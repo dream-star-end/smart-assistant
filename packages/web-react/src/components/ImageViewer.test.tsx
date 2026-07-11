@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { useState } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
+import { ImageEditActionsContext, type ImageCommentSubmit } from './chat/imageEditActions'
 import { ImageViewer, type ImageEditSubmit } from './ImageViewer'
 
 afterEach(() => {
@@ -21,6 +22,8 @@ const SIGNED = 'https://signed.test/x.png'
 
 type HarnessProps = {
   submitImageEdit?: (v: ImageEditSubmit) => Promise<void>
+  // 评论门控 = ImageEditActionsContext.submitImageComment(无 prop),经下面 Provider 注入。
+  submitImageComment?: (v: ImageCommentSubmit) => Promise<void>
   onOpenChange?: (o: boolean) => void
   signPath?: string | null
   get?: (opts?: { forceResign?: boolean }) => Promise<string | null>
@@ -28,23 +31,33 @@ type HarnessProps = {
   initialMode?: 'view' | 'edit'
 }
 
-function Harness({ submitImageEdit, onOpenChange, signPath = '/home/a.png', get, peek, initialMode }: HarnessProps) {
+function Harness({
+  submitImageEdit,
+  submitImageComment,
+  onOpenChange,
+  signPath = '/home/a.png',
+  get,
+  peek,
+  initialMode,
+}: HarnessProps) {
   const [open, setOpen] = useState(true)
   return (
-    <ImageViewer
-      open={open}
-      onOpenChange={(o) => {
-        setOpen(o)
-        onOpenChange?.(o)
-      }}
-      src={SIGNED}
-      alt="海报"
-      signPath={signPath}
-      get={get ?? (async () => SIGNED)}
-      peek={peek ?? (() => SIGNED)}
-      submitImageEdit={submitImageEdit}
-      initialMode={initialMode}
-    />
+    <ImageEditActionsContext.Provider value={{ submitImageComment }}>
+      <ImageViewer
+        open={open}
+        onOpenChange={(o) => {
+          setOpen(o)
+          onOpenChange?.(o)
+        }}
+        src={SIGNED}
+        alt="海报"
+        signPath={signPath}
+        get={get ?? (async () => SIGNED)}
+        peek={peek ?? (() => SIGNED)}
+        submitImageEdit={submitImageEdit}
+        initialMode={initialMode}
+      />
+    </ImageEditActionsContext.Provider>
   )
 }
 
@@ -78,7 +91,7 @@ describe('ImageViewer 全屏查看器', () => {
   })
 
   test('点评论 → 进入评论模式(0 条评论 + 空态提示)', () => {
-    render(<Harness submitImageEdit={vi.fn()} />)
+    render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: '评论' }))
     expect(screen.getByRole('heading', { name: '0 条评论' })).toBeInTheDocument()
     expect(screen.getByText('点按图片添加评论')).toBeInTheDocument()
@@ -134,7 +147,7 @@ describe('ImageViewer 全屏查看器', () => {
 
   test('ESC 逐层退出:评论模式按 ESC → 回到查看器(不直接关闭)(需求 §5)', () => {
     const onOpenChange = vi.fn()
-    render(<Harness submitImageEdit={vi.fn()} onOpenChange={onOpenChange} />)
+    render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} onOpenChange={onOpenChange} />)
     // 进入评论子模式
     fireEvent.click(screen.getByRole('button', { name: '评论' }))
     expect(screen.getByRole('heading', { name: '0 条评论' })).toBeInTheDocument()
@@ -146,7 +159,7 @@ describe('ImageViewer 全屏查看器', () => {
   })
 
   test('三模式(编辑/评论/调整大小)均可从查看器底部动作条直达(需求 §2)', () => {
-    render(<Harness submitImageEdit={vi.fn()} />)
+    render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} />)
     // 底部三动作齐全且可用
     for (const label of ['编辑', '评论', '调整大小']) {
       expect(screen.getByRole('button', { name: label })).toBeEnabled()

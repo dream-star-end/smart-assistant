@@ -1,50 +1,31 @@
 /**
- * 评论模式:在图片上落数字锚点(蓝底白字圆点),点图新增、点锚点改文案/删除,提交时
- * **客户端合成** annotated 三件套 —— 零后端新语义:
- *   ① mask   = 每锚点白色实心圆合并到黑底二值 mask(复用编辑器二值 mask 管线)
- *   ② guide  = 原图 + 编号圆标 overlay(进主对话用户气泡的可见缩略图)
- *   ③ prompt = 编号指令文本
- * 走现有 imageEdit(annotated)帧 → 计费不动(50 积分/张)。
+ * 评论模式(ChatGPT 同款「模型驱动精确修改」):在图片上落数字锚点(蓝底白字圆点),点图新增、
+ * 点锚点改文案/删除。提交时**不再客户端合成 mask/guide** —— 而是发一条**普通对话消息**:
+ *   media = [原图(可见,非 hidden)]
+ *   text  = 固定前导 + 每锚点一行「n. (x: NN%, y: NN%) 文案」(左上角为原点,百分比整数)
+ * 由 GPT 看图 + 坐标调它自己的原生 imagegen 完成精确修改。原图能复用持久 /api/media 引用就
+ * 直接复用,否则取签名 URL 字节交 App 上传一次(签名 URL 会过期,禁当持久 MediaRef)。
  */
 import { useEffect, useState } from 'react'
 import { ArrowUp, Check, Trash2, X } from 'lucide-react'
 import { apiErrorMessage } from '../lib/api'
+import { fetchImageBlobWithResign } from '../lib/chat/media'
 import { cn } from '../lib/utils'
-import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
-import {
-  canvasToPngFile,
-  drawDisplayCanvas,
-  type ImageEditSubmit,
-  loadImageBytes,
-  newImageJobId,
-} from './ImageViewer'
+import type { ImageCommentSubmit } from './chat/imageEditActions'
 
 type Anchor = { id: string; x: number; y: number; text: string }
 
-function buildCommentPrompt(anchors: Anchor[]): string {
-  const lines = anchors.map((a, i) => `${i + 1}. ${a.text.trim()}`).join('\n')
-  return `请按下列标注修改这张图片，编号对应图中相应位置的圆形标记：\n${lines}`
-}
+const COMMENT_TEXT_LEAD =
+  '请按下列标注修改这张图片，编号对应以下坐标（图片左上角为原点，百分比）：'
 
-/** 在 guide 画布上叠编号蓝圆标(与屏上锚点同款视觉)。 */
-function drawMarkers(ctx: CanvasRenderingContext2D, anchors: Anchor[], width: number, height: number) {
-  const r = Math.max(14, Math.round(Math.min(width, height) * 0.038))
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
-  ctx.font = `bold ${Math.round(r * 1.1)}px sans-serif`
-  anchors.forEach((a, i) => {
-    const cx = a.x * width
-    const cy = a.y * height
-    ctx.beginPath()
-    ctx.arc(cx, cy, r, 0, Math.PI * 2)
-    ctx.fillStyle = 'rgba(56,132,255,0.96)'
-    ctx.fill()
-    ctx.lineWidth = Math.max(2, r * 0.14)
-    ctx.strokeStyle = '#ffffff'
-    ctx.stroke()
-    ctx.fillStyle = '#ffffff'
-    ctx.fillText(String(i + 1), cx, cy)
+/** 前导 + 每锚点一行「n. (x: NN%, y: NN%) 文案」;NN = 归一化坐标 ×100 后取整。 */
+function buildCommentText(anchors: Anchor[]): string {
+  const lines = anchors.map((a, i) => {
+    const x = Math.round(a.x * 100)
+    const y = Math.round(a.y * 100)
+    return `${i + 1}. (x: ${x}%, y: ${y}%) ${a.text.trim()}`
   })
+  return [COMMENT_TEXT_LEAD, ...lines].join('\n')
 }
 
 export function ImageCommentMode({
@@ -60,7 +41,7 @@ export function ImageCommentMode({
   resolveSrc: (opts?: { forceResign?: boolean }) => Promise<string | null>
   canSubmit: boolean
   onBack: () => void
-  onSubmit: (value: ImageEditSubmit) => Promise<void>
+  onSubmit: (value: ImageCommentSubmit) => Promise<void>
 }) {
   const [anchors, setAnchors] = useState<Anchor[]>([])
   const [draft, setDraft] = useState<{ x: number; y: number } | null>(null)
@@ -99,7 +80,7 @@ export function ImageCommentMode({
         setDraft(null)
         return
       }
-      setAnchors((cur) => [...cur, { id: newImageJobId(), x: draft.x, y: draft.y, text }])
+      setAnchors((cur) => [...cur, { id: crypto.randomUUID(), x: draft.x, y: draft.y, text }])
       setDraft(null)
       setInputText('')
       return
@@ -130,55 +111,21 @@ export function ImageCommentMode({
     if (!canSubmit || anchors.length === 0 || busy) return
     setBusy(true)
     setError(null)
-    let revoke: (() => void) | null = null
     try {
-      const url = (await resolveSrc()) ?? src
-      const loaded = await loadImageBytes(url, resolveSrc)
-      revoke = loaded.revoke
-      const { blob, image, naturalWidth, naturalHeight } = loaded
-      const { canvas: guideCanvas, width, height } = drawDisplayCanvas(image, naturalWidth, naturalHeight)
-      const gctx = guideCanvas.getContext('2d')
-      if (!gctx) throw new Error('浏览器不支持图片处理')
-      drawMarkers(gctx, anchors, width, height)
-      const guide = await canvasToPngFile(guideCanvas, 'image-comment-guide.png')
-
-      const maskCanvas = document.createElement('canvas')
-      maskCanvas.width = width
-      maskCanvas.height = height
-      const mctx = maskCanvas.getContext('2d')
-      if (!mctx) throw new Error('浏览器不支持图片处理')
-      mctx.fillStyle = '#000000'
-      mctx.fillRect(0, 0, width, height)
-      mctx.fillStyle = '#ffffff'
-      // 锚点掩膜圆半径 = 短边 8%(floor 28px):语义「这个位置附近」的一片可编辑区,
-      // 与 master 侧 enforceMinSelectionBox(短边 8% 下限)同口径,双侧收口防上游 400。
-      const radius = Math.max(28, Math.round(Math.min(width, height) * 0.08))
-      for (const a of anchors) {
-        mctx.beginPath()
-        mctx.arc(a.x * width, a.y * height, radius, 0, Math.PI * 2)
-        mctx.fill()
+      const text = buildCommentText(anchors)
+      if (/^\/api\/media\//.test(src)) {
+        // 持久服务端 URL → 直接复用,不重新上传。
+        await onSubmit({ text, reuseUrl: src })
+      } else {
+        // 容器签名 URL / data: / blob: 等非持久源 → 取字节(过期自愈)交 App 上传一次。
+        const url = (await resolveSrc()) ?? src
+        const blob = await fetchImageBlobWithResign(url, resolveSrc)
+        const file = new File([blob], `${alt?.trim() || 'image'}.png`, { type: blob.type || 'image/png' })
+        await onSubmit({ text, sourceFile: file })
       }
-      const mask = await canvasToPngFile(maskCanvas, 'image-comment-mask.png')
-
-      const sourceBlob = await normalizeImageSourceForGateway(blob, image)
-      const source = new File([sourceBlob], alt?.trim() || 'image-comment-source', {
-        type: sourceBlob.type || 'image/png',
-      })
-
-      await onSubmit({
-        mode: 'comment',
-        clientJobId: newImageJobId(),
-        prompt: buildCommentPrompt(anchors),
-        source,
-        mask,
-        guide,
-        width: naturalWidth,
-        height: naturalHeight,
-      })
     } catch (err) {
       setError(apiErrorMessage(err, '提交失败，请重试'))
     } finally {
-      revoke?.()
       setBusy(false)
     }
   }

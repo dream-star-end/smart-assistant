@@ -11,6 +11,7 @@ import {
   type ImageAnnotationSource,
 } from "./components/ImageAnnotationEditor";
 import {
+  type ImageCommentSubmit,
   type ImageEditActions,
   ImageEditActionsContext,
   type ImageEditSubmit,
@@ -519,6 +520,21 @@ export function App() {
     [send, toast, uploadMedia],
   );
 
+  // 评论模式提交（ChatGPT 同款「模型驱动精确修改」）：不再合成 mask/guide,而是一条**普通对话
+  // 消息** —— media=[原图(可见)] + text=固定前导 + 每锚点百分比坐标行。原图能复用持久
+  // /api/media 引用就直接复用(reuseUrl),否则用 ImageCommentMode 取到的字节(sourceFile)上传
+  // 一次。由 GPT 看图+坐标调它自己的原生 imagegen 完成精确修改。
+  const submitImageComment = useCallback(
+    async (value: ImageCommentSubmit) => {
+      const ref: MediaRef = value.reuseUrl
+        ? { kind: "image", url: value.reuseUrl }
+        : await uploadMedia(value.sourceFile as File);
+      await send(value.text, [ref]);
+      toast("已提交标注修改，模型将按坐标精确修改", "success");
+    },
+    [send, uploadMedia, toast],
+  );
+
   // 图片编辑可用性(image2 门控):image2 特性开放 + 当前模型是 GPT 引擎时才可编辑。
   // **单一权威**:注入 submitImageEdit / annotate 与否即"可否编辑"的唯一判定,聊天缩略图
   // 「编辑」浮钮、全屏查看器动作、composer 附件编辑按钮全部据此显隐/禁用。
@@ -540,10 +556,11 @@ export function App() {
   const imageEditActions = useMemo<ImageEditActions>(
     () => ({
       submitImageEdit: image2Available ? submitImageEdit : undefined,
+      submitImageComment: image2Available ? submitImageComment : undefined,
       annotate: image2Available ? setImageAnnotationSource : undefined,
       annotateUnavailableReason: image2UnavailableReason,
     }),
-    [image2Available, submitImageEdit, image2UnavailableReason],
+    [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
   // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮

@@ -4,7 +4,7 @@
  * 状态,非三个独立 Dialog:
  *   view    → 默认浏览态(加载中亮深色 shimmer 骨架,禁纯白/白闪)
  *   edit    → 复用 ImageAnnotationEditor(笔刷圈选,核心逻辑不动)
- *   comment → ImageCommentMode(数字锚点,客户端合成 annotated 三件套)
+ *   comment → ImageCommentMode(数字锚点,提交为普通模型 turn:原图 media + 百分比坐标文本)
  *   resize  → ImageResizeMode(五比例 outpaint)
  *
  * 与 App 的接线:submitImageEdit 经 ImageEditActionsContext 从 App 下传(单一权威 =
@@ -29,7 +29,7 @@ import { nativeDownload, openInNewTab } from '../lib/chat/download'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
 import { cn } from '../lib/utils'
 import { ImageAnnotationEditor, type ImageAnnotationSource } from './ImageAnnotationEditor'
-import { ImageEditActionsContext, type ImageEditSubmit } from './chat/imageEditActions'
+import { ImageEditActionsContext, type ImageCommentSubmit, type ImageEditSubmit } from './chat/imageEditActions'
 import { ImageCommentMode } from './ImageCommentMode'
 import { ImageResizeMode } from './ImageResizeMode'
 
@@ -182,6 +182,9 @@ export function ImageViewer({
 }) {
   const ctx = useContext(ImageEditActionsContext)
   const submitImageEdit = submitProp ?? ctx.submitImageEdit
+  // 评论 = 普通模型 turn(原图 media + 百分比坐标文本),不走 submitImageEdit 帧链路。
+  // 与 submitImageEdit 同门控(image2/GPT),存在即评论动作可用。
+  const submitImageComment = ctx.submitImageComment
 
   const [mode, setMode] = useState<ViewerMode>('view')
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
@@ -238,6 +241,14 @@ export function ImageViewer({
   const handleSubmit = async (value: ImageEditSubmit) => {
     if (!submitImageEdit) return
     await submitImageEdit(value)
+    setMode('view')
+    onOpenChange(false)
+  }
+
+  // 评论提交(普通模型 turn):走 submitImageComment,同样成功后回 view + 关查看器。
+  const handleCommentSubmit = async (value: ImageCommentSubmit) => {
+    if (!submitImageComment) return
+    await submitImageComment(value)
     setMode('view')
     onOpenChange(false)
   }
@@ -344,9 +355,9 @@ export function ImageViewer({
                 src={src}
                 alt={alt}
                 resolveSrc={get}
-                canSubmit={!!submitImageEdit}
+                canSubmit={!!submitImageComment}
                 onBack={() => setMode('view')}
-                onSubmit={handleSubmit}
+                onSubmit={handleCommentSubmit}
               />
             ) : mode === 'resize' ? (
               <ImageResizeMode
@@ -466,7 +477,7 @@ export function ImageViewer({
                   <ActionButton
                     label="评论"
                     icon={<MessageCircle size={20} />}
-                    disabled={!submitImageEdit}
+                    disabled={!submitImageComment}
                     reason={editDisabledReason}
                     onClick={() => setMode('comment')}
                   />

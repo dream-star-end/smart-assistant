@@ -489,28 +489,65 @@ export async function decodeValidatedImageBase64(encoded: string): Promise<Buffe
   }
 }
 
-async function normalizeSingleImageRequest(
+/** Order-independent JSON canonicalization for the native-request content hash. */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  const obj = value as Record<string, unknown>
+  return `{${Object.keys(obj)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`)
+    .join(',')}}`
+}
+
+function clampImageCount(raw: unknown): number {
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : 1
+  if (!Number.isFinite(n)) return 1
+  return Math.min(4, Math.max(1, Math.trunc(n)))
+}
+
+/**
+ * Normalize a native imagegen request (POST /images/generations|edits) for the
+ * metered data plane. Unlike the annotated internal endpoint, the model owns
+ * the request; we only enforce model=gpt-image-2, clamp n into [1,4] so billing
+ * is bounded (50×n), and derive a content digest used as the idempotency key
+ * (codex has no stable x-request-id — an identical retry hashes the same and
+ * replays the cached result instead of re-charging).
+ */
+async function normalizeNativeImageRequest(
   body: Buffer,
   contentType: string | undefined,
-): Promise<{ body: BodyInit; contentType: string | null }> {
+): Promise<{ body: BodyInit; contentType: string | null; imageCount: number; digest: Buffer }> {
   if ((contentType ?? '').toLowerCase().includes('application/json')) {
     const parsed = JSON.parse(body.toString('utf8')) as Record<string, unknown>
-    if (parsed.model !== 'gpt-image-2' || (parsed.n !== undefined && parsed.n !== 1)) {
-      throw new Error('only model=gpt-image-2 and n=1 are supported')
-    }
+    if (parsed.model !== 'gpt-image-2') throw new Error('only model=gpt-image-2 is supported')
+    const imageCount = clampImageCount(parsed.n)
     parsed.model = 'gpt-image-2'
-    parsed.n = 1
-    return { body: JSON.stringify(parsed), contentType: 'application/json' }
+    parsed.n = imageCount
+    const digest = createHash('sha256').update('native\0json\0', 'utf8').update(stableStringify(parsed), 'utf8').digest()
+    return { body: JSON.stringify(parsed), contentType: 'application/json', imageCount, digest }
   }
   const form = await new Response(new Uint8Array(body), { headers: { 'content-type': contentType ?? '' } }).formData()
   const models = form.getAll('model')
-  const counts = form.getAll('n')
-  if (models.length !== 1 || models[0] !== 'gpt-image-2' || counts.length > 1 || (counts.length === 1 && counts[0] !== '1')) {
-    throw new Error('only model=gpt-image-2 and n=1 are supported')
-  }
+  if (models.length !== 1 || models[0] !== 'gpt-image-2') throw new Error('only model=gpt-image-2 is supported')
+  const imageCount = clampImageCount(form.get('n'))
   form.set('model', 'gpt-image-2')
-  form.set('n', '1')
-  return { body: form, contentType: null }
+  form.set('n', String(imageCount))
+  // Digest over sorted (field, value) pairs + file bytes — boundary-independent,
+  // so two logically identical multipart retries hash the same. Blobs are
+  // re-readable, hashing does not consume the form we forward. Insertion order is
+  // deterministic for identical requests; a stable sort by key keeps same-key
+  // entries in that order.
+  const entries: Array<[string, FormDataEntryValue]> = []
+  form.forEach((value, key) => entries.push([key, value]))
+  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const hash = createHash('sha256').update('native\0form\0', 'utf8')
+  for (const [key, val] of entries) {
+    hash.update(`\0${key}\0`, 'utf8')
+    if (typeof val === 'string') hash.update(val, 'utf8')
+    else hash.update(Buffer.from(await val.arrayBuffer()))
+  }
+  return { body: form, contentType: null, imageCount, digest: hash.digest() }
 }
 
 type AnnotatedImageRequest = {
@@ -677,18 +714,37 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     const preflightJobId = preflightAnnotated && typeof annotatedJobHeader === 'string' && /^[0-9a-f]{32}$/.test(annotatedJobHeader)
       ? annotatedJobHeader
       : null
-    const preflightImageRequestId = preflightImage
-      ? preflightAnnotated ? (preflightJobId ? `image-job:${preflightJobId}` : null) : `image:${requestId}`
-      : null
-    const preflightOperation: 'generation' | 'edit' | 'annotated_edit' | null = !preflightImage
+    const preflightNative = preflightImage && !preflightAnnotated
+    const preflightOperation: 'annotated_edit' | 'native_image' | null = !preflightImage
       ? null
-      : preflightAnnotated ? 'annotated_edit' : mappedSuffix === '/images/edits' ? 'edit' : 'generation'
+      : preflightAnnotated ? 'annotated_edit' : 'native_image'
+    // native imagegen 请求体在预检读一次:内容哈希 → 稳定幂等 request_id(codex 无
+    // x-request-id;同图同 prompt 同 n 的重试命中已完成缓存零重复扣费),并拿到 clamp 后
+    // 的 n 供精确预留 50×n。req 流只能读一次,规范化后的 body 存下游 isImageRequest 复用。
+    let nativeNormalized: Awaited<ReturnType<typeof normalizeNativeImageRequest>> | null = null
+    let preflightImageRequestId: string | null = null
+    let preflightImageCount = 1
     let imageReservation: ReservationHandle | null = null
     let didInsertImageReservation = false
     if (preflightImage) {
       if (!deps.pgPool || !deps.preCheckRedis) {
         sendJsonError(res, 503, 'IMAGE_BILLING_UNAVAILABLE', 'image billing unavailable', requestId)
         return
+      }
+      if (preflightNative) {
+        try {
+          nativeNormalized = await normalizeNativeImageRequest(
+            await readBoundedBody(req),
+            typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
+          )
+        } catch (err) {
+          sendJsonError(res, 400, 'INVALID_IMAGE_REQUEST', err instanceof Error ? err.message : 'invalid image request', requestId)
+          return
+        }
+        preflightImageCount = nativeNormalized.imageCount
+        preflightImageRequestId = `native:${nativeNormalized.digest.toString('hex')}`
+      } else {
+        preflightImageRequestId = preflightJobId ? `image-job:${preflightJobId}` : null
       }
       if (!preflightImageRequestId || !preflightOperation) {
         sendJsonError(res, 400, 'INVALID_IMAGE_REQUEST', 'missing stable image job id', requestId)
@@ -730,12 +786,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         const imageUsage = await reserveImageUsage(deps.pgPool, {
           userId: BigInt(identity.userId), containerId: identity.containerId,
           requestId: preflightImageRequestId, jobId: preflightJobId,
-          operation: preflightOperation,
+          operation: preflightOperation, imageCount: preflightImageCount,
         })
         didInsertImageReservation = true
         if (!imageUsage.alreadyCharged) {
           imageReservation = (await preCheckExactCost(deps.preCheckRedis, {
-            userId: identity.userId, requestId: preflightImageRequestId, maxCost: IMAGE2_UNIT_COST,
+            userId: identity.userId, requestId: preflightImageRequestId,
+            maxCost: IMAGE2_UNIT_COST * BigInt(preflightImageCount),
           })).reservation
         }
       } catch (err) {
@@ -899,7 +956,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let imageRequestBody: BodyInit | null = null
     let imageRequestContentType: string | null = null
     let imageRequestId: string | null = null
-    let imageOperation: 'generation' | 'edit' | 'annotated_edit' | null = null
+    let imageOperation: 'annotated_edit' | 'native_image' | null = null
     let annotatedJob: ImageEditJob | null = null
     let annotatedPrepared: Awaited<ReturnType<typeof prepareImageEdit>> | null = null
     let outpaintPrepared: Awaited<ReturnType<typeof prepareImageOutpaint>> | null = null
@@ -1003,12 +1060,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           upstreamUrl.pathname = upstreamUrl.pathname.replace(/\/images\/annotated-edits$/, '/images/edits')
           mappedUrl = { ...mappedUrl, url: upstreamUrl.toString(), upstreamPath: upstreamUrl.pathname }
         } else {
-          const normalized = await normalizeSingleImageRequest(
-            await readBoundedBody(req),
-            typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
-          )
-          imageRequestBody = normalized.body
-          imageRequestContentType = normalized.contentType
+          // native imagegen:请求体已在预检读并规范化(内容哈希幂等 + n clamp),此处复用,
+          // 绝不重读 req(流已消费)。
+          if (!nativeNormalized) throw new Error('native image request not normalized')
+          imageRequestBody = nativeNormalized.body
+          imageRequestContentType = nativeNormalized.contentType
         }
       } catch (err) {
         if (didInsertImageReservation && imageRequestId && imageOperation) {
@@ -1081,13 +1137,29 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       }
       if (isImageRequest) {
         const bytes = await readBoundedResponseBody(upstream)
+        // annotated:decode 单张待合成图;native:校验上游恰好返回 n 张且每张合法(据此扣 50×n)。
         let generated: Buffer | null = null
+        let nativeValid = false
         if (upstream.ok) {
           try {
             const parsed = JSON.parse(bytes.toString('utf8')) as { data?: Array<{ b64_json?: string }> }
-            const encoded = parsed.data?.[0]?.b64_json
-            if (parsed.data?.length === 1 && typeof encoded === 'string') {
-              generated = await decodeValidatedImageBase64(encoded)
+            if (isAnnotatedImageRequest) {
+              const encoded = parsed.data?.[0]?.b64_json
+              if (parsed.data?.length === 1 && typeof encoded === 'string') {
+                generated = await decodeValidatedImageBase64(encoded)
+              }
+            } else {
+              const data = parsed.data
+              if (Array.isArray(data) && data.length === preflightImageCount) {
+                let allValid = true
+                for (const item of data) {
+                  if (typeof item?.b64_json !== 'string' || !(await decodeValidatedImageBase64(item.b64_json))) {
+                    allValid = false
+                    break
+                  }
+                }
+                nativeValid = allValid
+              }
             }
           } catch {}
         } else {
@@ -1098,12 +1170,14 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             status: upstream.status,
             operation: imageOperation,
             annotated: isAnnotatedImageRequest,
+            imageCount: preflightImageCount,
             requestedSize: annotatedPrepared?.target.api ?? outpaintPrepared?.target.api ?? null,
             imageJobId: annotatedJob?.jobId ?? null,
             bodyPrefix: sanitizeUpstreamErrorBody(bytes),
           })
         }
-        if (!generated) {
+        const producedValid = isAnnotatedImageRequest ? generated !== null : nativeValid
+        if (!producedValid) {
           if (!upstream.ok) throw new ImageUpstreamError(upstream.status)
           throw new Error('Image 2 returned an invalid image')
         }
@@ -1113,9 +1187,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           if (!annotatedJob || (!annotatedPrepared && !outpaintPrepared)) throw new Error('annotated edit preparation missing')
           if (controller.signal.aborted) throw new DOMException('image request aborted', 'AbortError')
           if (outpaintPrepared) {
-            await compositeImageOutpaint(annotatedJob, generated, outpaintPrepared)
+            await compositeImageOutpaint(annotatedJob, generated!, outpaintPrepared)
           } else {
-            await compositeImageEdit(annotatedJob, generated, annotatedPrepared!)
+            await compositeImageEdit(annotatedJob, generated!, annotatedPrepared!)
           }
           const finalImage = await readFile(annotatedJob.outputPath)
           responseBody = Buffer.from(JSON.stringify({
@@ -1130,6 +1204,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           requestId: imageRequestId!,
           jobId: annotatedJob?.jobId ?? null,
           operation: imageOperation!,
+          imageCount: preflightImageCount,
           responseBody,
         })
         if (imageReservation) {
@@ -1139,7 +1214,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         if (!settled.duplicate && deps.onImageCharge) {
           try {
             deps.onImageCharge(BigInt(identity.userId), {
-              costCredits: IMAGE2_UNIT_COST.toString(),
+              costCredits: (IMAGE2_UNIT_COST * BigInt(preflightImageCount)).toString(),
               balanceAfter: settled.balanceAfter?.toString() ?? null,
             })
           } catch (err) {

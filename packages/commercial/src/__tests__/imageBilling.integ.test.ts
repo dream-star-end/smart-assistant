@@ -166,6 +166,31 @@ describe('Image 2 exact billing', () => {
     )).rows[0]!.count, '1')
   })
 
+  test('native_image bills 50×n and records image_count/cost_credits', async (t) => {
+    if (skip(t)) return
+    const userId = await user()
+    const requestId = 'native:' + 'a'.repeat(64)
+    const reserved = await reserveImageUsage(getPool(), {
+      userId, containerId: null, requestId, operation: 'native_image', imageCount: 2,
+    })
+    assert.equal(reserved.alreadyCharged, false)
+    const body = Buffer.from('{"data":[{"b64_json":"x"},{"b64_json":"y"}]}')
+    const settled = await settleImageCharge(getPool(), {
+      userId, containerId: null, requestId, operation: 'native_image', imageCount: 2, responseBody: body,
+    })
+    assert.equal(settled.duplicate, false)
+    assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '400')
+    assert.deepEqual(
+      (await query<{ delta: string }>("SELECT delta::text AS delta FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'", [userId.toString()])).rows,
+      [{ delta: '-100' }],
+    )
+    const rec = await query<{ image_count: number; cost_credits: string; operation: string }>(
+      'SELECT image_count, cost_credits::text AS cost_credits, operation FROM image_generation_usage_records WHERE user_id=$1 AND request_id=$2',
+      [userId.toString(), requestId],
+    )
+    assert.deepEqual(rec.rows[0], { image_count: 2, cost_credits: '100', operation: 'native_image' })
+  })
+
   test('annotated paid result remains recoverable after ordinary cache expiry', async (t) => {
     if (skip(t)) return
     const userId = await user()
@@ -378,6 +403,88 @@ describe('Image 2 relay orchestration', () => {
     } finally {
       await close(server)
     }
+  })
+
+  test('native imagegen bills 50×n once, clamps n to [1,4], and replays cache by content hash', async (t) => {
+    if (skip(t)) return
+    const userId = await user(500n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    const generated = await sharp({ create: { width: 512, height: 512, channels: 3, background: '#3366cc' } }).png().toBuffer()
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      // Upstream honours whatever n we forwarded (clamped): returns exactly that many images.
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        upstreamCalls++
+        const n = (JSON.parse(String(init.body)) as { n: number }).n
+        return Response.json({ data: Array.from({ length: n }, () => ({ b64_json: generated.toString('base64') })) })
+      }) as unknown as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const gen = async (n: number, prompt = 'a blue square') => fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/generations`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt, n }),
+    })
+    try {
+      const first = await gen(2)
+      assert.equal(first.status, 200)
+      const firstJson = await first.json() as { data: Array<{ b64_json: string }> }
+      assert.equal(firstJson.data.length, 2, 'forwards n=2 and returns 2 images')
+      assert.equal(upstreamCalls, 1)
+      // Identical request → identical content hash → cached replay, no second upstream call, no second charge.
+      const second = await gen(2)
+      assert.equal(second.status, 200)
+      assert.deepEqual(await second.json(), firstJson)
+      assert.equal(upstreamCalls, 1, 'identical native request replays cache without a second upstream call')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '400', '50×2 charged exactly once')
+      // n above the ceiling clamps to 4; different prompt = different hash = a new paid generation.
+      const clamped = await gen(9, 'a green triangle')
+      assert.equal(clamped.status, 200)
+      assert.equal((await clamped.json() as { data: unknown[] }).data.length, 4, 'n=9 clamped to 4 images')
+      assert.equal(upstreamCalls, 2)
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '200', '50×4 charged for the clamped request')
+      assert.equal((await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'",
+        [userId.toString()],
+      )).rows[0]!.count, '2')
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('native imagegen with insufficient balance never debits or calls upstream', async (t) => {
+    if (skip(t)) return
+    const userId = await user(50n) // needs 50×2=100 for n=2
+    await addContainer(userId)
+    const tracker = redisTracker()
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => { upstreamCalls++; return Response.json({ data: [] }) }) as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/generations`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a red square', n: 2 }),
+      })
+      assert.equal(response.status, 402)
+      assert.equal(upstreamCalls, 0, 'precheck fails before any upstream call')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50', 'no debit')
+    } finally { await close(server) }
   })
 
   test('invalid upstream image and insufficient balance never debit', async (t) => {

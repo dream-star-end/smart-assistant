@@ -1,14 +1,18 @@
 /**
- * 评论模式(ImageCommentMode)行为契约:
+ * 评论模式(ImageCommentMode)行为契约(ChatGPT 同款「模型驱动精确修改」):
  *  - 空态提示「点按图片添加评论」;顶部「N 条评论」。
  *  - 点图 → 输入条(占位「描述编辑」)→ 确认 → 落编号锚点,计数 +1。
  *  - 点已有锚点 → 可改文案/删除。
- *  - 0 条禁用发送;≥1 条且 canSubmit → 提交合成 annotated 三件套(mode:'annotated')。
- *  - 渲染失败(图片加载失败)/解析失败(取图字节失败)各有回退。
+ *  - 0 条禁用发送;≥1 条且 canSubmit → 提交**普通对话消息**({ text, reuseUrl | sourceFile }):
+ *      · src 为持久 /api/media/... → onSubmit 收到 reuseUrl===src(不上传);
+ *      · src 为签名 URL/data/blob → 取字节交 App 上传(onSubmit 收到 sourceFile File)。
+ *    text = 前导 + 每锚点「n. (x: NN%, y: NN%) 文案」(左上原点百分比整数)。
+ *  - 渲染失败(图片加载失败)/取字节失败各有回退。
  */
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
+import type { ImageCommentSubmit } from './chat/imageEditActions'
 import { ImageCommentMode } from './ImageCommentMode'
 
 afterEach(() => {
@@ -24,41 +28,7 @@ const baseProps = {
   onBack: vi.fn(),
 }
 
-function stubImagePipeline() {
-  const blob = new Blob(['png'], { type: 'image/png' })
-  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response))
-  URL.createObjectURL = vi.fn(() => 'blob:mock')
-  URL.revokeObjectURL = vi.fn()
-  class MockImage {
-    onload: (() => void) | null = null
-    onerror: (() => void) | null = null
-    naturalWidth = 900
-    naturalHeight = 900
-    _src = ''
-    set src(v: string) {
-      this._src = v
-      setTimeout(() => this.onload?.(), 0)
-    }
-    get src() {
-      return this._src
-    }
-  }
-  vi.stubGlobal('Image', MockImage)
-  const ctx = {
-    drawImage: vi.fn(),
-    fillRect: vi.fn(),
-    clearRect: vi.fn(),
-    beginPath: vi.fn(),
-    arc: vi.fn(),
-    fill: vi.fn(),
-    stroke: vi.fn(),
-    fillText: vi.fn(),
-  } as unknown as CanvasRenderingContext2D
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx as never)
-  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation(function (cb: BlobCallback) {
-    cb(new Blob(['out'], { type: 'image/png' }))
-  })
-}
+const LEAD = '请按下列标注修改这张图片，编号对应以下坐标（图片左上角为原点，百分比）：'
 
 /** 落一个带文案的锚点(点图 → 输入 → 确认)。 */
 function addComment(text: string) {
@@ -97,21 +67,39 @@ describe('ImageCommentMode', () => {
     expect(screen.getByRole('heading', { name: '0 条评论' })).toBeInTheDocument()
   })
 
-  test('发送 → 合成 annotated 三件套(mode/source/mask/guide/prompt)', async () => {
-    stubImagePipeline()
-    const onSubmit = vi.fn(async () => {})
+  test('发送(持久 /api/media 源):复用 reuseUrl,不上传,携百分比坐标文本', async () => {
+    // /api/media/... 是持久服务端 URL → 直接复用,fetch 不应被调用。
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const onSubmit = vi.fn(async (_v: ImageCommentSubmit) => {})
+    render(<ImageCommentMode {...baseProps} src="/api/media/abc.png" canSubmit onSubmit={onSubmit} />)
+    addComment('把裙子改成蓝色')
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    const value = onSubmit.mock.calls[0][0]
+    expect(value.reuseUrl).toBe('/api/media/abc.png')
+    expect(value.sourceFile).toBeUndefined()
+    expect(value.text.startsWith(LEAD)).toBe(true)
+    expect(value.text).toContain('1. (x: 50%, y: 50%) 把裙子改成蓝色')
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  test('发送(签名 URL 源):取字节上传,onSubmit 收到 sourceFile File', async () => {
+    const blob = new Blob(['png'], { type: 'image/png' })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response),
+    )
+    const onSubmit = vi.fn(async (_v: ImageCommentSubmit) => {})
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={onSubmit} />)
     addComment('去掉背景路人')
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     const value = onSubmit.mock.calls[0][0]
-    expect(value.mode).toBe('comment')
-    expect(value.source).toBeInstanceOf(File)
-    expect(value.mask).toBeInstanceOf(File)
-    expect(value.guide).toBeInstanceOf(File)
-    expect(value.prompt).toContain('1. 去掉背景路人')
-    expect(value.width).toBe(900)
-    expect(value.clientJobId).toMatch(/^[0-9a-f]{32}$/)
+    expect(value.sourceFile).toBeInstanceOf(File)
+    expect(value.reuseUrl).toBeUndefined()
+    expect(value.text.startsWith(LEAD)).toBe(true)
+    expect(value.text).toContain('1. (x: 50%, y: 50%) 去掉背景路人')
   })
 
   test('渲染失败:图片 onError → 加载失败回退', () => {
@@ -120,7 +108,7 @@ describe('ImageCommentMode', () => {
     expect(screen.getByText('图片加载失败')).toBeInTheDocument()
   })
 
-  test('解析失败:取图字节失败 → 错误提示', async () => {
+  test('取字节失败:签名 URL 410(重签后仍失败)→ 错误提示,onSubmit 未调用', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 410 }) as unknown as Response))
     const onSubmit = vi.fn(async () => {})
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={onSubmit} />)

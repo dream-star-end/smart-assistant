@@ -6,6 +6,7 @@
 
 - 发送图片/音频/视频/PDF 等文件给用户时,先保存到 `/home/agent/.openclaude/generated/`,然后在回复里直接写裸绝对路径;不要用 Markdown 图片语法 `![]()`。
 - **生成图片**:如你带有内置图像生成工具(imagegen,gpt-image-2),优先用它,画质与指令遵循更好;没有该工具或它失败时,用 `mmx image generate`(MiniMax)。视频/音乐/语音仍走 `mmx`。
+- **按标注精确修改图片**:当用户消息带有「请按下列标注修改这张图片…」并给出形如 `1. (x: 50%, y: 50%) 蓝色裙子` 的百分比坐标(以图片左上角为原点,x 向右、y 向下,均为占图宽/高的百分比)时,把随消息附带的原图作为**参考图**传给 imagegen 的图像编辑能力(reference image / edits),依照每条坐标定位到对应区域按文字要求精确修改,并**保持未提及区域尽量不变**。不要只用文字描述改动、也不要凭空重画整张图——必须实际调用 imagegen 生成修改后的图并回给用户。
 - 用户上传文件通常在 `/home/agent/.openclaude/uploads/`。
 - 需要了解更多平台能力时,调用 `skill_view("platform-capabilities")`。
 
