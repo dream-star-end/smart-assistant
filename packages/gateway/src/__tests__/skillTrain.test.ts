@@ -7,7 +7,10 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  FEEDBACK_SCENARIO_MAX_CHARS,
+  MAX_FEEDBACK_SCENARIOS,
   SKILL_TRAIN_DEFAULT_MODEL,
+  buildFeedbackScenariosSection,
   buildSkillTrainContext,
   buildSkillTrainPrompt,
   isNestedSkillTrainBlocked,
@@ -80,6 +83,61 @@ describe('buildSkillTrainPrompt', () => {
   it('auto-select wording when no target skill', () => {
     const auto = buildSkillTrainPrompt(normalizeSkillTrainArgs({ runId: 'r2' }, 'main'))
     assert.match(auto, /auto-select among the USER'S OWN skills/)
+  })
+})
+
+describe('buildFeedbackScenariosSection', () => {
+  it('empty scenarios → empty string (caller skips injection)', () => {
+    assert.equal(buildFeedbackScenariosSection([]), '')
+    assert.equal(buildFeedbackScenariosSection([{ text: '   ' }]), '') // 空白文本被过滤
+  })
+
+  it('renders the down-vote section with numbered blocks and titles', () => {
+    const section = buildFeedbackScenariosSection([
+      { title: '部署失败会话', text: '用户: 帮我部署\n助手: 部署失败了' },
+      { text: '用户: 又报错' },
+    ])
+    // 注意:小节标题含中文圆括号,用 includes 避免正则分组歧义。
+    assert.ok(section.includes('用户差评过的真实场景(优先分析这些失败案例)'))
+    assert.ok(section.includes('### 差评场景 1(部署失败会话)'))
+    assert.ok(section.includes('### 差评场景 2'))
+    assert.ok(section.includes('部署失败了'))
+  })
+
+  it('caps at MAX_FEEDBACK_SCENARIOS blocks', () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ text: `场景${i}` }))
+    const section = buildFeedbackScenariosSection(many)
+    const blocks = section.match(/### 差评场景 /g) ?? []
+    assert.equal(blocks.length, MAX_FEEDBACK_SCENARIOS)
+  })
+
+  it('hard-truncates an over-long excerpt to <= FEEDBACK_SCENARIO_MAX_CHARS', () => {
+    const huge = 'x'.repeat(FEEDBACK_SCENARIO_MAX_CHARS + 500)
+    const section = buildFeedbackScenariosSection([{ text: huge }])
+    // 取正文块(标题行之后)长度不超过上限。
+    const body = section.split('### 差评场景 1\n')[1] ?? ''
+    assert.ok(body.length <= FEEDBACK_SCENARIO_MAX_CHARS, `body len ${body.length}`)
+    assert.ok(body.endsWith('…'))
+  })
+})
+
+describe('buildSkillTrainPrompt feedback injection', () => {
+  const base = normalizeSkillTrainArgs({ runId: 'run-fb', targetSkill: 'deploy-flow' }, 'main')
+
+  it('injects the feedback section when provided', () => {
+    const section = buildFeedbackScenariosSection([{ text: '用户: 部署炸了' }])
+    const prompt = buildSkillTrainPrompt(base, new Date('2026-06-18T00:00:00.000Z'), section)
+    assert.match(prompt, /用户差评过的真实场景/)
+    assert.match(prompt, /部署炸了/)
+    // 仍保留原有 CRITICAL guards(注入不破坏后续结构)。
+    assert.match(prompt, /CRITICAL guards:/)
+  })
+
+  it('omits the feedback section when absent/empty (fail-open no-refs branch)', () => {
+    const noArg = buildSkillTrainPrompt(base, new Date('2026-06-18T00:00:00.000Z'))
+    assert.doesNotMatch(noArg, /用户差评过的真实场景/)
+    const emptyArg = buildSkillTrainPrompt(base, new Date('2026-06-18T00:00:00.000Z'), '')
+    assert.doesNotMatch(emptyArg, /用户差评过的真实场景/)
   })
 })
 

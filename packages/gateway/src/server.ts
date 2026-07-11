@@ -128,10 +128,13 @@ import {
   type GenSessionExcerpt,
 } from './skillEvalGen.js'
 import {
+  MAX_FEEDBACK_SCENARIOS,
   SKILL_TRAIN_DEFAULT_MODEL,
   SKILL_TRAIN_EFFORT,
+  buildFeedbackScenariosSection,
   buildSkillTrainPrompt,
   normalizeSkillTrainArgs,
+  type FeedbackScenario,
 } from './skillTrain.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
@@ -199,7 +202,11 @@ import {
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
 } from './v3MarketplaceRelay.js'
 import { startToolFailureReporter } from './v3ToolFailureReporter.js'
-import { startSkillUsageReporter } from './skillUsageReporter.js'
+import {
+  fetchUserSkillFeedbackRefs,
+  startSkillUsageReporter,
+  type SkillFeedbackRef,
+} from './skillUsageReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
@@ -6503,6 +6510,44 @@ export class Gateway {
 
   // POST /api/skills/:name/train — start an async DeepSeek training run for ONE
   // user-authored skill. Returns a runId immediately; progress via GET status.
+  /**
+   * 采集「用户对该技能差评过的真实场景」摘录(供技能训练注入失败案例小节):
+   *  1) GET master skill-feedback?slug=&layer=user(容器 token 通道,已内建 fail-open);
+   *  2) 有 refs → 按 sessionKey 从**本地** sessions.db 取 turns(复用 P1 buildSessionExcerpt
+   *     裁成 ≤1500 字符摘录),至多 MAX_FEEDBACK_SCENARIOS 段。
+   * 返回 `{scenarios, total}`:scenarios=实际注入的摘录;total=master 未截断的差评总数
+   * (DISTINCT session_key,供前端"已找到 N 条"提示)。任何环节失败/无数据 → `{[], 0}`
+   * (训练照常,不注入失败案例小节)。内容主权不出容器:master 只回引用,摘录本体由本地 DB 组装。
+   */
+  private async _collectSkillFeedbackScenarios(
+    skillName: string,
+  ): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
+    let feedback: { refs: SkillFeedbackRef[]; total: number }
+    try {
+      // 拉取有界超时(fail-open):不让 master 慢响应拖住训练启动。
+      feedback = await fetchUserSkillFeedbackRefs(skillName, { timeoutMs: 5_000 })
+    } catch {
+      return { scenarios: [], total: 0 } // 已 fail-open,这里再兜底一层绝不上抛
+    }
+    if (feedback.refs.length === 0) return { scenarios: [], total: 0 }
+    const scenarios: FeedbackScenario[] = []
+    for (const ref of feedback.refs) {
+      if (scenarios.length >= MAX_FEEDBACK_SCENARIOS) break
+      let turns: Awaited<ReturnType<typeof loadSessionTurns>>
+      try {
+        // sessions_meta.id / sessions_fts.session_id == sessionKey(sessionManager
+        // indexTurn 用 session.sessionKey 作 FTS 主键),故 loadSessionTurns 直接吃 sessionKey。
+        turns = await loadSessionTurns(ref.sessionKey)
+      } catch {
+        continue
+      }
+      const text = buildSessionExcerpt(turns, SESSION_EXCERPT_MAX_CHARS)
+      if (!text) continue // 会话已归档/清理 → 跳过该 ref
+      scenarios.push({ text })
+    }
+    return { scenarios, total: feedback.total }
+  }
+
   private async _handleSkillTrainStart(
     req: IncomingMessage,
     res: ServerResponse,
@@ -6544,6 +6589,16 @@ export class Gateway {
       now: Date.now(),
     })
 
+    // 差评驱动:起训前拉「用户对该技能差评过的真实使用记录」→ 按 sessionKey 从本地
+    // sessions.db 取摘录,注入训练 prompt 的失败案例小节。整链 fail-open:任一步失败/无
+    // 数据都返回空 → 照常训练(feedbackRefs=0),绝不影响训练启动。
+    const { scenarios: feedbackScenarios, total: feedbackTotal } =
+      await this._collectSkillFeedbackScenarios(skillName)
+    const feedbackSection = buildFeedbackScenariosSection(feedbackScenarios)
+    // feedbackRefs:仅当确有素材注入训练时才回传 master 的未截断差评总数(前端"已找到 N 条")。
+    // 差评存在但摘录全部拉不到(会话已清理)→ 无注入 → 0(不误报"将优先分析")。
+    const feedbackRefs = feedbackScenarios.length > 0 ? feedbackTotal : 0
+
     // Background session bound to this run (skillTrainRunId exposes skill_propose).
     const session = await this.sessions.getOrCreate({
       sessionKey: `skilltrain:${runId}`,
@@ -6558,7 +6613,7 @@ export class Gateway {
     void this.sessions
       .submit(
         session,
-        buildSkillTrainPrompt(opts),
+        buildSkillTrainPrompt(opts, new Date(), feedbackSection),
         (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
         SKILL_TRAIN_DEFAULT_MODEL,
@@ -6567,7 +6622,7 @@ export class Gateway {
       .catch((err) => {
         void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
       })
-    this.sendJson(res, 202, { ok: true, runId })
+    this.sendJson(res, 202, { ok: true, runId, feedbackRefs })
   }
 
   // GET /api/skill-training — 当前用户的训练 run 列表(startedAt 降序)。归属权威与
