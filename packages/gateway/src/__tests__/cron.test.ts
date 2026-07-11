@@ -1,6 +1,6 @@
 // Set OPENCLAUDE_HOME to an isolated temp dir BEFORE importing cron.ts —
 // `paths.cronYaml` snapshots HOME at module load time, so this must run first.
-import { mkdtempSync, rmSync, existsSync, unlinkSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync, unlinkSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -413,5 +413,100 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
     // 尊重原配置:getOrCreate 不注入 model 键(沿用 agent 默认),submit model 为 undefined。
     assert.equal('model' in getOrCreateOpts[0], false, '非 codex 不应注入 model override')
     assert.equal(submitCalls[0].model, undefined)
+  })
+})
+
+describe('CronScheduler.runJob — 引擎 API 错误熔断(402 站内信轰炸根治)', () => {
+  // 线上事故:402 余额不足 × 高频 schedule → 同一段 "API Error: 402…" 被当正常产出
+  // 反复送达,离线兜底 35 小时写了 424 条同文站内信。断言三件事:
+  //   1. API 错误产出一律不送达(它是失败,不是结果);
+  //   2. insufficient_credits 连续 3 次 → job.enabled=false 持久化 + 恰好一条暂停通知;
+  //   3. 瞬时错误(429 等)只抑制送达,永不替用户关任务;正常产出清零计数。
+  function makeSchedulerWithOutput(): {
+    sched: InstanceType<typeof CronScheduler>
+    setOutput: (text: string) => void
+    delivered: string[]
+  } {
+    let output = ''
+    const delivered: string[] = []
+    const sessions = {
+      getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }) as any,
+      submit: async (_s: any, _t: any, cb: any) => {
+        if (output) cb({ kind: 'block', block: { kind: 'text', text: output } })
+      },
+      destroySession: async () => {},
+    }
+    const config = { defaults: { model: 'glm-5.2' } } as any
+    const sched = new CronScheduler(config, sessions as any, (text: string) => {
+      delivered.push(text)
+    })
+    return { sched, setOutput: (t) => (output = t), delivered }
+  }
+
+  const ERR_402 = 'API Error: 402 {"error":{"code":"INSUFFICIENT_CREDITS","message":"insufficient credits: balance=0 required=69"}}'
+  const ERR_429 = 'API Error: 429 {"error":{"code":"RATE_LIMITED"}}'
+  // 非 codex agent,避开合成模型降级的 provider seam 依赖。
+  const AGENT = { id: 'x', model: 'glm-5.2' } as any
+
+  function seedJob(job: any): void {
+    // YAML 是 JSON 超集,直接写 JSON 形态即可被 parseYaml 读回。
+    writeFileSync(paths.cronYaml, JSON.stringify({ jobs: [job] }))
+  }
+
+  beforeEach(() => {
+    process.env.OC_SEED_DEFAULT_CRON = '0'
+    if (existsSync(paths.cronYaml)) unlinkSync(paths.cronYaml)
+  })
+
+  afterEach(() => {
+    delete process.env.OC_SEED_DEFAULT_CRON
+  })
+
+  it('API 错误产出不送达;连续 3 次 402 → 持久化停用 + 恰好一条暂停通知', async () => {
+    const job = { id: 'wd-1', schedule: '*/5 * * * *', agent: 'x', prompt: 'watch', deliver: 'webchat', label: 'Run the watchdog', enabled: true } as any
+    seedJob(job)
+    const { sched, setOutput, delivered } = makeSchedulerWithOutput()
+    setOutput(ERR_402)
+
+    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT)
+    assert.equal(delivered.length, 0, '裸 API 错误绝不能作为任务产出送达')
+    assert.equal(job.enabled, true, '未到阈值不停用')
+
+    await (sched as any).runJob(job, AGENT)
+    assert.equal(job.enabled, false, '第 3 次连续 402 必须停用任务')
+    assert.equal(delivered.length, 1, '暂停通知恰好一条')
+    assert.ok(delivered[0].includes('已自动暂停'), `通知需说明暂停:${delivered[0]}`)
+    assert.ok(delivered[0].includes('Run the watchdog'), '通知需带任务名')
+
+    const onDisk = parseYaml(readFileSync(paths.cronYaml, 'utf8')) as any
+    assert.equal(onDisk.jobs[0].enabled, false, '停用必须持久化到 cron.yaml')
+  })
+
+  it('正常产出清零连击:2 次 402 → 成功 → 2 次 402,不停用', async () => {
+    const job = { id: 'wd-2', schedule: '*/5 * * * *', agent: 'x', prompt: 'watch', deliver: 'webchat', enabled: true } as any
+    seedJob(job)
+    const { sched, setOutput, delivered } = makeSchedulerWithOutput()
+
+    setOutput(ERR_402)
+    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT)
+    setOutput('今日一切正常。')
+    await (sched as any).runJob(job, AGENT)
+    assert.deepEqual(delivered, ['今日一切正常。'], '正常产出照常送达')
+    setOutput(ERR_402)
+    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT)
+    assert.equal(job.enabled, true, '成功已清零连击,两次新失败不该停用')
+  })
+
+  it('瞬时错误(429)只抑制送达,永不停用', async () => {
+    const job = { id: 'wd-3', schedule: '*/5 * * * *', agent: 'x', prompt: 'watch', deliver: 'webchat', enabled: true } as any
+    seedJob(job)
+    const { sched, setOutput, delivered } = makeSchedulerWithOutput()
+    setOutput(ERR_429)
+    for (let i = 0; i < 5; i++) await (sched as any).runJob(job, AGENT)
+    assert.equal(delivered.length, 0, '瞬时错误不送达')
+    assert.equal(job.enabled, true, '瞬时错误永不替用户关任务')
   })
 })

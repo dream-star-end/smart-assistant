@@ -132,9 +132,11 @@ describe("inbox-post handler", () => {
       now: () => clock,
       maxPerMin: 2,
     });
+    // 每次发不同内容 —— 这里测的是"条数"维度限流,不能被内容去重先行短路。
+    let seq = 0;
     const send = async () => {
       const res = makeRes();
-      await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { title: "t", bodyMd: "b" } }), res, CTX);
+      await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { title: "t", bodyMd: `b-${seq++}` } }), res, CTX);
       return res;
     };
 
@@ -153,6 +155,101 @@ describe("inbox-post handler", () => {
     r = await send();
     assert.equal(r.body.ok, true);
     assert.equal(p.posts.length, 3);
+  });
+
+  test("content dedupe: same uid+content within window → duplicate, no write; expiry/different content pass", async () => {
+    const p = capturePost();
+    let clock = 1_000_000;
+    const h = makeInboxPostHandler({
+      identityRepo: repoFor(5),
+      postMessage: p.postMessage,
+      now: () => clock,
+      maxPerMin: 100, // 限频放宽,单测只看内容去重维度
+      dedupeWindowMs: 6 * 3600_000,
+    });
+    const send = async (title: string, bodyMd: string) => {
+      const res = makeRes();
+      await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { title, bodyMd } }), res, CTX);
+      return res;
+    };
+
+    // 事故形态:同一段 "API Error: 402…" 每 5 分钟一条 → 首条落库,后续全部 duplicate。
+    const errBody = 'API Error: 402 {"error":{"code":"INSUFFICIENT_CREDITS"}}';
+    let r = await send("Run the watchdog", errBody);
+    assert.equal(r.body.ok, true);
+    for (let i = 0; i < 5; i++) {
+      clock += 5 * 60_000;
+      r = await send("Run the watchdog", errBody);
+      assert.equal(r.body.ok, false, `第 ${i + 2} 条应被去重`);
+      assert.equal(r.body.reason, "duplicate");
+    }
+    assert.equal(p.posts.length, 1);
+
+    // 不同内容不受影响。
+    r = await send("Run the watchdog", "正常任务产出");
+    assert.equal(r.body.ok, true);
+    assert.equal(p.posts.length, 2);
+
+    // 窗口过期后同内容放行(第二天的失败该再提醒一次)。
+    clock += 6 * 3600_000 + 1;
+    r = await send("Run the watchdog", errBody);
+    assert.equal(r.body.ok, true);
+    assert.equal(p.posts.length, 3);
+  });
+
+  test("content dedupe scoped per uid: same content from different users both write", async () => {
+    const p = capturePost();
+    // repo 按 boundIp 区分 uid —— 同一 handler 实例(共享去重表)服务两个用户。
+    const repo: ContainerIdentityRepo = {
+      async findActiveByHostAndBoundIp(hostUuid, boundIp) {
+        // token 里的 identity id 固定为 7(TOKEN=oc-v3.7.…),user_id 按 boundIp 区分。
+        const uid = boundIp === "172.31.0.7" ? 7 : 8;
+        return { id: 7, user_id: uid, bound_ip: boundIp, host_uuid: hostUuid, secret_hash: hashSecret(SECRET) };
+      },
+    };
+    const h = makeInboxPostHandler({ identityRepo: repo, postMessage: p.postMessage });
+    const body = { title: "同文", bodyMd: "同一段内容" };
+
+    let res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body }), res, { hostUuid: "host-1", boundIp: "172.31.0.7" });
+    assert.equal(res.body.ok, true);
+
+    res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body }), res, { hostUuid: "host-1", boundIp: "172.31.0.8" });
+    assert.equal(res.body.ok, true, "不同 uid 的同内容不该互相去重");
+    assert.equal(p.posts.length, 2);
+
+    // 同 uid 重发才被去重。
+    res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body }), res, { hostUuid: "host-1", boundIp: "172.31.0.7" });
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.reason, "duplicate");
+  });
+
+  test("content dedupe: failed write does not claim the key — retry passes", async () => {
+    let failOnce = true;
+    const posts: number[] = [];
+    const h = makeInboxPostHandler({
+      identityRepo: repoFor(5),
+      postMessage: async (uid) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("transient pg error");
+        }
+        posts.push(uid);
+      },
+    });
+    const body = { title: "t", bodyMd: "b" };
+
+    let res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body }), res, CTX);
+    assert.equal(res.statusCode, 500);
+
+    res = makeRes();
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.ok, true, "落库失败不该占用去重键,合法重试要能过");
+    assert.equal(posts.length, 1);
   });
 
   test("postMessage throws → 500", async () => {
