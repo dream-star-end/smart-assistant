@@ -1,4 +1,5 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createConnection, createServer } from 'node:net'
@@ -32,6 +33,29 @@ const PROXY_ENV_KEYS_TO_STRIP = [
   'no_proxy',
 ] as const
 
+// ── slice ③: 主备 selector + clash_api 无重启切换 ──
+// 出站不再是"单节点 route.final=proxy",而是一个 `proxy` selector 指向 node-a(主)/
+// node-b(备)两个具名候选 + direct。切换 = clash_api PUT(不重启);watchdog 靠此做
+// 异常自动切换。命名稳定(node-a/node-b)以便 cache_file store_selected 跨重启/刷新
+// 保持选中。
+const SELECTOR_TAG = 'proxy'
+const PRIMARY_TAG = 'node-a'
+const BACKUP_TAG = 'node-b'
+const DIRECT_TAG = 'direct'
+const DEFAULT_CLASH_LISTEN = '127.0.0.1'
+// 避开商业版 clash_api(19095);个人版独占 19096
+const DEFAULT_CLASH_PORT = 19096
+// cache_file:持久化 selector 选中(sing-box 1.13 启用即默认持久化)。root 起的 sing-box 可写;
+// 目录不存在则降级为不写 cache_file(不持久化,但不影响出海)
+const DEFAULT_CACHE_FILE = '/var/lib/openclaude-egress/clash.db'
+// 无重启切换时不主动掐断在途连接(任务要求 false),由上层客户端自然重连/重试
+const SELECTOR_INTERRUPT_EXISTING = false
+// Claude Code 自动更新的下载域名必须直连,否则更新流量灌进出海代理形成黑洞
+// (memory: personal-proxy-traffic-autoupdate-loop)。历史 landmine:buildConfig 每次
+// 刷新/切换都整写 route,曾把这条直连规则抹掉。现在做成模板常量由 buildRoute() 每次
+// 注入,刷新/切换永不再丢 —— 根治。
+const ROUTE_DIRECT_DOMAIN_SUFFIXES = ['downloads.claude.ai', 'storage.googleapis.com'] as const
+
 interface EgressOptions {
   env?: NodeJS.ProcessEnv
   gatewayPort?: number
@@ -51,6 +75,10 @@ interface EgressSettings {
   curlPath: string
   mutationsEnabled: boolean
   mutationDisabledReason?: string
+  clashListen: string
+  clashPort: number
+  clashSecretSeed?: string
+  cacheFile: string
 }
 
 export interface EgressNodePublic {
@@ -119,6 +147,14 @@ export interface EgressStatus {
     server?: string
     updatedAt?: string
     health?: Partial<EgressHealth>
+    // 备节点(node-b);无备时 undefined。selector 升级后补充,老单节点为 undefined
+    standby?: {
+      idx?: number
+      name?: string
+      server?: string
+    }
+    // 活跃权威 = clash_api selector.now(watchdog/前端切换都改它);读不到为 undefined
+    activeTag?: string
   }
 }
 
@@ -229,6 +265,10 @@ export function resolveEgressSettings(opts: EgressOptions = {}): EgressSettings 
     curlPath: envAbsolutePath(env, 'OC_EGRESS_CURL', DEFAULT_CURL),
     mutationsEnabled: mutation.enabled,
     mutationDisabledReason: mutation.reason,
+    clashListen: DEFAULT_CLASH_LISTEN,
+    clashPort: envInt(env, 'OC_EGRESS_CLASH_PORT', DEFAULT_CLASH_PORT),
+    clashSecretSeed: env.OC_EGRESS_CLASH_SECRET?.trim() || undefined,
+    cacheFile: envAbsolutePath(env, 'OC_EGRESS_CACHE_FILE', DEFAULT_CACHE_FILE),
   }
 }
 
@@ -386,73 +426,211 @@ function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
+/**
+ * route.rules 模板:把 Claude Code 自动更新的下载域名钉死走 direct。单一权威,
+ * 单节点/selector 两条配置都注入,刷新/切换永不再抹掉(根治历史 landmine)。
+ */
+export function buildRouteRules(): Array<Record<string, unknown>> {
+  return [{ domain_suffix: [...ROUTE_DIRECT_DOMAIN_SUFFIXES], outbound: DIRECT_TAG }]
+}
+
+function buildRoute(): { rules: Array<Record<string, unknown>>; final: string } {
+  return { rules: buildRouteRules(), final: SELECTOR_TAG }
+}
+
+/** 把一个节点的私有字段物化成 sing-box vless outbound(给定 tag)。共享原语。 */
+function buildVlessOutbound(node: EgressNodeInternal, tag: string): Record<string, any> {
+  const isWsTls = node.transport === 'ws' && node.security === 'tls'
+  const isTcpReality = node.transport === 'tcp' && node.security === 'reality'
+  if (!node.supported || !node.uuid || !node.server || !node.sni) {
+    throw new EgressHttpError(400, `node #${node.idx} is not supported`)
+  }
+  if (isWsTls && !node.wsHost) {
+    throw new EgressHttpError(400, `node #${node.idx} is not supported`)
+  }
+  if (isTcpReality && !node.realityPublicKey) {
+    throw new EgressHttpError(400, `node #${node.idx} is not supported`)
+  }
+  if (!isWsTls && !isTcpReality) {
+    throw new EgressHttpError(400, `node #${node.idx} is not supported`)
+  }
+  const outbound: Record<string, any> = {
+    type: 'vless',
+    tag,
+    server: node.server,
+    server_port: node.port || 443,
+    uuid: node.uuid,
+    tls: {
+      enabled: true,
+      server_name: node.sni,
+      utls: {
+        enabled: true,
+        fingerprint: node.fingerprint || 'chrome',
+      },
+    },
+  }
+  if (node.flow) outbound.flow = node.flow
+  if (isWsTls) {
+    outbound.transport = {
+      type: 'ws',
+      path: node.path || '/',
+      headers: { Host: node.wsHost },
+    }
+  } else {
+    outbound.tls.reality = {
+      enabled: true,
+      public_key: node.realityPublicKey,
+    }
+    if (node.realityShortId) outbound.tls.reality.short_id = node.realityShortId
+  }
+  return outbound
+}
+
+function metaForNode(node: EgressNodeInternal): EgressMeta {
+  const meta: EgressMeta = {
+    idx: node.idx,
+    name: node.name,
+    server: `${node.server}:${node.port || 443}`,
+    sni: node.sni,
+    updated_at: nowIso(),
+  }
+  if (node.transport === 'ws' && node.security === 'tls') {
+    meta.ws_host = node.wsHost
+    meta.path = node.path || '/'
+  }
+  return meta
+}
+
+/** 两个节点是否同一落地端点(server:port + uuid)。用于判定备节点冗余是否有效。 */
+function sameEndpoint(a: EgressNodeInternal, b: EgressNodeInternal): boolean {
+  return a.server === b.server && (a.port || 443) === (b.port || 443) && a.uuid === b.uuid
+}
+
+/**
+ * 单节点配置:node 直接作为 tag=`proxy` 的 outbound,route.final=proxy。仍用于隔离
+ * 探测单个候选节点(testCandidate),不含 selector/clash_api。向后兼容既有断言。
+ */
 export function buildSingBoxConfig(
   node: EgressNodePublic | EgressNodeInternal,
   listen = DEFAULT_LISTEN,
   port = DEFAULT_PORT,
 ): { config: any; meta: EgressMeta } {
   const internal = node as EgressNodeInternal
-  const isWsTls = internal.transport === 'ws' && internal.security === 'tls'
-  const isTcpReality = internal.transport === 'tcp' && internal.security === 'reality'
-  if (!internal.supported || !internal.uuid || !internal.server || !internal.sni) {
-    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
-  }
-  if (isWsTls && !internal.wsHost) {
-    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
-  }
-  if (isTcpReality && !internal.realityPublicKey) {
-    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
-  }
-  if (!isWsTls && !isTcpReality) {
-    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
-  }
-  const outbound: Record<string, any> = {
-    type: 'vless',
-    tag: 'proxy',
-    server: internal.server,
-    server_port: internal.port || 443,
-    uuid: internal.uuid,
-    tls: {
-      enabled: true,
-      server_name: internal.sni,
-      utls: {
-        enabled: true,
-        fingerprint: internal.fingerprint || 'chrome',
-      },
-    },
-  }
-  if (internal.flow) outbound.flow = internal.flow
-  if (isWsTls) {
-    outbound.transport = {
-      type: 'ws',
-      path: internal.path || '/',
-      headers: { Host: internal.wsHost },
-    }
-  } else {
-    outbound.tls.reality = {
-      enabled: true,
-      public_key: internal.realityPublicKey,
-    }
-    if (internal.realityShortId) outbound.tls.reality.short_id = internal.realityShortId
-  }
+  const outbound = buildVlessOutbound(internal, SELECTOR_TAG)
   const cfg = {
     log: { level: 'warn', timestamp: true },
     inbounds: [{ type: 'mixed', tag: 'mixed-in', listen, listen_port: port }],
-    outbounds: [outbound, { type: 'direct', tag: 'direct' }],
-    route: { final: 'proxy' },
+    outbounds: [outbound, { type: 'direct', tag: DIRECT_TAG }],
+    route: buildRoute(),
   }
-  const meta: EgressMeta = {
-    idx: internal.idx,
-    name: internal.name,
-    server: `${internal.server}:${internal.port || 443}`,
-    sni: internal.sni,
-    updated_at: nowIso(),
+  return { config: cfg, meta: metaForNode(internal) }
+}
+
+export interface ClashApiConfig {
+  listen: string
+  port: number
+  secret: string
+  /** 省略 → 不写 cache_file(不持久化 selector 选中) */
+  cacheFile?: string
+}
+
+/**
+ * 主备 selector 实时配置:`proxy` selector(outbounds=[node-a,(node-b)],default=node-a,
+ * interrupt_exist_connections=false)+ 两个具名候选 outbound + direct;route.final=proxy
+ * 且注入 ROUTE_RULES;experimental.clash_api(切换/测速)+ cache_file(持久化选中)。
+ * backup 缺省或与 primary 同端点 → 退化为单成员 selector(诚实无冗余)。
+ */
+export function buildSelectorConfig(
+  primary: EgressNodeInternal,
+  backup: EgressNodeInternal | undefined,
+  listen = DEFAULT_LISTEN,
+  port = DEFAULT_PORT,
+  clash?: ClashApiConfig,
+): { config: any; meta: EgressMeta } {
+  const hasBackup = !!backup && !sameEndpoint(primary, backup)
+  const candidateOutbounds: Record<string, any>[] = [buildVlessOutbound(primary, PRIMARY_TAG)]
+  const members: string[] = [PRIMARY_TAG]
+  if (hasBackup && backup) {
+    candidateOutbounds.push(buildVlessOutbound(backup, BACKUP_TAG))
+    members.push(BACKUP_TAG)
   }
-  if (isWsTls) {
-    meta.ws_host = internal.wsHost
-    meta.path = internal.path || '/'
+  const selector = {
+    type: 'selector',
+    tag: SELECTOR_TAG,
+    outbounds: members,
+    default: PRIMARY_TAG,
+    interrupt_exist_connections: SELECTOR_INTERRUPT_EXISTING,
+  }
+  const cfg: any = {
+    log: { level: 'warn', timestamp: true },
+    inbounds: [{ type: 'mixed', tag: 'mixed-in', listen, listen_port: port }],
+    outbounds: [selector, ...candidateOutbounds, { type: 'direct', tag: DIRECT_TAG }],
+    route: buildRoute(),
+  }
+  if (clash) {
+    const experimental: any = {
+      clash_api: {
+        external_controller: `${clash.listen}:${clash.port}`,
+        secret: clash.secret,
+      },
+    }
+    if (clash.cacheFile) {
+      // sing-box 1.13:cache_file 启用即默认持久化 selector 选中(store_selected 字段已移除)
+      experimental.cache_file = { enabled: true, path: clash.cacheFile }
+    }
+    cfg.experimental = experimental
+  }
+  const meta = metaForNode(primary)
+  if (hasBackup && backup) {
+    meta.backup_idx = backup.idx
+    meta.backup_name = backup.name
+    meta.backup_server = `${backup.server}:${backup.port || 443}`
   }
   return { config: cfg, meta }
+}
+
+/** buildVlessOutbound 的逆映射:把已落盘 outbound 原样还原为 internal(迁移/刷新保真)。 */
+export function outboundToInternal(
+  outbound: any,
+  idx: number,
+  name: string,
+): EgressNodeInternal | undefined {
+  if (!outbound || outbound.type !== 'vless' || !outbound.server || !outbound.uuid) return undefined
+  const tls = outbound.tls || {}
+  const sni = typeof tls.server_name === 'string' ? tls.server_name : undefined
+  if (!sni) return undefined
+  const base: EgressNodeInternal = {
+    idx,
+    uri: '',
+    name,
+    scheme: 'vless',
+    server: String(outbound.server),
+    port: Number(outbound.server_port) || 443,
+    supported: true,
+    active: false,
+    uuid: String(outbound.uuid),
+    sni,
+    fingerprint: typeof tls.utls?.fingerprint === 'string' ? tls.utls.fingerprint : 'chrome',
+    flow: typeof outbound.flow === 'string' ? outbound.flow : undefined,
+  }
+  if (tls.reality?.enabled) {
+    base.transport = 'tcp'
+    base.security = 'reality'
+    base.realityPublicKey =
+      typeof tls.reality.public_key === 'string' ? tls.reality.public_key : undefined
+    base.realityShortId =
+      typeof tls.reality.short_id === 'string' ? tls.reality.short_id : undefined
+    if (!base.realityPublicKey) return undefined
+  } else if (outbound.transport?.type === 'ws') {
+    base.transport = 'ws'
+    base.security = 'tls'
+    base.path = typeof outbound.transport.path === 'string' ? outbound.transport.path : '/'
+    base.wsHost =
+      typeof outbound.transport.headers?.Host === 'string' ? outbound.transport.headers.Host : sni
+  } else {
+    return undefined
+  }
+  return base
 }
 
 async function fetchSubscription(settings: EgressSettings): Promise<string[]> {
@@ -556,6 +734,48 @@ async function serviceActive(settings: EgressSettings): Promise<boolean> {
   }
 }
 
+/**
+ * 活跃节点权威 = clash_api selector.now(watchdog 与前端切换都只改它);meta 只提供
+ * 主/备两成员的详情。仅 selector 配置(有 clash_api)才查询;老单节点/查询失败回落 meta 主。
+ */
+async function resolveActiveNode(
+  settings: EgressSettings,
+  meta: EgressMeta,
+): Promise<EgressStatus['active']> {
+  const primary = {
+    idx: typeof meta.idx === 'number' ? meta.idx : undefined,
+    name: typeof meta.name === 'string' ? meta.name : undefined,
+    server: typeof meta.server === 'string' ? meta.server : undefined,
+    updatedAt: typeof meta.updated_at === 'string' ? meta.updated_at : undefined,
+    health: healthFromMeta(meta),
+  }
+  const backupIdxNum = Number(meta.backup_idx)
+  const standby =
+    meta.backup_server !== undefined || meta.backup_name !== undefined
+      ? {
+          idx: Number.isInteger(backupIdxNum) ? backupIdxNum : undefined,
+          name: typeof meta.backup_name === 'string' ? meta.backup_name : undefined,
+          server: typeof meta.backup_server === 'string' ? meta.backup_server : undefined,
+        }
+      : undefined
+  const cfg = await readConfigJson(settings)
+  const secret = cfg?.experimental?.clash_api?.secret
+  const activeTag =
+    typeof secret === 'string' ? await clashSelectorNow(settings, secret) : undefined
+  if (activeTag === BACKUP_TAG && standby) {
+    return {
+      idx: standby.idx,
+      name: standby.name,
+      server: standby.server,
+      updatedAt: primary.updatedAt,
+      health: undefined,
+      standby,
+      activeTag,
+    }
+  }
+  return { ...primary, standby, activeTag }
+}
+
 export async function getEgressProxyStatus(opts: EgressOptions = {}): Promise<EgressStatus> {
   const settings = resolveEgressSettings(opts)
   const meta = await readMeta(settings)
@@ -566,13 +786,7 @@ export async function getEgressProxyStatus(opts: EgressOptions = {}): Promise<Eg
     mutationDisabledReason: settings.mutationDisabledReason,
     localProxy: `http://${settings.listen}:${settings.port}`,
     service: { name: settings.service, active: await serviceActive(settings) },
-    active: {
-      idx: typeof meta.idx === 'number' ? meta.idx : undefined,
-      name: typeof meta.name === 'string' ? meta.name : undefined,
-      server: typeof meta.server === 'string' ? meta.server : undefined,
-      updatedAt: typeof meta.updated_at === 'string' ? meta.updated_at : undefined,
-      health: healthFromMeta(meta),
-    },
+    active: await resolveActiveNode(settings, meta),
   }
 }
 
@@ -847,12 +1061,199 @@ export function metaText(meta: EgressMeta, health?: EgressHealth): string {
     .join('')
 }
 
-async function installNode(
+// ── clash_api 客户端(本机回环,强制直连不经代理) ──
+
+function safeJson(text: string): any {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
+  }
+}
+
+async function readConfigJson(settings: EgressSettings): Promise<any | undefined> {
+  try {
+    return JSON.parse(await readFile(settings.configPath, 'utf-8'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * clash_api secret 解析(稳定优先):已落盘 config 里的 secret 最高优先(保证 watchdog
+ * 跨刷新稳定,不因 regen 改 secret)→ env 种子(OC_EGRESS_CLASH_SECRET,块C 可预置)→
+ * 随机生成一次并从此固化在 config。watchdog 始终从 config 读 secret,故此为唯一权威。
+ */
+async function resolveClashSecret(settings: EgressSettings): Promise<string> {
+  const existing = await readConfigJson(settings)
+  const cur = existing?.experimental?.clash_api?.secret
+  if (typeof cur === 'string' && cur.length >= 16) return cur
+  if (settings.clashSecretSeed && settings.clashSecretSeed.length >= 8) return settings.clashSecretSeed
+  return randomBytes(24).toString('hex')
+}
+
+async function clashRequest(
   settings: EgressSettings,
-  node: EgressNodeInternal,
-  health: EgressHealth,
+  secret: string,
+  method: string,
+  path: string,
+  body?: unknown,
+  timeoutMs = 4_000,
+): Promise<{ status: number; data: any }> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await undiciFetch(`http://${settings.clashListen}:${settings.clashPort}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${secret}`,
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      dispatcher: DIRECT_FETCH_DISPATCHER,
+      signal: ctrl.signal,
+    })
+    const text = await res.text()
+    return { status: res.status, data: text ? safeJson(text) : {} }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function clashSelectorNow(settings: EgressSettings, secret: string): Promise<string | undefined> {
+  try {
+    const { status, data } = await clashRequest(settings, secret, 'GET', `/proxies/${SELECTOR_TAG}`)
+    if (status === 200 && typeof data?.now === 'string') return data.now
+  } catch {}
+  return undefined
+}
+
+async function clashSwitch(settings: EgressSettings, secret: string, tag: string): Promise<boolean> {
+  try {
+    const { status } = await clashRequest(settings, secret, 'PUT', `/proxies/${SELECTOR_TAG}`, {
+      name: tag,
+    })
+    return status === 200 || status === 204
+  } catch {
+    return false
+  }
+}
+
+async function clashDelay(
+  settings: EgressSettings,
+  secret: string,
+  tag: string,
+  url = 'https://cp.cloudflare.com/generate_204',
+  timeoutMs = 5_000,
+): Promise<number | undefined> {
+  try {
+    const q = new URLSearchParams({ timeout: String(timeoutMs), url }).toString()
+    const { status, data } = await clashRequest(
+      settings,
+      secret,
+      'GET',
+      `/proxies/${encodeURIComponent(tag)}/delay?${q}`,
+      undefined,
+      timeoutMs + 3_000,
+    )
+    if (status === 200 && Number.isInteger(data?.delay)) return data.delay as number
+  } catch {}
+  return undefined
+}
+
+/** clash_api 无重启切换后没有完整 anthropic/cf 探测,用 selector delay 合成一个健康摘要。 */
+function synthHealthFromDelay(delay?: number): EgressHealth {
+  const ok = typeof delay === 'number'
+  return {
+    healthy: ok,
+    anthropicCode: ok ? 'selector' : '000',
+    anthropicMs: delay ?? 0,
+    cfCode: ok ? '204' : '000',
+    cfMs: delay ?? 0,
+    scoreMs: delay ?? 0,
+  }
+}
+
+function findMemberOutbound(config: any, tag: string): any | undefined {
+  const outs = Array.isArray(config?.outbounds) ? config.outbounds : []
+  return outs.find((o: any) => o?.tag === tag && o?.type === 'vless')
+}
+
+/** 目标节点是否已是当前 selector 的某个具名成员(按 server:port+uuid 判定),返回其 tag。 */
+function matchLoadedMemberTag(config: any, node: EgressNodeInternal): string | undefined {
+  if (!config?.experimental?.clash_api) return undefined
+  for (const tag of [PRIMARY_TAG, BACKUP_TAG]) {
+    const o = findMemberOutbound(config, tag)
+    if (
+      o &&
+      o.server === node.server &&
+      (Number(o.server_port) || 443) === (node.port || 443) &&
+      o.uuid === node.uuid
+    ) {
+      return tag
+    }
+  }
+  return undefined
+}
+
+/** 把一个已落盘成员 outbound 匹配回订阅最新行(凭据可能轮转 → 采用订阅最新版本)。 */
+function matchSubscriptionNode(
+  nodes: EgressNodeInternal[],
+  outbound: any,
+): EgressNodeInternal | undefined {
+  if (!outbound?.server) return undefined
+  const port = Number(outbound.server_port) || 443
+  return (
+    nodes.find(
+      (n) =>
+        n.supported && n.server === outbound.server && (n.port || 443) === port && n.uuid === outbound.uuid,
+    ) || nodes.find((n) => n.supported && n.server === outbound.server && (n.port || 443) === port)
+  )
+}
+
+/**
+ * 从订阅择优一个健康的、与主节点不同落地端点的备节点(best-effort,实测健康)。
+ * 逐个候选隔离探测,取首个 healthy;都不健康 → 无备(诚实退化为单成员 selector)。
+ */
+async function pickHealthyBackup(
+  settings: EgressSettings,
+  nodes: EgressNodeInternal[],
+  primary: EgressNodeInternal,
+  maxTests = 3,
+): Promise<{ node?: EgressNodeInternal; health?: EgressHealth }> {
+  const candidates = nodes
+    .filter((n) => n.supported && n.idx !== primary.idx && !sameEndpoint(n, primary))
+    .slice(0, maxTests)
+  for (const cand of candidates) {
+    const tested = await testCandidate(settings, cand)
+    if (tested.health?.healthy) return { node: cand, health: tested.health }
+  }
+  return {}
+}
+
+/**
+ * 写入主备 selector 实时配置并重启 sing-box。sing-box check 通过才 rename(原子),
+ * cache_file 目录建不出来则降级为不持久化(绝不因此让 sing-box 起不来 = boss 出海断)。
+ */
+async function installSelectorConfig(
+  settings: EgressSettings,
+  primary: EgressNodeInternal,
+  backup: EgressNodeInternal | undefined,
+  primaryHealth?: EgressHealth,
 ): Promise<void> {
-  const { config, meta } = buildSingBoxConfig(node, settings.listen, settings.port)
+  const secret = await resolveClashSecret(settings)
+  let cacheFile: string | undefined = settings.cacheFile
+  try {
+    await mkdir(dirname(cacheFile), { recursive: true })
+  } catch {
+    cacheFile = undefined
+  }
+  const { config, meta } = buildSelectorConfig(primary, backup, settings.listen, settings.port, {
+    listen: settings.clashListen,
+    port: settings.clashPort,
+    secret,
+    cacheFile,
+  })
   const json = `${JSON.stringify(config, null, 2)}\n`
   await mkdir(dirname(settings.configPath), { recursive: true })
   const tmpConfigPath = join(
@@ -868,7 +1269,7 @@ async function installNode(
     await rm(tmpConfigPath, { force: true })
     throw err
   }
-  await atomicWrite(settings.metaPath, metaText(meta, health))
+  await atomicWrite(settings.metaPath, metaText(meta, primaryHealth))
   await execLimited('systemctl', ['restart', settings.service], 25_000)
   await execLimited('systemctl', ['is-active', '--quiet', settings.service], 10_000)
 }
@@ -880,6 +1281,7 @@ export async function selectEgressNode(
   selected: EgressNodePublic
   health: EgressHealth
   status: EgressStatus
+  switched?: 'clash_api' | 'restart'
 }> {
   const settings = resolveEgressSettings(opts)
   if (!settings.mutationsEnabled) {
@@ -899,6 +1301,26 @@ export async function selectEgressNode(
     const node = parseNode(lines[idx - 1], idx)
     if (!node.supported)
       throw new EgressHttpError(400, node.error || `node #${idx} is not supported`)
+
+    // ── fast path:目标已是当前 selector 成员 → clash_api PUT 无重启切换 ──
+    const existing = await readConfigJson(settings)
+    const memberTag = matchLoadedMemberTag(existing, node)
+    if (memberTag) {
+      const secret = existing?.experimental?.clash_api?.secret
+      if (typeof secret === 'string' && (await clashSwitch(settings, secret, memberTag))) {
+        const delay = await clashDelay(settings, secret, memberTag)
+        node.active = true
+        return {
+          selected: publicNode(node),
+          health: synthHealthFromDelay(delay),
+          status: await getEgressProxyStatus(opts),
+          switched: 'clash_api',
+        }
+      }
+      // PUT 失败 → 回落到重生成路径(下方),不让切换哑火
+    }
+
+    // ── slow path:新节点作主 → 健康校验 + 择优备节点 + 重生成 selector + 重启 ──
     const tested = await testCandidate(settings, node)
     if (!tested.health?.healthy) {
       throw new EgressHttpError(
@@ -906,13 +1328,123 @@ export async function selectEgressNode(
         `node #${idx} health test failed: ${tested.error || tested.health?.anthropicCode || 'unhealthy'}`,
       )
     }
-    await installNode(settings, node, tested.health)
+    const backup = await pickHealthyBackup(settings, parseSubscriptionNodesInternal(lines), node)
+    await installSelectorConfig(settings, node, backup.node, tested.health)
     node.active = true
     return {
       selected: publicNode(node),
       health: tested.health,
       status: await getEgressProxyStatus(opts),
+      switched: 'restart',
     }
+  } finally {
+    installInFlight = false
+  }
+}
+
+/**
+ * 向后兼容:把现有单节点配置平滑升级为主备 selector。主节点 = 现有 outbound **原样提取**
+ * (server/uuid/reality/ws 全保真,boss 当前节点零改动),备节点从订阅择优(拿不到就单成员)。
+ * 已是 selector 则幂等 no-op。块C 首次迁移调用此函数(切换窗口 = 一次 sing-box 重启)。
+ */
+export async function migrateEgressToSelector(
+  opts: EgressOptions = {},
+): Promise<{ migrated: boolean; reason?: string; status: EgressStatus }> {
+  const settings = resolveEgressSettings(opts)
+  if (!settings.mutationsEnabled) {
+    throw new EgressHttpError(
+      403,
+      settings.mutationDisabledReason || 'egress proxy mutations are disabled',
+    )
+  }
+  if (installInFlight) throw new EgressHttpError(409, 'egress proxy operation already running')
+  installInFlight = true
+  try {
+    const cfg = await readConfigJson(settings)
+    if (!cfg) throw new EgressHttpError(503, 'no existing egress config to migrate')
+    const alreadySelector =
+      cfg?.experimental?.clash_api &&
+      Array.isArray(cfg.outbounds) &&
+      cfg.outbounds.some((o: any) => o?.tag === SELECTOR_TAG && o?.type === 'selector')
+    if (alreadySelector) {
+      return { migrated: false, reason: 'already a selector config', status: await getEgressProxyStatus(opts) }
+    }
+    const cur = Array.isArray(cfg.outbounds)
+      ? cfg.outbounds.find((o: any) => o?.type === 'vless')
+      : undefined
+    const meta = await readMeta(settings)
+    const primary = outboundToInternal(
+      cur,
+      typeof meta.idx === 'number' ? meta.idx : 0,
+      typeof meta.name === 'string' ? meta.name : '当前节点',
+    )
+    if (!primary)
+      throw new EgressHttpError(400, 'existing egress outbound is not a supported vless node')
+    let backup: EgressNodeInternal | undefined
+    try {
+      const lines = await fetchSubscription(settings)
+      backup = (await pickHealthyBackup(settings, parseSubscriptionNodesInternal(lines), primary)).node
+    } catch {
+      // 订阅暂不可达不阻塞迁移:先单成员 selector,后续 refresh/select 再补备
+    }
+    await installSelectorConfig(settings, primary, backup)
+    return { migrated: true, status: await getEgressProxyStatus(opts) }
+  } finally {
+    installInFlight = false
+  }
+}
+
+/**
+ * 刷新订阅:重生成 selector 配置,**保持 selector 结构与当前 tag→物理节点映射**
+ * (node-a/node-b 端点不变),仅从订阅拉取各成员最新凭据。配合 cache_file store_selected,
+ * 当前选中(即便 watchdog 已切到 node-b)跨这次重启依然保持。非 selector 配置先迁移。
+ */
+export async function resyncEgressSelector(
+  opts: EgressOptions = {},
+): Promise<{ resynced: boolean; reason?: string; status: EgressStatus }> {
+  const settings = resolveEgressSettings(opts)
+  if (!settings.mutationsEnabled) {
+    throw new EgressHttpError(
+      403,
+      settings.mutationDisabledReason || 'egress proxy mutations are disabled',
+    )
+  }
+  if (installInFlight) throw new EgressHttpError(409, 'egress proxy operation already running')
+  installInFlight = true
+  try {
+    const cfg = await readConfigJson(settings)
+    if (!cfg?.experimental?.clash_api) {
+      return {
+        resynced: false,
+        reason: 'not a selector config; run migrate first',
+        status: await getEgressProxyStatus(opts),
+      }
+    }
+    const curPrimary = findMemberOutbound(cfg, PRIMARY_TAG)
+    if (!curPrimary) {
+      return {
+        resynced: false,
+        reason: 'no primary member in config',
+        status: await getEgressProxyStatus(opts),
+      }
+    }
+    const curBackup = findMemberOutbound(cfg, BACKUP_TAG)
+    const meta = await readMeta(settings)
+    const lines = await fetchSubscription(settings)
+    const allNodes = parseSubscriptionNodesInternal(lines)
+    const primary =
+      matchSubscriptionNode(allNodes, curPrimary) ||
+      outboundToInternal(curPrimary, typeof meta.idx === 'number' ? meta.idx : 0, PRIMARY_TAG)
+    if (!primary)
+      throw new EgressHttpError(400, 'primary member is not a supported vless node')
+    let backup: EgressNodeInternal | undefined
+    if (curBackup) {
+      backup = matchSubscriptionNode(allNodes, curBackup) || outboundToInternal(curBackup, 0, BACKUP_TAG)
+    } else {
+      backup = (await pickHealthyBackup(settings, allNodes, primary)).node
+    }
+    await installSelectorConfig(settings, primary, backup)
+    return { resynced: true, status: await getEgressProxyStatus(opts) }
   } finally {
     installInFlight = false
   }

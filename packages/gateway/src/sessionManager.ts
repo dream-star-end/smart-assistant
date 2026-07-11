@@ -4,11 +4,16 @@ import { join } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
+  type SelfhealExecutionStatus,
   appendServerAuthoredMessageDurable,
+  claimQueuedTurn,
+  enqueueExecution,
   getClientSession,
+  getExecution,
   getMaxTurnIdx,
   indexTurn,
   paths,
+  setExecutionStatus,
   upsertSessionMeta,
 } from '@openclaude/storage'
 import { ClaudeMessageParser, type SessionStreamEvent } from './claudeMessageParser.js'
@@ -756,6 +761,7 @@ export class SessionManager {
           effortLevel: initialEffort,
           config: this.config,
           delegationDepth: opts.delegationDepth,
+          runAsUser: opts.agent.runAsUser,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -1267,6 +1273,62 @@ export class SessionManager {
       }
     } finally {
       release()
+    }
+  }
+
+  /**
+   * At-most-once submit keyed by a durable `executionId` (self-heal slice ②).
+   *
+   * The dedup ledger lives in selfheal.db and is the *only* thing added on top
+   * of the ordinary {@link submit} path:
+   *
+   *   1. {@link enqueueExecution} — in ONE transaction, write the execution row
+   *      ('accepted') AND the durable_turn_queue row ('queued'). This is the
+   *      commit point: `accepted` therefore ALWAYS implies a queued turn exists,
+   *      so we can never "record accepted but never submit" (the permanent
+   *      swallow). Idempotent on executionId.
+   *   2. {@link claimQueuedTurn} — CAS queued→consumed (+ execution
+   *      accepted→running) in one transaction. EXACTLY ONE caller wins. The
+   *      winner (and only it) runs the real turn; everyone else returns the
+   *      existing status WITHOUT creating a second turn.
+   *   3. Run the turn via the shared {@link submit} path, then settle the
+   *      execution status to done/failed.
+   *
+   * Crash semantics: a crash before step 2 leaves the row 'queued' → a re-drive
+   * (jobWorker re-claims via lease expiry, same deterministic session) wins the
+   * CAS and submits — no swallow. A crash after step 2 leaves it 'consumed' → a
+   * re-drive loses the CAS and does NOT resubmit — at-most-once (repairs must
+   * never double-execute).
+   *
+   * `ranHere` tells the caller whether THIS call executed the turn (vs. observed
+   * an already-consumed one), so it can map the outcome onto its own bookkeeping.
+   */
+  async submitWithExecutionId(
+    session: AgentSession,
+    prompt: string,
+    executionId: string,
+    onEvent: (e: SessionStreamEvent) => void,
+  ): Promise<{ executionId: string; status: SelfhealExecutionStatus; ranHere: boolean }> {
+    // 1. Durable, idempotent enqueue (accepted + queued in one txn).
+    await enqueueExecution({ executionId, sessionKey: session.sessionKey })
+
+    // 2. Claim the single turn. Losing the CAS means it was already consumed —
+    //    return the current status without creating a second turn.
+    const won = await claimQueuedTurn(executionId)
+    if (!won) {
+      const exec = await getExecution(executionId)
+      return { executionId, status: exec?.status ?? 'accepted', ranHere: false }
+    }
+
+    // 3. We own the turn (execution is now 'running'). Reuse the normal submit
+    //    path; settle the ledger on completion.
+    try {
+      await this.submit(session, prompt, onEvent)
+      await setExecutionStatus(executionId, 'done')
+      return { executionId, status: 'done', ranHere: true }
+    } catch (err) {
+      await setExecutionStatus(executionId, 'failed')
+      throw err
     }
   }
 

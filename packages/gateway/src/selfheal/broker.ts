@@ -1,0 +1,445 @@
+/**
+ * Self-heal broker — root-side Unix-socket privilege gateway.
+ *
+ * The unprivileged `ocheal` codex has NO ability to run systemctl / docker /
+ * deploy. Every privileged operation is a structured request over this ACL'd
+ * Unix socket, which the root-side broker validates and performs itself:
+ *
+ *   Tier1  — deterministic ops from the {@link TIER1_ACTIONS} allowlist
+ *            (restart_service / clean_disk / switch_node). Strict param schema,
+ *            fixed shell-free commands, audit log.
+ *
+ *   Tier2  — production cutover: `{ sha, verificationRef }`. The broker trusts
+ *            NOTHING codex says — it (a) loads the root-signed verification and
+ *            checks its HMAC + `allPassed` + sha/repairId match, (b) verifies
+ *            the sha is a descendant of the canonical branch, (c) requires the
+ *            global deploy flock, then runs a SELF-HELD trusted deploy driver
+ *            (never a script from the candidate clone). `OC_SELFHEAL_AUTO_DEPLOY
+ *            _TIER2` defaults to 0 ⇒ the request is recorded + notified as
+ *            "pending release", NOT executed; only =1 auto-cuts-over.
+ *
+ * Idempotency: every request is keyed by `repairId:actionKind`. A recorded
+ * side-effecting outcome is replayed from the ledger instead of re-executing
+ * (replay/duplicate-delivery protection).
+ */
+
+import { chmodSync, chownSync, existsSync, mkdirSync, unlinkSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
+import { type Server, type Socket, createServer } from 'node:net'
+import { dirname, join } from 'node:path'
+import { type Logger, createLogger } from '../logger.js'
+import {
+  type BrokerActionDef,
+  BrokerActionError,
+  type CommandRunner,
+  TIER1_ACTIONS,
+} from './brokerActions.js'
+import {
+  type SignedVerification,
+  defaultCommandRunner,
+  loadSignedVerification,
+  verifySignature,
+} from './verifier.js'
+
+const rootLog = createLogger({ module: 'selfheal-broker' })
+
+const CUTOVER_KIND = 'cutover'
+const MAX_REQUEST_BYTES = 64 * 1024
+
+export interface BrokerRequest {
+  repairId: string
+  actionKind: string
+  params?: unknown
+}
+
+export interface BrokerResponse {
+  ok: boolean
+  /** Machine-readable outcome. */
+  status: string
+  detail?: Record<string, unknown>
+}
+
+// ── idempotency ledger ───────────────────────────────────────────────────────
+
+export interface BrokerLedgerEntry {
+  key: string
+  repairId: string
+  actionKind: string
+  response: BrokerResponse
+  recordedAt: string
+}
+
+export interface BrokerLedger {
+  get(key: string): BrokerLedgerEntry | undefined
+  put(entry: BrokerLedgerEntry): void
+}
+
+/** Durable JSON-lines ledger (root-owned). Replays on construction so broker
+ *  restarts keep replay protection. */
+export class FileBrokerLedger implements BrokerLedger {
+  private readonly map = new Map<string, BrokerLedgerEntry>()
+  constructor(private readonly file: string) {
+    mkdirSync(dirname(file), { recursive: true })
+    if (existsSync(file)) {
+      for (const line of readFileSync(file, 'utf-8').split('\n')) {
+        if (!line.trim()) continue
+        try {
+          const entry = JSON.parse(line) as BrokerLedgerEntry
+          this.map.set(entry.key, entry)
+        } catch {
+          /* skip corrupt line */
+        }
+      }
+    }
+  }
+  get(key: string): BrokerLedgerEntry | undefined {
+    return this.map.get(key)
+  }
+  put(entry: BrokerLedgerEntry): void {
+    this.map.set(entry.key, entry)
+    appendFileSync(this.file, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
+  }
+}
+
+/** In-memory ledger (tests / ephemeral). */
+export class MemoryBrokerLedger implements BrokerLedger {
+  private readonly map = new Map<string, BrokerLedgerEntry>()
+  get(key: string): BrokerLedgerEntry | undefined {
+    return this.map.get(key)
+  }
+  put(entry: BrokerLedgerEntry): void {
+    this.map.set(entry.key, entry)
+  }
+}
+
+// ── deploy driver ────────────────────────────────────────────────────────────
+
+/** Executes the trusted production cutover for a validated sha. Injectable so
+ *  the default posture (auto-deploy off) and tests never touch prod. */
+export type DeployDriver = (sha: string, ctx: { log: Logger }) => Promise<BrokerResponse>
+
+export interface SelfhealBrokerOpts {
+  socketPath: string
+  /** Numeric gid ocheal belongs to; used to chown the socket so ocheal can
+   *  connect. When omitted, socket ACL is left to the caller (tests). */
+  ochealGid?: number
+  ledger?: BrokerLedger
+  actions?: Record<string, BrokerActionDef>
+  run?: CommandRunner
+  log?: Logger
+
+  // ── cutover deps ──
+  /** Canonical v5 checkout — the trusted repo for ancestry checks + object
+   *  import. Default /opt/openclaude/openclaude-v5-aurora. */
+  canonicalRepo?: string
+  /** Branch a candidate sha must descend from. Default feat/v5-aurora-rewrite. */
+  canonicalBranch?: string
+  /** Root of ocheal per-repair clones (object import source). Default
+   *  /home/ocheal/selfheal. */
+  ochealSelfhealRoot?: string
+  /** Root-owned dir holding signed verifications. */
+  verificationDir?: string
+  /** HMAC key to verify signed verifications. Default OC_SELFHEAL_VERIFY_HMAC. */
+  verifyKey?: string
+  /** When true (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1), a fully-gated cutover runs the
+   *  deploy driver. Default false ⇒ record + notify "pending release" only. */
+  autoDeployTier2?: boolean
+  /** Trusted deploy driver (only invoked when autoDeployTier2 and all gates
+   *  pass). */
+  deployDriver?: DeployDriver
+  /** Called when a gated cutover is held for manual release (default posture). */
+  notifyPendingRelease?: (info: { repairId: string; sha: string }) => void
+}
+
+export class SelfhealBroker {
+  private server: Server | null = null
+  private readonly log: Logger
+  private readonly ledger: BrokerLedger
+  private readonly actions: Record<string, BrokerActionDef>
+  private readonly run: CommandRunner
+  private readonly canonicalRepo: string
+  private readonly canonicalBranch: string
+  private readonly ochealSelfhealRoot: string
+  private readonly autoDeployTier2: boolean
+
+  constructor(private readonly opts: SelfhealBrokerOpts) {
+    this.log = opts.log ?? rootLog
+    this.ledger = opts.ledger ?? new MemoryBrokerLedger()
+    this.actions = opts.actions ?? TIER1_ACTIONS
+    this.run = opts.run ?? defaultCommandRunner
+    this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
+    this.canonicalBranch = opts.canonicalBranch ?? 'feat/v5-aurora-rewrite'
+    this.ochealSelfhealRoot = opts.ochealSelfhealRoot ?? '/home/ocheal/selfheal'
+    this.autoDeployTier2 = opts.autoDeployTier2 ?? process.env.OC_SELFHEAL_AUTO_DEPLOY_TIER2 === '1'
+  }
+
+  /** Start listening on the Unix socket and apply the ocheal ACL. */
+  async start(): Promise<void> {
+    const sock = this.opts.socketPath
+    if (existsSync(sock)) {
+      try {
+        unlinkSync(sock)
+      } catch {
+        /* stale socket removal best-effort */
+      }
+    }
+    mkdirSync(dirname(sock), { recursive: true })
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer((c) => this.onConnection(c))
+      server.on('error', reject)
+      server.listen(sock, () => {
+        try {
+          // ACL: rw for owner (root) + group. chown to root:ocheal-gid so only
+          // ocheal (and root) can connect; world has no access.
+          chmodSync(sock, 0o660)
+          if (this.opts.ochealGid !== undefined) {
+            chownSync(sock, process.getuid?.() ?? 0, this.opts.ochealGid)
+          }
+        } catch (err) {
+          this.log.warn('failed to apply broker socket ACL', { sock }, err)
+        }
+        this.server = server
+        this.log.info('selfheal broker listening', { sock, autoDeployTier2: this.autoDeployTier2 })
+        resolve()
+      })
+    })
+  }
+
+  async stop(): Promise<void> {
+    const server = this.server
+    if (!server) return
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    this.server = null
+  }
+
+  private onConnection(conn: Socket): void {
+    let buf = ''
+    let done = false
+    const finish = (resp: BrokerResponse) => {
+      if (done) return
+      done = true
+      try {
+        conn.write(`${JSON.stringify(resp)}\n`)
+      } catch {
+        /* client gone */
+      }
+      conn.end()
+    }
+    conn.setEncoding('utf-8')
+    conn.on('data', (chunk: string) => {
+      if (done) return
+      buf += chunk
+      if (buf.length > MAX_REQUEST_BYTES) {
+        finish({ ok: false, status: 'rejected', detail: { reason: 'request too large' } })
+        return
+      }
+      const nl = buf.indexOf('\n')
+      if (nl < 0) return
+      const line = buf.slice(0, nl)
+      let req: BrokerRequest
+      try {
+        req = JSON.parse(line) as BrokerRequest
+      } catch {
+        finish({ ok: false, status: 'rejected', detail: { reason: 'invalid JSON' } })
+        return
+      }
+      this.handleRequest(req).then(finish, (err) => {
+        this.log.error('broker request crashed', {}, err)
+        finish({ ok: false, status: 'error', detail: { reason: 'internal error' } })
+      })
+    })
+    conn.on('error', () => {
+      /* ignore — client disconnects are normal */
+    })
+  }
+
+  /**
+   * Core request handler — also the unit-test entry point (no socket needed).
+   * Applies idempotency, then routes Tier1 vs cutover.
+   */
+  async handleRequest(req: BrokerRequest): Promise<BrokerResponse> {
+    if (
+      !req ||
+      typeof req.repairId !== 'string' ||
+      req.repairId.length === 0 ||
+      typeof req.actionKind !== 'string' ||
+      req.actionKind.length === 0
+    ) {
+      return { ok: false, status: 'rejected', detail: { reason: 'malformed request' } }
+    }
+    if (!/^[A-Za-z0-9._:-]+$/.test(req.repairId)) {
+      return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
+    }
+
+    const key = `${req.repairId}:${req.actionKind}`
+    const prior = this.ledger.get(key)
+    if (prior) {
+      // Replay/duplicate: return the recorded outcome, never re-execute.
+      this.log.info('broker idempotent replay', { key, status: prior.response.status })
+      return { ...prior.response, detail: { ...prior.response.detail, replayed: true } }
+    }
+
+    const response =
+      req.actionKind === CUTOVER_KIND ? await this.handleCutover(req) : await this.handleTier1(req)
+
+    // Only record side-effecting outcomes so a transient validation failure can
+    // be retried, but an executed action / held cutover is never repeated.
+    if (this.isCommitted(response)) {
+      this.ledger.put({
+        key,
+        repairId: req.repairId,
+        actionKind: req.actionKind,
+        response,
+        recordedAt: new Date().toISOString(),
+      })
+    }
+    return response
+  }
+
+  private isCommitted(resp: BrokerResponse): boolean {
+    return resp.ok || resp.status === 'pending_release' || resp.status === 'deployed'
+  }
+
+  private async handleTier1(req: BrokerRequest): Promise<BrokerResponse> {
+    const action = this.actions[req.actionKind]
+    if (!action) {
+      this.audit(req, 'rejected', { reason: 'unknown action' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: `unknown action ${req.actionKind}` },
+      }
+    }
+    let params: unknown
+    try {
+      params = action.validate(req.params)
+    } catch (err) {
+      const reason = err instanceof BrokerActionError ? err.message : 'invalid params'
+      this.audit(req, 'rejected', { reason })
+      return { ok: false, status: 'rejected', detail: { reason } }
+    }
+    const result = await action.execute(params, { run: this.run, log: this.log })
+    this.audit(req, result.status, result.detail)
+    return result
+  }
+
+  private async handleCutover(req: BrokerRequest): Promise<BrokerResponse> {
+    const p = (req.params ?? {}) as Record<string, unknown>
+    const sha = typeof p.sha === 'string' ? p.sha : ''
+    const verificationRef = typeof p.verificationRef === 'string' ? p.verificationRef : ''
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      return this.rejectCutover(req, 'sha must be a full 40-char hex commit')
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(verificationRef)) {
+      return this.rejectCutover(req, 'invalid verificationRef')
+    }
+
+    // (a) Trust the ROOT-signed verification, never codex's claim.
+    let signed: SignedVerification
+    try {
+      signed = loadSignedVerification(verificationRef, this.opts.verificationDir)
+    } catch (err) {
+      return this.rejectCutover(req, `verification not found: ${(err as Error).message}`)
+    }
+    if (!verifySignature(signed, this.opts.verifyKey)) {
+      return this.rejectCutover(req, 'verification signature invalid')
+    }
+    const vr = signed.result
+    if (vr.repairId !== req.repairId) {
+      return this.rejectCutover(req, 'verification repairId mismatch')
+    }
+    if (vr.sha !== sha) {
+      return this.rejectCutover(req, 'verification sha mismatch')
+    }
+    if (!vr.allPassed) {
+      return this.rejectCutover(req, 'verification did not pass all layers')
+    }
+
+    // (b) Ancestry: sha must descend from the canonical branch (broker's own
+    //     check against the trusted canonical repo).
+    const ancestor = await this.checkCanonicalAncestry(req.repairId, sha)
+    if (!ancestor) {
+      return this.rejectCutover(req, 'sha is not a descendant of the canonical branch')
+    }
+
+    // (c) Auto-deploy gate. Default posture: hold for manual release.
+    if (!this.autoDeployTier2) {
+      this.audit(req, 'pending_release', { sha })
+      this.opts.notifyPendingRelease?.({ repairId: req.repairId, sha })
+      this.log.warn('cutover fully gated but AUTO_DEPLOY_TIER2=0 — held for manual release', {
+        repairId: req.repairId,
+        sha,
+      })
+      return {
+        ok: false,
+        status: 'pending_release',
+        detail: { sha, reason: 'awaiting one-click release (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0)' },
+      }
+    }
+
+    // (d) Trusted, self-held deploy under the global deploy flock.
+    const driver = this.opts.deployDriver
+    if (!driver) {
+      return this.rejectCutover(req, 'no trusted deploy driver configured')
+    }
+    const result = await driver(sha, { log: this.log })
+    this.audit(req, result.status, { sha, ...result.detail })
+    return result
+  }
+
+  private rejectCutover(req: BrokerRequest, reason: string): BrokerResponse {
+    this.audit(req, 'rejected', { reason })
+    this.log.warn('cutover rejected', { repairId: req.repairId, reason })
+    return { ok: false, status: 'rejected', detail: { reason } }
+  }
+
+  /**
+   * Import the candidate objects from the ocheal clone into the trusted
+   * canonical repo (without running the candidate repo's hooks), then check
+   * that the canonical branch is an ancestor of the sha.
+   */
+  private async checkCanonicalAncestry(repairId: string, sha: string): Promise<boolean> {
+    const clonePath = join(this.ochealSelfhealRoot, repairId)
+    // Import objects. `-c uploadpack.packObjectsHook=` best-effort neutralizes a
+    // hostile clone-side pack hook; block C hardening may switch to bundle
+    // import. Fetch failure ⇒ we cannot verify ancestry ⇒ fail closed.
+    const fetch = await this.run('git', [
+      '-C',
+      this.canonicalRepo,
+      '-c',
+      'uploadpack.packObjectsHook=',
+      'fetch',
+      '--no-tags',
+      '--no-recurse-submodules',
+      clonePath,
+      `+${sha}:refs/selfheal/import/${repairId}`,
+    ])
+    if (fetch.code !== 0) {
+      this.log.warn('cutover object import failed', {
+        repairId,
+        code: fetch.code,
+        stderr: fetch.stderr.slice(0, 500),
+      })
+      return false
+    }
+    const anc = await this.run('git', [
+      '-C',
+      this.canonicalRepo,
+      'merge-base',
+      '--is-ancestor',
+      this.canonicalBranch,
+      sha,
+    ])
+    // exit 0 ⇒ canonicalBranch IS an ancestor of sha (sha is a descendant).
+    return anc.code === 0
+  }
+
+  private audit(req: BrokerRequest, status: string, detail?: Record<string, unknown>): void {
+    this.log.info('selfheal broker action', {
+      repairId: req.repairId,
+      actionKind: req.actionKind,
+      status,
+      ...(detail ? { detail } : {}),
+    })
+  }
+}

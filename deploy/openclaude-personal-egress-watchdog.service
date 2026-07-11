@@ -1,0 +1,39 @@
+# OpenClaude 个人版 egress 节点看门狗 —— systemd 单元
+#
+# 装机(块C 执行):
+#   1) 把看门狗脚本放到 host 级 ops 目录(与既有 update-openclaude-egress-subscription.py 同处):
+#        cp /opt/openclaude/openclaude/ops/openclaude-personal-egress-watchdog.py \
+#           /opt/openclaude/ops/openclaude-personal-egress-watchdog.py
+#      (若走蓝绿/canonical,ExecStart 指向的路径按实际部署位置调整)
+#   2) 建 env 文件 /etc/openclaude/egress-watchdog.env(0600,填企微 webhook;阈值/路径可选覆盖):
+#        EGW_WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<机器人key>
+#        # 或只填 key:EGW_WECOM_KEY=<机器人key>  / 或从文件读:EGW_WECOM_KEY_FILE=/etc/openclaude/wecom-egress.key
+#   3) 前置条件:gateway 已把 egress 配置迁成主备 selector(含 experimental.clash_api 19096)。
+#      未迁移时看门狗会打印 "WAIT selector 未就绪" 空转等待,不误报、不崩溃,可安全先 enable。
+#   4) 安装两个单元并启用(本单元 + 下面的 OnFailure 通知单元 openclaude-personal-egress-watchdog-fail.service):
+#        cp deploy/openclaude-personal-egress-watchdog*.service /etc/systemd/system/
+#        systemctl daemon-reload
+#        systemctl enable --now openclaude-personal-egress-watchdog.service
+#
+# StateDirectory=openclaude-egress 会创建 /var/lib/openclaude-egress(root 属),
+# 同时承载看门狗 state.json 与 gateway 生成的 clash.db(cache_file),两者共用此目录。
+
+[Unit]
+Description=OpenClaude 个人版 egress 节点看门狗(主备 selector 异常自动切换)
+After=network-online.target openclaude-egress.service
+Wants=network-online.target
+# 看门狗"本体"异常退出 → 企微通知(与它守护的 egress 节点告警区分开)
+OnFailure=openclaude-personal-egress-watchdog-fail.service
+
+[Service]
+Type=simple
+# 企微 webhook + 可选阈值/路径覆盖(EGW_* 全部有默认值,此文件可缺省)
+EnvironmentFile=-/etc/openclaude/egress-watchdog.env
+ExecStart=/usr/bin/python3 /opt/openclaude/ops/openclaude-personal-egress-watchdog.py
+Restart=always
+RestartSec=5
+StateDirectory=openclaude-egress
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

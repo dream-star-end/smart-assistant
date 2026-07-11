@@ -1,0 +1,14 @@
+# OnFailure 通知单元:openclaude-personal-egress-watchdog.service 异常退出时触发。
+# 复用看门狗脚本自带的 --notify-fail 入口(同一套企微 webhook 解析逻辑,避免在
+# systemd ExecStart 里手写 curl/JSON 转义)。企微未配置则静默(脚本内只记日志)。
+#
+# 装法:随主单元一起 cp 到 /etc/systemd/system/ 并 daemon-reload(无需 enable,
+# 由主单元的 OnFailure= 拉起)。
+
+[Unit]
+Description=OpenClaude 个人版 egress 看门狗异常通知(OnFailure → 企微)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/openclaude/egress-watchdog.env
+ExecStart=/usr/bin/python3 /opt/openclaude/ops/openclaude-personal-egress-watchdog.py --notify-fail
