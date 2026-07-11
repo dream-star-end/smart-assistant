@@ -313,6 +313,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
+| AgentGate 错误 message 直显 | useAgentGate/AgentGate 仍 `e.message` 直显(裸露面窄:仅 getAgentStatus 网络/未知错误);因 AgentGate 有独立 requestId 展示行,直接换 apiErrorMessage 会双显追踪号,需连动渲染一并设计(2026-07-11 全站错误文案收口批有意跳过) | 下次改 AgentGate 时连动收口 |
+| gateway 域错误信封无 code | 会话/cron/memory/skills 容器代理路径返 `{error:"<string>"}` 无结构化 code,前端 apiErrorMessage 只能靠 CJK 启发式判"是否用户向文案";另有伪 code 当 message(not_in_allowlist)与用户可触发的 422 英文校验(slug required 等) | 迁 `{error:{code,message}}` 结构化信封时,前端同批改走 code 表、删 CJK 启发式 |
 | agent 发布胶水双份 | 技能发布已收口 prepareSkillPublish 单一权威(166e9ecc,浏览器路由+容器内部代理同源,bundle/benchmark/逐文件扫描对齐);**agent 发布**的胶水校验(字段序/humanMeta/metaScan → validateAgentManifest)在 marketplaceRoutes 与 internalMarketplaceAgent 仍各一份,本批仅对齐 visibility 剔除清单未收口 | 下次改 agent 发布逻辑时(改一处必须同步另一处,或顺手收口成 prepareAgentPublish) |
 | ~~会话归档孤儿清理~~ **已偿还**(2026-07-10,feat/v5-concurrency-guards) | deleteClientSession 软删同事务级联清 archive_chunks/archived_ids | — |
 | admin 归档 offset 深翻 O(skip/200) | admin sessions 视图 offset 分页越过尾巴走归档 cursor walk,深 offset 重走前缀页;单人低频诊断可接受 | admin 前端改用与用户面 /archive 一致的 cursor 翻页 |
