@@ -157,6 +157,10 @@ export const CLOSE_BRIDGE = {
   PRODUCT_POLICY: 4507,
   /** GPT/Codex 环境被回收/重建,提示刷新重试。 */
   ENV_RECYCLED: 4508,
+  /** 服务重启/发版(shutdown → registry.closeAll)。**瞬态**:前端收此码后静默自动重连,
+   *  hello/resume 从容器 ring 续传,不弹错、不进会话正文(web-react pure.ts classifyClose
+   *  同步认识此码,两端语义务必同改)。不要复用 4505——那是"连接数超限"的 kick 语义。 */
+  SERVER_RESTART: 4509,
 } as const;
 
 /** 入站 / 出站 帧的最大字节数(单帧)。
@@ -1574,14 +1578,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
 
-    // 注册到 registry,超额会踢老的
+    // 注册到 registry,超额会踢老的。连接态信号只走 close code,**不发 turn 级 error 帧**
+    // (曾经 kick/shutdown 共用"error 帧 + 4505",部署一次=全线会话钉红卡+误报连接数超限;
+    // close code 语义拆分后前端按码分流:4505=提示关多余标签页,4509=静默重连+resume 续传)。
     const conn: Conn = {
       id: connId,
       user_id: uid.toString(),
       opened_at: startedAt,
-      close: (reason) => {
-        sendErrorFrame(userWs, "ERR_CONN_KICKED", reason);
-        try { userWs.close(CLOSE_BRIDGE.TOO_MANY_CONNECTIONS, "too_many_connections"); } catch { /* */ }
+      close: (_reason, cause) => {
+        if (cause === "shutdown") {
+          try { userWs.close(CLOSE_BRIDGE.SERVER_RESTART, "server_restart"); } catch { /* */ }
+        } else {
+          try { userWs.close(CLOSE_BRIDGE.TOO_MANY_CONNECTIONS, "too_many_connections"); } catch { /* */ }
+        }
       },
     };
     const { unregister } = registry.register(conn);
@@ -2785,7 +2794,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // → 暂存到 ws lib 的 send buffer 里 = 不可控。这里直接 buffer 起来,
         // OPEN 后冲刷;若超 buffer 上限 → backpressure
         if (bufferedUC + len > maxBufferedBytes) {
-          sendErrorFrame(userWs, "ERR_BACKPRESSURE", "agent slow");
+          // 背压=连接态瞬态信号:只走 close code,不发 turn 级 error 帧(重连+resume 自愈,
+          // 不在会话正文钉卡)。
           try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
           // backpressure → force final;一般无 inflight,即便有也异常态不 drain
           cleanup("backpressure", true);
@@ -3247,7 +3257,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
           buffered: userWs.bufferedAmount, len,
         });
-        sendErrorFrame(userWs, "ERR_BACKPRESSURE", "client slow");
+        // 背压=连接态瞬态信号:只走 close code,不发 turn 级 error 帧(同 agent-slow 侧)。
         try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
         // user-WS 不可写但 container 仍在跑 codex turn → 走 drain 让 billing 落账
         // (broadcast 会 no-op 因 user-WS 已关,但 ledger debit 必须完成)

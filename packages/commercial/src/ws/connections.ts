@@ -12,8 +12,15 @@
 
 export const DEFAULT_MAX_PER_USER = 3;
 
+/** 连接被关闭的原因分类——决定 ws close code 与前端 UX 语义,**绝不合流**:
+ *   - 'kick'    :同用户超额,踢最老连接(4505,前端提示关闭多余标签页);
+ *   - 'shutdown':服务重启/发版(4509,瞬态,前端静默自动重连+resume 续传,不打扰用户)。
+ *  历史教训:两者曾共用一条 close 路径(error 帧 + 4505),导致每次部署所有在线会话
+ *  被钉一张"连接已断开,刷新页面"红卡 + 误报"连接数超限"。 */
+export type ConnCloseCause = "kick" | "shutdown";
+
 /**
- * 一个已注册的连接句柄。`close` 由调用方传入;本模块在"被 kick"时调用它。
+ * 一个已注册的连接句柄。`close` 由调用方传入;本模块在"被 kick"/"shutdown"时调用它。
  * `opened_at` 用来在超限时挑"最老的一个"踢出。
  */
 export interface Conn {
@@ -21,8 +28,9 @@ export interface Conn {
   id: string;
   user_id: bigint | string;
   opened_at: number;
-  /** 被 kick 时调用;应发送一个 error frame 然后 close(code=1008)。幂等。 */
-  close: (reason: string) => void;
+  /** 被 kick / shutdown 时调用;实现应按 cause 选 close code(kick=4505 / shutdown=4509),
+   *  **不发 turn 级 error 帧**(连接态信号走 close code,不进会话正文)。幂等。 */
+  close: (reason: string, cause: ConnCloseCause) => void;
 }
 
 export interface RegisterResult {
@@ -72,7 +80,7 @@ export class ConnectionRegistry {
     // 非阻塞的。若 close 抛出我们吞掉(不能让 kick 的副作用污染 register 路径)。
     for (const v of evicted) {
       try {
-        v.close("kicked: too many concurrent connections for this user (max=" + this.max + ")");
+        v.close("kicked: too many concurrent connections for this user (max=" + this.max + ")", "kick");
       } catch {
         /* close 实现问题,不是我们的错 */
       }
@@ -104,11 +112,12 @@ export class ConnectionRegistry {
     return n;
   }
 
-  /** 清空。shutdown 时调用(给每个 conn 发 close)。 */
+  /** 清空。服务重启/发版时调用(给每个 conn 发 cause='shutdown' 的 close——
+   *  瞬态语义,前端自动重连,**不是** kick)。 */
   closeAll(reason = "server shutting down"): void {
     for (const list of this.byUser.values()) {
       for (const c of list) {
-        try { c.close(reason); } catch { /* */ }
+        try { c.close(reason, "shutdown"); } catch { /* */ }
       }
     }
     this.byUser.clear();

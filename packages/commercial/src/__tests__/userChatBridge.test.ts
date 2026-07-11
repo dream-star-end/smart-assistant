@@ -488,6 +488,14 @@ describe("userChatBridge — per-user concurrency", () => {
     await c2;
 
     const ws1Closed = waitClose(ws1);
+    // 契约:kick 只走 close code(4505),不发 turn 级 error 帧(不进会话正文)。
+    const ws1ErrorFrames: string[] = [];
+    ws1.on("message", (data) => {
+      const s = typeof data === "string" ? data : data.toString();
+      try {
+        if (JSON.parse(s)?.type === "error") ws1ErrorFrames.push(s);
+      } catch { /* 非 JSON 帧忽略 */ }
+    });
 
     const c3 = waitNextContainerSocket(rig);
     const ws3 = openClient(rig.gatewayPort, token);
@@ -495,8 +503,10 @@ describe("userChatBridge — per-user concurrency", () => {
     await c3;
 
     const close1 = await ws1Closed;
-    assert.equal(close1.code, CLOSE_BRIDGE.POLICY,
-      "ws1 应该被 kick(收 1008)");
+    assert.equal(close1.code, CLOSE_BRIDGE.TOO_MANY_CONNECTIONS,
+      "ws1 应该被 kick(收 4505,连接数超限语义)");
+    assert.equal(close1.reason, "too_many_connections");
+    assert.deepEqual(ws1ErrorFrames, [], "kick 不应发 turn 级 error 帧");
     assert.notEqual(ws2.readyState, WebSocket.CLOSED);
     assert.notEqual(ws3.readyState, WebSocket.CLOSED);
 
@@ -510,7 +520,7 @@ describe("userChatBridge — per-user concurrency", () => {
 // ------- shutdown ---------------------------------------------------------
 
 describe("userChatBridge — shutdown", () => {
-  test("shutdown 关掉所有活跃连接", async () => {
+  test("shutdown 关掉所有活跃连接:4509 瞬态语义,无 error 帧(部署不打扰用户)", async () => {
     const rig = await startRig();
     const token = await makeJwt("400");
     const cP = waitNextContainerSocket(rig);
@@ -518,10 +528,23 @@ describe("userChatBridge — shutdown", () => {
     await new Promise<void>((r) => ws.once("open", () => r()));
     await cP;
 
+    // 契约:发版/重启只走 close code(4509 SERVER_RESTART),不发 turn 级 error 帧——
+    // 前端据此静默自动重连+resume 续传,会话正文零痕迹(历史上曾误用 error 帧+4505,
+    // 每次部署=全线会话钉"连接已断开"红卡+误报连接数超限)。
+    const errorFrames: string[] = [];
+    ws.on("message", (data) => {
+      const s = typeof data === "string" ? data : data.toString();
+      try {
+        if (JSON.parse(s)?.type === "error") errorFrames.push(s);
+      } catch { /* 非 JSON 帧忽略 */ }
+    });
+
     const closeP = waitClose(ws);
     await rig.bridge.shutdown();
     const close = await closeP;
-    assert.equal(close.code, CLOSE_BRIDGE.POLICY);
+    assert.equal(close.code, CLOSE_BRIDGE.SERVER_RESTART);
+    assert.equal(close.reason, "server_restart");
+    assert.deepEqual(errorFrames, [], "shutdown 不应发 turn 级 error 帧");
 
     await new Promise<void>((r) => rig.containerWss.close(() => r()));
     await new Promise<void>((r) => rig.gateway.close(() => r()));
