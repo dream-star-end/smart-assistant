@@ -203,6 +203,11 @@ import {
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
 } from './v3MarketplaceRelay.js'
+import {
+  buildSkillTrainCompleteNotice,
+  decideSkillLocalRelay,
+  SKILL_LOCAL_RELAY_PREFIX,
+} from './ocSkillLocalRelay.js'
 import { startToolFailureReporter } from './v3ToolFailureReporter.js'
 import {
   fetchUserSkillFeedbackRefs,
@@ -2329,6 +2334,40 @@ export class Gateway {
           try { res.end() } catch {}
         }
       })
+      return
+    }
+
+    // oc-skill 对话内训练/评测生成:容器内 CLI(回环)打本 gateway 自己的 train/eval-gen
+    // API。Codex 子进程 env 被擦拿不到 accessToken,故走这条 loopback-only 路径映射到既有
+    // /api 处理器。身份仍走 getUserId(回环无 JWT → 'default',与 master 代理剥掉
+    // auth/cookie 后的前端请求同一分区 → CLI 起的训练在管理中心可见)。relay 只做「回环 +
+    // 路径匹配」,可写性门/生成-评测互斥/owner/method 一律由被派发的处理器权威执行。
+    if (url.pathname === SKILL_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${SKILL_LOCAL_RELAY_PREFIX}/`)) {
+      const decision = decideSkillLocalRelay(url.pathname, req.socket.remoteAddress)
+      if (decision.action === 'forbidden') {
+        this.sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'skill relay is loopback-only' } })
+        return
+      }
+      if (decision.action === 'not-found') {
+        this.sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown skill relay path' } })
+        return
+      }
+      const p = decision.param
+      const guarded = (pr: Promise<void>) => pr.catch((err) => this.sendInternalError(res, err))
+      switch (decision.route) {
+        case 'train-start':
+          guarded(this._handleSkillTrainStart(req, res, p))
+          return
+        case 'train-status':
+          guarded(this._handleSkillTrainRun(req, res, p))
+          return
+        case 'evalgen-start':
+          guarded(this._handleSkillEvalGenStart(req, res, p))
+          return
+        case 'evalgen-status':
+          guarded(this._handleSkillEvalGenStatus(req, res, p))
+          return
+      }
       return
     }
 
@@ -6465,6 +6504,14 @@ export class Gateway {
         .listDrafts(runId)
         .then(async (d) => {
           await this.skillTrainJobs.finalize(runId, d.length, Date.now())
+          // 训练完成 → 写一条站内信(对话内发起训练的用户多半已离开管理中心;前端发起的
+          // 也可能已切走)。draft>0 报草稿数并引导看 diff,draft=0 明确「未产生草稿」。
+          // fail-open:postInboxMessage 本就永不抛(缺 master env → no-op),这里再挂一层
+          // warn,通知失败绝不影响 finalize / autoEval。
+          const doneRun = this.skillTrainJobs.get(runId)
+          void postInboxMessage(
+            buildSkillTrainCompleteNotice(doneRun?.skillName ?? null, d.length),
+          ).catch((err) => this.log.warn('skill train complete inbox notify failed', undefined, err))
           // 评测门(P1):产出草稿且用户启动时同意 autoEval → 自动对目标技能草稿跑
           // draft vs 现版评测。成本已在训练确认对话框中披露(autoEval 开关 + 估算)。
           if (d.length > 0) void this._maybeAutoEvalTrainRun(runId)

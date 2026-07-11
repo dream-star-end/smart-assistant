@@ -216,6 +216,10 @@ COPY --chown=root:root ./runtime/oc-browser.sh /usr/local/bin/oc-browser
 # oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
 # master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
 COPY --chown=root:root ./runtime/oc-market.sh /usr/local/bin/oc-market
+# oc-skill: AI-driven, conversation-triggered skill training / eval-case generation
+# over THIS container's own gateway loopback (/internal/v3/skill-local/*); documented
+# by the `skill-management` baseline skill.
+COPY --chown=root:root ./runtime/oc-skill.sh /usr/local/bin/oc-skill
 # oc-lit / oc-cite / oc-ingest / oc-litrag: 科研 agent 能力(多源检索 + 引用接地门禁 +
 # 文档解析 + quote-first RAG),走 master /v3/research/*(平台持 key + 铸造证据权威)。
 # 文档见对应 baseline skill。
@@ -248,7 +252,7 @@ COPY --chown=root:root ./runtime/oc-diagram.sh /usr/local/bin/oc-diagram
 # 子命令已退役(调用只打印迁移提示)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
 COPY --chown=root:root ./runtime/oc-memory.sh /usr/local/bin/oc-memory
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
