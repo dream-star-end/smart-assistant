@@ -15,7 +15,7 @@ import type { RiskFlag } from './skillScanner.js'
 /** Artifact kind. The marketplace is generalized over this discriminator; the
  *  lifecycle (publish→scan→review→approve→install→sync→revoke) is shared, only
  *  the scanner / install-applier / detail-renderer vary by kind. */
-export type ArtifactKind = 'skill' | 'agent'
+export type ArtifactKind = 'skill' | 'agent' | 'connector'
 
 export class MarketplaceError extends Error {
   constructor(
