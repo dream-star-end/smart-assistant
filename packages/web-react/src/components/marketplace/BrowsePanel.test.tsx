@@ -145,3 +145,56 @@ test("卡片:rating=null/缺省(服务端已按样本阈值收口)→ 不渲染�
   await screen.findByText("无评分");
   expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
 });
+
+test("AI 导购入口:浏览态(空查询)不渲染操作行,不挤占分区视图", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} onAskAiInChat={() => {}} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+  expect(screen.queryByRole("button", { name: /让 AI 帮我找并装好/ })).not.toBeInTheDocument();
+});
+
+test("AI 导购入口:有查询词 → 结果区顶部出操作行,点击回调带预填(含查询词)", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [card("t", { name: "翻译技能", category: "office-docs" })],
+    method: "keyword",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  const onAsk = vi.fn();
+
+  render(<BrowsePanel auth={auth} onAskAiInChat={onAsk} />);
+  fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "翻译" } });
+
+  const btn = await screen.findByRole("button", { name: /让 AI 帮我找并装好/ });
+  fireEvent.click(btn);
+  expect(onAsk).toHaveBeenCalledTimes(1);
+  expect(onAsk.mock.calls[0][0]).toContain("我想要:翻译");
+});
+
+test("AI 导购入口:查询无结果(空态)仍给操作行(AI 可现场解决)", async () => {
+  searchMarketplace.mockResolvedValue({ results: [], method: "keyword" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  const onAsk = vi.fn();
+
+  render(<BrowsePanel auth={auth} onAskAiInChat={onAsk} />);
+  fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "不存在的东西" } });
+
+  const btn = await screen.findByRole("button", { name: /让 AI 帮我找并装好/ });
+  expect(screen.getByText("没有匹配的技能")).toBeInTheDocument();
+  fireEvent.click(btn);
+  expect(onAsk.mock.calls[0][0]).toContain("不存在的东西");
+});
+
+test("AI 导购入口:未传 onAskAiInChat → 即便有查询词也不渲染操作行", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [card("t", { name: "翻译技能", category: "office-docs" })],
+    method: "keyword",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "翻译" } });
+  await screen.findByText("翻译技能");
+  expect(screen.queryByRole("button", { name: /让 AI 帮我找并装好/ })).not.toBeInTheDocument();
+});

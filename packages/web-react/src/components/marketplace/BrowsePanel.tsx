@@ -15,11 +15,12 @@ import {
   benchmarkBadgeLabel,
   formatInstallCount,
   groupCardsByCategory,
+  marketAskAiPrefill,
   updateAvailable,
 } from "../../lib/marketplace";
 import { cn } from "../../lib/utils";
 import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
-import { Alert, Badge, EmptyState, Input, Skeleton } from "../ui";
+import { Alert, Badge, Button, EmptyState, Input, Skeleton } from "../ui";
 import { DetailModal } from "./DetailModal";
 
 /** 「未分类」兜底分区/筛选片的合成 id（不与任何 taxonomy id 冲突）。 */
@@ -169,10 +170,13 @@ function Section({
 export function BrowsePanel({
   auth,
   kind = "skill",
+  onAskAiInChat,
 }: {
   auth: AuthSession;
   /** 仅展示该类目。M2 默认且仅 'skill'（agent 投递在 M3，M4 才开 agent Tab）。 */
   kind?: "skill" | "agent";
+  /** AI 导购入口(批3):有查询词时结果区顶部「让 AI 帮我找并装好」;缺省则不渲染入口。 */
+  onAskAiInChat?: (text: string) => void;
 }) {
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
@@ -296,6 +300,23 @@ export function BrowsePanel({
         </div>
       )}
 
+      {/* AI 导购入口:仅搜索态(有查询词)渲染一条轻量操作行——不挤占卡片网格空间,
+          浏览/分区态不出现。有结果时给「换 AI 代劳」、空结果时 AI 可现场解决。 */}
+      {onAskAiInChat && debouncedQ && (
+        <div className="mx-4 mb-2.5 flex flex-wrap items-center gap-2.5 rounded-xl border border-accent/30 bg-accent-soft/40 px-3 py-2.5">
+          <Button
+            size="sm"
+            variant="accent"
+            onClick={() => onAskAiInChat(marketAskAiPrefill(debouncedQ))}
+          >
+            🤖 让 AI 帮我找并装好
+          </Button>
+          <span className="min-w-0 flex-1 text-[12px] leading-snug text-muted">
+            AI 会在对话里对比适配度，经你确认后安装。
+          </span>
+        </div>
+      )}
+
       {loading ? (
         <ul className="grid grid-cols-1 gap-2.5 px-4 pb-5 sm:grid-cols-2" aria-hidden="true">
           {Array.from({ length: 4 }, (_, i) => (
@@ -374,6 +395,7 @@ export function BrowsePanel({
         installed={active ? installed.get(active) : undefined}
         onClose={() => setActive(null)}
         onInstalled={onInstalled}
+        onAskAiInChat={onAskAiInChat}
       />
     </div>
   );

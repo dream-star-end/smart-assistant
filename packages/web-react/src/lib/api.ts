@@ -1949,6 +1949,23 @@ export const api = {
       ),
     ),
 
+  /**
+   * 设置/取消精选（POST /api/admin/marketplace/:slug/featured；requireAdminVerifyDb）。
+   * featuredRank：1..9999 精选排序（越小越靠前）；null=取消精选。listing 不存在/非
+   * active 时后端返 404/409，上层据此提示。服务端契约见批3简报（并行 agent 实现）。
+   */
+  setMarketplaceFeatured: (a: AuthSession, slug: string, featuredRank: number | null) =>
+    jsonOrThrow<{ ok: boolean; slug: string; featuredRank: number | null }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/admin/marketplace/${encodeURIComponent(slug)}/featured`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ featuredRank }),
+        }),
+      ),
+    ),
+
   // ── 站内信（inbox，用户侧） ───────────────────────────────────────────
 
   /** 拉站内信列表 + 未读数（GET /api/me/messages，Bearer）。unreadOnly 仅返未读。 */

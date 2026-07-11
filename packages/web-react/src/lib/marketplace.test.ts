@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   benchmarkBadgeLabel,
   benchmarkSuspect,
+  bundleHasEvals,
   formatInstallCount,
   groupCardsByCategory,
+  marketAskAiPrefill,
+  marketTrySkillPrefill,
+  sortFeaturedListings,
   suggestSlug,
   updateAvailable,
   validateHumanMeta,
@@ -182,5 +186,65 @@ describe('benchmarkSuspect (审核黄牌判定)', () => {
 
   it('withPassRate < 0.5(绝对通过率过低)→ true,即便有正增益', () => {
     expect(benchmarkSuspect({ withoutPassRate: 0.1, withPassRate: 0.4, cases: 3 })).toBe(true)
+  })
+})
+
+describe('marketAskAiPrefill / marketTrySkillPrefill (AI 导购预填文案)', () => {
+  it('marketAskAiPrefill 带上查询词并要求经确认后再安装(不 autoSend 的语义)', () => {
+    const out = marketAskAiPrefill('把中文论文翻译成地道英文')
+    expect(out).toContain('我想要:把中文论文翻译成地道英文')
+    expect(out).toContain('oc-market')
+    expect(out).toContain('经我确认后再安装')
+  })
+
+  it('marketTrySkillPrefill 带上名称与 slug,要求装好并给上手示例', () => {
+    const out = marketTrySkillPrefill('学术翻译', 'academic-translate')
+    expect(out).toContain('「学术翻译」')
+    expect(out).toContain('slug: academic-translate')
+    expect(out).toContain('上手示例')
+  })
+})
+
+describe('bundleHasEvals (审核面「带 evals」徽章判定)', () => {
+  it('无 bundle / 空 bundle → false', () => {
+    expect(bundleHasEvals(undefined)).toBe(false)
+    expect(bundleHasEvals(null)).toBe(false)
+    expect(bundleHasEvals({})).toBe(false)
+  })
+
+  it('含 evals/ 路径或裸 evals → true', () => {
+    expect(bundleHasEvals({ 'evals/evals.json': '{}' })).toBe(true)
+    expect(bundleHasEvals({ evals: '{}' })).toBe(true)
+  })
+
+  it('只含其它附属文件 → false(不误判)', () => {
+    expect(bundleHasEvals({ 'references/a.md': 'x', 'scripts/run.sh': 'y' })).toBe(false)
+    // 名字里含 evals 但非 evals 目录不算(如 my-evals-notes.md)
+    expect(bundleHasEvals({ 'my-evals-notes.md': 'x' })).toBe(false)
+  })
+})
+
+describe('sortFeaturedListings (精选管理排序单一权威)', () => {
+  const card = (
+    slug: string,
+    over: Partial<MarketplaceCard> = {},
+  ): MarketplaceCard => ({ slug, kind: 'skill', name: slug, description: '', tags: [], ...over })
+
+  it('精选按 rank 升序在前,非精选按 users30d 降序在后', () => {
+    const out = sortFeaturedListings([
+      card('coldNonFeat', { users30d: 2 }),
+      card('featB', { featuredRank: 5 }),
+      card('hotNonFeat', { users30d: 40 }),
+      card('featA', { featuredRank: 1 }),
+    ])
+    expect(out.map((c) => c.slug)).toEqual(['featA', 'featB', 'hotNonFeat', 'coldNonFeat'])
+  })
+
+  it('同 rank / 同使用数以 slug 稳定兜底,且不修改入参', () => {
+    const input = [card('b', { users30d: 3 }), card('a', { users30d: 3 })]
+    const out = sortFeaturedListings(input)
+    expect(out.map((c) => c.slug)).toEqual(['a', 'b'])
+    // 纯函数:不改入参顺序
+    expect(input.map((c) => c.slug)).toEqual(['b', 'a'])
   })
 })

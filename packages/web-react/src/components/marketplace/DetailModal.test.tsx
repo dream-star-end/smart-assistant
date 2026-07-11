@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceDetail, MarketplaceMyAgent } from "../../lib/types";
 
@@ -107,6 +107,38 @@ test("信号徽章:usage30d/users30d/安装数/rating 都渲染,rating 文案诚
   expect(badge).toHaveAttribute("title", "来自 9 次使用反馈");
   expect(screen.getByText("来自 9 次使用反馈")).toBeInTheDocument();
   expect(screen.queryByText(/好评率/)).not.toBeInTheDocument();
+});
+
+test("footer「在对话中试用」→ 回调带预填(含名称与 slug),供 AI 装好并给示例", async () => {
+  getMarketplaceDetail.mockResolvedValue(detail());
+  listMyAgents.mockResolvedValue([]);
+  const onAsk = vi.fn();
+
+  render(
+    <DetailModal
+      slug="academic-translate"
+      auth={auth}
+      onClose={() => {}}
+      onInstalled={() => {}}
+      onAskAiInChat={onAsk}
+    />,
+  );
+
+  const btn = await screen.findByRole("button", { name: "在对话中试用" });
+  fireEvent.click(btn);
+  expect(onAsk).toHaveBeenCalledTimes(1);
+  const text = onAsk.mock.calls[0][0] as string;
+  expect(text).toContain("「学术翻译」");
+  expect(text).toContain("slug: academic-translate");
+});
+
+test("未传 onAskAiInChat → 不渲染「在对话中试用」按钮", async () => {
+  getMarketplaceDetail.mockResolvedValue(detail());
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+  await screen.findByText("适用场景");
+  expect(screen.queryByRole("button", { name: "在对话中试用" })).not.toBeInTheDocument();
 });
 
 test("信号徽章:旧后端缺字段 → 不渲染 usage/rating,仅保留安装数(优雅降级)", async () => {

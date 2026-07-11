@@ -41,6 +41,7 @@ import {
   reviewVersion,
   reviewVersions,
   revokeListing,
+  setListingFeaturedRank,
   updateInstalledAgentScope,
   withdrawPublishVersion,
 } from '../marketplace/marketplaceDb.js'
@@ -380,14 +381,59 @@ describe('marketplaceDb (integ)', () => {
     const c = await publishSkillVersion(buildPublish('plain-c', owner))
     await reviewVersion({ versionId: c.versionId, reviewerUserId: admin, approve: true })
 
-    // B 有 1 个活跃安装(热度高于 C);A 设为平台精选(featured_rank=1,只由运维脚本写)。
+    // B 有 1 个活跃安装(热度高于 C);A 经 setListingFeaturedRank 设为平台精选(featured_rank=1)。
     await installApprovedVersion({ userId: installer, versionId: b.versionId })
-    await query("UPDATE marketplace_skill_listings SET featured_rank = 1 WHERE slug = 'feat-a'")
+    await setListingFeaturedRank('feat-a', 1)
 
     const order = (await listApprovedForSearch()).map((c2) => c2.slug)
     assert.deepEqual(order, ['feat-a', 'inst-b', 'plain-c'])
     const featA = (await listApprovedForSearch()).find((c2) => c2.slug === 'feat-a')
     assert.equal(featA?.featuredRank, 1)
+  })
+
+  test('setListingFeaturedRank:设置/取消/非 active 拒绝/不存在拒绝', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('feat-set-owner@x.com')
+    const admin = await createUser('feat-set-admin@x.com')
+    await publishApproved('feat-set', owner, admin)
+
+    // 默认非精选。
+    assert.equal(
+      (await listApprovedForSearch()).find((c) => c.slug === 'feat-set')?.featuredRank,
+      null,
+    )
+    // 设置 → 目录透出该 rank。
+    await setListingFeaturedRank('feat-set', 3)
+    assert.equal(
+      (await listApprovedForSearch()).find((c) => c.slug === 'feat-set')?.featuredRank,
+      3,
+    )
+    // 取消(null)→ 回到非精选。
+    await setListingFeaturedRank('feat-set', null)
+    assert.equal(
+      (await listApprovedForSearch()).find((c) => c.slug === 'feat-set')?.featuredRank,
+      null,
+    )
+
+    // 不存在的 slug → VERSION_NOT_FOUND。
+    await expectMarketplaceError(() => setListingFeaturedRank('no-such-slug', 1), 'VERSION_NOT_FOUND')
+
+    // 非 active(admin revoke 后 state='revoked')→ LISTING_REVOKED,拒绝设为精选。
+    await revokeListing('feat-set', 'kill-switch')
+    await expectMarketplaceError(() => setListingFeaturedRank('feat-set', 1), 'LISTING_REVOKED')
+
+    // rank 越界(契约违背)→ 普通 Error(非 MarketplaceError,路由层另有 400 前置校验)。
+    const owner2 = await createUser('feat-range-owner@x.com')
+    const admin2 = await createUser('feat-range-admin@x.com')
+    await publishApproved('feat-range', owner2, admin2)
+    await assert.rejects(
+      () => setListingFeaturedRank('feat-range', 0),
+      (e: unknown) => e instanceof Error && !(e instanceof MarketplaceError),
+    )
+    await assert.rejects(
+      () => setListingFeaturedRank('feat-range', 10000),
+      (e: unknown) => e instanceof Error && !(e instanceof MarketplaceError),
+    )
   })
 
   test('batch review approves multiple pending versions', async (t) => {
