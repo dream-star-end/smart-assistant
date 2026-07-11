@@ -1,7 +1,7 @@
 import { Monitor, Moon, Sun, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import type { Theme } from "../../hooks/useTheme";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, PublicModel } from "../../lib/types";
 import {
   initialModelFromPreferences,
@@ -80,7 +80,7 @@ export function PreferencesTab({
     try {
       await onPatch(p);
     } catch (e) {
-      setErr((e as Error).message || "保存失败");
+      setErr(apiErrorMessage(e, "保存失败"));
     }
   }
 

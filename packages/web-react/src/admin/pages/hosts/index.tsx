@@ -10,7 +10,7 @@ import {
   barConfig,
   useChart,
 } from '../../components'
-import { ApiError, adminGet, adminSend } from '../../lib/adminApi'
+import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { useAdminPoll } from '../../lib/useAdminPoll'
 import { getAdminPage } from '../../registry'
 import { useAdminRoute } from '../../router'
@@ -95,7 +95,7 @@ export default function HostsPage() {
       toast(opts.okToast, 'success')
       refreshAll()
     } catch (e) {
-      toast(`失败：${e instanceof ApiError ? e.message : String(e)}`, 'error')
+      toast(`失败：${apiErrorMessage(e, '请求失败')}`, 'error')
     }
   }
 
@@ -202,7 +202,7 @@ export default function HostsPage() {
       {list.error ? (
         <SectionCard title="虚机列表">
           <p className="py-6 text-center text-[13px] text-danger">
-            加载失败：{list.error instanceof ApiError ? list.error.message : String(list.error)}
+            加载失败：{apiErrorMessage(list.error, '加载失败')}
           </p>
         </SectionCard>
       ) : list.loading && rows.length === 0 ? (

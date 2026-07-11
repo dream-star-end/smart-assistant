@@ -1,7 +1,7 @@
 import { MARKETPLACE_CATEGORIES } from "@openclaude/protocol";
 import { CheckCircle2, ChevronRight, Loader2, Plus, Sparkles, Upload, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api, ApiError, apiErrorMessage } from "../../lib/api";
 import {
   type HumanMetaDraft,
   suggestSlug,
@@ -411,7 +411,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setErr("发布被安全扫描拦截，请按下面的提示修正后重试。");
         }
       } else {
-        setErr(e instanceof ApiError ? e.message : (e as Error).message || "发布失败");
+        setErr(apiErrorMessage(e, "发布失败"));
       }
     } finally {
       setSubmitting(false);
@@ -716,10 +716,10 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setFlags(b.riskFlags);
           setErr("人设被安全扫描拦截，请修正后重试。");
         } else {
-          setErr(e.message);
+          setErr(apiErrorMessage(e, "发布失败"));
         }
       } else {
-        setErr(e instanceof ApiError ? e.message : (e as Error).message || "发布失败");
+        setErr(apiErrorMessage(e, "发布失败"));
       }
     } finally {
       setSubmitting(false);
@@ -972,7 +972,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
       await api.withdrawMarketplacePublish(auth, r.versionId);
       setActionReload((n) => n + 1);
     } catch (e) {
-      setActionErr((e as Error).message || "撤销发布失败");
+      setActionErr(apiErrorMessage(e, "撤销发布失败"));
     } finally {
       setBusyId(null);
     }
@@ -993,7 +993,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
       await api.unlistMarketplaceListing(auth, r.slug);
       setActionReload((n) => n + 1);
     } catch (e) {
-      setActionErr((e as Error).message || "下架失败");
+      setActionErr(apiErrorMessage(e, "下架失败"));
     } finally {
       setBusyId(null);
     }

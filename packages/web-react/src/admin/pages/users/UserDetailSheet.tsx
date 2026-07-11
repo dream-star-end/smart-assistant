@@ -2,7 +2,7 @@ import { Ban, Container, ExternalLink, ShieldCheck, ShieldOff, Undo2, Wallet } f
 import { type ReactNode, useState } from 'react'
 import { Badge, Button, Sheet, Switch, useConfirm, useToast } from '../../../components/ui'
 import { KeyValue, LevelBadge, SectionCard, TimeAgo } from '../../components'
-import { ApiError, adminGet, adminSend } from '../../lib/adminApi'
+import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtDateTime, fmtInt, fmtYuan } from './format'
 import type { ModelGrant, UserDetail, UserRow } from './types'
 import { useLoad } from './useLoad'
@@ -15,7 +15,7 @@ const STATUS_TONE: Record<string, 'success' | 'danger' | 'warning' | 'neutral'> 
 }
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
+  return apiErrorMessage(e, '请求失败')
 }
 
 export function UserDetailSheet({

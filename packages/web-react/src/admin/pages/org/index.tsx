@@ -20,7 +20,7 @@ import {
   SectionCard,
   SelectFilter,
 } from "../../components";
-import { adminGet, adminSend, ApiError } from "../../lib/adminApi";
+import { adminGet, adminSend, ApiError, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 
 type BadgeTone = "neutral" | "success" | "warning" | "danger" | "info" | "accent";
@@ -145,7 +145,7 @@ function CreateOrgModal({
       onSaved();
       onClose();
     } catch (e) {
-      toast(`创建失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`创建失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setSaving(false);
     }
@@ -229,7 +229,7 @@ function EditOrgModal({
       onSaved();
       onClose();
     } catch (e) {
-      toast(`保存失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`保存失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setSaving(false);
     }
@@ -318,7 +318,7 @@ function CreditsModal({
       onClose();
     } catch (e) {
       const status = e instanceof ApiError ? e.status : undefined;
-      toast(e instanceof Error ? e.message : String(e), status === 501 ? "info" : "error");
+      toast(apiErrorMessage(e, "操作失败"), status === 501 ? "info" : "error");
       if (status === 501) onClose();
     } finally {
       setSaving(false);
@@ -392,7 +392,7 @@ function RejectInvoiceModal({
       onDone();
       onClose();
     } catch (e) {
-      toast(`操作失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`操作失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setSaving(false);
     }
@@ -472,7 +472,7 @@ export default function OrgPage() {
         const data = await adminGet<{ rows: InvoiceRow[] }>("/org-invoices", { status: invStatus });
         if (alive) setInvoices(data.rows ?? []);
       } catch (e) {
-        if (alive) toast(`加载开票失败：${e instanceof Error ? e.message : String(e)}`, "error");
+        if (alive) toast(`加载开票失败：${apiErrorMessage(e, "请求失败")}`, "error");
       } finally {
         if (alive) setInvLoading(false);
       }
@@ -492,7 +492,7 @@ export default function OrgPage() {
       toast("已开票", "success");
       setInvReload((t) => t + 1);
     } catch (e) {
-      toast(`操作失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`操作失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setIssuingId(null);
     }
@@ -593,7 +593,7 @@ export default function OrgPage() {
           <EmptyState
             icon={Inbox}
             title="加载失败"
-            hint={orgError.message}
+            hint={apiErrorMessage(orgError, "加载失败")}
             action={
               <Button variant="secondary" size="sm" onClick={() => setOrgReload((t) => t + 1)}>
                 重试

@@ -1,6 +1,6 @@
 import { Check, ChevronRight, Loader2, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, MemoryFileMeta, MemoryIndexResponse } from "../../lib/types";
 import { cn, relativeTime } from "../../lib/utils";
 import { Alert, Badge, Button, Input, Modal, PanelHeader, Textarea, useConfirm } from "../ui";
@@ -142,7 +142,7 @@ function CoreMemorySection({
         if (alive) setIndex(d);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载记忆失败");
+        if (alive) setErr(apiErrorMessage(e, "加载记忆失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -307,7 +307,7 @@ function MemoryFileEditor({
         setBaseline({ content: d.content, version: d.version });
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载记忆内容失败");
+        if (alive) setErr(apiErrorMessage(e, "加载记忆内容失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -335,7 +335,7 @@ function MemoryFileEditor({
       // 版本落后:不覆盖,提示 + 保留用户未保存文本,等用户点「刷新」后再存。
       setConflict(res.conflict);
     } catch (e) {
-      setErr((e as Error).message || "保存失败");
+      setErr(apiErrorMessage(e, "保存失败"));
     } finally {
       setSaving(false);
     }
@@ -364,7 +364,7 @@ function MemoryFileEditor({
       onReload();
       onClose();
     } catch (e) {
-      setErr((e as Error).message || "删除失败");
+      setErr(apiErrorMessage(e, "删除失败"));
       setDeleting(false);
     }
   }, [auth, agentId, file.file, title, confirm, onReload, onClose]);
@@ -491,7 +491,7 @@ function NewMemoryFileDialog({
       // 新建理论上不冲突(undefined version 不做校验);真撞名给友好提示。
       setErr("同名记忆文件已被创建，请换个文件名。");
     } catch (e) {
-      setErr((e as Error).message || "创建失败");
+      setErr(apiErrorMessage(e, "创建失败"));
     } finally {
       setSaving(false);
     }
@@ -595,7 +595,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
         setLimit(typeof d.limit === "number" ? d.limit : 0);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载用户画像失败");
+        if (alive) setErr(apiErrorMessage(e, "加载用户画像失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -628,7 +628,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
       setServerLatest(res.conflict.text);
       setNotice("智能体在你编辑期间更新了用户画像，已刷新基线；确认下方最新内容后再次保存，将以你的版本为准。");
     } catch (e) {
-      setErr((e as Error).message || "保存失败");
+      setErr(apiErrorMessage(e, "保存失败"));
     } finally {
       setSaving(false);
     }

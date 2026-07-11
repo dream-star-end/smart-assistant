@@ -2,7 +2,7 @@ import { Search } from "lucide-react";
 import { useState } from "react";
 import { Button, Input, Modal, useToast } from "../../../components/ui";
 import { CopyChip, KeyValue, TimeAgo } from "../../components";
-import { ApiError, adminGet } from "../../lib/adminApi";
+import { ApiError, adminGet, apiErrorMessage } from "../../lib/adminApi";
 import type { TraceInfo, TraceLookupResp } from "./types";
 
 /** 反查结果卡：turn_traces 命中后的用户 / 会话 / agent / 模型 / 时间。 */
@@ -72,7 +72,7 @@ export function TraceLookup() {
       if (e instanceof ApiError && e.status === 404) {
         setResult({ status: "notfound" });
       } else {
-        toast(`反查失败：${e instanceof Error ? e.message : String(e)}`, "error");
+        toast(`反查失败：${apiErrorMessage(e, "请求失败")}`, "error");
       }
     } finally {
       setBusy(false);

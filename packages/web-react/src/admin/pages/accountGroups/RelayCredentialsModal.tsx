@@ -11,12 +11,12 @@ import {
   useToast,
 } from "../../../components/ui";
 import { DataTable, type Column } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { Field, Select } from "./form";
 import type { RelayCredential } from "./types";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 const credTone = (s: string) => (s === "active" ? "success" : s === "cooldown" ? "warning" : "neutral");

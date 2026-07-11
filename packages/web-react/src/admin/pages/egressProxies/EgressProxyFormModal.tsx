@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { Button, Input, Modal, Spinner, useToast } from "../../../components/ui";
-import { ApiError, adminSend } from "../../lib/adminApi";
+import { adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { Field, Select } from "./form";
 import type { EgressProxyRow } from "./types";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 /**

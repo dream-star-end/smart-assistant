@@ -17,7 +17,7 @@ import {
   barConfig,
   useChart,
 } from '../../components'
-import { ApiError, adminGet, adminText } from '../../lib/adminApi'
+import { adminGet, adminText, apiErrorMessage } from '../../lib/adminApi'
 import { getAdminPage } from '../../registry'
 import { useAdminRoute } from '../../router'
 import { AdjustCreditsModal } from './AdjustCreditsModal'
@@ -57,7 +57,7 @@ const STATUS_TONE: Record<string, 'success' | 'danger' | 'warning' | 'neutral'> 
 }
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
+  return apiErrorMessage(e, '请求失败')
 }
 
 /** 最近活跃时间的健康 tone：>7 天 danger，>1 天 warning，否则 success。 */

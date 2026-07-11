@@ -10,7 +10,7 @@ import {
   Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import {
   benchmarkBadgeLabel,
   formatInstallCount,
@@ -215,7 +215,7 @@ export function BrowsePanel({
         // 信任服务端顺序:目录态已按 featured_rank/热度排好,搜索态是相关度排序。
         setCards(r.results);
       })
-      .catch((e) => alive && setErr((e as Error).message || "加载市场失败"))
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载市场失败")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;

@@ -20,14 +20,14 @@ import {
   StatCard,
   StatCardRow,
 } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { GroupFormModal } from "./GroupFormModal";
 import { RelayCredentialsModal } from "./RelayCredentialsModal";
 import { ACCOUNT_GROUP_KIND_LABEL, type AccountGroup } from "./types";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 export default function AccountGroupsPage() {

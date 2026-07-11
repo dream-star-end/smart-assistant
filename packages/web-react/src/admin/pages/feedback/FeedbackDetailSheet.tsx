@@ -2,7 +2,7 @@ import { Check, X } from "lucide-react";
 import { useState } from "react";
 import { Badge, Button, IconButton, Sheet, useToast } from "../../../components/ui";
 import { CopyChip, KeyValue } from "../../components";
-import { ApiError, adminSend } from "../../lib/adminApi";
+import { adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { FEEDBACK_STATUS_LABELS, FEEDBACK_STATUS_TONE, type FeedbackRow } from "./types";
 
 function fmt(ts: string | null): string {
@@ -42,7 +42,7 @@ export function FeedbackDetailSheet({
       onAcked(resp.feedback);
       onOpenChange(false);
     } catch (e) {
-      toast(e instanceof ApiError ? e.message : "确认失败", "error");
+      toast(apiErrorMessage(e, "确认失败"), "error");
     } finally {
       setBusy(false);
     }

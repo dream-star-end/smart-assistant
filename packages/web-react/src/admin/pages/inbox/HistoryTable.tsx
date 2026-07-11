@@ -16,7 +16,7 @@ import {
   SectionCard,
   TimeAgo,
 } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import {
   EMAIL_STATUS_META,
   INBOX_LEVEL_LABELS,
@@ -101,7 +101,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       toast(`已删除 #${m.id}`, "success");
       void load();
     } catch (e) {
-      toast(e instanceof ApiError ? e.message : "删除失败", "error");
+      toast(apiErrorMessage(e, "删除失败"), "error");
     }
   };
 
@@ -178,7 +178,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       {confirmEl}
       {error ? (
         <div className="px-5 py-4">
-          <p className="text-[13px] text-danger">加载失败：{error.message}</p>
+          <p className="text-[13px] text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
         </div>
       ) : (
         <>

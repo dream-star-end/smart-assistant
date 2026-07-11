@@ -2,7 +2,7 @@ import { FlaskConical, Save } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Badge, Button, Input, Skeleton, Spinner, Switch, useToast } from "../../../components/ui";
 import { PageHeader, SectionCard, TimeAgo } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 
@@ -141,7 +141,7 @@ export default function LiteraturePage() {
       // 刷新 poll 数据（更新掩码 token_hint / 最后更新时间），不覆盖已重播种的表单。
       config.refresh();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : String(err), "error");
+      toast(apiErrorMessage(err, "保存失败"), "error");
     } finally {
       setSaving(false);
     }
@@ -154,7 +154,7 @@ export default function LiteraturePage() {
       const data = await adminSend<{ result: TestResult }>("POST", "/literature/test", {});
       setTestResult(data.result ?? { ok: false, error: "unknown" });
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : String(err);
+      const msg = apiErrorMessage(err, "请求失败");
       setTestResult({ exception: msg });
       toast(`测试失败：${msg}`, "error");
     } finally {
@@ -173,7 +173,7 @@ export default function LiteraturePage() {
         {!ready && config.error ? (
           <p className="py-8 text-center text-[13px] text-danger">
             加载失败：
-            {config.error instanceof ApiError ? config.error.message : String(config.error)}
+            {apiErrorMessage(config.error, "加载失败")}
           </p>
         ) : !ready ? (
           <LoadingSkeleton />

@@ -1,7 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { Check, GitBranch, Lock, Search, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import { githubErrorText } from "../../lib/github";
 import type {
   AuthSession,
@@ -107,7 +107,7 @@ export function GithubRepoModal({
         if (alive) setRepos(r);
       })
       .catch((e) => {
-        if (alive) setReposErr((e as Error).message || "加载仓库失败");
+        if (alive) setReposErr(apiErrorMessage(e, "加载仓库失败"));
       })
       .finally(() => {
         if (alive) setReposLoading(false);
@@ -134,7 +134,7 @@ export function GithubRepoModal({
           setBranches(sorted);
           setSelBranch(repo.default_branch);
         })
-        .catch((e) => toast((e as Error).message || "加载分支失败", "error"))
+        .catch((e) => toast(apiErrorMessage(e, "加载分支失败"), "error"))
         .finally(() => setBranchesLoading(false));
     },
     [auth, toast],
@@ -148,7 +148,7 @@ export function GithubRepoModal({
       window.location.href = authorizeUrl; // 跳 GitHub 授权页，回调后 302 回 /?github_linked=1
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : (e as Error).message || "连接失败", "error");
+      toast(code ? githubErrorText(code) : apiErrorMessage(e, "连接失败"), "error");
       setLinking(false);
     }
   }, [auth, linking, toast]);
@@ -170,7 +170,7 @@ export function GithubRepoModal({
       toast(`已解绑 GitHub · ${r.sessionsCleared} 个会话已清空`, "success");
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : (e as Error).message || "解绑失败", "error");
+      toast(code ? githubErrorText(code) : apiErrorMessage(e, "解绑失败"), "error");
     } finally {
       setUnlinking(false);
     }
@@ -184,7 +184,7 @@ export function GithubRepoModal({
       onClose();
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : (e as Error).message || "绑定失败", "error");
+      toast(code ? githubErrorText(code) : apiErrorMessage(e, "绑定失败"), "error");
     } finally {
       setConfirming(false);
     }
@@ -197,7 +197,7 @@ export function GithubRepoModal({
       await onUnbind();
       onClose();
     } catch (e) {
-      toast((e as Error).message || "解除绑定失败", "error");
+      toast(apiErrorMessage(e, "解除绑定失败"), "error");
     } finally {
       setUnbinding(false);
     }

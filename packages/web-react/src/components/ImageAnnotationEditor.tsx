@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
+import { apiErrorMessage } from '../lib/api'
 import { cn } from '../lib/utils'
 
 export type ImageAnnotationSource = { url: string; name?: string }
@@ -266,7 +267,7 @@ export function ImageAnnotationEditor({
           URL.revokeObjectURL(url)
         }
       })
-      .catch((err) => !cancelled && setLoadError((err as Error).message || '图片加载失败'))
+      .catch((err) => !cancelled && setLoadError(apiErrorMessage(err, '图片加载失败')))
       .finally(() => !cancelled && setLoading(false))
     return () => {
       cancelled = true
@@ -525,7 +526,7 @@ export function ImageAnnotationEditor({
       })
       onOpenChange(false)
     } catch (err) {
-      setError((err as Error).message || '提交失败，请重试')
+      setError(apiErrorMessage(err, '提交失败，请重试'))
     } finally {
       setSubmitting(false)
     }

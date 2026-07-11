@@ -1,6 +1,6 @@
 import { Copy, KeyRound, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { ApiError, api } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type { ApiKeySummary, AuthSession, CreatedApiKey } from "../../lib/types";
 import { Alert, Button, Input, Spinner, useConfirm } from "../ui";
 import { shortTime } from "./labels";
@@ -37,7 +37,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
           setHidden(true);
           return;
         }
-        setErr((e as Error).message || "加载 API Key 失败");
+        setErr(apiErrorMessage(e, "加载 API Key 失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -68,7 +68,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
         ...(prev ?? []),
       ]);
     } catch (e) {
-      setErr((e as Error).message || "创建失败");
+      setErr(apiErrorMessage(e, "创建失败"));
     } finally {
       setCreating(false);
     }
@@ -88,7 +88,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
       setKeys((prev) => (prev ?? []).filter((k) => k.id !== id));
       if (justCreated?.id === id) setJustCreated(null);
     } catch (e) {
-      setErr((e as Error).message || "撤销失败");
+      setErr(apiErrorMessage(e, "撤销失败"));
     }
   }
 

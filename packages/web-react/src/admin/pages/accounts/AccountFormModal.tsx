@@ -1,7 +1,7 @@
 import { CheckCircle2, KeyRound } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Button, Input, Modal, Spinner, Textarea, useToast } from "../../../components/ui";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { Field, Select } from "./form";
 import {
   ACCOUNT_PLANS,
@@ -14,7 +14,7 @@ import {
 type Mode = "create" | "edit";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 const isNull = (v: string) => v.trim().toUpperCase() === "NULL";

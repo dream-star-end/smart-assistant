@@ -2,7 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
-import { api } from "../lib/api";
+import { api, apiErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
 import { extractPrefs, type PrefsView } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
@@ -93,7 +93,7 @@ export function SettingsCenter({
         onPreferencesChange?.(next);
       })
       .catch((e) => {
-        if (alive) setPrefsErr((e as Error).message || "加载偏好失败");
+        if (alive) setPrefsErr(apiErrorMessage(e, "加载偏好失败"));
       })
       .finally(() => {
         if (alive) setPrefsLoading(false);

@@ -2,7 +2,7 @@ import { RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button, Modal, Spinner } from '../../../components/ui'
 import { SelectFilter } from '../../components'
-import { ApiError, adminGet } from '../../lib/adminApi'
+import { adminGet, apiErrorMessage } from '../../lib/adminApi'
 import type { ContainerLogs } from './types'
 
 const LINE_OPTIONS = [
@@ -60,7 +60,7 @@ export function ContainerLogsModal({
       })
     } catch (e) {
       if (mySeq !== seqRef.current) return
-      setText(`加载失败：${e instanceof ApiError ? e.message : String(e)}`)
+      setText(`加载失败：${apiErrorMessage(e, '请求失败')}`)
     } finally {
       if (mySeq === seqRef.current) setLoading(false)
     }

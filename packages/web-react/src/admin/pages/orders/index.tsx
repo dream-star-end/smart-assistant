@@ -23,7 +23,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { adminGet, adminText } from "../../lib/adminApi";
+import { adminGet, adminText, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { useAdminRoute } from "../../router";
 
@@ -140,7 +140,7 @@ function OrderDetailModal({
         );
         if (alive) setOrder(data.order);
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        if (alive) setError(apiErrorMessage(e, "请求失败"));
       } finally {
         if (alive) setLoading(false);
       }
@@ -317,7 +317,7 @@ export default function OrdersPage() {
       setCursor({ createdAt: data.next_before_created_at, id: data.next_before_id });
       setDone(!data.next_before_created_at || !data.next_before_id);
     } catch (e) {
-      toast(`加载失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`加载失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setLoadingMore(false);
     }
@@ -344,7 +344,7 @@ export default function OrdersPage() {
       triggerCsvDownload(csv, `orders-${stamp}.csv`);
       toast("CSV 已开始下载", "success");
     } catch (e) {
-      toast(`导出失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`导出失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setExporting(false);
     }
@@ -522,7 +522,7 @@ export default function OrdersPage() {
           <EmptyState
             icon={Inbox}
             title="加载失败"
-            hint={error.message}
+            hint={apiErrorMessage(error, "加载失败")}
             action={
               <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
                 重试

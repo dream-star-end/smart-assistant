@@ -14,6 +14,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
+import { apiErrorMessage } from "../../lib/adminApi";
 import { FeedbackDetailSheet } from "./FeedbackDetailSheet";
 import {
   FEEDBACK_STATUS_LABELS,
@@ -170,7 +171,7 @@ export function FeedbackQueue() {
           </FilterBar>
 
           {error ? (
-            <Alert tone="danger">加载失败：{error.message}</Alert>
+            <Alert tone="danger">加载失败：{apiErrorMessage(error, "加载失败")}</Alert>
           ) : (
             <>
               <DataTable

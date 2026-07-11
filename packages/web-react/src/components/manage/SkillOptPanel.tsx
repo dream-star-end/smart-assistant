@@ -18,7 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import {
   creditsForUsage,
   estimateEvalRunCredits,
@@ -137,7 +137,7 @@ function genErrMessage(e: unknown): string {
   if (status === 409) return "该技能有评测或生成任务在进行中,请稍后再试";
   if (status === 403) return "只有你自建的技能才能生成评测用例";
   if (status === 404) return "技能不存在或已删除";
-  return (e as Error).message || "AI 生成用例失败";
+  return apiErrorMessage(e, "AI 生成用例失败");
 }
 
 // ── 评测分区 ─────────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ export function SkillEvalSection({
         setDirty(false);
         setDraftBanner(false);
       })
-      .catch((e) => setErr((e as Error).message || "加载评测用例失败"))
+      .catch((e) => setErr(apiErrorMessage(e, "加载评测用例失败")))
       .finally(() => setLoading(false));
   }, [auth, skillName]);
   useEffect(load, [load]);
@@ -215,7 +215,7 @@ export function SkillEvalSection({
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
     } catch (e) {
-      setErr((e as Error).message || "保存失败");
+      setErr(apiErrorMessage(e, "保存失败"));
     } finally {
       setSaving(false);
     }
@@ -247,7 +247,7 @@ export function SkillEvalSection({
       const r = await api.startSkillEvalRun(auth, skillName, { mode: "baseline" });
       setRunId(r.runId);
     } catch (e) {
-      setErr((e as Error).message || "启动评测失败");
+      setErr(apiErrorMessage(e, "启动评测失败"));
     }
   };
 
@@ -711,7 +711,7 @@ export function SkillTrainSection({
         );
       }
     } catch (e) {
-      setErr((e as Error).message || "启动训练失败");
+      setErr(apiErrorMessage(e, "启动训练失败"));
     }
   };
 
@@ -833,7 +833,7 @@ function TrainDraftView({
           if (alive) setDetail(d);
         }
       })
-      .catch((e) => alive && setErr((e as Error).message));
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载草稿失败")));
     return () => {
       alive = false;
     };
@@ -866,7 +866,7 @@ function TrainDraftView({
       if (!r.ok) setErr(r.results.map((x) => x.error).filter(Boolean).join("; ") || "合并失败");
       else onMergedOrDiscarded();
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(apiErrorMessage(e, "合并失败"));
     } finally {
       setBusy(false);
     }
@@ -894,7 +894,7 @@ function TrainDraftView({
       setComment("");
       setErr("已提交修订,训练会话重新运行中 —— 稍后回来看新草稿。");
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(apiErrorMessage(e, "提交修订失败"));
     } finally {
       setBusy(false);
     }

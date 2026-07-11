@@ -9,7 +9,7 @@ import {
   useToast,
 } from "../../../components/ui";
 import { PageHeader } from "../../components";
-import { adminGet, adminSend, ApiError } from "../../lib/adminApi";
+import { adminGet, adminSend, ApiError, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 import { ModelRow, type PriceChange } from "./ModelRow";
@@ -226,8 +226,7 @@ export default function PricingPage() {
     }
   };
 
-  const errMsg = (e: unknown) =>
-    e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  const errMsg = (e: unknown) => apiErrorMessage(e, "请求失败");
 
   // ── 写路径回调 ──
   const savePricing = async (
@@ -332,7 +331,7 @@ export default function PricingPage() {
         <EmptyState
           icon={Inbox}
           title="加载模型与服务商失败"
-          hint={error.message}
+          hint={apiErrorMessage(error, "加载失败")}
           action={
             <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
               重试

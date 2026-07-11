@@ -18,7 +18,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, MarketplaceMyAgent, SkillDetail } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from "../AgentScopePicker";
@@ -86,7 +86,7 @@ export function SkillEditor({
         setScopeDirty(false);
         setDirty(false);
       })
-      .catch((e) => setErr((e as Error).message || "加载技能失败"))
+      .catch((e) => setErr(apiErrorMessage(e, "加载技能失败")))
       .finally(() => setLoading(false));
   }, [auth, skillName]);
 
@@ -106,7 +106,7 @@ export function SkillEditor({
     api
       .getSkillFile(auth, skillName, selected)
       .then((r) => setFileContent(r.content))
-      .catch((e) => setErr((e as Error).message || "读取文件失败"))
+      .catch((e) => setErr(apiErrorMessage(e, "读取文件失败")))
       .finally(() => setFileLoading(false));
     setDirty(false);
   }, [open, selected, auth, skillName]);
@@ -159,7 +159,7 @@ export function SkillEditor({
       onChanged();
       if (selected === "SKILL.md") load();
     } catch (e) {
-      setErr((e as Error).message || "保存失败");
+      setErr(apiErrorMessage(e, "保存失败"));
     } finally {
       setSaving(false);
     }
@@ -179,7 +179,7 @@ export function SkillEditor({
       setSelected(path);
       onChanged();
     } catch (e) {
-      setErr((e as Error).message || "创建失败");
+      setErr(apiErrorMessage(e, "创建失败"));
     }
   };
 
@@ -196,7 +196,7 @@ export function SkillEditor({
       load();
       onChanged();
     } catch (e) {
-      setErr((e as Error).message || "删除失败");
+      setErr(apiErrorMessage(e, "删除失败"));
     }
   };
 
@@ -214,7 +214,7 @@ export function SkillEditor({
       setSelected("SKILL.md");
       onChanged();
     } catch (e) {
-      setErr((e as Error).message || "恢复失败");
+      setErr(apiErrorMessage(e, "恢复失败"));
     }
   };
 

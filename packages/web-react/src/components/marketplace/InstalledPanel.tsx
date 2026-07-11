@@ -1,6 +1,6 @@
 import { AlertTriangle, ArrowUpCircle, Loader2, PackageOpen, Settings2, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import { updateAvailable } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceInstalled, MarketplaceMyAgent } from "../../lib/types";
 import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from "../AgentScopePicker";
@@ -34,7 +34,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
         setRows(r);
         setAgents(a.length ? a : [{ id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true }]);
       })
-      .catch((e) => alive && setErr((e as Error).message || "加载已安装失败"))
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载已安装失败")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -56,7 +56,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
         await api.uninstallMarketplace(auth, slug);
         setReload((n) => n + 1);
       } catch (e) {
-        setErr((e as Error).message || "卸载失败");
+        setErr(apiErrorMessage(e, "卸载失败"));
       } finally {
         setBusy(null);
       }
@@ -75,7 +75,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
         await api.installMarketplace(auth, row.latestVersionId, row.kind === "skill" ? normalizeAgentScope(row.agentIds) : undefined);
         setReload((n) => n + 1);
       } catch (e) {
-        setErr((e as Error).message || "更新失败");
+        setErr(apiErrorMessage(e, "更新失败"));
         setReload((n) => n + 1);
       } finally {
         setBusy(null);
@@ -98,7 +98,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       setEditing(null);
       setReload((n) => n + 1);
     } catch (e) {
-      setErr((e as Error).message || "保存归属失败");
+      setErr(apiErrorMessage(e, "保存归属失败"));
     } finally {
       setBusy(null);
     }

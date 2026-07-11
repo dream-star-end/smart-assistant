@@ -1,7 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Loader2, RefreshCw, Star, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import { formatInstallCount, sortFeaturedListings } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
 import { Alert, Badge, Button, EmptyState, Input, Spinner } from "../ui";
@@ -117,7 +117,7 @@ export function FeaturedPanel({ auth }: { auth: AuthSession }) {
           ),
         );
       })
-      .catch((e) => alive && setErr((e as Error).message || "加载市场目录失败"))
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载市场目录失败")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -146,7 +146,7 @@ export function FeaturedPanel({ auth }: { auth: AuthSession }) {
         await api.setMarketplaceFeatured(auth, card.slug, rank);
         setReload((n) => n + 1); // 成功即刷新:服务端重排 + 回填 featuredRank
       } catch (e) {
-        setErr((e as Error).message || "保存失败");
+        setErr(apiErrorMessage(e, "保存失败"));
       } finally {
         setSaving(null);
       }

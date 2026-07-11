@@ -3,6 +3,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import { ArrowUp, FileText, Loader2, Mic, Pencil, Plus, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
+import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { useImageEditActions } from "./chat/imageEditActions";
 import type { MediaRef } from "../lib/chat/frames";
@@ -184,7 +185,7 @@ export function Composer({
         setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
       } catch (e) {
         setAttachments((prev) =>
-          prev.map((a) => (a.id === id ? { ...a, status: "error", error: (e as Error).message } : a)),
+          prev.map((a) => (a.id === id ? { ...a, status: "error", error: apiErrorMessage(e, "上传失败") } : a)),
         );
       }
     },

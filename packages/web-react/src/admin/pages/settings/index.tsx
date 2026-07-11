@@ -2,6 +2,7 @@ import { RefreshCw, SlidersHorizontal } from "lucide-react";
 import { useMemo } from "react";
 import { Alert, Badge, Button, EmptyState, Skeleton } from "../../../components/ui";
 import { PageHeader, SectionCard } from "../../components";
+import { apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { SettingRow } from "./SettingRow";
 import { groupSettings } from "./grouping";
@@ -46,7 +47,7 @@ export default function SettingsPage() {
       </div>
 
       {error ? (
-        <Alert tone="danger">加载失败：{error.message}</Alert>
+        <Alert tone="danger">加载失败：{apiErrorMessage(error, "请求失败")}</Alert>
       ) : firstLoad ? (
         <div className="flex flex-col gap-4">
           {[0, 1].map((i) => (

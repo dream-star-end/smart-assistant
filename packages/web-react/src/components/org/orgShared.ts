@@ -6,7 +6,7 @@
 // 抽到本叶子模块后,向导 / 各分区只依赖轻量 helper,不再牵连重组件;循环 import 一并消除。
 // OrgCenter.tsx 再从这里 re-export,兼容既有 `from "../OrgCenter"` 引用点。
 
-import { ApiError } from "../../lib/api";
+import { apiErrorMessage } from "../../lib/api";
 import type { OrgRole } from "../../lib/types";
 
 /** org 角色 → 中文标签。 */
@@ -15,11 +15,10 @@ export function orgRoleLabel(role: OrgRole): string {
 }
 
 /**
- * 错误 → 展示文案:优先后端原文(ApiError.message 已含 501 NOT_IMPLEMENTED / 404 等),
- * 退化到通用 Error.message,最后 fallback。集成期端点未上线时的友好提示由此产出。
+ * 错误 → 展示文案：收口进全站唯一权威 apiErrorMessage（后端中文文案直显、英文/技术串回退到
+ * 调用方 fallback + 追踪号），不再自带第二套 `e.message` 直露逻辑。集成期端点未上线（501
+ * NOT_IMPLEMENTED）后端返中文提示时会被 helper 直显，符合"友好提示"预期。
  */
 export function orgErrText(e: unknown, fallback: string): string {
-  if (e instanceof ApiError) return e.message || fallback;
-  if (e instanceof Error) return e.message || fallback;
-  return fallback;
+  return apiErrorMessage(e, fallback);
 }

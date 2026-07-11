@@ -9,7 +9,7 @@ import {
   KeyValue,
   TimeAgo,
 } from "../../components";
-import { adminGet } from "../../lib/adminApi";
+import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import { buildDiffRows, FormatJsonValue } from "./diff";
 
 const PAGE_SIZE = 100;
@@ -192,7 +192,7 @@ export function AdminAuditTab() {
       setRows((prev) => [...prev, ...(data.rows ?? [])]);
       setCursor(data.next_before ?? null);
     } catch (e) {
-      toast(`加载失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`加载失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setLoadingMore(false);
     }
@@ -330,7 +330,7 @@ export function AdminAuditTab() {
       </FilterBar>
 
       {error && (
-        <p className="text-sm text-danger">加载失败：{error.message}</p>
+        <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
       )}
 
       <DataTable

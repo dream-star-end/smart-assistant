@@ -11,7 +11,7 @@ import {
   Pagination,
   TimeAgo,
 } from "../../components";
-import { adminGet } from "../../lib/adminApi";
+import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import { FormatJsonValue } from "./diff";
 
 const PAGE_SIZE = 50;
@@ -254,7 +254,7 @@ export function AgentAuditTab() {
         </Button>
       </FilterBar>
 
-      {error && <p className="text-sm text-danger">加载失败：{error.message}</p>}
+      {error && <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>}
 
       <DataTable
         columns={columns}

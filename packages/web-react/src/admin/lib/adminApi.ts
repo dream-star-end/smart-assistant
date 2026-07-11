@@ -21,7 +21,7 @@ import { adminSession } from "../auth";
  * 不去 parse 中文 message。
  */
 
-export { ApiError } from "../../lib/api";
+export { ApiError, apiErrorMessage } from "../../lib/api";
 
 export type AdminParam = string | number | boolean | null | undefined;
 export type AdminParams = Record<string, AdminParam>;

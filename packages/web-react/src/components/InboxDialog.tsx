@@ -1,7 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { Bell, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../lib/api";
+import { api, apiErrorMessage } from "../lib/api";
 import type { AuthSession, InboxLevel, InboxMessage } from "../lib/types";
 import { cn } from "../lib/utils";
 import { Markdown } from "./Markdown";
@@ -86,7 +86,7 @@ export function InboxDialog({
         }
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载站内信失败");
+        if (alive) setErr(apiErrorMessage(e, "加载站内信失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -104,7 +104,7 @@ export function InboxDialog({
       setMessages((cur) => cur.map((m) => (m.read ? m : { ...m, read: true })));
       onUnreadChange();
     } catch (e) {
-      setErr((e as Error).message || "标记失败");
+      setErr(apiErrorMessage(e, "标记失败"));
     } finally {
       setMarkingAll(false);
     }

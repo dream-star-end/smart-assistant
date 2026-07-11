@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Button, Input, Modal, useToast } from '../../../components/ui'
-import { ApiError, adminSend } from '../../lib/adminApi'
+import { adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtYuan, parseYuanToCents } from './format'
 
 type AdjustResult = { ledger_id: string; balance_after: string; audit_id: string }
@@ -67,8 +67,7 @@ export function AdjustCreditsModal({
       onDone()
       onClose()
     } catch (e) {
-      const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
-      toast(`调账失败：${msg}`, 'error')
+      toast(`调账失败：${apiErrorMessage(e, '请求失败')}`, 'error')
     } finally {
       setSubmitting(false)
     }

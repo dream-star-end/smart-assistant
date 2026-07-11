@@ -1,6 +1,7 @@
 import { ArrowLeft, ArrowRight, Check, MailCheck, Sparkles } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
+import { authErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
 import { LEGAL_DOCS, TERMS_VERSION, type LegalKind } from "../lib/legal";
 import { LegalDocBody } from "./LegalPage";
@@ -68,7 +69,7 @@ export function AuthGate({
   allowRegistration?: boolean;
   /** 是否强制邮箱验证后才能登录（公开配置 require_email_verified）。 */
   requireEmailVerified?: boolean;
-  /** 初始模式：登录页用 login，「免费开始」用 register，重置链接用 reset。 */
+  /** 初始模式：登录页与「免费开始」入口均用 login，重置链接用 reset。 */
   initialMode?: AuthMode;
   /** 重置密码邮件链接里的 token（mode=reset 时必有）。 */
   resetToken?: string;
@@ -133,7 +134,7 @@ export function AuthGate({
   // 当前回调是否仍有效（组件在挂载且本次操作未被新操作/模式切换取代）。
   const alive = (gen: number) => mountedRef.current && opGen.current === gen;
 
-  // 配置确认禁止注册后，若仍停在注册表单（如「免费开始」直接进 register），硬兜底回登录。
+  // 配置确认禁止注册后，若仍停在注册表单（如 initialMode=register 或用户切到注册页），硬兜底回登录。
   // opGen 递增：万一 config 动态刷新时有在途注册请求，迟到回调一并失效。
   useEffect(() => {
     if (mode === "register" && !allowRegistration) {
@@ -196,7 +197,7 @@ export function AuthGate({
     } catch (e) {
       if (!alive(gen)) return;
       setBusy(false);
-      setLocalErr((e as Error).message || "注册失败，请重试。");
+      setLocalErr(authErrorMessage(e) || "注册失败，请重试。");
     }
   }
 
@@ -217,7 +218,7 @@ export function AuthGate({
     } catch (e) {
       if (!alive(gen)) return;
       setBusy(false);
-      setLocalErr((e as Error).message || "验证失败，请检查验证码。");
+      setLocalErr(authErrorMessage(e) || "验证失败，请检查验证码。");
     }
   }
 
@@ -232,7 +233,7 @@ export function AuthGate({
       setCooldown(60);
     } catch (e) {
       if (!alive(gen)) return;
-      setLocalErr((e as Error).message || "发送失败，请稍后再试。");
+      setLocalErr(authErrorMessage(e) || "发送失败，请稍后再试。");
     }
   }
 
@@ -254,7 +255,7 @@ export function AuthGate({
     } catch (e) {
       if (!alive(gen)) return;
       setBusy(false);
-      setLocalErr((e as Error).message || "发送失败，请重试。");
+      setLocalErr(authErrorMessage(e) || "发送失败，请重试。");
     }
   }
 
@@ -285,7 +286,7 @@ export function AuthGate({
     } catch (e) {
       if (!alive(gen)) return;
       setBusy(false);
-      setLocalErr((e as Error).message || "重置失败，链接可能已过期，请重新申请。");
+      setLocalErr(authErrorMessage(e) || "重置失败，链接可能已过期，请重新申请。");
     }
   }
 

@@ -12,7 +12,7 @@ import {
   useToast,
 } from "../../../components/ui";
 import { KeyValue, PageHeader } from "../../components";
-import { adminGet, adminSend, ApiError } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 
 type PlanRow = {
@@ -83,7 +83,7 @@ function EditPlanModal({
       onSaved();
       onClose();
     } catch (e) {
-      toast(`失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setSaving(false);
     }
@@ -183,8 +183,7 @@ export default function PlansPage() {
       toast(next ? `${plan.code} 已上架` : `${plan.code} 已下架`, "success");
       reload();
     } catch (e) {
-      const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
-      toast(`操作失败：${msg}`, "error");
+      toast(`操作失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setTogglingCode(null);
     }
@@ -207,7 +206,7 @@ export default function PlansPage() {
         <EmptyState
           icon={Inbox}
           title="加载失败"
-          hint={error.message}
+          hint={apiErrorMessage(error, "加载失败")}
           action={
             <Button variant="secondary" size="sm" onClick={reload}>
               重试

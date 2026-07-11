@@ -18,7 +18,7 @@ import {
   donutConfig,
   useChart,
 } from '../../components'
-import { ApiError, adminGet, adminSend } from '../../lib/adminApi'
+import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { useAdminPoll } from '../../lib/useAdminPoll'
 import { getAdminPage } from '../../registry'
 import { useAdminRoute } from '../../router'
@@ -146,7 +146,7 @@ export default function ContainersPage() {
       toast(`#${c.id} 已${ACTION_LABEL[action]}`, 'success')
       refreshAll()
     } catch (e) {
-      toast(`失败：${e instanceof ApiError ? e.message : String(e)}`, 'error')
+      toast(`失败：${apiErrorMessage(e, '请求失败')}`, 'error')
     } finally {
       setBusyId(null)
     }
@@ -407,7 +407,7 @@ export default function ContainersPage() {
 
         {list.error ? (
           <p className="px-1 py-8 text-center text-[13px] text-danger">
-            加载失败：{list.error instanceof ApiError ? list.error.message : String(list.error)}
+            加载失败：{apiErrorMessage(list.error, '加载失败')}
           </p>
         ) : (
           <DataTable
