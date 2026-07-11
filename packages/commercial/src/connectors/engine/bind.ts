@@ -16,39 +16,15 @@
 import type { Pool } from 'pg'
 import { getPool } from '../../db/index.js'
 import { ConnectorError } from '../errors.js'
-import type { ConnectorIdentityT, ExecActionT, ExecContractT } from '../spec/types.js'
+import type { ConnectorIdentityT, ExecActionT } from '../spec/types.js'
 import { loadVerifiedContractWithMeta } from '../spec/review.js'
 import { computeAccountKey } from '../store.js'
 import { insertDeclarativeConnection } from './binding.js'
-import { bagToResolvedCredentials, requiredBindSources, validateSecretBag } from './credentialBag.js'
+import { requiredBindSources, validateSecretBag } from './credentialBag.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
 import { soleApiOrigin } from './execute.js'
-
-const POLLUTION_KEYS: ReadonlySet<string> = new Set(['__proto__', 'prototype', 'constructor'])
-
-/** 解析 RFC6901 JSON pointer 进 probe 结果;缺失/非标量 → undefined。拒污染段。 */
-export function resolveResultPointer(root: unknown, pointer: string): unknown {
-  if (!pointer.startsWith('/')) return undefined
-  const segs = pointer
-    .split('/')
-    .slice(1)
-    .map((s) => s.replace(/~1/g, '/').replace(/~0/g, '~'))
-  let cur = root
-  for (const seg of segs) {
-    if (POLLUTION_KEYS.has(seg)) return undefined
-    if (cur === null || typeof cur !== 'object') return undefined
-    if (Array.isArray(cur)) {
-      if (!/^\d+$/.test(seg)) return undefined
-      const idx = Number(seg)
-      if (idx < 0 || idx >= cur.length) return undefined
-      cur = cur[idx]
-    } else {
-      if (!Object.prototype.hasOwnProperty.call(cur, seg)) return undefined
-      cur = (cur as Record<string, unknown>)[seg]
-    }
-  }
-  return cur
-}
+import { resolveResultPointer } from './pointer.js'
+import { resolveApiCredentials } from './tokenEngine.js'
 
 /** pointer 取到的账号标识必须是非空标量(string/number)。 */
 function pointerScalar(root: unknown, pointer: string, what: string): string {
@@ -61,8 +37,11 @@ function pointerScalar(root: unknown, pointer: string, what: string): string {
 export interface BindDeclarativeInput {
   userId: number
   connectorVersionId: number
-  /** 用户直填的长期 token(static-token)。 */
-  token: string
+  /**
+   * 用户直填的凭据(键 = 该 contract 需要的 source 名)。static-token: {access_token};
+   * token-exchange: 交换输入(如 {client_id, client_secret} / {refresh_token})。
+   */
+  secrets: Record<string, string>
   displayName?: string
   deps?: EngineHttpDeps
 }
@@ -79,17 +58,17 @@ export async function bindDeclarativeConnector(
 ): Promise<BindDeclarativeResult> {
   const meta = await loadVerifiedContractWithMeta(input.connectorVersionId, pool)
   const contract = meta.contract
-  const authMode = contract.authMode
 
   const identity: ConnectorIdentityT | undefined = contract.identity
   if (identity === undefined)
     throw new ConnectorError('BAD_REQUEST', 'connector declares no identity probe')
 
-  // ② 凭据袋(static-token:单 access_token)。
-  const sources = requiredBindSources(authMode)
-  const bag: Record<string, string> = { [sources[0]!]: input.token }
+  // ② 凭据袋:按 contract 需要的 source 严格校验(static-token 单 access_token;token-exchange 交换输入)。
+  const sources = requiredBindSources(contract)
+  const bag = input.secrets
   validateSecretBag(bag, sources)
-  const resolvedCreds = bagToResolvedCredentials(authMode, bag)
+  // 解析出可注入 API 的凭据:static-token 直接用;token-exchange 换一次(bind 无 connectionId → 不落缓存)。
+  const resolvedCreds = await resolveApiCredentials({ contract, bag, deps: input.deps })
 
   // ③ identityProbe:跑 probe read action(编译期已保证存在且 read)。
   const probe: ExecActionT | undefined = contract.actions.find((a) => a.id === identity.probeActionId)
@@ -125,7 +104,6 @@ export async function bindDeclarativeConnector(
       execContractHashHex: meta.execContractHash,
       authContractVersion: meta.authContractVersion,
       accountKey,
-      authMode,
       bag,
       displayName: input.displayName,
       meta: rowMeta,

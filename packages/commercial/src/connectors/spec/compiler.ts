@@ -420,6 +420,8 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
     }
     if (audience.tokenOrigins.length === 0)
       throw new ConnectorSpecError('AUDIENCE_MISSING', 'token-exchange requires >=1 tokenOrigin')
+    // token 端点路径:静态(无占位符 → 传空 params schema,任何 {…} 即拒)+ 常规路径安全形状。
+    validatePath(auth.exchangeRequest.path, { properties: {} })
     for (const src of Object.values(auth.exchangeRequest.credentialFieldNames)) {
       if (!TOKEN_EXCHANGE_SOURCES.has(src))
         throw new ConnectorSpecError(

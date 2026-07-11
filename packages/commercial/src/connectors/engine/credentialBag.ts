@@ -11,7 +11,7 @@
  */
 
 import { ConnectorError } from '../errors.js'
-import type { AuthModeValue } from '../spec/types.js'
+import type { AuthModeValue, ExecContractT } from '../spec/types.js'
 import type { ResolvedCredentials } from './placement.js'
 
 /** 用户 bind 时直填的凭据袋(明文,仅在 master 内存活;落库前 AEAD 加密)。 */
@@ -22,16 +22,26 @@ const MAX_SECRET_LEN = 4096
 const HAS_CONTROL = /[\x00-\x1f\x7f]/
 
 /**
- * 某 authMode 下**用户 bind 时必须直填**的 credential source 名集合。
- *   static-token → ['access_token'](单一长期 token)。
- *   其它 authMode:token 由 OAuth/交换流程获得,用户不直填 → 空集(后续切片按各自 bind 流程接)。
+ * 某 contract 下**用户 bind 时必须直填**的 credential source 名集合。
+ *   static-token → ['access_token'](单一长期 token,直接作 API 凭据)。
+ *   token-exchange → 交换请求引用的规范 source 去重(client_id/client_secret/refresh_token 等);
+ *     这些是**交换输入**,引擎据此换 access_token,用户不直填 access_token。
+ *   其它 authMode:后续切片按各自 bind 流程接。
  */
-export function requiredBindSources(authMode: AuthModeValue): readonly string[] {
-  switch (authMode) {
+export function requiredBindSources(contract: ExecContractT): string[] {
+  switch (contract.authMode) {
     case 'static-token':
       return ['access_token']
+    case 'token-exchange': {
+      if (contract.tokenAcquisition === undefined)
+        throw new ConnectorError('INTERNAL', 'token-exchange contract missing tokenAcquisition')
+      const set = new Set<string>(
+        Object.values(contract.tokenAcquisition.exchangeRequest.credentialFieldNames),
+      )
+      return [...set]
+    }
     default:
-      throw new ConnectorError('BAD_REQUEST', `authMode ${authMode} bind not supported yet`)
+      throw new ConnectorError('BAD_REQUEST', `authMode ${contract.authMode} bind not supported yet`)
   }
 }
 

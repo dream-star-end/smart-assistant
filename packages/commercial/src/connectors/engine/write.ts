@@ -28,9 +28,10 @@ import {
 import { canonicalSha256Hex } from '../spec/canonical.js'
 import type { ExecActionT } from '../spec/types.js'
 import { getDeclarativeConnection, decryptBagFromRow } from './binding.js'
-import { bagToResolvedCredentials } from './credentialBag.js'
+import { requiredBindSources } from './credentialBag.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
 import { loadContractForConnection, soleApiOrigin } from './execute.js'
+import { resolveApiCredentials } from './tokenEngine.js'
 import { type RedactedRequestPlan, buildRequestPlan, redactedPlan } from './requestPlan.js'
 
 function asObjectParams(params: unknown): Record<string, unknown> {
@@ -155,8 +156,13 @@ export async function executeDeclarativeWrite(
     throw new ConnectorError('ACTION_UNKNOWN', 'ledger action not a write action in pinned contract')
   }
 
-  const bag = decryptBagFromRow(row, contract.authMode)
-  const resolvedCreds = bagToResolvedCredentials(contract.authMode, bag)
+  const bag = decryptBagFromRow(row, requiredBindSources(contract))
+  const resolvedCreds = await resolveApiCredentials({
+    contract,
+    bag,
+    deps: input.deps,
+    cache: { connectionId: row.id, pool },
+  })
   const targetOrigin = soleApiOrigin(contract)
 
   try {

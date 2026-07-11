@@ -91,6 +91,7 @@ interface Captured {
   method: string
   path: string
   authorization: string | undefined
+  body: string
 }
 interface TestServer {
   port: number
@@ -109,12 +110,14 @@ function startServer(): Promise<TestServer> {
     })
     const server: Server = createServer((req, res) => {
       const u = new URL(req.url ?? '/', 'http://127.0.0.1')
-      req.resume()
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
       req.on('end', () => {
         requests.push({
           method: req.method ?? '',
           path: u.pathname,
           authorization: req.headers.authorization,
+          body: Buffer.concat(chunks).toString('utf8'),
         })
         const out = handler(u.pathname)
         res.statusCode = out.status
@@ -131,8 +134,8 @@ function startServer(): Promise<TestServer> {
           handler = fn
         },
         reset: () => {
+          // 只清请求日志,保留 handler(避免 reset 后忘记重设 handler 的坑)。
           requests.length = 0
-          handler = () => ({ status: 200, body: '{}' })
         },
         close: () => new Promise<void>((r) => server.close(() => r())),
       })
@@ -372,7 +375,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       // ── bind ──────────────────────────────────────────────────────────────
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, token: TOKEN, deps },
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
         getPool(),
       )
       assert.equal(bind.rebound, false)
@@ -428,7 +431,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, token: TOKEN, deps },
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
         getPool(),
       )
       server.reset()
@@ -456,7 +459,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: owner, connectorVersionId: conn.versionId, token: TOKEN, deps },
+        { userId: owner, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
         getPool(),
       )
       await assert.rejects(
@@ -480,7 +483,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, token: TOKEN, deps },
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
         getPool(),
       )
       await revokeExecVersion(conn.versionId, getPool())
@@ -506,7 +509,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       server.setHandler(() => ({ status: 401, body: '{}' }))
       await assert.rejects(
         bindDeclarativeConnector(
-          { userId: user, connectorVersionId: conn.versionId, token: TOKEN, deps },
+          { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
           getPool(),
         ),
         isConnErr('UPSTREAM_AUTH_FAILED'),
@@ -530,11 +533,11 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const first = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, token: TOKEN, deps },
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
         getPool(),
       )
       const second = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, token: `${TOKEN}-v2`, deps },
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: `${TOKEN}-v2` }, deps },
         getPool(),
       )
       assert.equal(first.rebound, false)
@@ -561,7 +564,7 @@ async function boundConnection(
   const userId = await mkUser()
   server.setHandler(identityHandler())
   const bind = await bindDeclarativeConnector(
-    { userId, connectorVersionId: conn.versionId, token: TOKEN, deps },
+    { userId, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
     getPool(),
   )
   server.reset()
@@ -651,7 +654,7 @@ describe('声明式写门 propose→approve→execute', () => {
       server.setHandler(identityHandler())
       const conn2 = await approvedConnector()
       const bind2 = await bindDeclarativeConnector(
-        { userId: a.userId, connectorVersionId: conn2.versionId, token: `${TOKEN}-2`, deps },
+        { userId: a.userId, connectorVersionId: conn2.versionId, secrets: { access_token: `${TOKEN}-2` }, deps },
         getPool(),
       )
       server.reset()
@@ -667,6 +670,287 @@ describe('声明式写门 propose→approve→execute', () => {
           getPool(),
         ),
         isConnErr('BAD_REQUEST'),
+      )
+    } finally {
+      await server.close()
+    }
+  })
+})
+
+// ─── token-exchange 垂直(slice⑤ token 引擎:凭据→交换→缓存→注入) ─────────────
+
+/** 交换凭据 canary:client_secret 只能出现在发往 /token 的 body,绝不进 API 请求。 */
+const CLIENT_SECRET = 'EXCH-SECRET-CANARY-7a1b2c3d-DO-NOT-LEAK'
+/** 交换换回的短寿命 access_token(≠ 上面的 secret)。 */
+const EXCHANGED = 'EXCHANGED-ACCESS-abc123def456'
+
+function tokenExchangeSpecFixture(slug: string): Record<string, unknown> {
+  return {
+    id: slug,
+    label: 'Feishu-like',
+    description: 'tenant token exchange connector',
+    authMode: 'token-exchange',
+    auth: {
+      exchangeRequest: {
+        method: 'POST',
+        path: '/token',
+        encoding: 'json',
+        credentialFieldNames: { app_id: 'client_id', app_secret: 'client_secret' },
+        staticFields: {},
+      },
+      tokenResponse: {},
+      tokenOutputs: { accessToken: '/access_token', expiresIn: '/expires_in' },
+      apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+    },
+    originMode: 'fixed-reviewed',
+    credentialPipeline: {
+      nodes: [
+        { id: 'tenant-token', authMode: 'token-exchange', subject: 'app', audience: 'token' },
+        {
+          id: 'api-cred',
+          authMode: 'token-exchange',
+          subject: 'app',
+          audience: 'api',
+          dependsOn: ['tenant-token'],
+        },
+      ],
+    },
+    actions: [
+      {
+        id: 'whoami',
+        description: 'identity probe',
+        request: { method: 'GET', pathTemplate: '/v1/users/me' },
+        params: { type: 'object', additionalProperties: false },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { bot_id: { type: 'string' }, workspace_name: { type: 'string' } },
+        },
+        usesSlot: 'api-cred',
+      },
+      {
+        id: 'get_page',
+        description: 'get a page',
+        request: { method: 'GET', pathTemplate: '/v1/pages/{/params/pageId}' },
+        params: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { pageId: { type: 'string' } },
+          required: ['pageId'],
+        },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' }, title: { type: 'string' } },
+        },
+        usesSlot: 'api-cred',
+      },
+    ],
+    identity: {
+      probeActionId: 'whoami',
+      accountKeyPointer: '/bot_id',
+      accountHintPointer: '/workspace_name',
+    },
+  }
+}
+
+const txDecision = {
+  audience: {
+    authorizationOrigins: [],
+    tokenOrigins: [API_ORIGIN],
+    apiOrigins: [API_ORIGIN],
+    unauthenticatedUploadOrigins: [],
+  },
+  actions: {},
+}
+
+async function approvedTokenExchange(): Promise<{ versionId: number; slug: string }> {
+  seq += 1
+  const slug = `feishu-${seq}-${Date.now() % 1_000_000}`
+  const spec = tokenExchangeSpecFixture(slug)
+  const author = await mkUser()
+  const reviewer = await mkUser('admin')
+  const raw = JSON.stringify(spec)
+  const specHash = canonicalSha256Hex(spec)
+  await query('INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)', [
+    slug,
+    author,
+    'connector',
+  ])
+  const v = await query<{ id: string }>(
+    `INSERT INTO marketplace_skill_versions
+       (slug, version, name, description, raw_artifact, artifact_hash, embedding_hash, submitted_by, status)
+     VALUES ($1,'1.0.0',$2,'d',$3,$4,$4,$5,'pending') RETURNING id::text AS id`,
+    [slug, slug, raw, specHash, author],
+  )
+  const versionId = Number(v.rows[0]!.id)
+  await securityApprove({
+    versionId,
+    reviewerUserId: reviewer,
+    securityDecision: txDecision,
+    expectedSpecHash: specHash,
+    pool: getPool(),
+  })
+  return { versionId, slug }
+}
+
+/** /token 返回可配 access_token+expires_in;/v1/users/me 身份;/v1/pages/* 页。 */
+function exchangeHandler(expiresIn: number): (p: string) => { status: number; body: string } {
+  return (p) => {
+    if (p === '/token')
+      return { status: 200, body: JSON.stringify({ access_token: EXCHANGED, expires_in: expiresIn }) }
+    if (p === '/v1/users/me')
+      return { status: 200, body: JSON.stringify({ bot_id: 'bot-x', workspace_name: 'WS' }) }
+    if (p.startsWith('/v1/pages/'))
+      return { status: 200, body: JSON.stringify({ id: p.split('/').pop(), title: 'T', secret: 'LEAK' }) }
+    return { status: 404, body: '{}' }
+  }
+}
+
+function countPath(server: TestServer, path: string): number {
+  return server.requests.filter((r) => r.path === path).length
+}
+
+describe('声明式 token-exchange 垂直', () => {
+  test('bind 换 token 跑探针;execute 换+缓存+注入;client_secret 只进 /token', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { versionId } = await approvedTokenExchange()
+      const user = await mkUser()
+
+      // ── bind:交换 → 探针 ────────────────────────────────────────────────────
+      server.setHandler(exchangeHandler(7200))
+      const bind = await bindDeclarativeConnector(
+        {
+          userId: user,
+          connectorVersionId: versionId,
+          secrets: { client_id: 'app-1', client_secret: CLIENT_SECRET },
+          deps,
+        },
+        getPool(),
+      )
+      assert.equal(bind.accountHint, 'WS')
+      const tokenReq = server.requests.find((r) => r.path === '/token')
+      assert.ok(tokenReq, 'exchange happened')
+      assert.ok(tokenReq!.body.includes(CLIENT_SECRET), 'client_secret in /token body')
+      const probeReq = server.requests.find((r) => r.path === '/v1/users/me')
+      assert.equal(probeReq!.authorization, `Bearer ${EXCHANGED}`) // 探针用换回的 token
+
+      // ── execute:缓存 miss → 再换一次 + 落缓存 → 注入 API ──────────────────────
+      server.reset()
+      const out1 = await executeDeclarativeAction(
+        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'p1' }, deps },
+        getPool(),
+      )
+      assert.deepEqual(out1, { id: 'p1', title: 'T' }) // secret 剥掉
+      assert.equal(countPath(server, '/token'), 1) // 首次 execute 换一次
+      const apiReq = server.requests.find((r) => r.path === '/v1/pages/p1')
+      assert.equal(apiReq!.authorization, `Bearer ${EXCHANGED}`)
+
+      // ── 第二次 execute:缓存命中 → 不再打 /token ──────────────────────────────
+      server.reset()
+      await executeDeclarativeAction(
+        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'p2' }, deps },
+        getPool(),
+      )
+      assert.equal(countPath(server, '/token'), 0) // 命中缓存,零交换
+      assert.equal(countPath(server, '/v1/pages/p2'), 1)
+
+      // ── 不变量:client_secret 绝不出现在任何 /v1/* 请求(header/body) ─────────
+      for (const r of server.requests.filter((x) => x.path.startsWith('/v1/'))) {
+        assert.ok(!(r.authorization ?? '').includes(CLIENT_SECRET))
+        assert.ok(!r.body.includes(CLIENT_SECRET))
+      }
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('token 近过期 → 每次 execute 重换(缓存 skew 生效)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { versionId } = await approvedTokenExchange()
+      const user = await mkUser()
+      server.setHandler(exchangeHandler(10)) // 10s TTL < 60s skew → 恒视作过期
+      const bind = await bindDeclarativeConnector(
+        {
+          userId: user,
+          connectorVersionId: versionId,
+          secrets: { client_id: 'app-1', client_secret: CLIENT_SECRET },
+          deps,
+        },
+        getPool(),
+      )
+      server.reset()
+      await executeDeclarativeAction(
+        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'a' }, deps },
+        getPool(),
+      )
+      await executeDeclarativeAction(
+        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'b' }, deps },
+        getPool(),
+      )
+      assert.equal(countPath(server, '/token'), 2) // 两次都重换(近过期)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('bind 交换 401 → UPSTREAM_AUTH_FAILED 不落连接', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { versionId } = await approvedTokenExchange()
+      const user = await mkUser()
+      server.setHandler((p) => (p === '/token' ? { status: 401, body: '{}' } : { status: 404, body: '{}' }))
+      await assert.rejects(
+        bindDeclarativeConnector(
+          {
+            userId: user,
+            connectorVersionId: versionId,
+            secrets: { client_id: 'app-1', client_secret: CLIENT_SECRET },
+            deps,
+          },
+          getPool(),
+        ),
+        isConnErr('UPSTREAM_AUTH_FAILED'),
+      )
+      const cnt = await query<{ n: string }>(
+        'SELECT count(*)::text AS n FROM connections WHERE user_id = $1',
+        [user],
+      )
+      assert.equal(cnt.rows[0]!.n, '0')
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('交换 200 但无 access_token → UPSTREAM_AUTH_FAILED', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { versionId } = await approvedTokenExchange()
+      const user = await mkUser()
+      server.setHandler((p) =>
+        p === '/token' ? { status: 200, body: JSON.stringify({ code: 99991663 }) } : { status: 404, body: '{}' },
+      )
+      await assert.rejects(
+        bindDeclarativeConnector(
+          {
+            userId: user,
+            connectorVersionId: versionId,
+            secrets: { client_id: 'app-1', client_secret: CLIENT_SECRET },
+            deps,
+          },
+          getPool(),
+        ),
+        isConnErr('UPSTREAM_AUTH_FAILED'),
       )
     } finally {
       await server.close()

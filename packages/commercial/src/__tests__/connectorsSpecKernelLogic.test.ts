@@ -394,6 +394,7 @@ describe('compileSpec', () => {
       auth: {
         exchangeRequest: {
           method: 'POST',
+          path: '/open-apis/auth/v3/tenant_access_token/internal',
           encoding: 'json',
           credentialFieldNames: { app_id: 'client_id', app_secret: 'client_secret' },
           staticFields: {},
@@ -444,6 +445,7 @@ describe('compileSpec', () => {
     assert.ok(c.tokenAcquisition, 'tokenAcquisition carried')
     assert.deepEqual((c.tokenAcquisition as Record<string, unknown>).exchangeRequest, {
       method: 'POST',
+      path: '/open-apis/auth/v3/tenant_access_token/internal',
       encoding: 'json',
       credentialFieldNames: { app_id: 'client_id', app_secret: 'client_secret' },
       staticFields: {},
@@ -558,6 +560,7 @@ describe('compileSpec', () => {
     spec.auth = {
       exchangeRequest: {
         method: 'POST',
+        path: '/token',
         encoding: 'json',
         credentialFieldNames: { appid: 'client_id', secret: 'client_secret' },
       },
@@ -624,6 +627,7 @@ describe('compileSpec', () => {
     spec.auth = {
       exchangeRequest: {
         method: 'POST',
+        path: '/token',
         encoding: 'json',
         credentialFieldNames: { appid: 'client_id' },
       },

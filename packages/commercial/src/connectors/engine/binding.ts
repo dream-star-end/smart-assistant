@@ -24,13 +24,8 @@ import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { getPool } from '../../db/index.js'
 import { tx } from '../../db/queries.js'
 import { ConnectorError } from '../errors.js'
-import type { AuthModeValue } from '../spec/types.js'
 import { connectionAad } from '../store.js'
-import {
-  type DeclarativeSecretBag,
-  requiredBindSources,
-  validateSecretBag,
-} from './credentialBag.js'
+import { type DeclarativeSecretBag, validateSecretBag } from './credentialBag.js'
 
 /** 声明式连接行(读取执行/撤销所需列)。 */
 export interface DeclarativeConnectionRow {
@@ -69,7 +64,6 @@ export interface InsertDeclarativeConnectionInput {
   authContractVersion: number
   /** computeAccountKey(canonicalAccountIdentity) 的 HMAC。 */
   accountKey: string
-  authMode: AuthModeValue
   bag: DeclarativeSecretBag
   displayName?: string
   /** 展示元数据(account_hint 等;严禁凭据)。 */
@@ -160,10 +154,10 @@ export async function getDeclarativeConnection(
   return r.rows[0] ?? null
 }
 
-/** 解密声明式连接的凭据袋(解密 + 按 authMode 需要的 source 复校验)。 */
+/** 解密声明式连接的凭据袋(解密 + 按 contract 需要的 source 复校验;sources 由调用方从 contract 算)。 */
 export function decryptBagFromRow(
   row: DeclarativeConnectionRow,
-  authMode: AuthModeValue,
+  sources: readonly string[],
 ): DeclarativeSecretBag {
   if (row.secret_enc === null || row.secret_nonce === null)
     throw new ConnectorError('CONNECTION_REVOKED', 'connection has no secret')
@@ -177,7 +171,7 @@ export function decryptBagFromRow(
       connectionAad(row.aad_seed, row.user_id, row.provider),
     )
     const parsed = JSON.parse(pt.toString('utf8')) as unknown
-    validateSecretBag(parsed, requiredBindSources(authMode))
+    validateSecretBag(parsed, sources)
     return parsed
   } catch (e) {
     if (e instanceof ConnectorError) throw e

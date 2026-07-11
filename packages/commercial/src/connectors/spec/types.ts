@@ -251,6 +251,31 @@ const Encoding = Type.Union([
   Type.Literal('basic-auth'),
 ])
 
+/**
+ * token 交换请求形状(**单一定义**:TokenExchangeAuth 与 ExecContract.tokenAcquisition 共用,
+ * 消除漂移)。`path`=token 端点路径(作者声明,发往 reviewer 批准的 tokenOrigin;编译期校验形状);
+ * credentialFieldNames:交换请求字段名 → 规范凭据 source 名(引擎注入进 body/basic-auth)。
+ */
+export const ExchangeRequestSpec = Type.Object(
+  {
+    method: HttpMethod,
+    path: Type.String({ minLength: 1, maxLength: 1024, pattern: '^/' }),
+    encoding: Encoding,
+    credentialFieldNames: Type.Record(QueryName, Type.String({ minLength: 1, maxLength: 64 })),
+    staticFields: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
+    grantValue: Type.Optional(Type.String({ maxLength: 128 })),
+  },
+  strict,
+)
+export const TokenResponseSpec = Type.Object(
+  {
+    successPredicate: Type.Optional(ResponsePointer),
+    // token/expires 指针的**唯一权威** = tokenOutputs(不在此重复,P1-5②)。
+    providerErrorCodePointer: Type.Optional(ResponsePointer),
+  },
+  strict,
+)
+
 const Oauth2Auth = Type.Object(
   {
     authorizeEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
@@ -275,24 +300,8 @@ const Oauth2Auth = Type.Object(
 
 const TokenExchangeAuth = Type.Object(
   {
-    exchangeRequest: Type.Object(
-      {
-        method: HttpMethod,
-        encoding: Encoding,
-        credentialFieldNames: Type.Record(QueryName, Type.String({ maxLength: 64 })),
-        staticFields: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
-        grantValue: Type.Optional(Type.String({ maxLength: 128 })),
-      },
-      strict,
-    ),
-    tokenResponse: Type.Object(
-      {
-        successPredicate: Type.Optional(ResponsePointer),
-        // token/expires 指针的**唯一权威** = tokenOutputs(不在此重复,P1-5②)。
-        providerErrorCodePointer: Type.Optional(ResponsePointer),
-      },
-      strict,
-    ),
+    exchangeRequest: ExchangeRequestSpec,
+    tokenResponse: TokenResponseSpec,
     tokenOutputs: TokenOutputs,
     apiCredentialPlacements: Type.Array(ApiCredentialPlacement, { minItems: 1, maxItems: 8 }),
   },
@@ -340,23 +349,8 @@ const WebdavBasicAuth = Type.Object({}, strict)
  */
 export const TokenAcquisition = Type.Object(
   {
-    exchangeRequest: Type.Object(
-      {
-        method: HttpMethod,
-        encoding: Encoding,
-        credentialFieldNames: Type.Record(QueryName, Type.String({ minLength: 1, maxLength: 64 })),
-        staticFields: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
-        grantValue: Type.Optional(Type.String({ maxLength: 128 })),
-      },
-      strict,
-    ),
-    tokenResponse: Type.Object(
-      {
-        successPredicate: Type.Optional(ResponsePointer),
-        providerErrorCodePointer: Type.Optional(ResponsePointer),
-      },
-      strict,
-    ),
+    exchangeRequest: ExchangeRequestSpec,
+    tokenResponse: TokenResponseSpec,
   },
   strict,
 )

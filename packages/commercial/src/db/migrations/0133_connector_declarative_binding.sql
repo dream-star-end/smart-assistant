@@ -8,8 +8,8 @@
 --
 -- 四个 pin 列(connector_version_id / spec_hash / exec_contract_hash / auth_contract_version)在
 -- 0132 已 additive 加好(可空,兼容 v1 行);声明式行由应用层保证四列非空,v1 行留空。
-
-BEGIN;
+--
+-- 注:runner 已把整文件包在 BEGIN…INSERT schema_migrations…COMMIT 里,本文件只写 DDL(0130/0132 惯例)。
 
 -- 1. provider 从枚举 CHECK → slug 形状(与 ConnectorSpec.id / listing slug 同形)。
 ALTER TABLE connections DROP CONSTRAINT IF EXISTS connections_provider_check;
@@ -22,5 +22,3 @@ CREATE INDEX IF NOT EXISTS connections_user_version
   WHERE revoked_at IS NULL AND connector_version_id IS NOT NULL;
 
 COMMENT ON COLUMN connections.provider IS 'v1=硬编码 provider 名;声明式=listing slug(应用层校验指向真实 listing)';
-
-COMMIT;
