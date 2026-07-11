@@ -1,5 +1,6 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import {
+  ArrowUp,
   Brush,
   Eraser,
   LassoSelect,
@@ -8,6 +9,7 @@ import {
   Plus,
   Redo2,
   RotateCcw,
+  SlidersHorizontal,
   Square,
   Undo2,
   X,
@@ -93,6 +95,31 @@ function hasSelection(canvas: HTMLCanvasElement): boolean {
   return false
 }
 
+/** 左侧竖直锥形笔刷滑杆(粗上细下,圆头拖点)。纯 UI —— 只读写外部 brushSize,
+ * 无自身逻辑状态。竖直方向用 writing-mode(现代浏览器原生竖向 range),direction:rtl
+ * 让「顶部=最粗」。锥形轨道为装饰层(clip-path 梯形),真正的可拖点是覆盖其上的 range。 */
+function BrushSlider({ value, onChange }: { value: number; onChange: (n: number) => void }) {
+  return (
+    <div className="relative flex h-48 w-12 items-center justify-center">
+      <span
+        aria-hidden
+        className="absolute inset-y-3 left-1/2 -translate-x-1/2 bg-white/20"
+        style={{ width: '26px', clipPath: 'polygon(0 0, 100% 0, 66% 100%, 34% 100%)' }}
+      />
+      <input
+        type="range"
+        min={12}
+        max={180}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        aria-label="画笔粗细"
+        className="relative z-10 cursor-pointer accent-white"
+        style={{ writingMode: 'vertical-lr', direction: 'rtl', height: '160px' }}
+      />
+    </div>
+  )
+}
+
 /** Native-canvas editor shared by desktop and mobile. One pointer draws;
  * two pointers pan/zoom. Undo history is compressed PNG blobs rather than
  * full ImageData frames, keeping large mobile images within a bounded memory
@@ -158,7 +185,9 @@ export function ImageAnnotationEditor({
     overlayCtx.globalCompositeOperation = 'source-over'
     overlayCtx.drawImage(mask, 0, 0)
     overlayCtx.globalCompositeOperation = 'source-in'
-    overlayCtx.fillStyle = 'rgba(255,49,88,.42)'
+    // 半透明蓝覆盖(对齐参考图选区视觉)。仅改显示层 tint 颜色,不影响 submit() 从
+    // mask canvas alpha 另建的二值 mask —— 选区/上传管线字节保真。
+    overlayCtx.fillStyle = 'rgba(56,132,255,.42)'
     overlayCtx.fillRect(0, 0, canvas.width, canvas.height)
     ctx.drawImage(overlay, 0, 0)
   }, [])
@@ -501,11 +530,28 @@ export function ImageAnnotationEditor({
       aria-pressed={tool === value}
       className={cn(
         'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
-        tool === value ? 'bg-primary text-primary-fg' : 'bg-hover text-fg hover:bg-border',
+        tool === value ? 'bg-white text-black' : 'text-white hover:bg-white/10',
       )}
     >
       {icon}
-      <span className="hidden sm:inline">{label}</span>
+      <span>{label}</span>
+    </button>
+  )
+
+  const RoundBtn = ({
+    label,
+    icon,
+    onClick,
+    disabled,
+  }: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }) => (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
+    >
+      {icon}
     </button>
   )
 
@@ -513,162 +559,141 @@ export function ImageAnnotationEditor({
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <Dialog.Portal>
         <Dialog.Overlay
-          className="fixed inset-x-0 z-[70] bg-black/70 backdrop-blur-sm"
+          className="fixed inset-x-0 z-[70] bg-black/95 backdrop-blur-sm"
           style={{ top: 'var(--oc-visual-offset-top, 0px)', height: 'var(--oc-visual-height, 100dvh)' }}
         />
         <Dialog.Content
           aria-describedby="image-edit-help"
-          className="fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 flex-col bg-bg outline-none sm:inset-x-4 sm:top-[calc(var(--oc-visual-offset-top,0px)+1rem)] sm:h-[calc(var(--oc-visual-height,100dvh)-2rem)] sm:rounded-2xl sm:border sm:border-border sm:shadow-float lg:inset-x-[7vw] lg:top-[calc(var(--oc-visual-offset-top,0px)+2rem)] lg:h-[calc(var(--oc-visual-height,100dvh)-4rem)]"
+          className="fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-black text-white outline-none"
         >
-          <header className="flex min-h-14 items-center gap-3 border-b border-border px-4 pt-[env(safe-area-inset-top)]">
-            <div className="min-w-0 flex-1">
-              <Dialog.Title className="truncate font-semibold">圈选要修改的区域</Dialog.Title>
-              <p id="image-edit-help" className="text-xs text-muted">
-                红色区域会交给 Image 2 重绘，每张 50 积分
-              </p>
-            </div>
+          {/* 顶栏:X | 已选中区域/圈选要修改的区域(居中) | 发送 */}
+          <header className="relative flex min-h-14 shrink-0 items-center justify-between gap-3 px-3 pt-[env(safe-area-inset-top)]">
             <Dialog.Close asChild>
               <button
                 type="button"
                 aria-label="关闭图片编辑器"
-                className="flex size-11 items-center justify-center rounded-xl hover:bg-hover"
+                className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
               >
                 <X size={20} />
               </button>
             </Dialog.Close>
+            <div className="pointer-events-none absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center pt-[env(safe-area-inset-top)]">
+              <Dialog.Title className="text-sm font-semibold">
+                {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
+              </Dialog.Title>
+              <span className="text-[11px] text-white/60">Image 2 · 每张 50 积分</span>
+            </div>
+            <button
+              type="button"
+              disabled={!canSubmit}
+              onClick={() => void submit()}
+              className="flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {submitting ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" /> 提交…
+                </>
+              ) : (
+                <>
+                  发送 <ArrowUp size={16} />
+                </>
+              )}
+            </button>
           </header>
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
-            <section className="flex min-h-[240px] flex-[1_0_55vh] flex-col bg-black/5 lg:min-h-0 lg:flex-1">
-              <div className="flex flex-wrap items-center gap-2 border-b border-border bg-surface px-3 py-2">
-                <ToolButton value="brush" label="画笔" icon={<Brush size={18} />} />
-                <ToolButton value="rect" label="矩形" icon={<Square size={18} />} />
-                <ToolButton value="lasso" label="套索" icon={<LassoSelect size={18} />} />
-                <ToolButton value="erase" label="橡皮" icon={<Eraser size={18} />} />
-                <label className="flex min-h-11 items-center gap-2 rounded-xl bg-hover px-3 text-xs">
-                  粗细
-                  <input
-                    aria-label="画笔粗细"
-                    type="range"
-                    min="12"
-                    max="180"
-                    value={brushSize}
-                    onChange={(e) => setBrushSize(Number(e.target.value))}
-                    className="w-24"
-                  />
-                </label>
-                <button
-                  type="button"
-                  aria-label="撤销"
-                  disabled={historyPending || historyRef.current.length === 0}
-                  onClick={() => void undo()}
-                  className="flex size-11 items-center justify-center rounded-xl hover:bg-hover disabled:opacity-35"
-                >
-                  <Undo2 size={18} />
-                </button>
-                <button
-                  type="button"
-                  aria-label="重做"
-                  disabled={historyPending || redoRef.current.length === 0}
-                  onClick={() => void redo()}
-                  className="flex size-11 items-center justify-center rounded-xl hover:bg-hover disabled:opacity-35"
-                >
-                  <Redo2 size={18} />
-                </button>
-                <button
-                  type="button"
-                  disabled={historyPending}
-                  onClick={() => void clear()}
-                  className="flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm hover:bg-hover disabled:opacity-35"
-                >
-                  <RotateCcw size={17} />
-                  清空
-                </button>
-                <button
-                  type="button"
-                  aria-label="缩小画布"
-                  onClick={() => zoomBy(1 / 1.2)}
-                  disabled={view.scale <= 1}
-                  className="flex size-11 items-center justify-center rounded-xl hover:bg-hover disabled:opacity-35"
-                >
-                  <Minus size={18} />
-                </button>
-                <span className="min-w-11 text-center text-xs text-muted">{Math.round(view.scale * 100)}%</span>
-                <button
-                  type="button"
-                  aria-label="放大画布"
-                  onClick={() => zoomBy(1.2)}
-                  disabled={view.scale >= 4}
-                  className="flex size-11 items-center justify-center rounded-xl hover:bg-hover disabled:opacity-35"
-                >
-                  <Plus size={18} />
-                </button>
-                {(view.scale > 1 || Math.abs(view.x) > 1 || Math.abs(view.y) > 1) && (
-                  <button
-                    type="button"
-                    onClick={() => setView({ scale: 1, x: 0, y: 0 })}
-                    className="min-h-11 rounded-xl px-3 text-sm hover:bg-hover"
-                  >
-                    适应画布
-                  </button>
-                )}
+          {/* 画布区:左侧竖直笔刷滑杆 + 居中画布 */}
+          <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-3 py-2">
+            {loading && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center text-white/80">
+                <Loader2 className="animate-spin" />
+                &nbsp;正在打开图片…
               </div>
-              <div className="relative flex min-h-[280px] flex-1 items-center justify-center overflow-auto p-3 sm:p-5">
-                {loading && (
-                  <div className="absolute inset-0 z-10 flex items-center justify-center bg-bg/70">
-                    <Loader2 className="animate-spin" />
-                    &nbsp;正在打开图片…
-                  </div>
-                )}
-                <canvas
-                  ref={visibleRef}
-                  onPointerDown={pointerDown}
-                  onPointerMove={pointerMove}
-                  onPointerUp={pointerUp}
-                  onPointerCancel={pointerUp}
-                  onWheel={wheelZoom}
-                  aria-busy={historyPending}
-                  className="max-h-full max-w-full origin-center rounded-lg bg-white object-contain shadow-float [touch-action:none]"
-                  style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
-                />
-              </div>
-            </section>
-            <aside className="shrink-0 border-t border-border bg-surface p-4 pb-[max(1rem,env(safe-area-inset-bottom))] lg:w-[330px] lg:overflow-y-auto lg:border-l lg:border-t-0">
-              <label className="mb-2 block text-sm font-medium" htmlFor="image-edit-prompt">
-                希望怎样修改？
-              </label>
+            )}
+            <div className="absolute left-2 top-1/2 z-10 -translate-y-1/2">
+              <BrushSlider value={brushSize} onChange={setBrushSize} />
+            </div>
+            <canvas
+              ref={visibleRef}
+              onPointerDown={pointerDown}
+              onPointerMove={pointerMove}
+              onPointerUp={pointerUp}
+              onPointerCancel={pointerUp}
+              onWheel={wheelZoom}
+              aria-busy={historyPending}
+              className="max-h-full max-w-full origin-center rounded-lg bg-white object-contain shadow-float [touch-action:none]"
+              style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
+            />
+          </div>
+          {/* 底栏:提示词输入条 + 居中撤销/重做 + 更多工具/缩放(次级) */}
+          <div className="flex shrink-0 flex-col gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
+            {error && (
+              <p role="alert" className="mx-auto max-w-2xl rounded-lg bg-danger/25 px-3 py-1.5 text-center text-sm text-white">
+                {error}
+              </p>
+            )}
+            <div className="mx-auto flex w-full max-w-2xl items-end gap-2 rounded-2xl bg-white/10 px-3 py-2 backdrop-blur">
               <textarea
                 id="image-edit-prompt"
+                aria-label="希望怎样修改"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
-                rows={4}
+                rows={1}
                 maxLength={1200}
-                placeholder="例如：把圈选的白色杯子改成透明玻璃杯，保持光影和其它部分不变"
-                className="w-full resize-none rounded-xl border border-border bg-bg p-3 text-base leading-relaxed outline-none focus:border-border-strong"
+                placeholder="描述想要的修改，例如：把杯子改成透明玻璃材质"
+                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/40"
               />
-              <p className="mt-2 text-xs leading-relaxed text-muted">
-                只重绘圈选区域；未圈选部分会按原图像素保留。手机可双指缩放、移动画布。
-              </p>
-              {error && (
-                <p role="alert" className="mt-3 rounded-lg bg-danger/10 p-2 text-sm text-danger">
-                  {error}
-                </p>
+            </div>
+            <p id="image-edit-help" className="sr-only">
+              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。每张 50 积分。
+            </p>
+            <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-2">
+              {/* 次级:矩形/套索/橡皮/清空收进「更多工具」 */}
+              <details className="relative">
+                <summary className="flex size-11 cursor-pointer list-none items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [&::-webkit-details-marker]:hidden">
+                  <SlidersHorizontal size={18} />
+                  <span className="sr-only">更多工具</span>
+                </summary>
+                <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
+                  <ToolButton value="brush" label="画笔" icon={<Brush size={18} />} />
+                  <ToolButton value="rect" label="矩形" icon={<Square size={18} />} />
+                  <ToolButton value="lasso" label="套索" icon={<LassoSelect size={18} />} />
+                  <ToolButton value="erase" label="橡皮" icon={<Eraser size={18} />} />
+                  <button
+                    type="button"
+                    disabled={historyPending}
+                    onClick={() => void clear()}
+                    className="flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm text-white hover:bg-white/10 disabled:opacity-35"
+                  >
+                    <RotateCcw size={17} /> 清空
+                  </button>
+                </div>
+              </details>
+              {/* 主级:撤销/重做居中 */}
+              <RoundBtn
+                label="撤销"
+                icon={<Undo2 size={18} />}
+                disabled={historyPending || historyRef.current.length === 0}
+                onClick={() => void undo()}
+              />
+              <RoundBtn
+                label="重做"
+                icon={<Redo2 size={18} />}
+                disabled={historyPending || redoRef.current.length === 0}
+                onClick={() => void redo()}
+              />
+              {/* 次级:缩放 */}
+              <RoundBtn label="缩小画布" icon={<Minus size={18} />} disabled={view.scale <= 1} onClick={() => zoomBy(1 / 1.2)} />
+              <span className="min-w-11 text-center text-xs text-white/60">{Math.round(view.scale * 100)}%</span>
+              <RoundBtn label="放大画布" icon={<Plus size={18} />} disabled={view.scale >= 4} onClick={() => zoomBy(1.2)} />
+              {(view.scale > 1 || Math.abs(view.x) > 1 || Math.abs(view.y) > 1) && (
+                <button
+                  type="button"
+                  onClick={() => setView({ scale: 1, x: 0, y: 0 })}
+                  className="min-h-11 rounded-full px-3 text-sm text-white hover:bg-white/10"
+                >
+                  适应
+                </button>
               )}
-              <button
-                type="button"
-                disabled={!canSubmit}
-                onClick={() => void submit()}
-                className="mt-4 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 font-semibold text-primary-fg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {submitting ? (
-                  <>
-                    <Loader2 size={18} className="animate-spin" />
-                    正在提交…
-                  </>
-                ) : (
-                  '使用 Image 2 修改 · 50 积分'
-                )}
-              </button>
-            </aside>
+            </div>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

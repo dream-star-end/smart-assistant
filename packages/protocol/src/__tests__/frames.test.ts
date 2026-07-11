@@ -140,9 +140,78 @@ describe('InboundMessage schema', () => {
   })
 })
 
+describe('InboundMessage.imageEdit — annotated / outpaint (v5 图片体验)', () => {
+  const withImageEdit = (imageEdit: Record<string, unknown>) => ({
+    ...(baseInbound() as object),
+    content: { text: 'edit', media: [], imageEdit },
+  })
+  it('accepts a legacy annotated imageEdit without mode (backward compat)', () => {
+    assert.equal(
+      Value.Check(
+        InboundMessage,
+        withImageEdit({
+          clientJobId: '0'.repeat(32),
+          sourceIndex: 0,
+          maskIndex: 1,
+          guideIndex: 2,
+          width: 1024,
+          height: 768,
+        }),
+      ),
+      true,
+    )
+  })
+  it('accepts an outpaint imageEdit with mode + targetAspect and no maskIndex', () => {
+    assert.equal(
+      Value.Check(
+        InboundMessage,
+        withImageEdit({
+          clientJobId: '0'.repeat(32),
+          mode: 'outpaint',
+          sourceIndex: 0,
+          guideIndex: 1,
+          targetAspect: '16:9',
+          width: 1024,
+          height: 768,
+        }),
+      ),
+      true,
+    )
+  })
+  it('rejects an unsupported targetAspect literal', () => {
+    assert.equal(
+      Value.Check(
+        InboundMessage,
+        withImageEdit({
+          clientJobId: '0'.repeat(32),
+          mode: 'outpaint',
+          sourceIndex: 0,
+          guideIndex: 1,
+          targetAspect: '2:1',
+          width: 1024,
+          height: 768,
+        }),
+      ),
+      false,
+    )
+  })
+})
+
 describe('OutboundMessage schema', () => {
   it('accepts frame without traceId (backward compat)', () => {
     assert.equal(Value.Check(OutboundMessage, baseOutboundMsg()), true)
+  })
+  it('accepts an image-edit delivery frame carrying imageEditJobId', () => {
+    assert.equal(
+      Value.Check(OutboundMessage, { ...(baseOutboundMsg() as object), imageEditJobId: 'a'.repeat(32) }),
+      true,
+    )
+  })
+  it('rejects a malformed imageEditJobId (not 32 hex)', () => {
+    assert.equal(
+      Value.Check(OutboundMessage, { ...(baseOutboundMsg() as object), imageEditJobId: 'nope' }),
+      false,
+    )
   })
   it('accepts valid traceId', () => {
     assert.equal(

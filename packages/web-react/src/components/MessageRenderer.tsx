@@ -22,6 +22,7 @@ import {
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
@@ -66,6 +67,18 @@ export const MessageRenderer = memo(
         // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
         return <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />;
       case "tool": {
+        // 模型原生 imagegen(codex:imageGeneration)running → 生成占位卡(需求 C，粒子特效框);
+        // 完成/失败回落 ToolCardSlot。running 判定语义与 bodies.tsx 一致(按 tool._completed/error
+        // + input.status,不 import bodies 内部),保证两处对同一态的判断不漂移。
+        if (message.toolName === "codex:imageGeneration") {
+          const input = resolveToolInput(message);
+          const failedStatus = /^(failed|error)$/i.test(asStr(input?.status)) || !!message.error;
+          const running = !message._completed && !message.error && !failedStatus;
+          if (running) {
+            // native imagegen 不带目标比例 → 默认 1:1(规格 §36);startedAt = 工具行 mint 时刻。
+            return <GeneratingPlaceholderCard aspect={1} status="running" startedAt={message.ts} />;
+          }
+        }
         // 任务列表(TodoWrite):当前活跃段且本轮进行中 → 由钉在输入框上方的 PinnedTaskTracker
         // (HUD)接管,inline 卡抑制避免上下重复;历史段(或 turn 已结束、HUD 隐藏后)渲染
         // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
@@ -336,7 +349,9 @@ export function MessageList({
     !!last &&
     last.role !== "assistant" &&
     last.role !== "thinking" &&
-    last.role !== "permission";
+    last.role !== "permission" &&
+    // 生成占位卡本身即进度指示器(粒子框 + 角标),末条是占位时不再叠裸 typing 三点。
+    !last._genPlaceholder;
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
@@ -375,6 +390,23 @@ export function MessageList({
       {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,
           不让 React 卸载整棵树白屏。key 稳定在 boundary 上;memo 比较仍由内层组件承担。 */}
       {coalesceTeam(messages, start, sending).map((it) => {
+        // 生成占位卡(需求 C，本地专属行):拦在 MessageRenderer(memo)之前,用自算签名(含 status/
+        // startedAt/aspect)驱动 running→failed 重渲——占位状态不进 render.ts messageSignature,
+        // 走通用 memo 会漏渲失败态。coalesceTeam 已把它归为 single(role 'system' → 非面板/思考)。
+        if (it.kind === "single" && it.m._genPlaceholder) {
+          const gp = it.m._genPlaceholder;
+          const sig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
+          return (
+            <MessageBoundary key={it.m.id} messageId={it.m.id} sig={sig}>
+              <GeneratingPlaceholderCard
+                aspect={gp.aspect}
+                status={gp.status}
+                startedAt={gp.startedAt}
+                reason={gp.reason}
+              />
+            </MessageBoundary>
+          );
+        }
         if (it.kind === "team") {
           return (
             <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>

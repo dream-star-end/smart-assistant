@@ -93,9 +93,20 @@ import { appendScanSciPaperIntentHintToFrame } from "./paperIntentHint.js";
 /** 桥接路径(只此一个,gateway upgrade 路由按 url.pathname 匹配)。 */
 export const BRIDGE_WS_PATH = "/ws/user-chat-bridge";
 
-/** Strictly recognize the native annotated-edit envelope before bypassing
+/** 五枚举目标画面比例(与 protocol imageEdit.targetAspect / gateway OUTPAINT_ASPECT_RATIOS
+ * 同源;master 侧只做识别不算几何,故内联而非跨包 import 保持接帧热路径零新依赖)。 */
+const OUTPAINT_ASPECTS = new Set(["16:9", "4:3", "9:16", "3:4", "1:1"]);
+
+/** Strictly recognize a server-completed image-edit envelope before bypassing
  * ordinary Codex precheck/journal plumbing. A loose `imageEdit` presence
- * check would let malformed client frames evade normal chat billing. */
+ * check would let malformed client frames evade normal chat billing.
+ *
+ * v5 图片体验:两种直投形态都必须命中此 bypass(否则会被当普通 codex chat turn
+ * 预扣槽/开 journal,而 gateway 又永远不发 codex turn → 计费悬挂 / 双计费):
+ *   - annotated(笔刷圈选 / 数字锚点评论):带用户 mask,media=[source,mask,guide]
+ *     → 3 个互异图片索引(mode 缺省即此,兼容旧前端)。
+ *   - outpaint(调整画面比例):无用户 mask,media=[source,guide] → 2 个互异图片
+ *     索引 + 合法 targetAspect。计费同 50 积分/张,relay 内完成。 */
 export function isValidatedAnnotatedImageInbound(frame: Record<string, unknown>): boolean {
   if (frame.type !== "inbound.message") return false;
   const content = frame.content;
@@ -111,10 +122,15 @@ export function isValidatedAnnotatedImageInbound(frame: Record<string, unknown>)
   if (!Number.isInteger(value.width) || Number(value.width) < 1 || Number(value.width) > 8192) return false;
   if (!Number.isInteger(value.height) || Number(value.height) < 1 || Number(value.height) > 8192) return false;
   if (Number(value.width) * Number(value.height) > 16_777_216) return false;
-  const indices = [value.sourceIndex, value.maskIndex, value.guideIndex];
+  const isOutpaint = value.mode === "outpaint";
+  if (isOutpaint && !OUTPAINT_ASPECTS.has(value.targetAspect as string)) return false;
+  const indices = isOutpaint
+    ? [value.sourceIndex, value.guideIndex]
+    : [value.sourceIndex, value.maskIndex, value.guideIndex];
+  const wantDistinct = isOutpaint ? 2 : 3;
   if (
     !indices.every((index) => Number.isInteger(index) && Number(index) >= 0 && Number(index) < media.length)
-    || new Set(indices).size !== 3
+    || new Set(indices).size !== wantDistinct
   ) return false;
   return indices.every((index) => {
     const item = media[Number(index)];

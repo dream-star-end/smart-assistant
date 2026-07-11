@@ -548,6 +548,54 @@ describe("userChatBridge / annotated Image 2 — forward only", () => {
     );
     ws.close();
   });
+
+  test("outpaint imageEdit (mode:'outpaint', no mask) also bypasses Codex slot/precheck/journal", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      idempotencyKey: "image-outpaint-test",
+      channel: "webchat",
+      peer: { id: "outpaint-peer", kind: "dm" },
+      agentId: "codex",
+      model: "gpt-5.6-sol",
+      content: {
+        text: "把这张图调整为 16:9 宽屏构图",
+        // outpaint 无用户 mask:media 只有 source + guide 两张图。
+        media: [0, 1].map((n) => ({
+          kind: "image", url: `/api/media/outpaint-${n}.png`, mimeType: "image/png", hidden: n === 0,
+        })),
+        imageEdit: {
+          clientJobId: "abcdef0123456789abcdef0123456789",
+          mode: "outpaint",
+          sourceIndex: 0,
+          guideIndex: 1,
+          targetAspect: "16:9",
+          width: 1024,
+          height: 768,
+        },
+      },
+      ts: Date.now(),
+    }));
+
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.match(String(forwarded.requestId), /^[0-9a-f]{32}$/);
+    assert.match(String(forwarded.traceId), /^[A-Za-z0-9_-]{16,64}$/);
+    assert.equal(rig.binding.acquireCalls, 0, "outpaint must not consume a Codex chat slot");
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /request_finalize_journal/.test(q.sql)),
+      false,
+      "outpaint must not open a Codex inflight journal",
+    );
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /SELECT\s+u\.credits/i.test(q.sql)),
+      false,
+      "outpaint must not run ordinary chat preCheck",
+    );
+    ws.close();
+  });
 });
 
 describe("userChatBridge / codex billing — happy path(双钱包 settle)", () => {

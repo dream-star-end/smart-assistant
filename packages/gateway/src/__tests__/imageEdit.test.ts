@@ -4,7 +4,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import sharp from 'sharp'
-import { compositeImageEdit, normalizeImageEditMask, normalizeImageEditSource, orientedImageDimensions, prepareImageEdit, type ImageEditJob } from '../imageEdit.js'
+import {
+  compositeImageEdit,
+  compositeImageOutpaint,
+  type ImageEditJob,
+  isOutpaintAspect,
+  normalizeImageEditMask,
+  normalizeImageEditSource,
+  type OutpaintAspect,
+  orientedImageDimensions,
+  outpaintTargetDimensions,
+  prepareImageEdit,
+  prepareImageOutpaint,
+} from '../imageEdit.js'
 
 const roots: string[] = []
 afterEach(async () =>
@@ -111,7 +123,7 @@ describe('precise image editing', () => {
     assert.equal((await readFile(outputPath)).length > 0, true)
   })
 
-  it('rejects an empty selection before calling Image 2', async () => {
+  it('rejects an empty selection before calling Image 2 (annotated)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oc-image-edit-'))
     roots.push(root)
     const sourcePath = join(root, 'source.png')
@@ -139,6 +151,152 @@ describe('precise image editing', () => {
           createdAt: new Date().toISOString(),
         }),
       /empty/,
+    )
+  })
+})
+
+describe('image outpaint (调整画面比例)', () => {
+  it('recognizes exactly the five supported aspects', () => {
+    for (const good of ['16:9', '4:3', '9:16', '3:4', '1:1']) {
+      assert.equal(isOutpaintAspect(good), true, `${good} must be accepted`)
+    }
+    for (const bad of ['2:1', '16-9', '1:2', '', 'square', undefined, null, 169]) {
+      assert.equal(isOutpaintAspect(bad), false, `${String(bad)} must be rejected`)
+    }
+  })
+
+  it('expands the canvas to the target aspect without ever cropping the source', () => {
+    // Source 120×80 (3:2). Each aspect keeps one axis and pads the other so the
+    // source is fully contained; the returned canvas is the FINAL output size.
+    const cases: Array<[OutpaintAspect, { width: number; height: number }]> = [
+      ['16:9', { width: 142, height: 80 }], // widen: round(80*16/9)
+      ['4:3', { width: 120, height: 90 }], // heighten: round(120/(4/3))
+      ['9:16', { width: 120, height: 213 }], // heighten: round(120/(9/16))
+      ['3:4', { width: 120, height: 160 }], // heighten: round(120/(3/4))
+      ['1:1', { width: 120, height: 120 }], // heighten to square
+    ]
+    for (const [aspect, expected] of cases) {
+      const dims = outpaintTargetDimensions(120, 80, aspect)
+      assert.deepEqual(dims, expected, `${aspect} canvas dims`)
+      assert.ok(dims.width >= 120 && dims.height >= 80, `${aspect}: source never cropped`)
+    }
+  })
+
+  it('builds a transparent outpaint padding mask at the nearest native API size', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-image-outpaint-'))
+    roots.push(root)
+    const width = 120
+    const height = 80
+    const sourcePath = join(root, 'source.png')
+    await sharp({ create: { width, height, channels: 3, background: { r: 20, g: 80, b: 160 } } })
+      .png()
+      .toFile(sourcePath)
+    const job: ImageEditJob = {
+      version: 1,
+      jobId: 'd'.repeat(32),
+      sourcePath,
+      maskPath: '',
+      guidePath: '',
+      outputPath: join(root, 'out.png'),
+      width,
+      height,
+      createdAt: new Date().toISOString(),
+    }
+    const prepared = await prepareImageOutpaint(job, '16:9')
+    assert.equal(prepared.target.api, '1536x1024', 'ratio 1.775 → nearest native 1536x1024')
+    assert.deepEqual(prepared.canvas, { width: 142, height: 80 })
+    assert.deepEqual(prepared.footprint, { width: 120, height: 80, left: 11, top: 0 })
+    const imgMeta = await sharp(prepared.image).metadata()
+    assert.deepEqual({ w: imgMeta.width, h: imgMeta.height }, { w: 1536, h: 1024 }, 'API image = native frame')
+    const maskMeta = await sharp(prepared.mask).metadata()
+    assert.deepEqual({ w: maskMeta.width, h: maskMeta.height }, { w: 1536, h: 1024 }, 'API mask = native frame')
+    const maskAlpha = await sharp(prepared.mask).ensureAlpha().raw().toBuffer()
+    assert.ok(
+      maskAlpha.some((_, i) => i % 4 === 3 && maskAlpha[i] === 0),
+      'padding band is transparent (editable)',
+    )
+    assert.ok(
+      maskAlpha.some((_, i) => i % 4 === 3 && maskAlpha[i] === 255),
+      'source footprint stays opaque (preserved)',
+    )
+  })
+
+  it('picks the nearest native API frame per aspect', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-image-outpaint-api-'))
+    roots.push(root)
+    const sourcePath = join(root, 's.png')
+    await sharp({ create: { width: 120, height: 80, channels: 3, background: '#123456' } }).png().toFile(sourcePath)
+    const job = (aspect: string): ImageEditJob => ({
+      version: 1, jobId: 'e'.repeat(32), sourcePath, maskPath: '', guidePath: '',
+      outputPath: join(root, `${aspect.replace(':', '_')}.png`), width: 120, height: 80,
+      createdAt: new Date().toISOString(),
+    })
+    assert.equal((await prepareImageOutpaint(job('16:9'), '16:9')).target.api, '1536x1024')
+    assert.equal((await prepareImageOutpaint(job('9:16'), '9:16')).target.api, '1024x1536')
+    assert.equal((await prepareImageOutpaint(job('1:1'), '1:1')).target.api, '1024x1024')
+  })
+
+  it('crops the model output to the target ratio and keeps the source footprint byte-for-byte', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-image-outpaint-composite-'))
+    roots.push(root)
+    const width = 120
+    const height = 80
+    // Per-pixel gradient so a byte-identical footprint can only pass if the
+    // original source bytes are preserved (a solid colour would pass trivially).
+    const srcRaw = Buffer.alloc(width * height * 3)
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 3
+        srcRaw[i] = (x * 2) % 256
+        srcRaw[i + 1] = (y * 3) % 256
+        srcRaw[i + 2] = (x + y) % 256
+      }
+    }
+    const sourcePath = join(root, 'source.png')
+    await sharp(srcRaw, { raw: { width, height, channels: 3 } }).png().toFile(sourcePath)
+    const outputPath = join(root, 'out.png')
+    const job: ImageEditJob = {
+      version: 1, jobId: 'f'.repeat(32), sourcePath, maskPath: '', guidePath: '', outputPath,
+      width, height, createdAt: new Date().toISOString(),
+    }
+    const prepared = await prepareImageOutpaint(job, '1:1')
+    assert.deepEqual(prepared.canvas, { width: 120, height: 120 })
+    assert.deepEqual(prepared.footprint, { width: 120, height: 80, left: 0, top: 20 })
+    // A uniform "generated" model frame at the requested native size.
+    const generated = await sharp({
+      create: { width: prepared.target.width, height: prepared.target.height, channels: 4, background: { r: 230, g: 30, b: 20, alpha: 1 } },
+    }).png().toBuffer()
+    await compositeImageOutpaint(job, generated, prepared)
+    const outMeta = await sharp(outputPath).metadata()
+    assert.deepEqual({ w: outMeta.width, h: outMeta.height }, { w: 120, h: 120 }, 'output cropped to exact target aspect')
+    // Source footprint preserved byte-for-byte.
+    const outFootprint = await sharp(outputPath)
+      .extract({ left: prepared.footprint.left, top: prepared.footprint.top, width: prepared.footprint.width, height: prepared.footprint.height })
+      .removeAlpha()
+      .raw()
+      .toBuffer()
+    const srcRawOut = await sharp(sourcePath).removeAlpha().raw().toBuffer()
+    assert.equal(Buffer.compare(outFootprint, srcRawOut), 0, 'source footprint is byte-identical')
+    // Padding band comes from the model output, not the source.
+    const padPixel = await sharp(outputPath).extract({ left: 40, top: 2, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
+    assert.deepEqual([...padPixel], [230, 30, 20], 'padding filled by the generated image')
+  })
+
+  it('rejects a tampered source size before calling Image 2', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-image-outpaint-tamper-'))
+    roots.push(root)
+    const sourcePath = join(root, 'source.png')
+    await sharp({ create: { width: 100, height: 100, channels: 3, background: '#fff' } }).png().toFile(sourcePath)
+    await assert.rejects(
+      () =>
+        prepareImageOutpaint(
+          {
+            version: 1, jobId: 'a'.repeat(32), sourcePath, maskPath: '', guidePath: '',
+            outputPath: join(root, 'o.png'), width: 120, height: 80, createdAt: new Date().toISOString(),
+          },
+          '16:9',
+        ),
+      /tampered/,
     )
   })
 })

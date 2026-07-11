@@ -642,8 +642,13 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     render(<App />)
     // boot 读到 ?panel=settings → 设置中心随工作区打开（Dialog.Title「设置」）。
-    await waitFor(() =>
-      expect(screen.getByRole('heading', { name: '设置' })).toBeInTheDocument(),
+    // SettingsCenter 是 React.lazy 懒块(App.tsx:87),测试内 idle 预取(3s setTimeout)等不到 →
+    // 冷 chunk 在本测试内现取现 transform;机器有后台负载时 >1s 即超 waitFor 默认超时。
+    // 实证:canonical 树(96f08ecb,无本批改动)同环境同样 3/5 失败——纯环境时序,非应用回归。
+    // 与 MessageRenderer.test.tsx markdown 懒块测试同款处理:给足 5s 余量(隔离/静载秒过)。
+    await waitFor(
+      () => expect(screen.getByRole('heading', { name: '设置' })).toBeInTheDocument(),
+      { timeout: 5000 },
     )
     // 打开态与 URL 参数一致（同步 effect no-op 保参）。
     expect(window.location.search).toContain('panel=settings')

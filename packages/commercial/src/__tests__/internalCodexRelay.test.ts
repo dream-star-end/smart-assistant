@@ -20,6 +20,7 @@ import {
   makeCodexRelayHandler,
   mapCodexRelayUrl,
   mapCodexRelayUrlMulti,
+  parseAnnotatedImageRequest,
   resolveCodexRelayUpstreamBases,
   type CodexRelayDb,
 } from '../http/internalCodexRelay.js'
@@ -115,6 +116,60 @@ describe('internalCodexRelay path mapping', () => {
     }
   })
 
+})
+
+// ─── annotated-edits body 解析:annotated(带 mask)与 outpaint(无 mask + aspect)
+// 共用 /images/annotated-edits 端点,计费同 annotated_edit。解析器必须两形态都收、
+// 对形态各自的必填字段 fail-closed。────────────────────────────────────────────
+describe('parseAnnotatedImageRequest(annotated / outpaint 双形态)', () => {
+  const JOB = 'a'.repeat(32)
+  const b = (o: Record<string, unknown>) => Buffer.from(JSON.stringify(o))
+  const baseAnnotated = () => ({
+    jobId: JOB, prompt: '把圈选区域改成晚霞', width: 1024, height: 768,
+    sourceBase64: 'AAAA', maskBase64: 'BBBB',
+  })
+  const baseOutpaint = () => ({
+    jobId: JOB, prompt: '把这张图调整为 16:9 宽屏构图', width: 1024, height: 768,
+    sourceBase64: 'AAAA', outpaint: { aspect: '16:9' },
+  })
+
+  test('accepts a classic annotated request (mask required)', () => {
+    const parsed = parseAnnotatedImageRequest(b(baseAnnotated()))
+    assert.equal(parsed.maskBase64, 'BBBB')
+    assert.equal(parsed.outpaint, undefined)
+  })
+
+  test('accepts an outpaint request without a mask when aspect is valid', () => {
+    for (const aspect of ['16:9', '4:3', '9:16', '3:4', '1:1']) {
+      const parsed = parseAnnotatedImageRequest(b({ ...baseOutpaint(), outpaint: { aspect } }))
+      assert.deepEqual(parsed.outpaint, { aspect })
+      assert.equal(parsed.maskBase64, undefined)
+    }
+  })
+
+  test('rejects an annotated request missing its mask', () => {
+    const noMask = baseAnnotated() as Record<string, unknown>
+    delete noMask.maskBase64
+    assert.throws(() => parseAnnotatedImageRequest(b(noMask)), /invalid annotated image request/)
+  })
+
+  test('rejects an outpaint request with an unsupported aspect', () => {
+    for (const aspect of ['2:1', '16-9', '', 'square']) {
+      assert.throws(
+        () => parseAnnotatedImageRequest(b({ ...baseOutpaint(), outpaint: { aspect } })),
+        /invalid outpaint aspect/,
+        `aspect ${aspect} must be rejected`,
+      )
+    }
+    // outpaint 存在但形状非法(非对象)
+    assert.throws(() => parseAnnotatedImageRequest(b({ ...baseOutpaint(), outpaint: 'x' })), /invalid outpaint aspect/)
+  })
+
+  test('still enforces shared guards (jobId shape / prompt / pixel budget) for both shapes', () => {
+    assert.throws(() => parseAnnotatedImageRequest(b({ ...baseOutpaint(), jobId: 'zzz' })), /invalid annotated image request/)
+    assert.throws(() => parseAnnotatedImageRequest(b({ ...baseOutpaint(), prompt: '' })), /invalid annotated image request/)
+    assert.throws(() => parseAnnotatedImageRequest(b({ ...baseOutpaint(), width: 9000, height: 9000 })), /invalid annotated image request/)
+  })
 })
 
 describe('internalCodexRelay handler', () => {

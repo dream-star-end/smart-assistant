@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Dispatcher } from 'undici'
 import sharp from 'sharp'
-import { compositeImageEdit, prepareImageEdit, type ImageEditJob } from '@openclaude/gateway'
+import { compositeImageEdit, compositeImageOutpaint, isOutpaintAspect, type OutpaintAspect, prepareImageEdit, prepareImageOutpaint, type ImageEditJob } from '@openclaude/gateway'
 import type { Pool } from 'pg'
 
 import { rootLogger, type Logger } from '../logging/logger.js'
@@ -501,19 +501,30 @@ type AnnotatedImageRequest = {
   width: number
   height: number
   sourceBase64: string
-  maskBase64: string
+  // annotated 携带用户 mask;outpaint 无 mask,改带 outpaint.aspect(relay 合成)。
+  maskBase64?: string
+  outpaint?: { aspect: OutpaintAspect }
 }
 
-function parseAnnotatedImageRequest(body: Buffer): AnnotatedImageRequest {
+export function parseAnnotatedImageRequest(body: Buffer): AnnotatedImageRequest {
   const value = JSON.parse(body.toString('utf8')) as Partial<AnnotatedImageRequest>
+  const isOutpaint = value.outpaint !== undefined
   if (
     typeof value.jobId !== 'string' || !/^[0-9a-f]{32}$/.test(value.jobId)
     || typeof value.prompt !== 'string' || value.prompt.trim().length < 1 || value.prompt.length > 8_000
     || !Number.isInteger(value.width) || !Number.isInteger(value.height)
     || (value.width ?? 0) < 1 || (value.height ?? 0) < 1
     || (value.width ?? 0) * (value.height ?? 0) > 16_777_216
-    || typeof value.sourceBase64 !== 'string' || typeof value.maskBase64 !== 'string'
+    || typeof value.sourceBase64 !== 'string'
   ) {
+    throw new Error('invalid annotated image request')
+  }
+  if (isOutpaint) {
+    // outpaint 分支:aspect 必须是五枚举之一;有无 mask 都忽略(不需要用户 mask)。
+    if (!value.outpaint || typeof value.outpaint !== 'object' || !isOutpaintAspect(value.outpaint.aspect)) {
+      throw new Error('invalid outpaint aspect')
+    }
+  } else if (typeof value.maskBase64 !== 'string') {
     throw new Error('invalid annotated image request')
   }
   return value as AnnotatedImageRequest
@@ -873,6 +884,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let imageOperation: 'generation' | 'edit' | 'annotated_edit' | null = null
     let annotatedJob: ImageEditJob | null = null
     let annotatedPrepared: Awaited<ReturnType<typeof prepareImageEdit>> | null = null
+    let outpaintPrepared: Awaited<ReturnType<typeof prepareImageOutpaint>> | null = null
     let annotatedTempDir: string | null = null
     let imageHeavySlot = false
 
@@ -892,50 +904,82 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           const input = parseAnnotatedImageRequest(await readBoundedBody(req, 80 * 1024 * 1024))
           if (input.jobId !== preflightJobId) throw new Error('annotated image job id mismatch')
           const source = await decodeValidatedImageBase64(input.sourceBase64)
-          const mask = await decodeValidatedImageBase64(input.maskBase64)
-          if (!source || !mask) throw new Error('source or mask is not a valid image')
-          const [normalizedSource, maskMeta] = await Promise.all([
-            sharp(source).rotate().png().toBuffer({ resolveWithObject: true }),
-            sharp(mask).metadata(),
-          ])
-          if (
-            normalizedSource.info.width !== input.width || normalizedSource.info.height !== input.height
-            || maskMeta.width !== input.width || maskMeta.height !== input.height
-            || maskMeta.format !== 'png'
-          ) throw new Error('source and mask dimensions differ')
-          const inputHash = createHash('sha256')
-            .update('gpt-image-2\0annotated_edit\0', 'utf8')
-            .update(`${input.width}x${input.height}\0`, 'utf8')
-            .update(input.prompt.trim(), 'utf8')
-            .update('\0', 'utf8')
-            .update(normalizedSource.data)
-            .update(mask)
-            .digest()
-          await bindImageInputHash(deps.pgPool!, {
-            userId: BigInt(identity.userId),
-            requestId: imageRequestId!,
-            inputHash,
-          })
+          if (!source) throw new Error('source is not a valid image')
+          const normalizedSource = await sharp(source).rotate().png().toBuffer({ resolveWithObject: true })
+          if (normalizedSource.info.width !== input.width || normalizedSource.info.height !== input.height) {
+            throw new Error('source dimensions differ')
+          }
           annotatedTempDir = await mkdtemp(join(tmpdir(), 'oc-image2-'))
           const sourcePath = join(annotatedTempDir, 'source.png')
-          const maskPath = join(annotatedTempDir, 'mask.png')
           const outputPath = join(annotatedTempDir, 'output.png')
-          await Promise.all([
-            writeFile(sourcePath, normalizedSource.data, { mode: 0o600 }),
-            writeFile(maskPath, mask, { mode: 0o600 }),
-          ])
-          annotatedJob = {
-            version: 1, jobId: input.jobId, sourcePath, maskPath, guidePath: '', outputPath,
-            width: input.width, height: input.height, createdAt: new Date().toISOString(),
+          await writeFile(sourcePath, normalizedSource.data, { mode: 0o600 })
+          // Both shapes bill as annotated_edit(50 credits;reserve/settle 不变);
+          // only the prepare geometry differs — outpaint synthesises its own mask
+          // from the source footprint, annotated uses the user's drawn mask.
+          let preparedImage: Buffer
+          let preparedMask: Buffer
+          let preparedApi: string
+          if (input.outpaint) {
+            const inputHash = createHash('sha256')
+              .update('gpt-image-2\0outpaint\0', 'utf8')
+              .update(`${input.outpaint.aspect}\0`, 'utf8')
+              .update(`${input.width}x${input.height}\0`, 'utf8')
+              .update(input.prompt.trim(), 'utf8')
+              .update('\0', 'utf8')
+              .update(normalizedSource.data)
+              .digest()
+            await bindImageInputHash(deps.pgPool!, {
+              userId: BigInt(identity.userId),
+              requestId: imageRequestId!,
+              inputHash,
+            })
+            annotatedJob = {
+              version: 1, jobId: input.jobId, sourcePath, maskPath: '', guidePath: '', outputPath,
+              width: input.width, height: input.height, createdAt: new Date().toISOString(),
+            }
+            outpaintPrepared = await prepareImageOutpaint(annotatedJob, input.outpaint.aspect)
+            preparedImage = outpaintPrepared.image
+            preparedMask = outpaintPrepared.mask
+            preparedApi = outpaintPrepared.target.api
+          } else {
+            const mask = await decodeValidatedImageBase64(input.maskBase64!)
+            if (!mask) throw new Error('source or mask is not a valid image')
+            const maskMeta = await sharp(mask).metadata()
+            if (
+              maskMeta.width !== input.width || maskMeta.height !== input.height
+              || maskMeta.format !== 'png'
+            ) throw new Error('source and mask dimensions differ')
+            const inputHash = createHash('sha256')
+              .update('gpt-image-2\0annotated_edit\0', 'utf8')
+              .update(`${input.width}x${input.height}\0`, 'utf8')
+              .update(input.prompt.trim(), 'utf8')
+              .update('\0', 'utf8')
+              .update(normalizedSource.data)
+              .update(mask)
+              .digest()
+            await bindImageInputHash(deps.pgPool!, {
+              userId: BigInt(identity.userId),
+              requestId: imageRequestId!,
+              inputHash,
+            })
+            const maskPath = join(annotatedTempDir, 'mask.png')
+            await writeFile(maskPath, mask, { mode: 0o600 })
+            annotatedJob = {
+              version: 1, jobId: input.jobId, sourcePath, maskPath, guidePath: '', outputPath,
+              width: input.width, height: input.height, createdAt: new Date().toISOString(),
+            }
+            annotatedPrepared = await prepareImageEdit(annotatedJob)
+            preparedImage = annotatedPrepared.image
+            preparedMask = annotatedPrepared.mask
+            preparedApi = annotatedPrepared.target.api
           }
-          annotatedPrepared = await prepareImageEdit(annotatedJob)
           const form = new FormData()
           form.set('model', 'gpt-image-2')
           form.set('prompt', input.prompt.trim())
           form.set('n', '1')
-          form.set('size', annotatedPrepared.target.api)
-          form.set('image', new Blob([new Uint8Array(annotatedPrepared.image)], { type: 'image/png' }), 'source.png')
-          form.set('mask', new Blob([new Uint8Array(annotatedPrepared.mask)], { type: 'image/png' }), 'mask.png')
+          form.set('size', preparedApi)
+          form.set('image', new Blob([new Uint8Array(preparedImage)], { type: 'image/png' }), 'source.png')
+          form.set('mask', new Blob([new Uint8Array(preparedMask)], { type: 'image/png' }), 'mask.png')
           imageRequestBody = form
           const upstreamUrl = new URL(mappedUrl.url)
           upstreamUrl.pathname = upstreamUrl.pathname.replace(/\/images\/annotated-edits$/, '/images/edits')
@@ -1036,9 +1080,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
 
         let responseBody = bytes
         if (isAnnotatedImageRequest) {
-          if (!annotatedJob || !annotatedPrepared) throw new Error('annotated edit preparation missing')
+          if (!annotatedJob || (!annotatedPrepared && !outpaintPrepared)) throw new Error('annotated edit preparation missing')
           if (controller.signal.aborted) throw new DOMException('image request aborted', 'AbortError')
-          await compositeImageEdit(annotatedJob, generated, annotatedPrepared)
+          if (outpaintPrepared) {
+            await compositeImageOutpaint(annotatedJob, generated, outpaintPrepared)
+          } else {
+            await compositeImageEdit(annotatedJob, generated, annotatedPrepared!)
+          }
           const finalImage = await readFile(annotatedJob.outputPath)
           responseBody = Buffer.from(JSON.stringify({
             created: Math.floor(Date.now() / 1000),

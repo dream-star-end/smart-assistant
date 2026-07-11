@@ -6,20 +6,19 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
-import * as Dialog from "@radix-ui/react-dialog";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Download, ExternalLink, FileText, RotateCcw, WandSparkles, X } from "lucide-react";
+import { AlertCircle, Download, FileText, RotateCcw, WandSparkles, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
 import {
   downloadPercent,
   formatBytes,
   nativeDownload,
-  openInNewTab,
   pickDownloadStrategy,
   saveBlob,
 } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
+import { ImageViewer } from "../ImageViewer";
 
 type SignFn = (paths: string[]) => Promise<Record<string, string>>;
 
@@ -262,54 +261,18 @@ export function ZoomableImage({
           </button>
         )}
       </span>
-      <Dialog.Root open={open} onOpenChange={handleOpenChange}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
-          <Dialog.Content
-            aria-describedby={undefined}
-            className="fixed left-1/2 top-1/2 z-50 max-h-[92vh] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
-          >
-            <Dialog.Title className="sr-only">{alt || "图片预览"}</Dialog.Title>
-            <img src={display} alt={alt} className="max-h-[88vh] max-w-[94vw] rounded-lg object-contain shadow-float" />
-            <div className="mt-2 flex items-center justify-center gap-3">
-              <a
-                href={display}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(e) => {
-                  if (!signPath) return;
-                  // 快路径:缓存未过期 → 同步校正 href 让原生导航直接用最新 URL(不动手势)。
-                  const cached = peek();
-                  if (cached) {
-                    if (cached !== display) e.currentTarget.href = cached;
-                    return;
-                  }
-                  // 慢路径:已过期 → 拦下本次,重签后程序化开新标签(仍在手势激活窗口内)。
-                  e.preventDefault();
-                  void get({ forceResign: true }).then((u) => {
-                    if (u) {
-                      setFreshSrc(u);
-                      openInNewTab(u);
-                    }
-                  });
-                }}
-                className="flex items-center gap-1 rounded-full bg-surface px-3 py-1 text-xs font-medium text-fg no-underline shadow-float transition-colors hover:bg-hover"
-              >
-                <ExternalLink size={12} /> 新标签打开原图
-              </a>
-            </div>
-            <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭预览"
-                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+      {/* 全屏沉浸查看器(替代旧内联灯箱):四模式 编辑/评论/调整大小/移除。
+          签名不在此复制,下传 get/peek(点击时签名权威);submit/remove 由 App 经
+          ImageEditActionsContext 供给。display=开灯箱时现签的最新 URL。 */}
+      <ImageViewer
+        open={open}
+        onOpenChange={handleOpenChange}
+        src={display}
+        alt={alt}
+        signPath={signPath ?? null}
+        get={get}
+        peek={peek}
+      />
     </>
   );
 }

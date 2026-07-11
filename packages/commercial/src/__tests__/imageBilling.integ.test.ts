@@ -127,6 +127,15 @@ async function annotatedInput(jobId: string, prompt = 'make the selected area re
   })
 }
 
+async function outpaintInput(jobId: string, aspect = '16:9', prompt = 'expand to a 16:9 widescreen frame'): Promise<string> {
+  // outpaint 无用户 mask;relay 端按 aspect 合成透明画布外扩。
+  const source = await sharp({ create: { width: 120, height: 80, channels: 3, background: '#4477aa' } }).png().toBuffer()
+  return JSON.stringify({
+    jobId, prompt, width: 120, height: 80,
+    sourceBase64: source.toString('base64'), outpaint: { aspect },
+  })
+}
+
 describe('Image 2 exact billing', () => {
   test('charges exactly 50 once and replays the committed response', async (t) => {
     if (skip(t)) return
@@ -300,6 +309,72 @@ describe('Image 2 relay orchestration', () => {
         [userId.toString()],
       )).rows[0]!.count, '1')
       assert.equal(tracker.releases() >= 1, true)
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('outpaint composites to the target aspect, charges 50 once, and replays cache', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    // Model returns a full native 16:9-nearest frame (1536x1024); the relay
+    // crops it back to the exact target-aspect canvas (142x80 for 120x80 → 16:9).
+    const generated = await sharp({ create: { width: 1536, height: 1024, channels: 3, background: '#22aa55' } }).png().toBuffer()
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => {
+        upstreamCalls++
+        return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
+      }) as typeof fetch,
+      pgPool: getPool(),
+      preCheckRedis: tracker.redis,
+      image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const jobId = 'd'.repeat(32)
+    const send = async () => fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream',
+        'content-type': 'application/json',
+        'x-openclaude-image-job': jobId,
+      },
+      body: await outpaintInput(jobId),
+    })
+    try {
+      const first = await send()
+      assert.equal(first.status, 200)
+      const firstJson = await first.json() as { data: Array<{ b64_json: string }> }
+      const finalMeta = await sharp(Buffer.from(firstJson.data[0]!.b64_json, 'base64')).metadata()
+      assert.deepEqual(
+        { width: finalMeta.width, height: finalMeta.height, format: finalMeta.format },
+        { width: 142, height: 80, format: 'png' },
+        'outpaint output cropped to exact 16:9 canvas',
+      )
+      const second = await send()
+      assert.equal(second.status, 200)
+      assert.deepEqual(await second.json(), firstJson)
+      assert.equal(upstreamCalls, 1, 'outpaint cache replays without a second upstream call')
+      // Billed exactly once at 50 credits under the annotated_edit operation.
+      assert.equal(
+        (await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits,
+        '50',
+      )
+      assert.equal(
+        (await query<{ count: string }>(
+          "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'",
+          [userId.toString()],
+        )).rows[0]!.count,
+        '1',
+      )
     } finally {
       await close(server)
     }
