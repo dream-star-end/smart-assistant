@@ -26,8 +26,11 @@ const BASE = {
 describe('prepareSkillPublish — 基本校验错误码', () => {
   test('slug/version/category/useCases 逐项拒绝,码与语义对齐', () => {
     for (const [patch, code] of [
+      // 统一契约:slug/version 的缺失与格式错误同码(历史两条路径本就互相矛盾)
       [{ slug: 'BAD SLUG' }, 'BAD_SLUG'],
+      [{ slug: undefined }, 'BAD_SLUG'],
       [{ version: 'v1' }, 'BAD_VERSION'],
+      [{ version: undefined }, 'BAD_VERSION'],
       [{ name: undefined }, 'BAD_REQUEST'],
       [{ body: undefined }, 'BAD_REQUEST'],
       [{ tags: ['a]b'] }, 'BAD_TAG'],

@@ -268,8 +268,9 @@ export async function handleMarketplaceAgentPublish(
   const manifestInput: Record<string, unknown> = { ...body }
   // slug is the listing key, NOT a manifest field — remove the KEY (not just set
   // undefined) so the strict allowlist validator doesn't reject it as "未知字段".
-  // category/useCases/outcomeExamples/humanMd 同理:发布级 storefront 元数据,不进 manifest。
-  for (const k of ['slug', 'category', 'useCases', 'outcomeExamples', 'humanMd']) delete manifestInput[k]
+  // category/useCases/outcomeExamples/humanMd/visibility 同理:发布级字段,不进 manifest。
+  for (const k of ['slug', 'category', 'useCases', 'outcomeExamples', 'humanMd', 'visibility'])
+    delete manifestInput[k]
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,
     allowedModels,

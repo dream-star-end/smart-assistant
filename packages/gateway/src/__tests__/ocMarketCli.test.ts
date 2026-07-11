@@ -141,12 +141,17 @@ describe('collectBundleDir — 白名单收集与本地预检', () => {
   type Ent = { name: string; isDirectory(): boolean; isFile(): boolean }
   const d = (name: string): Ent => ({ name, isDirectory: () => true, isFile: () => false })
   const f = (name: string): Ent => ({ name, isDirectory: () => false, isFile: () => true })
+  const enoent = (p: string): never => {
+    const err = new Error(`ENOENT ${p}`) as NodeJS.ErrnoException
+    err.code = 'ENOENT'
+    throw err
+  }
   /** tree: 目录绝对路径 → 目录项;files: 文件绝对路径 → 内容。 */
   function fakeFs(tree: Record<string, Ent[]>, files: Record<string, string>) {
     const readDir = (p: string): Ent[] => {
       const v = tree[p]
-      if (!v) throw new Error(`ENOENT ${p}`)
-      return v
+      if (!v) enoent(p)
+      return v as Ent[]
     }
     const readFile = ((p: string) => {
       const v = files[p]
@@ -178,10 +183,26 @@ describe('collectBundleDir — 白名单收集与本地预检', () => {
     )
   })
 
+  test('白名单根目录不可读(非 ENOENT)→ 显式报错,不静默发残缺 bundle', () => {
+    const readDir = (p: string): Ent[] => {
+      if (p === '/skill/references') return [f('a.md')]
+      const err = new Error(`EACCES ${p}`) as NodeJS.ErrnoException
+      err.code = 'EACCES'
+      throw err
+    }
+    const r = collectBundleDir('/skill', readDir, ((p: string) =>
+      p === '/skill/references/a.md' ? 'A' : enoent(p)) as any)
+    // references 收集成功,另外三个根目录 EACCES 全部上报
+    assert.deepEqual(
+      r.files.map((x) => x.path),
+      ['references/a.md'],
+    )
+    assert.equal(r.errors.length, 3)
+    for (const e of r.errors) assert.match(e, /目录读取失败\(EACCES\)/)
+  })
+
   test('空目录 / 超限逐条报错,一次说清', () => {
-    const empty = collectBundleDir('/nothing', () => {
-      throw new Error('ENOENT')
-    })
+    const empty = collectBundleDir('/nothing', (p) => enoent(p))
     assert.equal(empty.files.length, 0)
     assert.equal(empty.errors.length, 1)
     assert.match(empty.errors[0], /没有可发布的附属文件/)

@@ -312,6 +312,69 @@ describe('internalMarketplaceAgent (integ)', () => {
     assert.equal(res.body.error.code, 'SCAN_BLOCKED')
   })
 
+  test('publish 带 visibility=org:成员发布成功且 visibility 不进 manifest;非成员 403', async (t) => {
+    if (skip(t)) return
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    try {
+      const member = await createUser('org-member@x.com')
+      const outsider = await createUser('org-outsider@x.com')
+      const org = await query<{ id: string }>("INSERT INTO orgs (name) VALUES ('测试组织') RETURNING id::text")
+      await query('INSERT INTO org_memberships (org_id, user_id) VALUES ($1, $2)', [org.rows[0].id, member])
+
+      // 非成员 → 403(skill 与 agent 同一道门)
+      let res = makeRes()
+      await h403(outsider, res)
+      assert.equal(res.statusCode, 403)
+      assert.equal(res.body.error.code, 'NOT_ORG_MEMBER')
+
+      // 成员发布 agent 带 visibility=org → 200;visibility 是发布级字段,严格
+      // allowlist manifest 校验前必须剔除(回归:曾被拒为「未知字段」422)。
+      const h = await handlerFor(member, 100)
+      res = makeRes()
+      await h(
+        makeReq('POST', 'publish', {
+          token: tokenFor(100),
+          body: {
+            kind: 'agent', slug: 'org-agent', name: '组织助手', description: '仅本组织可见的助手',
+            version: '1.0.0', model: 'glm-5.2', toolsets: ['core'], skillDeps: [],
+            persona: '你是本组织的专属助手。', category: 'daily-tools', useCases: ['做组织内部的日常任务'],
+            visibility: 'org',
+          },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+      const row = await query<{ org_id: string | null; vis_in_manifest: string | null }>(
+        `SELECT l.org_id::text AS org_id, v.manifest->>'visibility' AS vis_in_manifest
+           FROM marketplace_skill_listings l
+           JOIN marketplace_skill_versions v ON v.slug = l.slug
+          WHERE l.slug = 'org-agent'`,
+      )
+      assert.equal(row.rows[0]?.org_id, org.rows[0].id, 'listing 归属该 org')
+      assert.equal(row.rows[0]?.vis_in_manifest, null, 'visibility 不落 manifest')
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel
+    }
+
+    async function h403(uid: number, res: ServerResponse & { body: any }): Promise<void> {
+      const h = await handlerFor(uid, 101)
+      await h(
+        makeReq('POST', 'publish', {
+          token: tokenFor(101),
+          body: {
+            kind: 'skill', slug: 'org-skill-403', name: 'X', version: '1.0.0', description: 'd',
+            body: '正文', category: 'daily-tools', useCases: ['测试用途的技能示例'], visibility: 'org',
+          },
+        }),
+        res,
+        CTX,
+      )
+    }
+  })
+
   test('publish 缺 category → 400 BAD_CATEGORY;缺 useCases → 400 BAD_USE_CASES', async (t) => {
     if (skip(t)) return
     const u = await createUser('meta400@x.com')

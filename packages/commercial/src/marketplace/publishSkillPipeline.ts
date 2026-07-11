@@ -113,12 +113,18 @@ function parseTags(v: unknown): string[] | SkillPublishReject {
 export function prepareSkillPublish(
   body: Record<string, unknown>,
 ): SkillPublishPrepared | SkillPublishReject {
-  const slugV = strField(body.slug, 'slug', 64)
-  if (typeof slugV !== 'string') return slugV
-  if (!SLUG_RE.test(slugV)) return reject(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
-  const versionV = strField(body.version, 'version', 16)
-  if (typeof versionV !== 'string') return versionV
-  if (!VERSION_RE.test(versionV)) return reject(400, 'BAD_VERSION', 'version 须为 N.N.N')
+  // 错误码契约(收口时显式统一;历史两条路径本就互相矛盾,不逐条迁就):
+  //   slug 的一切问题 → BAD_SLUG;version 的一切问题 → BAD_VERSION;
+  //   name/description/body 缺失或超长 → BAD_REQUEST;tags 非法 → BAD_TAG
+  //   (tags: null 视同缺省 —— JSON 客户端的合法表达)。
+  // Web PublishPanel 不依赖 400 级错误码细分(Codex R1 已核),改码零破坏面。
+  const slugV = typeof body.slug === 'string' && SLUG_RE.test(body.slug) ? body.slug : null
+  if (!slugV) return reject(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
+  const versionV =
+    typeof body.version === 'string' && body.version.length <= 16 && VERSION_RE.test(body.version)
+      ? body.version
+      : null
+  if (!versionV) return reject(400, 'BAD_VERSION', 'version 须为 N.N.N')
   const nameV = strField(body.name, 'name', 64)
   if (typeof nameV !== 'string') return nameV
   const descriptionV = strField(body.description, 'description', 1024)

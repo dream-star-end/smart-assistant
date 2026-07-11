@@ -90,15 +90,17 @@ function send(res: ServerResponse, status: number, body: unknown, requestId: str
   res.end(JSON.stringify({ ...(body as object), requestId }))
 }
 
+// 默认上限保留历史 +4096 松弛(兼容既有 op 行为);发布 op 显式传
+// PUBLISH_MAX_REQUEST_BYTES 时为精确硬上限,与浏览器发布路径一致。
 async function readBody(
   req: IncomingMessage,
-  maxBytes = MAX_BODY,
+  maxBytes = MAX_BODY + 4096,
 ): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const c of req) {
     total += (c as Buffer).length
-    if (total > maxBytes + 4096) throw new Error('body too large')
+    if (total > maxBytes) throw new Error('body too large')
     chunks.push(c as Buffer)
   }
   if (chunks.length === 0) return {}
@@ -473,9 +475,9 @@ async function handlePublish(
     )
   }
   const manifestInput: Record<string, unknown> = { ...body }
-  // category/useCases/outcomeExamples/humanMd 是发布级 storefront 元数据,不进 manifest —— 与
+  // category/useCases/outcomeExamples/humanMd/visibility 是发布级字段,不进 manifest —— 与
   // kind/slug 一样在严格 allowlist 校验前 delete,否则会被拒为「未知字段」。
-  for (const k of ['kind', 'slug', 'category', 'useCases', 'outcomeExamples', 'humanMd'])
+  for (const k of ['kind', 'slug', 'category', 'useCases', 'outcomeExamples', 'humanMd', 'visibility'])
     delete manifestInput[k]
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,

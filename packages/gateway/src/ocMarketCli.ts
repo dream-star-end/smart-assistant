@@ -154,22 +154,26 @@ export function collectBundleDir(
   readFile: FileReader = readFileSync,
 ): { files: BundleFileEntry[]; errors: string[] } {
   const relPaths: string[] = []
-  const walk = (abs: string, rel: string): void => {
+  const errors: string[] = []
+  const walk = (abs: string, rel: string, isRoot: boolean): void => {
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>
     try {
       entries = readDir(abs)
-    } catch {
-      return // 白名单子目录不存在/不可读 → 视为没有该类附属文件
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code
+      // 白名单根目录不存在 = 没有该类附属文件,正常;其余失败(权限/IO/嵌套目录
+      // 读不了)必须显式报出 —— 静默跳过等于发布残缺 bundle。
+      if (!(isRoot && (code === 'ENOENT' || code === 'ENOTDIR')))
+        errors.push(`${rel}: 目录读取失败(${code ?? 'unknown'})`)
+      return
     }
     for (const e of entries) {
-      if (e.isDirectory()) walk(join(abs, e.name), `${rel}${e.name}/`)
+      if (e.isDirectory()) walk(join(abs, e.name), `${rel}${e.name}/`, false)
       else if (e.isFile()) relPaths.push(`${rel}${e.name}`) // symlink 等特殊类型一律忽略
     }
   }
-  for (const prefix of BUNDLE_ALLOWED_PREFIXES) walk(join(dir, prefix.replace(/\/$/, '')), prefix)
+  for (const prefix of BUNDLE_ALLOWED_PREFIXES) walk(join(dir, prefix.replace(/\/$/, '')), prefix, true)
   relPaths.sort()
-
-  const errors: string[] = []
   const files: BundleFileEntry[] = []
   let total = 0
   if (relPaths.length === 0) errors.push(`目录下没有可发布的附属文件(只认 ${BUNDLE_ALLOWED_PREFIXES.join(' ')} 子目录)`)
