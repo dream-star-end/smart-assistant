@@ -10589,11 +10589,22 @@ export class Gateway {
             || imageCode === 'IMAGE_ATTEMPT_LIMIT'
             || imageCode === 'IMAGE_SERVER_BUSY'
           const insufficient = imageCode === 'ERR_INSUFFICIENT_CREDITS'
+          // 失败原因透传(relay 已把上游失败归类成稳定 code,这里本地化成人话)。
+          const rejectionMessage = imageCode === 'IMAGE_UPSTREAM_REJECTED_FORMAT'
+            ? '图片服务拒绝了请求格式，请稍后重试。'
+            : imageCode === 'IMAGE_UPSTREAM_REJECTED_IMAGE'
+              ? '图片数据无法被识别，请更换图片后重试。'
+              : imageCode === 'IMAGE_UPSTREAM_REJECTED_MODERATION'
+                ? '图片内容被安全策略拦截，请更换图片。'
+                : imageCode === 'IMAGE_UPSTREAM_REJECTED'
+                  ? '图片服务拒绝了本次请求，请更换图片或稍后重试。'
+                  : null
           const message = insufficient
             ? '积分不足，Image 2 每张需要 50 积分。'
             : rateLimited
               ? 'Image 2 当前繁忙或已达使用上限，请稍后重试。'
-              : 'Image 2 服务暂时不可用，请稍后重试。'
+              : rejectionMessage
+                ?? 'Image 2 服务暂时不可用，请稍后重试。'
           const errorFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
             sessionKey,
