@@ -19,7 +19,15 @@ import {
   saveBlob,
 } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
+import { pickThumbnailWidth } from "../../lib/chat/imageBytes";
+import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import { ImageViewer } from "../ImageViewer";
+
+/** 气泡缩略默认按 dpr 选档:标屏 640,retina 1280(与服务端白名单一致)。 */
+function defaultThumbWidth(): 640 | 1280 {
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  return pickThumbnailWidth(640, dpr);
+}
 
 type SignFn = (paths: string[]) => Promise<Record<string, string>>;
 
@@ -207,90 +215,95 @@ export function ZoomableImage({
   imgClassName,
   onError,
   signPath,
+  thumbWidth,
 }: {
   src: string;
   alt: string;
   /** 缩略态 <img> 的样式(灯箱内恒全尺寸 object-contain)。 */
   imgClassName?: string;
   onError?: React.ReactEventHandler<HTMLImageElement>;
-  /** 原始容器路径(src 是签名 URL 时传)。传了才有"开灯箱/开原图时点击时重签"能力。 */
+  /** 原始容器路径(src 是签名 URL 时传)。传了才有"开灯箱/开原图时点击时重签"能力,也作字节缓存身份。 */
   signPath?: string | null;
+  /** 缩略请求宽度(640/1280);缺省按 dpr 自选。null = 直接取原图(不缩)。 */
+  thumbWidth?: number | null;
 }) {
   const [open, setOpen] = useState(false);
-  // 缩略图字节是否已就绪(骨架 → 图 的切换门)。src 变化(重签/换图)重新亮骨架。
-  const [thumbLoaded, setThumbLoaded] = useState(false);
-  // 直传媒体(/api/media 等非签名 URL)刚上传即渲染,存在「写后可读」的短暂传播/冷启窗口
-  // → img 可能瞬时 404/503(评论/编辑/调整大小 guide 缩略图裂图根因,image r4 §3;三模式同点)。
-  // 对**非签名直传 URL**做带退避的缓存击穿重试:重试期保持骨架(不闪裂图),传播完成即正常显示。
-  // 签名(容器)URL 的过期自愈仍走上游 onError 重签,不在此列;data:/blob: 自足永不重试。
-  const retriable = signPath == null && /^(https?:|\/(?!\/))/.test(src);
-  const [attempt, setAttempt] = useState(0);
-  const retryRef = useRef(0);
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    setThumbLoaded(false);
-    setAttempt(0);
-    retryRef.current = 0;
-    return () => {
-      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    };
-  }, [src]);
-  const imgSrc = attempt > 0 ? `${src}${src.includes("?") ? "&" : "?"}_r=${attempt}` : src;
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
   // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
   const canEdit = !!useImageEditActions().submitImageEdit;
   const { get, peek } = useFreshSignedUrl(signPath ?? null);
-  // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死;
-  // 缩略图有字节缓存看不出,但灯箱大图/新标签/进编辑是新请求,必须现签)。
+
+  // 缩略分级 + 流式进度 + 字节复用(单一 hook 收口)。签名 URL 请求 ?w=<640|1280>;
+  // 直链/本地 blob 零网络透传。懒加载:进视口才拉,避免长会话多图打爆 per-uid 6 并发闸。
+  const width = thumbWidth === undefined ? defaultThumbWidth() : thumbWidth;
+  const { containerRef, objectUrl, percent, status, reload } = useProgressiveImage({
+    src,
+    width,
+    cacheIdentity: signPath ?? null,
+    resolveSrc: get,
+    lazy: true,
+  });
+
+  // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死)。
   const [freshSrc, setFreshSrc] = useState<string | null>(null);
   const display = freshSrc ?? src;
   const signFresh = () => {
     if (signPath) void get().then((u) => u && setFreshSrc(u));
   };
   // 缩略图与左下角「编辑」胶囊都开**查看器 view 模式**(image r4 §5a):进去先看大图,
-  // 再从底部动作条三选 编辑/评论/调整大小,不再从胶囊直达圈选编辑器。编辑可用性由查看器
-  // 内动作条据 ImageEditActionsContext 门控(单一权威),此处不再各自判定。
+  // 再从底部动作条三选 编辑/评论/调整大小。编辑可用性由查看器内动作条据 ImageEditActionsContext
+  // 门控(单一权威),此处不再各自判定。
   const openViewer = () => {
     setOpen(true);
     signFresh();
   };
-  // ImageViewer 的 onOpenChange(用户 X/Esc/遮罩关闭)回调。
   const handleOpenChange = (o: boolean) => {
     setOpen(o);
     if (o) signFresh();
   };
   return (
     <>
-      <span className="group relative inline-block max-w-full">
+      <span ref={containerRef} className="group relative inline-block max-w-full">
         <button
           type="button"
-          aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
-          onClick={() => openViewer()}
+          // 失败态复用同一钮做「点击重试」(避免 button 内嵌 button 的非法 DOM);
+          // 就绪/加载态点击开查看器。
+          aria-label={
+            status === "error"
+              ? `重试加载${alt ? ` ${alt}` : "图片"}`
+              : `放大查看${alt ? ` ${alt}` : "图片"}`
+          }
+          onClick={() => (status === "error" ? reload() : openViewer())}
           className="relative block max-w-full cursor-zoom-in overflow-hidden rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
         >
-          <img
-            src={imgSrc}
-            alt={alt}
-            loading="lazy"
-            decoding="async"
-            onLoad={() => setThumbLoaded(true)}
-            onError={(e) => {
-              // 非签名直传 URL 且重试额度未尽:退避重试(缓存击穿),重试期保持骨架不裂图。
-              if (retriable && retryRef.current < 3) {
-                retryRef.current += 1;
-                const next = retryRef.current;
-                retryTimerRef.current = setTimeout(() => setAttempt(next), 400 * next);
-                return;
-              }
-              // 重试用尽 / 签名 URL:兜底解除骨架(不留骨架),再把 onError 交给上游(签名重签)。
-              setThumbLoaded(true);
-              onError?.(e);
-            }}
-            className={cn(imgClassName, !thumbLoaded && "absolute inset-0 h-full w-full opacity-0")}
-          />
-          {/* 加载中:深色 shimmer 骨架撑占位(禁纯白);加载后由 <img> 接管尺寸。 */}
-          {!thumbLoaded && (
-            <span aria-hidden className="oc-img-skeleton block h-40 w-64 max-w-full rounded-lg" />
+          {objectUrl && (
+            <img
+              src={objectUrl}
+              alt={alt}
+              decoding="async"
+              onError={(e) => onError?.(e)}
+              className={cn(imgClassName, status !== "loaded" && "absolute inset-0 h-full w-full opacity-0")}
+            />
+          )}
+          {/* 加载中/未就绪:深色 shimmer 骨架 + 居中百分比(禁纯白;reduced-motion 由 CSS 处理)。
+              失败:同骨架底 +「加载失败 · 点击重试」文案。加载完由 <img> 接管尺寸。 */}
+          {status !== "loaded" && (
+            <span
+              className="oc-img-skeleton flex h-40 w-64 max-w-full items-center justify-center rounded-lg"
+              {...(status === "error" ? { role: "alert" } : { "aria-hidden": true })}
+            >
+              <span className="flex items-center gap-1 text-center text-xs font-medium tabular-nums text-white/85 drop-shadow">
+                {status === "error" ? (
+                  <>
+                    <RotateCcw size={12} /> 加载失败 · 点击重试
+                  </>
+                ) : percent != null ? (
+                  `${percent}%`
+                ) : (
+                  "加载中…"
+                )}
+              </span>
+            </span>
           )}
         </button>
         {canEdit && (

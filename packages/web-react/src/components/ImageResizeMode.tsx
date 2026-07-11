@@ -6,6 +6,8 @@
 import { useEffect, useState } from 'react'
 import { X } from 'lucide-react'
 import { apiErrorMessage } from '../lib/api'
+import { downloadPercent } from '../lib/chat/download'
+import { getCachedThumbnail } from '../lib/chat/imageBytes'
 import { cn } from '../lib/utils'
 import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
 import {
@@ -54,6 +56,7 @@ export function ImageResizeMode({
   src,
   alt,
   resolveSrc,
+  cacheIdentity,
   canSubmit,
   onBack,
   onSubmit,
@@ -61,6 +64,11 @@ export function ImageResizeMode({
   src: string
   alt: string
   resolveSrc: (opts?: { forceResign?: boolean }) => Promise<string | null>
+  /**
+   * 字节缓存身份(signPath)。传入即让合成取原图字节**零请求复用**查看器/气泡已下载的原图
+   * (共享 LRU 命中),并在展示图就绪前先铺已缓存缩略图做模糊底图(禁纯白闪)。
+   */
+  cacheIdentity?: string | null
   canSubmit: boolean
   onBack: () => void
   onSubmit: (value: ImageEditSubmit) => Promise<void>
@@ -68,18 +76,43 @@ export function ImageResizeMode({
   const [busy, setBusy] = useState<ImageAspectRatio | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loadError, setLoadError] = useState(false)
+  // 合成取原图进度百分比(null = 命中缓存/无 Content-Length → 显示「提交…」而非数字)。
+  const [loadPercent, setLoadPercent] = useState<number | null>(null)
+  // 展示图是否已解码就绪:就绪前用缩略底图/骨架占位(禁纯白闪)。
+  const [imgReady, setImgReady] = useState(false)
+  // 加载期即时底图:已缓存缩略图(气泡/查看器已下载)的 objectURL。未命中 → null。
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null)
   // 展示态 src:重试时重签后更新它,让 <img> 真正换新 URL 重载(见 ImageCommentMode 同款说明)。
   const [displaySrc, setDisplaySrc] = useState(src)
   useEffect(() => setDisplaySrc(src), [src])
+  // 换图(含重试重签)→ 重置就绪态,重新走占位底图。
+  useEffect(() => setImgReady(false), [displaySrc])
+  // 从共享 LRU 取已缓存缩略图字节造 objectURL 做底图;卸载/换身份 revoke 防泄漏。
+  useEffect(() => {
+    const thumb = getCachedThumbnail(cacheIdentity)
+    if (!thumb) {
+      setThumbUrl(null)
+      return
+    }
+    const url = URL.createObjectURL(thumb)
+    setThumbUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [cacheIdentity])
 
   const choose = async (ratio: RatioOption) => {
     if (!canSubmit || busy) return
     setBusy(ratio.value)
     setError(null)
+    setLoadPercent(null)
     let revoke: (() => void) | null = null
     try {
       const url = (await resolveSrc()) ?? src
-      const loaded = await loadImageBytes(url, resolveSrc)
+      // 取原图字节收口到 loadImageBytes:cacheIdentity 命中共享 LRU 即**零请求复用**查看器/
+      // 气泡已下载的原图;miss 走流式 + onProgress 汇报百分比;403/410 强制重签自愈。
+      const loaded = await loadImageBytes(url, resolveSrc, {
+        cacheIdentity,
+        onProgress: (l, t) => setLoadPercent(downloadPercent(l, t)),
+      })
       revoke = loaded.revoke
       const { blob, image, naturalWidth, naturalHeight } = loaded
       const { canvas } = drawDisplayCanvas(image, naturalWidth, naturalHeight)
@@ -103,6 +136,7 @@ export function ImageResizeMode({
     } finally {
       revoke?.()
       setBusy(null)
+      setLoadPercent(null)
     }
   }
 
@@ -139,13 +173,34 @@ export function ImageResizeMode({
             </button>
           </div>
         ) : (
-          <img
-            src={displaySrc}
-            alt={alt}
-            onError={() => setLoadError(true)}
-            draggable={false}
-            className="max-h-full max-w-full select-none object-contain"
-          />
+          <div className="relative inline-flex max-h-full max-w-full items-center justify-center">
+            {/* 主图就绪前:已缓存缩略图做模糊底图(占位给容器尺寸);未命中 → 深色骨架。禁纯白闪。
+                shimmer 尊重 reduced-motion(oc-img-skeleton CSS 已处理)。 */}
+            {!imgReady &&
+              (thumbUrl ? (
+                <img
+                  src={thumbUrl}
+                  alt=""
+                  aria-hidden
+                  draggable={false}
+                  className="max-h-full max-w-full select-none object-contain opacity-40 blur-[1px]"
+                />
+              ) : (
+                <div className="oc-img-skeleton h-64 w-64 max-w-full rounded-lg" aria-hidden />
+              ))}
+            {/* 主图:就绪前覆盖在底图上且透明(避免半载闪),onLoad 后转 static 显形定尺寸。 */}
+            <img
+              src={displaySrc}
+              alt={alt}
+              onLoad={() => setImgReady(true)}
+              onError={() => setLoadError(true)}
+              draggable={false}
+              className={cn(
+                'max-h-full max-w-full select-none object-contain',
+                imgReady ? 'opacity-100' : 'absolute inset-0 h-full w-full opacity-0',
+              )}
+            />
+          </div>
         )}
       </div>
 
@@ -175,7 +230,11 @@ export function ImageResizeMode({
               <span className="flex-1 text-sm font-medium">
                 {r.label} <span className="text-white/50">{r.value}</span>
               </span>
-              {busy === r.value && <span className="text-xs text-white/60">提交…</span>}
+              {busy === r.value && (
+                <span className="text-xs tabular-nums text-white/60">
+                  {loadPercent != null ? `${loadPercent}%` : '提交…'}
+                </span>
+              )}
             </button>
           ))}
         </div>

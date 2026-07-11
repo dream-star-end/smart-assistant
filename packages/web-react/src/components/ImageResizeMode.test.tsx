@@ -26,7 +26,12 @@ const baseProps = {
 /** 桩住 fetch → Image 解码 → canvas 合成管线,让 onSubmit 能真实收到三件套。 */
 function stubImagePipeline() {
   const blob = new Blob(['png'], { type: 'image/png' })
-  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response))
+  // 完整 Response 桩:共享流式取字节路径(fetchImageProgressiveStream)会读 res.headers
+  // 的 content-length,缺 headers 会抛 TypeError,故补一个恒返 null 的 headers。
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null }, blob: async () => blob }) as unknown as Response),
+  )
   URL.createObjectURL = vi.fn(() => 'blob:mock')
   URL.revokeObjectURL = vi.fn()
   class MockImage {

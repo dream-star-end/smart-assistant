@@ -27,6 +27,7 @@ import {
 } from 'lucide-react'
 import { nativeDownload, openInNewTab } from '../lib/chat/download'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
+import { useProgressiveImage } from '../lib/chat/useProgressiveImage'
 import { cn } from '../lib/utils'
 import { ImageAnnotationEditor, type ImageAnnotationSource } from './ImageAnnotationEditor'
 import { ImageEditActionsContext, type ImageCommentSubmit, type ImageEditSubmit } from './chat/imageEditActions'
@@ -50,6 +51,7 @@ const MAX_PIXELS = 16_777_216 // 4096²,与编辑器一致
 export async function loadImageBytes(
   url: string,
   resolveSrc?: ResolveSignedSrc,
+  opts?: { cacheIdentity?: string | null; onProgress?: (loaded: number, total: number | null) => void },
 ): Promise<{
   blob: Blob
   image: HTMLImageElement
@@ -57,8 +59,12 @@ export async function loadImageBytes(
   naturalHeight: number
   revoke: () => void
 }> {
-  // 取字节收口到共享 helper:403/410(签名过期)时强制重签一次再试(过期 URL 入口自愈)。
-  const blob = await fetchImageBlobWithResign(url, resolveSrc)
+  // 取字节收口到共享 helper:字节缓存命中零请求复用(查看器已载原图 → 评论/调整大小直接用);
+  // 403/410(签名过期)强制重签一次;miss 流式 + onProgress 汇报百分比。
+  const blob = await fetchImageBlobWithResign(url, resolveSrc, {
+    cacheIdentity: opts?.cacheIdentity ?? null,
+    onProgress: opts?.onProgress,
+  })
   const objUrl = URL.createObjectURL(blob)
   const image = new Image()
   try {
@@ -190,7 +196,15 @@ export function ImageViewer({
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
   const [moreOpen, setMoreOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
-  const [imgLoaded, setImgLoaded] = useState(false)
+  // 原图渐进加载(单一 hook 收口):点开先复用气泡已载缩略字节做即时预览(零请求、非灰屏),
+  // 后台流式拉原图带百分比,到达后无缝换。lazy=false(查看器打开即可见)。signPath 作字节缓存身份。
+  const { objectUrl: viewerUrl, percent: viewerPercent, status: viewerStatus } = useProgressiveImage({
+    src: open ? src : null,
+    width: null,
+    cacheIdentity: signPath ?? null,
+    resolveSrc: get,
+    lazy: false,
+  })
   // Radix DismissableLayer 的 onEscapeKeyDown 会绑定挂载时那一版闭包(不随 mode/moreOpen
   // 重渲刷新),直接读 state 会拿到陈旧值 → ESC 误把子模式当 view 直接关掉整个查看器。用
   // ref 存最新值,闭包读 ref.current 永远最新(ref 对象跨渲染稳定)。
@@ -209,9 +223,6 @@ export function ImageViewer({
     setMode('edit')
   }
 
-  // src 变化(freshSrc 回填 / 换图)→ 重新亮骨架,直到新图 onLoad。
-  useEffect(() => setImgLoaded(false), [src])
-
   // 关闭时复位:回浏览态,清 edit source / 浮层 —— 下次开图是干净初始态。
   useEffect(() => {
     if (!open) {
@@ -219,7 +230,6 @@ export function ImageViewer({
       setEditSource(null)
       setMoreOpen(false)
       setNotice(null)
-      setImgLoaded(false)
       autoEditRef.current = false
       return
     }
@@ -355,6 +365,7 @@ export function ImageViewer({
                 src={src}
                 alt={alt}
                 resolveSrc={get}
+                cacheIdentity={signPath ?? null}
                 canSubmit={!!submitImageComment}
                 onBack={() => setMode('view')}
                 onSubmit={handleCommentSubmit}
@@ -364,6 +375,7 @@ export function ImageViewer({
                 src={src}
                 alt={alt}
                 resolveSrc={get}
+                cacheIdentity={signPath ?? null}
                 canSubmit={!!submitImageEdit}
                 onBack={() => setMode('view')}
                 onSubmit={handleSubmit}
@@ -443,26 +455,29 @@ export function ImageViewer({
                   </div>
                 </header>
 
-                {/* 图片居中:加载中亮深色 shimmer 骨架(禁纯白/白闪),onLoad 后淡入。 */}
+                {/* 图片居中:先复用气泡缩略字节做即时预览(零请求、非灰屏),原图流式到达无缝换;
+                    加载期顶部细进度条 + 百分比(禁纯白/白闪)。无预览时亮深色 shimmer 骨架。 */}
                 <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-4">
-                  {!imgLoaded && (
-                    <span
-                      aria-hidden
-                      className="oc-img-skeleton absolute inset-6 rounded-xl"
+                  {viewerUrl ? (
+                    <img
+                      src={viewerUrl}
+                      alt={alt}
+                      decoding="async"
+                      className="max-h-full max-w-full object-contain opacity-100 transition-opacity duration-200"
+                      draggable={false}
                     />
+                  ) : (
+                    <span aria-hidden className="oc-img-skeleton absolute inset-6 rounded-xl" />
                   )}
-                  <img
-                    src={src}
-                    alt={alt}
-                    decoding="async"
-                    onLoad={() => setImgLoaded(true)}
-                    onError={() => setImgLoaded(true)}
-                    className={cn(
-                      'max-h-full max-w-full object-contain transition-opacity duration-200',
-                      imgLoaded ? 'opacity-100' : 'opacity-0',
-                    )}
-                    draggable={false}
-                  />
+                  {viewerStatus === 'loading' && (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/55 px-3 py-1 text-xs font-medium tabular-nums text-white/90 backdrop-blur"
+                    >
+                      {viewerPercent != null ? `加载原图 ${viewerPercent}%` : '加载原图…'}
+                    </div>
+                  )}
                 </div>
 
                 {/* 底部动作条:编辑 / 评论 / 调整大小(「移除」已按 boss 判定下线)。 */}
@@ -513,6 +528,7 @@ export function ImageViewer({
         source={editSource}
         open={open && mode === 'edit'}
         resolveSrc={get}
+        cacheIdentity={signPath ?? null}
         onOpenChange={(o) => {
           if (!o) setMode('view')
         }}

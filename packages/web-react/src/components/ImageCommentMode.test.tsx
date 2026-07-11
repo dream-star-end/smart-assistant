@@ -86,9 +86,11 @@ describe('ImageCommentMode', () => {
 
   test('发送(签名 URL 源):取字节上传,onSubmit 收到 sourceFile File', async () => {
     const blob = new Blob(['png'], { type: 'image/png' })
+    // 完整 Response 桩:共享流式取字节路径会读 res.headers 的 content-length(缺 headers 抛
+    // TypeError),故补恒返 null 的 headers。
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response),
+      vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null }, blob: async () => blob }) as unknown as Response),
     )
     const onSubmit = vi.fn(async (_v: ImageCommentSubmit) => {})
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={onSubmit} />)

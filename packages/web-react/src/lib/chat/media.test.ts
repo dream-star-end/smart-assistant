@@ -4,7 +4,14 @@ import { classifyMediaRef, fetchImageBlobWithResign, isContainerPath, needsSigne
 afterEach(() => vi.unstubAllGlobals())
 
 const res = (status: number, blob?: Blob): Response =>
-  ({ ok: status >= 200 && status < 300, status, blob: async () => blob ?? new Blob() }) as unknown as Response
+  ({
+    ok: status >= 200 && status < 300,
+    status,
+    // 渐进 fetch 会读 content-length；无流(body=null)时回落 res.blob()。
+    headers: { get: () => null },
+    body: null,
+    blob: async () => blob ?? new Blob(),
+  }) as unknown as Response
 
 describe('fetchImageBlobWithResign（图片编辑取图过期自愈）', () => {
   test('过期 URL 入口(410)→ 强制重签一次 → 用新 URL 取图成功', async () => {

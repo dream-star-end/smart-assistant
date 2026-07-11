@@ -21,6 +21,38 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+let __objUrlSeq = 0;
+/** 流式 image Response(缩略 fetch 用):默认 1KB webp。 */
+function streamImageResponse(): Response {
+  let done = false;
+  const headers = new Headers({ "content-length": "1024", "content-type": "image/webp" });
+  return {
+    ok: true,
+    status: 200,
+    headers,
+    body: {
+      getReader() {
+        return {
+          read: async () =>
+            done ? { done: true, value: undefined } : ((done = true), { done: false, value: new Uint8Array(1024) }),
+        };
+      },
+    },
+  } as unknown as Response;
+}
+
+beforeEach(() => {
+  __objUrlSeq = 0;
+  // 渐进加载完成后 blob→objectURL:jsdom 未实现 createObjectURL,桩成可辨识值。
+  vi.stubGlobal("URL", {
+    ...URL,
+    createObjectURL: vi.fn(() => `blob:obj-${++__objUrlSeq}`),
+    revokeObjectURL: vi.fn(),
+  });
+  // 缩略/原图渐进 fetch 默认成功(个别用例可再 vi.stubGlobal 覆盖)。
+  vi.stubGlobal("fetch", vi.fn(async () => streamImageResponse()));
+});
+
 describe("ZoomableImage 灯箱", () => {
   // 编辑入口的显隐单一权威 = ImageEditActionsContext.submitImageEdit(image2 门控)。
   const withEdit = (node: ReactNode, canEdit: boolean) => (
@@ -187,9 +219,15 @@ describe("用户气泡媒体缩略图:/api/media 收口签名管线(iOS/CF 下 4
     );
     // 签名前占位(加载中),不会先挂裸 /api/media URL。
     await waitFor(() => expect(sign).toHaveBeenCalledWith(["/api/media/abc.png"]));
+    // 渐进加载:对签名 URL 追加缩略 w 后 fetch,完成后 <img> 挂 blob objectURL(非裸 URL 靠 cookie)。
     const img = await screen.findByAltText("图.png");
-    expect(img.getAttribute("src")).toBe("/api/media-signed?t=v1");
-    // 裸 /api/media URL 绝不出现在 <img src>(那正是会 401 的请求形态)。
+    await waitFor(() => expect(img.getAttribute("src")?.startsWith("blob:")).toBe(true));
+    const fetched = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
+      (c) => String(c[0]),
+    );
+    // 缩略请求走签名 URL + w=640(渲染参数);裸 /api/media URL 绝不被请求(那正是会 401 的形态)。
+    expect(fetched.some((u) => u === "/api/media-signed?t=v1&w=640")).toBe(true);
+    expect(fetched.some((u) => u.includes("/api/media/abc.png"))).toBe(false);
     expect(img.getAttribute("src")).not.toBe("/api/media/abc.png");
   });
 
@@ -235,9 +273,12 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
     );
     vi.advanceTimersByTime(5 * 60_000); // 挂载 5 分钟后才点开大图,挂载缓存已过期
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
+    // 开查看器**现场重签**(点击时签名铁律不回归):signPath 被重新 sign()。原图字节按 identity
+    // 复用(缩略/原图共享缓存),故不必再打网络 —— 重签发生 + 大图挂 blob 即证。
+    await waitFor(() => expect(sign).toHaveBeenCalledWith(["/home/agent/a.png"]));
     await waitFor(() => {
       const imgs = screen.getAllByAltText("图表") as HTMLImageElement[];
-      expect(imgs.some((im) => im.getAttribute("src") === "/api/media-signed?t=v1")).toBe(true);
+      expect(imgs.some((im) => im.getAttribute("src")?.startsWith("blob:"))).toBe(true);
     });
   });
 
