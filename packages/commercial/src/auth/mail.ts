@@ -92,6 +92,16 @@ export function createResendMailer(opts: ResendMailerOptions): Mailer {
         process.stdout.write(
           `[mail-resend] ${JSON.stringify({ _kind: "mail-resend", to: msg.to, subject: msg.subject, id, ts: new Date().toISOString() })}\n`,
         );
+      } catch (err) {
+        // 失败日志收口在 mailer 层:register/resend/forgot 等 caller 各自吞错
+        // 降级(用户可重发),但通道级故障必须在日志留痕 —— 07-07/07-11 两次
+        // Resend 通道静默断数天,根因之一就是这里无痕。v5-monitor.sh check_mail
+        // 盯 [mail-resend-error] 前缀告警,改前缀必须同步 monitor。
+        // 只记 to/subject/error,不记正文(验证码/重置链接不落日志)。
+        process.stdout.write(
+          `[mail-resend-error] ${JSON.stringify({ _kind: "mail-resend-error", to: msg.to, subject: msg.subject, error: String((err as Error)?.message ?? err).slice(0, 400), ts: new Date().toISOString() })}\n`,
+        );
+        throw err;
       } finally {
         clearTimeout(t);
       }

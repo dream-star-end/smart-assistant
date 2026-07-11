@@ -58,6 +58,8 @@ MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
 POOL_MAX=20            # v5-ccb 容器数上限(线上稳态 ~1-5,>20 = 回收失灵/被刷)
 REALERT_SECS=21600     # 坏状态持续时的重复提醒间隔(6h)
 CURL_TIMEOUT=5
+MAIL_ERR_WINDOW_SECS="${V5MON_MAIL_ERR_WINDOW:-1800}"  # 邮件发送失败回看窗口(30min)
+MAIL_LOG="${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}"
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -142,11 +144,38 @@ check_image() {
   fi
 }
 
+check_mail() {
+  # 邮件通道:master 日志 30min 窗口内出现 [mail-resend-error] → 告警。
+  # 前缀契约 = packages/commercial/src/auth/mail.ts createResendMailer 失败日志,
+  # 改前缀两侧必须同步。背景:07-07/07-11 两次 Resend 通道静默断数天,注册
+  # 验证码全丢(register 吞错降级),无告警无人知 → 用日志留痕 + 本检查补盲区。
+  # 日志按天轮转,跨轮转最多丢一次恢复沿,可接受。
+  local recent n last ts_iso ep
+  if [ ! -r "$MAIL_LOG" ]; then record mail ok "邮件通道:$MAIL_LOG 不可读(跳过)"; return; fi
+  recent="$(grep -a '\[mail-resend-error\]' "$MAIL_LOG" 2>/dev/null | tail -20)"
+  if [ -z "$recent" ]; then record mail ok "邮件通道:无失败记录"; return; fi
+  n=0; last=""
+  while IFS= read -r line; do
+    ts_iso="$(printf '%s' "$line" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+    [ -n "$ts_iso" ] || continue
+    ep="$(date -d "$ts_iso" +%s 2>/dev/null || echo 0)"
+    if [ "$ep" -gt 0 ] && [ $((NOW - ep)) -le "$MAIL_ERR_WINDOW_SECS" ]; then n=$((n+1)); last="$line"; fi
+  done <<EOF
+$recent
+EOF
+  if [ "$n" -gt 0 ]; then
+    record mail bad "邮件发送失败 ${n} 条(${MAIL_ERR_WINDOW_SECS}s 内,注册/找回密码受影响):$(printf '%s' "$last" | tail -c 200)"
+  else
+    record mail ok "邮件通道:窗口内无失败"
+  fi
+}
+
 # 检查项 → 告警 severity(方案 §2.3-2):服务/HTTP/公网/池/镜像 = critical(聊天全挂),
 # 磁盘/内存 = warning(容量预警,尚未致命)。未知项保守按 warning。
+# mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    svc_v5|svc_egress|http_v5|http_egress|http_v3|public_route|pool|image) echo critical ;;
+    svc_v5|svc_egress|http_v5|http_egress|http_v3|public_route|pool|image|mail) echo critical ;;
     disk_root|disk_var|mem) echo warning ;;
     *) echo warning ;;
   esac
@@ -181,6 +210,7 @@ check_disk disk_var  /var
 check_mem
 check_pool
 check_image
+check_mail
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)
