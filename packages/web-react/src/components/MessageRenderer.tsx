@@ -27,7 +27,7 @@ import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex } from "./chat/turnSegment";
+import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import { loadedArchivedCount, planLoadMore } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput, stripShellWrapperForDisplay } from "./tool/format";
@@ -50,13 +50,17 @@ type RendererProps = {
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
   delegateCost?: string;
+  /** 该行是否为「所在轮末条 assistant 正文」(评价反馈行只挂末条,轮内中间回复不出)。
+   *  值随后续消息追加而翻转,**已编进 sig head**(messageSignature 的 turnFinalAssistant)→
+   *  由 a.sig===b.sig 覆盖翻转重渲,无需单列进 memo 比较器。*/
+  turnFinalAssistant?: boolean;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, sig, isLast, sending, inActiveTurn, turnActivity, delegateCost, cb, onRespondPermission }: RendererProps) {
-    const ctx = { isLast, sending, turnActivity, inActiveTurn };
+  function MessageRenderer({ message, sig, isLast, sending, inActiveTurn, turnActivity, delegateCost, turnFinalAssistant, cb, onRespondPermission }: RendererProps) {
+    const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
     switch (messageKind(message)) {
       case "user":
         return <UserCard msg={message} cb={cb} />;
@@ -342,6 +346,9 @@ export function MessageList({
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(messages);
+  // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
+  // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
+  const ratingFinal = turnFinalAssistantFlags(messages);
   // typing 指示：本轮进行中、且末条不是会自渲流式态的卡（assistant/thinking 自带光标，
   // permission 处于等待用户决策态）。
   const showTyping =
@@ -423,7 +430,9 @@ export function MessageList({
             </MessageBoundary>
           );
         }
-        const sig = messageSignature(it.m, { isLast: it.isLast, sending });
+        // 轮末条 flag 进 sig(head)+ 同时作 prop:sig 保证翻转时穿透 memo 重渲,prop 供 ctx 渲染。
+        const turnFinalAssistant = ratingFinal[it.idx] ?? false;
+        const sig = messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant });
         return (
           <MessageBoundary key={it.m.id} messageId={it.m.id} sig={sig}>
             <MessageRenderer
@@ -434,6 +443,7 @@ export function MessageList({
               inActiveTurn={it.idx >= turnStart}
               turnActivity={turnActivity}
               delegateCost={it.delegateCost}
+              turnFinalAssistant={turnFinalAssistant}
               cb={cb}
               onRespondPermission={onRespondPermission}
             />

@@ -50,6 +50,10 @@ export type RenderCtx = {
    *  队长引擎收笔后 gateway 还要跑审查编排,积分/请求ID 尾注若此刻就出现会制造"回合已
    *  结束"的错觉(2026-07-07 boss 反馈)——终态帧到达(sending=false)才渲染。 */
   inActiveTurn?: boolean;
+  /** 该行是否为「所在轮末条 assistant 正文」(轮边界判定收口在 turnSegment.ts)。仅它渲染
+   *  评价反馈行 —— 一轮里穿插的中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
+   *  缺省 false(非 assistant / 单条兜底路径不渲染评价行,与历史一致)。 */
+  turnFinalAssistant?: boolean;
 };
 
 /** 逐条反馈上下文（请求ID + 关联键）。P6 反馈弹窗消费；本期由 App 兜底。 */
@@ -389,9 +393,12 @@ export function AssistantCard({
           <MessageActions msg={msg} cb={cb} showRegen={ctx.isLast && !hasError} />
         )}
         {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
-        {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,门控与
-            MetaRow 一致(流式中 / 团队编排未终态时不出)。未登录/demo 由卡内 Context 兜底隐藏。 */}
-        {!live && !hasError && !!msg.text && !(ctx.sending && ctx.inActiveTurn) && (
+        {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
+            所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
+            一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
+            其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
+            未登录/demo 由卡内 Context 兜底隐藏。 */}
+        {!live && !hasError && !!msg.text && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
           <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
         )}
       </div>
