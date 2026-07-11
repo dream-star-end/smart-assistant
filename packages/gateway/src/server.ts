@@ -24,7 +24,7 @@ import { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse, cr
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import sharp from 'sharp'
-import { normalizeImageEditMask, orientedImageDimensions } from './imageEdit.js'
+import { isOutpaintAspect, normalizeImageEditMask, type OutpaintAspect, orientedImageDimensions, outpaintTargetDimensions } from './imageEdit.js'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import {
   type InboundFrame,
@@ -10427,34 +10427,85 @@ export class Gateway {
         rejectEdit('当前模型不支持 Image 2 精确修改')
         return
       }
-      const indices = [rawImageEdit.sourceIndex, rawImageEdit.maskIndex, rawImageEdit.guideIndex]
-      if (!indices.every((n) => Number.isInteger(n) && n >= 0 && n < media.length) || new Set(indices).size !== 3) {
-        rejectEdit('媒体索引错误')
-        return
+      // Two paid image-edit shapes share this deterministic delivery path:
+      //   - annotated (default / comment): user-drawn mask, media=[source,mask,guide]
+      //   - outpaint (resize aspect):      no user mask,   media=[source,guide]
+      // The relay bills both as annotated_edit (50 credits) — only the prepare/
+      // composite geometry differs. mode omitted ⇒ annotated (old-client compat).
+      const isOutpaint = rawImageEdit.mode === 'outpaint'
+      const resolveImageMedia = (mediaIndex: number) => savedMedia.find((m) => m.mediaIndex === mediaIndex)
+      let source: SavedMedia | undefined
+      let mask: SavedMedia | undefined
+      let guide: SavedMedia | undefined
+      let outpaintAspect: OutpaintAspect | null = null
+      if (isOutpaint) {
+        if (!isOutpaintAspect(rawImageEdit.targetAspect)) {
+          rejectEdit('目标比例无效')
+          return
+        }
+        outpaintAspect = rawImageEdit.targetAspect
+        const indices = [rawImageEdit.sourceIndex, rawImageEdit.guideIndex]
+        if (!indices.every((n) => Number.isInteger(n) && n >= 0 && n < media.length) || new Set(indices).size !== 2) {
+          rejectEdit('媒体索引错误')
+          return
+        }
+        source = resolveImageMedia(rawImageEdit.sourceIndex)
+        guide = resolveImageMedia(rawImageEdit.guideIndex)
+        if (!source || !guide || source.kind !== 'image' || guide.kind !== 'image') {
+          rejectEdit('源图或标注图缺失')
+          return
+        }
+      } else {
+        const maskIndex = rawImageEdit.maskIndex
+        if (typeof maskIndex !== 'number' || !Number.isInteger(maskIndex)) {
+          rejectEdit('遮罩索引缺失')
+          return
+        }
+        const indices = [rawImageEdit.sourceIndex, maskIndex, rawImageEdit.guideIndex]
+        if (!indices.every((n) => Number.isInteger(n) && n >= 0 && n < media.length) || new Set(indices).size !== 3) {
+          rejectEdit('媒体索引错误')
+          return
+        }
+        source = resolveImageMedia(rawImageEdit.sourceIndex)
+        mask = resolveImageMedia(maskIndex)
+        guide = resolveImageMedia(rawImageEdit.guideIndex)
+        if (!source || !mask || !guide || [source, mask, guide].some((m) => m.kind !== 'image')) {
+          rejectEdit('源图、遮罩或标注图缺失')
+          return
+        }
       }
-      const [source, mask, guide] = indices.map((mediaIndex) => savedMedia.find((m) => m.mediaIndex === mediaIndex))
-      if (!source || !mask || !guide || [source, mask, guide].some((m) => m.kind !== 'image')) {
-        rejectEdit('源图、遮罩或标注图缺失')
+      if (!source || !guide) {
+        rejectEdit('媒体解析失败')
         return
       }
       let imageRuntimeStarted = false
       try {
-        const [sourceMeta, orientedSource, maskMeta, guideMeta, sourceBytes, maskBytes] = await Promise.all([
+        const [sourceMeta, orientedSource, guideMeta, sourceBytes] = await Promise.all([
           sharp(source.path).metadata(),
           orientedImageDimensions(source.path),
-          sharp(mask.path).metadata(),
           sharp(guide.path).metadata(),
           readFile(source.path),
-          readFile(mask.path),
         ])
         if (!['png', 'jpeg', 'webp'].includes(sourceMeta.format ?? '')) throw new Error('源图格式不受支持')
-        if (maskMeta.format !== 'png') throw new Error('遮罩必须为 PNG')
         if (!['png', 'jpeg', 'webp'].includes(guideMeta.format ?? '')) throw new Error('标注预览格式不受支持')
         if (orientedSource.width !== rawImageEdit.width || orientedSource.height !== rawImageEdit.height) {
           throw new Error('源图尺寸不一致')
         }
         if (rawImageEdit.width * rawImageEdit.height > 16_777_216) throw new Error('图片像素过大')
-        const normalizedMaskBytes = await normalizeImageEditMask(maskBytes, orientedSource)
+        // annotated 才有用户 mask;outpaint 无 mask(relay 按 targetAspect 合成)。
+        let normalizedMaskBytes: Buffer | null = null
+        if (!isOutpaint) {
+          const [maskMeta, maskBytes] = await Promise.all([
+            sharp(mask!.path).metadata(),
+            readFile(mask!.path),
+          ])
+          if (maskMeta.format !== 'png') throw new Error('遮罩必须为 PNG')
+          normalizedMaskBytes = await normalizeImageEditMask(maskBytes, orientedSource)
+        }
+        // 最终输出尺寸:annotated 与源图同尺寸;outpaint 按目标比例外扩(单一权威)。
+        const expectedDims = isOutpaint
+          ? outpaintTargetDimensions(rawImageEdit.width, rawImageEdit.height, outpaintAspect!)
+          : { width: rawImageEdit.width, height: rawImageEdit.height }
         imageEditJobId = rawImageEdit.clientJobId
         const outputPath = resolve(paths.generatedDir, `image2-edit-${imageEditJobId}.png`)
         if (dirname(outputPath) !== resolve(paths.generatedDir)) throw new Error('输出路径越界')
@@ -10463,8 +10514,8 @@ export class Gateway {
             const existingMeta = await sharp(outputPath, { failOn: 'error' }).metadata()
             if (
               existingMeta.format === 'png'
-              && existingMeta.width === rawImageEdit.width
-              && existingMeta.height === rawImageEdit.height
+              && existingMeta.width === expectedDims.width
+              && existingMeta.height === expectedDims.height
             ) imageEditOutputPath = outputPath
           } catch {
             // A partial/corrupt local artifact is not a successful recovery;
@@ -10481,7 +10532,9 @@ export class Gateway {
           width: rawImageEdit.width,
           height: rawImageEdit.height,
           sourceBase64: sourceBytes.toString('base64'),
-          maskBase64: normalizedMaskBytes.toString('base64'),
+          ...(isOutpaint
+            ? { outpaint: { aspect: outpaintAspect } }
+            : { maskBase64: normalizedMaskBytes!.toString('base64') }),
         })
         let lastDeliveryError: unknown = null
         imageRuntimeStarted = true
@@ -10514,7 +10567,7 @@ export class Gateway {
             }
             const finalImage = Buffer.from(encoded, 'base64')
             const finalMeta = await sharp(finalImage, { failOn: 'error' }).metadata()
-            if (finalMeta.format !== 'png' || finalMeta.width !== rawImageEdit.width || finalMeta.height !== rawImageEdit.height) {
+            if (finalMeta.format !== 'png' || finalMeta.width !== expectedDims.width || finalMeta.height !== expectedDims.height) {
               throw new Error('Image 2 返回图片尺寸异常')
             }
             const tmpOutputPath = `${outputPath}.${process.pid}.tmp`
@@ -10578,7 +10631,9 @@ export class Gateway {
     // start a second Codex turn: model failure could hide an already-charged
     // image, and model non-compliance could invoke imagegen a second time.
     if (imageEditOutputPath && imageEditJobId) {
-      const responseText = `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
+      const responseText = rawImageEdit?.mode === 'outpaint'
+        ? `已完成画面比例调整（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
+        : `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
       const externalTurn = await this.sessions.recordExternalTurn(session, {
         userText: text,
         assistantText: responseText,
@@ -10595,6 +10650,9 @@ export class Gateway {
         peer: frame.peer,
         blocks: [{ kind: 'text' as const, text: responseText, messageId: externalTurn.messageId }],
         isFinal: true,
+        // 回带 clientJobId(=占位卡 _genPlaceholder.jobId),前端据此把「生成中」
+        // 粒子占位卡原位替换为结果图。annotated / outpaint 走同一交付口径。
+        imageEditJobId,
         traceId: turnTraceId,
         _userId: activeUserId,
       }

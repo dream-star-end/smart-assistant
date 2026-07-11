@@ -69,9 +69,30 @@ export const InboundMessage = Type.Object({
     imageEdit: Type.Optional(
       Type.Object({
         clientJobId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
+        // 编辑语义:'annotated'(默认 — 笔刷圈选 / 数字锚点评论,都带用户 mask)
+        // 或 'outpaint'(调整画面比例 — 无用户 mask,master relay 按 targetAspect
+        // 把源图居中放入透明画布再外扩补全)。字段缺省 = 'annotated',保证旧前端
+        // (只发圈选编辑)向后兼容:老 master / 老 gateway 读不到该字段就走原
+        // annotated 分支。**注意**:master(userChatBridge)与 gateway 均以
+        // JSON.parse + 手写字段校验接帧(非 TypeBox 严格校验),新增可选字段不会
+        // 让旧代码 400;但 outpaint 的 master 侧识别(isValidatedAnnotatedImageInbound)
+        // 需要同步放行 mask-less 帧,故 outpaint 前端与 master 存在部署先后依赖。
+        mode: Type.Optional(Type.Union([Type.Literal('annotated'), Type.Literal('outpaint')])),
         sourceIndex: Type.Integer({ minimum: 0 }),
-        maskIndex: Type.Integer({ minimum: 0 }),
+        // annotated 必填(gateway 强制存在);outpaint 无 mask,故 Optional。
+        maskIndex: Type.Optional(Type.Integer({ minimum: 0 })),
         guideIndex: Type.Integer({ minimum: 0 }),
+        // outpaint 必填的目标画面比例(五枚举);annotated 忽略。gateway 与 relay
+        // 用它算 outpaintTargetDimensions(源图外扩后的最终输出尺寸,单一权威)。
+        targetAspect: Type.Optional(
+          Type.Union([
+            Type.Literal('16:9'),
+            Type.Literal('4:3'),
+            Type.Literal('9:16'),
+            Type.Literal('3:4'),
+            Type.Literal('1:1'),
+          ]),
+        ),
         width: Type.Integer({ minimum: 1, maximum: 8192 }),
         height: Type.Integer({ minimum: 1, maximum: 8192 }),
       }),
@@ -372,6 +393,12 @@ export const OutboundMessage = Type.Object({
   peer: Peer,
   blocks: Type.Array(OutboundContentBlock),
   isFinal: Type.Boolean(),
+  // v5 图片体验 — gateway「免模型直投」的图片编辑 / outpaint 交付终帧回带触发它的
+  // clientJobId,让前端把结果图原位替换掉对应的「生成中」粒子占位卡
+  // (_genPlaceholder.jobId === 此值)。仅 image-edit 直投终帧携带,普通 turn 不带。
+  // 容器 → master → user 全程 raw 透传(userChatBridge onContainerMessage 默认透传,
+  // 不过滤未知顶层字段),故该字段能原样抵达浏览器。
+  imageEditJobId: Type.Optional(Type.String({ pattern: '^[0-9a-f]{32}$' })),
   // V3 S12e — per-turn canonical 由 master 生成、container gateway
   // `dispatchInbound` 在 wire 发送前 stamp 到 frame。Optional 是给老路径
   // (cron / control / 非 turn deliver)留向后兼容口子,这些路径走 S11c。
