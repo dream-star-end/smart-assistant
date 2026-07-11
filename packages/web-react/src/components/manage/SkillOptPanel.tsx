@@ -13,11 +13,12 @@ import {
   Loader2,
   Play,
   Plus,
+  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { ApiError, api } from "../../lib/api";
 import {
   creditsForUsage,
   estimateEvalRunCredits,
@@ -31,6 +32,7 @@ import type {
   AuthSession,
   SkillDraftDetail,
   SkillDraftSummary,
+  SkillEvalGenJob,
   SkillEvalRun,
   SkillEvalsFile,
   SkillRunUsage,
@@ -129,6 +131,15 @@ function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: Mode
 
 const ARM_LABEL: Record<string, string> = { with: "有技能", without: "无技能", draft: "草稿版" };
 
+/** AI 生成端点错误 → 友好中文(409/403/404 单独措辞,其余回原始信息)。 */
+function genErrMessage(e: unknown): string {
+  const status = e instanceof ApiError ? e.status : 0;
+  if (status === 409) return "该技能有评测或生成任务在进行中,请稍后再试";
+  if (status === 403) return "只有你自建的技能才能生成评测用例";
+  if (status === 404) return "技能不存在或已删除";
+  return (e as Error).message || "AI 生成用例失败";
+}
+
 // ── 评测分区 ─────────────────────────────────────────────────────────────────
 
 export function SkillEvalSection({
@@ -150,6 +161,10 @@ export function SkillEvalSection({
   const [saved, setSaved] = useState(false);
   const [lastRun, setLastRun] = useState<{ finishedAt: number; benchmark: SkillEvalRun["benchmark"]; usage: SkillRunUsage } | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  // AI 生成 job:genRunId 非空即"生成中";done 后把草稿灌进上面的 cases 编辑器(dirty),
+  // draftBanner 提示用户审阅后保存。生成绝不落库,保存仍走既有 PUT。
+  const [genRunId, setGenRunId] = useState<string | null>(null);
+  const [draftBanner, setDraftBanner] = useState(false);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
   const load = useCallback(() => {
@@ -170,6 +185,7 @@ export function SkillEvalSection({
         setLastRun(r.lastRun as typeof lastRun);
         if (r.parseErrors?.length) setErr(`evals.json 解析失败:${r.parseErrors.join(";")}`);
         setDirty(false);
+        setDraftBanner(false);
       })
       .catch((e) => setErr((e as Error).message || "加载评测用例失败"))
       .finally(() => setLoading(false));
@@ -195,6 +211,7 @@ export function SkillEvalSection({
     try {
       await api.putSkillEvals(auth, skillName, buildFile(auto));
       setDirty(false);
+      setDraftBanner(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
     } catch (e) {
@@ -247,6 +264,69 @@ export function SkillEvalSection({
     if (run && run.status === "done") load();
   }, [run?.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── AI 生成用例:成本确认 → POST → 3s 轮询 → done 灌进编辑器(追加,dirty) ──
+  const generating = !!genRunId;
+  const genFetcher = useCallback(
+    () => (genRunId ? api.getSkillEvalGen(auth, genRunId) : Promise.reject(new Error("no gen"))),
+    [auth, genRunId],
+  );
+  const genActive = useCallback((g: SkillEvalGenJob) => g.status === "running", []);
+  const [genRun, setGenRun] = usePollingRun(genRunId ? genFetcher : null, genActive);
+  useEffect(() => {
+    if (!genRun || genRun.status === "running") return; // 进行中:继续轮询,别清 job。
+    if (genRun.status === "done") {
+      const drafted = (genRun.cases ?? []).map((c) => ({
+        id: c.id,
+        prompt: c.prompt,
+        assertions: c.assertions.join("\n"),
+      }));
+      // 灌进现有编辑器 state(唯一编辑权威;不旁路造第二份草稿 state)。已有用例=追加,
+      // 尊重 5 条上限(与「加用例」同一不变量),超出部分裁掉。
+      setCases((prev) => {
+        const room = Math.max(0, 5 - prev.length);
+        return room > 0 ? [...prev, ...drafted.slice(0, room)] : prev;
+      });
+      setDirty(true);
+      setDraftBanner(true);
+    } else {
+      // failed:提示失败原因(note)。
+      setErr(genRun.note ? `AI 生成用例失败:${genRun.note}` : "AI 生成用例失败");
+    }
+    // 仅终态(done/failed)清 job、停止轮询。
+    setGenRunId(null);
+    setGenRun(null);
+  }, [genRun?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 成本确认弹窗对齐评测确认框;单次一个对话轮次,无 rates 估算 → 固定保守区间文案。
+  const startGenerate = async () => {
+    const hasCases = cases.length > 0;
+    const ok = await confirmDialog({
+      title: hasCases ? "AI 补充生成评测用例?" : "AI 生成评测用例?",
+      body: (
+        <CostBody
+          lines={[
+            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
+            "单次一个对话轮次:AI 读技能内容 + 你的真实使用记录起草用例",
+            hasCases
+              ? "在现有用例基础上补充不重复的新场景(灌入编辑器,保存前不写入技能库)"
+              : "起草 3~5 个用例灌入下方编辑器,你审阅/修改后保存才写入技能库",
+          ]}
+          range="约 1~3 积分(一个对话轮次)"
+          rates={null}
+        />
+      ),
+      confirmText: hasCases ? "补充生成(接受消耗)" : "生成(接受消耗)",
+    });
+    if (!ok) return;
+    setErr(null);
+    try {
+      const r = await api.generateSkillEvals(auth, skillName);
+      setGenRunId(r.runId);
+    } catch (e) {
+      setErr(genErrMessage(e));
+    }
+  };
+
   // 自动回归 opt-in:显式确认成本后写回 evals.json。
   const toggleAutoRegression = async () => {
     if (!autoRegression) {
@@ -288,6 +368,7 @@ export function SkillEvalSection({
     <div className="flex flex-col gap-3">
       {confirmDialogEl}
       {err && <Alert tone="danger">{err}</Alert>}
+      {draftBanner && <Alert tone="info">AI 草稿已生成,请审阅修改后保存</Alert>}
 
       {/* 用例编辑 */}
       <div className="flex items-center justify-between">
@@ -306,23 +387,61 @@ export function SkillEvalSection({
               <Plus size={13} /> 加用例
             </Button>
           )}
+          {/* 已有用例态:次级「补充生成」;生成中/评测中禁用(后端亦 409 排他)。 */}
+          {writable && cases.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={startGenerate}
+              disabled={generating || !!running || cases.length >= 5}
+            >
+              {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+              补充生成
+            </Button>
+          )}
           {writable && (
             <Button variant="secondary" size="sm" disabled={!dirty || saving} onClick={() => save()}>
               {saving ? <Loader2 size={13} className="animate-spin" /> : saved ? <Check size={13} /> : null}
               {saved ? "已保存" : "保存用例"}
             </Button>
           )}
-          <Button variant="primary" size="sm" onClick={startRun} disabled={!!running || cases.length === 0}>
+          <Button variant="primary" size="sm" onClick={startRun} disabled={!!running || cases.length === 0 || generating}>
             {running ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
             运行评测
           </Button>
         </div>
       </div>
+
+      {/* 生成中进度(禁用运行评测与再次生成期间的可见反馈)。 */}
+      {generating && (
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-bg p-3 text-[12.5px] text-muted">
+          <Spinner size={14} /> AI 正在起草评测用例…(约一个对话轮次,请稍候)
+        </div>
+      )}
       {cases.length === 0 ? (
-        <p className="text-[12px] text-faint">
-          还没有评测用例。用例 = 一个真实任务 + 几条可判定的验收断言;它是「这个技能到底有没有用」的
-          唯一事实标准。{writable ? "点「加用例」开始。" : ""}
-        </p>
+        <div className="flex flex-col gap-2.5 rounded-lg border border-dashed border-border bg-bg p-4">
+          <p className="text-[12px] text-faint">
+            还没有评测用例。用例 = 一个真实任务 + 几条可判定的验收断言;它是「这个技能到底有没有用」的
+            唯一事实标准。
+          </p>
+          {writable && (
+            <>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={startGenerate}
+                disabled={generating || !!running}
+                className="self-start"
+              >
+                {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                AI 生成用例
+              </Button>
+              <p className="text-[11.5px] text-faint">
+                从技能内容和你的真实使用记录起草,生成后可编辑;也可点上方「加用例」手动写。
+              </p>
+            </>
+          )}
+        </div>
       ) : (
         <ul className="flex flex-col gap-2">
           {cases.map((c, i) => (

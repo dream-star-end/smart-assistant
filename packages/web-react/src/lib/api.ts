@@ -22,6 +22,7 @@ import type {
   MarketplaceMyAgent,
   SkillDraftDetail,
   SkillDraftSummary,
+  SkillEvalGenJob,
   SkillEvalRun,
   SkillEvalsFile,
   SkillRunUsage,
@@ -1621,6 +1622,32 @@ export const api = {
         }),
       ),
     ).then((b) => b.run),
+
+  /** 启动 AI 生成评测用例 job（POST /api/skills/:name/evals/generate;消耗积分,调用前必须
+   *  已过成本确认）。生成绝不落库,只回草稿由前端灌进编辑器。经 ApiError 抛:409=同技能已有
+   *  生成/评测在跑;403=非自建技能;404=技能不存在。 */
+  generateSkillEvals: (a: AuthSession, name: string) =>
+    jsonOrThrow<{ ok: boolean; runId: string }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/evals/generate`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({}),
+        }),
+      ),
+    ),
+
+  /** AI 生成 job 状态（GET /api/skill-eval-gen/:runId;直接回 job,cases 仅 done）。 */
+  getSkillEvalGen: (a: AuthSession, runId: string) =>
+    jsonOrThrow<SkillEvalGenJob>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skill-eval-gen/${encodeURIComponent(runId)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 
   /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
