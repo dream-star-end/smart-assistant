@@ -23,6 +23,7 @@ import { AddressInfo } from "node:net";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { signAccess } from "../auth/jwt.js";
 import { createCommercialHandler } from "../http/router.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
@@ -90,7 +91,8 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  // schema 级重置替代手工表清单 DROP(清单漂移=新迁移表撞 already exists,见 helpers/db.ts)。
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
