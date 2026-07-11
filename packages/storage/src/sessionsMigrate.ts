@@ -1,5 +1,10 @@
 // sessionsMigrate.ts
 //
+// ⚠️ DEPRECATED(RFC-v5-sessions-pg §5b,2026-07-11):v5 master 会话权威割接 PG 后,
+// 本工具**不再适用于 master 形态**(列清单缺归档水位列,且只认 SQLite)。仅保留给
+// SQLite 形态的历史场景(个人版/容器/留档库)。master 相关迁移一律走
+// scripts/v5-sessions-backfill-pg.ts。
+//
 // v3 → v5 master sessions.db 的**per-user 行级迁移**(L2 WebChat 会话历史)。
 //
 // 为什么是行拷贝而非文件拷贝:master sessions.db 是**多租户单文件**(client_sessions
