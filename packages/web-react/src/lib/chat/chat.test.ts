@@ -1695,6 +1695,38 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
   });
 
+  test("annotated image sends hidden source/mask to gateway but only shows the guide in the user bubble", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "把杯子改成玻璃杯",
+      media: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png" },
+      ],
+      imageEdit: { clientJobId: "a".repeat(32), sourceIndex: 0, maskIndex: 1, guideIndex: 2, width: 100, height: 80 },
+    });
+    const inbound = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.message");
+    expect(inbound.content.media).toHaveLength(3);
+    expect(inbound.content.imageEdit).toMatchObject({ sourceIndex: 0, maskIndex: 1, guideIndex: 2 });
+    expect(sock.sessions.get("s1")!.messages.find((m) => m.role === "user")?._media).toEqual([
+      { kind: "image", url: "/api/media/guide.png" },
+    ]);
+    const user = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!;
+    user.status = "error";
+    sock.sessions.get("s1")!._sendingInFlight = false;
+    sock.retryMessage({ sessId: "s1", msgId: user.id, agentId: "main" });
+    const retried = ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.message").at(-1);
+    expect(retried.content.media).toHaveLength(3);
+    expect(retried.content.imageEdit.clientJobId).toBe("a".repeat(32));
+  });
+
   test("send persists optimistic user row + in-flight marker immediately", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();

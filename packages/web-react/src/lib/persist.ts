@@ -349,6 +349,8 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
   if (serverMsg.role === "user" && localMsg.role === "user") {
     const localFields = {
       ...(localMsg._media !== undefined ? { _media: localMsg._media } : {}),
+      ...(localMsg._retryMedia !== undefined ? { _retryMedia: localMsg._retryMedia } : {}),
+      ...(localMsg._imageEdit !== undefined ? { _imageEdit: localMsg._imageEdit } : {}),
       ...(localMsg._modelText !== undefined ? { _modelText: localMsg._modelText } : {}),
       ...(localMsg._routing !== undefined ? { _routing: localMsg._routing } : {}),
     };

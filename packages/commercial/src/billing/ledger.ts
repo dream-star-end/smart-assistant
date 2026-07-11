@@ -41,6 +41,7 @@ export const LEDGER_REASONS = [
   "admin_adjust",
   "promotion",
   "minimax_media",
+  "image_generation",
   // 0096 双钱包订阅：subscription=期内桶发放, subscription_expire=轮转清零(负), pack=加量包进期内桶。
   "subscription",
   "subscription_expire",

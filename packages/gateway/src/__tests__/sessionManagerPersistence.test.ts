@@ -29,6 +29,11 @@ import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
 import type { SubprocessRunner } from "../subprocessRunner.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
+import {
+  setV3MasterSinkSingleton,
+  type V3MasterSink,
+  type V3MasterSinkPayload,
+} from "../v3MasterSink.js";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────
 
@@ -65,6 +70,8 @@ type FakeExitInfo = { code: number | null; signal: string | null; crashed: boole
 
 class FakeTurnRunner extends EventEmitter {
   lastActivityAt = Date.now();
+  submitted: unknown[] = [];
+  isRunning = false;
 
   constructor(
     private readonly onSubmit: (runner: FakeTurnRunner, requestId?: string) => void,
@@ -76,10 +83,15 @@ class FakeTurnRunner extends EventEmitter {
     return false;
   }
 
+  clearSessionId(): void {}
+
+  async shutdown(): Promise<void> {}
+
   async submit(
-    _textOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
+    textOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     requestId?: string,
   ): Promise<void> {
+    this.submitted.push(textOrBlocks);
     this.onSubmit(this, requestId);
   }
 
@@ -158,6 +170,81 @@ async function runPrivateOneTurn(
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 describe("SessionManager pending-persistence tracking", () => {
+  test("external turns keep the active abort controller aligned with lock order", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner(() => {});
+    const session = makeTurnSession(runner);
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+    const first = await sm.beginExternalTurn(session);
+    const secondPromise = sm.beginExternalTurn(session);
+    await Promise.resolve();
+    assert.equal(session._externalTurnAbort?.signal, first.signal);
+    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(first.signal.aborted, true);
+
+    first.finish("errored");
+    const second = await secondPromise;
+    assert.equal(second.signal.aborted, false);
+    assert.equal(session._externalTurnAbort?.signal, second.signal);
+    second.finish("completed");
+    assert.equal(session._activeClientTurnCount, 0);
+    assert.equal(session._externalTurnAbort, undefined);
+  });
+
+  test("queued external turn is injected into the next provider context", async () => {
+    const payloads: V3MasterSinkPayload[] = [];
+    const queuedSink = {
+      persistOrQueue: async (payload: V3MasterSinkPayload) => {
+        payloads.push(payload);
+        return { ok: false as const, queued: true as const, errorClass: "transient" as const };
+      },
+      attemptOnce: async () => {},
+    } as V3MasterSink;
+    setV3MasterSinkSingleton(queuedSink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeTurnRunner((r) => {
+        setImmediate(() => {
+          r.emitAssistantText("follow-up");
+          r.emitResult("req-next");
+        });
+      });
+      const session = makeTurnSession(runner);
+      session.channel = "webchat";
+      session.turns = 1;
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+      const guard = await sm.beginExternalTurn(session);
+      await sm.recordExternalTurn(session, {
+        userText: "把天空圈选区域改成晚霞",
+        assistantText: "已完成圈选区域的精确修改。\n\n/api/media/edited.png",
+        requestId: "1234567890abcdef1234567890abcdef",
+        model: "gpt-image-2",
+      });
+      guard.finish("completed");
+      assert.equal(payloads.length, 1);
+
+      await sm.submit(
+        session,
+        "继续把整体色调调暖",
+        () => {},
+        undefined,
+        undefined,
+        "req-next",
+        undefined,
+        undefined,
+        { historicalMessages: [] },
+      );
+      const submitted = String(runner.submitted.at(-1));
+      assert.match(submitted, /把天空圈选区域改成晚霞/);
+      assert.match(submitted, /已完成圈选区域的精确修改/);
+      assert.match(submitted, /<current_user_message>\n继续把整体色调调暖/);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("awaitPendingPersistence is a no-op when set is empty", async () => {
     const sm = new SessionManager(makeConfigStub());
     const t0 = Date.now();

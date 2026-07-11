@@ -1415,7 +1415,18 @@ export async function registerCommercial(
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
-      const codexRelayHandler: CodexRelayHandler = buildCodexRelayHandler({ identityRepo });
+      const codexRelayHandler: CodexRelayHandler = buildCodexRelayHandler({
+        identityRepo,
+        preCheckRedis,
+        pgPool: getPool(),
+        onImageCharge: (uid, charge) => {
+          bridgeBroadcastRef.current(uid, {
+            type: 'outbound.cost_charged',
+            costCredits: charge.costCredits,
+            balanceAfter: charge.balanceAfter,
+          })
+        },
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。

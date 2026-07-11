@@ -20,7 +20,7 @@ export function isContainerPath(s: string): boolean {
   if (typeof s !== "string" || !s) return false;
   if (!s.startsWith("/")) return false;
   if (s.startsWith("//")) return false; // 协议相对 URL
-  if (s.startsWith("/api/")) return false; // 已是后端端点
+  if (s.startsWith("/api/")) return false; // 已是同源后端端点
   return true;
 }
 
@@ -37,6 +37,7 @@ export function classifyMediaRef(m: MediaRef): ResolvedMedia {
   }
   const url = (m.url || "").trim();
   if (!url) return { mode: "none", kind: m.kind, filename: m.filename };
+  if (url.startsWith("/api/media/")) return { mode: "direct", src: url, ...base };
   if (isDirectUrl(url)) return { mode: "direct", src: url, ...base };
   if (isContainerPath(url)) return { mode: "sign", path: url, ...base };
   return { mode: "none", kind: m.kind, filename: m.filename };

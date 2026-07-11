@@ -14,6 +14,7 @@
     "@openclaude/storage": "*",
     "mammoth": "^1.12.0",
     "pdf-parse": "^2.4.5",
+    "sharp": "^0.34.3",
     "ws": "^8.18.0",
     "yaml": "^2.6.0"
   },

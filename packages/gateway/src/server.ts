@@ -19,10 +19,12 @@ import {
   unlink,
   unlinkSync,
 } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import sharp from 'sharp'
+import { normalizeImageEditMask, orientedImageDimensions } from './imageEdit.js'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import {
   type InboundFrame,
@@ -9920,6 +9922,10 @@ export class Gateway {
     // so the agent knows how to access them via MCP tools or Read.
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
+    const rawImageEdit = frame.content.imageEdit
+    const externalTurnGuard = rawImageEdit ? await this.sessions.beginExternalTurn(session) : null
+    let externalTurnCompleted = false
+    try {
 
     // Server-side upload validation. Constants live at module level
     // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
@@ -9994,6 +10000,7 @@ export class Gateway {
     }
 
     type SavedMedia = {
+      mediaIndex: number
       kind: string
       path: string
       name: string
@@ -10014,7 +10021,7 @@ export class Gateway {
       return
     }
 
-    for (const m of media) {
+    for (const [mediaIndex, m] of media.entries()) {
       // ── New url-only path (Plan B) ──
       if (!m.base64 && m.url) {
         const match = m.url.match(/^\/api\/media\/(.+)$/)
@@ -10071,6 +10078,7 @@ export class Gateway {
         }
         const mimeType = m.mimeType || mimeFor(realPath) || 'application/octet-stream'
         savedMedia.push({
+          mediaIndex,
           kind: m.kind,
           path: realPath,
           name: m.filename ?? basename(realPath),
@@ -10101,6 +10109,7 @@ export class Gateway {
         await writeFile(fpath, Buffer.from(base64, 'base64'))
         const sizeKb = (Buffer.byteLength(base64, 'base64') / 1024).toFixed(1)
         savedMedia.push({
+          mediaIndex,
           kind: m.kind,
           path: fpath,
           name: m.filename ?? fname,
@@ -10110,6 +10119,201 @@ export class Gateway {
       } catch (err) {
         this.log.warn('dispatchInbound failed to save upload', { kind: m.kind }, err)
       }
+    }
+
+    let imageEditJobId: string | null = null
+    let imageEditOutputPath: string | null = null
+    if (rawImageEdit !== undefined) {
+      const rejectEdit = (reason: string) => {
+        rejectFrame(`图片标注无效: ${reason}`)
+      }
+      if (
+        rawImageEdit === null || typeof rawImageEdit !== 'object'
+        || typeof rawImageEdit.clientJobId !== 'string'
+        || !/^[0-9a-f]{32}$/.test(rawImageEdit.clientJobId)
+      ) {
+        rejectEdit('任务标识无效')
+        return
+      }
+      const effectiveModel = safeModel ?? effectiveAgent.model ?? ''
+      if (!isCodexEngineModel(effectiveModel)) {
+        rejectEdit('当前模型不支持 Image 2 精确修改')
+        return
+      }
+      const indices = [rawImageEdit.sourceIndex, rawImageEdit.maskIndex, rawImageEdit.guideIndex]
+      if (!indices.every((n) => Number.isInteger(n) && n >= 0 && n < media.length) || new Set(indices).size !== 3) {
+        rejectEdit('媒体索引错误')
+        return
+      }
+      const [source, mask, guide] = indices.map((mediaIndex) => savedMedia.find((m) => m.mediaIndex === mediaIndex))
+      if (!source || !mask || !guide || [source, mask, guide].some((m) => m.kind !== 'image')) {
+        rejectEdit('源图、遮罩或标注图缺失')
+        return
+      }
+      let imageRuntimeStarted = false
+      try {
+        const [sourceMeta, orientedSource, maskMeta, guideMeta, sourceBytes, maskBytes] = await Promise.all([
+          sharp(source.path).metadata(),
+          orientedImageDimensions(source.path),
+          sharp(mask.path).metadata(),
+          sharp(guide.path).metadata(),
+          readFile(source.path),
+          readFile(mask.path),
+        ])
+        if (!['png', 'jpeg', 'webp'].includes(sourceMeta.format ?? '')) throw new Error('源图格式不受支持')
+        if (maskMeta.format !== 'png') throw new Error('遮罩必须为 PNG')
+        if (!['png', 'jpeg', 'webp'].includes(guideMeta.format ?? '')) throw new Error('标注预览格式不受支持')
+        if (orientedSource.width !== rawImageEdit.width || orientedSource.height !== rawImageEdit.height) {
+          throw new Error('源图尺寸不一致')
+        }
+        if (rawImageEdit.width * rawImageEdit.height > 16_777_216) throw new Error('图片像素过大')
+        const normalizedMaskBytes = await normalizeImageEditMask(maskBytes, orientedSource)
+        imageEditJobId = rawImageEdit.clientJobId
+        const outputPath = resolve(paths.generatedDir, `image2-edit-${imageEditJobId}.png`)
+        if (dirname(outputPath) !== resolve(paths.generatedDir)) throw new Error('输出路径越界')
+        if (existsSync(outputPath)) {
+          try {
+            const existingMeta = await sharp(outputPath, { failOn: 'error' }).metadata()
+            if (
+              existingMeta.format === 'png'
+              && existingMeta.width === rawImageEdit.width
+              && existingMeta.height === rawImageEdit.height
+            ) imageEditOutputPath = outputPath
+          } catch {
+            // A partial/corrupt local artifact is not a successful recovery;
+            // the trusted relay cache below remains the source of truth.
+          }
+        }
+        if (!imageEditOutputPath) {
+        const relayCfg = readV3CodexRelayConfig(process.env)
+        if (!relayCfg) throw new Error('商业版图片计费通道未配置')
+        const relayUrl = `${relayCfg.masterBaseUrl}${V3_CODEX_RELAY_PREFIX}/backend-api/codex/images/annotated-edits`
+        const body = JSON.stringify({
+          jobId: imageEditJobId,
+          prompt: text,
+          width: rawImageEdit.width,
+          height: rawImageEdit.height,
+          sourceBase64: sourceBytes.toString('base64'),
+          maskBase64: normalizedMaskBytes.toString('base64'),
+        })
+        let lastDeliveryError: unknown = null
+        imageRuntimeStarted = true
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const generated = await fetch(relayUrl, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${relayCfg.containerToken}`,
+                'content-type': 'application/json',
+                'x-openclaude-image-job': imageEditJobId,
+              },
+              body,
+              signal: externalTurnGuard?.signal,
+            })
+            const generatedBody = await generated.json() as {
+              data?: Array<{ b64_json?: string }>
+              error?: { code?: string; message?: string }
+            }
+            const encoded = generatedBody.data?.[0]?.b64_json
+            if (!generated.ok || generatedBody.data?.length !== 1 || typeof encoded !== 'string') {
+              throw Object.assign(
+                new Error(generatedBody.error?.message ?? `Image 2 生成失败 (${generated.status})`),
+                {
+                  imageCode: generatedBody.error?.code,
+                  imageStatus: generated.status,
+                  noRetry: generated.status !== 409 && generated.status < 500,
+                },
+              )
+            }
+            const finalImage = Buffer.from(encoded, 'base64')
+            const finalMeta = await sharp(finalImage, { failOn: 'error' }).metadata()
+            if (finalMeta.format !== 'png' || finalMeta.width !== rawImageEdit.width || finalMeta.height !== rawImageEdit.height) {
+              throw new Error('Image 2 返回图片尺寸异常')
+            }
+            const tmpOutputPath = `${outputPath}.${process.pid}.tmp`
+            try {
+              await writeFile(tmpOutputPath, finalImage, { mode: 0o600 })
+              await rename(tmpOutputPath, outputPath)
+            } catch (err) {
+              try { unlinkSync(tmpOutputPath) } catch {}
+              throw err
+            }
+            imageEditOutputPath = outputPath
+            break
+          } catch (err) {
+            if (externalTurnGuard?.signal.aborted) throw err
+            if ((err as { noRetry?: boolean }).noRetry) throw err
+            lastDeliveryError = err
+          }
+        }
+        if (!imageEditOutputPath) throw lastDeliveryError ?? new Error('Image 2 服务连接失败')
+        }
+      } catch (err) {
+        if (externalTurnGuard?.signal.aborted) return
+        const imageCode = (err as { imageCode?: string }).imageCode
+        if (imageRuntimeStarted) {
+          const rateLimited = (err as { imageStatus?: number }).imageStatus === 429
+            || imageCode === 'IMAGE_DAILY_LIMIT'
+            || imageCode === 'IMAGE_ATTEMPT_LIMIT'
+            || imageCode === 'IMAGE_SERVER_BUSY'
+          const insufficient = imageCode === 'ERR_INSUFFICIENT_CREDITS'
+          const message = insufficient
+            ? '积分不足，Image 2 每张需要 50 积分。'
+            : rateLimited
+              ? 'Image 2 当前繁忙或已达使用上限，请稍后重试。'
+              : 'Image 2 服务暂时不可用，请稍后重试。'
+          const errorFrame: OutboundError & { _userId?: string } = {
+            type: 'outbound.error',
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            code: insufficient ? 'insufficient_credits' : rateLimited ? 'rate_limited' : 'upstream_failed',
+            message,
+            detail: err instanceof Error ? err.message : String(err),
+            isFinal: false,
+            traceId: turnTraceId,
+            _userId: activeUserId,
+          }
+          this.deliver(errorFrame, adapter)
+          this.deliver({
+            type: 'outbound.message', sessionKey, channel: frame.channel, peer: frame.peer,
+            blocks: [{ kind: 'text', text: `[error] ${message}` }],
+            isFinal: true, traceId: turnTraceId, _userId: activeUserId,
+          } as OutboundMessage, adapter)
+        } else {
+          rejectEdit(err instanceof Error ? err.message : '图片校验失败')
+        }
+        return
+      }
+    }
+
+    // Paid image edits are delivered deterministically by the gateway. Do not
+    // start a second Codex turn: model failure could hide an already-charged
+    // image, and model non-compliance could invoke imagegen a second time.
+    if (imageEditOutputPath && imageEditJobId) {
+      const responseText = `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
+      const externalTurn = await this.sessions.recordExternalTurn(session, {
+        userText: text,
+        assistantText: responseText,
+        requestId: typeof frame.requestId === 'string' && /^[0-9a-f]{32}$/.test(frame.requestId)
+          ? frame.requestId
+          : imageEditJobId,
+        traceId: turnTraceId,
+        model: 'gpt-image-2',
+      })
+      const delivered = {
+        type: 'outbound.message' as const,
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: responseText, messageId: externalTurn.messageId }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: activeUserId,
+      }
+      externalTurnCompleted = true
+      this.deliver(delivered as OutboundMessage, adapter)
+      return
     }
 
     let finalText = text
@@ -10691,6 +10895,9 @@ export class Gateway {
     }
     if (liveWechatAdapter) {
       await liveWechatSendQueue
+    }
+    } finally {
+      externalTurnGuard?.finish(externalTurnCompleted ? 'completed' : 'errored')
     }
   }
 

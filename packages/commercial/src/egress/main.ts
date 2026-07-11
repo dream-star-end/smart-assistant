@@ -224,7 +224,22 @@ export async function startEgress(): Promise<void> {
       enqueueCodexDisableFanout(accountId, codexFanoutDeps);
     },
   });
-  const codexRelayHandler = buildCodexRelayHandler({ identityRepo });
+  const codexRelayHandler = buildCodexRelayHandler({
+    identityRepo,
+    preCheckRedis,
+    pgPool: getPool(),
+    onImageCharge: (uid, charge) => {
+      costSink.enqueue({
+        kind: "broadcast",
+        uid: uid.toString(),
+        payload: {
+          type: "outbound.cost_charged",
+          costCredits: charge.costCredits,
+          balanceAfter: charge.balanceAfter,
+        },
+      });
+    },
+  });
 
   const forward = makeForwarder({ controlBaseUrl });
 

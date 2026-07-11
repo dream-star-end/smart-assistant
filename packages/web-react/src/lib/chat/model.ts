@@ -10,7 +10,7 @@
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
 import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
-import type { MediaRef } from "./frames";
+import type { InboundMessage, MediaRef } from "./frames";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
 export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" | "error";
@@ -121,6 +121,9 @@ export type ChatMessage = {
   // ── user ──
   status?: UserMsgStatus;
   _media?: MediaRef[];
+  /** Full local retry payload; hidden source/mask never enter cloud user-message persistence. */
+  _retryMedia?: MediaRef[];
+  _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
   /** 含附件的完整模型可见文本（regen 用）。*/
   _modelText?: string;
   /** 首发时的路由快照；重试旧消息时不能被后续 turn 的选择覆盖。*/
