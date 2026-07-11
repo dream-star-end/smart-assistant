@@ -630,6 +630,29 @@ build_release() {
   echo "  ✓ release 就绪(带 .complete):$reldir" >&2
 }
 
+# sessions-store-pg 割接后的 capability 门(RFC-v5-sessions-pg §D4,R2 MAJOR#5)。
+# 会话权威割接到 PG(远端 env OC_SESSIONS_STORE=pg)后,PG 即唯一权威。此时激活/回滚
+# 只能翻到**声明 sessions-store-pg-v1 capability 的 release**;旧蓝绿目录里割接前的老
+# release 缺 PG sessions backend,一次普通 rollback 误启它 → master 以 SQLite 语义起
+# (拒起或权威分叉)。本门读远端 env 值判定是否已割接:未割接 → 不激活(任意 release 放行);
+# 已割接 → 断言目标 release 的 deploy/v5/release-metadata.json capabilities 含该 cap,否则拒绝。
+assert_release_capability_for_sessions_pg() {
+  local reldir="$1" store has
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过 sessions-store-pg capability 门"; return 0; }
+  # 读远端 master env 的实际生效值(与 assert_runtime_channel_column 同法 source env 文件)。
+  store="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null; printf '%s' \"\${OC_SESSIONS_STORE:-}\"" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$store" == "pg" ]] || return 0   # 未割接到 PG → 门不激活,任意 release 可激活
+  has="$(ssh "$KL_HOST" "jq -r '(.capabilities // []) | index(\"sessions-store-pg-v1\") // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "$has" ]]; then
+    echo "✗ 激活中止:OC_SESSIONS_STORE=pg(会话权威已在 PG),但目标 release 未声明 capability 'sessions-store-pg-v1':" >&2
+    echo "    $reldir/deploy/v5/release-metadata.json" >&2
+    echo "  该 release 缺 PG sessions backend,激活会让 master 以 SQLite 语义起(拒起或权威分叉)。" >&2
+    echo "  回滚只能翻到同样声明该 capability 的前序 release;禁止回退到 PG 割接前的旧 release。" >&2
+    exit 1
+  fi
+  echo "  ✓ capability 门:目标 release 声明 sessions-store-pg-v1(OC_SESSIONS_STORE=pg 已割接,前置满足)。"
+}
+
 # 原子激活 release:只认带 .complete 的目录;翻转**前**先原子写 prev(rollback 元数据与翻转
 # 不脱域,Codex P1#7);唯一临时 symlink(防前次残留 .newlink 阻断);mv -T 原子翻转 → restart。
 activate_release() {
@@ -639,6 +662,8 @@ activate_release() {
     return 0
   fi
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
+  # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
+  assert_release_capability_for_sessions_pg "$reldir"
   prev="$(bg_current_release)"
   tmplink="$REMOTE_SRC.newlink.$$"
   # 翻转前先落 prev(原子);再翻转(ln -sfn 非原子,故临时链+mv -T)
