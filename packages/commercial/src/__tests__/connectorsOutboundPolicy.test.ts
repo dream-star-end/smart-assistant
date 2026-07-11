@@ -85,19 +85,38 @@ describe('isGlobalUnicastIpv4(拒绝表全矩阵)', () => {
     assert.equal(isGlobalUnicastIpv4('1.2.3'), false)
     assert.equal(isGlobalUnicastIpv4('1.2.3.4.5'), false)
   })
+  test('family 守卫:v6 串走 v4 判定 → false(P1#10)', () => {
+    assert.equal(isGlobalUnicastIpv4('2606:4700::1'), false)
+    assert.equal(isGlobalUnicastIpv4('::1'), false)
+  })
 })
 
-describe('isGlobalUnicastIpv6(2000::/3 白名单式)', () => {
+describe('isGlobalUnicastIpv6(2000::/3 + IANA special 剔除;P1#10 收紧)', () => {
   const denied = [
     '::', // unspecified
     '::1', // loopback
     '::ffff:8.8.8.8', // IPv4-mapped(设计:直接拒)
+    '::ffff:7f00:1', // IPv4-mapped 127.0.0.1(hex 形式)
     '64:ff9b::808:808', // NAT64
     'fc00::1', // ULA
     'fd12:3456::1', // ULA
     'fe80::1', // link-local
     'ff02::1', // multicast
-    '2001:db8::1', // documentation
+    '2001:db8::1', // documentation(2001:db8::/32)
+    // ── P1#10 新增:6to4 2002::/16 可把 loopback/私网 IPv4 编码进 v6 ──
+    '2002::1', // 6to4 通配(整个 /16 拒)
+    '2002:7f00:1::', // 6to4 编码 127.0.0.1(0x7f000001)
+    '2002:a00:1::1', // 6to4 编码 10.0.0.1(私网)
+    '2002:c0a8:101::', // 6to4 编码 192.168.1.1(私网)
+    // ── 文档段 3fff::/20(RFC 9637;此前被误当可接受)──
+    '3fff::1',
+    '3fff:0fff::1', // /20 上界内
+    // ── 2001::/23 IETF 协议块(Teredo / benchmarking / ORCHID / AS112 …)──
+    '2001::1', // Teredo 2001::/32
+    '2001:2::1', // benchmarking 2001:2::/48
+    '2001:10::1', // ORCHID(已弃用)
+    // ── discard-only ──
+    '0100::1',
   ]
   for (const ip of denied) {
     test(`拒 ${ip}`, () => assert.equal(isGlobalUnicastIpv6(ip), false))
@@ -106,12 +125,17 @@ describe('isGlobalUnicastIpv6(2000::/3 白名单式)', () => {
     '2400:cb00::1',
     '2606:4700::1111',
     '2a06:98c0::1',
-    '3fff::1',
-    '2001:4860:4860::8888',
+    '2001:4860:4860::8888', // Google DNS(2001:4860,在 2001::/23 之外 → 放行)
+    '2600::1',
+    '3fff:1000::1', // 3fff::/16 内、/20 之外 → 非文档段 → 放行
   ]
   for (const ip of allowed) {
     test(`放 ${ip}`, () => assert.equal(isGlobalUnicastIpv6(ip), true))
   }
+  test('family 守卫:v4 串走 v6 判定 → false', () => {
+    assert.equal(isGlobalUnicastIpv6('8.8.8.8'), false)
+    assert.equal(isGlobalUnicastIpv6('not-an-ip'), false)
+  })
 })
 
 describe('isGlobalUnicastIp(统一入口)', () => {
@@ -222,6 +246,18 @@ describe('resolvePinnedAddress(DNS 全记录校验 + 钉死)', () => {
   test('metadata IP(169.254.169.254)拒绝', async () => {
     await expectCodeAsync(
       resolvePinnedAddress('meta.example.com', resolver(['169.254.169.254'], [])),
+      'OUTBOUND_BLOCKED',
+    )
+  })
+  test('AAAA 为 6to4 编码 loopback(2002:7f00:1::)整体拒绝(P1#10)', async () => {
+    await expectCodeAsync(
+      resolvePinnedAddress('sixfour.example.com', resolver([], ['2002:7f00:1::'])),
+      'OUTBOUND_BLOCKED',
+    )
+  })
+  test('AAAA 为文档段 3fff::1 拒绝(P1#10)', async () => {
+    await expectCodeAsync(
+      resolvePinnedAddress('doc6.example.com', resolver([], ['3fff::1'])),
       'OUTBOUND_BLOCKED',
     )
   })

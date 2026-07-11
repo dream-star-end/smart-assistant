@@ -66,8 +66,15 @@ async function ghFetch(
   }
   if (res.status === 401) {
     await res.body?.cancel().catch(() => {})
-    // 复用既有 revoke/清 session 语义(同 githubApi 的 link_revoked 路径)
-    await revokeGithubLinkAndClearSessions(pool, userId, 'link_revoked').catch(() => {})
+    // 复用既有 revoke/清 session 语义(同 githubApi 的 link_revoked 路径)。
+    // P1#9:本地 revoke+清 session **失败不得吞掉** —— 若吞掉仍返回 RELINK_REQUIRED,
+    // DB link 可能仍 active → 前端引导重绑但底层没清,反复 401 反复失败。只有清干净了
+    // 才返回 RELINK_REQUIRED;失败返回稳定可重试码(UPSTREAM_ERROR),详情不透传。
+    try {
+      await revokeGithubLinkAndClearSessions(pool, userId, 'link_revoked')
+    } catch {
+      throw new ConnectorError('UPSTREAM_ERROR', 'github local revoke failed after upstream 401')
+    }
     throw new ConnectorError('RELINK_REQUIRED', 'github token revoked upstream')
   }
   if (!res.ok) {

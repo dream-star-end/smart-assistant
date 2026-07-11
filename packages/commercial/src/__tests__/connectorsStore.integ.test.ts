@@ -16,8 +16,11 @@
  */
 
 import assert from 'node:assert/strict'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { EventEmitter } from 'node:events'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { after, before, describe, test } from 'node:test'
+import { startAuditRetentionSweeper } from '../admin/auditRetention.js'
 import { ConnectorError } from '../connectors/errors.js'
 import {
   NON_TERMINAL_LIMIT,
@@ -31,6 +34,14 @@ import {
 } from '../connectors/ledger.js'
 import { consumeOauthPending, startOauthPending } from '../connectors/oauthPending.js'
 import {
+  type ConnectorRedis,
+  ensureFreshFeishuConnection,
+  feishuTokenExpired,
+} from '../connectors/providers/feishu.js'
+import { githubSearchIssues } from '../connectors/providers/github.js'
+import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
+import {
+  type FeishuSecret,
   type NotionSecret,
   canonicalAccountIdentity,
   computeAccountKey,
@@ -45,6 +56,7 @@ import {
   upsertConnection,
 } from '../connectors/store.js'
 import { startConnectorSweeper } from '../connectors/sweeper.js'
+import { saveGithubLink } from '../github/tokenStore.js'
 import { AeadError } from '../crypto/aead.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
@@ -416,6 +428,22 @@ describe('connector_write_ledger 状态机', () => {
     })
   }
 
+  // 现有用例的 ledger 行都是 notion/create_page;beginExecute 需带 expected provider/action(P0#2)。
+  const beginExec = (
+    id: string,
+    uid: number,
+    connId: string,
+    action = 'create_page',
+    provider = 'notion',
+  ) =>
+    beginExecute({
+      id,
+      userId: uid,
+      connectionId: connId,
+      expectedProvider: provider,
+      expectedAction: action,
+    })
+
   test('propose → pending;params 加密 roundtrip + hash 复核', async (t) => {
     if (skipIfNoDb(t)) return
     const uid = await mkUser()
@@ -489,19 +517,19 @@ describe('connector_write_ledger 状态机', () => {
 
     // 未批准先执行 → 拒
     await assert.rejects(
-      beginExecute({ id: p.id, userId: uid, connectionId: connection.id }),
+      beginExec(p.id, uid, connection.id),
       (e: unknown) => e instanceof ConnectorError && e.code === 'CONFIRMATION_NOT_APPROVED',
     )
     await approveConfirmation(p.id, uid)
 
-    const begun = await beginExecute({ id: p.id, userId: uid, connectionId: connection.id })
+    const begun = await beginExec(p.id, uid, connection.id)
     assert.equal(begun.kind, 'ok')
     if (begun.kind !== 'ok') return
     assert.equal((begun.params as { title?: string }).title, '周报') // 账本参数,非模型重传
     assert.equal(begun.row.status, 'executing')
 
     // 同 id 并发/重复 → in_progress
-    const dup = await beginExecute({ id: p.id, userId: uid, connectionId: connection.id })
+    const dup = await beginExec(p.id, uid, connection.id)
     assert.equal(dup.kind, 'in_progress')
 
     // 终态 CAS + 参数销毁
@@ -516,7 +544,7 @@ describe('connector_write_ledger 状态机', () => {
     assert.ok(done.finished_at)
 
     // 终态重放 → replay(不承诺原结果,只给 digest)
-    const replay = await beginExecute({ id: p.id, userId: uid, connectionId: connection.id })
+    const replay = await beginExec(p.id, uid, connection.id)
     assert.equal(replay.kind, 'replay')
     if (replay.kind === 'replay') {
       assert.equal(replay.status, 'succeeded')
@@ -537,7 +565,7 @@ describe('connector_write_ledger 状态机', () => {
       [p.id],
     )
     await assert.rejects(
-      beginExecute({ id: p.id, userId: uid, connectionId: connection.id }),
+      beginExec(p.id, uid, connection.id),
       (e: unknown) => e instanceof ConnectorError && e.code === 'CONFIRMATION_EXPIRED',
     )
     const row = (await getLedgerRow(p.id, uid))!
@@ -561,7 +589,7 @@ describe('connector_write_ledger 状态机', () => {
       meta: {},
     })
     await assert.rejects(
-      beginExecute({ id: p.id, userId: uid, connectionId: connection.id }),
+      beginExec(p.id, uid, connection.id),
       (e: unknown) => e instanceof ConnectorError && e.code === 'REVISION_MISMATCH',
     )
     const row = (await getLedgerRow(p.id, uid))!
@@ -579,11 +607,11 @@ describe('connector_write_ledger 状态机', () => {
     const p = await mkProposal(uid, connection.id, connection.revision)
     await approveConfirmation(p.id, uid)
     await assert.rejects(
-      beginExecute({ id: p.id, userId: uid, connectionId: conn2.id }),
+      beginExec(p.id, uid, conn2.id),
       (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
     )
     await assert.rejects(
-      beginExecute({ id: p.id, userId: other, connectionId: connection.id }),
+      beginExec(p.id, other, connection.id),
       (e: unknown) => e instanceof ConnectorError && e.code === 'CONFIRMATION_NOT_FOUND',
     )
   })
@@ -600,12 +628,36 @@ describe('connector_write_ledger 状态机', () => {
       (e: unknown) => e instanceof ConnectorError && e.code === 'QUOTA_EXCEEDED',
     )
   })
+
+  test('P1#6:非终态限额并发原子 —— 15 并发 propose 恰 10 成功(advisory lock 消 TOCTOU)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const { connection } = await mkConnection(uid)
+    const results = await Promise.allSettled(
+      Array.from({ length: 15 }, () => mkProposal(uid, connection.id, connection.revision)),
+    )
+    const ok = results.filter((r) => r.status === 'fulfilled').length
+    const quota = results.filter(
+      (r) =>
+        r.status === 'rejected' &&
+        r.reason instanceof ConnectorError &&
+        r.reason.code === 'QUOTA_EXCEEDED',
+    ).length
+    assert.equal(ok, NON_TERMINAL_LIMIT, `应恰 ${NON_TERMINAL_LIMIT} 个成功,实际 ${ok}`)
+    assert.equal(quota, 15 - NON_TERMINAL_LIMIT)
+    const cnt = await query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM connector_write_ledger
+        WHERE user_id = $1 AND status IN ('pending','approved','executing')`,
+      [uid],
+    )
+    assert.equal(cnt.rows[0]!.n, String(NON_TERMINAL_LIMIT))
+  })
 })
 
-// ─── sweeper 四职责 ──────────────────────────────────────────────────────
+// ─── sweeper 三职责(活跃态转换;P1#11:retention 已迁 auditRetention) ─────────
 
 describe('connectorSweeper', () => {
-  test('stale executing→unknown(绝不回 approved)/ 过期→expired / oauth DELETE / retention', async (t) => {
+  test('stale executing→unknown(绝不回 approved)/ 过期→expired / oauth DELETE', async (t) => {
     if (skipIfNoDb(t)) return
     const uid = await mkUser()
     const { connection } = await mkConnection(uid)
@@ -621,7 +673,13 @@ describe('connectorSweeper', () => {
       summary: 's1',
     })
     await approveConfirmation(pExec.id, uid)
-    const begun = await beginExecute({ id: pExec.id, userId: uid, connectionId: connection.id })
+    const begun = await beginExecute({
+      id: pExec.id,
+      userId: uid,
+      connectionId: connection.id,
+      expectedProvider: 'notion',
+      expectedAction: 'create_page',
+    })
     assert.equal(begun.kind, 'ok')
     await query(
       `UPDATE connector_write_ledger SET started_at = now() - interval '10 minutes' WHERE id = $1::uuid`,
@@ -654,7 +712,8 @@ describe('connectorSweeper', () => {
       [uid],
     )
 
-    // ④ retention:>90 天的终态行
+    // ④ 一条 >90 天终态行:connectorSweeper **不再删**(P1#11 已迁 auditRetention),
+    //    此处用来断言 sweeper 不碰它。
     const pOld = await proposeWrite({
       userId: uid,
       connectionId: connection.id,
@@ -682,7 +741,6 @@ describe('connectorSweeper', () => {
       assert.ok(result.staleExecuting >= 1, `staleExecuting=${result.staleExecuting}`)
       assert.ok(result.expired >= 1, `expired=${result.expired}`)
       assert.ok(result.oauthDeleted >= 1, `oauthDeleted=${result.oauthDeleted}`)
-      assert.ok(result.retentionDeleted >= 1, `retentionDeleted=${result.retentionDeleted}`)
     } finally {
       sweeper.stop()
     }
@@ -694,7 +752,8 @@ describe('connectorSweeper', () => {
     const expd = (await getLedgerRow(pExpired.id, uid))!
     assert.equal(expd.status, 'expired')
     assert.equal(expd.params_enc, null)
-    assert.equal(await getLedgerRow(pOld.id, uid), null) // retention 删除
+    // P1#11:sweeper 不做 retention → 90 天终态行仍在(交给 auditRetention 删)
+    assert.ok((await getLedgerRow(pOld.id, uid)) !== null, 'connectorSweeper 不应删终态 retention 行')
     const oauthLeft = await query<{ n: string }>(
       'SELECT count(*)::text AS n FROM connector_oauth_pending WHERE user_id = $1',
       [uid],
@@ -709,10 +768,546 @@ describe('connectorSweeper', () => {
         staleExecuting: 0,
         expired: 0,
         oauthDeleted: 0,
-        retentionDeleted: 0,
       })
     } finally {
       sweeper2.stop()
     }
+  })
+})
+
+// ═══ P0#2 / P1#3 / P1#4 / P1#5 / P1#7 / P1#9 / P1#11:审计整改批 ═══════════════
+
+function feishuPayload(
+  unionId: string,
+  accessToken = 'feishu-access-1',
+  refreshToken = 'feishu-refresh-1',
+): FeishuSecret {
+  return {
+    schema_version: 1,
+    account_identity: canonicalAccountIdentity('feishu', { unionId }),
+    account_identity_version: 1,
+    clientId: 'cli-x',
+    clientSecret: 'sec-x',
+    accessToken, // schema minLength 8
+    refreshToken,
+  }
+}
+
+async function mkFeishuConnection(uid: number, unionId: string, tokenExpiresAt: number) {
+  const accountKey = computeAccountKey(canonicalAccountIdentity('feishu', { unionId }))
+  const { connection } = await upsertConnection({
+    userId: uid,
+    provider: 'feishu',
+    displayName: '飞书',
+    accountKey,
+    payload: feishuPayload(unionId),
+    meta: { account_hint: unionId, tokenExpiresAt },
+  })
+  return connection
+}
+
+/** 内存 Redis(忠实实现连接器用到的 4 类 Lua 脚本;lock/counter 两个命名空间)。 */
+function makeFakeRedis() {
+  const locks = new Map<string, string>()
+  const counters = new Map<string, number>()
+  const redis: ConnectorRedis & { locks: Map<string, string>; counters: Map<string, number> } = {
+    locks,
+    counters,
+    async eval(script: string, _n: number, ...args: Array<string | number>) {
+      const key = String(args[0])
+      if (script.includes('INCR')) {
+        // WINDOW_SCRIPT: GET-then-INCR;ARGV[1]=cap
+        const cap = Number(args[1])
+        const cur = counters.get(key) ?? 0
+        if (cur >= cap) return -1
+        counters.set(key, cur + 1)
+        return cur + 1
+      }
+      if (script.includes('EXISTS')) return locks.has(key) ? 1 : 0
+      if (script.includes("'SET'") && script.includes("'NX'")) {
+        if (locks.has(key)) return 0
+        locks.set(key, String(args[1]))
+        return 1
+      }
+      if (script.includes('PEXPIRE')) return locks.get(key) === String(args[1]) ? 1 : 0
+      if (script.includes("'DEL'")) {
+        if (locks.get(key) === String(args[1])) {
+          locks.delete(key)
+          return 1
+        }
+        return 0
+      }
+      return 0
+    },
+  }
+  return redis
+}
+
+// ── 容器 RPC 测试装配 ──
+const CONTAINER_SECRET_HEX = 'b'.repeat(64)
+const RPC_CTX = { hostUuid: 'h', boundIp: '1.2.3.4' }
+function okIdentityRepo(userId: number) {
+  return {
+    async findActiveByHostAndBoundIp() {
+      return {
+        id: 1,
+        user_id: userId,
+        bound_ip: '1.2.3.4',
+        host_uuid: 'h',
+        secret_hash: createHash('sha256')
+          .update(Buffer.from(CONTAINER_SECRET_HEX, 'hex'))
+          .digest(),
+      }
+    },
+  }
+}
+
+interface RpcState {
+  statusCode: number
+  body: string
+}
+function fakeRes(): { res: ServerResponse; state: RpcState } {
+  const state: RpcState = { statusCode: 200, body: '' }
+  const res = {
+    get statusCode() {
+      return state.statusCode
+    },
+    set statusCode(v: number) {
+      state.statusCode = v
+    },
+    headersSent: false,
+    setHeader() {},
+    end(chunk?: string) {
+      if (chunk) state.body += chunk
+    },
+  } as unknown as ServerResponse
+  return { res, state }
+}
+function fakeReq(body: unknown): IncomingMessage {
+  const em = new EventEmitter() as EventEmitter & Record<string, unknown>
+  em.method = 'POST'
+  em.url = '/v3/connectors/call'
+  em.headers = { authorization: `Bearer oc-v3.1.${CONTAINER_SECRET_HEX}` }
+  ;(em as unknown as { [Symbol.asyncIterator]: unknown })[Symbol.asyncIterator] =
+    async function* () {
+      yield Buffer.from(JSON.stringify(body), 'utf8')
+    }
+  return em as unknown as IncomingMessage
+}
+function utcDayKey(uid: number, now: number): string {
+  const d = new Date(now)
+  const day = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`
+  return `connectors:send:${uid}:${day}`
+}
+/** 飞书 200 成功响应工厂(create_calendar_event / send_message)。 */
+function feishuOkFetch(): (u: string, i: Record<string, unknown>) => Promise<Response> {
+  return async (u: string) => {
+    let body: unknown = { code: 0, data: {} }
+    if (u.includes('/events')) body = { code: 0, data: { event: { event_id: 'ev1', summary: '会' } } }
+    else if (u.includes('/messages')) body = { code: 0, data: { message_id: 'm1' } }
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+}
+async function callRpc(handler: ReturnType<typeof makeConnectorsRpcHandler>, body: unknown) {
+  const { res, state } = fakeRes()
+  await handler(fakeReq(body), res, RPC_CTX)
+  return { status: state.statusCode, env: JSON.parse(state.body) as Record<string, unknown> }
+}
+
+describe('P1#7 并发 rebind(FOR UPDATE + 双代数 CAS)', () => {
+  test('三并发 rebind 串行递进 revision/generation 不丢更新', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const base = await mkConnection(uid, 'bot-cc-rebind') // revision 1 / generation 1
+    const key = computeAccountKey(canonicalAccountIdentity('notion', { botId: 'bot-cc-rebind' }))
+    const rebind = (tok: string) =>
+      upsertConnection({
+        userId: uid,
+        provider: 'notion',
+        accountKey: key,
+        payload: notionPayload(tok, 'bot-cc-rebind'),
+        meta: {},
+      })
+    const toks = ['ntok-aaaa', 'ntok-bbbb', 'ntok-cccc'] // schema minLength 8
+    const results = await Promise.all(toks.map((t) => rebind(t)))
+    for (const r of results) assert.equal(r.rebound, true)
+    const revs = results.map((r) => r.connection.revision).sort((a, b) => a - b)
+    assert.deepEqual(revs, [2, 3, 4], '三次 rebind 应得连续 revision(FOR UPDATE 串行)')
+    const gens = results.map((r) => Number(r.connection.secret_generation)).sort((a, b) => a - b)
+    assert.deepEqual(gens, [2, 3, 4])
+    // 每个返回行内部一致(revision==generation:base 1/1 各 +1)
+    for (const r of results) {
+      assert.equal(Number(r.connection.secret_generation), r.connection.revision)
+    }
+    const cur = (await getActiveConnection(base.connection.id, uid))!
+    assert.equal(cur.revision, 4)
+    assert.equal(cur.secret_generation, '4')
+    assert.ok(toks.includes(decryptConnectionSecret<NotionSecret>(cur).token))
+  })
+})
+
+describe('P0#2 执行按账本行 provider/action 绑定(越权面)', () => {
+  test('同一 feishu connection 换写 action(create_calendar_event→send_message)必被拒', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-swap', Date.now() + 3_600_000)
+    const p = await proposeWrite({
+      userId: uid,
+      connectionId: conn.id,
+      connectionRevision: conn.revision,
+      provider: 'feishu',
+      action: 'create_calendar_event',
+      params: {
+        calendarId: 'cal-1',
+        summary: '会',
+        startTime: '2026-07-12T10:00:00Z',
+        endTime: '2026-07-12T11:00:00Z',
+      },
+      summary: '建日程',
+    })
+    await approveConfirmation(p.id, uid)
+    // 换 action 执行 → 拒(且不终态化账本行)
+    await assert.rejects(
+      beginExecute({
+        id: p.id,
+        userId: uid,
+        connectionId: conn.id,
+        expectedProvider: 'feishu',
+        expectedAction: 'send_message',
+      }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal((await getLedgerRow(p.id, uid))!.status, 'approved') // 仍可正确执行
+    // 正确 action → ok
+    const begun = await beginExecute({
+      id: p.id,
+      userId: uid,
+      connectionId: conn.id,
+      expectedProvider: 'feishu',
+      expectedAction: 'create_calendar_event',
+    })
+    assert.equal(begun.kind, 'ok')
+  })
+
+  test('RPC 端到端:confirmId 换 action 执行 → {kind:error, BAD_REQUEST};正确 action → result', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-rpc-swap', Date.now() + 3_600_000)
+    const redis = makeFakeRedis()
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okIdentityRepo(uid),
+      pool: getPool(),
+      redis,
+      fetchImpl: feishuOkFetch(),
+      log: () => {},
+    })
+    const prop = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'create_calendar_event',
+      params: {
+        calendarId: 'cal-1',
+        summary: '会',
+        startTime: '2026-07-12T10:00:00Z',
+        endTime: '2026-07-12T11:00:00Z',
+      },
+    })
+    assert.equal(prop.env.kind, 'confirmation_required')
+    const id = prop.env.id as string
+    await approveConfirmation(id, uid)
+    // 换成 send_message 执行 → 拒
+    const swapped = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'send_message',
+      confirmId: id,
+    })
+    assert.equal(swapped.env.kind, 'error')
+    assert.equal(swapped.env.code, 'BAD_REQUEST')
+    // 正确 action → 执行成功
+    const good = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'create_calendar_event',
+      confirmId: id,
+    })
+    assert.equal(good.env.kind, 'result')
+    assert.equal((await getLedgerRow(id, uid))!.status, 'succeeded')
+  })
+})
+
+describe('P1#5 send 日上限扣在 execute 而非 propose', () => {
+  test('propose send_message 不扣 send 桶;execute 才扣', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-send-a', Date.now() + 3_600_000)
+    const now = Date.UTC(2026, 6, 12, 3, 0, 0)
+    const redis = makeFakeRedis()
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okIdentityRepo(uid),
+      pool: getPool(),
+      redis,
+      fetchImpl: feishuOkFetch(),
+      now: () => now,
+      log: () => {},
+    })
+    const prop = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'send_message',
+      params: { receiveId: 'ou_x', receiveIdType: 'open_id', text: 'hi' },
+    })
+    assert.equal(prop.env.kind, 'confirmation_required')
+    // propose 后 send 桶仍空(P1#5:不再在 propose 扣 send)
+    assert.equal(redis.counters.get(utcDayKey(uid, now)) ?? 0, 0)
+    const id = prop.env.id as string
+    await approveConfirmation(id, uid)
+    const exec = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'send_message',
+      confirmId: id,
+    })
+    assert.equal(exec.env.kind, 'result')
+    // execute 才扣 send 桶:0 → 1
+    assert.equal(redis.counters.get(utcDayKey(uid, now)), 1)
+  })
+
+  test('send 日上限已满 → execute 前拒(SEND_DAILY_CAP)+ 账本 failed(未 dispatch)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-send-b', Date.now() + 3_600_000)
+    const now = Date.UTC(2026, 6, 12, 3, 0, 0)
+    const redis = makeFakeRedis()
+    redis.counters.set(utcDayKey(uid, now), 50) // SEND_DAILY_CAP 已满
+    let dispatched = 0
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okIdentityRepo(uid),
+      pool: getPool(),
+      redis,
+      fetchImpl: async (u: string) => {
+        dispatched += 1
+        return feishuOkFetch()(u, {})
+      },
+      now: () => now,
+      log: () => {},
+    })
+    const prop = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'send_message',
+      params: { receiveId: 'ou_x', receiveIdType: 'open_id', text: 'hi' },
+    })
+    assert.equal(prop.env.kind, 'confirmation_required') // propose 不受 send 上限影响
+    const id = prop.env.id as string
+    await approveConfirmation(id, uid)
+    const exec = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'send_message',
+      confirmId: id,
+    })
+    assert.equal(exec.env.kind, 'error')
+    assert.equal(exec.env.code, 'SEND_DAILY_CAP')
+    assert.equal(dispatched, 0, 'send 上限拒绝必须在 dispatch 之前')
+    const row = (await getLedgerRow(id, uid))!
+    assert.equal(row.status, 'failed')
+    assert.equal(row.error_code, 'SEND_DAILY_CAP')
+  })
+})
+
+describe('P1#4 写请求送达不确定 → unknown(服务端已收包后断连)', () => {
+  async function drive(fetchImpl: (u: string, i: Record<string, unknown>) => Promise<Response>) {
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, `union-p14-${randomBytes(4).toString('hex')}`, Date.now() + 3_600_000)
+    const redis = makeFakeRedis()
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okIdentityRepo(uid),
+      pool: getPool(),
+      redis,
+      fetchImpl,
+      log: () => {},
+    })
+    const prop = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'create_calendar_event',
+      params: {
+        calendarId: 'cal-1',
+        summary: '会',
+        startTime: '2026-07-12T10:00:00Z',
+        endTime: '2026-07-12T11:00:00Z',
+      },
+    })
+    const id = prop.env.id as string
+    await approveConfirmation(id, uid)
+    const exec = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'create_calendar_event',
+      confirmId: id,
+    })
+    return { uid, id, exec }
+  }
+
+  test('post-dispatch ECONNRESET → 账本 unknown(不盲重试)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { uid, id, exec } = await drive(async () => {
+      throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } })
+    })
+    assert.equal(exec.env.kind, 'error')
+    assert.equal(exec.env.code, 'UPSTREAM_ERROR')
+    assert.equal((await getLedgerRow(id, uid))!.status, 'unknown')
+  })
+
+  test('明确 404 → 账本 failed(服务端拒绝=未写入)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { uid, id, exec } = await drive(async () => new Response('', { status: 404 }))
+    assert.equal(exec.env.kind, 'error')
+    assert.equal(exec.env.code, 'UPSTREAM_NOT_FOUND')
+    assert.equal((await getLedgerRow(id, uid))!.status, 'failed')
+  })
+})
+
+describe('P1#3 飞书刷新:锁内重查当前 generation + 续租 + 双代数 CAS', () => {
+  test('过期 → 锁内刷新 + generation 递进 + 写回新 token', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-refresh', Date.now() - 1_000) // 已过期
+    const redis = makeFakeRedis()
+    let refreshCalls = 0
+    const fetchImpl = async () => {
+      refreshCalls += 1
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          access_token: 'new-access-token', // schema minLength 8
+          refresh_token: 'new-refresh-token',
+          expires_in: 7200,
+          scope: '',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    const fresh = await ensureFreshFeishuConnection(conn, getPool(), redis, { fetchImpl })
+    assert.equal(refreshCalls, 1)
+    assert.equal(fresh.secret.accessToken, 'new-access-token')
+    assert.equal(fresh.secret.refreshToken, 'new-refresh-token')
+    assert.equal(fresh.row.secret_generation, '2') // 1 → 2(fencing CAS 写回)
+    assert.ok((fresh.row.meta.tokenExpiresAt as number) > Date.now())
+    assert.equal(redis.locks.size, 0, '刷新后释放锁')
+  })
+
+  test('等锁期间别人已刷新 → 直接用新 generation,不再打 token 端点', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-wait', Date.now() - 1_000)
+    // 模拟另一请求持锁在刷
+    const redis = makeFakeRedis()
+    redis.locks.set(`connectors:refresh:${conn.id}`, 'someone-else')
+    // 别人刷完:DB generation 1→2 且 meta 未过期
+    await updateConnectionSecret({
+      id: conn.id,
+      userId: uid,
+      provider: 'feishu',
+      expectedRevision: conn.revision,
+      expectedGeneration: conn.secret_generation,
+      payload: feishuPayload('union-wait', 'other-refreshed-at'),
+      meta: { account_hint: 'union-wait', tokenExpiresAt: Date.now() + 3_600_000 },
+    })
+    let calls = 0
+    const fetchImpl = async () => {
+      calls += 1
+      return new Response('{}', { status: 200 })
+    }
+    const fresh = await ensureFreshFeishuConnection(conn, getPool(), redis, { fetchImpl })
+    assert.equal(calls, 0, '不得再打 token 端点(别人已刷)')
+    assert.equal(fresh.secret.accessToken, 'other-refreshed-at')
+    assert.equal(feishuTokenExpired(fresh.row.meta), false)
+  })
+})
+
+describe('P1#11 连接器账本 retention 迁 auditRetention(只删终态)', () => {
+  test('auditRetention 删 >90 天终态行;活跃态老行保留', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const { connection } = await mkConnection(uid)
+    const mkP = (title: string) =>
+      proposeWrite({
+        userId: uid,
+        connectionId: connection.id,
+        connectionRevision: connection.revision,
+        provider: 'notion',
+        action: 'create_page',
+        params: { parentPageId: 'e'.repeat(32), title, content: '' },
+        summary: title,
+      })
+    // 终态老行(denied,>90d)
+    const term = await mkP('term-old')
+    await denyConfirmation(term.id, uid)
+    await query(
+      `UPDATE connector_write_ledger SET created_at = now() - interval '91 days' WHERE id = $1::uuid`,
+      [term.id],
+    )
+    // 活跃态老行(pending,>90d)——谓词保证不删
+    const active = await mkP('active-old')
+    await query(
+      `UPDATE connector_write_ledger SET created_at = now() - interval '91 days' WHERE id = $1::uuid`,
+      [active.id],
+    )
+    const sweeper = startAuditRetentionSweeper({ intervalMs: 3_600_000, onError: () => {} })
+    try {
+      const res = await sweeper.runNow()
+      assert.ok((res['connector_write_ledger'] ?? 0) >= 1, 'connector_write_ledger 终态行应被删')
+    } finally {
+      sweeper.stop()
+    }
+    assert.equal(await getLedgerRow(term.id, uid), null, '终态老行删除')
+    assert.ok((await getLedgerRow(active.id, uid)) !== null, '活跃态老行(pending)必须保留')
+  })
+})
+
+describe('P1#9 github 401:本地撤销失败不谎报 RELINK', () => {
+  const profile = { githubUserId: 4242, login: 'octocat', avatarUrl: null, scopes: 'repo' }
+
+  test('本地 revoke 成功 → RELINK_REQUIRED + link 撤销', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    await saveGithubLink({ pool: getPool(), userId: uid, profile, accessToken: 'ghtok' })
+    await assert.rejects(
+      githubSearchIssues(getPool(), uid, { query: 'test' }, { fetchImpl: async () => new Response('', { status: 401 }) }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'RELINK_REQUIRED',
+    )
+    const r = await query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM github_links WHERE user_id = $1 AND revoked_at IS NULL`,
+      [uid],
+    )
+    assert.equal(r.rows[0]!.n, '0', 'link 应已撤销')
+  })
+
+  test('本地 revoke 失败 → 稳定可重试码 UPSTREAM_ERROR(不谎报 RELINK,link 仍 active)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    await saveGithubLink({ pool: getPool(), userId: uid, profile, accessToken: 'ghtok2' })
+    const real = getPool()
+    // 读走真 pool(getGithubLinkWithToken 用 .query),revoke 走 .connect() → 抛错
+    const brokenPool = new Proxy(real, {
+      get(target, prop, recv) {
+        if (prop === 'connect') {
+          return async () => ({
+            async query(sql: string) {
+              if (/UPDATE github_links/i.test(sql)) throw new Error('simulated revoke failure')
+              return { rowCount: 0, rows: [] }
+            },
+            release() {},
+          })
+        }
+        const v = Reflect.get(target, prop, recv)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) as typeof real
+    await assert.rejects(
+      githubSearchIssues(brokenPool, uid, { query: 'test' }, { fetchImpl: async () => new Response('', { status: 401 }) }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'UPSTREAM_ERROR',
+    )
+    const r = await query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM github_links WHERE user_id = $1 AND revoked_at IS NULL`,
+      [uid],
+    )
+    assert.equal(r.rows[0]!.n, '1', 'revoke 失败 → link 仍 active(可重试)')
   })
 })

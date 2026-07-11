@@ -31,7 +31,7 @@ import { getPool } from '../db/index.js'
 import { getGithubLinkPublic } from '../github/tokenStore.js'
 import { canonicalDigestHex } from './canonicalJson.js'
 import { ConnectorError, toConnectorError } from './errors.js'
-import { beginExecute, finalizeExecute, proposeWrite } from './ledger.js'
+import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
 import type { DnsResolver } from './outboundPolicy.js'
 import type { ConnectorRedis } from './providers/feishu.js'
 import { GITHUB_VIRTUAL_CONNECTION_ID } from './providers/github.js'
@@ -504,10 +504,9 @@ async function handleCall(
 
   // ── 写操作,无 confirmId:propose → 确认卡 ──
   if (!body.confirmId) {
+    // P1#5:propose 只计 10/min 频率闸;send 类日上限**移到 execute 前**原子扣减,
+    // 避免被拒/过期的 proposal 耗额度、以及跨 UTC 日预造 proposal 绕过日上限。
     await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
-    if (decl.sendClass) {
-      await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
-    }
     const params = validateActionParams(decl.params, body.params)
     const proposed = await proposeWrite(
       {
@@ -532,9 +531,17 @@ async function handleCall(
     return
   }
 
-  // ── 写操作,带 confirmId:执行(只用账本解密参数,忽略模型重传 params) ──
+  // ── 写操作,带 confirmId:执行 ──
+  // P0#2:beginExecute 强制账本行 provider/action 与本请求一致(权威源=账本行,忽略
+  // 模型可能重传的 action;不一致直接拒,防同一 connection 内换 action 越权)。
   const begun = await beginExecute(
-    { id: body.confirmId, userId: who.userId, connectionId: row.id },
+    {
+      id: body.confirmId,
+      userId: who.userId,
+      connectionId: row.id,
+      expectedProvider: row.provider,
+      expectedAction: body.action,
+    },
     pool,
   )
   if (begun.kind === 'in_progress') {
@@ -551,14 +558,21 @@ async function handleCall(
     return
   }
 
-  // executing:执行 → 终态
+  // executing:handler 按**账本行** provider/action 解析(权威源),解密参数按账本 action
+  // 的 schema 重新校验后再执行(P0#2 ①③)。
+  const ledgerDecl = requireAction(begun.row.provider, begun.row.action)
+  const ledgerParams = validateActionParams(ledgerDecl.params, begun.params)
   try {
+    // P1#5:send 类日上限在实发 dispatch 前原子扣减(按**账本 action** 的 sendClass)。
+    if (ledgerDecl.sendClass) {
+      await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
+    }
     const result = await withConnectionSlot(`c:${row.id}`, () =>
       executeConnectionAction({
         connectionId: row.id,
         userId: who.userId,
-        action: decl,
-        params: begun.params, // 账本参数(hash 已复核)
+        action: ledgerDecl,
+        params: ledgerParams, // 账本参数(hash 已复核 + 按账本 action schema 重校验)
         expectedRevision: begun.row.connection_revision,
         idempotencyKey: begun.row.idempotency_key,
         deps: execDeps,
@@ -570,15 +584,10 @@ async function handleCall(
     sendEnvelope(res, { kind: 'result', result })
   } catch (err) {
     const ce = toConnectorError(err)
-    const maybeDelivered =
-      (err as { maybeDelivered?: boolean })?.maybeDelivered === true ||
-      ce.code === 'UPSTREAM_TIMEOUT' // 已发出请求且超时 → 结局不明,不盲重试(§3)
+    // P1#4:已送达不确定(post-dispatch 断连/超时/5xx)→ unknown 不盲重试;
+    // 确定未送达(校验错/4xx/门限拒绝/pre-dispatch 连接失败)→ failed。
     await finalizeExecute(
-      {
-        id: body.confirmId,
-        status: maybeDelivered ? 'unknown' : 'failed',
-        errorCode: ce.code,
-      },
+      { id: body.confirmId, status: writeFinalizeStatus(err), errorCode: ce.code },
       pool,
     ).catch(() => {})
     throw ce

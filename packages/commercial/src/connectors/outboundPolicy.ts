@@ -109,6 +109,8 @@ const V4_DENY: ReadonlyArray<readonly [string, number]> = [
 ]
 
 export function isGlobalUnicastIpv4(ip: string): boolean {
+  // 分类前强制 family(防 v6/垃圾串走 v4 路径)
+  if (isIP(ip) !== 4) return false
   const n = ipv4ToInt(ip)
   if (n === null) return false
   for (const [base, bits] of V4_DENY) {
@@ -148,19 +150,45 @@ function ipv6ToBigInt(ip: string): bigint | null {
 }
 
 /**
- * IPv6 global unicast 判定:**只接受 2000::/3**(当前全球单播分配段),
- * 且排除 2001:db8::/32(文档段)。其余(loopback / unspecified / IPv4-mapped /
- * NAT64 64:ff9b::/96 / ULA fc00::/7 / link-local fe80::/10 / multicast ff00::/8)
- * 全部落在 2000::/3 之外,天然被拒。IPv4-mapped 按设计**直接拒绝**
- * (合法目标应发布真 AAAA 或 A 记录)。
+ * IPv6 特殊/不可路由/可编码内网 的拒绝表(全部落在 2000::/3 内的特例;/3 之外的
+ * loopback/unspecified/IPv4-mapped/NAT64/ULA/link-local/multicast 由 2000::/3 门天然拒)。
+ * P1#10 收紧:6to4(可编码任意 IPv4 含 loopback/RFC1918)、文档段、2001::/23 IETF 协议块
+ * (含 Teredo/benchmarking/ORCHID/AS112 等)一律拒绝。
+ */
+const V6_DENY_CIDR: ReadonlyArray<readonly [string, number]> = [
+  ['2001:db8::', 32], // documentation(RFC 3849)
+  ['2001::', 23], // IETF protocol assignments(Teredo 2001::/32 / benchmarking / ORCHID / AS112 …)
+  ['2002::', 16], // 6to4——可把 loopback/RFC1918 IPv4 编码进 v6 地址
+  ['3fff::', 20], // documentation(RFC 9637)
+  ['0100::', 64], // discard-only(RFC 6666;也在 /3 之外,冗余显式)
+] as const
+
+/** n 是否落在 IPv6 CIDR(base/prefix)内。 */
+function inV6Cidr(n: bigint, base: string, prefix: number): boolean {
+  const baseInt = ipv6ToBigInt(base)
+  if (baseInt === null) return false
+  if (prefix <= 0) return true
+  const shift = BigInt(128 - prefix)
+  return n >> shift === baseInt >> shift
+}
+
+/**
+ * IPv6 global unicast 判定:**只接受 2000::/3**(当前全球单播分配段),并在其内进一步
+ * 剔除 IANA special-purpose / 可编码内网的子段(见 V6_DENY_CIDR)。其余(loopback /
+ * unspecified / IPv4-mapped / NAT64 64:ff9b::/96 / ULA fc00::/7 / link-local fe80::/10 /
+ * multicast ff00::/8)全部落在 2000::/3 之外,天然被拒。IPv4-mapped/transition 按设计
+ * **直接拒绝**(合法目标应发布真 AAAA 或 A 记录)。
  */
 export function isGlobalUnicastIpv6(ip: string): boolean {
+  // 分类前强制 family(防 v4/垃圾串走 v6 路径)
+  if (isIP(ip) !== 6) return false
   const n = ipv6ToBigInt(ip)
   if (n === null) return false
   // 2000::/3 → 最高 3 bit == 001
   if (n >> 125n !== 0b001n) return false
-  // 2001:db8::/32 documentation
-  if (n >> 96n === 0x20010db8n) return false
+  for (const [base, prefix] of V6_DENY_CIDR) {
+    if (inV6Cidr(n, base, prefix)) return false
+  }
   return true
 }
 

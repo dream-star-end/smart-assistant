@@ -146,16 +146,6 @@ export async function proposeWrite(
   input: ProposeWriteInput,
   pool: Pool = getPool(),
 ): Promise<ProposedWrite> {
-  // 限额:非终态总量 ≤ 10(软闸,窗口内并发略可超,可接受 —— 硬闸是 propose 频率 Redis)
-  const cnt = await pool.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM connector_write_ledger
-      WHERE user_id = $1 AND status IN ('pending','approved','executing')`,
-    [input.userId],
-  )
-  if (Number(cnt.rows[0]?.n ?? '0') >= NON_TERMINAL_LIMIT) {
-    throw new ConnectorError('QUOTA_EXCEEDED', 'too many outstanding write confirmations')
-  }
-
   const id = randomUUID()
   const paramsAadSeed = randomUUID()
   const canonical = canonicalStringify(input.params)
@@ -176,31 +166,60 @@ export async function proposeWrite(
     zeroBuffer(key)
   }
 
-  const r = await pool.query<{ expires_at: Date }>(
-    `INSERT INTO connector_write_ledger
-       (id, user_id, connection_id, connection_revision, provider, action,
-        params_enc, params_nonce, params_aad_seed, params_hash, canonicalization_version,
-        summary, idempotency_key, status, expires_at)
-     VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13, 'pending',
-             now() + interval '10 minutes')
-     RETURNING expires_at`,
-    [
-      id,
-      input.userId,
-      input.connectionId,
-      input.connectionRevision,
-      input.provider,
-      input.action,
-      enc.ciphertext,
-      enc.nonce,
-      paramsAadSeed,
-      hash,
-      CANONICALIZATION_VERSION,
-      input.summary.slice(0, 2000),
-      idempotencyKey,
-    ],
-  )
-  return { id, summary: input.summary.slice(0, 2000), expiresAt: r.rows[0]!.expires_at }
+  // 限额:非终态总量 ≤ 10。P1#6:count+insert 必须原子 —— 用 per-user 事务级 advisory
+  // lock(pg_advisory_xact_lock,随 COMMIT/ROLLBACK 自动释放)串行化,消除 TOCTOU
+  // (并发 propose 曾可同时通过 count 检查各插一行 → 超限)。
+  const expiresAt = await tx<Date>(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+      `cwl-nonterm:${input.userId}`,
+    ])
+    const cnt = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM connector_write_ledger
+        WHERE user_id = $1 AND status IN ('pending','approved','executing')`,
+      [input.userId],
+    )
+    if (Number(cnt.rows[0]?.n ?? '0') >= NON_TERMINAL_LIMIT) {
+      throw new ConnectorError('QUOTA_EXCEEDED', 'too many outstanding write confirmations')
+    }
+    const r = await client.query<{ expires_at: Date }>(
+      `INSERT INTO connector_write_ledger
+         (id, user_id, connection_id, connection_revision, provider, action,
+          params_enc, params_nonce, params_aad_seed, params_hash, canonicalization_version,
+          summary, idempotency_key, status, expires_at)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13, 'pending',
+               now() + interval '10 minutes')
+       RETURNING expires_at`,
+      [
+        id,
+        input.userId,
+        input.connectionId,
+        input.connectionRevision,
+        input.provider,
+        input.action,
+        enc.ciphertext,
+        enc.nonce,
+        paramsAadSeed,
+        hash,
+        CANONICALIZATION_VERSION,
+        input.summary.slice(0, 2000),
+        idempotencyKey,
+      ],
+    )
+    return r.rows[0]!.expires_at
+  }, pool)
+  return { id, summary: input.summary.slice(0, 2000), expiresAt }
+}
+
+/**
+ * 写路径 finalize 状态判定(P1#4)。已被 transport 标注「可能已送达」(maybeDelivered:
+ * post-dispatch socket 断裂 / 已建连后超时 / 5xx / SMTP DATA 后异常)→ `unknown`
+ * (绝不盲重试,防重复写);其余(确定性校验错误 / 明确 4xx 拒绝 / pre-dispatch 连接失败 /
+ * 门限拒绝)→ `failed`。
+ */
+export function writeFinalizeStatus(err: unknown): 'unknown' | 'failed' {
+  return (err as { maybeDelivered?: boolean } | null)?.maybeDelivered === true
+    ? 'unknown'
+    : 'failed'
 }
 
 // ─── 读取 / 解密 ─────────────────────────────────────────────────────────
@@ -327,14 +346,27 @@ interface ConnCheckRow {
 
 /**
  * CAS approved→executing(单事务 FOR UPDATE):
+ *   - **绑定校验(P0#2 越权面)**:账本行必须属于本 connection,且 provider/action 与
+ *     期望一致(忽略模型可能重传的 action —— 权威源是账本行;不一致直接拒,不改状态)。
  *   - 复核 expires_at>now()(过期 → 就地终态 expired + 销毁 params → CONFIRMATION_EXPIRED)
  *   - 复核 connection_revision 一致且 connection active(否则就地终态 failed
  *     REVISION_MISMATCH / CONNECTION_* —— 该确认永无成功可能)
  *   - 解密参数(hash 复核)→ 记 started_at
  * 同 id 并发/重复按 classifyForExecute 返回 in_progress / replay。
+ *
+ * 调用方随后必须**按返回的账本行 provider/action** 解析执行 handler(见 rpc.ts),
+ * 并用账本 action 的 schema 重新校验解密参数,严禁按请求体 action 执行。
  */
 export async function beginExecute(
-  opts: { id: string; userId: number; connectionId: string },
+  opts: {
+    id: string
+    userId: number
+    connectionId: string
+    /** 期望的 connection provider(来自 getActiveConnection 的权威行)。 */
+    expectedProvider: string
+    /** 期望的 action(来自请求体;必须与账本行 action 一致,否则拒)。 */
+    expectedAction: string
+  },
   pool: Pool = getPool(),
 ): Promise<BeginExecuteOutcome> {
   // 注意:tx() 对 throw 语义是 ROLLBACK —— "就地终态"(expired/failed)必须**先提交
@@ -355,6 +387,12 @@ export async function beginExecute(
     if (!row) throw new ConnectorError('CONFIRMATION_NOT_FOUND', 'no such confirmation')
     if (row.connection_id !== opts.connectionId) {
       throw new ConnectorError('BAD_REQUEST', 'confirmId does not belong to this connection')
+    }
+    // P0#2 绑定校验:账本行 provider/action 是执行权威。请求体若企图用同一 confirmId
+    // 换执行另一个 action(如飞书 create_calendar_event 的确认换成 send_message),
+    // 或 provider 不匹配 → 直接拒(不改状态,账本行仍可被正确 action 执行)。
+    if (row.provider !== opts.expectedProvider || row.action !== opts.expectedAction) {
+      throw new ConnectorError('BAD_REQUEST', 'confirmId provider/action mismatch')
     }
     const cls = classifyForExecute(row)
     if (cls.kind === 'in_progress') return { kind: 'in_progress' } as const

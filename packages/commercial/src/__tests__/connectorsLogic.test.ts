@@ -14,11 +14,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { describe, test } from 'node:test'
 import { ConnectorError } from '../connectors/errors.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
-import { classifyForExecute } from '../connectors/ledger.js'
+import { classifyForExecute, writeFinalizeStatus } from '../connectors/ledger.js'
+import {
+  type ConnectorRedis,
+  checkFeishuScopes,
+  normalizeScopes,
+  startLeaseRenewal,
+} from '../connectors/providers/feishu.js'
 import { presetImapConfig } from '../connectors/providers/imap.js'
 import {
   RESULT_MAX_ARRAY,
   enforceResultLimits,
+  isMaybeDelivered,
+  mapFetchFailure,
   mapUpstreamStatus,
   truncateText,
 } from '../connectors/providers/shared.js'
@@ -274,6 +282,220 @@ describe('mapUpstreamStatus(不透传上游 body)', () => {
     assert.equal(mapUpstreamStatus(429, 'x').code, 'UPSTREAM_RATE_LIMITED')
     assert.equal(mapUpstreamStatus(500, 'x').code, 'UPSTREAM_ERROR')
     assert.equal(mapUpstreamStatus(418, 'x').code, 'UPSTREAM_ERROR')
+  })
+})
+
+// ─── P1#4:写送达不确定性(pre-dispatch vs post-dispatch)─────────────────────
+
+describe('mapUpstreamStatus / mapFetchFailure 的 maybeDelivered 标记(P1#4)', () => {
+  test('5xx = 服务端可能已处理 → maybeDelivered', () => {
+    for (const s of [500, 502, 503, 504]) {
+      const e = mapUpstreamStatus(s, 'notion')
+      assert.equal(e.code, 'UPSTREAM_ERROR')
+      assert.equal(isMaybeDelivered(e), true, `status ${s} 应标 maybeDelivered`)
+    }
+  })
+  test('明确 4xx(400/409/422/404/401/403/429)= 服务端拒绝 → 不标(确定未写入)', () => {
+    for (const s of [400, 409, 422]) {
+      assert.equal(isMaybeDelivered(mapUpstreamStatus(s, 'feishu')), false, `status ${s}`)
+    }
+    for (const s of [401, 403, 404, 429]) {
+      assert.equal(isMaybeDelivered(mapUpstreamStatus(s, 'feishu')), false, `status ${s}`)
+    }
+  })
+  test('post-dispatch socket 断裂(ECONNRESET,含 undici .cause 包裹)→ maybeDelivered', () => {
+    const raw = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } })
+    const e = mapFetchFailure(raw, 'webdav')
+    assert.equal(e.code, 'UPSTREAM_ERROR')
+    assert.equal(isMaybeDelivered(e), true)
+  })
+  test('已建连后超时(AbortError)→ UPSTREAM_TIMEOUT + maybeDelivered', () => {
+    const abort = Object.assign(new Error('aborted'), { name: 'AbortError' })
+    const e = mapFetchFailure(abort, 'feishu')
+    assert.equal(e.code, 'UPSTREAM_TIMEOUT')
+    assert.equal(isMaybeDelivered(e), true)
+  })
+  test('pre-dispatch 连接失败(ECONNREFUSED/ENOTFOUND/连接超时)= 未送出 → 不标', () => {
+    const refused = mapFetchFailure({ code: 'ECONNREFUSED' }, 'webdav')
+    assert.equal(refused.code, 'UPSTREAM_ERROR')
+    assert.equal(isMaybeDelivered(refused), false)
+    const dns = mapFetchFailure({ code: 'ENOTFOUND' }, 'notion')
+    assert.equal(isMaybeDelivered(dns), false)
+    const connTimeout = mapFetchFailure({ code: 'UND_ERR_CONNECT_TIMEOUT' }, 'feishu')
+    assert.equal(connTimeout.code, 'UPSTREAM_TIMEOUT')
+    assert.equal(isMaybeDelivered(connTimeout), false, '连接期超时=未送出,不标')
+  })
+})
+
+describe('writeFinalizeStatus(P1#4:Notion/飞书/WebDAV 服务端已收包后断连)', () => {
+  test('post-dispatch 断连 / 5xx / 已建连超时 → unknown(不盲重试防重复写)', () => {
+    assert.equal(
+      writeFinalizeStatus(
+        mapFetchFailure(
+          Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }),
+          'notion',
+        ),
+      ),
+      'unknown',
+    )
+    assert.equal(writeFinalizeStatus(mapUpstreamStatus(502, 'feishu')), 'unknown')
+    // 到达 rpc catch 的错误恒为 provider 已映射的 ConnectorError(已建连后 AbortError→timeout+标)
+    assert.equal(
+      writeFinalizeStatus(
+        mapFetchFailure(Object.assign(new Error('x'), { name: 'AbortError' }), 'feishu'),
+      ),
+      'unknown',
+    )
+  })
+  test('确定未送达(校验错 / 明确 4xx / 门限拒绝 / pre-dispatch 连接失败)→ failed', () => {
+    assert.equal(writeFinalizeStatus(new ConnectorError('VALIDATION_FAILED')), 'failed')
+    assert.equal(writeFinalizeStatus(new ConnectorError('SEND_DAILY_CAP')), 'failed')
+    assert.equal(writeFinalizeStatus(mapUpstreamStatus(404, 'webdav')), 'failed')
+    assert.equal(writeFinalizeStatus(mapUpstreamStatus(409, 'notion')), 'failed')
+    assert.equal(writeFinalizeStatus(mapFetchFailure({ code: 'ECONNREFUSED' }, 'webdav')), 'failed')
+  })
+})
+
+// ─── P2#12:飞书 granted scopes 校验 ─────────────────────────────────────────
+
+describe('checkFeishuScopes / normalizeScopes(P2#12)', () => {
+  const REQUIRED = [
+    'docx:document:readonly',
+    'calendar:calendar.event:read',
+    'calendar:calendar.event:create',
+    'im:message:send_as_bot',
+  ]
+  test('normalizeScopes:空白/逗号切分 + trim + 去重保序', () => {
+    assert.deepEqual(normalizeScopes('  a  b,c , a  '), ['a', 'b', 'c'])
+    assert.deepEqual(normalizeScopes(''), [])
+  })
+  test('全部必需授予 → verified,missing 空', () => {
+    const r = checkFeishuScopes(REQUIRED.join(' '))
+    assert.equal(r.verified, true)
+    assert.deepEqual(r.missing, [])
+  })
+  test('部分授权(缺 calendar create + im send)→ missing 非空 → 调用方拒绑', () => {
+    const r = checkFeishuScopes('docx:document:readonly calendar:calendar.event:read')
+    assert.equal(r.verified, false)
+    assert.deepEqual(r.missing.sort(), [
+      'calendar:calendar.event:create',
+      'im:message:send_as_bot',
+    ])
+  })
+  test('多余 scope 不影响 verified', () => {
+    const r = checkFeishuScopes(`${REQUIRED.join(' ')} extra:scope another:one`)
+    assert.equal(r.verified, true)
+    assert.deepEqual(r.missing, [])
+  })
+  test('飞书未回报 scope(空串)→ 不误拒:verified=false 但 missing 空(放行+审计标记)', () => {
+    const r = checkFeishuScopes('')
+    assert.equal(r.verified, false)
+    assert.deepEqual(r.missing, [])
+    assert.deepEqual(r.granted, [])
+  })
+})
+
+// ─── P1#3:飞书刷新锁续租(compare-and-PEXPIRE)─────────────────────────────
+
+describe('startLeaseRenewal(P1#3:锁续租 + lease 丢失中止)', () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  test('持有期间周期性续租成功 → 不触发 onLost', async () => {
+    const renewCalls: unknown[][] = []
+    const redis: ConnectorRedis = {
+      async eval(_script, _n, ...args) {
+        renewCalls.push(args)
+        return 1 // 始终持有
+      },
+    }
+    let lost = false
+    const stop = startLeaseRenewal({
+      redis,
+      lockKey: 'k',
+      lease: 'lease-1',
+      ttlMs: 30_000,
+      intervalMs: 10,
+      onLost: () => {
+        lost = true
+      },
+    })
+    // 给足挂钟时间(测试运行器并发下 10ms 定时器会被 starve,不断言精确次数)
+    await sleep(120)
+    stop()
+    assert.equal(lost, false)
+    assert.ok(renewCalls.length >= 1, `持锁期间应至少续租一次,实际 ${renewCalls.length}`)
+    // 每次续租带 lockKey + lease + ttl(compare-and-PEXPIRE 语义)
+    assert.equal(renewCalls[0]![0], 'k')
+    assert.equal(renewCalls[0]![1], 'lease-1')
+    assert.equal(renewCalls[0]![2], 30_000)
+  })
+
+  test('lease 被抢走(eval 返回 0)→ 调 onLost(据此 abort 在飞请求)', async () => {
+    const redis: ConnectorRedis = {
+      async eval() {
+        return 0 // 续租失败=锁已不在我手
+      },
+    }
+    let lost = 0
+    const stop = startLeaseRenewal({
+      redis,
+      lockKey: 'k',
+      lease: 'lease-x',
+      ttlMs: 1_000,
+      intervalMs: 10,
+      onLost: () => {
+        lost += 1
+      },
+    })
+    await sleep(35)
+    stop()
+    assert.ok(lost >= 1, 'lease 丢失必须触发 onLost')
+  })
+
+  test('Redis 抖动(eval 抛错)→ 不误报 onLost(真 fencing 在 DB CAS)', async () => {
+    const redis: ConnectorRedis = {
+      async eval() {
+        throw new Error('redis down')
+      },
+    }
+    let lost = false
+    const stop = startLeaseRenewal({
+      redis,
+      lockKey: 'k',
+      lease: 'l',
+      ttlMs: 1_000,
+      intervalMs: 10,
+      onLost: () => {
+        lost = true
+      },
+    })
+    await sleep(35)
+    stop()
+    assert.equal(lost, false)
+  })
+
+  test('stop() 后不再续租(幂等)', async () => {
+    let calls = 0
+    const redis: ConnectorRedis = {
+      async eval() {
+        calls += 1
+        return 1
+      },
+    }
+    const stop = startLeaseRenewal({
+      redis,
+      lockKey: 'k',
+      lease: 'l',
+      ttlMs: 1_000,
+      intervalMs: 10,
+      onLost: () => {},
+    })
+    await sleep(25)
+    stop()
+    stop() // 幂等
+    const after = calls
+    await sleep(30)
+    assert.equal(calls, after, 'stop 后不应再有续租调用')
   })
 })
 

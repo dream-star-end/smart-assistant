@@ -25,6 +25,7 @@ import type { Pool } from 'pg'
 import { decryptToBuffer, encrypt } from '../crypto/aead.js'
 import { loadKmsKey, zeroBuffer } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
+import { tx } from '../db/queries.js'
 import { ConnectorError } from './errors.js'
 import type { DbConnectorProvider } from './registry.js'
 
@@ -254,34 +255,51 @@ export async function upsertConnection(
       throw err
     }
   }
-  // rebind:唯一索引权威 → 既有行上原子更新(重生成 aad_seed、revision+1、generation+1)。
+  // rebind:唯一索引权威 → **短事务 SELECT ... FOR UPDATE 后带 expected revision/generation
+  // 条件更新**(P1#7:双代数 CAS + 行锁,消除 last-write-wins;并发 rebind 由行锁串行,
+  // 每次基于锁内当前代数递进,不丢更新、不用旧代数覆盖)。
   const aadSeed2 = randomUUID()
   const enc2 = encryptPayload(input.payload, input.provider, input.userId, aadSeed2)
-  const r2 = await pool.query<ConnectionRow>(
-    `UPDATE connections SET
-        secret_enc = $1, secret_nonce = $2, aad_seed = $3::uuid,
-        revision = revision + 1, secret_generation = secret_generation + 1,
-        display_name = CASE WHEN $4 <> '' THEN $4 ELSE display_name END,
-        meta = $5, status = 'active', last_error_code = NULL,
-        last_verified_at = now(), updated_at = now()
-      WHERE user_id = $6 AND provider = $7 AND account_key = $8 AND revoked_at IS NULL
-      RETURNING ${ROW_COLS}`,
-    [
-      enc2.ciphertext,
-      enc2.nonce,
-      aadSeed2,
-      displayName,
-      JSON.stringify(meta),
-      input.userId,
-      input.provider,
-      input.accountKey,
-    ],
-  )
-  if (r2.rowCount === 0) {
+  const rebound = await tx<ConnectionRow | null>(async (client) => {
+    const sel = await client.query<{ revision: number; secret_generation: string }>(
+      `SELECT revision, secret_generation::text AS secret_generation
+         FROM connections
+        WHERE user_id = $1 AND provider = $2 AND account_key = $3 AND revoked_at IS NULL
+        FOR UPDATE`,
+      [input.userId, input.provider, input.accountKey],
+    )
+    const cur = sel.rows[0]
+    if (!cur) return null // 并发解绑窗口:既有行已撤销
+    const upd = await client.query<ConnectionRow>(
+      `UPDATE connections SET
+          secret_enc = $1, secret_nonce = $2, aad_seed = $3::uuid,
+          revision = revision + 1, secret_generation = secret_generation + 1,
+          display_name = CASE WHEN $4 <> '' THEN $4 ELSE display_name END,
+          meta = $5, status = 'active', last_error_code = NULL,
+          last_verified_at = now(), updated_at = now()
+        WHERE user_id = $6 AND provider = $7 AND account_key = $8 AND revoked_at IS NULL
+          AND revision = $9 AND secret_generation = $10
+        RETURNING ${ROW_COLS}`,
+      [
+        enc2.ciphertext,
+        enc2.nonce,
+        aadSeed2,
+        displayName,
+        JSON.stringify(meta),
+        input.userId,
+        input.provider,
+        input.accountKey,
+        cur.revision,
+        cur.secret_generation,
+      ],
+    )
+    return upd.rows[0] ?? null
+  }, pool)
+  if (!rebound) {
     // 撞唯一又更新不到:并发解绑窗口 → 让调用方重试一次绑定
     throw new ConnectorError('INTERNAL', 'rebind lost race with concurrent revoke')
   }
-  return { connection: r2.rows[0]!, rebound: true }
+  return { connection: rebound, rebound: true }
 }
 
 /** 调用链强制查询:id + user_id + 未撤销 + active(§7 凭据查询收口)。 */

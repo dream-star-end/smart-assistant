@@ -22,7 +22,7 @@ import {
   resolvePinnedAddress,
 } from '../outboundPolicy.js'
 import type { ImapSecret } from '../store.js'
-import { TEXT_FIELD_MAX_CHARS, mapFetchFailure, truncateText } from './shared.js'
+import { TEXT_FIELD_MAX_CHARS, mapFetchFailure, markMaybeDelivered, truncateText } from './shared.js'
 
 export interface ImapDeps {
   resolver?: DnsResolver
@@ -387,9 +387,7 @@ export async function imapSendEmail(
       throw new ConnectorError('UPSTREAM_ERROR', `smtp rejected (${e.responseCode})`)
     }
     // DATA 之后 / 传输层断连:可能已发出 → unknown
-    const ambiguous = new ConnectorError('UPSTREAM_ERROR', 'smtp outcome ambiguous')
-    ;(ambiguous as ConnectorError & { maybeDelivered?: boolean }).maybeDelivered = true
-    throw ambiguous
+    throw markMaybeDelivered(new ConnectorError('UPSTREAM_ERROR', 'smtp outcome ambiguous'))
   } finally {
     try {
       transport.close()

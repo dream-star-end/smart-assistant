@@ -3560,8 +3560,9 @@ export async function registerCommercial(
   }
 
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
-  // 四职责=stale executing→unknown / pending|approved 过期→expired+销毁 params /
-  // OAuth 过期行 DELETE / ledger 90 天 retention;全部 DB CAS+SKIP LOCKED 幂等。
+  // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
+  // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
+  // 90 天终态 retention 已迁至统一 auditRetention 注册表(带终态谓词),此处不再删。
   // 【域归属 v5-owned】connectors 三表是 0130 v5 引入,v3 无代码 → 不写共享现网;
   // 但 gate 在 controlPlaneEnabled(OC_CONTROL_PLANE_LEADER)防多 v5 实例双跑
   // (设计 §3:v5 leader 门控)。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。

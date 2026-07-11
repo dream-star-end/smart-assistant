@@ -2,13 +2,17 @@
  * connectorSweeper — 连接器域独立定时器(设计终稿 §3 护栏;**不挂**被钉死的 idleSweep)。
  *
  * 启动门控在 index.ts:v5 控制面 leader(OC_CONTROL_PLANE_LEADER)才跑,
- * 与其它 leader 门控调度器同挂;本模块只管四职责本身,全部 DB CAS + SKIP LOCKED 幂等:
+ * 与其它 leader 门控调度器同挂;本模块只管**活跃态转换**三职责,全部 DB CAS +
+ * SKIP LOCKED 幂等:
  *
  *   1. stale executing → unknown(超 action 总时限 + 缓冲;**绝不回 approved** ——
  *      "可能已发出"的写不允许二次执行)+ 销毁 params
  *   2. pending|approved 过期 → expired + 销毁 params
  *   3. connector_oauth_pending 过期行 **DELETE 整行**(未消费行密文随行销毁)
- *   4. ledger 90 天 retention(终态行才删;审计窗口)
+ *
+ * P1#11:connector_write_ledger 的 90 天**终态** retention 已迁至统一 retention 注册表
+ * (admin/auditRetention.ts,带终态谓词),**不再由本 sweeper 删**——避免两处双清理权威。
+ * 本 sweeper 只做活跃→终态的状态转换(销毁 params),终态行的最终删除归 auditRetention。
  *
  * 每 tick 各职责独立 try/catch,单条失败不拖垮其余。
  */
@@ -19,7 +23,6 @@ import { getPool } from '../db/index.js'
 export const CONNECTOR_SWEEP_INTERVAL_MS = 60_000
 /** action 总时限 60s(outboundPolicy.TOTAL_TIMEOUT_MS)+ 缓冲 → 5min 视为 stale。 */
 export const STALE_EXECUTING_AFTER = '5 minutes'
-export const LEDGER_RETENTION = '90 days'
 
 export interface ConnectorSweeperHandle {
   stop(): void
@@ -31,7 +34,6 @@ export interface ConnectorSweepResult {
   staleExecuting: number
   expired: number
   oauthDeleted: number
-  retentionDeleted: number
 }
 
 export interface ConnectorSweeperOptions {
@@ -50,7 +52,6 @@ async function sweepOnce(
     staleExecuting: 0,
     expired: 0,
     oauthDeleted: 0,
-    retentionDeleted: 0,
   }
 
   // ① stale executing → unknown(SKIP LOCKED:与在飞 finalize 的行锁互让)
@@ -102,21 +103,7 @@ async function sweepOnce(
     onError('oauth_expired', err)
   }
 
-  // ④ ledger retention:仅终态行(CHECK 保证其 params 已销毁)
-  try {
-    const r = await pool.query(
-      `DELETE FROM connector_write_ledger
-        WHERE id IN (
-          SELECT id FROM connector_write_ledger
-           WHERE status IN ('succeeded','failed','unknown','expired','denied')
-             AND created_at < now() - interval '${LEDGER_RETENTION}'
-           FOR UPDATE SKIP LOCKED
-        )`,
-    )
-    result.retentionDeleted = r.rowCount ?? 0
-  } catch (err) {
-    onError('retention', err)
-  }
+  // ④ ledger 90 天终态 retention 已迁至 admin/auditRetention.ts(P1#11);本 sweeper 不再删。
 
   return result
 }

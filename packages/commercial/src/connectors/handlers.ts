@@ -46,6 +46,7 @@ import {
 import { validateWebdavBaseUrl } from './outboundPolicy.js'
 import {
   buildFeishuAuthorizeUrl,
+  checkFeishuScopes,
   exchangeFeishuCode,
   fetchFeishuUserInfo,
   generatePkceVerifier,
@@ -66,7 +67,6 @@ import {
   type ConnectorSecret,
   canonicalAccountIdentity,
   computeAccountKey,
-  decryptConnectionSecret,
   getConnectionAnyStatus,
   listConnections,
   renameConnection,
@@ -116,6 +116,8 @@ function wireErrorCode(code: string, context: 'bind' | 'oauth' | 'generic'): str
       return 'TOKEN_EXCHANGE_FAILED'
     case 'OAUTH_NOT_CONFIGURED':
       return 'OAUTH_START_FAILED'
+    case 'SCOPE_INSUFFICIENT':
+      return 'SCOPE_INSUFFICIENT'
     default:
       return code
   }
@@ -560,6 +562,17 @@ async function handleOauthCallback(
       redirectUri,
       pkceVerifier: consumed.draft.pkceVerifier,
     })
+    // P2#12:校验飞书回报的 granted scopes 覆盖 v1 必需集;缺失则 fail-closed 拒绝绑定
+    // (缺权限仍绑定 → 运行时 action 报不透明错;不如绑定期挡下并明确告知)。
+    const scopeCheck = checkFeishuScopes(tokens.grantedScopes)
+    if (scopeCheck.missing.length > 0) {
+      ctx.log.warn('connector_feishu_scope_insufficient', {
+        provider,
+        missingCount: scopeCheck.missing.length,
+      })
+      throw new ConnectorError('SCOPE_INSUFFICIENT', 'feishu granted scopes missing required set')
+    }
+
     const who = await fetchFeishuUserInfo(tokens.accessToken)
     const identity = canonicalAccountIdentity('feishu', { unionId: who.unionId })
     const accountKey = computeAccountKey(identity)
@@ -581,7 +594,10 @@ async function handleOauthCallback(
         meta: {
           account_hint: who.name || '飞书',
           tokenExpiresAt: tokens.expiresAt,
-          grantedScopes: tokens.grantedScopes, // verify granted scopes 存 meta(§2)
+          // verify granted scopes 存 meta(§2);scopesVerified=false 表示飞书未回报 scope
+          // 字段(无法核验,已放行但留审计标记)。
+          grantedScopes: scopeCheck.granted.join(' '),
+          scopesVerified: scopeCheck.verified,
         },
       },
       pool,
@@ -716,31 +732,25 @@ async function handleUnbind(
       .catch(() => {})
   }
 
-  // ② 解密暂存 revoke 所需凭据(仅 feishu 有 revoke 端点;v1 无公开端点 → 留债)
+  // ② 【已知偏离,P1#8】设计 §8 ② 为"解密暂存 revoke 所需 Buffer";但 v1 唯一有 OAuth
+  //    凭据的 provider 是**飞书 BYOA**,其 user_access_token **无公开 revoke/logout 端点**
+  //    (设计债表已登记:"feishu upstream token revoke 无公开 BYOA 端点")。故本地 tombstone
+  //    即为终态,**不解密**(拒绝"解密后只拿来算个布尔值"的无意义明文触碰)。若未来飞书
+  //    ISV/端点可用,再在此解密 + 事务外 best-effort 调 revoke。
   const existing = await getConnectionAnyStatus(id, userId, pool)
   if (!existing) throw new HttpError(404, 'NOT_FOUND', 'no such connection')
-  let revokeSecretHeld = false
-  if (existing.provider === 'feishu' && existing.secret_enc) {
-    try {
-      decryptConnectionSecret(existing) // 验证可解密;v1 无 upstream revoke 端点,不留明文
-      revokeSecretHeld = true
-    } catch {
-      revokeSecretHeld = false
-    }
-  }
 
   // ③ 短事务:secret 置 NULL + revoked_at(事务内禁网络 I/O)
   const revoked = await revokeConnection(id, userId, pool)
   if (!revoked) throw new HttpError(404, 'NOT_FOUND', 'no such connection')
 
-  // ④ 事务外 best-effort provider revoke:飞书 BYOA v1 无公开 user token revoke 端点,
-  //    仅记录 outcome(登记债:官方 ISV/端点可用后补 revoke 调用)。
+  // ④ 事务外 best-effort provider revoke:v1 无 provider 有公开 user token revoke 端点
+  //    (飞书亦无)→ 本地销毁即终态,仅如实记录 outcome。
   ctx.log.info('connector_unbound', {
     sub: user.id,
     provider: existing.provider,
     connectionId: id,
-    upstreamRevoke: revokeSecretHeld ? 'skipped_no_endpoint' : 'not_applicable',
+    upstreamRevoke: existing.provider === 'feishu' ? 'unsupported_no_endpoint' : 'not_applicable',
   })
-  // ⑤ zeroBuffer 已在 decrypt helper finally 内完成
   sendJson(res, 200, { ok: true })
 }

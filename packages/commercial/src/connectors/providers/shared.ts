@@ -10,9 +10,63 @@
 
 import { ConnectorError } from '../errors.js'
 
+// ─── 写送达不确定性标记(P1#4:pre-dispatch vs post-dispatch) ───────────────
+
+/**
+ * 标注一个错误为「可能已送达」(maybeDelivered):请求体已开始/完成发送后失败,
+ * 第三方**可能已执行写入** → 写路径 finalize 成 `unknown`(绝不盲重试,防重复写)。
+ * 反之,未打标的写错误 = 确定未送达(pre-dispatch 连接失败 / 明确 4xx 拒绝) → `failed`。
+ */
+export function markMaybeDelivered<E extends ConnectorError>(e: E): E {
+  ;(e as ConnectorError & { maybeDelivered?: boolean }).maybeDelivered = true
+  return e
+}
+
+/** 一个错误是否已被标注为「可能已送达」。 */
+export function isMaybeDelivered(err: unknown): boolean {
+  return (err as { maybeDelivered?: boolean } | null)?.maybeDelivered === true
+}
+
+/**
+ * 「确定未送达」的连接期错误码(请求体从未发出:DNS/连接拒绝/路由不可达/连接超时/
+ * TLS 握手失败)。命中这些 → 写路径可安全判 `failed`(重提交不会重复)。
+ */
+const PRE_DISPATCH_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  // TLS 握手在请求体发送前完成 → 握手类失败 = 未送达
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'CERT_HAS_EXPIRED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+])
+
+/** undici fetch 把根因裹在 `.cause` 里;取顶层或 cause 的 code。 */
+function fetchErrCode(err: unknown): string | undefined {
+  const top = (err as { code?: string } | null)?.code
+  if (top) return top
+  return (err as { cause?: { code?: string } } | null)?.cause?.code
+}
+
+/** 取错误 name(fetch 包成 TypeError,穿透到 cause 找真实 name)。 */
+function fetchErrName(err: unknown): string | undefined {
+  const top = (err as { name?: string } | null)?.name
+  if (top && top !== 'TypeError' && top !== 'Error') return top
+  return (err as { cause?: { name?: string } } | null)?.cause?.name ?? top
+}
+
 // ─── 上游错误映射 ────────────────────────────────────────────────────────
 
-/** HTTP 状态 → 稳定错误码(不带上游 body)。 */
+/**
+ * HTTP 状态 → 稳定错误码(不带上游 body)。
+ * P1#4:5xx = 服务端可能已处理写入 → 标 maybeDelivered;其余 4xx = 服务端收到并拒绝
+ * (401/403/404/429/400/409/…) = 确定未写入,不打标。
+ */
 export function mapUpstreamStatus(status: number, providerTag: string): ConnectorError {
   if (status === 401 || status === 403) {
     return new ConnectorError('UPSTREAM_AUTH_FAILED', `${providerTag} upstream ${status}`)
@@ -23,20 +77,42 @@ export function mapUpstreamStatus(status: number, providerTag: string): Connecto
   if (status === 429) {
     return new ConnectorError('UPSTREAM_RATE_LIMITED', `${providerTag} upstream 429`)
   }
+  if (status >= 500) {
+    // 5xx:服务端已收到请求,可能已落地写入 → 结局不明
+    return markMaybeDelivered(new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream ${status}`))
+  }
+  // 其余 4xx:服务端明确拒绝 → 未写入
   return new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream ${status}`)
 }
 
-/** fetch/网络异常 → 稳定错误码(超时区分)。message 不含 err 原文(可能带 URL)。 */
+/**
+ * fetch/网络异常 → 稳定错误码(超时区分 + 送达不确定性)。message 不含 err 原文
+ * (可能带 URL)。P1#4:pre-dispatch(连接期)失败 = 未送达 → 不打标;post-dispatch
+ * (已建连后 socket 断裂 / 响应超时) = 可能已送达 → 打标 maybeDelivered。
+ */
 export function mapFetchFailure(err: unknown, providerTag: string): ConnectorError {
   if (err instanceof ConnectorError) return err
-  const name = (err as { name?: string })?.name
-  const code = (err as { code?: string })?.code
-  if (name === 'AbortError' || name === 'TimeoutError' || code === 'UND_ERR_CONNECT_TIMEOUT') {
-    return new ConnectorError('UPSTREAM_TIMEOUT', `${providerTag} upstream timeout`)
+  const name = fetchErrName(err)
+  const code = fetchErrCode(err)
+  const preDispatch = code != null && PRE_DISPATCH_ERROR_CODES.has(code)
+
+  if (
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'UND_ERR_HEADERS_TIMEOUT' ||
+    code === 'UND_ERR_BODY_TIMEOUT'
+  ) {
+    const e = new ConnectorError('UPSTREAM_TIMEOUT', `${providerTag} upstream timeout`)
+    // 连接期超时 = 未送出;其余超时 = 已建连后 → 结局不明
+    return preDispatch ? e : markMaybeDelivered(e)
   }
-  return new ConnectorError(
-    'UPSTREAM_ERROR',
-    `${providerTag} upstream unreachable (${name ?? code ?? 'err'})`,
+  if (preDispatch) {
+    return new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream unreachable`)
+  }
+  // 已建连后 socket 断裂(ECONNRESET / EPIPE / UND_ERR_SOCKET / …)→ 可能已送达
+  return markMaybeDelivered(
+    new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream error (${name ?? code ?? 'err'})`),
   )
 }
 

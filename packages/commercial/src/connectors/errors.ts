@@ -43,6 +43,7 @@ export type ConnectorErrorCode =
   | 'OAUTH_STATE_MISMATCH'
   | 'OAUTH_EXCHANGE_FAILED'
   | 'OAUTH_NOT_CONFIGURED'
+  | 'SCOPE_INSUFFICIENT'
   // 兜底
   | 'INTERNAL'
 
@@ -95,6 +96,7 @@ function defaultHttpStatus(code: ConnectorErrorCode): number {
       return 429
     case 'OAUTH_NOT_CONFIGURED':
     case 'OUTBOUND_BLOCKED':
+    case 'SCOPE_INSUFFICIENT':
       return 400
     case 'UPSTREAM_RATE_LIMITED':
       return 429
