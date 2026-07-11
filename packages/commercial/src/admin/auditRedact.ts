@@ -23,12 +23,12 @@ export const SENSITIVE_KEY_RE =
   /(secret|password|passwd|credential|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|signing[_-]?key|token)/i;
 
 /**
- * token 计数字段 allowlist(Codex R2):数值放行仅限这些形状——
- * `max_tokens`/`input_tokens`/`cache_read_tokens`/`tokens_per_credit`/
- * `token_count`/`token_limit` 等;命中敏感 RE 的其余数值(如数值型口令)照脱。
+ * token 计数字段 allowlist(Codex R2+R3):数值放行仅限**显式计数名**——
+ * 裸 `*_token`(access_token/api_token/bot_token…)一律不放行,数值型 token
+ * 凭据照脱。宁可多脱:未列入的新计数名默认被脱,需要时来这里登记。
  */
 export const TOKEN_COUNT_KEY_RE =
-  /(^|[_-])[a-z0-9_-]*tokens?([_-](per|count|used|limit|budget|remaining)[a-z0-9_-]*)?$/i;
+  /^(?:(?:max|min|num|input|output|total|prompt|completion|reasoning|cache_creation|cache_read|cached)_tokens|tokens?_(?:count|limit|used|budget|remaining)|tokens_per_[a-z0-9_]+)$/i;
 
 const MAX_DEPTH = 8;
 

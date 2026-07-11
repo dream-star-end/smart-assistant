@@ -54,11 +54,25 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.deepEqual(out.access_token, { __redacted: true, len: 17, last4: "here" });
     // Codex R1 MAJOR#3:复数凭据集合绝不能被 lookahead 放过
     assert.deepEqual(out.access_tokens, { __redacted: true });
-    // Codex R2:数值放行只限计数形状——数值型口令/密钥照脱
-    const out3 = redactSensitive({ password: 123456, api_key: 987654321, tokens_per_credit: 250 }) as Record<string, unknown>;
+    // Codex R2+R3:数值放行只限显式计数名——数值型口令/密钥/裸 *_token 凭据照脱
+    const out3 = redactSensitive({
+      password: 123456,
+      api_key: 987654321,
+      access_token: 123456789,
+      refresh_token: 42,
+      api_token: 7,
+      tokens_per_credit: 250,
+      output_tokens: 512,
+      token_count: 99,
+    }) as Record<string, unknown>;
     assert.deepEqual(out3.password, { __redacted: true });
     assert.deepEqual(out3.api_key, { __redacted: true });
+    assert.deepEqual(out3.access_token, { __redacted: true });
+    assert.deepEqual(out3.refresh_token, { __redacted: true });
+    assert.deepEqual(out3.api_token, { __redacted: true });
     assert.equal(out3.tokens_per_credit, 250);
+    assert.equal(out3.output_tokens, 512);
+    assert.equal(out3.token_count, 99);
   });
 
   test("嵌套对象与数组内的敏感 key 也被脱敏;敏感 key 下的对象整体替换", () => {
