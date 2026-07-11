@@ -1,5 +1,7 @@
 // v5 设置/计费中心的展示文案映射（唯一权威源，杜绝各组件硬编码散落）。
 
+import type { UsageReportWindow } from "../../lib/types";
+
 /**
  * credit_ledger.reason → 中文标签。后端 reason 是开放枚举（admin/ledger.ts），
  * 未知值回退到 reason 原文 —— 绝不吞掉未知类型，保证可观测。
@@ -50,6 +52,26 @@ export function orderStatusLabel(status: string): string {
     default:
       return status;
   }
+}
+
+/** 报表窗口 → 中文名词（用量/账单图表卡的窗口标注共用）。 */
+export const REPORT_WINDOW_NOUN: Record<UsageReportWindow, string> = {
+  "24h": "24 小时",
+  "7d": "7 天",
+  "30d": "30 天",
+};
+
+/**
+ * 报表 bucket → 图表轴标签（设置/计费图表共用单一权威）。
+ * 24h 桶「MM-DD HH:00」取「HH:00」；日桶「YYYY-MM-DD」去年份取「MM-DD」；其余原样。
+ */
+export function formatReportBucket(bucket: string, window: UsageReportWindow): string {
+  if (window === "24h") {
+    const parts = bucket.split(" ");
+    return parts.length > 1 ? parts[parts.length - 1] : bucket;
+  }
+  const m = /^\d{4}-(\d{2}-\d{2})$/.exec(bucket);
+  return m ? m[1] : bucket;
 }
 
 /** ISO 时间 → 简洁本地展示（M月D日 HH:mm）。非法时间返回空串。 */

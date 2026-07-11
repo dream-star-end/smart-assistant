@@ -2,9 +2,12 @@
 // 用法：import { PageHeader, StatCard, ChartCard, DataTable, FilterBar } from "../../components";
 export { PageHeader } from "./PageHeader";
 export { StatCard, StatCardRow, type StatTone, type StatDelta } from "./StatCard";
+// 图表栈已提升为全站共享单一权威（src/components/charts.tsx）；
+// admin 页面仍经本工作台 barrel 消费，路径指向共享位置。
 export {
   useChart,
   ChartCard,
+  chartNum,
   lineConfig,
   barConfig,
   donutConfig,
@@ -12,7 +15,7 @@ export {
   withAlpha,
   type ChartTheme,
   type LineSeries,
-} from "./charts";
+} from "../../components/charts";
 export { DataTable, Pagination, type Column } from "./DataTable";
 export {
   FilterBar,

@@ -213,6 +213,7 @@ import {
   handleDeleteResearchLibraryDoc,
   handleGetMyPreferences,
   handleGetMyUsage,
+  handleGetMyUsageReport,
   handleGetPublicConfig,
   handleListMyInbox,
   handleListPublicModels,
@@ -606,6 +607,9 @@ export function createCommercialHandler(
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
     // 使用消耗统计(含 summary / sessions 分页 / ledger 分页 / savings)
     { method: 'GET', path: '/api/me/usage', handler: handleGetMyUsage },
+    // 用量报表聚合(前端画图表):summary + 趋势 + 按模型 + 流水。exact path,与上面
+    // `/api/me/usage`(同为 exact)互不吞噬(matchRoute exact-first;两者无 pathPrefix)。
+    { method: 'GET', path: '/api/me/usage/report', handler: handleGetMyUsageReport },
     // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC 外接 API key 的管理面。
     //   GET    /api/me/api-keys           → list 未撤销 key(无 secret)
     //   POST   /api/me/api-keys { label } → 创建,**返完整明文一次**
