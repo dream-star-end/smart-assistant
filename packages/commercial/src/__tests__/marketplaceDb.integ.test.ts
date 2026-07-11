@@ -21,9 +21,10 @@ import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
-import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { querySkillFeedbackRefs } from '../http/internalSkillFeedback.js'
 import {
   MarketplaceError,
   getApprovedSkillVersions,
@@ -183,31 +184,53 @@ async function expectMarketplaceError(fn: () => Promise<unknown>, code: string):
 }
 
 let usageSeq = 0
-/** 直插一条使用事件(模拟容器 skillUsageReporter 落库);ageDays 控制事件年龄以测 30 天窗口。 */
+/**
+ * 直插一条使用事件(模拟容器 skillUsageReporter 落库)。
+ *   ageDays 控制事件年龄以测 30 天窗口;layer 缺省 'hub'(测 layer 隔离时传 'user');
+ *   sessionKey 缺省 null(测 skill-feedback 差评引用时传具体会话键)。
+ */
 async function insertUsage(
   userId: number,
   slug: string,
-  opts: { traceId?: string | null; eventId?: string; ageDays?: number } = {},
+  opts: {
+    traceId?: string | null
+    eventId?: string
+    ageDays?: number
+    layer?: 'hub' | 'user'
+    sessionKey?: string | null
+  } = {},
 ): Promise<void> {
   const eventId = opts.eventId ?? `evt-${++usageSeq}`
   await query(
     `INSERT INTO marketplace_skill_usage_events
-       (user_id, slug, agent_id, session_key, trace_id, event_id, created_at)
-     VALUES ($1, $2, 'main', NULL, $3, $4, NOW() - make_interval(days => $5))`,
-    [userId, slug, opts.traceId ?? null, eventId, opts.ageDays ?? 0],
+       (user_id, slug, agent_id, session_key, trace_id, event_id, layer, created_at)
+     VALUES ($1, $2, 'main', $3, $4, $5, $6, NOW() - make_interval(days => $7))`,
+    [
+      userId,
+      slug,
+      opts.sessionKey ?? null,
+      opts.traceId ?? null,
+      eventId,
+      opts.layer ?? 'hub',
+      opts.ageDays ?? 0,
+    ],
   )
 }
-/** 直插一条响应评分(评分归因的另一端;按 trace_id 与使用事件关联)。 */
+/**
+ * 直插一条响应评分(评分归因的另一端;按 trace_id 与使用事件关联)。
+ *   ratedAgeDays 控制评分时刻年龄以测 skill-feedback 的 90 天窗口(窗口过滤的是 r.created_at)。
+ */
 async function insertRating(
   userId: number,
   messageId: string,
   traceId: string,
   rating: 'up' | 'down',
+  ratedAgeDays = 0,
 ): Promise<void> {
   await query(
-    `INSERT INTO response_rating (user_id, session_id, message_id, trace_id, rating)
-     VALUES ($1, 's', $2, $3, $4)`,
-    [userId, messageId, traceId, rating],
+    `INSERT INTO response_rating (user_id, session_id, message_id, trace_id, rating, created_at)
+     VALUES ($1, 's', $2, $3, $4, NOW() - make_interval(days => $5))`,
+    [userId, messageId, traceId, rating, ratedAgeDays],
   )
 }
 /** 发布 + 批准一个技能,返回 slug(信号聚合测试的公共前置)。 */
@@ -908,5 +931,90 @@ describe('marketplaceDb (integ)', () => {
 
     const order = (await listApprovedForSearch()).map((c) => c.slug)
     assert.deepEqual(order, ['pop-x', 'pop-y'], 'users30d(2) 排在安装数(1)之前')
+  })
+
+  test('正确性红线:layer=user 事件绝不进市场聚合(usage30d/users30d/rating)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('layer-owner@x.com')
+    const admin = await createUser('layer-admin@x.com')
+    const uA = await createUser('layer-a@x.com')
+    await publishApproved('layer-skill', owner, admin)
+    // hub 层:1 次使用 + 1 个差评归因 turn(样本 1 <5 → rating 本应 null)。
+    const hubTrace = `${'0'.repeat(31)}1`
+    await insertUsage(uA, 'layer-skill', { traceId: hubTrace, layer: 'hub' })
+    await insertRating(uA, 'mh', hubTrace, 'down')
+    // user 层:**同 slug** 5 次使用 + 5 个 up 评分 turn(足以越过 rating 阈值)。
+    // 若聚合未过滤 layer='hub',这些会把 usage30d 抬到 6、把 rating 抬成非 null 的 up 群 —— 全都必须被挡。
+    for (let i = 1; i <= 5; i++) {
+      const t2 = `${'2'.repeat(31)}${i}`
+      await insertUsage(uA, 'layer-skill', { traceId: t2, layer: 'user' })
+      await insertRating(uA, `mu${i}`, t2, 'up')
+    }
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'layer-skill')
+    assert.equal(card?.usage30d, 1, 'user 层 5 次使用不得计入 usage30d')
+    assert.equal(card?.users30d, 1)
+    assert.equal(card?.rating, null, 'user 层 5 个 up 评分不得把样本抬过阈值/污染好评率')
+    const detail = await getListingDetail('layer-skill')
+    assert.equal(detail?.usage30d, 1, 'detail 与卡片同口径:user 层被过滤')
+    assert.equal(detail?.users30d, 1)
+    assert.equal(detail?.rating, null)
+  })
+
+  test('skill-feedback:差评引用 DISTINCT session_key、90 天窗口、layer/用户隔离、total 不截断', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('fb-user@x.com')
+    const other = await createUser('fb-other@x.com')
+    const slug = 'fb-skill'
+    // s1:同会话两条差评(t1a 较老、t1b 较新)→ DISTINCT ON 取最近一条(t1b)。
+    const t1a = `${'1'.repeat(31)}a`
+    const t1b = `${'1'.repeat(31)}b`
+    await insertUsage(u, slug, { sessionKey: 's1', traceId: t1a, layer: 'hub' })
+    await insertRating(u, 'm1a', t1a, 'down', 5)
+    await insertUsage(u, slug, { sessionKey: 's1', traceId: t1b, layer: 'hub' })
+    await insertRating(u, 'm1b', t1b, 'down', 2)
+    // s2:一条差评(1 天前,比 s1 新 → 排序在前)。
+    const t2 = `${'2'.repeat(31)}0`
+    await insertUsage(u, slug, { sessionKey: 's2', traceId: t2, layer: 'hub' })
+    await insertRating(u, 'm2', t2, 'down', 1)
+    // s3:好评 → 不进差评引用。
+    const t3 = `${'3'.repeat(31)}0`
+    await insertUsage(u, slug, { sessionKey: 's3', traceId: t3, layer: 'hub' })
+    await insertRating(u, 'm3', t3, 'up', 0)
+    // s4:差评但评分在 100 天前(窗口外)→ 不进。
+    const t4 = `${'4'.repeat(31)}0`
+    await insertUsage(u, slug, { sessionKey: 's4', traceId: t4, layer: 'hub' })
+    await insertRating(u, 'm4', t4, 'down', 100)
+    // sNull:差评但 session_key=null(无法摘录)→ 不进。
+    const tN = `${'5'.repeat(31)}0`
+    await insertUsage(u, slug, { sessionKey: null, traceId: tN, layer: 'hub' })
+    await insertRating(u, 'mN', tN, 'down', 0)
+    // user 层:同用户同 slug 一条差评 → 只在 layer='user' 查询里出现,不进 hub 查询。
+    const tU = `${'6'.repeat(31)}0`
+    await insertUsage(u, slug, { sessionKey: 'su', traceId: tU, layer: 'user' })
+    await insertRating(u, 'mU', tU, 'down', 0)
+    // 别的用户:同 slug 差评 → 不进本用户查询(user_id 隔离)。
+    const tO = `${'7'.repeat(31)}0`
+    await insertUsage(other, slug, { sessionKey: 'so', traceId: tO, layer: 'hub' })
+    await insertRating(other, 'mO', tO, 'down', 0)
+
+    // hub 层:只应见 s1、s2 两个会话;s2(1 天前)排在 s1(2 天前)之前;s1 取新 trace t1b。
+    const hub = await querySkillFeedbackRefs(getPool(), u, slug, 'hub')
+    assert.equal(hub.total, 2, 'DISTINCT session_key 总数=2(不含好评/窗口外/null/user/他人)')
+    assert.deepEqual(
+      hub.refs.map((r) => r.sessionKey),
+      ['s2', 's1'],
+      '按差评时刻降序:s2 先于 s1',
+    )
+    assert.equal(hub.refs[1].traceId, t1b, 's1 同会话多差评取最近一条的 trace')
+    assert.ok(hub.refs[0].at > hub.refs[1].at, 'at 单调降序')
+
+    // user 层:只见 su 一条。
+    const user = await querySkillFeedbackRefs(getPool(), u, slug, 'user')
+    assert.equal(user.total, 1)
+    assert.deepEqual(user.refs.map((r) => r.sessionKey), ['su'])
+
+    // 空:不存在的 slug → refs:[] total:0。
+    const empty = await querySkillFeedbackRefs(getPool(), u, 'no-such-skill', 'hub')
+    assert.deepEqual(empty, { refs: [], total: 0 })
   })
 })
