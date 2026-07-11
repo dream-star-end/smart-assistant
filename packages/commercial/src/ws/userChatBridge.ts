@@ -93,6 +93,35 @@ import { appendScanSciPaperIntentHintToFrame } from "./paperIntentHint.js";
 /** 桥接路径(只此一个,gateway upgrade 路由按 url.pathname 匹配)。 */
 export const BRIDGE_WS_PATH = "/ws/user-chat-bridge";
 
+/** Strictly recognize the native annotated-edit envelope before bypassing
+ * ordinary Codex precheck/journal plumbing. A loose `imageEdit` presence
+ * check would let malformed client frames evade normal chat billing. */
+export function isValidatedAnnotatedImageInbound(frame: Record<string, unknown>): boolean {
+  if (frame.type !== "inbound.message") return false;
+  const content = frame.content;
+  if (!content || typeof content !== "object") return false;
+  const typedContent = content as { text?: unknown; media?: unknown; imageEdit?: unknown };
+  if (typeof typedContent.text !== "string" || typedContent.text.trim().length === 0) return false;
+  if (!Array.isArray(typedContent.media)) return false;
+  const media = typedContent.media;
+  const edit = typedContent.imageEdit;
+  if (!edit || typeof edit !== "object") return false;
+  const value = edit as Record<string, unknown>;
+  if (typeof value.clientJobId !== "string" || !/^[0-9a-f]{32}$/.test(value.clientJobId)) return false;
+  if (!Number.isInteger(value.width) || Number(value.width) < 1 || Number(value.width) > 8192) return false;
+  if (!Number.isInteger(value.height) || Number(value.height) < 1 || Number(value.height) > 8192) return false;
+  if (Number(value.width) * Number(value.height) > 16_777_216) return false;
+  const indices = [value.sourceIndex, value.maskIndex, value.guideIndex];
+  if (
+    !indices.every((index) => Number.isInteger(index) && Number(index) >= 0 && Number(index) < media.length)
+    || new Set(indices).size !== 3
+  ) return false;
+  return indices.every((index) => {
+    const item = media[Number(index)];
+    return !!item && typeof item === "object" && (item as { kind?: unknown }).kind === "image";
+  });
+}
+
 /** WebSocket close codes(自家私有码段:4000-4999)。 */
 export const CLOSE_BRIDGE = {
   NORMAL: 1000,
@@ -1646,6 +1675,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 把 effectiveModel / 是否 codex 帧 提到外层,后面 codex slot 路径要用
       let effectiveModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
+      let isAnnotatedImageInboundFrame = false;
       // plan v3 G6 早释放(BLOCKER 1):codex inbound 帧的 peer.id,acquire 路径捕获后存
       // codexInboundPeerId,匹配 outbound 终态时用。无 peer.id 即保持 null,降级为 timer 兜底。
       let inboundPeerIdForFrame: string | null = null;
@@ -2048,6 +2078,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // but enrich the master→container frame with a bounded ScanSci PDF
             // usage hint when the user's message is clearly a paper task.
             inboundParsedFrame = appendScanSciPaperIntentHintToFrame(sanitizedParsed);
+            isAnnotatedImageInboundFrame = isValidatedAnnotatedImageInbound(inboundParsedFrame);
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
             turnLogForFrame?.info("user-chat-bridge: inbound turn start", clientTraceFields);
@@ -2091,6 +2122,55 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   - 否则:async acquire → 成功 forward;Busy / 其他 fail → fast-fail error 帧
       //
       // 非 codex 帧 / 没注入 codexBinding / 没 containerId → 直接走下方原同步 forward
+      if (
+        isCodexInboundFrame &&
+        isAnnotatedImageInboundFrame &&
+        containerId !== undefined
+      ) {
+        const inboundParsedCapture = inboundParsedFrame;
+        const turnTraceIdCapture = turnTraceIdForFrame;
+        const turnLogCapture = turnLogForFrame;
+        void (async () => {
+          if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+            bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+              try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
+            }
+            return;
+          }
+          const enrichedParsed = await attachMasterHistoricalMessages(
+            inboundParsedCapture,
+            turnLogCapture,
+          );
+          if (cleaned) return;
+          // Image 2 owns its exact 50-credit reservation inside the trusted
+          // relay. Do not acquire a chat slot, open a Codex journal, or create
+          // a chat Redis reservation for a turn the gateway intentionally
+          // completes without starting Codex. The relay resolves the active
+          // container binding/account independently.
+          const requestId = ensureRequestIdServerSide();
+          const rewrittenObj = {
+            ...enrichedParsed,
+            requestId,
+            traceId: turnTraceIdCapture,
+          };
+          const rewrittenStr = JSON.stringify(rewrittenObj);
+          const rewrittenLen = Buffer.byteLength(rewrittenStr);
+          if (rewrittenLen > maxFrameBytes) {
+            turnLogCapture?.error("user-chat-bridge: rewritten annotated image frame too big", {
+              rewrittenLen, max: maxFrameBytes,
+            });
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`);
+              try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+            }
+            return;
+          }
+          forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+        })();
+        return;
+      }
       if (
         isCodexInboundFrame &&
         containerId !== undefined &&

@@ -644,12 +644,14 @@ export const api = {
       turnstile_bypass: boolean;
       require_email_verified: boolean;
       feature_remote_ssh: boolean;
+      feature_image2: boolean;
       allow_registration: boolean;
     }>(fetch("/api/public/config", { headers: { Accept: "application/json" } })).then((b) => ({
       turnstileSiteKey: b.turnstile_site_key,
       turnstileBypass: b.turnstile_bypass,
       requireEmailVerified: b.require_email_verified,
       featureRemoteSsh: b.feature_remote_ssh,
+      featureImage2: b.feature_image2,
       allowRegistration: b.allow_registration,
     })),
 

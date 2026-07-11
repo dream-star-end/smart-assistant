@@ -120,7 +120,6 @@ export async function handleV3CodexRelayLocal(
     sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown codex relay path' } })
     return
   }
-
   const controller = new AbortController()
   const abort = () => controller.abort()
   req.once('aborted', abort)

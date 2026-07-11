@@ -19,6 +19,28 @@ afterEach(() => {
 });
 
 describe("ZoomableImage 灯箱", () => {
+  test("模型能力切换后圈选入口即时出现和隐藏", () => {
+    const annotate = vi.fn();
+    const { rerender } = render(
+      <MediaSignProvider sign={null} onAnnotate={undefined}>
+        <ZoomableImage src={src} alt="拟合曲线" />
+      </MediaSignProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "圈选区域修改图片" })).not.toBeInTheDocument();
+    rerender(
+      <MediaSignProvider sign={null} onAnnotate={annotate}>
+        <ZoomableImage src={src} alt="拟合曲线" />
+      </MediaSignProvider>,
+    );
+    expect(screen.getByRole("button", { name: "圈选区域修改图片" })).toBeInTheDocument();
+    rerender(
+      <MediaSignProvider sign={null} onAnnotate={undefined}>
+        <ZoomableImage src={src} alt="拟合曲线" />
+      </MediaSignProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "圈选区域修改图片" })).not.toBeInTheDocument();
+  });
+
   const src = "https://example.test/chart.png";
 
   test("缩略态渲染 img + 可访问的放大按钮", () => {
@@ -95,7 +117,7 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
     await waitFor(() => expect(anchorClick).toHaveBeenCalled());
     expect(sign).toHaveBeenCalledTimes(2); // 点击时重签 v2,而不是复用挂载时的 v1
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/media-signed?t=v2");
+    expect((fetchMock.mock.calls as unknown[][])[0]?.[0]).toBe("/api/media-signed?t=v2");
   });
 
   test("本地缓存未过期但服务端 410 → 强制重签一次重试成功", async () => {

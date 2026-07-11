@@ -115,6 +115,7 @@ export type PublicConfig = {
   turnstileBypass: boolean;
   requireEmailVerified: boolean;
   featureRemoteSsh: boolean;
+  featureImage2: boolean;
   allowRegistration: boolean;
 };
 

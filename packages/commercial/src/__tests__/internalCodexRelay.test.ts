@@ -114,6 +114,7 @@ describe('internalCodexRelay path mapping', () => {
       assert.equal(isRelayCredentialFailureStatus(status), false, `${status} should not count as credential failure`)
     }
   })
+
 })
 
 describe('internalCodexRelay handler', () => {
