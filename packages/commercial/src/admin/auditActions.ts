@@ -64,6 +64,9 @@ export const ADMIN_AUDIT_ACTIONS = {
   "alert_rule.ack": { kind: "write", mode: "tx" },
   "alert_outbox.retry": { kind: "write", mode: "best-effort" },
 
+  // ── 自愈体系(v5 selfheal 切片①)—— admin 手动 resolve incident 走 tx fail-closed ─
+  "incident.resolve": { kind: "write", mode: "tx" },
+
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },

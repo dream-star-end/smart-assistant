@@ -61,6 +61,34 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */
 export const PERMANENT_AUDIT_TABLES: readonly string[] = ["admin_audit"] as const;
 
+/**
+ * v5 自愈体系(RFC §7 [解 M-retention])运维业务账本 —— **永久保留(ops-ledger 档)**。
+ *
+ * incident/repair 账本是独立运维业务账本,**不冒充 admin_audit 合规域**(那是人类管理员
+ * 操作留痕),自成 'ops-ledger':为满足"永久可回溯"整链(核心账本 + 进度时间线 + 投递/
+ * 收件人快照)一律不删(repair 量级小,无存储压力)。
+ *
+ * 与 TTL policies(会 DELETE)、PERMANENT_AUDIT_TABLES **三者互斥**,由下方 fail-fast 断言强制:
+ * 任一 ops-ledger 表若被误加进删除政策或与合规永久表重名,resolveRetentionPolicies 抛错拒启。
+ */
+export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
+  "incidents",
+  "codex_repairs",
+  "codex_repair_events",
+  "incident_recipients",
+  "incident_deliveries",
+] as const;
+
+// 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。
+{
+  const overlap = PERMANENT_OPS_LEDGER_TABLES.filter((t) => PERMANENT_AUDIT_TABLES.includes(t));
+  if (overlap.length > 0) {
+    throw new Error(
+      `[auditRetention] ops-ledger 永久表与合规审计永久表重叠: ${overlap.join(",")} — 命名域必须分离`,
+    );
+  }
+}
+
 export const AUDIT_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export interface AuditRetentionSweeperHandle {
@@ -102,10 +130,13 @@ export function resolveRetentionPolicies(overrides?: string): RetentionPolicy[] 
     if (Number.isFinite(days) && days >= 1) p.days = Math.floor(days);
   }
   const resolved = [...map.values()];
-  // fail-fast 断言:永久表绝不允许出现在删除政策里(防未来误加)。
+  // fail-fast 断言:永久表(合规审计 + 运维账本)绝不允许出现在删除政策里(防未来误加)。
   for (const p of resolved) {
     if (PERMANENT_AUDIT_TABLES.includes(p.table)) {
-      throw new Error(`[auditRetentionSweeper] ${p.table} 声明为永久保留,禁止配置删除政策`);
+      throw new Error(`[auditRetentionSweeper] ${p.table} 声明为永久保留(合规审计),禁止配置删除政策`);
+    }
+    if (PERMANENT_OPS_LEDGER_TABLES.includes(p.table)) {
+      throw new Error(`[auditRetentionSweeper] ${p.table} 声明为永久保留(ops-ledger 运维账本),禁止配置删除政策`);
     }
   }
   return resolved;

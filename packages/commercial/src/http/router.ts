@@ -79,6 +79,11 @@ import {
   handleAdminTraceLookup,
 } from './admin/audit.js'
 import {
+  handleAdminListIncidents,
+  handleAdminGetIncident,
+  handleAdminResolveIncident,
+} from './admin/selfheal.js'
+import {
   handleAdminAgentContainerAction,
   handleAdminContainerLogs,
   handleAdminContainersStats,
@@ -795,6 +800,11 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
+    // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
+    // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
+    { method: 'GET', path: '/api/admin/selfheal/incidents', handler: handleAdminListIncidents },
+    { method: 'GET', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminGetIncident },
+    { method: 'POST', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminResolveIncident },
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },

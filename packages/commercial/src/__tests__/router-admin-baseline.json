@@ -128,6 +128,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/incidents",
+    "handler": "handleAdminListIncidents"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/incidents/",
+    "handler": "handleAdminGetIncident"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/incidents/",
+    "handler": "handleAdminResolveIncident"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/pricing",
     "handler": "handleAdminListPricing"
   },
