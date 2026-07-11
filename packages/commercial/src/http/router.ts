@@ -138,6 +138,7 @@ import {
   handleAdminPatchOrgInvoice,
 } from './admin/orgInvoices.js'
 import { dispatchOrgRoute } from './org/routes.js'
+import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import {
   handleAdminAlertsAckRule,
   handleAdminAlertsCreateSilence,
@@ -618,6 +619,11 @@ export function createCommercialHandler(
     // 导致 /api/org/invoice-profile 死路由)。新增任何 method 的 org 路由无需再动 router。
     { method: ANY_METHOD, path: '/api/org', handler: dispatchOrgRoute },
     { method: ANY_METHOD, pathPrefix: '/api/org/', handler: dispatchOrgRoute },
+    // ── 应用连接器(v5 connectors)──
+    // 同 org 模式:ANY_METHOD 通配转发,method/子路由权威收口在 dispatchConnectorsRoute
+    // (handler 内自调 requireAuth;oauth/callback 是浏览器导航例外,身份由 state 行推导)。
+    { method: ANY_METHOD, path: '/api/connectors', handler: dispatchConnectorsRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/connectors/', handler: dispatchConnectorsRoute },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
