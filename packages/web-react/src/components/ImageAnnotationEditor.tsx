@@ -247,6 +247,8 @@ export function ImageAnnotationEditor({
   const [tool, setTool] = useState<Tool>('brush')
   const [brushSize, setBrushSize] = useState(48)
   const [prompt, setPrompt] = useState('')
+  // 发送被点但条件不齐时的引导提示(boss 实测:圈完没写描述,按钮灰着但零解释)。
+  const [submitHint, setSubmitHint] = useState<string | null>(null)
   // 「更多工具」下拉:受控开合(需求 §4)——选完工具/点外部/ESC 都要自动收起,原生 <details>
   // 做不到(选后不收、点外部不收),改受控状态。
   const [toolsOpen, setToolsOpen] = useState(false)
@@ -779,9 +781,25 @@ export function ImageAnnotationEditor({
             </div>
             <button
               type="button"
-              disabled={!canSubmit}
-              onClick={() => void submit()}
-              className="flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              aria-disabled={!canSubmit}
+              onClick={() => {
+                if (canSubmit) {
+                  void submit()
+                  return
+                }
+                if (submitting || historyPending) return
+                // 缺什么提示什么,并把光标送到缺失处(disabled 会吞点击,故用 aria-disabled+守卫)。
+                if (!selectionPresent) {
+                  setSubmitHint('请先在图片上圈选要修改的区域')
+                } else {
+                  setSubmitHint('请先描述想要的修改')
+                  document.getElementById('image-edit-prompt')?.focus()
+                }
+              }}
+              className={cn(
+                'flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90',
+                !canSubmit && 'cursor-not-allowed opacity-40',
+              )}
             >
               {submitting ? (
                 <>
@@ -865,12 +883,20 @@ export function ImageAnnotationEditor({
                 {error}
               </p>
             )}
+            {submitHint && (
+              <p role="status" className="mx-auto w-full max-w-2xl text-center text-[13px] text-amber-300">
+                {submitHint}
+              </p>
+            )}
             <div className="mx-auto flex w-full max-w-2xl items-end gap-2 rounded-2xl bg-white/10 px-3 py-2 backdrop-blur">
               <textarea
                 id="image-edit-prompt"
                 aria-label="希望怎样修改"
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => {
+                  setPrompt(e.target.value)
+                  setSubmitHint(null)
+                }}
                 // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
