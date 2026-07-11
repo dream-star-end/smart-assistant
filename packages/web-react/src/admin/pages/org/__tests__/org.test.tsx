@@ -52,16 +52,18 @@ afterEach(() => {
 describe("OrgPage", () => {
   test("渲染组织卡片 + 开票申请", async () => {
     render(<OrgPage />);
-    // org 卡片 + 发票行都含 Acme
+    // org 卡片 + 发票行都含 Acme;orgs 与 org-invoices 是两个独立 fetch,
+    // 金额断言各自 findBy(await),不假设两份数据同帧渲染。
     expect((await screen.findAllByText(/Acme/)).length).toBeGreaterThan(0);
-    expect(screen.getByText("¥100.00")).toBeTruthy(); // 组织余额 10000 分
-    expect(screen.getByText("¥50.00")).toBeTruthy(); // 开票金额 5000 分
+    expect(await screen.findByText("¥100.00")).toBeTruthy(); // 组织余额 10000 分
+    expect(await screen.findByText("¥50.00")).toBeTruthy(); // 开票金额 5000 分
   });
 
   test("开票走确认 → PATCH { status:issued }", async () => {
     render(<OrgPage />);
-    await screen.findByText("待处理");
-    fireEvent.click(screen.getByRole("button", { name: "开票" }));
+    // 「开票」按钮在发票数据行里(独立 fetch 异步出现),必须 findByRole await——
+    // 「待处理」文案早于数据行出现时 getByRole 会抢跑(满载并行 jsdom 下的既有 flake)。
+    fireEvent.click(await screen.findByRole("button", { name: "开票" }));
     fireEvent.click(await screen.findByRole("button", { name: "确认开票" }));
     await waitFor(() => {
       expect(vi.mocked(adminSend)).toHaveBeenCalledWith("PATCH", "/org-invoices/11", {
