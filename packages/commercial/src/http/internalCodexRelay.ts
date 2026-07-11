@@ -87,6 +87,11 @@ const SAFE_UPSTREAM_REQUEST_HEADERS = new Set([
   'originator',
   'session_id',
   'conversation_id',
+  // Codex 0.144+ uses these headers for within-turn sticky routing and the
+  // Responses Lite request path. They contain routing state/capability only;
+  // broader client-correlation headers intentionally remain blocked.
+  'x-codex-turn-state',
+  'x-openai-internal-codex-responses-lite',
 ])
 
 export interface CodexRelayCtx {
@@ -995,8 +1000,16 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           fallbackAccessToken = null
         }
       }
+      const outgoingHeaders = init.headers instanceof Headers
+        ? init.headers
+        : new Headers(init.headers as HeadersInit)
+      init.headers = outgoingHeaders
       const upstream = await fetchImpl(mappedUrl.url, init)
-      relayLog.info('relay_upstream_response', { status: upstream.status })
+      relayLog.info('relay_upstream_response', {
+        status: upstream.status,
+        forwardedCodexTurnState: outgoingHeaders.has('x-codex-turn-state'),
+        forwardedResponsesLite: outgoingHeaders.has('x-openai-internal-codex-responses-lite'),
+      })
       if (routeContext) {
         if (isRelayCredentialFailureStatus(upstream.status)) {
           void markCredentialFailure(routeContext.credential.id, `http_${upstream.status}`).catch(() => {})
