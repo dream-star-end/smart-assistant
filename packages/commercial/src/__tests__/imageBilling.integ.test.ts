@@ -266,6 +266,72 @@ describe('Image 2 exact billing', () => {
 })
 
 describe('Image 2 relay orchestration', () => {
+  // Regression guard for the R7 "Unsupported content type" 400: the codex backend
+  // /images/edits endpoint only accepts application/json (multipart is rejected)
+  // and has no separate `mask` field — the mask must ride in the image alpha
+  // channel. Assert the REALIZED upstream request form (content-type + JSON body
+  // shape), not merely our intent.
+  for (const shape of ['annotated', 'outpaint'] as const) {
+    test(`sends ${shape} to upstream as application/json with images[{image_url}] and no multipart/mask`, async (t) => {
+      if (skip(t)) return
+      const userId = await user(100n)
+      await addContainer(userId)
+      const tracker = redisTracker()
+      const generated = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#2288cc' } }).png().toBuffer()
+      let captured: { contentType: string | null; body: string; isFormData: boolean } | null = null
+      const handler = makeCodexRelayHandler({
+        identityRepo: repo(userId),
+        db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+        upstreamBaseUrl: 'https://example.test/v1',
+        resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+        fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          // Realize the request exactly as undici would (content-type gets derived
+          // from a FormData body; an explicit header survives for a string body).
+          const realized = new Request(String(input), { method: 'POST', headers: init?.headers, body: init?.body as BodyInit })
+          captured = {
+            contentType: realized.headers.get('content-type'),
+            body: await realized.text(),
+            isFormData: init?.body instanceof FormData,
+          }
+          return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
+        }) as unknown as typeof fetch,
+        pgPool: getPool(),
+        preCheckRedis: tracker.redis,
+        image2Enabled: true,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      const jobId = (shape === 'annotated' ? 'a' : 'b').repeat(32)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json', 'x-openclaude-image-job': jobId },
+          body: shape === 'annotated' ? await annotatedInput(jobId) : await outpaintInput(jobId),
+        })
+        assert.equal(res.status, 200)
+        assert.ok(captured, 'upstream must have been called')
+        const cap = captured!
+        assert.equal(cap.isFormData, false, 'upstream body must not be multipart FormData')
+        assert.equal(cap.contentType, 'application/json', 'upstream content-type must be application/json (multipart is rejected by codex backend)')
+        const parsed = JSON.parse(cap.body) as { model?: string; prompt?: string; n?: number; size?: string; images?: Array<{ image_url?: string }>; mask?: unknown }
+        assert.equal(parsed.model, 'gpt-image-2')
+        assert.equal(typeof parsed.prompt, 'string')
+        assert.equal(parsed.n, 1)
+        assert.equal(typeof parsed.size, 'string')
+        assert.equal(parsed.mask, undefined, 'endpoint has no separate mask field; mask must be baked into the image alpha')
+        assert.equal(parsed.images?.length, 1)
+        const url = parsed.images?.[0]?.image_url ?? ''
+        assert.ok(url.startsWith('data:image/png;base64,'), 'image must be sent as a png data URL')
+        // The image the model receives must carry an alpha channel (transparency =
+        // editable region); without it the endpoint's mask-via-alpha edit is lost.
+        const sent = await sharp(Buffer.from(url.slice('data:image/png;base64,'.length), 'base64')).metadata()
+        assert.equal(sent.hasAlpha, true, 'sent image must have an alpha channel encoding the mask')
+      } finally {
+        await close(server)
+      }
+    })
+  }
+
   test('composites, charges once, survives callback failure, and replays cache without upstream', async (t) => {
     if (skip(t)) return
     const userId = await user(100n)

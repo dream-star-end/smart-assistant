@@ -388,6 +388,33 @@ class ImageUpstreamError extends Error {
   }
 }
 
+/** 把上游图片端点的失败归类成一个稳定、不泄漏原文的机器码,交给 gateway 本地化成
+ * 人话文案(见 server.ts 图片编辑错误分支)。原始 body 从不透传给用户 —— 只依据其中
+ * 的粗粒度关键词判类。5xx / 429 归为瞬时可重试;4xx 归为"请求被拒"的确定性失败。 */
+type ImageUpstreamFailureCode =
+  | 'IMAGE_UPSTREAM_FAILED'
+  | 'IMAGE_UPSTREAM_RATE_LIMITED'
+  | 'IMAGE_UPSTREAM_REJECTED_FORMAT'
+  | 'IMAGE_UPSTREAM_REJECTED_IMAGE'
+  | 'IMAGE_UPSTREAM_REJECTED_MODERATION'
+  | 'IMAGE_UPSTREAM_REJECTED'
+function classifyImageUpstreamFailure(status: number, bytes: Buffer): ImageUpstreamFailureCode {
+  if (status === 429) return 'IMAGE_UPSTREAM_RATE_LIMITED'
+  if (status >= 500) return 'IMAGE_UPSTREAM_FAILED'
+  let body = ''
+  try { body = bytes.toString('utf8').toLowerCase() } catch { body = '' }
+  if (body.includes('content type') || body.includes('content-type')) return 'IMAGE_UPSTREAM_REJECTED_FORMAT'
+  if (body.includes('invalid image') || body.includes('invalid_image') || body.includes('image data') || body.includes('image_file')) return 'IMAGE_UPSTREAM_REJECTED_IMAGE'
+  if (body.includes('moderation') || body.includes('safety') || body.includes('flagged') || body.includes('content_policy')) return 'IMAGE_UPSTREAM_REJECTED_MODERATION'
+  return 'IMAGE_UPSTREAM_REJECTED'
+}
+/** 4xx 归为客户端确定性拒绝(gateway 据此不重试),5xx→503 瞬时,429 保留。 */
+function imageUpstreamClientStatus(code: ImageUpstreamFailureCode, upstreamStatus: number): number {
+  if (code === 'IMAGE_UPSTREAM_RATE_LIMITED') return 429
+  if (code === 'IMAGE_UPSTREAM_FAILED') return upstreamStatus >= 500 ? 503 : 502
+  return 400
+}
+
 /** 上游图片端点非 2xx 时,把响应体前 N 字符投进结构化日志(此前 err 空对象、排查无从下手)。
  * 响应体是上游返回的 error JSON,本不含我方请求的 Authorization;仍防御性脱敏任何形似
  * bearer / sk- 密钥的串,并折叠空白、截断到 500 字符(避免把整个 body 灌进日志)。 */
@@ -962,6 +989,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let outpaintPrepared: Awaited<ReturnType<typeof prepareImageOutpaint>> | null = null
     let annotatedTempDir: string | null = null
     let imageHeavySlot = false
+    // 上游图片失败归类(task 3):非 2xx 分支据 body 前缀判类,catch 里据此选 client
+    // 状态码 + code,gateway 再本地化成人话文案。
+    let imageUpstreamFailureCode: ImageUpstreamFailureCode | null = null
 
     if (isImageRequest) {
       if (activeImageHeavyWork >= 4) {
@@ -1048,14 +1078,30 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             preparedMask = annotatedPrepared.mask
             preparedApi = annotatedPrepared.target.api
           }
-          const form = new FormData()
-          form.set('model', 'gpt-image-2')
-          form.set('prompt', input.prompt.trim())
-          form.set('n', '1')
-          form.set('size', preparedApi)
-          form.set('image', new Blob([new Uint8Array(preparedImage)], { type: 'image/png' }), 'source.png')
-          form.set('mask', new Blob([new Uint8Array(preparedMask)], { type: 'image/png' }), 'mask.png')
-          imageRequestBody = form
+          // 上游 chatgpt.com/backend-api/codex/images/edits 是 codex 后端(非公开
+          // OpenAI multipart 端点):只收 application/json —— multipart 会被 400
+          // {"detail":"Unsupported content type"} 拒(实测 + 生产 egress 日志证实)。
+          // 且该端点不接受独立 `mask` 字段(会被静默忽略),遮罩必须写进图像自身的
+          // alpha 通道(透明=可编辑),与 OpenAI images / codex 原生 image_gen 的
+          // transparency-as-mask 语义一致。preparedMask 的 alpha 已按遮罩合成
+          // (annotated=选区透明,outpaint=外扩带透明,其余不透明),叠到 preparedImage
+          // 的 RGB 上得到带 alpha 遮罩的单张图,以 data URL 送出。
+          const maskAlpha = await sharp(preparedMask).extractChannel(3).raw().toBuffer()
+          const rgb = await sharp(preparedImage).removeAlpha().raw().toBuffer({ resolveWithObject: true })
+          const maskedImage = await sharp(rgb.data, {
+            raw: { width: rgb.info.width, height: rgb.info.height, channels: 3 },
+          })
+            .joinChannel(maskAlpha, { raw: { width: rgb.info.width, height: rgb.info.height, channels: 1 } })
+            .png()
+            .toBuffer()
+          imageRequestBody = JSON.stringify({
+            model: 'gpt-image-2',
+            prompt: input.prompt.trim(),
+            n: 1,
+            size: preparedApi,
+            images: [{ image_url: `data:image/png;base64,${maskedImage.toString('base64')}` }],
+          })
+          imageRequestContentType = 'application/json'
           const upstreamUrl = new URL(mappedUrl.url)
           upstreamUrl.pathname = upstreamUrl.pathname.replace(/\/images\/annotated-edits$/, '/images/edits')
           mappedUrl = { ...mappedUrl, url: upstreamUrl.toString(), upstreamPath: upstreamUrl.pathname }
@@ -1089,7 +1135,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     try {
       const headers = buildUpstreamHeaders(req)
       if (imageRequestContentType) headers.set('content-type', imageRequestContentType)
-      if (isAnnotatedImageRequest || imageRequestBody instanceof FormData) headers.delete('content-type')
+      // 仅 FormData(native imagegen 的 multipart 透传)需删掉容器带来的 content-type,
+      // 让 undici 依据重新序列化的 FormData 生成带 boundary 的 multipart 头。annotated
+      // 与 native-json 都已在上面显式 set application/json,绝不能删 —— 否则上游收不到
+      // content-type 会 400 "Unsupported content type"。
+      if (imageRequestBody instanceof FormData) headers.delete('content-type')
       const init: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = {
         method,
         headers,
@@ -1166,6 +1216,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           // 诊断盲区根治(Task 2):上游非 2xx 把响应体前缀 + 我方送出的关键几何(size)
           // 落结构化日志。requestedSize 命中 annotated/outpaint 的 API 画布串——若 400
           // 由 size/几何触发,这里一眼可见。
+          imageUpstreamFailureCode = classifyImageUpstreamFailure(upstream.status, bytes)
           relayLog.warn('image_upstream_non_2xx', {
             status: upstream.status,
             operation: imageOperation,
@@ -1173,6 +1224,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             imageCount: preflightImageCount,
             requestedSize: annotatedPrepared?.target.api ?? outpaintPrepared?.target.api ?? null,
             imageJobId: annotatedJob?.jobId ?? null,
+            failureCode: imageUpstreamFailureCode,
             bodyPrefix: sanitizeUpstreamErrorBody(bytes),
           })
         }
@@ -1265,8 +1317,12 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       if (err instanceof LedgerInsufficientCreditsError) {
         sendJsonError(res, 402, 'ERR_INSUFFICIENT_CREDITS', err.message, requestId)
       } else if (err instanceof ImageUpstreamError) {
-        const status = err.status === 429 ? 429 : err.status >= 500 ? 503 : 502
-        sendJsonError(res, status, 'IMAGE_UPSTREAM_FAILED', 'Image 2 service is temporarily unavailable', requestId)
+        // 失败原因透传(task 3):把上游失败的粗粒度归类 code 带回,gateway 本地化文案。
+        // 原始 upstream body 不透传(仅入结构化日志),这里只给稳定 code + 安全兜底文案。
+        const code = imageUpstreamFailureCode
+          ?? (err.status === 429 ? 'IMAGE_UPSTREAM_RATE_LIMITED' : err.status >= 500 ? 'IMAGE_UPSTREAM_FAILED' : 'IMAGE_UPSTREAM_REJECTED')
+        const status = imageUpstreamClientStatus(code, err.status)
+        sendJsonError(res, status, code, 'Image 2 upstream request was not accepted', requestId)
       } else {
         sendJsonError(res, 502, 'CODEX_RELAY_UPSTREAM_FAILED', 'codex upstream request failed', requestId)
       }
