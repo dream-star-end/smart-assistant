@@ -161,7 +161,8 @@ export function App() {
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
   const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
-  // AuthGate 初始模式：「登录」入口=login，「免费开始」入口=register，重置链接=reset。
+  // AuthGate 初始模式：「登录」与「免费开始」入口均=login（登录页自带「立即注册」链接，
+  // 新用户不受阻），重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
@@ -1243,7 +1244,8 @@ export function App() {
       <LazyBoundary fallback={<SplashFallback />}>
         <Landing
           onStart={() => {
-            setAuthMode("register");
+            // 「免费开始」入口进登录页（login）：登录页本身有「立即注册」链接，新用户不受阻。
+            setAuthMode("login");
             setView("app");
           }}
           onLogin={() => {

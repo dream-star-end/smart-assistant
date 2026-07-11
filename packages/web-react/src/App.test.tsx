@@ -223,18 +223,49 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect((refreshCall![1] as RequestInit).credentials).toBe('include')
   })
 
-  test('login error surfaces the backend message', async () => {
+  test('login error localizes the backend code to friendly Chinese (no raw English / trace id)', async () => {
+    // 生产实况：后端 message 是英文 "invalid credentials" + x-request-id 头（追踪号来源）。
+    const invalidCreds = {
+      ok: false,
+      status: 401,
+      headers: { get: (h: string) => (h === 'x-request-id' ? '0f0ac9caa' : null) },
+      json: async () => ({ error: { code: 'INVALID_CREDENTIALS', message: 'invalid credentials' } }),
+    }
     fetchMock = vi.fn(async (url: string) =>
-      String(url).includes('/api/public/config')
-        ? PUBLIC_CONFIG
-        : errJson(401, { error: { code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' } }),
-    ) as unknown as FetchMock // refresh 也命中 401 分支 → boot 落 Landing,符合本用例。
+      String(url).includes('/api/public/config') ? PUBLIC_CONFIG : invalidCreds,
+    ) as unknown as FetchMock // refresh 也命中该分支 → boot 落 Landing,符合本用例。
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
     await loginViaUi()
 
+    // 红条展示友好中文；绝不把后端英文 message / 追踪号怼给用户。
     await waitFor(() => expect(screen.getByText('邮箱或密码错误')).toBeInTheDocument())
+    expect(screen.queryByText(/invalid credentials/)).toBeNull()
+    expect(screen.queryByText(/追踪号/)).toBeNull()
+  })
+
+  test('Landing「免费开始」进入登录表单（login，非注册）；新用户经登录页「立即注册」不受阻', async () => {
+    // Bug2：「免费开始」入口从 register 改为 login。登录页自带「立即注册」链接，新用户不受阻。
+    fetchMock = vi.fn(async (url: string) =>
+      String(url).includes('/api/auth/refresh')
+        ? REFRESH_401
+        : String(url).includes('/api/public/config')
+          ? PUBLIC_CONFIG
+          : okJson({}),
+    ) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    // splash → Landing：等「免费开始」CTA 出现再点（nav 按钮为首个匹配）。
+    const start = (await screen.findAllByRole('button', { name: /免费开始/ }))[0]
+    fireEvent.click(start)
+
+    // 进登录表单：有「登录」提交按钮，无「创建账号」按钮（注册表单标志）。
+    await waitFor(() => expect(screen.getByRole('button', { name: /登录/ })).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /创建账号/ })).toBeNull()
+    // 登录页仍提供「立即注册」入口，新用户不受阻。
+    expect(screen.getByRole('button', { name: '立即注册' })).toBeInTheDocument()
   })
 
   test('authenticated send goes through the real WS engine — optimistic user bubble, no SSE/v4 chat', async () => {
