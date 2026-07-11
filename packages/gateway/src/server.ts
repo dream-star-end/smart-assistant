@@ -52,6 +52,7 @@ import { isHostRoutableStaticModel } from './hostStaticProviders.js'
 import {
   parseSkillEvalsJson,
   serializeSkillEvals,
+  type SkillEvalCase,
   type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
@@ -70,6 +71,7 @@ import {
   readAgentsConfig,
   readConfig,
   searchSessions,
+  loadSessionTurns,
   syncMarketplaceHub,
   writeAgentsConfig,
   writeConfig,
@@ -113,6 +115,18 @@ import {
   gradesToAssertions,
   parseGraderJson,
 } from './skillEval.js'
+import { SkillEvalGenJobStore, type SkillEvalGenRun } from './skillEvalGenJobs.js'
+import {
+  MAX_SESSION_EXCERPTS,
+  SESSION_EXCERPT_MAX_CHARS,
+  buildGeneratePrompt,
+  buildGenerationNote,
+  buildSessionExcerpt,
+  buildSessionSearchQuery,
+  finalizeGeneratedCases,
+  selectUsageSessionHits,
+  type GenSessionExcerpt,
+} from './skillEvalGen.js'
 import {
   SKILL_TRAIN_DEFAULT_MODEL,
   SKILL_TRAIN_EFFORT,
@@ -1065,6 +1079,7 @@ export class Gateway {
   // cap). Drafts staged via skill_propose; merge promotes them to the authoritative lib.
   private skillTrainJobs = new SkillTrainJobStore({ maxConcurrent: 2 })
   private skillEvalJobs = new SkillEvalJobStore({ maxConcurrent: 1 })
+  private skillEvalGenJobs = new SkillEvalGenJobStore({ maxConcurrent: 1 })
   private skillDrafts = new SkillDraftStore()
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
@@ -1345,6 +1360,7 @@ export class Gateway {
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
     void this.skillTrainJobs.loadAll(Date.now())
     void this.skillEvalJobs.loadAll(Date.now())
+    void this.skillEvalGenJobs.loadAll(Date.now())
     // P3:技能每日自动回归(严格 opt-in:仅 evals.json 里 autoRegression=true 的技能;
     // 开启入口在管理中心且强制确认每日消耗 —— 平台绝不静默烧用户积分)。
     this._startSkillAutoRegression()
@@ -3084,6 +3100,24 @@ export class Gateway {
     const skillEvalRunMatch = url.pathname.match(/^\/api\/skill-eval\/([a-zA-Z0-9_-]+)$/)
     if (skillEvalRunMatch) {
       this._handleSkillEvalRunStatus(req, res, skillEvalRunMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    // AI 生成用例(P1):启动异步生成 + 轮询状态。skill 名段用 [a-z0-9-]+ 与容器路由 /
+    // bridge allowlist 完全一致(evals 精确路由带 $,不会吞掉 evals/generate)。
+    const skillEvalGenStartMatch = url.pathname.match(
+      /^\/api\/skills\/([a-z0-9-]+)\/evals\/generate$/,
+    )
+    if (skillEvalGenStartMatch) {
+      this._handleSkillEvalGenStart(req, res, skillEvalGenStartMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const skillEvalGenRunMatch = url.pathname.match(/^\/api\/skill-eval-gen\/([a-zA-Z0-9_-]+)$/)
+    if (skillEvalGenRunMatch) {
+      this._handleSkillEvalGenStatus(req, res, skillEvalGenRunMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
       return
@@ -5953,6 +5987,157 @@ export class Gateway {
     if (!run) return this.sendError(res, 404, 'eval run not found')
     if (run.userId !== this.getUserId(req)) return this.sendError(res, 403, 'forbidden')
     this.sendJson(res, 200, { run })
+  }
+
+  // ── P1:AI 生成评测用例(异步 job + 轮询;不落库,只回草稿供编辑器审阅保存)──
+
+  /**
+   * POST /api/skills/:name/evals/generate — 启动一次 AI 生成 run(202 → runId)。
+   *   404 = 技能不存在/平台技能(与训练同权威:includePlatform:false → 平台名解析为 null,
+   *         避免 403/404 变成平台技能目录的存在性 oracle);
+   *   403 = 技能存在但只读(hub/非自建;写不进且会被 sync 覆盖,生成无意义) —— 与 PUT evals
+   *         的可写性门同一权威(store.view(...).writable);
+   *   409 = 同技能已有生成 or 评测在跑(生成/评测互斥,避免并跑扰乱与重复扣费)。
+   */
+  private async _handleSkillEvalGenStart(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const userId = this.getUserId(req)
+
+    // 可写性门(与训练/PUT evals 同权威):includePlatform:false 让平台技能解析为 404,
+    // 用户可写技能才放行;hub/只读技能存在但 writable!==true → 403。
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
+
+    // 生成/评测互斥:同技能不能既生成又评测(各查各 store 的同技能活跃 run)。
+    if (this.skillEvalGenJobs.activeForSkill(skillName) || this.skillEvalJobs.activeForSkill(skillName)) {
+      return this.sendError(res, 409, `a generation or eval for "${skillName}" is already in progress`)
+    }
+    const guard = this.skillEvalGenJobs.canStart(skillName)
+    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start generation')
+
+    const run = await this.skillEvalGenJobs.create({
+      runId: SkillEvalGenJobStore.newRunId(),
+      skillName,
+      userId,
+      model: SKILL_TRAIN_DEFAULT_MODEL,
+      now: Date.now(),
+    })
+    // fire-and-forget:采集素材 → 生成 turn → 归一化落 job;任何异常都收敛为 job failed。
+    void this._runSkillEvalGen(run, {
+      skillMd: skill.rawContent,
+      description: skill.description ?? '',
+    }).catch((err) => {
+      void this.skillEvalGenJobs.finishFailed(run, Date.now(), String(err))
+    })
+    this.sendJson(res, 202, { ok: true, runId: run.runId })
+  }
+
+  /** GET /api/skill-eval-gen/:runId — 生成 run 状态(owner 校验,与评测 run 同语义)。 */
+  private async _handleSkillEvalGenStatus(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const run = this.skillEvalGenJobs.get(runId)
+    if (!run) return this.sendError(res, 404, 'generation run not found')
+    if (run.userId !== this.getUserId(req)) return this.sendError(res, 403, 'forbidden')
+    this.sendJson(res, 200, {
+      status: run.status,
+      ...(run.status === 'done' ? { cases: run.cases } : {}),
+      ...(run.note ? { note: run.note } : {}),
+      usage: run.usage,
+    })
+  }
+
+  /**
+   * 采集该技能近 30 天真实使用会话的摘录(sessionsDb FTS 既有导出,不 spawn CLI):
+   * searchSessions 按 技能名+描述关键词 召回 → 30 天/排除评测训练自身通道过滤 →
+   * loadSessionTurns 取每个会话 ≤1500 字符摘录,至多 5 段。任何 DB 异常都降级为空数组
+   * (无素材 → 仅 SKILL.md 起草)。
+   */
+  private async _collectGenSessionExcerpts(
+    name: string,
+    description: string,
+  ): Promise<GenSessionExcerpt[]> {
+    const query = buildSessionSearchQuery(name, description)
+    if (!query) return []
+    let hits: Awaited<ReturnType<typeof searchSessions>>
+    try {
+      // 多召回一些以吸收 30 天/通道过滤后的损耗。
+      hits = await searchSessions(query, MAX_SESSION_EXCERPTS + 5)
+    } catch {
+      return []
+    }
+    // 近 30 天 + 排除评测/训练/生成自身通道,取至多 N 个候选(纯逻辑,已单测)。
+    const selected = selectUsageSessionHits(hits, Date.now(), MAX_SESSION_EXCERPTS)
+    const out: GenSessionExcerpt[] = []
+    for (const h of selected) {
+      let turns: Awaited<ReturnType<typeof loadSessionTurns>>
+      try {
+        turns = await loadSessionTurns(h.sessionId)
+      } catch {
+        continue
+      }
+      const text = buildSessionExcerpt(turns, SESSION_EXCERPT_MAX_CHARS)
+      if (!text) continue
+      out.push({ title: h.title, text })
+    }
+    return out
+  }
+
+  /** 生成编排:采集素材 → 单个隔离 turn(deepseek,正常计费)→ 宽容解析+归一化+过格式权威。 */
+  private async _runSkillEvalGen(
+    run: SkillEvalGenRun,
+    input: { skillMd: string; description: string },
+  ): Promise<void> {
+    // 现有用例(补充生成的去重锚 + id 归一化避让);读不到按空处理。
+    let existingCases: SkillEvalCase[] = []
+    const store = buildUserSkillStore()
+    const rawEvals = await store
+      .view(run.skillName, 'evals/evals.json', { includePlatform: false })
+      .catch(() => null)
+    if (typeof rawEvals === 'string') {
+      const parsedExisting = parseSkillEvalsJson(rawEvals)
+      if (parsedExisting.ok) existingCases = parsedExisting.file.cases
+    }
+
+    const excerpts = await this._collectGenSessionExcerpts(run.skillName, input.description)
+    const prompt = buildGeneratePrompt({
+      skillName: run.skillName,
+      description: input.description,
+      skillMd: input.skillMd,
+      existingCases,
+      excerpts,
+    })
+
+    // 单 turn 无工具:素材已在 prompt 里,隔离一次性会话(同 _skillEvalTurn 形态,正常计费)。
+    const { text, usage } = await this._skillEvalTurn(
+      `skillevalgen:${run.runId}`,
+      run.userId,
+      prompt,
+      run.model,
+      {},
+    )
+    addUsage(run.usage, usage)
+
+    const finalized = finalizeGeneratedCases(text, existingCases)
+    if (!finalized.ok) {
+      await this.skillEvalGenJobs.finishFailed(run, Date.now(), finalized.error)
+      return
+    }
+    const note = buildGenerationNote({
+      excerptCount: excerpts.length,
+      existingCount: existingCases.length,
+      generatedCount: finalized.cases.length,
+    })
+    await this.skillEvalGenJobs.finishDone(run, Date.now(), { cases: finalized.cases, note })
   }
 
   /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */

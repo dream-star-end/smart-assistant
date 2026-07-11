@@ -62,6 +62,17 @@ export class SkillEvalJobStore {
     return `eval-${randomUUID()}`
   }
 
+  /**
+   * 本 store 内是否有该技能的活跃评测 run。供「生成」侧做同技能互斥查询 —— 只看**同技能**,
+   * 不受全局并发上限干扰(canStart 会把别的技能占满上限也算 false,不适合跨 store 互斥)。
+   */
+  activeForSkill(skillName: string): boolean {
+    for (const r of this.runs.values()) {
+      if (ACTIVE.has(r.status) && r.skillName === skillName) return true
+    }
+    return false
+  }
+
   /** 并发守卫:全局上限 + 同技能不并发(防同一技能两跑互相当噪声)。 */
   canStart(skillName: string): { ok: boolean; reason?: string } {
     let active = 0

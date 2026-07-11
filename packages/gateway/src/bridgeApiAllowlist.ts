@@ -141,6 +141,21 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // P1 AI 生成评测用例:启动(skill 名段 [a-z0-9-]+ 与容器路由一致)+ 状态轮询。
+    // 与 /api/skills/:name/eval-run + /api/skill-eval/:runId 完全对齐(生成不落库,
+    // 只回草稿供编辑器审阅保存,写仍走 PUT /api/skills/:name/evals)。
+    label: '/api/skills/:name/evals/generate',
+    re: /^\/api\/skills\/[a-z0-9-]+\/evals\/generate$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-eval-gen/:runId',
+    re: /^\/api\/skill-eval-gen\/[A-Za-z0-9_-]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/skills/:name/train',
     // skill name segment matches the container route exactly ([a-z0-9-]+) so the
     // bridge gate is no looser than the handler (rejects %2F/%5C/uppercase/dots).
