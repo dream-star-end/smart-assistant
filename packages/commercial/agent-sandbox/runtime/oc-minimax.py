@@ -20,22 +20,45 @@ from urllib import request, error
 
 MASTER_ENV = "OPENCLAUDE_V3_MASTER_BASE_URL"
 TOKEN_ENV = "OPENCLAUDE_V3_CONTAINER_TOKEN"
+# codex 引擎路径 ambient env 会被双重清洗剥掉(gateway buildCodexEnv 剥 OPENCLAUDE_* 前缀 +
+# codex shell 策略剥 *TOKEN* 名),supervisor 每次 boot 把同一对值写进这个文件(entrypoint.ts);
+# env 优先(CCB 路径零变化),文件是 codex 路径的回退通道。
+AUTH_FILE_CANDIDATES = (
+    Path("/home/agent/.openclaude/container-auth.json"),
+    Path.home() / ".openclaude" / "container-auth.json",
+)
 DEFAULT_OUT_DIR = Path("minimax-output")
 
 
-def _endpoint() -> str:
+def _auth() -> tuple[str, str]:
     base = os.environ.get(MASTER_ENV, "").strip().rstrip("/")
     token = os.environ.get(TOKEN_ENV, "").strip()
-    if not base or not token:
-        raise SystemExit(
-            f"MiniMax wrapper requires {MASTER_ENV} and {TOKEN_ENV}; "
-            "this command only works inside OpenClaude commercial containers."
-        )
+    if base and token:
+        return base, token
+    for p in AUTH_FILE_CANDIDATES:
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        base = str(data.get("masterBaseUrl", "")).strip().rstrip("/")
+        token = str(data.get("containerToken", "")).strip()
+        if base and token:
+            return base, token
+    raise SystemExit(
+        f"MiniMax wrapper requires {MASTER_ENV}/{TOKEN_ENV} env or "
+        f"{AUTH_FILE_CANDIDATES[0]}; this command only works inside "
+        "OpenClaude commercial containers."
+    )
+
+
+def _endpoint() -> str:
+    base, _ = _auth()
     return f"{base}/internal/v3/minimax"
 
 
 def _token() -> str:
-    return os.environ.get(TOKEN_ENV, "").strip()
+    _, token = _auth()
+    return token
 
 
 def compact_none(value):
