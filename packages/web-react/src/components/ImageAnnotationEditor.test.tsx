@@ -204,9 +204,11 @@ function stubCanvasPipeline(opts: { selection?: boolean } = {}) {
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x')
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
   const blob = new Blob(['x'], { type: 'image/png' })
+  // 完整 Response 桩:共享流式取字节路径会读 res.headers 的 content-length(缺 headers 抛
+  // TypeError),故补恒返 null 的 headers。
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response),
+    vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null }, blob: async () => blob }) as unknown as Response),
   )
   class FakeImage {
     onload: (() => void) | null = null

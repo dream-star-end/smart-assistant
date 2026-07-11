@@ -19,6 +19,7 @@ import { isIPv4 } from "node:net";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { homedir } from "node:os";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
@@ -28,6 +29,7 @@ import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
+import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
 import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
@@ -1949,6 +1951,27 @@ export async function registerCommercial(
     }
   }
 
+  // 服务端缩略图磁盘缓存 —— 与 mediaSignKey 同生命周期(依赖 signed media 管线)。
+  // 落 OPENCLAUDE_HOME/media-thumb-cache/,启动清零(init)。缺 mediaSignKey → 不装配,
+  // `?w=` 被 handler 忽略回原图(优雅降级)。
+  let thumbnailCache: ThumbnailDiskCache | undefined;
+  if (mediaSignKey) {
+    try {
+      const home = process.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
+      const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
+      await cache.init();
+      thumbnailCache = cache;
+      // eslint-disable-next-line no-console
+      console.log("[commercial] media thumbnail cache ready (startup-cleared)");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", {
+        error: (err as Error)?.message ?? String(err),
+      });
+      thumbnailCache = undefined;
+    }
+  }
+
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
@@ -2394,6 +2417,8 @@ export async function registerCommercial(
     // agentCwds + realpathSync + isFileAllowed) 把权威,master 侧只做 sanity check
     // (isContainerPathAllowed)。
     mediaSignKey,
+    // 服务端缩略图缓存(见 mediaThumbnail.ts):/api/media-signed?w=640|1280 缩 webp。
+    thumbnailCache,
     wechatLiveLinkKey,
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。

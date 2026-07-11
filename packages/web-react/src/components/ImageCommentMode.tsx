@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react'
 import { ArrowUp, Check, Trash2, X } from 'lucide-react'
 import { apiErrorMessage } from '../lib/api'
 import { fetchImageBlobWithResign } from '../lib/chat/media'
+import { useProgressiveImage } from '../lib/chat/useProgressiveImage'
 import { cn } from '../lib/utils'
 import type { ImageCommentSubmit } from './chat/imageEditActions'
 
@@ -32,6 +33,7 @@ export function ImageCommentMode({
   src,
   alt,
   resolveSrc,
+  cacheIdentity,
   canSubmit,
   onBack,
   onSubmit,
@@ -39,6 +41,11 @@ export function ImageCommentMode({
   src: string
   alt: string
   resolveSrc: (opts?: { forceResign?: boolean }) => Promise<string | null>
+  /**
+   * 字节缓存身份(signPath)。传入即让展示图与提交取字节都**零请求复用**查看器/气泡已下载的
+   * 原图字节(共享 LRU 命中),并在原图到达前先铺已缓存缩略图(渐进、禁灰/白屏)。
+   */
+  cacheIdentity?: string | null
   canSubmit: boolean
   onBack: () => void
   onSubmit: (value: ImageCommentSubmit) => Promise<void>
@@ -49,11 +56,27 @@ export function ImageCommentMode({
   const [inputText, setInputText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [loadError, setLoadError] = useState(false)
-  // 展示态 src:重试时重签后更新它,让 <img> 真正换新 URL 重载(此前重试只重签 provider
-  // 缓存却不换 img src,过期裂图点重试无效)。
+  // 直链(data:/blob:/http)裂图只能靠 <img onError> 感知(渐进 hook 对直链是透传不 fetch)。
+  const [imgError, setImgError] = useState(false)
+  // 展示态 src:重试时重签后更新它,让展示管线换新 URL 重载(此前重试只重签 provider
+  // 缓存却不换 src,过期裂图点重试无效)。
   const [displaySrc, setDisplaySrc] = useState(src)
-  useEffect(() => setDisplaySrc(src), [src])
+  useEffect(() => {
+    setDisplaySrc(src)
+    setImgError(false)
+  }, [src])
+  // 展示图收口到渐进 hook:签名 URL 命中共享 LRU 即**零请求复用**查看器/气泡已下载的原图;
+  // miss 时先铺已缓存缩略图做即时预览(禁灰/白屏)再无缝换原图,并汇报百分比。lazy=false:
+  // 查看器打开即可见,立即拉。403/410 由 hook 内部强制重签自愈。
+  const { objectUrl, percent, status, reload } = useProgressiveImage({
+    src: displaySrc,
+    width: null,
+    cacheIdentity,
+    resolveSrc,
+    lazy: false,
+  })
+  const loadError = imgError || status === 'error'
+  const loading = status === 'loading'
 
   const editing = draft != null || editingId != null
 
@@ -119,7 +142,7 @@ export function ImageCommentMode({
       } else {
         // 容器签名 URL / data: / blob: 等非持久源 → 取字节(过期自愈)交 App 上传一次。
         const url = (await resolveSrc()) ?? src
-        const blob = await fetchImageBlobWithResign(url, resolveSrc)
+        const blob = await fetchImageBlobWithResign(url, resolveSrc, { cacheIdentity })
         const file = new File([blob], `${alt?.trim() || 'image'}.png`, { type: blob.type || 'image/png' })
         await onSubmit({ text, sourceFile: file })
       }
@@ -167,7 +190,8 @@ export function ImageCommentMode({
             <button
               type="button"
               onClick={() => {
-                setLoadError(false)
+                setImgError(false)
+                reload()
                 void resolveSrc({ forceResign: true }).then((u) => u && setDisplaySrc(u))
               }}
               className="min-h-10 rounded-full bg-white/10 px-4 text-sm text-white hover:bg-white/20"
@@ -177,13 +201,25 @@ export function ImageCommentMode({
           </div>
         ) : (
           <div className="relative inline-block max-h-full max-w-full">
-            <img
-              src={displaySrc}
-              alt={alt}
-              onError={() => setLoadError(true)}
-              draggable={false}
-              className="max-h-full max-w-full select-none object-contain"
-            />
+            {objectUrl ? (
+              <img
+                src={objectUrl}
+                alt={alt}
+                onError={() => setImgError(true)}
+                draggable={false}
+                className="max-h-full max-w-full select-none object-contain"
+              />
+            ) : (
+              // 冷加载(无任何缓存字节):深色骨架(禁纯白),给锚点层一个可点区域,shimmer 尊重
+              // reduced-motion(oc-img-skeleton CSS 已处理)。
+              <div className="oc-img-skeleton h-64 w-64 max-w-full rounded-lg" aria-hidden />
+            )}
+            {/* 加载中:百分比徽标(命中缓存瞬时 loaded → 不出现)。 */}
+            {loading && (
+              <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full bg-black/60 px-2.5 py-1 text-xs font-medium tabular-nums text-white backdrop-blur">
+                {percent != null ? `${percent}%` : '加载中…'}
+              </div>
+            )}
             {/* 落点层:点空白处新增锚点 */}
             <button
               type="button"
