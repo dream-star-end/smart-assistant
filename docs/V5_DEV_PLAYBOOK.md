@@ -379,6 +379,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 - **admin = web-react 第二 Vite 入口**(`admin.html` + `src/admin/**`,21 页,hash 路由 `#tab=NAME&k=v` 兼容旧深链);URL 仍 `/admin.html`(+`/admin` 302);鉴权 refresh→me→role gate。地基组件权威在 `src/admin/components`(StatCard/ChartCard/DataTable/FilterBar/useAdminPoll/adminApi),页面禁手写内联样式原语。
 - **告警送达不变量**:enqueueAlert 零订阅通道→inbox(uid=1)兜底;critical 恒 inbox 镜像(每 enqueue 至多一次)。shell 侧(monitor/daily/alert-fail)psql 直插 outbox,**判定单一 SQL 权威 = scripts/v5-alert-fanout.sql——改订阅/静默判定必须 TS(alertOutbox.ts)与该 SQL 同改**。注意:企微通道 severity_min=warning 时 info 级(恢复通知/日报)不进企微是订阅语义,非 bug。
 - **坑:undici NO_PROXY 不支持 CIDR**。master 全局 EnvHttpProxyAgent 下,fetch 内网桥接 IP(172.31.0.1)必须 per-request `directEgressDispatcher()` 直连(modelOps 容量面曾因此静默降级 local_fallback);任何新的 master→内网 fetch 同此纪律。
+- **坑:新增 npm 依赖不随 deploy 上线(07-11 实际停机 ~4 分钟)**。deploy-v5.sh rsync 排除 node_modules 且不跑 npm install;批次若加了新依赖(package.json/lock 变更),master 重启即 ERR_MODULE_NOT_FOUND 崩溃循环(实例:连接器批的 imapflow,由后续无关部署首次带上线引爆)。**纪律:合并含 package-lock 变更的批次后、restart 之前,必须 `ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && npm install --no-audit --no-fund'`**;止血=同命令补装后 restart(lockfile 已同步,秒级)。根治债:deploy-v5.sh 检测 package-lock 哈希变化自动补装(见 §5)。
 - **坑:CI commercial-unit 门曾挂死 3 天(07-07~07-10)**。根因=握手测试对"背靠背同步双帧"用逐次 once('message') 取帧,第二帧在无 listener 窗口被 EventEmitter 丢弃→await 永挂→30min 超时 cancelled。**WS 测试等多帧一律用 userChatBridge.test.ts 的 frameCollector 模式**(持久 listener+队列)。诊断法:TAP 停哪个套件之后+零改动探针 PR 定责基线。
 
 ### 0105 模型与服务商运维页(2026-07-06)速记
