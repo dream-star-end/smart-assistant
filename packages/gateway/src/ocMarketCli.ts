@@ -13,20 +13,39 @@
  *   oc-market uninstall <slug>
  *   oc-market publish-skill --slug <s> --name <n> --version <v> --description <d> --body-file <f>
  *     --category <id> --use-cases "a;b" [--outcomes "a;b"] [--intro-file <f>] [--tags a,b]
+ *     [--bundle-dir <dir>] [--benchmark-file <f>] [--visibility org]
  *   oc-market publish-agent --slug <s> --name <n> --version <v> --description <d> --model <m>
  *     --toolsets a,b --persona-file <f> --category <id> --use-cases "a;b"
- *     [--outcomes "a;b"] [--intro-file <f>] [--skill-deps a,b] [--tags a,b]
+ *     [--outcomes "a;b"] [--intro-file <f>] [--skill-deps a,b] [--tags a,b] [--visibility org]
  *
  * Storefront ("人向商品层") metadata carried on publish (validated server-side):
  *   --category <id>       one of the marketplace taxonomy ids (required)
  *   --use-cases "a;b"     1-4 "what the user wants to do" sentences, ';'-separated (required)
  *   --outcomes "a;b"      0-4 concrete "give X → get Y" effect examples, ';'-separated (optional)
  *   --intro-file <f>      Markdown rich intro rendered on the storefront page (optional) → humanMd
+ *
+ * Multi-file skill payload (publish-skill only; server is the final authority):
+ *   --bundle-dir <dir>    collect ALL files under <dir>/{references,assets,evals,scripts}/
+ *                         as the skill's bundle (≤20 files / ≤64KB each / ≤256KB total,
+ *                         limits shared with the server via @openclaude/protocol).
+ *                         SKILL.md body still goes through --body-file.
+ *   --benchmark-file <f>  publisher-reported eval summary JSON:
+ *                         {"withPassRate":0..1,"withoutPassRate":0..1,"cases":1-5}
+ *   --visibility org      publish org-private (requires the user to be an active
+ *                         org member; default public)
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+import {
+  BUNDLE_ALLOWED_PREFIXES,
+  BUNDLE_MAX_FILE_BYTES,
+  BUNDLE_MAX_FILES,
+  BUNDLE_MAX_TOTAL_BYTES,
+  validateBundlePath,
+} from '@openclaude/protocol'
 
 function fail(msg: string): never {
   process.stderr.write(`oc-market: ${msg}\n`)
@@ -117,6 +136,70 @@ export function splitList(raw: string | undefined, sep: ',' | ';'): string[] {
     : []
 }
 
+export interface BundleFileEntry {
+  path: string
+  content: string
+}
+
+/**
+ * 收集 --bundle-dir 下的附属文件:只认 references/ assets/ evals/ scripts/ 四个
+ * 白名单子目录(SKILL.md 正文另走 --body-file)。路径规则与限额同源自
+ * @openclaude/protocol,和服务端一致 —— 预检把所有问题一次说清,而不是打一发
+ * 422 再猜。返回按路径排序,保证同一目录两次发布产物一致。
+ */
+export function collectBundleDir(
+  dir: string,
+  readDir: (p: string) => Array<{ name: string; isDirectory(): boolean; isFile(): boolean }> = (p) =>
+    readdirSync(p, { withFileTypes: true }),
+  readFile: FileReader = readFileSync,
+): { files: BundleFileEntry[]; errors: string[] } {
+  const relPaths: string[] = []
+  const walk = (abs: string, rel: string): void => {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>
+    try {
+      entries = readDir(abs)
+    } catch {
+      return // 白名单子目录不存在/不可读 → 视为没有该类附属文件
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) walk(join(abs, e.name), `${rel}${e.name}/`)
+      else if (e.isFile()) relPaths.push(`${rel}${e.name}`) // symlink 等特殊类型一律忽略
+    }
+  }
+  for (const prefix of BUNDLE_ALLOWED_PREFIXES) walk(join(dir, prefix.replace(/\/$/, '')), prefix)
+  relPaths.sort()
+
+  const errors: string[] = []
+  const files: BundleFileEntry[] = []
+  let total = 0
+  if (relPaths.length === 0) errors.push(`目录下没有可发布的附属文件(只认 ${BUNDLE_ALLOWED_PREFIXES.join(' ')} 子目录)`)
+  if (relPaths.length > BUNDLE_MAX_FILES) errors.push(`附属文件最多 ${BUNDLE_MAX_FILES} 个(实际 ${relPaths.length} 个)`)
+  for (const rel of relPaths) {
+    const pathErr = validateBundlePath(rel)
+    if (pathErr) {
+      errors.push(`${rel}: ${pathErr}`)
+      continue
+    }
+    let content: string
+    try {
+      content = readFile(join(dir, rel), 'utf8')
+    } catch {
+      errors.push(`${rel}: 读取失败`)
+      continue
+    }
+    const bytes = Buffer.byteLength(content, 'utf8')
+    if (bytes > BUNDLE_MAX_FILE_BYTES) {
+      errors.push(`${rel}: 超过单文件上限 ${BUNDLE_MAX_FILE_BYTES / 1024}KB`)
+      continue
+    }
+    total += bytes
+    files.push({ path: rel, content })
+  }
+  if (total > BUNDLE_MAX_TOTAL_BYTES)
+    errors.push(`附属文件总量超过 ${BUNDLE_MAX_TOTAL_BYTES / 1024}KB`)
+  return { files, errors }
+}
+
 export interface PublishSkillRequest {
   kind: 'skill'
   slug?: string
@@ -129,6 +212,9 @@ export interface PublishSkillRequest {
   outcomeExamples: string[]
   humanMd?: string
   body: string
+  files?: BundleFileEntry[]
+  benchmark?: unknown
+  visibility?: 'org'
 }
 
 export interface PublishAgentRequest {
@@ -146,6 +232,7 @@ export interface PublishAgentRequest {
   outcomeExamples: string[]
   humanMd?: string
   persona: string
+  visibility?: 'org'
 }
 
 /**
@@ -158,6 +245,7 @@ export function buildPublishSkillRequest(
   flags: Record<string, string>,
   body: string,
   humanMd?: string,
+  extras?: { files?: BundleFileEntry[]; benchmark?: unknown; visibility?: 'org' },
 ): PublishSkillRequest {
   return {
     kind: 'skill',
@@ -171,6 +259,9 @@ export function buildPublishSkillRequest(
     outcomeExamples: splitList(flags.outcomes, ';'),
     ...(humanMd != null ? { humanMd } : {}),
     body,
+    ...(extras?.files && extras.files.length > 0 ? { files: extras.files } : {}),
+    ...(extras?.benchmark !== undefined ? { benchmark: extras.benchmark } : {}),
+    ...(extras?.visibility ? { visibility: extras.visibility } : {}),
   }
 }
 
@@ -179,6 +270,7 @@ export function buildPublishAgentRequest(
   flags: Record<string, string>,
   persona: string,
   humanMd?: string,
+  extras?: { visibility?: 'org' },
 ): PublishAgentRequest {
   return {
     kind: 'agent',
@@ -195,7 +287,15 @@ export function buildPublishAgentRequest(
     outcomeExamples: splitList(flags.outcomes, ';'),
     ...(humanMd != null ? { humanMd } : {}),
     persona,
+    ...(extras?.visibility ? { visibility: extras.visibility } : {}),
   }
+}
+
+/** --visibility 只认 org(默认公开);别的值直接报错,防手滑静默变公开。 */
+function parseVisibility(raw: string | undefined): 'org' | undefined {
+  if (raw === undefined || raw === 'public') return undefined
+  if (raw === 'org') return 'org'
+  fail(`--visibility 只支持 org 或 public,收到 "${raw}"`)
 }
 
 async function call(
@@ -286,12 +386,32 @@ async function main(): Promise<void> {
     case 'publish-skill': {
       const body = fileArg(flags, 'body-file') ?? flags.body
       if (!body) fail('publish-skill needs --body-file <f>')
+      let files: BundleFileEntry[] | undefined
+      if (flags['bundle-dir']) {
+        const collected = collectBundleDir(flags['bundle-dir'])
+        if (collected.errors.length > 0)
+          fail(`--bundle-dir 预检不通过:\n- ${collected.errors.join('\n- ')}`)
+        files = collected.files
+      }
+      let benchmark: unknown
+      const benchRaw = fileArg(flags, 'benchmark-file')
+      if (benchRaw !== undefined) {
+        try {
+          benchmark = JSON.parse(benchRaw)
+        } catch {
+          fail('--benchmark-file 不是合法 JSON')
+        }
+      }
       out(
         await call(
           'POST',
           'publish',
           undefined,
-          buildPublishSkillRequest(flags, body, fileArg(flags, 'intro-file')),
+          buildPublishSkillRequest(flags, body, fileArg(flags, 'intro-file'), {
+            files,
+            benchmark,
+            visibility: parseVisibility(flags.visibility),
+          }),
         ),
       )
       return
@@ -304,7 +424,9 @@ async function main(): Promise<void> {
           'POST',
           'publish',
           undefined,
-          buildPublishAgentRequest(flags, persona, fileArg(flags, 'intro-file')),
+          buildPublishAgentRequest(flags, persona, fileArg(flags, 'intro-file'), {
+            visibility: parseVisibility(flags.visibility),
+          }),
         ),
       )
       return
