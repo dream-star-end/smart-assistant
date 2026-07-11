@@ -347,6 +347,43 @@ describe('compileSpec', () => {
     }
   })
 
+  test('identity:probeActionId=已声明 read action + pointer 合法 → 通过并签进 contract', () => {
+    const spec = baseSpec()
+    spec.identity = { probeActionId: 'get_page', accountKeyPointer: '/id', accountHintPointer: '/name' }
+    const { execContract } = compileSpec(spec, baseDecision())
+    assert.deepEqual((execContract as Record<string, unknown>).identity, {
+      probeActionId: 'get_page',
+      accountKeyPointer: '/id',
+      accountHintPointer: '/name',
+    })
+  })
+
+  test('identity:probeActionId 指向不存在的 action → IDENTITY_INVALID', () => {
+    const spec = baseSpec()
+    spec.identity = { probeActionId: 'nope', accountKeyPointer: '/id' }
+    assert.throws(() => compileSpec(spec, baseDecision()), isCode('IDENTITY_INVALID'))
+  })
+
+  test('identity:probeActionId 指向 write action → IDENTITY_INVALID', () => {
+    const spec = baseSpec()
+    // 追加一个未签 safe-read-non-get 的 POST(effect=write)。
+    ;(spec.actions as Record<string, unknown>[]).push({
+      id: 'do_write',
+      description: 'a write',
+      request: { method: 'POST', pathTemplate: '/v1/write' },
+      params: { type: 'object', additionalProperties: false },
+      result: { type: 'object', additionalProperties: false },
+    })
+    spec.identity = { probeActionId: 'do_write', accountKeyPointer: '/id' }
+    assert.throws(() => compileSpec(spec, baseDecision()), isCode('IDENTITY_INVALID'))
+  })
+
+  test('identity:accountKeyPointer 污染段 → IDENTITY_INVALID', () => {
+    const spec = baseSpec()
+    spec.identity = { probeActionId: 'get_page', accountKeyPointer: '/__proto__' }
+    assert.throws(() => compileSpec(spec, baseDecision()), isCode('IDENTITY_INVALID'))
+  })
+
   test('credentialPipeline:cacheKey 字段被 schema strict 拒', () => {
     const spec = baseSpec()
     ;(spec.credentialPipeline as Record<string, unknown>).nodes = [

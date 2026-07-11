@@ -165,6 +165,20 @@ function normalizeAudience(a: CredentialAudiencePolicyT): CredentialAudiencePoli
 
 // ─── request 校验(transform 前;pathTemplate 深层安全) ──────────────────────
 
+/** identity 的 JSON pointer(指向 probe 结果):以 / 开头、无控制符、段不得为污染键。 */
+function assertResultPointer(ptr: string): void {
+  if (!ptr.startsWith('/'))
+    throw new ConnectorSpecError('IDENTITY_INVALID', 'result pointer must start with /')
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally block CRLF/control
+  if (/[\x00-\x1f\x7f]/.test(ptr))
+    throw new ConnectorSpecError('IDENTITY_INVALID', 'control char in result pointer')
+  for (const seg of ptr.split('/').slice(1)) {
+    const unescaped = seg.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (POLLUTION_KEYS.has(unescaped))
+      throw new ConnectorSpecError('IDENTITY_INVALID', 'pollution segment in result pointer')
+  }
+}
+
 function validatePath(path: string, paramsSchema: unknown): void {
   if (!path.startsWith('/')) throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'must start with /')
   if (path.includes('//'))
@@ -453,6 +467,25 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
     }
   })
 
+  // identity probe(可选,§bind):probeActionId 必须是已声明 read action;pointer 段拒污染/控制符
+  // (schema 已保证 ^/ + 有界)。identity 随 spec 签进 contract → bind 服务单一权威。
+  if (spec.identity !== undefined) {
+    const probe = execActions.find((a) => a.id === spec.identity?.probeActionId)
+    if (probe === undefined)
+      throw new ConnectorSpecError(
+        'IDENTITY_INVALID',
+        `identity probeActionId '${spec.identity.probeActionId}' has no action`,
+      )
+    if (probe.effect !== 'read')
+      throw new ConnectorSpecError(
+        'IDENTITY_INVALID',
+        `identity probe action '${probe.id}' must be read effect (got ${probe.effect})`,
+      )
+    assertResultPointer(spec.identity.accountKeyPointer)
+    if (spec.identity.accountHintPointer !== undefined)
+      assertResultPointer(spec.identity.accountHintPointer)
+  }
+
   // ⑤ 组装 ExecContract + hash
   const execContract: ExecContractT = {
     spec_hash: specHash,
@@ -467,6 +500,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       : {}),
     credentialPipeline: spec.credentialPipeline,
     actions: execActions,
+    ...(spec.identity !== undefined ? { identity: spec.identity } : {}),
   }
 
   // 自校验(编程错误 fail-closed)。

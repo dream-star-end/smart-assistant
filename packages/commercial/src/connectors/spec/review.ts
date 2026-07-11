@@ -221,11 +221,27 @@ export interface LoadContractOptions {
  * + 未 revoke + contract/sig 齐全 + hash 自洽 + 验签通过(kind 用 DB 事实)+
  * security_policy_version ≥ 策略下限 → 返回 ExecContract;任一不满足 → 抛 fail-closed 错误。
  */
-export async function loadVerifiedContract(
+/** 载入验签后的 contract + 绑定所需的 DB 事实(slug/versionId/hash)——bind/execute 的 pin 用。 */
+export interface VerifiedContract {
+  contract: ExecContractT
+  /** listing slug(= connections.provider 声明式取值,DB 权威)。 */
+  slug: string
+  versionId: number
+  /** exec_contract_hash 的 hex(= canonicalSha256Hex(contract),已与存列比对自洽)。 */
+  execContractHash: string
+  authContractVersion: number
+}
+
+/**
+ * 与 loadVerifiedContract 同一套 4 闸(kind=connector / security_approved / 未 revoke /
+ * hash 自洽 + 验签 + policy 下限),但**多返回** slug/versionId/hash 供三表 pin。
+ * loadVerifiedContract 是它的薄封装(只取 .contract),保证闸门单一权威。
+ */
+export async function loadVerifiedContractWithMeta(
   versionId: number,
   pool: Pool,
   opts: LoadContractOptions = {},
-): Promise<ExecContractT> {
+): Promise<VerifiedContract> {
   // P0-1:下限只能抬高,传入值绝不能把它压到 CURRENT 以下。
   const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
   const env = opts.env ?? process.env
@@ -302,5 +318,20 @@ export async function loadVerifiedContract(
   if (!ok)
     throw new ConnectorSpecError('SIGNATURE_INVALID', 'contract signature verification failed')
 
-  return execContract as ExecContractT
+  return {
+    contract: execContract as ExecContractT,
+    slug: row.slug,
+    versionId,
+    execContractHash: recomputedHash,
+    authContractVersion: (execContract as ExecContractT).auth_contract_version,
+  }
+}
+
+/** 薄封装:只取验签后的 contract(不需要 DB 事实的调用方用它)。 */
+export async function loadVerifiedContract(
+  versionId: number,
+  pool: Pool,
+  opts: LoadContractOptions = {},
+): Promise<ExecContractT> {
+  return (await loadVerifiedContractWithMeta(versionId, pool, opts)).contract
 }

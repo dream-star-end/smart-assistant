@@ -27,6 +27,8 @@ const strict = { additionalProperties: false } as const
 /** connector slug / builtin id / slot id 通用形状。 */
 const Slug = Type.String({ pattern: '^[a-z][a-z0-9-]{1,63}$' })
 const ActionId = Type.String({ pattern: '^[a-z][a-z0-9_-]{0,63}$' })
+/** JSON Pointer(RFC6901,以 / 开头)→ 指向 identity probe **结果**里的字段;运行期解析兜底。 */
+const ResultPointer = Type.String({ minLength: 1, maxLength: 256, pattern: '^/' })
 const SlotId = Type.String({ pattern: '^[a-z][a-z0-9-]{1,63}$' })
 /** 内置 transform/operation 具名 id(白名单校验在编译器)。 */
 const BuiltinId = Type.String({ pattern: '^[a-z][a-z0-9-]{1,63}$' })
@@ -365,6 +367,22 @@ export const ConnectorActionSpec = Type.Object(
 )
 export type ConnectorActionSpecT = Static<typeof ConnectorActionSpec>
 
+/**
+ * identity probe 声明(bind 时验证凭据有效 + 派生账号身份)。account 身份是**签进 contract**
+ * 的作者声明(单一权威):bind 服务执行 probeActionId 这个 read action → 从结果按
+ * accountKeyPointer 取稳定账号标识(computeAccountKey 输入,唯一索引/重绑依赖它),
+ * 按 accountHintPointer(可选)取展示 hint。probeActionId 必须是已声明的 read action。
+ */
+export const ConnectorIdentity = Type.Object(
+  {
+    probeActionId: ActionId,
+    accountKeyPointer: ResultPointer,
+    accountHintPointer: Type.Optional(ResultPointer),
+  },
+  strict,
+)
+export type ConnectorIdentityT = Static<typeof ConnectorIdentity>
+
 export const ConnectorSpec = Type.Object(
   {
     id: Slug,
@@ -384,6 +402,7 @@ export const ConnectorSpec = Type.Object(
     originMode: OriginMode,
     credentialPipeline: CredentialPipeline,
     actions: Type.Array(ConnectorActionSpec, { minItems: 1, maxItems: 64 }),
+    identity: Type.Optional(ConnectorIdentity),
   },
   strict,
 )
@@ -438,6 +457,7 @@ export const ExecContract = Type.Object(
     tokenOutputs: Type.Optional(TokenOutputs),
     credentialPipeline: CredentialPipeline,
     actions: Type.Array(ExecAction, { minItems: 1 }),
+    identity: Type.Optional(ConnectorIdentity),
   },
   strict,
 )
@@ -479,6 +499,7 @@ export type ConnectorSpecErrorCode =
   | 'AUDIENCE_MISSING'
   | 'BAD_PATH_TEMPLATE'
   | 'BAD_PATH_PLACEHOLDER'
+  | 'IDENTITY_INVALID'
   | 'RESERVED_HEADER'
   | 'BAD_PLACEMENT'
   | 'BUILTIN_NOT_ALLOWED'
