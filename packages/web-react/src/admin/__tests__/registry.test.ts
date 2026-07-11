@@ -14,15 +14,15 @@ const EXPECTED: Record<string, string[]> = {
   运行资源: ["containers", "hosts"],
   财务与商业: ["ledger", "orders", "pricing", "plans", "org", "modelGrants"],
   用户触达: ["feedback", "inbox", "marketplace"],
-  系统运营: ["literature", "settings", "audit", "health", "alerts"],
+  系统运营: ["literature", "settings", "audit", "health", "alerts", "selfheal"],
 };
 
 describe("registry 完整性", () => {
-  test("恰好 21 个页面，key 无重复", () => {
-    expect(adminPages).toHaveLength(21);
+  test("恰好 22 个页面，key 无重复", () => {
+    expect(adminPages).toHaveLength(22);
     const keys = adminPages.map((p) => p.key);
-    expect(new Set(keys).size).toBe(21);
-    expect(adminTabKeys.size).toBe(21);
+    expect(new Set(keys).size).toBe(22);
+    expect(adminTabKeys.size).toBe(22);
   });
 
   test("每个 key 都存在且分组正确", () => {
@@ -39,8 +39,8 @@ describe("registry 完整性", () => {
     expect(ADMIN_GROUP_ORDER).toEqual(Object.keys(EXPECTED));
     expect(adminGroups.map((g) => g.group)).toEqual(ADMIN_GROUP_ORDER);
     const flat = adminGroups.flatMap((g) => g.pages.map((p) => p.key));
-    expect(flat).toHaveLength(21);
-    expect(new Set(flat).size).toBe(21);
+    expect(flat).toHaveLength(22);
+    expect(new Set(flat).size).toBe(22);
   });
 
   test("每页有标题/描述/图标/懒组件", () => {
