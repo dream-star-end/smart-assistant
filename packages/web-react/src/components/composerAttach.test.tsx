@@ -58,3 +58,36 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
     expect(screen.queryByLabelText("重试上传 c.txt")).toBeNull();
   });
 });
+
+describe("AttachChip（对话框上传图的「编辑」入口 —— 需求 §5 可点回归）", () => {
+  const imageAttach = {
+    id: "img-0",
+    name: "photo.png",
+    size: 2048,
+    kind: "image" as const,
+    status: "done" as const,
+    previewUrl: "blob:preview-photo",
+  };
+
+  test("已传成功的图 + onAnnotate → 渲染可点「编辑」按钮,点击回调触发", () => {
+    const onAnnotate = vi.fn();
+    render(<AttachChip a={imageAttach} onRemove={() => {}} onAnnotate={onAnnotate} />);
+    const btn = screen.getByRole("button", { name: "编辑图片 photo.png" });
+    expect(btn).toBeEnabled();
+    fireEvent.click(btn);
+    expect(onAnnotate).toHaveBeenCalledTimes(1);
+  });
+
+  test("不可编辑(仅 annotateDisabledReason)→ 按钮渲染但禁用,原因入 title", () => {
+    render(
+      <AttachChip
+        a={imageAttach}
+        onRemove={() => {}}
+        annotateDisabledReason="当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型"
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "编辑图片 photo.png" });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("title", "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型");
+  });
+});

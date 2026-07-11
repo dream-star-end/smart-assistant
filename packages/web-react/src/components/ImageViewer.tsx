@@ -1,32 +1,33 @@
 /**
  * 全屏沉浸图片查看器(替代 ZoomableImage 的内联灯箱)。全屏黑底,顶栏 X/更多/下载/分享,
- * 底部 编辑/评论/调整大小/移除 四动作圆钮。四模式为查看器内 `mode` 状态,非四个独立 Dialog:
- *   view    → 默认浏览态
+ * 底部 编辑/评论/调整大小 三动作圆钮(「移除」按 boss 判定下线)。三模式为查看器内 `mode`
+ * 状态,非三个独立 Dialog:
+ *   view    → 默认浏览态(加载中亮深色 shimmer 骨架,禁纯白/白闪)
  *   edit    → 复用 ImageAnnotationEditor(笔刷圈选,核心逻辑不动)
  *   comment → ImageCommentMode(数字锚点,客户端合成 annotated 三件套)
  *   resize  → ImageResizeMode(五比例 outpaint)
  *
- * 与 App 的接线:submitImageEdit / onRemoveImage 经 ImageEditActionsContext 从 App 下传
- * (单一权威 = chat/imageEditActions.tsx,由 agent P 在 App 挂 Provider 注入语义)。签名逻辑
- * 不在此复制,由 ZoomableImage(media.tsx)下传 src/alt/signPath/get/peek —— 「点击时签名权威」
- * 铁律(下载/分享/进编辑前都用 get() 现签,禁冻结挂载态 URL)。
+ * 与 App 的接线:submitImageEdit 经 ImageEditActionsContext 从 App 下传(单一权威 =
+ * chat/imageEditActions.tsx,其存在即"可否编辑"的唯一判定)。签名逻辑不在此复制,由
+ * ZoomableImage(media.tsx)下传 src/alt/signPath/get/peek —— 「点击时签名权威」铁律
+ * (下载/分享/进编辑前都用 get() 现签,禁冻结挂载态 URL;编辑器取图再有 403/410 重签兜底)。
  */
 import * as Dialog from '@radix-ui/react-dialog'
-import { useContext, useEffect, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import {
   ArrowUpRight,
   Download,
   Link2,
-  Loader2,
   MessageCircle,
   MoreHorizontal,
   Pencil,
   Scaling,
   Share2,
-  Trash2,
   X,
 } from 'lucide-react'
 import { nativeDownload, openInNewTab } from '../lib/chat/download'
+import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
+import { cn } from '../lib/utils'
 import { ImageAnnotationEditor, type ImageAnnotationSource } from './ImageAnnotationEditor'
 import { ImageEditActionsContext, type ImageEditSubmit } from './chat/imageEditActions'
 import { ImageCommentMode } from './ImageCommentMode'
@@ -46,16 +47,18 @@ const MAX_PIXELS = 16_777_216 // 4096²,与编辑器一致
  * 取签名 URL 的图片字节并解码。返回原始 blob(source 上传用)+ 已解码 image + 自然尺寸 +
  * revoke(调用方用完 image 后释放 objectURL —— 释放前 image 必须已 drawImage/normalize 完毕)。
  */
-export async function loadImageBytes(url: string): Promise<{
+export async function loadImageBytes(
+  url: string,
+  resolveSrc?: ResolveSignedSrc,
+): Promise<{
   blob: Blob
   image: HTMLImageElement
   naturalWidth: number
   naturalHeight: number
   revoke: () => void
 }> {
-  const res = await fetch(url, { credentials: 'include' })
-  if (!res.ok) throw new Error(`读取图片失败 (${res.status})`)
-  const blob = await res.blob()
+  // 取字节收口到共享 helper:403/410(签名过期)时强制重签一次再试(过期 URL 入口自愈)。
+  const blob = await fetchImageBlobWithResign(url, resolveSrc)
   const objUrl = URL.createObjectURL(blob)
   const image = new Image()
   try {
@@ -151,9 +154,9 @@ function ActionButton({
 }
 
 /**
- * §4 契约:{open,onOpenChange,src,alt,signPath,get,peek,submitImageEdit,onRemove}。
- * submitImageEdit/onRemove 允许经 props 直传,缺省则回落 ImageEditActionsContext
- * —— media.tsx 调用点在 :265-312 窗口内不便新增 hook,故经 context 从 App 供给。
+ * §4 契约:{open,onOpenChange,src,alt,signPath,get,peek,submitImageEdit,initialMode}。
+ * submitImageEdit 允许经 prop 直传,缺省回落 ImageEditActionsContext(App 供给)。
+ * initialMode='edit' → 开图即直接进圈选编辑器(聊天缩略图左下角「编辑」浮钮的直达入口)。
  */
 export function ImageViewer({
   open,
@@ -164,7 +167,7 @@ export function ImageViewer({
   get,
   peek,
   submitImageEdit: submitProp,
-  onRemove: onRemoveProp,
+  initialMode = 'view',
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -174,19 +177,30 @@ export function ImageViewer({
   get: (opts?: { forceResign?: boolean }) => Promise<string | null>
   peek: () => string | null
   submitImageEdit?: (value: ImageEditSubmit) => void | Promise<void>
-  onRemove?: (signPath: string) => void
+  /** 开图即进入的模式;'edit' = 直达圈选编辑器(左下角「编辑」浮钮用)。默认 'view'。 */
+  initialMode?: ViewerMode
 }) {
   const ctx = useContext(ImageEditActionsContext)
   const submitImageEdit = submitProp ?? ctx.submitImageEdit
-  const onRemove = onRemoveProp ?? ctx.onRemoveImage
-  // 移除仅对有容器路径(生成图/可签图)的图片开放;直链无 signPath 无从隐藏。
-  const canRemove = !!onRemove && !!signPath
 
   const [mode, setMode] = useState<ViewerMode>('view')
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
   const [moreOpen, setMoreOpen] = useState(false)
-  const [removeConfirm, setRemoveConfirm] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [imgLoaded, setImgLoaded] = useState(false)
+  // initialMode='edit' 时开图直达编辑:每次开图只触发一次(ref 守卫),避免编辑器关闭回
+  // view 后又被重新拉回 edit。
+  const autoEditRef = useRef(false)
+
+  const enterEdit = async () => {
+    // 进编辑前现签,避免编辑器 fetch 到过期 URL(编辑器内再有 403/410 重签兜底)。
+    const url = (await get()) ?? src
+    setEditSource({ url, name: alt || '图片' })
+    setMode('edit')
+  }
+
+  // src 变化(freshSrc 回填 / 换图)→ 重新亮骨架,直到新图 onLoad。
+  useEffect(() => setImgLoaded(false), [src])
 
   // 关闭时复位:回浏览态,清 edit source / 浮层 —— 下次开图是干净初始态。
   useEffect(() => {
@@ -194,10 +208,19 @@ export function ImageViewer({
       setMode('view')
       setEditSource(null)
       setMoreOpen(false)
-      setRemoveConfirm(false)
       setNotice(null)
+      setImgLoaded(false)
+      autoEditRef.current = false
+      return
     }
-  }, [open])
+    // 开图直达编辑(需求 §3):enterEdit 内部现签,不依赖 freshSrc 是否已回填。
+    if (initialMode === 'edit' && !autoEditRef.current && submitImageEdit) {
+      autoEditRef.current = true
+      void enterEdit()
+    }
+    // enterEdit 故意不入 deps:它每渲染重建但捕获当帧 get/src,ref 守卫保证每次开图只跑一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, initialMode])
 
   const flash = (text: string) => {
     setNotice(text)
@@ -274,13 +297,6 @@ export function ImageViewer({
       }
     }
     openInNewTab(url)
-  }
-
-  const enterEdit = async () => {
-    // 进编辑前现签,避免编辑器 fetch 到过期 URL。
-    const url = (await get()) ?? src
-    setEditSource({ url, name: alt || '图片' })
-    setMode('edit')
   }
 
   const editDisabledReason = submitImageEdit ? undefined : '当前模型不支持图片编辑'
@@ -392,17 +408,29 @@ export function ImageViewer({
                   </div>
                 </header>
 
-                {/* 图片居中 */}
-                <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden px-4">
+                {/* 图片居中:加载中亮深色 shimmer 骨架(禁纯白/白闪),onLoad 后淡入。 */}
+                <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-4">
+                  {!imgLoaded && (
+                    <span
+                      aria-hidden
+                      className="oc-img-skeleton absolute inset-6 rounded-xl"
+                    />
+                  )}
                   <img
                     src={src}
                     alt={alt}
-                    className="max-h-full max-w-full object-contain"
+                    decoding="async"
+                    onLoad={() => setImgLoaded(true)}
+                    onError={() => setImgLoaded(true)}
+                    className={cn(
+                      'max-h-full max-w-full object-contain transition-opacity duration-200',
+                      imgLoaded ? 'opacity-100' : 'opacity-0',
+                    )}
                     draggable={false}
                   />
                 </div>
 
-                {/* 底部动作条:编辑 / 评论 / 调整大小 / 移除 */}
+                {/* 底部动作条:编辑 / 评论 / 调整大小(「移除」已按 boss 判定下线)。 */}
                 <div className="flex shrink-0 items-start justify-center gap-3 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:gap-6">
                   <ActionButton
                     label="编辑"
@@ -425,13 +453,6 @@ export function ImageViewer({
                     reason={editDisabledReason}
                     onClick={() => setMode('resize')}
                   />
-                  <ActionButton
-                    label="移除"
-                    icon={<Trash2 size={20} />}
-                    disabled={!canRemove}
-                    reason="此图片不可移除"
-                    onClick={() => setRemoveConfirm(true)}
-                  />
                 </div>
               </>
             )}
@@ -447,35 +468,6 @@ export function ImageViewer({
               </div>
             )}
 
-            {/* 移除确认弹层 */}
-            {removeConfirm && (
-              <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 px-6">
-                <div className="w-full max-w-xs rounded-2xl bg-neutral-900 p-5 text-center shadow-float">
-                  <p className="text-sm font-semibold text-white">移除这张图片？</p>
-                  <p className="mt-1.5 text-xs text-white/60">仅从当前对话隐藏，不影响已生成的记录。</p>
-                  <div className="mt-4 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setRemoveConfirm(false)}
-                      className="min-h-11 flex-1 rounded-xl bg-white/10 text-sm font-medium text-white hover:bg-white/20"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setRemoveConfirm(false)
-                        if (onRemove && signPath) onRemove(signPath)
-                        onOpenChange(false)
-                      }}
-                      className="min-h-11 flex-1 rounded-xl bg-danger text-sm font-semibold text-white hover:opacity-90"
-                    >
-                      移除
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -485,6 +477,7 @@ export function ImageViewer({
       <ImageAnnotationEditor
         source={editSource}
         open={open && mode === 'edit'}
+        resolveSrc={get}
         onOpenChange={(o) => {
           if (!o) setMode('view')
         }}

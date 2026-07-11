@@ -8,8 +8,10 @@
  * 410/403 → 强制重签一次再试。禁止任何交互路径冻结挂载时的旧 URL。
  */
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import { ImageEditActionsContext } from "./imageEditActions";
 import { MediaSignProvider, SignedFileCard, ZoomableImage } from "./media";
 
 afterEach(() => {
@@ -19,26 +21,28 @@ afterEach(() => {
 });
 
 describe("ZoomableImage 灯箱", () => {
-  test("模型能力切换后圈选入口即时出现和隐藏", () => {
-    const annotate = vi.fn();
-    const { rerender } = render(
-      <MediaSignProvider sign={null} onAnnotate={undefined}>
-        <ZoomableImage src={src} alt="拟合曲线" />
-      </MediaSignProvider>,
-    );
-    expect(screen.queryByRole("button", { name: "圈选区域修改图片" })).not.toBeInTheDocument();
-    rerender(
-      <MediaSignProvider sign={null} onAnnotate={annotate}>
-        <ZoomableImage src={src} alt="拟合曲线" />
-      </MediaSignProvider>,
-    );
-    expect(screen.getByRole("button", { name: "圈选区域修改图片" })).toBeInTheDocument();
-    rerender(
-      <MediaSignProvider sign={null} onAnnotate={undefined}>
-        <ZoomableImage src={src} alt="拟合曲线" />
-      </MediaSignProvider>,
-    );
-    expect(screen.queryByRole("button", { name: "圈选区域修改图片" })).not.toBeInTheDocument();
+  // 编辑入口的显隐单一权威 = ImageEditActionsContext.submitImageEdit(image2 门控)。
+  const withEdit = (node: ReactNode, canEdit: boolean) => (
+    <ImageEditActionsContext.Provider value={canEdit ? { submitImageEdit: vi.fn() } : {}}>
+      <MediaSignProvider sign={null}>{node}</MediaSignProvider>
+    </ImageEditActionsContext.Provider>
+  );
+
+  test("可编辑时缩略图左下角出现「编辑」入口,不可编辑时隐藏", () => {
+    const { rerender } = render(withEdit(<ZoomableImage src={src} alt="拟合曲线" />, false));
+    expect(screen.queryByRole("button", { name: "编辑图片" })).not.toBeInTheDocument();
+    rerender(withEdit(<ZoomableImage src={src} alt="拟合曲线" />, true));
+    expect(screen.getByRole("button", { name: "编辑图片" })).toBeInTheDocument();
+    rerender(withEdit(<ZoomableImage src={src} alt="拟合曲线" />, false));
+    expect(screen.queryByRole("button", { name: "编辑图片" })).not.toBeInTheDocument();
+  });
+
+  test("点「编辑」→ 直接开全屏查看器并进入圈选编辑器(需求 §3 单一入口)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response));
+    render(withEdit(<ZoomableImage src={src} alt="拟合曲线" />, true));
+    fireEvent.click(screen.getByRole("button", { name: "编辑图片" }));
+    // 不经「先进查看器再点编辑」——直接落到圈选编辑器。
+    expect(await screen.findByRole("button", { name: "关闭图片编辑器" })).toBeInTheDocument();
   });
 
   const src = "https://example.test/chart.png";
@@ -57,10 +61,11 @@ describe("ZoomableImage 灯箱", () => {
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
     // 全屏查看器展示大图(缩略图 + 查看器两张同 alt)。
     expect(screen.getAllByAltText("拟合曲线").length).toBeGreaterThanOrEqual(2);
-    // 底部四动作条(圆钮 + 中文标签)。
-    for (const label of ["编辑", "评论", "调整大小", "移除"]) {
+    // 底部三动作条(圆钮 + 中文标签;「移除」已下线)。
+    for (const label of ["编辑", "评论", "调整大小"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
+    expect(screen.queryByRole("button", { name: "移除" })).not.toBeInTheDocument();
     // 「新标签打开原图」逃生口收进更多菜单。
     fireEvent.click(screen.getByRole("button", { name: "更多" }));
     expect(screen.getByRole("button", { name: /新标签打开原图/ })).toBeInTheDocument();

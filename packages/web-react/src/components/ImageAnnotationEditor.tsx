@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
 import { cn } from '../lib/utils'
 
 export type ImageAnnotationSource = { url: string; name?: string }
@@ -129,11 +130,18 @@ export function ImageAnnotationEditor({
   open,
   onOpenChange,
   onSubmit,
+  resolveSrc,
 }: {
   source: ImageAnnotationSource | null
   open: boolean
   onOpenChange: (open: boolean) => void
   onSubmit: (value: ImageAnnotationExport) => Promise<void>
+  /**
+   * 点击时签名权威:取图 fetch 若被服务端裁决 403/410(签名过期),用它强制重签一次再试
+   * (对齐仓内「手势时刻取媒体禁冻结挂载态 URL」铁律)。签名图(聊天缩略图 → 全屏查看器
+   * 编辑)必传;本地 objectURL(composer 附件)无过期概念,省略。
+   */
+  resolveSrc?: ResolveSignedSrc
 }) {
   const visibleRef = useRef<HTMLCanvasElement>(null)
   const maskRef = useRef<HTMLCanvasElement | null>(null)
@@ -160,6 +168,10 @@ export function ImageAnnotationEditor({
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // 取图失败(过期/网络/容器冷启)专用态:与 submit 失败(error 底部提示)分开 —— loadError
+  // 时画布尚未画上任何东西,必须用**满画布错误面板 + 重试**覆盖,永不留纯白画布(需求 §1)。
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
   const [revision, setRevision] = useState(0)
   const [historyPending, setHistoryPending] = useState(false)
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
@@ -198,15 +210,15 @@ export function ImageAnnotationEditor({
     setLoading(true)
     setHistoryPending(false)
     setError(null)
+    setLoadError(null)
     setPrompt('')
     setView({ scale: 1, x: 0, y: 0 })
     historyRef.current = []
     redoRef.current = []
     const generation = ++generationRef.current
-    void fetch(source.url, { credentials: 'include' })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`读取图片失败 (${response.status})`)
-        const blob = await response.blob()
+    // 取字节收口到 fetchImageBlobWithResign:403/410 强制重签一次再试(过期 URL 入口自愈)。
+    void fetchImageBlobWithResign(source.url, resolveSrc)
+      .then(async (blob) => {
         const url = URL.createObjectURL(blob)
         try {
           const image = new Image()
@@ -254,7 +266,7 @@ export function ImageAnnotationEditor({
           URL.revokeObjectURL(url)
         }
       })
-      .catch((err) => !cancelled && setError((err as Error).message))
+      .catch((err) => !cancelled && setLoadError((err as Error).message || '图片加载失败'))
       .finally(() => !cancelled && setLoading(false))
     return () => {
       cancelled = true
@@ -272,7 +284,7 @@ export function ImageAnnotationEditor({
       imageRef.current = null
       sourceBlobRef.current = null
     }
-  }, [open, source, render])
+  }, [open, source, render, resolveSrc, reloadKey])
 
   const restore = useCallback(
     async (blob: Blob) => {
@@ -606,6 +618,25 @@ export function ImageAnnotationEditor({
               <div className="absolute inset-0 z-20 flex items-center justify-center text-white/80">
                 <Loader2 className="animate-spin" />
                 &nbsp;正在打开图片…
+              </div>
+            )}
+            {/* 取图失败 → 满画布错误面板(覆盖白底画布)+ 重试;永不留纯白画布(需求 §1)。 */}
+            {loadError && !loading && (
+              <div
+                role="alert"
+                className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 px-6 text-center"
+              >
+                <p className="max-w-xs text-sm text-white/85">{loadError}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoadError(null)
+                    setReloadKey((k) => k + 1)
+                  }}
+                  className="flex min-h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-white transition-colors hover:bg-white/20"
+                >
+                  <RotateCcw size={16} /> 重试
+                </button>
               </div>
             )}
             <div className="absolute left-2 top-1/2 z-10 -translate-y-1/2">

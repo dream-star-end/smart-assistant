@@ -1,9 +1,10 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
-import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, WandSparkles, X } from "lucide-react";
+import { ArrowUp, FileText, Loader2, Mic, Pencil, Plus, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { appUpdate } from "../lib/appUpdate";
+import { useImageEditActions } from "./chat/imageEditActions";
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -46,8 +47,6 @@ export function Composer({
   prefill,
   repoSelection,
   onOpenRepo,
-  onAnnotateImage,
-  image2UnavailableReason,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
@@ -65,10 +64,10 @@ export function Composer({
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
   onOpenRepo?: () => void;
-  /** Open the precise Image 2 editor for a locally selected attachment. */
-  onAnnotateImage?: (source: { url: string; name?: string }) => void;
-  image2UnavailableReason?: string;
 }) {
+  // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
+  // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
+  const { annotate, annotateUnavailableReason } = useImageEditActions();
   const [value, setValue] = useState("");
   // 指针类型:粗指针(触屏/移动)下 Enter=换行(否则打不出多段消息),发送交给按钮;
   // 细指针(桌面鼠标)下 Enter=发送。指针类型运行期几乎不变,挂载读一次即可;
@@ -257,11 +256,13 @@ export function Composer({
                   a.status === "error" && a.file ? () => void uploadOne(a.id, a.file as File) : undefined
                 }
                 onAnnotate={
-                  a.kind === "image" && a.previewUrl && a.status === "done" && onAnnotateImage
-                    ? () => onAnnotateImage({ url: a.previewUrl as string, name: a.name })
+                  a.kind === "image" && a.previewUrl && a.status === "done" && annotate
+                    ? () => annotate({ url: a.previewUrl as string, name: a.name })
                     : undefined
                 }
-                annotateDisabledReason={a.kind === "image" && a.status === "done" ? image2UnavailableReason : undefined}
+                annotateDisabledReason={
+                  a.kind === "image" && a.status === "done" ? annotateUnavailableReason : undefined
+                }
               />
             ))}
           </div>
@@ -448,11 +449,12 @@ export function AttachChip({
           type="button"
           onClick={onAnnotate}
           disabled={!onAnnotate}
-          aria-label={`圈选修改 ${a.name}`}
-          title={annotateDisabledReason ?? "圈选修改 · Image 2"}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35"
+          aria-label={`编辑图片 ${a.name}`}
+          title={annotateDisabledReason ?? "编辑 · Image 2"}
+          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
         >
-          <WandSparkles size={15} />
+          <Pencil size={14} />
+          编辑
         </button>
       )}
       <button

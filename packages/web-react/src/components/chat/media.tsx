@@ -6,10 +6,11 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Download, FileText, RotateCcw, WandSparkles, X } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
+import { useImageEditActions } from "./imageEditActions";
 import {
   downloadPercent,
   formatBytes,
@@ -35,23 +36,20 @@ type MediaSignCtx = {
   invalidate: (path: string) => void;
   /** 同步读缓存:有未过期条目回 URL,否则 null(不触发签名)。点击手势内的快路径用 —— 锚点原生导航前校正 href。 */
   peek: (path: string) => string | null;
-  annotate: ((source: { url: string; name?: string }) => void) | null;
 };
 
-const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null, annotate: null };
+const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null };
 const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
   sign,
   authKey,
-  onAnnotate,
   children,
 }: {
   sign: SignFn | null;
   // P5 fix(Codex):商业签名 URL 是 5min bearerless、token 内含 user/path。同浏览器换账号后
   // 旧账号 signed URL 不能命中(隐私)。authKey 随登录用户变化(登出→null),变即清缓存。
   authKey?: string | number | null;
-  onAnnotate?: (source: { url: string; name?: string }) => void;
   children: React.ReactNode;
 }) {
   // 缓存与 inflight 跨重渲存活；sign 或 authKey 变化（登录态/账号切换）时重置。
@@ -106,15 +104,10 @@ export function MediaSignProvider({
       const hit = cacheRef.current.get(path);
       return hit && hit.expiresAt > Date.now() ? hit.url : null;
     },
-    annotate: null,
   });
 
-  const contextValue = useMemo(
-    () => ({ ...ctxRef.current, annotate: onAnnotate ?? null }),
-    [onAnnotate],
-  );
-
-  return <Ctx.Provider value={contextValue}>{children}</Ctx.Provider>;
+  // ctxRef.current 跨重渲稳定(内部读 ref,不闭包 props),直接下传即可。
+  return <Ctx.Provider value={ctxRef.current}>{children}</Ctx.Provider>;
 }
 
 /**
@@ -200,10 +193,13 @@ function useFreshSignedUrl(src: string | null | undefined): {
 }
 
 /**
- * 可放大图片(共享灯箱):点击开全屏预览(2026-07-07 boss 反馈"agent 响应的图表
- * 不支持放大")。覆盖 assistant 响应里图片的两条渲染路径 —— markdown 行内 <img>
- * (SignedImg)与媒体附件卡(MediaItem image)。灯箱内提供"新标签打开原图"
- * (移动端可借浏览器原生缩放细看图表)。Composer 的附件灯箱是上传预览语义,独立保留。
+ * 可放大图片(共享灯箱 + 编辑入口):点击开全屏查看器(2026-07-07 boss 反馈"agent 响应的
+ * 图表不支持放大")。覆盖 assistant 响应里图片的两条渲染路径 —— markdown 行内 <img>
+ * (SignedImg)与媒体附件卡(MediaItem image)。左下角常驻「编辑」胶囊(需求 §3):点击=
+ * **直接开全屏查看器并进入圈选编辑器**(不是先进查看器再点),桌面 hover 现、移动端常显;
+ * 仅在当前可编辑(image2 门控:ImageEditActionsContext.submitImageEdit 存在)时出现,不再
+ * 与右下角浮钮双入口并存。加载中亮深色 shimmer 骨架(禁纯白/白闪,需求 §2)。
+ * Composer 的附件灯箱是上传预览语义,独立保留。
  */
 export function ZoomableImage({
   src,
@@ -221,19 +217,31 @@ export function ZoomableImage({
   signPath?: string | null;
 }) {
   const [open, setOpen] = useState(false);
-  const { annotate } = useContext(Ctx);
+  // 开图即进编辑与否:左下角「编辑」按钮 → true;放大按钮 → false。
+  const [editOnOpen, setEditOnOpen] = useState(false);
+  // 缩略图字节是否已就绪(骨架 → 图 的切换门)。src 变化(重签/换图)重新亮骨架。
+  const [thumbLoaded, setThumbLoaded] = useState(false);
+  useEffect(() => setThumbLoaded(false), [src]);
+  // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
+  // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
+  const canEdit = !!useImageEditActions().submitImageEdit;
   const { get, peek } = useFreshSignedUrl(signPath ?? null);
   // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死;
-  // 缩略图有字节缓存看不出,但灯箱大图/新标签是新请求,必须现签)。
+  // 缩略图有字节缓存看不出,但灯箱大图/新标签/进编辑是新请求,必须现签)。
   const [freshSrc, setFreshSrc] = useState<string | null>(null);
   const display = freshSrc ?? src;
+  const signFresh = () => {
+    if (signPath) void get().then((u) => u && setFreshSrc(u));
+  };
+  const openViewer = (edit: boolean) => {
+    setEditOnOpen(edit);
+    setOpen(true);
+    signFresh();
+  };
+  // ImageViewer 的 onOpenChange(用户 X/Esc/遮罩关闭)回调。
   const handleOpenChange = (o: boolean) => {
     setOpen(o);
-    if (o && signPath) {
-      void get().then((u) => {
-        if (u) setFreshSrc(u);
-      });
-    }
+    if (o) signFresh();
   };
   return (
     <>
@@ -241,29 +249,42 @@ export function ZoomableImage({
         <button
           type="button"
           aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
-          onClick={() => handleOpenChange(true)}
-          className="block max-w-full cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+          onClick={() => openViewer(false)}
+          className="relative block max-w-full cursor-zoom-in overflow-hidden rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
         >
-          <img src={src} alt={alt} loading="lazy" onError={onError} className={imgClassName} />
+          <img
+            src={src}
+            alt={alt}
+            loading="lazy"
+            decoding="async"
+            onLoad={() => setThumbLoaded(true)}
+            onError={(e) => {
+              // 先兜底解除骨架(裂图也不留骨架),再把 onError 交给上游(签名重签)。
+              setThumbLoaded(true);
+              onError?.(e);
+            }}
+            className={cn(imgClassName, !thumbLoaded && "absolute inset-0 h-full w-full opacity-0")}
+          />
+          {/* 加载中:深色 shimmer 骨架撑占位(禁纯白);加载后由 <img> 接管尺寸。 */}
+          {!thumbLoaded && (
+            <span aria-hidden className="oc-img-skeleton block h-40 w-64 max-w-full rounded-lg" />
+          )}
         </button>
-        {annotate && (
+        {canEdit && (
           <button
             type="button"
-            aria-label="圈选区域修改图片"
-            title="圈选修改 · Image 2"
-            onClick={() => {
-              const start = async () => annotate({ url: signPath ? (await get()) ?? src : src, name: alt || "图片" });
-              void start();
-            }}
-            className="absolute bottom-2 right-2 flex min-h-11 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs font-medium text-white shadow-float backdrop-blur transition-opacity hover:bg-black/85 sm:min-h-9 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
+            aria-label="编辑图片"
+            title="编辑 · Image 2"
+            onClick={() => openViewer(true)}
+            className="absolute bottom-2 left-2 flex min-h-11 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs font-medium text-white shadow-float backdrop-blur transition-opacity hover:bg-black/85 sm:min-h-9 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
           >
-            <WandSparkles size={15} />圈选修改
+            <Pencil size={15} />编辑
           </button>
         )}
       </span>
-      {/* 全屏沉浸查看器(替代旧内联灯箱):四模式 编辑/评论/调整大小/移除。
-          签名不在此复制,下传 get/peek(点击时签名权威);submit/remove 由 App 经
-          ImageEditActionsContext 供给。display=开灯箱时现签的最新 URL。 */}
+      {/* 全屏沉浸查看器(替代旧内联灯箱):三模式 编辑/评论/调整大小。签名不在此复制,
+          下传 get/peek(点击时签名权威);submit 由 App 经 ImageEditActionsContext 供给。
+          display=开灯箱时现签的最新 URL;initialMode=左下角「编辑」直达编辑器。 */}
       <ImageViewer
         open={open}
         onOpenChange={handleOpenChange}
@@ -272,6 +293,7 @@ export function ZoomableImage({
         signPath={signPath ?? null}
         get={get}
         peek={peek}
+        initialMode={editOnOpen ? "edit" : "view"}
       />
     </>
   );

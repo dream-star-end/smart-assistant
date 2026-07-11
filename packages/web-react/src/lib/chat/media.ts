@@ -55,3 +55,35 @@ function guessMime(kind: MediaKind): string {
       return "application/octet-stream";
   }
 }
+
+/** 点击时签名权威:交互那一刻解析/重签签名 URL(过期自动重签;forceResign 强制)。 */
+export type ResolveSignedSrc = (opts?: { forceResign?: boolean }) => Promise<string | null>;
+
+/**
+ * 取图字节 + 过期自愈 —— 图片编辑三入口(编辑/评论/调整大小)共用的取字节收口。
+ *
+ * 先 fetch 传入 url;若服务端裁决 403/410(签名失效/过期,本地缓存钟可能还认为没过期)
+ * 且有 resolveSrc,则**强制重签一次**再 fetch —— 服务端裁决优先于本地钟(对齐仓内
+ * 「点击手势取媒体入口禁冻结挂载态 URL」+ SignedImg/useSignedDownload 的 410/403 重签铁律)。
+ * 任一 fetch 非 2xx(且无可重签路径或重签后仍失败)→ 抛错,调用方转**显式错误态**(danger
+ * 文案 + 重试),永不把过期/失败静默吞成留白画布。
+ *
+ * credentials:'include' —— /api/media-signed 是同源端点,带 cookie 兜底(signed token
+ * 已自证身份,cookie 只是 CDN drop token 场景的第二保险)。
+ */
+export async function fetchImageBlobWithResign(
+  url: string,
+  resolveSrc?: ResolveSignedSrc,
+): Promise<Blob> {
+  let target = url;
+  let res = await fetch(target, { credentials: "include" });
+  if ((res.status === 403 || res.status === 410) && resolveSrc) {
+    const resigned = await resolveSrc({ forceResign: true });
+    if (resigned) {
+      target = resigned;
+      res = await fetch(target, { credentials: "include" });
+    }
+  }
+  if (!res.ok) throw new Error(`读取图片失败 (${res.status})`);
+  return res.blob();
+}
