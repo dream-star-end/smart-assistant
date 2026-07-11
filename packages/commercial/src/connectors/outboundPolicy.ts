@@ -218,6 +218,35 @@ export function assertHostnameShape(hostname: string): void {
   }
 }
 
+/**
+ * 规范化 https origin → `https://host:port`（**单一权威**:编译器 audience 归一化与 driver
+ * 目标 origin 归一化共用本函数,保证逐字节一致——否则 audience 精确匹配会漏判/误判,是凭据
+ * 流向不变量的安全前提）。https-only、禁 userinfo/path/query/fragment、host 小写、禁尾点/`..`/`*`、
+ * 非 IP 字面量(经 assertHostnameShape)。失败抛 ConnectorError('OUTBOUND_BLOCKED');编译器可 catch
+ * 后转成自己的 spec 错误类型。
+ */
+export function normalizeHttpsOrigin(raw: string): string {
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    throw new ConnectorError('OUTBOUND_BLOCKED', 'unparsable origin')
+  }
+  if (u.protocol !== 'https:') throw new ConnectorError('OUTBOUND_BLOCKED', 'origin must be https')
+  if (u.username !== '' || u.password !== '')
+    throw new ConnectorError('OUTBOUND_BLOCKED', 'userinfo not allowed in origin')
+  if ((u.pathname !== '' && u.pathname !== '/') || u.search !== '' || u.hash !== '')
+    throw new ConnectorError('OUTBOUND_BLOCKED', 'origin must have no path/query/fragment')
+  const host = u.hostname
+  if (host !== host.toLowerCase())
+    throw new ConnectorError('OUTBOUND_BLOCKED', 'origin host must be lowercase')
+  if (host.endsWith('.') || host.includes('..') || host.includes('*'))
+    throw new ConnectorError('OUTBOUND_BLOCKED', 'malformed origin host')
+  assertHostnameShape(host) // 非 IP 字面量 + DNS 形状
+  const port = u.port || '443'
+  return `https://${host}:${port}`
+}
+
 export interface ValidatedWebdavBase {
   /** 规范化 origin(https://host[:port],默认端口省略)。 */
   origin: string

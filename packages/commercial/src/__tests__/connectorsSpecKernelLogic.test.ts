@@ -296,6 +296,57 @@ describe('compileSpec', () => {
     }
   })
 
+  test('path 占位符引用未声明 params 字段 → BAD_PATH_PLACEHOLDER', () => {
+    const spec = baseSpec()
+    ;(spec.actions as Record<string, unknown>[])[0].request = {
+      method: 'GET',
+      pathTemplate: '/v1/pages/{/params/pageId}',
+    }
+    // params schema 未声明 pageId
+    ;(spec.actions as Record<string, unknown>[])[0].params = {
+      type: 'object',
+      additionalProperties: false,
+    }
+    assert.throws(() => compileSpec(spec, baseDecision()), isCode('BAD_PATH_PLACEHOLDER'))
+  })
+
+  test('path 占位符引用已声明 params 字段 → 通过', () => {
+    const spec = baseSpec()
+    ;(spec.actions as Record<string, unknown>[])[0].request = {
+      method: 'GET',
+      pathTemplate: '/v1/pages/{/params/pageId}',
+    }
+    ;(spec.actions as Record<string, unknown>[])[0].params = {
+      type: 'object',
+      additionalProperties: false,
+      properties: { pageId: { type: 'string' } },
+      required: ['pageId'],
+    }
+    // 不抛即通过
+    compileSpec(spec, baseDecision())
+  })
+
+  test('path 占位符非 /params/<顶层字段>(嵌套/非 params)→ BAD_PATH_PLACEHOLDER', () => {
+    for (const pathTemplate of [
+      '/v1/pages/{/params/a/b}', // 嵌套
+      '/v1/pages/{/credential/token}', // 越权指向凭据
+      '/v1/pages/{pageId}', // 非 pointer
+    ]) {
+      const spec = baseSpec()
+      ;(spec.actions as Record<string, unknown>[])[0].request = { method: 'GET', pathTemplate }
+      ;(spec.actions as Record<string, unknown>[])[0].params = {
+        type: 'object',
+        additionalProperties: false,
+        properties: { pageId: { type: 'string' }, a: { type: 'object' } },
+      }
+      assert.throws(
+        () => compileSpec(spec, baseDecision()),
+        isCode('BAD_PATH_PLACEHOLDER'),
+        pathTemplate,
+      )
+    }
+  })
+
   test('credentialPipeline:cacheKey 字段被 schema strict 拒', () => {
     const spec = baseSpec()
     ;(spec.credentialPipeline as Record<string, unknown>).nodes = [

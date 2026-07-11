@@ -15,6 +15,7 @@
  */
 
 import { Value } from '@sinclair/typebox/value'
+import { normalizeHttpsOrigin } from '../outboundPolicy.js'
 import { canonicalSha256Hex } from './canonical.js'
 import {
   AUTH_SCHEMAS,
@@ -131,25 +132,14 @@ function firstError(schema: Parameters<typeof Value.Errors>[0], v: unknown): str
 // ─── origin 规范化(fixed-reviewed) ─────────────────────────────────────────
 
 /** 精确 https origin+port;禁 userinfo/path/query/非https/大小写/尾点/`..`/wildcard。 */
+// origin 归一化走 outboundPolicy 的**单一权威** normalizeHttpsOrigin(与 driver 逐字节一致);
+// 仅把出站错误类型换成 spec 上下文的 BAD_ORIGIN(含 IP 字面量拒:audience origin 必须是 DNS 域)。
 function normalizeOrigin(raw: string): string {
-  let u: URL
   try {
-    u = new URL(raw)
-  } catch {
-    throw new ConnectorSpecError('BAD_ORIGIN', `unparsable origin: ${raw}`)
+    return normalizeHttpsOrigin(raw)
+  } catch (e) {
+    throw new ConnectorSpecError('BAD_ORIGIN', e instanceof Error ? e.message : `bad origin: ${raw}`)
   }
-  if (u.protocol !== 'https:') throw new ConnectorSpecError('BAD_ORIGIN', 'origin must be https')
-  if (u.username || u.password) throw new ConnectorSpecError('BAD_ORIGIN', 'userinfo not allowed')
-  if (u.pathname !== '/' && u.pathname !== '')
-    throw new ConnectorSpecError('BAD_ORIGIN', 'path not allowed in origin')
-  if (u.search || u.hash) throw new ConnectorSpecError('BAD_ORIGIN', 'query/fragment not allowed')
-  const host = u.hostname
-  if (host !== host.toLowerCase())
-    throw new ConnectorSpecError('BAD_ORIGIN', 'host must be lowercase')
-  if (host.endsWith('.') || host.includes('..') || host.includes('*'))
-    throw new ConnectorSpecError('BAD_ORIGIN', 'malformed host')
-  const port = u.port || '443'
-  return `https://${host}:${port}`
 }
 
 function normalizeAudience(a: CredentialAudiencePolicyT): CredentialAudiencePolicyT {
@@ -175,7 +165,7 @@ function normalizeAudience(a: CredentialAudiencePolicyT): CredentialAudiencePoli
 
 // ─── request 校验(transform 前;pathTemplate 深层安全) ──────────────────────
 
-function validatePath(path: string): void {
+function validatePath(path: string, paramsSchema: unknown): void {
   if (!path.startsWith('/')) throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'must start with /')
   if (path.includes('//'))
     throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'no // (host injection)')
@@ -187,6 +177,35 @@ function validatePath(path: string): void {
     throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'no control chars/CRLF')
   if (/(^|\/)\.\.(\/|$)/.test(path))
     throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'no .. segment')
+  // path 占位符 `{<json-pointer>}`:每个必须是 `/params/<顶层标量字段>` 且该字段在 params schema
+  // 已声明(编译期拦截拼错/越权指针,driver 运行期兜底 fail-closed 前置到这里,§3 path 参数)。
+  const props =
+    paramsSchema !== null &&
+    typeof paramsSchema === 'object' &&
+    typeof (paramsSchema as { properties?: unknown }).properties === 'object'
+      ? ((paramsSchema as { properties: Record<string, unknown> }).properties ?? {})
+      : {}
+  const declared = new Set(Object.keys(props))
+  for (const m of path.matchAll(/\{([^}]*)\}/g)) {
+    const ptr = m[1] ?? ''
+    const mm = /^\/params\/([^/]+)$/.exec(ptr)
+    if (mm === null)
+      throw new ConnectorSpecError(
+        'BAD_PATH_PLACEHOLDER',
+        `path placeholder must be {/params/<field>}: got {${ptr}}`,
+      )
+    const field = decodeURIComponent(mm[1]!.replace(/~1/g, '/').replace(/~0/g, '~'))
+    if (!declared.has(field) || field === '__proto__' || field === 'constructor')
+      throw new ConnectorSpecError(
+        'BAD_PATH_PLACEHOLDER',
+        `path placeholder /params/${field} not a declared params field`,
+      )
+  }
+  // 花括号必须成对(防残留 `{` / `}`)
+  const open = (path.match(/\{/g) ?? []).length
+  const close = (path.match(/\}/g) ?? []).length
+  if (open !== close)
+    throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'unbalanced {} in path template')
 }
 
 // ─── placement 判别联合的跨字段校验(§3.3) ─────────────────────────────────
@@ -403,7 +422,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       if (b !== undefined && !BUILTIN_ALLOWLIST.has(b))
         throw new ConnectorSpecError('BUILTIN_NOT_ALLOWED', `builtin '${b}' not in allowlist`)
     }
-    validatePath(a.request.pathTemplate)
+    validatePath(a.request.pathTemplate, a.params)
     // usesSlot 必须存在 + api audience + 该 slot 的 authMode 与 connector authMode 一致(§3.4,P1-5④)。
     if (a.usesSlot !== undefined) {
       const node = slotById.get(a.usesSlot)
