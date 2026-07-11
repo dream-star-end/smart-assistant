@@ -1420,9 +1420,26 @@ export class ChatSocket {
     if (!s) return null;
     // 生成占位卡（需求 C）是**本地专属瞬态行**：绝不持久化（重开会话不留孤儿卡，
     // 进行中态靠 resume/回放重建，见规格 §6）。仅当存在占位行时才建新数组，否则保持原引用。
-    const messages = s.messages.some((m) => m._genPlaceholder)
+    // 同时剥离 _media 里的 localSrc：那是乐观渲染用的 blob: URL，持久化到 IndexedDB 后
+    // reload 即成死链（blob 是页面生命周期内的）。剥离后重开会话的媒体回落 url 走签名管线。
+    const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
+    let messages = s.messages.some((m) => m._genPlaceholder)
       ? s.messages.filter((m) => !m._genPlaceholder)
       : s.messages;
+    if (needsLocalSrcStrip) {
+      messages = messages.map((m) => {
+        if (!m._media?.some((r) => r.localSrc)) return m;
+        return {
+          ...m,
+          _media: m._media.map((r) => {
+            if (!r.localSrc) return r;
+            const rest = { ...r };
+            delete rest.localSrc;
+            return rest;
+          }),
+        };
+      });
+    }
     return {
       id: s.id,
       agentId: s.agentId,
@@ -1688,13 +1705,21 @@ export class ChatSocket {
     const routing = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
     sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
+    // 出站帧 + 跨设备持久化剥离 localSrc:它是本机乐观渲染用的 blob: URL,换设备/刷新即失效,
+    // 塞进 server 历史只会污染回显(死链)。乐观气泡(_media)保留 localSrc 供本机即时渲染。
+    const outboundMedia = media?.map((m) => {
+      if (!m.localSrc) return m;
+      const rest = { ...m };
+      delete rest.localSrc;
+      return rest;
+    });
     const payload: InboundMessage = {
       type: "inbound.message",
       idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId: p.agentId,
-      content: { text: p.text, ...(media ? { media } : {}), ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}) },
+      content: { text: p.text, ...(outboundMedia ? { media: outboundMedia } : {}), ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}) },
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
@@ -1704,7 +1729,8 @@ export class ChatSocket {
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {
       status: "sending",
       _media: media?.filter((m) => m.hidden !== true),
-      _retryMedia: p.imageEdit ? media : undefined,
+      // 重发走 dispatchPayload 会重新构帧,用剥离 localSrc 的版本(blob 不重发)。
+      _retryMedia: p.imageEdit ? outboundMedia : undefined,
       _imageEdit: p.imageEdit,
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
@@ -1720,7 +1746,7 @@ export class ChatSocket {
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
     {
       const sid = sess.id;
-      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media: media?.filter((m) => m.hidden !== true) };
+      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media: outboundMedia?.filter((m) => m.hidden !== true) };
       void ensurePromise
         .then((ok) => {
           if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {

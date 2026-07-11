@@ -12,7 +12,8 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { ImageEditActionsContext } from "./imageEditActions";
-import { MediaSignProvider, SignedFileCard, ZoomableImage } from "./media";
+import { Media, MediaSignProvider, SignedFileCard, ZoomableImage } from "./media";
+import type { MediaRef } from "../../lib/chat/frames";
 
 afterEach(() => {
   cleanup();
@@ -172,6 +173,54 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
     expect(await screen.findByText("下载失败")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /重试/ })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "直接下载" })).toBeInTheDocument();
+  });
+});
+
+describe("用户气泡媒体缩略图:/api/media 收口签名管线(iOS/CF 下 401 持久裂图根治)", () => {
+  test("/api/media 上传媒体经 media-sign 换签名 URL 后再挂 <img>,不再裸 URL 靠 cookie", async () => {
+    const sign = makeSignMock();
+    const media: MediaRef[] = [{ kind: "image", url: "/api/media/abc.png", filename: "图.png" }];
+    render(
+      <MediaSignProvider sign={sign}>
+        <Media media={media} />
+      </MediaSignProvider>,
+    );
+    // 签名前占位(加载中),不会先挂裸 /api/media URL。
+    await waitFor(() => expect(sign).toHaveBeenCalledWith(["/api/media/abc.png"]));
+    const img = await screen.findByAltText("图.png");
+    expect(img.getAttribute("src")).toBe("/api/media-signed?t=v1");
+    // 裸 /api/media URL 绝不出现在 <img src>(那正是会 401 的请求形态)。
+    expect(img.getAttribute("src")).not.toBe("/api/media/abc.png");
+  });
+
+  test("非图媒体条(audio /api/media)同样走签名(那条 401 的 mp3 同类)", async () => {
+    const sign = makeSignMock();
+    const media: MediaRef[] = [{ kind: "audio", url: "/api/media/b99bc530.mp3" }];
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        <Media media={media} />
+      </MediaSignProvider>,
+    );
+    await waitFor(() => expect(sign).toHaveBeenCalledWith(["/api/media/b99bc530.mp3"]));
+    await waitFor(() => {
+      const audio = container.querySelector("audio");
+      expect(audio?.getAttribute("src")).toBe("/api/media-signed?t=v1");
+    });
+  });
+
+  test("乐观气泡:localSrc(本地 blob)优先直渲,不触发签名(上传→回显窗口不裂图)", async () => {
+    const sign = makeSignMock();
+    const media: MediaRef[] = [
+      { kind: "image", url: "/api/media/abc.png", localSrc: "blob:local-preview", filename: "图.png" },
+    ];
+    render(
+      <MediaSignProvider sign={sign}>
+        <Media media={media} />
+      </MediaSignProvider>,
+    );
+    const img = await screen.findByAltText("图.png");
+    expect(img.getAttribute("src")).toBe("blob:local-preview");
+    expect(sign).not.toHaveBeenCalled(); // 本地字节在手,无需签名/网络
   });
 });
 

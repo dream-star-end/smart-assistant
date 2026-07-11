@@ -1835,6 +1835,32 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(retried.content.imageEdit.clientJobId).toBe("a".repeat(32));
   });
 
+  test("optimistic localSrc: 气泡保留本地 blob 即时渲染,出站帧 + 持久化显式剥离", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "看这张图",
+      media: [{ kind: "image", url: "/api/media/x.png", localSrc: "blob:preview", filename: "x.png" }],
+    });
+    // 乐观气泡保留 localSrc → 上传成功即渲(不等服务端回显/签名)。
+    expect(sock.sessions.get("s1")!.messages.find((m) => m.role === "user")?._media).toEqual([
+      { kind: "image", url: "/api/media/x.png", localSrc: "blob:preview", filename: "x.png" },
+    ]);
+    // 出站帧剥离 localSrc:blob: URL 换端/刷新即死,不该进 server 历史污染回显。
+    const inbound = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.message");
+    expect(inbound.content.media).toEqual([{ kind: "image", url: "/api/media/x.png", filename: "x.png" }]);
+    // 持久化(IndexedDB)同样剥离 → reload 后媒体回落 url 走签名管线(needsSignedSrc)。
+    const stored = sock.toStored("s1")!;
+    expect(stored.messages.find((m) => m.role === "user")?._media).toEqual([
+      { kind: "image", url: "/api/media/x.png", filename: "x.png" },
+    ]);
+  });
+
   test("send persists optimistic user row + in-flight marker immediately", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();

@@ -4,11 +4,13 @@ import { describe, test } from 'node:test'
 import { extractRawQueryParam } from '../handlers.js'
 import {
   MEDIA_SIGN_BATCH_MAX,
+  buildOpaqueMediaFileUrl,
   buildOpaqueSignedUrl,
   buildSignedUrl,
   computeSignature,
   deriveMediaSignKey,
   isContainerPathAllowed,
+  isMediaFilenameAllowed,
   normalizeSignBatchInput,
   verifySignedUrl,
 } from '../mediaSign.js'
@@ -202,6 +204,83 @@ describe('buildOpaqueSignedUrl + verifySignedUrl roundtrip', () => {
     const flipped = `${t.slice(0, -1)}${t.endsWith('A') ? 'B' : 'A'}`
     const r = verifySignedUrl(key, { t: flipped })
     assert.equal(r.kind, 'forbidden')
+  })
+
+  test('container-path opaque token → mediaKind file(转发到 /api/file)', () => {
+    const { url } = buildOpaqueSignedUrl(key, '/home/agent/.openclaude/uploads/x.png', 'c:7')
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
+    const r = verifySignedUrl(key, { t })
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok') assert.equal(r.mediaKind, 'file')
+  })
+
+  test('legacy p-u-e-s URL → mediaKind file(向后兼容)', () => {
+    const { url } = buildSignedUrl(key, '/home/agent/.openclaude/uploads/x.png', 'c:7')
+    const q = parseSignedQuery(url)
+    const r = verifySignedUrl(key, { pRaw: q.p, u: q.u, e: q.e, s: q.s })
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok') assert.equal(r.mediaKind, 'file')
+  })
+})
+
+// 内容寻址媒体(`/api/media/<digest>.<ext>`)签名 token —— 让用户上传/生成媒体的渲染从
+// "裸 <img src> 靠 SameSite cookie"(iOS/CF 下 401 持久裂图根因)迁到凭证进 URL 的签名管线。
+describe('buildOpaqueMediaFileUrl + verifySignedUrl(内容寻址媒体)', () => {
+  const key = deriveMediaSignKey(VALID_BRIDGE_SECRET)
+
+  test('media-file token 验签 → mediaKind media,decodedPath = 文件名(非路径)', () => {
+    const { url, expMs } = buildOpaqueMediaFileUrl(key, 'b99bc530.mp3', 'c:42')
+    assert.ok(url.startsWith('/api/media-signed?t='), '仍走同一签名端点')
+    assert.ok(!url.includes('b99bc530'), 'opaque token 不暴露文件名')
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
+    const r = verifySignedUrl(key, { t })
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok') {
+      assert.equal(r.userId, 'c:42')
+      assert.equal(r.expMs, expMs)
+      assert.equal(r.decodedPath, 'b99bc530.mp3')
+      assert.equal(r.mediaKind, 'media')
+    }
+  })
+
+  test('中文/特殊字符文件名 roundtrip 保真', () => {
+    const { url } = buildOpaqueMediaFileUrl(key, '报表 & 图 100%.png', 'c:1')
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
+    const r = verifySignedUrl(key, { t })
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok') {
+      assert.equal(r.decodedPath, '报表 & 图 100%.png')
+      assert.equal(r.mediaKind, 'media')
+    }
+  })
+
+  test('过期 media-file token → gone;篡改 → forbidden', () => {
+    const past = buildOpaqueMediaFileUrl(key, 'x.png', 'c:1', -1000)
+    const tPast = new URLSearchParams(past.url.slice(past.url.indexOf('?') + 1)).get('t')
+    assert.equal(verifySignedUrl(key, { t: tPast }).kind, 'gone')
+
+    const { url } = buildOpaqueMediaFileUrl(key, 'x.png', 'c:1')
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t') ?? ''
+    const flipped = `${t.slice(0, -1)}${t.endsWith('A') ? 'B' : 'A'}`
+    assert.equal(verifySignedUrl(key, { t: flipped }).kind, 'forbidden')
+  })
+})
+
+describe('isMediaFilenameAllowed', () => {
+  test('接受内容寻址 digest.ext / 常见文件名', () => {
+    assert.equal(isMediaFilenameAllowed('b99bc530abc.mp3'), true)
+    assert.equal(isMediaFilenameAllowed('abc123.png'), true)
+    assert.equal(isMediaFilenameAllowed('报表 100%.png'), true)
+  })
+  test('拒绝路径分隔符 / traversal / 控制字符 / 空 / 超长', () => {
+    assert.equal(isMediaFilenameAllowed('a/b.png'), false)
+    assert.equal(isMediaFilenameAllowed('a\\b.png'), false)
+    assert.equal(isMediaFilenameAllowed('../etc/passwd'), false)
+    assert.equal(isMediaFilenameAllowed('x..png'), false) // 含 `..` 一律拒(粗筛,防 traversal)
+    assert.equal(isMediaFilenameAllowed('x\x00.png'), false)
+    assert.equal(isMediaFilenameAllowed('x\n.png'), false)
+    assert.equal(isMediaFilenameAllowed(''), false)
+    assert.equal(isMediaFilenameAllowed('a'.repeat(257)), false)
   })
 })
 

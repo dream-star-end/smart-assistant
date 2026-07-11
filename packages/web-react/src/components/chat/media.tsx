@@ -9,7 +9,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
-import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
+import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/chat/media";
 import { useImageEditActions } from "./imageEditActions";
 import {
   downloadPercent,
@@ -122,7 +122,7 @@ export function useSignedSrc(src: string | null | undefined): {
 } {
   const { resolve, invalidate } = useContext(Ctx);
   const [url, setUrl] = useState<string | null>(() =>
-    src && !isContainerPath(src) ? src : null,
+    src && !needsSignedSrc(src) ? src : null,
   );
   const [attempt, setAttempt] = useState(0);
   const retriedRef = useRef(false);
@@ -132,7 +132,7 @@ export function useSignedSrc(src: string | null | undefined): {
       setUrl(null);
       return;
     }
-    if (!isContainerPath(src)) {
+    if (!needsSignedSrc(src)) {
       setUrl(src);
       return;
     }
@@ -149,7 +149,7 @@ export function useSignedSrc(src: string | null | undefined): {
     retriedRef.current = false;
   }, [src]);
   const onError = () => {
-    if (retriedRef.current || !src || !isContainerPath(src)) return;
+    if (retriedRef.current || !src || !needsSignedSrc(src)) return;
     retriedRef.current = true;
     invalidate(src);
     setAttempt((n) => n + 1); // 触发重签 effect
@@ -179,14 +179,14 @@ function useFreshSignedUrl(src: string | null | undefined): {
   const get = useCallback(
     async (opts?: { forceResign?: boolean }) => {
       if (!src) return null;
-      if (!isContainerPath(src)) return src;
+      if (!needsSignedSrc(src)) return src;
       if (opts?.forceResign) invalidate(src);
       return resolve(src);
     },
     [src, resolve, invalidate],
   );
   const peekFresh = useCallback(
-    () => (src ? (isContainerPath(src) ? peek(src) : src) : null),
+    () => (src ? (needsSignedSrc(src) ? peek(src) : src) : null),
     [src, peek],
   );
   return { get, peek: peekFresh };
@@ -341,7 +341,7 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
       src={resolved}
       alt={typeof alt === "string" ? alt : ""}
       onError={onError}
-      signPath={typeof src === "string" && isContainerPath(src) ? src : null}
+      signPath={typeof src === "string" && needsSignedSrc(src) ? src : null}
       imgClassName={typeof rest.className === "string" ? rest.className : undefined}
     />
   );
