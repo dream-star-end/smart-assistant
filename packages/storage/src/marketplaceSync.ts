@@ -18,6 +18,8 @@
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { BUNDLE_ALLOWED_PREFIXES, validateBundlePath } from '@openclaude/protocol'
+
 import { type AgentDef, type AgentsConfig, readAgentsConfig, writeAgentsConfig } from './config.js'
 import { paths } from './paths.js'
 import { marketplaceArtifactHash } from './skillEmbedding.js'
@@ -45,7 +47,8 @@ function warnRateLimited(key: string, message: string): void {
   console.warn(`[marketplaceSync] ${message}`)
 }
 
-const BUNDLE_PATH_RE = /^(references|assets|evals|scripts)\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/
+// 路径词法规则同源自 @openclaude/protocol(与 master 校验、CLI 预检一致);内容
+// 本身仍不信任 master —— bundleHash 在本侧独立复算比对后才落盘。
 
 /** 稳定序列化(键排序)—— 与 master 侧 canonicalBundleJson 完全一致的 hash 输入。 */
 function canonicalBundleJson(bundle: Record<string, string>): string {
@@ -114,7 +117,7 @@ async function fetchInstalled(
               const b: Record<string, string> = {}
               let ok = true
               for (const [k, v] of Object.entries(o.bundle as Record<string, unknown>)) {
-                if (typeof v !== 'string' || !BUNDLE_PATH_RE.test(k)) {
+                if (typeof v !== 'string' || validateBundlePath(k) !== null) {
                   ok = false
                   break
                 }
@@ -210,12 +213,12 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
         await rename(tmpScope, scopePath)
       }
       // 附属文件:独立验 bundleHash(不信 master 内容),验过才逐文件落盘;
-      // 三个附属目录内不再被 bundle 引用的文件删除(uninstall/改版收敛)。
+      // 各附属目录内不再被 bundle 引用的文件删除(uninstall/改版收敛)。
       const bundle =
         s.bundle && s.bundleHash && marketplaceArtifactHash(canonicalBundleJson(s.bundle)) === s.bundleHash
           ? s.bundle
           : null
-      for (const sub of ['references', 'assets', 'evals', 'scripts']) {
+      for (const sub of BUNDLE_ALLOWED_PREFIXES.map((p) => p.replace(/\/$/, ''))) {
         const subDir = join(skillDir, sub)
         const wanted = new Map<string, string>()
         if (bundle) {
@@ -236,7 +239,7 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
         }
         // write
         for (const [rel, content] of wanted) {
-          if (!BUNDLE_PATH_RE.test(rel)) continue
+          if (validateBundlePath(rel) !== null) continue
           const full = join(skillDir, rel)
           const curF = await readFile(full, 'utf8').catch(() => null)
           if (curF === content) continue

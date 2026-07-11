@@ -1,5 +1,7 @@
 /**
- * 市场多文件工件(bundle)—— SKILL.md 之外的附属文本文件的校验与规范化单一权威。
+ * 市场多文件工件(bundle)—— SKILL.md 之外的附属文本文件的**语义**校验与规范化
+ * 单一权威(词法规则:路径白名单/限额/路径校验,住 @openclaude/protocol 供
+ * 客户端预检同源引用)。
  *
  * 安全边界:
  *  - 路径白名单:references/ | assets/ | evals/ | scripts/;
@@ -14,33 +16,29 @@
  * bundle 的完整性:canonicalBundleJson(排序键的稳定序列化)喂给
  * marketplaceArtifactHash,master 与容器两侧各自计算比对,不信任对方内容。
  */
+import {
+  BUNDLE_MAX_FILE_BYTES,
+  BUNDLE_MAX_FILES,
+  BUNDLE_MAX_TOTAL_BYTES,
+  validateBundlePath,
+} from '@openclaude/protocol'
 import { parseSkillEvalsJson } from '@openclaude/storage'
 
-export const BUNDLE_ALLOWED_PREFIXES = ['references/', 'assets/', 'evals/', 'scripts/'] as const
-export const BUNDLE_MAX_FILES = 20
-export const BUNDLE_MAX_FILE_BYTES = 64 * 1024
-export const BUNDLE_MAX_TOTAL_BYTES = 256 * 1024
-
-const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+// 词法权威(路径白名单/限额/路径校验)住在 @openclaude/protocol/marketplaceBundle,
+// 与容器侧 oc-market CLI 预检同源;这里 re-export 维持既有引用面。
+export {
+  BUNDLE_ALLOWED_PREFIXES,
+  BUNDLE_MAX_FILE_BYTES,
+  BUNDLE_MAX_FILES,
+  BUNDLE_MAX_TOTAL_BYTES,
+  validateBundlePath,
+} from '@openclaude/protocol'
 
 export type BundleFiles = Record<string, string>
 
 export type ValidateBundleResult =
   | { ok: true; bundle: BundleFiles | null }
   | { ok: false; errors: string[] }
-
-export function validateBundlePath(path: string): string | null {
-  if (typeof path !== 'string' || path.length === 0 || path.length > 160) return '路径非法'
-  if (path.includes('..') || path.startsWith('/') || path.includes('\\')) return '路径不允许目录穿越'
-  if (!BUNDLE_ALLOWED_PREFIXES.some((p) => path.startsWith(p)))
-    return `路径须位于 ${BUNDLE_ALLOWED_PREFIXES.join(' | ')} 之下`
-  const segs = path.split('/')
-  if (segs.length < 2 || segs.length > 3) return '目录深度须为 1-2 级'
-  for (const seg of segs) {
-    if (!SEGMENT_RE.test(seg)) return `路径段 "${seg}" 含非法字符`
-  }
-  return null
-}
 
 /** 校验发布入参 files:[{path,content}] → 规范化 bundle(空数组 → null)。 */
 export function validateBundleFiles(
