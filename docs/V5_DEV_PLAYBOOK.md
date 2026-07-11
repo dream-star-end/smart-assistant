@@ -360,6 +360,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 市场审核审计是 handler 层 best-effort | marketplace.skill.review/revoke 的业务 tx 在 marketplaceDb 内部,审计在 handler 层补写(失败有 critical 告警,非静默,但非同事务原子) | 若出现"审过了但无痕"实证:reviewVersion/revokeListing 事务内接 writeAdminAudit(需把审计上下文穿透 storage 层,评估耦合代价) |
 | ~~deploy 源码同步非原子~~ **蓝绿已激活**(07-11 迁移完成 rel-278a1085-…-migrated+已合 canonical 8fe7e2e3) | 原半同步窗口(26522660 --delay-updates 仅缓解)已被蓝绿根治:REMOTE_SRC=symlink→RELEASES_ROOT/rel-<sha>-<ts>;deploy=git archive **锁定 sha** 建不可变 release(staging→.complete→mv -T 改名;dist 在 staging pinned 源远端 vite build)→原子 symlink 翻转→restart。消崩溃循环+部署树 HEAD 漂移+混源。**未激活**:须先在受控窗口(无并发部署)跑 `deploy-v5.sh --migrate-bluegreen`(几秒停机把实目录转 symlink 布局)再合并该分支;合并前跑 migrate 否则老 canonical deploy 会因 assert_bluegreen_layout 失败 | —(已激活;首次远端 staging vite build 待下一次 dist 部署实证) |
 | 蓝绿:bootstrap 未收口 | 新机 `--bootstrap` 仍建实目录,首次 deploy 会被 assert_bluegreen_layout 挡(fail-closed 无声破坏已防);须手动再跑一次 --migrate-bluegreen | bootstrap 直接建首个 release+symlink(下次碰 bootstrap 顺手) |
+| deploy 重启窗口监控告警噪音 | 每次普通 deploy restart 触发 monitor critical(svc_v5/http_v5/public_route)×3 条;maintenance marker 静默仅覆盖 offline-cutover lane | 告警疲劳成为实际问题时:deploy-v5.sh restart 前落短时 planned-maintenance marker(复用既有 marker 机制,窗口 ≤2min) |
 | 蓝绿:offline cutover lane 未适配 | stage/activate-staged/offline-recycle/prepare-offline-cutover 仍按实目录 in-place+mv 语义操作 REMOTE_SRC,symlink 布局下会破坏不变量 → 已 assert_not_bluegreen_for_cutover **fail-closed 拒绝**(不静默破坏);但也就用不了该 lane 做 GPT56 类离线大切换 | 做下一次离线大切换(image codex 版本切换等)前,把 stage/activate_staged 也改为 build_release+原子 symlink |
 
 ### 审计体系速记(2026-07-11 整改批)
@@ -390,6 +391,12 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 - **坑:undici NO_PROXY 不支持 CIDR**。master 全局 EnvHttpProxyAgent 下,fetch 内网桥接 IP(172.31.0.1)必须 per-request `directEgressDispatcher()` 直连(modelOps 容量面曾因此静默降级 local_fallback);任何新的 master→内网 fetch 同此纪律。
 - **坑:新增 npm 依赖不随 deploy 上线(07-11 实际停机 ~4 分钟)**。deploy-v5.sh rsync 排除 node_modules 且不跑 npm install;批次若加了新依赖(package.json/lock 变更),master 重启即 ERR_MODULE_NOT_FOUND 崩溃循环(实例:连接器批的 imapflow,由后续无关部署首次带上线引爆)。**纪律:合并含 package-lock 变更的批次后、restart 之前,必须 `ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && npm install --no-audit --no-fund'`**;止血=同命令补装后 restart(lockfile 已同步,秒级)。根治债:deploy-v5.sh 检测 package-lock 哈希变化自动补装(见 §5)。
 - **坑:CI commercial-unit 门曾挂死 3 天(07-07~07-10)**。根因=握手测试对"背靠背同步双帧"用逐次 once('message') 取帧,第二帧在无 listener 窗口被 EventEmitter 丢弃→await 永挂→30min 超时 cancelled。**WS 测试等多帧一律用 userChatBridge.test.ts 的 frameCollector 模式**(持久 listener+队列)。诊断法:TAP 停哪个套件之后+零改动探针 PR 定责基线。
+
+### 2026-07-11 管理后台全面审计修复批速记
+- **cron 引擎错误熔断(容器侧 gateway/cron.ts)**:API 错误产出(CCB "API Error: …" 文本块)一律不作为任务结果送达;`insufficient_credits` 连续 3 次 → 持久化停用任务(cron.yaml enabled=false)+ 恰好一条暂停通知(凌驾 deliver=local);瞬时错误(429/上游)只抑制送达绝不替用户关任务。**错误识别单一权威 = errorClassify.classifyDelegateOutputError,禁再造第二套字符串匹配**。背景事故:402 × 每 5 分钟 schedule,35h 刷 424 条同文站内信(user 66)。
+- **inbox-post 同内容去重(master 侧)**:同 uid+同 (title,bodyMd) 6h 窗口只落一条(`{ok:false,reason:'duplicate'}`)。内存窗口重启清零,是信任边界兜底闸,根治在容器侧熔断;逐分钟限频拦不住"低频×长时间"重复轰炸这一类。
+- **allow_registration 单一权威恢复**:拆除 handleRegister/handleGetPublicConfig 的 v5 channel bypass(v3/v5 共库过渡脚手架,v3 已退役)。现在 admin 系统设置页翻 `allow_registration` 即真实全链路生效(后端 403 + 前端注册入口隐藏 + linuxdo allowCreate 三面同源)。DB 值已置 true(与放开注册的现实对齐)。
+- **告警通道卫生**:ilink_wechat(channel id=4)自 05-13 session 过期不可达,已停用(enabled=false);告警企微送达权威=wecom_aibot(id=5)。恢复 ilink 需重新登录激活后再启用。
 
 ### 0105 模型与服务商运维页(2026-07-06)速记
 - 服务商枚举权威 = protocol STATIC_KEY_PROVIDERS(+codex 虚拟条目);provider_ops 表**稀疏**只存运维字段,首次 PUT 建行 —— 新增 provider 本页零改动,严禁再造种子清单。
