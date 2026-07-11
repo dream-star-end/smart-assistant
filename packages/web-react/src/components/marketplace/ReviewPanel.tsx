@@ -2,7 +2,7 @@ import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/p
 import { Check, ChevronRight, Inbox, Loader2, ShieldX, Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import { benchmarkSuspect } from "../../lib/marketplace";
+import { benchmarkSuspect, bundleHasEvals } from "../../lib/marketplace";
 import type {
   AuthSession,
   MarketplaceAiReview,
@@ -251,6 +251,12 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           <Badge tone="neutral">v{r.version}</Badge>
                           {/* 存量/平台 seed 行缺人向元数据 → 中性提示徽章(非阻断,仅提示补齐)。 */}
                           {humanMetaMissing(r) && <Badge tone="neutral">人向元数据缺失</Badge>}
+                          {/* 供给凸显:附带 evals/ 评测用例 → 中性徽章(鼓励供给,不做质量背书)。 */}
+                          {bundleHasEvals(r.rawBundle) && (
+                            <Badge tone="neutral" title="附带 evals/ 评测用例（发布者提供，未复跑验证）">
+                              带 evals
+                            </Badge>
+                          )}
                           {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                           {/* 自报评测黄牌:增益≤0 或通过率<50% 时提示人审留意;数据为发布者
                               自报、未经平台验证,仅提示不阻断。无 benchmark 不渲染。 */}

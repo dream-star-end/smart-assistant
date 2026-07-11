@@ -2,7 +2,7 @@ import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/p
 import { Activity, ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ApiError, api } from '../../lib/api'
-import { formatInstallCount } from '../../lib/marketplace'
+import { formatInstallCount, marketTrySkillPrefill } from '../../lib/marketplace'
 import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
@@ -166,6 +166,7 @@ export function DetailModal({
   installed,
   onClose,
   onInstalled,
+  onAskAiInChat,
 }: {
   slug: string | null
   auth: AuthSession
@@ -173,6 +174,8 @@ export function DetailModal({
   installed?: MarketplaceInstalled
   onClose: () => void
   onInstalled: () => void
+  /** AI 导购(批3):「在对话中试用」——关市场 → 新会话 → 预填安装+上手示例;缺省不渲染。 */
+  onAskAiInChat?: (text: string) => void
 }) {
   const [detail, setDetail] = useState<MarketplaceDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -266,6 +269,15 @@ export function DetailModal({
             <Button variant="ghost" onClick={onClose}>
               关闭
             </Button>
+            {/* AI 导购次级入口:关市场 → 新会话 → 预填「装好并给上手示例」,发送权仍在用户。 */}
+            {onAskAiInChat && (
+              <Button
+                variant="secondary"
+                onClick={() => onAskAiInChat(marketTrySkillPrefill(detail.name, detail.slug))}
+              >
+                在对话中试用
+              </Button>
+            )}
             {isPreset ? (
               <Badge tone="success" className="self-center">
                 <ShieldCheck size={13} /> 平台预设 · 开箱即用

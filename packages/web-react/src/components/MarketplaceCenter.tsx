@@ -24,6 +24,7 @@ export function MarketplaceCenter({
   isAdmin,
   initialBrowseKind = 'skill',
   onCreateInChat,
+  onAskAiInChat,
   onTabChange,
   onClose,
 }: {
@@ -35,6 +36,8 @@ export function MarketplaceCenter({
   initialBrowseKind?: MarketplaceKind
   /** 「在对话中创建」:关闭市场 → 新会话 → 输入框预填引导模板。 */
   onCreateInChat?: (kind: MarketplaceKind) => void
+  /** AI 导购入口(批3):关闭市场 → 新会话 → 输入框预填(text 已拼好);不 autoSend。 */
+  onAskAiInChat?: (text: string) => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
@@ -112,7 +115,11 @@ export function MarketplaceCenter({
                         </button>
                       ))}
                     </div>
-                    <BrowsePanel auth={auth} kind={browseKind} />
+                    <BrowsePanel
+                      auth={auth}
+                      kind={browseKind}
+                      onAskAiInChat={onAskAiInChat}
+                    />
                   </div>
                 )}
                 {safeTab === 'installed' && (
