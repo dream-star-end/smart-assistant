@@ -188,6 +188,13 @@ export function ImageViewer({
   const [moreOpen, setMoreOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [imgLoaded, setImgLoaded] = useState(false)
+  // Radix DismissableLayer 的 onEscapeKeyDown 会绑定挂载时那一版闭包(不随 mode/moreOpen
+  // 重渲刷新),直接读 state 会拿到陈旧值 → ESC 误把子模式当 view 直接关掉整个查看器。用
+  // ref 存最新值,闭包读 ref.current 永远最新(ref 对象跨渲染稳定)。
+  const modeRef = useRef(mode)
+  modeRef.current = mode
+  const moreOpenRef = useRef(moreOpen)
+  moreOpenRef.current = moreOpen
   // initialMode='edit' 时开图直达编辑:每次开图只触发一次(ref 守卫),避免编辑器关闭回
   // view 后又被重新拉回 edit。
   const autoEditRef = useRef(false)
@@ -316,6 +323,19 @@ export function ImageViewer({
             aria-describedby={undefined}
             className="fixed inset-0 z-[61] flex select-none flex-col bg-black text-white outline-none"
             onOpenAutoFocus={(e) => e.preventDefault()}
+            // ESC 逐层退出(需求 §5):更多菜单 → 子模式(评论/调整大小)→ 查看器。edit 模式由
+            // 上层编辑器 Dialog 自己捕获 ESC(topmost layer),这里不会触发。
+            onEscapeKeyDown={(e) => {
+              // 读 ref(非闭包 state):Radix 绑定的是挂载时闭包,state 会陈旧。
+              if (moreOpenRef.current) {
+                e.preventDefault()
+                setMoreOpen(false)
+              } else if (modeRef.current === 'comment' || modeRef.current === 'resize') {
+                e.preventDefault()
+                setMode('view')
+              }
+              // view 模式:放行 Radix 关闭整个查看器。
+            }}
           >
             <Dialog.Title className="sr-only">{alt || '图片预览'}</Dialog.Title>
 
@@ -345,6 +365,7 @@ export function ImageViewer({
                     <button
                       type="button"
                       aria-label="关闭预览"
+                      title="关闭 (Esc)"
                       className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
                     >
                       <X size={20} />
@@ -354,6 +375,7 @@ export function ImageViewer({
                     <button
                       type="button"
                       aria-label="下载"
+                      title="下载"
                       onClick={() => void handleDownload()}
                       className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
                     >
@@ -362,6 +384,7 @@ export function ImageViewer({
                     <button
                       type="button"
                       aria-label="分享"
+                      title="分享"
                       onClick={() => void handleShare()}
                       className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
                     >
@@ -371,6 +394,7 @@ export function ImageViewer({
                       <button
                         type="button"
                         aria-label="更多"
+                        title="更多"
                         aria-expanded={moreOpen}
                         onClick={() => setMoreOpen((v) => !v)}
                         className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"

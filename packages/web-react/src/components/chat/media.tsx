@@ -276,7 +276,10 @@ export function ZoomableImage({
             aria-label="编辑图片"
             title="编辑 · Image 2"
             onClick={() => openViewer(true)}
-            className="absolute bottom-2 left-2 flex min-h-11 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs font-medium text-white shadow-float backdrop-blur transition-opacity hover:bg-black/85 sm:min-h-9 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
+            // 桌面**常显**(此前 sm:opacity-0 仅 hover 才现 → 鼠标用户发现不了编辑入口,是
+            // 「电脑端用不了」的主因之一);移动端本就常显。hover 只做底色加深的强调,不再靠它
+            // 决定"有没有入口"。cursor-pointer 显式声明(不依赖全局兜底,这是关键交互点)。
+            className="absolute bottom-2 left-2 flex min-h-11 cursor-pointer items-center gap-1.5 rounded-full bg-black/65 px-3 text-xs font-medium text-white shadow-float backdrop-blur transition-colors hover:bg-black/85 sm:min-h-9"
           >
             <Pencil size={15} />编辑
           </button>

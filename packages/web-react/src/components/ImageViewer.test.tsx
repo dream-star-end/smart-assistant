@@ -128,6 +128,28 @@ describe('ImageViewer 全屏查看器', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
     render(<Harness submitImageEdit={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: '编辑' }))
-    expect(await screen.findByRole('button', { name: '关闭图片编辑器' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: '关闭图片编辑器' }))
+      .toBeInTheDocument()
+  })
+
+  test('ESC 逐层退出:评论模式按 ESC → 回到查看器(不直接关闭)(需求 §5)', () => {
+    const onOpenChange = vi.fn()
+    render(<Harness submitImageEdit={vi.fn()} onOpenChange={onOpenChange} />)
+    // 进入评论子模式
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    expect(screen.getByRole('heading', { name: '0 条评论' })).toBeInTheDocument()
+    // ESC → 先退回 view(三动作条重现),不关整个查看器
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('heading', { name: '0 条评论' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+  })
+
+  test('三模式(编辑/评论/调整大小)均可从查看器底部动作条直达(需求 §2)', () => {
+    render(<Harness submitImageEdit={vi.fn()} />)
+    // 底部三动作齐全且可用
+    for (const label of ['编辑', '评论', '调整大小']) {
+      expect(screen.getByRole('button', { name: label })).toBeEnabled()
+    }
   })
 })
