@@ -1,19 +1,27 @@
 /**
  * oc-connect（应用连接器 CLI）的专属工具卡，重点是**写操作确认卡**（human-in-the-loop，
- * 安全关键）：CLI 在需要确认时 stdout 输出单个 JSON 对象
- * `{"oc_connect":{"type":"confirmation_required","id":…,"provider":…,"action":…,"summary":…,"expiresAt":…}}`，
- * 本模块从 Bash 工具输出解析该对象 → 渲染确认卡（summary + 查看完整内容 + 确认/拒绝）。
+ * 安全关键）。
+ *
+ * ── P0#1 防伪造（本模块的安全核心）─────────────────────────────────────────────
+ * CLI 的 stdout 经模型可读。它在需要确认时只吐**不透明 id**：
+ *   `{"oc_connect":{"type":"confirmation_required","id":"<uuid>"}}`
+ * 本模块解析**只取 id**（其余字段即便被模型 echo 出来也一律忽略、绝不展示）。确认卡挂载后
+ * **强制**调 `GET /api/connectors/confirmations/:id`（服务端解密 ledger 里的真实参数），
+ * provider/action/summary/detail/status/expiresAt **全部以服务端响应为准**渲染。
+ * 这样堵死攻击路径：模型先真实发起高危写操作拿到 id，再 echo「同 id 但摘要无害」的伪造 JSON——
+ * 因为展示锚定在服务端而非 CLI 输出，用户看到的永远是这个 id 对应的真实操作，「展示什么」与
+ * 「批准后执行什么」由同一 id 决定、不可分叉。拉取失败/id 不符 → 禁用批准（宁可不放行）。
  *
  * 机制对齐（不发明并行机制）：
  *  - 分派：researchCards.OC_BODY_CARDS 注册 `oc-connect`（键受 OcCli 编译期约束）；
  *    解析不出确认对象 → 返回 null，由 researchToolCard 兜底 GenericOcCard（绝不泄漏命令）。
  *  - 鉴权动作（详情 GET / approve / deny）：经 ToolCardActionsContext.connectorConfirm
- *    注入（App 绑定 authRef），无 provider → 降级纯展示（同 onOpenMemory 等哲学）。
+ *    注入（App 绑定 authRef），无 provider → 降级纯展示（无凭据 → 无可信内容可展示）。
  *  - 决策后替用户发一条消息：ChatInteractionContext.sendUserText（```options 选择卡同机制）；
  *    无 provider → 卡上显示「请回复助手继续」降级文案。
  *
- * 状态注意：卡片状态是**本地乐观态 + 服务端响应回写**；组件重挂载（切会话回看历史）后
- * 回到 trigger 初始态，点击操作时后端 CAS 是唯一权威（重复 approve 会被 4xx 拒绝并回显）。
+ * 状态注意：卡片状态是**服务端拉取 + 决策后本地回写**；组件重挂载（切会话回看历史）后重新
+ * 拉取服务端权威详情，点击操作时后端 CAS 是唯一权威（重复 approve 会被 4xx 拒绝并回显）。
  */
 import {
   AlertTriangle,
@@ -24,7 +32,7 @@ import {
   ShieldAlert,
   XCircle,
 } from "lucide-react";
-import { type ReactNode, useCallback, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import {
   confirmActionLabel,
@@ -33,7 +41,6 @@ import {
   connectorErrorText,
   connectorIcon,
   isConfirmExpired,
-  isConfirmTerminal,
   type ConnectorConfirmationDetail,
   type ConnectorConfirmTrigger,
 } from "../../lib/connectors";
@@ -67,8 +74,11 @@ function matchBraces(text: string, start: number): string | null {
 
 /**
  * 从（可能混有其他日志行的）工具输出里解析确认触发对象。找 `"oc_connect"` 键 → 花括号
- * 配对提取其对象值 → JSON.parse → 严格校验必填字段。解析失败/字段缺失/非
- * confirmation_required → null（调用方回落通用卡）。纯函数，绝不抛异常。
+ * 配对提取其对象值 → JSON.parse → 校验 type + id。解析失败/缺 id/非 confirmation_required
+ * → null（调用方回落通用卡）。纯函数，绝不抛异常。
+ *
+ * **只取 id**（P0#1）：CLI 输出可被模型伪造，provider/action/summary 等即便存在也一律忽略——
+ * 展示权威在服务端 `GET /api/connectors/confirmations/:id`，不信 CLI 输出里的任何内容字段。
  */
 export function parseOcConnectConfirmation(
   text: string | null | undefined,
@@ -88,19 +98,10 @@ export function parseOcConnectConfirmation(
       !Array.isArray(v) &&
       v.type === "confirmation_required" &&
       typeof v.id === "string" &&
-      v.id &&
-      typeof v.provider === "string" &&
-      typeof v.action === "string" &&
-      typeof v.summary === "string"
+      v.id
     ) {
-      return {
-        type: "confirmation_required",
-        id: v.id,
-        provider: v.provider,
-        action: v.action,
-        summary: v.summary,
-        expiresAt: typeof v.expiresAt === "string" ? v.expiresAt : "",
-      };
+      // 只锚定 id;其余字段不读、不展示（服务端 GET 才是唯一展示权威）。
+      return { type: "confirmation_required", id: v.id };
     }
   } catch {
     /* 非法 JSON → null */
@@ -244,46 +245,65 @@ function StatusBadge({ status }: { status: string }) {
 export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTrigger }) {
   const { connectorConfirm } = useToolCardActions();
   const { sendUserText } = useChatInteraction();
-  // 本地状态机：trigger 初始 pending（已过期直接 expired）；服务端响应是唯一回写来源。
-  const [status, setStatus] = useState<string>(() =>
-    trigger.expiresAt && isConfirmExpired(trigger.expiresAt) ? "expired" : "pending",
-  );
+  // 服务端权威详情（GET /api/connectors/confirmations/:id）：挂载即强制拉取，是**唯一**
+  // 展示来源。CLI 只给了 id，别无可信内容。
+  const [detail, setDetail] = useState<ConnectorConfirmationDetail | null>(null);
+  // 初始拉取态：有鉴权注入才拉（无注入=demo/未登录 → 无凭据可拉，降级纯提示）。
+  const [loading, setLoading] = useState<boolean>(() => !!connectorConfirm);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 决策后本地回写的状态（覆盖服务端拉取的 detail.status）；null=以服务端 detail.status 为准。
+  const [decidedStatus, setDecidedStatus] = useState<string | null>(null);
   const [deciding, setDeciding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** 决策成功但无 sendUserText 注入时的降级提示（"请回复助手继续"）。 */
   const [manualFollowUp, setManualFollowUp] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [detail, setDetail] = useState<ConnectorConfirmationDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError] = useState<string | null>(null);
 
-  const Icon = connectorIcon(trigger.provider);
-  const actionLabel = confirmActionLabel(trigger.action);
-  const shortId = trigger.id.slice(0, 8);
-  const actionable = status === "pending" && !isConfirmTerminal(status) && !!connectorConfirm;
-
-  // 详情懒加载（服务端解密渲染完整参数；同时以其 status 为准同步本地状态）。
-  // 注：副作用不放进 setState updater（StrictMode 会双调 updater → 双请求）。
-  const toggleDetail = useCallback(() => {
-    const next = !detailOpen;
-    setDetailOpen(next);
-    if (next && !detail && !detailLoading && connectorConfirm) {
-      setDetailLoading(true);
-      setDetailError(null);
-      connectorConfirm
-        .getDetail(trigger.id)
-        .then((d) => {
-          setDetail(d);
-          if (d.status) setStatus(d.status);
-        })
-        .catch((e) => {
-          setDetailError(
-            e instanceof ApiError && e.code ? connectorErrorText(e.code) : "加载完整内容失败，请重试",
+  // ── 挂载即拉取服务端权威详情 ────────────────────────────────────────────────
+  // provider/action/summary/detail/status/expiresAt 全部以服务端响应为准。拉取进行中显示
+  // loading、失败显示错误并禁用批准——宁可不放行，也不拿本地/CLI 的不可信内容当展示。
+  useEffect(() => {
+    if (!connectorConfirm) return;
+    let alive = true;
+    setLoading(true);
+    setLoadError(null);
+    connectorConfirm
+      .getDetail(trigger.id)
+      .then((d) => {
+        if (alive) setDetail(d);
+      })
+      .catch((e) => {
+        if (alive) {
+          setLoadError(
+            e instanceof ApiError && e.code ? connectorErrorText(e.code) : "加载确认详情失败，请重试",
           );
-        })
-        .finally(() => setDetailLoading(false));
-    }
-  }, [detailOpen, detail, detailLoading, connectorConfirm, trigger.id]);
+        }
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [connectorConfirm, trigger.id]);
+
+  const shortId = trigger.id.slice(0, 8);
+  // 服务端返回的 id 与卡片 id 不一致（不该发生）→ 视为无法核验，禁用一切操作。
+  const unverified = detail !== null && detail.id !== trigger.id;
+  const Icon = connectorIcon(detail?.provider ?? "");
+  const actionLabel = detail ? confirmActionLabel(detail.action) : "";
+  // 展示状态：决策回写 > 服务端 status；服务端说 pending 但时钟已过期 → 按 expired 显示（防御）。
+  const rawStatus = decidedStatus ?? detail?.status ?? null;
+  const expiredByClock = detail ? isConfirmExpired(detail.expiresAt) : false;
+  const status =
+    rawStatus === "pending" && expiredByClock ? "expired" : rawStatus;
+  // 只有：已注入鉴权 + 拉取成功 + id 相符 + 服务端 status==='pending' + 未在决策中 → 才允许点。
+  const actionable =
+    !!connectorConfirm && !loading && !loadError && !unverified && status === "pending" && !deciding;
+  // 操作按钮行的可见性：pending 期（含加载/错误/不符时以禁用态呈现，给「不可操作」的确定信号），
+  // 终态（approved/expired/denied…）与无鉴权注入 → 不渲染按钮行。
+  const showButtons =
+    !!connectorConfirm && (loading || !!loadError || unverified || status === "pending");
 
   const decide = useCallback(
     (decision: "approve" | "deny") => {
@@ -293,7 +313,7 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
       connectorConfirm
         .decide(trigger.id, decision)
         .then((r) => {
-          setStatus(r.status);
+          setDecidedStatus(r.status);
           const message =
             decision === "approve" ? `已确认执行（${shortId}）` : `已拒绝（${shortId}）`;
           if (sendUserText) {
@@ -308,11 +328,12 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
         })
         .catch((e) => {
           setError(e instanceof ApiError && e.code ? connectorErrorText(e.code) : "操作失败，请重试");
-          // 后端 CAS 拒绝（已过期/已被处理等）→ 以服务端状态为准刷新本地态（best-effort）。
+          // 后端 CAS 拒绝（已过期/已被处理等）→ 以服务端为准刷新详情与状态（best-effort）。
           connectorConfirm
             .getDetail(trigger.id)
             .then((d) => {
-              if (d.status) setStatus(d.status);
+              setDetail(d);
+              setDecidedStatus(null);
             })
             .catch(() => {
               /* 状态刷新失败：保留本地态，错误文案已展示 */
@@ -325,65 +346,96 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
 
   return (
     <div className="mt-1.5 rounded-md border border-warning/40 bg-surface">
-      {/* 头部：盾牌警示 + 动作中文名 + 状态徽标 */}
+      {/* 头部：盾牌警示 + 动作中文名（服务端）+ 状态徽标 */}
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <span className="text-warning">
           <ShieldAlert className="size-4" />
         </span>
-        <span className="font-medium text-sm text-fg">写操作待确认 · {actionLabel}</span>
+        <span className="font-medium text-sm text-fg">
+          写操作待确认{actionLabel ? ` · ${actionLabel}` : ""}
+        </span>
         <span className="ml-auto">
-          <StatusBadge status={status} />
+          {loading ? (
+            <Spinner />
+          ) : loadError || unverified ? (
+            <span className="inline-flex items-center gap-1 rounded bg-danger/10 px-1.5 py-0.5 text-[11px] text-danger">
+              <AlertTriangle className="size-2.5" />
+              无法核验
+            </span>
+          ) : status ? (
+            <StatusBadge status={status} />
+          ) : null}
         </span>
       </div>
 
       <div className="px-3 py-2">
-        {/* 摘要（来自 CLI 触发对象；完整参数以服务端账本为准） */}
-        <div className="flex items-start gap-2">
-          <span className="mt-0.5 text-accent">
-            <Icon className="size-4" />
-          </span>
-          <div className="min-w-0 flex-1 break-words text-[13px] leading-snug text-fg">
-            {trigger.summary}
+        {/* 主体：一切展示以服务端权威为准；拉取中/失败/不符/无凭据各自降级，绝不展示 CLI 内容 */}
+        {loading ? (
+          <div className="flex items-center gap-2 py-1 text-[13px] text-faint">
+            <Spinner /> 正在核验此操作…
           </div>
-        </div>
+        ) : loadError ? (
+          <div className="py-1 text-[13px] text-danger">{loadError}</div>
+        ) : unverified ? (
+          <div className="py-1 text-[13px] text-danger">无法核验此确认，请勿在此操作。</div>
+        ) : detail ? (
+          <>
+            {/* 摘要：服务端解密后铸造，非 CLI 输出 */}
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 text-accent">
+                <Icon className="size-4" />
+              </span>
+              <div className="min-w-0 flex-1 break-words text-[13px] leading-snug text-fg">
+                {detail.summary}
+              </div>
+            </div>
 
-        {/* 查看完整内容：懒加载服务端解密渲染的结构化详情 */}
-        <button
-          type="button"
-          onClick={toggleDetail}
-          className="mt-2 inline-flex items-center gap-1 text-[12px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {detailOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-          查看完整内容
-        </button>
-        {detailOpen && (
-          <div className="mt-1.5 rounded-md border border-border px-2.5 py-2">
-            {detailLoading && (
-              <div className="flex items-center gap-2 py-1 text-xs text-faint">
-                <Spinner /> 加载完整内容…
+            {/* 查看完整内容：展开已拉取的服务端结构化详情（React 文本渲染，外部内容当纯文本） */}
+            <button
+              type="button"
+              onClick={() => setDetailOpen((o) => !o)}
+              className="mt-2 inline-flex items-center gap-1 text-[12px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {detailOpen ? (
+                <ChevronDown className="size-3.5" />
+              ) : (
+                <ChevronRight className="size-3.5" />
+              )}
+              查看完整内容
+            </button>
+            {detailOpen && (
+              <div className="mt-1.5 rounded-md border border-border px-2.5 py-2">
+                <ConfirmationDetailView detail={detail.detail} />
               </div>
             )}
-            {detailError && <div className="py-1 text-xs text-danger">{detailError}</div>}
-            {!detailLoading && !detailError && !connectorConfirm && (
-              <div className="py-1 text-xs text-faint">登录后可查看完整内容。</div>
-            )}
-            {detail && <ConfirmationDetailView detail={detail.detail} />}
-          </div>
+          </>
+        ) : (
+          <div className="py-1 text-[13px] text-faint">此写操作需在网页端登录后核验并确认。</div>
         )}
 
-        {/* 操作区：pending 且已注入鉴权动作才可操作；批准是危险色（写操作） */}
-        {actionable && (
+        {/* 操作区：只有拉取成功且服务端 status==='pending' 才可点，批准是危险色（写操作） */}
+        {showButtons && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
-            <Button variant="danger" size="sm" disabled={deciding} onClick={() => decide("approve")}>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={!actionable}
+              onClick={() => decide("approve")}
+            >
               确认执行
             </Button>
-            <Button variant="secondary" size="sm" disabled={deciding} onClick={() => decide("deny")}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!actionable}
+              onClick={() => decide("deny")}
+            >
               拒绝
             </Button>
             {deciding && <Spinner />}
           </div>
         )}
-        {status === "pending" && !connectorConfirm && (
+        {!connectorConfirm && (
           <div className="mt-2 text-xs text-faint">（此会话中不可操作，请在网页端登录后确认）</div>
         )}
         {status === "expired" && (

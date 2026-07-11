@@ -89,14 +89,18 @@ export type ConnectorConfirmationDetail = {
 /** POST approve|deny 回包。 */
 export type ConnectorDecisionResult = { ok: boolean; status: ConnectorConfirmStatus };
 
-/** CLI 在需要确认时 stdout 输出的触发对象（包裹在 {"oc_connect": …} 内）。 */
+/**
+ * CLI 在需要确认时 stdout 输出的触发对象（包裹在 {"oc_connect": …} 内）。
+ *
+ * 安全关键（P0#1）：**只含不透明 id**。CLI 的 stdout 经模型可读，任何 provider/action/summary
+ * 等内容字段都可被模型伪造（同 id 换无害摘要诱导批准），故一律不进本类型、不用于展示。
+ * 确认卡凭此 id 向服务端 `GET /api/connectors/confirmations/:id` 拉取解密后的真实参数，
+ * provider/action/summary/detail/status/expiresAt **全部以服务端响应（ConnectorConfirmationDetail）
+ * 为准**。id 是展示与执行的唯一锚点：同一 id 决定「展示什么」与「批准后执行什么」，二者不可分叉。
+ */
 export type ConnectorConfirmTrigger = {
   type: "confirmation_required";
   id: string;
-  provider: string;
-  action: string;
-  summary: string;
-  expiresAt: string;
 };
 
 // ── provider 展示元数据（图标 + 读写能力标注） ──────────────────────────────

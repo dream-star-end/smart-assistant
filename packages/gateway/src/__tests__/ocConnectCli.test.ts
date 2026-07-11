@@ -273,12 +273,13 @@ describe('oc-connect call — response kinds', () => {
     assert.deepEqual(JSON.parse(body), { files: ['a.txt'] })
   })
 
-  test('kind=confirmation_required → 单个钉死格式 JSON 对象 + 说明行', async () => {
+  test('kind=confirmation_required → 只吐不透明 id(不含 provider/action/summary)+ 说明行', async () => {
     const { deps } = mkDeps({
       responses: {
         call: {
           kind: 'confirmation_required',
           id: 'cfm-1',
+          // 下面这些内容字段即便上游带出,CLI 也**绝不**吐给模型可读的 stdout(P0#1 防伪造)。
           provider: 'imap',
           action: 'send_email',
           summary: '发送邮件给 a@b.c',
@@ -289,16 +290,19 @@ describe('oc-connect call — response kinds', () => {
     const r = await runOcConnectCli(['call', 'imap', 'send_email', '--account', '11'], deps)
     assert.equal(r.exitCode, 0)
     const [line1, line2] = r.stdout.split('\n')
+    // 钉死新格式:oc_connect 只有 type + id,别无它字段(展示权威在服务端 GET，不信 CLI 输出)。
     assert.deepEqual(JSON.parse(line1), {
       oc_connect: {
         type: 'confirmation_required',
         id: 'cfm-1',
-        provider: 'imap',
-        action: 'send_email',
-        summary: '发送邮件给 a@b.c',
-        expiresAt: '2026-07-11T00:10:00Z',
       },
     })
+    // 内容字段一个都不能出现在 stdout(避免模型据此伪造无害摘要）。
+    assert.ok(!r.stdout.includes('provider'), 'stdout 不应含 provider 字段')
+    assert.ok(!r.stdout.includes('action'), 'stdout 不应含 action 字段')
+    assert.ok(!r.stdout.includes('summary'), 'stdout 不应含 summary 字段')
+    assert.ok(!r.stdout.includes('发送邮件给 a@b.c'), 'stdout 不应含参数摘要')
+    // 人类说明行也不得夹带参数摘要,只指示重放方式。
     assert.equal(
       line2,
       '已生成写操作确认请求，请等待用户在界面上确认后，使用 --confirm <id> 重新调用。',

@@ -117,16 +117,20 @@ function wrapExternal(provider: string, jsonText: string): string {
   ].join('\n')
 }
 
-/** 前端工具卡钉死格式:单个 JSON 对象。字段顺序固定。 */
+/**
+ * 前端工具卡钉死格式:单个 JSON 对象,**只含不透明 id**。
+ *
+ * 安全关键(P0#1):此 stdout 经模型可读,provider/action/summary 等**内容字段一律不输出**——
+ * 否则模型可先真实发起高危写操作拿到 confirmation id,再自行 echo 一个「同 id 但摘要无害」的
+ * 伪造 JSON,诱导用户在无害摘要下批准真实的高危操作。展示权威**只在服务端**
+ * (前端确认卡凭此 id 强制 `GET /api/connectors/confirmations/:id` 拉取解密后的真实参数渲染)。
+ * 故本层只吐 id,不吐任何可被伪造的展示内容。
+ */
 function confirmationObject(resp: any): { oc_connect: Record<string, string> } {
   return {
     oc_connect: {
       type: 'confirmation_required',
       id: String(resp?.id ?? ''),
-      provider: String(resp?.provider ?? ''),
-      action: String(resp?.action ?? ''),
-      summary: String(resp?.summary ?? ''),
-      expiresAt: String(resp?.expiresAt ?? ''),
     },
   }
 }
