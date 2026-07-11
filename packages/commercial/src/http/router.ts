@@ -20,13 +20,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 // request logger. master HTTP segment is the ONLY commercial path that reads
 // X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
 import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
-import { writeAdminAudit } from '../admin/audit.js'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
+import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
-import { getPool } from '../db/index.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
@@ -73,7 +72,12 @@ import {
   handleAdminPatchAccount,
   handleAdminResetAccountCooldown,
 } from './admin/accounts.js'
-import { handleAdminListAudit } from './admin/audit.js'
+import {
+  handleAdminListAudit,
+  handleAdminListSecurityEvents,
+  handleAdminListHostAudit,
+  handleAdminTraceLookup,
+} from './admin/audit.js'
 import {
   handleAdminAgentContainerAction,
   handleAdminContainerLogs,
@@ -768,8 +772,11 @@ export function createCommercialHandler(
     // 企业版(P3.1)批次 D:平台开票申请处理。exact list 优先于 prefix patch。
     { method: 'GET', path: '/api/admin/org-invoices', handler: handleAdminListOrgInvoices },
     { method: 'PATCH', pathPrefix: '/api/admin/org-invoices/', handler: handleAdminPatchOrgInvoice },
-    // T-60 超管审计记录
+    // T-60 超管审计记录(整改批:+target/时间过滤;新增安全事件/主机审计/trace 反查)
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
+    { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
+    { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
+    { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
@@ -1539,21 +1546,16 @@ export function createCommercialHandler(
               sub: claims.sub,
               adminId: admin.id,
             })
-            // admin bypass 审计:写 admin_audit,方便事后查"谁在 host 敏感路由上动手"。
-            // 失败不影响放行(best-effort);审计写失败仅记 warn,避免"DB 故障导致 admin
-            // 运维路径被误杀"。
-            writeAdminAudit(getPool(), {
-              adminId: admin.id,
-              action: 'blocked_route_bypass',
+            // admin bypass 留痕:这是系统安全事件,不是管理员操作 —— 归 security_events
+            // (语义三分层,0129;此前混在 admin_audit 里占了全表 79%,把操作审计刷成噪音)。
+            // writeSecurityEvent 内部 catch,fire-and-forget,失败不影响放行。
+            void writeSecurityEvent({
+              type: 'route_bypass',
+              actorUserId: admin.id,
               target: `${method} ${blockedRule.label}`,
-              before: null,
-              after: { path },
+              detail: { path },
               ip: clientIpOf(req),
               userAgent: userAgentOf(req),
-            }).catch((err) => {
-              blockLog.warn('admin_audit_write_failed', {
-                err: err instanceof Error ? err.message : String(err),
-              })
             })
             // 不 return true —— 让 gateway 自己的 handler 继续处理
             return false

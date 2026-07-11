@@ -10,8 +10,7 @@
 
 import { randomUUID, randomBytes } from "node:crypto";
 import { HttpError } from "../http/util.js";
-import { writeAdminAudit } from "./audit.js";
-import { incrAdminAuditWriteFailure } from "./metrics.js";
+import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import type { AdminAuditCtx } from "./accounts.js";
 import * as queries from "../compute-pool/queries.js";
 import type { ComputeHostRow, ComputeHostStatus } from "../compute-pool/types.js";
@@ -139,34 +138,8 @@ function mapRowToView(
   };
 }
 
-// ─── best-effort audit(同 accounts.ts)────────────────────────────
-
-async function bestEffortAudit(
-  ctx: AdminAuditCtx,
-  action: string,
-  target: string,
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null,
-): Promise<void> {
-  const { getPool } = await import("../db/index.js");
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: ctx.adminId,
-      action,
-      target,
-      before,
-      after,
-      ip: ctx.ip ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch (err) {
-    incrAdminAuditWriteFailure(action);
-    (ctx.onAuditError ?? ((e) => {
-      // eslint-disable-next-line no-console
-      console.error("[admin/computeHosts] admin_audit write failed:", e);
-    }))(err);
-  }
-}
+// ─── best-effort audit ────────────────────────────────────────────
+// 本地实现已收口到 audit.ts writeAdminAuditBestEffort(整改批)。
 
 // ─── list ────────────────────────────────────────────────────────
 

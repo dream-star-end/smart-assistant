@@ -600,8 +600,8 @@ export async function markBootstrapResult(
  * 不一致时会引发 image-mismatch quarantine,但**那由 imagePromote 周期任务执行**,
  * 此函数不直接 hard-quarantine。
  *
- * 同一 tx 写 audit:operation='health.snapshot',若发生 status 切换额外写
- * operation='health.transition'。
+ * audit(0129 整改批):只在 status 切换/soft reason 升级时写 operation=
+ * 'health.transition';周期快照本身不再写审计行(快照态权威=compute_hosts 列)。
  */
 export interface HealthSnapshotInput {
   /** master → host:9443 GET /health 是否 200。**必填**(本字段触发计数器逻辑)。 */
@@ -838,29 +838,10 @@ export async function applyHealthSnapshot(
       ],
     );
 
-    await writeAuditInTx(client, {
-      hostId: id,
-      operation: "health.snapshot",
-      operationId: input.operationId,
-      reasonCode: appliedReason,
-      detail: {
-        endpointOk: input.endpointOk,
-        endpointErr: input.endpointErr ?? null,
-        uplinkOk: input.uplinkOk ?? null,
-        uplinkErr: input.uplinkErr ?? null,
-        egressOk: input.egressOk ?? null,
-        egressErr: input.egressErr ?? null,
-        loadedImageId: input.loadedImageId ?? null,
-        loadedImageTag: input.loadedImageTag ?? null,
-        consecutiveFail: nextFail,
-        consecutiveOk: nextOk,
-        previousStatus,
-        nextStatus,
-        previousReason: prevReason,
-        cleared,
-      },
-      actor: input.actor,
-    });
+    // 整改批(0129):不再每次快照写 operation='health.snapshot' 审计行——那是每
+    // 5 分钟一次的周期遥测,曾把 compute_host_audit 刷到 11.9 万行/122MB(全表 84%)。
+    // 快照态的权威在 compute_hosts 行本身(last_health_* / consecutive_* 列,上方
+    // UPDATE 已写);审计表只留下面的 health.transition —— 真实状态迁移才是审计事件。
 
     // health.transition 写一行的条件:status 切换 OR soft reason 升级
     // (quarantined→quarantined 但 reason 变了)。后者让 reason-only 升级

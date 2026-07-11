@@ -15,12 +15,10 @@
  *   - 所有 mutate 写 admin_audit;失败 best-effort 不冒泡
  */
 
-import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { encrypt, decrypt } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
-import { writeAdminAudit } from "./audit.js";
-import { incrAdminAuditWriteFailure } from "./metrics.js";
+import { writeAdminAuditBestEffort as audit } from "./audit.js";
 import { maskEgressProxy } from "./accounts.js";
 
 export type EgressProxyStatus = "active" | "disabled";
@@ -69,35 +67,12 @@ function rowToView(r: RawRow, keyFn: () => Buffer): EgressProxyRow {
 }
 
 // ─── audit helper ───────────────────────────────────────────────────
+// 本地实现已收口到 audit.ts writeAdminAuditBestEffort(整改批);ctx 结构兼容。
 
 export interface EgressProxyAuditCtx {
   adminId: bigint | number | string;
   ip?: string | null;
   userAgent?: string | null;
-}
-
-async function audit(
-  ctx: EgressProxyAuditCtx,
-  action: string,
-  target: string | null,
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null,
-): Promise<void> {
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: ctx.adminId,
-      action,
-      target,
-      before,
-      after,
-      ip: ctx.ip ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch (err) {
-    incrAdminAuditWriteFailure(action);
-    // eslint-disable-next-line no-console
-    console.error("[admin/egressProxies] admin_audit write failed:", err);
-  }
 }
 
 function snapshotForAudit(r: EgressProxyRow): Record<string, unknown> {

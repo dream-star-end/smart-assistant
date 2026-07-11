@@ -84,6 +84,10 @@ import {
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
 import {
+  startAuditRetentionSweeper,
+  type AuditRetentionSweeperHandle,
+} from "./admin/auditRetention.js";
+import {
   startCodexRefreshActor,
   type CodexRefreshActorHandle,
 } from "./account-pool/codexAccountActor.js";
@@ -3286,6 +3290,15 @@ export async function registerCommercial(
     refreshEventsSweeper = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
   }
 
+  // 审计体系整改批 — 审计/事件表统一 retention sweeper(24h tick,unref,boot 不立即跑)。
+  // 政策注册表=admin/auditRetention.ts(security_events 180d/agent_audit 90d/
+  // compute_host_audit 90d/turn_traces 90d/rate_limit_events 30d;admin_audit 显式
+  // 永久,不允许出现在删除政策)。shared 域:删的是共享审计表,仅 leader 运行。
+  let auditRetentionSweeper: AuditRetentionSweeperHandle | undefined;
+  if (controlPlaneEnabled && process.env.COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED !== "1") {
+    auditRetentionSweeper = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper());
+  }
+
   // plan G2/G4 — codex token refresh actor(单进程独占,60s tick,unref)。
   // 扫 codex 账号 → 提前 15min refresh → 持锁逐容器写 per-container auth.json。
   // 永不写 master 文件 / legacy 共享 dir。详见 codexAccountActor.ts 头注。
@@ -3638,6 +3651,9 @@ export async function registerCommercial(
       }
       if (refreshEventsSweeper) {
         try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
+      }
+      if (auditRetentionSweeper) {
+        try { auditRetentionSweeper.stop(); } catch { /* ignore */ }
       }
       if (codexRefreshActor) {
         try { codexRefreshActor.stop(); } catch { /* ignore */ }

@@ -110,6 +110,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/security-events",
+    "handler": "handleAdminListSecurityEvents"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/host-audit",
+    "handler": "handleAdminListHostAudit"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/trace/",
+    "handler": "handleAdminTraceLookup"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/pricing",
     "handler": "handleAdminListPricing"
   },

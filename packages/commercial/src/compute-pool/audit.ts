@@ -78,6 +78,66 @@ export interface AuditEvent {
   ts: string;
 }
 
+/**
+ * 全量 list(admin 审计页「主机审计」Tab,整改批新增):可选按 host 过滤,
+ * keyset(id < before)分页。此前 compute_host_audit 只在 host 详情弹窗露 20 条,
+ * 无独立浏览面。
+ */
+export async function listAuditEvents(
+  pool: {
+    query: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>;
+  },
+  opts: { hostId?: string; before?: string; limit?: number } = {},
+): Promise<{ rows: AuditEvent[]; next_before: string | null }> {
+  let limit = opts.limit ?? 50;
+  if (!Number.isInteger(limit) || limit <= 0) limit = 50;
+  if (limit > 200) limit = 200;
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.hostId) {
+    params.push(opts.hostId);
+    where.push(`host_id = $${params.length}`);
+  }
+  if (opts.before) {
+    if (!/^[1-9][0-9]{0,19}$/.test(opts.before)) throw new RangeError("invalid_before");
+    params.push(opts.before);
+    where.push(`id < $${params.length}`);
+  }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(limit);
+  const r = (await pool.query(
+    `SELECT id, host_id, operation, operation_id, reason_code, detail, actor, ts
+       FROM compute_host_audit
+       ${whereClause}
+      ORDER BY id DESC
+      LIMIT $${params.length}`,
+    params,
+  )) as { rows: Array<{
+    id: string;
+    host_id: string | null;
+    operation: string;
+    operation_id: string | null;
+    reason_code: string | null;
+    detail: Record<string, unknown>;
+    actor: string;
+    ts: Date;
+  }>; };
+  const rows = r.rows.map((row) => ({
+    id: Number(row.id),
+    hostId: row.host_id,
+    operation: row.operation,
+    operationId: row.operation_id,
+    reasonCode: row.reason_code,
+    detail: row.detail ?? {},
+    actor: row.actor,
+    ts: row.ts.toISOString(),
+  }));
+  return {
+    rows,
+    next_before: rows.length === limit ? String(rows[rows.length - 1].id) : null,
+  };
+}
+
 export async function listAuditEventsForHost(
   pool: {
     query: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>;

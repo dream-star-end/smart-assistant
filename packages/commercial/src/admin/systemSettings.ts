@@ -26,6 +26,7 @@ import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
+import { SENSITIVE_KEY_RE } from "./auditRedact.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
 
@@ -462,12 +463,20 @@ export async function setSystemSetting<K extends SystemSettingKey>(
     );
     const row = upsert.rows[0];
 
+    // 整改批脱敏:setting key 本身命中敏感模式(如 *_api_key)→ 整值以元信息入审计
+    // (中央钩子只认得对象内的敏感字段名,认不出"这个 setting 的值整个是密钥")。
+    // 嵌套在 value 对象里的敏感字段由 writeAdminAudit 的 redactSensitive 兜底。
+    const wholeValueSensitive = SENSITIVE_KEY_RE.test(key);
+    const auditValue = (v: unknown): unknown =>
+      wholeValueSensitive && v !== null && v !== undefined
+        ? { __redacted: true, ...(typeof v === "string" ? { len: v.length } : {}) }
+        : v;
     await writeAdminAudit(client, {
       adminId: ctx.adminId,
       action: "system_settings.set",
       target: `setting:${key}`,
-      before: { value: beforeValue, description: beforeDesc },
-      after: { value, description: newDesc },
+      before: { value: auditValue(beforeValue), description: beforeDesc },
+      after: { value: auditValue(value), description: newDesc },
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });

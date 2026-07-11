@@ -26,6 +26,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { HttpError, sendJson, readJsonBody } from "../util.js";
 import { requireAdmin, requireAdminVerifyDb } from "../../admin/requireAdmin.js";
+import { writeAdminAuditBestEffort } from "../../admin/audit.js";
 import {
   adminListAccounts,
   adminGetAccount,
@@ -616,13 +617,13 @@ export async function handleAdminOAuthStart(
 export async function handleAdminOAuthExchange(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
   // 写路径:返回可落库的 anthropic OAuth token,后续 adminCreateAccount 真正入库。
   // 虽然 exchange 本身不写 DB,但它是账号创建链路里必经的"换 token"动作,保持
   // 与写族一致的 requireAdminVerifyDb 鉴权防降权 admin 重用旧 JWT 建账号。
-  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const body = (await readJsonBody(req)) ?? {};
   if (typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
@@ -636,6 +637,15 @@ export async function handleAdminOAuthExchange(
   }
   try {
     const r = await exchangeAccountOAuth(b.code, b.state);
+    // 换 token 成功留痕:严禁写入 code/state/access_token/refresh_token,只记元信息
+    // (哪个 provider、拿到什么 scope、到期时间),满足账号绑定链路的可审计要求。
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      "oauth.exchange",
+      `oauth:${r.provider}`,
+      undefined,
+      { provider: r.provider, scope: r.scope, expires_at: r.expires_at },
+    );
     sendJson(res, 200, r);
   } catch (err) {
     if (err instanceof OAuthExchangeError) {

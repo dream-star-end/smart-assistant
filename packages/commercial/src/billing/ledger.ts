@@ -30,6 +30,7 @@
 
 import type { PoolClient } from "pg";
 import { tx, query as rootQuery } from "../db/queries.js";
+import { writeAdminAudit } from "../admin/audit.js";
 
 /** credit_ledger.reason 的 CHECK 白名单,和 0002 / 0077 / 0096 迁移保持同步。 */
 export const LEDGER_REASONS = [
@@ -175,29 +176,26 @@ export async function adminAdjust(
 
     // admin_audit: before / after 只存受影响的 credits 字段 —— 完整 user 快照太大,
     // 且审计目的是 "看这次调整改了什么",credits 前后值已足够复核。
-    const auditRow = await client.query<{ id: string }>(
-      `INSERT INTO admin_audit
-        (admin_id, action, target, before, after, ip, user_agent)
-       VALUES ($1, 'credits.adjust', $2, $3::jsonb, $4::jsonb, $5, $6)
-       RETURNING id::text AS id`,
-      [
-        aid,
-        `user:${uid}`,
-        JSON.stringify({ credits: balance.toString() }),
-        JSON.stringify({
-          credits: newBalance.toString(),
-          delta: delta.toString(),
-          memo,
-          ledger_id: ledgerId.toString(),
-        }),
-        ip,
-        userAgent,
-      ],
-    );
+    // 整改批:此前是裸 INSERT(绕过统一写入口 → 写失败没有 critical 告警,与其它
+    // 路径行为不一致);收口 writeAdminAudit(同事务 client,fail-closed 语义不变)。
+    const auditId = await writeAdminAudit(client, {
+      adminId: aid,
+      action: "user.credits.adjust",
+      target: `user:${uid}`,
+      before: { credits: balance.toString() },
+      after: {
+        credits: newBalance.toString(),
+        delta: delta.toString(),
+        memo,
+        ledger_id: ledgerId.toString(),
+      },
+      ip,
+      userAgent,
+    });
     return {
       ledger_id: ledgerId,
       balance_after: newBalance,
-      audit_id: BigInt(auditRow.rows[0].id),
+      audit_id: auditId,
     };
   });
 }

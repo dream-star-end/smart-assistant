@@ -21,8 +21,9 @@
  *   - perHostTimeoutMs:单 host distribute 超时(默认 imageDistribute.DEFAULT_STREAM_TIMEOUT_MS)
  *   - concurrency:并发 distribute 数(默认 2)
  *
- * audit 流:
- *   - operation='image.promote.tick' 每轮一行(detail.host 数 / changed?)
+ * audit 流(0129 整改批:审计表只记状态迁移,不记周期遥测):
+ *   - operation='image.promote.apply' 仅在本轮实际变更时一行(desired 切换/有 host
+ *     被分发或失败;稳态空转轮不写——旧 image.promote.tick 每轮一行已废,存量已清)
  *   - operation='image.promote.host' 每 host 一行(detail.action='already' | 'distributed' | 'failed')
  */
 
@@ -260,15 +261,10 @@ export async function promoteOnce(opts: ImagePromoteOptions): Promise<PromoteTic
   }
   const desiredImageId = await inspectLocalImageId(imageTag);
   if (!desiredImageId) {
+    // 整改批(0129):abort 不再写审计行——镜像缺失期间每 5min 一条 tick 行是遥测
+    // 噪音(曾贡献 compute_host_audit 2.1 万行),log.warn 已覆盖排障;修复后的
+    // 首轮实际 promote 动作会落 image.promote.apply 行。
     log.warn("master local image inspect failed — promote tick aborted", { imageTag });
-    await writeAuditStandalone(getPool(), {
-      hostId: null,
-      operation: "image.promote.tick",
-      operationId,
-      reasonCode: null,
-      detail: { skipReason: "master-image-not-found", imageTag },
-      actor: "system:imagePromote",
-    });
     return { desiredImageId: null, changedDesired: false, hosts: [] };
   }
 
@@ -311,21 +307,27 @@ export async function promoteOnce(opts: ImagePromoteOptions): Promise<PromoteTic
   }
   await Promise.all(workers);
 
-  await writeAuditStandalone(getPool(), {
-    hostId: null,
-    operation: "image.promote.tick",
-    operationId,
-    reasonCode: null,
-    detail: {
-      desiredImageId,
-      imageTag,
-      changedDesired: setRes.changed,
-      newEpoch: setRes.newEpoch.toString(),
-      hostCount: results.length,
-      summary: results.map((r) => `${r.hostName}:${r.action}`).join(","),
-    },
-    actor: "system:imagePromote",
-  });
+  // 整改批(0129):每轮无脑写 image.promote.tick 是遥测非审计(全网对齐的稳态下
+  // 每 5min 一条"什么都没发生"行)。只在本轮实际发生变更(desired 切换/有 host
+  // 被分发或失败)时写 image.promote.apply —— 审计表回归"记录状态迁移"语义。
+  const didSomething = setRes.changed || results.some((r) => r.action !== "already");
+  if (didSomething) {
+    await writeAuditStandalone(getPool(), {
+      hostId: null,
+      operation: "image.promote.apply",
+      operationId,
+      reasonCode: null,
+      detail: {
+        desiredImageId,
+        imageTag,
+        changedDesired: setRes.changed,
+        newEpoch: setRes.newEpoch.toString(),
+        hostCount: results.length,
+        summary: results.map((r) => `${r.hostName}:${r.action}`).join(","),
+      },
+      actor: "system:imagePromote",
+    });
+  }
 
   return { desiredImageId, changedDesired: setRes.changed, hosts: results };
 }

@@ -38,7 +38,6 @@
  */
 
 import type Docker from "dockerode";
-import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
@@ -51,9 +50,9 @@ import {
   stopAndRemoveV3Container,
   type V3SupervisorDeps,
 } from "../agent-sandbox/v3supervisor.js";
-import { writeAdminAudit } from "./audit.js";
+import { writeAdminAuditBestEffort } from "./audit.js";
+import type { AdminAuditAction } from "./auditActions.js";
 import type { AdminAuditCtx } from "./accounts.js";
-import { incrAdminAuditWriteFailure } from "./metrics.js";
 
 export interface AdminContainerRowView {
   id: string;
@@ -318,30 +317,15 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
   return { kind: "v3", rowId: rowIdNum, containerInternalId: row.container_internal_id };
 }
 
+// 失败行为已收口到 audit.ts writeAdminAuditBestEffort(整改批);本函数只剩
+// target 拼形适配(`agent_container:<id>`)。
 async function auditBestEffort(
   ctx: AdminAuditCtx,
-  action: string,
+  action: AdminAuditAction,
   id: string,
   extra?: Record<string, unknown>,
 ): Promise<void> {
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: ctx.adminId,
-      action,
-      target: `agent_container:${id}`,
-      before: extra ?? null,
-      after: null,
-      ip: ctx.ip ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch (err) {
-    // 同 accounts.bestEffortAudit:Prometheus counter + onAuditError(或 stderr)双报
-    incrAdminAuditWriteFailure(action);
-    (ctx.onAuditError ?? ((e) => {
-      // eslint-disable-next-line no-console
-      console.error("[admin/containers] admin_audit write failed:", e);
-    }))(err);
-  }
+  await writeAdminAuditBestEffort(ctx, action, `agent_container:${id}`, extra ?? null, null);
 }
 
 // ─── logs ─────────────────────────────────────────────────────────
