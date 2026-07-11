@@ -37,6 +37,9 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+// 引擎 API 错误识别的单一权威(delegate 输出错误同款):CCB 把上游失败以
+// "API Error: …" 文本块流出而不抛,cron 侧必须把这类"产出"当失败而非结果。
+import { classifyDelegateOutputError } from './errorClassify.js'
 // 合成首帧执行模型解析(codex 计费旁路封堵的对偶面):cron 无 per-user 计费主体,
 // 落 codex 会被 CODEX_BILLING_GUARD fail-closed 拒 —— 解析为 codex 时改用显式非 codex
 // 兜底模型。与 sessionManager.getOrCreate 的 engine 判定同点收口(单一权威)。
@@ -54,6 +57,14 @@ import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 const logger = createLogger({ module: 'cron' })
 
 const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
+
+// 连续「余额不足」失败自动暂停阈值。余额不足是**持续性**失败(用户不充值不会自愈),
+// 放任任务按 schedule 空转 = 每次产出同一段 "API Error: 402…"(线上事故:每 5 分钟
+// 一次的任务 35 小时给用户刷了 424 条同文站内信)。3 次给足偶发误判余量(如充值与
+// 扣费的竞态),又保证 5 分钟粒度的任务最迟 15 分钟内熔断。rate_limited / upstream
+// 等瞬时错误**不**计入 —— 平台侧故障不该替用户关任务。
+// (行注释而非 docblock:注释里出现 crontab 星号斜杠写法会截断 docblock,历史炸过套件。)
+const CREDIT_FAIL_PAUSE_THRESHOLD = 3
 
 export interface CronJob {
   id: string
@@ -529,6 +540,9 @@ export class CronScheduler {
    *  the fire-and-forget send resolves): a dropped push is recovered by master's
    *  periodic rescan, so we trade at-least-once for far fewer POSTs. */
   private lastCronIndex: CronIndexPayload | null = null
+  /** job.id → 连续「余额不足」失败次数(内存态,容器重启清零 —— 失败仍在就会重新累积,
+   *  最多多试 CREDIT_FAIL_PAUSE_THRESHOLD 轮,可接受)。成功产出即清零。 */
+  private creditFailStreak = new Map<string, number>()
 
   constructor(
     private config: OpenClaudeConfig,
@@ -743,6 +757,48 @@ export class CronScheduler {
       })
       return
     }
+
+    // 引擎 API 错误产出 = 失败,不是结果。CCB 把上游失败以 "API Error: …" 文本块
+    // 流出(不抛),若不识别就会被当正常产出送达 —— 线上事故:402 余额不足叠加
+    // 高频 schedule,同一段错误文本被离线兜底反复写成站内信。处理:
+    //   - 一律不送达裸错误文本(用户视角它不是任务结果);
+    //   - insufficient_credits 是持续性失败 → 连续 CREDIT_FAIL_PAUSE_THRESHOLD 次
+    //     持久化停用任务,并送**一条**明确的暂停通知(状态变更通知,凌驾 deliver=local);
+    //   - 其余错误类(rate_limited/upstream/bad_request)视为瞬时,只记日志等下轮自愈。
+    const apiErr = classifyDelegateOutputError(trimmed)
+    if (apiErr) {
+      logger.warn(`job ${job.id} produced engine API error, suppressing delivery`, {
+        jobId: job.id,
+        code: apiErr.code,
+        detail: apiErr.detail.slice(0, 200),
+      })
+      if (apiErr.code === 'insufficient_credits') {
+        const fails = (this.creditFailStreak.get(job.id) ?? 0) + 1
+        this.creditFailStreak.set(job.id, fails)
+        if (fails >= CREDIT_FAIL_PAUSE_THRESHOLD) {
+          this.creditFailStreak.delete(job.id)
+          job.enabled = false
+          await saveCronFile(await ensureCronFile(), job)
+          logger.warn(`job ${job.id} auto-paused after consecutive insufficient-credit failures`, {
+            jobId: job.id,
+            fails,
+          })
+          const label = job.label || job.id
+          try {
+            await this.onDeliver(
+              `⏸️ 定时任务「${label}」已自动暂停:连续 ${fails} 次因积分余额不足执行失败。` +
+                `充值后在管理中心重新启用该任务,或直接在对话里让我帮你重新开启。`,
+              job,
+            )
+          } catch (err) {
+            logger.warn(`pause notice delivery failed for ${job.id}`, { jobId: job.id }, err as Error)
+          }
+        }
+      }
+      return
+    }
+    // 正常产出 → 清失败计数(偶发失败不累积成误杀)。
+    this.creditFailStreak.delete(job.id)
     logger.info(`job ${job.id} completed`, {
       jobId: job.id,
       chars: trimmed.length,

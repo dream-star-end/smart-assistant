@@ -259,6 +259,7 @@ export const AUTH_ERROR_MESSAGES: Record<string, string> = {
   VALIDATION: "输入格式有误，请检查邮箱与密码",
   CONFLICT: "该邮箱已注册，可直接登录",
   EMAIL_DOMAIN_BLOCKED: "该邮箱域名不支持注册，请更换邮箱",
+  REGISTRATION_DISABLED: "注册暂未开放，请稍后再来",
   WEAK_PASSWORD: "密码需为 8-72 位，请重新设置",
   INVALID_TOKEN: "验证码或重置链接无效或已过期，请重新获取",
 };

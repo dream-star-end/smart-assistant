@@ -472,10 +472,12 @@ export async function handleRegister(
     getSystemSetting("allow_registration"),
     getSystemSetting("register_email_domain_blocklist"),
   ]);
-  // v5 灰度: 注册放开(channel 权威, 与 system_settings 共享库无关) —— v3 现网仍按 system_settings
-  // 门控, 不被 v5 牵连。channel 信号同模型过滤(OC_RUNTIME_CHANNEL)。
-  const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || "v3") === "v5";
-  if (!isV5Channel && allowReg.value !== true) {
+  // 2026-07-11:拆除 v5 channel bypass(v3/v5 共库过渡期脚手架 —— 当年 v5 放开注册
+  // 不能牵连共享 system_settings 的 v3 现网)。v3 已于 2026-07-08 彻底下线,bypass 的
+  // 唯一效果变成"让 admin 的 allow_registration 开关在 v5 上永久失效"(admin 显示
+  // false、实际注册全开)。恢复 system_settings 为唯一权威,与 socialLogin(linuxdo
+  // OAuth allowCreate)对称;上线前先把 DB 值置 true,行为零变化。
+  if (allowReg.value !== true) {
     throw new HttpError(403, "REGISTRATION_DISABLED", "已关闭新用户注册");
   }
   const cfg = deps.rateLimits?.register ?? DEFAULT_RATE_LIMITS.register;
@@ -1032,9 +1034,9 @@ export async function handleGetPublicConfig(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  // v5 灰度注册放开(channel 权威);v3 现网仍按 system_settings。与 handleRegister 后端门控一致。
-  const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || "v3") === "v5";
-  const allow_registration = isV5Channel || (await _readAllowRegistrationCached());
+  // 2026-07-11:同 handleRegister,拆除 v5 channel bypass(v3 已下线),system_settings
+  // 是唯一权威 —— 前端注册入口可见性与后端 403 门必须同源,否则开关半生效。
+  const allow_registration = await _readAllowRegistrationCached();
   sendJson(res, 200, {
     turnstile_site_key: deps.turnstileSiteKey ?? "",
     // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false
