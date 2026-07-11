@@ -217,11 +217,25 @@ export function ZoomableImage({
   signPath?: string | null;
 }) {
   const [open, setOpen] = useState(false);
-  // 开图即进编辑与否:左下角「编辑」按钮 → true;放大按钮 → false。
-  const [editOnOpen, setEditOnOpen] = useState(false);
   // 缩略图字节是否已就绪(骨架 → 图 的切换门)。src 变化(重签/换图)重新亮骨架。
   const [thumbLoaded, setThumbLoaded] = useState(false);
-  useEffect(() => setThumbLoaded(false), [src]);
+  // 直传媒体(/api/media 等非签名 URL)刚上传即渲染,存在「写后可读」的短暂传播/冷启窗口
+  // → img 可能瞬时 404/503(评论/编辑/调整大小 guide 缩略图裂图根因,image r4 §3;三模式同点)。
+  // 对**非签名直传 URL**做带退避的缓存击穿重试:重试期保持骨架(不闪裂图),传播完成即正常显示。
+  // 签名(容器)URL 的过期自愈仍走上游 onError 重签,不在此列;data:/blob: 自足永不重试。
+  const retriable = signPath == null && /^(https?:|\/(?!\/))/.test(src);
+  const [attempt, setAttempt] = useState(0);
+  const retryRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    setThumbLoaded(false);
+    setAttempt(0);
+    retryRef.current = 0;
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [src]);
+  const imgSrc = attempt > 0 ? `${src}${src.includes("?") ? "&" : "?"}_r=${attempt}` : src;
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
   // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
   const canEdit = !!useImageEditActions().submitImageEdit;
@@ -233,8 +247,10 @@ export function ZoomableImage({
   const signFresh = () => {
     if (signPath) void get().then((u) => u && setFreshSrc(u));
   };
-  const openViewer = (edit: boolean) => {
-    setEditOnOpen(edit);
+  // 缩略图与左下角「编辑」胶囊都开**查看器 view 模式**(image r4 §5a):进去先看大图,
+  // 再从底部动作条三选 编辑/评论/调整大小,不再从胶囊直达圈选编辑器。编辑可用性由查看器
+  // 内动作条据 ImageEditActionsContext 门控(单一权威),此处不再各自判定。
+  const openViewer = () => {
     setOpen(true);
     signFresh();
   };
@@ -249,17 +265,24 @@ export function ZoomableImage({
         <button
           type="button"
           aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
-          onClick={() => openViewer(false)}
+          onClick={() => openViewer()}
           className="relative block max-w-full cursor-zoom-in overflow-hidden rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
         >
           <img
-            src={src}
+            src={imgSrc}
             alt={alt}
             loading="lazy"
             decoding="async"
             onLoad={() => setThumbLoaded(true)}
             onError={(e) => {
-              // 先兜底解除骨架(裂图也不留骨架),再把 onError 交给上游(签名重签)。
+              // 非签名直传 URL 且重试额度未尽:退避重试(缓存击穿),重试期保持骨架不裂图。
+              if (retriable && retryRef.current < 3) {
+                retryRef.current += 1;
+                const next = retryRef.current;
+                retryTimerRef.current = setTimeout(() => setAttempt(next), 400 * next);
+                return;
+              }
+              // 重试用尽 / 签名 URL:兜底解除骨架(不留骨架),再把 onError 交给上游(签名重签)。
               setThumbLoaded(true);
               onError?.(e);
             }}
@@ -275,7 +298,7 @@ export function ZoomableImage({
             type="button"
             aria-label="编辑图片"
             title="编辑 · Image 2"
-            onClick={() => openViewer(true)}
+            onClick={() => openViewer()}
             // 桌面**常显**(此前 sm:opacity-0 仅 hover 才现 → 鼠标用户发现不了编辑入口,是
             // 「电脑端用不了」的主因之一);移动端本就常显。hover 只做底色加深的强调,不再靠它
             // 决定"有没有入口"。cursor-pointer 显式声明(不依赖全局兜底,这是关键交互点)。
@@ -287,7 +310,7 @@ export function ZoomableImage({
       </span>
       {/* 全屏沉浸查看器(替代旧内联灯箱):三模式 编辑/评论/调整大小。签名不在此复制,
           下传 get/peek(点击时签名权威);submit 由 App 经 ImageEditActionsContext 供给。
-          display=开灯箱时现签的最新 URL;initialMode=左下角「编辑」直达编辑器。 */}
+          display=开灯箱时现签的最新 URL;initialMode 恒 'view'(胶囊改开 view 模式,§5a)。 */}
       <ImageViewer
         open={open}
         onOpenChange={handleOpenChange}
@@ -296,7 +319,7 @@ export function ZoomableImage({
         signPath={signPath ?? null}
         get={get}
         peek={peek}
-        initialMode={editOnOpen ? "edit" : "view"}
+        initialMode="view"
       />
     </>
   );

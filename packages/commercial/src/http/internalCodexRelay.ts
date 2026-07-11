@@ -388,6 +388,24 @@ class ImageUpstreamError extends Error {
   }
 }
 
+/** 上游图片端点非 2xx 时,把响应体前 N 字符投进结构化日志(此前 err 空对象、排查无从下手)。
+ * 响应体是上游返回的 error JSON,本不含我方请求的 Authorization;仍防御性脱敏任何形似
+ * bearer / sk- 密钥的串,并折叠空白、截断到 500 字符(避免把整个 body 灌进日志)。 */
+function sanitizeUpstreamErrorBody(bytes: Buffer, max = 500): string {
+  let text: string
+  try {
+    text = bytes.toString('utf8')
+  } catch {
+    return '<non-utf8 body>'
+  }
+  const redacted = text
+    .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, 'Bearer <redacted>')
+    .replace(/\bsk-[A-Za-z0-9._-]{6,}/g, 'sk-<redacted>')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return redacted.length > max ? `${redacted.slice(0, max)}…(+${redacted.length - max})` : redacted
+}
+
 async function readBoundedBody(req: IncomingMessage, maxBytes = 40 * 1024 * 1024): Promise<Buffer> {
   const chunks: Buffer[] = []
   let total = 0
@@ -1072,6 +1090,18 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
               generated = await decodeValidatedImageBase64(encoded)
             }
           } catch {}
+        } else {
+          // 诊断盲区根治(Task 2):上游非 2xx 把响应体前缀 + 我方送出的关键几何(size)
+          // 落结构化日志。requestedSize 命中 annotated/outpaint 的 API 画布串——若 400
+          // 由 size/几何触发,这里一眼可见。
+          relayLog.warn('image_upstream_non_2xx', {
+            status: upstream.status,
+            operation: imageOperation,
+            annotated: isAnnotatedImageRequest,
+            requestedSize: annotatedPrepared?.target.api ?? outpaintPrepared?.target.api ?? null,
+            imageJobId: annotatedJob?.jobId ?? null,
+            bodyPrefix: sanitizeUpstreamErrorBody(bytes),
+          })
         }
         if (!generated) {
           if (!upstream.ok) throw new ImageUpstreamError(upstream.status)

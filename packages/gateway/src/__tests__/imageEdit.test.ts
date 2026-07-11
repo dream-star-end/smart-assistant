@@ -7,6 +7,7 @@ import sharp from 'sharp'
 import {
   compositeImageEdit,
   compositeImageOutpaint,
+  enforceMinSelectionBox,
   type ImageEditJob,
   isOutpaintAspect,
   normalizeImageEditMask,
@@ -152,6 +153,54 @@ describe('precise image editing', () => {
         }),
       /empty/,
     )
+  })
+
+  it('enforceMinSelectionBox expands a degenerate box to the image short-edge floor, clamped', () => {
+    // 1px 选区 → 短边扩到 8% × 1000 = 80,以中心为锚,clamp 回图像内。
+    const tiny = enforceMinSelectionBox({ left: 4, top: 4, width: 1, height: 1 }, 1200, 1000)
+    assert.equal(tiny.width, 80)
+    assert.equal(tiny.height, 80)
+    assert.equal(tiny.left, 0) // 中心(4.5)向左扩到下限后 clamp 到 0(不越界)
+    assert.equal(tiny.top, 0)
+    assert.ok(tiny.left + tiny.width <= 1200 && tiny.top + tiny.height <= 1000)
+    // 已达标的选区原样返回(只在短边低于下限时才动)。
+    const ok = enforceMinSelectionBox({ left: 100, top: 100, width: 300, height: 300 }, 1200, 1000)
+    assert.deepEqual(ok, { left: 100, top: 100, width: 300, height: 300 })
+  })
+
+  it('prepareImageEdit floors a tiny annotated selection so the crop is never degenerate (anti-400)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-image-edit-'))
+    roots.push(root)
+    const width = 1000
+    const height = 800
+    const sourcePath = join(root, 'source.png')
+    const maskPath = join(root, 'mask.png')
+    await sharp({ create: { width, height, channels: 3, background: '#3355aa' } })
+      .png()
+      .toFile(sourcePath)
+    // 一个 6×6 的极小白点选区(远低于 8% 短边 = 64px)。
+    const mask = Buffer.alloc(width * height, 0)
+    for (let y = 400; y < 406; y++) for (let x = 500; x < 506; x++) mask[y * width + x] = 255
+    await sharp(mask, { raw: { width, height, channels: 1 } }).png().toFile(maskPath)
+    const prepared = await prepareImageEdit({
+      version: 1,
+      jobId: 'c'.repeat(32),
+      sourcePath,
+      maskPath,
+      guidePath: sourcePath,
+      outputPath: join(root, 'out.png'),
+      width,
+      height,
+      createdAt: new Date().toISOString(),
+    })
+    const floor = Math.round(Math.min(width, height) * 0.08) // 64
+    assert.ok(
+      Math.min(prepared.box.width, prepared.box.height) >= floor,
+      `box short edge ${Math.min(prepared.box.width, prepared.box.height)} must be >= floor ${floor}`,
+    )
+    // 仍产出良构的 API 画布 + 透明可编辑区(不退化 → 不触发上游 400)。
+    const apiMask = await sharp(prepared.mask).ensureAlpha().raw().toBuffer()
+    assert.ok(apiMask.some((_, i) => i % 4 === 3 && apiMask[i] === 0), 'editable region present')
   })
 })
 

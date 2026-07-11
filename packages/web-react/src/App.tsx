@@ -522,11 +522,19 @@ export function App() {
   // 图片编辑可用性(image2 门控):image2 特性开放 + 当前模型是 GPT 引擎时才可编辑。
   // **单一权威**:注入 submitImageEdit / annotate 与否即"可否编辑"的唯一判定,聊天缩略图
   // 「编辑」浮钮、全屏查看器动作、composer 附件编辑按钮全部据此显隐/禁用。
-  const image2Available =
-    !demo && publicCfg?.featureImage2 === true && isCodexEngineModel(modelId ?? "");
+  // 可编辑判定的**确定性**收口(image r4 §5b):publicCfg / modelId 都是刷新后 async 加载,
+  // 若「未知即不可编辑」,编辑入口会在加载完成的一瞬从无到有——刷新后「编辑按钮时有时无」
+  // 的抖动根因。改为:**加载未知期乐观视为可用**(不闪),仅在**确定**关闭时才收起——
+  //   · featureOff  = publicCfg 已到且 featureImage2 !== true(平台维护/未开放)
+  //   · modelKnownUnsupported = modelId 已到且非 GPT 引擎模型
+  // 真实提交仍受下游 image2 门控兜底;错判窗口仅存在于首帧加载的数百 ms,且只影响罕见的
+  // 非 GPT 会话(GPT 会话——商业版绝大多数——从首帧起即稳定显示,消除 boss 复现的闪烁)。
+  const image2FeatureOff = publicCfg != null && publicCfg.featureImage2 !== true;
+  const modelKnownUnsupported = !!modelId && !isCodexEngineModel(modelId);
+  const image2Available = !demo && !image2FeatureOff && !modelKnownUnsupported;
   const image2UnavailableReason = image2Available
     ? undefined
-    : publicCfg?.featureImage2 !== true
+    : image2FeatureOff
       ? "Image 2 暂未开放或正在维护"
       : "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型";
   const imageEditActions = useMemo<ImageEditActions>(

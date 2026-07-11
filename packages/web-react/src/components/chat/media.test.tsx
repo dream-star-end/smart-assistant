@@ -37,12 +37,15 @@ describe("ZoomableImage 灯箱", () => {
     expect(screen.queryByRole("button", { name: "编辑图片" })).not.toBeInTheDocument();
   });
 
-  test("点「编辑」→ 直接开全屏查看器并进入圈选编辑器(需求 §3 单一入口)", async () => {
+  test("点「编辑」胶囊 → 开查看器 view 模式(三选:编辑/评论/调整大小),不再直达圈选(§5a)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response));
     render(withEdit(<ZoomableImage src={src} alt="拟合曲线" />, true));
     fireEvent.click(screen.getByRole("button", { name: "编辑图片" }));
-    // 不经「先进查看器再点编辑」——直接落到圈选编辑器。
-    expect(await screen.findByRole("button", { name: "关闭图片编辑器" })).toBeInTheDocument();
+    // 落查看器 view 模式:底部三动作条出现,而非直接进圈选编辑器。
+    for (const label of ["编辑", "评论", "调整大小"]) {
+      expect(await screen.findByRole("button", { name: label })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole("button", { name: "关闭图片编辑器" })).not.toBeInTheDocument();
   });
 
   const src = "https://example.test/chart.png";
