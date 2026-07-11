@@ -117,6 +117,9 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
 # 疑似已中毒(跑啥都挂)先清场:ps -eo pid,etime,args | grep 'node.*--test'(etime 分钟级=孤儿)→ kill -9 -- -<pgid>
 ```
 ℹ️ **userChatBridge 挂死已根治(46303b5b,2026-07-10 10:38)**:根因=握手测试丢帧竞态(once listener 背靠背双帧丢第二帧→await 永挂),frameCollector 收口,详见该提交与 §CI 挂死条目。**worktree 基于 46303b5b 之前提交的会跑必挂**——rebase canonical 即解,别再按环境问题排查(当天多个会话在此各误诊 1-2 小时;彼时观察到的 tsx IPC pipe close 不完成是下游症状:await 永挂→子进程不退→抱着 rig 服务器与 IPC 连接)。
+🎯 **CI flake 两类根治(d65edb5d,2026-07-11)**——CI 红 ≠ 一定是回归,先对号这两类:
+- **web-react 截止线饥饿**:RTL waitFor/findBy 的失败截止线是**真实时钟**,CI 4vCPU 上 vitest 并行有 >1s 调度饥饿窗口。单一权威=`src/test/setup.ts` 的 `configure({asyncUtilTimeout: 5s})` + vite.config `testTimeout: 15s` 梯度;**禁止在单个用例里散装 {timeout}**;时序竞态修交互语义(等按钮 enabled 再点/先等 boot 自动选中落定再操作),不靠加 sleep 或关并行掩盖(实测串行 7m12s vs 并行 ~1m,不关)。此前"本地须 --no-file-parallelism"的规则已被本校准取代。
+- **gateway 跨进程锁互踩**:凡"进程域=容器"的 tmpdir 锁(vision slot 锁),node --test 文件级并行共享宿主 /tmp 会互踩 → 测试文件各自 mkdtemp 设 `OPENCLAUDE_VISION_LOCK_DIR`(生产不设,tmpdir 语义不变)。**新增同类 host 级锁时必须同步提供锁域 env 并在测试里隔离。**
 - 测试必须是**行为断言**(帧序列驱动 reducer/mock WS/真 DB),不是对源码文本的 regex(那只能防删行,防不了行为)。prompt 驱动的行为(团队模式规则等)本质不可单测——这是设计信号,应改为代码硬编排,而不是写 regex 测试。
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 
