@@ -1152,6 +1152,11 @@ export function createCommercialHandler(
     // 注:BLOCKED_FOR_USER_RULES 不含 /api/org,BRIDGE 白名单也不含 → 容器无法代理,
     // 只服务浏览器用户 JWT;dispatchOrgRoute 内做 requireOrgRole 单一鉴权收口。
     '/api/org',
+    // 应用连接器(v5 connectors):匹配 exact `/api/connectors` 与 prefix `/api/connectors/`。
+    // 铁律:commercial 新增路由必须**同步两处**——routes 数组(见上 dispatchConnectorsRoute 注册)
+    // + 本 prefixes 所有权清单;漏本处 → commercialHandler 不认领 → fall through gateway → 浏览器
+    // 401/404("not found")。2026-07-11 连接器目录 not found 事故根因即漏登本处。
+    '/api/connectors',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     '/api/remote-hosts',
     // P0/P1:commercial user 的 memory/skills/tasks/agent 管理 API 由 master
