@@ -45,6 +45,7 @@ import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
+import { connectorErrorText } from "./lib/connectors";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
@@ -568,6 +569,18 @@ export function App() {
       sp.delete("github_error");
       touched = true;
     }
+    // 应用连接器 BYOA OAuth 回调（照 github_linked 模式）：/?connector_linked=<provider> 或
+    // /?connector_error=<code>（错误码经 connectorErrorText 映射中文，不裸露码）。
+    if (sp.has("connector_linked")) {
+      toast("应用已连接", "success");
+      sp.delete("connector_linked");
+      touched = true;
+    }
+    if (sp.has("connector_error")) {
+      toast(`应用连接失败：${connectorErrorText(sp.get("connector_error"))}`, "error");
+      sp.delete("connector_error");
+      touched = true;
+    }
     if (touched) {
       const q = sp.toString();
       window.history.replaceState(
@@ -878,8 +891,9 @@ export function App() {
     },
     [activeId],
   );
-  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮）。稳定引用经 context 注入，
-  // 不污染 ToolCard 数据契约。demo 无网络 → 不提供（按钮自动隐藏）。
+  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮 + 连接器写操作确认卡的
+  // 鉴权动作）。稳定引用经 context 注入，不污染 ToolCard 数据契约。demo 无网络 → 不提供
+  //（按钮自动隐藏 / 确认卡降级纯展示）。authRef 是稳定 ref，不入依赖。
   const toolActions = useMemo(
     () =>
       demo
@@ -888,6 +902,11 @@ export function App() {
             onOpenMemory: () => openManage("memory"),
             onOpenSkills: () => openManage("skills"),
             onOpenTasks: () => openManage("cron"),
+            connectorConfirm: {
+              getDetail: (id: string) => api.getConnectorConfirmation(authRef.current, id),
+              decide: (id: string, decision: "approve" | "deny") =>
+                api.decideConnectorConfirmation(authRef.current, id, decision),
+            },
           },
     [demo, openManage],
   );

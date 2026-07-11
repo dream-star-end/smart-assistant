@@ -30,6 +30,7 @@ import {
   Music,
   NotebookPen,
   Pencil,
+  Plug,
   Search,
   Send,
   Server,
@@ -123,6 +124,9 @@ export const OC_TOOLS = {
   "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
   // mmx = oc-minimax 的软链(Dockerfile `ln -sf oc-minimax mmx`);同图标/标签/卡。
   mmx: { icon: Sparkles, label: "媒体生成", tone: "accent" },
+  // 应用连接器(webdav/imap/notion/github/feishu):body 专属卡含写操作确认卡
+  // (connectorCards.tsx,human-in-the-loop 安全关键)。
+  "oc-connect": { icon: Plug, label: "应用连接", tone: "accent" },
 } satisfies Record<string, ToolMeta>;
 
 /** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的
