@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { classifyMediaRef, fetchImageBlobWithResign } from './media'
+import { classifyMediaRef, fetchImageBlobWithResign, isContainerPath, needsSignedSrc } from './media'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -40,14 +40,40 @@ describe('fetchImageBlobWithResign（图片编辑取图过期自愈）', () => {
   })
 })
 
+describe('needsSignedSrc（签名管线单一权威判定）', () => {
+  test('容器绝对路径 + /api/media 上传/生成媒体都需签名(凭证进 URL,不靠 SameSite cookie)', () => {
+    expect(needsSignedSrc('/home/agent/.openclaude/generated/a.png')).toBe(true)
+    expect(needsSignedSrc('/api/media/abc123.png')).toBe(true)
+    expect(needsSignedSrc('/api/media/b99bc530.mp3')).toBe(true) // 非图媒体条(那条 401 的 mp3)同样走通
+  })
+  test('http/data/blob 与其它 /api 端点不走签名', () => {
+    expect(needsSignedSrc('https://cdn.test/x.png')).toBe(false)
+    expect(needsSignedSrc('data:image/png;base64,AAAA')).toBe(false)
+    expect(needsSignedSrc('blob:https://app/uuid')).toBe(false)
+    expect(needsSignedSrc('/api/media-signed?t=xyz')).toBe(false) // 已签名端点自身不再套娃
+    expect(needsSignedSrc('/api/uploads')).toBe(false)
+    expect(needsSignedSrc('')).toBe(false)
+  })
+  test('/api/media 不再被 isContainerPath 误分类为容器路径(两谓词职责分明)', () => {
+    expect(isContainerPath('/api/media/x.png')).toBe(false)
+    expect(isContainerPath('/home/agent/x.png')).toBe(true)
+  })
+})
+
 describe('classifyMediaRef', () => {
-  test('/api/media uploads are same-origin direct images rather than permanent placeholders', () => {
-    expect(classifyMediaRef({ kind: 'image', url: '/api/media/example.png' })).toEqual({
-      mode: 'direct',
+  test('/api/media 上传/生成媒体收口到签名管线(此前裸 direct → iOS/CF 下 401 持久裂图根因)', () => {
+    expect(classifyMediaRef({ kind: 'image', url: '/api/media/example.png' })).toMatchObject({
+      mode: 'sign',
+      path: '/api/media/example.png',
       kind: 'image',
-      src: '/api/media/example.png',
-      filename: undefined,
-      mimeType: undefined,
+    })
+  })
+
+  test('/api/media 非图媒体条(audio)同样走签名', () => {
+    expect(classifyMediaRef({ kind: 'audio', url: '/api/media/b99bc530.mp3' })).toMatchObject({
+      mode: 'sign',
+      path: '/api/media/b99bc530.mp3',
+      kind: 'audio',
     })
   })
 
@@ -58,6 +84,27 @@ describe('classifyMediaRef', () => {
       mode: 'sign',
       path: '/home/agent/.openclaude/generated/a.png',
       kind: 'image',
+    })
+  })
+
+  test('乐观气泡:localSrc(本地 blob)优先直渲,盖过 url(消除上传→回显裂图窗口)', () => {
+    expect(
+      classifyMediaRef({ kind: 'image', url: '/api/media/x.png', localSrc: 'blob:local-preview' }),
+    ).toMatchObject({
+      mode: 'direct',
+      src: 'blob:local-preview',
+      kind: 'image',
+    })
+  })
+
+  test('http/data URL 仍直渲(无 localSrc 时)', () => {
+    expect(classifyMediaRef({ kind: 'image', url: 'https://cdn.test/x.png' })).toMatchObject({
+      mode: 'direct',
+      src: 'https://cdn.test/x.png',
+    })
+    expect(classifyMediaRef({ kind: 'image', base64: 'AAAA', mimeType: 'image/png' })).toMatchObject({
+      mode: 'direct',
+      src: 'data:image/png;base64,AAAA',
     })
   })
 })

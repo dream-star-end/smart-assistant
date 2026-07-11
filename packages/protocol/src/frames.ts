@@ -36,6 +36,12 @@ export const MediaRef = Type.Object({
    * controlled tools (for example an image-edit mask) but must not appear in
    * the optimistic user bubble or persisted chat history. */
   hidden: Type.Optional(Type.Boolean()),
+  /** UI-only, client-local. A `blob:`/`data:` URL for the just-uploaded bytes so the
+   * optimistic user bubble renders instantly (no wait for server echo / signing).
+   * A `blob:` URL is browser-scoped and dies on reload/other devices, so it is
+   * explicitly stripped from the outbound frame + cross-device persist + IndexedDB
+   * (see socket.sendMessage / toStored). Renderers prioritise it (classifyMediaRef). */
+  localSrc: Type.Optional(Type.String()),
 })
 export type MediaRef = Static<typeof MediaRef>
 

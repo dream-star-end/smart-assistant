@@ -24,6 +24,22 @@ export function isContainerPath(s: string): boolean {
   return true;
 }
 
+/**
+ * 需要经 /api/media-sign 换成带 token 的签名 URL 才能可靠渲染的来源。**单一权威**判定,
+ * 供渲染器(classifyMediaRef)与签名 hook(useSignedSrc/useFreshSignedUrl)共用,避免漂移。
+ *
+ * 覆盖两类:
+ *   1. 容器内绝对路径(/home/agent/... 等)—— 浏览器直接取不到容器盘。
+ *   2. `/api/media/<digest>` —— 内容寻址的用户上传/生成媒体。裸 `<img src>` 直取要靠
+ *      HttpOnly `oc_session` SameSite=Strict cookie,iOS Safari + Cloudflare 下该 cookie
+ *      在媒体子资源请求里被 drop → master 收不到凭证 → 持久 401 裂图(现网实锤,de16e2be
+ *      同类)。收口到签名管线后凭证进 URL,不再依赖 cookie。
+ */
+export function needsSignedSrc(s: string): boolean {
+  if (typeof s !== "string" || !s) return false;
+  return isContainerPath(s) || s.startsWith("/api/media/");
+}
+
 /** 已可直接用于 <img src> 的 URL（http/https/data/blob）。 */
 export function isDirectUrl(s: string): boolean {
   return /^(https?:|data:|blob:)/i.test(s);
@@ -31,15 +47,21 @@ export function isDirectUrl(s: string): boolean {
 
 export function classifyMediaRef(m: MediaRef): ResolvedMedia {
   const base = { kind: m.kind, filename: m.filename, mimeType: m.mimeType };
+  // 乐观气泡:刚上传的媒体带本地 blob URL(上传时字节在手),先本地直渲,消除"上传成功→
+  // 服务端回显/签名前"的短暂裂图窗口。localSrc 仅本机 UI、不持久化、不进出站帧(socket/
+  // toStored 显式剥离)→ 刷新/换设备后自然回落 url 走签名管线。
+  if (m.localSrc) {
+    return { mode: "direct", src: m.localSrc, ...base };
+  }
   if (m.base64) {
     const mt = m.mimeType || guessMime(m.kind);
     return { mode: "direct", src: `data:${mt};base64,${m.base64}`, ...base };
   }
   const url = (m.url || "").trim();
   if (!url) return { mode: "none", kind: m.kind, filename: m.filename };
-  if (url.startsWith("/api/media/")) return { mode: "direct", src: url, ...base };
   if (isDirectUrl(url)) return { mode: "direct", src: url, ...base };
-  if (isContainerPath(url)) return { mode: "sign", path: url, ...base };
+  // /api/media(内容寻址上传/生成媒体)与容器路径统一走签名管线(凭证进 URL,不靠 cookie)。
+  if (needsSignedSrc(url)) return { mode: "sign", path: url, ...base };
   return { mode: "none", kind: m.kind, filename: m.filename };
 }
 

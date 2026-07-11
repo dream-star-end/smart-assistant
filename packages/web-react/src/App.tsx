@@ -467,7 +467,18 @@ export function App() {
         : mime.startsWith("video/")
           ? "video"
           : "file";
-    return { kind, url: r.url, mimeType: mime || undefined, filename: file.name };
+    // 乐观本地渲染:上传时 File 字节在手,建 blob URL 让气泡先渲(消除服务端回显/签名前的裂图
+    // 窗口)。仅可预览媒体(image/video/audio)需要;file 走下载卡无预览。localSrc 仅本机 UI:
+    // socket.sendMessage 出站帧 + 跨设备持久化 + toStored(IndexedDB)都显式剥离,刷新即回落签名管线。
+    const localSrc =
+      kind !== "file" ? URL.createObjectURL(file) : undefined;
+    return {
+      kind,
+      url: r.url,
+      mimeType: mime || undefined,
+      filename: file.name,
+      ...(localSrc ? { localSrc } : {}),
+    };
   }, []);
 
   // 统一图片编辑提交 handler（需求 B/§5）：编辑/评论/调整大小三态联合 → 进主对话生成。

@@ -39,9 +39,11 @@ import {
 import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
   buildOpaqueSignedUrl,
+  buildOpaqueMediaFileUrl,
   verifySignedUrl,
   normalizeSignBatchInput,
   isContainerPathAllowed,
+  isMediaFilenameAllowed,
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
@@ -2057,6 +2059,33 @@ function _logMediaSignSubjectMismatch(
  * 谓词不通过的 path **从 response map 里 drop**,不抛 403 —— 前端按 cache miss
  * 处理。这避免单条非法 path 让整个 batch 失败(媒体 URL 渲染应尽可能优雅)。
  */
+/** `/api/media/<file>` 前缀。用户上传/生成媒体存库即此形态的裸 URL。 */
+const API_MEDIA_URL_PREFIX = "/api/media/";
+
+/**
+ * 若 entry 是 `/api/media/<file>` 形态,decode 出 file 段并过注入形态 sanity,返回 decoded
+ * 文件名;否则 null。
+ *
+ * 存库的 `_media.url` 是内容寻址裸 URL(`/api/media/<digest>.<ext>`)。渲染层不能靠
+ * `<img>` 的 SameSite cookie 取(iOS Safari + CF 下被 drop),必须换成带 opaque token 的
+ * 签名 URL —— 这里把 `/api/media/<file>` 归一成"文件名",交 buildOpaqueMediaFileUrl 签。
+ */
+function extractApiMediaFilename(entry: string): string | null {
+  if (!entry.startsWith(API_MEDIA_URL_PREFIX)) return null;
+  let seg = entry.slice(API_MEDIA_URL_PREFIX.length);
+  const q = seg.indexOf("?");
+  if (q >= 0) seg = seg.slice(0, q);
+  const hash = seg.indexOf("#");
+  if (hash >= 0) seg = seg.slice(0, hash);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(seg);
+  } catch {
+    return null;
+  }
+  return isMediaFilenameAllowed(decoded) ? decoded : null;
+}
+
 export async function handleMediaSign(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2154,6 +2183,14 @@ export async function handleMediaSign(
   const expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
   const urls: Record<string, string> = {};
   for (const p of norm.paths) {
+    // 内容寻址媒体(`/api/media/<file>`)与容器绝对路径共用同一签名端点,只是转发目标不同。
+    // 存库历史消息里的裸 `/api/media/` URL 在渲染时经此归一为签名 URL,零数据迁移。
+    const mediaFile = extractApiMediaFilename(p);
+    if (mediaFile) {
+      const { url } = buildOpaqueMediaFileUrl(deps.mediaSignKey, mediaFile, userId, DEFAULT_SIGN_TTL_MS);
+      urls[p] = url;
+      continue;
+    }
     let resolved: string;
     try {
       resolved = resolvePath(p);
@@ -2220,7 +2257,7 @@ export async function handleMediaSigned(
     case "ok":
       break;
   }
-  const { userId, expMs, decodedPath } = result;
+  const { userId, expMs, decodedPath, mediaKind } = result;
 
   // userId 形 `c:<digits>`(USER_ID_RE 已守护)→ sub 是 digits
   const sub = userId.slice(2);
@@ -2238,18 +2275,28 @@ export async function handleMediaSigned(
     throw new HttpError(403, "FORBIDDEN", "account not active");
   }
 
-  // Path sanity check —— **不是 ACL**,真正访问控制由容器内 handleApiFile 做
-  // (realpathSync + agentCwds + blocklist + fd recheck)。这里只挡明显扫描类路径
-  // (`/etc/passwd` / `/var/log/...` / `/proc/...`),粗白名单到 `/home/agent/...`。
-  // 详见 mediaSign.ts::isContainerPathAllowed 注释。
-  let resolved: string;
-  try {
-    resolved = resolvePath(decodedPath);
-  } catch {
-    throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-path");
-  }
-  if (!isContainerPathAllowed(resolved)) {
-    throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
+  // Path/filename sanity check —— **不是 ACL**,真正访问控制由容器内 handler 做
+  // (realpathSync + agentCwds + blocklist + fd recheck / uploads·generated 双目录 + tenant scope)。
+  // 这里只挡明显扫描 / 注入形态。mediaKind 决定转发到容器的哪个端点:
+  //   - 'media':decodedPath = 内容寻址文件名 → `/api/media/<file>`(双目录搜索,保留 /api/media 语义)
+  //   - 'file' :decodedPath = 容器绝对路径   → `/api/file?path=`(粗白名单到 `/home/agent/...`)
+  let forwardPath: string;
+  if (mediaKind === "media") {
+    if (!isMediaFilenameAllowed(decodedPath)) {
+      throw new HttpError(403, "FORBIDDEN", "signed URL media filename not authorized");
+    }
+    forwardPath = `/api/media/${encodeURIComponent(decodedPath)}`;
+  } else {
+    let resolved: string;
+    try {
+      resolved = resolvePath(decodedPath);
+    } catch {
+      throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-path");
+    }
+    if (!isContainerPathAllowed(resolved)) {
+      throw new HttpError(403, "FORBIDDEN", "signed URL path not authorized");
+    }
+    forwardPath = `/api/file?path=${encodeURIComponent(decodedPath)}`;
   }
 
   // v1.0.191 冷启动护栏 —— 见 CommercialHttpDeps.ensureContainerReady JSDoc。
@@ -2288,10 +2335,10 @@ export async function handleMediaSigned(
     }
   }
 
-  // 调 containerFileProxy:它内部从 req.url 解析 path → 我们必须把 req.url 改成
-  // `/api/file?path=<encoded decoded path>`,proxy 看到的 pathname 必须是 /api/file
-  // (它按 pathname === '/api/file' 走 isFilePath 分支)。try/finally 恢复原值
-  // (虽然请求结束后 req 不再用,但符合 hygiene)。
+  // 调 containerFileProxy:它内部从 req.url 解析 path。file kind → `/api/file?path=...`
+  // (pathname==='/api/file' 走 isFilePath 分支);media kind → `/api/media/<file>`
+  // (容器 handleMediaGet 双目录搜索,proxy 原样转发 pathname)。forwardPath 已在上方按
+  // mediaKind 定好。try/finally 恢复原值(请求结束后 req 不再用,但符合 hygiene)。
   const log = (_ctx).log;
   const requestId = _ctx.requestId;
   const ctxForProxy: RequestContext = {
@@ -2302,7 +2349,7 @@ export async function handleMediaSigned(
     log,
   };
   const originalUrl = req.url;
-  const newPath = `/api/file?path=${encodeURIComponent(decodedPath)}`;
+  const newPath = forwardPath;
   req.url = newPath;
   try {
     const selfHostIdForProxy = deps.v3Supervisor.selfHostId;

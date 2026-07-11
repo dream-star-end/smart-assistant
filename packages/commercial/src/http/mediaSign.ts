@@ -57,6 +57,9 @@ const USER_ID_RE = /^c:[1-9]\d{0,18}$/
 /** 单条 path 长度上限(防 DoS / URL 过长) */
 const MAX_PATH_LEN = 4096
 
+/** 单个 `/api/media/<file>` 文件名段长度上限(内容寻址 digest.ext / 工具生成名) */
+export const MAX_MEDIA_FILENAME_LEN = 256
+
 /** Sign endpoint 单批 paths 数量上限(对齐 frontend mediaSign.js cap) */
 export const MEDIA_SIGN_BATCH_MAX = 32
 
@@ -115,6 +118,28 @@ export function isContainerPathAllowed(p: string): boolean {
 }
 
 /**
+ * `/api/media/<file>` 的 file 段 sanity check —— **不是 ACL**。
+ *
+ * `/api/media/<digest>.<ext>` 是**内容寻址**的用户上传 / MCP 生成媒体的裸 URL(存库形态)。
+ * 与容器绝对路径(isContainerPathAllowed)不同:它不是文件系统路径,而是一个单段文件名,
+ * 由容器内 `handleMediaGet` 在 uploads/ + generated/ **双目录**里 realpath 解析 +
+ * tenant-scoped predicate 授权。master 端只做**注入形态**筛查:让签名 ticket 不承载
+ * 路径分隔符 / traversal / 控制字符,真正的越权隔离仍在容器内那一层。
+ *
+ * 接受:非空单段文件名,长度 ≤ 256,不含 `/`、`\`、`..`、NUL/控制字符。
+ * 拒绝:`../x`、`a/b.png`、`x\0.png`、空串、超长。
+ */
+export function isMediaFilenameAllowed(f: string): boolean {
+  if (typeof f !== 'string') return false
+  if (f.length === 0 || f.length > MAX_MEDIA_FILENAME_LEN) return false
+  if (f.includes('/') || f.includes('\\')) return false
+  if (f.includes('..')) return false
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control-char screen
+  if (/[\x00-\x1F\x7F]/.test(f)) return false
+  return true
+}
+
+/**
  * 从 bridgeSecret (64-char lowercase hex, see bridgeSecret.ts)派生 MEDIA_SIGN_KEY。
  *
  * 调用方在 registerCommercial 中算一次,把返回的 Buffer 作为 deps 喂给 handlers。
@@ -167,8 +192,15 @@ export function computeSignature(
  *
  * 让调用方按枚举对照映射 HTTP status code(400 / 403 / 410),实现 endpoint 不重复字面量。
  */
+/**
+ * `mediaKind` 决定验签通过后 `/api/media-signed` 把请求转发到容器的哪个端点:
+ *   - `'file'`(默认 / 所有 legacy p-u-e-s token)→ `decodedPath` 是**容器绝对路径**,
+ *     走容器 `/api/file?path=`。
+ *   - `'media'` → `decodedPath` 是**内容寻址媒体文件名**(`<digest>.<ext>`),走容器
+ *     `/api/media/<file>`(uploads/generated 双目录 + tenant scope 在容器内做)。
+ */
 export type VerifyResult =
-  | { kind: 'ok'; userId: string; expMs: number; decodedPath: string }
+  | { kind: 'ok'; userId: string; expMs: number; decodedPath: string; mediaKind: 'file' | 'media' }
   | { kind: 'bad-request'; reason: string }
   | { kind: 'forbidden'; reason: string }
   | { kind: 'gone'; reason: string }
@@ -230,7 +262,8 @@ export function verifySignedUrl(key: Buffer, input: VerifySignatureInput): Verif
   if (expMs <= now) {
     return { kind: 'gone', reason: 'expired' }
   }
-  return { kind: 'ok', userId: u, expMs, decodedPath }
+  // Legacy p-u-e-s URL 恒为容器绝对路径语义(此形态从不签内容寻址媒体)。
+  return { kind: 'ok', userId: u, expMs, decodedPath, mediaKind: 'file' }
 }
 
 interface OpaqueMediaPayload {
@@ -238,6 +271,12 @@ interface OpaqueMediaPayload {
   p: string
   u: string
   e: number
+  /**
+   * 转发语义判别:缺省 / `'file'` = 容器绝对路径(走 `/api/file?path=`);
+   * `'media'` = 内容寻址媒体文件名(走容器 `/api/media/<file>`)。legacy token 无此字段
+   * → 解出 undefined → 归 `'file'`,向后兼容。
+   */
+  k?: 'file' | 'media'
 }
 
 function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): VerifyResult {
@@ -272,6 +311,7 @@ function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): Veri
   const p = (payload as OpaqueMediaPayload).p
   const u = (payload as OpaqueMediaPayload).u
   const expMs = (payload as OpaqueMediaPayload).e
+  const k = (payload as OpaqueMediaPayload).k
   if ((payload as OpaqueMediaPayload).v !== 2) return { kind: 'bad-request', reason: 'bad-token-version' }
   if (typeof p !== 'string' || p.length === 0 || p.length > MAX_PATH_LEN) {
     return { kind: 'bad-request', reason: 'path-too-long' }
@@ -282,9 +322,14 @@ function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): Veri
   if (!Number.isSafeInteger(expMs)) {
     return { kind: 'bad-request', reason: 'bad-exp' }
   }
+  // k 缺省(legacy token)→ 'file';显式值只接受 file/media,其余判伪造。
+  if (k !== undefined && k !== 'file' && k !== 'media') {
+    return { kind: 'bad-request', reason: 'bad-kind' }
+  }
+  const mediaKind: 'file' | 'media' = k === 'media' ? 'media' : 'file'
   const now = nowMs ?? Date.now()
   if (expMs <= now) return { kind: 'gone', reason: 'expired' }
-  return { kind: 'ok', userId: u, expMs, decodedPath: p }
+  return { kind: 'ok', userId: u, expMs, decodedPath: p, mediaKind }
 }
 
 /**
@@ -322,6 +367,36 @@ export function buildOpaqueSignedUrl(
 ): { url: string; expMs: number } {
   const expMs = Date.now() + ttlMs
   const payload: OpaqueMediaPayload = { v: 2, p: decodedPath, u: userId, e: expMs }
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
+  const ct = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  const token = Buffer.concat([iv, tag, ct]).toString('base64url')
+  return { url: `/api/media-signed?t=${encodeURIComponent(token)}`, expMs }
+}
+
+/**
+ * 内容寻址媒体(`/api/media/<digest>.<ext>`)的签名 URL。
+ *
+ * 与 `buildOpaqueSignedUrl` 同一 crypto / TTL / 端点(`/api/media-signed`),只是 payload 打
+ * `k:'media'` + `p=<文件名>`(不是容器绝对路径)。`/api/media-signed` 验签后据 `mediaKind`
+ * 转发到容器 `/api/media/<file>`(uploads/generated 双目录 realpath + tenant scope 由容器内
+ * handleMediaGet 收口)。
+ *
+ * 这条路径把用户上传/生成媒体的渲染从"裸 `<img src=/api/media/...>` 靠 SameSite cookie"
+ * (iOS Safari + CF 下 cookie 被 drop → 持久 401 裂图,de16e2be 同类)迁到**凭证进 URL**
+ * 的签名管线,与容器路径共用同一权威,无第二套机制。
+ *
+ * 调用方负责先用 `isMediaFilenameAllowed(filename)` 过注入形态。
+ */
+export function buildOpaqueMediaFileUrl(
+  key: Buffer,
+  filename: string,
+  userId: string,
+  ttlMs: number = DEFAULT_SIGN_TTL_MS,
+): { url: string; expMs: number } {
+  const expMs = Date.now() + ttlMs
+  const payload: OpaqueMediaPayload = { v: 2, p: filename, u: userId, e: expMs, k: 'media' }
   const iv = randomBytes(12)
   const cipher = createCipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
   const ct = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()])
