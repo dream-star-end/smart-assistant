@@ -21,37 +21,10 @@ import {
   type UpdateGroupInput,
   type UpdateRelayCredentialInput,
 } from "../account-pool/groups.js";
-import { writeAdminAudit } from "./audit.js";
-import { incrAdminAuditWriteFailure } from "./metrics.js";
+import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import type { AdminAuditCtx } from "./accounts.js";
 
-function defaultAuditErrorLog(err: unknown): void {
-  // eslint-disable-next-line no-console
-  console.error("[admin/accountGroups] admin_audit write failed:", err);
-}
-
-async function bestEffortAudit(
-  ctx: AdminAuditCtx,
-  action: string,
-  target: string | null,
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null,
-): Promise<void> {
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: ctx.adminId,
-      action,
-      target,
-      before,
-      after,
-      ip: ctx.ip ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch (err) {
-    incrAdminAuditWriteFailure(action);
-    (ctx.onAuditError ?? defaultAuditErrorLog)(err);
-  }
-}
+// bestEffortAudit 本地实现已收口到 audit.ts writeAdminAuditBestEffort(整改批)。
 
 function groupSnapshot(row: AccountGroupRow): Record<string, unknown> {
   return {

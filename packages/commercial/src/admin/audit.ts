@@ -1,30 +1,48 @@
 /**
- * T-60 — 超管审计共用工具。
+ * T-60 — 超管审计共用工具(审计体系整改批重构)。
  *
- * ### writeAdminAudit
- * 所有 /api/admin/* 的写操作必须走这里落 admin_audit。为了复用现有 tx(例:
- * adminAdjust 已在 billing/ledger 的事务里自己拼 INSERT),这里接受任何
- * `QueryRunner`(pool 或 tx 内的 PoolClient),让调用方决定是否入事务。
+ * ### writeAdminAudit — 唯一写入口
+ * 所有 admin_audit 写入必须走这里(整改批已消灭 billing/ledger 的裸 INSERT 例外)。
+ * 接受任何 `QueryRunner`(pool 或 tx 内的 PoolClient),由 action 注册表
+ * (auditActions.ts)声明该 action 的政策:
+ *   - mode='tx':调用方必须传业务事务内的 client,审计失败 → 业务回滚(fail-closed);
+ *   - mode='best-effort':业务成功后经 writeAdminAuditBestEffort 补写,失败不冒泡
+ *     但有 critical 告警 + Prometheus 计数。
+ * action 参数是注册表字面量类型:未登记的 action 编译不过;运行时再兜一层校验
+ * (防 as-cast 绕过)。
+ *
+ * ### 中央脱敏
+ * before/after 在入口统一过 redactSensitive(auditRedact.ts):敏感 key 的值替换为
+ * {__redacted,len,last4} 元信息。调用点级脱敏(literature/research config)仍保留,
+ * 双保险;此前 system_settings.set 全量 value 明文入库的缺口由本钩子闭合。
  *
  * `before` / `after`:JSON-safe 对象(建议只放受影响字段,完整行审计价值低且容量大)。
  * 超管的 ip/ua 从 RequestContext 取,永远不要从 body 接收。
  *
  * ### listAdminAudit
- * GET /api/admin/audit —— 超管查自己和同行干了啥。keyset(before=id)分页,
- * 同 agent-audit 的思路:PK 索引 + 常数级翻页。支持 `admin_id` / `action` 过滤。
+ * GET /api/admin/audit —— 超管查自己和同行干了啥。keyset(before=id)分页。
+ * 过滤:admin_id / action 前缀 / target 精确 / created_from..created_to 时间窗。
  */
 
 import type { QueryRunner } from "../db/queries.js";
 import { query } from "../db/queries.js";
+import { getPool } from "../db/index.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
+import { incrAdminAuditWriteFailure } from "./metrics.js";
+import {
+  ADMIN_AUDIT_ACTIONS,
+  isAdminAuditAction,
+  type AdminAuditAction,
+} from "./auditActions.js";
+import { redactSensitive } from "./auditRedact.js";
 
 // ─── writeAdminAudit ───────────────────────────────────────────────
 
 export interface WriteAdminAuditInput {
   adminId: bigint | number | string;
-  /** 短动词短语,如 `user.patch` / `credits.adjust` / `pricing.patch`。前端据此分组。 */
-  action: string;
+  /** 注册表字面量(auditActions.ts)。新增 action 先登记再用。 */
+  action: AdminAuditAction;
   /** 受影响对象定位符,如 `user:123` / `account:7` / `model:claude-opus-4-7`。可空。 */
   target?: string | null;
   /** 变更前的关键字段快照。JSON.stringify 可序列化。可空(新建场景)。 */
@@ -37,13 +55,19 @@ export interface WriteAdminAuditInput {
 }
 
 /**
- * 写 admin_audit 一行,返 id。**请在业务事务内调用本函数**(把 tx 内的 client 作为 runner),
- * 避免"业务成功但审计失败"或反过来。如果没有业务 tx(纯读场景),不应调用。
+ * 写 admin_audit 一行,返 id。mode='tx' 的 action **必须在业务事务内调用**(把 tx 内的
+ * client 作为 runner),避免"业务成功但审计丢失";mode='best-effort' 的 action 请用
+ * writeAdminAuditBestEffort,不要直接调本函数再自行 catch(会漏 Prometheus 计数)。
  */
 export async function writeAdminAudit(
   runner: QueryRunner,
   input: WriteAdminAuditInput,
 ): Promise<bigint> {
+  // 运行时兜底:类型系统被 as-cast 绕过时 fail-fast(未登记 action 是编程错误,
+  // 宁可炸在开发/测试期,不让野字符串污染枚举空间)。
+  if (!isAdminAuditAction(input.action)) {
+    throw new Error(`[adminAudit] unregistered action: ${String(input.action)} — 先在 auditActions.ts 登记`);
+  }
   try {
     const r = await runner.query<{ id: string }>(
       `INSERT INTO admin_audit(admin_id, action, target, before, after, ip, user_agent)
@@ -53,8 +77,8 @@ export async function writeAdminAudit(
         String(input.adminId),
         input.action,
         input.target ?? null,
-        input.before === undefined ? null : JSON.stringify(input.before),
-        input.after === undefined ? null : JSON.stringify(input.after),
+        input.before === undefined ? null : JSON.stringify(redactSensitive(input.before)),
+        input.after === undefined ? null : JSON.stringify(redactSensitive(input.after)),
         input.ip ?? null,
         input.userAgent ?? null,
       ],
@@ -83,6 +107,62 @@ export async function writeAdminAudit(
   }
 }
 
+// ─── writeAdminAuditBestEffort — best-effort 政策的中央执行点 ────────
+
+/** 各 admin 模块请求上下文的最小审计投影(accounts.AdminAuditCtx 结构兼容)。 */
+export interface AdminAuditRequestCtx {
+  adminId: bigint | number | string;
+  ip?: string | null;
+  userAgent?: string | null;
+  /** 可选:审计写失败回调(生产应挂监控)。默认 stderr。 */
+  onAuditError?: (err: unknown) => void;
+}
+
+function defaultAuditErrorLog(err: unknown): void {
+  // eslint-disable-next-line no-console
+  console.error("[adminAudit] best-effort write failed:", err);
+}
+
+/**
+ * 业务成功后补写审计;失败不冒泡。此前 accounts/accountGroups/egressProxies/
+ * computeHosts/containers 各自复制粘贴同款 helper——整改批收口到这里,失败行为
+ * 单一权威:writeAdminAudit 内部发 critical 告警 → 本函数 catch → Prometheus
+ * 计数 + onAuditError(或 stderr)。
+ *
+ * mode='tx' 的 action 走到这里=编程错误(敏感操作不得降级为 best-effort),
+ * 同步抛 —— 这是注册表政策的运行时执行点。
+ */
+export async function writeAdminAuditBestEffort(
+  ctx: AdminAuditRequestCtx,
+  action: AdminAuditAction,
+  target: string | null,
+  before: unknown,
+  after: unknown,
+): Promise<void> {
+  if (isAdminAuditAction(action) && ADMIN_AUDIT_ACTIONS[action].mode === "tx") {
+    throw new Error(
+      `[adminAudit] action=${action} 注册为 mode='tx'(fail-closed),禁止走 best-effort — 在业务事务内调 writeAdminAudit`,
+    );
+  }
+  try {
+    await writeAdminAudit(getPool(), {
+      adminId: ctx.adminId,
+      action,
+      target,
+      before,
+      after,
+      ip: ctx.ip ?? null,
+      userAgent: ctx.userAgent ?? null,
+    });
+  } catch (err) {
+    // 两路上报,保证不管 HTTP 层有没有传 onAuditError,运维都能看到:
+    //   1) Prometheus counter(admin_audit_write_failures_total{action=...})→ 告警
+    //   2) ctx.onAuditError(或 stderr)→ 详细错误
+    incrAdminAuditWriteFailure(action);
+    (ctx.onAuditError ?? defaultAuditErrorLog)(err);
+  }
+}
+
 // ─── listAdminAudit ────────────────────────────────────────────────
 
 export interface AdminAuditRowView {
@@ -100,8 +180,14 @@ export interface AdminAuditRowView {
 export interface ListAdminAuditInput {
   /** 可选:按 admin 过滤 */
   adminId?: string | number | bigint;
-  /** 可选:按 action 精确过滤(支持短横/点,不支持 LIKE — 避免扫全表) */
+  /** 可选:按 action 前缀过滤(小写归一,LIKE prefix,命中 text_pattern_ops 索引) */
   action?: string;
+  /** 可选:按 target 精确过滤(格式 `类型:id`) */
+  target?: string;
+  /** 可选:created_at >= from(ISO 8601) */
+  createdFrom?: string;
+  /** 可选:created_at <= to(ISO 8601) */
+  createdTo?: string;
   /** 可选:keyset 游标(取 id < before 的行) */
   before?: string | number | bigint;
   /** 单页行数,默认 50,上限 200 */
@@ -119,6 +205,8 @@ export const ADMIN_AUDIT_MAX_LIMIT = 200;
 /** action 白名单正则:字母数字+点+下划线+短横,1..64 字符。 */
 const ACTION_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const ID_RE = /^[1-9][0-9]{0,19}$/;
+/** target 白名单:注册 action 的 target 都是可打印 ASCII 定位符,cap 128。 */
+const TARGET_RE = /^[\x20-\x7e]{1,128}$/;
 
 function normalizeId(v: string | number | bigint | undefined): string | null {
   if (v === undefined) return null;
@@ -128,6 +216,12 @@ function normalizeId(v: string | number | bigint | undefined): string | null {
     return v.toString();
   }
   return ID_RE.test(v) ? v : null;
+}
+
+function parseIsoDate(v: string, err: string): Date {
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw new RangeError(err);
+  return d;
 }
 
 export async function listAdminAudit(input: ListAdminAuditInput): Promise<ListAdminAuditResult> {
@@ -142,8 +236,23 @@ export async function listAdminAudit(input: ListAdminAuditInput): Promise<ListAd
   let action: string | null = null;
   if (input.action !== undefined) {
     if (!ACTION_RE.test(input.action)) throw new RangeError("invalid_action");
-    action = input.action;
+    // 枚举 action 全小写;入参归一后用 LIKE(可命中 text_pattern_ops 索引,
+    // 旧 ILIKE 任何 btree 都服务不了,必退化扫描)。
+    action = input.action.toLowerCase();
   }
+  let target: string | null = null;
+  if (input.target !== undefined && input.target !== "") {
+    if (!TARGET_RE.test(input.target)) throw new RangeError("invalid_target");
+    target = input.target;
+  }
+  const createdFrom =
+    input.createdFrom === undefined || input.createdFrom === ""
+      ? null
+      : parseIsoDate(input.createdFrom, "invalid_created_from");
+  const createdTo =
+    input.createdTo === undefined || input.createdTo === ""
+      ? null
+      : parseIsoDate(input.createdTo, "invalid_created_to");
 
   let limit = input.limit ?? ADMIN_AUDIT_DEFAULT_LIMIT;
   if (!Number.isInteger(limit) || limit <= 0) limit = ADMIN_AUDIT_DEFAULT_LIMIT;
@@ -153,14 +262,16 @@ export async function listAdminAudit(input: ListAdminAuditInput): Promise<ListAd
   const params: unknown[] = [];
   if (adminId !== null) { params.push(adminId); where.push(`admin_id = $${params.length}`); }
   if (action !== null) {
-    // P1-8 前缀过滤:UI placeholder 写"action 前缀(如 user.)",过去后端是精确比较,
-    // 输 `user.` 会 0 命中。改成 ILIKE prefix。LIKE 元字符 `_`/`%`/`\` escape 必做 ——
-    // ACTION_RE 允许 `_`(`system_settings.set` 是真实 action),不 escape 的话 `system_`
-    // 会匹配任意 7 字符,污染审计查询。`\` 不在 ACTION_RE 字符集,但保留通用 escape。
+    // P1-8 前缀过滤。LIKE 元字符 `_`/`%`/`\` escape 必做 —— ACTION_RE 允许 `_`
+    // (`system_settings.set` 是真实 action),不 escape 的话 `system_` 会匹配任意
+    // 7 字符,污染审计查询。`\` 不在 ACTION_RE 字符集,但保留通用 escape。
     const liked = action.replace(/\\/g, "\\\\").replace(/[_%]/g, "\\$&");
     params.push(`${liked}%`);
-    where.push(`action ILIKE $${params.length} ESCAPE '\\'`);
+    where.push(`action LIKE $${params.length} ESCAPE '\\'`);
   }
+  if (target !== null) { params.push(target); where.push(`target = $${params.length}`); }
+  if (createdFrom !== null) { params.push(createdFrom.toISOString()); where.push(`created_at >= $${params.length}`); }
+  if (createdTo !== null) { params.push(createdTo.toISOString()); where.push(`created_at <= $${params.length}`); }
   if (before !== null) { params.push(before); where.push(`id < $${params.length}`); }
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 

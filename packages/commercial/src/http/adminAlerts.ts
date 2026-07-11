@@ -31,6 +31,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { HttpError, sendJson, readJsonBody } from './util.js'
 import { requireAdmin, requireAdminVerifyDb } from '../admin/requireAdmin.js'
+import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import {
   listAlertChannels,
   createIlinkChannel,
@@ -620,7 +621,7 @@ export async function handleAdminAlertsTestChannel(
     return _handleRebindChannel(req, res, ctx, deps)
   }
   // default: /test
-  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const id = extractChannelId(url, '/api/admin/alerts/channels/', '/test')
   const ch = await getAlertChannel(id)
   if (!ch) throw new HttpError(404, 'NOT_FOUND', 'channel not found')
@@ -658,6 +659,15 @@ export async function handleAdminAlertsTestChannel(
     payload: { channel_id: ch.id, nonce },
     dedupe_key: `system.test_alert:${ch.id}:${nonce}`,
   })
+  // test 分支专属留痕(rebind 走独立 handler,不在此写):测试消息成功入 outbox 后
+  // 记 who tested which channel。只记通道元信息(type/label),绝不含 bot_token/密文。
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+    'alert_channel.test',
+    `alert_channel:${ch.id}`,
+    undefined,
+    { channel_type: ch.channel_type, label: ch.label },
+  )
   sendJson(res, 202, {
     enqueued: result.enqueued,
     note: 'dispatcher will send within ~5s; check outbox row status or the target channel (WeChat / Telegram)',
@@ -915,10 +925,10 @@ export async function handleAdminAlertsListRuleStates(
 export async function handleAdminAlertsRetryOutbox(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const url = urlOf(req)
   const prefix = '/api/admin/alerts/outbox/'
   const suffix = '/retry'
@@ -933,6 +943,13 @@ export async function handleAdminAlertsRetryOutbox(
   if (!result.retried) {
     throw new HttpError(409, 'NOT_RETRYABLE', 'outbox row is not in a retryable state')
   }
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+    'alert_outbox.retry',
+    `alert_outbox:${id}`,
+    undefined,
+    undefined,
+  )
   sendJson(res, 200, { retried: true })
 }
 

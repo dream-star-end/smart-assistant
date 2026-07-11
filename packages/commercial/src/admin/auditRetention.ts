@@ -1,0 +1,153 @@
+/**
+ * 审计/事件表统一 retention(审计体系整改批)。
+ *
+ * 动机:评审发现核心审计表全部无清理(admin_audit/agent_audit/compute_host_audit/
+ * turn_traces/rate_limit_events 无界增长),而外围事件表反而各自长了 sweeper
+ * (account_refresh_events 28d / provider_health 30min / wechat_audit 7d)。
+ * 本模块把"哪张表保留多久"收敛为单一权威注册表 + 一个每日 sweeper,新增事件表
+ * 只需在注册表加一行,不再各自造轮子。
+ *
+ * 政策取值:
+ *   - security_events   180d  安全复盘窗口(半年足够;有告警面做实时性)
+ *   - agent_audit        90d  工具失败遥测,排障价值随时间衰减
+ *   - compute_host_audit 90d  遥测已退出本表(0129),剩真实生命周期事件,量级小,
+ *                             90d 覆盖"host 出事回看历史"场景
+ *   - turn_traces        90d  请求ID→用户/会话反查,计费争议窗口内必须在
+ *   - rate_limit_events  30d  限流命中信号,只喂告警聚合
+ *   - admin_audit        永久  合规审计,显式登记在 PERMANENT_AUDIT_TABLES,
+ *                             不允许出现在删除政策里(sweeper 有 fail-fast 断言)
+ *   - account_refresh_events / provider_health / wechat_audit 已有各自 sweeper,
+ *     不重复纳管(避免双清理权威;登记债:后续可迁入本表统一)
+ *
+ * 运维:COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED=1 一键关停(UX 铁律:限流/清理类
+ * 默认宽松 + env 可回滚)。天数可经 COMMERCIAL_AUDIT_RETENTION_OVERRIDES 覆盖,
+ * 格式 `table=days,table=days`(只允许注册表内的表,防 env 注入任意表名)。
+ */
+
+import { query } from "../db/queries.js";
+
+export interface RetentionPolicy {
+  /** 表名(标识符来自本常量表,永不来自用户输入——SQL 内直接拼接的前提) */
+  table: string;
+  /** 时间列名(同上,常量) */
+  column: string;
+  days: number;
+}
+
+export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
+  { table: "security_events", column: "created_at", days: 180 },
+  { table: "agent_audit", column: "created_at", days: 90 },
+  { table: "compute_host_audit", column: "ts", days: 90 },
+  { table: "turn_traces", column: "created_at", days: 90 },
+  { table: "rate_limit_events", column: "created_at", days: 30 },
+] as const;
+
+/** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */
+export const PERMANENT_AUDIT_TABLES: readonly string[] = ["admin_audit"] as const;
+
+export const AUDIT_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+export interface AuditRetentionSweeperHandle {
+  stop(): void;
+  /** 测试/运维用:立即跑一轮,返回 per-table 删除行数。 */
+  runNow(): Promise<Record<string, number>>;
+}
+
+export interface AuditRetentionSweeperOptions {
+  intervalMs?: number;
+  /** 测试用:首次 boot 立即跑(默认 false,boot 后等 intervalMs,避免启动风暴)。 */
+  runOnStart?: boolean;
+  onError?: (table: string, err: unknown) => void;
+  /** env 覆盖串,默认读 process.env.COMMERCIAL_AUDIT_RETENTION_OVERRIDES。 */
+  overrides?: string;
+  /** 测试用注入:覆盖默认的 DELETE 执行(便于无 DB 单元测试;同 refreshEventsSweeper 惯例)。 */
+  purgeFn?: (p: RetentionPolicy) => Promise<number>;
+}
+
+function defaultOnError(table: string, err: unknown): void {
+  // eslint-disable-next-line no-console
+  console.warn(`[auditRetentionSweeper] purge ${table} failed:`, err);
+}
+
+/** 解析 env 覆盖串;未注册的表名忽略并 warn(不给 env 开任意表删除的口子)。 */
+export function resolveRetentionPolicies(overrides?: string): RetentionPolicy[] {
+  const map = new Map(AUDIT_RETENTION_POLICIES.map((p) => [p.table, { ...p }]));
+  const raw = overrides ?? process.env.COMMERCIAL_AUDIT_RETENTION_OVERRIDES ?? "";
+  for (const pair of raw.split(",")) {
+    const [table, daysStr] = pair.split("=").map((s) => s?.trim());
+    if (!table) continue;
+    const days = Number(daysStr);
+    const p = map.get(table);
+    if (!p) {
+      // eslint-disable-next-line no-console
+      console.warn(`[auditRetentionSweeper] override 忽略未注册表: ${table}`);
+      continue;
+    }
+    if (Number.isFinite(days) && days >= 1) p.days = Math.floor(days);
+  }
+  const resolved = [...map.values()];
+  // fail-fast 断言:永久表绝不允许出现在删除政策里(防未来误加)。
+  for (const p of resolved) {
+    if (PERMANENT_AUDIT_TABLES.includes(p.table)) {
+      throw new Error(`[auditRetentionSweeper] ${p.table} 声明为永久保留,禁止配置删除政策`);
+    }
+  }
+  return resolved;
+}
+
+async function purgeTable(p: RetentionPolicy): Promise<number> {
+  // 标识符来自常量注册表(resolveRetentionPolicies 已过滤 env 注入),可安全拼接。
+  const r = await query(
+    `DELETE FROM ${p.table} WHERE ${p.column} < NOW() - ($1 || ' days')::interval`,
+    [String(p.days)],
+  );
+  return r.rowCount ?? 0;
+}
+
+export function startAuditRetentionSweeper(
+  opts: AuditRetentionSweeperOptions = {},
+): AuditRetentionSweeperHandle {
+  const interval = Math.max(60_000, opts.intervalMs ?? AUDIT_RETENTION_INTERVAL_MS);
+  const onError = opts.onError ?? defaultOnError;
+  const purgeFn = opts.purgeFn ?? purgeTable;
+  const policies = resolveRetentionPolicies(opts.overrides);
+  let stopped = false;
+
+  async function runOneTick(): Promise<Record<string, number>> {
+    const deleted: Record<string, number> = {};
+    for (const p of policies) {
+      if (stopped) break;
+      try {
+        deleted[p.table] = await purgeFn(p);
+      } catch (err) {
+        onError(p.table, err);
+        deleted[p.table] = -1;
+      }
+    }
+    const summary = Object.entries(deleted)
+      .filter(([, n]) => n !== 0)
+      .map(([t, n]) => `${t}=${n}`)
+      .join(" ");
+    if (summary) {
+      // eslint-disable-next-line no-console
+      console.log(`[auditRetentionSweeper] purged: ${summary}`);
+    }
+    return deleted;
+  }
+
+  const timer = setInterval(() => {
+    if (stopped) return;
+    void runOneTick();
+  }, interval);
+  if (typeof timer.unref === "function") timer.unref();
+
+  if (opts.runOnStart) void runOneTick();
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+    runNow: runOneTick,
+  };
+}

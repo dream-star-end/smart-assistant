@@ -25,8 +25,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type Docker from "dockerode";
 import { HttpError, sendJson } from "../util.js";
 import { requireAdmin, requireAdminVerifyDb } from "../../admin/requireAdmin.js";
-import { writeAdminAudit } from "../../admin/audit.js";
-import { getPool } from "../../db/index.js";
+import { writeAdminAuditBestEffort } from "../../admin/audit.js";
 import {
   listContainers,
   adminRestartContainer,
@@ -181,25 +180,21 @@ export async function handleAdminContainerLogs(
   }
   try {
     const logs = await adminContainerLogs(id, docker, lines, deps.v3Supervisor);
-    // Codex MEDIUM#2 补:敏感读 best-effort audit(同 accounts/containers.ts 语义,
-    // 写 admin_audit 失败不阻塞响应)
-    try {
-      await writeAdminAudit(getPool(), {
-        adminId: admin.id,
-        action: "agent_container.logs",
-        target: `agent_container:${id}`,
-        before: null,
-        after: {
-          lines,
-          docker_ref: logs.docker_ref,
-          missing: logs.missing,
-          bytes: logs.combined.length,
-          partial: logs.partial,
-        },
-        ip: ctx.clientIp ?? null,
-        userAgent: ctx.userAgent ?? null,
-      });
-    } catch { /* best-effort */ }
+    // Codex MEDIUM#2 补:敏感读 best-effort audit(写 admin_audit 失败不阻塞响应)。
+    // 整改批:收口中央 writeAdminAuditBestEffort(带 Prometheus 计数)。
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      "agent_container.logs",
+      `agent_container:${id}`,
+      null,
+      {
+        lines,
+        docker_ref: logs.docker_ref,
+        missing: logs.missing,
+        bytes: logs.combined.length,
+        partial: logs.partial,
+      },
+    );
     sendJson(res, 200, {
       id,
       lines,

@@ -46,8 +46,7 @@ import {
   type ListAccountsOptions,
   type UpdateAccountPatch,
 } from "../account-pool/store.js";
-import { writeAdminAudit } from "./audit.js";
-import { incrAdminAuditWriteFailure } from "./metrics.js";
+import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import {
   reassignEgressHost,
 } from "../account-pool/egressAssignment.js";
@@ -85,39 +84,8 @@ export interface AdminAuditCtx {
   triggerCodexDisableFanout?: (accountId: bigint) => void;
 }
 
-function defaultAuditErrorLog(err: unknown): void {
-  // eslint-disable-next-line no-console
-  console.error("[admin/accounts] admin_audit write failed:", err);
-}
-
-/**
- * 在主操作成功后写审计;审计失败不冒泡。
- */
-async function bestEffortAudit(
-  ctx: AdminAuditCtx,
-  action: string,
-  target: string | null,
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null,
-): Promise<void> {
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: ctx.adminId,
-      action,
-      target,
-      before,
-      after,
-      ip: ctx.ip ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch (err) {
-    // 两路上报,保证不管 HTTP 层有没有传 onAuditError,运维都能看到:
-    //   1) Prometheus counter(admin_audit_write_failures_total{action=...})→ 告警
-    //   2) ctx.onAuditError(或 stderr)→ 详细错误
-    incrAdminAuditWriteFailure(action);
-    (ctx.onAuditError ?? defaultAuditErrorLog)(err);
-  }
-}
+// bestEffortAudit 本地实现已收口到 audit.ts writeAdminAuditBestEffort(整改批:
+// 五处复制粘贴的失败行为收敛为单一权威,action 收窄为注册表字面量类型)。
 
 /**
  * 给 audit/UI 使用的代理 URL 脱敏:`http://user:****@host:port`。
