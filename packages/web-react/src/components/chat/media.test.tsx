@@ -52,15 +52,21 @@ describe("ZoomableImage 灯箱", () => {
     expect(img.className).toContain("max-h-72");
   });
 
-  test("点击缩略图 → 打开全尺寸预览 + 新标签原图链接;关闭按钮收起", () => {
+  test("点击缩略图 → 打开全屏查看器:四动作条 + 更多菜单逃生口;关闭收起", () => {
     render(<ZoomableImage src={src} alt="拟合曲线" />);
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
-    const imgs = screen.getAllByAltText("拟合曲线");
-    expect(imgs.length).toBeGreaterThanOrEqual(2);
-    const link = screen.getByRole("link", { name: /新标签打开原图/ });
-    expect(link).toHaveAttribute("href", src);
+    // 全屏查看器展示大图(缩略图 + 查看器两张同 alt)。
+    expect(screen.getAllByAltText("拟合曲线").length).toBeGreaterThanOrEqual(2);
+    // 底部四动作条(圆钮 + 中文标签)。
+    for (const label of ["编辑", "评论", "调整大小", "移除"]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+    }
+    // 「新标签打开原图」逃生口收进更多菜单。
+    fireEvent.click(screen.getByRole("button", { name: "更多" }));
+    expect(screen.getByRole("button", { name: /新标签打开原图/ })).toBeInTheDocument();
+    // 关闭按钮收起查看器。
     fireEvent.click(screen.getByRole("button", { name: "关闭预览" }));
-    expect(screen.queryByRole("link", { name: /新标签打开原图/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
   });
 
   test("无 alt → 按钮名回退'放大查看图片'", () => {
@@ -161,8 +167,8 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
   });
 });
 
-describe("ZoomableImage 灯箱开启时刷新签名", () => {
-  test("传 signPath → 开灯箱现场重签,原图链接用新 URL", async () => {
+describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", () => {
+  test("传 signPath → 开查看器现场重签,大图 src 用新 URL", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const sign = makeSignMock();
     render(
@@ -170,13 +176,29 @@ describe("ZoomableImage 灯箱开启时刷新签名", () => {
         <ZoomableImage src="/api/media-signed?t=stale" alt="图表" signPath="/home/agent/a.png" />
       </MediaSignProvider>,
     );
-    vi.advanceTimersByTime(5 * 60_000); // 挂载 5 分钟后才点开大图
+    vi.advanceTimersByTime(5 * 60_000); // 挂载 5 分钟后才点开大图,挂载缓存已过期
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
     await waitFor(() => {
-      expect(screen.getByRole("link", { name: /新标签打开原图/ })).toHaveAttribute(
-        "href",
-        "/api/media-signed?t=v1",
-      );
+      const imgs = screen.getAllByAltText("图表") as HTMLImageElement[];
+      expect(imgs.some((im) => im.getAttribute("src") === "/api/media-signed?t=v1")).toBe(true);
     });
+  });
+
+  test("点下载 → 手势内现签,交原生下载用最新签名 URL", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const sign = makeSignMock();
+    const hrefs: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      hrefs.push(this.href);
+    });
+    render(
+      <MediaSignProvider sign={sign}>
+        <ZoomableImage src="/api/media-signed?t=stale" alt="图表" signPath="/home/agent/a.png" />
+      </MediaSignProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /放大查看/ })); // 开查看器 → 现签 v1
+    fireEvent.click(screen.getByRole("button", { name: "下载" })); // 点下载 → 复用/重签后交原生下载
+    await waitFor(() => expect(hrefs.length).toBeGreaterThan(0));
+    expect(hrefs.some((h) => h.includes("/api/media-signed?t=v"))).toBe(true);
   });
 });
