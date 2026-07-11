@@ -648,7 +648,7 @@ smoke() {
   #     runtime_channel 行级隔离;只唤醒容器不做执行/送达。关停:COMMERCIAL_CRON_WAKE_DISABLED=1)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert cronWake"
   if [[ "$leader" == "1" ]]; then
-    allowed="$allowed containerEvents alert refreshEventsSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
+    allowed="$allowed containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
   fi
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"

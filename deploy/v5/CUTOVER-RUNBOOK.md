@@ -38,7 +38,7 @@ rule 2 强制),v5 fail-closed 不变量按域断言(shared 域出现在 v5 → �
 
 | 域 | 语义 | 谁运行 | 成员 |
 |---|---|---|---|
-| `shared` | 写共享现网数据(订单/账号池/容器面/邮件) | 仅 controlPlaneEnabled(v3 leader) | lifecycle, idleSweep, volumeGc, orphanReconcile, migrationReconcile, healthPoller, containerEvents, imagePromote, alert, refreshEventsSweep, cooldownRecovery, pendingOrdersExpirer, finalizeReconciler, onboarding, inboxEmail, researchJobs, wechatBroker |
+| `shared` | 写共享现网数据(订单/账号池/容器面/邮件) | 仅 controlPlaneEnabled(v3 leader) | lifecycle, idleSweep, volumeGc, orphanReconcile, migrationReconcile, healthPoller, containerEvents, imagePromote, alert, refreshEventsSweep, auditRetentionSweep, cooldownRecovery, pendingOrdersExpirer, finalizeReconciler, onboarding, inboxEmail, researchJobs, wechatBroker |
 | `v5-owned` | v5 独有数据域(v3 现网树无对应代码) | v5(及 controlPlaneEnabled) | subscriptionRollover(0096:free 月度重置/到期降级) |
 | `local` | 纯进程内自愈,无共享副作用 | 所有 channel | accountSlotReaper(slot 租约泄漏回收,防虚假 429) |
 
