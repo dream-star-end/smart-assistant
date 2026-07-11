@@ -45,23 +45,14 @@ import {
   canonicalizeAgentManifest,
   validateAgentManifest,
 } from './agentManifest.js'
-import {
-  canonicalBundleJson,
-  scanScriptContent,
-  validateBenchmark,
-  validateBundleFiles,
-} from './bundle.js'
 import { HumanMetaError, type HumanMeta, humanMetaScanBody, parseHumanMeta } from './marketplaceMeta.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
+import { PUBLISH_MAX_REQUEST_BYTES, prepareSkillPublish } from './publishSkillPipeline.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 const VERSION_RE = /^\d+\.\d+\.\d+$/
 const AGENT_ID_RE = /^[A-Za-z0-9_-]+$/
-const MAX_BODY = 64 * 1024
-// tags become a YAML inline-array in the canonical SKILL.md ([a, b]); reject any
-// character that could break/inject that array (comma/bracket/quote/angle/newline).
-const TAG_SAFE_RE = /^[^,[\]"'<>\r\n]{1,64}$/
 
 function uid(user: { id: string }): number {
   const n = Number.parseInt(user.id, 10)
@@ -93,20 +84,6 @@ function rejectionNote(v: unknown): string {
   const note = typeof v === 'string' ? v.trim().slice(0, 2000) : ''
   if (!note) throw new HttpError(400, 'BAD_REQUEST', '拒绝时必须填写理由')
   return note
-}
-
-function asTags(v: unknown): string[] {
-  if (v === undefined) return []
-  if (!Array.isArray(v)) throw new HttpError(400, 'BAD_REQUEST', 'tags must be an array')
-  const out: string[] = []
-  for (const t of v) {
-    if (typeof t !== 'string') throw new HttpError(400, 'BAD_REQUEST', 'tag must be a string')
-    const tag = t.trim()
-    if (!tag) continue
-    if (!TAG_SAFE_RE.test(tag)) throw new HttpError(400, 'BAD_REQUEST', 'tag 含非法字符')
-    out.push(tag)
-  }
-  return out.slice(0, 16)
 }
 
 function asAgentIds(v: unknown, fallback: string[] = ['main']): string[] {
@@ -204,120 +181,50 @@ export async function handleMarketplacePublish(
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
-  const body = (await readJsonBody(req)) as Record<string, unknown>
-  const slug = asStr(body.slug, 'slug', 64)
-  if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
-  const version = asStr(body.version, 'version', 16)
-  if (!VERSION_RE.test(version)) throw new HttpError(400, 'BAD_VERSION', 'version 须为 N.N.N')
-  const name = asStr(body.name, 'name', 64)
-  const description = asStr(body.description, 'description', 1024)
-  const skillBody = asStr(body.body, 'body', MAX_BODY)
-  const tags = asTags(body.tags)
-  // 人向商品层元数据(必填 category/useCases;单一校验权威 parseHumanMeta)→ 校验失败 400。
-  const humanMeta = parseHumanMetaOr400(body)
-
-  // 附属文件(references/assets/evals;scripts 暂拒)+ 发布者自报评测摘要。
-  const bundleV = validateBundleFiles(
-    Array.isArray(body.files) ? (body.files as Array<{ path?: unknown; content?: unknown }>) : undefined,
-  )
-  if (!bundleV.ok) {
+  // 发布是唯一携带 bundle 的入口,body 上限放大到 PUBLISH_MAX_REQUEST_BYTES
+  // (历史 bug:全局 64KB 默认让满额 bundle 在这里 413,能力被静默阉割)。
+  const body = (await readJsonBody(req, PUBLISH_MAX_REQUEST_BYTES)) as Record<string, unknown>
+  // 内容校验/扫描/规范化全部走单一权威管线(与容器内部代理同源)。
+  const prepared = prepareSkillPublish(body)
+  if (!prepared.ok) {
+    if (prepared.status === 400) throw new HttpError(400, prepared.code, prepared.message)
     sendJson(res, 422, {
-      error: { code: 'BAD_BUNDLE', message: '附属文件不合法,请按提示修正' },
-      errors: bundleV.errors,
+      error: { code: prepared.code, message: prepared.message },
+      ...(prepared.errors ? { errors: prepared.errors } : {}),
+      ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
     })
     return
   }
-  const benchV = validateBenchmark(body.benchmark)
-  if (!benchV.ok) {
-    sendJson(res, 422, { error: { code: 'BAD_BENCHMARK', message: benchV.error } })
-    return
-  }
-
-  const scan = scanSkillArtifact({ name, description, tags, body: skillBody })
-  if (scan.blocked) {
-    sendJson(res, 422, {
-      error: { code: 'SCAN_BLOCKED', message: '发布被静态安全扫描拦截,请修正后重试' },
-      riskFlags: scan.flags,
-    })
-    return
-  }
-  // 人向商品页文案(用例/效果/富介绍)与正文同规则扫描,防注入/密钥进商品页。
-  if (humanMetaScanBlocked(res, name, humanMeta)) return
-  // 逐附属文件走同一静态扫描(密钥/注入/内网地址等对文本文件同样适用);
-  // scripts/ 额外过危险模式扫描:毁灭性/远程管道执行直接拦,可疑模式作为
-  // warning flag 随版本入库(审核页可见,人审判断)。
-  const scriptFlags: ReturnType<typeof scanScriptContent> = []
-  if (bundleV.bundle) {
-    for (const [path, content] of Object.entries(bundleV.bundle)) {
-      const fscan = scanSkillArtifact({ name: slug, description: path, tags: [], body: content })
-      if (fscan.blocked) {
-        sendJson(res, 422, {
-          error: { code: 'SCAN_BLOCKED', message: `附属文件 ${path} 被安全扫描拦截` },
-          riskFlags: fscan.flags,
-        })
-        return
-      }
-      if (path.startsWith('scripts/')) {
-        const sflags = scanScriptContent(path, content)
-        const blocked = sflags.filter((f) => f.block)
-        if (blocked.length > 0) {
-          sendJson(res, 422, {
-            error: { code: 'SCAN_BLOCKED', message: `脚本 ${path} 命中危险模式,发布被拦截` },
-            riskFlags: sflags,
-          })
-          return
-        }
-        scriptFlags.push(...sflags)
-      }
-    }
-  }
-
-  // Reconstruct a canonical SKILL.md so the stored artifact == what installs.
-  // The frontmatter `name` is the slug (NOT the display name): the runtime skill
-  // overlay keys a skill by its frontmatter name AND resolves view() by the dir
-  // name, and the hub writes each skill into a dir named after the slug. Using
-  // the slug here keeps name===dir, so the installed skill is both listed and
-  // viewable. The human-friendly `name` lives in the DB for the storefront only.
-  const fm = [
-    '---',
-    `name: ${slug}`,
-    `description: ${JSON.stringify(description)}`,
-    ...(tags.length ? [`tags: [${tags.join(', ')}]`] : []),
-    `version: ${version}`,
-    '---',
-    '',
-  ].join('\n')
-  const rawSkillMd = `${fm + skillBody.replace(/\r\n/g, '\n').trimEnd()}\n`
 
   const orgId = await resolvePublishOrgId(uid(user), body.visibility)
   try {
     const { versionId } = await publishSkillVersion({
-      slug,
+      slug: prepared.slug,
       ownerUserId: uid(user),
-      version,
-      name,
-      description,
-      tags,
-      rawSkillMd,
-      artifactHash: marketplaceArtifactHash(rawSkillMd),
-      embeddingHash: skillContentHash({ name, description, tags, use_cases: humanMeta.useCases }),
-      riskFlags: [...scan.flags, ...scriptFlags],
-      policyVersion: scan.policyVersion,
+      version: prepared.version,
+      name: prepared.name,
+      description: prepared.description,
+      tags: prepared.tags,
+      rawSkillMd: prepared.rawSkillMd,
+      artifactHash: prepared.artifactHash,
+      embeddingHash: prepared.embeddingHash,
+      riskFlags: prepared.riskFlags,
+      policyVersion: prepared.policyVersion,
       submittedBy: uid(user),
-      rawBundle: bundleV.bundle,
-      benchmark: benchV.benchmark,
+      rawBundle: prepared.rawBundle,
+      benchmark: prepared.benchmark,
       orgId,
-      category: humanMeta.category,
-      useCases: humanMeta.useCases,
-      outcomeExamples: humanMeta.outcomeExamples,
-      humanMd: humanMeta.humanMd,
+      category: prepared.humanMeta.category,
+      useCases: prepared.humanMeta.useCases,
+      outcomeExamples: prepared.humanMeta.outcomeExamples,
+      humanMd: prepared.humanMeta.humanMd,
     })
     sendJson(res, 200, {
       ok: true,
       versionId,
       status: 'pending',
       // 含 scripts 危险模式的 warning flag —— 发布者与审核者看到同一份提示。
-      riskFlags: [...scan.flags, ...scriptFlags],
+      riskFlags: prepared.riskFlags,
       note: '已提交,平台审核通过后才会上架并对其他用户可见。',
     })
   } catch (e) {

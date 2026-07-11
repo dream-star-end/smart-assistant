@@ -51,6 +51,10 @@ import {
   parseHumanMeta,
 } from '../marketplace/marketplaceMeta.js'
 import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
+import {
+  PUBLISH_MAX_REQUEST_BYTES,
+  prepareSkillPublish,
+} from '../marketplace/publishSkillPipeline.js'
 import { scanSkillArtifact } from '../marketplace/skillScanner.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
@@ -86,12 +90,15 @@ function send(res: ServerResponse, status: number, body: unknown, requestId: str
   res.end(JSON.stringify({ ...(body as object), requestId }))
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readBody(
+  req: IncomingMessage,
+  maxBytes = MAX_BODY,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const c of req) {
     total += (c as Buffer).length
-    if (total > MAX_BODY + 4096) throw new Error('body too large')
+    if (total > maxBytes + 4096) throw new Error('body too large')
     chunks.push(c as Buffer)
   }
   if (chunks.length === 0) return {}
@@ -351,7 +358,9 @@ async function handlePublish(
   callerOrgId: string | null,
   deps: MarketplaceAgentDeps,
 ): Promise<void> {
-  const body = await readBody(req)
+  // 发布是唯一携带 bundle(正文 + 附属文件)的 op,读取上限随发布管线放大;
+  // 其余 op 维持默认 64KB。
+  const body = await readBody(req, PUBLISH_MAX_REQUEST_BYTES)
   const kind = body.kind === 'agent' ? 'agent' : 'skill'
   const slug = asStr(body.slug, 64)
   if (!slug || !SLUG_RE.test(slug))
@@ -365,6 +374,62 @@ async function handlePublish(
       { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的技能' } },
       requestId,
     )
+
+  if (kind === 'skill') {
+    // 内容校验/扫描/规范化走与浏览器发布路由同一条权威管线 —— 容器路径由此获得
+    // bundle(references/assets/evals/scripts)、benchmark 与逐附属文件扫描。
+    // (历史:两条路径各写一套已漂移,容器内只能发单文件技能。)
+    const prepared = prepareSkillPublish(body)
+    if (!prepared.ok)
+      return send(
+        res,
+        prepared.status,
+        {
+          error: { code: prepared.code, message: prepared.message },
+          ...(prepared.errors ? { errors: prepared.errors } : {}),
+          ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+        },
+        requestId,
+      )
+    const { versionId } = await publishSkillVersion({
+      slug: prepared.slug,
+      ownerUserId: userId,
+      version: prepared.version,
+      name: prepared.name,
+      description: prepared.description,
+      tags: prepared.tags,
+      rawSkillMd: prepared.rawSkillMd,
+      artifactHash: prepared.artifactHash,
+      embeddingHash: prepared.embeddingHash,
+      riskFlags: prepared.riskFlags,
+      policyVersion: prepared.policyVersion,
+      submittedBy: userId,
+      kind: 'skill',
+      rawBundle: prepared.rawBundle,
+      benchmark: prepared.benchmark,
+      orgId,
+      category: prepared.humanMeta.category,
+      useCases: prepared.humanMeta.useCases,
+      outcomeExamples: prepared.humanMeta.outcomeExamples,
+      humanMd: prepared.humanMeta.humanMd,
+    })
+    send(
+      res,
+      200,
+      {
+        ok: true,
+        versionId,
+        status: 'pending',
+        // 含 scripts 危险模式 warning flag —— 发布者(容器内 AI)与审核者看同一份。
+        riskFlags: prepared.riskFlags,
+        note: '已提交,平台审核通过后才会上架。',
+      },
+      requestId,
+    )
+    return
+  }
+
+  // ── agent 分支(字段权威 = validateAgentManifest,维持既有校验序) ──
   const version = asStr(body.version, 16)
   if (!version || !VERSION_RE.test(version))
     return send(res, 400, { error: { code: 'BAD_VERSION' } }, requestId)
@@ -377,7 +442,7 @@ async function handlePublish(
       { error: { code: 'BAD_REQUEST', message: 'name/description required' } },
       requestId,
     )
-  const tags = asTags(body.tags)
+  asTags(body.tags) // 早期 400 门(bad tag → 外层 catch);manifest 校验才是 tags 权威
   // 人向商品层元数据(必填 category/useCases;单一校验权威)→ HumanMetaError 由外层 catch 映射 400。
   const humanMeta = parseHumanMeta(body)
   // 商品页文案与正文同规则扫描,防注入/密钥进商品页。
@@ -395,58 +460,6 @@ async function handlePublish(
       requestId,
     )
 
-  if (kind === 'skill') {
-    const skillBody = asStr(body.body, MAX_BODY)
-    if (!skillBody)
-      return send(res, 400, { error: { code: 'BAD_REQUEST', message: 'body required' } }, requestId)
-    const scan = scanSkillArtifact({ name, description, tags, body: skillBody })
-    if (scan.blocked)
-      return send(
-        res,
-        422,
-        { error: { code: 'SCAN_BLOCKED', message: '被静态扫描拦截' }, riskFlags: scan.flags },
-        requestId,
-      )
-    const fm = [
-      '---',
-      `name: ${slug}`,
-      `description: ${JSON.stringify(description)}`,
-      ...(tags.length ? [`tags: [${tags.join(', ')}]`] : []),
-      `version: ${version}`,
-      '---',
-      '',
-    ].join('\n')
-    const rawSkillMd = `${fm + skillBody.replace(/\r\n/g, '\n').trimEnd()}\n`
-    const { versionId } = await publishSkillVersion({
-      slug,
-      ownerUserId: userId,
-      version,
-      name,
-      description,
-      tags,
-      rawSkillMd,
-      artifactHash: marketplaceArtifactHash(rawSkillMd),
-      embeddingHash: skillContentHash({ name, description, tags, use_cases: humanMeta.useCases }),
-      riskFlags: scan.flags,
-      policyVersion: scan.policyVersion,
-      submittedBy: userId,
-      kind: 'skill',
-      orgId,
-      category: humanMeta.category,
-      useCases: humanMeta.useCases,
-      outcomeExamples: humanMeta.outcomeExamples,
-      humanMd: humanMeta.humanMd,
-    })
-    send(
-      res,
-      200,
-      { ok: true, versionId, status: 'pending', note: '已提交,平台审核通过后才会上架。' },
-      requestId,
-    )
-    return
-  }
-
-  // agent
   let allowedModels: Set<string>
   try {
     if (!deps.listPublicModels) throw new Error('no pricing')

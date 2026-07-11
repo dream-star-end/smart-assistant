@@ -232,23 +232,26 @@ export function userAgentOf(req: IncomingMessage): string | null {
 }
 
 /** 读 raw body(含大小上限)。JSON / form 两个 helper 共用。 */
-async function readRawBody(req: IncomingMessage): Promise<string> {
+async function readRawBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
     const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
-    if (total > MAX_BODY_BYTES) {
-      throw new HttpError(413, "PAYLOAD_TOO_LARGE", `request body exceeds ${MAX_BODY_BYTES} bytes`);
+    if (total > maxBytes) {
+      throw new HttpError(413, "PAYLOAD_TOO_LARGE", `request body exceeds ${maxBytes} bytes`);
     }
     chunks.push(buf);
   }
   return total === 0 ? "" : Buffer.concat(chunks).toString("utf8");
 }
 
-/** 安全 JSON body 读取,带大小上限。 */
-export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const text = await readRawBody(req);
+/**
+ * 安全 JSON body 读取,带大小上限。默认 64KB 挡 DoS;仅确有大载荷语义的路由
+ * (目前只有市场发布:正文+bundle)显式传更大的 maxBytes,不放大全局攻击面。
+ */
+export async function readJsonBody(req: IncomingMessage, maxBytes?: number): Promise<unknown> {
+  const text = await readRawBody(req, maxBytes);
   if (text.length === 0) return undefined;
   try {
     return JSON.parse(text);
