@@ -90,5 +90,11 @@ export default defineConfig({
     environment: 'jsdom',
     globals: false,
     setupFiles: ['./src/test/setup.ts'],
+    // 用例级超时与 setup.ts 的 asyncUtilTimeout(5s)拉开梯度:waitFor 先于用例超时
+    // 报出精确断言错误,而不是笼统的 "Test timed out"。
+    // 显式权衡:**不**关 fileParallelism —— 实测本机串行 7m12s vs 并行 ~1m(CI 4vCPU
+    // 并行 ~72s),6 倍税不可接受;并行下的截止线饥饿由 asyncUtilTimeout 校准根治,
+    // 时序竞态一律修在交互语义上(等 enabled 再点/先等 boot 选中落定),不靠串行掩盖。
+    testTimeout: 15_000,
   },
 })

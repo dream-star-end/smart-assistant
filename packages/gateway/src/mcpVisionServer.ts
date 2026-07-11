@@ -467,8 +467,12 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
+// 锁的语义是「每容器最多 N 个并发识图」:生产里每容器 /tmp 独立,tmpdir() 即容器域。
+// 测试里多个 test 进程共享宿主 /tmp,同名 slot 会跨文件互踩(node --test 按文件并行),
+// 故允许 OPENCLAUDE_VISION_LOCK_DIR 显式指定锁域;生产不设置,默认 tmpdir() 语义不变。
 function lockPathForSlot(slot: number): string {
-  return join(tmpdir(), `openclaude-vision-codex.${slot}.lock`)
+  const base = process.env.OPENCLAUDE_VISION_LOCK_DIR?.trim() || tmpdir()
+  return join(base, `openclaude-vision-codex.${slot}.lock`)
 }
 
 function malformedLockStartedAtMs(lockPath: string): number {

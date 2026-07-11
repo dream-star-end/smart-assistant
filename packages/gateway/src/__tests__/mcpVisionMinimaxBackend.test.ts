@@ -7,6 +7,9 @@ import { STATIC_KEY_PROVIDERS } from '@openclaude/protocol'
 
 const home = mkdtempSync(join(tmpdir(), 'oc-vision-mm-'))
 process.env.OPENCLAUDE_HOME = home
+// 锁域按测试进程隔离(与 mcpVisionServer.test.ts 同理):否则并行文件抢同一把
+// 宿主 /tmp slot 锁,偶发 "another image understanding request is already running"。
+process.env.OPENCLAUDE_VISION_LOCK_DIR = mkdtempSync(join(tmpdir(), 'oc-vision-mm-lock-'))
 
 const vision = await import('../mcpVisionServer.js')
 
