@@ -691,6 +691,20 @@ export type SkillEvalRun = {
   finishedAt: number | null;
 };
 
+/**
+ * AI 生成评测用例 job(GET /api/skill-eval-gen/:runId)。
+ * 生成绝不落库 —— done 时只回草稿 cases,前端灌进编辑器变 dirty 态,保存仍走
+ * PUT /api/skills/:name/evals(唯一写路径)。异步轻量 job,同技能不并发。
+ */
+export type SkillEvalGenJob = {
+  status: "running" | "done" | "failed";
+  /** 仅 done:草稿用例(id 已由服务端归一化为 gen-1..n,避免与现有用例冲突)。 */
+  cases?: SkillEvalCase[];
+  /** 失败原因,或"无真实使用记录,按声明场景推导"之类提示。 */
+  note?: string;
+  usage?: SkillRunUsage;
+};
+
 /** 训练 run(GET /api/skill-training/:runId 的 run)。 */
 export type SkillTrainRun = {
   runId: string;

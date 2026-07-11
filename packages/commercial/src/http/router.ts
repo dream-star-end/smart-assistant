@@ -366,6 +366,14 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // allowlist)。这里 block host 兜底,防 proxy 关闭/admin 绕过时落到 master host。
   { re: /^\/api\/skills\/[A-Za-z0-9_\-]+\/train$/, label: '/api/skills/:name/train' },
   { re: /^\/api\/skill-training\/.+$/, label: '/api/skill-training/*' },
+  // 技能评测/用例生成家族(evals 读写 + eval-run + AI 生成 + run 轮询):与 train 同性质——
+  // 落 host singleton 存储 + 起 host 主 agent 会话(评测/生成 turn)= RCE/越权面,付费用户
+  // 必须经 container proxy。此前 eval 家族上线(82d54b02)漏了这层 host 兜底(bridge
+  // allowlist 有、BLOCKED 无);gen 路由上线时一并补齐**整个家族**的纵深防御。
+  { re: /^\/api\/skills\/[A-Za-z0-9_\-]+\/evals(\/generate)?$/, label: '/api/skills/:name/evals' },
+  { re: /^\/api\/skills\/[A-Za-z0-9_\-]+\/eval-run$/, label: '/api/skills/:name/eval-run' },
+  { re: /^\/api\/skill-eval\/.+$/, label: '/api/skill-eval/*' },
+  { re: /^\/api\/skill-eval-gen\/.+$/, label: '/api/skill-eval-gen/*' },
   // NOTE: /api/marketplace/* is deliberately NOT in this table. This table 403s
   // *commercial browser users*, but the marketplace is a browser-facing feature
   // those exact users must reach. Agent-bypass is enforced structurally instead:

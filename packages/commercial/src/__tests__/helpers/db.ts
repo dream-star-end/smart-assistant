@@ -43,3 +43,29 @@ export async function truncateAllForTest(
   const sql = `TRUNCATE TABLE ${tables.join(", ")} RESTART IDENTITY CASCADE`;
   await query(sql, [], runner);
 }
+
+/**
+ * 整库 schema 重置(DROP SCHEMA public CASCADE + 重建),供"重放全部迁移"型套件的
+ * before 钩子使用。
+ *
+ * 动机(2026-07-11):此前这类套件各自维护一份 COMMERCIAL_TABLES 手工清单,DROP 清单
+ * 后重放迁移 —— 新迁移加的表(如 admin_alert_channels)没进清单就撞"already exists",
+ * 且该清单在 33 个测试文件里各复制一份、独立漂移(一类必然复发的坑)。schema 级重置
+ * 零清单维护,迁移从零重放,确定性成立。其余仍用手工清单的套件属登记债,逐个迁移时
+ * 改用本函数。
+ *
+ * 防护与 truncateAllForTest 同源:库名必须以 `_test` 结尾,防 .env 配错清了生产库。
+ */
+export async function resetTestSchemaForTest(
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<void> {
+  const dbResult = await runner.query<{ db: string }>("SELECT current_database() AS db");
+  const db = dbResult.rows[0]?.db;
+  if (!db || !SAFE_DB_NAME.test(db)) {
+    throw new Error(
+      `resetTestSchemaForTest refuses to run against non-test database: ${JSON.stringify(db)}`,
+    );
+  }
+  await query("DROP SCHEMA public CASCADE", [], runner);
+  await query("CREATE SCHEMA public", [], runner);
+}
