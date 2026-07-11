@@ -313,6 +313,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
+| agent 发布胶水双份 | 技能发布已收口 prepareSkillPublish 单一权威(166e9ecc,浏览器路由+容器内部代理同源,bundle/benchmark/逐文件扫描对齐);**agent 发布**的胶水校验(字段序/humanMeta/metaScan → validateAgentManifest)在 marketplaceRoutes 与 internalMarketplaceAgent 仍各一份,本批仅对齐 visibility 剔除清单未收口 | 下次改 agent 发布逻辑时(改一处必须同步另一处,或顺手收口成 prepareAgentPublish) |
 | ~~会话归档孤儿清理~~ **已偿还**(2026-07-10,feat/v5-concurrency-guards) | deleteClientSession 软删同事务级联清 archive_chunks/archived_ids | — |
 | admin 归档 offset 深翻 O(skip/200) | admin sessions 视图 offset 分页越过尾巴走归档 cursor walk,深 offset 重走前缀页;单人低频诊断可接受 | admin 前端改用与用户面 /archive 一致的 cursor 翻页 |
 | ~~团队卡 server-authored 化~~ **已偿还**(4202986b+ac966d6f,P2 批次2) | 生成点=handleDelegateTask 收尾(parser Agent 排除保留);sink agentGroups[]→master role 'agent-group'(srv-*,_delegateStatus 三态)→storage/前端按 _delegateRunId **local-wins** 去重;server 行=骨架+终态(过程树有意不持久化,本设备 IndexedDB 承载)。**部署红线:master-first**(strict schema 新字段,新 gateway→旧 master 400 fatal-drop 整包)。TeamPanel 同批改按 turn 锚点归组 | — |
