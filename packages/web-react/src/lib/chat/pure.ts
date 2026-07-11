@@ -478,6 +478,9 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   // 供给类 close 的 status.label 也有可读文案,不落裸倒计时。
   provisioning: "环境启动中，正在为你准备工作区",
   starting: "环境启动中，正在为你准备工作区",
+  // 4509 服务重启/发版(CLOSE_BRIDGE.SERVER_RESTART):瞬态,自动重连+resume 续传,
+  // 只在连接横幅露出,不进会话正文。
+  server_restart: "服务更新中，正在自动重连…",
   host_full: "资源繁忙，正在排队重试",
   migration_in_progress: "环境迁移中，稍后自动重试",
   image_missing: "运行镜像未就绪，管理员处理中",
@@ -508,6 +511,16 @@ export function classifyClose(code: number, reason: unknown): CloseDecision {
   const policy = nonAuthPolicyCloseInfo(code, reason);
   if (policy) return { action: "policy", policy, serverHintedDelay: 0, provisioning: false, closeReasonLabel: "" };
   if (code === 1008) return { action: "auth_1008", serverHintedDelay: 0, provisioning: false, closeReasonLabel: "" };
+  // 4509 服务重启/发版(服务端 CLOSE_BRIDGE.SERVER_RESTART,两端语义务必同改):瞬态,
+  // 走标准退避立即自动重连(蓝绿重启秒级),横幅露「服务更新中」;绝不弹错/不进正文。
+  if (code === 4509) {
+    return {
+      action: "reconnect",
+      serverHintedDelay: 0,
+      provisioning: false,
+      closeReasonLabel: CLOSE_REASON_LABELS.server_restart,
+    };
+  }
 
   let serverHintedDelay = 0;
   let provisioning = false;
@@ -562,7 +575,9 @@ export function normalizeBridgeErrorCode(code: unknown): string {
   if (upper === "ERR_INSUFFICIENT_CREDITS" || upper === "INSUFFICIENT_CREDITS") return "insufficient_credits";
   if (upper === "UNAUTHORIZED_MODEL") return "unauthorized_model";
   if (upper === "MAINTENANCE") return "maintenance";
-  // 连接被踢/服务重启/背压关闭等 bridge 连接态错误 → 统一归一为 conn_kicked(友好"连接已断开")。
+  // 连接态错误归一(**遗留兼容**:新 bridge 已不再对 kick/重启/背压发 turn 级 error 帧,
+  // 连接态信号全走 close code——4505/4509/1009,见 classifyClose;此映射只兜旧 master
+  // 回滚窗口的残帧,不应再有新增发射点)。
   if (upper === "ERR_CONN_KICKED" || upper === "CONN_KICKED") return "conn_kicked";
   if (upper === "ERR_BACKPRESSURE" || upper === "BACKPRESSURE") return "conn_kicked";
   // codex_* v5 不会到达，保留归一化无害（删 codex 专属 UI 文案即可）。
@@ -582,7 +597,8 @@ export function friendlyBridgeErrorMessage(code: unknown, message?: string): str
   if (n === "insufficient_credits") return "余额不足，充值后即可继续使用。";
   if (n === "unauthorized_model") return "当前账号尚未开通这个模型，请切换模型或联系管理员。";
   if (n === "maintenance") return "服务正在维护中，请稍后再试。";
-  if (n === "conn_kicked") return "连接已断开（服务重启或被新会话顶替），刷新页面即可继续。";
+  // 遗留兼容文案(新 bridge 不再发该帧):如实告知会自动恢复,不再误导用户手动刷新。
+  if (n === "conn_kicked") return "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。";
   if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";
   if (n === "codex_pool_busy") return "账号池繁忙，请稍后重试。";
   // 未知码:回友好通用文案,不把裸技术消息(如 "server shutting down")抛给用户;
@@ -595,6 +611,9 @@ export const EXPECTED_TURN_ERR_CODES = new Set([
   "insufficient_credits",
   "unauthorized_model",
   "maintenance",
+  // 连接态瞬态(遗留残帧才会出现):部署/踢连接不是 turn 故障,不进错误监控
+  // (曾经每次发版让所有 mid-turn 客户端各上报一次,污染口径)。
+  "conn_kicked",
   "codex_turn_busy",
   "codex_pool_busy",
   "codex_route_unavailable",

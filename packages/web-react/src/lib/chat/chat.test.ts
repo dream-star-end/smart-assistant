@@ -188,6 +188,16 @@ describe("classifyClose / nonAuthPolicyCloseInfo (§5)", () => {
     const d = classifyClose(4503, JSON.stringify({ retryAfterSec: 3, reason: "image_outdated" }));
     expect(d.closeReasonLabel).toBe("运行镜像更新中，稍后自动重试");
   });
+  test("4509 服务重启 → 瞬态 reconnect + 「服务更新中」横幅,绝不落 policy/错误路径", () => {
+    const d = classifyClose(4509, "server_restart");
+    expect(d.action).toBe("reconnect");
+    expect(d.serverHintedDelay).toBe(0);
+    expect(d.provisioning).toBe(false);
+    expect(d.closeReasonLabel).toContain("服务更新中");
+  });
+  test("4509 不被误判为连接数超限(与 4505 kick 语义分流)", () => {
+    expect(nonAuthPolicyCloseInfo(4509, "server_restart")).toBeNull();
+  });
   test("backoff 2/4/8/16/30s ladder + jitter cap", () => {
     expect(backoffDelay(0)).toBeGreaterThanOrEqual(2000);
     expect(backoffDelay(0)).toBeLessThan(3001);

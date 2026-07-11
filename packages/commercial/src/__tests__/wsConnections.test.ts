@@ -1,17 +1,29 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { ConnectionRegistry, DEFAULT_MAX_PER_USER, type Conn } from "../ws/connections.js";
+import {
+  ConnectionRegistry,
+  DEFAULT_MAX_PER_USER,
+  type Conn,
+  type ConnCloseCause,
+} from "../ws/connections.js";
 
 function mkConn(
   overrides: Partial<Conn> & Pick<Conn, "id" | "user_id" | "opened_at">,
-): Conn & { closed: string[] } {
+): Conn & { closed: string[]; causes: ConnCloseCause[] } {
   const closed: string[] = [];
-  const conn: Conn & { closed: string[] } = {
+  const causes: ConnCloseCause[] = [];
+  const conn: Conn & { closed: string[]; causes: ConnCloseCause[] } = {
     id: overrides.id,
     user_id: overrides.user_id,
     opened_at: overrides.opened_at,
-    close: overrides.close ?? ((reason: string) => { closed.push(reason); }),
+    close:
+      overrides.close ??
+      ((reason: string, cause: ConnCloseCause) => {
+        closed.push(reason);
+        causes.push(cause);
+      }),
     closed,
+    causes,
   };
   return conn;
 }
@@ -51,6 +63,8 @@ describe("ConnectionRegistry", () => {
     assert.equal(r4.evicted[0]?.id, "c1");
     assert.equal(c1.closed.length, 1);
     assert.ok(c1.closed[0].includes("kicked"));
+    // 超额挤出 = kick 语义(前端 4505 提示关多余标签页),绝不能与 shutdown 合流
+    assert.deepEqual(c1.causes, ["kick"]);
     assert.equal(reg.count(100n), 3);
   });
 
@@ -180,6 +194,10 @@ describe("ConnectionRegistry", () => {
     assert.deepEqual(c1.closed, ["server shutdown"]);
     assert.deepEqual(c2.closed, ["server shutdown"]);
     assert.deepEqual(c3.closed, ["server shutdown"]);
+    // 发版/重启 = shutdown 语义(前端 4509 静默自动重连),绝不能与 kick 合流
+    assert.deepEqual(c1.causes, ["shutdown"]);
+    assert.deepEqual(c2.causes, ["shutdown"]);
+    assert.deepEqual(c3.causes, ["shutdown"]);
   });
 
   test("user_id 兼容 bigint 和 string(同一用户按同一 key 归并)", () => {
