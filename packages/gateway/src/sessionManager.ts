@@ -45,6 +45,27 @@ import type { UsageAttributionTag } from './subprocessRunner.js'
 const log = createLogger({ module: 'sessionManager' })
 
 /**
+ * 缺省 agent 工作目录(agent 未显式 pin cwd 时用)。
+ *
+ * 设计 §3.2:商业版容器里 supervisor 注入 OPENCLAUDE_DEFAULT_WORKSPACE =
+ * /home/agent/.openclaude/workspace(在 data named volume 内,容器重建后文件仍在);
+ * entrypoint 负责 mkdir。这里只在「env 已设 **且** 目录已存在」时采用它,否则回落
+ * process.cwd()(个人版/宿主机不设该 env → 行为与改造前逐字一致,零变化)。
+ * 目录不存在时保守回落而非在此 mkdir:创建责任在 entrypoint,gateway 不擅自造目录。
+ */
+export function resolveDefaultWorkspaceCwd(env: NodeJS.ProcessEnv = process.env): string {
+  const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+  if (ws) {
+    try {
+      if (statSync(ws).isDirectory()) return ws
+    } catch {
+      // 目录不存在/不可 stat → 回落现状
+    }
+  }
+  return process.cwd()
+}
+
+/**
  * 是否运行在 commercial 托管运行时(v3/v5 商业版容器 / master 实例)。
  *
  * 判定复用仓内既有惯例(不新造信号):
@@ -817,8 +838,20 @@ export function waiveAccountingSessionId(args: {
   return args.ccbSessionId
 }
 
+/** A short-lived host-controlled drain rejected a new runtime turn. */
+export class RuntimeRecycleDrainingError extends Error {
+  readonly code = 'RUNTIME_RECYCLE_DRAINING'
+  constructor() {
+    super('runtime is draining for a stale-image recycle')
+    this.name = 'RuntimeRecycleDrainingError'
+  }
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  /** Shared gate for every submit path during a host-controlled image recycle. */
+  private _runtimeRecycleDrainUntil = 0
+  private _runtimeRecycleDrainTimer: ReturnType<typeof setTimeout> | null = null
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
   private maxIdleMsChat = 2 * 60 * 60 * 1000 // 2 hours for webchat sessions (resume-map persists for reconnect)
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
@@ -1000,6 +1033,48 @@ export class SessionManager {
     this._loadResumeMap()
   }
 
+  isRuntimeRecycleDraining(now = Date.now()): boolean {
+    if (this._runtimeRecycleDrainUntil <= now) {
+      this.releaseRuntimeRecycleDrain()
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Arm the common submit gate, then synchronously inspect accepted turns.
+   * A later submit sees the gate; an earlier submit has already incremented
+   * `_activeTurnCount` before its first await.
+   */
+  armRuntimeRecycleDrain(ttlMs: number): { accepted: boolean; activeTurns: number } {
+    const boundedTtlMs = Number.isFinite(ttlMs)
+      ? Math.min(30_000, Math.max(1_000, Math.floor(ttlMs)))
+      : 10_000
+    this._runtimeRecycleDrainUntil = Date.now() + boundedTtlMs
+    if (this._runtimeRecycleDrainTimer) clearTimeout(this._runtimeRecycleDrainTimer)
+    this._runtimeRecycleDrainTimer = setTimeout(
+      () => this.releaseRuntimeRecycleDrain(),
+      boundedTtlMs,
+    )
+    this._runtimeRecycleDrainTimer.unref?.()
+
+    let activeTurns = 0
+    for (const session of this.sessions.values()) {
+      activeTurns += Math.max(0, session._activeTurnCount ?? 0)
+      activeTurns += Math.max(0, session._activeClientTurnCount ?? 0)
+    }
+    if (activeTurns > 0) this.releaseRuntimeRecycleDrain()
+    return { accepted: activeTurns === 0, activeTurns }
+  }
+
+  releaseRuntimeRecycleDrain(): void {
+    this._runtimeRecycleDrainUntil = 0
+    if (this._runtimeRecycleDrainTimer) {
+      clearTimeout(this._runtimeRecycleDrainTimer)
+      this._runtimeRecycleDrainTimer = null
+    }
+  }
+
   /** Update config reference (e.g. after OAuth token refresh) and propagate to all runners */
   updateConfig(config: OpenClaudeConfig): void {
     this.config = config
@@ -1146,6 +1221,7 @@ export class SessionManager {
     signal: AbortSignal
     finish: (outcome: 'completed' | 'errored') => void
   }> {
+    if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((resolve) => { release = resolve })
@@ -1544,7 +1620,9 @@ export class SessionManager {
         return existing
       }
     }
-    const cwd = opts.agent.cwd ?? process.cwd()
+    // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
+    // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
+    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
     const repoSessionId = opts.repoSessionId ?? opts.peerId
     // M0/M1a engine 适配层:runner 构造收口到 registry factory。
@@ -1779,6 +1857,7 @@ export class SessionManager {
       emitContextRebuilt?: (info: { messageCount: number }) => void
     },
   ): Promise<void> {
+    if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
     // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
     // engine-reported 计费的底座(codex,capabilities.needsServerRequestId=true)
     // 依赖 master bridge 注入的 server-owned requestId 关联 preCheck / inflight

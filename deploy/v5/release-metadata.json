@@ -2,6 +2,10 @@
   "databaseCompatibility": "backward-compatible",
   "requiredMigrations": [
     "0123_gpt56_models",
-    "0124_gpt56_xhigh_defaults"
+    "0124_gpt56_xhigh_defaults",
+    "0134_sessions_master_pg"
+  ],
+  "capabilities": [
+    "sessions-store-pg-v1"
   ]
 }

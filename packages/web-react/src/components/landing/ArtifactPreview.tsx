@@ -4,7 +4,7 @@ import type { Artifact } from "./demoScripts";
 
 /**
  * 演示区右栏「成果预览」—— 把交付物画出来（迷你图表 / PPT 缩略 / 岗位表 /
- * 代码 diff / 协作账本 / 带来源报告），让「交回能直接用的成果」有视觉证据。
+ * 代码 diff / 实机截图 / 协作账本 / 带来源报告），让「交回能直接用的成果」有视觉证据。
  * working 阶段呈现骨架占位（助手干活中），done 阶段揭示完整成果。
  * 配色纪律：数据标记只用「强调色 + 中性灰」两档，文字一律走文本 token。
  */
@@ -83,11 +83,61 @@ function ArtifactBody({ artifact }: { artifact: Artifact }) {
       return <TableMock a={artifact} />;
     case "diff":
       return <DiffMock a={artifact} />;
+    case "gallery":
+      return <GalleryMock a={artifact} />;
     case "board":
       return <BoardMock a={artifact} />;
     case "report":
       return <ReportMock a={artifact} />;
   }
+}
+
+/** 真实实机截图：主图优先加载，辅图延迟加载，图片仅展示不承担链接或交互。 */
+function GalleryMock({ a }: { a: Extract<Artifact, { kind: "gallery" }> }) {
+  const [main, ...secondary] = a.images;
+  return (
+    <MockFrame title={a.title} note={a.note}>
+      <div className="flex flex-col gap-2">
+        <figure className="relative overflow-hidden rounded-lg border border-border bg-code">
+          <img
+            src={main.src}
+            alt={main.alt}
+            width={main.width}
+            height={main.height}
+            loading={main.priority ? "eager" : "lazy"}
+            fetchPriority={main.priority ? "high" : "auto"}
+            decoding="async"
+            className="aspect-[8/5] w-full object-contain"
+          />
+          <figcaption className="absolute bottom-1.5 left-1.5 rounded-md bg-code/85 px-2 py-0.5 text-[9.5px] font-medium text-white">
+            {main.label}
+          </figcaption>
+        </figure>
+        <div className="grid grid-cols-2 gap-2">
+          {secondary.map((image) => (
+            <figure
+              key={image.src}
+              className="relative h-20 overflow-hidden rounded-lg border border-border bg-code"
+            >
+              <img
+                src={image.src}
+                alt={image.alt}
+                width={image.width}
+                height={image.height}
+                loading={image.priority ? "eager" : "lazy"}
+                fetchPriority={image.priority ? "high" : "auto"}
+                decoding="async"
+                className="h-full w-full object-contain"
+              />
+              <figcaption className="absolute bottom-1 left-1 rounded bg-code/85 px-1.5 py-0.5 text-[9px] font-medium text-white">
+                {image.label}
+              </figcaption>
+            </figure>
+          ))}
+        </div>
+      </div>
+    </MockFrame>
+  );
 }
 
 /** 成果标题 + 底部结论行（各 mock 通用）。 */

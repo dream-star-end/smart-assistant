@@ -2334,13 +2334,25 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
   });
 });
 
-describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () => {
-  test("to 小于当前游标时不回退(容器随后重放的帧不被误判重复/状态不被重置)", () => {
+describe("resume_failed 游标仲裁(容器=唯一裁决者)", () => {
+  // 语义修订(2026-07-11 boss 生产事故 webmrfo3rtrwhgi15):旧断言「to=0 一律视为陈旧信号、
+  // 游标不动」被生产证伪 —— 容器回收重建后 outboundRing 从零计数,hello 仲裁答复
+  // resume_failed{from:14,to:0,no_buffer} 是**容器本人**对自家空 ring 的权威裁决;游标不归零
+  // 则新生代帧 seq=1..14 全被 acceptFrameSeq 黑洞:imageEdit 免模型直投轮只有一帧终帧,
+  // 整轮蒸发(占位卡永转/结果只能靠 REST 对账迟到)。当年「只进不退」防的是 bridge 越权伪造
+  // resume_failed,该源已根治(bridge 对自身 miss 刻意不发,replay 唯一裁决者=容器);
+  // 空 ring 无帧可重放,归零零重复应用面。非重启签名(to>0)仍保持只进不退。
+  test("重启签名(no_buffer,to=0) → 游标归零(冷容器新生代帧不被黑洞)", () => {
     const s = sess();
     applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 42, reason: "buffer_miss" } as never, {});
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
-    // 重启后的陈旧信号 to=0 → 游标不动
-    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 0, reason: "no_buffer" } as never, {});
+    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 42, to: 0, reason: "no_buffer" } as never, {});
+    expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+  });
+  test("非重启签名(to>0)仍只进不退(buffer_miss 带倒退 to 不回退游标)", () => {
+    const s = sess();
+    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 42, reason: "buffer_miss" } as never, {});
+    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 7, reason: "buffer_miss" } as never, {});
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
   });
 });

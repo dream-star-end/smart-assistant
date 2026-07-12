@@ -9,9 +9,20 @@
  * 帧构造复刻 chat.test.ts 的 msgFrame()/sess() 模式。
  */
 import { describe, expect, test } from "vitest";
-import { addMessage, type ChatSession, createSession } from "./model";
-import type { LegacyBridgeErrorWire, OutboundErrorWire, OutboundMessageWire } from "./frames";
-import { applyLegacyBridgeError, applyOutboundError, applyOutboundMessage } from "./reducer";
+import { addMessage, type ChatMessage, type ChatSession, createSession } from "./model";
+import type {
+  LegacyBridgeErrorWire,
+  OutboundErrorWire,
+  OutboundMessageWire,
+  OutboundResumeFailedWire,
+} from "./frames";
+import {
+  applyLegacyBridgeError,
+  applyOutboundError,
+  applyOutboundMessage,
+  applyResumeFailed,
+  resetAgentFrameSeqCursorsForSession,
+} from "./reducer";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
 
 const JOB = "a".repeat(32);
@@ -208,6 +219,159 @@ describe("生成占位卡失败（turn error）", () => {
     const ph = s.messages.filter((m) => m._genPlaceholder?.jobId === JOB);
     expect(ph).toHaveLength(1); // 原地重置，不新增第二张
     expect(ph[0]._genPlaceholder!.status).toBe("running");
+  });
+});
+
+// ═══════════════ 2026-07-11 boss 生产事故回归(会话 webmrfo3rtrwhgi15) ═══════════════
+// 事故链:容器 6h 闲置被回收(oc-v5-u1 19:36 重建)→ outboundRing 内存计数从零 → 22:10 页面
+// boot hello,容器仲裁答复 resume_failed{from:14,to:0,no_buffer}(实测容器日志),旧客户端游标
+// 只进不退停在 14 → 22:12 提交圈选编辑(占位注入)→ 22:13 免模型直投终帧 frameSeq=1 ≤ 14 被
+// acceptFrameSeq 当重复帧丢弃 → 占位永转;结果行靠 REST 对账(applyServerMessages)迟到补上,
+// 该路径不消解占位;cost_charged 不进 frameSeq 去重故计费正常(实测 22:13:16 余额刷新),
+// 使 bug 看似"只有占位卡坏了"。帧形态均按生产实录构造。
+describe("生产回归:冷容器 frameSeq 重置 → 直投终帧黑洞", () => {
+  /** 生产实录形态的直投终帧(gateway server.ts delivered + deliver() ts/frameSeq 盖章)。 */
+  function prodDeliveredFinal(frameSeq: number, jobId = JOB): OutboundMessageWire {
+    return msgFrame({
+      isFinal: true,
+      imageEditJobId: jobId,
+      traceId: "1376356b8b67e1f789321e198329cf2b",
+      ts: Date.now(),
+      frameSeq,
+      blocks: [
+        {
+          kind: "text",
+          text: `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n/home/agent/.openclaude/generated/image2-edit-${jobId}.png`,
+          messageId: "srv-webmrfo3rtrwhgi15-x",
+        },
+      ],
+    });
+  }
+
+  test("事故复盘全链:resume_failed(no_buffer,to=0) 归零游标 → 冷容器终帧 frameSeq=1 被接受,占位消解", () => {
+    const sock = makeSocket();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "蓝色眼睛",
+      imageEdit: { clientJobId: JOB, sourceIndex: 0, maskIndex: 1, guideIndex: 2, width: 1024, height: 1024 },
+    });
+    const s = sock.sessions.get("s1")!;
+    // 上一代容器时代持久化下来的游标(IndexedDB 注水语义)。
+    s._lastFrameSeqByKey!["agent:main:webchat:dm:s1"] = 14;
+    // hello 仲裁:容器答复空 ring(生产实录 {from:14,to:0,reason:no_buffer})→ 游标归零。
+    applyResumeFailed(
+      s,
+      {
+        type: "outbound.resume_failed",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        from: 14,
+        to: 0,
+        reason: "no_buffer",
+        ts: Date.now(),
+      } as unknown as OutboundResumeFailedWire,
+      {},
+    );
+    expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+    // 冷容器新生代直投终帧 frameSeq=1:必须被接受(事故中被当重复帧丢弃)。
+    applyOutboundMessage(s, prodDeliveredFinal(1));
+    expect(s.messages.some((m) => m._genPlaceholder)).toBe(false); // 占位已消解
+    expect(s.messages.some((m) => m.role === "assistant" && (m.text || "").includes("已完成圈选区域"))).toBe(true);
+    expect(s._sendingInFlight).toBe(false); // 发送态正常收尾(事故中挂到 thinking-safety)
+  });
+
+  test("sys.cold_start(容器中途回收,无 hello 仲裁)→ 该会话 agent-scoped 游标归零", () => {
+    const s = sess();
+    s._lastFrameSeqByKey = {
+      "agent:main:webchat:dm:s1": 14,
+      "agent:coder:webchat:dm:s1": 9,
+      "agent:main:webchat:dm:OTHER": 33, // 别的会话的游标不受影响
+    };
+    resetAgentFrameSeqCursorsForSession(s);
+    expect(s._lastFrameSeqByKey["agent:main:webchat:dm:s1"]).toBeUndefined();
+    expect(s._lastFrameSeqByKey["agent:coder:webchat:dm:s1"]).toBeUndefined();
+    expect(s._lastFrameSeqByKey["agent:main:webchat:dm:OTHER"]).toBe(33);
+  });
+
+  test("兜底:终帧仍丢失时,REST 对账(锚点 user 行 echo + 更晚 _seq 的 server assistant 行)清运行中占位", () => {
+    const sock = makeSocket();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "蓝色眼睛",
+      imageEdit: { clientJobId: JOB, sourceIndex: 0, maskIndex: 1, guideIndex: 2, width: 1024, height: 1024 },
+    });
+    const s = sock.sessions.get("s1")!;
+    const user = s.messages.find((m) => m.role === "user")!;
+    expect(s.messages.find((m) => m._genPlaceholder)!._genPlaceholder!.afterUserMsgId).toBe(user.id);
+    // 终帧丢失(什么都不发生);随后 REST 对账带回:user 行 echo(_seq=16)+ 直投结果行(_seq=17)。
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        { id: user.id, role: "user", text: user.text, ts: user.ts, _seq: 16 },
+        {
+          id: "srv-webmrfo3rtrwhgi15-17",
+          role: "assistant",
+          text: "已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n/home/agent/.openclaude/generated/x.png",
+          ts: Date.now(),
+          _source: "server",
+          _seq: 17,
+        },
+      ] as ChatMessage[],
+      false,
+    );
+    const after = sock.sessions.get("s1")!;
+    expect(after.messages.some((m) => m._genPlaceholder)).toBe(false); // 占位被兜底消解
+    expect(after.messages.some((m) => m.role === "assistant" && (m.text || "").includes("已完成圈选区域"))).toBe(true);
+  });
+
+  test("兜底不误清:对账只带回 user echo(轮未收尾/无更晚 assistant 行)→ 运行中占位保留", () => {
+    const sock = makeSocket();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "蓝色眼睛",
+      imageEdit: { clientJobId: JOB, sourceIndex: 0, maskIndex: 1, guideIndex: 2, width: 1024, height: 1024 },
+    });
+    const s = sock.sessions.get("s1")!;
+    const user = s.messages.find((m) => m.role === "user")!;
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [{ id: user.id, role: "user", text: user.text, ts: user.ts, _seq: 16 }] as ChatMessage[],
+      false,
+    );
+    expect(sock.sessions.get("s1")!.messages.some((m) => m._genPlaceholder?.status === "running")).toBe(true);
+  });
+
+  test("兜底不误清:锚点 user 行尚未被 server echo(_seq 缺省)→ 占位保留(fail-safe)", () => {
+    const sock = makeSocket();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "蓝色眼睛",
+      imageEdit: { clientJobId: JOB, sourceIndex: 0, maskIndex: 1, guideIndex: 2, width: 1024, height: 1024 },
+    });
+    // 对账只带回一条与本轮无关、但 _seq 很大的 server assistant 行;锚点 user 行没有 _seq。
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        {
+          id: "srv-old-assistant",
+          role: "assistant",
+          text: "旧轮回答",
+          ts: Date.now() - 1,
+          _source: "server",
+          _seq: 999,
+        },
+      ] as ChatMessage[],
+      false,
+    );
+    expect(sock.sessions.get("s1")!.messages.some((m) => m._genPlaceholder?.status === "running")).toBe(true);
   });
 });
 

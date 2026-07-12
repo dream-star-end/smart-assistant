@@ -30,11 +30,13 @@
  *     subsystems — they are independent stores; we do not let codex's
  *     stage1/stage2 memory writer touch our MemoryStore.
  */
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
+import { getPlatformPrompt } from './platformPrompts.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
@@ -58,6 +60,12 @@ const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 //     platform context)。session-search / archival(深层召回)仍走 `oc-memory`
 //     CLI;skills / scheduling / agents 走 `openclaude_memory` MCP —— 三条通道
 //     各一份权威,codex 私有 store 一律不碰。
+//
+// 文案通道(设计 §4.2):此 preamble 已上移 platform bundle(商业版真热),商业版
+// 权威 = prompts/codex-preamble.md,个人版权威 = 下面这个 CODEX_PREAMBLE 常量。
+// **逐字同步义务**:改动本常量必须同步改
+// packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md,反之亦然
+// (__tests__/platformPrompts.test.ts 的「文件 === 常量」断言会在漂移时变红)。
 const CODEX_PREAMBLE = `# OpenClaude Platform Context (codex adapter)
 
 You are running inside the OpenClaude platform as a codex-backed agent. The
@@ -351,8 +359,19 @@ export async function buildCodexLaunchOverrides(
     repoSnapshot: ctx.repoSnapshot ?? undefined,
     availableMcpTools,
   })
-  const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
+  // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
+  const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)
+  const instructionsContent = `${preamble}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
+  overridesLog.info('prompt_context_built', {
+    agentId: ctx.agentId,
+    backend: 'codex',
+    prompt_bytes: Buffer.byteLength(instructionsContent, 'utf8'),
+    prompt_sha256: createHash('sha256')
+      .update(instructionsContent, 'utf8')
+      .digest('hex')
+      .slice(0, 12),
+  })
 
   // observability:per-model 行为补丁注入(MODEL_HINT)→ structured log + prom counter。
   // 不打 prompt 原文,只 sha256[:8] + bytes;subprocessRunner 同款。

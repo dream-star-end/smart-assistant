@@ -19,6 +19,7 @@ import { isIPv4 } from "node:net";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { homedir } from "node:os";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
@@ -28,6 +29,7 @@ import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
+import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
 import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
@@ -267,7 +269,14 @@ import {
   softDeleteMasterSession,
   allMasterWsessRows,
   getWechatBindingByUserId,
+  // P2 master 会话权威迁 PG(RFC-v5-sessions-pg D1):一次性注入 backend 的 composition root 入口。
+  setClientSessionsBackend,
 } from "@openclaude/storage";
+import {
+  createPgSessionsBackend,
+  startSessionsGcSweeper,
+} from "./db/pgSessionsBackend.js";
+import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -378,12 +387,17 @@ import {
   startVolumeGcScheduler,
   createUserMediaResolver,
   isUserVolumeMediaPath,
+  resolvePlatformBundleMount,
+  resolveRuntimeReleaseMount,
+  DEFAULT_PLATFORM_ROOT,
+  DEFAULT_RUNTIME_RELEASES_ROOT,
   type IdleSweepScheduler,
   type MigrationReconcileScheduler,
   type OrphanReconcileScheduler,
   type UserMediaLocation,
   type V3ContainerEventsWorker,
   type V3SupervisorDeps,
+  type V3RuntimeTuple,
   type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
 import {
@@ -986,6 +1000,30 @@ export async function registerCommercial(
     console.log(
       `[commercial] auto-migrate disabled (controlPlaneEnabled=${controlPlaneEnabled} channel=${runtimeChannel})`,
     );
+  }
+
+  // ── P2:master 会话权威 backend 选择(RFC-v5-sessions-pg D1 启动矩阵)────────────
+  // 放在 config 加载 + auto-migrate(0134 表须先在)之后、一切 schedulers/backend 消费之前。
+  // channel=v5 = master 形态(容器内 gateway / 个人版不加载 commercial → 天然 SQLite,零变化)。
+  // 依 OC_SESSIONS_STORE + PG 状态行 + 本地 manifest 三元组裁决 sqlite/pg;矩阵之外 fail-closed
+  // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
+  // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
+  let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  if (runtimeChannel === "v5") {
+    const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
+    if (decision.store === "pg") {
+      setClientSessionsBackend(
+        createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation }),
+      );
+      // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
+      // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
+      sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({ pool: getPool() }));
+      // eslint-disable-next-line no-console
+      console.log(`[commercial] sessions store authority = PG (generation=${decision.generation})`);
+    } else {
+      // eslint-disable-next-line no-console
+      console.log("[commercial] sessions store authority = SQLite(未割接 / 基建先行期)");
+    }
   }
 
   const jwtSecret =
@@ -1969,6 +2007,27 @@ export async function registerCommercial(
     }
   }
 
+  // 服务端缩略图磁盘缓存 —— 与 mediaSignKey 同生命周期(依赖 signed media 管线)。
+  // 落 OPENCLAUDE_HOME/media-thumb-cache/,启动清零(init)。缺 mediaSignKey → 不装配,
+  // `?w=` 被 handler 忽略回原图(优雅降级)。
+  let thumbnailCache: ThumbnailDiskCache | undefined;
+  if (mediaSignKey) {
+    try {
+      const home = process.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
+      const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
+      await cache.init();
+      thumbnailCache = cache;
+      // eslint-disable-next-line no-console
+      console.log("[commercial] media thumbnail cache ready (startup-cleared)");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", {
+        error: (err as Error)?.message ?? String(err),
+      });
+      thumbnailCache = undefined;
+    }
+  }
+
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
@@ -1979,6 +2038,68 @@ export async function registerCommercial(
     const v3Docker = cfg.AGENT_DOCKER_SOCKET
       ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
       : new Docker();
+
+    // ── V5 runtime tuple 启动期解析(plan §1.5 prepare/startup 一次性全量校验)──
+    // OC_PLATFORM_BUNDLE / OC_RUNTIME_RELEASE 配了就在此**一次性**跑昂贵的 resolvePlatformBundleMount
+    // (逐文件 sha256)/ resolveRuntimeReleaseMount,把 bundleRev/bootHash/resolved 路径灌进 tuple;
+    // provision 每次只做便宜的 assertCurrentMatches。解析失败**不阻断 gateway 启动**(与 baseline
+    // 自检同范式)——只 console.error 留态;下一次 provision 由 supervisor 依 v5 fail-closed / OPTIONAL
+    // 决定拒/降级(bundlePath 传下去但 bundleRev 空 → provision 侧判 "解析失败" 拒)。
+    let runtimeTuple: V3RuntimeTuple | undefined;
+    if (cfg.OC_RUNTIME_IMAGE_ID || cfg.OC_PLATFORM_BUNDLE || cfg.OC_RUNTIME_RELEASE) {
+      const platformRoot = cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT;
+      const releasesRoot = cfg.OC_RUNTIME_RELEASES_ROOT ?? DEFAULT_RUNTIME_RELEASES_ROOT;
+      const t: V3RuntimeTuple = {
+        imageId: cfg.OC_RUNTIME_IMAGE_ID,
+        bundlePath: cfg.OC_PLATFORM_BUNDLE,
+        releasePath: cfg.OC_RUNTIME_RELEASE,
+        platformRoot,
+        releasesRoot,
+      };
+      if (cfg.OC_PLATFORM_BUNDLE) {
+        try {
+          // B5 containment:传 platformRoot 让校验器显式断言 resolved 落在 <platformRoot>/bundles/ 下
+          // (ancestorRoot 同值锁祖先链;platformRoot 另钉布局根,两者语义分离但生产同一目录)。
+          const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, {
+            ancestorRoot: platformRoot,
+            platformRoot,
+          });
+          t.bundleResolvedPath = resolved.resolvedPath;
+          t.bundleRev = resolved.bundleRev;
+          t.bootHash = resolved.bootHash;
+          // eslint-disable-next-line no-console
+          console.log("[commercial] v5 platform bundle validated", {
+            bundlePath: cfg.OC_PLATFORM_BUNDLE,
+            bundleRev: resolved.bundleRev,
+            bootHash: resolved.bootHash,
+          });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[commercial] v5 platform bundle validation FAILED — provision will fail-closed (or skip with OC_PLATFORM_BUNDLE_OPTIONAL=1)",
+            { bundlePath: cfg.OC_PLATFORM_BUNDLE, error: (err as Error).message },
+          );
+        }
+      }
+      if (cfg.OC_RUNTIME_RELEASE) {
+        try {
+          t.releaseResolvedPath = resolveRuntimeReleaseMount(cfg.OC_RUNTIME_RELEASE, releasesRoot);
+          // eslint-disable-next-line no-console
+          console.log("[commercial] v5 runtime release validated", {
+            releasePath: cfg.OC_RUNTIME_RELEASE,
+            resolved: t.releaseResolvedPath,
+          });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[commercial] v5 runtime release validation FAILED — provision will fail-closed",
+            { releasePath: cfg.OC_RUNTIME_RELEASE, error: (err as Error).message },
+          );
+        }
+      }
+      runtimeTuple = t;
+    }
+
     v3Deps = {
       docker: v3Docker,
       pool: getPool(),
@@ -1986,6 +2107,8 @@ export async function registerCommercial(
       // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
       // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
       bridgeSecret,
+      // V5 runtime tuple(启动期已解析);未配 → undefined → provision/ensureRunning 走旧路径。
+      ...(runtimeTuple ? { runtimeTuple } : {}),
       // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
       // 避免出现 "containerService 注入但 selfHostId undefined" 的半 wire 状态
       // (provisionV3Container 的 useRemote 判定依赖 selfHostId 非空)。
@@ -2414,6 +2537,8 @@ export async function registerCommercial(
     // agentCwds + realpathSync + isFileAllowed) 把权威,master 侧只做 sanity check
     // (isContainerPathAllowed)。
     mediaSignKey,
+    // 服务端缩略图缓存(见 mediaThumbnail.ts):/api/media-signed?w=640|1280 缩 webp。
+    thumbnailCache,
     wechatLiveLinkKey,
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
@@ -3738,6 +3863,15 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
+      // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
+      if (sessionsGcSweeper) {
+        try {
+          await sessionsGcSweeper.stop();
+        } catch {
+          /* ignore */
+        }
+      }
       // P1.7 slice 7c — broker 先停。它会清 reconcile / housekeeping timer +
       // stop outboxWorker;放在 listener 关之前是为了:进行中的 outbox flush
       // 还能借 listener 把已经 admitted 的 outbound 完成最后一搏;同样 broker

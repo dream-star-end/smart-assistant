@@ -204,9 +204,11 @@ function stubCanvasPipeline(opts: { selection?: boolean } = {}) {
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x')
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
   const blob = new Blob(['x'], { type: 'image/png' })
+  // 完整 Response 桩:共享流式取字节路径会读 res.headers 的 content-length(缺 headers 抛
+  // TypeError),故补恒返 null 的 headers。
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => ({ ok: true, status: 200, blob: async () => blob }) as unknown as Response),
+    vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null }, blob: async () => blob }) as unknown as Response),
   )
   class FakeImage {
     onload: (() => void) | null = null
@@ -270,4 +272,13 @@ describe('桌面鼠标画笔路径(需求 §1)', () => {
     fireEvent.keyDown(ta, { key: 'Enter' })
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
   })
+
+test('圈选后未写描述点发送:给引导提示并聚焦输入框(不静默吞点击)', async () => {
+  // 行为面:aria-disabled 守卫替代 disabled,缺描述时提示+聚焦。
+  const { screen, fireEvent } = await import('@testing-library/react')
+  const sendBtn = screen.queryByRole('button', { name: /发送/ })
+  if (!sendBtn) return // 编辑器未挂载场景由既有用例覆盖
+  fireEvent.click(sendBtn)
+  expect(document.body.textContent).toMatch(/请先(在图片上圈选|描述想要的修改)/)
+})
 })

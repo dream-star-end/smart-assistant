@@ -432,6 +432,28 @@ describe('fetchSnapshotAndWriteContainerAuth', () => {
 // ─── pickCodexAccountForBindingInTx group filter ───────────────────────────
 
 describe('pickCodexAccountForBindingInTx', () => {
+  const pickerClient = (ids: string[]): PoolClient => ({
+    query: async () => ({
+      rows: ids.map((id) => ({ id, plan: 'pro', health_score: 50 })),
+    }),
+  }) as unknown as PoolClient
+
+  test('rendezvous affinity distributes users and only remaps keys on removed candidate', async () => {
+    const all = pickerClient(['101', '102', '103'])
+    const without102 = pickerClient(['101', '103'])
+    const before = new Map<string, bigint>()
+    const after = new Map<string, bigint>()
+    for (let uid = 1; uid <= 100; uid += 1) {
+      const key = `v5:user:${uid}`
+      before.set(key, (await pickCodexAccountForBindingInTx(all, key))!.account_id)
+      after.set(key, (await pickCodexAccountForBindingInTx(without102, key))!.account_id)
+    }
+    assert.ok(new Set(before.values()).size >= 2, 'users should not collapse onto one account')
+    for (const [key, oldAccount] of before) {
+      if (oldAccount !== 102n) assert.equal(after.get(key), oldAccount, key)
+    }
+  })
+
   test('filters active codex candidates by groupId when provided', async () => {
     let observed: { sql?: string; params?: unknown[] } = {}
     const client = {

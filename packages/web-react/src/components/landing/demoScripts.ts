@@ -1,5 +1,6 @@
 import {
   Briefcase,
+  Gamepad2,
   GitBranch,
   Globe,
   LayoutDashboard,
@@ -7,13 +8,23 @@ import {
   Presentation,
   Users,
 } from "lucide-react";
+import { GAME_DEMO_DISCLOSURE, GAME_DEMO_TURNS } from "./gameDemoTranscript";
 
 /** 演示中助手「执行动作」的瞬时提示（拆计划 / 跑代码 / 联网 / 委派…），逐条揭示以还原 agent 干活过程。 */
 export type DemoStep = { label: string };
 
+type GalleryImage = {
+  src: string;
+  alt: string;
+  label: string;
+  width: number;
+  height: number;
+  priority?: boolean;
+};
+
 /**
  * 成果预览面板的结构化数据 —— 每个场景一种可视化交付物 mock（迷你图表 / PPT 缩略 /
- * 岗位表 / 代码 diff / 协作账本 / 带来源报告），让「交回能直接用的成果」看得见。
+ * 岗位表 / 代码 diff / 实机截图 / 协作账本 / 带来源报告），让「交回能直接用的成果」看得见。
  * 纯展示数据，颜色一律走设计 token（单一强调色 + 中性灰，文字用文本 token）。
  */
 export type Artifact =
@@ -46,6 +57,12 @@ export type Artifact =
       note: string;
     }
   | {
+      kind: "gallery";
+      title: string;
+      images: [GalleryImage, ...GalleryImage[]];
+      note: string;
+    }
+  | {
       kind: "board";
       title: string;
       /**
@@ -71,37 +88,107 @@ export type Artifact =
       note: string;
     };
 
-export type DemoScenario = {
+type DemoScenarioBase = {
   id: string;
   /** 能力标签（Tab 文案）。 */
   tab: string;
   icon: LucideIcon;
-  /** 用户输入（直接整段显示，不打字）。 */
-  prompt: string;
-  /** 出答案前依次亮起的执行动作（可选）。 */
-  steps?: DemoStep[];
-  /** 助手回答（逐字打字；\n 保留换行）。 */
-  answer: string;
   /** 长程任务元信息（答案打完后呈现）：自主执行了多少步、跑了多久 —— 体现「交出去就不用管」。 */
   runMeta?: string;
   /** 任务产出的可交付文件（成果面板头部呈现，体现「交出真实成果」）。 */
   deliverable?: string;
   /** 成果预览面板：交付物长什么样，直接画出来。 */
   artifact: Artifact;
-  /** 回答用等宽字体渲染（代码场景）。 */
-  mono?: boolean;
+  /** 顶栏来源标识；缺省为「动态演示 · 示意数据」。 */
+  sourceLabel?: string;
 };
 
+export type DemoTranscriptBlock =
+  | { kind: "user"; turn: number; text: string }
+  | { kind: "work"; turn: number; label: string; toolCallCount: number; steps: readonly string[] }
+  | { kind: "assistant"; turn: number; text: string };
+
+export type DemoScenario = DemoScenarioBase &
+  (
+    | {
+        presentation: "animated";
+        /** 用户输入（直接整段显示，不打字）。 */
+        prompt: string;
+        /** 出答案前依次亮起的执行动作（可选）。 */
+        steps?: DemoStep[];
+        /** 助手回答（逐字打字；\n 保留换行）。 */
+        answer: string;
+        /** 回答用等宽字体渲染（代码场景）。 */
+        mono?: boolean;
+      }
+    | {
+        presentation: "transcript";
+        /** 已脱敏的两轮对话结构 + 按关键阶段归纳的执行过程。 */
+        transcript: readonly DemoTranscriptBlock[];
+        disclosure: string;
+      }
+  );
+
 /**
- * 落地页动态演示脚本 —— 全部为**虚构的示意场景与示意数据**（不含任何真实用户数据），
- * 用于展示 agent 处理长程复杂任务的工作方式：拆解计划 → 反复执行 / 自检修正 → 交付成果。
- * 纯展示文案，不发任何真实请求。
+ * 落地页动态演示脚本。除明确标注「真实公开案例」的场景外，其余均为虚构示意数据；
+ * 所有场景仅做前端展示，不发任何真实请求。
  */
 export const DEMO_SCENARIOS: DemoScenario[] = [
+  {
+    id: "game",
+    tab: "做游戏",
+    icon: Gamepad2,
+    presentation: "transcript",
+    disclosure: GAME_DEMO_DISCLOSURE,
+    transcript: GAME_DEMO_TURNS.flatMap((turn, index): DemoTranscriptBlock[] => [
+      { kind: "user", turn: index + 1, text: turn.userText },
+      {
+        kind: "work",
+        turn: index + 1,
+        label: turn.workLabel,
+        toolCallCount: turn.toolCallCount,
+        steps: turn.steps,
+      },
+      { kind: "assistant", turn: index + 1, text: turn.assistantText },
+    ]),
+    runMeta: "生产记录：两轮共 81 次工具调用 · 开发、实测与公网发布端到端完成",
+    deliverable: "《万劫问仙》· 公网游戏",
+    sourceLabel: "真实公开案例",
+    artifact: {
+      kind: "gallery",
+      title: "《万劫问仙》实机画面",
+      images: [
+        {
+          src: "/demo/wanjie/menu.webp",
+          alt: "《万劫问仙》传承选择界面，展示太虚剑宗、九霄雷府和赤炼丹霞三种本命传承",
+          label: "传承选择",
+          width: 1200,
+          height: 750,
+          priority: true,
+        },
+        {
+          src: "/demo/wanjie/battle.webp",
+          alt: "《万劫问仙》桌面端战斗实机画面，展示自动御剑、妖物、连斩和战斗 HUD",
+          label: "战斗实机",
+          width: 1200,
+          height: 750,
+        },
+        {
+          src: "/demo/wanjie/mobile.webp",
+          alt: "《万劫问仙》移动端战斗实机画面，展示竖屏 HUD 与触控操作",
+          label: "移动端",
+          width: 390,
+          height: 844,
+        },
+      ],
+      note: "真实游戏截图 · 桌面与移动端适配",
+    },
+  },
   {
     id: "analysis",
     tab: "数据分析",
     icon: LayoutDashboard,
+    presentation: "animated",
     prompt:
       "（上传门店经营数据.xlsx）分析 12 家门店上季度的坪效和外卖占比，找出拖后腿的门店和原因，出图给我",
     steps: [
@@ -133,6 +220,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "ppt",
     tab: "做 PPT",
     icon: Presentation,
+    presentation: "animated",
     prompt: "（上传季度销售数据.xlsx）做一份 10 页的季度经营复盘 PPT，图表齐全，能直接给管理层汇报",
     steps: [
       { label: "解析数据 · 定 10 页大纲" },
@@ -160,6 +248,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "job",
     tab: "找工作",
     icon: Briefcase,
+    presentation: "animated",
     prompt: "（上传我的简历.pdf）帮我在目标城市找匹配的岗位，筛掉不双休的，按匹配度排一张表",
     steps: [
       { label: "解析简历 · 提炼优势画像" },
@@ -187,6 +276,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "code",
     tab: "改代码",
     icon: GitBranch,
+    presentation: "animated",
     prompt: "连上我的 GitHub 仓库，把报表导出从同步接口改成异步任务队列，加上进度查询，测试通过后提交推送",
     steps: [
       { label: "通读仓库结构 · 120+ 文件" },
@@ -217,6 +307,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "team",
     tab: "团队协作",
     icon: Users,
+    presentation: "animated",
     prompt:
       "组个小组：先调研三家主流向量数据库的选型对比，写一个连接与查询性能的测试脚本各跑一轮，最后把结论排成一份带图表的选型报告给我",
     steps: [
@@ -246,6 +337,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "research",
     tab: "深度调研",
     icon: Globe,
+    presentation: "animated",
     prompt: "调研跨境电商物流赛道：主要玩家、价格模式、近期政策变化，出一份带来源的分析报告",
     steps: [
       { label: "联网检索 30+ 来源" },

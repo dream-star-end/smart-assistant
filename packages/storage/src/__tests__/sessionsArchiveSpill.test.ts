@@ -266,12 +266,16 @@ describe('PUT 防复活', () => {
     db.prepare('INSERT OR IGNORE INTO client_session_archived_ids (session_id, msg_id) VALUES (?, ?)').run('web-revive', 'r-0')
     db.prepare('INSERT OR IGNORE INTO client_session_archived_ids (session_id, msg_id) VALUES (?, ?)').run('web-revive', 'r-1')
 
+    // BLOCKER-1:首建 updated_at 现取 MAX(客户端 updatedAt, 服务端 now) = now(远大于 1000),
+    // 故第二个 PUT 的 baseSyncedAt 须用**实际存库版本**(而非旧的硬编码 1000),否则会被 stale
+    // 检测正确拒绝(这正是 BLOCKER-1 的目的)。读回真实 updated_at 作 baseSyncedAt 才走到 applied。
+    const stored = db.prepare('SELECT updated_at FROM client_sessions WHERE id = ?').get('web-revive') as { updated_at: number }
     // 客户端全量 PUT 带回完整历史(含已归档的 r-0/r-1)
     const second = {
       id: 'web-revive', userId: USER, agentId: 'main', title: 't', pinned: false,
-      createdAt: 1, lastAt: 3, messages: makeMsgs(5, 1024, 'r'), updatedAt: 2000,
+      createdAt: 1, lastAt: 3, messages: makeMsgs(5, 1024, 'r'), updatedAt: stored.updated_at + 1,
     }
-    const res = await upsertClientSession(second, 1000)
+    const res = await upsertClientSession(second, stored.updated_at)
     assert.equal(res, 'applied')
 
     const ids = (await rowMessages('web-revive')).map((m) => m.id)

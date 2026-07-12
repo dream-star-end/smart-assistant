@@ -32,7 +32,7 @@
  */
 
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
-import { SupervisorError } from "./types.js";
+import { SupervisorError, type SupervisorErrorCode } from "./types.js";
 import {
   getV3ContainerStatus,
   markV3ContainerActivity,
@@ -68,6 +68,13 @@ import { promoteOnce } from "../compute-pool/imagePromote.js";
 import { observeContainerEnsureDuration } from "../admin/metrics.js";
 import { isV5Channel } from "../runtimeChannel.js";
 import { randomUUID } from "node:crypto";
+import { basename as pathBasename } from "node:path";
+import { request as httpRequest } from "node:http";
+import { computeInboundNonce } from "../bridgeSecret.js";
+import {
+  RUNTIME_RELEASE_LABEL_KEY,
+  RUNTIME_BOOT_HASH_LABEL_KEY,
+} from "./platformBundle.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -109,8 +116,95 @@ const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
  * reason='baseline_missing' 让前端/运维 dashboard 看见 distinct 信号。
  */
 const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
+/**
+ * V5 runtime tuple **部署级坏产物**(PlatformBundleInvalid / RuntimeReleaseInvalid /
+ * RuntimePlacementInvalid)—— 与 CcbBaselineMissing 同为部署级故障(bundle/release 结构坏、
+ * 或 release 误配到远端 host 的多机 placement 硬门),不是"再试 5s 就好"的瞬态。走同等长重试避免
+ * 前端每 5s 风暴放大运维噪声;运维修好产物后 5min 内自恢复。
+ *
+ * R2-M5:**current 激活中间态**已从本类拆出(见 RuntimeActivationInProgress → 5s 短重试不告警)——
+ * 它是激活 saga 的正常秒级窗口,不该吃 300s 长退避 + critical 告警。
+ */
+const RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC = 300;
 // 已迁移到 v5:短重试;客户端应据 reason="migrated_to_v5" 重取(命中路由 cookie)导向 v5。
 const RETRY_AFTER_MIGRATED_V5_SEC = 3;
+
+/**
+ * R2-M5:v5 runtime tuple 相关 provision 失败码 → 重试/告警**分级**的单一权威(便于单测,免搭 harness)。
+ * 返回 null = 非本类(交回 catch-all / 其它专用块处理)。
+ *   - RuntimeActivationInProgress:current 激活中间态(秒级 saga 窗口)→ 5s 短重试 + **不告警**
+ *     (与 provisioning 同级)。运维无需介入,激活 saga 收尾后自然通过。
+ *   - PlatformBundleInvalid / RuntimeReleaseInvalid / RuntimePlacementInvalid:部署级坏产物 /
+ *     多机 placement 硬门 → 300s 长重试 + **critical 告警**(运维修产物后自恢复)。
+ */
+export interface RuntimeArtifactFailureClass {
+  retryAfterSec: number;
+  reason: string;
+  /** true → 发 critical 告警(部署级);false → 瞬态激活窗口,provisioning 同级不告警。 */
+  critical: boolean;
+}
+export function classifyRuntimeArtifactFailure(
+  code: SupervisorErrorCode,
+): RuntimeArtifactFailureClass | null {
+  switch (code) {
+    case "RuntimeActivationInProgress":
+      return { retryAfterSec: RETRY_AFTER_PROVISIONING_SEC, reason: "activation_in_progress", critical: false };
+    case "PlatformBundleInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "platform_bundle_invalid", critical: true };
+    case "RuntimeReleaseInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "runtime_release_invalid", critical: true };
+    case "RuntimePlacementInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "runtime_placement_invalid", critical: true };
+    default:
+      return null;
+  }
+}
+const V5_STALE_IMAGE_IDLE_MS = 30 * 60_000;
+const V5_RECYCLE_DRAIN_TIMEOUT_MS = 1_500;
+
+export type RuntimeRecycleDrainResult = "accepted" | "busy" | "failed";
+
+/** Authenticated v5 host→container turn-drain handshake. */
+export function requestRuntimeRecycleDrain(
+  deps: V3SupervisorDeps,
+  status: V3ContainerStatus,
+  timeoutMs = V5_RECYCLE_DRAIN_TIMEOUT_MS,
+): Promise<RuntimeRecycleDrainResult> {
+  const bridgeSecret = deps.bridgeSecret;
+  if (!bridgeSecret || isRemoteHost(status.hostId, deps.selfHostId)) {
+    return Promise.resolve("failed");
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: RuntimeRecycleDrainResult): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const req = httpRequest({
+      host: status.boundIp,
+      port: status.port,
+      path: "/internal/v3/runtime-recycle-drain",
+      method: "POST",
+      headers: {
+        "x-openclaude-container-id": String(status.containerId),
+        "x-openclaude-inbound-nonce": computeInboundNonce(
+          bridgeSecret,
+          status.containerId,
+        ),
+        "content-length": "0",
+      },
+    }, (res) => {
+      res.resume();
+      if (res.statusCode === 200) finish("accepted");
+      else if (res.statusCode === 409) finish("busy");
+      else finish("failed");
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("runtime recycle drain timeout")));
+    req.once("error", () => finish("failed"));
+    req.end();
+  });
+}
 
 /**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
@@ -135,6 +229,15 @@ export interface EnsureRunningOptions {
   sleep?: (ms: number) => Promise<void>;
   /** 测试钩子:可注入"现在是几号"用于 timeout 计算 */
   now?: () => number;
+  /** 测试钩子:覆盖 v5 stale-image drain handshake。 */
+  requestRuntimeRecycleDrain?: (
+    deps: V3SupervisorDeps,
+    status: V3ContainerStatus,
+  ) => Promise<RuntimeRecycleDrainResult>;
+  /** @internal 测试隔离:避免并发 test 通过 process.env 串扰。 */
+  runtimeChannelForTest?: "v3" | "v5";
+  /** @internal 测试隔离:生产默认仍读 OC_V5_FORCE_STALE_IMAGE_RECYCLE。 */
+  forceStaleImageRecycle?: boolean;
   /**
    * 测试钩子:跨 host 路径下用 hostId hydrate NodeAgentTarget(给 bridge 用)。
    * 默认实现:`getHostById` + `hostRowToTarget`。生产代码不必传。
@@ -234,6 +337,97 @@ export function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerRea
 }
 
 /**
+ * runtimeStale 判定结果。stale=是否需要回收;reasons 供日志(泛化自旧 stale-image)。
+ */
+interface RuntimeStaleResult {
+  stale: boolean;
+  reasons: string[];
+}
+
+/**
+ * desired runtime 三元组(makeV3EnsureRunning 闭包 setup 时从 deps.runtimeTuple 一次性算出)。
+ * 纯字符串派生,无 IO —— bootHash/imageId 直取,release 取 releasePath 的 basename。
+ * 昂贵的 bundle 全量校验在 index.ts 启动期做,这里只消费其结果。
+ */
+interface DesiredRuntime {
+  imageId?: string;
+  release?: string;
+  bootHash?: string;
+}
+
+function deriveDesiredRuntime(deps: V3SupervisorDeps): DesiredRuntime {
+  // M1 v3 channel stale 污染根治:runtime tuple 是 v5-only 热生效机制。**非 v5 实际 channel**
+  // (OC_RUNTIME_CHANNEL != v5,含 v3 休眠路径)一律忽略 imageId/release/bootHash,退回旧语义纯
+  // tag imageStale(computeRuntimeStale 见 desired 三字段全空 → tag 回落)。
+  // 否则:误配 tuple 时 v3 容器(无 runtime label)会被 release/boot_hash desired 判成永久 stale
+  // → 每次 ensure 都 stopAndRemove+重建,循环回收烧资源。v3 虽退役,休眠路径必须无害。
+  if (!isV5Channel()) return {};
+  const t = deps.runtimeTuple;
+  if (!t) return {};
+  const imageId = t.imageId?.trim() || undefined;
+  const release = t.releasePath ? pathBasename(t.releasePath) : undefined;
+  const bootHash = t.bootHash?.trim() || undefined;
+  return { imageId, release, bootHash };
+}
+
+/**
+ * runtimeStale 泛化(plan §1.4):运行中容器是否需要回收重建。
+ *   stale = imageStale ∨ releaseStale ∨ bootHashStale
+ *
+ *   - imageStale:
+ *       · desired.imageId 有(部署已填 OC_RUNTIME_IMAGE_ID)→ 用 **immutable image ID** 比较
+ *         (status.imageId != desired.imageId);拿不到 status.imageId(远端未扩契约)→ **保守不判 stale**
+ *         (行为同旧,避免误回收远端)。同 tag 重指新镜像也能判出(plan R2-M4)。
+ *       · desired.imageId 空(过渡兼容)→ 回落 **tag 比较**(status.image != deps.image),即旧 imageStale。
+ *   - releaseStale(desired.release 非空才评估):容器 release label != desired.release。label 缺失
+ *     (旧容器 / 未扩契约远端)+ desired 非空 → stale(fail toward converge,滚动升级抵达存量容器)。
+ *   - bootHashStale(desired.bootHash 非空才评估):同 release,比 boot_hash label。
+ *
+ * desired 三字段全空(v3 常态 / 未配 tuple)→ 退化为纯 tag imageStale,行为逐字节同旧。
+ */
+function computeRuntimeStale(
+  status: V3ContainerStatus,
+  deps: V3SupervisorDeps,
+  desired: DesiredRuntime,
+): RuntimeStaleResult {
+  const reasons: string[] = [];
+  if (status.state !== "running") return { stale: false, reasons };
+
+  // (a) image staleness
+  if (desired.imageId) {
+    // 有不可变 ID 权威:只有拿到容器 imageId 才比较(拿不到=保守放行,行为同旧)。
+    if (typeof status.imageId === "string" && status.imageId !== desired.imageId) {
+      reasons.push(`image_id ${status.imageId} != ${desired.imageId}`);
+    }
+  } else if (
+    typeof status.image === "string" &&
+    typeof deps.image === "string" &&
+    status.image !== deps.image
+  ) {
+    // 过渡兼容:tag 比较(旧 imageStale)。
+    reasons.push(`image_tag ${status.image} != ${deps.image}`);
+  }
+
+  // (b) release label staleness(desired 非空才评估)
+  if (desired.release) {
+    const cur = status.labels?.[RUNTIME_RELEASE_LABEL_KEY];
+    if (cur !== desired.release) {
+      reasons.push(`release ${cur ?? "<missing>"} != ${desired.release}`);
+    }
+  }
+
+  // (c) boot_hash label staleness(desired 非空才评估)
+  if (desired.bootHash) {
+    const cur = status.labels?.[RUNTIME_BOOT_HASH_LABEL_KEY];
+    if (cur !== desired.bootHash) {
+      reasons.push(`boot_hash ${cur ?? "<missing>"} != ${desired.bootHash}`);
+    }
+  }
+
+  return { stale: reasons.length > 0, reasons };
+}
+
+/**
  * Phase 3D 主入口 — bridge 注入这个 lambda 给 resolveContainerEndpoint。
  *
  * 闭包持 V3SupervisorDeps + EnsureRunningOptions。返回的函数签名严格匹配
@@ -277,6 +471,13 @@ export function makeV3EnsureRunning(
   const readinessOpts = buildReadinessOpts(options);
   const resolveBridgeTunnelTarget =
     options.resolveBridgeTunnelTarget ?? defaultResolveBridgeTunnelTarget;
+  const drainRuntime = options.requestRuntimeRecycleDrain ?? requestRuntimeRecycleDrain;
+  const wallNow = options.now ?? Date.now;
+  const applyV5StalePolicy = options.runtimeChannelForTest
+    ? options.runtimeChannelForTest === "v5"
+    : isV5Channel();
+  // desired runtime 三元组:闭包 setup 时一次性算出(纯字符串派生,无 IO)。
+  const desiredRuntime = deriveDesiredRuntime(deps);
 
   return async function ensureRunning(uidBig: bigint): Promise<{
     host: string;
@@ -327,25 +528,61 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
     }
 
-    // 镜像滚动回收:运行中容器的实际镜像 != 目标镜像(发版换了新 tag)→ 视作过期,不复用,
-    // 落到下方 (2b) stopAndRemove + 用 deps.image 重建。根治"存量长活容器一直跑旧镜像/旧行为
-    // (旧 permissionMode / baseline / CLI),要等 idle 回收或 crash 才换新版"的问题。
-    // remote 容器 image 暂为 undefined → 不触发(行为同旧,纵深安全)。
-    const imageStale =
-      status?.state === "running" &&
-      typeof status.image === "string" &&
-      typeof deps.image === "string" &&
-      status.image !== deps.image;
-    if (imageStale) {
+    // runtime 滚动回收(泛化自旧 imageStale,plan §1.4):运行中容器 image_id / release /
+    // boot_hash 任一 != desired → 视作过期,不复用,落到下方 (2b) stopAndRemove + 用 deps.image +
+    // 当前 tuple 重建。根治"存量长活容器一直跑旧镜像/旧源码/旧 entrypoint-seed,要等 idle 回收
+    // 或 crash 才换新版"的问题。desired 三元组全空(v3 常态)→ 退化为旧 tag imageStale,行为同旧。
+    // 既有 v5 drain / 最近活跃延迟状态机**不动**,只换判定输入(imageStale → runtimeStale)。
+    const runtimeStale = status
+      ? computeRuntimeStale(status, deps, desiredRuntime)
+      : { stale: false, reasons: [] as string[] };
+    // 变量名保留 recycleStaleImage + 日志保留 "stale-image" 字样(兼容既有 grep / 告警规则);
+    // 新增 staleReasons 字段承载泛化后的具体原因(image_id/release/boot_hash)。
+    let recycleStaleImage = runtimeStale.stale;
+    if (runtimeStale.stale && applyV5StalePolicy) {
+      const force = options.forceStaleImageRecycle
+        ?? process.env.OC_V5_FORCE_STALE_IMAGE_RECYCLE === "1";
+      const lastActivityMs = status?.lastWsActivity?.getTime();
+      const recentlyActive =
+        !force &&
+        typeof lastActivityMs === "number" &&
+        wallNow() - lastActivityMs < V5_STALE_IMAGE_IDLE_MS;
+      if (recentlyActive) {
+        recycleStaleImage = false;
+        console.info("[v3ensureRunning] stale-image recycle deferred", {
+          uid,
+          reason: "recent_activity",
+          staleReasons: runtimeStale.reasons,
+          idleMs: Math.max(0, wallNow() - (lastActivityMs as number)),
+        });
+      } else if (!force && status) {
+        const drainResult = await drainRuntime(deps, status);
+        if (drainResult !== "accepted") {
+          recycleStaleImage = false;
+          console.warn("[v3ensureRunning] stale-image recycle deferred", {
+            uid,
+            reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+            staleReasons: runtimeStale.reasons,
+          });
+        }
+      } else if (force) {
+        console.warn("[v3ensureRunning] forced stale-image recycle may terminate active work", {
+          uid,
+          staleReasons: runtimeStale.reasons,
+        });
+      }
+    }
+    if (recycleStaleImage) {
       console.warn("[v3ensureRunning] recycling stale-image container", {
         uid,
         current: status?.image,
         desired: deps.image,
+        staleReasons: runtimeStale.reasons,
       });
     }
 
     // 2a) running 且镜像最新 → 直接进 readiness 探活(HTTP /healthz + WS upgrade)
-    if (status && status.state === "running" && !imageStale) {
+    if (status && status.state === "running" && !recycleStaleImage) {
       const endpoint = chooseReadinessEndpoint(
         status.hostId,
         deps.selfHostId,
@@ -408,7 +645,7 @@ export function makeV3EnsureRunning(
     //     落本分支,由 stopAndRemove(对 NULL cid 提前 return,只翻 vanished 不动 docker)+ 重建自愈。
     // imageStale(running 但镜像过期)也走这里:stopAndRemove 对 running 容器先 stop 再 remove,
     // 然后 fall through 到 (3) 用 deps.image 重建 → 滚动升级抵达存量长活容器。
-    if (status && (status.state === "stopped" || status.state === "missing" || imageStale)) {
+    if (status && (status.state === "stopped" || status.state === "missing" || recycleStaleImage)) {
       try {
         await stopAndRemoveV3Container(deps, {
           id: status.containerId,
@@ -569,6 +806,42 @@ export function makeV3EnsureRunning(
           dedupe_key: `container.provision_failed:baseline_missing:${new Date().toISOString().slice(0, 13)}`,
         });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
+      }
+      // m1 / R2-M5 — V5 runtime tuple 相关失败经 classifyRuntimeArtifactFailure **单一权威**分级:
+      //   - 部署级坏产物(PlatformBundleInvalid / RuntimeReleaseInvalid / RuntimePlacementInvalid)
+      //     → critical 告警 + 300s 长重试(运维修产物后自恢复)。
+      //   - current 激活中间态(RuntimeActivationInProgress)→ **不告警** + 5s 短重试(与 provisioning
+      //     同级);它是激活 saga 的正常秒级窗口,不该吃长退避 + critical。
+      const artifactClass =
+        err instanceof SupervisorError ? classifyRuntimeArtifactFailure(err.code) : null;
+      if (artifactClass) {
+        if (artifactClass.critical) {
+          safeEnqueueAlert({
+            event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+            severity: "critical",
+            title: "容器 provision 失败 — v5 runtime 产物非法",
+            body:
+              `uid=${uid} provision 失败(${(err as SupervisorError).code}):platform bundle / runtime release / ` +
+              `多机 placement 校验未过。需人工修复产物(bundle/release 目录)或纠正调度。详情:${(err as SupervisorError).message}`,
+            payload: { uid, reason: artifactClass.reason, code: (err as SupervisorError).code },
+            dedupe_key: `container.provision_failed:${artifactClass.reason}:${new Date().toISOString().slice(0, 13)}`,
+          });
+          // eslint-disable-next-line no-console
+          console.error("[v3ensureRunning] v5 runtime artifact invalid — refusing provision", {
+            uid,
+            code: (err as SupervisorError).code,
+            errMsg: (err as SupervisorError).message,
+          });
+        } else {
+          // 瞬态激活窗口:provisioning 同级日志,不告警(避免激活 saga 的秒级窗口刷 critical 噪声)。
+          // eslint-disable-next-line no-console
+          console.warn("[v3ensureRunning] platform activation in progress — short retry (no alert)", {
+            uid,
+            code: (err as SupervisorError).code,
+            errMsg: (err as SupervisorError).message,
+          });
+        }
+        throw new ContainerUnreadyError(artifactClass.retryAfterSec, artifactClass.reason);
       }
       // v3→v5 迁移门控:该用户已迁移到 v5(migrated)或迁移进行中(migrating),v3 拒建容器。
       // 不告警、不当"provisioning"重试(那会让用户在 stale v3 路径上死循环重试);给独立

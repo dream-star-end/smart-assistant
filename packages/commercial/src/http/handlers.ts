@@ -47,6 +47,14 @@ import {
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
+import {
+  ThumbnailDiskCache,
+  THUMBNAIL_MAX_SOURCE_BYTES,
+  parseThumbnailWidth,
+  renderThumbnail,
+  thumbnailCacheKey,
+} from "./mediaThumbnail.js";
+import { BufferingResponseSink } from "./bufferingResponseSink.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import { getBearerToken, getSessionCookieToken } from "./authHelpers.js";
 import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
@@ -234,6 +242,12 @@ export interface CommercialHttpDeps {
    * rotate 改 `mediaSign.ts` 的 HKDF_INFO,旧 URL 全部失效。
    */
   mediaSignKey?: Buffer;
+  /**
+   * 服务端缩略图磁盘缓存(见 mediaThumbnail.ts)。注入后 `/api/media-signed?w=<640|1280>`
+   * 对 image/* 响应缩到 webp 缓存;未注入 → `w` 被忽略,一律回原图(优雅降级,不破坏渲染)。
+   * 由 registerCommercial 启动期 `init()` 清零后注入,与 mediaSignKey 同生命周期(依赖 file proxy)。
+   */
+  thumbnailCache?: ThumbnailDiskCache;
   /**
    * WeChat read-only live-process bearer link key. Derived from bridgeSecret
    * with a separate HKDF info string; absent means `/wx/live` API returns 503.
@@ -2299,8 +2313,36 @@ export async function handleMediaSigned(
     forwardPath = `/api/file?path=${encodeURIComponent(decodedPath)}`;
   }
 
+  // ─── 缩略图分级(w 白名单枚举;w 是渲染参数,不进签名,验签后应用)──────────
+  // 气泡缩略请求 ?w=640/1280;灯箱/查看器/编辑器/下载取原图(无 w)。非白名单 w → 400
+  // (防攻击者用任意值撑爆缓存 / 打 sharp CPU)。thumbnailCache 未注入 → 忽略 w 回原图(降级)。
+  const parsedWidth = parseThumbnailWidth(url.searchParams.get("w"));
+  if (parsedWidth.kind === "invalid") {
+    throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-w");
+  }
+  const thumbWidth =
+    parsedWidth.kind === "width" && deps.thumbnailCache ? parsedWidth.width : null;
+
+  // 缩略 Cache-Control:private, max-age = min(剩余 TTL, 240s)(与原图流式同口径)。
+  const thumbCacheControl = (): string | undefined => {
+    const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+    const ageSec = Math.min(240, remainSec);
+    return ageSec > 0 ? `private, max-age=${ageSec}` : undefined;
+  };
+
+  // 缩略缓存**命中** → 直接从 master 磁盘出字节:零容器/docker/tunnel 往返(最大提速面),
+  // 且不触 ensureContainerReady(命中无需容器活着)。DB active 已在上方校验,足够。
+  if (thumbWidth != null && deps.thumbnailCache) {
+    const key = thumbnailCacheKey({ userId, mediaKind, decodedPath, width: thumbWidth });
+    const cached = await deps.thumbnailCache.get(key);
+    if (cached) {
+      sendMediaBytes(res, cached.buffer, "image/webp", thumbCacheControl());
+      return;
+    }
+  }
+
   // v1.0.191 冷启动护栏 —— 见 CommercialHttpDeps.ensureContainerReady JSDoc。
-  // 位置在 path sanity 通过之后:被 isContainerPathAllowed 拒掉的请求不应触发 provision
+  // 位置在 path sanity + 缩略缓存命中之后:被拒/命中的请求不应触发 provision
   // (浪费 docker 资源 + 给 supervisor 假需求)。装配端的 per-uid singleflight 负责合并
   // 同页多图并发,这里只做"调用 + 错误映射"。
   if (deps.ensureContainerReady) {
@@ -2335,10 +2377,10 @@ export async function handleMediaSigned(
     }
   }
 
-  // 调 containerFileProxy:它内部从 req.url 解析 path。file kind → `/api/file?path=...`
-  // (pathname==='/api/file' 走 isFilePath 分支);media kind → `/api/media/<file>`
-  // (容器 handleMediaGet 双目录搜索,proxy 原样转发 pathname)。forwardPath 已在上方按
-  // mediaKind 定好。try/finally 恢复原值(请求结束后 req 不再用,但符合 hygiene)。
+  // 共享:把 forwardPath 喂给 containerFileProxy(容器取字节**唯一权威**)。resLike 可为真
+  // ServerResponse(原图流式)或 BufferingResponseSink(缩略缓冲)。containerFileProxy 内部
+  // 从 req.url 解析 path,故 try/finally swap req.url。file kind → `/api/file?path=...`;
+  // media kind → `/api/media/<file>`(forwardPath 已按 mediaKind 定好)。
   const log = (_ctx).log;
   const requestId = _ctx.requestId;
   const ctxForProxy: RequestContext = {
@@ -2348,45 +2390,104 @@ export async function handleMediaSigned(
     userAgent: _ctx.userAgent,
     log,
   };
-  const originalUrl = req.url;
-  const newPath = forwardPath;
-  req.url = newPath;
-  try {
-    const selfHostIdForProxy = deps.v3Supervisor.selfHostId;
-    // Cache-Control 覆盖:仅 200/206 → private, max-age = min(剩余 TTL, 240s)。
-    // 240 上限避免 expMs 离现在仍很远时 CDN 大段缓存(虽然签名 TTL 由 sign 端
-    // 控制 5min,这里再 clamp 一遍是 defense-in-depth)。
-    const cacheControlOverride = (upstreamStatus: number): string | null => {
-      if (upstreamStatus !== 200 && upstreamStatus !== 206) return null;
-      const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
-      const ageSec = Math.min(240, remainSec);
-      if (ageSec <= 0) return null;
-      return `private, max-age=${ageSec}`;
-    };
-    await containerFileProxy(
-      req,
-      res,
-      ctxForProxy,
-      {
-        v3: deps.v3Supervisor,
-        bridgeSecret: deps.bridgeSecret,
-        selfHostId: selfHostIdForProxy,
-        getHostById: computePoolGetHostById,
-        tunnelDial: defaultTunnelDial,
-        capabilityProbe: {
+  const v3Supervisor = deps.v3Supervisor;
+  const bridgeSecret = deps.bridgeSecret;
+  const runProxy = async (
+    resLike: ServerResponse,
+    cacheOverride?: (upstreamStatus: number) => string | null,
+  ): Promise<void> => {
+    const originalUrl = req.url;
+    req.url = forwardPath;
+    try {
+      const selfHostIdForProxy = v3Supervisor.selfHostId;
+      await containerFileProxy(
+        req,
+        resLike,
+        ctxForProxy,
+        {
+          v3: v3Supervisor,
+          bridgeSecret,
           selfHostId: selfHostIdForProxy,
-          tunnelFetchHealthz: (hostId, cid, timeoutMs) =>
-            defaultTunnelFetchHealthz(hostId, cid, timeoutMs, {
-              getHostById: computePoolGetHostById,
-            }),
+          getHostById: computePoolGetHostById,
+          tunnelDial: defaultTunnelDial,
+          capabilityProbe: {
+            selfHostId: selfHostIdForProxy,
+            tunnelFetchHealthz: (hostId, cid, timeoutMs) =>
+              defaultTunnelFetchHealthz(hostId, cid, timeoutMs, {
+                getHostById: computePoolGetHostById,
+              }),
+          },
+          responseCacheControlOverride: cacheOverride,
         },
-        responseCacheControlOverride: cacheControlOverride,
-      },
-      BigInt(sub),
-    );
-  } finally {
-    req.url = originalUrl;
+        BigInt(sub),
+      );
+    } finally {
+      req.url = originalUrl;
+    }
+  };
+
+  // Cache-Control 覆盖(原图流式路径):仅 200/206 → private, max-age = min(剩余 TTL, 240s)。
+  const cacheControlOverride = (upstreamStatus: number): string | null => {
+    if (upstreamStatus !== 200 && upstreamStatus !== 206) return null;
+    const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+    const ageSec = Math.min(240, remainSec);
+    if (ageSec <= 0) return null;
+    return `private, max-age=${ageSec}`;
+  };
+
+  // 缩略缓存 miss:经 sink 缓冲原图 → renderThumbnail(resize webp / 透传 / 降级)→ 出字节。
+  if (thumbWidth != null && deps.thumbnailCache) {
+    const sink = new BufferingResponseSink(THUMBNAIL_MAX_SOURCE_BYTES);
+    await runProxy(sink as unknown as ServerResponse);
+    const cap = await sink.completion;
+    const rendered = await renderThumbnail(cap, {
+      cache: deps.thumbnailCache,
+      cacheKey: thumbnailCacheKey({ userId, mediaKind, decodedPath, width: thumbWidth }),
+      width: thumbWidth,
+    });
+    switch (rendered.kind) {
+      case "bytes":
+        sendMediaBytes(res, rendered.body, rendered.contentType, thumbCacheControl());
+        return;
+      case "passthrough-error":
+        // 上游非 200(403/404/410/503/JSON error)原样回放,不缓存。
+        res.writeHead(rendered.statusCode, rendered.headers);
+        res.end(rendered.body);
+        return;
+      case "stream-original":
+        // 原图超 32MiB 不缩:回退成原图流式(第二次取字节,罕见)。
+        await runProxy(res, cacheControlOverride);
+        return;
+      case "upstream-error":
+        // 已发头后 upstream 中断(缓冲不完整)→ 502,永不出损坏/半截字节。
+        _ctx.log.warn("handle_media_signed_thumbnail_upstream_error", { uid: sub });
+        throw new HttpError(502, "BAD_GATEWAY", "thumbnail upstream error");
+    }
+    return;
   }
+
+  // 原图流式(灯箱/查看器/编辑器/下载):既有路径,直接把 res 交给 proxy。
+  await runProxy(res, cacheControlOverride);
+}
+
+/**
+ * 出字节到真 ServerResponse:统一 200 + Content-Type + 正确 Content-Length +
+ * inline disposition + Vary。缩略命中/miss 出字节共用。cacheControl 缺省 no-store。
+ */
+function sendMediaBytes(
+  res: ServerResponse,
+  body: Buffer,
+  contentType: string,
+  cacheControl?: string,
+): void {
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Content-Disposition": "inline",
+    Vary: "Authorization, Cookie",
+    "Cache-Control": cacheControl ?? "no-store",
+  });
+  res.end(body);
 }
 
 // ─── 用户文献库(research_documents 管理面,ManageCenter「文献库」tab)────────

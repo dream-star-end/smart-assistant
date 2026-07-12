@@ -201,7 +201,9 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | `packages/web-react` 前端 | dist 静态资源 | **`deploy-v5.sh --dist`**(vite build + 竞态安全 rsync + 资产 GC + restart + 版本握手 smoke);SPA 缓存必重启 |
 | **管理后台**(`packages/web-react/src/admin/**`,admin.html 第二 Vite 入口,2026-07-10 起) | dist 静态资源 | 同上 `--dist`;vanilla admin(web/public/admin.js)与 gateway legacy 透传已删,`?v=` 戳/bump-version 不再涉 v5 |
 | 告警脚本(`scripts/v5-monitor.sh`/`v5-daily-check.sh`/`v5-alert-fanout.sql`/`v5-alert-fail.sh`) | kl-mirror 脚本树 | 随 deploy rsync 即生效;**systemd 单元(deploy/v5/)仍手动 cp+daemon-reload**(alert-fail@ 模板免 enable) |
-| 容器内 gateway/CCB/baseline skill/entrypoint(packages/gateway、claude-code-best、agent-sandbox/runtime、ccb-baseline*) | **runtime image** | 重建镜像+切 tag(§4.3);纯 baseline skill 例外:bind-mount 源码树,rsync 即生效 |
+| 容器内 gateway/CCB/storage/protocol/mcp-memory 源码 | **runtime source release**(feat/v5-runtime-hotcfg 起) | deploy 自动构建 release(content digest 命名)+ tuple 激活;存量容器 runtimeStale 滚动(重连秒级/idle≤30min)。**启用前提:env 已有 OC_RUNTIME_RELEASE 或 deploy `--enable-runtime-release` 首次开启;未启用=旧行为(重建镜像)** |
+| 平台配置(agent-sandbox/platform-runtime/**:oc-* 薄壳、entrypoint.ts、seed 声明/persona/种子技能、prompts 文案) | **platform bundle** | deploy 自动打 bundle(digest 命名+current 原子翻转);bin/prompts **真热**(存量容器立即),entrypoint/seed 走 boot_hash 滚动。启用开关同上(`--enable-platform-bundle`)。baseline skill(ccb-baseline*)机制不变:rsync 即生效 |
+| 工具链(Dockerfile:apt/pip/Quarto/Typst/codex CLI pin/Chromium/sudoers) | **runtime image**(纯工具链面) | 重建镜像+切 tag(§4.3);v5 生产 build 传 `OC_EMBED_SOURCE=0`(瘦身,源码走 release 挂载);重建后必须刷新 emergency tuple(§4.3) |
 | `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
 | `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
 | `packages/commercial/src/db/migrations/*.sql` | 共享 PG | AUTO_MIGRATE=0 → **人工受控 apply**(§4.5) |
@@ -272,6 +274,28 @@ cutover manifest，也不要求新 migration。仅真正紧急人工维护可为
 `OC_BREAK_GLASS_OFFLINE_RECYCLE=I_ACCEPT_V5_OUTAGE`；它不能绕过数据库兼容性禁令。
 
 ### 4.3 runtime image 重建
+
+> **runtime tuple(feat/v5-runtime-hotcfg 起)**:激活/回滚原子单元 =
+> {OC_RUNTIME_IMAGE(_ID), OC_RUNTIME_RELEASE, OC_PLATFORM_BUNDLE},由 deploy 激活 saga
+> 统一写入 env + `/etc/openclaude/runtime-tuple.history`(带 checksum),回滚=翻上一条
+> committed tuple(`deploy-v5.sh --rollback`),**禁止手改单个键**。stale 判定按 image
+> **immutable ID**(同 tag 重指新镜像不会漏判)。镜像重建从"每个功能批次"降到
+> "工具链变更时";重建后跑 `deploy-v5.sh --emergency-tuple` 刷新 break-glass 记账
+> (emergency = 完整 pinned tuple,含内嵌源码镜像,兼容性破坏变更必须刷新+smoke)。
+> release/bundle GC 保护集含运行容器 label 引用,docker 不可用即放弃本轮 GC。
+
+> **首启实战坑(2026-07-12,均已在 lib 代码注释登记)**:①容器 bridge 网络 DNS 不通
+> → deps 安装容器必须 --network=host(同 OC_BUILD_NETWORK_HOST 坑);②bun run build 的
+> 嵌套 script 按名字找 bun → PATH 须前置 bun 目录(绝对路径调外层不够);③release 数万
+> 文件 files[] JSON 走 --argjson 撑爆 argv → --slurpfile;④结果值函数的子进程 stdout
+> 必须 >&2(npm 输出污染 $(…) 捕获);⑤**bun build 不可复现**(同源重建 bytes 都变)→
+> ccbDistKey 内容寻址缓存复用 dist,否则每次 deploy 全量容器 churn;⑥strict 壳里
+> 守卫式 `[ -n "$x" ] && …` 作函数末条会把空值放大成失败 → 显式 return 0。
+> **稳态操作**:瘦身镜像重建传 OC_EMBED_SOURCE=0;重建后跑
+> `deploy-v5.sh --emergency-tuple --image=<内嵌tag> --image-id=<ID> --bundle=<bundle>`
+> 刷新逃生点;逃生激活=`--activate-emergency-tuple`;禁用轴=`--disable-runtime-release
+> --image=<内嵌tag> --image-id=<ID>` / `--disable-platform-bundle`。
+
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun
 ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin:$PATH \
@@ -280,9 +304,14 @@ ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin
 # 完成判定:docker images 出现该 tag(日志 grep FATAL 会误报 Dockerfile 里的 echo 字符串)
 ssh kl-mirror 'sed -i "s|^OC_RUNTIME_IMAGE=.*|OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:v5-ccb-<sha>|" /etc/openclaude/commercial-v5.env'
 # 同步 bump 仓内 overrides 的 OC_RUNTIME_IMAGE(单独 chore commit)+ rsync 该文件到远端树
-ssh kl-mirror 'systemctl restart openclaude-v5'   # 新容器用新镜像;存量自然回收(除非明确要求 force recycle)
+ssh kl-mirror 'systemctl restart openclaude-v5'   # 新容器用新镜像;存量在空闲窗口按需回收
 # 镜像清理:保留 current + 上一版(回滚),其余 docker rmi
 ```
+
+存量容器镜像不一致时,v5 `ensureRunning` 先看最后 WS 活动:距今 <30 分钟只复用并延期;
+达到 30 分钟或活动时间为空时,再向容器做带 nonce 的 turn-drain 握手。Gateway ingress 与
+SessionManager submit 双闸均确认无在途 turn 才回收,握手失败/繁忙一律延期。紧急安全发布可
+临时设 `OC_V5_FORCE_STALE_IMAGE_RECYCLE=1` 绕过延期与握手,但会中断正在执行的工作;普通发布禁用。
 
 ### 4.4 env 三层模型
 `/etc/openclaude/commercial-v5.env` = V3_ENV 继承 − REMOVE_KEYS + overrides + OC_EGRESS_SECRET(保留链)。
@@ -338,6 +367,10 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
 | ~~org 订阅期内桶~~ **已偿还**(二期 8a4c14a9,0115) | 四桶+席位订阅(org-pro/max/ultra 9折池化)+自助开通+席位闸 | — |
+| 远端 host release/bundle 分发 | runtime release/platform bundle 仅本机(kl-mirror);多机硬门:OC_RUNTIME_RELEASE 非空+非 self-host placement → 调度前拒 provision+告警(v3supervisor 带测试) | 新增 compute host 时做 rsync 分发(与 baseline REMOTE_HOST_CCB_BASELINE_DIR 推送同构)+node-agent inspect 契约补 imageId/labels |
+| 模型权威独立批次(P2c+seed model) | 模型目录 master 下发(ModelExecutionCatalog:bridge 授权/engine 分类/计费编排/容器执行同快照消费,per-uid 过滤,enabled=false fail-closed)+seed agent model/engine 声明化(bridge 按容器实际 seed revision 推导);设计审 R1-B5/R2-B1 裁定不与镜像瘦身同批 —— **在此之前 platform-seed.yaml 禁放 model/engine/provider 键(schema 硬拒),模型面改动仍走 protocol 常量+release 滚动** | 下一个模型/计费面批次单独设计单独 Codex 审 |
+| SupervisorErrorCode 无平台专用码 | platform bundle/release/多机门校验失败统一映射 InvalidArgument(ensureRunning 短重试,功能正确但运维信号不如 CcbBaselineMissing 清晰) | 首次生产遇到 bundle 校验失败排障时加专用码+critical 告警 |
+| env.bak 无轮转 | 激活 saga 每次 cp env env.bak-<ts>,/etc/openclaude 缓慢累积 | 目录文件数>50 时加保留最近 10 份的清理 |
 | 知识库 org 化 | research_documents/artifacts 租户主键 (user_id,doc_id) + 引用权威链须跨 user 重构 | P3.1 稳定后单独立项 |
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |
@@ -353,6 +386,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~codex 原生生图关断~~ **已反转**(boss 07-11 拍板启用,merge 18943fa1) | relay 放行 POST /images/generations\|edits + 撤 features 关断 + AGENTS.md 引导优先 imagegen(gpt-image-2);minimax-media 退居备选/非 codex 引擎 | — |
 | ~~codex 生图按张计费未接~~ **已完成** | gpt-image-2 generations/edits 统一成功后每张 50 积分;精确标注编辑在遮罩合成原子落盘后结算;余额不足硬拒、单用户并发 1、UTC 每日成功 10 张、失败不扣费、request/job 幂等 | 运维查 `image_generation_usage_records` + `credit_ledger(reason='image_generation')`;改 relay/结算必须 `deploy-v5.sh --egress` |
 | mmx 凭据文件通道(镜像常量对) | codex 路径 env 被双重清洗(buildCodexEnv 剥 OPENCLAUDE_* + codex shell 策略剥 *TOKEN*),mmx 凭据走 entrypoint 每 boot 覆写的 container-auth.json;**新增依赖容器 env 的平台 CLI 必须同样走文件或 OC_ 前缀非凭据名**,argv `-c` 回注 = 违反 token 不进日志不变量(有防回归断言) | — |
+| 容器 outboundRing.lastSeq 不跨重启 | 容器回收后帧序从零,依赖客户端游标仲裁(resume_failed no_buffer+to:0 归零+cold_start 清游标,7994ac76)闭环;服务端 seq 持久化(seed 自 durable 源)是对称根治 | 再现"冷容器后 live 帧丢失"类报障时 gateway 域根治 |
+| 图片缩略磁盘缓存无运行期逐出 | media-thumb-cache 仅启动清(重启节奏封顶增长) | 磁盘告警时加 LRU 逐出 |
 | reminder 无独立 label 字段 | 列表标题=prompt 压平截断兜底(reminderFormat.ts);系统任务中文名是镜像常量(权威源 gateway cron.ts DEFAULT_JOBS,两处需同步) | 用户自定义任务名需求出现时:cron job 加 label 一等字段 |
 | CI 失败无告警 | v5-ci 挂/红没有任何推送(07-07 起 commercial-unit 门挂死 3 天无人知,2026-07-10 才根治);GitHub→告警 outbox 无桥 | 下次 CI 再次静默红超 1 天时:加 workflow 失败 webhook→admin_alert_outbox(events 已有 ops 组可挂) |
 | admin React 化残余小项 | ①Progress 原语无 tone/fill 定制(hosts 自建 Meter)②typedConfirm(打字确认)未平移,一律 useConfirm danger ③表单 Select 原语缺失(P2/P4/P6 各自局部实现)④fmtCents 字符串版 ¥ 格式化器 4 页内联重复⑤org 调余额后端仍 501 占位 | 下次 admin 批次顺手收敛①-④;⑤随 org 计费批次 |

@@ -1,0 +1,75 @@
+# runtime-src-excludes.txt — 个人版源码树进 runtime 镜像/release 的 rsync 排除清单(单一权威)。
+#
+# 消费方(必须共用本文件,禁止各自内联漂移):
+#   1. build-image.sh(rsync personal-version → build context)——`--exclude-from` 引用。
+#   2. deploy release 构建(agent C 的 deploy-v5.sh:git archive/rsync 源 → release 树)——同引用。
+#
+# 语义分两类:
+#   A. 体积/产物:node_modules(容器内 npm install 重装)、.git、dist/build 产物、缓存、日志、
+#      IDE/OS 杂物 —— 无需进镜像。
+#   B. **leak hardening(2026-04-29,紧要)**:镜像 /opt/openclaude 在容器内 agent shell 可读;
+#      容器只跑 npm run gateway(packages/cli),根目录 *.md / docs / infra / deploy / scripts /
+#      凭据类文件对 runtime 0 依赖,却会暴露 boss 名字 / master IP / Codex workflow / 内网 IP /
+#      SSH 凭据路径等平台敏感信息。Layer 1(subprocessRunner --setting-sources user)已堵 ccb
+#      自动加载注入;本清单关闭剩余"用户 cat 直读"攻击面。用户数据走 named volume + tmpfs,与
+#      build context 0 重叠,不受影响。
+#
+# 规则(rsync filter 语法):'/foo' 锚定源根(不误删 packages/*/foo 同名 child);'#'/空行忽略。
+# packages/commercial 排除保留"runtime 镜像不含商用版代码"不变量。
+
+# ── A. 体积 / 产物 / 缓存 / 杂物 ──
+node_modules/
+.git/
+.gitignore
+/dist/
+build/
+packages/commercial/
+packages/commercial
+.next/
+.turbo/
+coverage/
+.cache/
+.npm/
+.bun/
+*.log
+.DS_Store
+.vscode/
+.idea/
+tmp/
+.tmp/
+.playwright-mcp/
+
+# ── B. leak hardening:凭据 / 密钥 / 历史 ──
+.env
+.env.*
+.openclaude/
+.openclaude-dev/
+*.pem
+*.key
+.ssh/
+.aws/
+.gnupg/
+.npmrc
+.netrc
+.bash_history
+.zsh_history
+.claude/
+.codex/
+.codex
+
+# ── B. leak hardening:根级平台敏感文档 / 运维脚本(runtime 0 依赖)──
+/CLAUDE.md
+/README.md
+/AUDIT_REMEDIATION_TASKS_*.md
+/CCB_ASSISTANT_REFACTOR_PLAN_*.md
+/docs/
+/evals/
+/infra/
+/deploy/
+/scripts/
+/claude-code-best/CLAUDE.md
+/claude-code-best/DEV-LOG.md
+/claude-code-best/README.md
+/claude-code-best/SECURITY.md
+/claude-code-best/TODO.md
+/claude-code-best/docs/

@@ -113,6 +113,40 @@ export function advanceFrameSeqCursorTo(sess: ChatSession, frame: { sessionKey?:
   if (to > last) setFrameSeqCursor(sess, key, to);
 }
 
+/**
+ * 容器 ring **重启签名**下的游标归零(resume_failed reason='no_buffer' 且 to===0 专用)。
+ *
+ * 「只进不退」不适用于这个签名:它是**容器本人**对自家 ring 的权威裁决("我这代 ring 里
+ * 该 sessionKey 一帧都没有"),不是当年 bridge 越权伪造的陈旧信号(那个源已根治——bridge
+ * 对自身 miss 刻意不发 resume_failed,replay 唯一裁决者=容器,见 userChatBridge)。若游标
+ * 不回退,冷容器新生代帧 seq=1..旧游标 会被 acceptFrameSeq 全部当重复帧黑洞:流式轮丢开头
+ * 一截(自愈但丢内容),而 imageEdit 免模型直投轮**整轮只有一帧终帧 → 整轮蒸发**。
+ * 2026-07-11 boss 生产实证(会话 webmrfo3rtrwhgi15):hello 后容器答复 resume_failed
+ * {from:14,to:0,no_buffer},客户端游标停 14;直投终帧 frameSeq=1 被丢 → 粒子占位卡永不
+ * 消解、assistant 行只能靠 REST 对账迟到补上、发送态挂到 thinking-safety 超时。
+ * 安全性:空 ring 无帧可重放,归零后新生代帧 seq 1..N 恰好各被接受一次,无重复应用面。
+ */
+export function resetFrameSeqCursor(sess: ChatSession, frame: { sessionKey?: string }): void {
+  const key = frameSeqKey(frame, sess.id);
+  setFrameSeqCursor(sess, key, 0);
+}
+
+/**
+ * 冷启(sys.cold_start = bridge provision 分支 = **全新容器**)下,把该会话全部 agent-scoped
+ * 游标归零。覆盖「连接不断、容器中途被回收重建」的场景——此时没有 hello/resume_failed 仲裁,
+ * 新容器 outboundRing 从零计数,不归零则与上面同一类帧黑洞。删除键即可:getFrameSeqCursor
+ * 对 agent-scoped 缺省键恒返回 0(严禁回退 legacy 单游标,pure.ts)。
+ */
+export function resetAgentFrameSeqCursorsForSession(sess: ChatSession): void {
+  const byKey = sess._lastFrameSeqByKey;
+  if (!byKey || typeof byKey !== "object") return;
+  const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const suffix = `:webchat:dm:${safeId}`;
+  for (const key of Object.keys(byKey)) {
+    if (key.startsWith("agent:") && key.endsWith(suffix)) delete byKey[key];
+  }
+}
+
 // ═══════════════ delegate / subagent helpers（websocket.js:800-1172）═══════════════
 
 function isDelegateToolName(name?: string): boolean {
@@ -778,6 +812,34 @@ export function failGenPlaceholders(sess: ChatSession, reason?: string): void {
       gp.status = "failed";
       if (reason && !gp.reason) gp.reason = reason;
     }
+  }
+}
+
+/**
+ * 兜底消解(纵深防御):REST 对账(applyServerMessages)后,若某**运行中**占位的锚点 user 行
+ * (占位随其注入的那条乐观 user 消息,GenPlaceholder.afterUserMsgId)已被 server echo 回带
+ * `_seq`,且会话里存在 **server 序更晚** 的 server-authored assistant 行 —— 说明该轮结果已在
+ * 服务端 durable 收尾,只是 live 终帧没送达(任何帧丢失类故障)。按「turn 串行」语义清掉该
+ * 占位,防「扣费成功 + 结果已显示 + 占位永转」(2026-07-11 boss 生产事故形态:冷容器 frameSeq
+ * 重置致直投终帧被游标黑洞,结果行靠 REST 对账补上而占位无人消解)。
+ * 纯 `_seq`(server 单调序)比较,零时钟依赖;锚点行未被 echo(_seq 缺省)则不动(fail-safe,
+ * 绝不在轮进行中误清);failed 占位保留(失败卡要给用户看)。
+ */
+export function expireGenPlaceholdersAgainstServerRows(sess: ChatSession): void {
+  for (let i = sess.messages.length - 1; i >= 0; i--) {
+    const gp = sess.messages[i]._genPlaceholder;
+    if (!gp || gp.status !== "running" || !gp.afterUserMsgId) continue;
+    const anchor = sess.messages.find((m) => m.id === gp.afterUserMsgId);
+    if (!anchor || typeof anchor._seq !== "number") continue;
+    const anchorSeq = anchor._seq;
+    const answered = sess.messages.some(
+      (m) =>
+        m.role === "assistant" &&
+        isServerAuthoredRow(m) &&
+        typeof m._seq === "number" &&
+        m._seq > anchorSeq,
+    );
+    if (answered) sess.messages.splice(i, 1);
   }
 }
 
@@ -1483,9 +1545,15 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
 // ═══════════════ resume_failed（§4 第三层）═══════════════
 export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailedWire, effects: FrameEffects = {}): void {
   const frameTo = typeof frame.to === "number" ? frame.to : 0;
-  advanceFrameSeqCursorTo(sess, frame, frameTo); // 推游标到 server currentLast（防 reload 死循环，配 dbPut）
+  if (frameTo === 0 && frame.reason === "no_buffer") {
+    // 容器 ring 重启签名(该 sessionKey 在这代容器里零帧):游标必须归零,否则新生代帧
+    // seq=1.. 全被当重复帧黑洞——直投单帧轮整轮蒸发(生产实证见 resetFrameSeqCursor 注释)。
+    resetFrameSeqCursor(sess, frame);
+  } else {
+    advanceFrameSeqCursorTo(sess, frame, frameTo); // 推游标到 server currentLast（防 reload 死循环，配 dbPut）
+  }
   sess._liveStreamBroken = true;
-  effects.persistSession?.(sess.id); // 立即落地推进后的游标（dbPut 写点；防 reload 死循环）
+  effects.persistSession?.(sess.id); // 立即落地仲裁后的游标（dbPut 写点；防 reload 死循环）
   effects.forceSync?.(sess.id);
 }
 

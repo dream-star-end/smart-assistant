@@ -17,19 +17,23 @@
 #   - 个人版 gateway 默认绑 0.0.0.0:18789,docker bridge net 内 commercial
 #     gateway 通过 bound_ip:18789 直连
 #
-# Build context 期待布局(由 Phase 3B 的 build-image.sh 准备):
+# Build context 期待布局(由 build-image.sh 准备):
 #   ./Dockerfile.openclaude-runtime
-#   ./runtime/entrypoint.sh
-#   ./runtime/entrypoint.ts
-#   ./personal-version/         <-- rsync 自 /opt/openclaude/openclaude/
-#       package.json
-#       packages/...
-#       claude-code-best/...
+#   ./runtime/entrypoint.sh              <-- 镜像必需薄壳(分流 bundle/fallback entrypoint)
+#   ./runtime/create-docgen-reference.py <-- 构建期生成 reference.docx
+#   ./platform-runtime/                  <-- bundle 源(dev fallback COPY 用):
+#       bin/oc-*.{sh,py}  entrypoint/{entrypoint.ts,platformBundle.ts}
+#       etc-codex/managed_config.toml  codex-skills/  seed/{platform-seed.yaml,personas,skills}
+#   ./personal-version/         <-- rsync 自源码树(仅 OC_EMBED_SOURCE=1 时 COPY)
+#       package.json  packages/...  claude-code-best/...
 #
 # 构建命令(供 3B 参考):
 #   docker build -f Dockerfile.openclaude-runtime -t openclaude/openclaude-runtime:<tag> .
 # ------------------------------------------------------------
 
+# OC_EMBED_SOURCE:**全局 ARG**(FROM embed-${OC_EMBED_SOURCE} 需在首个 FROM 前声明)。
+# =0 瘦身(v5 生产,源码走 release ro 挂载),=1 内嵌源码+装依赖(默认;v3 + canary)。见文件尾部 embed 段。
+ARG OC_EMBED_SOURCE=1
 FROM node:22-slim AS base
 
 # 时区 + 语言环境(显式 Asia/Shanghai 与商用版宿主同步;不依赖 host 默认)
@@ -48,7 +52,10 @@ ENV TZ=Asia/Shanghai \
     # PATH 显式指定:~/.local/bin 放最前(D2 持久化的 user-level npm/pip/pipx
     # binary 优先于系统级)。完整列出 Debian 默认路径,避免 base image 升级
     # 漂移导致顺序错乱。
-    PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # runtime hotcfg §1.2:在 ~/.local/bin 后、系统路径前插 platform bundle 的 bin —— oc-*
+    # 工具优先命中 bundle current(原子翻转即真热),bundle 缺席才回落 /usr/local/bin 里
+    # 镜像 COPY 的 dev fallback 副本。bundle bin 由 supervisor 挂 /run/oc/platform:ro。
+    PATH=/home/agent/.local/bin:/run/oc/platform/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 必装工具(精挑,避免镜像膨胀):
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
@@ -203,58 +210,60 @@ RUN set -eux; \
     chmod -R a+rX /opt/typst-cache; rm -rf /tmp/typwarm; \
     find /opt/typst-cache -maxdepth 4 -type d \( -name cetz -o -name fletcher \)
 
-COPY --chown=root:root ./runtime/oc-docx.sh /usr/local/bin/oc-docx
+# ── oc-* 工具:dev fallback(生产走 PATH /run/oc/platform/current/bin 的 bundle,允许滞后)──
+# 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
+COPY --chown=root:root ./platform-runtime/bin/oc-docx.sh /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
-COPY --chown=root:root ./runtime/oc-minimax.py /usr/local/bin/oc-minimax
-COPY --chown=root:root ./runtime/oc-web-context.py /usr/local/bin/oc-web-context
+COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
+COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/oc-web-context
 # oc-web: CLI front-end over the web-context core (replaces the retired
 # web_context_* MCP tools; documented by the `web-context` baseline skill).
-COPY --chown=root:root ./runtime/oc-web.sh /usr/local/bin/oc-web
+COPY --chown=root:root ./platform-runtime/bin/oc-web.sh /usr/local/bin/oc-web
 # oc-browser: thin client over the oc-browser daemon (replaces the retired
 # browser_* MCP tools; documented by the `browser` baseline skill).
-COPY --chown=root:root ./runtime/oc-browser.sh /usr/local/bin/oc-browser
+COPY --chown=root:root ./platform-runtime/bin/oc-browser.sh /usr/local/bin/oc-browser
 # oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
 # master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
-COPY --chown=root:root ./runtime/oc-market.sh /usr/local/bin/oc-market
+COPY --chown=root:root ./platform-runtime/bin/oc-market.sh /usr/local/bin/oc-market
 # oc-skill: AI-driven, conversation-triggered skill training / eval-case generation
 # over THIS container's own gateway loopback (/internal/v3/skill-local/*); documented
 # by the `skill-management` baseline skill.
-COPY --chown=root:root ./runtime/oc-skill.sh /usr/local/bin/oc-skill
+COPY --chown=root:root ./platform-runtime/bin/oc-skill.sh /usr/local/bin/oc-skill
 # oc-lit / oc-cite / oc-ingest / oc-litrag: 科研 agent 能力(多源检索 + 引用接地门禁 +
 # 文档解析 + quote-first RAG),走 master /v3/research/*(平台持 key + 铸造证据权威)。
 # 文档见对应 baseline skill。
-COPY --chown=root:root ./runtime/oc-lit.sh /usr/local/bin/oc-lit
-COPY --chown=root:root ./runtime/oc-cite.sh /usr/local/bin/oc-cite
-COPY --chown=root:root ./runtime/oc-ingest.sh /usr/local/bin/oc-ingest
-COPY --chown=root:root ./runtime/oc-litrag.sh /usr/local/bin/oc-litrag
+COPY --chown=root:root ./platform-runtime/bin/oc-lit.sh /usr/local/bin/oc-lit
+COPY --chown=root:root ./platform-runtime/bin/oc-cite.sh /usr/local/bin/oc-cite
+COPY --chown=root:root ./platform-runtime/bin/oc-ingest.sh /usr/local/bin/oc-ingest
+COPY --chown=root:root ./platform-runtime/bin/oc-litrag.sh /usr/local/bin/oc-litrag
 # oc-report / oc-slides / oc-poster: 确定性产物渲染(报告/幻灯/海报,自建 Quarto 流水线)。
 # 文档见 research-report / research-slides baseline skill。
-COPY --chown=root:root ./runtime/oc-report.sh /usr/local/bin/oc-report
-COPY --chown=root:root ./runtime/oc-slides.sh /usr/local/bin/oc-slides
-COPY --chown=root:root ./runtime/oc-poster.sh /usr/local/bin/oc-poster
+COPY --chown=root:root ./platform-runtime/bin/oc-report.sh /usr/local/bin/oc-report
+COPY --chown=root:root ./platform-runtime/bin/oc-slides.sh /usr/local/bin/oc-slides
+COPY --chown=root:root ./platform-runtime/bin/oc-poster.sh /usr/local/bin/oc-poster
 # oc-rank: 确定性候选排名(tournament debate / tree-search 选分支),文档见 research-tournament skill。
-COPY --chown=root:root ./runtime/oc-rank.sh /usr/local/bin/oc-rank
+COPY --chown=root:root ./platform-runtime/bin/oc-rank.sh /usr/local/bin/oc-rank
 # oc-xlsx / oc-pdf: 办公助手确定性产物(Excel via openpyxl / 通用 PDF via Quarto-Typst)。
 # 文档见 office-spreadsheet / office-pdf baseline skill。
-COPY --chown=root:root ./runtime/oc-xlsx.py /usr/local/bin/oc-xlsx
-COPY --chown=root:root ./runtime/oc-pdf.sh /usr/local/bin/oc-pdf
+COPY --chown=root:root ./platform-runtime/bin/oc-xlsx.py /usr/local/bin/oc-xlsx
+COPY --chown=root:root ./platform-runtime/bin/oc-pdf.sh /usr/local/bin/oc-pdf
 # oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
 # 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
-COPY --chown=root:root ./runtime/oc-vision.sh /usr/local/bin/oc-vision
+COPY --chown=root:root ./platform-runtime/bin/oc-vision.sh /usr/local/bin/oc-vision
 # oc-figcheck: 出图质量门 + vision 回看闭环(确定性检查 + MiniMax-M3 审图 → PASS/WARN/FAIL,
 # 让 agent 看到自己刚画的图并自纠,根治"开环盲画");oc-diagram: Typst+CeTZ 精密矢量
 # 示意图(机制/装置/几何/通路图)。均文档见 scientific-figures baseline skill。
-COPY --chown=root:root ./runtime/oc-figcheck.sh /usr/local/bin/oc-figcheck
-COPY --chown=root:root ./runtime/oc-diagram.sh /usr/local/bin/oc-diagram
+COPY --chown=root:root ./platform-runtime/bin/oc-figcheck.sh /usr/local/bin/oc-figcheck
+COPY --chown=root:root ./platform-runtime/bin/oc-diagram.sh /usr/local/bin/oc-diagram
 # oc-memory: 长期记忆 CLI(Recall + Archival),复用 mcp-memory memoryTools 核心。取代常驻
 # openclaude_memory MCP 里的 session_search/archival_* 工具(常驻 stdio 传输脆弱 → codex 死等)。
 # memdir 范式后 Core 记忆改为直接用 Write/Edit 写 MEMORY.md 索引 + memory/*.md 文件,`memory`
 # 子命令已退役(调用只打印迁移提示)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
-COPY --chown=root:root ./runtime/oc-memory.sh /usr/local/bin/oc-memory
+COPY --chown=root:root ./platform-runtime/bin/oc-memory.sh /usr/local/bin/oc-memory
 # oc-connect: 应用连接器 CLI(webdav/imap/notion/github/feishu),走 master /v3/connectors/*
 # (第三方凭据只在 master,永不落容器);写操作走 propose-then-commit 确认门。
 # 文档见 app-connectors baseline skill。
-COPY --chown=root:root ./runtime/oc-connect.sh /usr/local/bin/oc-connect
+COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-connect
 RUN set -eux; \
     chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
@@ -331,7 +340,9 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 # 容器 loopback relay(残余 backend-api 请求 → relay allowlist 外 404,不出容器)。
 # COPY 自动创建 /etc/codex(root:root)。codex 缺席(OC_INCLUDE_CODEX=0)时此文件
 # 无害。键名经 codex 0.137 探针实测(见文件头 + docs/wip/v5-codex-telemetry-block.md)。
-COPY --chown=root:root ./runtime/codex-managed-config.toml /etc/codex/managed_config.toml
+# dev fallback:生产走 bundle etc-codex(探针未证 codex managed_config 路径可配前仍以镜像面为准,
+# 见报告探针结论);bundle 内 etc-codex/managed_config.toml 仅作 staging 源,不承诺热。
+COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/codex/managed_config.toml
 
 # ------------------------------------------------------------
 # Playwright MCP + Chromium for the oc-browser daemon
@@ -382,14 +393,12 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then set -eux; \
 # "当前环境没有暴露内置 image_gen 工具" 然后 fallback 到 PIL(2026-05-02 incident)。
 #
 # 解决:build 阶段以 root 跑一次 codex app-server 触发 populate,把生成的
-# skills/ 整体移到镜像内固定路径 /opt/codex-system-skills/(所有人可读),
-# 并叠加 OpenClaude runtime 自带的 Codex native system skill(document-writing)。
-# entrypoint 容器启动时逐 skill seed 到 /home/agent/.codex/skills/ —— 详见
-# runtime/entrypoint.ts 的 codex skills seed 段。逐 skill seed 是为了已有用户 volume
-# 里已经有 imagegen 时,仍能补进新增的 document-writing。
+# skills/ 整体移到镜像内固定路径 /opt/codex-system-skills/(所有人可读,只含 codex **原生**
+# system skill)。平台自有 skill(document-writing)已迁 bundle codex-skills/,由 entrypoint
+# overlay 单独 hash-overwrite 叠加(见下方 COPY 与 platform-runtime/entrypoint 的 codex overlay 段)。
+# entrypoint 容器启动时逐 skill seed 到 /home/agent/.codex/skills/ —— 原生走 skip-if-exists。
 #
 # 失败兜底:populate 后的 marker 文件必须存在,否则 build fail(避免发坏镜像)。
-COPY --chown=root:root ./runtime/codex-system-skills/document-writing/SKILL.md /tmp/codex-system-skills/document-writing/
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then mkdir -p /tmp/_cx/.codex && \
     HOME=/tmp/_cx CODEX_HOME=/tmp/_cx/.codex bash -c '\
       codex app-server --listen stdio:// </dev/null >/dev/null 2>&1 & \
@@ -403,12 +412,16 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then mkdir -p /tmp/_cx/.codex && \
     ' && \
     test -f /tmp/_cx/.codex/skills/.system/.codex-system-skills.marker && \
     cp -a /tmp/_cx/.codex/skills /opt/codex-system-skills && \
-    mkdir -p /opt/codex-system-skills/.system/document-writing && \
-    cp /tmp/codex-system-skills/document-writing/SKILL.md /opt/codex-system-skills/.system/document-writing/SKILL.md && \
     rm -rf /tmp/_cx && \
     chmod -R a+rX /opt/codex-system-skills && \
     test -f /opt/codex-system-skills/.system/.codex-system-skills.marker; \
     else echo "[v5 ccb-only] skip codex system skills populate (OC_INCLUDE_CODEX=0)"; fi
+
+# 平台自有 codex skill(document-writing 等)已迁 bundle platform-runtime/codex-skills/(runtime
+# hotcfg §2c):生产 entrypoint 从自身 bundle ../codex-skills 读并 **hash 不一致即覆写**叠加到
+# CODEX_HOME(真热,修 skip-if-exists 送不达缺陷);dev fallback = bundle 缺席时从这里读(允许滞后)。
+# 上面 /opt/codex-system-skills 现只含 codex **原生** system skill(走 skip-if-exists),两层分离。
+COPY --chown=root:root ./platform-runtime/codex-skills/ /usr/local/share/openclaude-platform/codex-skills/
 
 # ------------------------------------------------------------
 # 账户 agent (uid=1000)
@@ -495,63 +508,65 @@ RUN set -eux; \
     runuser -u agent -- sudo -n true || (echo "FATAL: agent sudo -n true failed at build" && exit 1)
 
 # ------------------------------------------------------------
-# Personal-version 源码 + npm install
+# Entrypoint 薄壳 + platform bundle dev fallback(EMBED-independent,落 base)
 # ------------------------------------------------------------
-# COPY 整个个人版源码树(含 claude-code-best 子目录),目标 /opt/openclaude
-# build context 由 3B 脚本用 rsync 准备(排除 node_modules / .git / dist 等)
-COPY --chown=agent:agent ./personal-version/ /opt/openclaude/
+# entrypoint.sh: 极薄 bash 壳,校验 supervisor 注入 3 个 anthropic env,确保 CLAUDE_CONFIG_DIR
+#                就绪,分流跑 bundle current/entrypoint 或镜像 fallback 的 entrypoint.ts。
+# entrypoint.ts + platformBundle.ts: tsx 跑,scrub provider env、bootstrap 配置、seed 平台内容。
+#                生产走 bundle;这里 /usr/local/lib/openclaude 副本仅 bundle 缺席时兜底(dev
+#                fallback,允许滞后)。两文件必须同目录(entrypoint 相对 import ./platformBundle)。
+COPY --chown=root:root ./runtime/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=root:root ./platform-runtime/entrypoint/entrypoint.ts /usr/local/lib/openclaude/entrypoint.ts
+COPY --chown=root:root ./platform-runtime/entrypoint/platformBundle.ts /usr/local/lib/openclaude/platformBundle.ts
+RUN chmod 0755 /usr/local/bin/entrypoint.sh && \
+    chmod 0644 /usr/local/lib/openclaude/entrypoint.ts /usr/local/lib/openclaude/platformBundle.ts
 
-# install 全部依赖(包括 devDependencies,因为 personal version 用 tsx 跑 .ts 入口)
-# claude-code-best 是 workspace 子模块以外的子目录,需要单独 install
-#
-# 用 `npm install` 而不是 `npm ci`: personal-version 仓库 package-lock.json 经常
-# 和 node_modules 漂移(有些 napi/native 子包按平台条件装),`npm ci` 会以 strict
-# 校验 lock vs 实际安装失败。`npm install` 容忍漂移直接按 package.json 装。
-# trade-off: 比 ci 慢一些,但镜像 build 是周期性动作(每次发版几次),可以接受。
+# platform seed dev fallback(runtime hotcfg §5d):entrypoint 读 seed 次序 = 自身 bundle ../seed →
+# 此处 → 跳过+dev 日志。生产走挂载的 bundle seed/;这里仅 bundle 缺席时兜底(允许滞后)。
+COPY --chown=root:root ./platform-runtime/seed/ /usr/local/share/openclaude-platform/seed/
+
+# ------------------------------------------------------------
+# 源码 embed(条件化 OC_EMBED_SOURCE,多阶段选择实现条件 COPY)
+# ------------------------------------------------------------
+# runtime hotcfg §3.2:v5 生产传 OC_EMBED_SOURCE=0 —— 不 COPY 个人版源码、不 npm install,只留
+# root-owned 空 /opt/openclaude 挂载点(源码走 release ro bind-mount;空 release + 瘦身镜像 →
+# supervisor fail-closed 拒 provision)。镜像 ~3.5GB → ~1GB+。=1(默认;v3 + canary)行为不变。
+# OC_EMBED_SOURCE 是**全局 ARG**(见文件顶部),FROM 行引用,故这里不再声明。
+
+# embed-1:内嵌个人版源码 + 装依赖(root 装完 chown agent)。
+FROM base AS embed-1
+# COPY 整个个人版源码树(含 claude-code-best);build context 由 build-image.sh rsync 准备
+# (--exclude-from runtime-src-excludes.txt)。用 npm install 而非 ci:lock 常按平台条件漂移,
+# ci strict 校验会 fail。trade-off:比 ci 慢,但 build 是周期性动作可接受。
+COPY --chown=agent:agent ./personal-version/ /opt/openclaude/
 WORKDIR /opt/openclaude
 RUN set -eux; \
     npm install --include=dev --no-audit --no-fund; \
-    # claude-code-best 是个人版 spawn 的 ccb 子目录,自己一份 package.json
-    # 即使 v3 容器内不一定 spawn ccb(内部代理走 anthropic SDK),先把依赖装好
-    # 避免某些 chat 模式触发 ccb 时再缺包
     if [ -d /opt/openclaude/claude-code-best ]; then \
-        # --ignore-scripts: 跳过 claude-code-best 的 prepare 钩子(`git config core.hooksPath`),
-        # 镜像里没有 .git 目录,prepare 会 exit 128 把 install 整体 fail
         cd /opt/openclaude/claude-code-best && \
             npm install --include=dev --ignore-scripts --no-audit --no-fund || \
             echo "[build] WARN: claude-code-best npm install failed, ccb spawn 模式可能不可用"; \
     fi; \
-    # 清 npm 缓存
     npm cache clean --force; \
     rm -rf /root/.npm /tmp/* /var/tmp/*
-
-# /opt/openclaude 改 ownership 给 agent(npm ci 期间是 root 跑的)
 RUN chown -R agent:agent /opt/openclaude
 
-# ------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------
-# entrypoint.sh: 极薄 bash 壳,校验 supervisor 注入的 3 个 anthropic env,
-#                确保 CLAUDE_CONFIG_DIR 目录存在,然后 exec 到 entrypoint.ts
-# entrypoint.ts: 用 tsx 跑,import personal-version 的 isProviderManagedEnvVar
-#                helper 遍历 env 把所有 provider 路由变量 unset(留 3 个白名单),
-#                然后 spawn `npm run gateway`,转发 SIGTERM/SIGINT,退出码透传
-COPY --chown=root:root ./runtime/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY --chown=root:root ./runtime/entrypoint.ts /usr/local/lib/openclaude/entrypoint.ts
-RUN chmod 0755 /usr/local/bin/entrypoint.sh && \
-    chmod 0644 /usr/local/lib/openclaude/entrypoint.ts
+# embed-0:瘦身。只留 root-owned 空 /opt/openclaude 挂载点(源码走 release ro bind)。
+FROM base AS embed-0
+RUN mkdir -p /opt/openclaude && chown root:root /opt/openclaude && chmod 0755 /opt/openclaude
 
 # ------------------------------------------------------------
-# 运行时配置
+# 运行时配置(final:按 OC_EMBED_SOURCE 选 embed-0/1)
 # ------------------------------------------------------------
+FROM embed-${OC_EMBED_SOURCE} AS runtime
+ARG OC_EMBED_SOURCE=1
+
 WORKDIR /opt/openclaude
 
 # 强制非 root(双重保险,supervisor 也会设 User=1000:1000)
 USER agent:agent
 
-# 个人版 gateway 内部监听端口(默认 18789,见 personal-version
-# packages/storage/src/config.ts L48)。supervisor 会通过容器 bound_ip:18789
-# 直连,不暴露到宿主公网。
+# 个人版 gateway 内部监听端口(默认 18789)。supervisor 通过容器 bound_ip:18789 直连。
 EXPOSE 18789
 
 # tini 做 PID 1,转发信号给 entrypoint.sh
@@ -560,4 +575,5 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 LABEL org.opencontainers.image.title="openclaude-runtime" \
       org.opencontainers.image.description="Per-user OpenClaude personal-version sandbox (v3 commercial)" \
       org.opencontainers.image.source="https://github.com/anthropics/openclaude" \
-      org.opencontainers.image.licenses="proprietary"
+      org.opencontainers.image.licenses="proprietary" \
+      oc.runtime.embed_source="${OC_EMBED_SOURCE}"

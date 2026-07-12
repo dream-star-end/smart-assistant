@@ -29,6 +29,10 @@ beforeEach(async () => {
 
 describe("upsertMasterClientSession", () => {
   it("inserts a row with all provided fields + origin_channel='wechat'", async () => {
+    // BLOCKER-1:首建 updated_at 取 MAX(lastAt, 服务端 now)。lastAt=1500 远在过去 → updated_at
+    // 应是服务端墙钟(≥ before),不再等于 lastAt(旧语义 updated_at===1500 是 Codex 裁决的
+    // 语义修正:客户端回传值不再无条件信任,防首建版本落后被后续 stale PUT 击穿)。
+    const before = Date.now()
     await upsertMasterClientSession({
       sessionId: "wsess-0123456789abcdef",
       userId: "user-A",
@@ -38,6 +42,7 @@ describe("upsertMasterClientSession", () => {
       createdAt: 1000,
       lastAt: 1500,
     })
+    const after = Date.now()
     const db = await getSessionsDb()
     const row = db
       .prepare(
@@ -52,7 +57,12 @@ describe("upsertMasterClientSession", () => {
     assert.equal(row.title, "微信会话")
     assert.equal(row.created_at, 1000)
     assert.equal(row.last_at, 1500)
-    assert.equal(row.updated_at, 1500, "updated_at defaults to lastAt at insert time")
+    // updated_at = MAX(lastAt=1500, 服务端 now) = 服务端 now(墙钟远大于 1500)。
+    assert.ok(
+      row.updated_at >= before && row.updated_at <= after,
+      `updated_at(${row.updated_at}) 应落在 [${before},${after}](= MAX(lastAt, 服务端 now))`,
+    )
+    assert.ok(row.updated_at >= 1500, "updated_at ≥ lastAt(服务端时钟下限)")
     assert.equal(row.origin_channel, "wechat")
     // 显式省略列由 schema DEFAULT 兜底
     assert.equal(row.pinned, 0)

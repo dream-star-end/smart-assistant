@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
+  codexBindingAffinityKey,
   dockerContainerOwnedByChannel,
   getCodexAccountRuntimeChannel,
   getRuntimeChannel,
@@ -71,6 +72,14 @@ describe("runtimeChannel", () => {
       process.env.OC_RUNTIME_CHANNEL = bad;
       assert.throws(() => getRuntimeChannel(), /非法 OC_RUNTIME_CHANNEL/, `应对 '${bad}' 抛错`);
     }
+  });
+
+  it("Codex provision affinity 只由 canonical channel + uid 决定", () => {
+    assert.equal(codexBindingAffinityKey(42, "v5"), "v5:user:42");
+    assert.equal(codexBindingAffinityKey(42n, "v5"), "v5:user:42");
+    assert.notEqual(codexBindingAffinityKey(42, "v3"), codexBindingAffinityKey(42, "v5"));
+    assert.notEqual(codexBindingAffinityKey(42, "v5"), codexBindingAffinityKey(43, "v5"));
+    assert.throws(() => codexBindingAffinityKey(0, "v5"), /invalid uid/);
   });
 });
 

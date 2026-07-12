@@ -68,6 +68,7 @@ function makeStatus(overrides: Partial<V3ContainerStatus> = {}): V3ContainerStat
     boundIp: '172.30.0.42',
     port: V3_CONTAINER_PORT,
     hostId: 'self',
+    lastWsActivity: null,
     dockerContainerId: '0123456789abcdef',
     ...overrides,
   }

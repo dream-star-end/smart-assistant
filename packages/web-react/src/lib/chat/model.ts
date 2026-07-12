@@ -70,6 +70,9 @@ export type BashTail = { tail: string; totalBytes: number; truncatedHead: boolea
  *  - `aspect` = 目标宽高比：数字比值（编辑/评论用源图 width/height）或比例枚举字符串
  *    （调整大小用 targetAspect，如 "16:9"）；渲染据此定占位框比例。
  *  - `reason` = 失败友好文案（可选，契约外附加项，供 danger 卡展示原因）。
+ *  - `afterUserMsgId` = 触发本占位的乐观 user 行 id（兜底消解锚点：REST 对账发现锚点行被
+ *    server echo 且存在更晚 `_seq` 的 server-authored assistant 行 → 该轮已在服务端收尾,
+ *    live 终帧丢失也能清占位。见 reducer.expireGenPlaceholdersAgainstServerRows）。
  */
 export type GenPlaceholder = {
   jobId: string;
@@ -77,6 +80,7 @@ export type GenPlaceholder = {
   status: "running" | "failed";
   startedAt: number;
   reason?: string;
+  afterUserMsgId?: string;
 };
 
 /**

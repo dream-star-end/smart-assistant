@@ -121,8 +121,19 @@ export interface ContainerSpec {
 /**
  * 容器 inspect 结果。与 node-agent /containers/:id/inspect 的响应结构一致;
  * 本机 backend 会把 dockerode 的结构映射成这个形状。
+ *
+ * v5 runtime tuple 扩展(intersection):加 imageId(immutable image ID)+ labels
+ * (含 4 个 runtime label)供 runtimeStale 用不可变 ID / label 判定。**本机 backend 已回传**;
+ * 远端 node-agent /containers/:id/inspect 契约暂未扩(AgentContainerInspect 在 compute-pool/types.ts,
+ * 需同步加可选字段 + Go 侧返回)→ 远端为 undefined,getV3ContainerStatus 与 runtimeStale
+ * 侧对 undefined 已做保守处理(见其注释)。此处用 intersection 就地扩,不改 types.ts。
  */
-export type ContainerInspect = AgentContainerInspect;
+export type ContainerInspect = AgentContainerInspect & {
+  /** 容器实际跑的 immutable image ID(dockerode inspect 的顶层 `Image`,= 镜像 config digest)。 */
+  imageId?: string;
+  /** 容器 labels(dockerode inspect 的 Config.Labels)。 */
+  labels?: Record<string, string>;
+};
 
 /** 基线挂载源路径(host 上的绝对路径)。 */
 export interface BaselineSourcePaths {
@@ -321,6 +332,14 @@ export class LocalDockerBackend {
         (info.NetworkSettings.Networks as Record<string, { IPAddress?: string }> | undefined)) ||
       undefined;
     const boundIp = endpoints?.[v3NetworkNameForChannel()]?.IPAddress ?? "";
+    // v5 runtime tuple:回传 immutable image ID + labels(runtimeStale 用)。
+    const imageId = typeof (info as { Image?: unknown }).Image === "string"
+      ? (info as { Image: string }).Image
+      : undefined;
+    const rawLabels = (info.Config as { Labels?: unknown } | undefined)?.Labels;
+    const labels = (rawLabels && typeof rawLabels === "object")
+      ? (rawLabels as Record<string, string>)
+      : undefined;
     return {
       id: info.Id ?? cid,
       state: normalized,
@@ -329,6 +348,8 @@ export class LocalDockerBackend {
       exitCode: typeof state.ExitCode === "number" ? state.ExitCode : null,
       oomKilled: Boolean(state.OOMKilled),
       boundIp,
+      ...(imageId ? { imageId } : {}),
+      ...(labels ? { labels } : {}),
     };
   }
 

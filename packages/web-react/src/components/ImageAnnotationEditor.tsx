@@ -15,6 +15,8 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
+import { downloadPercent } from '../lib/chat/download'
+import { getCachedThumbnail } from '../lib/chat/imageBytes'
 import { apiErrorMessage } from '../lib/api'
 import { cn } from '../lib/utils'
 
@@ -205,6 +207,7 @@ export function ImageAnnotationEditor({
   onOpenChange,
   onSubmit,
   resolveSrc,
+  cacheIdentity,
 }: {
   source: ImageAnnotationSource | null
   open: boolean
@@ -216,6 +219,11 @@ export function ImageAnnotationEditor({
    * 编辑)必传;本地 objectURL(composer 附件)无过期概念,省略。
    */
   resolveSrc?: ResolveSignedSrc
+  /**
+   * 字节缓存身份(signPath / `/api/media/<digest>`)。传入即让取原图**零请求复用**查看器/
+   * 气泡已下载的字节(共享 LRU 命中),并用已缓存缩略图做加载期即时底图(禁纯白画布)。
+   */
+  cacheIdentity?: string | null
 }) {
   const visibleRef = useRef<HTMLCanvasElement>(null)
   const maskRef = useRef<HTMLCanvasElement | null>(null)
@@ -239,12 +247,19 @@ export function ImageAnnotationEditor({
   const [tool, setTool] = useState<Tool>('brush')
   const [brushSize, setBrushSize] = useState(48)
   const [prompt, setPrompt] = useState('')
+  // 发送被点但条件不齐时的引导提示(boss 实测:圈完没写描述,按钮灰着但零解释)。
+  const [submitHint, setSubmitHint] = useState<string | null>(null)
   // 「更多工具」下拉:受控开合(需求 §4)——选完工具/点外部/ESC 都要自动收起,原生 <details>
   // 做不到(选后不收、点外部不收),改受控状态。
   const [toolsOpen, setToolsOpen] = useState(false)
   // 误触保护(需求 §5):有未提交笔画/描述时关闭 → 先弹确认层,空白直接退。
   const [confirmClose, setConfirmClose] = useState(false)
   const [loading, setLoading] = useState(false)
+  // 取原图进度百分比(null = 未知/无 Content-Length → 转圈而非数字)。
+  const [loadPercent, setLoadPercent] = useState<number | null>(null)
+  // 加载期即时底图:已缓存缩略图(气泡/查看器已下载)的 objectURL,加载完成前铺在画布上做
+  // 模糊底图(禁纯白闪);未命中缓存 → null(退化为深色底 + 转圈)。
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // 取图失败(过期/网络/容器冷启)专用态:与 submit 失败(error 底部提示)分开 —— loadError
@@ -287,6 +302,7 @@ export function ImageAnnotationEditor({
     if (!open || !source) return
     let cancelled = false
     setLoading(true)
+    setLoadPercent(null)
     setHistoryPending(false)
     setError(null)
     setLoadError(null)
@@ -297,8 +313,14 @@ export function ImageAnnotationEditor({
     historyRef.current = []
     redoRef.current = []
     const generation = ++generationRef.current
-    // 取字节收口到 fetchImageBlobWithResign:403/410 强制重签一次再试(过期 URL 入口自愈)。
-    void fetchImageBlobWithResign(source.url, resolveSrc)
+    // 取字节收口到 fetchImageBlobWithResign:cacheIdentity 命中共享 LRU 即**零请求复用**查看器/
+    // 气泡已下载的原图;miss 走流式 + onProgress 汇报百分比;403/410 强制重签一次再试(过期自愈)。
+    void fetchImageBlobWithResign(source.url, resolveSrc, {
+      cacheIdentity,
+      onProgress: (loaded, total) => {
+        if (!cancelled) setLoadPercent(downloadPercent(loaded, total))
+      },
+    })
       .then(async (blob) => {
         const url = URL.createObjectURL(blob)
         try {
@@ -365,7 +387,24 @@ export function ImageAnnotationEditor({
       imageRef.current = null
       sourceBlobRef.current = null
     }
-  }, [open, source, render, resolveSrc, reloadKey])
+  }, [open, source, render, resolveSrc, reloadKey, cacheIdentity])
+
+  // 加载期即时底图:从共享 LRU 取已缓存缩略图字节(优先高清 1280 → 640)造 objectURL,
+  // 铺在加载遮罩里做模糊底图(零请求、禁纯白闪)。未命中 → null。卸载/换图 revoke 防泄漏。
+  useEffect(() => {
+    if (!open) {
+      setThumbUrl(null)
+      return
+    }
+    const thumb = getCachedThumbnail(cacheIdentity)
+    if (!thumb) {
+      setThumbUrl(null)
+      return
+    }
+    const url = URL.createObjectURL(thumb)
+    setThumbUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [open, cacheIdentity])
 
   const restore = useCallback(
     async (blob: Blob) => {
@@ -742,9 +781,25 @@ export function ImageAnnotationEditor({
             </div>
             <button
               type="button"
-              disabled={!canSubmit}
-              onClick={() => void submit()}
-              className="flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              aria-disabled={!canSubmit}
+              onClick={() => {
+                if (canSubmit) {
+                  void submit()
+                  return
+                }
+                if (submitting || historyPending) return
+                // 缺什么提示什么,并把光标送到缺失处(disabled 会吞点击,故用 aria-disabled+守卫)。
+                if (!selectionPresent) {
+                  setSubmitHint('请先在图片上圈选要修改的区域')
+                } else {
+                  setSubmitHint('请先描述想要的修改')
+                  document.getElementById('image-edit-prompt')?.focus()
+                }
+              }}
+              className={cn(
+                'flex min-h-10 items-center gap-1.5 rounded-full bg-white px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90',
+                !canSubmit && 'cursor-not-allowed opacity-40',
+              )}
             >
               {submitting ? (
                 <>
@@ -760,9 +815,31 @@ export function ImageAnnotationEditor({
           {/* 画布区:左侧竖直笔刷滑杆 + 居中画布 */}
           <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-3 py-2">
             {loading && (
-              <div className="absolute inset-0 z-20 flex items-center justify-center text-white/80">
-                <Loader2 className="animate-spin" />
-                &nbsp;正在打开图片…
+              <div className="absolute inset-0 z-20 overflow-hidden">
+                {/* 已缓存缩略图做模糊底图(零请求、禁纯白闪);未命中缓存则退化为纯深色底。 */}
+                {thumbUrl && (
+                  <img
+                    src={thumbUrl}
+                    alt=""
+                    aria-hidden
+                    className="absolute inset-0 h-full w-full object-contain opacity-30 blur-[1px]"
+                  />
+                )}
+                {/* 顶部细进度条:有百分比时按比例增长(无 Content-Length → 只转圈)。 */}
+                {loadPercent != null && (
+                  <div aria-hidden className="absolute inset-x-0 top-0 h-0.5 bg-white/10">
+                    <div
+                      className="h-full bg-white/80 transition-[width] duration-200"
+                      style={{ width: `${loadPercent}%` }}
+                    />
+                  </div>
+                )}
+                <div className="absolute inset-0 flex items-center justify-center gap-2 text-white/80">
+                  <Loader2 className="animate-spin" />
+                  <span className="text-sm tabular-nums">
+                    {loadPercent != null ? `${loadPercent}%` : '正在打开图片…'}
+                  </span>
+                </div>
               </div>
             )}
             {/* 取图失败 → 满画布错误面板(覆盖白底画布)+ 重试;永不留纯白画布(需求 §1)。 */}
@@ -795,7 +872,7 @@ export function ImageAnnotationEditor({
               onPointerCancel={pointerUp}
               onWheel={wheelZoom}
               aria-busy={historyPending}
-              className="max-h-full max-w-full origin-center rounded-lg bg-white object-contain shadow-float [touch-action:none]"
+              className="max-h-full max-w-full origin-center rounded-lg bg-neutral-900 object-contain shadow-float [touch-action:none]"
               style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
             />
           </div>
@@ -806,12 +883,20 @@ export function ImageAnnotationEditor({
                 {error}
               </p>
             )}
+            {submitHint && (
+              <p role="status" className="mx-auto w-full max-w-2xl text-center text-[13px] text-amber-300">
+                {submitHint}
+              </p>
+            )}
             <div className="mx-auto flex w-full max-w-2xl items-end gap-2 rounded-2xl bg-white/10 px-3 py-2 backdrop-blur">
               <textarea
                 id="image-edit-prompt"
                 aria-label="希望怎样修改"
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => {
+                  setPrompt(e.target.value)
+                  setSubmitHint(null)
+                }}
                 // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {

@@ -17,12 +17,11 @@ provisionV3Container — image label guard (v1.0.84 PR \#4)
 provisionV3Container — per-host bridge gateway env injection
 provisionV3Container — per-host max_containers cap (3I)
 stopAndRemoveV3Container
-userChatBridge — Phase 0.4 ring replay
-userChatBridge — container frame too big
-userChatBridge — happy path
-userChatBridge — model authorization
-userChatBridge — per-user concurrency
-userChatBridge — shutdown
+# 2026-07-11 清债:userChatBridge 全部 6 套件修绿并移出清单——根因三类:①sys.relay_ready
+# 连接性帧插队 vs once 取帧竞态(改 frameCollector+nextBusinessFrame 过滤);②close code
+# 语义演进后断言陈腐(kick=4505/shutdown=4509/模型未授权=4507/容器超大帧=maxPayload→1011);
+# ③ring replay miss 断言锁了 1b488863 已废除的"bridge 越权 resume_failed"旧语义(现契约=
+# miss 静默,裁决在容器)。此后该文件必须保持全绿,新失败=真回归。
 v3 agent_migrations ledger — INV-8 留 placeholder
 v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6)
 v3 reconciler — INV-7 占位(Phase 2.D)

@@ -20,7 +20,9 @@ import {
   applyResumeFailed,
   applyTurnStatus,
   AUTO_CONTINUE_PROMPT,
+  expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
+  resetAgentFrameSeqCursorsForSession,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -1116,8 +1118,19 @@ export class ChatSocket {
         return;
       }
       case "sys.cold_start": {
-        const sess = this.firstSession();
-        if (sess) sess._isFirstTurnAfterReady = true;
+        // 冷启帧带 peer 时按 peer 精确路由(provision 由该会话的 inbound 触发);
+        // 缺省回退 firstSession(既有 v3 单会话语义,typing 文案不回退)。
+        const cold = f as ColdStartWire;
+        const sess = (cold.peer?.id ? this.sessions.get(cold.peer.id) : undefined) ?? this.firstSession();
+        if (sess) {
+          sess._isFirstTurnAfterReady = true;
+          // provision 分支 = 全新容器 = outboundRing 从零计数:该会话全部 agent-scoped
+          // frameSeq 游标立即归零,否则新生代帧 seq=1..旧游标 被 acceptFrameSeq 当重复帧
+          // 黑洞(与 resume_failed no_buffer 同根因;此处覆盖「连接不断、容器中途回收」
+          // 没有 hello 仲裁的场景,生产实证见 reducer.resetFrameSeqCursor 注释)。
+          resetAgentFrameSeqCursorsForSession(sess);
+          this.deps.persistSession?.(sess.id); // 游标变更立即落地(断点续传语义)
+        }
         return;
       }
       case "sys.frontend_build": {
@@ -1571,6 +1584,10 @@ export class ChatSocket {
     s._agentGroups = new Map();
     rebuildIndexes(s);
     normalizeDelegateCards(s);
+    // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
+    // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
+    // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
+    expireGenPlaceholdersAgainstServerRows(s);
     this.scheduleNotify();
   }
 
@@ -1748,7 +1765,7 @@ export class ChatSocket {
     // 渲染 GeneratingPlaceholderCard；本会话 turn final 由 reducer 按 jobId 消解（结果图作为
     // assistant 消息原位渲染），turn error 转 failed。**不持久化**（toStored 显式剥离）、不进
     // server 历史 → 重开会话不留孤儿卡（reducer 回放路径无此行）。
-    this.ensureGenPlaceholder(sess, p.imageEdit, false);
+    this.ensureGenPlaceholder(sess, p.imageEdit, false, userMsg.id);
     // 跨设备持久化用户消息:行确保存在后,带本地 client id POST 给 master(getSession 回带同
     // id → 合并天然去重,不与本地乐观 user 重复)。best-effort:失败不影响发送(本地 + IndexedDB
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
@@ -1831,13 +1848,21 @@ export class ChatSocket {
     sess: ChatSession,
     imageEdit: NonNullable<InboundMessage["content"]>["imageEdit"] | undefined,
     reuse: boolean,
+    anchorUserMsgId?: string,
   ): void {
     if (!imageEdit) return;
     // aspect 优先 targetAspect（outpaint 五枚举）,否则源图 width/height 比值（annotated）。
     const aspect: number | string =
       imageEdit.targetAspect ??
       (imageEdit.width > 0 && imageEdit.height > 0 ? imageEdit.width / imageEdit.height : 1);
-    const gp = { jobId: imageEdit.clientJobId, aspect, status: "running" as const, startedAt: Date.now() };
+    const gp = {
+      jobId: imageEdit.clientJobId,
+      aspect,
+      status: "running" as const,
+      startedAt: Date.now(),
+      // 兜底消解锚点(REST 对账按 server _seq 判轮已收尾,见 expireGenPlaceholdersAgainstServerRows)。
+      ...(anchorUserMsgId ? { afterUserMsgId: anchorUserMsgId } : {}),
+    };
     if (reuse) {
       const existing = sess.messages.find((m) => m._genPlaceholder?.jobId === imageEdit.clientJobId);
       if (existing) {
@@ -1937,7 +1962,7 @@ export class ChatSocket {
     };
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
     // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
-    this.ensureGenPlaceholder(sess, userMsg._imageEdit, true);
+    this.ensureGenPlaceholder(sess, userMsg._imageEdit, true, userMsg.id);
     this.dispatchPayload(sess, userMsg, payload);
   }
 
