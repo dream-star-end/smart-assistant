@@ -189,4 +189,50 @@ describe('默认连接器 seed', () => {
       await server.close()
     }
   })
+
+  test('飞书(token-exchange)默认:seed → bind(换 tenant token + bot 探针)', async (t) => {
+    if (skip(t)) return
+    const server = await startServer()
+    try {
+      await seedDefaultConnectors(getPool()) // 幂等
+      const v = await query<{ id: string }>(
+        `SELECT id::text AS id FROM marketplace_skill_versions
+          WHERE slug='feishu' AND security_review_state='security_approved'`,
+      )
+      const versionId = Number(v.rows[0]!.id)
+      const meta = await loadVerifiedContractWithMeta(versionId, getPool())
+      assert.equal(meta.contract.authMode, 'token-exchange')
+
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const SECRET = 'FEISHU-APP-SECRET-CANARY'
+      server.setHandler((p) => {
+        if (p === '/open-apis/auth/v3/tenant_access_token/internal')
+          return { status: 200, body: JSON.stringify({ code: 0, tenant_access_token: 't-abc', expire: 7200 }) }
+        if (p === '/open-apis/bot/v3/info')
+          return { status: 200, body: JSON.stringify({ code: 0, bot: { open_id: 'ou_1', app_name: 'MyBot' } }) }
+        return { status: 404, body: '{}' }
+      })
+      const user = await mkUser()
+      const bind = await bindDeclarativeConnector(
+        {
+          userId: user,
+          connectorVersionId: versionId,
+          secrets: { client_id: 'app-1', client_secret: SECRET },
+          deps,
+        },
+        getPool(),
+      )
+      assert.equal(bind.accountHint, 'MyBot') // 从 /bot/app_name 派生
+
+      // 连接密文里绝无 app_secret 明文。
+      const row = await query<{ has: boolean; enc: Buffer }>(
+        `SELECT (secret_enc IS NOT NULL) AS has, secret_enc AS enc FROM connections WHERE id=$1::bigint`,
+        [bind.connectionId],
+      )
+      assert.equal(row.rows[0]!.has, true)
+      assert.ok(!row.rows[0]!.enc.toString('latin1').includes(SECRET))
+    } finally {
+      await server.close()
+    }
+  })
 })
