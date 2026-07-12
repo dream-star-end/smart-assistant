@@ -90,6 +90,9 @@ export const EVENTS = {
   // ── 运维(v5 自愈体系 incident 生命周期通报;reconciler open/resolve 时 safeEnqueueAlert)──
   OPS_INCIDENT_OPENED: "ops.incident_opened",
   OPS_INCIDENT_RESOLVED: "ops.incident_resolved",
+  // ── 运维(v5 自愈体系 codex 修复升级;修复终态失败/超时时 safeEnqueueAlert,需人工介入)──
+  OPS_REPAIR_FAILED: "ops.repair_failed",
+  OPS_REPAIR_TIMEOUT: "ops.repair_timeout",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -175,6 +178,11 @@ export const EVENT_META: EventMeta[] = [
     description: "v5 自愈事故打开(condition firing 命中 incident_policies → 派生 incident);severity 随 incident 实际等级", trigger: "passive" },
   { event_type: EVENTS.OPS_INCIDENT_RESOLVED, severity: "info", group: "ops",
     description: "v5 自愈事故恢复(condition 当前值 firing=false → reconciler resolve incident)", trigger: "passive" },
+  // v5 自愈体系:codex 自动修复升级 —— 修复终态失败或超时,自愈已尽力,需人工介入。
+  { event_type: EVENTS.OPS_REPAIR_FAILED, severity: "critical", group: "ops",
+    description: "v5 自愈 codex 修复达到失败保险丝阈值(连续失败终态),已停止自动重试,需人工介入", trigger: "passive" },
+  { event_type: EVENTS.OPS_REPAIR_TIMEOUT, severity: "critical", group: "ops",
+    description: "v5 自愈 codex 修复超时未收敛(verify_failed / 超过修复时限),已升级,需人工介入", trigger: "passive" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);

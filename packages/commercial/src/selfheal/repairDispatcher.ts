@@ -26,14 +26,15 @@ import type { PoolClient } from "pg";
 import { query as _query, tx as _tx } from "../db/queries.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { safeEnqueueAlert as _safeEnqueueAlert, type AlertEventInput } from "../admin/alertOutbox.js";
+import { EVENTS } from "../admin/alertEvents.js";
 
 /**
- * ops 升级告警 event_type。**债**:这两个键尚未登记 alertEvents.ts EVENT_META(块A 文件所有权
- * 不含该文件);集成者应登记到 'ops' 组以进事件目录/静默 UI。当前即便未登记也能送达:
- * 空过滤通道订阅全部事件 + enqueueAlert 零订阅时 inbox 兜底,boss 必有落点(见 alertOutbox)。
+ * ops 升级告警 event_type —— 单一真理源在 alertEvents.ts EVENTS(已登记 EVENT_META 'ops' 组,
+ * 进事件目录/通道订阅/静默 UI)。此处仅按既有 import 站点(sweeper 等)习惯做同名 re-export,
+ * 是引用别名而非第二份字面量。
  */
-export const OPS_REPAIR_FAILED = "ops.repair_failed";
-export const OPS_REPAIR_TIMEOUT = "ops.repair_timeout";
+export const OPS_REPAIR_FAILED = EVENTS.OPS_REPAIR_FAILED;
+export const OPS_REPAIR_TIMEOUT = EVENTS.OPS_REPAIR_TIMEOUT;
 
 /** 保险丝阈值。 */
 const FAILED_ATTEMPT_FUSE = 2;
