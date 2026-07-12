@@ -85,6 +85,37 @@ export interface IncidentDetailResp {
   events: RepairEventRow[];
 }
 
+/**
+ * POST …/incidents/:id/resolve 的 mode-aware 判定结果(设计 H1b):
+ *  - suppressed_until_clear:probe 类 condition 仍 firing → 压制投影直至真实恢复;
+ *  - condition_closed:latched/spike 类 → 直接关 condition;
+ *  - condition_already_clear:condition 不存在或已 !firing,仅 resolve incident。
+ * 字符串联合 + 未知回落,兼容后端扩态。
+ */
+export type ResolveResolution =
+  | "suppressed_until_clear"
+  | "condition_closed"
+  | "condition_already_clear"
+  | (string & {});
+
+export interface ResolveResp {
+  resolved?: boolean;
+  resolution?: ResolveResolution;
+  rev?: number;
+}
+
+/** GET /selfheal/conditions?suppressed=1 行(camelCase,对齐后端 serializer 契约)。 */
+export interface SuppressedConditionRow {
+  conditionKey: string;
+  suppressedAt: string | null;
+  suppressedBy: string | null;
+  level: Severity | null;
+}
+
+export interface SuppressedConditionsResp {
+  items: SuppressedConditionRow[];
+}
+
 /** repair 是否处于活跃（进行中）态——用于「正在修复」卡与 resolve 禁用判断。 */
 export const ACTIVE_REPAIR_STATUSES: ReadonlySet<RepairStatus> = new Set<RepairStatus>([
   "pending",

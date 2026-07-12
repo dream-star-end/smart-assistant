@@ -1,4 +1,4 @@
-import { AlertTriangle, RefreshCw } from "lucide-react";
+import { AlertTriangle, RefreshCw, Rocket } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Modal, useConfirm, useToast } from "../../../components/ui";
 import {
@@ -25,6 +25,9 @@ import {
   type RepairEventRow,
   type RepairRow,
   type RepairStatus,
+  type ResolveResp,
+  type SuppressedConditionRow,
+  type SuppressedConditionsResp,
 } from "./types";
 
 type BadgeTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info";
@@ -46,6 +49,17 @@ const STATUS_OPTS: { label: string; value: "" | IncidentStatus }[] = [
   { label: "修复中", value: "repairing" },
   { label: "已恢复", value: "resolved" },
 ];
+
+/**
+ * resolve 的 mode-aware 结果 → toast 文案(H1b 判定表,三种 resolution 区分展示;
+ * 未知/缺失回落通用文案,兼容后端扩态)。
+ */
+const RESOLVE_TOAST: Record<string, string> = {
+  suppressed_until_clear: "已压制该检测项并标记恢复；检测真实恢复后压制自动解除",
+  condition_closed: "已关闭检测项并标记恢复，恢复通知将下发",
+  condition_already_clear: "检测项已恢复，事故已标记恢复",
+};
+const RESOLVE_TOAST_FALLBACK = "已标记为已恢复，恢复通知将下发";
 
 /** repair 状态 → 徽标色（未知回落 neutral）。 */
 const REPAIR_STATUS_TONE: Record<string, BadgeTone> = {
@@ -86,6 +100,10 @@ function latestEventFor(repairId: string, events: RepairEventRow[]): RepairEvent
  * retry/cancel 属切片②，置灰留 TODO。
  */
 function IncidentDetailBody({ id }: { id: string }) {
+  const toast = useToast();
+  const [confirm, confirmEl] = useConfirm();
+  const [releasing, setReleasing] = useState(false);
+
   const { data, error, loading, refresh } = useAdminPoll<IncidentDetailResp>(
     () => adminGet(`/selfheal/incidents/${encodeURIComponent(id)}`),
     { intervalMs: POLL_MS, deps: [id] },
@@ -99,6 +117,47 @@ function IncidentDetailBody({ id }: { id: string }) {
     () => (data?.repairs ?? []).find((r) => ACTIVE_REPAIR_STATUSES.has(r.status)) ?? null,
     [data],
   );
+  // 待放行 repair(设计 §B):status='running' 且时间线里有 message 含 'pending_release'
+  // 的 progress 事件 = 修复已过验证、部署停待 boss 放行(Tier2 部署门)。
+  const pendingReleaseRepair = useMemo(
+    () =>
+      (data?.repairs ?? []).find(
+        (r) =>
+          r.status === "running" &&
+          sortedEvents.some(
+            (e) =>
+              e.repair_id === r.id &&
+              e.kind === "progress" &&
+              (e.message ?? "").includes("pending_release"),
+          ),
+      ) ?? null,
+    [data, sortedEvents],
+  );
+
+  const onRelease = async (repairId: string) => {
+    const ok = await confirm({
+      title: "放行部署？",
+      body: (
+        <span className="text-[13px] text-muted">
+          codex 修复已通过验证，部署正等待人工放行。确认后将通知执行侧合并并部署该修复
+          （全链审计留痕）。仅在核对过修复内容后操作。
+        </span>
+      ),
+      confirmText: "确认放行",
+      danger: true,
+    });
+    if (!ok) return;
+    setReleasing(true);
+    try {
+      await adminSend("POST", `/selfheal/repairs/${encodeURIComponent(repairId)}/release`);
+      toast("已放行，部署将由执行侧继续完成", "success");
+      refresh();
+    } catch (e) {
+      toast(apiErrorMessage(e, "放行失败"), "error");
+    } finally {
+      setReleasing(false);
+    }
+  };
 
   if (loading && !data) {
     return <p className="py-6 text-center text-[13px] text-muted">加载详情…</p>;
@@ -117,8 +176,34 @@ function IncidentDetailBody({ id }: { id: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* 正在修复卡（活跃 repair 的最新进度）。 */}
-      {activeRepair && (
+      {/* 待放行卡（修复已过验证，部署停待人工放行 —— 一键放行经 useConfirm 二次确认）。 */}
+      {pendingReleaseRepair && (
+        <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-[13px] font-semibold text-warning">
+                <Rocket size={14} />
+                修复已就绪，待放行部署
+              </div>
+              <div className="mt-1.5 text-[13px] text-fg">
+                codex 修复已通过验证（第 {pendingReleaseRepair.attempt} 次尝试），部署等待人工放行。
+              </div>
+            </div>
+            <Button
+              variant="primary"
+              size="sm"
+              className="shrink-0"
+              onClick={() => void onRelease(pendingReleaseRepair.id)}
+              disabled={releasing}
+            >
+              {releasing ? "放行中…" : "一键放行"}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 正在修复卡（活跃 repair 的最新进度；待放行时上卡已覆盖，不重复）。 */}
+      {activeRepair && activeRepair.id !== pendingReleaseRepair?.id && (
         <div className="rounded-lg border border-info/40 bg-info-soft px-4 py-3">
           <div className="flex items-center gap-2 text-[13px] font-semibold text-info">
             <RefreshCw size={14} className="animate-spin" />
@@ -252,6 +337,8 @@ function IncidentDetailBody({ id }: { id: string }) {
           </ol>
         )}
       </SectionCard>
+
+      {confirmEl}
     </div>
   );
 }
@@ -270,14 +357,28 @@ export default function SelfhealPage() {
   const [limit, setLimit] = useState(PAGE);
   const [selected, setSelected] = useState<IncidentRow | null>(null);
   const [resolving, setResolving] = useState(false);
+  const [unsuppressing, setUnsuppressing] = useState<string | null>(null);
 
   const { data, error, loading, refresh } = useAdminPoll<IncidentListResp>(
     () => adminGet("/selfheal/incidents", { status, limit }),
     { intervalMs: POLL_MS, deps: [status, limit] },
   );
 
+  // 已压制的 conditions(H1b suppression:resolve 仍 firing 的 probe 类 → 压制投影
+  // 直至真实恢复)。与 incidents 同节奏轮询,便于 resolve → 压制行即时出现。
+  const {
+    data: suppressedData,
+    error: suppressedError,
+    loading: suppressedLoading,
+    refresh: refreshSuppressed,
+  } = useAdminPoll<SuppressedConditionsResp>(
+    () => adminGet("/selfheal/conditions", { suppressed: 1 }),
+    { intervalMs: POLL_MS },
+  );
+
   const incidents = data?.incidents ?? [];
   const canLoadMore = !!data?.nextBeforeId && limit < MAX_LIMIT;
+  const suppressedRows = suppressedData?.items ?? [];
 
   // 列表刷新后同步弹窗选中行的状态（如已被后台标记 resolved，footer 的 resolve 钮随之禁用）。
   useEffect(() => {
@@ -300,16 +401,92 @@ export default function SelfhealPage() {
     if (!ok) return;
     setResolving(true);
     try {
-      await adminSend("POST", `/selfheal/incidents/${encodeURIComponent(row.id)}/resolve`);
-      toast("已标记为已恢复，恢复通知将下发", "success");
+      const r = await adminSend<ResolveResp | undefined>(
+        "POST",
+        `/selfheal/incidents/${encodeURIComponent(row.id)}/resolve`,
+      );
+      // mode-aware 结果分文案(H1b):压制至恢复 / 已关闭检测项 / 检测项已恢复。
+      toast(RESOLVE_TOAST[r?.resolution ?? ""] ?? RESOLVE_TOAST_FALLBACK, "success");
       setSelected(null);
       refresh();
+      refreshSuppressed(); // suppressed_until_clear 会新增压制行,立即反映
     } catch (e) {
       toast(apiErrorMessage(e, "操作失败"), "error");
     } finally {
       setResolving(false);
     }
   };
+
+  const onUnsuppress = async (row: SuppressedConditionRow) => {
+    const ok = await confirm({
+      title: "解除压制？",
+      body: (
+        <span className="text-[13px] text-muted">
+          解除后该检测项恢复正常投影：若仍在异常，下一轮探测（约 2 分钟内）会重新开启事故并推送告警。
+        </span>
+      ),
+      confirmText: "解除压制",
+    });
+    if (!ok) return;
+    setUnsuppressing(row.conditionKey);
+    try {
+      await adminSend("POST", "/selfheal/conditions/unsuppress", {
+        conditionKey: row.conditionKey,
+      });
+      toast("已解除压制，该检测项恢复正常投影", "success");
+      refreshSuppressed();
+      refresh();
+    } catch (e) {
+      toast(apiErrorMessage(e, "操作失败"), "error");
+    } finally {
+      setUnsuppressing(null);
+    }
+  };
+
+  const suppressedColumns: Column<SuppressedConditionRow>[] = [
+    {
+      key: "conditionKey",
+      title: "检测项",
+      render: (r) => <span className="font-mono text-[12px] break-all">{r.conditionKey}</span>,
+    },
+    {
+      key: "level",
+      title: "级别",
+      width: 88,
+      render: (r) => (r.level ? <LevelBadge level={r.level} /> : <span className="text-faint">—</span>),
+    },
+    {
+      key: "suppressedAt",
+      title: "压制时间",
+      width: 96,
+      render: (r) =>
+        r.suppressedAt ? <TimeAgo value={r.suppressedAt} /> : <span className="text-faint">—</span>,
+    },
+    {
+      key: "suppressedBy",
+      title: "操作人",
+      width: 120,
+      render: (r) => (
+        <span className="text-[12px] text-muted">{r.suppressedBy ?? "—"}</span>
+      ),
+    },
+    {
+      key: "actions",
+      title: "",
+      align: "right",
+      width: 96,
+      render: (r) => (
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => void onUnsuppress(r)}
+          disabled={unsuppressing !== null}
+        >
+          {unsuppressing === r.conditionKey ? "处理中…" : "解除压制"}
+        </Button>
+      ),
+    },
+  ];
 
   const columns: Column<IncidentRow>[] = [
     {
@@ -419,6 +596,31 @@ export default function SelfhealPage() {
           </div>
         )}
       </div>
+
+      {/* 已压制的 conditions(H1b suppression 审计面:压制中 = 不投影/不派修,
+          真实恢复自动解除;误压可在此手动解除)。 */}
+      <SectionCard
+        title="已压制的检测项"
+        hint="resolve 仍异常的探测类事故后进入压制；检测真实恢复自动解除，误压可手动解除"
+        bodyClassName="p-0"
+      >
+        {suppressedError ? (
+          <div className="flex items-center gap-2 px-4 py-3 text-[13px] text-danger">
+            <AlertTriangle size={15} className="shrink-0" />
+            加载已压制检测项失败：{apiErrorMessage(suppressedError, "请求失败")}
+          </div>
+        ) : (
+          <DataTable
+            columns={suppressedColumns}
+            rows={suppressedRows}
+            rowKey={(r) => r.conditionKey}
+            loading={suppressedLoading && suppressedRows.length === 0}
+            emptyTitle="当前没有被压制的检测项"
+            emptyHint="手动 resolve 仍在异常的探测类事故后，压制记录会出现在这里。"
+            className="rounded-none border-0"
+          />
+        )}
+      </SectionCard>
 
       <Modal
         open={selected !== null}
