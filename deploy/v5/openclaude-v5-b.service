@@ -1,0 +1,45 @@
+[Unit]
+# v5 Aurora —— B slot(双 master 蓝绿交接的第二实例;RFC-v5-dual-master-cohort §3/D2/D3)。
+# 与 A slot(openclaude-v5.service)同机、共享 PG/Redis/egress/env 文件,但:
+#   - 独立端口 18795(由 $OPENCLAUDE_HOME/openclaude.json gateway.port 决定,--canary 时生成)
+#   - 独立 HOME /root/.openclaude-v5-b(uploads/诊断/副产物隔离;会话正文权威在 PG,不在 HOME)
+#   - 独立源码 symlink /opt/openclaude/openclaude-v5-b → RELEASES_ROOT/rel-*(candidate release)
+#   - 独立私有诊断控制口 18897(A=18896;healthz/smoke/运维直达本 slot,与流量/VIP 正交,RFC D3)
+#   - 共享 A 的会话权威 manifest(OC_SESSIONS_MANIFEST_PATH;写方唯一=割接工具,双进程只读安全,D2)
+# leader / VIP(18894)归属**不由本 unit 决定**:运行时 lease controller 读 deploy_state.desired_*
+# 才决定竞锁 / bind(RFC D4/D3)。env 里 OC_CONTROL_PLANE_LEADER=1 只表示"有资格",candidate
+# 起手 desired_* 仍指向 A → 本实例恒 standby、不抢 leader、不 bind VIP,直到 finalize 翻转 desired。
+Description=OpenClaude Gateway (v5 Aurora slot B)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+# 独立源码树 symlink(由 scripts/deploy-v5.sh --canary 建/翻转;与 A 的 /opt/openclaude/openclaude-v5 并列)
+WorkingDirectory=/opt/openclaude/openclaude-v5-b
+# 共享 env 文件(与 A 同一份 commercial-v5.env:身份/计费/账号池/egress secret 全一致)
+EnvironmentFile=/etc/openclaude/commercial-v5.env
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-b"
+Environment="NODE_ENV=production"
+# slot 身份 + 私有控制口(RFC D3):master 据此决定本 slot 私有 dispatcher 端口 / healthz slot 标识。
+Environment="OC_SLOT=B"
+Environment="OC_PRIVATE_CONTROL_PORT=18897"
+# 会话权威 manifest 共享读(RFC D2):两 slot 指同一份 A 的权威文件,写方唯一=割接工具。
+Environment="OC_SESSIONS_MANIFEST_PATH=/root/.openclaude-v5/sessions-store-authority.json"
+ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+SendSIGKILL=yes
+# 独立日志,按 slot 检索;绝不写 A 的 /var/log/openclaude-v5.log
+StandardOutput=append:/var/log/openclaude-v5-b.log
+StandardError=append:/var/log/openclaude-v5-b.log
+LimitNOFILE=65536
+StateDirectory=openclaude-v5-b
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

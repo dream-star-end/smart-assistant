@@ -6,6 +6,7 @@
     "0134_sessions_master_pg"
   ],
   "capabilities": [
-    "sessions-store-pg-v1"
+    "sessions-store-pg-v1",
+    "dual-master-v1"
   ]
 }
