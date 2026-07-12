@@ -794,10 +794,24 @@ export async function refreshEgressNodes(
   opts: EgressOptions = {},
 ): Promise<{ nodes: EgressNodePublic[]; status: EgressStatus }> {
   const settings = resolveEgressSettings(opts)
-  const [lines, meta] = await Promise.all([fetchSubscription(settings), readMeta(settings)])
+  const [lines, meta, status] = await Promise.all([
+    fetchSubscription(settings),
+    readMeta(settings),
+    getEgressProxyStatus(opts),
+  ])
+  // Mark the ACTUAL active node — status.active is resolved from the clash
+  // selector (selector.now), so after a watchdog failover it points at the
+  // backup, not the meta primary idx (Codex MED #17). Fall back to meta.idx only
+  // when the selector state is unavailable.
+  const activeIdx =
+    typeof status.active?.idx === 'number'
+      ? status.active.idx
+      : typeof meta.idx === 'number'
+        ? meta.idx
+        : undefined
   return {
-    nodes: parseSubscriptionNodes(lines, typeof meta.idx === 'number' ? meta.idx : undefined),
-    status: await getEgressProxyStatus(opts),
+    nodes: parseSubscriptionNodes(lines, activeIdx),
+    status,
   }
 }
 
@@ -1256,6 +1270,15 @@ async function installSelectorConfig(
   })
   const json = `${JSON.stringify(config, null, 2)}\n`
   await mkdir(dirname(settings.configPath), { recursive: true })
+  // Snapshot the current known-good config so a failed restart can roll back
+  // rather than leaving sing-box running a config it can't start = all egress
+  // down (Codex MED #18). Undefined on the first install (nothing to restore).
+  let prevConfig: string | undefined
+  try {
+    prevConfig = await readFile(settings.configPath, 'utf-8')
+  } catch {
+    prevConfig = undefined
+  }
   const tmpConfigPath = join(
     dirname(settings.configPath),
     `${basename(settings.configPath)}.${process.pid}.${Date.now()}.check.tmp`,
@@ -1270,8 +1293,22 @@ async function installSelectorConfig(
     throw err
   }
   await atomicWrite(settings.metaPath, metaText(meta, primaryHealth))
-  await execLimited('systemctl', ['restart', settings.service], 25_000)
-  await execLimited('systemctl', ['is-active', '--quiet', settings.service], 10_000)
+  try {
+    await execLimited('systemctl', ['restart', settings.service], 25_000)
+    await execLimited('systemctl', ['is-active', '--quiet', settings.service], 10_000)
+  } catch (err) {
+    // Roll back to the previous known-good config and restart with it, so a bad
+    // switch never leaves the box with all egress down (Codex MED #18).
+    if (prevConfig !== undefined) {
+      try {
+        await atomicWrite(settings.configPath, prevConfig)
+        await execLimited('systemctl', ['restart', settings.service], 25_000)
+      } catch {
+        /* best effort — surface the original failure regardless */
+      }
+    }
+    throw err
+  }
 }
 
 export async function selectEgressNode(

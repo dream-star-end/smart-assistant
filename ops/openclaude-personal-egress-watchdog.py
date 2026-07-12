@@ -318,7 +318,7 @@ def tick(state: dict, pool: ThreadPoolExecutor) -> None:
             api["last_alert"] = now
             alert("ops.egress_singbox_unreachable", "critical",
                   "[个人版 egress] sing-box 代理失联,出海可能全断",
-                  f"🚨 watchdog 连续 {api['fails']} 次连不上 sing-box clash_api({CLASH_BASE})。\n"
+                  f"🚨 watchdog 连续 {api['fails']} 次连不上 sing-box clash_api({base})。\n"
                   f"`systemctl is-active {SERVICE}` = **{systemctl_status()}**\n"
                   "本机全部出海经此代理,请立即处理:\n"
                   f"```\njournalctl -u {SERVICE} -n 50 --no-pager\n```")
