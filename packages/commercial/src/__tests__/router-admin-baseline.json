@@ -158,6 +158,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps",
+    "handler": "handleAdminListPlatformOauthApps"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps/",
+    "handler": "handleAdminPutPlatformOauthApp"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps/",
+    "handler": "handleAdminDeletePlatformOauthApp"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/literature",
     "handler": "handleAdminGetLiterature"
   },

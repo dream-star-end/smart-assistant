@@ -282,6 +282,8 @@ function oauth2Spec(slug: string): Record<string, unknown> {
     auth: {
       authorizeEndpoint: AUTHORIZE_ENDPOINT,
       tokenEndpoint: TOKEN_ENDPOINT,
+      // BYOA(用户自带 App):本文件全部用例的原语义。platform 模式见 connectorsPlatformOauth.integ。
+      clientProvisioning: 'byoa',
       clientAuth: 'form',
       scopeSeparator: ' ',
       scopes: ['read:user'],

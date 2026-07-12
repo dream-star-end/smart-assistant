@@ -286,11 +286,34 @@ export const TokenResponseSpec = Type.Object(
  * tokenOutputs=ExecContract.tokenOutputs;placements 经 extractPlacements 进 action)。两处共用这份
  * props 消除漂移。
  */
+/**
+ * OAuth client 凭据的**供给模式**(作者声明,签进契约 —— 运行期不可配、不可被请求覆盖)。
+ *
+ *   'byoa'     用户自带 OAuth App:用户去 provider 后台注册应用,把 client_id/client_secret
+ *              填进授权表单 → 进加密 pending draft → 回调用它换 token。
+ *   'platform' 平台注册 OAuth App:凭据存平台表(connector_platform_oauth_apps,0136),
+ *              用户点一下就授权,什么都不填。
+ *
+ * **为什么 'platform' 不构成提权**(安全推理,必须理解后再改):
+ *   作者(可能是任意市场发布者)在自己的 spec 里写 'platform',**并不能凭空获得任何平台凭据** ——
+ *   platform 模式下的 client 凭据**只有 admin 显式 provision(admin API 往 0136 表写一行)才存在**。
+ *   没 provision 的 slug 走 platform 分支一律 fail-closed:oauth/start 返 503 OAUTH_NOT_CONFIGURED,
+ *   catalog 甚至不展示该连接器。也就是说:**admin provisioning 本身就是那道信任闸**,
+ *   声明 'platform' 至多是"向 admin 表达一个诉求",授权与否 100% 由 admin 决定。
+ *   另一侧的对称保证:platform 模式的 client_secret **绝不复制进用户连接袋**
+ *   (storedBagSources 只留 access_token/refresh_token),secret 只活在平台表 + 发往 token origin
+ *   的那一次交换请求里。
+ */
+const ClientProvisioning = Type.Union([Type.Literal('byoa'), Type.Literal('platform')])
+export type ClientProvisioningT = Static<typeof ClientProvisioning>
+
 const Oauth2ConfigProps = {
   authorizeEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
   tokenEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
   refreshEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
   revokeEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
+  /** client 凭据供给模式(**必填**,strict:作者必须显式表态,不给隐式默认值)。 */
+  clientProvisioning: ClientProvisioning,
   clientAuth: ClientAuth,
   scopeSeparator: Type.String({ minLength: 1, maxLength: 4 }),
   scopes: Type.Optional(Type.Array(Type.String({ maxLength: 128 }), { maxItems: 64 })),

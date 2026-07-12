@@ -18,7 +18,7 @@
  */
 
 import { ConnectorError } from '../errors.js'
-import type { AuthModeValue, ExecContractT } from '../spec/types.js'
+import type { AuthModeValue, ClientProvisioningT, ExecContractT } from '../spec/types.js'
 import type { ResolvedCredentials } from './placement.js'
 
 /** 用户 bind 时直填 / 落库的凭据袋(明文,仅在 master 内存活;落库前 AEAD 加密)。 */
@@ -27,6 +27,22 @@ export type DeclarativeSecretBag = Record<string, string>
 const MAX_SECRET_LEN = 4096
 // biome-ignore lint/suspicious/noControlCharactersInRegex: 凭据值会进 header,禁 CR/LF/控制符
 const HAS_CONTROL = /[\x00-\x1f\x7f]/
+
+/**
+ * oauth2 契约的 client 供给模式 —— **单一读取口**(禁止各处散写
+ * `contract.oauth2?.clientProvisioning ?? 'byoa'`:那种隐式默认值一旦漂移就是"platform 连接器
+ * 被当成 byoa 处理"的安全事故)。契约缺 oauth2 块 = 编译器不变量被破坏 → INTERNAL fail-closed。
+ *
+ * 非 oauth2 契约调用本函数 = 编程错误(它们没有 client 概念)。
+ */
+export function oauth2ClientProvisioning(contract: ExecContractT): ClientProvisioningT {
+  if (contract.authMode !== 'oauth2-auth-code')
+    throw new ConnectorError('INTERNAL', 'clientProvisioning queried on non-oauth2 contract')
+  const cfg = contract.oauth2
+  if (cfg === undefined)
+    throw new ConnectorError('INTERNAL', 'oauth2 contract has no oauth2 config')
+  return cfg.clientProvisioning
+}
 
 /** token-exchange:交换请求引用的规范 source 去重(client_id/client_secret/refresh_token 等)。 */
 function exchangeSources(contract: ExecContractT): string[] {
@@ -42,8 +58,10 @@ function exchangeSources(contract: ExecContractT): string[] {
 /**
  * 某 contract 下**用户 bind 时必须直填**的 credential source 名集合(前端表单 / catalog 投影)。
  *   static-token → ['access_token'](单一长期 token,直接作 API 凭据)。
- *   oauth2-auth-code → ['client_id','client_secret'](BYOA:用户自建应用的 client 凭据;
- *     access/refresh token 由授权码流程获得 —— 用户填的 ≠ 落库的,见 storedBagSources)。
+ *   oauth2-auth-code → **按 clientProvisioning 分叉**:
+ *     - byoa     → ['client_id','client_secret'](用户自建应用的 client 凭据;access/refresh token
+ *                  由授权码流程获得 —— 用户填的 ≠ 落库的,见 storedBagSources);
+ *     - platform → **[]**(平台已注册 App,用户一键授权、什么都不填)。
  *   token-exchange → 交换请求引用的规范 source 去重;引擎据此换 access_token,用户不直填 token。
  *   其它 authMode:后续切片按各自 bind 流程接。
  */
@@ -52,7 +70,7 @@ export function requiredBindSources(contract: ExecContractT): string[] {
     case 'static-token':
       return ['access_token']
     case 'oauth2-auth-code':
-      return ['client_id', 'client_secret']
+      return oauth2ClientProvisioning(contract) === 'platform' ? [] : ['client_id', 'client_secret']
     case 'token-exchange':
       return exchangeSources(contract)
     default:
@@ -73,8 +91,13 @@ export interface StoredBagSources {
  * 某 contract 下**落库**(connections.secret_enc)的凭据袋形状 —— 执行期解密复校验的单一权威。
  *   static-token → 用户填的那一个 token 原样存。
  *   token-exchange → 交换输入原样存(每次执行按需换 access_token,换回的进 token 缓存表)。
- *   oauth2-auth-code → access_token(必须,执行凭据)+ client_id/client_secret(必须,日后
- *     refresh 轮换要用)+ refresh_token(**可选**:上游可能不下发 —— 如 GitHub 默认不回 refresh)。
+ *   oauth2-auth-code → **按 clientProvisioning 分叉**:
+ *     - byoa     → access_token(必须,执行凭据)+ client_id/client_secret(必须,日后 refresh
+ *                  轮换要用)+ refresh_token(**可选**:上游可能不下发,如 GitHub 默认不回);
+ *     - platform → **只有 access_token**(必须)+ refresh_token(可选)。client 凭据留在平台表
+ *                  (connector_platform_oauth_apps),**绝不复制进每个用户的连接袋** —— 一份 secret
+ *                  存 N 份加密副本毫无收益,只会把泄露面按用户数放大;将来 refresh 轮换时引擎
+ *                  照样能从平台表现取。
  */
 export function storedBagSources(contract: ExecContractT): StoredBagSources {
   switch (contract.authMode) {
@@ -83,10 +106,12 @@ export function storedBagSources(contract: ExecContractT): StoredBagSources {
     case 'token-exchange':
       return { required: exchangeSources(contract), optional: [] }
     case 'oauth2-auth-code':
-      return {
-        required: ['access_token', 'client_id', 'client_secret'],
-        optional: ['refresh_token'],
-      }
+      return oauth2ClientProvisioning(contract) === 'platform'
+        ? { required: ['access_token'], optional: ['refresh_token'] }
+        : {
+            required: ['access_token', 'client_id', 'client_secret'],
+            optional: ['refresh_token'],
+          }
     default:
       throw new ConnectorError(
         'BAD_REQUEST',
@@ -143,7 +168,12 @@ export function bagToResolvedCredentials(
       return { accessToken: bag.access_token }
     case 'oauth2-auth-code':
       // client_id 是公开标识(非凭据),某些上游要求随 API 请求带上;client_secret/refresh_token 不给。
-      return { accessToken: bag.access_token, clientId: bag.client_id }
+      // **platform 模式的袋里结构上就没有 client_id**(client 凭据留平台表)→ 只出 accessToken。
+      // 判据取自袋形状本身(袋已由 storedBagSources 校验过),故与 clientProvisioning 天然一致。
+      return {
+        accessToken: bag.access_token,
+        ...(bag.client_id !== undefined ? { clientId: bag.client_id } : {}),
+      }
     default:
       throw new ConnectorError('BAD_REQUEST', `authMode ${authMode} not injectable yet`)
   }

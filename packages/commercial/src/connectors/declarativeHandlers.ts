@@ -26,6 +26,7 @@ import {
   revokeDeclarativeConnection,
 } from './engine/binding.js'
 import { listDeclarativeCatalog } from './engine/catalog.js'
+import { oauth2ClientProvisioning } from './engine/credentialBag.js'
 import { buildAuthorizeUrl } from './engine/oauth2.js'
 import { clearTokenCache } from './engine/tokenEngine.js'
 import { ConnectorError } from './errors.js'
@@ -35,6 +36,7 @@ import {
   startOauthPending,
 } from './oauthPending.js'
 import { generatePkceVerifier, pkceChallengeS256 } from './pkce.js'
+import { getPlatformOauthAppClientId } from './platformOauthApps.js'
 import { loadVerifiedContractWithMeta } from './spec/review.js'
 import { ConnectorSpecError } from './spec/types.js'
 
@@ -116,11 +118,18 @@ async function handleBind(
 
 /**
  * POST declarative/oauth/start —— oauth2-auth-code 授权流起点
- * (body: {versionId, clientId, clientSecret, displayName?})。
+ * (body: {versionId, displayName?} + **byoa 模式**额外要 {clientId, clientSecret})。
+ *
+ * **两种 client 供给模式**(权威 = 已验签契约的 oauth2.clientProvisioning,**不看请求**):
+ *   - `byoa`     用户自带 OAuth App:body 必带 clientId/clientSecret → 进加密 pending draft。
+ *   - `platform` 平台注册 OAuth App:**完全不读 body 的 clientId/clientSecret**(带了也忽略,
+ *     杜绝"用户伪造 client_id 冒充平台应用"),client_id 取自平台表;未 provision →
+ *     503 OAUTH_NOT_CONFIGURED(fail-closed)。draft 里**不含**任何 client 凭据。
  *
  * 凭据流向(切片 B 安全核心):
- *   - clientId/clientSecret(用户 BYOA 自建应用的 client 凭据)→ **只**进 AEAD 加密的 pending draft;
- *     clientSecret **绝不**进 authorize URL(buildAuthorizeUrl 结构上就不收它);
+ *   - clientSecret:byoa → **只**进 AEAD 加密的 pending draft;platform → **start 阶段根本不出现**
+ *     (start 只需公开的 client_id,故用 getPlatformOauthAppClientId,不解密 secret)。
+ *     两种模式下 clientSecret **绝不**进 authorize URL(buildAuthorizeUrl 结构上就不收它);
  *   - pkceVerifier 服务端生成 → 只进 draft;进 URL 的是它的 S256 单向派生 challenge;
  *   - state / cookieNonce 原值只出现在 authorize URL / Set-Cookie,DB 只存 sha256。
  * 回调时四因子(state_hash + cookie_nonce + 未消费 + 未过期)全中才解出 draft。
@@ -135,15 +144,30 @@ async function handleOauthStart(
   const userId = Number(user.id)
   const body = asRecord(await readJsonBody(req))
   const versionId = requireVersionId(body)
-  const clientId = requireBoundedString(body, 'clientId', 256)
-  const clientSecret = requireBoundedString(body, 'clientSecret', 512)
   const displayName =
     typeof body.displayName === 'string' ? body.displayName.slice(0, 64) : undefined
 
-  // 载入即验签(4 闸 fail-closed);slug/versionId 取 DB 事实,不信任调用方。
+  // 载入即验签(4 闸 fail-closed);slug/versionId/provisioning 全取 DB 事实,不信任调用方。
   const meta = await loadVerifiedContractWithMeta(versionId, pool)
   if (meta.contract.authMode !== 'oauth2-auth-code')
     throw new HttpError(400, 'BAD_REQUEST', 'connector does not use oauth2 authorization code flow')
+  const provisioning = oauth2ClientProvisioning(meta.contract)
+
+  // authorize URL 用的 client_id + (byoa 才有的)进 draft 的 client 凭据。
+  let clientId: string
+  let draftClientCreds: { clientId: string; clientSecret: string } | undefined
+  if (provisioning === 'platform') {
+    // 一键授权:用户什么都不填。**未 provision = 平台没授权这个连接器用平台身份** → fail-closed。
+    const platformClientId = await getPlatformOauthAppClientId(meta.slug, pool)
+    if (platformClientId === null)
+      throw new HttpError(503, 'OAUTH_NOT_CONFIGURED', 'OAUTH_NOT_CONFIGURED')
+    clientId = platformClientId
+  } else {
+    const byoaClientId = requireBoundedString(body, 'clientId', 256)
+    const byoaClientSecret = requireBoundedString(body, 'clientSecret', 512)
+    clientId = byoaClientId
+    draftClientCreds = { clientId: byoaClientId, clientSecret: byoaClientSecret }
+  }
 
   const redirectUri = readConnectorsOauthRedirectUri()
   const pkceVerifier = generatePkceVerifier()
@@ -154,8 +178,8 @@ async function handleOauthStart(
       userId,
       provider: meta.slug,
       draft: {
-        clientId,
-        clientSecret,
+        // platform 模式:draft 里**没有** client 凭据(回调时从平台表现取)。
+        ...(draftClientCreds ?? {}),
         pkceVerifier,
         connectorVersionId: meta.versionId,
         ...(displayName ? { displayName } : {}),

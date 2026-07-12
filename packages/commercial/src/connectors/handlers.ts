@@ -31,7 +31,7 @@ import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError, sendJson } from '../http/util.js'
 import { dispatchDeclarativeConnectors } from './declarativeHandlers.js'
 import { bindWithBag } from './engine/bind.js'
-import type { DeclarativeSecretBag } from './engine/credentialBag.js'
+import { type DeclarativeSecretBag, oauth2ClientProvisioning } from './engine/credentialBag.js'
 import { exchangeAuthCode } from './engine/oauth2.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import {
@@ -51,6 +51,7 @@ import {
 } from './oauthPending.js'
 import { validateWebdavBaseUrl } from './outboundPolicy.js'
 import { generatePkceVerifier } from './pkce.js'
+import { getPlatformOauthApp } from './platformOauthApps.js'
 import {
   buildFeishuAuthorizeUrl,
   checkFeishuScopes,
@@ -581,9 +582,14 @@ async function handleOauthCallback(
 
   try {
     const redirectUri = readConnectorsOauthRedirectUri()
+    // **v1 只有 BYOA**:draft 必须带 client 凭据。draft 形状放松(platform 模式不落 client 凭据)
+    // 后,这条硬校验就是 v1 路径的守门人 —— 缺了 = 数据错乱/降级攻击,绝不放行到交换层。
+    const { clientId: v1ClientId, clientSecret: v1ClientSecret } = consumed.draft
+    if (v1ClientId === undefined || v1ClientSecret === undefined)
+      throw new ConnectorError('INTERNAL', 'v1 oauth draft missing client credentials')
     const tokens = await exchangeFeishuCode({
-      clientId: consumed.draft.clientId,
-      clientSecret: consumed.draft.clientSecret,
+      clientId: v1ClientId,
+      clientSecret: v1ClientSecret,
       code,
       redirectUri,
       pkceVerifier: consumed.draft.pkceVerifier,
@@ -612,8 +618,8 @@ async function handleOauthCallback(
           schema_version: 1,
           account_identity: identity,
           account_identity_version: 1,
-          clientId: consumed.draft.clientId,
-          clientSecret: consumed.draft.clientSecret,
+          clientId: v1ClientId,
+          clientSecret: v1ClientSecret,
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
         },
@@ -664,11 +670,17 @@ interface DeclarativeOauthInput {
  * 声明式 oauth2-auth-code 收尾:载入即验签 → code 换 token(发 sole token origin)→ 组落库袋 →
  * bindWithBag(identity 探针 + 加密落 pin 连接)→ 302。
  *
+ * **两种 client 供给模式**(权威 = 已验签契约的 oauth2.clientProvisioning,不看 draft/请求):
+ *   - `byoa`     client 凭据来自 draft(用户自带 App);draft 缺它们 → fail-closed。
+ *   - `platform` client 凭据来自**平台表**(connector_platform_oauth_apps);未 provision →
+ *     fail-closed(OAUTH_NOT_CONFIGURED)。落库袋里**不含**任何 client 凭据。
+ *
  * 凭据流向(全链不落日志、不回显、不进 URL):
  *   - `code` / `client_secret` / `pkceVerifier`:**只**进 exchangeAuthCode 发往 token origin 的
  *     form body / basic-auth 头(受众隔离由 contract.credentialAudiencePolicy 在引擎里硬校验);
- *   - 换回的 access_token(+ refresh_token,若上游给)与 client_id/client_secret 一起进**加密**凭据袋
- *     落库(AEAD,AAD 绑 user+slug);
+ *   - 换回的 access_token(+ refresh_token,若上游给)进**加密**凭据袋落库(AEAD,AAD 绑 user+slug);
+ *     byoa 的 client_id/client_secret 一并进袋(日后 refresh 轮换要用),**platform 的 client 凭据
+ *     绝不进袋** —— 它只活在平台表里,一份密文,不按用户数复制;
  *   - 任何失败只回**稳定错误码**,绝不回显凭据或上游原文(exchangeAuthCode 内已做脱敏出口)。
  */
 async function completeDeclarativeOauth(
@@ -687,25 +699,51 @@ async function completeDeclarativeOauth(
     if (meta.slug !== provider)
       throw new ConnectorError('BAD_REQUEST', 'pending provider does not match contract slug')
 
+    // client 凭据取值分叉。**权威是契约,不是 draft** —— 即便 platform 连接器的 draft 里被塞进
+    // client 凭据(理论上做不到:start 不落),这里也只认平台表。
+    const provisioning = oauth2ClientProvisioning(meta.contract)
+    let clientId: string
+    let clientSecret: string
+    if (provisioning === 'platform') {
+      const app = await getPlatformOauthApp(meta.slug, pool)
+      // 授权中途 admin 删了平台 app(或从来没 provision)→ fail-closed,绝不降级去找 draft 要凭据。
+      if (app === null)
+        throw new ConnectorError('OAUTH_NOT_CONFIGURED', 'platform oauth app not provisioned')
+      clientId = app.clientId
+      clientSecret = app.clientSecret
+    } else {
+      if (draft.clientId === undefined || draft.clientSecret === undefined)
+        throw new ConnectorError('INTERNAL', 'byoa oauth draft missing client credentials')
+      clientId = draft.clientId
+      clientSecret = draft.clientSecret
+    }
+
     const tokens = await exchangeAuthCode({
       contract: meta.contract,
       code: input.code,
-      clientId: draft.clientId,
-      clientSecret: draft.clientSecret,
+      clientId,
+      clientSecret,
       redirectUri,
       pkceVerifier: draft.pkceVerifier,
       ...(input.deps.connectorEngineDeps ? { deps: input.deps.connectorEngineDeps } : {}),
     })
 
-    // 落库袋 = storedBagSources('oauth2-auth-code'):access_token + client_id + client_secret
-    // (+ refresh_token 若上游下发)。client_secret 留袋供日后 refresh 轮换,但**永不**进
-    // ResolvedCredentials(placement 层结构上拿不到它)。
-    const bag: DeclarativeSecretBag = {
-      access_token: tokens.accessToken,
-      client_id: draft.clientId,
-      client_secret: draft.clientSecret,
-      ...(tokens.refreshToken ? { refresh_token: tokens.refreshToken } : {}),
-    }
+    // 落库袋 = storedBagSources(contract) —— 形状随 clientProvisioning 分叉,与 bind 期
+    // validateSecretBag / 执行期 decryptBagFromRow 用的是同一权威函数,天然对齐:
+    //   byoa     → access_token + client_id + client_secret (+ refresh_token 若上游给)
+    //   platform → access_token (+ refresh_token 若上游给)  ← client 凭据留平台表
+    const bag: DeclarativeSecretBag =
+      provisioning === 'platform'
+        ? {
+            access_token: tokens.accessToken,
+            ...(tokens.refreshToken ? { refresh_token: tokens.refreshToken } : {}),
+          }
+        : {
+            access_token: tokens.accessToken,
+            client_id: clientId,
+            client_secret: clientSecret,
+            ...(tokens.refreshToken ? { refresh_token: tokens.refreshToken } : {}),
+          }
     const bound = await bindWithBag(
       {
         userId: input.userId,

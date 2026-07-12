@@ -22,6 +22,7 @@ import { describe, test } from 'node:test'
 
 import {
   bagToResolvedCredentials,
+  oauth2ClientProvisioning,
   requiredBindSources,
   storedBagSources,
   validateSecretBag,
@@ -57,6 +58,8 @@ function githubSpec(): Record<string, unknown> {
     auth: {
       authorizeEndpoint: 'https://github.com/login/oauth/authorize',
       tokenEndpoint: 'https://github.com/login/oauth/access_token',
+      // BYOA:用户自建 OAuth App(切片 B 原语义)。platform 模式另有专门用例。
+      clientProvisioning: 'byoa',
       clientAuth: 'form',
       scopeSeparator: ' ',
       scopes: ['repo', 'read:user'],
@@ -121,6 +124,7 @@ describe('compileSpec · oauth2-auth-code', () => {
     assert.deepEqual((c as Record<string, unknown>).oauth2, {
       authorizeEndpoint: 'https://github.com/login/oauth/authorize',
       tokenEndpoint: 'https://github.com/login/oauth/access_token',
+      clientProvisioning: 'byoa',
       clientAuth: 'form',
       scopeSeparator: ' ',
       scopes: ['repo', 'read:user'],
@@ -562,16 +566,40 @@ function compileStaticToken(): ExecContractT {
   ).execContract
 }
 
+/** 同 github fixture,但 clientProvisioning='platform'(平台注册 App,用户一键授权)。 */
+function compilePlatform(): ExecContractT {
+  return compileGithub((s) => {
+    ;(s.auth as Record<string, unknown>).clientProvisioning = 'platform'
+  })
+}
+
 describe('credentialBag · oauth2-auth-code', () => {
-  test('requiredBindSources = 用户直填的 client_id + client_secret(token 由流程获得)', () => {
+  test('requiredBindSources:byoa 直填 client_id+client_secret;**platform 什么都不填**', () => {
     assert.deepEqual(requiredBindSources(compileGithub()), ['client_id', 'client_secret'])
+    // platform:平台已注册 App → 用户一键授权,表单零字段。
+    assert.deepEqual(requiredBindSources(compilePlatform()), [])
     // 对照:static-token 用户直填 access_token。
     assert.deepEqual(requiredBindSources(compileStaticToken()), ['access_token'])
   })
 
-  test('storedBagSources = 落库形状(access_token+client_id+client_secret 必填;refresh_token 可选)', () => {
+  test('oauth2ClientProvisioning:契约字段是唯一权威(byoa / platform)', () => {
+    assert.equal(oauth2ClientProvisioning(compileGithub()), 'byoa')
+    assert.equal(oauth2ClientProvisioning(compilePlatform()), 'platform')
+    // 非 oauth2 契约问 provisioning = 编程错误 → fail-closed(不给默认值)。
+    assert.throws(
+      () => oauth2ClientProvisioning(compileStaticToken()),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'INTERNAL',
+    )
+  })
+
+  test('storedBagSources:byoa 落 client 凭据;**platform 只落 access_token(client 凭据留平台表)**', () => {
     assert.deepEqual(storedBagSources(compileGithub()), {
       required: ['access_token', 'client_id', 'client_secret'],
+      optional: ['refresh_token'],
+    })
+    // platform:袋里**结构上没有** client_id/client_secret —— 平台密钥不按用户数复制加密副本。
+    assert.deepEqual(storedBagSources(compilePlatform()), {
+      required: ['access_token'],
       optional: ['refresh_token'],
     })
     // 对照:static-token 两种形状恰好相等。
@@ -579,6 +607,22 @@ describe('credentialBag · oauth2-auth-code', () => {
       required: ['access_token'],
       optional: [],
     })
+  })
+
+  test('validateSecretBag · platform 袋:多带 client_id/client_secret 一律拒(未知键)', () => {
+    const { required, optional } = storedBagSources(compilePlatform())
+    validateSecretBag({ access_token: 'at' }, required, optional)
+    validateSecretBag({ access_token: 'at', refresh_token: 'rt' }, required, optional)
+    // 即便是"看起来合法"的 client 凭据,在 platform 袋里也是未知键 → 拒(防止回调路径写错形状)。
+    for (const evil of [
+      { access_token: 'at', client_id: 'cid' },
+      { access_token: 'at', client_secret: SECRET },
+    ]) {
+      assert.throws(
+        () => validateSecretBag(evil, required, optional),
+        (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+      )
+    }
   })
 
   test('validateSecretBag:optional 可缺可有;required 缺一必拒;未知键必拒', () => {
@@ -634,6 +678,15 @@ describe('credentialBag · oauth2-auth-code', () => {
     // canary 不在注入层任何字段里。
     assert.equal(JSON.stringify(creds).includes(SECRET), false)
     assert.deepEqual(creds, { accessToken: 'AT', clientId: 'CID' })
+  })
+
+  test('bagToResolvedCredentials:platform 袋无 client_id → 只出 accessToken', () => {
+    const creds: ResolvedCredentials = bagToResolvedCredentials('oauth2-auth-code', {
+      access_token: 'AT',
+      refresh_token: 'RT',
+    })
+    assert.deepEqual(creds, { accessToken: 'AT' })
+    assert.equal('clientId' in creds, false)
   })
 
   test('resolveApiCredentials:oauth2 直接用落库的 access_token(不发网)', async () => {

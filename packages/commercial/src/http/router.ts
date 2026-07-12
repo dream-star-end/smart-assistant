@@ -79,6 +79,11 @@ import {
   handleAdminTraceLookup,
 } from './admin/audit.js'
 import {
+  handleAdminDeletePlatformOauthApp,
+  handleAdminListPlatformOauthApps,
+  handleAdminPutPlatformOauthApp,
+} from './admin/connectorPlatformOauth.js'
+import {
   handleAdminAgentContainerAction,
   handleAdminContainerLogs,
   handleAdminContainersStats,
@@ -803,6 +808,23 @@ export function createCommercialHandler(
     // 0106 轻量在飞快照(前端 30s 轮询)
     { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
+    // 0136 连接器平台 OAuth App provisioning(clientProvisioning='platform' 的信任闸)。
+    // exact list 排在 :slug prefix 之前(matchRoute exact-first)。
+    {
+      method: 'GET',
+      path: '/api/admin/connectors/platform-oauth-apps',
+      handler: handleAdminListPlatformOauthApps,
+    },
+    {
+      method: 'PUT',
+      pathPrefix: '/api/admin/connectors/platform-oauth-apps/',
+      handler: handleAdminPutPlatformOauthApp,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/connectors/platform-oauth-apps/',
+      handler: handleAdminDeletePlatformOauthApp,
+    },
     // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
     { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
     { method: 'PATCH', path: '/api/admin/literature', handler: handleAdminPatchLiterature },

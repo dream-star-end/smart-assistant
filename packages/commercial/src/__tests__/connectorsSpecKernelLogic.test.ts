@@ -299,6 +299,7 @@ describe('compileSpec', () => {
     spec.auth = {
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/token',
+      clientProvisioning: 'byoa',
       clientAuth: 'basic',
       scopeSeparator: ' ',
       refreshRotation: false,

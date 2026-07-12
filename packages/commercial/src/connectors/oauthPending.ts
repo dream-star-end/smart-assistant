@@ -4,8 +4,10 @@
  * 不变量:
  *   - **start**:`INSERT ... ON CONFLICT (user_id,provider) DO UPDATE` 单语句原子替换
  *     (并发双 start 只剩一行,旧 state 必败 —— state_hash 被新值覆盖)。
- *   - draft = 加密 {clientId, clientSecret, pkceVerifier, displayName?},
+ *   - draft = 加密 {clientId?, clientSecret?, pkceVerifier, displayName?},
  *     **AAD = `oauth:{state_hash_hex}:{user_id}:{provider}:{aad_seed}`**(公式二)。
+ *     client 凭据**可选**:仅 BYOA(用户自带 App)才落它们;声明式 platform 模式的 client 凭据
+ *     在平台表(connector_platform_oauth_apps),没必要每次授权都复制一份加密副本进 draft。
  *   - **callback consume**:单事务两语句 —— `SELECT ... FOR UPDATE` 校验四因子
  *     (state_hash 命中 + cookie_nonce_hash 匹配 + 未消费 + 未过期)读 draft 入 Buffer
  *     → `UPDATE SET consumed_at=now(), draft_enc=NULL, draft_nonce=NULL` → COMMIT。
@@ -37,8 +39,17 @@ export function oauthDraftAad(
 }
 
 export interface OauthDraft {
-  clientId: string
-  clientSecret: string
+  /**
+   * OAuth client 凭据 —— **仅 BYOA 落它们**(v1 feishu 手写路径 / 声明式 clientProvisioning='byoa')。
+   * 声明式 **platform 模式不落**:凭据在平台表(connector_platform_oauth_apps),回调时现取;
+   * 每次授权复制一份加密副本进 pending 只会平白多一处密文暴露面,零收益。
+   *
+   * ⚠️ 两条消费路径各自硬校验自己的必需项(consume 只做"存在即 string"的形状底线):
+   *   - v1 feishu 分支:缺 clientId/clientSecret → INTERNAL(v1 只有 BYOA,缺了必是数据错乱);
+   *   - 声明式分支:byoa 缺 → fail-closed;platform 有也不看(权威是平台表)。
+   */
+  clientId?: string
+  clientSecret?: string
   pkceVerifier: string
   displayName?: string
   /**
@@ -264,13 +275,15 @@ export async function consumeOauthPending(
       oauthDraftAad(stateHashHex, held.userId, held.provider, held.aadSeed),
     )
     const draft = JSON.parse(pt.toString('utf8')) as OauthDraft
-    if (
-      typeof draft.clientId !== 'string' ||
-      typeof draft.clientSecret !== 'string' ||
-      typeof draft.pkceVerifier !== 'string'
-    ) {
+    // pkceVerifier 恒必需(两条路径共用的四因子之一,少了就没法完成交换)。
+    if (typeof draft.pkceVerifier !== 'string')
       throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
-    }
+    // client 凭据**可选**(platform 模式压根不落);但只要出现,就必须是 string —— 防止畸形
+    // draft(对象/数组/数字)一路漏到 exchange 层。"该不该有"由各消费分支自己硬校验。
+    if (draft.clientId !== undefined && typeof draft.clientId !== 'string')
+      throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
+    if (draft.clientSecret !== undefined && typeof draft.clientSecret !== 'string')
+      throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
     // 声明式标记若存在,必须是正整数 versionId(回调据它选路径 + 载入契约,形状必须硬)。
     if (
       draft.connectorVersionId !== undefined &&
