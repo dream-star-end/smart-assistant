@@ -89,7 +89,11 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('rejects an unknown action kind', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore(), repairAuthority: activeAuthority })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+    })
     const resp = await broker.handleRequest({
       repairId: 'r3',
       capability: CAP,
@@ -119,7 +123,11 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('switch_node is a reserved no-op', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore(), repairAuthority: activeAuthority })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+    })
     const resp = await broker.handleRequest({
       repairId: 'r5',
       capability: CAP,
@@ -191,10 +199,14 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
     assert.equal(resp.status, 'unauthorized')
     assert.match(String(resp.detail?.reason), /capability mismatch/)
     assert.equal(calls.length, 0, 'unauthorized request must never execute')
-    delete process.env.OC_SELFHEAL_RESTART_UNITS
+    setOrUnset('OC_SELFHEAL_RESTART_UNITS', undefined)
   })
 
-  it('rejects a missing capability', async () => {
+  // Block C trust-model change: the capability NEVER reaches the ocheal/codex
+  // side (M-capability), so a socket request cannot be required to present it.
+  // Authorization = socket ACL + ACTIVE repair; a presented-but-wrong capability
+  // is still always rejected (previous test above).
+  it('allows a request WITHOUT a capability for an active repair (block C posture)', async () => {
     const { run } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
@@ -207,7 +219,7 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
       actionKind: 'switch_node',
       params: {},
     })
-    assert.equal(resp.status, 'unauthorized')
+    assert.equal(resp.status, 'reserved', 'no-capability request reaches the action')
   })
 
   it('rejects when the repair is not in an active state', async () => {
@@ -393,5 +405,503 @@ describe('SelfhealBroker Tier2 cutover', () => {
       params: { sha: 'not-a-sha', verificationRef: 'c7' },
     })
     assert.equal(resp.status, 'rejected')
+  })
+})
+
+// ── block C: context / verify / report socket kinds ──────────────────────────
+
+function fetchStub(
+  handler: (url: string, init?: RequestInit) => { status: number; body?: unknown },
+) {
+  const calls: { url: string; init?: RequestInit }[] = []
+  const impl = (async (url: string | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init })
+    const r = handler(String(url), init)
+    return {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      text: async () => JSON.stringify(r.body ?? {}),
+      json: async () => r.body ?? {},
+    }
+  }) as unknown as typeof fetch
+  return { impl, calls }
+}
+
+describe('broker context kind — root-held capability, transparent JSON', () => {
+  it('GETs the master context with Bearer <job capability> and returns the JSON', async () => {
+    const { impl, calls } = fetchStub(() => ({
+      status: 200,
+      body: { incident: { id: 'inc-1' }, level: 'auto_repair' },
+    }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      callbackBaseUrl: 'http://127.0.0.1:18796',
+      fetchImpl: impl,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'ctx-1',
+      actionKind: 'context',
+      params: {},
+    })
+    assert.equal(resp.ok, true)
+    assert.equal(resp.status, 'ok')
+    assert.deepEqual(resp.detail?.context, { incident: { id: 'inc-1' }, level: 'auto_repair' })
+    assert.equal(calls[0]?.url, 'http://127.0.0.1:18796/internal/v5/repairs/ctx-1/context')
+    assert.equal(
+      (calls[0]?.init?.headers as Record<string, string>)?.Authorization,
+      `Bearer ${CAP}`,
+      'the ROOT-held job capability authenticates the fetch — never supplied by the caller',
+    )
+  })
+
+  it('maps a master error to context_failed (retryable — claim released)', async () => {
+    const { impl } = fetchStub(() => ({ status: 503 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      callbackBaseUrl: 'http://127.0.0.1:18796',
+      fetchImpl: impl,
+    })
+    const r1 = await broker.handleRequest({ repairId: 'ctx-2', actionKind: 'context', params: {} })
+    assert.equal(r1.status, 'context_failed')
+    // Failure released the claim → the retry re-executes (not in_progress).
+    const r2 = await broker.handleRequest({ repairId: 'ctx-2', actionKind: 'context', params: {} })
+    assert.equal(r2.status, 'context_failed')
+  })
+
+  it('rejects when the callback base url is not configured', async () => {
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'ctx-3',
+      actionKind: 'context',
+      params: {},
+    })
+    assert.equal(resp.status, 'rejected')
+  })
+})
+
+describe('broker verify kind — de-privileged four-layer run via verifier', () => {
+  it('returns allPassed + verificationRef + signed file path + layer summary', async () => {
+    const seen: { repairId: string; sha: string; clonePath: string }[] = []
+    const SHA = 'd'.repeat(40)
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      verificationDir: '/var/lib/test-verifications',
+      verifyRunner: async (input) => {
+        seen.push(input)
+        return {
+          verificationRef: input.repairId,
+          signed: {
+            result: {
+              repairId: input.repairId,
+              sha: input.sha,
+              clonePath: input.clonePath,
+              layers: [
+                { name: 'lint', ok: true, code: 0, durationMs: 1 },
+                { name: 'typecheck', ok: true, code: 0, durationMs: 1 },
+              ],
+              allPassed: true,
+              verifiedAt: new Date().toISOString(),
+            },
+            sig: 'unused',
+          },
+        }
+      },
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'v-1',
+      actionKind: 'verify',
+      params: { sha: SHA },
+    })
+    assert.equal(resp.ok, true)
+    assert.equal(resp.status, 'verified')
+    assert.equal(resp.detail?.allPassed, true)
+    assert.equal(resp.detail?.verificationRef, 'v-1')
+    assert.equal(resp.detail?.file, '/var/lib/test-verifications/v-1.json')
+    assert.deepEqual(resp.detail?.layers, [
+      { name: 'lint', ok: true, code: 0 },
+      { name: 'typecheck', ok: true, code: 0 },
+    ])
+    assert.deepEqual(seen, [{ repairId: 'v-1', sha: SHA, clonePath: '/home/ocheal/selfheal/v-1' }])
+  })
+
+  it('rejects a malformed sha', async () => {
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      verifyRunner: async () => {
+        throw new Error('must not be called')
+      },
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'v-2',
+      actionKind: 'verify',
+      params: { sha: 'short' },
+    })
+    assert.equal(resp.status, 'rejected')
+  })
+
+  it('maps a thrown verification to verify_failed', async () => {
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      verifyRunner: async () => {
+        throw new Error('worktree add failed')
+      },
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'v-3',
+      actionKind: 'verify',
+      params: { sha: 'e'.repeat(40) },
+    })
+    assert.equal(resp.status, 'verify_failed')
+    assert.match(String(resp.detail?.reason), /worktree add failed/)
+  })
+})
+
+describe('broker report kind — redacted, length-capped capability POST', () => {
+  function reportBroker(handler?: Parameters<typeof fetchStub>[0]) {
+    const { impl, calls } = fetchStub(handler ?? (() => ({ status: 200, body: { ok: true } })))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      callbackBaseUrl: 'http://127.0.0.1:18796',
+      fetchImpl: impl,
+      reportMessageMaxChars: 50,
+      reportDetailMaxChars: 60,
+    })
+    return { broker, calls }
+  }
+
+  it('POSTs the outcome-specific callback with Bearer capability', async () => {
+    const { broker, calls } = reportBroker()
+    const resp = await broker.handleRequest({
+      repairId: 'rp-1',
+      actionKind: 'report',
+      params: { outcome: 'progress', message: 'starting layer 2' },
+    })
+    assert.equal(resp.ok, true)
+    assert.equal(resp.status, 'reported')
+    assert.equal(calls[0]?.url, 'http://127.0.0.1:18796/internal/v5/repairs/rp-1/progress')
+    assert.equal(
+      (calls[0]?.init?.headers as Record<string, string>)?.Authorization,
+      `Bearer ${CAP}`,
+    )
+    assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), { message: 'starting layer 2' })
+  })
+
+  it('redacts secrets and enforces the length caps', async () => {
+    const { broker, calls } = reportBroker()
+    const resp = await broker.handleRequest({
+      repairId: 'rp-2',
+      actionKind: 'report',
+      params: {
+        outcome: 'done',
+        message: `token sk-abcdefgh12345678 ${'y'.repeat(100)}`,
+        detail: `Bearer very.secret.jwt and password=hunter2 ${'z'.repeat(100)}`,
+      },
+    })
+    assert.equal(resp.ok, true)
+    const body = JSON.parse(String(calls[0]?.init?.body)) as { message: string; detail: string }
+    assert.ok(!body.message.includes('sk-abcdefgh12345678'), 'api key redacted')
+    assert.ok(body.message.length <= 50, 'message capped')
+    assert.ok(!body.detail.includes('very.secret.jwt'), 'bearer redacted')
+    assert.ok(!body.detail.includes('hunter2'), 'password value redacted')
+    assert.ok(body.detail.length <= 60, 'detail capped')
+  })
+
+  it('rejects an unknown outcome and a missing message', async () => {
+    const { broker } = reportBroker()
+    const bad1 = await broker.handleRequest({
+      repairId: 'rp-3',
+      actionKind: 'report',
+      params: { outcome: 'exploded', message: 'x' },
+    })
+    assert.equal(bad1.status, 'rejected')
+    const bad2 = await broker.handleRequest({
+      repairId: 'rp-3',
+      actionKind: 'report',
+      params: { outcome: 'done' },
+    })
+    assert.equal(bad2.status, 'rejected')
+  })
+
+  it('a master 5xx is report_failed (claim released → retry re-sends)', async () => {
+    let n = 0
+    const { broker, calls } = reportBroker(() => ({ status: ++n === 1 ? 502 : 200 }))
+    const p = { outcome: 'failed', message: 'gave up' }
+    const r1 = await broker.handleRequest({ repairId: 'rp-4', actionKind: 'report', params: p })
+    assert.equal(r1.status, 'report_failed')
+    const r2 = await broker.handleRequest({ repairId: 'rp-4', actionKind: 'report', params: p })
+    assert.equal(r2.status, 'reported')
+    assert.equal(calls.length, 2)
+  })
+
+  it('an identical successful report is replayed, different messages both send', async () => {
+    const { broker, calls } = reportBroker()
+    const p = { outcome: 'progress', message: 'step 1' }
+    await broker.handleRequest({ repairId: 'rp-5', actionKind: 'report', params: p })
+    const replay = await broker.handleRequest({ repairId: 'rp-5', actionKind: 'report', params: p })
+    assert.equal(replay.detail?.replayed, true)
+    assert.equal(calls.length, 1, 'identical report deduped')
+    await broker.handleRequest({
+      repairId: 'rp-5',
+      actionKind: 'report',
+      params: { outcome: 'progress', message: 'step 2' },
+    })
+    assert.equal(calls.length, 2, 'a NEW message is a fresh params-keyed claim')
+  })
+})
+
+// ── block C: release is NEVER a socket action; releaseApproved is in-process ──
+
+describe('release structural isolation (design §C2 R2-BLOCKER2)', () => {
+  it('the socket path categorically rejects kind=release (even with a valid capability)', async () => {
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      deployDriver: async () => {
+        throw new Error('must never be reached from the socket')
+      },
+    })
+    for (const kind of ['release', 'release_approved']) {
+      const resp = await broker.handleRequest({
+        repairId: 'rl-sock',
+        capability: CAP,
+        actionKind: kind,
+        params: {},
+      })
+      assert.equal(resp.status, 'rejected', kind)
+      assert.match(String(resp.detail?.reason), /not a socket action/)
+    }
+  })
+})
+
+describe('releaseApproved — re-verifies pending record + ancestry + denylist', () => {
+  const SHA = 'f'.repeat(40)
+
+  // Fully self-contained fixture per test (no shared mutable state — tests may
+  // interleave). `ancestry.ok` is mutable so a test can flip it AFTER parking
+  // the pending cutover, exercising the release-time re-check.
+  function releaseFixture(opts: { deployStatus?: string; deployOk?: boolean } = {}) {
+    const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-rel-'))
+    const store = new InMemoryBrokerClaimStore()
+    const deployed: string[] = []
+    const ancestry = { ok: true }
+    const { run } = stubRunner((cmd, args) => {
+      if (cmd === 'git' && args.includes('merge-base')) {
+        return { code: ancestry.ok ? 0 : 1 }
+      }
+      return { code: 0 }
+    })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store,
+      repairAuthority: activeAuthority,
+      verifyKey: VERIFY_KEY,
+      verificationDir: vdir,
+      canonicalRepo: '/canon',
+      run,
+      autoDeployTier2: false, // default posture → cutover parks in pending_release
+      deployDriver: async (sha) => {
+        deployed.push(sha)
+        return {
+          ok: opts.deployOk ?? true,
+          status: opts.deployStatus ?? 'deployed',
+          detail: { sha },
+        }
+      },
+    })
+    async function parkPendingCutover(repairId: string): Promise<void> {
+      const result = {
+        repairId,
+        sha: SHA,
+        clonePath: `/home/ocheal/selfheal/${repairId}`,
+        layers: [{ name: 'typecheck', ok: true, code: 0, durationMs: 1 }],
+        allPassed: true,
+        verifiedAt: new Date().toISOString(),
+      }
+      writeSignedVerification(vdir, result)
+      const resp = await broker.handleRequest({
+        repairId,
+        capability: CAP,
+        actionKind: 'cutover',
+        params: { sha: SHA, verificationRef: repairId },
+      })
+      assert.equal(resp.status, 'pending_release')
+    }
+    const cleanup = () => rmSync(vdir, { recursive: true, force: true })
+    return { broker, store, deployed, ancestry, parkPendingCutover, cleanup }
+  }
+
+  it('happy path: pending record found → ancestry re-checked → driver deploys; replay is idempotent', async () => {
+    const fx = releaseFixture()
+    await fx.parkPendingCutover('rl-1')
+    const resp = await fx.broker.releaseApproved('rl-1')
+    assert.equal(resp.status, 'deployed')
+    assert.equal(resp.ok, true)
+    assert.deepEqual(fx.deployed, [SHA])
+    // The durable cutover record now reflects the deployed outcome.
+    const rec = await fx.store.get('rl-1:cutover')
+    assert.equal(JSON.parse(rec?.response ?? '{}').status, 'deployed')
+    // A duplicate release replays — the deploy runs EXACTLY once.
+    const again = await fx.broker.releaseApproved('rl-1')
+    assert.equal(again.status, 'deployed')
+    assert.equal(again.detail?.replayed, true)
+    assert.deepEqual(fx.deployed, [SHA], 'at-most-once deploy')
+    fx.cleanup()
+  })
+
+  it('refuses when there is no pending cutover record', async () => {
+    const fx = releaseFixture()
+    const resp = await fx.broker.releaseApproved('rl-none')
+    assert.equal(resp.status, 'rejected')
+    assert.match(String(resp.detail?.reason), /no committed cutover record/)
+    assert.deepEqual(fx.deployed, [])
+    fx.cleanup()
+  })
+
+  it('re-runs ancestry at release time and refuses a non-descendant (deploy never invoked)', async () => {
+    const fx = releaseFixture()
+    await fx.parkPendingCutover('rl-anc')
+    // Ancestry passed at cutover time; canonical moved on → flip it for release.
+    fx.ancestry.ok = false
+    const resp = await fx.broker.releaseApproved('rl-anc')
+    assert.equal(resp.status, 'rejected')
+    assert.match(String(resp.detail?.reason), /not a descendant/)
+    assert.deepEqual(fx.deployed, [], 'deploy never invoked')
+    fx.cleanup()
+  })
+
+  it('denylist refusal from the driver leaves the release retryable and NOT deployed', async () => {
+    const fx = releaseFixture({ deployOk: false, deployStatus: 'pending_release' })
+    await fx.parkPendingCutover('rl-deny')
+    const resp = await fx.broker.releaseApproved('rl-deny')
+    assert.equal(resp.status, 'pending_release', 'toolchain-touching sha stays held')
+    // The release claim was released → a later legitimate attempt can retry.
+    const releaseRec = await fx.store.get('rl-deny:release_approved')
+    assert.equal(releaseRec, null)
+    // The cutover record still says pending_release (not deployed).
+    const cutRec = await fx.store.get('rl-deny:cutover')
+    assert.equal(JSON.parse(cutRec?.response ?? '{}').status, 'pending_release')
+    fx.cleanup()
+  })
+
+  it('a second release of an already-deployed cutover replays without re-deploying', async () => {
+    const fx = releaseFixture()
+    await fx.parkPendingCutover('rl-twice')
+    assert.equal((await fx.broker.releaseApproved('rl-twice')).status, 'deployed')
+    // Replay path returns the recorded deploy; the driver ran once.
+    assert.equal((await fx.broker.releaseApproved('rl-twice')).detail?.replayed, true)
+    assert.equal(fx.deployed.length, 1)
+    fx.cleanup()
+  })
+})
+
+describe('broker → master callback seam (pending_release progress / post-release done)', () => {
+  const SHA = 'b'.repeat(40)
+  function seamFixture(opts: { fetchStatus?: number; fetchThrows?: boolean } = {}) {
+    const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-seam-'))
+    const calls: { url: string; init?: RequestInit }[] = []
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init })
+      if (opts.fetchThrows) throw new Error('tunnel down')
+      const status = opts.fetchStatus ?? 200
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => '{}',
+        json: async () => ({}),
+      }
+    }) as unknown as typeof fetch
+    const { run } = stubRunner((cmd, args) => {
+      if (cmd === 'git' && args.includes('merge-base')) return { code: 0 }
+      return { code: 0 }
+    })
+    const deployed: string[] = []
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      verifyKey: VERIFY_KEY,
+      verificationDir: vdir,
+      canonicalRepo: '/canon',
+      run,
+      autoDeployTier2: false,
+      callbackBaseUrl: 'http://127.0.0.1:18796',
+      fetchImpl: impl,
+      deployDriver: async (sha) => {
+        deployed.push(sha)
+        return { ok: true, status: 'deployed', detail: { sha } }
+      },
+    })
+    function park(repairId: string) {
+      writeSignedVerification(vdir, {
+        repairId,
+        sha: SHA,
+        clonePath: `/home/ocheal/selfheal/${repairId}`,
+        layers: [{ name: 'typecheck', ok: true, code: 0, durationMs: 1 }],
+        allPassed: true,
+        verifiedAt: new Date().toISOString(),
+      })
+      return broker.handleRequest({
+        repairId,
+        capability: CAP,
+        actionKind: 'cutover',
+        params: { sha: SHA, verificationRef: repairId },
+      })
+    }
+    return { broker, calls, deployed, park, cleanup: () => rmSync(vdir, { recursive: true, force: true }) }
+  }
+
+  it('a gated cutover posts the pending_release progress marker (detail.phase, object) to the master', async () => {
+    const fx = seamFixture()
+    const resp = await fx.park('seam-1')
+    assert.equal(resp.status, 'pending_release')
+    const call = fx.calls.find((c) => c.url.endsWith('/internal/v5/repairs/seam-1/progress'))
+    assert.ok(call, 'broker must deterministically post the progress callback')
+    const body = JSON.parse(String(call?.init?.body))
+    assert.equal(body.detail.phase, 'pending_release', "master's release gate reads detail->>'phase'")
+    assert.match(body.message, /pending_release/)
+    assert.equal(
+      (call?.init?.headers as Record<string, string>)?.Authorization,
+      `Bearer ${CAP}`,
+      'root-held capability authenticates the seam callback',
+    )
+    fx.cleanup()
+  })
+
+  it('releaseApproved posts DONE (phase=deployed) after a successful human release', async () => {
+    const fx = seamFixture()
+    await fx.park('seam-2')
+    const resp = await fx.broker.releaseApproved('seam-2')
+    assert.equal(resp.status, 'deployed')
+    assert.deepEqual(fx.deployed, [SHA])
+    const done = fx.calls.find((c) => c.url.endsWith('/internal/v5/repairs/seam-2/done'))
+    assert.ok(done, 'the broker (not codex) closes the loop after release')
+    assert.equal(JSON.parse(String(done?.init?.body)).detail.phase, 'deployed')
+    fx.cleanup()
+  })
+
+  it('callback failure never changes the cutover/release outcome (audited best-effort)', async () => {
+    const fx = seamFixture({ fetchThrows: true })
+    const parked = await fx.park('seam-3')
+    assert.equal(parked.status, 'pending_release', 'pending outcome survives a dead tunnel')
+    const rel = await fx.broker.releaseApproved('seam-3')
+    assert.equal(rel.status, 'deployed', 'deploy outcome survives a dead tunnel')
+    fx.cleanup()
   })
 })

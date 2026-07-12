@@ -28,8 +28,14 @@ import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'selfheal-receiver' })
 
-/** Exact path this receiver owns (see server.ts pre-auth routing). */
+/** Exact dispatch path this receiver owns (see server.ts pre-auth routing). */
 export const SELFHEAL_WEBHOOK_PATH = '/api/webhooks/v5-selfheal'
+/** Canonical cancel path (design §A2/§C4) — same trust chain as dispatch. The
+ *  legacy /internal/selfheal/cancel route is deleted. */
+export const SELFHEAL_CANCEL_WEBHOOK_PATH = '/api/webhooks/v5-selfheal-cancel'
+/** One-click release path (design §C3) — same trust chain as dispatch; the only
+ *  remote entry into broker.releaseApproved (release is NEVER a socket action). */
+export const SELFHEAL_RELEASE_WEBHOOK_PATH = '/api/webhooks/v5-selfheal-release'
 
 const DEFAULT_MAX_BODY_BYTES = 8 * 1024 // dispatch bodies are 3 ids — kilobytes, not megabytes
 const DEFAULT_TS_TOLERANCE_MS = 120_000
@@ -63,6 +69,10 @@ export function getSelfhealReceiverConfig(
 
 export interface SelfhealWebhookInput {
   remoteAddress: string | undefined
+  /** HTTP method — part of the signed string (route binding, design §A6/M3). */
+  method: string | undefined
+  /** URL pathname (no query) — part of the signed string (route binding). */
+  path: string | undefined
   ts: string | undefined
   nonce: string | undefined
   sig: string | undefined
@@ -130,9 +140,32 @@ function timingSafeHexEqual(a: string, b: string): boolean {
 export type VerifyResult = { ok: true } | { ok: false; status: 401 | 403 | 413; error: string }
 
 /**
- * Shared trust chain for every inbound self-heal request (dispatch AND cancel):
- * loopback → size cap → ts window → HMAC → atomic nonce. `repairId` is passed in
- * because it is part of the signed string but lives in the (caller-parsed) body.
+ * Build the canonical signed string. SINGLE AUTHORITY for the HMAC contract —
+ * the receiver (inbound verify) and jobWorker (outbound signing) both use this,
+ * and the v5 side mirrors it exactly (design §A6/M3, route-bound signatures):
+ *
+ *   `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`
+ *
+ * METHOD is uppercased; path is the URL pathname WITHOUT query. Binding the
+ * route into the signature makes a signature minted for one endpoint (e.g.
+ * dispatch) unusable against another (e.g. cancel/release).
+ */
+export function selfhealSignedString(input: {
+  method: string
+  path: string
+  ts: string
+  nonce: string
+  repairId: string
+  bodySha256: string
+}): string {
+  return `${input.method.toUpperCase()}.${input.path}.${input.ts}.${input.nonce}.${input.repairId}.${input.bodySha256}`
+}
+
+/**
+ * Shared trust chain for every inbound self-heal request (dispatch, cancel AND
+ * release): loopback → size cap → ts window → HMAC → atomic nonce. `repairId`
+ * is passed in because it is part of the signed string but lives in the
+ * (caller-parsed) body; `method`/`path` bind the signature to the exact route.
  *
  * HMAC is verified BEFORE the nonce is recorded so unauthenticated traffic can
  * never mutate the nonce table; replay defense is unaffected (see module header).
@@ -140,6 +173,8 @@ export type VerifyResult = { ok: true } | { ok: false; status: 401 | 403 | 413; 
 export async function verifySelfhealSignedRequest(
   input: {
     remoteAddress: string | undefined
+    method: string | undefined
+    path: string | undefined
     ts: string | undefined
     nonce: string | undefined
     sig: string | undefined
@@ -156,6 +191,9 @@ export async function verifySelfhealSignedRequest(
   if (input.rawBody.length > cfg.maxBodyBytes) {
     return { ok: false, status: 413, error: 'payload too large' }
   }
+  if (!input.method || !input.path || !input.path.startsWith('/')) {
+    return { ok: false, status: 401, error: 'missing method or path' }
+  }
   const ts = Number(input.ts)
   if (!input.ts || !Number.isFinite(ts) || Math.abs(now - ts) > cfg.tsToleranceMs) {
     return { ok: false, status: 401, error: 'stale or missing timestamp' }
@@ -165,10 +203,17 @@ export async function verifySelfhealSignedRequest(
     return { ok: false, status: 401, error: 'missing nonce or signature' }
   }
   const bodySha256 = createHash('sha256').update(input.rawBody).digest('hex')
-  const signed = `${input.ts}.${nonce}.${input.repairId}.${bodySha256}`
+  const signed = selfhealSignedString({
+    method: input.method,
+    path: input.path,
+    ts: input.ts,
+    nonce,
+    repairId: input.repairId,
+    bodySha256,
+  })
   const expected = createHmac('sha256', cfg.hmacSecret).update(signed).digest('hex')
   if (!timingSafeHexEqual(expected, sig)) {
-    log.warn('rejected bad signature', { repairId: input.repairId })
+    log.warn('rejected bad signature', { repairId: input.repairId, path: input.path })
     return { ok: false, status: 401, error: 'invalid signature' }
   }
   const fresh = await recordNonceIfFresh(nonce, now)
@@ -183,6 +228,38 @@ export async function verifySelfhealSignedRequest(
 /** sha256 hex of the raw body — the payload hash used for job idempotency. */
 export function bodyPayloadHash(rawBody: Buffer): string {
   return createHash('sha256').update(rawBody).digest('hex')
+}
+
+/** Shared id-shape constraint (safe as session-key / path components). */
+const SELFHEAL_ID_RE = /^[a-zA-Z0-9_.:-]{1,128}$/
+
+/**
+ * Parse a signed command body carrying ids only (cancel / release). Returns
+ * null on any deviation. `requireIncidentId` is set for cancel (the tombstone's
+ * NOT NULL incident_id comes from the body — design §A2).
+ */
+export function parseSelfhealIdBody(
+  raw: Buffer,
+  opts: { requireIncidentId?: boolean } = {},
+): { repairId: string; incidentId?: string } | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw.toString('utf8'))
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const p = parsed as Record<string, unknown>
+  if (typeof p.repairId !== 'string' || !SELFHEAL_ID_RE.test(p.repairId)) return null
+  if (opts.requireIncidentId) {
+    if (typeof p.incidentId !== 'string' || !SELFHEAL_ID_RE.test(p.incidentId)) return null
+    return { repairId: p.repairId, incidentId: p.incidentId }
+  }
+  if (p.incidentId !== undefined) {
+    if (typeof p.incidentId !== 'string' || !SELFHEAL_ID_RE.test(p.incidentId)) return null
+    return { repairId: p.repairId, incidentId: p.incidentId }
+  }
+  return { repairId: p.repairId }
 }
 
 /**
@@ -215,6 +292,8 @@ export async function receiveSelfhealDispatch(
   const verified = await verifySelfhealSignedRequest(
     {
       remoteAddress: input.remoteAddress,
+      method: input.method,
+      path: input.path,
       ts: input.ts,
       nonce: input.nonce,
       sig: input.sig,

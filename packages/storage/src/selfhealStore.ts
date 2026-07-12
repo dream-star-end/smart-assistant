@@ -56,6 +56,52 @@ function _onExit(): void {
   }
 }
 
+// Column body of selfheal_jobs — single source for CREATE TABLE and the
+// cancelling-CHECK rebuild guard below. `cancelling` is the durable
+// mid-teardown state of the cancel contract (design §A2): a live session's
+// cancel first CASes running→cancelling, and only a CONFIRMED teardown may CAS
+// cancelling→cancelled, so `terminated=true` is decidable across crashes.
+const SELFHEAL_JOBS_COLUMNS_DDL = `
+      repair_id    TEXT PRIMARY KEY,
+      incident_id  TEXT NOT NULL,
+      attempt      INTEGER NOT NULL DEFAULT 0,
+      payload_hash TEXT NOT NULL,
+      capability   TEXT,
+      status       TEXT NOT NULL DEFAULT 'received'
+                     CHECK (status IN ('received','starting','running','cancelling','succeeded','failed','cancelled')),
+      lease_owner  TEXT,
+      lease_until  INTEGER NOT NULL DEFAULT 0,
+      session_key  TEXT,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+`
+
+/**
+ * Idempotent schema guard: an older selfheal.db was created with a status CHECK
+ * that lacks 'cancelling'. SQLite cannot ALTER a CHECK, so rebuild the table
+ * (new table → copy → drop → rename) inside one transaction. Production never
+ * shipped the old schema (defensive only), but a dev DB may carry it.
+ */
+function ensureCancellingStatusSchema(db: Database.Database): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'selfheal_jobs'")
+    .get() as { sql: string } | undefined
+  if (!row || row.sql.includes("'cancelling'")) return
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE selfheal_jobs_rebuild (${SELFHEAL_JOBS_COLUMNS_DDL});
+      INSERT INTO selfheal_jobs_rebuild
+        SELECT repair_id, incident_id, attempt, payload_hash, capability, status,
+               lease_owner, lease_until, session_key, created_at, updated_at
+        FROM selfheal_jobs;
+      DROP TABLE selfheal_jobs;
+      ALTER TABLE selfheal_jobs_rebuild RENAME TO selfheal_jobs;
+      CREATE INDEX IF NOT EXISTS idx_selfheal_jobs_status ON selfheal_jobs(status);
+      CREATE INDEX IF NOT EXISTS idx_selfheal_jobs_lease ON selfheal_jobs(status, lease_until);
+    `)
+  })()
+}
+
 export async function getSelfhealDb(): Promise<Database.Database> {
   if (_db) return _db
   await mkdir(dirname(SELFHEAL_DB), { recursive: true })
@@ -65,20 +111,7 @@ export async function getSelfhealDb(): Promise<Database.Database> {
   // lets the rare writer overlap resolve instead of throwing SQLITE_BUSY.
   db.pragma('busy_timeout = 5000')
   db.exec(`
-    CREATE TABLE IF NOT EXISTS selfheal_jobs (
-      repair_id    TEXT PRIMARY KEY,
-      incident_id  TEXT NOT NULL,
-      attempt      INTEGER NOT NULL DEFAULT 0,
-      payload_hash TEXT NOT NULL,
-      capability   TEXT,
-      status       TEXT NOT NULL DEFAULT 'received'
-                     CHECK (status IN ('received','starting','running','succeeded','failed','cancelled')),
-      lease_owner  TEXT,
-      lease_until  INTEGER NOT NULL DEFAULT 0,
-      session_key  TEXT,
-      created_at   INTEGER NOT NULL,
-      updated_at   INTEGER NOT NULL
-    );
+    CREATE TABLE IF NOT EXISTS selfheal_jobs (${SELFHEAL_JOBS_COLUMNS_DDL});
     CREATE INDEX IF NOT EXISTS idx_selfheal_jobs_status ON selfheal_jobs(status);
     CREATE INDEX IF NOT EXISTS idx_selfheal_jobs_lease ON selfheal_jobs(status, lease_until);
 
@@ -125,6 +158,10 @@ export async function getSelfhealDb(): Promise<Database.Database> {
     );
   `)
 
+  // Schema guard: rebuild selfheal_jobs when an old DB lacks 'cancelling' in the
+  // status CHECK (the CREATE above no-ops on an existing table).
+  ensureCancellingStatusSchema(db)
+
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
     try {
@@ -162,9 +199,16 @@ export type SelfhealJobStatus =
   | 'received'
   | 'starting'
   | 'running'
+  /** Durable mid-teardown state: cancel of a LIVE session parks here until the
+   *  teardown is CONFIRMED, then CASes to 'cancelled'. Crash-safe: a re-received
+   *  cancel resumes the teardown from this state. */
+  | 'cancelling'
   | 'succeeded'
   | 'failed'
   | 'cancelled'
+
+/** Job states under which turn execution may proceed (the SQLite-side fence). */
+const EXECUTABLE_JOB_STATES: SelfhealJobStatus[] = ['starting', 'running']
 
 export interface SelfhealJob {
   repairId: string
@@ -231,7 +275,9 @@ function rowToJob(r: JobRow): SelfhealJob {
 export async function recordNonceIfFresh(nonce: string, now = Date.now()): Promise<boolean> {
   const db = await getSelfhealDb()
   const res = db
-    .prepare('INSERT INTO selfheal_nonces (nonce, seen_at) VALUES (?, ?) ON CONFLICT(nonce) DO NOTHING')
+    .prepare(
+      'INSERT INTO selfheal_nonces (nonce, seen_at) VALUES (?, ?) ON CONFLICT(nonce) DO NOTHING',
+    )
     .run(nonce, now)
   return res.changes > 0
 }
@@ -305,6 +351,48 @@ export async function getJob(repairId: string): Promise<SelfhealJob | null> {
     | JobRow
     | undefined
   return row ? rowToJob(row) : null
+}
+
+/** List jobs currently in any of the given states (cancel/ops introspection). */
+export async function listJobsByStatus(statuses: SelfhealJobStatus[]): Promise<SelfhealJob[]> {
+  if (statuses.length === 0) return []
+  const db = await getSelfhealDb()
+  const placeholders = statuses.map(() => '?').join(',')
+  const rows = db
+    .prepare(
+      `SELECT * FROM selfheal_jobs WHERE status IN (${placeholders}) ORDER BY created_at ASC`,
+    )
+    .all(...statuses) as JobRow[]
+  return rows.map(rowToJob)
+}
+
+/**
+ * Cancel tombstone for a repair the gateway has never seen (design §A2 case ①):
+ * an UNKNOWN repairId being cancelled atomically inserts a terminal 'cancelled'
+ * row so a LATE dispatch for the same repair can never start executing (the
+ * receiver's payload-hash check turns it into a 409 conflict). Returns true when
+ * THIS call inserted the tombstone; false when the repair row already existed
+ * (caller re-reads and follows the normal cancel path).
+ *
+ * NOT NULL column values are fixed by the contract: incident_id = the cancel
+ * body's incidentId, attempt = 0, payload_hash = 'tombstone'.
+ */
+export async function insertCancelTombstone(input: {
+  repairId: string
+  incidentId: string
+  now?: number
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const now = input.now ?? Date.now()
+  const res = db
+    .prepare(`
+      INSERT INTO selfheal_jobs
+        (repair_id, incident_id, attempt, payload_hash, capability, status, lease_owner, lease_until, session_key, created_at, updated_at)
+      VALUES (?, ?, 0, 'tombstone', NULL, 'cancelled', NULL, 0, NULL, ?, ?)
+      ON CONFLICT(repair_id) DO NOTHING
+    `)
+    .run(input.repairId, input.incidentId, now, now)
+  return res.changes > 0
 }
 
 /**
@@ -471,6 +559,10 @@ export async function setJobStatus(
 export type EnqueueExecutionResult =
   | { outcome: 'enqueued'; execution: SelfhealExecution } // fresh — accepted + queued written
   | { outcome: 'exists'; execution: SelfhealExecution } // already accepted/running/done/failed
+  /** Fence rejection (design §A2): the owning job is absent or not in an
+   *  executable state (starting/running) — e.g. cancelled between the worker's
+   *  CAS and this enqueue. Nothing is written; the turn must never run. */
+  | { outcome: 'rejected'; reason: string }
 
 /**
  * The at-most-once commit point. In ONE transaction, INSERT the execution row
@@ -482,6 +574,13 @@ export type EnqueueExecutionResult =
  * Idempotent on execution_id: a second call for an existing execution returns
  * `{ exists }` and writes nothing (never a second queue row → never a second
  * turn).
+ *
+ * Cancel fence (design §A2, second line of defense behind the per-repair
+ * mutex): execution_id doubles as the repair_id, and a NEW enqueue is only
+ * allowed while the owning selfheal_job is in an executable state
+ * ('starting'/'running') — checked INSIDE this same transaction, so a cancel
+ * that already CASed the job to cancelling/cancelled can never be raced into a
+ * fresh turn.
  */
 export async function enqueueExecution(input: {
   executionId: string
@@ -512,6 +611,16 @@ export async function enqueueExecution(input: {
           createdAt: existing.created_at,
           updatedAt: existing.updated_at,
         },
+      }
+    }
+    // Cancel fence: only an executable job may enqueue a fresh turn (see doc).
+    const job = db
+      .prepare('SELECT status FROM selfheal_jobs WHERE repair_id = ?')
+      .get(input.executionId) as { status: SelfhealJobStatus } | undefined
+    if (!job || !EXECUTABLE_JOB_STATES.includes(job.status)) {
+      return {
+        outcome: 'rejected',
+        reason: job ? `job status is '${job.status}'` : 'no job row for execution',
       }
     }
     db.prepare(`
@@ -548,14 +657,25 @@ export async function enqueueExecution(input: {
  * given execution_id. A crash BEFORE this claim leaves the row 'queued' (a later
  * re-drive wins → no swallow); a crash AFTER this claim leaves it 'consumed' (a
  * later re-drive loses → no double-execute).
+ *
+ * Cancel fence (design §A2, mirrors enqueueExecution): the claim additionally
+ * requires the owning selfheal_job to still be in an executable state
+ * ('starting'/'running') INSIDE this transaction — a job CASed to
+ * cancelling/cancelled can never have its queued turn consumed (zero submit).
  */
 export async function claimQueuedTurn(executionId: string, now = Date.now()): Promise<boolean> {
   const db = await getSelfhealDb()
   const txn = db.transaction((): boolean => {
     const res = db
-      .prepare(
-        "UPDATE durable_turn_queue SET status = 'consumed' WHERE execution_id = ? AND status = 'queued'",
-      )
+      .prepare(`
+        UPDATE durable_turn_queue SET status = 'consumed'
+        WHERE execution_id = ? AND status = 'queued'
+          AND EXISTS (
+            SELECT 1 FROM selfheal_jobs j
+            WHERE j.repair_id = durable_turn_queue.execution_id
+              AND j.status IN ('starting','running')
+          )
+      `)
       .run(executionId)
     if (res.changes === 0) return false
     db.prepare(
@@ -602,16 +722,16 @@ export async function setExecutionStatus(
   status: SelfhealExecutionStatus,
 ): Promise<void> {
   const db = await getSelfhealDb()
-  db.prepare('UPDATE selfheal_executions SET status = ?, updated_at = ? WHERE execution_id = ?').run(
-    status,
-    Date.now(),
-    executionId,
-  )
+  db.prepare(
+    'UPDATE selfheal_executions SET status = ?, updated_at = ? WHERE execution_id = ?',
+  ).run(status, Date.now(), executionId)
 }
 
 export async function getExecution(executionId: string): Promise<SelfhealExecution | null> {
   const db = await getSelfhealDb()
-  const row = db.prepare('SELECT * FROM selfheal_executions WHERE execution_id = ?').get(executionId) as
+  const row = db
+    .prepare('SELECT * FROM selfheal_executions WHERE execution_id = ?')
+    .get(executionId) as
     | {
         execution_id: string
         status: SelfhealExecutionStatus
@@ -699,4 +819,68 @@ export async function finalizeBrokerAction(
 export async function releaseBrokerClaim(claimKey: string): Promise<void> {
   const db = await getSelfhealDb()
   db.prepare("DELETE FROM broker_actions WHERE claim_key = ? AND status = 'claimed'").run(claimKey)
+}
+
+export interface BrokerActionRecord {
+  claimKey: string
+  repairId: string
+  actionKind: string
+  paramsHash: string
+  status: 'claimed' | 'committed'
+  response: string | null
+  claimedAt: number
+  updatedAt: number
+}
+
+/** Read one broker action record (release path re-verifies the durable
+ *  pending_release cutover record through this). */
+export async function getBrokerAction(claimKey: string): Promise<BrokerActionRecord | null> {
+  const db = await getSelfhealDb()
+  const row = db
+    .prepare(
+      'SELECT claim_key, repair_id, action_kind, params_hash, status, response, claimed_at, updated_at FROM broker_actions WHERE claim_key = ?',
+    )
+    .get(claimKey) as
+    | {
+        claim_key: string
+        repair_id: string
+        action_kind: string
+        params_hash: string
+        status: 'claimed' | 'committed'
+        response: string | null
+        claimed_at: number
+        updated_at: number
+      }
+    | undefined
+  if (!row) return null
+  return {
+    claimKey: row.claim_key,
+    repairId: row.repair_id,
+    actionKind: row.action_kind,
+    paramsHash: row.params_hash,
+    status: row.status,
+    response: row.response,
+    claimedAt: row.claimed_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+/**
+ * Overwrite the recorded response of a COMMITTED action (observability update —
+ * e.g. a cutover that was held 'pending_release' later gets released and its
+ * durable record should reflect 'deployed'). Never touches 'claimed' rows (that
+ * is {@link finalizeBrokerAction}'s job). Returns true if a row was updated.
+ */
+export async function overwriteBrokerActionResponse(
+  claimKey: string,
+  response: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      "UPDATE broker_actions SET response = ?, updated_at = ? WHERE claim_key = ? AND status = 'committed'",
+    )
+    .run(response, now, claimKey)
+  return res.changes > 0
 }

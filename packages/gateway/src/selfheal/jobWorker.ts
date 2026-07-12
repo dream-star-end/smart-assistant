@@ -24,6 +24,7 @@ import {
   type SelfhealJob,
   claimNextJob,
   getExecution,
+  getJob,
   reclaimOrphanedLeases,
   releaseJobLeasesForOwner,
   renewJobLease,
@@ -38,7 +39,14 @@ import {
   buildRepairPrompt,
   createRepairTurnSink,
   selfhealSessionKey,
+  withRepairLock,
 } from './executionLedger.js'
+import { selfhealSignedString } from './receiver.js'
+import {
+  type PrepareCloneOpts,
+  type PrepareCloneResult,
+  prepareClone as defaultPrepareClone,
+} from './verifier.js'
 
 const log = createLogger({ module: 'selfheal-jobworker' })
 
@@ -46,6 +54,7 @@ const POLL_INTERVAL_MS = 5_000
 const LEASE_MS = 10 * 60_000
 const LEASE_RENEW_MS = 2 * 60_000
 const CAPABILITY_FETCH_TIMEOUT_MS = 15_000
+const REPORT_TIMEOUT_MS = 10_000
 
 export interface SelfhealJobWorkerDeps {
   sessions: SessionManager
@@ -55,6 +64,18 @@ export interface SelfhealJobWorkerDeps {
   callbackBaseUrl: string
   /** OC_SELFHEAL_WEBHOOK_HMAC — shared secret for signing the capability fetch. */
   hmacSecret: string
+  /** Canonical v5 checkout the per-repair clone is built FROM (block C2). */
+  canonicalRepo: string
+  /** Branch checked out in the per-repair clone. */
+  canonicalBranch: string
+  /** OC_SELFHEAL_OCHEAL_UID / _GID — the de-privileged owner of the clone.
+   *  Absent ⇒ clone preparation fails closed (job → failed). */
+  ochealUid?: number
+  ochealGid?: number
+  /** Injectable clone builder (tests). Defaults to verifier.prepareClone. */
+  prepareClone?: (opts: PrepareCloneOpts) => Promise<PrepareCloneResult>
+  /** Injectable fetch (tests). Defaults to global fetch. */
+  fetchImpl?: typeof fetch
 }
 
 /** Build worker deps from env, or null when the feature is not fully configured. */
@@ -65,21 +86,43 @@ export function getSelfhealJobWorkerDeps(
   const callbackBaseUrl = env.OC_SELFHEAL_CALLBACK_URL?.trim()
   const hmacSecret = env.OC_SELFHEAL_WEBHOOK_HMAC?.trim()
   if (!callbackBaseUrl || !hmacSecret) return null
-  return { ...base, callbackBaseUrl, hmacSecret }
+  const uid = Number(env.OC_SELFHEAL_OCHEAL_UID)
+  const gid = Number(env.OC_SELFHEAL_OCHEAL_GID)
+  return {
+    ...base,
+    callbackBaseUrl,
+    hmacSecret,
+    canonicalRepo: env.OC_SELFHEAL_CANONICAL_DIR?.trim() || '/opt/openclaude/openclaude-v5-aurora',
+    canonicalBranch: env.OC_SELFHEAL_CANONICAL_BRANCH?.trim() || 'feat/v5-aurora-rewrite',
+    ochealUid: Number.isInteger(uid) ? uid : undefined,
+    ochealGid: Number.isInteger(gid) ? gid : undefined,
+  }
 }
 
-/** Sign an outbound self-heal request the same way the receiver verifies inbound. */
+/**
+ * Sign an outbound self-heal request the same way the v5 master verifies it —
+ * the route-bound HMAC contract shared with the receiver (design §A6/M3):
+ * `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`.
+ */
 export function signSelfhealRequest(
   hmacSecret: string,
-  repairId: string,
-  rawBody: Buffer,
+  input: { method: string; path: string; repairId: string; rawBody: Buffer },
   now = Date.now(),
 ): { ts: string; nonce: string; sig: string } {
   const ts = String(now)
   const nonce = randomBytes(16).toString('hex')
-  const bodySha256 = createHash('sha256').update(rawBody).digest('hex')
+  const bodySha256 = createHash('sha256').update(input.rawBody).digest('hex')
   const sig = createHmac('sha256', hmacSecret)
-    .update(`${ts}.${nonce}.${repairId}.${bodySha256}`)
+    .update(
+      selfhealSignedString({
+        method: input.method,
+        path: input.path,
+        ts,
+        nonce,
+        repairId: input.repairId,
+        bodySha256,
+      }),
+    )
     .digest('hex')
   return { ts, nonce, sig }
 }
@@ -192,7 +235,21 @@ export class SelfhealJobWorker {
       return
     }
 
-    // 3. Deterministic session (stable across restarts → idempotent recovery).
+    // 3. Independent, de-privileged clone BEFORE any submit (block C2): the
+    //    codex works only inside /home/ocheal/selfheal/<repairId>. Root prepares
+    //    it here (verifier.prepareClone is idempotent for crash re-drives).
+    //    Failure ⇒ job failed + best-effort failed-callback to v5.
+    let clonePath: string
+    try {
+      clonePath = await this.ensureRepairClone(repairId)
+    } catch (err) {
+      log.error('repair clone preparation failed', { repairId }, err as Error)
+      await setJobStatus(repairId, 'failed', ['starting', 'running'])
+      this.reportFailed(repairId, capability, 'prepare clone failed').catch(() => {})
+      return
+    }
+
+    // 4. Deterministic session (stable across restarts → idempotent recovery).
     const sessionKey = selfhealSessionKey(repairId)
     const session = await this.deps.sessions.getOrCreate({
       sessionKey,
@@ -203,24 +260,113 @@ export class SelfhealJobWorker {
     })
     await setJobSessionKey(repairId, sessionKey)
 
-    // 4. Drive the turn under a renewed lease. submitWithExecutionId is the
-    //    at-most-once收口: enqueue(accepted+queued) then CAS-consume then submit.
-    await setJobStatus(repairId, 'running', ['starting', 'running'])
-    const leaseTimer = this.startLeaseRenew(repairId)
+    // 5. Execution-side fence (design §A2): the starting→running CAS and the
+    //    turn initiation happen inside the per-repair mutex — the SAME lock the
+    //    cancel path holds for its CAS + teardown. Cancel-first ⇒ the guarded
+    //    CAS below loses (its return value is CHECKED), the session is destroyed
+    //    and ZERO turns are submitted. Worker-first ⇒ cancel serializes behind
+    //    us, finds the live session and tears it down. The residual sliver
+    //    between lock release and runner registration is closed by the
+    //    SQLite-transaction guards (enqueue/claim re-check job status in-txn).
     const sink = createRepairTurnSink()
+    type TurnResult = { executionId: string; status: string; ranHere: boolean }
+    // The critical section returns a WRAPPED promise handle (never the bare
+    // promise — async flattening would make the lock wait for the whole turn,
+    // deadlocking the cancel path that needs this same lock for teardown).
+    const started = await withRepairLock(
+      repairId,
+      async (): Promise<{ turn: Promise<TurnResult> } | null> => {
+        // Guarded CAS *is* the fresh-state terminal check: one atomic UPDATE
+        // that only applies while the job is still executable. A cancel that
+        // already moved the job to cancelling/cancelled makes this return false.
+        const cas = await setJobStatus(repairId, 'running', ['starting', 'running'])
+        if (!cas) {
+          const now = await getJob(repairId)
+          log.info('repair CAS lost to cancel — destroying session, zero submit', {
+            repairId,
+            status: now?.status,
+          })
+          await this.teardownSessionQuiet(sessionKey, repairId)
+          return null
+        }
+        // Initiate the turn INSIDE the lock (do not await the full turn here —
+        // cancel must be able to take this lock to tear a live turn down).
+        return {
+          turn: this.deps.sessions.submitWithExecutionId(
+            session,
+            buildRepairPrompt(repairId, clonePath),
+            repairId,
+            sink.onEvent,
+          ),
+        }
+      },
+    )
+    if (!started) return // cancelled — the cancel path owns the job status
+
+    // 6. Await the turn under a renewed lease and settle the job status.
+    const leaseTimer = this.startLeaseRenew(repairId)
     try {
-      const result = await this.deps.sessions.submitWithExecutionId(
-        session,
-        buildRepairPrompt(repairId),
-        repairId,
-        sink.onEvent,
-      )
+      const result = await started.turn
       await this.finalizeJob(repairId, result, sink.getError())
     } catch (err) {
       log.error('repair turn threw', { repairId }, err as Error)
       await setJobStatus(repairId, 'failed', ['starting', 'running'])
     } finally {
       clearInterval(leaseTimer)
+    }
+  }
+
+  /** Build (or reuse) the per-repair de-privileged clone. Fails closed when the
+   *  ocheal uid/gid are not configured (the clone MUST be ocheal-owned). */
+  private async ensureRepairClone(repairId: string): Promise<string> {
+    const { ochealUid, ochealGid, canonicalRepo, canonicalBranch } = this.deps
+    if (ochealUid === undefined || ochealGid === undefined) {
+      throw new Error(
+        'OC_SELFHEAL_OCHEAL_UID/OC_SELFHEAL_OCHEAL_GID not configured — refusing to build a root-owned repair clone',
+      )
+    }
+    const prepare = this.deps.prepareClone ?? defaultPrepareClone
+    const { clonePath } = await prepare({
+      repairId,
+      canonicalRepo,
+      canonicalBranch,
+      ochealUid,
+      ochealGid,
+    })
+    return clonePath
+  }
+
+  /** Best-effort teardown of a session we must not run (cancel won the fence). */
+  private async teardownSessionQuiet(sessionKey: string, repairId: string): Promise<void> {
+    try {
+      this.deps.sessions.interrupt(sessionKey)
+    } catch {
+      /* no live turn — fine */
+    }
+    try {
+      await this.deps.sessions.destroySession(sessionKey)
+    } catch (err) {
+      log.warn('post-cancel session teardown failed', { repairId, sessionKey }, err)
+    }
+  }
+
+  /** Best-effort failed-callback to the v5 master (capability-authenticated). */
+  private async reportFailed(repairId: string, capability: string, message: string): Promise<void> {
+    const f = this.deps.fetchImpl ?? fetch
+    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/failed`
+    try {
+      await f(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${capability}`,
+        },
+        body: JSON.stringify({ message }),
+        redirect: 'manual',
+        signal: AbortSignal.timeout(REPORT_TIMEOUT_MS),
+      })
+    } catch (err) {
+      log.warn('failed-callback to v5 did not go through', { repairId }, err)
     }
   }
 
@@ -273,11 +419,18 @@ export class SelfhealJobWorker {
   private async fetchCapability(repairId: string): Promise<string> {
     const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/claim-capability`
     const rawBody = Buffer.from('{}', 'utf8')
-    const { ts, nonce, sig } = signSelfhealRequest(this.deps.hmacSecret, repairId, rawBody)
+    // Route-bound signature: METHOD + the exact pathname the master sees.
+    const { ts, nonce, sig } = signSelfhealRequest(this.deps.hmacSecret, {
+      method: 'POST',
+      path: new URL(url).pathname,
+      repairId,
+      rawBody,
+    })
     const ctrl = new AbortController()
     const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
     try {
-      const res = await fetch(url, {
+      const f = this.deps.fetchImpl ?? fetch
+      const res = await f(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

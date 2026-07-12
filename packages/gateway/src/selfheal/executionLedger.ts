@@ -29,16 +29,56 @@ export function selfhealSessionKey(repairId: string): string {
 }
 
 /**
- * Minimal, injection-free repair prompt. Only the constrained repairId is
- * interpolated — NO free text from the dispatch payload ever reaches the model
- * (the payload carries ids only, and repairId is regex-validated at intake).
- * All incident context is pulled by the agent itself via the read-only v5
- * context callback (contract §拉上下文), gated by its short-lived capability.
+ * Per-repair keyed async mutex (design §A2 execution-side fence). The jobWorker
+ * holds this lock across its terminal-state CAS + turn initiation, and the
+ * cancel path holds the SAME lock across its status CAS + session teardown, so
+ * the two can never interleave inside a repair: cancel-first ⇒ the worker's CAS
+ * loses and zero turns are submitted; worker-first ⇒ cancel sees the live
+ * session and tears it down before confirming `terminated`.
+ *
+ * Single-process premise (registered constraint): the personal gateway is one
+ * node process (better-sqlite3 in-process); if it ever goes multi-process this
+ * must be upgraded to a cross-process flock. The SQLite-transaction guards in
+ * selfhealStore (enqueue/claim check job status) remain as the second fence.
  */
-export function buildRepairPrompt(repairId: string): string {
+const _repairLockTails = new Map<string, Promise<void>>()
+
+export function withRepairLock<T>(repairId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = _repairLockTails.get(repairId) ?? Promise.resolve()
+  // Run after the predecessor SETTLES (success or failure) — a crashed critical
+  // section must never wedge the lock.
+  const run = prev.then(fn, fn)
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  _repairLockTails.set(repairId, tail)
+  void tail.then(() => {
+    // GC the chain tail once no successor replaced it.
+    if (_repairLockTails.get(repairId) === tail) _repairLockTails.delete(repairId)
+  })
+  return run
+}
+
+/**
+ * Minimal, injection-free repair prompt. Only the constrained repairId and the
+ * root-controlled clone path are interpolated — NO free text from the dispatch
+ * payload ever reaches the model (the payload carries ids only, and repairId is
+ * regex-validated at intake). All incident context is pulled by the agent
+ * itself via `oc-selfheal context` (the broker holds the capability — the model
+ * never sees credentials of any kind).
+ */
+export function buildRepairPrompt(repairId: string, clonePath: string): string {
   return [
     `selfheal repair ${repairId}.`,
-    '严格按 skill v5-incident-repair 执行:先调用回调 ack,再拉取结构化上下文,按等级执行修复并回报 progress/verify/done。',
+    `工作目录(独立 clone,已就绪):${clonePath}`,
+    '所有代码调查、修改、git commit 都只在该目录内进行;不得触碰 canonical 仓库或其它路径。',
+    '特权操作与回报一律通过 `oc-selfheal` CLI(它只连 broker socket;你不持有任何凭据):',
+    `  oc-selfheal context ${repairId}                     拉取结构化事件上下文`,
+    `  oc-selfheal report ${repairId} progress|done|failed <message>   回报进度/终态`,
+    `  oc-selfheal verify ${repairId} <sha>                对 clone 内 commit 跑降权四层验证`,
+    `  oc-selfheal cutover ${repairId} <sha>               验证通过后申请上线(默认停在待人工放行)`,
+    '严格按 skill v5-incident-repair 执行:先 report progress 确认接单,再 context 拉上下文,按等级修复;红线禁区以该 skill 为准。',
   ].join('\n')
 }
 

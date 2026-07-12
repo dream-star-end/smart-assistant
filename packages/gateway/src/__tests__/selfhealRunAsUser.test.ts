@@ -202,7 +202,11 @@ describe('CodexAppServerRunner spawn privilege drop', () => {
     assert.ok(args.includes('--clear-groups'), 'supplementary groups must be cleared')
     assert.equal(args[args.indexOf('--reuid') + 1], '997', 'setpriv must drop to ocheal uid')
     assert.equal(args[args.indexOf('--regid') + 1], '998', 'setpriv must drop to ocheal gid')
-    assert.equal(args[args.indexOf('--') + 1], 'codex', 'codex must be the wrapped command after --')
+    assert.equal(
+      args[args.indexOf('--') + 1],
+      'codex',
+      'codex must be the wrapped command after --',
+    )
     // Node uid/gid options must NOT also be set (setpriv performs the drop).
     assert.equal(opts.uid, undefined)
     assert.equal(opts.gid, undefined)

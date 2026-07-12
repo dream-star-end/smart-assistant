@@ -23,9 +23,13 @@ const {
   claimQueuedTurn,
   closeSelfhealDb,
   enqueueExecution,
+  getBrokerAction,
   getExecution,
   getJob,
+  insertCancelTombstone,
   insertJobReceived,
+  listJobsByStatus,
+  overwriteBrokerActionResponse,
   purgeExpiredNonces,
   reclaimOrphanedLeases,
   recordNonceIfFresh,
@@ -42,6 +46,20 @@ const {
 after(async () => {
   await closeSelfhealDb()
 })
+
+/**
+ * Block C fence (design §A2): enqueueExecution/claimQueuedTurn now REQUIRE an
+ * owning selfheal_job in an executable state ('starting'/'running'). This
+ * helper stages such a job for the execution-ledger tests. It claims with a
+ * REAL wall-clock lease so the job is never a claimable candidate for the
+ * synthetic-`now` lease tests later in this file.
+ */
+async function stageRunningJob(repairId: string): Promise<void> {
+  await insertJobReceived({ repairId, incidentId: 'i', attempt: 0, payloadHash: 'p' })
+  const claimed = await claimNextJob({ owner: 'fence-setup', leaseMs: 3_600_000, now: Date.now() })
+  assert.equal(claimed?.repairId, repairId, 'fence setup must claim the staged job')
+  assert.equal(await setJobStatus(repairId, 'running', ['starting']), true)
+}
 
 describe('insertJobReceived — idempotency & conflict', () => {
   it('inserts a fresh repair', async () => {
@@ -146,16 +164,19 @@ describe('setJobStatus — guarded transitions', () => {
 })
 
 describe('enqueueExecution + claimQueuedTurn — at-most-once', () => {
+  // Block C semantics change: both now require the owning job to be in an
+  // executable state (fence, design §A2) — hence stageRunningJob per id.
   it('enqueues accepted + queued atomically on first call', async () => {
+    await stageRunningJob('e1')
     const r = await enqueueExecution({ executionId: 'e1', sessionKey: 'selfheal:e1' })
     assert.equal(r.outcome, 'enqueued')
-    assert.equal(r.execution.status, 'accepted')
+    assert.equal(r.outcome === 'enqueued' && r.execution.status, 'accepted')
   })
 
   it('is idempotent — a second enqueue does not create a second turn', async () => {
     const r = await enqueueExecution({ executionId: 'e1', sessionKey: 'selfheal:e1' })
     assert.equal(r.outcome, 'exists')
-    assert.equal(r.execution.status, 'accepted')
+    assert.equal(r.outcome === 'exists' && r.execution.status, 'accepted')
   })
 
   it('exactly one caller wins the turn claim; execution flips to running', async () => {
@@ -172,6 +193,7 @@ describe('enqueueExecution + claimQueuedTurn — at-most-once', () => {
 
   it('a crash BEFORE consume is re-drained (queued survives → claim wins)', async () => {
     // Enqueue but never claim → simulates crash after accept, before consume.
+    await stageRunningJob('e2')
     const r = await enqueueExecution({ executionId: 'e2', sessionKey: 'selfheal:e2' })
     assert.equal(r.outcome, 'enqueued')
     // Re-drive: the queued row is still there, so the claim must win — no swallow.
@@ -185,9 +207,102 @@ describe('enqueueExecution + claimQueuedTurn — at-most-once', () => {
   })
 })
 
+describe('execution fence (design §A2) — job status guards inside the txn', () => {
+  it('rejects an enqueue when no job row exists for the execution', async () => {
+    const r = await enqueueExecution({ executionId: 'fence-nojob', sessionKey: 'k' })
+    assert.equal(r.outcome, 'rejected')
+  })
+
+  it('rejects an enqueue once the job is cancelled (zero submit)', async () => {
+    await stageRunningJob('fence-cxl')
+    assert.equal(await setJobStatus('fence-cxl', 'cancelled', ['starting', 'running']), true)
+    const r = await enqueueExecution({ executionId: 'fence-cxl', sessionKey: 'k' })
+    assert.equal(r.outcome, 'rejected')
+  })
+
+  it('blocks claimQueuedTurn after the job leaves starting/running (late claim)', async () => {
+    await stageRunningJob('fence-late')
+    const r = await enqueueExecution({ executionId: 'fence-late', sessionKey: 'k' })
+    assert.equal(r.outcome, 'enqueued')
+    // Cancel wins between enqueue and claim (the exact「取消后迟到 submit」window).
+    assert.equal(await setJobStatus('fence-late', 'cancelling', ['starting', 'running']), true)
+    assert.equal(await claimQueuedTurn('fence-late'), false, 'cancelling job must not claim')
+    assert.equal(await setJobStatus('fence-late', 'cancelled', ['cancelling']), true)
+    assert.equal(await claimQueuedTurn('fence-late'), false, 'cancelled job must not claim')
+    // The execution never ran.
+    assert.equal((await getExecution('fence-late'))?.status, 'accepted')
+  })
+})
+
+describe('cancel tombstone + cancelling state (design §A2)', () => {
+  it('tombstones an unknown repair with the contract NOT NULL values', async () => {
+    assert.equal(await insertCancelTombstone({ repairId: 'tomb-1', incidentId: 'inc-t1' }), true)
+    const job = await getJob('tomb-1')
+    assert.equal(job?.status, 'cancelled')
+    assert.equal(job?.incidentId, 'inc-t1')
+    assert.equal(job?.attempt, 0)
+    assert.equal(job?.payloadHash, 'tombstone')
+  })
+
+  it('is single-winner: a second tombstone insert loses', async () => {
+    assert.equal(await insertCancelTombstone({ repairId: 'tomb-1', incidentId: 'inc-t1' }), false)
+  })
+
+  it('never clobbers an existing job row', async () => {
+    await insertJobReceived({ repairId: 'tomb-2', incidentId: 'i', attempt: 3, payloadHash: 'h' })
+    assert.equal(await insertCancelTombstone({ repairId: 'tomb-2', incidentId: 'x' }), false)
+    const job = await getJob('tomb-2')
+    assert.equal(job?.status, 'received')
+    assert.equal(job?.attempt, 3)
+    await setJobStatus('tomb-2', 'succeeded')
+  })
+
+  it('a LATE dispatch for a tombstoned repair is a payload conflict (never executes)', async () => {
+    const r = await insertJobReceived({
+      repairId: 'tomb-1',
+      incidentId: 'inc-t1',
+      attempt: 0,
+      payloadHash: 'real-dispatch-hash',
+    })
+    assert.equal(r.outcome, 'conflict')
+  })
+
+  it("'cancelling' is a legal durable state and only teardown-confirm reaches 'cancelled'", async () => {
+    await insertJobReceived({ repairId: 'cxl-1', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    assert.equal(
+      await setJobStatus('cxl-1', 'cancelling', ['received', 'starting', 'running']),
+      true,
+    )
+    assert.equal((await getJob('cxl-1'))?.status, 'cancelling')
+    // listJobsByStatus sees it (retry-cancel discovery surface).
+    const stuck = await listJobsByStatus(['cancelling'])
+    assert.ok(stuck.some((j) => j.repairId === 'cxl-1'))
+    // A worker CAS (starting/running guard) must NOT resurrect it.
+    assert.equal(await setJobStatus('cxl-1', 'running', ['starting', 'running']), false)
+    assert.equal(await setJobStatus('cxl-1', 'cancelled', ['cancelling']), true)
+    assert.equal((await getJob('cxl-1'))?.status, 'cancelled')
+  })
+
+  it('a cancelling job is NOT claimable by the worker loop', async () => {
+    await insertJobReceived({ repairId: 'cxl-2', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    assert.equal(await setJobStatus('cxl-2', 'cancelling'), true)
+    // Even with a synthetic far-future now (any expired-lease window), a
+    // cancelling job never comes back to a worker.
+    const claimed = await claimNextJob({ owner: 'w-cxl', leaseMs: 1000, now: 9_000_000 })
+    assert.notEqual(claimed?.repairId, 'cxl-2')
+    if (claimed) await setJobStatus(claimed.repairId, 'succeeded')
+    await setJobStatus('cxl-2', 'cancelled', ['cancelling'])
+  })
+})
+
 describe('reclaimOrphanedLeases — expired-only (Codex HIGH #10)', () => {
   it('does NOT reclaim a still-FRESH lease (a live worker must not be clobbered)', async () => {
-    await insertJobReceived({ repairId: 'live-lease', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    await insertJobReceived({
+      repairId: 'live-lease',
+      incidentId: 'i',
+      attempt: 0,
+      payloadHash: 'p',
+    })
     const now = 3_000_000
     const claimed = await claimNextJob({ owner: 'liveworker', leaseMs: 600_000, now })
     assert.equal(claimed?.repairId, 'live-lease')
@@ -233,7 +348,9 @@ describe('releaseJobLeasesForOwner — graceful shutdown fast recovery', () => {
 })
 
 describe('reopenExecutionForRedrive — crash-mid-turn re-run (Codex HIGH #9)', () => {
+  // Block C: executions now need an executable owning job (fence) — staged here.
   it('re-opens a running execution so a re-drive re-runs (no swallow)', async () => {
+    await stageRunningJob('rex')
     await enqueueExecution({ executionId: 'rex', sessionKey: 'selfheal:rex' })
     // Simulate a claimed-but-crashed attempt: queue consumed, execution running.
     assert.equal(await claimQueuedTurn('rex'), true)
@@ -246,6 +363,7 @@ describe('reopenExecutionForRedrive — crash-mid-turn re-run (Codex HIGH #9)', 
   })
 
   it('does NOT re-open a completed (done) execution — no re-run after success', async () => {
+    await stageRunningJob('rex2')
     await enqueueExecution({ executionId: 'rex2', sessionKey: 'selfheal:rex2' })
     await claimQueuedTurn('rex2')
     await setExecutionStatus('rex2', 'done')
@@ -303,26 +421,110 @@ describe('broker action claim — atomic single-winner idempotency', () => {
 
   it('same key with a different params hash is a conflict (not a silent replay)', async () => {
     const k = 'b2:clean_disk'
-    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b2', actionKind: 'clean_disk', paramsHash: 'A' })).outcome, 'won')
+    assert.equal(
+      (
+        await tryClaimBrokerAction({
+          claimKey: k,
+          repairId: 'b2',
+          actionKind: 'clean_disk',
+          paramsHash: 'A',
+        })
+      ).outcome,
+      'won',
+    )
     await finalizeBrokerAction(k, JSON.stringify({ ok: true, status: 'cleaned' }))
-    const conflict = await tryClaimBrokerAction({ claimKey: k, repairId: 'b2', actionKind: 'clean_disk', paramsHash: 'B' })
+    const conflict = await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b2',
+      actionKind: 'clean_disk',
+      paramsHash: 'B',
+    })
     assert.equal(conflict.outcome, 'conflict')
   })
 
   it('a released (non-committed) claim can be re-claimed', async () => {
     const k = 'b3:switch_node'
-    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b3', actionKind: 'switch_node', paramsHash: 'h' })).outcome, 'won')
+    assert.equal(
+      (
+        await tryClaimBrokerAction({
+          claimKey: k,
+          repairId: 'b3',
+          actionKind: 'switch_node',
+          paramsHash: 'h',
+        })
+      ).outcome,
+      'won',
+    )
     await releaseBrokerClaim(k)
     // After release, a fresh claim wins again (validation-reject retry path).
-    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b3', actionKind: 'switch_node', paramsHash: 'h' })).outcome, 'won')
+    assert.equal(
+      (
+        await tryClaimBrokerAction({
+          claimKey: k,
+          repairId: 'b3',
+          actionKind: 'switch_node',
+          paramsHash: 'h',
+        })
+      ).outcome,
+      'won',
+    )
   })
 
   it('release must NOT remove a committed side effect', async () => {
     const k = 'b4:cutover'
-    await tryClaimBrokerAction({ claimKey: k, repairId: 'b4', actionKind: 'cutover', paramsHash: 'h' })
+    await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b4',
+      actionKind: 'cutover',
+      paramsHash: 'h',
+    })
     await finalizeBrokerAction(k, JSON.stringify({ ok: false, status: 'deployed' }))
     await releaseBrokerClaim(k) // no-op on a committed row
-    const after = await tryClaimBrokerAction({ claimKey: k, repairId: 'b4', actionKind: 'cutover', paramsHash: 'h' })
+    const after = await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b4',
+      actionKind: 'cutover',
+      paramsHash: 'h',
+    })
     assert.equal(after.outcome, 'replay')
+  })
+})
+
+describe('broker action record read/overwrite (release path, block C)', () => {
+  it('getBrokerAction reads the durable record; missing key is null', async () => {
+    const k = 'b5:cutover'
+    await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b5',
+      actionKind: 'cutover',
+      paramsHash: 'h',
+    })
+    let rec = await getBrokerAction(k)
+    assert.equal(rec?.status, 'claimed')
+    assert.equal(rec?.response, null)
+    await finalizeBrokerAction(k, JSON.stringify({ ok: false, status: 'pending_release' }))
+    rec = await getBrokerAction(k)
+    assert.equal(rec?.status, 'committed')
+    assert.equal(JSON.parse(rec?.response ?? '{}').status, 'pending_release')
+    assert.equal(await getBrokerAction('nope:cutover'), null)
+  })
+
+  it('overwriteBrokerActionResponse only touches COMMITTED rows', async () => {
+    const k = 'b5:cutover'
+    assert.equal(
+      await overwriteBrokerActionResponse(k, JSON.stringify({ ok: true, status: 'deployed' })),
+      true,
+    )
+    assert.equal(JSON.parse((await getBrokerAction(k))?.response ?? '{}').status, 'deployed')
+    // A still-claimed row must not be overwritten.
+    const kc = 'b6:cutover'
+    await tryClaimBrokerAction({
+      claimKey: kc,
+      repairId: 'b6',
+      actionKind: 'cutover',
+      paramsHash: 'h',
+    })
+    assert.equal(await overwriteBrokerActionResponse(kc, '{"status":"deployed"}'), false)
+    assert.equal((await getBrokerAction(kc))?.response, null)
   })
 })

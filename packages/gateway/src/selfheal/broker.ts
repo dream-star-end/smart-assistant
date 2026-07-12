@@ -38,7 +38,9 @@ import { dirname, join } from 'node:path'
 import {
   type BrokerClaimResult,
   finalizeBrokerAction,
+  getBrokerAction,
   getJob as getSelfhealJob,
+  overwriteBrokerActionResponse,
   releaseBrokerClaim,
   tryClaimBrokerAction,
 } from '@openclaude/storage'
@@ -50,10 +52,13 @@ import {
   type RunOpts,
   TIER1_ACTIONS,
 } from './brokerActions.js'
+import { listToolchainTouches } from './deployDriver.js'
 import {
   type SignedVerification,
+  type VerifyOutcome,
   defaultCommandRunner,
   loadSignedVerification,
+  verify as runVerification,
   stableStringify,
   verifySignature,
 } from './verifier.js'
@@ -61,7 +66,39 @@ import {
 const rootLog = createLogger({ module: 'selfheal-broker' })
 
 const CUTOVER_KIND = 'cutover'
+const CONTEXT_KIND = 'context'
+const VERIFY_KIND = 'verify'
+const REPORT_KIND = 'report'
+const RELEASE_CLAIM_KIND = 'release_approved'
 const MAX_REQUEST_BYTES = 64 * 1024
+const CALLBACK_TIMEOUT_MS = 20_000
+const MAX_CONTEXT_BYTES = 512 * 1024
+const DEFAULT_REPORT_MESSAGE_MAX = 2_000
+const DEFAULT_REPORT_DETAIL_MAX = 8_192
+
+/** Kinds whose claim key includes the params hash: they are legitimately called
+ *  multiple times with different params (a new sha to verify, a new progress
+ *  message) — identical retries replay, different params get a fresh claim.
+ *  Tier1 and cutover keep the strict one-claim-per-repair key. */
+const PARAMS_KEYED_KINDS = new Set([CONTEXT_KIND, VERIFY_KIND, REPORT_KIND])
+
+const REPORT_OUTCOMES = new Set(['progress', 'done', 'failed'])
+
+/** Conservative free-text redaction for report messages (design §A7/M4 scope —
+ *  applied here because report text is candidate/model-authored). */
+export function redactSelfhealText(input: string): string {
+  return input
+    .replace(/sk-\w{8,}/g, '[redacted]')
+    .replace(/Bearer\s+\S+/g, 'Bearer [redacted]')
+    .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, '[redacted]')
+    .replace(/xox[bap]-[A-Za-z0-9-]+/g, '[redacted]')
+    .replace(/AKIA[0-9A-Z]{16}/g, '[redacted]')
+    .replace(/\/\/([^/\s:@]+):([^/\s@]+)@/g, '//[redacted]@')
+    .replace(
+      /\b(password|passwd|secret|token|api[_-]?key)(["']?\s*[:=]\s*["']?)[^\s"'&]+/gi,
+      '$1$2[redacted]',
+    )
+}
 
 export interface BrokerRequest {
   repairId: string
@@ -125,6 +162,16 @@ export interface BrokerClaimStore {
   }): Promise<BrokerClaimResult>
   finalize(claimKey: string, response: string): Promise<void>
   release(claimKey: string): Promise<void>
+  /** Read one committed/claimed record (release path re-verifies the durable
+   *  pending_release cutover record through this). */
+  get(claimKey: string): Promise<{
+    paramsHash: string
+    status: 'claimed' | 'committed'
+    response: string | null
+  } | null>
+  /** Update the recorded response of a COMMITTED record (e.g. pending_release →
+   *  deployed after a one-click release). Never touches claimed rows. */
+  overwriteCommitted(claimKey: string, response: string): Promise<void>
 }
 
 /** Default durable store backed by the root-owned selfheal SQLite DB. */
@@ -132,6 +179,13 @@ export const durableBrokerClaimStore: BrokerClaimStore = {
   tryClaim: (input) => tryClaimBrokerAction(input),
   finalize: (claimKey, response) => finalizeBrokerAction(claimKey, response),
   release: (claimKey) => releaseBrokerClaim(claimKey),
+  get: async (claimKey) => {
+    const rec = await getBrokerAction(claimKey)
+    return rec ? { paramsHash: rec.paramsHash, status: rec.status, response: rec.response } : null
+  },
+  overwriteCommitted: async (claimKey, response) => {
+    await overwriteBrokerActionResponse(claimKey, response)
+  },
 }
 
 /** In-memory store for tests / ephemeral use only. NOT durable — a real broker
@@ -161,13 +215,33 @@ export class InMemoryBrokerClaimStore implements BrokerClaimStore {
     const cur = this.map.get(claimKey)
     if (cur && cur.response === undefined) this.map.delete(claimKey)
   }
+  async get(claimKey: string): Promise<{
+    paramsHash: string
+    status: 'claimed' | 'committed'
+    response: string | null
+  } | null> {
+    const cur = this.map.get(claimKey)
+    if (!cur) return null
+    return {
+      paramsHash: cur.paramsHash,
+      status: cur.response !== undefined ? 'committed' : 'claimed',
+      response: cur.response ?? null,
+    }
+  }
+  async overwriteCommitted(claimKey: string, response: string): Promise<void> {
+    const cur = this.map.get(claimKey)
+    if (cur && cur.response !== undefined) cur.response = response
+  }
 }
 
 // ── deploy driver ────────────────────────────────────────────────────────────
 
 /** Executes the trusted production cutover for a validated sha. Injectable so
  *  the default posture (auto-deploy off) and tests never touch prod. */
-export type DeployDriver = (sha: string, ctx: { log: Logger }) => Promise<BrokerResponse>
+export type DeployDriver = (
+  sha: string,
+  ctx: { log: Logger; repairId?: string },
+) => Promise<BrokerResponse>
 
 export interface SelfhealBrokerOpts {
   socketPath: string
@@ -205,11 +279,30 @@ export interface SelfhealBrokerOpts {
   /** When true (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1), a fully-gated cutover runs the
    *  deploy driver. Default false ⇒ record + notify "pending release" only. */
   autoDeployTier2?: boolean
-  /** Trusted deploy driver (only invoked when autoDeployTier2 and all gates
-   *  pass). */
+  /** Trusted deploy driver (invoked on auto cutover AND one-click release). */
   deployDriver?: DeployDriver
-  /** Called when a gated cutover is held for manual release (default posture). */
-  notifyPendingRelease?: (info: { repairId: string; sha: string }) => void
+  /** Called when a gated cutover is held for manual release (default posture).
+   *  `toolchain` lists deploy-toolchain files the candidate touches (if any) —
+   *  such a candidate can ONLY ship via a human offline standard deploy. */
+  notifyPendingRelease?: (info: { repairId: string; sha: string; toolchain?: string[] }) => void
+
+  // ── block C action deps (context / verify / report) ──
+  /** OC_SELFHEAL_CALLBACK_URL — forward tunnel base to the v5 master. The
+   *  broker (root) uses the job's capability against it; the capability never
+   *  reaches the codex side. */
+  callbackBaseUrl?: string
+  /** Injectable fetch (tests). Defaults to global fetch. */
+  fetchImpl?: typeof fetch
+  /** Injectable verification runner (tests). Defaults to verifier.verify with
+   *  the broker's ocheal uid/gid + verification dir + signing key. */
+  verifyRunner?: (input: {
+    repairId: string
+    sha: string
+    clonePath: string
+  }) => Promise<VerifyOutcome>
+  /** Report free-text caps (defaults 2000 / 8192 chars). */
+  reportMessageMaxChars?: number
+  reportDetailMaxChars?: number
 }
 
 export class SelfhealBroker {
@@ -354,21 +447,41 @@ export class SelfhealBroker {
       return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
     }
 
-    // Authorization (Codex HIGH #5): a valid Unix socket connection is NOT
-    // authorization. The request must name an ACTIVE repair and hold that
-    // repair's capability — otherwise any ocheal process could forge a repairId
-    // to replay Tier1 (restart / docker prune). Checked BEFORE the claim so an
-    // unauthorized request never touches the idempotency ledger.
+    // Structural isolation (design §C2, R2 BLOCKER2): release is NEVER a socket
+    // action — an ocheal caller cannot be trusted about its own provenance. The
+    // ONLY entries into releaseApproved() are the HMAC-verified release webhook
+    // and the root break-glass route (both terminate on the in-process method).
+    if (req.actionKind === 'release' || req.actionKind === RELEASE_CLAIM_KIND) {
+      this.audit(req, 'rejected', { reason: 'release is not a socket action' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: {
+          reason:
+            'release is not a socket action — it only enters via the signed v5 webhook or the root break-glass route',
+        },
+      }
+    }
+
+    // Authorization (Codex HIGH #5, amended by block C): a valid Unix socket
+    // connection is NOT authorization — the request must name an ACTIVE repair.
+    // Checked BEFORE the claim so an unauthorized request never touches the
+    // idempotency ledger. See authorizeRepair for the capability posture.
     const authz = await this.authorizeRepair(req)
     if (!authz.ok) {
       this.log.warn('broker request unauthorized', { repairId: req.repairId, reason: authz.reason })
       return { ok: false, status: 'unauthorized', detail: { reason: authz.reason } }
     }
 
-    const key = `${req.repairId}:${req.actionKind}`
     // Hash the params so a same-key request with DIFFERENT params is a conflict,
-    // not a silent replay of the old outcome (Codex HIGH #13).
-    const paramsHash = createHash('sha256').update(stableStringify(req.params ?? null)).digest('hex')
+    // not a silent replay of the old outcome (Codex HIGH #13). context/verify/
+    // report are params-keyed (multiple legitimate invocations per repair).
+    const paramsHash = createHash('sha256')
+      .update(stableStringify(req.params ?? null))
+      .digest('hex')
+    const key = PARAMS_KEYED_KINDS.has(req.actionKind)
+      ? `${req.repairId}:${req.actionKind}:${paramsHash.slice(0, 16)}`
+      : `${req.repairId}:${req.actionKind}`
 
     // Atomically claim BEFORE any side effect (Codex HIGH #3/#4): single winner,
     // durable across restart.
@@ -406,8 +519,22 @@ export class SelfhealBroker {
     // permanent) or release (a non-side-effecting validation reject may be retried).
     let response: BrokerResponse
     try {
-      response =
-        req.actionKind === CUTOVER_KIND ? await this.handleCutover(req) : await this.handleTier1(req)
+      switch (req.actionKind) {
+        case CUTOVER_KIND:
+          response = await this.handleCutover(req)
+          break
+        case CONTEXT_KIND:
+          response = await this.handleContext(req, authz.rec)
+          break
+        case VERIFY_KIND:
+          response = await this.handleVerify(req)
+          break
+        case REPORT_KIND:
+          response = await this.handleReport(req, authz.rec)
+          break
+        default:
+          response = await this.handleTier1(req)
+      }
     } catch (err) {
       await this.store.release(key)
       throw err
@@ -420,8 +547,20 @@ export class SelfhealBroker {
     return response
   }
 
-  /** Authorize a request against the durable repair record + its capability. */
-  private async authorizeRepair(req: BrokerRequest): Promise<{ ok: boolean; reason?: string }> {
+  /**
+   * Authorize a request against the durable repair record.
+   *
+   * Capability posture (block C final trust model): the capability NEVER
+   * reaches the codex/ocheal side (M-capability — it lives only on the job row,
+   * root-readable), so a socket request CANNOT be required to present it.
+   * Socket-path authorization is therefore: socket ACL (only ocheal + root can
+   * connect) + the request naming an ACTIVE repair. When a caller DOES present
+   * a capability it must match (defense in depth for root-side tooling); a
+   * wrong capability is always rejected.
+   */
+  private async authorizeRepair(
+    req: BrokerRequest,
+  ): Promise<{ ok: true; rec: RepairAuthorityRecord } | { ok: false; reason: string }> {
     let rec: RepairAuthorityRecord | null
     try {
       rec = await this.repairAuthority(req.repairId)
@@ -431,10 +570,12 @@ export class SelfhealBroker {
     }
     if (!rec) return { ok: false, reason: 'unknown repair' }
     if (!ACTIVE_REPAIR_STATES.has(rec.status)) return { ok: false, reason: 'repair not active' }
-    if (!rec.capability) return { ok: false, reason: 'repair has no capability' }
-    const provided = typeof req.capability === 'string' ? req.capability : ''
-    if (!capabilityMatches(provided, rec.capability)) return { ok: false, reason: 'capability mismatch' }
-    return { ok: true }
+    if (typeof req.capability === 'string' && req.capability.length > 0) {
+      if (!rec.capability || !capabilityMatches(req.capability, rec.capability)) {
+        return { ok: false, reason: 'capability mismatch' }
+      }
+    }
+    return { ok: true, rec }
   }
 
   private isCommitted(resp: BrokerResponse): boolean {
@@ -507,35 +648,466 @@ export class SelfhealBroker {
       return this.rejectCutover(req, 'sha is not a descendant of the canonical branch')
     }
 
-    // (c) Auto-deploy gate. Default posture: hold for manual release.
+    // (c) Auto-deploy gate. Default posture: hold for manual release. The
+    //     toolchain denylist is probed here too so the pending notification
+    //     carries the "manual offline deploy only" annotation up front (the
+    //     driver re-enforces it as the hard gate at deploy time).
     if (!this.autoDeployTier2) {
-      this.audit(req, 'pending_release', { sha })
-      this.opts.notifyPendingRelease?.({ repairId: req.repairId, sha })
+      const touched = (await listToolchainTouches(this.run, this.canonicalRepo, sha)) ?? []
+      this.audit(req, 'pending_release', { sha, ...(touched.length ? { toolchain: touched } : {}) })
+      this.opts.notifyPendingRelease?.({
+        repairId: req.repairId,
+        sha,
+        ...(touched.length ? { toolchain: touched } : {}),
+      })
       this.log.warn('cutover fully gated but AUTO_DEPLOY_TIER2=0 — held for manual release', {
         repairId: req.repairId,
         sha,
       })
+      // Deterministic root-side pending_release marker to the master (seam
+      // contract: the admin release gate requires a progress event with
+      // detail.phase='pending_release', and codex cannot be relied on to send
+      // it). Failure never changes the pending outcome (audited only).
+      await this.postMasterCallback(
+        req.repairId,
+        'progress',
+        'pending_release: verified and gated — awaiting one-click release',
+        { phase: 'pending_release', sha, ...(touched.length ? { toolchain: true } : {}) },
+      )
       return {
         ok: false,
         status: 'pending_release',
-        detail: { sha, reason: 'awaiting one-click release (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0)' },
+        detail: {
+          sha,
+          ...(touched.length ? { toolchain: true, files: touched.slice(0, 20) } : {}),
+          reason: 'awaiting one-click release (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0)',
+        },
       }
     }
 
-    // (d) Trusted, self-held deploy under the global deploy flock.
+    // (d) Trusted, self-held deploy (driver re-checks the toolchain denylist as
+    //     the execution-time hard gate, then ff-merges + runs canonical deploy).
     const driver = this.opts.deployDriver
     if (!driver) {
       return this.rejectCutover(req, 'no trusted deploy driver configured')
     }
-    const result = await driver(sha, { log: this.log })
+    const result = await driver(sha, { log: this.log, repairId: req.repairId })
     this.audit(req, result.status, { sha, ...result.detail })
+    if (result.status === 'deployed') {
+      // Auto-deploy path closes the loop root-side: master → 'verifying',
+      // probe fence adjudicates real recovery.
+      await this.postMasterCallback(req.repairId, 'done', 'auto cutover deployed', {
+        phase: 'deployed',
+        sha,
+      })
+    }
     return result
+  }
+
+  // ── block C action handlers (context / verify / report) ─────────────────────
+
+  /** `context {repairId}` — fetch the structured incident context from the v5
+   *  master using the ROOT-HELD capability (never exposed to the caller's env;
+   *  the response body is the only thing the codex sees). */
+  private async handleContext(
+    req: BrokerRequest,
+    rec: RepairAuthorityRecord,
+  ): Promise<BrokerResponse> {
+    const base = this.opts.callbackBaseUrl?.replace(/\/$/, '')
+    if (!base) {
+      this.audit(req, 'rejected', { reason: 'callback base url not configured' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'callback base url not configured' },
+      }
+    }
+    if (!rec.capability) {
+      this.audit(req, 'rejected', { reason: 'repair has no capability yet' })
+      return { ok: false, status: 'rejected', detail: { reason: 'repair has no capability yet' } }
+    }
+    const f = this.opts.fetchImpl ?? fetch
+    const url = `${base}/internal/v5/repairs/${encodeURIComponent(req.repairId)}/context`
+    try {
+      const res = await f(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${rec.capability}` },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+      })
+      if (!res.ok) {
+        this.audit(req, 'context_failed', { httpStatus: res.status })
+        return { ok: false, status: 'context_failed', detail: { httpStatus: res.status } }
+      }
+      const text = await res.text()
+      if (Buffer.byteLength(text, 'utf8') > MAX_CONTEXT_BYTES) {
+        return { ok: false, status: 'context_failed', detail: { reason: 'context too large' } }
+      }
+      let context: unknown
+      try {
+        context = JSON.parse(text)
+      } catch {
+        return {
+          ok: false,
+          status: 'context_failed',
+          detail: { reason: 'invalid JSON from master' },
+        }
+      }
+      this.audit(req, 'ok')
+      return { ok: true, status: 'ok', detail: { context } }
+    } catch (err) {
+      this.audit(req, 'context_failed', { reason: String((err as Error).message).slice(0, 200) })
+      return {
+        ok: false,
+        status: 'context_failed',
+        detail: { reason: String((err as Error).message).slice(0, 200) },
+      }
+    }
+  }
+
+  /** `verify {repairId, sha}` — run the de-privileged four-layer verification
+   *  against the repair's clone and return the (root-signed) summary. */
+  private async handleVerify(req: BrokerRequest): Promise<BrokerResponse> {
+    const p = (req.params ?? {}) as Record<string, unknown>
+    const sha = typeof p.sha === 'string' ? p.sha : ''
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      this.audit(req, 'rejected', { reason: 'sha must be a full 40-char hex commit' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'sha must be a full 40-char hex commit' },
+      }
+    }
+    const clonePath = join(this.ochealSelfhealRoot, req.repairId)
+    const runVerify =
+      this.opts.verifyRunner ??
+      (async (input: { repairId: string; sha: string; clonePath: string }) => {
+        if (this.ochealUid === undefined || this.ochealGid === undefined) {
+          throw new Error('ochealUid/ochealGid not configured — refusing a root-privileged verify')
+        }
+        return runVerification({
+          repairId: input.repairId,
+          sha: input.sha,
+          clonePath: input.clonePath,
+          ochealUid: this.ochealUid,
+          ochealGid: this.ochealGid,
+          verificationDir: this.opts.verificationDir,
+          signingKey: this.opts.verifyKey,
+          run: this.opts.run,
+        })
+      })
+    try {
+      const outcome = await runVerify({ repairId: req.repairId, sha, clonePath })
+      const result = outcome.signed.result
+      const dir =
+        this.opts.verificationDir ??
+        process.env.OC_SELFHEAL_VERIFY_DIR ??
+        '/var/lib/openclaude-selfheal/verifications'
+      const detail = {
+        allPassed: result.allPassed,
+        verificationRef: outcome.verificationRef,
+        file: join(dir, `${outcome.verificationRef}.json`),
+        layers: result.layers.map((l) => ({ name: l.name, ok: l.ok, code: l.code })),
+      }
+      this.audit(req, 'verified', { sha, allPassed: result.allPassed })
+      return { ok: true, status: 'verified', detail }
+    } catch (err) {
+      this.audit(req, 'verify_failed', {
+        sha,
+        reason: String((err as Error).message).slice(0, 300),
+      })
+      return {
+        ok: false,
+        status: 'verify_failed',
+        detail: { reason: String((err as Error).message).slice(0, 300) },
+      }
+    }
+  }
+
+  /** `report {repairId, outcome, message, detail?}` — forward a redacted,
+   *  length-capped progress/终态 report to the v5 master (capability POST). */
+  private async handleReport(
+    req: BrokerRequest,
+    rec: RepairAuthorityRecord,
+  ): Promise<BrokerResponse> {
+    const p = (req.params ?? {}) as Record<string, unknown>
+    const outcome = typeof p.outcome === 'string' ? p.outcome : ''
+    if (!REPORT_OUTCOMES.has(outcome)) {
+      this.audit(req, 'rejected', { reason: 'outcome must be progress|done|failed' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'outcome must be progress|done|failed' },
+      }
+    }
+    if (typeof p.message !== 'string' || p.message.length === 0) {
+      this.audit(req, 'rejected', { reason: 'message is required' })
+      return { ok: false, status: 'rejected', detail: { reason: 'message is required' } }
+    }
+    if (p.detail !== undefined && typeof p.detail !== 'string') {
+      this.audit(req, 'rejected', { reason: 'detail must be a string when present' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'detail must be a string when present' },
+      }
+    }
+    const base = this.opts.callbackBaseUrl?.replace(/\/$/, '')
+    if (!base) {
+      this.audit(req, 'rejected', { reason: 'callback base url not configured' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'callback base url not configured' },
+      }
+    }
+    if (!rec.capability) {
+      this.audit(req, 'rejected', { reason: 'repair has no capability yet' })
+      return { ok: false, status: 'rejected', detail: { reason: 'repair has no capability yet' } }
+    }
+    const msgMax = this.opts.reportMessageMaxChars ?? DEFAULT_REPORT_MESSAGE_MAX
+    const detailMax = this.opts.reportDetailMaxChars ?? DEFAULT_REPORT_DETAIL_MAX
+    const message = redactSelfhealText(p.message).slice(0, msgMax)
+    const detail =
+      p.detail !== undefined ? redactSelfhealText(p.detail).slice(0, detailMax) : undefined
+    const f = this.opts.fetchImpl ?? fetch
+    const url = `${base}/internal/v5/repairs/${encodeURIComponent(req.repairId)}/${outcome}`
+    try {
+      const res = await f(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${rec.capability}`,
+        },
+        body: JSON.stringify({ message, ...(detail !== undefined ? { detail } : {}) }),
+        redirect: 'manual',
+        signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+      })
+      if (!res.ok) {
+        this.audit(req, 'report_failed', { outcome, httpStatus: res.status })
+        return { ok: false, status: 'report_failed', detail: { outcome, httpStatus: res.status } }
+      }
+      this.audit(req, 'reported', { outcome })
+      return { ok: true, status: 'reported', detail: { outcome, httpStatus: res.status } }
+    } catch (err) {
+      this.audit(req, 'report_failed', {
+        outcome,
+        reason: String((err as Error).message).slice(0, 200),
+      })
+      return {
+        ok: false,
+        status: 'report_failed',
+        detail: { outcome, reason: String((err as Error).message).slice(0, 200) },
+      }
+    }
+  }
+
+  // ── one-click release (in-process ONLY — never a socket action) ─────────────
+
+  /**
+   * Release a held cutover (design §C3). Callers: the HMAC-verified release
+   * webhook (v5 admin one-click) and the root break-glass route — both hold a
+   * reference to this broker instance; nothing on the ocheal socket can reach
+   * this method.
+   *
+   * Re-verifies EVERYTHING from durable state (never trusts the request):
+   *   1. the durable cutover record must exist, be committed, and be
+   *      'pending_release' (the sha comes from that record, not the caller);
+   *   2. its own release claim (at-most-once deploy across duplicates/crashes);
+   *   3. canonical ancestry, re-checked from scratch;
+   *   4. the deploy driver — whose toolchain denylist re-runs as the hard gate,
+   *      so a toolchain-touching candidate is refused here too.
+   */
+  async releaseApproved(repairId: string): Promise<BrokerResponse> {
+    if (!/^[A-Za-z0-9._:-]+$/.test(repairId)) {
+      return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
+    }
+    const cutoverKey = `${repairId}:${CUTOVER_KIND}`
+    const rec = await this.store.get(cutoverKey)
+    if (!rec || rec.status !== 'committed' || !rec.response) {
+      this.log.warn('release refused — no committed cutover record', { repairId })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'no committed cutover record for this repair' },
+      }
+    }
+    let prior: BrokerResponse
+    try {
+      prior = JSON.parse(rec.response) as BrokerResponse
+    } catch {
+      return { ok: false, status: 'rejected', detail: { reason: 'corrupt cutover record' } }
+    }
+    // The sha authority is the DURABLE record's detail (present for both a
+    // pending_release and an already-released record) — never the caller.
+    const sha = typeof prior.detail?.sha === 'string' ? (prior.detail.sha as string) : ''
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'cutover record has no valid sha' },
+      }
+    }
+
+    // At-most-once release claim (durable): duplicates replay, a crash mid-deploy
+    // is fail-closed 'in_progress' (never re-run the deploy blindly). This MUST
+    // precede the pending-status check: a successful release flips the cutover
+    // record to 'deployed', and a duplicate release must replay — not reject.
+    const releaseKey = `${repairId}:${RELEASE_CLAIM_KIND}`
+    const paramsHash = createHash('sha256').update(stableStringify({ sha })).digest('hex')
+    const claim = await this.store.tryClaim({
+      claimKey: releaseKey,
+      repairId,
+      actionKind: RELEASE_CLAIM_KIND,
+      paramsHash,
+    })
+    if (claim.outcome === 'replay') {
+      const priorRelease = JSON.parse(claim.response ?? '{}') as BrokerResponse
+      this.log.info('release idempotent replay', { repairId, status: priorRelease.status })
+      return { ...priorRelease, detail: { ...priorRelease.detail, replayed: true } }
+    }
+    if (claim.outcome === 'in_progress') {
+      return {
+        ok: false,
+        status: 'in_progress',
+        detail: { reason: 'a prior release did not finalize; not re-executing (at-most-once)' },
+      }
+    }
+    if (claim.outcome === 'conflict') {
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'release claim conflict (sha changed?)' },
+      }
+    }
+    // We won the claim — the record must still be awaiting release.
+    if (prior.status !== 'pending_release') {
+      await this.store.release(releaseKey)
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: `cutover is not pending release (status ${prior.status})` },
+      }
+    }
+
+    let response: BrokerResponse
+    try {
+      const ancestor = await this.checkCanonicalAncestry(repairId, sha)
+      if (!ancestor) {
+        response = {
+          ok: false,
+          status: 'rejected',
+          detail: { reason: 'sha is not a descendant of the canonical branch' },
+        }
+      } else {
+        const driver = this.opts.deployDriver
+        if (!driver) {
+          response = {
+            ok: false,
+            status: 'rejected',
+            detail: { reason: 'no trusted deploy driver configured' },
+          }
+        } else {
+          response = await driver(sha, { log: this.log, repairId })
+        }
+      }
+    } catch (err) {
+      await this.store.release(releaseKey)
+      throw err
+    }
+
+    if (response.status === 'deployed') {
+      await this.store.finalize(releaseKey, JSON.stringify(response))
+      // Observability: flip the durable cutover record from pending_release to
+      // the deployed outcome so ops sees the true terminal state.
+      await this.store.overwriteCommitted(cutoverKey, JSON.stringify(response))
+      // Close the loop on the master: the codex turn ended back at cutover
+      // time, so the DONE callback must come from the broker after a human
+      // release — master → 'verifying' → probe fence adjudicates.
+      await this.postMasterCallback(repairId, 'done', 'released and deployed', {
+        phase: 'deployed',
+        sha,
+      })
+    } else {
+      // Not deployed (toolchain hold / driver failure / gate reject): release
+      // the claim so a corrected future release attempt can retry.
+      await this.store.release(releaseKey)
+    }
+    this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, response.status, {
+      sha,
+      ...response.detail,
+    })
+    return response
   }
 
   private rejectCutover(req: BrokerRequest, reason: string): BrokerResponse {
     this.audit(req, 'rejected', { reason })
     this.log.warn('cutover rejected', { repairId: req.repairId, reason })
     return { ok: false, status: 'rejected', detail: { reason } }
+  }
+
+  /**
+   * Deterministic ROOT-side callback to the v5 master (seam contract, design
+   * §C2/§C3): the pending_release progress marker and the post-release done are
+   * posted by the broker itself — the master's release gate reads
+   * `detail->>'phase'`, and the codex turn may have long ended when a human
+   * releases. `detail` is a JSON OBJECT here; the ocheal-facing `report` kind
+   * intentionally keeps its string-only detail posture (free text from codex).
+   * Best-effort: failure is audited and never changes the caller's outcome.
+   */
+  private async postMasterCallback(
+    repairId: string,
+    action: 'progress' | 'done',
+    message: string,
+    detail: Record<string, unknown>,
+  ): Promise<boolean> {
+    const auditReq = { repairId, actionKind: `${action}_callback` } as BrokerRequest
+    const base = this.opts.callbackBaseUrl?.replace(/\/$/, '')
+    if (!base) {
+      this.audit(auditReq, 'skipped', { reason: 'callback base url not configured' })
+      return false
+    }
+    let capability: string | null = null
+    try {
+      capability = (await this.repairAuthority(repairId))?.capability ?? null
+    } catch {
+      capability = null
+    }
+    if (!capability) {
+      this.audit(auditReq, 'skipped', { reason: 'repair has no capability' })
+      return false
+    }
+    const f = this.opts.fetchImpl ?? fetch
+    try {
+      const res = await f(
+        `${base}/internal/v5/repairs/${encodeURIComponent(repairId)}/${action}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${capability}`,
+          },
+          body: JSON.stringify({ message, detail }),
+          redirect: 'manual',
+          signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+        },
+      )
+      this.audit(auditReq, res.ok ? 'reported' : 'report_failed', { httpStatus: res.status })
+      if (!res.ok) {
+        this.log.error('selfheal master callback failed', {
+          repairId,
+          action,
+          httpStatus: res.status,
+        })
+      }
+      return res.ok
+    } catch (err) {
+      this.audit(auditReq, 'report_failed', {
+        reason: String((err as Error).message).slice(0, 200),
+      })
+      this.log.error('selfheal master callback failed', { repairId, action }, err as Error)
+      return false
+    }
   }
 
   /**

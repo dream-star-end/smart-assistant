@@ -39,7 +39,7 @@
 
 import { execFile } from 'node:child_process'
 import { createHmac, timingSafeEqual } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createLogger } from '../logger.js'
 import type { CommandRunner, RunOpts, RunResult } from './brokerActions.js'
@@ -216,6 +216,14 @@ export async function prepareClone(opts: PrepareCloneOpts): Promise<PrepareClone
   const run = opts.run ?? defaultCommandRunner
   const root = opts.ochealSelfhealRoot ?? '/home/ocheal/selfheal'
   const clonePath = join(root, opts.repairId)
+
+  // Idempotent recovery: a crash-re-driven job re-runs processJob; if the clone
+  // already exists (from the prior attempt) reuse it rather than failing on
+  // `git clone` into a non-empty dir. Ownership/remote were already fixed up.
+  if (existsSync(join(clonePath, '.git'))) {
+    log.info('reusing existing selfheal clone', { repairId: opts.repairId, clonePath })
+    return { clonePath }
+  }
 
   const clone = await run('git', [
     'clone',

@@ -101,9 +101,18 @@ describe('verifier.verify orchestration', () => {
     // worktree add first, then install, then the 4 layers = 6 runner calls.
     assert.equal(calls[0]!.cmd, 'git')
     assert.ok(calls[0]!.args.includes('worktree'))
-    assert.ok(calls[0]!.args.includes('core.hooksPath=/dev/null'), 'checkout hooks must be disabled')
+    assert.ok(
+      calls[0]!.args.includes('core.hooksPath=/dev/null'),
+      'checkout hooks must be disabled',
+    )
     const npmScripts = calls.filter((c) => c.cmd === 'npm').map((c) => c.args.join(' '))
-    assert.deepEqual(npmScripts, ['ci', 'run lint', 'run typecheck', 'run test:gateway', 'run test:web'])
+    assert.deepEqual(npmScripts, [
+      'ci',
+      'run lint',
+      'run typecheck',
+      'run test:gateway',
+      'run test:web',
+    ])
     // SECURITY (BLOCKER1 regression fence): EVERY candidate-executing command must
     // drop to ocheal with a curated, secret-free env; npm layers run in the clean
     // worktree via cwd. If a future change runs any of these as root, this fails.
