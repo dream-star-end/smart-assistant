@@ -8,10 +8,14 @@
  *                       │
  *                       ├─ verifyAccess(jwt) → uid
  *                       ├─ ConnectionRegistry.register({uid})  // 默认每人 3 条
- *                       ├─ const {host, port} = await resolveContainerEndpoint(uid)
+ *                       ├─ const {host, port, bundleRev} = await resolveContainerEndpoint(uid)
  *                       │     ↑ 唯一入口(R6.11 reader 硬约束)。Phase 3 接入
  *                       │       supervisor.ensureRunning(uid);Phase 2 由调用方注入。
  *                       │       throw 503 → 关 ws + close code 4503 + retryAfter 给前端
+ *                       ├─ await loadAgentModelResolver(uid, { bundleRev })   // 必须在 ↑ 之后!
+ *                       │     ↑ seed agent 的计费模型 = **该容器实际跑的 bundle rev** 的 seed 声明
+ *                       │       (模型权威批次 §5 阶段 B)。提前到 ensureRunning 之前 = master 用
+ *                       │       current 声明给跑旧 seed 的容器计费 = 滚动窗口计费分叉。
  *                       └─ 内部 fetch ws://<host>:<port>/ws → 双向 pipe(text + binary)
  *
  * 协议透明为默认路径:非业务控制帧保持 byte-exact 透传；`inbound.message`
@@ -71,11 +75,20 @@ import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   DEFAULT_CODEX_ENGINE_MODEL,
+  MODEL_AUTHORITY_CAPABILITY,
+  MODEL_AUTHORITY_FIELD,
   isCodexEngineModel,
   newTraceId,
   parseTraceIdCandidate,
+  stripModelAuthorityField,
+  type ModelAuthorityBundle,
+  type ModelAuthorityEngine,
+  type ModelExecutionDescriptor,
   type TraceIdIssue,
 } from "@openclaude/protocol";
+import type { AuthoritySigner } from "./authoritySigner.js";
+import { platformAuxModels } from "../billing/modelCatalog.js";
+import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import {
   applyStatusFrame,
@@ -257,6 +270,19 @@ export type ResolveContainerEndpoint = (
     containerInternalId: string;
     nodeAgent: NodeAgentTarget;
   };
+  /**
+   * 容器**实际运行**的 platform bundle rev(容器 label `com.openclaude.runtime.bundle_rev`;
+   * v3ensureRunning 从 docker inspect labels / provision 实际打的 label 取,不是 master 的
+   * desired tuple)。
+   *
+   * 模型权威批次 §5 阶段 B:bridge 拿它去读**该 rev 的** seed 声明推导 seed agent 计费模型。
+   * 正因为需要它,`loadAgentModelResolver` 的调用必须排在 `resolveContainerEndpoint` **之后**
+   * —— 否则 master 会用 current 声明给跑旧 seed 的容器计费(滚动窗口分叉)。
+   *
+   * 缺失(bundle 轴未启用 / 旧容器 / 测试 mock)→ flag `OC_SEED_AUTHORITY_BY_REV` 未开时无害;
+   * flag 开启时 resolver loader 抛 SeedDeclarationError → 桥 close(1011) fail-closed。
+   */
+  bundleRev?: string;
 }>;
 
 /**
@@ -320,10 +346,135 @@ export type BridgeCloseCause =
   | "internal_error"         // 兜底
   | "shutdown";              // server.shutdown()
 
+// ---------- 模型执行权威(方案 §2 / §7 步 4)---------------------------------
+
+/**
+ * bridge 侧的模型权威签发装配(docs/V5_MODEL_AUTHORITY_PLAN.md)。
+ *
+ * **注入即开启**(index.ts 只在 flag `OC_MODEL_AUTHORITY=1` 时构造并注入):
+ *   - 未注入 → bridge 完全走旧路径(不签发、不注入、不做 attestation 门),零行为变化;
+ *   - 注入   → ①每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
+ *              有界 + 超时;超时/不支持 → 拒连接 + 触发 stale recycle);
+ *              ②每条 forward 的 inbound.message 先 strip 客户端同名字段,再注入
+ *              master 签名的 `__oc_model_authority`;
+ *              ③codex 计费链的 isCodex 判定改用 **descriptor.engine**(与签发同源,
+ *              不再是 baked 的 gpt-* 前缀集合)。
+ *
+ * fail-closed 边界:catalog 快照 unknown / epoch fence 失败 / 模型不可路由 → **拒帧**,
+ * 绝不「降级为不带 envelope 转发」—— 那会让容器回落 baked 判定,而 master 这边可能已按
+ * 另一套语义预扣,正是本批次要消灭的计费/执行分裂。
+ */
+export interface BridgeModelAuthorityDeps {
+  /** master 独占私钥的签发器(公钥 keyring 由 supervisor 注入容器 env)。 */
+  signer: AuthoritySigner;
+  /** ModelExecutionCatalog 快照缓存(epoch fence 的执行体)。 */
+  catalog: ModelCatalogCache;
+  /**
+   * 容器不支持 attestation(旧 release / 旧 env)→ 触发 stale recycle,让用户下次连接
+   * 拿到带 keyring 的新容器。未注入 → 只拒连接不 recycle(测试/降级)。
+   */
+  recycleContainer?: (containerId: number, reason: string) => void;
+  /** 等待容器 attestation 的上限(默认 10s)。 */
+  attestTimeoutMs?: number;
+}
+
+/** 容器 attestation 帧 type —— 与 gateway `modelAuthority.CONTAINER_ATTEST_FRAME_TYPE` 同值
+ *  (两包不互相 import,parity 由 modelAuthorityBridge.test.ts 锁定)。 */
+export const CONTAINER_ATTEST_FRAME_TYPE = "outbound.control.container_attest";
+
+/** 等待容器 attestation 的默认上限。容器 open 后立刻发 attest,10s 已是极宽松的上限。 */
+const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
+
+/**
+ * slice1 catalog descriptor → protocol 签名载荷 descriptor(wire 形状)。
+ *
+ * 两个 `ModelExecutionDescriptor` 是**有意不同**的类型:
+ *   - commercial/billing/modelCatalog 的那份是 DB 投影(带 providerId / upstreamModelId
+ *     —— **路由**语义,只有 master/egress 需要,容器不该看见上游身份);
+ *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
+ * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
+ *
+ * `contextWindow` 的 null(catalog 未声明)映射为 0 —— protocol 载荷要求 safe integer,
+ * 0 语义 = 「未声明」(容器当前不消费该字段;声明后由切片 5 的 spawn 侧使用)。
+ */
+function toProtocolDescriptor(
+  d: import("../billing/modelCatalog.js").ModelExecutionDescriptor,
+): ModelExecutionDescriptor {
+  const profile = d.capabilityProfile;
+  return {
+    capabilityProfile: {
+      supportsVision: profile.supportsVision,
+      reasoning: {
+        supported: [...profile.reasoning.supported],
+        codexModelDefault: profile.reasoning.codexModelDefault,
+      },
+    },
+    capabilitySchemaVersion: d.capabilitySchemaVersion,
+    contextWindow: d.contextWindow ?? 0,
+    supportedEfforts: [...profile.reasoning.supported],
+    ...(profile.reasoning.codexModelDefault === null
+      ? {}
+      : { codexDefaultEffort: profile.reasoning.codexModelDefault }),
+    supportsVision: profile.supportsVision,
+  };
+}
+
+/** 一个 turn 的执行解析结果(epoch fence 已过 → 可以签)。 */
+interface ResolvedTurnExecution {
+  canonicalModel: string;
+  engine: ModelAuthorityEngine;
+  descriptor: ModelExecutionDescriptor;
+  /** 该 turn 的平台次级模型放行集(见 billing/modelCatalog.ts platformAuxModels)。 */
+  auxModels: string[];
+  executionRevision: string;
+  securityEpoch: number;
+}
+
+/** 模型不可路由(catalog 无 active 行 / 无价 / capability schema 未来版本)。 */
+class ModelNotAvailableError extends Error {
+  constructor(readonly modelId: string) {
+    super(`model not available: ${modelId}`);
+    this.name = "ModelNotAvailableError";
+  }
+}
+
+/**
+ * epoch fence + 解析执行 descriptor(方案 §1.2 R3-B2:签发 authority **之前**必须 fence)。
+ *
+ * `catalog.assertFresh()` 语义:快照 epoch 与 DB 单行 epoch 比对(**无时间缓存**),
+ * 不等 → 同步重建;重建失败 / DB 不可达 → 抛 → 调用方拒帧(fail-closed)。
+ */
+async function resolveTurnExecution(
+  catalog: ModelCatalogCache,
+  modelIdOrAlias: string,
+): Promise<ResolvedTurnExecution> {
+  const snapshot: ModelCatalogSnapshot = await catalog.assertFresh();
+  const canonicalModel = snapshot.aliasToCanonical(modelIdOrAlias);
+  const descriptor = snapshot.resolve(canonicalModel);
+  if (descriptor === null) throw new ModelNotAvailableError(modelIdOrAlias);
+  return {
+    canonicalModel: descriptor.canonicalModel,
+    engine: descriptor.engine,
+    descriptor: toProtocolDescriptor(descriptor),
+    // 次级模型只对 **ccb** 引擎有意义:CCB 的 WebFetch/WebSearch 等隐藏调用读
+    // ANTHROPIC_SMALL_FAST_MODEL 打 anthropic proxy;codex turn 走 /internal/v3/codex-relay,
+    // 根本不产生 `/v1/messages` —— 给它签 aux 只会白白撑大放行集合(最小权限)。
+    // platformAuxModels 对"aux 不在 catalog active"fail-closed 抛 → 调用方拒帧。
+    auxModels: descriptor.engine === "ccb" ? platformAuxModels(snapshot) : [],
+    executionRevision: snapshot.executionRevision,
+    securityEpoch: Number(snapshot.securityEpoch),
+  };
+}
+
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
   jwtSecret: string | Uint8Array;
+  /**
+   * 模型执行权威签发(方案 §2)。注入即开启 flag —— 见 BridgeModelAuthorityDeps。
+   * 缺省(v3 / 测试 / flag 未开)→ bridge 行为与本批次之前**完全一致**。
+   */
+  modelAuthority?: BridgeModelAuthorityDeps;
   /** 解析 uid → 容器 host/port。Phase 3D 接 supervisor.ensureRunning;Phase 2 单测自行 mock。 */
   resolveContainerEndpoint: ResolveContainerEndpoint;
   /**
@@ -439,13 +590,24 @@ export interface UserChatBridgeDeps {
    * 容器侧用户手改 agents.yaml 的 agent 不在权威内 → 推导失败 → 拒
    * (gateway seam 的 requestId fail-closed guard 是同问题的容器侧兜底)。
    *
-   * 生命周期与 loadAllowedModelChecker 完全同构:连接建立时加载一次(load 失败
-   * → 桥关 1011,不静默放行),桥 lifetime 内随 GRANTS_REFRESH_INTERVAL_MS 周期
-   * 刷新(新装 agent 在窗口内生效;推导 miss 时也会即时补触发一次 refresh,
-   * 用户重发即可)。未注入(测试 / 旧装配)→ 桥不做推导,行为与本字段加入前一致。
+   * 生命周期(**模型权威批次 §5 阶段 B 重排**):**必须在 `resolveContainerEndpoint`
+   * 之后**加载 —— seed agent 的执行三元组权威 = 该容器实际跑的 bundle rev 的 seed 声明,
+   * 而 rev 只有 ensureRunning 返回容器 label 之后才知道。载入失败(含 seed 声明读不出的
+   * SeedDeclarationError)→ 桥关 1011,**不静默放行、不回落 master 常量**(回落 = 滚动窗口
+   * 里 master 按 current 声明计费、容器按旧 seed 执行的分叉重现)。
+   *
+   * 桥 lifetime 内随 GRANTS_REFRESH_INTERVAL_MS 周期刷新(新装 agent 在窗口内生效;推导 miss
+   * 时也会即时补触发一次 refresh,用户重发即可)。**refresh 复用同一 `bundleRev`**:容器在连接
+   * 存续期内不变(被 recycle → 桥断 → 新连接重取 label);refresh 失败保留上次快照。
+   *
+   * 未注入(测试 / 旧装配)→ 桥不做推导,行为与本字段加入前一致。
    */
   loadAgentModelResolver?: (
     uid: bigint,
+    opts: {
+      /** 容器 label 上的 platform bundle rev(见 ResolveContainerEndpoint.bundleRev)。 */
+      bundleRev?: string;
+    },
   ) => Promise<(agentId: string) => string | null>;
   /**
    * Commercial v3 authority for browser chat history lives in master's
@@ -1123,59 +1285,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           };
         }
 
-        // 1.4b) P0 计费旁路封堵 —— agent→model 权威快照(bridge 可信模型推导)。
-        //   语义/生命周期与 modelCheckerHandle 完全同构:load 失败 close(1011)
-        //   不静默放行;refresh 失败保留上次快照。未注入 → null(测试 / 旧装配,
-        //   桥不做推导,行为不变)。
-        let agentModelResolverHandle:
-          | {
-              resolve: (agentId: string) => string | null;
-              refresh: () => Promise<void>;
-            }
-          | null = null;
-        if (deps.loadAgentModelResolver) {
-          const loadResolver = deps.loadAgentModelResolver;
-          let innerResolve: (agentId: string) => string | null;
-          try {
-            innerResolve = await loadResolver(uid);
-          } catch (err) {
-            log?.error("user-chat-bridge: loadAgentModelResolver threw", {
-              uid: uid.toString(),
-              err,
-            });
-            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
-            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
-            return;
-          }
-          // refresh 去重:miss 补触发 + 周期 timer 可能并发,同一时刻只放一个在飞
-          // (DB 查询很轻,但没必要放大;后到的直接搭前一班车)。
-          // 注意:此处刻意不写 `finally { }` 块 —— userChatBridge.test.ts 的
-          // tryAutoRebindFlush 源码 tripwire 以「文件内第一个 `finally {`」定位
-          // 目标块,在它之前新增 finally 块会让 tripwire 锚错。.finally() 等价。
-          let refreshInflight: Promise<void> | null = null;
-          agentModelResolverHandle = {
-            resolve: (agentId) => innerResolve(agentId),
-            refresh: async () => {
-              if (refreshInflight !== null) return refreshInflight;
-              refreshInflight = (async () => {
-                try {
-                  const next = await loadResolver(uid);
-                  innerResolve = next;
-                } catch (err) {
-                  // 保留上次成功快照(与 modelChecker.refresh 同语义)。
-                  log?.warn("user-chat-bridge: agentModelResolver refresh failed (keep last good)", {
-                    uid: uid.toString(),
-                    err,
-                  });
-                }
-              })().finally(() => {
-                refreshInflight = null;
-              });
-              return refreshInflight;
-            },
-          };
-        }
-
         // 1.5) V3 Phase 4H+ maintenance 闸门:非 admin 在维护模式下不得建立新 chat 会话。
         //   - admin 判定只看 claims.role —— WS chat 不是"动账/改配置"的破坏性操作,
         //     按 HTTP 中间件那种 DB double-check 会让每次 handshake 多一次 PG roundtrip。
@@ -1217,6 +1326,78 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           sendErrorFrame(ws, "ERR_INTERNAL", "agent unavailable");
           try { ws.close(CLOSE_BRIDGE.INTERNAL, "agent unavailable"); } catch { /* */ }
           return;
+        }
+
+        // 2b) P0 计费旁路封堵 —— agent→model 权威快照(bridge 可信模型推导)。
+        //
+        //   **顺序是硬约束(模型权威批次 §5 阶段 B / 设计审 R2-B3)**:本块必须排在
+        //   `resolveContainerEndpoint`(= ensureRunning)**之后** —— seed agent
+        //   (main/codex/hidden-reviewer)的执行三元组权威是「该容器实际跑的那个 bundle rev 的
+        //   platform-seed 声明」,而 rev 只有 ensureRunning 返回容器 label(endpoint.bundleRev)
+        //   之后才知道。若在之前 load,master 只能用自己的 current 常量/声明 → 滚动窗口里
+        //   「master 按新声明计费、旧容器按旧 seed 执行」的**计费分叉**原样复活。
+        //
+        //   语义/生命周期与 modelCheckerHandle 同构:load 失败 close(1011) 不静默放行
+        //   (flag 开启时 SeedDeclarationError 走同一条 catch —— 绝不回落 master 常量);
+        //   refresh 失败保留上次快照。未注入 → null(测试 / 旧装配,桥不做推导,行为不变)。
+        //
+        //   **refresh 复用同一 endpoint.bundleRev**:容器在本连接存续期内不会换 rev
+        //   (被 recycle → 桥断)。新容器 = 新连接 = 重新取 label,不存在"连接中途换 rev"。
+        const connectionBundleRev = endpoint.bundleRev;
+        let agentModelResolverHandle:
+          | {
+              resolve: (agentId: string) => string | null;
+              refresh: () => Promise<void>;
+            }
+          | null = null;
+        if (deps.loadAgentModelResolver) {
+          const loadResolver = deps.loadAgentModelResolver;
+          const resolverOpts: { bundleRev?: string } = connectionBundleRev !== undefined
+            ? { bundleRev: connectionBundleRev }
+            : {};
+          let innerResolve: (agentId: string) => string | null;
+          try {
+            innerResolve = await loadResolver(uid, resolverOpts);
+          } catch (err) {
+            // 含阶段 B 的 SeedDeclarationError(rev 缺失 / bundle 被篡改 / schema 不认):
+            // fail-closed 拒连接,不放行到容器(放行 = 按未知声明计费)。
+            log?.error("user-chat-bridge: loadAgentModelResolver threw", {
+              uid: uid.toString(),
+              bundleRev: connectionBundleRev ?? null,
+              err,
+            });
+            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
+            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
+            return;
+          }
+          // refresh 去重:miss 补触发 + 周期 timer 可能并发,同一时刻只放一个在飞
+          // (DB 查询很轻,但没必要放大;后到的直接搭前一班车)。
+          // 注意:此处刻意不写 `finally { }` 块 —— userChatBridge.test.ts 的
+          // tryAutoRebindFlush 源码 tripwire 以「文件内第一个 `finally {`」定位
+          // 目标块,在它之前新增 finally 块会让 tripwire 锚错。.finally() 等价。
+          let refreshInflight: Promise<void> | null = null;
+          agentModelResolverHandle = {
+            resolve: (agentId) => innerResolve(agentId),
+            refresh: async () => {
+              if (refreshInflight !== null) return refreshInflight;
+              refreshInflight = (async () => {
+                try {
+                  // 同一 bundleRev:连接存续期内容器不变 ⇒ seed 声明不变(LRU 命中,零 IO)。
+                  const next = await loadResolver(uid, resolverOpts);
+                  innerResolve = next;
+                } catch (err) {
+                  // 保留上次成功快照(与 modelChecker.refresh 同语义)。
+                  log?.warn("user-chat-bridge: agentModelResolver refresh failed (keep last good)", {
+                    uid: uid.toString(),
+                    err,
+                  });
+                }
+              })().finally(() => {
+                refreshInflight = null;
+              });
+              return refreshInflight;
+            },
+          };
         }
 
         // 3) 构造容器 WS — direct(sync)或 tunnel(async pre-dial mTLS+pin)。
@@ -1428,6 +1609,170 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // turn 在飞的心跳放行截止点(绝对时刻)。inbound.message 到达 → now+MAX_TURN_GRACE_MS(硬上限);
     // isFinal 到达 → 收窄到 now+POST_FINAL_GRACE_MS(只缩不延);心跳 now<turnActiveUntil 即放行。
     let turnActiveUntil = 0;
+
+    // ── 模型执行权威:per-connection attestation 门 + 签发(方案 §7 步 4)──────
+    //
+    // attestation 是**连接级持续门**而非一次性 census(R2-B5):stopped 旧容器复活 /
+    // 检查窗口内新建的旧容器 / 早到帧,三类竞态全部由「未 attest 前缓冲、超时即拒 +
+    // recycle」覆盖 —— 不靠"部署时数一遍容器"这种会过期的证据。
+    const authorityDeps = deps.modelAuthority;
+    const authorityOn = authorityDeps !== undefined;
+    /** 容器 attest 帧携带的 challenge(gateway 每连接现铸)。签进每份 authority payload。 */
+    let containerChallenge: string | null = null;
+    /** pending = 缓冲用户帧;ok = 放行;failed = 连接已判死(帧丢弃,close 在飞)。 */
+    let attestState: "pending" | "ok" | "failed" = authorityOn ? "pending" : "ok";
+    let attestTimer: ReturnType<typeof setTimeout> | null = null;
+    const attestQueue: Array<{ data: RawData; isBinary: boolean }> = [];
+    let attestQueuedBytes = 0;
+
+    /** 容器不支持 / 不及时 attest → 拒连接 + 触发 stale recycle(下次连接拿到新容器)。 */
+    const failAttestation = (reason: string): void => {
+      if (attestState === "failed") return;
+      attestState = "failed";
+      if (attestTimer !== null) {
+        clearTimeout(attestTimer);
+        attestTimer = null;
+      }
+      attestQueue.length = 0;
+      attestQueuedBytes = 0;
+      bridgeLog?.error("user-chat-bridge: model authority attestation failed", {
+        reason,
+        containerId,
+      });
+      if (containerId !== undefined && authorityDeps?.recycleContainer !== undefined) {
+        try {
+          authorityDeps.recycleContainer(containerId, reason);
+        } catch (err) {
+          bridgeLog?.warn("user-chat-bridge: recycle request failed", { err });
+        }
+      }
+      if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+        sendErrorFrame(
+          userWs,
+          "CONTAINER_OUTDATED",
+          "运行环境需要更新,已自动重建,请刷新页面后重发",
+        );
+        try {
+          userWs.close(CLOSE_BRIDGE.ENV_RECYCLED, "model_authority_unsupported");
+        } catch { /* */ }
+      }
+    };
+
+    /** 容器 attest 帧到达(bridge 拦截消费,**绝不**透传给浏览器)。 */
+    const onContainerAttest = (frame: Record<string, unknown>): void => {
+      if (!authorityOn || attestState !== "pending") return;
+      const capsRaw = frame.capabilities;
+      const caps = Array.isArray(capsRaw) ? capsRaw : [];
+      const challenge =
+        typeof frame.connectionChallenge === "string" ? frame.connectionChallenge : "";
+      if (!caps.includes(MODEL_AUTHORITY_CAPABILITY) || challenge === "") {
+        // 容器广播不出 capability = 它**验不了签**(旧 release 或旧 env 无 keyring)。
+        // 放它过去就等于让 master 与容器各判各的 —— 正是本批次要消灭的双信任源。
+        failAttestation("model_authority_capability_missing");
+        return;
+      }
+      containerChallenge = challenge;
+      attestState = "ok";
+      if (attestTimer !== null) {
+        clearTimeout(attestTimer);
+        attestTimer = null;
+      }
+      const queued = attestQueue.splice(0, attestQueue.length);
+      attestQueuedBytes = 0;
+      bridgeLog?.debug("user-chat-bridge: container attested model authority", {
+        containerId,
+        queuedFrames: queued.length,
+      });
+      // 原样重放:缓冲的是**未处理的原始帧**,重放即走完整 onUserMessage 流程
+      // (authz / codex 分类 / 计费编排 / 签发注入),不存在"半处理帧"的中间态。
+      for (const m of queued) onUserMessage(m.data, m.isBinary);
+    };
+
+    /**
+     * 签票(纯 crypto,无 I/O):必须在 `resolveTurnExecution` 的 epoch fence 之后调用。
+     * containerChallenge / containerId 缺失 = 装配 bug(attest 门已保证它们就位)→ 抛。
+     */
+    const signAuthorityBundle = (
+      exec: ResolvedTurnExecution,
+      billingRequestId?: string,
+    ): ModelAuthorityBundle => {
+      if (authorityDeps === undefined || containerChallenge === null || containerId === undefined) {
+        throw new Error(
+          "[model-authority] sign called before attestation (challenge/containerId missing)",
+        );
+      }
+      return authorityDeps.signer.signBundle({
+        uid: Number(uid),
+        containerId,
+        connectionChallenge: containerChallenge,
+        canonicalModel: exec.canonicalModel,
+        engine: exec.engine,
+        executionDescriptor: exec.descriptor,
+        auxModels: exec.auxModels,
+        executionRevision: exec.executionRevision,
+        securityEpoch: exec.securityEpoch,
+        ...(billingRequestId === undefined ? {} : { billingRequestId }),
+      }).bundle;
+    };
+
+    /**
+     * 三条 forward 路径共用的前置:epoch fence → resolve descriptor → 与同步分类对账。
+     *
+     * @returns exec(可签) | null = **已拒帧**(error 帧已发),调用方必须立即 return。
+     *
+     * 「与同步分类对账」是必须的:codex/非 codex 的**计费路径**在同步上下文里就已按
+     * peek 快照选定(preCheck / journal / 单飞槽都挂在那条路上)。若 fence 后的权威快照
+     * 判出另一个 engine,说明 catalog 在这两步之间变了 —— 继续跑就是「按 A 计费、按 B 执行」。
+     * 此时返回 MODEL_CONFIG_CHANGED_RETRY_TURN(R3-m12),让前端重开 turn。
+     */
+    const resolveAuthorityExecOrReject = async (args: {
+      model: string | null;
+      classifiedCodex: boolean;
+      log: Logger | null;
+    }): Promise<ResolvedTurnExecution | null> => {
+      const reject = (code: string, message: string): null => {
+        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+          sendErrorFrame(userWs, code, message);
+        }
+        return null;
+      };
+      if (authorityDeps === undefined) return null;
+      if (args.model === null) {
+        args.log?.info("user-chat-bridge: model authority unresolved model");
+        return reject(
+          "UNRESOLVED_AGENT_MODEL",
+          "cannot resolve execution model for this turn — retry shortly or specify a model",
+        );
+      }
+      let exec: ResolvedTurnExecution;
+      try {
+        exec = await resolveTurnExecution(authorityDeps.catalog, args.model);
+      } catch (err) {
+        if (err instanceof ModelNotAvailableError) {
+          args.log?.info("user-chat-bridge: model not available", { model: args.model });
+          return reject("MODEL_NOT_AVAILABLE", `model not available: ${args.model}`);
+        }
+        // catalog unknown / epoch fence 重建失败 / DB 不可达 → fail-closed 拒帧。
+        // **不降级为"不带 envelope 转发"** —— 那会让容器回落 baked 判定(双信任源)。
+        args.log?.error("user-chat-bridge: model authority fence failed", { err });
+        return reject("MODEL_AUTHORITY_UNAVAILABLE", "model catalog unavailable, retry shortly");
+      }
+      if (cleaned) return null;
+      const execIsCodex = exec.engine === "codex";
+      if (execIsCodex !== args.classifiedCodex) {
+        args.log?.warn("user-chat-bridge: engine reclassified mid-turn", {
+          model: args.model,
+          canonicalModel: exec.canonicalModel,
+          engine: exec.engine,
+          classifiedCodex: args.classifiedCodex,
+        });
+        return reject(
+          "MODEL_CONFIG_CHANGED_RETRY_TURN",
+          "model configuration changed, please resend",
+        );
+      }
+      return exec;
+    };
 
     // plan v3 G5/G7 — codex per-account 并发槽:per-bridge 状态。
     //   acquiredCodexAccountId !== null → 已持槽,新 codex inbound 应被严格单飞拒绝
@@ -1665,6 +2010,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup("frame_too_big", true);
         return;
       }
+      // ── attestation 门(方案 §7 步 4)────────────────────────────────────────
+      // 未 attest 前**缓冲**用户帧 —— 三个选项里只有这个是对的:
+      //   - 放行 → 容器可能是旧的(不认 envelope,按 baked 判定跑)= 判定源分裂;
+      //   - 丢弃 → 用户的第一条消息静默消失;
+      //   - 缓冲 → attest 到达即原样重放(容器 open 后立刻 attest,实际延迟 ~ms)。
+      // 有界(maxBufferedBytes)+ 有超时(attestTimeoutMs)—— 缓冲不是无限等待。
+      if (authorityOn && attestState !== "ok") {
+        if (attestState === "failed") return; // 连接已判死(close 在飞),丢弃
+        if (attestQueuedBytes + len > maxBufferedBytes) {
+          // 背压=连接态瞬态信号:只走 close code,不发 turn 级 error 帧。
+          try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+          cleanup("backpressure", true);
+          return;
+        }
+        attestQueuedBytes += len;
+        attestQueue.push({ data, isBinary });
+        return;
+      }
       let passthroughData: RawData = data;
       let passthroughLen = len;
       // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up)+ P0 计费旁路
@@ -1699,6 +2062,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   可能来自代码 bug,不该静默吞。
       // 把 effectiveModel / 是否 codex 帧 提到外层,后面 codex slot 路径要用
       let effectiveModelForFrame: string | null = null;
+      // 模型执行权威签发用的 model(= effectiveModel,帧完全无线索时回落默认 agent 的模型)。
+      let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
       // plan v3 G6 早释放(BLOCKER 1):codex inbound 帧的 peer.id,acquire 路径捕获后存
@@ -1726,6 +2091,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (frameStr !== null) {
           let parsed: unknown = null;
           try { parsed = JSON.parse(frameStr); } catch { /* 非 JSON 帧透传 */ }
+
+          // ── 模型执行权威:一切入口的**第一动作** = 无条件 strip 同名字段(方案 §2)──
+          // 客户端自带的 `__oc_model_authority` 必须先死,再谈注入。这里 strip 的是
+          // **解析后的对象**;下面所有 inbound.message 路径都从它重新序列化转发,
+          // 因此原始 raw(带伪造字段)不会被透传。非 inbound.message 的 JSON 帧若带了
+          // 该字段,也在此处剥离后重新序列化(passthrough 不再用原 raw)—— 容器侧只在
+          // inbound.message 上消费 authority,但"入口无条件 strip"是一条不留缺口的铁律。
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const parsedObj = parsed as Record<string, unknown>;
+            if (Object.prototype.hasOwnProperty.call(parsedObj, MODEL_AUTHORITY_FIELD)) {
+              stripModelAuthorityField(parsedObj);
+              bridgeLog?.warn("user-chat-bridge: client-supplied model authority field stripped");
+              const strippedStr = JSON.stringify(parsedObj);
+              passthroughData = Buffer.from(strippedStr, "utf8");
+              passthroughLen = Buffer.byteLength(strippedStr);
+            }
+          }
 
           // Phase 4 — GitHub session-repo bind 帧:bridge 富化 + forward
           //   inbound 帧只带 sessionId/version/peer/agentId/channel(token 不在前端);
@@ -2035,12 +2417,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             effectiveModelForFrame = effectiveModel;
-            // codex 判定:isCodexEngineModel(@openclaude/protocol 单一权威,与容器
-            // gateway resolveEngine 的 MODEL_ENGINE_MAP 同源同构 —— 两处不允许各自
-            // 硬编码 gpt 集合)。agentId='codex' 已通过 AGENT_AUTHZ_IMPLIED_MODEL 把
-            // effectiveModel 设为 gpt-5.5,marketplace/seed agent 经 agentAuthority
-            // 推导,判定一样命中。
-            isCodexInboundFrame = isCodexEngineModel(effectiveModel);
+            // ── 模型执行权威:待签发的 model(方案 §2 步 ②)────────────────────
+            // 复用上面既有的 effectiveModel 推导链。它为 null 的唯一场景 = 帧既无
+            // model 也无 agentId 且本桥从没见过 model —— 此时容器会落到默认 agent
+            // (通常 'main'),故用 master agent 权威解析 'main' 补齐,推不出则由
+            // resolveAuthorityExecOrReject fail-closed 拒帧(不猜、不放行)。
+            authorityModelForFrame =
+              effectiveModel ?? agentModelResolverHandle?.resolve("main") ?? null;
+            // codex 判定的**单一权威**:
+            //   - flag 开 → catalog 快照的 engine(与签发同源;alias 归一后查 active 行)。
+            //     baked 的 gpt-* 前缀集合从此不参与判定 —— 它与 catalog 必然漂移
+            //     (catalog 里 engine 迁移 / 新增 codex 系模型,旧镜像的前缀表不认识)。
+            //   - flag 关 → 旧的 isCodexEngineModel(零行为变化)。
+            // peek() 为 null(快照 unknown)时回落 baked **仅用于选路**:真正的判定发生在
+            // IIFE 里的 epoch fence,fence 不过一律拒帧,故错选路不会造成错计费。
+            isCodexInboundFrame =
+              authorityOn && authorityModelForFrame !== null
+                ? (authorityDeps?.catalog.peek()?.isCodexModel(authorityModelForFrame) ??
+                   isCodexEngineModel(effectiveModel))
+                : isCodexEngineModel(effectiveModel);
             // 提取 peer.id(用于 outbound 终态早释放匹配)。codex 帧才需要;非 codex
             // 帧不影响 acquiredCodexAccountId,捕不捕没用。
             if (isCodexInboundFrame) {
@@ -2155,6 +2550,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const inboundParsedCapture = inboundParsedFrame;
         const turnTraceIdCapture = turnTraceIdForFrame;
         const turnLogCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
         void (async () => {
           if (turnTraceIdCapture === null || inboundParsedCapture === null) {
             bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
@@ -2163,6 +2559,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
             }
             return;
+          }
+          // 模型执行权威:epoch fence + descriptor(拒帧 → 直接 return,本路径尚无预扣)。
+          let authorityExec: ResolvedTurnExecution | null = null;
+          if (authorityOn) {
+            authorityExec = await resolveAuthorityExecOrReject({
+              model: authorityModelCapture,
+              classifiedCodex: true,
+              log: turnLogCapture,
+            });
+            if (authorityExec === null) return;
           }
           const enrichedParsed = await attachMasterHistoricalMessages(
             inboundParsedCapture,
@@ -2179,6 +2585,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...enrichedParsed,
             requestId,
             traceId: turnTraceIdCapture,
+            // 注入签名执行权威 + 把 frame.model 归一为 canonical(容器侧断言
+            // descriptor.canonicalModel === frame.model,不一致即拒)。
+            ...(authorityExec !== null
+              ? {
+                  model: authorityExec.canonicalModel,
+                  [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(authorityExec, requestId),
+                }
+              : {}),
           };
           const rewrittenStr = JSON.stringify(rewrittenObj);
           const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2241,6 +2655,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const effectiveModelCapture = effectiveModelForFrame;
         const inboundAgentIdCapture = inboundAgentIdForFrame;
         const inboundParsedCapture = inboundParsedFrame;
+        const authorityModelCapture = authorityModelForFrame;
         // CG2a — capture canonical traceId 给 IIFE 局部用。inbound.message ⇒ isCodexInboundFrame=true
         // 路径强保证 turnTraceIdForFrame 非 null(invariant 由 IIFE 起手处显式校验)。
         const turnTraceIdCapture = turnTraceIdForFrame;
@@ -2259,6 +2674,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
               }
               return;
+            }
+            // ── 模型执行权威:epoch fence + descriptor(方案 §1.2 R3-B2)─────────
+            // **必须在 acquire / preCheck / journal 之前**:此刻拒帧的代价是零(没占槽、
+            // 没预扣、没开 journal)。放到后面拒 = 要写一堆补偿回滚,而补偿路径正是漏账
+            // 的常见来源。fence 失败(catalog unknown / DB 不可达 / 模型不可路由)一律拒。
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              authorityExec = await resolveAuthorityExecOrReject({
+                model: authorityModelCapture,
+                classifiedCodex: true,
+                log: turnLogCapture,
+              });
+              if (authorityExec === null) return;
             }
             let codexRoute: CodexApiRelayRoute | null = null;
             let officialOAuthGroupId: string | null = null;
@@ -2600,6 +3028,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 requestId,
                 traceId: turnTraceIdCapture,
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+                // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),
+                // 并把 frame.model 归一为 canonical(容器断言 canonicalModel === frame.model)。
+                ...(authorityExec !== null
+                  ? {
+                      model: authorityExec.canonicalModel,
+                      [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(authorityExec, requestId),
+                    }
+                  : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2641,6 +3077,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+                // billing 未启用(legacy NULL 容器 / 测试):无 server requestId 可绑,
+                // 仍必须签票 —— 容器侧(flag 开)对无 envelope 的帧一律拒。
+                ...(authorityExec !== null
+                  ? {
+                      model: authorityExec.canonicalModel,
+                      [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(authorityExec),
+                    }
+                  : {}),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2731,7 +3175,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const inboundParsedCapture = inboundParsedFrame;
         const turnTraceIdCapture = turnTraceIdForFrame;
         const turnLogCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
+        const classifiedCodexCapture = isCodexInboundFrame;
         void (async () => {
+          // 模型执行权威:epoch fence + descriptor。CCB turn 的计费在 egress 侧按请求
+          // 结算(见方案 §4),此处拒帧无需任何回滚。
+          //
+          // classifiedCodex 传**同步分类结果**而不是 false:走到这条路径的 codex 帧
+          // 是"没注 codexBinding/createCodexRoute"的降级形态(测试 / 个人版),它的
+          // engine 确实是 codex —— 传 false 会把这类帧误判成 engine 漂移。
+          let authorityExec: ResolvedTurnExecution | null = null;
+          if (authorityOn) {
+            authorityExec = await resolveAuthorityExecOrReject({
+              model: authorityModelCapture,
+              classifiedCodex: classifiedCodexCapture,
+              log: turnLogCapture,
+            });
+            if (authorityExec === null) return;
+          }
           const enrichedParsed = await attachMasterHistoricalMessages(
             inboundParsedCapture,
             turnLogCapture,
@@ -2740,6 +3201,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const rewrittenObj = {
             ...enrichedParsed,
             traceId: turnTraceIdCapture,
+            ...(authorityExec !== null
+              ? {
+                  model: authorityExec.canonicalModel,
+                  [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(authorityExec),
+                }
+              : {}),
           };
           const rewrittenStr = JSON.stringify(rewrittenObj);
           const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -2840,6 +3307,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // 容器协议错 → force final
         cleanup("frame_too_big", true);
         return;
+      }
+      // ── 容器 attestation 帧(方案 §7 步 3/4)────────────────────────────────
+      // container→master 的内部控制帧,**绝不**透传给浏览器(与 outbound.codex_billing
+      // 同款拦截:cheap string 预筛,不解 JSON 影响热路径)。必须在 TTFT 观测之前处理 ——
+      // attest 是连接握手的一部分,不是"容器的第一帧响应"。
+      if (!isBinary) {
+        let attestPeek: string | null = null;
+        if (typeof data === "string") attestPeek = data;
+        else if (Buffer.isBuffer(data)) {
+          try { attestPeek = data.toString("utf8"); } catch { attestPeek = null; }
+        }
+        if (attestPeek !== null && attestPeek.includes(`"${CONTAINER_ATTEST_FRAME_TYPE}"`)) {
+          let parsedAttest: unknown = null;
+          try { parsedAttest = JSON.parse(attestPeek); } catch { /* 非 JSON → 落回常规路径 */ }
+          if (
+            parsedAttest !== null && typeof parsedAttest === "object" &&
+            (parsedAttest as { type?: unknown }).type === CONTAINER_ATTEST_FRAME_TYPE
+          ) {
+            onContainerAttest(parsedAttest as Record<string, unknown>);
+            return;
+          }
+        }
       }
       // Bridge TTFT 终点:首个 container→user 帧。
       // 守卫 firstUserFrameAtMs !== null 防御容器在用户发帧前主动 push(理论不发生,
@@ -3296,6 +3785,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       bridgeLog?.debug("user-chat-bridge: container connected", {
         host: endpoint.host, port: endpoint.port,
       });
+      // attestation 超时:容器 open 后应**立刻**发 attest 帧(gateway 在 ws connection
+      // 建立时同步 send)。超时 = 旧 release(没这段代码)→ 拒连接 + stale recycle。
+      // 计时起点放在 open 而不是 upgrade:连接还没建立就开始计时会把慢网络误判成旧容器。
+      if (authorityOn && attestState === "pending" && attestTimer === null) {
+        attestTimer = setTimeout(
+          () => failAttestation("attestation_timeout"),
+          authorityDeps?.attestTimeoutMs ?? DEFAULT_ATTEST_TIMEOUT_MS,
+        );
+      }
       // V3 cold-start UX 提示:本次 ensureRunning 走了 provision 分支 → 给前端发
       // 一帧 sidecar,前端把 typing indicator 文案换成"首次加载上下文较慢"。
       // 用 sys.* 命名空间避免与 ccb outbound.* 帧冲突;前端 default case 会忽略未知 type,
@@ -3812,6 +4310,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         clearInterval(modelCheckerRefreshTimer);
         modelCheckerRefreshTimer = null;
       }
+      // attestation 门的超时 timer:连接一走就必须清(否则 timer 到点后对一条已关的
+      // 连接触发 recycle —— 把用户容器无辜换掉)。
+      if (attestTimer !== null) {
+        clearTimeout(attestTimer);
+        attestTimer = null;
+      }
+      attestQueue.length = 0;
+      attestQueuedBytes = 0;
       clearTimeout(connectTimer);
       // heartbeat timeout / shutdown / force 路径下 userWs 可能还 OPEN —— terminate
       if (

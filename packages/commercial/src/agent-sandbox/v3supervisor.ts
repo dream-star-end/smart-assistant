@@ -869,6 +869,37 @@ export interface V3SupervisorDeps {
    */
   bridgeSecret?: string;
   /**
+   * 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7 步 4)。
+   *
+   * 注入 → provisionV3Container 往容器 env 写三项:
+   *   - `OC_MODEL_AUTHORITY_KEYRING`(**公钥** keyring;私钥只在 master 的
+   *     ws/authoritySigner,永不进容器。公钥公开无妨 —— 容器内同 uid 进程读得到
+   *     /proc/self/environ 也伪造不出 Ed25519 签名,这正是非对称信任根优于共享密钥的地方);
+   *   - `OC_USER_ID`(容器归属 uid;容器侧断言 envelope.uid == 本容器,防跨用户复用);
+   *   - `OC_MODEL_AUTHORITY=1`(仅 required 时;容器侧同构 fail-closed:bridge 连接的
+   *     inbound.message 必须带有效 envelope,否则拒帧)。
+   *
+   * 未注入 → 容器拿不到 keyring → gateway 的 ModelAuthorityConsumer.enabled=false →
+   * hello attestation **不广播** `model_authority_v1` → flag 开启后 bridge 拒该连接并
+   * 触发 recycle(旧 env 容器由此被换掉,不会静默跑在无权威判定的老路径上)。
+   *
+   * **轮换耦合**(R3-M7 五步):keyring env 只在 provision 时注入,故「下发新公钥」=
+   * 换 env + 全量 recycle。切私钥(步③)必须在全部在跑容器 attest 新 keyId 之后,
+   * 否则在跑容器验不了新签名 → 全站 UnknownKey 拒帧。
+   */
+  modelAuthority?: {
+    /** `OC_MODEL_AUTHORITY_KEYRING=<keyId:pub,...>`(AuthoritySigner.publicKeyringEnvAssignment())。 */
+    keyringEnvAssignment: string;
+    /** flag 开启 → 容器侧强制要求 envelope。 */
+    required: boolean;
+    /**
+     * 平台次级模型(签发 authority 时进 auxModels;egress 据此放行 WebFetch/WebSearch 的
+     * `/v1/messages`)。**master 单向下发**:注入 `OPENCLAUDE_SECONDARY_MODEL` 让容器实际
+     * 用同一值,消除 master/runtime 版本 skew 导致的 403。省略 → 容器回落 gateway 常量(同旧)。
+     */
+    auxModels?: readonly string[];
+  };
+  /**
    * 多机 compute-pool facade。注入 + 传入的 `hostId !== selfHostId` 时,
    * provision/stop/status 的 docker 操作走 remote node-agent;否则所有
    * docker 调用仍然走本地 `deps.docker`(保留单机 MVP 行为,零风险)。
@@ -948,6 +979,17 @@ export interface ProvisionedV3Container {
    * deps.selfHostId = remote host(caller 的 readiness 要走 node-tunnel)。
    */
   hostId: string | null;
+  /**
+   * 本次 provision **实际打在容器 `bundle_rev` label 上的值**(模型权威批次 §5 阶段 B)。
+   *
+   * 取自同一份 `runtimeLabels[RUNTIME_BUNDLE_REV_LABEL_KEY]` —— 不是"desired tuple 的镜像",
+   * 而是"这个容器身上那个 label 的值",与 warm 路径(docker inspect labels)**同一权威源**,
+   * 两条路径不可能漂移。
+   *
+   * bundle 轴未启用 / label 值为空 → undefined。master 阶段 B 按它读该 rev 的 seed 声明
+   * 推导计费模型;缺失 → bridge fail-closed 拒帧(不回落常量)。
+   */
+  bundleRev?: string;
 }
 
 /** getV3ContainerStatus 返回 */
@@ -2277,6 +2319,8 @@ export async function provisionV3Container(
   let createdDockerId = "";
   // codex 绑定成功则记账;Tx2 与 container_internal_id 一并写库(中段不再持事务 UPDATE)。
   let boundCodexAccountId: bigint | null = null;
+  // 实际打上的 bundle_rev label(在下方 runtimeLabels 组装处赋值)—— 中段块作用域外要读,故在此声明。
+  let appliedBundleRev: string | undefined;
   try {
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
 
@@ -2397,6 +2441,26 @@ export async function provisionV3Container(
           .digest("hex")}`,
       );
       env.push(`OPENCLAUDE_INBOUND_NONCE=${computeInboundNonce(deps.bridgeSecret, row.id)}`);
+    }
+
+    // 模型执行权威(方案 §2/§7 步 4)—— 公钥 keyring + 容器身份 + 强制门。
+    // 只加 env,不改任何其它 provision 语义;未注入 deps.modelAuthority → 容器行为完全同旧。
+    // OC_CONTAINER_ID 已在上面 bridgeSecret 分支注入(容器侧断言 containerId 依赖它;
+    // 二者同为「master 与容器共享身份」的 env,生产两者恒同时存在)。
+    if (deps.modelAuthority) {
+      env.push(deps.modelAuthority.keyringEnvAssignment);
+      env.push(`OC_USER_ID=${String(uid)}`);
+      if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
+      // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
+      // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
+      // 值让容器实际用它 —— 二者同源,消除"master 签 A、容器发 B"的版本 skew(master 与
+      // runtime image 来自不同 commit 时,skew 会让 WebFetch/WebSearch 吃 403)。
+      // gateway 侧 `OPENCLAUDE_SECONDARY_MODEL ?? DEFAULT_SECONDARY_UTILITY_MODEL` 的回落保留,
+      // 未注入时(个人版/旧 master)行为完全同旧。
+      for (const aux of deps.modelAuthority.auxModels ?? []) {
+        env.push(`OPENCLAUDE_SECONDARY_MODEL=${aux}`);
+        break; // 容器侧 ANTHROPIC_SMALL_FAST_MODEL 是单值(取证:CCB getSmallFastModel 单一 env)
+      }
     }
 
     // CCB 基线只读挂载。**fail-closed 默认**:基线缺失/校验失败 → 抛
@@ -2540,6 +2604,9 @@ export async function provisionV3Container(
           // converge;两端 desired 同源见 v3ensureRunning)。未启用则完全不打(B1)。
           runtimeLabels[RUNTIME_BUNDLE_REV_LABEL_KEY] = tuple.bundleRev ?? "";
           runtimeLabels[RUNTIME_BOOT_HASH_LABEL_KEY] = tuple.bootHash ?? "";
+          // 阶段 B:把"实际打上的 label 值"回传给 caller(ensureRunning → bridge)。空串(OPTIONAL
+          // 降级)视同缺失 → master 拒帧,不去猜一个它并没真跑的 rev。
+          appliedBundleRev = runtimeLabels[RUNTIME_BUNDLE_REV_LABEL_KEY] || undefined;
         }
 
         // ── release 轴 ── 未启用 = 完全跳过(不挂 /opt/openclaude、不打 release label、不注 workspace env)。
@@ -2996,6 +3063,7 @@ export async function provisionV3Container(
     dockerContainerId: createdDockerId,
     token,
     hostId: effectiveHostUuid,
+    ...(appliedBundleRev ? { bundleRev: appliedBundleRev } : {}),
   };
 }
 

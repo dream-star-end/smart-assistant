@@ -74,6 +74,7 @@ import { computeInboundNonce } from "../bridgeSecret.js";
 import {
   RUNTIME_RELEASE_LABEL_KEY,
   RUNTIME_BOOT_HASH_LABEL_KEY,
+  RUNTIME_BUNDLE_REV_LABEL_KEY,
 } from "./platformBundle.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
@@ -428,6 +429,21 @@ function computeRuntimeStale(
 }
 
 /**
+ * 运行中容器**实际跑的** platform bundle rev(= 容器 `bundle_rev` label)。
+ *
+ * 模型权威批次 §5 阶段 B:master 按它读**这个容器那个 rev** 的 seed 声明推导计费模型。
+ * 权威必须是"容器身上贴着的 label",不是 master 的 desired tuple —— 滚动窗口里(新 bundle 已发、
+ * 老容器未回收)两者可以不同,拿 desired 就是"master 按新声明计费、容器按旧 seed 执行"的分叉本身。
+ *
+ * 空串(bundle 轴 OPTIONAL 降级,生产禁用)/ label 缺失(远端 inspect 未扩契约、bundle 轴未启用)
+ * → undefined → bridge 在 flag 开启时 fail-closed 拒帧(阶段 A 的全量核验已保证生产不出现)。
+ */
+function bundleRevOfStatus(status: V3ContainerStatus): string | undefined {
+  const rev = status.labels?.[RUNTIME_BUNDLE_REV_LABEL_KEY];
+  return typeof rev === "string" && rev !== "" ? rev : undefined;
+}
+
+/**
  * Phase 3D 主入口 — bridge 注入这个 lambda 给 resolveContainerEndpoint。
  *
  * 闭包持 V3SupervisorDeps + EnsureRunningOptions。返回的函数签名严格匹配
@@ -466,6 +482,11 @@ export function makeV3EnsureRunning(
    * admin/metrics.ts wsBridgeTtft help 文档)。
    */
   coldStart: boolean;
+  /**
+   * 容器实际跑的 platform bundle rev(label `bundle_rev`;见 bundleRevOfStatus)。
+   * bridge 阶段 B 用它按 rev 读 seed 声明推导计费模型;缺失 → flag 开启时 fail-closed 拒帧。
+   */
+  bundleRev?: string;
   tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
 }> {
   const readinessOpts = buildReadinessOpts(options);
@@ -603,11 +624,13 @@ export function makeV3EnsureRunning(
         resolveBridgeTunnelTarget,
       );
       observeContainerEnsureDuration("warm", (Date.now() - ensureStartedAt) / 1000);
+      const warmBundleRev = bundleRevOfStatus(status);
       return {
         host: status.boundIp,
         port: status.port,
         containerId: status.containerId,
         coldStart: false,
+        ...(warmBundleRev ? { bundleRev: warmBundleRev } : {}),
         ...(tunnel ? { tunnel } : {}),
       };
     }
@@ -908,6 +931,9 @@ export function makeV3EnsureRunning(
       port: provisioned.port,
       containerId: provisioned.containerId,
       coldStart: true,
+      // 冷启:provision 回传的是它**实际打在 label 上**的值(与 warm 路径的 docker inspect
+      // 同一权威源),不是 desired tuple 的镜像 —— 两条路径不可能漂移。
+      ...(provisioned.bundleRev ? { bundleRev: provisioned.bundleRev } : {}),
       ...(tunnel ? { tunnel } : {}),
     };
   };

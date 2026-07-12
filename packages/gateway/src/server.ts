@@ -215,6 +215,17 @@ import {
   type SkillFeedbackRef,
 } from './skillUsageReporter.js'
 import { resolveEngine } from './engine/registry.js'
+import {
+  AuthorityRejected,
+  MODEL_AUTHORITY_FIELD,
+  ModelAuthorityConsumer,
+  attachTurnAuthority,
+  buildContainerAttestFrame,
+  getTurnAuthority,
+  stripModelAuthorityField,
+  type ConnectionAuthorityContext,
+  type TurnExecutionDescriptor,
+} from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -301,7 +312,18 @@ export const EXECUTION_MODEL_FALLBACK = 'glm-5.2'
 export function resolveExecutionModel(
   preferred: string | undefined | null,
   fallback: string | undefined | null,
+  /**
+   * master 签名的执行权威(方案 §2)。存在 → **直接用 descriptor.canonicalModel**,
+   * 不过 ALLOWED_INBOUND_MODELS 这张 baked 白名单。
+   *
+   * 为什么不能再过白名单:baked 白名单是容器镜像里的第二信任源。catalog 里新 staged→active
+   * 的模型(镜像没这一版)会被它降级成 glm-5.2 —— master 按新模型预扣/签发,容器却跑
+   * 另一个模型,计费与执行分裂。descriptor 已经是「master 唯一判定者」的产物(active +
+   * 有价 + capability schema 可理解),再拿旧白名单去二次审判它,等于让旧快照否决新快照。
+   */
+  authority?: { canonicalModel: string },
 ): string {
+  if (authority !== undefined) return authority.canonicalModel
   for (const m of [preferred, fallback]) {
     if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
   }
@@ -512,6 +534,8 @@ export function _buildSafeCodexRouteOverride(args: {
   /** 本 gateway 的监听端口(config.gateway.port)——official override 的 loopback
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
+  /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -521,7 +545,7 @@ export function _buildSafeCodexRouteOverride(args: {
   // 只需不带 override。
   let engineId: string
   try {
-    engineId = resolveEngine(args.model, args.agent as never)
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
   } catch {
     return null
   }
@@ -1346,6 +1370,17 @@ export class Gateway {
   // can catch up without hitting REST. When the ring can't satisfy a resume,
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
   private _outboundRing!: OutboundRingBuffer
+
+  // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7)────────────────────
+  // 容器侧验签消费器(进程级:keyring + 容器身份 + epoch 单调水位 + replay cache)。
+  // env 缺 keyring / 身份 → enabled=false → attestation 不广播 model_authority_v1
+  // → bridge(flag 开)拒该连接并触发 recycle。个人版 / 无 env 的场景恒 disabled,
+  // 所有旧路径行为零变化。
+  private _modelAuthority = ModelAuthorityConsumer.fromEnv(process.env, (event, fields) =>
+    this.log.error(event, fields),
+  )
+  /** 每条 bridge 连接的 challenge(WeakMap:ws GC 即释放)。 */
+  private _authorityConns = new WeakMap<WebSocket, ConnectionAuthorityContext>()
 
   // ── Phase 4 GitHub workspace: per-WS recent hello peers cache + pending binds ──
   // bind 帧到达时,sessionId 必须出现在 clientsByPeer 注册表 OR 该 ws 最近 5s 内
@@ -8622,6 +8657,77 @@ export class Gateway {
 
   private wsClients = new Set<WebSocket>()
 
+  /**
+   * 消费一条 bridge inbound.message 上的模型执行权威(方案 §2)。
+   *
+   * @returns true = 放行(descriptor 已挂载 / 本地路径无需 authority);
+   *          false = **拒帧**(已回 error 帧,调用方必须 return,不得 dispatch)
+   *
+   * 真值表(fail-closed 优先):
+   *   | 来源      | 帧带 envelope | 容器能验签 | required | 结果                    |
+   *   |-----------|---------------|-----------|----------|-------------------------|
+   *   | 本地 WS   | —             | —         | —        | 放行(baked 判定,零变化)|
+   *   | bridge    | 否            | —         | 否       | 放行(flag 未开的旧行为) |
+   *   | bridge    | 否            | —         | **是**   | **拒**(flag 开 = 必须带)|
+   *   | bridge    | 是            | 否        | —        | **拒**(验不了就不许信)  |
+   *   | bridge    | 是            | 是        | —        | 验签 + 全断言,过 → 挂载 |
+   *
+   * 「带 envelope 但容器验不了签」为什么必须拒而不是回落 baked:master 已按 descriptor
+   * 完成计费编排(codex 预扣 / journal),容器若改用自己的 baked 判定跑,就是**计费与执行
+   * 分裂**。宁可拒帧让用户重发(桥会把这类容器 recycle 掉)。
+   */
+  private _consumeFrameAuthority(
+    ws: WebSocket,
+    frame: Record<string, unknown>,
+    isFromBridge: boolean,
+  ): boolean {
+    // 本地路径(个人版前端 / 容器内自连):不消费 authority。wire 字段由
+    // dispatchInbound 入口无条件 strip(客户端塞的同名字段永不被信任)。
+    if (!isFromBridge) return true
+
+    const hasEnvelope = frame[MODEL_AUTHORITY_FIELD] !== undefined && frame[MODEL_AUTHORITY_FIELD] !== null
+    const conn = this._authorityConns.get(ws)
+
+    if (!hasEnvelope) {
+      if (this._modelAuthority.required) {
+        this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority')
+        return false
+      }
+      return true
+    }
+
+    try {
+      if (!conn) {
+        throw new AuthorityRejected('not_configured', 'no authority context for this connection')
+      }
+      const descriptor = this._modelAuthority.consume(frame, conn)
+      attachTurnAuthority(frame, descriptor)
+      return true
+    } catch (err) {
+      const rejection =
+        err instanceof AuthorityRejected
+          ? err
+          : new AuthorityRejected('bad_shape', (err as Error)?.message ?? String(err))
+      this._rejectAuthority(ws, rejection.code, rejection.message)
+      return false
+    }
+  }
+
+  private _rejectAuthority(ws: WebSocket, code: string, detail: string): void {
+    // 拒帧是安全事件:reason 进日志(运维可见),**不**回给客户端内文
+    // (避免把 epoch / challenge / keyId 等内部线索泄漏给容器内的用户 AI)。
+    this.log.warn('model_authority.rejected', { code, detail })
+    try {
+      ws.send(
+        JSON.stringify({
+          type: 'error',
+          code: 'MODEL_AUTHORITY_REJECTED',
+          error: 'model authority rejected',
+        }),
+      )
+    } catch { /* ws may already be closed */ }
+  }
+
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
     if (this._shuttingDown) {
@@ -8668,6 +8774,40 @@ export class Gateway {
 
     this.wsClients.add(ws)
     ws.once('close', () => this.wsClients.delete(ws))
+
+    // ── 模型执行权威 attestation(方案 §7 步 3/4)────────────────────────────
+    // **只对 bridge 连接发**:isFromBridge 是「对端是 master」的唯一权威判据(容器内
+    // 的本地/个人版 WS 客户端拿不到这条旁路)。个人版前端因此永远看不到这帧,零影响。
+    //
+    // 帧内容 = { capabilities, connectionChallenge }:
+    //   - capabilities 含 model_authority_v1 ⟺ 本容器**真的能验签**(有 keyring + 身份 env);
+    //     旧 env 的新镜像容器不会骗到 bridge(见 ModelAuthorityConsumer.enabled)。
+    //   - connectionChallenge 每连接现铸,bridge 必须把它签进 authority payload
+    //     (R4-m4)。连接关闭 / gateway 重启后 challenge 变更 → 旧 envelope 天然失效,
+    //     replay cache 不需要跨进程共享。
+    // 连接一建立就发(先于任何用户帧到达):bridge 侧的 attestation 门在收到本帧前会
+    // 缓冲用户帧,收到即放行 —— 早到帧竞态由缓冲覆盖,不靠时序运气。
+    if (isFromBridge) {
+      const authorityConn = this._modelAuthority.newConnection()
+      this._authorityConns.set(ws, authorityConn)
+      ws.once('close', () => this._modelAuthority.closeConnection(authorityConn))
+      try {
+        ws.send(
+          JSON.stringify(
+            buildContainerAttestFrame(
+              this._modelAuthority,
+              authorityConn,
+              Number(process.env.OC_CONTAINER_ID) || null,
+            ),
+          ),
+        )
+      } catch (err) {
+        this.log.warn('model_authority.attest_send_failed', {
+          err: (err as Error)?.message ?? String(err),
+        })
+      }
+    }
+
     // Phase 4 — ws close 时清 pending bind 队列(WeakMap recentHelloPeers 自动 GC)
     ws.once('close', () => {
       for (const [key, entry] of this._pendingRepoBinds) {
@@ -8745,6 +8885,12 @@ export class Gateway {
       }
 
       if (frame.type === 'inbound.message') {
+        // ── 模型执行权威消费(方案 §2)───────────────────────────────────────
+        // 顺序铁律:**先消费(需要读 wire 字段),再 strip**。strip 由 dispatchInbound
+        // 入口统一兜底(一切入口无条件 strip),descriptor 经 WeakMap 旁路挂载 ——
+        // 客户端在 wire 上伪造不出 WeakMap key,故没有「伪造 descriptor」这个面。
+        if (!this._consumeFrameAuthority(ws, frame as any, isFromBridge)) return
+
         // Stash userId on the frame so downstream dispatchInbound/deliver
         // paths that don't have the WS in scope can still build the correct
         // per-user peerKey. Private field (leading _), never sent over wire.
@@ -9796,6 +9942,16 @@ export class Gateway {
   }
 
   private async dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
+    // ── 一切入口无条件 strip `__oc_model_authority`(方案 §2 铁律)──────────────
+    // dispatchInbound 是**所有** inbound 的唯一汇流点(bridge WS / 本地 WS / HTTP
+    // inbound / cron / delegate / channel adapter),故 strip 收口在这里一处:
+    //   - bridge WS 路径:_consumeFrameAuthority 已在此之前读完并把 descriptor 挂进
+    //     WeakMap,wire 字段的使命已尽 → 删掉,绝不让它流进 runner / 日志 / 持久化;
+    //   - 其余路径:该字段只可能来自客户端伪造 → 删掉,永不被信任。
+    // descriptor 走 WeakMap 而不是 frame 上的私有属性,正是为了让「strip 干净」与
+    // 「descriptor 可用」两件事互不冲突(见 modelAuthority.ts 的 authorityByFrame)。
+    stripModelAuthorityField(frame as unknown as Record<string, unknown>)
+
     // Ingress guard: drop new messages once shutdown begins so we don't spin
     // up work that `shutdownAll()` then has to tear back down.
     if (this._shuttingDown) return
@@ -9970,11 +10126,19 @@ export class Gateway {
     // 模型准入由 ALLOWED_INBOUND_MODELS(入站帧)+ resolveExecutionModel
     // (agent.model 绕过口)收口;canUseModel 在 ws bridge 层已先于此路径拦截,
     // 这是 belt-and-suspenders。
+    // ── 模型执行权威(方案 §2):有 descriptor 的 turn,model 判定**只**认 descriptor ──
+    // baked 白名单(ALLOWED_INBOUND_MODELS)是容器镜像里的第二信任源,与 master 的
+    // catalog 快照必然漂移(catalog 里新 active 的模型,旧镜像的白名单不认识 → 帧被
+    // 静默降级 → master 按 A 计费、容器跑 B)。descriptor 存在时它已是 master 唯一判定
+    // 的产物(active + 有价 + capability schema 可理解),不再过第二道审判。
+    const turnAuthority: TurnExecutionDescriptor | undefined = getTurnAuthority(frame)
     const _frameModelRaw = (frame as any).model
     const safeModelForRouting: string | undefined =
-      typeof _frameModelRaw === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModelRaw)
-        ? _frameModelRaw
-        : undefined
+      turnAuthority !== undefined
+        ? turnAuthority.canonicalModel
+        : typeof _frameModelRaw === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModelRaw)
+          ? _frameModelRaw
+          : undefined
     if (safeModelForRouting) {
       // 用 router/explicit 已解析出的 agent.id,而不是 frame.agentId ?? cfg.default。
       // 否则如果 router 通过 routes 规则选了一个非 default 的 claude agent,这里会把它
@@ -10055,15 +10219,24 @@ export class Gateway {
     //   - 合法 string → 透传
     //   - null      → 透传(显式清除已有 effort,让 runner 回到模型默认)
     //   - 其它(包括字段缺省) → 不传给 sessionManager,保持现有 runner 不动
+    //
+    // effort 的判定权威同样上移 descriptor(方案 §2:engine/capability/context/effort/
+    // vision 全取自 descriptor):allowlist 用 descriptor.supportedEfforts(该模型真实
+    // 支持的档位),而不是平台全集 —— 平台全集会把「模型不支持的档位」放进 runner。
+    // 帧未带 effort 且 descriptor 有 codexDefaultEffort → 用模型默认档(仅新建 session
+    // 生效,既存 session 的切换由 submit 处理,语义与旧实现一致)。
     const _frameEffort = (frame as any).effortLevel
+    const allowedEfforts: ReadonlySet<string> =
+      turnAuthority !== undefined
+        ? new Set(turnAuthority.supportedEfforts)
+        : ALLOWED_REASONING_EFFORTS
     let safeEffortLevel: string | null | undefined
     if (_frameEffort === null) {
       safeEffortLevel = null
-    } else if (
-      typeof _frameEffort === 'string' &&
-      ALLOWED_REASONING_EFFORTS.has(_frameEffort)
-    ) {
+    } else if (typeof _frameEffort === 'string' && allowedEfforts.has(_frameEffort)) {
       safeEffortLevel = _frameEffort
+    } else if (_frameEffort === undefined && turnAuthority?.codexDefaultEffort !== undefined) {
+      safeEffortLevel = turnAuthority.codexDefaultEffort
     } else {
       safeEffortLevel = undefined
     }
@@ -10107,6 +10280,17 @@ export class Gateway {
       model: safeModelForRouting,
       rawRoute: (frame as any).__oc_codex_route,
       officialRelayPort: this.deps.config.gateway.port,
+      // engine 判定与 getOrCreate 同源:descriptor 说 codex 就是 codex,不看 baked 表
+      // (否则 catalog 新增的 codex 系模型在旧镜像里判成 ccb → route override 被丢 →
+      //  codex turn 无路由)。
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
     })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
@@ -10143,6 +10327,16 @@ export class Gateway {
       // 触发 engine teardown + compact transcript preamble;同 engine 内的模型
       // 切换仍由 submit() 的 setModel + shutdown 处理。
       model: safeModel,
+      // 方案 §2:有签名 descriptor 的 turn,engine + canonicalModel 直接落地,
+      // sessionManager 内的两张 baked 表(白名单 / MODEL_ENGINE_MAP)不参与判定。
+      ...(turnAuthority !== undefined
+        ? {
+            executionAuthority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
     })
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
@@ -11234,6 +11428,23 @@ export class Gateway {
     const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      // 模型权威批次 §4 —— bridge turn 的上游请求凭据。
+      //
+      // descriptor 是**验签产物**(_consumeAuthority → attachTurnAuthority),它原样保留了
+      // 两张 envelope 串;这里只是把它们透传到 CCB runner(→ ANTHROPIC_CUSTOM_HEADERS →
+      // 每个 `/v1/messages` 的 x-oc-model-authority / x-oc-turn-lease)。**不重签、不改写**:
+      // egress 的验签根是 master 私钥,容器只是搬运工。
+      //
+      // 无 descriptor(本地路径 / flag 未开)→ 不传 → runner 写空串清位 + (flag 开时)自取
+      // local_catalog token。清位判定收在 runner 单点,任何 submit 入口都漏不掉。
+      ...(turnAuthority !== undefined
+        ? {
+            modelAuthority: {
+              authorityEnvelope: turnAuthority.authorityEnvelope,
+              leaseEnvelope: turnAuthority.leaseEnvelope,
+            },
+          }
+        : {}),
       ...(teamMode && agent.id === 'main'
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
