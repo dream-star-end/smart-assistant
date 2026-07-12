@@ -612,6 +612,15 @@ if oc_hotcfg__history_verify_line "$BADLINE" >/dev/null 2>&1; then
   bad "schemaVer=3 应被拒"
 else ok "R3-m2 未知 schemaVer=3 被拒"; fi
 
+echo "== TR4 GC 遇空轴条目(pre-state)不炸严格壳 =="
+# 生产首启实证:pre-state 条目 release/bundle 皆空,_hotcfg_protect '' '' 末条 [ -n '' ]
+# 返回 1 在 set -e 下炸整个 GC(部署期"GC 失败"告警真身)。HPRE 含 pre-state 条目,直跑断言。
+if oc_hotcfg_gc "$WORK/pre.env" "$HPRE" >/dev/null 2>&1; then
+  ok "TR4 GC 含空轴 pre-state 条目正常完成(严格壳)"
+else
+  bad "TR4 GC 遇空轴条目不应失败"
+fi
+
 echo ""
 echo "════════ 结果:PASS=$PASS FAIL=$FAIL ════════"
 [ "$FAIL" = 0 ]
