@@ -95,7 +95,21 @@ not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
 
 `
 
-const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+/** Keep native Codex effort forwarding identical across exec and app-server.
+ *  `max` is currently verified only for GPT-5.6 Sol; the common four levels
+ *  preserve the existing behaviour for other Codex models. */
+export function codexReasoningEffortForModel(
+  model: string | undefined,
+  effort: string | undefined,
+): CodexReasoningEffort | null {
+  if (!effort || !CODEX_REASONING_EFFORTS.has(effort)) return null
+  if (effort !== 'max') return effort as CodexReasoningEffort
+  const modelName = model?.toLowerCase().split('/').pop() ?? ''
+  return /^gpt[-_]?5\.6[-_]sol$/.test(modelName) ? 'max' : null
+}
 
 const PROJECT_RULE_FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
 const PROJECT_RULE_MAX_BYTES = 96 * 1024
@@ -240,8 +254,8 @@ export interface CodexLaunchOverridesContext {
    *  etc., so codex gets a no-op pass-through. */
   provider?: string
   model?: string
-  /** UI effort level passed through. For codex-backed agents, OpenClaude only
-   *  forwards the stable common subset low/medium/high/xhigh as codex's native
+  /** UI effort level passed through. For codex-backed agents, OpenClaude
+   *  forwards low/medium/high/xhigh/max as codex's native
    *  `model_reasoning_effort`; other UI-only levels remain prompt-slot-only. */
   effortLevel?: string
   /** mkdtempSync'd directory the caller has prepared. We write the
@@ -285,7 +299,7 @@ export interface CodexLaunchOverrides {
    *
    *  Order is stable and deterministic for snapshot tests:
    *    1. model_instructions_file
-   *    2. model_reasoning_effort (if low/medium/high/xhigh is selected)
+   *    2. model_reasoning_effort (if low/medium/high/xhigh/max is selected)
    *    3. mcp_servers.openclaude_memory.command (if entry resolved)
    *    4. mcp_servers.openclaude_memory.args
    *    5. mcp_servers.openclaude_memory.env
@@ -330,8 +344,9 @@ export async function buildCodexLaunchOverrides(
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
 
   const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
-  if (ctx.effortLevel && CODEX_REASONING_EFFORTS.has(ctx.effortLevel)) {
-    argvOverrides.push('-c', `model_reasoning_effort=${tomlValue(ctx.effortLevel)}`)
+  const reasoningEffort = codexReasoningEffortForModel(ctx.model, ctx.effortLevel)
+  if (reasoningEffort) {
+    argvOverrides.push('-c', `model_reasoning_effort=${tomlValue(reasoningEffort)}`)
   }
 
   // mcp-memory injection — best-effort. If the bundled entry can't be

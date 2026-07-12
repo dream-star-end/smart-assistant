@@ -9,21 +9,22 @@ import { defaultModels, effortsForModel } from '@openclaude/storage'
  * own default — never silently loses its control again (the gpt-5.5 regression).
  */
 describe('effortsForModel: capability authority', () => {
-  it('Codex GPT-5 reasoning depth → low/medium/high/xhigh, tolerant of id variants', () => {
-    const expected = ['low', 'medium', 'high', 'xhigh']
-    assert.deepEqual(effortsForModel('gpt-5.6-sol'), expected)
-    assert.deepEqual(effortsForModel('gpt-5.6-terra'), expected)
-    assert.deepEqual(effortsForModel('gpt-5.6-luna'), expected)
-    assert.deepEqual(effortsForModel('GPT-5.6-SOL'), expected)
-    assert.deepEqual(effortsForModel('openai/gpt-5.6-sol'), expected)
-    assert.deepEqual(effortsForModel('gpt-5.5'), expected)
-    assert.deepEqual(effortsForModel('GPT-5.5'), expected)
-    assert.deepEqual(effortsForModel('openai/gpt-5.5'), expected)
+  it('Codex GPT-5 reasoning depth includes Sol max and tolerates id variants', () => {
+    const common = ['low', 'medium', 'high', 'xhigh']
+    const sol = [...common, 'max']
+    assert.deepEqual(effortsForModel('gpt-5.6-sol'), sol)
+    assert.deepEqual(effortsForModel('GPT-5.6-SOL'), sol)
+    assert.deepEqual(effortsForModel('openai/gpt-5.6-sol'), sol)
+    assert.deepEqual(effortsForModel('gpt-5.6-terra'), common)
+    assert.deepEqual(effortsForModel('gpt-5.6-luna'), common)
+    assert.deepEqual(effortsForModel('gpt-5.5'), common)
+    assert.deepEqual(effortsForModel('GPT-5.5'), common)
+    assert.deepEqual(effortsForModel('openai/gpt-5.5'), common)
     // Only concrete GPT-5.6 variants are valid with ChatGPT-auth Codex.
     assert.deepEqual(effortsForModel('gpt-5.6'), [])
     assert.deepEqual(effortsForModel('gpt-5.6-pro'), [])
-    // OpenClaude only exposes the stable common Codex subset; no Claude Workflow-only ultracode.
-    assert.ok(!effortsForModel('gpt-5.6-sol').includes('max'))
+    // Sol's native `ultra` is automatic delegation, not the Claude-only
+    // `ultracode` mode, so it is not exposed as a plain reasoning depth.
     assert.ok(!effortsForModel('gpt-5.6-sol').includes('ultracode'))
   })
 

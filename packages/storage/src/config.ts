@@ -60,9 +60,12 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
   const id = modelId.toLowerCase()
   const modelName = id.split('/').pop() ?? id
   // Codex GPT-5 reasoning depth. Maps to OpenAI Codex `model_reasoning_effort`.
-  // Expose the common stable subset across GPT-5.6 Sol/Terra/Luna and GPT-5.5;
-  // do not add bare `gpt-5.6`, which ChatGPT-auth Codex rejects.
-  if (/^gpt[-_]?5\.5$/.test(modelName) || /^gpt[-_]?5\.6[-_](sol|terra|luna)$/.test(modelName)) {
+  // Sol also supports `max`; keep Terra/Luna/GPT-5.5 on the verified common
+  // subset. Do not add bare `gpt-5.6`, which ChatGPT-auth Codex rejects.
+  if (/^gpt[-_]?5\.6[-_]sol$/.test(modelName)) {
+    return ['low', 'medium', 'high', 'xhigh', 'max']
+  }
+  if (/^gpt[-_]?5\.5$/.test(modelName) || /^gpt[-_]?5\.6[-_](terra|luna)$/.test(modelName)) {
     return ['low', 'medium', 'high', 'xhigh']
   }
   // Claude Fable 5 — 旗舰,最强长程 agentic + 异步子代理编排。同 Opus 全档 + ultracode;
