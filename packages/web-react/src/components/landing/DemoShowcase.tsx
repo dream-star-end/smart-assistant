@@ -29,7 +29,7 @@ const HOLD_MS = 4200; // 答案打完后停留再切下一幕（留足时间看�
  *
  * 动效纪律（避免「页面一直在动」）：
  * - 卡片 md 起定高、答案区按完整文案预留高度 —— 打字过程零布局位移；
- * - 六幕播完一轮即停在完成态（不无限循环），提供「重播」；
+ * - 全部场景播完一轮即停在完成态（不无限循环），提供「重播」；
  * - 滚出视口自动暂停，回来再继续；尊重 prefers-reduced-motion。
  * 纯前端动画（无任何网络请求）。
  */
@@ -39,7 +39,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
   const [stepCount, setStepCount] = useState(0); // 已完成的执行动作数
   const [typed, setTyped] = useState(0); // 已打出的答案字数
   const [done, setDone] = useState(false); // 本幕答案是否打完
-  const [ended, setEnded] = useState(false); // 六幕播完一轮，停住
+  const [ended, setEnded] = useState(false); // 全部场景播完一轮，停住
   const [runSeq, setRunSeq] = useState(0); // 手动跳转/重播时自增，强制重跑当前幕
   // stepCount/typed/done 归属的场景。切场景时 idx 先变、这些进度态下一拍才在 effect 里重置，
   // 中间那一帧若直接用旧进度态配新场景，会让新场景的答案/成果面板错误闪现。以此守卫。
@@ -183,7 +183,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           </span>
           <span className="text-[13px] font-medium text-fg">全能助手</span>
           <span className="ml-auto rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-faint">
-            动态演示 · 示意数据
+            {sc.sourceLabel ?? "动态演示 · 示意数据"}
           </span>
         </div>
 
@@ -279,7 +279,12 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
 
           {/* 右栏：成果预览（把交付物画出来） */}
           <div className="border-t border-border bg-sidebar/25 md:border-l md:border-t-0">
-            <ArtifactPreview artifact={sc.artifact} deliverable={sc.deliverable} done={stepsDone} />
+            <ArtifactPreview
+              artifact={sc.artifact}
+              deliverable={sc.deliverable}
+              done={stepsDone}
+              publicLink={sc.publicLink}
+            />
           </div>
         </div>
 
