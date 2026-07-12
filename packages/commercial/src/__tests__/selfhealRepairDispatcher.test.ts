@@ -225,11 +225,12 @@ describe("repairDispatcher.postCancel", () => {
   });
 });
 
-describe("repairDispatcher.postRelease(收尾批 §B)", () => {
-  test("2xx → ok,POST 到 /api/webhooks/v5-selfheal-release,body 只含 id,同 HMAC 契约", async () => {
-    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true }));
+describe("repairDispatcher.postRelease(收尾批 §B + BLOCKER1 body 裁决)", () => {
+  test("200 {ok:true,status:'deployed'} → ok,POST 到 /api/webhooks/v5-selfheal-release,body 只含 id,同 HMAC 契约", async () => {
+    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true, status: "deployed", detail: null }));
     const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
     assert.equal(r.ok, true);
+    assert.equal(r.remoteStatus, "deployed");
     assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal-release");
     assert.deepEqual(JSON.parse(calls[0].init.body), { repairId: "10", incidentId: "7" });
     const h = calls[0].init.headers;
@@ -240,12 +241,53 @@ describe("repairDispatcher.postRelease(收尾批 §B)", () => {
     assert.equal(h["X-Selfheal-Sig"], expected);
   });
 
+  test("BLOCKER1 负例:200 但 body.status!=='deployed' → ok=false,携带 remoteStatus/reason", async () => {
+    const { fetchFn } = makeFetch(
+      200,
+      JSON.stringify({ ok: true, status: "in_progress", detail: { reason: "deploy already running" } }),
+    );
+    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, false, "2xx 不是部署成功的权威,body.status 才是");
+    assert.equal(r.remoteStatus, "in_progress");
+    assert.equal(r.reason, "deploy already running");
+  });
+
+  test("BLOCKER1 负例:200 但 body.ok!==true → ok=false", async () => {
+    const { fetchFn } = makeFetch(200, JSON.stringify({ ok: false, status: "deployed", detail: null }));
+    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, false);
+  });
+
+  test("BLOCKER1 负例:200 但 body 非 JSON → ok=false", async () => {
+    const { fetchFn } = makeFetch(200, "OK");
+    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, false, "无法解析的 body 绝不算部署成功");
+    assert.equal(r.remoteStatus, undefined);
+  });
+
+  test("非 2xx(409 pending/rejected)→ ok=false,body 的 status/detail.reason 仍被解析供展示", async () => {
+    const { fetchFn } = makeFetch(
+      409,
+      JSON.stringify({ ok: false, status: "rejected", detail: { reason: "denylist hit: deploy-v5.sh" } }),
+    );
+    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, false);
+    assert.equal(r.httpStatus, 409);
+    assert.equal(r.remoteStatus, "rejected");
+    assert.equal(r.reason, "denylist hit: deploy-v5.sh");
+  });
+
   test("3xx(SSRF 重定向逃逸面)按失败;5xx/网络异常 → ok=false", async () => {
     const { fetchFn: f302 } = makeFetch(302, "");
     assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f302, now: () => NOW })).ok, false);
-    const { fetchFn: f500 } = makeFetch(500, "boom");
-    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f500, now: () => NOW })).ok, false);
+    const { fetchFn: f500 } = makeFetch(500, JSON.stringify({ ok: false, status: "deploy_failed", detail: { reason: "smoke failed" } }));
+    const r500 = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f500, now: () => NOW });
+    assert.equal(r500.ok, false);
+    assert.equal(r500.remoteStatus, "deploy_failed");
+    assert.equal(r500.reason, "smoke failed");
     const fThrow: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
-    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fThrow, now: () => NOW })).ok, false);
+    const rThrow = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fThrow, now: () => NOW });
+    assert.equal(rThrow.ok, false);
+    assert.equal(rThrow.error, "ECONNREFUSED");
   });
 });

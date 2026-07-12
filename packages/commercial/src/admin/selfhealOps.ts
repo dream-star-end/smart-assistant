@@ -20,12 +20,14 @@
  * 收尾批新增:
  *   - listConditions(suppressed 过滤)/ adminUnsuppressCondition(误压回滚,audit tx)。
  *   - adminReleaseRepair:boss 一键放行 pending_release 的 Tier2 部署 →
- *     repairDispatcher.postRelease 经隧道通知个人版(见该函数头契约)。
+ *     claimRelease 原子占位(HIGH2 TOCTOU 收口)→ repairDispatcher.postRelease
+ *     经隧道通知个人版,只认其同步部署裁决 body.status==='deployed' 为成功
+ *     (BLOCKER1);失败审计如实记 failed 并清 claim 允许重试(见函数头时序)。
  */
 
 import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
-import { redactOpsPayload } from "../selfheal/redact.js";
+import { redactOpsPayload, scrubSecretsInString } from "../selfheal/redact.js";
 import { writeAdminAudit } from "./audit.js";
 import {
   writeCondition,
@@ -80,6 +82,11 @@ interface IncidentRow {
   resolved_at: Date | null;
 }
 
+/** M4:自由文本出口清洗(null 透传;值级凭据形状见 selfheal/redact.ts)。 */
+function scrubText(s: string | null): string | null {
+  return s === null ? null : scrubSecretsInString(s);
+}
+
 function serialize(r: IncidentRow): IncidentRowView {
   return {
     id: r.id,
@@ -92,7 +99,8 @@ function serialize(r: IncidentRow): IncidentRowView {
     audience: r.audience,
     user_title: r.user_title,
     user_message: r.user_message,
-    ops_detail: r.ops_detail,
+    // M4:ops_detail 出自探测器自由文本,可能夹带凭据 → 出口清洗(列表+详情共用本序列化)。
+    ops_detail: scrubText(r.ops_detail),
     rev: r.rev,
     resolve_source: r.resolve_source,
     opened_at: r.opened_at.toISOString(),
@@ -209,9 +217,10 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
     status: r.status,
     attempt: Number(r.attempt),
     tier: r.tier,
-    summary: r.summary,
+    // M4:summary/fail_reason 是 codex 回传自由文本 → 与 detail 同口径出口清洗。
+    summary: scrubText(r.summary),
     detail: redactOpsPayload(r.detail),
-    fail_reason: r.fail_reason,
+    fail_reason: scrubText(r.fail_reason),
     verify_after: r.verify_after ? r.verify_after.toISOString() : null,
     verify_deadline: r.verify_deadline ? r.verify_deadline.toISOString() : null,
     dispatched_at: r.dispatched_at ? r.dispatched_at.toISOString() : null,
@@ -237,7 +246,8 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
       id: e.id,
       repair_id: e.repair_id,
       kind: e.kind,
-      message: e.message,
+      // M4:event message 同为 codex 自由文本 → 出口清洗(detail 已过 redactOpsPayload)。
+      message: scrubSecretsInString(e.message),
       detail: redactOpsPayload(e.detail),
       created_at: e.created_at.toISOString(),
     }));
@@ -407,7 +417,39 @@ export async function adminUnsuppressCondition(
 
 // ─── repair 一键放行(§B:pending_release → 个人版 releaseApproved)────
 
-export type ReleaseOutcome = "released" | "not_found" | "conflict" | "delivery_failed";
+export type ReleaseOutcome = "released" | "not_found" | "conflict" | "failed";
+
+/**
+ * HIGH2:release-claim(PG 原子 CAS)。读检查(放行门)与网络请求之间的 TOCTOU 收口:
+ * 在 codex_repairs.detail 上原子置 `release_claimed=true`,WHERE 同时校验
+ * status='running' 且尚未 claim。该 UPDATE 与 resolveIncident 的 cancel CAS
+ * (running→cancel_requested)竞争**同一行**(行锁序化,谁先赢谁说了算):
+ *   - cancel/resolve 先赢 → status 已非 running → 0 行 → 不发放行请求;
+ *   - claim 先赢 → cancel 在行锁后依旧可推进状态(个人版 releaseApproved 侧再重验)。
+ * 0 行 → false(已被 cancel/resolve,或已有放行在途/已放行)。
+ */
+export async function claimRelease(repairId: string): Promise<boolean> {
+  const r = await query<{ id: string }>(
+    `UPDATE codex_repairs
+        SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb),
+            updated_at = NOW()
+      WHERE id = $1::bigint AND status = 'running'
+        AND COALESCE(detail->>'release_claimed','') <> 'true'
+      RETURNING id`,
+    [repairId],
+  );
+  return r.rows.length > 0;
+}
+
+/** HIGH2:postRelease 失败/异常后清 claim,允许重试(成功保留,挡二次放行)。 */
+export async function clearReleaseClaim(repairId: string): Promise<void> {
+  await query(
+    `UPDATE codex_repairs
+        SET detail = detail - 'release_claimed', updated_at = NOW()
+      WHERE id = $1::bigint`,
+    [repairId],
+  );
+}
 
 /**
  * pending_release 标记契约(跨仓,个人版 broker.notifyPendingRelease 同步):
@@ -415,6 +457,15 @@ export type ReleaseOutcome = "released" | "not_found" | "conflict" | "delivery_f
  * `POST .../progress { message, detail: { phase: 'pending_release', ... } }`,
  * 本端以 codex_repair_events(kind='progress' AND detail->>'phase'='pending_release')
  * 判定"待放行"。放行门:repair 当前 status='running' 且存在该事件。
+ *
+ * 时序(BLOCKER1 + HIGH2):
+ *   1) 读侧放行门 → 2) claimRelease 原子 CAS(0 行 → conflict,不发请求)→
+ *   3) postRelease(只认个人版同步裁决 body.status==='deployed' 为成功,见其头注)→
+ *   4a) 成功:同事务 note 事件 + 成功审计,claim 保留;
+ *   4b) 失败/异常:审计如实记 failed(不留成功假象),finally 清 claim 允许重试。
+ *
+ * 注意:break-glass(个人版 root 直连路径)**不经此门**——那是绕开 v5 控制面的
+ * break-glass 语义,本 claim 只序列化 v5 admin 面的放行入口。
  */
 export async function adminReleaseRepair(
   repairId: string,
@@ -441,25 +492,68 @@ export async function adminReleaseRepair(
     };
   }
 
-  // 2) 经隧道通知个人版 releaseApproved(网络操作在事务外;失败 = durable 状态零变化,可重试)。
-  const del = await _postRelease({ repairId: row.id, incidentId: row.incident_id });
-  if (!del.ok) return { outcome: "delivery_failed", httpStatus: del.httpStatus };
+  // 2) HIGH2:release-claim CAS(读检查后、网络请求前)。0 行 = 已被 cancel/resolve
+  //    抢先,或已有放行在途/已放行 → conflict,绝不重复发放行请求。
+  if (!(await claimRelease(repairId))) {
+    return { outcome: "conflict", reason: "release already claimed or repair no longer running" };
+  }
 
-  // 3) 成功后同事务:进度事件 + audit(tx fail-closed)。
-  await tx(async (client: PoolClient) => {
-    await client.query(
-      `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
-       VALUES ($1::bigint, 'note', $2, '{}'::jsonb)`,
-      [repairId, "管理员一键放行,已通知个人版执行部署(release webhook 2xx)"],
-    );
-    await writeAdminAudit(client, {
-      adminId: input.adminId,
-      action: "repair.release",
-      target: `repair:${repairId}`,
-      after: { repair_id: repairId, incident_id: row.incident_id },
-      ip: input.ip ?? null,
-      userAgent: input.userAgent ?? null,
+  let released = false;
+  try {
+    // 3) 经隧道通知个人版 releaseApproved(网络操作在事务外)。BLOCKER1:del.ok 已是
+    //    "个人版确认部署完成"(2xx ∧ body.ok ∧ status==='deployed'),不是裸 HTTP 2xx。
+    const del = await _postRelease({ repairId: row.id, incidentId: row.incident_id });
+    if (!del.ok) {
+      const reason =
+        del.reason ??
+        (del.remoteStatus !== undefined
+          ? `personal-side status: ${del.remoteStatus}`
+          : (del.error ??
+            (del.httpStatus !== undefined ? `http ${del.httpStatus}` : "release delivery failed")));
+      // 4b) 审计如实记 failed(不写 note 事件,不留"已放行并部署"假象);claim 在 finally 清。
+      await tx(async (client: PoolClient) => {
+        await writeAdminAudit(client, {
+          adminId: input.adminId,
+          action: "repair.release",
+          target: `repair:${repairId}`,
+          after: {
+            repair_id: repairId,
+            incident_id: row.incident_id,
+            outcome: "failed",
+            reason,
+            remote_status: del.remoteStatus ?? null,
+            http_status: del.httpStatus ?? null,
+          },
+          ip: input.ip ?? null,
+          userAgent: input.userAgent ?? null,
+        });
+      });
+      return { outcome: "failed", httpStatus: del.httpStatus, reason };
+    }
+
+    // 4a) 部署确认成功 → 同事务:note 事件 + 成功审计(tx fail-closed)。
+    await tx(async (client: PoolClient) => {
+      await client.query(
+        `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
+         VALUES ($1::bigint, 'note', $2, '{}'::jsonb)`,
+        [repairId, "管理员一键放行,个人版已确认部署完成(release deployed)"],
+      );
+      await writeAdminAudit(client, {
+        adminId: input.adminId,
+        action: "repair.release",
+        target: `repair:${repairId}`,
+        after: { repair_id: repairId, incident_id: row.incident_id, outcome: "released" },
+        ip: input.ip ?? null,
+        userAgent: input.userAgent ?? null,
+      });
     });
-  });
-  return { outcome: "released", httpStatus: del.httpStatus };
+    released = true; // claim 保留:已放行部署的修复不允许再次放行。
+    return { outcome: "released", httpStatus: del.httpStatus };
+  } finally {
+    if (!released) {
+      // postRelease 失败/任何异常(含 4a 事务写失败——此时无成功审计,重试得到真实状态)
+      // → 清 claim 允许重试。
+      await clearReleaseClaim(repairId);
+    }
+  }
 }

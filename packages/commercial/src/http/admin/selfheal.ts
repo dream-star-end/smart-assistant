@@ -189,8 +189,14 @@ export async function handleAdminReleaseRepair(
     if (r.outcome === "conflict") {
       throw new HttpError(409, "CONFLICT", r.reason ?? "repair is not pending release");
     }
-    if (r.outcome === "delivery_failed") {
-      throw new HttpError(502, "RELEASE_DELIVERY_FAILED", "personal-side release webhook failed; retry later");
+    if (r.outcome === "failed") {
+      // BLOCKER1:含"个人版 2xx 但部署未完成/被拒/失败"——reason 带个人版 status/detail,
+      // 如实透传给 admin UI;claim 已清,可重试。
+      throw new HttpError(
+        502,
+        "RELEASE_FAILED",
+        r.reason ?? "personal-side release failed; retry later",
+      );
     }
     sendJson(res, 200, { released: true, repairId: m[1] });
   } catch (err) {

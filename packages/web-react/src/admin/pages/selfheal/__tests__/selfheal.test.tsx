@@ -184,7 +184,7 @@ describe("repair 待放行卡 + 一键放行", () => {
     await waitFor(() =>
       expect(adminSend).toHaveBeenCalledWith("POST", "/selfheal/repairs/42/release"),
     );
-    expect(await screen.findByText("已放行，部署将由执行侧继续完成")).toBeTruthy();
+    expect(await screen.findByText("已放行，个人版已确认部署完成")).toBeTruthy();
   });
 
   test("running 但无 pending_release 事件 → 不渲染待放行卡(渲染正在修复卡)", async () => {

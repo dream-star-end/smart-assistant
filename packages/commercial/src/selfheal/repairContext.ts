@@ -18,7 +18,7 @@
  */
 
 import { query as _query } from "../db/queries.js";
-import { redactOpsPayload } from "./redact.js";
+import { redactOpsPayload, scrubSecretsInString } from "./redact.js";
 
 export interface RepairContext {
   repairId: string;
@@ -97,7 +97,8 @@ export async function getRepairContext(
     // sk-/Bearer/URL userinfo 凭据也被清);与 selfhealOps admin 视图同一收口。
     opsDetail: redactOpsPayload(row.ops_detail),
     probeSnapshot: redactOpsPayload(row.snapshot ?? {}),
-    repairHint: row.repair_hint,
+    // M4:repair_hint 虽是 admin 配的策略文本,仍可能被贴进凭据 → 同口径出口清洗。
+    repairHint: row.repair_hint === null ? null : scrubSecretsInString(row.repair_hint),
     tier: row.tier,
   };
 }

@@ -150,7 +150,9 @@ function IncidentDetailBody({ id }: { id: string }) {
     setReleasing(true);
     try {
       await adminSend("POST", `/selfheal/repairs/${encodeURIComponent(repairId)}/release`);
-      toast("已放行，部署将由执行侧继续完成", "success");
+      // BLOCKER1:200 = 个人版已同步确认部署完成(deployed),文案如实;失败(含个人版
+      // 部署被拒/失败)走 catch,reason 由后端 RELEASE_FAILED message 透传。
+      toast("已放行，个人版已确认部署完成", "success");
       refresh();
     } catch (e) {
       toast(apiErrorMessage(e, "放行失败"), "error");

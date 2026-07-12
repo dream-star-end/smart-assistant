@@ -26,6 +26,9 @@
  *   (METHOD 大写;path = URL pathname,无 query —— 签名绑路由,防跨端点重放)。
  * 端点路径:/api/webhooks/v5-selfheal(派单)/ -cancel(取消)/ -release(放行)。
  * cancel 响应:200 `{terminated: boolean, accepted?: boolean}`。
+ * release 响应(BLOCKER1,同步部署裁决,body 恒 {ok,status,detail}):deployed→200 /
+ *   pending|rejected→409 / in_progress→423 / deploy_failed→500 / 内部异常→503;
+ *   本端只认 2xx ∧ body.ok===true ∧ body.status==='deployed' 为成功(见 postRelease)。
  * SSRF 钉死(M5):派单 URL 由 selfheal/config.assertSelfhealConfig 限定 loopback;
  * fetch 全部 redirect:'manual',3xx 一律按失败(okStatus 只认 2xx),重定向逃逸封死。
  */
@@ -442,10 +445,19 @@ export async function postCancel(
 // ─── 放行通知(隧道 → 个人版 release 端点;收尾批 §B)──────────────────
 
 export interface ReleaseDelivery {
-  /** 2xx = 个人版 receiver 已受理放行(releaseApproved 重验 + 部署在个人版侧推进)。 */
+  /**
+   * true = 个人版确认**部署完成**:HTTP 2xx **且** body.ok===true **且**
+   * body.status==='deployed'(BLOCKER1:2xx 只证明 receiver 活着,部署成败的
+   * 权威在 body;2xx + 非 deployed body / body 非 JSON 一律按失败)。
+   */
   ok: boolean;
   httpStatus?: number;
+  /** 网络/配置层错误(fetch 异常、URL/secret 未配置)。 */
   error?: string;
+  /** 个人版 body.status(deployed/pending/rejected/in_progress/deploy_failed…);body 非 JSON → undefined。 */
+  remoteStatus?: string;
+  /** 个人版 body.detail.reason(或 detail 为字符串时其本体);失败时供上层展示。 */
+  reason?: string;
 }
 
 /**
@@ -453,27 +465,58 @@ export interface ReleaseDelivery {
  * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-release`,与
  *   dispatch 完全相同的 HMAC 信任链(M3 路由绑定签名),body `{ repairId, incidentId }`。
  * 个人版 receiver 验签后走**进程内** releaseApproved(repairId)(重验 pending_release
- * 记录 + ancestry + denylist → deployDriver)。非 2xx / 网络失败 → ok=false(调用方
- * 据此回 502,不落审计/事件——durable 状态零变化,可安全重试)。
+ * 记录 + ancestry + denylist → deployDriver),**同步**返回部署裁决(跨仓契约,BLOCKER1):
+ *   deployed      → 200 `{ok:true,  status:'deployed',    detail}`
+ *   pending/rejected → 409 `{ok:false, status:'pending'|'rejected', detail}`
+ *   in_progress   → 423 `{ok:false, status:'in_progress', detail}`
+ *   deploy_failed → 500 `{ok:false, status:'deploy_failed', detail}`
+ *   内部异常       → 503 `{ok:false, status:'…',           detail}`
+ * (body 恒有 {ok,status,detail}。)只有 2xx ∧ body.ok===true ∧ body.status==='deployed'
+ * 才算成功;其余(含 2xx 但 body 非 deployed / 非 JSON)一律 ok=false,并携带
+ * remoteStatus / detail.reason 供上层(adminReleaseRepair → admin UI)如实展示。
  */
 export async function postRelease(
   input: { repairId: string; incidentId: string },
   deps: DispatcherDeps = {},
 ): Promise<ReleaseDelivery> {
   const d = resolveDeps(deps);
-  const { res } = await postSigned(
+  const { res, rawText } = await postSigned(
     "/api/webhooks/v5-selfheal-release",
     { repairId: input.repairId, incidentId: input.incidentId },
     input.repairId,
     (s) => s >= 200 && s < 300,
     { fetch: d.fetch, now: d.now, logger: d.logger },
   );
-  if (!res.ok) {
+  // body 恒为 {ok,status,detail}(含 409/423/5xx 失败码);解析失败 → body=null 按失败。
+  let body: { ok?: unknown; status?: unknown; detail?: unknown } | null = null;
+  if (rawText) {
+    try {
+      const parsed: unknown = JSON.parse(rawText);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        body = parsed as { ok?: unknown; status?: unknown; detail?: unknown };
+      }
+    } catch {
+      /* body 非 JSON → 按失败处理 */
+    }
+  }
+  const remoteStatus = typeof body?.status === "string" ? body.status : undefined;
+  const detail = body?.detail;
+  let reason: string | undefined;
+  if (typeof detail === "string" && detail.length > 0) {
+    reason = detail;
+  } else if (detail !== null && typeof detail === "object") {
+    const r = (detail as { reason?: unknown }).reason;
+    if (typeof r === "string" && r.length > 0) reason = r;
+  }
+  const deployed = res.ok && body !== null && body.ok === true && remoteStatus === "deployed";
+  if (!deployed) {
     d.logger.warn("selfheal_release_post_failed", {
       repairId: input.repairId,
       httpStatus: res.httpStatus,
-      error: res.error,
+      remoteStatus,
+      reason,
+      error: res.error ?? (res.ok ? "release response body not deployed" : undefined),
     });
   }
-  return { ok: res.ok, httpStatus: res.httpStatus, error: res.error };
+  return { ok: deployed, httpStatus: res.httpStatus, error: res.error, remoteStatus, reason };
 }

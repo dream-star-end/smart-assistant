@@ -35,7 +35,10 @@ import {
   adminResolveIncident,
   adminUnsuppressCondition,
   adminReleaseRepair,
+  claimRelease,
+  getIncidentDetail,
   listConditions,
+  listIncidents,
 } from "../admin/selfhealOps.js";
 
 const TEST_DB_URL =
@@ -446,17 +449,24 @@ describe("§B adminReleaseRepair(一键放行)", () => {
   let server: Server | null = null;
   let received: Array<{ url: string; method: string; headers: Record<string, string | string[] | undefined>; body: string }> = [];
   let respondStatus = 200;
+  // BLOCKER1 契约:个人版 release 端点同步返回部署裁决,body 恒 {ok,status,detail}。
+  const defaultBody = (): string =>
+    respondStatus === 200
+      ? JSON.stringify({ ok: true, status: "deployed", detail: null })
+      : JSON.stringify({ ok: false, status: "deploy_failed", detail: { reason: "deploy smoke failed" } });
+  let respondBody: () => string = defaultBody;
 
   async function startReleaseServer(): Promise<number> {
     received = [];
     respondStatus = 200;
+    respondBody = defaultBody;
     server = createServer((req, res) => {
       let body = "";
       req.on("data", (c) => { body += String(c); });
       req.on("end", () => {
         received.push({ url: req.url ?? "", method: req.method ?? "", headers: req.headers, body });
         res.statusCode = respondStatus;
-        res.end(JSON.stringify({ ok: respondStatus === 200 }));
+        res.end(respondBody());
       });
     });
     await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
@@ -492,6 +502,15 @@ describe("§B adminReleaseRepair(一键放行)", () => {
     return rep.rows[0].id;
   }
 
+  /** codex_repairs.detail->>'release_claimed' 现值(null = 无 claim)。 */
+  async function releaseClaimed(repairId: string): Promise<string | null> {
+    const r = await query<{ claimed: string | null }>(
+      `SELECT detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
+      [repairId],
+    );
+    return r.rows[0]?.claimed ?? null;
+  }
+
   test("放行门通过 → POST release(HMAC 路由绑定签名可验)+ note event + audit", async (t) => {
     if (skipIfNoPg(t)) return;
     const repairId = await seedPendingRelease();
@@ -518,7 +537,16 @@ describe("§B adminReleaseRepair(一键放行)", () => {
         `SELECT kind, message FROM codex_repair_events WHERE repair_id=$1::bigint ORDER BY id DESC LIMIT 1`, [repairId]);
       assert.equal(ev.rows[0].kind, "note");
       assert.match(ev.rows[0].message, /放行/);
+      assert.match(ev.rows[0].message, /部署完成/, "note 只在个人版确认 deployed 后才写");
       assert.equal(await auditRows("repair.release"), 1);
+      const audit = await query<{ outcome: string | null }>(
+        `SELECT after->>'outcome' AS outcome FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
+      assert.equal(audit.rows[0].outcome, "released");
+      // HIGH2:成功保留 claim(挡二次放行)→ 再次放行必 conflict 且零新 POST。
+      assert.equal(await releaseClaimed(repairId), "true");
+      const again = await adminReleaseRepair(repairId, adminInput());
+      assert.equal(again.outcome, "conflict");
+      assert.equal(received.length, 1, "二次放行不重发 release POST");
     } finally {
       await stopReleaseServer();
     }
@@ -535,23 +563,130 @@ describe("§B adminReleaseRepair(一键放行)", () => {
     assert.equal(await auditRows("repair.release"), 0, "被拒路径零审计零事件");
   });
 
-  test("个人版 5xx → delivery_failed,零 durable 副作用(可安全重试)", async (t) => {
+  test("个人版 5xx → failed:审计如实记 failed(零 note 事件),清 claim 后可重试成功", async (t) => {
     if (skipIfNoPg(t)) return;
     const repairId = await seedPendingRelease();
     await startReleaseServer();
     respondStatus = 500;
     try {
       const r = await adminReleaseRepair(repairId, adminInput());
-      assert.equal(r.outcome, "delivery_failed");
+      assert.equal(r.outcome, "failed");
+      assert.equal(r.reason, "deploy smoke failed", "body.detail.reason 透传供展示");
       const ev = await query<{ n: string }>(
         `SELECT COUNT(*)::text AS n FROM codex_repair_events WHERE repair_id=$1::bigint AND kind='note'`, [repairId]);
-      assert.equal(ev.rows[0].n, "0");
-      assert.equal(await auditRows("repair.release"), 0);
-      // 重试成功路径仍通。
+      assert.equal(ev.rows[0].n, "0", "失败绝不写'已放行并部署'note(不留成功假象)");
+      // BLOCKER1:失败也留审计,但 outcome 必须如实为 failed。
+      assert.equal(await auditRows("repair.release"), 1);
+      const audit = await query<{ outcome: string | null; reason: string | null }>(
+        `SELECT after->>'outcome' AS outcome, after->>'reason' AS reason
+           FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
+      assert.equal(audit.rows[0].outcome, "failed");
+      assert.equal(audit.rows[0].reason, "deploy smoke failed");
+      // HIGH2 CAS 例3:失败已清 claim → 重试成功路径仍通。
+      assert.equal(await releaseClaimed(repairId), null, "失败后 claim 必须被清,否则永久卡死重试");
       respondStatus = 200;
       assert.equal((await adminReleaseRepair(repairId, adminInput())).outcome, "released");
+      assert.equal(await releaseClaimed(repairId), "true", "成功保留 claim");
     } finally {
       await stopReleaseServer();
     }
+  });
+
+  test("BLOCKER1:个人版 2xx 但 body.status!=='deployed' → failed(不写成功事件/成功审计),清 claim", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const repairId = await seedPendingRelease();
+    await startReleaseServer();
+    respondBody = () =>
+      JSON.stringify({ ok: false, status: "pending", detail: { reason: "operator gate not approved" } });
+    try {
+      const r = await adminReleaseRepair(repairId, adminInput());
+      assert.equal(r.outcome, "failed", "裸 HTTP 2xx 不是部署成功的权威");
+      assert.equal(r.reason, "operator gate not approved");
+      const ev = await query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM codex_repair_events WHERE repair_id=$1::bigint AND kind='note'`, [repairId]);
+      assert.equal(ev.rows[0].n, "0");
+      const audit = await query<{ outcome: string | null; remote: string | null }>(
+        `SELECT after->>'outcome' AS outcome, after->>'remote_status' AS remote
+           FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
+      assert.equal(audit.rows[0].outcome, "failed");
+      assert.equal(audit.rows[0].remote, "pending");
+      assert.equal(await releaseClaimed(repairId), null, "失败清 claim 允许重试");
+    } finally {
+      await stopReleaseServer();
+    }
+  });
+
+  test("HIGH2 CAS 例1:cancel(resolveIncident)先赢 → claim 0 行拒,conflict 且零放行 POST", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const repairId = await seedPendingRelease();
+    const incR = await query<{ incident_id: string }>(
+      `SELECT incident_id::text AS incident_id FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
+    // cancel CAS 先赢:running → cancel_requested(与 claim UPDATE 竞争同一行)。
+    await tx((client: PoolClient) => resolveIncident(incR.rows[0].incident_id, "admin", client));
+    // claim CAS 直接验证:status 已非 running → 0 行 → false。
+    assert.equal(await claimRelease(repairId), false, "cancel 先赢后 claim 必须 0 行拒");
+    // 全链:不发请求(未起 server —— 若走到 POST 会得 failed 而非 conflict)。
+    const r = await adminReleaseRepair(repairId, adminInput());
+    assert.equal(r.outcome, "conflict");
+    assert.equal(await auditRows("repair.release"), 0, "conflict 路径零审计");
+  });
+
+  test("HIGH2 CAS 例2:重复 claim 拒 —— 已在放行中(claim 持有)时二次放行 conflict,不发请求", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const repairId = await seedPendingRelease();
+    assert.equal(await claimRelease(repairId), true, "首次 claim 成功");
+    assert.equal(await releaseClaimed(repairId), "true");
+    assert.equal(await claimRelease(repairId), false, "重复 claim 必须 0 行拒");
+    // 读侧放行门(running + pending_release)全过,但 claim CAS 挡住 → conflict。
+    // 未起 server:若绕过 claim 走到 POST,会得 failed 而非 conflict。
+    const r = await adminReleaseRepair(repairId, adminInput());
+    assert.equal(r.outcome, "conflict");
+    assert.match(r.reason ?? "", /already claimed/);
+    assert.equal(await releaseClaimed(repairId), "true", "他人持有的 claim 不被 conflict 路径清除");
+  });
+});
+
+// ═══ M4 — admin 出口脱敏(自由文本值级清洗)═══════════════════════════
+
+describe("M4 admin 出口:ops_detail/summary/fail_reason/event message 值级脱敏", () => {
+  test("ops_detail 含 sk- 令牌在列表+详情输出被清;summary/fail_reason/event message 同口径", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const inc = await query<{ id: string }>(
+      `INSERT INTO incidents (dedupe_key, condition_key, status, severity, surface, audience,
+                              user_title, user_message, ops_detail)
+       VALUES ('k.m4','k.m4','open','critical','global','all','t','m',
+               'probe saw Authorization: Bearer eyJhbGciOi.abc and key sk-live0123456789abcdef')
+       RETURNING id::text AS id`,
+    );
+    const rep = await query<{ id: string }>(
+      `INSERT INTO codex_repairs (incident_id, status, attempt, tier, summary, fail_reason, detail)
+       VALUES ($1::bigint, 'failed', 1, 'tier2',
+               'patched config with token=sk-live0123456789abcdef',
+               'redeploy failed: password=hunter2sEcret unreachable',
+               '{"note":"used sk-live0123456789abcdef"}'::jsonb)
+       RETURNING id::text AS id`,
+      [inc.rows[0].id],
+    );
+    await query(
+      `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
+       VALUES ($1::bigint, 'progress', 'calling api with sk-live0123456789abcdef now', '{}'::jsonb)`,
+      [rep.rows[0].id],
+    );
+
+    const detail = await getIncidentDetail(inc.rows[0].id);
+    assert.ok(detail);
+    const flat = JSON.stringify(detail);
+    assert.ok(!flat.includes("sk-live0123456789abcdef"), "sk- 令牌不得出现在 admin 详情任何字段");
+    assert.ok(!flat.includes("hunter2sEcret"), "password= 尾随值不得泄漏");
+    assert.ok(!flat.includes("eyJhbGciOi.abc"), "Bearer 值不得泄漏");
+    assert.match(detail.incident.ops_detail ?? "", /\[redacted:key\]/);
+    assert.match(detail.repairs[0].summary ?? "", /\[redacted\]/);
+    assert.match(detail.repairs[0].fail_reason ?? "", /\[redacted\]/);
+    assert.match(detail.events[0].message, /\[redacted:key\]/);
+
+    const list = await listIncidents({});
+    const row = list.rows.find((x) => x.id === inc.rows[0].id);
+    assert.ok(row);
+    assert.ok(!(row.ops_detail ?? "").includes("sk-live0123456789abcdef"), "列表出口同样被清");
   });
 });

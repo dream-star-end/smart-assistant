@@ -8,6 +8,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { redactOpsPayload, scrubSecretsInString } from "../selfheal/redact.js";
+import { getRepairContext, type RepairContextDeps } from "../selfheal/repairContext.js";
 
 describe("scrubSecretsInString(值级清洗)", () => {
   test("sk- key / Bearer / gh 令牌 / Slack / AWS key 全部被替换", () => {
@@ -76,5 +77,50 @@ describe("redactOpsPayload(key 级 + 值级叠加,深度遍历)", () => {
     let deep: Record<string, unknown> = { v: "x" };
     for (let i = 0; i < 12; i++) deep = { child: deep };
     assert.doesNotThrow(() => redactOpsPayload(deep));
+  });
+});
+
+describe("M4 出口:getRepairContext 自由文本清洗(repairHint 含)", () => {
+  test("repair_hint 内嵌 sk- 令牌被清;opsDetail/snapshot 同口径出口", async () => {
+    const fakeQuery = (async () => ({
+      rows: [
+        {
+          repair_id: "1",
+          incident_id: "2",
+          attempt: 1,
+          tier: "tier2",
+          condition_key: "ops.monitor:svc_v5",
+          surface: "global",
+          severity: "critical",
+          ops_detail: "probe saw Authorization: Bearer eyJhbGciOi.abc",
+          match_key: null,
+          repair_hint: "rotate old key sk-live0123456789abcdef in egress config",
+          snapshot: { token: "sk-live0123456789abcdef" },
+        },
+      ],
+    })) as unknown as RepairContextDeps["query"];
+
+    const ctx = await getRepairContext("1", { query: fakeQuery });
+    assert.ok(ctx);
+    const flat = JSON.stringify(ctx);
+    assert.ok(!flat.includes("sk-live0123456789abcdef"), "凭据不得穿透 repairHint/snapshot 出口");
+    assert.ok(!flat.includes("eyJhbGciOi.abc"), "Bearer 值不得穿透 opsDetail 出口");
+    assert.match(ctx.repairHint ?? "", /\[redacted:key\]/);
+    assert.ok(ctx.repairHint!.includes("egress config"), "非凭据文本保留(运维定位价值)");
+  });
+
+  test("repair_hint 为 null 时透传 null", async () => {
+    const fakeQuery = (async () => ({
+      rows: [
+        {
+          repair_id: "1", incident_id: "2", attempt: 1, tier: "tier1",
+          condition_key: "k", surface: "chat", severity: "warning",
+          ops_detail: null, match_key: null, repair_hint: null, snapshot: null,
+        },
+      ],
+    })) as unknown as RepairContextDeps["query"];
+    const ctx = await getRepairContext("1", { query: fakeQuery });
+    assert.ok(ctx);
+    assert.equal(ctx.repairHint, null);
   });
 });
