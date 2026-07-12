@@ -267,6 +267,32 @@ describe('compileSpec', () => {
     assert.throws(() => compileSpec(spec, baseDecision()), isCode('SPEC_SCHEMA_INVALID'))
   })
 
+  test('result 顶层数组(list 端点):items 严格 object → 通过;items 非严格/params 数组 → 拒', () => {
+    // ① items 为严格 object allowlist → 编译通过(与运行时投影能力对齐)。
+    const ok = baseSpec()
+    ;(ok.actions as Record<string, unknown>[])[0].result = {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, properties: { id: { type: 'integer' } } },
+    }
+    assert.doesNotThrow(() => compileSpec(ok, baseDecision()))
+
+    // ② items 非严格(缺 additionalProperties:false)→ 拒。
+    const loose = baseSpec()
+    ;(loose.actions as Record<string, unknown>[])[0].result = {
+      type: 'array',
+      items: { type: 'object', properties: { id: { type: 'integer' } } },
+    }
+    assert.throws(() => compileSpec(loose, baseDecision()), isCode('UNSAFE_SCHEMA'))
+
+    // ③ params 顶层不得为数组(仍须 object,支撑占位符解析)。
+    const badParams = baseSpec()
+    ;(badParams.actions as Record<string, unknown>[])[0].params = {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false },
+    }
+    assert.throws(() => compileSpec(badParams, baseDecision()), isCode('UNSAFE_SCHEMA'))
+  })
+
   test('auth 与 authMode 不匹配 → AUTH_SCHEMA_INVALID', () => {
     const spec = baseSpec()
     // oauth2 形状的 auth,但 authMode 仍是 static-token → 过 union,但过不了权威逐字段校验。

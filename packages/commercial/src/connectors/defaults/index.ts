@@ -7,8 +7,13 @@
 
 import type { DefaultConnector } from './types.js'
 import { feishuDefault } from './feishu.js'
+import { githubDefault } from './github.js'
 import { notionDefault } from './notion.js'
 
-export const DEFAULT_CONNECTORS: readonly DefaultConnector[] = [notionDefault, feishuDefault]
+export const DEFAULT_CONNECTORS: readonly DefaultConnector[] = [
+  notionDefault,
+  feishuDefault,
+  githubDefault,
+]
 
 export type { DefaultConnector } from './types.js'

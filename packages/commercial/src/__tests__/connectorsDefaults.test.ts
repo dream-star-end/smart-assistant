@@ -33,6 +33,17 @@ describe('默认连接器 seed spec', () => {
     }
   })
 
+  test('GitHub:static-token + list_repos 顶层数组 read', () => {
+    const gh = DEFAULT_CONNECTORS.find((d) => d.spec.id === 'github')
+    assert.ok(gh)
+    const { execContract } = compileSpec(gh!.spec, gh!.decision)
+    assert.equal(execContract.authMode, 'static-token')
+    const list = execContract.actions.find((a) => a.id === 'list_repos')
+    assert.equal(list?.effect, 'read')
+    assert.equal((list?.result as { type?: string })?.type, 'array')
+    assert.equal(execContract.actions.find((a) => a.id === 'whoami')?.effect, 'read')
+  })
+
   test('Notion:query_database 被签为 read(safe-read-non-get)', () => {
     const notion = DEFAULT_CONNECTORS.find((d) => d.spec.id === 'notion')
     assert.ok(notion)

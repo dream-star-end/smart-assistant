@@ -115,11 +115,31 @@ function assertSafeSchemaDeep(node: unknown, depth: number): void {
   }
 }
 
-/** params 顶层必须 object + strict;result 顶层 object + allowlist(additionalProperties:false)。 */
+/**
+ * params 顶层必须 object + strict(支撑 `{/params/x}` 占位符解析与严格入参)。
+ * result 顶层 object + allowlist,**或**顶层数组(list 端点:GitHub /user/repos、issues、commits 等
+ * 一整类返回顶层数组的只读 REST;运行时 projectResultAllowlist 早已按 items 递归投影)——此时 items
+ * 必须是严格 object allowlist(additionalProperties:false),深度/污染键/字节上限护栏与 object 同。
+ */
 function assertSafeActionSchema(schema: unknown, kind: 'params' | 'result'): void {
   if (schema === null || typeof schema !== 'object' || Array.isArray(schema))
     throw new ConnectorSpecError('UNSAFE_SCHEMA', `${kind} schema must be a JSON Schema object`)
   const s = schema as Record<string, unknown>
+  if (kind === 'result' && s.type === 'array') {
+    const items = s.items
+    if (items === null || typeof items !== 'object' || Array.isArray(items))
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'result array items must be a JSON Schema object')
+    const it = items as Record<string, unknown>
+    if (it.type !== 'object')
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', "result array items type must be 'object'")
+    if (it.additionalProperties !== false)
+      throw new ConnectorSpecError(
+        'UNSAFE_SCHEMA',
+        'result array items must be strict (additionalProperties:false)',
+      )
+    assertSafeSchemaDeep(schema, 0)
+    return
+  }
   if (s.type !== 'object')
     throw new ConnectorSpecError('UNSAFE_SCHEMA', `${kind} schema top-level type must be 'object'`)
   if (s.additionalProperties !== false)
