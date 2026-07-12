@@ -1,4 +1,4 @@
-import { Check, FileDown, Link2, Loader2 } from "lucide-react";
+import { Check, ExternalLink, FileDown, Link2, Loader2 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import type { Artifact } from "./demoScripts";
 
@@ -12,10 +12,12 @@ export function ArtifactPreview({
   artifact,
   deliverable,
   done,
+  publicLink,
 }: {
   artifact: Artifact;
   deliverable?: string;
   done: boolean;
+  publicLink?: { label: string; href: string };
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -52,6 +54,21 @@ export function ArtifactPreview({
           <ArtifactSkeleton />
         )}
       </div>
+
+      {publicLink && (
+        <div className="border-t border-border bg-sidebar/40 px-3.5 py-2.5">
+          <a
+            href={publicLink.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`${publicLink.label}（在新窗口打开）`}
+            className="inline-flex items-center gap-1.5 rounded-md text-[12.5px] font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          >
+            <ExternalLink size={13} />
+            {publicLink.label}
+          </a>
+        </div>
+      )}
     </div>
   );
 }

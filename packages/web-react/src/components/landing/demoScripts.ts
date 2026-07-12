@@ -1,5 +1,6 @@
 import {
   Briefcase,
+  Gamepad2,
   GitBranch,
   Globe,
   LayoutDashboard,
@@ -88,16 +89,55 @@ export type DemoScenario = {
   deliverable?: string;
   /** 成果预览面板：交付物长什么样，直接画出来。 */
   artifact: Artifact;
+  /** 顶栏来源标识；缺省为「动态演示 · 示意数据」。 */
+  sourceLabel?: string;
+  /** 已公开交付物的外链（真实公开案例可选）。 */
+  publicLink?: { label: string; href: string };
   /** 回答用等宽字体渲染（代码场景）。 */
   mono?: boolean;
 };
 
 /**
- * 落地页动态演示脚本 —— 全部为**虚构的示意场景与示意数据**（不含任何真实用户数据），
- * 用于展示 agent 处理长程复杂任务的工作方式：拆解计划 → 反复执行 / 自检修正 → 交付成果。
- * 纯展示文案，不发任何真实请求。
+ * 落地页动态演示脚本。除明确标注「真实公开案例」的场景外，其余均为虚构示意数据；
+ * 所有场景仅做前端展示，不发任何真实请求。
  */
 export const DEMO_SCENARIOS: DemoScenario[] = [
+  {
+    id: "game",
+    tab: "做游戏",
+    icon: Gamepad2,
+    prompt:
+      "把当前项目已有内容清空，然后做一个修仙割草游戏，要有优秀美观的游戏画面和特效，以及丰富完整的功能",
+    steps: [
+      { label: "清理旧项目 · 设计完整玩法" },
+      { label: "编写战斗系统与水墨特效" },
+      { label: "构建并实测桌面 / 移动端" },
+      { label: "推送 GitHub · 发布公网试玩" },
+    ],
+    answer:
+      "《万劫问仙》已从零完成并公网发布：包含传承、神通、境界突破、6 波妖潮、Boss、洞府永久强化与本地存档，水墨粒子、法阵、雷电和剑光等特效齐全，手机和电脑浏览器都能直接游玩。",
+    runMeta: "自主执行 81 步 · 完成开发、实测与公网发布",
+    deliverable: "《万劫问仙》· 公网游戏",
+    sourceLabel: "真实公开案例",
+    publicLink: {
+      label: "立即游玩《万劫问仙》",
+      href: "https://dream-star-end.github.io/hello-world/",
+    },
+    artifact: {
+      kind: "diff",
+      title: "Canvas 修仙割草游戏",
+      file: "src/game.js",
+      lines: [
+        { t: "ctx", code: "@@ 从空项目到公网可玩 @@" },
+        { t: "add", code: "+ 3 种传承 · 6 类神通 · 6 波妖潮" },
+        { t: "add", code: "+ Boss / 境界突破 / 洞府永久强化" },
+        { t: "add", code: "+ 水墨粒子 · 法阵 · 雷电 · 剑光" },
+        { t: "add", code: "+ 键盘 + 移动端虚拟摇杆" },
+        { t: "add", code: "+ GitHub Pages 公网发布" },
+      ],
+      note: "构建通过 · 桌面 / 移动端实测 · 已上线",
+    },
+  },
   {
     id: "analysis",
     tab: "数据分析",
