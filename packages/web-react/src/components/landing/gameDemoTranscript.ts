@@ -1,9 +1,10 @@
 /**
  * 《万劫问仙》首页真实案例的单一数据源。
  *
- * userText / assistantText 来自用户明确授权展示的生产会话，两轮正文逐字保留；仅未收录
- * 请求 ID、会话 ID、账号、凭据与内部路径等敏感元数据。执行过程不是逐条 trace，而是依据
- * 当轮工具记录归纳的关键阶段，toolCallCount 保留生产记录中的真实数量。
+ * userText / assistantText 来自用户明确授权展示的生产会话：保留两轮结构和非地址
+ * 正文，第二轮的公网地址按用户最新展示要求脱敏。请求 ID、会话 ID、账号、凭据与内部
+ * 路径等敏感元数据也未收录。执行过程不是逐条 trace，而是依据当轮工具记录归纳的关键
+ * 阶段，toolCallCount 保留生产记录中的真实数量。
  */
 export const GAME_DEMO_TURNS = [
   {
@@ -57,11 +58,9 @@ npm run dev
     ],
     assistantText: `已公网发布并验证可正常进入游戏：
 
-https://dream-star-end.github.io/hello-world/
-
 手机和电脑浏览器都能直接游玩。`,
   },
 ] as const
 
 export const GAME_DEMO_DISCLOSURE =
-  '两轮用户与助手正文未删节；执行过程按真实关键阶段归纳；仅移除请求 ID、会话 ID、账号与凭据等敏感元数据。'
+  '保留两轮结构和非地址正文；公网地址按展示要求脱敏；执行过程按真实关键阶段归纳；敏感元数据已移除。'
