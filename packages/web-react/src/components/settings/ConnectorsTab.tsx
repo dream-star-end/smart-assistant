@@ -8,6 +8,7 @@ import {
   connectorIcon,
   connectorNeedsRelink,
   declarativeCapabilityLabel,
+  isOauthAuthMode,
   type ConnectorConnection,
   type ConnectorFormField,
   type ConnectorProvider,
@@ -620,13 +621,19 @@ function BindDialog({
   );
 }
 
-// ── 声明式绑定弹层（requiredBindSources 驱动；凭据直落服务端加密存储） ─────────
+// ── 声明式绑定弹层（requiredBindSources 驱动；直填落库 / oauth2 整页跳授权） ───
 
 /**
  * 声明式连接器绑定弹层：表单字段由 entry.requiredBindSources 驱动，每个 source 经
  * bindFieldMeta 取 label/输入类型（未知 source 回退密码框）。全部必填，另有可选备注名。
- * 提交调 api.bindDeclarativeConnector（secrets 键 = source 名）。凭据仅用于服务端加密
- * 存储，绝不进入对话或容器。
+ * 凭据仅用于服务端加密存储，绝不进入对话或容器。
+ *
+ * 按 authMode 分两条提交路径（判定收口于 isOauthAuthMode，禁散写字符串比较）：
+ *   - **oauth2-auth-code**：字段即用户 BYOA 自建应用的 client_id/client_secret →
+ *     api.startDeclarativeOauth → 整页跳转授权页（后端回跳 /?connector_linked=<slug>
+ *     由 App 层 toast）。此模式走直填 bind 会被后端硬拒，故必须走这条。
+ *   - 其余（static-token / token-exchange…）：api.bindDeclarativeConnector 直填落库
+ *     （secrets 键 = source 名）。
  */
 function DeclarativeBindDialog({
   auth,
@@ -652,6 +659,7 @@ function DeclarativeBindDialog({
     setSubmitting(false);
   }, [entry?.versionId]);
 
+  const isOauth = entry != null && isOauthAuthMode(entry.authMode);
   const sources = entry?.requiredBindSources ?? [];
   const missingRequired = sources.some((s) => !(values[s] ?? "").trim());
 
@@ -666,6 +674,18 @@ function DeclarativeBindDialog({
     }
     const dn = displayName.trim() || undefined;
     try {
+      if (isOauth) {
+        // 键 = 后端下发的 source 名（client_id / client_secret），非 camelCase。
+        const r = await api.startDeclarativeOauth(auth, {
+          versionId: entry.versionId,
+          clientId: secrets.client_id ?? "",
+          clientSecret: secrets.client_secret ?? "",
+          displayName: dn,
+        });
+        // 整页跳转授权页；回跳 /?connector_linked=<slug> 由 App 层 toast。
+        window.location.href = r.authorizeUrl;
+        return; // 跳转中，不再触发本地状态更新
+      }
       await api.bindDeclarativeConnector(auth, {
         versionId: entry.versionId,
         secrets,
@@ -673,7 +693,7 @@ function DeclarativeBindDialog({
       });
       onBound();
     } catch (e) {
-      setErr(errText(e, "绑定失败，请重试"));
+      setErr(errText(e, isOauth ? "发起授权失败，请重试" : "绑定失败，请重试"));
       setSubmitting(false);
     }
   };
@@ -683,7 +703,11 @@ function DeclarativeBindDialog({
       open={entry != null}
       onOpenChange={(o) => !o && onClose()}
       title={entry ? `绑定 ${entry.label}` : undefined}
-      description="凭据仅用于服务端加密存储，绝不会进入对话或容器。"
+      description={
+        isOauth
+          ? "填写你的自建应用凭据，前往授权后即可完成绑定。"
+          : "凭据仅用于服务端加密存储，绝不会进入对话或容器。"
+      }
       footer={
         entry && (
           <>
@@ -696,7 +720,7 @@ function DeclarativeBindDialog({
               disabled={submitting || missingRequired}
               onClick={() => void submit()}
             >
-              {submitting ? "提交中…" : "绑定"}
+              {submitting ? "提交中…" : isOauth ? "前往授权" : "绑定"}
             </Button>
           </>
         )

@@ -90,6 +90,7 @@ import type {
   DeclarativeBindResult,
   DeclarativeCatalogResponse,
   DeclarativeConnectionsResponse,
+  DeclarativeOauthStartResult,
 } from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 
@@ -2462,6 +2463,28 @@ export const api = {
     jsonOrThrow<DeclarativeBindResult>(
       callWithRefresh(a, (t) =>
         fetch("/api/connectors/declarative/bind", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /**
+   * oauth2-auth-code 授权流起点（POST /api/connectors/declarative/oauth/start，Bearer）。
+   * body 带用户 BYOA 自建应用的 client 凭据（clientSecret 只进服务端 AEAD 加密的 pending
+   * draft，绝不进 authorize URL）。返回 authorizeUrl，调用方**整页跳转**；授权后后端 302 回
+   * `/?connector_linked=<slug>` 或 `/?connector_error=<code>`（App 层统一 toast）。
+   * 注：oauth2-auth-code 连接器走直填 bind 会被后端硬拒，必须走本端点。
+   */
+  startDeclarativeOauth: (
+    a: AuthSession,
+    body: { versionId: number; clientId: string; clientSecret: string; displayName?: string },
+  ): Promise<DeclarativeOauthStartResult> =>
+    jsonOrThrow<DeclarativeOauthStartResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/oauth/start", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),

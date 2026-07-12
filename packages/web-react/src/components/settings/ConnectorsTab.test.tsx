@@ -11,6 +11,8 @@
  *   4. github：跳现有 GitHub OAuth（startGithubOAuth）
  *   5. RELINK_REQUIRED：显示「需要重新绑定」引导 + 重新绑定按钮
  *   6. 解绑二次确认 → deleteConnector；备注名行内编辑 → renameConnector
+ *   7. 声明式连接器：直填绑定（static-token）· **oauth2-auth-code 重定向流**（填 client
+ *      凭据 → 「前往授权」→ startDeclarativeOauth，绝不走直填 bind）
  */
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -40,6 +42,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getDeclarativeCatalog: vi.fn(),
       getDeclarativeConnections: vi.fn(),
       bindDeclarativeConnector: vi.fn(),
+      startDeclarativeOauth: vi.fn(),
       unbindDeclarativeConnector: vi.fn(),
     },
   };
@@ -56,6 +59,7 @@ const mockedDelete = vi.mocked(api.deleteConnector);
 const mockedDeclCatalog = vi.mocked(api.getDeclarativeCatalog);
 const mockedDeclConnections = vi.mocked(api.getDeclarativeConnections);
 const mockedDeclBind = vi.mocked(api.bindDeclarativeConnector);
+const mockedDeclOauthStart = vi.mocked(api.startDeclarativeOauth);
 const mockedDeclUnbind = vi.mocked(api.unbindDeclarativeConnector);
 
 afterEach(cleanup);
@@ -449,8 +453,109 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
         displayName: "团队账号",
       }),
     );
+    // 非回归：非 oauth2 authMode 绝不走授权重定向流
+    expect(mockedDeclOauthStart).not.toHaveBeenCalled();
     // 成功 → 目录 reload（getConnectors 初始 1 + 成功后 1）
     await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
+  });
+
+  test("oauth2-auth-code:弹层渲染 client 凭据字段,提交钮文案为「前往授权」(非「绑定」)", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          authMode: "oauth2-auth-code",
+          requiredBindSources: ["client_id", "client_secret"],
+        }),
+      ],
+    });
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("Linear");
+
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("绑定 Linear")).toBeInTheDocument();
+    // 字段仍由 requiredBindSources + bindFieldMeta 驱动（client_id=text / client_secret=password）
+    const cid = within(dialog).getByLabelText(/应用 ID/) as HTMLInputElement;
+    const csec = within(dialog).getByLabelText(/应用密钥/) as HTMLInputElement;
+    expect(cid.type).toBe("text");
+    expect(csec.type).toBe("password");
+    // oauth2 → 提交钮是「前往授权」，且不存在「绑定」提交钮（直填 bind 会被后端硬拒）
+    expect(within(dialog).getByRole("button", { name: "前往授权" })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "绑定" })).not.toBeInTheDocument();
+    // oauth2 专属引导文案
+    expect(within(dialog).getByText(/前往授权后即可完成绑定/)).toBeInTheDocument();
+  });
+
+  test("oauth2-auth-code:填 client 凭据提交 → startDeclarativeOauth(versionId+client 凭据),不调 bindDeclarativeConnector", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          versionId: 88,
+          authMode: "oauth2-auth-code",
+          requiredBindSources: ["client_id", "client_secret"],
+          actions: [{ id: "create", effect: "write" }],
+        }),
+      ],
+    });
+    // 返回后组件整页跳转；jsdom 不实现导航（既有 Not implemented: navigation 告警），仅断言 API 入参
+    mockedDeclOauthStart.mockResolvedValue({
+      authorizeUrl: "https://linear.app/oauth/authorize?x=1",
+    });
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("Linear");
+
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    const submit = within(dialog).getByRole("button", { name: "前往授权" });
+    expect(submit).toBeDisabled();
+
+    fireEvent.change(within(dialog).getByLabelText(/应用 ID/), { target: { value: "cli_x" } });
+    fireEvent.change(within(dialog).getByLabelText(/应用密钥/), { target: { value: "sec_y" } });
+    fireEvent.change(within(dialog).getByLabelText(/备注名/), { target: { value: "我的应用" } });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mockedDeclOauthStart).toHaveBeenCalledWith(auth, {
+        versionId: 88,
+        clientId: "cli_x",
+        clientSecret: "sec_y",
+        displayName: "我的应用",
+      }),
+    );
+    // oauth2 连接器绝不走直填 bind（后端硬拒 BAD_REQUEST）
+    expect(mockedDeclBind).not.toHaveBeenCalled();
+  });
+
+  test("oauth2-auth-code:发起授权失败 → 弹层内中文文案(不裸露码)", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          authMode: "oauth2-auth-code",
+          requiredBindSources: ["client_id", "client_secret"],
+        }),
+      ],
+    });
+    mockedDeclOauthStart.mockRejectedValue(
+      new ApiError({ status: 503, message: "raw internal", code: "CONNECTOR_UNAVAILABLE" }),
+    );
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("Linear");
+
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/应用 ID/), { target: { value: "cli_x" } });
+    fireEvent.change(within(dialog).getByLabelText(/应用密钥/), { target: { value: "sec_y" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "前往授权" }));
+
+    expect(
+      await within(dialog).findByText("该连接器暂不可用，请稍后重试或联系管理员"),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText("CONNECTOR_UNAVAILABLE")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("raw internal")).not.toBeInTheDocument();
   });
 
   test("声明式已绑连接:无改名铅笔;解绑确认后调 unbindDeclarativeConnector(非 v1 deleteConnector)", async () => {

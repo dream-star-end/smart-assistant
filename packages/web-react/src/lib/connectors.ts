@@ -141,6 +141,18 @@ export type DeclarativeBindResult = {
   connection: { id: string; rebound: boolean; accountHint?: string };
 };
 
+/** POST /api/connectors/declarative/oauth/start 回包（整页跳转授权页）。 */
+export type DeclarativeOauthStartResult = { authorizeUrl: string };
+
+/**
+ * 该 authMode 是否走 OAuth 授权码重定向流（用户 BYOA 自建应用：填 client 凭据 → 跳授权页）。
+ * 单一权威：UI 一律用本函数判断，禁止各组件散写 authMode 字符串比较。
+ * oauth2-auth-code 连接器**不能**走直填 bind（后端硬拒），必须走 oauth/start。
+ */
+export function isOauthAuthMode(authMode: string): boolean {
+  return authMode === "oauth2-auth-code";
+}
+
 /** bind 表单单个字段的展示元数据（source → label/输入类型/占位符）。 */
 export type BindFieldMeta = { label: string; type: "text" | "password"; placeholder?: string };
 
@@ -244,10 +256,13 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   INVALID_URL: "地址格式不正确，请检查后重试",
   UNSUPPORTED_SCHEME: "仅支持 https 安全连接",
   // OAuth（BYOA）
+  CONNECTOR_UNAVAILABLE: "该连接器暂不可用，请稍后重试或联系管理员",
   OAUTH_START_FAILED: "发起授权失败，请稍后重试",
   TOKEN_EXCHANGE_FAILED: "授权失败，请重新发起授权",
   INVALID_CLIENT: "应用凭据无效，请检查 Client ID / Secret",
   STATE_MISMATCH: "授权状态校验失败，请重新发起授权",
+  // 授权页勾选的权限不足(后端 fail-closed 拒绝绑定,不落半残连接)。
+  SCOPE_INSUFFICIENT: "授权的权限不足，请在授权页勾选全部所需权限后重试",
   // 通用
   RATE_LIMITED: "操作过于频繁，请稍后再试",
   UNSUPPORTED_PROVIDER: "暂不支持该应用",
