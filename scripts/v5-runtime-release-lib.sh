@@ -369,7 +369,11 @@ oc_hotcfg_deps_cache_key() {
 oc_hotcfg_install_deps_in_image() {
   local staging="$1" image_id="$2"
   oc_hotcfg__log "docker 一次性容器内 npm ci(root)@ image=$image_id"
-  "$OC_DOCKER_BIN" run --rm --entrypoint /bin/sh --user 0:0 \
+  # --network=host:kl-mirror docker bridge 网络 DNS 不通(systemd-resolved stub 未被
+  # daemon.json 兜底,与 build-image.sh 的 OC_BUILD_NETWORK_HOST 同一类坑,2026-07-12 实测
+  # bridge 下 npm ping 挂死/host 下 297ms PONG,npm 崩为 "Exit handler never called")。
+  # 构建期一次性容器,走宿主网络栈无隔离顾虑。
+  "$OC_DOCKER_BIN" run --rm --network=host --entrypoint /bin/sh --user 0:0 \
     -v "$staging:/build" -w /build "$image_id" -c '
       set -e
       npm ci --include=dev --no-audit --no-fund
