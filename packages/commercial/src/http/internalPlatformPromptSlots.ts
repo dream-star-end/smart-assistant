@@ -52,6 +52,7 @@ import {
 import { getLiteratureSkillConfig } from "../admin/literatureConfig.js";
 import { renderLiteratureSkillContent } from "../literatureSkill.js";
 import type { PricingCache } from "../billing/pricing.js";
+import type { CatalogSource } from "./internalModelCatalog.js";
 
 /** Container → master GET 这个 path 拿平台级 slot。挂在 plain 18791 self-host
  *  和 mTLS 18443 remote-host 同一个 listener,与 anthropicProxy / serverAuthored /
@@ -85,7 +86,24 @@ export interface PlatformPromptSlotsResponseBody {
 
 export interface PlatformPromptSlotsHandlerDeps {
   identityRepo: ContainerIdentityRepo;
+  /**
+   * MODEL_HINT 的**文案**权威(model_pricing.extra_system_prompt —— catalog 只管 execution,
+   * 不持 prompt 文本)。**alias → canonical 不再由它负责**(见 deps.catalog)。
+   */
   pricingCache: PricingCache;
+  /**
+   * 模型执行 catalog(方案 §6;MAJOR-5 收口 2026-07-12)。
+   *
+   * MODEL_HINT 的 `?model=` 入参可能是 **alias**(model_aliases)。此前这里直接 `PricingCache.get()`,
+   * 而它内部走 legacy `canonicalizeModelId`(只认 anthropic 带日期后缀 + 静态 provider 的前缀规则)
+   * —— **不认识 model_aliases**:用 alias 发起的 turn 会静默拿不到该模型的行为补丁(prompt 漂移,
+   * 且随 alias 使用面扩大而变成一类问题)。注入后:alias→canonical **只走 catalog**,且只对
+   * catalog 里可路由(active + 有价 + capability schema 可理解)的模型出 hint;canonicalModelId
+   * 取 catalog 的 canonical id(仍是 bounded label,容器侧 metric cardinality 上界不变)。
+   *
+   * 未注入 → 退回 legacy PricingCache 路径(装配未接线 / 单测)。
+   */
+  catalog?: CatalogSource;
   logger?: Logger;
   /**
    * 测试 hook:literature config 读取。默认走真实
@@ -195,8 +213,11 @@ export function makePlatformPromptSlotsHandler(
       reqLog.warn("literature_skill_read_failed", { err: errString(err) });
     }
 
-    // MODEL_HINT —— 走 PricingCache 内存查询,无 I/O;命中需 extra_system_prompt
-    // 非空,canonical id 永远取 row.model_id(provider 已 canonicalize)。
+    // MODEL_HINT —— 两步:
+    //   ① alias → canonical:**catalog 单一权威**(deps.catalog 注入时)。legacy
+    //      canonicalizeModelId 只认 anthropic 日期后缀 / 静态 provider 前缀,不认识
+    //      model_aliases;用 alias 发起的 turn 会静默丢掉行为补丁。
+    //   ② canonical → 文案:model_pricing.extra_system_prompt(catalog 不持 prompt 文本)。
     //
     // 必须把 raw extra_system_prompt 包成与 personal hook 路径(promptSlots.ts
     // buildModelHintSlot)完全一致的 markdown 段:`# 模型行为补丁` 标题 + "不要复述"
@@ -204,15 +225,14 @@ export function makePlatformPromptSlotsHandler(
     // 与 SKILLS_LITERATURE 走 renderLiteratureSkillContent 同型(master 出全渲染文本)。
     if (modelId !== undefined) {
       try {
-        const p = deps.pricingCache.get(modelId);
-        const text = p?.extra_system_prompt ?? null;
-        if (p && text) {
-          const trimmed = text.trim();
+        const resolved = await resolveHintModel(deps, modelId, reqLog);
+        if (resolved) {
+          const trimmed = resolved.text.trim();
           if (trimmed) {
             slots.push({
               name: "MODEL_HINT",
               content: renderModelHintContent(trimmed),
-              canonicalModelId: p.model_id,
+              canonicalModelId: resolved.canonicalModelId,
             });
           }
         }
@@ -275,6 +295,50 @@ function renderModelHintContent(trimmed: string): string {
     "",
     trimmed,
   ].join("\n");
+}
+
+/**
+ * `?model=`(可能是 alias)→ { canonicalModelId, extra_system_prompt }。
+ *
+ * catalog 注入时(生产):
+ *   - alias→canonical **只走 catalog**(model_aliases 是唯一别名权威);
+ *   - 只对 catalog 里**可路由**(active + 有价 + capability schema 可理解)的模型出 hint ——
+ *     staged/retired/disabled 的行为补丁不该被注入(那些模型的 turn 本来就会被 gate 拒);
+ *   - 文案仍取 model_pricing.extra_system_prompt,但**按 catalog 的 canonical id 取行**
+ *     (PricingCache.get 内部的 legacy canonicalizeModelId 对 canonical id 幂等,它不再
+ *     承担任何别名语义 —— 别名权威已单点收口到 catalog)。
+ *   - fence 失败 / 快照 unknown → **不出 MODEL_HINT**(fail-soft,与本文件既有契约一致:
+ *     prompt slot 是行为补丁而非安全控制,拿不到就不注入;**不**回落 legacy 归一 —— 那会在
+ *     故障窗口悄悄复活第二套 alias 语义)。
+ *
+ * catalog 未注入 → legacy:PricingCache.get(raw)(内部 canonicalizeModelId),canonical id
+ * 取 pricing row 的 model_id。
+ */
+async function resolveHintModel(
+  deps: PlatformPromptSlotsHandlerDeps,
+  rawModel: string,
+  reqLog: Logger,
+): Promise<{ canonicalModelId: string; text: string } | null> {
+  if (deps.catalog) {
+    let snapshot;
+    try {
+      snapshot = await deps.catalog.assertFresh();
+    } catch (err) {
+      reqLog.warn("model_hint_catalog_unavailable", { err: errString(err), model: rawModel });
+      return null;
+    }
+    const canonical = snapshot.aliasToCanonical(rawModel);
+    // resolve() 对 capability schema 未来版本抛 → 上层 catch 记 warn 并跳过该 slot(fail-soft)。
+    if (!snapshot.resolve(canonical)) return null;
+    const text = deps.pricingCache.get(canonical)?.extra_system_prompt ?? null;
+    if (!text) return null;
+    return { canonicalModelId: canonical, text };
+  }
+
+  const p = deps.pricingCache.get(rawModel);
+  const text = p?.extra_system_prompt ?? null;
+  if (!p || !text) return null;
+  return { canonicalModelId: p.model_id, text };
 }
 
 /** Sentry-style error → 短字串,避免循环引用类对象塞日志。 */

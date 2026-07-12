@@ -57,6 +57,16 @@ import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 import { _resetAgentMultiplierCacheForTests } from "../billing/agentMultiplier.js";
 import { deriveEngineSessionId } from "../billing/codexFinalizer.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
+import { AuthoritySigner } from "../ws/authoritySigner.js";
+import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
+import { ModelAuthorityConsumer, buildContainerAttestFrame } from "@openclaude/gateway";
+import { MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
+import {
+  ModelCatalogSnapshot,
+  type ModelCatalogCache,
+  type ModelCatalogEntry,
+  type ModelCatalogPricing,
+} from "../billing/modelCatalog.js";
 
 const JWT_SECRET = "x".repeat(32);
 
@@ -244,6 +254,60 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
   return { pool: fakePool as Pool, queries, journalRows };
 }
 
+// ---------- 模型执行权威夹具(签发边界 epoch 重读 / journal 补偿用) ----------
+
+/** 快照 epoch;签发边界重读到别的值 = turn 途中发生了安全写 → 必须整单放弃。 */
+const AUTH_EPOCH = 42n;
+
+/** 只含本套件用的 codex 模型(gpt-5.6-sol),engine=codex → 走 codex 计费编排。 */
+function fakeAuthorityCatalog(): ModelCatalogCache {
+  const entries: ModelCatalogEntry[] = [
+    {
+      entryId: 1,
+      modelId: "gpt-5.6-sol",
+      engine: "codex",
+      providerId: "codex",
+      upstreamModelId: null,
+      contextWindow: 400_000,
+      capabilityProfile: {
+        supportsVision: true,
+        reasoning: { supported: ["medium", "xhigh"], codexModelDefault: "xhigh" },
+      },
+      capabilitySchemaVersion: 1,
+      state: "active",
+      lockVersion: 1,
+    } as ModelCatalogEntry,
+  ];
+  const pricing = new Map<string, ModelCatalogPricing>([
+    [
+      "gpt-5.6-sol",
+      {
+        modelId: "gpt-5.6-sol",
+        displayName: "GPT 5.6",
+        inputPerMtok: 1000n,
+        outputPerMtok: 5000n,
+        cacheReadPerMtok: 100n,
+        cacheWritePerMtok: 500n,
+        multiplier: "1.000",
+        visibility: "public",
+        sortOrder: 0,
+        defaultEffort: null,
+      },
+    ],
+  ]);
+  const snapshot = new ModelCatalogSnapshot({
+    entries,
+    aliases: new Map(),
+    pricing,
+    securityEpoch: AUTH_EPOCH,
+  });
+  return {
+    peek: () => snapshot,
+    current: () => snapshot,
+    assertFresh: async () => snapshot,
+  } as unknown as ModelCatalogCache;
+}
+
 // ---------- Rig with billing deps ------------------------------------------
 
 interface BillingRig {
@@ -257,6 +321,8 @@ interface BillingRig {
   preCheckRedis: InMemoryPreCheckRedis;
   pricing: PricingCache;
   binding: { acquireCalls: number; releaseCalls: number; acquireGroupIds: Array<string | null | undefined> };
+  /** 模型执行权威(仅 modelAuthority:true 的 rig 有);epochAtSign 可中途改 = 模拟 admin 安全写。 */
+  authority?: { signer: AuthoritySigner; epochAtSign: { value: bigint } };
 }
 
 // CG2c — 测试用最小 logger,记 fields(含 child 累计 bindings)。
@@ -303,13 +369,36 @@ async function startRig(opts: {
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   // P0 跨桥修复 — displacement 用例把 per-user 连接上限压到 1,新连接必踢旧桥。
   maxPerUser?: number;
+  /**
+   * 模型执行权威(flag 开)。开了之后:容器必须 attest(rig 用**真 gateway 代码**发帧),
+   * 每条 inbound 注入签名 envelope,且**签发边界重读 epoch**(MAJOR-2)。
+   */
+  modelAuthority?: boolean;
 } = {}): Promise<BillingRig> {
+  // 模型执行权威装配(flag 关 → 全部 undefined,rig 行为与本批次之前完全一致)
+  const authoritySigner = opts.modelAuthority === true ? AuthoritySigner.createEphemeral() : null;
+  const epochAtSign = { value: AUTH_EPOCH };
+
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
   const containerWss = new WebSocketServer({ port: 0 });
   await new Promise<void>((r) => containerWss.once("listening", () => r()));
   const containerPort = (containerWss.address() as { port: number }).port;
-  containerWss.on("connection", (ws) => { containerSockets.push(ws); });
+  containerWss.on("connection", (ws) => {
+    containerSockets.push(ws);
+    if (authoritySigner !== null) {
+      // 真容器行为:连上就 attest(keyring = master 注入的公钥 ring)。
+      const consumer = new ModelAuthorityConsumer({
+        keyring: authoritySigner.publicKeyring(),
+        containerId: 999,
+        uid: 11,
+        required: true,
+      });
+      ws.send(
+        JSON.stringify(buildContainerAttestFrame(consumer, consumer.newConnection(), 999)),
+      );
+    }
+  });
 
   // billing deps
   const poolCtrl = makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits });
@@ -359,6 +448,18 @@ async function startRig(opts: {
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
     maxPerUser: opts.maxPerUser,
+    ...(authoritySigner !== null
+      ? {
+          modelAuthority: {
+            signer: authoritySigner,
+            catalog: fakeAuthorityCatalog(),
+            census: new AuthorityKeyCensus(),
+            // **签发边界**的 epoch 直读(MAJOR-2)。默认 = 快照 epoch(无安全写);
+            // 用例把它改掉 = turn 途中 admin 禁用/撤销/改价 → 签发前必须拒 + 补偿。
+            readSecurityEpoch: async () => epochAtSign.value,
+          },
+        }
+      : {}),
   });
 
   const gateway = http.createServer((_, res) => res.end());
@@ -373,6 +474,7 @@ async function startRig(opts: {
     containerWss, containerPort, containerSockets,
     poolCtrl, preCheckRedis, pricing,
     binding: bindingState,
+    ...(authoritySigner !== null ? { authority: { signer: authoritySigner, epochAtSign } } : {}),
   };
 }
 
@@ -2229,5 +2331,124 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     } finally {
       await stopRig(rig);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 代码审 R1 MAJOR-2 —— 签发边界 epoch 重读 + journal 补偿
+//
+// 起手 fence(resolveTurnExecution)之后,codex turn 还要走 route → acquire →
+// getAgentCostMultiplier → preCheck → startInflightJournal → 历史装配 一连串 await。
+// 安全写(admin 禁用模型 / 撤销授权 / 改价 → bump epoch)完全可能落在这中间。
+// 只 fence 一次的实现会:**照样开 journal、照样按旧价签出 lease 50min 的票**。
+//
+// 本组测试锁死的不变量:签之前重读 epoch,不一致就整单放弃 —— 且**不留悬空 journal**
+// (悬空 = 要等 reconciler 30min 才终态化,期间对账口径是错的)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("userChatBridge / 模型执行权威 — 签发边界 epoch 重读(MAJOR-2)", () => {
+  let rig: BillingRig;
+  before(async () => { rig = await startRig({ modelAuthority: true }); });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    rig.poolCtrl.queries.length = 0;
+    rig.poolCtrl.journalRows.clear();
+    rig.binding.acquireCalls = 0;
+    rig.binding.releaseCalls = 0;
+    rig.authority!.epochAtSign.value = AUTH_EPOCH;
+  });
+
+  test("epoch 未变 → 正常签发:envelope 注入 + journal 保持 inflight", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-ok", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "hi" }, ts: Date.now(),
+    }));
+
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.equal(forwarded.type, "inbound.message");
+    assert.ok(forwarded[MODEL_AUTHORITY_FIELD], "epoch 没变就该签票");
+    const rows = [...rig.poolCtrl.journalRows.values()];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].state, "inflight", "正常 turn 的 journal 留 inflight 等 settle");
+    ws.close();
+  });
+
+  test("journal 开了之后 epoch 变了 → 拒帧 + **journal 关闭(aborted)** + 还槽 + 不转发", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    const containerFrames: string[] = [];
+    containerWs.on("message", (d) => containerFrames.push(String(d)));
+
+    // admin 在 turn 途中禁用了这个模型 / 撤销了授权 / 改了价 → DB epoch 前进。
+    rig.authority!.epochAtSign.value = AUTH_EPOCH + 1n;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-epoch", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "hi" }, ts: Date.now(),
+    }));
+
+    const err = await waitJsonFrameOfType(ws, "error", 3000);
+    assert.equal(err.code, "MODEL_CONFIG_CHANGED_RETRY_TURN");
+
+    // ① journal 必须被**补偿关闭** —— 悬空 inflight = 漏账/错账(reconciler 30min 才兜底)
+    const rows = [...rig.poolCtrl.journalRows.values()];
+    assert.equal(rows.length, 1, "journal 已经开过(证明拒帧发生在 journal 之后)");
+    assert.equal(rows[0].state, "aborted", "epoch 变了必须 abort journal,绝不留悬空 inflight");
+    assert.match(String(rows[0].error_msg), /sign_boundary_epoch_changed/);
+
+    // ② 不扣费:没有任何 usage_records 落笔
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /INSERT INTO usage_records/i.test(q.sql)),
+      false,
+      "拒帧的 turn 不许产生扣费记录",
+    );
+
+    // ③ codex 槽还回去(否则该用户后续 codex turn 全被单飞门挡住)
+    assert.equal(rig.binding.acquireCalls, 1);
+    assert.equal(rig.binding.releaseCalls, 1, "拒帧必须还槽");
+
+    // ④ 帧绝不进容器(既不带 envelope 转发,也不降级为无 envelope 转发)
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(
+      containerFrames.some((s) => s.includes("inbound.message")),
+      false,
+      "epoch 变了就不许把这条 turn 送进容器",
+    );
+    ws.close();
+  });
+
+  test("补偿后用户可重开 turn:下一条(epoch 已稳定)照常计费转发", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    rig.authority!.epochAtSign.value = AUTH_EPOCH + 1n;
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-retry", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "one" }, ts: Date.now(),
+    }));
+    const err = await waitJsonFrameOfType(ws, "error", 3000);
+    assert.equal(err.code, "MODEL_CONFIG_CHANGED_RETRY_TURN");
+
+    // 管理员的变更已被快照吸收(生产里 = NOTIFY 重建;这里直接把两边对齐)
+    rig.authority!.epochAtSign.value = AUTH_EPOCH;
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-retry", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "two" }, ts: Date.now(),
+    }));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.ok(forwarded[MODEL_AUTHORITY_FIELD], "重开的 turn 必须能正常签发(单飞槽已释放)");
+    // 前一轮 aborted + 本轮 inflight,两行互不干扰
+    const states = [...rig.poolCtrl.journalRows.values()].map((r) => r.state).sort();
+    assert.deepEqual(states, ["aborted", "inflight"]);
+    ws.close();
   });
 });

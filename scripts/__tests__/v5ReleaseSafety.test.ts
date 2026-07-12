@@ -58,6 +58,104 @@ describe('v5 release safety lanes', () => {
     }
   })
 
+  // ── 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)──────────────
+  //
+  // 用 ssh stub 模拟 kl-mirror:preflight 的四面探测(DB/master/egress/容器 runtime)全部
+  // 经 `ssh $KL_HOST <cmd>` 出口,故一个 stub 即可把"四面缺任一 → 拒绝开 flag"的矩阵实跑出来。
+  // 锁走 OC_V5_DEPLOY_LOCK_FILE(hermetic,不抢真实部署锁)。
+  async function maFixture(over: Record<string, string> = {}) {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-')); dirs.push(dir)
+    const ssh = path.join(dir, 'ssh')
+    // stub 收到的是 `ssh <host> <cmd...>`;按命令特征回放各面的探测结果。
+    await writeFile(
+      ssh,
+      [
+        '#!/bin/bash',
+        'cmd="$*"',
+        'case "$cmd" in',
+        '  *schema_migrations*) printf "%s\\n" "${MA_DB:-1}" ;;',
+        '  *"/healthz"*) printf "%s\\n" "{\\"ok\\":true,\\"runtime\\":{\\"capabilities\\":[${MA_MASTER_CAPS-\\"model_authority_v1\\"}]}}" ;;',
+        '  *egress-health*) printf "%s\\n" "{\\"ok\\":true,\\"role\\":\\"egress\\",\\"capabilities\\":[${MA_EGRESS_CAPS-\\"model_authority_v1-egress\\"}]}" ;;',
+        '  *OC_RUNTIME_RELEASE*) printf "%s\\n" "${MA_RT_RELEASE-/var/lib/openclaude-v5/runtime-releases/rel-abc}" ;;',
+        '  *OC_RUNTIME_IMAGE_ID*) printf "%s\\n" "sha256:emb" ;;',
+        '  *OC_MODEL_AUTHORITY_CUTOVER*) printf "%s\\n" "${MA_CUTOVER:-}" ;;',
+        '  *OC_MODEL_AUTHORITY=*) printf "%s\\n" "${MA_FLAG:-}" ;;',
+        '  *MANIFEST.json*) printf "%s\\n" "${MA_RT_CAPS-model_authority_v1}" ;;',
+        '  *oc.runtime.features*) printf "%s\\n" "${MA_IMG_FEATURES-v3-sink model_authority_v1}" ;;',
+        '  *) printf "\\n" ;;',
+        'esac',
+        'exit 0',
+      ].join('\n'),
+    )
+    await chmod(ssh, 0o755)
+    return run(deploy, ['--model-authority-preflight'], {
+      PATH: `${dir}:${process.env.PATH}`,
+      OC_V5_DEPLOY_LOCK_FILE: path.join(dir, 'lock'),
+      ...over,
+    })
+  }
+
+  test('model-authority preflight passes only when all four faces declare capability', async () => {
+    const green = await maFixture()
+    assert.equal(green.status, 0, green.stdout + green.stderr)
+    for (const line of ['✓ ① DB', '✓ ② master', '✓ ③ egress', '✓ ④ runtime']) {
+      assert.ok(green.stdout.includes(line), `missing "${line}" in:\n${green.stdout}`)
+    }
+
+    // ① DB:0135 未 apply
+    const noDb = await maFixture({ MA_DB: '0' })
+    assert.notEqual(noDb.status, 0)
+    assert.match(noDb.stdout + noDb.stderr, /① DB:迁移 0135_model_catalog 未 apply/)
+
+    // ② master:旧版本不广播 capability
+    const oldMaster = await maFixture({ MA_MASTER_CAPS: '' })
+    assert.notEqual(oldMaster.status, 0)
+    assert.match(oldMaster.stdout + oldMaster.stderr, /② master:\/healthz 未广播/)
+
+    // ③ egress:旧进程无 epoch fence(deploy 默认不重启 egress —— 最易错配的一面,R4-m6)
+    const oldEgress = await maFixture({ MA_EGRESS_CAPS: '' })
+    assert.notEqual(oldEgress.status, 0)
+    assert.match(oldEgress.stdout + oldEgress.stderr, /③ egress:未广播/)
+    assert.match(oldEgress.stdout + oldEgress.stderr, /--egress/)
+
+    // ④ 容器 runtime release 未声明
+    const oldRelease = await maFixture({ MA_RT_CAPS: '' })
+    assert.notEqual(oldRelease.status, 0)
+    assert.match(oldRelease.stdout + oldRelease.stderr, /④ runtime release:.*未声明/)
+
+    // ④ release 轴关闭时回落镜像 label:旧镜像(无 model_authority_v1 token)同样拒
+    const oldImage = await maFixture({ MA_RT_RELEASE: '', MA_IMG_FEATURES: 'v3-sink' })
+    assert.notEqual(oldImage.status, 0)
+    assert.match(oldImage.stdout + oldImage.stderr, /④ runtime 镜像/)
+  })
+
+  test('step-5 compat floor is irreversible and guards every activation path', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // 地板挂在**全部**激活/回滚路径:蓝绿 activate_release、hotcfg tuple 激活、tuple 回滚。
+    for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple']) {
+      const body = source.match(new RegExp(`${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+      assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
+    }
+    // marker 探测 fail-closed:psql 失败 → 按已置位处理(不确定即拒)
+    const cutoverFn = source.match(/model_authority_cutover_done\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(cutoverFn, /fail-closed/)
+    // 关 flag 在 cutover 后必须被拒(不可逆地板)
+    const disableFn = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(disableFn, /model_authority_cutover_done/)
+    assert.match(disableFn, /兼容地板不可逆/)
+  })
+
+  test('release metadata declares the 0135 migration and both authority capabilities', async () => {
+    const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(meta.requiredMigrations.includes('0135_model_catalog'))
+    assert.ok(meta.capabilities.includes('model_authority_v1'))
+    assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
+    // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
+    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
+    assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
   test('Caddy fallback is transport-error-only and installer dry-run is inert', async () => {
     const source = await readFile(caddy, 'utf8')
     assert.match(source, /handle_errors/)

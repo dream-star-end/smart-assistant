@@ -29,6 +29,8 @@ import {
   CONTAINER_ATTEST_FRAME_TYPE as GATEWAY_ATTEST_FRAME_TYPE,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   GATEWAY_CAPABILITY_SCHEMA_VERSION,
+  ModelAuthorityConsumer,
+  buildContainerAttestFrame,
 } from "@openclaude/gateway";
 
 import { signAccess } from "../auth/jwt.js";
@@ -42,6 +44,7 @@ import {
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
+import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -157,6 +160,9 @@ interface Rig {
   containerSeen: string[];
   recycled: Array<{ containerId: number; reason: string }>;
   signer: AuthoritySigner;
+  census: AuthorityKeyCensus;
+  /** 签发边界 epoch 直读的返回值(测试可中途改,模拟 admin 安全写)。 */
+  epochAtSign: { value: bigint; fail?: boolean };
 }
 
 async function startRig(opts: {
@@ -169,10 +175,21 @@ async function startRig(opts: {
   attestDelayMs?: number;
   /** 平台次级模型在 catalog 里的状态(默认 active = 生产形态)。 */
   auxState?: "active" | "disabled" | "absent";
+  /**
+   * 容器上报的 keyIds 形态:
+   *   'real'     = 用**真的 gateway 代码**(ModelAuthorityConsumer + buildContainerAttestFrame)
+   *                从注入的 keyring 里算 —— 生产形态,顺带锁死 attest 帧的跨包 parity;
+   *   'legacy'   = 旧 release(帧里没有 keyIds 字段)→ census 记 keyIdsUnknown,不判死;
+   *   'stale'    = ring 里没有 master 当前 activeKeyId(轮换步骤③ 早于 ①)→ 必须当场拒 + recycle。
+   */
+  keyIds?: "real" | "legacy" | "stale";
 }): Promise<Rig> {
   const containerSeen: string[] = [];
   const recycled: Array<{ containerId: number; reason: string }> = [];
   const signer = AuthoritySigner.createEphemeral();
+  const census = new AuthorityKeyCensus();
+  const epochAtSign: { value: bigint; fail?: boolean } = { value: 12n };
+  const keyIdsMode = opts.keyIds ?? "real";
 
   const containerWss = new WebSocketServer({ port: 0 });
   await new Promise<void>((r) => containerWss.once("listening", () => r()));
@@ -181,6 +198,19 @@ async function startRig(opts: {
     // 容器 gateway 的行为:连接建立即发 attest 帧(见 gateway handleWsConnection)。
     const sendAttest = () => {
       if (opts.attest === "silent") return;
+      if (keyIdsMode === "real" && opts.attest === "yes") {
+        // **真容器代码**:keyring 来自 master 注入的 env ring(这里直接用 signer 的公钥环),
+        // keyIds/指纹由 gateway 侧算 —— census 与 attest 帧形状的跨包 parity 一并被锁死。
+        const consumer = new ModelAuthorityConsumer({
+          keyring: signer.publicKeyring(),
+          containerId: CONTAINER_ID,
+          uid: UID,
+          required: true,
+        });
+        const conn = consumer.newConnection();
+        ws.send(JSON.stringify(buildContainerAttestFrame(consumer, conn, CONTAINER_ID)));
+        return;
+      }
       ws.send(
         JSON.stringify({
           type: CONTAINER_ATTEST_FRAME_TYPE,
@@ -188,6 +218,10 @@ async function startRig(opts: {
           connectionChallenge: "chal-" + Math.random().toString(16).slice(2),
           containerId: CONTAINER_ID,
           authorityTtlMs: 120_000,
+          // legacy = 旧 release:整个字段缺席;stale = 有 ring 但不含 master 的 activeKeyId
+          ...(keyIdsMode === "stale"
+            ? { keyIds: ["mak1_0000000000000000"], keyringFingerprint: "deadbeefdeadbeef" }
+            : {}),
         }),
       );
     };
@@ -210,6 +244,13 @@ async function startRig(opts: {
           }),
           recycleContainer: (containerId, reason) => recycled.push({ containerId, reason }),
           attestTimeoutMs: opts.attestTimeoutMs ?? 10_000,
+          // 签发边界的 epoch 直读(MAJOR-2)。默认与快照 epoch 同值 = 无安全写发生;
+          // 用例可在 turn 途中改 epochAtSign.value 模拟 admin 的 disable/撤销/改价。
+          readSecurityEpoch: async () => {
+            if (epochAtSign.fail === true) throw new Error("db down");
+            return epochAtSign.value;
+          },
+          census,
         };
 
   const bridge = createUserChatBridge({
@@ -230,7 +271,7 @@ async function startRig(opts: {
   await new Promise<void>((r) => gateway.listen(0, "127.0.0.1", () => r()));
   const port = (gateway.address() as { port: number }).port;
 
-  return { gateway, bridge, port, containerWss, containerSeen, recycled, signer };
+  return { gateway, bridge, port, containerWss, containerSeen, recycled, signer, census, epochAtSign };
 }
 
 async function stopRig(rig: Rig): Promise<void> {
@@ -364,8 +405,9 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     assert.equal(payload.executionDescriptor.contextWindow, 200_000);
     assert.equal(payload.executionDescriptor.supportsVision, false);
     assert.deepEqual([...payload.executionDescriptor.supportedEfforts], ["low", "medium", "high"]);
-    // challenge 必须来自容器 attest 帧(gateway 现铸),而不是 bridge 自己编的。
-    assert.ok(payload.connectionChallenge.startsWith("chal-"));
+    // challenge 必须来自容器 attest 帧(**真 gateway 代码**现铸的 128bit CSPRNG),
+    // 而不是 bridge 自己编的 —— 否则「绑连接」这条防重放的腿是假的。
+    assert.match(payload.connectionChallenge, /^[0-9a-f]{32}$/);
     // frame.model 必须已归一 —— 容器会断言 canonicalModel === frame.model。
     assert.equal(f.model, payload.canonicalModel);
     ws.close();
@@ -587,6 +629,142 @@ describe("bridge 模型执行权威 — fail-closed(绝不降级为无 envelope 
         false,
         "fence 不过一律拒帧(零 stale window)",
       );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 代码审 R1 MAJOR-2:签发边界的 epoch 重读
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("bridge 模型执行权威 — 签发边界 epoch 重读(MAJOR-2)", () => {
+  test("fence 通过后 epoch 变了(admin 禁用/撤销/改价)→ 签发前拒帧,不签、不转发", async () => {
+    const rig = await startRig({ attest: "yes" });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      // 起手 fence 用的是快照 epoch=12;这里把 DB epoch 抬到 13 = turn 途中发生了安全写。
+      // 只 fence 一次的旧实现会拿**过时快照**签出一张 lease TTL 50min 的票。
+      rig.epochAtSign.value = 13n;
+      ws.send(inboundFrame());
+      const err = await frames.next();
+      assert.equal(err.type, "error");
+      assert.equal(err.code, "MODEL_CONFIG_CHANGED_RETRY_TURN");
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(
+        rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)),
+        false,
+        "epoch 变了就不许签票",
+      );
+      assert.equal(
+        rig.containerSeen.some((s) => s.includes("inbound.message")),
+        false,
+        "更不许降级为无 envelope 转发",
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("签发边界 epoch 读不到(DB 挂)→ fail-closed 拒帧(不当作『没变』)", async () => {
+    const rig = await startRig({ attest: "yes" });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      rig.epochAtSign.fail = true;
+      ws.send(inboundFrame());
+      const err = await frames.next();
+      assert.equal(err.code, "MODEL_AUTHORITY_UNAVAILABLE");
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(rig.containerSeen.some((s) => s.includes("inbound.message")), false);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("epoch 没变 → 正常签发(重读只拦真正的变更,不误伤)", async () => {
+    const rig = await startRig({ attest: "yes" });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame());
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      const f = firstInbound(rig.containerSeen);
+      const bundle = f[MODEL_AUTHORITY_FIELD] as { authority: string; lease: string };
+      const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+      assert.equal(payload.securityEpoch, 12);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 代码审 R1 MAJOR-3 ④:attestation 上报 keyIds + master 侧 census(轮换步骤② 的 gate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("bridge 模型执行权威 — keyring census(轮换步骤② gate)", () => {
+  test("容器 attest 上报 keyIds/指纹 → census 覆盖 = 全覆盖;连接关闭 → 出册", async () => {
+    const rig = await startRig({ attest: "yes" });
+    try {
+      const ws = await openClient(rig.port);
+      // attest 成功后才会登记(登记发生在 attest 帧到达时,不必等业务帧)
+      await waitFor(() => rig.census.size === 1);
+      const snap = rig.census.snapshot();
+      assert.equal(snap.connections, 1);
+      assert.equal(snap.unknown, 0, "真容器必须自报 keyIds");
+      assert.equal(snap.byKeyId[rig.signer.activeKeyId], 1);
+      assert.deepEqual(Object.keys(snap.byFingerprint), [rig.signer.fingerprint()]);
+
+      const cov = rig.census.coverage(rig.signer.activeKeyId);
+      assert.equal(cov.fullyCovered, true, "全部在跑连接都认得 active key → 可以切私钥");
+      assert.deepEqual(cov.missing, []);
+
+      // 轮换步骤①:master 加了新公钥但容器还没换 env → 步骤② 的 gate 必须为 false,
+      // 否则运维会在容器认不得新钥的情况下切私钥 = 全站 UnknownKey。
+      const newKeyId = rig.signer.addKey({ activate: false });
+      assert.equal(rig.census.isFullyCovered(newKeyId), false);
+
+      ws.close();
+      await waitFor(() => rig.census.size === 0, 3000);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("旧 release 容器(attest 无 keyIds 字段)→ 不判死,但 census 记 unknown = 永不算覆盖", async () => {
+    const rig = await startRig({ attest: "yes", keyIds: "legacy" });
+    try {
+      const ws = await openClient(rig.port);
+      await waitFor(() => rig.census.size === 1);
+      assert.equal(rig.census.snapshot().unknown, 1);
+      const cov = rig.census.coverage(rig.signer.activeKeyId);
+      assert.equal(cov.fullyCovered, false, "不知道 ≠ 认得:轮换 gate 必须 fail-closed");
+      assert.equal(cov.missing[0]?.keyIdsUnknown, true);
+      // 但它仍然是可服务的(capability 有 + challenge 有)→ 帧照常签发转发
+      ws.send(inboundFrame());
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("容器 ring 里没有 master 的 activeKeyId → 当场拒连接 + recycle(不让用户撞一轮 403)", async () => {
+    const rig = await startRig({ attest: "yes", keyIds: "stale" });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      const err = await frames.next();
+      assert.equal(err.code, "CONTAINER_OUTDATED");
+      await waitFor(() => rig.recycled.length === 1);
+      assert.equal(rig.recycled[0].reason, "model_authority_active_key_missing");
+      assert.equal(rig.census.size, 0, "判死的连接不进 census");
       ws.close();
     } finally {
       await stopRig(rig);

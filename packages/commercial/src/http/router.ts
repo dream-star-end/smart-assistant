@@ -116,6 +116,11 @@ import { handleAdminGetOrder, handleAdminListOrders, handleAdminOrdersKpi } from
 import { handleAdminListPlans, handleAdminPatchPlan } from './admin/plans.js'
 import { handleAdminListPricing, handleAdminPatchPricing } from './admin/pricing.js'
 import { handleAdminModelOpsOverview, handleAdminModelOpsStats, handleAdminPutProviderOps } from './admin/modelOps.js'
+import {
+  handleAdminCreateModelCatalogEntry,
+  handleAdminListModelCatalog,
+  handleAdminModelCatalogAction,
+} from './admin/modelCatalog.js'
 import { handleAdminGetSession } from './admin/sessions.js'
 import {
   handleAdminGetSetting,
@@ -803,6 +808,11 @@ export function createCommercialHandler(
     // 0106 轻量在飞快照(前端 30s 轮询)
     { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
+    // 0135 模型 catalog 状态机(方案 §7 步 5:staged→active→disabled + 版本切换)。
+    // exact(list/create)必须排在 prefix(switch / :id/activate / :id/disable)之前。
+    { method: 'GET', path: '/api/admin/model-catalog', handler: handleAdminListModelCatalog },
+    { method: 'POST', path: '/api/admin/model-catalog', handler: handleAdminCreateModelCatalogEntry },
+    { method: 'POST', pathPrefix: '/api/admin/model-catalog/', handler: handleAdminModelCatalogAction },
     // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
     { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
     { method: 'PATCH', path: '/api/admin/literature', handler: handleAdminPatchLiterature },

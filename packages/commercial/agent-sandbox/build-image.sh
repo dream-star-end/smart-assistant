@@ -396,9 +396,19 @@ echo "[build-image] docker build → $IMAGE_FULL"
 # OC_BUILD_NETWORK_HOST=1 → docker build 用宿主网络栈跑 RUN(buildkit --network=host)。
 # 用于宿主 docker 容器 DNS 不可用(如 systemd-resolved 127.0.0.53 stub 未被 daemon.json
 # DNS 兜底)时让 build 期 npm/playwright 能解析+走宿主代理。默认空=不加(v3 行为不变)。
+#
+# - model_authority_v1(2026-07-12,方案 §7 步 3/5):容器 gateway 消费 master 签名的
+#   execution descriptor + hello attestation 的能力。**只有内嵌源码镜像(embed_source≠0)
+#   才由镜像自证** —— 瘦身镜像的容器跑的是 runtime release 树的源码,能力声明在该 release
+#   的 MANIFEST.capabilities(见 scripts/v5-runtime-release-lib.sh)。deploy 的兼容地板
+#   (cutover 后)按这两处之一验证容器面能力,拒绝把 baked 判定的旧容器翻回来。
+RUNTIME_FEATURES="v3-sink"
+if [ "${OC_EMBED_SOURCE:-1}" != "0" ]; then
+  RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1"
+fi
 docker build \
   ${OC_BUILD_NETWORK_HOST:+--network=host} \
-  --label "oc.runtime.features=v3-sink" \
+  --label "oc.runtime.features=$RUNTIME_FEATURES" \
   --label "oc.runtime.git_sha=$TAG" \
   --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
   --label "oc.runtime.codex_version=$CODEX_VERSION" \

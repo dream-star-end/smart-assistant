@@ -108,6 +108,46 @@ function httpErrToReject(err: HttpError): ProxyRejectReason {
   return "bad_body";
 }
 
+/** 建议清单上限(错误文案里列太多反而没人看)。 */
+const MAX_DEGRADED_ALTERNATIVES = 8;
+
+/**
+ * provider 降级时的"建议改用"清单(MINOR-4,2026-07-12)。
+ *
+ * **归属权威 = catalog 的 provider_id**(gate 生效时)。此前这里用 legacy
+ * `findRouteProviderForModel(m.id)` —— 那是**静态 route registry 的名字前缀推断**:catalog 里
+ * 自定义了 provider_id 的行会被推断成另一个(甚至 undefined)provider,于是"建议改用"里可能
+ * 塞回**同一个已降级 provider** 的模型 —— 把用户从坑里指回坑里(而且是在他刚被 503 的那一刻)。
+ *
+ * 范围 = public 可见集(与 legacy listPublic 同口径:不泄漏 admin/hidden 模型的存在)。
+ * 不按 engine 过滤:codex 模型对**用户**是合法替代(前端可切),只是不走本代理。
+ *
+ * 导出仅为单测(纯函数,不碰 DB);handler 之外无其它调用方。
+ */
+export function degradedAlternatives(args: {
+  gate: ModelAuthorityDecision | null;
+  pricing: AnthropicProxyDeps["pricing"];
+  uid: bigint;
+  degraded: ReadonlySet<string>;
+}): string[] {
+  if (args.gate) {
+    return args.gate.snapshot
+      .listForUser({ uid: args.uid.toString(), role: "user", grantedModelIds: new Set<string>() })
+      .filter((m) => !m.providerId || !args.degraded.has(m.providerId))
+      .map((m) => m.modelId)
+      .slice(0, MAX_DEGRADED_ALTERNATIVES);
+  }
+  // legacy(catalog 未接线):route registry 推断归属,保持本批次之前的行为。
+  return args.pricing
+    .listPublic()
+    .filter((m) => {
+      const pid = findRouteProviderForModel(m.id)?.id;
+      return !pid || !args.degraded.has(pid);
+    })
+    .map((m) => m.id)
+    .slice(0, MAX_DEGRADED_ALTERNATIVES);
+}
+
 /** 模型权威 gate 的拒绝类型 → reject metric 标签(运维仪表盘按这个分流告警)。 */
 const GATE_REJECT_METRIC: Record<GateRejectKind, ProxyRejectReason> = {
   not_available: "model_not_available",
@@ -383,14 +423,12 @@ export function makeAnthropicProxyHandler(
         if (providerId) {
           const degradedSet = await getDegradedProviders();
           if (degradedSet.has(providerId)) {
-            const alts = deps.pricing
-              .listPublic()
-              .filter((m) => {
-                const pid = findRouteProviderForModel(m.id)?.id;
-                return !pid || !degradedSet.has(pid);
-              })
-              .map((m) => m.id)
-              .slice(0, 8);
+            const alts = degradedAlternatives({
+              gate,
+              pricing: deps.pricing,
+              uid,
+              degraded: degradedSet,
+            });
             userLog.warn("proxy_provider_degraded", { model: body.model, provider: providerId });
             incrAnthropicProxyReject("provider_degraded");
             sendJsonError(

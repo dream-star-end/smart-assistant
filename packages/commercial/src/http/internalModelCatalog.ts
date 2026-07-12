@@ -78,6 +78,12 @@ export const MODEL_NOT_AVAILABLE = "MODEL_NOT_AVAILABLE";
  */
 export interface CatalogSource {
   assertFresh(): Promise<ModelCatalogSnapshot>;
+  /**
+   * 展示面专用的 fence 微缓存变体(方案 §1.2)。**仅**匿名不限流的展示端点可用
+   * (/api/public/models);安全/计费面(签发/preCheck/journal/egress)必须用 assertFresh()。
+   * 可选:测试 double 与非 cache 实现可不提供。
+   */
+  assertFreshCached?(ttlMs: number): Promise<ModelCatalogSnapshot>;
 }
 
 export interface ModelCatalogHandlerDeps {

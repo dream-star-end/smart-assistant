@@ -24,6 +24,8 @@
  *      (容器无私钥,不可能签)——授权仍走既有的容器身份双因子 + canUseModel + catalog 判定;
  *      token 只承载 epoch,让 egress 能对本地路径做同一道 fence。故意与 bridge authority
  *      **不同 header、不同 kind**,不允许互相伪装。
+ *      · token 里的 `projectionRevision` **同样不可信**(MAJOR-7):落 usage 的那一份由 egress
+ *        按已认证 uid 的当前 role/grants 重算,token 值只做比对/告警(否则容器可污染审计证据)。
  *
  * ── 失败语义(全部 fail-closed)────────────────────────────────────────────────
  *   · 快照 unknown / DB 不可达            → 503 MODEL_CATALOG_UNAVAILABLE
@@ -54,6 +56,8 @@ import {
   type ModelCatalogSnapshot,
   type ModelExecutionDescriptor,
 } from "../../billing/modelCatalog.js";
+import { makeLoadUserModelAuthz, type UserModelAuthz } from "../../auth/userModelAuthz.js";
+import { rootLogger, type Logger } from "../../logging/logger.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // wire 契约(与容器侧 gateway/src/modelCatalogClient.ts **逐字节同值**)
@@ -84,6 +88,12 @@ export type AuthorityKind = "bridge_signed" | "local_catalog";
  * 其余(这个 uid 能不能用这个模型)全部走服务端权威(容器身份 → uid → grants → catalog)。
  * 伪造一个"更新的 epoch"不会带来任何越权:epoch 必须与 **DB 当前值**相等才放行,
  * 伪造只会让自己被拒。
+ *
+ * **`projectionRevision` 同理不可信(MAJOR-7,2026-07-12)**:它曾被原样写进 decision →
+ * 落 `usage_records.projection_revision`,于是容器能**污染审计证据**(金额与授权始终安全 ——
+ * 那两条走服务端权威 —— 但"这笔消费是在哪份用户投影下发生的"这条审计线索可被任意伪造)。
+ * 现在 egress 按**已认证 uid 的当前 role/grants** 用同一份 fenced 快照重算,token 里的值
+ * 降级为**比对值**:不一致只告警(合法漂移见 `recomputeProjectionRevision` 注释),永不落库。
  */
 export interface LocalCatalogToken {
   v: 1;
@@ -201,8 +211,19 @@ export interface ModelAuthorityDecision {
   authorityKind: AuthorityKind;
   /** 落 usage_records.execution_revision(全局执行投影哈希;**不下发**用户)。 */
   executionRevision: string;
-  /** 落 usage_records.projection_revision;bridge 路径无此概念 → null。 */
+  /**
+   * 落 usage_records.projection_revision。bridge 路径无此概念 → null。
+   *
+   * **服务端重算值**(MAJOR-7):= `snapshot.projectionRevisionFor({uid, role, grants})`,
+   * 与 `/internal/v3/model-catalog` 下发时的算法/权威源逐字同源。**绝不**取 local_catalog
+   * token 里的自称值(容器可伪造 → 审计污染)。
+   */
   projectionRevision: string | null;
+  /**
+   * local_catalog token 自称的 projectionRevision(容器自铸,**不可信**)。
+   * 只用于与重算值比对/告警与排障,**不落库**;bridge 路径恒 null。
+   */
+  claimedProjectionRevision: string | null;
   /** 落 usage_records.security_epoch。 */
   securityEpoch: bigint;
   /** bridge 路径的 turn 标识(日志/对账用;本地路径 null)。 */
@@ -230,8 +251,39 @@ export interface EnforceArgs {
   containerId: bigint | null;
   /** 客户端请求里的 body.model(可能是 alias)。 */
   model: string;
+  /**
+   * role + grants 的**服务端权威**加载器(本地路径重算 projectionRevision 用)。
+   *
+   * 不传 → 用本模块的进程级默认实例(`makeLoadUserModelAuthz()`,与 identity strategy
+   * 同一份业务规则模块 = 单一权威;两个实例各自持 60s soft-TTL 缓存,只是多一次同规则读,
+   * 不产生语义分叉)。**默认实例走 DB**,单测必须显式注入,否则会真连库。
+   *
+   * 之所以做成"可选 + 模块内默认"而不是从 handler 注入:生产的 `/v1/messages` 装配在
+   * `egress/main.ts`,它构造 `AnthropicProxyDeps` 时不认识本 gate 的内部依赖;把 loader
+   * 做成必填会把 wiring 改动摊到 egress 装配面(本批次不动那面)。登记债:wiring 批次收口时
+   * 改为注入 identity strategy 已持有的同一个 loader 实例,消掉重复缓存。
+   */
+  loadUserModelAuthz?: (uid: bigint) => Promise<UserModelAuthz>;
+  /** 日志(默认 rootLogger 子 logger)。projectionRevision 不一致的告警从这里出。 */
+  logger?: Logger;
   /** 测试注入。 */
   now?: number;
+}
+
+/** 进程级默认 authz 加载器(懒建 —— 单测不注入就不会拉起 DB 依赖链)。 */
+let defaultAuthzLoader: ((uid: bigint) => Promise<UserModelAuthz>) | null = null;
+
+function resolveAuthzLoader(
+  injected?: (uid: bigint) => Promise<UserModelAuthz>,
+): (uid: bigint) => Promise<UserModelAuthz> {
+  if (injected) return injected;
+  if (!defaultAuthzLoader) defaultAuthzLoader = makeLoadUserModelAuthz();
+  return defaultAuthzLoader;
+}
+
+/** 测试用:清掉进程级默认 loader(避免跨用例串缓存)。 */
+export function _resetGateAuthzLoaderForTests(): void {
+  defaultAuthzLoader = null;
 }
 
 /**
@@ -305,19 +357,75 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
   if (localRaw) {
     const token = parseLocalCatalogToken(localRaw);
     assertEpochMatches(BigInt(token.securityEpoch), snapshot.securityEpoch, "local_catalog");
+    // MAJOR-7:落库的 projectionRevision 必须由**服务端**按已认证 uid 重算,token 的自称值
+    // 只作比对。见 recomputeProjectionRevision。
+    const projectionRevision = await recomputeProjectionRevision({
+      snapshot,
+      uid: args.uid,
+      claimed: token.projectionRevision,
+      loadAuthz: resolveAuthzLoader(args.loadUserModelAuthz),
+      logger: args.logger ?? rootLogger.child({ subsys: "modelAuthorityGate" }),
+    });
     return {
       snapshot,
       canonicalModel,
       descriptor,
       authorityKind: "local_catalog",
       executionRevision: snapshot.executionRevision,
-      projectionRevision: token.projectionRevision,
+      projectionRevision,
+      claimedProjectionRevision: token.projectionRevision,
       securityEpoch: snapshot.securityEpoch,
       authorityTurnId: null,
     };
   }
 
   throw new ModelGateReject("authority_invalid", "request carries no model authority");
+}
+
+/**
+ * 按**已认证 uid 的当前 role/grants** + 本请求 fence 到的快照重算 per-uid projectionRevision
+ * (与 `/internal/v3/model-catalog` 下发时同一个 `snapshot.projectionRevisionFor`,单一算法)。
+ *
+ * fail-closed:授权信息读不到 → 拒(503)。不能"退回用 token 自称值"——那正是本修复要消灭的
+ * 污染面;也不能"退回 null 继续跑"——审计列会静默变空,事故无痕。语义与 internalModelCatalog
+ * 的 authz_load_failed → 503 对齐(同一条"授权读不到就别放行"的纪律)。
+ *
+ * **不一致不拒**,只告警:epoch 相等下二者仍可能合法不等 —— 状态机只对"收窄类"写
+ * (state 离开 active / visibility 收紧 / grant 撤销 / 价格·execution·alias 变更)bump epoch,
+ * 而**放宽类**(新 grant、新模型 staged→active)不 bump → 容器手里的投影少一行、epoch 却相等。
+ * 这类漂移对安全无害(执行仍由服务端权威判定),拒了反而误伤正常 turn。真正的越权尝试
+ * (伪造一个"更宽的" projectionRevision)本来就落不了库,也拿不到任何额外授权。
+ */
+async function recomputeProjectionRevision(a: {
+  snapshot: ModelCatalogSnapshot;
+  uid: bigint;
+  claimed: string;
+  loadAuthz: (uid: bigint) => Promise<UserModelAuthz>;
+  logger: Logger;
+}): Promise<string> {
+  let authz: UserModelAuthz;
+  try {
+    authz = await a.loadAuthz(a.uid);
+  } catch (err) {
+    throw new ModelGateReject(
+      "catalog_unavailable",
+      `authz load failed for projection revision: ${(err as Error)?.message ?? String(err)}`,
+    );
+  }
+  const computed = a.snapshot.projectionRevisionFor({
+    uid: a.uid.toString(),
+    role: authz.role,
+    grantedModelIds: authz.grantedModelIds,
+  });
+  if (computed !== a.claimed) {
+    a.logger.warn("local_catalog_projection_revision_mismatch", {
+      uid: a.uid.toString(),
+      claimed: a.claimed.slice(0, 12),
+      computed: computed.slice(0, 12),
+      securityEpoch: a.snapshot.securityEpoch.toString(),
+    });
+  }
+  return computed;
 }
 
 function verifyBridgeAuthority(a: {
@@ -402,6 +510,7 @@ function verifyBridgeAuthority(a: {
     executionRevision: a.snapshot.executionRevision,
     // 全局 executionRevision 不下发用户;bridge 路径也不产出 per-uid projectionRevision。
     projectionRevision: null,
+    claimedProjectionRevision: null,
     securityEpoch: a.snapshot.securityEpoch,
     authorityTurnId: principal.authorityTurnId,
   };

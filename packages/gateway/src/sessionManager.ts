@@ -26,6 +26,7 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
+import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -1512,15 +1513,27 @@ export class SessionManager {
      */
     model?: string
     /**
-     * master 签名的**执行权威**(docs/V5_MODEL_AUTHORITY_PLAN.md §2;由 server.ts
-     * dispatchInbound 从验签通过的 inbound authority 取出)。
+     * **master 的执行权威**(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§3)。两个来源:
+     *   - `source:'bridge_signed'`:server.ts dispatchInbound 从验签通过的 inbound
+     *     authority(签名 descriptor)取出;
+     *   - `source:'local_catalog'`:无 envelope 的本地路径(cron/synthetic/delegate/
+     *     wechat/prewarm)在**创建 runner 之前**从 master catalog 投影现取
+     *     (server.ts `resolveLocalExecutionIfEnforced`)。
      *
      * 存在 → 该 turn 的 canonicalModel + engine **全部取自它**,容器不再查 baked
      * 白名单/MODEL_ENGINE_MAP(两处 baked 表是 master 之外的第二信任源,与 catalog
-     * 快照必然漂移)。缺省(cron / synthetic / delegate / 个人版本地路径)→ 现状判定,
-     * 行为零变化。
+     * 快照必然漂移)。
+     *
+     * 缺省的语义按 flag 分岔(registry.resolveEngine 的 requireAuthority 门):
+     *   - flag 未开(个人版 / 过渡期)→ 现状 baked 判定,**行为零变化**;
+     *   - flag 开(托管)→ **fail-closed 抛 ModelAuthorityRequiredError**(= 调用方漏了
+     *     catalog 判定,不许回落 baked)。
      */
-    executionAuthority?: { canonicalModel: string; engine: 'ccb' | 'codex' }
+    executionAuthority?: {
+      canonicalModel: string
+      engine: 'ccb' | 'codex'
+      source?: 'bridge_signed' | 'local_catalog'
+    }
     /**
      * Authenticated userId owning the client_sessions row. When provided,
      * stored on the resulting AgentSession so the durable server-authored-
@@ -1596,14 +1609,23 @@ export class SessionManager {
       this.config.defaults.model,
       opts.executionAuthority,
     )
-    const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority)
+    // flag 门(§3):托管 + OC_MODEL_AUTHORITY=1 时,**无 master 权威一律不许创建 runner**。
+    // 判定放在 resolveEngine 内部(engine 判定的单一收口),这里只把 flag 传进去 ——
+    // 于是"所有无 envelope 的 runner 创建入口"的完整性不再依赖人工枚举:createEngine 的
+    // 唯一调用者就是本函数,任何漏取 catalog 投影的入口都会在这里 fail-closed 炸出来。
+    const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
+      requireAuthority: isModelAuthorityRequired(),
+    })
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
-      // 跨 engine 切换判定:只有"caller 明确给了 model"或"agent 显式 pin 到
-      // codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见
-      // opts.model JSDoc)。
+      // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
+      // 到 codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见 opts.model
+      // JSDoc)。authority 在场必权威 —— master 说这个 turn 跑 codex,就不能因为 caller
+      // 没显式带 model 而沿用现存 ccb runner(那正是执行与计费分裂的形状)。
       const desiredEngine =
-        opts.model !== undefined || opts.agent.provider === 'codex-native'
+        opts.model !== undefined ||
+        opts.executionAuthority !== undefined ||
+        opts.agent.provider === 'codex-native'
           ? engineId
           : existing.providerTag
       if (existing.providerTag !== desiredEngine) {

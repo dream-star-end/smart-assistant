@@ -687,6 +687,8 @@ export const CATALOG_CHANNEL = "model_catalog_changed";
  */
 export class ModelCatalogCache {
   private snapshot: ModelCatalogSnapshot | null = null;
+  /** 展示面 fence 微缓存的上次 fence 时刻(仅 assertFreshCached 用;epoch NOTIFY 会清 snapshot,故失效自动生效)。 */
+  private displayFenceAt: number | null = null;
   private lastError: unknown = null;
   private listener: Client | null = null;
   private rebuildInFlight: Promise<void> | null = null;
@@ -737,11 +739,37 @@ export class ModelCatalogCache {
   }
 
   /**
+   * unknown 时**等在飞重建**(而不是立刻抛)。
+   *
+   * 为什么(0136):自「grant 写也 bump epoch」起,每一次 admin 授权/撤权都会让 master 与
+   * egress 的快照瞬间进入 unknown → 若执行面直接拒帧,一次后台点击就会给正在聊天的用户
+   * 抛一个 MODEL_AUTHORITY_UNAVAILABLE。等待在飞重建的语义与 fail-closed **完全不冲突**:
+   * 期间绝不使用旧快照(零 stale),只是把「重建完成」这几十毫秒等掉;重建失败 → 照抛。
+   *
+   * 没有在飞重建(冷启/上次失败后无人再触发)→ 自己同步发起一次。
+   */
+  private async ensureSnapshot(): Promise<ModelCatalogSnapshot> {
+    if (this.snapshot) return this.snapshot;
+    const inflight = this.rebuildInFlight;
+    if (inflight) {
+      await inflight; // scheduleRebuild 内部已 catch,不会抛
+      if (this.snapshot) return this.snapshot;
+      throw new CatalogUnknownError(this.lastError);
+    }
+    return await this.rebuild(); // 失败 → 抛(fail-closed)
+  }
+
+  /**
    * fence + 自愈一次:epoch 漂移 → 同步重建后返回新快照;重建失败 → 抛(拒)。
    * 执行/计费入口应当调它而不是裸 current()。
+   *
+   * 注意 rebuild() **故意不做单飞合并**:admin 安全写在提交后调它,要求「本进程快照
+   * 确实前进到了该写之后」——若合并到一个更早启动的在飞重建上,就可能拿到写之前的快照
+   * 并向 admin 报成功。ensureSnapshot() 里可以搭在飞的车,是因为那班车必然由 epoch NOTIFY
+   * (= 提交之后)触发,且随后的 assertEpochFresh 还会再 fence 一次。
    */
   async assertFresh(): Promise<ModelCatalogSnapshot> {
-    const snap = this.current();
+    const snap = await this.ensureSnapshot();
     try {
       await assertEpochFresh(snap);
       return snap;
@@ -749,6 +777,28 @@ export class ModelCatalogCache {
       if (!(err instanceof EpochStaleError)) throw err;
       return await this.rebuild();
     }
+  }
+
+  /**
+   * **展示面专用**的 fence 微缓存变体(方案 §1.2 明许:安全/计费面禁缓存,纯展示面许)。
+   *
+   * 唯一合法调用者 = 匿名不限流的展示端点(如 /api/public/models)。它们以前零 DB 查询,
+   * 逐请求直读 epoch 会把匿名路径变成可被放大的 DB 打点。展示面晚 ≤ttlMs 看到 disable
+   * **无金钱/授权后果** —— 真正的执行闸在 bridge 签发与 egress 每请求 fence,前端就算把
+   * 已 disable 的模型画出来、点了也跑不了。
+   *
+   * **禁止**用于:authority 签发 / codex preCheck / journal / egress /v1/messages 授权与
+   * 路由 —— 那些面必须 assertFresh()(零 stale 窗口是它们的安全前提,R3-B2)。
+   */
+  async assertFreshCached(ttlMs: number): Promise<ModelCatalogSnapshot> {
+    const now = Date.now();
+    if (this.displayFenceAt !== null && now - this.displayFenceAt < ttlMs) {
+      const snap = this.snapshot;
+      if (snap) return snap;
+    }
+    const snap = await this.assertFresh();
+    this.displayFenceAt = Date.now();
+    return snap;
   }
 
   async startListener(connectionString?: string): Promise<void> {

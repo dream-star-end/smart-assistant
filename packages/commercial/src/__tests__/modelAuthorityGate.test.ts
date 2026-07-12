@@ -12,6 +12,8 @@
  *   - uid / containerId 不匹配 → 拒(跨用户、跨容器复用票据)
  *   - 长 turn:authority 过期但 lease 有效 → 放行(R4-M1);lease 与 authority 不同 turn → 拒
  *   - 本地路径 local_catalog token:epoch 相等放行 / 漂移拒;无凭据 → 拒
+ *   - **projectionRevision 由服务端按 uid 的 role/grants 重算**(R1 MAJOR-7):容器自铸 token 里的
+ *     值只作比对(不一致 → 告警),绝不落库;authz 读不到 → fail-closed 503
  *   - 不可路由(非 active / codex engine)→ MODEL_NOT_AVAILABLE
  *   - **跨包 header/kind 常量 parity**(容器侧 gateway/modelCatalogClient 是同一份 wire 契约)
  */
@@ -50,6 +52,8 @@ import {
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
 } from "../http/internalModelCatalog.js";
+import type { UserModelAuthz } from "../auth/userModelAuthz.js";
+import type { Logger } from "../logging/logger.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 
 // ─── fixtures ────────────────────────────────────────────────────────────
@@ -137,6 +141,55 @@ function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): Mode
     ),
     securityEpoch: epoch,
   });
+}
+
+/**
+ * 带一行 **visibility='admin'** 模型的快照 —— per-uid 投影只有在存在"不是人人可见"的行时
+ * 才会随 role/grants 变化(全 public 的 snap() 下 user 与 admin 投影恒等,断不出差异)。
+ */
+function snapWithAdminModel(epoch = EPOCH): ModelCatalogSnapshot {
+  const HAIKU = entry({ entryId: 9, modelId: "claude-haiku-4-5", providerId: null });
+  return new ModelCatalogSnapshot({
+    entries: [GLM, SOL, DISABLED, FLASH, HAIKU],
+    aliases: new Map([["glm-latest", 1]]),
+    pricing: new Map(
+      [
+        price("glm-5.2"),
+        price("gpt-5.6-sol"),
+        price("glm-5.1"),
+        price(DEFAULT_SECONDARY_UTILITY_MODEL),
+        price("claude-haiku-4-5", { visibility: "admin" }),
+      ].map((p) => [p.modelId, p]),
+    ),
+    securityEpoch: epoch,
+  });
+}
+
+/**
+ * role + grants 的服务端权威桩(本地路径重算 projectionRevision 用)。
+ * **必须显式注入**:不注入 gate 会用进程级默认 loader → 真连 DB。
+ */
+function authzLoader(authz: UserModelAuthz): (uid: bigint) => Promise<UserModelAuthz> {
+  return async () => authz;
+}
+
+/** 收集 warn 的 logger 桩(projectionRevision 不一致的告警从这里出)。 */
+function silentLogger(
+  warns: Array<{ msg: string; fields?: Record<string, unknown> }> = [],
+): Logger {
+  const log: Logger = {
+    trace() {},
+    debug() {},
+    info() {},
+    warn(msg, fields) {
+      warns.push({ msg, fields });
+    },
+    error() {},
+    child() {
+      return log;
+    },
+  };
+  return log;
 }
 
 /** 计数版 CatalogSource:断言"每请求一次 fence"。 */
@@ -595,12 +648,13 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
 });
 
 describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
-  test("epoch 相等 → 放行,kind=local_catalog + projectionRevision 落 usage", async () => {
+  test("epoch 相等 → 放行,kind=local_catalog;projectionRevision **服务端重算**", async () => {
     const s = snap();
+    // 容器自铸 token:projectionRevision 随手编一个(它本来就能编)。
     const token = encodeLocalCatalogToken({
       v: 1,
       kind: "local_catalog",
-      projectionRevision: "proj-rev-1",
+      projectionRevision: "proj-rev-forged",
       securityEpoch: s.securityEpoch.toString(),
     });
     const d = await enforceModelAuthority({
@@ -610,13 +664,143 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
       uid: UID,
       containerId: CONTAINER_ID,
       model: "glm-5.2",
+      loadUserModelAuthz: authzLoader({ role: "user", grantedModelIds: new Set() }),
+      logger: silentLogger(),
     });
     assert.equal(d.authorityKind, "local_catalog");
-    assert.equal(d.projectionRevision, "proj-rev-1");
     assert.equal(d.securityEpoch, s.securityEpoch);
+    // 落库的那一份 = 按已认证 uid 的当前 role/grants + 本请求快照重算(与 /internal/v3/model-catalog 同源)
+    const expected = s.projectionRevisionFor({
+      uid: UID.toString(),
+      role: "user",
+      grantedModelIds: new Set(),
+    });
+    assert.equal(d.projectionRevision, expected);
+    // 伪造值绝不落库,只作为比对值留在 decision 里(供告警/排障)
+    assert.notEqual(d.projectionRevision, "proj-rev-forged");
+    assert.equal(d.claimedProjectionRevision, "proj-rev-forged");
   });
 
-  test("epoch 漂移 → MODEL_CONFIG_CHANGED_RETRY_TURN(容器快照旧了)", async () => {
+  test("伪造 projectionRevision(冒充 admin 投影)不改变落库值,且打不一致告警", async () => {
+    const s = snapWithAdminModel();
+    // 攻击者拿 admin 投影的 hash 塞进 token,想让审计看起来像"在 admin 投影下消费"。
+    const adminRevision = s.projectionRevisionFor({
+      uid: UID.toString(),
+      role: "admin",
+      grantedModelIds: new Set(),
+    });
+    const token = encodeLocalCatalogToken({
+      v: 1,
+      kind: "local_catalog",
+      projectionRevision: adminRevision,
+      securityEpoch: s.securityEpoch.toString(),
+    });
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const d = await enforceModelAuthority({
+      catalog: source(s),
+      keyring: null,
+      headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "glm-5.2",
+      // 服务端权威:这个 uid 只是普通 user
+      loadUserModelAuthz: authzLoader({ role: "user", grantedModelIds: new Set() }),
+      logger: silentLogger(warns),
+    });
+    const userRevision = s.projectionRevisionFor({
+      uid: UID.toString(),
+      role: "user",
+      grantedModelIds: new Set(),
+    });
+    assert.equal(d.projectionRevision, userRevision);
+    assert.notEqual(d.projectionRevision, adminRevision);
+    // 不一致 → 告警(不拒:放宽类变更下的合法漂移也会走到这里,拒了会误伤正常 turn)
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0].msg, "local_catalog_projection_revision_mismatch");
+    assert.equal(warns[0].fields?.claimed, adminRevision.slice(0, 12));
+    assert.equal(warns[0].fields?.computed, userRevision.slice(0, 12));
+  });
+
+  test("token 值与服务端重算一致 → 无告警", async () => {
+    const s = snap();
+    const authz = { role: "user" as const, grantedModelIds: new Set<string>() };
+    const token = encodeLocalCatalogToken({
+      v: 1,
+      kind: "local_catalog",
+      projectionRevision: s.projectionRevisionFor({ uid: UID.toString(), ...authz }),
+      securityEpoch: s.securityEpoch.toString(),
+    });
+    const warns: Array<{ msg: string }> = [];
+    await enforceModelAuthority({
+      catalog: source(s),
+      keyring: null,
+      headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "glm-5.2",
+      loadUserModelAuthz: authzLoader(authz),
+      logger: silentLogger(warns),
+    });
+    assert.equal(warns.length, 0);
+  });
+
+  test("grants 变了 → 重算值随之变(投影 revision 绑 role/grants,不绑容器自称)", async () => {
+    const s = snapWithAdminModel();
+    const token = encodeLocalCatalogToken({
+      v: 1,
+      kind: "local_catalog",
+      projectionRevision: "whatever",
+      securityEpoch: s.securityEpoch.toString(),
+    });
+    const base = {
+      catalog: source(s),
+      keyring: null,
+      headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "glm-5.2",
+      logger: silentLogger(),
+    };
+    const asUser = await enforceModelAuthority({
+      ...base,
+      catalog: source(s),
+      loadUserModelAuthz: authzLoader({ role: "user", grantedModelIds: new Set() }),
+    });
+    const asAdmin = await enforceModelAuthority({
+      ...base,
+      catalog: source(s),
+      loadUserModelAuthz: authzLoader({ role: "admin", grantedModelIds: new Set() }),
+    });
+    assert.notEqual(asUser.projectionRevision, asAdmin.projectionRevision);
+  });
+
+  test("role/grants 读不到(DB 抖)→ 503 MODEL_CATALOG_UNAVAILABLE(fail-closed,不退回 token 自称值)", async () => {
+    const s = snap();
+    const token = encodeLocalCatalogToken({
+      v: 1,
+      kind: "local_catalog",
+      projectionRevision: "proj-rev-1",
+      securityEpoch: s.securityEpoch.toString(),
+    });
+    const err = await expectReject(
+      enforceModelAuthority({
+        catalog: source(s),
+        keyring: null,
+        headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "glm-5.2",
+        loadUserModelAuthz: async () => {
+          throw new Error("PG down");
+        },
+        logger: silentLogger(),
+      }),
+      "MODEL_CATALOG_UNAVAILABLE",
+    );
+    assert.equal(err.status, 503);
+  });
+
+  test("epoch 漂移 → MODEL_CONFIG_CHANGED_RETRY_TURN(容器快照旧了;此时不该去读 authz)", async () => {
     const s = snap(6n);
     const token = encodeLocalCatalogToken({
       v: 1,
@@ -624,6 +808,7 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
       projectionRevision: "proj-rev-1",
       securityEpoch: "5",
     });
+    let authzCalls = 0;
     await expectReject(
       enforceModelAuthority({
         catalog: source(s),
@@ -632,9 +817,15 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
         uid: UID,
         containerId: CONTAINER_ID,
         model: "glm-5.2",
+        loadUserModelAuthz: async () => {
+          authzCalls += 1;
+          return { role: "user" as const, grantedModelIds: new Set<string>() };
+        },
+        logger: silentLogger(),
       }),
       "MODEL_CONFIG_CHANGED_RETRY_TURN",
     );
+    assert.equal(authzCalls, 0);
   });
 
   test("token 形状非法 / 伪装成 bridge kind → 拒", async () => {

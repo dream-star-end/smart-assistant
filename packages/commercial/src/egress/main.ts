@@ -43,6 +43,10 @@ import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
+import {
+  EGRESS_CAPABILITIES,
+  assertModelAuthorityCutoverFloor,
+} from "../runtimeCapabilities.js";
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
 import { rootLogger } from "../logging/logger.js";
@@ -88,6 +92,8 @@ export async function startEgress(): Promise<void> {
   if (!cfg.OC_EGRESS_SPLIT) {
     throw new Error("[egress] OC_EGRESS_SPLIT!=1 — egress 进程只在 split 模式下运行,拒启");
   }
+  // 步骤 5 兼容地板(方案 §7 步 5,R4-M2:egress 是四面之一)。marker 置位却 flag 关 = 拒启。
+  assertModelAuthorityCutoverFloor();
   const bind = cfg.INTERNAL_PROXY_BIND;
   const port = cfg.INTERNAL_PROXY_PORT;
   const controlBind = cfg.INTERNAL_CONTROL_BIND;
@@ -324,7 +330,19 @@ export async function startEgress(): Promise<void> {
     if (path === "/internal/v5/egress-health") {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ ok: true, role: "egress", pendingCostEvents: costSink.pending }));
+      // capabilities:**构建级事实**(本 egress 版本实现了模型权威协议:每请求 epoch fence +
+      // catalog 数据驱动路由)。deploy 的四面守卫在开 flag / 走 cutover 前读它 —— 一个旧
+      // egress 进程(无 fence)会让 master 签发的权威在出站面失效,必须在启用前被拒。
+      // enforced 是**开关态**(诊断用),与 capability 语义正交。
+      res.end(
+        JSON.stringify({
+          ok: true,
+          role: "egress",
+          pendingCostEvents: costSink.pending,
+          capabilities: [...EGRESS_CAPABILITIES],
+          modelAuthority: { enforced: isModelAuthorityEnforced() },
+        }),
+      );
       return;
     }
     // 0106 — per-model 在飞快照(admin 容量面;master 的 model-ops 端点拉取,egress 是

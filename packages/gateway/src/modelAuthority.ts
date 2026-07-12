@@ -51,6 +51,8 @@ import {
   type ModelAuthorityPayload,
   type ModelExecutionDescriptor,
   assertLeaseMatchesAuthority,
+  keyringFingerprint,
+  keyringKeyIds,
   parseAuthorityKeyring,
   stripModelAuthorityField,
   verifyAuthority,
@@ -77,6 +79,22 @@ const CONTAINER_ID_ENV = 'OC_CONTAINER_ID'
 const USER_ID_ENV = 'OC_USER_ID'
 /** 强制门 env:master flag 开启时由 supervisor 注入,容器侧同构 fail-closed。 */
 const REQUIRE_AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
+
+/**
+ * flag 门的**单一权威**判定(`OC_MODEL_AUTHORITY=1`)。
+ *
+ * 两条路径同读这里:
+ *   - bridge turn:inbound 必须带有效 authority(ModelAuthorityConsumer.required);
+ *   - 本地路径(cron/synthetic/delegate/wechat/prewarm):判定源必须是 master 的 catalog
+ *     投影(server.ts resolveLocalExecutionIfEnforced;registry.resolveEngine 的 requireAuthority 门)。
+ *
+ * 两者**不允许各自解释 flag** —— 半开状态(bridge 强制、本地仍 baked)正是本批要消灭的
+ * 旁路形状:本地路径会继续用镜像里的 baked 表判 engine/可用性,与 catalog 漂移。
+ * flag 未设 → 恒 false → 全部旧行为零变化(个人版 / 过渡期)。
+ */
+export function isModelAuthorityRequired(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[REQUIRE_AUTHORITY_ENV] === '1'
+}
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -184,7 +202,7 @@ export class AuthorityReplayCache implements AuthorityReplayGuard {
 
   consume(connectionChallenge: string, authorityTurnId: string, expiresAt: number): boolean {
     const now = this.clock()
-    const key = `${connectionChallenge} ${authorityTurnId}`
+    const key = `${connectionChallenge}\x00${authorityTurnId}`
     const prev = this.seen.get(key)
     if (prev !== undefined) {
       // 活跃期内重复 = 重放。**过期条目也不放行**:它已被 verify 的 Expired 门挡住,
@@ -214,7 +232,7 @@ export class AuthorityReplayCache implements AuthorityReplayGuard {
 
   /** 连接关闭时丢弃该连接的条目(challenge 已换,留着也无意义)。 */
   dropConnection(connectionChallenge: string): void {
-    const prefix = `${connectionChallenge} `
+    const prefix = `${connectionChallenge}\x00`
     for (const key of this.seen.keys()) {
       if (key.startsWith(prefix)) this.seen.delete(key)
     }
@@ -317,7 +335,7 @@ export class ModelAuthorityConsumer {
       keyring,
       containerId: parsePositiveInt(env[CONTAINER_ID_ENV]),
       uid: parsePositiveInt(env[USER_ID_ENV]),
-      required: env[REQUIRE_AUTHORITY_ENV] === '1',
+      required: isModelAuthorityRequired(env),
       onAlert,
     })
   }
@@ -336,6 +354,23 @@ export class ModelAuthorityConsumer {
   /** hello attestation 广播的 capability 列表(不 enabled → 空数组)。 */
   capabilities(): string[] {
     return this.enabled ? [MODEL_AUTHORITY_CAPABILITY] : []
+  }
+
+  /**
+   * 本容器 env ring 里的 keyId(字典序)—— attestation 上报,master 侧 census 统计覆盖。
+   *
+   * **为什么容器必须自报 keyId**(R3-M7 轮换五步的步骤②):master 切私钥(步③)之前
+   * 必须确证「全部在跑容器都已经拿到新公钥」。整改前 attestation 只广播一个 capability
+   * 字符串,master 无从知道容器 ring 里到底有哪几把钥匙 —— 步骤② 只能靠目测,切早了就是
+   * 全站 UnknownKey 拒帧。keyId 是公钥派生的公开标识,上报它不泄漏任何秘密。
+   */
+  keyIds(): string[] {
+    return keyringKeyIds(this.keyring)
+  }
+
+  /** 本容器 ring 的指纹(与 master 侧 `AuthoritySigner.fingerprint()` 同源:protocol 实现)。 */
+  keyringFingerprint(): string {
+    return keyringFingerprint(this.keyring)
   }
 
   /** 每条 bridge 连接现铸一个 challenge(128 bit CSPRNG)。 */
@@ -509,6 +544,18 @@ export interface ContainerAttestFrame {
   containerId: number | null
   /** authority TTL,供 bridge 观测(不参与判定)。 */
   authorityTtlMs: number
+  /**
+   * 本容器 env keyring 的 keyId 集合(字典序)+ 指纹 —— **轮换五步步骤② 的数据源**。
+   *
+   * master 的 census(commercial/ws/authorityKeyCensus.ts)按连接汇总这两个字段,回答
+   * 「全部在跑容器是否都已认得新公钥」;为 true 才允许切私钥(步③)。
+   * 公钥/keyId 都是公开材料,上报不泄漏秘密。
+   *
+   * bridge 侧对**缺席**这两个字段的旧容器按 `keyIdsUnknown` 记账,覆盖判定一律算"不覆盖"
+   * (fail-closed:不知道 ≠ 认得)。
+   */
+  keyIds: string[]
+  keyringFingerprint: string
 }
 
 export function buildContainerAttestFrame(
@@ -522,5 +569,7 @@ export function buildContainerAttestFrame(
     connectionChallenge: conn.challenge,
     containerId,
     authorityTtlMs: AUTHORITY_TTL_MS,
+    keyIds: consumer.keyIds(),
+    keyringFingerprint: consumer.keyringFingerprint(),
   }
 }

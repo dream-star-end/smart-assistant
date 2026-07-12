@@ -46,7 +46,13 @@ import { classifyDelegateOutputError } from './errorClassify.js'
 // 注:server.ts ↔ cron.ts 已存在被容忍的模块循环(server import CronScheduler;
 // sessionManager 亦 `import { resolveExecutionModel } from './server.js'`),本函数只在
 // runJob 运行期调用,非模块初始化期,live-binding 安全,沿用既有模式。
-import { resolveSyntheticTurnModel } from './server.js'
+import {
+  localExecutionOverride,
+  resolveLocalExecutionIfEnforced,
+  resolveSyntheticTurnModel,
+  type LocalExecutionDecision,
+} from './server.js'
+import { localExecutionRejectCode } from './modelCatalogClient.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -684,13 +690,41 @@ export class CronScheduler {
     // 与 agent 交互态默认(可能是 gpt-5.5=codex)解耦;非 codex agent 返回 undefined,
     // 沿用原默认(行为不变)。同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
     const cronRoute = resolveSyntheticTurnModel(agent, this.config.defaults.model)
-    const cronModel = cronRoute?.model
+    // ── 模型权威 §3:cron 是**无 envelope 的本地路径** ────────────────────────
+    // flag 开(托管)→ 判定源换成 master 的 per-uid catalog 投影:归一 / 可用性(active)/
+    // engine **全取投影**,容器镜像里 baked 的两张表不再参与(它们与 catalog 必然漂移)。
+    // codex 意图仍按真值表**降级为非 codex**(既有语义,cron 无 server-owned requestId)。
+    // 投影拉不到 → 抛 → 本 job 本次不执行(**无 baked 回落**,R1-B1)。
+    // flag 未开(个人版/过渡期)→ undefined → 完全沿用上面的 baked 合成降级,零变化。
+    // 判定失败(投影不可用 / 模型不可用 / codex pin)→ **本 job 跳过本次执行**,不上抛:
+    // runJob 的异常会中断整个 tick 的 for 循环,一个 pin 到 disabled 模型的 job 会永久
+    // 饿死排在它后面的所有 job。这里就地记日志 + return(lastRun 照记,不产生重试风暴)。
+    let cronExec: LocalExecutionDecision | undefined
+    try {
+      cronExec = await resolveLocalExecutionIfEnforced({
+        agent,
+        kind: 'synthetic',
+        model: cronRoute?.model,
+        defaultModel: this.config.defaults.model,
+      })
+    } catch (err) {
+      const code = localExecutionRejectCode(err)
+      if (!code) throw err
+      logger.error(`job ${job.id} rejected by model catalog`, {
+        jobId: job.id,
+        agent: agent.id,
+        code,
+      })
+      return
+    }
+    const cronModel = cronExec?.canonicalModel ?? cronRoute?.model
     // MAJOR-2 透明化:cron 是 host 平台维护 turn(无用户面),降级记 runLog/日志即可,不需用户可见。
-    if (cronRoute?.downgraded) {
+    const downgradedFrom = cronExec?.downgradedFrom ?? (cronRoute?.downgraded ? cronRoute.originalModel : undefined)
+    if (downgradedFrom) {
       logger.info(`job ${job.id} synthetic model downgraded off codex`, {
         jobId: job.id,
-        from: cronRoute.originalModel,
-        to: cronRoute.model,
+        from: downgradedFrom,
+        to: cronModel,
       })
     }
 
@@ -698,6 +732,7 @@ export class CronScheduler {
       sessionKey,
       agent,
       ...(cronModel ? { model: cronModel } : {}),
+      ...localExecutionOverride(cronExec),
       channel: 'cron',
       peerId: job.id,
       title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,

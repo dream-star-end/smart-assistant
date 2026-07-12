@@ -222,10 +222,19 @@ import {
   attachTurnAuthority,
   buildContainerAttestFrame,
   getTurnAuthority,
+  isModelAuthorityRequired,
   stripModelAuthorityField,
   type ConnectionAuthorityContext,
   type TurnExecutionDescriptor,
 } from './modelAuthority.js'
+import {
+  LocalExecutionRejected,
+  ModelCatalogUnavailableError,
+  getLocalCatalogView,
+  localExecutionRejectCode,
+  type LocalCatalogView,
+  type LocalExecutionRejectCode,
+} from './modelCatalogClient.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -391,6 +400,184 @@ export function resolveSyntheticTurnModel(
   // internal proxy 按模型名路由可达),不受影响。
   if (!isHostRoutableStaticModel(candidate)) return undefined
   return { model: candidate, originalModel: effective, downgraded: true }
+}
+
+// ─── 本地路径(无 envelope)的执行判定 —— 方案 §3 真值表 ─────────────────────
+//
+// 谁走这里:cron / webhook / scheduled task / inter-agent / openai-compat / skill-train /
+// skill-eval / delegate / wechat inbound / boot pre-warm —— 所有**不经 bridge 签发
+// authority** 的 runner 创建入口。它们此前按容器镜像里 baked 的两张表判定
+// (ALLOWED_INBOUND_MODELS / MODEL_ENGINE_MAP),那是 master 之外的**第二信任源**:
+// 与 catalog 必然漂移(新模型 / engine 迁移 / 撤销授权在两侧不同步生效),漂移方向恰好是
+// "容器以为自己能跑" = 免费或越权执行。本批把判定源换成 master 的 per-uid catalog 投影。
+//
+// 三条硬语义:
+//   1. **flag 未开 → 一行不动**(resolveLocalExecutionIfEnforced 返回 undefined,调用方
+//      走现状 baked 判定)。个人版 / 过渡期零变化。
+//   2. **投影拉不到 → 拒新 turn**(ModelCatalogUnavailableError 上抛,无 baked 回落,R1-B1)。
+//   3. **codex 意图按 kind 分岔**(§3 真值表):
+//        - 'synthetic'(cron/webhook/task/inter-agent/openai-compat)→ 既有语义:**降级**
+//          为非 codex 兜底模型(这些是进程内合成首帧,拿不到 master 铸的 server-owned
+//          requestId,落 codex 必被 CODEX_BILLING_GUARD 拒;降级让 cron 照常跑);
+//        - 'turn'(delegate / wechat 等真实本地 turn / skill-train / skill-eval)→ **拒**,
+//          结构化 DELEGATE_CODEX_UNSUPPORTED。现状是同样跑不了(晚期被 billing guard 拒),
+//          本批把它提前到**创建 runner 之前**并给出稳定错误码 —— 不静默换模型:用户/队长
+//          明确点了 codex,悄悄换成别的模型执行并计费是更坏的答案;
+//        - 'prewarm'(boot / hello 预热)→ **不适用 codex 策略**:预热不执行 turn、不计费,
+//          engine/model 照样取投影(不查 baked),但允许 codex —— 真正的 turn 一定带 envelope
+//          (bridge)或被上面两条拦住,且 CODEX_BILLING_GUARD 仍是最后一道闸。拒预热只会
+//          让 codex 会话丢掉预热(UX 回退),换不到任何安全收益。
+//   4. **provider pin('codex-native')的本地 turn → 一律拒**:model 替换救不了它
+//      (resolveEngine 的 pin 恒判 codex),与 resolveSyntheticTurnModel 现状(返回 undefined
+//      → 保持 fail-closed)同向,只是把"晚期 guard 拒"提前成结构化错误。
+
+/** 本地路径的 turn 语义分类(决定 codex 意图怎么处理,见上方真值表)。 */
+export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm'
+
+/** 本地路径判定结果:该 turn 的 canonical 模型 + engine(= getOrCreate/submit 的同源入参)。 */
+export interface LocalExecutionDecision {
+  /** catalog 归一后的 canonical model id(alias 已解析)。 */
+  readonly canonicalModel: string
+  /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
+  readonly engine: 'ccb' | 'codex'
+  /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
+  readonly downgradedFrom?: string
+}
+
+/**
+ * 纯函数:给定 per-uid 投影 + 执行意图 → 本地路径判定(真值表实现体,便于单测)。
+ *
+ * 候选阶梯与 `resolveExecutionModel` **同形**(caller model → agent.model → config 默认 →
+ * 平台兜底),只是"这个模型能不能跑"的判定从 baked 白名单换成 catalog 投影 —— 于是
+ * "agent.model 是个已下线/未授权模型"这类存量情况仍然优雅降级到平台默认(不回归),
+ * 而"catalog 里 disabled / 该 uid 无授权"的模型则被真正拦下(baked 白名单拦不住)。
+ */
+export function decideLocalExecution(args: {
+  view: LocalCatalogView
+  agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
+  /** caller 显式指定的模型(cron 降级模型 / skill-train 模型 / inbound frame.model)。 */
+  model?: string
+  /** config.defaults.model。 */
+  defaultModel?: string | null
+  kind: LocalTurnKind
+  env?: NodeJS.ProcessEnv
+}): LocalExecutionDecision {
+  const { view, agent, kind } = args
+  const env = args.env ?? process.env
+
+  // ① provider 硬 pin:engine 恒 codex,换模型无效 → 本地 turn 一律拒(prewarm 除外)。
+  if (agent.provider === 'codex-native' && kind !== 'prewarm') {
+    throw new LocalExecutionRejected(
+      'DELEGATE_CODEX_UNSUPPORTED',
+      `agent '${agent.id}' is pinned to the codex engine, which cannot run on a local ` +
+        `(non-bridge) turn: codex billing needs a master-minted request id. Run it from a chat turn.`,
+    )
+  }
+
+  // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
+  const candidates = [args.model, agent.model, args.defaultModel, EXECUTION_MODEL_FALLBACK]
+  for (const raw of candidates) {
+    if (typeof raw !== 'string' || raw === '') continue
+    const canonicalModel = view.canonicalize(raw)
+    if (!view.isRoutable(canonicalModel)) continue // 未 active / 未授权 / 未知 → 下一档
+    const engine = view.resolve(canonicalModel)?.engine
+    if (engine === undefined) continue
+    if (engine !== 'codex') return { canonicalModel, engine }
+
+    // codex 意图(engine 取自投影,不看 baked)。
+    if (kind === 'prewarm') return { canonicalModel, engine }
+    if (kind === 'turn') {
+      throw new LocalExecutionRejected(
+        'DELEGATE_CODEX_UNSUPPORTED',
+        `model '${canonicalModel}' runs on the codex engine, which cannot run on a local ` +
+          `(non-bridge) turn: codex billing needs a master-minted request id.`,
+      )
+    }
+    return downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env)
+  }
+
+  throw new LocalExecutionRejected(
+    'MODEL_NOT_AVAILABLE',
+    `no routable model for agent '${agent.id}' in the current model catalog projection`,
+  )
+}
+
+/**
+ * 合成路径的 codex → 非 codex 降级(真值表 'synthetic' 分支)。
+ *
+ * 与 `resolveSyntheticTurnModel` 同一套兜底选择(env 覆盖 → deepseek-v4-pro → config 默认 →
+ * 平台兜底),差别只在**每一级都必须过投影**(可路由 + 非 codex)——"换一个必 401 的模型"
+ * 比闸的显式错误更糟(MAJOR-1 的同构结论):全部兜底都不可路由 → MODEL_NOT_AVAILABLE。
+ */
+function downgradeSyntheticCodex(
+  view: LocalCatalogView,
+  from: string,
+  defaultModel: string | null | undefined,
+  env: NodeJS.ProcessEnv,
+): LocalExecutionDecision {
+  const override = env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
+  const fallbacks = [
+    override,
+    SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT,
+    defaultModel,
+    EXECUTION_MODEL_FALLBACK,
+  ]
+  for (const raw of fallbacks) {
+    if (typeof raw !== 'string' || raw === '') continue
+    const canonicalModel = view.canonicalize(raw)
+    if (!view.isRoutable(canonicalModel)) continue
+    const engine = view.resolve(canonicalModel)?.engine
+    if (engine !== 'ccb') continue // 兜底自身是 codex → 忽略(防"把 bug 换个门再引入")
+    return { canonicalModel, engine, downgradedFrom: from }
+  }
+  throw new LocalExecutionRejected(
+    'MODEL_NOT_AVAILABLE',
+    `synthetic turn intended codex ('${from}') but no routable non-codex fallback exists`,
+  )
+}
+
+/**
+ * 本地路径判定入口(**所有无 envelope 的 runner 创建入口在创建前调它**)。
+ *
+ *   - flag 未开 → `undefined`(调用方走现状 baked 判定,行为零变化);
+ *   - flag 开 → 取 catalog 投影(TTL 30s + 单飞 + LKG,见 modelCatalogClient)并判定;
+ *       · 投影拉不到 → 抛 `ModelCatalogUnavailableError`(**拒新 turn**,无 baked 回落);
+ *       · 真值表拒 → 抛 `LocalExecutionRejected`(结构化 code)。
+ *
+ * 调用方拿到 decision 后:把 `canonicalModel` **同时**喂给 `getOrCreate({model, executionAuthority})`
+ * 和 `submit(model)` —— 两处同源,避免 spawn 用 A、路由字段用 B。
+ */
+export async function resolveLocalExecutionIfEnforced(args: {
+  agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
+  kind: LocalTurnKind
+  model?: string
+  defaultModel?: string | null
+  env?: NodeJS.ProcessEnv
+}): Promise<LocalExecutionDecision | undefined> {
+  const env = args.env ?? process.env
+  if (!isModelAuthorityRequired(env)) return undefined
+  const view = await getLocalCatalogView()
+  return decideLocalExecution({ ...args, view, env })
+}
+
+/** decision → getOrCreate 的执行覆盖入参(flag 未开 → `{}`,展开后零影响)。 */
+export function localExecutionOverride(decision: LocalExecutionDecision | undefined): {
+  model?: string
+  executionAuthority?: {
+    canonicalModel: string
+    engine: 'ccb' | 'codex'
+    source: 'local_catalog'
+  }
+} {
+  if (!decision) return {}
+  return {
+    model: decision.canonicalModel,
+    executionAuthority: {
+      canonicalModel: decision.canonicalModel,
+      engine: decision.engine,
+      source: 'local_catalog',
+    },
+  }
 }
 
 /**
@@ -975,7 +1162,7 @@ interface RunDelegateInput {
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
 type DelegateTaskResult =
-  | { kind: 'rejected'; httpStatus: number; message: string }
+  | { kind: 'rejected'; httpStatus: number; message: string; code?: LocalExecutionRejectCode }
   | { kind: 'error'; message: string }
   | {
       kind: 'completed'
@@ -1913,11 +2100,21 @@ export class Gateway {
         // 合成首帧路由字段补齐(同 cron):webhook 触发的会话首帧绕过 master bridge
         // 计费编排,落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
         const _whRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
-        const _whModel = _whRoute?.model
+        // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影
+        // (归一 / 可用性 / engine 全取投影;拉不到 → 抛 → 本次 webhook 执行失败并记日志,
+        // 不回落 baked)。flag 未开 → undefined,沿用上面的 baked 合成降级,零变化。
+        const _whExec = await resolveLocalExecutionIfEnforced({
+          agent,
+          kind: 'synthetic',
+          model: _whRoute?.model,
+          defaultModel: this.deps.config.defaults.model,
+        })
+        const _whModel = _whExec?.canonicalModel ?? _whRoute?.model
         const session = await this.sessions.getOrCreate({
           sessionKey,
           agent,
           ...(_whModel ? { model: _whModel } : {}),
+          ...localExecutionOverride(_whExec),
           channel: 'webhook',
           peerId: webhookId,
           title: `[webhook] ${webhookId}`,
@@ -4532,6 +4729,34 @@ export class Gateway {
   private sendError(res: ServerResponse, code: number, message: string): void {
     this.sendJson(res, code, { error: message })
   }
+
+  /**
+   * 本地路径判定拒绝 → HTTP/结构化映射(模型权威 §3;**单一收口**,禁散落第二套映射)。
+   *
+   * 非本体系错误 → `undefined`(调用方原样上抛,不吞)。
+   */
+  private _mapLocalExecutionError(
+    err: unknown,
+  ): { code: LocalExecutionRejectCode; httpStatus: number; message: string } | undefined {
+    const code = localExecutionRejectCode(err)
+    if (!code) return undefined
+    const detail = (err as Error)?.message ?? String(err)
+    this.log.warn('local_execution_rejected', { code, detail })
+    switch (code) {
+      case 'DELEGATE_CODEX_UNSUPPORTED':
+        // 409:显式 codex 意图 + 本地路径 = 语义冲突(不是"稍后重试"能解决的)。
+        return {
+          code,
+          httpStatus: 409,
+          message: `DELEGATE_CODEX_UNSUPPORTED: ${detail}`,
+        }
+      case 'MODEL_NOT_AVAILABLE':
+        return { code, httpStatus: 403, message: `MODEL_NOT_AVAILABLE: ${detail}` }
+      case 'MODEL_CATALOG_UNAVAILABLE':
+        // 503:master 不可达/投影拉不到 —— 拒新 turn(无 baked 回落),可重试。
+        return { code, httpStatus: 503, message: `MODEL_CATALOG_UNAVAILABLE: ${detail}` }
+    }
+  }
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处
    *  `sendError(res, 500, String(err))` 会把容器内部路径/栈回显给客户端。 */
   private sendInternalError(res: ServerResponse, err: unknown): void {
@@ -6265,9 +6490,21 @@ export class Gateway {
   ): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
     const agent = await this._trainingAgent()
     if (!agent) throw new Error('no agent available for eval')
+    // 模型权威 §3:skill-eval 是**真实计费的本地 turn**(无 envelope)→ kind='turn'
+    // (codex 意图不降级、直接结构化拒:换个模型跑分等于换了被测对象)。
+    const evalExec = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const evalModel = evalExec?.canonicalModel ?? model
     const session = await this.sessions.getOrCreate({
+      // flag 未开 → localExecutionOverride 展开为 {},**不带 model** —— 与改造前逐字
+      // 一致(spawn 用 agent.model,submit 再按 run.model 覆盖)。零行为变化。
       sessionKey,
       agent,
+      ...localExecutionOverride(evalExec),
       channel: 'skill-eval',
       peerId: sessionKey,
       userId,
@@ -6300,7 +6537,8 @@ export class Gateway {
               }
             },
             'high',
-            model,
+            // getOrCreate 与 submit 的模型**同源**(flag 未开时 evalModel === model)。
+            evalModel,
           )
           .catch(rejectPromise)
       })
@@ -6712,10 +6950,28 @@ export class Gateway {
     // 差评存在但摘录全部拉不到(会话已清理)→ 无注入 → 0(不误报"将优先分析")。
     const feedbackRefs = feedbackScenarios.length > 0 ? feedbackTotal : 0
 
+    // 模型权威 §3:skill-train 是**真实计费的本地 turn**(无 envelope)→ kind='turn'。
+    // 投影不可用 / 模型不可用 / codex 意图 → 结构化拒(HTTP 4xx/503),不 spawn runner。
+    let trainExec: LocalExecutionDecision | undefined
+    try {
+      trainExec = await resolveLocalExecutionIfEnforced({
+        agent,
+        kind: 'turn',
+        model: SKILL_TRAIN_DEFAULT_MODEL,
+        defaultModel: this.deps.config.defaults.model,
+      })
+    } catch (err) {
+      const mapped = this._mapLocalExecutionError(err)
+      if (!mapped) throw err
+      await this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), mapped.message)
+      return this.sendError(res, mapped.httpStatus, mapped.message)
+    }
+    const trainModel = trainExec?.canonicalModel ?? SKILL_TRAIN_DEFAULT_MODEL
     // Background session bound to this run (skillTrainRunId exposes skill_propose).
     const session = await this.sessions.getOrCreate({
       sessionKey: `skilltrain:${runId}`,
       agent,
+      ...localExecutionOverride(trainExec),
       channel: 'skill-train',
       peerId: runId,
       userId,
@@ -6729,7 +6985,7 @@ export class Gateway {
         buildSkillTrainPrompt(opts, new Date(), feedbackSection),
         (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
-        SKILL_TRAIN_DEFAULT_MODEL,
+        trainModel,
         runId,
       )
       .catch((err) => {
@@ -6854,9 +7110,25 @@ export class Gateway {
       'what the comment asks for.',
     ].join('\n')
 
+    // 模型权威 §3:同 skill-train 起训(本地 turn)。
+    let reviseExec: LocalExecutionDecision | undefined
+    try {
+      reviseExec = await resolveLocalExecutionIfEnforced({
+        agent,
+        kind: 'turn',
+        model: SKILL_TRAIN_DEFAULT_MODEL,
+        defaultModel: this.deps.config.defaults.model,
+      })
+    } catch (err) {
+      const mapped = this._mapLocalExecutionError(err)
+      if (!mapped) throw err
+      return this.sendError(res, mapped.httpStatus, mapped.message)
+    }
+    const reviseModel = reviseExec?.canonicalModel ?? SKILL_TRAIN_DEFAULT_MODEL
     const session = await this.sessions.getOrCreate({
       sessionKey: `skilltrain:${runId}`,
       agent,
+      ...localExecutionOverride(reviseExec),
       channel: 'skill-train',
       peerId: runId,
       userId: run.userId,
@@ -6870,7 +7142,7 @@ export class Gateway {
         revisePrompt,
         (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
-        SKILL_TRAIN_DEFAULT_MODEL,
+        reviseModel,
         runId,
       )
       .catch((err) => {
@@ -6968,11 +7240,26 @@ export class Gateway {
     // 合成首帧路由字段补齐(同 cron):agent 间消息的会话首帧绕过 master bridge
     // 计费编排,落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
     const _iaRoute = resolveSyntheticTurnModel(targetAgent, this.deps.config.defaults.model)
-    const _iaModel = _iaRoute?.model
+    // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影。
+    let _iaExec: LocalExecutionDecision | undefined
+    try {
+      _iaExec = await resolveLocalExecutionIfEnforced({
+        agent: targetAgent,
+        kind: 'synthetic',
+        model: _iaRoute?.model,
+        defaultModel: this.deps.config.defaults.model,
+      })
+    } catch (err) {
+      const mapped = this._mapLocalExecutionError(err)
+      if (!mapped) throw err
+      return this.sendError(res, mapped.httpStatus, mapped.message)
+    }
+    const _iaModel = _iaExec?.canonicalModel ?? _iaRoute?.model
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: targetAgent,
       ...(_iaModel ? { model: _iaModel } : {}),
+      ...localExecutionOverride(_iaExec),
       channel: 'inter-agent',
       peerId: sourceAgent || 'system',
       title: `[from ${sourceAgent}] ${message.slice(0, 30)}`,
@@ -7359,7 +7646,14 @@ export class Gateway {
       depth,
       effort,
     })
-    if (result.kind === 'rejected') return this.sendError(res, result.httpStatus, result.message)
+    if (result.kind === 'rejected') {
+      // 结构化码(DELEGATE_CODEX_UNSUPPORTED / MODEL_NOT_AVAILABLE / MODEL_CATALOG_UNAVAILABLE)
+      // 随信封下发 —— 调用方(delegate_task MCP 工具 / 硬编排)据此稳定分支,不靠 message 文本匹配。
+      if (result.code) {
+        return this.sendJson(res, result.httpStatus, { error: result.message, code: result.code })
+      }
+      return this.sendError(res, result.httpStatus, result.message)
+    }
     if (result.kind === 'error') return this.sendError(res, 500, result.message)
     return this.sendJson(res, 200, {
       ok: result.ok,
@@ -7486,6 +7780,30 @@ export class Gateway {
     )
     const delegatedAgent =
       resolvedToolsets === undefined ? targetAgent : { ...targetAgent, toolsets: resolvedToolsets }
+
+    // ── 模型权威 §3:delegate 是**无 envelope 的本地 turn** ────────────────────
+    // 判定源 = master catalog 投影(归一 / 可用性 / engine 全取投影,不查 baked 表)。
+    // 位置有意放在**资源闸之前**:codex delegate 是语义硬冲突(不是"稍后重试"能解决的),
+    // 让它先去排队等内存名额、等到了再拒,是纯粹的浪费 + 误导性等待。
+    // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
+    // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
+    let delegateExec: LocalExecutionDecision | undefined
+    try {
+      delegateExec = await resolveLocalExecutionIfEnforced({
+        agent: delegatedAgent,
+        kind: 'turn',
+        defaultModel: this.deps.config.defaults.model,
+      })
+    } catch (err) {
+      const mapped = this._mapLocalExecutionError(err)
+      if (!mapped) throw err
+      return {
+        kind: 'rejected',
+        httpStatus: mapped.httpStatus,
+        message: mapped.message,
+        code: mapped.code,
+      }
+    }
 
     const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
     this.log.info('delegate', {
@@ -7655,6 +7973,8 @@ export class Gateway {
       session = await this.sessions.getOrCreate({
         sessionKey,
         agent: delegatedAgent,
+        // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
+        ...localExecutionOverride(delegateExec),
         channel: 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
@@ -8243,11 +8563,20 @@ export class Gateway {
     // 合成首帧路由字段补齐(同 cron):定时任务的会话首帧绕过 master bridge 计费编排,
     // 落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
     const _taskRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
-    const _taskModel = _taskRoute?.model
+    // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影。
+    // 投影不可用 → 抛 → 由 _triggerTask 的调用方 .catch 记录(任务本次不执行,不回落 baked)。
+    const _taskExec = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'synthetic',
+      model: _taskRoute?.model,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const _taskModel = _taskExec?.canonicalModel ?? _taskRoute?.model
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
       ...(_taskModel ? { model: _taskModel } : {}),
+      ...localExecutionOverride(_taskExec),
       channel: 'task',
       peerId: taskId,
       title: `[task] ${task.title}`,
@@ -9680,12 +10009,31 @@ export class Gateway {
       this.log.info('auto-resume pre-warming', { sessionKey })
       const cfg = await this._getAgentsConfig()
       const agent = cfg.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
-      await this.sessions.getOrCreate({
-        sessionKey,
-        agent,
-        channel: 'webchat',
-        peerId,
-      })
+      // 模型权威 §3:预热也不许查 baked 表(engine/model 取投影)。但预热**不是 turn**——
+      // 不执行、不计费 → 不套 codex 真值表(见 decideLocalExecution 的 'prewarm' 语义)。
+      // 投影拉不到 → **跳过本次预热**(best-effort:预热失败不该炸 boot 循环;真正的 turn
+      // 到来时会重新判定)。绝不回落 baked spawn。
+      try {
+        const preExec = await resolveLocalExecutionIfEnforced({
+          agent,
+          kind: 'prewarm',
+          defaultModel: this.deps.config.defaults.model,
+        })
+        await this.sessions.getOrCreate({
+          sessionKey,
+          agent,
+          ...localExecutionOverride(preExec),
+          channel: 'webchat',
+          peerId,
+        })
+      } catch (err) {
+        this.log.warn(
+          'auto-resume pre-warm skipped',
+          { sessionKey, code: localExecutionRejectCode(err) ?? 'unknown' },
+          err as Error,
+        )
+        continue
+      }
       this.lastActiveChannel.set(agentId, {
         channel: 'webchat',
         peerId,
@@ -9738,9 +10086,18 @@ export class Gateway {
           try {
             const cfg = await this._getAgentsConfig()
             const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as any)
+            // 模型权威 §3:预热的 engine/model 取 catalog 投影(不查 baked);预热非 turn
+            // → 不套 codex 真值表。投影拉不到 → 抛 → 下方既有 catch:跳过预热(不回落 baked),
+            // 真正的 turn 到来时带 envelope 走 §2 判定。
+            const preExec = await resolveLocalExecutionIfEnforced({
+              agent,
+              kind: 'prewarm',
+              defaultModel: this.deps.config.defaults.model,
+            })
             session = await this.sessions.getOrCreate({
               sessionKey,
               agent,
+              ...localExecutionOverride(preExec),
               channel: 'webchat',
               peerId,
               // Pre-warm path still knows the authenticated userId from the
@@ -10307,6 +10664,45 @@ export class Gateway {
     const effectiveAgent =
       effectiveToolsets === undefined ? agent : { ...agent, toolsets: effectiveToolsets }
 
+    // ── 无 envelope 的 inbound(方案 §3)────────────────────────────────────────
+    // dispatchInbound 是**所有** inbound 的汇流点,其中一部分不经 bridge 签发 authority:
+    // v3 WeChat broker 直投(/internal/v3/wechat-inbound)、个人版本地 WS。这些 turn 在
+    // flag 开启后同样不许查 baked 表 —— 判定源换成 master catalog 投影(kind='turn':
+    // codex 意图**结构化拒**而不是静默换模型;现状是同样跑不了 —— 晚期被 CODEX_BILLING_GUARD
+    // 拒,本批把它提前到创建 runner 之前)。bridge turn(turnAuthority 在场)不进本分支。
+    let localExec: LocalExecutionDecision | undefined
+    if (turnAuthority === undefined) {
+      try {
+        localExec = await resolveLocalExecutionIfEnforced({
+          agent: effectiveAgent,
+          kind: 'turn',
+          model: safeModel,
+          defaultModel: this.deps.config.defaults.model,
+        })
+      } catch (err) {
+        const mapped = this._mapLocalExecutionError(err)
+        if (!mapped) throw err
+        // 用户可见:回 error 帧收尾本 turn(与 inferAgentForModel 拒帧同形),不 spawn runner。
+        this.deliver(
+          {
+            type: 'outbound.message' as const,
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            blocks: [{ kind: 'text' as const, text: `[error] ${mapped.code}` }],
+            isFinal: true,
+            traceId: turnTraceId,
+            _userId: activeUserId,
+          } as OutboundMessage,
+          adapter,
+        )
+        return
+      }
+    }
+    // 本 turn 的执行模型:catalog 判定在场则以它为准(alias 已归一),否则沿用入站 safeModel。
+    // getOrCreate(spawn)与 submit(路由字段)**同源** —— 不允许 spawn 用 A、路由用 B。
+    const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -10327,6 +10723,9 @@ export class Gateway {
       // 触发 engine teardown + compact transcript preamble;同 engine 内的模型
       // 切换仍由 submit() 的 setModel + shutdown 处理。
       model: safeModel,
+      // 无 envelope 的本地 inbound:catalog 投影就是本 turn 的权威(canonicalModel + engine)。
+      // flag 未开 → localExec 恒 undefined → 展开为 {},行为零变化。
+      ...localExecutionOverride(localExec),
       // 方案 §2:有签名 descriptor 的 turn,engine + canonicalModel 直接落地,
       // sessionManager 内的两张 baked 表(白名单 / MODEL_ENGINE_MAP)不参与判定。
       ...(turnAuthority !== undefined
@@ -10334,6 +10733,7 @@ export class Gateway {
             executionAuthority: {
               canonicalModel: turnAuthority.canonicalModel,
               engine: turnAuthority.engine,
+              source: 'bridge_signed' as const,
             },
           }
         : {}),
@@ -11471,7 +11871,8 @@ export class Gateway {
         payload,
         onLeaderEvent,
         safeEffortLevel,
-        safeModel,
+        // 与 getOrCreate 同源(见 turnExecutionModel):flag 未开时恒等于 safeModel。
+        turnExecutionModel,
         safeRequestId,
         turnTraceId,
         safeConversationMode,

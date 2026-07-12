@@ -21,14 +21,15 @@ import type { AuthorityKeyring } from "@openclaude/protocol";
 
 import { ModelCatalogCache } from "./modelCatalog.js";
 import { checkSnapshotCapabilities } from "../http/proxy/upstream.js";
-import { AuthoritySigner } from "../ws/authoritySigner.js";
+import { AuthorityKeyringReader } from "../ws/authoritySigner.js";
 import { rootLogger } from "../logging/logger.js";
 
 const log = rootLogger.child({ subsys: "modelCatalogRuntime" });
 
 let cache: ModelCatalogCache | null = null;
 let starting: Promise<ModelCatalogCache> | null = null;
-let signer: AuthoritySigner | null = null;
+/** 验签侧的**只读** keyring(私钥不在本进程;文件变更热重载)。 */
+let keyringReader: AuthorityKeyringReader | null = null;
 
 /** `OC_MODEL_AUTHORITY=1` —— 判定权在 catalog(强制模式)。未开 = 影子期。 */
 export function isModelAuthorityEnforced(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -87,17 +88,25 @@ export function peekModelCatalogCache(): ModelCatalogCache | null {
 }
 
 /**
- * authority **公钥** keyring 的取数函数(验签侧用;私钥只在签发侧)。
+ * authority **公钥** keyring 的取数函数(验签侧用;**私钥只在 master 的 AuthoritySigner**)。
  *
- * 每次调用现取 —— 轮换五步(R3-M7)期间 ring 会变(加新公钥 / 删旧公钥),闭包快照会让
- * egress 在轮换窗口里认不出新签名。AuthoritySigner 内部持文件态,取 keyring 是内存操作。
+ * 整改前(代码审 R1 MAJOR-3):这里拿的是 `AuthoritySigner.loadOrCreate()` ——
+ *   ① 它会在文件缺失时**创建** keyring:egress(一个纯验签进程)因此具备铸私钥的能力,
+ *      与 master 并发首启就是双钥竞态(rename 互相覆盖 → master 签 B、egress 只认 A);
+ *   ② "每请求现取"取的是常驻对象的**内存**,文件被轮换换掉了也不重读 —— 轮换窗口里
+ *      egress 恒用旧 ring,新 keyId 的签名一律 UnknownKey。
+ *
+ * 现在换成 `AuthorityKeyringReader`:
+ *   - **只读**、不创建(文件缺失 → 空 ring → 验签方 fail-closed 拒帧,不静默造钥);
+ *   - 每次取 ring 先 `stat`(ino+mtime+size),文件换了就重读 → **热重载**,轮换期间
+ *     egress 不必重启也认得新公钥。
  *
  * egress 与 master 同机、同 root、读同一份 keyring 文件(/var/lib/openclaude/.v5-model-authority-keys)。
  */
 export function authorityKeyringProvider(): () => AuthorityKeyring {
   return () => {
-    if (!signer) signer = AuthoritySigner.loadOrCreate();
-    return signer.publicKeyring();
+    if (!keyringReader) keyringReader = AuthorityKeyringReader.open();
+    return keyringReader.keyring();
   };
 }
 
@@ -105,5 +114,5 @@ export function authorityKeyringProvider(): () => AuthorityKeyring {
 export function _resetModelCatalogRuntimeForTests(): void {
   cache = null;
   starting = null;
-  signer = null;
+  keyringReader = null;
 }

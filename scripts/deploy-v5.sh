@@ -39,6 +39,14 @@
 #   --emergency-tuple [--image=REF --image-id=ID --bundle=DIR]
 #       # 登记逃生 tuple。缺省取当前 env 四键;显式候选(R2-M1)供瘦身稳态直接登记内嵌镜像逃生点,
 #       # 不必先把现网翻到空 release。硬验含 immutable ID 钉死(inspect .Id == image_id)。
+#
+# 模型权威(docs/V5_MODEL_AUTHORITY_PLAN.md §7 六步上线;四面 = DB/master/egress/容器 runtime):
+#   --model-authority-preflight   # 只读:四面活体 capability 逐面结论(不抢部署锁)
+#   --enable-model-authority      # 步骤 4:四面全绿 → OC_MODEL_AUTHORITY=1 → 重启 master+egress → smoke
+#   --disable-model-authority     # 步骤 4 回滚:关 flag(**cutover 后拒绝执行**)
+#   --model-authority-cutover     # 步骤 5:置位不可逆兼容地板 marker(DB 单行 + env 键)
+#                                 # 置位后:deploy/rollback 拒绝激活缺 capability 的 release/tuple;
+#                                 #        master/egress 在 flag 关闭态拒启;admin catalog 状态机开放。
 set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
@@ -153,6 +161,11 @@ for arg in "$@"; do
     --activate-staged) MODE="activate-staged" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
+    # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
+    --model-authority-preflight) MODE="model-authority-preflight" ;;
+    --enable-model-authority) MODE="enable-model-authority" ;;
+    --disable-model-authority) MODE="disable-model-authority" ;;
+    --model-authority-cutover) MODE="model-authority-cutover" ;;
     --cutover-nonce=*) CUTOVER_NONCE="${arg#*=}" ;;
     --target-image=*) CUTOVER_TARGET_IMAGE="${arg#*=}" ;;
     # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
@@ -748,6 +761,260 @@ assert_release_capability_for_sessions_pg() {
   echo "  ✓ capability 门:目标 release 声明 sessions-store-pg-v1(已割接前置满足)。"
 }
 
+# ═════════════════ 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)═════════════
+#
+# 四面 = {DB schema, master, egress, 容器 runtime}。判定单点化后 master 签发签名 execution
+# descriptor、容器验签消费、egress 每请求 epoch fence —— 任一面回到 legacy/baked 判定 =
+# 判定源分叉(签发的人与执行的人不同源),轻则模型不可用,重则按已撤销的价格/能力执行。
+#
+# 两个不同强度的门:
+#   ① **preflight**(开 flag / 走 cutover 前):四面**活体**全绿才允许 —— 活体证据来自
+#      /healthz.runtime.capabilities(master)、egress-health.capabilities(egress)、
+#      schema_migrations(DB)、env tuple 指向的 release MANIFEST / 镜像 label(容器)。
+#   ② **地板**(cutover marker 置位后,不可逆):**每一次**激活/回滚都要求目标制品声明
+#      capability —— master release 看 deploy/v5/release-metadata.json;容器 tuple 由
+#      v5-runtime-release-lib.sh 的 assert_tuple_viable ③ 覆盖(release MANIFEST / 镜像 label)。
+#      egress 与 master 同源同树(同一 release symlink),故 master release 的声明同时覆盖
+#      egress 制品面;egress **进程**是否真的带上了新代码,由 smoke 的活体断言兜底。
+#
+# marker 双源(env 键 + DB 单行):env 让 DB 不可达时也能判定地板已生效,DB 让主机重建/DR 后
+# marker 不丢(它和它保护的 model_catalog 同库同命运)。任一为真即地板生效(OR)。
+MODEL_AUTHORITY_CAP="model_authority_v1"
+MODEL_AUTHORITY_EGRESS_CAP="model_authority_v1-egress"
+MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
+MODEL_AUTHORITY_FLAG_KEY="OC_MODEL_AUTHORITY"
+MODEL_AUTHORITY_MIGRATION="0135_model_catalog"
+MODEL_AUTHORITY_SETTING_KEY="model_authority.cutover"
+
+# 远端 env 取键值(末行为准,与 hotcfg env_get 同法)。缺失 → 空。
+remote_env_get() {
+  ssh "$KL_HOST" "grep -E '^[[:space:]]*$1=' '$V5_ENV' 2>/dev/null | tail -n1 | cut -d= -f2-" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# 远端 env 原子写单键(备份 + tmp + mv;值只允许 [0-9A-Za-z_.-])。
+remote_env_set() {
+  local key="$1" val="$2"
+  [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { echo "✗ remote_env_set: 非法键 '$key'" >&2; return 1; }
+  [[ "$val" =~ ^[0-9A-Za-z_.-]*$ ]] || { echo "✗ remote_env_set: 非法值 '$val'" >&2; return 1; }
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    ts=\$(date -u +%Y%m%d%H%M%S)
+    cp -a '$V5_ENV' '$V5_ENV.bak-\$ts'
+    tmp='$V5_ENV.keyset.\$\$'
+    cp -a '$V5_ENV' \"\$tmp\"
+    if grep -Eq '^[[:space:]]*$key=' \"\$tmp\"; then
+      sed -i 's|^[[:space:]]*$key=.*|$key=$val|' \"\$tmp\"
+    else
+      printf '%s=%s\n' '$key' '$val' >> \"\$tmp\"
+    fi
+    chmod --reference='$V5_ENV' \"\$tmp\" 2>/dev/null || true
+    mv -f \"\$tmp\" '$V5_ENV'" || { echo "✗ 写 env 键 $key 失败" >&2; return 1; }
+  echo "  ✓ env $key=$val(已备份 $V5_ENV.bak-<ts>)"
+}
+
+# 远端 psql 单值查询(fail-closed:ssh/psql 失败 → 非 0)。
+remote_psql() {
+  ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null; psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"$1\"" 2>/dev/null | tr -d '[:space:]'
+}
+
+# release 制品声明的 capabilities(空格分隔)。文件缺失/无法解析 → 非 0(fail-closed)。
+release_declared_caps() {
+  local reldir="$1"
+  ssh "$KL_HOST" "jq -er '(.capabilities // []) | join(\" \")' '$reldir/deploy/v5/release-metadata.json'" 2>/dev/null
+}
+
+caps_contain() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+
+# cutover marker 是否置位(env OR DB)。**fail-closed**:env≠1 且 DB 探测失败 → 视为置位并拒
+# (不确定即拒;与 sessions-pg capability 门同口径)。返回 0=已置位 / 1=未置位。
+model_authority_cutover_done() {
+  local env_marker db_marker
+  env_marker="$(remote_env_get "$MODEL_AUTHORITY_CUTOVER_KEY")"
+  [[ "$env_marker" == "1" ]] && return 0
+  if ! db_marker="$(remote_psql "SELECT EXISTS (SELECT 1 FROM system_settings WHERE key='$MODEL_AUTHORITY_SETTING_KEY')::text")"; then
+    echo "✗ 无法探测 cutover marker(psql 失败;env $MODEL_AUTHORITY_CUTOVER_KEY≠1)" >&2
+    echo "  fail-closed:无法证明步骤 5 尚未执行 → 按已置位处理(拒绝激活缺 capability 的版本)。" >&2
+    echo "  请先恢复 DB 连通性,或直接在 $V5_ENV 写 $MODEL_AUTHORITY_CUTOVER_KEY=0/1 明示状态。" >&2
+    return 0
+  fi
+  [[ "$db_marker" == "true" ]]
+}
+
+# 地板:cutover 后任何 master release 激活/回滚都必须声明 master + egress 两个 capability,
+# 且 0135 已 apply。容器面在 lib 的 assert_tuple_viable ③(release MANIFEST / 镜像 label)。
+assert_model_authority_floor() {
+  local reldir="$1" caps applied
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过模型权威兼容地板"; return 0; }
+  if ! model_authority_cutover_done; then
+    echo "  · 模型权威地板:cutover marker 未置位(步骤 5 之前)→ 不设限。"
+    return 0
+  fi
+  echo "  · 模型权威地板生效(步骤 5 已 cutover):校验目标 release 与 DB schema。"
+  # ① DB schema 面
+  applied="$(remote_psql "SELECT count(*) FROM schema_migrations WHERE version='$MODEL_AUTHORITY_MIGRATION'")" \
+    || { echo "✗ 激活中止:无法查询 schema_migrations(DB 不可达)—— 不确定即拒。" >&2; exit 1; }
+  [[ "$applied" == "1" ]] || {
+    echo "✗ 激活中止:cutover 已置位但迁移 $MODEL_AUTHORITY_MIGRATION 未 apply —— catalog 权威表不存在,master 起不来。" >&2
+    exit 1
+  }
+  # ②③ master / egress 制品面(同一 release 树,一个文件两个 token)
+  caps="$(release_declared_caps "$reldir")" || {
+    echo "✗ 激活中止:目标 release 无法读取 deploy/v5/release-metadata.json:$reldir" >&2
+    echo "  cutover 后必须能自证 capability;不确定即拒。" >&2
+    exit 1
+  }
+  caps_contain "$caps" "$MODEL_AUTHORITY_CAP" || {
+    echo "✗ 激活中止:目标 release 未声明 '$MODEL_AUTHORITY_CAP'(caps=[$caps]):$reldir" >&2
+    echo "  步骤 5 后 catalog 里已有 baked 判定不认识的行,回退到 legacy master = 判定源分叉。" >&2
+    echo "  回滚只能翻到同样声明该 capability 的前序 release。" >&2
+    exit 1
+  }
+  caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" || {
+    echo "✗ 激活中止:目标 release 未声明 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[$caps]):$reldir" >&2
+    echo "  egress 与 master 同树同源:该 release 的 egress 进程没有每请求 epoch fence," >&2
+    echo "  下线/收窄一个模型后出站面仍会放行(安全变更有 stale window)。" >&2
+    exit 1
+  }
+  echo "  ✓ 模型权威地板:release 声明 [$caps],0135 已 apply。"
+}
+
+# ── 活体四面探测(preflight:开 flag / cutover 前)──────────────────────────────
+# 打印每一面的结论;全绿 → 0,任一红 → 1。**只读**,不改现场。
+model_authority_preflight() {
+  local ok=1 hz caps rt_release rt_image_id eg
+  echo "── 模型权威四面 preflight(活体)──"
+  # ① DB schema
+  local applied
+  if applied="$(remote_psql "SELECT count(*) FROM schema_migrations WHERE version='$MODEL_AUTHORITY_MIGRATION'")" && [[ "$applied" == "1" ]]; then
+    echo "  ✓ ① DB:迁移 $MODEL_AUTHORITY_MIGRATION 已 apply"
+  else
+    echo "  ✗ ① DB:迁移 $MODEL_AUTHORITY_MIGRATION 未 apply(psql 结果='${applied:-<err>}')" >&2; ok=0
+  fi
+  # ② master 活体 capability(/healthz.runtime.capabilities —— commercial 广播,gateway 透传)
+  hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
+  caps="$(printf '%s' "$hz" | jq -r '(.runtime.capabilities // []) | join(" ")' 2>/dev/null || true)"
+  if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+    echo "  ✓ ② master:/healthz runtime.capabilities=[$caps]"
+  else
+    echo "  ✗ ② master:/healthz 未广播 '$MODEL_AUTHORITY_CAP'(caps=[${caps:-<none>}])—— 现网 master 版本不认模型权威协议" >&2; ok=0
+  fi
+  # ③ egress 活体 capability(独立进程:deploy 默认不重启它 → 必须单独证明)
+  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+  caps="$(printf '%s' "$eg" | jq -r '(.capabilities // []) | join(" ")' 2>/dev/null || true)"
+  if caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP"; then
+    echo "  ✓ ③ egress:capabilities=[$caps]"
+  else
+    echo "  ✗ ③ egress:未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${caps:-<none>}])—— 旧 egress 进程无 epoch fence" >&2
+    echo "      修法:scripts/deploy-v5.sh --egress(把 egress 重启到当前 release)" >&2; ok=0
+  fi
+  # ④ 容器 runtime:env tuple 指向的 release MANIFEST(release 轴启用)或镜像 features label
+  rt_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+  rt_image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  if [[ -n "$rt_release" ]]; then
+    caps="$(ssh "$KL_HOST" "jq -r '(.capabilities // []) | join(\" \")' '$rt_release/MANIFEST.json'" 2>/dev/null || true)"
+    if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+      echo "  ✓ ④ runtime release:$rt_release capabilities=[$caps]"
+    else
+      echo "  ✗ ④ runtime release:$rt_release 未声明 '$MODEL_AUTHORITY_CAP'(caps=[${caps:-<none>}])" >&2
+      echo "      修法:scripts/deploy-v5.sh(带 runtime release 轴)重建 release 并激活" >&2; ok=0
+    fi
+  else
+    [[ -n "$rt_image_id" ]] || rt_image_id="$(remote_env_get OC_RUNTIME_IMAGE)"
+    caps="$(ssh "$KL_HOST" "docker image inspect --format '{{index .Config.Labels \"oc.runtime.features\"}}' '$rt_image_id'" 2>/dev/null || true)"
+    if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+      echo "  ✓ ④ runtime 镜像(内嵌源码):$rt_image_id features=[$caps]"
+    else
+      echo "  ✗ ④ runtime 镜像:$rt_image_id 的 oc.runtime.features=[${caps:-<none>}] 不含 '$MODEL_AUTHORITY_CAP'" >&2
+      echo "      修法:用带该能力的 commit 重建镜像(build-image.sh 写 label)后写入 env" >&2; ok=0
+    fi
+  fi
+  [[ "$ok" == 1 ]]
+}
+
+# bootstrap 专用:DB marker(跨主机权威)存在 → 把 flag + marker 回写到**新派生**的 env。
+# 不确定即拒(DB 探不到 → 拒绝 bootstrap:宁可不起,也不让一个判定源不明的 master 上线)。
+restore_model_authority_env_after_bootstrap() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 查 DB cutover marker → 必要时回写 env(flag + marker)"; return 0; }
+  local db_marker
+  db_marker="$(remote_psql "SELECT EXISTS (SELECT 1 FROM system_settings WHERE key='$MODEL_AUTHORITY_SETTING_KEY')::text")" \
+    || { echo "✗ bootstrap 中止:无法探测 cutover marker(DB 不可达)—— 不确定即拒。" >&2; exit 1; }
+  if [[ "$db_marker" != "true" ]]; then
+    echo "  · DB 无 cutover marker(步骤 5 之前)→ env 不动。"
+    return 0
+  fi
+  echo "  · DB cutover marker 已置位 → 回写 env(否则重建实例会以 baked 判定静默起来)。"
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1 || exit 1
+  remote_env_set "$MODEL_AUTHORITY_CUTOVER_KEY" 1 || exit 1
+}
+
+# --enable-model-authority:四面全绿 → 写 OC_MODEL_AUTHORITY=1 → 重启 master + egress → smoke。
+# (方案 §7 步 4:判定源切换。egress 也读该 flag —— /v1/messages 在 egress 进程,必须一起重启。)
+enable_model_authority() {
+  echo "══ 开启模型权威 flag(方案 §7 步 4)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] preflight(四面活体)→ env $MODEL_AUTHORITY_FLAG_KEY=1 → restart master+egress → smoke"
+    return 0
+  fi
+  model_authority_preflight || { echo "✗ preflight 未全绿,拒绝开启 flag(见上方逐面结论)" >&2; exit 1; }
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1 || exit 1
+  echo "── restart master + egress(flag 两进程都读)──"
+  ssh "$KL_HOST" "systemctl restart '$V5_UNIT' && systemctl restart '$V5_EGRESS_UNIT'" \
+    || { echo "✗ 重启失败;flag 已写入 env —— 人工核查后重启或 --disable-model-authority 回退" >&2; exit 1; }
+  run "sleep 4"
+  smoke || { echo "✗ 开启后 smoke 失败 —— 立刻 --disable-model-authority 回退" >&2; exit 1; }
+  echo "✓ $MODEL_AUTHORITY_FLAG_KEY=1 已生效(判定源 = catalog)。观察一段时间后再走 --model-authority-cutover。"
+}
+
+# --disable-model-authority:关 flag(步骤 4 的回滚)。**cutover 后禁用**(地板不可逆)。
+disable_model_authority() {
+  echo "══ 关闭模型权威 flag(步骤 4 回滚)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 cutover marker 未置位 → env $MODEL_AUTHORITY_FLAG_KEY=0 → restart master+egress"
+    return 0
+  fi
+  if model_authority_cutover_done; then
+    echo "✗ 拒绝:cutover marker 已置位(步骤 5 已执行),兼容地板不可逆。" >&2
+    echo "  catalog 里可能已有 baked 判定不认识的行,关 flag = 容器按旧表执行 → 判定源分叉。" >&2
+    echo "  合法退路(方案 §7 步 5 回滚列):事务性把 catalog 恢复到 baked 等价值 + bump epoch +" >&2
+    echo "  等全部快照与运行容器收敛,再清 marker(env 键 + system_settings 行),才允许关 flag。" >&2
+    exit 1
+  fi
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || exit 1
+  ssh "$KL_HOST" "systemctl restart '$V5_UNIT' && systemctl restart '$V5_EGRESS_UNIT'" \
+    || { echo "✗ 重启失败,人工核查" >&2; exit 1; }
+  run "sleep 4"
+  smoke
+  echo "✓ flag 已关(容器无 envelope → 回落 baked 判定,集合同值)。"
+}
+
+# --model-authority-cutover:步骤 5 的持久化 marker。置位后地板不可逆(见 assert_model_authority_floor)。
+# 前置:flag 已开 + 四面活体全绿。写 DB 单行(权威)+ env 键(DB 不可达时的本地信号)。
+model_authority_cutover() {
+  echo "══ 步骤 5:置位模型权威 cutover marker(不可逆兼容地板)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言 flag=1 + preflight 四面 → 写 system_settings['$MODEL_AUTHORITY_SETTING_KEY'] → env $MODEL_AUTHORITY_CUTOVER_KEY=1 → 复核"
+    return 0
+  fi
+  local flag
+  flag="$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")"
+  [[ "$flag" == "1" ]] || {
+    echo "✗ 拒绝:$MODEL_AUTHORITY_FLAG_KEY≠1(当前='${flag:-<unset>}')—— 步骤 5 必须在步骤 4 之后。" >&2
+    exit 1
+  }
+  model_authority_preflight || { echo "✗ preflight 未全绿,拒绝 cutover" >&2; exit 1; }
+  echo "── 写 DB marker(system_settings)──"
+  remote_psql "INSERT INTO system_settings(key, value, description) VALUES ('$MODEL_AUTHORITY_SETTING_KEY', jsonb_build_object('at', NOW()::text, 'by', 'deploy-v5.sh'), 'model authority step-5 cutover: 四面兼容地板已生效,禁止回滚到 baked 判定(见 docs/V5_MODEL_AUTHORITY_PLAN.md §7)') ON CONFLICT (key) DO NOTHING; SELECT 'ok'" >/dev/null \
+    || { echo "✗ 写 DB marker 失败(未写 env,可安全重试)" >&2; exit 1; }
+  echo "── 写 env marker ──"
+  remote_env_set "$MODEL_AUTHORITY_CUTOVER_KEY" 1 || {
+    echo "✗ env marker 写失败(DB marker 已置位 → 地板已生效);重试本命令即可补齐 env" >&2; exit 1
+  }
+  model_authority_cutover_done || { echo "✗ 复核失败:marker 写完却读不到" >&2; exit 1; }
+  echo "✓ cutover marker 已置位(DB + env)。此后:"
+  echo "   · deploy/rollback 拒绝激活缺 capability 的 master release / runtime tuple;"
+  echo "   · master 与 egress 在 flag 关闭态下**拒启**(runtimeCapabilities.ts 地板断言);"
+  echo "   · admin catalog 状态机(/api/admin/model-catalog)即为开放状态。"
+}
+
 # 原子激活 release:只认带 .complete 的目录;翻转**前**先原子写 prev(rollback 元数据与翻转
 # 不脱域,Codex P1#7);唯一临时 symlink(防前次残留 .newlink 阻断);mv -T 原子翻转 → restart。
 activate_release() {
@@ -759,6 +1026,8 @@ activate_release() {
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
+  # 模型权威兼容地板(步骤 5 后):同上,激活/回滚同一处收口。
+  assert_model_authority_floor "$reldir"
   prev="$(bg_current_release)"
   tmplink="$REMOTE_SRC.newlink.$$"
   # 翻转前先落 prev(原子);再翻转(ln -sfn 非原子,故临时链+mv -T)
@@ -944,6 +1213,11 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
+  # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
+  # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
+  assert_release_capability_for_sessions_pg "$BUILT_RELEASE"
+  assert_model_authority_floor "$BUILT_RELEASE"
   local prev_src old_prev image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert
   prev_src="$(bg_current_release)"
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
@@ -1278,6 +1552,26 @@ smoke() {
     local eg; eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
     echo "  egress-health: $eg"
     echo "$eg" | grep -q '"role":"egress"' || { echo "✗ egress 进程不健康(18892 无响应或非 egress)" >&2; return 1; }
+    EGRESS_HEALTH_JSON="$eg"
+  fi
+  # 模型权威(flag 开启后):master 与 egress 两个**活体进程**都必须广播 capability。
+  # 制品面(release metadata / MANIFEST / 镜像 label)由激活期地板守卫;这里补的是"进程真的
+  # 换上了新代码"——egress 默认不随 deploy 重启,最容易出现"master 新 / egress 旧"的错配
+  # (R4-m6:master 新 + egress 旧必拒)。flag 未开 → 影子期,不断言(旧 egress 合法存活)。
+  local ma_flag
+  ma_flag="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_MODEL_AUTHORITY=' '$V5_ENV' | tail -n 1 | cut -d= -f2-" 2>/dev/null || true)"
+  if [[ "$ma_flag" == "1" ]]; then
+    local mcaps
+    mcaps="$(printf '%s' "$hz" | jq -r '(.runtime.capabilities // []) | join(" ")' 2>/dev/null || true)"
+    caps_contain "$mcaps" "$MODEL_AUTHORITY_CAP" \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 master /healthz 未广播 '$MODEL_AUTHORITY_CAP'(caps=[${mcaps:-<none>}])—— 旧 master 版本" >&2; return 1; }
+    [[ "$split" == "1" ]] \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 OC_EGRESS_SPLIT≠1 —— /v1/messages 的 epoch fence 面无法证明" >&2; return 1; }
+    local ecaps
+    ecaps="$(printf '%s' "${EGRESS_HEALTH_JSON:-}" | jq -r '(.capabilities // []) | join(" ")' 2>/dev/null || true)"
+    caps_contain "$ecaps" "$MODEL_AUTHORITY_EGRESS_CAP" \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
+    echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
@@ -1320,6 +1614,12 @@ bootstrap() {
   # 5.5) 部署顺序守卫:P1a channel-aware 代码需共享库已加 runtime_channel 列(0088)。
   echo "── 5.5) 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
+  # 5.6) 模型权威地板的 DR 守卫(方案 §7 步 5)。
+  # bootstrap 是**唯一**会重新派生 env 的路径(从 v3 env + overrides),而 cutover marker 的
+  # 进程侧信号就在 env 里 —— 不补回来,重建后的 master 会以 baked 判定**静默**起来(flag 丢了,
+  # 地板断言也看不到 marker),正是 R3-B4 要根治的那类分叉。DB marker 是跨主机权威,故以它为准。
+  echo "── 5.6) 模型权威:按 DB cutover marker 回填 env(flag + marker)──"
+  restore_model_authority_env_after_bootstrap
   # 6) 启动 + 环境隔离断言(egress 先起:master split 模式依赖 18892 已有人监听)
   echo "── 6) 启动 openclaude-v5-egress + openclaude-v5 + 环境隔离断言 ──"
   sshk "systemctl enable --now $V5_EGRESS_UNIT"
@@ -1610,6 +1910,10 @@ rollback_runtime_tuple() {
   master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
+  # 回滚同样过两个 capability 门(地板的核心场景就是"拒绝把旧版本翻回来")。
+  # 容器 tuple(image/release)面在 saga 内由 lib 的 assert_tuple_viable ③ 覆盖。
+  assert_release_capability_for_sessions_pg "$master"
+  assert_model_authority_floor "$master"
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
   # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
   flip_rev=""
@@ -1637,8 +1941,11 @@ rollback_runtime_tuple() {
 # 与连环重启。锁文件记录持有者(pid/mode/tree/时刻)供另一会话诊断;等待 ≤900s 后
 # fail-loud。只读模式(--dry-run / --smoke)不抢锁。cutover 自有的 CUTOVER_LOCK 是
 # 远端状态机锁,与本地这把互斥锁正交,两把都要。
-DEPLOY_LOCK="/var/lock/oc-v5-deploy.lock"
-if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
+# 锁文件路径:生产恒为全局 /var/lock/oc-v5-deploy.lock(env 不设 → 与旧行为逐字节一致)。
+# OC_V5_DEPLOY_LOCK_FILE 仅供**本地 hermetic 测试**注入独立锁文件(与 v5-runtime-release-lib.sh
+# 的 OC_HOTCFG_* 根路径同款"自测可覆盖"约定),避免测试去抢真实部署锁而挂死 900s。
+DEPLOY_LOCK="${OC_V5_DEPLOY_LOCK_FILE:-/var/lock/oc-v5-deploy.lock}"
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "model-authority-preflight" ]]; then
   exec 8>"$DEPLOY_LOCK"
   if ! flock -n 8; then
     echo "⏳ 部署锁被占:$(cat "${DEPLOY_LOCK}.holder" 2>/dev/null || echo '持有者未知')"
@@ -1655,6 +1962,10 @@ case "$MODE" in
   smoke)     smoke ;;
   deploy)    deploy ;;
   dist)      deploy_dist ;;
+  model-authority-preflight) model_authority_preflight ;;
+  enable-model-authority)    enable_model_authority ;;
+  disable-model-authority)   disable_model_authority ;;
+  model-authority-cutover)   model_authority_cutover ;;
   emergency-tuple) emergency_tuple ;;
   activate-emergency-tuple) activate_emergency_tuple ;;
   prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;

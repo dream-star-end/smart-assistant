@@ -1,5 +1,6 @@
 /**
- * authoritySigner —— master 侧**模型执行权威签发器**(Ed25519 私钥独占方)。
+ * authoritySigner —— 模型执行权威的 **keyring 生命周期**(落盘 / 初始化 / 轮换 / 热重载)
+ * 与 master 侧 **Ed25519 签发器**(私钥独占方)。
  *
  * 方案:docs/V5_MODEL_AUTHORITY_PLAN.md §2(判定单点化)。信任根是**非对称**的:
  *
@@ -10,14 +11,35 @@
  * 就能自签一份「我可以用最贵的模型 / epoch 拉回旧值」的权威。公钥注入则无此问题
  * (R3-M5 同款理由:裸 header 也可伪造,故 CCB proxy 请求必须带完整签名 envelope)。
  *
- * 本文件只负责**铸票**:
- *   - 私钥/keyring 持久化与轮换(R3-M7 五步);
+ * ---------------------------------------------------------------------------
+ * **三个角色,一个权威源(落盘文件)**(代码审 R1 MAJOR-3 整改)
+ *
+ *   KeyringStore           —— 落盘文件的唯一读写体:O_EXCL 首启、原子写、文件锁下的
+ *                             read-modify-write、stat(ino+mtime+size)驱动的**热重载**。
+ *   AuthorityKeyringReader —— **只读公钥**(egress / 非 split 拓扑的 proxy / env 注入)。
+ *                             **不持私钥、不创建文件**:验签方多起一个进程不该有能力铸钥。
+ *   AuthoritySigner        —— master 独占:签发 + 轮换五步的写操作(内部同样经 KeyringStore)。
+ *
+ * 整改前的三个洞(全部由上面的分工消掉):
+ *   ① `existsSync → generate → 固定 .tmp → rename` 的首启:master 与 egress 并发起
+ *      → 两把钥匙互相覆盖(rename 会盖掉对方),egress 用 A 验、master 用 B 签 → 全站
+ *      UnknownKey。现在:内容先落**唯一 tmp**,再用 `link()`(原子且**不覆盖**)抢占
+ *      文件名 —— 输的一方丢弃自己的钥匙去读赢家的,双钥竞态在物理上不可能。
+ *   ② egress「每请求现取 keyring」实际只读常驻对象的**内存**,文件换了也不重读 →
+ *      轮换窗口里 egress 认不出新签名。现在:reader 每次取 ring 先 stat,签名(ino,
+ *      mtime,size)变了就重读 —— 换 ring 无需重启 egress。
+ *   ③ 多进程/多次 addKey 的 read-modify-write 丢更新。现在:写操作全在 `${path}.lock`
+ *      的文件锁内**重读后再改**,并发加钥不会互相吞掉。
+ *
+ * 本文件只负责**铸票与钥匙**:
+ *   - keyring 持久化 / 初始化 / 轮换(R3-M7 五步);
  *   - signAuthority / signTurnLease / signBundle(两张票据的签发);
  *   - mintAuthorityTurnId(每 inbound 现铸的重放标识);
- *   - publicKeyringEnv():supervisor 注入容器的公钥 env 值(切片3 消费)。
+ *   - publicKeyringEnv():supervisor 注入容器的公钥 env 值。
  *
  * **不负责**:载荷字段的业务取值(catalog 快照投影,由调用方 bridge 组装)、epoch fence
- * (签发前的 fence 断言在调用方)、重放拒绝(容器侧 AuthorityReplayGuard)。
+ * (签发前 fence + **签发边界的 epoch 重读**都在调用方 bridge)、重放拒绝(容器侧
+ * AuthorityReplayGuard)、轮换步骤② 的覆盖统计(ws/authorityKeyCensus.ts)。
  *
  * ---------------------------------------------------------------------------
  * replay 防护契约(R3-M10)—— 实现体在容器 gateway 侧,签发侧在此登记语义,便于
@@ -47,12 +69,23 @@ import {
   createHash,
   createPrivateKey,
   createPublicKey,
+  generateKeyPairSync,
   sign as cryptoSign,
   randomBytes,
 } from 'node:crypto'
 import type { KeyObject } from 'node:crypto'
-import { generateKeyPairSync } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 
 import {
@@ -70,6 +103,8 @@ import {
   encodeAuthorityEnvelope,
   encodeAuthorityKeyring,
   encodeTurnLeaseEnvelope,
+  keyringFingerprint,
+  keyringKeyIds,
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 
@@ -80,6 +115,10 @@ export const DEFAULT_MODEL_AUTHORITY_KEYS_PATH = '/var/lib/openclaude/.v5-model-
 
 /** keyId 前缀:`mak1_`(model authority key v1)+ sha256(pubRaw) 前 8 字节 hex。 */
 const KEY_ID_PREFIX = 'mak1_'
+
+/** 写锁获取上限 / stale 锁回收阈值(写 = 轮换,极低频;超时即抛,不静默降级)。 */
+const LOCK_ACQUIRE_TIMEOUT_MS = 5_000
+const LOCK_STALE_MS = 30_000
 
 interface StoredKey {
   keyId: string
@@ -95,6 +134,286 @@ interface KeyringFile {
   activeKeyId: string
   keys: StoredKey[]
 }
+
+// ---------------------------------------------------------------------------
+// KeyringStore —— 落盘文件的唯一读写体(reader / signer 共用)
+// ---------------------------------------------------------------------------
+
+/**
+ * 文件态 keyring 的读写单点。
+ *
+ * **热重载**:`read()` 每次先 `statSync` 取 (ino, mtimeMs, size) 三元组签名,与上次缓存
+ * 的签名相同 → 返回缓存(零解析);不同 → 重读 + 重解析。inode 进签名很关键 —— 原子写是
+ * `tmp + rename`,新内容必然是**新 inode**,即使同一毫秒内替换也能被发现(只看 mtime
+ * 会漏掉亚毫秒替换)。
+ *
+ * **原子写**:唯一 tmp 名(pid+随机)避免多进程互踩同一个 `.tmp`,再 `rename` 覆盖 ——
+ * 读者永远看到完整的旧文件或完整的新文件,没有半写态。
+ */
+class KeyringStore {
+  private cached: KeyringFile | null = null
+  private cachedStamp: string | null = null
+  /** ephemeral(测试)= 纯内存,不碰文件系统。 */
+  private memory: KeyringFile | null = null
+
+  constructor(readonly path: string | null) {}
+
+  static ephemeral(file: KeyringFile): KeyringStore {
+    const s = new KeyringStore(null)
+    s.memory = file
+    return s
+  }
+
+  /**
+   * 当前 ring。文件不存在:`allowMissing` → null,否则抛(fail-closed)。
+   * 文件损坏 → 恒抛(绝不静默重生成私钥,见文件头)。
+   */
+  read(opts: { allowMissing?: boolean } = {}): KeyringFile | null {
+    if (this.path === null) return this.memory
+    let stamp: string
+    try {
+      const st = statSync(this.path)
+      stamp = `${st.ino}:${st.mtimeMs}:${st.size}`
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.invalidate()
+        if (opts.allowMissing === true) return null
+        throw new Error(`[model-authority] keyring file missing: ${this.path}`)
+      }
+      throw err
+    }
+    if (this.cached !== null && this.cachedStamp === stamp) return this.cached
+    const file = parseKeyringFile(readFileSync(this.path, 'utf8'), this.path)
+    this.cached = file
+    this.cachedStamp = stamp
+    return file
+  }
+
+  /** 存在即返回,不存在 → 抛。签发/取公钥路径用它(缺文件不是可降级状态)。 */
+  current(): KeyringFile {
+    const f = this.read()
+    if (f === null) throw new Error(`[model-authority] keyring file missing: ${String(this.path)}`)
+    return f
+  }
+
+  /**
+   * 首启初始化(**无锁但无竞态**):内容先落唯一 tmp,再 `link()` 抢文件名。
+   *
+   * `link` 是原子的**且遇到已存在的目标会 EEXIST 失败**(rename 则会静默覆盖)——
+   * 这正是要的语义:并发首启只有一方能把自己的钥匙变成"那把钥匙",输的一方丢弃自己
+   * 刚生成的私钥去读赢家的。旧实现(existsSync → rename)在这里会产生**双钥**:
+   * master 签 B、egress 只认 A → 全站 UnknownKey 拒帧。
+   */
+  initIfMissing(log: (msg: string) => void): KeyringFile {
+    if (this.path === null) return this.memory as KeyringFile
+    const existing = this.read({ allowMissing: true })
+    if (existing !== null) return existing
+
+    const first = generateStoredKey()
+    const file: KeyringFile = { v: 1, activeKeyId: first.keyId, keys: [first] }
+    const tmp = this.tmpPath()
+    writeFileSync(tmp, serializeKeyringFile(file), { mode: 0o600 })
+    try {
+      linkSync(tmp, this.path)
+      log(`[model-authority] keyring initialized path=${this.path} activeKeyId=${first.keyId}`)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        safeUnlink(tmp)
+        throw err
+      }
+      // 并发首启:别的进程先建成了 —— 丢弃本进程刚生成的钥匙,用文件里那把。
+      log(`[model-authority] keyring already created by a concurrent process: ${this.path}`)
+    } finally {
+      safeUnlink(tmp)
+    }
+    this.invalidate()
+    return this.current()
+  }
+
+  /**
+   * 写操作(轮换五步)= **文件锁内 read-modify-write**。
+   *
+   * 不能"拿内存里的 file 改一改再写回":另一个进程(或本进程更早的实例)刚加的钥匙会被
+   * 整份覆盖掉 —— 丢一把在跑容器正在用的公钥 = 那批容器全站验签失败。锁内重读保证
+   * mutator 看到的一定是磁盘现状。
+   */
+  mutate(fn: (current: KeyringFile) => KeyringFile): KeyringFile {
+    if (this.path === null) {
+      this.memory = fn(this.memory as KeyringFile)
+      return this.memory
+    }
+    return withKeyringLock(this.path, () => {
+      const cur = this.forceRead()
+      const next = fn(cur)
+      this.write(next)
+      return next
+    })
+  }
+
+  /** 绕过 stat 缓存直读(锁内用:别的进程可能刚写完,别信任何缓存)。 */
+  private forceRead(): KeyringFile {
+    this.invalidate()
+    return this.current()
+  }
+
+  private write(file: KeyringFile): void {
+    if (this.path === null) {
+      this.memory = file
+      return
+    }
+    const tmp = this.tmpPath()
+    try {
+      writeFileSync(tmp, serializeKeyringFile(file), { mode: 0o600 })
+      renameSync(tmp, this.path)
+    } catch (e) {
+      safeUnlink(tmp)
+      throw e
+    }
+    this.invalidate()
+  }
+
+  private invalidate(): void {
+    this.cached = null
+    this.cachedStamp = null
+  }
+
+  /** 唯一 tmp 名:固定 `.tmp` 会让并发写者互相截断对方的半成品。 */
+  private tmpPath(): string {
+    return `${String(this.path)}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+  }
+}
+
+/** 进程间互斥的写锁(O_EXCL 创建 lock 文件;持锁进程崩溃留下的 stale 锁按 mtime 回收)。 */
+function withKeyringLock<T>(path: string, fn: () => T): T {
+  const lockPath = `${path}.lock`
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS
+  for (;;) {
+    try {
+      closeSync(openSync(lockPath, 'wx', 0o600))
+      break
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      try {
+        const st = statSync(lockPath)
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) safeUnlink(lockPath)
+      } catch {
+        /* 锁刚被别人释放 —— 下一轮直接抢到 */
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`[model-authority] keyring lock busy: ${lockPath}`)
+      }
+      sleepSync(20)
+    }
+  }
+  try {
+    return fn()
+  } finally {
+    safeUnlink(lockPath)
+  }
+}
+
+/** 同步 sleep(锁重试用;写操作低频,不值得把整条轮换 API 变成 async)。 */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function safeUnlink(p: string): void {
+  try {
+    if (existsSync(p)) unlinkSync(p)
+  } catch {
+    /* best-effort */
+  }
+}
+
+function serializeKeyringFile(file: KeyringFile): string {
+  return `${JSON.stringify(file, null, 2)}\n`
+}
+
+// ---------------------------------------------------------------------------
+// AuthorityKeyringReader —— 只读公钥(验签方 / env 注入方)
+// ---------------------------------------------------------------------------
+
+/**
+ * **公钥 keyring 读取器**(无私钥、无铸钥能力)。
+ *
+ * 谁用它:
+ *   - egress(独立进程)`/v1/messages` 的每请求验签 —— 每次取 ring 都 stat 文件,master
+ *     轮换换了 ring,egress **无需重启**即认得新 keyId(整改前它读的是常驻 AuthoritySigner
+ *     的内存,轮换窗口必然拿旧 ring → 新签名一律 UnknownKey);
+ *   - 非 split 拓扑下 master 内部 proxy(同为验签方);
+ *   - supervisor 注入容器 env 的公钥串。
+ *
+ * 为什么不让它们复用 AuthoritySigner:`loadOrCreate` 会**创建**文件 —— 一个只负责验签的
+ * 进程有能力铸出一把 master 不知道的私钥,是纯粹的负资产(首启双钥竞态的根因之一)。
+ *
+ * fail-closed 语义:文件**缺失** → 空 ring(验签方随即 UnknownKey 拒帧,不放行);
+ * 文件**损坏** → 抛(与 signer 同语义:密钥材料异常必须由运维显式处置,不静默降级)。
+ */
+export class AuthorityKeyringReader {
+  private readonly store: KeyringStore
+  private readonly log: (msg: string) => void
+  private warnedMissing = false
+
+  private constructor(store: KeyringStore, log: (msg: string) => void) {
+    this.store = store
+    this.log = log
+  }
+
+  /** 打开(**不创建**)。目录完整性异常 → 抛(与 signer 同域校验)。 */
+  static open(
+    path: string = DEFAULT_MODEL_AUTHORITY_KEYS_PATH,
+    log: (msg: string) => void = (m) => console.warn(m),
+  ): AuthorityKeyringReader {
+    checkDirIntegrity(dirname(path), log)
+    return new AuthorityKeyringReader(new KeyringStore(path), log)
+  }
+
+  /** 内部/测试:复用一个已有 store(signer.reader() 的实现体)。 */
+  private static forStore(store: KeyringStore, log: (msg: string) => void): AuthorityKeyringReader {
+    return new AuthorityKeyringReader(store, log)
+  }
+
+  /** @internal signer 用来暴露自己的只读视图(同一 store = 同一份热重载状态)。 */
+  static _viewOf(store: KeyringStore, log: (msg: string) => void = () => {}): AuthorityKeyringReader {
+    return AuthorityKeyringReader.forStore(store, log)
+  }
+
+  /** 当前公钥 ring(每次调用做一次 stat 热重载检查;未变 = 命中缓存,零解析)。 */
+  keyring(): AuthorityKeyring {
+    const file = this.store.read({ allowMissing: true })
+    if (file === null) {
+      if (!this.warnedMissing) {
+        this.warnedMissing = true
+        this.log('[model-authority] keyring file not present yet — verification is fail-closed')
+      }
+      return new Map()
+    }
+    this.warnedMissing = false
+    return toPublicKeyring(file)
+  }
+
+  /** ring 里的 keyId(字典序;census 对账维度,protocol 单一实现)。 */
+  keyIds(): string[] {
+    return keyringKeyIds(this.keyring())
+  }
+
+  /** ring 指纹(容器 attestation 上报同名字段,两侧同源)。 */
+  fingerprint(): string {
+    return keyringFingerprint(this.keyring())
+  }
+
+  publicKeyringEnv(): string {
+    return encodeAuthorityKeyring(this.keyring())
+  }
+
+  publicKeyringEnvAssignment(): string {
+    return `${MODEL_AUTHORITY_KEYRING_ENV}=${this.publicKeyringEnv()}`
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AuthoritySigner —— master 独占(私钥 + 轮换写操作)
+// ---------------------------------------------------------------------------
 
 /** 签发 authority 所需的业务字段(v/keyId/issuedAt/expiresAt 由签发器补齐)。 */
 export interface AuthorityMintInput {
@@ -147,21 +466,26 @@ export interface MintedAuthority {
  * master 独占的 Ed25519 签发器 + keyring(多 keyId 并存,支持 R3-M7 轮换五步)。
  *
  * 轮换五步与本类的映射:
- *   ① 下发新公钥(旧钥保留) → `addKey({ activate: false })` + supervisor 重注入 env
- *   ② 全容器 attest 新 keyId → 运维核验(容器 hello 广播 keyring 指纹)
- *   ③ master 切新私钥       → `setActiveKey(newKeyId)`
+ *   ① 下发新公钥(旧钥保留) → `addKey({ activate: false })`;新 provision 的容器由
+ *      supervisor **现取** `publicKeyringEnvAssignment()`(index.ts 传函数而非启动期
+ *      快照字符串),在跑容器靠 recycle 换 env;
+ *   ② 全容器 attest 新 keyId → `ws/authorityKeyCensus.ts`:容器 hello attestation 上报
+ *      自己 ring 的 keyIds/指纹,census 统计覆盖 —— `isFullyCovered(newKeyId)` 为 true
+ *      才允许进第③步(**这是 gate,不是目测**);
+ *   ③ master 切新私钥       → `setActiveKey(newKeyId)`(文件锁内改,其它进程立刻可见)
  *   ④ 等旧签名 TTL 耗尽      → 等待 ≥ TURN_LEASE_TTL_MS(lease 是最长命的票据)
- *   ⑤ 删旧公钥              → `removeKey(oldKeyId)` + supervisor 重注入 env
- * 任一步顺序颠倒(尤其 ③ 早于 ①)= 在跑容器验不了新签名 → 全站 UnknownKey 拒帧。
+ *   ⑤ 删旧公钥              → `removeKey(oldKeyId)` + recycle/重注入 env
+ * 任一步顺序颠倒(尤其 ③ 早于 ①②)= 在跑容器验不了新签名 → 全站 UnknownKey 拒帧。
+ *
+ * **热重载**:所有读(activeKeyId / keyIds / publicKeyring / 签名取私钥)都经 KeyringStore
+ * 的 stat 检查 —— 运维用另一个进程动了 ring,本进程立刻跟上,不必重启 master。
  */
 export class AuthoritySigner {
-  private file: KeyringFile
-  private readonly path: string | null
+  private readonly store: KeyringStore
   private readonly privateKeyCache = new Map<string, KeyObject>()
 
-  private constructor(file: KeyringFile, path: string | null) {
-    this.file = file
-    this.path = path
+  private constructor(store: KeyringStore) {
+    this.store = store
   }
 
   /** 生产入口:加载(或首启生成)落盘 keyring。文件损坏 → 抛(fail-closed,见文件头)。 */
@@ -171,50 +495,51 @@ export class AuthoritySigner {
   ): AuthoritySigner {
     const dir = dirname(path)
     checkDirIntegrity(dir, log)
-
-    if (existsSync(path)) {
-      const raw = readFileSync(path, 'utf8')
-      const file = parseKeyringFile(raw, path)
-      return new AuthoritySigner(file, path)
-    }
-
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
-    const first = generateStoredKey()
-    const file: KeyringFile = { v: 1, activeKeyId: first.keyId, keys: [first] }
-    const signer = new AuthoritySigner(file, path)
-    signer.persist()
-    log(`[model-authority] keyring initialized path=${path} activeKeyId=${first.keyId}`)
-    return signer
+    const store = new KeyringStore(path)
+    store.initIfMissing(log)
+    return new AuthoritySigner(store)
   }
 
   /** 测试/内存态入口(不落盘)。 */
   static createEphemeral(): AuthoritySigner {
     const first = generateStoredKey()
-    return new AuthoritySigner({ v: 1, activeKeyId: first.keyId, keys: [first] }, null)
+    return new AuthoritySigner(
+      KeyringStore.ephemeral({ v: 1, activeKeyId: first.keyId, keys: [first] }),
+    )
+  }
+
+  /** 同一份 keyring 的**只读视图**(要 keyring 的地方一律拿它,别传 signer)。 */
+  reader(): AuthorityKeyringReader {
+    return AuthorityKeyringReader._viewOf(this.store)
   }
 
   get activeKeyId(): string {
-    return this.file.activeKeyId
+    return this.store.current().activeKeyId
   }
 
   get keyIds(): string[] {
-    return this.file.keys.map((k) => k.keyId)
+    return this.store.current().keys.map((k) => k.keyId)
   }
 
   /** 公钥 keyring(keyId → raw32)—— verifyAuthority / verifyTurnLease 的入参形状。 */
   publicKeyring(): AuthorityKeyring {
-    const map = new Map<string, Uint8Array>()
-    for (const k of this.file.keys) {
-      map.set(k.keyId, new Uint8Array(Buffer.from(k.publicRawB64u, 'base64url')))
-    }
-    return map
+    return toPublicKeyring(this.store.current())
+  }
+
+  /** ring 指纹(轮换 census 的对账串;与容器 attestation 上报值同源)。 */
+  fingerprint(): string {
+    return keyringFingerprint(this.publicKeyring())
   }
 
   /**
-   * supervisor 注入容器的 env 值(切片3 消费):
+   * supervisor 注入容器的 env 值:
    *   env.push(`${MODEL_AUTHORITY_KEYRING_ENV}=${signer.publicKeyringEnv()}`)
    * 值格式 `keyId:pubRawBase64url,...`(protocol encodeAuthorityKeyring 单一权威)。
    * 公钥公开无妨 —— 容器同 uid 进程读得到也伪造不出签名。
+   *
+   * **每次 provision 现取**(supervisor 收的是函数):轮换步骤① 之后新建的容器要立刻
+   * 拿到含新公钥的 ring,否则步骤② 的 census 永远收敛不到 100%,轮换卡死。
    */
   publicKeyringEnv(): string {
     return encodeAuthorityKeyring(this.publicKeyring())
@@ -309,19 +634,26 @@ export class AuthoritySigner {
   /** 步①:加一把新钥进 ring(默认**不**切签发,先让公钥下发到全部容器)。 */
   addKey(opts: { activate?: boolean } = {}): string {
     const key = generateStoredKey()
-    this.file = { ...this.file, keys: [...this.file.keys, key] }
-    if (opts.activate) this.file = { ...this.file, activeKeyId: key.keyId }
-    this.persist()
+    this.store.mutate((cur) => ({
+      ...cur,
+      keys: [...cur.keys, key],
+      ...(opts.activate === true ? { activeKeyId: key.keyId } : {}),
+    }))
     return key.keyId
   }
 
-  /** 步③:切签发私钥(前提 = 该 keyId 的公钥已下发到全部在跑容器)。 */
+  /**
+   * 步③:切签发私钥。
+   * **前提 = 该 keyId 的公钥已下发到全部在跑容器**(轮换步骤②;gate = census.isFullyCovered)。
+   * 切早了 = 在跑容器全部 UnknownKey 拒帧。
+   */
   setActiveKey(keyId: string): void {
-    if (!this.file.keys.some((k) => k.keyId === keyId)) {
-      throw new Error(`[model-authority] setActiveKey: unknown keyId ${keyId}`)
-    }
-    this.file = { ...this.file, activeKeyId: keyId }
-    this.persist()
+    this.store.mutate((cur) => {
+      if (!cur.keys.some((k) => k.keyId === keyId)) {
+        throw new Error(`[model-authority] setActiveKey: unknown keyId ${keyId}`)
+      }
+      return { ...cur, activeKeyId: keyId }
+    })
   }
 
   /**
@@ -329,24 +661,32 @@ export class AuthoritySigner {
    * 前提 = 已过 ④「旧签名 TTL 耗尽」(最长命票据 = turn lease)。禁止移除 active 钥。
    */
   removeKey(keyId: string): void {
-    if (keyId === this.file.activeKeyId) {
-      throw new Error(`[model-authority] removeKey: refusing to remove active keyId ${keyId}`)
-    }
-    if (!this.file.keys.some((k) => k.keyId === keyId)) {
-      throw new Error(`[model-authority] removeKey: unknown keyId ${keyId}`)
-    }
-    this.file = { ...this.file, keys: this.file.keys.filter((k) => k.keyId !== keyId) }
+    this.store.mutate((cur) => {
+      if (keyId === cur.activeKeyId) {
+        throw new Error(`[model-authority] removeKey: refusing to remove active keyId ${keyId}`)
+      }
+      if (!cur.keys.some((k) => k.keyId === keyId)) {
+        throw new Error(`[model-authority] removeKey: unknown keyId ${keyId}`)
+      }
+      return { ...cur, keys: cur.keys.filter((k) => k.keyId !== keyId) }
+    })
     this.privateKeyCache.delete(keyId)
-    this.persist()
   }
 
   // --- 内部 ---------------------------------------------------------------
 
+  /**
+   * 私钥 KeyObject(按 keyId 缓存)。
+   *
+   * **每次都先在当前落盘 ring 里找这把 keyId**:别的进程把它删了(轮换步骤⑤)之后,本
+   * 进程不该还能用缓存里的旧私钥继续签 —— 那会签出全站验不过的票(公钥已从容器 env 撤走)。
+   * keyId 由公钥派生,"同 keyId 不同私钥"不可能,故按 keyId 缓存 KeyObject 本身是安全的。
+   */
   private privateKey(keyId: string): KeyObject {
+    const stored = this.store.current().keys.find((k) => k.keyId === keyId)
+    if (!stored) throw new Error(`[model-authority] sign: unknown keyId ${keyId}`)
     const cached = this.privateKeyCache.get(keyId)
     if (cached) return cached
-    const stored = this.file.keys.find((k) => k.keyId === keyId)
-    if (!stored) throw new Error(`[model-authority] sign: unknown keyId ${keyId}`)
     const key = createPrivateKey({
       key: Buffer.from(stored.privatePkcs8B64, 'base64'),
       format: 'der',
@@ -355,23 +695,14 @@ export class AuthoritySigner {
     this.privateKeyCache.set(keyId, key)
     return key
   }
+}
 
-  /** 原子落盘(tmp + rename):半写文件 = 下次启动 fail-closed,不可接受。 */
-  private persist(): void {
-    if (this.path === null) return // ephemeral(测试)
-    const tmp = `${this.path}.tmp`
-    try {
-      writeFileSync(tmp, `${JSON.stringify(this.file, null, 2)}\n`, { mode: 0o600 })
-      renameSync(tmp, this.path)
-    } catch (e) {
-      try {
-        if (existsSync(tmp)) unlinkSync(tmp)
-      } catch {
-        /* best-effort cleanup */
-      }
-      throw e
-    }
+function toPublicKeyring(file: KeyringFile): AuthorityKeyring {
+  const map = new Map<string, Uint8Array>()
+  for (const k of file.keys) {
+    map.set(k.keyId, new Uint8Array(Buffer.from(k.publicRawB64u, 'base64url')))
   }
+  return map
 }
 
 /**

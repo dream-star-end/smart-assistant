@@ -15,7 +15,7 @@
 // (验签)共同 import —— 签名格式、规范编码、错误语义必须单一权威,任何一侧另抄一份
 // 编码规则 = 签名互不认账。私钥逻辑**不在本文件**(master 独占)。
 
-import { createPublicKey, verify as cryptoVerify } from 'node:crypto'
+import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
 
 import type { PlatformReasoningEffort } from './engineModels.js'
 
@@ -590,6 +590,32 @@ export function encodeAuthorityKeyring(keyring: AuthorityKeyring): string {
   return [...keyring.entries()]
     .map(([keyId, raw]) => `${keyId}:${Buffer.from(raw).toString('base64url')}`)
     .join(',')
+}
+
+/**
+ * ring 里的 keyId 集合(**字典序**)—— 轮换 census 的对账维度。
+ *
+ * 排序是语义的一部分:census 要回答「这条连接的容器认不认得 keyId X」,集合语义不该
+ * 因 env 里的书写顺序而变。两侧(容器从 env ring / master 从落盘 ring)都过这个函数。
+ */
+export function keyringKeyIds(keyring: AuthorityKeyring): string[] {
+  return [...keyring.keys()].sort()
+}
+
+/**
+ * keyring 指纹 = sha256(规范串) 前 16 hex,规范串 = `keyId:pubB64u` 排序后逗号连接。
+ *
+ * 用途(R3-M7 轮换五步的步骤②「全容器 attest 新 keyId」):容器 hello attestation 上报
+ * `keyIds` + 本指纹,master 的 census 据此统计「全部在连容器是否都已认得新公钥」。
+ * **必须单一权威**:若容器与 master 各算一套(哪怕只是排序或分隔符不同),census 会
+ * 永远显示「不覆盖」,轮换步骤②就永远 gate 不过 —— 所以放在 protocol 而不是各写各的。
+ */
+export function keyringFingerprint(keyring: AuthorityKeyring): string {
+  const canon = [...keyring.entries()]
+    .map(([keyId, raw]) => `${keyId}:${Buffer.from(raw).toString('base64url')}`)
+    .sort()
+    .join(',')
+  return createHash('sha256').update(canon).digest('hex').slice(0, 16)
 }
 
 /** 解析 keyring env(容器侧 / 测试)。任何一项非法 → BadShape(fail-closed,不做部分解析)。 */

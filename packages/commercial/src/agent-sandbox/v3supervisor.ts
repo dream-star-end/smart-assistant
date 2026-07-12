@@ -884,12 +884,20 @@ export interface V3SupervisorDeps {
    * 触发 recycle(旧 env 容器由此被换掉,不会静默跑在无权威判定的老路径上)。
    *
    * **轮换耦合**(R3-M7 五步):keyring env 只在 provision 时注入,故「下发新公钥」=
-   * 换 env + 全量 recycle。切私钥(步③)必须在全部在跑容器 attest 新 keyId 之后,
-   * 否则在跑容器验不了新签名 → 全站 UnknownKey 拒帧。
+   * 换 env + 全量 recycle。切私钥(步③)必须在全部在跑容器 attest 新 keyId 之后
+   * (gate = commercial/ws/authorityKeyCensus 的覆盖普查),否则在跑容器验不了新签名
+   * → 全站 UnknownKey 拒帧。
    */
   modelAuthority?: {
-    /** `OC_MODEL_AUTHORITY_KEYRING=<keyId:pub,...>`(AuthoritySigner.publicKeyringEnvAssignment())。 */
-    keyringEnvAssignment: string;
+    /**
+     * `OC_MODEL_AUTHORITY_KEYRING=<keyId:pub,...>`(AuthoritySigner.publicKeyringEnvAssignment())。
+     *
+     * **传函数**(index.ts 生产装配即如此):每次 provision **现取**当前 ring。传字符串 =
+     * 启动期快照 —— 轮换步骤①(addKey)之后新建的容器仍会拿到**旧 ring**,步骤② 的
+     * census 因此永远收敛不到 100%,整条轮换卡死在 master 重启之前。字符串形态只保留给
+     * 测试/静态场景。
+     */
+    keyringEnvAssignment: string | (() => string);
     /** flag 开启 → 容器侧强制要求 envelope。 */
     required: boolean;
     /**
@@ -2448,7 +2456,12 @@ export async function provisionV3Container(
     // OC_CONTAINER_ID 已在上面 bridgeSecret 分支注入(容器侧断言 containerId 依赖它;
     // 二者同为「master 与容器共享身份」的 env,生产两者恒同时存在)。
     if (deps.modelAuthority) {
-      env.push(deps.modelAuthority.keyringEnvAssignment);
+      // **现取**(函数形态):轮换步骤① 加了新公钥之后,新建容器必须立刻拿到含新钥的 ring,
+      // 否则 census 永远收敛不到 100%,步骤②(切私钥前的 gate)过不去。
+      const keyringAssignment = deps.modelAuthority.keyringEnvAssignment;
+      env.push(
+        typeof keyringAssignment === "function" ? keyringAssignment() : keyringAssignment,
+      );
       env.push(`OC_USER_ID=${String(uid)}`);
       if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master

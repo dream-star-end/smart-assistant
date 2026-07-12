@@ -296,22 +296,27 @@ describe("0135 状态机 trigger", () => {
     );
   });
 
-  test("不能直接插入 retired 行", async (t) => {
+  // 0136 收紧:新行**只能生于 staged**(0135 允许直插 active/disabled,只拒 retired)。
+  // 边界矩阵与权限层的完整覆盖在 modelAuthorityDbGuards.integ.test.ts。
+  test("新行只能生于 staged(retired/active/disabled 直插全拒;0136)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await assert.rejects(
-      () =>
-        query(
-          `INSERT INTO model_catalog(model_id, engine, provider_id, capability_profile, state)
-           VALUES ('zzz-new','ccb','ark','{}'::jsonb,'retired')`,
-        ),
-      /cannot insert entry directly in retired state/,
-    );
+    for (const state of ["retired", "active", "disabled"]) {
+      await assert.rejects(
+        () =>
+          query(
+            `INSERT INTO model_catalog(model_id, engine, provider_id, capability_profile, state)
+             VALUES ('zzz-new','ccb','ark','{}'::jsonb,'${state}')`,
+          ),
+        /must be born in staged state/,
+        `直插 ${state} 必须被拒`,
+      );
+    }
   });
 
-  test("active 行**全部** execution 字段不可变(R3-B3)", async (t) => {
+  test("execution 字段:active **与 disabled** 都不可变,只有 staged 可编辑(0136 收紧)", async (t) => {
     if (skipIfNoPg(t)) return;
     const mutations: Array<[string, RegExp]> = [
-      ["engine='codex', provider_id='codex'", /execution fields of an ACTIVE entry are immutable/],
+      ["engine='codex', provider_id='codex'", /execution fields of a active entry are immutable/],
       ["provider_id='deepseek'", /immutable/],
       ["upstream_model_id='glm-5.2-0712'", /immutable/],
       ["context_window=123456", /immutable/],
@@ -326,11 +331,22 @@ describe("0135 状态机 trigger", () => {
         `mutation should be rejected: ${set}`,
       );
     }
-    // disabled 行则可以改 execution 字段(版本准备期)
+    // 0136:**disabled 行也冻结**。0135 允许原地改写 disabled 行再 disabled→active,
+    // 同一 entry_id 的执行语义被静默篡改(历史不再是历史,usage_records 的
+    // execution_revision 归因失效)。改执行语义必须产生新版本(fn_model_switch_version)。
     await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
-    await query("UPDATE model_catalog SET context_window=123456 WHERE model_id='glm-5.2'");
+    await assert.rejects(
+      () => query("UPDATE model_catalog SET context_window=123456 WHERE model_id='glm-5.2'"),
+      /execution fields of a disabled entry are immutable/,
+    );
+    // staged 行是唯一的编辑面
+    await query(
+      `INSERT INTO model_catalog(model_id, engine, provider_id, capability_profile, state)
+       VALUES ('zzz-staged','ccb','ark','{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null}}'::jsonb,'staged')`,
+    );
+    await query("UPDATE model_catalog SET context_window=123456 WHERE model_id='zzz-staged'");
     const r = await query<{ context_window: number }>(
-      "SELECT context_window FROM model_catalog WHERE model_id='glm-5.2'",
+      "SELECT context_window FROM model_catalog WHERE model_id='zzz-staged'",
     );
     assert.equal(r.rows[0].context_window, 123456);
   });
@@ -470,9 +486,20 @@ describe("0135 security epoch", () => {
     assert.equal(await epoch(), before + 1n);
   });
 
-  test("epoch 单调:回退/清零被 CHECK 拒", async (t) => {
+  // 0136:epoch 表加 guard —— 只接受 fn_model_security_epoch_bump 的 +1 写。
+  // (0135 只有 CHECK(epoch >= 1):`SET epoch = 1` 这种**回退**是合法的,而回退会让
+  //  所有陈旧快照重新通过 fence = fence 机制被直接旁路。)
+  test("epoch 单调:回退/清零/跳变全拒(0136)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await assert.rejects(() => query("UPDATE model_security_epoch SET epoch = 0 WHERE id"), /check/i);
+    await assert.rejects(
+      () => query("UPDATE model_security_epoch SET epoch = 0 WHERE id"),
+      /advance by exactly 1/,
+    );
+    await query("UPDATE model_pricing SET multiplier=9.000 WHERE model_id='glm-5.2'"); // 抬到 2
+    await assert.rejects(
+      () => query("UPDATE model_security_epoch SET epoch = 1 WHERE id"),
+      /advance by exactly 1/,
+    );
   });
 });
 
@@ -666,17 +693,27 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
     assert.equal(await catalogState("glm-5.2"), "disabled");
   });
 
-  test("DELETE FROM model_pricing → catalog 行随之清除(不留孤儿 active)", async (t) => {
+  // 0136:DELETE FROM model_pricing 从「级联物理删除 catalog 全部版本」改为**软退役**。
+  //   0135 的形态:一条 `DELETE FROM model_pricing` 就能把该模型的**全部历史**(含 retired)
+  //   抹掉 —— 计费行(usage_records.execution_revision)从此无从回溯。
+  test("DELETE FROM model_pricing → catalog 行**软退役**(历史保留,不留孤儿 active;0136)", async (t) => {
     if (skipIfNoPg(t)) return;
     await query("DELETE FROM model_pricing WHERE model_id='kimi-k2.7-code'");
-    const r = await query("SELECT 1 FROM model_catalog WHERE model_id='kimi-k2.7-code'");
-    assert.equal(r.rows.length, 0);
-    // 复位(下个用例的 beforeEach 只复位状态,不重建行)
+    const r = await query<{ state: string }>(
+      "SELECT state FROM model_catalog WHERE model_id='kimi-k2.7-code'",
+    );
+    assert.equal(r.rows.length, 1, "历史行必须还在");
+    assert.equal(r.rows[0].state, "retired", "不再可路由,但不物理删除");
+    // 复位(下个用例的 beforeEach 只复位状态,不重建行)。重新 INSERT pricing 会派生新 entry。
     await query(
       `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility)
        VALUES ('kimi-k2.7-code','Kimi K2.7 Code (256k)',684,2880,137,0,1.000,TRUE,88,'public')`,
     );
+    const revived = await query<{ state: string }>(
+      "SELECT state FROM model_catalog WHERE model_id='kimi-k2.7-code' ORDER BY entry_id",
+    );
+    assert.deepEqual(revived.rows.map((x) => x.state), ["retired", "active"]);
   });
 
   test("不变量:model_pricing.enabled 恒等于 (catalog 有 active 行)", async (t) => {

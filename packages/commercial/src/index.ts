@@ -257,7 +257,12 @@ import {
   authorityKeyringProvider,
   getModelCatalogCache,
   isModelAuthorityEnforced,
+  peekModelCatalogCache,
 } from "./billing/modelCatalogRuntime.js";
+import {
+  MASTER_CAPABILITIES,
+  assertModelAuthorityCutoverFloor,
+} from "./runtimeCapabilities.js";
 import {
   makePgSkillEmbedCache,
   makePgSkillSearchLogger,
@@ -514,6 +519,13 @@ export interface CommercialRuntimeStatus {
   containerRuntime: "enabled" | "disabled";
   /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。 */
   schedulers: string[];
+  /**
+   * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
+   * deploy 的四面 capability 守卫读 `/healthz` 的 `runtime.capabilities` 判断"这个 master
+   * 版本认不认模型权威协议",据此拒绝把不认的旧版本翻上来(方案 §7 步 5 兼容地板)。
+   * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
+   */
+  capabilities: string[];
 }
 
 export interface RegisterCommercialResult {
@@ -899,6 +911,10 @@ export async function registerCommercial(
   } = {},
 ): Promise<RegisterCommercialResult> {
   void app;
+
+  // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
+  // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
+  assertModelAuthorityCutoverFloor();
 
   const cfg = loadConfig();
 
@@ -1501,6 +1517,10 @@ export async function registerCommercial(
         makePlatformPromptSlotsHandler({
           identityRepo,
           pricingCache: pricing,
+          // MODEL_HINT 的 alias→canonical 单一权威 = catalog(model_aliases);
+          // pricingCache 只留 extra_system_prompt 文案。未装配(shadow 期 catalog
+          // 拉不起来)→ handler 内部退 legacy 归一。
+          catalog: modelCatalogForProxy,
         });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
@@ -2204,7 +2224,10 @@ export async function registerCommercial(
       ...(modelAuthoritySigner
         ? {
             modelAuthority: {
-              keyringEnvAssignment: modelAuthoritySigner.publicKeyringEnvAssignment(),
+              // **函数**而非启动期快照:轮换步骤①(addKey)之后新 provision 的容器必须
+              // 立刻拿到含新公钥的 ring —— 传字符串的话要等 master 重启才生效,步骤②
+              // 的 census 永远收敛不到 100%,整条轮换卡死。signer 内部按文件 stat 热重载。
+              keyringEnvAssignment: () => modelAuthoritySigner!.publicKeyringEnvAssignment(),
               required: true,
               // 次级模型 master 单向下发(注入 OPENCLAUDE_SECONDARY_MODEL);与签发 authority 的
               // auxModels 同源,消除 master/runtime 版本 skew 的 WebFetch/WebSearch 403。
@@ -2609,6 +2632,11 @@ export async function registerCommercial(
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,
+    // `/api/public/models` 的投影权威(方案 §6):active catalog + pricing join,
+    // provider 归属/能力/可用性全部来自 catalog(不再用 route registry 推断)。
+    // 取进程级唯一快照(modelCatalogRuntime 单例;上面 internal-proxy 装配段已 get 过)——
+    // 未装配(skipInternalProxy / catalog 拉不起来的 shadow 期)→ undefined → handler 退 legacy 投影。
+    modelCatalog: peekModelCatalogCache() ?? undefined,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
     // 2026-05-06:admin reset-cooldown 修 bug 时新接的依赖。adminResetCooldown
@@ -3957,6 +3985,7 @@ export async function registerCommercial(
     agentRuntime: agentRuntime ? "enabled" : "disabled",
     containerRuntime: v3Deps ? "enabled" : "disabled",
     schedulers: enabledSchedulers,
+    capabilities: [...MASTER_CAPABILITIES],
   };
   // fail-closed:非 leader(controlPlaneEnabled=false)绝不允许任何 shared 域 mutator 存活 ——
   // 防 gate 漏 controlPlaneEnabled 让 follower 写共享现网(订单/账号池/容器面/邮件)。宁可拒启,

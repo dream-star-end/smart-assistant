@@ -86,11 +86,22 @@ export interface LocalCatalogView {
   readonly models: readonly LocalCatalogModel[]
   readonly projectionRevision: string
   readonly securityEpoch: string
-  /** 该 model 是否在本 uid 的投影里(= 可执行 + 可计费)。 */
+  /**
+   * alias → canonical model id 归一(方案 §2/§8「alias 全链归一」的本地路径一端)。
+   *
+   * 与 master `ModelCatalogSnapshot.aliasToCanonical` 同语义:**投影里没有这个 alias
+   * 就原样返回** —— 归一不做可用性判定,随后由 `isRoutable` fail-closed 拒。
+   * 归一必须先于 isRoutable/resolve/engine 三个判定,否则同一个模型经 alias 进来会
+   * 被判成"不在投影里"(把可用模型误拒)或绕过 disabled(把不可用模型误放)。
+   */
+  canonicalize(modelIdOrAlias: string): string
+  /** alias → canonical 的全量映射(LKG 落盘 / 诊断用)。 */
+  aliasEntries(): readonly (readonly [string, string])[]
+  /** 该 model 是否在本 uid 的投影里(= 可执行 + 可计费)。入参须为 canonical id。 */
   isRoutable(modelId: string): boolean
-  /** 完整执行语义;不在投影里 → null。 */
+  /** 完整执行语义;不在投影里 → null。入参须为 canonical id。 */
   resolve(modelId: string): LocalCatalogModel | null
-  /** engine 判定(codex 本地路径的真值表见方案 §3)。 */
+  /** engine 判定(codex 本地路径的真值表见方案 §3)。入参须为 canonical id。 */
   isCodexModel(modelId: string): boolean
 }
 
@@ -104,10 +115,45 @@ interface LocalCatalogTokenWire {
 
 /** 快照不可用 → 本地路径**拒新 turn**(调用方不得 catch 后放行)。 */
 export class ModelCatalogUnavailableError extends Error {
+  /** 结构化错误码(与 LocalExecutionRejected 同一张码表,便于调用方统一映射)。 */
+  readonly code = 'MODEL_CATALOG_UNAVAILABLE' as const
   constructor(readonly reason: string) {
     super(`model catalog unavailable: ${reason}`)
     this.name = 'ModelCatalogUnavailableError'
   }
+}
+
+/**
+ * 本地路径(无 envelope)的**结构化拒绝**码(方案 §3 真值表 / §6)。
+ *
+ *  - `DELEGATE_CODEX_UNSUPPORTED`:codex delegate / provider pin 的本地 turn。现状是
+ *    晚期被 CODEX_BILLING_GUARD(submit 时)拒 —— 那时 runner 已 spawn、容器已起进程;
+ *    本批**产品化提前到创建 runner 之前**,给出稳定错误码而不是一句 guard 文案。
+ *  - `MODEL_NOT_AVAILABLE`:模型不在本 uid 的投影里(未 active / 未授权 / 未知),
+ *    或合成路径找不到可路由的非 codex 兜底。码与 master §6 统一(不回显 model/provider)。
+ *  - `MODEL_CATALOG_UNAVAILABLE`:投影拉不到(见 ModelCatalogUnavailableError)。
+ */
+export type LocalExecutionRejectCode =
+  | 'DELEGATE_CODEX_UNSUPPORTED'
+  | 'MODEL_NOT_AVAILABLE'
+  | 'MODEL_CATALOG_UNAVAILABLE'
+
+/** 本地路径判定拒绝(**在创建 runner 之前**抛)。调用方按 code 映射用户面错误。 */
+export class LocalExecutionRejected extends Error {
+  constructor(
+    readonly code: LocalExecutionRejectCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'LocalExecutionRejected'
+  }
+}
+
+/** 统一取结构化码(两类拒绝共用一张码表;非本体系错误 → undefined)。 */
+export function localExecutionRejectCode(err: unknown): LocalExecutionRejectCode | undefined {
+  if (err instanceof LocalExecutionRejected) return err.code
+  if (err instanceof ModelCatalogUnavailableError) return err.code
+  return undefined
 }
 
 interface Snapshot {
@@ -355,9 +401,26 @@ interface WireResponse {
   models: WireRow[]
   projection_revision: string
   security_epoch: string
+  /**
+   * alias → canonical model_id(**可选**)。
+   *
+   * master 的 per-uid 投影端点(commercial `http/internalModelCatalog.ts`)当前**尚未**
+   * 下发该字段(WireCatalogResponse 只有 models/projection_revision/security_epoch),
+   * DB `model_aliases` 表在上线态也是空的 —— 故生产语义上 canonicalize 恒等于 identity,
+   * 与"gateway 历史上根本没有 alias 概念"完全一致(零行为变化)。
+   *
+   * 客户端先把消费面做齐(缺席 = 空 map,**不放宽**任何判定),master 侧一旦补上 aliases
+   * 就自然生效,不需要再动容器镜像。
+   */
+  aliases?: Record<string, string>
 }
 
 function toWire(view: LocalCatalogView): WireResponse {
+  // LKG 落盘必须**保留 alias 映射** —— 否则冷启用 LKG 的那一轮会丢掉归一能力,
+  // 同一个 alias 在"有网"和"用 LKG"两种路径下判定不同(误拒)。
+  const aliasEntries = view.aliasEntries()
+  const aliases: Record<string, string> = {}
+  for (const [alias, canonical] of aliasEntries) aliases[alias] = canonical
   return {
     models: view.models.map((m) => ({
       model_id: m.modelId,
@@ -371,6 +434,7 @@ function toWire(view: LocalCatalogView): WireResponse {
     })),
     projection_revision: view.projectionRevision,
     security_epoch: view.securityEpoch,
+    ...(aliasEntries.length > 0 ? { aliases } : {}),
   }
 }
 
@@ -409,11 +473,35 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     }
   })
 
+  // alias 解析:缺席 = 空 map(**不放宽**);形状不符 = 抛(宁可拒 turn,也不要拿半份
+  // 归一表去判定 —— 半份归一表会让某些 alias 静默落到"原样不可路由"分支)。
+  const aliases = new Map<string, string>()
+  if (o.aliases !== undefined) {
+    if (o.aliases === null || typeof o.aliases !== 'object' || Array.isArray(o.aliases)) {
+      throw new ModelCatalogUnavailableError('catalog response aliases is not an object')
+    }
+    for (const [alias, canonical] of Object.entries(o.aliases)) {
+      if (
+        typeof alias !== 'string' ||
+        alias === '' ||
+        typeof canonical !== 'string' ||
+        canonical === ''
+      ) {
+        throw new ModelCatalogUnavailableError('catalog response alias entry invalid')
+      }
+      aliases.set(alias, canonical)
+    }
+  }
+
   const byId = new Map(models.map((m) => [m.modelId, m]))
+  const canonicalize = (modelIdOrAlias: string): string =>
+    aliases.get(modelIdOrAlias) ?? modelIdOrAlias
   return {
     models,
     projectionRevision: o.projection_revision,
     securityEpoch: o.security_epoch,
+    canonicalize,
+    aliasEntries: () => [...aliases.entries()],
     isRoutable: (modelId) => byId.has(modelId),
     resolve: (modelId) => byId.get(modelId) ?? null,
     isCodexModel: (modelId) => byId.get(modelId)?.engine === 'codex',
