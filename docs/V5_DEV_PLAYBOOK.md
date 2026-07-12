@@ -284,6 +284,18 @@ cutover manifest，也不要求新 migration。仅真正紧急人工维护可为
 > (emergency = 完整 pinned tuple,含内嵌源码镜像,兼容性破坏变更必须刷新+smoke)。
 > release/bundle GC 保护集含运行容器 label 引用,docker 不可用即放弃本轮 GC。
 
+> **首启实战坑(2026-07-12,均已在 lib 代码注释登记)**:①容器 bridge 网络 DNS 不通
+> → deps 安装容器必须 --network=host(同 OC_BUILD_NETWORK_HOST 坑);②bun run build 的
+> 嵌套 script 按名字找 bun → PATH 须前置 bun 目录(绝对路径调外层不够);③release 数万
+> 文件 files[] JSON 走 --argjson 撑爆 argv → --slurpfile;④结果值函数的子进程 stdout
+> 必须 >&2(npm 输出污染 $(…) 捕获);⑤**bun build 不可复现**(同源重建 bytes 都变)→
+> ccbDistKey 内容寻址缓存复用 dist,否则每次 deploy 全量容器 churn;⑥strict 壳里
+> 守卫式 `[ -n "$x" ] && …` 作函数末条会把空值放大成失败 → 显式 return 0。
+> **稳态操作**:瘦身镜像重建传 OC_EMBED_SOURCE=0;重建后跑
+> `deploy-v5.sh --emergency-tuple --image=<内嵌tag> --image-id=<ID> --bundle=<bundle>`
+> 刷新逃生点;逃生激活=`--activate-emergency-tuple`;禁用轴=`--disable-runtime-release
+> --image=<内嵌tag> --image-id=<ID>` / `--disable-platform-bundle`。
+
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun
 ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin:$PATH \
