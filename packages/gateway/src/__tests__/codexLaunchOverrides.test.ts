@@ -284,12 +284,41 @@ describe('buildCodexLaunchOverrides', () => {
     assert.equal(out.argvOverrides[3], 'model_reasoning_effort="high"')
   })
 
-  it('does not pass non-common max as codex model_reasoning_effort', async () => {
+  it('passes Sol max as codex model_reasoning_effort', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',
       model: 'gpt-5.6-sol',
       effortLevel: 'max',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.ok(out.argvOverrides.includes('model_reasoning_effort="max"'))
+  })
+
+  it('does not pass max to a Codex model without that declared capability', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      model: 'openai/gpt-5.6-terra',
+      effortLevel: 'max',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.equal(
+      out.argvOverrides.some((s) => s.startsWith('model_reasoning_effort=')),
+      false,
+    )
+  })
+
+  it('does not pass Claude-only ultracode as codex model_reasoning_effort', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      model: 'gpt-5.6-sol',
+      effortLevel: 'ultracode',
       sessionDir: dir,
       gatewayPort: 18789,
       gatewayToken: 'tok-xyz',
