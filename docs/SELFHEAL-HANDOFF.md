@@ -39,36 +39,43 @@
 | 个人版 typecheck / gateway / storage | 0 错 / **740 全绿** / 全绿 |
 | v5 typecheck / gateway / storage / web-react | 0 错 / 1647 / 275 / **1228 全绿** |
 | v5 commercial **unit** | **基线 diff 法通过** — 独有失败仅 4 个 `userChatBridge`(= 继承测试债 `c5192f5e`,该 commit 在 canonical 里不在本分支,**合并后自然转绿**) |
-| v5 commercial **integ** | ⚠️ **唯一未收尾项**,见下 |
+| v5 commercial **integ** | ✅ **双树对照通过,零回归**(见下) |
 
-### 唯一待办测试项:integ 双树对照
-- selfheal 树干净库跑:1113 tests / 469 pass / **52 fail**。
-- **必须与基线树(`/opt/openclaude/openclaude-v5-aurora`)干净库跑对照**才能定性(本机 integ 对 Redis/外部依赖有大批存量失败,基线自己也挂一片)。基线对照跑我启动了但没等到结果。
-- **判定法**(playbook 铁律):两树各跑一次 → `grep '^not ok' | sed 's/^not ok [0-9]* - //' | sort` 存文件 → diff。**本树失败集必须 ⊆ 基线失败集**。
-- **踩坑提醒**:octest 共享库(55432)被并发跑污染会产生假失败(`relation "admin_alert_channels" already exists` / `cancelledByParent`)。跑之前先重置:
-  ```bash
-  bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:55432/openclaude_test" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO test;" && npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name "*.integ.test.ts")'
-  ```
-  **commercial 测试必须经 `test-mutex.sh`,禁裸跑**(跨 worktree 共享 octest,裸跑必互相污染)。
-- 已定性的假失败:4 个 v3 `INV-*` 测试(`v3MigrationReconciler.test.ts`)——干净库单独重跑 **12/12 全绿**,是污染 flake 非回归。
+### integ 双树对照结果(已收尾)
+干净库(DROP SCHEMA 重置)+ test-mutex 下各跑一次:
+
+| 树 | tests | pass | fail |
+|---|---|---|---|
+| selfheal | 1113 | 469 | 52 |
+| 基线 aurora | 1090 | 446 | 52 |
+
+- **失败集完全一致**(去重后 `comm -23` = 空)→ 52 个失败全是本机 integ 对外部依赖的存量失败,**零回归**。
+- selfheal 树多出的 23 个测试(新增 suppression / release claim / cancel 矩阵 / M4 出口用例)**全部通过**(pass 差值 469−446 = 23,精确对上)。
+
+**踩坑提醒(给后续任何 commercial 测试)**:octest 共享库(55432)跨 worktree 共享,被并发跑污染会产生假失败(`relation "admin_alert_channels" already exists` / `cancelledByParent`)。**必经 `test-mutex.sh`,禁裸跑**;对照跑前先重置:
+```bash
+bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:55432/openclaude_test" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO test;" && npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name "*.integ.test.ts")'
+```
+已定性的污染假失败:4 个 v3 `INV-*`(`v3MigrationReconciler.test.ts`)——干净库单独重跑 **12/12 全绿**,非回归。
 
 ---
 
 ## 4. 剩余工作(按序,全在 runbook 里有命令)
 
-1. **integ 对照定性**(上面)。通过 = 测试门全清。
-2. **合并 canonical**:
+> **测试门已全清**(四层 + 双树对照零回归)。接手直接从第 1 步开始。
+
+1. **合并 canonical**:
    - v5:`feat/v5-selfheal` → `feat/v5-aurora-rewrite`(`git merge --no-ff`);合并后 4 个 userChatBridge 失败应转绿(复验)。
    - 个人版:`feat/selfheal-repair` → `master`。
    - v5 合并后需重新 `vite build` + rsync dist(playbook 铁律:合并后必 rebuild,否则 stale dist)。
-3. **部署**(严格按 `docs/SELFHEAL-RUNBOOK.md` 七步,每步有回滚):
+2. **部署**(严格按 `docs/SELFHEAL-RUNBOOK.md` 七步,每步有回滚):
    - ① 个人版合并 + safe-restart(env 未设 = dormant,零行为变化)
    - ② v5:PG apply `0133`→`0134`→`0135`(additive,在线;记账 `schema_migrations`,version=文件名去 `.sql`)→ env 先写 `OC_SELFHEAL_*`(**`OC_SELFHEAL_DISABLED=1` + `DISPATCH_DISABLED=1` 双关**)→ deploy → 核对 effective config
    - ③ 观察层激活:stale firing condition 逐行处置 → `V5MON_CONDITIONS=1` + 删 `OC_SELFHEAL_DISABLED` → restart → 全链 smoke(无派单)
    - ④ 执行侧激活:`scripts/selfheal-provision.sh`(个人版仓,幂等,有 `--dry-run`)→ safe-restart → `apt install autossh` + 隧道单元 → kl-mirror 侧 `DISPATCH_DISABLED=0` + restart → **合成 incident 全链 E2E**
    - ⑤ **0136 writer-guard:双重门未过前只进仓不 apply**(门① 新 master 上线 ✅ 部署后即达成;门② 回滚池核对:`deploy-v5.sh --rollback` 候选全部 ≥ selfheal 合并点。未过 → 登记 playbook §5 债表)
    - ⑥ watchdog + egress selector 迁移(独立小窗口,走 release-checklist)
-4. **收尾**:playbook 登记新机制/新坑 + 记忆固化。
+3. **收尾**:playbook 登记新机制/新坑 + 记忆固化。
 
 ---
 
