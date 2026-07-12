@@ -279,6 +279,7 @@ import {
   startSessionsGcSweeper,
 } from "./db/pgSessionsBackend.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
+import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -517,6 +518,8 @@ export interface CommercialRuntimeStatus {
    * acquiring|leader|fenced。env=1 不再等同 active leader(smoke 断言随之改为断言 state=leader)。
    */
   leadership: LeadershipStatus;
+  /** P3 lane 放量观测快照(evaluateLane 命中计数,详见 deploy/laneEvaluate.ts)。 */
+  laneMetrics: LaneMetricsSnapshot;
 }
 
 export interface RegisterCommercialResult {
@@ -3938,6 +3941,11 @@ export async function registerCommercial(
     },
     get leadership(): LeadershipStatus {
       return leaderLease ? leaderLease.status() : legacyLeadership();
+    },
+    // P3 放量观测(RFC D1):lane_evaluations(请求次)+lane_users((generation,uid) 去重),
+    // operator 据此判断 promote N% 已覆盖多少活跃用户。只读快照,零成本。
+    get laneMetrics(): ReturnType<typeof getLaneMetricsSnapshot> {
+      return getLaneMetricsSnapshot();
     },
   };
   // fail-closed:非 leader(controlPlaneEnabled=false)绝不允许 eager 注册的 shared mutator 存活 ——
