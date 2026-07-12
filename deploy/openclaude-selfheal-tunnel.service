@@ -1,0 +1,42 @@
+# =============================================================================
+# openclaude-selfheal-tunnel.service — 个人版 ⇄ kl-mirror(v5 生产)自愈双向 SSH 隧道
+#
+# 端口语义(selfheal-final-design §C6 定案):
+#   -R 127.0.0.1:18795:127.0.0.1:18789
+#       kl-mirror 上监听 127.0.0.1:18795 = v5 master 派单入口
+#       (kl-mirror commercial-v5.env: OC_SELFHEAL_DISPATCH_URL=http://127.0.0.1:18795)
+#       → 转发回本机个人版 gateway 127.0.0.1:18789(selfheal receiver webhook)。
+#   -L 127.0.0.1:18796:127.0.0.1:18790
+#       本机监听 127.0.0.1:18796 = 个人版回调出口
+#       (本机 selfheal.env: OC_SELFHEAL_CALLBACK_URL=http://127.0.0.1:18796)
+#       → 转发到 kl-mirror v5 master 127.0.0.1:18790(healthz/capability 回调端口)。
+#
+# key 限权要求(kl-mirror ~/.ssh/authorized_keys 中该 key 必须带限权前缀,
+# 实值由 scripts/selfheal-provision.sh 步骤7 打印):
+#   restrict,no-pty,no-agent-forwarding,no-X11-forwarding,\
+#   permitopen="127.0.0.1:18790",permitlisten="127.0.0.1:18795" <tunnel_key.pub 内容>
+#   —— 该 key 只能建这两条转发,不能开 shell / 转发其他端口。
+#
+# 安装:本单元【不随 deploy 自动安装】,由 provision/runbook 人工执行:
+#   cp deploy/openclaude-selfheal-tunnel.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now openclaude-selfheal-tunnel.service
+# 前置:autossh 已装(provision --apply-packages);kl-mirror authorized_keys 限权行已装;
+#       kl-mirror host key 已在 /root/.ssh/known_hosts(StrictHostKeyChecking=yes 否则拒连)。
+# =============================================================================
+
+[Unit]
+Description=OpenClaude selfheal SSH tunnel (personal gateway <-> kl-mirror v5 master)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# AUTOSSH_GATETIME=0:首连即失败也不放弃(交给自身重试 + systemd Restart)
+Environment=AUTOSSH_GATETIME=0
+ExecStart=/usr/bin/autossh -M 0 -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i /root/.secrets/v5-selfheal/tunnel_key -R 127.0.0.1:18795:127.0.0.1:18789 -L 127.0.0.1:18796:127.0.0.1:18790 kl-mirror
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
