@@ -83,7 +83,6 @@ import {
   EgressHttpError,
   getEgressProxyStatus,
   redactEgressError,
-  refreshEgressNodes,
   selectEgressNode,
   testEgressProxy,
 } from './egressSubscription.js'
@@ -110,6 +109,24 @@ import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { selectRunLogResponse } from './runLogApi.js'
+import { type BrokerResponse, SelfhealBroker, releaseHttpStatusFor } from './selfheal/broker.js'
+import { SelfhealCallbackPump } from './selfheal/callbackPump.js'
+import { executeSelfhealCancel } from './selfheal/cancel.js'
+import { createDeployDriver } from './selfheal/deployDriver.js'
+import { refreshEgressPreferSelector } from './selfheal/egressRefresh.js'
+import { SelfhealJobWorker, getSelfhealJobWorkerDeps } from './selfheal/jobWorker.js'
+import { createWecomNotifier } from './selfheal/notify.js'
+import {
+  SELFHEAL_CANCEL_WEBHOOK_PATH,
+  SELFHEAL_RELEASE_WEBHOOK_PATH,
+  SELFHEAL_WEBHOOK_PATH,
+  type SelfhealReceiverConfig,
+  getSelfhealReceiverConfig,
+  isLoopbackAddress,
+  parseSelfhealIdBody,
+  receiveSelfhealDispatch,
+  verifySelfhealSignedRequest,
+} from './selfheal/receiver.js'
 import { SessionManager } from './sessionManager.js'
 import {
   VOICE_WS_PATH,
@@ -130,6 +147,11 @@ function envNumber(name: string): number | undefined {
   if (!raw) return undefined
   const n = Number(raw)
   return Number.isFinite(n) ? n : undefined
+}
+
+/** Normalize a raw Node header value to a single string (first of a list). */
+function firstHeader(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v
 }
 
 export function isFullAccessGatewayJwtPayload(payload: JwtPayload | null): payload is JwtPayload {
@@ -217,6 +239,13 @@ export class Gateway {
   private sessions: SessionManager
   private cron: CronScheduler | null = null
   private webhookRouter: WebhookRouter | null = null
+  // Self-heal (slice ②): durable repair intake + at-most-once executor.
+  private _selfhealReceiverCfg: SelfhealReceiverConfig | null = null
+  private _selfhealJobWorker: SelfhealJobWorker | null = null
+  // Self-heal (BLOCKER2): durable broker→master callback delivery.
+  private _selfhealCallbackPump: SelfhealCallbackPump | null = null
+  // Self-heal (block C): root-side privilege broker (Unix socket) + release path.
+  private _selfhealBroker: SelfhealBroker | null = null
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
   private channels = new Map<string, ChannelAdapter>()
@@ -907,6 +936,77 @@ export class Gateway {
       count: this.webhookRouter.list().length,
     })
 
+    // ── Self-heal (slice ②): durable repair receiver + at-most-once executor ──
+    // Both gate on OC_SELFHEAL_WEBHOOK_HMAC. The receiver additionally needs
+    // nothing else; the jobWorker also needs OC_SELFHEAL_CALLBACK_URL to fetch
+    // capabilities. Absent config → the endpoints 503 and no worker runs.
+    this._selfhealReceiverCfg = getSelfhealReceiverConfig()
+    if (this._selfhealReceiverCfg) {
+      const workerDeps = getSelfhealJobWorkerDeps({
+        sessions: this.sessions,
+        resolveAgent: async (id: string) => {
+          const cfg = await this._getAgentsConfig()
+          return cfg.agents.find((a) => a.id === id) ?? null
+        },
+      })
+      if (workerDeps) {
+        this._selfhealJobWorker = new SelfhealJobWorker(workerDeps)
+        this._selfhealJobWorker.start()
+        // Durable broker→master callback delivery (BLOCKER2): drains the
+        // selfheal callback outbox with a fresh capability per send. Same env
+        // surface as the jobWorker (callback URL + webhook HMAC).
+        this._selfhealCallbackPump = new SelfhealCallbackPump({
+          callbackBaseUrl: workerDeps.callbackBaseUrl,
+          hmacSecret: workerDeps.hmacSecret,
+        })
+        this._selfhealCallbackPump.start()
+        this.log.info('selfheal receiver + jobWorker + callback pump active')
+      } else {
+        this.log.warn(
+          'selfheal receiver active but OC_SELFHEAL_CALLBACK_URL unset — jobs will accept but not execute',
+        )
+      }
+
+      // ── Self-heal broker (block C / §C1): root-side privilege gateway on an
+      //    ACL'd Unix socket. Gated on OC_SELFHEAL_BROKER_SOCK so the dormant
+      //    posture (receiver-only) stays byte-identical until provision sets it.
+      const brokerSock = process.env.OC_SELFHEAL_BROKER_SOCK?.trim()
+      if (brokerSock) {
+        const uidRaw = Number(process.env.OC_SELFHEAL_OCHEAL_UID)
+        const gidRaw = Number(process.env.OC_SELFHEAL_OCHEAL_GID)
+        const canonicalRepo =
+          process.env.OC_SELFHEAL_CANONICAL_DIR?.trim() || '/opt/openclaude/openclaude-v5-aurora'
+        const canonicalBranch =
+          process.env.OC_SELFHEAL_CANONICAL_BRANCH?.trim() || 'feat/v5-aurora-rewrite'
+        const notify = createWecomNotifier()
+        this._selfhealBroker = new SelfhealBroker({
+          socketPath: brokerSock,
+          ochealUid: Number.isInteger(uidRaw) ? uidRaw : undefined,
+          ochealGid: Number.isInteger(gidRaw) ? gidRaw : undefined,
+          canonicalRepo,
+          canonicalBranch,
+          callbackBaseUrl: process.env.OC_SELFHEAL_CALLBACK_URL?.trim() || undefined,
+          autoDeployTier2: process.env.OC_SELFHEAL_AUTO_DEPLOY_TIER2 === '1',
+          deployDriver: createDeployDriver({ canonicalRepo, canonicalBranch, notify }),
+          notifyPendingRelease: (info) =>
+            notify(
+              info.toolchain?.length
+                ? `[selfheal] repair ${info.repairId} 通过验证但改动了部署工具链(${info.toolchain
+                    .slice(0, 5)
+                    .join(', ')}):一键放行不可用,须人工线下审后走标准 deploy。sha=${info.sha}`
+                : `[selfheal] repair ${info.repairId} 修复已通过验证,待放行。sha=${info.sha} —— 到 v5 admin 自愈页一键放行。`,
+            ),
+        })
+        this._selfhealBroker
+          .start()
+          .then(() => this.log.info('selfheal broker active', { sock: brokerSock }))
+          .catch((err) => {
+            this.log.error('selfheal broker failed to start', { sock: brokerSock }, err)
+            this._selfhealBroker = null
+          })
+      }
+    }
+
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
       const { webhookId, agentId, payload } = ev
@@ -1195,6 +1295,21 @@ export class Gateway {
     } catch (err) {
       this.log.warn('cron stop error', undefined, err)
     }
+    try {
+      this._selfhealJobWorker?.stop()
+    } catch (err) {
+      this.log.warn('selfheal jobWorker stop error', undefined, err)
+    }
+    try {
+      this._selfhealCallbackPump?.stop()
+    } catch (err) {
+      this.log.warn('selfheal callback pump stop error', undefined, err)
+    }
+    try {
+      await this._selfhealBroker?.stop()
+    } catch (err) {
+      this.log.warn('selfheal broker stop error', undefined, err)
+    }
 
     // ── Stage 3: drain channel adapters (Telegram etc.) ──
     for (const ch of this.channels.values()) {
@@ -1413,6 +1528,32 @@ export class Gateway {
           CHATGPT_PROXY_CORS_HEADERS['Access-Control-Allow-Headers'],
       })
       res.end()
+      return
+    }
+
+    // ── Self-heal (slice ②): HMAC-only endpoints, exempt from the global Bearer
+    //    gate. Routed HERE, before the /api/* auth guard, so the generic Bearer
+    //    check never applies. Their own handlers enforce loopback + HMAC + nonce.
+    //    Placed before the generic /api/webhooks/:id match so the exact
+    //    `v5-selfheal` path is claimed by the durable receiver, not WebhookRouter.
+    if (url.pathname === SELFHEAL_WEBHOOK_PATH) {
+      this._handleSelfhealWebhook(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    if (url.pathname === SELFHEAL_CANCEL_WEBHOOK_PATH) {
+      this._handleSelfhealCancel(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    if (url.pathname === SELFHEAL_RELEASE_WEBHOOK_PATH) {
+      this._handleSelfhealRelease(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    // Root break-glass release: loopback + the personal-edition global token
+    // (both enforced inside the handler — /internal/* is outside the /api gate).
+    if (url.pathname === '/internal/selfheal/release') {
+      this._handleSelfhealBreakGlassRelease(req, res).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
       return
     }
 
@@ -2601,7 +2742,10 @@ export class Gateway {
         this.sendError(res, 405, 'method not allowed')
         return
       }
-      this.sendJson(res, 200, await refreshEgressNodes(opts))
+      // MED16 (block C §C5): once the config is a primary/backup selector the
+      // legacy refresh would destroy it — prefer the structure-preserving
+      // resync; only a not-yet-migrated config falls back to the legacy path.
+      this.sendJson(res, 200, await refreshEgressPreferSelector(opts))
       return
     }
     if (url.pathname === '/api/egress-proxy/test') {
@@ -3223,6 +3367,255 @@ export class Gateway {
       return
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  /**
+   * POST /api/webhooks/v5-selfheal — durable repair intake (slice ②).
+   * HMAC-only; the global Bearer gate is bypassed by the pre-auth route in
+   * handleHttp. All verification (loopback + ts + HMAC + nonce) + the durable
+   * job commit live in {@link receiveSelfhealDispatch}; a 202 means it is on disk.
+   */
+  private async _handleSelfhealWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const cfg = this._selfhealReceiverCfg
+    if (!cfg) {
+      this.sendError(res, 503, 'selfheal receiver not configured')
+      return
+    }
+    // Cheap loopback gate before we even read the body.
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      this.sendError(res, 403, 'forbidden')
+      return
+    }
+    let rawBody: Buffer
+    try {
+      rawBody = await this.readBinaryBody(req, cfg.maxBodyBytes)
+    } catch {
+      this.sendJson(res, 413, { error: 'payload too large' })
+      return
+    }
+    const result = await receiveSelfhealDispatch(
+      {
+        remoteAddress: req.socket.remoteAddress,
+        method: req.method,
+        path: SELFHEAL_WEBHOOK_PATH,
+        ts: firstHeader(req.headers['x-selfheal-ts']),
+        nonce: firstHeader(req.headers['x-selfheal-nonce']),
+        sig: firstHeader(req.headers['x-selfheal-sig']),
+        rawBody,
+      },
+      cfg,
+    )
+    this.sendJson(res, result.status, result.body)
+    // Wake the executor immediately so intake→execution latency is low.
+    if (result.status === 202) this._selfhealJobWorker?.kick()
+  }
+
+  /**
+   * Shared intake for the signed selfheal command webhooks (cancel / release):
+   * method gate → receiver config → loopback → size-capped body → id parse →
+   * full trust chain (route-bound HMAC + nonce). Returns the verified ids, or
+   * null after having already written the HTTP error response.
+   */
+  private async _readVerifiedSelfhealCommand(
+    req: IncomingMessage,
+    res: ServerResponse,
+    path: string,
+    opts: { requireIncidentId: boolean },
+  ): Promise<{ repairId: string; incidentId?: string } | null> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return null
+    }
+    const cfg = this._selfhealReceiverCfg
+    if (!cfg) {
+      this.sendError(res, 503, 'selfheal receiver not configured')
+      return null
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      this.sendError(res, 403, 'forbidden')
+      return null
+    }
+    let rawBody: Buffer
+    try {
+      rawBody = await this.readBinaryBody(req, cfg.maxBodyBytes)
+    } catch {
+      this.sendJson(res, 413, { error: 'payload too large' })
+      return null
+    }
+    const parsed = parseSelfhealIdBody(rawBody, opts)
+    if (!parsed) {
+      this.sendJson(res, 400, { error: 'invalid body' })
+      return null
+    }
+    const verified = await verifySelfhealSignedRequest(
+      {
+        remoteAddress: req.socket.remoteAddress,
+        method: req.method,
+        path,
+        ts: firstHeader(req.headers['x-selfheal-ts']),
+        nonce: firstHeader(req.headers['x-selfheal-nonce']),
+        sig: firstHeader(req.headers['x-selfheal-sig']),
+        rawBody,
+        repairId: parsed.repairId,
+      },
+      cfg,
+    )
+    if (!verified.ok) {
+      this.sendJson(res, verified.status, { error: verified.error })
+      return null
+    }
+    return parsed
+  }
+
+  /**
+   * POST /api/webhooks/v5-selfheal-cancel { repairId, incidentId } — the
+   * canonical v5-initiated cancel (design §A2/§C4; same trust chain as
+   * dispatch). Runs the four-case terminated contract under the per-repair
+   * mutex; `terminated=true` IFF the durable job status is now 'cancelled'.
+   */
+  private async _handleSelfhealCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const parsed = await this._readVerifiedSelfhealCommand(req, res, SELFHEAL_CANCEL_WEBHOOK_PATH, {
+      requireIncidentId: true,
+    })
+    if (!parsed) return
+    const incidentId = parsed.incidentId
+    if (!incidentId) {
+      // Unreachable — requireIncidentId already enforced it — but keep the
+      // narrow explicit rather than asserting.
+      this.sendJson(res, 400, { error: 'invalid body' })
+      return
+    }
+    const outcome = await executeSelfhealCancel(
+      { repairId: parsed.repairId, incidentId },
+      this.sessions,
+    )
+    this.log.info('selfheal cancel', {
+      repairId: outcome.repairId,
+      terminated: outcome.terminated,
+      accepted: outcome.accepted,
+      status: outcome.status,
+    })
+    this.sendJson(res, 200, {
+      ok: true,
+      repairId: outcome.repairId,
+      terminated: outcome.terminated,
+      accepted: outcome.accepted,
+      status: outcome.status,
+    })
+  }
+
+  /**
+   * POST /api/webhooks/v5-selfheal-release { repairId } — the v5 admin
+   * one-click release (design §C3; same trust chain as dispatch). Terminates on
+   * the broker's IN-PROCESS releaseApproved (release is never a socket action),
+   * which re-verifies the durable pending_release record + ancestry + denylist.
+   *
+   * HTTP mapping (BLOCKER1): the v5 side judges success by "2xx && body.ok &&
+   * body.status==='deployed'", so the broker outcome drives the status code
+   * (releaseHttpStatusFor: deployed→200, pending_release/rejected→409,
+   * in_progress→423, deploy_failed→500); store/internal exceptions → 503.
+   * The body is always JSON { ok, status, detail }.
+   */
+  private async _handleSelfhealRelease(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const parsed = await this._readVerifiedSelfhealCommand(
+      req,
+      res,
+      SELFHEAL_RELEASE_WEBHOOK_PATH,
+      { requireIncidentId: false },
+    )
+    if (!parsed) return
+    const broker = this._selfhealBroker
+    if (!broker) {
+      this.sendJson(res, 503, {
+        ok: false,
+        status: 'error',
+        detail: { reason: 'selfheal broker not active' },
+      })
+      return
+    }
+    let resp: BrokerResponse
+    try {
+      resp = await broker.releaseApproved(parsed.repairId)
+    } catch (err) {
+      this.log.error('selfheal release crashed', { repairId: parsed.repairId }, err as Error)
+      this.sendJson(res, 503, { ok: false, status: 'error', detail: { reason: 'internal error' } })
+      return
+    }
+    this.log.info('selfheal release (webhook)', { repairId: parsed.repairId, status: resp.status })
+    this.sendJson(res, releaseHttpStatusFor(resp), {
+      ok: resp.ok,
+      repairId: parsed.repairId,
+      status: resp.status,
+      detail: resp.detail ?? {},
+    })
+  }
+
+  /**
+   * POST /internal/selfheal/release { repairId } — root break-glass release:
+   * loopback + the personal-edition global token (checkHttpAuth). Same
+   * in-process releaseApproved terminal AND the same broker-outcome→HTTP
+   * mapping (BLOCKER1) as the signed webhook.
+   */
+  private async _handleSelfhealBreakGlassRelease(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      this.sendError(res, 403, 'forbidden')
+      return
+    }
+    if (!this.checkHttpAuth(req)) {
+      this.sendJson(res, 401, { error: 'unauthorized' })
+      return
+    }
+    let repairId: string
+    try {
+      const body = JSON.parse(await this.readBody(req)) as { repairId?: unknown }
+      if (
+        !body ||
+        typeof body.repairId !== 'string' ||
+        !/^[a-zA-Z0-9_.:-]{1,128}$/.test(body.repairId)
+      ) {
+        this.sendJson(res, 400, { error: 'invalid repairId' })
+        return
+      }
+      repairId = body.repairId
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid body' })
+      return
+    }
+    const broker = this._selfhealBroker
+    if (!broker) {
+      this.sendJson(res, 503, {
+        ok: false,
+        status: 'error',
+        detail: { reason: 'selfheal broker not active' },
+      })
+      return
+    }
+    let resp: BrokerResponse
+    try {
+      resp = await broker.releaseApproved(repairId)
+    } catch (err) {
+      this.log.error('selfheal release (break-glass) crashed', { repairId }, err as Error)
+      this.sendJson(res, 503, { ok: false, status: 'error', detail: { reason: 'internal error' } })
+      return
+    }
+    this.log.warn('selfheal release (break-glass)', { repairId, status: resp.status })
+    this.sendJson(res, releaseHttpStatusFor(resp), {
+      ok: resp.ok,
+      repairId,
+      status: resp.status,
+      detail: resp.detail ?? {},
+    })
   }
 
   private async _handleWechat(

@@ -4,11 +4,17 @@ import { join } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
+  type SelfhealExecutionStatus,
   appendServerAuthoredMessageDurable,
+  claimQueuedTurn,
+  enqueueExecution,
   getClientSession,
+  getExecution,
   getMaxTurnIdx,
   indexTurn,
   paths,
+  reopenExecutionForRedrive,
+  setExecutionStatus,
   upsertSessionMeta,
 } from '@openclaude/storage'
 import { ClaudeMessageParser, type SessionStreamEvent } from './claudeMessageParser.js'
@@ -743,6 +749,16 @@ export class SessionManager {
       // `-c` overrides. Without these the codex agent would launch "naked"
       // with no awareness of OpenClaude's slot pipeline (SOUL/USER/SKILLS/
       // MEMORY/AGENTS/TOOLS/RESEARCH).
+      // Fail-CLOSED (Codex HIGH #7): only the app-server runner performs the
+      // uid/gid privilege drop. If a runAsUser agent were routed to any other
+      // runner (legacy `codex exec` / CCB), codex would launch as the root
+      // gateway user — silently defeating the self-heal OS boundary. Refuse.
+      if (opts.agent.runAsUser && opts.agent.runnerKind !== 'app-server') {
+        throw new Error(
+          `agent "${opts.agent.id}": runAsUser requires runnerKind=app-server ` +
+            `(got ${JSON.stringify(opts.agent.runnerKind ?? 'exec')}); refusing to spawn un-dropped`,
+        )
+      }
       if (opts.agent.runnerKind === 'app-server') {
         runner = new CodexAppServerRunner({
           sessionKey: opts.sessionKey,
@@ -756,6 +772,7 @@ export class SessionManager {
           effortLevel: initialEffort,
           config: this.config,
           delegationDepth: opts.delegationDepth,
+          runAsUser: opts.agent.runAsUser,
         }) as unknown as SubprocessRunner
       } else {
         runner = new CodexRunner({
@@ -1267,6 +1284,75 @@ export class SessionManager {
       }
     } finally {
       release()
+    }
+  }
+
+  /**
+   * At-most-once submit keyed by a durable `executionId` (self-heal slice ②).
+   *
+   * The dedup ledger lives in selfheal.db and is the *only* thing added on top
+   * of the ordinary {@link submit} path:
+   *
+   *   1. {@link enqueueExecution} — in ONE transaction, write the execution row
+   *      ('accepted') AND the durable_turn_queue row ('queued'). This is the
+   *      commit point: `accepted` therefore ALWAYS implies a queued turn exists,
+   *      so we can never "record accepted but never submit" (the permanent
+   *      swallow). Idempotent on executionId.
+   *   2. {@link claimQueuedTurn} — CAS queued→consumed (+ execution
+   *      accepted→running) in one transaction. EXACTLY ONE caller wins. The
+   *      winner (and only it) runs the real turn; everyone else returns the
+   *      existing status WITHOUT creating a second turn.
+   *   3. Run the turn via the shared {@link submit} path, then settle the
+   *      execution status to done/failed.
+   *
+   * Crash semantics (called ONLY by the jobWorker, under its job lease — the
+   * lease guarantees no other live attempt for this executionId):
+   *   - crash BEFORE the claim → row stays 'queued' → a re-drive wins the CAS and
+   *     submits (no swallow);
+   *   - crash AFTER the claim, mid-submit → execution stuck 'running' / queue
+   *     'consumed'. Step 0 re-opens that crashed attempt (safe: the prior owner
+   *     is dead — its job lease elapsed before re-claim), so the re-drive wins
+   *     the CAS and RE-RUNS instead of silently failing the repair (Codex HIGH
+   *     #9). Turn execution is thus at-LEAST-once; the broker keeps the actual
+   *     privileged SIDE EFFECTS at-most-once, so a re-run never double-deploys.
+   *   - a completed ('done') execution is never re-opened → no re-run after
+   *     success.
+   *
+   * `ranHere` tells the caller whether THIS call executed the turn (vs. observed
+   * an already-consumed one), so it can map the outcome onto its own bookkeeping.
+   */
+  async submitWithExecutionId(
+    session: AgentSession,
+    prompt: string,
+    executionId: string,
+    onEvent: (e: SessionStreamEvent) => void,
+  ): Promise<{ executionId: string; status: SelfhealExecutionStatus; ranHere: boolean }> {
+    // 0. Crash recovery: if a prior attempt crashed mid-submit (execution stuck
+    //    'running', turn 'consumed'), re-open it so this re-drive can win the CAS
+    //    and re-run instead of the repair being silently lost. Safe under the job
+    //    lease (no live prior attempt); a 'done' execution is never re-opened.
+    await reopenExecutionForRedrive(executionId)
+
+    // 1. Durable, idempotent enqueue (accepted + queued in one txn).
+    await enqueueExecution({ executionId, sessionKey: session.sessionKey })
+
+    // 2. Claim the single turn. Losing the CAS means it was already consumed —
+    //    return the current status without creating a second turn.
+    const won = await claimQueuedTurn(executionId)
+    if (!won) {
+      const exec = await getExecution(executionId)
+      return { executionId, status: exec?.status ?? 'accepted', ranHere: false }
+    }
+
+    // 3. We own the turn (execution is now 'running'). Reuse the normal submit
+    //    path; settle the ledger on completion.
+    try {
+      await this.submit(session, prompt, onEvent)
+      await setExecutionStatus(executionId, 'done')
+      return { executionId, status: 'done', ranHere: true }
+    } catch (err) {
+      await setExecutionStatus(executionId, 'failed')
+      throw err
     }
   }
 

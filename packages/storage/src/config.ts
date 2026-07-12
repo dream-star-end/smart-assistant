@@ -395,7 +395,139 @@ export interface AgentDef {
    * the provider default described above.
    */
   proxyUrl?: string
+  /**
+   * Self-heal OS privilege-drop identity. When set, the gateway spawns this
+   * agent's codex subprocess under a NON-root Unix user (Node `spawn` uid/gid
+   * drop) so a compromised/misbehaving codex cannot touch root-only production
+   * assets (deploy scripts, systemd, secrets) — it must go through the
+   * self-heal broker socket for any privileged action.
+   *
+   * NOT a free-form string. Only values in {@link RUN_AS_USER_ALLOWLIST} are
+   * accepted; any other value fails config load (`assertValidRunAsUser`). Each
+   * whitelisted identity maps to env-provided numeric uid/gid
+   * ({@link resolveRunAsUserIds}). Undefined ⇒ no drop (spawns as the gateway
+   * user, historical behavior — zero regression for every non-self-heal agent).
+   */
+  runAsUser?: RunAsUserName
   updatedAt?: string // ISO timestamp of last config change
+}
+
+/**
+ * Allowlist of accepted `AgentDef.runAsUser` identities. This is the SINGLE
+ * authority mapping a symbolic run-as identity → the env vars that hold the
+ * numeric uid/gid the gateway must drop to. A fixed table (not a free string)
+ * so a config edit can never point an agent at an arbitrary uid, and adding a
+ * new drop identity is a deliberate, reviewed code change here.
+ */
+export const RUN_AS_USER_ALLOWLIST = {
+  /** Self-heal codex operator — the non-root user that runs repair sessions. */
+  ocheal: { uidEnv: 'OC_SELFHEAL_OCHEAL_UID', gidEnv: 'OC_SELFHEAL_OCHEAL_GID' },
+} as const
+
+export type RunAsUserName = keyof typeof RUN_AS_USER_ALLOWLIST
+
+/**
+ * The SINGLE agent id permitted to carry a `runAsUser` privilege-drop identity —
+ * the self-heal repair operator. Any other agent with `runAsUser` fails config
+ * load (Codex HIGH #6). This is the single authority for the id; the gateway's
+ * execution ledger re-exports it so both sides agree.
+ */
+export const SELFHEAL_AGENT_ID = 'codex-v5ops'
+
+/** Type guard: is `v` a whitelisted run-as identity? */
+export function isAllowedRunAsUser(v: unknown): v is RunAsUserName {
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(RUN_AS_USER_ALLOWLIST, v)
+}
+
+/**
+ * Fail-fast validate an agent's `runAsUser`. Throws (at config load) when the
+ * field is set to anything outside {@link RUN_AS_USER_ALLOWLIST}. Absent ⇒ ok.
+ * This runs on EVERY agent, so a stray/hostile `runAsUser` on a normal agent is
+ * rejected before it can ever be spawned.
+ */
+export function assertValidRunAsUser(
+  agent: Pick<AgentDef, 'id' | 'runAsUser' | 'provider' | 'runnerKind'>,
+): void {
+  const v = agent.runAsUser as unknown
+  if (v === undefined || v === null) return
+  if (!isAllowedRunAsUser(v)) {
+    throw new Error(
+      `agent "${agent.id}": runAsUser=${JSON.stringify(v)} is not permitted; ` +
+        `only [${Object.keys(RUN_AS_USER_ALLOWLIST).join(', ')}] may be used`,
+    )
+  }
+  // Bind the drop identity to the designated self-heal agent + the only runner
+  // that actually performs the uid/gid drop (Codex HIGH #6/#7). A stray
+  // runAsUser on any other agent — or on a runner that would silently bypass the
+  // drop and launch codex as root — fails config load.
+  if (agent.id !== SELFHEAL_AGENT_ID) {
+    throw new Error(
+      `agent "${agent.id}": runAsUser is permitted only on the self-heal agent "${SELFHEAL_AGENT_ID}"`,
+    )
+  }
+  if (agent.provider !== 'codex-native') {
+    throw new Error(`agent "${agent.id}": runAsUser requires provider=codex-native`)
+  }
+  if (agent.runnerKind !== 'app-server') {
+    throw new Error(
+      `agent "${agent.id}": runAsUser requires runnerKind=app-server ` +
+        `(the only runner that performs the OS privilege drop)`,
+    )
+  }
+}
+
+export interface RunAsUserIds {
+  uid: number
+  gid: number
+}
+
+/**
+ * Resolve the numeric uid/gid for a whitelisted `runAsUser` from env. Throws
+ * (fail-CLOSED) when:
+ *   - the identity is not whitelisted, or
+ *   - the env uid/gid is missing / non-integer, or
+ *   - it resolves to 0 (root).
+ *
+ * A throw MUST be treated by callers as "refuse to spawn" — the gateway must
+ * NEVER silently fall back to a root spawn for a privilege-drop agent. Reading
+ * env (rather than baking numbers in) lets block C provision the real uid/gid
+ * without a code change while keeping 0/root categorically rejected.
+ */
+export function resolveRunAsUserIds(runAsUser: string): RunAsUserIds {
+  if (!isAllowedRunAsUser(runAsUser)) {
+    throw new Error(`runAsUser=${JSON.stringify(runAsUser)} is not in the allowlist`)
+  }
+  const { uidEnv, gidEnv } = RUN_AS_USER_ALLOWLIST[runAsUser]
+  const uidRaw = process.env[uidEnv]
+  const gidRaw = process.env[gidEnv]
+  const uid = Number(uidRaw)
+  const gid = Number(gidRaw)
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new Error(
+      `${uidEnv} must be a positive integer uid for runAsUser=${runAsUser} (got ${JSON.stringify(
+        uidRaw ?? null,
+      )})`,
+    )
+  }
+  if (!Number.isInteger(gid) || gid <= 0) {
+    throw new Error(
+      `${gidEnv} must be a positive integer gid for runAsUser=${runAsUser} (got ${JSON.stringify(
+        gidRaw ?? null,
+      )})`,
+    )
+  }
+  return { uid, gid }
+}
+
+/**
+ * Validate an entire agents config at load time. Currently enforces the
+ * `runAsUser` allowlist across all agents; extend here for future
+ * cross-agent invariants. Throws on the first violation (fail-fast).
+ */
+export function validateAgentsConfig(cfg: AgentsConfig): void {
+  for (const agent of cfg.agents ?? []) {
+    assertValidRunAsUser(agent)
+  }
 }
 
 export interface RouteRule {
@@ -416,7 +548,12 @@ export interface AgentsConfig {
 export async function readAgentsConfig(): Promise<AgentsConfig> {
   try {
     const raw = await readFile(paths.agentsYaml, 'utf-8')
-    return parseYaml(raw) as AgentsConfig
+    const cfg = parseYaml(raw) as AgentsConfig
+    // Fail-fast on an illegal runAsUser (see RUN_AS_USER_ALLOWLIST). A normal
+    // agents.yaml never carries runAsUser, so this is a no-op for existing
+    // configs — it only blocks a stray/hostile drop identity from loading.
+    validateAgentsConfig(cfg)
+    return cfg
   } catch (err: any) {
     if (err.code === 'ENOENT') {
       return { agents: [{ id: 'main' }], routes: [], default: 'main' }

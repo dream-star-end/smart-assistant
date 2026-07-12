@@ -6,9 +6,12 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 import {
+  buildRouteRules,
+  buildSelectorConfig,
   buildSingBoxConfig,
   decodeSubscriptionLines,
   metaText,
+  outboundToInternal,
   parseSubscriptionNodes,
   redactEgressError,
   refreshEgressNodes,
@@ -203,6 +206,139 @@ describe('egress sing-box config construction', () => {
     assert.equal(config.route.final, 'proxy')
     assert.equal(meta.idx, 8)
     assert.equal(meta.server, 'reality.example.com:443')
+  })
+})
+
+describe('egress selector config (slice ③ 主备 failover)', () => {
+  const wsNode = {
+    idx: 7,
+    uri: VLESS_URI,
+    name: 'US Node 1',
+    scheme: 'vless',
+    server: 'example.com',
+    port: 2053,
+    transport: 'ws',
+    security: 'tls',
+    supported: true,
+    active: false,
+    uuid: '11111111-1111-4111-8111-111111111111',
+    sni: 'edge.example.com',
+    wsHost: 'ws.example.com',
+    path: '/secret-path',
+    fingerprint: 'chrome',
+  }
+  const realityNode = {
+    idx: 8,
+    uri: REALITY_URI,
+    name: 'Reality Node',
+    scheme: 'vless',
+    server: 'reality.example.com',
+    port: 443,
+    transport: 'tcp',
+    security: 'reality',
+    supported: true,
+    active: false,
+    uuid: '22222222-2222-4222-8222-222222222222',
+    sni: REALITY_SNI,
+    fingerprint: 'firefox',
+    flow: 'xtls-rprx-vision',
+    realityPublicKey: REALITY_PUBLIC_KEY,
+    realityShortId: REALITY_SHORT_ID,
+  }
+  const clash = {
+    listen: '127.0.0.1',
+    port: 19096,
+    secret: 'x'.repeat(32),
+    cacheFile: '/var/lib/openclaude-egress/clash.db',
+  }
+
+  it('injects claude auto-updater domains as direct route rules', () => {
+    const rules = buildRouteRules() as Array<Record<string, any>>
+    assert.equal(rules.length, 1)
+    assert.equal(rules[0].outbound, 'direct')
+    assert.deepEqual(rules[0].domain_suffix, ['downloads.claude.ai', 'storage.googleapis.com'])
+  })
+
+  it('single-node config also carries the direct route rules (landmine root-caused)', () => {
+    const { config } = buildSingBoxConfig(realityNode, '127.0.0.1', 19999)
+    assert.equal(config.route.final, 'proxy')
+    assert.equal(config.route.rules[0].outbound, 'direct')
+    assert.ok(config.route.rules[0].domain_suffix.includes('downloads.claude.ai'))
+  })
+
+  it('builds a proxy selector over node-a(主)/node-b(备) with clash_api + cache_file', () => {
+    const { config, meta } = buildSelectorConfig(realityNode, wsNode, '127.0.0.1', 18991, clash)
+    const selector = config.outbounds.find((o: any) => o.type === 'selector')
+    assert.equal(selector.tag, 'proxy')
+    assert.deepEqual(selector.outbounds, ['node-a', 'node-b'])
+    assert.equal(selector.default, 'node-a')
+    assert.equal(selector.interrupt_exist_connections, false)
+    const a = config.outbounds.find((o: any) => o.tag === 'node-a')
+    const b = config.outbounds.find((o: any) => o.tag === 'node-b')
+    assert.equal(a.uuid, realityNode.uuid)
+    assert.equal(a.tls.reality.public_key, REALITY_PUBLIC_KEY)
+    assert.equal(b.uuid, wsNode.uuid)
+    assert.equal(b.transport.type, 'ws')
+    assert.ok(config.outbounds.some((o: any) => o.tag === 'direct' && o.type === 'direct'))
+    assert.equal(config.route.final, 'proxy')
+    assert.equal(config.route.rules[0].outbound, 'direct')
+    assert.equal(config.experimental.clash_api.external_controller, '127.0.0.1:19096')
+    assert.equal(config.experimental.clash_api.secret, clash.secret)
+    assert.equal(config.experimental.cache_file.enabled, true)
+    assert.equal(config.experimental.cache_file.path, '/var/lib/openclaude-egress/clash.db')
+    assert.equal(meta.idx, 8)
+    assert.equal(meta.backup_idx, 7)
+    assert.equal(meta.backup_server, 'example.com:2053')
+  })
+
+  it('degrades to a single-member selector when no distinct backup exists', () => {
+    const { config, meta } = buildSelectorConfig(realityNode, undefined, '127.0.0.1', 18991, clash)
+    const selector = config.outbounds.find((o: any) => o.type === 'selector')
+    assert.deepEqual(selector.outbounds, ['node-a'])
+    assert.equal(
+      config.outbounds.some((o: any) => o.tag === 'node-b'),
+      false,
+    )
+    assert.equal(meta.backup_idx, undefined)
+  })
+
+  it('collapses a backup that shares the primary endpoint (no fake redundancy)', () => {
+    const sameEndpointBackup = {
+      ...wsNode,
+      server: realityNode.server,
+      port: realityNode.port,
+      uuid: realityNode.uuid,
+    }
+    const { config } = buildSelectorConfig(realityNode, sameEndpointBackup, '127.0.0.1', 18991, clash)
+    const selector = config.outbounds.find((o: any) => o.type === 'selector')
+    assert.deepEqual(selector.outbounds, ['node-a'])
+  })
+
+  it('omits experimental block entirely when no clash config is supplied', () => {
+    const { config } = buildSelectorConfig(realityNode, wsNode, '127.0.0.1', 18991)
+    assert.equal(config.experimental, undefined)
+  })
+
+  it('keeps clash_api but omits cache_file when cacheFile is not provided', () => {
+    const { config } = buildSelectorConfig(realityNode, wsNode, '127.0.0.1', 18991, {
+      listen: '127.0.0.1',
+      port: 19096,
+      secret: 'y'.repeat(32),
+    })
+    assert.equal(config.experimental.clash_api.external_controller, '127.0.0.1:19096')
+    assert.equal(config.experimental.cache_file, undefined)
+  })
+
+  it('round-trips outbound → internal → outbound losslessly (migration fidelity)', () => {
+    for (const node of [realityNode, wsNode]) {
+      const { config } = buildSelectorConfig(node, undefined, '127.0.0.1', 18991, clash)
+      const built = config.outbounds.find((o: any) => o.tag === 'node-a')
+      const back = outboundToInternal(built, node.idx, node.name)
+      assert.ok(back)
+      const { config: rebuilt } = buildSelectorConfig(back!, undefined, '127.0.0.1', 18991, clash)
+      const rebuiltA = rebuilt.outbounds.find((o: any) => o.tag === 'node-a')
+      assert.deepEqual(rebuiltA, built)
+    }
   })
 })
 

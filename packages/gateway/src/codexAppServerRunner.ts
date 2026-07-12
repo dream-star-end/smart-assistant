@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { type OpenClaudeConfig, type RunAsUserName, paths, resolveRunAsUserIds } from '@openclaude/storage'
 import {
   type CodexLaunchOverrides,
   type CodexReasoningEffort,
@@ -105,6 +105,20 @@ export interface CodexAppServerRunnerOpts {
   delegationDepth?: number
   /** Per-turn default. SessionManager resets this before every submit. */
   conversationMode?: 'default' | 'plan'
+  /**
+   * Self-heal OS privilege-drop identity, forwarded from `AgentDef.runAsUser`
+   * (see storage/config.ts). When set, `ensureSpawned` resolves the identity's
+   * numeric uid/gid from env and passes them to Node `spawn` so `codex
+   * app-server` (and every tool subprocess it forks) runs as that non-root
+   * user instead of the gateway user.
+   *
+   * Undefined (the case for every non-self-heal agent) ⇒ NO uid/gid is added
+   * to the spawn options and env is untouched: byte-for-byte the historical
+   * launch. Resolution is fail-CLOSED — if the identity is set but its env
+   * uid/gid is missing/invalid/root, the spawn throws rather than silently
+   * launching codex as root.
+   */
+  runAsUser?: RunAsUserName
 }
 
 interface QueuedTurn {
@@ -863,10 +877,73 @@ export class CodexAppServerRunner extends EventEmitter {
     // process startup (`--enable goals` / `features.goals=true`); Codex 0.130
     // rejects trying to enable it later via `experimentalFeature/enablement/set`.
     const args = ['app-server', ...argvOverrides, '--enable', 'goals', '--listen', 'stdio://']
-    const proc = _spawnFn('codex', args, {
+    const spawnEnv = buildCodexEnv({ proxyUrl: this.opts.proxyUrl })
+    // ── Self-heal secret containment ─────────────────────────────────────────
+    // buildCodexEnv scrubs ANTHROPIC_/CLAUDE_CODE_/OPENCLAUDE_ + known secret
+    // keys, but NOT the self-heal namespace. Those hold the broker socket path,
+    // the verification HMAC signing key, the webhook/master secrets and the
+    // run-as uid/gid — none of which codex (least of all the dropped `ocheal`
+    // repair session) may read. Strip the whole `OC_SELFHEAL_` prefix here so a
+    // compromised codex cannot forge a signed verification or bypass the broker.
+    // Harmless for every non-self-heal agent (they never use these vars).
+    for (const k of Object.keys(spawnEnv)) {
+      if (k.startsWith('OC_SELFHEAL_')) delete spawnEnv[k]
+    }
+    // ── Self-heal OS privilege drop ──────────────────────────────────────────
+    // Only agents that carry `runAsUser` (allowlisted to `ocheal`, see
+    // storage/config.ts) drop privileges; for every other agent `privilegeDrop`
+    // stays undefined and the spawn options below are identical to the historical
+    // launch (zero regression). Resolution is fail-CLOSED: a set-but-misconfigured
+    // identity throws here (rejecting the turn) rather than launching codex as
+    // root — the whole point of the self-heal security boundary.
+    let privilegeDrop: { uid: number; gid: number } | undefined
+    if (this.opts.runAsUser) {
+      const ids = resolveRunAsUserIds(this.opts.runAsUser)
+      privilegeDrop = ids
+      // The dropped process must not inherit the gateway (root) HOME — codex
+      // would try to read/write /root and fail as the unprivileged user. Point
+      // it at the run-as user's own home (env override for block C, else the
+      // conventional /home/<user>) and fix USER/LOGNAME to match.
+      const home = process.env.OC_SELFHEAL_OCHEAL_HOME || `/home/${this.opts.runAsUser}`
+      spawnEnv.HOME = home
+      spawnEnv.USER = this.opts.runAsUser
+      spawnEnv.LOGNAME = this.opts.runAsUser
+      log.info('codex app-server spawning with OS privilege drop', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        runAsUser: this.opts.runAsUser,
+        uid: ids.uid,
+        gid: ids.gid,
+      })
+    }
+    // Build the launch command. For a privilege-drop agent we wrap codex in
+    // `setpriv` rather than using Node's uid/gid spawn options, because Node
+    // CANNOT clear supplementary groups (Codex HIGH #8): a plain uid/gid drop
+    // would let the dropped codex inherit the root gateway's docker/root group
+    // membership and reach group-readable secrets or the docker socket. setpriv
+    // sets reuid/regid AND clears ALL supplementary groups in one exec-replace,
+    // so codex keeps exactly its primary gid (ocheal's — the minimum needed to
+    // reach the broker socket) and nothing else. setpriv must start as root, so
+    // we do NOT also set Node's uid/gid.
+    let spawnCmd = 'codex'
+    let spawnArgs = args
+    if (privilegeDrop) {
+      spawnCmd = 'setpriv'
+      spawnArgs = [
+        '--reuid',
+        String(privilegeDrop.uid),
+        '--regid',
+        String(privilegeDrop.gid),
+        '--clear-groups',
+        '--',
+        'codex',
+        ...args,
+      ]
+    }
+    const proc = _spawnFn(spawnCmd, spawnArgs, {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildCodexEnv({ proxyUrl: this.opts.proxyUrl }),
+      env: spawnEnv,
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     proc.stdout.on('data', (chunk: Buffer) => {
