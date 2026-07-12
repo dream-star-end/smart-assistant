@@ -68,8 +68,13 @@ import { promoteOnce } from "../compute-pool/imagePromote.js";
 import { observeContainerEnsureDuration } from "../admin/metrics.js";
 import { isV5Channel } from "../runtimeChannel.js";
 import { randomUUID } from "node:crypto";
+import { basename as pathBasename } from "node:path";
 import { request as httpRequest } from "node:http";
 import { computeInboundNonce } from "../bridgeSecret.js";
+import {
+  RUNTIME_RELEASE_LABEL_KEY,
+  RUNTIME_BOOT_HASH_LABEL_KEY,
+} from "./platformBundle.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -291,6 +296,91 @@ export function buildReadinessOpts(opts: EnsureRunningOptions): WaitContainerRea
 }
 
 /**
+ * runtimeStale 判定结果。stale=是否需要回收;reasons 供日志(泛化自旧 stale-image)。
+ */
+interface RuntimeStaleResult {
+  stale: boolean;
+  reasons: string[];
+}
+
+/**
+ * desired runtime 三元组(makeV3EnsureRunning 闭包 setup 时从 deps.runtimeTuple 一次性算出)。
+ * 纯字符串派生,无 IO —— bootHash/imageId 直取,release 取 releasePath 的 basename。
+ * 昂贵的 bundle 全量校验在 index.ts 启动期做,这里只消费其结果。
+ */
+interface DesiredRuntime {
+  imageId?: string;
+  release?: string;
+  bootHash?: string;
+}
+
+function deriveDesiredRuntime(deps: V3SupervisorDeps): DesiredRuntime {
+  const t = deps.runtimeTuple;
+  if (!t) return {};
+  const imageId = t.imageId?.trim() || undefined;
+  const release = t.releasePath ? pathBasename(t.releasePath) : undefined;
+  const bootHash = t.bootHash?.trim() || undefined;
+  return { imageId, release, bootHash };
+}
+
+/**
+ * runtimeStale 泛化(plan §1.4):运行中容器是否需要回收重建。
+ *   stale = imageStale ∨ releaseStale ∨ bootHashStale
+ *
+ *   - imageStale:
+ *       · desired.imageId 有(部署已填 OC_RUNTIME_IMAGE_ID)→ 用 **immutable image ID** 比较
+ *         (status.imageId != desired.imageId);拿不到 status.imageId(远端未扩契约)→ **保守不判 stale**
+ *         (行为同旧,避免误回收远端)。同 tag 重指新镜像也能判出(plan R2-M4)。
+ *       · desired.imageId 空(过渡兼容)→ 回落 **tag 比较**(status.image != deps.image),即旧 imageStale。
+ *   - releaseStale(desired.release 非空才评估):容器 release label != desired.release。label 缺失
+ *     (旧容器 / 未扩契约远端)+ desired 非空 → stale(fail toward converge,滚动升级抵达存量容器)。
+ *   - bootHashStale(desired.bootHash 非空才评估):同 release,比 boot_hash label。
+ *
+ * desired 三字段全空(v3 常态 / 未配 tuple)→ 退化为纯 tag imageStale,行为逐字节同旧。
+ */
+function computeRuntimeStale(
+  status: V3ContainerStatus,
+  deps: V3SupervisorDeps,
+  desired: DesiredRuntime,
+): RuntimeStaleResult {
+  const reasons: string[] = [];
+  if (status.state !== "running") return { stale: false, reasons };
+
+  // (a) image staleness
+  if (desired.imageId) {
+    // 有不可变 ID 权威:只有拿到容器 imageId 才比较(拿不到=保守放行,行为同旧)。
+    if (typeof status.imageId === "string" && status.imageId !== desired.imageId) {
+      reasons.push(`image_id ${status.imageId} != ${desired.imageId}`);
+    }
+  } else if (
+    typeof status.image === "string" &&
+    typeof deps.image === "string" &&
+    status.image !== deps.image
+  ) {
+    // 过渡兼容:tag 比较(旧 imageStale)。
+    reasons.push(`image_tag ${status.image} != ${deps.image}`);
+  }
+
+  // (b) release label staleness(desired 非空才评估)
+  if (desired.release) {
+    const cur = status.labels?.[RUNTIME_RELEASE_LABEL_KEY];
+    if (cur !== desired.release) {
+      reasons.push(`release ${cur ?? "<missing>"} != ${desired.release}`);
+    }
+  }
+
+  // (c) boot_hash label staleness(desired 非空才评估)
+  if (desired.bootHash) {
+    const cur = status.labels?.[RUNTIME_BOOT_HASH_LABEL_KEY];
+    if (cur !== desired.bootHash) {
+      reasons.push(`boot_hash ${cur ?? "<missing>"} != ${desired.bootHash}`);
+    }
+  }
+
+  return { stale: reasons.length > 0, reasons };
+}
+
+/**
  * Phase 3D 主入口 — bridge 注入这个 lambda 给 resolveContainerEndpoint。
  *
  * 闭包持 V3SupervisorDeps + EnsureRunningOptions。返回的函数签名严格匹配
@@ -339,6 +429,8 @@ export function makeV3EnsureRunning(
   const applyV5StalePolicy = options.runtimeChannelForTest
     ? options.runtimeChannelForTest === "v5"
     : isV5Channel();
+  // desired runtime 三元组:闭包 setup 时一次性算出(纯字符串派生,无 IO)。
+  const desiredRuntime = deriveDesiredRuntime(deps);
 
   return async function ensureRunning(uidBig: bigint): Promise<{
     host: string;
@@ -389,17 +481,18 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
     }
 
-    // 镜像滚动回收:运行中容器的实际镜像 != 目标镜像(发版换了新 tag)→ 视作过期,不复用,
-    // 落到下方 (2b) stopAndRemove + 用 deps.image 重建。根治"存量长活容器一直跑旧镜像/旧行为
-    // (旧 permissionMode / baseline / CLI),要等 idle 回收或 crash 才换新版"的问题。
-    // remote 容器 image 暂为 undefined → 不触发(行为同旧,纵深安全)。
-    const imageStale =
-      status?.state === "running" &&
-      typeof status.image === "string" &&
-      typeof deps.image === "string" &&
-      status.image !== deps.image;
-    let recycleStaleImage = imageStale;
-    if (imageStale && applyV5StalePolicy) {
+    // runtime 滚动回收(泛化自旧 imageStale,plan §1.4):运行中容器 image_id / release /
+    // boot_hash 任一 != desired → 视作过期,不复用,落到下方 (2b) stopAndRemove + 用 deps.image +
+    // 当前 tuple 重建。根治"存量长活容器一直跑旧镜像/旧源码/旧 entrypoint-seed,要等 idle 回收
+    // 或 crash 才换新版"的问题。desired 三元组全空(v3 常态)→ 退化为旧 tag imageStale,行为同旧。
+    // 既有 v5 drain / 最近活跃延迟状态机**不动**,只换判定输入(imageStale → runtimeStale)。
+    const runtimeStale = status
+      ? computeRuntimeStale(status, deps, desiredRuntime)
+      : { stale: false, reasons: [] as string[] };
+    // 变量名保留 recycleStaleImage + 日志保留 "stale-image" 字样(兼容既有 grep / 告警规则);
+    // 新增 staleReasons 字段承载泛化后的具体原因(image_id/release/boot_hash)。
+    let recycleStaleImage = runtimeStale.stale;
+    if (runtimeStale.stale && applyV5StalePolicy) {
       const force = options.forceStaleImageRecycle
         ?? process.env.OC_V5_FORCE_STALE_IMAGE_RECYCLE === "1";
       const lastActivityMs = status?.lastWsActivity?.getTime();
@@ -412,6 +505,7 @@ export function makeV3EnsureRunning(
         console.info("[v3ensureRunning] stale-image recycle deferred", {
           uid,
           reason: "recent_activity",
+          staleReasons: runtimeStale.reasons,
           idleMs: Math.max(0, wallNow() - (lastActivityMs as number)),
         });
       } else if (!force && status) {
@@ -421,11 +515,13 @@ export function makeV3EnsureRunning(
           console.warn("[v3ensureRunning] stale-image recycle deferred", {
             uid,
             reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+            staleReasons: runtimeStale.reasons,
           });
         }
       } else if (force) {
         console.warn("[v3ensureRunning] forced stale-image recycle may terminate active work", {
           uid,
+          staleReasons: runtimeStale.reasons,
         });
       }
     }
@@ -434,6 +530,7 @@ export function makeV3EnsureRunning(
         uid,
         current: status?.image,
         desired: deps.image,
+        staleReasons: runtimeStale.reasons,
       });
     }
 

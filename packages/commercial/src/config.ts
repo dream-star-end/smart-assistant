@@ -302,6 +302,32 @@ const egressSecret = z.string().trim().min(16).optional();
 const ocRuntimeImage = z.string().trim().min(1).max(256).optional();
 
 /**
+ * V5 runtime tuple 热生效改造(docs/V5_RUNTIME_HOTCFG_PLAN.md §1)。全 optional ——
+ * v3 / 未开热生效时缺失,supervisor 走旧路径零行为变化;v5 生产由 deploy-v5.sh 激活 saga
+ * 注入完整 tuple(env + current 翻转)。
+ *
+ *   - OC_RUNTIME_IMAGE_ID:部署验证过的 immutable image ID(sha256:...)。缺省 → runtimeStale
+ *     回落 tag 比较(**部署后必填**,否则同 tag 重指新镜像漏判)。不强制 sha256: 前缀格式
+ *     (docker daemon 版本文案有差异),仅非空。
+ *   - OC_PLATFORM_BUNDLE:bundles/<bundleRev12> 绝对路径(内容 digest 命名,不可变)。
+ *   - OC_RUNTIME_RELEASE:releases/rel-<digest12> 绝对路径(源码树 + node_modules + ccb dist)。
+ *   - OC_PLATFORM_ROOT / OC_RUNTIME_RELEASES_ROOT:稳定根 / releases 根覆盖(默认见 platformBundle.ts
+ *     DEFAULT_PLATFORM_ROOT / DEFAULT_RUNTIME_RELEASES_ROOT);一般不配,测试 / 非标准布局才覆盖。
+ *   - OC_RUNTIME_EMERGENCY_TUPLE:一条完整 pinned tuple 的不透明快照(plan §1.1 R2-M6),
+ *     由 deploy checklist 维护;master 不解析内容,仅透传 / 记录(GC 保护集 / 回滚锚点)。
+ *   - OC_PLATFORM_BUNDLE_OPTIONAL:dev 逃生开关(0/1)。生产禁;缺 bundle 时 warn+跳过而非 fail-closed。
+ *     实际 gate 由 supervisor readPlatformBundleOptionalFromEnv 直读 process.env(与 baseline OPTIONAL
+ *     同范式);此处仅纳入 schema 做校验/文档化。
+ */
+const ocRuntimeImageId = z.string().trim().min(1).max(256).optional();
+const ocPlatformBundle = absolutePath("OC_PLATFORM_BUNDLE");
+const ocRuntimeRelease = absolutePath("OC_RUNTIME_RELEASE");
+const ocPlatformRoot = absolutePath("OC_PLATFORM_ROOT");
+const ocRuntimeReleasesRoot = absolutePath("OC_RUNTIME_RELEASES_ROOT");
+const ocRuntimeEmergencyTuple = z.string().trim().min(1).max(2048).optional();
+const ocPlatformBundleOptional = z.enum(["0", "1"]).optional().transform((v) => v === "1");
+
+/**
  * v3 file proxy feature flag —— 开启后 /api/file / /api/media/* 的 GET 会走
  * `containerFileProxy` 代理到用户容器。OFF(默认) = 继续走 `BLOCKED_FOR_USER_RULES`
  * 返 403,与上线前一致。
@@ -431,6 +457,14 @@ export const commercialConfigSchema = z
     INTERNAL_CONTROL_PORT: internalControlPort,
     OC_EGRESS_SECRET: egressSecret,
     OC_RUNTIME_IMAGE: ocRuntimeImage,
+    // V5 runtime tuple 热生效改造(见上方各字段定义)。
+    OC_RUNTIME_IMAGE_ID: ocRuntimeImageId,
+    OC_PLATFORM_BUNDLE: ocPlatformBundle,
+    OC_RUNTIME_RELEASE: ocRuntimeRelease,
+    OC_PLATFORM_ROOT: ocPlatformRoot,
+    OC_RUNTIME_RELEASES_ROOT: ocRuntimeReleasesRoot,
+    OC_RUNTIME_EMERGENCY_TUPLE: ocRuntimeEmergencyTuple,
+    OC_PLATFORM_BUNDLE_OPTIONAL: ocPlatformBundleOptional,
     FILE_PROXY_ENABLED: fileProxyEnabled,
     FEATURE_REMOTE_SSH: featureRemoteSsh,
     R7_GCS_BUCKET: r7GcsBucket,

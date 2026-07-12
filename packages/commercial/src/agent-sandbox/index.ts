@@ -52,12 +52,46 @@ export {
   DEFAULT_V3_CCB_BASELINE_DIR,
   V3_CCB_BASELINE_SKILL_NAMES,
   resolveCcbBaselineMounts,
+  readPlatformBundleOptionalFromEnv,
   type V3SupervisorDeps,
+  type V3RuntimeTuple,
   type ProvisionedV3Container,
   type V3ContainerStatus,
   type V3ImagePreheatResult,
   type V3VolumeBundle,
 } from "./v3supervisor.js";
+
+// V5 runtime tuple —— platform bundle / runtime release 校验与挂载解析(热生效改造,plan §1)。
+export {
+  resolvePlatformBundleMount,
+  assertCurrentMatches,
+  resolveRuntimeReleaseMount,
+  assertBaselineLeaf,
+  assertSafeAncestry,
+  manifestDigestOf,
+  bootHashOf,
+  DEFAULT_PLATFORM_ROOT,
+  DEFAULT_RUNTIME_RELEASES_ROOT,
+  PLATFORM_MOUNT_TARGET,
+  RELEASE_MOUNT_TARGET,
+  RUNTIME_IMAGE_ID_LABEL_KEY,
+  RUNTIME_RELEASE_LABEL_KEY,
+  RUNTIME_BUNDLE_REV_LABEL_KEY,
+  RUNTIME_BOOT_HASH_LABEL_KEY,
+  RUNTIME_EMBED_SOURCE_LABEL_KEY,
+  OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE,
+  OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
+  OPENCLAUDE_WEB_CONTEXT_BIN_VALUE,
+  PLATFORM_BUNDLE_TOP_LEVEL,
+  PLATFORM_BUNDLE_FILE_EXTENSIONS,
+  PLATFORM_BUNDLE_MAX_FILE_BYTES,
+  PLATFORM_BUNDLE_MAX_TOTAL_BYTES,
+  PLATFORM_BUNDLE_MAX_DEPTH,
+  PLATFORM_BUNDLE_MAX_ENTRIES,
+  type ManifestFileEntry,
+  type PlatformBundleManifest,
+  type ResolvedPlatformBundle,
+} from "./platformBundle.js";
 
 // V3 Phase 3D — bridge(/ws/user-chat-bridge)resolveContainerEndpoint 实现
 export {

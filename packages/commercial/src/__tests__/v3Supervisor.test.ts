@@ -511,14 +511,21 @@ describe("provisionV3Container", () => {
   let pool: FakePool;
   // 基线 fail-closed 默认启用;这些 happy-path 测试不关心基线内容,设 OPTIONAL 降级
   // 为 warn+skip,避免触发 CcbBaselineMissing。基线专项测试在下一个 describe 里。
+  // OC_PLATFORM_BUNDLE_OPTIONAL=1 同理:v5 runtime tuple 上线后 v5 channel 缺 bundle 默认
+  // fail-closed(供 dev 降级),本组不关心 bundle 内容(B6 用例走 v5 channel),降级避免拒 provision。
   let prevOptional: string | undefined;
+  let prevBundleOptional: string | undefined;
   before(() => {
     prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    prevBundleOptional = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
   });
   after(() => {
     if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+    if (prevBundleOptional === undefined) delete process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    else process.env.OC_PLATFORM_BUNDLE_OPTIONAL = prevBundleOptional;
   });
   beforeEach(() => {
     pool = new FakePool();
@@ -969,10 +976,15 @@ describe("provisionV3Container", () => {
 describe("provisionV3Container — docker create NameConflict 自愈", () => {
   let pool: FakePool;
   let prevOptional: string | undefined;
+  let prevBundleOptional: string | undefined;
   let savedChannel: string | undefined;
   before(() => {
     prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    // v5 runtime tuple 上线后 v5 channel 缺 OC_PLATFORM_BUNDLE 默认 fail-closed;本组不测 bundle,
+    // 设 OPTIONAL=1 降级(dev 逃生),让 NameConflict 自愈用例在无 bundle 的单元环境里跑过。
+    prevBundleOptional = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
     // 事故 channel = v5(容器名 oc-v5-u1)。v5 provision 跳过 v3MayServe 门控
     // (它走全局 getPool → 无 DATABASE_URL 会抛 ConfigError,是既有基线失败源),
     // 故这里显式 v5:既忠实复现事故,又让自愈用例可在无 DB 的单元环境里独立跑过。
@@ -982,6 +994,8 @@ describe("provisionV3Container — docker create NameConflict 自愈", () => {
   after(() => {
     if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+    if (prevBundleOptional === undefined) delete process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    else process.env.OC_PLATFORM_BUNDLE_OPTIONAL = prevBundleOptional;
     if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
     else process.env.OC_RUNTIME_CHANNEL = savedChannel;
   });

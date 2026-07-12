@@ -50,9 +50,9 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
-import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
+import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
@@ -76,6 +76,24 @@ import {
   removeCodexContainerAuthDir,
   writeCodexContainerAuthFile,
 } from "../codex-auth/codexAuthFile.js";
+import {
+  // 单一实现:baseline / bundle / release 共用的 leaf 不变量(原在本文件,已移入 platformBundle)。
+  assertBaselineLeaf,
+  assertCurrentMatches,
+  resolveRuntimeReleaseMount,
+  DEFAULT_PLATFORM_ROOT,
+  DEFAULT_RUNTIME_RELEASES_ROOT,
+  PLATFORM_MOUNT_TARGET,
+  RELEASE_MOUNT_TARGET,
+  RUNTIME_IMAGE_ID_LABEL_KEY,
+  RUNTIME_RELEASE_LABEL_KEY,
+  RUNTIME_BUNDLE_REV_LABEL_KEY,
+  RUNTIME_BOOT_HASH_LABEL_KEY,
+  RUNTIME_EMBED_SOURCE_LABEL_KEY,
+  OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE,
+  OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
+  OPENCLAUDE_WEB_CONTEXT_BIN_VALUE,
+} from "./platformBundle.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 常量(硬编码,设计有意为之)
@@ -483,51 +501,12 @@ function readCcbBaselineOptionalFromEnv(): boolean {
 }
 
 /**
- * 校验单个 baseline 叶子路径(文件或目录):
- *   - lstat 必须是对应类型(`file` / `dir`),**拒绝 symlink**(避免把 /etc/shadow 之类
- *     挂进容器 ro 暴露)
- *   - realpath 必须严格在 baselineRoot 下(把"软链逃逸到 baseline 外"堵死)
- *   - owner 必须是 root(uid=0)—— 非 root owned 说明部署态失控,直接拒
- *   - mode 不允许 group/other 可写(020/002),防 baseline 被非 root 用户改
- *
- * 返回 normalized 绝对路径(和 realpath 一致,消除软链影响),失败抛 Error(调用方捕获)。
- */
-function assertBaselineLeaf(
-  leafPath: string,
-  expected: "file" | "dir",
-  baselineRoot: string,
-): string {
-  const st = lstatSync(leafPath);
-  if (st.isSymbolicLink()) {
-    throw new Error(`baseline leaf is a symlink: ${leafPath}`);
-  }
-  if (expected === "file" && !st.isFile()) {
-    throw new Error(`baseline leaf is not a regular file: ${leafPath}`);
-  }
-  if (expected === "dir" && !st.isDirectory()) {
-    throw new Error(`baseline leaf is not a directory: ${leafPath}`);
-  }
-  if (st.uid !== 0) {
-    throw new Error(`baseline leaf not owned by root (uid=${st.uid}): ${leafPath}`);
-  }
-  // 低 3 位按 rwx for user/group/other。要求 group-write & other-write 都为 0。
-  if ((st.mode & 0o022) !== 0) {
-    throw new Error(
-      `baseline leaf group/other writable (mode=${(st.mode & 0o777).toString(8)}): ${leafPath}`,
-    );
-  }
-  // realpath 双重兜底:确保最终 bind 源不在 baselineRoot 外面
-  const real = realpathSync(leafPath);
-  const rootReal = realpathSync(baselineRoot);
-  // 允许 real === rootReal(baseline 根本身也允许),否则要求 real 在 rootReal 下
-  if (real !== rootReal && !real.startsWith(rootReal + pathSep)) {
-    throw new Error(`baseline leaf realpath escapes baselineRoot: ${leafPath} → ${real}`);
-  }
-  return real;
-}
-
-/**
  * 校验 baseline 目录是否齐全 + 返回可直接拼 docker Bind 的绝对路径。
+ *
+ * 注:单文件/单目录的 leaf 不变量(owner=root / 非 group-other 可写 / 非 symlink /
+ * realpath 不逃逸)由 `assertBaselineLeaf`(已移入 platformBundle.ts,单一实现;
+ * baseline / platform bundle / release 三条链共用)提供,本函数在其之上叠加
+ * "skills/ 顶层集合 ≡ manifest"的强约束。
  *
  * 严格校验(按顺序):
  *   1. 输入是非空字符串
@@ -802,6 +781,54 @@ export async function acquireHostCapLock(
 // ───────────────────────────────────────────────────────────────────────
 
 /**
+ * v5 runtime tuple(热生效改造,plan §1)。仅 v5 channel + 显式配置时真正生效。
+ *
+ * 分工:
+ *   - provision:挂平台稳定根(→ /run/oc/platform:ro)+ release(→ /opt/openclaude:ro)、
+ *     打 4 个 runtime label、注入 3 个平台 env。**昂贵的全量 bundle 校验(逐文件 sha256)
+ *     不在这里做**,而在 index.ts 启动期一次性 resolvePlatformBundleMount / resolveRuntimeReleaseMount
+ *     完成后把结果(bundleRev/bootHash/resolved 路径)灌进本结构;provision 每次只做便宜的
+ *     `assertCurrentMatches`(current symlink realpath 对照,防激活中间态)。
+ *   - ensureRunning:desired 三元组(imageId / release / bootHash)做 runtimeStale 判定。
+ *
+ * 字段全 optional:未配置(v3 常态)→ 整套逻辑跳过,provision/ensureRunning 行为逐字节同旧。
+ */
+export interface V3RuntimeTuple {
+  /**
+   * OC_RUNTIME_IMAGE_ID —— 部署时验证过的 immutable image ID(sha256:...)。
+   * label image_id 值 + runtimeStale 的 desired imageId。缺省 → runtimeStale 回落 tag 比较
+   * (过渡兼容;**部署后必填**,否则同 tag 重指新镜像漏判,见 plan §1.1 R2-M4)。
+   */
+  imageId?: string;
+  /** OC_PLATFORM_BUNDLE —— bundles/<bundleRev12>(内容 digest 命名)。assertCurrentMatches 对照目标。 */
+  bundlePath?: string;
+  /** 启动期解析:bundle realpath(== platform current 目标)。 */
+  bundleResolvedPath?: string;
+  /** 启动期解析:bundleRev(= digest12 = bundle 目录名)。label bundle_rev。 */
+  bundleRev?: string;
+  /** 启动期解析:bootHash(entrypoint/+seed/ 子集)。label boot_hash + runtimeStale desired。 */
+  bootHash?: string;
+  /** OC_RUNTIME_RELEASE —— releases/rel-<digest12>。 */
+  releasePath?: string;
+  /** 启动期解析:release realpath(bind /opt/openclaude:ro 的源;绝不挂 symlink)。 */
+  releaseResolvedPath?: string;
+  /** 平台稳定根(默认 DEFAULT_PLATFORM_ROOT);挂 /run/oc/platform:ro + assertCurrentMatches。 */
+  platformRoot?: string;
+  /** releases 根(默认 DEFAULT_RUNTIME_RELEASES_ROOT);release realpath 必在其下。 */
+  releasesRoot?: string;
+}
+
+/**
+ * 读 env `OC_PLATFORM_BUNDLE_OPTIONAL`:只有显式 "1"/"true"/"yes" 才 true(fail-closed)。
+ * 语义同 OC_V3_CCB_BASELINE_OPTIONAL:**生产禁止设置** —— 缺 bundle 时 warn+跳过挂载/label/env,
+ * 容器照起(仅 dev/test/local 用)。默认(未设)→ v5 fail-closed 拒 provision。
+ */
+export function readPlatformBundleOptionalFromEnv(): boolean {
+  const raw = process.env.OC_PLATFORM_BUNDLE_OPTIONAL?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
  * provisionV3Container 的依赖注入。
  *
  * - `docker`:dockerode client(index.ts 单例)
@@ -894,6 +921,12 @@ export interface V3SupervisorDeps {
    * 测试可注入 fake 列表精确控制 host 维度。
    */
   listAllHosts?: () => Promise<ComputeHostRow[]>;
+  /**
+   * v5 runtime tuple(热生效改造,plan §1)。见 `V3RuntimeTuple`。
+   * 未注入 → provision/ensureRunning 的平台 bundle / release / label / stale 逻辑整体跳过,
+   * 行为逐字节同旧(v3 常态)。
+   */
+  runtimeTuple?: V3RuntimeTuple;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -940,10 +973,24 @@ export interface V3ContainerStatus {
   lastWsActivity: Date | null;
   /**
    * 运行容器实际镜像(docker inspect 的 Config.Image,如 openclaude/...:v5-ccb-<sha>)。
-   * 供 ensureRunning 比对 deps.image 做"镜像不符→滚动回收"。本地路径可取;remote
-   * containerService.inspect 暂不返回时为 undefined(不触发回收,行为同旧)。
+   * 供 ensureRunning 比对 deps.image 做"镜像不符→滚动回收"(desired imageId 缺省时的 tag 回落)。
+   * 本地路径可取;remote containerService.inspect 暂不返回时为 undefined(不触发回收,行为同旧)。
    */
   image?: string;
+  /**
+   * 运行容器 immutable image ID(docker inspect 的 **`Image`** 字段,= 镜像 config digest)。
+   * 供 runtimeStale 用不可变 ID 判定"同 tag 重指新镜像"(plan §1.1 R2-M4)。
+   * 本地 dockerode 直取;远端 containerService.inspect 契约未扩展前为 undefined
+   * (desired imageId 非空时 runtimeStale 保守不因 imageId 判 stale,避免误回收远端,行为同旧)。
+   */
+  imageId?: string;
+  /**
+   * 运行容器 labels(docker inspect 的 Config.Labels),含 4 个 runtime label
+   * (image_id/release/bundle_rev/boot_hash)。供 runtimeStale 比 release/boot_hash desired。
+   * 本地 dockerode 直取;远端未扩契约时为 undefined —— runtimeStale 对"label 缺失 + desired 非空"
+   * 视作 stale(fail toward converge,plan 要求;但多机 + release 已由 provision 硬门拒,不实际发生)。
+   */
+  labels?: Record<string, string>;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1287,6 +1334,71 @@ async function assertImageHasV3Sink(
   throw new SupervisorError(
     "ImageOutdated",
     `runtime image missing required feature label: ${detail}`,
+  );
+}
+
+/**
+ * inspect 镜像 labels(facade / monolith 双路径,与 assertImageHasV3Sink 同结构)。
+ *   - image absent(404)→ null(让 ImageNotFound 路径接管,本 guard 不抢)
+ *   - inspect 抛(daemon down / 旧 agent 无路由)→ 透 wrapDockerError
+ * 返回 labels map(可能空对象)。
+ */
+async function inspectRuntimeImageLabels(
+  deps: V3SupervisorDeps,
+  hostId: string | undefined,
+  image: string,
+): Promise<Record<string, string> | null> {
+  const resolvedHost = hostId ?? deps.selfHostId ?? "self";
+  try {
+    if (deps.containerService) {
+      const inspected = await deps.containerService.inspectImage(resolvedHost, image);
+      return inspected === null ? null : (inspected.labels ?? {});
+    }
+    try {
+      const info = (await deps.docker.getImage(image).inspect()) as {
+        Config?: { Labels?: Record<string, string> | null };
+      };
+      return info.Config?.Labels ?? {};
+    } catch (err) {
+      if ((err as { statusCode?: number } | null)?.statusCode === 404) return null;
+      throw err;
+    }
+  } catch (err) {
+    throw wrapDockerError(err);
+  }
+}
+
+/**
+ * 瘦身镜像护栏(plan §1.1 / §3.2):
+ *   - 镜像 label `oc.runtime.embed_source=0`(未内嵌源码)且未配 OC_RUNTIME_RELEASE
+ *     → 拒 provision(容器 /opt/openclaude 会是空挂载点,gateway 起不来 = 裸奔)。
+ *   - label 缺失 / 不为 "0"(旧胖镜像 EMBED_SOURCE=1)→ 放行(兼容,不破存量)。
+ *   - image absent(inspect 返 null)→ 放行,后续 docker create 撞 ImageNotFound 走原路径。
+ *
+ * 早于 BEGIN 调,失败不留半事务。
+ */
+async function assertRuntimeSourcePresent(
+  deps: V3SupervisorDeps,
+  hostId: string | undefined,
+  image: string,
+  releasePath: string | undefined,
+): Promise<void> {
+  // 有 release → 源码有兜底,无需 inspect(省一次 image inspect)。
+  if (releasePath && releasePath.trim() !== "") return;
+  const labels = await inspectRuntimeImageLabels(deps, hostId, image);
+  if (labels === null) return; // image absent — 让 ImageNotFound 接管
+  const embed = (labels[RUNTIME_EMBED_SOURCE_LABEL_KEY] ?? "").trim();
+  // 拿不到 label 或非 "0" → 视为内嵌源码(embed_source=1),兼容放行。
+  if (embed !== "0") return;
+  const resolvedHost = hostId ?? deps.selfHostId ?? "self";
+  // eslint-disable-next-line no-console
+  console.error(
+    "[v3supervisor] slim image (oc.runtime.embed_source=0) with empty OC_RUNTIME_RELEASE; refusing provision",
+    { image, host: resolvedHost },
+  );
+  throw new SupervisorError(
+    "InvalidArgument",
+    `slim runtime image (${RUNTIME_EMBED_SOURCE_LABEL_KEY}=0) requires OC_RUNTIME_RELEASE; got empty (image=${image} host=${resolvedHost})`,
   );
 }
 
@@ -1947,6 +2059,24 @@ export async function provisionV3Container(
   // 正常路径已由 v3ensureRunning 跳过多机 schedulePlacement(placement=undefined →
   // effectiveHostUuid=selfHostId → useRemote=false)保证;此处兜底防 future caller 误传
   // 远端 hostId,或 host 池增长后 schedulePlacement 被错误启用。fail-closed 优于静默跨网段。
+  // 多机硬门(plan §3.2 R1-M8):OC_RUNTIME_RELEASE 非空 + placement 非 self-host(useRemote)
+  // → 拒 provision。release 树只存在于 master 本机(releases 根 + ro 挂),远端 host 无对应目录
+  // 与分发机制(登记为债:分发触发=新增 compute host)。若允许调度到远端,容器会挂不到源码树
+  // 或误挂本机路径 → fail-closed 优于静默裸奔。早于 BEGIN / docker 副作用抛。
+  // **置于 v5-local-only 门之前**:release 是跨 channel 语义(v3 多机也拦),放前面语义更精确
+  // (v5+remote 无 release 才落到下面 v5-local-only 通用门)。
+  if (deps.runtimeTuple?.releasePath && useRemote) {
+    // eslint-disable-next-line no-console
+    console.error(
+      "[v3supervisor] OC_RUNTIME_RELEASE set but placement is a remote host; refusing provision (release tree is master-local only)",
+      { uid, hostId: effectiveHostUuid, selfHostId: deps.selfHostId, releasePath: deps.runtimeTuple.releasePath },
+    );
+    throw new SupervisorError(
+      "InvalidArgument",
+      `runtime release requires self-host placement; remote host ${effectiveHostUuid} forbidden (release=${deps.runtimeTuple.releasePath})`,
+    );
+  }
+
   if (useRemote && getRuntimeChannel() === "v5") {
     throw new SupervisorError(
       "InvalidArgument",
@@ -1958,6 +2088,12 @@ export async function provisionV3Container(
   // 缺 v3-sink token 直接抛 ImageOutdated。早于 BEGIN / docker create,失败不留
   // 半事务和 docker 副作用。模式 OC_V3_IMAGE_GUARD ∈ enforce/warn/off,缺省 enforce。
   await assertImageHasV3Sink(deps, hostId, deps.image);
+
+  // 瘦身镜像护栏(plan §1.1 / §3.2):镜像 label oc.runtime.embed_source=0(未内嵌源码)
+  // 且 OC_RUNTIME_RELEASE 为空 → 拒 provision(裸奔:容器 /opt/openclaude 无源码,gateway 起不来)。
+  // 拿不到 label(inspect 失败 / label 缺失)→ 视为 embed_source=1(旧胖镜像)兼容放行。
+  // 早于 BEGIN,失败不留半事务。
+  await assertRuntimeSourcePresent(deps, hostId, deps.image, deps.runtimeTuple?.releasePath);
 
   // ═══ Tx1:短事务,持 per-uid + per-host 双锁,亚毫秒完成 ═══
   // BEGIN → acquireUserLifecycleLock(per-uid)→ dup 复查 → acquireHostCapLock(per-host)
@@ -2278,6 +2414,119 @@ export async function provisionV3Container(
       }
     }
 
+    // ═══ v5 runtime tuple:platform bundle + release 挂载 / 4 label / 3 注入 env(plan §1/§3.2)═══
+    //   - v5 channel:fail-closed。配了 OC_PLATFORM_BUNDLE → 挂稳定根 /run/oc/platform:ro +
+    //     assertCurrentMatches(current==bundle,防激活中间态)+ release ro 挂 /opt/openclaude +
+    //     打 4 label + 注入 3 env。缺 bundle / current 不一致 → 拒 provision(OC_PLATFORM_BUNDLE_OPTIONAL=1
+    //     才 warn+跳过,**生产禁**)。
+    //   - v3 channel:零行为变化。仅当误配 tuple 时 warn 提示忽略,不挂/不打 label/不注入 env。
+    // 昂贵的全量 bundle 校验(逐文件 sha256)已在 index.ts 启动期做过(结果灌进 deps.runtimeTuple);
+    // 这里每次 provision 只做便宜的 assertCurrentMatches(两次 realpath)。
+    const platformBinds: string[] = [];
+    let runtimeLabels: Record<string, string> = {};
+    let injectPlatformEnv = false;
+    {
+      const tuple = deps.runtimeTuple;
+      if (getRuntimeChannel() === "v5") {
+        const bundleOptional = readPlatformBundleOptionalFromEnv();
+        // 判定"配置是否就绪":bundlePath 给了 + 启动期解析成功(bundleRev/bootHash/resolved 齐)。
+        const bundleReady = Boolean(
+          tuple?.bundlePath && tuple.bundleResolvedPath && tuple.bundleRev && tuple.bootHash,
+        );
+        if (!tuple?.bundlePath) {
+          if (bundleOptional) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              "[v3supervisor] OC_PLATFORM_BUNDLE unset (OPTIONAL=1); v5 container spawns WITHOUT platform bundle (no hot config)",
+              { uid },
+            );
+          } else {
+            // eslint-disable-next-line no-console
+            console.error(
+              "[v3supervisor] OC_PLATFORM_BUNDLE unset on v5 channel; refusing provision (set OC_PLATFORM_BUNDLE_OPTIONAL=1 to override in dev)",
+              { uid },
+            );
+            throw new SupervisorError(
+              "InvalidArgument",
+              "v5 channel requires OC_PLATFORM_BUNDLE (platform bundle) to be configured",
+            );
+          }
+        } else if (!bundleReady) {
+          // bundlePath 配了但启动期解析失败(index.ts resolvePlatformBundleMount 抛)→ deps 里缺
+          // bundleRev/bootHash。fail-closed(OPTIONAL 才降级)。
+          if (bundleOptional) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation (OPTIONAL=1); skipping platform bundle mount",
+              { uid, bundlePath: tuple.bundlePath },
+            );
+          } else {
+            // eslint-disable-next-line no-console
+            console.error(
+              "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation; refusing provision",
+              { uid, bundlePath: tuple.bundlePath },
+            );
+            throw new SupervisorError(
+              "InvalidArgument",
+              `platform bundle not resolved at startup (bundlePath=${tuple.bundlePath}); check gateway boot logs`,
+            );
+          }
+        } else {
+          // bundle 就绪:current 对照 + 组装挂载/label/env。
+          const platformRoot = tuple.platformRoot ?? DEFAULT_PLATFORM_ROOT;
+          try {
+            // 激活中间态守卫(便宜):current symlink realpath 必须 == 声明 bundle。
+            assertCurrentMatches(platformRoot, tuple.bundlePath!);
+            const platformRootReal = realpathSync(platformRoot);
+            // 挂稳定根(不挂 current);容器经 /run/oc/platform/current/... 访问,翻转原子生效。
+            platformBinds.push(`${platformRootReal}:${PLATFORM_MOUNT_TARGET}:ro`);
+            // release ro 挂 /opt/openclaude(bind resolved realpath,绝不挂 symlink;多机已被上方硬门拒)。
+            if (tuple.releaseResolvedPath) {
+              platformBinds.push(`${tuple.releaseResolvedPath}:${RELEASE_MOUNT_TARGET}:ro`);
+            }
+            injectPlatformEnv = true;
+          } catch (e) {
+            // assertCurrentMatches 失败 = 激活中间态(短暂窗口)。OPTIONAL 才降级,否则拒(前端 retry 兜底)。
+            if (bundleOptional) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                "[v3supervisor] platform current mid-state (OPTIONAL=1); skipping platform bundle mount",
+                { uid, error: (e as Error).message },
+              );
+            } else {
+              throw e instanceof SupervisorError
+                ? e
+                : new SupervisorError("InvalidArgument", `platform activation mid-state: ${(e as Error).message}`);
+            }
+          }
+        }
+        // 4 个 channel-neutral runtime label:值来自 deps(缺省 "")。即使 bundle 未挂(OPTIONAL 降级)
+        // 也打 label —— image_id 恒来自 tuple,release/bundle_rev/boot_hash 走 tuple 解析值或 ""。
+        // runtimeStale 侧 desired 三元组同源(见 v3ensureRunning),两端一致。
+        runtimeLabels = {
+          [RUNTIME_IMAGE_ID_LABEL_KEY]: tuple?.imageId ?? "",
+          [RUNTIME_RELEASE_LABEL_KEY]: tuple?.releasePath ? pathBasename(tuple.releasePath) : "",
+          [RUNTIME_BUNDLE_REV_LABEL_KEY]: tuple?.bundleRev ?? "",
+          [RUNTIME_BOOT_HASH_LABEL_KEY]: tuple?.bootHash ?? "",
+        };
+      } else if (tuple?.bundlePath || tuple?.releasePath) {
+        // v3 channel:零行为变化。误配 tuple 仅提示忽略(不挂/不打 label/不注入 env)。
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[v3supervisor] OC_PLATFORM_BUNDLE/OC_RUNTIME_RELEASE ignored on v3 channel (v5-only hot-config)",
+          { uid },
+        );
+      }
+    }
+    // 3 个平台注入 env(仅 v5 + bundle 挂载生效时)。走 current symlink → 翻转对存量容器原子生效。
+    if (injectPlatformEnv) {
+      env.push(
+        `OPENCLAUDE_PLATFORM_PROMPTS_DIR=${OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE}`,
+        `OPENCLAUDE_DEFAULT_WORKSPACE=${OPENCLAUDE_DEFAULT_WORKSPACE_VALUE}`,
+        `OPENCLAUDE_WEB_CONTEXT_BIN=${OPENCLAUDE_WEB_CONTEXT_BIN_VALUE}`,
+      );
+    }
+
     // 远程执行 mux per-user 目录:ro 挂到容器 /run/ccb-ssh。
     // 用户启用远程执行机前,dir 是空目录(无 host 子目录),容器侧 CCB 检测到
     // 空目录按本地执行处理,符合 feature off 语义。启用后 sshMux 会在宿主侧
@@ -2455,6 +2704,11 @@ export async function provisionV3Container(
       );
     }
 
+    // v5 平台稳定根(→ /run/oc/platform:ro)+ release(→ /opt/openclaude:ro)。
+    // 挂载顺序:docker 按挂载点深度排序,release(/opt/openclaude)先于 baseline 的
+    // /opt/openclaude/AGENTS.md 叠加,基线 AGENTS.md 仍覆盖 release 里的同名文件(意图不变)。
+    if (platformBinds.length > 0) binds.push(...platformBinds);
+
     // v3 容器资源硬限额(Memory / NanoCpus / PidsLimit)。env 覆盖见 resolveV3ResourceLimits。
     const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits();
 
@@ -2481,7 +2735,9 @@ export async function provisionV3Container(
         image: deps.image,
         name: containerName,
         env: envMap,
-        labels: { [V3_UID_LABEL_KEY]: String(uid) },
+        // 4 个 runtime label(image_id/release/bundle_rev/boot_hash)与 uid label 一并透传;
+        // backend 再补 managed + channel label。runtimeLabels 在 v3 / 未配 tuple 时为空对象。
+        labels: { [V3_UID_LABEL_KEY]: String(uid), ...runtimeLabels },
         binds: bindObjs,
         memoryBytes,
         nanoCpus,
@@ -2525,6 +2781,9 @@ export async function provisionV3Container(
             // P1a:self-host 直建路径也盖 runtime_channel(否则 v5 容器无 label →
             // orphanReconcile 误把它当 v3 处理。network/IP channel 化须与 pickIp 配套,留 P1b/P1d)。
             [RUNTIME_CHANNEL_LABEL_KEY]: getRuntimeChannel(),
+            // 4 个 channel-neutral runtime label(image_id/release/bundle_rev/boot_hash)。
+            // runtimeLabels 在 v3 / 未配 tuple 时为空对象 → 展开无副作用(零行为变化)。
+            ...runtimeLabels,
           },
           AttachStdin: false,
           AttachStdout: false,
@@ -3070,18 +3329,37 @@ export async function getV3ContainerStatus(
 
   let state: V3ContainerStatus["state"];
   let image: string | undefined;
+  let imageId: string | undefined;
+  let labels: Record<string, string> | undefined;
   try {
     if (useRemote) {
       const info = await deps.containerService!.inspect(row.host_uuid!, row.container_internal_id);
       state = info.state === "running" ? "running" : "stopped";
-      // remote inspect 暂不暴露 image(契约扩展前为 undefined → 不触发镜像回收)。
-      image = (info as { image?: unknown }).image as string | undefined;
+      // remote inspect:image(tag)/imageId/labels 均待 node-agent 契约扩展。ContainerInspect
+      // 类型已在 containerService.ts 加可选 imageId/labels,但远端 backend 未回传前为 undefined
+      // (desired imageId 非空 → runtimeStale 保守不判 imageId stale;desired release/bootHash 非空
+      //  + labels 缺失 → 判 stale,但多机 + release 已被 provision 硬门拒,不实际发生)。
+      const rinfo = info as { image?: unknown; imageId?: unknown; labels?: unknown };
+      image = typeof rinfo.image === "string" ? rinfo.image : undefined;
+      imageId = typeof rinfo.imageId === "string" ? rinfo.imageId : undefined;
+      labels = (rinfo.labels && typeof rinfo.labels === "object")
+        ? (rinfo.labels as Record<string, string>)
+        : undefined;
     } else {
       const info = await deps.docker.getContainer(row.container_internal_id).inspect();
       const running = Boolean(info.State && info.State.Running);
       state = running ? "running" : "stopped";
-      // Config.Image = 创建容器时的镜像名:tag(非 resolved sha),与 deps.image 同形可直接比对。
+      // Config.Image = 创建容器时的镜像名:tag(非 resolved sha),desired imageId 缺省时按 tag 回落比对。
       image = info.Config?.Image;
+      // Image(顶层)= 容器实际跑的 immutable image ID(= 镜像 config digest);runtimeStale 首选。
+      imageId = typeof (info as { Image?: unknown }).Image === "string"
+        ? (info as { Image: string }).Image
+        : undefined;
+      // Config.Labels = 容器 labels,含 4 个 runtime label(image_id/release/bundle_rev/boot_hash)。
+      const rawLabels = (info.Config as { Labels?: unknown } | undefined)?.Labels;
+      labels = (rawLabels && typeof rawLabels === "object")
+        ? (rawLabels as Record<string, string>)
+        : undefined;
     }
   } catch (err) {
     if (isNotFound(err)) {
@@ -3101,6 +3379,8 @@ export async function getV3ContainerStatus(
     hostId: row.host_uuid,
     lastWsActivity: row.last_ws_activity,
     ...(image ? { image } : {}),
+    ...(imageId ? { imageId } : {}),
+    ...(labels ? { labels } : {}),
   };
 }
 
