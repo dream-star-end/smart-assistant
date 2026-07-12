@@ -1,0 +1,688 @@
+# shellcheck shell=bash
+# v5-runtime-release-lib.sh —— runtime tuple / platform bundle 的**宿主本地纯函数库**。
+#
+# 设计不变量(RFC docs/V5_RUNTIME_HOTCFG_PLAN.md §1.1/1.2/1.5/3.1):
+#   - 本文件**不含任何 ssh**。所有函数只操作"当前主机的本地文件系统 + 本地命令"。
+#     · 真实部署:deploy-v5.sh 把本文件 ship 到 kl-mirror 后 source,函数在制品所在主机
+#       (制品 /var/lib/openclaude-v5/... 与 docker/bun 都在那台)本地执行 → digest 在
+#       制品真实树上算,权威唯一。
+#     · 自测:直接 source 本文件,用 env 覆盖根路径指向 /tmp 假树、OC_DOCKER_BIN 指向
+#       stub,即可本地干跑 bundle 构建 / digest 幂等 / GC 保护集 / 激活 saga 回滚。
+#     → 同一份代码两处跑 = 无第二权威源、无漂移(CLAUDE.md「权威源不分裂」)。
+#   - digest 契约(四 agent 统一):对**规范化相对路径 LC_ALL=C 排序**后的每个正则文件,
+#     取行 (path + NUL + sha256 + NUL + mode + LF) 顺序拼接求 sha256 → 前 12 hex。
+#     忽略 uid/gid/mtime;mode = `stat -c %a`(八进制无前导 0,如 755/644)。bootHash 同法
+#     但仅 entrypoint/ 与 seed/ 前缀行。**awk 的 \0 会截断格式串,故 digest 一律 bash printf。**
+#   - MANIFEST.json 由本库生成(jq 组装),files[] **不含 MANIFEST 自身**。
+#
+# 依赖(kl-mirror 与自测机都具备):bash4+ / jq / sha256sum / find(GNU 兼容)/ sort / xargs /
+#   stat / date / mv / ln / rm / cp。docker/bun 仅 release 面用,经 OC_DOCKER_BIN / OC_BUN_BIN
+#   间接调用(自测可 stub)。
+
+# ── 根路径 / 权威文件(deploy-v5.sh 或自测可用 env 覆盖;`:-` 保证不覆盖调用方已设值)──
+: "${OC_HOTCFG_PLATFORM_ROOT:=/var/lib/openclaude-v5/platform}"
+: "${OC_HOTCFG_RELEASES_ROOT:=/var/lib/openclaude-v5/runtime-releases}"
+: "${OC_HOTCFG_ENV_FILE:=/etc/openclaude/commercial-v5.env}"
+: "${OC_HOTCFG_HISTORY:=/etc/openclaude/runtime-tuple.history}"
+: "${OC_HOTCFG_KEEP_TUPLES:=5}"       # GC 保护:history 最近 N 条 committed tuple 引用
+: "${OC_DOCKER_BIN:=docker}"          # 自测 stub 注入点
+: "${OC_BUN_BIN:=}"                   # 空 → 运行期解析(~/.bun/bin/bun 或 PATH)
+
+# tuple 四键(激活原子单元;emergency 是第 5 个独立键,不随普通激活写)。顺序即写入/快照顺序。
+OC_HOTCFG_TUPLE_KEYS=(OC_RUNTIME_IMAGE OC_RUNTIME_IMAGE_ID OC_RUNTIME_RELEASE OC_PLATFORM_BUNDLE)
+OC_HOTCFG_EMERGENCY_KEY="OC_RUNTIME_EMERGENCY_TUPLE"
+
+# bundle 顶层目录白名单(§1.2:与 TS 侧 platformBundle.ts 校验语义一致的 bash 版)。
+OC_HOTCFG_BUNDLE_TOPDIRS="bin entrypoint etc-codex codex-skills seed prompts"
+# 允许扩展名(§1.3)。
+OC_HOTCFG_BUNDLE_EXTS="sh py ts toml md yaml json"
+# 敏感名 denylist(§1.3 / §3.1 产物阶段扫描)。find -name 通配。
+OC_HOTCFG_SENSITIVE_GLOBS='.env* id_rsa* *.pem *.key .npmrc .netrc'
+# bundle 结构上限(§1.3)。
+OC_HOTCFG_BUNDLE_MAX_FILE=$((1024 * 1024))         # 单文件 ≤1MB
+OC_HOTCFG_BUNDLE_MAX_TOTAL=$((32 * 1024 * 1024))   # 总量 ≤32MB
+OC_HOTCFG_BUNDLE_MAX_ENTRIES=512
+OC_HOTCFG_BUNDLE_MAX_DEPTH=6
+
+oc_hotcfg__die() { echo "FATAL[hotcfg]: $*" >&2; return 1; }
+oc_hotcfg__log() { echo "  [hotcfg] $*" >&2; }
+
+# ─────────────────────────── digest / MANIFEST 核心 ───────────────────────────
+
+# 产出**已按 path LC_ALL=C 排序**的文件行 TSV:<relpath>\t<sha256>\t<size>\t<mode>。
+# 排除根下 MANIFEST.json(与 .tmp)。并行 sha256(xargs -P nproc)后再按 path 重排 → 既快又确定。
+# 注:release node_modules 可含数万文件;假设路径无 TAB/换行(bundle selfcheck 强制,npm 包名规范)。
+oc_hotcfg__file_rows() {
+  local root="$1"
+  [ -d "$root" ] || { oc_hotcfg__die "file_rows: 目录不存在 $root"; return 1; }
+  ( cd "$root" || exit 1
+    find . -type f ! -name 'MANIFEST.json' ! -name 'MANIFEST.json.tmp' -print0 \
+      | xargs -0 -P"$(nproc)" -I '{}' sh -c '
+          f=${1#./}
+          h=$(sha256sum "$1" | cut -d" " -f1) || exit 1
+          s=$(stat -c "%s" "$1") || exit 1
+          m=$(stat -c "%a" "$1") || exit 1
+          printf "%s\t%s\t%s\t%s\n" "$f" "$h" "$s" "$m"
+        ' _ '{}' \
+      | LC_ALL=C sort -t "$(printf '\t')" -k1,1
+  )
+}
+
+# TSV(stdin) → files[] JSON 数组。size 转数字。
+oc_hotcfg__rows_to_json() {
+  jq -R -s -c '
+    split("\n") | map(select(length > 0)) | map(split("\t"))
+    | map({path: .[0], sha256: .[1], size: (.[2] | tonumber), mode: .[3]})
+  '
+}
+
+# TSV(stdin) → 12hex digest。$1: all|boot(boot 仅 entrypoint/ 与 seed/ 前缀行)。
+# **bash printf 逐行输出真实 NUL 字节**(awk 会在 \0 处截断格式串,故不可用 awk)。
+oc_hotcfg__digest_from_rows() {
+  local mode="${1:-all}" p h s m
+  {
+    while IFS=$'\t' read -r p h s m; do
+      [ -n "$p" ] || continue
+      if [ "$mode" = boot ]; then
+        case "$p" in entrypoint/*|seed/*) : ;; *) continue ;; esac
+      fi
+      printf '%s\0%s\0%s\n' "$p" "$h" "$m"
+    done
+  } | sha256sum | cut -c1-12
+}
+
+# 在 <root> 写 MANIFEST.json 并 echo digest。
+# 用法:oc_hotcfg_build_manifest <root> <schemaVersion> <sourceCommit> [bunVersion] [depsCacheKey]
+oc_hotcfg_build_manifest() {
+  local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}"
+  local rows files_json digest boothash builtAt
+  rows="$(oc_hotcfg__file_rows "$root")" || return 1
+  files_json="$(printf '%s\n' "$rows" | oc_hotcfg__rows_to_json)" || return 1
+  digest="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows all)" || return 1
+  boothash="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows boot)" || return 1
+  builtAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n \
+    --argjson schemaVersion "$schema" \
+    --arg digest "$digest" --arg bootHash "$boothash" \
+    --arg sourceCommit "$commit" --arg builtAt "$builtAt" \
+    --arg bunVersion "$bun" --arg depsCacheKey "$cache" \
+    --argjson files "$files_json" '
+    {schemaVersion: $schemaVersion, digest: $digest, bootHash: $bootHash,
+     sourceCommit: $sourceCommit, builtAt: $builtAt, files: $files}
+    + (if $bunVersion == "" then {} else {bunVersion: $bunVersion} end)
+    + (if $depsCacheKey == "" then {} else {depsCacheKey: $depsCacheKey} end)
+  ' > "$root/MANIFEST.json.tmp" || return 1
+  mv -f "$root/MANIFEST.json.tmp" "$root/MANIFEST.json" || return 1
+  printf '%s\n' "$digest"
+}
+
+# 全量重校验:重算 digest 并与 MANIFEST.json.digest 比对(用于同 rev 目录已存在时的幂等信任前置,
+# R3-minor:不能仅因目录存在就信任)。bundle 用(文件少);release 全量太贵,改用抽样版。
+oc_hotcfg_verify_manifest_full() {
+  local root="$1" rows have want
+  [ -f "$root/MANIFEST.json" ] || { oc_hotcfg__die "verify: 缺 MANIFEST.json @ $root"; return 1; }
+  want="$(jq -r '.digest // empty' "$root/MANIFEST.json")" || return 1
+  [ -n "$want" ] || { oc_hotcfg__die "verify: MANIFEST 无 digest @ $root"; return 1; }
+  rows="$(oc_hotcfg__file_rows "$root")" || return 1
+  have="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows all)" || return 1
+  [ "$have" = "$want" ] || { oc_hotcfg__die "verify: digest 不符 @ $root (实算=$have manifest=$want)"; return 1; }
+  return 0
+}
+
+# 抽样重校验(release 大树):文件数一致 + 随机 N 个文件 sha256 与 MANIFEST 相符。
+# 取样理由:release 含 node_modules 数万文件,全量 sha256 每次幂等命中都跑一遍代价过高;
+# 目录已 content-addressed 命名(digest 前 12 hex 撞库概率极低),抽样足以抓到"目录被篡改/半写"。
+oc_hotcfg_verify_manifest_sampled() {
+  local root="$1" n="${2:-64}" mf_count fs_count bad=0 line p want have
+  [ -f "$root/MANIFEST.json" ] || { oc_hotcfg__die "verify: 缺 MANIFEST.json @ $root"; return 1; }
+  mf_count="$(jq -r '.files | length' "$root/MANIFEST.json")" || return 1
+  fs_count="$(cd "$root" && find . -type f ! -name 'MANIFEST.json' -printf '.' | wc -c)" || return 1
+  [ "$mf_count" = "$fs_count" ] || { oc_hotcfg__die "verify: 文件数不符 @ $root (manifest=$mf_count fs=$fs_count)"; return 1; }
+  # 随机取 N 行 {path,sha256} 校验
+  while IFS=$'\t' read -r p want; do
+    [ -n "$p" ] || continue
+    have="$(sha256sum "$root/$p" 2>/dev/null | cut -d' ' -f1)"
+    [ "$have" = "$want" ] || { echo "  [hotcfg] 抽样不符: $p" >&2; bad=1; }
+  done < <(jq -r '.files[] | [.path, .sha256] | @tsv' "$root/MANIFEST.json" | shuf | head -n "$n")
+  [ "$bad" = 0 ] || { oc_hotcfg__die "verify: 抽样 sha256 不符 @ $root"; return 1; }
+  return 0
+}
+
+# ─────────────────────────── 敏感文件扫描 ───────────────────────────
+# 命中任一敏感名即 fail(§3.1 产物阶段红线)。bundle 与 release 产物都过。
+oc_hotcfg_scan_sensitive() {
+  local root="$1" g hit=0 found
+  for g in $OC_HOTCFG_SENSITIVE_GLOBS; do
+    found="$(cd "$root" && find . -name "$g" -print 2>/dev/null | head -5)"
+    if [ -n "$found" ]; then
+      echo "  [hotcfg] 敏感文件命中 '$g':" >&2; printf '    %s\n' $found >&2; hit=1
+    fi
+  done
+  [ "$hit" = 0 ] || { oc_hotcfg__die "scan_sensitive: 产物含敏感文件,拒绝发布 @ $root"; return 1; }
+  return 0
+}
+
+# ─────────────────────────── bundle 结构自检(§1.3 轻量 bash 版)───────────────────────────
+oc_hotcfg_selfcheck_bundle() {
+  local root="$1" e name base ext total entries depth bad=0
+  [ -d "$root" ] || { oc_hotcfg__die "selfcheck: 目录不存在 $root"; return 1; }
+  # 1) 顶层白名单:目录 ∈ TOPDIRS,文件仅 MANIFEST.json
+  for e in "$root"/* "$root"/.*; do
+    [ -e "$e" ] || continue
+    base="$(basename "$e")"
+    case "$base" in .|..) continue ;; esac
+    if [ -d "$e" ]; then
+      case " $OC_HOTCFG_BUNDLE_TOPDIRS " in *" $base "*) : ;; *)
+        echo "  [hotcfg] 顶层非白名单目录: $base" >&2; bad=1 ;; esac
+    elif [ -f "$e" ]; then
+      [ "$base" = "MANIFEST.json" ] || { echo "  [hotcfg] 顶层非法文件: $base" >&2; bad=1; }
+    else
+      echo "  [hotcfg] 顶层非常规条目(symlink/设备/socket): $base" >&2; bad=1
+    fi
+  done
+  # 2) 逐文件:类型(拒 symlink/设备/FIFO/socket/nlink>1)、扩展名白名单、单文件大小
+  while IFS= read -r -d '' e; do
+    if [ -L "$e" ]; then echo "  [hotcfg] 含 symlink: ${e#"$root"/}" >&2; bad=1; continue; fi
+    if [ ! -f "$e" ]; then echo "  [hotcfg] 非常规文件: ${e#"$root"/}" >&2; bad=1; continue; fi
+    local nlink; nlink="$(stat -c '%h' "$e")"
+    [ "$nlink" -le 1 ] || { echo "  [hotcfg] 硬链接 nlink=$nlink: ${e#"$root"/}" >&2; bad=1; }
+    name="$(basename "$e")"; ext="${name##*.}"
+    # bin/ 例外(与 TS 侧 platformBundle.ts collectBundleFiles 同规则):bin/ 下必须
+    # **无扩展名**(PATH 命令名即工具名;finalize_bundle 已剥 .sh/.py),其余目录走白名单。
+    case "${e#"$root"/}" in
+      bin/*)
+        if [ "$ext" != "$name" ]; then
+          echo "  [hotcfg] bin/ 下必须无扩展名(finalize 剥失败?): ${e#"$root"/}" >&2; bad=1
+        fi ;;
+      *)
+        if [ "$ext" = "$name" ]; then
+          echo "  [hotcfg] 无扩展名文件(白名单外): ${e#"$root"/}" >&2; bad=1
+        else
+          case " $OC_HOTCFG_BUNDLE_EXTS " in *" $ext "*) : ;; *)
+            echo "  [hotcfg] 扩展名 .$ext 不在白名单: ${e#"$root"/}" >&2; bad=1 ;; esac
+        fi ;;
+    esac
+    local sz; sz="$(stat -c '%s' "$e")"
+    [ "$sz" -le "$OC_HOTCFG_BUNDLE_MAX_FILE" ] || { echo "  [hotcfg] 单文件超 1MB($sz): ${e#"$root"/}" >&2; bad=1; }
+  done < <(find "$root" -type f ! -name 'MANIFEST.json' -print0)
+  # 3) 总量 / 条目数 / 深度上限(超限**拒绝**而非截断放行)
+  entries="$(find "$root" ! -name 'MANIFEST.json' -mindepth 1 | wc -l)"
+  [ "$entries" -le "$OC_HOTCFG_BUNDLE_MAX_ENTRIES" ] || { echo "  [hotcfg] 条目数 $entries > $OC_HOTCFG_BUNDLE_MAX_ENTRIES" >&2; bad=1; }
+  total="$(du -sb --exclude MANIFEST.json "$root" | cut -f1)"
+  [ "$total" -le "$OC_HOTCFG_BUNDLE_MAX_TOTAL" ] || { echo "  [hotcfg] 总量 $total > $OC_HOTCFG_BUNDLE_MAX_TOTAL" >&2; bad=1; }
+  depth="$(find "$root" -type f -printf '%d\n' | sort -n | tail -1)"; depth="${depth:-0}"
+  [ "$depth" -le "$OC_HOTCFG_BUNDLE_MAX_DEPTH" ] || { echo "  [hotcfg] 目录深度 $depth > $OC_HOTCFG_BUNDLE_MAX_DEPTH" >&2; bad=1; }
+  # 4) 敏感名
+  oc_hotcfg_scan_sensitive "$root" || bad=1
+  [ "$bad" = 0 ] || { oc_hotcfg__die "selfcheck_bundle: 结构校验失败 @ $root"; return 1; }
+  oc_hotcfg__log "bundle 结构自检通过(entries=$entries total=${total}B depth=$depth)"
+  return 0
+}
+
+# 规范化 bundle 制品权限:目录 0755、文件 0644、bin/ 下 .sh/.py 与可执行脚本 0755;全 root:root。
+# (仅当以 root 运行时 chown 才成功;非 root 自测环境 chown 失败降级为跳过并不 fail,只保证权限位。)
+oc_hotcfg_normalize_bundle_perms() {
+  local root="$1"
+  chown -R root:root "$root" 2>/dev/null || oc_hotcfg__log "chown root:root 跳过(非 root 环境)"
+  find "$root" -type d -exec chmod 0755 {} +
+  find "$root" -type f -exec chmod 0644 {} +
+  # bin/ 下脚本与顶层 *.sh/*.py 置可执行
+  if [ -d "$root/bin" ]; then find "$root/bin" -type f -exec chmod 0755 {} +; fi
+  find "$root" -type f \( -name '*.sh' -o -name '*.py' \) -exec chmod 0755 {} +
+}
+
+# ─────────────────────────── bundle 落定(§1.1/1.2)───────────────────────────
+# 从已组装好的 staging 目录 → 规范权限 → 自检 → 生成 MANIFEST → 按 digest 定名 mv -T 落正式。
+# 幂等:同 rev 目录已存在 → **先全量重校验其 MANIFEST**(R3-minor)再丢弃 staging;校验失败 fail-loud。
+# echo bundleRev(=digest 前 12 hex)到 stdout。
+# 用法:oc_hotcfg_finalize_bundle <staging_dir> <schemaVersion> <sourceCommit>
+oc_hotcfg_finalize_bundle() {
+  local staging="$1" schema="$2" commit="$3"
+  [ -d "$staging" ] || { oc_hotcfg__die "finalize_bundle: staging 不存在 $staging"; return 1; }
+  # prompts/ 子目录缺失 → fail-loud(agent D 依赖)
+  [ -d "$staging/prompts" ] || { oc_hotcfg__die "finalize_bundle: 缺 prompts/ 子目录(agent D 未就位?)@ $staging"; return 1; }
+  # bin/ 剥扩展名:源仓 bin/ 里是 oc-*.sh/.py(git 可读性),bundle 里必须是 PATH 命令名
+  # (`oc-docx` 而非 `oc-docx.sh`,镜像 dev-fallback COPY 也是逐文件重命名的同一语义)。
+  # 剥完撞名 = 源目录同名 .sh/.py 并存,fail-loud 人工处置。
+  if [ -d "$staging/bin" ]; then
+    local f bare
+    for f in "$staging"/bin/*.sh "$staging"/bin/*.py; do
+      [ -e "$f" ] || continue
+      bare="${f%.*}"
+      [ ! -e "$bare" ] || { oc_hotcfg__die "finalize_bundle: bin/ 剥扩展名撞名 $(basename "$bare")"; return 1; }
+      mv "$f" "$bare" || return 1
+    done
+  fi
+  oc_hotcfg_normalize_bundle_perms "$staging"
+  oc_hotcfg_selfcheck_bundle "$staging" || return 1
+  local digest target
+  digest="$(oc_hotcfg_build_manifest "$staging" "$schema" "$commit")" || return 1
+  target="$OC_HOTCFG_PLATFORM_ROOT/bundles/$digest"
+  mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles"
+  if [ -d "$target" ]; then
+    oc_hotcfg__log "bundle rev=$digest 已存在 → 全量重校验后复用(不信任裸存在)"
+    if oc_hotcfg_verify_manifest_full "$target"; then
+      rm -rf "$staging"
+      printf '%s\n' "$digest"; return 0
+    fi
+    oc_hotcfg__die "bundle rev=$digest 目录存在但 MANIFEST 校验失败 → 需人工处置(疑被篡改/半写),拒绝复用"
+    return 1
+  fi
+  mv -T "$staging" "$target" || { oc_hotcfg__die "bundle mv -T 落定失败"; return 1; }
+  oc_hotcfg__log "bundle 落定 → $target"
+  printf '%s\n' "$digest"
+}
+
+# current 相对 symlink 原子翻转(§1.2:挂载源永不变,翻转对存量容器原子生效)。
+oc_hotcfg_flip_current() {
+  local rev="$1" root="${2:-$OC_HOTCFG_PLATFORM_ROOT}" tmp
+  [ -d "$root/bundles/$rev" ] || { oc_hotcfg__die "flip_current: 目标 bundle 不存在 bundles/$rev"; return 1; }
+  tmp="$root/.current.$$.$RANDOM"
+  rm -f "$tmp"
+  ln -s "bundles/$rev" "$tmp"      # 相对目标
+  mv -T "$tmp" "$root/current"     # 原子替换
+}
+
+# ─────────────────────────── release 依赖缓存键(§3.1)───────────────────────────
+# key = sha256( root lock sha256 + image immutable ID + arch )。
+# **不含 ccb lock**(2026-07-12 集成取证):claude-code-best 依赖用 `workspace:*` 协议,
+# npm 根本不支持(npm ci/install 皆报 Unsupported URL Type)—— 镜像里那步 ccb npm install
+# 一直走 WARN fallback,生产容器从未有过 ccb node_modules;真正运行物是 bun build 的
+# **自足** dist/cli.js(build.ts 无 externals、target=node,全量打包),其 bytes 已进
+# release 树 digest。故 release 只装 root 一套依赖,ccb 只有 host bun build(见下)。
+oc_hotcfg_deps_cache_key() {
+  local root="$1" image_id="$2" root_lock arch
+  [ -f "$root/package-lock.json" ] || { oc_hotcfg__die "deps_cache_key: 缺 root package-lock.json @ $root"; return 1; }
+  root_lock="$(sha256sum "$root/package-lock.json" | cut -d' ' -f1)"
+  arch="$(uname -m)"
+  printf '%s\n' "$(printf '%s\0%s\0%s' "$root_lock" "$image_id" "$arch" | sha256sum | cut -c1-64)"
+}
+
+# 在目标 runtime 镜像的**一次性容器内**装 root 依赖(§3.1:与容器运行时同 ABI)。
+# npm ci 失败即整体失败(§3.1e 不降级 npm install;root lock 已实证 ci 通过)。
+# ccb 不装(见 deps_cache_key 头注:workspace:* npm 不支持,dist/cli.js 自足)。
+oc_hotcfg_install_deps_in_image() {
+  local staging="$1" image_id="$2"
+  oc_hotcfg__log "docker 一次性容器内 npm ci(root)@ image=$image_id"
+  "$OC_DOCKER_BIN" run --rm --entrypoint /bin/sh --user 0:0 \
+    -v "$staging:/build" -w /build "$image_id" -c '
+      set -e
+      npm ci --include=dev --no-audit --no-fund
+    ' || { oc_hotcfg__die "npm ci 失败(整体失败,不降级 npm install)"; return 1; }
+}
+
+# ccb dist:host bun 在 staging/claude-code-best 内 bun install --ignore-scripts + bun run build。
+# 记录 bun --version 供 MANIFEST。echo bun 版本。
+oc_hotcfg_build_ccb_dist() {
+  local staging="$1" bun ver
+  bun="$OC_BUN_BIN"
+  [ -n "$bun" ] || { if [ -x "$HOME/.bun/bin/bun" ]; then bun="$HOME/.bun/bin/bun"; else bun="$(command -v bun || true)"; fi; }
+  [ -n "$bun" ] && [ -x "$bun" ] || { oc_hotcfg__die "build_ccb_dist: 找不到 host bun(~/.bun/bin/bun 或 PATH)"; return 1; }
+  [ -d "$staging/claude-code-best" ] || { oc_hotcfg__die "build_ccb_dist: staging 无 claude-code-best"; return 1; }
+  ver="$("$bun" --version 2>/dev/null)" || { oc_hotcfg__die "bun --version 失败"; return 1; }
+  ( cd "$staging/claude-code-best" && "$bun" install --ignore-scripts && "$bun" run build ) \
+    || { oc_hotcfg__die "ccb bun install/build 失败"; return 1; }
+  [ -f "$staging/claude-code-best/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; return 1; }
+  printf '%s\n' "$ver"
+}
+
+# release 落定(§3.1 d/e):在已 archive+prune+敏感扫描过的 staging 上装依赖、建 ccb dist、
+# 生成 MANIFEST(含 depsCacheKey/bunVersion)、按 digest 定名 mv -T。
+# 依赖缓存:cache key 与上一 release 同 → cp -al 复用两处 node_modules 跳过 ci。
+# 幂等:同 digest 已存在 → 抽样重校验后复用。echo releaseDir。
+# 用法:oc_hotcfg_finalize_release <staging> <image_id> <sourceCommit> <prev_release_or_empty>
+oc_hotcfg_finalize_release() {
+  local staging="$1" image_id="$2" commit="$3" prev="${4:-}"
+  [ -d "$staging" ] || { oc_hotcfg__die "finalize_release: staging 不存在 $staging"; return 1; }
+  local cache reuse=0 bunver
+  cache="$(oc_hotcfg_deps_cache_key "$staging" "$image_id")" || return 1
+  # 依赖复用判定:上一 release 的 depsCacheKey 相同且两处 node_modules 齐 → cp -al
+  if [ -n "$prev" ] && [ -d "$prev" ] && [ -f "$prev/MANIFEST.json" ]; then
+    local prev_key
+    prev_key="$(jq -r '.depsCacheKey // empty' "$prev/MANIFEST.json")"
+    if [ "$prev_key" = "$cache" ] && [ -d "$prev/node_modules" ] && [ -d "$prev/claude-code-best/node_modules" ]; then
+      oc_hotcfg__log "depsCacheKey 命中上一 release → cp -al 复用 node_modules(跳过 npm ci)"
+      cp -al "$prev/node_modules" "$staging/node_modules"
+      cp -al "$prev/claude-code-best/node_modules" "$staging/claude-code-best/node_modules"
+      reuse=1
+    fi
+  fi
+  [ "$reuse" = 1 ] || oc_hotcfg_install_deps_in_image "$staging" "$image_id" || return 1
+  bunver="$(oc_hotcfg_build_ccb_dist "$staging")" || return 1
+  # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
+  # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
+  # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。
+  local scan_bad=0 g found
+  for g in $OC_HOTCFG_SENSITIVE_GLOBS; do
+    found="$(cd "$staging" && find . -path ./node_modules -prune -o -path './claude-code-best/node_modules' -prune -o -name "$g" -print 2>/dev/null | head -5)"
+    [ -n "$found" ] && { echo "  [hotcfg] release 源码敏感命中 '$g':" >&2; printf '    %s\n' $found >&2; scan_bad=1; }
+  done
+  [ "$scan_bad" = 0 ] || { oc_hotcfg__die "finalize_release: 源码树含敏感文件"; return 1; }
+
+  local digest target
+  digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache")" || return 1
+  target="$OC_HOTCFG_RELEASES_ROOT/rel-$digest"
+  mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
+  if [ -d "$target" ]; then
+    oc_hotcfg__log "release rel-$digest 已存在 → 抽样重校验后复用"
+    if oc_hotcfg_verify_manifest_sampled "$target" 64; then
+      rm -rf "$staging"; printf '%s\n' "$target"; return 0
+    fi
+    oc_hotcfg__die "release rel-$digest 存在但抽样校验失败 → 人工处置"; return 1
+  fi
+  mv -T "$staging" "$target" || { oc_hotcfg__die "release mv -T 落定失败"; return 1; }
+  oc_hotcfg__log "release 落定 → $target"
+  printf '%s\n' "$target"
+}
+
+# ─────────────────────────── env tuple 读写(§1.1)───────────────────────────
+oc_hotcfg_env_get() {
+  local env_file="$1" key="$2"
+  grep -E "^[[:space:]]*${key}=" "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+# 原子写 tuple 四键:先 cp 备份 env.bak-<ts>,再逐键 sed-替换-或-append,tmp+mv 原子落盘。
+# 用法:oc_hotcfg_env_write_tuple <env_file> <image> <image_id> <release> <bundle>
+oc_hotcfg_env_write_tuple() {
+  local env_file="$1"; shift
+  local vals=("$@") keys=("${OC_HOTCFG_TUPLE_KEYS[@]}")
+  [ "${#vals[@]}" -eq "${#keys[@]}" ] || { oc_hotcfg__die "env_write_tuple: 值个数 ${#vals[@]} != 键 ${#keys[@]}"; return 1; }
+  local ts; ts="$(date -u +%Y%m%d%H%M%S)"
+  cp -a "$env_file" "$env_file.bak-$ts" || return 1
+  local tmp="$env_file.tuple.$$"
+  cp -a "$env_file" "$tmp" || return 1
+  local i k v
+  for i in "${!keys[@]}"; do
+    k="${keys[$i]}"; v="${vals[$i]}"
+    if grep -Eq "^[[:space:]]*${k}=" "$tmp"; then
+      # 替换(用 | 作分隔避免路径 / 冲突;值不含 | 假设成立,路径/镜像 ref 不含 |)
+      sed -i "s|^[[:space:]]*${k}=.*|${k}=${v}|" "$tmp"
+    else
+      printf '%s=%s\n' "$k" "$v" >> "$tmp"
+    fi
+  done
+  chmod --reference="$env_file" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$env_file"
+  oc_hotcfg__log "env tuple 写入(备份 $env_file.bak-$ts)"
+}
+
+# 快照 tuple 四键当前值(每行 KEY=VAL;缺失键记 KEY=<UNSET>)供回滚复原。
+oc_hotcfg_env_snapshot_tuple() {
+  local env_file="$1" k v
+  for k in "${OC_HOTCFG_TUPLE_KEYS[@]}"; do
+    if grep -Eq "^[[:space:]]*${k}=" "$env_file"; then
+      v="$(oc_hotcfg_env_get "$env_file" "$k")"
+      printf '%s=%s\n' "$k" "$v"
+    else
+      printf '%s=<UNSET>\n' "$k"
+    fi
+  done
+}
+
+# 用快照复原 tuple 四键(<UNSET> → 删除该键行)。snapshot 经 stdin 或 $2 文件。
+oc_hotcfg_env_restore_tuple() {
+  local env_file="$1" snap_file="$2" tmp="$env_file.restore.$$" line k v
+  cp -a "$env_file" "$tmp" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    k="${line%%=*}"; v="${line#*=}"
+    # 先删该键所有行
+    sed -i "/^[[:space:]]*${k}=/d" "$tmp"
+    # <UNSET> 表示原本无此键 → 保持删除;否则 append 原值
+    [ "$v" = "<UNSET>" ] || printf '%s=%s\n' "$k" "$v" >> "$tmp"
+  done < "$snap_file"
+  chmod --reference="$env_file" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$env_file"
+  oc_hotcfg__log "env tuple 已复原"
+}
+
+# emergency tuple:把当前 tuple 四键压成 JSON 字符串写入 OC_RUNTIME_EMERGENCY_TUPLE(§1.1)。
+oc_hotcfg_write_emergency_tuple() {
+  local env_file="$1" image image_id release bundle val
+  image="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE)"
+  image_id="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE_ID)"
+  release="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_RELEASE)"
+  bundle="$(oc_hotcfg_env_get "$env_file" OC_PLATFORM_BUNDLE)"
+  val="$(jq -cn --arg image "$image" --arg image_id "$image_id" --arg release "$release" --arg bundle "$bundle" \
+    '{image:$image, image_id:$image_id, release:$release, bundle:$bundle}')"
+  local ts; ts="$(date -u +%Y%m%d%H%M%S)"
+  cp -a "$env_file" "$env_file.bak-$ts"
+  local tmp="$env_file.emerg.$$"; cp -a "$env_file" "$tmp"
+  sed -i "/^[[:space:]]*${OC_HOTCFG_EMERGENCY_KEY}=/d" "$tmp"
+  printf '%s=%s\n' "$OC_HOTCFG_EMERGENCY_KEY" "$val" >> "$tmp"
+  chmod --reference="$env_file" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$env_file"
+  oc_hotcfg__log "emergency tuple 写入: $val"
+}
+
+# ─────────────────────────── tuple history(§1.1)───────────────────────────
+# checksum = sha256( schemaVer\0seq\0ts\0image\0image_id\0release\0bundle )前 64 hex(规范串,顺序固定)。
+oc_hotcfg_history_checksum() {
+  local schemaVer="$1" seq="$2" ts="$3" image="$4" image_id="$5" release="$6" bundle="$7"
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+    "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" | sha256sum | cut -c1-64
+}
+
+# 返回最后一条 checksum 通过的 committed 条目(JSON 单行)到 stdout;无则空。
+oc_hotcfg_history_last_committed() {
+  local hist="$1" line schemaVer seq ts image image_id release bundle sum want
+  [ -f "$hist" ] || return 0
+  # 逆序遍历,首个校验通过者即结果
+  tac "$hist" 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    schemaVer="$(jq -r '.schemaVer // empty' <<<"$line" 2>/dev/null)" || continue
+    [ -n "$schemaVer" ] || continue
+    seq="$(jq -r '.seq' <<<"$line")"; ts="$(jq -r '.ts' <<<"$line")"
+    image="$(jq -r '.image' <<<"$line")"; image_id="$(jq -r '.image_id' <<<"$line")"
+    release="$(jq -r '.release' <<<"$line")"; bundle="$(jq -r '.bundle' <<<"$line")"
+    want="$(jq -r '.checksum' <<<"$line")"
+    sum="$(oc_hotcfg_history_checksum "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle")"
+    if [ "$sum" = "$want" ]; then printf '%s\n' "$line"; break; fi
+  done
+}
+
+# 取倒数第 N 条 checksum 通过的 committed 条目(N=1 即 last,N=2 即上一条)。JSON 单行到 stdout。
+oc_hotcfg_history_nth_committed() {
+  local hist="$1" n="${2:-1}" cnt=0 line
+  [ -f "$hist" ] || return 0
+  tac "$hist" 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local schemaVer seq ts image image_id release bundle want sum
+    schemaVer="$(jq -r '.schemaVer // empty' <<<"$line" 2>/dev/null)" || continue
+    [ -n "$schemaVer" ] || continue
+    seq="$(jq -r '.seq' <<<"$line")"; ts="$(jq -r '.ts' <<<"$line")"
+    image="$(jq -r '.image' <<<"$line")"; image_id="$(jq -r '.image_id' <<<"$line")"
+    release="$(jq -r '.release' <<<"$line")"; bundle="$(jq -r '.bundle' <<<"$line")"
+    want="$(jq -r '.checksum' <<<"$line")"
+    sum="$(oc_hotcfg_history_checksum "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle")"
+    [ "$sum" = "$want" ] || continue
+    cnt=$((cnt+1))
+    if [ "$cnt" -eq "$n" ]; then printf '%s\n' "$line"; break; fi
+  done
+}
+
+# 追加一条 committed tuple:seq=上一 committed +1,temp+fsync+rename 落盘。
+# 用法:oc_hotcfg_history_append <hist> <image> <image_id> <release> <bundle>
+oc_hotcfg_history_append() {
+  local hist="$1" image="$2" image_id="$3" release="$4" bundle="$5"
+  local last seq ts sum line dir
+  last="$(oc_hotcfg_history_last_committed "$hist")"
+  if [ -n "$last" ]; then seq=$(( $(jq -r '.seq' <<<"$last") + 1 )); else seq=1; fi
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sum="$(oc_hotcfg_history_checksum 1 "$seq" "$ts" "$image" "$image_id" "$release" "$bundle")"
+  line="$(jq -cn --argjson schemaVer 1 --argjson seq "$seq" --arg ts "$ts" \
+    --arg image "$image" --arg image_id "$image_id" --arg release "$release" --arg bundle "$bundle" --arg checksum "$sum" \
+    '{schemaVer:$schemaVer, seq:$seq, ts:$ts, image:$image, image_id:$image_id, release:$release, bundle:$bundle, checksum:$checksum}')"
+  dir="$(dirname "$hist")"; mkdir -p "$dir"
+  local tmp="$hist.append.$$"
+  # 先把已有内容复制进 tmp 再追加,tmp fsync 后 rename(整文件原子替换,防半写)
+  if [ -f "$hist" ]; then cp -a "$hist" "$tmp"; else : > "$tmp"; fi
+  printf '%s\n' "$line" >> "$tmp"
+  # fsync tmp 与目录
+  { command -v sync >/dev/null && sync "$tmp" 2>/dev/null; } || sync || true
+  mv -f "$tmp" "$hist"
+  sync "$dir" 2>/dev/null || sync || true
+  oc_hotcfg__log "history 追加 committed tuple seq=$seq"
+}
+
+# ─────────────────────────── 激活 saga(§1.5)───────────────────────────
+# 宿主本地、可注入 restart/smoke/extra 钩子 → 直接自测(模拟第 N 步失败断言复原)。
+# 真实部署:deploy-v5.sh ship 本库到 kl-mirror 后以远端命令做钩子调用本函数。
+#
+# 顺序:snapshot(旧 env 四键 + 旧 current 目标)→ [extra_apply(master 源码 symlink 翻转)]→
+#       写 env tuple → 翻 current → restart → smoke → history append(fsync)→ 解 trap → GC(库外)。
+# **任一步(含 history 写)失败 → 恢复全部(current/env/extra 逆操作)并 restart 旧 master → return 1**。
+# trap 持续到 history fsync 成功后才解除(R3-minor)。
+#
+# 两机制独立开关(§5):flip_rev 空 → 不翻 current(bundle 机制未启用);bundle_value 为 env
+# OC_PLATFORM_BUNDLE 写入值(与 flip 解耦:release-only 激活时 bundle_value=沿用旧值/空)。
+# 用法:oc_hotcfg_activate_saga <env_file> <platform_root> <flip_rev> <hist> \
+#         <image> <image_id> <release> <bundle_value> <restart_cmd> <smoke_cmd> [extra_apply_cmd] [extra_revert_cmd]
+oc_hotcfg_activate_saga() {
+  local env_file="$1" platform_root="$2" flip_rev="$3" hist="$4"
+  local image="$5" image_id="$6" release="$7" bundle_value="$8"
+  local restart_cmd="$9" smoke_cmd="${10}"
+  local extra_apply="${11:-}" extra_revert="${12:-}"
+
+  # 1) 快照旧现场(旧 env 四键 + 旧 current 目标)
+  local snap; snap="$(mktemp)"
+  oc_hotcfg_env_snapshot_tuple "$env_file" > "$snap"
+  local old_current=""
+  [ -L "$platform_root/current" ] && old_current="$(readlink "$platform_root/current" || true)"
+
+  # 已完成阶段的进度旗标,回滚只逆做已生效者。这些是本函数的局部状态,rollback 闭包内引用。
+  local extra_done=0 env_done=0 current_done=0
+
+  # 集中回滚(不依赖 ERR trap;由各步 `if ! step` 显式触发。逆序复原后 restart 旧 master)。
+  # trap 语义(§1.5)由"任一步失败→_saga_rollback→return 1"等价实现,且覆盖到 history 写为止:
+  # history 写在最后一步,其失败同样走本回滚 → 满足"trap 持续到 history fsync 成功后才解除"。
+  _hotcfg_saga_rollback() {
+    echo "⚠ [hotcfg] 激活 saga 失败 → 回滚全部并 restart 旧 master" >&2
+    if [ "$current_done" = 1 ]; then
+      if [ -n "$old_current" ]; then
+        local t="$platform_root/.current.rb.$$"; rm -f "$t"; ln -s "$old_current" "$t"; mv -T "$t" "$platform_root/current" 2>/dev/null || true
+      else
+        rm -f "$platform_root/current" 2>/dev/null || true
+      fi
+    fi
+    [ "$env_done" = 1 ] && oc_hotcfg_env_restore_tuple "$env_file" "$snap"
+    if [ "$extra_done" = 1 ] && [ -n "$extra_revert" ]; then eval "$extra_revert" || true; fi
+    eval "$restart_cmd" || echo "⚠ [hotcfg] 回滚后 restart 旧 master 失败,须人工核查" >&2
+    rm -f "$snap"
+  }
+
+  # 2) extra:master 源码 symlink 翻转(可选,由 deploy-v5.sh 注入)
+  if [ -n "$extra_apply" ]; then
+    if ! eval "$extra_apply"; then _hotcfg_saga_rollback; return 1; fi
+    extra_done=1
+  fi
+  # 3) 写 env tuple
+  if ! oc_hotcfg_env_write_tuple "$env_file" "$image" "$image_id" "$release" "$bundle_value"; then
+    _hotcfg_saga_rollback; return 1; fi
+  env_done=1
+  # 4) 翻 current(仅 bundle 机制启用时;flip_rev 空 → 跳过)
+  if [ -n "$flip_rev" ]; then
+    if ! oc_hotcfg_flip_current "$flip_rev" "$platform_root"; then _hotcfg_saga_rollback; return 1; fi
+    current_done=1
+  fi
+  # 5) restart 新 master
+  if ! eval "$restart_cmd"; then _hotcfg_saga_rollback; return 1; fi
+  # 6) smoke
+  if ! eval "$smoke_cmd"; then _hotcfg_saga_rollback; return 1; fi
+  # 7) commit:history append(fsync)。写失败仍触发回滚(覆盖到 history fsync)
+  if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value"; then
+    _hotcfg_saga_rollback; return 1; fi
+  # 8) 提交成功
+  rm -f "$snap"
+  oc_hotcfg__log "激活 saga 提交完成 image_id=$image_id release=$release bundle=${flip_rev:-<unchanged>}"
+  return 0
+}
+
+# ─────────────────────────── GC(§1.4)───────────────────────────
+# 保护集 = {history 最近 N 条 committed 引用} ∪ {emergency tuple 引用} ∪ {当前 env tuple + 上一条 committed}
+#        ∪ {docker managed 容器 label 引用的 release/bundle_rev} ∪ {.staging-*}
+# docker 命令失败 → 本轮**放弃 GC** 并告警(不误删运行中容器仍引用的制品)。
+# 其余 rel-*/bundles/* 目录 rm -rf 并记 artifact_retired。
+# 容器 label:com.openclaude.runtime.release / com.openclaude.runtime.bundle_rev
+# managed 过滤 label:com.openclaude.runtime_channel=v5
+oc_hotcfg_gc() {
+  local env_file="${1:-$OC_HOTCFG_ENV_FILE}" hist="${2:-$OC_HOTCFG_HISTORY}"
+  local protect_rel protect_bun tmp_rel tmp_bun
+  tmp_rel="$(mktemp)"; tmp_bun="$(mktemp)"
+
+  _hotcfg_protect() {  # $1=release_path $2=bundle_path(abs)
+    [ -n "$1" ] && printf '%s\n' "$1" >> "$tmp_rel"
+    [ -n "$2" ] && printf '%s\n' "$2" >> "$tmp_bun"
+  }
+
+  # (a) history 最近 N 条 committed
+  local n=0 line
+  while IFS= read -r line && [ "$n" -lt "$OC_HOTCFG_KEEP_TUPLES" ]; do
+    [ -n "$line" ] || continue
+    # 复用 last_committed 的校验:逐条自校
+    local schemaVer seq ts image image_id release bundle want sum
+    schemaVer="$(jq -r '.schemaVer // empty' <<<"$line" 2>/dev/null)" || continue
+    [ -n "$schemaVer" ] || continue
+    seq="$(jq -r '.seq' <<<"$line")"; ts="$(jq -r '.ts' <<<"$line")"
+    image="$(jq -r '.image' <<<"$line")"; image_id="$(jq -r '.image_id' <<<"$line")"
+    release="$(jq -r '.release' <<<"$line")"; bundle="$(jq -r '.bundle' <<<"$line")"
+    want="$(jq -r '.checksum' <<<"$line")"
+    sum="$(oc_hotcfg_history_checksum "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle")"
+    [ "$sum" = "$want" ] || continue
+    _hotcfg_protect "$release" "$bundle"; n=$((n+1))
+  done < <(tac "$hist" 2>/dev/null || true)
+
+  # (b) emergency tuple 引用
+  if [ -f "$env_file" ]; then
+    local emerg; emerg="$(oc_hotcfg_env_get "$env_file" "$OC_HOTCFG_EMERGENCY_KEY")"
+    if [ -n "$emerg" ]; then
+      _hotcfg_protect "$(jq -r '.release // empty' <<<"$emerg" 2>/dev/null)" "$(jq -r '.bundle // empty' <<<"$emerg" 2>/dev/null)"
+    fi
+    # (c) 当前 env tuple
+    _hotcfg_protect "$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_RELEASE)" "$(oc_hotcfg_env_get "$env_file" OC_PLATFORM_BUNDLE)"
+  fi
+
+  # (d) docker managed 容器 label —— 失败即放弃 GC
+  local cids cid rel bun
+  if ! cids="$("$OC_DOCKER_BIN" ps -aq --filter 'label=com.openclaude.runtime_channel=v5' 2>/dev/null)"; then
+    echo "⚠ [hotcfg] docker ps 失败 → 本轮放弃 GC(不误删运行中容器仍引用的制品)" >&2
+    rm -f "$tmp_rel" "$tmp_bun"; return 0
+  fi
+  for cid in $cids; do
+    if ! rel="$("$OC_DOCKER_BIN" inspect --format '{{ index .Config.Labels "com.openclaude.runtime.release" }}' "$cid" 2>/dev/null)"; then
+      echo "⚠ [hotcfg] docker inspect $cid 失败 → 本轮放弃 GC" >&2
+      rm -f "$tmp_rel" "$tmp_bun"; return 0
+    fi
+    bun="$("$OC_DOCKER_BIN" inspect --format '{{ index .Config.Labels "com.openclaude.runtime.bundle_rev" }}' "$cid" 2>/dev/null || true)"
+    _hotcfg_protect "$rel" ""
+    [ -n "$bun" ] && printf '%s\n' "$OC_HOTCFG_PLATFORM_ROOT/bundles/$bun" >> "$tmp_bun"
+  done
+
+  local protect_rel_set protect_bun_set
+  protect_rel_set="$(LC_ALL=C sort -u "$tmp_rel")"; protect_bun_set="$(LC_ALL=C sort -u "$tmp_bun")"
+  rm -f "$tmp_rel" "$tmp_bun"
+
+  # (e) 回收 release:rel-* 目录不在保护集 → rm -rf
+  local d
+  if [ -d "$OC_HOTCFG_RELEASES_ROOT" ]; then
+    for d in "$OC_HOTCFG_RELEASES_ROOT"/rel-*; do
+      [ -d "$d" ] || continue
+      if ! grep -qxF "$d" <<<"$protect_rel_set"; then
+        rm -rf "$d" && echo "  [hotcfg] artifact_retired release: $d" >&2
+      fi
+    done
+    # 清孤儿 staging(>1 天)
+    find "$OC_HOTCFG_RELEASES_ROOT" -maxdepth 1 -name '.staging-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+  fi
+  # (f) 回收 bundle:bundles/* 目录不在保护集 → rm -rf(current 指向者一定在 env tuple 保护集内)
+  if [ -d "$OC_HOTCFG_PLATFORM_ROOT/bundles" ]; then
+    for d in "$OC_HOTCFG_PLATFORM_ROOT"/bundles/*; do
+      [ -d "$d" ] || continue
+      if ! grep -qxF "$d" <<<"$protect_bun_set"; then
+        rm -rf "$d" && echo "  [hotcfg] artifact_retired bundle: $d" >&2
+      fi
+    done
+    find "$OC_HOTCFG_PLATFORM_ROOT/bundles" -maxdepth 1 -name '.staging-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+  fi
+  oc_hotcfg__log "GC 完成(保护 release=$(grep -c . <<<"$protect_rel_set") bundle=$(grep -c . <<<"$protect_bun_set"))"
+}
