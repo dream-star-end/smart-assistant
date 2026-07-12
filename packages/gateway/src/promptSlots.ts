@@ -419,11 +419,6 @@ export const _memoryInternals = {
 }
 
 export function buildToolsSlot(): PromptSlot {
-  // Inject current server time so agents can compute cron expressions
-  const now = new Date()
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
-
   return {
     name: 'TOOLS',
     content: [
@@ -443,9 +438,8 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '## 定时任务',
       '',
-      `**当前服务器时间**: ${timeStr}`,
-      '',
       '用户要求定时任务或提醒时,**必须立即创建,不要说做不到**。',
+      '计算 cron 前必须立刻在 Bash 运行 `date \'+%F %T %z\'` 获取带时区的当前时间,不要依赖提示词生成时刻。',
       '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`;到点执行的任务(非播报提醒)加 `kind="task"`。',
       '查看/修改/删除: `list_reminders()` / `update_reminder(id, ...)` / `delete_reminder(id)`。这套工具与网页「管理中心 → 定时任务」是同一份数据,用户在页面上建的任务你也能看到。',
       '详细指南见 `skill_view("scheduled-tasks")`。',
@@ -962,6 +956,8 @@ export interface PromptSlotApplied {
 export interface PromptContextResult {
   /** 拼好的 prompt 文本(写到 extra-prompt.md 的内容) */
   content: string
+  /** Exact sha256 of `content`, for cache-prefix observability without logging it. */
+  contentSha256: string
   /** 命中的 slot 列表(按拼装顺序) */
   applied: PromptSlotApplied[]
 }
@@ -1104,5 +1100,5 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       return base
     }),
   )
-  return { content, applied }
+  return { content, contentSha256: await sha256Hex(content), applied }
 }

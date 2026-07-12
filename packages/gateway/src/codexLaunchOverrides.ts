@@ -30,6 +30,7 @@
  *     subsystems — they are independent stores; we do not let codex's
  *     stage1/stage2 memory writer touch our MemoryStore.
  */
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
@@ -353,6 +354,15 @@ export async function buildCodexLaunchOverrides(
   })
   const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
+  overridesLog.info('prompt_context_built', {
+    agentId: ctx.agentId,
+    backend: 'codex',
+    prompt_bytes: Buffer.byteLength(instructionsContent, 'utf8'),
+    prompt_sha256: createHash('sha256')
+      .update(instructionsContent, 'utf8')
+      .digest('hex')
+      .slice(0, 12),
+  })
 
   // observability:per-model 行为补丁注入(MODEL_HINT)→ structured log + prom counter。
   // 不打 prompt 原文,只 sha256[:8] + bytes;subprocessRunner 同款。

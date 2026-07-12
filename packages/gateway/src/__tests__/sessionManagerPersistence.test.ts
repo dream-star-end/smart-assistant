@@ -23,7 +23,11 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { SessionManager, type AgentSession } from "../sessionManager.js";
+import {
+  RuntimeRecycleDrainingError,
+  SessionManager,
+  type AgentSession,
+} from "../sessionManager.js";
 import type { SessionStreamEvent } from "../ccbMessageParser.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -170,6 +174,39 @@ async function runPrivateOneTurn(
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 describe("SessionManager pending-persistence tracking", () => {
+  test("runtime recycle drain gates direct submit and external turns", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner(() => {});
+    const session = makeTurnSession(runner);
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+    assert.deepEqual(sm.armRuntimeRecycleDrain(10_000), { accepted: true, activeTurns: 0 });
+    await assert.rejects(
+      sm.submit(session, "cron/direct", () => {}),
+      RuntimeRecycleDrainingError,
+    );
+    await assert.rejects(sm.beginExternalTurn(session), RuntimeRecycleDrainingError);
+    assert.equal(runner.submitted.length, 0);
+  });
+
+  test("runtime recycle drain sees long tool-only/client turns and rolls back", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
+    session._activeTurnCount = 1;
+    session._activeClientTurnCount = 1;
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+    assert.deepEqual(sm.armRuntimeRecycleDrain(10_000), { accepted: false, activeTurns: 2 });
+    assert.equal(sm.isRuntimeRecycleDraining(), false);
+  });
+
+  test("runtime recycle drain expires fail-safe", () => {
+    const sm = new SessionManager(makeConfigStub());
+    assert.equal(sm.armRuntimeRecycleDrain(1_000).accepted, true);
+    assert.equal(sm.isRuntimeRecycleDraining(), true);
+    assert.equal(sm.isRuntimeRecycleDraining(Date.now() + 2_000), false);
+  });
+
   test("external turns keep the active abort controller aligned with lock order", async () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeTurnRunner(() => {});

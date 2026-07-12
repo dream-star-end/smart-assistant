@@ -58,7 +58,7 @@ type FakeRow = {
   state: "active" | "vanished";
   port: number;
   container_internal_id: string | null;
-  last_ws_activity: Date;
+  last_ws_activity: Date | null;
   created_at: Date;
   updated_at: Date;
 };
@@ -209,6 +209,7 @@ class FakePool {
           port: r.port,
           container_internal_id: r.container_internal_id,
           host_uuid: r.host_uuid,
+          last_ws_activity: r.last_ws_activity,
           // getV3ContainerStatus 的 cid=NULL 分支按 created_at 二分 provisioning/missing。
           // 缺此列 → new Date(undefined) → NaN age → 恒 missing(旧测试的隐性 bug)。
           created_at: r.created_at,
@@ -433,6 +434,99 @@ describe("makeV3EnsureRunning", () => {
     assert.strictEqual(ep.coldStart, true, "镜像过期应走 provision 重建,不是 warm 复用");
     assert.ok(captured.stopped >= 1 && captured.removed >= 1, "旧容器应被 stopAndRemove");
     assert.ok(captured.containersCreated >= 1, "应用新镜像 provision 新容器");
+  });
+
+  test("v5 stale image + 活动不足 30 分钟 → 延期并 warm 复用", async () => {
+      const pool = new FakePool();
+      const row = pool.preInsertActive(111, "172.31.1.11", "dockerid-pre-111");
+      const now = 2_000_000;
+      row.last_ws_activity = new Date(now - 29 * 60_000);
+      const { docker, captured } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        now: () => now,
+        runtimeChannelForTest: "v5",
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
+      });
+      const ep = await ensureRunning(111n);
+      assert.equal(ep.coldStart, false);
+      assert.equal(drainCalls, 0);
+      assert.equal(captured.stopped, 0);
+  });
+
+  test("v5 stale image + 恰好 30 分钟 + drain accepted → 回收", async () => {
+      const pool = new FakePool();
+      const row = pool.preInsertActive(112, "172.31.1.12", "dockerid-pre-112");
+      const now = 2_000_000;
+      row.last_ws_activity = new Date(now - 30 * 60_000);
+      const { docker, captured } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        now: () => now,
+        runtimeChannelForTest: "v5",
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
+      });
+      await assert.rejects(ensureRunning(112n), (err) => {
+        assert.ok(err instanceof ContainerUnreadyError);
+        assert.equal(err.reason, "provisioning");
+        return true;
+      });
+      assert.equal(drainCalls, 1);
+      assert.ok(captured.stopped >= 1);
+  });
+
+  test("v5 stale image + NULL 活动 + drain busy/failure → 延期", async () => {
+      for (const result of ["busy", "failed"] as const) {
+        const pool = new FakePool();
+        const row = pool.preInsertActive(113, "172.31.1.13", "dockerid-pre-113");
+        row.last_ws_activity = null;
+        const { docker, captured } = makeDocker({
+          inspectState: "running",
+          containerImage: "openclaude/openclaude-runtime:old",
+        });
+        const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+          probeHealthz: async () => true,
+          probeWsUpgrade: async () => true,
+          runtimeChannelForTest: "v5",
+          requestRuntimeRecycleDrain: async () => result,
+        });
+        const ep = await ensureRunning(113n);
+        assert.equal(ep.coldStart, false, result);
+        assert.equal(captured.stopped, 0, result);
+      }
+  });
+
+  test("v5 force stale recycle 绕过活动与 drain", async () => {
+      const pool = new FakePool();
+      pool.preInsertActive(114, "172.31.1.14", "dockerid-pre-114");
+      const { docker } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        runtimeChannelForTest: "v5",
+        forceStaleImageRecycle: true,
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "busy"; },
+      });
+      await assert.rejects(ensureRunning(114n), (err) => {
+        assert.ok(err instanceof ContainerUnreadyError);
+        assert.equal(err.reason, "provisioning");
+        return true;
+      });
+      assert.equal(drainCalls, 0);
   });
 
   test("active + running + healthz 一直返 false → ContainerUnreadyError('starting')", async () => {

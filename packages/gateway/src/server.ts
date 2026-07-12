@@ -1109,6 +1109,9 @@ export class Gateway {
   private _stopV3RetryDrainer: (() => void) | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
+  /** Host-controlled stale-image barrier: covers dispatch preprocessing. */
+  private _runtimeRecycleDrainUntil = 0
+  private _runtimeRecycleIngressActive = 0
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, {
@@ -2485,6 +2488,32 @@ export class Gateway {
       const secure = this.isHttps(req) ? '; Secure' : ''
       res.setHeader('Set-Cookie', `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`)
       this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // v5 stale-image recycle handshake. Authentication reuses the existing
+    // host→container inbound nonce; v3 never calls this endpoint.
+    if (url.pathname === '/internal/v3/runtime-recycle-drain' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      const ttlMs = 10_000
+      this._runtimeRecycleDrainUntil = Date.now() + ttlMs
+      const sessionDrain = this.sessions.armRuntimeRecycleDrain(ttlMs)
+      const activeIngress = this._runtimeRecycleIngressActive
+      if (!sessionDrain.accepted || activeIngress > 0) {
+        this._runtimeRecycleDrainUntil = 0
+        this.sessions.releaseRuntimeRecycleDrain()
+        this.sendJson(res, 409, {
+          ok: false,
+          reason: 'active_turn',
+          activeIngress,
+          activeTurns: sessionDrain.activeTurns,
+        })
+        return
+      }
+      this.sendJson(res, 200, { ok: true, drainTtlMs: ttlMs })
       return
     }
 
@@ -9774,6 +9803,12 @@ export class Gateway {
       // TODO: 权限响应处理
       return
     }
+    if (this._runtimeRecycleDrainUntil > Date.now()) {
+      this.log.info('runtime recycle drain rejected inbound turn')
+      return
+    }
+    this._runtimeRecycleIngressActive += 1
+    try {
 
     // ── Idempotency dedup (read-only check): skip already-processed messages ──
     // Checked first so duplicates don't consume rate-limit budget
@@ -11246,6 +11281,9 @@ export class Gateway {
     }
     } finally {
       externalTurnGuard?.finish(externalTurnCompleted ? 'completed' : 'errored')
+    }
+    } finally {
+      this._runtimeRecycleIngressActive = Math.max(0, this._runtimeRecycleIngressActive - 1)
     }
   }
 

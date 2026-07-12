@@ -48,6 +48,21 @@ export function isV5Channel(): boolean {
   return getRuntimeChannel() === "v5";
 }
 
+/** Stable provision-time Codex affinity; never includes ephemeral container row ids. */
+export function codexBindingAffinityKey(
+  uid: number | bigint,
+  channel: RuntimeChannel = getRuntimeChannel(),
+): string {
+  const canonicalUid = String(uid);
+  if (!/^[1-9][0-9]*$/.test(canonicalUid)) {
+    throw new TypeError(`invalid uid for codex binding affinity: ${canonicalUid}`);
+  }
+  if (channel !== "v3" && channel !== "v5") {
+    throw new TypeError(`invalid runtime channel for codex binding affinity: ${channel}`);
+  }
+  return `${channel}:user:${canonicalUid}`;
+}
+
 /**
  * docker 容器(按其 runtime_channel label)是否归当前实例 channel 管辖 —— 用于 orphan
  * reconcile 等 docker 侧扫描的【非对称】归属判定(存量 v3 容器在 slice 前创建、无 label):
