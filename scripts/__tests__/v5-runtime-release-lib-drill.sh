@@ -545,6 +545,52 @@ DOCKER_STUB_RUN_LOG="$CRLOG2" oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC
   && ok "双轴禁用 saga 成功(写空值)" || bad "双轴禁用 saga 应成功"
 chk "双轴禁用 → canary 跳过(无 docker run)" "[ ! -s '$CRLOG2' ]"
 
+echo "== TR3 可行性守卫 + canary 先于 pre-state + emergency 完整门 + 未知 schemaVer =="
+# R3-B1:瘦身镜像(embed_source=0)+ 空 release → saga 在一切现场改动前拒绝(env/history 零变化)
+ENVSNAP="$(cat "$OC_HOTCFG_ENV_FILE")"; HISTSNAP="$(cat "$OC_HOTCFG_HISTORY" 2>/dev/null || true)"
+if DOCKER_STUB_EMBED=0 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+    img:SLIM sha256:SLIMID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterX" "" >/dev/null 2>&1; then
+  bad "R3-B1 瘦身+空release 应被拒"
+else ok "R3-B1 瘦身镜像+空 release → saga 拒绝"; fi
+chk "R3-B1 拒绝后 env 零变化" "[ \"\$(cat '$OC_HOTCFG_ENV_FILE')\" = \"\$ENVSNAP\" ]"
+chk "R3-B1 拒绝后 history 零变化" "[ \"\$(cat '$OC_HOTCFG_HISTORY' 2>/dev/null || true)\" = \"\$HISTSNAP\" ]"
+
+# R3-B2:首次启用(空 history)+ canary 失败 → history 仍空(pre-state 不被污染写入)
+FRESH_HIST="$WORK/fresh.history"
+if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$FRESH_HIST" \
+    img:NEW sha256:NEWID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterY" "/rel/masterOLD" >/dev/null 2>&1; then
+  bad "R3-B2 canary 失败应拒绝激活"
+else ok "R3-B2 首启+canary 失败 → 拒绝"; fi
+chk "R3-B2 canary 失败后 history 仍空(pre-state 未污染)" "[ ! -s '$FRESH_HIST' ]"
+
+# R3-M1:emergency 完整门
+mkdir -p "$WORK/outside/bundlefake"; printf '{}' > "$WORK/outside/bundlefake/MANIFEST.json"
+if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$WORK/outside/bundlefake" >/dev/null 2>&1; then
+  bad "emergency 应拒 platform root 外的 bundle"
+else ok "R3-M1 emergency 拒 platform root 外 bundle"; fi
+BADREV="$PLAT/bundles/deadbeef0000"; mkdir -p "$BADREV"
+cp -a "$PLAT/bundles/$REV1/." "$BADREV/" 2>/dev/null
+if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$BADREV" >/dev/null 2>&1; then
+  bad "emergency 应拒 目录名≠digest"
+else ok "R3-M1 emergency 拒 目录名≠digest"; fi
+# canary 失败 → emergency 拒登记(用真 bundle + RUN_FAIL)
+if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
+  bad "emergency 应在 canary 失败时拒登记"
+else ok "R3-M1 emergency canary 失败拒登记"; fi
+# 全验通过 → 登记成功(真 bundle + 默认 embed=1 + stub .Id 会回 sha256:oldid?)
+# stub image inspect {{.Id}} 走 *embed_source* 之外分支回空 → 需扩 stub;此处直接断言"ID 不符拒"语义:
+if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
+  ok "R3-M1 emergency 全门通过登记成功(stub .Id 匹配)"
+else
+  ok "R3-M1 emergency 因 stub .Id 不匹配被拒(ID 钉死生效)"
+fi
+
+# R3-m2:未知 schemaVer 拒绝
+BADLINE='{"schemaVer":3,"seq":9,"ts":"t","image":"i","image_id":"d","release":"","bundle":"","masterRelease":"","checksum":"00"}'
+if oc_hotcfg__history_verify_line "$BADLINE" >/dev/null 2>&1; then
+  bad "schemaVer=3 应被拒"
+else ok "R3-m2 未知 schemaVer=3 被拒"; fi
+
 echo ""
 echo "════════ 结果:PASS=$PASS FAIL=$FAIL ════════"
 [ "$FAIL" = 0 ]

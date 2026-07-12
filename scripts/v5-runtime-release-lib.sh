@@ -258,6 +258,18 @@ oc_hotcfg_selfcheck_bundle() {
   return 0
 }
 
+# 必需叶子校验(M8,单一权威;finalize_bundle 与 write_emergency_tuple 共用):
+# 平台冷启/gateway LKG 快照依赖的叶子必须齐全,缺任一 fail-loud。
+# 清单 = OC_HOTCFG_BUNDLE_REQUIRED_LEAVES(与 TS PLATFORM_BUNDLE_REQUIRED_LEAVES 同步义务,见其定义处)。
+oc_hotcfg_assert_required_leaves() {
+  local root="$1" leaf missing=0
+  for leaf in "${OC_HOTCFG_BUNDLE_REQUIRED_LEAVES[@]}"; do
+    [ -f "$root/$leaf" ] || { echo "  [hotcfg] 缺必需叶子: $leaf" >&2; missing=1; }
+  done
+  [ "$missing" = 0 ] || { oc_hotcfg__die "缺必需叶子(与 TS PLATFORM_BUNDLE_REQUIRED_LEAVES 同步义务)@ $root"; return 1; }
+  return 0
+}
+
 # 规范化 bundle 制品权限:目录 0755、文件 0644、bin/ 下 .sh/.py 与可执行脚本 0755;全 root:root。
 # (仅当以 root 运行时 chown 才成功;非 root 自测环境 chown 失败降级为跳过并不 fail,只保证权限位。)
 oc_hotcfg_normalize_bundle_perms() {
@@ -306,13 +318,8 @@ oc_hotcfg_finalize_bundle() {
   fi
   oc_hotcfg_normalize_bundle_perms "$staging"
   oc_hotcfg_selfcheck_bundle "$staging" || return 1
-  # 必需叶子校验(M8):平台冷启/gateway LKG 快照依赖的叶子必须齐全,缺任一 fail-loud。
-  # 清单 = OC_HOTCFG_BUNDLE_REQUIRED_LEAVES(与 TS PLATFORM_BUNDLE_REQUIRED_LEAVES 同步义务,见其定义处)。
-  local leaf missing_leaf=0
-  for leaf in "${OC_HOTCFG_BUNDLE_REQUIRED_LEAVES[@]}"; do
-    [ -f "$staging/$leaf" ] || { echo "  [hotcfg] 缺必需叶子: $leaf" >&2; missing_leaf=1; }
-  done
-  [ "$missing_leaf" = 0 ] || { oc_hotcfg__die "finalize_bundle: 缺必需叶子(与 TS PLATFORM_BUNDLE_REQUIRED_LEAVES 同步义务)@ $staging"; return 1; }
+  # 必需叶子校验(M8):单一权威函数(emergency 硬验④亦复用,禁再散装内联)。
+  oc_hotcfg_assert_required_leaves "$staging" || return 1
   local digest target
   digest="$(oc_hotcfg_build_manifest "$staging" "$schema" "$commit")" || return 1
   target="$OC_HOTCFG_PLATFORM_ROOT/bundles/$digest"
@@ -583,10 +590,28 @@ oc_hotcfg_write_emergency_tuple() {
     oc_hotcfg__die "emergency: 候选 OC_RUNTIME_RELEASE 非空($release)—— 逃生态要求 release=空(靠镜像内嵌源码)。瘦身稳态请改用显式候选(--image=/--image-id=/--bundle= 指内嵌镜像),不必先把现网翻到空 release。"
     return 1
   fi
-  # 硬验 ④:候选 bundle 目录存在且 MANIFEST 校验通过。
+  # 硬验 ④(R3-M1 升级):候选 bundle 复用正常 bundle 的完整门 —— 仅 digest 自洽不够,
+  # 任意"自洽 MANIFEST 目录"都能过 verify_manifest_full,恢复时才被 supervisor/entrypoint 拒。
+  # 登记时就必须证明"完整可启动":containment + 目录名==digest + 结构 schema + 必需叶子 +
+  # rev-pinned validate-only canary(候选内嵌镜像真跑 entrypoint 校验链,覆盖 seed 语义)。
   [ -n "$bundle" ] || { oc_hotcfg__die "emergency: 候选 OC_PLATFORM_BUNDLE 为空"; return 1; }
   [ -d "$bundle" ] || { oc_hotcfg__die "emergency: 候选 bundle 目录不存在: $bundle"; return 1; }
-  oc_hotcfg_verify_manifest_full "$bundle" || { oc_hotcfg__die "emergency: 候选 bundle MANIFEST 全量校验失败: $bundle"; return 1; }
+  local bundle_real bundles_real rev
+  bundle_real="$(readlink -f "$bundle")" || { oc_hotcfg__die "emergency: 候选 bundle realpath 失败: $bundle"; return 1; }
+  bundles_real="$(readlink -f "$OC_HOTCFG_PLATFORM_ROOT/bundles" 2>/dev/null || true)"
+  case "$bundle_real" in
+    "$bundles_real"/*) : ;;
+    *) oc_hotcfg__die "emergency: 候选 bundle 不在 platform root bundles/ 下: $bundle_real"; return 1 ;;
+  esac
+  rev="$(basename "$bundle_real")"
+  [[ "$rev" =~ ^[0-9a-f]{12}$ ]] || { oc_hotcfg__die "emergency: 候选 bundle 目录名非 12hex rev: $rev"; return 1; }
+  [ "$(jq -r '.digest // empty' "$bundle_real/MANIFEST.json" 2>/dev/null)" = "$rev" ] \
+    || { oc_hotcfg__die "emergency: 候选 bundle 目录名与 MANIFEST.digest 不符: $rev"; return 1; }
+  oc_hotcfg_verify_manifest_full "$bundle_real" || { oc_hotcfg__die "emergency: 候选 bundle MANIFEST 全量校验失败: $bundle_real"; return 1; }
+  oc_hotcfg_selfcheck_bundle "$bundle_real" || { oc_hotcfg__die "emergency: 候选 bundle 结构 schema 校验失败"; return 1; }
+  oc_hotcfg_assert_required_leaves "$bundle_real" || { oc_hotcfg__die "emergency: 候选 bundle 缺必需叶子"; return 1; }
+  oc_hotcfg_canary_boot "$image_id" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "" \
+    || { oc_hotcfg__die "emergency: 候选 tuple canary boot 失败(该 bundle+镜像组合不可启动,拒登记)"; return 1; }
   # 硬验通过 → 写 {image,image_id,bundle}
   val="$(jq -cn --arg image "$image" --arg image_id "$image_id" --arg bundle "$bundle" \
     '{image:$image, image_id:$image_id, bundle:$bundle}')"
@@ -613,13 +638,18 @@ oc_hotcfg_write_emergency_tuple() {
 #   被静默丢弃 —— R2-M3 起编码变更必须 bump schemaVer 并在 verify 按行内 schemaVer 分支。
 oc_hotcfg_history_checksum() {
   local schemaVer="$1" seq="$2" ts="$3" image="$4" image_id="$5" release="$6" bundle="$7" masterRelease="${8:-}"
-  if [ "$schemaVer" = 1 ]; then
-    printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' \
-      "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" | sha256sum | cut -c1-64
-  else
-    printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
-      "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$masterRelease" | sha256sum | cut -c1-64
-  fi
+  # 未知 schemaVer **显式拒绝**(R3-m2):否则伪造/未来版本只要沿用 v2 编码即被静默接受,
+  # "按版本分支验证"失去升版语义(编码变更必 bump schemaVer + 必在此显式登记)。
+  case "$schemaVer" in
+    1)
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+        "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" | sha256sum | cut -c1-64 ;;
+    2)
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+        "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$masterRelease" | sha256sum | cut -c1-64 ;;
+    *)
+      oc_hotcfg__die "history_checksum: 未知 schemaVer=$schemaVer(已知 1|2)"; return 1 ;;
+  esac
 }
 
 # 校验单行 history 条目(R2-M3 单一权威:last/nth/GC 三处共用,禁再散装内联)。
@@ -715,11 +745,27 @@ oc_hotcfg_canary_boot() {
     || { oc_hotcfg__die "canary boot 冒烟失败(entrypoint validate-only 非 0)→ 拒绝激活"; return 1; }
 }
 
+# tuple 可行性守卫(R3-B1):禁止提交"瘦身镜像(embed_source=0)+ 空 release"的目标 tuple ——
+# 该组合下新容器无源码可跑,supervisor 护栏会拒 provision,但那时坏 tuple 已激活 = 全站
+# provision 真空。必须在 saga 一切现场改动之前拦下(**两轴全空也要跑**,恰恰是 --disable-* 场景)。
+# 缺 label 视为内嵌镜像(兼容旧镜像)放行;inspect 失败 = 无法证明可行,拒绝。
+oc_hotcfg_assert_tuple_viable() {
+  local image_id="$1" release="$2" embed
+  [ -n "$release" ] && return 0
+  embed="$("$OC_DOCKER_BIN" image inspect --format '{{index .Config.Labels "oc.runtime.embed_source"}}' "$image_id" 2>/dev/null)" \
+    || { oc_hotcfg__die "tuple_viable: 无法 inspect 镜像 $image_id(release 为空时必须证明镜像内嵌源码)"; return 1; }
+  if [ "$embed" = "0" ]; then
+    oc_hotcfg__die "tuple_viable: 拒绝激活'瘦身镜像(embed_source=0)+ 空 release'——须带显式内嵌镜像(--image/--image-id)或走 --activate-emergency-tuple"
+    return 1
+  fi
+  return 0
+}
+
 # ─────────────────────────── 激活 saga(§1.5)───────────────────────────
 # 宿主本地、可注入 restart/smoke/extra 钩子 → 直接自测(模拟第 N 步失败断言复原)。
 # 真实部署:deploy-v5.sh ship 本库到 kl-mirror 后以远端命令做钩子调用本函数。
 #
-# 顺序:[pre-state history(R2-B2,仅 history 尚无 committed 条目时)]→ [canary boot(R2-M2③,
+# 顺序:[tuple 可行性守卫(R3-B1)]→ [canary boot(R2-M2③,失败零 history 污染)]→ [pre-state history(R2-B2,
 #       仅两轴任一启用)]→ snapshot(旧 env 四键 + 旧 current 目标)→ [extra_apply(master 源码
 #       symlink 翻转)]→ 写 env tuple → 翻 current → restart → smoke → history append(fsync)→
 #       解 trap → GC(库外)。
@@ -740,10 +786,22 @@ oc_hotcfg_activate_saga() {
   local restart_cmd="$9" smoke_cmd="${10}"
   local extra_apply="${11:-}" extra_revert="${12:-}" master_release="${13:-}" prev_master_release="${14:-}"
 
-  # 0) R2-B2:首次启用 pre-state —— history 尚无 committed 条目时,先原子 append 一条"激活前
+  # 0) R3-B1:tuple 可行性守卫(两轴全空也要跑 —— --disable-* 恰是高危场景)。
+  #    R3-B2:守卫与 canary 都必须在 pre-state 记账**之前**:canary 失败若已留 history 条目,
+  #    hotcfg_history_present 会把 --rollback 导向 tuple 路径而倒数第 2 条不存在 = rollback 报废。
+  oc_hotcfg_assert_tuple_viable "$image_id" "$release" || return 1
+
+  # 0.3) R2-M2③:canary boot 冒烟(仅两轴任一启用;rev-pinned,不依赖 current/env → 现场未动,
+  #      失败直接拒绝激活,无需回滚、history 零污染)。
+  if [ -n "$release" ] || [ -n "$flip_rev" ]; then
+    oc_hotcfg_canary_boot "$image_id" "$platform_root" "$flip_rev" "$release" || return 1
+  fi
+
+  # 0.6) R2-B2:首次启用 pre-state —— history 尚无 committed 条目时,先原子 append 一条"激活前
   #    live 状态"(env 四键**逐字面**,缺键记空 + 激活前 master,preState:true)。保证首次启用后
   #    --rollback=1 能退回启用前(倒数第 2 条=pre-state,配合 R2-B1 三态写把空值也恢复回去)。
   #    该记录反映真实旧现场:saga 后续失败也**不**回滚它;有 committed 条目即不再补(幂等)。
+  #    置于守卫/canary 之后(R3-B2):所有"零现场改动即可失败"的检查都过了才记账。
   if [ -z "$(oc_hotcfg_history_last_committed "$hist")" ]; then
     local pre_image pre_image_id pre_release pre_bundle
     pre_image="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE)"
@@ -754,12 +812,6 @@ oc_hotcfg_activate_saga() {
       oc_hotcfg__die "activate_saga: pre-state history 记录写入失败(现场未动,拒绝继续激活)"; return 1
     fi
     oc_hotcfg__log "pre-state 已记账(首次启用;--rollback=1 可退回启用前)"
-  fi
-
-  # 0.5) R2-M2③:canary boot 冒烟(仅两轴任一启用;rev-pinned,不依赖 current/env → 现场未动,
-  #      失败直接拒绝激活,无需回滚)。
-  if [ -n "$release" ] || [ -n "$flip_rev" ]; then
-    oc_hotcfg_canary_boot "$image_id" "$platform_root" "$flip_rev" "$release" || return 1
   fi
 
   # 1) 快照旧现场(旧 env 四键 + 旧 current 目标)

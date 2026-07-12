@@ -558,6 +558,9 @@ try {
   const bakedSystemSkills = join(BAKED_SKILLS, ".system");
   const targetSystemSkills = join(TARGET_SKILLS, ".system");
   if (existsSync(bakedSystemSkills)) {
+    // R3-m1:guard 必须在 mkdir **之前** —— recursive mkdir 会跟随 symlinked 祖先在卷外创建目录,
+    // 事后 realpath 复核只能挡住文件写、挡不住目录已越界落盘。
+    assertVolumeAncestryNoSymlink(targetSystemSkills, CODEX_HOME_DIR, lstatSync, dirname);
     mkdirSync(targetSystemSkills, { recursive: true });
     assertDirWithinVolume(targetSystemSkills, CODEX_HOME_DIR); // R2-M4:mkdir 后 realpath 复核
     for (const entry of readdirSync(bakedSystemSkills, { withFileTypes: true })) {
@@ -602,6 +605,8 @@ try {
       "[entrypoint] platform codex-skills overlay skipped: no bundle/codex-skills on path (dev-only)",
     );
   } else {
+    // R3-m1:guard 先于 mkdir(理由同上方 baked skills 段)。
+    assertVolumeAncestryNoSymlink(targetSystemSkills, CODEX_HOME_DIR, lstatSync, dirname);
     mkdirSync(targetSystemSkills, { recursive: true });
     assertDirWithinVolume(targetSystemSkills, CODEX_HOME_DIR); // R2-M4:mkdir 后 realpath 复核
     for (const entry of readdirSync(platformCodexSkillsDir, { withFileTypes: true })) {
@@ -815,9 +820,11 @@ try {
       console.error(`[entrypoint] WARN: ${agentId} persona path escapes agents dir, skipped`);
       return personaPath;
     }
-    mkdirSync(personaDir, { recursive: true });
-    // R2-M4:mkdir 后复核 personaDir realpath 仍在 volume 内(拒经 symlinked agents/ 逃逸,护住下方读/写)。
+    // R3-m1:guard 先于 mkdir(recursive mkdir 会穿 symlinked 祖先在卷外建目录);
+    // R2-M4:mkdir 后再 realpath 复核。两道均命中 → WARN 跳过该 agent persona,不崩。
     try {
+      assertVolumeAncestryNoSymlink(personaDir, ocConfigDir, lstatSync, dirname);
+      mkdirSync(personaDir, { recursive: true });
       assertDirWithinVolume(personaDir, ocConfigDir);
     } catch (guardErr) {
       console.error(

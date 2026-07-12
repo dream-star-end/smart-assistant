@@ -139,6 +139,7 @@ for arg in "$@"; do
     --disable-platform-bundle) DISABLE_BUNDLE_FLAG=1 ;;
     --disable-runtime-release) DISABLE_RELEASE_FLAG=1 ;;
     --emergency-tuple) MODE="emergency-tuple" ;;
+    --activate-emergency-tuple) MODE="activate-emergency-tuple" ;;
     --image=*) EMERG_IMAGE="${arg#*=}" ;;
     --image-id=*) EMERG_IMAGE_ID="${arg#*=}" ;;
     --bundle=*) EMERG_BUNDLE="${arg#*=}" ;;
@@ -169,8 +170,17 @@ done
 if [[ ( "$DISABLE_RELEASE_FLAG" == 1 || "$DISABLE_BUNDLE_FLAG" == 1 ) && "$MODE" != "deploy" && "$MODE" != "dist" ]]; then
   echo "✗ --disable-* 仅适用于 deploy / --dist(禁用轴须走完整激活 saga+smoke)" >&2; exit 2
 fi
-if [[ -n "$EMERG_IMAGE$EMERG_IMAGE_ID$EMERG_BUNDLE" && "$MODE" != "emergency-tuple" ]]; then
-  echo "✗ --image/--image-id/--bundle 是 --emergency-tuple 的显式候选参数,不用于其它模式" >&2; exit 2
+# --image/--image-id 的合法宿主:emergency-tuple(显式候选)与 --disable-runtime-release
+# (R3-B1:瘦身稳态下禁用 release 轴必须显式给出**内嵌源码**镜像,否则 tuple 可行性守卫
+# 会拒'瘦身镜像+空 release';--bundle 仅 emergency-tuple 用)。
+if [[ -n "$EMERG_BUNDLE" && "$MODE" != "emergency-tuple" ]]; then
+  echo "✗ --bundle 是 --emergency-tuple 的显式候选参数,不用于其它模式" >&2; exit 2
+fi
+if [[ -n "$EMERG_IMAGE$EMERG_IMAGE_ID" && "$MODE" != "emergency-tuple" && "$DISABLE_RELEASE_FLAG" != 1 ]]; then
+  echo "✗ --image/--image-id 仅用于 --emergency-tuple 或 --disable-runtime-release" >&2; exit 2
+fi
+if [[ "$DISABLE_RELEASE_FLAG" == 1 && -n "$EMERG_IMAGE" && -z "$EMERG_IMAGE_ID" ]]; then
+  echo "✗ --disable-runtime-release --image= 必须同时给 --image-id=(ID 钉死,防 tag 漂移)" >&2; exit 2
 fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
@@ -936,9 +946,19 @@ activate_runtime_tuple() {
   if hotcfg_release_axis_on; then
     image="$RUNTIME_IMAGE_REF"; image_id="$RUNTIME_IMAGE_ID"; release="$BUILT_RUNTIME_RELEASE"
   else
-    image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
-    image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
+    if [[ "$DISABLE_RELEASE_FLAG" == 1 && -n "$EMERG_IMAGE" ]]; then
+      # R3-B1:禁用 release 轴时显式切换到内嵌源码镜像(tuple 可行性守卫要求 embed_source≠0;
+      # ID 就地核验,tag 漂移在此拦下而非等 saga)。
+      image="$EMERG_IMAGE"
+      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
+      [[ "$image_id" == "$EMERG_IMAGE_ID" ]] \
+        || { echo "✗ --image 的 immutable ID($image_id)与 --image-id($EMERG_IMAGE_ID)不符" >&2; return 1; }
+    else
+      image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
+      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
+    fi
     # R2-B1:release 轴禁用/未启用 → 传**空串**(恒写 OC_RUNTIME_RELEASE=,值空=禁用,--disable 后即稳态)。
+    # 注:saga 内 oc_hotcfg_assert_tuple_viable 会对"镜像 embed_source=0 + 空 release"fail-loud(R3-B1)。
     release=""
   fi
   # bundle 轴:启用则翻新 rev + 写新绝对路径;禁用/未启用 → flip_rev 空(不翻 current)+ 写空值(R2-B1)。
@@ -984,6 +1004,40 @@ emergency_tuple() {
   hotcfg_rmt oc_hotcfg_write_emergency_tuple "$V5_ENV" "$EMERG_IMAGE" "$EMERG_IMAGE_ID" "$EMERG_BUNDLE" 2>&1 | sed 's/^/  /' \
     || { echo "✗ 写 emergency tuple 失败" >&2; exit 1; }
   echo "✓ emergency tuple 已写入 $V5_ENV(破坏兼容性变更后须刷新并实跑 smoke)。"
+}
+
+# ── 5b. --activate-emergency-tuple:把已登记的 emergency tuple 激活为现网 tuple(R3-B1)──
+# 逃生场景(瘦身稳态下 release/bundle 产物不可用、须退回内嵌源码镜像)的一等路径:
+# 读 OC_RUNTIME_EMERGENCY_TUPLE(登记时已过完整硬验:embed≠0/ID 钉死/bundle 完整门/canary)
+# → 组目标 tuple{image,image_id,release="",bundle} 走**完整激活 saga**(canary+restart+smoke+
+# history 记账,失败自动回滚)。master 源码不动(extra 空);再次核验 inspect .Id==登记 ID,
+# 防登记后镜像被删/tag 漂移(恢复前复核,R2-M1)。
+activate_emergency_tuple() {
+  echo "══ 激活 emergency tuple(逃生:内嵌源码镜像 + 登记 bundle,release 置空)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 读 OC_RUNTIME_EMERGENCY_TUPLE → 核验 ID → saga{canary→env(release=空)→flip current→restart→smoke→history}"
+    return 0
+  fi
+  local ej image image_id bundle rev live_id prev_src
+  ej="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_EMERGENCY_TUPLE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
+  [[ -n "$ej" ]] || { echo "✗ env 无 OC_RUNTIME_EMERGENCY_TUPLE(先 --emergency-tuple 登记)" >&2; exit 1; }
+  image="$(jq -r '.image // empty' <<<"$ej")"; image_id="$(jq -r '.image_id // empty' <<<"$ej")"; bundle="$(jq -r '.bundle // empty' <<<"$ej")"
+  [[ -n "$image" && -n "$image_id" && -n "$bundle" ]] || { echo "✗ emergency tuple JSON 字段缺失: $ej" >&2; exit 1; }
+  live_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image_id'" 2>/dev/null || true)"
+  [[ "$live_id" == "$image_id" ]] || { echo "✗ emergency 镜像 ID 复核失败(登记 $image_id,现查 ${live_id:-<gone>})—— 镜像可能已被删,须重建内嵌镜像再登记" >&2; exit 1; }
+  rev="$(basename "$bundle")"
+  ssh "$KL_HOST" "[ -d '$bundle' ]" || { echo "✗ emergency bundle 已不存在: $bundle(GC 保护集应含它,须排查)" >&2; exit 1; }
+  prev_src="$(bg_current_release)"
+  local restart_cmd smoke_cmd
+  restart_cmd="systemctl restart '$V5_UNIT'"
+  smoke_cmd="hz=\"\"; for i in \$(seq 1 15); do hz=\$(curl -fsS http://127.0.0.1:$V5_PORT/healthz 2>/dev/null||true); [ -n \"\$hz\" ] && break; sleep 2; done; printf '%s' \"\$hz\" | grep -q '\"ok\":true' && printf '%s' \"\$hz\" | grep -q '\"channel\":\"v5\"'"
+  # masterRelease=prev_src(master 源码不动,history 记当前 live);extra_apply/revert 传空。
+  hotcfg_rmt oc_hotcfg_activate_saga \
+    "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "$OC_HOTCFG_HISTORY" \
+    "$image" "$image_id" "" "$bundle" \
+    "$restart_cmd" "$smoke_cmd" "" "" "$prev_src" "$prev_src" \
+    || { echo "✗ emergency 激活 saga 失败,已自动回滚" >&2; exit 1; }
+  echo "✓ emergency tuple 已激活(image=$image release=<empty> bundle=$rev);存量容器按 runtimeStale 滚动。"
 }
 
 # 一次性迁移:实目录 $REMOTE_SRC → symlink 布局(须在无并发部署的受控窗口跑)。
@@ -1591,6 +1645,7 @@ case "$MODE" in
   deploy)    deploy ;;
   dist)      deploy_dist ;;
   emergency-tuple) emergency_tuple ;;
+  activate-emergency-tuple) activate_emergency_tuple ;;
   prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;
   offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
   stage)     assert_not_bluegreen_for_cutover; stage ;;
