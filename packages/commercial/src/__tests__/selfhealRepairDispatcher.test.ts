@@ -25,6 +25,8 @@ interface FakeOpts {
   failedCount?: number;
   cooldownHit?: boolean;
   insertError?: { code?: string };
+  /** Guarded INSERT…SELECT matched 0 rows (incident recovered mid-dispatch). */
+  insertNoRow?: boolean;
 }
 
 /** 构造一套 fake query/tx,按 SQL 关键片段返回 canned 行。 */
@@ -61,6 +63,9 @@ function makeFake(opts: FakeOpts = {}) {
       query: async (sql: string) => {
         if (/INSERT INTO codex_repairs/.test(sql) && /RETURNING id::text/.test(sql)) {
           if (opts.insertError) throw opts.insertError;
+          // insertNoRow: the guarded INSERT…SELECT matched 0 rows (incident
+          // resolved / condition recovered between read and insert) — H2 TOCTOU.
+          if (opts.insertNoRow) return qr([]);
           return qr([{ id: state.insertedId, attempt: state.insertedAttempt }]);
         }
         if (/UPDATE codex_repairs/.test(sql)) {
@@ -135,6 +140,16 @@ describe("repairDispatcher.dispatchRepair", () => {
     assert.equal(r.status, "skipped");
     assert.equal((r as { reason: string }).reason, "singleflight_conflict");
     assert.equal(calls.length, 0);
+  });
+
+  test("TOCTOU(H2):incident 读到 open 但守卫 INSERT 0 行 → skipped:incident_recovered,不派单", async () => {
+    // incident 步1 读为 open,但恢复发生在读与守卫 INSERT…SELECT 之间(WHERE 匹配 0 行)。
+    const { fakeQuery, fakeTx } = makeFake({ insertNoRow: true });
+    const { fetchFn, calls } = makeFetch(202);
+    const r = await dispatchRepair("1", { query: fakeQuery, tx: fakeTx, fetch: fetchFn, now: () => NOW });
+    assert.equal(r.status, "skipped");
+    assert.equal((r as { reason: string }).reason, "incident_recovered");
+    assert.equal(calls.length, 0, "已恢复系统绝不派单");
   });
 
   test("happy path:INSERT ok + POST 202 → dispatched,POST 头/URL 正确", async () => {

@@ -255,23 +255,36 @@ export async function dispatchRepair(
   // 4) singleflight INSERT(pending)。attempt = incident 现有最大 attempt+1。
   //    受 ux_repair_singleflight(全表活跃至多一行)+ UNIQUE(incident_id,attempt) 保护:
   //    任何重叠 → 23505 → 丢弃(视为已有活跃修复在进行)。
-  let created: { id: string; attempt: number };
+  let created: { id: string; attempt: number } | null;
   try {
     created = await d.tx(async (client: PoolClient) => {
+      // TOCTOU 收口(Codex H2):在同一条 INSERT…SELECT 里再核 incident 仍活跃 **且**
+      // condition 仍 firing。若在步1读到 open 之后 condition 已恢复 / incident 被
+      // resolve,SELECT 返 0 行 → 不插入 → 不派单(绝不对已恢复系统派 codex 改动)。
       const ins = await client.query<{ id: string; attempt: number }>(
         `INSERT INTO codex_repairs (incident_id, status, attempt, tier, created_at, updated_at)
-         SELECT $1::bigint, 'pending', COALESCE(MAX(attempt),0)+1, 'tier2', NOW(), NOW()
-           FROM codex_repairs WHERE incident_id = $1::bigint
+         SELECT i.id, 'pending', COALESCE(MAX(cr.attempt), 0) + 1, 'tier2', NOW(), NOW()
+           FROM incidents i
+           LEFT JOIN codex_repairs cr ON cr.incident_id = i.id
+           LEFT JOIN admin_alert_rule_state c ON c.rule_id = i.condition_key
+          WHERE i.id = $1::bigint
+            AND i.status <> 'resolved'
+            AND COALESCE(c.firing, FALSE) = TRUE
+          GROUP BY i.id
          RETURNING id::text AS id, attempt`,
         [incidentId],
       );
-      return { id: ins.rows[0].id, attempt: Number(ins.rows[0].attempt) };
+      return ins.rows[0] ? { id: ins.rows[0].id, attempt: Number(ins.rows[0].attempt) } : null;
     });
   } catch (err) {
     if ((err as { code?: string })?.code === "23505") {
       return { status: "skipped", reason: "singleflight_conflict" };
     }
     throw err;
+  }
+  if (!created) {
+    // incident 已 resolve / condition 已恢复(TOCTOU),不派单。
+    return { status: "skipped", reason: "incident_recovered" };
   }
 
   // 5) 隧道 POST(body 只含 id)。202 → CAS pending→dispatched;失败留 pending 待 redispatch。

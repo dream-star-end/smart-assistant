@@ -148,11 +148,13 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
     }
   }
 
-  // 2) 活跃 incident 的 condition firing=false(或缺失)→ resolve(level-triggered)
+  // 2) 活跃 incident 的 condition **存在且显式 firing=false** → resolve(level-triggered)。
+  //    condition 行**缺失**视为 unknown/stale(行被删 / 检测器空档),**不** resolve——
+  //    在"缺失即恢复"下会发假恢复通知、把仍在异常的事故错误关闭(Codex H1)。宁可留 open。
   for (const inc of activeR.rows) {
     const cond = conditionsByKey.get(inc.condition_key);
-    const firing = cond?.firing === true;
-    if (firing) continue;
+    if (!cond) continue; // 缺失 = unknown,保持 open,不发假恢复
+    if (cond.firing === true) continue;
     try {
       const r = await tx((client: PoolClient) => resolveIncident(inc.id, "probe", client));
       if (r.resolved) {
