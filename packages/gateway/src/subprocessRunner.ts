@@ -1294,6 +1294,13 @@ export class SubprocessRunner extends EventEmitter {
         writeFileSync(path, promptResult.content)
         out.extraPromptFile = path
       }
+      runnerLog.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'ccb',
+        prompt_bytes: Buffer.byteLength(promptResult.content, 'utf8'),
+        prompt_sha256: promptResult.contentSha256.slice(0, 12),
+      })
       // observability:MODEL_HINT 命中(per-model 行为补丁注入)→ structured log + prom counter。
       // 不打 prompt 原文(可能含敏感引导),只记 sha256[:8] + bytes。
       // 关键安全约束:label 与 log 字段都只用 hint.meta.model_id(provider 已 canonicalize),

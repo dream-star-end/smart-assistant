@@ -19,10 +19,12 @@
  * 测试隔离:每个 test 后 setModelHintProvider(null) 防交叉污染(模块级状态)。
  */
 import * as assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import {
   buildModelHintSlot,
   buildPromptContext,
+  buildToolsSlot,
   setModelHintProvider,
 } from '../promptSlots.js'
 
@@ -139,6 +141,10 @@ describe('buildPromptContext result shape', () => {
   it('returns { content, applied } and applied items have bytes + sha256(64 hex)', async () => {
     const result = await buildPromptContext({ agentId: 'nonexistent-agent-for-test' })
     assert.equal(typeof result.content, 'string')
+    assert.equal(
+      result.contentSha256,
+      createHash('sha256').update(result.content, 'utf8').digest('hex'),
+    )
     assert.ok(Array.isArray(result.applied))
     assert.ok(result.applied.length > 0, 'at least AGENTS + TOOLS slots always emit')
     for (const slot of result.applied) {
@@ -147,6 +153,14 @@ describe('buildPromptContext result shape', () => {
       assert.ok(slot.bytes > 0)
       assert.match(slot.sha256, /^[0-9a-f]{64}$/, `sha256 must be 64-char lowercase hex (got ${slot.sha256})`)
     }
+  })
+
+  it('TOOLS is wall-clock stable and tells scheduling turns to query date', () => {
+    const first = buildToolsSlot().content
+    const second = buildToolsSlot().content
+    assert.equal(first, second)
+    assert.doesNotMatch(first, /当前服务器时间/)
+    assert.match(first, /date '\+%F %T %z'/)
   })
 
   it('applied[].name list reflects slot order (AGENTS … TOOLS … MODEL_HINT … RESEARCH)', async () => {

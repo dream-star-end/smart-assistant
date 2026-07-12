@@ -59,7 +59,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 |---|---|---|---|
 | 计费突增 | 昨日(北京时间自然日)单用户 `usage_records`(status='success')credits 合计 | > 前 7 日日均 ×3 **且** >2000 | 双条件防误报:倍数抓突变,绝对值滤掉小额用户(10→40 credits 无意义);新用户无历史 → 日均按 0,>2000 即报(首日暴刷值得看一眼) |
 | 免单率 | (零输出免单 + 冲正退款笔数) / 昨日成功计费笔数 | >20%(样本 <10 笔不判) | 免单面扩大 = 上游 hang/超时恶化或计费口径 bug;线上基线 ~7%(2026-07-05:19/276),20% 为基线 ~3 倍 |
-| GPT-5.6 缓存命中 | 昨日成功 `usage_records`,按 `model` 分组;`cache_read_tokens / (input_tokens + cache_read_tokens)` 加权计算(`cache_write_tokens` 不计入),COUNT 是 usage records 数而非 turn 数 | 单模型总输入 ≥1,000,000 tokens **且**命中率 <85% | 按模型避免 Terra 高命中掩盖 Sol;大输入门槛过滤低流量抖动 |
+| GPT-5.6 缓存命中 | 今日(北京时间 0 点至当前)成功 `usage_records`,按 `model` 分组;`cache_read_tokens / (input_tokens + cache_read_tokens)` 加权计算。基线取今日之前最近 3 个有正输入的活跃日并按总 token 加权;同时报 Top 用户/非空会话输入集中度 | 当前总输入 ≥5,000,000 且 records ≥10,并满足“<70%”或“<85%、较三活跃日基线下降 ≥15pp 且基线总输入 ≥5,000,000” | 绝对低线抓真实异常,相对基线抓模型自身退化;样本双门过滤低流量抖动。Top 集中度用于识别单个长会话主导的假全局告警 |
 | 日报正文 | v5 近 24h 活跃用户数/会话数(sessions.db `client_sessions`,`deleted_at IS NULL`)、错误日志行数(`"level":"error"`)、昨日计费笔数/总消耗 | 无(纯日报) | 即使无告警也发一条 info,兼作"监控还活着"的心跳 |
 
 免单两种形态的落库形状(与代码对齐):
@@ -84,7 +84,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 
 ```
 scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / POOL_MAX / REALERT_SECS
-scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_HIT_PCT_MIN / CACHE_MIN_INPUT_TOKENS
+scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_SAMPLE_MIN_INPUT / CACHE_MIN_RECORDS / CACHE_ABSOLUTE_LOW_BPS / CACHE_REGRESSION_LOW_BPS / CACHE_DROP_MIN_BPS
 ```
 
 注意:脚本经 `deploy-v5.sh` rsync 分发,**线上直接改会被下次部署覆盖** —— 改阈值要改在仓里(worktree → canonical → 部署),和其他 v5 代码同纪律。

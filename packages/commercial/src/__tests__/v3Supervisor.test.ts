@@ -395,6 +395,7 @@ class FakePool {
               container_internal_id: r.container_internal_id,
               host_uuid: r.host_uuid,
               created_at: r.created_at,
+              last_ws_activity: r.last_ws_activity,
             }],
           };
         }

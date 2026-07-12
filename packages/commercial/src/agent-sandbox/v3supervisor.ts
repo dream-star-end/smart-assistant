@@ -64,7 +64,7 @@ import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js"
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
 import { v3MayServe } from "../channelMigration/channelState.js";
-import { dockerContainerOwnedByChannel, getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
+import { codexBindingAffinityKey, dockerContainerOwnedByChannel, getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
@@ -936,6 +936,8 @@ export interface V3ContainerStatus {
    * deps.selfHostId = remote host(caller 的 readiness/stop 要走 node-tunnel)。
    */
   hostId: string | null;
+  /** Last client↔container bridge activity persisted by the master. */
+  lastWsActivity: Date | null;
   /**
    * 运行容器实际镜像(docker inspect 的 Config.Image,如 openclaude/...:v5-ccb-<sha>)。
    * 供 ensureRunning 比对 deps.image 做"镜像不符→滚动回收"。本地路径可取;remote
@@ -2338,7 +2340,10 @@ export async function provisionV3Container(
         : readCodexContainerDirFromEnv();
       // boundCodexAccountId 声明在中段顶层(Tx2 与 cid 一并写库),此处只赋值。
       try {
-        const picked = await pickCodexAccountForBinding(String(row.id), {});
+        const picked = await pickCodexAccountForBinding(
+          codexBindingAffinityKey(uid),
+          {},
+        );
         if (picked) {
           let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
           try {
@@ -3008,6 +3013,7 @@ export async function getV3ContainerStatus(
     container_internal_id: string | null;
     host_uuid: string | null;
     created_at: Date;
+    last_ws_activity: Date | null;
   }>(
     // host(bound_ip): PG INET 类型 ::text 会带 /32 netmask(e.g. 172.30.227.97/32),
     // 这串拼进 ws://host:port/ws 会让 dns lookup 直接 fail,readiness probe 永远 false,
@@ -3015,7 +3021,8 @@ export async function getV3ContainerStatus(
     // 与 IPv4/IPv6 都兼容,与 provision 路径 INSERT 时传入的 JS string 一致。
     // P1a 隔离:按 runtime_channel 过滤 —— v3 实例只见 v3 容器、v5 只见 v5,
     // 防换 (user_id,runtime_channel) 复合唯一后 v3/v5 互相捞到对方的 active 行。
-    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid, created_at
+    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid,
+            created_at, last_ws_activity
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active' AND runtime_channel = $2::text
         AND NOT EXISTS (
@@ -3051,6 +3058,7 @@ export async function getV3ContainerStatus(
       dockerContainerId: "",
       state: ageMs < PROVISION_INFLIGHT_GRACE_MS ? "provisioning" : "missing",
       hostId: row.host_uuid,
+      lastWsActivity: row.last_ws_activity,
     };
   }
 
@@ -3091,6 +3099,7 @@ export async function getV3ContainerStatus(
     dockerContainerId: row.container_internal_id,
     state,
     hostId: row.host_uuid,
+    lastWsActivity: row.last_ws_activity,
     ...(image ? { image } : {}),
   };
 }

@@ -68,6 +68,8 @@ import { promoteOnce } from "../compute-pool/imagePromote.js";
 import { observeContainerEnsureDuration } from "../admin/metrics.js";
 import { isV5Channel } from "../runtimeChannel.js";
 import { randomUUID } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import { computeInboundNonce } from "../bridgeSecret.js";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
 const RETRY_AFTER_PROVISIONING_SEC = 5;
@@ -111,6 +113,52 @@ const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
 const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
 // 已迁移到 v5:短重试;客户端应据 reason="migrated_to_v5" 重取(命中路由 cookie)导向 v5。
 const RETRY_AFTER_MIGRATED_V5_SEC = 3;
+const V5_STALE_IMAGE_IDLE_MS = 30 * 60_000;
+const V5_RECYCLE_DRAIN_TIMEOUT_MS = 1_500;
+
+export type RuntimeRecycleDrainResult = "accepted" | "busy" | "failed";
+
+/** Authenticated v5 host→container turn-drain handshake. */
+export function requestRuntimeRecycleDrain(
+  deps: V3SupervisorDeps,
+  status: V3ContainerStatus,
+  timeoutMs = V5_RECYCLE_DRAIN_TIMEOUT_MS,
+): Promise<RuntimeRecycleDrainResult> {
+  const bridgeSecret = deps.bridgeSecret;
+  if (!bridgeSecret || isRemoteHost(status.hostId, deps.selfHostId)) {
+    return Promise.resolve("failed");
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: RuntimeRecycleDrainResult): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const req = httpRequest({
+      host: status.boundIp,
+      port: status.port,
+      path: "/internal/v3/runtime-recycle-drain",
+      method: "POST",
+      headers: {
+        "x-openclaude-container-id": String(status.containerId),
+        "x-openclaude-inbound-nonce": computeInboundNonce(
+          bridgeSecret,
+          status.containerId,
+        ),
+        "content-length": "0",
+      },
+    }, (res) => {
+      res.resume();
+      if (res.statusCode === 200) finish("accepted");
+      else if (res.statusCode === 409) finish("busy");
+      else finish("failed");
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("runtime recycle drain timeout")));
+    req.once("error", () => finish("failed"));
+    req.end();
+  });
+}
 
 /**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
@@ -135,6 +183,15 @@ export interface EnsureRunningOptions {
   sleep?: (ms: number) => Promise<void>;
   /** 测试钩子:可注入"现在是几号"用于 timeout 计算 */
   now?: () => number;
+  /** 测试钩子:覆盖 v5 stale-image drain handshake。 */
+  requestRuntimeRecycleDrain?: (
+    deps: V3SupervisorDeps,
+    status: V3ContainerStatus,
+  ) => Promise<RuntimeRecycleDrainResult>;
+  /** @internal 测试隔离:避免并发 test 通过 process.env 串扰。 */
+  runtimeChannelForTest?: "v3" | "v5";
+  /** @internal 测试隔离:生产默认仍读 OC_V5_FORCE_STALE_IMAGE_RECYCLE。 */
+  forceStaleImageRecycle?: boolean;
   /**
    * 测试钩子:跨 host 路径下用 hostId hydrate NodeAgentTarget(给 bridge 用)。
    * 默认实现:`getHostById` + `hostRowToTarget`。生产代码不必传。
@@ -277,6 +334,11 @@ export function makeV3EnsureRunning(
   const readinessOpts = buildReadinessOpts(options);
   const resolveBridgeTunnelTarget =
     options.resolveBridgeTunnelTarget ?? defaultResolveBridgeTunnelTarget;
+  const drainRuntime = options.requestRuntimeRecycleDrain ?? requestRuntimeRecycleDrain;
+  const wallNow = options.now ?? Date.now;
+  const applyV5StalePolicy = options.runtimeChannelForTest
+    ? options.runtimeChannelForTest === "v5"
+    : isV5Channel();
 
   return async function ensureRunning(uidBig: bigint): Promise<{
     host: string;
@@ -336,7 +398,38 @@ export function makeV3EnsureRunning(
       typeof status.image === "string" &&
       typeof deps.image === "string" &&
       status.image !== deps.image;
-    if (imageStale) {
+    let recycleStaleImage = imageStale;
+    if (imageStale && applyV5StalePolicy) {
+      const force = options.forceStaleImageRecycle
+        ?? process.env.OC_V5_FORCE_STALE_IMAGE_RECYCLE === "1";
+      const lastActivityMs = status?.lastWsActivity?.getTime();
+      const recentlyActive =
+        !force &&
+        typeof lastActivityMs === "number" &&
+        wallNow() - lastActivityMs < V5_STALE_IMAGE_IDLE_MS;
+      if (recentlyActive) {
+        recycleStaleImage = false;
+        console.info("[v3ensureRunning] stale-image recycle deferred", {
+          uid,
+          reason: "recent_activity",
+          idleMs: Math.max(0, wallNow() - (lastActivityMs as number)),
+        });
+      } else if (!force && status) {
+        const drainResult = await drainRuntime(deps, status);
+        if (drainResult !== "accepted") {
+          recycleStaleImage = false;
+          console.warn("[v3ensureRunning] stale-image recycle deferred", {
+            uid,
+            reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+          });
+        }
+      } else if (force) {
+        console.warn("[v3ensureRunning] forced stale-image recycle may terminate active work", {
+          uid,
+        });
+      }
+    }
+    if (recycleStaleImage) {
       console.warn("[v3ensureRunning] recycling stale-image container", {
         uid,
         current: status?.image,
@@ -345,7 +438,7 @@ export function makeV3EnsureRunning(
     }
 
     // 2a) running 且镜像最新 → 直接进 readiness 探活(HTTP /healthz + WS upgrade)
-    if (status && status.state === "running" && !imageStale) {
+    if (status && status.state === "running" && !recycleStaleImage) {
       const endpoint = chooseReadinessEndpoint(
         status.hostId,
         deps.selfHostId,
@@ -408,7 +501,7 @@ export function makeV3EnsureRunning(
     //     落本分支,由 stopAndRemove(对 NULL cid 提前 return,只翻 vanished 不动 docker)+ 重建自愈。
     // imageStale(running 但镜像过期)也走这里:stopAndRemove 对 running 容器先 stop 再 remove,
     // 然后 fall through 到 (3) 用 deps.image 重建 → 滚动升级抵达存量长活容器。
-    if (status && (status.state === "stopped" || status.state === "missing" || imageStale)) {
+    if (status && (status.state === "stopped" || status.state === "missing" || recycleStaleImage)) {
       try {
         await stopAndRemoveV3Container(deps, {
           id: status.containerId,

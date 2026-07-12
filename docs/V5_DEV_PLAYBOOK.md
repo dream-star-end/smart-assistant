@@ -280,9 +280,14 @@ ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin
 # 完成判定:docker images 出现该 tag(日志 grep FATAL 会误报 Dockerfile 里的 echo 字符串)
 ssh kl-mirror 'sed -i "s|^OC_RUNTIME_IMAGE=.*|OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:v5-ccb-<sha>|" /etc/openclaude/commercial-v5.env'
 # 同步 bump 仓内 overrides 的 OC_RUNTIME_IMAGE(单独 chore commit)+ rsync 该文件到远端树
-ssh kl-mirror 'systemctl restart openclaude-v5'   # 新容器用新镜像;存量自然回收(除非明确要求 force recycle)
+ssh kl-mirror 'systemctl restart openclaude-v5'   # 新容器用新镜像;存量在空闲窗口按需回收
 # 镜像清理:保留 current + 上一版(回滚),其余 docker rmi
 ```
+
+存量容器镜像不一致时,v5 `ensureRunning` 先看最后 WS 活动:距今 <30 分钟只复用并延期;
+达到 30 分钟或活动时间为空时,再向容器做带 nonce 的 turn-drain 握手。Gateway ingress 与
+SessionManager submit 双闸均确认无在途 turn 才回收,握手失败/繁忙一律延期。紧急安全发布可
+临时设 `OC_V5_FORCE_STALE_IMAGE_RECYCLE=1` 绕过延期与握手,但会中断正在执行的工作;普通发布禁用。
 
 ### 4.4 env 三层模型
 `/etc/openclaude/commercial-v5.env` = V3_ENV 继承 − REMOVE_KEYS + overrides + OC_EGRESS_SECRET(保留链)。

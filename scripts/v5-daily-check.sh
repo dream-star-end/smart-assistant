@@ -10,8 +10,8 @@
 #          落库形状;waive 标记只进日志不进库,这是库内能取到的最好近似,见文档局限)
 #        - 冲正退款:credit_ledger reason='refund' AND ref_type='usage_record'
 #          (billing/refund.ts 唯一写入形状),按 ref_id 去重计笔
-#   3. GPT-5.6 缓存命中:按模型统计昨日成功 usage records;总输入 ≥100 万
-#      tokens 且加权命中率 <85% → 告警。
+#   3. GPT-5.6 缓存命中:按模型统计今日(北京时间 0 点至当前)成功 usage
+#      records;达到样本门槛后按绝对低线/相对前三活跃日基线判断。
 #   4. 日报正文(无告警也发):v5 近 24h 活跃用户数/会话数(sessions.db
 #      client_sessions)、昨日错误日志行数、昨日计费笔数/总消耗
 #
@@ -37,11 +37,51 @@ SPIKE_ABS_MIN=2000     # 计费突增:昨日消耗绝对值下限(credits)
 SPIKE_MULT=3           # 计费突增:昨日消耗 > 前 7 日日均 × 此倍数
 WAIVE_PCT_MAX=20       # 免单率上限(%)
 WAIVE_MIN_SAMPLES=10   # 昨日成功笔数低于此值不算免单率(小样本防误报,如 1/2=50%)
-CACHE_HIT_PCT_MIN=85   # GPT-5.6 各模型缓存加权命中率下限(%)
-CACHE_MIN_INPUT_TOKENS=1000000 # 小于此总输入量不告警,避免低流量噪音
+CACHE_SAMPLE_MIN_INPUT=5000000 # 当前/基线最低总输入量
+CACHE_MIN_RECORDS=10           # 当前成功 usage records 最低样本数
+CACHE_ABSOLUTE_LOW_BPS=7000    # 绝对低线:<70.00%
+CACHE_REGRESSION_LOW_BPS=8500  # 回归线:<85.00%
+CACHE_DROP_MIN_BPS=1500        # 相对三活跃日基线至少下降 15.00pp
+
+cache_should_alert() { # records current_input current_bps baseline_input baseline_bps
+  local records="$1" current_input="$2" current_bps="$3" baseline_input="$4" baseline_bps="$5"
+  [ "$records" -ge "$CACHE_MIN_RECORDS" ] &&
+    [ "$current_input" -ge "$CACHE_SAMPLE_MIN_INPUT" ] || return 1
+  [ "$current_bps" -lt "$CACHE_ABSOLUTE_LOW_BPS" ] && return 0
+  [ "$current_bps" -lt "$CACHE_REGRESSION_LOW_BPS" ] &&
+    [ "$baseline_input" -ge "$CACHE_SAMPLE_MIN_INPUT" ] &&
+    [ "$((baseline_bps - current_bps))" -ge "$CACHE_DROP_MIN_BPS" ]
+}
+
+cache_threshold_self_test() {
+  cache_should_alert 10 5000000 6999 0 0 || return 1
+  ! cache_should_alert 10 5000000 7000 0 0 || return 1
+  cache_should_alert 10 5000000 8499 5000000 9999 || return 1
+  ! cache_should_alert 10 5000000 8500 5000000 10000 || return 1
+  cache_should_alert 10 5000000 8000 5000000 9500 || return 1
+  ! cache_should_alert 10 5000000 8001 5000000 9500 || return 1
+  ! cache_should_alert 9 5000000 1 5000000 10000 || return 1
+  ! cache_should_alert 10 4999999 1 5000000 10000 || return 1
+  ! cache_should_alert 10 5000000 8000 4999999 9500 || return 1
+}
+
+cache_boundary_self_test() {
+  # SQL 使用相同的 Asia/Shanghai 当日零点公式。固定时刻确保边界不会
+  # 被执行机器时区影响:2026-07-12 04:34:56Z → 当日 00:00 CST。
+  local now_epoch=1783830896
+  local start_epoch
+  start_epoch="$(TZ=Asia/Shanghai date -d "$(TZ=Asia/Shanghai date -d "@${now_epoch}" '+%F 00:00:00')" +%s)"
+  [ "$start_epoch" -eq 1783785600 ] || return 1
+  [ "$start_epoch" -le "$now_epoch" ] || return 1
+}
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+if [ "${1:-}" = "--self-test" ]; then
+  cache_threshold_self_test && cache_boundary_self_test && \
+    echo "v5-daily-check cache threshold/boundary self-test: PASS"
+  exit $?
+fi
 
 ts() { TZ=Asia/Shanghai date '+%F %T'; }
 log() { if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $*"; else echo "$(ts) $*" >> "$LOG_FILE"; fi; }
@@ -150,49 +190,104 @@ SQL
     INFOS+=("免单率:样本不足(${total} < ${WAIVE_MIN_SAMPLES}),跳过判定")
   fi
 
-  # ── 3. GPT-5.6 缓存命中率(按模型,防止 Terra 高命中掩盖 Sol) ──
+  # ── 3. GPT-5.6 今日缓存命中率(按模型 + 三活跃日基线 + 集中度) ──
   # usage_records.input_tokens 是非缓存输入,因此总输入 = input + cache_read;
   # cache_write 不属于本次读取命中率分母。COUNT(*) 是成功 usage records,不是 turn 数。
   local cache_rows
   if cache_rows="$(psql "$DBURL" -At -F'|' -v ON_ERROR_STOP=1 <<'SQL' 2>&1
 WITH b AS (
-  SELECT (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '1 day') AT TIME ZONE 'Asia/Shanghai' AS y0,
-         date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai' AS y1
+  SELECT date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai' AS c0,
+         now() AS c1
+), current_rows AS (
+  SELECT ur.model, ur.user_id, ur.session_id,
+         COALESCE(ur.input_tokens, 0) + COALESCE(ur.cache_read_tokens, 0) AS total_input,
+         COALESCE(ur.cache_read_tokens, 0) AS cached_input
+    FROM usage_records ur, b
+   WHERE ur.status = 'success'
+     AND ur.created_at >= b.c0 AND ur.created_at < b.c1
+     AND ur.model LIKE 'gpt-5.6-%'
 ), per_model AS (
   SELECT ur.model,
          COUNT(*) AS records,
+         SUM(ur.total_input) AS total_input,
+         SUM(ur.cached_input) AS cached_input
+    FROM current_rows ur
+   GROUP BY ur.model
+), user_rank AS (
+  SELECT model, user_id, SUM(total_input) AS user_input,
+         ROW_NUMBER() OVER (PARTITION BY model ORDER BY SUM(total_input) DESC, user_id) AS rn
+    FROM current_rows GROUP BY model, user_id
+), session_rank AS (
+  SELECT model, LEFT(md5(session_id), 8) AS session_hash,
+         SUM(total_input) AS session_input,
+         ROW_NUMBER() OVER (
+           PARTITION BY model ORDER BY SUM(total_input) DESC, session_id
+         ) AS rn
+    FROM current_rows
+   WHERE session_id IS NOT NULL AND BTRIM(session_id) <> ''
+   GROUP BY model, session_id
+), prior_daily AS (
+  SELECT ur.model, (ur.created_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
          SUM(COALESCE(ur.input_tokens, 0) + COALESCE(ur.cache_read_tokens, 0)) AS total_input,
          SUM(COALESCE(ur.cache_read_tokens, 0)) AS cached_input
     FROM usage_records ur, b
-   WHERE ur.status = 'success'
-     AND ur.created_at >= b.y0 AND ur.created_at < b.y1
-     AND ur.model LIKE 'gpt-5.6-%'
-   GROUP BY ur.model
+   WHERE ur.status = 'success' AND ur.created_at < b.c0
+     AND ur.model IN (SELECT model FROM per_model)
+   GROUP BY ur.model, (ur.created_at AT TIME ZONE 'Asia/Shanghai')::date
+  HAVING SUM(COALESCE(ur.input_tokens, 0) + COALESCE(ur.cache_read_tokens, 0)) > 0
+), prior_ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY model ORDER BY day DESC) AS rn
+    FROM prior_daily
+), baseline AS (
+  SELECT model, COUNT(*) AS days, SUM(total_input) AS total_input,
+         SUM(cached_input) AS cached_input
+    FROM prior_ranked WHERE rn <= 3 GROUP BY model
 )
-SELECT model, records, total_input, cached_input,
-       CASE WHEN total_input > 0
-            THEN FLOOR(cached_input * 10000.0 / total_input)::bigint
+SELECT p.model, p.records, p.total_input, p.cached_input,
+       CASE WHEN p.total_input > 0
+            THEN FLOOR(p.cached_input * 10000.0 / p.total_input)::bigint
             ELSE 0 END AS hit_bps
-  FROM per_model
- ORDER BY model;
+     , COALESCE(bl.total_input, 0), COALESCE(bl.cached_input, 0)
+     , CASE WHEN COALESCE(bl.total_input, 0) > 0
+            THEN FLOOR(bl.cached_input * 10000.0 / bl.total_input)::bigint ELSE 0 END
+     , COALESCE(bl.days, 0)
+     , COALESCE(u.user_id::text, '-'), COALESCE(u.user_input, 0)
+     , CASE WHEN p.total_input > 0
+            THEN FLOOR(COALESCE(u.user_input, 0) * 10000.0 / p.total_input)::bigint ELSE 0 END
+     , COALESCE(s.session_hash, '-'), COALESCE(s.session_input, 0)
+     , CASE WHEN p.total_input > 0
+            THEN FLOOR(COALESCE(s.session_input, 0) * 10000.0 / p.total_input)::bigint ELSE 0 END
+  FROM per_model p
+  LEFT JOIN baseline bl ON bl.model = p.model
+  LEFT JOIN user_rank u ON u.model = p.model AND u.rn = 1
+  LEFT JOIN session_rank s ON s.model = p.model AND s.rn = 1
+ ORDER BY p.model;
 SQL
   )"; then
     if [ -z "$cache_rows" ]; then
-      INFOS+=("GPT-5.6 缓存:昨日无成功 usage records")
+      INFOS+=("GPT-5.6 缓存:今日暂无成功 usage records")
     else
-      while IFS='|' read -r model records total_input cached_input hit_bps; do
+      while IFS='|' read -r model records total_input cached_input hit_bps \
+          baseline_input baseline_cached baseline_bps baseline_days \
+          top_uid top_user_input top_user_bps top_session top_session_input top_session_bps; do
         [ -z "$model" ] && continue
         if [[ ! "$records" =~ ^[0-9]+$ || ! "$total_input" =~ ^[0-9]+$ ||
-              ! "$cached_input" =~ ^[0-9]+$ || ! "$hit_bps" =~ ^[0-9]+$ ]]; then
+              ! "$cached_input" =~ ^[0-9]+$ || ! "$hit_bps" =~ ^[0-9]+$ ||
+              ! "$baseline_input" =~ ^[0-9]+$ || ! "$baseline_bps" =~ ^[0-9]+$ ||
+              ! "$baseline_days" =~ ^[0-9]+$ || ! "$top_user_bps" =~ ^[0-9]+$ ||
+              ! "$top_session_bps" =~ ^[0-9]+$ ]]; then
           ALERTS+=("GPT-5.6 缓存查询输出异常:$(echo "$model|$records|$total_input|$cached_input|$hit_bps" | head -c 200)")
           continue
         fi
-        local hit_pct
+        local hit_pct baseline_pct top_user_pct top_session_pct
         printf -v hit_pct '%d.%02d' "$((hit_bps / 100))" "$((hit_bps % 100))"
-        INFOS+=("GPT-5.6 缓存 ${model}:命中 ${hit_pct}%,成功 usage records ${records},总输入 ${total_input},缓存输入 ${cached_input}")
-        if [ "$total_input" -ge "$CACHE_MIN_INPUT_TOKENS" ] && \
-           [ "$hit_bps" -lt "$((CACHE_HIT_PCT_MIN * 100))" ]; then
-          ALERTS+=("GPT-5.6 缓存命中偏低:${model} 昨日 ${hit_pct}%(缓存 ${cached_input}/总输入 ${total_input},成功 usage records ${records};阈值:总输入≥${CACHE_MIN_INPUT_TOKENS} 且命中<${CACHE_HIT_PCT_MIN}%)")
+        printf -v baseline_pct '%d.%02d' "$((baseline_bps / 100))" "$((baseline_bps % 100))"
+        printf -v top_user_pct '%d.%02d' "$((top_user_bps / 100))" "$((top_user_bps % 100))"
+        printf -v top_session_pct '%d.%02d' "$((top_session_bps / 100))" "$((top_session_bps % 100))"
+        INFOS+=("GPT-5.6 缓存 ${model}:命中 ${hit_pct}%,成功 records ${records},总输入 ${total_input},缓存输入 ${cached_input};前三活跃日基线 ${baseline_pct}%(${baseline_days} 日,总输入 ${baseline_input})")
+        INFOS+=("GPT-5.6 集中度 ${model}:Top 用户 ${top_uid} 占 ${top_user_pct}%(${top_user_input});Top 会话 #${top_session} 占 ${top_session_pct}%(${top_session_input})")
+        if cache_should_alert "$records" "$total_input" "$hit_bps" "$baseline_input" "$baseline_bps"; then
+          ALERTS+=("GPT-5.6 缓存命中偏低:${model} 今日 ${hit_pct}%(基线 ${baseline_pct}%,缓存 ${cached_input}/总输入 ${total_input},成功 records ${records};规则:样本≥${CACHE_SAMPLE_MIN_INPUT}/${CACHE_MIN_RECORDS},绝对<70% 或 <85%且较基线下降≥15pp)")
         fi
       done <<< "$cache_rows"
     fi
