@@ -1,8 +1,9 @@
-import { Check, Loader2, RotateCcw, Sparkles, Timer } from "lucide-react";
+import { Check, ExternalLink, Loader2, RotateCcw, Sparkles, Timer } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
+import { Markdown } from "../Markdown";
 import { ArtifactPreview } from "./ArtifactPreview";
-import { DEMO_SCENARIOS } from "./demoScripts";
+import { DEMO_SCENARIOS, type DemoScenario } from "./demoScripts";
 
 /** 读「减少动态效果」系统偏好（无障碍）：true 时跳过打字动画，直接整段呈现。 */
 function usePrefersReducedMotion(): boolean {
@@ -21,6 +22,92 @@ function usePrefersReducedMotion(): boolean {
 const TYPE_MS = 14; // 每字打字间隔
 const STEP_MS = 640; // 执行动作逐条完成间隔
 const HOLD_MS = 4200; // 答案打完后停留再切下一幕（留足时间看成果）
+
+type TranscriptScenario = Extract<DemoScenario, { presentation: "transcript" }>;
+
+/** 真实公开案例：完整呈现两轮正文，执行 trace 只按关键阶段归纳，不伪装成逐条日志。 */
+function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
+  return (
+    <div className="min-w-0 px-4 py-4 sm:px-5">
+      <div className="mb-4 rounded-xl border border-accent/20 bg-accent-soft/45 px-3 py-2 text-[11.5px] leading-relaxed text-muted">
+        <span className="font-semibold text-accent">展示说明：</span>
+        {scenario.disclosure}
+      </div>
+
+      {scenario.publicLink && (
+        <a
+          href={scenario.publicLink.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label={`${scenario.publicLink.label}（在新窗口打开）`}
+          className="mb-4 inline-flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent-soft px-3 py-1.5 text-[12.5px] font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 md:hidden"
+        >
+          <ExternalLink size={13} />
+          {scenario.publicLink.label}
+        </a>
+      )}
+
+      <div className="flex min-w-0 flex-col gap-4">
+        {scenario.transcript.map((block) => {
+          const key = `${block.turn}-${block.kind}`;
+          if (block.kind === "user") {
+            return (
+              <div key={key} className="flex min-w-0 justify-end">
+                <div className="max-w-[92%] break-words rounded-2xl rounded-br-md bg-bubble px-3.5 py-2.5 text-[13.5px] leading-relaxed text-fg">
+                  <span className="mb-1 block text-[10.5px] font-semibold text-faint">第 {block.turn} 轮 · 用户</span>
+                  {block.text}
+                </div>
+              </div>
+            );
+          }
+
+          if (block.kind === "work") {
+            return (
+              <div key={key} className="rounded-xl border border-border bg-sidebar/25 px-3 py-3">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[12px] font-semibold text-fg">{block.label}</span>
+                  <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] font-medium text-accent">
+                    生产记录 · {block.toolCallCount} 次工具调用
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {block.steps.map((step) => (
+                    <div key={step} className="flex items-start gap-2 text-[12px] leading-relaxed text-muted">
+                      <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full bg-success-soft text-success">
+                        <Check size={10} strokeWidth={3} />
+                      </span>
+                      <span className="min-w-0 break-words">{step}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          }
+
+          return (
+            <div key={key} className="flex min-w-0 justify-start">
+              <div className="min-w-0 max-w-[98%] overflow-hidden rounded-2xl rounded-bl-md border border-border bg-bg px-3.5 py-2.5">
+                <span className="mb-1 block text-[10.5px] font-semibold text-faint">
+                  第 {block.turn} 轮 · Agent 完成
+                </span>
+                <div className="min-w-0 break-words text-[13px] leading-relaxed text-fg [overflow-wrap:anywhere] [&_.prose]:max-w-none [&_.prose]:text-[13px] [&_.prose]:leading-relaxed [&_pre]:max-w-full [&_pre]:overflow-x-auto">
+                  <Markdown>{block.text}</Markdown>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {scenario.runMeta && (
+        <div className="mt-4 flex items-center gap-1.5 pl-1 text-[12px] text-faint">
+          <Timer size={13} className="shrink-0 text-accent" />
+          {scenario.runMeta}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * 落地页动态演示 —— 「工作台」双栏布局：左栏还原 agent 干活过程（提问 → 执行动作
@@ -70,6 +157,14 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
 
   useEffect(() => {
     const sc = DEMO_SCENARIOS[idx];
+    if (sc.presentation === "transcript") {
+      // 真实案例完整常驻：不逐字、不自动切走，避免用户还没读完就被轮播带走。
+      setStateIdx(idx);
+      setStepCount(0);
+      setTyped(0);
+      setDone(true);
+      return;
+    }
     const steps = sc.steps ?? [];
     const answer = sc.answer;
     setStateIdx(idx); // 进度态从这一拍起归属当前场景
@@ -139,15 +234,17 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
   }, [idx, reduced, ended, visible, runSeq]);
 
   const sc = DEMO_SCENARIOS[idx];
-  const steps = sc.steps ?? [];
+  const animated = sc.presentation === "animated" ? sc : null;
+  const steps = animated?.steps ?? [];
   // 未同步（切场景后的第一帧）时一律按重置态渲染，避免用上一幕的完成态配新场景。
   const synced = stateIdx === idx;
   const shownStep = synced ? stepCount : 0;
   const shownTyped = synced ? typed : 0;
   const shownDone = synced ? done : false;
-  const shownAnswer = sc.answer.slice(0, shownTyped);
+  const shownAnswer = animated?.answer.slice(0, shownTyped) ?? "";
   const stepsDone = steps.length > 0 && shownStep >= steps.length;
-  const typing = stepsDone && !shownDone && shownTyped < sc.answer.length;
+  const typing = !!animated && stepsDone && !shownDone && shownTyped < animated.answer.length;
+  const artifactDone = sc.presentation === "transcript" || stepsDone;
 
   return (
     <div className="mx-auto w-full max-w-4xl">
@@ -177,7 +274,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
       {/* 工作台卡（仿应用窗口）：左对话 / 右成果。md 起定高，打字过程页面零位移。 */}
       <div ref={cardRef} className="overflow-hidden rounded-2xl border border-border bg-surface shadow-float">
         {/* 窗口顶栏 */}
-        <div className="flex items-center gap-2 border-b border-border bg-sidebar/60 px-4 py-2.5">
+        <div className="flex items-center gap-2 rounded-t-2xl border-b border-border bg-sidebar/60 px-4 py-2.5">
           <span className="flex size-6 items-center justify-center rounded-lg bg-grad-cta text-white">
             <Sparkles size={13} />
           </span>
@@ -187,13 +284,21 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           </span>
         </div>
 
-        <div className="grid grid-cols-1 md:h-[440px] md:grid-cols-[1.08fr_1fr]">
+        <div
+          className={cn(
+            "grid grid-cols-1 md:grid-cols-[1.08fr_1fr]",
+            sc.presentation === "animated" && "md:h-[440px]",
+          )}
+        >
           {/* 左栏：对话 + 执行过程 */}
+          {sc.presentation === "transcript" ? (
+            <TranscriptFlow scenario={sc} />
+          ) : (
           <div className="flex flex-col gap-3.5 px-4 py-4 sm:px-5">
             {/* 用户气泡 */}
             <div className="flex justify-end">
               <div className="max-w-[92%] rounded-2xl rounded-br-md bg-bubble px-3.5 py-2.5 text-[13.5px] leading-relaxed text-fg">
-                {sc.prompt}
+                {animated?.prompt}
               </div>
             </div>
 
@@ -244,15 +349,15 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
                   aria-hidden
                   className={cn(
                     "invisible whitespace-pre-wrap text-[13.5px] leading-relaxed",
-                    sc.mono && "font-mono text-[12px] leading-[1.6]",
+                    animated?.mono && "font-mono text-[12px] leading-[1.6]",
                   )}
                 >
-                  {sc.answer}
+                  {animated?.answer}
                 </p>
                 <p
                   className={cn(
                     "absolute inset-x-3.5 top-2.5 whitespace-pre-wrap text-[13.5px] leading-relaxed text-fg",
-                    sc.mono && "font-mono text-[12px] leading-[1.6]",
+                    animated?.mono && "font-mono text-[12px] leading-[1.6]",
                   )}
                 >
                   {shownAnswer}
@@ -276,22 +381,32 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
               </div>
             )}
           </div>
+          )}
 
           {/* 右栏：成果预览（把交付物画出来） */}
-          <div className="border-t border-border bg-sidebar/25 md:border-l md:border-t-0">
+          <div
+            className={cn(
+              "border-t border-border bg-sidebar/25 md:border-l md:border-t-0",
+              sc.presentation === "transcript" && "md:h-[440px] md:self-start",
+            )}
+          >
             <ArtifactPreview
               artifact={sc.artifact}
               deliverable={sc.deliverable}
-              done={stepsDone}
+              done={artifactDone}
               publicLink={sc.publicLink}
             />
           </div>
         </div>
 
         {/* 底部行动条 */}
-        <div className="flex items-center justify-between gap-3 border-t border-border bg-sidebar/40 px-4 py-3 sm:px-6">
+        <div className="flex items-center justify-between gap-3 rounded-b-2xl border-t border-border bg-sidebar/40 px-4 py-3 sm:px-6">
           <span className="flex items-center gap-3 text-[12.5px] text-faint">
-            {ended ? "演示播完了" : "想让它帮你干同样的活？"}
+            {ended
+              ? "演示播完了"
+              : sc.presentation === "transcript"
+                ? "两轮端到端完成，想让它帮你做同样的事？"
+                : "想让它帮你干同样的活？"}
             {ended && (
               <button
                 onClick={() => play(0)}
