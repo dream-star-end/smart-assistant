@@ -29,6 +29,7 @@ import { revokeGithubLinkAndClearSessions } from '../github/tokenStore.js'
 import { requireAuth } from '../http/auth.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError, sendJson } from '../http/util.js'
+import { dispatchDeclarativeConnectors } from './declarativeHandlers.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import {
   approveConfirmation,
@@ -216,6 +217,12 @@ export async function dispatchConnectorsRoute(
   if (segs.length === 0) {
     if (method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'GET only')
     await handleCatalog(req, res, deps)
+    return
+  }
+
+  // 声明式连接器子路由(/api/connectors/declarative/*):catalog/bind/connections/unbind。
+  if (segs[0] === 'declarative') {
+    await dispatchDeclarativeConnectors(req, res, deps, segs.slice(1), method)
     return
   }
 

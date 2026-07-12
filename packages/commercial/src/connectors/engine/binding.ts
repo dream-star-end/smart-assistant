@@ -139,6 +139,45 @@ export async function insertDeclarativeConnection(
   }, pool)
 }
 
+/** 列出用户的活跃声明式连接(管理界面/列表用;不含 secret)。 */
+export async function listDeclarativeConnections(
+  userId: number,
+  pool: Pool = getPool(),
+): Promise<
+  Array<{
+    id: string
+    slug: string
+    displayName: string
+    connectorVersionId: string | null
+    meta: Record<string, unknown>
+    createdAt: Date
+  }>
+> {
+  const r = await pool.query<{
+    id: string
+    provider: string
+    display_name: string
+    connector_version_id: string | null
+    meta: Record<string, unknown>
+    created_at: Date
+  }>(
+    `SELECT id::text AS id, provider, display_name,
+            connector_version_id::text AS connector_version_id, meta, created_at
+       FROM connections
+      WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
+      ORDER BY created_at DESC`,
+    [userId],
+  )
+  return r.rows.map((row) => ({
+    id: row.id,
+    slug: row.provider,
+    displayName: row.display_name,
+    connectorVersionId: row.connector_version_id,
+    meta: row.meta ?? {},
+    createdAt: row.created_at,
+  }))
+}
+
 /** 读取一条**活跃**声明式连接(id + user + 未撤销 + active + connector_version_id 非空)。 */
 export async function getDeclarativeConnection(
   id: string,
