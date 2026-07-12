@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import { ImageResizeMode } from './ImageResizeMode'
+import type { ImageEditSubmit } from './ImageViewer'
 
 afterEach(() => {
   cleanup()
@@ -80,12 +81,13 @@ describe('ImageResizeMode', () => {
 
   test('选择 16:9 → onSubmit 带 mode:resize 与 targetAspect + 三件资源', async () => {
     stubImagePipeline()
-    const onSubmit = vi.fn(async () => {})
+    const onSubmit = vi.fn(async (_value: ImageEditSubmit) => {})
     render(<ImageResizeMode {...baseProps} canSubmit onSubmit={onSubmit} />)
     fireEvent.click(screen.getByRole('button', { name: /16:9/ }))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     const value = onSubmit.mock.calls[0][0]
     expect(value.mode).toBe('resize')
+    if (value.mode !== 'resize') throw new Error('expected resize payload')
     expect(value.targetAspect).toBe('16:9')
     expect(value.source).toBeInstanceOf(File)
     expect(value.guide).toBeInstanceOf(File)

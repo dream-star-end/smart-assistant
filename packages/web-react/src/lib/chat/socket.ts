@@ -73,6 +73,7 @@ import {
   WS_CLOSE_CODE_STALLED,
 } from "./pure";
 import type {
+  ColdStartWire,
   ContextRebuiltWire,
   CostChargedWire,
   CostWaivedWire,
