@@ -501,6 +501,73 @@ describe('usage aggregation: appendServerAuthoredMessageForRequest idempotency',
   })
 })
 
+describe('usage aggregation: appendForRequest 不可重映射(MAJOR-1,与 pgSessionsBackend 对齐)', () => {
+  before(async () => {
+    await clearTables()
+  })
+
+  it('R1 map 已存在但 (session,msg) 不一致 → fail-closed 抛 /拒绝重映射/,不改动已有映射', async () => {
+    const userId = 'u-remap'
+    const requestId = 'req-remap'
+    await ensureSession(userId)
+    // 首次映射到 srv-remap-a。
+    const r1 = await appendServerAuthoredMessageForRequest(requestId, SESSION_ID, userId, {
+      id: 'srv-remap-a',
+      role: 'assistant' as const,
+      text: 'first',
+      ts: 100,
+      status: 'completed',
+    })
+    assert.deepEqual(r1, { applied: true })
+
+    // 同 (requestId,userId) 复用到不同 msgId → 抛错(SQLite 现在与 PG 一样严,不再 DO NOTHING 静默吞)。
+    await assert.rejects(
+      () =>
+        appendServerAuthoredMessageForRequest(requestId, SESSION_ID, userId, {
+          id: 'srv-remap-b',
+          role: 'assistant' as const,
+          text: 'second',
+          ts: 200,
+          status: 'completed',
+        }),
+      /拒绝重映射/,
+    )
+
+    // map 仍指向原消息;srv-remap-b 未写入(事务回滚)。
+    const mapRow = await getMapRow(requestId, userId)
+    assert.equal(mapRow?.msg_id, 'srv-remap-a', 'map 仍映射到原消息')
+    const messages = await getMessages(SESSION_ID, userId)
+    assert.equal(messages.length, 1, 'srv-remap-b 未写入')
+    assert.equal(messages[0].id, 'srv-remap-a')
+  })
+
+  it('R2 一致重放 → already_exists 幂等,map 不重插、不重复 append', async () => {
+    await clearTables()
+    const userId = 'u-remap2'
+    const requestId = 'req-remap2'
+    await ensureSession(userId)
+    const msg = {
+      id: 'srv-remap2-a',
+      role: 'assistant' as const,
+      text: 'x',
+      ts: 100,
+      status: 'completed',
+    }
+    assert.deepEqual(await appendServerAuthoredMessageForRequest(requestId, SESSION_ID, userId, msg), {
+      applied: true,
+    })
+    const mapBefore = await getMapRow(requestId, userId)
+    // 一致重放:已存在且 (session,msg) 一致 → 幂等 already_exists,map 不变。
+    assert.deepEqual(await appendServerAuthoredMessageForRequest(requestId, SESSION_ID, userId, msg), {
+      applied: false,
+      reason: 'already_exists',
+    })
+    const mapAfter = await getMapRow(requestId, userId)
+    assert.equal(mapAfter?.written_at, mapBefore?.written_at, 'map 行未被重插(written_at 不变)')
+    assert.equal((await getMessages(SESSION_ID, userId)).length, 1, '无重复 append')
+  })
+})
+
 describe('usage aggregation: GC sweep windows (Codex R3)', () => {
   before(async () => {
     await clearTables()

@@ -82,7 +82,6 @@ import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   closeSync,
-  copyFileSync,
   existsSync,
   fsyncSync,
   openSync,
@@ -957,21 +956,29 @@ async function overwriteSqliteFromPg(sqliteDb: Database.Database, source: pg.Cli
   }
 }
 
-/** 灾难反灌栅栏事务:主 PG pg_authoritative → sqlite_disaster_recovered,gen+1,清 source_digest/completed_at。 */
+/**
+ * 灾难反灌栅栏事务:主 PG pg_authoritative → sqlite_disaster_recovered,gen+1。
+ * **携带反灌校验所得聚合 digest(sourceDigest)+ completed_at=now**——sqlite_disaster_recovered
+ * 是**终态**(非 prepared),0134 的 CHECK(authority='prepared' OR source_digest/completed_at 非空)
+ * 要求终态必须带校验凭证。「推进到新一代**清终态凭证置 NULL**」只适用于推进到新一代 `prepared`
+ * (见 prepareTx),对灾难终态不适用——此处写入反灌 SQLite 的 digest 作为该代凭证。
+ */
 async function disasterAdvanceTx(
   client: pg.Client,
   expectedGeneration: string,
   newGeneration: string,
   newCutoverId: string,
+  sourceDigest: string,
 ): Promise<void> {
   await client.query("BEGIN");
   try {
+    const now = Date.now();
     const upd = await client.query(
       `UPDATE ${STATE_TABLE}
           SET authority = 'sqlite_disaster_recovered', generation = $1, cutover_id = $2,
-              source_digest = NULL, completed_at = NULL
-        WHERE singleton = true AND authority = 'pg_authoritative' AND generation = $3`,
-      [newGeneration, newCutoverId, expectedGeneration],
+              source_digest = $3, completed_at = $4
+        WHERE singleton = true AND authority = 'pg_authoritative' AND generation = $5`,
+      [newGeneration, newCutoverId, sourceDigest, String(now), expectedGeneration],
     );
     if (upd.rowCount !== 1) {
       throw new Error(
@@ -1139,11 +1146,27 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
       console.log("  [--yes] 跳过交互确认(演练自动化)");
     }
 
-    // 1) 备份原 SQLite。
+    // 1) 备份原 SQLite。**WAL 库不可裸 copyFileSync**(-wal 中已提交内容不在主库文件里,会丢)。
+    //    用 better-sqlite3 在线备份 API(db.backup 返回 Promise,内部走 SQLite online backup,
+    //    把 WAL 已提交内容一并 checkpoint 进目标),再开只读连接跑 integrity_check 验证,失败即中止反灌。
     const ts = Date.now();
     const bak = `${args.sqlite}.pre-disaster-${ts}.bak`;
-    copyFileSync(args.sqlite, bak);
-    console.log(`  ✓ 已备份原 SQLite → ${bak}`);
+    await sqliteDb.backup(bak);
+    console.log(`  ✓ 已在线备份原 SQLite(含 WAL 已提交内容)→ ${bak}`);
+    {
+      const bakDb = new Database(bak, { readonly: true, fileMustExist: true });
+      try {
+        const integrity = bakDb.pragma("integrity_check", { simple: true });
+        if (integrity !== "ok") {
+          throw new Error(
+            `.bak 完整性校验失败(integrity_check=${JSON.stringify(integrity)}):${bak};中止反灌(源 SQLite 与 PG 均未改动)。`,
+          );
+        }
+      } finally {
+        bakDb.close();
+      }
+    }
+    console.log(`  ✓ .bak 完整性校验通过(integrity_check=ok)`);
 
     // 2) 六表全量覆盖 SQLite(单事务清+灌)。
     console.log("── 反灌:源 → SQLite 六表全量覆盖(单事务)──");
@@ -1166,9 +1189,10 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
         throw new Error(`推进失败:主 PG authority=${st.authority}(灾难反灌只从 pg_authoritative 推进)。当前状态非常规,请人工核查。`);
       }
       const newGen = (BigInt(st.generation) + 1n).toString();
-      await disasterAdvanceTx(mainClient, st.generation, newGen, newCut);
+      // 反灌校验(步骤 3)所得聚合 digest 作为该代终态凭证写入(满足 0134 终态 CHECK)。
+      await disasterAdvanceTx(mainClient, st.generation, newGen, newCut, v.sourceDigest);
       console.log(
-        `  ✓ 主 PG 状态推进 pg_authoritative → sqlite_disaster_recovered(generation ${st.generation} → ${newGen}, cutover_id=${newCut})`,
+        `  ✓ 主 PG 状态推进 pg_authoritative → sqlite_disaster_recovered(generation ${st.generation} → ${newGen}, cutover_id=${newCut}, source_digest=${v.sourceDigest.slice(0, 12)})`,
       );
       writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
       console.log(`  ✓ manifest 已原子写入 ${args.manifest}(authority=sqlite_disaster_recovered, generation=${newGen})`);

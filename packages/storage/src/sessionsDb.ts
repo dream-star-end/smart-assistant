@@ -1882,9 +1882,17 @@ export type AppendForRequestResult =
  * applied. Coordinates with `appendCostCredits` via two SQLite tables.
  *
  * Idempotency: same (requestId, userId, sessId, msgId) replayed → message
- * write returns `already_exists`; map insert is `ON CONFLICT DO NOTHING`;
- * pending drain is a no-op. Caller-visible result is identical for first
- * and subsequent calls (with `applied: false, reason: 'already_exists'`).
+ * write returns `already_exists`; the map row already matches so it is NOT
+ * re-inserted; pending drain is a no-op. Caller-visible result is identical
+ * for first and subsequent calls (with `applied: false, reason: 'already_exists'`).
+ *
+ * **Non-remappable (RFC D3/R1, parity with pgSessionsBackend)**: before
+ * touching pending/append, we read the existing map row. If it already maps
+ * (requestId, userId) to a *different* (sessionId, msgId), we throw
+ * fail-closed — a mis-reused requestId must never re-point cost at another
+ * message. This runs even on `already_exists` replays. The PG backend does
+ * the same under `SELECT … FOR UPDATE`; here the single-writer transaction
+ * makes a plain read sufficient.
  */
 async function _sqliteAppendServerAuthoredMessageForRequest(
   requestId: string,
@@ -1894,6 +1902,19 @@ async function _sqliteAppendServerAuthoredMessageForRequest(
 ): Promise<AppendForRequestResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendForRequestResult => {
+    // 0. Non-remappable check (MUST precede any early return). Existing map
+    //    with a different (session_id, msg_id) → fail-closed (error form
+    //    aligned with pgSessionsBackend's `拒绝重映射`).
+    const existingMap = db.prepare(
+      'SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = ? AND user_id = ?'
+    ).get(requestId, userId) as { session_id: string; msg_id: string } | undefined
+    if (existingMap && (existingMap.session_id !== sessId || existingMap.msg_id !== message.id)) {
+      throw new Error(
+        `[sqliteSessions] server_authored_request_map 拒绝重映射: (requestId=${requestId},userId=${userId}) ` +
+          `已映射 (${existingMap.session_id},${existingMap.msg_id}),本次欲映射 (${sessId},${message.id})`
+      )
+    }
+
     // 1. Drain pending costCredits if commit arrived first.
     const pending = db.prepare(
       'SELECT cost_credits FROM pending_usage_patches WHERE request_id = ? AND user_id = ?'
@@ -1929,12 +1950,17 @@ async function _sqliteAppendServerAuthoredMessageForRequest(
 
     // 3. Record (requestId, userId) → (sessionId, msgId). Composite PK
     //    means a late commit from another user with the same requestId
-    //    inserts a separate row instead of being silently dropped.
-    db.prepare(
-      `INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (request_id, user_id) DO NOTHING`
-    ).run(requestId, userId, sessId, message.id)
+    //    inserts a separate row instead of being silently dropped. Only
+    //    insert when no map row exists yet — if one exists it was already
+    //    validated consistent in step 0, so re-inserting is redundant (the
+    //    ON CONFLICT stays as defense-in-depth, never expected to fire).
+    if (!existingMap) {
+      db.prepare(
+        `INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (request_id, user_id) DO NOTHING`
+      ).run(requestId, userId, sessId, message.id)
+    }
 
     // 4. Pending row drained — clear it.
     if (pending) {

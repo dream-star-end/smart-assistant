@@ -1,17 +1,20 @@
 // sessionsStoreAuthority — master 会话权威 store 的**启动裁决**(RFC-v5-sessions-pg D1)。
 //
 // 权威状态机 + 启动规则矩阵是 sqlite/pg 选择的**唯一裁决源**(R2/R3 BLOCKER 消歧):驱动选择
-// 权威在 composition root 一处(registerCommercial),禁止函数内 if(pg) 分支。裁决输入三元组:
+// 权威在 composition root 一处(registerCommercial),禁止函数内 if(pg) 分支。裁决输入四元组:
 //   ①env OC_SESSIONS_STORE ②PG 状态行 sessions_store_migration_state ③本地权威 manifest
-//     ($OPENCLAUDE_HOME/sessions-store-authority.json)。
+//     ($OPENCLAUDE_HOME/sessions-store-authority.json)④本地灾难 nonce
+//     ($OPENCLAUDE_HOME/sessions-disaster-nonce.json,backfill disaster-restore 写)。
 // 输出:选 sqlite / 选 pg(带 generation)/ 抛错拒起(消息说清是矩阵哪一行拒的)。矩阵之外
 // 组合**默认 fail-closed 拒起**。正常代码回滚**不能**通过删 env 退回 SQLite 重造双权威。
 //
-// 纯决策函数 decideSessionsStore 无 IO(env/PG/manifest 已读好),便于矩阵全组合穷举测试;
-// resolveSessionsStoreAuthority 是读 env+PG+manifest 的 async 装配壳。
+// 两个纯决策函数无 IO(env/PG/manifest/nonce 已读好),便于矩阵全组合穷举测试:
+//   · decideSessionsStore            —— PG **可达**(读到状态行/42P01→null)时的启动矩阵;
+//   · decideSessionsStorePgUnreachable —— PG **不可达**(连接错误)时的兜底裁决。
+// resolveSessionsStoreAuthority 是读 env+PG+manifest+nonce 的 async 装配壳。
 
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Pool } from "pg";
 import { paths } from "@openclaude/storage";
 import { getPool } from "./index.js";
@@ -34,6 +37,17 @@ export interface SessionsStoreManifest {
   authority: string;
   generation: number;
   cutoverId: string;
+}
+
+/**
+ * 本地灾难 nonce($OPENCLAUDE_HOME/sessions-disaster-nonce.json)。
+ * backfill disaster-restore-to-sqlite 写 {cutoverId, ts, reason};启动裁决只信 cutoverId
+ * (须与 manifest/PG 状态行 cutoverId 一致才认灾难过渡态,RFC D1「sqlite + 本地灾难 nonce 匹配」)。
+ */
+export interface SessionsStoreDisasterNonce {
+  cutoverId: string;
+  ts?: number;
+  reason?: string;
 }
 
 export class SessionsStoreAuthorityError extends Error {
@@ -63,13 +77,14 @@ function manifestMatchesPg(manifest: SessionsStoreManifest | null, pg: SessionsS
 }
 
 /**
- * **启动规则矩阵**(RFC D1 表格逐行)。纯函数:输入已读好的三元组,输出决策或抛
+ * **启动规则矩阵**(RFC D1 表格逐行,PG **可达**分支)。纯函数:输入已读好的四元组,输出决策或抛
  * {@link SessionsStoreAuthorityError}(消息注明拒的矩阵行)。矩阵之外默认拒起。
  */
 export function decideSessionsStore(
   env: SessionsStoreEnvIntent,
   pg: SessionsStoreStateRow | null,
   manifest: SessionsStoreManifest | null,
+  nonce: SessionsStoreDisasterNonce | null,
 ): SessionsStoreDecision {
   // 非法 env 值一律拒起(先于一切)。
   if (env === "invalid") {
@@ -129,7 +144,7 @@ export function decideSessionsStore(
       return { store: "pg", generation: pg.generation };
     }
 
-    // ── sqlite_disaster_recovered:灾难过渡态,仅 env=sqlite + 本地 nonce/manifest 匹配 ──
+    // ── sqlite_disaster_recovered:灾难过渡态,仅 env=sqlite + 本地 manifest 匹配 + 本地 nonce cutover 匹配 ──
     case "sqlite_disaster_recovered": {
       if (env !== "sqlite") {
         throw new SessionsStoreAuthorityError(
@@ -139,7 +154,15 @@ export function decideSessionsStore(
       // 灾难态按本地 manifest + nonce(cutoverId)裁决:manifest 须存在且与 PG 状态行完全匹配。
       if (!manifestMatchesPg(manifest, pg)) {
         throw new SessionsStoreAuthorityError(
-          "[sessions-store] 矩阵[authority=sqlite_disaster_recovered × env=sqlite]:本地灾难 nonce/manifest 与 PG 状态不匹配,fail-closed 拒起。",
+          "[sessions-store] 矩阵[authority=sqlite_disaster_recovered × env=sqlite]:manifest 与 PG 状态不匹配,fail-closed 拒起。",
+        );
+      }
+      // RFC D1 原文「sqlite + 本地灾难 nonce 匹配」:nonce 文件须存在且 cutoverId 与 PG(=manifest)一致。
+      // 仅 manifest 匹配不足以放行 —— 灾难 nonce 是 backfill disaster-restore 铸造的过渡态凭证,缺失/不匹配即拒起。
+      if (!nonce || nonce.cutoverId !== pg.cutoverId) {
+        throw new SessionsStoreAuthorityError(
+          `[sessions-store] 矩阵[authority=sqlite_disaster_recovered × env=sqlite]:本地灾难 nonce ` +
+            `${nonce ? `cutover=${nonce.cutoverId} 与 PG cutover=${pg.cutoverId} 不匹配` : "缺失"},fail-closed 拒起。`,
         );
       }
       return { store: "sqlite" };
@@ -153,9 +176,56 @@ export function decideSessionsStore(
   }
 }
 
+/**
+ * **PG 不可达兜底裁决**(RFC D1:PG 读不到 marker→本地 manifest+nonce 裁决)。纯函数。
+ * PG 连接错误(非 42P01)时不得静默走 SQLite;放行 SQLite 只有两种,其余一切 fail-closed:
+ *   ① 真·基建先行期:无 manifest + env=unset(PG 尚未 provision,连不上本就正常);
+ *   ② 灾难过渡态:env=sqlite + manifest.authority=sqlite_disaster_recovered + 本地 nonce 存在且
+ *      cutoverId 与 manifest 一致(RFC「sqlite + 本地灾难 nonce 匹配」)。
+ * 含 manifest 其他 authority / env 其他值 / nonce 缺失损坏不匹配,一律拒起。
+ */
+export function decideSessionsStorePgUnreachable(
+  env: SessionsStoreEnvIntent,
+  manifest: SessionsStoreManifest | null,
+  nonce: SessionsStoreDisasterNonce | null,
+): SessionsStoreDecision {
+  // 非法 env 值一律拒起(先于一切)。
+  if (env === "invalid") {
+    throw new SessionsStoreAuthorityError(
+      "[sessions-store] PG 不可达兜底:非法 OC_SESSIONS_STORE 值(仅接受 unset / 'sqlite' / 'pg'),fail-closed 拒起。",
+    );
+  }
+  // ① 真·基建先行期:无 manifest + env=unset → SQLite。
+  if (manifest === null && env === "unset") {
+    return { store: "sqlite" };
+  }
+  // ② 灾难过渡态:env=sqlite + manifest=灾难态 + 本地 nonce cutover 与 manifest 一致 → SQLite。
+  if (
+    env === "sqlite" &&
+    manifest !== null &&
+    manifest.authority === "sqlite_disaster_recovered" &&
+    nonce !== null &&
+    nonce.cutoverId === manifest.cutoverId
+  ) {
+    return { store: "sqlite" };
+  }
+  // 其余一切 fail-closed(须人工介入核对 DATABASE_URL / PG 可达性 / 灾难 nonce)。
+  throw new SessionsStoreAuthorityError(
+    `[sessions-store] PG 不可达兜底:仅[无 manifest × env=unset(基建先行期)]或` +
+      `[env=sqlite × manifest.authority=sqlite_disaster_recovered × 本地 nonce cutover 与 manifest 一致(灾难过渡态)]放行 SQLite;` +
+      `当前(env=${env}, manifest=${manifest ? `authority=${manifest.authority},cutover=${manifest.cutoverId}` : "无"}, ` +
+      `nonce=${nonce ? `cutover=${nonce.cutoverId}` : "无"})不满足,fail-closed 拒起。`,
+  );
+}
+
 /** 本地权威 manifest 默认路径($OPENCLAUDE_HOME/sessions-store-authority.json)。 */
 export function defaultManifestPath(): string {
   return join(paths.home, "sessions-store-authority.json");
+}
+
+/** 本地灾难 nonce 默认路径($OPENCLAUDE_HOME/sessions-disaster-nonce.json;与 manifest 同目录)。 */
+export function defaultNoncePath(): string {
+  return join(paths.home, "sessions-disaster-nonce.json");
 }
 
 /** 读 PG 状态行;表不存在(0134 未 apply,基建先行期)视为无行。其它错误透传(fail-closed)。 */
@@ -209,9 +279,42 @@ async function readManifest(path: string): Promise<SessionsStoreManifest | null>
   return { authority: o.authority, generation: o.generation, cutoverId: o.cutoverId };
 }
 
+/** 读本地灾难 nonce;文件缺失 → null;损坏 / 缺 cutoverId → 抛(fail-closed)。 */
+async function readDisasterNonce(path: string): Promise<SessionsStoreDisasterNonce | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, { encoding: "utf8" });
+  } catch (err) {
+    if ((err as { code?: string })?.code === "ENOENT") return null;
+    throw err;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new SessionsStoreAuthorityError(`[sessions-store] 本地灾难 nonce 损坏(非合法 JSON): ${path}`);
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new SessionsStoreAuthorityError(`[sessions-store] 本地灾难 nonce 结构非法: ${path}`);
+  }
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.cutoverId !== "string" || o.cutoverId === "") {
+    throw new SessionsStoreAuthorityError(
+      `[sessions-store] 本地灾难 nonce 缺 cutoverId(需 {cutoverId:string, ts?, reason?}): ${path}`,
+    );
+  }
+  return {
+    cutoverId: o.cutoverId,
+    ts: typeof o.ts === "number" ? o.ts : undefined,
+    reason: typeof o.reason === "string" ? o.reason : undefined,
+  };
+}
+
 export interface ResolveSessionsStoreOptions {
   pool?: Pool;
   manifestPath?: string;
+  /** 灾难 nonce 路径;缺省 = 与 manifest 同目录的 sessions-disaster-nonce.json。 */
+  noncePath?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -225,6 +328,8 @@ export async function resolveSessionsStoreAuthority(
   const env = parseSessionsStoreEnv((opts.env ?? process.env).OC_SESSIONS_STORE);
   const pool = opts.pool ?? getPool();
   const manifestPath = opts.manifestPath ?? defaultManifestPath();
+  // 灾难 nonce 与 manifest 同目录(backfill disaster-restore 写在 dirname(manifest) 下)。
+  const noncePath = opts.noncePath ?? join(dirname(manifestPath), "sessions-disaster-nonce.json");
 
   // PG 状态读取区分两种"读不到":
   //   ① 42P01(表不存在=0134 未 apply,基建先行期):readPgStateRow 内部吞成 null(pgReadFailed=false)。
@@ -241,21 +346,24 @@ export async function resolveSessionsStoreAuthority(
   }
 
   const manifest = await readManifest(manifestPath);
+  // 灾难 nonce 读取的**损坏**(非合法 JSON/缺 cutoverId)是已判定 fail-closed,直接冒泡;
+  // 文件缺失 → null(下游 decide 视缺失为不满足灾难过渡态条件)。
+  const nonce = await readDisasterNonce(noncePath);
 
   if (pgReadError) {
-    // PG 状态读取失败(连接错误):**不得静默走 sqlite**,由 manifest + env 兜底裁决。
-    // 仅"真·基建先行期"(无 manifest 且 env 未设,PG 尚未 provision、连接本就不该通)允许 sqlite;
-    // 其余(有 manifest,或 env 已表明操作意图含 sqlite/pg/invalid)一律 fail-closed 拒起。
-    if (manifest === null && env === "unset") {
-      return { store: "sqlite" };
+    // PG 状态读取失败(连接错误):**不得静默走 sqlite**,由 manifest + nonce + env 兜底裁决
+    // (放行 SQLite 仅"真·基建先行期"或"灾难过渡态",见 decideSessionsStorePgUnreachable)。
+    try {
+      return decideSessionsStorePgUnreachable(env, manifest, nonce);
+    } catch (err) {
+      if (err instanceof SessionsStoreAuthorityError) {
+        // 补挂原始连接错误上下文,便于运维定位(核对 DATABASE_URL / PG 可达性)。
+        throw new SessionsStoreAuthorityError(`${err.message} 原始 PG 错误: ${pgReadError.message.slice(0, 200)}`);
+      }
+      throw err;
     }
-    throw new SessionsStoreAuthorityError(
-      `[sessions-store] PG 状态读取失败/连接错误,且存在本地 manifest 或 OC_SESSIONS_STORE 已表明操作意图` +
-        `(manifest=${manifest ? "存在" : "无"}, env=${env}),无法判定会话权威,fail-closed 拒起,须人工介入` +
-        `(核对 DATABASE_URL / PG 可达性)。原始错误: ${pgReadError.message.slice(0, 200)}`,
-    );
   }
 
   // 正常读到(含 42P01→null)→ 走启动规则矩阵纯函数裁决。
-  return decideSessionsStore(env, pgState, manifest);
+  return decideSessionsStore(env, pgState, manifest, nonce);
 }

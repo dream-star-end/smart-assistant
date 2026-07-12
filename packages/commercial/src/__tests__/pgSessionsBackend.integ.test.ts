@@ -196,7 +196,8 @@ describe("pgSessionsBackend contract", () => {
   maybe("appendForRequest 拒绝重映射(map 已存在但 msgId 不一致)→ fail-closed", async () => {
     await backend.upsertClientSession(mkSession());
     await backend.appendServerAuthoredMessageForRequest("req-r", "s-1", "u-1", { id: "srv-a", role: "assistant" } as MessageLike & { id: string });
-    // 同 requestId 复用到不同 msgId → 抛错(PG 比 SQLite DO NOTHING 更严)。
+    // 同 requestId 复用到不同 msgId → 抛错。MAJOR-1 后 SQLite 侧同样 fail-closed(双 backend 对齐,
+    // 见 storage usageAggregation.test.ts「不可重映射」),此处为 PG 侧对齐断言。
     await assert.rejects(
       () => backend.appendServerAuthoredMessageForRequest("req-r", "s-1", "u-1", { id: "srv-b", role: "assistant" } as MessageLike & { id: string }),
       /拒绝重映射/,
