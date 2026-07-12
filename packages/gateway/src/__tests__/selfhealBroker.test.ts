@@ -7,12 +7,17 @@ import {
   type BrokerRequest,
   type BrokerResponse,
   InMemoryBrokerClaimStore,
+  type RepairAuthority,
   SelfhealBroker,
 } from '../selfheal/broker.js'
 import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
+
+// Capability authorization test fixtures: an active repair holding CAP.
+const CAP = 'test-capability-token-xyz'
+const activeAuthority: RepairAuthority = async () => ({ status: 'running', capability: CAP })
 
 function stubRunner(handler: (cmd: string, args: string[]) => Partial<RunResult> | undefined): {
   run: CommandRunner
@@ -49,10 +54,12 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       run,
     })
     const resp = await broker.handleRequest({
       repairId: 'r1',
+      capability: CAP,
       actionKind: 'restart_service',
       params: { unit: 'openclaude-v5' },
     })
@@ -67,10 +74,12 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       run,
     })
     const resp = await broker.handleRequest({
       repairId: 'r2',
+      capability: CAP,
       actionKind: 'restart_service',
       params: { unit: 'sshd' },
     })
@@ -80,9 +89,10 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('rejects an unknown action kind', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore() })
+    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore(), repairAuthority: activeAuthority })
     const resp = await broker.handleRequest({
       repairId: 'r3',
+      capability: CAP,
       actionKind: 'rm_rf_slash',
       params: {},
     })
@@ -94,10 +104,12 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       run,
     })
     const resp = await broker.handleRequest({
       repairId: 'r4',
+      capability: CAP,
       actionKind: 'clean_disk',
       params: { target: 'docker' },
     })
@@ -107,9 +119,10 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('switch_node is a reserved no-op', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore() })
+    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore(), repairAuthority: activeAuthority })
     const resp = await broker.handleRequest({
       repairId: 'r5',
+      capability: CAP,
       actionKind: 'switch_node',
       params: {},
     })
@@ -122,10 +135,12 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       run,
     })
     const req: BrokerRequest = {
       repairId: 'r6',
+      capability: CAP,
       actionKind: 'restart_service',
       params: { unit: 'openclaude-v5' },
     }
@@ -135,6 +150,82 @@ describe('SelfhealBroker Tier1', () => {
     assert.equal(second.ok, true)
     assert.equal(second.detail?.replayed, true)
     assert.equal(calls.length, 1, 'a replayed request must NOT re-execute')
+  })
+})
+
+describe('SelfhealBroker authorization (capability + repair record)', () => {
+  it('rejects when the repair is unknown (forged repairId)', async () => {
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: async () => null, // no such repair
+      run,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'ghost',
+      capability: CAP,
+      actionKind: 'switch_node',
+      params: {},
+    })
+    assert.equal(resp.status, 'unauthorized')
+    assert.match(String(resp.detail?.reason), /unknown repair/)
+    assert.equal(calls.length, 0)
+  })
+
+  it('rejects a wrong capability and does not execute', async () => {
+    process.env.OC_SELFHEAL_RESTART_UNITS = 'openclaude-v5'
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      run,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'r1',
+      capability: 'wrong-token-of-len',
+      actionKind: 'restart_service',
+      params: { unit: 'openclaude-v5' },
+    })
+    assert.equal(resp.status, 'unauthorized')
+    assert.match(String(resp.detail?.reason), /capability mismatch/)
+    assert.equal(calls.length, 0, 'unauthorized request must never execute')
+    delete process.env.OC_SELFHEAL_RESTART_UNITS
+  })
+
+  it('rejects a missing capability', async () => {
+    const { run } = stubRunner(() => ({ code: 0 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      run,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'r1',
+      actionKind: 'switch_node',
+      params: {},
+    })
+    assert.equal(resp.status, 'unauthorized')
+  })
+
+  it('rejects when the repair is not in an active state', async () => {
+    const { run } = stubRunner(() => ({ code: 0 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: async () => ({ status: 'succeeded', capability: CAP }),
+      run,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'r1',
+      capability: CAP,
+      actionKind: 'switch_node',
+      params: {},
+    })
+    assert.equal(resp.status, 'unauthorized')
+    assert.match(String(resp.detail?.reason), /not active/)
   })
 })
 
@@ -170,6 +261,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       canonicalRepo: '/canon',
@@ -192,6 +284,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     })
     const resp = await broker.handleRequest({
       repairId: 'c1',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c1' },
     })
@@ -213,6 +306,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     })
     const resp = await broker.handleRequest({
       repairId: 'c2',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c2' },
     })
@@ -229,6 +323,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const { broker } = makeBroker({ autoDeployTier2: true })
     const resp = await broker.handleRequest({
       repairId: 'c3',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c3' },
     })
@@ -242,6 +337,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const { broker } = makeBroker({ autoDeployTier2: true })
     const resp = await broker.handleRequest({
       repairId: 'c4',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c4' },
     })
@@ -258,6 +354,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       autoDeployTier2: true,
@@ -266,6 +363,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     })
     const resp = await broker.handleRequest({
       repairId: 'c5',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c5' },
     })
@@ -278,6 +376,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const { broker } = makeBroker({ autoDeployTier2: true })
     const resp = await broker.handleRequest({
       repairId: 'c6',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c6' },
     })
@@ -289,6 +388,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const { broker } = makeBroker({ autoDeployTier2: true })
     const resp: BrokerResponse = await broker.handleRequest({
       repairId: 'c7',
+      capability: CAP,
       actionKind: 'cutover',
       params: { sha: 'not-a-sha', verificationRef: 'c7' },
     })

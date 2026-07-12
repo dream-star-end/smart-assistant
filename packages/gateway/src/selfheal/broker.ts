@@ -31,13 +31,14 @@
  * with different params is a conflict. See {@link BrokerClaimStore}.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { chmodSync, chownSync, existsSync, mkdirSync, unlinkSync } from 'node:fs'
 import { type Server, type Socket, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
   type BrokerClaimResult,
   finalizeBrokerAction,
+  getJob as getSelfhealJob,
   releaseBrokerClaim,
   tryClaimBrokerAction,
 } from '@openclaude/storage'
@@ -66,6 +67,36 @@ export interface BrokerRequest {
   repairId: string
   actionKind: string
   params?: unknown
+  /** Capability token bound to this repair. The broker verifies it against the
+   *  durable repair record — a valid Unix connection alone is NOT authorization. */
+  capability?: string
+}
+
+/** The subset of a durable repair record the broker authorizes against. */
+export interface RepairAuthorityRecord {
+  status: string
+  capability: string | null
+}
+
+/** Resolves the durable repair record for a repairId (or null if none). */
+export type RepairAuthority = (repairId: string) => Promise<RepairAuthorityRecord | null>
+
+/** States in which a repair may request privileged broker actions. Terminal /
+ *  not-yet-started jobs are rejected. */
+const ACTIVE_REPAIR_STATES = new Set(['starting', 'running'])
+
+/** Default authority backed by the durable selfheal job store. */
+const defaultRepairAuthority: RepairAuthority = async (repairId) => {
+  const job = await getSelfhealJob(repairId)
+  return job ? { status: job.status, capability: job.capability } : null
+}
+
+/** Constant-time capability comparison. Length mismatch / empty ⇒ false. */
+function capabilityMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || a.length === 0) return false
+  return timingSafeEqual(a, b)
 }
 
 export interface BrokerResponse {
@@ -151,6 +182,9 @@ export interface SelfhealBrokerOpts {
   /** Idempotency + claim backend. Defaults to the durable SQLite-backed store;
    *  tests inject {@link InMemoryBrokerClaimStore}. */
   store?: BrokerClaimStore
+  /** Resolves the durable repair record for capability authorization. Defaults
+   *  to the selfheal job store; tests inject a stub. */
+  repairAuthority?: RepairAuthority
   actions?: Record<string, BrokerActionDef>
   run?: CommandRunner
   log?: Logger
@@ -182,6 +216,7 @@ export class SelfhealBroker {
   private server: Server | null = null
   private readonly log: Logger
   private readonly store: BrokerClaimStore
+  private readonly repairAuthority: RepairAuthority
   private readonly actions: Record<string, BrokerActionDef>
   private readonly run: CommandRunner
   private readonly canonicalRepo: string
@@ -196,6 +231,7 @@ export class SelfhealBroker {
     // Durable by default; an ephemeral in-memory store would silently drop
     // replay protection across a restart (Codex HIGH #4), so it must be opted in.
     this.store = opts.store ?? durableBrokerClaimStore
+    this.repairAuthority = opts.repairAuthority ?? defaultRepairAuthority
     this.actions = opts.actions ?? TIER1_ACTIONS
     this.run = opts.run ?? defaultCommandRunner
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
@@ -318,6 +354,17 @@ export class SelfhealBroker {
       return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
     }
 
+    // Authorization (Codex HIGH #5): a valid Unix socket connection is NOT
+    // authorization. The request must name an ACTIVE repair and hold that
+    // repair's capability — otherwise any ocheal process could forge a repairId
+    // to replay Tier1 (restart / docker prune). Checked BEFORE the claim so an
+    // unauthorized request never touches the idempotency ledger.
+    const authz = await this.authorizeRepair(req)
+    if (!authz.ok) {
+      this.log.warn('broker request unauthorized', { repairId: req.repairId, reason: authz.reason })
+      return { ok: false, status: 'unauthorized', detail: { reason: authz.reason } }
+    }
+
     const key = `${req.repairId}:${req.actionKind}`
     // Hash the params so a same-key request with DIFFERENT params is a conflict,
     // not a silent replay of the old outcome (Codex HIGH #13).
@@ -371,6 +418,23 @@ export class SelfhealBroker {
       await this.store.release(key)
     }
     return response
+  }
+
+  /** Authorize a request against the durable repair record + its capability. */
+  private async authorizeRepair(req: BrokerRequest): Promise<{ ok: boolean; reason?: string }> {
+    let rec: RepairAuthorityRecord | null
+    try {
+      rec = await this.repairAuthority(req.repairId)
+    } catch (err) {
+      this.log.error('repair authority lookup failed — denying', { repairId: req.repairId }, err)
+      return { ok: false, reason: 'authority unavailable' }
+    }
+    if (!rec) return { ok: false, reason: 'unknown repair' }
+    if (!ACTIVE_REPAIR_STATES.has(rec.status)) return { ok: false, reason: 'repair not active' }
+    if (!rec.capability) return { ok: false, reason: 'repair has no capability' }
+    const provided = typeof req.capability === 'string' ? req.capability : ''
+    if (!capabilityMatches(provided, rec.capability)) return { ok: false, reason: 'capability mismatch' }
+    return { ok: true }
   }
 
   private isCommitted(resp: BrokerResponse): boolean {
