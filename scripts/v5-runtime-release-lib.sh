@@ -814,7 +814,8 @@ oc_hotcfg_assert_tuple_viable() {
 #
 # 顺序:[tuple 可行性守卫(R3-B1)]→ [canary boot(R2-M2③,失败零 history 污染)]→ [pre-state history(R2-B2,
 #       仅两轴任一启用)]→ snapshot(旧 env 四键 + 旧 current 目标)→ [extra_apply(master 源码
-#       symlink 翻转)]→ 写 env tuple → 翻 current → restart → smoke → history append(fsync)→
+#       symlink 翻转)]→ 写 env tuple → 翻 current → restart → smoke → [commit_apply(deploy_state CAS)]
+#       → history append(fsync)→
 #       解 trap → GC(库外)。
 # **snapshot 之后任一步(含 history 写)失败 → 恢复全部(current/env/extra 逆操作)并 restart 旧
 # master → return 1**;pre-state/canary 在 snapshot 之前、不动任何现场,失败直接 return 1(无需回滚)。
@@ -824,7 +825,8 @@ oc_hotcfg_assert_tuple_viable() {
 # release/bundle_value 按轴传新值或**空串**(空串=该轴禁用,env_write_tuple 恒写四键、空值落盘)。
 # 用法:oc_hotcfg_activate_saga <env_file> <platform_root> <flip_rev> <hist> \
 #         <image> <image_id> <release> <bundle_value> <restart_cmd> <smoke_cmd> \
-#         [extra_apply_cmd] [extra_revert_cmd] [master_release] [prev_master_release]
+#         [extra_apply_cmd] [extra_revert_cmd] [master_release] [prev_master_release] \
+#         [commit_apply_cmd] [commit_revert_cmd]
 # master_release(M7):激活时 master 蓝绿 release 目录,进 history 条目;rollback 从同一条记录取回对齐。
 # prev_master_release(R2-B2):激活**前**的 live master 目录,只用于首次启用的 pre-state 记录。
 oc_hotcfg_activate_saga() {
@@ -832,6 +834,7 @@ oc_hotcfg_activate_saga() {
   local image="$5" image_id="$6" release="$7" bundle_value="$8"
   local restart_cmd="$9" smoke_cmd="${10}"
   local extra_apply="${11:-}" extra_revert="${12:-}" master_release="${13:-}" prev_master_release="${14:-}"
+  local commit_apply="${15:-}" commit_revert="${16:-}"
 
   # 0) R3-B1:tuple 可行性守卫(两轴全空也要跑 —— --disable-* 恰是高危场景)。
   #    R3-B2:守卫与 canary 都必须在 pre-state 记账**之前**:canary 失败若已留 history 条目,
@@ -868,13 +871,17 @@ oc_hotcfg_activate_saga() {
   [ -L "$platform_root/current" ] && old_current="$(readlink "$platform_root/current" || true)"
 
   # 已完成阶段的进度旗标,回滚只逆做已生效者。这些是本函数的局部状态,rollback 闭包内引用。
-  local extra_done=0 env_done=0 current_done=0
+  local extra_done=0 env_done=0 current_done=0 commit_done=0
 
   # 集中回滚(不依赖 ERR trap;由各步 `if ! step` 显式触发。逆序复原后 restart 旧 master)。
   # trap 语义(§1.5)由"任一步失败→_saga_rollback→return 1"等价实现,且覆盖到 history 写为止:
   # history 写在最后一步,其失败同样走本回滚 → 满足"trap 持续到 history fsync 成功后才解除"。
   _hotcfg_saga_rollback() {
     echo "⚠ [hotcfg] 激活 saga 失败 → 回滚全部并 restart 旧 master" >&2
+    # deploy_state 是 release 血缘权威；若 smoke 后已 CAS、但 history fsync 失败，先精确 CAS 回旧血缘。
+    if [ "$commit_done" = 1 ] && [ -n "$commit_revert" ]; then
+      eval "$commit_revert" || echo "FATAL [hotcfg] deploy_state 补偿 CAS 失败，须人工核查 release 血缘" >&2
+    fi
     if [ "$current_done" = 1 ]; then
       if [ -n "$old_current" ]; then
         local t="$platform_root/.current.rb.$$"; rm -f "$t"; ln -s "$old_current" "$t"; mv -T "$t" "$platform_root/current" 2>/dev/null || true
@@ -890,8 +897,9 @@ oc_hotcfg_activate_saga() {
 
   # 2) extra:master 源码 symlink 翻转(可选,由 deploy-v5.sh 注入)
   if [ -n "$extra_apply" ]; then
-    if ! eval "$extra_apply"; then _hotcfg_saga_rollback; return 1; fi
+    # apply 可能在多条命令中途失败；先标记 attempted，让补偿钩子也覆盖“部分生效”现场。
     extra_done=1
+    if ! eval "$extra_apply"; then _hotcfg_saga_rollback; return 1; fi
   fi
   # 3) 写 env tuple
   if ! oc_hotcfg_env_write_tuple "$env_file" "$image" "$image_id" "$release" "$bundle_value"; then
@@ -906,7 +914,13 @@ oc_hotcfg_activate_saga() {
   if ! eval "$restart_cmd"; then _hotcfg_saga_rollback; return 1; fi
   # 6) smoke
   if ! eval "$smoke_cmd"; then _hotcfg_saga_rollback; return 1; fi
-  # 7) commit:history append(fsync,含 masterRelease)。写失败仍触发回滚(覆盖到 history fsync)
+  # 6.5) 可选外部权威提交(P3=deploy_state release CAS)。失败仍回滚 symlink/env/current+旧 master；
+  #       成功后 history 若失败，commit_revert 与其它现场一起补偿。
+  if [ -n "$commit_apply" ]; then
+    if ! eval "$commit_apply"; then _hotcfg_saga_rollback; return 1; fi
+    commit_done=1
+  fi
+  # 7) commit:history append(fsync,含 masterRelease)。写失败仍触发回滚(覆盖到 history fsync+外部权威)
   if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value" "$master_release"; then
     _hotcfg_saga_rollback; return 1; fi
   # 8) 提交成功 → 轮转 env.bak(m6:只在 commit 成功路径,保留最近 10 份;失败现场备份最近 → 恒保留)

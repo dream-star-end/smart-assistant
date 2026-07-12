@@ -75,13 +75,14 @@ beforeEach(async () => {
   await pool.query(
     `UPDATE deploy_state SET
        generation=1, phase='stable', active_slot='A', candidate_slot=NULL,
-       active_release='bootstrap', candidate_release=NULL,
+       active_release=NULL, candidate_release=NULL, previous_active_release=NULL,
        desired_leader_slot='A', desired_control_slot='A',
        cohort_percent=0, cohort_salt='', cohort_allowlist='{}',
        lock_version=1, transition_step=0, operation_id=NULL, updated_at=now()
      WHERE singleton=true`,
   );
   await pool.query(`TRUNCATE oauth_pending_states`);
+  await pool.query(`TRUNCATE deploy_state_journal`);
 });
 
 const maybe = (name: string, fn: () => Promise<void> | void) =>
@@ -105,6 +106,8 @@ describe("0135 迁移幂等 + 约束 + seed", () => {
 
     const after2 = await readDeployState(pool);
     assert.equal(after2.phase, "canary", "ON CONFLICT DO NOTHING → seed 不覆盖已有运行态");
+    assert.equal(after2.activeRelease, null, "0135 真实 seed active_release=NULL");
+    assert.equal(after2.previousActiveRelease, null, "0135 真实 seed previous_active_release=NULL");
 
     const cnt = await pool.query("SELECT count(*)::int AS n FROM deploy_state");
     assert.equal(cnt.rows[0].n, 1, "deploy_state 仍只有一行");

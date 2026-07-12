@@ -46,6 +46,61 @@ ds_exec() {  # stdin=SQL;stdout=结果
 # 但仍统一走转义,杜绝将来复用时的注入面。
 ds_lit() { local s="$1"; printf "%s" "${s//\'/\'\'}"; }
 
+# 传统 deploy/dist/rollback 在 stable 态更新 release 血缘时使用的唯一 SQL 生成器。
+# 空串代表 SQL NULL（0135 初始 seed 的 active_release 正是 NULL）；非空 release 路径统一转义。
+ds_sql_nullable() {  # $1=value
+  if [[ -z "$1" ]]; then printf 'NULL'; else printf "'%s'" "$(ds_lit "$1")"; fi
+}
+
+ds_stable_release_commit_sql() {  # $1=expect_lv $2=slot $3=expected_active $4=target
+  local expect="$1" slot target old_sql target_sql
+  slot="$(ds_lit "$2")"; old_sql="$(ds_sql_nullable "$3")"; target_sql="$(ds_sql_nullable "$4")"
+  cat <<SQL
+UPDATE deploy_state
+   SET previous_active_release = active_release,
+       active_release          = $target_sql,
+       lock_version            = lock_version + 1,
+       updated_at              = now()
+ WHERE singleton = true
+   AND lock_version = $expect
+   AND phase = 'stable'
+   AND candidate_slot IS NULL
+   AND candidate_release IS NULL
+   AND active_slot = '$slot'
+   AND active_release IS NOT DISTINCT FROM $old_sql
+RETURNING lock_version;
+SQL
+}
+
+ds_stable_release_revert_sql() {  # $1=expect_lv $2=slot $3=current $4=restore_active $5=restore_previous
+  local expect="$1" slot current_sql active_sql previous_sql
+  slot="$(ds_lit "$2")"; current_sql="$(ds_sql_nullable "$3")"
+  active_sql="$(ds_sql_nullable "$4")"; previous_sql="$(ds_sql_nullable "$5")"
+  cat <<SQL
+UPDATE deploy_state
+   SET active_release          = $active_sql,
+       previous_active_release = $previous_sql,
+       lock_version            = lock_version + 1,
+       updated_at              = now()
+ WHERE singleton = true
+   AND lock_version = $expect
+   AND phase = 'stable'
+   AND candidate_slot IS NULL
+   AND candidate_release IS NULL
+   AND active_slot = '$slot'
+   AND active_release IS NOT DISTINCT FROM $current_sql
+RETURNING lock_version;
+SQL
+}
+
+ds_stable_release_commit() {  # 参数同 ds_stable_release_commit_sql；成功 stdout=新 lock_version
+  ds_exec <<<"$(ds_stable_release_commit_sql "$@")"
+}
+
+ds_stable_release_revert() {  # 参数同 ds_stable_release_revert_sql；成功 stdout=新 lock_version
+  ds_exec <<<"$(ds_stable_release_revert_sql "$@")"
+}
+
 # ── 读:回传 singleton 关键列(| 分隔,顺序固定;NULL→空串)──
 # 顺序:generation|phase|active_slot|candidate_slot|active_release|candidate_release|
 #       desired_leader_slot|desired_control_slot|cohort_percent|cohort_salt|

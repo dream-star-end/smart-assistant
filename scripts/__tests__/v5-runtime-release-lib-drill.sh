@@ -507,6 +507,39 @@ else ok "smoke 失败返回非 0(extra_apply 已成功)"; fi
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
 chk "M7c:.prev-release 指针经 extra_revert 还原为 OLDPREV" "[ \"\$(cat '$PREVPTR')\" = 'OLDPREV' ]"
 
+echo "== TP3 hotcfg 外部权威 commit/revert 钩子纳入 saga 补偿边界 =="
+STATEPTR="$WORK/deploy-state.ptr"; echo OLD > "$STATEPTR"
+HHOOK="$WORK/hook-history"; : > "$HHOOK"
+# 成功路径:smoke 后 commit hook 生效，history 随后提交。
+DOCKER_STUB_IMAGE_ID=sha256:HOOK oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
+  img:HOOK sha256:HOOK /rel/HOOK "" "true" "true" "" "" "/rel/masterHOOK" "/rel/masterOLD" \
+  "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1 \
+  && ok "TP3 commit hook 成功路径" || bad "TP3 commit hook 应成功"
+chk "TP3 commit 后外部权威=NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
+
+# commit hook 自身失败:env/current/extra 全回滚，外部权威仍 OLD。
+echo OLD > "$STATEPTR"
+if DOCKER_STUB_IMAGE_ID=sha256:HOOK2 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
+  img:HOOK2 sha256:HOOK2 /rel/HOOK2 "" "true" "true" "" "" "/rel/masterHOOK2" "/rel/masterHOOK" \
+  "false" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
+  bad "TP3 commit hook 失败不应返回成功"
+else ok "TP3 commit hook 失败触发 saga 回滚"; fi
+chk "TP3 commit 失败后外部权威仍 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+
+# history fsync/append 位于 commit 之后；注入 append 失败，必须调用 commit_revert。
+HFAIL="$WORK/hook-history-fail"; : > "$HFAIL"
+oc_hotcfg_history_append "$HFAIL" img:BASE sha256:BASE /rel/BASE "" /rel/masterBASE prestate >/dev/null
+echo OLD > "$STATEPTR"
+oc_hotcfg_history_append() { return 1; }
+if DOCKER_STUB_IMAGE_ID=sha256:HOOK3 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:HOOK3 sha256:HOOK3 /rel/HOOK3 "" "true" "true" "" "" "/rel/masterHOOK3" "/rel/masterBASE" \
+  "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
+  bad "TP3 history 失败不应返回成功"
+else ok "TP3 history 失败触发 commit_revert"; fi
+chk "TP3 history 失败后外部权威补偿回 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+# 恢复真实函数，避免污染后续 drill。
+source "$LIB"
+
 echo "== TR2M2c canary boot 冒烟两路径(R2-M2③)=="
 # 成功路径:双轴启用 → docker run 带 bundle 挂载(platform_root+rev)+ release 挂载 + validate-only env
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF

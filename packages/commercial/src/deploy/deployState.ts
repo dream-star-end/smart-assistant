@@ -23,6 +23,7 @@ export interface DeployStateRow {
   candidateSlot: Slot | null;
   activeRelease: string | null;
   candidateRelease: string | null;
+  previousActiveRelease: string | null;
   desiredLeaderSlot: Slot;
   desiredControlSlot: Slot;
   cohortPercent: number;
@@ -52,6 +53,7 @@ interface RawDeployRow {
   candidate_slot: Slot | null;
   active_release: string | null;
   candidate_release: string | null;
+  previous_active_release: string | null;
   desired_leader_slot: Slot;
   desired_control_slot: Slot;
   cohort_percent: number;
@@ -80,6 +82,7 @@ function mapRow(r: RawDeployRow): DeployStateRow {
     candidateSlot: r.candidate_slot,
     activeRelease: r.active_release,
     candidateRelease: r.candidate_release,
+    previousActiveRelease: r.previous_active_release,
     desiredLeaderSlot: r.desired_leader_slot,
     desiredControlSlot: r.desired_control_slot,
     cohortPercent: r.cohort_percent,
@@ -92,7 +95,7 @@ function mapRow(r: RawDeployRow): DeployStateRow {
   };
 }
 
-const SELECT_COLS = `generation, phase, active_slot, candidate_slot, active_release, candidate_release,
+const SELECT_COLS = `generation, phase, active_slot, candidate_slot, active_release, candidate_release, previous_active_release,
   desired_leader_slot, desired_control_slot, cohort_percent, cohort_salt, cohort_allowlist,
   lock_version, transition_step, operation_id, updated_at`;
 
@@ -116,6 +119,7 @@ export interface DeployStatePatch {
   candidateSlot?: Slot | null;
   activeRelease?: string | null;
   candidateRelease?: string | null;
+  previousActiveRelease?: string | null;
   desiredLeaderSlot?: Slot;
   desiredControlSlot?: Slot;
   cohortPercent?: number;
@@ -133,6 +137,7 @@ const PATCH_COLUMN: Record<keyof DeployStatePatch, string> = {
   candidateSlot: "candidate_slot",
   activeRelease: "active_release",
   candidateRelease: "candidate_release",
+  previousActiveRelease: "previous_active_release",
   desiredLeaderSlot: "desired_leader_slot",
   desiredControlSlot: "desired_control_slot",
   cohortPercent: "cohort_percent",

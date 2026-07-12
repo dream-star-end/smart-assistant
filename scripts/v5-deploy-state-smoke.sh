@@ -149,8 +149,135 @@ grep -q 'active lane: slot=B' <<<"$rb_out" && ok "C 解析 active slot=B" || bad
 grep -q '/opt/openclaude/openclaude-v5-b' <<<"$rb_out" && ok "C 操作 B slot symlink(openclaude-v5-b)" || bad "C 未操作 B slot symlink"
 grep -q 'openclaude-v5-b.service' <<<"$rb_out" && ok "C restart B slot unit(openclaude-v5-b.service)" || bad "C 未 restart B slot unit"
 grep -q 'rel-oldA' <<<"$rb_out" && ok "C 回滚目标=deploy_state.previous_active_release(rel-oldA)" || bad "C 回滚目标未用 previous_active_release"
-grep -q 'previous←旧' <<<"$rb_out" && ok "C state 提交:active←target / previous←旧 对调" || bad "C 未见 state active/previous 对调提交"
+grep -q '严格 state CAS' <<<"$rb_out" && ok "C state 提交进入严格 CAS/补偿路径" || bad "C 未见严格 state CAS 路径"
 grep -qF 'openclaude-v5.service' <<<"$rb_out" && bad "C 误操作 A slot unit openclaude-v5.service(应只碰 B)" || ok "C 未误碰 A slot unit(仅 B)"
+
+echo "── D) 真 PG + fake SSH/systemd:传统激活副作用与补偿行为 ──"
+# source 真实 deploy 编排函数但不 dispatch/抢锁；随后用 fake SSH 记录并模拟 symlink/unit。
+set -- --dry-run
+export V5_DEPLOY_SOURCE_ONLY=1
+# shellcheck source=scripts/deploy-v5.sh
+source "$SCRIPT_DIR/deploy-v5.sh"
+unset V5_DEPLOY_SOURCE_ONLY
+DRY=0
+FAKE_EFFECT_LOG="/tmp/p3-effects-$$.log"; : > "$FAKE_EFFECT_LOG"
+FAKE_CURRENT=""; FAKE_PREV_FILE=""; FAKE_ASSET_FAIL=0; FAKE_SMOKE_FAIL_ONCE=0
+run() { :; }
+assert_release_capability_for_sessions_pg() { :; }
+sync_assets_to_pool() {
+  echo "assets:$1" >> "$FAKE_EFFECT_LOG"
+  [[ "$FAKE_ASSET_FAIL" == 0 ]]
+}
+smoke() {
+  echo "smoke:$1" >> "$FAKE_EFFECT_LOG"
+  if [[ "$FAKE_SMOKE_FAIL_ONCE" == 1 ]]; then FAKE_SMOKE_FAIL_ONCE=0; return 1; fi
+  return 0
+}
+ssh() {
+  local _host="$1" cmd="${2:-}" link_target
+  echo "ssh:$cmd" >> "$FAKE_EFFECT_LOG"
+  if [[ "$cmd" == *"cat '$RELEASES_ROOT/.prev-release'"* ]]; then printf '%s\n' "$FAKE_PREV_FILE"; return 0; fi
+  if [[ "$cmd" == *"readlink -f"* ]]; then printf '%s\n' "$FAKE_CURRENT"; return 0; fi
+  if [[ "$cmd" == *"ln -s '"* ]]; then
+    link_target="${cmd#*ln -s \'}"; link_target="${link_target%%\'*}"; FAKE_CURRENT="$link_target"
+  fi
+  return 0
+}
+reset_traditional_state() { # $1=active $2=previous $3=lock
+  ds_exec >/dev/null <<SQL
+UPDATE deploy_state SET generation=3, phase='stable', active_slot='B', candidate_slot=NULL,
+ active_release='$(ds_lit "$1")', candidate_release=NULL, previous_active_release='$(ds_lit "$2")',
+ desired_leader_slot='B', desired_control_slot='B', cohort_percent=0, cohort_salt='',
+ lock_version=$3, transition_step=0, operation_id=NULL, updated_at=now() WHERE singleton=true;
+SQL
+  ACTIVE_STATE_LOADED=0; ACTIVE_SLOT=A; ACTIVE_STATE_RELEASE=""; ACTIVE_STATE_PREVIOUS_RELEASE=""
+}
+
+# D1:PG 不可达必须在任何 fake effect 前失败。
+saved_db="$DS_DATABASE_URL"; DS_DATABASE_URL="postgres://test:test@127.0.0.1:1/nope"; : > "$FAKE_EFFECT_LOG"; ACTIVE_STATE_LOADED=0
+if load_active_lane_state_strict >/dev/null 2>&1; then bad "D1 PG 不可达不应解析 active lane"; else ok "D1 PG 不可达 fail-closed"; fi
+eq "D1 PG 失败前零副作用" "$(wc -l < "$FAKE_EFFECT_LOG")" "0"
+DS_DATABASE_URL="$saved_db"
+
+# D2:active=B 成功路径，assets 必须先于 symlink，且只 restart B；DB 血缘原子对调。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 1; FAKE_CURRENT="/rel/oldB"; FAKE_PREV_FILE="/rel/file-prev"; : > "$FAKE_EFFECT_LOG"
+assert_no_rollout_in_progress; resolve_active_lane
+if activate_release "/rel/newB"; then ok "D2 active=B 激活成功"; else bad "D2 active=B 激活应成功"; fi
+eq "D2 fake symlink 指向 newB" "$FAKE_CURRENT" "/rel/newB"
+eq "D2 DB active_release=newB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/newB"
+eq "D2 DB previous=oldB" "$(ds_exec <<<"SELECT previous_active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
+assets_line="$(grep -n '^assets:/rel/newB$' "$FAKE_EFFECT_LOG" | cut -d: -f1)"
+flip_line="$(grep -n "ln -s '/rel/newB'" "$FAKE_EFFECT_LOG" | head -1 | cut -d: -f1)"
+[[ -n "$assets_line" && -n "$flip_line" && "$assets_line" -lt "$flip_line" ]] && ok "D2 assets 先于 live 翻转" || bad "D2 assets/flip 顺序错误(assets=$assets_line flip=$flip_line)"
+grep -q "systemctl restart 'openclaude-v5-b.service'" "$FAKE_EFFECT_LOG" && ok "D2 restart B unit" || bad "D2 未 restart B unit"
+grep -q "systemctl restart 'openclaude-v5.service'" "$FAKE_EFFECT_LOG" && bad "D2 误 restart A unit" || ok "D2 未碰 A unit"
+
+# D3:起手快照后 lock 被推进 → release CAS 落空，必须回切旧 symlink/unit且不得报成功。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 10; FAKE_CURRENT="/rel/oldB"; : > "$FAKE_EFFECT_LOG"
+assert_no_rollout_in_progress; resolve_active_lane
+ds_exec <<<"UPDATE deploy_state SET lock_version=lock_version+1 WHERE singleton=true" >/dev/null
+if activate_release "/rel/racyB" >/dev/null 2>&1; then bad "D3 CAS 落空不应成功"; else ok "D3 CAS 落空返回失败"; fi
+eq "D3 symlink 已补偿回 oldB" "$FAKE_CURRENT" "/rel/oldB"
+eq "D3 DB active 仍 oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
+grep -q "ln -s '/rel/racyB'" "$FAKE_EFFECT_LOG" && grep -q "ln -s '/rel/oldB'" "$FAKE_EFFECT_LOG" \
+  && ok "D3 真实发生 new flip 后 old 补偿" || bad "D3 缺 flip/补偿行为证据"
+
+# D4:assets 预同步失败时，symlink/systemd 零副作用。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 20; FAKE_CURRENT="/rel/oldB"; : > "$FAKE_EFFECT_LOG"; FAKE_ASSET_FAIL=1
+assert_no_rollout_in_progress; resolve_active_lane
+if activate_release "/rel/no-assets" >/dev/null 2>&1; then bad "D4 assets 失败不应成功"; else ok "D4 assets 失败 fail-loud"; fi
+FAKE_ASSET_FAIL=0
+eq "D4 symlink 未动" "$FAKE_CURRENT" "/rel/oldB"
+grep -q systemctl "$FAKE_EFFECT_LOG" && bad "D4 assets 失败后不应碰 systemd" || ok "D4 assets 失败后 systemd 零副作用"
+
+# D5:hotcfg commit/revert 钩子打同一真 PG，验证 active=B + previous 精确恢复。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 30; assert_no_rollout_in_progress; resolve_active_lane
+TEST_V5_ENV="/tmp/p3-v5-env-$$"; printf 'DATABASE_URL=%s\n' "$DS_DATABASE_URL" > "$TEST_V5_ENV"; V5_ENV="$TEST_V5_ENV"
+build_hotcfg_state_hooks "/rel/hotB"
+if eval "$HOTCFG_STATE_COMMIT_CMD"; then ok "D5 hotcfg state commit hook 命中"; else bad "D5 hotcfg commit hook 失败"; fi
+eq "D5 commit active=hotB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/hotB"
+if eval "$HOTCFG_STATE_REVERT_CMD"; then ok "D5 hotcfg state revert hook 命中"; else bad "D5 hotcfg revert hook 失败"; fi
+eq "D5 revert active=oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
+eq "D5 revert previous=oldA" "$(ds_exec <<<"SELECT previous_active_release FROM deploy_state WHERE singleton=true")" "/rel/oldA"
+rm -f "$TEST_V5_ENV" "$FAKE_EFFECT_LOG"
+
+echo "── E) 真 PG 恢复路径:journal 原基线 / 缺失基线 / step6 candidate 异常 ──"
+# 外部效果全部换成可观测 fake；状态推进仍打本地真 PG。
+sshk() { :; }; abort_continue() { :; }; caddy_render_reload() { :; }; smoke() { :; }; dist_handshake_smoke() { :; }
+wait_for_slot_leadership() { return 0; }; vip_control_gate() { return 0; }
+reset_finalize_state() { # $1=step $2=op
+  ds_exec >/dev/null <<SQL
+UPDATE deploy_state SET generation=4, phase='finalizing', active_slot='A', candidate_slot='B',
+ active_release='/rel/oldA', candidate_release='/rel/newB', previous_active_release='/rel/older',
+ desired_leader_slot='B', desired_control_slot='B', cohort_percent=100, cohort_salt='s',
+ lock_version=100, transition_step=$1, operation_id='$(ds_lit "$2")', updated_at=now() WHERE singleton=true;
+TRUNCATE deploy_state_journal;
+SQL
+}
+
+# E1:step5 resume 必须恢复 step0 的旧 startId/计数，而非现场重 baseline。
+reset_finalize_state 5 op-base
+ds_exec >/dev/null <<'SQL'
+INSERT INTO deploy_state_journal(operation_id,step,action)
+VALUES('op-base',0,'finalize-begin egress-baseline={"startId":"orig-start","enq":"11","sent":"7","exp":"2","ovf":"1"}');
+SQL
+EGR_CAPTURE="/tmp/p3-egr-capture-$$"
+egress_gate_conservation() { printf '%s|%s|%s|%s|%s' "$EGR_START_STARTID" "$EGR_START_ENQ" "$EGR_START_SENT" "$EGR_START_EXP" "$EGR_START_OVF" > "$EGR_CAPTURE"; return 1; }
+if ( finalize >/dev/null 2>&1 ); then bad "E1 gate 故障应转 aborting"; else ok "E1 gate 故障返回非零"; fi
+eq "E1 使用 journal 原基线" "$(cat "$EGR_CAPTURE")" "orig-start|11|7|2|1"
+eq "E1 gate 失败真实终态=aborting" "$(ds_exec <<<"SELECT phase FROM deploy_state WHERE singleton=true")" "aborting"
+rm -f "$EGR_CAPTURE"
+
+# E2:step0 journal 缺失必须真实 CAS 到 aborting，不只打印提示。
+reset_finalize_state 0 op-missing
+if ( finalize >/dev/null 2>&1 ); then bad "E2 缺基线不应继续 finalize"; else ok "E2 缺基线 fail-closed"; fi
+eq "E2 缺基线真实终态=aborting" "$(ds_exec <<<"SELECT phase FROM deploy_state WHERE singleton=true")" "aborting"
+
+# E3:step6 candidate 异常不得提交 stable。
+reset_finalize_state 6 op-step6
+wait_for_slot_leadership() { return 1; }
+if ( finalize >/dev/null 2>&1 ); then bad "E3 candidate 异常不应成功"; else ok "E3 candidate 异常返回失败"; fi
+eq "E3 step6 异常真实终态=aborting" "$(ds_exec <<<"SELECT phase FROM deploy_state WHERE singleton=true")" "aborting"
 
 echo
 echo "══ 冒烟结果:PASS=$PASS FAIL=$FAIL ══"
