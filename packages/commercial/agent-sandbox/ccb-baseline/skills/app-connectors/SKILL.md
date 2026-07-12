@@ -13,6 +13,11 @@ tags: [connectors, email, webdav, notion, github, feishu, calendar]
 ## 用法
 
 ```bash
+# 发现「可绑定」的应用连接器(可带关键词搜索),用于回答"我能连哪些应用"、帮用户找应用。
+# 注意:绑定要用户自己在 设置 → 应用连接器 里填凭据(凭据永不进容器),你不能代绑,只能引导。
+oc-connect catalog
+oc-connect catalog notion        # 关键词搜索
+
 # 列出已绑定连接 + 每个连接可用的 actions(含 readOnly 标记)。未绑定时会输出引导文案。
 oc-connect list
 

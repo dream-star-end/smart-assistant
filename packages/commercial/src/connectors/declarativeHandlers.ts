@@ -20,10 +20,9 @@ import {
   listDeclarativeConnections,
   revokeDeclarativeConnection,
 } from './engine/binding.js'
-import { requiredBindSources } from './engine/credentialBag.js'
+import { listDeclarativeCatalog } from './engine/catalog.js'
 import { clearTokenCache } from './engine/tokenEngine.js'
 import { ConnectorError } from './errors.js'
-import { loadVerifiedContractWithMeta } from './spec/review.js'
 import { ConnectorSpecError } from './spec/types.js'
 
 /** ConnectorError/ConnectorSpecError → HttpError(稳定 code,不泄 message)。 */
@@ -40,32 +39,8 @@ function asRecord(v: unknown): Record<string, unknown> {
 
 /** GET declarative/catalog —— 已审可绑连接器目录(含 authMode / 需填 source / 动作)。 */
 async function handleCatalog(res: ServerResponse, pool: Pool): Promise<void> {
-  const rows = await pool.query<{ id: string; slug: string; name: string; description: string }>(
-    `SELECT v.id::text AS id, v.slug, v.name, v.description
-       FROM marketplace_skill_versions v
-       JOIN marketplace_skill_listings l ON l.slug = v.slug
-      WHERE l.kind = 'connector'
-        AND v.security_review_state = 'security_approved'
-        AND v.exec_revoked_at IS NULL
-      ORDER BY v.slug`,
-  )
-  const catalog: unknown[] = []
-  for (const row of rows.rows) {
-    try {
-      const meta = await loadVerifiedContractWithMeta(Number(row.id), pool)
-      catalog.push({
-        versionId: Number(row.id),
-        slug: row.slug,
-        label: row.name,
-        description: row.description,
-        authMode: meta.contract.authMode,
-        requiredBindSources: requiredBindSources(meta.contract),
-        actions: meta.contract.actions.map((a) => ({ id: a.id, effect: a.effect })),
-      })
-    } catch {
-      // 某版本载入失败(被 revoke/篡改)→ 跳过,不阻塞整目录。
-    }
-  }
+  // 目录查询/投影单一权威(与 agent RPC catalog 共用 listDeclarativeCatalog)。
+  const catalog = await listDeclarativeCatalog(pool)
   sendJson(res, 200, { connectors: catalog })
 }
 

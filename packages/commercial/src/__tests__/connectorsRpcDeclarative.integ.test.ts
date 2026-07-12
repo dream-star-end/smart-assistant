@@ -284,4 +284,51 @@ describe('声明式连接器 · 容器 RPC', () => {
       await server.close()
     }
   })
+
+  test('CATALOG:agent 发现可绑连接器(seed 默认)+ query 子串搜索;不含凭据/versionId', async (t) => {
+    if (skip(t)) return
+    await seedDefaultConnectors(getPool())
+    const userId = await mkUser()
+    const containerId = 4343
+    const secret = randomBytes(32).toString('hex')
+    const token = `oc-v3.${containerId}.${secret}`
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: memRepo(containerId, userId, hashSecret(secret)),
+      redis: null,
+      resolver: okResolver(),
+      fetchImpl: localFetch(0),
+    })
+    const ctx = { hostUuid: HOST_UUID, boundIp: BOUND_IP }
+
+    // ── 全量 catalog:含 seed 的 notion/feishu/github,投影出 slug/label/authMode/需填凭据/动作。 ──
+    {
+      const m = mockRes()
+      await handler(mockReq('/v3/connectors/catalog', token, {}), m.res, ctx)
+      const { env } = m.parsed()
+      const cons = env.connectors as Array<Record<string, unknown>>
+      const slugs = cons.map((c) => c.slug)
+      assert.ok(slugs.includes('notion'), 'notion in catalog')
+      assert.ok(slugs.includes('feishu'), 'feishu in catalog')
+      assert.ok(slugs.includes('github'), 'github in catalog')
+      const notion = cons.find((c) => c.slug === 'notion')!
+      assert.equal(notion.authMode, 'static-token')
+      assert.deepEqual(notion.requiredBindSources, ['access_token'])
+      // 动作只投 id + readOnly;不含凭据、不含 versionId(agent 不能代绑,不需要)。
+      assert.equal(notion.versionId, undefined)
+      const acts = notion.actions as Array<{ id: string; readOnly: boolean }>
+      assert.ok(acts.find((a) => a.id === 'whoami')?.readOnly === true)
+      const feishu = cons.find((c) => c.slug === 'feishu')!
+      assert.deepEqual(feishu.requiredBindSources, ['client_id', 'client_secret'])
+    }
+
+    // ── query 子串搜索:只回匹配项。 ──
+    {
+      const m = mockRes()
+      await handler(mockReq('/v3/connectors/catalog', token, { query: 'notion' }), m.res, ctx)
+      const { env } = m.parsed()
+      const cons = env.connectors as Array<Record<string, unknown>>
+      assert.equal(cons.length, 1)
+      assert.equal(cons[0]!.slug, 'notion')
+    }
+  })
 })

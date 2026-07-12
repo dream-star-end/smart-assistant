@@ -35,6 +35,7 @@ import {
   getDeclarativeConnection,
   listDeclarativeConnections,
 } from './engine/binding.js'
+import { listDeclarativeCatalog } from './engine/catalog.js'
 import type { EngineHttpDeps } from './engine/driver.js'
 import { executeDeclarativeAction, loadContractForConnection } from './engine/execute.js'
 import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
@@ -61,6 +62,7 @@ import {
 export const CONNECTORS_RPC_PREFIX = '/v3/connectors/'
 const LIST_PATH = '/v3/connectors/list'
 const CALL_PATH = '/v3/connectors/call'
+const CATALOG_PATH = '/v3/connectors/catalog'
 
 /** call body 上限:put_file contentBase64 ≤6MB + JSON 包装余量。 */
 const MAX_CALL_BODY_BYTES = 8 * 1024 * 1024
@@ -333,6 +335,15 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         })
         return
       }
+      if (path === CATALOG_PATH) {
+        const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
+        const query =
+          body !== null && typeof body === 'object' && typeof (body as { query?: unknown }).query === 'string'
+            ? (body as { query: string }).query
+            : undefined
+        await handleCatalog(res, pool, query)
+        return
+      }
       sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' })
     } catch (err) {
       const ce = toConnectorError(err)
@@ -419,6 +430,27 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
     })
   }
   sendEnvelope(res, { connections })
+}
+
+// ─── catalog(agent 发现/搜索可装连接器;只读,不含凭据) ─────────────────────
+
+/**
+ * agent 目录发现:列出**可绑**连接器(≠已绑 list)。供 AI 感知"有哪些应用可用"、按关键词
+ * 搜索、并引导用户去管理界面绑定(凭据永不进容器 → agent 不能代绑)。与前端 REST catalog
+ * 共用 listDeclarativeCatalog 单一权威。
+ */
+async function handleCatalog(res: ServerResponse, pool: Pool, query?: string): Promise<void> {
+  const connectors = await listDeclarativeCatalog(pool, query ? { query } : {})
+  sendEnvelope(res, {
+    connectors: connectors.map((c) => ({
+      slug: c.slug,
+      label: c.label,
+      description: c.description,
+      authMode: c.authMode,
+      requiredBindSources: c.requiredBindSources,
+      actions: c.actions.map((a) => ({ id: a.id, readOnly: a.effect === 'read' })),
+    })),
+  })
 }
 
 // ─── call ────────────────────────────────────────────────────────────────
