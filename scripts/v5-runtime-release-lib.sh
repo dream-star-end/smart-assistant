@@ -613,7 +613,9 @@ oc_hotcfg_write_emergency_tuple() {
   oc_hotcfg_canary_boot "$image_id" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "" \
     || { oc_hotcfg__die "emergency: 候选 tuple canary boot 失败(该 bundle+镜像组合不可启动,拒登记)"; return 1; }
   # 硬验通过 → 写 {image,image_id,bundle}
-  val="$(jq -cn --arg image "$image" --arg image_id "$image_id" --arg bundle "$bundle" \
+  # R4-M1:登记 canonical 路径(bundle_real,恒为 bundles/<12hex> 固定 digest 目录)——
+  # 传 current 之类 symlink 也被解析钉死,GC 保护与激活取 rev 都作用在真实 digest 目录上。
+  val="$(jq -cn --arg image "$image" --arg image_id "$image_id" --arg bundle "$bundle_real" \
     '{image:$image, image_id:$image_id, bundle:$bundle}')"
   local ts; ts="$(date -u +%Y%m%d%H%M%S)"
   cp -a "$env_file" "$env_file.bak-$ts"
@@ -745,12 +747,22 @@ oc_hotcfg_canary_boot() {
     || { oc_hotcfg__die "canary boot 冒烟失败(entrypoint validate-only 非 0)→ 拒绝激活"; return 1; }
 }
 
-# tuple 可行性守卫(R3-B1):禁止提交"瘦身镜像(embed_source=0)+ 空 release"的目标 tuple ——
-# 该组合下新容器无源码可跑,supervisor 护栏会拒 provision,但那时坏 tuple 已激活 = 全站
-# provision 真空。必须在 saga 一切现场改动之前拦下(**两轴全空也要跑**,恰恰是 --disable-* 场景)。
+# tuple 可行性守卫(R3-B1 + R4-B1):saga 一切现场改动之前(**两轴全空也要跑**)拦两类坏 tuple:
+#   ① tag↔ID 漂移:tuple 记 {image(tag), image_id(权威)},但容器最终以 tag 起(supervisor
+#      deps.image)——若 tag 已被重打到别的镜像,提交后=运行镜像与 stale 权威 ID 不同,
+#      错误镜像启动 + 存量容器持续 runtimeStale 循环。强制 inspect(image).Id == image_id。
+#   ② 瘦身镜像(embed_source=0)+ 空 release:新容器无源码可跑,provision 真空。
 # 缺 label 视为内嵌镜像(兼容旧镜像)放行;inspect 失败 = 无法证明可行,拒绝。
 oc_hotcfg_assert_tuple_viable() {
-  local image_id="$1" release="$2" embed
+  local image="$1" image_id="$2" release="$3" live_id embed
+  # ① tag↔ID 一致性(image/image_id 都非空才可验;正常 saga 两者恒非空)。
+  if [ -n "$image" ] && [ -n "$image_id" ]; then
+    live_id="$("$OC_DOCKER_BIN" image inspect --format '{{.Id}}' "$image" 2>/dev/null)" \
+      || { oc_hotcfg__die "tuple_viable: 无法 inspect 镜像 tag $image(镜像不存在?)"; return 1; }
+    [ "$live_id" = "$image_id" ] \
+      || { oc_hotcfg__die "tuple_viable: tag↔ID 漂移(inspect($image).Id=$live_id ≠ tuple.image_id=$image_id)—— tag 已被重打,拒绝提交错位 tuple"; return 1; }
+  fi
+  # ② 瘦身+空 release(按权威 immutable ID 查 label,不再信 tag)。
   [ -n "$release" ] && return 0
   embed="$("$OC_DOCKER_BIN" image inspect --format '{{index .Config.Labels "oc.runtime.embed_source"}}' "$image_id" 2>/dev/null)" \
     || { oc_hotcfg__die "tuple_viable: 无法 inspect 镜像 $image_id(release 为空时必须证明镜像内嵌源码)"; return 1; }
@@ -789,7 +801,7 @@ oc_hotcfg_activate_saga() {
   # 0) R3-B1:tuple 可行性守卫(两轴全空也要跑 —— --disable-* 恰是高危场景)。
   #    R3-B2:守卫与 canary 都必须在 pre-state 记账**之前**:canary 失败若已留 history 条目,
   #    hotcfg_history_present 会把 --rollback 导向 tuple 路径而倒数第 2 条不存在 = rollback 报废。
-  oc_hotcfg_assert_tuple_viable "$image_id" "$release" || return 1
+  oc_hotcfg_assert_tuple_viable "$image" "$image_id" "$release" || return 1
 
   # 0.3) R2-M2③:canary boot 冒烟(仅两轴任一启用;rev-pinned,不依赖 current/env → 现场未动,
   #      失败直接拒绝激活,无需回滚、history 零污染)。

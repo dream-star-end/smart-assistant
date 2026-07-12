@@ -179,8 +179,8 @@ fi
 if [[ -n "$EMERG_IMAGE$EMERG_IMAGE_ID" && "$MODE" != "emergency-tuple" && "$DISABLE_RELEASE_FLAG" != 1 ]]; then
   echo "✗ --image/--image-id 仅用于 --emergency-tuple 或 --disable-runtime-release" >&2; exit 2
 fi
-if [[ "$DISABLE_RELEASE_FLAG" == 1 && -n "$EMERG_IMAGE" && -z "$EMERG_IMAGE_ID" ]]; then
-  echo "✗ --disable-runtime-release --image= 必须同时给 --image-id=(ID 钉死,防 tag 漂移)" >&2; exit 2
+if [[ "$DISABLE_RELEASE_FLAG" == 1 && ( ( -n "$EMERG_IMAGE" && -z "$EMERG_IMAGE_ID" ) || ( -z "$EMERG_IMAGE" && -n "$EMERG_IMAGE_ID" ) ) ]]; then
+  echo "✗ --disable-runtime-release 的 --image=/--image-id= 必须成对出现(ID 钉死,防 tag 漂移;单传 --image-id 会被静默忽略故拒)" >&2; exit 2
 fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
@@ -932,6 +932,12 @@ build_runtime_release() {
 # 两轴独立 + R2-B1 三态写:启用轴产新值;禁用/未启用轴传**空串**(env_write_tuple 恒写四键,空值落盘
 # = 该轴禁用可表达,--disable-* 即走此路)。saga 内含 R2-B2 pre-state(首次启用记激活前现场)与
 # R2-M2③ canary boot 冒烟(restart 前,validate-only)。
+# 激活提交的核心健康门(单一权威,R4-M2):正常激活与 emergency 激活**同强度**,
+# 恒含 sessionsDb=ok(数据库失联时不许提交任何 tuple history)。
+hotcfg_core_smoke_cmd() {
+  printf '%s' 'hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$V5_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q "\"ok\":true" && printf "%s" "$hz" | grep -q "\"channel\":\"v5\"" && printf "%s" "$hz" | grep -q "\"sessionsDb\":\"ok\""'
+}
+
 activate_runtime_tuple() {
   echo "── 激活 runtime tuple saga ──"
   if [[ "$DRY" == 1 ]]; then
@@ -970,7 +976,7 @@ activate_runtime_tuple() {
   restart_cmd="systemctl restart '$V5_UNIT'"
   # 远端核心健康门(fail-closed):ok=true + channel=v5 + sessionsDb=ok(与 smoke() 深度探活同不变量)。
   # 全量 smoke(调度器白名单等第二道防线)在 saga 提交后由 deploy() 另跑本地 smoke() 兜底。
-  smoke_cmd='hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$V5_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q '\''"ok":true'\'' && printf "%s" "$hz" | grep -q '\''"channel":"v5"'\'' && printf "%s" "$hz" | grep -q '\''"sessionsDb":"ok"'\'''
+  smoke_cmd="$(hotcfg_core_smoke_cmd)"
   # extra:master 源码 symlink 翻转(先原子落 .prev-release=prev_src,再 ln+mv -T);
   # revert(M7c):**先还原 .prev-release=old_prev**(翻转前快照),再翻回 master symlink=prev_src。
   extra_apply="printf '%s\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$BUILT_RELEASE' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
@@ -1023,14 +1029,19 @@ activate_emergency_tuple() {
   [[ -n "$ej" ]] || { echo "✗ env 无 OC_RUNTIME_EMERGENCY_TUPLE(先 --emergency-tuple 登记)" >&2; exit 1; }
   image="$(jq -r '.image // empty' <<<"$ej")"; image_id="$(jq -r '.image_id // empty' <<<"$ej")"; bundle="$(jq -r '.bundle // empty' <<<"$ej")"
   [[ -n "$image" && -n "$image_id" && -n "$bundle" ]] || { echo "✗ emergency tuple JSON 字段缺失: $ej" >&2; exit 1; }
-  live_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image_id'" 2>/dev/null || true)"
-  [[ "$live_id" == "$image_id" ]] || { echo "✗ emergency 镜像 ID 复核失败(登记 $image_id,现查 ${live_id:-<gone>})—— 镜像可能已被删,须重建内嵌镜像再登记" >&2; exit 1; }
+  # R4-B1:按 **tag** inspect —— 容器最终以 tag 起,必须证明 tag 此刻仍指向登记的 immutable ID
+  # (按 ID inspect 只能证明旧镜像还在,发现不了 tag 已被重打)。
+  live_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
+  [[ "$live_id" == "$image_id" ]] || { echo "✗ emergency 镜像 tag↔ID 复核失败(登记 $image_id,inspect($image)=${live_id:-<gone>})—— tag 漂移或镜像被删,须重建/重打后重新登记" >&2; exit 1; }
+  # R4-M1(激活侧):登记值应恒为 canonical bundles/<12hex>;再验一次防手改 env。
   rev="$(basename "$bundle")"
+  [[ "$rev" =~ ^[0-9a-f]{12}$ && "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT/bundles/$rev" ]] \
+    || { echo "✗ emergency bundle 路径非 canonical bundles/<12hex> 形态: $bundle(重新 --emergency-tuple 登记)" >&2; exit 1; }
   ssh "$KL_HOST" "[ -d '$bundle' ]" || { echo "✗ emergency bundle 已不存在: $bundle(GC 保护集应含它,须排查)" >&2; exit 1; }
   prev_src="$(bg_current_release)"
   local restart_cmd smoke_cmd
   restart_cmd="systemctl restart '$V5_UNIT'"
-  smoke_cmd="hz=\"\"; for i in \$(seq 1 15); do hz=\$(curl -fsS http://127.0.0.1:$V5_PORT/healthz 2>/dev/null||true); [ -n \"\$hz\" ] && break; sleep 2; done; printf '%s' \"\$hz\" | grep -q '\"ok\":true' && printf '%s' \"\$hz\" | grep -q '\"channel\":\"v5\"'"
+  smoke_cmd="$(hotcfg_core_smoke_cmd)"  # R4-M2:与正常激活同强度(含 sessionsDb=ok)
   # masterRelease=prev_src(master 源码不动,history 记当前 live);extra_apply/revert 传空。
   hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "$OC_HOTCFG_HISTORY" \
@@ -1609,7 +1620,7 @@ rollback_runtime_tuple() {
   # M7c:快照翻转前的 .prev-release,saga 失败时一并还原
   old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   restart_cmd="systemctl restart '$V5_UNIT'"
-  smoke_cmd='hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$V5_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q '\''"ok":true'\'' && printf "%s" "$hz" | grep -q '\''"channel":"v5"'\'' && printf "%s" "$hz" | grep -q '\''"sessionsDb":"ok"'\'''
+  smoke_cmd="$(hotcfg_core_smoke_cmd)"
   extra_apply="printf '%s\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$master' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
   extra_revert="printf '%s\n' '$old_prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$prev_src' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
   echo "  回滚到倒数第 $nth 条 committed tuple(同条恢复,四键逐字面含空值): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"

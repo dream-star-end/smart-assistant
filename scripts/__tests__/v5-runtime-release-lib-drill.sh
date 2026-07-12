@@ -398,7 +398,7 @@ EOF
 : > "$OC_HOTCFG_HISTORY"
 oc_hotcfg_flip_current "$REV2"     # 旧 current=REV2
 NEWHIST="$OC_HOTCFG_HISTORY"
-if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$NEWHIST" \
+if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$NEWHIST" \
      img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterNEW" "/rel/masterPREV"; then ok "saga 成功返回 0"; else bad "saga 应成功"; fi
 chk "env OC_RUNTIME_IMAGE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:NEW' ]"
 chk "env OC_RUNTIME_RELEASE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/NEW' ]"
@@ -419,7 +419,7 @@ EOF
 HPRE="$WORK/hist-pre"; : > "$HPRE"
 oc_hotcfg_flip_current "$REV2"
 # 首次启用(release+bundle 双轴)
-oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$HPRE" \
+DOCKER_STUB_IMAGE_ID=sha256:EN oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$HPRE" \
   img:EN sha256:EN /rel/EN "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterEN" "/rel/masterPRE" \
   >/dev/null 2>&1 || bad "TR2B2 首次启用 saga 应成功"
 # 模拟 --rollback=1:取倒数第 2 条 committed(= pre-state),按其逐字面值再走一次 saga
@@ -428,7 +428,8 @@ chk "rollback 目标=pre-state 条目(preState=true)" "[ \"\$(jq -r .preState <<
 RB_IMG="$(jq -r '.image' <<<"$RB")"; RB_ID="$(jq -r '.image_id' <<<"$RB")"
 RB_REL="$(jq -r '.release' <<<"$RB")"; RB_BUN="$(jq -r '.bundle' <<<"$RB")"
 chk "pre-state 记录 release/bundle 均为空(启用前皆禁用)" "[ -z '$RB_REL' ] && [ -z '$RB_BUN' ]"
-oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HPRE" \
+# R4-B1 配套:回滚路径同样过 tag↔ID 守卫 —— stub 模拟 img:PRE 此刻仍指向 pre-state 登记的 ID。
+DOCKER_STUB_IMAGE_ID=sha256:PRE oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HPRE" \
   "$RB_IMG" "$RB_ID" "$RB_REL" "$RB_BUN" "true" "true" "" "" "$(jq -r '.masterRelease' <<<"$RB")" "" \
   >/dev/null 2>&1 || bad "TR2B2 回滚 saga 应成功"
 chk "退回启用前:OC_RUNTIME_RELEASE 空值(三态写恢复空)" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/pre.env'"
@@ -444,7 +445,7 @@ OC_PLATFORM_BUNDLE=/bun/KEEP
 EOF
 : > "$OC_HOTCFG_HISTORY"
 oc_hotcfg_flip_current "$REV2"
-oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
+DOCKER_STUB_IMAGE_ID=sha256:R oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
   img:R sha256:R /rel/R "" "true" "true" "" "" "/rel/masterR" "/rel/masterPREV" >/dev/null 2>&1 && ok "release-only saga 成功" || bad "release-only saga 应成功"
 chk "release-only:OC_RUNTIME_RELEASE 写入 /rel/R" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/R' ]"
 chk "release-only:OC_PLATFORM_BUNDLE 轴禁用 → 写空值(三态,旧值被清)" "grep -q '^OC_PLATFORM_BUNDLE=$' '$OC_HOTCFG_ENV_FILE'"
@@ -460,7 +461,7 @@ EOF
 : > "$OC_HOTCFG_HISTORY"
 oc_hotcfg_flip_current "$REV2"   # 旧 current=REV2
 RESTART_LOG="$WORK/restart.log"; : > "$RESTART_LOG"
-if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
      img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$RESTART_LOG" "false" "" "" "/rel/masterNEW"; then
   bad "saga 应因 smoke 失败返回非 0"
 else ok "saga 因 smoke 失败返回非 0"; fi
@@ -478,7 +479,7 @@ OC_RUNTIME_RELEASE=/rel/OLD
 OC_PLATFORM_BUNDLE=/bun/OLD
 EOF
 oc_hotcfg_flip_current "$REV2"
-if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
      img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "false" "echo revert" "/rel/masterNEW"; then
   bad "extra_apply 失败应返回非 0"
 else ok "extra_apply 失败返回非 0"; fi
@@ -498,7 +499,7 @@ oc_hotcfg_flip_current "$REV2"
 PREVPTR="$WORK/prevptr"; echo OLDPREV > "$PREVPTR"
 APPLY="echo NEWPREV > '$PREVPTR'"     # apply 成功(改指针)
 REVERT="echo OLDPREV > '$PREVPTR'"    # revert 还原指针
-if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
      img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "false" "$APPLY" "$REVERT" "/rel/masterNEW"; then
   bad "smoke 失败应返回非 0"
 else ok "smoke 失败返回非 0(extra_apply 已成功)"; fi
@@ -515,7 +516,7 @@ OC_PLATFORM_BUNDLE=/bun/OLD
 EOF
 oc_hotcfg_flip_current "$REV2"
 CRLOG="$WORK/canary-run.log"; : > "$CRLOG"
-DOCKER_STUB_RUN_LOG="$CRLOG" oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+DOCKER_STUB_RUN_LOG="$CRLOG" DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
   img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterC" "" \
   >/dev/null 2>&1 && ok "canary 成功路径:saga 提交" || bad "canary 成功路径 saga 应成功"
 chk "canary 以 validate-only 跑 entrypoint" "grep -q 'OC_ENTRYPOINT_VALIDATE_ONLY=1' '$CRLOG' && grep -q -- '--entrypoint /usr/local/bin/entrypoint.sh' '$CRLOG'"
@@ -532,7 +533,7 @@ OC_PLATFORM_BUNDLE=/bun/OLD
 EOF
 oc_hotcfg_flip_current "$REV2"
 CRESTART="$WORK/canary-restart.log"; : > "$CRESTART"
-if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+if DOCKER_STUB_RUN_FAIL=1 DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
      img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$CRESTART" "true" "" "" "/rel/masterC" "" \
      >/dev/null 2>&1; then bad "canary 失败应让 saga 返回非 0"; else ok "canary 失败 → saga 拒绝激活"; fi
 chk "canary 失败:env 未动(仍 OLD)" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/OLD' ]"
@@ -540,7 +541,7 @@ chk "canary 失败:current 未动(仍 REV2)" "[ \"\$(readlink '$OC_HOTCFG_PLATFO
 chk "canary 失败:未无谓重启旧 master(现场未动无需 restart)" "[ ! -s '$CRESTART' ]"
 # 两轴皆禁用(release 空 + flip_rev 空)→ canary 跳过(docker run 不被调用)
 CRLOG2="$WORK/canary-run2.log"; : > "$CRLOG2"
-DOCKER_STUB_RUN_LOG="$CRLOG2" oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
+DOCKER_STUB_RUN_LOG="$CRLOG2" DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
   img:NEW sha256:NEWID "" "" "true" "true" "" "" "/rel/masterC" "" >/dev/null 2>&1 \
   && ok "双轴禁用 saga 成功(写空值)" || bad "双轴禁用 saga 应成功"
 chk "双轴禁用 → canary 跳过(无 docker run)" "[ ! -s '$CRLOG2' ]"
@@ -548,7 +549,7 @@ chk "双轴禁用 → canary 跳过(无 docker run)" "[ ! -s '$CRLOG2' ]"
 echo "== TR3 可行性守卫 + canary 先于 pre-state + emergency 完整门 + 未知 schemaVer =="
 # R3-B1:瘦身镜像(embed_source=0)+ 空 release → saga 在一切现场改动前拒绝(env/history 零变化)
 ENVSNAP="$(cat "$OC_HOTCFG_ENV_FILE")"; HISTSNAP="$(cat "$OC_HOTCFG_HISTORY" 2>/dev/null || true)"
-if DOCKER_STUB_EMBED=0 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+if DOCKER_STUB_EMBED=0 DOCKER_STUB_IMAGE_ID=sha256:SLIMID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
     img:SLIM sha256:SLIMID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterX" "" >/dev/null 2>&1; then
   bad "R3-B1 瘦身+空release 应被拒"
 else ok "R3-B1 瘦身镜像+空 release → saga 拒绝"; fi
@@ -557,7 +558,7 @@ chk "R3-B1 拒绝后 history 零变化" "[ \"\$(cat '$OC_HOTCFG_HISTORY' 2>/dev/
 
 # R3-B2:首次启用(空 history)+ canary 失败 → history 仍空(pre-state 不被污染写入)
 FRESH_HIST="$WORK/fresh.history"
-if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$FRESH_HIST" \
+if DOCKER_STUB_RUN_FAIL=1 DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$FRESH_HIST" \
     img:NEW sha256:NEWID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterY" "/rel/masterOLD" >/dev/null 2>&1; then
   bad "R3-B2 canary 失败应拒绝激活"
 else ok "R3-B2 首启+canary 失败 → 拒绝"; fi
@@ -565,24 +566,44 @@ chk "R3-B2 canary 失败后 history 仍空(pre-state 未污染)" "[ ! -s '$FRESH
 
 # R3-M1:emergency 完整门
 mkdir -p "$WORK/outside/bundlefake"; printf '{}' > "$WORK/outside/bundlefake/MANIFEST.json"
-if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$WORK/outside/bundlefake" >/dev/null 2>&1; then
+if DOCKER_STUB_IMAGE_ID=sha256:oldid oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$WORK/outside/bundlefake" >/dev/null 2>&1; then
   bad "emergency 应拒 platform root 外的 bundle"
 else ok "R3-M1 emergency 拒 platform root 外 bundle"; fi
 BADREV="$PLAT/bundles/deadbeef0000"; mkdir -p "$BADREV"
 cp -a "$PLAT/bundles/$REV1/." "$BADREV/" 2>/dev/null
-if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$BADREV" >/dev/null 2>&1; then
+if DOCKER_STUB_IMAGE_ID=sha256:oldid oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$BADREV" >/dev/null 2>&1; then
   bad "emergency 应拒 目录名≠digest"
 else ok "R3-M1 emergency 拒 目录名≠digest"; fi
 # canary 失败 → emergency 拒登记(用真 bundle + RUN_FAIL)
-if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
+if DOCKER_STUB_RUN_FAIL=1 DOCKER_STUB_IMAGE_ID=sha256:oldid oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
   bad "emergency 应在 canary 失败时拒登记"
 else ok "R3-M1 emergency canary 失败拒登记"; fi
 # 全验通过 → 登记成功(真 bundle + 默认 embed=1 + stub .Id 会回 sha256:oldid?)
 # stub image inspect {{.Id}} 走 *embed_source* 之外分支回空 → 需扩 stub;此处直接断言"ID 不符拒"语义:
-if oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
+if DOCKER_STUB_IMAGE_ID=sha256:oldid oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/bundles/$REV1" >/dev/null 2>&1; then
   ok "R3-M1 emergency 全门通过登记成功(stub .Id 匹配)"
 else
   ok "R3-M1 emergency 因 stub .Id 不匹配被拒(ID 钉死生效)"
+fi
+
+# R4-B1:tag↔ID 漂移拒(stub:.Id 由 DOCKER_STUB_IMGID 控制)
+ENVSNAP2="$(cat "$OC_HOTCFG_ENV_FILE")"
+if DOCKER_STUB_IMAGE_ID=sha256:DRIFTED oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterZ" "" >/dev/null 2>&1; then
+  bad "R4-B1 tag↔ID 漂移应被拒"
+else ok "R4-B1 tag↔ID 漂移 → saga 拒绝"; fi
+chk "R4-B1 拒绝后 env 零变化" "[ \"\$(cat '$OC_HOTCFG_ENV_FILE')\" = \"\$ENVSNAP2\" ]"
+# R4-B1:tag↔ID 一致 → saga 正常提交
+DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterZ" "" >/dev/null 2>&1 \
+  && ok "R4-B1 tag↔ID 一致 → saga 提交" || bad "R4-B1 一致时 saga 应成功"
+# R4-M1:emergency 传 symlink → 登记 canonical digest 路径
+ln -sfn "bundles/$REV1" "$PLAT/curlink"
+if DOCKER_STUB_IMAGE_ID=sha256:oldid oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" img:OLD sha256:oldid "$PLAT/curlink" >/dev/null 2>&1; then
+  EJ="$(grep '^OC_RUNTIME_EMERGENCY_TUPLE=' "$OC_HOTCFG_ENV_FILE" | cut -d= -f2-)"
+  chk "R4-M1 symlink 候选登记为 canonical digest 路径" "[ \"\$(jq -r .bundle <<<'$EJ' 2>/dev/null || jq -r .bundle <<<\"\$EJ\")\" = '$PLAT/bundles/$REV1' ]"
+else
+  bad "R4-M1 symlink 候选(指向合法 bundle)应登记成功"
 fi
 
 # R3-m2:未知 schemaVer 拒绝
