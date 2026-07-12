@@ -346,7 +346,10 @@ export interface UserChatBridgeDeps {
    * **不让 bridge 直连 PG**:集成者在 index.ts 从 selfheal sweeper 的内存快照 forward-ref
    * 装配。未注入(v3 / 测试)→ 不补发,零行为变化。
    */
-  incidentSnapshotProvider?: () => SysIncident[];
+  /** Returns the active incidents VISIBLE TO this uid (audience-filtered), for
+   *  post-auth backfill. Must never return another user's targeted incident
+   *  (Codex B2) — the provider filters by recipient. */
+  incidentSnapshotProvider?: (uid: string) => SysIncident[];
   /** 可选:每用户最大并发(默认 3)。 */
   maxPerUser?: number;
   /** 可选:单帧上限(双向,默认 1MB)。 */
@@ -1637,7 +1640,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   best-effort:provider 抛错 / 单帧 send 失败都只记日志,绝不影响桥主链路。
     if (deps.incidentSnapshotProvider) {
       try {
-        const activeIncidents = deps.incidentSnapshotProvider();
+        // Per-uid: only incidents THIS user may see (audience-filtered), never a
+        // global snapshot (Codex B2 — targeted incidents leaked to all).
+        const activeIncidents = deps.incidentSnapshotProvider(uid.toString());
         for (const incident of activeIncidents) {
           if (userWs.readyState !== WebSocket.OPEN) break;
           try { userWs.send(JSON.stringify(incident)); }

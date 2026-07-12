@@ -52,6 +52,33 @@ export interface IncidentPayload {
 export type BroadcastAllFn = (payload: unknown) => number;
 export type BroadcastToUsersFn = (uids: string[], payload: unknown) => number;
 
+/** One active incident in the backfill snapshot: its WS payload plus the routing
+ *  facts needed to filter visibility per user. */
+export interface ActiveIncidentEntry {
+  payload: IncidentPayload;
+  audience: string;
+  /** Materialized recipient uids for audience='user_ids' (empty otherwise). */
+  recipients: Set<string>;
+}
+
+/**
+ * Per-user visibility filter for the post-auth backfill (Codex B2 — a global
+ * snapshot leaked targeted incidents to every reconnecting user). Rules:
+ *   - audience='all'           → visible to everyone;
+ *   - audience='user_ids'      → visible ONLY to a materialized recipient;
+ *   - audience='surface_cohort'/anything else → visible to NOBODY (fail closed:
+ *     cohort attribution isn't materialized, so we never leak a targeted incident
+ *     by treating it as broadcast).
+ */
+export function visibleIncidentsForUser(
+  entries: ActiveIncidentEntry[],
+  uid: string,
+): IncidentPayload[] {
+  return entries
+    .filter((e) => e.audience === "all" || (e.audience === "user_ids" && e.recipients.has(uid)))
+    .map((e) => e.payload);
+}
+
 export interface SweeperDeps {
   broadcastAll: BroadcastAllFn;
   broadcastToUsers: BroadcastToUsersFn;
@@ -194,9 +221,16 @@ async function deliverWs(
       [inc.id],
     );
     deps.broadcastToUsers(recips.rows.map((r) => r.user_id), payload);
-  } else {
-    // 'all' 与 'surface_cohort'(切片① 降级广播,TODO:接 cohort 归因)都走全站广播。
+  } else if (inc.audience === "all") {
     deps.broadcastAll(payload);
+  } else {
+    // surface_cohort: cohort attribution not implemented → fail CLOSED. NEVER
+    // broadcast a targeted incident to every user (Codex B2). The incident still
+    // exists for admins; realtime targeted delivery awaits cohort materialization
+    // (RFC M-recipients). Marked sent below to avoid a delivery retry loop.
+    deps.logger?.warn("selfheal_ws_surface_cohort_failclosed", {
+      incidentId: payload.incidentId,
+    });
   }
   await query(`UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`, [deliveryId]);
 }
@@ -555,8 +589,13 @@ function alertTimeout(
 export interface IncidentReconcilerSnapshotHandle {
   stop(): void;
   runNow(): Promise<SweepResult>;
-  /** 当前活跃(未 resolved)incident 的 WS payload 快照。bridge 在鉴权后补发。 */
-  getActiveIncidents(): IncidentPayload[];
+  /**
+   * 当前活跃(未 resolved)incident 中**该 uid 可见**的 WS payload 快照,供 bridge
+   * 鉴权后补发。可见性 = audience='all' 或(audience='user_ids' 且 uid 在
+   * incident_recipients)。surface_cohort 未 materialize 归因 → 对任何具体用户
+   * fail-closed 不可见(绝不把定向事故补发给全站,Codex B2)。
+   */
+  getActiveIncidentsForUser(uid: string): IncidentPayload[];
 }
 
 export function startIncidentSweeper(
@@ -567,7 +606,10 @@ export function startIncidentSweeper(
   const log = opts.logger ?? rootLogger.child({ subsys: "selfheal", module: "sweeper" });
   let stopped = false;
   let inflight: Promise<SweepResult> | null = null;
-  let activeSnapshot: IncidentPayload[] = [];
+  // Per-incident snapshot carries audience + materialized recipients so the
+  // bridge re-send can be filtered PER USER (Codex B2 — a global array leaked
+  // targeted incidents to every reconnecting user).
+  let activeSnapshot: ActiveIncidentEntry[] = [];
 
   async function refreshActive(): Promise<void> {
     try {
@@ -576,7 +618,20 @@ export function startIncidentSweeper(
                 user_title, user_message
            FROM incidents WHERE status <> 'resolved'`,
       );
-      activeSnapshot = r.rows.map((inc) => buildPayload(inc, Number(inc.rev), "opened"));
+      const entries: ActiveIncidentEntry[] = [];
+      for (const inc of r.rows) {
+        const payload = buildPayload(inc, Number(inc.rev), "opened");
+        let recipients = new Set<string>();
+        if (inc.audience === "user_ids") {
+          const rr = await query<{ user_id: string }>(
+            `SELECT user_id::text AS user_id FROM incident_recipients WHERE incident_id = $1::bigint`,
+            [inc.id],
+          );
+          recipients = new Set(rr.rows.map((x) => x.user_id));
+        }
+        entries.push({ payload, audience: inc.audience, recipients });
+      }
+      activeSnapshot = entries;
     } catch (err) {
       log.warn("selfheal_active_snapshot_refresh_failed", {
         err: (err as Error)?.message ?? String(err),
@@ -619,6 +674,7 @@ export function startIncidentSweeper(
       clearInterval(timer);
     },
     runNow: tick,
-    getActiveIncidents: () => activeSnapshot,
+    // Per-user visibility filter (Codex B2) — see visibleIncidentsForUser.
+    getActiveIncidentsForUser: (uid: string) => visibleIncidentsForUser(activeSnapshot, uid),
   };
 }
