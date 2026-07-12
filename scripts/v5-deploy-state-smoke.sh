@@ -106,21 +106,51 @@ ne "T6 换盐改变 hash(同 rollout 固定盐、跨 rollout 换盐)" "$h2" "$h1
 under=0; for u in $(seq 1 2000); do [[ "$(ds_lane_hash distsalt "$u")" -lt 10 ]] && under=$((under+1)); done
 [[ "$under" -ge 140 && "$under" -le 260 ]] && ok "T6 lane_hash 分布合理(<10% 命中 $under/2000≈200)" || bad "T6 分布偏斜: $under/2000"
 
+# A2 原子 CTE:CAS 命中 → journal 恰一行;CAS 落空 → journal 零新增(MINOR:状态-审计原子,单语句 CTE)。
+echo "── A2) 原子 CTE:CAS 命中 journal 恰一行 / 落空零行 ──"
+ds_load
+lv_cte="$DS_lock_version"
+eq "T7 前置 op-cte journal=0" "$(ds_exec <<<"SELECT count(*) FROM deploy_state_journal WHERE operation_id='op-cte';")" "0"
+hit="$(ds_cas "$lv_cte" "cohort_percent=7" "op-cte" 1 "cte-hit")"
+[[ -n "$hit" ]] && ok "T7 CAS 命中回传新 lock_version($hit)" || bad "T7 CAS 命中应回传 lock_version"
+eq "T7 命中 → journal 恰 1 行(CTE upd→j 同事务)" "$(ds_exec <<<"SELECT count(*) FROM deploy_state_journal WHERE operation_id='op-cte';")" "1"
+# 复用已被消耗的 lv_cte(现已 +1)= 陈旧 → CAS 落空,upd 空 → journal 的 INSERT ... SELECT FROM upd 零行。
+lost="$(ds_cas "$lv_cte" "cohort_percent=9" "op-cte" 2 "cte-miss")"
+[[ -z "$lost" ]] && ok "T7 陈旧 CAS 落空回严格空串" || bad "T7 陈旧 CAS 应回空,实得[$lost]"
+eq "T7 落空 → journal 仍 1 行(零新增,状态-审计原子)" "$(ds_exec <<<"SELECT count(*) FROM deploy_state_journal WHERE operation_id='op-cte';")" "1"
+
 echo "── B) 恢复矩阵 dispatch(deploy-v5.sh --recover --dry-run × 各 (phase,step))──"
-recover_case() { # $1=phase $2=step $3=candidate $4=期望关键字
-  local out
+# MINOR:不吞退出码(&& rc=0 || rc=$?,非 `|| true`)+ 除路由提示外还断言**真实续作动作**($5:state 终态 CAS /
+#        unit 操作),而非仅 grep 提示文字。dry 下 finalize/abort 前滚会跑到终态 commit,可断言其 CAS SET。
+recover_case() { # $1=phase $2=step $3=candidate $4=路由提示关键字 [$5=续作终态动作关键字(state/unit)]
+  local out rc
   out="$(ALLOW_ANY_BRANCH=1 DRY_DS_PHASE="$1" DRY_DS_STEP="$2" DRY_DS_CANDIDATE="$3" \
-        bash "$SCRIPT_DIR/deploy-v5.sh" --recover --dry-run 2>&1 || true)"
-  if grep -q -- "$4" <<<"$out"; then ok "recover ($1,step$2) → 命中「$4」"; else bad "recover ($1,step$2) 未命中「$4」;输出:$(echo "$out" | tail -2)"; fi
+        bash "$SCRIPT_DIR/deploy-v5.sh" --recover --dry-run 2>&1)" && rc=0 || rc=$?
+  [[ "$rc" == 0 ]] && ok "recover ($1,step$2) 退出码 0(不吞)" || bad "recover ($1,step$2) 退出码=$rc(应 0);尾:$(echo "$out" | tail -3)"
+  if grep -q -- "$4" <<<"$out"; then ok "recover ($1,step$2) 路由命中「$4」"; else bad "recover ($1,step$2) 未命中「$4」;尾:$(echo "$out" | tail -3)"; fi
+  if [[ -n "${5:-}" ]]; then
+    if grep -q -- "$5" <<<"$out"; then ok "recover ($1,step$2) 续作终态动作命中「$5」"; else bad "recover ($1,step$2) 终态动作未命中「$5」;尾:$(echo "$out" | tail -4)"; fi
+  fi
 }
 recover_case stable     0 ""  "无需恢复"
-recover_case canary     5 B   "canary<READY"
-recover_case canary    10 B   "canary≥READY"
-recover_case finalizing 0 B   "finalizing 0-1"
-recover_case finalizing 2 B   "finalizing 2-3"
-recover_case finalizing 4 B   "finalizing 4-5"
-recover_case finalizing 6 B   "finalizing 6"
-recover_case aborting   2 B   "abort"
+recover_case canary     5 B   "canary<READY"    "phase='stable'"        # 前滚清理 → 回 stable(state 终态)
+recover_case canary    10 B   "canary≥READY"    "candidate(B)自检"     # 核验 candidate(unit 状态探活)
+recover_case finalizing 0 B   "finalizing 0-1"  "active_slot='B'"       # 前滚 finalize → commit(state 翻转)
+recover_case finalizing 2 B   "finalizing 2-3"  "active_slot='B'"
+recover_case finalizing 4 B   "finalizing 4-5"  "active_slot='B'"
+recover_case finalizing 6 B   "finalizing 6"    "active_slot='B'"
+recover_case aborting   2 B   "abort"           "phase='stable'"        # abort 前滚 → commit stable
+
+echo "── C) BLOCKER 4:A→B finalize 后 --rollback dry(断言操作 B slot symlink/unit + state active/previous 对调)──"
+rb_out="$(ALLOW_ANY_BRANCH=1 DRY_DS_ACTIVE=B DRY_DS_PREV_RELEASE='/opt/openclaude/openclaude-v5-releases/rel-oldA' \
+      bash "$SCRIPT_DIR/deploy-v5.sh" --rollback --dry-run 2>&1)" && rb_rc=0 || rb_rc=$?
+[[ "$rb_rc" == 0 ]] && ok "C rollback dry 退出码 0" || bad "C rollback dry 退出码=$rb_rc;尾:$(echo "$rb_out" | tail -4)"
+grep -q 'active lane: slot=B' <<<"$rb_out" && ok "C 解析 active slot=B" || bad "C 未解析 active=B;尾:$(echo "$rb_out" | tail -4)"
+grep -q '/opt/openclaude/openclaude-v5-b' <<<"$rb_out" && ok "C 操作 B slot symlink(openclaude-v5-b)" || bad "C 未操作 B slot symlink"
+grep -q 'openclaude-v5-b.service' <<<"$rb_out" && ok "C restart B slot unit(openclaude-v5-b.service)" || bad "C 未 restart B slot unit"
+grep -q 'rel-oldA' <<<"$rb_out" && ok "C 回滚目标=deploy_state.previous_active_release(rel-oldA)" || bad "C 回滚目标未用 previous_active_release"
+grep -q 'previous←旧' <<<"$rb_out" && ok "C state 提交:active←target / previous←旧 对调" || bad "C 未见 state active/previous 对调提交"
+grep -qF 'openclaude-v5.service' <<<"$rb_out" && bad "C 误操作 A slot unit openclaude-v5.service(应只碰 B)" || ok "C 未误碰 A slot unit(仅 B)"
 
 echo
 echo "══ 冒烟结果:PASS=$PASS FAIL=$FAIL ══"

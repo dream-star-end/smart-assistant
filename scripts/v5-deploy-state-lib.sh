@@ -49,8 +49,9 @@ ds_lit() { local s="$1"; printf "%s" "${s//\'/\'\'}"; }
 # ── 读:回传 singleton 关键列(| 分隔,顺序固定;NULL→空串)──
 # 顺序:generation|phase|active_slot|candidate_slot|active_release|candidate_release|
 #       desired_leader_slot|desired_control_slot|cohort_percent|cohort_salt|
-#       transition_step|operation_id|lock_version
-DS_ROW_FIELDS="generation phase active_slot candidate_slot active_release candidate_release desired_leader_slot desired_control_slot cohort_percent cohort_salt transition_step operation_id lock_version"
+#       transition_step|operation_id|lock_version|previous_active_release
+# (previous_active_release 追加在末尾:BLOCKER 4 rollback 权威目标,老消费点位置不受影响)
+DS_ROW_FIELDS="generation phase active_slot candidate_slot active_release candidate_release desired_leader_slot desired_control_slot cohort_percent cohort_salt transition_step operation_id lock_version previous_active_release"
 ds_read_row() {
   ds_exec <<'SQL'
 SELECT generation
@@ -66,6 +67,7 @@ SELECT generation
      ||'|'|| transition_step
      ||'|'|| coalesce(operation_id,'')
      ||'|'|| lock_version
+     ||'|'|| coalesce(previous_active_release,'')
 FROM deploy_state
 ORDER BY generation DESC
 LIMIT 1;
@@ -78,7 +80,8 @@ ds_load() {
   [[ -n "$row" ]] || { echo "ds_load: deploy_state 无行(未 seed?)" >&2; return 1; }
   IFS='|' read -r DS_generation DS_phase DS_active_slot DS_candidate_slot \
     DS_active_release DS_candidate_release DS_desired_leader_slot DS_desired_control_slot \
-    DS_cohort_percent DS_cohort_salt DS_transition_step DS_operation_id DS_lock_version <<<"$row"
+    DS_cohort_percent DS_cohort_salt DS_transition_step DS_operation_id DS_lock_version \
+    DS_previous_active_release <<<"$row"
 }
 
 # ── CAS 写(+ 可选 journal,原子同事务)──
@@ -141,7 +144,8 @@ ds_lane_hash() {  # $1=salt $2=uid → 0..99
 }
 
 # 本地冒烟建表:与 Agent A 的 0135_deploy_state.sql **逐列逐约束对齐**(singleton PK、
-# lock_version DEFAULT 1 CHECK≥1、generation CHECK≥1、cohort_salt DEFAULT '')。生产绝不调用——
+# lock_version DEFAULT 1 CHECK≥1、generation CHECK≥1、cohort_salt DEFAULT ''、active_release/
+# previous_active_release seed=NULL,与 0135 一致——MINOR:seed 对齐,冒烟打在真实形态的表上)。生产绝不调用——
 # 仅 DS_MODE=local 的冒烟自建 scratch schema 时用,保证冒烟 CAS 打在真实形态的表上。
 ds_bootstrap_local_schema() {
   [[ "${DS_MODE:-remote}" == "local" ]] || { echo "ds_bootstrap_local_schema 仅限 DS_MODE=local" >&2; return 2; }
@@ -154,6 +158,7 @@ CREATE TABLE IF NOT EXISTS deploy_state (
   candidate_slot       TEXT              CHECK (candidate_slot IS NULL OR candidate_slot IN ('A','B')),
   active_release       TEXT,
   candidate_release    TEXT,
+  previous_active_release TEXT,
   desired_leader_slot  TEXT     NOT NULL CHECK (desired_leader_slot IN ('A','B')),
   desired_control_slot TEXT     NOT NULL CHECK (desired_control_slot IN ('A','B')),
   cohort_percent       SMALLINT NOT NULL DEFAULT 0 CHECK (cohort_percent BETWEEN 0 AND 100),
@@ -173,11 +178,13 @@ CREATE TABLE IF NOT EXISTS deploy_state_journal (
 );
 CREATE INDEX IF NOT EXISTS idx_deploy_journal_op ON deploy_state_journal(operation_id, id);
 -- seed singleton(基建版初态=现状:A 全 desired,无 candidate,generation=1,lock_version=1)
+-- active_release/previous_active_release=NULL(与 0135 seed 一致,MINOR:局部 smoke 与迁移对齐;
+-- 传统 deploy 的 ds_commit_active_release 成功后才校准成真实 rel 路径)。
 INSERT INTO deploy_state (singleton, generation, phase, active_slot, candidate_slot,
-                          active_release, desired_leader_slot, desired_control_slot,
+                          active_release, previous_active_release, desired_leader_slot, desired_control_slot,
                           cohort_percent, cohort_salt, cohort_allowlist, lock_version, transition_step)
 VALUES (true, 1, 'stable', 'A', NULL,
-        'bootstrap', 'A', 'A',
+        NULL, NULL, 'A', 'A',
         0, '', '{}', 1, 0)
 ON CONFLICT (singleton) DO NOTHING;
 SQL

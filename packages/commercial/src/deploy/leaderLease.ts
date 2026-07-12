@@ -280,6 +280,9 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
       // 拿到 advisory:执行安装协议。
       const outcome = await installOnClient(client);
       if (outcome === "installed") {
+        // 安装成功:installOnClient 已把 heldEpoch 置为 pred.epoch+1。捕获它 + client 作为
+        // onAcquire 等待期的二次确认 token(BLOCKER 1 等待期竞态)。
+        const installedEpoch = heldEpoch;
         leaseClient = client;
         // 掉线监听在 leader 期贯穿(compete 早期已 attach,此处不重复)。
         // BLOCKER 1:onAcquire = bundle start-all-or-fail。抛错 → 释放 lease + fail-stop,
@@ -295,6 +298,37 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
           // 回滚已完成(bundle 无成员在跑),可安全解锁 advisory 让后继竞得;随后 fail-stop。
           await unlockAndRelease(client).catch(() => {});
           failStop(`onAcquire(bundle start) failed: ${(err as Error)?.message ?? String(err)}`, err);
+          return;
+        }
+        // BLOCKER 1(onAcquire 等待期竞态):await onAcquire(bundle.start)期间可能 ①lease 断连
+        // (onLeaseClientError 已把 leaseClient 置空并接管 drain/ACK/fail-stop)②被 usurp(heldEpoch 变)
+        // ③desired 翻走(finalize 交接把 desired 指向对方 slot)。旧实现无条件 setState("leader"),会让
+        // "连接已死 / desired 已翻"的实例仍以 leader 自居(heartbeat 空转 = shared 职责静默真空)。
+        // 修:以捕获 token 二次确认后才进 leader;任一不满足 → 让路 / 安全 step-down(回滚已启动 bundle+释放),绝不进 leader。
+        if (stopped || leaseClient !== client || heldEpoch !== installedEpoch) {
+          // 断连 / 被接管 / 停机:那条路径(onLeaseClientError / shutdown)已负责 drain/ACK/收尾,本函数让路,不进 leader。
+          log.warn("[leaderLease] onAcquire 返回时 lease 已断连/被接管/停机 → 让路,不进 leader", {
+            hasClient: leaseClient === client,
+            epochStable: heldEpoch === installedEpoch,
+            stopped,
+          });
+          return;
+        }
+        // 连接与 epoch 仍在 → 再确认 desired 仍=自己(等待期 finalize 翻走则安全让位,drain 已启动 bundle)。
+        let desiredStillSelf = true;
+        try {
+          desiredStillSelf = (await opts.desiredWatch.refreshNow()).desiredLeaderSlot === opts.slot;
+        } catch {
+          desiredStillSelf = desiredIsSelf();
+        }
+        // refreshNow 可能耗时,其间又可能断连/被接管 —— 再核一次 token。
+        if (stopped || leaseClient !== client || heldEpoch !== installedEpoch) {
+          log.warn("[leaderLease] onAcquire 后确认 desired 期间 lease 已断连/被接管 → 让路,不进 leader");
+          return;
+        }
+        if (!desiredStillSelf) {
+          log.warn("[leaderLease] onAcquire 期间 desired 翻走 → 安全 step-down(drain 已启动 bundle+写 ACK+释放),不进 leader");
+          await stepDown("desired-flip-during-acquire", { writeAck: true });
           return;
         }
         setState("leader");
@@ -503,15 +537,39 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
       }
       if (client) {
         if (o.writeAck && epoch !== null) {
-          // 写本 epoch ACK(epoch/instance 条件:迟到不污染新代)。best-effort。
+          // graceful ACK:先在 lease 连接上写本 epoch ACK(epoch/instance 条件:迟到不污染新代)。
+          let acked = false;
           try {
             await client.query(
               `UPDATE leader_lease SET fenced_ack_epoch = $1, updated_at = now()
                  WHERE singleton = true AND holder_instance_id = $2 AND lease_epoch = $3`,
               [epoch, selfInstance, epoch],
             );
+            acked = true; // rowCount=0(已被安装新代)也算完成:交接已成,ACK 无意义
           } catch (err) {
-            log.warn("[leaderLease] 写 ACK 失败(后继将回退 liveness 判定)", err);
+            log.warn("[leaderLease] graceful ACK 在 lease 连接上失败(drain 期连接断连?)→ 回退独立短连接", err);
+          }
+          // BLOCKER 2:stepDown 先清 leaseClient,drain 期断连被 onLeaseClientError 忽略(client!==leaseClient);
+          // 若此处 ACK 又吞在坏连接上只 warn,旧进程活着且无 ACK → 后继等 45s liveness 才 fail-stop = 卡死。
+          // 修:lease 连接 ACK 失败 → 回退独立短连接写 ACK;短连接也失败 → fail-stop(进程退出供 PID 死亡确认接管)。
+          if (!acked) {
+            const shortAcked = await writeAckShortConn(epoch);
+            if (!shortAcked) {
+              log.error(
+                "[leaderLease] graceful ACK 主/短连接均失败 → fail-stop(进程退出,后继经 PID 死亡确认接管;绝不留活进程不 ACK 卡后继 45s)",
+                { reason, epoch },
+              );
+              // lease 连接已坏:销毁(不还池);advisory 随进程退出由 PG 释放,后继走 liveness 接管。
+              try {
+                client.release(new Error("graceful ACK failed on lease conn"));
+              } catch {
+                /* 连接已断 */
+              }
+              transitioning = false;
+              failStop(`graceful ACK failed on both lease conn and short conn (reason=${reason}, epoch=${epoch})`);
+              return;
+            }
+            log.warn("[leaderLease] graceful ACK 已回退独立短连接成功(lease 连接在 drain 期已坏)");
           }
         }
         await unlockAndRelease(client);

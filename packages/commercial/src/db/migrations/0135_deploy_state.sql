@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS deploy_state (
   candidate_slot       TEXT            CHECK (candidate_slot IS NULL OR candidate_slot IN ('A','B')),
   active_release       TEXT,
   candidate_release    TEXT,
+  -- BLOCKER 4:rollback 权威目标(state 权威;每次 activate/rollback 提交时 previous←旧 active_release)。
+  -- 蓝绿 slot 翻转后(A→B finalize)传统 rollback 靠此定位上一 active release,不再依赖 A-slot 专属
+  -- .prev-release 文件(该文件降级为 A-slot 传统 lane 的兼容兜底)。0135 尚未生产 apply → 直接加列。
+  previous_active_release TEXT,
   -- leader lease 竞争资格(唯一授权 slot)/ VIP 控制口 18894 bind 资格(唯一授权 slot)
   desired_leader_slot  TEXT   NOT NULL CHECK (desired_leader_slot IN ('A','B')),
   desired_control_slot TEXT   NOT NULL CHECK (desired_control_slot IN ('A','B')),
@@ -38,11 +42,11 @@ CREATE TABLE IF NOT EXISTS deploy_state (
 -- 是假占位"时误起 canary(candidate 的 capability preflight 会拿假 active release 做兼容比较,BLOCKER 6)。
 INSERT INTO deploy_state (
   singleton, generation, phase, active_slot, candidate_slot,
-  active_release, candidate_release, desired_leader_slot, desired_control_slot,
+  active_release, candidate_release, previous_active_release, desired_leader_slot, desired_control_slot,
   cohort_percent, cohort_salt, cohort_allowlist, lock_version, transition_step, operation_id
 ) VALUES (
   true, 1, 'stable', 'A', NULL,
-  NULL, NULL, 'A', 'A',
+  NULL, NULL, NULL, 'A', 'A',
   0, '', '{}', 1, 0, NULL
 )
 ON CONFLICT (singleton) DO NOTHING;
