@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
-  type BrokerCallbackOutbox,
   type BrokerRequest,
   type BrokerResponse,
   InMemoryBrokerClaimStore,
@@ -13,6 +12,7 @@ import {
   releaseHttpStatusFor,
 } from '../selfheal/broker.js'
 import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
+import type { SelfhealCallbackPhase } from '@openclaude/storage'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
@@ -895,15 +895,27 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       calls.push({ url: String(url), init })
       return { ok: true, status: 200, text: async () => '{}', json: async () => ({}) }
     }) as unknown as typeof fetch
-    const enqueued: Enq[] = []
-    const outbox: BrokerCallbackOutbox = {
-      enqueue: async (input) => {
+    // Atomic commit model (审计R2 BLOCKER): the outbox row is written INSIDE the
+    // claim store's finalizeWithCallback transaction. The in-memory store keeps
+    // a test-visible mirror; `outboxThrows` simulates the whole combined commit
+    // failing (disk full) — the claim must then stay held (fail-closed).
+    class SeamStore extends InMemoryBrokerClaimStore {
+      override async finalizeWithCallback(
+        finalize: { claimKey: string; response: string }[],
+        overwriteCommitted: { claimKey: string; response: string } | undefined,
+        callback: {
+          repairId: string
+          phase: SelfhealCallbackPhase
+          message: string
+          detail: Record<string, unknown>
+        },
+      ): Promise<void> {
         if (opts.outboxThrows) throw new Error('outbox disk full')
-        const dup = enqueued.some((e) => e.repairId === input.repairId && e.phase === input.phase)
-        if (!dup) enqueued.push(input)
-        return !dup
-      },
+        await super.finalizeWithCallback(finalize, overwriteCommitted, callback)
+      }
     }
+    const store = new SeamStore()
+    const enqueued: Enq[] = store.outbox
     const { run } = stubRunner((cmd, args) => {
       if (cmd === 'git' && args.includes('merge-base')) return { code: 0 }
       return { code: 0 }
@@ -911,7 +923,7 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     const deployed: string[] = []
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      store: new InMemoryBrokerClaimStore(),
+      store,
       repairAuthority: activeAuthority,
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
@@ -920,7 +932,6 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       autoDeployTier2: opts.autoDeploy ?? false,
       callbackBaseUrl: 'http://127.0.0.1:18796',
       fetchImpl: impl,
-      callbackOutbox: outbox,
       deployDriver: async (sha) => {
         deployed.push(sha)
         return { ok: true, status: 'deployed', detail: { sha } }
@@ -1008,13 +1019,89 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     fx.cleanup()
   })
 
-  it('outbox enqueue failure never changes the cutover/release outcome (audited only)', async () => {
+  it('combined commit failure is FAIL-CLOSED: commit_failed + claim held, never a silent success', async () => {
+    // 审计R2 BLOCKER:enqueue 失败绝不允许 outcome 照常 committed(那会永久
+    // 孤儿化 master 状态机)。失败 = commit_failed,claim 保持,重试报 in_progress。
     const fx = seamFixture({ outboxThrows: true })
     const parked = await fx.park('seam-3')
-    assert.equal(parked.status, 'pending_release', 'pending outcome survives an enqueue failure')
-    const rel = await fx.broker.releaseApproved('seam-3')
-    assert.equal(rel.status, 'deployed', 'deploy outcome survives an enqueue failure')
+    assert.equal(parked.status, 'commit_failed', 'cutover outcome must not silently commit')
+    assert.equal(fx.enqueued.length, 0)
+    const retry = await fx.park('seam-3')
+    assert.equal(retry.status, 'in_progress', 'claim held fail-closed — never re-executed blindly')
     fx.cleanup()
+  })
+
+  it('release combined commit failure holds the release claim and never re-deploys', async () => {
+    const fx = seamFixture()
+    await fx.park('seam-3b')
+    // Flip the store into failure mode only for the release commit.
+    ;(fx as unknown as { failNext?: boolean }).failNext = true
+    const store = fx.broker as unknown as { store: { finalizeWithCallback: unknown } }
+    const orig = store.store.finalizeWithCallback as (...a: unknown[]) => Promise<void>
+    store.store.finalizeWithCallback = async () => {
+      throw new Error('outbox disk full')
+    }
+    const rel = await fx.broker.releaseApproved('seam-3b')
+    assert.equal(rel.status, 'commit_failed', 'deploy ran but commit failed — reported honestly')
+    assert.equal(fx.deployed.length, 1)
+    store.store.finalizeWithCallback = orig
+    const retry = await fx.broker.releaseApproved('seam-3b')
+    assert.equal(retry.status, 'in_progress', 'claim held — the deploy is never blindly re-run')
+    assert.equal(fx.deployed.length, 1, 'no second deploy')
+    fx.cleanup()
+  })
+
+  it('a terminal-cancel fuse set AFTER the entry check still blocks the deploy (per-repair fence)', async () => {
+    // HIGH2(审计R2):releaseApproved 的终检在 per-repair 锁内 fresh 读 fuse。
+    // 模拟:入口检查时未 revoked,锁内终检时已 revoked(cancel 先赢)。
+    const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-fence-'))
+    const { run } = stubRunner((cmd, args) => {
+      if (cmd === 'git' && args.includes('merge-base')) return { code: 0 }
+      return { code: 0 }
+    })
+    let reads = 0
+    const flippingAuthority: RepairAuthority = async () => {
+      reads += 1
+      // 1st read: handleRequest authorize; 2nd: release entry check; 3rd+ (locked
+      // re-check): revoked.
+      return { status: 'running', capability: CAP, releaseRevoked: reads >= 3 }
+    }
+    const deployed: string[] = []
+    const store = new InMemoryBrokerClaimStore()
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store,
+      repairAuthority: flippingAuthority,
+      verifyKey: VERIFY_KEY,
+      verificationDir: vdir,
+      canonicalRepo: '/canon',
+      run,
+      autoDeployTier2: false,
+      deployDriver: async (sha) => {
+        deployed.push(sha)
+        return { ok: true, status: 'deployed', detail: { sha } }
+      },
+    })
+    writeSignedVerification(vdir, {
+      repairId: 'fence-1',
+      sha: SHA,
+      clonePath: '/home/ocheal/selfheal/fence-1',
+      layers: [{ name: 'typecheck', ok: true, code: 0, durationMs: 1 }],
+      allPassed: true,
+      verifiedAt: new Date().toISOString(),
+    })
+    const parked = await broker.handleRequest({
+      repairId: 'fence-1',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'fence-1' },
+    })
+    assert.equal(parked.status, 'pending_release')
+    const rel = await broker.releaseApproved('fence-1')
+    assert.equal(rel.status, 'rejected')
+    assert.equal(rel.detail?.reason, 'release_revoked')
+    assert.equal(deployed.length, 0, 'the fuse won the fence — driver never ran')
+    rmSync(vdir, { recursive: true, force: true })
   })
 
   it('a replayed cutover does not enqueue a second marker', async () => {

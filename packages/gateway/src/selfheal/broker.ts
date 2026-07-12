@@ -38,7 +38,7 @@ import { dirname, join } from 'node:path'
 import {
   type BrokerClaimResult,
   type SelfhealCallbackPhase,
-  enqueueCallback,
+  commitBrokerOutcomeWithCallback,
   finalizeBrokerAction,
   getBrokerAction,
   getJob as getSelfhealJob,
@@ -55,6 +55,7 @@ import {
   TIER1_ACTIONS,
 } from './brokerActions.js'
 import { listToolchainTouches } from './deployDriver.js'
+import { withRepairLock } from './executionLedger.js'
 import {
   type SignedVerification,
   type VerifyOutcome,
@@ -148,6 +149,16 @@ export interface BrokerResponse {
   /** Machine-readable outcome. */
   status: string
   detail?: Record<string, unknown>
+  /** INTERNAL (never serialized to the socket / durable store): a master
+   *  callback that must be enqueued ATOMICALLY with this outcome's finalize
+   *  (审计R2 BLOCKER — a committed cutover/release without its outbox row would
+   *  permanently orphan the v5 state machine). handleRequest strips it and
+   *  commits outcome+callback in one SQLite transaction. */
+  masterCallback?: {
+    phase: SelfhealCallbackPhase
+    message: string
+    detail: Record<string, unknown>
+  }
 }
 
 /**
@@ -179,29 +190,6 @@ export function releaseHttpStatusFor(resp: BrokerResponse): number {
   }
 }
 
-// ── durable master-callback outbox seam (BLOCKER2) ───────────────────────────
-
-/**
- * Where the broker parks its deterministic master callbacks (the
- * pending_release progress marker and the deployed done). Durable + idempotent
- * on (repairId, phase); the gateway callbackPump owns delivery/retry — the
- * broker itself never talks to the master for these anymore (a one-shot network
- * failure used to permanently break the v5 state machine).
- */
-export interface BrokerCallbackOutbox {
-  enqueue(input: {
-    repairId: string
-    phase: SelfhealCallbackPhase
-    message: string
-    detail: Record<string, unknown>
-  }): Promise<boolean>
-}
-
-/** Default outbox backed by the durable selfheal SQLite store. */
-export const durableCallbackOutbox: BrokerCallbackOutbox = {
-  enqueue: (input) => enqueueCallback(input),
-}
-
 // ── idempotency store (durable, atomic single-winner claim) ──────────────────
 
 /**
@@ -231,6 +219,19 @@ export interface BrokerClaimStore {
   /** Update the recorded response of a COMMITTED record (e.g. pending_release →
    *  deployed after a one-click release). Never touches claimed rows. */
   overwriteCommitted(claimKey: string, response: string): Promise<void>
+  /** 审计R2 BLOCKER:finalize(+可选 overwrite)与 master 回调 enqueue 必须同一
+   *  事务。失败时 claim 保持 'claimed'(replay=in_progress fail-closed),调用方
+   *  上报 commit_failed —— 绝不出现"已提交却无回调"的半状态。 */
+  finalizeWithCallback(
+    finalize: { claimKey: string; response: string }[],
+    overwriteCommitted: { claimKey: string; response: string } | undefined,
+    callback: {
+      repairId: string
+      phase: SelfhealCallbackPhase
+      message: string
+      detail: Record<string, unknown>
+    },
+  ): Promise<void>
 }
 
 /** Default durable store backed by the root-owned selfheal SQLite DB. */
@@ -244,6 +245,9 @@ export const durableBrokerClaimStore: BrokerClaimStore = {
   },
   overwriteCommitted: async (claimKey, response) => {
     await overwriteBrokerActionResponse(claimKey, response)
+  },
+  finalizeWithCallback: async (finalize, overwriteCommitted, callback) => {
+    await commitBrokerOutcomeWithCallback({ finalize, overwriteCommitted, callback })
   },
 }
 
@@ -290,6 +294,29 @@ export class InMemoryBrokerClaimStore implements BrokerClaimStore {
   async overwriteCommitted(claimKey: string, response: string): Promise<void> {
     const cur = this.map.get(claimKey)
     if (cur && cur.response !== undefined) cur.response = response
+  }
+  /** Test-visible outbox mirror of the durable combined commit. */
+  readonly outbox: {
+    repairId: string
+    phase: SelfhealCallbackPhase
+    message: string
+    detail: Record<string, unknown>
+  }[] = []
+  async finalizeWithCallback(
+    finalize: { claimKey: string; response: string }[],
+    overwriteCommitted: { claimKey: string; response: string } | undefined,
+    callback: {
+      repairId: string
+      phase: SelfhealCallbackPhase
+      message: string
+      detail: Record<string, unknown>
+    },
+  ): Promise<void> {
+    for (const f of finalize) await this.finalize(f.claimKey, f.response)
+    if (overwriteCommitted)
+      await this.overwriteCommitted(overwriteCommitted.claimKey, overwriteCommitted.response)
+    if (!this.outbox.some((r) => r.repairId === callback.repairId && r.phase === callback.phase))
+      this.outbox.push(callback)
   }
 }
 
@@ -345,10 +372,6 @@ export interface SelfhealBrokerOpts {
    *  such a candidate can ONLY ship via a human offline standard deploy. */
   notifyPendingRelease?: (info: { repairId: string; sha: string; toolchain?: string[] }) => void
 
-  /** Durable outbox for the deterministic broker→master callbacks (BLOCKER2).
-   *  Defaults to the SQLite-backed outbox; tests inject a recorder. */
-  callbackOutbox?: BrokerCallbackOutbox
-
   // ── block C action deps (context / verify / report) ──
   /** OC_SELFHEAL_CALLBACK_URL — forward tunnel base to the v5 master. The
    *  broker (root) uses the job's capability against it; the capability never
@@ -381,7 +404,6 @@ export class SelfhealBroker {
   private readonly ochealUid?: number
   private readonly ochealGid?: number
   private readonly autoDeployTier2: boolean
-  private readonly callbackOutbox: BrokerCallbackOutbox
 
   constructor(private readonly opts: SelfhealBrokerOpts) {
     this.log = opts.log ?? rootLog
@@ -389,7 +411,6 @@ export class SelfhealBroker {
     // replay protection across a restart (Codex HIGH #4), so it must be opted in.
     this.store = opts.store ?? durableBrokerClaimStore
     this.repairAuthority = opts.repairAuthority ?? defaultRepairAuthority
-    this.callbackOutbox = opts.callbackOutbox ?? durableCallbackOutbox
     this.actions = opts.actions ?? TIER1_ACTIONS
     this.run = opts.run ?? defaultCommandRunner
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
@@ -605,6 +626,38 @@ export class SelfhealBroker {
       throw err
     }
     if (this.isCommitted(response)) {
+      const cb = response.masterCallback
+      if (cb) {
+        // 审计R2 BLOCKER:committed 结果与其 master 回调必须同一 SQLite 事务。
+        // 失败 → claim 保持 'claimed'(replay=in_progress fail-closed),如实上报
+        // commit_failed;绝不 release(否则重试会重跑副作用)。
+        const { masterCallback: _stripped, ...wire } = response
+        try {
+          await this.store.finalizeWithCallback(
+            [{ claimKey: key, response: JSON.stringify(wire) }],
+            undefined,
+            { repairId: req.repairId, ...cb },
+          )
+        } catch (err) {
+          this.log.error(
+            'broker outcome commit failed — claim held fail-closed',
+            { repairId: req.repairId, actionKind: req.actionKind },
+            err as Error,
+          )
+          this.audit(req, 'commit_failed', {
+            reason: String((err as Error).message).slice(0, 200),
+          })
+          return {
+            ok: false,
+            status: 'commit_failed',
+            detail: {
+              reason:
+                'outcome durable commit failed — claim held; retry reports in_progress (see runbook)',
+            },
+          }
+        }
+        return wire
+      }
       await this.store.finalize(key, JSON.stringify(response))
     } else {
       await this.store.release(key)
@@ -732,15 +785,9 @@ export class SelfhealBroker {
       // Deterministic root-side pending_release marker to the master (seam
       // contract: the admin release gate requires a progress event with
       // detail.phase='pending_release', and codex cannot be relied on to send
-      // it). DURABLE (BLOCKER2): enqueued to the outbox and pumped with retry —
-      // a network blip can no longer orphan the release gate. Enqueue failure
-      // never changes the pending outcome (audited only).
-      await this.enqueueMasterCallback(
-        req.repairId,
-        'pending_release',
-        'pending_release: verified and gated — awaiting one-click release',
-        { phase: 'pending_release', sha, ...(touched.length ? { toolchain: true } : {}) },
-      )
+      // it). 审计R2 BLOCKER:marker 与本 outcome 的 finalize 必须同一事务 ——
+      // masterCallback 由 handleRequest 与 claim finalize 原子提交,失败则
+      // claim 不提交(commit_failed,重试重跑本无副作用的 cutover 检查)。
       return {
         ok: false,
         status: 'pending_release',
@@ -748,6 +795,11 @@ export class SelfhealBroker {
           sha,
           ...(touched.length ? { toolchain: true, files: touched.slice(0, 20) } : {}),
           reason: 'awaiting one-click release (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0)',
+        },
+        masterCallback: {
+          phase: 'pending_release',
+          message: 'pending_release: verified and gated — awaiting one-click release',
+          detail: { phase: 'pending_release', sha, ...(touched.length ? { toolchain: true } : {}) },
         },
       }
     }
@@ -762,11 +814,12 @@ export class SelfhealBroker {
     this.audit(req, result.status, { sha, ...result.detail })
     if (result.status === 'deployed') {
       // Auto-deploy path closes the loop root-side: master → 'verifying',
-      // probe fence adjudicates real recovery. Durable outbox (BLOCKER2).
-      await this.enqueueMasterCallback(req.repairId, 'done', 'auto cutover deployed', {
-        phase: 'deployed',
-        sha,
-      })
+      // probe fence adjudicates real recovery. done 标记与 finalize 原子提交
+      // (审计R2 BLOCKER,经 masterCallback → handleRequest 合并事务)。
+      return {
+        ...result,
+        masterCallback: { phase: 'done', message: 'auto cutover deployed', detail: { phase: 'deployed', sha } },
+      }
     }
     return result
   }
@@ -1085,46 +1138,83 @@ export class SelfhealBroker {
 
     let response: BrokerResponse
     try {
-      const ancestor = await this.checkCanonicalAncestry(repairId, sha)
-      if (!ancestor) {
-        response = {
-          ok: false,
-          status: 'rejected',
-          detail: { reason: 'sha is not a descendant of the canonical branch' },
+      // HIGH2(审计R2):从 fuse 终检到 driver 执行必须与 terminal-cancel 的
+      // fuse 写入共享同一 per-repair 临界区 —— 入口检查早已通过的在途 release,
+      // cancel 设 fuse 后不得再进 driver。锁内 fresh 读,先赢者胜:release 先赢
+      // 则锁持有至部署结束(cancel 等待,部署后取消=业务上"太迟",审计留痕);
+      // cancel 先赢则这里拒绝。deploy 时长受锁保护是有意为之(bounded,单 repair)。
+      response = await withRepairLock(repairId, async (): Promise<BrokerResponse> => {
+        let fresh: RepairAuthorityRecord | null
+        try {
+          fresh = await this.repairAuthority(repairId)
+        } catch (err) {
+          this.log.error('release authority re-check failed — refusing', { repairId }, err)
+          return { ok: false, status: 'rejected', detail: { reason: 'authority unavailable' } }
         }
-      } else {
+        if (fresh?.releaseRevoked) {
+          this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'rejected', {
+            reason: 'release_revoked',
+          })
+          return { ok: false, status: 'rejected', detail: { reason: 'release_revoked' } }
+        }
+        const ancestor = await this.checkCanonicalAncestry(repairId, sha)
+        if (!ancestor) {
+          return {
+            ok: false,
+            status: 'rejected',
+            detail: { reason: 'sha is not a descendant of the canonical branch' },
+          }
+        }
         const driver = this.opts.deployDriver
         if (!driver) {
-          response = {
+          return {
             ok: false,
             status: 'rejected',
             detail: { reason: 'no trusted deploy driver configured' },
           }
-        } else {
-          response = await driver(sha, { log: this.log, repairId })
         }
-      }
+        return await driver(sha, { log: this.log, repairId })
+      })
     } catch (err) {
       await this.store.release(releaseKey)
       throw err
     }
 
     if (response.status === 'deployed') {
-      // Close the loop on the master: the codex turn ended back at cutover
-      // time, so the DONE callback must come from the broker after a human
-      // release — master → 'verifying' → probe fence adjudicates. Enqueued
-      // BEFORE finalize (BLOCKER2): once the deploy has actually run, the
-      // master must eventually learn of it even across a crash right here —
-      // the outbox row is deduped on (repairId, phase), so a re-drive that
-      // enqueues again cannot double-post.
-      await this.enqueueMasterCallback(repairId, 'done', 'released and deployed', {
-        phase: 'deployed',
-        sha,
-      })
-      await this.store.finalize(releaseKey, JSON.stringify(response))
-      // Observability: flip the durable cutover record from pending_release to
-      // the deployed outcome so ops sees the true terminal state.
-      await this.store.overwriteCommitted(cutoverKey, JSON.stringify(response))
+      // 审计R2 BLOCKER:done 标记 + release finalize + cutover 记录翻转必须同一
+      // SQLite 事务 —— 部署已发生却没有 outbox 行 = master 永远等不到 done。
+      // 事务失败:release claim 保持 'claimed'(replay=in_progress fail-closed,
+      // 绝不重跑部署),如实上报 commit_failed(500),人工按 runbook 收口。
+      try {
+        await this.store.finalizeWithCallback(
+          [{ claimKey: releaseKey, response: JSON.stringify(response) }],
+          { claimKey: cutoverKey, response: JSON.stringify(response) },
+          {
+            repairId,
+            phase: 'done',
+            message: 'released and deployed',
+            detail: { phase: 'deployed', sha },
+          },
+        )
+      } catch (err) {
+        this.log.error(
+          'release outcome commit failed — claim held fail-closed',
+          { repairId },
+          err as Error,
+        )
+        this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'commit_failed', {
+          sha,
+          reason: String((err as Error).message).slice(0, 200),
+        })
+        return {
+          ok: false,
+          status: 'commit_failed',
+          detail: {
+            sha,
+            reason: 'deploy succeeded but durable commit failed — claim held; see runbook',
+          },
+        }
+      }
     } else {
       // Not deployed (toolchain hold / driver failure / gate reject): release
       // the claim so a corrected future release attempt can retry.
@@ -1143,39 +1233,6 @@ export class SelfhealBroker {
     return { ok: false, status: 'rejected', detail: { reason } }
   }
 
-  /**
-   * Deterministic ROOT-side callback to the v5 master (seam contract, design
-   * §C2/§C3): the pending_release progress marker and the post-release done are
-   * OWNED by the broker — the master's release gate reads `detail->>'phase'`,
-   * and the codex turn may have long ended when a human releases.
-   *
-   * DURABLE (BLOCKER2): the broker no longer POSTs these itself. It enqueues to
-   * the SQLite outbox (idempotent on repairId+phase) and the gateway
-   * callbackPump delivers with a FRESH capability per attempt + retry/backoff —
-   * one network failure (or a >90min-late release outliving the capability TTL)
-   * can no longer permanently break the state machine. The actual send
-   * primitive lives in callbackPump.postMasterCallback.
-   *
-   * Enqueue failure (local disk) is audited and never changes the caller's
-   * committed outcome.
-   */
-  private async enqueueMasterCallback(
-    repairId: string,
-    phase: SelfhealCallbackPhase,
-    message: string,
-    detail: Record<string, unknown>,
-  ): Promise<void> {
-    const auditReq = { repairId, actionKind: `${phase}_callback` } as BrokerRequest
-    try {
-      const inserted = await this.callbackOutbox.enqueue({ repairId, phase, message, detail })
-      this.audit(auditReq, inserted ? 'enqueued' : 'already_enqueued')
-    } catch (err) {
-      this.audit(auditReq, 'enqueue_failed', {
-        reason: String((err as Error).message).slice(0, 200),
-      })
-      this.log.error('selfheal master callback enqueue failed', { repairId, phase }, err as Error)
-    }
-  }
 
   /**
    * Verify `sha` descends from the canonical branch WITHOUT root ever running git

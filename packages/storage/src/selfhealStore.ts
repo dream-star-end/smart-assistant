@@ -1010,6 +1010,55 @@ function rowToCallback(r: CallbackOutboxDbRow): SelfhealCallbackRow {
 }
 
 /**
+ * BLOCKER(审计R2):broker 结果 finalize 与 master 回调 enqueue **同一 SQLite
+ * 事务** —— cutover/release 绝不允许被 durably committed 而 pending_release/done
+ * 标记却没入 outbox(pump 永远送不出去,replay 又只重放已提交响应不再补投)。
+ * 事务失败时 claim 保持 'claimed'(replay=in_progress,fail-closed 绝不重跑副作用),
+ * 由调用方如实上报 commit_failed。
+ */
+export async function commitBrokerOutcomeWithCallback(input: {
+  finalize: { claimKey: string; response: string }[]
+  overwriteCommitted?: { claimKey: string; response: string }
+  callback: {
+    repairId: string
+    phase: SelfhealCallbackPhase
+    message: string
+    detail: Record<string, unknown>
+  }
+  now?: number
+}): Promise<void> {
+  const db = await getSelfhealDb()
+  const now = input.now ?? Date.now()
+  const txn = db.transaction(() => {
+    for (const f of input.finalize) {
+      db.prepare(
+        "UPDATE broker_actions SET status = 'committed', response = ?, updated_at = ? WHERE claim_key = ? AND status = 'claimed'",
+      ).run(f.response, now, f.claimKey)
+    }
+    if (input.overwriteCommitted) {
+      db.prepare(
+        "UPDATE broker_actions SET response = ?, updated_at = ? WHERE claim_key = ? AND status = 'committed'",
+      ).run(input.overwriteCommitted.response, now, input.overwriteCommitted.claimKey)
+    }
+    db.prepare(`
+      INSERT INTO selfheal_callback_outbox
+        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      ON CONFLICT(repair_id, phase) DO NOTHING
+    `).run(
+      input.callback.repairId,
+      input.callback.phase,
+      input.callback.message,
+      JSON.stringify(input.callback.detail),
+      now,
+      now,
+      now,
+    )
+  })
+  txn()
+}
+
+/**
  * Idempotently enqueue a broker→master callback. UNIQUE(repair_id, phase) +
  * ON CONFLICT DO NOTHING: a crash-re-driven cutover/release can call this again
  * without producing a duplicate delivery. Returns true when THIS call inserted
