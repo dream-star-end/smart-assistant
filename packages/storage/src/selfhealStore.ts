@@ -359,19 +359,39 @@ export async function claimNextJob(input: {
 }
 
 /**
- * Startup crash recovery: expire the lease on every non-terminal job so the
- * next {@link claimNextJob} can immediately take it over, instead of waiting out
- * a full lease window. Safe on the single-instance personal version — at gateway
- * boot there is no other live worker, so any 'starting'/'running' row is an
- * orphan from a hard-crashed prior process. Idempotent; returns rows touched.
+ * Startup cleanup: proactively zero the lease on jobs whose lease has ALREADY
+ * EXPIRED, so the next claim takes them over without re-checking the clock. Only
+ * expired leases are touched (Codex HIGH #10): a still-fresh lease belongs to a
+ * LIVE worker — a rolling restart / second instance — and clobbering it would
+ * let two workers drive the same repair (and, with reopenExecutionForRedrive,
+ * double-run its turn). A hard-crashed worker's lease elapses on its own; a
+ * graceful shutdown proactively releases its leases (see
+ * {@link releaseJobLeasesForOwner}) for immediate recovery. Returns rows touched.
  */
 export async function reclaimOrphanedLeases(now = Date.now()): Promise<number> {
   const db = await getSelfhealDb()
   const res = db
     .prepare(
-      "UPDATE selfheal_jobs SET lease_until = 0, updated_at = ? WHERE status IN ('starting','running')",
+      "UPDATE selfheal_jobs SET lease_until = 0, updated_at = ? WHERE status IN ('starting','running') AND lease_until <= ?",
     )
-    .run(now)
+    .run(now, now)
+  return res.changes
+}
+
+/**
+ * Graceful-shutdown fast recovery: a stopping worker releases the leases it
+ * still holds on its own non-terminal jobs (owner match → lease_until=0) so the
+ * next process re-claims them immediately instead of waiting out the lease
+ * window. Only the caller's OWN in-flight jobs are released, so this is safe even
+ * if another live worker exists. Returns rows touched.
+ */
+export async function releaseJobLeasesForOwner(owner: string, now = Date.now()): Promise<number> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      "UPDATE selfheal_jobs SET lease_until = 0, updated_at = ? WHERE lease_owner = ? AND status IN ('starting','running')",
+    )
+    .run(now, owner)
   return res.changes
 }
 
@@ -541,6 +561,37 @@ export async function claimQueuedTurn(executionId: string, now = Date.now()): Pr
     db.prepare(
       "UPDATE selfheal_executions SET status = 'running', updated_at = ? WHERE execution_id = ? AND status = 'accepted'",
     ).run(now, executionId)
+    return true
+  })
+  return txn()
+}
+
+/**
+ * Re-open a claimed-but-unfinished execution for one more attempt (crash
+ * recovery). Called ONLY by the job-lease holder before re-driving, so a
+ * 'running' row here is a crashed prior attempt — the job lease guarantees no
+ * live one. Resets execution 'running'→'accepted' and its consumed turn back to
+ * 'queued' (one transaction) so the next {@link claimQueuedTurn} wins and
+ * re-runs. 'done'/'failed'/absent are left untouched — a completed turn is never
+ * re-run. This makes turn execution at-LEAST-once; the broker keeps SIDE EFFECTS
+ * at-most-once. Returns true if a running attempt was re-opened.
+ */
+export async function reopenExecutionForRedrive(
+  executionId: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const txn = db.transaction((): boolean => {
+    const exec = db
+      .prepare('SELECT status FROM selfheal_executions WHERE execution_id = ?')
+      .get(executionId) as { status: string } | undefined
+    if (!exec || exec.status !== 'running') return false
+    db.prepare(
+      "UPDATE selfheal_executions SET status = 'accepted', updated_at = ? WHERE execution_id = ? AND status = 'running'",
+    ).run(now, executionId)
+    db.prepare(
+      "UPDATE durable_turn_queue SET status = 'queued' WHERE execution_id = ? AND status = 'consumed'",
+    ).run(executionId)
     return true
   })
   return txn()

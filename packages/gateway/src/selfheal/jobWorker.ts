@@ -25,6 +25,7 @@ import {
   claimNextJob,
   getExecution,
   reclaimOrphanedLeases,
+  releaseJobLeasesForOwner,
   renewJobLease,
   setJobCapability,
   setJobSessionKey,
@@ -121,6 +122,16 @@ export class SelfhealJobWorker {
       clearTimeout(this.timer)
       this.timer = null
     }
+    // Graceful-shutdown fast recovery: release the leases we still hold so the
+    // next process re-claims our in-flight repairs immediately instead of waiting
+    // out the lease window. Best-effort — a hard crash falls back to lease expiry.
+    // (Codex HIGH #10 companion to the expired-only reclaim.)
+    releaseJobLeasesForOwner(this.owner)
+      .then((n) => {
+        if (n > 0)
+          log.info('released in-flight repair leases on shutdown', { count: n, owner: this.owner })
+      })
+      .catch((err) => log.warn('lease release on shutdown failed', undefined, err))
   }
 
   /** Wake the loop immediately (e.g. right after the receiver commits a job). */
@@ -218,8 +229,12 @@ export class SelfhealJobWorker {
    *   - ran here + no error   → succeeded
    *   - ran here + error      → failed
    *   - deduped (didn't run)  → mirror the execution's own status:
-   *       done → succeeded, failed → failed,
-   *       running (crashed mid-turn, at-most-once ⇒ not retried) → failed
+   *       done → succeeded, else → failed.
+   * With reopenExecutionForRedrive, a crash-mid-turn re-drive now RE-RUNS
+   * (ranHere=true) rather than landing here, so the deduped path is reached only
+   * by a genuine concurrent completion (which the job lease makes rare); mapping
+   * a still-'running' dedupe to failed is a defensive fallback (the job fuse /
+   * re-dispatch covers a truly stuck repair).
    */
   private async finalizeJob(
     repairId: string,

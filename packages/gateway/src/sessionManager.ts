@@ -13,6 +13,7 @@ import {
   getMaxTurnIdx,
   indexTurn,
   paths,
+  reopenExecutionForRedrive,
   setExecutionStatus,
   upsertSessionMeta,
 } from '@openclaude/storage'
@@ -1304,11 +1305,18 @@ export class SessionManager {
    *   3. Run the turn via the shared {@link submit} path, then settle the
    *      execution status to done/failed.
    *
-   * Crash semantics: a crash before step 2 leaves the row 'queued' → a re-drive
-   * (jobWorker re-claims via lease expiry, same deterministic session) wins the
-   * CAS and submits — no swallow. A crash after step 2 leaves it 'consumed' → a
-   * re-drive loses the CAS and does NOT resubmit — at-most-once (repairs must
-   * never double-execute).
+   * Crash semantics (called ONLY by the jobWorker, under its job lease — the
+   * lease guarantees no other live attempt for this executionId):
+   *   - crash BEFORE the claim → row stays 'queued' → a re-drive wins the CAS and
+   *     submits (no swallow);
+   *   - crash AFTER the claim, mid-submit → execution stuck 'running' / queue
+   *     'consumed'. Step 0 re-opens that crashed attempt (safe: the prior owner
+   *     is dead — its job lease elapsed before re-claim), so the re-drive wins
+   *     the CAS and RE-RUNS instead of silently failing the repair (Codex HIGH
+   *     #9). Turn execution is thus at-LEAST-once; the broker keeps the actual
+   *     privileged SIDE EFFECTS at-most-once, so a re-run never double-deploys.
+   *   - a completed ('done') execution is never re-opened → no re-run after
+   *     success.
    *
    * `ranHere` tells the caller whether THIS call executed the turn (vs. observed
    * an already-consumed one), so it can map the outcome onto its own bookkeeping.
@@ -1319,6 +1327,12 @@ export class SessionManager {
     executionId: string,
     onEvent: (e: SessionStreamEvent) => void,
   ): Promise<{ executionId: string; status: SelfhealExecutionStatus; ranHere: boolean }> {
+    // 0. Crash recovery: if a prior attempt crashed mid-submit (execution stuck
+    //    'running', turn 'consumed'), re-open it so this re-drive can win the CAS
+    //    and re-run instead of the repair being silently lost. Safe under the job
+    //    lease (no live prior attempt); a 'done' execution is never re-opened.
+    await reopenExecutionForRedrive(executionId)
+
     // 1. Durable, idempotent enqueue (accepted + queued in one txn).
     await enqueueExecution({ executionId, sessionKey: session.sessionKey })
 

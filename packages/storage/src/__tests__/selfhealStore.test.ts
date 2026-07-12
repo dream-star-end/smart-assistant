@@ -35,6 +35,8 @@ const {
   tryClaimBrokerAction,
   finalizeBrokerAction,
   releaseBrokerClaim,
+  reopenExecutionForRedrive,
+  releaseJobLeasesForOwner,
 } = await import('../selfhealStore.js')
 
 after(async () => {
@@ -183,21 +185,73 @@ describe('enqueueExecution + claimQueuedTurn — at-most-once', () => {
   })
 })
 
-describe('reclaimOrphanedLeases — startup crash recovery', () => {
-  it('expires leases on non-terminal jobs so they are immediately re-claimable', async () => {
-    await insertJobReceived({ repairId: 'orph', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+describe('reclaimOrphanedLeases — expired-only (Codex HIGH #10)', () => {
+  it('does NOT reclaim a still-FRESH lease (a live worker must not be clobbered)', async () => {
+    await insertJobReceived({ repairId: 'live-lease', incidentId: 'i', attempt: 0, payloadHash: 'p' })
     const now = 3_000_000
-    // Claim it with a lease far in the future — normally NOT re-claimable.
-    const claimed = await claimNextJob({ owner: 'dead', leaseMs: 600_000, now })
-    assert.equal(claimed?.repairId, 'orph')
-    assert.equal(await claimNextJob({ owner: 'live', leaseMs: 600_000, now: now + 1000 }), null)
-    // Simulate startup recovery: expire orphaned leases.
-    const touched = await reclaimOrphanedLeases(now + 2000)
+    const claimed = await claimNextJob({ owner: 'liveworker', leaseMs: 600_000, now })
+    assert.equal(claimed?.repairId, 'live-lease')
+    // Boot reclaim while the lease is still fresh — must touch nothing.
+    const touched = await reclaimOrphanedLeases(now + 1000)
+    assert.equal(touched, 0, 'a fresh (live) lease must never be reclaimed')
+    // And the job stays un-stealable while the lease holds.
+    assert.equal(await claimNextJob({ owner: 'other', leaseMs: 600_000, now: now + 2000 }), null)
+    await setJobStatus('live-lease', 'succeeded')
+  })
+
+  it('reclaims an EXPIRED lease so it is immediately re-claimable', async () => {
+    await insertJobReceived({ repairId: 'orph', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    const now = 4_000_000
+    await claimNextJob({ owner: 'dead', leaseMs: 60_000, now })
+    // Now past the lease → reclaim zeroes it.
+    const touched = await reclaimOrphanedLeases(now + 120_000)
     assert.ok(touched >= 1)
-    const re = await claimNextJob({ owner: 'live', leaseMs: 600_000, now: now + 3000 })
+    const re = await claimNextJob({ owner: 'live', leaseMs: 60_000, now: now + 121_000 })
     assert.equal(re?.repairId, 'orph')
     assert.equal(re?.leaseOwner, 'live')
     await setJobStatus('orph', 'succeeded')
+  })
+})
+
+describe('releaseJobLeasesForOwner — graceful shutdown fast recovery', () => {
+  it('releases only the owner’s own in-flight leases → immediately re-claimable', async () => {
+    await insertJobReceived({ repairId: 'rel1', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    const now = 5_000_000
+    await claimNextJob({ owner: 'gwA', leaseMs: 600_000, now })
+    // Another owner's fresh lease must be untouched.
+    await insertJobReceived({ repairId: 'rel2', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    await claimNextJob({ owner: 'gwB', leaseMs: 600_000, now: now + 10 })
+    const n = await releaseJobLeasesForOwner('gwA', now + 20)
+    assert.equal(n, 1, 'only gwA’s lease is released')
+    // gwA's job is immediately re-claimable; gwB's is not.
+    const re = await claimNextJob({ owner: 'gwC', leaseMs: 600_000, now: now + 30 })
+    assert.equal(re?.repairId, 'rel1')
+    assert.equal(await claimNextJob({ owner: 'gwC', leaseMs: 600_000, now: now + 40 }), null)
+    await setJobStatus('rel1', 'succeeded')
+    await setJobStatus('rel2', 'succeeded')
+  })
+})
+
+describe('reopenExecutionForRedrive — crash-mid-turn re-run (Codex HIGH #9)', () => {
+  it('re-opens a running execution so a re-drive re-runs (no swallow)', async () => {
+    await enqueueExecution({ executionId: 'rex', sessionKey: 'selfheal:rex' })
+    // Simulate a claimed-but-crashed attempt: queue consumed, execution running.
+    assert.equal(await claimQueuedTurn('rex'), true)
+    assert.equal((await getExecution('rex'))?.status, 'running')
+    // A naive re-drive would lose the CAS forever (swallow); reopen fixes it.
+    assert.equal(await claimQueuedTurn('rex'), false, 'without reopen the re-drive is swallowed')
+    assert.equal(await reopenExecutionForRedrive('rex'), true)
+    assert.equal((await getExecution('rex'))?.status, 'accepted')
+    assert.equal(await claimQueuedTurn('rex'), true, 're-drive now wins and re-runs')
+  })
+
+  it('does NOT re-open a completed (done) execution — no re-run after success', async () => {
+    await enqueueExecution({ executionId: 'rex2', sessionKey: 'selfheal:rex2' })
+    await claimQueuedTurn('rex2')
+    await setExecutionStatus('rex2', 'done')
+    assert.equal(await reopenExecutionForRedrive('rex2'), false)
+    assert.equal((await getExecution('rex2'))?.status, 'done')
+    assert.equal(await claimQueuedTurn('rex2'), false, 'a done turn is never re-run')
   })
 })
 
