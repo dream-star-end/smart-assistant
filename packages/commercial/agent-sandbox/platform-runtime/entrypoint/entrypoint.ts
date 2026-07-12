@@ -58,9 +58,12 @@ import {
 // 该模块**不进 commercial tsc 编译图**(与 entrypoint.ts 同,靠 entrypointPlatform.test.ts 守护)。
 import {
   buildSeedAgent,
+  decidePersonaWrite,
+  isPathWithin,
   resolvePlatformCodexSkillsDir,
   resolvePlatformSeedDir,
-  shouldWriteCodexSkill,
+  sha256Hex,
+  shouldWriteSeededSkill,
   validatePlatformSeed,
   type PlatformSeedAgentDecl,
   type PlatformSeedDoc,
@@ -83,12 +86,27 @@ const SELF_ENTRY_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
 
 // seed 根解析次序(设计 §5d):自身 bundle 相对 → /usr/local/share/openclaude-platform/seed → null。
 const platformSeedDir = resolvePlatformSeedDir(SELF_ENTRY_DIR, existsSync, join);
+// M5 confinement:seed 根 realpath 一次(穿透 current + 收 `..`),作为源路径 containment 基准。
+const platformSeedDirReal = platformSeedDir === null ? null : realpathSync(platformSeedDir);
 // 平台 seed 声明(persona 引用 + 非计费 defaults + seedSkills 清单)。**fail loud 放在下方 volume
 // try 之外**:声明含 model/engine/provider/runnerKind = 部署配置错,须立即崩(§4.1),不能被
 // volume-tolerant catch 吞成 WARN。dev fallback(yaml 缺失)= null → 回落最小内置集(仅 main)。
 let platformSeed: PlatformSeedDoc | null = null;
 // persona 文本在 top-level 预读(bundle ro,始终在);缺失 = 坏 bundle,fail loud。写卷在 volume try 里。
 const seedPersonas: Record<string, string> = {};
+
+// M5 Part B:把 bundle seed 下的**源文件**路径 join 后做 normalize+realpath containment,越界即抛。
+// schema(validatePlatformSeed)已 slug/persona-ref 收敛为一道防线;这里是消费端二道防线,
+// 兜住"schema 被绕过 / 未来新增声明字段忘了收敛"的路径逃逸。
+function readConfinedSeedFile(relParts: string[], what: string): string {
+  const abs = join(platformSeedDir!, ...relParts);
+  const absReal = realpathSync(abs); // 源必存在(bundle ro);顺带解 symlink
+  if (!isPathWithin(platformSeedDirReal!, absReal)) {
+    throw new Error(`platform-seed: ${what} path escapes bundle seed dir: ${relParts.join("/")}`);
+  }
+  return readFileSync(absReal, "utf8");
+}
+
 if (platformSeedDir === null) {
   console.error(
     "[entrypoint] platform-seed dev fallback: no platform-seed.yaml on bundle/fallback path → seeding minimal main-only set (dev-only)",
@@ -99,7 +117,7 @@ if (platformSeedDir === null) {
   );
   for (const decl of platformSeed.agents) {
     if (decl.persona) {
-      seedPersonas[decl.id] = readFileSync(join(platformSeedDir, decl.persona), "utf8");
+      seedPersonas[decl.id] = readConfinedSeedFile([decl.persona], `persona for agent "${decl.id}"`);
     }
   }
 }
@@ -518,7 +536,7 @@ try {
       const targetExists = existsSync(targetSkillMd);
       const sourceContent = readFileSync(sourceSkillMd);
       const targetContent = targetExists ? readFileSync(targetSkillMd) : null;
-      if (shouldWriteCodexSkill("hash-overwrite", targetExists, targetContent, sourceContent)) {
+      if (shouldWriteSeededSkill("hash-overwrite", targetExists, targetContent, sourceContent)) {
         // 覆写:先清目标目录再整目录 cp,避免旧版残留附属文件;平台 skill 是权威。
         rmSync(targetDir, { recursive: true, force: true });
         cpSync(sourceDir, targetDir, { recursive: true, preserveTimestamps: true });
@@ -667,29 +685,100 @@ try {
   // (v5 ccb-only:gpt-* 被 inferAgentForModel fail-closed 拒绝,不再有 codex runner。)
   const agentsPath = join(ocConfigDir, "agents.yaml");
 
+  // M4b:persona 平台热更新 —— 用「上次写入的平台版本 hash」判定用户是否改过,记录在
+  // agents/<id>/.platform-persona-hash。三态升级规则:
+  //   目标不存在                              → 写 + 记 hash;
+  //   当前内容 hash == 记录的上次平台 hash(用户没改过)→ 升级到新平台版 + 更新记录;
+  //   当前 hash 与记录不符(用户定制)/ 记录缺失(存量 volume,保守)→ 跳过 + log。
+  // force(hidden-reviewer 裁决词须稳定同步)→ 无条件覆写 + 刷新记录(不受定制保护)。
+  // 用「记录上次平台 hash」取代旧的 legacyContents 逐版枚举:泛化为「用户改没改过」的单一判据,
+  // 平台文案演进无需再维护历史全集。
+  const PERSONA_HASH_FILE = ".platform-persona-hash";
+
+  function readPlatformPersonaHash(hashPath: string): string | null {
+    try {
+      const raw = readFileSync(hashPath, "utf8").trim();
+      return /^[0-9a-f]{64}$/.test(raw) ? raw : null; // 损坏/非法 → 视为无记录(保守)
+    } catch {
+      return null; // 记录缺失 → null
+    }
+  }
+  function writePlatformPersonaHash(hashPath: string, hash: string): void {
+    try {
+      writeFileSync(hashPath, `${hash}\n`, { mode: 0o644 });
+    } catch (e) {
+      console.error(
+        `[entrypoint] WARN: ${hashPath} persona-hash record write failed (non-fatal): ${(e as Error).message}`,
+      );
+    }
+  }
+
   function ensureAgentPersona(
     agentId: string,
     content: string,
-    legacyContents: readonly string[] = [],
     opts: { force?: boolean } = {},
   ): string {
     const personaDir = join(ocConfigDir, "agents", agentId);
     const personaPath = join(personaDir, "CLAUDE.md");
+    const hashPath = join(personaDir, PERSONA_HASH_FILE);
+    // M5 containment(二道防线):写目标必须落在 agents/<id>/ 子树内(agentId 虽为代码字面量,
+    // 仍做归一化越界拒,与 seed-skill 写路径同款防线)。
+    if (!isPathWithin(join(ocConfigDir, "agents"), personaPath)) {
+      console.error(`[entrypoint] WARN: ${agentId} persona path escapes agents dir, skipped`);
+      return personaPath;
+    }
     mkdirSync(personaDir, { recursive: true });
-    if (opts.force || !existsSync(personaPath)) {
-      writeFileSync(personaPath, content, { mode: 0o644 });
-    } else if (legacyContents.length > 0) {
+    const platformHash = sha256Hex(content);
+
+    // 读当前内容(存在时)比对是否被用户改过。读失败(perm 等)→ 保守跳过。
+    const targetExists = existsSync(personaPath);
+    let currentContent: string | null = null;
+    if (targetExists) {
       try {
-        const current = readFileSync(personaPath, "utf8");
-        if (legacyContents.some((legacy) => current === legacy)) {
-          writeFileSync(personaPath, content, { mode: 0o644 });
-          console.error(`[entrypoint] agents.yaml: refreshed legacy ${agentId} persona`);
-        }
+        currentContent = readFileSync(personaPath, "utf8");
       } catch (personaErr) {
         console.error(
-          `[entrypoint] WARN: ${agentId} persona refresh skipped: ${(personaErr as Error).message}`,
+          `[entrypoint] WARN: ${agentId} persona read skipped: ${(personaErr as Error).message}`,
         );
+        return personaPath;
       }
+    }
+    const currentHash = currentContent === null ? null : sha256Hex(currentContent);
+    const recordedHash = targetExists ? readPlatformPersonaHash(hashPath) : null;
+
+    // 决策矩阵在 platformBundle.ts 纯函数(全矩阵单测);此处只做 IO。
+    const action = decidePersonaWrite({
+      force: opts.force ?? false,
+      targetExists,
+      currentHash,
+      recordedHash,
+      platformHash,
+    });
+    switch (action) {
+      case "force":
+      case "write-new":
+        writeFileSync(personaPath, content, { mode: 0o644 });
+        writePlatformPersonaHash(hashPath, platformHash);
+        break;
+      case "upgrade":
+        writeFileSync(personaPath, content, { mode: 0o644 });
+        writePlatformPersonaHash(hashPath, platformHash);
+        console.error(`[entrypoint] agents.yaml: upgraded ${agentId} persona to new platform version`);
+        break;
+      case "already-latest":
+        // 已是最新平台版:仅回填/更新记录(存量 volume 记录缺失时补上,免下次误判为定制)。
+        if (recordedHash !== platformHash) writePlatformPersonaHash(hashPath, platformHash);
+        break;
+      case "skip-no-record":
+        console.error(
+          `[entrypoint] agents.yaml: ${agentId} persona has no platform-hash record → treated as user-customized, skip platform upgrade (conservative)`,
+        );
+        break;
+      case "skip-customized":
+        console.error(
+          `[entrypoint] agents.yaml: ${agentId} persona user-customized → skip platform upgrade (customization protected)`,
+        );
+        break;
     }
     return personaPath;
   }
@@ -703,17 +792,26 @@ try {
       // (agent-seed wins over legacy on read; reserved on write).
       const skillDir = join(ocConfigDir, "agents", agentId, "seed-skills", name);
       const skillPath = join(skillDir, "SKILL.md");
-      if (existsSync(skillPath)) return;
+      // M5 containment(二道防线):写目标必须落在 agents/<id>/seed-skills/ 子树内。
+      if (!isPathWithin(join(ocConfigDir, "agents", agentId, "seed-skills"), skillPath)) {
+        console.error(`[entrypoint] WARN: seed skill "${name}" write path escapes seed-skills dir, skipped`);
+        return;
+      }
       if (existsSync(skillDir)) {
         const st = lstatSync(skillDir);
         if (!st.isDirectory() || st.isSymbolicLink()) {
           console.error(`[entrypoint] WARN: scientist skill seed skipped for ${name}: non-directory or symlinked skill dir`);
           return;
         }
-      } else {
-        mkdirSync(skillDir, { recursive: true });
       }
-      if (!existsSync(skillPath)) writeFileSync(skillPath, content, { mode: 0o644 });
+      // M4a:平台自有 seed skill 从 skip-if-exists 改**内容 hash 不一致即覆写**(与 codex-skills
+      // overlay 同款 shouldWriteSeededSkill("hash-overwrite"))—— 平台更新 skill 内容时旧的
+      // skip-if-exists 会让新版本送不达存量 volume(缺陷)。内容一致则幂等跳过。
+      const targetExists = existsSync(skillPath);
+      const targetContent = targetExists ? readFileSync(skillPath) : null;
+      if (!shouldWriteSeededSkill("hash-overwrite", targetExists, targetContent, content)) return;
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(skillPath, content, { mode: 0o644 });
     } catch (skillErr) {
       console.error(
         `[entrypoint] WARN: scientist skill seed skipped for ${name}: ${(skillErr as Error).message}`,
@@ -731,6 +829,14 @@ try {
         if (!existsSync(skillMd)) {
           console.error(
             `[entrypoint] WARN: platform seed skill file missing, skipped: ${seedAgentId}/${skillName}`,
+          );
+          continue;
+        }
+        // M5 containment(二道防线):源必须落在 bundle seed 子树内(seedAgentId/skillName 已 slug
+        // 校验为一道防线;platformSeedDirReal 非空——本块由 `platformSeed && platformSeedDir` 守护)。
+        if (!isPathWithin(platformSeedDirReal!, realpathSync(skillMd))) {
+          console.error(
+            `[entrypoint] WARN: platform seed skill escapes bundle seed dir, skipped: ${seedAgentId}/${skillName}`,
           );
           continue;
         }
@@ -914,7 +1020,7 @@ try {
       },
       personaPath:
         hrPersonaContent !== undefined
-          ? ensureAgentPersona("hidden-reviewer", hrPersonaContent, [], {
+          ? ensureAgentPersona("hidden-reviewer", hrPersonaContent, {
               force: hrDecl?.forcePersona ?? true,
             })
           : undefined,

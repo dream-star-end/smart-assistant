@@ -448,7 +448,15 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /ensureAgentSeedSkill\(seedAgentId,\s*skillName,\s*readFileSync\(skillMd,\s*"utf8"\)\)/,
       "seed skill content must be read from the bundle SKILL.md file, not an inline TS constant",
     );
-    assert.match(src, /if \(existsSync\(skillPath\)\) return/, "skill seed must not overwrite existing skills");
+    // M4a(runtime hotcfg):平台 seed skill 从 skip-if-exists 改**内容 hash 不一致即覆写**
+    // (与 codex-skills overlay 同款 shouldWriteSeededSkill("hash-overwrite")),平台更新的 skill
+    // 内容才能送达存量 volume。故不再有 `if (existsSync(skillPath)) return` 短路。
+    assert.doesNotMatch(src, /if \(existsSync\(skillPath\)\) return;/, "seed skill 不得再走 skip-if-exists 短路(改 hash-overwrite)");
+    assert.match(
+      src,
+      /shouldWriteSeededSkill\("hash-overwrite", targetExists, targetContent, content\)/,
+      "seed skill 覆写决策必须复用共用纯函数 shouldWriteSeededSkill(hash-overwrite)",
+    );
     // 反回潮:内容/清单不得再内联进 entrypoint(必须走 bundle 文件)。
     assert.doesNotMatch(src, /const SCIENTIST_SKILL_SEEDS/, "scientist seed content must be externalized to bundle files, not inline");
     assert.doesNotMatch(src, /function scientificSkillContent/, "scientificSkillContent must be gone (content lives in bundle files)");

@@ -17,7 +17,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, test } from "node:test";
 import { parse as parseYaml } from "yaml";
@@ -126,16 +126,84 @@ describe("resolvePlatformSeedDir / resolvePlatformCodexSkillsDir (次序解析)"
   });
 });
 
-describe("shouldWriteCodexSkill (原生 skip-if-exists / 平台自有 hash-overwrite)", () => {
+describe("shouldWriteSeededSkill (原生 skip-if-exists / 平台自有 hash-overwrite;codex overlay + seed skill 共用)", () => {
   test("skip-if-exists: write only when target missing", () => {
-    assert.equal(pb.shouldWriteCodexSkill("skip-if-exists", false, null, "src"), true);
-    assert.equal(pb.shouldWriteCodexSkill("skip-if-exists", true, "whatever", "src"), false);
+    assert.equal(pb.shouldWriteSeededSkill("skip-if-exists", false, null, "src"), true);
+    assert.equal(pb.shouldWriteSeededSkill("skip-if-exists", true, "whatever", "src"), false);
   });
   test("hash-overwrite: write when missing OR content hash differs; skip when identical", () => {
-    assert.equal(pb.shouldWriteCodexSkill("hash-overwrite", false, null, "src"), true);
-    assert.equal(pb.shouldWriteCodexSkill("hash-overwrite", true, "same", "same"), false);
-    assert.equal(pb.shouldWriteCodexSkill("hash-overwrite", true, "old", "new"), true);
-    assert.equal(pb.shouldWriteCodexSkill("hash-overwrite", true, null, "new"), true);
+    assert.equal(pb.shouldWriteSeededSkill("hash-overwrite", false, null, "src"), true);
+    assert.equal(pb.shouldWriteSeededSkill("hash-overwrite", true, "same", "same"), false);
+    assert.equal(pb.shouldWriteSeededSkill("hash-overwrite", true, "old", "new"), true);
+    assert.equal(pb.shouldWriteSeededSkill("hash-overwrite", true, null, "new"), true);
+  });
+});
+
+describe("validatePlatformSeed confinement 强化(M5:slug / persona-ref / 未知字段 / 重复 id)", () => {
+  const V = (doc: unknown) => () => pb.validatePlatformSeed(doc);
+  test("agent id 必须严格 slug(拒大写/点/斜杠/空白/过长)", () => {
+    for (const bad of ["BadCase", "a.b", "a/b", "a b", "-lead", "a".repeat(65)]) {
+      assert.throws(V({ schemaVersion: 1, agents: [{ id: bad }] }), /must match slug/, `id "${bad}" 必须拒`);
+    }
+    // 合法 slug 通过
+    assert.equal(pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "a-1b" }] }).agents[0].id, "a-1b");
+  });
+  test("persona 引用只允许 personas/<slug>.md(拒 ../ / 绝对路径 / 子目录)", () => {
+    for (const bad of ["../x.md", "/etc/x.md", "personas/sub/x.md", "personas/x.txt", "x.md", "personas/BAD.md"]) {
+      assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", persona: bad }] }), /must be personas\/<slug>\.md/, `persona "${bad}" 必须拒`);
+    }
+    assert.equal(
+      pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "a", persona: "personas/main.md" }] }).agents[0].persona,
+      "personas/main.md",
+    );
+  });
+  test("未知顶层字段 / 未知 agent 字段 fail-loud", () => {
+    assert.throws(V({ schemaVersion: 1, agents: [], extra: 1 }), /unknown top-level field "extra"/);
+    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", bogus: 1 }] }), /unknown field "bogus"/);
+  });
+  test("重复 agent id 拒", () => {
+    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }, { id: "a" }] }), /duplicate agent id "a"/);
+  });
+  test("banned 计费键仍走专属报错(先于 slug/unknown 检查)", () => {
+    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", provider: "x" }] }), /forbidden key "provider"/);
+  });
+  test("seedSkills key/skill 名必须 slug", () => {
+    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }], seedSkills: { BadAgent: ["x"] } }), /seedSkills agent id "BadAgent" must match slug/);
+    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }], seedSkills: { sci: ["Bad_Name"] } }), /skill name "Bad_Name" must match slug/);
+  });
+});
+
+describe("isPathWithin (M5 二道防线:归一化后越界拒)", () => {
+  test("同路径 / 子树内 = true;.. 逃逸 / 兄弟前缀 = false", () => {
+    assert.equal(pb.isPathWithin("/a/b", "/a/b"), true);
+    assert.equal(pb.isPathWithin("/a/b", "/a/b/c/d"), true);
+    assert.equal(pb.isPathWithin("/a/b", "/a/b/../c"), false); // 逃逸
+    assert.equal(pb.isPathWithin("/a/b", "/a/bc"), false); // 兄弟前缀,非子树
+    assert.equal(pb.isPathWithin("/a/b", "/a"), false); // 父目录
+  });
+});
+
+describe("decidePersonaWrite (M4b:persona 三态升级矩阵)", () => {
+  const P = "p".repeat(64); // platform hash（新版）
+  const R = "r".repeat(64); // recorded hash（上次平台版）
+  const U = "u".repeat(64); // user-edited hash
+  test("force → 无条件覆写(hidden-reviewer 裁决词稳定同步)", () => {
+    assert.equal(pb.decidePersonaWrite({ force: true, targetExists: true, currentHash: U, recordedHash: R, platformHash: P }), "force");
+  });
+  test("目标不存在 → write-new", () => {
+    assert.equal(pb.decidePersonaWrite({ force: false, targetExists: false, currentHash: null, recordedHash: null, platformHash: P }), "write-new");
+  });
+  test("已是最新平台版 → already-latest(不改内容,仅回填记录)", () => {
+    assert.equal(pb.decidePersonaWrite({ force: false, targetExists: true, currentHash: P, recordedHash: R, platformHash: P }), "already-latest");
+  });
+  test("用户没改过(当前==记录) → upgrade", () => {
+    assert.equal(pb.decidePersonaWrite({ force: false, targetExists: true, currentHash: R, recordedHash: R, platformHash: P }), "upgrade");
+  });
+  test("记录缺失(存量 volume) → skip-no-record(保守视为定制)", () => {
+    assert.equal(pb.decidePersonaWrite({ force: false, targetExists: true, currentHash: U, recordedHash: null, platformHash: P }), "skip-no-record");
+  });
+  test("用户定制(当前既非新版也非上次平台版) → skip-customized", () => {
+    assert.equal(pb.decidePersonaWrite({ force: false, targetExists: true, currentHash: U, recordedHash: R, platformHash: P }), "skip-customized");
   });
 });
 
@@ -206,28 +274,63 @@ describe("persona files + codex-skills bundle", () => {
 });
 
 describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
-  test("entrypoint.sh dispatches to bundle entrypoint, falls back to image copy, execs single entry", () => {
+  test("entrypoint.sh 三级分流:rev-pinned(REV) → current → image copy;REV 严格 12hex 校验", () => {
     const sh = readFileSync(ENTRYPOINT_SH, "utf8");
+    // ① rev-pinned:读 env OC_PLATFORM_BUNDLE_REV,拼 bundles/<REV>/entrypoint/entrypoint.ts
+    assert.match(sh, /REV="\$\{OC_PLATFORM_BUNDLE_REV:-\}"/);
+    assert.match(sh, /\[\[ "\$REV" =~ \^\[0-9a-f\]\{12\}\$ \]\]/, "REV 必须严格 [0-9a-f]{12} 校验防路径注入");
+    assert.match(sh, /EP="\/run\/oc\/platform\/bundles\/\$REV\/entrypoint\/entrypoint\.ts"/);
+    // ② current(原子翻转)兜底
     assert.match(sh, /EP=\/run\/oc\/platform\/current\/entrypoint\/entrypoint\.ts/);
+    // ③ 镜像 COPY 副本兜底
     assert.match(sh, /\[ -f "\$EP" \] \|\| EP=\/usr\/local\/lib\/openclaude\/entrypoint\.ts/);
     assert.match(sh, /exec npx --no tsx "\$EP"/);
   });
 
-  test("the [ -f ] || fallback idiom picks bundle when present, image copy when absent", () => {
+  test("三级分流行为(bash 复现):REV 合法+存在→rev;REV 非法/缺失→current;current 缺→image", () => {
     const dir = mkdtempSync(join(tmpdir(), "ep-dispatch-"));
     try {
-      const bundle = join(dir, "bundle-ep.ts");
-      const fallback = join(dir, "image-ep.ts");
-      writeFileSync(fallback, "// fallback");
-      const pick = (b: string, f: string) =>
-        execFileSync("bash", ["-c", `EP="$1"; [ -f "$EP" ] || EP="$2"; printf '%s' "$EP"`, "bash", b, f], {
-          encoding: "utf8",
-        });
-      // bundle absent → fallback
-      assert.equal(pick(bundle, fallback), fallback);
-      // bundle present → bundle
-      writeFileSync(bundle, "// bundle");
-      assert.equal(pick(bundle, fallback), bundle);
+      // 模拟容器内三个候选路径(相对 dir,脚本片段用绝对路径拼)
+      const revDir = join(dir, "bundles", "abc123def456", "entrypoint");
+      const revEp = join(revDir, "entrypoint.ts");
+      const currentEp = join(dir, "current", "entrypoint", "entrypoint.ts");
+      const imageEp = join(dir, "image", "entrypoint.ts");
+      for (const p of [revDir, join(dir, "current", "entrypoint"), join(dir, "image")]) {
+        mkdirSync(p, { recursive: true });
+      }
+      writeFileSync(imageEp, "// image"); // image 兜底始终在
+
+      // 复刻 entrypoint.sh 的三级分流逻辑(路径参数化以便隔离测试)
+      const pick = (rev: string) =>
+        execFileSync(
+          "bash",
+          [
+            "-c",
+            `REV="$1"; ROOT="$2"; IMG="$3"; EP="";
+             if [[ "$REV" =~ ^[0-9a-f]{12}$ ]] && [ -f "$ROOT/bundles/$REV/entrypoint/entrypoint.ts" ]; then EP="$ROOT/bundles/$REV/entrypoint/entrypoint.ts"; fi
+             [ -n "$EP" ] || EP="$ROOT/current/entrypoint/entrypoint.ts"
+             [ -f "$EP" ] || EP="$IMG"
+             printf '%s' "$EP"`,
+            "bash",
+            rev,
+            dir,
+            imageEp,
+          ],
+          { encoding: "utf8" },
+        );
+
+      // ③ rev 未建 + current 未建 → image(裸镜像)
+      assert.equal(pick("abc123def456"), imageEp, "rev/current 均缺 → image");
+      // ② current 建了、rev 未建 → current
+      writeFileSync(currentEp, "// current");
+      assert.equal(pick("abc123def456"), currentEp, "rev 缺 → current");
+      // ① rev 建了 + REV 合法 → rev-pinned(优先于 current)
+      writeFileSync(revEp, "// rev");
+      assert.equal(pick("abc123def456"), revEp, "REV 合法且 rev 存在 → rev-pinned");
+      // REV 非法(路径注入/大写/13位)即使 rev 存在也不采用 → 回落 current
+      assert.equal(pick("../etc/passwd"), currentEp, "REV 注入串 → 拒,回落 current");
+      assert.equal(pick("ABC123DEF456"), currentEp, "REV 大写 → 拒(严格小写 hex)");
+      assert.equal(pick(""), currentEp, "REV 缺失 → current");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -245,10 +348,36 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     // 默认工作目录:OPENCLAUDE_DEFAULT_WORKSPACE 存在时 mkdir + 对齐 volume owner。
     assert.match(src, /const defaultWorkspace = \(process\.env\.OPENCLAUDE_DEFAULT_WORKSPACE \|\| ""\)\.trim\(\)/);
     assert.match(src, /mkdirSync\(defaultWorkspace, \{ recursive: true \}\)/);
-    // codex overlay 走 hash-overwrite;原生 populate 保持 skip-if-exists。
-    assert.match(src, /shouldWriteCodexSkill\("hash-overwrite"/);
+    // codex overlay + 平台 seed skill 共用 shouldWriteSeededSkill("hash-overwrite");原生 populate 仍 skip-if-exists。
+    assert.match(src, /shouldWriteSeededSkill\("hash-overwrite"/);
     // dev fallback:platformSeed 缺失回落最小内置集(仅 main)+ dev-only 日志。
     assert.match(src, /if \(!platformSeed\) \{/);
     assert.match(src, /minimal main-only/);
+  });
+
+  test("M4a:平台 seed skill 从 skip-if-exists 改 hash-overwrite(平台更新送达存量 volume)", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    // ensureAgentSeedSkill 不再 skip-if-exists 短路;改经 shouldWriteSeededSkill 判定覆写。
+    assert.doesNotMatch(src, /if \(existsSync\(skillPath\)\) return;/, "seed skill 不得再走 skip-if-exists 短路");
+    assert.match(src, /shouldWriteSeededSkill\("hash-overwrite", targetExists, targetContent, content\)/);
+  });
+
+  test("M4b:persona 升级走 decidePersonaWrite 三态 + .platform-persona-hash 记录", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    assert.match(src, /const PERSONA_HASH_FILE = "\.platform-persona-hash"/);
+    assert.match(src, /decidePersonaWrite\(\{/, "persona 升级决策走纯函数 decidePersonaWrite");
+    // 用户定制保护日志(平台热更新明确排除用户改过的 persona)。
+    assert.match(src, /customization protected/);
+    assert.match(src, /skip platform upgrade \(conservative\)/);
+  });
+
+  test("M5:消费端源/写路径 containment(isPathWithin)+ realpath 源基准", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    // 源:seed 根 realpath 一次做 containment 基准。
+    assert.match(src, /const platformSeedDirReal = platformSeedDir === null \? null : realpathSync\(platformSeedDir\)/);
+    assert.match(src, /isPathWithin\(platformSeedDirReal!, realpathSync\(skillMd\)\)/, "seed skill 源必须 containment");
+    // 写:seed-skill / persona 写目标 containment 到 agents 子树。
+    assert.match(src, /isPathWithin\(join\(ocConfigDir, "agents", agentId, "seed-skills"\), skillPath\)/);
+    assert.match(src, /isPathWithin\(join\(ocConfigDir, "agents"\), personaPath\)/);
   });
 });

@@ -38,6 +38,20 @@ const PROMPT_FILES: Record<PlatformPromptKey, string> = {
 }
 const PROMPT_KEYS = Object.keys(PROMPT_FILES) as PlatformPromptKey[]
 
+/**
+ * key → 该 prompt **必需占位符**清单(m2 注入契约)。加载校验时若某文件缺任一必需占位符 →
+ * 该轮整套加载失败(保留 LKG + 告警,fail-soft)。防止 bundle 侧误删占位符导致运行时
+ * `replaceAll` 静默 no-op、注入契约悄悄断裂(如微信识图提示 / memdir 运行时路径注不进去)。
+ *   - platform-capabilities:{{WECHAT_VISION_HINT}}(buildAgentsSlot 按模型注入 CLI/原生变体);
+ *   - memory-instructions:{{MEMORY_DIR}}/{{MEMORY_MD}}/{{MEMORY_INDEX}}(renderMemoryInstructions 注入);
+ *   - codex-preamble:无(纯静态文案,无运行时注入点)。
+ */
+const REQUIRED_PLACEHOLDERS: Record<PlatformPromptKey, readonly string[]> = {
+  'platform-capabilities': ['{{WECHAT_VISION_HINT}}'],
+  'memory-instructions': ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{MEMORY_INDEX}}'],
+  'codex-preamble': [],
+}
+
 const ENV_DIR_KEY = 'OPENCLAUDE_PLATFORM_PROMPTS_DIR'
 /** 单文件字节上限(§1.2 消费侧的 prompt 面 cap;结构面另有 §1.3 supervisor 校验)。 */
 const MAX_PROMPT_BYTES = 256 * 1024
@@ -61,18 +75,24 @@ let lastPollAt = 0
 // fatal:true → 非法 UTF-8 抛错(而非静默替换成 U+FFFD),使「非 UTF-8」成为校验失败项。
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
 
-/** 整套读入 + 逐文件校验(缺失/超限/空/非 UTF-8 任一即抛)。全过或全不过 —— 无半套。 */
+/** 整套读入 + 逐文件校验(缺失/超限/空/非 UTF-8/缺必需占位符任一即抛)。全过或全不过 —— 无半套。 */
 function readValidatedSet(dir: string): Snapshot {
+  // M3:realpath **解析一次**得 resolved rev 目录,三个文件全部从 resolved rev 读 —— 翻转中途
+  // current 若被 mv -T 翻转,整套仍恒为同一 rev(消 dir 逐个读时 current 翻转的 TOCTOU)。
   const rev = realpathSync(dir) // 经 current symlink 的稳定基准;symlink 断裂即抛,走 LKG
   const prompts = {} as Record<PlatformPromptKey, string>
   for (const key of PROMPT_KEYS) {
-    const file = join(dir, PROMPT_FILES[key])
+    const file = join(rev, PROMPT_FILES[key]) // 从 resolved rev 读,而非含 current 的原 dir
     const buf = readFileSync(file) // 文件缺失 → 抛 → 整套不生效
     if (buf.byteLength > MAX_PROMPT_BYTES) {
       throw new Error(`${PROMPT_FILES[key]} 超出单文件上限 ${MAX_PROMPT_BYTES}B(实际 ${buf.byteLength}B)`)
     }
     const text = utf8Decoder.decode(buf) // 非 UTF-8 → 抛
     if (text.trim().length === 0) throw new Error(`${PROMPT_FILES[key]} 为空`)
+    // m2:必需占位符缺失即整套失败(注入契约不被 bundle 侧误删而静默断裂)。
+    for (const ph of REQUIRED_PLACEHOLDERS[key]) {
+      if (!text.includes(ph)) throw new Error(`${PROMPT_FILES[key]} 缺必需占位符 ${ph}`)
+    }
     prompts[key] = text
   }
   return { rev, prompts }
@@ -139,6 +159,7 @@ export const _internals = {
   TTL_MS,
   MAX_PROMPT_BYTES,
   PROMPT_FILES,
+  REQUIRED_PLACEHOLDERS,
   /** 复位模块级状态,使下一次 getPlatformPrompt 重新读 env。 */
   resetForTests(): void {
     initialized = false

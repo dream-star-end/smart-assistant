@@ -48,11 +48,14 @@ function promptsDirVia(root: string): string {
   return join(root, 'current', 'prompts')
 }
 
+// 合法样本必须携带各 key 的必需占位符(m2 校验),否则整套加载失败(那正是占位符测试要单独构造的)。
 const sample = (tag: string): Record<PlatformPromptKey, string> => ({
-  'platform-capabilities': `CAP-${tag}`,
-  'memory-instructions': `MEM-${tag}`,
+  'platform-capabilities': `CAP-${tag} {{WECHAT_VISION_HINT}}`,
+  'memory-instructions': `MEM-${tag} {{MEMORY_DIR}} {{MEMORY_MD}} {{MEMORY_INDEX}}`,
   'codex-preamble': `CODEX-${tag}`,
 })
+// 便捷取样(替代早期硬编码的 'CAP-r1' 等 —— 现样本含占位符)。
+const cap = (tag: string) => sample(tag)['platform-capabilities']
 
 const roots: string[] = []
 let origEnv: string | undefined
@@ -107,9 +110,9 @@ describe('platformPrompts LKG 加载器', () => {
     roots.push(root)
     const revDir = join(root, 'bundles', 'r1', 'prompts')
     mkdirSync(revDir, { recursive: true })
-    // 只写两个,故意缺 codex-preamble
-    writeFileSync(join(revDir, FILES['platform-capabilities']), 'CAP', 'utf8')
-    writeFileSync(join(revDir, FILES['memory-instructions']), 'MEM', 'utf8')
+    // 只写两个(含合法占位符,确保失败点是「缺文件」而非「缺占位符」),故意缺 codex-preamble
+    writeFileSync(join(revDir, FILES['platform-capabilities']), cap('r1'), 'utf8')
+    writeFileSync(join(revDir, FILES['memory-instructions']), sample('r1')['memory-instructions'], 'utf8')
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
     // 半套不生效:连齐全的两个也回落 fallback
@@ -161,7 +164,7 @@ describe('platformPrompts LKG 加载器', () => {
     _internals.pollNow()
     // LKG:仍返回 r1 的值,而非 fallback、也不是半套 r2
     assert.equal(getPlatformPrompt('codex-preamble', 'FB'), 'CODEX-r1')
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r1')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r1'))
     assert.ok(errorLogs.some((l) => l.includes('platform-prompts')))
   })
 
@@ -172,13 +175,31 @@ describe('platformPrompts LKG 加载器', () => {
     writeBundle(root, 'r2', sample('r2'))
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r1')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r1'))
     const rev1 = _internals.currentRev()
 
     pointCurrent(root, 'r2')
     _internals.pollNow()
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r2', '翻转后应读到新 rev')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r2'), '翻转后应读到新 rev')
     assert.notEqual(_internals.currentRev(), rev1, 'rev 应随 current 翻转而变')
+  })
+
+  it('M3 混 rev 防护:翻到内容全不同的 r2 → 三键整套一致来自 r2(无半套 / 无 r1 残留混读)', () => {
+    // M3 修复:readValidatedSet 一次 realpath 得 resolved rev,三个文件全部从 resolved rev 读,
+    // 翻转中途不会混用两版。此处以「翻到内容全不同的 r2 后三键必须整套一致」固化该整套读语义。
+    const root = makeBundleRoot()
+    roots.push(root)
+    writeBundle(root, 'r1', sample('r1'))
+    writeBundle(root, 'r2', sample('r2'))
+    pointCurrent(root, 'r1')
+    process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
+    for (const k of KEYS) assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r1')[k])
+
+    pointCurrent(root, 'r2')
+    _internals.pollNow()
+    // 三键必须全部来自 r2(任一残留 r1 = 混 rev,视为回归)
+    for (const k of KEYS) assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r2')[k], `${k} 必须整套翻到 r2`)
+    assert.equal(_internals.hasSnapshot(), true)
   })
 
   it('TTL 未到不重读(翻转后立即访问仍是旧值)', () => {
@@ -188,14 +209,56 @@ describe('platformPrompts LKG 加载器', () => {
     writeBundle(root, 'r2', sample('r2'))
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r1')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r1'))
 
     // 翻到 r2 但不越过 TTL:普通 get 不应重读(仍 r1)
     pointCurrent(root, 'r2')
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r1', 'TTL 内不该重读')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r1'), 'TTL 内不该重读')
     // 越过 TTL(pollNow 绕过门控)后才拾取 r2
     _internals.pollNow()
-    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'CAP-r2')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r2'))
+  })
+
+  it('m2 占位符缺失:启动即缺 → 首轮失败回落 fallback + 告警', () => {
+    const root = makeBundleRoot()
+    roots.push(root)
+    const c = sample('r1')
+    // platform-capabilities 去掉必需占位符(其余合法)→ 整套加载失败
+    c['platform-capabilities'] = 'CAP-r1 without the required placeholder'
+    writeBundle(root, 'r1', c)
+    pointCurrent(root, 'r1')
+    process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
+    // 半套不生效:连合法的 memory 也回落 fallback
+    assert.equal(getPlatformPrompt('memory-instructions', 'FB-MEM'), 'FB-MEM')
+    assert.equal(getPlatformPrompt('platform-capabilities', 'FB-CAP'), 'FB-CAP')
+    assert.equal(_internals.hasSnapshot(), false)
+    assert.ok(errorLogs.some((l) => l.includes('占位符')), '缺占位符必须告警')
+  })
+
+  it('m2 占位符缺失:先成功后翻到缺占位符的 r2 → 保留 LKG(不回落、不半套)+ 告警', () => {
+    const root = makeBundleRoot()
+    roots.push(root)
+    writeBundle(root, 'r1', sample('r1'))
+    pointCurrent(root, 'r1')
+    process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
+    assert.equal(getPlatformPrompt('memory-instructions', 'FB'), sample('r1')['memory-instructions'], '首轮加载成功')
+
+    // r2:memory 去掉一个必需占位符 {{MEMORY_INDEX}}(其余合法)
+    const c = sample('r2')
+    c['memory-instructions'] = 'MEM-r2 {{MEMORY_DIR}} {{MEMORY_MD}} 缺 index 占位符'
+    writeBundle(root, 'r2', c)
+    pointCurrent(root, 'r2')
+    _internals.pollNow()
+    // LKG:三键仍是 r1(缺占位符的 r2 整套不生效)
+    for (const k of KEYS) assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r1')[k], `${k} 应保 LKG=r1`)
+    assert.ok(errorLogs.some((l) => l.includes('占位符')))
+  })
+
+  it('m2 占位符登记表:三 key 必需占位符与消费方注入契约一致', () => {
+    const req = _internals.REQUIRED_PLACEHOLDERS
+    assert.deepEqual([...req['platform-capabilities']], ['{{WECHAT_VISION_HINT}}'])
+    assert.deepEqual([...req['memory-instructions']].sort(), ['{{MEMORY_DIR}}', '{{MEMORY_INDEX}}', '{{MEMORY_MD}}'])
+    assert.deepEqual([...req['codex-preamble']], [])
   })
 })
 

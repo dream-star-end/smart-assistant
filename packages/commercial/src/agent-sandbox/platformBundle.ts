@@ -24,6 +24,7 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
 } from "node:fs";
 import {
@@ -87,6 +88,25 @@ export const PLATFORM_BUNDLE_TOP_LEVEL = new Set<string>([
   "prompts",
   "MANIFEST.json",
 ]);
+
+/**
+ * platform bundle **必需叶子**清单(plan §2 / M8)。resolvePlatformBundleMount 校验逐一存在 ——
+ * 结构白名单 / 上限只堵"多出来的坏东西",不保证"该有的关键文件都在"。缺任一关键 boot/prompt/
+ * seed/etc-codex 叶子的 bundle 会让容器 entrypoint/consumer 静默退化(读不到平台守则/能力文案/
+ * codex 配置),必须在校验期 fail-closed 拒绝,而非等运行期才发现"平台配置半套"。
+ *
+ * **与 bash 侧(agent F 的 v5-runtime-release-lib.sh selfcheck)镜像同清单** —— 两侧任一改动
+ * 先在 runtimeArtifactConformance.test.ts 红。路径均为相对 bundle 根的规范 POSIX 形态。
+ */
+export const PLATFORM_BUNDLE_REQUIRED_LEAVES: readonly string[] = [
+  "entrypoint/entrypoint.ts",
+  "entrypoint/platformBundle.ts",
+  "seed/platform-seed.yaml",
+  "prompts/platform-capabilities.md",
+  "prompts/memory-instructions.md",
+  "prompts/codex-preamble.md",
+  "etc-codex/managed_config.toml",
+];
 
 /** 文件扩展名白名单(plan §1.3)。MANIFEST.json 走 .json;其它文件必须命中其一。 */
 export const PLATFORM_BUNDLE_FILE_EXTENSIONS = new Set<string>([
@@ -190,6 +210,11 @@ export function assertBaselineLeaf(
  * 生产由 index.ts 传 platformRoot / releasesRoot(两者本就 root-owned)。不给 → 一直走到
  * 文件系统根(最严;但会踩 /tmp 这类 world-writable 中间目录,故测试与非标准布局须传 stopAt)。
  *
+ * **B5 containment 缺口**:给了 stopAt 但沿祖先链一直走到文件系统根都没遇到它 → 说明
+ * resolvedPath **根本不在** stopAt 子树内(如 bundle 落在 platformRoot 之外),此时静默返回
+ * 会漏掉整段"应受信任边界之外"的祖先检查。改为**未抵达 stopAt 必抛** —— 让"路径不在可信根下"
+ * 这一类越界在祖先校验阶段就 fail-closed,而非依赖上层再补 containment。
+ *
  * 失败抛 Error(调用方捕获)。
  */
 export function assertSafeAncestry(resolvedPath: string, stopAt?: string): void {
@@ -212,7 +237,15 @@ export function assertSafeAncestry(resolvedPath: string, stopAt?: string): void 
     }
     if (stopReal && cur === stopReal) break; // 到达可信边界(inclusive)
     const parent = pathDirname(cur);
-    if (parent === cur) break; // 到达文件系统根
+    if (parent === cur) {
+      // 到达文件系统根。若指定了 stopAt 却始终没命中 → resolvedPath 不在 stopAt 子树内,拒。
+      if (stopReal) {
+        throw new Error(
+          `ancestry walk reached filesystem root without hitting stopAt boundary (${stopReal}); path escapes trusted root: ${resolvedPath}`,
+        );
+      }
+      break;
+    }
     cur = parent;
   }
 }
@@ -230,15 +263,27 @@ export function assertSafeAncestry(resolvedPath: string, stopAt?: string): void 
  * runtimeArtifactConformance.test.ts 用真实 fixture 树双跑锁死(改任何一侧编码必先红那个门)。
  * digest 行拼接直接用 mode 字符串;磁盘校验比 `(lstat.mode & 0o7777).toString(8) === entry.mode`。
  * uid/gid/mtime 一律忽略(plan §1.2:内容 digest 只认内容,不认时间/属主漂移)。
+ *
+ * **symlink 行约定(M6;仅 runtime release 的 MANIFEST 会出现,bundle 侧仍拒 symlink)**:
+ *   release 树(node_modules 等)可含 symlink,MANIFEST 需把它编码进 files[] 才能进 digest。
+ *   与 bash 侧(agent F 的 v5-runtime-release-lib.sh)**逐字节一致**的约定:
+ *     - `path`   = 链本身的相对路径;
+ *     - `sha256` = 字面串 `link:<readlink 原始 target>`(**不是** hash;消费方按 `link:` 前缀识别);
+ *     - `size`   = 0;
+ *     - `mode`   = "777"(Linux symlink 的 lstat %a 恒 777)。
+ *   digest 行编码不变(仍是 `path\0<sha256字段>\0mode\n`),故 manifestDigestOf/bootHashOf
+ *   无需特判 —— 它们只拼接字符串字段。跨实现一致性由 runtimeArtifactConformance.test.ts 锁死。
+ *   注:release 侧 resolveRuntimeReleaseMount **不**逐条比对 MANIFEST(大树太贵),symlink 的
+ *   安全边界由启动期 lstat-only 结构深校验(target 相对 + normalize 不逃逸)独立兜底,见其注释。
  */
 export interface ManifestFileEntry {
-  /** 规范化相对路径(相对 bundle 根,POSIX 分隔,不以 / 开头)。 */
+  /** 规范化相对路径(相对 bundle/release 根,POSIX 分隔,不以 / 开头)。 */
   path: string;
-  /** 文件内容 sha256(hex 全长)。 */
+  /** 文件内容 sha256(hex 全长);symlink 行为字面串 `link:<readlink 原始 target>`(见上)。 */
   sha256: string;
-  /** 文件字节数。 */
+  /** 文件字节数;symlink 行恒 0。 */
   size: number;
-  /** permission bits,八进制字符串(见上方 mode 约定)。 */
+  /** permission bits,八进制字符串(见上方 mode 约定);symlink 行恒 "777"。 */
   mode: string;
 }
 
@@ -414,15 +459,18 @@ function collectBundleFiles(bundleRoot: string): ManifestFileEntry[] {
 /**
  * platform bundle 结构校验 + 挂载解析(plan §1.3)。
  *
- * 完整校验链(任一失败抛 SupervisorError("InvalidArgument")):
+ * 完整校验链(任一失败抛 SupervisorError("PlatformBundleInvalid")):
  *   1. 非空绝对路径;
  *   2. bundle 目录本身 + 祖先链 leaf 不变量(root owned / 非 group-other 可写 / 非 symlink);
- *   3. 有界递归 collectBundleFiles(顶层白名单 / 类型白名单 / 扩展名白名单 / denylist /
+ *      B5.1:给了 ancestorRoot 却沿祖先链走到根都没命中 → 拒(路径逃逸可信根)。
+ *   3. B5.2 containment:给了 opts.platformRoot 时,resolved 必须严格落在 `<platformRoot>/bundles/` 下;
+ *   4. 有界递归 collectBundleFiles(顶层白名单 / 类型白名单 / 扩展名白名单 / denylist /
  *      单文件≤1MB / 总量≤32MB / 深度≤6 / 条目≤512);
- *   4. MANIFEST.json 存在、schemaVersion=1;
- *   5. 磁盘实际条目集合 ≡ MANIFEST.files 路径集合(逐一);每文件 sha256 与 mode 相符;
- *   6. manifestDigestOf(files) === MANIFEST.digest;bootHashOf(files) === MANIFEST.bootHash;
- *   7. bundle 目录名 basename === MANIFEST.digest(内容 digest 命名不变量)。
+ *   5. M8 必需叶子:PLATFORM_BUNDLE_REQUIRED_LEAVES 逐一存在;
+ *   6. MANIFEST.json 存在、schemaVersion=1;
+ *   7. 磁盘实际条目集合 ≡ MANIFEST.files 路径集合(逐一);每文件 sha256 与 mode 相符;
+ *   8. manifestDigestOf(files) === MANIFEST.digest;bootHashOf(files) === MANIFEST.bootHash;
+ *   9. bundle 目录名 basename === MANIFEST.digest(内容 digest 命名不变量)。
  *
  * 返回 { resolvedPath, bundleRev, bootHash }。
  *
@@ -432,13 +480,13 @@ function collectBundleFiles(bundleRoot: string): ManifestFileEntry[] {
  */
 export function resolvePlatformBundleMount(
   bundlePath: string,
-  opts?: { ancestorRoot?: string },
+  opts?: { ancestorRoot?: string; platformRoot?: string },
 ): ResolvedPlatformBundle {
   if (typeof bundlePath !== "string" || bundlePath.trim() === "") {
-    throw new SupervisorError("InvalidArgument", "platform bundle path is empty");
+    throw new SupervisorError("PlatformBundleInvalid", "platform bundle path is empty");
   }
   if (!pathIsAbsolute(bundlePath)) {
-    throw new SupervisorError("InvalidArgument", `platform bundle path must be absolute: ${bundlePath}`);
+    throw new SupervisorError("PlatformBundleInvalid", `platform bundle path must be absolute: ${bundlePath}`);
   }
   const abs = pathNormalize(bundlePath).replace(/(?<!^)\/+$/, "");
   try {
@@ -447,8 +495,35 @@ export function resolvePlatformBundleMount(
     const resolvedPath = realpathSync(abs);
     assertSafeAncestry(resolvedPath, opts?.ancestorRoot);
 
+    // B5 显式 containment:给了 platformRoot(生产由 index.ts 传 config 稳定根)时,resolved 必须
+    // 严格位于 `<platformRoot>/bundles/` 下 —— bundle 目录名是内容 digest,但"落在哪个根的
+    // bundles/ 下"是布局契约(current 只翻到 bundles/<rev>)。不在其下 = 越界布局,拒。
+    if (opts?.platformRoot != null) {
+      let platformRootReal: string;
+      try {
+        platformRootReal = realpathSync(opts.platformRoot);
+      } catch (e) {
+        throw new Error(`platform root unresolvable (${opts.platformRoot}): ${(e as Error).message}`);
+      }
+      const bundlesPrefix = pathJoin(platformRootReal, "bundles") + pathSep;
+      if (!resolvedPath.startsWith(bundlesPrefix)) {
+        throw new Error(
+          `bundle realpath must live under ${pathJoin(platformRootReal, "bundles")}/; got ${resolvedPath}`,
+        );
+      }
+    }
+
     // 递归收集 + 结构不变量。
     const files = collectBundleFiles(resolvedPath);
+
+    // M8 必需叶子:结构白名单只堵"多出来的坏东西",不保证关键文件都在。逐一断言必需 boot/prompt/
+    // seed/etc-codex 叶子存在于收集到的 regular-file 集合(collectBundleFiles 已校过 leaf 不变量)。
+    const diskPathSet = new Set(files.map((f) => f.path));
+    for (const leaf of PLATFORM_BUNDLE_REQUIRED_LEAVES) {
+      if (!diskPathSet.has(leaf)) {
+        throw new Error(`bundle missing required leaf: ${leaf}`);
+      }
+    }
 
     // MANIFEST.json 解析。
     const manifestPath = pathJoin(resolvedPath, "MANIFEST.json");
@@ -508,7 +583,7 @@ export function resolvePlatformBundleMount(
   } catch (err) {
     if (err instanceof SupervisorError) throw err;
     throw new SupervisorError(
-      "InvalidArgument",
+      "PlatformBundleInvalid",
       `platform bundle validation failed (${abs}): ${(err as Error).message}`,
     );
   }
@@ -522,18 +597,42 @@ export function resolvePlatformBundleMount(
  * 平台根,容器会看到与 env 声明不一致的 bundle(混合版本)。断言 current == 声明 bundle,
  * 不等 = 激活中间态 → 拒 provision(前端 retry 兜底,与今日 restart 窗口同量级)。
  *
- * 这是**便宜的**每次 provision 检查(两次 realpath),与昂贵的全量 resolvePlatformBundleMount
- * (逐文件 sha256,启动期一次)分工。失败抛 SupervisorError("InvalidArgument")。
+ * 这是**便宜的**每次 provision 检查(readlink + 两次 realpath),与昂贵的全量
+ * resolvePlatformBundleMount(逐文件 sha256,启动期一次)分工。失败抛
+ * SupervisorError("RuntimePlacementInvalid")。
+ *
+ * **B5 symlink 契约加固**:除 realpath 相等外,另断言 current 的 **readlink 原始目标** 恰为
+ * 规范相对形态 `bundles/<12hex>`(bash `oc_hotcfg_flip_current` 产 `ln -s "bundles/$rev"`)。
+ * 只比 realpath 会放过"current 指到别处再软链回来"或"current 是绝对/多级异常目标"的畸形布局;
+ * 钉死原始目标形态 = current 只能是"指向本根 bundles/ 下某个 12hex rev 的相对链",堵住这类越界。
  */
+const CURRENT_LINK_TARGET_RE = /^bundles\/[0-9a-f]{12}$/;
+
 export function assertCurrentMatches(platformRoot: string, expectedBundlePath: string): void {
   const currentLink = pathJoin(platformRoot, "current");
+  // 先看原始 symlink 目标形态(readlink,不解析);非规范相对形态即拒(激活布局被污染)。
+  let rawTarget: string;
+  try {
+    rawTarget = readlinkSync(currentLink);
+  } catch (e) {
+    throw new SupervisorError(
+      "RuntimePlacementInvalid",
+      `platform current symlink unreadable (${currentLink}): ${(e as Error).message}`,
+    );
+  }
+  if (!CURRENT_LINK_TARGET_RE.test(rawTarget)) {
+    throw new SupervisorError(
+      "RuntimePlacementInvalid",
+      `platform current target must be canonical relative "bundles/<12hex>"; got ${JSON.stringify(rawTarget)}`,
+    );
+  }
   let currentReal: string;
   let expectedReal: string;
   try {
     currentReal = realpathSync(currentLink);
   } catch (e) {
     throw new SupervisorError(
-      "InvalidArgument",
+      "RuntimePlacementInvalid",
       `platform current symlink unresolvable (${currentLink}): ${(e as Error).message}`,
     );
   }
@@ -541,13 +640,13 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
     expectedReal = realpathSync(expectedBundlePath);
   } catch (e) {
     throw new SupervisorError(
-      "InvalidArgument",
+      "RuntimePlacementInvalid",
       `expected bundle path unresolvable (${expectedBundlePath}): ${(e as Error).message}`,
     );
   }
   if (currentReal !== expectedReal) {
     throw new SupervisorError(
-      "InvalidArgument",
+      "RuntimePlacementInvalid",
       `platform activation mid-state: current=${currentReal} != expected=${expectedReal}`,
     );
   }
@@ -558,6 +657,66 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
 // ───────────────────────────────────────────────────────────────────────
 
 /**
+ * runtime release 树**结构深校验**(M6;plan §3.2)。启动期一次,**lstat-only 不 hash 内容**
+ * —— release 含 node_modules 数万文件,内容完整性由内容寻址目录名 + deploy prepare 期一次性
+ * 组装 digest 兜底;这里的深校验只锁"结构安全",递归 walk 整树每条 lstat:
+ *   - owner=root(uid=0)—— 非 root owned = 部署态失控;
+ *   - regular file / dir:非 group/other 可写(mode & 022 == 0);
+ *   - symlink:target 必须**相对**且相对自身目录 normalize 后**不逃逸 release 树**
+ *     (bundle 侧拒 symlink,release 侧允许 node_modules 内部相对链但堵越界);
+ *   - file / dir / symlink **之外的类型**(device/socket/FIFO)一律拒。
+ *
+ * **无 env 逃生口**(设计承诺):fail-closed。任一条不满足抛 Error(调用方 wrap 成
+ * SupervisorError("RuntimeReleaseInvalid"))。`releaseRoot` 必须是已 realpath 的绝对路径。
+ * symlink 不跟进(不 walk 其 target),避免顺链走出树 / 无限环。
+ */
+function assertReleaseTreeStructure(releaseRoot: string): void {
+  const walk = (absDir: string, relPrefix: string): void => {
+    const names = readdirSync(absDir).sort();
+    for (const name of names) {
+      const abs = pathJoin(absDir, name);
+      const rel = relPrefix ? `${relPrefix}/${name}` : name;
+      const st = lstatSync(abs);
+      if (st.uid !== 0) {
+        throw new Error(`release entry not owned by root (uid=${st.uid}): ${rel}`);
+      }
+      if (st.isSymbolicLink()) {
+        const target = readlinkSync(abs);
+        if (pathIsAbsolute(target)) {
+          throw new Error(`release symlink target must be relative: ${rel} -> ${target}`);
+        }
+        // 相对自身所在目录做**纯词法** normalize(不触碰 fs;target 可能尚不存在/本身也是链)。
+        const resolvedTarget = pathNormalize(pathJoin(absDir, target));
+        if (resolvedTarget !== releaseRoot && !resolvedTarget.startsWith(releaseRoot + pathSep)) {
+          throw new Error(`release symlink target escapes release tree: ${rel} -> ${target}`);
+        }
+        continue; // 不跟进 symlink
+      }
+      if (st.isDirectory()) {
+        if ((st.mode & 0o022) !== 0) {
+          throw new Error(
+            `release dir group/other writable (mode=${(st.mode & 0o777).toString(8)}): ${rel}`,
+          );
+        }
+        walk(abs, rel);
+        continue;
+      }
+      if (st.isFile()) {
+        if ((st.mode & 0o022) !== 0) {
+          throw new Error(
+            `release file group/other writable (mode=${(st.mode & 0o777).toString(8)}): ${rel}`,
+          );
+        }
+        continue;
+      }
+      // regular file / dir / symlink 之外的类型(device / socket / FIFO)一律拒。
+      throw new Error(`release entry has forbidden type (not file/dir/symlink): ${rel}`);
+    }
+  };
+  walk(releaseRoot, "");
+}
+
+/**
  * runtime release 校验 + 挂载解析(plan §3.2)。
  *
  * 校验链(任一失败抛 SupervisorError("InvalidArgument")):
@@ -565,12 +724,15 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
  *   2. realpath 落在 releasesRoot 下(逃逸即拒);
  *   3. release 目录 root-owned + 非 group-other 可写 + 非 symlink(leaf 不变量)+ 祖先链锁死;
  *   4. MANIFEST.json 存在,含 digest;
- *   5. 目录名 `rel-<digest12>` 的 <digest12> === MANIFEST.digest(命名一致)。
+ *   5. 目录名 `rel-<digest12>` 的 <digest12> === MANIFEST.digest(命名一致);
+ *   6. **结构深校验**(M6,lstat-only 不 hash 内容):递归整树,每条 owner=root / file·dir 非
+ *      group-other 可写 / symlink target 相对且不逃逸 release 树 / 拒 file·dir·symlink 外类型。
+ *      **无 env 逃生口**(fail-closed 设计承诺)。
  *
  * **与 bundle 不同**:release 含 node_modules + ccb dist(体量大),这里**不**逐文件重算
- * content digest(那要 hash 整棵 GB 级树,每次都做代价过高);只校验结构 + 命名 ↔ digest 一致。
- * 内容完整性由 deploy prepare 期的一次性组装 digest(§3.1)+ 内容寻址目录名 + ro 挂载 +
- * 祖先链锁死共同兜底。
+ * content digest(那要 hash 整棵 GB 级树,每次都做代价过高);内容完整性由 deploy prepare 期
+ * 的一次性组装 digest(§3.1)+ 内容寻址目录名 + ro 挂载 + 祖先链锁死共同兜底。但结构安全
+ * (owner/权限/类型/symlink 越界)由第 6 步 lstat-only 深校验独立兜底(~数万文件秒级)。
  *
  * 返回 resolved realpath(bind 到 /opt/openclaude:ro 的源;绝不挂 symlink 本身)。
  */
@@ -579,10 +741,10 @@ export function resolveRuntimeReleaseMount(
   releasesRoot: string = DEFAULT_RUNTIME_RELEASES_ROOT,
 ): string {
   if (typeof releasePath !== "string" || releasePath.trim() === "") {
-    throw new SupervisorError("InvalidArgument", "runtime release path is empty");
+    throw new SupervisorError("RuntimeReleaseInvalid", "runtime release path is empty");
   }
   if (!pathIsAbsolute(releasePath)) {
-    throw new SupervisorError("InvalidArgument", `runtime release path must be absolute: ${releasePath}`);
+    throw new SupervisorError("RuntimeReleaseInvalid", `runtime release path must be absolute: ${releasePath}`);
   }
   const abs = pathNormalize(releasePath).replace(/(?<!^)\/+$/, "");
   try {
@@ -622,11 +784,15 @@ export function resolveRuntimeReleaseMount(
       throw new Error(`release dir digest ${m[1]} != MANIFEST.digest ${manifest.digest}`);
     }
 
+    // M6 结构深校验(lstat-only,不 hash 内容):整树 owner/权限/类型/symlink 越界(见函数注释)。
+    // **无 env 逃生口**:fail-closed 是设计承诺。
+    assertReleaseTreeStructure(resolvedPath);
+
     return resolvedPath;
   } catch (err) {
     if (err instanceof SupervisorError) throw err;
     throw new SupervisorError(
-      "InvalidArgument",
+      "RuntimeReleaseInvalid",
       `runtime release validation failed (${abs}): ${(err as Error).message}`,
     );
   }

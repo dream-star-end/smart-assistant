@@ -37,11 +37,23 @@ fi
 # ---- 3. 交棒 entrypoint.ts ----
 # 用 tsx (个人版 devDep,npm ci 已装) 跑 .ts 入口,避免维护两份 isProviderManagedEnvVar 列表。
 #
-# 分流(runtime hotcfg §2):优先跑 platform bundle 里的 entrypoint(原子翻转即温热生效),
-# 缺失(裸镜像 / dev fallback)才回落镜像内 COPY 的副本。EP 解析后再 cd,exec 单入口。
-# entrypoint.ts 自身用 realpath(import.meta.url) 自钉所在 bundle,读相对 seed —— 不依赖本
-# 变量,这里只决定"跑哪份 entrypoint"。
-EP=/run/oc/platform/current/entrypoint/entrypoint.ts
+# 三级分流(runtime hotcfg §2 / M2 消 current 翻转 TOCTOU):
+#   ① supervisor 注入 OC_PLATFORM_BUNDLE_REV(=12hex,与容器 label bundle_rev 同 rev)且对应
+#      rev-pinned entrypoint 存在 → exec 之。**钉死单一 rev**:此刻 current 可能正被 deploy 原子
+#      翻转,直接读 current 会与容器 label 声明的 rev 分叉(TOCTOU);读 bundles/<REV>/ 恒一致。
+#   ② REV 未注入 / 格式非法 / rev 路径不存在(过渡期或 dev)→ current(原子翻转,兼容旧行为)。
+#   ③ 都无 → 镜像内 COPY 副本(裸镜像 / dev fallback)。
+# REV 严格 [0-9a-f]{12} 校验:拒绝任何注入串拼进路径(防 `../` / 绝对路径 / 命令注入)。
+# entrypoint.ts 自身用 realpath(import.meta.url) 自钉所在 bundle —— exec 的就是 rev 路径,
+# 读相对 seed 恒为同一 rev 整套。
+REV="${OC_PLATFORM_BUNDLE_REV:-}"
+EP=""
+if [[ "$REV" =~ ^[0-9a-f]{12}$ ]] && [ -f "/run/oc/platform/bundles/$REV/entrypoint/entrypoint.ts" ]; then
+  EP="/run/oc/platform/bundles/$REV/entrypoint/entrypoint.ts"
+fi
+# ② current(原子翻转)
+[ -n "$EP" ] || EP=/run/oc/platform/current/entrypoint/entrypoint.ts
+# ③ 镜像内 COPY 副本
 [ -f "$EP" ] || EP=/usr/local/lib/openclaude/entrypoint.ts
 cd /opt/openclaude
 exec npx --no tsx "$EP"

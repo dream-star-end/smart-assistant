@@ -162,4 +162,18 @@ export type SupervisorErrorCode =
   // 后悄悄丢 server-authored 文本)。v3ensureRunning 翻成 setQuarantined
   // (image-mismatch hard) + ContainerUnreadyError("image_outdated") + critical alert。
   | "ImageOutdated"
+  // V5 runtime tuple 热生效改造(docs/V5_RUNTIME_HOTCFG_PLAN.md §1/§3.2)—— 平台 bundle /
+  // runtime release / 运行时放置(placement)三类专用失败码,替代原来一律 "InvalidArgument"
+  // 的笼统归类,让 v3ensureRunning 能把它们与 CcbBaselineMissing 同款处理(部署级故障 →
+  // critical 告警 + 长重试,而非当普通瞬态 5s 风暴重试)。
+  //   - PlatformBundleInvalid:platform bundle(bin/entrypoint/prompts/seed/…+MANIFEST)
+  //     结构 / MANIFEST / digest 校验失败,或启动期解析失败但仍配置了 OC_PLATFORM_BUNDLE。
+  //   - RuntimeReleaseInvalid:runtime release(源码树+node_modules+ccb dist)结构深校验 /
+  //     命名↔digest / 启动期解析失败但仍配置了 OC_RUNTIME_RELEASE。
+  //   - RuntimePlacementInvalid:运行时产物放置态非法 —— platform current symlink 中间态
+  //     (current != 声明 bundle / 目标非规范 bundles/<rev> 相对形态),或 release 被要求
+  //     调度到非 self-host(release 树 master-local only)。
+  | "PlatformBundleInvalid"
+  | "RuntimeReleaseInvalid"
+  | "RuntimePlacementInvalid"
   | "Unknown";

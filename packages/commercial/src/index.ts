@@ -2038,7 +2038,12 @@ export async function registerCommercial(
       };
       if (cfg.OC_PLATFORM_BUNDLE) {
         try {
-          const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, { ancestorRoot: platformRoot });
+          // B5 containment:传 platformRoot 让校验器显式断言 resolved 落在 <platformRoot>/bundles/ 下
+          // (ancestorRoot 同值锁祖先链;platformRoot 另钉布局根,两者语义分离但生产同一目录)。
+          const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, {
+            ancestorRoot: platformRoot,
+            platformRoot,
+          });
           t.bundleResolvedPath = resolved.resolvedPath;
           t.bundleRev = resolved.bundleRev;
           t.bootHash = resolved.bootHash;

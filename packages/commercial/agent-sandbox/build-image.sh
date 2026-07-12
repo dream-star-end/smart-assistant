@@ -44,6 +44,12 @@ BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
 IMAGE_OUT_DIR="/var/lib/openclaude-v3/images"
 
+# OC_EMBED_SOURCE(m4):=0 → **纯工具链镜像**,不内嵌个人版源码。此时 build context 只需
+# Dockerfile+runtime/+platform-runtime/,**跳过 ccb prebuild(不需 bun)与个人源码 rsync**,
+# 解除工具链镜像对源码树/bun 的耦合(Dockerfile 侧 COPY personal-version 已由 OC_EMBED_SOURCE
+# 多阶段门控 embed-0/embed-1)。默认 1(内嵌,v3 行为不变);v5 hotcfg 瘦身镜像传 0。
+OC_EMBED_SOURCE_VAL="${OC_EMBED_SOURCE:-1}"
+
 # tag = 命令行第 1 参,没传就用 v3 仓库 HEAD 短 sha
 TAG="${1:-}"
 if [ -z "$TAG" ]; then
@@ -69,8 +75,13 @@ if [ -z "$SOURCE_COMMIT" ]; then
   SOURCE_COMMIT="$(git -C "$PERSONAL_SRC" rev-parse --short HEAD 2>/dev/null || true)"
 fi
 if [ -z "$SOURCE_COMMIT" ]; then
-  echo "[build-image] FATAL: 无法确定 runtime source commit" >&2
-  exit 1
+  if [ "$OC_EMBED_SOURCE_VAL" = "0" ]; then
+    # 纯工具链镜像不内嵌源码,source_commit 非权威(运行物权威=hotcfg release digest)。
+    SOURCE_COMMIT="toolchain"
+  else
+    echo "[build-image] FATAL: 无法确定 runtime source commit" >&2
+    exit 1
+  fi
 fi
 
 echo "[build-image] tag=$TAG"
@@ -91,15 +102,18 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -d "$PERSONAL_SRC" ]; then
+# 个人源码存在性:仅内嵌构建(EMBED≠0)硬需;EMBED=0 纯工具链镜像不 COPY/rsync 源码 → 不强求(m4)。
+if [ "$OC_EMBED_SOURCE_VAL" != "0" ] && [ ! -d "$PERSONAL_SRC" ]; then
   echo "[build-image] FATAL: 个人版源码不存在: $PERSONAL_SRC" >&2
   exit 1
 fi
 
 # 取源指纹,让 ops 一眼确认 build 取的是 deploy 后的最新源,而不是某棵 stale 树。
 # deploy-v3.sh 在 $PERSONAL_SRC/VERSION.json 写 {tag, commit, builtAt};没有(本地 dev
-# / 首次 bootstrap)就回退到 mtime,信息少一些但不致命。
-if [ -f "$PERSONAL_SRC/VERSION.json" ]; then
+# / 首次 bootstrap)就回退到 mtime,信息少一些但不致命。EMBED=0 且无源码树时跳过指纹打印。
+if [ "$OC_EMBED_SOURCE_VAL" = "0" ] && [ ! -d "$PERSONAL_SRC" ]; then
+  echo "[build-image] source: <skipped, OC_EMBED_SOURCE=0 纯工具链镜像不内嵌源码>"
+elif [ -f "$PERSONAL_SRC/VERSION.json" ]; then
   echo "[build-image] source: $PERSONAL_SRC  ($(cat "$PERSONAL_SRC/VERSION.json"))"
 else
   echo "[build-image] source: $PERSONAL_SRC  (VERSION.json missing; mtime=$(stat -c '%y' "$PERSONAL_SRC"))"
@@ -131,38 +145,45 @@ mkdir -p "$IMAGE_OUT_DIR"
 # ───────────────────────────────────────────────
 # 不复用旧 BUILD_CTX(避免上一次残留污染),整个 wipe 重建
 rm -rf "$BUILD_CTX"
-mkdir -p "$BUILD_CTX/personal-version"
+mkdir -p "$BUILD_CTX"
 
-# 0. **预构建 claude-code-best dist** (容器内只有 node,没有 bun,需 prebuild)
-#    build.ts 走 Bun.build target=bun,后处理 import.meta.require → node 兼容
-#    产物 node dist/cli.js 直接可跑(MACRO defines 已烤进产物)
-#
-#    `--ignore-scripts`:跳过 ccb 的 `prepare` (git config core.hooksPath .githooks)。
-#    那条 hook 是给本地 dev 装的,build 完全不需要,而且 deploy-v3.sh rsync `.git/`
-#    exclude 把 ccb 子目录 .git 也排除了,跑 prepare 会向上找到根 .git(deploy 树
-#    根 .git 是个递归坏 worktree)→ fatal 128 → 整个 build 挂掉。跳过 install
-#    scripts 是 build env idiomatic 做法。
-if ! command -v bun >/dev/null 2>&1; then
-  echo "[build-image] FATAL: 没 bun (~/.bun/bin/bun) — 无法 prebuild claude-code-best/dist" >&2
-  exit 1
-fi
-if [ -d "$PERSONAL_SRC/claude-code-best" ]; then
-  echo "[build-image] prebuild $PERSONAL_SRC/claude-code-best/dist (bun)"
-  ( cd "$PERSONAL_SRC/claude-code-best" && bun install --silent --ignore-scripts && bun run build ) \
-    || { echo "[build-image] FATAL: ccb prebuild 失败" >&2; exit 1; }
-  if [ ! -f "$PERSONAL_SRC/claude-code-best/dist/cli.js" ]; then
-    echo "[build-image] FATAL: prebuild 完成但 dist/cli.js 不存在" >&2
+# m4:EMBED=0 = 纯工具链镜像 —— Dockerfile 走 embed-0 阶段(不 COPY personal-version),故 build
+# context **无需**个人源码,跳过 ccb prebuild(不依赖 bun)与源码 rsync,彻底解除工具链镜像↔源码/bun 耦合。
+if [ "$OC_EMBED_SOURCE_VAL" = "0" ]; then
+  echo "[build-image] OC_EMBED_SOURCE=0 → 跳过 ccb prebuild + personal-version rsync(纯工具链镜像,context 只含 Dockerfile+runtime+platform-runtime)"
+else
+  mkdir -p "$BUILD_CTX/personal-version"
+  # 0. **预构建 claude-code-best dist** (容器内只有 node,没有 bun,需 prebuild)
+  #    build.ts 走 Bun.build target=bun,后处理 import.meta.require → node 兼容
+  #    产物 node dist/cli.js 直接可跑(MACRO defines 已烤进产物)
+  #
+  #    `--ignore-scripts`:跳过 ccb 的 `prepare` (git config core.hooksPath .githooks)。
+  #    那条 hook 是给本地 dev 装的,build 完全不需要,而且 deploy-v3.sh rsync `.git/`
+  #    exclude 把 ccb 子目录 .git 也排除了,跑 prepare 会向上找到根 .git(deploy 树
+  #    根 .git 是个递归坏 worktree)→ fatal 128 → 整个 build 挂掉。跳过 install
+  #    scripts 是 build env idiomatic 做法。
+  if ! command -v bun >/dev/null 2>&1; then
+    echo "[build-image] FATAL: 没 bun (~/.bun/bin/bun) — 无法 prebuild claude-code-best/dist" >&2
     exit 1
   fi
-fi
+  if [ -d "$PERSONAL_SRC/claude-code-best" ]; then
+    echo "[build-image] prebuild $PERSONAL_SRC/claude-code-best/dist (bun)"
+    ( cd "$PERSONAL_SRC/claude-code-best" && bun install --silent --ignore-scripts && bun run build ) \
+      || { echo "[build-image] FATAL: ccb prebuild 失败" >&2; exit 1; }
+    if [ ! -f "$PERSONAL_SRC/claude-code-best/dist/cli.js" ]; then
+      echo "[build-image] FATAL: prebuild 完成但 dist/cli.js 不存在" >&2
+      exit 1
+    fi
+  fi
 
-echo "[build-image] rsync $PERSONAL_SRC → $BUILD_CTX/personal-version/"
-# --delete 让 dest 和 src 完全一致。排除清单(体积/产物 + leak hardening)已抽到单一权威文件
-# runtime-src-excludes.txt —— build-image.sh 与 deploy release 构建共用,禁内联漂移。语义(为何排
-# docs/deploy/scripts/凭据等)见该文件头。'/foo' 锚定源根,不误删 packages/*/foo 同名 child。
-rsync -a --delete \
-  --exclude-from="$SANDBOX_DIR/runtime-src-excludes.txt" \
-  "$PERSONAL_SRC/" "$BUILD_CTX/personal-version/"
+  echo "[build-image] rsync $PERSONAL_SRC → $BUILD_CTX/personal-version/"
+  # --delete 让 dest 和 src 完全一致。排除清单(体积/产物 + leak hardening)已抽到单一权威文件
+  # runtime-src-excludes.txt —— build-image.sh 与 deploy release 构建共用,禁内联漂移。语义(为何排
+  # docs/deploy/scripts/凭据等)见该文件头。'/foo' 锚定源根,不误删 packages/*/foo 同名 child。
+  rsync -a --delete \
+    --exclude-from="$SANDBOX_DIR/runtime-src-excludes.txt" \
+    "$PERSONAL_SRC/" "$BUILD_CTX/personal-version/"
+fi
 
 # 2. Dockerfile + runtime/(镜像薄壳+构建期文件) + platform-runtime/(bundle 源,dev fallback COPY)
 cp "$SANDBOX_DIR/Dockerfile.openclaude-runtime" "$BUILD_CTX/Dockerfile.openclaude-runtime"
@@ -278,18 +299,40 @@ if [ "${OC_IMAGE_GC:-1}" = "0" ]; then
 else
   KEEP_LAST="${OC_IMAGE_KEEP_LAST:-3}"
   DRY_RUN="${OC_IMAGE_GC_DRY_RUN:-0}"
-  ENV_FILE="/etc/openclaude/commercial.env"
+  # B7:ENV_FILE 优先 v5(commercial-v5.env);同时并读 v3(commercial.env)兜底 v3 遗留镜像。
+  # 两个 env 的 OC_RUNTIME_IMAGE tag + v5 env 的 emergency tuple image tag 都进保护集 —— 防
+  # image-gc 把某 env 在用/逃生所需的镜像误删。
+  ENV_FILE_V5="/etc/openclaude/commercial-v5.env"
+  ENV_FILE_V3="/etc/openclaude/commercial.env"
 
-  # 当前在用 tag(从 OC_RUNTIME_IMAGE env 提取 ":<tag>" 部分)
-  # 文件不存在 / 行不存在都返回空字符串,不让 set -e 中断
-  CURRENT_TAG=""
-  if [ -f "$ENV_FILE" ]; then
-    OC_LINE="$(grep -E '^OC_RUNTIME_IMAGE=' "$ENV_FILE" 2>/dev/null || true)"
-    if [ -n "$OC_LINE" ]; then
-      # OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:<tag>  →  <tag>
-      CURRENT_TAG="$(printf '%s' "$OC_LINE" | sed -n 's/^OC_RUNTIME_IMAGE=.*:\([^[:space:]]*\)$/\1/p')"
-    fi
-  fi
+  # 从 image ref 取 tag(最后一个冒号之后,不含路径分隔 /);无 tag → 空。
+  tag_of_ref() { printf '%s' "$1" | sed -n 's|^.*:\([^:/]*\)$|\1|p'; }
+  # 取某 env 文件 OC_RUNTIME_IMAGE 的 tag(缺文件/缺键 → 空,不触发 set -e)
+  env_runtime_tag() {
+    local f="$1" line
+    [ -f "$f" ] || return 0
+    line="$(grep -E '^OC_RUNTIME_IMAGE=' "$f" 2>/dev/null | tail -n1 || true)"
+    [ -n "$line" ] && tag_of_ref "${line#OC_RUNTIME_IMAGE=}"
+    return 0
+  }
+  # 取 v5 env 的 emergency tuple(JSON 单行 {image,image_id,bundle})image tag —— 逃生镜像常是
+  # 更老的内嵌源码 tag,极易掉出 created-desc 的 KEEP_LAST 窗口,必须显式保护。仅在存在 emergency
+  # 行时才需 jq;缺 jq 且有该行 → fail-loud(宁停 GC 也不误删逃生镜像)。jq 是既定依赖。
+  env_emergency_tag() {
+    local f="$1" line json img
+    [ -f "$f" ] || return 0
+    line="$(grep -E '^OC_RUNTIME_EMERGENCY_TUPLE=' "$f" 2>/dev/null | tail -n1 || true)"
+    [ -n "$line" ] || return 0
+    command -v jq >/dev/null 2>&1 || { echo "[build-image] FATAL: image-gc 需 jq 解析 emergency tuple 保护(防误删逃生镜像)" >&2; exit 1; }
+    json="${line#OC_RUNTIME_EMERGENCY_TUPLE=}"
+    img="$(printf '%s' "$json" | jq -r '.image // empty' 2>/dev/null || true)"
+    [ -n "$img" ] && tag_of_ref "$img"
+    return 0
+  }
+
+  # 展示用当前 tag(优先 v5,回退 v3)
+  CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V5")"
+  [ -n "$CURRENT_TAG" ] || CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V3")"
 
   # 列出本仓所有 tag,按 docker images 默认 created desc 顺序
   # --format 用 \t 分隔,docker 自身保证 created desc(最新在前)
@@ -298,7 +341,7 @@ else
   docker images "$IMAGE_REPO" --format '{{.Tag}}' > "$ALL_TAGS_FILE" 2>/dev/null || true
 
   # 构建 keep set (用 newline-separated 文本,grep -F -x -f 比较)。
-  # 选 top KEEP_LAST 个历史 tag 时:**先**过滤掉 latest / TAG / CURRENT_TAG,
+  # 选 top KEEP_LAST 个历史 tag 时:**先**过滤掉所有 PROTECT tag,
   # 否则它们会占 KEEP_LAST 槽位,实际保留的独立历史版本数 < KEEP_LAST。
   KEEP_FILE="$(mktemp)"
   trap 'rm -f "$ALL_TAGS_FILE" "$KEEP_FILE"' EXIT
@@ -307,8 +350,10 @@ else
   {
     echo "$TAG"
     echo "latest"
-    [ -n "$CURRENT_TAG" ] && echo "$CURRENT_TAG"
-  } | sort -u > "$PROTECT_FILE"
+    env_runtime_tag "$ENV_FILE_V5"
+    env_runtime_tag "$ENV_FILE_V3"
+    env_emergency_tag "$ENV_FILE_V5"
+  } | grep -v '^$' | sort -u > "$PROTECT_FILE"
   # `|| true` 兜底:全新机器首次 build 时 ALL_TAGS - PROTECT 可能为空,grep -v
   # 无匹配返回 exit 1,set -euo pipefail 下会让外层 { } 子块中断。
   {

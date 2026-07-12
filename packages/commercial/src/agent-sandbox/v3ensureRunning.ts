@@ -116,6 +116,14 @@ const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
  * reason='baseline_missing' 让前端/运维 dashboard 看见 distinct 信号。
  */
 const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
+/**
+ * V5 runtime tuple 产物级故障(PlatformBundleInvalid / RuntimeReleaseInvalid /
+ * RuntimePlacementInvalid)—— 与 CcbBaselineMissing 同为**部署级**故障(bundle/release 坏、
+ * current 激活中间态、release 误配到远端 host),不是"再试 5s 就好"的瞬态。走同等长重试避免
+ * 前端每 5s 风暴放大运维噪声;运维修好产物 / 激活 saga 收尾后 5min 内自恢复(其中 current
+ * 中间态本就是重启量级的短暂窗口,长重试上限足够覆盖且宽松)。
+ */
+const RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC = 300;
 // 已迁移到 v5:短重试;客户端应据 reason="migrated_to_v5" 重取(命中路由 cookie)导向 v5。
 const RETRY_AFTER_MIGRATED_V5_SEC = 3;
 const V5_STALE_IMAGE_IDLE_MS = 30 * 60_000;
@@ -315,6 +323,12 @@ interface DesiredRuntime {
 }
 
 function deriveDesiredRuntime(deps: V3SupervisorDeps): DesiredRuntime {
+  // M1 v3 channel stale 污染根治:runtime tuple 是 v5-only 热生效机制。**非 v5 实际 channel**
+  // (OC_RUNTIME_CHANNEL != v5,含 v3 休眠路径)一律忽略 imageId/release/bootHash,退回旧语义纯
+  // tag imageStale(computeRuntimeStale 见 desired 三字段全空 → tag 回落)。
+  // 否则:误配 tuple 时 v3 容器(无 runtime label)会被 release/boot_hash desired 判成永久 stale
+  // → 每次 ensure 都 stopAndRemove+重建,循环回收烧资源。v3 虽退役,休眠路径必须无害。
+  if (!isV5Channel()) return {};
   const t = deps.runtimeTuple;
   if (!t) return {};
   const imageId = t.imageId?.trim() || undefined;
@@ -759,6 +773,39 @@ export function makeV3EnsureRunning(
           dedupe_key: `container.provision_failed:baseline_missing:${new Date().toISOString().slice(0, 13)}`,
         });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
+      }
+      // m1 — V5 runtime tuple 产物级故障:PlatformBundleInvalid / RuntimeReleaseInvalid /
+      // RuntimePlacementInvalid 与 CcbBaselineMissing 同款处理(部署级故障 → critical 告警 +
+      // 长重试)。bundle/release 坏或 current 激活中间态,运维修好产物 / 激活 saga 收尾后自恢复。
+      if (
+        err instanceof SupervisorError &&
+        (err.code === "PlatformBundleInvalid" ||
+          err.code === "RuntimeReleaseInvalid" ||
+          err.code === "RuntimePlacementInvalid")
+      ) {
+        const reason =
+          err.code === "PlatformBundleInvalid"
+            ? "platform_bundle_invalid"
+            : err.code === "RuntimeReleaseInvalid"
+              ? "runtime_release_invalid"
+              : "runtime_placement_invalid";
+        safeEnqueueAlert({
+          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+          severity: "critical",
+          title: "容器 provision 失败 — v5 runtime 产物非法",
+          body:
+            `uid=${uid} provision 失败(${err.code}):platform bundle / runtime release / 激活布局校验未过。` +
+            `需人工修复产物(bundle/release 目录)或等激活 saga 收尾。详情:${err.message}`,
+          payload: { uid, reason, code: err.code },
+          dedupe_key: `container.provision_failed:${reason}:${new Date().toISOString().slice(0, 13)}`,
+        });
+        // eslint-disable-next-line no-console
+        console.error("[v3ensureRunning] v5 runtime artifact invalid — refusing provision", {
+          uid,
+          code: err.code,
+          errMsg: err.message,
+        });
+        throw new ContainerUnreadyError(RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason);
       }
       // v3→v5 迁移门控:该用户已迁移到 v5(migrated)或迁移进行中(migrating),v3 拒建容器。
       // 不告警、不当"provisioning"重试(那会让用户在 stale v3 路径上死循环重试);给独立

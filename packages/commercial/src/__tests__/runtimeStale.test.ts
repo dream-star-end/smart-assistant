@@ -267,10 +267,12 @@ describe("runtimeStale 判定", () => {
   const RELEASE_BASENAME = "rel-abc123def456";
   const BOOT = "boot00001111";
   const IMAGE_ID = "sha256:desiredimage";
-  // desired 三元组齐全的 tuple。
+  // desired 三元组齐全的 tuple。releaseResolvedPath 与 releasePath 同值 —— B3 门要求
+  // release 已配置(raw)则必须已解析(否则 reprovision 会被 RuntimeReleaseInvalid 无条件拦掉)。
   const fullTuple = (): V3RuntimeTuple => ({
     imageId: IMAGE_ID,
     releasePath: RELEASE_PATH,
+    releaseResolvedPath: RELEASE_PATH,
     bootHash: BOOT,
   });
   // 与 fullTuple 匹配的运行容器 label(release / boot_hash 走 label)。
@@ -421,7 +423,30 @@ describe("provision 硬门:多机 release / 瘦身镜像", () => {
       // hostId=TEST_HOST_ALT(≠ selfHostId)→ useRemote=true。
       provisionV3Container(deps, 100, TEST_HOST_ALT, "172.31.5.99", "172.31.0.0/24"),
       (err: unknown) =>
-        err instanceof SupervisorError && err.code === "InvalidArgument" && /release requires self-host/i.test(err.message),
+        err instanceof SupervisorError &&
+        err.code === "RuntimePlacementInvalid" &&
+        /release requires self-host/i.test(err.message),
+    );
+    assert.equal(pool.rows.length, 0, "gate 早于 BEGIN,无占位行");
+  });
+
+  test("B3:release 已配置(raw)但启动期未解析(releaseResolvedPath 空)→ 无条件拒(RuntimeReleaseInvalid)", async () => {
+    const pool = new FakePool();
+    // 胖镜像 —— 排除瘦身护栏干扰,专测 B3 的 configured&&!resolved 门。
+    const { docker } = makeDocker({ imageLabels: { "oc.runtime.features": "v3-sink" } });
+    const deps: V3SupervisorDeps = {
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST,
+      randomIp: () => "172.31.5.77", randomSecret: () => "a".repeat(64),
+      // releasePath 配了但 releaseResolvedPath 缺 —— 模拟 index.ts 启动期解析失败留空。
+      runtimeTuple: { releasePath: "/var/lib/openclaude-v5/runtime-releases/rel-abc123def456" },
+    };
+    // OC_PLATFORM_BUNDLE_OPTIONAL=1 对 release **无效**(release 无逃生口)→ 仍拒。
+    await assert.rejects(
+      provisionV3Container(deps, 103),
+      (err: unknown) =>
+        err instanceof SupervisorError &&
+        err.code === "RuntimeReleaseInvalid" &&
+        /not resolved at startup/i.test(err.message),
     );
     assert.equal(pool.rows.length, 0, "gate 早于 BEGIN,无占位行");
   });

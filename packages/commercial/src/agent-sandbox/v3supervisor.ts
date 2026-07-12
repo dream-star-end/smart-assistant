@@ -819,13 +819,13 @@ export interface V3RuntimeTuple {
 }
 
 /**
- * 读 env `OC_PLATFORM_BUNDLE_OPTIONAL`:只有显式 "1"/"true"/"yes" 才 true(fail-closed)。
- * 语义同 OC_V3_CCB_BASELINE_OPTIONAL:**生产禁止设置** —— 缺 bundle 时 warn+跳过挂载/label/env,
- * 容器照起(仅 dev/test/local 用)。默认(未设)→ v5 fail-closed 拒 provision。
+ * 读 env `OC_PLATFORM_BUNDLE_OPTIONAL`:**只认 "1"**(fail-closed)。
+ * m3 值域统一:config.ts schema 只收 `z.enum(["0","1"])`,本运行时函数与其对齐 —— 只有 "1"
+ * 为真,其它任何值(含 "true"/"yes"/未设)都视为 false。**生产禁止设置** —— 缺/坏 bundle 时
+ * warn+跳过挂载/env(仅 dev/test/local 用);默认(未设)→ v5 已启用 bundle 时 fail-closed 拒 provision。
  */
 export function readPlatformBundleOptionalFromEnv(): boolean {
-  const raw = process.env.OC_PLATFORM_BUNDLE_OPTIONAL?.trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes";
+  return process.env.OC_PLATFORM_BUNDLE_OPTIONAL?.trim() === "1";
 }
 
 /**
@@ -1399,6 +1399,32 @@ async function assertRuntimeSourcePresent(
   throw new SupervisorError(
     "InvalidArgument",
     `slim runtime image (${RUNTIME_EMBED_SOURCE_LABEL_KEY}=0) requires OC_RUNTIME_RELEASE; got empty (image=${image} host=${resolvedHost})`,
+  );
+}
+
+/**
+ * B3 无效 release 绕过根治:v5 channel + OC_RUNTIME_RELEASE 已配置(raw 非空)但启动期解析失败
+ * (deps.runtimeTuple.releaseResolvedPath 为空)→ 抛 RuntimeReleaseInvalid,**无条件拒 provision**。
+ *
+ * 与 bundle 的差异:release **没有** OPTIONAL 逃生口 —— 配了一个解析不出的 release 目录 = 部署级
+ * 坏产物,绝不允许静默降级(那会让容器挂到旧内嵌源码 / 空 /opt/openclaude)。非 v5 channel 或
+ * 未配置 release → no-op(默认关≠变化,B1 同源语义)。早于 BEGIN 调,失败不留半事务。
+ */
+function assertV5ReleaseResolvableOrThrow(deps: V3SupervisorDeps): void {
+  if (getRuntimeChannel() !== "v5") return;
+  const t = deps.runtimeTuple;
+  const releaseConfigured = Boolean(t?.releasePath && t.releasePath.trim() !== "");
+  if (!releaseConfigured) return; // release 未启用 → 零校验(不挂 /opt/openclaude、见 mount 段)
+  const releaseResolved = Boolean(t?.releaseResolvedPath && t.releaseResolvedPath.trim() !== "");
+  if (releaseResolved) return;
+  // eslint-disable-next-line no-console
+  console.error(
+    "[v3supervisor] OC_RUNTIME_RELEASE configured but failed startup validation; refusing provision (no OPTIONAL escape for release)",
+    { releasePath: t!.releasePath },
+  );
+  throw new SupervisorError(
+    "RuntimeReleaseInvalid",
+    `runtime release configured but not resolved at startup (release=${t!.releasePath}); check gateway boot logs`,
   );
 }
 
@@ -2072,7 +2098,7 @@ export async function provisionV3Container(
       { uid, hostId: effectiveHostUuid, selfHostId: deps.selfHostId, releasePath: deps.runtimeTuple.releasePath },
     );
     throw new SupervisorError(
-      "InvalidArgument",
+      "RuntimePlacementInvalid",
       `runtime release requires self-host placement; remote host ${effectiveHostUuid} forbidden (release=${deps.runtimeTuple.releasePath})`,
     );
   }
@@ -2089,11 +2115,20 @@ export async function provisionV3Container(
   // 半事务和 docker 副作用。模式 OC_V3_IMAGE_GUARD ∈ enforce/warn/off,缺省 enforce。
   await assertImageHasV3Sink(deps, hostId, deps.image);
 
+  // B3 无效 release 绕过根治:v5 channel 上,release **已配置(raw 非空)但启动期解析失败**
+  // (index.ts resolveRuntimeReleaseMount 抛 → releaseResolvedPath 留空)→ **无条件拒 provision**。
+  // release 无 OPTIONAL 逃生口(区别于 bundle):配了却解析不出 = 部署级坏产物,绝不能静默绕过
+  // (旧行为:mount 段 `if (releaseResolvedPath)` 静默跳过 → 容器挂到旧内嵌源码或空 /opt/openclaude)。
+  // **置于瘦身护栏之前**:让 configured&&!resolved 命中专用 RuntimeReleaseInvalid(而非被瘦身护栏
+  // 的 "requires OC_RUNTIME_RELEASE" 误导 —— release 明明配了,只是坏)。早于 BEGIN,失败不留半事务。
+  assertV5ReleaseResolvableOrThrow(deps);
+
   // 瘦身镜像护栏(plan §1.1 / §3.2):镜像 label oc.runtime.embed_source=0(未内嵌源码)
-  // 且 OC_RUNTIME_RELEASE 为空 → 拒 provision(裸奔:容器 /opt/openclaude 无源码,gateway 起不来)。
-  // 拿不到 label(inspect 失败 / label 缺失)→ 视为 embed_source=1(旧胖镜像)兼容放行。
-  // 早于 BEGIN,失败不留半事务。
-  await assertRuntimeSourcePresent(deps, hostId, deps.image, deps.runtimeTuple?.releasePath);
+  // 且**解析后的** release 为空 → 拒 provision(裸奔:容器 /opt/openclaude 无源码,gateway 起不来)。
+  // B3:只认 releaseResolvedPath 非空(raw releasePath 配了但解析失败已被上面的 B3 门拦掉,
+  // 这里传 resolved 保证"有真正可挂的源码兜底"才放行瘦身镜像)。
+  // 拿不到 label(inspect 失败 / label 缺失)→ 视为 embed_source=1(旧胖镜像)兼容放行。早于 BEGIN。
+  await assertRuntimeSourcePresent(deps, hostId, deps.image, deps.runtimeTuple?.releaseResolvedPath);
 
   // ═══ Tx1:短事务,持 per-uid + per-host 双锁,亚毫秒完成 ═══
   // BEGIN → acquireUserLifecycleLock(per-uid)→ dup 复查 → acquireHostCapLock(per-host)
@@ -2414,101 +2449,94 @@ export async function provisionV3Container(
       }
     }
 
-    // ═══ v5 runtime tuple:platform bundle + release 挂载 / 4 label / 3 注入 env(plan §1/§3.2)═══
-    //   - v5 channel:fail-closed。配了 OC_PLATFORM_BUNDLE → 挂稳定根 /run/oc/platform:ro +
-    //     assertCurrentMatches(current==bundle,防激活中间态)+ release ro 挂 /opt/openclaude +
-    //     打 4 label + 注入 3 env。缺 bundle / current 不一致 → 拒 provision(OC_PLATFORM_BUNDLE_OPTIONAL=1
-    //     才 warn+跳过,**生产禁**)。
-    //   - v3 channel:零行为变化。仅当误配 tuple 时 warn 提示忽略,不挂/不打 label/不注入 env。
-    // 昂贵的全量 bundle 校验(逐文件 sha256)已在 index.ts 启动期做过(结果灌进 deps.runtimeTuple);
-    // 这里每次 provision 只做便宜的 assertCurrentMatches(两次 realpath)。
+    // ═══ v5 runtime tuple:platform bundle + release 挂载 / runtime label / 注入 env(plan §1/§3.2)═══
+    // **B1 默认关≠零变化:bundle / release / imageId 是三条【独立轴】,各自"启用 = 配置值非空"**。
+    // 未启用的轴 = 完全走原路径(不挂对应根、不注对应 env、不打对应 label)。已启用才 fail-closed。
+    //   - bundle 轴(bundlePath 非空):挂稳定根 /run/oc/platform:ro + assertCurrentMatches(防激活中间态)
+    //     + 注入 4 平台 env(含 M2 的 OC_PLATFORM_BUNDLE_REV)+ 打 bundle_rev/boot_hash label。
+    //     启动期解析失败 → PlatformBundleInvalid(OC_PLATFORM_BUNDLE_OPTIONAL=1 才 warn+跳过挂载,生产禁)。
+    //   - release 轴(releasePath 非空):ro 挂 /opt/openclaude + 打 release label。configured&&!resolved
+    //     已被上方 assertV5ReleaseResolvableOrThrow 无条件拦掉(无 OPTIONAL 逃生口),到此必已 resolved。
+    //   - imageId 轴(imageId 非空):打 image_id label(审计;runtimeStale 走 docker inspect 的 Image ID)。
+    //   - v3 channel:零行为变化。误配 tuple 仅 warn 提示忽略,不挂/不打 label/不注入 env。
+    // 昂贵的全量 bundle 校验(逐文件 sha256)已在 index.ts 启动期做过(灌进 deps.runtimeTuple);
+    // provision 每次只做便宜的 assertCurrentMatches(readlink + realpath)。
     const platformBinds: string[] = [];
-    let runtimeLabels: Record<string, string> = {};
+    const runtimeLabels: Record<string, string> = {};
     let injectPlatformEnv = false;
+    let injectedBundleRev = "";
     {
       const tuple = deps.runtimeTuple;
-      if (getRuntimeChannel() === "v5") {
+      if (getRuntimeChannel() === "v5" && tuple) {
+        const bundleEnabled = Boolean(tuple.bundlePath && tuple.bundlePath.trim() !== "");
+        const releaseEnabled = Boolean(tuple.releasePath && tuple.releasePath.trim() !== "");
         const bundleOptional = readPlatformBundleOptionalFromEnv();
-        // 判定"配置是否就绪":bundlePath 给了 + 启动期解析成功(bundleRev/bootHash/resolved 齐)。
-        const bundleReady = Boolean(
-          tuple?.bundlePath && tuple.bundleResolvedPath && tuple.bundleRev && tuple.bootHash,
-        );
-        if (!tuple?.bundlePath) {
-          if (bundleOptional) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              "[v3supervisor] OC_PLATFORM_BUNDLE unset (OPTIONAL=1); v5 container spawns WITHOUT platform bundle (no hot config)",
-              { uid },
-            );
-          } else {
-            // eslint-disable-next-line no-console
-            console.error(
-              "[v3supervisor] OC_PLATFORM_BUNDLE unset on v5 channel; refusing provision (set OC_PLATFORM_BUNDLE_OPTIONAL=1 to override in dev)",
-              { uid },
-            );
-            throw new SupervisorError(
-              "InvalidArgument",
-              "v5 channel requires OC_PLATFORM_BUNDLE (platform bundle) to be configured",
-            );
-          }
-        } else if (!bundleReady) {
-          // bundlePath 配了但启动期解析失败(index.ts resolvePlatformBundleMount 抛)→ deps 里缺
-          // bundleRev/bootHash。fail-closed(OPTIONAL 才降级)。
-          if (bundleOptional) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation (OPTIONAL=1); skipping platform bundle mount",
-              { uid, bundlePath: tuple.bundlePath },
-            );
-          } else {
-            // eslint-disable-next-line no-console
-            console.error(
-              "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation; refusing provision",
-              { uid, bundlePath: tuple.bundlePath },
-            );
-            throw new SupervisorError(
-              "InvalidArgument",
-              `platform bundle not resolved at startup (bundlePath=${tuple.bundlePath}); check gateway boot logs`,
-            );
-          }
-        } else {
-          // bundle 就绪:current 对照 + 组装挂载/label/env。
-          const platformRoot = tuple.platformRoot ?? DEFAULT_PLATFORM_ROOT;
-          try {
-            // 激活中间态守卫(便宜):current symlink realpath 必须 == 声明 bundle。
-            assertCurrentMatches(platformRoot, tuple.bundlePath!);
-            const platformRootReal = realpathSync(platformRoot);
-            // 挂稳定根(不挂 current);容器经 /run/oc/platform/current/... 访问,翻转原子生效。
-            platformBinds.push(`${platformRootReal}:${PLATFORM_MOUNT_TARGET}:ro`);
-            // release ro 挂 /opt/openclaude(bind resolved realpath,绝不挂 symlink;多机已被上方硬门拒)。
-            if (tuple.releaseResolvedPath) {
-              platformBinds.push(`${tuple.releaseResolvedPath}:${RELEASE_MOUNT_TARGET}:ro`);
-            }
-            injectPlatformEnv = true;
-          } catch (e) {
-            // assertCurrentMatches 失败 = 激活中间态(短暂窗口)。OPTIONAL 才降级,否则拒(前端 retry 兜底)。
+
+        // imageId 轴:配了才打 image_id label(独立于 bundle/release;未配 → 不打,零变化)。
+        if (tuple.imageId && tuple.imageId.trim() !== "") {
+          runtimeLabels[RUNTIME_IMAGE_ID_LABEL_KEY] = tuple.imageId;
+        }
+
+        // ── bundle 轴 ── 未启用 = 完全跳过(不挂平台根/不注 4 env/不打 bundle_rev+boot_hash label)。
+        if (bundleEnabled) {
+          const bundleReady = Boolean(tuple.bundleResolvedPath && tuple.bundleRev && tuple.bootHash);
+          if (!bundleReady) {
+            // 配了但启动期解析失败(index.ts resolvePlatformBundleMount 抛)→ fail-closed(OPTIONAL 才降级)。
             if (bundleOptional) {
               // eslint-disable-next-line no-console
               console.warn(
-                "[v3supervisor] platform current mid-state (OPTIONAL=1); skipping platform bundle mount",
-                { uid, error: (e as Error).message },
+                "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation (OPTIONAL=1); skipping platform bundle mount",
+                { uid, bundlePath: tuple.bundlePath },
               );
             } else {
-              throw e instanceof SupervisorError
-                ? e
-                : new SupervisorError("InvalidArgument", `platform activation mid-state: ${(e as Error).message}`);
+              // eslint-disable-next-line no-console
+              console.error(
+                "[v3supervisor] OC_PLATFORM_BUNDLE failed startup validation; refusing provision",
+                { uid, bundlePath: tuple.bundlePath },
+              );
+              throw new SupervisorError(
+                "PlatformBundleInvalid",
+                `platform bundle not resolved at startup (bundlePath=${tuple.bundlePath}); check gateway boot logs`,
+              );
+            }
+          } else {
+            // bundle 就绪:current 对照(便宜)+ 组装稳定根挂载 + 标记注入 env。
+            const platformRoot = tuple.platformRoot ?? DEFAULT_PLATFORM_ROOT;
+            try {
+              // 激活中间态守卫:current symlink 原始目标须 bundles/<rev> 且 realpath == 声明 bundle。
+              assertCurrentMatches(platformRoot, tuple.bundlePath!);
+              const platformRootReal = realpathSync(platformRoot);
+              // 挂稳定根(不挂 current);容器经 /run/oc/platform/current/... 访问,翻转原子生效。
+              platformBinds.push(`${platformRootReal}:${PLATFORM_MOUNT_TARGET}:ro`);
+              injectPlatformEnv = true;
+              injectedBundleRev = tuple.bundleRev!;
+            } catch (e) {
+              // 激活中间态(短暂窗口)。OPTIONAL 才降级跳过,否则拒(前端 retry 兜底)。
+              if (bundleOptional) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  "[v3supervisor] platform current mid-state (OPTIONAL=1); skipping platform bundle mount",
+                  { uid, error: (e as Error).message },
+                );
+              } else {
+                throw e instanceof SupervisorError
+                  ? e
+                  : new SupervisorError("RuntimePlacementInvalid", `platform activation mid-state: ${(e as Error).message}`);
+              }
             }
           }
+          // bundle_rev/boot_hash label:bundle 轴启用即打(即使 OPTIONAL 降级未挂,label 供 runtimeStale
+          // converge;两端 desired 同源见 v3ensureRunning)。未启用则完全不打(B1)。
+          runtimeLabels[RUNTIME_BUNDLE_REV_LABEL_KEY] = tuple.bundleRev ?? "";
+          runtimeLabels[RUNTIME_BOOT_HASH_LABEL_KEY] = tuple.bootHash ?? "";
         }
-        // 4 个 channel-neutral runtime label:值来自 deps(缺省 "")。即使 bundle 未挂(OPTIONAL 降级)
-        // 也打 label —— image_id 恒来自 tuple,release/bundle_rev/boot_hash 走 tuple 解析值或 ""。
-        // runtimeStale 侧 desired 三元组同源(见 v3ensureRunning),两端一致。
-        runtimeLabels = {
-          [RUNTIME_IMAGE_ID_LABEL_KEY]: tuple?.imageId ?? "",
-          [RUNTIME_RELEASE_LABEL_KEY]: tuple?.releasePath ? pathBasename(tuple.releasePath) : "",
-          [RUNTIME_BUNDLE_REV_LABEL_KEY]: tuple?.bundleRev ?? "",
-          [RUNTIME_BOOT_HASH_LABEL_KEY]: tuple?.bootHash ?? "",
-        };
+
+        // ── release 轴 ── 未启用 = 完全跳过(不挂 /opt/openclaude、不打 release label)。
+        if (releaseEnabled) {
+          // configured&&!resolved 已被 assertV5ReleaseResolvableOrThrow 无条件拦掉,到此必 resolved。
+          platformBinds.push(`${tuple.releaseResolvedPath}:${RELEASE_MOUNT_TARGET}:ro`);
+          runtimeLabels[RUNTIME_RELEASE_LABEL_KEY] = pathBasename(tuple.releasePath!);
+        }
       } else if (tuple?.bundlePath || tuple?.releasePath) {
         // v3 channel:零行为变化。误配 tuple 仅提示忽略(不挂/不打 label/不注入 env)。
         // eslint-disable-next-line no-console
@@ -2518,12 +2546,15 @@ export async function provisionV3Container(
         );
       }
     }
-    // 3 个平台注入 env(仅 v5 + bundle 挂载生效时)。走 current symlink → 翻转对存量容器原子生效。
+    // 平台注入 env(仅 bundle 轴启用且挂载生效时)。走 current symlink → 翻转对存量容器原子生效。
+    // M2:另注 OC_PLATFORM_BUNDLE_REV=<bundleRev>,让 entrypoint.sh 优先按 rev 直拼
+    // /run/oc/platform/bundles/<rev>/... 读 boot 内容,消 check-then-create 后 current 翻转的 TOCTOU。
     if (injectPlatformEnv) {
       env.push(
         `OPENCLAUDE_PLATFORM_PROMPTS_DIR=${OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE}`,
         `OPENCLAUDE_DEFAULT_WORKSPACE=${OPENCLAUDE_DEFAULT_WORKSPACE_VALUE}`,
         `OPENCLAUDE_WEB_CONTEXT_BIN=${OPENCLAUDE_WEB_CONTEXT_BIN_VALUE}`,
+        `OC_PLATFORM_BUNDLE_REV=${injectedBundleRev}`,
       );
     }
 

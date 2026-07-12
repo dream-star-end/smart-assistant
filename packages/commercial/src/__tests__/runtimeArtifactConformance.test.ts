@@ -10,7 +10,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   resolvePlatformBundleMount,
   assertCurrentMatches,
+  manifestDigestOf,
 } from "../agent-sandbox/platformBundle.js";
 
 const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
@@ -47,6 +48,8 @@ function buildFixtureStaging(stagingDir: string): void {
   write(pathJoin(stagingDir, "bin/oc-py.py"), "#!/usr/bin/env python3\nprint('py')\n");
   write(pathJoin(stagingDir, "bin/mmx"), '#!/bin/sh\nexec "$(dirname "$0")/oc-demo" "$@"\n');
   write(pathJoin(stagingDir, "entrypoint/entrypoint.ts"), "export const boot = true;\n");
+  // M8 必需叶子:entrypoint/platformBundle.ts(与 PLATFORM_BUNDLE_REQUIRED_LEAVES 对齐)。
+  write(pathJoin(stagingDir, "entrypoint/platformBundle.ts"), "export const bundle = true;\n");
   write(pathJoin(stagingDir, "etc-codex/managed_config.toml"), "check_for_update_on_startup = false\n");
   write(pathJoin(stagingDir, "codex-skills/document-writing/SKILL.md"), "# document-writing\n");
   write(pathJoin(stagingDir, "seed/platform-seed.yaml"), "schemaVersion: 1\nagents: []\n");
@@ -90,7 +93,9 @@ describe(
         const bundleDir = pathJoin(platformRoot, "bundles", rev);
 
         // TS 侧:全量结构校验 + digest/bootHash 重算必须与 bash MANIFEST 一致。
-        const resolved = resolvePlatformBundleMount(bundleDir, { ancestorRoot: work });
+        // 传 platformRoot 一并会师 B5.2 containment(bash 产物落 <platformRoot>/bundles/<rev>)+ M8
+        // 必需叶子(bash selfcheck 与 TS PLATFORM_BUNDLE_REQUIRED_LEAVES 同清单,任一侧漂移先在此红)。
+        const resolved = resolvePlatformBundleMount(bundleDir, { ancestorRoot: work, platformRoot });
         assert.equal(resolved.bundleRev, rev, "TS 重算 digest 必须等于 bash 定名");
 
         const manifest = JSON.parse(readFileSync(pathJoin(bundleDir, "MANIFEST.json"), "utf8"));
@@ -108,7 +113,52 @@ describe(
         }
 
         // current 断言(supervisor provision 每次跑的便宜检查)与 bash flip 会师。
+        // bash flip_current 产 `ln -s "bundles/$rev"`,与 assertCurrentMatches 的 bundles/<12hex>
+        // 相对链契约(B5.3)逐字节一致。
         assertCurrentMatches(platformRoot, bundleDir);
+      } finally {
+        rmSync(work, { recursive: true, force: true });
+      }
+    });
+
+    // release MANIFEST symlink 行跨实现会师(M6a):bash file_rows 产 `link:<target>`/size=0/
+    // mode=777 行进 digest;TS manifestDigestOf 对同一 files 表重算必须等于 bash 声明的
+    // digest —— node_modules/.bin 全是 symlink,这条编码漂移 = release 完整性守卫失效。
+    test("release symlink `link:` 行:bash MANIFEST digest == TS 重算", () => {
+      const work = mkdtempSync(pathJoin(tmpdir(), "oc-conform-rel-"));
+      chmodSync(work, 0o755);
+      try {
+        const tree = pathJoin(work, "tree");
+        mkdirSync(pathJoin(tree, "node_modules", ".bin"), { recursive: true });
+        write(pathJoin(tree, "package.json"), '{"name":"x"}\n');
+        write(pathJoin(tree, "node_modules", "tool.js"), "#!/usr/bin/env node\n", 0o755);
+        symlinkSync("../tool.js", pathJoin(tree, "node_modules", ".bin", "tool"));
+
+        const manifestJson = execFileSync(
+          "bash",
+          [
+            "-c",
+            `set -euo pipefail
+             source ${JSON.stringify(LIB)}
+             oc_hotcfg_build_manifest ${JSON.stringify(tree)} 1 conformlinkbeef >/dev/null
+             cat ${JSON.stringify(pathJoin(tree, "MANIFEST.json"))}`,
+          ],
+          { encoding: "utf8" },
+        );
+        const manifest = JSON.parse(manifestJson) as {
+          digest: string;
+          files: Array<{ path: string; sha256: string; size: number; mode: string }>;
+        };
+        const linkRow = manifest.files.find((f) => f.path === "node_modules/.bin/tool");
+        assert.ok(linkRow, "bash MANIFEST 必须收录 symlink 行");
+        assert.equal(linkRow.sha256, "link:../tool.js", "sha256 字段=字面 link:<target>");
+        assert.equal(linkRow.size, 0);
+        assert.equal(linkRow.mode, "777");
+        assert.equal(
+          manifestDigestOf(manifest.files as never),
+          manifest.digest,
+          "TS manifestDigestOf 重算必须等于 bash 声明 digest(含 link: 行)",
+        );
       } finally {
         rmSync(work, { recursive: true, force: true });
       }
