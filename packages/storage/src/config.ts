@@ -423,6 +423,14 @@ export const RUN_AS_USER_ALLOWLIST = {
 
 export type RunAsUserName = keyof typeof RUN_AS_USER_ALLOWLIST
 
+/**
+ * The SINGLE agent id permitted to carry a `runAsUser` privilege-drop identity —
+ * the self-heal repair operator. Any other agent with `runAsUser` fails config
+ * load (Codex HIGH #6). This is the single authority for the id; the gateway's
+ * execution ledger re-exports it so both sides agree.
+ */
+export const SELFHEAL_AGENT_ID = 'codex-v5ops'
+
 /** Type guard: is `v` a whitelisted run-as identity? */
 export function isAllowedRunAsUser(v: unknown): v is RunAsUserName {
   return typeof v === 'string' && Object.prototype.hasOwnProperty.call(RUN_AS_USER_ALLOWLIST, v)
@@ -434,13 +442,33 @@ export function isAllowedRunAsUser(v: unknown): v is RunAsUserName {
  * This runs on EVERY agent, so a stray/hostile `runAsUser` on a normal agent is
  * rejected before it can ever be spawned.
  */
-export function assertValidRunAsUser(agent: Pick<AgentDef, 'id' | 'runAsUser'>): void {
+export function assertValidRunAsUser(
+  agent: Pick<AgentDef, 'id' | 'runAsUser' | 'provider' | 'runnerKind'>,
+): void {
   const v = agent.runAsUser as unknown
   if (v === undefined || v === null) return
   if (!isAllowedRunAsUser(v)) {
     throw new Error(
       `agent "${agent.id}": runAsUser=${JSON.stringify(v)} is not permitted; ` +
         `only [${Object.keys(RUN_AS_USER_ALLOWLIST).join(', ')}] may be used`,
+    )
+  }
+  // Bind the drop identity to the designated self-heal agent + the only runner
+  // that actually performs the uid/gid drop (Codex HIGH #6/#7). A stray
+  // runAsUser on any other agent — or on a runner that would silently bypass the
+  // drop and launch codex as root — fails config load.
+  if (agent.id !== SELFHEAL_AGENT_ID) {
+    throw new Error(
+      `agent "${agent.id}": runAsUser is permitted only on the self-heal agent "${SELFHEAL_AGENT_ID}"`,
+    )
+  }
+  if (agent.provider !== 'codex-native') {
+    throw new Error(`agent "${agent.id}": runAsUser requires provider=codex-native`)
+  }
+  if (agent.runnerKind !== 'app-server') {
+    throw new Error(
+      `agent "${agent.id}": runAsUser requires runnerKind=app-server ` +
+        `(the only runner that performs the OS privilege drop)`,
     )
   }
 }

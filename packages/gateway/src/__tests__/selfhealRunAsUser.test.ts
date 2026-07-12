@@ -51,9 +51,16 @@ function makeFakeConfig(): OpenClaudeConfig {
 }
 
 describe('runAsUser allowlist (config.ts)', () => {
-  it('accepts the whitelisted identity', () => {
+  const selfhealAgent = {
+    id: 'codex-v5ops',
+    runAsUser: 'ocheal',
+    provider: 'codex-native',
+    runnerKind: 'app-server',
+  }
+
+  it('accepts runAsUser only on the designated self-heal agent + app-server', () => {
     assert.equal(isAllowedRunAsUser('ocheal'), true)
-    assert.doesNotThrow(() => assertValidRunAsUser({ id: 'a', runAsUser: 'ocheal' } as any))
+    assert.doesNotThrow(() => assertValidRunAsUser(selfhealAgent as any))
   })
 
   it('rejects any non-whitelisted value at config load', () => {
@@ -70,6 +77,27 @@ describe('runAsUser allowlist (config.ts)', () => {
           default: 'x',
         } as any),
       /not permitted/,
+    )
+  })
+
+  it('rejects runAsUser on a non-self-heal agent (Codex HIGH #6)', () => {
+    assert.throws(
+      () => assertValidRunAsUser({ ...selfhealAgent, id: 'main' } as any),
+      /only on the self-heal agent/,
+    )
+  })
+
+  it('rejects runAsUser with the wrong provider', () => {
+    assert.throws(
+      () => assertValidRunAsUser({ ...selfhealAgent, provider: 'anthropic' } as any),
+      /provider=codex-native/,
+    )
+  })
+
+  it('rejects runAsUser on a non-app-server runner (Codex HIGH #7)', () => {
+    assert.throws(
+      () => assertValidRunAsUser({ ...selfhealAgent, runnerKind: 'exec' } as any),
+      /runnerKind=app-server/,
     )
   })
 
@@ -161,15 +189,23 @@ describe('CodexAppServerRunner spawn privilege drop', () => {
     await runner.shutdown().catch(() => {})
   }
 
-  it('adds uid/gid + sane HOME and scrubs OC_SELFHEAL_* when runAsUser=ocheal', async () => {
+  it('wraps codex in setpriv (uid/gid drop + cleared groups) + sane HOME + scrubs OC_SELFHEAL_* when runAsUser=ocheal', async () => {
     process.env.OC_SELFHEAL_OCHEAL_UID = '997'
     process.env.OC_SELFHEAL_OCHEAL_GID = '998'
     process.env.OC_SELFHEAL_VERIFY_HMAC = 'super-secret-signing-key-value'
     await spawnOnce('ocheal')
     assert.equal(captured.length, 1, 'spawn must fire once')
-    const { opts } = captured[0]!
-    assert.equal(opts.uid, 997, 'spawn must drop to ocheal uid')
-    assert.equal(opts.gid, 998, 'spawn must drop to ocheal gid')
+    const { cmd, args, opts } = captured[0]!
+    // setpriv performs the drop AND clears supplementary groups (Node can't —
+    // Codex HIGH #8). A plain uid/gid drop would inherit root's docker/root group.
+    assert.equal(cmd, 'setpriv', 'privilege-drop agent must launch via setpriv')
+    assert.ok(args.includes('--clear-groups'), 'supplementary groups must be cleared')
+    assert.equal(args[args.indexOf('--reuid') + 1], '997', 'setpriv must drop to ocheal uid')
+    assert.equal(args[args.indexOf('--regid') + 1], '998', 'setpriv must drop to ocheal gid')
+    assert.equal(args[args.indexOf('--') + 1], 'codex', 'codex must be the wrapped command after --')
+    // Node uid/gid options must NOT also be set (setpriv performs the drop).
+    assert.equal(opts.uid, undefined)
+    assert.equal(opts.gid, undefined)
     assert.equal(opts.env.HOME, '/home/ocheal', 'dropped proc must not inherit root HOME')
     assert.equal(opts.env.USER, 'ocheal')
     // Self-heal secrets must NOT leak into the codex subprocess env.
@@ -177,12 +213,13 @@ describe('CodexAppServerRunner spawn privilege drop', () => {
     assert.deepEqual(leaked, [], `OC_SELFHEAL_* must be scrubbed; leaked: ${leaked.join(',')}`)
   })
 
-  it('does NOT add uid/gid for a normal agent (zero regression)', async () => {
+  it('launches codex directly (no setpriv, no uid/gid) for a normal agent (zero regression)', async () => {
     process.env.OC_SELFHEAL_OCHEAL_UID = '997'
     process.env.OC_SELFHEAL_OCHEAL_GID = '998'
     await spawnOnce(undefined)
     assert.equal(captured.length, 1)
-    const { opts } = captured[0]!
+    const { cmd, opts } = captured[0]!
+    assert.equal(cmd, 'codex', 'normal agent must launch codex directly')
     assert.equal(opts.uid, undefined, 'normal agent must not be privilege-dropped')
     assert.equal(opts.gid, undefined)
   })

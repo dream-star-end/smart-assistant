@@ -11,10 +11,13 @@
 // @openclaude/storage/selfhealStore (enqueueExecution / claimQueuedTurn / …);
 // this module deliberately holds no SQL.
 
+import { SELFHEAL_AGENT_ID } from '@openclaude/storage'
 import type { SessionStreamEvent } from '../sessionManager.js'
 
-/** Agent id the jobWorker runs repairs under (defined by block C in agents.yaml). */
-export const SELFHEAL_AGENT_ID = 'codex-v5ops'
+/** Agent id the jobWorker runs repairs under. Single authority lives in
+ *  @openclaude/storage/config (also the runAsUser binding); re-exported here so
+ *  existing gateway import sites are unchanged. */
+export { SELFHEAL_AGENT_ID }
 
 /**
  * Deterministic session key for a repair. Stable across process restarts so a

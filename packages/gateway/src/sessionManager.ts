@@ -748,6 +748,16 @@ export class SessionManager {
       // `-c` overrides. Without these the codex agent would launch "naked"
       // with no awareness of OpenClaude's slot pipeline (SOUL/USER/SKILLS/
       // MEMORY/AGENTS/TOOLS/RESEARCH).
+      // Fail-CLOSED (Codex HIGH #7): only the app-server runner performs the
+      // uid/gid privilege drop. If a runAsUser agent were routed to any other
+      // runner (legacy `codex exec` / CCB), codex would launch as the root
+      // gateway user — silently defeating the self-heal OS boundary. Refuse.
+      if (opts.agent.runAsUser && opts.agent.runnerKind !== 'app-server') {
+        throw new Error(
+          `agent "${opts.agent.id}": runAsUser requires runnerKind=app-server ` +
+            `(got ${JSON.stringify(opts.agent.runnerKind ?? 'exec')}); refusing to spawn un-dropped`,
+        )
+      }
       if (opts.agent.runnerKind === 'app-server') {
         runner = new CodexAppServerRunner({
           sessionKey: opts.sessionKey,

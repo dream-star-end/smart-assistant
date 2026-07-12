@@ -911,11 +911,34 @@ export class CodexAppServerRunner extends EventEmitter {
         gid: ids.gid,
       })
     }
-    const proc = _spawnFn('codex', args, {
+    // Build the launch command. For a privilege-drop agent we wrap codex in
+    // `setpriv` rather than using Node's uid/gid spawn options, because Node
+    // CANNOT clear supplementary groups (Codex HIGH #8): a plain uid/gid drop
+    // would let the dropped codex inherit the root gateway's docker/root group
+    // membership and reach group-readable secrets or the docker socket. setpriv
+    // sets reuid/regid AND clears ALL supplementary groups in one exec-replace,
+    // so codex keeps exactly its primary gid (ocheal's — the minimum needed to
+    // reach the broker socket) and nothing else. setpriv must start as root, so
+    // we do NOT also set Node's uid/gid.
+    let spawnCmd = 'codex'
+    let spawnArgs = args
+    if (privilegeDrop) {
+      spawnCmd = 'setpriv'
+      spawnArgs = [
+        '--reuid',
+        String(privilegeDrop.uid),
+        '--regid',
+        String(privilegeDrop.gid),
+        '--clear-groups',
+        '--',
+        'codex',
+        ...args,
+      ]
+    }
+    const proc = _spawnFn(spawnCmd, spawnArgs, {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: spawnEnv,
-      ...(privilegeDrop ? { uid: privilegeDrop.uid, gid: privilegeDrop.gid } : {}),
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     proc.stdout.on('data', (chunk: Buffer) => {
