@@ -1131,6 +1131,18 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
 
     await assertPgTablesExist(sourceClient);
 
+    // 前置校验(Codex R4 非阻断备注采纳):PG 不可达路径的 generation 栅栏基准来自 dump 状态行,
+    // 提前到任何 SQLite 改动之前校验——失败路径完全不动 SQLite(连 .bak 都不产生)。
+    if (!pgReachable) {
+      const srcStateEarly = await readState(sourceClient);
+      if (!srcStateEarly || srcStateEarly.authority !== "pg_authoritative") {
+        throw new Error(
+          `dump 状态行缺失或非 pg_authoritative(${srcStateEarly ? srcStateEarly.authority : "无行"}):无法确定 generation 栅栏基准,` +
+            "拒绝反灌(SQLite 未改动)。请人工核查 dump 与主 PG 后重跑。",
+        );
+      }
+    }
+
     // 源现状展示 + 目标 realpath,非 --yes 要求确认(备份/覆盖前对账)。
     console.log(
       `── 反灌数据源现状(${args.fromDump ? `pg_dump 临时库 ${tempDbName}` : "当前 PG(DATABASE_URL)"},将全量覆盖 SQLite)──`,
