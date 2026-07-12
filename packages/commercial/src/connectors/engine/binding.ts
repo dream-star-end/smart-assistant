@@ -22,11 +22,31 @@ import type { Pool, PoolClient } from 'pg'
 import { decryptToBuffer, encrypt } from '../../crypto/aead.js'
 import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { getPool } from '../../db/index.js'
-import { tx } from '../../db/queries.js'
+import { type QueryRunner, tx } from '../../db/queries.js'
 import { ConnectorError } from '../errors.js'
 import type { ExecContractT } from '../spec/types.js'
 import { connectionAad } from '../store.js'
 import { type DeclarativeSecretBag, storedBagSources, validateSecretBag } from './credentialBag.js'
+
+/**
+ * 连接 meta 里 access_token 的**过期时刻**(ISO-8601 字符串)。
+ *
+ * 为什么放 meta 而不是加密袋:它**不是机密**(知道"某 token 何时过期"毫无攻击价值),而放进袋里
+ * 意味着每次判断是否需要续期都得先解密 —— 且袋的形状权威(storedBagSources)是**凭据 source 枚举**,
+ * 塞一个时间戳进去会破坏"袋里每个键都是一个可注入凭据"的不变量。
+ *
+ * **缺这个键 = 视作永不过期**(GitHub 这类不下发 expires_in、access_token 长期有效的 provider)——
+ * 这是有意的语义:绝不能因为"没有过期时间"就每次都去 refresh(那类 provider 连 refresh_token 都没有)。
+ */
+export const META_TOKEN_EXPIRES_AT = 'token_expires_at'
+
+/** 从连接 meta 读 access_token 过期时刻;缺失/非法 → null(= 永不过期,见 META_TOKEN_EXPIRES_AT)。 */
+export function readTokenExpiresAt(meta: Record<string, unknown> | null | undefined): Date | null {
+  const raw = meta?.[META_TOKEN_EXPIRES_AT]
+  if (typeof raw !== 'string' || raw.length === 0) return null
+  const t = Date.parse(raw)
+  return Number.isFinite(t) ? new Date(t) : null
+}
 
 /** 声明式连接行(读取执行/撤销所需列)。 */
 export interface DeclarativeConnectionRow {
@@ -192,6 +212,83 @@ export async function getDeclarativeConnection(
     [id, userId],
   )
   return r.rows[0] ?? null
+}
+
+/**
+ * **行锁**读取一条活跃声明式连接(`SELECT … FOR UPDATE`;必须在事务 client 上调用)。
+ *
+ * 唯一用途 = oauth2 token 续期的临界区(tokenEngine):同一连接的并发请求在这里排队,保证
+ * "重查过期 → refresh → 写新袋" 三步是**原子**的。锁在行上,不同连接互不阻塞;锁随事务
+ * COMMIT/ROLLBACK 释放。
+ */
+export async function lockDeclarativeConnectionForUpdate(
+  id: string,
+  userId: number,
+  client: PoolClient,
+): Promise<DeclarativeConnectionRow | null> {
+  const r = await client.query<DeclarativeConnectionRow>(
+    `SELECT ${DECL_COLS} FROM connections
+      WHERE id = $1::bigint AND user_id = $2 AND revoked_at IS NULL
+        AND status = 'active' AND connector_version_id IS NOT NULL
+      FOR UPDATE`,
+    [id, userId],
+  )
+  return r.rows[0] ?? null
+}
+
+export interface UpdateDeclarativeConnectionSecretInput {
+  connectionId: string
+  userId: number
+  /** **完整**新袋(落库形状;调用方负责按 storedBagSources 组齐)。 */
+  bag: DeclarativeSecretBag
+  /** 新 access_token 的过期时刻;不给 = 不动 meta 里的既有值。 */
+  tokenExpiresAt?: Date
+}
+
+/**
+ * 就地更新连接的凭据袋(oauth2 refresh 轮换的唯一写入口)。收 `QueryRunner` → 可以是事务 client
+ * (tokenEngine 在行锁事务内调用)也可以是 Pool。
+ *
+ * 三条关键决策:
+ *   ① **AAD 不变**:复用行上既有的 `aad_seed`(+ user_id + provider),即 connectionAad 公式原样 ——
+ *      同一条连接自始至终同一个 AAD。换 seed 只在"新一代连接"(insertDeclarativeConnection)时做;
+ *      refresh 只是同一凭据的续期,不是新绑定。nonce 由 encrypt 每次新生成,不存在 nonce 复用问题。
+ *   ② **meta 增量合并**(`meta || jsonb_build_object`)而非整块覆盖 —— 整块覆盖会把 bind 期写进去的
+ *      account_hint 等字段抹掉。
+ *   ③ **不 bump revision**:revision 是"凭据主体代数"(账本 pin + beginExecute 复核 REVISION_MISMATCH),
+ *      语义是"用户换了账号/重新绑定"。token 续期是同一账号同一授权的延续,若在这里 bump,一条正在
+ *      等用户确认的 write 提案会因为后台自动续期而失效 —— 那是纯粹的用户体验倒退。
+ */
+export async function updateDeclarativeConnectionSecret(
+  input: UpdateDeclarativeConnectionSecretInput,
+  runner: QueryRunner,
+): Promise<void> {
+  // aad_seed / provider 是 AAD 公式的输入,必须取行上的真值(不接受调用方自带,防传错)。
+  const cur = await runner.query<{ aad_seed: string; provider: string }>(
+    `SELECT aad_seed::text AS aad_seed, provider FROM connections
+      WHERE id = $1::bigint AND user_id = $2 AND revoked_at IS NULL`,
+    [input.connectionId, input.userId],
+  )
+  const row = cur.rows[0]
+  if (!row) throw new ConnectorError('CONNECTION_REVOKED', 'connection not active')
+
+  const enc = encryptBag(input.bag, input.userId, row.provider, row.aad_seed)
+  // 空 patch = jsonb 合并的恒等元(不给 tokenExpiresAt 时 meta 原封不动)。
+  const metaPatch =
+    input.tokenExpiresAt === undefined
+      ? '{}'
+      : JSON.stringify({ [META_TOKEN_EXPIRES_AT]: input.tokenExpiresAt.toISOString() })
+
+  const r = await runner.query(
+    `UPDATE connections
+        SET secret_enc = $3, secret_nonce = $4,
+            meta = COALESCE(meta, '{}'::jsonb) || $5::jsonb,
+            updated_at = now()
+      WHERE id = $1::bigint AND user_id = $2 AND revoked_at IS NULL`,
+    [input.connectionId, input.userId, enc.ciphertext, enc.nonce, metaPatch],
+  )
+  if ((r.rowCount ?? 0) === 0)
+    throw new ConnectorError('CONNECTION_REVOKED', 'connection not active')
 }
 
 /**

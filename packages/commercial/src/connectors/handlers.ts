@@ -744,11 +744,16 @@ async function completeDeclarativeOauth(
             client_secret: clientSecret,
             ...(tokens.refreshToken ? { refresh_token: tokens.refreshToken } : {}),
           }
+    // access_token 过期时刻 → 连接 meta(非机密,不进袋)。执行期据此自动 refresh 轮换。
+    // 上游**没给** expires_in → 不写 → 视作永不过期(GitHub 情形:token 长期有效、也没 refresh_token)。
     const bound = await bindWithBag(
       {
         userId: input.userId,
         meta,
         bag,
+        ...(tokens.expiresInSec !== undefined
+          ? { tokenExpiresAt: new Date(Date.now() + tokens.expiresInSec * 1000) }
+          : {}),
         displayName: draft.displayName,
         ...(input.deps.connectorEngineDeps ? { deps: input.deps.connectorEngineDeps } : {}),
       },

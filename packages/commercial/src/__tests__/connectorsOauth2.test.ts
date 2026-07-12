@@ -28,7 +28,7 @@ import {
   validateSecretBag,
 } from '../connectors/engine/credentialBag.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
-import { buildAuthorizeUrl, exchangeAuthCode } from '../connectors/engine/oauth2.js'
+import { buildAuthorizeUrl, exchangeAuthCode, refreshOauth2Token } from '../connectors/engine/oauth2.js'
 import type { ResolvedCredentials } from '../connectors/engine/placement.js'
 import { resolveApiCredentials } from '../connectors/engine/tokenEngine.js'
 import { ConnectorError } from '../connectors/errors.js'
@@ -523,6 +523,323 @@ describe('exchangeAuthCode', () => {
       (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
     )
     assert.equal(captured.length, 0) // 受众隔离:请求根本没发出
+  })
+})
+
+// ─── refreshOauth2Token(镜像 exchangeAuthCode;RFC 6749 §6) ────────────────────
+
+/** canary:落库的 refresh_token。跑完不得出现在任何返回值/错误 message 里。 */
+const REFRESH_TOKEN = 'RT-CANARY-3e8b-DO-NOT-LEAK-71fa9c02'
+const NEW_ACCESS = 'AT-NEW-a91f'
+const NEW_REFRESH = 'RT-NEW-b72e'
+
+const REFRESH_ARGS = {
+  refreshToken: REFRESH_TOKEN,
+  clientId: 'cid-public-abc',
+  clientSecret: SECRET,
+} as const
+
+describe('refreshOauth2Token', () => {
+  test('form 型:打 tokenEndpoint(无 refreshEndpoint),body = grant_type/refresh_token/client 凭据', async () => {
+    const c = compileGithub()
+    const captured: Captured[] = []
+    const out = await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: NEW_ACCESS, expires_in: 7200 }),
+        })),
+      },
+    })
+    assert.deepEqual(out, { accessToken: NEW_ACCESS, expiresInSec: 7200 })
+    // 无 refreshEndpoint → 回落到 token 端点(RFC 6749 §6)。
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0]?.url, 'https://github.com/login/oauth/access_token')
+    assert.equal(captured[0]?.method, 'POST')
+    assert.equal(captured[0]?.headers['content-type'], 'application/x-www-form-urlencoded')
+    const b = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b.get('grant_type'), 'refresh_token')
+    assert.equal(b.get('refresh_token'), REFRESH_TOKEN)
+    assert.equal(b.get('client_id'), 'cid-public-abc')
+    assert.equal(b.get('client_secret'), SECRET)
+    assert.equal(captured[0]?.headers.authorization, undefined)
+    // 返回值不含 refresh_token/client_secret(它们只上行到 token origin)。
+    const serialized = JSON.stringify(out)
+    for (const s of [SECRET, REFRESH_TOKEN]) assert.ok(!serialized.includes(s))
+  })
+
+  test('refreshEndpoint 声明了就打它(仍受 tokenOrigins 守门)', async () => {
+    const c = compileGithub((s) => {
+      ;(s.auth as Record<string, unknown>).refreshEndpoint =
+        'https://github.com/login/oauth/refresh'
+    })
+    const captured: Captured[] = []
+    await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: NEW_ACCESS }),
+        })),
+      },
+    })
+    assert.equal(captured[0]?.url, 'https://github.com/login/oauth/refresh')
+  })
+
+  test('json 型 refreshEncoding:content-type=application/json,body 是 JSON 对象', async () => {
+    const c = compileGithub((s) => {
+      ;(s.auth as Record<string, unknown>).refreshEncoding = 'json'
+    })
+    const captured: Captured[] = []
+    await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: NEW_ACCESS }),
+        })),
+      },
+    })
+    assert.equal(captured[0]?.headers['content-type'], 'application/json')
+    assert.deepEqual(JSON.parse(captured[0]?.body ?? '{}'), {
+      grant_type: 'refresh_token',
+      refresh_token: REFRESH_TOKEN,
+      client_id: 'cid-public-abc',
+      client_secret: SECRET,
+    })
+  })
+
+  test('basic 型 clientAuth:client 凭据进 Authorization Basic,body 里没有 client_secret', async () => {
+    const c = compileGithub((s) => {
+      ;(s.auth as Record<string, unknown>).clientAuth = 'basic'
+    })
+    const captured: Captured[] = []
+    await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: NEW_ACCESS }),
+        })),
+      },
+    })
+    const authz = captured[0]?.headers.authorization ?? ''
+    assert.ok(authz.startsWith('Basic '))
+    assert.equal(
+      Buffer.from(authz.slice('Basic '.length), 'base64').toString('utf8'),
+      `cid-public-abc:${SECRET}`,
+    )
+    const b = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b.get('client_secret'), null)
+    assert.equal(b.get('client_id'), null)
+    assert.equal(b.get('grant_type'), 'refresh_token')
+    assert.equal(b.get('refresh_token'), REFRESH_TOKEN)
+  })
+
+  test('refreshFieldNames 覆盖线上字段名(Record<线上字段名, 规范 source>)', async () => {
+    const c = compileGithub((s) => {
+      // 某些国内 provider 用非标准字段名。key=线上字段名,value=规范 source(与
+      // tokenAcquisition.credentialFieldNames 同构)。未映射的 source 保持默认名。
+      ;(s.auth as Record<string, unknown>).refreshFieldNames = {
+        grant: 'grant_type',
+        rt: 'refresh_token',
+        app_id: 'client_id',
+      }
+    })
+    const captured: Captured[] = []
+    await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: NEW_ACCESS }),
+        })),
+      },
+    })
+    const b = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b.get('grant'), 'refresh_token') // 字段名改了,grant **值**仍是 RFC 固定值
+    assert.equal(b.get('rt'), REFRESH_TOKEN)
+    assert.equal(b.get('app_id'), 'cid-public-abc')
+    assert.equal(b.get('client_secret'), SECRET) // 未映射 → 默认名
+    // 默认名不再出现(已被覆盖)。
+    assert.equal(b.get('grant_type'), null)
+    assert.equal(b.get('refresh_token'), null)
+    assert.equal(b.get('client_id'), null)
+  })
+
+  test('refreshFieldNames 指向未知 source → BAD_REQUEST,请求不发出', async () => {
+    const c = compileGithub((s) => {
+      ;(s.auth as Record<string, unknown>).refreshFieldNames = { evil: 'access_token' }
+    })
+    const captured: Captured[] = []
+    await assert.rejects(
+      refreshOauth2Token({
+        contract: c,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch(captured, () => ({ status: 200, body: '{}' })),
+        },
+      }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal(captured.length, 0)
+  })
+
+  test('refreshFieldNames 两个 source 撞同一线上字段名 → BAD_REQUEST,请求不发出', async () => {
+    const c = compileGithub((s) => {
+      // 把 client_id 映射到线上字段名 'refresh_token' —— 而 refresh_token 自己的默认线上名也是
+      // 'refresh_token' ⇒ 撞车:client_id 会静默顶掉真正的 refresh_token 值。必须挡下。
+      ;(s.auth as Record<string, unknown>).refreshFieldNames = { refresh_token: 'client_id' }
+    })
+    const captured: Captured[] = []
+    await assert.rejects(
+      refreshOauth2Token({
+        contract: c,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch(captured, () => ({ status: 200, body: '{}' })),
+        },
+      }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal(captured.length, 0)
+  })
+
+  test('轮换:上游回新 refresh_token → 解析出来(调用方据此换袋)', async () => {
+    const c = compileGithub()
+    const captured: Captured[] = []
+    const out = await refreshOauth2Token({
+      contract: c,
+      ...REFRESH_ARGS,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({
+            access_token: NEW_ACCESS,
+            refresh_token: NEW_REFRESH,
+            expires_in: 3600,
+          }),
+        })),
+      },
+    })
+    assert.deepEqual(out, {
+      accessToken: NEW_ACCESS,
+      refreshToken: NEW_REFRESH,
+      expiresInSec: 3600,
+    })
+  })
+
+  test('上游 401(refresh_token 失效)→ **RELINK_REQUIRED**,message 脱敏', async () => {
+    const c = compileGithub()
+    const captured: Captured[] = []
+    let err: unknown
+    try {
+      await refreshOauth2Token({
+        contract: c,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch(captured, () => ({
+            // 上游把凭据回显进 body —— 但非 2xx 吞 body(绝不读)。
+            status: 401,
+            body: JSON.stringify({ error: `bad ${REFRESH_TOKEN} secret ${SECRET}` }),
+          })),
+        },
+      })
+    } catch (e) {
+      err = e
+    }
+    assert.ok(err instanceof ConnectorError)
+    // 语义差别:refresh 失败 = 这条连接自愈无望 → 必须重新授权(≠ UPSTREAM_AUTH_FAILED)。
+    assert.equal(err.code, 'RELINK_REQUIRED')
+    for (const s of [SECRET, REFRESH_TOKEN])
+      assert.ok(!err.message.includes(s), `leaked in message: ${s}`)
+  })
+
+  test('上游 400/403 也 → RELINK_REQUIRED;但 429/408/5xx 是瞬态 → 不误判成需重绑', async () => {
+    const c = compileGithub()
+    const mk = (status: number) =>
+      refreshOauth2Token({
+        contract: c,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch([], () => ({ status, body: '{}' })),
+        },
+      })
+    for (const status of [400, 403]) {
+      await assert.rejects(
+        mk(status),
+        (e: unknown) => e instanceof ConnectorError && e.code === 'RELINK_REQUIRED',
+        `status ${status}`,
+      )
+    }
+    // 限流/超时/5xx 把好连接判成"需重新授权"是纯粹的误伤 → 走 mapUpstreamStatus 的瞬态码。
+    await assert.rejects(
+      mk(429),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'UPSTREAM_RATE_LIMITED',
+    )
+    await assert.rejects(
+      mk(503),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'UPSTREAM_ERROR',
+    )
+  })
+
+  test('2xx 但 accessToken 指针空 → UPSTREAM_AUTH_FAILED(不视作需重绑)', async () => {
+    const c = compileGithub()
+    await assert.rejects(
+      refreshOauth2Token({
+        contract: c,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch([], () => ({
+            status: 200,
+            body: JSON.stringify({ note: 'no token' }),
+          })),
+        },
+      }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'UPSTREAM_AUTH_FAILED',
+    )
+  })
+
+  test('refresh 端点 origin ∉ tokenOrigins(篡改契约)→ BAD_REQUEST,请求不发出', async () => {
+    const c = compileGithub()
+    const tampered = {
+      ...c,
+      credentialAudiencePolicy: {
+        ...c.credentialAudiencePolicy,
+        tokenOrigins: ['https://elsewhere.example.com:443'],
+      },
+    } as ExecContractT
+    const captured: Captured[] = []
+    await assert.rejects(
+      refreshOauth2Token({
+        contract: tampered,
+        ...REFRESH_ARGS,
+        deps: {
+          resolver: okResolver(),
+          fetchImpl: mockFetch(captured, () => ({ status: 200, body: '{}' })),
+        },
+      }),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    // 受众隔离:refresh_token + client_secret 一个字节都没离开进程。
+    assert.equal(captured.length, 0)
   })
 })
 

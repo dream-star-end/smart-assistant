@@ -155,16 +155,21 @@ export async function executeDeclarativeWrite(
     throw new ConnectorError('ACTION_UNKNOWN', 'ledger action not a write action in pinned contract')
   }
 
-  const bag = decryptBagFromRow(row, contract)
-  const resolvedCreds = await resolveApiCredentials({
-    contract,
-    bag,
-    deps: input.deps,
-    cache: { connectionId: row.id, pool },
-  })
-  const targetOrigin = soleApiOrigin(contract)
-
+  // **凭据解析必须在 try 内**:账本此刻已 CAS 到 executing,凡在 finalize 之前抛出的错都必须被
+  // catch 记进账本,否则这行会永远卡在 executing(既幂等门又不放行、又不过期)。凭据解析这一步
+  // 现在含网络调用(oauth2 过期 → refresh 轮换),失败是**常态而非意外**,更不能漏记。
+  // 它在 dispatch 之前失败 → 请求根本没发出 → writeFinalizeStatus 给 'failed'(非 unknown),正确。
   try {
+    const bag = decryptBagFromRow(row, contract)
+    // 同 execute:token-exchange 走缓存;oauth2 过期自动续期(行锁串行化)。
+    const resolvedCreds = await resolveApiCredentials({
+      contract,
+      bag,
+      deps: input.deps,
+      connection: { row, pool },
+    })
+    const targetOrigin = soleApiOrigin(contract)
+
     const result = await engineHttpRequest({
       contract,
       action,

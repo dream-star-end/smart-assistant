@@ -39,12 +39,18 @@ process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI =
   'https://app.oauth2.test/api/connectors/oauth/callback'
 
 import { signAccess } from '../auth/jwt.js'
-import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
-import { decryptBagFromRow, getDeclarativeConnection } from '../connectors/engine/binding.js'
+import { bindDeclarativeConnector, bindWithBag } from '../connectors/engine/bind.js'
+import {
+  META_TOKEN_EXPIRES_AT,
+  decryptBagFromRow,
+  getDeclarativeConnection,
+} from '../connectors/engine/binding.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
+import { executeDeclarativeAction } from '../connectors/engine/execute.js'
 import { ConnectorError } from '../connectors/errors.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { oauthCookieName } from '../connectors/oauthPending.js'
+import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
@@ -69,12 +75,42 @@ const CLIENT_ID = 'cid-public-abc123'
 /** canary:上游发的 access/refresh token。 */
 const ACCESS_TOKEN = 'AT-CANARY-2f8b60c1-DO-NOT-LEAK-0011223344556677'
 const REFRESH_TOKEN = 'RT-CANARY-5a1d47e9-DO-NOT-LEAK-8899aabbccddeeff'
+/** canary:**续期换回**的新 access/refresh token(轮换后旧的必须从袋里消失)。 */
+const NEW_ACCESS_TOKEN = 'AT2-CANARY-9c4e17b3-DO-NOT-LEAK-a1b2c3d4e5f60718'
+const NEW_REFRESH_TOKEN = 'RT2-CANARY-6b0f83da-DO-NOT-LEAK-1122334455667788'
+/** canary:platform 模式的平台 App 凭据(存平台表,**绝不进用户袋**)。 */
+const PLATFORM_CLIENT_ID = 'platform-cid-refresh-001'
+const PLATFORM_CLIENT_SECRET = 'PS-CANARY-0d7a52ef-DO-NOT-LEAK-99aabbccddeeff00'
 
 const AUTHZ_ORIGIN = 'https://auth.oauth2.test:443'
 const TOKEN_ORIGIN = 'https://token.oauth2.test:443'
 const API_ORIGIN = 'https://api.oauth2.test:443'
 const AUTHORIZE_ENDPOINT = 'https://auth.oauth2.test/oauth/authorize'
 const TOKEN_ENDPOINT = 'https://token.oauth2.test/oauth/token'
+/** refresh 端点与 token 端点**分开**(同 token origin 不同 path):这样能数清到底打了哪一个。 */
+const REFRESH_ENDPOINT = 'https://token.oauth2.test/oauth/refresh'
+
+/**
+ * 受控上游的**可变脚本**(每个用例 before 用 resetUpstream 重置)。
+ * `null` 一律表示"这个字段上游不回"(如 GitHub 不回 expires_in / refresh_token)。
+ */
+interface UpstreamCfg {
+  tokenExpiresIn: number | null
+  tokenRefreshToken: string | null
+  refreshStatus: number
+  refreshAccessToken: string
+  refreshRefreshToken: string | null
+  refreshExpiresIn: number | null
+}
+const DEFAULT_UPSTREAM: UpstreamCfg = {
+  tokenExpiresIn: 3600,
+  tokenRefreshToken: REFRESH_TOKEN,
+  refreshStatus: 200,
+  refreshAccessToken: NEW_ACCESS_TOKEN,
+  refreshRefreshToken: NEW_REFRESH_TOKEN,
+  refreshExpiresIn: 3600,
+}
+let upstream: UpstreamCfg = { ...DEFAULT_UPSTREAM }
 
 let pgAvailable = false
 
@@ -132,14 +168,36 @@ function startServer(): Promise<TestServer> {
         })
         res.setHeader('content-type', 'application/json')
         if (u.pathname === '/oauth/token') {
-          // token 端点:回 access/refresh/expires。
+          // token 端点(授权码交换):按脚本回 access/refresh/expires。
           res.statusCode = 200
           res.end(
             JSON.stringify({
               access_token: ACCESS_TOKEN,
-              refresh_token: REFRESH_TOKEN,
-              expires_in: 3600,
+              ...(upstream.tokenRefreshToken !== null
+                ? { refresh_token: upstream.tokenRefreshToken }
+                : {}),
+              ...(upstream.tokenExpiresIn !== null ? { expires_in: upstream.tokenExpiresIn } : {}),
             }),
+          )
+          return
+        }
+        if (u.pathname === '/oauth/refresh') {
+          // refresh 端点(RFC 6749 §6):按脚本回新 token / 失败码。
+          res.statusCode = upstream.refreshStatus
+          res.end(
+            JSON.stringify(
+              upstream.refreshStatus === 200
+                ? {
+                    access_token: upstream.refreshAccessToken,
+                    ...(upstream.refreshRefreshToken !== null
+                      ? { refresh_token: upstream.refreshRefreshToken }
+                      : {}),
+                    ...(upstream.refreshExpiresIn !== null
+                      ? { expires_in: upstream.refreshExpiresIn }
+                      : {}),
+                  }
+                : { error: 'invalid_grant' },
+            ),
           )
           return
         }
@@ -282,12 +340,14 @@ function oauth2Spec(slug: string): Record<string, unknown> {
     auth: {
       authorizeEndpoint: AUTHORIZE_ENDPOINT,
       tokenEndpoint: TOKEN_ENDPOINT,
+      // 独立 refresh 端点(同 token origin,不同 path)→ 能数清续期到底打没打。
+      refreshEndpoint: REFRESH_ENDPOINT,
       // BYOA(用户自带 App):本文件全部用例的原语义。platform 模式见 connectorsPlatformOauth.integ。
       clientProvisioning: 'byoa',
       clientAuth: 'form',
       scopeSeparator: ' ',
       scopes: ['read:user'],
-      refreshRotation: false,
+      refreshRotation: true,
       refreshEncoding: 'form',
       pkce: 'required',
       tokenOutputs: {
@@ -738,5 +798,303 @@ describe('oauth2-auth-code · 对抗', () => {
       (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
     )
     assert.equal(await activeConnectionCount(userId), 0)
+  })
+})
+
+// ─── refresh 轮换(access_token 过期 → 自动续期,用户无感) ─────────────────────
+//
+// 判过期的权威 = 连接 meta.token_expires_at(bind 时由上游 expires_in 换算)。skew=60s ⇒ 让
+// token 端点回 `expires_in: 1` 就等价于"这条连接的 token 立刻算过期",无需 sleep。
+// refresh 端点与 token 端点是**不同 path**(/oauth/refresh vs /oauth/token)⇒ 能精确数出
+// "到底续了几次"—— 并发只续一次的断言全靠这个。
+
+/** platform 供给模式变体(client 凭据留平台表,袋里结构上没有)。 */
+function platformOauth2Spec(slug: string): Record<string, unknown> {
+  const s = oauth2Spec(slug)
+  ;(s.auth as Record<string, unknown>).clientProvisioning = 'platform'
+  return s
+}
+
+function engineDeps(): EngineHttpDeps {
+  return { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+}
+
+/** 重置上游脚本 + 清空请求记录(每个用例开头调)。 */
+function resetUpstream(patch: Partial<UpstreamCfg> = {}): void {
+  upstream = { ...DEFAULT_UPSTREAM, ...patch }
+  server.requests.length = 0
+}
+
+function countPath(p: string): number {
+  return server.requests.filter((r) => r.path === p).length
+}
+
+/** 走完整授权流绑一条 byoa oauth2 连接(上游行为由当前 upstream 脚本决定)。 */
+async function bindViaOauth(
+  prefix: string,
+): Promise<{ userId: number; connectionId: string; versionId: number }> {
+  const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, prefix)
+  const userId = await mkUser()
+  const started = await oauthStart(userId, versionId, slug)
+  const loc = await oauthCallback({
+    state: started.state,
+    code: `code-${prefix}`,
+    cookie: `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`,
+  })
+  assert.equal(loc, `/?connector_linked=${encodeURIComponent(slug)}`)
+  const r = await query<{ id: string }>(
+    'SELECT id::text AS id FROM connections WHERE user_id = $1 AND revoked_at IS NULL',
+    [userId],
+  )
+  assert.equal(r.rowCount, 1)
+  return { userId, connectionId: r.rows[0]!.id, versionId }
+}
+
+async function whoami(connectionId: string, userId: number): Promise<unknown> {
+  return executeDeclarativeAction(
+    { connectionId, userId, actionId: 'whoami', params: {}, deps: engineDeps() },
+    getPool(),
+  )
+}
+
+/** 解密某连接当前的落库袋 + meta(断言"袋真的换了/真的没换"用)。 */
+async function readBag(
+  connectionId: string,
+  userId: number,
+  versionId: number,
+): Promise<{ bag: Record<string, string>; meta: Record<string, unknown>; cipher: string }> {
+  const meta = await loadVerifiedContractWithMeta(versionId, getPool())
+  const row = await getDeclarativeConnection(connectionId, userId, getPool())
+  assert.ok(row)
+  return {
+    bag: decryptBagFromRow(row!, meta.contract),
+    meta: row!.meta,
+    cipher: row!.secret_enc!.toString('latin1'),
+  }
+}
+
+describe('oauth2-auth-code · refresh 轮换', () => {
+  test('过期 → 自动 refresh:打 refresh 端点、用新 token 打 API、新袋落库、meta 前推', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 }) // 1s 有效期 → 减 60s skew ⇒ 立刻判"将过期"
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-auto')
+    const boundExpiry = (await readBag(connectionId, userId, versionId)).meta[META_TOKEN_EXPIRES_AT]
+    assert.equal(typeof boundExpiry, 'string') // bind 就写了过期时刻
+
+    server.requests.length = 0
+    const result = await whoami(connectionId, userId)
+    // ① 结果正常(用户完全无感:没有 401、没有重新授权)。
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+
+    // ② refresh 端点被打了恰好一次,body 是 RFC 6749 §6 形状 + 用**旧** refresh_token 去换。
+    assert.equal(countPath('/oauth/refresh'), 1)
+    const rr = server.requests.find((r) => r.path === '/oauth/refresh')!
+    assert.equal(rr.method, 'POST')
+    const form = new URLSearchParams(rr.body)
+    assert.equal(form.get('grant_type'), 'refresh_token')
+    assert.equal(form.get('refresh_token'), REFRESH_TOKEN)
+    assert.equal(form.get('client_id'), CLIENT_ID)
+    assert.equal(form.get('client_secret'), CLIENT_SECRET)
+    // 授权码交换端点没被重打(续期不是重新授权)。
+    assert.equal(countPath('/oauth/token'), 0)
+
+    // ③ API 请求带的是**新** access_token(不是袋里那个旧的)。
+    const probe = server.requests.find((r) => r.path === '/user')!
+    assert.equal(probe.authorization, `Bearer ${NEW_ACCESS_TOKEN}`)
+    // 受众隔离照旧:api origin 的请求里没有任何 client 凭据 / refresh_token。
+    assert.equal(probe.body.includes(CLIENT_SECRET), false)
+    assert.equal(probe.body.includes(REFRESH_TOKEN), false)
+
+    // ④ 新袋落库(**轮换**:refresh_token 换成新的,旧的从袋里消失)。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: NEW_REFRESH_TOKEN,
+    })
+    // 仍是密文:明文 grep 不到任何 token/secret。
+    for (const s of [NEW_ACCESS_TOKEN, NEW_REFRESH_TOKEN, ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET])
+      assert.equal(after.cipher.includes(s), false)
+
+    // ⑤ meta.token_expires_at 前推(新的 3600s);account_hint **没被覆盖掉**(增量合并,非整块覆盖)。
+    const newExpiry = after.meta[META_TOKEN_EXPIRES_AT]
+    assert.equal(typeof newExpiry, 'string')
+    assert.ok(Date.parse(newExpiry as string) > Date.now() + 3000, 'expiry pushed forward')
+    assert.notEqual(newExpiry, boundExpiry)
+    assert.equal(after.meta.account_hint, 'octocat')
+  })
+
+  test('不轮换(上游不回新 refresh_token)→ 旧 refresh_token 原样留在袋里', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1, refreshRefreshToken: null })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-norotate')
+
+    server.requests.length = 0
+    await whoami(connectionId, userId)
+    assert.equal(countPath('/oauth/refresh'), 1)
+
+    const after = await readBag(connectionId, userId, versionId)
+    // access_token 换新;refresh_token 保持旧的(上游没发新的 ⇒ 旧的仍然有效)。
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: REFRESH_TOKEN,
+    })
+  })
+
+  test('未过期 → **不打** refresh 端点(零额外开销)', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 3600 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-fresh')
+
+    server.requests.length = 0
+    await whoami(connectionId, userId)
+    assert.equal(countPath('/oauth/refresh'), 0)
+    // 用的还是袋里那个 access_token。
+    assert.equal(server.requests.find((r) => r.path === '/user')!.authorization, `Bearer ${ACCESS_TOKEN}`)
+    // 袋原封不动。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.equal(after.bag.access_token, ACCESS_TOKEN)
+    assert.equal(after.bag.refresh_token, REFRESH_TOKEN)
+  })
+
+  test('GitHub 情形(无 expires_in、无 refresh_token)→ 永不过期,**不打** refresh', async (t) => {
+    if (skipIfNoDb(t)) return
+    // GitHub OAuth App 默认:access_token 长期有效、不下发 refresh_token、不回 expires_in。
+    resetUpstream({ tokenExpiresIn: null, tokenRefreshToken: null })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-github')
+
+    const bound = await readBag(connectionId, userId, versionId)
+    // 袋里结构上没有 refresh_token;meta 里没有过期时刻(= 永不过期)。
+    assert.deepEqual(bound.bag, {
+      access_token: ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    })
+    assert.equal(bound.meta[META_TOKEN_EXPIRES_AT], undefined)
+
+    server.requests.length = 0
+    const result = await whoami(connectionId, userId)
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+    // 没有过期时刻 ⇒ 引擎绝不会去 refresh(那类 provider 连 refresh 端点都没有)。
+    assert.equal(countPath('/oauth/refresh'), 0)
+    assert.equal(server.requests.find((r) => r.path === '/user')!.authorization, `Bearer ${ACCESS_TOKEN}`)
+  })
+
+  test('refresh 失败(上游 400)→ RELINK_REQUIRED,且**袋没被写坏**(事务回滚)', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-fail')
+    const before = await readBag(connectionId, userId, versionId)
+
+    // refresh_token 被上游吊销 → 400 invalid_grant。
+    resetUpstream({ tokenExpiresIn: 1, refreshStatus: 400 })
+    await assert.rejects(
+      whoami(connectionId, userId),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'RELINK_REQUIRED',
+    )
+    assert.equal(countPath('/oauth/refresh'), 1)
+    // API 请求根本没发出(续期失败 → 绝不拿坏 token 去打上游)。
+    assert.equal(countPath('/user'), 0)
+
+    // **袋原封不动**:仍是旧 token,meta 的过期时刻也没动 —— 事务回滚了,没留下半吊子状态。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, before.bag)
+    assert.equal(after.meta[META_TOKEN_EXPIRES_AT], before.meta[META_TOKEN_EXPIRES_AT])
+  })
+
+  test('上游回**带控制符**的 access_token → 写袋前挡下,袋没被写坏', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-crlf')
+    const before = await readBag(connectionId, userId, versionId)
+
+    // 换回的 token 是**不可信输入**。含 CRLF 的 token 一旦落袋:注入层每次都硬拒(连接实质死掉),
+    // 且解密期形状复校验也会炸 —— 必须在写袋前挡下,让事务回滚保住旧袋。
+    resetUpstream({ tokenExpiresIn: 1, refreshAccessToken: 'AT-EVIL\r\nX-Injected: 1' })
+    await assert.rejects(
+      whoami(connectionId, userId),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal(countPath('/user'), 0) // 坏 token 一次都没被拿去打上游
+
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, before.bag) // 袋原封不动(旧 token 仍可用)
+    assert.equal(after.meta[META_TOKEN_EXPIRES_AT], before.meta[META_TOKEN_EXPIRES_AT])
+  })
+
+  test('**并发**:两个请求同时命中过期 → 行锁串行化,只 refresh 一次,两者都拿到有效 token', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-race')
+
+    server.requests.length = 0
+    const [a, b] = await Promise.all([whoami(connectionId, userId), whoami(connectionId, userId)])
+    assert.deepEqual(a, { id: 'U-99887', login: 'octocat' })
+    assert.deepEqual(b, { id: 'U-99887', login: 'octocat' })
+
+    // **核心断言**:refresh 端点只被打了一次。后到的那个请求在 FOR UPDATE 上排队,拿到锁后重查
+    // meta 发现已经不过期了 → 直接用前者续好的 token,不再打上游。若网络调用在锁外,这里会是 2 ——
+    // 而对轮换型 provider,那第二次会拿着**已失效的旧 refresh_token** 去换 → 用户被无辜踢去重新授权。
+    assert.equal(countPath('/oauth/refresh'), 1)
+
+    // 两个 API 请求都带着**同一个新** access_token。
+    const probes = server.requests.filter((r) => r.path === '/user')
+    assert.equal(probes.length, 2)
+    for (const p of probes) assert.equal(p.authorization, `Bearer ${NEW_ACCESS_TOKEN}`)
+
+    // 袋里是这一次轮换的结果(不是两次连续轮换)。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.equal(after.bag.access_token, NEW_ACCESS_TOKEN)
+    assert.equal(after.bag.refresh_token, NEW_REFRESH_TOKEN)
+  })
+
+  test('platform 模式 refresh:client 凭据取自**平台表**(用户袋里结构上没有)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(
+      platformOauth2Spec,
+      oauth2Decision,
+      'refresh-plat',
+    )
+    await upsertPlatformOauthApp(
+      { slug, clientId: PLATFORM_CLIENT_ID, clientSecret: PLATFORM_CLIENT_SECRET },
+      getPool(),
+    )
+    const userId = await mkUser()
+    resetUpstream({ tokenExpiresIn: 1 })
+
+    // platform 袋 = access_token (+refresh_token),**无 client 凭据**;tokenExpiresAt 走 bind 的 meta 通路。
+    const contractMeta = await loadVerifiedContractWithMeta(versionId, getPool())
+    const bound = await bindWithBag(
+      {
+        userId,
+        meta: contractMeta,
+        bag: { access_token: ACCESS_TOKEN, refresh_token: REFRESH_TOKEN },
+        tokenExpiresAt: new Date(Date.now() + 1000), // 1s ⇒ 立刻判"将过期"
+        deps: engineDeps(),
+      },
+      getPool(),
+    )
+
+    server.requests.length = 0
+    const result = await whoami(bound.connectionId, userId)
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+
+    // 续期用的 client 凭据来自平台表 —— 袋里根本没有它们,只能从 connector_platform_oauth_apps 取。
+    assert.equal(countPath('/oauth/refresh'), 1)
+    const form = new URLSearchParams(server.requests.find((r) => r.path === '/oauth/refresh')!.body)
+    assert.equal(form.get('client_id'), PLATFORM_CLIENT_ID)
+    assert.equal(form.get('client_secret'), PLATFORM_CLIENT_SECRET)
+    assert.equal(form.get('refresh_token'), REFRESH_TOKEN)
+
+    // 新袋仍是 platform 形状:**平台 secret 没有被顺手写进用户袋**(泄露面不按用户数放大)。
+    const after = await readBag(bound.connectionId, userId, versionId)
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      refresh_token: NEW_REFRESH_TOKEN,
+    })
+    assert.equal(after.cipher.includes(PLATFORM_CLIENT_SECRET), false)
   })
 })

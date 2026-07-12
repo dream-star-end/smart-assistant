@@ -95,11 +95,12 @@ export async function executeDeclarativeAction(
     throw new ConnectorError('VALIDATION_FAILED', 'params must be an object')
 
   const bag = decryptBagFromRow(row, contract)
+  // connection 传下去 → token-exchange 走加密缓存;oauth2 过期时自动 refresh 轮换(行锁串行化)。
   const resolvedCreds = await resolveApiCredentials({
     contract,
     bag,
     deps: input.deps,
-    cache: { connectionId: row.id, pool },
+    connection: { row, pool },
   })
   const targetOrigin = soleApiOrigin(contract)
 

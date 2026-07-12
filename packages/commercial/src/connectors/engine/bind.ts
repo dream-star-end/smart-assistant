@@ -27,7 +27,7 @@ import type { VerifiedContract } from '../spec/review.js'
 import { loadVerifiedContractWithMeta } from '../spec/review.js'
 import type { ConnectorIdentityT, ExecActionT } from '../spec/types.js'
 import { computeAccountKey } from '../store.js'
-import { insertDeclarativeConnection } from './binding.js'
+import { META_TOKEN_EXPIRES_AT, insertDeclarativeConnection } from './binding.js'
 import {
   type DeclarativeSecretBag,
   requiredBindSources,
@@ -62,6 +62,14 @@ export interface BindWithBagInput {
   meta: VerifiedContract
   /** **落库形状**的凭据袋(oauth2 回调路径已把换回的 access_token/refresh_token 并进来)。 */
   bag: DeclarativeSecretBag
+  /**
+   * access_token 的过期时刻(oauth2 回调把上游 expires_in 换算后传进来)。落进连接 `meta`
+   * (**非机密,不进加密袋** —— 见 binding.META_TOKEN_EXPIRES_AT),执行期据此判断要不要 refresh 轮换。
+   *
+   * **不传 = 该 token 永不过期**(GitHub 这类不发 expires_in 的 provider):执行期永远不会去 refresh。
+   * 所以只有上游**明确给了** expires_in 才该传 —— 别为了"保险"编一个过期时间出来。
+   */
+  tokenExpiresAt?: Date
   displayName?: string
   deps?: EngineHttpDeps
 }
@@ -114,6 +122,9 @@ export async function bindWithBag(
     if (typeof hintRaw === 'string' && hintRaw.length > 0)
       rowMeta.account_hint = hintRaw.slice(0, 120)
   }
+  // token 过期时刻走**这一条 meta 通路**(与 account_hint 同处),不在 SQL 里散写。
+  if (input.tokenExpiresAt !== undefined)
+    rowMeta[META_TOKEN_EXPIRES_AT] = input.tokenExpiresAt.toISOString()
 
   const { id, rebound } = await insertDeclarativeConnection(
     {
