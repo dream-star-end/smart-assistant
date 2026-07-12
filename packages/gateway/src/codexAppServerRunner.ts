@@ -11,7 +11,12 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
-import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from './codexLaunchOverrides.js'
+import {
+  type CodexLaunchOverrides,
+  type CodexReasoningEffort,
+  buildCodexLaunchOverrides,
+  codexReasoningEffortForModel,
+} from './codexLaunchOverrides.js'
 import { _sanitizeThreadId, buildCodexEnv, copyImagePathsToPublicDir } from './codexRunner.js'
 import { createLogger } from './logger.js'
 
@@ -1089,16 +1094,8 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
-    switch (this.effortLevel) {
-      case 'low':
-      case 'medium':
-      case 'high':
-      case 'xhigh':
-        return this.effortLevel
-      default:
-        return null
-    }
+  private codexReasoningEffort(): CodexReasoningEffort | null {
+    return codexReasoningEffortForModel(this.opts.model, this.effortLevel)
   }
 
   private buildTurnStartParams(prompt: string): Record<string, unknown> {

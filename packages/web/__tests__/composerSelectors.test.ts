@@ -154,10 +154,20 @@ describe('effortMode: capability-driven gating', () => {
     // via the agent's own efforts (carried by /api/agents).
     const agents = [
       { id: 'main', model: 'claude-opus-4-7' },
-      { id: 'codex', model: 'gpt-5.6-sol', efforts: ['low', 'medium', 'high', 'xhigh'] },
+      {
+        id: 'codex',
+        model: 'gpt-5.6-sol',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
     ]
     const e = makeEffortMode('gpt-5.6-sol', undefined, agents)
-    assert.deepEqual(e.getSupportedEfforts('gpt-5.6-sol'), ['low', 'medium', 'high', 'xhigh'])
+    assert.deepEqual(e.getSupportedEfforts('gpt-5.6-sol'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
     assert.equal(e.modelSupportsExtraEffort('gpt-5.6-sol'), true)
     // pool still wins when present; unknown stays empty.
     assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), [

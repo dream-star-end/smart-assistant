@@ -372,6 +372,28 @@ describe('CodexAppServerRunner plan-first turn/start params', () => {
     assert.deepEqual(params.sandboxPolicy, { type: 'dangerFullAccess' })
     await h.cleanup()
   })
+
+  it('passes Sol max through collaborationMode reasoning_effort', async () => {
+    const h = await makeHarness({ model: 'gpt-5.6-sol' })
+    ;(h.runner as any).threadId = 'thr-max'
+    ;(h.runner as any).effortLevel = 'max'
+
+    const params = (h.runner as any).buildTurnStartParams('solve the hardest problem')
+
+    assert.equal((params.collaborationMode as any).settings.reasoning_effort, 'max')
+    await h.cleanup()
+  })
+
+  it('does not pass max to a Codex model without that declared capability', async () => {
+    const h = await makeHarness({ model: 'gpt-5.5' })
+    ;(h.runner as any).threadId = 'thr-no-max'
+    ;(h.runner as any).effortLevel = 'max'
+
+    const params = (h.runner as any).buildTurnStartParams('solve it')
+
+    assert.equal((params.collaborationMode as any).settings.reasoning_effort, null)
+    await h.cleanup()
+  })
 })
 
 describe('handleLine — dispatch', () => {
