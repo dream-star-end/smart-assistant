@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# 本地干跑演练:build_platform_bundle + digest 幂等/确定性 + selfcheck 拒绝 + 必需叶子(M8) +
-# GC 保护集(含 B4 basename label + m5 退休台账) + saga 回滚 + B2 开关互染 + B6 ccb 隔离构建 +
-# B7 emergency 硬验 + M6 symlink digest + M7 masterRelease 同条恢复 + m6 env.bak 轮转。
+# 本地干跑演练:build_platform_bundle + digest 幂等/确定性 + selfcheck 拒绝 + 必需叶子(M8,含
+# bin/oc-web-context R2-M2①) + GC 保护集(含 B4 basename label + m5 退休台账) + saga 回滚 +
+# R2-B1 env 三态写(禁用轴写空值) + R2-B2 首次启用 pre-state→rollback 退回启用前 + B6 ccb 隔离构建 +
+# B7/R2-M1 emergency 硬验(显式候选 + immutable ID 钉死 + R2-m1 bak 轮转) + M6 symlink digest +
+# M7 masterRelease 同条恢复 + R2-M3 history v1/v2 混存 + R2-M2③ canary boot 两路径 + m6 env.bak 轮转。
 set -Eeuo pipefail
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/v5-runtime-release-lib.sh"
 WORK="$(mktemp -d /tmp/hotcfg-drill.XXXXXX)"
@@ -25,7 +27,9 @@ cat > "$OC_DOCKER_BIN" <<'DOCK'
 #!/usr/bin/env bash
 # 可切换 docker stub:
 #   DOCKER_STUB_CIDS / DOCKER_STUB_REL_<cid> / DOCKER_STUB_BUN_<cid>(basename 形态,B4)/
-#   DOCKER_STUB_FAIL(ps/inspect 失败)/ DOCKER_STUB_EMBED(image inspect embed_source 值,B7)
+#   DOCKER_STUB_FAIL(ps/inspect 失败)/ DOCKER_STUB_EMBED(image inspect embed_source 值,B7)/
+#   DOCKER_STUB_IMAGE_ID(image inspect {{.Id}} 值,R2-M1)/ DOCKER_STUB_IMAGE_INSPECT_FAIL /
+#   DOCKER_STUB_RUN_LOG(docker run 全参记录文件,R2-M2③ canary)/ DOCKER_STUB_RUN_FAIL
 [ -n "${DOCKER_STUB_FAIL:-}" ] && { echo "docker down" >&2; exit 1; }
 case "$1" in
   ps) echo "${DOCKER_STUB_CIDS:-}" ;;
@@ -45,12 +49,19 @@ case "$1" in
       eval "echo \"\${DOCKER_STUB_BUN_${cid}:-}\""
     else echo ""; fi ;;
   image)
-    # image inspect --format '{{...embed_source...}}' <image>(B7;format 在 $4,扫全部 args 稳妥)
+    # image inspect --format '...'(B7 embed_source / R2-M1 {{.Id}};扫全部 args 稳妥)
     case "$*" in
       *embed_source*) printf '%s\n' "${DOCKER_STUB_EMBED-1}" ;;
+      *'{{.Id}}'*)
+        if [ -n "${DOCKER_STUB_IMAGE_INSPECT_FAIL:-}" ]; then echo "no such image" >&2; exit 1; fi
+        printf '%s\n' "${DOCKER_STUB_IMAGE_ID-sha256:emb}" ;;
       *) echo "" ;;
     esac ;;
-  run) : ;;   # docker run(install_deps):stub 空实现;B6 复用路径不会调用
+  run)
+    # docker run:install_deps(B6 复用路径不会调用)+ canary boot(R2-M2③)。
+    if [ -n "${DOCKER_STUB_RUN_LOG:-}" ]; then echo "run $*" >> "$DOCKER_STUB_RUN_LOG"; fi
+    if [ -n "${DOCKER_STUB_RUN_FAIL:-}" ]; then echo "canary boom" >&2; exit 1; fi
+    ;;
   *) echo "" ;;
 esac
 DOCK
@@ -76,6 +87,7 @@ mk_staging() {   # $1=dest  $2=extra_marker(用于制造不同内容)
   mkdir -p "$d"/{bin,entrypoint,seed/skills/scientist,seed/personas,prompts,etc-codex,codex-skills}
   printf '#!/usr/bin/env bash\necho oc-web %s\n' "${2:-}" > "$d/bin/oc-web.sh"
   printf 'print("figcheck")\n' > "$d/bin/oc-figcheck.py"
+  printf 'print("web-context")\n' > "$d/bin/oc-web-context.py"   # R2-M2① 必需叶子(剥名后 bin/oc-web-context)
   printf '// entrypoint %s\nconsole.log("boot")\n' "${2:-}" > "$d/entrypoint/entrypoint.ts"
   printf '// platformBundle %s\nexport const x = 1;\n' "${2:-}" > "$d/entrypoint/platformBundle.ts"
   printf 'schemaVersion: 1\nagents: []\n' > "$d/seed/platform-seed.yaml"
@@ -136,6 +148,8 @@ mk_staging "$WORK/bad6" A; rm -f "$WORK/bad6/entrypoint/platformBundle.ts"
 chk "M8 缺 entrypoint/platformBundle.ts → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad6' 1 deadbeef 2>/dev/null"
 mk_staging "$WORK/bad7" A; rm -f "$WORK/bad7/etc-codex/managed_config.toml"
 chk "M8 缺 etc-codex/managed_config.toml → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad7' 1 deadbeef 2>/dev/null"
+mk_staging "$WORK/bad8" A; rm -f "$WORK/bad8/bin/oc-web-context.py"
+chk "R2-M2① 缺 bin/oc-web-context → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad8' 1 deadbeef 2>/dev/null"
 
 echo "== T5 current 原子翻转(相对 symlink)=="
 oc_hotcfg_flip_current "$REV1"
@@ -170,27 +184,48 @@ chk "last committed masterRelease=masterC" "[ \"\$(jq -r .masterRelease <<<\"\$(
 sed -i 's/masterC/HACKEDMASTER/' "$HM"   # 只改 masterRelease 值 → checksum 应失配
 chk "篡改 masterRelease 被 checksum 拒(回退 seq=2)" "[ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HM')\")\" = 2 ]"
 
-echo "== TB2 env_write_tuple 只写非空 release/bundle,恒写 image/image_id(B2)=="
+echo "== TR2B1 env_write_tuple 三态写:四键恒写,禁用轴写空值(R2-B1,取代旧 B2 空值跳过)=="
 cat > "$WORK/b2.env" <<EOF
 OC_RUNTIME_IMAGE=img:OLD
 OC_RUNTIME_IMAGE_ID=sha256:OLD
 OC_RUNTIME_RELEASE=/rel/OLD
 OC_PLATFORM_BUNDLE=/bun/OLD
 EOF
-# 只启用 bundle(release 传空):image/id 更新、bundle 更新、release 键**不动**
+# bundle 轴启用 + release 轴禁用(传空):image/id 更新、bundle 更新、release **清空**(键在值空)
 oc_hotcfg_env_write_tuple "$WORK/b2.env" img:NEW sha256:NEW "" /bun/NEW >/dev/null 2>&1
 chk "image 恒写(→NEW)" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$WORK/b2.env'|cut -d= -f2-)\" = 'img:NEW' ]"
 chk "image_id 恒写(→NEW)" "[ \"\$(grep ^OC_RUNTIME_IMAGE_ID= '$WORK/b2.env'|cut -d= -f2-)\" = 'sha256:NEW' ]"
-chk "release 传空 → 键不动(仍 /rel/OLD)" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$WORK/b2.env'|cut -d= -f2-)\" = '/rel/OLD' ]"
+chk "release 传空 → 键在值空(禁用可表达,旧值被清)" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/b2.env'"
 chk "bundle 非空 → 更新 /bun/NEW" "[ \"\$(grep ^OC_PLATFORM_BUNDLE= '$WORK/b2.env'|cut -d= -f2-)\" = '/bun/NEW' ]"
-# 原本无 release 键 + 传空 → 不新建该键;bundle 非空 → 新建
+# 原本无 release 键 + 传空 → 新建**空值键**(四键恒写);bundle 非空 → 新建
 cat > "$WORK/b2b.env" <<EOF
 OC_RUNTIME_IMAGE=img:OLD
 OC_RUNTIME_IMAGE_ID=sha256:OLD
 EOF
 oc_hotcfg_env_write_tuple "$WORK/b2b.env" img:NEW sha256:NEW "" /bun/NEW >/dev/null 2>&1
-chk "release 传空且原无键 → 不新建 OC_RUNTIME_RELEASE" "! grep -q '^OC_RUNTIME_RELEASE=' '$WORK/b2b.env'"
+chk "release 传空且原无键 → 新建空值键 OC_RUNTIME_RELEASE=" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/b2b.env'"
 chk "bundle 非空且原无键 → 新建 OC_PLATFORM_BUNDLE" "[ \"\$(grep ^OC_PLATFORM_BUNDLE= '$WORK/b2b.env'|cut -d= -f2-)\" = '/bun/NEW' ]"
+# 两轴全禁用(双空)也可表达:四键仍恒写
+oc_hotcfg_env_write_tuple "$WORK/b2.env" img:NEW2 sha256:NEW2 "" "" >/dev/null 2>&1
+chk "双轴禁用 → release/bundle 皆空值键" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/b2.env' && grep -q '^OC_PLATFORM_BUNDLE=$' '$WORK/b2.env'"
+
+echo "== TM3 history schemaVersion 2 + v1 旧行混存(R2-M3)=="
+HV="$WORK/hist-m3"; : > "$HV"
+# 手工造一条 v1 旧行(旧编码:checksum 7 字段、**无 masterRelease 字段**)
+V1SUM="$(oc_hotcfg_history_checksum 1 1 2026-01-01T00:00:00Z imgV1 idV1 relV1 bunV1)"
+printf '{"schemaVer":1,"seq":1,"ts":"2026-01-01T00:00:00Z","image":"imgV1","image_id":"idV1","release":"relV1","bundle":"bunV1","checksum":"%s"}\n' "$V1SUM" >> "$HV"
+oc_hotcfg_history_append "$HV" imgV2 idV2 relV2 bunV2 masterV2
+chk "append 写 schemaVer=2" "[ \"\$(tail -n1 '$HV' | jq -r .schemaVer)\" = 2 ]"
+chk "v2 last committed=imgV2(seq 接续 v1)" "[ \"\$(jq -r .image <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = imgV2 ] && [ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = 2 ]"
+P_V1="$(oc_hotcfg_history_nth_committed "$HV" 2)"
+chk "v1 旧行 checksum(7 字段)验过,nth=2 命中" "[ \"\$(jq -r .image <<<'$P_V1')\" = imgV1 ]"
+chk "v1 条目读出 masterRelease 归一化为空" "[ \"\$(jq -r .masterRelease <<<'$P_V1')\" = '' ]"
+# v1 行被塞 masterRelease 也视为空(不进 v1 checksum,防注入未验值)
+HV2="$WORK/hist-m3b"; printf '{"schemaVer":1,"seq":1,"ts":"2026-01-01T00:00:00Z","image":"imgV1","image_id":"idV1","release":"relV1","bundle":"bunV1","masterRelease":"INJECTED","checksum":"%s"}\n' "$V1SUM" > "$HV2"
+chk "v1 行注入 masterRelease → 读出仍视为空" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$HV2')\")\" = '' ]"
+# 篡改 v1 行字段 → checksum 拒
+sed -i 's/imgV1/imgHACK/' "$HV2"
+chk "篡改 v1 行被 checksum 拒(无 committed)" "[ -z \"\$(oc_hotcfg_history_last_committed '$HV2')\" ]"
 
 echo "== T7 GC 保护集(B4 basename label + env + history + emergency + m5 退休台账)=="
 # 造若干 release/bundle 目录。docker 容器引用者用 **basename + 合法 hex** 形态(B4)。
@@ -299,6 +334,35 @@ if DOCKER_STUB_EMBED=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" >/d
 mk_emerg_env "" "$OC_HOTCFG_PLATFORM_ROOT/bundles/nonexistent00"
 if DOCKER_STUB_EMBED=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" >/dev/null 2>&1; then bad "bundle 不存在应拒"; else ok "bundle 目录不存在被拒"; fi
 
+echo "== TR2M1 emergency immutable ID 钉死 + 显式候选 + bak 轮转(R2-M1/R2-m1)=="
+# 反例:inspect .Id 与 env OC_RUNTIME_IMAGE_ID 不符(tag 被重打)→ 拒
+mk_emerg_env "" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1"
+if DOCKER_STUB_EMBED=1 DOCKER_STUB_IMAGE_ID=sha256:drifted oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" >/dev/null 2>&1; then
+  bad "ID 不符应拒"; else ok "inspect .Id != env image_id 被拒(tag 重打防护)"; fi
+# 反例:image inspect {{.Id}} 失败 → 拒
+mk_emerg_env "" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1"
+if DOCKER_STUB_EMBED=1 DOCKER_STUB_IMAGE_INSPECT_FAIL=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" >/dev/null 2>&1; then
+  bad "inspect 失败应拒"; else ok "inspect {{.Id}} 失败被拒"; fi
+# 显式候选正例:env 处于瘦身稳态(release 非空)也能直接登记逃生 tuple(不必先翻空 release)
+mk_emerg_env "$OC_HOTCFG_RELEASES_ROOT/rel-r1" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV2"
+if DOCKER_STUB_EMBED=1 DOCKER_STUB_IMAGE_ID=sha256:pinme oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" \
+     "img:pinned" "sha256:pinme" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" >/dev/null 2>&1; then
+  ok "显式候选:env release 非空仍可登记(瘦身稳态)"; else bad "显式候选应通过"; fi
+EJSON2="$(grep '^OC_RUNTIME_EMERGENCY_TUPLE=' "$OC_HOTCFG_ENV_FILE" | cut -d= -f2-)"
+chk "显式候选 JSON image/image_id/bundle 逐字面" "[ \"\$(jq -r .image <<<'$EJSON2')\" = 'img:pinned' ] && [ \"\$(jq -r .image_id <<<'$EJSON2')\" = 'sha256:pinme' ] && [ \"\$(jq -r .bundle <<<'$EJSON2')\" = '$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1' ]"
+chk "显式候选不改 env 现网 tuple(release 仍在)" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '$OC_HOTCFG_RELEASES_ROOT/rel-r1' ]"
+# 显式候选反例:显式 image_id 与 inspect .Id 不符 → 拒
+mk_emerg_env "" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1"
+if DOCKER_STUB_EMBED=1 DOCKER_STUB_IMAGE_ID=sha256:actual oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" \
+     "img:pinned" "sha256:claimed" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" >/dev/null 2>&1; then
+  bad "显式候选 ID 不符应拒"; else ok "显式候选 ID 不符被拒"; fi
+# R2-m1:成功写入后 env.bak 轮转(预置 12 份旧 bak + 本次新增 1 份 → 轮转后恰 10 份)
+mk_emerg_env "" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1"
+rm -f "$OC_HOTCFG_ENV_FILE".bak-*
+for i in $(seq -w 1 12); do : > "$OC_HOTCFG_ENV_FILE.bak-202601010000$i"; done
+DOCKER_STUB_EMBED=1 oc_hotcfg_write_emergency_tuple "$OC_HOTCFG_ENV_FILE" >/dev/null 2>&1 || bad "R2-m1 正例写入应成功"
+chk "R2-m1 emergency 成功后 bak 轮转至 10 份" "[ \"\$(ls -1 '$OC_HOTCFG_ENV_FILE'.bak-* 2>/dev/null | wc -l)\" = 10 ]"
+
 echo "== TM6 symlink 纳入 digest + verify(M6)=="
 # 造两棵含 symlink 的假 release 树,仅 symlink 目标不同 → digest 应不同
 MK_SYMTREE() { local d="$1" tgt="$2"; rm -rf "$d"; mkdir -p "$d/sub"; echo file > "$d/sub/a.txt"; ln -s "$tgt" "$d/link"; }
@@ -323,7 +387,7 @@ chk "删的是最旧(...01 不在)" "[ ! -e '$ENVR.bak-20260101000001' ]"
 chk "删的是次旧(...02 不在)" "[ ! -e '$ENVR.bak-20260101000002' ]"
 chk "保留最新(...12 在)" "[ -e '$ENVR.bak-20260101000012' ]"
 
-echo "== T8 saga 成功路径(全钩子 true,带 masterRelease + env.bak 轮转)=="
+echo "== T8 saga 成功路径(全钩子 true,带 masterRelease + R2-B2 首启 pre-state + env.bak 轮转)=="
 # 重置 env tuple 为已知旧值
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
 OC_RUNTIME_IMAGE=img:OLD
@@ -335,14 +399,44 @@ EOF
 oc_hotcfg_flip_current "$REV2"     # 旧 current=REV2
 NEWHIST="$OC_HOTCFG_HISTORY"
 if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$NEWHIST" \
-     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterNEW"; then ok "saga 成功返回 0"; else bad "saga 应成功"; fi
+     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterNEW" "/rel/masterPREV"; then ok "saga 成功返回 0"; else bad "saga 应成功"; fi
 chk "env OC_RUNTIME_IMAGE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:NEW' ]"
 chk "env OC_RUNTIME_RELEASE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/NEW' ]"
 chk "current 翻到 REV1" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV1' ]"
-chk "history 记录 committed 1 条" "[ \"\$(grep -c . '$NEWHIST')\" = 1 ]"
-chk "history 条目带 masterRelease=/rel/masterNEW" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$NEWHIST')\")\" = '/rel/masterNEW' ]"
+chk "history 共 2 条(pre-state + committed,R2-B2)" "[ \"\$(grep -c . '$NEWHIST')\" = 2 ]"
+PRE_ENTRY="$(oc_hotcfg_history_nth_committed "$NEWHIST" 2)"
+chk "pre-state 条目 preState=true 且四键=激活前 env 逐字面" "[ \"\$(jq -r .preState <<<'$PRE_ENTRY')\" = true ] && [ \"\$(jq -r .image <<<'$PRE_ENTRY')\" = 'img:OLD' ] && [ \"\$(jq -r .release <<<'$PRE_ENTRY')\" = '/rel/OLD' ] && [ \"\$(jq -r .bundle <<<'$PRE_ENTRY')\" = '/bun/OLD' ]"
+chk "pre-state 条目 masterRelease=激活前 master(/rel/masterPREV)" "[ \"\$(jq -r .masterRelease <<<'$PRE_ENTRY')\" = '/rel/masterPREV' ]"
+chk "history 末条带 masterRelease=/rel/masterNEW" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$NEWHIST')\")\" = '/rel/masterNEW' ]"
 
-echo "== T8b saga 仅 release(flip_rev 空 + bundle_value 空)→ 不翻 current、不写 OC_PLATFORM_BUNDLE(B2)=="
+echo "== TR2B2 首次启用 pre-state → rollback=1 逐字面退回启用前(含空值,R2-B1+R2-B2)=="
+# 启用前形态:release 键**缺失**、bundle 空值(两轴皆禁用)
+cat > "$WORK/pre.env" <<EOF
+OC_RUNTIME_IMAGE=img:PRE
+OC_RUNTIME_IMAGE_ID=sha256:PRE
+OC_PLATFORM_BUNDLE=
+EOF
+HPRE="$WORK/hist-pre"; : > "$HPRE"
+oc_hotcfg_flip_current "$REV2"
+# 首次启用(release+bundle 双轴)
+oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$HPRE" \
+  img:EN sha256:EN /rel/EN "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterEN" "/rel/masterPRE" \
+  >/dev/null 2>&1 || bad "TR2B2 首次启用 saga 应成功"
+# 模拟 --rollback=1:取倒数第 2 条 committed(= pre-state),按其逐字面值再走一次 saga
+RB="$(oc_hotcfg_history_nth_committed "$HPRE" 2)"
+chk "rollback 目标=pre-state 条目(preState=true)" "[ \"\$(jq -r .preState <<<'$RB')\" = true ]"
+RB_IMG="$(jq -r '.image' <<<"$RB")"; RB_ID="$(jq -r '.image_id' <<<"$RB")"
+RB_REL="$(jq -r '.release' <<<"$RB")"; RB_BUN="$(jq -r '.bundle' <<<"$RB")"
+chk "pre-state 记录 release/bundle 均为空(启用前皆禁用)" "[ -z '$RB_REL' ] && [ -z '$RB_BUN' ]"
+oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HPRE" \
+  "$RB_IMG" "$RB_ID" "$RB_REL" "$RB_BUN" "true" "true" "" "" "$(jq -r '.masterRelease' <<<"$RB")" "" \
+  >/dev/null 2>&1 || bad "TR2B2 回滚 saga 应成功"
+chk "退回启用前:OC_RUNTIME_RELEASE 空值(三态写恢复空)" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/pre.env'"
+chk "退回启用前:OC_PLATFORM_BUNDLE 空值" "grep -q '^OC_PLATFORM_BUNDLE=$' '$WORK/pre.env'"
+chk "退回启用前:image 复原 img:PRE" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$WORK/pre.env'|cut -d= -f2-)\" = 'img:PRE' ]"
+chk "回滚也留痕:history 共 3 条(pre-state+启用+回滚)" "[ \"\$(grep -c . '$HPRE')\" = 3 ]"
+
+echo "== T8b saga 仅 release(flip_rev 空 + bundle_value 空)→ 不翻 current、bundle 轴写空值(R2-B1)=="
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
 OC_RUNTIME_IMAGE=img:OLD
 OC_RUNTIME_IMAGE_ID=sha256:OLD
@@ -351,9 +445,9 @@ EOF
 : > "$OC_HOTCFG_HISTORY"
 oc_hotcfg_flip_current "$REV2"
 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
-  img:R sha256:R /rel/R "" "true" "true" "" "" "/rel/masterR" >/dev/null 2>&1 && ok "release-only saga 成功" || bad "release-only saga 应成功"
+  img:R sha256:R /rel/R "" "true" "true" "" "" "/rel/masterR" "/rel/masterPREV" >/dev/null 2>&1 && ok "release-only saga 成功" || bad "release-only saga 应成功"
 chk "release-only:OC_RUNTIME_RELEASE 写入 /rel/R" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/R' ]"
-chk "release-only:OC_PLATFORM_BUNDLE 不被覆盖(仍 /bun/KEEP)" "[ \"\$(grep ^OC_PLATFORM_BUNDLE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/bun/KEEP' ]"
+chk "release-only:OC_PLATFORM_BUNDLE 轴禁用 → 写空值(三态,旧值被清)" "grep -q '^OC_PLATFORM_BUNDLE=$' '$OC_HOTCFG_ENV_FILE'"
 chk "release-only:current 未翻转(仍 REV2)" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
 
 echo "== T9 saga 回滚(smoke 失败第 6 步)→ env/current 全复原 =="
@@ -373,7 +467,7 @@ else ok "saga 因 smoke 失败返回非 0"; fi
 chk "env OC_RUNTIME_IMAGE 复原为 OLD" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:OLD' ]"
 chk "env OC_RUNTIME_RELEASE 复原为 OLD" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/OLD' ]"
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
-chk "history 未提交(空文件)" "[ ! -s '$OC_HOTCFG_HISTORY' ]"
+chk "激活未提交:history 仅 pre-state 1 条(R2-B2,失败不回滚 pre-state)" "[ \"\$(grep -c . '$OC_HOTCFG_HISTORY')\" = 1 ] && [ \"\$(jq -r .preState <<<\"\$(oc_hotcfg_history_last_committed '$OC_HOTCFG_HISTORY')\")\" = true ]"
 chk "回滚后 restart 被调用 2 次(新+旧)" "[ \"\$(grep -c restart '$RESTART_LOG')\" = 2 ]"
 
 echo "== T10 saga 回滚(第 3 步 extra_apply 失败)=="
@@ -410,6 +504,46 @@ if oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$RE
 else ok "smoke 失败返回非 0(extra_apply 已成功)"; fi
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
 chk "M7c:.prev-release 指针经 extra_revert 还原为 OLDPREV" "[ \"\$(cat '$PREVPTR')\" = 'OLDPREV' ]"
+
+echo "== TR2M2c canary boot 冒烟两路径(R2-M2③)=="
+# 成功路径:双轴启用 → docker run 带 bundle 挂载(platform_root+rev)+ release 挂载 + validate-only env
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD
+OC_RUNTIME_IMAGE_ID=sha256:OLD
+OC_RUNTIME_RELEASE=/rel/OLD
+OC_PLATFORM_BUNDLE=/bun/OLD
+EOF
+oc_hotcfg_flip_current "$REV2"
+CRLOG="$WORK/canary-run.log"; : > "$CRLOG"
+DOCKER_STUB_RUN_LOG="$CRLOG" oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+  img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterC" "" \
+  >/dev/null 2>&1 && ok "canary 成功路径:saga 提交" || bad "canary 成功路径 saga 应成功"
+chk "canary 以 validate-only 跑 entrypoint" "grep -q 'OC_ENTRYPOINT_VALIDATE_ONLY=1' '$CRLOG' && grep -q -- '--entrypoint /usr/local/bin/entrypoint.sh' '$CRLOG'"
+chk "canary 带 bundle 轴挂载 + rev-pinned env" "grep -q -- '-v $OC_HOTCFG_PLATFORM_ROOT:/run/oc/platform:ro' '$CRLOG' && grep -q 'OC_PLATFORM_BUNDLE_REV=$REV1' '$CRLOG'"
+chk "canary 带 release 轴挂载(:ro)" "grep -q -- '-v /rel/NEWREL:/opt/openclaude:ro' '$CRLOG'"
+chk "canary 以 immutable image_id 起容器" "grep -q 'sha256:NEWID' '$CRLOG'"
+chk "canary 屏蔽真实上游(ANTHROPIC_BASE_URL 钉死黑洞)" "grep -q 'ANTHROPIC_BASE_URL=http://127.0.0.1:1' '$CRLOG'"
+# 失败路径:canary 非 0 → saga 拒绝激活;现场未动(env/current 原样)、旧 master 不被无谓重启
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD
+OC_RUNTIME_IMAGE_ID=sha256:OLD
+OC_RUNTIME_RELEASE=/rel/OLD
+OC_PLATFORM_BUNDLE=/bun/OLD
+EOF
+oc_hotcfg_flip_current "$REV2"
+CRESTART="$WORK/canary-restart.log"; : > "$CRESTART"
+if DOCKER_STUB_RUN_FAIL=1 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
+     img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$CRESTART" "true" "" "" "/rel/masterC" "" \
+     >/dev/null 2>&1; then bad "canary 失败应让 saga 返回非 0"; else ok "canary 失败 → saga 拒绝激活"; fi
+chk "canary 失败:env 未动(仍 OLD)" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/OLD' ]"
+chk "canary 失败:current 未动(仍 REV2)" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
+chk "canary 失败:未无谓重启旧 master(现场未动无需 restart)" "[ ! -s '$CRESTART' ]"
+# 两轴皆禁用(release 空 + flip_rev 空)→ canary 跳过(docker run 不被调用)
+CRLOG2="$WORK/canary-run2.log"; : > "$CRLOG2"
+DOCKER_STUB_RUN_LOG="$CRLOG2" oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
+  img:NEW sha256:NEWID "" "" "true" "true" "" "" "/rel/masterC" "" >/dev/null 2>&1 \
+  && ok "双轴禁用 saga 成功(写空值)" || bad "双轴禁用 saga 应成功"
+chk "双轴禁用 → canary 跳过(无 docker run)" "[ ! -s '$CRLOG2' ]"
 
 echo ""
 echo "════════ 结果:PASS=$PASS FAIL=$FAIL ════════"

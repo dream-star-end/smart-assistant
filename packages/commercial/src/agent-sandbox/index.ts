@@ -98,7 +98,9 @@ export {
 export {
   makeV3EnsureRunning,
   ENSURE_RUNNING_DEFAULTS,
+  classifyRuntimeArtifactFailure,
   type EnsureRunningOptions,
+  type RuntimeArtifactFailureClass,
 } from "./v3ensureRunning.js";
 
 // V3 Phase 3E — readiness probe(HTTP /healthz + WS upgrade)

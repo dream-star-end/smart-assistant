@@ -42,7 +42,8 @@ PERSONAL_SRC="${PERSONAL_SRC:-/opt/openclaude/openclaude}"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
-IMAGE_OUT_DIR="/var/lib/openclaude-v3/images"
+# tar 输出目录(仅 GC drill 用 env 覆盖到假树,生产恒默认值)
+IMAGE_OUT_DIR="${OC_IMAGE_OUT_DIR:-/var/lib/openclaude-v3/images}"
 
 # OC_EMBED_SOURCE(m4):=0 → **纯工具链镜像**,不内嵌个人版源码。此时 build context 只需
 # Dockerfile+runtime/+platform-runtime/,**跳过 ccb prebuild(不需 bun)与个人源码 rsync**,
@@ -139,6 +140,188 @@ if [ ! -f "$SANDBOX_DIR/runtime-src-excludes.txt" ]; then
 fi
 
 mkdir -p "$IMAGE_OUT_DIR"
+
+# ───────────────────────────────────────────────
+# image GC(函数化;正常流在 save 之后调用,OC_IMAGE_GC_ONLY=1 可单独跑)
+# ───────────────────────────────────────────────
+# 背景:每次 build 在 master 同时累积一份 docker image (~3.5GB) 和一份
+# tar.gz (~660MB)。8 个 tag 就能把 49GB 根盘打到 99% (历史事件 2026-04-29)。
+#
+# 远端 host 已有 _pruneRemoteStaleImages 在分发后自动清旧 tag,master 没有
+# 对应路径,所以这里收尾。
+#
+# 触发点:build-image.sh 末尾(build 是 rebuild 的唯一入口,GC 频率 ≈ 累积频率,
+# 自然平衡,**不**写 systemd timer / cron);或 OC_IMAGE_GC_ONLY=1 手动/演练单跑。
+#
+# 保留集(tag 面)= {本次 build $TAG} ∪ {latest} ∪ {两 env OC_RUNTIME_IMAGE tag}
+#         ∪ {emergency tuple image tag} ∪ {top OC_IMAGE_KEEP_LAST 个 by created desc}
+# 保护集(**immutable ID 面,R2-M1**)= {两 env OC_RUNTIME_IMAGE 解析出的 .Id}
+#         ∪ {emergency tuple 的 image_id}。候选 stale tag 删除前先 inspect .Id:
+#         ∈ 保护集 → skip(tag 可被重打,同一镜像可能顶着别的 tag 在用);inspect
+#         失败 → **保守跳过该 tag**(拿不到 ID 就不删)。
+# emergency tuple JSON 解析失败(jq 报错/image・image_id 字段缺)→ **放弃本轮 GC**
+# (R2-M1,禁 `|| true` 吞错:保护集算不全时删除面必须归零)。
+#
+# 边界:
+#   - in-use image rmi 自然 fail,best-effort skip(脚本不抛)
+#   - 不调 docker image prune / system prune(多租户主机越权 — archival
+#     arc-mof4luq1-r9o8ze 教训)
+#   - 不删 latest tag 自身;不动 dangling <none>:<none>;不删 build cache
+#
+# Env switches:
+#   OC_IMAGE_KEEP_LAST=N      # 默认 3
+#   OC_IMAGE_GC=0             # 整体跳过 GC(冻结历史 / 调试)
+#   OC_IMAGE_GC_DRY_RUN=1     # 打印待清单不执行
+#   OC_IMAGE_GC_ONLY=1        # 跳过 build/save 只跑 GC(手动清理/drill)
+#   OC_IMAGE_GC_ENV_V5/V3     # env 文件路径覆盖(仅自测 stub 用)
+image_gc() {
+  if [ "${OC_IMAGE_GC:-1}" = "0" ]; then
+    echo "[build-image] image-gc skipped (OC_IMAGE_GC=0)"
+    return 0
+  fi
+  local KEEP_LAST DRY_RUN ENV_FILE_V5 ENV_FILE_V3
+  KEEP_LAST="${OC_IMAGE_KEEP_LAST:-3}"
+  DRY_RUN="${OC_IMAGE_GC_DRY_RUN:-0}"
+  # B7:ENV_FILE 优先 v5(commercial-v5.env);同时并读 v3(commercial.env)兜底 v3 遗留镜像。
+  ENV_FILE_V5="${OC_IMAGE_GC_ENV_V5:-/etc/openclaude/commercial-v5.env}"
+  ENV_FILE_V3="${OC_IMAGE_GC_ENV_V3:-/etc/openclaude/commercial.env}"
+
+  # 从 image ref 取 tag(最后一个冒号之后,不含路径分隔 /);无 tag → 空。
+  tag_of_ref() { printf '%s' "$1" | sed -n 's|^.*:\([^:/]*\)$|\1|p'; }
+  # 取某 env 文件 OC_RUNTIME_IMAGE 的完整 ref / tag(缺文件/缺键 → 空,不触发 set -e)
+  env_runtime_ref() {
+    local f="$1" line
+    [ -f "$f" ] || return 0
+    line="$(grep -E '^OC_RUNTIME_IMAGE=' "$f" 2>/dev/null | tail -n1 || true)"
+    [ -n "$line" ] && printf '%s\n' "${line#OC_RUNTIME_IMAGE=}"
+    return 0
+  }
+  env_runtime_tag() { tag_of_ref "$(env_runtime_ref "$1")"; return 0; }
+
+  # emergency tuple(v5 env,JSON 单行 {image,image_id,bundle})严格解析(R2-M1):
+  # 行存在但 jq 报错 / image・image_id 任一字段缺 → 返回 1 = 调用方放弃本轮 GC。
+  # 逃生镜像常是更老的内嵌源码 tag,极易掉出 created-desc 的 KEEP_LAST 窗口,必须显式保护。
+  local EMERG_TAG="" EMERG_IMAGE_ID=""
+  parse_emergency() {
+    local f="$1" line json img
+    [ -f "$f" ] || return 0
+    line="$(grep -E '^OC_RUNTIME_EMERGENCY_TUPLE=' "$f" 2>/dev/null | tail -n1 || true)"
+    [ -n "$line" ] || return 0
+    command -v jq >/dev/null 2>&1 || { echo "[build-image] FATAL: image-gc 需 jq 解析 emergency tuple 保护(防误删逃生镜像)" >&2; return 1; }
+    json="${line#OC_RUNTIME_EMERGENCY_TUPLE=}"
+    if ! img="$(printf '%s' "$json" | jq -r '.image // empty' 2>/dev/null)" \
+       || ! EMERG_IMAGE_ID="$(printf '%s' "$json" | jq -r '.image_id // empty' 2>/dev/null)"; then
+      echo "[build-image] ⚠ image-gc: emergency tuple JSON 解析失败(jq 报错)→ 放弃本轮 GC: $json" >&2
+      return 1
+    fi
+    if [ -z "$img" ] || [ -z "$EMERG_IMAGE_ID" ]; then
+      echo "[build-image] ⚠ image-gc: emergency tuple 缺 image/image_id 字段 → 放弃本轮 GC: $json" >&2
+      return 1
+    fi
+    EMERG_TAG="$(tag_of_ref "$img")"
+    return 0
+  }
+  if ! parse_emergency "$ENV_FILE_V5"; then
+    echo "[build-image] image-gc aborted(emergency tuple 解析失败,保护集算不全 → 本轮不删任何镜像)"
+    return 0
+  fi
+
+  # 展示用当前 tag(优先 v5,回退 v3)
+  local CURRENT_TAG
+  CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V5")"
+  [ -n "$CURRENT_TAG" ] || CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V3")"
+
+  # 列出本仓所有 tag,按 docker images 默认 created desc 顺序(最新在前)
+  local ALL_TAGS_FILE KEEP_FILE PROTECT_FILE PROTECT_IDS_FILE
+  ALL_TAGS_FILE="$(mktemp)"; KEEP_FILE="$(mktemp)"; PROTECT_FILE="$(mktemp)"; PROTECT_IDS_FILE="$(mktemp)"
+  # EXIT 级清理(不能用 RETURN trap:它会在其后每次嵌套函数返回时都触发,把在建的临时文件删掉)。
+  # 本脚本此前无其它 EXIT trap,覆盖安全;GC 在脚本尾段跑,EXIT 清理时效足够。
+  # shellcheck disable=SC2064
+  trap "rm -f '$ALL_TAGS_FILE' '$KEEP_FILE' '$PROTECT_FILE' '$PROTECT_IDS_FILE'" EXIT
+  docker images "$IMAGE_REPO" --format '{{.Tag}}' > "$ALL_TAGS_FILE" 2>/dev/null || true
+
+  # R2-M1:immutable ID 保护集 = 两 env OC_RUNTIME_IMAGE 解析出的 .Id + emergency image_id。
+  # env 引用镜像本机 inspect 不到 → 本机没有"那一个镜像",无 ID 需保护(跳过,不视为错)。
+  local _ref _id
+  for _ref in "$(env_runtime_ref "$ENV_FILE_V5")" "$(env_runtime_ref "$ENV_FILE_V3")"; do
+    [ -n "$_ref" ] || continue
+    if _id="$(docker image inspect --format '{{.Id}}' "$_ref" 2>/dev/null)"; then
+      [ -n "$_id" ] && printf '%s\n' "$_id" >> "$PROTECT_IDS_FILE"
+    fi
+  done
+  [ -n "$EMERG_IMAGE_ID" ] && printf '%s\n' "$EMERG_IMAGE_ID" >> "$PROTECT_IDS_FILE"
+
+  # 构建 keep set (tag 面;newline-separated 文本,grep -F -x -f 比较)。
+  # 选 top KEEP_LAST 个历史 tag 时:**先**过滤掉所有 PROTECT tag,
+  # 否则它们会占 KEEP_LAST 槽位,实际保留的独立历史版本数 < KEEP_LAST。
+  {
+    echo "$TAG"
+    echo "latest"
+    env_runtime_tag "$ENV_FILE_V5"
+    env_runtime_tag "$ENV_FILE_V3"
+    [ -n "$EMERG_TAG" ] && echo "$EMERG_TAG"
+    :
+  } | grep -v '^$' | sort -u > "$PROTECT_FILE"
+  # `|| true` 兜底:全新机器首次 build 时 ALL_TAGS - PROTECT 可能为空,grep -v
+  # 无匹配返回 exit 1,set -euo pipefail 下会让外层 { } 子块中断。
+  {
+    cat "$PROTECT_FILE"
+    { grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$PROTECT_FILE" | head -n "$KEEP_LAST"; } || true
+  } | sort -u > "$KEEP_FILE"
+
+  # 待清 = ALL - KEEP, 跳过 <none>
+  local STALE_TAGS
+  STALE_TAGS="$(grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$KEEP_FILE" || true)"
+
+  echo "[build-image] image-gc keep_last=$KEEP_LAST dry_run=$DRY_RUN current_tag=${CURRENT_TAG:-<none>}"
+  echo "[build-image] image-gc keep set:"
+  sed 's/^/  - /' "$KEEP_FILE"
+  echo "[build-image] image-gc protected IDs:"
+  sed 's/^/  - /' "$PROTECT_IDS_FILE"
+
+  if [ -z "$STALE_TAGS" ]; then
+    echo "[build-image] image-gc no stale tags to remove"
+    return 0
+  fi
+  echo "[build-image] image-gc stale tags:"
+  printf '  - %s\n' $STALE_TAGS
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[build-image] image-gc DRY_RUN — no changes"
+    return 0
+  fi
+  local t tid STALE_TAR
+  for t in $STALE_TAGS; do
+    # R2-M1:删除前按 immutable ID 复核。inspect 失败 → 保守跳过(拿不到 ID 就不删);
+    # .Id ∈ 保护集 → 跳过(该 tag 与某 env/emergency 在用镜像是同一实体,只是 tag 别名)。
+    if ! tid="$(docker image inspect --format '{{.Id}}' "${IMAGE_REPO}:${t}" 2>/dev/null)"; then
+      echo "[build-image] image-gc skip (inspect .Id 失败,保守不删): ${IMAGE_REPO}:${t}"
+      continue
+    fi
+    if grep -qxF "$tid" "$PROTECT_IDS_FILE"; then
+      echo "[build-image] image-gc skip (immutable ID 受保护 $tid): ${IMAGE_REPO}:${t}"
+      continue
+    fi
+    if docker rmi "${IMAGE_REPO}:${t}" >/dev/null 2>&1; then
+      echo "[build-image] image-gc rmi ok: ${IMAGE_REPO}:${t}"
+      # 同时清对应 tar.gz(若存在)
+      STALE_TAR="${IMAGE_OUT_DIR}/openclaude-runtime-${t}.tar.gz"
+      if [ -f "$STALE_TAR" ]; then
+        rm -f "$STALE_TAR" && echo "[build-image] image-gc rm tar: $STALE_TAR"
+      fi
+    else
+      # 多半是 in-use(active container 引用),best-effort skip
+      echo "[build-image] image-gc rmi skipped (in-use? other err): ${IMAGE_REPO}:${t}"
+    fi
+  done
+  return 0
+}
+
+# OC_IMAGE_GC_ONLY=1 → 跳过 build/save,仅跑 GC(手动清理入口;drill 用 docker stub 覆盖)。
+if [ "${OC_IMAGE_GC_ONLY:-0}" = "1" ]; then
+  echo "[build-image] OC_IMAGE_GC_ONLY=1 → 只跑 image GC,跳过 build context/docker build/save"
+  image_gc
+  exit 0
+fi
 
 # ───────────────────────────────────────────────
 # 1. 准备 build context
@@ -270,128 +453,7 @@ fi
 # ───────────────────────────────────────────────
 # 4. master-side image GC (保留最新 N 个 + latest + 当前在用 + 本次 build)
 # ───────────────────────────────────────────────
-# 背景:每次 build 在 master 同时累积一份 docker image (~3.5GB) 和一份
-# tar.gz (~660MB)。8 个 tag 就能把 49GB 根盘打到 99% (历史事件 2026-04-29)。
-#
-# 远端 host 已有 _pruneRemoteStaleImages 在分发后自动清旧 tag,master 没有
-# 对应路径,所以这里收尾。
-#
-# 触发点:仅 build-image.sh 末尾。**不**写 systemd timer / cron — build 是
-# rebuild 的唯一入口,GC 频率 ≈ 累积频率,自然平衡。
-#
-# 保留集 = {本次 build $TAG} ∪ {latest} ∪ {OC_RUNTIME_IMAGE 当前指向 tag}
-#         ∪ {top OC_IMAGE_KEEP_LAST 个 by created desc}
-#
-# 边界:
-#   - in-use image rmi 自然 fail,best-effort skip(脚本不抛)
-#   - 不调 docker image prune / system prune(多租户主机越权 — archival
-#     arc-mof4luq1-r9o8ze 教训)
-#   - 不删 latest tag 自身
-#   - 不动 dangling <none>:<none>
-#   - 不删 build cache(boss 自管 docker builder prune)
-#
-# Env switches:
-#   OC_IMAGE_KEEP_LAST=N      # 默认 3
-#   OC_IMAGE_GC=0             # 整体跳过 GC(冻结历史 / 调试)
-#   OC_IMAGE_GC_DRY_RUN=1     # 打印待清单不执行
-if [ "${OC_IMAGE_GC:-1}" = "0" ]; then
-  echo "[build-image] image-gc skipped (OC_IMAGE_GC=0)"
-else
-  KEEP_LAST="${OC_IMAGE_KEEP_LAST:-3}"
-  DRY_RUN="${OC_IMAGE_GC_DRY_RUN:-0}"
-  # B7:ENV_FILE 优先 v5(commercial-v5.env);同时并读 v3(commercial.env)兜底 v3 遗留镜像。
-  # 两个 env 的 OC_RUNTIME_IMAGE tag + v5 env 的 emergency tuple image tag 都进保护集 —— 防
-  # image-gc 把某 env 在用/逃生所需的镜像误删。
-  ENV_FILE_V5="/etc/openclaude/commercial-v5.env"
-  ENV_FILE_V3="/etc/openclaude/commercial.env"
-
-  # 从 image ref 取 tag(最后一个冒号之后,不含路径分隔 /);无 tag → 空。
-  tag_of_ref() { printf '%s' "$1" | sed -n 's|^.*:\([^:/]*\)$|\1|p'; }
-  # 取某 env 文件 OC_RUNTIME_IMAGE 的 tag(缺文件/缺键 → 空,不触发 set -e)
-  env_runtime_tag() {
-    local f="$1" line
-    [ -f "$f" ] || return 0
-    line="$(grep -E '^OC_RUNTIME_IMAGE=' "$f" 2>/dev/null | tail -n1 || true)"
-    [ -n "$line" ] && tag_of_ref "${line#OC_RUNTIME_IMAGE=}"
-    return 0
-  }
-  # 取 v5 env 的 emergency tuple(JSON 单行 {image,image_id,bundle})image tag —— 逃生镜像常是
-  # 更老的内嵌源码 tag,极易掉出 created-desc 的 KEEP_LAST 窗口,必须显式保护。仅在存在 emergency
-  # 行时才需 jq;缺 jq 且有该行 → fail-loud(宁停 GC 也不误删逃生镜像)。jq 是既定依赖。
-  env_emergency_tag() {
-    local f="$1" line json img
-    [ -f "$f" ] || return 0
-    line="$(grep -E '^OC_RUNTIME_EMERGENCY_TUPLE=' "$f" 2>/dev/null | tail -n1 || true)"
-    [ -n "$line" ] || return 0
-    command -v jq >/dev/null 2>&1 || { echo "[build-image] FATAL: image-gc 需 jq 解析 emergency tuple 保护(防误删逃生镜像)" >&2; exit 1; }
-    json="${line#OC_RUNTIME_EMERGENCY_TUPLE=}"
-    img="$(printf '%s' "$json" | jq -r '.image // empty' 2>/dev/null || true)"
-    [ -n "$img" ] && tag_of_ref "$img"
-    return 0
-  }
-
-  # 展示用当前 tag(优先 v5,回退 v3)
-  CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V5")"
-  [ -n "$CURRENT_TAG" ] || CURRENT_TAG="$(env_runtime_tag "$ENV_FILE_V3")"
-
-  # 列出本仓所有 tag,按 docker images 默认 created desc 顺序
-  # --format 用 \t 分隔,docker 自身保证 created desc(最新在前)
-  ALL_TAGS_FILE="$(mktemp)"
-  trap 'rm -f "$ALL_TAGS_FILE"' EXIT
-  docker images "$IMAGE_REPO" --format '{{.Tag}}' > "$ALL_TAGS_FILE" 2>/dev/null || true
-
-  # 构建 keep set (用 newline-separated 文本,grep -F -x -f 比较)。
-  # 选 top KEEP_LAST 个历史 tag 时:**先**过滤掉所有 PROTECT tag,
-  # 否则它们会占 KEEP_LAST 槽位,实际保留的独立历史版本数 < KEEP_LAST。
-  KEEP_FILE="$(mktemp)"
-  trap 'rm -f "$ALL_TAGS_FILE" "$KEEP_FILE"' EXIT
-  PROTECT_FILE="$(mktemp)"
-  trap 'rm -f "$ALL_TAGS_FILE" "$KEEP_FILE" "$PROTECT_FILE"' EXIT
-  {
-    echo "$TAG"
-    echo "latest"
-    env_runtime_tag "$ENV_FILE_V5"
-    env_runtime_tag "$ENV_FILE_V3"
-    env_emergency_tag "$ENV_FILE_V5"
-  } | grep -v '^$' | sort -u > "$PROTECT_FILE"
-  # `|| true` 兜底:全新机器首次 build 时 ALL_TAGS - PROTECT 可能为空,grep -v
-  # 无匹配返回 exit 1,set -euo pipefail 下会让外层 { } 子块中断。
-  {
-    cat "$PROTECT_FILE"
-    { grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$PROTECT_FILE" | head -n "$KEEP_LAST"; } || true
-  } | sort -u > "$KEEP_FILE"
-
-  # 待清 = ALL - KEEP, 跳过 <none>
-  STALE_TAGS="$(grep -v '^<none>$' "$ALL_TAGS_FILE" | grep -F -x -v -f "$KEEP_FILE" || true)"
-
-  echo "[build-image] image-gc keep_last=$KEEP_LAST dry_run=$DRY_RUN current_tag=${CURRENT_TAG:-<none>}"
-  echo "[build-image] image-gc keep set:"
-  sed 's/^/  - /' "$KEEP_FILE"
-
-  if [ -z "$STALE_TAGS" ]; then
-    echo "[build-image] image-gc no stale tags to remove"
-  else
-    echo "[build-image] image-gc stale tags:"
-    printf '  - %s\n' $STALE_TAGS
-    if [ "$DRY_RUN" = "1" ]; then
-      echo "[build-image] image-gc DRY_RUN — no changes"
-    else
-      for t in $STALE_TAGS; do
-        if docker rmi "${IMAGE_REPO}:${t}" >/dev/null 2>&1; then
-          echo "[build-image] image-gc rmi ok: ${IMAGE_REPO}:${t}"
-          # 同时清对应 tar.gz(若存在)
-          STALE_TAR="${IMAGE_OUT_DIR}/openclaude-runtime-${t}.tar.gz"
-          if [ -f "$STALE_TAR" ]; then
-            rm -f "$STALE_TAR" && echo "[build-image] image-gc rm tar: $STALE_TAR"
-          fi
-        else
-          # 多半是 in-use(active container 引用),best-effort skip
-          echo "[build-image] image-gc rmi skipped (in-use? other err): ${IMAGE_REPO}:${t}"
-        fi
-      done
-    fi
-  fi
-fi
+image_gc
 
 # ───────────────────────────────────────────────
 # 5. summary

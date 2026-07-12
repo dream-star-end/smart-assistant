@@ -101,6 +101,10 @@ export const PLATFORM_BUNDLE_TOP_LEVEL = new Set<string>([
 export const PLATFORM_BUNDLE_REQUIRED_LEAVES: readonly string[] = [
   "entrypoint/entrypoint.ts",
   "entrypoint/platformBundle.ts",
+  // supervisor 注入 OPENCLAUDE_WEB_CONTEXT_BIN=<current>/bin/oc-web-context;bundle 缺此薄壳 =
+  // 注入了一条**死路径**(容器内 oc-web MCP 起不来,静默退化)。M2:提前到校验期 fail-closed。
+  // 构建期 finalize_bundle 由 bin/oc-web-context.py 剥扩展名而来(与 F2 的 bash selfcheck 同清单)。
+  "bin/oc-web-context",
   "seed/platform-seed.yaml",
   "prompts/platform-capabilities.md",
   "prompts/memory-instructions.md",
@@ -598,8 +602,13 @@ export function resolvePlatformBundleMount(
  * 不等 = 激活中间态 → 拒 provision(前端 retry 兜底,与今日 restart 窗口同量级)。
  *
  * 这是**便宜的**每次 provision 检查(readlink + 两次 realpath),与昂贵的全量
- * resolvePlatformBundleMount(逐文件 sha256,启动期一次)分工。失败抛
- * SupervisorError("RuntimePlacementInvalid")。
+ * resolvePlatformBundleMount(逐文件 sha256,启动期一次)分工。
+ *
+ * **R2-M5 错误码语义**:本函数的所有失败都是激活 saga 的**中间态**(current 尚未翻到声明 bundle /
+ * 目标形态畸形 / current 暂不可读),属于正常的秒级窗口(≈ 一次 restart 时长),故抛
+ * SupervisorError("RuntimeActivationInProgress") —— 让 v3ensureRunning 走 5s 短重试 + 不发 critical
+ * (与 provisioning 同级),而非当永久坏产物吃 300s 长重试 + critical 告警。RuntimePlacementInvalid
+ * 现专留给**多机 placement 硬门**(release 调度到非 self-host)。
  *
  * **B5 symlink 契约加固**:除 realpath 相等外,另断言 current 的 **readlink 原始目标** 恰为
  * 规范相对形态 `bundles/<12hex>`(bash `oc_hotcfg_flip_current` 产 `ln -s "bundles/$rev"`)。
@@ -616,13 +625,13 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
     rawTarget = readlinkSync(currentLink);
   } catch (e) {
     throw new SupervisorError(
-      "RuntimePlacementInvalid",
+      "RuntimeActivationInProgress",
       `platform current symlink unreadable (${currentLink}): ${(e as Error).message}`,
     );
   }
   if (!CURRENT_LINK_TARGET_RE.test(rawTarget)) {
     throw new SupervisorError(
-      "RuntimePlacementInvalid",
+      "RuntimeActivationInProgress",
       `platform current target must be canonical relative "bundles/<12hex>"; got ${JSON.stringify(rawTarget)}`,
     );
   }
@@ -632,7 +641,7 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
     currentReal = realpathSync(currentLink);
   } catch (e) {
     throw new SupervisorError(
-      "RuntimePlacementInvalid",
+      "RuntimeActivationInProgress",
       `platform current symlink unresolvable (${currentLink}): ${(e as Error).message}`,
     );
   }
@@ -640,13 +649,13 @@ export function assertCurrentMatches(platformRoot: string, expectedBundlePath: s
     expectedReal = realpathSync(expectedBundlePath);
   } catch (e) {
     throw new SupervisorError(
-      "RuntimePlacementInvalid",
+      "RuntimeActivationInProgress",
       `expected bundle path unresolvable (${expectedBundlePath}): ${(e as Error).message}`,
     );
   }
   if (currentReal !== expectedReal) {
     throw new SupervisorError(
-      "RuntimePlacementInvalid",
+      "RuntimeActivationInProgress",
       `platform activation mid-state: current=${currentReal} != expected=${expectedReal}`,
     );
   }

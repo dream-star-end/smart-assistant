@@ -321,3 +321,150 @@ export function buildSeedAgent(args: {
   }
   return out;
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// R2-M2:platform seed 资产存在性语义校验(entrypoint validate-only 与 deploy prepare CLI 共用)
+// ───────────────────────────────────────────────────────────────────────
+
+export interface SeedAssetCheckDeps {
+  /** 路径存在判定(注入以便测试;生产 = existsSync)。 */
+  exists: (path: string) => boolean;
+  /** 解 symlink 取真实路径(注入;生产 = realpathSync;源必存在故不特判 ENOENT)。 */
+  realpath: (path: string) => string;
+  /** 路径拼接(注入;生产 = node:path join)。 */
+  join: (...parts: string[]) => string;
+}
+
+/**
+ * 对**已通过 schema 校验**的 platform seed 做**资产存在性 + containment** 语义校验:
+ *   - 每个 agent 的 persona 引用(personas/<slug>.md)在 <seedDir> 内实际存在,且 realpath 不逃逸 seed 子树;
+ *   - 每个 seedSkills[agentId][name] 对应 <seedDir>/skills/<agentId>/<name>/SKILL.md 实际存在且不逃逸。
+ *
+ * 返回错误原因清单(空 = 全过)。**纯函数**(fs/path 全注入),同时服务:
+ *   1. deploy prepare 的 validatePlatformSeedCli(离线校验 bundle 产物,F2 接线);
+ *   2. entrypoint validate-only 模式(canary boot 冒烟)。
+ * schema 校验(validatePlatformSeed)已把 slug/persona-ref 收敛为一道防线;本函数补"引用的文件真的在"
+ * 这一层(schema 只管形态,不管磁盘)。containment 为消费端二道防线,兜 schema 被绕过的路径逃逸。
+ */
+export function validateSeedAssetsExist(
+  seedDir: string,
+  seedDirReal: string,
+  doc: PlatformSeedDoc,
+  deps: SeedAssetCheckDeps,
+): string[] {
+  const errors: string[] = [];
+  const checkContained = (abs: string, label: string): void => {
+    if (!deps.exists(abs)) {
+      errors.push(`${label} missing: ${abs}`);
+      return;
+    }
+    if (!isPathWithin(seedDirReal, deps.realpath(abs))) {
+      errors.push(`${label} escapes bundle seed dir: ${abs}`);
+    }
+  };
+  for (const decl of doc.agents) {
+    if (decl.persona) {
+      checkContained(deps.join(seedDir, decl.persona), `persona for agent "${decl.id}"`);
+    }
+  }
+  for (const [agentId, names] of Object.entries(doc.seedSkills)) {
+    for (const name of names) {
+      checkContained(
+        deps.join(seedDir, "skills", agentId, name, "SKILL.md"),
+        `seed skill "${agentId}/${name}"`,
+      );
+    }
+  }
+  return errors;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// R2-M4:volume 平台写入的 symlink 逃逸纵深防御(纯函数 + 注入 fs 便于测)
+// ───────────────────────────────────────────────────────────────────────
+
+export interface AncestryLstat {
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * 从 volumeRoot(**exclusive**)向下到 targetPath(**inclusive**),对每级**已存在**祖先 lstat 拒 symlink。
+ * volumeRoot 自身及其之上视为部署可信(named volume 挂载点,不检查)。
+ *
+ * 意义(R2-M4 写侧纵深):卷内内容在两次 boot 之间由容器内进程(即 agent 本身)可写。攻击者可把
+ * `agents/<id>` 换成指向 `/etc` 的 symlink,词法 containment(isPathWithin)判定不出来 —— 写
+ * `agents/<id>/CLAUDE.md` 就穿透到卷外。逐级 lstat 已存在祖先(含 targetPath 自身,拒被换成 symlink
+ * 的目标文件)即从写侧堵死。用 lstat 而非 exists:dangling symlink 上 exists=false 但 lstat 成功,
+ * 必须识别为 symlink 拒之。命中 → 抛(调用方 catch → 跳过该 agent 平台 seed,不崩 entrypoint)。
+ */
+export function assertVolumeAncestryNoSymlink(
+  targetPath: string,
+  volumeRoot: string,
+  lstat: (p: string) => AncestryLstat,
+  dirname: (p: string) => string,
+): void {
+  const chain: string[] = [];
+  let cur = targetPath;
+  for (;;) {
+    if (cur === volumeRoot) break;
+    chain.push(cur);
+    const parent = dirname(cur);
+    if (parent === cur) {
+      // 走到文件系统根仍未命中 volumeRoot → targetPath 词法上不在 volumeRoot 下,拒。
+      throw new Error(`platform volume write target escapes volume root: ${targetPath} (root=${volumeRoot})`);
+    }
+    cur = parent;
+  }
+  // 自顶向下(靠近 root → 靠近 target)逐级检查已存在层级。
+  for (const p of [...chain].reverse()) {
+    let st: AncestryLstat;
+    try {
+      st = lstat(p);
+    } catch {
+      continue; // 该级尚未创建 → 跳过(mkdir 会补)
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`platform volume ancestry contains a symlink (refusing to write through it): ${p}`);
+    }
+  }
+}
+
+export interface SafeVolumeWriteFs {
+  lstatSync: (p: string) => AncestryLstat;
+  mkdirSync: (p: string, opts: { recursive: boolean }) => void;
+  realpathSync: (p: string) => string;
+  writeFileSync: (p: string, data: string | Buffer, opts: { mode: number }) => void;
+  renameSync: (from: string, to: string) => void;
+}
+
+/**
+ * 安全写平台文件到用户 volume(R2-M4 symlink 逃逸纵深防御,三步合一):
+ *   1. assertVolumeAncestryNoSymlink:目标在 volumeRoot 以下每级已存在祖先(含目标)非 symlink,词法越界亦拒;
+ *   2. mkdir 父目录(recursive)后 **realpath 复核**父目录仍落在 volumeRoot 子树内(拒 mkdir 沿 symlink 逃逸);
+ *   3. 同目录**临时文件 + rename 原子落盘**(读者永不看到半写文件;rename 同目录同 fs 是原子的)。
+ * 任一步失败抛(调用方 catch → 跳过该 agent 平台 seed,不崩 entrypoint)。纯函数,fs/path/rand 全注入便于测。
+ */
+export function safeWritePlatformVolumeFile(args: {
+  targetPath: string;
+  volumeRoot: string;
+  content: string | Buffer;
+  mode: number;
+  fs: SafeVolumeWriteFs;
+  dirname: (p: string) => string;
+  randomSuffix: () => string;
+}): void {
+  const { targetPath, volumeRoot, content, mode, fs, dirname, randomSuffix } = args;
+  assertVolumeAncestryNoSymlink(targetPath, volumeRoot, fs.lstatSync, dirname);
+  const parent = dirname(targetPath);
+  fs.mkdirSync(parent, { recursive: true });
+  const volumeRootReal = fs.realpathSync(volumeRoot);
+  const parentReal = fs.realpathSync(parent);
+  // 容器 runtime 恒 POSIX;"/" 分隔判定子树。
+  if (parentReal !== volumeRootReal && !parentReal.startsWith(volumeRootReal + "/")) {
+    throw new Error(
+      `platform volume write parent realpath escapes volume root: ${parentReal} not under ${volumeRootReal}`,
+    );
+  }
+  const tmp = `${targetPath}.tmp-${randomSuffix()}`;
+  fs.writeFileSync(tmp, content, { mode });
+  fs.renameSync(tmp, targetPath);
+}

@@ -32,6 +32,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -57,14 +58,17 @@ import {
 // fallback),platformBundle.ts 与本文件同目录同步 COPY/bundle,故 `./` 在两处都解析得到。
 // 该模块**不进 commercial tsc 编译图**(与 entrypoint.ts 同,靠 entrypointPlatform.test.ts 守护)。
 import {
+  assertVolumeAncestryNoSymlink,
   buildSeedAgent,
   decidePersonaWrite,
   isPathWithin,
   resolvePlatformCodexSkillsDir,
   resolvePlatformSeedDir,
+  safeWritePlatformVolumeFile,
   sha256Hex,
   shouldWriteSeededSkill,
   validatePlatformSeed,
+  validateSeedAssetsExist,
   type PlatformSeedAgentDecl,
   type PlatformSeedDoc,
 } from "./platformBundle.ts";
@@ -123,6 +127,36 @@ if (platformSeedDir === null) {
 }
 // 默认全能助手 persona 的 dev-fallback 内置文案(仅 platformSeed 缺失时用;与 personas/main.md 同源)。
 const MAIN_FALLBACK_PERSONA = "你是 OpenClaude 商业版的默认全能助手,用简洁中文直接回答。\n";
+
+// R2-M4:所有平台向 volume 的写入统一走本 helper —— 祖先 symlink 逃逸拒 + mkdir 后 realpath 复核
+// + 临时文件 rename 原子落盘(纯逻辑在 platformBundle.safeWritePlatformVolumeFile,此处注入真实 fs)。
+// 失败抛,由调用方 catch → 跳过该 agent 平台 seed(不崩 entrypoint)。
+function platformVolumeWrite(
+  targetPath: string,
+  volumeRoot: string,
+  content: string | Buffer,
+  mode: number,
+): void {
+  safeWritePlatformVolumeFile({
+    targetPath,
+    volumeRoot,
+    content,
+    mode,
+    fs: { lstatSync, mkdirSync, realpathSync, writeFileSync, renameSync },
+    dirname,
+    randomSuffix: () => randomBytes(6).toString("hex"),
+  });
+}
+
+// R2-M4:目录 mkdir 后复核 realpath 仍在 volume 子树内(codex skill overlay 走 cpSync 整目录,
+// 不经 safeWritePlatformVolumeFile;单文件写已在该函数内自带此复核)。逃逸即抛 → 调用方 catch 跳过。
+function assertDirWithinVolume(dir: string, volumeRoot: string): void {
+  const dirReal = realpathSync(dir);
+  const rootReal = realpathSync(volumeRoot);
+  if (dirReal !== rootReal && !dirReal.startsWith(rootReal + "/")) {
+    throw new Error(`path escapes volume root after mkdir: ${dirReal} not under ${rootReal}`);
+  }
+}
 
 // ───────────────────────────────────────────────
 // 1. 环境变量清洗
@@ -392,6 +426,39 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
 // auth token(mode 0400),改 symlink 最多让自己的 codex 找不到 auth(自伤)。
 cleanEnv.CODEX_HOME = "/home/agent/.codex";
 
+// ───────────────────────────────────────────────
+// 1.5 validate-only 模式(R2-M2c:激活 saga 的 canary boot 冒烟入口)
+// ───────────────────────────────────────────────
+// OC_ENTRYPOINT_VALIDATE_ONLY=1 时:此刻 **env 清洗已完成**(上方 cleanEnv 全部构建),
+// **bundle 解析已完成**(module top 的 SELF_ENTRY_DIR realpath + resolvePlatformSeedDir 已定
+// rev 分流路径;platform-seed schema 校验与 persona 引用读取在 module top 已 fail-loud)。
+// 这里只补 **seed skill 文件存在性**语义校验(persona 引用上方 readConfinedSeedFile 已 fail-loud;
+// 但 seedSkills 文件原本要到下方 volume 块才读)—— 复用与 deploy prepare CLI 同一 validateSeedAssetsExist。
+// 通过则 exit 0,**不写任何 volume、不 spawn gateway、不要求真实 master 可达**;任一失败非 0 退出 + stderr 原因。
+// F2 以 `docker run --rm` + 假 anthropic env 调用本模式做激活前冒烟。entrypoint.sh 无需感知(此处早退)。
+if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
+  try {
+    if (platformSeed && platformSeedDir) {
+      const seedErrors = validateSeedAssetsExist(platformSeedDir, platformSeedDirReal!, platformSeed, {
+        exists: existsSync,
+        realpath: realpathSync,
+        join,
+      });
+      if (seedErrors.length > 0) {
+        console.error(`[entrypoint] validate-only FAILED (seed assets):\n  ${seedErrors.join("\n  ")}`);
+        process.exit(1);
+      }
+    }
+    console.error(
+      "[entrypoint] validate-only OK: env scrub + bundle/seed parse + persona/seed-skill semantic checks passed (no volume write, no gateway spawn)",
+    );
+    process.exit(0);
+  } catch (validateErr) {
+    console.error(`[entrypoint] validate-only FAILED: ${(validateErr as Error).message}`);
+    process.exit(1);
+  }
+}
+
 const CODEX_HOME_DIR = "/home/agent/.codex";
 const CODEX_AUTH_SOURCE = "/run/oc/codex-auth/auth.json";
 try {
@@ -492,6 +559,7 @@ try {
   const targetSystemSkills = join(TARGET_SKILLS, ".system");
   if (existsSync(bakedSystemSkills)) {
     mkdirSync(targetSystemSkills, { recursive: true });
+    assertDirWithinVolume(targetSystemSkills, CODEX_HOME_DIR); // R2-M4:mkdir 后 realpath 复核
     for (const entry of readdirSync(bakedSystemSkills, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const sourceDir = join(bakedSystemSkills, entry.name);
@@ -500,6 +568,15 @@ try {
       const targetSkillMd = join(targetDir, "SKILL.md");
       // (1) 镜像 populate 的 codex **原生** system skill:skip-if-exists,绝不覆盖用户/codex 侧状态。
       if (!existsSync(sourceSkillMd) || existsSync(targetSkillMd)) continue;
+      // R2-M4:cp 前拒祖先/目标 symlink 逃逸(卷内容两次 boot 间可被容器改)。命中 → 跳过该 skill,不崩。
+      try {
+        assertVolumeAncestryNoSymlink(targetDir, CODEX_HOME_DIR, lstatSync, dirname);
+      } catch (guardErr) {
+        console.error(
+          `[entrypoint] WARN: codex system skill "${entry.name}" skipped (symlink guard): ${(guardErr as Error).message}`,
+        );
+        continue;
+      }
       cpSync(sourceDir, targetDir, {
         recursive: true,
         preserveTimestamps: true,
@@ -526,6 +603,7 @@ try {
     );
   } else {
     mkdirSync(targetSystemSkills, { recursive: true });
+    assertDirWithinVolume(targetSystemSkills, CODEX_HOME_DIR); // R2-M4:mkdir 后 realpath 复核
     for (const entry of readdirSync(platformCodexSkillsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const sourceDir = join(platformCodexSkillsDir, entry.name);
@@ -537,6 +615,15 @@ try {
       const sourceContent = readFileSync(sourceSkillMd);
       const targetContent = targetExists ? readFileSync(targetSkillMd) : null;
       if (shouldWriteSeededSkill("hash-overwrite", targetExists, targetContent, sourceContent)) {
+        // R2-M4:覆写前拒祖先/目标 symlink 逃逸(rmSync+cpSync 会穿透 symlinked targetDir)。命中 → 跳过该 skill。
+        try {
+          assertVolumeAncestryNoSymlink(targetDir, CODEX_HOME_DIR, lstatSync, dirname);
+        } catch (guardErr) {
+          console.error(
+            `[entrypoint] WARN: platform codex skill "${entry.name}" skipped (symlink guard): ${(guardErr as Error).message}`,
+          );
+          continue;
+        }
         // 覆写:先清目标目录再整目录 cp,避免旧版残留附属文件;平台 skill 是权威。
         rmSync(targetDir, { recursive: true, force: true });
         cpSync(sourceDir, targetDir, { recursive: true, preserveTimestamps: true });
@@ -705,7 +792,8 @@ try {
   }
   function writePlatformPersonaHash(hashPath: string, hash: string): void {
     try {
-      writeFileSync(hashPath, `${hash}\n`, { mode: 0o644 });
+      // R2-M4:hash 记录也走 symlink 逃逸纵深防御 + 原子落盘(与 persona 同 volume 子树)。
+      platformVolumeWrite(hashPath, ocConfigDir, `${hash}\n`, 0o644);
     } catch (e) {
       console.error(
         `[entrypoint] WARN: ${hashPath} persona-hash record write failed (non-fatal): ${(e as Error).message}`,
@@ -728,6 +816,15 @@ try {
       return personaPath;
     }
     mkdirSync(personaDir, { recursive: true });
+    // R2-M4:mkdir 后复核 personaDir realpath 仍在 volume 内(拒经 symlinked agents/ 逃逸,护住下方读/写)。
+    try {
+      assertDirWithinVolume(personaDir, ocConfigDir);
+    } catch (guardErr) {
+      console.error(
+        `[entrypoint] WARN: ${agentId} persona dir escapes volume (symlink guard), skipped: ${(guardErr as Error).message}`,
+      );
+      return personaPath;
+    }
     const platformHash = sha256Hex(content);
 
     // 读当前内容(存在时)比对是否被用户改过。读失败(perm 等)→ 保守跳过。
@@ -757,13 +854,26 @@ try {
     switch (action) {
       case "force":
       case "write-new":
-        writeFileSync(personaPath, content, { mode: 0o644 });
-        writePlatformPersonaHash(hashPath, platformHash);
+        try {
+          // R2-M4:persona 写走祖先 symlink 逃逸拒 + 原子落盘。命中 → 跳过该 agent seed,不崩。
+          platformVolumeWrite(personaPath, ocConfigDir, content, 0o644);
+          writePlatformPersonaHash(hashPath, platformHash);
+        } catch (wErr) {
+          console.error(
+            `[entrypoint] WARN: ${agentId} persona platform write skipped (symlink/escape guard): ${(wErr as Error).message}`,
+          );
+        }
         break;
       case "upgrade":
-        writeFileSync(personaPath, content, { mode: 0o644 });
-        writePlatformPersonaHash(hashPath, platformHash);
-        console.error(`[entrypoint] agents.yaml: upgraded ${agentId} persona to new platform version`);
+        try {
+          platformVolumeWrite(personaPath, ocConfigDir, content, 0o644);
+          writePlatformPersonaHash(hashPath, platformHash);
+          console.error(`[entrypoint] agents.yaml: upgraded ${agentId} persona to new platform version`);
+        } catch (wErr) {
+          console.error(
+            `[entrypoint] WARN: ${agentId} persona upgrade write skipped (symlink/escape guard): ${(wErr as Error).message}`,
+          );
+        }
         break;
       case "already-latest":
         // 已是最新平台版:仅回填/更新记录(存量 volume 记录缺失时补上,免下次误判为定制)。
@@ -810,8 +920,8 @@ try {
       const targetExists = existsSync(skillPath);
       const targetContent = targetExists ? readFileSync(skillPath) : null;
       if (!shouldWriteSeededSkill("hash-overwrite", targetExists, targetContent, content)) return;
-      mkdirSync(skillDir, { recursive: true });
-      writeFileSync(skillPath, content, { mode: 0o644 });
+      // R2-M4:seed skill 写走祖先 symlink 逃逸拒 + mkdir realpath 复核 + 原子落盘(mkdir 内含于 helper)。
+      platformVolumeWrite(skillPath, ocConfigDir, content, 0o644);
     } catch (skillErr) {
       console.error(
         `[entrypoint] WARN: scientist skill seed skipped for ${name}: ${(skillErr as Error).message}`,

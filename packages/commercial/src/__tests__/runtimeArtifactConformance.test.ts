@@ -47,6 +47,9 @@ function buildFixtureStaging(stagingDir: string): void {
   write(pathJoin(stagingDir, "bin/oc-demo.sh"), "#!/bin/sh\nexec echo demo\n");
   write(pathJoin(stagingDir, "bin/oc-py.py"), "#!/usr/bin/env python3\nprint('py')\n");
   write(pathJoin(stagingDir, "bin/mmx"), '#!/bin/sh\nexec "$(dirname "$0")/oc-demo" "$@"\n');
+  // M2 必需叶子:bin/oc-web-context(finalize_bundle 剥 .py → bin/oc-web-context;与 F2 的 bash
+  // selfcheck 清单 + TS PLATFORM_BUNDLE_REQUIRED_LEAVES 三侧会师)。
+  write(pathJoin(stagingDir, "bin/oc-web-context.py"), "#!/usr/bin/env python3\nprint('web-context')\n");
   write(pathJoin(stagingDir, "entrypoint/entrypoint.ts"), "export const boot = true;\n");
   // M8 必需叶子:entrypoint/platformBundle.ts(与 PLATFORM_BUNDLE_REQUIRED_LEAVES 对齐)。
   write(pathJoin(stagingDir, "entrypoint/platformBundle.ts"), "export const bundle = true;\n");

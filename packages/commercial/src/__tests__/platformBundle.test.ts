@@ -8,7 +8,8 @@
  *     必须落在 <platformRoot>/bundles/ 下)。错误码 = PlatformBundleInvalid。
  *   - assertSafeAncestry:**B5.1**(给了 stopAt 却走到根未命中 → 抛)。
  *   - assertCurrentMatches:current==bundle 通过,不等抛(激活中间态);**B5.3**(readlink 原始
- *     目标须规范相对 bundles/<12hex>)。错误码 = RuntimePlacementInvalid。
+ *     目标须规范相对 bundles/<12hex>)。R2-M5 错误码 = RuntimeActivationInProgress(秒级激活窗口,
+ *     与永久坏产物的 RuntimePlacementInvalid 分离)。
  *   - resolveRuntimeReleaseMount:realpath 在 releases 根下 / root-owned / 非可写 / MANIFEST
  *     digest ↔ 目录名一致;**M6 结构深校验**(owner/权限/类型/symlink 越界)。错误码 = RuntimeReleaseInvalid。
  *
@@ -82,6 +83,8 @@ interface BuiltBundle {
 function bundleContents(): Record<string, string> {
   return {
     "bin/oc-tool": "#!/bin/sh\necho hi\n",
+    // M2:bin/oc-web-context 现为必需叶子(supervisor 注入 OPENCLAUDE_WEB_CONTEXT_BIN 指向它)。
+    "bin/oc-web-context": "#!/bin/sh\nexec echo web-context\n",
     "entrypoint/entrypoint.ts": "export const boot = 1;\n",
     "entrypoint/platformBundle.ts": "export const bundle = 1;\n",
     "seed/platform-seed.yaml": "schemaVersion: 1\nagents: []\n",
@@ -155,7 +158,8 @@ function rejectsWith(expected: string, fn: () => unknown): void {
 }
 const rejectsBundle = (fn: () => unknown): void => rejectsWith("PlatformBundleInvalid", fn);
 const rejectsRelease = (fn: () => unknown): void => rejectsWith("RuntimeReleaseInvalid", fn);
-const rejectsPlacement = (fn: () => unknown): void => rejectsWith("RuntimePlacementInvalid", fn);
+// R2-M5:assertCurrentMatches 的中间态现抛 RuntimeActivationInProgress(秒级激活窗口,非坏产物)。
+const rejectsActivation = (fn: () => unknown): void => rejectsWith("RuntimeActivationInProgress", fn);
 
 // ───────────────────────────────────────────────────────────────────────
 
@@ -475,7 +479,7 @@ describe("assertCurrentMatches", { skip: !IS_ROOT ? "requires root (uid=0)" : fa
       // 另建一个 12hex 名目录(空即可,assertCurrentMatches 只 realpath 它,不做内容校验)。
       const otherDir = pathJoin(b.ancestorRoot, "bundles", "0123456789ab");
       mkdir755(otherDir);
-      rejectsPlacement(() => assertCurrentMatches(b.ancestorRoot, otherDir));
+      rejectsActivation(() => assertCurrentMatches(b.ancestorRoot, otherDir));
     } finally {
       cleanup(b);
     }
@@ -484,7 +488,7 @@ describe("assertCurrentMatches", { skip: !IS_ROOT ? "requires root (uid=0)" : fa
   test("拒绝:current 不存在", () => {
     const b = buildValidBundle();
     try {
-      rejectsPlacement(() => assertCurrentMatches(b.ancestorRoot, b.bundleDir));
+      rejectsActivation(() => assertCurrentMatches(b.ancestorRoot, b.bundleDir));
     } finally {
       cleanup(b);
     }
@@ -495,7 +499,7 @@ describe("assertCurrentMatches", { skip: !IS_ROOT ? "requires root (uid=0)" : fa
     try {
       // 绝对目标即使 realpath 相等也拒 —— 只认 bundles/<12hex> 相对形态。
       symlinkSync(b.bundleDir, pathJoin(b.ancestorRoot, "current"));
-      rejectsPlacement(() => assertCurrentMatches(b.ancestorRoot, b.bundleDir));
+      rejectsActivation(() => assertCurrentMatches(b.ancestorRoot, b.bundleDir));
     } finally {
       cleanup(b);
     }
@@ -508,7 +512,7 @@ describe("assertCurrentMatches", { skip: !IS_ROOT ? "requires root (uid=0)" : fa
       const weird = pathJoin(b.ancestorRoot, "bundles", "not12hex");
       renameSync(b.bundleDir, weird);
       symlinkSync("bundles/not12hex", pathJoin(b.ancestorRoot, "current"));
-      rejectsPlacement(() => assertCurrentMatches(b.ancestorRoot, weird));
+      rejectsActivation(() => assertCurrentMatches(b.ancestorRoot, weird));
     } finally {
       cleanup(b);
     }

@@ -2465,6 +2465,9 @@ export async function provisionV3Container(
     const runtimeLabels: Record<string, string> = {};
     let injectPlatformEnv = false;
     let injectedBundleRev = "";
+    // R2-B3:workspace env 随 **release 轴**注入(不再绑 bundle 轴)。/opt/openclaude 变 ro 的时刻
+    // 正是 release 挂载生效时,agent 默认 cwd 必须同时离开只读源码树 → 落 data volume 内的 workspace。
+    let injectReleaseEnv = false;
     {
       const tuple = deps.runtimeTuple;
       if (getRuntimeChannel() === "v5" && tuple) {
@@ -2519,9 +2522,17 @@ export async function provisionV3Container(
                   { uid, error: (e as Error).message },
                 );
               } else {
+                // R2-M5:assertCurrentMatches 的中间态已是 SupervisorError("RuntimeActivationInProgress")
+                // → 原样抛(v3ensureRunning 走 5s 短重试不告警)。非 SupervisorError 只可能是
+                // realpathSync(platformRoot) 失败 = 平台稳定根丢失(部署级坏产物,非瞬态激活窗口,更非
+                // 多机 placement)→ 归 PlatformBundleInvalid(300s + critical),而**不再**误用
+                // RuntimePlacementInvalid(现专留多机 placement 硬门)。
                 throw e instanceof SupervisorError
                   ? e
-                  : new SupervisorError("RuntimePlacementInvalid", `platform activation mid-state: ${(e as Error).message}`);
+                  : new SupervisorError(
+                      "PlatformBundleInvalid",
+                      `platform stable root unresolvable during activation guard: ${(e as Error).message}`,
+                    );
               }
             }
           }
@@ -2531,11 +2542,14 @@ export async function provisionV3Container(
           runtimeLabels[RUNTIME_BOOT_HASH_LABEL_KEY] = tuple.bootHash ?? "";
         }
 
-        // ── release 轴 ── 未启用 = 完全跳过(不挂 /opt/openclaude、不打 release label)。
+        // ── release 轴 ── 未启用 = 完全跳过(不挂 /opt/openclaude、不打 release label、不注 workspace env)。
         if (releaseEnabled) {
           // configured&&!resolved 已被 assertV5ReleaseResolvableOrThrow 无条件拦掉,到此必 resolved。
           platformBinds.push(`${tuple.releaseResolvedPath}:${RELEASE_MOUNT_TARGET}:ro`);
           runtimeLabels[RUNTIME_RELEASE_LABEL_KEY] = pathBasename(tuple.releasePath!);
+          // R2-B3:release 挂载生效即注入 workspace env —— /opt/openclaude 此刻变 ro,默认 cwd 必须
+          // 同时离开只读树(entrypoint 据此 mkdir data-volume 内 workspace,sessionManager 缺省 cwd 读它)。
+          injectReleaseEnv = true;
         }
       } else if (tuple?.bundlePath || tuple?.releasePath) {
         // v3 channel:零行为变化。误配 tuple 仅提示忽略(不挂/不打 label/不注入 env)。
@@ -2546,16 +2560,22 @@ export async function provisionV3Container(
         );
       }
     }
-    // 平台注入 env(仅 bundle 轴启用且挂载生效时)。走 current symlink → 翻转对存量容器原子生效。
-    // M2:另注 OC_PLATFORM_BUNDLE_REV=<bundleRev>,让 entrypoint.sh 优先按 rev 直拼
-    // /run/oc/platform/bundles/<rev>/... 读 boot 内容,消 check-then-create 后 current 翻转的 TOCTOU。
+    // ── bundle 轴 env(仅 bundle 挂载生效时)── 走 current symlink → 翻转对存量容器原子生效。
+    // PROMPTS_DIR / WEB_CONTEXT_BIN 指向 current/... 平台薄壳;OC_PLATFORM_BUNDLE_REV 让 entrypoint.sh
+    // 优先按 rev 直拼 /run/oc/platform/bundles/<rev>/... 读 boot 内容,消 current 翻转的 TOCTOU。
+    // R2-B3:OPENCLAUDE_DEFAULT_WORKSPACE 已移出本块(改随 release 轴,见下)——它与 bundle 无关,
+    // 语义上绑的是"/opt/openclaude 何时变 ro"(= release 挂载时)。
     if (injectPlatformEnv) {
       env.push(
         `OPENCLAUDE_PLATFORM_PROMPTS_DIR=${OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE}`,
-        `OPENCLAUDE_DEFAULT_WORKSPACE=${OPENCLAUDE_DEFAULT_WORKSPACE_VALUE}`,
         `OPENCLAUDE_WEB_CONTEXT_BIN=${OPENCLAUDE_WEB_CONTEXT_BIN_VALUE}`,
         `OC_PLATFORM_BUNDLE_REV=${injectedBundleRev}`,
       );
+    }
+    // ── release 轴 env(仅 release 挂载生效时)── /opt/openclaude 变 ro,默认 cwd 必须离开只读源码树。
+    // 落 data named volume 内(容器重建文件仍在);gateway sessionManager 缺省 cwd 读该 env。
+    if (injectReleaseEnv) {
+      env.push(`OPENCLAUDE_DEFAULT_WORKSPACE=${OPENCLAUDE_DEFAULT_WORKSPACE_VALUE}`);
     }
 
     // 远程执行 mux per-user 目录:ro 挂到容器 /run/ccb-ssh。

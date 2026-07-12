@@ -35,6 +35,8 @@ import {
   RUNTIME_RELEASE_LABEL_KEY,
   RUNTIME_BOOT_HASH_LABEL_KEY,
   RUNTIME_EMBED_SOURCE_LABEL_KEY,
+  RELEASE_MOUNT_TARGET,
+  OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
   type V3SupervisorDeps,
   type V3RuntimeTuple,
 } from "../agent-sandbox/index.js";
@@ -173,7 +175,19 @@ type DockerBehavior = {
   /** 镜像 inspect labels(assertImageHasV3Sink / slim guard)。默认含 v3-sink。 */
   imageLabels?: Record<string, string>;
 };
-type DockerCaptured = { created: number; started: number; stopped: number; removed: number };
+type CreateOptsShape = {
+  Env?: string[];
+  Labels?: Record<string, string>;
+  HostConfig?: { Binds?: string[] };
+};
+type DockerCaptured = {
+  created: number;
+  started: number;
+  stopped: number;
+  removed: number;
+  /** R2-B3:最后一次 docker createContainer 的 opts(断言 Env / Binds 注入)。 */
+  lastCreateOpts?: CreateOptsShape;
+};
 
 function httpError(code: number, msg: string): Error {
   const e = new Error(msg) as Error & { statusCode: number };
@@ -201,8 +215,9 @@ function makeDocker(b: DockerBehavior = {}): { docker: Docker; captured: DockerC
         Config: { Labels: b.imageLabels ?? { "oc.runtime.features": "v3-sink" } },
       }),
     }),
-    createContainer: async () => {
+    createContainer: async (opts: CreateOptsShape) => {
       captured.created++;
+      captured.lastCreateOpts = opts;
       const id = `dockerid-new-${captured.created}`;
       return { id, start: async () => { captured.started++; }, remove: async () => { captured.removed++; } };
     },
@@ -473,5 +488,56 @@ describe("provision 硬门:多机 release / 瘦身镜像", () => {
     assert.equal(r.userId, 102);
     assert.equal(captured.created, 1);
     assert.equal(captured.started, 1);
+  });
+});
+
+describe("R2-B3:workspace env 绑 release 轴(bundle 未启用也注入,离开只读源码树)", () => {
+  let savedChannel: string | undefined;
+  let savedBaselineOpt: string | undefined;
+  let savedBundleOpt: string | undefined;
+  before(() => {
+    savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    savedBaselineOpt = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    savedBundleOpt = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
+  });
+  after(() => {
+    const restore = (k: string, v: string | undefined) => { if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+    restore("OC_RUNTIME_CHANNEL", savedChannel);
+    restore("OC_V3_CCB_BASELINE_OPTIONAL", savedBaselineOpt);
+    restore("OC_PLATFORM_BUNDLE_OPTIONAL", savedBundleOpt);
+  });
+
+  const RELEASE_PATH = "/var/lib/openclaude-v5/runtime-releases/rel-abc123def456";
+
+  test("release-only(瘦身镜像 + release 配齐、无 bundle)→ Env 含 OPENCLAUDE_DEFAULT_WORKSPACE,不含 bundle 三 env;Binds 含 release 挂载", async () => {
+    const pool = new FakePool();
+    // 瘦身镜像(embed_source=0)+ release 配齐 = 生产 release 轴激活的真实形态。
+    const { docker, captured } = makeDocker({
+      imageLabels: { "oc.runtime.features": "v3-sink", [RUNTIME_EMBED_SOURCE_LABEL_KEY]: "0" },
+    });
+    const deps = makeDeps(docker, pool, { releasePath: RELEASE_PATH, releaseResolvedPath: RELEASE_PATH });
+    await provisionV3Container(deps, 200);
+    assert.equal(captured.created, 1);
+
+    const env = captured.lastCreateOpts?.Env ?? [];
+    const binds = captured.lastCreateOpts?.HostConfig?.Binds ?? [];
+
+    // release 轴:workspace env 必须在(/opt/openclaude 变 ro,默认 cwd 须离开只读树)。
+    assert.ok(
+      env.includes(`OPENCLAUDE_DEFAULT_WORKSPACE=${OPENCLAUDE_DEFAULT_WORKSPACE_VALUE}`),
+      "workspace env 必须随 release 轴注入",
+    );
+    // bundle 三 env 必须不在(bundle 未启用 → 绝不注入 PROMPTS_DIR / WEB_CONTEXT_BIN / BUNDLE_REV)。
+    assert.ok(!env.some((e) => e.startsWith("OPENCLAUDE_PLATFORM_PROMPTS_DIR=")), "bundle 未启用 → 无 PROMPTS_DIR");
+    assert.ok(!env.some((e) => e.startsWith("OPENCLAUDE_WEB_CONTEXT_BIN=")), "bundle 未启用 → 无 WEB_CONTEXT_BIN");
+    assert.ok(!env.some((e) => e.startsWith("OC_PLATFORM_BUNDLE_REV=")), "bundle 未启用 → 无 BUNDLE_REV");
+    // release 挂载 bind 必须在(/opt/openclaude:ro)。
+    assert.ok(
+      binds.includes(`${RELEASE_PATH}:${RELEASE_MOUNT_TARGET}:ro`),
+      "release 挂载 bind 必须在",
+    );
   });
 });

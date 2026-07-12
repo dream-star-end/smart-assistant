@@ -170,10 +170,15 @@ export type SupervisorErrorCode =
   //     结构 / MANIFEST / digest 校验失败,或启动期解析失败但仍配置了 OC_PLATFORM_BUNDLE。
   //   - RuntimeReleaseInvalid:runtime release(源码树+node_modules+ccb dist)结构深校验 /
   //     命名↔digest / 启动期解析失败但仍配置了 OC_RUNTIME_RELEASE。
-  //   - RuntimePlacementInvalid:运行时产物放置态非法 —— platform current symlink 中间态
-  //     (current != 声明 bundle / 目标非规范 bundles/<rev> 相对形态),或 release 被要求
-  //     调度到非 self-host(release 树 master-local only)。
+  //   - RuntimePlacementInvalid:运行时产物**放置态**硬门 —— release 被要求调度到非 self-host
+  //     (release 树 master-local only)。多机 placement 违约 = 真·部署态失控(长重试 + critical)。
+  //   - RuntimeActivationInProgress:platform current symlink 激活**中间态**(current 尚未翻到声明
+  //     bundle / 目标非规范 bundles/<rev> 相对形态 / current 暂不可读)。这是激活 saga 的**正常秒级
+  //     窗口**(≈ 一次 restart 时长),不是坏产物 —— 与 RuntimePlacementInvalid 分离,让 v3ensureRunning
+  //     对它走 5s 短重试 + 不发 critical(与 provisioning 同级),而非 300s 长重试 + critical 告警。
+  //     (R2-M5:原先中间态误吃 RuntimePlacementInvalid 的 300s+critical,现拆出专用瞬态码。)
   | "PlatformBundleInvalid"
   | "RuntimeReleaseInvalid"
   | "RuntimePlacementInvalid"
+  | "RuntimeActivationInProgress"
   | "Unknown";

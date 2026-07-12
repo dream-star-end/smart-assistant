@@ -13,11 +13,22 @@
  * import**(tsc 视作 any、不解析;tsx 运行时按 .ts 解析)载入,与既有"读源码字符串"精神一致。
  */
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, test } from "node:test";
 import { parse as parseYaml } from "yaml";
@@ -379,5 +390,233 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     // 写:seed-skill / persona 写目标 containment 到 agents 子树。
     assert.match(src, /isPathWithin\(join\(ocConfigDir, "agents", agentId, "seed-skills"\), skillPath\)/);
     assert.match(src, /isPathWithin\(join\(ocConfigDir, "agents"\), personaPath\)/);
+  });
+});
+
+describe("R2-M2 validateSeedAssetsExist(persona/seed skill 引用存在性 + containment,纯函数)", () => {
+  const j = (...p: string[]) => p.join("/");
+  const doc = {
+    schemaVersion: 1,
+    agents: [{ id: "main", persona: "personas/main.md" }, { id: "codex" }],
+    seedSkills: { scientist: ["demo"] },
+  };
+  const presentSet = (paths: string[]) => (p: string) => new Set(paths).has(p);
+
+  test("全部引用存在且不逃逸 → 空错误清单", () => {
+    const errs = pb.validateSeedAssetsExist("/seed", "/seed", doc, {
+      exists: presentSet(["/seed/personas/main.md", "/seed/skills/scientist/demo/SKILL.md"]),
+      realpath: (p: string) => p,
+      join: j,
+    });
+    assert.deepEqual(errs, []);
+  });
+  test("persona 文件缺失 → 报 persona missing(agentId 带出)", () => {
+    const errs = pb.validateSeedAssetsExist("/seed", "/seed", doc, {
+      exists: presentSet(["/seed/skills/scientist/demo/SKILL.md"]),
+      realpath: (p: string) => p,
+      join: j,
+    });
+    assert.equal(errs.length, 1);
+    assert.match(errs[0], /persona for agent "main" missing/);
+  });
+  test("seed skill 文件缺失 → 报 seed skill missing", () => {
+    const errs = pb.validateSeedAssetsExist("/seed", "/seed", doc, {
+      exists: presentSet(["/seed/personas/main.md"]),
+      realpath: (p: string) => p,
+      join: j,
+    });
+    assert.equal(errs.length, 1);
+    assert.match(errs[0], /seed skill "scientist\/demo" missing/);
+  });
+  test("引用存在但 realpath 逃逸 seed 子树 → 报 escapes", () => {
+    const errs = pb.validateSeedAssetsExist("/seed", "/seed", doc, {
+      exists: presentSet(["/seed/personas/main.md", "/seed/skills/scientist/demo/SKILL.md"]),
+      realpath: (p: string) => (p === "/seed/personas/main.md" ? "/etc/evil" : p), // main persona 软链逃逸
+      join: j,
+    });
+    assert.equal(errs.length, 1);
+    assert.match(errs[0], /persona for agent "main" escapes bundle seed dir/);
+  });
+});
+
+describe("R2-M4 assertVolumeAncestryNoSymlink(祖先 symlink 逃逸拒,注入 lstat)", () => {
+  const dn = (p: string) => p.split("/").slice(0, -1).join("/") || "/";
+  const linkStat = (isLink: boolean) => ({ isSymbolicLink: () => isLink });
+
+  test("无 symlink 祖先 → 通过", () => {
+    assert.doesNotThrow(() =>
+      pb.assertVolumeAncestryNoSymlink("/vol/agents/main/CLAUDE.md", "/vol", () => linkStat(false), dn),
+    );
+  });
+  test("某级祖先是 symlink → 抛(拒穿透写)", () => {
+    const links = new Set(["/vol/agents"]); // agents 被换成 symlink
+    assert.throws(
+      () =>
+        pb.assertVolumeAncestryNoSymlink(
+          "/vol/agents/main/CLAUDE.md",
+          "/vol",
+          (p: string) => linkStat(links.has(p)),
+          dn,
+        ),
+      /symlink/,
+    );
+  });
+  test("target 词法越界(不在 volumeRoot 下)→ 抛", () => {
+    assert.throws(
+      () => pb.assertVolumeAncestryNoSymlink("/etc/passwd", "/vol", () => linkStat(false), dn),
+      /escapes volume root/,
+    );
+  });
+  test("祖先尚未创建(lstat 抛)→ 跳过该级,不误报", () => {
+    assert.doesNotThrow(() =>
+      pb.assertVolumeAncestryNoSymlink(
+        "/vol/agents/main/CLAUDE.md",
+        "/vol",
+        (p: string) => {
+          if (p === "/vol/agents/main" || p === "/vol/agents/main/CLAUDE.md") throw new Error("ENOENT");
+          return linkStat(false);
+        },
+        dn,
+      ),
+    );
+  });
+});
+
+describe("R2-M4 safeWritePlatformVolumeFile(三步合一:原子写 + 祖先 symlink 拒,真实 fs)", () => {
+  const realFs = { lstatSync, mkdirSync, realpathSync, writeFileSync, renameSync };
+
+  test("正常:落盘内容正确 + 临时文件已 rename(原子)", () => {
+    const vol = mkdtempSync(join(tmpdir(), "oc-m4-ok-"));
+    try {
+      const target = join(vol, "agents", "main", "CLAUDE.md");
+      pb.safeWritePlatformVolumeFile({
+        targetPath: target,
+        volumeRoot: vol,
+        content: "hello persona\n",
+        mode: 0o644,
+        fs: realFs,
+        dirname,
+        randomSuffix: () => "testsuffix",
+      });
+      assert.equal(readFileSync(target, "utf8"), "hello persona\n");
+      assert.ok(!existsSync(`${target}.tmp-testsuffix`), "临时文件必须已 rename 掉");
+    } finally {
+      rmSync(vol, { recursive: true, force: true });
+    }
+  });
+
+  test("祖先 symlink → 抛(拒穿透写卷外),绝不落盘到卷外", () => {
+    const vol = mkdtempSync(join(tmpdir(), "oc-m4-lnk-"));
+    const outside = mkdtempSync(join(tmpdir(), "oc-m4-out-"));
+    try {
+      symlinkSync(outside, join(vol, "agents")); // agents 被换成指向卷外的 symlink
+      const target = join(vol, "agents", "main", "CLAUDE.md");
+      assert.throws(
+        () =>
+          pb.safeWritePlatformVolumeFile({
+            targetPath: target,
+            volumeRoot: vol,
+            content: "x",
+            mode: 0o644,
+            fs: realFs,
+            dirname,
+            randomSuffix: () => "s",
+          }),
+        /symlink/,
+      );
+      assert.ok(!existsSync(join(outside, "main", "CLAUDE.md")), "绝不能穿透 symlink 写到卷外");
+    } finally {
+      rmSync(vol, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("R2-M2b validatePlatformSeedCli.ts(deploy prepare 离线语义校验 CLI)", () => {
+  const CLI = join(PLATFORM_RUNTIME, "entrypoint", "validatePlatformSeedCli.ts");
+  function buildBundle(root: string, opts: { withSkill: boolean }): void {
+    mkdirSync(join(root, "seed", "personas"), { recursive: true });
+    mkdirSync(join(root, "seed", "skills", "scientist", "demo"), { recursive: true });
+    writeFileSync(
+      join(root, "seed", "platform-seed.yaml"),
+      "schemaVersion: 1\nagents:\n  - id: main\n    persona: personas/main.md\nseedSkills:\n  scientist:\n    - demo\n",
+    );
+    writeFileSync(join(root, "seed", "personas", "main.md"), "# main\n");
+    if (opts.withSkill) writeFileSync(join(root, "seed", "skills", "scientist", "demo", "SKILL.md"), "# demo\n");
+  }
+  function runCli(bundleRoot: string): { status: number; stderr: string } {
+    try {
+      execFileSync("npx", ["--no", "tsx", CLI, bundleRoot], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      return { status: 0, stderr: "" };
+    } catch (e) {
+      const err = e as { status?: number | null; stderr?: string };
+      return { status: err.status ?? -1, stderr: String(err.stderr ?? "") };
+    }
+  }
+  test("引用齐全 → exit 0", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oc-cli-ok-"));
+    try {
+      buildBundle(dir, { withSkill: true });
+      assert.equal(runCli(dir).status, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("seed skill 文件缺失 → exit 1 + stderr 原因", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oc-cli-bad-"));
+    try {
+      buildBundle(dir, { withSkill: false });
+      const r = runCli(dir);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /seed skill "scientist\/demo" missing/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("声明含 banned 计费键(model)→ schema 校验 exit 1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oc-cli-schema-"));
+    try {
+      mkdirSync(join(dir, "seed"), { recursive: true });
+      writeFileSync(join(dir, "seed", "platform-seed.yaml"), "schemaVersion: 1\nagents:\n  - id: main\n    model: sneaky\n");
+      const r = runCli(dir);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /forbidden key "model"/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("R2-M2c/M4 entrypoint.ts validate-only 早退 + 写侧 symlink 逃逸纵深(源码不变量)", () => {
+  test("M2c:OC_ENTRYPOINT_VALIDATE_ONLY=1 早退在 volume try 之前,过 seed 语义校验后 exit 0/1", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    // validate-only 分支存在,读 OC_ENTRYPOINT_VALIDATE_ONLY,调 validateSeedAssetsExist。
+    assert.match(src, /OC_ENTRYPOINT_VALIDATE_ONLY \|\| ""\)\.trim\(\) === "1"/);
+    assert.match(src, /validateSeedAssetsExist\(platformSeedDir, platformSeedDirReal!, platformSeed,/);
+    assert.match(src, /process\.exit\(0\)/);
+    // 早退必须在 volume try(mkdirSync(ocConfigDir...)之前 —— 不写任何 volume。
+    const validateOnlyIdx = src.indexOf("OC_ENTRYPOINT_VALIDATE_ONLY");
+    const volumeTryIdx = src.indexOf("try {\n  mkdirSync(ocConfigDir");
+    assert.ok(validateOnlyIdx > 0 && volumeTryIdx > 0 && validateOnlyIdx < volumeTryIdx,
+      "validate-only 早退必须在 volume try 之前(不写 volume / 不 spawn gateway)");
+  });
+
+  test("M4:persona/hash/seed-skill 写走 platformVolumeWrite;codex overlay 前 assertVolumeAncestryNoSymlink;renameSync 已引入", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    // renameSync 已 import(原子落盘)。
+    assert.match(src, /\n  renameSync,\n/);
+    // 统一写 helper + 复核 helper 定义。
+    assert.match(src, /function platformVolumeWrite\(/);
+    assert.match(src, /safeWritePlatformVolumeFile\(\{/);
+    assert.match(src, /function assertDirWithinVolume\(/);
+    // persona / hash / seed skill 三处写都改经 platformVolumeWrite。
+    assert.match(src, /platformVolumeWrite\(personaPath, ocConfigDir, content, 0o644\)/);
+    assert.match(src, /platformVolumeWrite\(hashPath, ocConfigDir, `\$\{hash\}\\n`, 0o644\)/);
+    assert.match(src, /platformVolumeWrite\(skillPath, ocConfigDir, content, 0o644\)/);
+    // codex overlay(两处 cpSync)前置祖先 symlink 逃逸拒。
+    assert.match(src, /assertVolumeAncestryNoSymlink\(targetDir, CODEX_HOME_DIR, lstatSync, dirname\)/);
+    // 旧的裸 writeFileSync(personaPath/skillPath) 不得残留(全走 helper)。
+    assert.doesNotMatch(src, /writeFileSync\(personaPath, content/);
+    assert.doesNotMatch(src, /writeFileSync\(skillPath, content/);
   });
 });

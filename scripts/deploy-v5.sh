@@ -31,6 +31,14 @@
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
+#
+# runtime hotcfg(§5,两轴独立开关):
+#   --enable-runtime-release / --enable-platform-bundle    # 首次启用该轴(随本次 deploy 激活)
+#   --disable-runtime-release / --disable-platform-bundle  # 禁用该轴:本次激活把 env 键写**空值**
+#                                                          # (R2-B1 三态写),走完整 saga+smoke
+#   --emergency-tuple [--image=REF --image-id=ID --bundle=DIR]
+#       # 登记逃生 tuple。缺省取当前 env 四键;显式候选(R2-M1)供瘦身稳态直接登记内嵌镜像逃生点,
+#       # 不必先把现网翻到空 release。硬验含 immutable ID 钉死(inspect .Id == image_id)。
 set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
@@ -116,7 +124,11 @@ DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 # runtime hotcfg 两机制**各自独立开关,默认关**(§5:合并后未部署期间生产行为零变化)。
 # 首次开启用 --enable-*;开启后写入 env 的 tuple 键会让后续 deploy 自动持续走该机制。
+# --disable-*(R2-B1):该轴本次激活写**空值**(三态写:键在值空=禁用),走完整 saga+smoke。
 ENABLE_BUNDLE_FLAG=0; ENABLE_RELEASE_FLAG=0
+DISABLE_BUNDLE_FLAG=0; DISABLE_RELEASE_FLAG=0
+# --emergency-tuple 的显式候选(R2-M1;空=取当前 env 现值)
+EMERG_IMAGE=""; EMERG_IMAGE_ID=""; EMERG_BUNDLE=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
@@ -124,7 +136,12 @@ for arg in "$@"; do
     --with-dist) WITH_DIST=1 ;;
     --enable-platform-bundle) ENABLE_BUNDLE_FLAG=1 ;;
     --enable-runtime-release) ENABLE_RELEASE_FLAG=1 ;;
+    --disable-platform-bundle) DISABLE_BUNDLE_FLAG=1 ;;
+    --disable-runtime-release) DISABLE_RELEASE_FLAG=1 ;;
     --emergency-tuple) MODE="emergency-tuple" ;;
+    --image=*) EMERG_IMAGE="${arg#*=}" ;;
+    --image-id=*) EMERG_IMAGE_ID="${arg#*=}" ;;
+    --bundle=*) EMERG_BUNDLE="${arg#*=}" ;;
     --bootstrap) MODE="bootstrap" ;;
     --migrate-bluegreen) MODE="migrate-bluegreen" ;;
     --smoke) MODE="smoke" ;;
@@ -146,6 +163,15 @@ for arg in "$@"; do
 done
 [[ "$MODE" == "rollback" && ! "$ROLLBACK_N" =~ ^[1-5]$ ]] && { echo "✗ --rollback=N 需 N∈1..5" >&2; exit 2; }
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
+# R2-B1/R2-M1 旗标一致性
+[[ "$ENABLE_RELEASE_FLAG" == 1 && "$DISABLE_RELEASE_FLAG" == 1 ]] && { echo "✗ --enable-runtime-release 与 --disable-runtime-release 互斥" >&2; exit 2; }
+[[ "$ENABLE_BUNDLE_FLAG" == 1 && "$DISABLE_BUNDLE_FLAG" == 1 ]] && { echo "✗ --enable-platform-bundle 与 --disable-platform-bundle 互斥" >&2; exit 2; }
+if [[ ( "$DISABLE_RELEASE_FLAG" == 1 || "$DISABLE_BUNDLE_FLAG" == 1 ) && "$MODE" != "deploy" && "$MODE" != "dist" ]]; then
+  echo "✗ --disable-* 仅适用于 deploy / --dist(禁用轴须走完整激活 saga+smoke)" >&2; exit 2
+fi
+if [[ -n "$EMERG_IMAGE$EMERG_IMAGE_ID$EMERG_BUNDLE" && "$MODE" != "emergency-tuple" ]]; then
+  echo "✗ --image/--image-id/--bundle 是 --emergency-tuple 的显式候选参数,不用于其它模式" >&2; exit 2
+fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
@@ -790,8 +816,8 @@ RLIB
 }
 
 # 机制启用判定:显式 --enable-* flag,或**远端 env 对应 tuple 键存在且值非空**(开启后持续生效)。
-# B2:判定用"键存在**且值非空**"(不是裸键存在)——env_write_tuple 对未启用机制留空键不写,故
-# "空键/空值"= 未启用;非空绝对路径 = 已启用。用与 oc_hotcfg_env_get 同法取末行值判空。
+# R2-B1 三态写语义:env_write_tuple 恒写四键,禁用轴写**空值** —— 故"键缺失/值空"= 未启用,
+# "值非空绝对路径"= 已启用,enabled 判定的单一权威就是"值非空"。用与 oc_hotcfg_env_get 同法取末行值判空。
 # 未启用 → 该机制零行为(保证合并后未部署期间生产零变化)。
 hotcfg_bundle_enabled() {
   [[ "$ENABLE_BUNDLE_FLAG" == 1 ]] && return 0
@@ -805,6 +831,18 @@ hotcfg_release_enabled() {
 }
 hotcfg_any_enabled() { hotcfg_bundle_enabled || hotcfg_release_enabled; }
 
+# 轴的**本次部署生效态**(R2-B1):--disable-* 恒 0(该轴本次写空值);否则同 enabled 判定。
+# build 与 activate 都按此取轴,保证"禁用轴不 build、激活传空串"。
+hotcfg_bundle_axis_on()  { [[ "$DISABLE_BUNDLE_FLAG" == 1 ]] && return 1; hotcfg_bundle_enabled; }
+hotcfg_release_axis_on() { [[ "$DISABLE_RELEASE_FLAG" == 1 ]] && return 1; hotcfg_release_enabled; }
+
+# tuple 账本是否已有记录(R2-B1):--disable 把两轴 env 都清空后,rollback 的入口判定若只看
+# enabled 会漏掉"退回启用态"场景 —— history 非空即认为 tuple 账本在管辖,rollback 走 tuple 感知路径。
+hotcfg_history_present() {
+  [[ "$DRY" == 1 ]] && return 1
+  ssh "$KL_HOST" "test -s '$OC_HOTCFG_HISTORY'" 2>/dev/null
+}
+
 # ── 1. build_platform_bundle:从**钉死的** BUILT_RELEASE 内 platform-runtime/ 组装 → 落 bundles/<rev> ──
 # 源必须取本次 deploy 已建的不可变 master release(而非 live 树),与 VERSION/archive 同 sha 自洽。
 BUILT_BUNDLE_REV=""
@@ -815,7 +853,7 @@ build_platform_bundle() {
   full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   echo "── build platform bundle(源=pinned $src)──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] assert platform-runtime+prompts/ 存在;cp → bundles/.staging;finalize → bundles/<rev>"
+    echo "  [dry-run] assert platform-runtime+prompts/ 存在;cp → bundles/.staging;seed 语义校验(validatePlatformSeedCli,缺 CLI 即 fail);finalize → bundles/<rev>"
     BUILT_BUNDLE_REV="dryrunbundle0"; return 0
   fi
   nonce="$(openssl rand -hex 8)"
@@ -828,6 +866,15 @@ build_platform_bundle() {
     mkdir -p '$OC_HOTCFG_PLATFORM_ROOT/bundles'
     rm -rf '$staging'; mkdir -p '$staging'
     cp -a '$src/.' '$staging/'" || { echo "✗ bundle staging 组装失败" >&2; return 1; }
+  # R2-M2②:seed 语义校验(EG2 契约 CLI:参数=bundle 根;exit 0/非 0;stderr 给原因)。
+  # finalize 前对 staging 跑(幂等复用路径的内容 ≡ staging,校验 staging 即覆盖);CLI 与 node_modules
+  # 都取本次 pinned 的 BUILT_RELEASE(同 sha 自洽);npx --no-install 禁网络兜底;**CLI 文件不存在 →
+  # fail-loud**(防 TS 侧文件挪位/漂移后校验被静默跳过)。
+  local seed_cli="$BUILT_RELEASE/packages/commercial/agent-sandbox/platform-runtime/entrypoint/validatePlatformSeedCli.ts"
+  ssh "$KL_HOST" "test -f '$seed_cli'" \
+    || { echo "✗ 缺 seed 语义校验 CLI(agent EG2 契约文件,拒绝静默跳过): $seed_cli" >&2; return 1; }
+  ssh "$KL_HOST" "cd '$BUILT_RELEASE' && npx --no-install tsx '$seed_cli' '$staging'" \
+    || { echo "✗ seed 语义校验失败(validatePlatformSeedCli 非 0,原因见其 stderr)" >&2; return 1; }
   BUILT_BUNDLE_REV="$(hotcfg_rmt oc_hotcfg_finalize_bundle "$staging" 1 "$full_sha")" \
     || { echo "✗ bundle finalize 失败(结构自检/MANIFEST/校验)" >&2; return 1; }
   BUILT_BUNDLE_REV="$(printf '%s' "$BUILT_BUNDLE_REV" | tr -d '[:space:]')"
@@ -844,7 +891,7 @@ build_runtime_release() {
   full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   echo "── build runtime release(源钉死 git archive $full_sha)──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] archive→prune(--exclude-from=$excl)→敏感扫描→docker npm ci(root+ccb)→ccb bun build→manifest→rel-<digest>"
+    echo "  [dry-run] archive→prune(--exclude-from=$excl)→敏感扫描→docker npm ci(root 一套)→ccb host bun build 仅拷 dist(无 ccb node_modules)→manifest→rel-<digest>"
     BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-dryrunrelease"; RUNTIME_IMAGE_REF="dry"; RUNTIME_IMAGE_ID="sha256:dry"; return 0
   fi
   hotcfg_ship_lib || return 1
@@ -872,28 +919,30 @@ build_runtime_release() {
 
 # ── 3. activate_runtime_tuple:激活 saga(env tuple + master 源码翻转 + current 翻转 + restart + smoke + history)──
 # 取代"直接 restart 段":master 源码 symlink 翻转作为 saga 的 extra_apply(与 tuple 同原子回滚)。
-# 两机制独立:release/bundle 只有启用者产新值,未启用者沿用 env 现值(bundle 未启用 → flip_rev="" 不翻 current)。
+# 两轴独立 + R2-B1 三态写:启用轴产新值;禁用/未启用轴传**空串**(env_write_tuple 恒写四键,空值落盘
+# = 该轴禁用可表达,--disable-* 即走此路)。saga 内含 R2-B2 pre-state(首次启用记激活前现场)与
+# R2-M2③ canary boot 冒烟(restart 前,validate-only)。
 activate_runtime_tuple() {
   echo "── 激活 runtime tuple saga ──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] saga: extra_apply(master symlink→$BUILT_RELEASE)→env tuple→[flip current]→restart→smoke→history commit"
+    echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
   local prev_src old_prev image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert
   prev_src="$(bg_current_release)"
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
   old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
-  # image / image_id **恒写**:release 启用则用刚 inspect 的;否则从 env 取 image 并 inspect 出 id(供 stale/label)。
-  if hotcfg_release_enabled; then
+  # image / image_id **恒写**:release 轴启用则用刚 inspect 的;否则从 env 取 image 并 inspect 出 id(供 stale/label/canary)。
+  if hotcfg_release_axis_on; then
     image="$RUNTIME_IMAGE_REF"; image_id="$RUNTIME_IMAGE_ID"; release="$BUILT_RUNTIME_RELEASE"
   else
     image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
     image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
-    # B2:release 未启用 → 传**空**(env_write_tuple 跳过 OC_RUNTIME_RELEASE,不覆盖/不新建空键)。
+    # R2-B1:release 轴禁用/未启用 → 传**空串**(恒写 OC_RUNTIME_RELEASE=,值空=禁用,--disable 后即稳态)。
     release=""
   fi
-  # bundle:启用则翻新 rev + 写新绝对路径;否则 flip_rev 空 + 传**空**(B2:不写 OC_PLATFORM_BUNDLE)。
-  if hotcfg_bundle_enabled; then
+  # bundle 轴:启用则翻新 rev + 写新绝对路径;禁用/未启用 → flip_rev 空(不翻 current)+ 写空值(R2-B1)。
+  if hotcfg_bundle_axis_on; then
     flip_rev="$BUILT_BUNDLE_REV"; bundle_val="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   else
     flip_rev=""; bundle_val=""
@@ -907,10 +956,11 @@ activate_runtime_tuple() {
   extra_apply="printf '%s\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$BUILT_RELEASE' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
   extra_revert="printf '%s\n' '$old_prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$prev_src' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
   # M7a:masterRelease=$BUILT_RELEASE(本次激活的 master 蓝绿 release)进 history,rollback 从同一条取回对齐。
+  # R2-B2:prev_master=$prev_src(激活前 live master)供首次启用的 pre-state 记录。
   hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle_val" \
-    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" \
+    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" "$prev_src" \
     || { echo "✗ 激活 saga 失败,已自动回滚旧 tuple(env/current/master 源码/.prev-release/重启旧 master)" >&2; return 1; }
   echo "  ✓ runtime tuple 激活并提交 history(release=${release:-<none>} bundle=${flip_rev:-<unchanged>} master=$BUILT_RELEASE)"
   run "sleep 3"
@@ -922,11 +972,16 @@ gc_runtime_artifacts() {
   hotcfg_rmt oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' || echo "  ⚠ runtime GC 失败(仅告警,不回滚)" >&2
 }
 
-# ── 5. --emergency-tuple:把当前 tuple 写为 OC_RUNTIME_EMERGENCY_TUPLE(部署 checklist 用,§1.1)──
+# ── 5. --emergency-tuple:写 OC_RUNTIME_EMERGENCY_TUPLE(部署 checklist 用,§1.1 / R2-M1)──
+# 缺省候选=当前 env 四键;显式候选 --image=/--image-id=/--bundle=(瘦身稳态直接登记内嵌镜像逃生点,
+# 不必先把现网翻到空 release)。硬验含 immutable ID 钉死(inspect .Id == image_id),见 lib 头注。
 emergency_tuple() {
-  echo "══ 写 emergency tuple(当前 tuple 快照 → OC_RUNTIME_EMERGENCY_TUPLE)══"
-  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] 读当前 tuple 四键 → 组 JSON → 写 OC_RUNTIME_EMERGENCY_TUPLE(cp env.bak)"; return 0; fi
-  hotcfg_rmt oc_hotcfg_write_emergency_tuple "$V5_ENV" 2>&1 | sed 's/^/  /' \
+  echo "══ 写 emergency tuple(→ OC_RUNTIME_EMERGENCY_TUPLE)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 候选(显式 --image/--image-id/--bundle,缺省取 env 现值)→ 硬验(embed≠0 / inspect .Id==image_id / release 空 / bundle MANIFEST 全量)→ 写键 + env.bak 轮转"
+    return 0
+  fi
+  hotcfg_rmt oc_hotcfg_write_emergency_tuple "$V5_ENV" "$EMERG_IMAGE" "$EMERG_IMAGE_ID" "$EMERG_BUNDLE" 2>&1 | sed 's/^/  /' \
     || { echo "✗ 写 emergency tuple 失败" >&2; exit 1; }
   echo "✓ emergency tuple 已写入 $V5_ENV(破坏兼容性变更后须刷新并实跑 smoke)。"
 }
@@ -1228,11 +1283,13 @@ deploy() {
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
   # 作为 saga 的 extra_apply,与 tuple env/current 同一原子回滚单元,单次重启)。
+  # R2-B1:--disable-* 时该轴不 build,但**必须走 saga**(把空值写进 env + restart + smoke + history 留痕)。
   local hc_bundle=0 hc_release=0 hc_any=0
-  if hotcfg_bundle_enabled; then hc_bundle=1; hc_any=1; fi
-  if hotcfg_release_enabled; then hc_release=1; hc_any=1; fi
+  if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
+  if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
+  [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
   if [[ "$hc_any" == 1 ]]; then
-    echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release)──"
+    echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
@@ -1421,9 +1478,11 @@ deploy_dist() {
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   # hotcfg 启用时同样走 tuple saga(master 源码翻转=extra_apply,单次重启)。纯前端变更下
   # bundle/release digest 不变 → 幂等复用零 churn;tuple env 不变 → 只是随本次重启一并生效。
+  # R2-B1:--disable-* 同 deploy(),该轴不 build 但强制走 saga 写空值。
   local hc_bundle=0 hc_release=0 hc_any=0
-  if hotcfg_bundle_enabled; then hc_bundle=1; hc_any=1; fi
-  if hotcfg_release_enabled; then hc_release=1; hc_any=1; fi
+  if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
+  if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
+  [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
   if [[ "$hc_any" == 1 ]]; then
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
@@ -1444,9 +1503,11 @@ rollback() {
   assert_bluegreen_layout
   # hotcfg 启用 → tuple 感知回滚:master 源码 symlink 与 runtime tuple(env 四键+current)是同一
   # deploy 的一对孪生产物,必须从**同一条** history 记录一起翻回(M7:master 与 tuple 不再各取一源)。
-  if hotcfg_bundle_enabled || hotcfg_release_enabled; then
+  # R2-B1:两轴刚被 --disable(env 已空)时 enabled 判定全 0,但 history 有账 → 仍须走 tuple 感知
+  # 路径才能"退回启用态";故入口判定并上 hotcfg_history_present。
+  if hotcfg_bundle_enabled || hotcfg_release_enabled || hotcfg_history_present; then
     if [[ "$DRY" == 1 ]]; then
-      echo "  [dry-run] hotcfg rollback:读 history 倒数第 $((ROLLBACK_N+1)) 条 committed(master+tuple 同源)→ saga 全量恢复(env 四键+current+master 源码+.prev-release+restart+smoke)"
+      echo "  [dry-run] hotcfg rollback:读 history 倒数第 $((ROLLBACK_N+1)) 条 committed(master+tuple 同源)→ saga 全量恢复(env 四键逐字面含空值+current+master 源码+.prev-release+restart+smoke)"
       return 0
     fi
     rollback_runtime_tuple "$ROLLBACK_N" || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
@@ -1484,9 +1545,10 @@ rollback_runtime_tuple() {
   master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
-  # 目标 bundle 值形如 <platform_root>/bundles/<rev>;仅当 bundle 机制在用且值合法时才翻 current
+  # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
+  # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
   flip_rev=""
-  if hotcfg_bundle_enabled && [[ "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT"/bundles/* ]]; then
+  if [[ -n "$bundle" && "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT"/bundles/* ]]; then
     flip_rev="${bundle##*/}"
   fi
   prev_src="$(bg_current_release)"   # 当前 master 源码(回滚后成为新的 .prev-release)
@@ -1496,12 +1558,13 @@ rollback_runtime_tuple() {
   smoke_cmd='hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$V5_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q '\''"ok":true'\'' && printf "%s" "$hz" | grep -q '\''"channel":"v5"'\'' && printf "%s" "$hz" | grep -q '\''"sessionsDb":"ok"'\'''
   extra_apply="printf '%s\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$master' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
   extra_revert="printf '%s\n' '$old_prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'; rm -f '$REMOTE_SRC.hotlink'; ln -s '$prev_src' '$REMOTE_SRC.hotlink'; mv -T '$REMOTE_SRC.hotlink' '$REMOTE_SRC'"
-  echo "  回滚到倒数第 $nth 条 committed tuple(同条恢复): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<unchanged>} master源码=$master"
+  echo "  回滚到倒数第 $nth 条 committed tuple(同条恢复,四键逐字面含空值): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
+  # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
   hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle" \
-    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master"
+    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src"
 }
 
 # ── 全局部署互斥(硬机制,2026-07-10 boss 指令:多会话并发改 v5 不靠记忆自觉)──

@@ -32,7 +32,7 @@
  */
 
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
-import { SupervisorError } from "./types.js";
+import { SupervisorError, type SupervisorErrorCode } from "./types.js";
 import {
   getV3ContainerStatus,
   markV3ContainerActivity,
@@ -117,15 +117,48 @@ const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
  */
 const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
 /**
- * V5 runtime tuple 产物级故障(PlatformBundleInvalid / RuntimeReleaseInvalid /
- * RuntimePlacementInvalid)—— 与 CcbBaselineMissing 同为**部署级**故障(bundle/release 坏、
- * current 激活中间态、release 误配到远端 host),不是"再试 5s 就好"的瞬态。走同等长重试避免
- * 前端每 5s 风暴放大运维噪声;运维修好产物 / 激活 saga 收尾后 5min 内自恢复(其中 current
- * 中间态本就是重启量级的短暂窗口,长重试上限足够覆盖且宽松)。
+ * V5 runtime tuple **部署级坏产物**(PlatformBundleInvalid / RuntimeReleaseInvalid /
+ * RuntimePlacementInvalid)—— 与 CcbBaselineMissing 同为部署级故障(bundle/release 结构坏、
+ * 或 release 误配到远端 host 的多机 placement 硬门),不是"再试 5s 就好"的瞬态。走同等长重试避免
+ * 前端每 5s 风暴放大运维噪声;运维修好产物后 5min 内自恢复。
+ *
+ * R2-M5:**current 激活中间态**已从本类拆出(见 RuntimeActivationInProgress → 5s 短重试不告警)——
+ * 它是激活 saga 的正常秒级窗口,不该吃 300s 长退避 + critical 告警。
  */
 const RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC = 300;
 // 已迁移到 v5:短重试;客户端应据 reason="migrated_to_v5" 重取(命中路由 cookie)导向 v5。
 const RETRY_AFTER_MIGRATED_V5_SEC = 3;
+
+/**
+ * R2-M5:v5 runtime tuple 相关 provision 失败码 → 重试/告警**分级**的单一权威(便于单测,免搭 harness)。
+ * 返回 null = 非本类(交回 catch-all / 其它专用块处理)。
+ *   - RuntimeActivationInProgress:current 激活中间态(秒级 saga 窗口)→ 5s 短重试 + **不告警**
+ *     (与 provisioning 同级)。运维无需介入,激活 saga 收尾后自然通过。
+ *   - PlatformBundleInvalid / RuntimeReleaseInvalid / RuntimePlacementInvalid:部署级坏产物 /
+ *     多机 placement 硬门 → 300s 长重试 + **critical 告警**(运维修产物后自恢复)。
+ */
+export interface RuntimeArtifactFailureClass {
+  retryAfterSec: number;
+  reason: string;
+  /** true → 发 critical 告警(部署级);false → 瞬态激活窗口,provisioning 同级不告警。 */
+  critical: boolean;
+}
+export function classifyRuntimeArtifactFailure(
+  code: SupervisorErrorCode,
+): RuntimeArtifactFailureClass | null {
+  switch (code) {
+    case "RuntimeActivationInProgress":
+      return { retryAfterSec: RETRY_AFTER_PROVISIONING_SEC, reason: "activation_in_progress", critical: false };
+    case "PlatformBundleInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "platform_bundle_invalid", critical: true };
+    case "RuntimeReleaseInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "runtime_release_invalid", critical: true };
+    case "RuntimePlacementInvalid":
+      return { retryAfterSec: RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason: "runtime_placement_invalid", critical: true };
+    default:
+      return null;
+  }
+}
 const V5_STALE_IMAGE_IDLE_MS = 30 * 60_000;
 const V5_RECYCLE_DRAIN_TIMEOUT_MS = 1_500;
 
@@ -774,38 +807,41 @@ export function makeV3EnsureRunning(
         });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
       }
-      // m1 — V5 runtime tuple 产物级故障:PlatformBundleInvalid / RuntimeReleaseInvalid /
-      // RuntimePlacementInvalid 与 CcbBaselineMissing 同款处理(部署级故障 → critical 告警 +
-      // 长重试)。bundle/release 坏或 current 激活中间态,运维修好产物 / 激活 saga 收尾后自恢复。
-      if (
-        err instanceof SupervisorError &&
-        (err.code === "PlatformBundleInvalid" ||
-          err.code === "RuntimeReleaseInvalid" ||
-          err.code === "RuntimePlacementInvalid")
-      ) {
-        const reason =
-          err.code === "PlatformBundleInvalid"
-            ? "platform_bundle_invalid"
-            : err.code === "RuntimeReleaseInvalid"
-              ? "runtime_release_invalid"
-              : "runtime_placement_invalid";
-        safeEnqueueAlert({
-          event_type: EVENTS.CONTAINER_PROVISION_FAILED,
-          severity: "critical",
-          title: "容器 provision 失败 — v5 runtime 产物非法",
-          body:
-            `uid=${uid} provision 失败(${err.code}):platform bundle / runtime release / 激活布局校验未过。` +
-            `需人工修复产物(bundle/release 目录)或等激活 saga 收尾。详情:${err.message}`,
-          payload: { uid, reason, code: err.code },
-          dedupe_key: `container.provision_failed:${reason}:${new Date().toISOString().slice(0, 13)}`,
-        });
-        // eslint-disable-next-line no-console
-        console.error("[v3ensureRunning] v5 runtime artifact invalid — refusing provision", {
-          uid,
-          code: err.code,
-          errMsg: err.message,
-        });
-        throw new ContainerUnreadyError(RETRY_AFTER_RUNTIME_ARTIFACT_INVALID_SEC, reason);
+      // m1 / R2-M5 — V5 runtime tuple 相关失败经 classifyRuntimeArtifactFailure **单一权威**分级:
+      //   - 部署级坏产物(PlatformBundleInvalid / RuntimeReleaseInvalid / RuntimePlacementInvalid)
+      //     → critical 告警 + 300s 长重试(运维修产物后自恢复)。
+      //   - current 激活中间态(RuntimeActivationInProgress)→ **不告警** + 5s 短重试(与 provisioning
+      //     同级);它是激活 saga 的正常秒级窗口,不该吃长退避 + critical。
+      const artifactClass =
+        err instanceof SupervisorError ? classifyRuntimeArtifactFailure(err.code) : null;
+      if (artifactClass) {
+        if (artifactClass.critical) {
+          safeEnqueueAlert({
+            event_type: EVENTS.CONTAINER_PROVISION_FAILED,
+            severity: "critical",
+            title: "容器 provision 失败 — v5 runtime 产物非法",
+            body:
+              `uid=${uid} provision 失败(${(err as SupervisorError).code}):platform bundle / runtime release / ` +
+              `多机 placement 校验未过。需人工修复产物(bundle/release 目录)或纠正调度。详情:${(err as SupervisorError).message}`,
+            payload: { uid, reason: artifactClass.reason, code: (err as SupervisorError).code },
+            dedupe_key: `container.provision_failed:${artifactClass.reason}:${new Date().toISOString().slice(0, 13)}`,
+          });
+          // eslint-disable-next-line no-console
+          console.error("[v3ensureRunning] v5 runtime artifact invalid — refusing provision", {
+            uid,
+            code: (err as SupervisorError).code,
+            errMsg: (err as SupervisorError).message,
+          });
+        } else {
+          // 瞬态激活窗口:provisioning 同级日志,不告警(避免激活 saga 的秒级窗口刷 critical 噪声)。
+          // eslint-disable-next-line no-console
+          console.warn("[v3ensureRunning] platform activation in progress — short retry (no alert)", {
+            uid,
+            code: (err as SupervisorError).code,
+            errMsg: (err as SupervisorError).message,
+          });
+        }
+        throw new ContainerUnreadyError(artifactClass.retryAfterSec, artifactClass.reason);
       }
       // v3→v5 迁移门控:该用户已迁移到 v5(migrated)或迁移进行中(migrating),v3 拒建容器。
       // 不告警、不当"provisioning"重试(那会让用户在 stale v3 路径上死循环重试);给独立
