@@ -17,9 +17,11 @@ process.env.OPENCLAUDE_HOME = testHome
 const {
   claimQueuedTurn,
   closeSelfhealDb,
+  enqueueCallback,
   enqueueExecution,
   getJob,
   insertJobReceived,
+  listCallbacksForRepair,
   setJobSessionKey,
   setJobStatus,
 } = await import('@openclaude/storage')
@@ -149,15 +151,63 @@ describe('cancel case ④ — live session → durable cancelling → confirmed 
   })
 })
 
-describe('cancel vs terminal success/failure — never resurrected', () => {
-  it('a succeeded job reports terminated=false, accepted=false and stays succeeded', async () => {
+describe('cancel case ⑤ — terminal success/failure: never resurrected, slot fully released (HIGH3)', () => {
+  // Semantics change (HIGH3): a terminal job used to answer terminated=false /
+  // accepted=false, permanently occupying the v5 singleflight slot. Now the
+  // cancel is honored WITHOUT touching the business result: terminated=true,
+  // release durably revoked, queued callbacks abandoned, residual session gone.
+  it('a succeeded job reports terminated=true, keeps its status, revokes the release and abandons the outbox', async () => {
     await insertJobReceived({ repairId: 'cx-done', incidentId: 'i', attempt: 0, payloadHash: 'p' })
     await setJobStatus('cx-done', 'succeeded')
+    // A parked pending_release marker is still queued when the cancel lands.
+    await enqueueCallback({
+      repairId: 'cx-done',
+      phase: 'pending_release',
+      message: 'gated',
+      detail: { phase: 'pending_release' },
+    })
     const r = await executeSelfhealCancel({ repairId: 'cx-done', incidentId: 'i' }, fakeSessions())
-    assert.equal(r.terminated, false)
-    assert.equal(r.accepted, false)
-    assert.equal(r.status, 'succeeded')
-    assert.equal((await getJob('cx-done'))?.status, 'succeeded')
+    assert.equal(r.terminated, true, 'terminal cancel now fully releases the slot')
+    assert.equal(r.accepted, true)
+    assert.equal(r.status, 'succeeded', 'business result unchanged')
+    const job = await getJob('cx-done')
+    assert.equal(job?.status, 'succeeded', 'never resurrected')
+    assert.equal(job?.releaseRevoked, true, 'durable release fuse blown')
+    assert.equal(
+      (await listCallbacksForRepair('cx-done'))[0]?.status,
+      'abandoned',
+      'queued master callbacks abandoned',
+    )
+  })
+
+  it('a failed job with a RESIDUAL live session tears it down (best-effort) and reports terminated=true', async () => {
+    await insertJobReceived({ repairId: 'cx-fail', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    await setJobStatus('cx-fail', 'failed')
+    const sessionKey = selfhealSessionKey('cx-fail')
+    await setJobSessionKey('cx-fail', sessionKey)
+    const sessions = fakeSessions({ live: [sessionKey] })
+    const r = await executeSelfhealCancel({ repairId: 'cx-fail', incidentId: 'i' }, sessions)
+    assert.equal(r.terminated, true)
+    assert.equal(r.status, 'failed')
+    assert.deepEqual(sessions.state.destroys, [sessionKey], 'residual session torn down')
+    assert.equal((await getJob('cx-fail'))?.status, 'failed')
+    assert.equal((await getJob('cx-fail'))?.releaseRevoked, true)
+  })
+
+  it('a wedged residual teardown still revokes + terminates (teardown is best-effort)', async () => {
+    await insertJobReceived({
+      repairId: 'cx-wedgeT',
+      incidentId: 'i',
+      attempt: 0,
+      payloadHash: 'p',
+    })
+    await setJobStatus('cx-wedgeT', 'succeeded')
+    const sessionKey = selfhealSessionKey('cx-wedgeT')
+    await setJobSessionKey('cx-wedgeT', sessionKey)
+    const sessions = fakeSessions({ live: [sessionKey], failDestroy: true })
+    const r = await executeSelfhealCancel({ repairId: 'cx-wedgeT', incidentId: 'i' }, sessions)
+    assert.equal(r.terminated, true, 'the revocation, not the teardown, is the hard guarantee')
+    assert.equal((await getJob('cx-wedgeT'))?.releaseRevoked, true)
   })
 })
 

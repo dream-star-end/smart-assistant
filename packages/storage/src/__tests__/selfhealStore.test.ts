@@ -19,22 +19,32 @@ const testHome = await mkdtemp(join(tmpdir(), 'oc-selfheal-'))
 process.env.OPENCLAUDE_HOME = testHome
 
 const {
+  SELFHEAL_CALLBACK_BACKOFF_BASE_MS,
+  SELFHEAL_CALLBACK_BACKOFF_CAP_MS,
+  abandonQueuedCallbacks,
+  bumpCallbackAttempt,
+  claimDueCallbacks,
   claimNextJob,
   claimQueuedTurn,
   closeSelfhealDb,
+  enqueueCallback,
   enqueueExecution,
   getBrokerAction,
   getExecution,
   getJob,
   insertCancelTombstone,
   insertJobReceived,
+  listCallbacksForRepair,
   listJobsByStatus,
+  markCallbackAbandoned,
+  markCallbackSent,
   overwriteBrokerActionResponse,
   purgeExpiredNonces,
   reclaimOrphanedLeases,
   recordNonceIfFresh,
   renewJobLease,
   setExecutionStatus,
+  setJobReleaseRevoked,
   setJobStatus,
   tryClaimBrokerAction,
   finalizeBrokerAction,
@@ -487,6 +497,165 @@ describe('broker action claim — atomic single-winner idempotency', () => {
       paramsHash: 'h',
     })
     assert.equal(after.outcome, 'replay')
+  })
+})
+
+describe('release_revoked fuse (HIGH3)', () => {
+  it('defaults to false; setJobReleaseRevoked durably and idempotently flips it', async () => {
+    await insertJobReceived({ repairId: 'rv-1', incidentId: 'i', attempt: 0, payloadHash: 'p' })
+    assert.equal((await getJob('rv-1'))?.releaseRevoked, false)
+    assert.equal(await setJobReleaseRevoked('rv-1'), true)
+    assert.equal((await getJob('rv-1'))?.releaseRevoked, true)
+    // Idempotent re-apply; unknown repair touches nothing.
+    assert.equal(await setJobReleaseRevoked('rv-1'), true)
+    assert.equal(await setJobReleaseRevoked('rv-ghost'), false)
+    await setJobStatus('rv-1', 'succeeded')
+  })
+})
+
+describe('callback outbox — durable broker→master delivery (BLOCKER2)', () => {
+  it('enqueue is idempotent on (repair_id, phase); different phases coexist', async () => {
+    assert.equal(
+      await enqueueCallback({
+        repairId: 'ob-1',
+        phase: 'pending_release',
+        message: 'm1',
+        detail: { phase: 'pending_release', sha: 'a'.repeat(40) },
+        now: 1_000,
+      }),
+      true,
+    )
+    // Duplicate (crash re-drive) is a no-op — never a second delivery.
+    assert.equal(
+      await enqueueCallback({
+        repairId: 'ob-1',
+        phase: 'pending_release',
+        message: 'm1-retry',
+        detail: {},
+        now: 1_001,
+      }),
+      false,
+    )
+    assert.equal(
+      await enqueueCallback({
+        repairId: 'ob-1',
+        phase: 'done',
+        message: 'm2',
+        detail: { phase: 'deployed' },
+        now: 1_002,
+      }),
+      true,
+    )
+    const rows = await listCallbacksForRepair('ob-1')
+    assert.equal(rows.length, 2)
+    assert.equal(rows[0]?.phase, 'pending_release')
+    assert.equal(rows[0]?.message, 'm1', 'losing enqueue must not overwrite the original')
+    assert.deepEqual(JSON.parse(rows[0]?.detailJson ?? '{}'), {
+      phase: 'pending_release',
+      sha: 'a'.repeat(40),
+    })
+    assert.equal(rows[1]?.phase, 'done')
+  })
+
+  it('claimDue holds back a repair’s done while its pending_release is still queued (保序)', async () => {
+    // ob-1 has pending_release(id smaller) + done queued: only pending is due.
+    const due = await claimDueCallbacks(2_000, 10)
+    const mine = due.filter((r) => r.repairId === 'ob-1')
+    assert.equal(mine.length, 1)
+    assert.equal(mine[0]?.phase, 'pending_release')
+    // Once pending_release is sent, done becomes claimable.
+    await markCallbackSent(mine[0]!.id, 2_001)
+    const due2 = await claimDueCallbacks(2_002, 10)
+    const mine2 = due2.filter((r) => r.repairId === 'ob-1')
+    assert.equal(mine2.length, 1)
+    assert.equal(mine2[0]?.phase, 'done')
+    await markCallbackSent(mine2[0]!.id, 2_003)
+    assert.equal(
+      (await claimDueCallbacks(2_004, 10)).filter((r) => r.repairId === 'ob-1').length,
+      0,
+    )
+  })
+
+  it('bumpCallbackAttempt backs off exponentially (base 5s, doubling, cap 5min)', async () => {
+    await enqueueCallback({
+      repairId: 'ob-bk',
+      phase: 'done',
+      message: 'm',
+      detail: {},
+      now: 10_000,
+    })
+    const [row] = await listCallbacksForRepair('ob-bk')
+    assert.ok(row)
+    // attempt 1: +base
+    await bumpCallbackAttempt(row!.id, 20_000)
+    let cur = (await listCallbacksForRepair('ob-bk'))[0]
+    assert.equal(cur?.attempts, 1)
+    assert.equal(cur?.nextAttemptAt, 20_000 + SELFHEAL_CALLBACK_BACKOFF_BASE_MS)
+    // Not due before next_attempt_at, due at/after it.
+    assert.equal(
+      (await claimDueCallbacks(20_000 + SELFHEAL_CALLBACK_BACKOFF_BASE_MS - 1, 10)).some(
+        (r) => r.repairId === 'ob-bk',
+      ),
+      false,
+    )
+    assert.equal(
+      (await claimDueCallbacks(20_000 + SELFHEAL_CALLBACK_BACKOFF_BASE_MS, 10)).some(
+        (r) => r.repairId === 'ob-bk',
+      ),
+      true,
+    )
+    // attempt 2: +2*base
+    await bumpCallbackAttempt(row!.id, 30_000)
+    cur = (await listCallbacksForRepair('ob-bk'))[0]
+    assert.equal(cur?.attempts, 2)
+    assert.equal(cur?.nextAttemptAt, 30_000 + 2 * SELFHEAL_CALLBACK_BACKOFF_BASE_MS)
+    // Many attempts later the delay is capped at 5min.
+    for (let i = 0; i < 10; i++) await bumpCallbackAttempt(row!.id, 40_000)
+    cur = (await listCallbacksForRepair('ob-bk'))[0]
+    assert.equal(cur?.attempts, 12)
+    assert.equal(cur?.nextAttemptAt, 40_000 + SELFHEAL_CALLBACK_BACKOFF_CAP_MS)
+    await markCallbackAbandoned(row!.id)
+  })
+
+  it('markCallbackAbandoned removes the row from the due set and unblocks later rows', async () => {
+    await enqueueCallback({
+      repairId: 'ob-ab',
+      phase: 'pending_release',
+      message: 'm',
+      detail: {},
+      now: 0,
+    })
+    await enqueueCallback({ repairId: 'ob-ab', phase: 'done', message: 'm', detail: {}, now: 1 })
+    const rows = await listCallbacksForRepair('ob-ab')
+    await markCallbackAbandoned(rows[0]!.id, 2)
+    // The abandoned pending_release no longer holds back done.
+    const due = (await claimDueCallbacks(3, 10)).filter((r) => r.repairId === 'ob-ab')
+    assert.equal(due.length, 1)
+    assert.equal(due[0]?.phase, 'done')
+    await markCallbackSent(due[0]!.id, 4)
+  })
+
+  it('abandonQueuedCallbacks abandons only the repair’s queued rows', async () => {
+    await enqueueCallback({
+      repairId: 'ob-cx',
+      phase: 'pending_release',
+      message: 'm',
+      detail: {},
+      now: 0,
+    })
+    await enqueueCallback({ repairId: 'ob-cx', phase: 'done', message: 'm', detail: {}, now: 1 })
+    await enqueueCallback({ repairId: 'ob-other', phase: 'done', message: 'm', detail: {}, now: 2 })
+    // A sent row must stay sent.
+    const cxRows = await listCallbacksForRepair('ob-cx')
+    await markCallbackSent(cxRows[0]!.id, 3)
+    assert.equal(await abandonQueuedCallbacks('ob-cx', 4), 1)
+    const after = await listCallbacksForRepair('ob-cx')
+    assert.equal(after[0]?.status, 'sent')
+    assert.equal(after[1]?.status, 'abandoned')
+    // The other repair is untouched (still due).
+    const other = (await claimDueCallbacks(5, 10)).filter((r) => r.repairId === 'ob-other')
+    assert.equal(other.length, 1)
+    await markCallbackSent(other[0]!.id, 6)
   })
 })
 

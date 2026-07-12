@@ -127,6 +127,77 @@ export function signSelfhealRequest(
   return { ts, nonce, sig }
 }
 
+/** The master EXPLICITLY refused to issue a capability for this repair
+ *  (unknown / terminal) — a permanent condition callers must not retry. */
+export class CapabilityClaimRejectedError extends Error {
+  constructor(public readonly httpStatus: number) {
+    super(`claim-capability explicitly refused: HTTP ${httpStatus}`)
+    this.name = 'CapabilityClaimRejectedError'
+  }
+}
+
+/** HTTP statuses that mean the master will NEVER issue a capability for this
+ *  repair (repair unknown, or already terminal) — everything else is transient. */
+const CAPABILITY_REJECT_STATUSES = new Set([404, 409, 410])
+
+/**
+ * POST ${callbackBaseUrl}/internal/v5/repairs/:id/claim-capability, authed with
+ * the webhook HMAC scheme (route-bound signature — the shared contract with the
+ * receiver). Single authority for capability claims: used by the jobWorker
+ * (initial claim before a repair turn) AND by the callbackPump (a FRESH
+ * capability per durable callback send — the 90min TTL would otherwise 401 any
+ * late one-click release).
+ *
+ * Throws {@link CapabilityClaimRejectedError} on an explicit master refusal
+ * (repair unknown/terminal); a plain Error on transient failures (retryable).
+ */
+export async function claimSelfhealCapability(input: {
+  callbackBaseUrl: string
+  hmacSecret: string
+  repairId: string
+  fetchImpl?: typeof fetch
+  timeoutMs?: number
+}): Promise<string> {
+  const url = `${input.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(input.repairId)}/claim-capability`
+  const rawBody = Buffer.from('{}', 'utf8')
+  // Route-bound signature: METHOD + the exact pathname the master sees.
+  const { ts, nonce, sig } = signSelfhealRequest(input.hmacSecret, {
+    method: 'POST',
+    path: new URL(url).pathname,
+    repairId: input.repairId,
+    rawBody,
+  })
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), input.timeoutMs ?? CAPABILITY_FETCH_TIMEOUT_MS)
+  try {
+    const f = input.fetchImpl ?? fetch
+    const res = await f(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Selfheal-Ts': ts,
+        'X-Selfheal-Nonce': nonce,
+        'X-Selfheal-Sig': sig,
+      },
+      body: rawBody,
+      signal: ctrl.signal,
+    })
+    if (!res.ok) {
+      if (CAPABILITY_REJECT_STATUSES.has(res.status)) {
+        throw new CapabilityClaimRejectedError(res.status)
+      }
+      throw new Error(`claim-capability HTTP ${res.status}`)
+    }
+    const data = (await res.json()) as { capability?: unknown }
+    if (typeof data.capability !== 'string' || !data.capability) {
+      throw new Error('claim-capability response missing capability')
+    }
+    return data.capability
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 export class SelfhealJobWorker {
   private readonly deps: SelfhealJobWorkerDeps
   private readonly owner: string
@@ -412,45 +483,19 @@ export class SelfhealJobWorker {
   }
 
   /**
-   * POST ${callbackBaseUrl}/internal/v5/repairs/:id/claim-capability, authed with
-   * the webhook HMAC scheme. Returns the capability string. Throws on non-200 /
-   * timeout / malformed response so the caller can retry via lease expiry.
+   * Claim the short-lived capability via the shared HMAC-signed primitive
+   * ({@link claimSelfhealCapability}). Throws on failure so the caller retries
+   * via lease expiry (an EXPLICIT refusal also lands here — the job then keeps
+   * failing its claim until the fuse/re-dispatch resolves it, which is correct:
+   * the master says this repair must not run).
    */
   private async fetchCapability(repairId: string): Promise<string> {
-    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/claim-capability`
-    const rawBody = Buffer.from('{}', 'utf8')
-    // Route-bound signature: METHOD + the exact pathname the master sees.
-    const { ts, nonce, sig } = signSelfhealRequest(this.deps.hmacSecret, {
-      method: 'POST',
-      path: new URL(url).pathname,
+    return claimSelfhealCapability({
+      callbackBaseUrl: this.deps.callbackBaseUrl,
+      hmacSecret: this.deps.hmacSecret,
       repairId,
-      rawBody,
+      fetchImpl: this.deps.fetchImpl,
+      timeoutMs: CAPABILITY_FETCH_TIMEOUT_MS,
     })
-    const ctrl = new AbortController()
-    const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
-    try {
-      const f = this.deps.fetchImpl ?? fetch
-      const res = await f(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Selfheal-Ts': ts,
-          'X-Selfheal-Nonce': nonce,
-          'X-Selfheal-Sig': sig,
-        },
-        body: rawBody,
-        signal: ctrl.signal,
-      })
-      if (!res.ok) {
-        throw new Error(`claim-capability HTTP ${res.status}`)
-      }
-      const data = (await res.json()) as { capability?: unknown }
-      if (typeof data.capability !== 'string' || !data.capability) {
-        throw new Error('claim-capability response missing capability')
-      }
-      return data.capability
-    } finally {
-      clearTimeout(timeout)
-    }
   }
 }

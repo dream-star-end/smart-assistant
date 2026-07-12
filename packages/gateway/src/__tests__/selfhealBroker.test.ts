@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
+  type BrokerCallbackOutbox,
   type BrokerRequest,
   type BrokerResponse,
   InMemoryBrokerClaimStore,
   type RepairAuthority,
   SelfhealBroker,
+  releaseHttpStatusFor,
 } from '../selfheal/broker.js'
 import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
@@ -602,7 +604,9 @@ describe('broker report kind — redacted, length-capped capability POST', () =>
     assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), { message: 'starting layer 2' })
   })
 
-  it('redacts secrets and enforces the length caps', async () => {
+  // MED1: the v5 callback schema requires `detail` to be a JSON OBJECT — the
+  // CLI/socket contract stays string-only, so the broker wraps it as { text }.
+  it('redacts secrets, enforces the length caps, and wraps detail as an OBJECT {text}', async () => {
     const { broker, calls } = reportBroker()
     const resp = await broker.handleRequest({
       repairId: 'rp-2',
@@ -614,12 +618,28 @@ describe('broker report kind — redacted, length-capped capability POST', () =>
       },
     })
     assert.equal(resp.ok, true)
-    const body = JSON.parse(String(calls[0]?.init?.body)) as { message: string; detail: string }
+    const body = JSON.parse(String(calls[0]?.init?.body)) as {
+      message: string
+      detail: { text: string }
+    }
     assert.ok(!body.message.includes('sk-abcdefgh12345678'), 'api key redacted')
     assert.ok(body.message.length <= 50, 'message capped')
-    assert.ok(!body.detail.includes('very.secret.jwt'), 'bearer redacted')
-    assert.ok(!body.detail.includes('hunter2'), 'password value redacted')
-    assert.ok(body.detail.length <= 60, 'detail capped')
+    assert.equal(typeof body.detail, 'object', 'detail is an object (v5 schema)')
+    assert.equal(typeof body.detail.text, 'string', 'string detail wrapped as {text}')
+    assert.ok(!body.detail.text.includes('very.secret.jwt'), 'bearer redacted')
+    assert.ok(!body.detail.text.includes('hunter2'), 'password value redacted')
+    assert.ok(body.detail.text.length <= 60, 'detail capped')
+  })
+
+  it('omits detail entirely when the caller sent none (no empty wrapper)', async () => {
+    const { broker, calls } = reportBroker()
+    await broker.handleRequest({
+      repairId: 'rp-nodetail',
+      actionKind: 'report',
+      params: { outcome: 'progress', message: 'no detail here' },
+    })
+    const body = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>
+    assert.equal('detail' in body, false)
   })
 
   it('rejects an unknown outcome and a missing message', async () => {
@@ -701,6 +721,9 @@ describe('releaseApproved — re-verifies pending record + ancestry + denylist',
     const store = new InMemoryBrokerClaimStore()
     const deployed: string[] = []
     const ancestry = { ok: true }
+    // Mutable release fuse (HIGH3): a test flips it AFTER parking the pending
+    // cutover to model a cancel of the (terminal) job revoking the release.
+    const revoked = { v: false }
     const { run } = stubRunner((cmd, args) => {
       if (cmd === 'git' && args.includes('merge-base')) {
         return { code: ancestry.ok ? 0 : 1 }
@@ -710,7 +733,11 @@ describe('releaseApproved — re-verifies pending record + ancestry + denylist',
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store,
-      repairAuthority: activeAuthority,
+      repairAuthority: async () => ({
+        status: 'running',
+        capability: CAP,
+        releaseRevoked: revoked.v,
+      }),
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       canonicalRepo: '/canon',
@@ -744,7 +771,7 @@ describe('releaseApproved — re-verifies pending record + ancestry + denylist',
       assert.equal(resp.status, 'pending_release')
     }
     const cleanup = () => rmSync(vdir, { recursive: true, force: true })
-    return { broker, store, deployed, ancestry, parkPendingCutover, cleanup }
+    return { broker, store, deployed, ancestry, revoked, parkPendingCutover, cleanup }
   }
 
   it('happy path: pending record found → ancestry re-checked → driver deploys; replay is idempotent', async () => {
@@ -809,24 +836,74 @@ describe('releaseApproved — re-verifies pending record + ancestry + denylist',
     assert.equal(fx.deployed.length, 1)
     fx.cleanup()
   })
+
+  it('refuses a release revoked by a terminal-job cancel (HIGH3 fuse — deploy never invoked)', async () => {
+    const fx = releaseFixture()
+    await fx.parkPendingCutover('rl-revoked')
+    // Cancel of the terminal job flips the durable fuse after the park.
+    fx.revoked.v = true
+    const resp = await fx.broker.releaseApproved('rl-revoked')
+    assert.equal(resp.status, 'rejected')
+    assert.equal(resp.detail?.reason, 'release_revoked')
+    assert.deepEqual(fx.deployed, [], 'deploy never invoked')
+    // The fuse is checked at ENTRY: no release claim was consumed either.
+    assert.equal(await fx.store.get('rl-revoked:release_approved'), null)
+    fx.cleanup()
+  })
 })
 
-describe('broker → master callback seam (pending_release progress / post-release done)', () => {
+// ── BLOCKER1: release endpoint HTTP mapping (server.ts consumes this) ─────────
+
+describe('releaseHttpStatusFor — 5-tier release HTTP mapping matrix', () => {
+  it('maps every broker release outcome onto the seam contract', () => {
+    // deployed → 200, including an idempotent replay of a deployed record.
+    assert.equal(releaseHttpStatusFor({ ok: true, status: 'deployed' }), 200)
+    assert.equal(
+      releaseHttpStatusFor({ ok: true, status: 'deployed', detail: { replayed: true } }),
+      200,
+    )
+    // gate refusals (ancestry / denylist / missing record / release_revoked)
+    // and a still-held pending → 409.
+    assert.equal(releaseHttpStatusFor({ ok: false, status: 'pending_release' }), 409)
+    assert.equal(releaseHttpStatusFor({ ok: false, status: 'rejected' }), 409)
+    assert.equal(
+      releaseHttpStatusFor({
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'release_revoked' },
+      }),
+      409,
+    )
+    // an unfinalized prior release → 423.
+    assert.equal(releaseHttpStatusFor({ ok: false, status: 'in_progress' }), 423)
+    // driver failure → 500.
+    assert.equal(releaseHttpStatusFor({ ok: false, status: 'deploy_failed' }), 500)
+    // anything unexpected is a server error, never a 2xx.
+    assert.equal(releaseHttpStatusFor({ ok: false, status: 'error' }), 500)
+  })
+})
+
+describe('broker → master callback seam (durable outbox — BLOCKER2)', () => {
   const SHA = 'b'.repeat(40)
-  function seamFixture(opts: { fetchStatus?: number; fetchThrows?: boolean } = {}) {
+  type Enq = { repairId: string; phase: string; message: string; detail: Record<string, unknown> }
+  function seamFixture(opts: { outboxThrows?: boolean; autoDeploy?: boolean } = {}) {
     const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-seam-'))
+    // The broker must NOT talk to the master for these callbacks anymore —
+    // every direct fetch is recorded so the tests can assert its absence.
     const calls: { url: string; init?: RequestInit }[] = []
     const impl = (async (url: string | URL, init?: RequestInit) => {
       calls.push({ url: String(url), init })
-      if (opts.fetchThrows) throw new Error('tunnel down')
-      const status = opts.fetchStatus ?? 200
-      return {
-        ok: status >= 200 && status < 300,
-        status,
-        text: async () => '{}',
-        json: async () => ({}),
-      }
+      return { ok: true, status: 200, text: async () => '{}', json: async () => ({}) }
     }) as unknown as typeof fetch
+    const enqueued: Enq[] = []
+    const outbox: BrokerCallbackOutbox = {
+      enqueue: async (input) => {
+        if (opts.outboxThrows) throw new Error('outbox disk full')
+        const dup = enqueued.some((e) => e.repairId === input.repairId && e.phase === input.phase)
+        if (!dup) enqueued.push(input)
+        return !dup
+      },
+    }
     const { run } = stubRunner((cmd, args) => {
       if (cmd === 'git' && args.includes('merge-base')) return { code: 0 }
       return { code: 0 }
@@ -840,9 +917,10 @@ describe('broker → master callback seam (pending_release progress / post-relea
       verificationDir: vdir,
       canonicalRepo: '/canon',
       run,
-      autoDeployTier2: false,
+      autoDeployTier2: opts.autoDeploy ?? false,
       callbackBaseUrl: 'http://127.0.0.1:18796',
       fetchImpl: impl,
+      callbackOutbox: outbox,
       deployDriver: async (sha) => {
         deployed.push(sha)
         return { ok: true, status: 'deployed', detail: { sha } }
@@ -864,44 +942,87 @@ describe('broker → master callback seam (pending_release progress / post-relea
         params: { sha: SHA, verificationRef: repairId },
       })
     }
-    return { broker, calls, deployed, park, cleanup: () => rmSync(vdir, { recursive: true, force: true }) }
+    return {
+      broker,
+      calls,
+      enqueued,
+      deployed,
+      park,
+      cleanup: () => rmSync(vdir, { recursive: true, force: true }),
+    }
   }
 
-  it('a gated cutover posts the pending_release progress marker (detail.phase, object) to the master', async () => {
+  it('a gated cutover ENQUEUES the pending_release marker (detail.phase object) — no direct POST', async () => {
     const fx = seamFixture()
     const resp = await fx.park('seam-1')
     assert.equal(resp.status, 'pending_release')
-    const call = fx.calls.find((c) => c.url.endsWith('/internal/v5/repairs/seam-1/progress'))
-    assert.ok(call, 'broker must deterministically post the progress callback')
-    const body = JSON.parse(String(call?.init?.body))
-    assert.equal(body.detail.phase, 'pending_release', "master's release gate reads detail->>'phase'")
-    assert.match(body.message, /pending_release/)
+    assert.equal(fx.enqueued.length, 1)
+    assert.equal(fx.enqueued[0]?.repairId, 'seam-1')
+    assert.equal(fx.enqueued[0]?.phase, 'pending_release')
     assert.equal(
-      (call?.init?.headers as Record<string, string>)?.Authorization,
-      `Bearer ${CAP}`,
-      'root-held capability authenticates the seam callback',
+      fx.enqueued[0]?.detail.phase,
+      'pending_release',
+      "master's release gate reads detail->>'phase' — the pump delivers this object verbatim",
+    )
+    assert.equal(fx.enqueued[0]?.detail.sha, SHA)
+    assert.match(fx.enqueued[0]?.message ?? '', /pending_release/)
+    // Durable delivery is the PUMP's job: the broker itself must not have
+    // POSTed the callback (best-effort direct sends are the bug being removed).
+    assert.equal(
+      fx.calls.some((c) => c.url.endsWith('/progress')),
+      false,
+      'no direct progress POST from the broker',
     )
     fx.cleanup()
   })
 
-  it('releaseApproved posts DONE (phase=deployed) after a successful human release', async () => {
+  it('releaseApproved ENQUEUES done (phase=deployed) after a successful human release', async () => {
     const fx = seamFixture()
     await fx.park('seam-2')
     const resp = await fx.broker.releaseApproved('seam-2')
     assert.equal(resp.status, 'deployed')
     assert.deepEqual(fx.deployed, [SHA])
-    const done = fx.calls.find((c) => c.url.endsWith('/internal/v5/repairs/seam-2/done'))
-    assert.ok(done, 'the broker (not codex) closes the loop after release')
-    assert.equal(JSON.parse(String(done?.init?.body)).detail.phase, 'deployed')
+    const done = fx.enqueued.find((e) => e.phase === 'done')
+    assert.ok(done, 'the broker (not codex) closes the loop after release — durably')
+    assert.equal(done?.repairId, 'seam-2')
+    assert.equal(done?.detail.phase, 'deployed')
+    assert.equal(done?.detail.sha, SHA)
+    assert.equal(
+      fx.calls.some((c) => c.url.endsWith('/done')),
+      false,
+      'no direct done POST from the broker',
+    )
     fx.cleanup()
   })
 
-  it('callback failure never changes the cutover/release outcome (audited best-effort)', async () => {
-    const fx = seamFixture({ fetchThrows: true })
+  it('an auto-deployed cutover (AUTO_DEPLOY_TIER2=1) enqueues done as well', async () => {
+    const fx = seamFixture({ autoDeploy: true })
+    const resp = await fx.park('seam-auto')
+    assert.equal(resp.status, 'deployed')
+    const done = fx.enqueued.find((e) => e.phase === 'done')
+    assert.equal(done?.detail.phase, 'deployed')
+    assert.equal(
+      fx.enqueued.some((e) => e.phase === 'pending_release'),
+      false,
+    )
+    fx.cleanup()
+  })
+
+  it('outbox enqueue failure never changes the cutover/release outcome (audited only)', async () => {
+    const fx = seamFixture({ outboxThrows: true })
     const parked = await fx.park('seam-3')
-    assert.equal(parked.status, 'pending_release', 'pending outcome survives a dead tunnel')
+    assert.equal(parked.status, 'pending_release', 'pending outcome survives an enqueue failure')
     const rel = await fx.broker.releaseApproved('seam-3')
-    assert.equal(rel.status, 'deployed', 'deploy outcome survives a dead tunnel')
+    assert.equal(rel.status, 'deployed', 'deploy outcome survives an enqueue failure')
+    fx.cleanup()
+  })
+
+  it('a replayed cutover does not enqueue a second marker', async () => {
+    const fx = seamFixture()
+    await fx.park('seam-4')
+    const replay = await fx.park('seam-4')
+    assert.equal(replay.detail?.replayed, true)
+    assert.equal(fx.enqueued.length, 1, 'idempotent replay leaves the outbox untouched')
     fx.cleanup()
   })
 })

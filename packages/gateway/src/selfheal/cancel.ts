@@ -5,9 +5,9 @@
 // server.ts, which then calls {@link executeSelfhealCancel}. The legacy
 // /internal/selfheal/cancel route is deleted.
 //
-// terminated semantics (§A2 table) — `terminated === true` IFF the repair's
-// durable status is 'cancelled' (decidable across crashes; a teardown that was
-// never CONFIRMED must not release the v5 singleflight slot):
+// terminated semantics (§A2 table) — `terminated === true` IFF the repair can
+// hold NO further execution and NO future deploy (decidable across crashes; a
+// teardown that was never CONFIRMED must not release the v5 singleflight slot):
 //
 //   ① unknown repair            → atomic tombstone insert         → true
 //   ② no live session           → CAS active→cancelled            → true
@@ -16,15 +16,26 @@
 //                                  teardown, CONFIRM, →'cancelled' → true
 //      teardown unconfirmed      → stays 'cancelling'              → false
 //                                  (a retried cancel resumes here)
+//   ⑤ terminal succeeded/failed  → best-effort residual-session
+//                                  teardown + DURABLE release
+//                                  revocation + outbox abandon     → true
 //
-// Terminal succeeded/failed jobs are NOT resurrected (guarded CAS refuses) and
-// report terminated=false with the actual status — the v5 side's verify fence
-// owns the success-attribution path.
+// Case ⑤ (HIGH3): a terminal job is NOT resurrected — its business result
+// (succeeded/failed) is unchanged — but the cancel must still fully release the
+// v5 singleflight slot: any residual session is torn down, the durable
+// `release_revoked` fuse blocks a parked pending_release cutover from ever
+// being released, and the repair's still-queued master callbacks are abandoned.
 //
 // The whole decision runs under the per-repair keyed mutex (withRepairLock), so
 // it serializes against the jobWorker's CAS→submit critical section.
 
-import { getJob, insertCancelTombstone, setJobStatus } from '@openclaude/storage'
+import {
+  abandonQueuedCallbacks,
+  getJob,
+  insertCancelTombstone,
+  setJobReleaseRevoked,
+  setJobStatus,
+} from '@openclaude/storage'
 import { createLogger } from '../logger.js'
 import { selfhealSessionKey, withRepairLock } from './executionLedger.js'
 
@@ -39,12 +50,15 @@ export interface CancelSessionOps {
 
 export interface CancelOutcome {
   repairId: string
-  /** True IFF the repair's durable status is now 'cancelled'. */
+  /** True IFF the repair can hold no further execution and no future deploy:
+   *  durable status 'cancelled', OR terminal (succeeded/failed) with its
+   *  residual session gone + release durably revoked (case ⑤). */
   terminated: boolean
-  /** True when the cancel is in effect (tombstoned / cancelled / cancelling);
-   *  false when refused because the job already reached succeeded/failed. */
+  /** True when the cancel is in effect (tombstoned / cancelled / cancelling /
+   *  terminal-with-revoked-release). */
   accepted: boolean
-  /** The job's durable status after this call (for observability). */
+  /** The job's durable status after this call (for observability). A terminal
+   *  job keeps its business result — cancel never rewrites succeeded/failed. */
   status: string
 }
 
@@ -86,9 +100,33 @@ async function cancelLocked(
   if (job.status === 'cancelled') {
     return { repairId, terminated: true, accepted: true, status: 'cancelled' }
   }
-  // Terminal success/failure is never resurrected (cancel racing completion).
+  // ⑤ Terminal success/failure is never resurrected (business result stands),
+  // but the cancel must still fully release the v5 slot (HIGH3): tear down any
+  // residual session (best-effort), durably revoke a held release so a parked
+  // pending_release cutover can never ship, and abandon the repair's queued
+  // master callbacks so the pump stops arming a gate that will never fire.
   if (job.status === 'succeeded' || job.status === 'failed') {
-    return { repairId, terminated: false, accepted: false, status: job.status }
+    const terminalSessionKey = job.sessionKey ?? selfhealSessionKey(repairId)
+    if (sessions.getByKey(terminalSessionKey)) {
+      try {
+        sessions.interrupt(terminalSessionKey)
+        await sessions.destroySession(terminalSessionKey)
+      } catch (err) {
+        log.warn(
+          'terminal-cancel residual session teardown failed (best-effort)',
+          { repairId, sessionKey: terminalSessionKey },
+          err,
+        )
+      }
+    }
+    await setJobReleaseRevoked(repairId)
+    const abandoned = await abandonQueuedCallbacks(repairId)
+    log.info('terminal-cancel: release revoked, outbox abandoned', {
+      repairId,
+      status: job.status,
+      abandoned,
+    })
+    return { repairId, terminated: true, accepted: true, status: job.status }
   }
 
   const sessionKey = job.sessionKey ?? selfhealSessionKey(repairId)

@@ -64,6 +64,9 @@ describe('selfheal_jobs cancelling-CHECK rebuild guard', () => {
     assert.equal(job?.sessionKey, 'selfheal:legacy-1')
     assert.equal(job?.createdAt, 100)
     assert.equal(job?.updatedAt, 200)
+    // The rebuild target carries the newer release_revoked fuse column too
+    // (HIGH3) — legacy rows take the default (not revoked).
+    assert.equal(job?.releaseRevoked, false)
   })
 
   it("the rebuilt CHECK accepts 'cancelling'", async () => {
@@ -77,11 +80,22 @@ describe('selfheal_jobs cancelling-CHECK rebuild guard', () => {
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'selfheal_jobs'")
       .get() as { sql: string }
     assert.ok(row.sql.includes("'cancelling'"))
+    assert.ok(row.sql.includes('release_revoked'), 'rebuild target includes the fuse column')
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'selfheal_jobs'")
       .all() as { name: string }[]
     const names = indexes.map((i) => i.name)
     assert.ok(names.includes('idx_selfheal_jobs_status'))
     assert.ok(names.includes('idx_selfheal_jobs_lease'))
+  })
+
+  it('the new callback outbox table exists on an upgraded DB', async () => {
+    const db = await getSelfhealDb()
+    const t = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'selfheal_callback_outbox'",
+      )
+      .get() as { name: string } | undefined
+    assert.equal(t?.name, 'selfheal_callback_outbox')
   })
 })

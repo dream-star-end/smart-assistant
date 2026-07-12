@@ -37,6 +37,8 @@ import { type Server, type Socket, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
   type BrokerClaimResult,
+  type SelfhealCallbackPhase,
+  enqueueCallback,
   finalizeBrokerAction,
   getBrokerAction,
   getJob as getSelfhealJob,
@@ -113,6 +115,9 @@ export interface BrokerRequest {
 export interface RepairAuthorityRecord {
   status: string
   capability: string | null
+  /** Durable release fuse (HIGH3): set by a cancel of a terminal job — a held
+   *  pending_release cutover for this repair must never be released. */
+  releaseRevoked?: boolean
 }
 
 /** Resolves the durable repair record for a repairId (or null if none). */
@@ -125,7 +130,9 @@ const ACTIVE_REPAIR_STATES = new Set(['starting', 'running'])
 /** Default authority backed by the durable selfheal job store. */
 const defaultRepairAuthority: RepairAuthority = async (repairId) => {
   const job = await getSelfhealJob(repairId)
-  return job ? { status: job.status, capability: job.capability } : null
+  return job
+    ? { status: job.status, capability: job.capability, releaseRevoked: job.releaseRevoked }
+    : null
 }
 
 /** Constant-time capability comparison. Length mismatch / empty ⇒ false. */
@@ -141,6 +148,58 @@ export interface BrokerResponse {
   /** Machine-readable outcome. */
   status: string
   detail?: Record<string, unknown>
+}
+
+/**
+ * Map a releaseApproved outcome onto the release endpoints' HTTP status
+ * (BLOCKER1). The v5 admin side treats "2xx && body.ok && body.status ===
+ * 'deployed'" as success, so every non-deployed outcome MUST be non-2xx —
+ * a refused/held/failed release can never be read as applied:
+ *   deployed (incl. idempotent replay)          → 200
+ *   pending_release / rejected (ancestry,
+ *     denylist, missing record, release_revoked) → 409
+ *   in_progress (unfinalized prior release)      → 423
+ *   deploy_failed                                → 500
+ * Store/internal exceptions never reach this mapper — the handlers catch them
+ * and answer 503 directly.
+ */
+export function releaseHttpStatusFor(resp: BrokerResponse): number {
+  switch (resp.status) {
+    case 'deployed':
+      return 200
+    case 'pending_release':
+    case 'rejected':
+      return 409
+    case 'in_progress':
+      return 423
+    case 'deploy_failed':
+      return 500
+    default:
+      return 500
+  }
+}
+
+// ── durable master-callback outbox seam (BLOCKER2) ───────────────────────────
+
+/**
+ * Where the broker parks its deterministic master callbacks (the
+ * pending_release progress marker and the deployed done). Durable + idempotent
+ * on (repairId, phase); the gateway callbackPump owns delivery/retry — the
+ * broker itself never talks to the master for these anymore (a one-shot network
+ * failure used to permanently break the v5 state machine).
+ */
+export interface BrokerCallbackOutbox {
+  enqueue(input: {
+    repairId: string
+    phase: SelfhealCallbackPhase
+    message: string
+    detail: Record<string, unknown>
+  }): Promise<boolean>
+}
+
+/** Default outbox backed by the durable selfheal SQLite store. */
+export const durableCallbackOutbox: BrokerCallbackOutbox = {
+  enqueue: (input) => enqueueCallback(input),
 }
 
 // ── idempotency store (durable, atomic single-winner claim) ──────────────────
@@ -286,6 +345,10 @@ export interface SelfhealBrokerOpts {
    *  such a candidate can ONLY ship via a human offline standard deploy. */
   notifyPendingRelease?: (info: { repairId: string; sha: string; toolchain?: string[] }) => void
 
+  /** Durable outbox for the deterministic broker→master callbacks (BLOCKER2).
+   *  Defaults to the SQLite-backed outbox; tests inject a recorder. */
+  callbackOutbox?: BrokerCallbackOutbox
+
   // ── block C action deps (context / verify / report) ──
   /** OC_SELFHEAL_CALLBACK_URL — forward tunnel base to the v5 master. The
    *  broker (root) uses the job's capability against it; the capability never
@@ -318,6 +381,7 @@ export class SelfhealBroker {
   private readonly ochealUid?: number
   private readonly ochealGid?: number
   private readonly autoDeployTier2: boolean
+  private readonly callbackOutbox: BrokerCallbackOutbox
 
   constructor(private readonly opts: SelfhealBrokerOpts) {
     this.log = opts.log ?? rootLog
@@ -325,6 +389,7 @@ export class SelfhealBroker {
     // replay protection across a restart (Codex HIGH #4), so it must be opted in.
     this.store = opts.store ?? durableBrokerClaimStore
     this.repairAuthority = opts.repairAuthority ?? defaultRepairAuthority
+    this.callbackOutbox = opts.callbackOutbox ?? durableCallbackOutbox
     this.actions = opts.actions ?? TIER1_ACTIONS
     this.run = opts.run ?? defaultCommandRunner
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
@@ -667,10 +732,12 @@ export class SelfhealBroker {
       // Deterministic root-side pending_release marker to the master (seam
       // contract: the admin release gate requires a progress event with
       // detail.phase='pending_release', and codex cannot be relied on to send
-      // it). Failure never changes the pending outcome (audited only).
-      await this.postMasterCallback(
+      // it). DURABLE (BLOCKER2): enqueued to the outbox and pumped with retry —
+      // a network blip can no longer orphan the release gate. Enqueue failure
+      // never changes the pending outcome (audited only).
+      await this.enqueueMasterCallback(
         req.repairId,
-        'progress',
+        'pending_release',
         'pending_release: verified and gated — awaiting one-click release',
         { phase: 'pending_release', sha, ...(touched.length ? { toolchain: true } : {}) },
       )
@@ -695,8 +762,8 @@ export class SelfhealBroker {
     this.audit(req, result.status, { sha, ...result.detail })
     if (result.status === 'deployed') {
       // Auto-deploy path closes the loop root-side: master → 'verifying',
-      // probe fence adjudicates real recovery.
-      await this.postMasterCallback(req.repairId, 'done', 'auto cutover deployed', {
+      // probe fence adjudicates real recovery. Durable outbox (BLOCKER2).
+      await this.enqueueMasterCallback(req.repairId, 'done', 'auto cutover deployed', {
         phase: 'deployed',
         sha,
       })
@@ -868,7 +935,10 @@ export class SelfhealBroker {
     const msgMax = this.opts.reportMessageMaxChars ?? DEFAULT_REPORT_MESSAGE_MAX
     const detailMax = this.opts.reportDetailMaxChars ?? DEFAULT_REPORT_DETAIL_MAX
     const message = redactSelfhealText(p.message).slice(0, msgMax)
-    const detail =
+    // Cross-repo schema (MED1): the v5 callback requires `detail` to be a JSON
+    // OBJECT. The CLI/socket contract stays string-only (free text from codex),
+    // so the broker wraps the redacted string as { text } before sending.
+    const detailText =
       p.detail !== undefined ? redactSelfhealText(p.detail).slice(0, detailMax) : undefined
     const f = this.opts.fetchImpl ?? fetch
     const url = `${base}/internal/v5/repairs/${encodeURIComponent(req.repairId)}/${outcome}`
@@ -879,7 +949,10 @@ export class SelfhealBroker {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${rec.capability}`,
         },
-        body: JSON.stringify({ message, ...(detail !== undefined ? { detail } : {}) }),
+        body: JSON.stringify({
+          message,
+          ...(detailText !== undefined ? { detail: { text: detailText } } : {}),
+        }),
         redirect: 'manual',
         signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
       })
@@ -922,6 +995,26 @@ export class SelfhealBroker {
     if (!/^[A-Za-z0-9._:-]+$/.test(repairId)) {
       return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
     }
+
+    // Release fuse (HIGH3): a cancel of a terminal job durably revokes any held
+    // release — checked at entry, before the claim, so a revoked repair can
+    // never consume a release claim or reach the driver. Authority lookup
+    // failure fails CLOSED (this method's outcome is a production deploy).
+    let authRec: RepairAuthorityRecord | null
+    try {
+      authRec = await this.repairAuthority(repairId)
+    } catch (err) {
+      this.log.error('release authority lookup failed — refusing', { repairId }, err)
+      return { ok: false, status: 'rejected', detail: { reason: 'authority unavailable' } }
+    }
+    if (authRec?.releaseRevoked) {
+      this.log.warn('release refused — revoked by cancel', { repairId })
+      this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'rejected', {
+        reason: 'release_revoked',
+      })
+      return { ok: false, status: 'rejected', detail: { reason: 'release_revoked' } }
+    }
+
     const cutoverKey = `${repairId}:${CUTOVER_KIND}`
     const rec = await this.store.get(cutoverKey)
     if (!rec || rec.status !== 'committed' || !rec.response) {
@@ -1017,17 +1110,21 @@ export class SelfhealBroker {
     }
 
     if (response.status === 'deployed') {
+      // Close the loop on the master: the codex turn ended back at cutover
+      // time, so the DONE callback must come from the broker after a human
+      // release — master → 'verifying' → probe fence adjudicates. Enqueued
+      // BEFORE finalize (BLOCKER2): once the deploy has actually run, the
+      // master must eventually learn of it even across a crash right here —
+      // the outbox row is deduped on (repairId, phase), so a re-drive that
+      // enqueues again cannot double-post.
+      await this.enqueueMasterCallback(repairId, 'done', 'released and deployed', {
+        phase: 'deployed',
+        sha,
+      })
       await this.store.finalize(releaseKey, JSON.stringify(response))
       // Observability: flip the durable cutover record from pending_release to
       // the deployed outcome so ops sees the true terminal state.
       await this.store.overwriteCommitted(cutoverKey, JSON.stringify(response))
-      // Close the loop on the master: the codex turn ended back at cutover
-      // time, so the DONE callback must come from the broker after a human
-      // release — master → 'verifying' → probe fence adjudicates.
-      await this.postMasterCallback(repairId, 'done', 'released and deployed', {
-        phase: 'deployed',
-        sha,
-      })
     } else {
       // Not deployed (toolchain hold / driver failure / gate reject): release
       // the claim so a corrected future release attempt can retry.
@@ -1049,64 +1146,34 @@ export class SelfhealBroker {
   /**
    * Deterministic ROOT-side callback to the v5 master (seam contract, design
    * §C2/§C3): the pending_release progress marker and the post-release done are
-   * posted by the broker itself — the master's release gate reads
-   * `detail->>'phase'`, and the codex turn may have long ended when a human
-   * releases. `detail` is a JSON OBJECT here; the ocheal-facing `report` kind
-   * intentionally keeps its string-only detail posture (free text from codex).
-   * Best-effort: failure is audited and never changes the caller's outcome.
+   * OWNED by the broker — the master's release gate reads `detail->>'phase'`,
+   * and the codex turn may have long ended when a human releases.
+   *
+   * DURABLE (BLOCKER2): the broker no longer POSTs these itself. It enqueues to
+   * the SQLite outbox (idempotent on repairId+phase) and the gateway
+   * callbackPump delivers with a FRESH capability per attempt + retry/backoff —
+   * one network failure (or a >90min-late release outliving the capability TTL)
+   * can no longer permanently break the state machine. The actual send
+   * primitive lives in callbackPump.postMasterCallback.
+   *
+   * Enqueue failure (local disk) is audited and never changes the caller's
+   * committed outcome.
    */
-  private async postMasterCallback(
+  private async enqueueMasterCallback(
     repairId: string,
-    action: 'progress' | 'done',
+    phase: SelfhealCallbackPhase,
     message: string,
     detail: Record<string, unknown>,
-  ): Promise<boolean> {
-    const auditReq = { repairId, actionKind: `${action}_callback` } as BrokerRequest
-    const base = this.opts.callbackBaseUrl?.replace(/\/$/, '')
-    if (!base) {
-      this.audit(auditReq, 'skipped', { reason: 'callback base url not configured' })
-      return false
-    }
-    let capability: string | null = null
+  ): Promise<void> {
+    const auditReq = { repairId, actionKind: `${phase}_callback` } as BrokerRequest
     try {
-      capability = (await this.repairAuthority(repairId))?.capability ?? null
-    } catch {
-      capability = null
-    }
-    if (!capability) {
-      this.audit(auditReq, 'skipped', { reason: 'repair has no capability' })
-      return false
-    }
-    const f = this.opts.fetchImpl ?? fetch
-    try {
-      const res = await f(
-        `${base}/internal/v5/repairs/${encodeURIComponent(repairId)}/${action}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${capability}`,
-          },
-          body: JSON.stringify({ message, detail }),
-          redirect: 'manual',
-          signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
-        },
-      )
-      this.audit(auditReq, res.ok ? 'reported' : 'report_failed', { httpStatus: res.status })
-      if (!res.ok) {
-        this.log.error('selfheal master callback failed', {
-          repairId,
-          action,
-          httpStatus: res.status,
-        })
-      }
-      return res.ok
+      const inserted = await this.callbackOutbox.enqueue({ repairId, phase, message, detail })
+      this.audit(auditReq, inserted ? 'enqueued' : 'already_enqueued')
     } catch (err) {
-      this.audit(auditReq, 'report_failed', {
+      this.audit(auditReq, 'enqueue_failed', {
         reason: String((err as Error).message).slice(0, 200),
       })
-      this.log.error('selfheal master callback failed', { repairId, action }, err as Error)
-      return false
+      this.log.error('selfheal master callback enqueue failed', { repairId, phase }, err as Error)
     }
   }
 

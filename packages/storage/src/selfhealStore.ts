@@ -6,12 +6,15 @@
 // independently of ordinary chat persistence, and a corrupt/locked chat DB must
 // never wedge repair intake (nor vice versa).
 //
-// Four tables, each with a single, explicit durability role:
+// Tables, each with a single, explicit durability role:
 //
 //   selfheal_jobs        — one row per dispatched repair (repair_id PK). The
 //                          receiver INSERTs `received`; the jobWorker leases it
 //                          (received→starting→running→succeeded/failed) with a
 //                          crash-recoverable lease (lease_owner + lease_until).
+//                          `release_revoked` is the cancel-side release fuse: a
+//                          cancel of a TERMINAL job flips it so a parked
+//                          pending_release cutover can never be released later.
 //   selfheal_executions  — at-most-once turn ledger (execution_id = repair_id).
 //                          `accepted` means the turn has been durably enqueued
 //                          (see durable_turn_queue) — never "accepted but not
@@ -26,6 +29,12 @@
 //   selfheal_nonces      — replay defense for the inbound webhook. INSERT-or-fail
 //                          on the nonce PK; a second delivery with the same nonce
 //                          loses the INSERT and is rejected. TTL-purged.
+//   selfheal_callback_outbox — durable broker→master callback queue (BLOCKER2):
+//                          the pending_release progress marker and the deployed
+//                          done callback are ENQUEUED here (idempotent on
+//                          repair_id+phase) and pumped with retry/backoff by the
+//                          gateway callbackPump — a single network failure can no
+//                          longer permanently break the v5-side state machine.
 //
 // better-sqlite3 is synchronous; every mutation that must be atomic uses a
 // db.transaction() closure exactly like sessionsDb.ts.
@@ -72,6 +81,7 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
       lease_owner  TEXT,
       lease_until  INTEGER NOT NULL DEFAULT 0,
       session_key  TEXT,
+      release_revoked INTEGER NOT NULL DEFAULT 0,
       created_at   INTEGER NOT NULL,
       updated_at   INTEGER NOT NULL
 `
@@ -81,6 +91,11 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
  * that lacks 'cancelling'. SQLite cannot ALTER a CHECK, so rebuild the table
  * (new table → copy → drop → rename) inside one transaction. Production never
  * shipped the old schema (defensive only), but a dev DB may carry it.
+ *
+ * The rebuild target uses the CURRENT column DDL (which includes
+ * `release_revoked`), and the copy lists the LEGACY columns explicitly — new
+ * columns take their defaults. A DB old enough to lack 'cancelling' predates
+ * release_revoked, so the legacy column list is fixed.
  */
 function ensureCancellingStatusSchema(db: Database.Database): void {
   const row = db
@@ -91,6 +106,8 @@ function ensureCancellingStatusSchema(db: Database.Database): void {
     db.exec(`
       CREATE TABLE selfheal_jobs_rebuild (${SELFHEAL_JOBS_COLUMNS_DDL});
       INSERT INTO selfheal_jobs_rebuild
+        (repair_id, incident_id, attempt, payload_hash, capability, status,
+         lease_owner, lease_until, session_key, created_at, updated_at)
         SELECT repair_id, incident_id, attempt, payload_hash, capability, status,
                lease_owner, lease_until, session_key, created_at, updated_at
         FROM selfheal_jobs;
@@ -100,6 +117,18 @@ function ensureCancellingStatusSchema(db: Database.Database): void {
       CREATE INDEX IF NOT EXISTS idx_selfheal_jobs_lease ON selfheal_jobs(status, lease_until);
     `)
   })()
+}
+
+/**
+ * Idempotent schema guard (same mechanism family as the cancelling rebuild): a
+ * DB created AFTER the cancelling rebuild but BEFORE the release-revoked fuse
+ * has the current CHECK yet lacks the `release_revoked` column. A plain
+ * defaulted column is ALTER-addable — no rebuild needed.
+ */
+function ensureReleaseRevokedColumn(db: Database.Database): void {
+  const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
+  if (cols.some((c) => c.name === 'release_revoked')) return
+  db.exec('ALTER TABLE selfheal_jobs ADD COLUMN release_revoked INTEGER NOT NULL DEFAULT 0')
 }
 
 export async function getSelfhealDb(): Promise<Database.Database> {
@@ -156,11 +185,36 @@ export async function getSelfhealDb(): Promise<Database.Database> {
       claimed_at  INTEGER NOT NULL,
       updated_at  INTEGER NOT NULL
     );
+
+    -- Durable broker→master callback outbox (BLOCKER2). One row per
+    -- (repair_id, phase): 'pending_release' carries the release-gate progress
+    -- marker, 'done' the deployed callback. Enqueue is idempotent (UNIQUE +
+    -- ON CONFLICT DO NOTHING); the callbackPump drains queued rows in id order
+    -- with exponential backoff and never gives up short of an explicit
+    -- master-side refusal (→ 'abandoned').
+    CREATE TABLE IF NOT EXISTS selfheal_callback_outbox (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      repair_id       TEXT NOT NULL,
+      phase           TEXT NOT NULL CHECK (phase IN ('pending_release','done')),
+      message         TEXT NOT NULL,
+      detail_json     TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (status IN ('queued','sent','abandoned')),
+      attempts        INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL,
+      UNIQUE(repair_id, phase)
+    );
+    CREATE INDEX IF NOT EXISTS idx_selfheal_cb_outbox_due
+      ON selfheal_callback_outbox(status, next_attempt_at);
   `)
 
   // Schema guard: rebuild selfheal_jobs when an old DB lacks 'cancelling' in the
-  // status CHECK (the CREATE above no-ops on an existing table).
+  // status CHECK (the CREATE above no-ops on an existing table), then ALTER-add
+  // the release_revoked fuse column when a newer-but-pre-fuse DB lacks it.
   ensureCancellingStatusSchema(db)
+  ensureReleaseRevokedColumn(db)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
@@ -220,6 +274,9 @@ export interface SelfhealJob {
   leaseOwner: string | null
   leaseUntil: number
   sessionKey: string | null
+  /** Cancel-side release fuse: a cancel of a terminal job durably revokes any
+   *  held (pending_release) cutover — the broker refuses to release it. */
+  releaseRevoked: boolean
   createdAt: number
   updatedAt: number
 }
@@ -244,6 +301,7 @@ interface JobRow {
   lease_owner: string | null
   lease_until: number
   session_key: string | null
+  release_revoked: number
   created_at: number
   updated_at: number
 }
@@ -259,6 +317,7 @@ function rowToJob(r: JobRow): SelfhealJob {
     leaseOwner: r.lease_owner,
     leaseUntil: r.lease_until,
     sessionKey: r.session_key,
+    releaseRevoked: r.release_revoked === 1,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -515,6 +574,19 @@ export async function setJobCapability(repairId: string, capability: string): Pr
     Date.now(),
     repairId,
   )
+}
+
+/**
+ * Durably revoke any held release for a repair (cancel of a terminal job —
+ * HIGH3). Idempotent; the broker's releaseApproved checks this fuse at entry
+ * and refuses with reason 'release_revoked'.
+ */
+export async function setJobReleaseRevoked(repairId: string, now = Date.now()): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare('UPDATE selfheal_jobs SET release_revoked = 1, updated_at = ? WHERE repair_id = ?')
+    .run(now, repairId)
+  return res.changes > 0
 }
 
 /** Persist the deterministic session key onto the job row. */
@@ -883,4 +955,174 @@ export async function overwriteBrokerActionResponse(
     )
     .run(response, now, claimKey)
   return res.changes > 0
+}
+
+// ── broker→master callback outbox (durable delivery — BLOCKER2) ──────────────
+
+export type SelfhealCallbackPhase = 'pending_release' | 'done'
+export type SelfhealCallbackStatus = 'queued' | 'sent' | 'abandoned'
+
+export interface SelfhealCallbackRow {
+  id: number
+  repairId: string
+  phase: SelfhealCallbackPhase
+  message: string
+  /** JSON-serialized detail OBJECT (the master requires an object detail). */
+  detailJson: string
+  status: SelfhealCallbackStatus
+  attempts: number
+  nextAttemptAt: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** Retry backoff: base 5s, doubling per attempt, capped at 5min. Exported for
+ *  test assertions — the pump itself never computes delays (single authority). */
+export const SELFHEAL_CALLBACK_BACKOFF_BASE_MS = 5_000
+export const SELFHEAL_CALLBACK_BACKOFF_CAP_MS = 5 * 60_000
+
+interface CallbackOutboxDbRow {
+  id: number
+  repair_id: string
+  phase: SelfhealCallbackPhase
+  message: string
+  detail_json: string
+  status: SelfhealCallbackStatus
+  attempts: number
+  next_attempt_at: number
+  created_at: number
+  updated_at: number
+}
+
+function rowToCallback(r: CallbackOutboxDbRow): SelfhealCallbackRow {
+  return {
+    id: r.id,
+    repairId: r.repair_id,
+    phase: r.phase,
+    message: r.message,
+    detailJson: r.detail_json,
+    status: r.status,
+    attempts: r.attempts,
+    nextAttemptAt: r.next_attempt_at,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+/**
+ * Idempotently enqueue a broker→master callback. UNIQUE(repair_id, phase) +
+ * ON CONFLICT DO NOTHING: a crash-re-driven cutover/release can call this again
+ * without producing a duplicate delivery. Returns true when THIS call inserted
+ * the row.
+ */
+export async function enqueueCallback(input: {
+  repairId: string
+  phase: SelfhealCallbackPhase
+  message: string
+  detail: Record<string, unknown>
+  now?: number
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const now = input.now ?? Date.now()
+  const res = db
+    .prepare(`
+      INSERT INTO selfheal_callback_outbox
+        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      ON CONFLICT(repair_id, phase) DO NOTHING
+    `)
+    .run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
+  return res.changes > 0
+}
+
+/**
+ * Read the due queued callbacks, id-ascending, up to `limit`.
+ *
+ * Per-repair ordering guard: a repair's 'done' must never be delivered before
+ * its 'pending_release' (the master's state machine reads the progress marker
+ * first). Enqueue order gives pending_release the smaller id, so a row is due
+ * only when NO earlier still-queued row exists for the same repair — a backed-
+ * off pending_release therefore also holds back its done row.
+ */
+export async function claimDueCallbacks(
+  now: number,
+  limit: number,
+): Promise<SelfhealCallbackRow[]> {
+  const db = await getSelfhealDb()
+  const rows = db
+    .prepare(`
+      SELECT * FROM selfheal_callback_outbox o
+      WHERE o.status = 'queued' AND o.next_attempt_at <= @now
+        AND NOT EXISTS (
+          SELECT 1 FROM selfheal_callback_outbox p
+          WHERE p.repair_id = o.repair_id AND p.status = 'queued' AND p.id < o.id
+        )
+      ORDER BY o.id ASC
+      LIMIT @limit
+    `)
+    .all({ now, limit }) as CallbackOutboxDbRow[]
+  return rows.map(rowToCallback)
+}
+
+/** Mark one callback delivered (2xx, or 409 = master already applied it). */
+export async function markCallbackSent(id: number, now = Date.now()): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    "UPDATE selfheal_callback_outbox SET status = 'sent', updated_at = ? WHERE id = ? AND status = 'queued'",
+  ).run(now, id)
+}
+
+/** Permanently abandon one callback (repair unknown/terminal on the master). */
+export async function markCallbackAbandoned(id: number, now = Date.now()): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    "UPDATE selfheal_callback_outbox SET status = 'abandoned', updated_at = ? WHERE id = ? AND status = 'queued'",
+  ).run(now, id)
+}
+
+/**
+ * Record a failed delivery attempt and schedule the retry with exponential
+ * backoff (base 5s doubling per attempt, cap 5min). The row stays 'queued' —
+ * durable delivery never gives up on transient failures.
+ */
+export async function bumpCallbackAttempt(id: number, now = Date.now()): Promise<void> {
+  const db = await getSelfhealDb()
+  const txn = db.transaction(() => {
+    const row = db
+      .prepare("SELECT attempts FROM selfheal_callback_outbox WHERE id = ? AND status = 'queued'")
+      .get(id) as { attempts: number } | undefined
+    if (!row) return
+    const delay = Math.min(
+      SELFHEAL_CALLBACK_BACKOFF_BASE_MS * 2 ** row.attempts,
+      SELFHEAL_CALLBACK_BACKOFF_CAP_MS,
+    )
+    db.prepare(
+      'UPDATE selfheal_callback_outbox SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ? WHERE id = ?',
+    ).run(now + delay, now, id)
+  })
+  txn()
+}
+
+/**
+ * Abandon every still-queued callback of a repair (cancel of a terminal job —
+ * HIGH3: the revoked repair must not keep pumping stale markers at the master).
+ * Returns the number of rows abandoned.
+ */
+export async function abandonQueuedCallbacks(repairId: string, now = Date.now()): Promise<number> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      "UPDATE selfheal_callback_outbox SET status = 'abandoned', updated_at = ? WHERE repair_id = ? AND status = 'queued'",
+    )
+    .run(now, repairId)
+  return res.changes
+}
+
+/** All callback rows of one repair (ops/test introspection). */
+export async function listCallbacksForRepair(repairId: string): Promise<SelfhealCallbackRow[]> {
+  const db = await getSelfhealDb()
+  const rows = db
+    .prepare('SELECT * FROM selfheal_callback_outbox WHERE repair_id = ? ORDER BY id ASC')
+    .all(repairId) as CallbackOutboxDbRow[]
+  return rows.map(rowToCallback)
 }
