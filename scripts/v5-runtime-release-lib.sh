@@ -918,6 +918,9 @@ oc_hotcfg_gc() {
   _hotcfg_protect() {  # $1=release_path $2=bundle_path(abs)
     [ -n "$1" ] && printf '%s\n' "$1" >> "$tmp_rel"
     [ -n "$2" ] && printf '%s\n' "$2" >> "$tmp_bun"
+    # 显式 return 0:两参皆可为空(pre-state/禁用轴 tuple),末条 [ -n '' ] 的 1 会在
+    # set -e 严格壳里炸掉整个 GC(2026-07-12 部署期"GC 失败"告警的真身,手动宽松壳跑不出来)。
+    return 0
   }
 
   # (a) history 最近 N 条 committed(校验走 oc_hotcfg__history_verify_line 单一权威,R2-M3:v1/v2 混存都认)
