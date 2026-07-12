@@ -1,4 +1,4 @@
-import { describe, test, beforeEach } from 'node:test'
+import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
@@ -10,24 +10,20 @@ import {
   readLinuxdoConfig,
   LinuxdoConfigMissingError,
   LinuxdoOAuthError,
-  _resetPendingForTesting,
-  _pendingSizeForTesting,
 } from '../auth/linuxdo.js'
 
 /**
  * LDC OAuth client 单元测试。覆盖:
  *   1. readLinuxdoConfig:env 缺失抛 LinuxdoConfigMissingError;齐了返默认 redirect。
- *   2. startLinuxdoOAuth:authUrl 含 client_id/redirect_uri/state,state 进 pending Map。
- *   3. setOAuthStateCookie / readOAuthStateCookie / clearOAuthStateCookie:
- *      Set-Cookie 头格式正确(SameSite=Lax + HttpOnly + Path=callback),
- *      读 cookie header 能拿回 state,clear 输出 Max-Age=0。
- *   4. exchangeLinuxdoOAuth:
- *      a) 未知 state → INVALID_STATE
- *      b) state 已被消费(replay)→ INVALID_STATE
- *      c) token endpoint 4xx → TOKEN_FAILED
- *      d) userinfo endpoint 4xx → USERINFO_FAILED
- *      e) userinfo 缺 id → USERINFO_INVALID
- *      f) happy path → 返合法字段(id 字符串化、email 小写、空 avatar 转 null)
+ *   2. startLinuxdoOAuth:authUrl 含 client_id/redirect_uri/state(纯函数,pending 迁 PG 后不写 Map)。
+ *   3. setOAuthStateCookie / readOAuthStateCookie / clearOAuthStateCookie 头格式。
+ *   4. exchangeLinuxdoOAuth(纯外部 I/O,不再消费 pending state):
+ *      a) token endpoint 4xx → TOKEN_FAILED
+ *      b) userinfo endpoint 4xx → USERINFO_FAILED
+ *      c) userinfo 缺 id → USERINFO_INVALID
+ *      d) happy path → 返合法字段(id 字符串化、email 小写、空 avatar 转 null)
+ *
+ * 注:state 的原子单次消费(anti-replay/TTL)已迁 PG,单测见 oauthPendingStore.test.ts。
  */
 
 function makeRes(): {
@@ -49,10 +45,6 @@ function makeRes(): {
 function makeReq(cookieHeader: string | undefined): IncomingMessage {
   return { headers: cookieHeader ? { cookie: cookieHeader } : {} } as IncomingMessage
 }
-
-beforeEach(() => {
-  _resetPendingForTesting()
-})
 
 describe('readLinuxdoConfig', () => {
   test('throws when client_id missing', () => {
@@ -87,7 +79,7 @@ describe('readLinuxdoConfig', () => {
 })
 
 describe('startLinuxdoOAuth', () => {
-  test('emits authUrl with required params + populates pending Map', () => {
+  test('emits authUrl with required params (纯函数,无进程内副作用)', () => {
     const result = startLinuxdoOAuth({
       clientId: 'CID',
       clientSecret: 'CSEC',
@@ -101,7 +93,11 @@ describe('startLinuxdoOAuth', () => {
     assert.equal(u.searchParams.get('response_type'), 'code')
     assert.equal(u.searchParams.get('state'), result.state)
     assert.match(result.state, /^[a-f0-9]{32}$/)
-    assert.equal(_pendingSizeForTesting(), 1)
+  })
+
+  test('每次调用 state 唯一', () => {
+    const cfg = { clientId: 'C', clientSecret: 'S', redirectUri: 'https://x/cb' }
+    assert.notEqual(startLinuxdoOAuth(cfg).state, startLinuxdoOAuth(cfg).state)
   })
 })
 
@@ -144,33 +140,9 @@ describe('exchangeLinuxdoOAuth', () => {
     redirectUri: 'https://test.example/cb',
   }
 
-  test('unknown state → INVALID_STATE', async () => {
-    await assert.rejects(
-      exchangeLinuxdoOAuth('code', 'never-issued', { config: cfg, fetchImpl: failFetch }),
-      (err: unknown) => err instanceof LinuxdoOAuthError && err.code === 'INVALID_STATE',
-    )
-  })
-
-  test('state replay → second call INVALID_STATE', async () => {
-    const { state } = startLinuxdoOAuth(cfg)
-    const fetchImpl = makeFetch({
-      tokenStatus: 200,
-      tokenBody: { access_token: 'AT' },
-      userStatus: 200,
-      userBody: { id: 1, username: 'u', email: 'e@e' },
-    })
-    await exchangeLinuxdoOAuth('code', state, { config: cfg, fetchImpl })
-    // 第二次同 state 必失败
-    await assert.rejects(
-      exchangeLinuxdoOAuth('code', state, { config: cfg, fetchImpl }),
-      (err: unknown) => err instanceof LinuxdoOAuthError && err.code === 'INVALID_STATE',
-    )
-  })
-
   test('token endpoint 400 → TOKEN_FAILED', async () => {
-    const { state } = startLinuxdoOAuth(cfg)
     await assert.rejects(
-      exchangeLinuxdoOAuth('bad', state, {
+      exchangeLinuxdoOAuth('bad', {
         config: cfg,
         fetchImpl: makeFetch({ tokenStatus: 400 }),
       }),
@@ -179,9 +151,8 @@ describe('exchangeLinuxdoOAuth', () => {
   })
 
   test('userinfo 401 → USERINFO_FAILED', async () => {
-    const { state } = startLinuxdoOAuth(cfg)
     await assert.rejects(
-      exchangeLinuxdoOAuth('code', state, {
+      exchangeLinuxdoOAuth('code', {
         config: cfg,
         fetchImpl: makeFetch({
           tokenStatus: 200,
@@ -194,9 +165,8 @@ describe('exchangeLinuxdoOAuth', () => {
   })
 
   test('userinfo missing id → USERINFO_INVALID', async () => {
-    const { state } = startLinuxdoOAuth(cfg)
     await assert.rejects(
-      exchangeLinuxdoOAuth('code', state, {
+      exchangeLinuxdoOAuth('code', {
         config: cfg,
         fetchImpl: makeFetch({
           tokenStatus: 200,
@@ -210,8 +180,7 @@ describe('exchangeLinuxdoOAuth', () => {
   })
 
   test('happy path: numeric id → string, email lowercased, missing avatar → null', async () => {
-    const { state } = startLinuxdoOAuth(cfg)
-    const info = await exchangeLinuxdoOAuth('code', state, {
+    const info = await exchangeLinuxdoOAuth('code', {
       config: cfg,
       fetchImpl: makeFetch({
         tokenStatus: 200,
@@ -234,10 +203,6 @@ describe('exchangeLinuxdoOAuth', () => {
 })
 
 // ─── fetch helpers ─────────────────────────────────────────────────
-
-function failFetch(): Promise<Response> {
-  throw new Error('fetch should not be called for INVALID_STATE early reject')
-}
 
 interface FakeOpts {
   tokenStatus: number

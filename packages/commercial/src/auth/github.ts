@@ -10,10 +10,13 @@
  *   - 成功后 302 回 /?github_linked=1,前端 toast 提示
  *   - GitHub OAuth App 不发 refresh token,token 有效期极长(一年不操作过期)
  *
- * CSRF 防御:
- *   - server 端 pending Map 绑定 state → userId(防重放、防过期)
+ * CSRF 防御(P3:pending state 迁 PG,见 auth/oauthPendingStore.ts):
+ *   - server 端 pending state(PG oauth_pending_states)绑定 state → userId
+ *     (原子单次消费 + 短 TTL,防重放/防过期;跨 slot callback 天然成立)
  *   - HttpOnly + SameSite=Lax + Path=/api/auth/github/callback state cookie,
  *     callback 时 query.state == cookie.state 双因素验证
+ *   - pending 生命周期(put/consume)由 http/oauthGithub.ts handler 编排;本模块只
+ *     负责纯粹的 state 生成 + code→token/profile 交换(无进程内状态)。
  *
  * 安全约束:
  *   - GitHub API 调用必须携带 User-Agent: OpenClaude/v3 (GitHub API 强制要求)
@@ -101,36 +104,6 @@ export function readGithubConfig(env: NodeJS.ProcessEnv = process.env): GithubOA
   return { clientId, clientSecret, redirectUri, scopes: DEFAULT_SCOPES }
 }
 
-// ─── Pending state(server-side anti-replay + userId 绑定)────────────
-
-export interface PendingGithubOAuth {
-  state: string
-  userId: number
-  createdAt: number
-}
-
-const PENDING_TTL_MS = 10 * 60 * 1000 // 600s
-const PENDING_MAX = 200
-const pending = new Map<string, PendingGithubOAuth>()
-
-function gcPending(): void {
-  while (pending.size >= PENDING_MAX) {
-    const oldest = pending.keys().next().value
-    if (!oldest) break
-    pending.delete(oldest)
-  }
-}
-
-/** 测试 hook:清空 pending Map */
-export function _test_clearPending(): void {
-  pending.clear()
-}
-
-/** 测试 hook:查看 pending Map 大小 */
-export function _test_pendingSize(): number {
-  return pending.size
-}
-
 // ─── State cookie(CSRF 双因素的"绑浏览器"那一极)─────────────────────
 
 const STATE_COOKIE_NAME = 'oc_oauth_gh_state'
@@ -190,26 +163,18 @@ export function readGithubStateCookie(req: IncomingMessage): string | null {
 // ─── Start OAuth ─────────────────────────────────────────────────────
 
 /**
- * 生成 state、绑定 userId、写 pending Map,返回 GitHub authorize URL + state。
+ * 生成随机 state,构建 GitHub authorize URL + state。**纯函数,无副作用**——
+ * pending state(state→userId 绑定)的持久化由 handler 调 putOAuthPendingState 完成。
  * handler 负责:
- *   1. setGithubStateCookie(res, result.state)
- *   2. 返回 JSON { authorizeUrl, state }
+ *   1. putOAuthPendingState({ provider:'github', state, payload:{ userId } })
+ *   2. setGithubStateCookie(res, result.state)
+ *   3. 返回 JSON { authorizeUrl, state }
  */
 export function startGithubOAuth(opts: {
-  userId: number
   cfg: GithubOAuthConfig
 }): { authorizeUrl: string; state: string } {
-  const { userId, cfg } = opts
+  const { cfg } = opts
   const state = randomBytes(16).toString('hex')
-  gcPending()
-  const now = Date.now()
-  const entry: PendingGithubOAuth = { state, userId, createdAt: now }
-  pending.set(state, entry)
-  // best-effort 自动 GC
-  setTimeout(() => {
-    const cur = pending.get(state)
-    if (cur && cur.createdAt === now) pending.delete(state)
-  }, PENDING_TTL_MS).unref?.()
 
   const params = new URLSearchParams({
     client_id: cfg.clientId,
@@ -240,34 +205,24 @@ export interface ExchangeGithubDeps {
 }
 
 /**
- * 用 callback 收到的 code 换 GitHub access_token + user profile。
+ * 用 callback 收到的 code 换 GitHub access_token + user profile。**纯外部 I/O**——
+ * state 的一次性消费 / userId 绑定已上移到 handler(consumeOAuthPendingState),本函数
+ * 不再持有任何进程内 pending 状态。
  *
  * 流程:
- *   1. 校 state 是否在 pending Map(server 端一次性 + TTL + userId 绑定)
- *   2. POST https://github.com/login/oauth/access_token 拿 access_token
- *   3. GET https://api.github.com/user (Bearer) 拿 user profile
- *   4. 返回 { result, userId }
+ *   1. POST https://github.com/login/oauth/access_token 拿 access_token
+ *   2. GET https://api.github.com/user (Bearer) 拿 user profile
+ *   3. 返回 GithubExchangeResult
  */
 export async function exchangeGithubOAuth(opts: {
   code: string
-  state: string
   cfg: GithubOAuthConfig
   deps?: ExchangeGithubDeps
-}): Promise<{ result: GithubExchangeResult; userId: number }> {
-  const { code, state, cfg, deps = {} } = opts
+}): Promise<GithubExchangeResult> {
+  const { code, cfg, deps = {} } = opts
   const fetchImpl = deps.fetchImpl ?? fetch
 
-  // 1) state 校验(server side 一次性消费)
-  const entry = pending.get(state)
-  if (!entry) {
-    throw new GithubOAuthError('state_mismatch', 'invalid or expired state')
-  }
-  pending.delete(state)
-  if (Date.now() - entry.createdAt > PENDING_TTL_MS) {
-    throw new GithubOAuthError('state_mismatch', 'state expired')
-  }
-
-  // 2) Token exchange — GitHub 接受 JSON 或 form,Accept: application/json 拿 JSON 响应
+  // 1) Token exchange — GitHub 接受 JSON 或 form,Accept: application/json 拿 JSON 响应
   let tokenRes: Response
   try {
     tokenRes = await fetchImpl(GITHUB_ENDPOINTS.tokenUrl, {
@@ -375,11 +330,8 @@ export async function exchangeGithubOAuth(opts: {
       : null
 
   return {
-    result: {
-      accessToken,
-      scopes,
-      githubUser: { id: rawId, login, avatar_url },
-    },
-    userId: entry.userId,
+    accessToken,
+    scopes,
+    githubUser: { id: rawId, login, avatar_url },
   }
 }

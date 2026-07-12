@@ -23,7 +23,11 @@ import {
   clearRefreshCookie,
   readRefreshCookie,
   appendSetCookie,
+  setLaneCookie,
+  clearLaneCookie,
+  readLaneCookie,
 } from "./cookies.js";
+import { evaluateLaneForUser } from "../deploy/laneEvaluate.js";
 import { register, RegisterError } from "../auth/register.js";
 import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
@@ -532,6 +536,35 @@ export async function handleRegister(
   }
 }
 
+// ─── P3 cohort lane 下发(login/refresh/`/api/me` 三处同构)─────────────
+//
+// 统一收口:评估 uid 的 lane → candidate 则下发 oc_v5lane cookie;active 则**仅在
+// 请求确实带了 oc_v5lane 时**清除(无 cookie 的 active = 零 Set-Cookie,基建版零行为
+// 变化)。返回 lane 标签写进响应体供前端 authStore(laneReady gate)。
+// fail-closed:评估内部已对 deploy_state 读失败兜底回 active;此处再包一层 try/catch,
+// 保证任何 lane 逻辑异常都绝不阻断 login/refresh/me 主流程。
+async function resolveLaneAndApply(
+  req: IncomingMessage,
+  res: ServerResponse,
+  uid: string,
+  secure: boolean | undefined,
+): Promise<"active" | "candidate"> {
+  try {
+    const decision = await evaluateLaneForUser(uid);
+    if (decision.lane === "candidate" && decision.cookieValue) {
+      setLaneCookie(res, decision.cookieValue, { secure });
+    } else if (readLaneCookie(req) !== null) {
+      clearLaneCookie(res, { secure });
+    }
+    return decision.lane;
+  } catch (err) {
+    rootLogger.child({ subsys: "laneCookie" }).warn("lane_apply_failed", {
+      err: (err as Error).message,
+    });
+    return "active";
+  }
+}
+
 // ─── POST /api/auth/login ───────────────────────────────────────────
 
 export async function handleLogin(
@@ -580,6 +613,8 @@ export async function handleLogin(
       secure: deps.refreshCookieSecure,
       persistent: result.remember,
     });
+    // P3 cohort:登录即评估 lane 并(按需)下发 oc_v5lane,前端 laneReady gate 拿到后建 WS。
+    const lane = await resolveLaneAndApply(req, res, String(result.user.id), deps.refreshCookieSecure);
     sendJson(res, 200, {
       user: result.user,
       access_token: result.access_token,
@@ -590,6 +625,8 @@ export async function handleLogin(
       // 把服务端定稿的 remember 回传;前端据此决定 access token 存 localStorage
       // (persistent)还是 sessionStorage(关窗口即清,与 cookie 同生命周期)。
       remember: result.remember,
+      // P3 cohort lane 决策(active|candidate),前端 authStore 持有做 laneReady gate。
+      lane,
     });
   } catch (err) {
     if (err instanceof LoginError) {
@@ -725,6 +762,8 @@ export async function handleRefresh(
       secure: deps.refreshCookieSecure,
       persistent: r.remember,
     });
+    // P3 cohort:静默 refresh 也重评 lane(在线用户随 token 刷新自然收敛到最新 percent)。
+    const lane = await resolveLaneAndApply(req, res, r.user_id, deps.refreshCookieSecure);
     // 2026-04-24 回传 remember 让前端 refresh 成功时把 access token 写到
     // 正确的 storage:persistent → localStorage / session → sessionStorage。
     // 不回传的话前端无从得知原登录选择,rotate 后 access 可能错放。
@@ -732,6 +771,7 @@ export async function handleRefresh(
       access_token: r.access_token,
       access_exp: r.access_exp,
       remember: r.remember,
+      lane,
     });
   } catch (err) {
     if (err instanceof RefreshError) {
@@ -981,7 +1021,10 @@ export async function handleMe(
   } else {
     appendSetCookie(res, "oc_v5user=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
   }
+  // P3 cohort:/api/me 是"在线用户重评 lane"的主入口(页面加载 + 定期 session 校验都走它)。
+  const lane = await resolveLaneAndApply(req, res, user.id, deps.refreshCookieSecure);
   sendJson(res, 200, {
+    lane,
     user: {
       id: u.id,
       email: u.email,
