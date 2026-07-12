@@ -3757,15 +3757,11 @@ export async function registerCommercial(
       "v5-owned",
       startIncidentReconciler({ intervalMs: tickMs }),
     );
-    incidentSweeper = trackScheduler(
-      "incidentSweeper",
-      "v5-owned",
-      startIncidentSweeper({
-        intervalMs: tickMs,
-        broadcastAll: (payload) => broadcastAllRef.current(payload),
-        broadcastToUsers: (uids, payload) => broadcastToUsersRef.current(uids, payload),
-      }),
-    );
+    incidentSweeper = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+      intervalMs: tickMs,
+      broadcastAll: (payload) => broadcastAllRef.current(payload),
+      broadcastToUsers: (uids, payload) => broadcastToUsersRef.current(uids, payload),
+    }));
     // 暴露 per-uid activeIncidents getter 供 bridge 鉴权后补发(audience 过滤,
     // 见 selfhealActiveIncidentsRef 注释;forward-ref 装配,bridge 创建早于此赋值)。
     selfhealActiveIncidentsRef.current = incidentSweeper.getActiveIncidentsForUser;
