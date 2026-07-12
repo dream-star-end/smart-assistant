@@ -401,7 +401,11 @@ oc_hotcfg_build_ccb_dist() {
   cp -a "$staging/claude-code-best" "$ccb_build" \
     || { oc_hotcfg__die "build_ccb_dist: cp ccb 源到临时目录失败"; rm -rf "$ccb_build"; return 1; }
   rm -rf "$ccb_build/node_modules"
-  if ! ( cd "$ccb_build" && "$bun" install --ignore-scripts && "$bun" run build ); then
+  # PATH 前置 bun 所在目录:`bun run build` 会经 shell 执行 package.json 的
+  # "build": "bun run build.ts",嵌套调用按**名字**找 bun —— 非交互 ssh 的 PATH 不含
+  # ~/.bun/bin(playbook §4.3 已知坑),只用绝对路径调外层不够(2026-07-12 首启实测
+  # bash: bun: command not found exit 127)。
+  if ! ( cd "$ccb_build" && PATH="$(dirname "$bun"):$PATH" "$bun" install --ignore-scripts && PATH="$(dirname "$bun"):$PATH" "$bun" run build ); then
     oc_hotcfg__die "ccb bun install/build 失败"; rm -rf "$ccb_build"; return 1
   fi
   [ -f "$ccb_build/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; rm -rf "$ccb_build"; return 1; }
