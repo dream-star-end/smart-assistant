@@ -18,7 +18,7 @@ boss 目标：v5 部署升级做到**分批切流、用户零感知、秒级回�
 
 - **分支** `feat/v5-p3-impl`，worktree `/opt/openclaude/openclaude-v5-p3-impl`，基于 canonical `12d8d8f2`（含 P3 RFC）。
 - **已提交**：`5230243e`（核心：0135+deployState+leaderLease+LeaderBundle+controlListener+index.ts 重构）/`84426f3e`（lane 评估+OAuth 迁 PG+egress 计数）/`88ae31f3`（deploy 五 lane+Caddy 状态机化）/`02c48ffd`（前端 laneReady+横幅 2s）/`4b1a92f9`（laneMetrics 接线）/`641317c0`（**代码审 R1 全修**，16 findings）。
-- **进行中（可能未完成）**：代码审 R2 修复 agent 正在改 worktree（未提交）。任务清单见 §3。接手第一步：`git status` 看未提交改动——若修复完整（对照 §3 清单+测试全绿）则按主题 commit；若中断则按 §3 继续修。
+- **R2 修复已完成并提交**（git log 最新 commit）：全部 4 BLOCKER+3 MAJOR+4 MINOR，验证全绿（deploy-state smoke 60/60 含 A→B rollback、lease integ 11/11 含 3 新故障注入、unit 基线 PASS）。**接手直接从 §4 步骤 1（Codex R3 复审）开始**。
 - **Codex 审查 thread（可 codex-reply 续审,上下文全在）**：P3 设计+代码审 = `019f5623-2553-7131-9889-7a1eec2c61ea`；P2 = `019f533a-e031-7fb0-92da-d5f7244daf0c`。
 
 ## 2. 验证体系（每轮修改后必跑）
