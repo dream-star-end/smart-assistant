@@ -17,6 +17,11 @@ import { seedDefaultConnectors } from '../connectors/declarativeSeed.js'
 import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
 import { executeDeclarativeAction } from '../connectors/engine/execute.js'
+import {
+  executeDeclarativeWrite,
+  proposeDeclarativeWrite,
+} from '../connectors/engine/write.js'
+import { approveConfirmation } from '../connectors/ledger.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
@@ -38,18 +43,28 @@ async function dropAllTables(): Promise<void> {
       EXECUTE 'DROP TABLE IF EXISTS public.'||quote_ident(r.tablename)||' CASCADE'; END LOOP; END $$;`)
 }
 
+interface CapturedRequest {
+  path: string
+  query: string
+  body: string
+}
 interface TestServer {
   port: number
   setHandler(fn: (p: string) => { status: number; body: string }): void
+  /** 最近一次收到的请求(path/query/原始 body),供写操作断言上游收到的体。 */
+  lastRequest(): CapturedRequest | null
   close(): Promise<void>
 }
 function startServer(): Promise<TestServer> {
   return new Promise((resolve) => {
     let handler: (p: string) => { status: number; body: string } = () => ({ status: 404, body: '{}' })
+    let last: CapturedRequest | null = null
     const server: Server = createServer((req, res) => {
       const u = new URL(req.url ?? '/', 'http://127.0.0.1')
-      req.resume()
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
       req.on('end', () => {
+        last = { path: u.pathname, query: u.search, body: Buffer.concat(chunks).toString('utf8') }
         const out = handler(u.pathname)
         res.statusCode = out.status
         res.setHeader('content-type', 'application/json')
@@ -62,6 +77,7 @@ function startServer(): Promise<TestServer> {
         setHandler: (fn) => {
           handler = fn
         },
+        lastRequest: () => last,
         close: () => new Promise<void>((r) => server.close(() => r())),
       })
     })
@@ -231,6 +247,69 @@ describe('默认连接器 seed', () => {
       )
       assert.equal(row.rows[0]!.has, true)
       assert.ok(!row.rows[0]!.enc.toString('latin1').includes(SECRET))
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('写对等:seed 的 notion create_page 走通写门(propose→approve→execute,嵌套体正确)', async (t) => {
+    if (skip(t)) return
+    const server = await startServer()
+    try {
+      await seedDefaultConnectors(getPool()) // 幂等
+      const v = await query<{ id: string }>(
+        `SELECT id::text AS id FROM marketplace_skill_versions
+          WHERE slug='notion' AND security_review_state='security_approved'`,
+      )
+      const versionId = Number(v.rows[0]!.id)
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      server.setHandler((p) => {
+        if (p === '/v1/users/me')
+          return { status: 200, body: JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }) }
+        if (p === '/v1/pages')
+          return { status: 200, body: JSON.stringify({ id: 'new-pg', url: 'https://n/new', extra: 'LEAK' }) }
+        return { status: 404, body: '{}' }
+      })
+      const user = await mkUser()
+      const bind = await bindDeclarativeConnector(
+        { userId: user, connectorVersionId: versionId, secrets: { access_token: 'ntn-tok' }, deps },
+        getPool(),
+      )
+      // bind 只打了 whoami 探针,尚未碰 /v1/pages。
+      assert.equal(server.lastRequest()?.path, '/v1/users/me')
+
+      // ① propose(不 dispatch:上游不应收到 /v1/pages)。
+      const prop = await proposeDeclarativeWrite(
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'create_page',
+          params: { parentPageId: 'parent-1', title: '会议纪要' },
+        },
+        getPool(),
+      )
+      assert.equal(prop.effect, 'write')
+      assert.equal(server.lastRequest()?.path, '/v1/users/me') // 仍是探针,未发写
+
+      // ② 未确认执行 → 拒。
+      await assert.rejects(
+        executeDeclarativeWrite({ connectionId: bind.connectionId, userId: user, confirmId: prop.confirmId, deps }, getPool()),
+      )
+
+      // ③ 确认后执行 → 上游收到 POST /v1/pages,嵌套体正确;结果 allowlist 投影(extra 剥掉)。
+      await approveConfirmation(prop.confirmId, user, getPool())
+      const exec = await executeDeclarativeWrite(
+        { connectionId: bind.connectionId, userId: user, confirmId: prop.confirmId, deps },
+        getPool(),
+      )
+      const req = server.lastRequest()!
+      assert.equal(req.path, '/v1/pages')
+      const sent = JSON.parse(req.body)
+      assert.equal(sent.parent.page_id, 'parent-1')
+      assert.equal(sent.properties.title.title[0].text.content, '会议纪要')
+      // 结果只留声明字段(extra 剥掉)。
+      assert.equal(exec.kind, 'ok')
+      if (exec.kind === 'ok') assert.deepEqual(exec.result, { id: 'new-pg', url: 'https://n/new' })
     } finally {
       await server.close()
     }

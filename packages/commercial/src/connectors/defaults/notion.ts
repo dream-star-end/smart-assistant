@@ -2,8 +2,9 @@
  * 默认连接器 · Notion(static-token)。
  *
  * 真实 Notion API:Bearer 集成 token + 必带 `Notion-Version` 头。whoami=GET /v1/users/me 返回
- * bot 用户({id, bot:{workspace_name}}),用作 identity probe 派生账号。read 动作示例:检索页面/
- * 数据库、查询数据库(POST 但只读 → reviewer 签 safe-read-non-get)。
+ * bot 用户({id, bot:{workspace_name}}),用作 identity probe 派生账号。read 动作:检索页面、
+ * 查询数据库(POST 但只读 → reviewer 签 safe-read-non-get);write 动作:create_page(POST /v1/pages,
+ * 走 propose-then-commit 确认门,与 v1 notion 功能对等)。
  *
  * 这是**声明层数据**(可过审、拿不到凭据);seed 机制据此建 listing+version 并由 reviewer 编译签名
  * 成 exec_contract。SecurityDecision 是"若由 reviewer 批准时的受众/effect 结论"随附给 seed。
@@ -84,6 +85,44 @@ export const notionDefault: DefaultConnector = {
             archived: { type: 'boolean' },
             properties: { type: 'object', additionalProperties: true },
           },
+        },
+        usesSlot: 'api-token',
+      },
+      {
+        id: 'create_page',
+        description: '在指定父页面下创建一个新页面(写操作,需用户确认)。',
+        request: {
+          method: 'POST',
+          pathTemplate: '/v1/pages',
+          staticHeaders: { 'Notion-Version': NOTION_VERSION },
+          // Notion 创建页面体:parent.page_id + properties.title.title[0].text.content。
+          bodyTemplate: {
+            obj: {
+              parent: { obj: { page_id: { ref: '/params/parentPageId' } } },
+              properties: {
+                obj: {
+                  title: {
+                    obj: {
+                      title: {
+                        arr: [{ obj: { text: { obj: { content: { ref: '/params/title' } } } } }],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        params: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { parentPageId: { type: 'string' }, title: { type: 'string' } },
+          required: ['parentPageId', 'title'],
+        },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' }, url: { type: 'string' } },
         },
         usesSlot: 'api-token',
       },

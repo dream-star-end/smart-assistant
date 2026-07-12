@@ -7,6 +7,8 @@
  *
  * 注:飞书 API 端点/响应形状按公开文档最佳努力编写,上真实 app 凭据后需按实测校准(声明式数据,
  * 可 republish 纠正)。用户 bind 时填 app_id/app_secret,引擎向 token 受众换 token,凭据永不进容器。
+ * read 动作:bot_info(identity probe)、list_chats;write 动作:send_message(POST /open-apis/im/v1/messages,
+ * 走 propose-then-commit 确认门,与 v1 feishu 发消息对等)。
  */
 
 import type { DefaultConnector } from './types.js'
@@ -102,6 +104,48 @@ export const feishuDefault: DefaultConnector = {
                 page_token: { type: 'string' },
                 items: { type: 'array', items: { type: 'object', additionalProperties: true } },
               },
+            },
+          },
+        },
+        usesSlot: 'api-cred',
+      },
+      {
+        id: 'send_message',
+        description: '向指定会话/用户发送消息(写操作,需用户确认)。',
+        request: {
+          method: 'POST',
+          pathTemplate: '/open-apis/im/v1/messages',
+          // receive_id_type 决定 receive_id 语义(chat_id / open_id / user_id 等)。
+          query: { receive_id_type: '/params/receiveIdType' },
+          // content 为飞书要求的 JSON 序列化字符串(如 {"text":"hi"}),由调用方预先序列化后传入。
+          bodyTemplate: {
+            obj: {
+              receive_id: { ref: '/params/receiveId' },
+              msg_type: { ref: '/params/msgType' },
+              content: { ref: '/params/content' },
+            },
+          },
+        },
+        params: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            receiveIdType: { type: 'string' },
+            receiveId: { type: 'string' },
+            msgType: { type: 'string' },
+            content: { type: 'string' },
+          },
+          required: ['receiveIdType', 'receiveId', 'msgType', 'content'],
+        },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            code: { type: 'integer' },
+            data: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { message_id: { type: 'string' }, msg_type: { type: 'string' } },
             },
           },
         },
