@@ -1214,7 +1214,15 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
       // 主应用库不可达(仅 --from-dump 且应用库连不上):只写 nonce + manifest,警告须人工推进状态行。
       // 写序与可达分支一致:nonce 先行。
       const srcState = await readState(sourceClient);
-      const newGen = ((srcState ? BigInt(srcState.generation) : 0n) + 1n).toString();
+      // 栅栏前提(R4):dump 里必须有 pg_authoritative 状态行——它的 generation 是人工 CAS 的
+      // 栅栏基准。没有它就无法给出防回退的安全推进语句,fail-closed 拒绝(.bak 已落,无副作用)。
+      if (!srcState || srcState.authority !== "pg_authoritative") {
+        throw new Error(
+          `dump 状态行缺失或非 pg_authoritative(${srcState ? srcState.authority : "无行"}):无法确定 generation 栅栏基准,` +
+            "拒绝生成人工推进语句。请人工核查 dump 与主 PG 后重跑。",
+        );
+      }
+      const newGen = (BigInt(srcState.generation) + 1n).toString();
       const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
       console.log(`  ✓ 灾难 nonce 已前置原子写入 → ${noncePath}`);
       writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
@@ -1222,11 +1230,14 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
       const completedAtHint = Date.now();
       console.warn(
         "[warn] 主 PG 不可达,状态行未推进;manifest/nonce 已就绪但与 PG 尚不一致。\n" +
-          "  PG 恢复后须人工推进状态行,**全部字段缺一即撞 0134 CHECK**(R3 MINOR):\n" +
+          "  PG 恢复后须人工推进状态行,**全部字段缺一即撞 0134 CHECK**;\n" +
+          "  WHERE 带 authority+generation 双栅栏(完整 CAS,R4):恢复后的 PG 若 generation 已非\n" +
+          `  dump 值(${srcState.generation}),affected=0 → **fail-closed 停手**,重新核对 PG/dump/manifest 三方,\n` +
+          "  绝不自行猜测新 generation(防状态机 generation 回退):\n" +
           `    UPDATE sessions_store_migration_state SET\n` +
           `      authority='sqlite_disaster_recovered', generation=${newGen}, cutover_id='${newCut}',\n` +
           `      source_digest='${v.sourceDigest}', completed_at=${completedAtHint}\n` +
-          `    WHERE singleton AND authority='pg_authoritative';  -- CAS 式,affected=0 须人工核查\n` +
+          `    WHERE singleton AND authority='pg_authoritative' AND generation=${srcState.generation};\n` +
           "  推进后跑 status 核对三方一致,再考虑 re-cutover-from-sqlite 回迁。",
       );
     }
