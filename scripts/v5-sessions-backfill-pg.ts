@@ -893,6 +893,14 @@ async function cmdRepairManifest(args: Args, client: pg.Client): Promise<void> {
   console.log(`  · 现 manifest: ${before ? JSON.stringify(before) : "(不存在)"}`);
   writeManifestAtomic(args.manifest, manifest);
   console.log(`  ✓ manifest 已收敛到 PG 状态行 → ${args.manifest}: ${JSON.stringify(manifest)}`);
+  // 灾难态收敛补全(Codex R3):PG 已是 sqlite_disaster_recovered 且 --cutover-id 经上方核对
+  // 与 PG 行一致时,一并补写灾难 nonce——覆盖"崩在 nonce 写入前"的历史缺口(新写序下 nonce
+  // 先行,该缺口理论不再产生,但 repair 保持能收敛一切遗留态)。语义仍是"只收敛到已验证的
+  // PG 状态,永不提升 authority"。
+  if (st.authority === "sqlite_disaster_recovered") {
+    const noncePath = writeDisasterNonce(args.manifest, st.cutover_id, Date.now(), "repair-manifest-converge");
+    console.log(`  ✓ 灾难 nonce 已补写(与 PG cutover_id 一致)→ ${noncePath}`);
+  }
   console.log("✓ repair-manifest 完成(PG 未改动,authority 未提升)。");
 }
 
@@ -1189,6 +1197,12 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
         throw new Error(`推进失败:主 PG authority=${st.authority}(灾难反灌只从 pg_authoritative 推进)。当前状态非常规,请人工核查。`);
       }
       const newGen = (BigInt(st.generation) + 1n).toString();
+      // 写序铁律(Codex R3 MAJOR):nonce **先于** PG 状态推进原子落盘——PG 仍是 pg_authoritative
+      // 时提前存在的 nonce 不会被 resolver 采信(resolver 只在 manifest/PG 表明 disaster 时才
+      // 咨询 nonce),故无副作用;而崩在"PG commit 后"的缺口里 nonce 已在,repair-manifest 补一次
+      // manifest 即完成收敛,灾难恢复路径无死角。旧序(commit 后写 nonce)崩在中间=安全但不可恢复。
+      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
+      console.log(`  ✓ 灾难 nonce 已前置原子写入 → ${noncePath}`);
       // 反灌校验(步骤 3)所得聚合 digest 作为该代终态凭证写入(满足 0134 终态 CHECK)。
       await disasterAdvanceTx(mainClient, st.generation, newGen, newCut, v.sourceDigest);
       console.log(
@@ -1196,20 +1210,24 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
       );
       writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
       console.log(`  ✓ manifest 已原子写入 ${args.manifest}(authority=sqlite_disaster_recovered, generation=${newGen})`);
-      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
-      console.log(`  ✓ 灾难 nonce 审计文件 → ${noncePath}`);
     } else {
-      // 主应用库不可达(仅 --from-dump 且应用库连不上):只写 manifest + nonce,警告须人工推进状态行。
+      // 主应用库不可达(仅 --from-dump 且应用库连不上):只写 nonce + manifest,警告须人工推进状态行。
+      // 写序与可达分支一致:nonce 先行。
       const srcState = await readState(sourceClient);
       const newGen = ((srcState ? BigInt(srcState.generation) : 0n) + 1n).toString();
+      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
+      console.log(`  ✓ 灾难 nonce 已前置原子写入 → ${noncePath}`);
       writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
       console.log(`  ✓ manifest 已原子写入 ${args.manifest}(authority=sqlite_disaster_recovered, generation=${newGen})`);
-      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
-      console.log(`  ✓ 灾难 nonce 审计文件 → ${noncePath}`);
+      const completedAtHint = Date.now();
       console.warn(
-        "[warn] 主 PG 不可达,状态行未推进;manifest/nonce 已就绪但与 PG 尚不一致。" +
-          "PG 恢复后须人工核对并把状态行推进到 authority='sqlite_disaster_recovered'" +
-          `(generation=${newGen}, cutover_id=${newCut}),否则 master 起不来(fail-closed)。`,
+        "[warn] 主 PG 不可达,状态行未推进;manifest/nonce 已就绪但与 PG 尚不一致。\n" +
+          "  PG 恢复后须人工推进状态行,**全部字段缺一即撞 0134 CHECK**(R3 MINOR):\n" +
+          `    UPDATE sessions_store_migration_state SET\n` +
+          `      authority='sqlite_disaster_recovered', generation=${newGen}, cutover_id='${newCut}',\n` +
+          `      source_digest='${v.sourceDigest}', completed_at=${completedAtHint}\n` +
+          `    WHERE singleton AND authority='pg_authoritative';  -- CAS 式,affected=0 须人工核查\n` +
+          "  推进后跑 status 核对三方一致,再考虑 re-cutover-from-sqlite 回迁。",
       );
     }
 
