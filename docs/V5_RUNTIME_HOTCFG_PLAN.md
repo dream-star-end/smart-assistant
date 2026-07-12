@@ -127,11 +127,17 @@ fail-closed 兜底,新 provision 短暂拒绝 + 前端 retry,与今日 restart �
   蓝绿 immutable release 目录)取源,禁止从可翻转 symlink/live 树 rsync;
 - excludes 单一权威 `agent-sandbox/runtime-src-excludes.txt`(build-image.sh 同用
   `--exclude-from`)+ 产物阶段敏感文件扫描;
-- 依赖安装(R1-B3):root 与 ccb 两套均在目标 runtime 镜像一次性容器内
-  `docker run --rm --entrypoint /bin/sh --user 0:0 -v <staging>:/build -w /build
-  <image_id> -c 'npm ci …'`;**npm ci 为准**(本批先修平 lock 提交);缓存键 =
-  {root lock hash, ccb lock hash, image immutable ID, arch} 全同才 cp -al 复用,
-  否则全新 ci;缓存键入 MANIFEST;
+- 依赖安装(R1-B3;**实现期取证修订 2026-07-12**):root 一套在目标 runtime 镜像
+  一次性容器内 `docker run --rm --entrypoint /bin/sh --user 0:0 -v <staging>:/build
+  -w /build <image_id> -c 'npm ci …'`;**npm ci 为准**(root lock 已实证 ci 通过,
+  777 包零漂移);缓存键 = {root lock hash, image immutable ID, arch} 全同才 cp -al
+  复用,否则全新 ci;缓存键入 MANIFEST;
+- **ccb 不装 npm 依赖**(取证推翻 R1-B3 的"ccb 两套 ci"与"补交 ccb lock"两点:
+  ccb 依赖用 `workspace:*` 协议,npm ci/install 均报 Unsupported URL Type ——
+  现镜像里那步 ccb npm install 一直走 WARN fallback,生产容器从未有过 ccb
+  node_modules;运行物是 bun build 的自足 dist/cli.js,build.ts 无 externals、
+  target=node 全量打包)。dist 可复现性由产物 bytes 进树 digest + bun 版本记
+  MANIFEST 承担;
 - ccb dist:host bun build(纯 JS bundling)产物 bytes 计入最终 digest(R2-M3),
   bun 版本记入 MANIFEST;
 - **release ID = 组装完成后对最终只读产物树(含 node_modules 与 ccb dist)求
