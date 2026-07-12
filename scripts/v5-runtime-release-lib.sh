@@ -126,23 +126,27 @@ oc_hotcfg__digest_from_rows() {
 # 用法:oc_hotcfg_build_manifest <root> <schemaVersion> <sourceCommit> [bunVersion] [depsCacheKey]
 oc_hotcfg_build_manifest() {
   local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}"
-  local rows files_json digest boothash builtAt
+  local rows digest boothash builtAt files_tmp
   rows="$(oc_hotcfg__file_rows "$root")" || return 1
-  files_json="$(printf '%s\n' "$rows" | oc_hotcfg__rows_to_json)" || return 1
   digest="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows all)" || return 1
   boothash="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows boot)" || return 1
   builtAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # files[] 经临时文件 + --slurpfile 传入:release 树数万文件的 JSON 几十 MB,走 --argjson
+  # 会撑爆 execve 参数上限(2026-07-12 首启实测 jq: Argument list too long)。
+  files_tmp="$(mktemp)"
+  if ! printf '%s\n' "$rows" | oc_hotcfg__rows_to_json > "$files_tmp"; then rm -f "$files_tmp"; return 1; fi
   jq -n \
     --argjson schemaVersion "$schema" \
     --arg digest "$digest" --arg bootHash "$boothash" \
     --arg sourceCommit "$commit" --arg builtAt "$builtAt" \
     --arg bunVersion "$bun" --arg depsCacheKey "$cache" \
-    --argjson files "$files_json" '
+    --slurpfile files "$files_tmp" '
     {schemaVersion: $schemaVersion, digest: $digest, bootHash: $bootHash,
-     sourceCommit: $sourceCommit, builtAt: $builtAt, files: $files}
+     sourceCommit: $sourceCommit, builtAt: $builtAt, files: $files[0]}
     + (if $bunVersion == "" then {} else {bunVersion: $bunVersion} end)
     + (if $depsCacheKey == "" then {} else {depsCacheKey: $depsCacheKey} end)
-  ' > "$root/MANIFEST.json.tmp" || return 1
+  ' > "$root/MANIFEST.json.tmp" || { rm -f "$files_tmp"; return 1; }
+  rm -f "$files_tmp"
   mv -f "$root/MANIFEST.json.tmp" "$root/MANIFEST.json" || return 1
   printf '%s\n' "$digest"
 }
