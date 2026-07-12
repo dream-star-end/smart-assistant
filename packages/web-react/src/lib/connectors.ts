@@ -117,6 +117,13 @@ export type DeclarativeCatalogEntry = {
   authMode: string;
   /** bind 时用户要填的凭据字段名（source 名，如 access_token / client_id）。 */
   requiredBindSources: string[];
+  /**
+   * 仅 authMode='oauth2-auth-code' 时下发：client 供给模式。
+   *   'platform' → **一键授权**（平台已注册 OAuth App，用户零填写；能出现在目录里就意味着已 provision）；
+   *   'byoa'     → 用户自带 App（需填 client_id/client_secret，即 requiredBindSources）。
+   * **读后端显式字段**，不从 `requiredBindSources.length === 0` 反推——那是隐式契约。
+   */
+  clientProvisioning?: "byoa" | "platform";
   /** 该连接器声明的动作（effect 推导读写能力）。 */
   actions: { id: string; effect: string }[];
 };

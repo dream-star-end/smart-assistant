@@ -660,6 +660,8 @@ function DeclarativeBindDialog({
   }, [entry?.versionId]);
 
   const isOauth = entry != null && isOauthAuthMode(entry.authMode);
+  // 平台已注册 OAuth App → 用户零填写，一键授权（读后端显式字段，不从空数组反推）。
+  const isPlatformOauth = isOauth && entry.clientProvisioning === "platform";
   const sources = entry?.requiredBindSources ?? [];
   const missingRequired = sources.some((s) => !(values[s] ?? "").trim());
 
@@ -704,9 +706,11 @@ function DeclarativeBindDialog({
       onOpenChange={(o) => !o && onClose()}
       title={entry ? `绑定 ${entry.label}` : undefined}
       description={
-        isOauth
-          ? "填写你的自建应用凭据，前往授权后即可完成绑定。"
-          : "凭据仅用于服务端加密存储，绝不会进入对话或容器。"
+        isPlatformOauth
+          ? "无需填写任何凭据，点击前往授权即可完成绑定。"
+          : isOauth
+            ? "填写你的自建应用凭据，前往授权后即可完成绑定。"
+            : "凭据仅用于服务端加密存储，绝不会进入对话或容器。"
       }
       footer={
         entry && (

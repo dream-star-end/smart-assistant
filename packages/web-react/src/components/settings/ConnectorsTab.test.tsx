@@ -529,6 +529,45 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     expect(mockedDeclBind).not.toHaveBeenCalled();
   });
 
+  test("oauth2 platform 模式:零凭据字段,一键「前往授权」(读 clientProvisioning,非从空数组反推)", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          versionId: 99,
+          authMode: "oauth2-auth-code",
+          clientProvisioning: "platform",
+          requiredBindSources: [], // 平台已注册 App → 用户什么都不用填
+        }),
+      ],
+    });
+    mockedDeclOauthStart.mockResolvedValue({ authorizeUrl: "https://linear.app/oauth/authorize" });
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("Linear");
+
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    // 零凭据字段（不该出现 client_id / client_secret 输入框）
+    expect(within(dialog).queryByLabelText(/应用 ID/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText(/应用密钥/)).not.toBeInTheDocument();
+    // 一键授权专属文案（不是 BYOA 的「填写你的自建应用凭据」）
+    expect(within(dialog).getByText(/无需填写任何凭据/)).toBeInTheDocument();
+    // 无必填项 → 按钮直接可点
+    const submit = within(dialog).getByRole("button", { name: "前往授权" });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mockedDeclOauthStart).toHaveBeenCalledWith(auth, {
+        versionId: 99,
+        clientId: "",
+        clientSecret: "",
+        displayName: undefined,
+      }),
+    );
+    expect(mockedDeclBind).not.toHaveBeenCalled();
+  });
+
   test("oauth2-auth-code:发起授权失败 → 弹层内中文文案(不裸露码)", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedDeclCatalog.mockResolvedValue({
