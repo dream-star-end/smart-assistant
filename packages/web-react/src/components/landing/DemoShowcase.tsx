@@ -1,4 +1,4 @@
-import { Check, ExternalLink, Loader2, RotateCcw, Sparkles, Timer } from "lucide-react";
+import { Check, Loader2, RotateCcw, Sparkles, Timer } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
@@ -25,7 +25,7 @@ const HOLD_MS = 4200; // 答案打完后停留再切下一幕（留足时间看�
 
 type TranscriptScenario = Extract<DemoScenario, { presentation: "transcript" }>;
 
-/** 真实公开案例：完整呈现两轮正文，执行 trace 只按关键阶段归纳，不伪装成逐条日志。 */
+/** 真实公开案例：呈现两轮结构与非地址正文，执行 trace 只按关键阶段归纳。 */
 function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
   return (
     <div className="min-w-0 px-4 py-4 sm:px-5">
@@ -33,19 +33,6 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
         <span className="font-semibold text-accent">展示说明：</span>
         {scenario.disclosure}
       </div>
-
-      {scenario.publicLink && (
-        <a
-          href={scenario.publicLink.href}
-          target="_blank"
-          rel="noopener noreferrer"
-          aria-label={`${scenario.publicLink.label}（在新窗口打开）`}
-          className="mb-4 inline-flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent-soft px-3 py-1.5 text-[12.5px] font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 md:hidden"
-        >
-          <ExternalLink size={13} />
-          {scenario.publicLink.label}
-        </a>
-      )}
 
       <div className="flex min-w-0 flex-col gap-4">
         {scenario.transcript.map((block) => {
@@ -394,7 +381,6 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
               artifact={sc.artifact}
               deliverable={sc.deliverable}
               done={artifactDone}
-              publicLink={sc.publicLink}
             />
           </div>
         </div>

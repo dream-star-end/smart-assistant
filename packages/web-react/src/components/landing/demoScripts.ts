@@ -13,9 +13,18 @@ import { GAME_DEMO_DISCLOSURE, GAME_DEMO_TURNS } from "./gameDemoTranscript";
 /** 演示中助手「执行动作」的瞬时提示（拆计划 / 跑代码 / 联网 / 委派…），逐条揭示以还原 agent 干活过程。 */
 export type DemoStep = { label: string };
 
+type GalleryImage = {
+  src: string;
+  alt: string;
+  label: string;
+  width: number;
+  height: number;
+  priority?: boolean;
+};
+
 /**
  * 成果预览面板的结构化数据 —— 每个场景一种可视化交付物 mock（迷你图表 / PPT 缩略 /
- * 岗位表 / 代码 diff / 协作账本 / 带来源报告），让「交回能直接用的成果」看得见。
+ * 岗位表 / 代码 diff / 实机截图 / 协作账本 / 带来源报告），让「交回能直接用的成果」看得见。
  * 纯展示数据，颜色一律走设计 token（单一强调色 + 中性灰，文字用文本 token）。
  */
 export type Artifact =
@@ -45,6 +54,12 @@ export type Artifact =
       title: string;
       file: string;
       lines: { t: "add" | "del" | "ctx"; code: string }[];
+      note: string;
+    }
+  | {
+      kind: "gallery";
+      title: string;
+      images: [GalleryImage, ...GalleryImage[]];
       note: string;
     }
   | {
@@ -86,8 +101,6 @@ type DemoScenarioBase = {
   artifact: Artifact;
   /** 顶栏来源标识；缺省为「动态演示 · 示意数据」。 */
   sourceLabel?: string;
-  /** 已公开交付物的外链（真实公开案例可选）。 */
-  publicLink?: { label: string; href: string };
 };
 
 export type DemoTranscriptBlock =
@@ -110,7 +123,7 @@ export type DemoScenario = DemoScenarioBase &
       }
     | {
         presentation: "transcript";
-        /** 已脱敏的完整对话正文 + 按关键阶段归纳的执行过程。 */
+        /** 已脱敏的两轮对话结构 + 按关键阶段归纳的执行过程。 */
         transcript: readonly DemoTranscriptBlock[];
         disclosure: string;
       }
@@ -141,23 +154,34 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     runMeta: "生产记录：两轮共 81 次工具调用 · 开发、实测与公网发布端到端完成",
     deliverable: "《万劫问仙》· 公网游戏",
     sourceLabel: "真实公开案例",
-    publicLink: {
-      label: "立即游玩《万劫问仙》",
-      href: "https://dream-star-end.github.io/hello-world/",
-    },
     artifact: {
-      kind: "diff",
-      title: "Canvas 修仙割草游戏",
-      file: "src/game.js",
-      lines: [
-        { t: "ctx", code: "@@ 从空项目到公网可玩 @@" },
-        { t: "add", code: "+ 3 种传承 · 6 类神通 · 6 波妖潮" },
-        { t: "add", code: "+ Boss / 境界突破 / 洞府永久强化" },
-        { t: "add", code: "+ 水墨粒子 · 法阵 · 雷电 · 剑光" },
-        { t: "add", code: "+ 键盘 + 移动端虚拟摇杆" },
-        { t: "add", code: "+ GitHub Pages 公网发布" },
+      kind: "gallery",
+      title: "《万劫问仙》实机画面",
+      images: [
+        {
+          src: "/demo/wanjie/menu.webp",
+          alt: "《万劫问仙》传承选择界面，展示太虚剑宗、九霄雷府和赤炼丹霞三种本命传承",
+          label: "传承选择",
+          width: 1200,
+          height: 750,
+          priority: true,
+        },
+        {
+          src: "/demo/wanjie/battle.webp",
+          alt: "《万劫问仙》桌面端战斗实机画面，展示自动御剑、妖物、连斩和战斗 HUD",
+          label: "战斗实机",
+          width: 1200,
+          height: 750,
+        },
+        {
+          src: "/demo/wanjie/mobile.webp",
+          alt: "《万劫问仙》移动端战斗实机画面，展示竖屏 HUD 与触控操作",
+          label: "移动端",
+          width: 390,
+          height: 844,
+        },
       ],
-      note: "构建通过 · 桌面 / 移动端实测 · 已上线",
+      note: "真实游戏截图 · 桌面与移动端适配",
     },
   },
   {
