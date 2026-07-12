@@ -18,9 +18,20 @@
   旧行 disable→retired,新行同 model_id 重新 staged→校验→active,旧版本保留审计。
 - **`model_aliases`**:`alias`(PK)→`entry_id`;alias 只可指向 staged/active 行;
   删除/重指/目标收窄走状态机+审计(R2-M8)。
-- **`model_pricing` 收口**(R2-M7):价格/可见性列保留;**`enabled` 列退役为生成
-  兼容视图**(读=对应 catalog 行 state='active'),写口移除 —— 可用性唯一权威 =
-  catalog.state,proxy/授权/公共投影/seed 校验统一改判 state。
+- **`model_pricing` 收口**(R2-M7;**实现期机制修订 2026-07-12**):价格/可见性列
+  保留;可用性唯一权威 = catalog.state,proxy/授权/公共投影/seed 校验统一改判 state。
+  **`enabled` 退役形态 = 双向 trigger 维护的派生镜像列**(非 R3-M9 原写的"可更新
+  视图+INSTEAD OF"):PG 实测视图不支持 `ON CONFLICT`(16.14 报 no unique or
+  exclusion constraint),而既有代码与多个 seed 迁移(0007/0077/0082/0083/0102/0103)
+  确实在 model_pricing 上用 ON CONFLICT → 视图化会让"既有 SQL 不改也能跑"的兼容
+  地板(步骤 1 回滚保证)当场塌陷。改为:①保持基表;②旧 `UPDATE SET enabled=` 被
+  BEFORE trigger 拦截并**路由到 catalog 状态机**(R3-M9 语义原意);③catalog 状态
+  变更 AFTER trigger 反向同步镜像;④**运行时(pricing.ts/modelCatalog.ts)不读镜像
+  列**,直接 JOIN catalog 派生 —— 镜像被外力写歪也不影响判定(测试用
+  session_replication_role=replica 写歪镜像后断言 PricingCache 仍返回权威值)。
+  代价:失去"视图天然不可能不一致"的物理保证,代之以双向 trigger 全覆盖+运行时
+  不信任镜像;收益:兼容地板成为最强形式(同一张表),稳态拆兼容层=删 2 trigger+
+  DROP COLUMN(登记债)。
 - **`model_security_epoch`**(单行表):单调递增。
 - **状态机与 epoch 由 DB 强制(R2-M9)**:trigger 校验合法转移(staged→active→
   disabled→{active|retired};retired 单向终态,被 alias 引用禁退休,R2-m14)、
