@@ -19,6 +19,7 @@ import type {
   ConnectorConnection,
   ConnectorProvider,
   ConnectorsResponse,
+  DeclarativeCatalogEntry,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { ConnectorsTab } from "./ConnectorsTab";
@@ -35,6 +36,11 @@ vi.mock("../../lib/api", async (importOriginal) => {
       startGithubOAuth: vi.fn(),
       renameConnector: vi.fn(),
       deleteConnector: vi.fn(),
+      // 声明式引擎（统一界面第二套后端）
+      getDeclarativeCatalog: vi.fn(),
+      getDeclarativeConnections: vi.fn(),
+      bindDeclarativeConnector: vi.fn(),
+      unbindDeclarativeConnector: vi.fn(),
     },
   };
 });
@@ -47,10 +53,17 @@ const mockedOAuthStart = vi.mocked(api.startConnectorOAuth);
 const mockedGithubStart = vi.mocked(api.startGithubOAuth);
 const mockedRename = vi.mocked(api.renameConnector);
 const mockedDelete = vi.mocked(api.deleteConnector);
+const mockedDeclCatalog = vi.mocked(api.getDeclarativeCatalog);
+const mockedDeclConnections = vi.mocked(api.getDeclarativeConnections);
+const mockedDeclBind = vi.mocked(api.bindDeclarativeConnector);
+const mockedDeclUnbind = vi.mocked(api.unbindDeclarativeConnector);
 
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
+  // 声明式默认降级为空（现有 v1 用例不受第二套后端影响）；声明式用例各自 override。
+  mockedDeclCatalog.mockResolvedValue({ connectors: [] });
+  mockedDeclConnections.mockResolvedValue({ connections: [] });
 });
 
 const auth: AuthSession = {
@@ -135,6 +148,20 @@ function conn(overrides: Partial<ConnectorConnection> = {}): ConnectorConnection
 
 function catalog(connections: ConnectorConnection[] = []): ConnectorsResponse {
   return { providers: PROVIDERS, connections };
+}
+
+/** 声明式 catalog 条目 fixture（默认 slug=linear，v1 目录无此 slug，便于非去重用例）。 */
+function declEntry(overrides: Partial<DeclarativeCatalogEntry> = {}): DeclarativeCatalogEntry {
+  return {
+    versionId: 42,
+    slug: "linear",
+    label: "Linear",
+    description: "声明式：检索与创建 Linear issue",
+    authMode: "static-token",
+    requiredBindSources: ["access_token"],
+    actions: [{ id: "search", effect: "read" }],
+    ...overrides,
+  };
 }
 
 /** 定位某 provider 目录卡的容器（label 文本 → 最近的卡片 div）。 */
@@ -336,5 +363,155 @@ describe("ConnectorsTab 已绑管理", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     await waitFor(() => expect(mockedRename).toHaveBeenCalledWith(auth, "11", "私人邮箱"));
+  });
+});
+
+describe("ConnectorsTab 声明式连接器（统一界面）", () => {
+  test("声明式 catalog 渲染成卡片:label/描述/能力标注(只读动作→只读)", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry()] });
+    render(<ConnectorsTab auth={auth} />);
+
+    expect(await screen.findByText("Linear")).toBeInTheDocument();
+    expect(screen.getByText("声明式：检索与创建 Linear issue")).toBeInTheDocument();
+    // actions 仅 read → 只读（write/send 才可读写）
+    expect(within(providerCard("Linear")).getByText("只读")).toBeInTheDocument();
+  });
+
+  test("写动作声明式连接器标注为可读写", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [declEntry({ actions: [{ id: "create", effect: "write" }] })],
+    });
+    render(<ConnectorsTab auth={auth} />);
+
+    await screen.findByText("Linear");
+    expect(within(providerCard("Linear")).getByText("可读写")).toBeInTheDocument();
+  });
+
+  test("去重(声明式优先):v1 与声明式同 slug(notion)只渲染声明式版一张卡", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          slug: "notion",
+          label: "Notion（声明式）",
+          description: "声明式 Notion 引擎",
+          actions: [{ id: "create", effect: "write" }],
+        }),
+      ],
+    });
+    render(<ConnectorsTab auth={auth} />);
+
+    // 声明式 notion 卡渲染
+    expect(await screen.findByText("Notion（声明式）")).toBeInTheDocument();
+    // v1 notion 被去重(其描述与裸 label "Notion" 均不再出现)
+    expect(screen.queryByText("读取与创建 Notion 页面")).not.toBeInTheDocument();
+    expect(screen.queryByText("Notion")).not.toBeInTheDocument();
+  });
+
+  test("声明式 bind:按 requiredBindSources 渲染字段→提交调 bindDeclarativeConnector(versionId+secrets)→reload", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          versionId: 77,
+          requiredBindSources: ["client_id", "client_secret"],
+          actions: [{ id: "create", effect: "write" }],
+        }),
+      ],
+    });
+    mockedDeclBind.mockResolvedValue({ connection: { id: "d1", rebound: false } });
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("Linear");
+
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("绑定 Linear")).toBeInTheDocument();
+    // source → 表单字段元数据：client_id=text, client_secret=password
+    const cid = within(dialog).getByLabelText(/应用 ID/) as HTMLInputElement;
+    const csec = within(dialog).getByLabelText(/应用密钥/) as HTMLInputElement;
+    expect(cid.type).toBe("text");
+    expect(csec.type).toBe("password");
+
+    const submit = within(dialog).getByRole("button", { name: "绑定" });
+    expect(submit).toBeDisabled();
+    fireEvent.change(cid, { target: { value: "cid_x" } });
+    fireEvent.change(csec, { target: { value: "csec_y" } });
+    fireEvent.change(within(dialog).getByLabelText(/备注名/), { target: { value: "团队账号" } });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mockedDeclBind).toHaveBeenCalledWith(auth, {
+        versionId: 77,
+        secrets: { client_id: "cid_x", client_secret: "csec_y" },
+        displayName: "团队账号",
+      }),
+    );
+    // 成功 → 目录 reload（getConnectors 初始 1 + 成功后 1）
+    await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
+  });
+
+  test("声明式已绑连接:无改名铅笔;解绑确认后调 unbindDeclarativeConnector(非 v1 deleteConnector)", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [declEntry({ actions: [{ id: "create", effect: "write" }] })],
+    });
+    mockedDeclConnections.mockResolvedValue({
+      connections: [
+        {
+          id: "dc1",
+          slug: "linear",
+          displayName: "我的 Linear",
+          accountHint: "team-x",
+          createdAt: "2026-07-11T00:00:00.000Z",
+        },
+      ],
+    });
+    mockedDeclUnbind.mockResolvedValue(undefined);
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("我的 Linear");
+
+    const card = providerCard("Linear");
+    // 声明式连接行不显示改名铅笔（后端无 rename）
+    expect(within(card).queryByRole("button", { name: "编辑备注名" })).not.toBeInTheDocument();
+
+    fireEvent.click(within(card).getByRole("button", { name: "解绑" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/解绑「我的 Linear」/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "解绑" }));
+
+    await waitFor(() => expect(mockedDeclUnbind).toHaveBeenCalledWith(auth, "dc1"));
+    // 走声明式解绑，绝不误调 v1 deleteConnector
+    expect(mockedDelete).not.toHaveBeenCalled();
+    await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
+  });
+
+  test("非回归:v1 独有 provider(webdav)仍渲染且绑定走 v1 表单弹层", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry()] });
+    render(<ConnectorsTab auth={auth} />);
+    await screen.findByText("WebDAV 网盘");
+
+    fireEvent.click(within(providerCard("WebDAV 网盘")).getByRole("button", { name: "绑定" }));
+    const dialog = await screen.findByRole("dialog");
+    // v1 BindDialog：formFields 驱动的字段（服务器地址/账号/应用密码）
+    expect(within(dialog).getByText("绑定 WebDAV 网盘")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/服务器地址/)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/应用密码/)).toBeInTheDocument();
+  });
+
+  test("非回归降级:声明式接口拉取失败仍显示完整 v1 列表,不弹整体错误", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclCatalog.mockRejectedValue(new Error("boom"));
+    mockedDeclConnections.mockRejectedValue(new Error("boom"));
+    render(<ConnectorsTab auth={auth} />);
+
+    expect(await screen.findByText("WebDAV 网盘")).toBeInTheDocument();
+    for (const p of PROVIDERS) expect(screen.getByText(p.label)).toBeInTheDocument();
+    expect(screen.queryByText("加载应用连接失败")).not.toBeInTheDocument();
+    warn.mockRestore();
   });
 });

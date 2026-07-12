@@ -103,6 +103,72 @@ export type ConnectorConfirmTrigger = {
   id: string;
 };
 
+// ── 声明式引擎（未来单一权威）契约类型 + bind 表单元数据 ─────────────────────
+// 声明式连接器走 REST 前缀 /api/connectors/declarative/*，与 v1 手写 provider 并存
+// （过渡期）。字段与后端钉死（不得擅改）；本模块补充「后端不下发但前端 bind 弹层需要」
+// 的展示项（source → 表单字段元数据、actions → 读写能力）。
+
+/** 声明式目录里的一个连接器（catalog 条目，label/description 由后端下发）。 */
+export type DeclarativeCatalogEntry = {
+  versionId: number;
+  slug: string;
+  label: string;
+  description: string;
+  authMode: string;
+  /** bind 时用户要填的凭据字段名（source 名，如 access_token / client_id）。 */
+  requiredBindSources: string[];
+  /** 该连接器声明的动作（effect 推导读写能力）。 */
+  actions: { id: string; effect: string }[];
+};
+
+/** GET /api/connectors/declarative/catalog 回包。 */
+export type DeclarativeCatalogResponse = { connectors: DeclarativeCatalogEntry[] };
+
+/** 一条已绑声明式连接（无 status，视为 active）。 */
+export type DeclarativeConnection = {
+  id: string;
+  slug: string;
+  displayName: string;
+  accountHint?: string;
+  createdAt: string;
+};
+
+/** GET /api/connectors/declarative/connections 回包。 */
+export type DeclarativeConnectionsResponse = { connections: DeclarativeConnection[] };
+
+/** POST /api/connectors/declarative/bind 回包。 */
+export type DeclarativeBindResult = {
+  connection: { id: string; rebound: boolean; accountHint?: string };
+};
+
+/** bind 表单单个字段的展示元数据（source → label/输入类型/占位符）。 */
+export type BindFieldMeta = { label: string; type: "text" | "password"; placeholder?: string };
+
+/**
+ * source（后端 requiredBindSources 下发的凭据字段名）→ 表单字段展示元数据（单一权威）。
+ * 未知 source 回退 password 类型（安全默认：宁可当密码遮挡也不明文回显未知凭据）。
+ */
+const BIND_SOURCE_FIELD: Record<string, BindFieldMeta> = {
+  access_token: { label: "访问令牌 / API Token", type: "password" },
+  client_id: { label: "应用 ID (Client ID)", type: "text" },
+  client_secret: { label: "应用密钥 (Client Secret)", type: "password" },
+  refresh_token: { label: "刷新令牌 (Refresh Token)", type: "password" },
+};
+
+/** source → 表单字段元数据（未知 source 回退 password + 原 source 名作 label）。 */
+export function bindFieldMeta(source: string): BindFieldMeta {
+  return BIND_SOURCE_FIELD[source] ?? { label: source, type: "password" };
+}
+
+/**
+ * 声明式连接器读写能力标注（由 actions 的 effect 推导）：
+ * 存在 write/send 类动作 → 可读写；否则只读。v1 卡片仍用 connectorCapabilityLabel。
+ */
+export function declarativeCapabilityLabel(actions: { effect: string }[]): string {
+  const canWrite = actions.some((a) => a.effect === "write" || a.effect === "send");
+  return canWrite ? "可读写" : "只读";
+}
+
 // ── provider 展示元数据（图标 + 读写能力标注） ──────────────────────────────
 
 /** 连接器图标组件的最小 props 面（LucideIcon 与内联品牌标志都满足）。 */
@@ -186,6 +252,13 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   RATE_LIMITED: "操作过于频繁，请稍后再试",
   UNSUPPORTED_PROVIDER: "暂不支持该应用",
   NOT_FOUND: "连接不存在或已解绑",
+  // 声明式引擎（/api/connectors/declarative/* 经 HttpError 抛的 code）
+  UPSTREAM_AUTH_FAILED: "应用凭据校验失败，请检查后重试",
+  IDENTITY_INVALID: "账号身份校验失败，请稍后重试",
+  BAD_REQUEST: "请求参数有误，请检查后重试",
+  CONNECTION_NOT_FOUND: "连接不存在或已解绑",
+  INTERNAL: "服务暂时不可用，请稍后重试",
+  UPSTREAM_ERROR: "应用服务暂时不可用，请稍后重试",
 };
 
 /** 错误码 → 友好中文（未知码回退通用文案，绝不暴露裸码/上游细节）。 */

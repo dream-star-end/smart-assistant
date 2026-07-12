@@ -2,14 +2,20 @@ import { Check, ExternalLink, Pencil, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError, apiErrorMessage } from "../../lib/api";
 import {
+  bindFieldMeta,
   connectorCapabilityLabel,
   connectorErrorText,
   connectorIcon,
   connectorNeedsRelink,
+  declarativeCapabilityLabel,
   type ConnectorConnection,
   type ConnectorFormField,
   type ConnectorProvider,
   type ConnectorsResponse,
+  type DeclarativeCatalogEntry,
+  type DeclarativeCatalogResponse,
+  type DeclarativeConnection,
+  type DeclarativeConnectionsResponse,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button, IconButton, Input, Modal, Spinner, useConfirm } from "../ui";
@@ -28,30 +34,67 @@ const DEFAULT_OAUTH_FIELDS: ConnectorFormField[] = [
 ];
 
 /**
- * 应用连接器 Tab：provider 目录（图标/描述/读写能力/绑定状态）+ formFields 驱动的绑定
- * 弹层（token/basic 表单 · BYOA OAuth 先填 client 凭据再整页跳授权）+ 已绑多账号列表
- * （行内改备注名 / RELINK 引导 / 解绑二次确认）。
+ * 统一连接器卡片模型：把 v1 手写 provider 与声明式 connector 归一到同一套渲染契约。
+ * system 决定绑定/解绑/能力标注走哪一套后端，slug 是去重键（声明式优先）。
+ */
+type UnifiedProvider =
+  | { system: "v1"; slug: string; label: string; description: string; v1: ConnectorProvider }
+  | {
+      system: "declarative";
+      slug: string;
+      label: string;
+      description: string;
+      decl: DeclarativeCatalogEntry;
+    };
+
+/**
+ * 应用连接器 Tab：统一展示 **v1 手写 provider** + **声明式 connector** 两套后端。
+ * 同一列表里按 slug 去重（同 slug 两边都有 → 只显示声明式版，因其是权威且带
+ * allowlist+pin）。绑定/解绑按卡片 system 路由：
+ *   - v1：formFields 弹层（token/basic）· BYOA OAuth 整页跳转 · github 复用账号 OAuth；
+ *   - 声明式：requiredBindSources 驱动的 DeclarativeBindDialog。
  *
- * 目录与已绑列表都以 GET /api/connectors 为唯一权威；任何变更（绑定/解绑/改名）后
- * 整体 reload，不做本地乐观拼接。github 绑定跳转现有 GitHub OAuth（api.startGithubOAuth）。
+ * v1 目录（GET /api/connectors）是硬依赖，失败 → 整体报错；声明式（catalog +
+ * connections）是增量，任一失败各自降级为空，**绝不阻断 v1 现有能力**。任何变更后
+ * 整体 reload，不做本地乐观拼接。
  */
 export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   const [data, setData] = useState<ConnectorsResponse | null>(null);
+  const [declCatalog, setDeclCatalog] = useState<DeclarativeCatalogEntry[]>([]);
+  const [declConnections, setDeclConnections] = useState<DeclarativeConnection[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  /** 打开绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
+  /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
   const [bindFor, setBindFor] = useState<ConnectorProvider | null>(null);
+  /** 打开声明式绑定弹层的 catalog 条目。 */
+  const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null);
   const [confirm, confirmEl] = useConfirm();
 
   const reload = useCallback(() => {
     let alive = true;
     setErr(null);
-    api
-      .getConnectors(auth)
-      .then((d) => {
-        if (alive) setData(d);
+    // 声明式是增量：各自 catch 降级为空，永不 reject 到 Promise.all；只有 v1 会阻断。
+    const catalogP: Promise<DeclarativeCatalogResponse> = api
+      .getDeclarativeCatalog(auth)
+      .catch((e) => {
+        console.warn("[connectors] 声明式目录加载失败，降级仅显示 v1 连接器", e);
+        return { connectors: [] };
+      });
+    const connsP: Promise<DeclarativeConnectionsResponse> = api
+      .getDeclarativeConnections(auth)
+      .catch((e) => {
+        console.warn("[connectors] 声明式连接加载失败，降级", e);
+        return { connections: [] };
+      });
+    Promise.all([api.getConnectors(auth), catalogP, connsP])
+      .then(([d, cat, cn]) => {
+        if (!alive) return;
+        setData(d);
+        setDeclCatalog(cat.connectors);
+        setDeclConnections(cn.connections);
       })
       .catch((e) => {
+        // 仅 v1 会 reject 到此（声明式已各自 catch 降级）。
         if (alive) setErr(errText(e, "加载应用连接失败"));
       })
       .finally(() => {
@@ -64,8 +107,37 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
 
   useEffect(() => reload(), [reload]);
 
-  /** provider id → 已绑连接（多账号多行）。 */
-  const connsByProvider = useMemo(() => {
+  /** slug 去重、声明式优先，合并成统一卡片列表（声明式在前，各自保持插入序，渲染稳定）。 */
+  const unified = useMemo<UnifiedProvider[]>(() => {
+    const bySlug = new Map<string, UnifiedProvider>();
+    for (const c of declCatalog) {
+      bySlug.set(c.slug, {
+        system: "declarative",
+        slug: c.slug,
+        label: c.label,
+        description: c.description,
+        decl: c,
+      });
+    }
+    // v1 provider 仅当该 slug 未被声明式占据时加入（声明式权威，带 allowlist+pin）。
+    for (const p of data?.providers ?? []) {
+      if (bySlug.has(p.id)) continue;
+      bySlug.set(p.id, {
+        system: "v1",
+        slug: p.id,
+        label: p.label,
+        description: p.description,
+        v1: p,
+      });
+    }
+    const decl: UnifiedProvider[] = [];
+    const v1: UnifiedProvider[] = [];
+    for (const u of bySlug.values()) (u.system === "declarative" ? decl : v1).push(u);
+    return [...decl, ...v1];
+  }, [declCatalog, data]);
+
+  /** v1 provider id → 已绑连接（多账号多行，带 status/lastErrorCode）。 */
+  const v1ConnsBySlug = useMemo(() => {
     const m = new Map<string, ConnectorConnection[]>();
     for (const c of data?.connections ?? []) {
       const list = m.get(c.provider) ?? [];
@@ -75,8 +147,32 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
     return m;
   }, [data]);
 
+  /** 声明式 slug → 已绑连接（无 status，映射为 active 形状喂给 ConnectionRow）。 */
+  const declConnsBySlug = useMemo(() => {
+    const m = new Map<string, ConnectorConnection[]>();
+    for (const c of declConnections) {
+      const list = m.get(c.slug) ?? [];
+      list.push({
+        id: c.id,
+        provider: c.slug,
+        displayName: c.displayName,
+        accountHint: c.accountHint ?? "",
+        status: "active",
+        lastErrorCode: null,
+        createdAt: c.createdAt,
+      });
+      m.set(c.slug, list);
+    }
+    return m;
+  }, [declConnections]);
+
   const startBind = useCallback(
-    (p: ConnectorProvider) => {
+    (u: UnifiedProvider) => {
+      if (u.system === "declarative") {
+        setBindDeclFor(u.decl);
+        return;
+      }
+      const p = u.v1;
       if (p.id === "github") {
         // GitHub 复用现有账号 OAuth 绑定入口（v1 只读，凭据权威在 github_links）。
         api
@@ -93,7 +189,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   );
 
   const unbind = useCallback(
-    async (conn: ConnectorConnection) => {
+    async (u: UnifiedProvider, conn: ConnectorConnection) => {
       const name = conn.displayName || conn.accountHint || conn.provider;
       const ok = await confirm({
         title: `解绑「${name}」?`,
@@ -103,7 +199,8 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
       });
       if (!ok) return;
       try {
-        await api.deleteConnector(auth, conn.id);
+        if (u.system === "declarative") await api.unbindDeclarativeConnector(auth, conn.id);
+        else await api.deleteConnector(auth, conn.id);
         reload();
       } catch (e) {
         setErr(errText(e, "解绑失败"));
@@ -147,17 +244,29 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
       </div>
 
       <div className="flex flex-col gap-3 px-5 py-4">
-        {(data?.providers ?? []).map((p) => (
+        {unified.map((u) => (
           <ProviderCard
-            key={p.id}
-            provider={p}
-            connections={connsByProvider.get(p.id) ?? []}
-            onBind={() => startBind(p)}
-            onUnbind={unbind}
+            key={u.slug}
+            slug={u.slug}
+            label={u.label}
+            description={u.description}
+            capabilityLabel={
+              u.system === "declarative"
+                ? declarativeCapabilityLabel(u.decl.actions)
+                : connectorCapabilityLabel(u.slug)
+            }
+            connections={
+              u.system === "declarative"
+                ? (declConnsBySlug.get(u.slug) ?? [])
+                : (v1ConnsBySlug.get(u.slug) ?? [])
+            }
+            canRename={u.system === "v1"}
+            onBind={() => startBind(u)}
+            onUnbind={(c) => unbind(u, c)}
             onRename={rename}
           />
         ))}
-        {data && data.providers.length === 0 && (
+        {data && unified.length === 0 && (
           <p className="py-6 text-center text-[13px] text-faint">暂无可绑定的应用。</p>
         )}
       </div>
@@ -171,6 +280,15 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
           reload();
         }}
       />
+      <DeclarativeBindDialog
+        auth={auth}
+        entry={bindDeclFor}
+        onClose={() => setBindDeclFor(null)}
+        onBound={() => {
+          setBindDeclFor(null);
+          reload();
+        }}
+      />
       {confirmEl}
     </div>
   );
@@ -179,19 +297,27 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
 // ── provider 目录卡（含该 provider 的已绑多账号列表） ────────────────────────
 
 function ProviderCard({
-  provider,
+  slug,
+  label,
+  description,
+  capabilityLabel,
   connections,
+  canRename,
   onBind,
   onUnbind,
   onRename,
 }: {
-  provider: ConnectorProvider;
+  slug: string;
+  label: string;
+  description: string;
+  capabilityLabel: string;
   connections: ConnectorConnection[];
+  canRename: boolean;
   onBind: () => void;
   onUnbind: (conn: ConnectorConnection) => void;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
 }) {
-  const Icon = connectorIcon(provider.id);
+  const Icon = connectorIcon(slug);
   return (
     <div className="rounded-xl border border-border bg-surface p-3.5">
       <div className="flex items-start gap-3">
@@ -200,9 +326,9 @@ function ProviderCard({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[14px] font-medium text-fg">{provider.label}</span>
+            <span className="text-[14px] font-medium text-fg">{label}</span>
             <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">
-              {connectorCapabilityLabel(provider.id)}
+              {capabilityLabel}
             </span>
             {connections.length > 0 && (
               <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
@@ -210,7 +336,7 @@ function ProviderCard({
               </span>
             )}
           </div>
-          <p className="mt-0.5 text-[12px] leading-snug text-faint">{provider.description}</p>
+          <p className="mt-0.5 text-[12px] leading-snug text-faint">{description}</p>
         </div>
         <Button variant="secondary" size="sm" className="shrink-0" onClick={onBind}>
           {connections.length > 0 ? "添加账号" : "绑定"}
@@ -223,6 +349,7 @@ function ProviderCard({
             <ConnectionRow
               key={c.id}
               conn={c}
+              canRename={canRename}
               onUnbind={onUnbind}
               onRename={onRename}
               onRelink={onBind}
@@ -238,11 +365,14 @@ function ProviderCard({
 
 function ConnectionRow({
   conn,
+  canRename = true,
   onUnbind,
   onRename,
   onRelink,
 }: {
   conn: ConnectorConnection;
+  /** 是否支持改名（声明式后端无 rename → 传 false 隐藏铅笔与行内编辑）。 */
+  canRename?: boolean;
   onUnbind: (conn: ConnectorConnection) => void;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
   onRelink: () => void;
@@ -298,9 +428,11 @@ function ConnectionRow({
             <span className="truncate text-[13px] text-fg">
               {conn.displayName || conn.accountHint || "未命名连接"}
             </span>
-            <IconButton size="sm" aria-label="编辑备注名" onClick={() => setEditing(true)}>
-              <Pencil size={13} />
-            </IconButton>
+            {canRename && (
+              <IconButton size="sm" aria-label="编辑备注名" onClick={() => setEditing(true)}>
+                <Pencil size={13} />
+              </IconButton>
+            )}
           </div>
         )}
         <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11.5px] text-faint">
@@ -479,6 +611,130 @@ function BindDialog({
               value={displayName}
               maxLength={64}
               placeholder="如：工作邮箱"
+              onChange={(e) => setDisplayName(e.target.value)}
+            />
+          </label>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ── 声明式绑定弹层（requiredBindSources 驱动；凭据直落服务端加密存储） ─────────
+
+/**
+ * 声明式连接器绑定弹层：表单字段由 entry.requiredBindSources 驱动，每个 source 经
+ * bindFieldMeta 取 label/输入类型（未知 source 回退密码框）。全部必填，另有可选备注名。
+ * 提交调 api.bindDeclarativeConnector（secrets 键 = source 名）。凭据仅用于服务端加密
+ * 存储，绝不进入对话或容器。
+ */
+function DeclarativeBindDialog({
+  auth,
+  entry,
+  onClose,
+  onBound,
+}: {
+  auth: AuthSession;
+  entry: DeclarativeCatalogEntry | null;
+  onClose: () => void;
+  onBound: () => void;
+}) {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [displayName, setDisplayName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // 换连接器 / 重开弹层 → 重置表单瞬态（凭据绝不跨连接器残留）。
+  useEffect(() => {
+    setValues({});
+    setDisplayName("");
+    setErr(null);
+    setSubmitting(false);
+  }, [entry?.versionId]);
+
+  const sources = entry?.requiredBindSources ?? [];
+  const missingRequired = sources.some((s) => !(values[s] ?? "").trim());
+
+  const submit = async () => {
+    if (!entry || submitting || missingRequired) return;
+    setSubmitting(true);
+    setErr(null);
+    const secrets: Record<string, string> = {};
+    for (const s of sources) {
+      const v = (values[s] ?? "").trim();
+      if (v) secrets[s] = v;
+    }
+    const dn = displayName.trim() || undefined;
+    try {
+      await api.bindDeclarativeConnector(auth, {
+        versionId: entry.versionId,
+        secrets,
+        displayName: dn,
+      });
+      onBound();
+    } catch (e) {
+      setErr(errText(e, "绑定失败，请重试"));
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={entry != null}
+      onOpenChange={(o) => !o && onClose()}
+      title={entry ? `绑定 ${entry.label}` : undefined}
+      description="凭据仅用于服务端加密存储，绝不会进入对话或容器。"
+      footer={
+        entry && (
+          <>
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={submitting || missingRequired}
+              onClick={() => void submit()}
+            >
+              {submitting ? "提交中…" : "绑定"}
+            </Button>
+          </>
+        )
+      }
+    >
+      {entry && (
+        <div className="flex flex-col gap-3">
+          {err && (
+            <Alert tone="danger" className="text-[12.5px]">
+              {err}
+            </Alert>
+          )}
+
+          {sources.map((s) => {
+            const meta = bindFieldMeta(s);
+            return (
+              <label key={s} className="flex flex-col gap-1">
+                <span className="text-[12.5px] text-muted">
+                  {meta.label}
+                  <span className="ml-0.5 text-danger">*</span>
+                </span>
+                <Input
+                  type={meta.type === "password" ? "password" : "text"}
+                  value={values[s] ?? ""}
+                  placeholder={meta.placeholder}
+                  autoComplete="off"
+                  onChange={(e) => setValues((prev) => ({ ...prev, [s]: e.target.value }))}
+                />
+              </label>
+            );
+          })}
+
+          <label className="flex flex-col gap-1">
+            <span className="text-[12.5px] text-muted">备注名（可选）</span>
+            <Input
+              value={displayName}
+              maxLength={64}
+              placeholder="如：工作账号"
               onChange={(e) => setDisplayName(e.target.value)}
             />
           </label>
