@@ -75,6 +75,10 @@ function mkController(o: {
   fenceWaitMs?: number;
   events: Ev[];
   eligibleEnv?: boolean;
+  /** 注入 fail-stop 观测(默认 process.exit);测试永不真退进程。 */
+  onFatal?: (reason: string, detail?: unknown) => void;
+  /** onFence 返回值(默认 {drained:true};BLOCKER 1 stuck 场景传 {drained:false,stuck}）。 */
+  fenceOutcome?: { drained: boolean; stuck: string[] };
 }): LeaderLeaseController {
   const c = createLeaderLeaseController({
     pool,
@@ -89,9 +93,13 @@ function mkController(o: {
     recompeteMs: 30,
     fenceWaitMs: o.fenceWaitMs ?? 2000,
     fenceWaitPollMs: 30,
+    onFatal: o.onFatal ?? ((reason) => { throw new Error(`unexpected fail-stop: ${reason}`); }),
     callbacks: {
       onAcquire: () => { o.events.push({ type: "acquire", slot: o.label, at: Date.now() }); },
-      onFence: () => { o.events.push({ type: "fence", slot: o.label, at: Date.now() }); },
+      onFence: () => {
+        o.events.push({ type: "fence", slot: o.label, at: Date.now() });
+        return o.fenceOutcome ?? { drained: true, stuck: [] };
+      },
     },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
@@ -154,6 +162,11 @@ afterEach(async () => {
     const c = liveControllers.pop()!;
     try { await c.shutdown(); } catch { /* ignore */ }
   }
+  // fail-stop 测试中 onFatal 被注入为观测器(不真退进程)→ 持 advisory 的孤儿 lease 连接不会随
+  // 进程死释放。真实生产靠 process.exit 释放;测试里显式 terminate 任何残留 advisory 后端,复位隔离。
+  try {
+    await pool.query("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND pid <> pg_backend_pid()");
+  } catch { /* ignore */ }
   await setLease({ epoch: 0, slot: null, instance: null, pid: null, startTicks: null, ack: null, req: null });
 });
 
@@ -235,6 +248,75 @@ describe("leaderLease epoch 协议", () => {
     assert.equal(lease.instance, idTaker);
     assert.equal(lease.ack, null);
     assert.equal(lease.req, null);
+  });
+
+  test("【BLOCKER 2】pg_terminate lease 连接 → drain + 独立短连接 ACK → 新 holder 秒级接管(非 45s liveness)", async (t) => {
+    if (!pgAvailable) return t.skip("no PG");
+    const events: Ev[] = [];
+    const fatals: string[] = [];
+    const wA = fakeWatch(snap("A")); // c1 slot A,desired A
+    const wB = fakeWatch(snap("A")); // c2 slot B,desired 初始 A(standby)
+    const idA = randomUUID();
+    const idB = randomUUID();
+    const c1 = mkController({ slot: "A", watch: wA, instanceId: idA, label: "t1", pid: 8001, startTicks: 811, events, onFatal: (r) => fatals.push(r) });
+    // c2 视 c1 进程恒"活着"(我们只掐连接、不杀进程)→ c2 绝不能靠 liveness 提前接管,
+    // 必须靠 c1 掉线后短连接写的 ACK 才能安装 → 这正是 BLOCKER 2 要验证的秒级接管路径。
+    const c2 = mkController({
+      slot: "B", watch: wB, instanceId: idB, label: "t2", pid: 8002, startTicks: 812, events,
+      isProcessAlive: () => true, fenceWaitMs: 15000, onFatal: (r) => fatals.push(r),
+    });
+    c1.start();
+    c2.start();
+    await waitFor(() => c1.status().state === "leader");
+    assert.equal(c2.status().state, "standby");
+    assert.equal((await readLease()).epoch, 1);
+
+    // 找到持 advisory 的后端 pid(c1 的 lease 连接;排除本查询自身后端)。
+    const pidRow = await pool.query<{ pid: number }>(
+      "SELECT pid FROM pg_locks WHERE locktype='advisory' AND pid <> pg_backend_pid()",
+    );
+    assert.ok(pidRow.rows[0]?.pid, "应能定位持 advisory 的 lease 后端");
+
+    // desired 翻 B(c1 让位资格失效、c2 取得资格),再 terminate c1 的 lease 连接。
+    wA.set({ desiredLeaderSlot: "B" });
+    wB.set({ desiredLeaderSlot: "B" });
+    await pool.query("SELECT pg_terminate_backend($1)", [pidRow.rows[0].pid]);
+
+    const t0 = Date.now();
+    await waitFor(() => c2.status().state === "leader", 12000);
+    const elapsed = Date.now() - t0;
+    const after = await readLease();
+    assert.equal(after.epoch, 2, "c2 安装 epoch2");
+    assert.equal(after.slot, "B");
+    assert.equal(after.instance, idB);
+    // 关键:c1 靠掉线后短连接 ACK 让 c2 秒级接管,远快于 fenceWaitMs=15s(liveness 对 c2 恒 false)。
+    assert.ok(elapsed < 10000, `新 holder 应秒级接管(靠 ACK,实际 ${elapsed}ms)`);
+    assert.ok(events.some((e) => e.type === "fence" && e.slot === "t1"), "c1 应因掉线 fence");
+    assert.deepEqual(fatals, [], "happy 路径(drain 成功 + 短连接 ACK 成功)绝不 fail-stop");
+  });
+
+  test("【BLOCKER 1】graceful 让位时 drain 未完成(drained:false)→ fail-stop,不写 ACK 不 unlock", async (t) => {
+    if (!pgAvailable) return t.skip("no PG");
+    const events: Ev[] = [];
+    const fatals: string[] = [];
+    const wA = fakeWatch(snap("A"));
+    const idA = randomUUID();
+    const c1 = mkController({
+      slot: "A", watch: wA, instanceId: idA, label: "s1", pid: 9001, startTicks: 911, events,
+      onFatal: (r) => fatals.push(r),
+      fenceOutcome: { drained: false, stuck: ["idleSweep"] }, // drain 谎报未完成
+    });
+    c1.start();
+    await waitFor(() => c1.status().state === "leader");
+    assert.equal((await readLease()).epoch, 1);
+
+    // desired 翻走 → 优雅让位;但 drain 返回 drained:false → 必须 fail-stop,绝不写 ACK/unlock。
+    wA.set({ desiredLeaderSlot: "B" });
+    await waitFor(() => fatals.length > 0, 4000);
+    assert.match(fatals[0]!, /drain incomplete/);
+    const lease = await readLease();
+    assert.equal(lease.ack, null, "drain 未完成绝不写 ACK");
+    assert.equal(lease.epoch, 1, "lease 未交出(仍 epoch1/holder=c1)");
   });
 
   test("【Codex-1】旧 epoch 迟到 ACK 不污染新代", async (t) => {

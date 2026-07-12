@@ -177,6 +177,14 @@ export async function handleLinuxdoCallback(
   // ── 2) LDC 把用户回退过来时带 ?error=… —— 多半是用户在 LDC 上拒绝授权
   if (queryError) {
     ctx.log.info('linuxdo_callback_provider_error', { error: queryError })
+    // MINOR 2:state 双因素已过 → 顺手 best-effort 消费(原子 DELETE)对应 pending row,
+    // 不给用户拒授权后的 pending(含 PKCE verifier)留悬挂行(不成功由 TTL/GC 兜底)。
+    await consumeOAuthPendingState({
+      provider: 'linuxdo',
+      state: queryState,
+      runner: overrides.pendingRunner,
+      key: overrides.pendingKey,
+    }).catch(() => { /* best-effort */ })
     sendRedirect(res, loginErrorRedirect(mapErrorCode(queryError)))
     return
   }

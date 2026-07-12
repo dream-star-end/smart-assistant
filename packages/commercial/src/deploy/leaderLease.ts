@@ -43,11 +43,24 @@ export interface LeadershipStatus {
   leasePid: number | null;
 }
 
+/** onFence 返回:drained=true 表示 bundle 已干净停(可安全交权);false 时 stuck 列未停成员。 */
+export interface FenceDrainOutcome {
+  drained: boolean;
+  stuck: string[];
+}
+
 export interface LeaseCallbacks {
-  /** 竞得并安装 lease 后调用:start LeaderBundle(幂等)。 */
+  /**
+   * 竞得并安装 lease 后调用:start LeaderBundle(幂等)。
+   * **抛错 = start-all-or-fail 回滚(BLOCKER 1)** → controller step-down + fail-stop(绝不带半启动 leader 运行)。
+   */
   onAcquire: () => Promise<void> | void;
-  /** lease loss / graceful 让位:stopAndDrain LeaderBundle(有界)。reason 供诊断。 */
-  onFence: (reason: string) => Promise<void> | void;
+  /**
+   * lease loss / graceful 让位:stopAndDrain LeaderBundle(有界)。reason 供诊断。
+   * 返回 {drained, stuck}:drained=false(超时仍有 mutator 在跑)→ controller 拒绝交权、fail-stop
+   * (后继经 PID liveness 确认死亡才接管),绝不带 stuck 成员写共享状态时把权交出去(BLOCKER 1)。
+   */
+  onFence: (reason: string) => Promise<FenceDrainOutcome> | FenceDrainOutcome;
 }
 
 export interface LeaderLeaseOptions {
@@ -63,6 +76,13 @@ export interface LeaderLeaseOptions {
   logger?: { info: (m: string, meta?: unknown) => void; warn: (m: string, meta?: unknown) => void; error: (m: string, meta?: unknown) => void };
   /** fence 等待超时(45s>drain 30s)后 fail-stop 告警回调(人工裁决)。 */
   onFenceTimeoutAlert?: (info: { predecessorEpoch: number; predecessorPid: number | null }) => void;
+  /**
+   * fail-stop:进程无法安全继续持有/交出 leadership 时调用(默认 process.exit(1),systemd 拉起后以
+   * standby 重来)。触发场景:①onAcquire(bundle start-all-or-fail)抛错 ②graceful/被动 fence 的 drain
+   * 返回 drained:false(有 stuck mutator,交权 = 双跑)③连接掉线 fence 后短连接 ACK 也失败(无法交出 ACK)。
+   * 测试注入 spy 观测,不真的退进程。
+   */
+  onFatal?: (reason: string, detail?: unknown) => void;
   heartbeatMs?: number;
   recompeteMs?: number;
   fenceWaitMs?: number;
@@ -163,6 +183,14 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
   const recompeteMs = opts.recompeteMs ?? 3_000;
   const fenceWaitMs = opts.fenceWaitMs ?? 45_000;
   const fenceWaitPollMs = opts.fenceWaitPollMs ?? 500;
+  // fail-stop:默认 process.exit(1)(systemd Restart=on-failure 拉起后因 desired 判定以 standby 起)。
+  const failStop =
+    opts.onFatal ??
+    ((reason: string, detail?: unknown) => {
+      log.error(`[leaderLease] FAIL-STOP: ${reason}`, detail);
+      // eslint-disable-next-line no-process-exit
+      process.exit(1);
+    });
 
   let state: LeadershipState = opts.eligibleEnv ? "standby" : "ineligible";
   let stopped = false;
@@ -253,12 +281,25 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
       const outcome = await installOnClient(client);
       if (outcome === "installed") {
         leaseClient = client;
+        // 掉线监听在 leader 期贯穿(compete 早期已 attach,此处不重复)。
+        // BLOCKER 1:onAcquire = bundle start-all-or-fail。抛错 → 释放 lease + fail-stop,
+        // 绝不置为 leader 态(半启动的 leader = shared 职责静默真空)。
+        try {
+          await Promise.resolve(opts.callbacks.onAcquire());
+        } catch (err) {
+          log.error("[leaderLease] onAcquire(bundle start)失败 → 释放 lease + fail-stop", err);
+          leaseClient = null;
+          heldEpoch = null;
+          clearHeartbeat();
+          setState("fenced");
+          // 回滚已完成(bundle 无成员在跑),可安全解锁 advisory 让后继竞得;随后 fail-stop。
+          await unlockAndRelease(client).catch(() => {});
+          failStop(`onAcquire(bundle start) failed: ${(err as Error)?.message ?? String(err)}`, err);
+          return;
+        }
         setState("leader");
         startHeartbeat();
         subscribeDesired();
-        await Promise.resolve(opts.callbacks.onAcquire()).catch((err) =>
-          log.error("[leaderLease] onAcquire 抛错", err),
-        );
         return;
       }
       // abandoned / timeout:释放 advisory + 连接,不安装(绝不重叠)。
@@ -450,9 +491,16 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
     heldEpoch = null;
     try {
       // 先 drain bundle(停止一切 mutator),再写 ACK / unlock —— 顺序:必须先停跑再交权。
-      await Promise.resolve(opts.callbacks.onFence(reason)).catch((err) =>
-        log.error("[leaderLease] onFence 抛错", err),
-      );
+      const outcome = await drainBundle(reason);
+      // BLOCKER 1:drain 未干净(有 stuck mutator 仍在跑)→ 绝不交权。不写 ACK、不 unlock
+      //(留 advisory 到进程死;后继经 PID liveness 确认死亡才接管),fail-stop。
+      if (!outcome.drained) {
+        log.error("[leaderLease] fence drain 未完成,拒绝交权 → fail-stop", { reason, stuck: outcome.stuck });
+        // 不 unlock:进程退出时 PG 自动释放 advisory;successor 走 liveness(此进程已死)接管。
+        transitioning = false;
+        failStop(`fence drain incomplete: stuck=[${outcome.stuck.join(",")}]`, { reason });
+        return;
+      }
       if (client) {
         if (o.writeAck && epoch !== null) {
           // 写本 epoch ACK(epoch/instance 条件:迟到不污染新代)。best-effort。
@@ -479,6 +527,9 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
   }
 
   // 连接掉线(pg_terminate_backend / 网络 / PG 重启):advisory 被 PG 自动释放 → 立即 fence。
+  // BLOCKER 2:掉线时**保留 heldEpoch**;drain 成功后用独立短连接写本 epoch ACK(WHERE holder=self
+  // AND lease_epoch=self),让新 holder 拿锁即见 ACK 秒级接管(不必等 45s liveness)。短连接也失败
+  //           → 无法交出 ACK,进程退出供后继确认死亡(45s liveness 兜底)。drain 未完成 → 同样 fail-stop。
   async function onLeaseClientError(client: PoolClient, err: unknown): Promise<void> {
     if (client !== leaseClient) {
       // 非当前 lease 连接(compete 中途的探测连接)——交由各自路径处理。
@@ -491,17 +542,32 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
     clearHeartbeat();
     unsubDesired?.();
     unsubDesired = null;
+    const epoch = heldEpoch; // 保留:短连接 ACK 要用
     leaseClient = null;
     heldEpoch = null;
     try {
-      await Promise.resolve(opts.callbacks.onFence("connection-lost")).catch((e) =>
-        log.error("[leaderLease] onFence 抛错", e),
-      );
+      const outcome = await drainBundle("connection-lost");
       // 连接已坏,直接销毁(不还池):advisory 随连接死已释放。
       try {
         client.release(err instanceof Error ? err : new Error(String(err)));
       } catch {
         /* 已断 */
+      }
+      if (!outcome.drained) {
+        log.error("[leaderLease] 掉线 fence drain 未完成 → fail-stop(后继经 liveness 接管)", { stuck: outcome.stuck });
+        transitioning = false;
+        failStop(`connection-lost fence drain incomplete: stuck=[${outcome.stuck.join(",")}]`);
+        return;
+      }
+      // drain 成功 → 独立短连接写 ACK(新 holder 秒级接管)。
+      if (epoch !== null) {
+        const acked = await writeAckShortConn(epoch);
+        if (!acked) {
+          log.error("[leaderLease] 掉线后短连接 ACK 失败 → fail-stop(无法交出 ACK,后继走 liveness)", { epoch });
+          transitioning = false;
+          failStop(`connection-lost ACK short-conn failed (epoch=${epoch})`);
+          return;
+        }
       }
     } finally {
       transitioning = false;
@@ -509,6 +575,48 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
     if (!stopped) {
       setState(opts.eligibleEnv ? (desiredIsSelf() ? "acquiring" : "standby") : "ineligible");
       scheduleRecompete();
+    }
+  }
+
+  /** onFence 归一:结构化 {drained,stuck};void→drained(兼容非 v5 回调);抛错→drained:false(保守 fail-stop)。 */
+  async function drainBundle(reason: string): Promise<FenceDrainOutcome> {
+    try {
+      const r = await Promise.resolve(opts.callbacks.onFence(reason));
+      if (r && typeof r === "object" && typeof (r as FenceDrainOutcome).drained === "boolean") {
+        return { drained: (r as FenceDrainOutcome).drained, stuck: (r as FenceDrainOutcome).stuck ?? [] };
+      }
+      return { drained: true, stuck: [] };
+    } catch (e) {
+      log.error("[leaderLease] onFence 抛错(视为 drain 未完成 → fail-stop)", e);
+      return { drained: false, stuck: ["<onFence-threw>"] };
+    }
+  }
+
+  /**
+   * 独立短连接写本 epoch ACK(掉线 fence 专用)。rowCount=0(新 holder 已安装/epoch 已变)也算成功
+   * (交接已完成,ACK 无意义);仅真实 DB 错误返回 false → 调用方 fail-stop。
+   */
+  async function writeAckShortConn(epoch: number): Promise<boolean> {
+    let c: PoolClient | null = null;
+    try {
+      c = await opts.pool.connect();
+      await c.query(
+        `UPDATE leader_lease SET fenced_ack_epoch = $1, updated_at = now()
+           WHERE singleton = true AND holder_instance_id = $2 AND lease_epoch = $3`,
+        [epoch, selfInstance, epoch],
+      );
+      return true;
+    } catch (e) {
+      log.warn("[leaderLease] 短连接写 ACK 失败", e);
+      return false;
+    } finally {
+      if (c) {
+        try {
+          c.release();
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 

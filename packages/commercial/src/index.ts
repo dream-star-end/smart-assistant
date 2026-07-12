@@ -305,7 +305,6 @@ import {
 } from "./connectors/rpc.js";
 import {
   startConnectorSweeper,
-  type ConnectorSweeperHandle,
 } from "./connectors/sweeper.js";
 import {
   RESEARCH_PREFIX,
@@ -1074,11 +1073,20 @@ export async function registerCommercial(
       desiredWatch: deployDesiredWatch,
       eligibleEnv,
       callbacks: {
+        // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
+        // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
         onAcquire: () => leaderBundle.start(),
         onFence: (reason) => {
           rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
           return leaderBundle.stopAndDrain();
         },
+      },
+      // fail-stop:无法安全持有/交出 leadership(bundle 半启动 / drain 有 stuck / 掉线后 ACK 也失败)时
+      // 退进程,systemd Restart=on-failure 拉起后因 desired 判定以 standby 起,后继经 PID liveness 接管。
+      onFatal: (reason, detail) => {
+        rootLogger.error(`[leaderLease] FAIL-STOP: ${reason}`, { subsys: "leaderLease", detail: (detail as Error)?.message ?? detail });
+        // eslint-disable-next-line no-process-exit
+        process.exit(1);
       },
       logger: {
         info: (m, meta) => rootLogger.info(m, { subsys: "leaderLease", meta }),
@@ -1785,8 +1793,86 @@ export async function registerCommercial(
         }
         return internalProxyHandler!(req, res, ctx);
       };
+      // ── P3 控制口只读端点(RFC D3;私有口 + VIP 共用此 handler)────────────────────
+      // 这两个是 Agent A/C 之间掉的球,现在补上:deploy lane 的 finalize 四门槛 / candidate 自检 /
+      // abort 健康核验都靠它们。在 dispatchInternal(anthropic proxy 路由,不认这些路径)之前拦截。
+      const currentLeadership = (): LeadershipStatus =>
+        leaderLease
+          ? leaderLease.status()
+          : { state: "ineligible", slot: ocSlot, generation: null, leasePid: null };
+      // 私有口 healthz:leadership + vip(owner|released)+ slot —— deploy 脚本据此判断 standby/leader/VIP 归属。
+      const respondControlHealthz = (res: ServerResponse): void => {
+        const vip = controlListener?.status().vipBound ? "owner" : "released";
+        const body = {
+          ok: true, // 本控制口在响应即证明进程存活;深度依赖探活走 /internal/v5/control-probe。
+          channel: runtimeChannel,
+          slot: ocSlot,
+          leadership: currentLeadership(),
+          vip,
+        };
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify(body));
+      };
+      // control-probe:egress secret 校验后自检 dispatcher 路由表 + PG SELECT 1 + "本实例持有 VIP"。
+      const respondControlProbe = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+        const reply = (code: number, obj: Record<string, unknown>): void => {
+          res.statusCode = code;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(obj));
+        };
+        const secret = cfg.OC_EGRESS_SECRET;
+        if (!secret) return reply(503, { ok: false, error: "EGRESS_SECRET_UNSET" });
+        const presented = req.headers["x-oc-egress-secret"];
+        const okSecret =
+          typeof presented === "string" &&
+          (() => {
+            const pBuf = Buffer.from(presented);
+            const eBuf = Buffer.from(secret);
+            return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf);
+          })();
+        if (!okSecret) return reply(401, { ok: false, error: "UNAUTHORIZED" });
+        // ① dispatcher 路由表已装配 ② PG 连通 ③ 本实例持有 VIP
+        const routeTable = typeof dispatchInternal === "function" && typeof internalProxyHandler === "function";
+        let pgOk = false;
+        try {
+          await getPool().query("SELECT 1");
+          pgOk = true;
+        } catch {
+          pgOk = false;
+        }
+        const vipOwner = controlListener?.status().vipBound === true;
+        return reply(200, {
+          ok: routeTable && pgOk && vipOwner,
+          routeTable,
+          pg: pgOk ? "ok" : "error",
+          vipOwner,
+          slot: ocSlot,
+          leadership: currentLeadership(),
+        });
+      };
       // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
       const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
+        // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
+        const urlPath = (req.url ?? "").split("?")[0];
+        if (req.method === "GET" && urlPath === "/healthz") {
+          try { respondControlHealthz(res); } catch { /* socket gone */ }
+          return;
+        }
+        if (req.method === "GET" && urlPath === "/internal/v5/control-probe") {
+          void respondControlProbe(req, res).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error("[commercial] control-probe handler threw:", err);
+            if (!res.headersSent) {
+              try {
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ ok: false, error: "PROBE_INTERNAL" }));
+              } catch { /* socket gone */ }
+            }
+          });
+          return;
+        }
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
         // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
@@ -2285,13 +2371,32 @@ export async function registerCommercial(
       }
     }
 
+    // ── P3 MAJOR 4(compute-pool 三件套双 master 护栏 + 收口债)───────────────────────
+    // preheatV3Image / initComputePool / imagePromote 都向共享 compute_hosts 写状态(desired/loaded
+    // image、quarantine、backfill),属 v3 控制面;它们仍以 **静态 controlPlaneEnabled eager-start,
+    // 未纳入 LeaderBundle**。双 master(v5)下两 slot 的 OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled
+    // 两 slot 都 true → 两 slot 都 eager 跑 = 双写 compute_hosts 竞态;且 imagePromote 以 shared 域 eager
+    // 注册会违反下方"非 leader 不跑 shared"实时不变量。在纳入 bundle 前的硬护栏:v5 下 candidate/incumbent
+    // 任一 slot 都必须显式关掉这些开关,否则 fail-loud 拒起。v3 已下线、v5 镜像本机常驻,compute-pool
+    // 对 v5 本就无用(preheat 是 noop)。【收口债】后续应将 compute-pool 纳入 LeaderBundle 或从 v5 剥离。
+    if (dualMasterEnabled && controlPlaneEnabled) {
+      const preheatOn = process.env.OC_PREHEAT_DISABLED !== "1";
+      const distributeOn = process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1";
+      if (preheatOn || distributeOn) {
+        throw new Error(
+          "[commercial] v5 双 master:compute-pool 三件套(preheat/initComputePool/imagePromote)未纳入 " +
+            "LeaderBundle,eager 跑会在两 slot 双写 v3 compute_hosts 且违反 shared 单跑不变量。须在 v5 " +
+            "drop-in 显式关闭:OC_PREHEAT_DISABLED=1 且 OC_IMAGE_DISTRIBUTE_DISABLED=1(v3 已下线、v5 镜像本机常驻)。拒起。",
+        );
+      }
+    }
+
     // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
     // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。
     // OC_PREHEAT_DISABLED=1 关闭(测试 / 网络受限 / CI)。失败不影响 gateway。
     // P1d 单一权威:preheat + 其内嵌的 compute pool init / image-promote scheduler 都向
-    // 共享 compute_hosts 写状态(desired/loaded image、quarantine、backfill),属 v3 控制面。
-    // 必须先过 controlPlaneEnabled(channel=v5 恒 false → 整块跳过,v5 绝不写共享控制面;
-    // v5 镜像本就在本机,preheat 对 v5 也是 noop)。
+    // 共享 compute_hosts 写状态。v5(dualMaster)已由上方 MAJOR 4 护栏要求显式关闭这些开关;
+    // 走到此处的 v5 一定 preheatOn=false,故本块实际只在非双 master(v3/legacy leader)执行。
     if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== "1") {
       void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
         info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
@@ -3073,6 +3178,11 @@ export async function registerCommercial(
   let wechatBroker: WechatBroker | undefined;
   // controlPlaneEnabled 纳入:broker 启动 outbox worker/reconcile/housekeeping(写 wechat_outbox /
   // soft-delete session / 发 iLink)属共享-state mutator,v5 follower 必须静默。
+  // 【P3 MINOR 3 收口债】wechatBroker 目前以 controlPlaneEnabled 静态 gate + eager start(未纳入
+  // LeaderBundle),且 v5 下被 follower 硬 block(WECHAT_BROKER_ENABLED=1 是禁忌项,见文首 v5 env
+  // 守卫)——即 v5 当前根本不跑 broker,故无双 master 双跑面。**未来若为 v5 解除该 legacy gate
+  // 让 broker 在 v5 上线,它是 shared-domain 单跑 mutator,必须同步纳入 LeaderBundle(add 成 member,
+  // 交给 lease 单 leader 启停),绝不能沿用这套静态 eager gate**,否则双 master 会双发 iLink / 双写 outbox。
   if (controlPlaneEnabled && cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
     // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
     //   sendText → broker
@@ -3863,17 +3973,21 @@ export async function registerCommercial(
   // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
   // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
   // 90 天终态 retention 已迁至统一 auditRetention 注册表(带终态谓词),此处不再删。
-  // 【域归属 v5-owned】connectors 三表是 0130 v5 引入,v3 无代码 → 不写共享现网;
-  // 但 gate 在 controlPlaneEnabled(OC_CONTROL_PLANE_LEADER)防多 v5 实例双跑
-  // (设计 §3:v5 leader 门控)。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
-  let connectorSweeper: ConnectorSweeperHandle | undefined;
-  if (
-    controlPlaneEnabled &&
-    process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1"
-  ) {
-    const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
-    connectorSweeper = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+  // 【域归属 v5-owned + P3 MAJOR 3:迁入 LeaderBundle】connectors 三表是 0130 v5 引入,v3 无代码。
+  // 旧实现 eager-start + gate 在 controlPlaneEnabled(静态 env):双 master 下两 slot env 都=1 →
+  // 双跑(双 expire / 双 DELETE 竞态)。收口进 bundle(单 leader 单跑,与 wecomAlert/cronWake 同),
+  // 启停交给 lease。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
+  if (runtimeChannel === "v5" && process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "connectorSweeper",
+      domain: "v5-owned",
+      start: () => {
+        const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+        const h = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 企业微信群机器人告警投递(v5-owned)。偿「v5 告警只入库不推送」债(playbook 债表
@@ -3948,16 +4062,27 @@ export async function registerCommercial(
       return getLaneMetricsSnapshot();
     },
   };
-  // fail-closed:非 leader(controlPlaneEnabled=false)绝不允许 eager 注册的 shared mutator 存活 ——
-  // 拦"gate 漏配让 follower 写共享现网"。P3 后:bundle 成员(shared 主体)deferred,竞得 lease 才注册,
-  // 此刻(bundle 未启动)不在册,故本同步断言只覆盖 eager 残留(imagePromote/lifecycle 等);
-  // 双 master 的单跑权威已上移 lease(follower env=0→ineligible→永不 start bundle)。
-  const sharedOnFollower = schedulerRegistry.filter((s) => s.domain === "shared").map((s) => s.name);
-  if (!controlPlaneEnabled && sharedOnFollower.length > 0) {
+  // fail-closed:非 leader 绝不允许 shared mutator 存活 —— 拦"gate 漏配让 follower 写共享现网"。
+  // P3 MAJOR 5:判据从**静态 controlPlaneEnabled 改为实时 leadership**。原因:双 master 下两 slot 的
+  // OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled 两 slot 都 true,`!controlPlaneEnabled` 恒 false
+  // → 断言对 v5 follower 完全失效(follower 带 shared mutator 也不报)。改用 leaseController.status()
+  // 的实时 state:!=='leader' 即非 leader。
+  // 【bundle deferred 语义】bundle 的 shared 成员仅在竞得 lease(onAcquire)后才 trackScheduler 注册,
+  // 竞得那刻 state 已='leader' → 不违反。此刻(lease 未 start)state=standby/ineligible,bundle 成员必不在册;
+  // 本同步断言据此拦"bundle shared 成员被漏配成 eager 存活"的情形。
+  // eager 残留(compute-pool 三件套=imagePromote/preheat 已由 MAJOR 4 在 v5 双 master fail-loud 拒起;
+  // lifecycle=agent 容器 GC 仍 eager 跑在所有 v5 slot,收口债未迁 bundle)——它们不是"follower 违规",
+  // 对 v5 从覆盖集剔除;非 v5(无 lease)保持全覆盖旧语义。
+  const liveLeader = leaderLease ? leaderLease.status().state === "leader" : controlPlaneEnabled;
+  const eagerResidual = leaderLease ? new Set(["lifecycle", "imagePromote"]) : new Set<string>();
+  const sharedOnFollower = schedulerRegistry
+    .filter((s) => s.domain === "shared" && !eagerResidual.has(s.name))
+    .map((s) => s.name);
+  if (!liveLeader && sharedOnFollower.length > 0) {
     throw new Error(
-      `[commercial] control-plane invariant violated: follower has shared-domain schedulers active=[${sharedOnFollower.join(
-        ",",
-      )}]. 非 leader 只允许 v5-owned/local 域 mutator。`,
+      `[commercial] control-plane invariant violated: 非 leader(leadership=${
+        leaderLease ? leaderLease.status().state : `env:${controlPlaneEnabled}`
+      })却有 shared-domain 调度器在册=[${sharedOnFollower.join(",")}]。非 leader 只允许 v5-owned/local 域 mutator。`,
     );
   }
   rootLogger.info(
@@ -4048,9 +4173,7 @@ export async function registerCommercial(
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
-      if (connectorSweeper) {
-        try { connectorSweeper.stop(); } catch { /* ignore */ }
-      }
+      // connectorSweeper 已迁入 LeaderBundle(P3 MAJOR 3),由 leaderLease.shutdown()→stopAndDrain 回收,此处不再单独 stop。
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
       }

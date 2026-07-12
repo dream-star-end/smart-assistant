@@ -66,6 +66,10 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
   let vipRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   let unsubDesired: (() => void) | null = null;
+  // VIP bind cancellation epoch(BLOCKER 3):releaseVip/close/desired 翻走时 ++,作废在途 bind。
+  // ensureVip 起手冻结 myEpoch,listen 成功后若 epoch 已变(desired 在 bind 期间翻走)→ 立即
+  // close 刚 bind 的 server、绝不发布 vipServer(否则 candidate 会带着不该有的 VIP 上线)。
+  let vipEpoch = 0;
 
   function desiredIsSelf(): boolean {
     return opts.desiredWatch.current()?.desiredControlSlot === opts.slot;
@@ -119,13 +123,24 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
     if (stopped || vipServer || vipBinding) return;
     if (!desiredIsSelf()) return;
     vipBinding = true;
+    const myEpoch = vipEpoch; // 冻结:bind 期间 releaseVip/close/desired 翻走会 ++,使本次 bind 作废
     const server = makeServer();
-    // 运行时错误(bind 成功后)loud 记录并重建。
-    server.on("error", (err) => {
-      log.error("[controlListener] VIP runtime error", err);
-    });
+    // 已 bind server 的运行时错误:清状态 + 重建(而非只 log)——见 handleVipRuntimeError。
+    server.on("error", (err) => handleVipRuntimeError(server, err));
     try {
       await bindOnce(server, vipAddr);
+      // ⑤ listen 成功后 re-check:epoch 变了(desired 在 bind 期间翻走 / 已 release)或不再 desired
+      //    → 立即 close 刚 bind 的 server,不发布 vipServer(否则 candidate 误带 VIP 上线)。
+      if (stopped || myEpoch !== vipEpoch || !desiredIsSelf()) {
+        vipBinding = false;
+        try {
+          server.close();
+        } catch {
+          /* ignore */
+        }
+        log.info(`[controlListener] VIP bind 完成但 desired 已翻走/被取消,丢弃(slot=${opts.slot})`);
+        return;
+      }
       vipServer = server;
       vipBinding = false;
       log.info(`[controlListener] VIP bound ${vipAddr.host}:${vipAddr.port}(slot=${opts.slot})`);
@@ -138,9 +153,9 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
       }
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "EADDRINUSE") {
-        // 交接窗:旧 slot 尚持 VIP → 2s 后重试(desired 仍=self 时)。
+        // 交接窗:旧 slot 尚持 VIP → 2s 后重试(desired 仍=self 且未被取消时)。
         log.warn(`[controlListener] VIP ${vipAddr.port} EADDRINUSE,${retryMs}ms 后重试(交接窗)`);
-        scheduleVipRetry();
+        scheduleVipRetry(myEpoch);
         return;
       }
       // 非 EADDRINUSE:权限/非法地址/handler 初始化失败。
@@ -152,11 +167,36 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
     }
   }
 
-  function scheduleVipRetry(): void {
+  /**
+   * 已 bind 的 VIP server 运行时 error(bind 成功后 emit):不能只 log。清状态后按 desired 决定
+   * 重建或放弃(desired 仍 self → 重 bind;否则 release)。非当前 vipServer 的陈旧事件忽略。
+   */
+  function handleVipRuntimeError(server: Server, err: unknown): void {
+    if (server !== vipServer) {
+      // 陈旧(已被 release/替换)server 的迟到 error;bind 期间的 error 走 bindOnce 的 reject。
+      log.warn("[controlListener] 陈旧 VIP server runtime error(忽略)", err);
+      return;
+    }
+    log.error("[controlListener] 已 bind 的 VIP server runtime error → 清状态并重建", err);
+    vipServer = null;
+    vipBinding = false;
+    vipEpoch++; // 作废任何在途 bind
+    try {
+      server.close();
+    } catch {
+      /* ignore */
+    }
+    if (!stopped && desiredIsSelf()) {
+      void ensureVip(false);
+    }
+  }
+
+  function scheduleVipRetry(atEpoch: number): void {
     if (stopped || vipRetryTimer) return;
     vipRetryTimer = setTimeout(() => {
       vipRetryTimer = null;
-      if (!stopped && !vipServer && desiredIsSelf()) {
+      // epoch 变了(重试等待期间 desired 翻走 / release)→ 放弃本次重试链。
+      if (!stopped && !vipServer && atEpoch === vipEpoch && desiredIsSelf()) {
         void ensureVip(false);
       }
     }, retryMs);
@@ -165,8 +205,10 @@ export function createControlListener(opts: ControlListenerOptions): ControlList
     }
   }
 
-  /** desired 不再是本 slot → 优雅 close VIP(in-flight 完成,不强断连接)。 */
+  /** desired 不再是本 slot → 优雅 close VIP(in-flight 完成,不强断连接)+ 取消在途 bind(BLOCKER 3)。 */
   async function releaseVip(): Promise<void> {
+    // ++epoch:作废任何 pending 的 bindOnce(它 listen 成功后会因 epoch 失配 self-close)。
+    vipEpoch++;
     clearRetry();
     const server = vipServer;
     vipServer = null;

@@ -26,16 +26,17 @@ describe("LeaderBundle", () => {
     assert.deepEqual(bundle.runningNames().sort(), ["a", "b"]);
   });
 
-  test("stopAndDrain 逐个 stop 并经 onMemberStopped 摘除;runningNames 清空", async () => {
+  test("stopAndDrain 逐个 stop 并经 onMemberStopped 摘除;runningNames 清空;返回 drained:true", async () => {
     const stops: string[] = [];
     const removed: string[] = [];
     const bundle = createLeaderBundle({ onMemberStopped: (n) => removed.push(n) });
     bundle.add({ name: "a", domain: "shared", start: () => ({ stop: () => { stops.push("a"); } }) });
     bundle.add({ name: "b", domain: "shared", start: () => ({ stop: async () => { stops.push("b"); } }) });
     await bundle.start();
-    await bundle.stopAndDrain();
+    const res = await bundle.stopAndDrain();
     assert.deepEqual(stops.sort(), ["a", "b"]);
     assert.deepEqual(removed.sort(), ["a", "b"]);
+    assert.deepEqual(res, { drained: true, stuck: [] });
     assert.equal(bundle.isRunning(), false);
     assert.deepEqual(bundle.runningNames(), []);
   });
@@ -46,13 +47,14 @@ describe("LeaderBundle", () => {
     assert.throws(() => bundle.add({ name: "dup", domain: "shared", start: () => ({ stop: () => {} }) }), /duplicate/);
   });
 
-  test("有界 stopAndDrain:成员 stop 慢于预算也在 timeout 内返回(让位优先)", async () => {
+  test("有界 stopAndDrain 超时:返回 {drained:false, stuck}(BLOCKER 1:不谎报让位,leaseController 据此 fail-stop)", async () => {
     let stopStarted = false;
     const slowStop = new Promise<void>((res) => {
       // 慢 stop(400ms,ref timer):stopAndDrain 预算 100ms 应先返回,不等它完成。
       setTimeout(() => res(), 400);
     });
-    const bundle = createLeaderBundle();
+    const removed: string[] = [];
+    const bundle = createLeaderBundle({ onMemberStopped: (n) => removed.push(n) });
     bundle.add({
       name: "slow",
       domain: "shared",
@@ -60,10 +62,15 @@ describe("LeaderBundle", () => {
     });
     await bundle.start();
     const t0 = Date.now();
-    await bundle.stopAndDrain(100); // 100ms 预算 < 400ms stop
+    const res = await bundle.stopAndDrain(100); // 100ms 预算 < 400ms stop
     const elapsed = Date.now() - t0;
     assert.equal(stopStarted, true);
     assert.ok(elapsed < 350, `stopAndDrain 应在预算附近返回(不等 stop 完成),实际 ${elapsed}ms`);
+    // 核心断言(锁定 BLOCKER 1 修复的行为):超时 → drained:false + stuck=["slow"],**不摘除** stuck 成员。
+    assert.equal(res.drained, false);
+    assert.deepEqual(res.stuck, ["slow"]);
+    assert.deepEqual(removed, [], "stuck 成员绝不 onMemberStopped 摘除(它可能仍在写共享状态)");
+    assert.deepEqual(bundle.runningNames(), ["slow"], "stuck 成员保留在 running(不谎报已停)");
     assert.equal(bundle.isRunning(), false);
     await slowStop; // 等慢 stop 的 timer 结算,清理事件循环(避免 pending-promise 泄漏)
   });
@@ -94,11 +101,28 @@ describe("LeaderBundle", () => {
     assert.deepEqual(bundle.runningNames(), []);
   });
 
-  test("成员 start 抛错不阻断其余成员(各自独立,与旧 eager 语义一致)", async () => {
+  test("required 成员 start 抛错 → 回滚已启动成员 + start reject(BLOCKER 1:start-all-or-fail)", async () => {
+    const starts: string[] = [];
+    const stops: string[] = [];
+    const removed: string[] = [];
+    const bundle = createLeaderBundle({ onMemberStopped: (n) => removed.push(n) });
+    bundle.add({ name: "ok1", domain: "shared", start: () => { starts.push("ok1"); return { stop: () => { stops.push("ok1"); } }; } });
+    bundle.add({ name: "boom", domain: "shared", start: () => { throw new Error("boom"); } }); // required 默认 true
+    bundle.add({ name: "ok2", domain: "shared", start: () => { starts.push("ok2"); return { stop: () => { stops.push("ok2"); } }; } });
+    // required 成员起不来 → 整 bundle 回滚 + 抛(leaseController 据此 fail-stop,绝不带半启动 leader 运行)。
+    await assert.rejects(() => bundle.start(), /boom/);
+    assert.deepEqual(starts, ["ok1"], "boom 之后的 ok2 不再启动");
+    assert.deepEqual(stops, ["ok1"], "已起的 ok1 被回滚 stop");
+    assert.deepEqual(removed, ["ok1"]);
+    assert.equal(bundle.isRunning(), false);
+    assert.deepEqual(bundle.runningNames(), []);
+  });
+
+  test("best-effort 成员(required:false)start 抛错不阻断其余(保留旧 eager 语义)", async () => {
     const starts: string[] = [];
     const bundle = createLeaderBundle();
     bundle.add({ name: "ok1", domain: "shared", start: () => { starts.push("ok1"); return { stop: () => {} }; } });
-    bundle.add({ name: "boom", domain: "shared", start: () => { throw new Error("boom"); } });
+    bundle.add({ name: "boom", domain: "shared", required: false, start: () => { throw new Error("boom"); } });
     bundle.add({ name: "ok2", domain: "shared", start: () => { starts.push("ok2"); return { stop: () => {} }; } });
     await bundle.start();
     assert.deepEqual(starts.sort(), ["ok1", "ok2"]);

@@ -8,5 +8,7 @@
   "capabilities": [
     "sessions-store-pg-v1",
     "dual-master-v1"
-  ]
+  ],
+  "bridgeFrameSchema": "1",
+  "runtimeApi": "1"
 }

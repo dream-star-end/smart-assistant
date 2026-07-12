@@ -32,13 +32,17 @@ CREATE TABLE IF NOT EXISTS deploy_state (
 );
 
 -- seed 即现状(基建版零行为变化)。ON CONFLICT DO NOTHING 保证迁移幂等 + 不覆盖已有运行态。
+-- active_release=NULL(不是占位 'bootstrap'):迁移只建表,尚不知真实 rel-* 目录名;基建版跑一次
+-- 传统 deploy(activate_release 成功后)会把 deploy_state.active_release 校准成真实 release 路径。
+-- canary 起手断言 active_release 非 NULL 且目录存在——防"迁移刚 apply、从未传统 deploy、active_release
+-- 是假占位"时误起 canary(candidate 的 capability preflight 会拿假 active release 做兼容比较,BLOCKER 6)。
 INSERT INTO deploy_state (
   singleton, generation, phase, active_slot, candidate_slot,
   active_release, candidate_release, desired_leader_slot, desired_control_slot,
   cohort_percent, cohort_salt, cohort_allowlist, lock_version, transition_step, operation_id
 ) VALUES (
   true, 1, 'stable', 'A', NULL,
-  'bootstrap', NULL, 'A', 'A',
+  NULL, NULL, 'A', 'A',
   0, '', '{}', 1, 0, NULL
 )
 ON CONFLICT (singleton) DO NOTHING;

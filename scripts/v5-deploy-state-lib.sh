@@ -81,12 +81,37 @@ ds_load() {
     DS_cohort_percent DS_cohort_salt DS_transition_step DS_operation_id DS_lock_version <<<"$row"
 }
 
-# ── CAS 写:UPDATE ... SET <set-clause>, lock_version=lock_version+1
-#     WHERE lock_version=$expect RETURNING lock_version ──
+# ── CAS 写(+ 可选 journal,原子同事务)──
+#     UPDATE ... SET <set-clause>, lock_version+1 WHERE lock_version=$expect RETURNING lock_version
 # 成功回传新 lock_version(stdout);CAS 落空(并发已推进)回传空串且 rc=0(调用方判空→重读恢复)。
 # set-clause 由调用方以合法 SQL 片段传入(如 "phase='canary', transition_step=0")。
-ds_cas() {  # $1=expect_lock_version  $2=set_clause
-  local expect="$1" set_clause="$2"
+#
+# 【MAJOR 1:CAS 与 journal 必须同一事务】给了 op/step/action 时用**数据修改 CTE 单语句**
+# (upd → j),PostgreSQL 保证 WITH 内所有子句同快照原子提交:CAS 命中才产生 upd 行,journal 的
+# `INSERT ... SELECT FROM upd` 才落一行;CAS 落空 upd 为空 → 不插 journal、SELECT 回空。这样彻底消
+# 除"状态已推进但 journal 半条/无"的崩溃诊断误导(旧实现两次 psql = 两事务,中途崩溃即撕裂)。
+ds_cas() {  # $1=expect_lock_version  $2=set_clause  [$3=op $4=step $5=action]
+  local expect="$1" set_clause="$2" op="${3:-}" step="${4:-}" action="${5:-}"
+  if [[ -n "$op" && -n "$step" ]]; then
+    local op_lit action_lit
+    op_lit="$(ds_lit "$op")"; action_lit="$(ds_lit "$action")"
+    ds_exec <<SQL
+WITH upd AS (
+  UPDATE deploy_state
+     SET $set_clause,
+         lock_version = lock_version + 1,
+         updated_at   = now()
+   WHERE lock_version = $expect
+  RETURNING lock_version
+), j AS (
+  INSERT INTO deploy_state_journal (operation_id, step, action)
+  SELECT '$op_lit', $step, '$action_lit' FROM upd
+  RETURNING 1
+)
+SELECT lock_version FROM upd;
+SQL
+    return
+  fi
   ds_exec <<SQL
 UPDATE deploy_state
    SET $set_clause,

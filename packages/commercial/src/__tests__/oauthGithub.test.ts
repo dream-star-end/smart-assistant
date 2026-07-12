@@ -24,6 +24,7 @@ import type { QueryRunner } from '../db/queries.js'
 import { exchangeGithubOAuth } from '../auth/github.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { handleGithubCallback, handleGithubStart } from '../http/oauthGithub.js'
+import { consumeOAuthPendingState } from '../auth/oauthPendingStore.js'
 
 // ─── Test KMS key (pending payload 加密) ─────────────────────────────
 const TEST_KMS_KEY = Buffer.alloc(32, 0xcd)
@@ -267,17 +268,22 @@ describe('handleGithubCallback', () => {
     assert.match(fakeRes.headers.Location as string, /github_error=state_mismatch/)
   })
 
-  test('provider error param → redirect ?github_error=exchange_failed (不消费 pending)', async () => {
-    const state = 'literalstate123'
+  test('provider error param → redirect ?github_error=exchange_failed + 顺手消费 pending(MINOR 2)', async () => {
+    const runner = makeFakePendingRunner()
+    const state = await doStart('7', runner) // 先 seed 一条 pending
     const encoded = encodeURIComponent(state)
     const req = makeReq({
       url: `/api/auth/github/callback?state=${encoded}&error=access_denied`,
       cookie: `oc_oauth_gh_state=${encoded}`,
     })
     const fakeRes = makeRes()
-    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps())
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps(), { pendingRunner: runner })
     assert.equal(fakeRes.statusCode, 302)
     assert.match(fakeRes.headers.Location as string, /github_error=exchange_failed/)
+    // MINOR 2:state 双因素已过 → provider-error 分支 best-effort 消费 pending row(原子 DELETE);
+    // 再次 consume 命中 0 行(null),证明悬挂行已清。
+    const replay = await consumeOAuthPendingState({ provider: 'github', state, runner })
+    assert.equal(replay, null, 'provider-error 分支应已消费 pending row')
   })
 
   test('start→callback 真回环:consume 拿回 userId → exchange + save → /?github_linked=1', async () => {

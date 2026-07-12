@@ -110,10 +110,12 @@ export async function handleGithubStart(
 
   const result = startGithubOAuth({ cfg })
   // pending state 迁 PG:state→userId 绑定原子落库(跨 slot callback 天然成立)。
+  // MINOR 1:payload 里 userId **保持字符串**(user.id 本就是 bigint-as-string)——不 Number() 强转,
+  // 避免大 uid 精度丢失;到 DB 边界(saveGithubLink 要 number)再局部收敛。
   await putOAuthPendingState({
     provider: 'github',
     state: result.state,
-    payload: { userId: Number(user.id) },
+    payload: { userId: user.id },
     runner: overrides.pendingRunner,
     key: overrides.pendingKey,
   })
@@ -168,6 +170,14 @@ export async function handleGithubCallback(
   // 2) GitHub 把用户带回时带 ?error=… (如用户拒绝授权)
   if (queryError) {
     ctx.log.info('github_callback_provider_error', { error: queryError })
+    // MINOR 2:state 已双因素校验通过,顺手消费(原子 DELETE)对应 pending row —— 用户拒授权后
+    // 那条 pending 已无用,best-effort 清掉不留悬挂行(不成功也不影响错误跳转)。
+    await consumeOAuthPendingState({
+      provider: 'github',
+      state: queryState,
+      runner: overrides.pendingRunner,
+      key: overrides.pendingKey,
+    }).catch(() => { /* best-effort 清理,失败由 TTL/GC 兜底 */ })
     sendRedirect(res, githubErrorRedirect('exchange_failed'))
     return
   }
@@ -199,12 +209,13 @@ export async function handleGithubCallback(
     key: overrides.pendingKey,
   })
   const rawUserId = pending?.userId
-  if (typeof rawUserId !== 'number') {
+  if (typeof rawUserId !== 'string') {
     ctx.log.warn('github_callback_pending_miss', {})
     sendRedirect(res, githubErrorRedirect('state_mismatch'))
     return
   }
-  const userId: number = rawUserId
+  // MINOR 1:payload userId 是字符串;DB 边界(saveGithubLink 要 number)在此局部收敛。
+  const userId: string = rawUserId
 
   // 5) 用 code 换 access_token + user profile
   let exchanged: Awaited<ReturnType<typeof exchangeGithubOAuth>>
@@ -224,7 +235,7 @@ export async function handleGithubCallback(
   try {
     await saveGithubLink({
       pool,
-      userId,
+      userId: Number(userId), // tokenStore 以 number 建模 user_id;payload 侧保持字符串,仅此边界收敛
       profile: {
         githubUserId: exchanged.githubUser.id,
         login: exchanged.githubUser.login,

@@ -232,6 +232,40 @@ describe("controlListener bind / VIP 生命周期", () => {
     assert.equal((await httpGet(vip.port)).body, "ok");
   });
 
+  it("⑥ bind pending(EADDRINUSE 重试中)时 desired 翻走 → releaseVip 取消在途 bind,释放端口后不 bind(BLOCKER 3)", async () => {
+    const vip = { host: "127.0.0.1", port: 39914 };
+    const priv = { host: "127.0.0.1", port: 39916 };
+    // 占住 VIP 口 → start() 走 EADDRINUSE 重试路径(bind pending)。
+    const blocker = await occupyPort(vip.port);
+    openServers.add(blocker);
+
+    const watch = makeFakeWatch("A");
+    listener = createControlListener({
+      slot: "A",
+      desiredWatch: watch,
+      handler: okHandler,
+      vip,
+      privateAddr: priv,
+      eaddrInUseRetryMs: 80,
+    });
+    await listener.start();
+    assert.equal(listener.status().vipBound, false); // EADDRINUSE,重试中
+
+    // desired 翻走(A→B):releaseVip 应 ++epoch 取消在途 bind 重试链。
+    watch.set(snapshot("B"));
+    await waitFor(() => listener!.status().vipDesired === false);
+
+    // 释放占位端口:即使 VIP 口现在空了,因 desired 已=B(且 epoch 已变),绝不 bind。
+    await closeServer(blocker);
+    openServers.delete(blocker);
+    await sleep(300); // 跨过数个重试周期
+    assert.equal(listener.status().vipBound, false, "desired 翻走后即使端口空出也不得 bind");
+    // 端口应仍可被他人占用(证明 controlListener 没抢它)。
+    const reoccupy = await occupyPort(vip.port);
+    openServers.add(reoccupy);
+    assert.ok(reoccupy.listening, "VIP 口应仍空闲(controlListener 未误 bind)");
+  });
+
   it("⑤ 私有口 fail-loud:占住私有口 → start reject", async () => {
     const vip = { host: "127.0.0.1", port: 39910 };
     const priv = { host: "127.0.0.1", port: 39912 };

@@ -223,8 +223,12 @@ render_from_state() {
     return 0
   fi
   ds_load || { echo "✗ 无法读取 deploy_state(未 seed / PG 不可达)" >&2; return 1; }
-  echo "  · deploy_state: gen=$DS_generation phase=$DS_phase step=$DS_transition_step active=$DS_active_slot candidate=${DS_candidate_slot:-<none>}" >&2
-  gen_caddyfile "$DS_generation" "$DS_phase" "$DS_transition_step" "$DS_active_slot" "$DS_candidate_slot"
+  # MAJOR 2:DS_RENDER_STEP_OVERRIDE 让 finalize 能"先按 step2 语义渲染默认→candidate + reload + 硬验证,
+  # 成功后才 CAS transition_step=2"——避免"记录 step2 但 Caddy 未真正切/未验证"的状态-现实撕裂。
+  local step="$DS_transition_step"
+  [[ -n "${DS_RENDER_STEP_OVERRIDE:-}" ]] && step="$DS_RENDER_STEP_OVERRIDE"
+  echo "  · deploy_state: gen=$DS_generation phase=$DS_phase step=$step(db=$DS_transition_step) active=$DS_active_slot candidate=${DS_candidate_slot:-<none>}" >&2
+  gen_caddyfile "$DS_generation" "$DS_phase" "$step" "$DS_active_slot" "$DS_candidate_slot"
 }
 
 # ── 离线双态自检(不碰 PG/远端):seed 纯加法不变量 + canary matcher 精确性 ──
@@ -317,21 +321,35 @@ verify_routing() {
   echo "── 验证分流(默认 → active;canary READY 时附带 lane cookie 探测)──"
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 探默认 /healthz(应 active);canary READY 时带 lane cookie 探 candidate"; return 0; }
   ds_load || { echo "✗ 读 deploy_state 失败" >&2; return 1; }
-  local active_port; active_port="$(slot_port "$DS_active_slot")"
-  # 默认(无 lane cookie):经 Caddy 回源应命中 active,healthz ok
+  local step="$DS_transition_step"
+  [[ -n "${DS_RENDER_STEP_OVERRIDE:-}" ]] && step="$DS_RENDER_STEP_OVERRIDE"
+  # 期望默认 slot(与 gen_caddyfile 同逻辑):finalizing ∧ step>=2 → candidate;否则 active。
+  local exp_default="$DS_active_slot"
+  if [[ "$DS_phase" == "finalizing" && -n "$DS_candidate_slot" && "$step" -ge 2 ]]; then exp_default="$DS_candidate_slot"; fi
+  local exp_default_port; exp_default_port="$(slot_port "$exp_default")"
+  # 默认(无 lane cookie):经 Caddy 回源应命中 exp_default,healthz ok
   local dresp; dresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' http://127.0.0.1:80/healthz" 2>/dev/null || true)"
-  echo "  默认 /healthz(应 active=$DS_active_slot:$active_port): $dresp"
-  [[ -z "$dresp" ]] && { echo "✗ 默认请求无响应(active 受影响!)" >&2; return 1; }
+  echo "  默认 /healthz(应 slot=$exp_default:$exp_default_port): $dresp"
+  [[ -z "$dresp" ]] && { echo "✗ 默认请求无响应(受影响!)" >&2; return 1; }
   echo "$dresp" | grep -q '"ok":true' || { echo "✗ 默认 /healthz ok!=true" >&2; return 1; }
-  # canary READY:带当前代次 lane cookie 应命中 candidate
-  if [[ "$DS_phase" == "canary" || "$DS_phase" == "finalizing" ]] && [[ -n "$DS_candidate_slot" ]] && [[ "$DS_transition_step" -ge "$DS_STEP_CANARY_READY" ]]; then
+  # BLOCKER 5②:断言响应**确实来自期望 slot**(healthz 顶层/leadership 的 slot 字段),而非只看 ok:true。
+  echo "$dresp" | grep -q "\"slot\":\"$exp_default\"" || {
+    echo "✗ 默认路由响应 slot != $exp_default(路由未生效或落错 slot;healthz 缺 slot 字段=master 过旧)。拒绝。" >&2
+    return 1
+  }
+  # canary/finalizing READY:带当前代次 lane cookie 应命中 candidate 且响应 slot=candidate
+  if [[ "$DS_phase" == "canary" || "$DS_phase" == "finalizing" ]] && [[ -n "$DS_candidate_slot" ]] && [[ "$step" -ge "$DS_STEP_CANARY_READY" ]]; then
     local cport cookie cresp; cport="$(slot_port "$DS_candidate_slot")"
     cookie="oc_v5lane=g${DS_generation}.${DS_candidate_slot}"
     cresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' -H 'Cookie: $cookie' http://127.0.0.1:80/healthz" 2>/dev/null || true)"
     echo "  lane cookie=$cookie /healthz(应 candidate=$DS_candidate_slot:$cport): $cresp"
     echo "$cresp" | grep -q '"ok":true' || { echo "✗ lane cookie 未命中健康 candidate" >&2; return 1; }
+    echo "$cresp" | grep -q "\"slot\":\"$DS_candidate_slot\"" || {
+      echo "✗ lane cookie 响应 slot != candidate($DS_candidate_slot)(matcher 未生效/落错 slot)。拒绝。" >&2
+      return 1
+    }
   fi
-  echo "✓ 分流验证通过"
+  echo "✓ 分流验证通过(默认 slot=$exp_default 已核实)"
 }
 
 # main guard:被 source(如单测 gen_caddyfile)时只定义函数,不执行任何 mode。

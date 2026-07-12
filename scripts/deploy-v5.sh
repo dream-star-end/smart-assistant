@@ -807,6 +807,32 @@ activate_release() {
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
   ssh "$KL_HOST" "systemctl restart '$V5_UNIT'" || { echo "✗ restart 失败——symlink 已指新 release,须人工 restart/回切" >&2; exit 1; }
   run "sleep 4"
+  # BLOCKER 6:基建版部署即校准 deploy_state.active_release=真实 rel 路径(seed 是 NULL)。
+  ds_calibrate_active_release "$reldir"
+}
+
+# 传统 deploy 的 activate_release 成功后,把 deploy_state.active_release 校准成真实 rel 目录名
+# (0135 seed=NULL)。仅当 active_slot='A'(REMOTE_SRC 是 A 的源;post-finalize active=B 时不 clobber)。
+# best-effort:0135 未 apply / PG 不可达只告警,绝不让传统 deploy 失败(保留 pre-deploy_state 的 11s 语义)。
+ds_calibrate_active_release() {
+  local reldir="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校准 deploy_state.active_release='$reldir'(WHERE active_slot='A')"
+    return 0
+  fi
+  local rl; rl="$(ds_lit "$reldir")"
+  local out
+  out="$(ds_exec 2>/dev/null <<SQL || true
+UPDATE deploy_state SET active_release='$rl', updated_at=now()
+ WHERE singleton = true AND active_slot = 'A' AND active_release IS DISTINCT FROM '$rl'
+RETURNING active_release;
+SQL
+)"
+  if [[ -n "$out" ]]; then
+    echo "  ✓ deploy_state.active_release 校准=$reldir"
+  else
+    echo "  · deploy_state.active_release 未变(已一致 / active_slot≠A / 表未 seed——基建版首部署须先 apply 0135)"
+  fi
 }
 
 # GC:保留最近 RELEASES_KEEP 个 release,删更老;**绝不删** current / .prev-release / master 与
@@ -1709,7 +1735,12 @@ ds_cas_or_die() {
     return 0
   fi
   local newlv
-  newlv="$(ds_cas "$DS_lock_version" "$set_clause")" || { echo "✗ CAS 执行失败(psql 错误)" >&2; exit 1; }
+  # MAJOR 1:CAS + journal 同一事务(ds_cas 给了 op/step/action 时走原子 CTE);无 step 则纯 CAS。
+  if [[ -n "$step" ]]; then
+    newlv="$(ds_cas "$DS_lock_version" "$set_clause" "$OP" "$step" "$action")" || { echo "✗ CAS 执行失败(psql 错误)" >&2; exit 1; }
+  else
+    newlv="$(ds_cas "$DS_lock_version" "$set_clause")" || { echo "✗ CAS 执行失败(psql 错误)" >&2; exit 1; }
+  fi
   if [[ -z "$newlv" ]]; then
     echo "✗ CAS 落空:lock_version=$DS_lock_version 已被并发/崩溃重跑推进。" >&2
     echo "  勿盲目重跑本 lane;用 deploy-v5.sh --recover 从 (phase, transition_step) 按 §8 续作。" >&2
@@ -1717,7 +1748,6 @@ ds_cas_or_die() {
   fi
   DS_lock_version="$newlv"
   ds_load   # 重载最新行(拿到刚写入字段:operation_id/candidate_slot 等)
-  [[ -n "$step" ]] && ds_journal "$OP" "$step" "$action"
 }
 
 # 断言当前 phase ∈ 允许集(dry-run:仅提示)。$@=允许的 phase 列表
@@ -1732,6 +1762,26 @@ slot_priv_healthz() {
   local slot="$1" priv; priv="$(slot_priv "$slot")"
   if [[ "$DRY" == 1 ]]; then echo '{"ok":true,"channel":"v5","leadership":{"state":"standby","slot":"'"$slot"'"},"vip":"released"}'; return 0; fi
   ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${priv}/healthz" 2>/dev/null || true
+}
+
+# BLOCKER 5⑤:有界轮询等待某 slot 私有口 healthz 到达 leadership=leader(want_vip=1 时并要求 vip=owner)。
+# 取代固定 sleep 8/6。$1=slot $2=want_vip(0|1) $3=timeout秒(默认60)。2s 间隔;达成 return 0,超时 return 1。
+wait_for_slot_leadership() {
+  local slot="$1" want_vip="${2:-0}" timeout="${3:-60}" waited=0 hz
+  echo "── 有界轮询等待 slot=$slot leadership=leader$([[ "$want_vip" == 1 ]] && echo '+vip=owner')(≤${timeout}s,2s 间隔)──"
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] 轮询等待(跳过)"; return 0; fi
+  while [[ "$waited" -lt "$timeout" ]]; do
+    hz="$(slot_priv_healthz "$slot")"
+    if echo "$hz" | grep -q '"state":"leader"'; then
+      if [[ "$want_vip" != 1 ]] || echo "$hz" | grep -q '"vip":"owner"'; then
+        echo "  ✓ slot=$slot 已 leader$([[ "$want_vip" == 1 ]] && echo '+VIP owner')(等待 ${waited}s)"
+        return 0
+      fi
+    fi
+    sleep 2; waited=$((waited+2))
+  done
+  echo "  ⚠ 等待 ${timeout}s 仍未达成 leadership=leader$([[ "$want_vip" == 1 ]] && echo '+vip=owner')" >&2
+  return 1
 }
 
 # candidate 起手自检(RFC D5 canary step3):私有口健康 + channel=v5 + leadership=standby + VIP 未 bind。
@@ -1750,30 +1800,64 @@ candidate_self_check() {
   echo "  ✓ candidate 自检通过(standby,未抢 VIP)"
 }
 
+# 版本兼容判定(MAJOR 7):candidate 与 active 的某版本字段必须**相等**,或命中显式兼容表
+# OC_CAPMATRIX_COMPAT(逗号分隔 "<key>:<activeVer>~<candidateVer>",如 "bridgeFrameSchema:1~2")。
+# $1=key $2=activeVer $3=candidateVer → 兼容 return 0。
+_capmatrix_version_compat() {
+  local key="$1" av="$2" cv="$3" entry
+  [[ "$av" == "$cv" ]] && return 0
+  local IFS=','
+  for entry in ${OC_CAPMATRIX_COMPAT:-}; do
+    [[ "$entry" == "$key:$av~$cv" ]] && return 0
+  done
+  return 1
+}
+
 # capability matrix preflight(RFC D5 canary step4 / R1 M7):
 #  ① candidate release-metadata capabilities 含 sessions-store-pg-v1 + dual-master-v1
 #  ② active release 也须含 dual-master-v1(双 master 同容器 bridge 帧兼容前提)
-#  ③ sw.js 字节一致(RFC §2 R3 M2:SW=release-neutral 平台资产,cohort 灰度不携带 SW 变更)
+#  ③ 版本兼容(MAJOR 7):bridgeFrameSchema / runtimeApi 在 candidate 与 active 间相等或显式兼容
+#     (新 master↔旧容器 bridge 帧 / 新 master↔旧前端 runtime API 的双 master 同容器共存前提)
+#  ④ sw.js 门(MAJOR 6):两边都有且字节同,或两边都无;一有一无=拒绝(origin-global SW 不随 cohort 灰度)
 capability_matrix_preflight() {
   local active_rel="$1" candidate_rel="$2"
-  echo "── capability matrix preflight(sessions-store-pg-v1 + dual-master-v1 + sw.js 字节一致)──"
-  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] jq 校验 $candidate_rel/deploy/v5/release-metadata.json + cmp sw.js"; return 0; fi
+  echo "── capability matrix preflight(capabilities + bridgeFrameSchema/runtimeApi 版本兼容 + sw.js 门)──"
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] jq 校验 capabilities + 比较 bridgeFrameSchema/runtimeApi(相等或 OC_CAPMATRIX_COMPAT)+ sw.js 两边同有/同无"; return 0; fi
+  local cma="$active_rel/deploy/v5/release-metadata.json" cmc="$candidate_rel/deploy/v5/release-metadata.json"
   local req="sessions-store-pg-v1 dual-master-v1" cap miss=""
   for cap in $req; do
-    ssh "$KL_HOST" "jq -e --arg c '$cap' '(.capabilities // []) | index(\$c)' '$candidate_rel/deploy/v5/release-metadata.json'" >/dev/null 2>&1 \
+    ssh "$KL_HOST" "jq -e --arg c '$cap' '(.capabilities // []) | index(\$c)' '$cmc'" >/dev/null 2>&1 \
       || miss="$miss $cap"
   done
   [[ -z "$miss" ]] || { echo "✗ candidate release 缺 capability:$miss" >&2; return 1; }
-  ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$active_rel/deploy/v5/release-metadata.json'" >/dev/null 2>&1 \
+  ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$cma'" >/dev/null 2>&1 \
     || { echo "✗ active release 未声明 dual-master-v1 —— 双 master 不兼容,拒绝 canary(active 须先经基建版升级)" >&2; return 1; }
-  # sw.js 字节一致
+  # ③ 版本字段兼容(MAJOR 7):bridgeFrameSchema / runtimeApi
+  local key av cv
+  for key in bridgeFrameSchema runtimeApi; do
+    av="$(ssh "$KL_HOST" "jq -r --arg k '$key' '.[\$k] // \"MISSING\"' '$cma'" 2>/dev/null || echo MISSING)"
+    cv="$(ssh "$KL_HOST" "jq -r --arg k '$key' '.[\$k] // \"MISSING\"' '$cmc'" 2>/dev/null || echo MISSING)"
+    [[ "$av" != "MISSING" && "$cv" != "MISSING" ]] || {
+      echo "✗ release-metadata 缺 $key 版本字段(active=$av candidate=$cv)。双 master 版本兼容矩阵要求显式声明,拒绝。" >&2; return 1; }
+    if _capmatrix_version_compat "$key" "$av" "$cv"; then
+      echo "  ✓ $key 兼容(active=$av candidate=$cv$([[ "$av" != "$cv" ]] && echo ',经 OC_CAPMATRIX_COMPAT'))"
+    else
+      echo "✗ $key 不兼容(active=$av candidate=$cv;既不相等也不在 OC_CAPMATRIX_COMPAT 兼容表)。双 master 同容器 bridge 帧/runtime API 不兼容,拒绝 canary。" >&2; return 1
+    fi
+  done
+  # ④ sw.js 门(MAJOR 6):两边同有(字节同)/ 两边同无 = 通过;一有一无 = 拒绝。
   local swa="$active_rel/packages/web-react/dist/sw.js" swb="$candidate_rel/packages/web-react/dist/sw.js"
-  if ssh "$KL_HOST" "test -f '$swa' && test -f '$swb'"; then
+  local swa_ex swb_ex
+  ssh "$KL_HOST" "test -f '$swa'" && swa_ex=1 || swa_ex=0
+  ssh "$KL_HOST" "test -f '$swb'" && swb_ex=1 || swb_ex=0
+  if [[ "$swa_ex" == 1 && "$swb_ex" == 1 ]]; then
     ssh "$KL_HOST" "cmp -s '$swa' '$swb'" \
       || { echo "✗ active/candidate 的 sw.js 字节不一致 —— SW 是 origin-global release-neutral 资产(RFC §2 R3 M2),SW 变更须走协调全量发布,不随 cohort 灰度。拒绝 canary。" >&2; return 1; }
-    echo "  ✓ sw.js 字节一致"
+    echo "  ✓ sw.js 两边都有且字节一致"
+  elif [[ "$swa_ex" == 0 && "$swb_ex" == 0 ]]; then
+    echo "  ✓ sw.js 两边都无(无 Service Worker,合法)"
   else
-    echo "  ⚠ 未找到 sw.js(active 或 candidate);若前端含 SW 请核查(TODO:sw.js 缺失是否合法取决于构建产物)"
+    echo "✗ sw.js 一有一无(active 存在=$swa_ex / candidate 存在=$swb_ex)—— 新增/移除 SW = origin-global 行为变更,必须走协调全量发布而非 cohort 灰度。拒绝 canary。" >&2; return 1
   fi
   echo "  ✓ capability matrix 通过"
 }
@@ -1783,18 +1867,60 @@ capability_matrix_preflight() {
 # 仍留在各 release 目录,由各 slot master 直服 → active/candidate 用户各拿本 lane 前端。
 sync_assets_to_pool() {
   local reldir="$1"
-  echo "── 同步 assets → union 池 $V5_ASSETS_POOL/assets(加法)+ 14d GC ──"
+  echo "── 同步 assets → union 池 $V5_ASSETS_POOL/assets(加法,无 --delete)──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] mkdir -p $V5_ASSETS_POOL/assets; rsync -a(加法,无 --delete) $reldir/packages/web-react/dist/assets/ → 池; find -mtime +14 -delete(保护 in-use)"
+    echo "  [dry-run] mkdir -p $V5_ASSETS_POOL/assets; rsync -a(加法) $reldir/packages/web-react/dist/assets/ → 池"
+  else
+    ssh "$KL_HOST" "set -e
+      mkdir -p '$V5_ASSETS_POOL/assets'
+      if [ -d '$reldir/packages/web-react/dist/assets' ]; then
+        rsync -a '$reldir/packages/web-react/dist/assets/' '$V5_ASSETS_POOL/assets/'
+      fi" 2>&1 | sed 's/^/  /' || true
+  fi
+  gc_assets_pool "$reldir"
+}
+
+# BLOCKER 6②:/assets union 池 GC 改**显式保护集**。旧实现"删 mtime>14d"隐性依赖"in-use 资产每次
+# rsync 刷新 mtime"——一旦某 release 长期不 redeploy(如稳定 active 数周不动),它引用但未被任何新
+# rsync 触碰的 chunk 会 mtime 过期被误删,老浏览器谱系/跨 lane 懒加载 404。改为:遍历 active/candidate/
+# 回滚代(.prev-release)+ 本次 reldir 四个 release 的 dist/assets 文件名并集为保护集,只删"不在保护集
+# **且** mtime>14d"的文件(保护集内的资产不论多老都不删)。
+gc_assets_pool() {
+  local reldir="$1"
+  echo "── /assets 池 GC(显式保护集=active/candidate/.prev-release/本次 release 的 dist/assets 并集;只删非保护且 >14d)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 收集四 release 的 dist/assets 文件名并集为保护集;删池内不在保护集且 mtime>14d 的文件"
     return 0
   fi
+  # 从 deploy_state 取 active/candidate release(权威);best-effort(未 seed → 空,靠 reldir + prev + mtime 底线兜底)。
+  local rels active_rel candidate_rel
+  rels="$(ds_exec 2>/dev/null <<'SQL' || true
+SELECT coalesce(active_release,'') || '|' || coalesce(candidate_release,'') FROM deploy_state WHERE singleton = true;
+SQL
+)"
+  IFS='|' read -r active_rel candidate_rel <<<"${rels:-|}"
   ssh "$KL_HOST" "set -e
-    mkdir -p '$V5_ASSETS_POOL/assets'
-    if [ -d '$reldir/packages/web-react/dist/assets' ]; then
-      rsync -a '$reldir/packages/web-react/dist/assets/' '$V5_ASSETS_POOL/assets/'
-    fi
-    # 14 天 GC:仅删久未 ship 的旧资产;双在役 release 的资产 mtime 每次 rsync 刷新 → 天然受保护。
-    find '$V5_ASSETS_POOL/assets' -type f -mtime +14 -delete 2>/dev/null || true" 2>&1 | sed 's/^/  /' || true
+    POOL='$V5_ASSETS_POOL/assets'
+    [ -d \"\$POOL\" ] || exit 0
+    prev=\$(cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true)
+    protect=\$(mktemp)
+    for r in '$(ds_lit "$reldir")' '$(ds_lit "$active_rel")' '$(ds_lit "$candidate_rel")' \"\$prev\"; do
+      [ -n \"\$r\" ] || continue
+      case \"\$r\" in /*) d=\"\$r\" ;; *) d=\"$RELEASES_ROOT/\$r\" ;; esac
+      ad=\"\$d/packages/web-react/dist/assets\"
+      if [ -d \"\$ad\" ]; then ls -1 \"\$ad\" >> \"\$protect\" 2>/dev/null || true; fi
+    done
+    sort -u \"\$protect\" -o \"\$protect\"
+    prot_n=\$(wc -l < \"\$protect\" 2>/dev/null || echo 0)
+    echo \"  保护集资产数=\$prot_n(来自 active/candidate/prev/本次 release)\"
+    del=0
+    while IFS= read -r f; do
+      b=\$(basename \"\$f\")
+      if grep -qxF \"\$b\" \"\$protect\"; then continue; fi
+      rm -f \"\$f\" && del=\$((del+1))
+    done < <(find \"\$POOL\" -type f -mtime +14)
+    echo \"  已删非保护且>14d 资产数=\$del\"
+    rm -f \"\$protect\"" 2>&1 | sed 's/^/  /' || true
 }
 
 # 调 v5-caddy-apply.sh 把当前 deploy_state 反映进 Caddy(渲染+validate+reload)。dry:透传 --dry-run。
@@ -1849,6 +1975,18 @@ _egress_health() {
   if [[ "$DRY" == 1 ]]; then echo '{"role":"egress","processStartId":"dry-1","pendingCostEvents":0,"enqueuedTotal":100,"sentTotal":100,"expiredDropsTotal":0,"overflowDropsTotal":0}'; return 0; fi
   ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true
 }
+# BLOCKER 5③:egress 计数字段严格数字校验。非数字(NA / 缺字段 / 脏值)= 拒绝(除非显式豁免),
+# 绝不让 "NA" 落进 $((...)) 被当 0 静默算出"守恒"假绿。$1=字段值 $2=字段名。
+_egress_num_or_die() {
+  local v="$1" name="$2"
+  if [[ "$v" =~ ^[0-9]+$ ]]; then return 0; fi
+  if [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]]; then
+    echo "  ⚠ egress 计数 $name='$v' 非数字,OC_FINALIZE_SKIP_EGRESS_GATE=1 已放行(危险,登记债)" >&2
+    return 0
+  fi
+  echo "✗ egress 计数 $name='$v' 非数字(NA/缺字段/脏值)。RFC D3 计数守恒门槛拒非数字;设 OC_FINALIZE_SKIP_EGRESS_GATE=1 显式豁免(危险)。" >&2
+  return 1
+}
 EGR_START_STARTID=""; EGR_START_ENQ=""; EGR_START_SENT=""; EGR_START_EXP=""; EGR_START_OVF=""
 # finalize 前置:pendingCostEvents==0 + 快照基线计数(RFC D3:有 backlog 先等排空防基线污染)。
 egress_gate_prelude() {
@@ -1867,8 +2005,14 @@ egress_gate_prelude() {
   EGR_START_STARTID="$(jq -r '.processStartId // "NA"' <<<"$eh")"
   EGR_START_ENQ="$(jq -r '.enqueuedTotal // "NA"' <<<"$eh")"
   EGR_START_SENT="$(jq -r '.sentTotal // "NA"' <<<"$eh")"
-  EGR_START_EXP="$(jq -r '.expiredDropsTotal // 0' <<<"$eh")"
-  EGR_START_OVF="$(jq -r '.overflowDropsTotal // 0' <<<"$eh")"
+  EGR_START_EXP="$(jq -r '.expiredDropsTotal // "NA"' <<<"$eh")"
+  EGR_START_OVF="$(jq -r '.overflowDropsTotal // "NA"' <<<"$eh")"
+  # BLOCKER 5③:严格数字校验基线计数(startId 是字符串,只需非 NA/非空)。
+  [[ "$EGR_START_STARTID" != "NA" && -n "$EGR_START_STARTID" ]] || { [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]] || { echo "✗ egress processStartId 缺失,拒绝" >&2; return 1; }; }
+  _egress_num_or_die "$EGR_START_ENQ" enqueuedTotal || return 1
+  _egress_num_or_die "$EGR_START_SENT" sentTotal || return 1
+  _egress_num_or_die "$EGR_START_EXP" expiredDropsTotal || return 1
+  _egress_num_or_die "$EGR_START_OVF" overflowDropsTotal || return 1
   echo "  ✓ pending==0;基线 startId=$EGR_START_STARTID enq=$EGR_START_ENQ sent=$EGR_START_SENT"
 }
 # finalize 计数守恒终判(交接窗后)。
@@ -1881,7 +2025,13 @@ egress_gate_conservation() {
   local sid pend enq sent exp ovf
   sid="$(jq -r '.processStartId // "NA"' <<<"$eh")"; pend="$(jq -r '.pendingCostEvents // "NA"' <<<"$eh")"
   enq="$(jq -r '.enqueuedTotal // "NA"' <<<"$eh")"; sent="$(jq -r '.sentTotal // "NA"' <<<"$eh")"
-  exp="$(jq -r '.expiredDropsTotal // 0' <<<"$eh")"; ovf="$(jq -r '.overflowDropsTotal // 0' <<<"$eh")"
+  exp="$(jq -r '.expiredDropsTotal // "NA"' <<<"$eh")"; ovf="$(jq -r '.overflowDropsTotal // "NA"' <<<"$eh")"
+  # BLOCKER 5③:终判前严格数字校验(防 NA 落进 $((...)) 被当 0 算出假守恒)。
+  _egress_num_or_die "$pend" pendingCostEvents || return 1
+  _egress_num_or_die "$enq" enqueuedTotal || return 1
+  _egress_num_or_die "$sent" sentTotal || return 1
+  _egress_num_or_die "$exp" expiredDropsTotal || return 1
+  _egress_num_or_die "$ovf" overflowDropsTotal || return 1
   [[ "$sid" == "$EGR_START_STARTID" ]] || { echo "✗ egress processStartId 变化($EGR_START_STARTID→$sid):中途重启计数归零假绿,进人工核对" >&2; return 1; }
   [[ "$pend" == "0" ]] || { echo "✗ egress pendingEnd=$pend≠0" >&2; return 1; }
   [[ $((enq-EGR_START_ENQ)) -eq $((sent-EGR_START_SENT)) ]] || { echo "✗ enqueuedΔ=$((enq-EGR_START_ENQ)) ≠ sentΔ=$((sent-EGR_START_SENT))(交接窗有事件未送达)" >&2; return 1; }
@@ -1896,23 +2046,21 @@ vip_control_gate() {
   hz="$(slot_priv_healthz "$slot")"; echo "  private healthz: $hz"
   [[ -n "$hz" ]] || { echo "✗ candidate 私有口无响应" >&2; return 1; }
   echo "$hz" | grep -q '"state":"leader"' || { echo "✗ candidate leadership!=leader(lease 未接管)" >&2; return 1; }
-  # ① VIP owner:私有口自检字段 "vip":"owner"(Agent A 提供);缺失 → TODO 降级为仅 leader 断言
-  if echo "$hz" | grep -q '"vip":'; then
-    echo "$hz" | grep -q '"vip":"owner"' || { echo "✗ candidate 未持有 VIP(egress 控制口未 bind 到 candidate)" >&2; return 1; }
-    echo "  ✓ candidate 持有 VIP(18894)"
-  else
-    echo "  ⚠ 私有 healthz 无 vip 字段(TODO:Agent A 补 VIP owner 自检);暂以 leadership=leader 代替 VIP owner 断言"
-  fi
-  # ② control-probe 只读(带 egress secret);Agent A 的 master 侧端点,缺则 healthz 代替 + TODO
+  # ① VIP owner(BLOCKER 5①:fail-closed,不降级)——私有 healthz 必须带 "vip":"owner"。
+  #    缺 vip 字段 = master 版本过旧/未补齐(现已在 master 侧实现),一律拒绝,绝不"暂以 leader 代替"。
+  echo "$hz" | grep -q '"vip":"owner"' || {
+    echo "✗ candidate 未持有 VIP 或 healthz 缺 vip 字段(egress 控制口未 bind 到 candidate / master 过旧)。拒绝。" >&2
+    return 1
+  }
+  echo "  ✓ candidate 持有 VIP(18894)"
+  # ② control-probe 只读(带 egress secret;BLOCKER 5①:fail-closed,不降级)。master 侧端点现已实现。
   local secret probe; secret="$(ssh "$KL_HOST" "grep -E '^OC_EGRESS_SECRET=' '$V5_ENV' | tail -n1 | cut -d= -f2-" 2>/dev/null || true)"
+  [[ -n "$secret" ]] || { echo "✗ 无法读取 OC_EGRESS_SECRET(control-probe 无法校验),拒绝" >&2; return 1; }
   probe="$(ssh "$KL_HOST" "curl -fsS --max-time 5 -H 'X-OC-Egress-Secret: $secret' http://127.0.0.1:${cpriv}/internal/v5/control-probe" 2>/dev/null || true)"
-  if [[ -n "$probe" ]]; then
-    echo "  control-probe: $probe"
-    echo "$probe" | grep -q '"ok":true' || { echo "✗ control-probe 非 ok(dispatcher/PG/身份/VIP 自检未过)" >&2; return 1; }
-    echo "  ✓ control-probe 通过"
-  else
-    echo "  ⚠ /internal/v5/control-probe 未就绪(TODO:Agent A master 侧端点);暂以私有 healthz 代替"
-  fi
+  [[ -n "$probe" ]] || { echo "✗ /internal/v5/control-probe 无响应(端点未就绪 / secret 不匹配)。拒绝。" >&2; return 1; }
+  echo "  control-probe: $probe"
+  echo "$probe" | grep -q '"ok":true' || { echo "✗ control-probe 非 ok(dispatcher 路由表/PG/持有 VIP 自检未过)" >&2; return 1; }
+  echo "  ✓ control-probe 通过"
 }
 
 # ═════════ lane: --canary ═════════
@@ -1922,6 +2070,20 @@ canary() {
   assert_runtime_channel_column
   ds_snapshot
   ds_assert_phase stable
+  # BLOCKER 6:canary 起手断言 active_release 非 NULL 且目录存在(seed=NULL;基建版须先跑一次传统
+  # deploy 校准 active_release)。否则 capability preflight 会拿假/空 active release 做兼容比较。
+  if [[ "$DRY" != 1 ]]; then
+    [[ -n "$DS_active_release" ]] || {
+      echo "✗ deploy_state.active_release 为空(NULL)。基建版首个 --canary 前必须先跑一次传统 deploy" >&2
+      echo "  (deploy-v5.sh 或 --dist)以把 active_release 校准成真实 release 目录。" >&2
+      exit 1
+    }
+    local _ar="$DS_active_release"; [[ "$_ar" == /* ]] || _ar="$RELEASES_ROOT/$_ar"
+    ssh "$KL_HOST" "test -d '$_ar'" || {
+      echo "✗ active_release 目录不存在:$_ar(已被 GC?先跑一次传统 deploy 重新校准)。" >&2
+      exit 1
+    }
+  fi
   local cand; cand="$(slot_other "$DS_active_slot")"
   echo "  · active=$DS_active_slot → candidate=$cand"
   new_operation_id canary
@@ -1969,9 +2131,13 @@ canary() {
   ds_cas_or_die "generation=generation+1, cohort_salt='$salt', cohort_percent=0, cohort_allowlist=$allowlist, transition_step=$DS_STEP_CANARY_READY" "$DS_STEP_CANARY_READY" "canary READY gen bumped salt rotated allowlist=internal"
   # 此刻起 Caddy 生成器才产 matcher(step≥READY)
   caddy_render_reload
-  # 内部账号验证:带当前代次 lane cookie 探 candidate
+  # 内部账号验证:带当前代次 lane cookie 探 candidate(BLOCKER 5②:硬门,去 || true)
   echo "── 内部账号验证(lane cookie 命中 candidate)──"
-  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || true
+  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || {
+    echo "✗ canary READY 验证失败(默认未命中 active / lane cookie 未命中健康 candidate)。candidate 已 READY 但不可服务。" >&2
+    echo "  用 deploy-v5.sh --abort 撤下 candidate,或核查 candidate 健康后重跑 --canary。" >&2
+    exit 1
+  }
   echo "✓ --canary 完成(gen=$((DS_generation)) candidate=$cand percent=0 allowlist=内部)。放量:deploy-v5.sh --promote=<pct>"
 }
 
@@ -2006,66 +2172,129 @@ promote() {
   echo "✓ --promote 完成。continue:--promote=<更高> / --finalize / --abort"
 }
 
-# ═════════ lane: --finalize(七步序;RFC D5 B2)═════════
+# ═════════ lane: --finalize(七步序;RFC D5 B2 + BLOCKER 4 可续作 resume)═════════
+# 入口接受 phase ∈ {canary(全新), finalizing(断点续作)}。resume 时按 (phase, transition_step) 逐步
+# 核验外部事实后从断点前滚(每步 `-lt N` 幂等守卫);step6(旧 unit 已停)= 直接前滚 step7。
+# --recover 对 finalizing 直接调用本函数,而非仅打印提示。
 finalize() {
-  echo "══ v5 --finalize(cohort 收敛 + master 交接;RFC D5 七步)══"
+  echo "══ v5 --finalize(cohort 收敛 + master 交接;RFC D5 七步;可 resume)══"
   ds_snapshot
-  ds_assert_phase canary
-  local cand="$DS_candidate_slot" old="$DS_active_slot"
-  [[ "$DRY" == 1 ]] && { cand="${DS_candidate_slot:-B}"; old="$DS_active_slot"; }
-  [[ -n "$cand" ]] || { echo "✗ 无 candidate,无法 finalize" >&2; exit 1; }
-  new_operation_id finalize
-  # egress 前置(pending==0 + 基线快照);未过不进 finalizing
-  egress_gate_prelude || { echo "✗ egress 前置未过,拒绝 finalize(不改状态)" >&2; exit 1; }
-  # 起手 CAS phase=finalizing step0
-  ds_cas_or_die "phase='finalizing', transition_step=0, operation_id='$OP'" 0 "finalize-begin candidate=$cand"
+  local cand old
+  if [[ "$DRY" == 1 ]]; then
+    ds_assert_phase canary
+    cand="${DS_candidate_slot:-B}"; old="$DS_active_slot"
+    new_operation_id finalize
+    egress_gate_prelude || { echo "✗ egress 前置未过" >&2; exit 1; }
+    finalize_run_steps "$cand" "$old"
+    return 0
+  fi
+  case "$DS_phase" in
+    canary)
+      cand="$DS_candidate_slot"; old="$DS_active_slot"
+      [[ -n "$cand" ]] || { echo "✗ 无 candidate,无法 finalize" >&2; exit 1; }
+      new_operation_id finalize
+      # egress 前置(pending==0 + 基线快照);未过不进 finalizing
+      egress_gate_prelude || { echo "✗ egress 前置未过,拒绝 finalize(不改状态)" >&2; exit 1; }
+      # 起手 CAS phase=finalizing step0
+      ds_cas_or_die "phase='finalizing', transition_step=0, operation_id='$OP'" 0 "finalize-begin candidate=$cand"
+      ;;
+    finalizing)
+      # resume:cand/old 由 deploy_state 派生(step7 前 active_slot 恒=旧,candidate_slot=cand)。
+      cand="$DS_candidate_slot"; old="$DS_active_slot"
+      [[ -n "$cand" ]] || { echo "✗ finalizing 但无 candidate_slot,状态损坏,人工介入" >&2; exit 1; }
+      OP="${DS_operation_id:-p3-finalize-resume-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+      echo "  · finalize resume:phase=finalizing step=$DS_transition_step candidate=$cand active(old)=$old op=$OP"
+      # step<5(守恒终判未过)才需重取 egress 基线(pending==0 + 快照);step>=5 已过门槛不再需要。
+      if [[ "$DS_transition_step" -lt 5 ]]; then
+        egress_gate_prelude || { echo "✗ egress 前置未过(resume),拒绝续作" >&2; exit 1; }
+      fi
+      ;;
+    *)
+      echo "✗ finalize 仅接受 phase ∈ {canary(全新), finalizing(resume)}(当前=$DS_phase)。aborting 请用 --abort/--recover。" >&2
+      exit 1
+      ;;
+  esac
+  finalize_run_steps "$cand" "$old"
+}
+
+# finalize step1..7 主体(每步 `-lt N` 幂等守卫;fresh 全跑,resume 从断点前滚)。$1=cand $2=old。
+finalize_run_steps() {
+  local cand="$1" old="$2"
 
   # ① percent=100 观察窗(step1)
-  ds_cas_or_die "cohort_percent=100, transition_step=1" 1 "percent=100 observe"
-  echo "  · percent=100:活跃评估者全量迁 candidate(观察窗)"
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 1 ]]; then
+    ds_cas_or_die "cohort_percent=100, transition_step=1" 1 "percent=100 observe"
+    echo "  · percent=100:活跃评估者全量迁 candidate(观察窗)"
+  fi
 
-  # ② Caddy 默认 upstream 切 candidate + 验证(step2)——生成器 phase=finalizing∧step≥2 → 默认→candidate
-  ds_cas_or_die "transition_step=2" 2 "default upstream → candidate (pre-render)"
-  caddy_render_reload
-  echo "── 验证新请求全落 candidate ──"
-  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || true
+  # ② Caddy 默认 upstream 切 candidate + 硬验证,**成功后才 CAS step=2**(MAJOR 2)。渲染用
+  #    DS_RENDER_STEP_OVERRIDE=2 表达 step2 语义(默认→candidate),避免"记录 step2 但 Caddy 未真正
+  #    切/验证未过"的状态-现实撕裂。验证失败 → 转 aborting 补偿(§8),不留错误的 step2 记录。
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 2 ]]; then
+    echo "── ② 渲染默认→candidate(step2 语义)+ reload + 硬验证新请求全落 candidate ──"
+    export DS_RENDER_STEP_OVERRIDE=2
+    caddy_render_reload
+    local step2_ok=1
+    KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" \
+      bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || step2_ok=0
+    unset DS_RENDER_STEP_OVERRIDE
+    if [[ "$step2_ok" != 1 ]]; then
+      echo "✗ finalize step2 验证失败(默认未确认切到 candidate)→ 转 aborting 补偿(§8)" >&2
+      ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize step2 verify FAILED → aborting"
+      sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
+      abort_continue "$old" "$cand"
+      exit 1
+    fi
+    ds_cas_or_die "transition_step=2" 2 "default upstream → candidate (rendered+verified)"
+  fi
 
   # ③ 旧 WS 自然存活或有界 drain(step3)——--drain-ws 时对旧 slot 发安全点重连
-  if [[ "$DRAIN_WS" == 1 ]]; then
-    echo "── 有界 drain 旧 slot($old)WS(可选)──"
-    sshk "curl -fsS --max-time 5 -X POST http://127.0.0.1:$(slot_priv "$old")/internal/v5/drain-ws 2>/dev/null || echo '  ⚠ drain-ws 端点未就绪(TODO:Agent A)'"
-  else
-    echo "  · 旧 slot WS 自然存活(resume 权威=容器 ring+客户端游标,跨实例透明)"
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 3 ]]; then
+    if [[ "$DRAIN_WS" == 1 ]]; then
+      echo "── 有界 drain 旧 slot($old)WS(可选)──"
+      sshk "curl -fsS --max-time 5 -X POST http://127.0.0.1:$(slot_priv "$old")/internal/v5/drain-ws 2>/dev/null || echo '  ⚠ drain-ws 端点未就绪(TODO:Agent A)'"
+    else
+      echo "  · 旧 slot WS 自然存活(resume 权威=容器 ring+客户端游标,跨实例透明)"
+    fi
+    ds_cas_or_die "transition_step=3" 3 "ws drain (drain_ws=$DRAIN_WS)"
   fi
-  ds_cas_or_die "transition_step=3" 3 "ws drain (drain_ws=$DRAIN_WS)"
 
   # ④ CAS desired_*=candidate(step4)→ 旧 master fence + close VIP;candidate 竞 lease + bind VIP
-  ds_cas_or_die "desired_leader_slot='$cand', desired_control_slot='$cand', transition_step=4" 4 "desired_* → candidate (lease/VIP handover)"
-  echo "── 等待 leader/VIP 交接(旧 master fence bundle+close VIP;candidate 竞 lease+bind 18894)──"
-  run "sleep 8"
-
-  # ⑤ D3 四门槛(step5;超时→转 aborting 按 §8)
-  if ! ( vip_control_gate "$cand" && egress_gate_conservation ); then
-    echo "✗ finalize 四门槛未过 → 补偿:desired 收回旧 slot + 重启旧 unit + 转 aborting(§8)" >&2
-    ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize gate FAILED → compensate → aborting"
-    sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
-    abort_continue "$old" "$cand"
-    exit 1
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 4 ]]; then
+    ds_cas_or_die "desired_leader_slot='$cand', desired_control_slot='$cand', transition_step=4" 4 "desired_* → candidate (lease/VIP handover)"
   fi
-  ds_cas_or_die "transition_step=5" 5 "four gates passed (VIP+control-probe+egress conservation)"
 
-  # ⑥ stop 旧 unit(step6)
-  echo "── stop 旧 unit $(slot_unit "$old")──"
-  sshk "systemctl stop $(slot_unit "$old")"
-  ds_cas_or_die "transition_step=6" 6 "old unit $old stopped"
+  # ⑤ D3 四门槛(step5;超时→转 aborting 按 §8)。resume 落到此步会重跑门槛(幂等)。
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 5 ]]; then
+    echo "── 等待 leader/VIP 交接(旧 master fence bundle+close VIP;candidate 竞 lease+bind 18894)──"
+    # BLOCKER 5⑤:固定 sleep 改有界轮询(2s 间隔,60s 上限);权威裁决在下方四门槛。
+    wait_for_slot_leadership "$cand" 1 60 || echo "  · 轮询超时,交由四门槛裁决"
+    if ! ( vip_control_gate "$cand" && egress_gate_conservation ); then
+      echo "✗ finalize 四门槛未过 → 补偿:desired 收回旧 slot + 重启旧 unit + 转 aborting(§8)" >&2
+      ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize gate FAILED → compensate → aborting"
+      sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
+      abort_continue "$old" "$cand"
+      exit 1
+    fi
+    ds_cas_or_die "transition_step=5" 5 "four gates passed (VIP+control-probe+egress conservation)"
+  fi
+
+  # ⑥ stop 旧 unit(step6)。§8:step6=旧 unit 已停 → resume 直接前滚 step7(guard 使其自然跳过)。
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 6 ]]; then
+    echo "── stop 旧 unit $(slot_unit "$old")──"
+    sshk "systemctl stop $(slot_unit "$old")"
+    ds_cas_or_die "transition_step=6" 6 "old unit $old stopped"
+  fi
 
   # ⑦ CAS active_slot=candidate + active_release 更新 + candidate_*=NULL + phase=stable(step7)
-  ds_cas_or_die "active_slot='$cand', active_release=candidate_release, candidate_slot=NULL, candidate_release=NULL, phase='stable', transition_step=0, cohort_percent=0" 7 "finalize commit active_slot=$cand phase=stable"
-  # 收敛后 Caddy re-render(此刻 active=cand,无 candidate → 回 seed 形态,默认→新 active)
-  caddy_render_reload
-  # 新 active(=原 candidate)完整 smoke(参数化端口)+ 版本握手
-  [[ "$DRY" == 1 ]] || smoke "$(slot_port "$cand")"
-  dist_handshake_smoke "$(slot_port "$cand")" || true
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 7 ]]; then
+    ds_cas_or_die "active_slot='$cand', active_release=candidate_release, candidate_slot=NULL, candidate_release=NULL, phase='stable', transition_step=0, cohort_percent=0" 7 "finalize commit active_slot=$cand phase=stable"
+    # 收敛后 Caddy re-render(此刻 active=cand,无 candidate → 回 seed 形态,默认→新 active)
+    caddy_render_reload
+    # 新 active(=原 candidate)完整 smoke(参数化端口)+ 版本握手
+    [[ "$DRY" == 1 ]] || smoke "$(slot_port "$cand")"
+    dist_handshake_smoke "$(slot_port "$cand")" || true
+  fi
   echo "✓ --finalize 完成:active_slot=$cand(原 candidate 已成新主+leader+VIP),旧 slot=$old 已停。"
 }
 
@@ -2090,31 +2319,39 @@ abort() {
   abort_continue "$old" "$cand"
 }
 
-# abort ①→④ 幂等续作(finalize 补偿与 --abort 共用)。$1=old(恢复目标) $2=candidate
+# abort ①→④ **按 step 幂等续作**(finalize 补偿与 --abort/--recover 共用)。$1=old(恢复目标) $2=candidate
+# BLOCKER 4:每步 `-lt N` 守卫 → resume(aborting 崩溃重跑)不回退已完成步;caddy 渲染/等旧 leader
+# 是幂等核验,总是执行。abort transition_step 序:0(begin)→2(desired 收回)→3(candidate 停)→commit。
 abort_continue() {
   local old="$1" cand="$2" csrc; csrc="$(slot_src "$cand")"
-  # ① re-render Caddy 摘 candidate matcher + 默认回旧 slot + reload(先摘路由再停 candidate,存量 WS 收 4509 重连时已只剩 active)
-  echo "── ① Caddy 摘 matcher + 默认回旧 slot($old)+ reload ──"
-  # desired 先收回(下面 ②),但 Caddy 默认取 active_slot;abort 时 active_slot 恒=旧(finalize 未走到 step7),
-  # 生成器 phase=aborting → 默认→active_slot(旧)、不产 matcher。故先 CAS desired 再 render 一致。
-  # ② CAS desired_*=旧 active_slot(旧 master 重竞 lease/VIP)
-  ds_cas_or_die "desired_leader_slot='$old', desired_control_slot='$old', transition_step=2" 2 "desired_* → old slot $old (reclaim lease/VIP)"
-  caddy_render_reload
-  echo "── 等待旧 master 重竞 lease + bind VIP(leadership=leader + VIP owner 确认)──"
-  run "sleep 6"
-  if [[ "$DRY" != 1 ]]; then
-    local ohz; ohz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:$(slot_priv "$old")/healthz" 2>/dev/null || true)"
-    echo "$ohz" | grep -q '"state":"leader"' || echo "  ⚠ 旧 slot leadership 未回 leader(可能仍在竞;人工核查)"
+  # ①② 先 CAS desired_*=old(旧 master 重竞 lease/VIP)——guard -lt 2(resume 已收回则不回退)
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 2 ]]; then
+    echo "── ① Caddy 摘 matcher + 默认回旧 slot($old);② CAS desired_*=old(旧 master 重竞 lease/VIP)──"
+    ds_cas_or_die "desired_leader_slot='$old', desired_control_slot='$old', transition_step=2" 2 "desired_* → old slot $old (reclaim lease/VIP)"
   fi
-  # ③ stop candidate unit
-  echo "── ③ stop candidate unit $(slot_unit "$cand")──"
-  sshk "systemctl stop $(slot_unit "$cand") 2>/dev/null || true"
-  # 只清本 operation 产物(未激活 symlink);HOME 绝不递归删(§8 R4)
-  sshk "rm -f '$csrc.newlink.'* 2>/dev/null || true"
-  ds_cas_or_die "transition_step=3" 3 "candidate unit $cand stopped"
-  # ④ CAS phase=stable,candidate_*=NULL,percent=0(cookie 靠 generation 不匹配自动失效)
-  ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, cohort_percent=0, transition_step=0, operation_id=NULL" 4 "abort commit → stable (old active=$old)"
-  [[ "$DRY" == 1 ]] || smoke "$(slot_port "$old")" || echo "  ⚠ 旧 active smoke 有告警,人工核查"
+  # Caddy 渲染回 aborting 态(默认→old、摘 matcher)——幂等,总是执行(先摘路由再停 candidate)。
+  caddy_render_reload
+  # BLOCKER 5④+⑤:有界轮询等旧 master 重获 leadership+VIP;**未恢复则绝不前滚提交 stable**——停在
+  # aborting 告警人工介入(旧 leader 未确认时切流会全停)。取代固定 sleep + 仅告警的旧行为。幂等核验。
+  if ! wait_for_slot_leadership "$old" 1 60; then
+    echo "✗ 旧 slot($old)60s 内未重获 leadership=leader+VIP owner(lease/VIP 未回)。" >&2
+    echo "  绝不在旧 leader 未确认时停 candidate/提交 stable(会全停)。停在 phase=aborting,人工介入:" >&2
+    echo "  核查旧 slot lease 竞争 / desired 是否已=$old / 旧 unit 是否健康;修复后重跑 deploy-v5.sh --abort(或 --recover)。" >&2
+    exit 1
+  fi
+  # ③ stop candidate unit(仅在旧 slot 已确认 leader+VIP 后)——guard -lt 3
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 3 ]]; then
+    echo "── ③ stop candidate unit $(slot_unit "$cand")──"
+    sshk "systemctl stop $(slot_unit "$cand") 2>/dev/null || true"
+    # 只清本 operation 产物(未激活 symlink);HOME 绝不递归删(§8 R4)
+    sshk "rm -f '$csrc.newlink.'* 2>/dev/null || true"
+    ds_cas_or_die "transition_step=3" 3 "candidate unit $cand stopped"
+  fi
+  # ④ CAS phase=stable,candidate_*=NULL,percent=0(cookie 靠 generation 不匹配自动失效)——guard -lt 4
+  if [[ "$DRY" == 1 || "$DS_transition_step" -lt 4 ]]; then
+    ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, cohort_percent=0, transition_step=0, operation_id=NULL" 4 "abort commit → stable (old active=$old)"
+    [[ "$DRY" == 1 ]] || smoke "$(slot_port "$old")" || echo "  ⚠ 旧 active smoke 有告警,人工核查"
+  fi
   echo "✓ --abort 完成:回退到旧 active_slot=$old;candidate=$cand 已停。cohort cookie 靠 generation 失配自动失效。"
 }
 
@@ -2138,19 +2375,20 @@ recover() {
         echo "  → 请据 candidate 健康决定:deploy-v5.sh --promote=<pct> / --finalize / --abort"
       fi ;;
     finalizing)
+      # BLOCKER 4:--recover 对 finalizing **直接调用 finalize()**(它按 (phase,step) 逐步核验外部事实
+      # 后从断点前滚),而非仅打印提示。前滚优先(§8);若 candidate 异常,step5 四门槛会失败并自动
+      # 补偿转 aborting(先起旧 unit 核验健康再切回),故前滚是安全的自愈默认。
       if [[ "$s" -le 1 ]]; then
-        echo "  · finalizing 0-1(默认流量仍在 active,安全)→ §8:可继续 step2 或转 aborting"
-        echo "  → 建议 --abort(零损)或重跑 --finalize"
+        echo "  · finalizing 0-1(默认流量仍在 active,安全)→ §8:前滚续作(或人工 --abort 零损回退)"
       elif [[ "$s" -le 3 ]]; then
-        echo "  · finalizing 2-3(默认已在 candidate,desired 仍旧)→ §8:继续 step4 或 aborting(Caddy 切回,旧 slot 仍健康)"
-        echo "  → --finalize 续作 或 --abort"
+        echo "  · finalizing 2-3(默认已在 candidate,desired 仍旧)→ §8:前滚续作(旧 slot 仍健康,失败可 --abort)"
       elif [[ "$s" -le 5 ]]; then
-        echo "  · finalizing 4-5(desired 已=candidate,VIP/lease 可能已交接)→ §8:门槛过→继续 step6;失败→aborting"
-        echo "  → --finalize 续作(会重跑门槛)或 --abort(desired 收回,等旧 master 重竞得)"
+        echo "  · finalizing 4-5(desired 已=candidate,VIP/lease 可能已交接)→ §8:前滚重跑门槛;失败自动 aborting"
       else
-        echo "  · finalizing 6(旧 unit 已停)→ §8:前滚优先(candidate 已全量服务→ --finalize 直达 step7);candidate 异常→ --abort 走'先起旧 unit 核验健康'前置"
-        echo "  → --finalize 完成 或 --abort"
-      fi ;;
+        echo "  · finalizing 6(旧 unit 已停)→ §8:前滚优先,直达 step7 完成"
+      fi
+      echo "  → 自动前滚:finalize() resume from step=$s"
+      finalize ;;
     aborting)
       echo "  · aborting(any step)→ §8:旧 slot 未确认健康则先恢复旧 unit;确认→按 abort ①→④ 幂等续作"
       abort ;;
