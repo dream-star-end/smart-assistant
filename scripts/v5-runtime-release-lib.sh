@@ -125,7 +125,7 @@ oc_hotcfg__digest_from_rows() {
 # 在 <root> 写 MANIFEST.json 并 echo digest。
 # 用法:oc_hotcfg_build_manifest <root> <schemaVersion> <sourceCommit> [bunVersion] [depsCacheKey]
 oc_hotcfg_build_manifest() {
-  local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}"
+  local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}" ccbkey="${6:-}"
   local rows digest boothash builtAt files_tmp
   rows="$(oc_hotcfg__file_rows "$root")" || return 1
   digest="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows all)" || return 1
@@ -139,12 +139,13 @@ oc_hotcfg_build_manifest() {
     --argjson schemaVersion "$schema" \
     --arg digest "$digest" --arg bootHash "$boothash" \
     --arg sourceCommit "$commit" --arg builtAt "$builtAt" \
-    --arg bunVersion "$bun" --arg depsCacheKey "$cache" \
+    --arg bunVersion "$bun" --arg depsCacheKey "$cache" --arg ccbDistKey "$ccbkey" \
     --slurpfile files "$files_tmp" '
     {schemaVersion: $schemaVersion, digest: $digest, bootHash: $bootHash,
      sourceCommit: $sourceCommit, builtAt: $builtAt, files: $files[0]}
     + (if $bunVersion == "" then {} else {bunVersion: $bunVersion} end)
     + (if $depsCacheKey == "" then {} else {depsCacheKey: $depsCacheKey} end)
+    + (if $ccbDistKey == "" then {} else {ccbDistKey: $ccbDistKey} end)
   ' > "$root/MANIFEST.json.tmp" || { rm -f "$files_tmp"; return 1; }
   rm -f "$files_tmp"
   mv -f "$root/MANIFEST.json.tmp" "$root/MANIFEST.json" || return 1
@@ -396,12 +397,29 @@ oc_hotcfg_install_deps_in_image() {
 # (node_modules 只活在临时目录,构建后即删),ccb 运行物只有自足的 dist/cli.js(§3.1)。
 # 临时目录取 staging 的兄弟目录(同文件系统,空间充足;避免 /tmp tmpfs 撑爆),函数退出前必删。
 oc_hotcfg_build_ccb_dist() {
-  local staging="$1" bun ver ccb_build
+  local staging="$1" prev="${2:-}" bun ver ccb_build src_rows src_key
   bun="$OC_BUN_BIN"
   [ -n "$bun" ] || { if [ -x "$HOME/.bun/bin/bun" ]; then bun="$HOME/.bun/bin/bun"; else bun="$(command -v bun || true)"; fi; }
   [ -n "$bun" ] && [ -x "$bun" ] || { oc_hotcfg__die "build_ccb_dist: 找不到 host bun(~/.bun/bin/bun 或 PATH)"; return 1; }
   [ -d "$staging/claude-code-best" ] || { oc_hotcfg__die "build_ccb_dist: staging 无 claude-code-best"; return 1; }
   ver="$("$bun" --version 2>/dev/null)" || { oc_hotcfg__die "bun --version 失败"; return 1; }
+  # ── ccb dist 内容寻址缓存(2026-07-12 首启实证):bun build **不可复现**(同源同目录重建
+  # bytes 都不同,内嵌时间戳类噪声)→ 若每次 deploy 都重建,release digest 恒变 = "只改
+  # master/前端 → 零容器 churn"承诺失效(全量用户容器每次 deploy 被滚动)。
+  # 根治:key = digest(ccb 源子树 rows) + bun 版本;命中上一 release 的 MANIFEST.ccbDistKey
+  # → **cp -a 真拷贝**其 dist(几 MB,不用硬链,零跨 release inode 共享)跳过 bun build。
+  # 源变/bun 升版 → key 变 → 重建(容器滚动,正确)。
+  src_rows="$(oc_hotcfg__file_rows "$staging/claude-code-best")" || return 1
+  src_key="$(printf '%s\0%s' "$(printf '%s\n' "$src_rows" | oc_hotcfg__digest_from_rows all)" "$ver" | sha256sum | cut -c1-12)"
+  if [ -n "$prev" ] && [ -f "$prev/MANIFEST.json" ] && [ -d "$prev/claude-code-best/dist" ] \
+     && [ "$(jq -r '.ccbDistKey // empty' "$prev/MANIFEST.json")" = "$src_key" ]; then
+    oc_hotcfg__log "ccbDistKey 命中上一 release → cp -a 复用 dist(跳过 bun build,digest 幂等)"
+    rm -rf "$staging/claude-code-best/dist"
+    cp -a "$prev/claude-code-best/dist" "$staging/claude-code-best/dist" \
+      || { oc_hotcfg__die "build_ccb_dist: 复用 dist 拷贝失败"; return 1; }
+    printf '%s\t%s\n' "$ver" "$src_key"
+    return 0
+  fi
   ccb_build="$(dirname "$staging")/.ccbbuild-$$.$RANDOM"
   rm -rf "$ccb_build"
   # 拷 ccb 源到独立临时目录(不含 staging 的 node_modules —— B6 后 staging 本就无 ccb node_modules;防御性再清一遍)
@@ -421,7 +439,7 @@ oc_hotcfg_build_ccb_dist() {
   cp -a "$ccb_build/dist" "$staging/claude-code-best/dist" \
     || { oc_hotcfg__die "build_ccb_dist: dist 拷回 staging 失败"; rm -rf "$ccb_build"; return 1; }
   rm -rf "$ccb_build"
-  printf '%s\n' "$ver"
+  printf '%s\t%s\n' "$ver" "$src_key"
 }
 
 # release 落定(§3.1 d/e):在已 archive+prune+敏感扫描过的 staging 上装依赖、建 ccb dist、
@@ -449,7 +467,9 @@ oc_hotcfg_finalize_release() {
     fi
   fi
   [ "$reuse" = 1 ] || oc_hotcfg_install_deps_in_image "$staging" "$image_id" || return 1
-  bunver="$(oc_hotcfg_build_ccb_dist "$staging")" || return 1
+  local ccb_out ccb_key
+  ccb_out="$(oc_hotcfg_build_ccb_dist "$staging" "$prev")" || return 1
+  bunver="${ccb_out%%$'\t'*}"; ccb_key="${ccb_out##*$'\t'}"
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。
@@ -465,7 +485,7 @@ oc_hotcfg_finalize_release() {
   oc_hotcfg_normalize_release_perms "$staging"
 
   local digest target
-  digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache")" || return 1
+  digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache" "$ccb_key")" || return 1
   target="$OC_HOTCFG_RELEASES_ROOT/rel-$digest"
   mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
   if [ -d "$target" ]; then
