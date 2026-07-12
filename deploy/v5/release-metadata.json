@@ -3,5 +3,8 @@
   "requiredMigrations": [
     "0123_gpt56_models",
     "0124_gpt56_xhigh_defaults"
+  ],
+  "capabilities": [
+    "sessions-store-pg-v1"
   ]
 }

@@ -1,5 +1,8 @@
 #!/usr/bin/env -S npx tsx
 /**
+ * ⚠️ SQLite-only(RFC-v5-sessions-pg §5b):master 割接 PG 后本脚本不再适用于生产
+ * master 库,仅个人版/留档库可用。PG 侧热尾巴搬移由 backend 在线执行,无需离线回填。
+ *
  * v5-sessions-spill-archive.ts — One-shot ops script that spills the oldest
  * messages out of over-sized `client_sessions.messages` rows into the archive
  * chunk tables, leaving each row with only a bounded "hot tail".

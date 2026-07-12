@@ -206,6 +206,21 @@ SQL
 # ───────────────────────────────────────────────
 run_activity_stats() {
   local row
+  # 会话权威分流(RFC-v5-sessions-pg §5b):OC_SESSIONS_STORE=pg 割接后 client_sessions
+  # 权威在 PG,继续查 SQLite 会静默报冻结旧数据。
+  local _store
+  _store="$(set -a; . /etc/openclaude/commercial-v5.env 2>/dev/null; printf '%s' "${OC_SESSIONS_STORE:-}")"
+  if [[ "$_store" == "pg" ]]; then
+    if row="$(psql "$(set -a; . /etc/openclaude/commercial-v5.env 2>/dev/null; printf '%s' "$DATABASE_URL")" -tA -c \
+        "SELECT COUNT(DISTINCT user_id) || '|' || COUNT(*) FROM client_sessions
+          WHERE deleted_at IS NULL
+            AND last_at >= (EXTRACT(EPOCH FROM now())::BIGINT - 86400) * 1000;" 2>&1)"; then
+      INFOS+=("v5 近 24h(PG):活跃用户 ${row%%|*},活跃会话 ${row##*|}")
+    else
+      ALERTS+=("PG client_sessions 取数失败:$(echo "$row" | head -c 200)")
+    fi
+    return
+  fi
   if row="$(sqlite3 -readonly "$SESSIONS_DB" \
       "SELECT COUNT(DISTINCT user_id) || '|' || COUNT(*) FROM client_sessions
         WHERE deleted_at IS NULL

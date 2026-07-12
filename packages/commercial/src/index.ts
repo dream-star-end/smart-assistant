@@ -260,7 +260,14 @@ import {
   softDeleteMasterSession,
   allMasterWsessRows,
   getWechatBindingByUserId,
+  // P2 master 会话权威迁 PG(RFC-v5-sessions-pg D1):一次性注入 backend 的 composition root 入口。
+  setClientSessionsBackend,
 } from "@openclaude/storage";
+import {
+  createPgSessionsBackend,
+  startSessionsGcSweeper,
+} from "./db/pgSessionsBackend.js";
+import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -979,6 +986,30 @@ export async function registerCommercial(
     console.log(
       `[commercial] auto-migrate disabled (controlPlaneEnabled=${controlPlaneEnabled} channel=${runtimeChannel})`,
     );
+  }
+
+  // ── P2:master 会话权威 backend 选择(RFC-v5-sessions-pg D1 启动矩阵)────────────
+  // 放在 config 加载 + auto-migrate(0134 表须先在)之后、一切 schedulers/backend 消费之前。
+  // channel=v5 = master 形态(容器内 gateway / 个人版不加载 commercial → 天然 SQLite,零变化)。
+  // 依 OC_SESSIONS_STORE + PG 状态行 + 本地 manifest 三元组裁决 sqlite/pg;矩阵之外 fail-closed
+  // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
+  // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
+  let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  if (runtimeChannel === "v5") {
+    const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
+    if (decision.store === "pg") {
+      setClientSessionsBackend(
+        createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation }),
+      );
+      // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
+      // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
+      sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({ pool: getPool() }));
+      // eslint-disable-next-line no-console
+      console.log(`[commercial] sessions store authority = PG (generation=${decision.generation})`);
+    } else {
+      // eslint-disable-next-line no-console
+      console.log("[commercial] sessions store authority = SQLite(未割接 / 基建先行期)");
+    }
   }
 
   const jwtSecret =
@@ -3703,6 +3734,15 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
+      // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
+      if (sessionsGcSweeper) {
+        try {
+          await sessionsGcSweeper.stop();
+        } catch {
+          /* ignore */
+        }
+      }
       // P1.7 slice 7c — broker 先停。它会清 reconcile / housekeeping timer +
       // stop outboxWorker;放在 listener 关之前是为了:进行中的 outbox flush
       // 还能借 listener 把已经 admitted 的 outbound 完成最后一搏;同样 broker
