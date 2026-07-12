@@ -78,14 +78,24 @@ export function decideSessionsStore(
     );
   }
 
-  // ── 无状态行(基建先行期,首次建立前永久只表示此态)──
+  // ── 无状态行:仅当 manifest 也为 null 才是真·首次基建先行期 ──
+  // manifest≠null 证明"曾经割接到 PG"(PG↔manifest 双写)。此刻 PG 无状态行 = 连错库 / PG 状态行被删。
+  // 绝不能静默退回 SQLite(会重造双权威),fail-closed 拒起须人工裁决;真·首次基建期 manifest 亦应为 null。
   if (!pg) {
-    if (env === "pg") {
+    if (manifest) {
       throw new SessionsStoreAuthorityError(
-        "[sessions-store] 矩阵[无状态行 × env=pg]:尚未割接(sessions_store_migration_state 无行),fail-closed 拒起。",
+        `[sessions-store] 矩阵[无状态行 × 有 manifest]:PG 无 sessions_store_migration_state 状态行,` +
+          `但本地 manifest 表明曾割接到 PG(authority=${manifest.authority}, generation=${manifest.generation}, ` +
+          `cutover=${manifest.cutoverId})=连错库 / PG 状态行被删。绝不静默退回 SQLite 重造双权威,` +
+          `fail-closed 拒起,须人工裁决(核对 DATABASE_URL 指向、状态行是否被误删)。`,
       );
     }
-    // env 未设 / sqlite → SQLite 启动(基建期)。
+    if (env === "pg") {
+      throw new SessionsStoreAuthorityError(
+        "[sessions-store] 矩阵[无状态行 × 无 manifest × env=pg]:尚未割接(sessions_store_migration_state 无行),fail-closed 拒起。",
+      );
+    }
+    // 仅 pg===null && manifest===null && env∈{unset,sqlite} → SQLite 启动(真·首次基建先行期)。
     return { store: "sqlite" };
   }
 
@@ -214,7 +224,38 @@ export async function resolveSessionsStoreAuthority(
 ): Promise<SessionsStoreDecision> {
   const env = parseSessionsStoreEnv((opts.env ?? process.env).OC_SESSIONS_STORE);
   const pool = opts.pool ?? getPool();
-  const pg = await readPgStateRow(pool);
-  const manifest = await readManifest(opts.manifestPath ?? defaultManifestPath());
-  return decideSessionsStore(env, pg, manifest);
+  const manifestPath = opts.manifestPath ?? defaultManifestPath();
+
+  // PG 状态读取区分两种"读不到":
+  //   ① 42P01(表不存在=0134 未 apply,基建先行期):readPgStateRow 内部吞成 null(pgReadFailed=false)。
+  //   ② 连接错误等(连不上/超时):readPgStateRow 透传抛出 → 此处捕获为 pgReadFailed=true。
+  // 例外:readPgStateRow 主动抛的 SessionsStoreAuthorityError(如 generation 越界)是**已判定的 fail-closed**,
+  // 不是连接失败,直接冒泡拒起,绝不降级为静默 sqlite。
+  let pgState: SessionsStoreStateRow | null = null;
+  let pgReadError: Error | null = null;
+  try {
+    pgState = await readPgStateRow(pool);
+  } catch (err) {
+    if (err instanceof SessionsStoreAuthorityError) throw err;
+    pgReadError = err instanceof Error ? err : new Error(String(err));
+  }
+
+  const manifest = await readManifest(manifestPath);
+
+  if (pgReadError) {
+    // PG 状态读取失败(连接错误):**不得静默走 sqlite**,由 manifest + env 兜底裁决。
+    // 仅"真·基建先行期"(无 manifest 且 env 未设,PG 尚未 provision、连接本就不该通)允许 sqlite;
+    // 其余(有 manifest,或 env 已表明操作意图含 sqlite/pg/invalid)一律 fail-closed 拒起。
+    if (manifest === null && env === "unset") {
+      return { store: "sqlite" };
+    }
+    throw new SessionsStoreAuthorityError(
+      `[sessions-store] PG 状态读取失败/连接错误,且存在本地 manifest 或 OC_SESSIONS_STORE 已表明操作意图` +
+        `(manifest=${manifest ? "存在" : "无"}, env=${env}),无法判定会话权威,fail-closed 拒起,须人工介入` +
+        `(核对 DATABASE_URL / PG 可达性)。原始错误: ${pgReadError.message.slice(0, 200)}`,
+    );
+  }
+
+  // 正常读到(含 42P01→null)→ 走启动规则矩阵纯函数裁决。
+  return decideSessionsStore(env, pgState, manifest);
 }

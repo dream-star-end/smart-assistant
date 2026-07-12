@@ -349,6 +349,31 @@ describe("pgSessionsBackend contract", () => {
     assert.equal(stats.pendingAging, 1); // 2h 在 [1h,24h) 老化窗
     assert.equal(stats.mapExpired, 1);
   });
+
+  maybe("BLOCKER-1 首建服务端时钟下限:updatedAt=0 首建 → 第二个 baseSyncedAt=0 upsert rejected_stale", async () => {
+    const before = Date.now();
+    assert.equal(await backend.upsertClientSession(mkSession({ id: "s-b1", updatedAt: 0 })), "applied");
+    const got = await backend.getClientSession("s-b1", "u-1");
+    assert.ok(got!.updatedAt >= before, `首建 updated_at(${got!.updatedAt}) 应 ≥ 服务端 now(${before})`);
+    // 第二个 baseSyncedAt=0 的 upsert:existing.updated_at(≈now) > 0 → rejected_stale。
+    // 修前:首建存客户端 0,此处 0<=0 会被误 applied = 双写击穿(BLOCKER-1 正是修这个)。
+    const r = await backend.upsertClientSession(mkSession({ id: "s-b1", title: "改", updatedAt: 0 }), 0);
+    assert.equal(r, "rejected_stale");
+  });
+
+  maybe("MAJOR-2 软删会话 late-cost:map-hit 但会话已软删 → noop 不 park", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-late", userId: "u-1" }));
+    await backend.appendServerAuthoredMessageForRequest("req-late", "s-late", "u-1", {
+      id: "srv-late",
+      role: "assistant",
+    } as MessageLike & { id: string });
+    // 软删会话(map 仍在,未过 7d GC)。
+    assert.equal(await backend.deleteClientSession("s-late", "u-1"), true);
+    // late-cost 到达:map-hit 但会话已软删 → noop(不 park,防永不 drain 的孤儿 pending)。
+    assert.deepEqual(await backend.appendCostCredits("req-late", "u-1", "42"), { applied: "noop" });
+    const pend = await pool.query("SELECT 1 FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2", ["req-late", "u-1"]);
+    assert.equal(pend.rowCount, 0, "软删会话 late-cost 不应 park pending");
+  });
 });
 
 describe("pgSessionsBackend §9 并发(双连接 barrier)", () => {
@@ -391,14 +416,93 @@ describe("pgSessionsBackend §9 并发(双连接 barrier)", () => {
 
   maybe("并发 upsert stale 竞态:恰一个 applied,另一个 rejected_stale", async () => {
     await backend.upsertClientSession(mkSession({ updatedAt: 1000 }));
-    // 两个都以 baseSyncedAt=1000 进入(都看到 updated_at=1000)→ FOR UPDATE 串行:先者 applied
-    // 并 bump updated_at>1000,后者在锁下见 updated_at>1000 → rejected_stale。
+    // BLOCKER-1:首建 updated_at 现取 MAX(客户端, 服务端 now) → 读回真实存库版本作 baseSyncedAt
+    // (两并发都以它进入)。FOR UPDATE 串行:先者 applied 并 bump 版本,后者在锁下见版本已推进
+    // → rejected_stale。
+    const base = (await backend.getClientSession("s-1", "u-1"))!.updatedAt;
     const [a, b] = await Promise.all([
-      backend.upsertClientSession(mkSession({ title: "A", updatedAt: 2000 }), 1000),
-      backend.upsertClientSession(mkSession({ title: "B", updatedAt: 2000 }), 1000),
+      backend.upsertClientSession(mkSession({ title: "A", updatedAt: base + 1 }), base),
+      backend.upsertClientSession(mkSession({ title: "B", updatedAt: base + 1 }), base),
     ]);
     const outcomes = [a, b].sort();
     assert.deepEqual(outcomes, ["applied", "rejected_stale"]);
+  });
+
+  maybe("BLOCKER-1 双连接首建竞态 barrier:updatedAt=0 并发首建 → 恰一 applied 一 rejected_stale", async () => {
+    // 全新 id、无既有行、两并发首建、baseSyncedAt 默认 0、updatedAt=0。修前两者都 store 0 →
+    // 后者 ON CONFLICT WHERE 0<=0 命中 → 双 applied(双写击穿)。修后:先者 store MAX(0,now)=now,
+    // 后者在 FOR UPDATE/ON CONFLICT 串行下见 now>0(>baseSyncedAt 0)→ 哨兵 ROLLBACK → rejected_stale。
+    const [a, b] = await Promise.all([
+      backend.upsertClientSession(mkSession({ id: "s-race1", title: "A", updatedAt: 0 })),
+      backend.upsertClientSession(mkSession({ id: "s-race1", title: "B", updatedAt: 0 })),
+    ]);
+    assert.deepEqual([a, b].sort(), ["applied", "rejected_stale"]);
+    // 恰一行落库,updated_at 是服务端时钟(≠0)。
+    const got = await backend.getClientSession("s-race1", "u-1");
+    assert.ok(got && got.updatedAt > 0, "落库版本应是服务端时钟(>0)");
+  });
+
+  maybe("MAJOR-1 appendForRequest × sweepGc 交错:锁序统一(session→map→pending)无死锁,状态收敛", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-lock", userId: "u-1" }));
+    // 预置若干"老" pending/map(8d 前)触发 sweepGc 实际删除,制造与 appendForRequest 的 map/pending
+    // 锁争用面(修前 appendForRequest 锁序 pending→map 与 sweepGc 的 map→pending 反序 → 死锁环)。
+    const oldTs = Date.now() - 8 * 24 * 60 * 60_000;
+    for (let i = 0; i < 20; i++) {
+      await pool.query(
+        "INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id, written_at) VALUES ($1,$2,$3,$4,$5)",
+        [`gcmap-${i}`, "u-1", "s-lock", `gm-${i}`, oldTs],
+      );
+      await pool.query(
+        "INSERT INTO pending_usage_patches (request_id, user_id, cost_credits, created_at) VALUES ($1,$2,$3,$4)",
+        [`gcpend-${i}`, "u-1", "1", oldTs],
+      );
+    }
+    // 并发:多路 appendForRequest + appendCostCredits(锁 map→pending)与 sweepGc(删 map→pending)交错。
+    const ops: Promise<unknown>[] = [];
+    for (let i = 0; i < 12; i++) {
+      ops.push(
+        backend.appendServerAuthoredMessageForRequest(`fr-${i}`, "s-lock", "u-1", {
+          id: `srv-fr-${i}`,
+          role: "assistant",
+        } as MessageLike & { id: string }),
+      );
+      ops.push(backend.appendCostCredits(`fr-${i}`, "u-1", "5"));
+      ops.push(backend.sweepUsageAggregationGc());
+    }
+    const settled = await Promise.allSettled(ops);
+    const deadlocks = settled.filter((s) => {
+      if (s.status !== "rejected") return false;
+      const r = (s as PromiseRejectedResult).reason as { code?: string; message?: string } | undefined;
+      return r?.code === "40P01" || /deadlock/i.test(String(r?.message ?? r ?? ""));
+    });
+    assert.equal(deadlocks.length, 0, "锁序统一后不应出现死锁(40P01)");
+    // 收敛:每个 fr-i 的 map 恰一行、pending 无残留(append drain 或 cost hit 后必无 pending)。
+    for (let i = 0; i < 12; i++) {
+      const map = await pool.query("SELECT 1 FROM server_authored_request_map WHERE request_id=$1 AND user_id=$2", [`fr-${i}`, "u-1"]);
+      assert.equal(map.rowCount, 1, `fr-${i} map 应恰一行`);
+      const pend = await pool.query("SELECT 1 FROM pending_usage_patches WHERE request_id=$1", [`fr-${i}`]);
+      assert.equal(pend.rowCount, 0, `fr-${i} pending 不应残留`);
+    }
+  });
+
+  maybe("MAJOR-2 delete × costCredits barrier:并发不产生孤儿 pending", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-dc", userId: "u-1" }));
+    await backend.appendServerAuthoredMessageForRequest("req-dc", "s-dc", "u-1", {
+      id: "srv-dc",
+      role: "assistant",
+    } as MessageLike & { id: string });
+    // 并发软删 + late-cost:两者在 client_sessions 行锁上串行。cost 先 → patch(applied);
+    // delete 先 → cost 见软删 → noop。两序都不 park。
+    const [, costRes] = await Promise.all([
+      backend.deleteClientSession("s-dc", "u-1"),
+      backend.appendCostCredits("req-dc", "u-1", "77"),
+    ]);
+    assert.ok(
+      costRes.applied === "patched" || costRes.applied === "noop",
+      `cost 结果应为 patched/noop,实为 ${costRes.applied}`,
+    );
+    const pend = await pool.query("SELECT 1 FROM pending_usage_patches WHERE request_id=$1", ["req-dc"]);
+    assert.equal(pend.rowCount, 0, "并发 delete × cost 不应产生孤儿 pending");
   });
 });
 

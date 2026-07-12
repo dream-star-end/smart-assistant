@@ -20,6 +20,7 @@
 // 函数体内(运行时),模块顶层不互相解引用 → ES module 环安全(function 声明实例化即就绪,
 // 常量在首次 API 调用时早已初始化)。
 
+import type { MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import {
   appendServerAuthoredPure,
   ARCHIVE_CHUNK_MAX_BYTES,
@@ -248,5 +249,216 @@ export function planAppendServerAuthored(
     archivedThroughSeq: spill.archivedThroughSeq,
     chunksToInsert: spill.chunksToInsert,
     idsToInsert: spill.idsToInsert,
+  }
+}
+
+// ── cost-only patch 变更集(RFC D6b;appendCostCredits 的 map-hit 分支决策)───────
+
+/**
+ * {@link planCostPatch} 的输出。'not_found'/'noop' 是终态(不带变更集):
+ *   - not_found:目标 (msgId, _source==='server') 不在热尾巴 —— **执行层**据此查 archived_ids
+ *     判定 noop(已归档)/ park pending(被删/编辑 out-of-band),plan 不查 DB。
+ *   - noop:幂等重放(prevCost===costCredits,不 bump _seq)或 spill 后 tail 仍超限(理论不可达)。
+ */
+export type CostPatchPlan =
+  | { kind: 'not_found' }
+  | { kind: 'noop' }
+  | {
+      kind: 'patch'
+      /** 写回行的热尾巴。 */
+      tail: MessageLike[]
+      /** JSON.stringify(tail) —— plan 已算好,执行层复用。 */
+      finalJson: string
+      /** 写回 archived_through_seq。 */
+      archivedThroughSeq: number
+      chunksToInsert: SpillChunkPlan[]
+      idsToInsert: string[]
+    }
+
+/**
+ * **cost-only patch 决策**(纯) —— 由 appendCostCredits 的 map-hit 分支抽出(定位目标 server 行
+ * → 幂等判定 → in-place patch usage.costCredits + bump _seq → spill 决策 → 超限判定)。**不触碰 DB**。
+ *
+ * 执行层负责:取锁、读会话行、(not_found 时)查 archived_ids、落 spill 变更集 + 主行 UPDATE
+ * (next_seq = next_seq + 1)。双 backend(SQLite / PG)复用本决策,不各养一份(RFC D6b 防漂移)。
+ *
+ * @param messages 会话热尾巴消息快照(已解析);@param msgId server_authored_request_map 定位的目标
+ *   消息 id;@param costCredits 要写入的绝对成本值(非增量);@param currentNextSeq patch 消息拿的
+ *   新 _seq(执行层从 next_seq 读、`>0 ? : 1` 归一后传入);@param currentArchivedThroughSeq 既有归档水位。
+ */
+export function planCostPatch(
+  messages: MessageLike[],
+  msgId: string,
+  costCredits: string,
+  currentNextSeq: number,
+  currentArchivedThroughSeq: number,
+): CostPatchPlan {
+  const idx = messages.findIndex((m) => m && m.id === msgId && m._source === 'server')
+  if (idx < 0) return { kind: 'not_found' }
+
+  const existing = messages[idx] as MessageLike & { usage?: Record<string, unknown> }
+  const prevCost = existing.usage?.costCredits
+  // 幂等重放:成本未变 → noop,**不** bump _seq(防重试膨胀 seq 空间触发无谓尾巴重载)。
+  if (typeof prevCost === 'string' && prevCost === costCredits) return { kind: 'noop' }
+
+  const patched: MessageLike = {
+    ...existing,
+    _seq: currentNextSeq,
+    usage: { ...(existing.usage ?? {}), costCredits },
+  }
+  const next: MessageLike[] = [...messages]
+  next[idx] = patched
+
+  // 热尾巴 + 归档:patch bump _seq/加 usage 键后行可能微涨,越软阈值则 spill。
+  const spill = planSpillOverflow(next, currentArchivedThroughSeq)
+  const tail = spill.tail
+  const finalJson = JSON.stringify(tail)
+  // Size guard(spill 后作用于 tail;理论不可达)。命中 → noop:成本这处展示丢,计费权威在
+  // PG ledger 不影响钱;**不** fall through 到 pending(map 已精确定位,pending 是"还没找到目标")。
+  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) return { kind: 'noop' }
+
+  return {
+    kind: 'patch',
+    tail,
+    finalJson,
+    archivedThroughSeq: spill.archivedThroughSeq,
+    chunksToInsert: spill.chunksToInsert,
+    idsToInsert: spill.idsToInsert,
+  }
+}
+
+// ── delegate 成本按父客户端会话归并 变更集(RFC D6b;drainDelegateCost 决策)────────
+
+/** planDelegateCostMerge 的一批 pending 输入(执行层从 pending_usage_patches 读好后传入)。 */
+export interface DelegatePendingRow {
+  costCredits: string
+  delegateAgentId: string | null
+}
+
+/**
+ * {@link planDelegateCostMerge} 的输出。三个终态由执行层落不同 SQL 效果:
+ *   - no_positive_cost:Σ委派成本 ≤0(无归并价值)—— 执行层清本批 pending、不写库、不 bump _seq,
+ *     返回 merged='0'、drained=本批行数。
+ *   - target_not_ready:会话缺位 / 找不到队长 server 行 / spill 后超限 —— 执行层**保留** pending
+ *     (下一 turn 再试),返回 merged='0'、drained=0。
+ *   - merge:正常归并 —— 执行层落 spill + 主行 UPDATE(next_seq+1)+ 清本批 pending。
+ */
+export type DelegateCostMergePlan =
+  | { kind: 'no_positive_cost' }
+  | { kind: 'target_not_ready' }
+  | {
+      kind: 'merge'
+      tail: MessageLike[]
+      finalJson: string
+      archivedThroughSeq: number
+      chunksToInsert: SpillChunkPlan[]
+      idsToInsert: string[]
+      /** 本次归并的 delegate 成本总和(十进制字符串)。 */
+      merged: string
+      /** 归并后队长助手行 usage.delegates[] 快照(按 agentId 排序;含历史 + 本次)。 */
+      delegates: MessageUsageDelegate[]
+    }
+
+/**
+ * **委派成本按父客户端会话归并决策**(纯) —— 由 drainDelegateCostForClientSession 抽出
+ * (Σ委派成本 + per-agent 分组 → 累加进队长行 usage.costCredits/delegates[] → spill → 超限判定)。
+ * **不触碰 DB**。双 backend 复用本决策(RFC D6b 防漂移)。
+ *
+ * @param messages 队长客户端会话热尾巴消息(已解析);会话缺位时传 null(→ target_not_ready)。
+ * @param msgId 队长助手 server 行的消息 id。@param pendings 本批已读的委派 pending。
+ * @param currentNextSeq 队长行 patch 拿的新 _seq(会话缺位时传任意,不使用)。
+ * @param currentArchivedThroughSeq 既有归档水位。
+ *
+ * 语义要点(与旧核心逐字节对齐):累加不替换(base+Σ)、delegates 累加合并(读历史 → 叠加本次 →
+ * 排序)、Σ≤0 先判(即便会话缺位也清 pending)、缺位/找不到/超限保守保留 pending。
+ */
+export function planDelegateCostMerge(
+  messages: MessageLike[] | null,
+  msgId: string,
+  pendings: DelegatePendingRow[],
+  currentNextSeq: number,
+  currentArchivedThroughSeq: number,
+): DelegateCostMergePlan {
+  // Σ + per-agent 分组(仅正成本计入;缺 agentId 的成本仍进 Σ,不进 delegates[] 明细)。
+  let sum = 0n
+  const perAgent = new Map<string, bigint>()
+  for (const p of pendings) {
+    let v: bigint
+    try {
+      v = BigInt(p.costCredits)
+    } catch {
+      continue // skip malformed
+    }
+    if (v <= 0n) continue
+    sum += v
+    const aid = p.delegateAgentId
+    if (aid) perAgent.set(aid, (perAgent.get(aid) ?? 0n) + v)
+  }
+  // Σ≤0:无归并价值 → 执行层清 pending(即便会话缺位也清)。先于会话/队长行判定。
+  if (sum <= 0n) return { kind: 'no_positive_cost' }
+
+  // 会话缺位(尚未 sink / 已删)→ 保守保留 pending。
+  if (messages === null) return { kind: 'target_not_ready' }
+  const idx = messages.findIndex((m) => m && m.id === msgId && m._source === 'server')
+  // 找不到队长助手行(未落库 / 被删)→ 保守保留 pending。
+  if (idx < 0) return { kind: 'target_not_ready' }
+
+  const existing = messages[idx] as MessageLike & { usage?: Record<string, unknown> }
+  let base = 0n
+  try {
+    base = BigInt((existing.usage?.costCredits as string) ?? '0')
+  } catch {
+    base = 0n
+  }
+  const nextCost = (base + sum).toString()
+
+  // delegates[] 累加合并(读历史已归并明细 → 叠加本次 perAgent → 确定性排序)。
+  const mergedAgent = new Map<string, bigint>()
+  const prevDelegates = existing.usage?.delegates
+  if (Array.isArray(prevDelegates)) {
+    for (const d of prevDelegates as unknown[]) {
+      if (!d || typeof d !== 'object') continue
+      const aid = (d as { agentId?: unknown }).agentId
+      const cc = (d as { costCredits?: unknown }).costCredits
+      if (typeof aid !== 'string' || !aid) continue
+      try {
+        mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + BigInt(String(cc ?? '0')))
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  for (const [aid, v] of perAgent) mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + v)
+  const delegates: MessageUsageDelegate[] = [...mergedAgent.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([agentId, v]) => ({ agentId, costCredits: v.toString() }))
+
+  const patched: MessageLike = {
+    ...existing,
+    _seq: currentNextSeq,
+    usage: {
+      ...(existing.usage ?? {}),
+      costCredits: nextCost,
+      ...(delegates.length > 0 ? { delegates } : {}),
+    },
+  }
+  const next: MessageLike[] = [...messages]
+  next[idx] = patched
+
+  const spill = planSpillOverflow(next, currentArchivedThroughSeq)
+  const tail = spill.tail
+  const finalJson = JSON.stringify(tail)
+  // 超限拒绝(理论不可达):保留 pending,不写库(下一轮 / 修 blob 后仍可归并)。
+  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) return { kind: 'target_not_ready' }
+
+  return {
+    kind: 'merge',
+    tail,
+    finalJson,
+    archivedThroughSeq: spill.archivedThroughSeq,
+    chunksToInsert: spill.chunksToInsert,
+    idsToInsert: spill.idsToInsert,
+    merged: sum.toString(),
+    delegates,
   }
 }

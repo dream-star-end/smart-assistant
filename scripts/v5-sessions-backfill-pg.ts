@@ -11,9 +11,10 @@
  * ── 权威状态机合法转换(RFC §D1/D4)──
  *   (无行) --initial-->            prepared(gen=1) --全量校验绿--> pg_authoritative(gen=1)
  *   prepared --retry-initial-->    prepared(gen+1) --全量校验绿--> pg_authoritative(gen+1)
+ *   pg_authoritative --disaster-restore-to-sqlite--> sqlite_disaster_recovered(gen+1)(反灌 PG/dump → SQLite)
  *   sqlite_disaster_recovered --re-cutover--> prepared(gen+1) --绿--> pg_authoritative(gen+1)
- *   (灾难反灌 pg_authoritative→sqlite_disaster_recovered 由 deploy-v5.sh 的 recover 流程做,
- *    本脚本只消费该状态,不生产它。)
+ *   (灾难反灌 pg_authoritative→sqlite_disaster_recovered 由本脚本 disaster-restore-to-sqlite 子命令产生
+ *    (与 deploy-v5.sh 的 DR 流程配合);re-cutover-from-sqlite 消费该状态推回 pg_authoritative,形成闭环。)
  *
  * ── 起手事务与推进顺序(RFC §D4,R4 双写故障恢复协议)──
  *   1. 起手事务:写 prepared + 新 generation + 新 cutover_id(retry/re-cutover 同事务清六表)→ commit。
@@ -44,15 +45,25 @@
  *     retry-initial           首灌失败重试(前置:authority='prepared' + master 已停)
  *     re-cutover-from-sqlite  灾难反灌后重割接(前置:authority='sqlite_disaster_recovered'
  *                             + master 已停 + 交互确认;--yes 跳过确认供演练自动化)
+ *     disaster-restore-to-sqlite  灾难反灌 PG→SQLite(前置:authority='pg_authoritative' + master 已停
+ *                             + 交互确认;数据源默认=当前 PG,--from-dump 从 pg_dump 归档反灌;
+ *                             推进 pg_authoritative→sqlite_disaster_recovered,与 re-cutover 闭环)
  *     repair-manifest         manifest 与 PG 状态不一致修复(--cutover-id 必填,须与 PG 行一致;
  *                             只收敛 manifest 到已验证 PG 状态行,永不改 PG、永不提升 authority)
  *     status                  只读:打印 PG 状态行 + manifest + 六表 counts
  *
+ *   生产割接/反灌子命令(initial / retry-initial / re-cutover-from-sqlite / disaster-restore-to-sqlite)
+ *   **必须显式 --sqlite <path> 与 --manifest <path>**,缺任一即 usage 报错退出(exit 2),绝不落默认路径;
+ *   status / repair-manifest 允许缺省(仅 manifest),用默认路径时打印 [warn]。
+ *
  *   flags:
- *     --sqlite <path>      SQLite 源路径(默认 $OPENCLAUDE_HOME/sessions.db)
- *     --manifest <path>    本地 manifest 路径(默认 $OPENCLAUDE_HOME/sessions-store-authority.json)
+ *     --sqlite <path>      SQLite 路径(生产割接/反灌子命令必须显式;status/repair-manifest 缺省
+ *                          回退 $OPENCLAUDE_HOME/sessions.db)
+ *     --manifest <path>    本地 manifest 路径(同上强制规则;缺省 $OPENCLAUDE_HOME/sessions-store-authority.json)
  *     --cutover-id <hex>   repair-manifest 用:必须与 PG 状态行 cutover_id 完全一致
- *     --yes                re-cutover-from-sqlite 用:跳过交互确认(演练自动化)
+ *     --from-dump <path>   disaster-restore-to-sqlite 用:从 pg_dump 归档(-Fc/-Fd/-Ft)pg_restore 到
+ *                          临时库后反灌(主应用库不可用时的数据源);缺省则从当前 PG(DATABASE_URL)反灌
+ *     --yes                initial / retry-initial / re-cutover / disaster-restore 用:跳过交互确认(演练自动化)
  *     -h / --help          帮助
  *
  *   env:
@@ -71,15 +82,17 @@ import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   closeSync,
+  copyFileSync,
   existsSync,
   fsyncSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import * as readline from "node:readline";
 
 const { Client } = pg;
@@ -216,8 +229,23 @@ function pkString(spec: TableSpec, row: Row): string {
 }
 
 // ─────────────────────────── CLI 解析 ───────────────────────────
-type Sub = "initial" | "retry-initial" | "re-cutover-from-sqlite" | "repair-manifest" | "status";
-const SUBS: Sub[] = ["initial", "retry-initial", "re-cutover-from-sqlite", "repair-manifest", "status"];
+type Sub =
+  | "initial"
+  | "retry-initial"
+  | "re-cutover-from-sqlite"
+  | "disaster-restore-to-sqlite"
+  | "repair-manifest"
+  | "status";
+const SUBS: Sub[] = [
+  "initial",
+  "retry-initial",
+  "re-cutover-from-sqlite",
+  "disaster-restore-to-sqlite",
+  "repair-manifest",
+  "status",
+];
+// 生产割接/反灌子命令:强制显式 --sqlite 与 --manifest(不落默认路径,MAJOR-4)。
+const PRODUCTION_SUBS: Sub[] = ["initial", "retry-initial", "re-cutover-from-sqlite", "disaster-restore-to-sqlite"];
 
 interface Args {
   sub: Sub;
@@ -225,6 +253,11 @@ interface Args {
   manifest: string;
   cutoverId: string | null;
   yes: boolean;
+  /** disaster-restore-to-sqlite 用:从 pg_dump 归档反灌(缺省=从当前 PG 反灌)。 */
+  fromDump: string | null;
+  /** 用户是否显式传了 --sqlite / --manifest(默认值仍算好,供 status/repair 兜底 + warn)。 */
+  sqliteExplicit: boolean;
+  manifestExplicit: boolean;
 }
 
 function usage(msg?: string): never {
@@ -232,8 +265,9 @@ function usage(msg?: string): never {
   console.error(
     [
       "usage: v5-sessions-backfill-pg.ts <子命令> [flags]",
-      "  子命令: initial | retry-initial | re-cutover-from-sqlite | repair-manifest | status",
-      "  flags : --sqlite <path> --manifest <path> --cutover-id <hex> --yes",
+      "  子命令: initial | retry-initial | re-cutover-from-sqlite | disaster-restore-to-sqlite | repair-manifest | status",
+      "  flags : --sqlite <path> --manifest <path> --cutover-id <hex> --from-dump <path> --yes",
+      "  强制 : initial/retry-initial/re-cutover-from-sqlite/disaster-restore-to-sqlite 必须显式 --sqlite 与 --manifest",
       "  env   : DATABASE_URL(必填) OPENCLAUDE_HOME OC_V5_UNIT OC_SESSIONS_ASSUME_MASTER_STOPPED",
     ].join("\n"),
   );
@@ -251,6 +285,9 @@ function parseArgs(argv: string[]): Args {
     manifest: join(home, "sessions-store-authority.json"),
     cutoverId: null,
     yes: false,
+    fromDump: null,
+    sqliteExplicit: false,
+    manifestExplicit: false,
   };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -259,11 +296,27 @@ function parseArgs(argv: string[]): Args {
       if (v === undefined) usage(`缺少 ${a} 的值`);
       return v;
     };
-    if (a === "--sqlite") out.sqlite = next();
-    else if (a === "--manifest") out.manifest = next();
-    else if (a === "--cutover-id") out.cutoverId = next();
+    if (a === "--sqlite") {
+      out.sqlite = next();
+      out.sqliteExplicit = true;
+    } else if (a === "--manifest") {
+      out.manifest = next();
+      out.manifestExplicit = true;
+    } else if (a === "--cutover-id") out.cutoverId = next();
+    else if (a === "--from-dump") out.fromDump = next();
     else if (a === "--yes") out.yes = true;
     else usage(`未知参数: ${a}`);
+  }
+  // MAJOR-4:生产割接/反灌子命令强制显式 --sqlite 与 --manifest(不落默认路径,防误用)。
+  if (PRODUCTION_SUBS.includes(out.sub) && (!out.sqliteExplicit || !out.manifestExplicit)) {
+    usage(
+      `${out.sub}:生产割接/反灌子命令(initial/retry-initial/re-cutover-from-sqlite/disaster-restore-to-sqlite)` +
+        "必须显式 --sqlite <path> 与 --manifest <path>,不给默认路径。",
+    );
+  }
+  // status/repair-manifest 允许缺省(它们只读/写 manifest,不动权威六表);用默认 manifest 路径时告警。
+  if ((out.sub === "status" || out.sub === "repair-manifest") && !out.manifestExplicit) {
+    console.warn(`[warn] ${out.sub} 未显式 --manifest,使用默认路径 ${out.manifest}`);
   }
   return out;
 }
@@ -441,9 +494,8 @@ function buildSqliteMap(
   return map;
 }
 
-/** PG 侧:keyset 分页流式建 pk→rowDigest 映射(LIMIT 有界每查询 buffer,large payload 小 batch)。 */
-async function buildPgMap(client: pg.Client, spec: TableSpec): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
+/** PG 侧 keyset 分页流式遍历(LIMIT 有界每查询 buffer,large payload 小 batch)。回调逐行消费,不驻留全表。 */
+async function forEachPgRow(client: pg.Client, spec: TableSpec, cb: (row: Row) => void): Promise<void> {
   const order = spec.pkCols.join(",");
   const batchRows = spec.largePayload ? 50 : 500;
   let last: unknown[] | null = null;
@@ -460,16 +512,27 @@ async function buildPgMap(client: pg.Client, spec: TableSpec): Promise<Map<strin
     }
     const res = await client.query(sql, params);
     if (res.rows.length === 0) break;
-    for (const row of res.rows as Row[]) map.set(pkString(spec, row), rowDigest(spec, row));
+    for (const row of res.rows as Row[]) cb(row);
     const lastRow = res.rows[res.rows.length - 1] as Row;
     last = spec.pkCols.map((c) => lastRow[c]);
     if (res.rows.length < batchRows) break;
   }
+}
+
+/** PG 侧:流式建 pk→rowDigest 映射(复用 forEachPgRow 分页)。 */
+async function buildPgMap(client: pg.Client, spec: TableSpec): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  await forEachPgRow(client, spec, (row) => map.set(pkString(spec, row), rowDigest(spec, row)));
   return map;
 }
 
 function tableDigestOf(map: Map<string, string>): string {
   return sha256([...map.values()].sort().join("\n"));
+}
+
+/** 全库 source_digest = sha256(六表 "表名:tableDigest" 按固定表序 join)。灌前展示与校验产物共用同一算法。 */
+function combineSourceDigest(tableDigests: Record<string, string>): string {
+  return sha256(SPECS.map((s) => `${s.table}:${tableDigests[s.table]}`).join("\n"));
 }
 
 /** 对比一张表的 SQLite vs PG 映射,返回是否一致 + 诊断报告。 */
@@ -601,7 +664,7 @@ async function verifyAll(
   const inv = checkClientSessionsInvariants(sqliteDb);
   for (const line of inv.report) console.log(line);
   if (!inv.ok) ok = false;
-  const sourceDigest = sha256(SPECS.map((s) => `${s.table}:${tableDigests[s.table]}`).join("\n"));
+  const sourceDigest = combineSourceDigest(tableDigests);
   return { ok, tableDigests, sourceDigest };
 }
 
@@ -633,8 +696,8 @@ interface Manifest {
   cutoverId: string;
 }
 
-/** 临时文件 + fsync + 原子 rename + 目录 fsync(RFC R4)。PG commit 成功后才调用。 */
-function writeManifestAtomic(path: string, obj: Manifest): void {
+/** 临时文件 + fsync + 原子 rename + 目录 fsync(RFC R4)。manifest 与灾难 nonce 文件共用。 */
+function writeJsonAtomic(path: string, obj: unknown): void {
   const tmp = `${path}.tmp.${process.pid}`;
   const fd = openSync(tmp, "w");
   try {
@@ -651,6 +714,11 @@ function writeManifestAtomic(path: string, obj: Manifest): void {
   } finally {
     closeSync(dfd);
   }
+}
+
+/** manifest 原子双写(RFC R4)。PG commit 成功后才调用。 */
+function writeManifestAtomic(path: string, obj: Manifest): void {
+  writeJsonAtomic(path, obj);
 }
 
 function readManifest(path: string): Manifest | null {
@@ -670,6 +738,35 @@ async function confirmYes(promptText: string): Promise<boolean> {
     return ans.trim() === "yes";
   } finally {
     rl.close();
+  }
+}
+
+// ─────────────────────────── 源侧展示 + 确认(灌前对账)───────────────────────────
+/** 打印源 SQLite 的 realpath + 六表 count + 逐表 tableDigest 前16位 + 全库 source_digest(只展示,不确认)。 */
+function printSqliteSourceSummary(sqliteDb: Database.Database, sqlitePath: string): void {
+  console.log("── 源 SQLite 现状(将全量灌入 PG)──");
+  console.log(`  · realpath: ${realpathSync(sqlitePath)}`);
+  const tableDigests: Record<string, string> = {};
+  for (const spec of SPECS) {
+    const map = buildSqliteMap(sqliteDb, spec);
+    const td = tableDigestOf(map);
+    tableDigests[spec.table] = td;
+    console.log(`  · ${spec.table}: ${map.size} 行 tableDigest=${td.slice(0, 16)}`);
+  }
+  console.log(`  · source_digest=${combineSourceDigest(tableDigests)}`);
+}
+
+/** initial/retry-initial 起手事务前:展示源 SQLite 摘要,非 --yes 时要求交互确认(输入 yes)。 */
+async function printSourceSummaryAndConfirm(sqliteDb: Database.Database, sqlitePath: string, args: Args): Promise<void> {
+  printSqliteSourceSummary(sqliteDb, sqlitePath);
+  if (args.yes) {
+    console.log("  [--yes] 跳过交互确认(演练自动化)");
+    return;
+  }
+  const ok = await confirmYes(`\n确认以上 SQLite 源(${sqlitePath})全量灌入 PG?输入 yes 继续: `);
+  if (!ok) {
+    console.error("✗ 用户未确认(未输入 yes),已取消。PG 未改动。");
+    process.exit(1);
   }
 }
 
@@ -703,6 +800,8 @@ async function cmdInitial(args: Args, client: pg.Client, sqliteDb: Database.Data
     const n = await countRows(client, spec.table);
     if (n !== 0) throw new Error(`前置失败:目标表 ${spec.table} 非空(${n} 行)。initial 要求六表全空。`);
   }
+  // 起手事务前:展示源 SQLite realpath + 六表 count/digest + source_digest,非 --yes 要求确认。
+  await printSourceSummaryAndConfirm(sqliteDb, args.sqlite, args);
   const cutoverId = randomBytes(16).toString("hex");
   console.log(`  · 分配 generation=1 cutover_id=${cutoverId}`);
   await prepareTx(client, { kind: "insert", cutoverId });
@@ -721,6 +820,8 @@ async function cmdRetryInitial(args: Args, client: pg.Client, sqliteDb: Database
     throw new Error(`前置失败:authority=${st.authority}(retry-initial 仅允许 prepared)。` +
       (st.authority === "pg_authoritative" ? "已割接完成,无需重试。" : "灾难反灌后请用 re-cutover-from-sqlite。"));
   }
+  // 起手事务前:展示源 SQLite realpath + 六表 count/digest + source_digest,非 --yes 要求确认。
+  await printSourceSummaryAndConfirm(sqliteDb, args.sqlite, args);
   const newGen = (BigInt(st.generation) + 1n).toString();
   const cutoverId = randomBytes(16).toString("hex");
   console.log(`  · 推进 generation ${st.generation} → ${newGen} cutover_id=${cutoverId}(同事务清六表)`);
@@ -746,7 +847,8 @@ async function cmdReCutover(args: Args, client: pg.Client, sqliteDb: Database.Da
     throw new Error(`前置失败:authority=${st.authority}(re-cutover 仅允许 sqlite_disaster_recovered)。` +
       "该状态由 deploy-v5.sh 的灾难反灌流程产生;正常割接用 initial/retry-initial。");
   }
-  // 清理前打印六表 count + digest,要求交互确认。
+  // 清理前打印两侧现状(源 SQLite 将覆盖 + 目标 PG 将被清空),再要求一次交互确认。
+  printSqliteSourceSummary(sqliteDb, args.sqlite);
   console.log("── 清理前 PG 六表现状(re-cutover 将清空后用 SQLite 全量覆盖)──");
   for (const spec of SPECS) {
     const pgMap = await buildPgMap(client, spec);
@@ -815,6 +917,292 @@ async function cmdStatus(args: Args, client: pg.Client): Promise<void> {
   }
 }
 
+// ─────────────────────────── 灾难反灌:PG → SQLite(disaster-restore-to-sqlite)───────────────────────────
+/** 可写打开 SQLite(反灌目标,须已存在承载覆盖)。better-sqlite3 默认可写。 */
+function openSqliteWritable(path: string): Database.Database {
+  if (!existsSync(path)) throw new Error(`SQLite 反灌目标不存在: ${path}(需已存在的 sessions.db 承载覆盖;--sqlite 指定)`);
+  return new Database(path, { fileMustExist: true });
+}
+
+/** SQLite 绑定值:int 列→整数字面值(normValue 已做 MAX_SAFE 断言),text 列→原样字符串,NULL→null。 */
+function sqliteBindValue(kind: ColKind, v: unknown): number | string | null {
+  const n = normValue(kind, v); // 校验 + MAX_SAFE 断言;int→十进制字符串,text→原样,null→null
+  if (n === null) return null;
+  return kind === "int" ? Number(n) : n;
+}
+
+/** 六表全量覆盖 SQLite:单事务内逐表 DELETE + 从源 PG 流式 INSERT(large payload 小 batch 控内存)。 */
+async function overwriteSqliteFromPg(sqliteDb: Database.Database, source: pg.Client): Promise<void> {
+  sqliteDb.exec("BEGIN IMMEDIATE");
+  try {
+    for (const spec of SPECS) {
+      sqliteDb.prepare(`DELETE FROM ${spec.table}`).run();
+      const placeholders = spec.cols.map(() => "?").join(",");
+      const insert = sqliteDb.prepare(`INSERT INTO ${spec.table} (${spec.cols.join(",")}) VALUES (${placeholders})`);
+      let total = 0;
+      await forEachPgRow(source, spec, (row) => {
+        insert.run(...spec.cols.map((c) => sqliteBindValue(spec.kind[c], row[c])));
+        total++;
+      });
+      console.log(`  · 覆盖 ${spec.table}: ${total} 行`);
+    }
+    sqliteDb.exec("COMMIT");
+  } catch (e) {
+    try {
+      sqliteDb.exec("ROLLBACK");
+    } catch {
+      /* 事务已断 → 忽略 */
+    }
+    throw e;
+  }
+}
+
+/** 灾难反灌栅栏事务:主 PG pg_authoritative → sqlite_disaster_recovered,gen+1,清 source_digest/completed_at。 */
+async function disasterAdvanceTx(
+  client: pg.Client,
+  expectedGeneration: string,
+  newGeneration: string,
+  newCutoverId: string,
+): Promise<void> {
+  await client.query("BEGIN");
+  try {
+    const upd = await client.query(
+      `UPDATE ${STATE_TABLE}
+          SET authority = 'sqlite_disaster_recovered', generation = $1, cutover_id = $2,
+              source_digest = NULL, completed_at = NULL
+        WHERE singleton = true AND authority = 'pg_authoritative' AND generation = $3`,
+      [newGeneration, newCutoverId, expectedGeneration],
+    );
+    if (upd.rowCount !== 1) {
+      throw new Error(
+        `灾难反灌栅栏失败:期望 (authority=pg_authoritative, generation=${expectedGeneration}) ` +
+          `但 UPDATE 命中 ${upd.rowCount} 行(状态被并发改动?)。已 rollback。`,
+      );
+    }
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  }
+}
+
+/** 灾难 nonce 审计文件(manifest 同目录),记录 {cutoverId, ts, reason}。裁决权威仍是 manifest↔PG 一致性。 */
+function writeDisasterNonce(manifestPath: string, cutoverId: string, ts: number, reason: string): string {
+  const noncePath = join(dirname(manifestPath), "sessions-disaster-nonce.json");
+  writeJsonAtomic(noncePath, { cutoverId, ts, reason });
+  return noncePath;
+}
+
+// ── --from-dump:pg_dump 归档 → 临时库(pg_restore)工具链 ──
+interface PgConn {
+  host: string;
+  port: string;
+  user: string;
+  password: string;
+  database: string;
+}
+function parsePgConn(dbUrl: string): PgConn {
+  const u = new URL(dbUrl);
+  return {
+    host: u.hostname,
+    port: u.port || "5432",
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    database: u.pathname.replace(/^\//, ""),
+  };
+}
+/** 从 DATABASE_URL 派生只换 database 的连接串(临时库读取用)。 */
+function pgUrlWithDatabase(dbUrl: string, database: string): string {
+  const u = new URL(dbUrl);
+  u.pathname = `/${database}`;
+  return u.toString();
+}
+/** pg 客户端工具的连接 env(host/port/user/password 从 DATABASE_URL 复用)。 */
+function pgToolEnv(conn: PgConn): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, PGHOST: conn.host, PGPORT: conn.port, PGUSER: conn.user };
+  if (conn.password) env.PGPASSWORD = conn.password;
+  return env;
+}
+function assertPgTool(tool: string): void {
+  try {
+    execFileSync(tool, ["--version"], { stdio: "ignore" });
+  } catch (e) {
+    throw new Error(
+      `--from-dump 需要 PostgreSQL 客户端工具 ${tool},但不可用(${(e as Error).message ?? e})。` +
+        "请在执行机安装 postgresql-client 后重试。",
+    );
+  }
+}
+/** createdb 临时库 → pg_restore 归档进去。失败尽力 dropdb 半成品后抛清晰错误。 */
+function restoreDumpToTempDb(dbUrl: string, dumpPath: string, tempDbName: string): void {
+  if (!existsSync(dumpPath)) throw new Error(`--from-dump 归档不存在: ${dumpPath}`);
+  for (const t of ["createdb", "pg_restore", "dropdb"]) assertPgTool(t);
+  const conn = parsePgConn(dbUrl);
+  const env = pgToolEnv(conn);
+  console.log(`  · createdb ${tempDbName}`);
+  execFileSync("createdb", [tempDbName], { env, stdio: "inherit" });
+  console.log(`  · pg_restore ${dumpPath} → ${tempDbName}`);
+  try {
+    execFileSync("pg_restore", ["--no-owner", "--no-privileges", "-d", tempDbName, dumpPath], { env, stdio: "inherit" });
+  } catch (e) {
+    try {
+      execFileSync("dropdb", ["--if-exists", tempDbName], { env, stdio: "inherit" });
+    } catch {
+      /* 半成品清理失败 → 由 finally/人工兜底 */
+    }
+    throw new Error(
+      `pg_restore 失败(${(e as Error).message ?? e})。确认 --from-dump 是 pg_dump 归档格式(-Fc/-Fd/-Ft,非纯 SQL),` +
+        "且 PG 服务器(非应用库)可达、执行用户有 createdb 权限。",
+    );
+  }
+}
+function dropTempDb(dbUrl: string, tempDbName: string): void {
+  try {
+    execFileSync("dropdb", ["--if-exists", tempDbName], { env: pgToolEnv(parsePgConn(dbUrl)), stdio: "inherit" });
+    console.log(`  · 已清理临时库 ${tempDbName}`);
+  } catch (e) {
+    console.warn(`[warn] 临时库 ${tempDbName} 清理失败(${(e as Error).message ?? e});请人工 dropdb ${tempDbName}。`);
+  }
+}
+
+/**
+ * disaster-restore-to-sqlite:灾难反灌 PG(或 pg_dump 归档)→ SQLite,推进 pg_authoritative→sqlite_disaster_recovered。
+ * 自管连接:需可写 SQLite + 主 PG 连接容错(应用库不可用时优雅降级)+ 可选 --from-dump 临时库,不走共享 client 路径。
+ */
+async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
+  console.log("══ disaster-restore-to-sqlite:灾难反灌(PG/dump → SQLite,推进 sqlite_disaster_recovered)══");
+  assertMasterStopped();
+
+  // 可写打开 SQLite(反灌目标,须已存在)。
+  const sqliteDb = openSqliteWritable(args.sqlite);
+
+  // 主 PG(DATABASE_URL 指向的应用库):用于推进权威状态行。真灾难(应用库损毁/丢失)时可能连不上。
+  let mainClient: pg.Client | null = null;
+  let pgReachable = false;
+  try {
+    mainClient = new Client({ connectionString: dbUrl });
+    mainClient.on("error", (e: Error) => console.error("[pg] main client error:", e.message));
+    await mainClient.connect();
+    pgReachable = true;
+    console.log("  ✓ 主 PG(DATABASE_URL)连接成功");
+  } catch (e) {
+    mainClient = null;
+    pgReachable = false;
+    console.warn(`[warn] 主 PG(DATABASE_URL)连接失败:${(e as Error).message}`);
+  }
+
+  // 数据源:默认=主 PG;--from-dump=pg_restore 到临时库后读临时库。
+  let sourceClient: pg.Client | null = null;
+  let sourceOwned = false; // sourceClient 是否独立于 mainClient(需单独 end)
+  let tempDbName: string | null = null;
+
+  try {
+    if (args.fromDump) {
+      tempDbName = `oc_disaster_restore_${randomBytes(6).toString("hex")}`;
+      console.log(`── --from-dump:pg_dump 归档 → 临时库 ${tempDbName} ──`);
+      restoreDumpToTempDb(dbUrl, args.fromDump, tempDbName);
+      sourceClient = new Client({ connectionString: pgUrlWithDatabase(dbUrl, tempDbName) });
+      sourceClient.on("error", (e: Error) => console.error("[pg] temp client error:", e.message));
+      await sourceClient.connect();
+      sourceOwned = true;
+      console.log(`  ✓ 临时库 ${tempDbName} 连接成功(反灌数据源)`);
+    } else {
+      if (!pgReachable || !mainClient) {
+        throw new Error("默认数据源=主 PG,但主 PG 连接失败。真灾难(应用库不可用)请用 --from-dump <pg_dump 归档> 从备份反灌。");
+      }
+      sourceClient = mainClient;
+      sourceOwned = false;
+    }
+
+    await assertPgTablesExist(sourceClient);
+
+    // 源现状展示 + 目标 realpath,非 --yes 要求确认(备份/覆盖前对账)。
+    console.log(
+      `── 反灌数据源现状(${args.fromDump ? `pg_dump 临时库 ${tempDbName}` : "当前 PG(DATABASE_URL)"},将全量覆盖 SQLite)──`,
+    );
+    const srcTableDigests: Record<string, string> = {};
+    for (const spec of SPECS) {
+      const map = await buildPgMap(sourceClient, spec);
+      const td = tableDigestOf(map);
+      srcTableDigests[spec.table] = td;
+      console.log(`  · ${spec.table}: ${map.size} 行 tableDigest=${td.slice(0, 16)}`);
+    }
+    console.log(`  · source_digest=${combineSourceDigest(srcTableDigests)}`);
+    console.log(`  · 反灌目标 SQLite realpath: ${realpathSync(args.sqlite)}`);
+    if (!args.yes) {
+      const ok = await confirmYes(`\n确认备份并用以上源全量覆盖 SQLite(${args.sqlite})六表?输入 yes 继续: `);
+      if (!ok) {
+        console.error("✗ 用户未确认(未输入 yes),已取消。SQLite 与 PG 均未改动。");
+        process.exit(1);
+      }
+    } else {
+      console.log("  [--yes] 跳过交互确认(演练自动化)");
+    }
+
+    // 1) 备份原 SQLite。
+    const ts = Date.now();
+    const bak = `${args.sqlite}.pre-disaster-${ts}.bak`;
+    copyFileSync(args.sqlite, bak);
+    console.log(`  ✓ 已备份原 SQLite → ${bak}`);
+
+    // 2) 六表全量覆盖 SQLite(单事务清+灌)。
+    console.log("── 反灌:源 → SQLite 六表全量覆盖(单事务)──");
+    await overwriteSqliteFromPg(sqliteDb, sourceClient);
+
+    // 3) 反灌后全量校验:SQLite(新写)vs 源。任何不一致 fail-closed(.bak 仍在可人工恢复)。
+    const v = await verifyAll(sqliteDb, sourceClient);
+    if (!v.ok) {
+      throw new Error(`反灌后全量校验未通过 —— SQLite 与源不一致。备份 ${bak} 仍在,可人工恢复。fail-closed 退出。`);
+    }
+    console.log(`  ✓ 反灌校验全绿。source_digest=${v.sourceDigest}`);
+
+    // 4) 推进权威状态。
+    const newCut = randomBytes(16).toString("hex");
+    const reason = args.fromDump ? `disaster-restore-from-dump:${basename(args.fromDump)}` : "disaster-restore-from-current-pg";
+    if (pgReachable && mainClient) {
+      const st = await readState(mainClient);
+      if (!st) throw new Error("推进失败:主 PG 状态表无行。灾难反灌只能从 pg_authoritative 推进。");
+      if (st.authority !== "pg_authoritative") {
+        throw new Error(`推进失败:主 PG authority=${st.authority}(灾难反灌只从 pg_authoritative 推进)。当前状态非常规,请人工核查。`);
+      }
+      const newGen = (BigInt(st.generation) + 1n).toString();
+      await disasterAdvanceTx(mainClient, st.generation, newGen, newCut);
+      console.log(
+        `  ✓ 主 PG 状态推进 pg_authoritative → sqlite_disaster_recovered(generation ${st.generation} → ${newGen}, cutover_id=${newCut})`,
+      );
+      writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
+      console.log(`  ✓ manifest 已原子写入 ${args.manifest}(authority=sqlite_disaster_recovered, generation=${newGen})`);
+      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
+      console.log(`  ✓ 灾难 nonce 审计文件 → ${noncePath}`);
+    } else {
+      // 主应用库不可达(仅 --from-dump 且应用库连不上):只写 manifest + nonce,警告须人工推进状态行。
+      const srcState = await readState(sourceClient);
+      const newGen = ((srcState ? BigInt(srcState.generation) : 0n) + 1n).toString();
+      writeManifestAtomic(args.manifest, { authority: "sqlite_disaster_recovered", generation: Number(newGen), cutoverId: newCut });
+      console.log(`  ✓ manifest 已原子写入 ${args.manifest}(authority=sqlite_disaster_recovered, generation=${newGen})`);
+      const noncePath = writeDisasterNonce(args.manifest, newCut, ts, reason);
+      console.log(`  ✓ 灾难 nonce 审计文件 → ${noncePath}`);
+      console.warn(
+        "[warn] 主 PG 不可达,状态行未推进;manifest/nonce 已就绪但与 PG 尚不一致。" +
+          "PG 恢复后须人工核对并把状态行推进到 authority='sqlite_disaster_recovered'" +
+          `(generation=${newGen}, cutover_id=${newCut}),否则 master 起不来(fail-closed)。`,
+      );
+    }
+
+    // 5) 闭环提示。
+    console.log("✓ disaster-restore-to-sqlite 完成。");
+    console.log(
+      "  下一步闭环:master 现以 SQLite 灾难态起(env OC_SESSIONS_STORE=sqlite);待 PG 修复后," +
+        "跑 re-cutover-from-sqlite 用本 SQLite 全量覆盖 PG,推回 pg_authoritative。",
+    );
+  } finally {
+    sqliteDb.close();
+    if (sourceOwned && sourceClient) await sourceClient.end().catch(() => {});
+    if (mainClient) await mainClient.end().catch(() => {});
+    if (tempDbName) dropTempDb(dbUrl, tempDbName);
+  }
+}
+
 // ─────────────────────────── main ───────────────────────────
 function openSqliteReadonly(path: string): Database.Database {
   if (!existsSync(path)) throw new Error(`SQLite 源不存在: ${path}(--sqlite 覆盖或设 OPENCLAUDE_HOME)`);
@@ -826,6 +1214,12 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) throw new Error("缺少 env DATABASE_URL(PG 连接串)。");
+
+  // disaster-restore-to-sqlite 自管连接(可写 SQLite + 主 PG 连接容错 + 可选临时库),不走下面的共享 client 路径。
+  if (args.sub === "disaster-restore-to-sqlite") {
+    await cmdDisasterRestore(args, dbUrl);
+    return;
+  }
 
   const client = new Client({ connectionString: dbUrl });
   // checked-out client 级 error 监听:idle-in-tx 被服务端强断时不冒成进程级 uncaughtException。

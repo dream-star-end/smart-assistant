@@ -18,6 +18,8 @@ import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
 import {
   planAppendServerAuthored,
+  planCostPatch,
+  planDelegateCostMerge,
   planSpillOverflow,
   type SpillChunkPlan,
 } from './clientSessionsPlan.js'
@@ -1634,7 +1636,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
 
     const result = db.prepare(`
       INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt, @nextSeq, @archivedThroughSeq, @archivedCount)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, MAX(@updatedAt, @updatedAtFloor), @nextSeq, @archivedThroughSeq, @archivedCount)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -1643,8 +1645,10 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
         messages = excluded.messages,
         message_count = excluded.message_count,
         -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 MAX(既有+1, now, 客户端回传值)
-        -- 严格单调推进;新插入(无冲突)仍用客户端 @updatedAt(保持首建=客户端值语义,
-        -- 乐观并发 baseSyncedAt 链不断)。双 master 下同毫秒双写/时钟偏差被 cur+1 兜底。
+        -- 严格单调推进。**首建(BLOCKER-1)**:新插入的 updated_at 也取 MAX(客户端回传, 服务端时钟
+        -- 下限 @updatedAtFloor)—— 不再无条件信任客户端 @updatedAt(客户端可回传 0 / 旧值,首建
+        -- 后紧跟 baseSyncedAt=0 的第二个 PUT 会因 existing.updated_at 仍是 0 而击穿 stale 检测)。
+        -- 服务端时钟下限保证首建版本 ≥ now,双 master 同毫秒双写/时钟偏差被 cur+1 兜底。
         updated_at = MAX(client_sessions.updated_at + 1, @updatedAtFloor, excluded.updated_at),
         next_seq = excluded.next_seq,
         archived_through_seq = excluded.archived_through_seq,
@@ -2057,88 +2061,57 @@ async function _sqliteAppendCostCredits(
     ).get(requestId, userId) as { session_id: string; msg_id: string } | undefined
 
     if (mapRow) {
+      // 会话行含软删行读出(去 deleted_at IS NULL 过滤,读出 deleted_at):RFC D3 late-cost —
+      // map 指向已软删会话 → 返回 noop **不 park**(park 会留永不 drain 的孤儿 pending;delete
+      // 已级联清 delegate pending,直接成本 patch 也走本 noop)。双 backend 语义一致(消除差异点)。
       const sess = db.prepare(
-        'SELECT messages, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+        'SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ?'
       ).get(mapRow.session_id, userId) as {
-        messages: string; next_seq: number | null
+        messages: string; next_seq: number | null; deleted_at: number | null
         archived_through_seq: number | null; archived_count: number | null
       } | undefined
       if (sess) {
+        if (sess.deleted_at !== null) return { applied: 'noop' } // 软删会话 late-cost → noop 不 park
         let msgs: MessageLike[]
         try {
           const parsed = JSON.parse(sess.messages)
-          if (!Array.isArray(parsed)) {
-            // Malformed sessions blob — fall through to pending so the
-            // value isn't lost; admin can fix the blob and the next sink
-            // POST will drain.
-            msgs = []
-          } else {
-            msgs = parsed as MessageLike[]
-          }
+          // Malformed sessions blob → 视为空 → planCostPatch not_found → 下面 fall through 到 pending
+          // (值不丢,admin 修 blob 后下次 sink POST 再 drain)。
+          msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
         } catch {
           msgs = []
         }
-        const idx = msgs.findIndex(
-          (m) => m && m.id === mapRow.msg_id && m._source === 'server',
-        )
-        if (idx >= 0) {
-          const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> }
-          const prevCost = existing.usage?.costCredits
-          if (typeof prevCost === 'string' && prevCost === costCredits) {
-            // Idempotent retry — no-op, do NOT bump _seq.
-            return { applied: 'noop' }
-          }
-          const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0
-            ? sess.next_seq
-            : 1
-          const patched: MessageLike = {
-            ...existing,
-            _seq: currentNextSeq,
-            usage: { ...(existing.usage ?? {}), costCredits },
-          }
-          const next: MessageLike[] = [...msgs]
-          next[idx] = patched
-          // patch 会 bump _seq 并给 usage 加键,行可能微涨。热尾巴 + 归档:若因此越过
-          // 软阈值,同 upsert/append 口径 spill(把最老的消息搬进归档,行只留热尾巴)。
+        const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0 ? sess.next_seq : 1
+        // 决策抽到引擎中立的 planCostPatch(RFC D6b):双 backend 复用,不各养一份(幂等判定 /
+        // patch 构造 / spill / size guard 全在 plan)。执行层只落 SQL。
+        const plan = planCostPatch(msgs, mapRow.msg_id, costCredits, currentNextSeq, sess.archived_through_seq ?? 0)
+        if (plan.kind === 'noop') return { applied: 'noop' }
+        if (plan.kind === 'patch') {
           const nowMs = Date.now()
-          const spill = _spillOverflowCore(db, mapRow.session_id, userId, next, {
-            currentArchivedThroughSeq: sess.archived_through_seq ?? 0,
-            now: nowMs,
-          })
-          const newArchivedCount = (sess.archived_count ?? 0) + spill.archivedDelta
-          const tail = spill.tail
-          // Size guard — same MAX_SESSION_BYTES rule(spill 后作用于 tail;理论不可达)。
-          // 命中时返回 noop:成本这一处展示丢,但计费权威在 PG ledger,不影响钱。**不** fall
-          // through 到 pending —— map 已精确定位本 session+message,pending 是"还没找到目标"
-          // 机制,不是"目标满了"机制。调用方对 noop 记 observability。
-          const nextJson = JSON.stringify(tail)
-          if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
-            return { applied: 'noop' }
-          }
+          const archivedDelta = _executeSpillPlan(db, mapRow.session_id, userId, plan.chunksToInsert, plan.idsToInsert, nowMs)
+          const newArchivedCount = (sess.archived_count ?? 0) + archivedDelta
           db.prepare(
             'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
           ).run(
-            nextJson,
-            tail.length + newArchivedCount,
+            plan.finalJson,
+            plan.tail.length + newArchivedCount,
             nowMs,
             nowMs,
-            spill.archivedThroughSeq,
+            plan.archivedThroughSeq,
             newArchivedCount,
             mapRow.session_id,
             userId,
           )
           return { applied: 'patched' }
         }
-        // 目标 msg 不在热尾巴。若它已归档(spill 搬出),成本永远无法再落回尾巴 —— 直接
-        // 放弃(noop),别再徒劳 re-pending(map 仍指向已归档 msgId,re-pending 会陷入
-        // "每次 drain 都找不到 → 再 pending" 的循环,直到 24h GC)。成本展示丢一处,计费
-        // 权威在 PG ledger,不影响钱;调用方对 noop 记 observability。
+        // plan.kind === 'not_found':目标 msg 不在热尾巴。若已归档(spill 搬出),成本无法再落回
+        // 尾巴 → 直接 noop(别徒劳 re-pending 陷 "找不到→再 pending" 循环,直到 24h GC)。
+        // 未归档 = 真被删/编辑 out-of-band → 维持现有语义,fall through 到 pending。
         const archivedHit = db.prepare(
           'SELECT 1 FROM client_session_archived_ids WHERE session_id = ? AND msg_id = ?'
         ).get(mapRow.session_id, mapRow.msg_id)
         if (archivedHit) return { applied: 'noop' }
-        // 未归档 = 真的被删/编辑 out-of-band → 维持现有语义,fall through 到 pending,
-        // 留给可能复活的行拾取(与归档前行为一致)。
+        // 未归档 → fall through 到 pending(与归档前行为一致)。
       }
     }
 
@@ -2209,106 +2182,63 @@ async function _sqliteDrainDelegateCostForClientSession(
     }[]
     if (pendings.length === 0) return { merged: '0', drained: 0 }
 
-    let sum = 0n
-    // P2 债D — per-agent 明细:按 delegate_agent_id 分组求和(仅正成本计入)。缺 agentId
-    // (老 park / 拿不到归因)的成本仍进 sum(总额不丢),只是不出现在 delegates[] 明细里。
-    const perAgent = new Map<string, bigint>()
-    for (const p of pendings) {
-      let v: bigint
-      try { v = BigInt(p.cost_credits) } catch { continue /* skip malformed */ }
-      if (v <= 0n) continue
-      sum += v
-      const aid = p.delegate_agent_id
-      if (aid) perAgent.set(aid, (perAgent.get(aid) ?? 0n) + v)
-    }
-    if (sum <= 0n) {
-      // 只有非正/畸形成本 → 清掉这些行(无归并价值),不写库、不 bump _seq。
-      const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
-      for (const p of pendings) del.run(userId, p.request_id)
-      return { merged: '0', drained: pendings.length }
-    }
-
+    // 目标会话行(deleted_at IS NULL);缺位 → msgs=null 传给 plan(→ target_not_ready 保留)。
     const sess = db.prepare(
       'SELECT messages, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
     ).get(clientSessionId, userId) as {
       messages: string; next_seq: number | null
       archived_through_seq: number | null; archived_count: number | null
     } | undefined
-    // 目标会话缺位(尚未 sink / 已删)→ 保守:保留 pending,下一 turn 再试。
-    if (!sess) return { merged: '0', drained: 0 }
 
-    let msgs: MessageLike[]
-    try {
-      const parsed = JSON.parse(sess.messages)
-      msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
-    } catch {
-      msgs = []
-    }
-    const idx = msgs.findIndex((m) => m && m.id === msgId && m._source === 'server')
-    // 找不到队长助手行(未落库 / 被删)→ 保守保留 pending,下一 turn 再归并。
-    if (idx < 0) return { merged: '0', drained: 0 }
-
-    const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> }
-    let base = 0n
-    try { base = BigInt((existing.usage?.costCredits as string) ?? '0') } catch { base = 0n }
-    const nextCost = (base + sum).toString()
-    // P2 债D — 累加合并 usage.delegates[](与 costCredits 同"累加不替换"语义):先把已归并
-    // 的历史明细读进 map(sink 重放/多轮委派下本行可能已被 drain 过),再叠加本次 perAgent。
-    // 每行至多被本函数排空一次(pending 排空即删),所以不会重复累加同一笔成本。
-    const mergedAgent = new Map<string, bigint>()
-    const prevDelegates = existing.usage?.delegates
-    if (Array.isArray(prevDelegates)) {
-      for (const d of prevDelegates as unknown[]) {
-        if (!d || typeof d !== 'object') continue
-        const aid = (d as { agentId?: unknown }).agentId
-        const cc = (d as { costCredits?: unknown }).costCredits
-        if (typeof aid !== 'string' || !aid) continue
-        try { mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + BigInt(String(cc ?? '0'))) } catch { /* skip */ }
+    let msgs: MessageLike[] | null = null
+    let currentNextSeq = 1
+    let currentArchivedThroughSeq = 0
+    if (sess) {
+      try {
+        const parsed = JSON.parse(sess.messages)
+        msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
+      } catch {
+        msgs = []
       }
+      currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0 ? sess.next_seq : 1
+      currentArchivedThroughSeq = sess.archived_through_seq ?? 0
     }
-    for (const [aid, v] of perAgent) mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + v)
-    // 确定性顺序(按 agentId 排序)便于快照稳定/测试可断言。
-    const delegates: MessageUsageDelegate[] = [...mergedAgent.entries()]
-      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-      .map(([agentId, v]) => ({ agentId, costCredits: v.toString() }))
-    const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0 ? sess.next_seq : 1
-    const patched: MessageLike = {
-      ...existing,
-      _seq: currentNextSeq,
-      usage: {
-        ...(existing.usage ?? {}),
-        costCredits: nextCost,
-        ...(delegates.length > 0 ? { delegates } : {}),
-      },
+
+    // 决策(Σ + per-agent 分组 + delegates 累加合并 + spill + 超限判定)抽到引擎中立的
+    // planDelegateCostMerge(RFC D6b):双 backend 复用,不各养一份。执行层只落 SQL。
+    const plan = planDelegateCostMerge(
+      msgs,
+      msgId,
+      pendings.map((p) => ({ costCredits: p.cost_credits, delegateAgentId: p.delegate_agent_id })),
+      currentNextSeq,
+      currentArchivedThroughSeq,
+    )
+
+    const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
+    if (plan.kind === 'no_positive_cost') {
+      // 只有非正/畸形成本 → 清本批(无归并价值,即便会话缺位也清),不写库、不 bump _seq。
+      for (const p of pendings) del.run(userId, p.request_id)
+      return { merged: '0', drained: pendings.length }
     }
-    const next: MessageLike[] = [...msgs]
-    next[idx] = patched
-    // 热尾巴 + 归档:patch bump _seq/加 usage 键后行可能微涨,越过软阈值则 spill(同
-    // appendCostCredits 口径,把最老的消息搬进归档,行只留热尾巴)。
-    const nowMs = Date.now()
-    const spill = _spillOverflowCore(db, clientSessionId, userId, next, {
-      currentArchivedThroughSeq: sess.archived_through_seq ?? 0,
-      now: nowMs,
-    })
-    const newArchivedCount = (sess.archived_count ?? 0) + spill.archivedDelta
-    const tail = spill.tail
-    const nextJson = JSON.stringify(tail)
-    // 超限拒绝(同 appendCostCredits;spill 后作用于 tail,理论不可达):保留 pending,
-    // 不写库(下一轮/修 blob 后仍可归并)。
-    if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
+    if (plan.kind === 'target_not_ready') {
+      // 会话缺位 / 找不到队长行 / spill 后超限 → 保守保留 pending,下一 turn 再试。
       return { merged: '0', drained: 0 }
     }
+
+    // plan.kind === 'merge':落 spill + 主行 UPDATE(next_seq+1)+ 清本批 pending。
+    const nowMs = Date.now()
+    const archivedDelta = _executeSpillPlan(db, clientSessionId, userId, plan.chunksToInsert, plan.idsToInsert, nowMs)
+    const newArchivedCount = (sess!.archived_count ?? 0) + archivedDelta
     db.prepare(
       'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
-    ).run(nextJson, tail.length + newArchivedCount, nowMs, nowMs, spill.archivedThroughSeq, newArchivedCount, clientSessionId, userId)
+    ).run(plan.finalJson, plan.tail.length + newArchivedCount, nowMs, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId)
 
     // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
-    const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
     for (const p of pendings) del.run(userId, p.request_id)
     return {
-      merged: sum.toString(),
+      merged: plan.merged,
       drained: pendings.length,
-      ...(delegates.length > 0 ? { delegates } : {}),
+      ...(plan.delegates.length > 0 ? { delegates: plan.delegates } : {}),
     }
   })
   return txn()
@@ -2857,6 +2787,10 @@ async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<
     // 不产生"主行已删、归档还在"的中间态;仅在主行真的被本次软删时才清,幂等。
     db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
+    // delegate pending 级联清(RFC D3;与 PG backend 对齐,消除差异点):parent_session_id 指向
+    // 该会话的委派 pending 若不清,会话删后永无队长行去 drain → 永不排空的孤儿。软删 late-cost
+    // 现已直接 noop(见 appendCostCredits 软删分支),此处级联清是同一不变量的另一半。
+    db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
     return true
   })
   return txn()
@@ -2968,6 +2902,10 @@ async function _sqliteAllMasterWsessRows(): Promise<Array<{
  * `messages` / `message_count` / `next_seq` / `deleted_at` rely on the
  * column DEFAULTs ('[]' / 0 / 1 / NULL). `pinned` is also omitted (default 0).
  * Downstream PUT path goes through `upsertClientSession` like any other row.
+ *
+ * **首建 updated_at 服务端时钟下限(BLOCKER-1)**:updated_at 取 MAX(lastAt, 服务端 now),
+ * 不再无条件用客户端传入的 lastAt —— 与 upsertClientSession 首建口径一致,防首建版本落后于
+ * 服务端时钟被后续 stale PUT 击穿。
  */
 async function _sqliteUpsertMasterClientSession(input: {
   sessionId: string
@@ -2979,11 +2917,12 @@ async function _sqliteUpsertMasterClientSession(input: {
   lastAt: number
 }): Promise<void> {
   const db = await getSessionsDb()
+  const nowMs = Date.now()
   db.prepare(`
     INSERT INTO client_sessions
       (id, user_id, agent_id, title, created_at, last_at, updated_at, origin_channel)
     VALUES
-      (@sessionId, @userId, @agentId, @title, @createdAt, @lastAt, @lastAt, @originChannel)
+      (@sessionId, @userId, @agentId, @title, @createdAt, @lastAt, MAX(@lastAt, @nowMs), @originChannel)
   `).run({
     sessionId: input.sessionId,
     userId: input.userId,
@@ -2991,6 +2930,7 @@ async function _sqliteUpsertMasterClientSession(input: {
     title: input.title,
     createdAt: input.createdAt,
     lastAt: input.lastAt,
+    nowMs,
     originChannel: input.originChannel,
   })
 }

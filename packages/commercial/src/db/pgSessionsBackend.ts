@@ -40,7 +40,6 @@
 //     Number()+MAX_SAFE_INTEGER 断言;**不改全局 type parser**(不影响 commercial 其它模块)。
 
 import type { Pool, PoolClient } from "pg";
-import type { MessageUsageDelegate } from "@openclaude/protocol/teamCards";
 import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
@@ -48,12 +47,15 @@ import {
   type ClientSessionMeta,
   type ClientSessionPartial,
   type ClientSessionsBackend,
+  type DelegatePendingRow,
   type DrainDelegateCostResult,
   MAX_SESSION_BYTES,
   type MessageLike,
   mergePreservingServerAuthored,
   normalizeAndAssignSeqs,
   planAppendServerAuthored,
+  planCostPatch,
+  planDelegateCostMerge,
   planSpillOverflow,
   type ReadArchivedMessagesResult,
   type ServerAuthoredAppendResult,
@@ -95,6 +97,7 @@ function bigIntNumOrNull(v: unknown): number | null {
 // ROLLBACK 并透传;正常返回 → COMMIT。client 用完必还回池(release)。
 async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
+  let destroyed = false;
   try {
     await client.query("BEGIN");
     const r = await fn(client);
@@ -103,12 +106,20 @@ async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Pr
   } catch (err) {
     try {
       await client.query("ROLLBACK");
-    } catch {
-      /* rollback 本身失败(连接已断等)—— 吞掉,不遮蔽真正原因 */
+    } catch (rollbackErr) {
+      // ROLLBACK 失败 = 连接处于未知/损坏事务态,**绝不能归还池**(下个借出者会拿到带未回滚
+      // 事务的脏连接 → 静默数据错乱)。client.release(err) 传 truthy err → node-postgres 销毁
+      // 连接不还池。标记 destroyed 跳过 finally 的正常 release。不遮蔽真正原因(仍抛原 err)。
+      destroyed = true;
+      try {
+        client.release(rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr)));
+      } catch {
+        /* 连接已彻底断,忽略 */
+      }
     }
     throw err;
   } finally {
-    client.release();
+    if (!destroyed) client.release();
   }
 }
 
@@ -485,7 +496,7 @@ export function createPgSessionsBackend(
           const res = await client.query(
             `INSERT INTO client_sessions
                (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13)
              ON CONFLICT (id) DO UPDATE SET
                agent_id = EXCLUDED.agent_id,
                title = EXCLUDED.title,
@@ -493,8 +504,11 @@ export function createPgSessionsBackend(
                last_at = EXCLUDED.last_at,
                messages = EXCLUDED.messages,
                message_count = EXCLUDED.message_count,
-               -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 GREATEST;新插入(无冲突)
-               -- 用客户端 $10(保持首建=客户端值语义,乐观并发 baseSyncedAt 链不断)。
+               -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 GREATEST。**首建(BLOCKER-1)**:
+               -- 新插入(无冲突)的 updated_at 也取 GREATEST(客户端 $10, 服务端时钟下限 clock_ms)——
+               -- 不再无条件信任客户端 $10(客户端可回传 0 / 旧值,首建后紧跟 baseSyncedAt=0 的第二个
+               -- PUT 会因 existing.updated_at 仍是 0 而击穿 stale 检测,造成双写静默覆盖)。
+               -- EXCLUDED.updated_at 即上面 VALUES 的 GREATEST 结果,故冲突路径口径不变。
                updated_at = GREATEST(client_sessions.updated_at + 1, ${CLOCK_MS_SQL}, EXCLUDED.updated_at),
                next_seq = EXCLUDED.next_seq,
                archived_through_seq = EXCLUDED.archived_through_seq,
@@ -556,9 +570,29 @@ export function createPgSessionsBackend(
     ): Promise<AppendForRequestResult> {
       return withTx(pool, async (client): Promise<AppendForRequestResult> => {
         await requestAdvisoryXactLock(client, userId, requestId);
-        // 锁序:advisory → client_sessions 行 → pending。先锁会话行,再 FOR UPDATE pending
-        // (与 drainByUser/drainDelegate 同序;pending FOR UPDATE 串行化跨路径的排空竞争)。
+        // 锁序(MAJOR-1;与 sweepGc 的 map→pending 同序,消除死锁环):
+        //   advisory → client_sessions 行 → server_authored_request_map → pending_usage_patches。
+        // 旧实现先锁 pending 再 INSERT map(pending→map),与 sweepGc 反序 → appendForRequest×sweepGc
+        // 死锁。改:锁会话行后**立即 SELECT map FOR UPDATE**,再锁 pending。
         await client.query("SELECT id FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE", [sessId, userId]);
+
+        // 立即 SELECT map FOR UPDATE + **不可重映射校验**(RFC D3/R1)。**必须发生在任何提前返回
+        // 之前** —— already_exists 幂等重放也要过 map 校验(防错误复用 requestId 时成本错挂到别的
+        // 消息)。map 不存在(首次 append)→ 锁不到行(合法),下面 append 成功后再 INSERT。
+        const existingMap = (
+          await client.query<{ session_id: string; msg_id: string }>(
+            "SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = $1 AND user_id = $2 FOR UPDATE",
+            [requestId, userId],
+          )
+        ).rows[0];
+        if (existingMap && (existingMap.session_id !== sessId || existingMap.msg_id !== message.id)) {
+          throw new Error(
+            `[pgSessions] server_authored_request_map 拒绝重映射: (requestId=${requestId},userId=${userId}) ` +
+              `已映射 (${existingMap.session_id},${existingMap.msg_id}),本次欲映射 (${sessId},${message.id})`,
+          );
+        }
+
+        // 锁 pending(确定序;pending FOR UPDATE 串行化跨路径的排空竞争)。
         const pending = (
           await client.query<{ cost_credits: string }>(
             "SELECT cost_credits FROM pending_usage_patches WHERE request_id = $1 AND user_id = $2 FOR UPDATE",
@@ -573,6 +607,7 @@ export function createPgSessionsBackend(
           msgToWrite = { ...message, usage: { ...existingUsage, costCredits: pending.cost_credits } };
         }
 
+        // append core(会话行已在锁下)。
         const r = await pgAppendServerAuthoredCore(client, sessId, userId, msgToWrite);
         if (!r.applied) {
           // 终态(session_deleted / oversized):无未来重试会 drain 此 pending,就地清(与 SQLite 同)。
@@ -583,32 +618,19 @@ export function createPgSessionsBackend(
           return r;
         }
 
-        // map 记录 + **不可重映射校验**(RFC D3/R1;PG 比 SQLite DO NOTHING 更严):已存在时
-        // (session_id,msg_id) 必须与本次一致,不一致 fail-closed 抛错(防错误复用 requestId 时
-        // 成本错挂到别的消息)。
-        const ins = await client.query<{ session_id: string }>(
-          `INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (request_id, user_id) DO NOTHING
-             RETURNING session_id`,
-          [requestId, userId, sessId, message.id],
-        );
-        if ((ins.rowCount ?? 0) === 0) {
-          const ex = (
-            await client.query<{ session_id: string; msg_id: string }>(
-              "SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = $1 AND user_id = $2",
-              [requestId, userId],
-            )
-          ).rows[0];
-          if (!ex || ex.session_id !== sessId || ex.msg_id !== message.id) {
-            throw new Error(
-              `[pgSessions] server_authored_request_map 拒绝重映射: (requestId=${requestId},userId=${userId}) ` +
-                `已映射 (${ex?.session_id},${ex?.msg_id}),本次欲映射 (${sessId},${message.id})`,
-            );
-          }
-          // 一致(幂等重放)→ 放行。
+        // 插 map(existingMap 已在上面 FOR UPDATE 校验一致;不存在则新插)。advisory_xact_lock 已
+        // 串行化同 (user,request) 的所有 appendForRequest,故此处 !existingMap 时无并发插入者,
+        // plain INSERT 安全(仍带 ON CONFLICT DO NOTHING 作纵深防御,理论不触发)。
+        if (!existingMap) {
+          await client.query(
+            `INSERT INTO server_authored_request_map (request_id, user_id, session_id, msg_id)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (request_id, user_id) DO NOTHING`,
+            [requestId, userId, sessId, message.id],
+          );
         }
 
+        // 删 pending。
         if (pending) {
           await client.query("DELETE FROM pending_usage_patches WHERE request_id = $1 AND user_id = $2", [requestId, userId]);
         }
@@ -695,18 +717,24 @@ export function createPgSessionsBackend(
         ).rows[0];
 
         if (mapRow0) {
-          // ③ 锁 client_sessions 行。
+          // ③ 锁 client_sessions 行(**含软删行**:去 deleted_at IS NULL 过滤,读出 deleted_at)。
           const sess = (
             await client.query<{
               messages: string;
               next_seq: number | null;
+              deleted_at: string | null;
               archived_through_seq: number | null;
               archived_count: number | null;
             }>(
-              "SELECT messages, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
+              "SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
               [mapRow0.session_id, userId],
             )
           ).rows[0];
+          // MAJOR-2 ②:map-hit 但会话已软删 → **noop 不 park**(RFC D3 late-cost)。map(mapRow0)已
+          // 确定目标会话,park 会留永不 drain 的孤儿 pending(delete 已级联清 delegate pending)。
+          // 双 backend 语义一致。早于 map 复核 —— 会话已死,无需 patch,故无需 locator 校验。
+          if (sess && sess.deleted_at !== null) return { applied: "noop" };
+
           // ④ FOR UPDATE 复核 map locator 未变/未被 GC 删(消失 → 按 miss 重决策,禁用陈旧 locator)。
           const mapRow = (
             await client.query<{ session_id: string; msg_id: string }>(
@@ -714,6 +742,17 @@ export function createPgSessionsBackend(
               [requestId, userId],
             )
           ).rows[0];
+          // MAJOR-2 ①:逐字段比较首次非锁定读(mapRow0)与 FOR UPDATE 复核值(mapRow)。map 不可重
+          // 映射 + advisory 串行化 appendForRequest → mapRow 只可能 ==mapRow0 或被 GC 删(never 变
+          // locator)。若 locator 变了,说明我们按 mapRow0.session_id 锁了**错误会话** → fail-closed
+          // 抛错(宁报错也不把成本错挂;理论不可达,是 non-remappable 不变量被破坏的信号)。
+          if (mapRow && (mapRow.session_id !== mapRow0.session_id || mapRow.msg_id !== mapRow0.msg_id)) {
+            throw new Error(
+              `[pgSessions] appendCostCredits map locator 在锁定间隙变化(non-remappable 不变量被破坏): ` +
+                `(requestId=${requestId},userId=${userId}) 首读 (${mapRow0.session_id},${mapRow0.msg_id}) ` +
+                `复核 (${mapRow.session_id},${mapRow.msg_id})`,
+            );
+          }
 
           if (sess && mapRow) {
             let msgs: MessageLike[];
@@ -723,37 +762,14 @@ export function createPgSessionsBackend(
             } catch {
               msgs = [];
             }
-            const idx = msgs.findIndex((m) => m && m.id === mapRow.msg_id && m._source === "server");
-            if (idx >= 0) {
-              const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> };
-              const prevCost = existing.usage?.costCredits;
-              if (typeof prevCost === "string" && prevCost === costCredits) {
-                return { applied: "noop" }; // 幂等重放 —— 不 bump _seq。
-              }
-              const currentNextSeq = typeof sess.next_seq === "number" && sess.next_seq > 0 ? sess.next_seq : 1;
-              const patched: MessageLike = {
-                ...existing,
-                _seq: currentNextSeq,
-                usage: { ...(existing.usage ?? {}), costCredits },
-              };
-              const next: MessageLike[] = [...msgs];
-              next[idx] = patched;
-              // ⑥ mutation(热尾巴 + 归档;size guard 先行 → 命中 noop,不落孤儿 chunk)。
+            const currentNextSeq = typeof sess.next_seq === "number" && sess.next_seq > 0 ? sess.next_seq : 1;
+            // 决策抽到引擎中立的 planCostPatch(RFC D6b):双 backend 复用(幂等判定 / patch 构造 /
+            // spill / size guard 全在 plan;size guard 先行 → 命中 noop 不落孤儿 chunk)。
+            const plan = planCostPatch(msgs, mapRow.msg_id, costCredits, currentNextSeq, bigIntNumOr(sess.archived_through_seq, 0));
+            if (plan.kind === "noop") return { applied: "noop" };
+            if (plan.kind === "patch") {
               const nowMs = Date.now();
-              const plan = planSpillOverflow(next, bigIntNumOr(sess.archived_through_seq, 0));
-              const tail = plan.tail;
-              const nextJson = JSON.stringify(tail);
-              if (Buffer.byteLength(nextJson, "utf8") > MAX_SESSION_BYTES) {
-                return { applied: "noop" };
-              }
-              const archivedDelta = await execPgSpillPlan(
-                client,
-                mapRow.session_id,
-                userId,
-                plan.chunksToInsert,
-                plan.idsToInsert,
-                nowMs,
-              );
+              const archivedDelta = await execPgSpillPlan(client, mapRow.session_id, userId, plan.chunksToInsert, plan.idsToInsert, nowMs);
               const newArchivedCount = bigIntNumOr(sess.archived_count, 0) + archivedDelta;
               await client.query(
                 `UPDATE client_sessions
@@ -761,12 +777,12 @@ export function createPgSessionsBackend(
                        updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                        next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5
                  WHERE id = $6 AND user_id = $7`,
-                [nextJson, tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId],
+                [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId],
               );
               return { applied: "patched" };
             }
-            // 目标 msg 不在热尾巴:已归档 → noop(别再徒劳 re-pending 陷入循环);未归档(被删/编辑
-            // out-of-band)→ 维持 fall through 到 pending(与 SQLite 同)。
+            // plan.kind === 'not_found':目标 msg 不在热尾巴:已归档 → noop(别再徒劳 re-pending 陷入
+            // 循环);未归档(被删/编辑 out-of-band)→ 维持 fall through 到 pending(与 SQLite 同)。
             const archivedHit = await client.query(
               "SELECT 1 FROM client_session_archived_ids WHERE session_id = $1 AND msg_id = $2",
               [mapRow.session_id, mapRow.msg_id],
@@ -774,7 +790,9 @@ export function createPgSessionsBackend(
             if ((archivedHit.rowCount ?? 0) > 0) return { applied: "noop" };
             // else fall through to pending
           }
-          // sess 缺位(会话已软删)或 mapRow 被 GC(④ 消失)→ fall through 到 pending(miss 重决策)。
+          // sess 缺位(会话行从未存在)或 mapRow 被 GC(④ 消失)→ fall through 到 pending(miss 重
+          // 决策)。边界:软删会话 + map 恰被 GC 删的窄窗 → 落 miss park(注:直接 pending 无
+          // parent_session_id,24h 老化 GC 兜底;delegate pending 走 delete 级联,不受此影响)。
         }
 
         // ⑤ park:UPSERT pending_usage_patches(created_at 冲突时重置为语句时刻)。
@@ -830,109 +848,62 @@ export function createPgSessionsBackend(
         ).rows;
         if (pendings.length === 0) return { merged: "0", drained: 0 }; // 竞态被抢走
 
-        let sum = 0n;
-        const perAgent = new Map<string, bigint>();
-        for (const p of pendings) {
-          let v: bigint;
+        // 决策(Σ + per-agent 分组 + delegates 累加合并 + spill + 超限判定)抽到引擎中立的
+        // planDelegateCostMerge(RFC D6b):双 backend 复用,不各养一份。执行层只落 SQL。
+        let msgs: MessageLike[] | null = null;
+        let currentNextSeq = 1;
+        let currentArchivedThroughSeq = 0;
+        if (sess) {
           try {
-            v = BigInt(p.cost_credits);
+            const parsed = JSON.parse(sess.messages);
+            msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
           } catch {
-            continue;
+            msgs = [];
           }
-          if (v <= 0n) continue;
-          sum += v;
-          const aid = p.delegate_agent_id;
-          if (aid) perAgent.set(aid, (perAgent.get(aid) ?? 0n) + v);
+          currentNextSeq = typeof sess.next_seq === "number" && sess.next_seq > 0 ? sess.next_seq : 1;
+          currentArchivedThroughSeq = bigIntNumOr(sess.archived_through_seq, 0);
         }
-        if (sum <= 0n) {
-          // 只有非正/畸形成本 → 清掉(无归并价值),不写库、不 bump _seq(与 SQLite 同,含 session 缺位时也清)。
+
+        const plan = planDelegateCostMerge(
+          msgs,
+          msgId,
+          pendings.map((p): DelegatePendingRow => ({ costCredits: p.cost_credits, delegateAgentId: p.delegate_agent_id })),
+          currentNextSeq,
+          currentArchivedThroughSeq,
+        );
+
+        if (plan.kind === "no_positive_cost") {
+          // 只有非正/畸形成本 → 清本批(无归并价值,即便 session 缺位也清),不写库、不 bump _seq。
           for (const p of pendings) {
             await client.query("DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = $2", [userId, p.request_id]);
           }
           return { merged: "0", drained: pendings.length };
         }
-
-        // 目标会话缺位(尚未 sink / 已删)→ 保守保留 pending,下一 turn 再试。
-        if (!sess) return { merged: "0", drained: 0 };
-
-        let msgs: MessageLike[];
-        try {
-          const parsed = JSON.parse(sess.messages);
-          msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
-        } catch {
-          msgs = [];
-        }
-        const idx = msgs.findIndex((m) => m && m.id === msgId && m._source === "server");
-        if (idx < 0) return { merged: "0", drained: 0 }; // 找不到队长助手行 → 保守保留 pending。
-
-        const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> };
-        let base = 0n;
-        try {
-          base = BigInt((existing.usage?.costCredits as string) ?? "0");
-        } catch {
-          base = 0n;
-        }
-        const nextCost = (base + sum).toString();
-        // usage.delegates[] 累加合并(读历史明细 → 叠加本次 perAgent → 确定性排序)。
-        const mergedAgent = new Map<string, bigint>();
-        const prevDelegates = existing.usage?.delegates;
-        if (Array.isArray(prevDelegates)) {
-          for (const d of prevDelegates as unknown[]) {
-            if (!d || typeof d !== "object") continue;
-            const aid = (d as { agentId?: unknown }).agentId;
-            const cc = (d as { costCredits?: unknown }).costCredits;
-            if (typeof aid !== "string" || !aid) continue;
-            try {
-              mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + BigInt(String(cc ?? "0")));
-            } catch {
-              /* skip */
-            }
-          }
-        }
-        for (const [aid, v] of perAgent) mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + v);
-        const delegates: MessageUsageDelegate[] = [...mergedAgent.entries()]
-          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-          .map(([agentId, v]) => ({ agentId, costCredits: v.toString() }));
-
-        const currentNextSeq = typeof sess.next_seq === "number" && sess.next_seq > 0 ? sess.next_seq : 1;
-        const patched: MessageLike = {
-          ...existing,
-          _seq: currentNextSeq,
-          usage: {
-            ...(existing.usage ?? {}),
-            costCredits: nextCost,
-            ...(delegates.length > 0 ? { delegates } : {}),
-          },
-        };
-        const next: MessageLike[] = [...msgs];
-        next[idx] = patched;
-
-        const nowMs = Date.now();
-        const plan = planSpillOverflow(next, bigIntNumOr(sess.archived_through_seq, 0));
-        const tail = plan.tail;
-        const nextJson = JSON.stringify(tail);
-        // 超限拒绝(理论不可达):保留 pending,不写库(下一轮/修 blob 后仍可归并)。
-        if (Buffer.byteLength(nextJson, "utf8") > MAX_SESSION_BYTES) {
+        if (plan.kind === "target_not_ready") {
+          // 会话缺位(尚未 sink / 已删)/ 找不到队长助手行 / spill 后超限 → 保守保留 pending。
           return { merged: "0", drained: 0 };
         }
+
+        // plan.kind === 'merge':落 spill + 主行 UPDATE(next_seq+1)+ 清本批 pending。
+        const nowMs = Date.now();
         const archivedDelta = await execPgSpillPlan(client, clientSessionId, userId, plan.chunksToInsert, plan.idsToInsert, nowMs);
-        const newArchivedCount = bigIntNumOr(sess.archived_count, 0) + archivedDelta;
+        const newArchivedCount = bigIntNumOr(sess!.archived_count, 0) + archivedDelta;
         await client.query(
           `UPDATE client_sessions
              SET messages = $1, message_count = $2, last_at = $3,
                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                  next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5
            WHERE id = $6 AND user_id = $7`,
-          [nextJson, tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId],
+          [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId],
         );
 
         for (const p of pendings) {
           await client.query("DELETE FROM pending_usage_patches WHERE user_id = $1 AND request_id = $2", [userId, p.request_id]);
         }
         return {
-          merged: sum.toString(),
+          merged: plan.merged,
           drained: pendings.length,
-          ...(delegates.length > 0 ? { delegates } : {}),
+          ...(plan.delegates.length > 0 ? { delegates: plan.delegates } : {}),
         };
       });
     },
@@ -1218,10 +1189,12 @@ export function createPgSessionsBackend(
     }): Promise<void> {
       // Plain INSERT by design:重复 id 必须抛(dispatcher 补偿链依赖 23505 冒泡),禁 ON CONFLICT。
       // messages/message_count/next_seq/deleted_at/pinned 走列 DEFAULT。
+      // 首建 updated_at 服务端时钟下限(BLOCKER-1):GREATEST($6 lastAt, clock_ms)—— 与
+      // upsertClientSession 首建口径一致,防首建版本落后于服务端时钟被后续 stale PUT 击穿。
       await pool.query(
         `INSERT INTO client_sessions
            (id, user_id, agent_id, title, created_at, last_at, updated_at, origin_channel)
-         VALUES ($1, $2, $3, $4, $5, $6, $6, $7)`,
+         VALUES ($1, $2, $3, $4, $5, $6, GREATEST($6, ${CLOCK_MS_SQL}), $7)`,
         [input.sessionId, input.userId, input.agentId, input.title, input.createdAt, input.lastAt, input.originChannel],
       );
     },
@@ -1266,6 +1239,19 @@ export function createPgSessionsBackend(
       const now = Date.now();
       try {
         await withTx(pool, async (client): Promise<void> => {
+          // 死锁面(D8):本函数锁同表 wechat_bindings 两行(account_id 行 + user_id 行)。两并发
+          // upsert 若 (user,account) 交叉(T1 的 user 行 == T2 的 account 行,反之亦然),FOR UPDATE
+          // 的取锁顺序会 ABBA → 死锁。修:先按**排序后的逻辑键**取 pg_advisory_xact_lock(全局定序,
+          // 经典 lock-ordering 消 ABBA),再行锁。锁序:advisory(sorted user/acct keys)→ account 行
+          // → user 行。两个键命名空间不同前缀(oc_wechat_user: / oc_wechat_acct:),同值不误撞;
+          // 与其它 advisory(oc_sarm: / oc_sessions_sweep_gc)不相交。
+          const advisoryKeys = [
+            `oc_wechat_user:${input.userId}`,
+            `oc_wechat_acct:${input.accountId}`,
+          ].sort();
+          for (const k of advisoryKeys) {
+            await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [k]);
+          }
           const accountOwner = (
             await client.query<{ user_id: string }>(
               "SELECT user_id FROM wechat_bindings WHERE account_id = $1 FOR UPDATE",
