@@ -62,6 +62,7 @@ import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveConnBanner } from "./lib/chat/pure";
+import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import {
   clearTeamModeForSession,
   readTeamModeForSession,
@@ -240,6 +241,7 @@ export function App() {
     authLoading,
     authError,
     booting,
+    laneReady,
     login,
     register,
     verifyEmail,
@@ -815,6 +817,8 @@ export function App() {
   const chat = useChatSocket({
     auth,
     ready: gate.ready,
+    // cohort lane 就绪（P3 RFC D1）：与 gate.ready 正交的 WS 连接前置，防首连落错 slot。
+    laneReady,
     enabled: inWorkspace && !demo,
     defaultAgentId: "main",
     refreshBalance: refreshMe,
@@ -918,7 +922,7 @@ export function App() {
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
   // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
   // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。
-  const connBanner = demo
+  const rawConnBanner = demo
     ? null
     : deriveConnBanner({
         cls: chat.status.cls,
@@ -926,6 +930,9 @@ export function App() {
         browserOnline: chat.browserOnline,
         provisioning: chat.provisioning,
       });
+  // 横幅 2s 延迟（P3 RFC D6）：断开 >2s 才点亮，2s 内重连成功零闪烁。只作用于横幅显示——
+  // deriveConnBanner 仍即时反映断线真相，断线排队/禁发等发送语义不受影响。
+  const connBanner = useDelayedConnBanner(rawConnBanner);
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   const stopTurn = useCallback(() => {
     if (demo) {

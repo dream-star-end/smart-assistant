@@ -22,6 +22,12 @@ export type User = {
   createdAt?: string;
   /** 企业版(P3.1):caller 的 active org 归属。无归属 → null / 缺省。 */
   org?: OrgMembershipBrief | null;
+  /**
+   * cohort 分批切流 lane（P3 RFC D1）：`g<generation>.<slot>`（如 g42.B）或 null。
+   * 由服务端 evaluateLane 在 /api/me 等响应体下发（同时 Set-Cookie oc_v5lane）；前端仅作
+   * 状态/观测持有——**字段缺失=后端未部署 lane=向后兼容视为已就绪**（laneReady 不依赖本值）。
+   */
+  lane?: string | null;
 };
 
 /** /api/me 注入的 org 归属摘要(handleMe LEFT JOIN)。org suspended 仍返回(带 status)。 */
@@ -94,6 +100,11 @@ export type LoginResult = {
   refreshExp: number;
   remember: boolean;
   user: User;
+  /**
+   * cohort 分批切流 lane（P3 RFC D1，`g<generation>.<slot>` 或 null）。服务端下发/清除
+   * cookie 后在响应体附带；缺失=后端未部署 lane=向后兼容（laneReady 视为已就绪，见 useLaneGate）。
+   */
+  lane?: string | null;
 };
 
 /** 静默刷新（POST /api/auth/refresh）。v5 仅回 access token，不回 user。 */
