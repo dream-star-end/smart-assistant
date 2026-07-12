@@ -257,6 +257,14 @@ interface Args {
   /** 用户是否显式传了 --sqlite / --manifest(默认值仍算好,供 status/repair 兜底 + warn)。 */
   sqliteExplicit: boolean;
   manifestExplicit: boolean;
+  /**
+   * 已诊断的历史源漂移会话白名单(逗号分隔 session id)。
+   * 唯一放行形态:archived_count == COUNT(archived_ids) 但 > SUM(chunk.message_count)
+   * ——07-10 一次性 spill 回填时代 chunk PK 冲突被 INSERT OR IGNORE 吞掉的既成事实
+   * (正文已不可恢复,与迁移无关,运行时影响仅计数展示)。默认仍 fail-closed;
+   * 必须显式具名确认,禁全局放宽。
+   */
+  allowKnownSourceDrift: Set<string>;
 }
 
 function usage(msg?: string): never {
@@ -287,6 +295,7 @@ function parseArgs(argv: string[]): Args {
     fromDump: null,
     sqliteExplicit: false,
     manifestExplicit: false,
+    allowKnownSourceDrift: new Set<string>(),
   };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -304,7 +313,9 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "--cutover-id") out.cutoverId = next();
     else if (a === "--from-dump") out.fromDump = next();
     else if (a === "--yes") out.yes = true;
-    else usage(`未知参数: ${a}`);
+    else if (a === "--allow-known-source-drift") {
+      for (const sid of next().split(",").map((x) => x.trim()).filter(Boolean)) out.allowKnownSourceDrift.add(sid);
+    } else usage(`未知参数: ${a}`);
   }
   // MAJOR-4:生产割接/反灌子命令强制显式 --sqlite 与 --manifest(不落默认路径,防误用)。
   if (PRODUCTION_SUBS.includes(out.sub) && (!out.sqliteExplicit || !out.manifestExplicit)) {
@@ -577,9 +588,17 @@ function compareTable(spec: TableSpec, sqliteMap: Map<string, string>, pgMap: Ma
 }
 
 /** client_sessions 源不变量(next_seq>max(tail._seq)、归档水位)——在 SQLite 源上算,digest 相等则传递到 PG。 */
-function checkClientSessionsInvariants(sqliteDb: Database.Database): { ok: boolean; report: string[] } {
+function checkClientSessionsInvariants(
+  sqliteDb: Database.Database,
+  allowDrift: Set<string> = new Set(),
+): { ok: boolean; report: string[] } {
   const report: string[] = [];
   const violations: string[] = [];
+  const waived: string[] = [];
+  // 白名单放行的唯一形态需要 archived_ids 计数佐证(archived_count==ids_cnt 才是"chunk 体缺失"签名)。
+  const idsCntStmt = sqliteDb.prepare(
+    `SELECT COUNT(*) AS c FROM ${ARCHIVED_IDS.table} WHERE session_id = ?`,
+  );
   // 归档 chunk 聚合:每会话 sum(message_count)/max(last_seq)/chunk 数。
   const aggMap = new Map<string, { sc: number; ml: number }>();
   for (const r of sqliteDb
@@ -620,7 +639,15 @@ function checkClientSessionsInvariants(sqliteDb: Database.Database): { ok: boole
     if (!(nextSeq > maxSeq)) violations.push(`${id}: next_seq(${nextSeq}) 未 > max(tail._seq)=${maxSeq}`);
     const agg = aggMap.get(id);
     const sumChunk = agg ? agg.sc : 0;
-    if (archivedCount !== sumChunk) violations.push(`${id}: archived_count(${archivedCount}) != SUM(chunk.message_count)(${sumChunk})`);
+    if (archivedCount !== sumChunk) {
+      const idsCnt = Number((idsCntStmt.get(id) as { c: number }).c);
+      if (allowDrift.has(id) && archivedCount === idsCnt && archivedCount > sumChunk) {
+        // 具名确认的历史漂移(签名匹配:count 与 ids 一致,chunk 少体)→ 降级警告放行。
+        waived.push(`${id}: archived_count(${archivedCount})==ids(${idsCnt}) > chunk_sum(${sumChunk}),差 ${archivedCount - sumChunk} 条正文(历史丢失,已具名确认)`);
+      } else {
+        violations.push(`${id}: archived_count(${archivedCount}) != SUM(chunk.message_count)(${sumChunk})${allowDrift.has(id) ? "(白名单签名不匹配,拒绝放行)" : ""}`);
+      }
+    }
     if (agg) {
       if (!(archivedThrough >= agg.ml)) violations.push(`${id}: archived_through_seq(${archivedThrough}) < MAX(chunk.last_seq)(${agg.ml})`);
     } else if (archivedCount !== 0) {
@@ -634,17 +661,24 @@ function checkClientSessionsInvariants(sqliteDb: Database.Database): { ok: boole
   for (const sid of aggMap.keys()) {
     if (!seenSessions.has(sid)) violations.push(`${sid}: 孤儿归档 chunk(无 client_sessions 行)`);
   }
+  for (const sid of allowDrift) {
+    if (!waived.some((w) => w.startsWith(sid + ":")) && !violations.some((v) => v.startsWith(sid + ":"))) {
+      report.push(`  [warn] 白名单会话 ${sid} 未检出漂移(白名单可能过期,请复核诊断)`);
+    }
+  }
   if (violations.length) {
     report.push(`  ✗ 源不变量违反 ${violations.length} 处(样本):`);
     for (const v of violations.slice(0, 10)) report.push(`      - ${v}`);
     return { ok: false, report };
   }
-  report.push(`  ✓ 源不变量通过(next_seq>max(tail._seq)、归档水位、message_count 一致)`);
+  for (const w of waived) report.push(`  [waived] ${w}`);
+  report.push(`  ✓ 源不变量通过(next_seq>max(tail._seq)、归档水位、message_count 一致${waived.length ? `;${waived.length} 处历史漂移已具名放行` : ""})`);
   return { ok: true, report };
 }
 
 /** 全量校验:六表 digest 对比 + 不变量。返回 ok + 每表 tableDigest(用于 source_digest)。 */
 async function verifyAll(
+  allowDrift: Set<string>,
   sqliteDb: Database.Database,
   client: pg.Client,
 ): Promise<{ ok: boolean; tableDigests: Record<string, string>; sourceDigest: string }> {
@@ -660,7 +694,7 @@ async function verifyAll(
     // digest 相等时两侧一致,取 SQLite 侧作为权威(校验通过前提下等于 PG)。
     tableDigests[spec.table] = tableDigestOf(sqliteMap);
   }
-  const inv = checkClientSessionsInvariants(sqliteDb);
+  const inv = checkClientSessionsInvariants(sqliteDb, allowDrift);
   for (const line of inv.report) console.log(line);
   if (!inv.ok) ok = false;
   const sourceDigest = combineSourceDigest(tableDigests);
@@ -770,10 +804,10 @@ async function printSourceSummaryAndConfirm(sqliteDb: Database.Database, sqliteP
 }
 
 // ─────────────────────────── 公共:一次割接(灌+校验+推进+manifest)───────────────────────────
-async function runCutover(client: pg.Client, sqliteDb: Database.Database, generation: string, cutoverId: string, manifestPath: string): Promise<void> {
+async function runCutover(client: pg.Client, sqliteDb: Database.Database, generation: string, cutoverId: string, manifestPath: string, allowDrift: Set<string> = new Set()): Promise<void> {
   console.log("── 全量灌库(SQLite → PG,单事务)──");
   await loadAllTables(client, sqliteDb);
-  const v = await verifyAll(sqliteDb, client);
+  const v = await verifyAll(allowDrift, sqliteDb, client);
   if (!v.ok) {
     throw new Error("全量校验未通过 —— 状态留在 prepared(master 拒起 = 安全态)。修正数据后走 retry-initial 重灌。");
   }
@@ -805,7 +839,7 @@ async function cmdInitial(args: Args, client: pg.Client, sqliteDb: Database.Data
   console.log(`  · 分配 generation=1 cutover_id=${cutoverId}`);
   await prepareTx(client, { kind: "insert", cutoverId });
   console.log("  ✓ 起手事务:写 prepared(gen=1)commit");
-  await runCutover(client, sqliteDb, "1", cutoverId, args.manifest);
+  await runCutover(client, sqliteDb, "1", cutoverId, args.manifest, args.allowKnownSourceDrift);
   console.log("✓ initial 割接完成。");
 }
 
@@ -832,7 +866,7 @@ async function cmdRetryInitial(args: Args, client: pg.Client, sqliteDb: Database
     cutoverId,
   });
   console.log("  ✓ 起手事务:prepared(gen+1)+ 清六表 commit");
-  await runCutover(client, sqliteDb, newGen, cutoverId, args.manifest);
+  await runCutover(client, sqliteDb, newGen, cutoverId, args.manifest, args.allowKnownSourceDrift);
   console.log("✓ retry-initial 重灌完成。");
 }
 
@@ -873,7 +907,7 @@ async function cmdReCutover(args: Args, client: pg.Client, sqliteDb: Database.Da
     cutoverId,
   });
   console.log("  ✓ 起手事务:sqlite_disaster_recovered → prepared(gen+1)+ 清六表 commit");
-  await runCutover(client, sqliteDb, newGen, cutoverId, args.manifest);
+  await runCutover(client, sqliteDb, newGen, cutoverId, args.manifest, args.allowKnownSourceDrift);
   console.log("✓ re-cutover-from-sqlite 重割接完成。");
 }
 
@@ -1193,7 +1227,7 @@ async function cmdDisasterRestore(args: Args, dbUrl: string): Promise<void> {
     await overwriteSqliteFromPg(sqliteDb, sourceClient);
 
     // 3) 反灌后全量校验:SQLite(新写)vs 源。任何不一致 fail-closed(.bak 仍在可人工恢复)。
-    const v = await verifyAll(sqliteDb, sourceClient);
+    const v = await verifyAll(args.allowKnownSourceDrift, sqliteDb, sourceClient);
     if (!v.ok) {
       throw new Error(`反灌后全量校验未通过 —— SQLite 与源不一致。备份 ${bak} 仍在,可人工恢复。fail-closed 退出。`);
     }
