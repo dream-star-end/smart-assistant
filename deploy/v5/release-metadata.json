@@ -3,7 +3,10 @@
   "requiredMigrations": [
     "0123_gpt56_models",
     "0124_gpt56_xhigh_defaults",
-    "0134_sessions_master_pg"
+    "0134_sessions_master_pg",
+    "0133_selfheal_incidents",
+    "0134_selfheal_condition_concurrency",
+    "0135_selfheal_hardening"
   ],
   "capabilities": [
     "sessions-store-pg-v1"
