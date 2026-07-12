@@ -20,12 +20,13 @@ import {
   Store,
   Tag,
   Users,
+  Wrench,
   type LucideIcon,
 } from "lucide-react";
 import { type ComponentType, type LazyExoticComponent, lazy } from "react";
 
 /**
- * 管理后台页面注册表 —— 21 页 / 6 分组的**唯一权威**。
+ * 管理后台页面注册表 —— 22 页 / 6 分组的**唯一权威**。
  *
  * 分组结构与中文文案抄旧 vanilla admin 的 ADMIN_TAB_META（packages/web/public/modules/
  * admin.js:436-458），保证与运维肌肉记忆、深链一致。每页组件经 React.lazy 动态 import
@@ -96,6 +97,7 @@ export const adminPages: AdminPage[] = [
   { key: "audit", title: "审计日志", group: "系统运营", desc: "操作者、对象和配置变更", icon: History, Component: lz(() => import("./pages/audit")) },
   { key: "health", title: "健康面板", group: "系统运营", desc: "服务依赖和探针状态", icon: Activity, Component: lz(() => import("./pages/health")) },
   { key: "alerts", title: "告警", group: "系统运营", desc: "风险确认、静默和处理", icon: Bell, Component: lz(() => import("./pages/alerts")) },
+  { key: "selfheal", title: "自愈修复", group: "系统运营", desc: "异常事故与 codex 自动修复审计", icon: Wrench, Component: lz(() => import("./pages/selfheal")) },
 ];
 
 /** tab key 白名单（路由回落判定）。 */

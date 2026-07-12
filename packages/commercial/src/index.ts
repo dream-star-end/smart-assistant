@@ -154,6 +154,15 @@ import {
   type ProviderHealthSchedulerHandle,
 } from "./admin/providerHealthScheduler.js";
 import {
+  startIncidentReconciler,
+  startIncidentSweeper,
+  assertSelfhealConfig,
+  selfhealTickMs,
+  type IncidentReconcilerHandle,
+  type IncidentReconcilerSnapshotHandle,
+  type IncidentPayload,
+} from "./selfheal/index.js";
+import {
   startWecomAlertDispatcher,
   type WecomAlertDispatcherHandle,
 } from "./admin/wecomAlertDispatcher.js";
@@ -1237,6 +1246,17 @@ export async function registerCommercial(
   // 看不到积分显示,但扣费本身仍生效;生产上 proxy 处理请求前 bridge 必已初始化)。
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
+  };
+  // v5 自愈体系(RFC §5):selfheal sweeper 经 forward-ref 拿 bridge 的全站/定向广播入口
+  // (与 bridgeBroadcastRef 同型;bridge 在下方装配后回填,未就绪时 no-op 返回 0)。
+  const broadcastAllRef: { current: (payload: unknown) => number } = { current: () => 0 };
+  const broadcastToUsersRef: { current: (uids: string[], payload: unknown) => number } = {
+    current: () => 0,
+  };
+  // activeIncidents 内存快照 getter(sweeper 装配后回填):供 bridge 鉴权后补发在线用户
+  // 未见过的活跃事故(RFC §5 [解 M4] 补发位置在 WS 注册之后)。bridge 侧集成读此 ref。
+  const selfhealActiveIncidentsRef: { current: (uid: string) => IncidentPayload[] } = {
+    current: () => [],
   };
   // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
   // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
@@ -3376,6 +3396,10 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
+    // 鉴权后补发当前活跃事故——**per-uid** 过滤(forward-ref:bridge 创建早于
+    // sweeper 赋值,故走闭包读 ref.current)。ref 默认 () => [],装配后为
+    // getActiveIncidentsForUser,只返该 uid 可见事故,绝不泄露他人定向事故(Codex B2)。
+    incidentSnapshotProvider: (uid: string) => selfhealActiveIncidentsRef.current(uid),
     // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
     // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
     // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
@@ -3426,6 +3450,9 @@ export async function registerCommercial(
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
+  // v5 自愈:把 selfheal sweeper 的广播 forward-ref 指向 bridge 真实入口。
+  broadcastAllRef.current = (payload) => userChatBridge.broadcastAll(payload);
+  broadcastToUsersRef.current = (uids, payload) => userChatBridge.broadcastToUsers(uids, payload);
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
   // then one-shot DeepSeek V4 Flash context polish after stop.
@@ -3711,6 +3738,35 @@ export async function registerCommercial(
     providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
   }
 
+  // v5 全链路自愈体系(RFC-v5-selfheal-ops)切片① — incidentReconciler + deliveries sweeper。
+  // 【域归属 v5-owned】gate 在 runtimeChannel==='v5'(**不是** controlPlaneEnabled——v5 是 follower
+  // 恒 false 会让整链真空,RFC 已论证:incident/policy/deliveries 皆 v5 引入表,v3 无对应代码 →
+  // 不写共享现网,v5 必须自跑)。reconciler 读 alert_conditions 当前值 level-triggered 投影 incidents;
+  // sweeper durable 投递 WS(bridge broadcast forward-ref)+ inbox(同事务幂等)。tick 10s。
+  // 关停:OC_SELFHEAL_DISABLED=1。派单(codex 修复)是切片②,sweeper 内 stub 默认关。
+  let incidentReconciler: IncidentReconcilerHandle | undefined;
+  let incidentSweeper: IncidentReconcilerSnapshotHandle | undefined;
+  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
+    // M5+B3(收尾批):装配前配置硬校验——dispatch 启用时密钥长度/互异/派单 URL
+    // loopback 钉死,违规 throw fail-fast 拒启;禁用时仅 warn。数值 env 解析统一
+    // 收口 selfheal/config.ts。
+    assertSelfhealConfig();
+    const tickMs = selfhealTickMs();
+    incidentReconciler = trackScheduler(
+      "incidentReconciler",
+      "v5-owned",
+      startIncidentReconciler({ intervalMs: tickMs }),
+    );
+    incidentSweeper = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+      intervalMs: tickMs,
+      broadcastAll: (payload) => broadcastAllRef.current(payload),
+      broadcastToUsers: (uids, payload) => broadcastToUsersRef.current(uids, payload),
+    }));
+    // 暴露 per-uid activeIncidents getter 供 bridge 鉴权后补发(audience 过滤,
+    // 见 selfhealActiveIncidentsRef 注释;forward-ref 装配,bridge 创建早于此赋值)。
+    selfhealActiveIncidentsRef.current = incidentSweeper.getActiveIncidentsForUser;
+  }
+
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
   // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
   // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
@@ -3891,6 +3947,12 @@ export async function registerCommercial(
       }
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (incidentReconciler) {
+        try { incidentReconciler.stop(); } catch { /* ignore */ }
+      }
+      if (incidentSweeper) {
+        try { incidentSweeper.stop(); } catch { /* ignore */ }
       }
       if (connectorSweeper) {
         try { connectorSweeper.stop(); } catch { /* ignore */ }
