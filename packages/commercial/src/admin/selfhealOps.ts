@@ -441,14 +441,37 @@ export async function claimRelease(repairId: string): Promise<boolean> {
   return r.rows.length > 0;
 }
 
-/** HIGH2:postRelease 失败/异常后清 claim,允许重试(成功保留,挡二次放行)。 */
+/**
+ * HIGH2:postRelease 失败/异常后清 claim,允许重试(成功保留,挡二次放行)。
+ * R2 补:claim 期间 resolveIncident 的 cancel CAS 会跳过 release_claimed 行
+ * (真互斥,见 incidents.ts)——所以 release 失败且 incident 已 resolved 时,
+ * 这里必须**确定性补 cancel**(否则该 repair 永远无人取消,占槽到超时)。
+ * 同一事务:清 claim + 条件 CAS running→cancel_requested + cancel 事件。
+ */
 export async function clearReleaseClaim(repairId: string): Promise<void> {
-  await query(
-    `UPDATE codex_repairs
-        SET detail = detail - 'release_claimed', updated_at = NOW()
-      WHERE id = $1::bigint`,
-    [repairId],
-  );
+  await tx(async (client) => {
+    await client.query(
+      `UPDATE codex_repairs
+          SET detail = detail - 'release_claimed', updated_at = NOW()
+        WHERE id = $1::bigint`,
+      [repairId],
+    );
+    const cancelled = await client.query(
+      `UPDATE codex_repairs r
+          SET status = 'cancel_requested', updated_at = NOW()
+         FROM incidents i
+        WHERE r.id = $1::bigint AND i.id = r.incident_id
+          AND r.status = 'running' AND i.status = 'resolved'`,
+      [repairId],
+    );
+    if ((cancelled.rowCount ?? 0) > 0) {
+      await client.query(
+        `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
+         VALUES ($1::bigint, 'cancel', 'release 失败且事故已恢复 — 补发取消', '{}'::jsonb)`,
+        [repairId],
+      );
+    }
+  });
 }
 
 /**

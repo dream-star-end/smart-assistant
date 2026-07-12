@@ -239,11 +239,16 @@ export async function resolveIncident(
   await insertDeliveries(client, incidentId, rev, "resolved", r.rows[0].audience);
 
   // H2-cancel:活跃修复 → cancel_requested(同事务;verifying 有意不含)。
+  // release_claimed 的 repair 同样有意不含(与 adminReleaseRepair 的 claim CAS
+  // 真互斥:claim 先赢 → resolve 不取消,放行后由 done→verifying→探测 fence 裁决;
+  // resolve 先赢 → 行已 cancel_requested,claim 的 WHERE status='running' 落空。
+  // release 失败时 clearReleaseClaim 对已 resolved 的 incident 确定性补 cancel)。
   const cancelled = await client.query<{ id: string }>(
     `UPDATE codex_repairs
         SET status = 'cancel_requested', updated_at = NOW()
       WHERE incident_id = $1::bigint
         AND status IN ('pending','dispatched','acked','running')
+        AND COALESCE(detail->>'release_claimed','') <> 'true'
       RETURNING id::text AS id`,
     [incidentId],
   );

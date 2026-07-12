@@ -436,7 +436,8 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
         const reqd = await tx(async (client: PoolClient) => {
           const cas = await client.query(
             `UPDATE codex_repairs SET status='cancel_requested', updated_at=NOW()
-              WHERE id=$1::bigint AND status IN ('dispatched','acked','running')`,
+              WHERE id=$1::bigint AND status IN ('dispatched','acked','running')
+                AND COALESCE(detail->>'release_claimed','') <> 'true'`,
             [row.id],
           );
           if ((cas.rowCount ?? 0) === 0) return false;

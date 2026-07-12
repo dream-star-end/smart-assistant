@@ -36,6 +36,7 @@ import {
   adminUnsuppressCondition,
   adminReleaseRepair,
   claimRelease,
+  clearReleaseClaim,
   getIncidentDetail,
   listConditions,
   listIncidents,
@@ -313,6 +314,54 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
     await tx((client: PoolClient) => resolveIncident(incidentId, "codex", client));
     const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
     assert.equal(r.rows[0].status, "verifying");
+  });
+
+  test("release_claimed 的 running repair:resolve 不取消(与放行 claim 真互斥,审计R2 HIGH1)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { incidentId, repairId } = await seedIncidentWithRepair("running");
+    await query(
+      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
+      [repairId],
+    );
+    await tx((client: PoolClient) => resolveIncident(incidentId, "probe", client));
+    const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
+    assert.equal(r.rows[0].status, "running", "claim 先赢 → resolve 不取消,放行后由 verify fence 裁决");
+  });
+
+  test("clearReleaseClaim:incident 已 resolved → 确定性补 cancel_requested + cancel 事件", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { incidentId, repairId } = await seedIncidentWithRepair("running");
+    await query(
+      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
+      [repairId],
+    );
+    await tx((client: PoolClient) => resolveIncident(incidentId, "probe", client));
+    await clearReleaseClaim(repairId);
+    const r = await query<{ status: string; claimed: string | null }>(
+      `SELECT status, detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
+      [repairId],
+    );
+    assert.equal(r.rows[0].status, "cancel_requested", "release 失败且事故已恢复 → 补 cancel(否则占槽到超时)");
+    assert.equal(r.rows[0].claimed, null);
+    const ev = await query<{ kind: string }>(
+      `SELECT kind FROM codex_repair_events WHERE repair_id=$1::bigint ORDER BY id DESC LIMIT 1`, [repairId]);
+    assert.equal(ev.rows[0].kind, "cancel");
+  });
+
+  test("clearReleaseClaim:incident 仍 open → 只清 claim,repair 保持 running", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { repairId } = await seedIncidentWithRepair("running");
+    await query(
+      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
+      [repairId],
+    );
+    await clearReleaseClaim(repairId);
+    const r = await query<{ status: string; claimed: string | null }>(
+      `SELECT status, detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
+      [repairId],
+    );
+    assert.equal(r.rows[0].status, "running");
+    assert.equal(r.rows[0].claimed, null);
   });
 
   test("admin resolve 全链:suppression + 修复取消同一事务", async (t) => {
