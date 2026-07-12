@@ -1337,6 +1337,32 @@ export interface AnthropicProxyDeps {
    */
   staticProviderKeys?: StaticProviderKeys;
   /**
+   * 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)。**注入 = 本进程参与 catalog 判定**。
+   *
+   * 装配点(两个进程各持一份,LISTEN 同一 NOTIFY 通道):
+   *   - egress/main.ts —— 生产 `/v1/messages` 的独占进程,fence 真正生效的地方;
+   *   - index.ts 的 internalProxyHandler —— 非 split 拓扑(dev/测试)。
+   *
+   * 不注入 → 完全走本批次之前的 legacy 判定(pricing.enabled + matchesRoute),零行为变化。
+   */
+  modelCatalog?: import("../../billing/modelCatalog.js").ModelCatalogCache;
+  /**
+   * authority 公钥 keyring 的取数函数(每请求现取 —— 轮换五步里 ring 会变,不能闭包快照)。
+   *
+   * master 私钥在 ws/authoritySigner.ts;egress 与 master 同机读同一份 keyring 文件,
+   * 只取公钥用于**验签**。不注入 → bridge 签名凭据一律拒(fail-closed)。
+   */
+  authorityKeyring?: () => import("@openclaude/protocol").AuthorityKeyring;
+  /**
+   * `OC_MODEL_AUTHORITY=1`(方案 §7 步 4)。
+   *
+   * - false(默认)= **影子期**:catalog 判定照跑并与 legacy 判定对比打日志(零漂移锚),
+   *   但拒绝权仍在 legacy —— 部署 catalog 基建不改变任何用户可见行为(§7 步 2);
+   * - true = **强制**:每请求 epoch fence + authority 校验 + provider_id 驱动路由,
+   *   无凭据/漂移/不可路由一律拒。
+   */
+  modelAuthorityEnforce?: boolean;
+  /**
    * Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1 envelope)。
    *
    * 在外接 ApiKey 路径 + OAuth 上游双重命中时,把 outbound body 改写成 CC 容器

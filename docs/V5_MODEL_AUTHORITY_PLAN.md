@@ -84,10 +84,26 @@ master `ModelCatalogSnapshot`(catalog+aliases+pricing 一次事务读,NOTIFY 重
   `{ v, uid, containerId, authorityTurnId(每 inbound 铸造,不复用计费 requestId
   的可选语义;codex 的 billing requestId 作绑定字段), canonicalModel, engine,
   executionDescriptor(该模型完整规范化执行语义:capability_profile/context_window/
-  effort/vision/upstream 无关字段除外), executionRevision, securityEpoch,
-  issuedAt, expiresAt(短,仅约束"开始执行",gateway 首次单次消费),
+  effort/vision/upstream 无关字段除外), **auxModels**(见下), executionRevision,
+  securityEpoch, issuedAt, expiresAt(短,仅约束"开始执行",gateway 首次单次消费),
   connectionChallenge(R4-m4:gateway 产生 challenge→hello attest→bridge 签入→
   gateway 验证与当前连接一致), billingRequestId? }` + Ed25519 签名。
+- **`auxModels`:次级模型放行集(实现期 BLOCKER 2026-07-12)**。CCB 有一批**隐藏调用**
+  不走主模型 —— WebFetch 的 `queryHaiku`、WebSearch 的 `useHaiku` 分支、awaySummary、
+  toolUseSummary、claudeAiLimits,全经 `getSmallFastModel()` 读 `ANTHROPIC_SMALL_FAST_MODEL`
+  (v5 容器由 gateway `_buildSecondaryUtilityModelEnv()` 钉死 = `DEFAULT_SECONDARY_UTILITY_MODEL`
+  = deepseek-v4-flash)。它们同样打 `/v1/messages` 经 anthropic proxy,但 `body.model ≠
+  canonicalModel` → 只认单个 canonicalModel 的硬相等断言会在 flag 开启当天把 WebFetch/
+  WebSearch 全判 403。**根治**:签名载荷带 `auxModels: string[]`,egress 放行集 =
+  `{canonicalModel} ∪ auxModels`(判定单点 = protocol `isModelAllowedByAuthority`)。
+  仍然显式 + fail-closed:集合外拒;**缺席 = 空集**(不放宽);集合由 master 签发(容器改不了)。
+  **权威源不新增**:master 直接 import gateway 的 `DEFAULT_SECONDARY_UTILITY_MODEL`
+  (`billing/modelCatalog.ts` `PLATFORM_AUX_MODEL_IDS` / `platformAuxModels(snapshot)`),
+  catalog 只做**校验**(aux ∉ active/有价/ccb engine → 签发期 fail-closed 拒帧)。
+  **计价不变**:仍按 `body.model` 的真实价格行结算(次级模型有自己的定价行),epoch fence
+  逐请求照跑。turn lease 同带 `auxModels`(WebFetch 多发生在 turn 中段,那时只有 lease 在飞),
+  并进 `assertLeaseMatchesAuthority` 的绑定对账(宽 lease + 窄 authority = 降级攻击面)。
+  codex turn 的 auxModels 恒空(不经 anthropic proxy,最小权限)。
   **turn lease(R4-M1)**:envelope 同时携带独立签名的 turn lease(期限=平台最大
   turn 窗口+grace,如 hard timeout 45min+5min),turn 内后续上游请求凭 lease ——
   长 turn(团队/delegate/compact/工具密集)不被 5min 过期误伤;**安全撤销不靠

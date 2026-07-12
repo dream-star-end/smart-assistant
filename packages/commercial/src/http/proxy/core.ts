@@ -178,6 +178,11 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     const upstreamMessages = session.sanitizeMessages(body.messages, body.model, userLog);
     const upstreamBodyJson = JSON.stringify({
       ...body,
+      // 上游 model 名与平台 model id 分离(模型权威批次 §1.3):session.upstreamModel =
+      // catalog 的 upstream_model_id ?? model_id;无 catalog 时恒等于 body.model(逐字节
+      // 等于旧行为)。**计费/授权/指标一律继续用 body.model**(平台 id),只有发往上游的
+      // 这一份 JSON 用 upstreamModel —— 两个 id 面不可混用。
+      model: session.upstreamModel,
       messages: upstreamMessages,
       stream: true,
     });

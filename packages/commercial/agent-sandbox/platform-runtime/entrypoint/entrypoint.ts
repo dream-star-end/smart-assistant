@@ -49,10 +49,9 @@ import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/ut
 // node_modules),故用工作区根的绝对源码路径。本文件不进 commercial tsconfig 编译图,
 // 一致性由 runtimeEntrypointPolicy.test.ts 守护。
 import { isHiddenSystemAgentId as isHiddenSystemAgentIdShared } from "/opt/openclaude/packages/protocol/src/agentVisibility.ts";
-import {
-  DEFAULT_CODEX_ENGINE_MODEL,
-  DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
-} from "/opt/openclaude/packages/protocol/src/engineModels.ts";
+// codex 型号目录(id → 显示名)。**不再**从这里取 seed 模型:模型权威已下沉到 platform-seed.yaml
+// 声明(schema v2)。这里只用来按**声明的 model** 反查队长显示名 —— 显示名的单一权威仍在 protocol。
+import { CODEX_ENGINE_MODELS } from "/opt/openclaude/packages/protocol/src/engineModels.ts";
 // platform bundle 纯函数集(seed 声明校验 / seed·codex-skill 目录解析 / 覆写决策 / seed agent 合并)。
 // 相对 import:本文件被打进 bundle 的 entrypoint/(生产)或镜像 /usr/local/lib/openclaude/(dev
 // fallback),platformBundle.ts 与本文件同目录同步 COPY/bundle,故 `./` 在两处都解析得到。
@@ -61,6 +60,7 @@ import {
   assertVolumeAncestryNoSymlink,
   buildSeedAgent,
   decidePersonaWrite,
+  DEV_FALLBACK_SEED_DOC,
   isPathWithin,
   resolvePlatformCodexSkillsDir,
   resolvePlatformSeedDir,
@@ -92,9 +92,10 @@ const SELF_ENTRY_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
 const platformSeedDir = resolvePlatformSeedDir(SELF_ENTRY_DIR, existsSync, join);
 // M5 confinement:seed 根 realpath 一次(穿透 current + 收 `..`),作为源路径 containment 基准。
 const platformSeedDirReal = platformSeedDir === null ? null : realpathSync(platformSeedDir);
-// 平台 seed 声明(persona 引用 + 非计费 defaults + seedSkills 清单)。**fail loud 放在下方 volume
-// try 之外**:声明含 model/engine/provider/runnerKind = 部署配置错,须立即崩(§4.1),不能被
-// volume-tolerant catch 吞成 WARN。dev fallback(yaml 缺失)= null → 回落最小内置集(仅 main)。
+// 平台 seed 声明(执行三元组 model/provider/runnerKind + persona 引用 + 非计费 defaults + seedSkills
+// 清单;schema v2)。**fail loud 放在下方 volume try 之外**:声明缺 model / provider 不在已知集 /
+// 含 engine 键 / schema 版本未知 = 部署配置错,须立即崩(§5),不能被 volume-tolerant catch 吞成 WARN。
+// dev fallback(yaml 缺失)= null → 回落 DEV_FALLBACK_SEED_DOC(仅 main 的最小内置**声明**)。
 let platformSeed: PlatformSeedDoc | null = null;
 // persona 文本在 top-level 预读(bundle ro,始终在);缺失 = 坏 bundle,fail loud。写卷在 volume try 里。
 const seedPersonas: Record<string, string> = {};
@@ -127,6 +128,44 @@ if (platformSeedDir === null) {
 }
 // 默认全能助手 persona 的 dev-fallback 内置文案(仅 platformSeed 缺失时用;与 personas/main.md 同源)。
 const MAIN_FALLBACK_PERSONA = "你是 OpenClaude 商业版的默认全能助手,用简洁中文直接回答。\n";
+
+// ── seed 声明 = 容器侧计费/引擎权威(schema v2 §5 阶段 A)──────────────────────
+// entrypoint 不再持任何本地 model/provider 常量:main/codex/hidden-reviewer 的执行三元组、以及
+// 容器 config.defaults.model,全部从**声明**派生。有 bundle → 用 bundle 的声明;无 bundle(dev)→
+// 用 platformBundle.DEV_FALLBACK_SEED_DOC(同一套 buildSeedAgent 装配,不走第二条硬编码路径)。
+const seedDoc: PlatformSeedDoc = platformSeed ?? DEV_FALLBACK_SEED_DOC;
+const seedDeclOf = (id: string): PlatformSeedAgentDecl | undefined =>
+  seedDoc.agents.find((a) => a.id === id);
+// main 是平台默认 agent:缺它 = 坏 bundle(fail loud,volume try 之外)。
+const seedMainDecl = seedDeclOf("main");
+if (!seedMainDecl) {
+  throw new Error('platform-seed: agent "main" is required (它同时是容器 config.defaults.model 的权威)');
+}
+/** 容器级 config.defaults.model —— 取 main seed agent 的**声明** model(单一权威)。 */
+const CONTAINER_DEFAULT_MODEL = seedMainDecl.model;
+
+/**
+ * codex-native seed agent 的队长显示名:按**声明的 model** 反查 protocol 型号目录取显示名。
+ * 声明的 model 不是 protocol 承认的 codex 型号 → fail loud(gateway registry 也会 fail-closed,
+ * 这里提前在 boot 期拒,而不是等 turn 里报错)。
+ */
+function codexLeaderDisplayName(model: string): string {
+  const spec = CODEX_ENGINE_MODELS.find((m) => m.id === model);
+  if (!spec) {
+    throw new Error(
+      `platform-seed: codex-native agent model "${model}" is not a known codex engine model ` +
+        `(protocol CODEX_ENGINE_MODELS: ${CODEX_ENGINE_MODELS.map((m) => m.id).join("/")})`,
+    );
+  }
+  return `${spec.displayName} 队长`;
+}
+/** agentId → 动态显示名(仅 codex-native)。top-level 预算,fail loud 在 volume try 之外。 */
+const seedDynamicDisplayNames: Record<string, string> = {};
+for (const decl of seedDoc.agents) {
+  if (decl.provider === "codex-native") {
+    seedDynamicDisplayNames[decl.id] = codexLeaderDisplayName(decl.model);
+  }
+}
 
 // R2-M4:所有平台向 volume 的写入统一走本 helper —— 祖先 symlink 逃逸拒 + mkdir 后 realpath 复核
 // + 临时文件 rename 原子落盘(纯逻辑在 platformBundle.safeWritePlatformVolumeFile,此处注入真实 fs)。
@@ -218,24 +257,13 @@ const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
 const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
-// 平台全局默认模型。**2026-06-17 改为 glm-5.2(火山方舟 ark,boss 决定:替换掉 glm-5.1、队长全切 glm-5.2)。**
-// ⚠️ 已知运营权衡:glm-5.x 走火山方舟【北京】端点,从 master(吉隆坡)跨境进中国大陆、链路间歇抖动,
-// 长 turn 可能撞瞬时丢包 → "半天没反应"(2026-06-16 正因此把队长撤回 MiniMax-M3)。boss 2026-06-17
-// 明确接受该风险、把队长/平台默认切回火山系 glm-5.2;部署 smoke 须重点验证队长长 turn 稳定性。
-// 注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法 import packages/commercial/src,故本地维护;
-// master 权威常量在 src/platformDefaults.ts,两源一致性由 src/__tests__/runtimeEntrypointPolicy.test.ts
-// 守护 —— 改这里必须同步改 platformDefaults.ts。
-const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
-const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// v5 纯市场模型:容器只 seed「全能助手」(main)+GPT-5.6 默认队长(codex)+隐藏审查员
-// (hidden-reviewer) → 其它用户可见 agent 一律走市场安装(见下方 desiredSeedAgents)。
-// 历史内置子 agent(researcher/scientist/coder/reviewer/scholar)已退役,其各角色专用
-// 的 model/provider 常量随之移除。
-// M1b codex 复活:codex seed agent 回归 —— provider:'codex-native' + runnerKind:
-// 'app-server' 是 gateway runner 路由依据,必须落 agents.yaml。
-const COMMERCIAL_CODEX_MODEL = DEFAULT_CODEX_ENGINE_MODEL;
-const COMMERCIAL_HIDDEN_REVIEWER_MODEL = "glm-5.2";
-const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER = "ark";
+// 计费/引擎权威(model/provider/runnerKind)**已下沉到 platform-seed.yaml 声明**(schema v2,
+// 模型权威批次 §5 阶段 A):entrypoint 不再持 COMMERCIAL_DEFAULT_MODEL / _PROVIDER /
+// COMMERCIAL_CODEX_MODEL / COMMERCIAL_HIDDEN_REVIEWER_* 这些本地常量 —— 双端硬编码(entrypoint
+// 常量 + master platformDefaults)正是滚动窗口计费分叉的根;权威改为"该容器 bundle rev 的声明",
+// master 阶段 B 按容器 label 上的 bundle_rev 读同一份声明(ws/seedDeclarationLoader.ts)。
+// 容器级默认模型见上方 CONTAINER_DEFAULT_MODEL(= main seed agent 的声明 model)。
+// v5 纯市场:容器只 seed 声明里的 main + codex + hidden-reviewer,其它可见 agent 走市场安装。
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
@@ -346,7 +374,7 @@ function ensureCoreDefaults(defaults: Record<string, unknown>): boolean {
     defaults.model.trim() === "" ||
     isLegacyClaudeModel(defaults.model)
   ) {
-    defaults.model = COMMERCIAL_DEFAULT_MODEL;
+    defaults.model = CONTAINER_DEFAULT_MODEL;
     mutated = true;
   }
   // 迁移旧平台默认 acceptEdits → bypassPermissions:已有用户卷里 config.defaults 在缺失分支
@@ -390,7 +418,7 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
     // 默认 bypassPermissions:容器是每用户独立沙箱(沙箱即安全边界),消费级产品不应逐条
     // bash 弹窗。seed agent 早已 bypass;市场/用户自建 agent(manifest 禁止自带 permissionMode)
     // 此前落到 acceptEdits → bash/oc-* CLI 都弹确认。统一默认 bypass 消除该摩擦。
-    config.defaults = { model: COMMERCIAL_DEFAULT_MODEL, permissionMode: "bypassPermissions", toolsets: [CORE_TOOLSET_ID] };
+    config.defaults = { model: CONTAINER_DEFAULT_MODEL, permissionMode: "bypassPermissions", toolsets: [CORE_TOOLSET_ID] };
     mutated = true;
   } else if (ensureCoreDefaults(config.defaults)) {
     mutated = true;
@@ -724,7 +752,7 @@ try {
       // 历史 incident 2026-04-21:漏写本字段,boss 在 claudeai.chat 发消息容器接到
       // 但永远不回包。
       defaults: {
-        model: COMMERCIAL_DEFAULT_MODEL,
+        model: CONTAINER_DEFAULT_MODEL,
         // bypassPermissions:沙箱即安全边界,消费级产品不逐条 bash 弹窗(详见上方 ensureCoreDefaults 注释)。
         permissionMode: "bypassPermissions",
         toolsets: [CORE_TOOLSET_ID],
@@ -1085,69 +1113,38 @@ try {
     return patched ? next : null;
   }
 
-  // ── 平台 seed agent 构建(runtime hotcfg P2a)──
-  // 非计费字段(persona 引用 / permissionMode / displayName / avatarEmoji / toolsets)来自
-  // platform-seed.yaml 声明;**计费/引擎权威(model/provider/runnerKind + codex 动态 displayName)
-  // 恒由下方 billing 常量注入,声明里禁止出现(validatePlatformSeed 已硬拒 model/engine/provider/
-  // runnerKind)**。persona 文本来自 bundle personas/<id>.md(top-level 预读入 seedPersonas);写卷
-  // 经 ensureAgentPersona。产物字段与旧内联 desiredXAgent 一致,下游 patchPlatformSeedAgent merge
-  // 逻辑零改动。dev fallback(platformSeed 缺失)只 seed 最小内置集(仅 main)。
-  const seedDeclOf = (id: string): PlatformSeedAgentDecl | undefined =>
-    platformSeed?.agents.find((a) => a.id === id);
-
-  let desiredSeedAgents: Record<string, unknown>[];
-  if (!platformSeed) {
-    desiredSeedAgents = [
+  // ── 平台 seed agent 构建(runtime hotcfg P2a + 模型权威 §5 阶段 A)──
+  // **全部字段来自 platform-seed.yaml 声明**(schema v2):执行三元组(model/provider/runnerKind)
+  // 与非计费字段(persona 引用 / permissionMode / displayName / avatarEmoji / toolsets)同源;
+  // entrypoint 侧唯一的动态注入是**展示层** codex 队长 displayName(按声明的 model 反查 protocol
+  // 型号目录,见 seedDynamicDisplayNames;buildSeedAgent 硬拒任何执行键走 dynamic 面)。
+  // persona 文本来自 bundle personas/<id>.md(top-level 预读入 seedPersonas);写卷经 ensureAgentPersona。
+  // 产物字段与旧内联 desiredXAgent 一致,下游 patchPlatformSeedAgent merge 逻辑零改动。
+  // dev fallback(无 bundle)= DEV_FALLBACK_SEED_DOC 的最小 main-only 声明,走同一条装配路径。
+  //
+  // v5 纯市场:seed 集合 = 声明里的 agent(生产 = main + codex + hidden-reviewer);其它可见 agent
+  // 一律走市场安装(syncMarketplaceHub 直写 agents.yaml + source:marketplace)。hidden-reviewer
+  // 不带 source:marketplace → 不进 AgentPicker/协作列表。存量幽灵 seed 不 prune。
+  const desiredSeedAgents: Record<string, unknown>[] = [];
+  for (const decl of seedDoc.agents) {
+    const personaContent = seedPersonas[decl.id];
+    // persona 卷路径:声明带 persona 引用 → 写卷(main 在 dev fallback 无 bundle 时用内置文案);
+    // 无 persona 声明(codex)→ 不写、产物不带 persona 字段(与旧内联对象一致)。
+    let personaPath: string | undefined;
+    if (personaContent !== undefined) {
+      personaPath = ensureAgentPersona(decl.id, personaContent, { force: decl.forcePersona ?? false });
+    } else if (decl.id === "main") {
+      personaPath = ensureAgentPersona("main", MAIN_FALLBACK_PERSONA);
+    }
+    const dynamicDisplayName = seedDynamicDisplayNames[decl.id];
+    desiredSeedAgents.push(
       buildSeedAgent({
-        id: "main",
-        billing: { model: COMMERCIAL_DEFAULT_MODEL, provider: COMMERCIAL_DEFAULT_PROVIDER },
-        personaPath: ensureAgentPersona("main", MAIN_FALLBACK_PERSONA),
+        id: decl.id,
+        decl,
+        personaPath,
+        dynamic: dynamicDisplayName !== undefined ? { displayName: dynamicDisplayName } : undefined,
       }),
-    ];
-  } else {
-    const desiredMainAgent = buildSeedAgent({
-      id: "main",
-      decl: seedDeclOf("main"),
-      billing: { model: COMMERCIAL_DEFAULT_MODEL, provider: COMMERCIAL_DEFAULT_PROVIDER },
-      personaPath: ensureAgentPersona("main", seedPersonas.main ?? MAIN_FALLBACK_PERSONA),
-    });
-
-    // codex 默认队长:displayName 动态(protocol 引擎显示名 + 队长),provider/runnerKind 是引擎路由。
-    const desiredCodexAgent = buildSeedAgent({
-      id: "codex",
-      decl: seedDeclOf("codex"),
-      billing: {
-        model: COMMERCIAL_CODEX_MODEL,
-        provider: "codex-native",
-        runnerKind: "app-server",
-        displayName: `${DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 队长`,
-      },
-    });
-
-    // 隐藏审查员:persona 每 boot 强制刷新(裁决词汇 PASS/NEEDS_FIX 与 @openclaude/protocol 两源一致,
-    // 靠 runtimeEntrypointPolicy 两源测试锁死;persona 文本已迁 personas/hidden-reviewer.md)。
-    const hrDecl = seedDeclOf("hidden-reviewer");
-    const hrPersonaContent = seedPersonas["hidden-reviewer"];
-    const desiredHiddenReviewerAgent = buildSeedAgent({
-      id: "hidden-reviewer",
-      decl: hrDecl,
-      billing: {
-        model: COMMERCIAL_HIDDEN_REVIEWER_MODEL,
-        provider: COMMERCIAL_HIDDEN_REVIEWER_PROVIDER,
-      },
-      personaPath:
-        hrPersonaContent !== undefined
-          ? ensureAgentPersona("hidden-reviewer", hrPersonaContent, {
-              force: hrDecl?.forcePersona ?? true,
-            })
-          : undefined,
-    });
-
-    // v5 纯市场:容器只 seed main + codex + hidden-reviewer;其它可见 agent 走市场安装
-    // (syncMarketplaceHub 直写 agents.yaml + source:marketplace)。hidden-reviewer 不带
-    // source:marketplace → 不进 AgentPicker/协作列表。存量幽灵 seed 不 prune(listCollaboratorAgents
-    // 的 marketplace-source 过滤已让其惰性)。
-    desiredSeedAgents = [desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent];
+    );
   }
 
   // v5 轻量组队重构:不再预置团队(队长 turn 级自主 delegate_task 组队)。保留空数组,

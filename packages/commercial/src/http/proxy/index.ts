@@ -42,12 +42,22 @@ import {
 } from "../../billing/proxyBilling.js";
 import { checkRateLimit } from "../../middleware/rateLimit.js";
 import {
+  UnroutableProviderError,
+  checkCapabilityWithinCeiling,
   pickUpstream,
+  providerCapabilityCeiling,
   releaseUpstreamSession,
   selectUpstreamRoute,
   validateUpstreamConfig,
   type PreparedUpstreamSession,
+  type UpstreamRoute,
 } from "./upstream.js";
+import {
+  ModelGateReject,
+  enforceModelAuthority,
+  type GateRejectKind,
+  type ModelAuthorityDecision,
+} from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import { getDegradedProviders } from "../../admin/providerHealthGate.js";
@@ -96,6 +106,55 @@ import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js
 function httpErrToReject(err: HttpError): ProxyRejectReason {
   if (err.status === 413) return "too_large";
   return "bad_body";
+}
+
+/** 模型权威 gate 的拒绝类型 → reject metric 标签(运维仪表盘按这个分流告警)。 */
+const GATE_REJECT_METRIC: Record<GateRejectKind, ProxyRejectReason> = {
+  not_available: "model_not_available",
+  authority_invalid: "model_authority_invalid",
+  config_changed: "model_config_changed",
+  catalog_unavailable: "model_catalog_unavailable",
+};
+
+/**
+ * 影子双读(方案 §7 步 2 的"零漂移锚"):catalog 判定 vs legacy 判定,只对比、只打日志,
+ * **绝不改变行为**。开 flag 前用它证明"切判定源不会改变任何一个请求的命运"。
+ *
+ * 全程 fail-soft:影子对比自身出任何问题(快照 unknown / DB 抖动)都不能影响正在跑的请求。
+ */
+function observeCatalogShadow(
+  catalog: NonNullable<AnthropicProxyDeps["modelCatalog"]>,
+  model: string,
+  pricing: AnthropicProxyDeps["pricing"],
+  log: ReturnType<typeof rootLogger.child>,
+): void {
+  try {
+    // peek():影子面允许 unknown(不 fence、不重建);拿不到快照就跳过本次对比。
+    const snapshot = catalog.peek();
+    if (!snapshot) return;
+    const canonical = snapshot.aliasToCanonical(model);
+    const catalogRoutable = snapshot.isRoutable(canonical);
+    const legacyRow = pricing.get(model);
+    const legacyRoutable = Boolean(legacyRow?.enabled);
+    const catalogProvider = catalogRoutable ? (snapshot.resolve(canonical)?.providerId ?? null) : null;
+    // legacy 的 OAuth 路径没有 provider id(matchesRoute 不命中 = OAuth);catalog 用虚拟条目
+    // 'anthropic' 表达同一件事 → 归一后再比,否则每个 OAuth 模型都会报一次假漂移。
+    const legacyProvider = catalogRoutable
+      ? (findRouteProviderForModel(model)?.id ?? "anthropic")
+      : null;
+    if (catalogRoutable !== legacyRoutable || catalogProvider !== legacyProvider) {
+      log.warn("model_authority_shadow_drift", {
+        model,
+        canonical,
+        catalogRoutable,
+        legacyRoutable,
+        catalogProvider,
+        legacyProvider,
+      });
+    }
+  } catch (err) {
+    log.warn("model_authority_shadow_failed", { err: errSummary(err) });
+  }
 }
 
 // ─── handler 工厂 ─────────────────────────────────────────────────────────
@@ -251,10 +310,60 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
-      // 5) 取 pricing
+      // 4b) 模型执行权威 gate(模型权威批次 · 方案 §1.2/§4)。
+      //
+      // **必须在授权 / 路由 / preCheck 之前**:它做三件事 ——
+      //   ① 每请求 epoch fence(单行 SELECT,不做时间微缓存)→ 拿到与 DB 线性化的 catalog 快照;
+      //   ② 可用性判定(catalog active + 有价 + capability schema 可理解);
+      //   ③ 校验请求携带的凭据(bridge 签名 envelope/lease,或本地路径 local_catalog token)。
+      //
+      // 三态:
+      //   - 未注入 catalog        → 完全 legacy(本批次之前的行为,零变化);
+      //   - 注入但 enforce=false  → **影子期**:catalog 判定与 legacy 判定对比打日志(零漂移锚),
+      //                             拒绝权仍在 legacy(§7 步 2 部署基建不改变用户可见行为);
+      //   - enforce=true          → 判定权在 catalog,拒绝一律 fail-closed(§7 步 4)。
+      let gate: ModelAuthorityDecision | null = null;
+      if (deps.modelCatalog && deps.modelAuthorityEnforce) {
+        try {
+          gate = await enforceModelAuthority({
+            catalog: deps.modelCatalog,
+            keyring: deps.authorityKeyring?.() ?? null,
+            headers: req.headers,
+            uid,
+            containerId: containerIdBig,
+            model: body.model,
+          });
+        } catch (err) {
+          if (err instanceof ModelGateReject) {
+            userLog.warn("proxy_model_authority_rejected", {
+              kind: err.kind,
+              code: err.code,
+              // detail 只进日志,不出网(错误响应统一通用文案,不回显 engine/provider/revision)。
+              detail: err.detail,
+              model: body.model,
+            });
+            incrAnthropicProxyReject(GATE_REJECT_METRIC[err.kind]);
+            sendJsonError(res, err.status, err.code, err.clientMessage, requestId);
+            return;
+          }
+          throw err;
+        }
+        // alias 归一到 master 权威的 canonical id:此后**全链**(pricing/授权/限流指标/journal/
+        // usage_records/广播)都用 canonical,避免"用户传 alias、计费落 alias"的双 id 面。
+        // 发往上游的 model 名另由 session.upstreamModel 决定(core.ts)。
+        body.model = gate.canonicalModel;
+      } else if (deps.modelCatalog) {
+        observeCatalogShadow(deps.modelCatalog, body.model, deps.pricing, userLog);
+      }
+
+      // 5) 取 pricing(catalog 判定通过后,价格仍来自 model_pricing —— catalog 只管 execution)。
+      //
+      // enforce 路径不再看 `pricing.enabled`:可用性的唯一权威是 catalog.state(0135 起
+      // enabled 只是派生镜像),且 gate 的 isRoutable 已经断言"有价格行"。此处 pricing 为空
+      // 只可能是 PricingCache 尚未收到 NOTIFY 的瞬时窗口 → 仍按 unknown_model 拒(fail-closed)。
       const pricing = deps.pricing.get(body.model);
-      if (!pricing || !pricing.enabled) {
-        userLog.warn("proxy_unknown_model", { model: body.model });
+      if (!pricing || (!gate && !pricing.enabled)) {
+        userLog.warn("proxy_unknown_model", { model: body.model, catalogGated: gate !== null });
         incrAnthropicProxyReject("unknown_model");
         sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${body.model}' not enabled`, requestId);
         return;
@@ -266,7 +375,11 @@ export function makeAnthropicProxyHandler(
       // 正交,红线②)。只治理静态 provider;OAuth/claude 归 account-pool。fail-soft:读失败空集放行。
       // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
       if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
-        const providerId = findRouteProviderForModel(body.model)?.id;
+        // provider 归属:catalog 判定生效时以 catalog 的 provider_id 为准(数据驱动);
+        // legacy 期仍走 matchesRoute 推断。
+        const providerId = gate
+          ? (gate.descriptor.providerId ?? undefined)
+          : findRouteProviderForModel(body.model)?.id;
         if (providerId) {
           const degradedSet = await getDegradedProviders();
           if (degradedSet.has(providerId)) {
@@ -344,7 +457,71 @@ export function makeAnthropicProxyHandler(
       //
       // **必须在 preCheck 之前**:静态 provider 路由缺 key 直接 503,不能 reserve credits 再 rollback。
       // 详见 `proxy/upstream.ts` selectUpstreamRoute / validateUpstreamConfig 注释 + plan 行为锁。
-      const route = selectUpstreamRoute(body.model);
+      //
+      // 模型权威批次:gate 生效时按 **catalog 的 provider_id** 选 provider 机制、按
+      // **upstream_model_id ?? model_id** 决定上游 model 名(matchesRoute 降级为迁移期回落)。
+      let route: UpstreamRoute;
+      try {
+        route = selectUpstreamRoute(
+          body.model,
+          gate
+            ? {
+                providerId: gate.descriptor.providerId,
+                upstreamModelId: gate.descriptor.upstreamModelId,
+              }
+            : undefined,
+        );
+      } catch (err) {
+        if (err instanceof UnroutableProviderError) {
+          // 配置事故:catalog 里写了本进程不认识的 provider 机制。静默回落 OAuth 会把它发到
+          // Anthropic 账号池上烧真钱 → 响亮 503 + error 日志(运维必须去修 catalog 行)。
+          userLog.error("proxy_unroutable_provider", {
+            provider: err.providerId,
+            model: body.model,
+          });
+          incrAnthropicProxyReject("model_config_invalid");
+          sendJsonError(res, 503, "MODEL_NOT_AVAILABLE", "model not available", requestId);
+          return;
+        }
+        throw err;
+      }
+
+      // 5c') 能力上限:catalog 声明的 capability ⊆ provider **机制**上限(方案 §4)。
+      // 声明 vision 而上游纯文本 → 图片进上游必 400 打死会话;声明 effort 而上游 strip
+      // output_config → 用户选了没效果。两者都是配置事故,fail-closed 拒而不是"尽力跑"。
+      if (gate) {
+        const violation = checkCapabilityWithinCeiling(
+          {
+            supportsVision: gate.descriptor.capabilityProfile.supportsVision,
+            supportedEfforts: gate.descriptor.capabilityProfile.reasoning.supported,
+          },
+          providerCapabilityCeiling(route),
+        );
+        if (violation) {
+          userLog.error("proxy_capability_exceeds_provider", {
+            model: body.model,
+            provider: gate.descriptor.providerId,
+            violation,
+          });
+          incrAnthropicProxyReject("model_config_invalid");
+          sendJsonError(res, 503, "MODEL_NOT_AVAILABLE", "model not available", requestId);
+          return;
+        }
+      }
+
+      /**
+       * 该**模型**是否原生识图。
+       *
+       * gate 生效 → 取 catalog 行的 per-model capability(方案 §4 "proxy 清洗消费 catalog 行
+       * per-model");legacy → 沿用 provider 级 spec.supportsVision(现状)。
+       * 二者的差别正是本批次要解决的一类问题:同一 provider 下未来会同时有多模态与纯文本型号,
+       * provider 级 flag 表达不了。
+       */
+      const modelSupportsVision = gate
+        ? gate.descriptor.capabilityProfile.supportsVision
+        : route.kind === "static"
+          ? route.provider.supportsVision === true
+          : true;
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
       });
@@ -436,7 +613,7 @@ export function makeAnthropicProxyHandler(
       // 与上游 400 同样卡会话),(b)高估 preCheck 预留 cost。strip 后估算/cap/上游 body 同口径。
       // 注:**多模态静态 provider(supportsVision=true,如 MiniMax-M3)不 strip 图** —— 它原生识图;
       // 其余纯文本静态 provider(deepseek/ark glm-5.x)仍 strip(模型看不到图,靠 understand_image 工具兜底)。
-      if (route.kind === "static" && !route.provider.supportsVision) {
+      if (route.kind === "static" && !modelSupportsVision) {
         const stripped = stripNonTextContentBlocks(body.messages);
         if (stripped.imagesStripped + stripped.documentsStripped > 0) {
           body.messages = stripped.messages as typeof body.messages;
@@ -459,7 +636,7 @@ export function makeAnthropicProxyHandler(
       // understand_image 永远 413。图请求的真正体积上限由下游 enforceFieldByteBudgets(messages 8MB)兜底。
       if (
         route.kind === "static" &&
-        !route.provider.supportsVision &&
+        !modelSupportsVision &&
         route.provider.maxInputTokens != null &&
         inputTokens > route.provider.maxInputTokens
       ) {
@@ -741,6 +918,17 @@ export function makeAnthropicProxyHandler(
           mode: attribution.mode,
           parentSessionId: attribution.parentSessionId,
           delegateAgentId: attribution.delegateAgentId,
+          // 模型权威留证(0135 四列;方案 §4 / R3-m11)。gate 未生效(legacy / 影子期)→ 全 NULL,
+          // 与本批次之前的落库形状一致。有值时可事后回答:这一笔是按哪个执行快照、哪个 epoch、
+          // 凭哪类权威扣的钱。
+          authority: gate
+            ? {
+                executionRevision: gate.executionRevision,
+                projectionRevision: gate.projectionRevision,
+                securityEpoch: gate.securityEpoch,
+                kind: gate.authorityKind,
+              }
+            : null,
         },
       );
 

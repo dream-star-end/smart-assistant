@@ -25,6 +25,11 @@ import IORedis from "ioredis";
 import { loadConfig } from "../config.js";
 import { getPool } from "../db/index.js";
 import { PricingCache } from "../billing/pricing.js";
+import {
+  authorityKeyringProvider,
+  getModelCatalogCache,
+  isModelAuthorityEnforced,
+} from "../billing/modelCatalogRuntime.js";
 import { wrapIoredisForPreCheck } from "../billing/preCheck.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
@@ -152,6 +157,23 @@ export async function startEgress(): Promise<void> {
     kimi: cfg.ARK_AGENT_PLAN_KEY,
   };
 
+  // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)────────────────────────────
+  //
+  // **这里才是 fence 真正生效的地方**:生产的 `/v1/messages` 全部走本进程,每个独立 HTTP
+  // 请求在授权/路由前做一次 epoch fence(单行 SELECT,不做时间微缓存)+ authority 校验。
+  // master 侧的同一份 handler 只服务非 split 拓扑。
+  //
+  // 两个模式都加载 catalog(影子期用真实流量证明"切判定源不改变任何请求的命运");
+  // 加载失败 → 抛 → egress 拒启(fail-closed:半开状态会让每条请求都被 fence 拒)。
+  // **生效面**:改本段或 gate/路由代码,部署必须 `deploy-v5.sh --egress`。
+  const modelCatalog = await getModelCatalogCache();
+  const modelAuthorityEnforce = isModelAuthorityEnforced();
+  log.info("model_catalog_ready", {
+    enforce: modelAuthorityEnforce,
+    securityEpoch: modelCatalog.current().securityEpoch.toString(),
+    executionRevision: modelCatalog.current().executionRevision.slice(0, 12),
+  });
+
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -159,6 +181,10 @@ export async function startEgress(): Promise<void> {
     scheduler,
     identity: identityStrategy,
     rateLimitRedis,
+    modelCatalog,
+    modelAuthorityEnforce,
+    // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
+    authorityKeyring: authorityKeyringProvider(),
     refreshDeps: { health: healthTracker },
     // 跨进程 post-commit hooks:两者都收敛到 costSink FIFO(persist 先入队,
     // broadcast 后入队;master 端按序 apply,与原进程内顺序一致)。
