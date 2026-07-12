@@ -35,6 +35,13 @@ if [ -z "${OPENCLAUDE_TRUST_BRIDGE_IP:-}" ]; then
 fi
 
 # ---- 3. 交棒 entrypoint.ts ----
-# 用 tsx (个人版 devDep,npm ci 已装) 跑 .ts 入口,避免维护两份 isProviderManagedEnvVar 列表
+# 用 tsx (个人版 devDep,npm ci 已装) 跑 .ts 入口,避免维护两份 isProviderManagedEnvVar 列表。
+#
+# 分流(runtime hotcfg §2):优先跑 platform bundle 里的 entrypoint(原子翻转即温热生效),
+# 缺失(裸镜像 / dev fallback)才回落镜像内 COPY 的副本。EP 解析后再 cd,exec 单入口。
+# entrypoint.ts 自身用 realpath(import.meta.url) 自钉所在 bundle,读相对 seed —— 不依赖本
+# 变量,这里只决定"跑哪份 entrypoint"。
+EP=/run/oc/platform/current/entrypoint/entrypoint.ts
+[ -f "$EP" ] || EP=/usr/local/lib/openclaude/entrypoint.ts
 cd /opt/openclaude
-exec npx --no tsx /usr/local/lib/openclaude/entrypoint.ts
+exec npx --no tsx "$EP"

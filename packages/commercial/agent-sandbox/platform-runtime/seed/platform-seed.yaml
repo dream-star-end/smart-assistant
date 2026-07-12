@@ -1,0 +1,51 @@
+# platform-seed.yaml — v5 平台 seed agent 的**非计费声明**(P2a 缩,设计 §4.1)。
+#
+# 不变量(硬边界,fail loud):
+#   - 本文件**只**声明 persona 文件引用 + 非计费 defaults(permissionMode / toolsets /
+#     displayName / avatarEmoji / forcePersona)+ seedSkills 清单。
+#   - **禁止**出现 model / engine / provider / runnerKind 键 —— 计费/引擎路由权威留在
+#     entrypoint.ts 常量硬编码,与 master agentModelAuthority 双端同构(见 §4.1)。出现即
+#     validatePlatformSeed() 抛错拒启(防止绕道声明化回潮计费分叉,设计 R2-B1)。
+#   - 消费方 = entrypoint.ts(经 platformBundle.ts 的 validatePlatformSeed / buildSeedAgent);
+#     persona 文件在 personas/<id>.md,scientist seed skill 内容在 skills/scientist/<name>/SKILL.md。
+#   - 改本文件 → bundle rev 变 → boot_hash 变 → 容器温滚动生效(无计费面)。
+schemaVersion: 1
+
+agents:
+  # 默认全能助手。model/provider 由 entrypoint COMMERCIAL_DEFAULT_MODEL/PROVIDER 注入。
+  - id: main
+    persona: personas/main.md
+    permissionMode: bypassPermissions
+    displayName: 全能助手
+    avatarEmoji: "🧠"
+  # GPT-5.6(Codex)默认队长。model/provider/runnerKind + 动态 displayName(由 protocol
+  # DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME 拼「队长」)全部由 entrypoint 注入,故此处只留
+  # 非计费的 permissionMode + avatarEmoji。
+  - id: codex
+    permissionMode: bypassPermissions
+    avatarEmoji: "🤖"
+  # 团队模式隐藏审查员(reserved system id;不带 source:marketplace,不进协作列表)。
+  # persona 每次 boot 强制刷新(forcePersona),裁决词汇与 @openclaude/protocol 两源一致。
+  - id: hidden-reviewer
+    persona: personas/hidden-reviewer.md
+    forcePersona: true
+    permissionMode: bypassPermissions
+    displayName: 隐藏审查员
+    avatarEmoji: "🕵️"
+    toolsets: [core]
+
+# per-agent seed skill 清单:skill 内容在 skills/<agentId>/<name>/SKILL.md,entrypoint 幂等
+# seed 到 volume 的 agents/<agentId>/seed-skills/ 只读层。scientist 是市场可安装 agent,预置其
+# seed-skills 让用户装上后即拥有精选静态科研指南(K-Dense 改写子集,frontmatter 钉源 commit)。
+seedSkills:
+  scientist:
+    - matplotlib
+    - statistical-analysis
+    - statsmodels
+    - scikit-learn
+    - sympy
+    - pymc
+    - pymoo
+    - aeon
+    - scanpy
+    - scvi-tools

@@ -1,0 +1,6 @@
+#!/bin/sh
+# mmx = oc-minimax 的别名入口。镜像内旧实现是 /usr/local/bin/mmx -> oc-minimax 软链;
+# bundle 校验拒 symlink(platformBundle.ts 类型白名单),故用同语义薄壳替代。
+# readlink -f 穿透 platform current 软链 → rev-pinned 路径,翻转期单次调用不混版
+# (与其它 bin 工具 SELF_ROOT 同不变量)。源文件即无扩展名,finalize 剥名步骤对它是 no-op。
+exec "$(dirname "$(readlink -f "$0")")/oc-minimax" "$@"
