@@ -30,6 +30,15 @@ import {
   ACTIVE_REPAIR_STATUSES,
   OPS_REPAIR_TIMEOUT,
 } from "./repairDispatcher.js";
+import {
+  isSelfhealDispatchDisabled,
+  ackBudgetMs,
+  totalBudgetMs,
+} from "./config.js";
+
+// B3:配置解析已收口 selfheal/config.ts;此处 re-export 保持既有 import 站点
+// (index barrel / bridge)不动。
+export { isSelfhealDispatchDisabled };
 
 const DEFAULT_INTERVAL_MS = 10_000;
 const CLAIM_LEASE = "2 minutes";
@@ -105,12 +114,6 @@ interface ClaimedDeliveryRow {
   phase: "opened" | "updated" | "resolved";
 }
 
-/** 切片① 默认关闭派单;仅 OC_SELFHEAL_DISPATCH_DISABLED 显式为 '0'/'false' 才视为启用。 */
-export function isSelfhealDispatchDisabled(): boolean {
-  const v = (process.env.OC_SELFHEAL_DISPATCH_DISABLED ?? "1").trim().toLowerCase();
-  return v !== "0" && v !== "false";
-}
-
 function buildPayload(inc: IncidentRow, deliveryRev: number, phase: string): IncidentPayload {
   const status: "open" | "resolved" = phase === "resolved" ? "resolved" : "open";
   return {
@@ -154,44 +157,56 @@ export async function sweepOnce(deps: SweeperDeps): Promise<SweepResult> {
       RETURNING d.id::text AS id, d.incident_id::text AS incident_id,
                 d.incident_rev::text AS incident_rev, d.channel, d.phase`,
   );
-  if (claimed.rows.length === 0) return out;
 
-  // 批量取 incident 详情(payload materialize)。
-  const incidentIds = [...new Set(claimed.rows.map((d) => d.incident_id))];
-  const incR = await query<IncidentRow>(
-    `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
-            user_title, user_message
-       FROM incidents WHERE id = ANY($1::bigint[])`,
-    [incidentIds],
-  );
-  const incById = new Map<string, IncidentRow>();
-  for (const r of incR.rows) incById.set(r.id, r);
+  // 注意:claimed 为空**不 early-return**——修复状态机看护(verify fence/timeout/
+  // cancel 推进)与 nonce 保洁必须每 tick 跑,否则"无 pending 投递"的安静时段里
+  // cancel/verify 永远卡住(收尾批修:此前 early-return 让 repair sweep 饿死)。
+  if (claimed.rows.length > 0) {
+    // 批量取 incident 详情(payload materialize)。
+    const incidentIds = [...new Set(claimed.rows.map((d) => d.incident_id))];
+    const incR = await query<IncidentRow>(
+      `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
+              user_title, user_message
+         FROM incidents WHERE id = ANY($1::bigint[])`,
+      [incidentIds],
+    );
+    const incById = new Map<string, IncidentRow>();
+    for (const r of incR.rows) incById.set(r.id, r);
 
-  for (const d of claimed.rows) {
-    const inc = incById.get(d.incident_id);
-    if (!inc) {
-      // 理论不可达(FK CASCADE);标 sent 防死循环。
-      await query(`UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`, [d.id]);
-      continue;
-    }
-    const payload = buildPayload(inc, Number(d.incident_rev), d.phase);
-    try {
-      if (d.channel === "ws") {
-        await deliverWs(query, deps, inc, d.id, payload);
-        out.ws++;
-      } else {
-        await deliverInbox(tx, inc, d, payload);
-        out.inbox++;
+    for (const d of claimed.rows) {
+      const inc = incById.get(d.incident_id);
+      if (!inc) {
+        // 理论不可达(FK CASCADE);标 sent 防死循环。
+        await query(`UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`, [d.id]);
+        continue;
       }
-    } catch (err) {
-      out.errors++;
-      // 失败留 pending(claimed_at 租约到期后重投,at-least-once);不置 failed 以免丢投递。
-      log.warn("selfheal_delivery_failed", {
-        delivery: d.id,
-        channel: d.channel,
-        err: (err as Error)?.message ?? String(err),
-      });
+      const payload = buildPayload(inc, Number(d.incident_rev), d.phase);
+      try {
+        if (d.channel === "ws") {
+          await deliverWs(query, deps, inc, d.id, payload);
+          out.ws++;
+        } else {
+          await deliverInbox(tx, inc, d, payload);
+          out.inbox++;
+        }
+      } catch (err) {
+        out.errors++;
+        // 失败留 pending(claimed_at 租约到期后重投,at-least-once);不置 failed 以免丢投递。
+        log.warn("selfheal_delivery_failed", {
+          delivery: d.id,
+          channel: d.channel,
+          err: (err as Error)?.message ?? String(err),
+        });
+      }
     }
+  }
+
+  // M3:webhook nonce 保洁(selfheal_webhook_nonces,ts 窗口 ±2min << 10min 保留余量)。
+  // 失败只 warn,不拖垮主链。
+  try {
+    await query(`DELETE FROM selfheal_webhook_nonces WHERE seen_at < NOW() - INTERVAL '10 minutes'`);
+  } catch (err) {
+    log.warn("selfheal_nonce_retention_failed", { err: (err as Error)?.message ?? String(err) });
   }
 
   // 切片②ⓐ:修复派单 + 状态机时序看护(默认关闭,env 缺省安全)。永不因其失败拖垮投递主链。
@@ -251,6 +266,10 @@ async function deliverInbox(
   const level = resolved ? "info" : "warning";
   const title = (resolved ? `${inc.user_title}(已恢复)` : inc.user_title).slice(0, 190) || inc.surface;
   const body = (resolved ? RECOVERY_MESSAGE : inc.user_message).slice(0, 16000) || title;
+  // L1(收尾批):'updated' 相位的 inbox 幂等键带上 incident_rev——同一 incident 的
+  // 多次 update(severity/文案升级)各落一条站内信;同 rev 重放仍只一条。
+  // opened/resolved 每 incident 语义唯一,保持裸相位不变。
+  const sourcePhase = d.phase === "updated" ? `updated:${d.incident_rev}` : d.phase;
   await tx(async (client: PoolClient) => {
     const adminR = await client.query<{ id: string }>(
       `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
@@ -263,7 +282,7 @@ async function deliverInbox(
          VALUES ('all', NULL, $1, $2, $3, $4::bigint, 'incident', $5::bigint, $6)
          ON CONFLICT (source_type, source_id, source_phase) WHERE source_type IS NOT NULL
            DO NOTHING`,
-        [title, body, level, createdBy, inc.id, d.phase],
+        [title, body, level, createdBy, inc.id, sourcePhase],
       );
     }
     await client.query(
@@ -274,16 +293,8 @@ async function deliverInbox(
 }
 
 // ─── 切片②ⓐ:修复派单 + 状态机时序看护 ─────────────────────────────────
-
-/** ack 预算(dispatched 未 ack)/ 总预算(created 起)。超预算 → cancel 流。 */
-function ackBudgetMs(): number {
-  const raw = Number(process.env.OC_SELFHEAL_ACK_BUDGET_MS);
-  return Number.isFinite(raw) && raw >= 30_000 ? raw : 5 * 60 * 1000;
-}
-function totalBudgetMs(): number {
-  const raw = Number(process.env.OC_SELFHEAL_TOTAL_BUDGET_MS);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 90 * 60 * 1000;
-}
+// ack 预算(dispatched 未 ack)/ 总预算(created 起)超限 → cancel 流。
+// 数值解析收口 selfheal/config.ts(B3):ackBudgetMs / totalBudgetMs 从那里 import。
 
 export interface RepairSweepDeps {
   query?: typeof _query;

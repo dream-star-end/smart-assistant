@@ -3,8 +3,8 @@
  *
  * codex 经隧道 `GET /internal/v5/repairs/:id/context`(capability 鉴权)拉取。**绝不**把自由文本
  * ops_detail 塞进派单 body(webhook payload 只含 id,见 repairDispatcher),注入面收敛到 master
- * 控制的结构化字段;free-text / snapshot 全部经 redactSensitive 脱敏后才出库(codex 侧当只读数据,
- * 不作为可信指令)。
+ * 控制的结构化字段;free-text / snapshot 全部经 redactOpsPayload(M4:key 级+值级清洗)
+ * 脱敏后才出库(codex 侧当只读数据,不作为可信指令)。
  *
  * 字段(接缝契约):
  *   eventType     — policy.match_key(命中的策略键,稳定类别);无 policy 回落 condition_key
@@ -18,7 +18,7 @@
  */
 
 import { query as _query } from "../db/queries.js";
-import { redactSensitive } from "../admin/auditRedact.js";
+import { redactOpsPayload } from "./redact.js";
 
 export interface RepairContext {
   repairId: string;
@@ -93,10 +93,10 @@ export async function getRepairContext(
     conditionKey: row.condition_key,
     surface: row.surface,
     severity: row.severity,
-    // ops_detail 是策展的内部文本(policy.repair_hint 派生),redactSensitive 对纯字符串是 no-op,
-    // 但对结构化残留一致脱敏;保持与 admin 视图同一收口。
-    opsDetail: redactSensitive(row.ops_detail),
-    probeSnapshot: redactSensitive(row.snapshot ?? {}),
+    // M4:redactOpsPayload = key 级 + 值级字符串清洗(snapshot/自由文本里嵌的
+    // sk-/Bearer/URL userinfo 凭据也被清);与 selfhealOps admin 视图同一收口。
+    opsDetail: redactOpsPayload(row.ops_detail),
+    probeSnapshot: redactOpsPayload(row.snapshot ?? {}),
     repairHint: row.repair_hint,
     tier: row.tier,
   };

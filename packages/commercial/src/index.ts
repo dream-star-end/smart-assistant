@@ -154,6 +154,8 @@ import {
 import {
   startIncidentReconciler,
   startIncidentSweeper,
+  assertSelfhealConfig,
+  selfhealTickMs,
   type IncidentReconcilerHandle,
   type IncidentReconcilerSnapshotHandle,
   type IncidentPayload,
@@ -3620,8 +3622,11 @@ export async function registerCommercial(
   let incidentReconciler: IncidentReconcilerHandle | undefined;
   let incidentSweeper: IncidentReconcilerSnapshotHandle | undefined;
   if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
-    const raw = Number(process.env.OC_SELFHEAL_TICK_MS);
-    const tickMs = Number.isFinite(raw) && raw >= 2_000 ? raw : 10_000;
+    // M5+B3(收尾批):装配前配置硬校验——dispatch 启用时密钥长度/互异/派单 URL
+    // loopback 钉死,违规 throw fail-fast 拒启;禁用时仅 warn。数值 env 解析统一
+    // 收口 selfheal/config.ts。
+    assertSelfhealConfig();
+    const tickMs = selfhealTickMs();
     incidentReconciler = trackScheduler(
       "incidentReconciler",
       "v5-owned",

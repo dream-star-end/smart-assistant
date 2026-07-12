@@ -67,6 +67,8 @@ import { z } from "zod";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { enqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
+import { writeCondition } from "../selfheal/conditions.js";
+import { sessionOversizedKey } from "../selfheal/conditionKeys.js";
 import {
   HttpError,
   REQUEST_ID_HEADER,
@@ -525,34 +527,63 @@ export function makeServerAuthoredHandler(
     subsys: "internalServerAuthored",
   });
   const now = deps.now ?? (() => Date.now());
-  // 单一权威拦截:所有 oversized 拒写(现在与未来任何站点)都经这一个 metric 口 →
-  // 附带触发 system.session_oversized 告警。热尾巴+归档上线后该结果理论不可达,
-  // 命中即 bug(spill 未生效/单条超大消息),必须有人被通知而不是等翻日志。
-  // dedupe 按小时桶防风暴;enqueue 失败只吞(告警不许拖垮持久化主路径)。
-  // sessionId 级细节在同点位的 error 日志里(postSpillUnexpected 标记)。
   const baseMetric = deps.metric ?? incrV3SinkPersist;
-  const metric: typeof baseMetric = (outcome, kind) => {
-    if (outcome === "reject_oversized") {
-      const bucket = new Date(now()).toISOString().slice(0, 13);
-      void enqueueAlert({
-        event_type: EVENTS.SYSTEM_SESSION_OVERSIZED,
-        severity: "critical",
-        title: "会话行 oversized 拒写(spill 后理论不可达,命中即 bug)",
-        body:
-          `server-authored 持久化命中 MAX_SESSION_BYTES 硬闸(kind=${kind})。` +
-          `热尾巴+归档上线后此路径不应触达 —— 排查 spill 是否失效或单条超大消息:` +
-          "`grep -E 'postSpillUnexpected|_session_oversized' /var/log/openclaude-v5.log` 取 sessionId。",
-        payload: { kind, bucket },
-        dedupe_key: `${EVENTS.SYSTEM_SESSION_OVERSIZED}:${kind}:${bucket}`,
-      }).catch(() => {});
-    }
-    baseMetric(outcome, kind);
-  };
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
     const requestId = ensureRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, requestId);
+
+    // 单一权威拦截:所有 oversized 拒写(现在与未来任何站点)都经这一个 metric 口 →
+    // 附带触发 system.session_oversized 告警 + selfheal condition(收尾批 B1)。
+    // 热尾巴+归档上线后该结果理论不可达,命中即 bug(spill 未生效/单条超大消息),
+    // 必须有人被通知而不是等翻日志。dedupe 按小时桶防风暴;enqueue/writeCondition
+    // 失败只吞(告警不许拖垮持久化主路径)。sessionId 级细节在同点位的 error 日志里
+    // (postSpillUnexpected 标记)。
+    //
+    // wrapper 是**请求级**闭包:身份/请求体解析成功后填 oversizedCtx,使 condition
+    // 走 per-user key `system.session_oversized:<uid>`(latched,occurrence 累积;
+    // snapshot.user_id 驱动定向收件人 materialize)。身份前的 reject 族不触发 oversized。
+    const oversizedCtx: {
+      uid?: string;
+      sessionId?: string;
+      bodyBytes?: number;
+      lazyBytes?: () => number | null;
+    } = {};
+    const metric: typeof baseMetric = (outcome, kind) => {
+      if (outcome === "reject_oversized") {
+        const bucket = new Date(now()).toISOString().slice(0, 13);
+        void enqueueAlert({
+          event_type: EVENTS.SYSTEM_SESSION_OVERSIZED,
+          severity: "critical",
+          title: "会话行 oversized 拒写(spill 后理论不可达,命中即 bug)",
+          body:
+            `server-authored 持久化命中 MAX_SESSION_BYTES 硬闸(kind=${kind})。` +
+            `热尾巴+归档上线后此路径不应触达 —— 排查 spill 是否失效或单条超大消息:` +
+            "`grep -E 'postSpillUnexpected|_session_oversized' /var/log/openclaude-v5.log` 取 sessionId。",
+          payload: { kind, bucket },
+          dedupe_key: `${EVENTS.SYSTEM_SESSION_OVERSIZED}:${kind}:${bucket}`,
+        }).catch(() => {});
+        if (oversizedCtx.uid !== undefined) {
+          if (oversizedCtx.bodyBytes === undefined && oversizedCtx.lazyBytes) {
+            oversizedCtx.bodyBytes = oversizedCtx.lazyBytes() ?? undefined;
+          }
+          void writeCondition(sessionOversizedKey(oversizedCtx.uid), {
+            mode: "latched",
+            firing: true,
+            level: "warning",
+            snapshot: {
+              kind: kind ?? null,
+              bytes: oversizedCtx.bodyBytes ?? null,
+              user_id: oversizedCtx.uid,
+              session_id: oversizedCtx.sessionId ?? null,
+            },
+            occurrenceDelta: 1,
+          }).catch(() => {});
+        }
+      }
+      baseMetric(outcome, kind);
+    };
 
     const reqLog = log.child({
       requestId,
@@ -594,6 +625,7 @@ export function makeServerAuthoredHandler(
     }
     const uid = identity.userId;
     const userId = `c:${uid}`;
+    oversizedCtx.uid = String(uid);
     const userLog = reqLog.child({
       uid,
       containerId: identity.containerId,
@@ -620,6 +652,17 @@ export function makeServerAuthoredHandler(
       }
       throw err;
     }
+    oversizedCtx.sessionId = body.sessionId;
+    // bytes 惰性求值:只在真的命中 oversized(罕见路径)才序列化,不给热路径加成本。
+    const capturedBody = body;
+    oversizedCtx.bodyBytes = undefined;
+    oversizedCtx.lazyBytes = () => {
+      try {
+        return Buffer.byteLength(JSON.stringify(capturedBody));
+      } catch {
+        return null;
+      }
+    };
 
     // 3) Persist
     //

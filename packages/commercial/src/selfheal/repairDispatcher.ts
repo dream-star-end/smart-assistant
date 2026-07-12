@@ -18,7 +18,16 @@
  *
  * 防注入:webhook body **只含 id**(`{repairId, incidentId, attempt}`),绝不塞自由文本
  * ops_detail;codex 要上下文自己经 capability 拉结构化脱敏 context(见 repairContext.ts)。
- * 隧道内叠加防重放签名:X-Selfheal-Ts/Nonce/Sig(HMAC over ts.nonce.repairId.bodySha256)。
+ *
+ * ── 跨仓契约(个人版 receiver/jobWorker 同步实现,不许漂移;收尾批 M3)────
+ * 隧道内防重放签名头:X-Selfheal-Ts / X-Selfheal-Nonce / X-Selfheal-Sig,
+ *   sig = hex(HMAC-SHA256(OC_SELFHEAL_WEBHOOK_HMAC,
+ *           `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`))
+ *   (METHOD 大写;path = URL pathname,无 query —— 签名绑路由,防跨端点重放)。
+ * 端点路径:/api/webhooks/v5-selfheal(派单)/ -cancel(取消)/ -release(放行)。
+ * cancel 响应:200 `{terminated: boolean, accepted?: boolean}`。
+ * SSRF 钉死(M5):派单 URL 由 selfheal/config.assertSelfhealConfig 限定 loopback;
+ * fetch 全部 redirect:'manual',3xx 一律按失败(okStatus 只认 2xx),重定向逃逸封死。
  */
 
 import { createHash, createHmac, randomBytes } from "node:crypto";
@@ -27,6 +36,7 @@ import { query as _query, tx as _tx } from "../db/queries.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { safeEnqueueAlert as _safeEnqueueAlert, type AlertEventInput } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
+import { repairCooldownMs } from "./config.js";
 
 /**
  * ops 升级告警 event_type —— 单一真理源在 alertEvents.ts EVENTS(已登记 EVENT_META 'ops' 组,
@@ -38,10 +48,6 @@ export const OPS_REPAIR_TIMEOUT = EVENTS.OPS_REPAIR_TIMEOUT;
 
 /** 保险丝阈值。 */
 const FAILED_ATTEMPT_FUSE = 2;
-function cooldownMs(): number {
-  const raw = Number(process.env.OC_SELFHEAL_REPAIR_COOLDOWN_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 30 * 60 * 1000;
-}
 
 /** singleflight 活跃态(与 0133 ux_repair_singleflight WHERE 子句严格一致)。 */
 export const ACTIVE_REPAIR_STATUSES = [
@@ -103,16 +109,37 @@ function webhookSecret(): string | null {
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s).digest("hex");
 }
-/** X-Selfheal-Sig = hex(HMAC-SHA256(secret, `${ts}.${nonce}.${repairId}.${bodySha256}`))。 */
-function signWebhook(secret: string, ts: string, nonce: string, repairId: string, bodySha: string): string {
-  return createHmac("sha256", secret).update(`${ts}.${nonce}.${repairId}.${bodySha}`).digest("hex");
+/**
+ * X-Selfheal-Sig(M3 路由绑定版):
+ *   hex(HMAC-SHA256(secret, `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`))
+ * METHOD 大写;path = URL pathname(无 query)。个人版 receiver / master claim-capability
+ * 校验侧同一签名串(跨仓契约,见文件头)。
+ */
+function signWebhook(
+  secret: string,
+  method: string,
+  path: string,
+  ts: string,
+  nonce: string,
+  repairId: string,
+  bodySha: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(`${method.toUpperCase()}.${path}.${ts}.${nonce}.${repairId}.${bodySha}`)
+    .digest("hex");
 }
 
 async function defaultFetch(
   url: string,
   init: { method: string; headers: Record<string, string>; body: string },
 ): Promise<{ status: number; text: () => Promise<string> }> {
-  const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+  // M5:redirect 'manual' —— 3xx 不跟随(okStatus 只认 2xx → 3xx 按失败),封死重定向出网逃逸。
+  const res = await fetch(url, {
+    method: init.method,
+    headers: init.headers,
+    body: init.body,
+    redirect: "manual",
+  });
   return { status: res.status, text: () => res.text() };
 }
 
@@ -139,9 +166,13 @@ async function postSigned(
   const body = JSON.stringify(bodyObj);
   const ts = String(deps.now());
   const nonce = randomBytes(16).toString("hex");
-  const sig = signWebhook(secret, ts, nonce, repairId, sha256Hex(body));
+  // 签名 path = 实际请求 URL 的 pathname(M3 路由绑定;base 约定为纯 host:port,
+  // 见 config.validateDispatchUrl,故 pathname === path)。
+  const fullUrl = `${base}${path}`;
+  const signedPath = new URL(fullUrl).pathname;
+  const sig = signWebhook(secret, "POST", signedPath, ts, nonce, repairId, sha256Hex(body));
   try {
-    const res = await deps.fetch(`${base}${path}`, {
+    const res = await deps.fetch(fullUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -238,7 +269,7 @@ export async function dispatchRepair(
   }
 
   // 3) 冷却:同 event_type 30min 内已有派单记录 → 跳过(防轰炸)。
-  const cd = cooldownMs();
+  const cd = repairCooldownMs();
   if (cd > 0) {
     const since = new Date(d.now() - cd);
     const coolR = await d.query<{ one: number }>(
@@ -259,8 +290,9 @@ export async function dispatchRepair(
   try {
     created = await d.tx(async (client: PoolClient) => {
       // TOCTOU 收口(Codex H2):在同一条 INSERT…SELECT 里再核 incident 仍活跃 **且**
-      // condition 仍 firing。若在步1读到 open 之后 condition 已恢复 / incident 被
-      // resolve,SELECT 返 0 行 → 不插入 → 不派单(绝不对已恢复系统派 codex 改动)。
+      // condition 仍 firing **且未被压制**(H1b:operator 压制中不派修)。若在步1读到
+      // open 之后 condition 已恢复 / incident 被 resolve / 被压制,SELECT 返 0 行 →
+      // 不插入 → 不派单(绝不对已恢复/已压制系统派 codex 改动)。
       const ins = await client.query<{ id: string; attempt: number }>(
         `INSERT INTO codex_repairs (incident_id, status, attempt, tier, created_at, updated_at)
          SELECT i.id, 'pending', COALESCE(MAX(cr.attempt), 0) + 1, 'tier2', NOW(), NOW()
@@ -270,6 +302,7 @@ export async function dispatchRepair(
           WHERE i.id = $1::bigint
             AND i.status <> 'resolved'
             AND COALESCE(c.firing, FALSE) = TRUE
+            AND NOT COALESCE(c.suppressed_until_clear, FALSE)
           GROUP BY i.id
          RETURNING id::text AS id, attempt`,
         [incidentId],
@@ -404,4 +437,43 @@ export async function postCancel(
     }
   }
   return { ok: true, terminated, accepted, httpStatus: res.httpStatus };
+}
+
+// ─── 放行通知(隧道 → 个人版 release 端点;收尾批 §B)──────────────────
+
+export interface ReleaseDelivery {
+  /** 2xx = 个人版 receiver 已受理放行(releaseApproved 重验 + 部署在个人版侧推进)。 */
+  ok: boolean;
+  httpStatus?: number;
+  error?: string;
+}
+
+/**
+ * 经隧道 POST 个人版 release 端点,放行一个 pending_release 的 Tier2 修复部署。
+ * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-release`,与
+ *   dispatch 完全相同的 HMAC 信任链(M3 路由绑定签名),body `{ repairId, incidentId }`。
+ * 个人版 receiver 验签后走**进程内** releaseApproved(repairId)(重验 pending_release
+ * 记录 + ancestry + denylist → deployDriver)。非 2xx / 网络失败 → ok=false(调用方
+ * 据此回 502,不落审计/事件——durable 状态零变化,可安全重试)。
+ */
+export async function postRelease(
+  input: { repairId: string; incidentId: string },
+  deps: DispatcherDeps = {},
+): Promise<ReleaseDelivery> {
+  const d = resolveDeps(deps);
+  const { res } = await postSigned(
+    "/api/webhooks/v5-selfheal-release",
+    { repairId: input.repairId, incidentId: input.incidentId },
+    input.repairId,
+    (s) => s >= 200 && s < 300,
+    { fetch: d.fetch, now: d.now, logger: d.logger },
+  );
+  if (!res.ok) {
+    d.logger.warn("selfheal_release_post_failed", {
+      repairId: input.repairId,
+      httpStatus: res.httpStatus,
+      error: res.error,
+    });
+  }
+  return { ok: res.ok, httpStatus: res.httpStatus, error: res.error };
 }

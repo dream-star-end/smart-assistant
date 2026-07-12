@@ -82,6 +82,9 @@ import {
   handleAdminListIncidents,
   handleAdminGetIncident,
   handleAdminResolveIncident,
+  handleAdminListSelfhealConditions,
+  handleAdminUnsuppressCondition,
+  handleAdminReleaseRepair,
 } from './admin/selfheal.js'
 // 切片②ⓐ:codex 修复回调端点(/internal/v5/repairs/*,capability/webhook HMAC 自鉴权,非 admin gate)。
 import {
@@ -810,6 +813,12 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/selfheal/incidents', handler: handleAdminListIncidents },
     { method: 'GET', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminGetIncident },
     { method: 'POST', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminResolveIncident },
+    // 收尾批(H1b/§B):condition 压制运维 + repair 一键放行。exact 在 prefix 前
+    // (matchRoute exact-first);release 走 prefix,handler 内 regex 抠 :id + /release 尾段。
+    { method: 'GET', path: '/api/admin/selfheal/conditions', handler: handleAdminListSelfhealConditions },
+    { method: 'POST', path: '/api/admin/selfheal/conditions/unsuppress', handler: handleAdminUnsuppressCondition },
+    // 字面量 path(不用常量):admin-route-inventory 基线静态抽取只认字符串字面量。
+    { method: 'POST', pathPrefix: '/api/admin/selfheal/repairs/', handler: handleAdminReleaseRepair },
     // 切片②ⓐ:codex 修复回调(经 SSH 隧道 loopback 到达)。ANY_METHOD 通配转发,method/子路由
     // (ack/progress/verify/done/failed/claim-capability/context)权威 + capability/webhook HMAC
     // 鉴权全部收口在 dispatchSelfhealRepairsRoute。**不是** /api/admin/*,不套 admin gate。

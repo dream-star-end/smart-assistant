@@ -90,3 +90,52 @@ export async function writeCondition(
     conditionRev: Number(row?.out_condition_rev ?? 0),
   };
 }
+
+// ─── operator 列直写(suppression,H1b)─────────────────────────────────
+//
+// 列域划分(0135/0136):检测列 = write_alert_condition 专写;operator 列
+// (acked* + suppressed_*)= 应用直写(0136 writer-guard 反向白名单放行)。
+// suppression 语义 = "operator 已知悉,压制 incident 投影,直到 condition 真实
+// 恢复"——绝不篡改检测权威(把 firing 改 false 是说谎,会被下轮真实观测推翻)。
+// 恢复(firing true→false 翻转)时 write_alert_condition 自动清三列。
+
+/**
+ * 压制一个仍 firing 的 condition(幂等:已压制则保持首次 suppressed_at/by)。
+ * 返回是否实际写入(false = 行不存在或已压制)。
+ */
+export async function suppressCondition(
+  conditionKey: string,
+  suppressedBy: string,
+  client: PoolClient,
+): Promise<boolean> {
+  const r = await client.query(
+    `UPDATE admin_alert_rule_state
+        SET suppressed_until_clear = TRUE, suppressed_at = NOW(), suppressed_by = $2
+      WHERE rule_id = $1 AND suppressed_until_clear = FALSE`,
+    [conditionKey, suppressedBy],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * 解除压制(误压回滚,admin unsuppress 端点用)。下轮 reconciler 若 condition
+ * 仍 firing 会重新 open incident(这正是解除压制的语义)。
+ * 返回 'unsuppressed' | 'not_suppressed' | 'not_found'。
+ */
+export async function unsuppressCondition(
+  conditionKey: string,
+  client: PoolClient,
+): Promise<"unsuppressed" | "not_suppressed" | "not_found"> {
+  const r = await client.query(
+    `UPDATE admin_alert_rule_state
+        SET suppressed_until_clear = FALSE, suppressed_at = NULL, suppressed_by = NULL
+      WHERE rule_id = $1 AND suppressed_until_clear = TRUE`,
+    [conditionKey],
+  );
+  if ((r.rowCount ?? 0) > 0) return "unsuppressed";
+  const cur = await client.query(
+    `SELECT 1 FROM admin_alert_rule_state WHERE rule_id = $1`,
+    [conditionKey],
+  );
+  return cur.rows.length > 0 ? "not_suppressed" : "not_found";
+}

@@ -7,11 +7,21 @@
  *
  *   POST /internal/v5/repairs/:id/{ack,progress,verify,done,failed}
  *        — Authorization: Bearer <capability>(逐 repair 短期 token,verifyCapability 绑 id)。
- *        — zod:message ≤4000 + detail 对象(长度上限);写库前 redactSensitive(codex 可能回传日志/凭据)。
+ *        — zod:message ≤4000 + detail 对象(长度上限);写库前 redactOpsPayload
+ *          (M4:key 级 + 值级字符串清洗,codex 可能回传日志/凭据)。
  *        — 状态机 CAS:ack→acked / progress→running(追加 event)/ verify→记 verify_after /
  *          done→verifying(**不直接 succeeded**,等 sweeper 探测 fence)/ failed→failed+fail_reason。
+ *        — M2 防重放:done/failed 在**同一事务**内消费 capability jti
+ *          (selfheal_capability_uses INSERT ON CONFLICT,冲突=重放→409;事务失败 jti
+ *          一并回滚,合法重试不误伤)。progress/ack 天然可重复,不记账。
+ *        — verify 窗口 set-once(M2):verify_after/verify_deadline 仅首次落值
+ *          (COALESCE),重复 verify/done 不再延窗(消"重复 verify 续命")。
  *   POST /internal/v5/repairs/:id/claim-capability
  *        — webhook HMAC 鉴权(**非** capability):个人版 gateway 用自己凭证换该 repair 的短期 capability。
+ *        — M3 签名串(跨仓契约,与 repairDispatcher.signWebhook 同源):
+ *          `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`(METHOD 大写,
+ *          path=URL pathname 无 query);nonce 落 PG selfheal_webhook_nonces 原子判重
+ *          (sig 验过才写;重放=插不进→401),sweeper 清 10min 前的行。
  *   GET  /internal/v5/repairs/:id/context
  *        — capability 鉴权 → getRepairContext(结构化只读脱敏,防注入)。
  */
@@ -23,7 +33,8 @@ import { z } from "zod";
 
 import { query, tx } from "../../db/queries.js";
 import { rootLogger } from "../../logging/logger.js";
-import { redactSensitive } from "../../admin/auditRedact.js";
+import { redactOpsPayload, scrubSecretsInString } from "../../selfheal/redact.js";
+import { verifyBudgetMs } from "../../selfheal/config.js";
 import { issueCapability, verifyCapability } from "../../selfheal/capability.js";
 import { getRepairContext } from "../../selfheal/repairContext.js";
 import {
@@ -44,11 +55,7 @@ const log = rootLogger.child({ subsys: "selfheal", module: "repairCallbacks" });
 const ROUTE_RE =
   /^\/internal\/v5\/repairs\/([1-9][0-9]{0,19})\/(ack|progress|verify|done|failed|claim-capability|context)$/;
 
-/** done/verify 后的探测确认预算:6min(env 覆盖)。sweeper verify fence 用 verify_deadline。 */
-function verifyBudgetMs(): number {
-  const raw = Number(process.env.OC_SELFHEAL_VERIFY_BUDGET_MS);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 6 * 60 * 1000;
-}
+// done/verify 后的探测确认预算(verify_deadline):数值解析收口 selfheal/config.ts(B3)。
 
 const WEBHOOK_TS_WINDOW_MS = 120_000;
 const DETAIL_MAX_BYTES = 16 * 1024;
@@ -71,46 +78,49 @@ function bearer(req: IncomingMessage): string | null {
   return m ? m[1].trim() : null;
 }
 
-/** 一次性 nonce 缓存(webhook 防重放)。in-memory,单 master;窗口外靠 ts 兜底。 */
-const seenNonces = new Map<string, number>();
-const NONCE_MAX = 8192;
-function nonceFresh(nonce: string, now: number): boolean {
-  const prev = seenNonces.get(nonce);
-  if (prev !== undefined && now - prev < WEBHOOK_TS_WINDOW_MS) return false;
-  if (seenNonces.size >= NONCE_MAX) {
-    for (const [k, t] of seenNonces) {
-      if (now - t >= WEBHOOK_TS_WINDOW_MS) seenNonces.delete(k);
-    }
-  }
-  seenNonces.set(nonce, now);
-  return true;
-}
-
-/** webhook HMAC 校验(claim-capability 用)。校验 ts 窗口 + nonce 未见 + sig。 */
-function verifyWebhookSig(
+/**
+ * webhook HMAC 校验(claim-capability 用;M3 路由绑定 + nonce 落库版)。
+ * 校验序:ts 窗口 → sig(绑 METHOD+path)→ nonce 原子落 PG(sig 验过才写,
+ * INSERT ON CONFLICT DO NOTHING 插不进 = 重放拒绝)。durable nonce 使 master
+ * 重启后重放窗口闭合(此前 in-memory Map 一重启就清零)。DB 异常 → fail-closed 拒绝。
+ */
+async function verifyWebhookSig(
   req: IncomingMessage,
   repairId: string,
+  path: string,
   rawBody: string,
   now: number,
-): boolean {
+): Promise<boolean> {
   const secret = process.env.OC_SELFHEAL_WEBHOOK_HMAC;
   if (!secret) return false;
   const ts = req.headers["x-selfheal-ts"];
   const nonce = req.headers["x-selfheal-nonce"];
   const sig = req.headers["x-selfheal-sig"];
   if (typeof ts !== "string" || typeof nonce !== "string" || typeof sig !== "string") return false;
+  if (nonce.length === 0 || nonce.length > 128) return false;
   const tsn = Number(ts);
   if (!Number.isFinite(tsn) || Math.abs(now - tsn) > WEBHOOK_TS_WINDOW_MS) return false;
   if (!/^[0-9a-f]{64}$/.test(sig)) return false;
+  const method = (req.method ?? "").toUpperCase();
   const bodySha = createHash("sha256").update(rawBody).digest("hex");
+  // 跨仓契约签名串(与 repairDispatcher.signWebhook / 个人版 receiver+jobWorker 同源)。
   const expected = createHmac("sha256", secret)
-    .update(`${ts}.${nonce}.${repairId}.${bodySha}`)
+    .update(`${method}.${path}.${ts}.${nonce}.${repairId}.${bodySha}`)
     .digest("hex");
   const a = Buffer.from(sig, "hex");
   const b = Buffer.from(expected, "hex");
   if (a.length !== b.length || !timingSafeEqual(a, b)) return false;
-  // sig 验过才写 nonce(RFC M-HMAC-route:验签成功才写 nonce)。
-  return nonceFresh(nonce, now);
+  // sig 验过才写 nonce(RFC M-HMAC-route);插不进 = 重放。DB 异常按拒绝处理(fail-closed)。
+  try {
+    const ins = await query(
+      `INSERT INTO selfheal_webhook_nonces (nonce) VALUES ($1) ON CONFLICT (nonce) DO NOTHING`,
+      [nonce],
+    );
+    return (ins.rowCount ?? 0) > 0;
+  } catch (err) {
+    log.warn("selfheal_nonce_persist_failed", { err: (err as Error)?.message });
+    return false;
+  }
 }
 
 // ─── body 校验 + 脱敏 ──────────────────────────────────────────────────
@@ -122,10 +132,12 @@ const CallbackBody = z
   })
   .strict();
 
-/** 脱敏 + 体积上限:超限则整体替换为 marker(codex 回传可能极大/夹带凭据)。 */
+/** 脱敏 + 体积上限:超限则整体替换为 marker(codex 回传可能极大/夹带凭据)。
+ *  M4:redactOpsPayload = key 级(redactSensitive)+ 值级字符串清洗(sk-/Bearer/
+ *  gh 令牌/URL userinfo…),codex 自由文本里嵌的凭据也被清。 */
 function safeDetail(detail: unknown): Record<string, unknown> {
   if (detail === undefined || detail === null) return {};
-  const redacted = redactSensitive(detail);
+  const redacted = redactOpsPayload(detail);
   const s = JSON.stringify(redacted);
   if (s.length > DETAIL_MAX_BYTES) return { __truncated: true, len: s.length };
   return (redacted && typeof redacted === "object" && !Array.isArray(redacted)
@@ -211,10 +223,12 @@ async function handleProgress(id: string, message: string, detail: Record<string
 async function handleVerify(id: string, message: string, detail: Record<string, unknown>): Promise<ActionResult> {
   const budget = verifyBudgetMs();
   return tx(async (client) => {
+    // M2 set-once:verify 窗口只在首次落值(COALESCE),重复 verify 幂等但**不延窗**
+    // (消"重复 verify 续命"——deadline 一旦钉死,codex 反复报 verify 也改不了裁决窗)。
     const cas = await client.query(
       `UPDATE codex_repairs
-          SET verify_after=NOW(),
-              verify_deadline=NOW() + ($2::bigint * INTERVAL '1 millisecond'),
+          SET verify_after=COALESCE(verify_after, NOW()),
+              verify_deadline=COALESCE(verify_deadline, NOW() + ($2::bigint * INTERVAL '1 millisecond')),
               updated_at=NOW()
         WHERE id=$1::bigint AND status IN ('acked','running','verifying')`,
       [id, budget],
@@ -230,10 +244,39 @@ async function handleVerify(id: string, message: string, detail: Record<string, 
   });
 }
 
-async function handleDone(id: string, message: string, detail: Record<string, unknown>): Promise<ActionResult> {
+/**
+ * M2:同事务消费 capability jti(一次性)。返回 true=首次消费;false=重放。
+ * 与状态 CAS + event 同一 PG 事务:事务失败 jti 一并回滚,合法重试不误 409。
+ */
+async function consumeJti(
+  client: PoolClient,
+  repairId: string,
+  jti: string,
+  action: string,
+): Promise<boolean> {
+  const ins = await client.query(
+    `INSERT INTO selfheal_capability_uses (repair_id, jti, action)
+     VALUES ($1::bigint, $2, $3)
+     ON CONFLICT (repair_id, jti, action) DO NOTHING`,
+    [repairId, jti, action],
+  );
+  return (ins.rowCount ?? 0) > 0;
+}
+
+async function handleDone(
+  id: string,
+  message: string,
+  detail: Record<string, unknown>,
+  jti: string,
+): Promise<ActionResult> {
   const budget = verifyBudgetMs();
   return tx(async (client) => {
-    // done → verifying(不直接 succeeded);verify_after=done_at(freshness fence 锚点)。
+    // M2:jti 一次性消费与状态 CAS + event 同事务;冲突 = 该 token 已成功 done 过 → 409。
+    if (!(await consumeJti(client, id, jti, "done"))) {
+      return { code: "conflict", message: "capability token already consumed for done (replay)" };
+    }
+    // done → verifying(不直接 succeeded);verify_after=done_at(freshness fence 锚点,
+    // set-once:重复 done 不延窗)。
     const cas = await client.query(
       `UPDATE codex_repairs
           SET status='verifying',
@@ -248,10 +291,6 @@ async function handleDone(id: string, message: string, detail: Record<string, un
       const cur = await client.query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [id]);
       const st = cur.rows[0]?.status;
       if (!st) return { code: "not_found" };
-      if (st === "verifying") {
-        await appendEvent(client, id, "done", message, detail);
-        return { code: "ok", body: { status: "verifying" } };
-      }
       return { code: "conflict", message: `repair is ${st}` };
     }
     await appendEvent(client, id, "done", message, detail);
@@ -259,8 +298,17 @@ async function handleDone(id: string, message: string, detail: Record<string, un
   });
 }
 
-async function handleFailed(id: string, message: string, detail: Record<string, unknown>): Promise<ActionResult> {
+async function handleFailed(
+  id: string,
+  message: string,
+  detail: Record<string, unknown>,
+  jti: string,
+): Promise<ActionResult> {
   return tx(async (client) => {
+    // M2:同 handleDone,jti 消费与 CAS 同事务;冲突 = 重放 → 409。
+    if (!(await consumeJti(client, id, jti, "failed"))) {
+      return { code: "conflict", message: "capability token already consumed for failed (replay)" };
+    }
     const cas = await client.query(
       `UPDATE codex_repairs
           SET status='failed', fail_reason=$2, finished_at=NOW(), updated_at=NOW()
@@ -355,7 +403,7 @@ export async function dispatchSelfhealRepairsRoute(
       }
       throw err;
     }
-    if (!verifyWebhookSig(req, repairId, rawBody, now)) {
+    if (!(await verifyWebhookSig(req, repairId, path, rawBody, now))) {
       sendError(res, 401, "UNAUTHORIZED", "invalid webhook signature", requestId);
       return;
     }
@@ -409,7 +457,8 @@ export async function dispatchSelfhealRepairsRoute(
   }
 
   const detail = safeDetail(parsed.detail);
-  const message = parsed.message;
+  // M4:message 是 codex 自由文本,同样过值级凭据清洗(key 级对纯字符串是 no-op)。
+  const message = scrubSecretsInString(parsed.message);
 
   try {
     let result: ActionResult;
@@ -424,10 +473,10 @@ export async function dispatchSelfhealRepairsRoute(
         result = await handleVerify(repairId, message, detail);
         break;
       case "done":
-        result = await handleDone(repairId, message, detail);
+        result = await handleDone(repairId, message, detail, cap.jti!);
         break;
       case "failed":
-        result = await handleFailed(repairId, message, detail);
+        result = await handleFailed(repairId, message, detail, cap.jti!);
         break;
       default:
         result = { code: "not_found" };

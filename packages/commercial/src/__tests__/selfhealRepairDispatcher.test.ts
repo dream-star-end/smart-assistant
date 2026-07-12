@@ -8,9 +8,11 @@
 import { describe, test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import type { PoolClient, QueryResult, QueryResultRow } from "pg";
+import { createHash, createHmac } from "node:crypto";
 import {
   dispatchRepair,
   postCancel,
+  postRelease,
   type FetchLike,
   type DispatcherDeps,
 } from "../selfheal/repairDispatcher.js";
@@ -164,6 +166,14 @@ describe("repairDispatcher.dispatchRepair", () => {
     assert.equal(h["X-Selfheal-Ts"], String(NOW));
     assert.ok(/^[0-9a-f]{32}$/.test(h["X-Selfheal-Nonce"]));
     assert.ok(/^[0-9a-f]{64}$/.test(h["X-Selfheal-Sig"]));
+    // M3 跨仓契约锁定:sig = HMAC(secret, `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`)。
+    {
+      const bodySha = createHash("sha256").update(calls[0].init.body).digest("hex");
+      const expected = createHmac("sha256", "webhook-hmac-secret")
+        .update(`POST./api/webhooks/v5-selfheal.${h["X-Selfheal-Ts"]}.${h["X-Selfheal-Nonce"]}.10.${bodySha}`)
+        .digest("hex");
+      assert.equal(h["X-Selfheal-Sig"], expected, "路由绑定 HMAC 契约漂移");
+    }
     const body = JSON.parse(calls[0].init.body);
     assert.deepEqual(body, { repairId: "10", incidentId: "7", attempt: 1 });
     // markDispatched 的 CAS 被执行(pending→dispatched)。
@@ -212,5 +222,30 @@ describe("repairDispatcher.postCancel", () => {
     const r = await postCancel({ repairId: "10", incidentId: "7", reason: "timeout" }, { fetch: fetchFn, now: () => NOW });
     assert.equal(r.ok, false);
     assert.equal(r.terminated, false);
+  });
+});
+
+describe("repairDispatcher.postRelease(收尾批 §B)", () => {
+  test("2xx → ok,POST 到 /api/webhooks/v5-selfheal-release,body 只含 id,同 HMAC 契约", async () => {
+    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true }));
+    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, true);
+    assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal-release");
+    assert.deepEqual(JSON.parse(calls[0].init.body), { repairId: "10", incidentId: "7" });
+    const h = calls[0].init.headers;
+    const bodySha = createHash("sha256").update(calls[0].init.body).digest("hex");
+    const expected = createHmac("sha256", "webhook-hmac-secret")
+      .update(`POST./api/webhooks/v5-selfheal-release.${h["X-Selfheal-Ts"]}.${h["X-Selfheal-Nonce"]}.10.${bodySha}`)
+      .digest("hex");
+    assert.equal(h["X-Selfheal-Sig"], expected);
+  });
+
+  test("3xx(SSRF 重定向逃逸面)按失败;5xx/网络异常 → ok=false", async () => {
+    const { fetchFn: f302 } = makeFetch(302, "");
+    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f302, now: () => NOW })).ok, false);
+    const { fetchFn: f500 } = makeFetch(500, "boom");
+    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f500, now: () => NOW })).ok, false);
+    const fThrow: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
+    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fThrow, now: () => NOW })).ok, false);
   });
 });

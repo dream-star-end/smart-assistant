@@ -36,6 +36,8 @@ interface ConditionRow {
   firing: boolean;
   level: string | null;
   snapshot: unknown;
+  /** H1b suppression:operator 压制投影(fake query 缺省 undefined → falsy,向后兼容)。 */
+  suppressed?: boolean;
 }
 interface ActiveIncidentRow {
   id: string;
@@ -80,7 +82,9 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
   const result: ReconcileResult = { opened: [], updated: [], resolved: [], errors: [] };
 
   const condsR = await query<ConditionRow>(
-    `SELECT rule_id AS condition_key, firing, level, snapshot FROM admin_alert_rule_state`,
+    `SELECT rule_id AS condition_key, firing, level, snapshot,
+            COALESCE(suppressed_until_clear, FALSE) AS suppressed
+       FROM admin_alert_rule_state`,
   );
   const conditionsByKey = new Map<string, ConditionRow>();
   for (const c of condsR.rows) conditionsByKey.set(c.condition_key, c);
@@ -92,9 +96,11 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
   const activeByKey = new Map<string, ActiveIncidentRow>();
   for (const a of activeR.rows) activeByKey.set(a.condition_key, a);
 
-  // 1) firing 的 condition → open / update
+  // 1) firing 的 condition → open / update。
+  //    suppressed(H1b)不投影:operator 已知悉,压制直到 condition 真实恢复
+  //    (write_alert_condition 在 true→false 翻转时自动清 suppression)。
   for (const c of condsR.rows) {
-    if (!c.firing) continue;
+    if (!c.firing || c.suppressed) continue;
     let policy: IncidentPolicy | null;
     try {
       policy = await matchPolicy(c.condition_key);
@@ -151,12 +157,18 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
   // 2) 活跃 incident 的 condition **存在且显式 firing=false** → resolve(level-triggered)。
   //    condition 行**缺失**视为 unknown/stale(行被删 / 检测器空档),**不** resolve——
   //    在"缺失即恢复"下会发假恢复通知、把仍在异常的事故错误关闭(Codex H1)。宁可留 open。
+  //    suppressed+firing(H1b)的遗留 open incident 同样 resolve(source='admin',幂等兜底:
+  //    主路径是 adminResolveIncident 同事务 suppress+resolve,这里兜崩溃/竞态残留)。
   for (const inc of activeR.rows) {
     const cond = conditionsByKey.get(inc.condition_key);
     if (!cond) continue; // 缺失 = unknown,保持 open,不发假恢复
-    if (cond.firing === true) continue;
+    const suppressed = Boolean(cond.suppressed);
+    if (cond.firing === true && !suppressed) continue;
+    const bySuppression = cond.firing === true && suppressed;
     try {
-      const r = await tx((client: PoolClient) => resolveIncident(inc.id, "probe", client));
+      const r = await tx((client: PoolClient) =>
+        resolveIncident(inc.id, bySuppression ? "admin" : "probe", client),
+      );
       if (r.resolved) {
         result.resolved.push(inc.condition_key);
         // 恢复通报文案从 policy 取(可能已随 condition 消失,尽力从缓存/表拿;拿不到则用通用文案)。
@@ -164,16 +176,28 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
         try {
           policy = await matchPolicy(inc.condition_key);
         } catch { /* 通报降级用通用文案 */ }
-        enqueue({
-          event_type: EVENTS.OPS_INCIDENT_RESOLVED,
-          severity: "info",
-          title: `自愈事故恢复:${policy?.userTitle ?? inc.condition_key}`,
-          body: policy
-            ? opsBody("恢复", inc.condition_key, policy, "info")
-            : `[自愈事故·恢复] condition=\`${inc.condition_key}\` 已恢复。`,
-          payload: { incident_id: inc.id, condition_key: inc.condition_key },
-          dedupe_key: `${EVENTS.OPS_INCIDENT_RESOLVED}:${inc.id}`,
-        });
+        enqueue(
+          bySuppression
+            ? {
+                // 压制关闭 ≠ 恢复:据实通报,绝不发"已恢复"假话(condition 仍 firing)。
+                event_type: EVENTS.OPS_INCIDENT_RESOLVED,
+                severity: "info",
+                title: `自愈事故已压制关闭:${policy?.userTitle ?? inc.condition_key}`,
+                body: `[自愈事故·压制] condition=\`${inc.condition_key}\` 仍 firing,已被管理员压制(suppressed_until_clear),incident 关闭;condition 真实恢复后压制自动解除。`,
+                payload: { incident_id: inc.id, condition_key: inc.condition_key, suppressed: true },
+                dedupe_key: `${EVENTS.OPS_INCIDENT_RESOLVED}:${inc.id}`,
+              }
+            : {
+                event_type: EVENTS.OPS_INCIDENT_RESOLVED,
+                severity: "info",
+                title: `自愈事故恢复:${policy?.userTitle ?? inc.condition_key}`,
+                body: policy
+                  ? opsBody("恢复", inc.condition_key, policy, "info")
+                  : `[自愈事故·恢复] condition=\`${inc.condition_key}\` 已恢复。`,
+                payload: { incident_id: inc.id, condition_key: inc.condition_key },
+                dedupe_key: `${EVENTS.OPS_INCIDENT_RESOLVED}:${inc.id}`,
+              },
+        );
       }
     } catch (err) {
       result.errors.push({ key: inc.condition_key, err: (err as Error)?.message ?? String(err) });

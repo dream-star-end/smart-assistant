@@ -21,6 +21,23 @@
 #   bash scripts/v5-monitor.sh --dry-run    # 只打印,不写状态、不发站内信
 #   V5MON_SKIP=http_v3,pool bash ...        # 静默指定检查项(逗号分隔,见文档)
 #
+# ── 自愈检测桥(bash⇄TS 契约,两侧改动必须同步)────────────────────
+#   每轮 check 结束后额外把每项检查投影成 alert condition(检测状态单一权威):
+#     SELECT write_alert_condition('ops.monitor:<check_name>','probe',<firing>,
+#                                  '<level>','<snapshot>'::jsonb, now());
+#   契约(对端 = packages/commercial/src/selfheal/conditionKeys.ts):
+#     - condition key = `ops.monitor:<check_name>` ↔ conditionKeys.ts 的
+#       opsMonitorKey(check);check 名(svc_v5/http_v5/…)即 key 后缀,改名两侧同步。
+#     - level ∈ {info,warning,critical}(本脚本经 check_severity 只产出
+#       warning|critical;info 保留给恢复语义,函数侧枚举三值)。
+#     - snapshot = {"detail":<一句话>,"check":<check_name>}(jq 生成,JSON 转义安全)。
+#   激活门 V5MON_CONDITIONS(默认关):非 '1' 时整段 condition 写入完全跳过。
+#     读取顺序 = 进程环境变量直接覆盖(测试用)> ENV_FILE 里 V5MON_CONDITIONS=
+#     (同 DATABASE_URL 手法;oneshot 每轮重读,改 env 即时生效,无需 reload)。
+#   计划维护窗口内被压制的 check(svc_v5/http_v5/public_route)与 V5MON_SKIP
+#   静默项同样跳过 condition 写(部署窗口/显式静默不误开 incident)。
+#   写入失败只 log 不阻断(绝不影响既有 outbox/inbox 告警流程)。
+#
 # 详见 docs/V5_MONITORING.md(安装 / 阈值调整 / 静默)。
 
 set -uo pipefail
@@ -52,6 +69,10 @@ FANOUT_SQL="${V5MON_FANOUT_SQL:-$SCRIPT_DIR/v5-alert-fanout.sql}"
 # fan-out 专用 DBURL(与 send_inbox 各自独立读,保持既有 inbox 路径行为不变)。
 DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
 HOSTFQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+# 自愈检测桥激活门(见文件头契约):进程 env 直接覆盖 > ENV_FILE;默认关。
+if [ -z "${V5MON_CONDITIONS:-}" ]; then
+  V5MON_CONDITIONS="$(grep '^V5MON_CONDITIONS=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+fi
 
 DISK_MAX_PCT=85        # / 与 /var 使用率上限(%)
 MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
@@ -299,6 +320,53 @@ for name in "${CHECK_NAMES[@]}"; do
     --argjson since "$since" --argjson la "$last_alert" \
     '.checks[$k] = {status:$s, since:$since, last_alert:$la}')"
 done
+
+# ───────────────────────────────────────────────
+# 自愈检测桥:每项 check → write_alert_condition(契约见文件头)
+# 每轮无论好坏都写(probe 语义:检测状态单一权威,恢复=firing false 由
+# reconciler 自动 resolve incident)。单独 mktemp SQL 批量文件 + 一次 psql;
+# 任何失败只 log,绝不影响既有 outbox/inbox/状态文件流程。
+# ───────────────────────────────────────────────
+write_conditions() {
+  [ "${V5MON_CONDITIONS:-}" = 1 ] || return 0
+  if [ -z "$DBURL" ]; then log "COND-SKIP 读不到 DATABASE_URL($ENV_FILE)"; return 0; fi
+  local sqlf name st detail firing sev snap wrote
+  sqlf="$(mktemp)" || { log "COND-FAIL mktemp 失败"; return 0; }
+  wrote=0
+  for name in "${CHECK_NAMES[@]}"; do
+    # 与告警流程同一套静默语义:V5MON_SKIP 显式静默 / 维护窗口压制的三项,
+    # 都不投影 condition(部署窗口/静默不误开 incident)。
+    case "$SKIP" in *",$name,"*) continue;; esac
+    if [[ "$MAINTENANCE_ACTIVE" == 1 && "$name" =~ ^(svc_v5|http_v5|public_route)$ ]]; then
+      continue
+    fi
+    st="${CHECK_ST[$name]}"; detail="${CHECK_DETAIL[$name]}"
+    firing=false; [ "$st" = bad ] && firing=true
+    sev="$(check_severity "$name")"
+    # 双层转义各管一层:jq --arg 负责 JSON 转义(引号/反斜杠),sed 把 SQL 单引号
+    # 翻倍(标准字符串字面量转义)→ detail 任意内容安全。
+    snap="$(jq -nc --arg d "$detail" --arg c "$name" '{detail:$d,check:$c}' | sed "s/'/''/g")"
+    printf "SELECT write_alert_condition('ops.monitor:%s','probe',%s,'%s','%s'::jsonb, now());\n" \
+      "$name" "$firing" "$sev" "$snap" >> "$sqlf"
+    wrote=$((wrote+1))
+  done
+  if [ "$wrote" -eq 0 ]; then rm -f "$sqlf"; return 0; fi
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "── dry-run:将写入 conditions(V5MON_CONDITIONS=1)─────"
+    cat "$sqlf"
+    rm -f "$sqlf"
+    return 0
+  fi
+  # ON_ERROR_STOP=0:单条失败不拖累其余 condition;连接级失败也只 log(|| true 语义)。
+  if psql "$DBURL" -q -v ON_ERROR_STOP=0 -f "$sqlf" >/dev/null 2>&1; then
+    log "COND-OK 写入 ${wrote} 项 condition"
+  else
+    log "COND-FAIL psql 批量写 condition 失败(${wrote} 项;告警主流程不受影响)"
+  fi
+  rm -f "$sqlf"
+  return 0
+}
+write_conditions || true
 
 # ───────────────────────────────────────────────
 # 落日志(兜底通道:每轮一行摘要;有事件再展开)

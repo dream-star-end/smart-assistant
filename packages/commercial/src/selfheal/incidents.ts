@@ -212,6 +212,14 @@ export interface ResolveIncidentResult {
 /**
  * resolve incident(CAS:WHERE status<>'resolved',幂等)。rev++、置 resolved_at/resolve_source。
  * 同事务写 resolved delivery(供 sweeper 推恢复通知)。
+ *
+ * H2-cancel(收尾批 A2):**同事务**把该 incident 的活跃修复推进 cancel_requested——
+ * incident 已恢复/关闭,不该再让 codex 继续改生产。范围:
+ *   - pending/dispatched/acked/running → cancel_requested(逐行 repair_event kind='cancel')。
+ *     `pending` 也走 cancel_requested 而非直接 cancelled:关闭派单竞态(dispatcher 可能
+ *     已 POST 未 markDispatched;个人版可能已接单),由 sweeper postCancel 统一走远端确认。
+ *   - `verifying` 不取消(成功归因路径,verify fence 自会裁决)。
+ * 后续驱动(postCancel → cancelling → cancelled,失联 fail-closed)在 sweeper 既有 cancel 流。
  */
 export async function resolveIncident(
   incidentId: string,
@@ -229,5 +237,22 @@ export async function resolveIncident(
   if (r.rows.length === 0) return { resolved: false, rev: 0 };
   const rev = Number(r.rows[0].rev);
   await insertDeliveries(client, incidentId, rev, "resolved", r.rows[0].audience);
+
+  // H2-cancel:活跃修复 → cancel_requested(同事务;verifying 有意不含)。
+  const cancelled = await client.query<{ id: string }>(
+    `UPDATE codex_repairs
+        SET status = 'cancel_requested', updated_at = NOW()
+      WHERE incident_id = $1::bigint
+        AND status IN ('pending','dispatched','acked','running')
+      RETURNING id::text AS id`,
+    [incidentId],
+  );
+  for (const row of cancelled.rows) {
+    await client.query(
+      `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
+       VALUES ($1::bigint, 'cancel', $2, '{}'::jsonb)`,
+      [row.id, "incident resolved — cancel requested"],
+    );
+  }
   return { resolved: true, rev };
 }

@@ -16,12 +16,37 @@
 
 export {
   writeCondition,
+  suppressCondition,
+  unsuppressCondition,
   coerceConditionLevel,
   type WriteConditionInput,
   type WriteConditionResult,
   type ConditionMode,
   type ConditionLevel,
 } from "./conditions.js";
+
+export {
+  opsMonitorKey,
+  providerDegradedKey,
+  sessionOversizedKey,
+  OPS_MONITOR_PREFIX,
+  PROVIDER_DEGRADED_PREFIX,
+  SESSION_OVERSIZED_PREFIX,
+  SYSTEM_MAINTENANCE_ON,
+} from "./conditionKeys.js";
+
+export {
+  assertSelfhealConfig,
+  validateDispatchUrl,
+  selfhealTickMs,
+  repairCooldownMs,
+  ackBudgetMs,
+  totalBudgetMs,
+  verifyBudgetMs,
+  MIN_SECRET_LENGTH,
+} from "./config.js";
+
+export { redactOpsPayload, scrubSecretsInString } from "./redact.js";
 
 export {
   matchPolicy,
