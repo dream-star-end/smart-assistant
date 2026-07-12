@@ -2,7 +2,7 @@
  * 连接器平台 · 声明式连接持久化(RFC §6.1/§10 三表 pin 之 connections)。
  *
  * 声明式连接与 v1 手写连接**共用同一张 connections 表**(不建平行表)。差别只在:
- *   - `provider` 存 **listing slug**(0133 放开硬编码 CHECK,应用层校验 slug 指向真实 listing);
+ *   - `provider` 存 **listing slug**(0136 放开硬编码 CHECK,应用层校验 slug 指向真实 listing);
  *   - 四个 pin 列(connector_version_id / spec_hash / exec_contract_hash / auth_contract_version)
  *     钉死绑定所依据的**已验签 contract revision**;contract bytes 变(重新编译签名)=新 hash,
  *     旧连接执行时 pin 不符 → RELINK_REQUIRED(fail-closed,§信任模型)。

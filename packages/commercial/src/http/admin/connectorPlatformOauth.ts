@@ -35,7 +35,7 @@ import type { CommercialHttpDeps, RequestContext } from '../handlers.js'
 import { HttpError, readJsonBody, sendJson } from '../util.js'
 
 const PREFIX = '/api/admin/connectors/platform-oauth-apps'
-/** = spec/types.ts Slug = 0136 表的 CHECK(三处同源)。 */
+/** = spec/types.ts Slug = 0139 表的 CHECK(三处同源)。 */
 const SLUG_RE = /^[a-z][a-z0-9-]{1,63}$/
 const MAX_CLIENT_ID_LEN = 256
 const MAX_CLIENT_SECRET_LEN = 1024

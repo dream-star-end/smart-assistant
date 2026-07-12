@@ -1,4 +1,4 @@
--- 0133 连接器平台 · 声明式绑定(slice③)
+-- 0136 连接器平台 · 声明式绑定(slice③)
 --
 -- connections 表从"v1 四个手写 provider"升级为"声明式平台的单一绑定表":
 --   1. 放开 provider 硬编码白名单 CHECK → slug 形状约束。声明式连接的 provider = listing slug,
@@ -7,9 +7,9 @@
 --   2. 加 (user_id, connector_version_id) 活跃索引:声明式执行/列表按 pin 的 version 查。
 --
 -- 四个 pin 列(connector_version_id / spec_hash / exec_contract_hash / auth_contract_version)在
--- 0132 已 additive 加好(可空,兼容 v1 行);声明式行由应用层保证四列非空,v1 行留空。
+-- 0135 已 additive 加好(可空,兼容 v1 行);声明式行由应用层保证四列非空,v1 行留空。
 --
--- 注:runner 已把整文件包在 BEGIN…INSERT schema_migrations…COMMIT 里,本文件只写 DDL(0130/0132 惯例)。
+-- 注:runner 已把整文件包在 BEGIN…INSERT schema_migrations…COMMIT 里,本文件只写 DDL(0130/0135 惯例)。
 
 -- 1. provider 从枚举 CHECK → slug 形状(与 ConnectorSpec.id / listing slug 同形)。
 ALTER TABLE connections DROP CONSTRAINT IF EXISTS connections_provider_check;

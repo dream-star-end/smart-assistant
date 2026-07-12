@@ -355,6 +355,91 @@ describe("full migration suite", () => {
     }
   });
 
+  test("production 0134 → connector 0135–0139 upgrades in order and preserves v1 rows", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const sourceDir = path.resolve(here, "../db/migrations");
+    const stagedDir = await mkdtemp(path.join(tmpdir(), "oc-connector-migrations-"));
+    const connectorMigrations = [
+      "0135_connector_platform.sql",
+      "0136_connector_declarative_binding.sql",
+      "0137_connector_token_cache.sql",
+      "0138_connector_oauth_pending_slug.sql",
+      "0139_connector_platform_oauth_apps.sql",
+    ];
+
+    try {
+      const files = (await readdir(sourceDir)).filter((file) => file.endsWith(".sql")).sort();
+      for (const file of files.filter((name) => name <= "0134_sessions_master_pg.sql")) {
+        await copyFile(path.join(sourceDir, file), path.join(stagedDir, file));
+      }
+
+      const baseline = await runMigrations({ dir: stagedDir });
+      assert.equal(baseline.applied.at(-1), "0134_sessions_master_pg");
+
+      const user = await query<{ id: string }>(
+        "INSERT INTO users(email, password_hash) VALUES ($1, $2) RETURNING id::text AS id",
+        ["connector-upgrade@example.com", "argon2$stub"],
+      );
+      const userId = user.rows[0].id;
+      await query(
+        `INSERT INTO connections
+           (user_id, provider, display_name, account_key, secret_enc, secret_nonce)
+         VALUES ($1, 'notion', 'legacy', 'legacy-account-key',
+                 decode(repeat('aa', 16), 'hex'), decode(repeat('bb', 12), 'hex'))`,
+        [userId],
+      );
+      await query(
+        `INSERT INTO connector_oauth_pending
+           (state_hash, user_id, provider, cookie_nonce_hash, draft_enc, draft_nonce, expires_at)
+         VALUES (decode(repeat('11', 32), 'hex'), $1, 'feishu',
+                 decode(repeat('22', 32), 'hex'), decode(repeat('33', 16), 'hex'),
+                 decode(repeat('44', 12), 'hex'), now() + interval '10 minutes')`,
+        [userId],
+      );
+
+      for (const file of connectorMigrations) {
+        await copyFile(path.join(sourceDir, file), path.join(stagedDir, file));
+      }
+      const upgraded = await runMigrations({ dir: stagedDir });
+      assert.deepEqual(
+        upgraded.applied,
+        connectorMigrations.map((file) => file.slice(0, -".sql".length)),
+      );
+
+      const preserved = await query<{ connection_provider: string; pending_provider: string }>(
+        `SELECT c.provider AS connection_provider, p.provider AS pending_provider
+           FROM connections c
+           JOIN connector_oauth_pending p ON p.user_id = c.user_id
+          WHERE c.user_id = $1`,
+        [userId],
+      );
+      assert.deepEqual(preserved.rows, [
+        { connection_provider: "notion", pending_provider: "feishu" },
+      ]);
+
+      const tables = await query<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN ('connector_token_cache','connector_platform_oauth_apps')
+          ORDER BY table_name`,
+      );
+      assert.deepEqual(tables.rows.map((row) => row.table_name), [
+        "connector_platform_oauth_apps",
+        "connector_token_cache",
+      ]);
+
+      const repeated = await runMigrations({ dir: stagedDir });
+      assert.equal(repeated.applied.length, 0);
+      for (const version of connectorMigrations.map((file) => file.slice(0, -4))) {
+        assert.ok(repeated.skipped.includes(version), `second run must skip ${version}`);
+      }
+    } finally {
+      await rm(stagedDir, { recursive: true, force: true });
+    }
+  });
+
   test("re-running migrations is still idempotent (applied=0 skipped=7)", async (t) => {
     if (skipIfNoPg(t)) return;
     const r1 = await runMigrations();

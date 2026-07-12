@@ -1,5 +1,5 @@
 /**
- * platformOauthApps —— 平台自有 OAuth App 凭据存储(0136 表 connector_platform_oauth_apps)。
+ * platformOauthApps —— 平台自有 OAuth App 凭据存储(0139 表 connector_platform_oauth_apps)。
  *
  * oauth2-auth-code 的两种 client 供给模式(契约字段 oauth2.clientProvisioning):
  *   - `byoa`     用户自带 OAuth App:client_id/client_secret 由用户在授权表单直填,进加密 pending draft;
@@ -23,7 +23,7 @@ import { getPool } from '../db/index.js'
 import type { QueryRunner } from '../db/queries.js'
 import { ConnectorError } from './errors.js'
 
-/** slug 形状(= spec/types.ts Slug,与 0136 的 CHECK 同源;写入前先在应用层挡一道)。 */
+/** slug 形状(= spec/types.ts Slug,与 0139 的 CHECK 同源;写入前先在应用层挡一道)。 */
 const SLUG_RE = /^[a-z][a-z0-9-]{1,63}$/
 const MAX_CLIENT_ID_LEN = 256
 const MAX_CLIENT_SECRET_LEN = 1024

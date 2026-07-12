@@ -504,7 +504,7 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
-  await runMigrations() // 全量迁移含 0135(pending.provider → slug 形状)
+  await runMigrations() // 全量迁移含 0138(pending.provider → slug 形状)
   server = await startServer()
   deps = makeDeps(server.port)
 })
@@ -613,7 +613,7 @@ describe('oauth2-auth-code · start → callback → bound', () => {
     // start 阶段引擎不发任何网络请求(纯组 URL)。
     assert.equal(server.requests.length, 0)
 
-    // pending 行落库:只存 hash,draft 是密文,provider = slug(0135 放开后合法)。
+    // pending 行落库:只存 hash,draft 是密文,provider = slug(0138 放开后合法)。
     const pending = await query<{
       provider: string
       draft_enc: Buffer | null

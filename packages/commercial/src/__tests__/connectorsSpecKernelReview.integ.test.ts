@@ -81,7 +81,7 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
-  await runMigrations() // 全量迁移含 0132 —— 顺带验证迁移可干净 apply
+  await runMigrations() // 全量迁移含 0135 —— 顺带验证迁移可干净 apply
 })
 
 after(async () => {

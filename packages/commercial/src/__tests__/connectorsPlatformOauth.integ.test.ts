@@ -393,7 +393,7 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
-  await runMigrations() // 含 0136 平台 OAuth App 表
+  await runMigrations() // 含 0139 平台 OAuth App 表
   server = await startServer()
   deps = makeDeps(server.port)
 })

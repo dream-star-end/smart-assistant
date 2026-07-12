@@ -1,7 +1,7 @@
 /**
  * 连接器 Contract 内核 · 审核状态机 + 载入即验签 fail-closed(RFC §1.1/§6.1/§10.2)。
  *
- * 状态落在 marketplace_skill_versions 独立列(0132):security_review_state /
+ * 状态落在 marketplace_skill_versions 独立列(0135):security_review_state /
  * functional_verify_state / exec_revoked_at,不复用单一 status(避免各 handler 各自解释)。
  *
  * 合法迁移:

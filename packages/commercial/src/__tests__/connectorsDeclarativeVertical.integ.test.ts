@@ -305,7 +305,7 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
-  await runMigrations() // 全量迁移含 0133
+  await runMigrations() // 全量迁移含 0136
 })
 
 after(async () => {
@@ -388,7 +388,7 @@ describe('声明式首垂直 static-token+Notion', () => {
       // ── 连接行:四个 pin 落齐 + secret 加密 + meta hint;明文里绝无 token ──────
       const row = await connectionRow(bind.connectionId)
       assert.ok(row)
-      assert.equal(row.provider, conn.slug) // provider = listing slug(0133 放开)
+      assert.equal(row.provider, conn.slug) // provider = listing slug(0136 放开)
       assert.equal(row.cvid, String(conn.versionId))
       assert.equal(row.sh, conn.specHash)
       assert.equal(row.eh, conn.execContractHash)

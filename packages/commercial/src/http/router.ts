@@ -808,7 +808,7 @@ export function createCommercialHandler(
     // 0106 轻量在飞快照(前端 30s 轮询)
     { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
-    // 0136 连接器平台 OAuth App provisioning(clientProvisioning='platform' 的信任闸)。
+    // 0139 连接器平台 OAuth App provisioning(clientProvisioning='platform' 的信任闸)。
     // exact list 排在 :slug prefix 之前(matchRoute exact-first)。
     {
       method: 'GET',

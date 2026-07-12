@@ -291,12 +291,12 @@ export const TokenResponseSpec = Type.Object(
  *
  *   'byoa'     用户自带 OAuth App:用户去 provider 后台注册应用,把 client_id/client_secret
  *              填进授权表单 → 进加密 pending draft → 回调用它换 token。
- *   'platform' 平台注册 OAuth App:凭据存平台表(connector_platform_oauth_apps,0136),
+ *   'platform' 平台注册 OAuth App:凭据存平台表(connector_platform_oauth_apps,0139),
  *              用户点一下就授权,什么都不填。
  *
  * **为什么 'platform' 不构成提权**(安全推理,必须理解后再改):
  *   作者(可能是任意市场发布者)在自己的 spec 里写 'platform',**并不能凭空获得任何平台凭据** ——
- *   platform 模式下的 client 凭据**只有 admin 显式 provision(admin API 往 0136 表写一行)才存在**。
+ *   platform 模式下的 client 凭据**只有 admin 显式 provision(admin API 往 0139 表写一行)才存在**。
  *   没 provision 的 slug 走 platform 分支一律 fail-closed:oauth/start 返 503 OAUTH_NOT_CONFIGURED,
  *   catalog 甚至不展示该连接器。也就是说:**admin provisioning 本身就是那道信任闸**,
  *   声明 'platform' 至多是"向 admin 表达一个诉求",授权与否 100% 由 admin 决定。

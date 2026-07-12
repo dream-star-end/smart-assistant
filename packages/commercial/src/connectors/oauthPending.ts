@@ -149,7 +149,7 @@ export interface StartOauthPendingResult {
  * 原子登记 pending(同 user+provider 旧行整体被覆盖,旧 state 必败)。
  *
  * provider:v1 = 手写 provider 名('feishu');声明式 = **listing slug**(调用方从
- * loadVerifiedContractWithMeta 的 DB 事实取,不接受用户输入;0135 已把 CHECK 放开到 slug 形状)。
+ * loadVerifiedContractWithMeta 的 DB 事实取,不接受用户输入;0138 已把 CHECK 放开到 slug 形状)。
  */
 export async function startOauthPending(
   opts: { userId: number; provider: string; draft: OauthDraft },

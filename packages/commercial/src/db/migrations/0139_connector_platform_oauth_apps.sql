@@ -1,4 +1,4 @@
--- 0136 连接器平台 · 平台自有 OAuth App 凭据(clientProvisioning='platform' 的信任闸)
+-- 0139 连接器平台 · 平台自有 OAuth App 凭据(clientProvisioning='platform' 的信任闸)
 --
 -- 背景:oauth2-auth-code 此前只有 BYOA 一种形态 —— 用户自己去 provider 后台注册 OAuth App、
 -- 把 client_id/client_secret 填进表单。对普通用户这是劝退级门槛。平台模式让**平台**注册一次
@@ -14,10 +14,10 @@
 --
 -- 加密:crypto/aead.ts AES-256-GCM,key=loadKmsKey();
 --       **AAD = `platform_oauth:{aad_seed}:{slug}`**(照 oauthPending 的 AAD 范式:aad_seed 每次
---       写入重生成 → 旧密文无法被移植到新行/别的 slug 上)。列形状对齐 0130/0134:
+--       写入重生成 → 旧密文无法被移植到新行/别的 slug 上)。列形状对齐 0130/0137:
 --       nonce=12B、密文 ≥16B(含 GCM tag)、key_version 备将来轮换。
 --
--- 注:runner 已把整文件包在 BEGIN…INSERT schema_migrations…COMMIT 里,本文件只写 DDL(0130/0132/0134 惯例)。
+-- 注:runner 已把整文件包在 BEGIN…INSERT schema_migrations…COMMIT 里,本文件只写 DDL(0130/0135/0137 惯例)。
 
 CREATE TABLE IF NOT EXISTS connector_platform_oauth_apps (
   -- slug = marketplace listing slug(与 connections.provider 声明式取值同形状,spec/types.ts Slug)。
