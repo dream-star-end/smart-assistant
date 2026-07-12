@@ -377,11 +377,14 @@ oc_hotcfg_install_deps_in_image() {
   # daemon.json 兜底,与 build-image.sh 的 OC_BUILD_NETWORK_HOST 同一类坑,2026-07-12 实测
   # bridge 下 npm ping 挂死/host 下 297ms PONG,npm 崩为 "Exit handler never called")。
   # 构建期一次性容器,走宿主网络栈无隔离顾虑。
+  # >&2:npm 的进度输出走 stdout("added N packages in Ns"),而本函数链上层
+  # (finalize_release → deploy 的 $(…) 捕获)约定 stdout 只承载结果值 —— 混入即污染
+  # 返回值(2026-07-12 首启实测 release 路径被拼上 npm 输出被合法性守卫拦下)。
   "$OC_DOCKER_BIN" run --rm --network=host --entrypoint /bin/sh --user 0:0 \
     -v "$staging:/build" -w /build "$image_id" -c '
       set -e
       npm ci --include=dev --no-audit --no-fund
-    ' || { oc_hotcfg__die "npm ci 失败(整体失败,不降级 npm install)"; return 1; }
+    ' >&2 || { oc_hotcfg__die "npm ci 失败(整体失败,不降级 npm install)"; return 1; }
 }
 
 # ccb dist:host bun install --ignore-scripts + bun run build,产物 dist/cli.js。记录 bun --version 供 MANIFEST。
@@ -409,7 +412,7 @@ oc_hotcfg_build_ccb_dist() {
   # "build": "bun run build.ts",嵌套调用按**名字**找 bun —— 非交互 ssh 的 PATH 不含
   # ~/.bun/bin(playbook §4.3 已知坑),只用绝对路径调外层不够(2026-07-12 首启实测
   # bash: bun: command not found exit 127)。
-  if ! ( cd "$ccb_build" && PATH="$(dirname "$bun"):$PATH" "$bun" install --ignore-scripts && PATH="$(dirname "$bun"):$PATH" "$bun" run build ); then
+  if ! ( cd "$ccb_build" && PATH="$(dirname "$bun"):$PATH" "$bun" install --ignore-scripts && PATH="$(dirname "$bun"):$PATH" "$bun" run build ) >&2; then
     oc_hotcfg__die "ccb bun install/build 失败"; rm -rf "$ccb_build"; return 1
   fi
   [ -f "$ccb_build/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; rm -rf "$ccb_build"; return 1; }
