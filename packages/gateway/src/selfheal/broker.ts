@@ -24,15 +24,23 @@
  *            deploy, it runs a SELF-HELD trusted deploy driver under the global
  *            deploy flock — never a script from the candidate clone.
  *
- * Idempotency: every request is keyed by `repairId:actionKind`. A recorded
- * side-effecting outcome is replayed from the ledger instead of re-executing
- * (replay/duplicate-delivery protection).
+ * Idempotency: every request is atomically CLAIMED by `repairId:actionKind`
+ * (keyed also by a params hash) in a durable store BEFORE any side effect, so
+ * concurrent duplicates can never both execute and a crash mid-execution never
+ * re-runs the side effect. A committed outcome is replayed; a same-key request
+ * with different params is a conflict. See {@link BrokerClaimStore}.
  */
 
+import { createHash } from 'node:crypto'
 import { chmodSync, chownSync, existsSync, mkdirSync, unlinkSync } from 'node:fs'
-import { appendFileSync, readFileSync } from 'node:fs'
 import { type Server, type Socket, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
+import {
+  type BrokerClaimResult,
+  finalizeBrokerAction,
+  releaseBrokerClaim,
+  tryClaimBrokerAction,
+} from '@openclaude/storage'
 import { type Logger, createLogger } from '../logger.js'
 import {
   type BrokerActionDef,
@@ -45,6 +53,7 @@ import {
   type SignedVerification,
   defaultCommandRunner,
   loadSignedVerification,
+  stableStringify,
   verifySignature,
 } from './verifier.js'
 
@@ -66,56 +75,60 @@ export interface BrokerResponse {
   detail?: Record<string, unknown>
 }
 
-// ── idempotency ledger ───────────────────────────────────────────────────────
+// ── idempotency store (durable, atomic single-winner claim) ──────────────────
 
-export interface BrokerLedgerEntry {
-  key: string
-  repairId: string
-  actionKind: string
-  response: BrokerResponse
-  recordedAt: string
+/**
+ * The broker's idempotency + claim backend. A request is claimed by
+ * `repairId:actionKind` keyed ALSO by a hash of its params, BEFORE any side
+ * effect. Concurrent duplicates can never both win; a committed outcome is
+ * replayed; a same-key request with different params is a conflict; and a claim
+ * whose handler crashed mid-execution is reported so we never re-run a side
+ * effect (at-most-once). See {@link tryClaimBrokerAction}.
+ */
+export interface BrokerClaimStore {
+  tryClaim(input: {
+    claimKey: string
+    repairId: string
+    actionKind: string
+    paramsHash: string
+  }): Promise<BrokerClaimResult>
+  finalize(claimKey: string, response: string): Promise<void>
+  release(claimKey: string): Promise<void>
 }
 
-export interface BrokerLedger {
-  get(key: string): BrokerLedgerEntry | undefined
-  put(entry: BrokerLedgerEntry): void
+/** Default durable store backed by the root-owned selfheal SQLite DB. */
+export const durableBrokerClaimStore: BrokerClaimStore = {
+  tryClaim: (input) => tryClaimBrokerAction(input),
+  finalize: (claimKey, response) => finalizeBrokerAction(claimKey, response),
+  release: (claimKey) => releaseBrokerClaim(claimKey),
 }
 
-/** Durable JSON-lines ledger (root-owned). Replays on construction so broker
- *  restarts keep replay protection. */
-export class FileBrokerLedger implements BrokerLedger {
-  private readonly map = new Map<string, BrokerLedgerEntry>()
-  constructor(private readonly file: string) {
-    mkdirSync(dirname(file), { recursive: true })
-    if (existsSync(file)) {
-      for (const line of readFileSync(file, 'utf-8').split('\n')) {
-        if (!line.trim()) continue
-        try {
-          const entry = JSON.parse(line) as BrokerLedgerEntry
-          this.map.set(entry.key, entry)
-        } catch {
-          /* skip corrupt line */
-        }
-      }
+/** In-memory store for tests / ephemeral use only. NOT durable — a real broker
+ *  must use {@link durableBrokerClaimStore} (enforced in {@link SelfhealBroker}). */
+export class InMemoryBrokerClaimStore implements BrokerClaimStore {
+  private readonly map = new Map<string, { paramsHash: string; response?: string }>()
+  async tryClaim(input: {
+    claimKey: string
+    repairId: string
+    actionKind: string
+    paramsHash: string
+  }): Promise<BrokerClaimResult> {
+    const cur = this.map.get(input.claimKey)
+    if (!cur) {
+      this.map.set(input.claimKey, { paramsHash: input.paramsHash })
+      return { outcome: 'won' }
     }
+    if (cur.paramsHash !== input.paramsHash) return { outcome: 'conflict' }
+    if (cur.response !== undefined) return { outcome: 'replay', response: cur.response }
+    return { outcome: 'in_progress' }
   }
-  get(key: string): BrokerLedgerEntry | undefined {
-    return this.map.get(key)
+  async finalize(claimKey: string, response: string): Promise<void> {
+    const cur = this.map.get(claimKey)
+    if (cur && cur.response === undefined) cur.response = response
   }
-  put(entry: BrokerLedgerEntry): void {
-    this.map.set(entry.key, entry)
-    appendFileSync(this.file, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
-  }
-}
-
-/** In-memory ledger (tests / ephemeral). */
-export class MemoryBrokerLedger implements BrokerLedger {
-  private readonly map = new Map<string, BrokerLedgerEntry>()
-  get(key: string): BrokerLedgerEntry | undefined {
-    return this.map.get(key)
-  }
-  put(entry: BrokerLedgerEntry): void {
-    this.map.set(entry.key, entry)
+  async release(claimKey: string): Promise<void> {
+    const cur = this.map.get(claimKey)
+    if (cur && cur.response === undefined) this.map.delete(claimKey)
   }
 }
 
@@ -135,7 +148,9 @@ export interface SelfhealBrokerOpts {
    *  check: the candidate-object bundle is exported AS ocheal so root never runs
    *  git in the untrusted clone. Omitted only in tests (which inject `run`). */
   ochealUid?: number
-  ledger?: BrokerLedger
+  /** Idempotency + claim backend. Defaults to the durable SQLite-backed store;
+   *  tests inject {@link InMemoryBrokerClaimStore}. */
+  store?: BrokerClaimStore
   actions?: Record<string, BrokerActionDef>
   run?: CommandRunner
   log?: Logger
@@ -166,7 +181,7 @@ export interface SelfhealBrokerOpts {
 export class SelfhealBroker {
   private server: Server | null = null
   private readonly log: Logger
-  private readonly ledger: BrokerLedger
+  private readonly store: BrokerClaimStore
   private readonly actions: Record<string, BrokerActionDef>
   private readonly run: CommandRunner
   private readonly canonicalRepo: string
@@ -178,7 +193,9 @@ export class SelfhealBroker {
 
   constructor(private readonly opts: SelfhealBrokerOpts) {
     this.log = opts.log ?? rootLog
-    this.ledger = opts.ledger ?? new MemoryBrokerLedger()
+    // Durable by default; an ephemeral in-memory store would silently drop
+    // replay protection across a restart (Codex HIGH #4), so it must be opted in.
+    this.store = opts.store ?? durableBrokerClaimStore
     this.actions = opts.actions ?? TIER1_ACTIONS
     this.run = opts.run ?? defaultCommandRunner
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
@@ -205,14 +222,28 @@ export class SelfhealBroker {
       server.on('error', reject)
       server.listen(sock, () => {
         try {
-          // ACL: rw for owner (root) + group. chown to root:ocheal-gid so only
-          // ocheal (and root) can connect; world has no access.
+          // ACL: rw for owner (root) + group only; world has NO access. chown to
+          // root:ocheal-gid so only ocheal (and root) can connect. If ochealGid
+          // is unset the socket stays root:root 0660 — secure (ocheal can't
+          // connect) rather than fail-open.
           chmodSync(sock, 0o660)
-          if (this.opts.ochealGid !== undefined) {
-            chownSync(sock, process.getuid?.() ?? 0, this.opts.ochealGid)
-          }
+          chownSync(sock, process.getuid?.() ?? 0, this.opts.ochealGid ?? process.getgid?.() ?? 0)
         } catch (err) {
-          this.log.warn('failed to apply broker socket ACL', { sock }, err)
+          // Fail CLOSED (Codex HIGH #11): an unenforced ACL could leave this
+          // privileged socket world-connectable. Tear down instead of serving.
+          this.log.error('broker socket ACL failed — refusing to serve', { sock }, err)
+          try {
+            server.close()
+          } catch {
+            /* best effort */
+          }
+          try {
+            unlinkSync(sock)
+          } catch {
+            /* best effort */
+          }
+          reject(err instanceof Error ? err : new Error('broker socket ACL failed'))
+          return
         }
         this.server = server
         this.log.info('selfheal broker listening', { sock, autoDeployTier2: this.autoDeployTier2 })
@@ -288,26 +319,56 @@ export class SelfhealBroker {
     }
 
     const key = `${req.repairId}:${req.actionKind}`
-    const prior = this.ledger.get(key)
-    if (prior) {
-      // Replay/duplicate: return the recorded outcome, never re-execute.
-      this.log.info('broker idempotent replay', { key, status: prior.response.status })
-      return { ...prior.response, detail: { ...prior.response.detail, replayed: true } }
+    // Hash the params so a same-key request with DIFFERENT params is a conflict,
+    // not a silent replay of the old outcome (Codex HIGH #13).
+    const paramsHash = createHash('sha256').update(stableStringify(req.params ?? null)).digest('hex')
+
+    // Atomically claim BEFORE any side effect (Codex HIGH #3/#4): single winner,
+    // durable across restart.
+    const claim = await this.store.tryClaim({
+      claimKey: key,
+      repairId: req.repairId,
+      actionKind: req.actionKind,
+      paramsHash,
+    })
+    if (claim.outcome === 'replay') {
+      const prior = JSON.parse(claim.response ?? '{}') as BrokerResponse
+      this.log.info('broker idempotent replay', { key, status: prior.status })
+      return { ...prior, detail: { ...prior.detail, replayed: true } }
+    }
+    if (claim.outcome === 'conflict') {
+      this.log.warn('broker claim conflict — key reused with different params', { key })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: { reason: 'repairId:actionKind reused with different params' },
+      }
+    }
+    if (claim.outcome === 'in_progress') {
+      // A prior claim executed (or was mid-execution) and never finalized — the
+      // side effect may already have happened. Fail closed: never re-execute.
+      this.log.warn('broker claim in_progress — refusing to re-execute', { key })
+      return {
+        ok: false,
+        status: 'in_progress',
+        detail: { reason: 'a prior claim did not finalize; not re-executing (at-most-once)' },
+      }
     }
 
-    const response =
-      req.actionKind === CUTOVER_KIND ? await this.handleCutover(req) : await this.handleTier1(req)
-
-    // Only record side-effecting outcomes so a transient validation failure can
-    // be retried, but an executed action / held cutover is never repeated.
+    // We won the claim. Execute, then either finalize (side-effecting outcome is
+    // permanent) or release (a non-side-effecting validation reject may be retried).
+    let response: BrokerResponse
+    try {
+      response =
+        req.actionKind === CUTOVER_KIND ? await this.handleCutover(req) : await this.handleTier1(req)
+    } catch (err) {
+      await this.store.release(key)
+      throw err
+    }
     if (this.isCommitted(response)) {
-      this.ledger.put({
-        key,
-        repairId: req.repairId,
-        actionKind: req.actionKind,
-        response,
-        recordedAt: new Date().toISOString(),
-      })
+      await this.store.finalize(key, JSON.stringify(response))
+    } else {
+      await this.store.release(key)
     }
     return response
   }

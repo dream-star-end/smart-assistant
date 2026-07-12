@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   type BrokerRequest,
   type BrokerResponse,
-  MemoryBrokerLedger,
+  InMemoryBrokerClaimStore,
   SelfhealBroker,
 } from '../selfheal/broker.js'
 import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
@@ -48,7 +48,7 @@ describe('SelfhealBroker Tier1', () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       run,
     })
     const resp = await broker.handleRequest({
@@ -66,7 +66,7 @@ describe('SelfhealBroker Tier1', () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       run,
     })
     const resp = await broker.handleRequest({
@@ -80,7 +80,7 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('rejects an unknown action kind', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', ledger: new MemoryBrokerLedger() })
+    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore() })
     const resp = await broker.handleRequest({
       repairId: 'r3',
       actionKind: 'rm_rf_slash',
@@ -93,7 +93,7 @@ describe('SelfhealBroker Tier1', () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       run,
     })
     const resp = await broker.handleRequest({
@@ -107,7 +107,7 @@ describe('SelfhealBroker Tier1', () => {
   })
 
   it('switch_node is a reserved no-op', async () => {
-    const broker = new SelfhealBroker({ socketPath: '/unused', ledger: new MemoryBrokerLedger() })
+    const broker = new SelfhealBroker({ socketPath: '/unused', store: new InMemoryBrokerClaimStore() })
     const resp = await broker.handleRequest({
       repairId: 'r5',
       actionKind: 'switch_node',
@@ -121,7 +121,7 @@ describe('SelfhealBroker Tier1', () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       run,
     })
     const req: BrokerRequest = {
@@ -169,7 +169,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     const pending: { repairId: string; sha: string }[] = []
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       canonicalRepo: '/canon',
@@ -257,7 +257,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
     })
     const broker = new SelfhealBroker({
       socketPath: '/unused',
-      ledger: new MemoryBrokerLedger(),
+      store: new InMemoryBrokerClaimStore(),
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       autoDeployTier2: true,

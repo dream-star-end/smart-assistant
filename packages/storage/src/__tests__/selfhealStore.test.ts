@@ -32,6 +32,9 @@ const {
   renewJobLease,
   setExecutionStatus,
   setJobStatus,
+  tryClaimBrokerAction,
+  finalizeBrokerAction,
+  releaseBrokerClaim,
 } = await import('../selfhealStore.js')
 
 after(async () => {
@@ -212,5 +215,60 @@ describe('nonce replay defense', () => {
     // 'old' is gone → it can be recorded fresh again; 'new' is still blocked.
     assert.equal(await recordNonceIfFresh('old', 100_001), true)
     assert.equal(await recordNonceIfFresh('new', 100_002), false)
+  })
+})
+
+describe('broker action claim — atomic single-winner idempotency', () => {
+  it('first claim wins; a committed replay returns the recorded response', async () => {
+    const k = 'b1:restart_service'
+    const first = await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b1',
+      actionKind: 'restart_service',
+      paramsHash: 'h',
+    })
+    assert.equal(first.outcome, 'won')
+    // Before finalize, a duplicate is 'in_progress' (never re-execute).
+    const mid = await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b1',
+      actionKind: 'restart_service',
+      paramsHash: 'h',
+    })
+    assert.equal(mid.outcome, 'in_progress')
+    await finalizeBrokerAction(k, JSON.stringify({ ok: true, status: 'restarted' }))
+    const replay = await tryClaimBrokerAction({
+      claimKey: k,
+      repairId: 'b1',
+      actionKind: 'restart_service',
+      paramsHash: 'h',
+    })
+    assert.equal(replay.outcome, 'replay')
+    assert.equal(JSON.parse(replay.response ?? '{}').status, 'restarted')
+  })
+
+  it('same key with a different params hash is a conflict (not a silent replay)', async () => {
+    const k = 'b2:clean_disk'
+    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b2', actionKind: 'clean_disk', paramsHash: 'A' })).outcome, 'won')
+    await finalizeBrokerAction(k, JSON.stringify({ ok: true, status: 'cleaned' }))
+    const conflict = await tryClaimBrokerAction({ claimKey: k, repairId: 'b2', actionKind: 'clean_disk', paramsHash: 'B' })
+    assert.equal(conflict.outcome, 'conflict')
+  })
+
+  it('a released (non-committed) claim can be re-claimed', async () => {
+    const k = 'b3:switch_node'
+    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b3', actionKind: 'switch_node', paramsHash: 'h' })).outcome, 'won')
+    await releaseBrokerClaim(k)
+    // After release, a fresh claim wins again (validation-reject retry path).
+    assert.equal((await tryClaimBrokerAction({ claimKey: k, repairId: 'b3', actionKind: 'switch_node', paramsHash: 'h' })).outcome, 'won')
+  })
+
+  it('release must NOT remove a committed side effect', async () => {
+    const k = 'b4:cutover'
+    await tryClaimBrokerAction({ claimKey: k, repairId: 'b4', actionKind: 'cutover', paramsHash: 'h' })
+    await finalizeBrokerAction(k, JSON.stringify({ ok: false, status: 'deployed' }))
+    await releaseBrokerClaim(k) // no-op on a committed row
+    const after = await tryClaimBrokerAction({ claimKey: k, repairId: 'b4', actionKind: 'cutover', paramsHash: 'h' })
+    assert.equal(after.outcome, 'replay')
   })
 })

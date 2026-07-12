@@ -106,6 +106,23 @@ export async function getSelfhealDb(): Promise<Database.Database> {
       seen_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_selfheal_nonces_seen ON selfheal_nonces(seen_at);
+
+    -- Durable, atomic broker idempotency + single-winner claim. The root broker
+    -- claims a (repair_id:action_kind) key BEFORE any side effect, keyed also by
+    -- params_hash so a same-key request with different params is a conflict (not
+    -- a silent replay of the old outcome). A 'claimed' row with no response marks
+    -- a claim whose handler crashed mid-execution ⇒ at-most-once: never re-run.
+    CREATE TABLE IF NOT EXISTS broker_actions (
+      claim_key   TEXT PRIMARY KEY,
+      repair_id   TEXT NOT NULL,
+      action_kind TEXT NOT NULL,
+      params_hash TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'claimed'
+                    CHECK (status IN ('claimed','committed')),
+      response    TEXT,
+      claimed_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
   `)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
@@ -560,4 +577,75 @@ export async function getExecution(executionId: string): Promise<SelfhealExecuti
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
+}
+
+// ── broker action claim (durable, atomic single-winner idempotency) ──────────
+
+export type BrokerClaimOutcome = 'won' | 'replay' | 'conflict' | 'in_progress'
+
+export interface BrokerClaimResult {
+  outcome: BrokerClaimOutcome
+  /** Present only for 'replay': the JSON-serialized recorded response. */
+  response?: string
+}
+
+/**
+ * Atomically claim a broker action. Single winner: the first caller for a
+ * claim_key inserts a 'claimed' row and gets 'won' — it (and only it) may then
+ * perform the side effect and call {@link finalizeBrokerAction}. Later callers:
+ *   - same params_hash + committed     → 'replay' (recorded response returned);
+ *   - same params_hash + still claimed → 'in_progress' (a prior handler crashed
+ *     before finalizing ⇒ NEVER re-execute — at-most-once for side effects);
+ *   - different params_hash            → 'conflict' (key reused with new params).
+ * The get+insert run in one SQLite transaction (and better-sqlite3 is
+ * synchronous), so two concurrent claims can never both win.
+ */
+export async function tryClaimBrokerAction(input: {
+  claimKey: string
+  repairId: string
+  actionKind: string
+  paramsHash: string
+  now?: number
+}): Promise<BrokerClaimResult> {
+  const db = await getSelfhealDb()
+  const now = input.now ?? Date.now()
+  const txn = db.transaction((): BrokerClaimResult => {
+    const row = db
+      .prepare('SELECT params_hash, status, response FROM broker_actions WHERE claim_key = ?')
+      .get(input.claimKey) as
+      | { params_hash: string; status: string; response: string | null }
+      | undefined
+    if (!row) {
+      db.prepare(
+        `INSERT INTO broker_actions (claim_key, repair_id, action_kind, params_hash, status, claimed_at, updated_at)
+         VALUES (?, ?, ?, ?, 'claimed', ?, ?)`,
+      ).run(input.claimKey, input.repairId, input.actionKind, input.paramsHash, now, now)
+      return { outcome: 'won' }
+    }
+    if (row.params_hash !== input.paramsHash) return { outcome: 'conflict' }
+    if (row.status === 'committed' && row.response != null)
+      return { outcome: 'replay', response: row.response }
+    return { outcome: 'in_progress' }
+  })
+  return txn()
+}
+
+/** Record the terminal (side-effecting) outcome for a won claim. */
+export async function finalizeBrokerAction(
+  claimKey: string,
+  response: string,
+  now = Date.now(),
+): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    "UPDATE broker_actions SET status = 'committed', response = ?, updated_at = ? WHERE claim_key = ? AND status = 'claimed'",
+  ).run(response, now, claimKey)
+}
+
+/** Release a won claim whose action turned out to be a non-side-effecting reject
+ *  (e.g. param validation failed), so a corrected retry can proceed. Only deletes
+ *  still-'claimed' rows — a committed side effect is never removed. */
+export async function releaseBrokerClaim(claimKey: string): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare("DELETE FROM broker_actions WHERE claim_key = ? AND status = 'claimed'").run(claimKey)
 }
