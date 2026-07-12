@@ -28,6 +28,8 @@ import {
   ExecContract,
   type ExecContractT,
   type HttpMethodValue,
+  Oauth2Config,
+  type Oauth2ConfigT,
   PROTOCOL_AUTH_MODES,
   SecurityDecision,
   type SecurityDecisionT,
@@ -263,6 +265,37 @@ function validatePath(path: string, paramsSchema: unknown): void {
     throw new ConnectorSpecError('BAD_PATH_TEMPLATE', 'unbalanced {} in path template')
 }
 
+// ─── oauth2 端点:静态安全 + 受众隔离(§3) ──────────────────────────────────
+
+/**
+ * oauth2 端点(作者声明的**完整 https URL**)静态安全校验 + **受众隔离**(安全关键):
+ *   - https、无 userinfo、无 query、无 fragment(query 由引擎 buildAuthorizeUrl 组装,端点须干净;
+ *     否则 `${authorizeEndpoint}?...` 会与自带 query 冲突);
+ *   - path 部分走 validatePath(禁占位符/CRLF/`..`/`//`/`://`/`\`/`@`,静态路径);
+ *   - origin(host+port,经单一权威 normalizeOrigin 归一化)必须 ∈ 指定受众集,否则 AUDIENCE_MISSING:
+ *       authorizeEndpoint → authorizationOrigins(浏览器重定向目标);
+ *       tokenEndpoint / refreshEndpoint / revokeEndpoint → tokenOrigins(发 client_secret 的后端交换)。
+ */
+function validateOauth2Endpoint(raw: string, allowedOrigins: readonly string[], label: string): void {
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    throw new ConnectorSpecError('BAD_ORIGIN', `oauth2 ${label} is not a valid url`)
+  }
+  if (u.protocol !== 'https:')
+    throw new ConnectorSpecError('BAD_ORIGIN', `oauth2 ${label} must be https`)
+  if (u.username !== '' || u.password !== '')
+    throw new ConnectorSpecError('BAD_ORIGIN', `oauth2 ${label} must not carry userinfo`)
+  if (u.search !== '' || u.hash !== '')
+    throw new ConnectorSpecError('BAD_PATH_TEMPLATE', `oauth2 ${label} must not carry query/fragment`)
+  const origin = normalizeOrigin(`${u.protocol}//${u.host}`)
+  if (!allowedOrigins.includes(origin))
+    throw new ConnectorSpecError('AUDIENCE_MISSING', `oauth2 ${label} origin not in reviewed audience`)
+  // path 静态安全(无占位符):传空 params schema,任何 {…} 即 BAD_PATH_PLACEHOLDER。
+  validatePath(u.pathname, { properties: {} })
+}
+
 // ─── placement 判别联合的跨字段校验(§3.3) ─────────────────────────────────
 
 function validatePlacement(p: ApiCredentialPlacementT): void {
@@ -468,6 +501,36 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
     }
   }
 
+  // oauth2-auth-code:授权码流。**受众隔离(安全关键)** + 端点静态 path 安全 + Oauth2Config 提取进契约。
+  // authorizeEndpoint 是浏览器重定向目标 → 必须 ∈ authorizationOrigins;tokenEndpoint(及可选
+  // refresh/revoke)发 client_secret → 必须 ∈ tokenOrigins。tokenOutputs 走 ExecContract.tokenOutputs
+  // 通道(hasTokenOutputs 已携带),placements 走 extractPlacements 进 action(与 token-exchange 一致)。
+  let oauth2: Oauth2ConfigT | undefined
+  if (spec.authMode === 'oauth2-auth-code') {
+    const auth = spec.auth as unknown as {
+      authorizeEndpoint: string
+      tokenEndpoint: string
+      refreshEndpoint?: string
+      revokeEndpoint?: string
+    }
+    if (audience.authorizationOrigins.length === 0)
+      throw new ConnectorSpecError(
+        'AUDIENCE_MISSING',
+        'oauth2-auth-code requires >=1 authorizationOrigin',
+      )
+    if (audience.tokenOrigins.length === 0)
+      throw new ConnectorSpecError('AUDIENCE_MISSING', 'oauth2-auth-code requires >=1 tokenOrigin')
+    validateOauth2Endpoint(auth.authorizeEndpoint, audience.authorizationOrigins, 'authorizeEndpoint')
+    validateOauth2Endpoint(auth.tokenEndpoint, audience.tokenOrigins, 'tokenEndpoint')
+    if (auth.refreshEndpoint !== undefined)
+      validateOauth2Endpoint(auth.refreshEndpoint, audience.tokenOrigins, 'refreshEndpoint')
+    if (auth.revokeEndpoint !== undefined)
+      validateOauth2Endpoint(auth.revokeEndpoint, audience.tokenOrigins, 'revokeEndpoint')
+    // Oauth2Config 提取:按 Oauth2Config strict schema 剔除 tokenOutputs/apiCredentialPlacements
+    // (二者另有权威通道)。Value.Clean = 单一权威、防漂移(config 增字段自动携带)。
+    oauth2 = Value.Clean(Oauth2Config, structuredClone(spec.auth)) as Oauth2ConfigT
+  }
+
   // pipeline
   validatePipeline(spec.credentialPipeline)
   const slotById = new Map(spec.credentialPipeline.nodes.map((n) => [n.id, n]))
@@ -566,6 +629,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
         }
       : {}),
     ...(tokenAcquisition !== undefined ? { tokenAcquisition } : {}),
+    ...(oauth2 !== undefined ? { oauth2 } : {}),
     credentialPipeline: spec.credentialPipeline,
     actions: execActions,
     ...(spec.identity !== undefined ? { identity: spec.identity } : {}),

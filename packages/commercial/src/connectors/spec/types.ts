@@ -279,22 +279,41 @@ export const TokenResponseSpec = Type.Object(
   strict,
 )
 
+/**
+ * oauth2 授权码流的**网络配置字段**(非凭据):authorize/token/refresh 端点 + scope/pkce/refresh 语义。
+ * **单一定义**:作者声明 Oauth2Auth = 这些 config 字段 + tokenOutputs + apiCredentialPlacements;
+ * 而 ExecContract.oauth2 只承载 config 字段(tokenOutputs/placements 在 ExecContract 上另有权威:
+ * tokenOutputs=ExecContract.tokenOutputs;placements 经 extractPlacements 进 action)。两处共用这份
+ * props 消除漂移。
+ */
+const Oauth2ConfigProps = {
+  authorizeEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
+  tokenEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
+  refreshEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
+  revokeEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
+  clientAuth: ClientAuth,
+  scopeSeparator: Type.String({ minLength: 1, maxLength: 4 }),
+  scopes: Type.Optional(Type.Array(Type.String({ maxLength: 128 }), { maxItems: 64 })),
+  fixedExtraParams: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
+  // token/refresh/expires 指针的**唯一权威** = tokenOutputs(不在此重复声明,P1-5②)。
+  providerErrorCodePointer: Type.Optional(ResponsePointer),
+  refreshRotation: Type.Boolean(),
+  refreshEncoding: Type.Union([Type.Literal('form'), Type.Literal('json')]),
+  refreshFieldNames: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 64 }))),
+  pkce: Type.Union([Type.Literal('required'), Type.Literal('optional')]),
+} as const
+
+/**
+ * §3 oauth2 授权码流配置载体(签进 ExecContract.oauth2)。引擎 `buildAuthorizeUrl` /
+ * `exchangeAuthCode` 据此组授权 URL / 换 token(凭据 code/client_secret/code_verifier 经 body /
+ * basic-auth 头注入,绝不进声明模板、绝不进 authorize URL)。
+ */
+export const Oauth2Config = Type.Object(Oauth2ConfigProps, strict)
+export type Oauth2ConfigT = Static<typeof Oauth2Config>
+
 const Oauth2Auth = Type.Object(
   {
-    authorizeEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
-    tokenEndpoint: Type.String({ minLength: 1, maxLength: 1024 }),
-    refreshEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
-    revokeEndpoint: Type.Optional(Type.String({ maxLength: 1024 })),
-    clientAuth: ClientAuth,
-    scopeSeparator: Type.String({ minLength: 1, maxLength: 4 }),
-    scopes: Type.Optional(Type.Array(Type.String({ maxLength: 128 }), { maxItems: 64 })),
-    fixedExtraParams: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
-    // token/refresh/expires 指针的**唯一权威** = tokenOutputs(不在此重复声明,P1-5②)。
-    providerErrorCodePointer: Type.Optional(ResponsePointer),
-    refreshRotation: Type.Boolean(),
-    refreshEncoding: Type.Union([Type.Literal('form'), Type.Literal('json')]),
-    refreshFieldNames: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 64 }))),
-    pkce: Type.Union([Type.Literal('required'), Type.Literal('optional')]),
+    ...Oauth2ConfigProps,
     tokenOutputs: TokenOutputs,
     apiCredentialPlacements: Type.Array(ApiCredentialPlacement, { minItems: 1, maxItems: 8 }),
   },
@@ -483,6 +502,9 @@ export const ExecContract = Type.Object(
     credentialAudiencePolicy: CredentialAudiencePolicy,
     tokenOutputs: Type.Optional(TokenOutputs),
     tokenAcquisition: Type.Optional(TokenAcquisition),
+    // oauth2 授权码流配置(仅 authMode='oauth2-auth-code' 时存在);随整个 canonical
+    // exec_contract 进 exec_contract_hash → 自动被签名覆盖(signer 无需改)。
+    oauth2: Type.Optional(Oauth2Config),
     credentialPipeline: CredentialPipeline,
     actions: Type.Array(ExecAction, { minItems: 1 }),
     identity: Type.Optional(ConnectorIdentity),
