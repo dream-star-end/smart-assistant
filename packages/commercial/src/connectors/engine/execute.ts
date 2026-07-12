@@ -25,7 +25,6 @@ import {
   decryptBagFromRow,
   getDeclarativeConnection,
 } from './binding.js'
-import { requiredBindSources } from './credentialBag.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
 import { resolveApiCredentials } from './tokenEngine.js'
 
@@ -95,7 +94,7 @@ export async function executeDeclarativeAction(
   if (typeof params !== 'object' || params === null || Array.isArray(params))
     throw new ConnectorError('VALIDATION_FAILED', 'params must be an object')
 
-  const bag = decryptBagFromRow(row, requiredBindSources(contract))
+  const bag = decryptBagFromRow(row, contract)
   const resolvedCreds = await resolveApiCredentials({
     contract,
     bag,

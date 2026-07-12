@@ -28,7 +28,6 @@ import {
 import { canonicalSha256Hex } from '../spec/canonical.js'
 import type { ExecActionT } from '../spec/types.js'
 import { getDeclarativeConnection, decryptBagFromRow } from './binding.js'
-import { requiredBindSources } from './credentialBag.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
 import { loadContractForConnection, soleApiOrigin } from './execute.js'
 import { resolveApiCredentials } from './tokenEngine.js'
@@ -156,7 +155,7 @@ export async function executeDeclarativeWrite(
     throw new ConnectorError('ACTION_UNKNOWN', 'ledger action not a write action in pinned contract')
   }
 
-  const bag = decryptBagFromRow(row, requiredBindSources(contract))
+  const bag = decryptBagFromRow(row, contract)
   const resolvedCreds = await resolveApiCredentials({
     contract,
     bag,

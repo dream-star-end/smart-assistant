@@ -1,8 +1,13 @@
 /**
  * 声明式连接器 · 前端 REST 子路由(挂在 dispatchConnectorsRoute 的 `declarative` 段下)。
  *
- * 面向浏览器/管理界面:catalog(可绑连接器目录)/ bind(绑定,含 identityProbe)/ connections(已绑列表)/
- * unbind(解绑)。**执行(read/write)不在这里**——那是 agent 经容器 RPC(rpc.ts)走的面。
+ * 面向浏览器/管理界面:catalog(可绑连接器目录)/ bind(直填绑定,含 identityProbe)/
+ * oauth/start(oauth2-auth-code 授权流起点)/ connections(已绑列表)/ unbind(解绑)。
+ * **执行(read/write)不在这里**——那是 agent 经容器 RPC(rpc.ts)走的面。
+ *
+ * OAuth **回调**也不在这里:它与 v1 feishu **共用** `GET /api/connectors/oauth/callback`
+ * (handlers.ts)—— state→provider→cookie→四因子消费这段加固逻辑是单一权威,绝不开第二条回调路由。
+ * 本模块只负责起点:落 pending(draft 里带 connectorVersionId 作声明式标记)+ 组 authorize URL。
  *
  * 每个子 handler 复刻仓内 http 约定:requireAuth(拿 userId)→ readJsonBody → 调引擎 → sendJson;
  * ConnectorError → HttpError(稳定 code + httpStatus,不泄内部 message)。
@@ -21,8 +26,16 @@ import {
   revokeDeclarativeConnection,
 } from './engine/binding.js'
 import { listDeclarativeCatalog } from './engine/catalog.js'
+import { buildAuthorizeUrl } from './engine/oauth2.js'
 import { clearTokenCache } from './engine/tokenEngine.js'
 import { ConnectorError } from './errors.js'
+import {
+  readConnectorsOauthRedirectUri,
+  setConnectorOauthCookie,
+  startOauthPending,
+} from './oauthPending.js'
+import { generatePkceVerifier, pkceChallengeS256 } from './pkce.js'
+import { loadVerifiedContractWithMeta } from './spec/review.js'
 import { ConnectorSpecError } from './spec/types.js'
 
 /** ConnectorError/ConnectorSpecError → HttpError(稳定 code,不泄 message)。 */
@@ -34,7 +47,25 @@ function toHttp(err: unknown): HttpError {
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {}
+}
+
+/** body 里的必填有界字符串(缺/空/超长 → BAD_REQUEST;值绝不进 message)。 */
+function requireBoundedString(body: Record<string, unknown>, key: string, maxLen: number): string {
+  const v = body[key]
+  if (typeof v !== 'string' || v.trim().length === 0 || v.length > maxLen)
+    throw new HttpError(400, 'BAD_REQUEST', `field ${key} required`)
+  return v.trim()
+}
+
+/** body 里的正整数 versionId。 */
+function requireVersionId(body: Record<string, unknown>): number {
+  const versionId = Number(body.versionId)
+  if (!Number.isInteger(versionId) || versionId <= 0)
+    throw new HttpError(400, 'BAD_REQUEST', 'versionId required')
+  return versionId
 }
 
 /** GET declarative/catalog —— 已审可绑连接器目录(含 authMode / 需填 source / 动作)。 */
@@ -44,7 +75,10 @@ async function handleCatalog(res: ServerResponse, pool: Pool): Promise<void> {
   sendJson(res, 200, { connectors: catalog })
 }
 
-/** POST declarative/bind —— 绑定(body: {versionId, secrets, displayName?})。 */
+/**
+ * POST declarative/bind —— 直填绑定(body: {versionId, secrets, displayName?})。
+ * oauth2-auth-code 契约在引擎层被硬拒(必须走 oauth/start),这里不需要重复判断。
+ */
 async function handleBind(
   req: IncomingMessage,
   res: ServerResponse,
@@ -54,16 +88,21 @@ async function handleBind(
   const user = await requireAuth(req, deps.jwtSecret)
   const userId = Number(user.id)
   const body = asRecord(await readJsonBody(req))
-  const versionId = Number(body.versionId)
-  if (!Number.isInteger(versionId) || versionId <= 0)
-    throw new HttpError(400, 'BAD_REQUEST', 'versionId required')
+  const versionId = requireVersionId(body)
   const secretsRaw = asRecord(body.secrets)
   const secrets: Record<string, string> = {}
   for (const [k, v] of Object.entries(secretsRaw)) if (typeof v === 'string') secrets[k] = v
-  const displayName = typeof body.displayName === 'string' ? body.displayName.slice(0, 64) : undefined
+  const displayName =
+    typeof body.displayName === 'string' ? body.displayName.slice(0, 64) : undefined
 
   const result = await bindDeclarativeConnector(
-    { userId, connectorVersionId: versionId, secrets, displayName },
+    {
+      userId,
+      connectorVersionId: versionId,
+      secrets,
+      displayName,
+      ...(deps.connectorEngineDeps ? { deps: deps.connectorEngineDeps } : {}),
+    },
     pool,
   )
   sendJson(res, 200, {
@@ -73,6 +112,67 @@ async function handleBind(
       accountHint: result.accountHint,
     },
   })
+}
+
+/**
+ * POST declarative/oauth/start —— oauth2-auth-code 授权流起点
+ * (body: {versionId, clientId, clientSecret, displayName?})。
+ *
+ * 凭据流向(切片 B 安全核心):
+ *   - clientId/clientSecret(用户 BYOA 自建应用的 client 凭据)→ **只**进 AEAD 加密的 pending draft;
+ *     clientSecret **绝不**进 authorize URL(buildAuthorizeUrl 结构上就不收它);
+ *   - pkceVerifier 服务端生成 → 只进 draft;进 URL 的是它的 S256 单向派生 challenge;
+ *   - state / cookieNonce 原值只出现在 authorize URL / Set-Cookie,DB 只存 sha256。
+ * 回调时四因子(state_hash + cookie_nonce + 未消费 + 未过期)全中才解出 draft。
+ */
+async function handleOauthStart(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: CommercialHttpDeps,
+  pool: Pool,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const userId = Number(user.id)
+  const body = asRecord(await readJsonBody(req))
+  const versionId = requireVersionId(body)
+  const clientId = requireBoundedString(body, 'clientId', 256)
+  const clientSecret = requireBoundedString(body, 'clientSecret', 512)
+  const displayName =
+    typeof body.displayName === 'string' ? body.displayName.slice(0, 64) : undefined
+
+  // 载入即验签(4 闸 fail-closed);slug/versionId 取 DB 事实,不信任调用方。
+  const meta = await loadVerifiedContractWithMeta(versionId, pool)
+  if (meta.contract.authMode !== 'oauth2-auth-code')
+    throw new HttpError(400, 'BAD_REQUEST', 'connector does not use oauth2 authorization code flow')
+
+  const redirectUri = readConnectorsOauthRedirectUri()
+  const pkceVerifier = generatePkceVerifier()
+  const pkceChallenge = await pkceChallengeS256(pkceVerifier)
+
+  const started = await startOauthPending(
+    {
+      userId,
+      provider: meta.slug,
+      draft: {
+        clientId,
+        clientSecret,
+        pkceVerifier,
+        connectorVersionId: meta.versionId,
+        ...(displayName ? { displayName } : {}),
+      },
+    },
+    pool,
+  )
+  // authorize URL 先组(纯函数,可能因契约端点/受众问题抛错)—— 成功后才发 cookie,
+  // 避免"给了 cookie 却没给跳转地址"的半吊子响应。
+  const authorizeUrl = buildAuthorizeUrl(meta.contract, {
+    clientId,
+    redirectUri,
+    state: started.state,
+    pkceChallenge,
+  })
+  setConnectorOauthCookie(res, meta.slug, started.cookieNonce, { secure: deps.refreshCookieSecure })
+  sendJson(res, 200, { authorizeUrl })
 }
 
 /** GET declarative/connections —— 已绑声明式连接列表。 */
@@ -133,6 +233,15 @@ export async function dispatchDeclarativeConnectors(
     }
     if (subSegs.length === 1 && subSegs[0] === 'bind' && method === 'POST') {
       await handleBind(req, res, deps, pool)
+      return
+    }
+    if (
+      subSegs.length === 2 &&
+      subSegs[0] === 'oauth' &&
+      subSegs[1] === 'start' &&
+      method === 'POST'
+    ) {
+      await handleOauthStart(req, res, deps, pool)
       return
     }
     if (subSegs.length === 1 && subSegs[0] === 'connections' && method === 'GET') {

@@ -3,76 +3,136 @@
  *
  * 手写 v1 store 把 secret 形状按四个 provider 硬编码(SECRET_SCHEMAS[provider])。声明式平台
  * 的凭据形状必须**由 auth_contract 驱动**:一个 `DeclarativeSecretBag = Record<source, string>`,
- * key 只能取该 authMode 需要用户提供的 credential source 名。本模块是"authMode → 需要哪些 source"
- * 与"bag ↔ 引擎 ResolvedCredentials"的单一映射,新增 authMode 只在这里扩。
+ * key 只能取该 authMode 允许的 credential source 名。本模块是"authMode → 凭据袋形状"与
+ * "bag ↔ 引擎 ResolvedCredentials"的单一映射,新增 authMode 只在这里扩。
  *
- * slice③ 只落 static-token(用户提供一个长期 token,source 名 `access_token`);其余 authMode
- * 在后续切片接入(oauth 的 token 由流程获得而非用户直填,故 requiredBindSources 为空)。
+ * **两种形状,别混用**(oauth2 切片 B 引入的关键区分):
+ *   - `requiredBindSources(contract)` = **用户直填**的 source(前端表单字段 / catalog 投影)。
+ *     oauth2-auth-code:用户在 OAuth start 表单填 client_id + client_secret(BYOA),
+ *     access_token/refresh_token 由授权流程获得,用户不直填。
+ *   - `storedBagSources(contract)` = **落库**的袋形状(执行期 decryptBagFromRow 复校验的权威)。
+ *     oauth2-auth-code:access_token(执行凭据)+ client_id/client_secret(供日后 refresh 轮换)
+ *     + 可选 refresh_token(上游可能不回)。
+ *   static-token / token-exchange 两者恰好相等(用户填什么就存什么),oauth2 则不等 —— 这正是
+ *   过去把两者当成一件事会出错的地方。
  */
 
 import { ConnectorError } from '../errors.js'
 import type { AuthModeValue, ExecContractT } from '../spec/types.js'
 import type { ResolvedCredentials } from './placement.js'
 
-/** 用户 bind 时直填的凭据袋(明文,仅在 master 内存活;落库前 AEAD 加密)。 */
+/** 用户 bind 时直填 / 落库的凭据袋(明文,仅在 master 内存活;落库前 AEAD 加密)。 */
 export type DeclarativeSecretBag = Record<string, string>
 
 const MAX_SECRET_LEN = 4096
 // biome-ignore lint/suspicious/noControlCharactersInRegex: 凭据值会进 header,禁 CR/LF/控制符
 const HAS_CONTROL = /[\x00-\x1f\x7f]/
 
+/** token-exchange:交换请求引用的规范 source 去重(client_id/client_secret/refresh_token 等)。 */
+function exchangeSources(contract: ExecContractT): string[] {
+  if (contract.tokenAcquisition === undefined)
+    throw new ConnectorError('INTERNAL', 'token-exchange contract missing tokenAcquisition')
+  return [
+    ...new Set<string>(
+      Object.values(contract.tokenAcquisition.exchangeRequest.credentialFieldNames),
+    ),
+  ]
+}
+
 /**
- * 某 contract 下**用户 bind 时必须直填**的 credential source 名集合。
+ * 某 contract 下**用户 bind 时必须直填**的 credential source 名集合(前端表单 / catalog 投影)。
  *   static-token → ['access_token'](单一长期 token,直接作 API 凭据)。
- *   token-exchange → 交换请求引用的规范 source 去重(client_id/client_secret/refresh_token 等);
- *     这些是**交换输入**,引擎据此换 access_token,用户不直填 access_token。
+ *   oauth2-auth-code → ['client_id','client_secret'](BYOA:用户自建应用的 client 凭据;
+ *     access/refresh token 由授权码流程获得 —— 用户填的 ≠ 落库的,见 storedBagSources)。
+ *   token-exchange → 交换请求引用的规范 source 去重;引擎据此换 access_token,用户不直填 token。
  *   其它 authMode:后续切片按各自 bind 流程接。
  */
 export function requiredBindSources(contract: ExecContractT): string[] {
   switch (contract.authMode) {
     case 'static-token':
       return ['access_token']
-    case 'token-exchange': {
-      if (contract.tokenAcquisition === undefined)
-        throw new ConnectorError('INTERNAL', 'token-exchange contract missing tokenAcquisition')
-      const set = new Set<string>(
-        Object.values(contract.tokenAcquisition.exchangeRequest.credentialFieldNames),
-      )
-      return [...set]
-    }
+    case 'oauth2-auth-code':
+      return ['client_id', 'client_secret']
+    case 'token-exchange':
+      return exchangeSources(contract)
     default:
-      throw new ConnectorError('BAD_REQUEST', `authMode ${contract.authMode} bind not supported yet`)
+      throw new ConnectorError(
+        'BAD_REQUEST',
+        `authMode ${contract.authMode} bind not supported yet`,
+      )
+  }
+}
+
+/** 落库凭据袋的形状(required 必须全在,optional 可有可无;其余键一律拒)。 */
+export interface StoredBagSources {
+  required: string[]
+  optional: string[]
+}
+
+/**
+ * 某 contract 下**落库**(connections.secret_enc)的凭据袋形状 —— 执行期解密复校验的单一权威。
+ *   static-token → 用户填的那一个 token 原样存。
+ *   token-exchange → 交换输入原样存(每次执行按需换 access_token,换回的进 token 缓存表)。
+ *   oauth2-auth-code → access_token(必须,执行凭据)+ client_id/client_secret(必须,日后
+ *     refresh 轮换要用)+ refresh_token(**可选**:上游可能不下发 —— 如 GitHub 默认不回 refresh)。
+ */
+export function storedBagSources(contract: ExecContractT): StoredBagSources {
+  switch (contract.authMode) {
+    case 'static-token':
+      return { required: ['access_token'], optional: [] }
+    case 'token-exchange':
+      return { required: exchangeSources(contract), optional: [] }
+    case 'oauth2-auth-code':
+      return {
+        required: ['access_token', 'client_id', 'client_secret'],
+        optional: ['refresh_token'],
+      }
+    default:
+      throw new ConnectorError(
+        'BAD_REQUEST',
+        `authMode ${contract.authMode} bind not supported yet`,
+      )
   }
 }
 
 /**
- * 严格校验凭据袋:key 恰等于 requiredSources(不多不少)、每值为非空有界字符串、无控制符/CRLF。
- * 失败一律 BAD_REQUEST(不带值,防泄漏)。
+ * 严格校验凭据袋:键 ⊆ required∪optional **且** required ⊆ 键(必填一个不缺、未知键一个不许);
+ * 每值为非空有界字符串、无控制符/CRLF。失败一律 BAD_REQUEST(不带值,防泄漏)。
  */
 export function validateSecretBag(
   bag: unknown,
   requiredSources: readonly string[],
+  optionalSources: readonly string[] = [],
 ): asserts bag is DeclarativeSecretBag {
   if (bag === null || typeof bag !== 'object' || Array.isArray(bag))
     throw new ConnectorError('BAD_REQUEST', 'secret bag must be an object')
-  const keys = Object.keys(bag as Record<string, unknown>)
-  const need = new Set(requiredSources)
-  if (keys.length !== need.size)
-    throw new ConnectorError('BAD_REQUEST', 'secret bag key set mismatch')
+  const record = bag as Record<string, unknown>
+  const keys = Object.keys(record)
+  const required = new Set(requiredSources)
+  const allowed = new Set([...requiredSources, ...optionalSources])
+  // ① 未知键一律拒(防塞入 driver 不认识 / placement 硬拒的 source)。
   for (const k of keys) {
-    if (!need.has(k)) throw new ConnectorError('BAD_REQUEST', `unexpected secret source ${k}`)
-    const v = (bag as Record<string, unknown>)[k]
+    if (!allowed.has(k)) throw new ConnectorError('BAD_REQUEST', `unexpected secret source ${k}`)
+    const v = record[k]
     if (typeof v !== 'string' || v.length === 0 || v.length > MAX_SECRET_LEN)
-      throw new ConnectorError('BAD_REQUEST', `secret source ${k} must be a bounded non-empty string`)
+      throw new ConnectorError(
+        'BAD_REQUEST',
+        `secret source ${k} must be a bounded non-empty string`,
+      )
     if (HAS_CONTROL.test(v))
       throw new ConnectorError('BAD_REQUEST', `secret source ${k} has control char`)
+  }
+  // ② 必填一个不缺(缺 → 执行期才炸不如 bind/解密期挡)。
+  for (const need of required) {
+    if (!Object.hasOwn(record, need))
+      throw new ConnectorError('BAD_REQUEST', `secret source ${need} missing`)
   }
 }
 
 /**
  * 凭据袋 → 引擎 driver 的 ResolvedCredentials。**只映射可作 API placement 的 source**
- * (access_token / client_id / auxiliary);client_secret / refresh_token 结构上不进这里
- * (§3.3,driver placement 亦硬拒)。slice③ static-token:access_token → accessToken。
+ * (access_token / client_id / auxiliary);client_secret / refresh_token **结构上不进这里**
+ * (§3.3,driver placement 亦硬拒)—— oauth2 的袋里虽然存着它们,但注入层永远看不到。
  */
 export function bagToResolvedCredentials(
   authMode: AuthModeValue,
@@ -81,6 +141,9 @@ export function bagToResolvedCredentials(
   switch (authMode) {
     case 'static-token':
       return { accessToken: bag.access_token }
+    case 'oauth2-auth-code':
+      // client_id 是公开标识(非凭据),某些上游要求随 API 请求带上;client_secret/refresh_token 不给。
+      return { accessToken: bag.access_token, clientId: bag.client_id }
     default:
       throw new ConnectorError('BAD_REQUEST', `authMode ${authMode} not injectable yet`)
   }

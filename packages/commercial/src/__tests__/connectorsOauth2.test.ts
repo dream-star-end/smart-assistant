@@ -17,15 +17,25 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { describe, test } from 'node:test'
 
+import {
+  bagToResolvedCredentials,
+  requiredBindSources,
+  storedBagSources,
+  validateSecretBag,
+} from '../connectors/engine/credentialBag.js'
+import type { EngineHttpDeps } from '../connectors/engine/driver.js'
+import { buildAuthorizeUrl, exchangeAuthCode } from '../connectors/engine/oauth2.js'
+import type { ResolvedCredentials } from '../connectors/engine/placement.js'
+import { resolveApiCredentials } from '../connectors/engine/tokenEngine.js'
+import { ConnectorError } from '../connectors/errors.js'
+import type { DnsResolver } from '../connectors/outboundPolicy.js'
+import { generatePkceVerifier, pkceChallengeS256 } from '../connectors/pkce.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import type { ExecContractT } from '../connectors/spec/types.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
-import { ConnectorError } from '../connectors/errors.js'
-import { buildAuthorizeUrl, exchangeAuthCode } from '../connectors/engine/oauth2.js'
-import type { DnsResolver } from '../connectors/outboundPolicy.js'
-import type { EngineHttpDeps } from '../connectors/engine/driver.js'
 
 function isSpecCode(code: string) {
   return (err: unknown) => err instanceof ConnectorSpecError && err.code === code
@@ -185,7 +195,8 @@ describe('compileSpec · oauth2-auth-code', () => {
     assert.throws(
       () =>
         compileGithub((s) => {
-          ;(s.auth as Record<string, unknown>).authorizeEndpoint = 'http://github.com/login/oauth/authorize'
+          ;(s.auth as Record<string, unknown>).authorizeEndpoint =
+            'http://github.com/login/oauth/authorize'
         }),
       isSpecCode('BAD_ORIGIN'),
     )
@@ -225,8 +236,7 @@ describe('compileSpec · oauth2-auth-code', () => {
     assert.throws(
       () =>
         compileGithub((s) => {
-          ;(s.auth as Record<string, unknown>).refreshEndpoint =
-            'https://evil.example.com/refresh'
+          ;(s.auth as Record<string, unknown>).refreshEndpoint = 'https://evil.example.com/refresh'
         }),
       isSpecCode('AUDIENCE_MISSING'),
     )
@@ -289,7 +299,10 @@ describe('buildAuthorizeUrl', () => {
 
   test('fixedExtraParams 不得覆盖核心协议参数', () => {
     const c = compileGithub((s) => {
-      ;(s.auth as Record<string, unknown>).fixedExtraParams = { client_id: 'HIJACK', prompt: 'consent' }
+      ;(s.auth as Record<string, unknown>).fixedExtraParams = {
+        client_id: 'HIJACK',
+        prompt: 'consent',
+      }
     })
     const u = new URL(buildAuthorizeUrl(c, OPTS))
     assert.equal(u.searchParams.get('client_id'), 'cid-public-abc') // 未被 HIJACK 覆盖
@@ -361,12 +374,20 @@ describe('exchangeAuthCode', () => {
         resolver: okResolver(),
         fetchImpl: mockFetch(captured, () => ({
           status: 200,
-          body: JSON.stringify({ access_token: 'at-live-xyz', refresh_token: 'rt-live-xyz', expires_in: 3600 }),
+          body: JSON.stringify({
+            access_token: 'at-live-xyz',
+            refresh_token: 'rt-live-xyz',
+            expires_in: 3600,
+          }),
         })),
       },
     })
     // 返回值。
-    assert.deepEqual(out, { accessToken: 'at-live-xyz', refreshToken: 'rt-live-xyz', expiresInSec: 3600 })
+    assert.deepEqual(out, {
+      accessToken: 'at-live-xyz',
+      refreshToken: 'rt-live-xyz',
+      expiresInSec: 3600,
+    })
     // 请求发到 token 端点(sole token origin)。
     assert.equal(captured.length, 1)
     assert.equal(captured[0]?.url, 'https://github.com/login/oauth/access_token')
@@ -445,7 +466,8 @@ describe('exchangeAuthCode', () => {
     }
     assert.ok(err instanceof ConnectorError)
     assert.equal(err.code, 'UPSTREAM_AUTH_FAILED')
-    for (const s of [SECRET, CODE, VERIFIER]) assert.ok(!err.message.includes(s), `leaked in message: ${s}`)
+    for (const s of [SECRET, CODE, VERIFIER])
+      assert.ok(!err.message.includes(s), `leaked in message: ${s}`)
   })
 
   test('2xx 但 accessToken 指针空 → UPSTREAM_AUTH_FAILED', async () => {
@@ -461,7 +483,10 @@ describe('exchangeAuthCode', () => {
         pkceVerifier: VERIFIER,
         deps: {
           resolver: okResolver(),
-          fetchImpl: mockFetch(captured, () => ({ status: 200, body: JSON.stringify({ note: 'no token' }) })),
+          fetchImpl: mockFetch(captured, () => ({
+            status: 200,
+            body: JSON.stringify({ note: 'no token' }),
+          })),
         },
       }),
       (e: unknown) => e instanceof ConnectorError && e.code === 'UPSTREAM_AUTH_FAILED',
@@ -494,5 +519,143 @@ describe('exchangeAuthCode', () => {
       (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
     )
     assert.equal(captured.length, 0) // 受众隔离:请求根本没发出
+  })
+})
+
+// ─── credentialBag(切片 B:用户填的 ≠ 落库的) ──────────────────────────────
+
+/** static-token 参照契约(用户填什么就存什么)。 */
+function compileStaticToken(): ExecContractT {
+  return compileSpec(
+    {
+      id: 'notion-decl',
+      label: 'Notion',
+      description: 'static token',
+      authMode: 'static-token',
+      auth: {
+        apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+      },
+      originMode: 'fixed-reviewed',
+      credentialPipeline: {
+        nodes: [{ id: 'api-token', authMode: 'static-token', subject: 'user', audience: 'api' }],
+      },
+      actions: [
+        {
+          id: 'whoami',
+          description: 'probe',
+          request: { method: 'GET', pathTemplate: '/v1/users/me' },
+          params: { type: 'object', additionalProperties: false },
+          result: { type: 'object', additionalProperties: false },
+          usesSlot: 'api-token',
+        },
+      ],
+    },
+    {
+      audience: {
+        authorizationOrigins: [],
+        tokenOrigins: [],
+        apiOrigins: ['https://api.notion.com:443'],
+        unauthenticatedUploadOrigins: [],
+      },
+      actions: {},
+    },
+  ).execContract
+}
+
+describe('credentialBag · oauth2-auth-code', () => {
+  test('requiredBindSources = 用户直填的 client_id + client_secret(token 由流程获得)', () => {
+    assert.deepEqual(requiredBindSources(compileGithub()), ['client_id', 'client_secret'])
+    // 对照:static-token 用户直填 access_token。
+    assert.deepEqual(requiredBindSources(compileStaticToken()), ['access_token'])
+  })
+
+  test('storedBagSources = 落库形状(access_token+client_id+client_secret 必填;refresh_token 可选)', () => {
+    assert.deepEqual(storedBagSources(compileGithub()), {
+      required: ['access_token', 'client_id', 'client_secret'],
+      optional: ['refresh_token'],
+    })
+    // 对照:static-token 两种形状恰好相等。
+    assert.deepEqual(storedBagSources(compileStaticToken()), {
+      required: ['access_token'],
+      optional: [],
+    })
+  })
+
+  test('validateSecretBag:optional 可缺可有;required 缺一必拒;未知键必拒', () => {
+    const { required, optional } = storedBagSources(compileGithub())
+    // 无 refresh_token(上游没给)→ 放行。
+    validateSecretBag(
+      { access_token: 'at', client_id: 'cid', client_secret: 'cs' },
+      required,
+      optional,
+    )
+    // 带 refresh_token → 放行。
+    validateSecretBag(
+      { access_token: 'at', client_id: 'cid', client_secret: 'cs', refresh_token: 'rt' },
+      required,
+      optional,
+    )
+    // 缺必填 access_token → 拒。
+    assert.throws(
+      () => validateSecretBag({ client_id: 'cid', client_secret: 'cs' }, required, optional),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    // 未知键 → 拒(哪怕必填都齐)。
+    assert.throws(
+      () =>
+        validateSecretBag(
+          { access_token: 'at', client_id: 'cid', client_secret: 'cs', evil: 'x' },
+          required,
+          optional,
+        ),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    // optional 未声明时(默认空)→ 多一个 refresh_token 也算未知键。
+    assert.throws(
+      () =>
+        validateSecretBag(
+          { access_token: 'at', client_id: 'cid', client_secret: 'cs', refresh_token: 'rt' },
+          required,
+        ),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+  })
+
+  test('bagToResolvedCredentials:oauth2 只出 accessToken+clientId(secret/refresh 结构上不进注入层)', () => {
+    const creds: ResolvedCredentials = bagToResolvedCredentials('oauth2-auth-code', {
+      access_token: 'AT',
+      client_id: 'CID',
+      client_secret: SECRET,
+      refresh_token: 'RT',
+    })
+    // 先断字段(deepEqual 的 `asserts actual is T` 会把 creds 收窄,故放最后)。
+    assert.equal(creds.clientSecret, undefined)
+    assert.equal(creds.refreshToken, undefined)
+    // canary 不在注入层任何字段里。
+    assert.equal(JSON.stringify(creds).includes(SECRET), false)
+    assert.deepEqual(creds, { accessToken: 'AT', clientId: 'CID' })
+  })
+
+  test('resolveApiCredentials:oauth2 直接用落库的 access_token(不发网)', async () => {
+    const creds = await resolveApiCredentials({
+      contract: compileGithub(),
+      bag: { access_token: 'AT', client_id: 'CID', client_secret: SECRET },
+    })
+    assert.deepEqual(creds, { accessToken: 'AT', clientId: 'CID' })
+  })
+})
+
+// ─── PKCE 助手(上移 connectors/pkce.ts 后仍是同一算法) ─────────────────────
+
+describe('pkce', () => {
+  test('verifier 长度 ∈ RFC 7636 [43,128] 且每次不同;challenge = base64url(sha256(verifier))', async () => {
+    const v1 = generatePkceVerifier()
+    const v2 = generatePkceVerifier()
+    assert.notEqual(v1, v2)
+    assert.ok(v1.length >= 43 && v1.length <= 128, `verifier length ${v1.length}`)
+    assert.match(v1, /^[A-Za-z0-9_-]+$/)
+    const challenge = await pkceChallengeS256(v1)
+    assert.equal(challenge, createHash('sha256').update(v1, 'ascii').digest('base64url'))
+    assert.notEqual(challenge, v1) // 单向派生:URL 里那半 ≠ 交换时那半
   })
 })

@@ -24,8 +24,9 @@ import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { getPool } from '../../db/index.js'
 import { tx } from '../../db/queries.js'
 import { ConnectorError } from '../errors.js'
+import type { ExecContractT } from '../spec/types.js'
 import { connectionAad } from '../store.js'
-import { type DeclarativeSecretBag, validateSecretBag } from './credentialBag.js'
+import { type DeclarativeSecretBag, storedBagSources, validateSecretBag } from './credentialBag.js'
 
 /** 声明式连接行(读取执行/撤销所需列)。 */
 export interface DeclarativeConnectionRow {
@@ -193,13 +194,18 @@ export async function getDeclarativeConnection(
   return r.rows[0] ?? null
 }
 
-/** 解密声明式连接的凭据袋(解密 + 按 contract 需要的 source 复校验;sources 由调用方从 contract 算)。 */
+/**
+ * 解密声明式连接的凭据袋(解密 + 按 **落库形状**(storedBagSources)复校验)。
+ * 形状权威直接从 pin 的 contract 算 —— 调用方不再自带 sources 数组(消除"传错一套 source"的可能:
+ * oauth2 的落库袋 ≠ 用户直填袋)。
+ */
 export function decryptBagFromRow(
   row: DeclarativeConnectionRow,
-  sources: readonly string[],
+  contract: ExecContractT,
 ): DeclarativeSecretBag {
   if (row.secret_enc === null || row.secret_nonce === null)
     throw new ConnectorError('CONNECTION_REVOKED', 'connection has no secret')
+  const stored = storedBagSources(contract)
   const key = loadKmsKey()
   let pt: Buffer | null = null
   try {
@@ -210,7 +216,7 @@ export function decryptBagFromRow(
       connectionAad(row.aad_seed, row.user_id, row.provider),
     )
     const parsed = JSON.parse(pt.toString('utf8')) as unknown
-    validateSecretBag(parsed, sources)
+    validateSecretBag(parsed, stored.required, stored.optional)
     return parsed
   } catch (e) {
     if (e instanceof ConnectorError) throw e

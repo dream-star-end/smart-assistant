@@ -28,6 +28,7 @@ import { register, RegisterError } from "../auth/register.js";
 import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
 import { requireAuth } from "./auth.js";
+import type { EngineHttpDeps as ConnectorEngineHttpDeps } from "../connectors/engine/driver.js";
 import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
 import { getUserUsageReport, isUsageWindow, type UsageWindow } from "../billing/usageReport.js";
@@ -154,6 +155,12 @@ export interface CommercialHttpDeps {
    * 必须显式传 false,否则浏览器/fetch undici 不会回带 cookie 给 HTTP 端点。
    */
   refreshCookieSecure?: boolean;
+  /**
+   * 连接器引擎的 HTTP 注入(DNS resolver / fetchImpl)。**生产恒 undefined**(引擎走真实
+   * pinnedHttpsFetch 出网);仅集成测试注入受控本地上游 —— 与本接口已有的 `fetchImpl?`
+   * (Turnstile 测试注入)同一范式。声明式绑定 / OAuth 回调经它把探针 + token 交换打到 mock server。
+   */
+  connectorEngineDeps?: ConnectorEngineHttpDeps;
   /**
    * T-53: Agent 运行时(docker + image + network + seccomp + proxy + rpc dir)。
    * 未注入时 `/api/agent/open` 返 503(仍允许 /status 查看过去订阅)。

@@ -108,6 +108,15 @@ export async function resolveApiCredentials(
   if (contract.authMode === 'static-token') {
     return bagToResolvedCredentials('static-token', bag)
   }
+  if (contract.authMode === 'oauth2-auth-code') {
+    // 授权码流:落库袋里就有 access_token(OAuth 回调换来的),直接用。
+    //
+    // **已知限制(切片 B 明确不做,登记在此)**:access_token 过期后**不自动 refresh 轮换**
+    // (refresh 引擎是后续切片)。过期表现 = 上游 401 → driver 的 UPSTREAM_AUTH_FAILED →
+    // 现有 RELINK_REQUIRED 路径把连接标 error 并引导用户重绑,fail-closed 不会静默用坏 token。
+    // 袋里已经存了 client_id/client_secret/refresh_token(如上游给),refresh 切片可直接接。
+    return bagToResolvedCredentials('oauth2-auth-code', bag)
+  }
   if (contract.authMode === 'token-exchange') {
     if (input.cache) {
       const cached = await readTokenCache(input.cache.connectionId, EXCHANGE_NODE_ID, input.cache.pool)

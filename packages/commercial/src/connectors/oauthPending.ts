@@ -41,10 +41,26 @@ export interface OauthDraft {
   clientSecret: string
   pkceVerifier: string
   displayName?: string
+  /**
+   * **声明式标记**(oauth2-auth-code 切片 B):存在 → 该 pending 属于声明式连接器,回调走
+   * 引擎路径(loadVerifiedContractWithMeta → exchangeAuthCode → bindWithBag);
+   * 不存在 → v1 手写 provider(feishu)路径。draft 在 AEAD 密文内,新增字段不动表结构。
+   */
+  connectorVersionId?: number
 }
 
 function sha256(s: string): Buffer {
   return createHash('sha256').update(s, 'utf8').digest()
+}
+
+/**
+ * OAuth 回跳地址(authorize 与 token 交换两阶段必须**同一个值**,RFC 6749 §4.1.3)。
+ * v1 feishu 与声明式 oauth2 共用同一条回调路由 → 共用同一权威读取口(禁第二份 env 解析)。
+ */
+export function readConnectorsOauthRedirectUri(env: NodeJS.ProcessEnv = process.env): string {
+  const v = env.OC_CONNECTORS_OAUTH_REDIRECT_URI?.trim()
+  if (!v) throw new ConnectorError('OAUTH_NOT_CONFIGURED', 'OC_CONNECTORS_OAUTH_REDIRECT_URI unset')
+  return v
 }
 
 // ─── state cookie(照 auth/github.ts 范式;per-provider 名) ────────────────
@@ -120,9 +136,12 @@ export interface StartOauthPendingResult {
 
 /**
  * 原子登记 pending(同 user+provider 旧行整体被覆盖,旧 state 必败)。
+ *
+ * provider:v1 = 手写 provider 名('feishu');声明式 = **listing slug**(调用方从
+ * loadVerifiedContractWithMeta 的 DB 事实取,不接受用户输入;0135 已把 CHECK 放开到 slug 形状)。
  */
 export async function startOauthPending(
-  opts: { userId: number; provider: 'feishu'; draft: OauthDraft },
+  opts: { userId: number; provider: string; draft: OauthDraft },
   pool: Pool = getPool(),
 ): Promise<StartOauthPendingResult> {
   const state = randomBytes(32).toString('base64url')
@@ -165,13 +184,14 @@ export async function startOauthPending(
 
 export interface ConsumedOauthPending {
   userId: number
-  provider: 'feishu'
+  /** v1 = provider 名;声明式 = listing slug。 */
+  provider: string
   draft: OauthDraft
 }
 
 interface PendingRow {
   user_id: number
-  provider: 'feishu'
+  provider: string
   cookie_nonce_hash: Buffer
   draft_enc: Buffer | null
   draft_nonce: Buffer | null
@@ -250,6 +270,13 @@ export async function consumeOauthPending(
       typeof draft.pkceVerifier !== 'string'
     ) {
       throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
+    }
+    // 声明式标记若存在,必须是正整数 versionId(回调据它选路径 + 载入契约,形状必须硬)。
+    if (
+      draft.connectorVersionId !== undefined &&
+      (!Number.isInteger(draft.connectorVersionId) || draft.connectorVersionId <= 0)
+    ) {
+      throw new ConnectorError('INTERNAL', 'oauth draft connectorVersionId invalid')
     }
     return { userId: held.userId, provider: held.provider, draft }
   } finally {

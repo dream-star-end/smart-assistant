@@ -30,6 +30,9 @@ import { requireAuth } from '../http/auth.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError, sendJson } from '../http/util.js'
 import { dispatchDeclarativeConnectors } from './declarativeHandlers.js'
+import { bindWithBag } from './engine/bind.js'
+import type { DeclarativeSecretBag } from './engine/credentialBag.js'
+import { exchangeAuthCode } from './engine/oauth2.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import {
   approveConfirmation,
@@ -38,19 +41,21 @@ import {
   getLedgerRow,
 } from './ledger.js'
 import {
+  type OauthDraft,
   clearConnectorOauthCookie,
   consumeOauthPending,
   readConnectorOauthCookie,
+  readConnectorsOauthRedirectUri,
   setConnectorOauthCookie,
   startOauthPending,
 } from './oauthPending.js'
 import { validateWebdavBaseUrl } from './outboundPolicy.js'
+import { generatePkceVerifier } from './pkce.js'
 import {
   buildFeishuAuthorizeUrl,
   checkFeishuScopes,
   exchangeFeishuCode,
   fetchFeishuUserInfo,
-  generatePkceVerifier,
 } from './providers/feishu.js'
 import { presetImapConfig, verifyImapCredentials } from './providers/imap.js'
 import { verifyNotionToken } from './providers/notion.js'
@@ -63,6 +68,8 @@ import {
   isDbProvider,
 } from './registry.js'
 import { buildWriteDetail } from './service.js'
+import { loadVerifiedContractWithMeta } from './spec/review.js'
+import { ConnectorSpecError } from './spec/types.js'
 import {
   type ConnectionRow,
   type ConnectorSecret,
@@ -454,12 +461,9 @@ async function bindFormProvider(
 }
 
 // ─── POST /api/connectors/:provider/oauth/start(BYOA feishu) ─────────────
-
-function readConnectorsOauthRedirectUri(env: NodeJS.ProcessEnv = process.env): string {
-  const v = env.OC_CONNECTORS_OAUTH_REDIRECT_URI?.trim()
-  if (!v) throw new ConnectorError('OAUTH_NOT_CONFIGURED', 'OC_CONNECTORS_OAUTH_REDIRECT_URI unset')
-  return v
-}
+//
+// 声明式 oauth2 连接器的起点在 declarativeHandlers(POST declarative/oauth/start);
+// redirect_uri 的读取权威已上移 oauthPending.readConnectorsOauthRedirectUri(两条起点 + 唯一回调共用)。
 
 async function handleOauthStart(
   req: IncomingMessage,
@@ -560,6 +564,21 @@ async function handleOauthCallback(
     return
   }
 
+  // ── 分流:draft 带 connectorVersionId → 声明式连接器(引擎路径);否则 v1 feishu(下方原逻辑)。
+  //    上面的 state→provider→cookie→四因子消费是**两条路径共用的单一权威**,故绝不另开回调路由。
+  if (consumed.draft.connectorVersionId !== undefined) {
+    await completeDeclarativeOauth(res, ctx, {
+      provider,
+      versionId: consumed.draft.connectorVersionId,
+      userId: consumed.userId,
+      draft: consumed.draft,
+      code,
+      pool,
+      deps,
+    })
+    return
+  }
+
   try {
     const redirectUri = readConnectorsOauthRedirectUri()
     const tokens = await exchangeFeishuCode({
@@ -622,6 +641,103 @@ async function handleOauthCallback(
     ctx.log.warn('connector_oauth_exchange_failed', {
       provider,
       code: err instanceof ConnectorError ? err.code : 'INTERNAL',
+    })
+    sendRedirect(res, connectorErrorRedirect(codeOut))
+  }
+}
+
+// ─── 声明式 oauth2 回调分支(共用上面那条回调路由的四因子消费结果) ─────────────
+
+interface DeclarativeOauthInput {
+  /** pending 行里的 provider(= listing slug,DB 事实)。 */
+  provider: string
+  versionId: number
+  userId: number
+  draft: OauthDraft
+  /** 授权回跳带回的一次性 authorization code。 */
+  code: string
+  pool: Pool
+  deps: CommercialHttpDeps
+}
+
+/**
+ * 声明式 oauth2-auth-code 收尾:载入即验签 → code 换 token(发 sole token origin)→ 组落库袋 →
+ * bindWithBag(identity 探针 + 加密落 pin 连接)→ 302。
+ *
+ * 凭据流向(全链不落日志、不回显、不进 URL):
+ *   - `code` / `client_secret` / `pkceVerifier`:**只**进 exchangeAuthCode 发往 token origin 的
+ *     form body / basic-auth 头(受众隔离由 contract.credentialAudiencePolicy 在引擎里硬校验);
+ *   - 换回的 access_token(+ refresh_token,若上游给)与 client_id/client_secret 一起进**加密**凭据袋
+ *     落库(AEAD,AAD 绑 user+slug);
+ *   - 任何失败只回**稳定错误码**,绝不回显凭据或上游原文(exchangeAuthCode 内已做脱敏出口)。
+ */
+async function completeDeclarativeOauth(
+  res: ServerResponse,
+  ctx: RequestContext,
+  input: DeclarativeOauthInput,
+): Promise<void> {
+  const { provider, draft, pool } = input
+  try {
+    const redirectUri = readConnectorsOauthRedirectUri()
+    // 载入即验签(4 闸 fail-closed:kind/审核态/未 revoke/hash+签名+policy)。
+    const meta = await loadVerifiedContractWithMeta(input.versionId, pool)
+    if (meta.contract.authMode !== 'oauth2-auth-code')
+      throw new ConnectorError('BAD_REQUEST', 'pinned connector is not oauth2-auth-code')
+    // pending 行的 provider 必须 == 契约 slug(两者都是 DB 事实;不等 = 数据错配,fail-closed)。
+    if (meta.slug !== provider)
+      throw new ConnectorError('BAD_REQUEST', 'pending provider does not match contract slug')
+
+    const tokens = await exchangeAuthCode({
+      contract: meta.contract,
+      code: input.code,
+      clientId: draft.clientId,
+      clientSecret: draft.clientSecret,
+      redirectUri,
+      pkceVerifier: draft.pkceVerifier,
+      ...(input.deps.connectorEngineDeps ? { deps: input.deps.connectorEngineDeps } : {}),
+    })
+
+    // 落库袋 = storedBagSources('oauth2-auth-code'):access_token + client_id + client_secret
+    // (+ refresh_token 若上游下发)。client_secret 留袋供日后 refresh 轮换,但**永不**进
+    // ResolvedCredentials(placement 层结构上拿不到它)。
+    const bag: DeclarativeSecretBag = {
+      access_token: tokens.accessToken,
+      client_id: draft.clientId,
+      client_secret: draft.clientSecret,
+      ...(tokens.refreshToken ? { refresh_token: tokens.refreshToken } : {}),
+    }
+    const bound = await bindWithBag(
+      {
+        userId: input.userId,
+        meta,
+        bag,
+        displayName: draft.displayName,
+        ...(input.deps.connectorEngineDeps ? { deps: input.deps.connectorEngineDeps } : {}),
+      },
+      pool,
+    )
+    ctx.log.info('connector_declarative_oauth_linked', {
+      sub: String(input.userId),
+      provider,
+      versionId: input.versionId,
+      connectionId: bound.connectionId,
+      rebound: bound.rebound,
+    })
+    sendRedirect(res, `/?connector_linked=${encodeURIComponent(provider)}`)
+  } catch (err) {
+    // 稳定码,不泄上游/内部细节:ConnectorError → wire 映射;契约层错误(被 revoke/验签失败等)
+    // → 统一 CONNECTOR_UNAVAILABLE(不把审核状态机的内部态透给浏览器);其余 → TOKEN_EXCHANGE_FAILED。
+    const codeOut =
+      err instanceof ConnectorError
+        ? wireErrorCode(err.code, 'oauth')
+        : err instanceof ConnectorSpecError
+          ? 'CONNECTOR_UNAVAILABLE'
+          : 'TOKEN_EXCHANGE_FAILED'
+    ctx.log.warn('connector_declarative_oauth_failed', {
+      provider,
+      versionId: input.versionId,
+      code:
+        err instanceof ConnectorError || err instanceof ConnectorSpecError ? err.code : 'INTERNAL',
     })
     sendRedirect(res, connectorErrorRedirect(codeOut))
   }
