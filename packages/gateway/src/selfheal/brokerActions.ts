@@ -39,9 +39,29 @@ export interface RunResult {
   stderr: string
 }
 
+/** Optional per-command execution controls. */
+export interface RunOpts {
+  /** Drop the child process to this uid. Set for steps that execute
+   *  candidate-controlled code (verify layers, bundle export) so they run as the
+   *  unprivileged `ocheal`, never root. Omitted ⇒ inherit the broker's uid. */
+  uid?: number
+  /** Drop the child process to this gid (paired with {@link RunOpts.uid}). */
+  gid?: number
+  /** Working directory for the child. */
+  cwd?: string
+  /** Explicit child environment (replaces inheritance). Security-sensitive
+   *  callers pass a curated, secret-free env; the default runner additionally
+   *  scrubs `OC_SELFHEAL_*` whenever a uid drop is requested. */
+  env?: NodeJS.ProcessEnv
+}
+
 /** Injectable, shell-free command runner. Args MUST be passed as an array (no
- *  string interpolation, no shell) — this is a security invariant. */
-export type CommandRunner = (cmd: string, args: string[]) => Promise<RunResult>
+ *  string interpolation, no shell) — this is a security invariant. The optional
+ *  {@link RunOpts} lets security-sensitive callers drop privileges (uid/gid) and
+ *  set a cwd; the default runner also scrubs `OC_SELFHEAL_*` secrets from the
+ *  child env whenever a uid drop is requested, so de-privileged candidate code
+ *  can never read the verification HMAC / capability keys. */
+export type CommandRunner = (cmd: string, args: string[], opts?: RunOpts) => Promise<RunResult>
 
 export interface BrokerActionExecContext {
   run: CommandRunner

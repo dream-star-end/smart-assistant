@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
+import type { CommandRunner, RunOpts, RunResult } from '../selfheal/brokerActions.js'
 import {
   type VerificationResult,
   loadSignedVerification,
@@ -30,16 +30,19 @@ function baseResult(over: Partial<VerificationResult> = {}): VerificationResult 
 
 function stubRunner(handler: (cmd: string, args: string[]) => Partial<RunResult> | undefined): {
   run: CommandRunner
-  calls: { cmd: string; args: string[] }[]
+  calls: { cmd: string; args: string[]; opts?: RunOpts }[]
 } {
-  const calls: { cmd: string; args: string[] }[] = []
-  const run: CommandRunner = async (cmd, args) => {
-    calls.push({ cmd, args })
+  const calls: { cmd: string; args: string[]; opts?: RunOpts }[] = []
+  const run: CommandRunner = async (cmd, args, opts) => {
+    calls.push({ cmd, args, opts })
     const r = handler(cmd, args) ?? {}
     return { code: r.code ?? 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
   }
   return { run, calls }
 }
+
+const OCHEAL_UID = 997
+const OCHEAL_GID = 998
 
 describe('verifier signing', () => {
   it('stableStringify is key-order independent', () => {
@@ -80,29 +83,41 @@ describe('verifier.verify orchestration', () => {
     rmSync(cwd, { recursive: true, force: true })
   })
 
-  it('runs install + 4 layers, signs, and persists a loadable result on success', async () => {
+  it('runs install + 4 layers de-privileged, signs, and persists a loadable result', async () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const wt = join(cwd, '.verify')
     const out = await verify({
       repairId: 'v2',
       sha: 'd'.repeat(40),
       clonePath: cwd,
-      worktreeDir: join(cwd, '.verify'),
+      ochealUid: OCHEAL_UID,
+      ochealGid: OCHEAL_GID,
+      worktreeDir: wt,
       verificationDir: vdir,
       signingKey: KEY,
       run,
     })
     assert.equal(out.signed.result.allPassed, true)
-    // worktree add, then install, then the 4 layers = 6 runner calls
+    // worktree add first, then install, then the 4 layers = 6 runner calls.
     assert.equal(calls[0]!.cmd, 'git')
     assert.ok(calls[0]!.args.includes('worktree'))
+    assert.ok(calls[0]!.args.includes('core.hooksPath=/dev/null'), 'checkout hooks must be disabled')
     const npmScripts = calls.filter((c) => c.cmd === 'npm').map((c) => c.args.join(' '))
-    assert.deepEqual(npmScripts, [
-      `--prefix ${join(cwd, '.verify')} ci`,
-      `--prefix ${join(cwd, '.verify')} run lint`,
-      `--prefix ${join(cwd, '.verify')} run typecheck`,
-      `--prefix ${join(cwd, '.verify')} run test:gateway`,
-      `--prefix ${join(cwd, '.verify')} run test:web`,
-    ])
+    assert.deepEqual(npmScripts, ['ci', 'run lint', 'run typecheck', 'run test:gateway', 'run test:web'])
+    // SECURITY (BLOCKER1 regression fence): EVERY candidate-executing command must
+    // drop to ocheal with a curated, secret-free env; npm layers run in the clean
+    // worktree via cwd. If a future change runs any of these as root, this fails.
+    for (const c of calls) {
+      assert.equal(c.opts?.uid, OCHEAL_UID, `${c.cmd} ${c.args[0]} must run as ocheal, not root`)
+      assert.equal(c.opts?.gid, OCHEAL_GID)
+      assert.ok(
+        c.opts?.env && !Object.keys(c.opts.env).some((k) => k.startsWith('OC_SELFHEAL_')),
+        'no OC_SELFHEAL_* secret may reach de-privileged candidate code',
+      )
+    }
+    for (const c of calls.filter((c) => c.cmd === 'npm')) {
+      assert.equal(c.opts?.cwd, wt, 'npm layers must run in the clean worktree')
+    }
     // Persisted + loadable + signature valid.
     const loaded = loadSignedVerification('v2', vdir)
     assert.equal(verifySignature(loaded, KEY), true)
@@ -118,6 +133,8 @@ describe('verifier.verify orchestration', () => {
       repairId: 'v3',
       sha: 'e'.repeat(40),
       clonePath: cwd,
+      ochealUid: OCHEAL_UID,
+      ochealGid: OCHEAL_GID,
       worktreeDir: join(cwd, '.verify'),
       verificationDir: vdir,
       signingKey: KEY,

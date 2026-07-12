@@ -1,24 +1,40 @@
 /**
- * Self-heal verifier — independent clone + four-layer test + signed result.
+ * Self-heal verifier — independent clone + de-privileged advisory verification.
  *
- * The verifier is a ROOT/broker-side facility. It:
+ * The verifier is a ROOT/broker-side ORCHESTRATOR, but it NEVER executes
+ * candidate-controlled code as root. It:
  *   1. `prepareClone` — builds `/home/ocheal/selfheal/<repairId>`, an INDEPENDENT
  *      clone of the canonical v5 checkout, chowned to `ocheal`, with the origin
  *      remote removed (no writable path back to canonical). The unprivileged
  *      codex commits inside this clone; canonical `.git` stays root-owned and is
  *      never writable by ocheal.
- *   2. `verify` — reconstructs a CLEAN tree at a candidate SHA (a git worktree of
- *      the committed sha, ignoring any dirty state) and runs the four test layers
- *      (lint / typecheck / gateway tests / web tests). It emits an HMAC-signed
- *      {@link SignedVerification}. The signing key (OC_SELFHEAL_VERIFY_HMAC) lives
- *      only in the root broker/gateway env and is scrubbed from the codex
- *      subprocess env, so ocheal cannot forge a passing verification.
+ *   2. `verify` — reconstructs a clean tree at a candidate SHA and runs the four
+ *      layers (lint / typecheck / gateway / web tests). CRITICAL: every command
+ *      that touches candidate-controlled content (the worktree checkout, `npm ci`
+ *      and every `npm run` — all of which run scripts / hooks the candidate can
+ *      edit) is spawned DE-PRIVILEGED as `ocheal` (uid/gid drop) with git hooks
+ *      disabled and `OC_SELFHEAL_*` scrubbed from its env. A hostile candidate
+ *      therefore gains at most `ocheal` (exactly what codex already has) — no
+ *      root RCE, and it can never read the verification HMAC to forge a result.
  *
- * The broker's Tier2 cutover trusts ONLY a valid signature over `allPassed:true`
- * plus its own canonical-ancestry check — never codex's word.
+ *      The root orchestrator observes the real exit codes and emits an
+ *      HMAC-signed {@link SignedVerification}. Because the HMAC key lives only in
+ *      the root env (scrubbed from every de-privileged child), ocheal cannot
+ *      fabricate a signed verification.
+ *
+ * TRUST MODEL — read carefully. `allPassed` is ADVISORY, NOT a security gate on
+ * its own: a candidate controls its own package.json scripts and can make any
+ * layer `exit 0`. So a valid signature proves only "the root broker ran these
+ * layers de-privileged and observed exit 0" — it does NOT prove real tests ran.
+ * The REAL cutover trust anchors (enforced by the broker) are:
+ *   (a) canonical ancestry — checked by root git against the trusted canonical
+ *       repo, importing candidate objects via an inert bundle (no upload-pack /
+ *       hook execution against the untrusted clone); and
+ *   (b) the human one-click release gate (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0).
+ * `allPassed` gates cutover only as a soft precondition on top of (a)+(b).
  *
  * All external commands go through an injectable {@link CommandRunner} so this
- * module is unit-testable without real git/npm.
+ * module is unit-testable without real git/npm or a real uid drop.
  */
 
 import { execFile } from 'node:child_process'
@@ -26,17 +42,37 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createLogger } from '../logger.js'
-import type { CommandRunner, RunResult } from './brokerActions.js'
+import type { CommandRunner, RunOpts, RunResult } from './brokerActions.js'
 
 const log = createLogger({ module: 'selfheal-verifier' })
 
-/** Default shell-free command runner (execFile — args as array, no shell). */
-export const defaultCommandRunner: CommandRunner = (cmd, args) =>
+/** Default shell-free command runner (execFile — args as array, no shell).
+ *  Honors {@link RunOpts}: uid/gid drop, cwd, and an explicit child env. Whenever
+ *  a uid drop is requested it ALSO scrubs every `OC_SELFHEAL_*` var from the
+ *  child env (defense in depth, even if the caller passed a broad env) so a
+ *  de-privileged candidate can never read the verification HMAC / capability
+ *  secrets. */
+export const defaultCommandRunner: CommandRunner = (cmd, args, opts) =>
   new Promise<RunResult>((resolve) => {
+    let env: NodeJS.ProcessEnv | undefined = opts?.env
+    if (opts?.uid !== undefined) {
+      const base: NodeJS.ProcessEnv = { ...(opts?.env ?? process.env) }
+      for (const k of Object.keys(base)) {
+        if (k.startsWith('OC_SELFHEAL_')) delete base[k]
+      }
+      env = base
+    }
     execFile(
       cmd,
       args,
-      { maxBuffer: 32 * 1024 * 1024, timeout: 30 * 60 * 1000 },
+      {
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: 30 * 60 * 1000,
+        cwd: opts?.cwd,
+        uid: opts?.uid,
+        gid: opts?.gid,
+        env,
+      },
       (err, stdout, stderr) => {
         const code =
           err && typeof (err as NodeJS.ErrnoException & { code?: number }).code === 'number'
@@ -87,8 +123,12 @@ export interface VerificationResult {
   sha: string
   clonePath: string
   layers: VerificationLayerResult[]
-  /** True only when every test layer (and install) passed. This is the single
-   *  fact the broker gates cutover on. */
+  /** True when every layer (and install) exited 0, as observed by the root
+   *  orchestrator running them DE-PRIVILEGED. ADVISORY only: a candidate controls
+   *  its own package.json scripts and can force `exit 0`, so this is NOT a
+   *  sufficient cutover gate on its own (the broker's real gate is canonical
+   *  ancestry + the human release). It is surfaced to inform that decision and
+   *  used as a soft precondition. */
   allPassed: boolean
   verifiedAt: string
 }
@@ -207,6 +247,14 @@ export interface VerifyOpts {
   repairId: string
   sha: string
   clonePath: string
+  /** Uid the candidate-executing steps (worktree checkout, `npm ci`, every test
+   *  layer) drop to. REQUIRED — these run candidate-controlled scripts/hooks and
+   *  must NEVER run as root. In production this is the `ocheal` uid. */
+  ochealUid: number
+  /** Gid paired with {@link VerifyOpts.ochealUid}. */
+  ochealGid: number
+  /** HOME for the de-privileged steps (npm cache etc.). Default /home/ocheal. */
+  ochealHome?: string
   /** Where to materialize the clean tree for the sha (git worktree). Default:
    *  `${clonePath}.verify`. */
   worktreeDir?: string
@@ -234,27 +282,45 @@ function verificationDirOf(opts: VerifyOpts): string {
 }
 
 /**
- * Reconstruct a clean tree at `sha` and run the four test layers. Produces an
- * HMAC-signed result and persists it (root-owned, 0600) so the broker can load
- * + verify it. A failed layer short-circuits the rest (allPassed=false).
+ * Reconstruct a clean tree at `sha` and run the layers DE-PRIVILEGED (as ocheal).
+ * Every step here executes candidate-controlled content (checkout hooks, npm
+ * scripts), so none of it runs as root. The root orchestrator observes the exit
+ * codes, signs the result (root-only HMAC), and persists it (root-owned, 0600).
+ * A failed layer short-circuits the rest (allPassed=false — advisory; see file
+ * header for why allPassed is not a standalone cutover gate).
  */
 export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
   const run = opts.run ?? defaultCommandRunner
   const worktreeDir = opts.worktreeDir ?? `${opts.clonePath}.verify`
   const layers = opts.layers ?? DEFAULT_VERIFICATION_LAYERS
   const installStep = opts.installStep === undefined ? DEFAULT_INSTALL_STEP : opts.installStep
+  // Every candidate-executing command drops to ocheal with a curated, secret-free
+  // env (the runner additionally scrubs OC_SELFHEAL_* as a second line of defense).
+  const deprivOpts: RunOpts = {
+    uid: opts.ochealUid,
+    gid: opts.ochealGid,
+    env: curatedChildEnv(opts.ochealHome ?? '/home/ocheal'),
+  }
 
-  // Clean checkout of the committed sha — ignores any dirty/uncommitted state
-  // in the clone. `--detach` so we never move a branch ref.
-  const wt = await run('git', [
-    '-C',
-    opts.clonePath,
-    'worktree',
-    'add',
-    '--detach',
-    worktreeDir,
-    opts.sha,
-  ])
+  // Clean checkout of the committed sha — ignores any dirty/uncommitted state in
+  // the clone. `--detach` so we never move a branch ref. Git hooks are disabled
+  // AND the checkout runs as ocheal, so a hostile clone-side post-checkout hook
+  // can neither run as root nor run at all.
+  const wt = await run(
+    'git',
+    [
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-C',
+      opts.clonePath,
+      'worktree',
+      'add',
+      '--detach',
+      worktreeDir,
+      opts.sha,
+    ],
+    deprivOpts,
+  )
   if (wt.code !== 0) {
     throw new Error(`worktree add failed (code ${wt.code}): ${wt.stderr.slice(0, 500)}`)
   }
@@ -264,10 +330,7 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
   let allPassed = true
   for (const layer of steps) {
     const started = Date.now()
-    const r = await run(
-      layer.cmd,
-      layer.cmd === 'npm' ? withCwd(layer.args, worktreeDir) : layer.args,
-    )
+    const r = await run(layer.cmd, layer.args, { ...deprivOpts, cwd: worktreeDir })
     const ok = r.code === 0
     results.push({
       name: layer.name,
@@ -303,11 +366,16 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
   return { verificationRef, signed }
 }
 
-/** npm scripts must run in the clean tree, not the broker cwd. */
-function withCwd(args: string[], cwd: string): string[] {
-  // `npm --prefix <dir> run <script>` runs the script from <dir>. Simpler and
-  // more robust than relying on process cwd for the injected runner.
-  return ['--prefix', cwd, ...args]
+/** Minimal, secret-free env for the de-privileged verification steps. An
+ *  allowlist (not a denylist) so no root secret leaks into candidate code; HOME
+ *  points at ocheal's home so npm has a writable cache. */
+function curatedChildEnv(home: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { HOME: home }
+  for (const k of ['PATH', 'LANG', 'LC_ALL', 'TZ', 'TERM']) {
+    const v = process.env[k]
+    if (v !== undefined) env[k] = v
+  }
+  return env
 }
 
 /** Load a persisted signed verification by ref (broker side, cutover gate). */

@@ -10,13 +10,19 @@
  *            fixed shell-free commands, audit log.
  *
  *   Tier2  — production cutover: `{ sha, verificationRef }`. The broker trusts
- *            NOTHING codex says — it (a) loads the root-signed verification and
- *            checks its HMAC + `allPassed` + sha/repairId match, (b) verifies
- *            the sha is a descendant of the canonical branch, (c) requires the
- *            global deploy flock, then runs a SELF-HELD trusted deploy driver
- *            (never a script from the candidate clone). `OC_SELFHEAL_AUTO_DEPLOY
- *            _TIER2` defaults to 0 ⇒ the request is recorded + notified as
- *            "pending release", NOT executed; only =1 auto-cuts-over.
+ *            NOTHING codex says. Its REAL gate is (a) canonical ancestry — the
+ *            sha must descend from the canonical branch, checked by root git in
+ *            the TRUSTED canonical repo after importing the candidate objects via
+ *            an INERT bundle (root never runs git in the untrusted clone, so a
+ *            hostile `core.fsmonitor` / hook / upload-pack config can't execute);
+ *            plus (b) the human one-click release — `OC_SELFHEAL_AUTO_DEPLOY_TIER2`
+ *            defaults to 0 ⇒ the request is recorded + notified as "pending
+ *            release", NOT executed; only =1 auto-cuts-over. The root-signed
+ *            verification (HMAC + `allPassed` + sha/repairId match) is a SOFT
+ *            precondition only: `allPassed` is advisory (a candidate controls its
+ *            own test scripts), so it never substitutes for (a)+(b). When it does
+ *            deploy, it runs a SELF-HELD trusted deploy driver under the global
+ *            deploy flock — never a script from the candidate clone.
  *
  * Idempotency: every request is keyed by `repairId:actionKind`. A recorded
  * side-effecting outcome is replayed from the ledger instead of re-executing
@@ -32,6 +38,7 @@ import {
   type BrokerActionDef,
   BrokerActionError,
   type CommandRunner,
+  type RunOpts,
   TIER1_ACTIONS,
 } from './brokerActions.js'
 import {
@@ -121,8 +128,13 @@ export type DeployDriver = (sha: string, ctx: { log: Logger }) => Promise<Broker
 export interface SelfhealBrokerOpts {
   socketPath: string
   /** Numeric gid ocheal belongs to; used to chown the socket so ocheal can
-   *  connect. When omitted, socket ACL is left to the caller (tests). */
+   *  connect, and to de-privilege the bundle-export step of the ancestry check.
+   *  When omitted, socket ACL is left to the caller (tests). */
   ochealGid?: number
+  /** Numeric uid of ocheal. Required in production for the cutover ancestry
+   *  check: the candidate-object bundle is exported AS ocheal so root never runs
+   *  git in the untrusted clone. Omitted only in tests (which inject `run`). */
+  ochealUid?: number
   ledger?: BrokerLedger
   actions?: Record<string, BrokerActionDef>
   run?: CommandRunner
@@ -160,6 +172,8 @@ export class SelfhealBroker {
   private readonly canonicalRepo: string
   private readonly canonicalBranch: string
   private readonly ochealSelfhealRoot: string
+  private readonly ochealUid?: number
+  private readonly ochealGid?: number
   private readonly autoDeployTier2: boolean
 
   constructor(private readonly opts: SelfhealBrokerOpts) {
@@ -170,6 +184,8 @@ export class SelfhealBroker {
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
     this.canonicalBranch = opts.canonicalBranch ?? 'feat/v5-aurora-rewrite'
     this.ochealSelfhealRoot = opts.ochealSelfhealRoot ?? '/home/ocheal/selfheal'
+    this.ochealUid = opts.ochealUid
+    this.ochealGid = opts.ochealGid
     this.autoDeployTier2 = opts.autoDeployTier2 ?? process.env.OC_SELFHEAL_AUTO_DEPLOY_TIER2 === '1'
   }
 
@@ -334,7 +350,9 @@ export class SelfhealBroker {
       return this.rejectCutover(req, 'invalid verificationRef')
     }
 
-    // (a) Trust the ROOT-signed verification, never codex's claim.
+    // (a) SOFT precondition: a root-signed verification (ocheal can't forge it —
+    //     no HMAC key in its env) whose sha/repairId match and whose advisory
+    //     `allPassed` is true. NOT a standalone trust anchor — see (b).
     let signed: SignedVerification
     try {
       signed = loadSignedVerification(verificationRef, this.opts.verificationDir)
@@ -355,8 +373,10 @@ export class SelfhealBroker {
       return this.rejectCutover(req, 'verification did not pass all layers')
     }
 
-    // (b) Ancestry: sha must descend from the canonical branch (broker's own
-    //     check against the trusted canonical repo).
+    // (b) REAL trust anchor #1: sha must descend from the canonical branch —
+    //     broker's own check in the trusted canonical repo (inert bundle import,
+    //     no code from the untrusted clone ever runs). Combined with (c) the
+    //     human release, this is what actually gates a deploy.
     const ancestor = await this.checkCanonicalAncestry(req.repairId, sha)
     if (!ancestor) {
       return this.rejectCutover(req, 'sha is not a descendant of the canonical branch')
@@ -394,35 +414,94 @@ export class SelfhealBroker {
   }
 
   /**
-   * Import the candidate objects from the ocheal clone into the trusted
-   * canonical repo (without running the candidate repo's hooks), then check
-   * that the canonical branch is an ancestor of the sha.
+   * Verify `sha` descends from the canonical branch WITHOUT root ever running git
+   * inside the untrusted ocheal clone (a hostile clone config can execute code —
+   * core.fsmonitor, upload-pack / pack-objects hooks). Instead:
+   *   1. ocheal (de-privileged) pins the sha under a ref and exports it to an
+   *      INERT bundle file;
+   *   2. root imports that bundle into the TRUSTED canonical repo — a bundle is a
+   *      static pack, so no upload-pack and no hook from the clone ever runs;
+   *   3. root runs the ancestry check entirely inside the canonical repo.
+   * Any failure ⇒ fail closed (return false).
    */
   private async checkCanonicalAncestry(repairId: string, sha: string): Promise<boolean> {
     const clonePath = join(this.ochealSelfhealRoot, repairId)
-    // Import objects. `-c uploadpack.packObjectsHook=` best-effort neutralizes a
-    // hostile clone-side pack hook; block C hardening may switch to bundle
-    // import. Fetch failure ⇒ we cannot verify ancestry ⇒ fail closed.
-    const fetch = await this.run('git', [
-      '-C',
-      this.canonicalRepo,
+    const bundlePath = `${clonePath}.import.bundle`
+    const exportRef = `refs/selfheal/export/${repairId}`
+
+    // Fail closed: in production (default runner, no injected mock) the export
+    // MUST drop to ocheal — otherwise root git would run in the untrusted clone.
+    if (this.opts.run === undefined && this.ochealUid === undefined) {
+      this.log.error('cutover ancestry requires ochealUid in production', { repairId })
+      return false
+    }
+    const asOcheal: RunOpts | undefined =
+      this.ochealUid !== undefined && this.ochealGid !== undefined
+        ? { uid: this.ochealUid, gid: this.ochealGid }
+        : undefined
+    // Neutralize code-executing config on the clone side too (these already run
+    // as ocheal — defense in depth + determinism).
+    const cloneGuards = [
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-c',
+      'core.fsmonitor=',
       '-c',
       'uploadpack.packObjectsHook=',
-      'fetch',
-      '--no-tags',
-      '--no-recurse-submodules',
-      clonePath,
-      `+${sha}:refs/selfheal/import/${repairId}`,
-    ])
-    if (fetch.code !== 0) {
-      this.log.warn('cutover object import failed', {
+    ]
+
+    // 1a. Pin the sha under a ref we control (also fails closed if sha is absent).
+    const ref = await this.run(
+      'git',
+      [...cloneGuards, '-C', clonePath, 'update-ref', exportRef, sha],
+      asOcheal,
+    )
+    if (ref.code !== 0) {
+      this.log.warn('cutover export ref failed', {
         repairId,
-        code: fetch.code,
-        stderr: fetch.stderr.slice(0, 500),
+        code: ref.code,
+        stderr: ref.stderr.slice(0, 300),
       })
       return false
     }
+    // 1b. Export that ref to an inert bundle (as ocheal).
+    const bundle = await this.run(
+      'git',
+      [...cloneGuards, '-C', clonePath, 'bundle', 'create', bundlePath, exportRef],
+      asOcheal,
+    )
+    if (bundle.code !== 0) {
+      this.log.warn('cutover bundle export failed', {
+        repairId,
+        code: bundle.code,
+        stderr: bundle.stderr.slice(0, 300),
+      })
+      return false
+    }
+    // 2. Import the inert bundle into the TRUSTED canonical repo (root, hooks off).
+    const imp = await this.run('git', [
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-C',
+      this.canonicalRepo,
+      'fetch',
+      '--no-tags',
+      '--no-recurse-submodules',
+      bundlePath,
+      `+${exportRef}:refs/selfheal/import/${repairId}`,
+    ])
+    if (imp.code !== 0) {
+      this.log.warn('cutover object import failed', {
+        repairId,
+        code: imp.code,
+        stderr: imp.stderr.slice(0, 500),
+      })
+      return false
+    }
+    // 3. Ancestry check, entirely inside the trusted canonical repo.
     const anc = await this.run('git', [
+      '-c',
+      'core.hooksPath=/dev/null',
       '-C',
       this.canonicalRepo,
       'merge-base',
