@@ -201,7 +201,9 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | `packages/web-react` 前端 | dist 静态资源 | **`deploy-v5.sh --dist`**(vite build + 竞态安全 rsync + 资产 GC + restart + 版本握手 smoke);SPA 缓存必重启 |
 | **管理后台**(`packages/web-react/src/admin/**`,admin.html 第二 Vite 入口,2026-07-10 起) | dist 静态资源 | 同上 `--dist`;vanilla admin(web/public/admin.js)与 gateway legacy 透传已删,`?v=` 戳/bump-version 不再涉 v5 |
 | 告警脚本(`scripts/v5-monitor.sh`/`v5-daily-check.sh`/`v5-alert-fanout.sql`/`v5-alert-fail.sh`) | kl-mirror 脚本树 | 随 deploy rsync 即生效;**systemd 单元(deploy/v5/)仍手动 cp+daemon-reload**(alert-fail@ 模板免 enable) |
-| 容器内 gateway/CCB/baseline skill/entrypoint(packages/gateway、claude-code-best、agent-sandbox/runtime、ccb-baseline*) | **runtime image** | 重建镜像+切 tag(§4.3);纯 baseline skill 例外:bind-mount 源码树,rsync 即生效 |
+| 容器内 gateway/CCB/storage/protocol/mcp-memory 源码 | **runtime source release**(feat/v5-runtime-hotcfg 起) | deploy 自动构建 release(content digest 命名)+ tuple 激活;存量容器 runtimeStale 滚动(重连秒级/idle≤30min)。**启用前提:env 已有 OC_RUNTIME_RELEASE 或 deploy `--enable-runtime-release` 首次开启;未启用=旧行为(重建镜像)** |
+| 平台配置(agent-sandbox/platform-runtime/**:oc-* 薄壳、entrypoint.ts、seed 声明/persona/种子技能、prompts 文案) | **platform bundle** | deploy 自动打 bundle(digest 命名+current 原子翻转);bin/prompts **真热**(存量容器立即),entrypoint/seed 走 boot_hash 滚动。启用开关同上(`--enable-platform-bundle`)。baseline skill(ccb-baseline*)机制不变:rsync 即生效 |
+| 工具链(Dockerfile:apt/pip/Quarto/Typst/codex CLI pin/Chromium/sudoers) | **runtime image**(纯工具链面) | 重建镜像+切 tag(§4.3);v5 生产 build 传 `OC_EMBED_SOURCE=0`(瘦身,源码走 release 挂载);重建后必须刷新 emergency tuple(§4.3) |
 | `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
 | `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
 | `packages/commercial/src/db/migrations/*.sql` | 共享 PG | AUTO_MIGRATE=0 → **人工受控 apply**(§4.5) |
@@ -272,6 +274,16 @@ cutover manifest，也不要求新 migration。仅真正紧急人工维护可为
 `OC_BREAK_GLASS_OFFLINE_RECYCLE=I_ACCEPT_V5_OUTAGE`；它不能绕过数据库兼容性禁令。
 
 ### 4.3 runtime image 重建
+
+> **runtime tuple(feat/v5-runtime-hotcfg 起)**:激活/回滚原子单元 =
+> {OC_RUNTIME_IMAGE(_ID), OC_RUNTIME_RELEASE, OC_PLATFORM_BUNDLE},由 deploy 激活 saga
+> 统一写入 env + `/etc/openclaude/runtime-tuple.history`(带 checksum),回滚=翻上一条
+> committed tuple(`deploy-v5.sh --rollback`),**禁止手改单个键**。stale 判定按 image
+> **immutable ID**(同 tag 重指新镜像不会漏判)。镜像重建从"每个功能批次"降到
+> "工具链变更时";重建后跑 `deploy-v5.sh --emergency-tuple` 刷新 break-glass 记账
+> (emergency = 完整 pinned tuple,含内嵌源码镜像,兼容性破坏变更必须刷新+smoke)。
+> release/bundle GC 保护集含运行容器 label 引用,docker 不可用即放弃本轮 GC。
+
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun
 ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin:$PATH \
@@ -343,6 +355,10 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
 | ~~org 订阅期内桶~~ **已偿还**(二期 8a4c14a9,0115) | 四桶+席位订阅(org-pro/max/ultra 9折池化)+自助开通+席位闸 | — |
+| 远端 host release/bundle 分发 | runtime release/platform bundle 仅本机(kl-mirror);多机硬门:OC_RUNTIME_RELEASE 非空+非 self-host placement → 调度前拒 provision+告警(v3supervisor 带测试) | 新增 compute host 时做 rsync 分发(与 baseline REMOTE_HOST_CCB_BASELINE_DIR 推送同构)+node-agent inspect 契约补 imageId/labels |
+| 模型权威独立批次(P2c+seed model) | 模型目录 master 下发(ModelExecutionCatalog:bridge 授权/engine 分类/计费编排/容器执行同快照消费,per-uid 过滤,enabled=false fail-closed)+seed agent model/engine 声明化(bridge 按容器实际 seed revision 推导);设计审 R1-B5/R2-B1 裁定不与镜像瘦身同批 —— **在此之前 platform-seed.yaml 禁放 model/engine/provider 键(schema 硬拒),模型面改动仍走 protocol 常量+release 滚动** | 下一个模型/计费面批次单独设计单独 Codex 审 |
+| SupervisorErrorCode 无平台专用码 | platform bundle/release/多机门校验失败统一映射 InvalidArgument(ensureRunning 短重试,功能正确但运维信号不如 CcbBaselineMissing 清晰) | 首次生产遇到 bundle 校验失败排障时加专用码+critical 告警 |
+| env.bak 无轮转 | 激活 saga 每次 cp env env.bak-<ts>,/etc/openclaude 缓慢累积 | 目录文件数>50 时加保留最近 10 份的清理 |
 | 知识库 org 化 | research_documents/artifacts 租户主键 (user_id,doc_id) + 引用权威链须跨 user 重构 | P3.1 稳定后单独立项 |
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |

@@ -1,5 +1,5 @@
 /**
- * 3A-1: 验证 packages/commercial/agent-sandbox/runtime/entrypoint.ts 的环境
+ * 3A-1: 验证 packages/commercial/agent-sandbox/platform-runtime/entrypoint/entrypoint.ts 的环境
  * 变量清洗策略与 personal-version `isProviderManagedEnvVar` helper 一致。
  *
  * 这个测试**不**真的跑 entrypoint.ts(它依赖容器内绝对路径 + npm 子进程,
@@ -29,12 +29,16 @@ import { REVIEW_VERDICTS } from "@openclaude/protocol";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// runtime hotcfg:entrypoint 迁 platform-runtime/entrypoint/(bundle 源);SCIENTIST 种子内容 /
+// persona 文案 / seed 声明已外置为文件(见 entrypointPlatform.test.ts 的行为断言)。本文件继续守
+// entrypoint.ts **源码里保留的机制**(env scrub / 计费常量 / merge 逻辑 / buildSeedAgent 装配)。
 const ENTRYPOINT_TS_PATH = join(
   __dirname,
   "..",
   "..",
   "agent-sandbox",
-  "runtime",
+  "platform-runtime",
+  "entrypoint",
   "entrypoint.ts",
 );
 
@@ -113,11 +117,8 @@ function readRetainKeysFromSource(): Set<string> {
   return keys;
 }
 
-function extractConstObjectFromSource(src: string, name: string): string {
-  const m = src.match(new RegExp(String.raw`const ${name} = \{([\s\S]*?)\n  \};`));
-  if (!m) throw new Error(`${name} object not found in entrypoint.ts`);
-  return m[0]!;
-}
+// runtime hotcfg:desiredXAgent 不再是内联对象字面量(改由 buildSeedAgent 装配 yaml 声明 + billing
+// 常量),extractConstObjectFromSource 随之退役;seed 对象结构的行为断言见 entrypointPlatform.test.ts。
 
 const expect = (actual: unknown) => ({
   toBe: (expected: unknown) => assert.strictEqual(actual, expected),
@@ -287,30 +288,39 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     // 纯市场 + M1b codex 复活 + 团队模式隐藏审查员:
     // 初始 agents.yaml 只 seed main + codex + hidden-reviewer。其它用户可见 agent 一律走市场安装。
+    // 纯市场 + M1b codex 复活 + 团队模式隐藏审查员:seed 装配恰为 main + codex + hidden-reviewer。
+    // runtime hotcfg 后:非计费字段(persona/permissionMode/displayName/toolsets)来自 platform-seed.yaml
+    // (见 entrypointPlatform.test.ts),此处只守 entrypoint **保留的计费/引擎权威注入** 与 seed 装配。
     assert.match(
       src,
-      /const desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\]/,
-      "v5 纯市场:initial agents.yaml must seed exactly main + codex + hidden reviewer (其它可见 agent 走市场安装)",
+      /desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\]/,
+      "v5 纯市场:seed 装配恰为 main + codex + hidden reviewer(其它可见 agent 走市场安装)",
     );
-    const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
-    assert.match(mainAgent, /id:\s*"main"/, "main agent id must be stable");
-    assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main must use DEFAULT model (glm-5.2)");
-    assert.match(mainAgent, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "main must use DEFAULT provider (ark)");
-    assert.match(mainAgent, /permissionMode:\s*"bypassPermissions"/, "main must bypass permissions in the sandbox");
-    const hiddenReviewerAgent = extractConstObjectFromSource(src, "desiredHiddenReviewerAgent");
-    assert.match(hiddenReviewerAgent, /id:\s*"hidden-reviewer"/, "hidden reviewer id must be stable");
+    // 计费/引擎权威(model/provider)由 buildSeedAgent 的 billing 常量注入 —— 声明化禁迁(§4.1)。
+    assert.match(
+      src,
+      /buildSeedAgent\(\{\s*id:\s*"main",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_DEFAULT_MODEL[\s\S]*?provider:\s*COMMERCIAL_DEFAULT_PROVIDER/,
+      "main billing must inject DEFAULT model+provider (glm-5.2/ark) via buildSeedAgent",
+    );
     assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_MODEL\s*=\s*"glm-5\.2"/, "hidden reviewer model must pin GLM");
     assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER\s*=\s*"ark"/, "hidden reviewer provider must pin ark");
-    assert.match(hiddenReviewerAgent, /model:\s*COMMERCIAL_HIDDEN_REVIEWER_MODEL/, "hidden reviewer must use pinned GLM model");
-    assert.match(hiddenReviewerAgent, /provider:\s*COMMERCIAL_HIDDEN_REVIEWER_PROVIDER/, "hidden reviewer must use pinned ark provider");
-    assert.match(hiddenReviewerAgent, /permissionMode:\s*"bypassPermissions"/, "hidden reviewer must bypass permissions in the sandbox");
-    assert.match(hiddenReviewerAgent, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "hidden reviewer only needs core toolset");
-    assert.doesNotMatch(hiddenReviewerAgent, /\bsource\s*:/, "hidden reviewer must not be marked marketplace-visible");
+    assert.match(
+      src,
+      /buildSeedAgent\(\{\s*id:\s*"hidden-reviewer",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_HIDDEN_REVIEWER_MODEL[\s\S]*?provider:\s*COMMERCIAL_HIDDEN_REVIEWER_PROVIDER/,
+      "hidden reviewer billing must inject pinned GLM/ark via buildSeedAgent",
+    );
+    // 隐藏 agent 保留 id 修复路径(reserved-id repair)仍在 patchPlatformSeedAgent(merge 逻辑不迁)。
     assert.match(src, /desired\.id === "hidden-reviewer"/, "hidden reviewer must have a dedicated reserved-id repair path");
     assert.match(src, /"source", "cwd", "greeting", "mcpServers"/, "hidden reviewer repair must strip user/marketplace-controlled fields");
     assert.match(src, /delete next\[key\]/, "hidden reviewer repair must remove stale source/cwd/mcp fields");
     assert.match(src, /setField\("toolsets", desired\.toolsets\)/, "hidden reviewer repair must force core-only toolsets");
-    assert.match(src, /ensureAgentPersona\(\s*"hidden-reviewer"[\s\S]*\{\s*force:\s*true\s*\}/, "hidden reviewer persona file must be force-refreshed");
+    assert.match(
+      src,
+      /ensureAgentPersona\(\s*"hidden-reviewer",[\s\S]*?force:\s*hrDecl\?\.forcePersona \?\? true/,
+      "hidden reviewer persona must be force-refreshed (forcePersona 来自 yaml,默认 true)",
+    );
+    // 计费/引擎权威声明化回潮防线:desiredSeedAgents 装配处禁止内联 model/provider 到 yaml 侧。
+    // (validatePlatformSeed 已硬拒声明里出现 model/provider,见 entrypointPlatform.test.ts。)
     // P2 债E 收口:隐藏 agent id 权威已上移 @openclaude/protocol,entrypoint 不再手抄
     // 黑名单,改 import 共享权威;本地 isHiddenSystemAgentId(id:unknown) 只做类型收窄后
     // 委派。守护意图从「entrypoint 自持一份识别逻辑(两源约定同步)」升级为「entrypoint
@@ -370,8 +380,12 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
   // 单一权威。本测试把两源锁在一起:任一源改动裁决词而另一源没跟 → 红。
   // 漂移后果:gateway 解析不到 VERDICT 行 → 判"审查未完成"并降级放行,团队模式隐藏审查形同虚设。
   test("hidden reviewer persona 的结构化裁决词汇与 @openclaude/protocol REVIEW_VERDICTS 两源一致", () => {
-    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    const personaSrc = extractConstObjectFromSource(src, "desiredHiddenReviewerAgent");
+    // runtime hotcfg:persona 文案已外置为 bundle 文件 personas/hidden-reviewer.md(不再内联 entrypoint)。
+    // 两源一致性(persona VERDICT 行 ↔ protocol 权威裁决词)照守,只是源1改读该文件。
+    const personaPath = join(
+      __dirname, "..", "..", "agent-sandbox", "platform-runtime", "seed", "personas", "hidden-reviewer.md",
+    );
+    const personaSrc = readFileSync(personaPath, "utf-8");
 
     // 源2 = protocol 权威裁决词(不再手抄,直接 import);当前应为 ['PASS','NEEDS_FIX']。
     // 兜底断言:如果哪天 protocol 词汇集变了,下面遍历会用新集合逐个校验 persona 是否跟进。
@@ -414,13 +428,11 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds curated scientific skills only under scientist agent seed-skills (read-only layer)", () => {
+  test("entrypoint.ts seeds curated scientific skills via externalized bundle files (yaml-manifest driven)", () => {
+    // runtime hotcfg P2a:SCIENTIST 种子内容已外置为 bundle 文件(seed/skills/scientist/<name>/SKILL.md),
+    // 清单在 platform-seed.yaml 的 seedSkills。**内容/清单断言移到 entrypointPlatform.test.ts**(读文件+yaml)。
+    // 此处只守 entrypoint **源码里保留的 seed 机制**:read-only seed-skills 层 + 幂等 + 泛化 yaml 驱动。
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    assert.match(
-      src,
-      /const KDENSE_SCIENTIFIC_SOURCE_COMMIT\s*=\s*"dab7aa672944a77f20cda3f2a672a6f1582adab6"/,
-      "scientific skill seed must pin the audited upstream commit",
-    );
     assert.match(
       src,
       /join\(ocConfigDir,\s*"agents",\s*agentId,\s*"seed-skills",\s*name\)/,
@@ -428,29 +440,32 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /ensureAgentSeedSkill\("scientist",\s*seed\.name,\s*scientificSkillContent\(seed\)\)/,
-      "scientific seed loop must target only the scientist agent",
+      /for \(const \[seedAgentId, skillNames\] of Object\.entries\(platformSeed\.seedSkills\)\)/,
+      "seed skill loop must be driven by the platform-seed.yaml seedSkills manifest (generic, not hardcoded scientist)",
     );
-    assert.match(src, /if \(existsSync\(skillPath\)\) return/, "skill seed must not overwrite existing skills");
+    assert.match(
+      src,
+      /ensureAgentSeedSkill\(seedAgentId,\s*skillName,\s*readFileSync\(skillMd,\s*"utf8"\)\)/,
+      "seed skill content must be read from the bundle SKILL.md file, not an inline TS constant",
+    );
+    // M4a(runtime hotcfg):平台 seed skill 从 skip-if-exists 改**内容 hash 不一致即覆写**
+    // (与 codex-skills overlay 同款 shouldWriteSeededSkill("hash-overwrite")),平台更新的 skill
+    // 内容才能送达存量 volume。故不再有 `if (existsSync(skillPath)) return` 短路。
+    assert.doesNotMatch(src, /if \(existsSync\(skillPath\)\) return;/, "seed skill 不得再走 skip-if-exists 短路(改 hash-overwrite)");
+    assert.match(
+      src,
+      /shouldWriteSeededSkill\("hash-overwrite", targetExists, targetContent, content\)/,
+      "seed skill 覆写决策必须复用共用纯函数 shouldWriteSeededSkill(hash-overwrite)",
+    );
+    // 反回潮:内容/清单不得再内联进 entrypoint(必须走 bundle 文件)。
+    assert.doesNotMatch(src, /const SCIENTIST_SKILL_SEEDS/, "scientist seed content must be externalized to bundle files, not inline");
+    assert.doesNotMatch(src, /function scientificSkillContent/, "scientificSkillContent must be gone (content lives in bundle files)");
+    assert.doesNotMatch(src, /KDENSE_SCIENTIFIC_SOURCE_COMMIT/, "pinned commit must live in the bundle SKILL.md frontmatter, not entrypoint");
     assert.doesNotMatch(
       src,
       /ccb-baseline\/skills|agent-sandbox\/ccb-baseline\/skills/,
       "scientific skills must not be added to global platform baseline",
     );
-    for (const name of [
-      "matplotlib",
-      "statistical-analysis",
-      "statsmodels",
-      "scikit-learn",
-      "sympy",
-      "pymc",
-      "pymoo",
-      "aeon",
-      "scanpy",
-      "scvi-tools",
-    ]) {
-      assert.match(src, new RegExp(`name:\\s*"${name}"`), `scientist curated skill missing: ${name}`);
-    }
   });
 
   test("entrypoint.ts seeds the codex/GPT-5.6 default agent with app-server routing fields", () => {
@@ -460,17 +475,21 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /const COMMERCIAL_CODEX_MODEL\s*=\s*DEFAULT_CODEX_ENGINE_MODEL/,
       "codex seed model must consume the protocol default",
     );
-    const codexAgent = extractConstObjectFromSource(src, "desiredCodexAgent");
-    assert.match(codexAgent, /id:\s*"codex"/, "codex agent id must be stable");
-    assert.match(codexAgent, /model:\s*COMMERCIAL_CODEX_MODEL/, "codex agent must use the protocol-backed model const");
-    // provider/runnerKind 是 gateway runner seam 的路由依据(codex-native → app-server
-    // 形态 CodexAppServerRunner),缺失会让 GPT-5.6 会话落错 runner。
-    assert.match(codexAgent, /provider:\s*"codex-native"/, "codex agent must declare codex-native provider");
-    assert.match(codexAgent, /runnerKind:\s*"app-server"/, "codex agent must declare app-server runnerKind");
-    assert.match(codexAgent, /permissionMode:\s*"bypassPermissions"/, "codex agent must bypass permissions in the sandbox");
+    // codex 计费/引擎权威(model/provider/runnerKind + 动态 displayName)由 buildSeedAgent 的 billing
+    // 常量注入,声明化禁迁(§4.1)。provider/runnerKind 是 gateway runner seam 路由依据,缺失落错 runner。
     assert.match(
       src,
-      /const desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\];/,
+      /buildSeedAgent\(\{\s*id:\s*"codex",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_CODEX_MODEL[\s\S]*?provider:\s*"codex-native"[\s\S]*?runnerKind:\s*"app-server"/,
+      "codex billing must inject protocol model + codex-native provider + app-server runnerKind via buildSeedAgent",
+    );
+    assert.match(
+      src,
+      /displayName:\s*`\$\{DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME\} 队长`/,
+      "codex display name must be derived from the protocol engine display name (dynamic, injected as billing)",
+    );
+    assert.match(
+      src,
+      /desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\];/,
       "codex agent must be part of the seed list",
     );
   });

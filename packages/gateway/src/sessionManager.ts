@@ -45,6 +45,27 @@ import type { UsageAttributionTag } from './subprocessRunner.js'
 const log = createLogger({ module: 'sessionManager' })
 
 /**
+ * 缺省 agent 工作目录(agent 未显式 pin cwd 时用)。
+ *
+ * 设计 §3.2:商业版容器里 supervisor 注入 OPENCLAUDE_DEFAULT_WORKSPACE =
+ * /home/agent/.openclaude/workspace(在 data named volume 内,容器重建后文件仍在);
+ * entrypoint 负责 mkdir。这里只在「env 已设 **且** 目录已存在」时采用它,否则回落
+ * process.cwd()(个人版/宿主机不设该 env → 行为与改造前逐字一致,零变化)。
+ * 目录不存在时保守回落而非在此 mkdir:创建责任在 entrypoint,gateway 不擅自造目录。
+ */
+export function resolveDefaultWorkspaceCwd(env: NodeJS.ProcessEnv = process.env): string {
+  const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+  if (ws) {
+    try {
+      if (statSync(ws).isDirectory()) return ws
+    } catch {
+      // 目录不存在/不可 stat → 回落现状
+    }
+  }
+  return process.cwd()
+}
+
+/**
  * 是否运行在 commercial 托管运行时(v3/v5 商业版容器 / master 实例)。
  *
  * 判定复用仓内既有惯例(不新造信号):
@@ -1599,7 +1620,9 @@ export class SessionManager {
         return existing
       }
     }
-    const cwd = opts.agent.cwd ?? process.cwd()
+    // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
+    // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
+    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
     const repoSessionId = opts.repoSessionId ?? opts.peerId
     // M0/M1a engine 适配层:runner 构造收口到 registry factory。

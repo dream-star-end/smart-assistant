@@ -15,6 +15,16 @@
  *   8. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   9. RESEARCH          — 用户显式选中的科研模式守则 (effortLevel='max')
  *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
+ *
+ * 文案通道边界(设计 §4.2,两通道不重叠):
+ *   - **per-model / 随计费** 的 slot(MODEL_HINT、SKILLS_LITERATURE 等)→ 权威在
+ *     master DB slot(个人版 commercial 反向钩子 / v3 容器 master GET fetch),按会话/
+ *     计费上下文动态取,机制不动。
+ *   - **平台静态守则/能力文案**(`# Platform capabilities`、`# Memory` 常驻指令段)→
+ *     权威在 platform bundle 的 `prompts/`(经 platformPrompts.ts 的 LKG 加载器,
+ *     商业版原子翻转真热;个人版回落本文件内 fallback 常量)。
+ *   改这两段文案 = 改 platform-runtime/prompts/*.md **与** 本文件 fallback 常量两处
+ *   同步(有 __tests__/platformPrompts.test.ts 的「文件 === 常量」断言把同步固化成门)。
  */
 import { existsSync, readFileSync } from 'node:fs'
 import {
@@ -30,6 +40,135 @@ import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
+import { getPlatformPrompt } from './platformPrompts.js'
+
+// ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
+//
+// 商业版权威 = platform bundle 的 prompts/<file>.md(supervisor 注入
+// OPENCLAUDE_PLATFORM_PROMPTS_DIR,原子翻转真热);个人版不设该 env → getPlatformPrompt
+// 恒返这里的常量。**逐字同步义务**:改动这些常量必须同步改
+// packages/commercial/agent-sandbox/platform-runtime/prompts/ 下对应 .md,反之亦然
+// (__tests__/platformPrompts.test.ts 的「文件 === 常量」断言会在漂移时变红)。
+
+/** `# Platform capabilities` 静态头部;{{WECHAT_VISION_HINT}} 由 buildAgentsSlot 按
+ *  needsVisionCli 注入下面两个变体之一。对应 prompts/platform-capabilities.md。 */
+const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
+
+你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。
+你运行在服务器本机上(不需要 SSH 连接自己,直接执行 Bash 命令即可)。
+
+## 多媒体与文件
+
+发送文件给用户: 必须先保存到平台生成目录再回复**绝对路径**;商业版容器优先使用 \`/home/agent/.openclaude/generated/\`,个人版/宿主机通常是 \`/root/.openclaude/generated/\`。不要用 \`/tmp\` 临时目录,不要用 \`![]()\` 语法。
+详细规则见 \`skill_view("platform-capabilities")\`。
+
+## 微信通道操作技能
+
+如果当前对话来自微信,或用户要求在微信里收发文件、图片、视频、语音/音频、附件,按以下规则操作:
+
+{{WECHAT_VISION_HINT}}
+- 要通过微信发回真实附件,不能只读取文件或口头描述。必须先创建或复制资源到 \`/home/agent/.openclaude/generated/<安全文件名>\`;也可以复用已存在的 \`/home/agent/.openclaude/uploads/<安全文件名>\`。
+- 最终回复里必须写出精确的绝对路径,例如 \`/home/agent/.openclaude/generated/example.txt\`;微信网关会把该路径转换成真实附件发送。路径要出现在**最终回答**中,不要只放在思考过程或工具调用说明里。
+- 安全文件名只能匹配 \`[A-Za-z0-9._@+=,-]{1,180}\`,最长 180 字符;不要使用子目录、\`..\`、URL 编码、软链接、\`/tmp\` 或任意系统路径。
+- 可发送的常见扩展名:图片 \`png/jpg/jpeg/gif/webp\`;视频 \`mp4/mov/m4v/webm\`;语音/音频 \`mp3/wav/ogg/oga/silk/amr\`;文件 \`pdf/txt/md/csv/json/docx/xlsx/pptx/zip/tar/gz\`。
+- 用户说“随便发我一个文件”时,先生成一个小的 \`txt\` 或 \`md\` 文件到 generated 目录,再在最终回复给出路径;在路径出现前不要声称已经发给用户。
+
+## 内联富内容: \`chart\` / \`mermaid\` / \`htmlpreview\` 代码块
+
+用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原或可视化原型时,优先直接输出 fenced \`htmlpreview\` 代码块在对话里渲染,不要默认先生成 \`.html\` 文件。详细模板见 \`skill_view("platform-capabilities")\`。
+需要用户在少数几个选项里做决定时,输出 fenced \`options\` 代码块 —— 前端渲染为可点击选项卡,用户点一下即自动回复,无需打字:\`{"question":"…?","multi":false,"options":[{"label":"选项A","desc":"说明"},{"label":"选项B"}]}\`(多选设 multi:true;选项≤12;开放式问题仍用普通文字提问)。
+
+## 子 Agent 与并行处理
+
+你可以使用 Agent 工具 spawn 子 agent 来并行处理独立的子任务。主动使用此能力:
+- **独立研究任务**: 搜索文件、分析代码结构、调研 → 用子 agent
+- **多文件并行操作**: 同时修改多个不相关文件 → 启动多个子 agent
+- **耗时操作**: 大规模搜索、批量处理 → 用子 agent 在后台执行
+- **保持响应**: 当任务可能超过 30 秒时,考虑用子 agent 异步处理
+
+子 agent 会继承你的全部工具和上下文。用户在 UI 中能看到子任务的进度卡片。
+
+## 浏览器操作 (CLI)
+
+用 Bash 调 \`oc-browser\` 操作真实浏览器(有状态,跨调用共享同一会话):
+1. \`oc-browser navigate --url <url>\` → 打开网页
+2. \`oc-browser snapshot\` → 拿页面 accessibility tree + 元素 ref
+3. \`oc-browser click --ref <ref> --element "<描述>"\` / \`oc-browser type --ref <ref> --element "<描述>" --text "<文本>"\` → 按 ref 操作,重复 2-3 直到完成
+常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 \`oc-browser screenshot\`。细节见 \`skill_view("browser")\`。
+
+## 网页/文档提取 · 论文下载 (CLI)
+
+读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 \`oc-web extract <url>\` / \`oc-web parse <绝对路径>\`;学术论文检索与下载 → \`scansci-pdf <子命令>\`(search/download/citation 等)。细节见 \`skill_view("web-context")\` 与 \`skill_view("scansci-pdf")\`。
+安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。`
+
+/** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{MEMORY_INDEX}} 由
+ *  renderMemoryInstructions 注入运行时值。对应 prompts/memory-instructions.md。 */
+const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
+
+你有一份跨会话持久的长期记忆:由「一个索引 + 若干记忆文件」组成。索引常驻在本段末尾,
+每条一行;记忆正文按需自己去读,不会自动进上下文。
+
+## 何时写
+
+**硬触发(命中即本轮就写,不等收尾、不等用户要求)**:
+- 用户明确陈述自己的身份/偏好/习惯(「我喜欢…」「我不喜欢/讨厌…」「我是…」「以后都…」)→ 写 \`type: user\`;
+- 用户明确纠正你的行为或结论(「不要这样」「你错了,应该…」)→ 写 \`type: feedback\`(带 Why / How to apply)。
+这两类写入是回复动作的一部分:先答后写、先写后答皆可,但**同一轮内必须完成**。
+
+软触发(对话或任务收尾时回顾):正在推进项目的关键事实与决定、踩坑与结论、值得留存的参考资料。
+流水账不记(见「何时不写」),但**用户亲口说出的偏好与纠正永远不算流水账**——拿不准时偏向写入,
+写错了下一轮还能删,漏掉了未来每一轮都在重复犯错。
+
+## 四类记忆(写文件时在 frontmatter 的 \`type\` 里标注,各配一例)
+
+- **user** — 用户是谁、长期偏好与风格。例:「用户是射电天文研究员,回答默认按同行水平、公式可保留」。
+- **feedback** — 用户对你的明确纠正/评价,必须附「为什么」与「下次怎么做」。例:「用户指出系统误差不能套 √N —— Why: 只有热噪声主导才成立;How to apply: 先分随机/系统误差再做 RSS 合成」。
+- **project** — 正在做的项目/任务的关键事实与决定。例:「X 项目部署在 kl-mirror,出站统一走 18991 订阅代理」。
+- **reference** — 稳定可复用的知识/资料/清单。例:「常用论文检索入口与各自的检索语法」。
+
+## 何时不写
+
+一次性的临时细节、当场能算出或查到的东西、纯寒暄,以及**任何密钥 / token / 密码 / 隐私原文**,
+都不要写进记忆。
+
+## 怎么保存(两步,直接用你的原生文件工具 —— 已经没有 \`oc-memory memory\` 命令了)
+
+1. **写记忆文件**:用 Write 在 \`{{MEMORY_DIR}}/\` 下新建 \`<slug>.md\`(slug 用小写中划线,如 \`user-radio-astronomer.md\`),文件顶部带 frontmatter:
+   \`\`\`markdown
+   ---
+   name: <kebab-slug>
+   description: <一句话摘要,决定未来会话是否召回这条>
+   type: user | feedback | project | reference
+   ---
+   <正文;feedback / project 记得写清 Why 与 How to apply>
+   \`\`\`
+2. **加索引行**:用 Edit 往 \`{{MEMORY_MD}}\` 追加一行:\`- [标题](memory/<slug>.md) — 一句话钩子\`(整行 ≤150 字符;钩子写清「什么情况下该翻开这条」)。
+
+## 维护
+
+- **更新优先于新建**:同一主题已有文件,直接 Edit 那个文件,不要另建近似条目。
+- **发现错误 / 过时的记忆就删**:删掉 \`{{MEMORY_DIR}}/<slug>.md\`,并同步删掉 \`{{MEMORY_MD}}\` 里对应那一行。
+- 想看某条正文时,用 Read 打开索引里对应的 \`{{MEMORY_DIR}}/<slug>.md\`(只有索引常驻,正文不会自动进上下文)。
+
+## 当前索引
+
+{{MEMORY_INDEX}}`
+
+const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
+/** needsVisionCli=true:模型看不到图,提示走 oc-vision CLI 识图。 */
+const WECHAT_VISION_HINT_CLI = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。当前模型看不到图,看到本地图片路径时,先用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
+/** needsVisionCli=false:原生多模态模型,直接读图。 */
+const WECHAT_VISION_HINT_NATIVE = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,直接读图回答,不要说“不支持图片/没有上传图片”。'
+
+/** 测试内部导出(非稳定 API):暴露 fallback 常量,让 platformPrompts.test.ts 断言
+ *  「fallback 常量 === bundle 文件内容」把逐字同步固化成 CI 门。 */
+export const _platformPromptFallbacks = {
+  PLATFORM_CAPABILITIES_FALLBACK,
+  MEMORY_INSTRUCTIONS_FALLBACK,
+  WECHAT_VISION_HINT_PLACEHOLDER,
+  WECHAT_VISION_HINT_CLI,
+  WECHAT_VISION_HINT_NATIVE,
+}
 
 export interface PromptSlotContext {
   agentId: string
@@ -128,68 +267,18 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // 'understand_image')` 语义完全等价。**原生多模态模型(gpt-5.5/claude 等)默认 false**,
   // 不会拿到误导性的"用 CLI 识图"提示(保持迁移前行为,不给它们加噪音)。
   const needsVisionCli = shouldEnableOpenClaudeVision(provider, ctx.model)
-  const lines = [
-    '# Platform capabilities',
-    '',
-    '你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。',
-    '你运行在服务器本机上(不需要 SSH 连接自己,直接执行 Bash 命令即可)。',
-    '',
-    '## 多媒体与文件',
-    '',
-    '发送文件给用户: 必须先保存到平台生成目录再回复**绝对路径**;商业版容器优先使用 `/home/agent/.openclaude/generated/`,个人版/宿主机通常是 `/root/.openclaude/generated/`。不要用 `/tmp` 临时目录,不要用 `![]()` 语法。',
-    '详细规则见 `skill_view("platform-capabilities")`。',
-    '',
-    '## 微信通道操作技能',
-    '',
-    '如果当前对话来自微信,或用户要求在微信里收发文件、图片、视频、语音/音频、附件,按以下规则操作:',
-    '',
-    needsVisionCli
-      ? '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。当前模型看不到图,看到本地图片路径时,先用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
-      : '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,直接读图回答,不要说“不支持图片/没有上传图片”。',
-    '- 要通过微信发回真实附件,不能只读取文件或口头描述。必须先创建或复制资源到 `/home/agent/.openclaude/generated/<安全文件名>`;也可以复用已存在的 `/home/agent/.openclaude/uploads/<安全文件名>`。',
-    '- 最终回复里必须写出精确的绝对路径,例如 `/home/agent/.openclaude/generated/example.txt`;微信网关会把该路径转换成真实附件发送。路径要出现在**最终回答**中,不要只放在思考过程或工具调用说明里。',
-    '- 安全文件名只能匹配 `[A-Za-z0-9._@+=,-]{1,180}`,最长 180 字符;不要使用子目录、`..`、URL 编码、软链接、`/tmp` 或任意系统路径。',
-    '- 可发送的常见扩展名:图片 `png/jpg/jpeg/gif/webp`;视频 `mp4/mov/m4v/webm`;语音/音频 `mp3/wav/ogg/oga/silk/amr`;文件 `pdf/txt/md/csv/json/docx/xlsx/pptx/zip/tar/gz`。',
-    '- 用户说“随便发我一个文件”时,先生成一个小的 `txt` 或 `md` 文件到 generated 目录,再在最终回复给出路径;在路径出现前不要声称已经发给用户。',
-    '',
-    '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
-    '',
-    '用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原或可视化原型时,优先直接输出 fenced `htmlpreview` 代码块在对话里渲染,不要默认先生成 `.html` 文件。详细模板见 `skill_view("platform-capabilities")`。',
-    '需要用户在少数几个选项里做决定时,输出 fenced `options` 代码块 —— 前端渲染为可点击选项卡,用户点一下即自动回复,无需打字:`{"question":"…?","multi":false,"options":[{"label":"选项A","desc":"说明"},{"label":"选项B"}]}`(多选设 multi:true;选项≤12;开放式问题仍用普通文字提问)。',
-    '',
-    '## 子 Agent 与并行处理',
-    '',
-    '你可以使用 Agent 工具 spawn 子 agent 来并行处理独立的子任务。主动使用此能力:',
-    '- **独立研究任务**: 搜索文件、分析代码结构、调研 → 用子 agent',
-    '- **多文件并行操作**: 同时修改多个不相关文件 → 启动多个子 agent',
-    '- **耗时操作**: 大规模搜索、批量处理 → 用子 agent 在后台执行',
-    '- **保持响应**: 当任务可能超过 30 秒时,考虑用子 agent 异步处理',
-    '',
-    '子 agent 会继承你的全部工具和上下文。用户在 UI 中能看到子任务的进度卡片。',
-  ]
-
-  // browser is now the stateful oc-browser daemon + thin CLI (retired from MCP);
-  // always available via Bash, detail via the `browser` skill.
-  lines.push(
-    '',
-    '## 浏览器操作 (CLI)',
-    '',
-    '用 Bash 调 `oc-browser` 操作真实浏览器(有状态,跨调用共享同一会话):',
-    '1. `oc-browser navigate --url <url>` → 打开网页',
-    '2. `oc-browser snapshot` → 拿页面 accessibility tree + 元素 ref',
-    '3. `oc-browser click --ref <ref> --element "<描述>"` / `oc-browser type --ref <ref> --element "<描述>" --text "<文本>"` → 按 ref 操作,重复 2-3 直到完成',
-    '常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 `oc-browser screenshot`。细节见 `skill_view("browser")`。',
+  // 平台静态能力文案(`# Platform capabilities` 头部 + 多媒体/微信/富内容/子 Agent/
+  // 浏览器/网页提取诸段)已上移 platform bundle(商业版真热),商业版权威 =
+  // prompts/platform-capabilities.md,个人版权威 = 下方 PLATFORM_CAPABILITIES_FALLBACK。
+  // 模板里唯一的 per-model 变体(微信识图提示)用 {{WECHAT_VISION_HINT}} 占位,由
+  // needsVisionCli 在此处按运行时判定注入 —— per-model 文案不进静态文件(见 §4.2 边界)。
+  const staticHeader = getPlatformPrompt(
+    'platform-capabilities',
+    PLATFORM_CAPABILITIES_FALLBACK,
+  ).replaceAll(WECHAT_VISION_HINT_PLACEHOLDER, () =>
+    needsVisionCli ? WECHAT_VISION_HINT_CLI : WECHAT_VISION_HINT_NATIVE,
   )
-
-  // web-context + scansci-pdf 已从 MCP 工具迁到 CLI(始终可用,经 Bash 调用),
-  // 细节走 skill 渐进披露,基线提示只放精简指针,避免臃肿。
-  lines.push(
-    '',
-    '## 网页/文档提取 · 论文下载 (CLI)',
-    '',
-    '读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 `oc-web extract <url>` / `oc-web parse <绝对路径>`;学术论文检索与下载 → `scansci-pdf <子命令>`(search/download/citation 等)。细节见 `skill_view("web-context")` 与 `skill_view("scansci-pdf")`。',
-    '安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。',
-  )
+  const lines = [staticHeader]
 
   // Dynamically inject available agents list
   try {
@@ -337,58 +426,14 @@ function renderMemoryInstructions(args: {
 }): string {
   const { memoryDir, memoryMd, index } = args
   const indexBlock = index && index.trim() ? index.trim() : '(空 —— 还没有任何记忆条目)'
-  return [
-    '# Memory',
-    '',
-    '你有一份跨会话持久的长期记忆:由「一个索引 + 若干记忆文件」组成。索引常驻在本段末尾,',
-    '每条一行;记忆正文按需自己去读,不会自动进上下文。',
-    '',
-    '## 何时写',
-    '',
-    '**硬触发(命中即本轮就写,不等收尾、不等用户要求)**:',
-    '- 用户明确陈述自己的身份/偏好/习惯(「我喜欢…」「我不喜欢/讨厌…」「我是…」「以后都…」)→ 写 `type: user`;',
-    '- 用户明确纠正你的行为或结论(「不要这样」「你错了,应该…」)→ 写 `type: feedback`(带 Why / How to apply)。',
-    '这两类写入是回复动作的一部分:先答后写、先写后答皆可,但**同一轮内必须完成**。',
-    '',
-    '软触发(对话或任务收尾时回顾):正在推进项目的关键事实与决定、踩坑与结论、值得留存的参考资料。',
-    '流水账不记(见「何时不写」),但**用户亲口说出的偏好与纠正永远不算流水账**——拿不准时偏向写入,',
-    '写错了下一轮还能删,漏掉了未来每一轮都在重复犯错。',
-    '',
-    '## 四类记忆(写文件时在 frontmatter 的 `type` 里标注,各配一例)',
-    '',
-    '- **user** — 用户是谁、长期偏好与风格。例:「用户是射电天文研究员,回答默认按同行水平、公式可保留」。',
-    '- **feedback** — 用户对你的明确纠正/评价,必须附「为什么」与「下次怎么做」。例:「用户指出系统误差不能套 √N —— Why: 只有热噪声主导才成立;How to apply: 先分随机/系统误差再做 RSS 合成」。',
-    '- **project** — 正在做的项目/任务的关键事实与决定。例:「X 项目部署在 kl-mirror,出站统一走 18991 订阅代理」。',
-    '- **reference** — 稳定可复用的知识/资料/清单。例:「常用论文检索入口与各自的检索语法」。',
-    '',
-    '## 何时不写',
-    '',
-    '一次性的临时细节、当场能算出或查到的东西、纯寒暄,以及**任何密钥 / token / 密码 / 隐私原文**,',
-    '都不要写进记忆。',
-    '',
-    '## 怎么保存(两步,直接用你的原生文件工具 —— 已经没有 `oc-memory memory` 命令了)',
-    '',
-    `1. **写记忆文件**:用 Write 在 \`${memoryDir}/\` 下新建 \`<slug>.md\`(slug 用小写中划线,如 \`user-radio-astronomer.md\`),文件顶部带 frontmatter:`,
-    '   ```markdown',
-    '   ---',
-    '   name: <kebab-slug>',
-    '   description: <一句话摘要,决定未来会话是否召回这条>',
-    '   type: user | feedback | project | reference',
-    '   ---',
-    '   <正文;feedback / project 记得写清 Why 与 How to apply>',
-    '   ```',
-    `2. **加索引行**:用 Edit 往 \`${memoryMd}\` 追加一行:\`- [标题](memory/<slug>.md) — 一句话钩子\`(整行 ≤150 字符;钩子写清「什么情况下该翻开这条」)。`,
-    '',
-    '## 维护',
-    '',
-    '- **更新优先于新建**:同一主题已有文件,直接 Edit 那个文件,不要另建近似条目。',
-    `- **发现错误 / 过时的记忆就删**:删掉 \`${memoryDir}/<slug>.md\`,并同步删掉 \`${memoryMd}\` 里对应那一行。`,
-    `- 想看某条正文时,用 Read 打开索引里对应的 \`${memoryDir}/<slug>.md\`(只有索引常驻,正文不会自动进上下文)。`,
-    '',
-    '## 当前索引',
-    '',
-    indexBlock,
-  ].join('\n')
+  // `# Memory` 常驻指令段已上移 platform bundle(商业版真热),商业版权威 =
+  // prompts/memory-instructions.md,个人版权威 = 下方 MEMORY_INSTRUCTIONS_FALLBACK。
+  // per-agent 的绝对路径与当前索引是运行时值,用占位符注入 —— 用函数式替换避免
+  // `$` 特殊模式(memoryDir/index 里若含 `$` 不会被误解释)。
+  return getPlatformPrompt('memory-instructions', MEMORY_INSTRUCTIONS_FALLBACK)
+    .replaceAll('{{MEMORY_DIR}}', () => memoryDir)
+    .replaceAll('{{MEMORY_MD}}', () => memoryMd)
+    .replaceAll('{{MEMORY_INDEX}}', () => indexBlock)
 }
 
 /**

@@ -378,12 +378,17 @@ import {
   startVolumeGcScheduler,
   createUserMediaResolver,
   isUserVolumeMediaPath,
+  resolvePlatformBundleMount,
+  resolveRuntimeReleaseMount,
+  DEFAULT_PLATFORM_ROOT,
+  DEFAULT_RUNTIME_RELEASES_ROOT,
   type IdleSweepScheduler,
   type MigrationReconcileScheduler,
   type OrphanReconcileScheduler,
   type UserMediaLocation,
   type V3ContainerEventsWorker,
   type V3SupervisorDeps,
+  type V3RuntimeTuple,
   type VolumeGcScheduler,
 } from "./agent-sandbox/index.js";
 import {
@@ -2013,6 +2018,68 @@ export async function registerCommercial(
     const v3Docker = cfg.AGENT_DOCKER_SOCKET
       ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
       : new Docker();
+
+    // ── V5 runtime tuple 启动期解析(plan §1.5 prepare/startup 一次性全量校验)──
+    // OC_PLATFORM_BUNDLE / OC_RUNTIME_RELEASE 配了就在此**一次性**跑昂贵的 resolvePlatformBundleMount
+    // (逐文件 sha256)/ resolveRuntimeReleaseMount,把 bundleRev/bootHash/resolved 路径灌进 tuple;
+    // provision 每次只做便宜的 assertCurrentMatches。解析失败**不阻断 gateway 启动**(与 baseline
+    // 自检同范式)——只 console.error 留态;下一次 provision 由 supervisor 依 v5 fail-closed / OPTIONAL
+    // 决定拒/降级(bundlePath 传下去但 bundleRev 空 → provision 侧判 "解析失败" 拒)。
+    let runtimeTuple: V3RuntimeTuple | undefined;
+    if (cfg.OC_RUNTIME_IMAGE_ID || cfg.OC_PLATFORM_BUNDLE || cfg.OC_RUNTIME_RELEASE) {
+      const platformRoot = cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT;
+      const releasesRoot = cfg.OC_RUNTIME_RELEASES_ROOT ?? DEFAULT_RUNTIME_RELEASES_ROOT;
+      const t: V3RuntimeTuple = {
+        imageId: cfg.OC_RUNTIME_IMAGE_ID,
+        bundlePath: cfg.OC_PLATFORM_BUNDLE,
+        releasePath: cfg.OC_RUNTIME_RELEASE,
+        platformRoot,
+        releasesRoot,
+      };
+      if (cfg.OC_PLATFORM_BUNDLE) {
+        try {
+          // B5 containment:传 platformRoot 让校验器显式断言 resolved 落在 <platformRoot>/bundles/ 下
+          // (ancestorRoot 同值锁祖先链;platformRoot 另钉布局根,两者语义分离但生产同一目录)。
+          const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, {
+            ancestorRoot: platformRoot,
+            platformRoot,
+          });
+          t.bundleResolvedPath = resolved.resolvedPath;
+          t.bundleRev = resolved.bundleRev;
+          t.bootHash = resolved.bootHash;
+          // eslint-disable-next-line no-console
+          console.log("[commercial] v5 platform bundle validated", {
+            bundlePath: cfg.OC_PLATFORM_BUNDLE,
+            bundleRev: resolved.bundleRev,
+            bootHash: resolved.bootHash,
+          });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[commercial] v5 platform bundle validation FAILED — provision will fail-closed (or skip with OC_PLATFORM_BUNDLE_OPTIONAL=1)",
+            { bundlePath: cfg.OC_PLATFORM_BUNDLE, error: (err as Error).message },
+          );
+        }
+      }
+      if (cfg.OC_RUNTIME_RELEASE) {
+        try {
+          t.releaseResolvedPath = resolveRuntimeReleaseMount(cfg.OC_RUNTIME_RELEASE, releasesRoot);
+          // eslint-disable-next-line no-console
+          console.log("[commercial] v5 runtime release validated", {
+            releasePath: cfg.OC_RUNTIME_RELEASE,
+            resolved: t.releaseResolvedPath,
+          });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[commercial] v5 runtime release validation FAILED — provision will fail-closed",
+            { releasePath: cfg.OC_RUNTIME_RELEASE, error: (err as Error).message },
+          );
+        }
+      }
+      runtimeTuple = t;
+    }
+
     v3Deps = {
       docker: v3Docker,
       pool: getPool(),
@@ -2020,6 +2087,8 @@ export async function registerCommercial(
       // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
       // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
       bridgeSecret,
+      // V5 runtime tuple(启动期已解析);未配 → undefined → provision/ensureRunning 走旧路径。
+      ...(runtimeTuple ? { runtimeTuple } : {}),
       // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
       // 避免出现 "containerService 注入但 selfHostId undefined" 的半 wire 状态
       // (provisionV3Container 的 useRemote 判定依赖 selfHostId 非空)。

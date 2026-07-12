@@ -52,6 +52,7 @@ import {
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
   SupervisorError,
+  classifyRuntimeArtifactFailure,
 } from "../agent-sandbox/index.js";
 import { buildCodexRelayLocalBaseUrl } from "../http/internalCodexRelay.js";
 
@@ -511,14 +512,21 @@ describe("provisionV3Container", () => {
   let pool: FakePool;
   // 基线 fail-closed 默认启用;这些 happy-path 测试不关心基线内容,设 OPTIONAL 降级
   // 为 warn+skip,避免触发 CcbBaselineMissing。基线专项测试在下一个 describe 里。
+  // OC_PLATFORM_BUNDLE_OPTIONAL=1 同理:v5 runtime tuple 上线后 v5 channel 缺 bundle 默认
+  // fail-closed(供 dev 降级),本组不关心 bundle 内容(B6 用例走 v5 channel),降级避免拒 provision。
   let prevOptional: string | undefined;
+  let prevBundleOptional: string | undefined;
   before(() => {
     prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    prevBundleOptional = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
   });
   after(() => {
     if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+    if (prevBundleOptional === undefined) delete process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    else process.env.OC_PLATFORM_BUNDLE_OPTIONAL = prevBundleOptional;
   });
   beforeEach(() => {
     pool = new FakePool();
@@ -969,10 +977,15 @@ describe("provisionV3Container", () => {
 describe("provisionV3Container — docker create NameConflict 自愈", () => {
   let pool: FakePool;
   let prevOptional: string | undefined;
+  let prevBundleOptional: string | undefined;
   let savedChannel: string | undefined;
   before(() => {
     prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    // v5 runtime tuple 上线后 v5 channel 缺 OC_PLATFORM_BUNDLE 默认 fail-closed;本组不测 bundle,
+    // 设 OPTIONAL=1 降级(dev 逃生),让 NameConflict 自愈用例在无 bundle 的单元环境里跑过。
+    prevBundleOptional = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
     // 事故 channel = v5(容器名 oc-v5-u1)。v5 provision 跳过 v3MayServe 门控
     // (它走全局 getPool → 无 DATABASE_URL 会抛 ConfigError,是既有基线失败源),
     // 故这里显式 v5:既忠实复现事故,又让自愈用例可在无 DB 的单元环境里独立跑过。
@@ -982,6 +995,8 @@ describe("provisionV3Container — docker create NameConflict 自愈", () => {
   after(() => {
     if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+    if (prevBundleOptional === undefined) delete process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
+    else process.env.OC_PLATFORM_BUNDLE_OPTIONAL = prevBundleOptional;
     if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
     else process.env.OC_RUNTIME_CHANNEL = savedChannel;
   });
@@ -3818,6 +3833,40 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
       assert.equal(captured.containersCreated.length, 0);
     } finally {
       restoreGuardEnv();
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// R2-M5:激活窗口错误码分离 —— classifyRuntimeArtifactFailure 两码路径的重试秒数 + 告警行为
+// (v3ensureRunning 的 provision 失败分级单一权威;pure fn,免搭 ensureRunning harness)。
+// ───────────────────────────────────────────────────────────────────────
+describe("R2-M5 classifyRuntimeArtifactFailure(激活中间态 vs 部署级坏产物)", () => {
+  test("RuntimeActivationInProgress → 5s 短重试 + 不告警(与 provisioning 同级)", () => {
+    const c = classifyRuntimeArtifactFailure("RuntimeActivationInProgress");
+    assert.ok(c, "激活中间态必须被本分级识别(非 null)");
+    assert.equal(c!.retryAfterSec, 5, "激活窗口走 5s 短重试(秒级 saga 窗口,非长退避)");
+    assert.equal(c!.critical, false, "激活窗口不发 critical 告警(避免秒级窗口刷噪声)");
+    assert.equal(c!.reason, "activation_in_progress");
+  });
+
+  test("PlatformBundleInvalid / RuntimeReleaseInvalid / RuntimePlacementInvalid → 300s 长重试 + critical 告警", () => {
+    for (const [code, reason] of [
+      ["PlatformBundleInvalid", "platform_bundle_invalid"],
+      ["RuntimeReleaseInvalid", "runtime_release_invalid"],
+      ["RuntimePlacementInvalid", "runtime_placement_invalid"],
+    ] as const) {
+      const c = classifyRuntimeArtifactFailure(code);
+      assert.ok(c, `${code} 必须被本分级识别`);
+      assert.equal(c!.retryAfterSec, 300, `${code} 走 300s 长退避(部署级坏产物 / 多机 placement 硬门)`);
+      assert.equal(c!.critical, true, `${code} 必须发 critical 告警(运维介入)`);
+      assert.equal(c!.reason, reason);
+    }
+  });
+
+  test("非本类错误码 → null(交回 catch-all / 其它专用块)", () => {
+    for (const code of ["NameConflict", "HostFull", "MigratedToV5", "CcbBaselineMissing", "Unknown"] as const) {
+      assert.equal(classifyRuntimeArtifactFailure(code), null, `${code} 不属 runtime artifact 分级`);
     }
   });
 });
