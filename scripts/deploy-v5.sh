@@ -1238,7 +1238,7 @@ smoke() {
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert userNoticeApproval cronWake connectorSweeper sessionsGcSweep"
   if [[ "$leader" == "1" ]]; then
-    allowed="$allowed containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
+    allowed="$allowed containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail incidentReconciler incidentSweeper"
   fi
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
