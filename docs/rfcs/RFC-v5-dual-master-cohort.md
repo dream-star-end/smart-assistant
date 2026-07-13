@@ -28,6 +28,7 @@ active_slot     TEXT        -- 'A'|'B'(当前主:默认流量+VIP 控制口+lead
 candidate_slot  TEXT        -- 灰度中的 slot(NULL=无)
 active_release  TEXT        -- rel-* 目录名(权威记录,Caddy 生成器/回滚以此为源)
 candidate_release TEXT
+previous_active_release TEXT -- stable 最近一次翻转前的 active；紧急 N=1 回滚唯一 master 血缘
 desired_leader_slot  TEXT   -- leader lease 竞争资格(唯一授权 slot)
 desired_control_slot TEXT   -- VIP 控制口 18894 bind 资格(唯一授权 slot)
 cohort_percent  SMALLINT CHECK(cohort_percent BETWEEN 0 AND 100)
@@ -78,7 +79,8 @@ slot=A/B 静态映射:A={unit openclaude-v5, port 18790, 私有控制口 18896, 
 - `--promote <pct>`:断言 phase=canary→CAS percent。观察面=双 slot healthz+错误日志 diff+计费一致性抽查。
 - `--finalize`(R1 B2 七步序+R2 B1 步进持久化):**起手 CAS{phase=finalizing, transition_step=0, operation_id=新}**→①percent=100 观察窗(step=1)②Caddy 默认 upstream 切 candidate+reload,验证新请求全落 candidate(step=2)③旧 WS 自然存活或有界 drain(step=3)④CAS{desired_leader_slot=candidate, desired_control_slot=candidate}(step=4)→旧 master fence+close VIP;candidate 竞得 lease+bind VIP⑤D3 四门槛校验(step=5;超时→转 aborting 按 §8 恢复)⑥stop 旧 unit(step=6)⑦CAS{active_slot=candidate, active_release 更新, candidate_*=NULL, phase=stable, transition_step=0}。每步完成即 CAS transition_step+journal。
 - `--abort`(R2 B1):**起手 CAS{phase=aborting, transition_step=0}**→**恢复前置(关键)**:若 finalize 已过 step6(旧 unit 已停)——先 `ensure 旧 unit running + 私有口健康 + capability 校验`,**旧 slot 确认健康后**才继续→①re-render Caddy 摘 candidate/恢复默认=旧 slot+reload②CAS{desired_*=active_slot}(旧 master 重竞 lease/VIP,等待其 leadership=leader+VIP owner 确认)③stop candidate unit④CAS{phase=stable, candidate_*=NULL, percent=0}。绝不在旧 slot 未确认健康时先切流(防全停)。cookie 靠 generation 不匹配自动失效。
-- **finalize 后回滚(R1 B2)**:stable 后发现问题→正常再跑一轮 --canary(旧 release 为 candidate)——**回滚=对称的前滚**;紧急整流(不起第二实例)=deploy-v5.sh --rollback(蓝绿 symlink+restart,回到今天的 11s 语义,capability gate 照拦)。旧 release/unit 保留=蓝绿 GC 现行 6 代策略;DB migration 兼容边界=现行 backward-compatible 纪律+capability matrix。
+- **finalize 后回滚(R1 B2)**:stable 后发现问题→正常再跑一轮 --canary(旧 release 为 candidate)——**回滚=对称的前滚**;紧急整流(不起第二实例)=deploy-v5.sh --rollback(蓝绿 symlink+restart,回到今天的 11s 语义,capability gate 照拦)。N=1 的 master 目标严格取 `previous_active_release`；若 hotcfg history.last 与 active 对齐则恢复上一条同源 master+tuple，若 P3 finalize 只切了 master 导致 history 落后，则保留当前 env tuple、只回 previous master，禁止按 history 相对位置多退一代。旧 release/unit 保留=蓝绿 GC 现行 6 代策略；release/assets 删除型 GC 读 PG 失败或零行时整轮跳过。DB migration 兼容边界=现行 backward-compatible 纪律+capability matrix。
+- **state/runtime 提交回执不明的硬停止**:传统激活与 hotcfg saga 的 release CAS 都按完整谓词回读为 `applied|original|reverted|unknown`；只有确认 original/reverted 才允许回切 symlink/env/unit。unknown 或 revert 未确认时保持现场不再盲补偿，并原子写 `$RELEASES_ROOT/.manual-recovery-required`，后续所有写 lane 起手拒绝；人工核对 deploy_state、A/B symlink/unit、tuple history 并收敛后才可移除标记。
 - V5_PORT/smoke 参数化(按 slot);smoke 白名单语义确认"允许集非必现集"。
 
 ### D6 前端横幅延迟(R1 m3 细化)

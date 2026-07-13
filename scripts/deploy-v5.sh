@@ -627,7 +627,29 @@ write_version() {
 #     无崩溃循环;VERSION/源码/dist 永远同 sha 自洽;并发部署=串行原子翻转,各发布 canonical 超集。
 #   - sessions.db 早已外置 /root/.openclaude-v5/,data/ 空 → 无"运行中 master 数据在树内"问题。
 RELEASES_ROOT="/opt/openclaude/openclaude-v5-releases"
+DEPLOY_RECOVERY_MARKER="$RELEASES_ROOT/.manual-recovery-required"
 RELEASES_KEEP="${RELEASES_KEEP:-6}"
+
+# 状态提交回执无法裁决时，绝不能继续猜测并翻另一生效面。落一个远端持久标记，后续所有
+# 写 lane 起手即拒；人工核对 deploy_state / A/B symlink / unit / tuple history 后才能移除。
+mark_deploy_recovery_required() {  # $1=reason
+  local reason="$1" quoted
+  printf -v quoted '%q' "$reason"
+  ssh "$KL_HOST" "set -e; umask 077; mkdir -p '$RELEASES_ROOT'; printf '%s\\n' $quoted > '$DEPLOY_RECOVERY_MARKER.tmp'; mv -f '$DEPLOY_RECOVERY_MARKER.tmp' '$DEPLOY_RECOVERY_MARKER'" \
+    || echo "FATAL:人工恢复标记也写入失败:$DEPLOY_RECOVERY_MARKER" >&2
+  echo "FATAL:部署进入人工恢复态:$reason" >&2
+  echo "  标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER（核对并修复 state/runtime 后人工移除）" >&2
+}
+
+assert_no_deploy_recovery_marker() {
+  [[ "$DRY" == 1 ]] && return 0
+  if ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
+    echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
+    ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
+    echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，收敛后人工移除。" >&2
+    return 1
+  fi
+}
 
 # ── 传统 deploy/dist/rollback 的严格状态快照 ──
 # 0135 必须先于 P3 基建版部署 apply；从此 deploy_state 是 active slot/release 的唯一权威。
@@ -868,23 +890,39 @@ restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason
   echo "  ✓ 补偿完成:slot=$ACTIVE_SLOT 已恢复 $old_release" >&2
 }
 
-# 状态提交回执丢失时，先严格回读；若实际上已提交 target，则 CAS 精确恢复原 release 血缘。
+# 状态提交回执丢失时做三态裁决，并把 state 收敛回提交前值。只有确认 original/reverted
+# 才允许继续回切 symlink/unit；PG 不可读、竞争或其它状态一律 unknown，落人工恢复标记并
+# 保持当前运行面不动，避免 state=new/runtime=old 的盲补偿分裂。
 restore_release_state_if_committed() {  # $1=target
-  local target="$1" out
-  if ! ds_load; then
-    echo "FATAL:状态提交失败后 PG 仍不可读，无法确认 deploy_state 是否已提交；禁止报告成功。" >&2
-    return 1
-  fi
-  if [[ "$DS_phase" == stable && "$DS_active_slot" == "$ACTIVE_SLOT" && -z "$DS_candidate_slot" && -z "$DS_candidate_release" && "$DS_active_release" == "$target" ]]; then
-    if ! out="$(ds_stable_release_revert "$DS_lock_version" "$ACTIVE_SLOT" "$target" "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE")" || [[ -z "$out" ]]; then
-      echo "FATAL:deploy_state 已指向 target，但补偿 CAS 失败；人工核查 release 血缘。" >&2
-      return 1
-    fi
-    echo "  ✓ deploy_state 补偿恢复 active=${ACTIVE_STATE_RELEASE:-NULL} previous=${ACTIVE_STATE_PREVIOUS_RELEASE:-NULL}" >&2
-  elif [[ "$DS_active_release" != "$ACTIVE_STATE_RELEASE" || "$DS_active_slot" != "$ACTIVE_SLOT" ]]; then
-    echo "FATAL:状态提交失败后发现 deploy_state 已被其它操作推进，拒绝盲写补偿。" >&2
-    return 1
-  fi
+  local target="$1" status="" i status_sql
+  status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
+    "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
+  for i in 1 2 3; do
+    status="$(ds_exec <<<"$status_sql" 2>/dev/null || true)"
+    status="$(printf '%s' "$status" | tr -d '[:space:]')"
+    [[ "$status" =~ ^(applied|original|reverted|unknown)$ ]] && break
+    sleep 1
+  done
+  case "$status" in
+    original|reverted)
+      echo "  ✓ deploy_state 已确认处于提交前血缘(status=$status)，允许运行面补偿。" >&2
+      return 0 ;;
+    applied)
+      # 只允许精确的 expect+1/target 血缘执行补偿 CAS；回执仍可能丢失，随后再次三态回读。
+      ds_stable_release_revert "$((ACTIVE_STATE_LOCK_VERSION + 1))" "$ACTIVE_SLOT" "$target" \
+        "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" >/dev/null 2>&1 || true
+      for i in 1 2 3; do
+        status="$(ds_exec <<<"$status_sql" 2>/dev/null || true)"
+        status="$(printf '%s' "$status" | tr -d '[:space:]')"
+        [[ "$status" == original || "$status" == reverted ]] && {
+          echo "  ✓ deploy_state 补偿确认完成(status=$status active=${ACTIVE_STATE_RELEASE:-NULL} previous=${ACTIVE_STATE_PREVIOUS_RELEASE:-NULL})" >&2
+          return 0
+        }
+        sleep 1
+      done ;;
+  esac
+  mark_deploy_recovery_required "release CAS 回执无法裁决/补偿未确认(target=$target status=${status:-unreadable})"
+  return 1
 }
 
 # 原子激活 release:assets 先就位；随后 symlink→restart→健康门→deploy_state CAS。
@@ -916,17 +954,23 @@ activate_release() {
   echo "  ✓ 原子翻转:$ACTIVE_SRC(slot=$ACTIVE_SLOT)→ $reldir(旧=$prev)"
   echo "── restart $ACTIVE_UNIT(仅 v5 active slot=$ACTIVE_SLOT,绝不碰 v3)──"
   if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
-    restore_release_activation "$prev" "$old_prev_file" "restart new failed" || true
+    restore_release_activation "$prev" "$old_prev_file" "restart new failed" \
+      || mark_deploy_recovery_required "新 release restart 失败且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
     return 1
   fi
   run "sleep 4"
   if ! smoke "$ACTIVE_PORT"; then
-    restore_release_activation "$prev" "$old_prev_file" "new release smoke failed" || true
+    restore_release_activation "$prev" "$old_prev_file" "new release smoke failed" \
+      || mark_deploy_recovery_required "新 release smoke 失败且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
     return 1
   fi
   if ! ds_commit_active_release "$reldir"; then
-    restore_release_state_if_committed "$reldir" || true
-    restore_release_activation "$prev" "$old_prev_file" "deploy_state commit failed" || true
+    if restore_release_state_if_committed "$reldir"; then
+      restore_release_activation "$prev" "$old_prev_file" "deploy_state commit failed" \
+        || mark_deploy_recovery_required "state 已恢复但 slot=$ACTIVE_SLOT 运行面回切失败(target=$reldir)"
+    else
+      echo "FATAL:state 未确认恢复，保持新运行面不动；禁止盲目回切旧 symlink/unit。" >&2
+    fi
     return 1
   fi
 }
@@ -954,16 +998,19 @@ ds_commit_active_release() {
 # 只删带 .complete 的正式 rel-*;顺带清超 1 天的孤儿 .staging-*。
 gc_releases() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] GC:保留最近 $RELEASES_KEEP 个,护 A/B slot current + .prev-release + deploy_state(active/candidate/previous)+ master/egress cwd"; return 0; }
-  # BLOCKER 4:双 master 下 A/B 两 slot symlink 都可能在役(finalize 交接期 / abort 后旧 slot 仍需可回),
-  # 且 deploy_state.active/candidate/previous_active_release 都是"绝不删"的权威引用。best-effort 读 state。
+  # 双 master 下 A/B 两 slot symlink 都可能在役；previous_active_release 还可能是唯一指向 B
+  # 直接回滚代的引用。删除型 GC 对 PG 读取必须 fail-closed：查询失败/零行就整轮跳过。
   local dsrels ds_active ds_candidate ds_previous
-  dsrels="$(ds_exec 2>/dev/null <<'SQL' || true
+  if ! dsrels="$(ds_exec 2>/dev/null <<'SQL'
 SELECT coalesce(active_release,'')||'|'||coalesce(candidate_release,'')||'|'||coalesce(previous_active_release,'') FROM deploy_state WHERE singleton = true;
 SQL
-)"
+)" || [[ -z "$dsrels" ]]; then
+    echo "  ⚠ deploy_state 保护集读取失败/无行 → 本轮安全跳过 release 删除型 GC" >&2
+    return 0
+  fi
   IFS='|' read -r ds_active ds_candidate ds_previous <<<"${dsrels:-||}"
   local srcA srcB; srcA="$(slot_src A)"; srcB="$(slot_src B)"
-  ssh "$KL_HOST" "set -e
+  if ! ssh "$KL_HOST" "set -e
     protect_paths() { for p in \"\$@\"; do [ -n \"\$p\" ] || continue; case \"\$p\" in /*) echo \"\$p\" ;; *) echo '$RELEASES_ROOT/'\"\$p\" ;; esac; done; }
     curA=\$(readlink -f '$srcA' 2>/dev/null || true)
     curB=\$(readlink -f '$srcB' 2>/dev/null || true)
@@ -983,7 +1030,10 @@ SQL
       [ -f \"\$d/.complete\" ] || continue
       rm -rf \"\$d\"
     done
-    find '$RELEASES_ROOT' -maxdepth 1 -name '.staging-*' -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true" 2>&1 | sed 's/^/  /' || true
+    find '$RELEASES_ROOT' -maxdepth 1 -name '.staging-*' -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true" 2>&1 | sed 's/^/  /'; then
+    echo "✗ release GC 远端删除失败——中止 lane，不吞掉部分删除错误。" >&2
+    return 1
+  fi
 }
 
 # ═══════════════════ runtime tuple / platform bundle 编排(§1.1/1.2/1.5/3.1)═══════════════════
@@ -1135,16 +1185,22 @@ hotcfg_core_smoke_cmd() {
 # 原有的 env/current/symlink/unit 全补偿，history 写失败则再用 revert SQL 恢复原 release 血缘。
 HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
 build_hotcfg_state_hooks() {  # $1=target master release
-  local target="$1" apply_sql revert_sql next_lock
+  local target="$1" apply_sql revert_sql status_sql next_lock
   next_lock=$((ACTIVE_STATE_LOCK_VERSION + 1))
   apply_sql="$(ds_stable_release_commit_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" "$ACTIVE_STATE_RELEASE" "$target")"
   revert_sql="$(ds_stable_release_revert_sql "$next_lock" "$ACTIVE_SLOT" "$target" "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE")"
+  status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
+    "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
+  # commit 三态协议:0=applied(含“UPDATE 已提交但回执丢失后回读确认”)；10=original 确认；
+  # 11=unknown。命令包在子 shell，避免 exit/return 穿透调用 saga。
   printf -v HOTCFG_STATE_COMMIT_CMD \
-    'set -a; . %q; out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q)"; [ -n "$out" ]' \
-    "$V5_ENV" "$apply_sql"
+    '( set -a; . %q; if out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null)" && [ -n "$out" ]; then exit 0; fi; for i in 1 2 3; do status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in applied) exit 0 ;; original) exit 10 ;; esac; sleep 1; done; exit 11 )' \
+    "$V5_ENV" "$apply_sql" "$status_sql"
+  # revert 是幂等 reconcile：无论 apply 明确成功、回执不明或明确未命中，只有回读确认
+  # original/reverted 才返回 0；PG 不可读/竞争/alien state 均返回 11，让 saga 保持新运行面。
   printf -v HOTCFG_STATE_REVERT_CMD \
-    'set -a; . %q; out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q)"; [ -n "$out" ]' \
-    "$V5_ENV" "$revert_sql"
+    '( set -a; . %q; for i in 1 2 3; do out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; [ -n "$out" ] && exit 0; status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in original|reverted) exit 0 ;; esac; sleep 1; done; exit 11 )' \
+    "$V5_ENV" "$revert_sql" "$status_sql"
 }
 
 activate_runtime_tuple() {
@@ -1206,7 +1262,7 @@ activate_runtime_tuple() {
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle_val" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" \
+    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" \
     || { echo "✗ 激活 saga 失败,已自动回滚旧 tuple(env/current/master 源码/.prev-release/重启旧 master)" >&2; return 1; }
   ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
   ACTIVE_STATE_RELEASE="$BUILT_RELEASE"
@@ -1814,7 +1870,7 @@ rollback() {
   # 路径才能"退回启用态";故入口判定并上 hotcfg_history_present。
   if hotcfg_bundle_enabled || hotcfg_release_enabled || hotcfg_history_present; then
     if [[ "$DRY" == 1 ]]; then
-      echo "  [dry-run] hotcfg rollback(slot=$ACTIVE_SLOT):读 history 倒数第 $((ROLLBACK_N+1)) 条→slot-aware saga+deploy_state commit/revert"
+      echo "  [dry-run] hotcfg rollback(slot=$ACTIVE_SLOT):N=1 以 state.previous 为 master 权威(P3 master-only 则保留当前 tuple)→slot-aware saga+三态 state commit/reconcile"
       return 0
     fi
     rollback_runtime_tuple "$ROLLBACK_N" || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
@@ -1860,17 +1916,53 @@ rollback() {
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
 }
 
-# tuple 感知回滚(M7):从**同一条** history 记录(倒数第 N+1 条 committed;last=当前 live,故
-# N=1→倒数第2条=上一激活)同时取回 master 源码目录(masterRelease)与 runtime tuple(image/id/
-# release/bundle),一起走同一激活 saga(任一步失败自动恢复现场)。成功后 history 追加一条(=回滚也
-# 留痕,last committed 恒=live)。根治旧实现"master 从 .prev-release、tuple 从 history 各取一源"的错位。
+# tuple 感知回滚：N=1 的 master 目标**永远**以 deploy_state.previous_active_release 为权威。
+# 若 history.last.masterRelease==active_release，说明最近一次 master+tuple 由 hotcfg 同步激活，
+# 上一条 history 必须与 previous 匹配并整条恢复；若不相等，说明中间经过 P3 finalize/传统
+# master-only 切换，runtime tuple 没变，故保留 env 当前四键、只回 previous master。N>1 只有
+# history.last 与 active 对齐时才允许相对寻址，否则 ancestry 已被 P3 插入，fail-closed 要求逐次 N=1。
 rollback_runtime_tuple() {
-  local n="$1" nth=$((n+1)) prev image image_id release bundle master flip_rev prev_src old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
-  prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$nth")"
-  [[ -n "$prev" ]] || { echo "✗ history 无倒数第 $nth 条 committed tuple 可回滚(N=$n)" >&2; return 1; }
+  local n="$1" nth prev last last_master image image_id release bundle master source_desc
+  nth=$((n+1))
+  local flip_rev prev_src old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
+  prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
+  [[ -n "$prev_src" ]] || { echo "✗ tuple 回滚前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  [[ "$prev_src" == "$ACTIVE_STATE_RELEASE" ]] || {
+    echo "✗ deploy_state.active_release=$ACTIVE_STATE_RELEASE 与 slot=$ACTIVE_SLOT symlink=$prev_src 不一致，拒绝回滚。" >&2
+    return 1
+  }
+  last="$(hotcfg_rmt oc_hotcfg_history_last_committed "$OC_HOTCFG_HISTORY")"
+  [[ -n "$last" ]] || { echo "✗ hotcfg history 无 committed tuple，无法安全回滚" >&2; return 1; }
+  last_master="$(jq -r '.masterRelease // ""' <<<"$last")"
+  if [[ "$n" == 1 ]]; then
+    master="$ACTIVE_STATE_PREVIOUS_RELEASE"
+    [[ -n "$master" ]] || { echo "✗ deploy_state.previous_active_release 为空，N=1 无权威回滚目标" >&2; return 1; }
+    if [[ "$last_master" == "$ACTIVE_STATE_RELEASE" ]]; then
+      prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
+      [[ -n "$prev" ]] || { echo "✗ history 缺上一条 committed tuple，但 state.previous=$master" >&2; return 1; }
+      [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$master" ]] || {
+        echo "✗ history 上一条 master 与 state.previous 不一致，拒绝多退/错配(history=$(jq -r '.masterRelease // ""' <<<"$prev") state=$master)" >&2
+        return 1
+      }
+      source_desc="history previous(同条 master+tuple)"
+    else
+      prev="$(hotcfg_rmt oc_hotcfg_env_tuple_json "$V5_ENV" "$master")"
+      [[ -n "$prev" ]] || { echo "✗ 无法读取当前 live tuple，拒绝 P3 master-only 回滚" >&2; return 1; }
+      source_desc="deploy_state previous + current env tuple(P3/master-only)"
+    fi
+  else
+    [[ "$last_master" == "$ACTIVE_STATE_RELEASE" ]] || {
+      echo "✗ N=$n 相对 history 回滚不安全：history.last.master=$last_master 与 active=$ACTIVE_STATE_RELEASE 不同。请逐次 --rollback=1。" >&2
+      return 1
+    }
+    prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$nth")"
+    [[ -n "$prev" ]] || { echo "✗ history 无倒数第 $nth 条 committed tuple 可回滚(N=$n)" >&2; return 1; }
+    master="$(jq -r '.masterRelease // ""' <<<"$prev")"
+    source_desc="history nth=$nth"
+  fi
   image="$(jq -r '.image' <<<"$prev")"; image_id="$(jq -r '.image_id' <<<"$prev")"
   release="$(jq -r '.release' <<<"$prev")"; bundle="$(jq -r '.bundle' <<<"$prev")"
-  master="$(jq -r '.masterRelease // ""' <<<"$prev")"
+  [[ -n "$master" ]] || master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
@@ -1879,8 +1971,6 @@ rollback_runtime_tuple() {
   if [[ -n "$bundle" && "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT"/bundles/* ]]; then
     flip_rev="${bundle##*/}"
   fi
-  prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
-  [[ -n "$prev_src" ]] || { echo "✗ tuple 回滚前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
   # M7c:快照翻转前的 .prev-release,saga 失败时一并还原
   if [[ "$ACTIVE_SLOT" == A ]]; then
     old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
@@ -1897,14 +1987,14 @@ rollback_runtime_tuple() {
   extra_revert="$prev_revert rm -f '$ACTIVE_SRC.hotlink'; ln -s '$prev_src' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
   sync_assets_to_pool "$master" || return 1
   build_hotcfg_state_hooks "$master"
-  echo "  回滚到倒数第 $nth 条 committed tuple(同条恢复,四键逐字面含空值): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
+  echo "  回滚计划($source_desc): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
   # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
   hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" || return 1
+    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" || return 1
   ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
   ACTIVE_STATE_RELEASE="$master"
   ACTIVE_STATE_LOCK_VERSION=$((ACTIVE_STATE_LOCK_VERSION + 1))
@@ -2711,6 +2801,12 @@ if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
   fi
   printf 'pid=%s mode=%s tree=%s started=%s\n' "$$" "$MODE" "$REPO_ROOT" "$(date -Is)" > "${DEPLOY_LOCK}.holder"
   trap 'rm -f "${DEPLOY_LOCK}.holder"' EXIT
+fi
+
+# 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新
+# 发布覆盖现场证据。只读 smoke 仍允许，供人工诊断；dry-run 不访问远端。
+if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
+  assert_no_deploy_recovery_marker || exit 1
 fi
 
 case "$MODE" in

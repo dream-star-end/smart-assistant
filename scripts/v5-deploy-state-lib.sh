@@ -93,6 +93,45 @@ RETURNING lock_version;
 SQL
 }
 
+# release CAS 的三态回读。expect_lv 是提交前 lock_version：
+#   applied  = commit 已生效且尚未补偿(lock=expect+1,target/previous=旧 active)
+#   original = commit 明确未生效(lock=expect,原 active/previous)
+#   reverted = commit 曾生效但已补偿(lock=expect+2,原 active/previous)
+#   unknown  = phase/candidate/slot/release/lock 任一不吻合，禁止猜测后继续改运行面。
+ds_stable_release_status_sql() {  # $1=expect_lv $2=slot $3=old_active $4=old_previous $5=target
+  local expect="$1" slot old_active_sql old_previous_sql target_sql
+  slot="$(ds_lit "$2")"; old_active_sql="$(ds_sql_nullable "$3")"
+  old_previous_sql="$(ds_sql_nullable "$4")"; target_sql="$(ds_sql_nullable "$5")"
+  cat <<SQL
+SELECT CASE
+  WHEN phase = 'stable'
+   AND candidate_slot IS NULL AND candidate_release IS NULL
+   AND active_slot = '$slot'
+   AND lock_version = $((expect + 1))
+   AND active_release IS NOT DISTINCT FROM $target_sql
+   AND previous_active_release IS NOT DISTINCT FROM $old_active_sql
+    THEN 'applied'
+  WHEN phase = 'stable'
+   AND candidate_slot IS NULL AND candidate_release IS NULL
+   AND active_slot = '$slot'
+   AND lock_version = $expect
+   AND active_release IS NOT DISTINCT FROM $old_active_sql
+   AND previous_active_release IS NOT DISTINCT FROM $old_previous_sql
+    THEN 'original'
+  WHEN phase = 'stable'
+   AND candidate_slot IS NULL AND candidate_release IS NULL
+   AND active_slot = '$slot'
+   AND lock_version = $((expect + 2))
+   AND active_release IS NOT DISTINCT FROM $old_active_sql
+   AND previous_active_release IS NOT DISTINCT FROM $old_previous_sql
+    THEN 'reverted'
+  ELSE 'unknown'
+END
+FROM deploy_state
+WHERE singleton = true;
+SQL
+}
+
 ds_stable_release_commit() {  # 参数同 ds_stable_release_commit_sql；成功 stdout=新 lock_version
   ds_exec <<<"$(ds_stable_release_commit_sql "$@")"
 }

@@ -537,6 +537,48 @@ if DOCKER_STUB_IMAGE_ID=sha256:HOOK3 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FIL
   bad "TP3 history 失败不应返回成功"
 else ok "TP3 history 失败触发 commit_revert"; fi
 chk "TP3 history 失败后外部权威补偿回 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+
+echo "== TP3b post-commit 丢回执 / reconcile unknown 的三态补偿 =="
+# apply 实际写 NEW 后返回非零(模拟 PG 已提交但客户端断连)；幂等 revert 确认 OLD 后，
+# saga 才能回切 env/master，且不应留下人工恢复标记。
+RECOVERY_MARK="$WORK/manual-recovery"; rm -f "$RECOVERY_MARK"
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD
+OC_RUNTIME_IMAGE_ID=sha256:OLD
+OC_RUNTIME_RELEASE=/rel/OLD
+OC_PLATFORM_BUNDLE=
+EOF
+MASTERPTR="$WORK/master.ptr"; echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"
+if DOCKER_STUB_IMAGE_ID=sha256:LOST oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:LOST sha256:LOST /rel/LOST "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
+  "/rel/masterLOST" "/rel/masterOLD" "echo NEW > '$STATEPTR'; false" \
+  "[ \"\$(cat '$STATEPTR')\" = NEW ] && echo OLD > '$STATEPTR'" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b post-commit 丢回执应让本次激活失败"
+else ok "TP3b post-commit 丢回执经 reconcile 后安全失败"; fi
+chk "TP3b reconcile 后 state=OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+chk "TP3b state 确认 OLD 后才回切 master/env" "[ \"\$(cat '$MASTERPTR')\" = OLD ] && [ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = img:OLD ]"
+chk "TP3b 已安全收敛不落人工恢复标记" "[ ! -e '$RECOVERY_MARK' ]"
+
+# history 失败后 revert/回读也失败：必须保持新运行面，不得盲回 OLD，并持久阻断后续激活。
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD2
+OC_RUNTIME_IMAGE_ID=sha256:OLD2
+OC_RUNTIME_RELEASE=/rel/OLD2
+OC_PLATFORM_BUNDLE=
+EOF
+echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"; rm -f "$RECOVERY_MARK"
+if DOCKER_STUB_IMAGE_ID=sha256:UNKNOWN oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:UNKNOWN sha256:UNKNOWN /rel/UNKNOWN "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
+  "/rel/masterUNKNOWN" "/rel/masterOLD" "echo NEW > '$STATEPTR'" "false" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b revert unknown 不应报告成功"
+else ok "TP3b revert unknown 进入人工恢复态"; fi
+chk "TP3b unknown 时 state 保持 NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
+chk "TP3b unknown 时禁止盲回运行面(master/env 仍 NEW)" "[ \"\$(cat '$MASTERPTR')\" = NEW ] && [ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = img:UNKNOWN ]"
+chk "TP3b unknown 落持久人工恢复标记" "[ -s '$RECOVERY_MARK' ] && grep -q 'master_target=/rel/masterUNKNOWN' '$RECOVERY_MARK'"
+if DOCKER_STUB_IMAGE_ID=sha256:BLOCKED oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:BLOCKED sha256:BLOCKED /rel/BLOCKED "" "true" "true" "" "" "/rel/masterBLOCKED" "" "" "" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b 有恢复标记时不应允许下一次激活"
+else ok "TP3b 恢复标记阻断后续激活"; fi
 # 恢复真实函数，避免污染后续 drill。
 source "$LIB"
 

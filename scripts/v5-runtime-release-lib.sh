@@ -729,6 +729,20 @@ oc_hotcfg_history_nth_committed() {
   done
 }
 
+# 把当前 env 四键包装成与 history committed 条目同形的恢复计划。P3 finalize 只切 master、
+# 不改 runtime tuple，因此当 history.last.masterRelease != deploy_state.active_release 时，
+# 即时回滚应保留这组 live tuple，只把 master 切回 previous_active_release。
+oc_hotcfg_env_tuple_json() {  # $1=env_file $2=master_release
+  local env_file="$1" master="$2" image image_id release bundle
+  image="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE)"
+  image_id="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE_ID)"
+  release="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_RELEASE)"
+  bundle="$(oc_hotcfg_env_get "$env_file" OC_PLATFORM_BUNDLE)"
+  jq -cn --arg image "$image" --arg image_id "$image_id" --arg release "$release" \
+    --arg bundle "$bundle" --arg masterRelease "$master" \
+    '{image:$image,image_id:$image_id,release:$release,bundle:$bundle,masterRelease:$masterRelease}'
+}
+
 # 追加一条 committed tuple(schemaVer=2,R2-M3):seq=上一 committed +1,temp+fsync+rename 落盘。
 # 用法:oc_hotcfg_history_append <hist> <image> <image_id> <release> <bundle> [masterRelease] [prestate]
 # masterRelease(M7)= 激活时 master 蓝绿 release 目录名;rollback 从同一条记录取回对齐 master 源码。
@@ -826,7 +840,7 @@ oc_hotcfg_assert_tuple_viable() {
 # 用法:oc_hotcfg_activate_saga <env_file> <platform_root> <flip_rev> <hist> \
 #         <image> <image_id> <release> <bundle_value> <restart_cmd> <smoke_cmd> \
 #         [extra_apply_cmd] [extra_revert_cmd] [master_release] [prev_master_release] \
-#         [commit_apply_cmd] [commit_revert_cmd]
+#         [commit_apply_cmd] [commit_revert_cmd] [manual_recovery_marker]
 # master_release(M7):激活时 master 蓝绿 release 目录,进 history 条目;rollback 从同一条记录取回对齐。
 # prev_master_release(R2-B2):激活**前**的 live master 目录,只用于首次启用的 pre-state 记录。
 oc_hotcfg_activate_saga() {
@@ -834,7 +848,13 @@ oc_hotcfg_activate_saga() {
   local image="$5" image_id="$6" release="$7" bundle_value="$8"
   local restart_cmd="$9" smoke_cmd="${10}"
   local extra_apply="${11:-}" extra_revert="${12:-}" master_release="${13:-}" prev_master_release="${14:-}"
-  local commit_apply="${15:-}" commit_revert="${16:-}"
+  local commit_apply="${15:-}" commit_revert="${16:-}" recovery_marker="${17:-}"
+
+  # 上一次外部权威提交若处于 unknown，禁止覆盖现场证据或开始另一轮激活。
+  if [ -n "$recovery_marker" ] && [ -e "$recovery_marker" ]; then
+    oc_hotcfg__die "activate_saga: 存在人工恢复标记，拒绝新激活: $recovery_marker"
+    return 1
+  fi
 
   # 0) R3-B1:tuple 可行性守卫(两轴全空也要跑 —— --disable-* 恰是高危场景)。
   #    R3-B2:守卫与 canary 都必须在 pre-state 记账**之前**:canary 失败若已留 history 条目,
@@ -871,28 +891,61 @@ oc_hotcfg_activate_saga() {
   [ -L "$platform_root/current" ] && old_current="$(readlink "$platform_root/current" || true)"
 
   # 已完成阶段的进度旗标,回滚只逆做已生效者。这些是本函数的局部状态,rollback 闭包内引用。
-  local extra_done=0 env_done=0 current_done=0 commit_done=0
+  local extra_done=0 env_done=0 current_done=0 commit_state=none
+
+  _hotcfg_mark_manual_recovery() { # $1=reason；保持新运行面不动，供人工按标记收敛。
+    local reason="$1" tmp
+    echo "FATAL [hotcfg] $reason；停止运行面补偿，进入人工恢复态" >&2
+    if [ -n "$recovery_marker" ]; then
+      tmp="$recovery_marker.tmp.$$"
+      umask 077
+      mkdir -p "$(dirname "$recovery_marker")" 2>/dev/null || true
+      {
+        printf 'ts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'reason=%s\n' "$reason"
+        printf 'master_target=%s\nmaster_previous=%s\n' "$master_release" "$prev_master_release"
+        printf 'history=%s\nsnapshot=%s\n' "$hist" "$snap"
+      } > "$tmp" && mv -f "$tmp" "$recovery_marker" \
+        || echo "FATAL [hotcfg] 人工恢复标记写入失败:$recovery_marker" >&2
+      echo "FATAL [hotcfg] 标记:$recovery_marker（核对 state/runtime 后人工移除）" >&2
+    fi
+  }
 
   # 集中回滚(不依赖 ERR trap;由各步 `if ! step` 显式触发。逆序复原后 restart 旧 master)。
   # trap 语义(§1.5)由"任一步失败→_saga_rollback→return 1"等价实现,且覆盖到 history 写为止:
   # history 写在最后一步,其失败同样走本回滚 → 满足"trap 持续到 history fsync 成功后才解除"。
   _hotcfg_saga_rollback() {
-    echo "⚠ [hotcfg] 激活 saga 失败 → 回滚全部并 restart 旧 master" >&2
-    # deploy_state 是 release 血缘权威；若 smoke 后已 CAS、但 history fsync 失败，先精确 CAS 回旧血缘。
-    if [ "$commit_done" = 1 ] && [ -n "$commit_revert" ]; then
-      eval "$commit_revert" || echo "FATAL [hotcfg] deploy_state 补偿 CAS 失败，须人工核查 release 血缘" >&2
+    local rb_failed=0
+    # deploy_state 是 release 血缘权威。只要提交已尝试且未明确 original，就先用幂等
+    # reconcile 钩子把 applied/不确定回执裁决并收敛到 old；未确认前绝不回切运行面。
+    if [ "$commit_state" = applied ] || [ "$commit_state" = uncertain ]; then
+      if [ -z "$commit_revert" ] || ! eval "$commit_revert"; then
+        _hotcfg_mark_manual_recovery "deploy_state commit/revert 无法确认(old 未证实,commit_state=$commit_state)"
+        return 1
+      fi
+      commit_state=old
     fi
+    echo "⚠ [hotcfg] 激活 saga 失败且 deploy_state=old 已确认 → 回滚运行面并 restart 旧 master" >&2
     if [ "$current_done" = 1 ]; then
       if [ -n "$old_current" ]; then
-        local t="$platform_root/.current.rb.$$"; rm -f "$t"; ln -s "$old_current" "$t"; mv -T "$t" "$platform_root/current" 2>/dev/null || true
+        local t="$platform_root/.current.rb.$$"
+        rm -f "$t"
+        ln -s "$old_current" "$t" && mv -T "$t" "$platform_root/current" 2>/dev/null || rb_failed=1
       else
-        rm -f "$platform_root/current" 2>/dev/null || true
+        rm -f "$platform_root/current" 2>/dev/null || rb_failed=1
       fi
     fi
-    [ "$env_done" = 1 ] && oc_hotcfg_env_restore_tuple "$env_file" "$snap"
-    if [ "$extra_done" = 1 ] && [ -n "$extra_revert" ]; then eval "$extra_revert" || true; fi
-    eval "$restart_cmd" || echo "⚠ [hotcfg] 回滚后 restart 旧 master 失败,须人工核查" >&2
+    if [ "$env_done" = 1 ]; then oc_hotcfg_env_restore_tuple "$env_file" "$snap" || rb_failed=1; fi
+    if [ "$extra_done" = 1 ] && [ -n "$extra_revert" ]; then eval "$extra_revert" || rb_failed=1; fi
+    eval "$restart_cmd" || rb_failed=1
+    # 回滚后的旧现场也必须过与新现场同强度 smoke；否则不能把“命令跑过”当作已收敛。
+    eval "$smoke_cmd" || rb_failed=1
+    if [ "$rb_failed" != 0 ]; then
+      _hotcfg_mark_manual_recovery "deploy_state 已恢复 old，但 env/current/master/restart/smoke 至少一项补偿失败"
+      return 1
+    fi
     rm -f "$snap"
+    return 0
   }
 
   # 2) extra:master 源码 symlink 翻转(可选,由 deploy-v5.sh 注入)
@@ -917,8 +970,16 @@ oc_hotcfg_activate_saga() {
   # 6.5) 可选外部权威提交(P3=deploy_state release CAS)。失败仍回滚 symlink/env/current+旧 master；
   #       成功后 history 若失败，commit_revert 与其它现场一起补偿。
   if [ -n "$commit_apply" ]; then
-    if ! eval "$commit_apply"; then _hotcfg_saga_rollback; return 1; fi
-    commit_done=1
+    # hook rc:0=applied；10=not-applied 且 original 已确认；其它=unknown。
+    # unknown 仍交给幂等 commit_revert 做最终 reconcile；失败则停止运行面补偿并落恢复标记。
+    if eval "$commit_apply"; then
+      commit_state=applied
+    else
+      local commit_rc=$?
+      if [ "$commit_rc" = 10 ]; then commit_state=old; else commit_state=uncertain; fi
+      _hotcfg_saga_rollback || true
+      return 1
+    fi
   fi
   # 7) commit:history append(fsync,含 masterRelease)。写失败仍触发回滚(覆盖到 history fsync+外部权威)
   if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value" "$master_release"; then

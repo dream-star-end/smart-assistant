@@ -197,6 +197,9 @@ SQL
 saved_db="$DS_DATABASE_URL"; DS_DATABASE_URL="postgres://test:test@127.0.0.1:1/nope"; : > "$FAKE_EFFECT_LOG"; ACTIVE_STATE_LOADED=0
 if load_active_lane_state_strict >/dev/null 2>&1; then bad "D1 PG 不可达不应解析 active lane"; else ok "D1 PG 不可达 fail-closed"; fi
 eq "D1 PG 失败前零副作用" "$(wc -l < "$FAKE_EFFECT_LOG")" "0"
+# release 删除型 GC 同样必须在 state 读取失败时整轮跳过，不能调用远端 rm。
+if gc_releases >/dev/null 2>&1; then ok "D1 release GC 在 PG 故障时安全跳过"; else bad "D1 release GC PG 故障不应报删除失败"; fi
+eq "D1 release GC PG 故障时远端零副作用" "$(wc -l < "$FAKE_EFFECT_LOG")" "0"
 DS_DATABASE_URL="$saved_db"
 
 # D2:active=B 成功路径，assets 必须先于 symlink，且只 restart B；DB 血缘原子对调。
@@ -212,15 +215,17 @@ flip_line="$(grep -n "ln -s '/rel/newB'" "$FAKE_EFFECT_LOG" | head -1 | cut -d: 
 grep -q "systemctl restart 'openclaude-v5-b.service'" "$FAKE_EFFECT_LOG" && ok "D2 restart B unit" || bad "D2 未 restart B unit"
 grep -q "systemctl restart 'openclaude-v5.service'" "$FAKE_EFFECT_LOG" && bad "D2 误 restart A unit" || ok "D2 未碰 A unit"
 
-# D3:起手快照后 lock 被推进 → release CAS 落空，必须回切旧 symlink/unit且不得报成功。
+# D3:起手快照后 lock 被其它操作推进 → release CAS 落空且状态不再是 exact original。
+# 此时不得猜测/盲回旧运行面；保持新运行面并进入人工恢复态。
 reset_traditional_state "/rel/oldB" "/rel/oldA" 10; FAKE_CURRENT="/rel/oldB"; : > "$FAKE_EFFECT_LOG"
 assert_no_rollout_in_progress; resolve_active_lane
 ds_exec <<<"UPDATE deploy_state SET lock_version=lock_version+1 WHERE singleton=true" >/dev/null
 if activate_release "/rel/racyB" >/dev/null 2>&1; then bad "D3 CAS 落空不应成功"; else ok "D3 CAS 落空返回失败"; fi
-eq "D3 symlink 已补偿回 oldB" "$FAKE_CURRENT" "/rel/oldB"
+eq "D3 unknown 时保持新 symlink 不盲回" "$FAKE_CURRENT" "/rel/racyB"
 eq "D3 DB active 仍 oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
-grep -q "ln -s '/rel/racyB'" "$FAKE_EFFECT_LOG" && grep -q "ln -s '/rel/oldB'" "$FAKE_EFFECT_LOG" \
-  && ok "D3 真实发生 new flip 后 old 补偿" || bad "D3 缺 flip/补偿行为证据"
+grep -q "ln -s '/rel/racyB'" "$FAKE_EFFECT_LOG" && ! grep -q "ln -s '/rel/oldB'" "$FAKE_EFFECT_LOG" \
+  && ok "D3 unknown 阻止盲目运行面补偿" || bad "D3 不应回切 old"
+grep -q "$DEPLOY_RECOVERY_MARKER" "$FAKE_EFFECT_LOG" && ok "D3 unknown 尝试落人工恢复标记" || bad "D3 缺人工恢复标记行为"
 
 # D4:assets 预同步失败时，symlink/systemd 零副作用。
 reset_traditional_state "/rel/oldB" "/rel/oldA" 20; FAKE_CURRENT="/rel/oldB"; : > "$FAKE_EFFECT_LOG"; FAKE_ASSET_FAIL=1
@@ -239,7 +244,76 @@ eq "D5 commit active=hotB" "$(ds_exec <<<"SELECT active_release FROM deploy_stat
 if eval "$HOTCFG_STATE_REVERT_CMD"; then ok "D5 hotcfg state revert hook 命中"; else bad "D5 hotcfg revert hook 失败"; fi
 eq "D5 revert active=oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
 eq "D5 revert previous=oldA" "$(ds_exec <<<"SELECT previous_active_release FROM deploy_state WHERE singleton=true")" "/rel/oldA"
-rm -f "$TEST_V5_ENV" "$FAKE_EFFECT_LOG"
+
+# D6:真实 UPDATE 已提交、客户端却丢回执。fake psql 首次执行 UPDATE 后强制 rc=1；commit hook
+# 必须靠 status 回读裁决 applied 并返回成功，随后 revert 仍能精确恢复。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 40; assert_no_rollout_in_progress; resolve_active_lane
+build_hotcfg_state_hooks "/rel/lost-receipt"
+REAL_PSQL="$(command -v psql)"; PSQL_WRAP="/tmp/p3-psql-wrap-$$"; mkdir -p "$PSQL_WRAP"
+cat > "$PSQL_WRAP/psql" <<WRAP
+#!/usr/bin/env bash
+set -e
+if [[ ! -e '$PSQL_WRAP/injected' && "\$*" == *'UPDATE deploy_state'* ]]; then
+  '$REAL_PSQL' "\$@" >/dev/null
+  : > '$PSQL_WRAP/injected'
+  exit 1
+fi
+exec '$REAL_PSQL' "\$@"
+WRAP
+chmod +x "$PSQL_WRAP/psql"
+if PATH="$PSQL_WRAP:$PATH" eval "$HOTCFG_STATE_COMMIT_CMD"; then ok "D6 post-commit 丢回执被回读裁决 applied"; else bad "D6 commit hook 应恢复 applied 回执"; fi
+eq "D6 DB 已是 lost-receipt" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/lost-receipt"
+if eval "$HOTCFG_STATE_REVERT_CMD"; then ok "D6 lost-receipt 后 revert 收敛"; else bad "D6 revert 应成功"; fi
+eq "D6 revert 后 active=oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
+
+# D7:非 hotcfg commit 已生效且首次回读失败；三次重试必须在第二次识别 applied、补偿并
+# 确认 reverted，之后才允许调用方回切运行面。
+reset_traditional_state "/rel/oldB" "/rel/oldA" 50; assert_no_rollout_in_progress; resolve_active_lane
+ds_stable_release_commit 50 B "/rel/oldB" "/rel/nonhot-lost" >/dev/null
+DS_EXEC_ORIG="$(declare -f ds_exec)"
+eval "$(declare -f ds_exec | sed '1s/ds_exec/ds_exec_real/')"
+DS_FAIL_MARK="/tmp/p3-ds-fail-once-$$"; rm -f "$DS_FAIL_MARK"
+ds_exec() {
+  if [[ ! -e "$DS_FAIL_MARK" ]]; then : > "$DS_FAIL_MARK"; return 1; fi
+  ds_exec_real
+}
+if restore_release_state_if_committed "/rel/nonhot-lost" >/dev/null 2>&1; then ok "D7 首次回读失败后重试并确认补偿"; else bad "D7 应在后续回读收敛"; fi
+eval "$DS_EXEC_ORIG"; unset -f ds_exec_real
+rm -f "$DS_FAIL_MARK"
+eq "D7 DB active 已恢复 oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
+eq "D7 DB previous 已恢复 oldA" "$(ds_exec <<<"SELECT previous_active_release FROM deploy_state WHERE singleton=true")" "/rel/oldA"
+
+# D8:hotcfg history 落后于 P3 master 切换时，N=1 必须用 state.previous，保留当前 env tuple；
+# A→B 与 B→A 两向都跑完整 rollback_runtime_tuple 编排到 saga 调用。
+HOTCFG_LAST_MASTER=""; HOTCFG_CURRENT_IMAGE="img:LIVE"; HOTCFG_CURRENT_RELEASE="/runtime/LIVE"; HOTCFG_CAPTURE="/tmp/p3-hotcfg-capture-$$"
+hotcfg_rmt() {
+  local fn="$1"; shift
+  case "$fn" in
+    oc_hotcfg_history_last_committed)
+      jq -cn --arg m "$HOTCFG_LAST_MASTER" '{image:"img:HIST",image_id:"id:HIST",release:"/runtime/HIST",bundle:"",masterRelease:$m}' ;;
+    oc_hotcfg_env_tuple_json)
+      jq -cn --arg i "$HOTCFG_CURRENT_IMAGE" --arg r "$HOTCFG_CURRENT_RELEASE" --arg m "$2" \
+        '{image:$i,image_id:"id:LIVE",release:$r,bundle:"",masterRelease:$m}' ;;
+    oc_hotcfg_activate_saga)
+      printf '%s|%s|%s|%s\n' "${13}" "${5}" "${7}" "$ACTIVE_SLOT" > "$HOTCFG_CAPTURE" ;;
+    *) return 1 ;;
+  esac
+}
+V5_ENV="$TEST_V5_ENV"
+# A(old) → B(new) finalize 后：history.last 仍 A；rollback target=A，tuple 保持 LIVE。
+ACTIVE_SLOT=B; ACTIVE_SRC="$(slot_src B)"; ACTIVE_UNIT="$(slot_unit B)"; ACTIVE_PORT="$(slot_port B)"
+ACTIVE_STATE_RELEASE="/rel/newB"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/oldA"; ACTIVE_STATE_LOCK_VERSION=60
+FAKE_CURRENT="/rel/newB"; HOTCFG_LAST_MASTER="/rel/oldA"
+if rollback_runtime_tuple 1; then ok "D8 A→B finalize 后 hotcfg rollback 编排成功"; else bad "D8 A→B rollback 不应多退"; fi
+eq "D8 A→B target=state.previous A 且保留 live tuple" "$(cat "$HOTCFG_CAPTURE")" "/rel/oldA|img:LIVE|/runtime/LIVE|B"
+# B(old) → A(new) finalize 后：history.last 可仍更老 A；rollback target=B，tuple 仍保持 LIVE。
+ACTIVE_SLOT=A; ACTIVE_SRC="$(slot_src A)"; ACTIVE_UNIT="$(slot_unit A)"; ACTIVE_PORT="$(slot_port A)"
+ACTIVE_STATE_RELEASE="/rel/newA"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/oldB"; ACTIVE_STATE_LOCK_VERSION=70
+FAKE_CURRENT="/rel/newA"; HOTCFG_LAST_MASTER="/rel/olderA"
+if rollback_runtime_tuple 1; then ok "D8 B→A finalize 后 hotcfg rollback 编排成功"; else bad "D8 B→A rollback 不应多退"; fi
+eq "D8 B→A target=state.previous B 且保留 live tuple" "$(cat "$HOTCFG_CAPTURE")" "/rel/oldB|img:LIVE|/runtime/LIVE|A"
+
+rm -rf "$PSQL_WRAP"; rm -f "$TEST_V5_ENV" "$FAKE_EFFECT_LOG" "$HOTCFG_CAPTURE"
 
 echo "── E) 真 PG 恢复路径:journal 原基线 / 缺失基线 / step6 candidate 异常 ──"
 # 外部效果全部换成可观测 fake；状态推进仍打本地真 PG。
