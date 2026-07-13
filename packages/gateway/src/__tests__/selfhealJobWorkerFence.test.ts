@@ -20,7 +20,7 @@ const { claimNextJob, closeSelfhealDb, getJob, insertJobReceived } = await impor
   '@openclaude/storage'
 )
 type AgentDefLike = import('@openclaude/storage').AgentDef
-const { SelfhealJobWorker } = await import('../selfheal/jobWorker.js')
+const { SelfhealJobWorker, claimSelfhealCapability } = await import('../selfheal/jobWorker.js')
 const { executeSelfhealCancel } = await import('../selfheal/cancel.js')
 type SessionManagerLike = import('../sessionManager.js').SessionManager
 
@@ -67,7 +67,7 @@ function fakeFetch() {
   const impl = (async (url: string | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init })
     if (String(url).includes('/claim-capability')) {
-      return { ok: true, status: 200, json: async () => ({ capability: 'cap-test' }) }
+      return { ok: true, status: 200, json: async () => ({ token: 'cap-test' }) }
     }
     return { ok: true, status: 200, json: async () => ({}) }
   }) as unknown as typeof fetch
@@ -94,6 +94,41 @@ function makeWorker(opts: {
     fetchImpl: opts.fetchImpl,
   })
 }
+
+function claimFetch(payload: unknown): typeof fetch {
+  return (async () => ({ ok: true, status: 200, json: async () => payload })) as unknown as typeof fetch
+}
+
+describe('claim-capability wire response', () => {
+  it('accepts the canonical token field', async () => {
+    const token = await claimSelfhealCapability({
+      callbackBaseUrl: 'http://127.0.0.1:1',
+      hmacSecret: 'test-secret-of-decent-length-123456',
+      repairId: '1',
+      fetchImpl: claimFetch({ token: 'cap-test' }),
+    })
+    assert.equal(token, 'cap-test')
+  })
+
+  for (const [name, payload] of [
+    ['missing token', {}],
+    ['empty token', { token: '' }],
+    ['non-string token', { token: 123 }],
+    ['legacy capability field', { capability: 'cap-test' }],
+  ] as const) {
+    it(`rejects ${name}`, async () => {
+      await assert.rejects(
+        claimSelfhealCapability({
+          callbackBaseUrl: 'http://127.0.0.1:1',
+          hmacSecret: 'test-secret-of-decent-length-123456',
+          repairId: '1',
+          fetchImpl: claimFetch(payload),
+        }),
+        /claim-capability response missing token/,
+      )
+    })
+  }
+})
 
 type ProcessJobRunner = { processJob(job: unknown): Promise<void> }
 
