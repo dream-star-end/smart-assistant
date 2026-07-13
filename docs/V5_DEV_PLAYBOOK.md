@@ -231,6 +231,12 @@ bash scripts/deploy-v5.sh [--egress]         # 快照(.prev.1..5 可 --rollback)
 bash scripts/deploy-v5.sh --dist
 bash scripts/deploy-v5.sh --smoke
 
+# 仅隔离预发宿主的 80 已被无关服务占用时，在线 deploy/P3 lane 可显式覆盖 Caddy 端口：
+CADDY_HTTP_PORT=18081 KL_HOST=kl-hk bash scripts/deploy-v5.sh --canary
+# 非 80 配置会自动 bind 127.0.0.1；预发 monitor 同步传
+# V5MON_PUBLIC_URL=http://127.0.0.1:18081/healthz。生产不得设置 CADDY_HTTP_PORT，恒用默认 80。
+# 此覆盖不支持 prepare/offline-cutover lane（该紧急通道仍固定生产 80）。
+
 # 版本握手(2026-07-07):bridge 每次 WS accept 下发 sys.frontend_build(服务端读 dist
 # index.html 的 <meta name="oc-build">,vite build 插件按最终 HTML 内容 sha256 注入),
 # 前端 lib/appUpdate.ts governor 在安全点软刷新拿新前端。防无限刷新硬上限=URL hash
