@@ -258,16 +258,28 @@ export async function dispatchRepair(
   const failedCount = Number(failedR.rows[0]?.n ?? 0);
   if (failedCount >= FAILED_ATTEMPT_FUSE) {
     d.logger.warn("selfheal_dispatch_fuse_blown", { incidentId, eventType, failedCount });
-    d.enqueueAlert({
-      event_type: OPS_REPAIR_FAILED,
-      severity: "critical",
-      title: `自愈修复连续失败,已停派待人工:${eventType}`,
-      body:
-        `incident=\`${incidentId}\` event=\`${eventType}\` 已累计 ${failedCount} 次修复失败,` +
-        `自愈派单保险丝已熔断,不再自动重试。请人工介入排查。`,
-      payload: { incident_id: incidentId, event_type: eventType, failed_count: failedCount },
-      dedupe_key: `${OPS_REPAIR_FAILED}:${incidentId}`,
-    });
+    const fuseDedupeKey = `${OPS_REPAIR_FAILED}:${incidentId}`;
+    // Outbox 的唯一索引只覆盖 pending/failed；sent 后同 key 可再次插入。
+    // 保险丝是 incident 级终态升级，历史上发过一次就永久跳过，避免 sweeper
+    // 每个 tick 都重新向企业微信推送同一条告警。
+    const alertedR = await d.query<{ one: number }>(
+      `SELECT 1 AS one FROM admin_alert_outbox
+        WHERE event_type = $1 AND dedupe_key = $2
+        LIMIT 1`,
+      [OPS_REPAIR_FAILED, fuseDedupeKey],
+    );
+    if (alertedR.rows.length === 0) {
+      d.enqueueAlert({
+        event_type: OPS_REPAIR_FAILED,
+        severity: "critical",
+        title: `自愈修复连续失败,已停派待人工:${eventType}`,
+        body:
+          `incident=\`${incidentId}\` event=\`${eventType}\` 已累计 ${failedCount} 次修复失败,` +
+          `自愈派单保险丝已熔断,不再自动重试。请人工介入排查。`,
+        payload: { incident_id: incidentId, event_type: eventType, failed_count: failedCount },
+        dedupe_key: fuseDedupeKey,
+      });
+    }
     return { status: "skipped", reason: "fuse_failed" };
   }
 
