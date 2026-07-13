@@ -1,4 +1,4 @@
--- 0135 — 连接器平台 P1 切片①:Contract 内核落库(信任产物分列 + 三表版本 pin)。
+-- 0138 — 连接器平台 P1 切片①:Contract 内核落库(信任产物分列 + 三表版本 pin)。
 --
 -- 权威:v5-connector-platform-rfc-2026-07-11.md §1.1/§6.1/§10。纯 additive,存量行不受影响
 -- (全部 ADD COLUMN 可空 / 带 DEFAULT;仅扩 kind CHECK 白名单)。slice① 不接真实网络,

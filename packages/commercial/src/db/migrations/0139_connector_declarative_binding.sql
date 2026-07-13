@@ -1,4 +1,4 @@
--- 0136 连接器平台 · 声明式绑定(slice③)
+-- 0139 连接器平台 · 声明式绑定(slice③)
 --
 -- connections 表从"v1 四个手写 provider"升级为"声明式平台的单一绑定表":
 --   1. 放开 provider 硬编码白名单 CHECK → slug 形状约束。声明式连接的 provider = listing slug,

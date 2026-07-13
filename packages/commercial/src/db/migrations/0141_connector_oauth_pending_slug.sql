@@ -1,4 +1,4 @@
--- 0138 连接器平台 · oauth pending 放开到声明式 slug(oauth2-auth-code 切片 B)
+-- 0141 连接器平台 · oauth pending 放开到声明式 slug(oauth2-auth-code 切片 B)
 --
 -- connector_oauth_pending.provider 原为 v1 硬编码枚举 CHECK (provider IN ('feishu'))。声明式
 -- oauth2-auth-code 连接器的 provider = listing slug(与 connections.provider 同语义、同形状),

@@ -1,4 +1,4 @@
--- 0137 连接器平台 · token 交换缓存(slice⑤ token 引擎)
+-- 0140 连接器平台 · token 交换缓存(slice⑤ token 引擎)
 --
 -- token-exchange 连接器:引擎用连接里的交换凭据(client_secret/refresh_token,永不进容器)向
 -- token 受众 origin 换取短寿命 access_token。为避免每次调用都重换,缓存加密的 access_token。

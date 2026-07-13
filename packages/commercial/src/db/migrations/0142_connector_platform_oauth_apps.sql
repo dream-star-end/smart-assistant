@@ -1,4 +1,4 @@
--- 0139 连接器平台 · 平台自有 OAuth App 凭据(clientProvisioning='platform' 的信任闸)
+-- 0142 连接器平台 · 平台自有 OAuth App 凭据(clientProvisioning='platform' 的信任闸)
 --
 -- 背景:oauth2-auth-code 此前只有 BYOA 一种形态 —— 用户自己去 provider 后台注册 OAuth App、
 -- 把 client_id/client_secret 填进表单。对普通用户这是劝退级门槛。平台模式让**平台**注册一次
