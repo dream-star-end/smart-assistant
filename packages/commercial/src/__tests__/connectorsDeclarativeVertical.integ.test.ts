@@ -35,10 +35,14 @@ import {
   executeDeclarativeWrite,
   proposeDeclarativeWrite,
 } from '../connectors/engine/write.js'
-import { approveConfirmation } from '../connectors/ledger.js'
+import { approveConfirmation, denyConfirmation } from '../connectors/ledger.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
-import { revokeExecVersion, securityApprove } from '../connectors/spec/review.js'
+import {
+  markFunctionalVerified,
+  revokeExecVersion,
+  securityApprove,
+} from '../connectors/spec/review.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
@@ -291,6 +295,7 @@ async function approvedConnector(): Promise<{
     expectedSpecHash: specHash,
     pool: getPool(),
   })
+  await markFunctionalVerified(versionId, reviewer, getPool())
   const local = compileSpec(spec, decision)
   return { versionId, slug, specHash, execContractHash: local.execContractHash }
 }
@@ -572,6 +577,160 @@ async function boundConnection(
 }
 
 describe('声明式写门 propose→approve→execute', () => {
+  test('连接四 pin 任一漂移 → read/propose/execute 全部 fail-closed，零出站/零新账本', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { connectionId, userId } = await boundConnection(server, deps)
+      const other = await approvedConnector()
+      const baseline = await query<{
+        connector_version_id: string
+        spec_hash: Buffer
+        exec_contract_hash: Buffer
+        auth_contract_version: number
+      }>(
+        `SELECT connector_version_id::text AS connector_version_id, spec_hash,
+                exec_contract_hash, auth_contract_version
+           FROM connections WHERE id = $1::bigint`,
+        [connectionId],
+      )
+      const pins = baseline.rows[0]!
+      const restore = () =>
+        query(
+          `UPDATE connections
+              SET connector_version_id = $2, spec_hash = $3,
+                  exec_contract_hash = $4, auth_contract_version = $5
+            WHERE id = $1::bigint`,
+          [
+            connectionId,
+            pins.connector_version_id,
+            pins.spec_hash,
+            pins.exec_contract_hash,
+            pins.auth_contract_version,
+          ],
+        )
+      const cases: Array<{ name: string; mutate: () => Promise<unknown> }> = [
+        {
+          name: 'connector_version_id',
+          mutate: () =>
+            query('UPDATE connections SET connector_version_id = $2 WHERE id = $1::bigint', [
+              connectionId,
+              other.versionId,
+            ]),
+        },
+        {
+          name: 'spec_hash',
+          mutate: () =>
+            query(
+              `UPDATE connections SET spec_hash = decode(repeat('00', 32), 'hex')
+                WHERE id = $1::bigint`,
+              [connectionId],
+            ),
+        },
+        {
+          name: 'exec_contract_hash',
+          mutate: () =>
+            query(
+              `UPDATE connections SET exec_contract_hash = decode(repeat('00', 32), 'hex')
+                WHERE id = $1::bigint`,
+              [connectionId],
+            ),
+        },
+        {
+          name: 'auth_contract_version',
+          mutate: () =>
+            query('UPDATE connections SET auth_contract_version = $2 WHERE id = $1::bigint', [
+              connectionId,
+              pins.auth_contract_version + 1,
+            ]),
+        },
+      ]
+      const confirmations: string[] = []
+      for (const c of cases) {
+        await restore()
+        const prop = await proposeDeclarativeWrite(
+          { connectionId, userId, actionId: 'create_page', params: {} },
+          getPool(),
+        )
+        confirmations.push(prop.confirmId)
+        await approveConfirmation(prop.confirmId, userId, getPool())
+        const before = await query<{ n: string }>(
+          'SELECT count(*)::text AS n FROM connector_write_ledger WHERE user_id = $1',
+          [userId],
+        )
+        await c.mutate()
+        await assert.rejects(
+          executeDeclarativeAction(
+            { connectionId, userId, actionId: 'get_page', params: { pageId: 'p' }, deps },
+            getPool(),
+          ),
+          isConnErr('RELINK_REQUIRED'),
+          `${c.name}: read`,
+        )
+        await assert.rejects(
+          proposeDeclarativeWrite(
+            { connectionId, userId, actionId: 'create_page', params: {} },
+            getPool(),
+          ),
+          isConnErr('RELINK_REQUIRED'),
+          `${c.name}: propose`,
+        )
+        await assert.rejects(
+          executeDeclarativeWrite(
+            { connectionId, userId, confirmId: prop.confirmId, deps },
+            getPool(),
+          ),
+          isConnErr('RELINK_REQUIRED'),
+          `${c.name}: execute`,
+        )
+        const after = await query<{ n: string }>(
+          'SELECT count(*)::text AS n FROM connector_write_ledger WHERE user_id = $1',
+          [userId],
+        )
+        assert.equal(after.rows[0]!.n, before.rows[0]!.n, `${c.name}: no new ledger`)
+        assert.equal(server.requests.length, 0, `${c.name}: no dispatch`)
+      }
+      await restore()
+      for (const confirmId of confirmations)
+        await denyConfirmation(confirmId, userId, getPool())
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('签名 params schema 在 read/propose 边界硬校验，错误类型/额外字段均不出站', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { connectionId, userId } = await boundConnection(server, deps)
+      await assert.rejects(
+        executeDeclarativeAction(
+          {
+            connectionId,
+            userId,
+            actionId: 'get_page',
+            params: { pageId: 42, extra: true },
+            deps,
+          },
+          getPool(),
+        ),
+        isConnErr('VALIDATION_FAILED'),
+      )
+      await assert.rejects(
+        proposeDeclarativeWrite(
+          { connectionId, userId, actionId: 'create_page', params: { extra: true } },
+          getPool(),
+        ),
+        isConnErr('VALIDATION_FAILED'),
+      )
+      assert.equal(server.requests.length, 0)
+    } finally {
+      await server.close()
+    }
+  })
+
   test('happy path:propose 不 dispatch;approve 后 execute 发写 + allowlist + 幂等 replay', async (t) => {
     if (skipIfNoDb(t)) return
     const server = await startServer()
@@ -671,6 +830,38 @@ describe('声明式写门 propose→approve→execute', () => {
         ),
         isConnErr('BAD_REQUEST'),
       )
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('账本契约 pin 漂移 → execute 终态 failed(RELINK_REQUIRED)，零 dispatch', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { connectionId, userId } = await boundConnection(server, deps)
+      const prop = await proposeDeclarativeWrite(
+        { connectionId, userId, actionId: 'create_page', params: {} },
+        getPool(),
+      )
+      await approveConfirmation(prop.confirmId, userId, getPool())
+      await query(
+        `UPDATE connector_write_ledger
+            SET exec_contract_hash = decode(repeat('00', 32), 'hex')
+          WHERE id = $1::uuid`,
+        [prop.confirmId],
+      )
+      await assert.rejects(
+        executeDeclarativeWrite({ connectionId, userId, confirmId: prop.confirmId, deps }, getPool()),
+        isConnErr('RELINK_REQUIRED'),
+      )
+      const ledger = await query<{ status: string; error_code: string }>(
+        'SELECT status, error_code FROM connector_write_ledger WHERE id = $1::uuid',
+        [prop.confirmId],
+      )
+      assert.deepEqual(ledger.rows[0], { status: 'failed', error_code: 'RELINK_REQUIRED' })
+      assert.equal(server.requests.length, 0)
     } finally {
       await server.close()
     }
@@ -791,6 +982,7 @@ async function approvedTokenExchange(): Promise<{ versionId: number; slug: strin
     expectedSpecHash: specHash,
     pool: getPool(),
   })
+  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
 }
 

@@ -272,7 +272,11 @@ describe('compileSpec', () => {
     const ok = baseSpec()
     ;(ok.actions as Record<string, unknown>[])[0].result = {
       type: 'array',
-      items: { type: 'object', additionalProperties: false, properties: { id: { type: 'integer' } } },
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { id: { type: 'integer' } },
+      },
     }
     assert.doesNotThrow(() => compileSpec(ok, baseDecision()))
 
@@ -400,7 +404,11 @@ describe('compileSpec', () => {
 
   test('identity:probeActionId=已声明 read action + pointer 合法 → 通过并签进 contract', () => {
     const spec = baseSpec()
-    spec.identity = { probeActionId: 'get_page', accountKeyPointer: '/id', accountHintPointer: '/name' }
+    spec.identity = {
+      probeActionId: 'get_page',
+      accountKeyPointer: '/id',
+      accountHintPointer: '/name',
+    }
     const { execContract } = compileSpec(spec, baseDecision())
     assert.deepEqual((execContract as Record<string, unknown>).identity, {
       probeActionId: 'get_page',
@@ -515,8 +523,9 @@ describe('compileSpec', () => {
 
   test('token-exchange:credentialFieldNames 引用不可注入 source → AUTH_SCHEMA_INVALID', () => {
     const spec = tokenExchangeSpec()
-    ;(spec.auth as Record<string, Record<string, Record<string, string>>>).exchangeRequest
-      .credentialFieldNames = { grant: 'access_token' } // access_token 非交换输入 source
+    ;(
+      spec.auth as Record<string, Record<string, Record<string, string>>>
+    ).exchangeRequest.credentialFieldNames = { grant: 'access_token' } // access_token 非交换输入 source
     assert.throws(() => compileSpec(spec, tokenExchangeDecision), isCode('AUTH_SCHEMA_INVALID'))
   })
 
@@ -656,6 +665,16 @@ describe('compileSpec', () => {
       type: 'object',
       additionalProperties: false,
       properties: { x: { $ref: 'https://evil/schema' } },
+    }
+    assert.throws(() => compileSpec(spec, baseDecision()), isCode('UNSAFE_SCHEMA'))
+  })
+
+  test('P0-4:执行器不支持的 schema keyword 在编译期拒绝', () => {
+    const spec = baseSpec()
+    ;(spec.actions as Record<string, unknown>[])[0].params = {
+      type: 'object',
+      additionalProperties: false,
+      unevaluatedProperties: false,
     }
     assert.throws(() => compileSpec(spec, baseDecision()), isCode('UNSAFE_SCHEMA'))
   })

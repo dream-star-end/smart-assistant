@@ -41,7 +41,6 @@ import { executeDeclarativeAction, loadContractForConnection } from './engine/ex
 import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
-import { loadVerifiedContractWithMeta } from './spec/review.js'
 import type { DnsResolver } from './outboundPolicy.js'
 import type { ConnectorRedis } from './providers/feishu.js'
 import { GITHUB_VIRTUAL_CONNECTION_ID } from './providers/github.js'
@@ -52,6 +51,7 @@ import {
   executeGithubAction,
   requireAction,
 } from './service.js'
+import { loadVerifiedContractWithMeta } from './spec/review.js'
 import {
   getActiveConnection,
   getConnectionAnyStatus,
@@ -338,7 +338,9 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
       if (path === CATALOG_PATH) {
         const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
         const query =
-          body !== null && typeof body === 'object' && typeof (body as { query?: unknown }).query === 'string'
+          body !== null &&
+          typeof body === 'object' &&
+          typeof (body as { query?: unknown }).query === 'string'
             ? (body as { query: string }).query
             : undefined
         await handleCatalog(res, pool, query)
@@ -532,9 +534,21 @@ async function handleDeclarativeCall(
   }
 
   if (body.confirmId) {
-    const r = await executeDeclarativeWrite(
-      { connectionId: declRow.id, userId: who.userId, confirmId: body.confirmId, deps: engineDeps },
-      pool,
+    const confirmId = body.confirmId
+    const r = await withConnectionSlot(`c:${declRow.id}`, () =>
+      executeDeclarativeWrite(
+        {
+          connectionId: declRow.id,
+          userId: who.userId,
+          confirmId,
+          deps: engineDeps,
+          beforeDispatch: async (effect) => {
+            if (effect === 'send')
+              await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
+          },
+        },
+        pool,
+      ),
     )
     if (r.kind === 'in_progress') {
       sendEnvelope(res, { kind: 'in_progress', id: body.confirmId })
@@ -579,6 +593,7 @@ async function handleDeclarativeCall(
   }
 
   // write/send → 走确认门(propose)。
+  await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
   const prop = await proposeDeclarativeWrite(
     { connectionId: declRow.id, userId: who.userId, actionId, params: body.params ?? {} },
     pool,

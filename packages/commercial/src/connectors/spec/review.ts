@@ -173,19 +173,34 @@ export async function securityApprove(input: SecurityApproveInput): Promise<Appr
   }, input.pool)
 }
 
-/** security_approved → functional_verified(隔离测试 dry-run 通过,§1.1)。 */
-export async function markFunctionalVerified(versionId: number, pool: Pool): Promise<void> {
-  const r = await pool.query(
-    `UPDATE marketplace_skill_versions
-        SET functional_verify_state = 'verified'
-      WHERE id = $1
-        AND security_review_state = 'security_approved'
-        AND functional_verify_state = 'unverified'
-        AND exec_revoked_at IS NULL`,
-    [versionId],
-  )
-  if (r.rowCount !== 1)
-    throw new ConnectorSpecError('INVALID_STATE', 'cannot mark functional-verified')
+/** security_approved → functional_verified；只允许 active admin，并留 verifier/time 审计。 */
+export async function markFunctionalVerified(
+  versionId: number,
+  verifierUserId: number,
+  pool: Pool,
+): Promise<void> {
+  await tx(async (client) => {
+    const verifier = await client.query<{ role: string; status: string }>(
+      'SELECT role, status FROM users WHERE id = $1',
+      [verifierUserId],
+    )
+    if (verifier.rows[0]?.role !== 'admin' || verifier.rows[0]?.status !== 'active') {
+      throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'verifier must be an active admin')
+    }
+    const r = await client.query(
+      `UPDATE marketplace_skill_versions
+          SET functional_verify_state = 'verified',
+              functional_verified_by = $2,
+              functional_verified_at = now()
+        WHERE id = $1
+          AND security_review_state = 'security_approved'
+          AND functional_verify_state = 'unverified'
+          AND exec_revoked_at IS NULL`,
+      [versionId, verifierUserId],
+    )
+    if (r.rowCount !== 1)
+      throw new ConnectorSpecError('INVALID_STATE', 'cannot mark functional-verified')
+  }, pool)
 }
 
 /** per-version kill switch(§1.1):置 exec_revoked_at。幂等(已 revoke 视作成功)。 */
@@ -249,6 +264,7 @@ export async function loadVerifiedContractWithMeta(
     slug: string
     kind: string
     security_review_state: string
+    functional_verify_state: string
     exec_revoked_at: Date | null
     exec_contract: unknown
     exec_contract_hash: Buffer | null
@@ -257,7 +273,8 @@ export async function loadVerifiedContractWithMeta(
     signature: Buffer | null
     key_id: string | null
   }>(
-    `SELECT v.slug, l.kind, v.security_review_state, v.exec_revoked_at, v.exec_contract,
+    `SELECT v.slug, l.kind, v.security_review_state, v.functional_verify_state,
+            v.exec_revoked_at, v.exec_contract,
             v.exec_contract_hash, v.compiler_version, v.security_policy_version, v.signature, v.key_id
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -271,6 +288,11 @@ export async function loadVerifiedContractWithMeta(
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
   if (row.security_review_state !== 'security_approved')
     throw new ConnectorSpecError('NOT_SECURITY_APPROVED', `state=${row.security_review_state}`)
+  if (row.functional_verify_state !== 'verified')
+    throw new ConnectorSpecError(
+      'NOT_FUNCTIONALLY_VERIFIED',
+      `state=${row.functional_verify_state}`,
+    )
   if (row.exec_revoked_at !== null)
     throw new ConnectorSpecError('EXEC_REVOKED', 'exec version revoked')
   if (

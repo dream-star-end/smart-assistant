@@ -414,6 +414,40 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     expect(screen.queryByText("Notion")).not.toBeInTheDocument();
   });
 
+  test("同 slug 的 v1 已绑连接仍合并展示，并按连接来源走 v1 解绑", async () => {
+    mockedGetConnectors.mockResolvedValue(
+      catalog([
+        conn({
+          id: "88",
+          provider: "notion",
+          displayName: "旧版 Notion",
+          accountHint: "workspace-v1",
+        }),
+      ]),
+    );
+    mockedDeclCatalog.mockResolvedValue({
+      connectors: [
+        declEntry({
+          slug: "notion",
+          label: "Notion（声明式）",
+          description: "声明式 Notion 引擎",
+        }),
+      ],
+    });
+    mockedDelete.mockResolvedValue({ ok: true });
+    render(<ConnectorsTab auth={auth} />);
+
+    await screen.findByText("Notion（声明式）");
+    const card = providerCard("Notion（声明式）");
+    expect(within(card).getByText("旧版 Notion")).toBeInTheDocument();
+    expect(within(card).getByText("已绑定 1 个账号")).toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "解绑" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "解绑" }));
+    await waitFor(() => expect(mockedDelete).toHaveBeenCalledWith(auth, "88"));
+    expect(mockedDeclUnbind).not.toHaveBeenCalled();
+  });
+
   test("声明式 bind:按 requiredBindSources 渲染字段→提交调 bindDeclarativeConnector(versionId+secrets)→reload", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedDeclCatalog.mockResolvedValue({

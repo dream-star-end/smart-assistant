@@ -160,6 +160,6 @@ export const feishuDefault: DefaultConnector = {
       apiOrigins: [ORIGIN],
       unauthenticatedUploadOrigins: [],
     },
-    actions: {},
+    actions: { send_message: { effect: 'send' } },
   },
 }

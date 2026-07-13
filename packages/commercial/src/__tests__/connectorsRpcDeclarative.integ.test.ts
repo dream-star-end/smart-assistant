@@ -21,6 +21,8 @@ import { hashSecret } from '../auth/containerIdentity.js'
 import { seedDefaultConnectors } from '../connectors/declarativeSeed.js'
 import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
+import { approveConfirmation } from '../connectors/ledger.js'
+import type { ConnectorRedis } from '../connectors/providers/feishu.js'
 import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
@@ -44,17 +46,31 @@ async function dropAllTables(): Promise<void> {
       EXECUTE 'DROP TABLE IF EXISTS public.'||quote_ident(r.tablename)||' CASCADE'; END LOOP; END $$;`)
 }
 
-function startServer(): Promise<{ port: number; close(): Promise<void> }> {
+function startServer(): Promise<{ port: number; requests: string[]; close(): Promise<void> }> {
   return new Promise((resolve) => {
+    const requests: string[] = []
     const server: Server = createServer((req, res) => {
       const u = new URL(req.url ?? '/', 'http://127.0.0.1')
       req.resume()
       req.on('end', () => {
+        requests.push(u.pathname)
         res.setHeader('content-type', 'application/json')
         if (u.pathname === '/v1/users/me')
           return res.end(JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }))
         if (u.pathname === '/v1/pages/pg1')
           return res.end(JSON.stringify({ id: 'pg1', url: 'https://n/pg1', leak: 'X' }))
+        if (u.pathname === '/open-apis/auth/v3/tenant_access_token/internal')
+          return res.end(
+            JSON.stringify({ code: 0, tenant_access_token: 'tenant-token', expire: 7200 }),
+          )
+        if (u.pathname === '/open-apis/bot/v3/info')
+          return res.end(
+            JSON.stringify({ code: 0, bot: { open_id: 'bot-rpc', app_name: 'RPC Bot' } }),
+          )
+        if (u.pathname === '/open-apis/im/v1/messages')
+          return res.end(
+            JSON.stringify({ code: 0, data: { message_id: 'msg-1', msg_type: 'text' } }),
+          )
         res.statusCode = 404
         res.end('{}')
       })
@@ -62,10 +78,24 @@ function startServer(): Promise<{ port: number; close(): Promise<void> }> {
     server.listen(0, '127.0.0.1', () => {
       resolve({
         port: (server.address() as AddressInfo).port,
+        requests,
         close: () => new Promise<void>((r) => server.close(() => r())),
       })
     })
   })
+}
+
+function makeGateRedis(): ConnectorRedis & { blockPrefix: string | null } {
+  return {
+    blockPrefix: null,
+    async eval(script: string, _numKeys: number, ...args: Array<string | number>) {
+      const key = String(args[0])
+      if (script.includes('EXISTS')) return 0
+      if (script.includes('INCR'))
+        return this.blockPrefix && key.startsWith(this.blockPrefix) ? -1 : 1
+      return 0
+    },
+  }
 }
 function localFetch(port: number): NonNullable<EngineHttpDeps['fetchImpl']> {
   return async (input, init) => {
@@ -97,7 +127,13 @@ function okResolver(): DnsResolver {
 function memRepo(containerId: number, userId: number, secretHash: Buffer): ContainerIdentityRepo {
   return {
     async findActiveByHostAndBoundIp() {
-      return { id: containerId, user_id: userId, bound_ip: BOUND_IP, host_uuid: HOST_UUID, secret_hash: secretHash }
+      return {
+        id: containerId,
+        user_id: userId,
+        bound_ip: BOUND_IP,
+        host_uuid: HOST_UUID,
+        secret_hash: secretHash,
+      }
     },
   }
 }
@@ -112,7 +148,10 @@ function mockReq(url: string, token: string, body: unknown): IncomingMessage {
   r.headers = { authorization: `Bearer ${token}` }
   return r as IncomingMessage
 }
-function mockRes(): { res: ServerResponse; parsed(): { status: number; env: Record<string, unknown> } } {
+function mockRes(): {
+  res: ServerResponse
+  parsed(): { status: number; env: Record<string, unknown> }
+} {
   const state = { status: 0, body: '' }
   const res = {
     statusCode: 0,
@@ -124,7 +163,10 @@ function mockRes(): { res: ServerResponse; parsed(): { status: number; env: Reco
   } as unknown as ServerResponse
   return {
     res,
-    parsed: () => ({ status: state.status, env: JSON.parse(state.body || '{}') as Record<string, unknown> }),
+    parsed: () => ({
+      status: state.status,
+      env: JSON.parse(state.body || '{}') as Record<string, unknown>,
+    }),
   }
 }
 
@@ -177,6 +219,106 @@ function skip(t: { skip: (r: string) => void }): boolean {
 }
 
 describe('声明式连接器 · 容器 RPC', () => {
+  test('声明式 propose 10/min 与 send 50/day 复用 v1 闸；send 超限账本终态 failed', async (t) => {
+    if (skip(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      await seedDefaultConnectors(getPool())
+      const versions = await query<{ id: string; slug: string }>(
+        `SELECT id::text AS id, slug FROM marketplace_skill_versions
+          WHERE slug IN ('notion','feishu')
+            AND security_review_state = 'security_approved'
+            AND functional_verify_state = 'verified'`,
+      )
+      const version = (slug: string) => Number(versions.rows.find((v) => v.slug === slug)!.id)
+      const userId = await mkUser()
+      const notion = await bindDeclarativeConnector(
+        {
+          userId,
+          connectorVersionId: version('notion'),
+          secrets: { access_token: 'notion-rpc-token' },
+          deps,
+        },
+        getPool(),
+      )
+      const feishu = await bindDeclarativeConnector(
+        {
+          userId,
+          connectorVersionId: version('feishu'),
+          secrets: { client_id: 'app-rpc', client_secret: 'secret-rpc' },
+          deps,
+        },
+        getPool(),
+      )
+
+      const containerId = 4455
+      const secret = randomBytes(32).toString('hex')
+      const token = `oc-v3.${containerId}.${secret}`
+      const redis = makeGateRedis()
+      const handler = makeConnectorsRpcHandler({
+        identityRepo: memRepo(containerId, userId, hashSecret(secret)),
+        redis,
+        resolver: okResolver(),
+        fetchImpl: localFetch(server.port),
+      })
+      const ctx = { hostUuid: HOST_UUID, boundIp: BOUND_IP }
+
+      redis.blockPrefix = 'connectors:propose:'
+      const limited = mockRes()
+      await handler(
+        mockReq('/v3/connectors/call', token, {
+          connectionId: notion.connectionId,
+          action: 'create_page',
+          params: { parentPageId: 'parent', title: 'title' },
+        }),
+        limited.res,
+        ctx,
+      )
+      assert.equal(limited.parsed().env.code, 'RATE_LIMITED')
+      const none = await query<{ n: string }>(
+        'SELECT count(*)::text AS n FROM connector_write_ledger WHERE user_id = $1',
+        [userId],
+      )
+      assert.equal(none.rows[0]!.n, '0')
+
+      redis.blockPrefix = null
+      const proposed = mockRes()
+      await handler(
+        mockReq('/v3/connectors/call', token, {
+          connectionId: feishu.connectionId,
+          action: 'send_message',
+          params: {
+            receiveIdType: 'chat_id',
+            receiveId: 'oc_chat',
+            msgType: 'text',
+            content: '{"text":"hello"}',
+          },
+        }),
+        proposed.res,
+        ctx,
+      )
+      const confirmId = String(proposed.parsed().env.id)
+      await approveConfirmation(confirmId, userId, getPool())
+      redis.blockPrefix = 'connectors:send:'
+      const denied = mockRes()
+      await handler(
+        mockReq('/v3/connectors/call', token, { connectionId: feishu.connectionId, confirmId }),
+        denied.res,
+        ctx,
+      )
+      assert.equal(denied.parsed().env.code, 'SEND_DAILY_CAP')
+      const ledger = await query<{ status: string; error_code: string }>(
+        'SELECT status, error_code FROM connector_write_ledger WHERE id = $1::uuid',
+        [confirmId],
+      )
+      assert.deepEqual(ledger.rows[0], { status: 'failed', error_code: 'SEND_DAILY_CAP' })
+      assert.equal(server.requests.includes('/open-apis/im/v1/messages'), false)
+    } finally {
+      await server.close()
+    }
+  })
+
   test('LIST 见声明式连接;CALL read → result allowlist;未知 action → error', async (t) => {
     if (skip(t)) return
     const server = await startServer()
@@ -215,7 +357,9 @@ describe('声明式连接器 · 容器 RPC', () => {
         const notion = conns.find((c) => c.id === bind.connectionId)
         assert.ok(notion, 'declarative notion connection listed')
         assert.equal(notion!.provider, 'notion')
-        const actionIds = (notion!.actions as Array<{ id: string; readOnly: boolean }>).map((a) => a.id)
+        const actionIds = (notion!.actions as Array<{ id: string; readOnly: boolean }>).map(
+          (a) => a.id,
+        )
         assert.ok(actionIds.includes('retrieve_page'))
         assert.ok(actionIds.includes('whoami'))
         // whoami/retrieve_page 是 read。

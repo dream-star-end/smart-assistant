@@ -18,14 +18,15 @@
 import type { Pool } from 'pg'
 import { getPool } from '../../db/index.js'
 import { ConnectorError } from '../errors.js'
-import { ConnectorSpecError, type ExecActionT, type ExecContractT } from '../spec/types.js'
 import { loadVerifiedContractWithMeta } from '../spec/review.js'
+import { ConnectorSpecError, type ExecActionT, type ExecContractT } from '../spec/types.js'
 import {
   type DeclarativeConnectionRow,
   decryptBagFromRow,
   getDeclarativeConnection,
 } from './binding.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
+import { validateDeclarativeParams } from './params.js'
 import { resolveApiCredentials } from './tokenEngine.js'
 
 export interface ExecuteDeclarativeInput {
@@ -46,8 +47,20 @@ export async function loadContractForConnection(
     throw new ConnectorError('RELINK_REQUIRED', 'connection has no pinned version')
   try {
     const meta = await loadVerifiedContractWithMeta(versionId, pool)
+    const specHash = row.spec_hash?.toString('hex') ?? ''
+    const execContractHash = row.exec_contract_hash?.toString('hex') ?? ''
+    if (
+      meta.versionId !== versionId ||
+      meta.slug !== row.provider ||
+      specHash !== meta.contract.spec_hash ||
+      execContractHash !== meta.execContractHash ||
+      row.auth_contract_version !== meta.authContractVersion
+    ) {
+      throw new ConnectorError('RELINK_REQUIRED', 'connection contract pins drifted')
+    }
     return { contract: meta.contract, execContractHash: meta.execContractHash }
   } catch (e) {
+    if (e instanceof ConnectorError) throw e
     if (e instanceof ConnectorSpecError)
       throw new ConnectorError('RELINK_REQUIRED', `pinned contract unusable: ${e.code}`)
     throw e
@@ -69,15 +82,11 @@ export async function executeDeclarativeAction(
   const row = await getDeclarativeConnection(input.connectionId, input.userId, pool)
   if (row === null) throw new ConnectorError('CONNECTION_NOT_FOUND', 'connection not found')
 
-  const { contract, execContractHash } = await loadContractForConnection(row, pool)
-
-  // ③ pin 复核:hash 漂移 → 重绑。
-  const pinnedHash = row.exec_contract_hash === null ? '' : row.exec_contract_hash.toString('hex')
-  if (pinnedHash !== execContractHash)
-    throw new ConnectorError('RELINK_REQUIRED', 'pinned exec_contract_hash drifted')
+  const { contract } = await loadContractForConnection(row, pool)
 
   const action: ExecActionT | undefined = contract.actions.find((a) => a.id === input.actionId)
-  if (action === undefined) throw new ConnectorError('ACTION_UNKNOWN', `unknown action ${input.actionId}`)
+  if (action === undefined)
+    throw new ConnectorError('ACTION_UNKNOWN', `unknown action ${input.actionId}`)
 
   // ④ effect 门:read 直执行;write/send 必须走确认门(proposeDeclarativeWrite → approve →
   //    executeDeclarativeWrite),不能从这里直接发。
@@ -87,12 +96,7 @@ export async function executeDeclarativeAction(
       `action effect ${action.effect} requires confirmation (use proposeDeclarativeWrite)`,
     )
 
-  // params 结构轻校验:必须是普通对象(driver 的 cloneNullProto 再深拒污染键/非 JSON 值)。
-  // 按签进 contract 的 action.params schema 做**类型级**入参校验属于 API 边界职责(P2 统一校验器
-  // 一处收口),此处不引第二套 JSON-Schema 校验;执行安全由 driver materialize 兜底(§4)。
-  const params = input.params ?? {}
-  if (typeof params !== 'object' || params === null || Array.isArray(params))
-    throw new ConnectorError('VALIDATION_FAILED', 'params must be an object')
+  const params = validateDeclarativeParams(action, input.params)
 
   const bag = decryptBagFromRow(row, contract)
   // connection 传下去 → token-exchange 走加密缓存;oauth2 过期时自动 refresh 轮换(行锁串行化)。

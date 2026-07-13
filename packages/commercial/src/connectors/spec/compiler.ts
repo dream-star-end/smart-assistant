@@ -73,6 +73,20 @@ const FORBIDDEN_SCHEMA_KEYS: ReadonlySet<string> = new Set([
   '$dynamicAnchor',
 ])
 const MAX_SCHEMA_DEPTH = 32
+const ALLOWED_SCHEMA_KEYS: ReadonlySet<string> = new Set([
+  'type',
+  'properties',
+  'required',
+  'additionalProperties',
+  'items',
+  'enum',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'minItems',
+  'maxItems',
+])
 
 export interface CompiledContract {
   execContract: ExecContractT
@@ -104,16 +118,58 @@ function assertNoPollutionKeysDeep(value: unknown, depth = 0): void {
 
 function assertSafeSchemaDeep(node: unknown, depth: number): void {
   if (depth > MAX_SCHEMA_DEPTH) throw new ConnectorSpecError('UNSAFE_SCHEMA', 'schema too deep')
-  if (Array.isArray(node)) {
-    for (const it of node) assertSafeSchemaDeep(it, depth + 1)
-    return
+  if (node === null || typeof node !== 'object' || Array.isArray(node))
+    throw new ConnectorSpecError('UNSAFE_SCHEMA', 'schema node must be an object')
+  const s = node as Record<string, unknown>
+  for (const k of Object.keys(s)) {
+    if (FORBIDDEN_SCHEMA_KEYS.has(k) || !ALLOWED_SCHEMA_KEYS.has(k))
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', `schema keyword '${k}' not allowed`)
   }
-  if (node !== null && typeof node === 'object') {
-    for (const k of Object.keys(node as Record<string, unknown>)) {
-      if (FORBIDDEN_SCHEMA_KEYS.has(k))
-        throw new ConnectorSpecError('UNSAFE_SCHEMA', `schema keyword '${k}' not allowed`)
-      assertSafeSchemaDeep((node as Record<string, unknown>)[k], depth + 1)
+  if (
+    !['object', 'array', 'string', 'integer', 'number', 'boolean', 'null'].includes(String(s.type))
+  )
+    throw new ConnectorSpecError('UNSAFE_SCHEMA', `schema type '${String(s.type)}' not allowed`)
+
+  if (s.properties !== undefined) {
+    if (
+      s.type !== 'object' ||
+      s.properties === null ||
+      typeof s.properties !== 'object' ||
+      Array.isArray(s.properties)
+    )
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'properties requires object schema')
+    for (const [name, child] of Object.entries(s.properties as Record<string, unknown>)) {
+      if (POLLUTION_KEYS.has(name))
+        throw new ConnectorSpecError('POLLUTION_KEY', `forbidden property '${name}'`)
+      assertSafeSchemaDeep(child, depth + 1)
     }
+  }
+  if (s.required !== undefined) {
+    if (
+      s.type !== 'object' ||
+      !Array.isArray(s.required) ||
+      s.required.some((name) => typeof name !== 'string')
+    )
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'required must be a string array')
+  }
+  if (s.additionalProperties !== undefined && typeof s.additionalProperties !== 'boolean')
+    throw new ConnectorSpecError('UNSAFE_SCHEMA', 'additionalProperties must be boolean')
+  if (s.items !== undefined) {
+    if (s.type !== 'array')
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'items requires array schema')
+    assertSafeSchemaDeep(s.items, depth + 1)
+  }
+  if (s.enum !== undefined) {
+    if (!Array.isArray(s.enum) || s.enum.length === 0 || s.enum.some((v) => typeof v === 'object'))
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'enum must contain scalar values')
+  }
+  for (const key of ['minLength', 'maxLength', 'minItems', 'maxItems'] as const) {
+    if (s[key] !== undefined && (!Number.isInteger(s[key]) || Number(s[key]) < 0))
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', `${key} must be a non-negative integer`)
+  }
+  for (const key of ['minimum', 'maximum'] as const) {
+    if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key])))
+      throw new ConnectorSpecError('UNSAFE_SCHEMA', `${key} must be finite`)
   }
 }
 
@@ -130,7 +186,10 @@ function assertSafeActionSchema(schema: unknown, kind: 'params' | 'result'): voi
   if (kind === 'result' && s.type === 'array') {
     const items = s.items
     if (items === null || typeof items !== 'object' || Array.isArray(items))
-      throw new ConnectorSpecError('UNSAFE_SCHEMA', 'result array items must be a JSON Schema object')
+      throw new ConnectorSpecError(
+        'UNSAFE_SCHEMA',
+        'result array items must be a JSON Schema object',
+      )
     const it = items as Record<string, unknown>
     if (it.type !== 'object')
       throw new ConnectorSpecError('UNSAFE_SCHEMA', "result array items type must be 'object'")
@@ -168,7 +227,10 @@ function normalizeOrigin(raw: string): string {
   try {
     return normalizeHttpsOrigin(raw)
   } catch (e) {
-    throw new ConnectorSpecError('BAD_ORIGIN', e instanceof Error ? e.message : `bad origin: ${raw}`)
+    throw new ConnectorSpecError(
+      'BAD_ORIGIN',
+      e instanceof Error ? e.message : `bad origin: ${raw}`,
+    )
   }
 }
 
@@ -196,7 +258,11 @@ function normalizeAudience(a: CredentialAudiencePolicyT): CredentialAudiencePoli
 // ─── request 校验(transform 前;pathTemplate 深层安全) ──────────────────────
 
 /** 静态请求头:名字禁保留头(authorization/host/content-type)+ 名/值禁 CRLF/控制符。 */
-const STATIC_HEADER_RESERVED: ReadonlySet<string> = new Set(['authorization', 'host', 'content-type'])
+const STATIC_HEADER_RESERVED: ReadonlySet<string> = new Set([
+  'authorization',
+  'host',
+  'content-type',
+])
 function validateStaticHeaders(headers: Record<string, string> | undefined): void {
   if (headers === undefined) return
   for (const [name, value] of Object.entries(headers)) {
@@ -204,7 +270,10 @@ function validateStaticHeaders(headers: Record<string, string> | undefined): voi
       throw new ConnectorSpecError('RESERVED_HEADER', `static header '${name}' is reserved`)
     // biome-ignore lint/suspicious/noControlCharactersInRegex: block CRLF/control in header value
     if (/[\x00-\x1f\x7f]/.test(value))
-      throw new ConnectorSpecError('BAD_PLACEMENT', `static header '${name}' value has control char`)
+      throw new ConnectorSpecError(
+        'BAD_PLACEMENT',
+        `static header '${name}' value has control char`,
+      )
   }
 }
 
@@ -276,7 +345,11 @@ function validatePath(path: string, paramsSchema: unknown): void {
  *       authorizeEndpoint → authorizationOrigins(浏览器重定向目标);
  *       tokenEndpoint / refreshEndpoint / revokeEndpoint → tokenOrigins(发 client_secret 的后端交换)。
  */
-function validateOauth2Endpoint(raw: string, allowedOrigins: readonly string[], label: string): void {
+function validateOauth2Endpoint(
+  raw: string,
+  allowedOrigins: readonly string[],
+  label: string,
+): void {
   let u: URL
   try {
     u = new URL(raw)
@@ -288,10 +361,16 @@ function validateOauth2Endpoint(raw: string, allowedOrigins: readonly string[], 
   if (u.username !== '' || u.password !== '')
     throw new ConnectorSpecError('BAD_ORIGIN', `oauth2 ${label} must not carry userinfo`)
   if (u.search !== '' || u.hash !== '')
-    throw new ConnectorSpecError('BAD_PATH_TEMPLATE', `oauth2 ${label} must not carry query/fragment`)
+    throw new ConnectorSpecError(
+      'BAD_PATH_TEMPLATE',
+      `oauth2 ${label} must not carry query/fragment`,
+    )
   const origin = normalizeOrigin(`${u.protocol}//${u.host}`)
   if (!allowedOrigins.includes(origin))
-    throw new ConnectorSpecError('AUDIENCE_MISSING', `oauth2 ${label} origin not in reviewed audience`)
+    throw new ConnectorSpecError(
+      'AUDIENCE_MISSING',
+      `oauth2 ${label} origin not in reviewed audience`,
+    )
   // path 静态安全(无占位符):传空 params schema,任何 {…} 即 BAD_PATH_PLACEHOLDER。
   validatePath(u.pathname, { properties: {} })
 }
@@ -520,7 +599,11 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       )
     if (audience.tokenOrigins.length === 0)
       throw new ConnectorSpecError('AUDIENCE_MISSING', 'oauth2-auth-code requires >=1 tokenOrigin')
-    validateOauth2Endpoint(auth.authorizeEndpoint, audience.authorizationOrigins, 'authorizeEndpoint')
+    validateOauth2Endpoint(
+      auth.authorizeEndpoint,
+      audience.authorizationOrigins,
+      'authorizeEndpoint',
+    )
     validateOauth2Endpoint(auth.tokenEndpoint, audience.tokenOrigins, 'tokenEndpoint')
     if (auth.refreshEndpoint !== undefined)
       validateOauth2Endpoint(auth.refreshEndpoint, audience.tokenOrigins, 'refreshEndpoint')

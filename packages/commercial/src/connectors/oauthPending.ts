@@ -60,6 +60,13 @@ export interface OauthDraft {
   connectorVersionId?: number
 }
 
+export interface OauthContractPins {
+  connectorVersionId: number
+  specHashHex: string
+  execContractHashHex: string
+  authContractVersion: number
+}
+
 function sha256(s: string): Buffer {
   return createHash('sha256').update(s, 'utf8').digest()
 }
@@ -152,7 +159,7 @@ export interface StartOauthPendingResult {
  * loadVerifiedContractWithMeta 的 DB 事实取,不接受用户输入;0138 已把 CHECK 放开到 slug 形状)。
  */
 export async function startOauthPending(
-  opts: { userId: number; provider: string; draft: OauthDraft },
+  opts: { userId: number; provider: string; draft: OauthDraft; pins?: OauthContractPins },
   pool: Pool = getPool(),
 ): Promise<StartOauthPendingResult> {
   const state = randomBytes(32).toString('base64url')
@@ -175,8 +182,10 @@ export async function startOauthPending(
   await pool.query(
     `INSERT INTO connector_oauth_pending
        (state_hash, user_id, provider, cookie_nonce_hash, draft_enc, draft_nonce,
-        aad_seed, created_at, expires_at, consumed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, now(), now() + interval '10 minutes', NULL)
+        aad_seed, created_at, expires_at, consumed_at,
+        connector_version_id, spec_hash, exec_contract_hash, auth_contract_version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, now(), now() + interval '10 minutes', NULL,
+             $8, $9, $10, $11)
      ON CONFLICT (user_id, provider) DO UPDATE SET
        state_hash = EXCLUDED.state_hash,
        cookie_nonce_hash = EXCLUDED.cookie_nonce_hash,
@@ -185,8 +194,24 @@ export async function startOauthPending(
        aad_seed = EXCLUDED.aad_seed,
        created_at = now(),
        expires_at = EXCLUDED.expires_at,
-       consumed_at = NULL`,
-    [stateHash, opts.userId, opts.provider, cookieNonceHash, enc.ciphertext, enc.nonce, aadSeed],
+       consumed_at = NULL,
+       connector_version_id = EXCLUDED.connector_version_id,
+       spec_hash = EXCLUDED.spec_hash,
+       exec_contract_hash = EXCLUDED.exec_contract_hash,
+       auth_contract_version = EXCLUDED.auth_contract_version`,
+    [
+      stateHash,
+      opts.userId,
+      opts.provider,
+      cookieNonceHash,
+      enc.ciphertext,
+      enc.nonce,
+      aadSeed,
+      opts.pins?.connectorVersionId ?? null,
+      opts.pins ? Buffer.from(opts.pins.specHashHex, 'hex') : null,
+      opts.pins ? Buffer.from(opts.pins.execContractHashHex, 'hex') : null,
+      opts.pins?.authContractVersion ?? null,
+    ],
   )
   return { state, stateHashHex, cookieNonce }
 }
@@ -198,6 +223,7 @@ export interface ConsumedOauthPending {
   /** v1 = provider 名;声明式 = listing slug。 */
   provider: string
   draft: OauthDraft
+  pins: OauthContractPins | null
 }
 
 interface PendingRow {
@@ -209,6 +235,10 @@ interface PendingRow {
   aad_seed: string
   expires_at: Date
   consumed_at: Date | null
+  connector_version_id: string | null
+  spec_hash: Buffer | null
+  exec_contract_hash: Buffer | null
+  auth_contract_version: number | null
 }
 
 /**
@@ -228,7 +258,9 @@ export async function consumeOauthPending(
   const held = await tx(async (client) => {
     const r = await client.query<PendingRow>(
       `SELECT user_id::int AS user_id, provider, cookie_nonce_hash, draft_enc, draft_nonce,
-              aad_seed::text AS aad_seed, expires_at, consumed_at
+              aad_seed::text AS aad_seed, expires_at, consumed_at,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version
          FROM connector_oauth_pending
         WHERE state_hash = $1
         FOR UPDATE`,
@@ -261,6 +293,15 @@ export async function consumeOauthPending(
       aadSeed: row.aad_seed,
       draftEnc: Buffer.from(row.draft_enc),
       draftNonce: Buffer.from(row.draft_nonce),
+      pins:
+        row.connector_version_id === null
+          ? null
+          : {
+              connectorVersionId: Number(row.connector_version_id),
+              specHashHex: Buffer.from(row.spec_hash!).toString('hex'),
+              execContractHashHex: Buffer.from(row.exec_contract_hash!).toString('hex'),
+              authContractVersion: Number(row.auth_contract_version),
+            },
     }
   }, pool)
 
@@ -291,7 +332,7 @@ export async function consumeOauthPending(
     ) {
       throw new ConnectorError('INTERNAL', 'oauth draft connectorVersionId invalid')
     }
-    return { userId: held.userId, provider: held.provider, draft }
+    return { userId: held.userId, provider: held.provider, draft, pins: held.pins }
   } finally {
     zeroBuffer(key)
     if (pt) zeroBuffer(pt)

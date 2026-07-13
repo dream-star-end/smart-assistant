@@ -346,6 +346,7 @@ describe('loadVerifiedContract', () => {
     const reviewer = await mkAdmin()
     const { versionId, slug, spec, specHash } = await mkVersion(author)
     await approve(versionId, reviewer, specHash)
+    await markFunctionalVerified(versionId, reviewer, getPool())
     return { versionId, slug, spec }
   }
 
@@ -366,6 +367,18 @@ describe('loadVerifiedContract', () => {
     await assert.rejects(
       loadVerifiedContract(versionId, getPool()),
       isCode('NOT_SECURITY_APPROVED'),
+    )
+  })
+
+  test('security approved 但未功能验收 → NOT_FUNCTIONALLY_VERIFIED', async (t) => {
+    if (skipIfNoDb(t)) return
+    const author = await mkUser()
+    const reviewer = await mkAdmin()
+    const { versionId, specHash } = await mkVersion(author)
+    await approve(versionId, reviewer, specHash)
+    await assert.rejects(
+      loadVerifiedContract(versionId, getPool()),
+      isCode('NOT_FUNCTIONALLY_VERIFIED'),
     )
   })
 
@@ -457,15 +470,19 @@ describe('markFunctionalVerified / revokeExecVersion', () => {
     const reviewer = await mkAdmin()
     const { versionId, specHash } = await mkVersion(author)
     await approve(versionId, reviewer, specHash)
-    await markFunctionalVerified(versionId, getPool())
+    await markFunctionalVerified(versionId, reviewer, getPool())
     assert.equal((await stateOf(versionId)).functional_verify_state, 'verified')
   })
 
   test('draft 不能直接 verified → INVALID_STATE', async (t) => {
     if (skipIfNoDb(t)) return
     const author = await mkUser()
+    const reviewer = await mkAdmin()
     const { versionId } = await mkVersion(author)
-    await assert.rejects(markFunctionalVerified(versionId, getPool()), isCode('INVALID_STATE'))
+    await assert.rejects(
+      markFunctionalVerified(versionId, reviewer, getPool()),
+      isCode('INVALID_STATE'),
+    )
   })
 
   test('revokeExecVersion 幂等', async (t) => {

@@ -50,7 +50,11 @@ import {
   upsertPlatformOauthApp,
 } from '../connectors/platformOauthApps.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
-import { loadVerifiedContractWithMeta, securityApprove } from '../connectors/spec/review.js'
+import {
+  loadVerifiedContractWithMeta,
+  markFunctionalVerified,
+  securityApprove,
+} from '../connectors/spec/review.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
@@ -362,6 +366,7 @@ async function approvedConnector(
     expectedSpecHash: specHash,
     pool: getPool(),
   })
+  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
 }
 

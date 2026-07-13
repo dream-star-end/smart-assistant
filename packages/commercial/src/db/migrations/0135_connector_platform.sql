@@ -16,6 +16,8 @@ ALTER TABLE marketplace_skill_versions
     CHECK (security_review_state IN ('draft','security_approved','security_rejected')),
   ADD COLUMN IF NOT EXISTS functional_verify_state TEXT NOT NULL DEFAULT 'unverified'
     CHECK (functional_verify_state IN ('unverified','verified')),
+  ADD COLUMN IF NOT EXISTS functional_verified_by BIGINT,
+  ADD COLUMN IF NOT EXISTS functional_verified_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS exec_revoked_at         TIMESTAMPTZ,  -- per-version kill switch
   ADD COLUMN IF NOT EXISTS security_reviewed_by    BIGINT,       -- ≠ author(应用层强制)
   ADD COLUMN IF NOT EXISTS security_reviewed_at    TIMESTAMPTZ,
@@ -57,3 +59,46 @@ ALTER TABLE connector_write_ledger
   ADD COLUMN IF NOT EXISTS spec_hash             BYTEA,
   ADD COLUMN IF NOT EXISTS exec_contract_hash    BYTEA,
   ADD COLUMN IF NOT EXISTS auth_contract_version INTEGER;
+
+-- 功能验收必须由真实 active admin 留痕；状态与审计列双向一致。
+ALTER TABLE marketplace_skill_versions
+  ADD CONSTRAINT marketplace_versions_functional_verifier_fk
+    FOREIGN KEY (functional_verified_by) REFERENCES users(id),
+  ADD CONSTRAINT marketplace_versions_functional_verify_shape
+    CHECK (
+      (functional_verify_state = 'unverified' AND functional_verified_by IS NULL AND functional_verified_at IS NULL)
+      OR
+      (functional_verify_state = 'verified' AND functional_verified_by IS NOT NULL AND functional_verified_at IS NOT NULL)
+    );
+
+-- v1 存量行四列全 NULL；声明式行四列必须全有，禁止“半 pin”。pending/ledger 的
+-- connector_version_id 也用 FK 钉到审核版本，不能伪造不存在的契约版本。
+ALTER TABLE connections
+  ADD CONSTRAINT connections_connector_version_fk
+    FOREIGN KEY (connector_version_id) REFERENCES marketplace_skill_versions(id),
+  ADD CONSTRAINT connections_connector_pins_shape
+    CHECK (
+      (connector_version_id IS NULL AND spec_hash IS NULL AND exec_contract_hash IS NULL AND auth_contract_version IS NULL)
+      OR
+      (connector_version_id IS NOT NULL AND spec_hash IS NOT NULL AND exec_contract_hash IS NOT NULL AND auth_contract_version IS NOT NULL)
+    );
+
+ALTER TABLE connector_oauth_pending
+  ADD CONSTRAINT connector_oauth_pending_version_fk
+    FOREIGN KEY (connector_version_id) REFERENCES marketplace_skill_versions(id),
+  ADD CONSTRAINT connector_oauth_pending_pins_shape
+    CHECK (
+      (connector_version_id IS NULL AND spec_hash IS NULL AND exec_contract_hash IS NULL AND auth_contract_version IS NULL)
+      OR
+      (connector_version_id IS NOT NULL AND spec_hash IS NOT NULL AND exec_contract_hash IS NOT NULL AND auth_contract_version IS NOT NULL)
+    );
+
+ALTER TABLE connector_write_ledger
+  ADD CONSTRAINT connector_write_ledger_version_fk
+    FOREIGN KEY (connector_version_id) REFERENCES marketplace_skill_versions(id),
+  ADD CONSTRAINT connector_write_ledger_pins_shape
+    CHECK (
+      (connector_version_id IS NULL AND spec_hash IS NULL AND exec_contract_hash IS NULL AND auth_contract_version IS NULL)
+      OR
+      (connector_version_id IS NOT NULL AND spec_hash IS NOT NULL AND exec_contract_hash IS NOT NULL AND auth_contract_version IS NOT NULL)
+    );

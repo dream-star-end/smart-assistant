@@ -19,25 +19,20 @@ import type { Pool } from 'pg'
 import { getPool } from '../../db/index.js'
 import { ConnectorError } from '../errors.js'
 import {
+  type LedgerStatus,
   beginExecute,
   finalizeExecute,
-  type LedgerStatus,
   proposeWrite,
   writeFinalizeStatus,
 } from '../ledger.js'
 import { canonicalSha256Hex } from '../spec/canonical.js'
 import type { ExecActionT } from '../spec/types.js'
-import { getDeclarativeConnection, decryptBagFromRow } from './binding.js'
+import { decryptBagFromRow, getDeclarativeConnection } from './binding.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
 import { loadContractForConnection, soleApiOrigin } from './execute.js'
-import { resolveApiCredentials } from './tokenEngine.js'
+import { validateDeclarativeParams } from './params.js'
 import { type RedactedRequestPlan, buildRequestPlan, redactedPlan } from './requestPlan.js'
-
-function asObjectParams(params: unknown): Record<string, unknown> {
-  if (typeof params !== 'object' || params === null || Array.isArray(params))
-    throw new ConnectorError('VALIDATION_FAILED', 'params must be an object')
-  return params as Record<string, unknown>
-}
+import { resolveApiCredentials } from './tokenEngine.js'
 
 export interface ProposeDeclarativeWriteInput {
   connectionId: string
@@ -63,9 +58,6 @@ export async function proposeDeclarativeWrite(
   if (row === null) throw new ConnectorError('CONNECTION_NOT_FOUND', 'connection not found')
 
   const { contract, execContractHash } = await loadContractForConnection(row, pool)
-  const pinnedHash = row.exec_contract_hash === null ? '' : row.exec_contract_hash.toString('hex')
-  if (pinnedHash !== execContractHash)
-    throw new ConnectorError('RELINK_REQUIRED', 'pinned exec_contract_hash drifted')
 
   const action: ExecActionT | undefined = contract.actions.find((a) => a.id === input.actionId)
   if (action === undefined)
@@ -76,15 +68,12 @@ export async function proposeDeclarativeWrite(
       'read action needs no confirmation (use executeDeclarativeAction)',
     )
 
-  const params = asObjectParams(input.params)
+  const params = validateDeclarativeParams(action, input.params)
   // 确定性导出 plan(同时对 params 做 materialize 期安全校验:CRLF/污染/占位符解析)。
   const plan = buildRequestPlan(action, params, soleApiOrigin(contract))
   const redacted = redactedPlan(plan)
   const query = redacted.query.map(([k]) => k).join(',')
-  const summary =
-    `${action.effect.toUpperCase()} ${action.id}: ${redacted.method} ${redacted.origin}${redacted.path}` +
-    (query ? `?${query}` : '') +
-    (redacted.hasBody ? ` (+body ${redacted.bodyBytes}B)` : '')
+  const summary = `${action.effect.toUpperCase()} ${action.id}: ${redacted.method} ${redacted.origin}${redacted.path}${query ? `?${query}` : ''}${redacted.hasBody ? ` (+body ${redacted.bodyBytes}B)` : ''}`
 
   const proposed = await proposeWrite(
     {
@@ -95,6 +84,12 @@ export async function proposeDeclarativeWrite(
       action: action.id,
       params,
       summary,
+      contractPins: {
+        connectorVersionId: Number(row.connector_version_id),
+        specHashHex: Buffer.from(row.spec_hash!).toString('hex'),
+        execContractHashHex: execContractHash,
+        authContractVersion: Number(row.auth_contract_version),
+      },
     },
     pool,
   )
@@ -112,6 +107,7 @@ export interface ExecuteDeclarativeWriteInput {
   userId: number
   confirmId: string
   deps?: EngineHttpDeps
+  beforeDispatch?: (effect: 'write' | 'send') => Promise<void>
 }
 
 export type ExecuteDeclarativeWriteResult =
@@ -136,7 +132,12 @@ export async function executeDeclarativeWrite(
 
   // 账本状态机:CAS approved→executing + 幂等/replay/过期/连接代数复核。权威源=账本行。
   const begin = await beginExecute(
-    { id: input.confirmId, userId: input.userId, connectionId: row.id, expectedProvider: row.provider },
+    {
+      id: input.confirmId,
+      userId: input.userId,
+      connectionId: row.id,
+      expectedProvider: row.provider,
+    },
     pool,
   )
   if (begin.kind === 'in_progress') return { kind: 'in_progress' }
@@ -151,8 +152,14 @@ export async function executeDeclarativeWrite(
   // kind === 'ok':按**账本行的 action**(不信调用方)从 pin 的 contract 取 ExecAction。
   const action: ExecActionT | undefined = contract.actions.find((a) => a.id === begin.row.action)
   if (action === undefined || action.effect === 'read') {
-    await finalizeExecute({ id: input.confirmId, status: 'failed', errorCode: 'ACTION_UNKNOWN' }, pool)
-    throw new ConnectorError('ACTION_UNKNOWN', 'ledger action not a write action in pinned contract')
+    await finalizeExecute(
+      { id: input.confirmId, status: 'failed', errorCode: 'ACTION_UNKNOWN' },
+      pool,
+    )
+    throw new ConnectorError(
+      'ACTION_UNKNOWN',
+      'ledger action not a write action in pinned contract',
+    )
   }
 
   // **凭据解析必须在 try 内**:账本此刻已 CAS 到 executing,凡在 finalize 之前抛出的错都必须被
@@ -160,6 +167,8 @@ export async function executeDeclarativeWrite(
   // 现在含网络调用(oauth2 过期 → refresh 轮换),失败是**常态而非意外**,更不能漏记。
   // 它在 dispatch 之前失败 → 请求根本没发出 → writeFinalizeStatus 给 'failed'(非 unknown),正确。
   try {
+    const params = validateDeclarativeParams(action, begin.params)
+    await input.beforeDispatch?.(action.effect)
     const bag = decryptBagFromRow(row, contract)
     // 同 execute:token-exchange 走缓存;oauth2 过期自动续期(行锁串行化)。
     const resolvedCreds = await resolveApiCredentials({
@@ -176,11 +185,15 @@ export async function executeDeclarativeWrite(
       credentialAudience: 'api',
       targetOrigin,
       resolvedCreds,
-      params: begin.params,
+      params,
       deps: input.deps,
     })
     await finalizeExecute(
-      { id: input.confirmId, status: 'succeeded', resultDigest: canonicalSha256Hex(result ?? null) },
+      {
+        id: input.confirmId,
+        status: 'succeeded',
+        resultDigest: canonicalSha256Hex(result ?? null),
+      },
       pool,
     )
     return { kind: 'ok', result }

@@ -41,6 +41,7 @@ import {
   getLedgerRow,
 } from './ledger.js'
 import {
+  type OauthContractPins,
   type OauthDraft,
   clearConnectorOauthCookie,
   consumeOauthPending,
@@ -568,6 +569,11 @@ async function handleOauthCallback(
   // ── 分流:draft 带 connectorVersionId → 声明式连接器(引擎路径);否则 v1 feishu(下方原逻辑)。
   //    上面的 state→provider→cookie→四因子消费是**两条路径共用的单一权威**,故绝不另开回调路由。
   if (consumed.draft.connectorVersionId !== undefined) {
+    if (consumed.pins === null) {
+      ctx.log.warn('connector_declarative_oauth_pins_missing', { provider })
+      sendRedirect(res, connectorErrorRedirect('CONNECTOR_UNAVAILABLE'))
+      return
+    }
     await completeDeclarativeOauth(res, ctx, {
       provider,
       versionId: consumed.draft.connectorVersionId,
@@ -576,6 +582,7 @@ async function handleOauthCallback(
       code,
       pool,
       deps,
+      pins: consumed.pins,
     })
     return
   }
@@ -664,6 +671,7 @@ interface DeclarativeOauthInput {
   code: string
   pool: Pool
   deps: CommercialHttpDeps
+  pins: OauthContractPins
 }
 
 /**
@@ -698,6 +706,14 @@ async function completeDeclarativeOauth(
     // pending 行的 provider 必须 == 契约 slug(两者都是 DB 事实;不等 = 数据错配,fail-closed)。
     if (meta.slug !== provider)
       throw new ConnectorError('BAD_REQUEST', 'pending provider does not match contract slug')
+    if (
+      input.pins.connectorVersionId !== meta.versionId ||
+      input.pins.specHashHex !== meta.contract.spec_hash ||
+      input.pins.execContractHashHex !== meta.execContractHash ||
+      input.pins.authContractVersion !== meta.authContractVersion
+    ) {
+      throw new ConnectorError('RELINK_REQUIRED', 'oauth pending contract pins drifted')
+    }
 
     // client 凭据取值分叉。**权威是契约,不是 draft** —— 即便 platform 连接器的 draft 里被塞进
     // client 凭据(理论上做不到:start 不落),这里也只认平台表。

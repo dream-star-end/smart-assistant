@@ -71,7 +71,13 @@ function requireVersionId(body: Record<string, unknown>): number {
 }
 
 /** GET declarative/catalog —— 已审可绑连接器目录(含 authMode / 需填 source / 动作)。 */
-async function handleCatalog(res: ServerResponse, pool: Pool): Promise<void> {
+async function handleCatalog(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: CommercialHttpDeps,
+  pool: Pool,
+): Promise<void> {
+  await requireAuth(req, deps.jwtSecret)
   // 目录查询/投影单一权威(与 agent RPC catalog 共用 listDeclarativeCatalog)。
   const catalog = await listDeclarativeCatalog(pool)
   sendJson(res, 200, { connectors: catalog })
@@ -184,6 +190,12 @@ async function handleOauthStart(
         connectorVersionId: meta.versionId,
         ...(displayName ? { displayName } : {}),
       },
+      pins: {
+        connectorVersionId: meta.versionId,
+        specHashHex: meta.contract.spec_hash,
+        execContractHashHex: meta.execContractHash,
+        authContractVersion: meta.authContractVersion,
+      },
     },
     pool,
   )
@@ -252,7 +264,7 @@ export async function dispatchDeclarativeConnectors(
   const pool = getPool()
   try {
     if (subSegs.length === 1 && subSegs[0] === 'catalog' && method === 'GET') {
-      await handleCatalog(res, pool)
+      await handleCatalog(req, res, deps, pool)
       return
     }
     if (subSegs.length === 1 && subSegs[0] === 'bind' && method === 'POST') {

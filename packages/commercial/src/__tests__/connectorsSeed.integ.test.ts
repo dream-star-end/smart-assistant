@@ -17,10 +17,7 @@ import { seedDefaultConnectors } from '../connectors/declarativeSeed.js'
 import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
 import { executeDeclarativeAction } from '../connectors/engine/execute.js'
-import {
-  executeDeclarativeWrite,
-  proposeDeclarativeWrite,
-} from '../connectors/engine/write.js'
+import { executeDeclarativeWrite, proposeDeclarativeWrite } from '../connectors/engine/write.js'
 import { approveConfirmation } from '../connectors/ledger.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
@@ -57,7 +54,10 @@ interface TestServer {
 }
 function startServer(): Promise<TestServer> {
   return new Promise((resolve) => {
-    let handler: (p: string) => { status: number; body: string } = () => ({ status: 404, body: '{}' })
+    let handler: (p: string) => { status: number; body: string } = () => ({
+      status: 404,
+      body: '{}',
+    })
     let last: CapturedRequest | null = null
     const server: Server = createServer((req, res) => {
       const u = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -183,20 +183,34 @@ describe('默认连接器 seed', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler((p) => {
         if (p === '/v1/users/me')
-          return { status: 200, body: JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }) }
+          return {
+            status: 200,
+            body: JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }),
+          }
         if (p === '/v1/pages/pg1')
           return { status: 200, body: JSON.stringify({ id: 'pg1', url: 'u', extra: 'LEAK' }) }
         return { status: 404, body: '{}' }
       })
       const user = await mkUser()
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: versionId, secrets: { access_token: 'ntn-secret-token' }, deps },
+        {
+          userId: user,
+          connectorVersionId: versionId,
+          secrets: { access_token: 'ntn-secret-token' },
+          deps,
+        },
         getPool(),
       )
       assert.equal(bind.accountHint, 'WS')
 
       const page = await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'retrieve_page', params: { pageId: 'pg1' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'retrieve_page',
+          params: { pageId: 'pg1' },
+          deps,
+        },
         getPool(),
       )
       // allowlist:extra 剥掉,只留声明的字段。
@@ -223,9 +237,15 @@ describe('默认连接器 seed', () => {
       const SECRET = 'FEISHU-APP-SECRET-CANARY'
       server.setHandler((p) => {
         if (p === '/open-apis/auth/v3/tenant_access_token/internal')
-          return { status: 200, body: JSON.stringify({ code: 0, tenant_access_token: 't-abc', expire: 7200 }) }
+          return {
+            status: 200,
+            body: JSON.stringify({ code: 0, tenant_access_token: 't-abc', expire: 7200 }),
+          }
         if (p === '/open-apis/bot/v3/info')
-          return { status: 200, body: JSON.stringify({ code: 0, bot: { open_id: 'ou_1', app_name: 'MyBot' } }) }
+          return {
+            status: 200,
+            body: JSON.stringify({ code: 0, bot: { open_id: 'ou_1', app_name: 'MyBot' } }),
+          }
         return { status: 404, body: '{}' }
       })
       const user = await mkUser()
@@ -265,9 +285,15 @@ describe('默认连接器 seed', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler((p) => {
         if (p === '/v1/users/me')
-          return { status: 200, body: JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }) }
+          return {
+            status: 200,
+            body: JSON.stringify({ id: 'bot-1', bot: { workspace_name: 'WS' } }),
+          }
         if (p === '/v1/pages')
-          return { status: 200, body: JSON.stringify({ id: 'new-pg', url: 'https://n/new', extra: 'LEAK' }) }
+          return {
+            status: 200,
+            body: JSON.stringify({ id: 'new-pg', url: 'https://n/new', extra: 'LEAK' }),
+          }
         return { status: 404, body: '{}' }
       })
       const user = await mkUser()
@@ -293,7 +319,10 @@ describe('默认连接器 seed', () => {
 
       // ② 未确认执行 → 拒。
       await assert.rejects(
-        executeDeclarativeWrite({ connectionId: bind.connectionId, userId: user, confirmId: prop.confirmId, deps }, getPool()),
+        executeDeclarativeWrite(
+          { connectionId: bind.connectionId, userId: user, confirmId: prop.confirmId, deps },
+          getPool(),
+        ),
       )
 
       // ③ 确认后执行 → 上游收到 POST /v1/pages,嵌套体正确;结果 allowlist 投影(extra 剥掉)。
@@ -313,5 +342,73 @@ describe('默认连接器 seed', () => {
     } finally {
       await server.close()
     }
+  })
+
+  test('seed 可恢复 security 已审但 functional 未验收的中断状态，不重复插版本', async (t) => {
+    if (skip(t)) return
+    const before = await query<{ id: string }>(
+      `SELECT id::text AS id FROM marketplace_skill_versions
+        WHERE slug = 'notion' AND security_review_state = 'security_approved'
+        ORDER BY id DESC LIMIT 1`,
+    )
+    const versionId = Number(before.rows[0]!.id)
+    await query(
+      `UPDATE marketplace_skill_versions
+          SET functional_verify_state = 'unverified',
+              functional_verified_by = NULL,
+              functional_verified_at = NULL
+        WHERE id = $1`,
+      [versionId],
+    )
+    const resumed = await seedDefaultConnectors(getPool())
+    assert.ok(resumed.seeded.includes('notion'))
+    const after = await query<{ n: string; state: string }>(
+      `SELECT count(*)::text AS n, max(functional_verify_state) AS state
+         FROM marketplace_skill_versions WHERE slug = 'notion'`,
+    )
+    assert.equal(after.rows[0]!.n, '1')
+    assert.equal(after.rows[0]!.state, 'verified')
+  })
+
+  test('预占系统 reviewer 邮箱绝不被 seed 提权/激活', async (t) => {
+    if (skip(t)) return
+    const email = 'connectors-seed-reviewer@system.openclaude'
+    const original = await query<{
+      password_hash: string
+      role: string
+      status: string
+      email_verified: boolean
+    }>('SELECT password_hash, role, status, email_verified FROM users WHERE email = $1', [email])
+    await query(
+      `UPDATE users
+          SET password_hash = 'attacker-owned', role = 'user', status = 'banned', email_verified = FALSE
+        WHERE email = $1`,
+      [email],
+    )
+    await assert.rejects(seedDefaultConnectors(getPool()), /service principal collision/)
+    const held = await query<{
+      password_hash: string
+      role: string
+      status: string
+      email_verified: boolean
+    }>('SELECT password_hash, role, status, email_verified FROM users WHERE email = $1', [email])
+    assert.deepEqual(held.rows[0], {
+      password_hash: 'attacker-owned',
+      role: 'user',
+      status: 'banned',
+      email_verified: false,
+    })
+    await query(
+      `UPDATE users
+          SET password_hash = $2, role = $3, status = $4, email_verified = $5
+        WHERE email = $1`,
+      [
+        email,
+        original.rows[0]!.password_hash,
+        original.rows[0]!.role,
+        original.rows[0]!.status,
+        original.rows[0]!.email_verified,
+      ],
+    )
   })
 })

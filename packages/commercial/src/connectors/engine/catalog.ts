@@ -55,6 +55,7 @@ export async function listDeclarativeCatalog(
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE l.kind = 'connector'
         AND v.security_review_state = 'security_approved'
+        AND v.functional_verify_state = 'verified'
         AND v.exec_revoked_at IS NULL
       ORDER BY v.slug`,
   )

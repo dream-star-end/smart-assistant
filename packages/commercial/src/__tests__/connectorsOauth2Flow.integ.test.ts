@@ -50,11 +50,14 @@ import { executeDeclarativeAction } from '../connectors/engine/execute.js'
 import { ConnectorError } from '../connectors/errors.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { oauthCookieName } from '../connectors/oauthPending.js'
-import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
+import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
-import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
-import { securityApprove } from '../connectors/spec/review.js'
+import {
+  loadVerifiedContractWithMeta,
+  markFunctionalVerified,
+  securityApprove,
+} from '../connectors/spec/review.js'
 import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
@@ -472,6 +475,7 @@ async function approvedConnector(
     expectedSpecHash: specHash,
     pool: getPool(),
   })
+  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
 }
 
@@ -589,6 +593,21 @@ async function activeConnectionCount(userId: number): Promise<number> {
 // ─── 主流程 ─────────────────────────────────────────────────────────────────
 
 describe('oauth2-auth-code · start → callback → bound', () => {
+  test('声明式 catalog 未登录返回 UNAUTHORIZED', async (t) => {
+    if (skipIfNoDb(t)) return
+    const res = makeRes()
+    await assert.rejects(
+      dispatchConnectorsRoute(
+        makeReq({ method: 'GET', url: '/api/connectors/declarative/catalog' }),
+        res.res,
+        makeCtx(),
+        deps,
+      ),
+      (e: unknown) =>
+        e !== null && typeof e === 'object' && (e as { status?: unknown }).status === 401,
+    )
+  })
+
   test('端到端授权流:authorizeUrl 零 secret → 换 token → 探针 → 落 pin 连接', async (t) => {
     if (skipIfNoDb(t)) return
     const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'demo-oauth2')
@@ -618,12 +637,25 @@ describe('oauth2-auth-code · start → callback → bound', () => {
       provider: string
       draft_enc: Buffer | null
       consumed_at: Date | null
-    }>('SELECT provider, draft_enc, consumed_at FROM connector_oauth_pending WHERE user_id = $1', [
-      userId,
-    ])
+      connector_version_id: string | null
+      spec_hash: Buffer | null
+      exec_contract_hash: Buffer | null
+      auth_contract_version: number | null
+    }>(
+      `SELECT provider, draft_enc, consumed_at,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version
+         FROM connector_oauth_pending WHERE user_id = $1`,
+      [userId],
+    )
     assert.equal(pending.rowCount, 1)
     assert.equal(pending.rows[0]!.provider, slug)
     assert.equal(pending.rows[0]!.consumed_at, null)
+    const pendingMeta = await loadVerifiedContractWithMeta(versionId, getPool())
+    assert.equal(pending.rows[0]!.connector_version_id, String(versionId))
+    assert.equal(pending.rows[0]!.spec_hash?.toString('hex'), pendingMeta.contract.spec_hash)
+    assert.equal(pending.rows[0]!.exec_contract_hash?.toString('hex'), pendingMeta.execContractHash)
+    assert.equal(pending.rows[0]!.auth_contract_version, pendingMeta.authContractVersion)
     const draftEnc = pending.rows[0]!.draft_enc
     assert.ok(draftEnc && draftEnc.length > 0, 'draft encrypted')
     // draft 密文里 grep 不到 client_secret 明文。
@@ -723,6 +755,28 @@ describe('oauth2-auth-code · start → callback → bound', () => {
 // ─── 对抗 ───────────────────────────────────────────────────────────────────
 
 describe('oauth2-auth-code · 对抗', () => {
+  test('pending 契约 pin 被篡改 → 回调 fail-closed，零 token 请求/零绑定', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'pin-drift')
+    const userId = await mkUser()
+    const started = await oauthStart(userId, versionId, slug)
+    server.requests.length = 0
+    await query(
+      `UPDATE connector_oauth_pending
+          SET exec_contract_hash = decode(repeat('00', 32), 'hex')
+        WHERE user_id = $1`,
+      [userId],
+    )
+    const location = await oauthCallback({
+      state: started.state,
+      code: 'code-pin-drift',
+      cookie: `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`,
+    })
+    assert.equal(location, '/?connector_error=RELINK_REQUIRED')
+    assert.equal(server.requests.length, 0)
+    assert.equal(await activeConnectionCount(userId), 0)
+  })
+
   test('重放同一 state(第二次回调)→ 失败且不重复绑定', async (t) => {
     if (skipIfNoDb(t)) return
     const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'replay')
@@ -914,7 +968,13 @@ describe('oauth2-auth-code · refresh 轮换', () => {
       refresh_token: NEW_REFRESH_TOKEN,
     })
     // 仍是密文:明文 grep 不到任何 token/secret。
-    for (const s of [NEW_ACCESS_TOKEN, NEW_REFRESH_TOKEN, ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET])
+    for (const s of [
+      NEW_ACCESS_TOKEN,
+      NEW_REFRESH_TOKEN,
+      ACCESS_TOKEN,
+      REFRESH_TOKEN,
+      CLIENT_SECRET,
+    ])
       assert.equal(after.cipher.includes(s), false)
 
     // ⑤ meta.token_expires_at 前推(新的 3600s);account_hint **没被覆盖掉**(增量合并,非整块覆盖)。
@@ -953,7 +1013,10 @@ describe('oauth2-auth-code · refresh 轮换', () => {
     await whoami(connectionId, userId)
     assert.equal(countPath('/oauth/refresh'), 0)
     // 用的还是袋里那个 access_token。
-    assert.equal(server.requests.find((r) => r.path === '/user')!.authorization, `Bearer ${ACCESS_TOKEN}`)
+    assert.equal(
+      server.requests.find((r) => r.path === '/user')!.authorization,
+      `Bearer ${ACCESS_TOKEN}`,
+    )
     // 袋原封不动。
     const after = await readBag(connectionId, userId, versionId)
     assert.equal(after.bag.access_token, ACCESS_TOKEN)
@@ -980,7 +1043,10 @@ describe('oauth2-auth-code · refresh 轮换', () => {
     assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
     // 没有过期时刻 ⇒ 引擎绝不会去 refresh(那类 provider 连 refresh 端点都没有)。
     assert.equal(countPath('/oauth/refresh'), 0)
-    assert.equal(server.requests.find((r) => r.path === '/user')!.authorization, `Bearer ${ACCESS_TOKEN}`)
+    assert.equal(
+      server.requests.find((r) => r.path === '/user')!.authorization,
+      `Bearer ${ACCESS_TOKEN}`,
+    )
   })
 
   test('refresh 失败(上游 400)→ RELINK_REQUIRED,且**袋没被写坏**(事务回滚)', async (t) => {

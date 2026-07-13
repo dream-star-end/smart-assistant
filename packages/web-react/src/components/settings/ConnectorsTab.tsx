@@ -48,6 +48,8 @@ type UnifiedProvider =
       decl: DeclarativeCatalogEntry;
     };
 
+type UnifiedConnection = ConnectorConnection & { system: "v1" | "declarative" };
+
 /**
  * 应用连接器 Tab：统一展示 **v1 手写 provider** + **声明式 connector** 两套后端。
  * 同一列表里按 slug 去重（同 slug 两边都有 → 只显示声明式版，因其是权威且带
@@ -137,12 +139,12 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
     return [...decl, ...v1];
   }, [declCatalog, data]);
 
-  /** v1 provider id → 已绑连接（多账号多行，带 status/lastErrorCode）。 */
+  /** v1 provider id → 已绑连接；即使同 slug 有声明式目录项也保留，避免连接被隐藏。 */
   const v1ConnsBySlug = useMemo(() => {
-    const m = new Map<string, ConnectorConnection[]>();
+    const m = new Map<string, UnifiedConnection[]>();
     for (const c of data?.connections ?? []) {
       const list = m.get(c.provider) ?? [];
-      list.push(c);
+      list.push({ ...c, system: "v1" });
       m.set(c.provider, list);
     }
     return m;
@@ -150,7 +152,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
 
   /** 声明式 slug → 已绑连接（无 status，映射为 active 形状喂给 ConnectionRow）。 */
   const declConnsBySlug = useMemo(() => {
-    const m = new Map<string, ConnectorConnection[]>();
+    const m = new Map<string, UnifiedConnection[]>();
     for (const c of declConnections) {
       const list = m.get(c.slug) ?? [];
       list.push({
@@ -161,6 +163,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
         status: "active",
         lastErrorCode: null,
         createdAt: c.createdAt,
+        system: "declarative",
       });
       m.set(c.slug, list);
     }
@@ -190,7 +193,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   );
 
   const unbind = useCallback(
-    async (u: UnifiedProvider, conn: ConnectorConnection) => {
+    async (conn: UnifiedConnection) => {
       const name = conn.displayName || conn.accountHint || conn.provider;
       const ok = await confirm({
         title: `解绑「${name}」?`,
@@ -200,7 +203,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
       });
       if (!ok) return;
       try {
-        if (u.system === "declarative") await api.unbindDeclarativeConnector(auth, conn.id);
+        if (conn.system === "declarative") await api.unbindDeclarativeConnector(auth, conn.id);
         else await api.deleteConnector(auth, conn.id);
         reload();
       } catch (e) {
@@ -208,6 +211,25 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
       }
     },
     [auth, confirm, reload],
+  );
+
+  const relink = useCallback(
+    (u: UnifiedProvider, conn: UnifiedConnection) => {
+      if (conn.system === "declarative") {
+        if (u.system === "declarative") setBindDeclFor(u.decl);
+        return;
+      }
+      const provider = data?.providers.find((p) => p.id === conn.provider);
+      if (!provider) return;
+      startBind({
+        system: "v1",
+        slug: provider.id,
+        label: provider.label,
+        description: provider.description,
+        v1: provider,
+      });
+    },
+    [data, startBind],
   );
 
   const rename = useCallback(
@@ -258,13 +280,16 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
             }
             connections={
               u.system === "declarative"
-                ? (declConnsBySlug.get(u.slug) ?? [])
+                ? [
+                    ...(declConnsBySlug.get(u.slug) ?? []),
+                    ...(v1ConnsBySlug.get(u.slug) ?? []),
+                  ]
                 : (v1ConnsBySlug.get(u.slug) ?? [])
             }
-            canRename={u.system === "v1"}
             onBind={() => startBind(u)}
-            onUnbind={(c) => unbind(u, c)}
+            onUnbind={unbind}
             onRename={rename}
+            onRelink={(c) => relink(u, c)}
           />
         ))}
         {data && unified.length === 0 && (
@@ -303,20 +328,20 @@ function ProviderCard({
   description,
   capabilityLabel,
   connections,
-  canRename,
   onBind,
   onUnbind,
   onRename,
+  onRelink,
 }: {
   slug: string;
   label: string;
   description: string;
   capabilityLabel: string;
-  connections: ConnectorConnection[];
-  canRename: boolean;
+  connections: UnifiedConnection[];
   onBind: () => void;
-  onUnbind: (conn: ConnectorConnection) => void;
+  onUnbind: (conn: UnifiedConnection) => void;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
+  onRelink: (conn: UnifiedConnection) => void;
 }) {
   const Icon = connectorIcon(slug);
   return (
@@ -350,10 +375,10 @@ function ProviderCard({
             <ConnectionRow
               key={c.id}
               conn={c}
-              canRename={canRename}
+              canRename={c.system === "v1"}
               onUnbind={onUnbind}
               onRename={onRename}
-              onRelink={onBind}
+              onRelink={() => onRelink(c)}
             />
           ))}
         </ul>
@@ -371,10 +396,10 @@ function ConnectionRow({
   onRename,
   onRelink,
 }: {
-  conn: ConnectorConnection;
+  conn: UnifiedConnection;
   /** 是否支持改名（声明式后端无 rename → 传 false 隐藏铅笔与行内编辑）。 */
   canRename?: boolean;
-  onUnbind: (conn: ConnectorConnection) => void;
+  onUnbind: (conn: UnifiedConnection) => void;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
   onRelink: () => void;
 }) {

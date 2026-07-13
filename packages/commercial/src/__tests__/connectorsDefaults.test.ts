@@ -55,13 +55,13 @@ describe('默认连接器 seed spec', () => {
     assert.equal(execContract.actions.find((a) => a.id === 'retrieve_page')?.effect, 'read')
   })
 
-  test('写对等:notion create_page / feishu send_message 被签为 write(走确认门)', () => {
+  test('写对等:notion create_page=write / feishu send_message=send(走确认门+日上限)', () => {
     const notion = DEFAULT_CONNECTORS.find((d) => d.spec.id === 'notion')!
     const nc = compileSpec(notion.spec, notion.decision).execContract
     assert.equal(nc.actions.find((a) => a.id === 'create_page')?.effect, 'write')
 
     const feishu = DEFAULT_CONNECTORS.find((d) => d.spec.id === 'feishu')!
     const fc = compileSpec(feishu.spec, feishu.decision).execContract
-    assert.equal(fc.actions.find((a) => a.id === 'send_message')?.effect, 'write')
+    assert.equal(fc.actions.find((a) => a.id === 'send_message')?.effect, 'send')
   })
 })
