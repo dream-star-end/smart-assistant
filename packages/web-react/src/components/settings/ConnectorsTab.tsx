@@ -1,7 +1,15 @@
-import { Check, ExternalLink, Pencil, Trash2, X } from "lucide-react";
+import { ArrowUpCircle, Check, ExternalLink, Pencil, Store, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, apiErrorMessage } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import {
+  type ConnectorConnection,
+  type ConnectorFormField,
+  type ConnectorProvider,
+  type ConnectorsResponse,
+  type DeclarativeCatalogEntry,
+  type DeclarativeConnection,
+  type DeclarativeManagementConnector,
+  type DeclarativeManagementResponse,
   bindFieldMeta,
   connectorCapabilityLabel,
   connectorErrorText,
@@ -9,14 +17,6 @@ import {
   connectorNeedsRelink,
   declarativeCapabilityLabel,
   isOauthAuthMode,
-  type ConnectorConnection,
-  type ConnectorFormField,
-  type ConnectorProvider,
-  type ConnectorsResponse,
-  type DeclarativeCatalogEntry,
-  type DeclarativeCatalogResponse,
-  type DeclarativeConnection,
-  type DeclarativeConnectionsResponse,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button, IconButton, Input, Modal, Spinner, useConfirm } from "../ui";
@@ -45,7 +45,8 @@ type UnifiedProvider =
       slug: string;
       label: string;
       description: string;
-      decl: DeclarativeCatalogEntry;
+      decl: DeclarativeCatalogEntry | null;
+      management: DeclarativeManagementConnector;
     };
 
 type UnifiedConnection = ConnectorConnection & { system: "v1" | "declarative" };
@@ -61,10 +62,16 @@ type UnifiedConnection = ConnectorConnection & { system: "v1" | "declarative" };
  * connections）是增量，任一失败各自降级为空，**绝不阻断 v1 现有能力**。任何变更后
  * 整体 reload，不做本地乐观拼接。
  */
-export function ConnectorsTab({ auth }: { auth: AuthSession }) {
+export function ConnectorsTab({
+  auth,
+  onOpenMarketplace,
+}: {
+  auth: AuthSession;
+  onOpenMarketplace?: () => void;
+}) {
   const [data, setData] = useState<ConnectorsResponse | null>(null);
-  const [declCatalog, setDeclCatalog] = useState<DeclarativeCatalogEntry[]>([]);
   const [declConnections, setDeclConnections] = useState<DeclarativeConnection[]>([]);
+  const [management, setManagement] = useState<DeclarativeManagementConnector[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
@@ -77,24 +84,18 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
     let alive = true;
     setErr(null);
     // 声明式是增量：各自 catch 降级为空，永不 reject 到 Promise.all；只有 v1 会阻断。
-    const catalogP: Promise<DeclarativeCatalogResponse> = api
-      .getDeclarativeCatalog(auth)
+    const managementP: Promise<DeclarativeManagementResponse> = api
+      .getDeclarativeManagement(auth)
       .catch((e) => {
-        console.warn("[connectors] 声明式目录加载失败，降级仅显示 v1 连接器", e);
-        return { connectors: [] };
+        console.warn("[connectors] 管理聚合加载失败，降级仅显示 v1 连接器", e);
+        return { connectors: [], connections: [] };
       });
-    const connsP: Promise<DeclarativeConnectionsResponse> = api
-      .getDeclarativeConnections(auth)
-      .catch((e) => {
-        console.warn("[connectors] 声明式连接加载失败，降级", e);
-        return { connections: [] };
-      });
-    Promise.all([api.getConnectors(auth), catalogP, connsP])
-      .then(([d, cat, cn]) => {
+    Promise.all([api.getConnectors(auth), managementP])
+      .then(([d, managed]) => {
         if (!alive) return;
         setData(d);
-        setDeclCatalog(cat.connectors);
-        setDeclConnections(cn.connections);
+        setManagement(managed.connectors);
+        setDeclConnections(managed.connections);
       })
       .catch((e) => {
         // 仅 v1 会 reject 到此（声明式已各自 catch 降级）。
@@ -113,13 +114,14 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   /** slug 去重、声明式优先，合并成统一卡片列表（声明式在前，各自保持插入序，渲染稳定）。 */
   const unified = useMemo<UnifiedProvider[]>(() => {
     const bySlug = new Map<string, UnifiedProvider>();
-    for (const c of declCatalog) {
+    for (const c of management) {
       bySlug.set(c.slug, {
         system: "declarative",
         slug: c.slug,
         label: c.label,
         description: c.description,
-        decl: c,
+        decl: c.contract,
+        management: c,
       });
     }
     // v1 provider 仅当该 slug 未被声明式占据时加入（声明式权威，带 allowlist+pin）。
@@ -137,7 +139,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
     const v1: UnifiedProvider[] = [];
     for (const u of bySlug.values()) (u.system === "declarative" ? decl : v1).push(u);
     return [...decl, ...v1];
-  }, [declCatalog, data]);
+  }, [data, management]);
 
   /** v1 provider id → 已绑连接；即使同 slug 有声明式目录项也保留，避免连接被隐藏。 */
   const v1ConnsBySlug = useMemo(() => {
@@ -173,7 +175,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   const startBind = useCallback(
     (u: UnifiedProvider) => {
       if (u.system === "declarative") {
-        setBindDeclFor(u.decl);
+        if (u.management.canBind && u.decl) setBindDeclFor(u.decl);
         return;
       }
       const p = u.v1;
@@ -216,7 +218,7 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
   const relink = useCallback(
     (u: UnifiedProvider, conn: UnifiedConnection) => {
       if (conn.system === "declarative") {
-        if (u.system === "declarative") setBindDeclFor(u.decl);
+        if (u.system === "declarative" && u.management.canBind && u.decl) setBindDeclFor(u.decl);
         return;
       }
       const provider = data?.providers.find((p) => p.id === conn.provider);
@@ -244,6 +246,41 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
     [auth, reload],
   );
 
+  const updateMarketConnector = useCallback(
+    async (c: DeclarativeManagementConnector) => {
+      if (!c.latestVersionId) return;
+      setErr(null);
+      try {
+        await api.installMarketplace(auth, c.latestVersionId);
+        reload();
+      } catch (e) {
+        setErr(errText(e, "更新连接器失败"));
+      }
+    },
+    [auth, reload],
+  );
+
+  const uninstallMarketConnector = useCallback(
+    async (c: DeclarativeManagementConnector) => {
+      if (c.installation !== "marketplace" || c.connectionCount > 0) return;
+      const ok = await confirm({
+        title: `卸载连接器「${c.label}」?`,
+        body: "卸载后不能再绑定或执行；以后仍可从 AI 市场重新安装。",
+        confirmText: "卸载",
+        danger: true,
+      });
+      if (!ok) return;
+      setErr(null);
+      try {
+        await api.uninstallMarketplace(auth, c.slug);
+        reload();
+      } catch (e) {
+        setErr(errText(e, "卸载连接器失败"));
+      }
+    },
+    [auth, confirm, reload],
+  );
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
@@ -259,6 +296,16 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
           绑定你的应用账号后，AI 助手即可在对话中访问这些应用；所有写入类操作（发邮件、
           上传文件等）都会先在对话里向你逐次确认，未经确认不会执行。
         </p>
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <span className="text-[11.5px] text-faint">
+            官方预装、市场安装与已绑定账号在这里统一管理。
+          </span>
+          {onOpenMarketplace && (
+            <Button size="sm" variant="secondary" onClick={onOpenMarketplace}>
+              <Store size={13} /> 去市场添加
+            </Button>
+          )}
+        </div>
         {err && (
           <Alert tone="danger" className="mt-3 text-[12.5px]">
             {err}
@@ -275,18 +322,29 @@ export function ConnectorsTab({ auth }: { auth: AuthSession }) {
             description={u.description}
             capabilityLabel={
               u.system === "declarative"
-                ? declarativeCapabilityLabel(u.decl.actions)
+                ? u.decl
+                  ? declarativeCapabilityLabel(u.decl.actions)
+                  : "当前不可用"
                 : connectorCapabilityLabel(u.slug)
             }
             connections={
               u.system === "declarative"
-                ? [
-                    ...(declConnsBySlug.get(u.slug) ?? []),
-                    ...(v1ConnsBySlug.get(u.slug) ?? []),
-                  ]
+                ? [...(declConnsBySlug.get(u.slug) ?? []), ...(v1ConnsBySlug.get(u.slug) ?? [])]
                 : (v1ConnsBySlug.get(u.slug) ?? [])
             }
             onBind={() => startBind(u)}
+            canBind={u.system === "v1" || u.management.canBind}
+            management={u.system === "declarative" ? u.management : undefined}
+            onUpdate={
+              u.system === "declarative"
+                ? () => void updateMarketConnector(u.management)
+                : undefined
+            }
+            onUninstallMarket={
+              u.system === "declarative"
+                ? () => void uninstallMarketConnector(u.management)
+                : undefined
+            }
             onUnbind={unbind}
             onRename={rename}
             onRelink={(c) => relink(u, c)}
@@ -329,6 +387,10 @@ function ProviderCard({
   capabilityLabel,
   connections,
   onBind,
+  canBind = true,
+  management,
+  onUpdate,
+  onUninstallMarket,
   onUnbind,
   onRename,
   onRelink,
@@ -339,6 +401,10 @@ function ProviderCard({
   capabilityLabel: string;
   connections: UnifiedConnection[];
   onBind: () => void;
+  canBind?: boolean;
+  management?: DeclarativeManagementConnector;
+  onUpdate?: () => void;
+  onUninstallMarket?: () => void;
   onUnbind: (conn: UnifiedConnection) => void;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
   onRelink: (conn: UnifiedConnection) => void;
@@ -356,6 +422,26 @@ function ProviderCard({
             <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">
               {capabilityLabel}
             </span>
+            {management?.installation === "default" && (
+              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
+                官方预装
+              </span>
+            )}
+            {management?.installation === "marketplace" && (
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+                市场已安装{management.installedVersion ? ` · v${management.installedVersion}` : ""}
+              </span>
+            )}
+            {management?.installation === "orphan" && (
+              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-[10.5px] text-warning">
+                历史绑定 · 当前未安装
+              </span>
+            )}
+            {management?.updateAvailable && management.latestVersion && (
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+                可更新 v{management.latestVersion}
+              </span>
+            )}
             {connections.length > 0 && (
               <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
                 已绑定 {connections.length} 个账号
@@ -364,10 +450,35 @@ function ProviderCard({
           </div>
           <p className="mt-0.5 text-[12px] leading-snug text-faint">{description}</p>
         </div>
-        <Button variant="secondary" size="sm" className="shrink-0" onClick={onBind}>
-          {connections.length > 0 ? "添加账号" : "绑定"}
-        </Button>
+        <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+          {management?.updateAvailable && onUpdate && (
+            <Button variant="primary" size="sm" onClick={onUpdate}>
+              <ArrowUpCircle size={13} /> 更新
+            </Button>
+          )}
+          <Button variant="secondary" size="sm" onClick={onBind} disabled={!canBind}>
+            {canBind ? (connections.length > 0 ? "添加账号" : "绑定") : "不可绑定"}
+          </Button>
+          {management?.installation === "marketplace" && onUninstallMarket && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-danger"
+              onClick={onUninstallMarket}
+              disabled={management.connectionCount > 0}
+              title={management.connectionCount > 0 ? "请先解绑全部账号" : "卸载连接器"}
+            >
+              <Trash2 size={13} /> 卸载
+            </Button>
+          )}
+        </div>
       </div>
+
+      {management && !management.available && (
+        <Alert tone="warning" className="mt-2 text-[11.5px]">
+          该连接器当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号。
+        </Alert>
+      )}
 
       {connections.length > 0 && (
         <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">

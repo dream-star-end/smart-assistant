@@ -38,6 +38,7 @@ function pending(over: Partial<MarketplacePending> = {}): MarketplacePending {
     description: "一个技能",
     tags: [],
     rawArtifact: "# SKILL",
+    artifactHash: "fixture-artifact-hash",
     submittedBy: "10",
     ownerUserId: "10",
     createdAt: new Date().toISOString(),

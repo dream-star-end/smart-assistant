@@ -231,7 +231,9 @@ export function buildReviewUserPrompt(c: AiReviewCandidate): string {
   // 人向商品页元数据(不可信;审核名实相符/能力一致/效果不夸大)。
   parts.push('# 商品页元数据(不可信,审核名实相符/能力一致/效果不夸大)')
   parts.push(`分类:${marketplaceCategoryLabel(c.category)}(id:${c.category ?? '未填'})`)
-  parts.push(`适用场景:${(c.useCases || []).length ? (c.useCases || []).map((u) => `「${u}」`).join(' / ') : '（未填)'}`)
+  parts.push(
+    `适用场景:${(c.useCases || []).length ? (c.useCases || []).map((u) => `「${u}」`).join(' / ') : '（未填)'}`,
+  )
   parts.push(
     `效果示例:${(c.outcomeExamples || []).length ? (c.outcomeExamples || []).map((o) => `「${o}」`).join(' / ') : '（未填)'}`,
   )
@@ -291,10 +293,7 @@ function extractContentText(raw: unknown): string {
 
 type LlmResult = { ok: true; text: string } | { ok: false; error: string }
 
-async function callReviewModelOnce(
-  userPrompt: string,
-  deps: ReviewDeps,
-): Promise<LlmResult> {
+async function callReviewModelOnce(userPrompt: string, deps: ReviewDeps): Promise<LlmResult> {
   const fetchImpl: FetchLike = deps.fetchImpl ?? ((i, init) => fetch(i, init))
   const dispatcher = (deps.makeDispatcher ?? directEgressDispatcher)()
   const controller = new AbortController()
@@ -345,6 +344,9 @@ export async function reviewOne(
   candidate: AiReviewCandidate,
   deps: ReviewDeps,
 ): Promise<AiReviewDecision> {
+  // 连接器必须由管理员给出实际 SecurityDecision 并完成隔离账号功能验收；AI 永不自动决策。
+  if (candidate.kind === 'connector')
+    return { action: 'escalate', aiNote: '连接器必须人工完成安全决策与隔离账号功能验收' }
   const prompt = buildReviewUserPrompt(candidate)
   const llm = await callReviewModel(prompt, deps)
   if (!llm.ok) {
@@ -382,7 +384,9 @@ async function applyDecision(
         // 避免僵尸回收把已决版本反复重排。其它错向上抛。
         if (
           e instanceof MarketplaceError &&
-          (e.code === 'NOT_PENDING' || e.code === 'LISTING_REVOKED' || e.code === 'VERSION_NOT_FOUND')
+          (e.code === 'NOT_PENDING' ||
+            e.code === 'LISTING_REVOKED' ||
+            e.code === 'VERSION_NOT_FOUND')
         ) {
           await markAiReviewSkipped(candidate.versionId, `AI 写回时版本已被处理(${e.code})`)
           return

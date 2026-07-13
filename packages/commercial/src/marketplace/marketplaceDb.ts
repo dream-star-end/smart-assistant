@@ -1,5 +1,12 @@
-import { query, tx, type QueryRunner } from '../db/queries.js'
+import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
+import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
+import { type QueryRunner, query, tx } from '../db/queries.js'
 import { getActiveMembership } from '../org/memberships.js'
+import {
+  lockMarketplaceListing,
+  lockMarketplaceUserSlug,
+  lockMarketplaceVersion,
+} from './locking.js'
 /**
  * Postgres data layer for the station-internal skill marketplace (migration 0087).
  *
@@ -58,20 +65,14 @@ export function normalizeInstallAgentIds(
   }
   if (out.length > 0) return out
   const fallbackOut =
-    raw === fallback ? DEFAULT_INSTALL_AGENT_IDS : normalizeInstallAgentIds(fallback, DEFAULT_INSTALL_AGENT_IDS)
+    raw === fallback
+      ? DEFAULT_INSTALL_AGENT_IDS
+      : normalizeInstallAgentIds(fallback, DEFAULT_INSTALL_AGENT_IDS)
   return fallbackOut.length > 0 ? fallbackOut : DEFAULT_INSTALL_AGENT_IDS
 }
 
 function mergeAgentIds(a: readonly string[], b: readonly string[]): string[] {
   return normalizeInstallAgentIds([...a, ...b], DEFAULT_INSTALL_AGENT_IDS)
-}
-
-async function lockInstallScope(c: QueryRunner, userId: number, slug: string): Promise<void> {
-  await query(
-    `SELECT pg_advisory_xact_lock(hashtext('marketplace_install_scope'), hashtext($1::text || ':' || $2::text))`,
-    [userId, slug],
-    c,
-  )
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -88,6 +89,13 @@ function isUniqueViolation(err: unknown): boolean {
  * the channel collapses and the gate is a no-op.
  */
 export function marketplaceAgentsEnabled(
+  channel: string = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3',
+): boolean {
+  return channel === 'v5'
+}
+
+/** Connector marketplace is v5-only until the v5 product line graduates. */
+export function marketplaceConnectorsEnabled(
   channel: string = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3',
 ): boolean {
   return channel === 'v5'
@@ -183,6 +191,11 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
   const rawArtifact = input.rawArtifact ?? input.rawSkillMd
   if (rawArtifact == null)
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
+  if (isDefaultConnectorSlug(input.slug))
+    throw new MarketplaceError(
+      'SLUG_OWNED_BY_OTHER',
+      `slug "${input.slug}" 为平台默认连接器保留，不能发布`,
+    )
   return tx(async (c) => {
     await query(
       // org_id 仅在首次创建 listing 时落(ON CONFLICT DO NOTHING → 已存在的 listing 保留
@@ -270,6 +283,7 @@ export interface PendingVersionRow {
   tags: string[]
   /** Generic raw artifact (skill: the SKILL.md; agent: the manifest). */
   rawArtifact: string
+  artifactHash: string
   /** Skill-only SKILL.md (null for agents). */
   rawSkillMd: string | null
   /** Structured per-kind metadata (agent: model/toolsets/skillDeps). */
@@ -303,6 +317,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     description: string
     tags: RiskFlag[] | unknown
     raw_artifact: string
+    artifact_hash: string
     raw_skill_md: string | null
     manifest: unknown
     risk_flags: RiskFlag[] | unknown
@@ -318,7 +333,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     ai_note: string | null
   }>(
     `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
-            v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
+            v.raw_artifact, v.artifact_hash, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
             v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note
        FROM marketplace_skill_versions v
@@ -337,6 +352,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     description: x.description,
     tags: (x.tags as string[]) ?? [],
     rawArtifact: x.raw_artifact,
+    artifactHash: x.artifact_hash,
     rawSkillMd: x.raw_skill_md,
     manifest: x.manifest ?? null,
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
@@ -386,6 +402,11 @@ export async function reviewVersion(args: {
     )
     const row = v.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
+    const lockedListing = await lockMarketplaceListing(c, row.slug)
+    if (!lockedListing) throw new MarketplaceError('VERSION_NOT_FOUND', 'listing 不存在')
+    // connector 必须走 connectorReview 的原子安全审+功能验收流程；approve/reject 都禁止旁路。
+    if (lockedListing.kind === 'connector')
+      throw new MarketplaceError('KIND_MISMATCH', 'connector 必须使用专用审核流程')
     if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
     if (
       args.reviewerUserId != null &&
@@ -544,6 +565,7 @@ function mapAiCandidateRow(x: {
   description: string
   tags: unknown
   raw_artifact: string
+  artifact_hash: string
   raw_skill_md: string | null
   manifest: unknown
   risk_flags: unknown
@@ -568,6 +590,7 @@ function mapAiCandidateRow(x: {
     description: x.description,
     tags: (x.tags as string[]) ?? [],
     rawArtifact: x.raw_artifact,
+    artifactHash: x.artifact_hash,
     rawSkillMd: x.raw_skill_md,
     manifest: x.manifest ?? null,
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
@@ -583,7 +606,8 @@ function mapAiCandidateRow(x: {
     outcomeExamples: (x.outcome_examples as string[]) ?? [],
     humanMd: x.human_md ?? null,
     aiNote: x.ai_note ?? null,
-    aiAttempts: typeof x.ai_attempts === 'string' ? Number.parseInt(x.ai_attempts, 10) : x.ai_attempts,
+    aiAttempts:
+      typeof x.ai_attempts === 'string' ? Number.parseInt(x.ai_attempts, 10) : x.ai_attempts,
   }
 }
 
@@ -615,7 +639,7 @@ export async function claimNextAiReview(): Promise<AiReviewCandidate | null> {
     )
     const full = await query<Parameters<typeof mapAiCandidateRow>[0]>(
       `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
-              v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
+              v.raw_artifact, v.artifact_hash, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
               v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
               v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note, v.ai_attempts
          FROM marketplace_skill_versions v
@@ -767,6 +791,7 @@ export interface ApprovedSearchRow {
   name: string
   description: string
   tags: string[]
+  artifactHash: string
   embeddingHash: string
   /** 当前活跃安装数(卸载不计;每用户同 slug 至多一条活跃安装,即≈使用人数)。 */
   installCount: number
@@ -805,6 +830,7 @@ export async function listApprovedForSearch(
     name: string
     description: string
     tags: unknown
+    artifact_hash: string
     embedding_hash: string
     benchmark: unknown
     install_count: string | null
@@ -827,7 +853,7 @@ export async function listApprovedForSearch(
     // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
     // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 30 天使用人数(users30d
     // DESC)→ 安装数(DESC)→ 新版本(v.id DESC)。前端不再自行排序,信任此序。
-    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
+    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.artifact_hash, v.embedding_hash,
             v.benchmark, ic.n::text AS install_count,
             v.category, v.use_cases, l.featured_rank,
             us.usage_n::text AS usage30d, us.users_n::text AS users30d,
@@ -850,6 +876,11 @@ export async function listApprovedForSearch(
                            WHERE e.trace_id IS NOT NULL AND e.layer = 'hub') d
                    GROUP BY slug) rt ON rt.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
+            AND (l.kind <> 'connector' OR (
+              v.security_review_state = 'security_approved'
+              AND v.functional_verify_state = 'verified'
+              AND v.exec_revoked_at IS NULL
+            ))
             AND ($1::text IS NULL OR l.kind = $1)
             AND ${orgVisibleFrag('l', 2)}
       ORDER BY l.featured_rank ASC NULLS LAST, us.users_n DESC NULLS LAST,
@@ -871,6 +902,7 @@ export async function listApprovedForSearch(
     name: x.name,
     description: x.description,
     tags: (x.tags as string[]) ?? [],
+    artifactHash: x.artifact_hash,
     embeddingHash: x.embedding_hash,
     installCount: Number.parseInt(x.install_count ?? '0', 10) || 0,
     benchmark:
@@ -924,6 +956,13 @@ export interface ListingDetail {
   users30d: number
   /** 评分归因(样本 <RATING_MIN_SAMPLE → null)。 */
   rating: { up: number; down: number } | null
+  /** connector-only：官方身份与已签执行契约的人向投影。 */
+  official?: boolean
+  connectorContract?: {
+    authMode: string
+    approvedOrigins: string[]
+    actions: Array<{ id: string; effect: string }>
+  } | null
 }
 
 /**
@@ -964,13 +1003,18 @@ export async function getListingDetail(
     users30d: string
     rating_up: string
     rating_down: string
+    exec_contract: unknown
+    security_review_state: string
+    functional_verify_state: string
+    exec_revoked_at: Date | null
   }>(
     // detail 是单行读:usage/rating 用 LEFT JOIN LATERAL 按 l.slug 直取(命中 idx_mkt_usage_slug_time,
     // 不做全表 GROUP BY),与 install_count 的单 slug 相关子查询同量级。rt 内先 DISTINCT 去重同
     // turn 同 slug 的多次 view(与 catalog 同语义);LATERAL 聚合恒返一行,LEFT JOIN 不会放大结果。
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
-            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
+            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark, v.exec_contract,
+            v.security_review_state, v.functional_verify_state, v.exec_revoked_at,
             v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count,
@@ -994,11 +1038,21 @@ export async function getListingDetail(
                          AND e.layer = 'hub') d
             ) rt ON true
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
+            AND (l.kind <> 'connector' OR (
+              v.security_review_state = 'security_approved'
+              AND v.functional_verify_state = 'verified'
+              AND v.exec_revoked_at IS NULL
+            ))
             AND ${orgVisibleFrag('l', 2)}`,
     [slug, callerOrgId],
   )
   const x = r.rows[0]
   if (!x) return null
+  const connectorExecutable =
+    x.kind === 'connector' &&
+    x.security_review_state === 'security_approved' &&
+    x.functional_verify_state === 'verified' &&
+    x.exec_revoked_at === null
   return {
     slug: x.slug,
     kind: x.kind as ArtifactKind,
@@ -1012,7 +1066,9 @@ export async function getListingDetail(
     artifactHash: x.artifact_hash,
     rawArtifact: x.raw_artifact,
     rawSkillMd: x.raw_skill_md,
-    manifest: x.manifest ?? null,
+    // connector 的 manifest 仅保存 publisher 提议的安全决定，不能作为公开已批准事实；
+    // 用户面只暴露下面由已签 exec_contract 生成的 connectorContract 投影。
+    manifest: x.kind === 'connector' ? null : (x.manifest ?? null),
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
     installCount: Number.parseInt(x.install_count, 10) || 0,
     rawBundle: (x.raw_bundle as Record<string, string> | null) ?? null,
@@ -1030,6 +1086,14 @@ export async function getListingDetail(
       Number.parseInt(x.rating_up ?? '0', 10) || 0,
       Number.parseInt(x.rating_down ?? '0', 10) || 0,
     ),
+    ...(x.kind === 'connector'
+      ? {
+          official: isDefaultConnectorArtifact(x.slug, x.artifact_hash),
+          connectorContract: connectorExecutable
+            ? projectSignedConnectorContract(x.exec_contract)
+            : null,
+        }
+      : {}),
   }
 }
 
@@ -1053,43 +1117,55 @@ export async function installApprovedVersion(args: {
   callerOrgId?: CallerOrgId
 }): Promise<{ slug: string; version: string; name: string }> {
   const callerOrgId = args.callerOrgId ?? null
-  return tx(async (c) => {
-    const v = await query<{
-      slug: string
-      version: string
-      name: string
-      artifact_hash: string
-      kind: string
-    }>(
-      // Kind-agnostic delivery (skill→hub/skills, agent→agents.yaml), but the
-      // install row carries the listing kind so we can channel-gate agents below.
-      // org 可见性谓词与 approved/active/current 的 TOCTOU 再校验同事务、同 FOR UPDATE OF l:
-      // 越权(org-private 且非本 org)→ 行不匹配 → NOT_INSTALLABLE(404,不泄露存在性)。
-      `SELECT v.slug, v.version, v.name, v.artifact_hash, l.kind
-         FROM marketplace_skill_versions v
-         JOIN marketplace_skill_listings l ON l.slug = v.slug
-        WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
-              AND l.current_approved_version_id = v.id
-              AND ${orgVisibleFrag('l', 2)}
-        FOR UPDATE OF l`,
-      [args.versionId, callerOrgId],
-      c,
-    )
-    const row = v.rows[0]
-    if (!row)
-      throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
-    // agent 类仅 v5 可装(单一总闸:覆盖浏览器 install + 容器内 internal install +
-    // agent 的 skillDep 联动)。skillDep 都是 kind='skill',不受影响。
-    if (row.kind === 'agent' && !marketplaceAgentsEnabled())
-      throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
+  // 仅定位锁域，所有最终状态都在事务行锁后重读。
+  const located = await query<{ slug: string }>(
+    'SELECT slug FROM marketplace_skill_versions WHERE id = $1',
+    [args.versionId],
+  )
+  const locatedSlug = located.rows[0]?.slug ?? null
+  if (!locatedSlug)
+    throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
 
-    await lockInstallScope(c, args.userId, row.slug)
+  return tx(async (c) => {
+    await lockMarketplaceUserSlug(c, args.userId, locatedSlug)
+    const version = await lockMarketplaceVersion(c, args.versionId)
+    if (!version || version.slug !== locatedSlug)
+      throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(版本不存在)')
+    const listing = await lockMarketplaceListing(c, version.slug)
+    const orgVisible =
+      listing?.orgId == null ||
+      (callerOrgId != null && BigInt(listing.orgId) === BigInt(callerOrgId))
+    if (
+      !listing ||
+      !orgVisible ||
+      version.status !== 'approved' ||
+      listing.state !== 'active' ||
+      listing.currentApprovedVersionId !== version.id
+    ) {
+      throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
+    }
+    if (listing.kind === 'agent' && !marketplaceAgentsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
+    if (listing.kind === 'connector') {
+      if (!marketplaceConnectorsEnabled())
+        throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
+      if (isDefaultConnectorSlug(version.slug))
+        throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
+      if (
+        version.securityReviewState !== 'security_approved' ||
+        version.functionalVerifyState !== 'verified' ||
+        version.execRevokedAt !== null
+      ) {
+        throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')
+      }
+    }
+
     const existing = await query<{ id: string; agent_ids: unknown }>(
       `SELECT id::text, agent_ids
          FROM marketplace_installs
         WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
         FOR UPDATE`,
-      [args.userId, row.slug],
+      [args.userId, version.slug],
       c,
     )
     const previous = existing.rows[0]
@@ -1101,20 +1177,20 @@ export async function installApprovedVersion(args: {
     const scopeMode: InstallScopeMode =
       args.scopeMode ?? (args.agentIds !== undefined ? 'replace' : 'preserve')
     let finalScope: string[]
-    if (row.kind === 'agent') {
+    if (listing.kind === 'agent' || listing.kind === 'connector') {
       finalScope = DEFAULT_INSTALL_AGENT_IDS
     } else if (scopeMode === 'replace') {
-      finalScope = providedScope && providedScope.length > 0 ? providedScope : DEFAULT_INSTALL_AGENT_IDS
+      finalScope = providedScope?.length ? providedScope : DEFAULT_INSTALL_AGENT_IDS
     } else if (scopeMode === 'merge') {
       finalScope = mergeAgentIds(previousScope ?? [], providedScope ?? [])
     } else {
-      finalScope = previousScope ?? (providedScope && providedScope.length > 0 ? providedScope : DEFAULT_INSTALL_AGENT_IDS)
+      finalScope =
+        previousScope ?? (providedScope?.length ? providedScope : DEFAULT_INSTALL_AGENT_IDS)
     }
 
     if (previous) {
       await query(
-        `UPDATE marketplace_installs SET uninstalled_at = NOW()
-          WHERE id = $1`,
+        'UPDATE marketplace_installs SET uninstalled_at = NOW() WHERE id = $1',
         [previous.id],
         c,
       )
@@ -1123,19 +1199,17 @@ export async function installApprovedVersion(args: {
       await query(
         `INSERT INTO marketplace_installs (user_id, slug, version_id, artifact_hash, installed_by, agent_ids)
               VALUES ($1,$2,$3,$4,$1,$5::jsonb)`,
-        [args.userId, row.slug, args.versionId, row.artifact_hash, JSON.stringify(finalScope)],
+        [args.userId, version.slug, version.id, version.artifactHash, JSON.stringify(finalScope)],
         c,
       )
     } catch (err) {
-      if (isUniqueViolation(err)) {
+      if (isUniqueViolation(err))
         throw new MarketplaceError('INSTALL_CONFLICT', '安装状态冲突,请重试')
-      }
       throw err
     }
-    return { slug: row.slug, version: row.version, name: row.name }
+    return { slug: version.slug, version: version.version, name: version.name }
   })
 }
-
 export async function getInstallableVersionTarget(
   versionId: string,
   callerOrgId: CallerOrgId = null,
@@ -1144,9 +1218,17 @@ export async function getInstallableVersionTarget(
   kind: ArtifactKind
   version: string
 } | null> {
-  const r = await query<{ slug: string; kind: string; version: string }>(
+  const r = await query<{
+    slug: string
+    kind: string
+    version: string
+    security_review_state: string
+    functional_verify_state: string
+    exec_revoked_at: Date | null
+  }>(
     // org 可见性收口:org-private 版本对非本 org caller 视同不存在(→ 路由 NOT_INSTALLABLE 404)。
-    `SELECT v.slug, l.kind, v.version
+    `SELECT v.slug, l.kind, v.version, v.security_review_state,
+            v.functional_verify_state, v.exec_revoked_at
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
@@ -1158,6 +1240,18 @@ export async function getInstallableVersionTarget(
   if (!row) return null
   if (row.kind === 'agent' && !marketplaceAgentsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
+  if (row.kind === 'connector') {
+    if (!marketplaceConnectorsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
+    if (isDefaultConnectorSlug(row.slug))
+      throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
+    if (
+      row.security_review_state !== 'security_approved' ||
+      row.functional_verify_state !== 'verified' ||
+      row.exec_revoked_at !== null
+    )
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')
+  }
   return { slug: row.slug, kind: row.kind as ArtifactKind, version: row.version }
 }
 
@@ -1168,14 +1262,23 @@ export async function updateInstalledAgentScope(
 ): Promise<boolean> {
   const finalScope = normalizeInstallAgentIds(agentIds, DEFAULT_INSTALL_AGENT_IDS)
   return tx(async (c) => {
-    await lockInstallScope(c, userId, slug)
+    await lockMarketplaceUserSlug(c, userId, slug)
+    const pin = await query<{ version_id: string }>(
+      `SELECT version_id::text FROM marketplace_installs
+        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+      [userId, slug],
+      c,
+    )
+    const versionId = pin.rows[0]?.version_id
+    if (!versionId) return false
+    const version = await lockMarketplaceVersion(c, versionId)
+    if (!version || version.slug !== slug) return false
+    const listing = await lockMarketplaceListing(c, slug)
+    if (listing?.kind !== 'skill') return false
     const existing = await query<{ id: string }>(
-      `SELECT i.id::text
-         FROM marketplace_installs i
-         JOIN marketplace_skill_listings l ON l.slug = i.slug
-        WHERE i.user_id = $1 AND i.slug = $2 AND i.uninstalled_at IS NULL
-              AND l.kind = 'skill'
-        FOR UPDATE OF i`,
+      `SELECT id::text FROM marketplace_installs
+        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
+        FOR UPDATE`,
       [userId, slug],
       c,
     )
@@ -1191,14 +1294,55 @@ export async function updateInstalledAgentScope(
 }
 
 export async function recordUninstall(userId: number, slug: string): Promise<boolean> {
-  const r = await query(
-    `UPDATE marketplace_installs SET uninstalled_at = NOW()
-      WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
-    [userId, slug],
-  )
-  return (r.rowCount ?? 0) > 0
-}
+  return tx(async (c) => {
+    await lockMarketplaceUserSlug(c, userId, slug)
+    // advisory lock 后先定位 pin（不取 install 行锁），再遵循 version → listing → install/connection。
+    const pin = await query<{ version_id: string }>(
+      `SELECT version_id::text FROM marketplace_installs
+        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+      [userId, slug],
+      c,
+    )
+    const versionId = pin.rows[0]?.version_id
+    if (!versionId) return false
+    const version = await lockMarketplaceVersion(c, versionId)
+    if (!version || version.slug !== slug)
+      throw new MarketplaceError('INSTALL_CONFLICT', '安装 pin 已损坏，请联系平台处理')
+    const listing = await lockMarketplaceListing(c, slug)
+    if (!listing)
+      throw new MarketplaceError('INSTALL_CONFLICT', '安装 listing 已不存在，请联系平台处理')
+    if (listing.kind === 'connector' && isDefaultConnectorSlug(slug))
+      throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器不可卸载')
 
+    const install = await query<{ id: string }>(
+      `SELECT id::text FROM marketplace_installs
+        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
+        FOR UPDATE`,
+      [userId, slug],
+      c,
+    )
+    const installId = install.rows[0]?.id
+    if (!installId) return false
+    if (listing.kind === 'connector') {
+      const bindings = await query(
+        `SELECT id FROM connections
+          WHERE user_id = $1 AND provider = $2 AND connector_version_id IS NOT NULL
+            AND revoked_at IS NULL
+          FOR UPDATE`,
+        [userId, slug],
+        c,
+      )
+      if ((bindings.rowCount ?? 0) > 0)
+        throw new MarketplaceError('INSTALL_CONFLICT', '请先在管理中心解绑该连接器的全部账号')
+    }
+    await query(
+      'UPDATE marketplace_installs SET uninstalled_at = NOW() WHERE id = $1',
+      [installId],
+      c,
+    )
+    return true
+  })
+}
 export interface InstalledRow {
   slug: string
   kind: ArtifactKind
@@ -1244,8 +1388,9 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   )
   // agent 类仅 v5:v3 渠道滤掉已装 agent(共享 installs 跨渠道,见 listActiveInstalledAgents)。
   const agentsOk = marketplaceAgentsEnabled()
+  const connectorsOk = marketplaceConnectorsEnabled()
   return r.rows
-    .filter((x) => agentsOk || x.kind !== 'agent')
+    .filter((x) => (agentsOk || x.kind !== 'agent') && (connectorsOk || x.kind !== 'connector'))
     .map((x) => ({
       slug: x.slug,
       kind: x.kind as ArtifactKind,
@@ -1336,26 +1481,25 @@ export async function ownerUnlistListing(
   ownerUserId: number,
   reason = 'unlisted by owner',
 ): Promise<number[]> {
+  const current = await query<{ version_id: string | null }>(
+    `SELECT current_approved_version_id::text AS version_id
+       FROM marketplace_skill_listings WHERE slug = $1`,
+    [slug],
+  )
+  if (!current.rows[0]) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+  const versionId = current.rows[0].version_id
+  if (!versionId) throw new MarketplaceError('NOT_INSTALLABLE', `slug "${slug}" 当前未上架`)
   return tx(async (c) => {
-    const listing = await query<{
-      owner_user_id: string
-      state: string
-      current_approved_version_id: string | null
-    }>(
-      `SELECT owner_user_id::text, state, current_approved_version_id::text
-         FROM marketplace_skill_listings
-        WHERE slug = $1
-        FOR UPDATE`,
-      [slug],
-      c,
-    )
-    const row = listing.rows[0]
-    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
-    if (BigInt(row.owner_user_id) !== BigInt(ownerUserId))
+    const version = await lockMarketplaceVersion(c, versionId)
+    if (!version || version.slug !== slug)
+      throw new MarketplaceError('NOT_INSTALLABLE', `slug "${slug}" 当前版本已变化`)
+    const listing = await lockMarketplaceListing(c, slug)
+    if (!listing) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+    if (BigInt(listing.ownerUserId) !== BigInt(ownerUserId))
       throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${slug}" 不属于当前用户`)
-    if (row.state === 'revoked')
+    if (listing.state === 'revoked')
       throw new MarketplaceError('LISTING_REVOKED', `slug "${slug}" 已被平台下架`)
-    if (row.state !== 'active' || row.current_approved_version_id == null)
+    if (listing.state !== 'active' || listing.currentApprovedVersionId !== version.id)
       throw new MarketplaceError('NOT_INSTALLABLE', `slug "${slug}" 当前未上架`)
 
     await query(
@@ -1374,44 +1518,41 @@ export async function ownerUnlistListing(
     return affected.rows.map((x) => Number.parseInt(x.user_id, 10))
   })
 }
-
 /** Publisher self-withdraw: pending versions can be cancelled before admin review. */
-export async function withdrawPublishVersion(versionId: string, ownerUserId: number): Promise<void> {
+export async function withdrawPublishVersion(
+  versionId: string,
+  ownerUserId: number,
+): Promise<void> {
   await tx(async (c) => {
-    const v = await query<{
-      status: string
-      submitted_by: string
-      owner_user_id: string
-      slug: string
-    }>(
-      `SELECT v.status, v.submitted_by::text, l.owner_user_id::text, v.slug
-         FROM marketplace_skill_versions v
-         JOIN marketplace_skill_listings l ON l.slug = v.slug
-        WHERE v.id = $1
-        FOR UPDATE OF v, l`,
-      [versionId],
-      c,
-    )
-    const row = v.rows[0]
-    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
+    const version = await lockMarketplaceVersion(c, versionId)
+    if (!version) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
+    const listing = await lockMarketplaceListing(c, version.slug)
+    if (!listing) throw new MarketplaceError('VERSION_NOT_FOUND', 'listing 不存在')
     if (
-      BigInt(row.submitted_by) !== BigInt(ownerUserId) ||
-      BigInt(row.owner_user_id) !== BigInt(ownerUserId)
+      BigInt(version.submittedBy) !== BigInt(ownerUserId) ||
+      BigInt(listing.ownerUserId) !== BigInt(ownerUserId)
     ) {
-      throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${row.slug}" 不属于当前用户`)
+      throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${version.slug}" 不属于当前用户`)
     }
-    if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
+    if (version.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
 
     await query(
       `UPDATE marketplace_skill_versions
-          SET status = 'rejected', reviewed_at = NOW(), review_note = '作者撤销发布'
+          SET status = 'rejected', reviewed_at = NOW(), review_note = '作者撤销发布',
+              security_review_state = CASE
+                WHEN $2::boolean AND security_review_state = 'draft' THEN 'security_rejected'
+                ELSE security_review_state END,
+              exec_revoked_at = CASE
+                WHEN $2::boolean AND security_review_state = 'security_approved'
+                  THEN COALESCE(exec_revoked_at, NOW())
+                ELSE exec_revoked_at END,
+              ai_review_state = CASE WHEN ai_review_state IN ('queued','running') THEN 'done' ELSE ai_review_state END
         WHERE id = $1`,
-      [versionId],
+      [versionId, listing.kind === 'connector'],
       c,
     )
   })
 }
-
 export interface InstalledArtifact {
   slug: string
   version: string
@@ -1533,7 +1674,9 @@ export async function listActiveInstalledAgents(userId: number): Promise<Install
  * 供 my-agents 与容器 sync 合并)。预设不 pin 版本 —— 恒取 listing 当前上架版本;
  * revoke / 无 approved 版本的 slug 自动缺席(kill-switch 优先于预设)。
  */
-export async function listPlatformPresetAgents(slugs: readonly string[]): Promise<InstalledAgent[]> {
+export async function listPlatformPresetAgents(
+  slugs: readonly string[],
+): Promise<InstalledAgent[]> {
   if (slugs.length === 0 || !marketplaceAgentsEnabled()) return []
   const r = await query<{
     slug: string
@@ -1586,6 +1729,14 @@ export async function getApprovedSkillVersions(
 /** Kill-switch: revoke a listing. Returns the user_ids with an active install (to notify). */
 export async function revokeListing(slug: string, reason: string): Promise<number[]> {
   return tx(async (c) => {
+    // kill-switch 同样遵循 version → listing；按 id 排序锁住该 slug 全部版本。
+    await query(
+      `SELECT id FROM marketplace_skill_versions WHERE slug = $1 ORDER BY id FOR UPDATE`,
+      [slug],
+      c,
+    )
+    const listing = await lockMarketplaceListing(c, slug)
+    if (!listing) return []
     await query(
       `UPDATE marketplace_skill_listings
           SET state = 'revoked', revoked_reason = $2, updated_at = NOW()
@@ -1593,6 +1744,15 @@ export async function revokeListing(slug: string, reason: string): Promise<numbe
       [slug, reason],
       c,
     )
+    if (listing.kind === 'connector') {
+      await query(
+        `UPDATE marketplace_skill_versions
+            SET exec_revoked_at = COALESCE(exec_revoked_at, NOW())
+          WHERE slug = $1 AND security_review_state = 'security_approved'`,
+        [slug],
+        c,
+      )
+    }
     const affected = await query<{ user_id: string }>(
       `SELECT DISTINCT user_id::text FROM marketplace_installs
         WHERE slug = $1 AND uninstalled_at IS NULL`,
@@ -1602,7 +1762,6 @@ export async function revokeListing(slug: string, reason: string): Promise<numbe
     return affected.rows.map((x) => Number.parseInt(x.user_id, 10))
   })
 }
-
 /** 平台精选权重上下界:1 最靠前、9999 最靠后、null=取消精选(数据不变量的单一权威)。 */
 export const FEATURED_RANK_MIN = 1
 export const FEATURED_RANK_MAX = 9999
@@ -1625,7 +1784,9 @@ export async function setListingFeaturedRank(slug: string, rank: number | null):
     rank !== null &&
     (!Number.isInteger(rank) || rank < FEATURED_RANK_MIN || rank > FEATURED_RANK_MAX)
   ) {
-    throw new Error(`featured_rank 越界:须为 ${FEATURED_RANK_MIN}..${FEATURED_RANK_MAX} 的整数或 null`)
+    throw new Error(
+      `featured_rank 越界:须为 ${FEATURED_RANK_MIN}..${FEATURED_RANK_MAX} 的整数或 null`,
+    )
   }
   await tx(async (c) => {
     const listing = await query<{ state: string }>(
@@ -1636,7 +1797,10 @@ export async function setListingFeaturedRank(slug: string, rank: number | null):
     const row = listing.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
     if (row.state !== 'active')
-      throw new MarketplaceError('LISTING_REVOKED', `slug "${slug}" 未上架(state=${row.state}),不可设为精选`)
+      throw new MarketplaceError(
+        'LISTING_REVOKED',
+        `slug "${slug}" 未上架(state=${row.state}),不可设为精选`,
+      )
     await query(
       `UPDATE marketplace_skill_listings
           SET featured_rank = $2, updated_at = NOW()

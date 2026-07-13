@@ -26,27 +26,23 @@ import { fetch as undiciFetch } from 'undici'
 
 // KMS key 必须在任何 sign/verify/encrypt 前就位。
 process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
+process.env.OC_RUNTIME_CHANNEL = 'v5'
 
 import { ConnectorError } from '../connectors/errors.js'
-import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
+import { bindDeclarativeConnector as bindDeclarativeConnectorCore } from '../connectors/engine/bind.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
 import { executeDeclarativeAction } from '../connectors/engine/execute.js'
-import {
-  executeDeclarativeWrite,
-  proposeDeclarativeWrite,
-} from '../connectors/engine/write.js'
+import { executeDeclarativeWrite, proposeDeclarativeWrite } from '../connectors/engine/write.js'
 import { approveConfirmation, denyConfirmation } from '../connectors/ledger.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
-import {
-  markFunctionalVerified,
-  revokeExecVersion,
-  securityApprove,
-} from '../connectors/spec/review.js'
+import { revokeExecVersion } from '../connectors/spec/review.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
+import { installApprovedVersion } from '../marketplace/marketplaceDb.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -276,11 +272,10 @@ async function approvedConnector(): Promise<{
   const reviewer = await mkUser('admin')
   const raw = JSON.stringify(spec)
   const specHash = canonicalSha256Hex(spec)
-  await query('INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)', [
-    slug,
-    author,
-    'connector',
-  ])
+  await query(
+    'INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)',
+    [slug, author, 'connector'],
+  )
   const v = await query<{ id: string }>(
     `INSERT INTO marketplace_skill_versions
        (slug, version, name, description, raw_artifact, artifact_hash, embedding_hash, submitted_by, status)
@@ -288,16 +283,27 @@ async function approvedConnector(): Promise<{
     [slug, slug, raw, specHash, author],
   )
   const versionId = Number(v.rows[0]!.id)
-  await securityApprove({
-    versionId,
+  await approveMarketplaceConnectorVersion({
+    versionId: String(versionId),
     reviewerUserId: reviewer,
     securityDecision: decision,
     expectedSpecHash: specHash,
+    functionalVerified: true,
     pool: getPool(),
   })
-  await markFunctionalVerified(versionId, reviewer, getPool())
   const local = compileSpec(spec, decision)
   return { versionId, slug, specHash, execContractHash: local.execContractHash }
+}
+
+/** 旧垂直测试关注执行内核；每次绑定先按新市场契约完成真实安装。 */
+async function bindDeclarativeConnector(
+  ...args: Parameters<typeof bindDeclarativeConnectorCore>
+): Promise<Awaited<ReturnType<typeof bindDeclarativeConnectorCore>>> {
+  await installApprovedVersion({
+    userId: args[0].userId,
+    versionId: String(args[0].connectorVersionId),
+  })
+  return bindDeclarativeConnectorCore(...args)
 }
 
 before(async () => {
@@ -380,7 +386,12 @@ describe('声明式首垂直 static-token+Notion', () => {
       // ── bind ──────────────────────────────────────────────────────────────
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        {
+          userId: user,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: TOKEN },
+          deps,
+        },
         getPool(),
       )
       assert.equal(bind.rebound, false)
@@ -414,7 +425,13 @@ describe('声明式首垂直 static-token+Notion', () => {
           : { status: 404, body: '{}' },
       )
       const out = await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'page-1' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'get_page',
+          params: { pageId: 'page-1' },
+          deps,
+        },
         getPool(),
       )
       assert.deepEqual(out, { id: 'page-1', title: 'Hello' }) // secret_field 剥掉
@@ -436,13 +453,24 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        {
+          userId: user,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: TOKEN },
+          deps,
+        },
         getPool(),
       )
       server.reset()
       await assert.rejects(
         executeDeclarativeAction(
-          { connectionId: bind.connectionId, userId: user, actionId: 'create_page', params: {}, deps },
+          {
+            connectionId: bind.connectionId,
+            userId: user,
+            actionId: 'create_page',
+            params: {},
+            deps,
+          },
           getPool(),
         ),
         isConnErr('BAD_REQUEST'),
@@ -464,12 +492,23 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: owner, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        {
+          userId: owner,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: TOKEN },
+          deps,
+        },
         getPool(),
       )
       await assert.rejects(
         executeDeclarativeAction(
-          { connectionId: bind.connectionId, userId: other, actionId: 'get_page', params: { pageId: 'p' }, deps },
+          {
+            connectionId: bind.connectionId,
+            userId: other,
+            actionId: 'get_page',
+            params: { pageId: 'p' },
+            deps,
+          },
           getPool(),
         ),
         isConnErr('CONNECTION_NOT_FOUND'),
@@ -488,13 +527,24 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const bind = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        {
+          userId: user,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: TOKEN },
+          deps,
+        },
         getPool(),
       )
       await revokeExecVersion(conn.versionId, getPool())
       await assert.rejects(
         executeDeclarativeAction(
-          { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'p' }, deps },
+          {
+            connectionId: bind.connectionId,
+            userId: user,
+            actionId: 'get_page',
+            params: { pageId: 'p' },
+            deps,
+          },
           getPool(),
         ),
         isConnErr('RELINK_REQUIRED'),
@@ -514,7 +564,12 @@ describe('声明式首垂直 static-token+Notion', () => {
       server.setHandler(() => ({ status: 401, body: '{}' }))
       await assert.rejects(
         bindDeclarativeConnector(
-          { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+          {
+            userId: user,
+            connectorVersionId: conn.versionId,
+            secrets: { access_token: TOKEN },
+            deps,
+          },
           getPool(),
         ),
         isConnErr('UPSTREAM_AUTH_FAILED'),
@@ -538,11 +593,21 @@ describe('声明式首垂直 static-token+Notion', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       server.setHandler(identityHandler())
       const first = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        {
+          userId: user,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: TOKEN },
+          deps,
+        },
         getPool(),
       )
       const second = await bindDeclarativeConnector(
-        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: `${TOKEN}-v2` }, deps },
+        {
+          userId: user,
+          connectorVersionId: conn.versionId,
+          secrets: { access_token: `${TOKEN}-v2` },
+          deps,
+        },
         getPool(),
       )
       assert.equal(first.rebound, false)
@@ -692,8 +757,7 @@ describe('声明式写门 propose→approve→execute', () => {
         assert.equal(server.requests.length, 0, `${c.name}: no dispatch`)
       }
       await restore()
-      for (const confirmId of confirmations)
-        await denyConfirmation(confirmId, userId, getPool())
+      for (const confirmId of confirmations) await denyConfirmation(confirmId, userId, getPool())
     } finally {
       await server.close()
     }
@@ -750,7 +814,10 @@ describe('声明式写门 propose→approve→execute', () => {
 
       // ── 未 approve 直接 execute → CONFIRMATION_NOT_APPROVED ────────────────────
       await assert.rejects(
-        executeDeclarativeWrite({ connectionId, userId, confirmId: prop.confirmId, deps }, getPool()),
+        executeDeclarativeWrite(
+          { connectionId, userId, confirmId: prop.confirmId, deps },
+          getPool(),
+        ),
         isConnErr('CONFIRMATION_NOT_APPROVED'),
       )
 
@@ -813,7 +880,12 @@ describe('声明式写门 propose→approve→execute', () => {
       server.setHandler(identityHandler())
       const conn2 = await approvedConnector()
       const bind2 = await bindDeclarativeConnector(
-        { userId: a.userId, connectorVersionId: conn2.versionId, secrets: { access_token: `${TOKEN}-2` }, deps },
+        {
+          userId: a.userId,
+          connectorVersionId: conn2.versionId,
+          secrets: { access_token: `${TOKEN}-2` },
+          deps,
+        },
         getPool(),
       )
       server.reset()
@@ -853,7 +925,10 @@ describe('声明式写门 propose→approve→execute', () => {
         [prop.confirmId],
       )
       await assert.rejects(
-        executeDeclarativeWrite({ connectionId, userId, confirmId: prop.confirmId, deps }, getPool()),
+        executeDeclarativeWrite(
+          { connectionId, userId, confirmId: prop.confirmId, deps },
+          getPool(),
+        ),
         isConnErr('RELINK_REQUIRED'),
       )
       const ledger = await query<{ status: string; error_code: string }>(
@@ -963,11 +1038,10 @@ async function approvedTokenExchange(): Promise<{ versionId: number; slug: strin
   const reviewer = await mkUser('admin')
   const raw = JSON.stringify(spec)
   const specHash = canonicalSha256Hex(spec)
-  await query('INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)', [
-    slug,
-    author,
-    'connector',
-  ])
+  await query(
+    'INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)',
+    [slug, author, 'connector'],
+  )
   const v = await query<{ id: string }>(
     `INSERT INTO marketplace_skill_versions
        (slug, version, name, description, raw_artifact, artifact_hash, embedding_hash, submitted_by, status)
@@ -975,14 +1049,14 @@ async function approvedTokenExchange(): Promise<{ versionId: number; slug: strin
     [slug, slug, raw, specHash, author],
   )
   const versionId = Number(v.rows[0]!.id)
-  await securityApprove({
-    versionId,
+  await approveMarketplaceConnectorVersion({
+    versionId: String(versionId),
     reviewerUserId: reviewer,
     securityDecision: txDecision,
     expectedSpecHash: specHash,
+    functionalVerified: true,
     pool: getPool(),
   })
-  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
 }
 
@@ -990,11 +1064,17 @@ async function approvedTokenExchange(): Promise<{ versionId: number; slug: strin
 function exchangeHandler(expiresIn: number): (p: string) => { status: number; body: string } {
   return (p) => {
     if (p === '/token')
-      return { status: 200, body: JSON.stringify({ access_token: EXCHANGED, expires_in: expiresIn }) }
+      return {
+        status: 200,
+        body: JSON.stringify({ access_token: EXCHANGED, expires_in: expiresIn }),
+      }
     if (p === '/v1/users/me')
       return { status: 200, body: JSON.stringify({ bot_id: 'bot-x', workspace_name: 'WS' }) }
     if (p.startsWith('/v1/pages/'))
-      return { status: 200, body: JSON.stringify({ id: p.split('/').pop(), title: 'T', secret: 'LEAK' }) }
+      return {
+        status: 200,
+        body: JSON.stringify({ id: p.split('/').pop(), title: 'T', secret: 'LEAK' }),
+      }
     return { status: 404, body: '{}' }
   }
 }
@@ -1033,7 +1113,13 @@ describe('声明式 token-exchange 垂直', () => {
       // ── execute:缓存 miss → 再换一次 + 落缓存 → 注入 API ──────────────────────
       server.reset()
       const out1 = await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'p1' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'get_page',
+          params: { pageId: 'p1' },
+          deps,
+        },
         getPool(),
       )
       assert.deepEqual(out1, { id: 'p1', title: 'T' }) // secret 剥掉
@@ -1044,7 +1130,13 @@ describe('声明式 token-exchange 垂直', () => {
       // ── 第二次 execute:缓存命中 → 不再打 /token ──────────────────────────────
       server.reset()
       await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'p2' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'get_page',
+          params: { pageId: 'p2' },
+          deps,
+        },
         getPool(),
       )
       assert.equal(countPath(server, '/token'), 0) // 命中缓存,零交换
@@ -1079,11 +1171,23 @@ describe('声明式 token-exchange 垂直', () => {
       )
       server.reset()
       await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'a' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'get_page',
+          params: { pageId: 'a' },
+          deps,
+        },
         getPool(),
       )
       await executeDeclarativeAction(
-        { connectionId: bind.connectionId, userId: user, actionId: 'get_page', params: { pageId: 'b' }, deps },
+        {
+          connectionId: bind.connectionId,
+          userId: user,
+          actionId: 'get_page',
+          params: { pageId: 'b' },
+          deps,
+        },
         getPool(),
       )
       assert.equal(countPath(server, '/token'), 2) // 两次都重换(近过期)
@@ -1099,7 +1203,9 @@ describe('声明式 token-exchange 垂直', () => {
       const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
       const { versionId } = await approvedTokenExchange()
       const user = await mkUser()
-      server.setHandler((p) => (p === '/token' ? { status: 401, body: '{}' } : { status: 404, body: '{}' }))
+      server.setHandler((p) =>
+        p === '/token' ? { status: 401, body: '{}' } : { status: 404, body: '{}' },
+      )
       await assert.rejects(
         bindDeclarativeConnector(
           {
@@ -1130,7 +1236,9 @@ describe('声明式 token-exchange 垂直', () => {
       const { versionId } = await approvedTokenExchange()
       const user = await mkUser()
       server.setHandler((p) =>
-        p === '/token' ? { status: 200, body: JSON.stringify({ code: 99991663 }) } : { status: 404, body: '{}' },
+        p === '/token'
+          ? { status: 200, body: JSON.stringify({ code: 99991663 }) }
+          : { status: 404, body: '{}' },
       )
       await assert.rejects(
         bindDeclarativeConnector(

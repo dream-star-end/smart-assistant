@@ -26,6 +26,7 @@ import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
+import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
@@ -35,6 +36,7 @@ import {
   handleAdminMarketplaceReviewBatch,
   handleAdminMarketplaceRevoke,
   handleMarketplaceAgentPublish,
+  handleMarketplaceConnectorPublish,
   handleMarketplaceDetail,
   handleMarketplaceInstall,
   handleMarketplaceInstalled,
@@ -42,8 +44,8 @@ import {
   handleMarketplaceMyAgents,
   handleMarketplaceMyPublishes,
   handleMarketplacePublish,
-  handleMarketplaceUnlist,
   handleMarketplaceUninstall,
+  handleMarketplaceUnlist,
   handleMarketplaceWithdrawPublish,
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
@@ -74,8 +76,8 @@ import {
 } from './admin/accounts.js'
 import {
   handleAdminListAudit,
-  handleAdminListSecurityEvents,
   handleAdminListHostAudit,
+  handleAdminListSecurityEvents,
   handleAdminTraceLookup,
 } from './admin/audit.js'
 import {
@@ -83,20 +85,6 @@ import {
   handleAdminListPlatformOauthApps,
   handleAdminPutPlatformOauthApp,
 } from './admin/connectorPlatformOauth.js'
-import {
-  handleAdminListIncidents,
-  handleAdminGetIncident,
-  handleAdminResolveIncident,
-  handleAdminListSelfhealConditions,
-  handleAdminUnsuppressCondition,
-  handleAdminReleaseRepair,
-  handleAdminGetSelfhealUserNotices,
-} from './admin/selfheal.js'
-// 切片②ⓐ:codex 修复回调端点(/internal/v5/repairs/*,capability/webhook HMAC 自鉴权,非 admin gate)。
-import {
-  dispatchSelfhealRepairsRoute,
-  SELFHEAL_REPAIRS_PREFIX,
-} from './internal/selfhealRepairs.js'
 import {
   handleAdminAgentContainerAction,
   handleAdminContainerLogs,
@@ -116,7 +104,6 @@ import {
   handleAdminExportUsersCsv,
 } from './admin/export.js'
 import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
-import { handleAdminResponseRatings } from './admin/responseRatings.js'
 import {
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
@@ -131,10 +118,33 @@ import {
 } from './admin/literature.js'
 import { handleAdminMetrics } from './admin/metrics.js'
 import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
+import {
+  handleAdminModelOpsOverview,
+  handleAdminModelOpsStats,
+  handleAdminPutProviderOps,
+} from './admin/modelOps.js'
 import { handleAdminGetOrder, handleAdminListOrders, handleAdminOrdersKpi } from './admin/orders.js'
+// 企业版(P3.1)批次 D:平台超管开票申请处理。
+import { handleAdminListOrgInvoices, handleAdminPatchOrgInvoice } from './admin/orgInvoices.js'
+// 企业版(P3.1)批次 A:org 平台超管运维 + org 成员管理分发器。
+import {
+  handleAdminAdjustOrgCredits,
+  handleAdminCreateOrg,
+  handleAdminListOrgs,
+  handleAdminPatchOrg,
+} from './admin/orgs.js'
 import { handleAdminListPlans, handleAdminPatchPlan } from './admin/plans.js'
 import { handleAdminListPricing, handleAdminPatchPricing } from './admin/pricing.js'
-import { handleAdminModelOpsOverview, handleAdminModelOpsStats, handleAdminPutProviderOps } from './admin/modelOps.js'
+import { handleAdminResponseRatings } from './admin/responseRatings.js'
+import {
+  handleAdminGetIncident,
+  handleAdminGetSelfhealUserNotices,
+  handleAdminListIncidents,
+  handleAdminListSelfhealConditions,
+  handleAdminReleaseRepair,
+  handleAdminResolveIncident,
+  handleAdminUnsuppressCondition,
+} from './admin/selfheal.js'
 import { handleAdminGetSession } from './admin/sessions.js'
 import {
   handleAdminGetSetting,
@@ -149,26 +159,12 @@ import {
   handleAdminPatchUser,
   handleAdminUsersStats,
 } from './admin/users.js'
-// 企业版(P3.1)批次 A:org 平台超管运维 + org 成员管理分发器。
-import {
-  handleAdminListOrgs,
-  handleAdminCreateOrg,
-  handleAdminPatchOrg,
-  handleAdminAdjustOrgCredits,
-} from './admin/orgs.js'
-// 企业版(P3.1)批次 D:平台超管开票申请处理。
-import {
-  handleAdminListOrgInvoices,
-  handleAdminPatchOrgInvoice,
-} from './admin/orgInvoices.js'
-import { dispatchOrgRoute } from './org/routes.js'
-import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import {
   handleAdminAlertsAckRule,
   handleAdminAlertsCreateSilence,
   handleAdminAlertsCreateTelegramChannel,
-  handleAdminAlertsCreateWecomChannel,
   handleAdminAlertsCreateWecomAibotChannel,
+  handleAdminAlertsCreateWecomChannel,
   handleAdminAlertsDeleteChannel,
   handleAdminAlertsDeleteSilence,
   handleAdminAlertsIlinkPoll,
@@ -253,20 +249,15 @@ import {
   handleUploadResearchLibraryDoc,
   handleVerifyEmail,
 } from './handlers.js'
+// 切片②ⓐ:codex 修复回调端点(/internal/v5/repairs/*,capability/webhook HMAC 自鉴权,非 admin gate)。
+import {
+  SELFHEAL_REPAIRS_PREFIX,
+  dispatchSelfhealRepairsRoute,
+} from './internal/selfhealRepairs.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
-import {
-  handleGetResponseRatings,
-  handlePostResponseRating,
-} from './responseRatings.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
+import { dispatchOrgRoute } from './org/routes.js'
 import { handleCreateHupi, handleGetOrder, handleHupiCallback, handleListPlans } from './payment.js'
-import {
-  handleBuyPack,
-  handleGetMySubscription,
-  handleListSubscriptionPlans,
-  handleSubscribe,
-  handleUpgrade,
-} from './subscription.js'
 import {
   handleCreateRemoteHost,
   handleDeleteRemoteHost,
@@ -276,6 +267,14 @@ import {
   handleRemoteHostAction,
 } from './remoteHosts.js'
 import { requireActiveAccountVerifyDb, requireUserVerifyDb } from './requireUser.js'
+import { handleGetResponseRatings, handlePostResponseRating } from './responseRatings.js'
+import {
+  handleBuyPack,
+  handleGetMySubscription,
+  handleListSubscriptionPlans,
+  handleSubscribe,
+  handleUpgrade,
+} from './subscription.js'
 import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
 import {
   HttpError,
@@ -642,7 +641,11 @@ export function createCommercialHandler(
     // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。
     { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
     { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
-    { method: 'DELETE', pathPrefix: '/api/me/research/library/', handler: handleDeleteResearchLibraryDoc },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/me/research/library/',
+      handler: handleDeleteResearchLibraryDoc,
+    },
     // ── 企业版(P3.1)org 成员管理面 ──
     // 全部转发到 dispatchOrgRoute:声明式路由表 + requireOrgRole 单一鉴权收口
     // (见 http/org/routes.ts)。org 由服务端从 caller membership 推导,不接受
@@ -704,6 +707,11 @@ export function createCommercialHandler(
       method: 'POST',
       path: '/api/marketplace/agent/publish',
       handler: (req, res) => handleMarketplaceAgentPublish(req, res, deps),
+    },
+    {
+      method: 'POST',
+      path: '/api/marketplace/connector/publish',
+      handler: (req, res) => handleMarketplaceConnectorPublish(req, res, deps),
     },
     {
       method: 'GET',
@@ -808,7 +816,11 @@ export function createCommercialHandler(
     { method: 'POST', pathPrefix: '/api/admin/orgs/', handler: handleAdminAdjustOrgCredits },
     // 企业版(P3.1)批次 D:平台开票申请处理。exact list 优先于 prefix patch。
     { method: 'GET', path: '/api/admin/org-invoices', handler: handleAdminListOrgInvoices },
-    { method: 'PATCH', pathPrefix: '/api/admin/org-invoices/', handler: handleAdminPatchOrgInvoice },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/org-invoices/',
+      handler: handleAdminPatchOrgInvoice,
+    },
     // T-60 超管审计记录(整改批:+target/时间过滤;新增安全事件/主机审计/trace 反查)
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
@@ -817,19 +829,47 @@ export function createCommercialHandler(
     // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
     // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
     { method: 'GET', path: '/api/admin/selfheal/incidents', handler: handleAdminListIncidents },
-    { method: 'GET', path: '/api/admin/selfheal/user-notices', handler: handleAdminGetSelfhealUserNotices },
-    { method: 'GET', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminGetIncident },
-    { method: 'POST', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminResolveIncident },
+    {
+      method: 'GET',
+      path: '/api/admin/selfheal/user-notices',
+      handler: handleAdminGetSelfhealUserNotices,
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/admin/selfheal/incidents/',
+      handler: handleAdminGetIncident,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/selfheal/incidents/',
+      handler: handleAdminResolveIncident,
+    },
     // 收尾批(H1b/§B):condition 压制运维 + repair 一键放行。exact 在 prefix 前
     // (matchRoute exact-first);release 走 prefix,handler 内 regex 抠 :id + /release 尾段。
-    { method: 'GET', path: '/api/admin/selfheal/conditions', handler: handleAdminListSelfhealConditions },
-    { method: 'POST', path: '/api/admin/selfheal/conditions/unsuppress', handler: handleAdminUnsuppressCondition },
+    {
+      method: 'GET',
+      path: '/api/admin/selfheal/conditions',
+      handler: handleAdminListSelfhealConditions,
+    },
+    {
+      method: 'POST',
+      path: '/api/admin/selfheal/conditions/unsuppress',
+      handler: handleAdminUnsuppressCondition,
+    },
     // 字面量 path(不用常量):admin-route-inventory 基线静态抽取只认字符串字面量。
-    { method: 'POST', pathPrefix: '/api/admin/selfheal/repairs/', handler: handleAdminReleaseRepair },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/selfheal/repairs/',
+      handler: handleAdminReleaseRepair,
+    },
     // 切片②ⓐ:codex 修复回调(经 SSH 隧道 loopback 到达)。ANY_METHOD 通配转发,method/子路由
     // (ack/progress/verify/done/failed/claim-capability/context)权威 + capability/webhook HMAC
     // 鉴权全部收口在 dispatchSelfhealRepairsRoute。**不是** /api/admin/*,不套 admin gate。
-    { method: ANY_METHOD, pathPrefix: SELFHEAL_REPAIRS_PREFIX, handler: dispatchSelfhealRepairsRoute },
+    {
+      method: ANY_METHOD,
+      pathPrefix: SELFHEAL_REPAIRS_PREFIX,
+      handler: dispatchSelfhealRepairsRoute,
+    },
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
@@ -1695,8 +1735,7 @@ export function createCommercialHandler(
     // 精确 method 命中优先;未命中再退到 ANY_METHOD 通配路由(§1:把某前缀的 method 权威
     // 下放给 handler,如 dispatchOrgRoute)。无通配 → undefined,走既有 405 分支不受影响。
     const route =
-      candidates.find((r) => r.method === method) ??
-      candidates.find((r) => r.method === ANY_METHOD)
+      candidates.find((r) => r.method === method) ?? candidates.find((r) => r.method === ANY_METHOD)
     // route label —— 同时给 metrics 与 access log 使用
     const labelRoute =
       route?.path ??

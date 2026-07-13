@@ -167,6 +167,7 @@ export function DetailModal({
   onClose,
   onInstalled,
   onAskAiInChat,
+  onOpenConnectors,
 }: {
   slug: string | null
   auth: AuthSession
@@ -176,6 +177,7 @@ export function DetailModal({
   onInstalled: () => void
   /** AI 导购(批3):「在对话中试用」——关市场 → 新会话 → 预填安装+上手示例;缺省不渲染。 */
   onAskAiInChat?: (text: string) => void
+  onOpenConnectors?: () => void
 }) {
   const [detail, setDetail] = useState<MarketplaceDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -247,9 +249,15 @@ export function DetailModal({
 
   const warns = friendlyRiskFlags(detail?.riskFlags)
   const isPreset = !!detail?.preset
+  const isOfficialConnector = detail?.kind === 'connector' && !!detail.official
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
   // 预设不走安装/更新语义(恒为最新上架版本,开箱即用)。
-  const canUpdate = !isPreset && !!installed && !!detail && installed.versionId !== detail.versionId
+  const canUpdate =
+    !isPreset &&
+    !isOfficialConnector &&
+    !!installed &&
+    !!detail &&
+    installed.versionId !== detail.versionId
   const isAgent = detail?.kind === 'agent'
   const scopeChanged =
     !!installed &&
@@ -270,7 +278,7 @@ export function DetailModal({
               关闭
             </Button>
             {/* AI 导购次级入口:关市场 → 新会话 → 预填「装好并给上手示例」,发送权仍在用户。 */}
-            {onAskAiInChat && (
+            {onAskAiInChat && detail.kind !== 'connector' && (
               <Button
                 variant="secondary"
                 onClick={() => onAskAiInChat(marketTrySkillPrefill(detail.name, detail.slug))}
@@ -278,10 +286,18 @@ export function DetailModal({
                 在对话中试用
               </Button>
             )}
-            {isPreset ? (
-              <Badge tone="success" className="self-center">
-                <ShieldCheck size={13} /> 平台预设 · 开箱即用
-              </Badge>
+            {isPreset || isOfficialConnector ? (
+              <>
+                <Badge tone="success" className="self-center">
+                  <ShieldCheck size={13} />
+                  {isOfficialConnector ? '官方连接器 · 已预装' : '平台预设 · 开箱即用'}
+                </Badge>
+                {isOfficialConnector && onOpenConnectors && (
+                  <Button variant="primary" onClick={onOpenConnectors}>
+                    去绑定账号
+                  </Button>
+                )}
+              </>
             ) : done ? (
               <Badge tone="success" className="self-center">
                 <ShieldCheck size={13} /> {canUpdate ? '更新成功' : '安装成功'}
@@ -329,14 +345,30 @@ export function DetailModal({
           {err && <Alert tone="danger">{err}</Alert>}
           {done && (
             <Alert tone="success" title={canUpdate ? '已更新' : '已安装'}>
-              {isAgent
-                ? '可在输入框上方的智能体选择器中切换使用。'
-                : '将在你的下一次会话中对 AI 可用。'}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  {detail.kind === 'connector'
+                    ? '已加入你的连接器，请到管理中心绑定应用账号。'
+                    : isAgent
+                      ? '可在输入框上方的智能体选择器中切换使用。'
+                      : '将在你的下一次会话中对 AI 可用。'}
+                </span>
+                {detail.kind === 'connector' && onOpenConnectors && (
+                  <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                    去管理中心绑定
+                  </Button>
+                )}
+              </div>
             </Alert>
           )}
           {isPreset && (
             <Alert tone="info" title="平台预设智能体">
               无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
+            </Alert>
+          )}
+          {isOfficialConnector && (
+            <Alert tone="info" title="官方预装连接器">
+              无需安装；可直接到管理中心绑定你的应用账号。
             </Alert>
           )}
           {!done && canUpdate && installed && (
@@ -435,6 +467,38 @@ export function DetailModal({
           {detail.kind === 'agent' ? (
             // 智能体的 manifest 是「装的到底是什么」的核心,保持展开(不折叠)。
             <AgentManifestView manifest={detail.manifest} />
+          ) : detail.kind === 'connector' ? (
+            <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-3 py-2.5">
+              <div className="text-[12px] font-medium text-muted">平台已签安全范围</div>
+              {detail.connectorContract ? (
+                <>
+                  <div className="text-[12.5px] text-fg">
+                    认证方式：{detail.connectorContract.authMode}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {detail.connectorContract.actions.map((a) => (
+                      <Badge key={a.id} tone={a.effect === 'read' ? 'neutral' : 'warning'}>
+                        {a.id} · {a.effect === 'read' ? '读取' : a.effect === 'send' ? '发送' : '写入'}
+                      </Badge>
+                    ))}
+                  </div>
+                  <div className="text-[11.5px] leading-relaxed text-faint">
+                    已批准网络：
+                    {detail.connectorContract.approvedOrigins.join('、') || '无外部网络'}
+                  </div>
+                </>
+              ) : (
+                <span className="text-[12px] text-warning">当前签名契约不可用，无法安装或绑定。</span>
+              )}
+              <details>
+                <summary className="cursor-pointer text-[11.5px] text-faint">
+                  查看发布者提交的技术声明
+                </summary>
+                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-border bg-code px-3 py-2 font-mono text-[11.5px] text-fg">
+                  {detail.rawArtifact}
+                </pre>
+              </details>
+            </div>
           ) : (
             // 技能 SKILL.md 原文归模型、非人向 —— 默认折叠进「技术详情」,想看的人点开。
             <details className="rounded-lg border border-border bg-surface">

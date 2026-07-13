@@ -1,18 +1,20 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 import type { AuthSession } from "../lib/types";
-import { Tabs } from "./ui";
 import { CronPanel } from "./manage/CronPanel";
 import { LibraryPanel } from "./manage/LibraryPanel";
 import { MemoryPanel } from "./manage/MemoryPanel";
 import { SkillsPanel } from "./manage/SkillsPanel";
+import { ConnectorsTab } from "./settings/ConnectorsTab";
+import { Tabs } from "./ui";
 
-export type ManageTab = "memory" | "cron" | "skills" | "library";
+export type ManageTab = "memory" | "cron" | "skills" | "connectors" | "library";
 
 const TABS: { id: ManageTab; label: string }[] = [
   { id: "memory", label: "记忆" },
   { id: "cron", label: "定时任务" },
   { id: "skills", label: "技能" },
+  { id: "connectors", label: "连接器" },
   { id: "library", label: "文献库" },
 ];
 
@@ -29,6 +31,7 @@ export function ManageCenter({
   agents,
   onTabChange,
   onClose,
+  onOpenMarketplace,
 }: {
   open: boolean;
   tab: ManageTab;
@@ -39,6 +42,7 @@ export function ManageCenter({
   agents: { id: string; name: string }[];
   onTabChange: (t: ManageTab) => void;
   onClose: () => void;
+  onOpenMarketplace?: () => void;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
@@ -77,6 +81,9 @@ export function ManageCenter({
                 {tab === "memory" && <MemoryPanel auth={auth} agentId={agentId} agents={agents} />}
                 {tab === "cron" && <CronPanel auth={auth} />}
                 {tab === "skills" && <SkillsPanel auth={auth} />}
+                {tab === "connectors" && (
+                  <ConnectorsTab auth={auth} onOpenMarketplace={onOpenMarketplace} />
+                )}
                 {tab === "library" && <LibraryPanel auth={auth} />}
               </>
             )}

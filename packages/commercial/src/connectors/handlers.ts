@@ -33,6 +33,7 @@ import { dispatchDeclarativeConnectors } from './declarativeHandlers.js'
 import { bindWithBag } from './engine/bind.js'
 import { type DeclarativeSecretBag, oauth2ClientProvisioning } from './engine/credentialBag.js'
 import { exchangeAuthCode } from './engine/oauth2.js'
+import { assertConnectorBindEntitlement } from './entitlement.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import {
   approveConfirmation,
@@ -714,6 +715,8 @@ async function completeDeclarativeOauth(
     ) {
       throw new ConnectorError('RELINK_REQUIRED', 'oauth pending contract pins drifted')
     }
+    // 授权页停留期间可能发生卸载/更新/下架；token 交换发网前重新确认资格。
+    await assertConnectorBindEntitlement(input.userId, input.versionId, pool)
 
     // client 凭据取值分叉。**权威是契约,不是 draft** —— 即便 platform 连接器的 draft 里被塞进
     // client 凭据(理论上做不到:start 不落),这里也只认平台表。

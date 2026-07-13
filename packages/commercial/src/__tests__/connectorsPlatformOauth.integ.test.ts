@@ -34,6 +34,7 @@ import { fetch as undiciFetch } from 'undici'
 process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
 process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI =
   'https://app.platoauth.test/api/connectors/oauth/callback'
+process.env.OC_RUNTIME_CHANNEL = 'v5'
 
 import { signAccess } from '../auth/jwt.js'
 import { decryptBagFromRow, getDeclarativeConnection } from '../connectors/engine/binding.js'
@@ -50,16 +51,14 @@ import {
   upsertPlatformOauthApp,
 } from '../connectors/platformOauthApps.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
-import {
-  loadVerifiedContractWithMeta,
-  markFunctionalVerified,
-  securityApprove,
-} from '../connectors/spec/review.js'
+import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
+import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
+import { installApprovedVersion } from '../marketplace/marketplaceDb.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -359,14 +358,14 @@ async function approvedConnector(
     [slug, slug, raw, specHash, author],
   )
   const versionId = Number(v.rows[0]!.id)
-  await securityApprove({
-    versionId,
+  await approveMarketplaceConnectorVersion({
+    versionId: String(versionId),
     reviewerUserId: reviewer,
     securityDecision: oauth2Decision,
     expectedSpecHash: specHash,
+    functionalVerified: true,
     pool: getPool(),
   })
-  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
 }
 
@@ -430,6 +429,7 @@ async function oauthStart(
   slug: string,
   extraBody: Record<string, unknown> = {},
 ): Promise<{ authorizeUrl: string; state: string; cookieNonce: string }> {
+  await installApprovedVersion({ userId, versionId: String(versionId) })
   const res = makeRes()
   await dispatchConnectorsRoute(
     makeReq({
@@ -699,9 +699,12 @@ describe('oauth2 · platform 未 provision → fail-closed', () => {
     if (skipIfNoDb(t)) return
     const plat = await approvedConnector('platform', 'catalog-plat')
     const byoa = await approvedConnector('byoa', 'catalog-byoa')
+    const userId = await mkUser()
+    await installApprovedVersion({ userId, versionId: String(plat.versionId) })
+    await installApprovedVersion({ userId, versionId: String(byoa.versionId) })
 
     // 未 provision:目录里没有 platform 那条(用户不该看见"点了必报错"的连接器)。
-    const before = await listDeclarativeCatalog(getPool())
+    const before = await listDeclarativeCatalog(getPool(), userId)
     assert.equal(
       before.some((c) => c.slug === plat.slug),
       false,
@@ -719,7 +722,7 @@ describe('oauth2 · platform 未 provision → fail-closed', () => {
       clientId: PLATFORM_CLIENT_ID,
       clientSecret: PLATFORM_CLIENT_SECRET,
     })
-    const afterProvision = await listDeclarativeCatalog(getPool())
+    const afterProvision = await listDeclarativeCatalog(getPool(), userId)
     const platEntry = afterProvision.find((c) => c.slug === plat.slug)
     assert.ok(platEntry, 'platform connector appears after provisioning')
     assert.deepEqual(platEntry!.requiredBindSources, [])
@@ -728,7 +731,7 @@ describe('oauth2 · platform 未 provision → fail-closed', () => {
 
     // 反 provision:又消失(admin 撤销 = 立刻停止新授权)。
     await deletePlatformOauthApp(plat.slug)
-    const afterDelete = await listDeclarativeCatalog(getPool())
+    const afterDelete = await listDeclarativeCatalog(getPool(), userId)
     assert.equal(
       afterDelete.some((c) => c.slug === plat.slug),
       false,

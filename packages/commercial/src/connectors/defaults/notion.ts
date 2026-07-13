@@ -17,7 +17,9 @@ const API_ORIGIN = 'https://api.notion.com:443'
 
 export const notionDefault: DefaultConnector = {
   featured: true,
-  category: 'productivity',
+  category: 'office-docs',
+  useCases: ['让 AI 检索、查询或创建 Notion 页面与数据库内容'],
+  tags: ['连接器', 'Notion', '办公'],
   spec: {
     id: 'notion',
     label: 'Notion',

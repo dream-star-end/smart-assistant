@@ -4,21 +4,19 @@ import { useCallback, useEffect, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { api, apiErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
-import { extractPrefs, type PrefsView } from "../lib/modelPreferences";
+import { type PrefsView, extractPrefs } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
-import { Avatar, Spinner, Tabs } from "./ui";
 import { AccountTab } from "./settings/AccountTab";
-import { ConnectorsTab } from "./settings/ConnectorsTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
+import { Avatar, Spinner, Tabs } from "./ui";
 
-type Section = "account" | "usage" | "connectors" | "preferences" | "about";
+type Section = "account" | "usage" | "preferences" | "about";
 
 const SECTIONS: { id: Section; label: string }[] = [
   { id: "account", label: "账户与计费" },
   { id: "usage", label: "用量" },
-  { id: "connectors", label: "应用连接" },
   { id: "preferences", label: "偏好" },
   { id: "about", label: "关于" },
 ];
@@ -164,9 +162,6 @@ export function SettingsCenter({
                 )}
 
                 {section === "usage" && <UsageTab auth={auth} />}
-
-                {/* 应用连接器：懒加载挂载（仅激活时渲染，组件内自拉 /api/connectors，照 UsageTab 模式）。 */}
-                {section === "connectors" && <ConnectorsTab auth={auth} />}
 
                 {section === "preferences" &&
                   (prefsLoading || !prefs ? (

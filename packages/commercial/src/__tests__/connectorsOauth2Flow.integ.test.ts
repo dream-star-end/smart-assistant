@@ -37,9 +37,13 @@ process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
 // OAuth 回跳地址(authorize 与 token 交换两阶段必须同值)。
 process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI =
   'https://app.oauth2.test/api/connectors/oauth/callback'
+process.env.OC_RUNTIME_CHANNEL = 'v5'
 
 import { signAccess } from '../auth/jwt.js'
-import { bindDeclarativeConnector, bindWithBag } from '../connectors/engine/bind.js'
+import {
+  bindDeclarativeConnector as bindDeclarativeConnectorCore,
+  bindWithBag as bindWithBagCore,
+} from '../connectors/engine/bind.js'
 import {
   META_TOKEN_EXPIRES_AT,
   decryptBagFromRow,
@@ -53,17 +57,15 @@ import { oauthCookieName } from '../connectors/oauthPending.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
-import {
-  loadVerifiedContractWithMeta,
-  markFunctionalVerified,
-  securityApprove,
-} from '../connectors/spec/review.js'
+import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
 import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
+import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
+import { installApprovedVersion } from '../marketplace/marketplaceDb.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -468,15 +470,35 @@ async function approvedConnector(
     [slug, slug, raw, specHash, author],
   )
   const versionId = Number(v.rows[0]!.id)
-  await securityApprove({
-    versionId,
+  await approveMarketplaceConnectorVersion({
+    versionId: String(versionId),
     reviewerUserId: reviewer,
     securityDecision: decision,
     expectedSpecHash: specHash,
+    functionalVerified: true,
     pool: getPool(),
   })
-  await markFunctionalVerified(versionId, reviewer, getPool())
   return { versionId, slug }
+}
+
+async function bindDeclarativeConnector(
+  ...args: Parameters<typeof bindDeclarativeConnectorCore>
+): Promise<Awaited<ReturnType<typeof bindDeclarativeConnectorCore>>> {
+  await installApprovedVersion({
+    userId: args[0].userId,
+    versionId: String(args[0].connectorVersionId),
+  })
+  return bindDeclarativeConnectorCore(...args)
+}
+
+async function bindWithBag(
+  ...args: Parameters<typeof bindWithBagCore>
+): Promise<Awaited<ReturnType<typeof bindWithBagCore>>> {
+  await installApprovedVersion({
+    userId: args[0].userId,
+    versionId: String(args[0].meta.versionId),
+  })
+  return bindWithBagCore(...args)
 }
 
 async function bearerFor(userId: number): Promise<string> {
@@ -540,6 +562,7 @@ async function oauthStart(
   slug: string,
   displayName?: string,
 ): Promise<{ authorizeUrl: string; state: string; cookieNonce: string }> {
+  await installApprovedVersion({ userId, versionId: String(versionId) })
   const res = makeRes()
   await dispatchConnectorsRoute(
     makeReq({

@@ -728,6 +728,8 @@ export function App() {
     // /?connector_error=<code>（错误码经 connectorErrorText 映射中文，不裸露码）。
     if (sp.has("connector_linked")) {
       toast("应用已连接", "success");
+      setManageTab("connectors");
+      setManageOpen(true);
       sp.delete("connector_linked");
       touched = true;
     }
@@ -1679,6 +1681,10 @@ export function App() {
             agentId={agent.id}
             agents={myAgents}
             onTabChange={setManageTab}
+            onOpenMarketplace={() => {
+              setManageOpen(false);
+              openMarketplace("browse", "connector");
+            }}
             onClose={() => setManageOpen(false)}
           />
         </LazyBoundary>
@@ -1703,6 +1709,10 @@ export function App() {
               setMarketplaceOpen(false);
               newSession();
               setComposerPrefill({ text, nonce: Date.now() });
+            }}
+            onOpenConnectors={() => {
+              setMarketplaceOpen(false);
+              openManage("connectors");
             }}
             onTabChange={setMarketplaceTab}
             onClose={() => {
