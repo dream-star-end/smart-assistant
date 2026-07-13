@@ -12,9 +12,8 @@
  * 所以本文件的断言全部落在**写进 stdin 的字节序列**上 —— 那是 gateway 侧唯一可观测、
  * 也是唯一有意义的 ground truth:
  *   ① env 更新必须**先于** user message(同一管道按行处理 ⇒ 本 turn 首个上游请求必带新票);
- *   ② bridge turn → 两张票各一行 `Name: Value`;
- *   ③ 无票的 turn → **写空串清位**(上一 turn 的 envelope 绝不允许泄漏到下一 turn:
- *      authorityTurnId 已被消费 → 重放 → egress 拒 → 用户可见故障 + 安全面);
+ *   ② bridge turn → 只投影长 lease,短 authority / local catalog 均不出容器;
+ *   ③ 无票的 turn → **写空串清位**(上一 turn 的 lease 绝不允许泄漏到下一 turn);
  *   ④ envelope 含 CR/LF → **一个字节都不写**(header 注入 fail-closed,本 turn 不发);
  *   ⑤ 本地路径(cron/synthetic/delegate)→ 只带 `x-oc-local-catalog`。
  *
@@ -187,22 +186,22 @@ describe('CCB authority headers — stdin 写入序列', () => {
 })
 
 // ---------------------------------------------------------------------------
-// ② bridge turn:两张票各一行
+// ② bridge turn:gateway 已消费短 authority,CCB 上游只带长 lease
 // ---------------------------------------------------------------------------
 
 describe('CCB authority headers — bridge turn', () => {
-  it('authority + lease 各一行 `Name: Value`,不带 local_catalog', async () => {
+  it('只带 lease,不把会在 turn 中途过期的 authority 挂到每个请求', async () => {
     const { runner, writes } = createHarness()
     await runner.submit('hi', 'req-1', authority('eyJhdXRoIjoxfQ', 'eyJsZWFzZSI6MX0'))
 
     const raw = parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS!
-    assert.equal(raw.split('\n').length, 2)
+    assert.equal(raw.split('\n').length, 1)
     const headers = parseCustomHeaders(raw)
     assert.deepEqual(headers, {
-      [AUTHORITY_HEADER]: 'eyJhdXRoIjoxfQ',
       [TURN_LEASE_HEADER]: 'eyJsZWFzZSI6MX0',
     })
-    // bridge 票据与本地路径 token 是**不同 kind、不同 header**,不允许互相伪装(R3-M6)。
+    assert.ok(!(AUTHORITY_HEADER in headers))
+    // bridge lease 与本地路径 token 是**不同 kind、不同 header**,不允许互相伪装(R3-M6)。
     assert.ok(!(LOCAL_CATALOG_HEADER in headers))
   })
 
@@ -215,7 +214,7 @@ describe('CCB authority headers — bridge turn', () => {
     const { runner, writes } = createHarness()
     await runner.submit('hi', undefined, authority('A', 'L'))
     const headers = parseCustomHeaders(parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS!)
-    assert.equal(headers[AUTHORITY_HEADER], 'A')
+    assert.ok(!(AUTHORITY_HEADER in headers))
     assert.equal(headers[TURN_LEASE_HEADER], 'L')
   })
 })
@@ -228,6 +227,11 @@ describe('CCB authority headers — 清位语义', () => {
   it('turn1 有票 → turn2 无票:第二次 env 写入必须是空串(旧 envelope 不残留)', async () => {
     const { runner, writes } = createHarness()
     await runner.submit('turn1', undefined, authority('AUTH1', 'LEASE1'))
+    assert.deepEqual(
+      parseCustomHeaders(parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS!),
+      { [TURN_LEASE_HEADER]: 'LEASE1' },
+    )
+    assert.ok(!writes[0]!.includes('AUTH1'), '短 authority 不得投影到 CCB 上游环境')
     // 本用例只验证 env 清位；视觉能力变化触发的真实 recycle 由独立用例覆盖。
     ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor = undefined
     await runner.submit('turn2') // 本地路径 / flag 未开
@@ -238,7 +242,7 @@ describe('CCB authority headers — 清位语义', () => {
       '',
       '第二个 turn 必须显式清位 —— CCB 对空串按「未设置」处理',
     )
-    // 残留 = 拿已消费的 authorityTurnId 去打上游 = egress 重放拒(用户可见故障 + 安全面)。
+    // 残留 = 拿上一 turn 的 lease 去打上游 = turn 绑定错位(用户可见故障 + 安全面)。
     assert.ok(!writes[2]!.includes('AUTH1'))
     assert.ok(!writes[2]!.includes('LEASE1'))
   })
@@ -283,7 +287,7 @@ describe('CCB authority headers — fail-closed', () => {
     await assert.rejects(
       runner.submit('hi', undefined, {
         // ANTHROPIC_CUSTOM_HEADERS 按 \n 切行 → 值里的 \n 可以凭空造出第二个 header。
-        ...authority('GOOD\nx-injected: evil', 'LEASE'),
+        ...authority('AUTH', 'GOOD\nx-injected: evil'),
       }),
       (err: unknown) => err instanceof AuthorityHeaderRejected,
     )
@@ -293,7 +297,7 @@ describe('CCB authority headers — fail-closed', () => {
   it('envelope 含 \\r → 同样拒发', async () => {
     const { runner, writes } = createHarness()
     await assert.rejects(
-      runner.submit('hi', undefined, authority('A\rB', 'L')),
+      runner.submit('hi', undefined, authority('A', 'L\rB')),
       (err: unknown) => err instanceof AuthorityHeaderRejected,
     )
     assert.equal(writes.length, 0)

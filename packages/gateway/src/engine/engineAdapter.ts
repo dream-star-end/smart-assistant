@@ -59,13 +59,14 @@ export interface TurnParams {
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
   /**
-   * 模型权威批次 §4 —— 本 turn 的**上游请求凭据**(master 签名的 authority + turn lease)。
+   * 模型权威批次 §4 —— 本 turn 的 master 签名 authority + turn lease bundle。
    *
    * 有值 = bridge turn(inbound 帧带 `__oc_model_authority`,gateway 验签后原样带下来);
    * 无值 = 本地路径 turn(cron/synthetic/delegate)→ CCB 侧自取 `x-oc-local-catalog` token。
    *
-   * 只有 CCB 路径消费(经 ANTHROPIC_CUSTOM_HEADERS 挂到每个 `/v1/messages`);codex 路径的
-   * 请求绑定走 bridge journal / codex-relay,不读本字段(engine 中立 = 允许底座忽略)。
+   * 只有 CCB 路径消费:gateway 先验签/消费短 authority,runner 再经
+   * ANTHROPIC_CUSTOM_HEADERS 把长 lease 挂到每个 `/v1/messages`;codex 路径的请求绑定
+   * 走 bridge journal / codex-relay,不读本字段(engine 中立 = 允许底座忽略)。
    */
   modelAuthority?: TurnModelAuthority
   traceId?: string
