@@ -1150,6 +1150,7 @@ MODEL_AUTHORITY_CAP="model_authority_v1"
 MODEL_AUTHORITY_EGRESS_CAP="model_authority_v1-egress"
 MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
 MODEL_AUTHORITY_FLAG_KEY="OC_MODEL_AUTHORITY"
+MODEL_AUTHORITY_PROVISION_FLAG_KEY="OC_MODEL_AUTHORITY_PROVISION_REQUIRED"
 MODEL_AUTHORITY_CATALOG_MIGRATION="0143_model_catalog"
 MODEL_AUTHORITY_GUARDS_MIGRATION="0144_model_authority_guards"
 MODEL_AUTHORITY_SETTING_KEY="cutover"
@@ -1649,46 +1650,156 @@ model_authority_observation_status() {
   jq . <<<"$raw"
 }
 
+# 只看 systemd **当前 MainPID** 的真实 env，不以 env 文件写入成功冒充进程已生效。
+assert_model_authority_live_env() { # <unit> <authority-flag> <provision-required>
+  local unit="$1" flag="$2" provision="$3"
+  ssh "$KL_HOST" bash -s -- "$unit" "$flag" "$provision" <<'REMOTE'
+set -Eeuo pipefail
+unit="$1"; flag="$2"; provision="$3"
+pid="$(systemctl show -p MainPID --value "$unit")"
+[[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid"
+env_file="/proc/$pid/environ"
+test -r "$env_file"
+tr '\0' '\n' <"$env_file" | grep -Fxq "OC_MODEL_AUTHORITY=$flag"
+tr '\0' '\n' <"$env_file" | grep -Fxq "OC_MODEL_AUTHORITY_PROVISION_REQUIRED=$provision"
+REMOTE
+}
+
+model_authority_basic_master_health() {
+  local hz
+  hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${ACTIVE_PORT}/healthz" 2>/dev/null || true)"
+  jq -e '.ok == true and .runtime.leadership.state == "leader"' <<<"$hz" >/dev/null 2>&1 \
+    && grep -q '"sessionsDb":"ok"' <<<"$hz"
+}
+
+model_authority_egress_enforced_is() { # <true|false>
+  local expected="$1" eg
+  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+  [[ "$(jq -r '.modelAuthority.enforced // false' <<<"$eg" 2>/dev/null || true)" == "$expected" ]]
+}
+
+run_model_authority_container_rollback() {
+  local active_home
+  active_home="$(slot_home "$ACTIVE_SLOT")"
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    set -a; . '$V5_ENV'; set +a
+    export OPENCLAUDE_HOME='$active_home' OC_RUNTIME_CHANNEL=v5
+    cd '$ACTIVE_SRC'
+    ./node_modules/.bin/tsx scripts/v5-model-authority-container-rollback.ts --timeout-seconds 2700"
+}
+
+model_authority_rollback_diagnostics() { # <reason>
+  local reason="$1"
+  echo "FATAL:模型权威回滚未完成:$reason" >&2
+  echo "  安全态可能仍为 flag=1 + egress enforce=true；不要手工只关一面。" >&2
+  echo "  修复故障后原命令重跑:scripts/deploy-v5.sh --disable-model-authority" >&2
+  ssh "$KL_HOST" "systemctl --no-pager --full status '$ACTIVE_UNIT' '$V5_EGRESS_UNIT' 2>&1 | tail -n 50" >&2 || true
+}
+
+# 步骤 4 的统一回滚闭环。关键顺序：
+#   停止制造 flagged 容器 → **无条件**重启 active master 并验 live env → authenticated
+#   drain + 20s quiet census →（若仍为 1）关总 flag → master 先回 legacy → egress 后撤
+#   enforce → full smoke。若上次已写 flag=0 后失败，重跑会在 live flag0 下重做 census 并前滚。
+# 任一步失败立即短路；尤其 census/CLI 失败时总 flag 与 egress 均保持开启，fail-closed。
+rollback_model_authority_before_cutover() { # <reason>
+  local reason="${1:-manual disable}" current_flag
+  assert_no_rollout_in_progress || { model_authority_rollback_diagnostics "deploy_state 非 stable"; return 1; }
+  current_flag="$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")" \
+    || { model_authority_rollback_diagnostics "无法读取总 flag"; return 1; }
+  [[ "$current_flag" == 0 || "$current_flag" == 1 ]] \
+    || { model_authority_rollback_diagnostics "总 flag 非规范值:${current_flag:-<empty>}"; return 1; }
+  remote_env_set "$MODEL_AUTHORITY_PROVISION_FLAG_KEY" 0 \
+    || { model_authority_rollback_diagnostics "无法停止新 flagged provision"; return 1; }
+  ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
+    || { model_authority_rollback_diagnostics "provision=0 后 active master 重启失败"; return 1; }
+  assert_model_authority_live_env "$ACTIVE_UNIT" "$current_flag" 0 \
+    || { model_authority_rollback_diagnostics "active master live env 未确认 flag=$current_flag/provision=0"; return 1; }
+  model_authority_basic_master_health \
+    || { model_authority_rollback_diagnostics "active master provision=0 基础健康失败"; return 1; }
+  # current_flag=0 是上次已过 census、但后续 master/egress/smoke 失败留下的可恢复状态。
+  # 仍重跑 Docker+DB census：既让 documented retry 真正前滚，也覆盖人工误写 0 时可能
+  # 残留的 flagged 容器；绝不因为 flag 已 0 就跳过清退证据。
+  run_model_authority_container_rollback \
+    || { model_authority_rollback_diagnostics "容器 drain/census 未在时限内收敛"; return 1; }
+
+  if [[ "$current_flag" == 1 ]]; then
+    # census 收敛后才允许写 0。写失败时不重启任何进程，避免 env 与活体面进一步分叉。
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 \
+      || { model_authority_rollback_diagnostics "总 flag 写 0 失败（未执行后续重启）"; return 1; }
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
+      || { model_authority_rollback_diagnostics "flag=0 后 active master 重启失败（egress 尚未后撤）"; return 1; }
+    assert_model_authority_live_env "$ACTIVE_UNIT" 0 0 \
+      || { model_authority_rollback_diagnostics "active master live env 未确认 flag=0/provision=0"; return 1; }
+    model_authority_basic_master_health \
+      || { model_authority_rollback_diagnostics "active master legacy 基础健康失败"; return 1; }
+  fi
+  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" \
+    || { model_authority_rollback_diagnostics "egress 后撤重启失败"; return 1; }
+  model_authority_egress_enforced_is false \
+    || { model_authority_rollback_diagnostics "egress 未活体确认 enforce=false"; return 1; }
+  smoke "$ACTIVE_PORT" \
+    || { model_authority_rollback_diagnostics "回滚后 full smoke 失败"; return 1; }
+  echo "✓ 模型权威已完整回滚(reason=$reason):容器 census 收敛，master→egress 顺序回到 legacy。"
+}
+
+# enable 尚未重启 master 时的窄补偿：此时没有新签发面，只需先写 flag=0，再重启
+# egress 并活体确认 enforce=false；写 0 失败时禁止任何重启。
+rollback_model_authority_egress_only() {
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || return 1
+  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || return 1
+  model_authority_egress_enforced_is false
+}
+
 # --enable-model-authority:四面全绿 → 写 OC_MODEL_AUTHORITY=1 → 重启 master + egress → smoke。
 # (方案 §7 步 4:判定源切换。egress 也读该 flag —— /v1/messages 在 egress 进程,必须一起重启。)
 enable_model_authority() {
   echo "══ 开启模型权威 flag(方案 §7 步 4)══"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] preflight → 安装受限 canary → env flag=1 → egress enforce → master → smoke → 持久 observation"
+    echo "  [dry-run] preflight → 安装受限 canary → provision-required=1 + flag=1 → egress enforce → master → smoke → 持久 observation"
     return 0
   fi
   model_authority_preflight || { echo "✗ preflight 未全绿,拒绝开启 flag(见上方逐面结论)" >&2; exit 1; }
   install_model_authority_canary || { echo "✗ canary 安装失败,flag 尚未改动" >&2; exit 1; }
-  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1 || exit 1
+  remote_env_set "$MODEL_AUTHORITY_PROVISION_FLAG_KEY" 1 || exit 1
+  if ! remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1; then
+    # 写失败的远端状态不确定：只做 env 补偿并验证，不重启任何进程。
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
+    [[ "$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")" == 0 ]] \
+      || { echo "FATAL:flag=1 写失败且无法确认补偿为 0；禁止重启，人工核查 $V5_ENV" >&2; exit 1; }
+    echo "✗ flag=1 写失败，已确认 env 补偿为 0（未重启任何进程）" >&2
+    exit 1
+  fi
   echo "── 先重启 egress 并确认 enforce=true(允许短暂 fail-closed,禁止新 master+旧 egress fail-open)──"
   if ! ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"; then
-    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
-    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || true
-    echo "✗ egress 重启失败,flag 已回滚为 0" >&2
+    rollback_model_authority_egress_only \
+      || { model_authority_rollback_diagnostics "egress enable 失败后的窄补偿未确认"; exit 1; }
+    echo "✗ egress 重启失败,已窄补偿为 flag=0/enforce=false" >&2
     exit 1
   fi
   run "sleep 2"
   local eg
   eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
   if [[ "$(printf '%s' "$eg" | jq -r '.modelAuthority.enforced // false' 2>/dev/null || true)" != "true" ]]; then
-    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
-    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || true
-    echo "✗ egress 未活体确认 modelAuthority.enforced=true,flag 已回滚" >&2
+    rollback_model_authority_egress_only \
+      || { model_authority_rollback_diagnostics "egress enforce 探测失败后的窄补偿未确认"; exit 1; }
+    echo "✗ egress 未活体确认 enforce=true,已窄补偿为 flag=0/enforce=false" >&2
     exit 1
   fi
   echo "  ✓ egress 已 enforce=true;现在才允许 master 开始签发"
   if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
-    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
-    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' '$ACTIVE_UNIT'" || true
-    echo "✗ master 重启失败,flag 已回滚为 0" >&2
+    rollback_model_authority_before_cutover "enable master restart failed" || exit 1
+    echo "✗ master 开启重启失败，已完成全量安全回滚" >&2
     exit 1
   fi
   run "sleep 4"
-  smoke "$ACTIVE_PORT" || { echo "✗ 开启后 smoke 失败 —— 立刻 --disable-model-authority 回退" >&2; exit 1; }
+  if ! smoke "$ACTIVE_PORT"; then
+    rollback_model_authority_before_cutover "post-enable smoke failed" || exit 1
+    echo "✗ 开启后 smoke 失败，已完成全量安全回滚" >&2
+    exit 1
+  fi
   if ! start_model_authority_observation; then
-    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
-    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' '$ACTIVE_UNIT'" || true
-    echo "✗ observation 无法持久化,flag 已回滚;禁止无证据运行后 cutover" >&2
+    rollback_model_authority_before_cutover "observation persistence failed" || exit 1
+    echo "✗ observation 无法持久化，已完成全量安全回滚；禁止无证据运行后 cutover" >&2
     exit 1
   fi
   echo "✓ $MODEL_AUTHORITY_FLAG_KEY=1 已生效(判定源 = catalog),observation 已开始。"
@@ -1698,7 +1809,7 @@ enable_model_authority() {
 disable_model_authority() {
   echo "══ 关闭模型权威 flag(步骤 4 回滚)══"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 校验 cutover marker 未置位 → env $MODEL_AUTHORITY_FLAG_KEY=0 → restart master+egress"
+    echo "  [dry-run] 校验 cutover marker 未置位 → provision=0 → restart master → drain+census quiet → flag=0 → restart master→egress → smoke"
     return 0
   fi
   if model_authority_cutover_done; then
@@ -1708,13 +1819,7 @@ disable_model_authority() {
     echo "  等全部快照与运行容器收敛,再清 marker(env 键 + model_authority_deploy_state 行),才允许关 flag。" >&2
     exit 1
   fi
-  assert_no_rollout_in_progress || exit 1
-  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || exit 1
-  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' && systemctl restart '$ACTIVE_UNIT'" \
-    || { echo "✗ 重启失败,人工核查" >&2; exit 1; }
-  run "sleep 4"
-  smoke "$ACTIVE_PORT"
-  echo "✓ flag 已关(容器无 envelope → 回落 baked 判定,集合同值)。"
+  rollback_model_authority_before_cutover "manual disable" || exit 1
 }
 
 # --model-authority-cutover:步骤 5 的持久化 marker。置位后地板不可逆(见 assert_model_authority_floor)。

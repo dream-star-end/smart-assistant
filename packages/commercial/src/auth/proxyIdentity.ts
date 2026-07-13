@@ -3,7 +3,9 @@
  *
  * 物理切出自 http/anthropicProxy.ts(2026-05-18 V3_ANTHROPIC_PROXY_SPLIT_PLAN §3.2)。
  * 把"身份双因子 verify + post-auth 流量计数 + 模型授权"三件事抽成 strategy 契约,
- * proxy handler 只通过 `deps.identity.resolve()` / `deps.identity.authorize()` 与之交互,
+ * proxy handler 只通过 `deps.identity.resolve()` / legacy/影子路径的
+ * `deps.identity.authorize()` 与之交互；强制 authority 路径已在 fenced catalog gate 内授权，
+ * 不再回读异步 PricingCache 做第二次判定。
  * 不再直接 import containerIdentity / authzModels / hostReqCounter。
  *
  * 当前实现:
@@ -61,7 +63,7 @@ export interface ProxyIdentity {
  *
  * 实现内部职责:
  *   - `resolve`:校验请求来源 + post-auth 流量记账。失败 throw IdentityError(handler 401)。
- *   - `authorize`:校验该 identity 对**已 enable-gate 过的** model 是否有权使用。
+ *   - `authorize`:legacy/影子路径校验该 identity 对**已 enable-gate 过的** model 是否有权使用。
  *     失败 throw AuthzLoadError(handler 500)/ AuthzDeniedError(handler 403)。
  *
  * 关键不变量:
@@ -77,7 +79,7 @@ export interface IdentityStrategy {
   ): Promise<ProxyIdentity>;
 
   /**
-   * 授权检查。**handler 必须先做完 pricing.enabled gate**,本方法假设 model 在
+   * legacy/影子路径授权检查。**handler 必须先做完 pricing.enabled gate**,本方法假设 model 在
    * pricing 表里且 enabled=true,只检查 visibility / grants / role。
    *
    * @param pricing 已 resolve 的 ModelPricing(handler 已通过 pricing.get + enabled gate)。
