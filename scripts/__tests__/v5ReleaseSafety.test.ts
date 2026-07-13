@@ -397,6 +397,70 @@ describe('v5 release safety lanes', () => {
     assert.match(timedOut.stderr, /last egress health: <empty>/)
   })
 
+  test('runtime release finalization propagates the full pinned capability list and rejects invalid metadata', async () => {
+    async function runBuild(runtimeCapabilities: unknown) {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-caps-')); dirs.push(dir)
+      const capture = path.join(dir, 'finalize.args')
+      await writeFile(capture, '')
+      const harness = [
+        'set -euo pipefail',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'git() {',
+        '  case "$*" in',
+        '    *"rev-parse HEAD"*) printf "%s\\n" pinned-commit ;;',
+        '    *"show pinned-commit:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
+        '    *"archive --format=tar pinned-commit"*) : ;;',
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'hotcfg_ship_lib() { :; }',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"grep \'^OC_RUNTIME_IMAGE=\'"*) printf "%s\\n" runtime:test ;;',
+        '    *"docker image inspect"*) printf "%s\\n" sha256:test ;;',
+        '    *"grep \'^OC_RUNTIME_RELEASE=\'"*) printf "%s\\n" /runtime/prev ;;',
+        '    *) cat >/dev/null || true ;;',
+        '  esac',
+        '}',
+        'hotcfg_rmt() { printf "%s\\n" "$@" >"$CAPTURE"; printf "%s\\n" "$OC_HOTCFG_RELEASES_ROOT/rel-test"; }',
+        'build_runtime_release',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CAPTURE: capture,
+          PINNED_METADATA: JSON.stringify({ runtimeCapabilities }),
+        },
+      })
+      return {
+        result,
+        args: (await readFile(capture, 'utf8')).trim().split('\n').filter(Boolean),
+      }
+    }
+
+    const valid = await runBuild(['model_authority_v1', 'future.runtime-cap'])
+    assert.equal(valid.result.status, 0, valid.result.stderr || valid.result.stdout)
+    assert.equal(valid.args[0], 'oc_hotcfg_finalize_release')
+    assert.equal(valid.args[5], 'model_authority_v1 future.runtime-cap')
+
+    for (const invalid of [
+      'model_authority_v1',
+      ['model_authority_v1', 'model_authority_v1'],
+      ['future.runtime-cap'],
+      ['model_authority_v1', 'bad token'],
+    ]) {
+      const rejected = await runBuild(invalid)
+      assert.notEqual(rejected.result.status, 0, rejected.result.stdout + rejected.result.stderr)
+      assert.deepEqual(rejected.args, [], 'invalid metadata must fail before finalize')
+      assert.match(rejected.result.stderr, /runtimeCapabilities 非法或缺/)
+    }
+  })
+
   test('release metadata declares both authority migrations and both authority capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
     const source = await readFile(deploy, 'utf8')
@@ -411,7 +475,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
     assert.match(
       source.slice(buildRuntimeStart, buildRuntimeEnd),
-      /oc_hotcfg_finalize_release "\$staging" "\$RUNTIME_IMAGE_ID" "\$full_sha" "\$\{prev:-\}" "\$MODEL_AUTHORITY_CAP"/,
+      /oc_hotcfg_finalize_release "\$staging" "\$RUNTIME_IMAGE_ID" "\$full_sha" "\$\{prev:-\}" "\$runtime_caps"/,
     )
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
