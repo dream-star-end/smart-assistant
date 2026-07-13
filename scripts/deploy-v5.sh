@@ -1552,6 +1552,27 @@ model_authority_fleet_census() {
   ssh "$KL_HOST" 'ids=$(docker ps -aq --filter label=com.openclaude.runtime_channel=v5); if [ -z "$ids" ]; then printf "[]\n"; else docker inspect $ids | jq -c '\''[.[] | {id:.Id,name:(.Name|ltrimstr("/")),status:.State.Status,bundle_rev:(.Config.Labels["com.openclaude.runtime.bundle_rev"] // "")} ] | sort_by(.id)'\''; fi'
 }
 
+rollback_seed_authority_by_rev() { # <reason>
+  local reason="$1" live
+  if ! remote_env_set OC_SEED_AUTHORITY_BY_REV 0; then
+    live="$(remote_env_get OC_SEED_AUTHORITY_BY_REV)"
+    [[ "$live" == 0 ]] || {
+      echo "FATAL:seed authority 补偿无法确认 env=0(reason=$reason,live=${live:-<unreadable>})" >&2
+      return 1
+    }
+    echo "  · seed=0 写回执丢失，但 env 回读已确认 0"
+  fi
+  ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || {
+    echo "FATAL:seed authority 补偿 master 重启失败(reason=$reason)" >&2
+    return 1
+  }
+  wait_for_model_authority_master_ready "$ACTIVE_UNIT" 1 1 0 60 || {
+    echo "FATAL:seed authority 补偿未活体确认 authority=1/provision=1/seed=0(reason=$reason)" >&2
+    return 1
+  }
+  echo "  ✓ seed authority 已验证回滚(reason=$reason):live authority=1/provision=1/seed=0"
+}
+
 enable_seed_authority_by_rev() {
   echo "══ seed authority 阶段 B:全 fleet bundle-rev census(含 stopped)══"
   if [[ "$DRY" == 1 ]]; then
@@ -1573,21 +1594,37 @@ enable_seed_authority_by_rev() {
   ssh "$KL_HOST" "cd '$ACTIVE_SRC' && npx --no-install tsx packages/commercial/agent-sandbox/platform-runtime/entrypoint/validatePlatformSeedCli.ts '$bundle'" \
     || { echo "✗ current bundle seed 声明校验失败" >&2; exit 1; }
 
-  remote_env_set OC_SEED_AUTHORITY_BY_REV 1 || exit 1
-  if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
-    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
-    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
-    echo "✗ master 重启失败,seed flag 已回滚" >&2; exit 1
+  if ! remote_env_set OC_SEED_AUTHORITY_BY_REV 1; then
+    rollback_seed_authority_by_rev "seed=1 env 写回执失败(commit-unknown)" || exit 1
+    echo "✗ seed=1 env 写入未确认，已完成活体回滚；未登记 census 证据" >&2
+    exit 1
   fi
-  sleep 4
+  if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
+    rollback_seed_authority_by_rev "seed=1 master restart failed" || exit 1
+    echo "✗ seed=1 master 重启失败，已完成活体回滚" >&2; exit 1
+  fi
+  if ! wait_for_model_authority_master_ready "$ACTIVE_UNIT" 1 1 1 60; then
+    rollback_seed_authority_by_rev "seed=1 master readiness failed" || exit 1
+    echo "✗ seed=1 未在当前 MainPID 活体生效，已完成活体回滚" >&2; exit 1
+  fi
   if ! smoke "$ACTIVE_PORT"; then
-    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
-    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
-    echo "✗ seed 阶段 B smoke 失败,flag 已回滚" >&2; exit 1
+    rollback_seed_authority_by_rev "seed=1 full smoke failed" || exit 1
+    echo "✗ seed 阶段 B smoke 失败，已完成活体回滚" >&2; exit 1
   fi
 
-  release="$(model_authority_release_sha)"; tuple="$(model_authority_runtime_tuple)"
-  epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")"
+  if ! release="$(model_authority_release_sha)"; then
+    rollback_seed_authority_by_rev "seed census release binding read failed" || exit 1
+    echo "✗ seed census 无法读取 live release，seed 已完成活体回滚" >&2; exit 1
+  fi
+  if ! tuple="$(model_authority_runtime_tuple)"; then
+    rollback_seed_authority_by_rev "seed census runtime tuple read failed" || exit 1
+    echo "✗ seed census 无法读取 runtime tuple，seed 已完成活体回滚" >&2; exit 1
+  fi
+  if ! epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")" \
+    || [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+    rollback_seed_authority_by_rev "seed census security epoch read failed" || exit 1
+    echo "✗ seed census 无法读取 security epoch，seed 已完成活体回滚" >&2; exit 1
+  fi
   rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$tuple")"; census64="$(model_authority_b64 "$census")"
   out="$(remote_model_authority_psql "UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{seed_census}',jsonb_build_object(
     'recorded_at',NOW()::text,'bundle_rev','$rev','container_count','$count',
@@ -1599,9 +1636,8 @@ enable_seed_authority_by_rev() {
     AND value->>'security_epoch'='$epoch'
   RETURNING 'ok'")" || true
   if [[ "$out" != "ok" ]]; then
-    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
-    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
-    echo "✗ observation 绑定漂移,seed flag 已回滚;重新开启 observation" >&2; exit 1
+    rollback_seed_authority_by_rev "seed census observation binding drift" || exit 1
+    echo "✗ observation 绑定漂移，seed 已完成活体回滚；重新开启 observation" >&2; exit 1
   fi
   echo "✓ seed authority by rev 已开启并留证(bundle=$rev fleet=$count,含 stopped)。"
 }
@@ -1655,32 +1691,173 @@ model_authority_observation_status() {
   jq . <<<"$raw"
 }
 
-# 只看 systemd **当前 MainPID** 的真实 env，不以 env 文件写入成功冒充进程已生效。
-assert_model_authority_live_env() { # <unit> <authority-flag> <provision-required>
-  local unit="$1" flag="$2" provision="$3"
-  ssh "$KL_HOST" bash -s -- "$unit" "$flag" "$provision" <<'REMOTE'
-set -Eeuo pipefail
-unit="$1"; flag="$2"; provision="$3"
-pid="$(systemctl show -p MainPID --value "$unit")"
-[[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid"
-env_file="/proc/$pid/environ"
-test -r "$env_file"
-tr '\0' '\n' <"$env_file" | grep -Fxq "OC_MODEL_AUTHORITY=$flag"
-tr '\0' '\n' <"$env_file" | grep -Fxq "OC_MODEL_AUTHORITY_PROVISION_REQUIRED=$provision"
+# systemd restart 后禁止固定 sleep/单点探测。每轮把 unit active + 同一个非零 MainPID
+# 的 live env/health 绑成一个样本，并在 health 后重读 PID；本地 timeout 钉死整次 SSH。
+MODEL_AUTHORITY_MASTER_LAST_STATE_BEFORE=""; MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE=""
+MODEL_AUTHORITY_MASTER_LAST_AUTHORITY=""; MODEL_AUTHORITY_MASTER_LAST_PROVISION=""
+MODEL_AUTHORITY_MASTER_LAST_SEED=""; MODEL_AUTHORITY_MASTER_LAST_HEALTH=""
+MODEL_AUTHORITY_MASTER_LAST_STATE_AFTER=""; MODEL_AUTHORITY_MASTER_LAST_PID_AFTER=""
+
+model_authority_master_ready_once() { # <unit> <authority> <provision> <seed:0|1|-> <request-timeout-seconds>
+  local unit="$1" authority="$2" provision="$3" seed="$4" request_timeout="${5:-2}" raw health_b64
+  raw="$(timeout --signal=KILL "${request_timeout}s" ssh "$KL_HOST" bash -s -- \
+    "$unit" "$ACTIVE_PORT" "$request_timeout" <<'REMOTE'
+set +e
+unit="$1"; port="$2" request_timeout="$3"
+state_before="$(systemctl is-active "$unit" 2>/dev/null || true)"
+pid_before="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+authority=""; provision=""; seed=""; health=""
+if [[ "$state_before" == active && "$pid_before" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid_before" 2>/dev/null; then
+  env_file="/proc/$pid_before/environ"
+  if test -r "$env_file"; then
+    authority="$(tr '\0' '\n' <"$env_file" | sed -n 's/^OC_MODEL_AUTHORITY=//p' | tail -n1)"
+    provision="$(tr '\0' '\n' <"$env_file" | sed -n 's/^OC_MODEL_AUTHORITY_PROVISION_REQUIRED=//p' | tail -n1)"
+    seed="$(tr '\0' '\n' <"$env_file" | sed -n 's/^OC_SEED_AUTHORITY_BY_REV=//p' | tail -n1)"
+  fi
+  health="$(curl -fsS --max-time "$request_timeout" "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)"
+fi
+state_after="$(systemctl is-active "$unit" 2>/dev/null || true)"
+pid_after="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+[[ "$pid_after" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid_after" 2>/dev/null || pid_after=""
+printf '%s\n%s\n%s\n%s\n%s\n' "$state_before" "$pid_before" "$authority" "$provision" "$seed"
+printf '%s' "$health" | base64 -w0; printf '\n'
+printf '%s\n%s\n' "$state_after" "$pid_after"
 REMOTE
+)" || raw=""
+
+  local -a lines=()
+  mapfile -t lines <<<"$raw"
+  MODEL_AUTHORITY_MASTER_LAST_STATE_BEFORE="${lines[0]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE="${lines[1]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_AUTHORITY="${lines[2]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_PROVISION="${lines[3]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_SEED="${lines[4]:-}"
+  health_b64="${lines[5]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_STATE_AFTER="${lines[6]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_PID_AFTER="${lines[7]:-}"
+  MODEL_AUTHORITY_MASTER_LAST_HEALTH=""
+  if [[ -n "$health_b64" ]]; then
+    MODEL_AUTHORITY_MASTER_LAST_HEALTH="$(printf '%s' "$health_b64" | base64 -d 2>/dev/null || true)"
+  fi
+
+  [[ "$MODEL_AUTHORITY_MASTER_LAST_STATE_BEFORE" == active \
+    && "$MODEL_AUTHORITY_MASTER_LAST_STATE_AFTER" == active \
+    && "$MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE" =~ ^[1-9][0-9]*$ \
+    && "$MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE" == "$MODEL_AUTHORITY_MASTER_LAST_PID_AFTER" \
+    && "$MODEL_AUTHORITY_MASTER_LAST_AUTHORITY" == "$authority" \
+    && "$MODEL_AUTHORITY_MASTER_LAST_PROVISION" == "$provision" ]] || return 1
+  [[ "$seed" == - || "$MODEL_AUTHORITY_MASTER_LAST_SEED" == "$seed" ]] || return 1
+  jq -e '.ok == true and .runtime.leadership.state == "leader"' \
+    <<<"$MODEL_AUTHORITY_MASTER_LAST_HEALTH" >/dev/null 2>&1 \
+    && grep -q '"sessionsDb":"ok"' <<<"$MODEL_AUTHORITY_MASTER_LAST_HEALTH"
 }
 
-model_authority_basic_master_health() {
-  local hz
-  hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${ACTIVE_PORT}/healthz" 2>/dev/null || true)"
-  jq -e '.ok == true and .runtime.leadership.state == "leader"' <<<"$hz" >/dev/null 2>&1 \
-    && grep -q '"sessionsDb":"ok"' <<<"$hz"
+wait_for_model_authority_master_ready() { # <unit> <authority> <provision> <seed:0|1|-> [timeout-seconds]
+  local unit="$1" authority="$2" provision="$3" seed="$4" wait_seconds="${5:-60}"
+  local deadline remaining request_timeout sleep_for
+  [[ "$authority" =~ ^[01]$ && "$provision" =~ ^[01]$ && "$seed" =~ ^[01-]$ \
+    && "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ master readiness 参数非法(authority=$authority provision=$provision seed=$seed timeout=$wait_seconds)" >&2
+    return 2
+  }
+  deadline=$((SECONDS + wait_seconds))
+  MODEL_AUTHORITY_MASTER_LAST_STATE_BEFORE=""; MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE=""
+  MODEL_AUTHORITY_MASTER_LAST_AUTHORITY=""; MODEL_AUTHORITY_MASTER_LAST_PROVISION=""
+  MODEL_AUTHORITY_MASTER_LAST_SEED=""; MODEL_AUTHORITY_MASTER_LAST_HEALTH=""
+  MODEL_AUTHORITY_MASTER_LAST_STATE_AFTER=""; MODEL_AUTHORITY_MASTER_LAST_PID_AFTER=""
+  echo "── 有界轮询等待 master ready(≤${wait_seconds}s,authority=$authority provision=$provision seed=$seed)──"
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    request_timeout="$remaining"; (( request_timeout > 2 )) && request_timeout=2
+    (( request_timeout < 1 )) && request_timeout=1
+    if model_authority_master_ready_once "$unit" "$authority" "$provision" "$seed" "$request_timeout"; then
+      echo "  ✓ master ready(pid=$MODEL_AUTHORITY_MASTER_LAST_PID_AFTER authority=$authority provision=$provision seed=$seed)"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && break
+    remaining=$((deadline - SECONDS)); sleep_for="$remaining"; (( sleep_for > 1 )) && sleep_for=1
+    (( sleep_for > 0 )) && sleep "$sleep_for"
+  done
+  echo "✗ master 在 ${wait_seconds}s 内未就绪(authority=$authority provision=$provision seed=$seed)" >&2
+  echo "  last state/pid=${MODEL_AUTHORITY_MASTER_LAST_STATE_BEFORE:-<empty>}/${MODEL_AUTHORITY_MASTER_LAST_PID_BEFORE:-<empty>}→${MODEL_AUTHORITY_MASTER_LAST_STATE_AFTER:-<empty>}/${MODEL_AUTHORITY_MASTER_LAST_PID_AFTER:-<empty>}" >&2
+  echo "  last live env:authority=${MODEL_AUTHORITY_MASTER_LAST_AUTHORITY:-<empty>} provision=${MODEL_AUTHORITY_MASTER_LAST_PROVISION:-<empty>} seed=${MODEL_AUTHORITY_MASTER_LAST_SEED:-<empty>}" >&2
+  echo "  last master health:${MODEL_AUTHORITY_MASTER_LAST_HEALTH:-<empty>}" >&2
+  return 1
 }
 
-model_authority_egress_enforced_is() { # <true|false>
-  local expected="$1" eg
-  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
-  [[ "$(jq -r '.modelAuthority.enforced // false' <<<"$eg" 2>/dev/null || true)" == "$expected" ]]
+MODEL_AUTHORITY_EGRESS_LAST_STATE_BEFORE=""; MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE=""
+MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER=""; MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER=""
+MODEL_AUTHORITY_EGRESS_LAST_HEALTH=""
+
+model_authority_egress_ready_once() { # <true|false> <request-timeout-seconds>
+  local expected="$1" request_timeout="${2:-2}" raw health_b64
+  raw="$(timeout --signal=KILL "${request_timeout}s" ssh "$KL_HOST" bash -s -- \
+    "$V5_EGRESS_UNIT" "$request_timeout" <<'REMOTE'
+set +e
+unit="$1"; request_timeout="$2"
+state_before="$(systemctl is-active "$unit" 2>/dev/null || true)"
+pid_before="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+health=""
+if [[ "$state_before" == active && "$pid_before" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid_before" 2>/dev/null; then
+  health="$(curl -fsS --max-time "$request_timeout" http://172.31.0.1:18892/internal/v5/egress-health 2>/dev/null || true)"
+fi
+state_after="$(systemctl is-active "$unit" 2>/dev/null || true)"
+pid_after="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+[[ "$pid_after" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid_after" 2>/dev/null || pid_after=""
+printf '%s\n%s\n' "$state_before" "$pid_before"
+printf '%s' "$health" | base64 -w0; printf '\n'
+printf '%s\n%s\n' "$state_after" "$pid_after"
+REMOTE
+)" || raw=""
+
+  local -a lines=()
+  mapfile -t lines <<<"$raw"
+  MODEL_AUTHORITY_EGRESS_LAST_STATE_BEFORE="${lines[0]:-}"
+  MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE="${lines[1]:-}"
+  health_b64="${lines[2]:-}"
+  MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER="${lines[3]:-}"
+  MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER="${lines[4]:-}"
+  MODEL_AUTHORITY_EGRESS_LAST_HEALTH=""
+  if [[ -n "$health_b64" ]]; then
+    MODEL_AUTHORITY_EGRESS_LAST_HEALTH="$(printf '%s' "$health_b64" | base64 -d 2>/dev/null || true)"
+  fi
+
+  [[ "$MODEL_AUTHORITY_EGRESS_LAST_STATE_BEFORE" == active \
+    && "$MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER" == active \
+    && "$MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE" =~ ^[1-9][0-9]*$ \
+    && "$MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE" == "$MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER" ]] || return 1
+  jq -e --argjson expected "$expected" \
+    '.ok == true and .role == "egress" and .modelAuthority.enforced == $expected' \
+    <<<"$MODEL_AUTHORITY_EGRESS_LAST_HEALTH" >/dev/null 2>&1
+}
+
+wait_for_model_authority_egress_ready() { # <true|false> [timeout-seconds]
+  local expected="$1" wait_seconds="${2:-60}" deadline remaining request_timeout sleep_for
+  [[ "$expected" == true || "$expected" == false ]] && [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ egress authority readiness 参数非法(expected=$expected timeout=$wait_seconds)" >&2
+    return 2
+  }
+  deadline=$((SECONDS + wait_seconds))
+  MODEL_AUTHORITY_EGRESS_LAST_STATE_BEFORE=""; MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE=""
+  MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER=""; MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER=""
+  MODEL_AUTHORITY_EGRESS_LAST_HEALTH=""
+  echo "── 有界轮询等待 egress authority ready(≤${wait_seconds}s,enforced=$expected)──"
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    request_timeout="$remaining"; (( request_timeout > 2 )) && request_timeout=2
+    (( request_timeout < 1 )) && request_timeout=1
+    if model_authority_egress_ready_once "$expected" "$request_timeout"; then
+      echo "  ✓ egress authority ready(pid=$MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER enforced=$expected)"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && break
+    remaining=$((deadline - SECONDS)); sleep_for="$remaining"; (( sleep_for > 1 )) && sleep_for=1
+    (( sleep_for > 0 )) && sleep "$sleep_for"
+  done
+  echo "✗ egress 在 ${wait_seconds}s 内未就绪(enforced=$expected)" >&2
+  echo "  last state/pid=${MODEL_AUTHORITY_EGRESS_LAST_STATE_BEFORE:-<empty>}/${MODEL_AUTHORITY_EGRESS_LAST_PID_BEFORE:-<empty>}→${MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER:-<empty>}/${MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER:-<empty>}" >&2
+  echo "  last egress health:${MODEL_AUTHORITY_EGRESS_LAST_HEALTH:-<empty>}" >&2
+  return 1
 }
 
 run_model_authority_container_rollback() {
@@ -1717,10 +1894,8 @@ rollback_model_authority_before_cutover() { # <reason>
     || { model_authority_rollback_diagnostics "无法停止新 flagged provision"; return 1; }
   ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
     || { model_authority_rollback_diagnostics "provision=0 后 active master 重启失败"; return 1; }
-  assert_model_authority_live_env "$ACTIVE_UNIT" "$current_flag" 0 \
-    || { model_authority_rollback_diagnostics "active master live env 未确认 flag=$current_flag/provision=0"; return 1; }
-  model_authority_basic_master_health \
-    || { model_authority_rollback_diagnostics "active master provision=0 基础健康失败"; return 1; }
+  wait_for_model_authority_master_ready "$ACTIVE_UNIT" "$current_flag" 0 - 60 \
+    || { model_authority_rollback_diagnostics "active master 未就绪 flag=$current_flag/provision=0"; return 1; }
   # current_flag=0 是上次已过 census、但后续 master/egress/smoke 失败留下的可恢复状态。
   # 仍重跑 Docker+DB census：既让 documented retry 真正前滚，也覆盖人工误写 0 时可能
   # 残留的 flagged 容器；绝不因为 flag 已 0 就跳过清退证据。
@@ -1733,14 +1908,12 @@ rollback_model_authority_before_cutover() { # <reason>
       || { model_authority_rollback_diagnostics "总 flag 写 0 失败（未执行后续重启）"; return 1; }
     ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
       || { model_authority_rollback_diagnostics "flag=0 后 active master 重启失败（egress 尚未后撤）"; return 1; }
-    assert_model_authority_live_env "$ACTIVE_UNIT" 0 0 \
-      || { model_authority_rollback_diagnostics "active master live env 未确认 flag=0/provision=0"; return 1; }
-    model_authority_basic_master_health \
-      || { model_authority_rollback_diagnostics "active master legacy 基础健康失败"; return 1; }
+    wait_for_model_authority_master_ready "$ACTIVE_UNIT" 0 0 - 60 \
+      || { model_authority_rollback_diagnostics "active master legacy 未就绪 flag=0/provision=0"; return 1; }
   fi
   ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" \
     || { model_authority_rollback_diagnostics "egress 后撤重启失败"; return 1; }
-  model_authority_egress_enforced_is false \
+  wait_for_model_authority_egress_ready false 60 \
     || { model_authority_rollback_diagnostics "egress 未活体确认 enforce=false"; return 1; }
   smoke "$ACTIVE_PORT" \
     || { model_authority_rollback_diagnostics "回滚后 full smoke 失败"; return 1; }
@@ -1752,7 +1925,7 @@ rollback_model_authority_before_cutover() { # <reason>
 rollback_model_authority_egress_only() {
   remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || return 1
   ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || return 1
-  model_authority_egress_enforced_is false
+  wait_for_model_authority_egress_ready false 60
 }
 
 # --enable-model-authority:四面全绿 → 写 OC_MODEL_AUTHORITY=1 → 重启 master + egress → smoke。
@@ -1781,10 +1954,7 @@ enable_model_authority() {
     echo "✗ egress 重启失败,已窄补偿为 flag=0/enforce=false" >&2
     exit 1
   fi
-  run "sleep 2"
-  local eg
-  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
-  if [[ "$(printf '%s' "$eg" | jq -r '.modelAuthority.enforced // false' 2>/dev/null || true)" != "true" ]]; then
+  if ! wait_for_model_authority_egress_ready true 60; then
     rollback_model_authority_egress_only \
       || { model_authority_rollback_diagnostics "egress enforce 探测失败后的窄补偿未确认"; exit 1; }
     echo "✗ egress 未活体确认 enforce=true,已窄补偿为 flag=0/enforce=false" >&2
@@ -1796,7 +1966,11 @@ enable_model_authority() {
     echo "✗ master 开启重启失败，已完成全量安全回滚" >&2
     exit 1
   fi
-  run "sleep 4"
+  if ! wait_for_model_authority_master_ready "$ACTIVE_UNIT" 1 1 - 60; then
+    rollback_model_authority_before_cutover "post-enable master readiness failed" || exit 1
+    echo "✗ master 开启后未在当前 MainPID 就绪，已完成全量安全回滚" >&2
+    exit 1
+  fi
   if ! smoke "$ACTIVE_PORT"; then
     rollback_model_authority_before_cutover "post-enable smoke failed" || exit 1
     echo "✗ 开启后 smoke 失败，已完成全量安全回滚" >&2

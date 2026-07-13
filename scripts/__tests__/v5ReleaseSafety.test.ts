@@ -502,15 +502,152 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
   })
 
+  test('model-authority readiness tolerates startup delay, rejects PID churn, and has a hard deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-ready-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    await writeFile(path.join(bin, 'ssh'), [
+      '#!/bin/sh',
+      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
+      'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
+      'case "$PROBE_MODE" in',
+      '  master-delayed)',
+      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\n\\n\\n\\nactivating\\n0\\n"',
+      '    elif [ "$n" -eq 2 ]; then printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health"',
+      '    else printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4321\\n" "$master_health"; fi ;;',
+      '  master-churn) printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health" ;;',
+      '  master-invalid) printf "inactive\\n0\\n1\\n1\\n0\\n%s\\ninactive\\n0\\n" "$master_health" ;;',
+      '  egress-delayed)',
+      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\nactivating\\n0\\n"',
+      '    elif [ "$n" -eq 2 ]; then printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health"',
+      '    else printf "active\\n5321\\n%s\\nactive\\n5321\\n" "$egress_health"; fi ;;',
+      '  egress-churn) printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health" ;;',
+      '  egress-invalid) printf "inactive\\n0\\n%s\\ninactive\\n0\\n" "$egress_health" ;;',
+      '  *) exit 2 ;;',
+      'esac',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+
+    async function runProbe(body: string, mode: string, slow = false) {
+      await writeFile(counter, '0')
+      return spawnSync('bash', ['-c', [
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        body,
+      ].join('\n')], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          KL_HOST: 'fake-v5',
+          COUNTER: counter,
+          PROBE_MODE: mode,
+          SLOW_PROBE: slow ? '1' : '0',
+        },
+      })
+    }
+
+    const masterDelayed = await runProbe(
+      'sleep() { :; }; wait_for_model_authority_master_ready openclaude-v5.service 1 1 - 5',
+      'master-delayed',
+    )
+    assert.equal(masterDelayed.status, 0, masterDelayed.stderr || masterDelayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(masterDelayed.stdout, /master ready\(pid=4321 authority=1 provision=1 seed=-\)/)
+
+    for (const mode of ['master-churn', 'master-invalid']) {
+      const rejected = await runProbe(
+        'model_authority_master_ready_once openclaude-v5.service 1 1 - 2',
+        mode,
+      )
+      assert.notEqual(rejected.status, 0, `${mode} must be rejected`)
+    }
+
+    const egressDelayed = await runProbe(
+      'sleep() { :; }; wait_for_model_authority_egress_ready true 5',
+      'egress-delayed',
+    )
+    assert.equal(egressDelayed.status, 0, egressDelayed.stderr || egressDelayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(egressDelayed.stdout, /egress authority ready\(pid=5321 enforced=true\)/)
+
+    for (const mode of ['egress-churn', 'egress-invalid']) {
+      const rejected = await runProbe('model_authority_egress_ready_once true 2', mode)
+      assert.notEqual(rejected.status, 0, `${mode} must be rejected`)
+    }
+
+    for (const [body, mode] of [
+      ['wait_for_model_authority_master_ready openclaude-v5.service 1 1 - 1', 'master-delayed'],
+      ['wait_for_model_authority_egress_ready true 1', 'egress-delayed'],
+    ] as const) {
+      const started = Date.now()
+      const timedOut = await runProbe(body, mode, true)
+      const elapsed = Date.now() - started
+      assert.notEqual(timedOut.status, 0)
+      assert.ok(elapsed < 2500, `one-second ${mode} deadline took ${elapsed}ms`)
+    }
+  })
+
   test('authority enable is fail-closed: egress enforces before master starts signing', async () => {
     const source = await readFile(deploy, 'utf8')
     const body = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     const egressRestart = body.indexOf("systemctl restart '$V5_EGRESS_UNIT'")
-    const enforceProbe = body.indexOf('modelAuthority.enforced')
+    const enforceProbe = body.indexOf('wait_for_model_authority_egress_ready true')
     const masterRestart = body.indexOf("systemctl restart '$ACTIVE_UNIT'")
     assert.ok(egressRestart >= 0, 'enable must restart egress')
     assert.ok(enforceProbe > egressRestart, 'enable must probe egress enforced=true after restart')
     assert.ok(masterRestart > enforceProbe, 'master may sign only after egress is enforcing')
+  })
+
+  test('authority enable readiness failures take the correct verified rollback path', async () => {
+    async function enableHarness(failAt: 'egress-true' | 'master-ready') {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-enable-')); dirs.push(dir)
+      const log = path.join(dir, 'order.log')
+      const body = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790',
+        'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+        'model_authority_preflight() { record preflight; return 0; }',
+        'install_model_authority_canary() { record canary; return 0; }',
+        'remote_env_set() { record "env:$1=$2"; return 0; }',
+        'ssh() { record "ssh:$*"; return 0; }',
+        'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; [[ ! ( "$FAIL_AT" == egress-true && "$1" == true ) ]]; }',
+        'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$FAIL_AT" != master-ready ]]; }',
+        'rollback_model_authority_before_cutover() { record "full-rollback:$1"; return 0; }',
+        'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+        'smoke() { record smoke; return 0; }',
+        'start_model_authority_observation() { record observation; return 0; }',
+        'enable_model_authority',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', body], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+      })
+      return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
+    }
+
+    const egressFailure = await enableHarness('egress-true')
+    assert.notEqual(egressFailure.result.status, 0)
+    assert.match(
+      egressFailure.order.join('\n'),
+      /openclaude-v5-egress[\s\S]*egress-ready:true[\s\S]*env:OC_MODEL_AUTHORITY=0[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false/,
+    )
+    assert.equal(egressFailure.order.some((line) => line.includes("restart 'openclaude-v5.service'")), false)
+
+    const masterFailure = await enableHarness('master-ready')
+    assert.notEqual(masterFailure.result.status, 0)
+    assert.match(
+      masterFailure.order.join('\n'),
+      /egress-ready:true[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/-[\s\S]*full-rollback:post-enable master readiness failed/,
+    )
+    assert.doesNotMatch(masterFailure.order.join('\n'), /smoke|observation/)
   })
 
   async function modelAuthorityRollbackHarness(fail = '') {
@@ -531,10 +668,9 @@ describe('v5 release safety lanes', () => {
       '  if [[ "$*" == *"restart \'$ACTIVE_UNIT\'"* && "$FAIL_AT" == master_first && "$(grep -c "restart \'$ACTIVE_UNIT\'" "$ORDER_LOG")" == 1 ]]; then return 1; fi',
       '  return 0',
       '}',
-      'assert_model_authority_live_env() { record "live:$2/$3"; [[ "$FAIL_AT" != "live:$2/$3" ]]; }',
-      'model_authority_basic_master_health() { record basic_health; [[ "$FAIL_AT" != basic_health ]]; }',
+      'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$FAIL_AT" != "master-ready:$2/$3/$4" ]]; }',
       'run_model_authority_container_rollback() { record census; [[ "$FAIL_AT" != census ]]; }',
-      'model_authority_egress_enforced_is() { record "egress:$1"; [[ "$FAIL_AT" != "egress:$1" ]]; }',
+      'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; [[ "$FAIL_AT" != "egress-ready:$1" ]]; }',
       'smoke() { record smoke; [[ "$FAIL_AT" != smoke ]]; }',
       'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
       'rollback_model_authority_before_cutover test',
@@ -554,15 +690,13 @@ describe('v5 release safety lanes', () => {
       'stable',
       'env:OC_MODEL_AUTHORITY_PROVISION_REQUIRED=0',
       "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
-      'live:1/0',
-      'basic_health',
+      'master-ready:1/0/-',
       'census',
       'env:OC_MODEL_AUTHORITY=0',
       "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
-      'live:0/0',
-      'basic_health',
+      'master-ready:0/0/-',
       "ssh:fake-v5 systemctl restart 'openclaude-v5-egress.service'",
-      'egress:false',
+      'egress-ready:false',
       'smoke',
     ]
     assert.deepEqual(order, expected)
@@ -579,13 +713,17 @@ describe('v5 release safety lanes', () => {
     assert.notEqual(masterFail.result.status, 0)
     assert.doesNotMatch(masterFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress:false/)
 
+    const masterReadinessFail = await modelAuthorityRollbackHarness('master-ready:1/0/-')
+    assert.notEqual(masterReadinessFail.result.status, 0)
+    assert.doesNotMatch(masterReadinessFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress-ready:false/)
+
     const censusFail = await modelAuthorityRollbackHarness('census')
     assert.notEqual(censusFail.result.status, 0)
     assert.doesNotMatch(censusFail.order.join('\n'), /env:OC_MODEL_AUTHORITY=0|egress:false/)
 
     const smokeFail = await modelAuthorityRollbackHarness('smoke')
     assert.notEqual(smokeFail.result.status, 0)
-    assert.match(smokeFail.order.join('\n'), /egress:false[\s\S]*smoke[\s\S]*diagnostic:/)
+    assert.match(smokeFail.order.join('\n'), /egress-ready:false[\s\S]*smoke[\s\S]*diagnostic:/)
   })
 
   test('authority rollback is resumable after flag0 when egress recovery previously failed', async () => {
@@ -602,10 +740,9 @@ describe('v5 release safety lanes', () => {
       'remote_env_get() { printf "%s\\n" "$authority_flag"; }',
       'remote_env_set() { record "env:$1=$2"; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
       'ssh() { record "ssh:$*"; if [[ "$*" == *"restart \'$V5_EGRESS_UNIT\'"* && "$egress_fail" == 1 ]]; then return 1; fi; return 0; }',
-      'assert_model_authority_live_env() { record "live:$2/$3"; [[ "$authority_flag" == "$2" ]]; }',
-      'model_authority_basic_master_health() { return 0; }',
+      'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$authority_flag" == "$2" ]]; }',
       'run_model_authority_container_rollback() { record census; return 0; }',
-      'model_authority_egress_enforced_is() { record "egress:$1"; return 0; }',
+      'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; return 0; }',
       'smoke() { record smoke; return 0; }',
       'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
       'rollback_model_authority_before_cutover first || true',
@@ -622,8 +759,77 @@ describe('v5 release safety lanes', () => {
     assert.equal(result.status, 0, result.stderr || result.stdout)
     const retryAt = order.indexOf('retry')
     const retried = order.slice(retryAt + 1).join('\n')
-    assert.match(retried, /live:0\/0[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress:false[\s\S]*smoke/)
-    assert.doesNotMatch(retried, /live:1\/0/)
+    assert.match(retried, /master-ready:0\/0\/-[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false[\s\S]*smoke/)
+    assert.doesNotMatch(retried, /master-ready:1\/0\/-/)
+  })
+
+  test('seed authority failures compensate commit-unknown writes and verify live seed=0', async () => {
+    async function seedHarness(failAt: 'write-unknown' | 'seed-ready' | 'comp-ready' | 'evidence-read') {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-seed-')); dirs.push(dir)
+      const log = path.join(dir, 'order.log')
+      const body = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+        'OC_HOTCFG_PLATFORM_ROOT=/platform; seed_state=0',
+        'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+        'assert_no_rollout_in_progress() { record stable; return 0; }',
+        'remote_env_get() { case "$1" in OC_PLATFORM_BUNDLE) printf "%s\\n" /platform/bundles/aaaaaaaaaaaa ;; OC_SEED_AUTHORITY_BY_REV) printf "%s\\n" "$seed_state" ;; esac; }',
+        'remote_env_set() { record "env:$1=$2"; if [[ "$1" == OC_SEED_AUTHORITY_BY_REV ]]; then seed_state="$2"; [[ ! ( "$FAIL_AT" == write-unknown && "$2" == 1 ) ]]; else return 0; fi; }',
+        'ssh() { record "ssh:$*"; return 0; }',
+        'model_authority_fleet_census() { printf "%s\\n" \'[{"id":"cid","name":"oc-v5-u1","status":"running","bundle_rev":"aaaaaaaaaaaa"}]\'; }',
+        'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; if [[ "$4" == 1 && ( "$FAIL_AT" == seed-ready || "$FAIL_AT" == comp-ready ) ]]; then return 1; fi; [[ ! ( "$4" == 0 && "$FAIL_AT" == comp-ready ) ]]; }',
+        'smoke() { record smoke; return 0; }',
+        'model_authority_release_sha() { record release-read; [[ "$FAIL_AT" != evidence-read ]] || return 1; printf %s release-sha; }',
+        'model_authority_runtime_tuple() { record tuple-read; printf "%s\\n" \'{"image":"i","image_id":"id","release":"r","bundle":"b"}\'; }',
+        'remote_model_authority_psql() { record psql; return 1; }',
+        'enable_seed_authority_by_rev',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', body], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+      })
+      return {
+        result,
+        order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean),
+        output: result.stdout + result.stderr,
+      }
+    }
+
+    const commitUnknown = await seedHarness('write-unknown')
+    assert.notEqual(commitUnknown.result.status, 0)
+    assert.match(
+      commitUnknown.order.join('\n'),
+      /env:OC_SEED_AUTHORITY_BY_REV=1[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.doesNotMatch(commitUnknown.order.join('\n'), /psql/)
+    assert.match(commitUnknown.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(commitUnknown.output, /seed authority by rev 已开启并留证/)
+
+    const readinessFailure = await seedHarness('seed-ready')
+    assert.notEqual(readinessFailure.result.status, 0)
+    assert.match(
+      readinessFailure.order.join('\n'),
+      /master-ready:1\/1\/1[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.match(readinessFailure.output, /seed authority 已验证回滚/)
+
+    const evidenceReadFailure = await seedHarness('evidence-read')
+    assert.notEqual(evidenceReadFailure.result.status, 0)
+    assert.match(
+      evidenceReadFailure.order.join('\n'),
+      /master-ready:1\/1\/1[\s\S]*smoke[\s\S]*release-read[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.match(evidenceReadFailure.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(evidenceReadFailure.output, /seed authority by rev 已开启并留证/)
+
+    const compensationFailure = await seedHarness('comp-ready')
+    assert.notEqual(compensationFailure.result.status, 0)
+    assert.match(compensationFailure.order.join('\n'), /master-ready:1\/1\/1[\s\S]*master-ready:1\/1\/0/)
+    assert.doesNotMatch(compensationFailure.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(compensationFailure.output, /seed authority by rev 已开启并留证/)
   })
 
   test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {
