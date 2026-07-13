@@ -650,9 +650,11 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(masterFailure.order.join('\n'), /smoke|observation/)
   })
 
-  test('observation persistence survives real psql command tags and stays fail-closed without a canary', (t) => {
+  test('model-authority evidence persistence survives real psql command tags and stays fail-closed without a canary', (t) => {
     const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
     const schema = `oc_ma_observation_${process.pid}_${Date.now()}`
+    const bundleRev = 'abcdef123456'
+    const bundlePath = `/var/lib/openclaude-v5/platform/bundles/${bundleRev}`
     const psql = (sql: string, searchPath = false) => spawnSync(
       'psql',
       [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
@@ -711,7 +713,7 @@ describe('v5 release safety lanes', () => {
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
       'model_authority_release_sha() { printf %s test-release-sha; }',
-      'model_authority_runtime_tuple() { printf "%s\\n" \'{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"/test/test-bundle"}\'; }',
+      `model_authority_runtime_tuple() { printf "%s\\n" '{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"${bundlePath}"}'; }`,
       'remote_model_authority_psql() {',
       '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc "$1" 2>/dev/null | tr -d \'[:space:]\'',
       '}',
@@ -741,7 +743,7 @@ describe('v5 release safety lanes', () => {
       image: 'test-image',
       image_id: 'sha256:test',
       release: '/test/release',
-      bundle: '/test/test-bundle',
+      bundle: bundlePath,
     })
 
     const addCanaryUsage = psql(`
@@ -754,6 +756,69 @@ describe('v5 release safety lanes', () => {
     const statusJson = JSON.parse(status.stdout) as Record<string, unknown>
     assert.equal(statusJson.signed_requests, 1)
     assert.equal(statusJson.canary_requests, 1)
+
+    const legacyUpdate = psql(`
+      UPDATE model_authority_deploy_state SET value=value
+      WHERE key='observation'
+      RETURNING 'ok'
+    `, true)
+    assert.equal(legacyUpdate.status, 0, legacyUpdate.stderr || legacyUpdate.stdout)
+    assert.equal(legacyUpdate.stdout.replace(/\s/g, ''), 'okUPDATE1')
+
+    const seed = runShell([
+      'OC_HOTCFG_PLATFORM_ROOT=/var/lib/openclaude-v5/platform',
+      'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/test/release',
+      'assert_no_rollout_in_progress() { return 0; }',
+      `remote_env_get() { case "$1" in OC_PLATFORM_BUNDLE) printf "%s\\n" '${bundlePath}' ;; OC_SEED_AUTHORITY_BY_REV) printf 0 ;; *) printf "" ;; esac; }`,
+      'remote_env_set() { return 0; }',
+      'ssh() { return 0; }',
+      `model_authority_fleet_census() { printf "%s\\n" '[{"id":"test-container","name":"oc-v5-test","status":"running","bundle_rev":"${bundleRev}"}]'; }`,
+      'wait_for_model_authority_master_ready() { return 0; }',
+      'smoke() { return 0; }',
+      'enable_seed_authority_by_rev',
+    ])
+    assert.equal(seed.status, 0, seed.stderr || seed.stdout)
+    assert.match(seed.stdout, /seed authority by rev 已开启并留证/)
+    const persistedSeed = psql(
+      "SELECT (value->'seed_census')::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persistedSeed.status, 0, persistedSeed.stderr || persistedSeed.stdout)
+    const seedEvidence = JSON.parse(persistedSeed.stdout.trim()) as Record<string, unknown>
+    assert.equal(seedEvidence.bundle_rev, bundleRev)
+    assert.equal(seedEvidence.container_count, '1')
+    assert.deepEqual(seedEvidence.fleet, [
+      { id: 'test-container', name: 'oc-v5-test', status: 'running', bundle_rev: bundleRev },
+    ])
+
+    const currentTuple = JSON.stringify({
+      image: 'test-image',
+      image_id: 'sha256:test',
+      release: '/test/release',
+      bundle: bundlePath,
+    })
+    const emergencyTuple = JSON.stringify({
+      image: 'test-emergency-image',
+      image_id: 'sha256:emergency',
+      release: '',
+      bundle: bundlePath,
+    })
+    const emergency = runShell([
+      'assert_no_rollout_in_progress() { return 0; }',
+      `hotcfg_rmt() { case "$3" in 1|3) printf "%s\\n" '${currentTuple}' ;; 2) printf "%s\\n" '${emergencyTuple}' ;; *) return 1 ;; esac; }`,
+      `ssh() { case "$*" in *OC_RUNTIME_EMERGENCY_TUPLE*) printf "%s\\n" '${emergencyTuple}' ;; *) return 0 ;; esac; }`,
+      'record_model_authority_emergency_drill',
+    ])
+    assert.equal(emergency.status, 0, emergency.stderr || emergency.stdout)
+    assert.match(emergency.stdout, /激活与原 tuple 恢复已由三条 committed history/)
+    const persistedEmergency = psql(
+      "SELECT (value->'emergency_drill')::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persistedEmergency.status, 0, persistedEmergency.stderr || persistedEmergency.stdout)
+    const emergencyEvidence = JSON.parse(persistedEmergency.stdout.trim()) as Record<string, unknown>
+    assert.equal(emergencyEvidence.activated_and_restored, true)
+    assert.deepEqual(emergencyEvidence.emergency_tuple, JSON.parse(emergencyTuple))
 
     const prepareCutover = psql(`
       INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
@@ -768,12 +833,7 @@ describe('v5 release safety lanes', () => {
       VALUES (1,'oc-catalog-canary-glm52','active');
       INSERT INTO model_aliases(alias,entry_id) VALUES ('oc-catalog-canary',1);
       UPDATE model_authority_deploy_state SET value=value || jsonb_build_object(
-        'started_at',(NOW()-interval '901 seconds')::text,
-        'seed_census',jsonb_build_object(
-          'container_count',1,
-          'fleet',jsonb_build_array(jsonb_build_object('id','test-container','bundle_rev','test-bundle'))
-        ),
-        'emergency_drill',jsonb_build_object('activated_and_restored',true)
+        'started_at',(NOW()-interval '901 seconds')::text
       ) WHERE key='observation';
     `, true)
     assert.equal(prepareCutover.status, 0, prepareCutover.stderr || prepareCutover.stdout)
@@ -781,7 +841,7 @@ describe('v5 release safety lanes', () => {
     const cutover = runShell([
       'remote_env_get() { case "$1" in "$MODEL_AUTHORITY_FLAG_KEY"|OC_SEED_AUTHORITY_BY_REV) printf 1 ;; *) printf "" ;; esac; }',
       'model_authority_preflight() { return 0; }',
-      'model_authority_fleet_census() { printf "%s\\n" \'[{"id":"test-container","bundle_rev":"test-bundle"}]\'; }',
+      `model_authority_fleet_census() { printf "%s\\n" '[{"id":"test-container","bundle_rev":"${bundleRev}"}]'; }`,
       'remote_model_authority_psql_script() {',
       '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -q',
       '}',

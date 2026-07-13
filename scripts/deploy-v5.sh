@@ -1628,7 +1628,8 @@ enable_seed_authority_by_rev() {
     echo "✗ seed census 无法读取 security epoch，seed 已完成活体回滚" >&2; exit 1
   fi
   rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$tuple")"; census64="$(model_authority_b64 "$census")"
-  out="$(remote_model_authority_psql "UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{seed_census}',jsonb_build_object(
+  out="$(remote_model_authority_psql "WITH persisted AS (
+  UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{seed_census}',jsonb_build_object(
     'recorded_at',NOW()::text,'bundle_rev','$rev','container_count','$count',
     'fleet',convert_from(decode('$census64','base64'),'UTF8')::jsonb
   )),updated_at=NOW()
@@ -1636,7 +1637,9 @@ enable_seed_authority_by_rev() {
     AND value->>'release_sha'=convert_from(decode('$rel64','base64'),'UTF8')
     AND value->'runtime_tuple'=convert_from(decode('$tuple64','base64'),'UTF8')::jsonb
     AND value->>'security_epoch'='$epoch'
-  RETURNING 'ok'")" || true
+  RETURNING 1
+  )
+  SELECT 'ok' FROM persisted")" || true
   if [[ "$out" != "ok" ]]; then
     rollback_seed_authority_by_rev "seed census observation binding drift" || exit 1
     echo "✗ observation 绑定漂移，seed 已完成活体回滚；重新开启 observation" >&2; exit 1
@@ -1666,7 +1669,8 @@ record_model_authority_emergency_drill() {
   }
   release="$(model_authority_release_sha)"; epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")"
   rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$current")"; image64="$(model_authority_b64 "$norm_emergency")"
-  out="$(remote_model_authority_psql "UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{emergency_drill}',jsonb_build_object(
+  out="$(remote_model_authority_psql "WITH persisted AS (
+  UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{emergency_drill}',jsonb_build_object(
     'recorded_at',NOW()::text,'activated_and_restored',true,
     'emergency_tuple',convert_from(decode('$image64','base64'),'UTF8')::jsonb
   )),updated_at=NOW()
@@ -1674,7 +1678,9 @@ record_model_authority_emergency_drill() {
     AND value->>'release_sha'=convert_from(decode('$rel64','base64'),'UTF8')
     AND value->'runtime_tuple'=convert_from(decode('$tuple64','base64'),'UTF8')::jsonb
     AND value->>'security_epoch'='$epoch'
-  RETURNING 'ok'")" || true
+  RETURNING 1
+  )
+  SELECT 'ok' FROM persisted")" || true
   [[ "$out" == "ok" ]] || { echo "✗ observation 绑定漂移,拒绝登记 emergency drill" >&2; exit 1; }
   echo "✓ emergency 激活与原 tuple 恢复已由三条 committed history 交叉核验并留证。"
 }
