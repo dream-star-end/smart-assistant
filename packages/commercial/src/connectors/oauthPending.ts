@@ -4,8 +4,10 @@
  * 不变量:
  *   - **start**:`INSERT ... ON CONFLICT (user_id,provider) DO UPDATE` 单语句原子替换
  *     (并发双 start 只剩一行,旧 state 必败 —— state_hash 被新值覆盖)。
- *   - draft = 加密 {clientId, clientSecret, pkceVerifier, displayName?},
+ *   - draft = 加密 {clientId?, clientSecret?, pkceVerifier, displayName?},
  *     **AAD = `oauth:{state_hash_hex}:{user_id}:{provider}:{aad_seed}`**(公式二)。
+ *     client 凭据**可选**:仅 BYOA(用户自带 App)才落它们;声明式 platform 模式的 client 凭据
+ *     在平台表(connector_platform_oauth_apps),没必要每次授权都复制一份加密副本进 draft。
  *   - **callback consume**:单事务两语句 —— `SELECT ... FOR UPDATE` 校验四因子
  *     (state_hash 命中 + cookie_nonce_hash 匹配 + 未消费 + 未过期)读 draft 入 Buffer
  *     → `UPDATE SET consumed_at=now(), draft_enc=NULL, draft_nonce=NULL` → COMMIT。
@@ -37,14 +39,46 @@ export function oauthDraftAad(
 }
 
 export interface OauthDraft {
-  clientId: string
-  clientSecret: string
+  /**
+   * OAuth client 凭据 —— **仅 BYOA 落它们**(v1 feishu 手写路径 / 声明式 clientProvisioning='byoa')。
+   * 声明式 **platform 模式不落**:凭据在平台表(connector_platform_oauth_apps),回调时现取;
+   * 每次授权复制一份加密副本进 pending 只会平白多一处密文暴露面,零收益。
+   *
+   * ⚠️ 两条消费路径各自硬校验自己的必需项(consume 只做"存在即 string"的形状底线):
+   *   - v1 feishu 分支:缺 clientId/clientSecret → INTERNAL(v1 只有 BYOA,缺了必是数据错乱);
+   *   - 声明式分支:byoa 缺 → fail-closed;platform 有也不看(权威是平台表)。
+   */
+  clientId?: string
+  clientSecret?: string
   pkceVerifier: string
   displayName?: string
+  /**
+   * **声明式标记**(oauth2-auth-code 切片 B):存在 → 该 pending 属于声明式连接器,回调走
+   * 引擎路径(loadVerifiedContractWithMeta → exchangeAuthCode → bindWithBag);
+   * 不存在 → v1 手写 provider(feishu)路径。draft 在 AEAD 密文内,新增字段不动表结构。
+   */
+  connectorVersionId?: number
+}
+
+export interface OauthContractPins {
+  connectorVersionId: number
+  specHashHex: string
+  execContractHashHex: string
+  authContractVersion: number
 }
 
 function sha256(s: string): Buffer {
   return createHash('sha256').update(s, 'utf8').digest()
+}
+
+/**
+ * OAuth 回跳地址(authorize 与 token 交换两阶段必须**同一个值**,RFC 6749 §4.1.3)。
+ * v1 feishu 与声明式 oauth2 共用同一条回调路由 → 共用同一权威读取口(禁第二份 env 解析)。
+ */
+export function readConnectorsOauthRedirectUri(env: NodeJS.ProcessEnv = process.env): string {
+  const v = env.OC_CONNECTORS_OAUTH_REDIRECT_URI?.trim()
+  if (!v) throw new ConnectorError('OAUTH_NOT_CONFIGURED', 'OC_CONNECTORS_OAUTH_REDIRECT_URI unset')
+  return v
 }
 
 // ─── state cookie(照 auth/github.ts 范式;per-provider 名) ────────────────
@@ -120,9 +154,12 @@ export interface StartOauthPendingResult {
 
 /**
  * 原子登记 pending(同 user+provider 旧行整体被覆盖,旧 state 必败)。
+ *
+ * provider:v1 = 手写 provider 名('feishu');声明式 = **listing slug**(调用方从
+ * loadVerifiedContractWithMeta 的 DB 事实取,不接受用户输入;0138 已把 CHECK 放开到 slug 形状)。
  */
 export async function startOauthPending(
-  opts: { userId: number; provider: 'feishu'; draft: OauthDraft },
+  opts: { userId: number; provider: string; draft: OauthDraft; pins?: OauthContractPins },
   pool: Pool = getPool(),
 ): Promise<StartOauthPendingResult> {
   const state = randomBytes(32).toString('base64url')
@@ -145,8 +182,10 @@ export async function startOauthPending(
   await pool.query(
     `INSERT INTO connector_oauth_pending
        (state_hash, user_id, provider, cookie_nonce_hash, draft_enc, draft_nonce,
-        aad_seed, created_at, expires_at, consumed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, now(), now() + interval '10 minutes', NULL)
+        aad_seed, created_at, expires_at, consumed_at,
+        connector_version_id, spec_hash, exec_contract_hash, auth_contract_version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, now(), now() + interval '10 minutes', NULL,
+             $8, $9, $10, $11)
      ON CONFLICT (user_id, provider) DO UPDATE SET
        state_hash = EXCLUDED.state_hash,
        cookie_nonce_hash = EXCLUDED.cookie_nonce_hash,
@@ -155,8 +194,24 @@ export async function startOauthPending(
        aad_seed = EXCLUDED.aad_seed,
        created_at = now(),
        expires_at = EXCLUDED.expires_at,
-       consumed_at = NULL`,
-    [stateHash, opts.userId, opts.provider, cookieNonceHash, enc.ciphertext, enc.nonce, aadSeed],
+       consumed_at = NULL,
+       connector_version_id = EXCLUDED.connector_version_id,
+       spec_hash = EXCLUDED.spec_hash,
+       exec_contract_hash = EXCLUDED.exec_contract_hash,
+       auth_contract_version = EXCLUDED.auth_contract_version`,
+    [
+      stateHash,
+      opts.userId,
+      opts.provider,
+      cookieNonceHash,
+      enc.ciphertext,
+      enc.nonce,
+      aadSeed,
+      opts.pins?.connectorVersionId ?? null,
+      opts.pins ? Buffer.from(opts.pins.specHashHex, 'hex') : null,
+      opts.pins ? Buffer.from(opts.pins.execContractHashHex, 'hex') : null,
+      opts.pins?.authContractVersion ?? null,
+    ],
   )
   return { state, stateHashHex, cookieNonce }
 }
@@ -165,19 +220,25 @@ export async function startOauthPending(
 
 export interface ConsumedOauthPending {
   userId: number
-  provider: 'feishu'
+  /** v1 = provider 名;声明式 = listing slug。 */
+  provider: string
   draft: OauthDraft
+  pins: OauthContractPins | null
 }
 
 interface PendingRow {
   user_id: number
-  provider: 'feishu'
+  provider: string
   cookie_nonce_hash: Buffer
   draft_enc: Buffer | null
   draft_nonce: Buffer | null
   aad_seed: string
   expires_at: Date
   consumed_at: Date | null
+  connector_version_id: string | null
+  spec_hash: Buffer | null
+  exec_contract_hash: Buffer | null
+  auth_contract_version: number | null
 }
 
 /**
@@ -197,7 +258,9 @@ export async function consumeOauthPending(
   const held = await tx(async (client) => {
     const r = await client.query<PendingRow>(
       `SELECT user_id::int AS user_id, provider, cookie_nonce_hash, draft_enc, draft_nonce,
-              aad_seed::text AS aad_seed, expires_at, consumed_at
+              aad_seed::text AS aad_seed, expires_at, consumed_at,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version
          FROM connector_oauth_pending
         WHERE state_hash = $1
         FOR UPDATE`,
@@ -230,6 +293,15 @@ export async function consumeOauthPending(
       aadSeed: row.aad_seed,
       draftEnc: Buffer.from(row.draft_enc),
       draftNonce: Buffer.from(row.draft_nonce),
+      pins:
+        row.connector_version_id === null
+          ? null
+          : {
+              connectorVersionId: Number(row.connector_version_id),
+              specHashHex: Buffer.from(row.spec_hash!).toString('hex'),
+              execContractHashHex: Buffer.from(row.exec_contract_hash!).toString('hex'),
+              authContractVersion: Number(row.auth_contract_version),
+            },
     }
   }, pool)
 
@@ -244,14 +316,23 @@ export async function consumeOauthPending(
       oauthDraftAad(stateHashHex, held.userId, held.provider, held.aadSeed),
     )
     const draft = JSON.parse(pt.toString('utf8')) as OauthDraft
-    if (
-      typeof draft.clientId !== 'string' ||
-      typeof draft.clientSecret !== 'string' ||
-      typeof draft.pkceVerifier !== 'string'
-    ) {
+    // pkceVerifier 恒必需(两条路径共用的四因子之一,少了就没法完成交换)。
+    if (typeof draft.pkceVerifier !== 'string')
       throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
+    // client 凭据**可选**(platform 模式压根不落);但只要出现,就必须是 string —— 防止畸形
+    // draft(对象/数组/数字)一路漏到 exchange 层。"该不该有"由各消费分支自己硬校验。
+    if (draft.clientId !== undefined && typeof draft.clientId !== 'string')
+      throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
+    if (draft.clientSecret !== undefined && typeof draft.clientSecret !== 'string')
+      throw new ConnectorError('INTERNAL', 'oauth draft shape invalid')
+    // 声明式标记若存在,必须是正整数 versionId(回调据它选路径 + 载入契约,形状必须硬)。
+    if (
+      draft.connectorVersionId !== undefined &&
+      (!Number.isInteger(draft.connectorVersionId) || draft.connectorVersionId <= 0)
+    ) {
+      throw new ConnectorError('INTERNAL', 'oauth draft connectorVersionId invalid')
     }
-    return { userId: held.userId, provider: held.provider, draft }
+    return { userId: held.userId, provider: held.provider, draft, pins: held.pins }
   } finally {
     zeroBuffer(key)
     if (pt) zeroBuffer(pt)

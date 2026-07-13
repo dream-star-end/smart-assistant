@@ -153,6 +153,75 @@ describe('oc-connect list', () => {
   })
 })
 
+// ---------- catalog(可绑连接器发现/搜索) ----------
+
+const CAT_NOTION = {
+  slug: 'notion',
+  label: 'Notion',
+  description: 'Notion 集成:检索页面与数据库',
+  authMode: 'static-token',
+  requiredBindSources: ['access_token'],
+  actions: [
+    { id: 'whoami', readOnly: true },
+    { id: 'query_database', readOnly: true },
+  ],
+}
+const CAT_FEISHU = {
+  slug: 'feishu',
+  label: '飞书',
+  description: '飞书自建应用',
+  authMode: 'token-exchange',
+  requiredBindSources: ['client_id', 'client_secret'],
+  actions: [{ id: 'bot_info', readOnly: true }],
+}
+
+describe('oc-connect catalog', () => {
+  test('列出可绑连接器 + 用户需提供的凭据 + 引导绑定说明', async () => {
+    const { deps, calls } = mkDeps({
+      responses: { catalog: { connectors: [CAT_NOTION, CAT_FEISHU] } },
+    })
+    const r = await runOcConnectCli(['catalog'], deps)
+    assert.equal(r.exitCode, 0)
+    assert.deepEqual(calls, [{ op: 'catalog', body: {} }])
+    // 引导语明确:凭据永不进容器、agent 不能代绑、引导用户去设置。
+    assert.match(r.stdout, /设置 → 应用连接器/)
+    assert.match(r.stdout, /凭据永不进入容器/)
+    assert.match(r.stdout, /notion · Notion/)
+    // static-token → 提示填"访问令牌";token-exchange → 提示填应用 ID/密钥。
+    assert.match(r.stdout, /用户需提供:访问令牌 \/ API Token/)
+    assert.match(r.stdout, /用户需提供:应用 ID \(Client ID\)、应用密钥 \(Client Secret\)/)
+  })
+
+  test('带关键词 → query 透传给 transport,过滤后展示', async () => {
+    const { deps, calls } = mkDeps({
+      responses: { catalog: { connectors: [CAT_FEISHU] } },
+    })
+    const r = await runOcConnectCli(['catalog', '飞书'], deps)
+    assert.equal(r.exitCode, 0)
+    assert.deepEqual(calls, [{ op: 'catalog', body: { query: '飞书' } }])
+    assert.match(r.stdout, /匹配「飞书」的应用连接器/)
+    assert.match(r.stdout, /feishu · 飞书/)
+  })
+
+  test('空目录 / 无匹配 → 分别给对应文案', async () => {
+    const empty = mkDeps({ responses: { catalog: { connectors: [] } } })
+    const r1 = await runOcConnectCli(['catalog'], empty.deps)
+    assert.equal(r1.exitCode, 0)
+    assert.equal(r1.stdout, '暂无可用的应用连接器。\n')
+
+    const noHit = mkDeps({ responses: { catalog: { connectors: [] } } })
+    const r2 = await runOcConnectCli(['catalog', 'zzz'], noHit.deps)
+    assert.equal(r2.exitCode, 0)
+    assert.match(r2.stdout, /未找到匹配「zzz」的应用连接器/)
+  })
+
+  test('catalog 至多一个 query 位置参数', async () => {
+    const { deps } = mkDeps({})
+    const r = await runOcConnectCli(['catalog', 'a', 'b'], deps)
+    assert.equal(r.exitCode, 2)
+  })
+})
+
 // ---------- --account 解析 ----------
 
 describe('oc-connect call — account resolution', () => {

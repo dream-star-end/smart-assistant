@@ -3,7 +3,7 @@
  *
  * 照 ocResearchClient 范式:读容器身份 bearer(OPENCLAUDE_V3_CONTAINER_TOKEN[_FILE])
  * + master base(OPENCLAUDE_V3_MASTER_BASE_URL),POST master 的
- * `/v3/connectors/{list|call}`。**第三方凭据 / 平台 token 全留 master,容器只带自己的
+ * `/v3/connectors/{catalog|list|call}`。**第三方凭据 / 平台 token 全留 master,容器只带自己的
  * 身份 bearer——客户端本来就拿不到任何第三方凭据。** 故本层永不打印上游 body/headers/URL
  * (防泄漏),只把传输/HTTP 故障映射成稳定错误码(ConnectorError.code)。
  *
@@ -20,7 +20,7 @@ export const CONNECTOR_BAD_RESPONSE = 'CONNECTOR_BAD_RESPONSE'
 export const CONNECTOR_NO_MASTER_BASE = 'CONNECTOR_NO_MASTER_BASE'
 export const CONNECTOR_NO_CONTAINER_TOKEN = 'CONNECTOR_NO_CONTAINER_TOKEN'
 
-export type ConnectorOp = 'list' | 'call'
+export type ConnectorOp = 'list' | 'call' | 'catalog'
 
 /** 传输层错误:message 只承载稳定码 + 可安全展示的非敏感细节(如 HTTP 状态数)。 */
 export class ConnectorError extends Error {

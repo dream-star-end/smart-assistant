@@ -322,6 +322,7 @@ import {
   makeConnectorsRpcHandler,
   type ConnectorsRpcHandler,
 } from "./connectors/rpc.js";
+import { seedDefaultConnectors } from "./connectors/declarativeSeed.js";
 import {
   startConnectorSweeper,
   type ConnectorSweeperHandle,
@@ -1665,6 +1666,17 @@ export async function registerCommercial(
           );
         } catch (err) {
           console.error("[commercial] seedPlatformGeneralAgents failed:", err);
+        }
+      })();
+      // 声明式**默认连接器**(notion/feishu/github)的幂等 seed —— 走完整 securityApprove 审计
+      // 路径落 security_approved,catalog 才有可绑连接器、用户/agent 才发现得到。无此调用则生产
+      // 目录为空(整套端到端不成立)。fire-and-forget,失败只 log 不阻断启动;幂等,重启可反复跑。
+      void (async () => {
+        try {
+          const seeded = await seedDefaultConnectors(getPool());
+          console.log("[commercial] default connectors seed:", JSON.stringify(seeded));
+        } catch (err) {
+          console.error("[commercial] seedDefaultConnectors failed:", err);
         }
       })();
       // egress split:cost 回执接收端(egress finalize 后的 SQLite 持久化 + WS 广播
