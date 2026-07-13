@@ -472,8 +472,13 @@ export function makeAnthropicProxyHandler(
       // strategy.authorize 失败模式:
       //   AuthzLoadError(loadUserModelAuthz throw) → 500 INTERNAL
       //   AuthzDeniedError(canUseModel false)     → 403 NOT_AUTHORIZED
+      // authority gate 已用同一份 fenced snapshot 完成 role/grants/visibility 授权；不得再回读
+      // 异步 PricingCache 重复授权，否则 catalog 新激活/新公开的模型会被旧 cache 误拒。
+      // legacy / 影子期仍逐字节走原 strategy.authorize 行为。
       try {
-        await deps.identity.authorize(identity, pricing, body.model, gate?.securityEpoch);
+        if (gate === null) {
+          await deps.identity.authorize(identity, pricing, body.model);
+        }
       } catch (err) {
         if (err instanceof AuthzLoadError) {
           userLog.error("proxy_authz_load_failed", { err: errSummary(err.cause) });

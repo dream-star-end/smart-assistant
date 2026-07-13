@@ -296,9 +296,7 @@ describe('v5 release safety lanes', () => {
     assert.match(enableSeed, /cd '\$ACTIVE_SRC'/)
     assert.doesNotMatch(enableSeed, /cd '\$REMOTE_SRC'/)
     assert.match(enableSeed, /smoke "\$ACTIVE_PORT"/)
-    assert.match(disable, /assert_no_rollout_in_progress/)
-    assert.match(disable, /systemctl restart '\$ACTIVE_UNIT'/)
-    assert.match(disable, /smoke "\$ACTIVE_PORT"/)
+    assert.match(disable, /rollback_model_authority_before_cutover/)
 
     const activeB = await maFixture({
       MA_DS_ROW: '2|stable|B||/rel/b||B|B|0|salt|0||2|/rel/a',
@@ -352,6 +350,119 @@ describe('v5 release safety lanes', () => {
     assert.ok(egressRestart >= 0, 'enable must restart egress')
     assert.ok(enforceProbe > egressRestart, 'enable must probe egress enforced=true after restart')
     assert.ok(masterRestart > enforceProbe, 'master may sign only after egress is enforcing')
+  })
+
+  async function modelAuthorityRollbackHarness(fail = '') {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-rollback-')); dirs.push(dir)
+    const log = path.join(dir, 'order.log')
+    const body = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+      'authority_flag=1',
+      'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+      'assert_no_rollout_in_progress() { record stable; return 0; }',
+      'remote_env_get() { [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && printf "%s\\n" "$authority_flag"; }',
+      'remote_env_set() { record "env:$1=$2"; [[ "$FAIL_AT" != "env:$1=$2" ]] || return 1; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
+      'ssh() {',
+      '  record "ssh:$*"',
+      '  if [[ "$*" == *"restart \'$ACTIVE_UNIT\'"* && "$FAIL_AT" == master_first && "$(grep -c "restart \'$ACTIVE_UNIT\'" "$ORDER_LOG")" == 1 ]]; then return 1; fi',
+      '  return 0',
+      '}',
+      'assert_model_authority_live_env() { record "live:$2/$3"; [[ "$FAIL_AT" != "live:$2/$3" ]]; }',
+      'model_authority_basic_master_health() { record basic_health; [[ "$FAIL_AT" != basic_health ]]; }',
+      'run_model_authority_container_rollback() { record census; [[ "$FAIL_AT" != census ]]; }',
+      'model_authority_egress_enforced_is() { record "egress:$1"; [[ "$FAIL_AT" != "egress:$1" ]]; }',
+      'smoke() { record smoke; [[ "$FAIL_AT" != smoke ]]; }',
+      'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+      'rollback_model_authority_before_cutover test',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', body], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: fail },
+    })
+    return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
+  }
+
+  test('authority rollback behavior is provision-stop → census → master-first → egress, with full smoke', async () => {
+    const { result, order } = await modelAuthorityRollbackHarness()
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const expected = [
+      'stable',
+      'env:OC_MODEL_AUTHORITY_PROVISION_REQUIRED=0',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
+      'live:1/0',
+      'basic_health',
+      'census',
+      'env:OC_MODEL_AUTHORITY=0',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
+      'live:0/0',
+      'basic_health',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5-egress.service'",
+      'egress:false',
+      'smoke',
+    ]
+    assert.deepEqual(order, expected)
+  })
+
+  test('authority rollback short-circuits safely on env/master/census/smoke failures', async () => {
+    const envFail = await modelAuthorityRollbackHarness('env:OC_MODEL_AUTHORITY=0')
+    assert.notEqual(envFail.result.status, 0)
+    const flagWrite = envFail.order.indexOf('env:OC_MODEL_AUTHORITY=0')
+    assert.ok(flagWrite >= 0)
+    assert.equal(envFail.order.slice(flagWrite + 1).some((v) => v.includes('restart')), false)
+
+    const masterFail = await modelAuthorityRollbackHarness('master_first')
+    assert.notEqual(masterFail.result.status, 0)
+    assert.doesNotMatch(masterFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress:false/)
+
+    const censusFail = await modelAuthorityRollbackHarness('census')
+    assert.notEqual(censusFail.result.status, 0)
+    assert.doesNotMatch(censusFail.order.join('\n'), /env:OC_MODEL_AUTHORITY=0|egress:false/)
+
+    const smokeFail = await modelAuthorityRollbackHarness('smoke')
+    assert.notEqual(smokeFail.result.status, 0)
+    assert.match(smokeFail.order.join('\n'), /egress:false[\s\S]*smoke[\s\S]*diagnostic:/)
+  })
+
+  test('authority rollback is resumable after flag0 when egress recovery previously failed', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-resume-')); dirs.push(dir)
+    const log = path.join(dir, 'order.log')
+    const body = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+      'authority_flag=1; egress_fail=1',
+      'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+      'assert_no_rollout_in_progress() { return 0; }',
+      'remote_env_get() { printf "%s\\n" "$authority_flag"; }',
+      'remote_env_set() { record "env:$1=$2"; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
+      'ssh() { record "ssh:$*"; if [[ "$*" == *"restart \'$V5_EGRESS_UNIT\'"* && "$egress_fail" == 1 ]]; then return 1; fi; return 0; }',
+      'assert_model_authority_live_env() { record "live:$2/$3"; [[ "$authority_flag" == "$2" ]]; }',
+      'model_authority_basic_master_health() { return 0; }',
+      'run_model_authority_container_rollback() { record census; return 0; }',
+      'model_authority_egress_enforced_is() { record "egress:$1"; return 0; }',
+      'smoke() { record smoke; return 0; }',
+      'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+      'rollback_model_authority_before_cutover first || true',
+      'record retry',
+      'egress_fail=0',
+      'rollback_model_authority_before_cutover retry',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', body], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log },
+    })
+    const order = (await readFile(log, 'utf8')).trim().split('\n')
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const retryAt = order.indexOf('retry')
+    const retried = order.slice(retryAt + 1).join('\n')
+    assert.match(retried, /live:0\/0[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress:false[\s\S]*smoke/)
+    assert.doesNotMatch(retried, /live:1\/0/)
   })
 
   test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {
