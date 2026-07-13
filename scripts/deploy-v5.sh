@@ -1533,17 +1533,19 @@ start_model_authority_observation() {
            '$epoch'::text AS security_epoch,
            (SELECT user_id::text FROM model_visibility_grants WHERE model_id='$MODEL_AUTHORITY_CANARY_MODEL' ORDER BY user_id LIMIT 1) AS canary_uid,
            (SELECT count(*)::text FROM usage_records WHERE authority_kind='bridge_signed') AS request_baseline
+  ), persisted AS (
+    INSERT INTO model_authority_deploy_state(key,value,description)
+    SELECT '$MODEL_AUTHORITY_OBSERVATION_KEY', jsonb_build_object(
+      'release_sha',release_sha,'runtime_tuple',runtime_tuple,'security_epoch',security_epoch,
+      'canary_model','$MODEL_AUTHORITY_CANARY_MODEL','canary_alias','$MODEL_AUTHORITY_CANARY_ALIAS',
+      'canary_uid',canary_uid,'started_at',NOW()::text,'request_baseline',request_baseline,
+      'seed_census',NULL,'emergency_drill',NULL
+    ), 'model authority reversible observation evidence; cutover locks this row + security epoch'
+    FROM f WHERE canary_uid IS NOT NULL
+    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,description=EXCLUDED.description,updated_at=NOW()
+    RETURNING 1
   )
-  INSERT INTO model_authority_deploy_state(key,value,description)
-  SELECT '$MODEL_AUTHORITY_OBSERVATION_KEY', jsonb_build_object(
-    'release_sha',release_sha,'runtime_tuple',runtime_tuple,'security_epoch',security_epoch,
-    'canary_model','$MODEL_AUTHORITY_CANARY_MODEL','canary_alias','$MODEL_AUTHORITY_CANARY_ALIAS',
-    'canary_uid',canary_uid,'started_at',NOW()::text,'request_baseline',request_baseline,
-    'seed_census',NULL,'emergency_drill',NULL
-  ), 'model authority reversible observation evidence; cutover locks this row + security epoch'
-  FROM f WHERE canary_uid IS NOT NULL
-  ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,description=EXCLUDED.description,updated_at=NOW()
-  RETURNING 'ok'")" || return 1
+  SELECT 'ok' FROM persisted")" || return 1
   [[ "$out" == "ok" ]] || { echo "✗ observation 未写入(canary grant 缺失?)" >&2; return 1; }
   echo "  ✓ observation 已开始(release=$release epoch=$epoch;最短 ${MODEL_AUTHORITY_MIN_OBSERVE_SECONDS}s / ${MODEL_AUTHORITY_MIN_REQUESTS} requests)"
 }

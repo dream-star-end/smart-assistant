@@ -650,6 +650,101 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(masterFailure.order.join('\n'), /smoke|observation/)
   })
 
+  test('observation persistence survives real psql command tags and stays fail-closed without a canary', (t) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+    const schema = `oc_ma_observation_${process.pid}_${Date.now()}`
+    const psql = (sql: string, searchPath = false) => spawnSync(
+      'psql',
+      [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...(searchPath ? { PGOPTIONS: `-c search_path=${schema}` } : {}),
+        },
+      },
+    )
+
+    const setup = psql(`
+      CREATE SCHEMA ${schema};
+      CREATE TABLE ${schema}.model_security_epoch (id BOOLEAN PRIMARY KEY, epoch BIGINT NOT NULL);
+      CREATE TABLE ${schema}.model_visibility_grants (user_id BIGINT NOT NULL, model_id TEXT NOT NULL);
+      CREATE TABLE ${schema}.usage_records (authority_kind TEXT);
+      CREATE TABLE ${schema}.model_authority_deploy_state (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        description TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      INSERT INTO ${schema}.model_security_epoch(id,epoch) VALUES (TRUE,3);
+      INSERT INTO ${schema}.model_visibility_grants(user_id,model_id)
+      VALUES (42,'oc-catalog-canary-glm52');
+      INSERT INTO ${schema}.usage_records(authority_kind) VALUES ('bridge_signed'),('legacy');
+    `)
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout)
+
+    t.after(() => {
+      const cleanup = psql(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
+      assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout)
+    })
+
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'model_authority_release_sha() { printf %s test-release-sha; }',
+      'model_authority_runtime_tuple() { printf "%s\\n" \'{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"/test/bundle"}\'; }',
+      'remote_model_authority_psql() {',
+      '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc "$1" 2>/dev/null | tr -d \'[:space:]\'',
+      '}',
+      'start_model_authority_observation',
+    ].join('\n')
+    const runObservation = () => spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TEST_DATABASE_URL: databaseUrl, TEST_SCHEMA: schema },
+    })
+
+    const success = runObservation()
+    assert.equal(success.status, 0, success.stderr || success.stdout)
+    assert.match(success.stdout, /observation 已开始/)
+
+    const persisted = psql(
+      "SELECT value::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persisted.status, 0, persisted.stderr || persisted.stdout)
+    const observation = JSON.parse(persisted.stdout.trim()) as Record<string, unknown>
+    assert.equal(observation.release_sha, 'test-release-sha')
+    assert.equal(observation.security_epoch, '3')
+    assert.equal(observation.canary_uid, '42')
+    assert.equal(observation.request_baseline, '1')
+    assert.deepEqual(observation.runtime_tuple, {
+      image: 'test-image',
+      image_id: 'sha256:test',
+      release: '/test/release',
+      bundle: '/test/bundle',
+    })
+
+    const legacy = psql(`
+      INSERT INTO model_authority_deploy_state(key,value)
+      VALUES ('cutover','{}')
+      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+      RETURNING 'ok'
+    `, true)
+    assert.equal(legacy.status, 0, legacy.stderr || legacy.stdout)
+    assert.equal(legacy.stdout.replace(/\s/g, ''), 'okINSERT01')
+
+    const removeGrant = psql('DELETE FROM model_visibility_grants', true)
+    assert.equal(removeGrant.status, 0, removeGrant.stderr || removeGrant.stdout)
+    const missingCanary = runObservation()
+    assert.notEqual(missingCanary.status, 0)
+    assert.match(missingCanary.stderr, /observation 未写入/)
+    assert.doesNotMatch(missingCanary.stdout, /observation 已开始/)
+  })
+
   async function modelAuthorityRollbackHarness(fail = '') {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-rollback-')); dirs.push(dir)
     const log = path.join(dir, 'order.log')
