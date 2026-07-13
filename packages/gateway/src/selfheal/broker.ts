@@ -607,7 +607,7 @@ export class SelfhealBroker {
     try {
       switch (req.actionKind) {
         case CUTOVER_KIND:
-          response = await this.handleCutover(req)
+          response = await this.handleCutover(req, authz.rec)
           break
         case CONTEXT_KIND:
           response = await this.handleContext(req, authz.rec)
@@ -723,7 +723,10 @@ export class SelfhealBroker {
     return result
   }
 
-  private async handleCutover(req: BrokerRequest): Promise<BrokerResponse> {
+  private async handleCutover(
+    req: BrokerRequest,
+    authority: RepairAuthorityRecord,
+  ): Promise<BrokerResponse> {
     const p = (req.params ?? {}) as Record<string, unknown>
     const sha = typeof p.sha === 'string' ? p.sha : ''
     const verificationRef = typeof p.verificationRef === 'string' ? p.verificationRef : ''
@@ -813,15 +816,77 @@ export class SelfhealBroker {
     const result = await driver(sha, { log: this.log, repairId: req.repairId })
     this.audit(req, result.status, { sha, ...result.detail })
     if (result.status === 'deployed') {
+      const trustedAttestation = await this.buildTrustedAttestation(
+        req.repairId,
+        authority,
+        'deploy_v5',
+        result.detail?.healthCheck,
+      )
       // Auto-deploy path closes the loop root-side: master → 'verifying',
       // probe fence adjudicates real recovery. done 标记与 finalize 原子提交
       // (审计R2 BLOCKER,经 masterCallback → handleRequest 合并事务)。
       return {
         ...result,
-        masterCallback: { phase: 'done', message: 'auto cutover deployed', detail: { phase: 'deployed', sha } },
+        masterCallback: {
+          phase: 'done',
+          message: 'auto cutover deployed',
+          detail: {
+            phase: 'deployed',
+            sha,
+            ...(trustedAttestation ? { trusted_attestation: trustedAttestation } : {}),
+          },
+        },
       }
     }
     return result
+  }
+
+  /**
+   * Root-authored attestation for the narrow fully-automatic deploy path.
+   * Model-authored `report done` and human release never call this method.
+   */
+  private async buildTrustedAttestation(
+    repairId: string,
+    authority: RepairAuthorityRecord,
+    action: string,
+    healthCheck: unknown,
+  ): Promise<Record<string, unknown> | null> {
+    if (!healthCheck || typeof healthCheck !== 'object' || Array.isArray(healthCheck)) return null
+    const h = healthCheck as Record<string, unknown>
+    if (
+      h.kind !== 'deploy-v5-smoke' || h.ok !== true || h.target !== 'service:v5' ||
+      typeof h.checkedAt !== 'string' || !Number.isFinite(Date.parse(h.checkedAt))
+    ) return null
+    const context = await this.handleContext(
+      { repairId, actionKind: CONTEXT_KIND, params: {} },
+      authority,
+    )
+    const raw = context.detail?.context
+    if (!context.ok || !raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const c = raw as Record<string, unknown>
+    const incidentId = typeof c.incidentId === 'string' ? c.incidentId : ''
+    const conditionKey = typeof c.conditionKey === 'string' ? c.conditionKey : ''
+    const target =
+      conditionKey === 'ops.monitor:svc_v5' || conditionKey === 'ops.monitor:http_v5'
+        ? 'service:v5'
+        : ''
+    if (!incidentId || !conditionKey || !target) return null
+    return {
+      version: 1,
+      repairId,
+      incidentId,
+      conditionKey,
+      target,
+      action,
+      executionMode: 'fully_automatic',
+      executed: true,
+      remoteResult: {
+        ok: true,
+        target,
+        healthOk: true,
+        checkedAt: h.checkedAt,
+      },
+    }
   }
 
   // ── block C action handlers (context / verify / report) ─────────────────────

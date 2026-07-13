@@ -52,6 +52,8 @@ export type SessionStreamEvent =
         cacheCreationTokens?: number
         totalCost?: number
         turn?: number
+        /** True when the runner's authoritative result row reports failure. */
+        isError?: boolean
         /** Anthropic API stop_reason, extracted from claude result row.
          *  Values: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use'
          *  | 'pause_turn' | 'refusal'. Used by sessionManager for phantom
@@ -722,6 +724,7 @@ export class ClaudeMessageParser {
         cacheCreationTokens: usage.cache_creation_input_tokens,
         totalCost: this._sessionTotals.totalCostUSD,
         turn: this._sessionTotals.turns,
+        isError: this.turnResult.isError,
         ...(stopReason !== null ? { stopReason } : {}),
       },
     })

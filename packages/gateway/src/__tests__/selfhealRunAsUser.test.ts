@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, statSync, type Stats } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -143,7 +143,7 @@ describe('resolveRunAsUserIds (config.ts)', () => {
 
 describe('CodexAppServerRunner spawn privilege drop', () => {
   let cwd: string
-  const captured: { cmd: string; args: string[]; opts: any }[] = []
+  const captured: { cmd: string; args: string[]; opts: any; promptStat?: Stats }[] = []
   const saved = {
     uid: process.env.OC_SELFHEAL_OCHEAL_UID,
     gid: process.env.OC_SELFHEAL_OCHEAL_GID,
@@ -154,7 +154,9 @@ describe('CodexAppServerRunner spawn privilege drop', () => {
     cwd = mkdtempSync(join(tmpdir(), 'oc-runas-'))
     captured.length = 0
     __setCodexAppServerSpawnForTests(((cmd: string, args: string[], opts: any) => {
-      captured.push({ cmd, args, opts })
+      const override = args.find((x) => x.startsWith('model_instructions_file='))
+      const promptPath = override ? JSON.parse(override.slice(override.indexOf('=') + 1)) : null
+      captured.push({ cmd, args, opts, ...(promptPath ? { promptStat: statSync(promptPath) } : {}) })
       return makeFakeProc()
     }) as any)
   })
@@ -212,6 +214,8 @@ describe('CodexAppServerRunner spawn privilege drop', () => {
     assert.equal(opts.gid, undefined)
     assert.equal(opts.env.HOME, '/home/ocheal', 'dropped proc must not inherit root HOME')
     assert.equal(opts.env.USER, 'ocheal')
+    assert.equal(captured[0]!.promptStat?.gid, 998, 'extra prompt must be readable by ocheal group')
+    assert.equal((captured[0]!.promptStat?.mode ?? 0) & 0o777, 0o640, 'extra prompt must not be world-readable')
     // Self-heal secrets must NOT leak into the codex subprocess env.
     const leaked = Object.keys(opts.env).filter((k) => k.startsWith('OC_SELFHEAL_'))
     assert.deepEqual(leaked, [], `OC_SELFHEAL_* must be scrubbed; leaked: ${leaked.join(',')}`)

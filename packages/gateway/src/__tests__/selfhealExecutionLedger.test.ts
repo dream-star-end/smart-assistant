@@ -106,4 +106,10 @@ describe('createRepairTurnSink', () => {
     assert.equal(sink.getOutput(), 'hello world')
     assert.equal(sink.getError(), 'boom-1')
   })
+
+  it('treats an authoritative final isError result as a failed repair turn', () => {
+    const sink = createRepairTurnSink()
+    sink.onEvent({ kind: 'final', meta: { isError: true } } as SessionStreamEvent)
+    assert.equal(sink.getError(), 'repair turn returned is_error=true')
+  })
 })
