@@ -109,7 +109,7 @@ export function isModelAuthorityRequired(env: NodeJS.ProcessEnv = process.env): 
 export interface TurnExecutionDescriptor {
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
-  readonly contextWindow: number
+  readonly contextWindow: number | null
   readonly supportsVision: boolean
   readonly supportedEfforts: readonly string[]
   readonly codexDefaultEffort?: string
@@ -154,6 +154,8 @@ export type AuthorityRejectCode =
   | 'identity_mismatch'
   /** descriptor.canonicalModel != frame.model。 */
   | 'model_mismatch'
+  /** codex 的 server-owned requestId 未被签名 descriptor 同值绑定。 */
+  | 'billing_request_mismatch'
   /** capabilitySchemaVersion > 本进程上限。 */
   | 'unknown_capability_version'
   /** 本进程没有 keyring / 容器身份 env —— 无法验签,fail-closed。 */
@@ -460,6 +462,19 @@ export class ModelAuthorityConsumer {
         `frame.model=${String(frameModel)} != authority.canonicalModel=${payload.canonicalModel}`,
       )
     }
+    if (payload.engine === 'codex') {
+      const frameRequestId = typeof frame.requestId === 'string' ? frame.requestId : undefined
+      if (
+        typeof payload.billingRequestId !== 'string' ||
+        !/^[0-9a-f]{32}$/.test(payload.billingRequestId) ||
+        frameRequestId !== payload.billingRequestId
+      ) {
+        throw new AuthorityRejected(
+          'billing_request_mismatch',
+          'codex authority billingRequestId does not match frame.requestId',
+        )
+      }
+    }
     const descriptorRaw: ModelExecutionDescriptor = payload.executionDescriptor
     if (descriptorRaw.capabilitySchemaVersion > GATEWAY_CAPABILITY_SCHEMA_VERSION) {
       throw new AuthorityRejected(
@@ -467,6 +482,20 @@ export class ModelAuthorityConsumer {
         `capability_schema_version=${descriptorRaw.capabilitySchemaVersion} > supported ` +
           `${GATEWAY_CAPABILITY_SCHEMA_VERSION} — fail-closed`,
       )
+    }
+    if (payload.engine === 'ccb') {
+      const ccb = descriptorRaw.capabilityProfile.ccb as Record<string, unknown> | undefined
+      if (
+        !ccb ||
+        typeof ccb !== 'object' ||
+        typeof ccb.capabilityZero !== 'boolean' ||
+        typeof ccb.supportsThinking !== 'boolean'
+      ) {
+        throw new AuthorityRejected(
+          'bad_shape',
+          'CCB execution descriptor missing capabilityZero/supportsThinking',
+        )
+      }
     }
 
     // 单次消费(cache 满 → AuthorityRejected('replay_cache_full') 已在 cache 内抛)。

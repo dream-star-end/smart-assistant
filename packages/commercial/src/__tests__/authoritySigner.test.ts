@@ -67,6 +67,14 @@ function keysPath(name: string): string {
   return join(tmpRoot, `${name}.json`)
 }
 
+function publicKeysPath(privatePath: string): string {
+  return `${privatePath}.public`
+}
+
+function fullCoverage(keyId: string) {
+  return { keyId, total: 2, covering: 2, missing: [], fullyCovered: true }
+}
+
 describe('AuthoritySigner 铸票 + 验签(签发/验证两侧拆开)', () => {
   test('signBundle → 容器只用公钥 ring 就能验通 authority + lease,并对账绑定字段', () => {
     const signer = AuthoritySigner.createEphemeral()
@@ -193,7 +201,8 @@ describe('AuthoritySigner 铸票 + 验签(签发/验证两侧拆开)', () => {
 
 describe('keyring 轮换五步(R3-M7)', () => {
   test('①新公钥入 ring(不切签发)→ ③切签发 → 新旧签名并存都验通 → ⑤删旧钥后旧签名拒', () => {
-    const signer = AuthoritySigner.loadOrCreate(keysPath('rotate'), () => {})
+    let clock = NOW
+    const signer = AuthoritySigner.createEphemeral(() => clock)
     const oldKeyId = signer.activeKeyId
 
     // 旧钥签的票(轮换前发出的,在跑 turn 还握着它)
@@ -201,7 +210,7 @@ describe('keyring 轮换五步(R3-M7)', () => {
     assert.equal(oldMinted.payload.keyId, oldKeyId)
 
     // 步①:加新钥,**不**切签发 —— 公钥先下发到全部容器
-    const newKeyId = signer.addKey({ activate: false })
+    const newKeyId = signer.addKey()
     assert.notEqual(newKeyId, oldKeyId)
     assert.equal(signer.activeKeyId, oldKeyId, '步①不得改变签发钥')
 
@@ -211,7 +220,7 @@ describe('keyring 轮换五步(R3-M7)', () => {
     assert.ok(verifyAuthority(oldMinted.bundle.authority, ringBoth, NOW))
 
     // 步③:切签发私钥
-    signer.setActiveKey(newKeyId)
+    signer.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), () => {})
     const newMinted = signer.signBundle(mintInput(), { now: NOW })
     assert.equal(newMinted.payload.keyId, newKeyId)
 
@@ -220,7 +229,17 @@ describe('keyring 轮换五步(R3-M7)', () => {
     assert.ok(verifyAuthority(newMinted.bundle.authority, ringBoth, NOW))
 
     // 步④→⑤:旧签名 TTL 耗尽后移除旧公钥 → 旧签名此后 UnknownKey
-    signer.removeKey(oldKeyId)
+    const removals: unknown[] = []
+    clock = NOW + TURN_LEASE_TTL_MS - 1
+    assert.throws(
+      () => signer.removeKey(oldKeyId, { audit: () => {} }),
+      /turn lease TTL has not elapsed/,
+    )
+    clock = NOW + TURN_LEASE_TTL_MS
+    signer.removeKey(oldKeyId, {
+      audit: (entry) => removals.push(entry),
+    })
+    assert.equal(removals.length, 1)
     const ringNewOnly = parseAuthorityKeyring(signer.publicKeyringEnv())
     assert.equal(ringNewOnly.size, 1)
     assert.throws(
@@ -230,11 +249,77 @@ describe('keyring 轮换五步(R3-M7)', () => {
     assert.ok(verifyAuthority(newMinted.bundle.authority, ringNewOnly, NOW))
   })
 
+  test('轮换审计 fail-closed：audit 抛错时 activation/removal 均不落盘', () => {
+    let clock = NOW
+    const signer = AuthoritySigner.createEphemeral(() => clock)
+    const oldKeyId = signer.activeKeyId
+    const newKeyId = signer.addKey()
+    assert.throws(
+      () => signer.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), () => {
+        throw new Error('audit unavailable')
+      }),
+      /audit unavailable/,
+    )
+    assert.equal(signer.activeKeyId, oldKeyId, '审计失败不得切签发钥')
+
+    signer.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), () => {})
+    clock += TURN_LEASE_TTL_MS
+    assert.throws(
+      () => signer.removeKey(oldKeyId, { audit: () => {
+        throw new Error('audit unavailable')
+      } }),
+      /audit unavailable/,
+    )
+    assert.ok(signer.keyIds.includes(oldKeyId), '审计失败不得删除仍需验旧 lease 的公钥')
+  })
+
   test('护栏:移除 active 钥 / 切到未知 keyId → 抛(顺序颠倒 = 全站验签失败)', () => {
     const signer = AuthoritySigner.loadOrCreate(keysPath('guard'), () => {})
-    assert.throws(() => signer.removeKey(signer.activeKeyId), /refusing to remove active/)
-    assert.throws(() => signer.setActiveKey('mak1_nope'), /unknown keyId/)
-    assert.throws(() => signer.removeKey('mak1_nope'), /unknown keyId/)
+    assert.throws(
+      () => signer.removeKey(signer.activeKeyId, { audit: () => {} }),
+      /refusing to remove active/,
+    )
+    assert.throws(
+      () => signer.activateKeyAfterCensus('mak1_nope', fullCoverage('mak1_nope'), () => {}),
+      /unknown keyId/,
+    )
+    assert.throws(
+      () => signer.removeKey('mak1_nope', { audit: () => {} }),
+      /unknown keyId/,
+    )
+  })
+
+  test('切签发钥必须有非空且全覆盖的 census,成功时写 rotation audit', () => {
+    const signer = AuthoritySigner.loadOrCreate(keysPath('rotation-gate'), () => {})
+    const newKeyId = signer.addKey()
+    assert.throws(
+      () => signer.activateKeyAfterCensus(
+        newKeyId,
+        { keyId: newKeyId, total: 0, covering: 0, missing: [], fullyCovered: true },
+        () => {},
+      ),
+      /non-empty census/,
+    )
+    assert.throws(
+      () => signer.activateKeyAfterCensus(
+        newKeyId,
+        {
+          keyId: newKeyId,
+          total: 2,
+          covering: 1,
+          missing: [{ uid: 1, containerId: 2, keyIdsUnknown: false }],
+          fullyCovered: false,
+        },
+        () => {},
+      ),
+      /not fully covered/,
+    )
+    const audit: Array<Record<string, unknown>> = []
+    signer.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), (entry) => audit.push(entry))
+    assert.equal(signer.activeKeyId, newKeyId)
+    assert.equal(audit.length, 1)
+    assert.equal(audit[0]?.newKeyId, newKeyId)
+    assert.equal(audit[0]?.censusTotal, 2)
   })
 })
 
@@ -257,7 +342,8 @@ describe('keyring 持久化(与 bridge secret 同域)', () => {
     const path = keysPath('persist-rotate')
     const s1 = AuthoritySigner.loadOrCreate(path, () => {})
     const oldKeyId = s1.activeKeyId
-    const newKeyId = s1.addKey({ activate: true })
+    const newKeyId = s1.addKey()
+    s1.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), () => {})
 
     const s2 = AuthoritySigner.loadOrCreate(path, () => {})
     assert.equal(s2.activeKeyId, newKeyId)
@@ -270,6 +356,8 @@ describe('keyring 持久化(与 bridge secret 同域)', () => {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { v: number; keys: unknown[] }
     assert.equal(parsed.v, 1)
     assert.equal(parsed.keys.length, 1)
+    const publicRaw = readFileSync(publicKeysPath(path), 'utf8')
+    assert.equal(publicRaw.includes('privatePkcs8B64'), false, '公钥文件不得含私钥字段')
   })
 
   test('**fail-closed**:文件损坏 / keyId 与公钥错配 / active 不在 ring → 抛,绝不静默换钥', () => {
@@ -351,7 +439,9 @@ describe('keyring 首启并发(MAJOR-3 ①:多进程同时起,只能有一把钥
     assert.ok(verifyAuthority(minted.bundle.authority, signer.publicKeyring(), NOW))
 
     // tmp / lock 残留 = 下次启动读到半成品 or 锁死。必须为零。
-    const residue = readdirSync(tmpRoot).filter((f) => f.startsWith('concurrent-init.json.'))
+    const residue = readdirSync(tmpRoot).filter(
+      (f) => f.startsWith('concurrent-init.json.') && f !== 'concurrent-init.json.public',
+    )
     assert.deepEqual(residue, [], `tmp/lock 残留:${residue.join(', ')}`)
   })
 
@@ -372,7 +462,7 @@ describe('keyring 首启并发(MAJOR-3 ①:多进程同时起,只能有一把钥
             '-e',
             `const m = await import(${JSON.stringify(mod)});
              const s = m.AuthoritySigner.loadOrCreate(${JSON.stringify(path)}, () => {});
-             process.stdout.write(s.addKey({ activate: false }));`,
+             process.stdout.write(s.addKey());`,
           ],
           { timeout: 60_000 },
           (err, stdout, stderr) => (err ? reject(new Error(`${err.message}\n${stderr}`)) : resolve(stdout.trim())),
@@ -391,7 +481,7 @@ describe('keyring 首启并发(MAJOR-3 ①:多进程同时起,只能有一把钥
 describe('AuthorityKeyringReader —— 只读公钥 + 热重载(MAJOR-3 ②③)', () => {
   test('reader **不创建**文件:缺失 → 空 ring(验签方 fail-closed,而不是自己铸一把钥)', () => {
     const path = keysPath('reader-missing')
-    const reader = AuthorityKeyringReader.open(path, () => {})
+    const reader = AuthorityKeyringReader.open(publicKeysPath(path), () => {})
     assert.equal(reader.keyring().size, 0)
     assert.equal(existsSync(path), false, 'reader 绝不能创建 keyring 文件(egress 铸钥 = 双钥源)')
   })
@@ -399,10 +489,11 @@ describe('AuthorityKeyringReader —— 只读公钥 + 热重载(MAJOR-3 ②③)
   test('master 加新钥 → reader **无需重启**就认得(轮换窗口 egress 不瞎)', () => {
     const path = keysPath('reader-hot')
     const signer = AuthoritySigner.loadOrCreate(path, () => {})
-    const reader = AuthorityKeyringReader.open(path, () => {})
+    const reader = AuthorityKeyringReader.open(publicKeysPath(path), () => {})
     assert.deepEqual(reader.keyIds(), [signer.activeKeyId])
 
-    const newKeyId = signer.addKey({ activate: true })
+    const newKeyId = signer.addKey()
+    signer.activateKeyAfterCensus(newKeyId, fullCoverage(newKeyId), () => {})
     // 整改前:reader 拿的是常驻 signer 的**内存** → 这里仍是旧 ring,新签名 UnknownKey。
     assert.equal(reader.keyIds().includes(newKeyId), true, '文件变了,reader 必须重读')
 
@@ -414,7 +505,7 @@ describe('AuthorityKeyringReader —— 只读公钥 + 热重载(MAJOR-3 ②③)
   test('整份换 ring(轮换/灾备恢复)→ 下次验签用新 ring,旧签名 UnknownKey', () => {
     const path = keysPath('reader-swap')
     const signerA = AuthoritySigner.loadOrCreate(path, () => {})
-    const reader = AuthorityKeyringReader.open(path, () => {})
+    const reader = AuthorityKeyringReader.open(publicKeysPath(path), () => {})
     const mintedA = signerA.signBundle(mintInput(), { now: NOW })
     assert.ok(verifyAuthority(mintedA.bundle.authority, reader.keyring(), NOW))
 
@@ -425,7 +516,7 @@ describe('AuthorityKeyringReader —— 只读公钥 + 热重载(MAJOR-3 ②③)
     const signerB = AuthoritySigner.loadOrCreate(other, () => {})
     const keyIdB = signerB.activeKeyId
     const mintedB = signerB.signBundle(mintInput(), { now: NOW })
-    renameSync(other, path)
+    renameSync(publicKeysPath(other), publicKeysPath(path))
 
     const ringNow = reader.keyring()
     assert.deepEqual(reader.keyIds(), [keyIdB], 'reader 必须看见换上去的新 ring')
@@ -439,8 +530,8 @@ describe('AuthorityKeyringReader —— 只读公钥 + 热重载(MAJOR-3 ②③)
   test('reader 与 signer 的指纹/keyIds 同源(census 对账的前提)', () => {
     const path = keysPath('reader-fp')
     const signer = AuthoritySigner.loadOrCreate(path, () => {})
-    const reader = AuthorityKeyringReader.open(path, () => {})
-    signer.addKey({ activate: false })
+    const reader = AuthorityKeyringReader.open(publicKeysPath(path), () => {})
+    signer.addKey()
     assert.equal(reader.fingerprint(), signer.fingerprint())
     assert.deepEqual(reader.keyIds(), [...signer.keyIds].sort())
     // 容器侧从 env 解析出的 ring 也必须算出同一个指纹(protocol 单一实现)

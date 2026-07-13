@@ -42,7 +42,7 @@ import {
   type ModelCatalogSnapshot,
   type UserModelScope,
 } from "../billing/modelCatalog.js";
-import type { UserModelAuthz } from "../auth/userModelAuthz.js";
+import type { UserModelAuthz, UserModelAuthzLoader } from "../auth/userModelAuthz.js";
 import { PLATFORM_SEED_AGENT_MODEL_IDS } from "../marketplace/seedPlatformAgents.js";
 import {
   PLATFORM_DEFAULT_MODEL,
@@ -90,7 +90,7 @@ export interface ModelCatalogHandlerDeps {
   identityRepo: ContainerIdentityRepo;
   catalog: CatalogSource;
   /** role + grants 的权威加载器(auth/userModelAuthz.makeLoadUserModelAuthz)。 */
-  loadUserModelAuthz: (uid: bigint) => Promise<UserModelAuthz>;
+  loadUserModelAuthz: UserModelAuthzLoader;
   /** DB 当前 epoch(单行读)。默认 readSecurityEpoch;测试 seam。 */
   readEpoch?: () => Promise<bigint>;
   logger?: Logger;
@@ -116,6 +116,8 @@ export interface WireModelRow {
   context_window: number | null;
   supported_efforts: readonly string[];
   supports_vision: boolean;
+  capability_zero: boolean;
+  supports_thinking: boolean;
   default_effort: string | null;
 }
 
@@ -123,6 +125,7 @@ export interface WireCatalogResponse {
   models: WireModelRow[];
   projection_revision: string;
   security_epoch: string;
+  aliases: Record<string, string>;
 }
 
 export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCatalogHandler {
@@ -193,7 +196,7 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
     // 4) role + grants → per-uid 投影(与 pricing.listForUser / canUseModel 同源规则)
     let authz: UserModelAuthz;
     try {
-      authz = await deps.loadUserModelAuthz(uid);
+      authz = await deps.loadUserModelAuthz(uid, snapshot.securityEpoch);
     } catch (err) {
       // fail-closed:授权信息读不到 → 不能"按 public 兜底"下发(那会把 grants 撤销
       // 变成"下次缓存过期前照旧可用")。
@@ -216,11 +219,14 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
         context_window: r.contextWindow,
         supported_efforts: r.supportedEfforts,
         supports_vision: r.supportsVision,
+        capability_zero: r.capabilityZero,
+        supports_thinking: r.supportsThinking,
         default_effort: r.defaultEffort,
       })),
       // per-uid 投影哈希(全局 executionRevision **不下发**,R2-M12)。
       projection_revision: snapshot.projectionRevisionFor(scope),
       security_epoch: snapshot.securityEpoch.toString(),
+      aliases: snapshot.aliasesForUser(scope),
     };
 
     sendJson(res, 200, body, {

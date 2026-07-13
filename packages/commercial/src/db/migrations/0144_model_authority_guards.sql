@@ -1,18 +1,18 @@
--- 0136_model_authority_guards.sql
+-- 0144_model_authority_guards.sql
 -- 模型权威批次 · 切片 1 加固(Codex 代码审 R1:BLOCKER-1 + MAJOR-1)。
 -- 方案:docs/V5_MODEL_AUTHORITY_PLAN.md §1.1(「状态机与 epoch 由 DB 强制 …… 应用账号仅经
 -- 存储过程/受限权限写」)+ §1.2(grant 撤销 = 安全收窄 → bump epoch → 消费侧 fence)。
 --
--- 为什么是补丁迁移而不是改 0135:0135 可能已在别处(预发/他人库)apply,改历史迁移会让
+-- 为什么是补丁迁移而不是改 0143:0143 可能已在别处(预发/他人库)apply,改历史迁移会让
 -- 「已 applied 的 version」与文件内容漂移(migrate.ts 的完整性校验只查文件存在,不查 hash,
 -- 静默漂移更危险)。本文件用 CREATE OR REPLACE FUNCTION + DROP/CREATE TRIGGER 原地收紧,
--- 0135 的对象名/签名全部保持不变。
+-- 0143 的对象名/签名全部保持不变。
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 修的两个洞
 --
 -- ① BLOCKER-1:grant 撤销不 bump epoch → codex 授权 stale window。
---    0135 只给 catalog/alias/pricing 挂了 epoch trigger,`model_visibility_grants` 没有。
+--    0143 只给 catalog/alias/pricing 挂了 epoch trigger,`model_visibility_grants` 没有。
 --    撤权后:CCB 走 egress 每请求授权 → 兜得住;**codex 不经 /v1/messages egress** →
 --    bridge 只有 30s 周期 refresh、且刷新失败永久保留旧 checker → 旧连接继续签票执行。
 --    修:grants 表 INSERT/UPDATE/DELETE 全部 bump epoch(+NOTIFY),让 master/egress/bridge
@@ -28,7 +28,7 @@
 --    ModelCatalogCache.assertFresh() 的「等在飞重建」改造吸收(不再直接拒帧)。
 --
 -- ② MAJOR-1:DB 状态机不是「不可绕边界」。
---    0135 的 guard 只覆盖 INSERT/UPDATE:直接 `INSERT ... state='active'` 合法、DELETE
+--    0143 的 guard 只覆盖 INSERT/UPDATE:直接 `INSERT ... state='active'` 合法、DELETE
 --    完全不受约束(删 pricing 行会**物理删除 catalog 全部版本历史**)、TRUNCATE 不设防、
 --    epoch 可被任意 UPDATE 回退(= fence 直接失效)。
 --    修(两层,内层无条件、外层需割接):
@@ -36,7 +36,7 @@
 --        · INSERT:**只能生于 staged**(active/disabled/retired 一律拒)—— 每一行的
 --          可执行性都必须由状态机赋予,没有「出生即可执行」的旁路。兼容路径
 --          (INSERT INTO model_pricing)改为 staged → activate 两步,语义不变。
---        · UPDATE:execution 字段**只有 staged 行可改**(0135 只冻结 active 行 → disabled
+--        · UPDATE:execution 字段**只有 staged 行可改**(0143 只冻结 active 行 → disabled
 --          行可被原地改写 engine/provider 再 activate,同一 entry_id 的历史被篡改,
 --          usage_records 的 execution_revision 无法回溯)。
 --        · DELETE:**只允许 staged 行**(从未可执行 → 无审计价值)。active/disabled/retired
@@ -57,7 +57,7 @@
 --          换 DATABASE_URL。见文件尾「割接 runbook」。在此之前,不可绕边界 = 内层 trigger。
 -- ─────────────────────────────────────────────────────────────────────────────
 --
--- 运维注:v5 AUTO_MIGRATE=0,须在受控窗口人工 apply(同 0104-0135 惯例)。
+-- 运维注:v5 AUTO_MIGRATE=0,须在受控窗口人工 apply(同 0104-0143 惯例)。
 -- 本迁移不改表数据(只换 trigger/函数 + 一个 FK 的 ON DELETE 动作)。
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -114,7 +114,7 @@ CREATE TRIGGER trg_model_security_epoch_guard
 
 -- bump 自身改 SECURITY DEFINER:它被 model_pricing / model_visibility_grants 上的
 -- trigger 调用(那两张表是应用角色的合法写面),而 epoch 表将不对应用角色开放 DML。
--- 函数体与 0135 逐字一致,仅加 SECURITY DEFINER + search_path 钉死。
+-- 函数体与 0143 逐字一致,仅加 SECURITY DEFINER + search_path 钉死。
 CREATE OR REPLACE FUNCTION fn_model_security_epoch_bump() RETURNS BIGINT
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -160,7 +160,27 @@ CREATE TRIGGER trg_model_grants_security_after
 
 COMMENT ON TABLE model_visibility_grants IS
   'per-user 模型授权(0049)。任何写(含 DELETE)= 安全事件 → 同事务 bump model_security_epoch'
-  '(0136):master/egress/bridge 的 epoch fence 据此同步失效,撤权无 stale window。';
+  '(0144):master/egress/bridge 的 epoch fence 据此同步失效,撤权无 stale window。';
+
+-- role 同样是模型可见性输入：admin→user 若不 bump，epoch-aware loader 会合法命中
+-- 同 epoch 的旧 admin cache，已连 WS 也会继续签 admin-visible 模型。
+CREATE OR REPLACE FUNCTION fn_users_model_role_security_after() RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  IF NEW.role IS DISTINCT FROM OLD.role THEN
+    PERFORM fn_model_security_epoch_bump();
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER trg_users_model_role_security_after
+  AFTER UPDATE OF role ON users
+  FOR EACH ROW
+  WHEN (OLD.role IS DISTINCT FROM NEW.role)
+  EXECUTE FUNCTION fn_users_model_role_security_after();
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 3. MAJOR-1:catalog 状态机边界(INSERT 只 staged / DELETE 只 staged / 历史不可改)
@@ -169,7 +189,7 @@ COMMENT ON TABLE model_visibility_grants IS
 CREATE OR REPLACE FUNCTION fn_model_catalog_guard() RETURNS trigger AS $$
 BEGIN
   -- ── INSERT:只能生于 staged ────────────────────────────────────────────
-  -- 0135 允许直插 active/disabled(为回填 + 旧 INSERT 兼容路径开的口子)。回填已在 0135
+  -- 0143 允许直插 active/disabled(为回填 + 旧 INSERT 兼容路径开的口子)。回填已在 0143
   -- 完成;兼容路径(fn_model_catalog_ensure_for_pricing)改为 staged → activate 两步。
   -- 于是「出生即可执行」的旁路被彻底关闭:任何行要变成可执行,都必须经过一次
   -- staged→active 的状态转移(→ 必然 bump epoch、必然进 lock_version/审计列)。
@@ -184,7 +204,7 @@ BEGIN
   -- ── DELETE:只允许 staged 行 ───────────────────────────────────────────
   -- staged = 从未可执行、从未计费 → 物理删除无审计损失(放弃一个待激活版本)。
   -- active/disabled/retired 是「曾经/仍然可执行」的历史,与 usage_records 的
-  -- execution_revision 对账相关 → append-only,永不物理删除(0135 的
+  -- execution_revision 对账相关 → append-only,永不物理删除(0143 的
   -- fn_model_pricing_delete_cascade 会把全部版本删光,本迁移改软退役)。
   IF TG_OP = 'DELETE' THEN
     IF OLD.state <> 'staged' THEN
@@ -222,8 +242,8 @@ BEGIN
     END IF;
   END IF;
 
-  -- execution 字段:**只有 staged 行可改**(0136 收紧;0135 只冻结 active 行)。
-  --   0135 的漏洞:disabled 行可被原地改写 engine/provider/capability 再 disabled→active,
+  -- execution 字段:**只有 staged 行可改**(0144 收紧;0143 只冻结 active 行)。
+  --   0143 的漏洞:disabled 行可被原地改写 engine/provider/capability 再 disabled→active,
   --   同一 entry_id 的执行语义被静默篡改 —— 历史行不再是历史,usage_records 的
   --   execution_revision / entry 归因失去意义。方案 §1.1 的原意就是「任何 execution
   --   字段变化都必须走版本状态机(→ 新 entry)」,staged 是唯一的编辑面。
@@ -245,7 +265,7 @@ BEGIN
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
--- 0135 的 trigger 不含 DELETE → 重建。
+-- 0143 的 trigger 不含 DELETE → 重建。
 DROP TRIGGER trg_model_catalog_guard ON model_catalog;
 CREATE TRIGGER trg_model_catalog_guard
   BEFORE INSERT OR UPDATE OR DELETE ON model_catalog
@@ -343,7 +363,7 @@ ALTER TABLE model_aliases
 -- 4. enabled 兼容层:INSERT 走 staged → activate;DELETE 改软退役
 -- ═══════════════════════════════════════════════════════════════════════════
 
--- 状态机映射(0135 语义不变),加 DEFINER(应用角色无 catalog DML)。
+-- 状态机映射(0143 语义不变),加 DEFINER(应用角色无 catalog DML)。
 CREATE OR REPLACE FUNCTION fn_model_catalog_apply_enabled(
   p_model_id   TEXT,
   p_enabled    BOOLEAN,
@@ -378,9 +398,9 @@ BEGIN
 END $$;
 
 -- 兼容路径(INSERT INTO model_pricing → catalog 行不存在):
---   0135 直插 active/disabled;0136 改为 **staged → (enabled 时) activate**。
+--   0143 直插 active/disabled;0144 改为 **staged → (enabled 时) activate**。
 --   语义完全等价(enabled=TRUE → 最终 active;enabled=FALSE → 无 active 行 → 镜像 FALSE),
---   但走的是状态机而不是绕过它。enabled=FALSE 时新行停在 **staged**(而非 0135 的 disabled):
+--   但走的是状态机而不是绕过它。enabled=FALSE 时新行停在 **staged**(而非 0143 的 disabled):
 --   两者对消费侧完全等价(都不可路由),而 staged 是「从未激活过」的诚实描述。
 --
 --   注意:执行语义(engine/provider/context/capability)由 protocol 派生函数决定,
@@ -482,9 +502,9 @@ BEGIN
 END $$;
 
 -- 软退役:model_pricing 行被物理删除时,catalog **不再被物理删除**。
---   0135:`DELETE FROM model_catalog WHERE model_id = OLD.model_id` —— 把该模型的
+--   0143:`DELETE FROM model_catalog WHERE model_id = OLD.model_id` —— 把该模型的
 --         **全部版本历史**(含 retired)一次性抹掉,只需要一条 DELETE FROM model_pricing。
---   0136:摘 alias → 删 staged 行(无审计价值)→ active/disabled 行走状态机退到 retired。
+--   0144:摘 alias → 删 staged 行(无审计价值)→ active/disabled 行走状态机退到 retired。
 --         历史完整保留;之后重新 INSERT 同名 pricing 行会派生出**新 entry**(retired 行
 --         不占 (staged∪active) 部分唯一索引),不与历史冲突。
 CREATE OR REPLACE FUNCTION fn_model_catalog_retire_all(
@@ -538,11 +558,62 @@ BEGIN
 END $$;
 
 COMMENT ON FUNCTION fn_model_pricing_delete_cascade() IS
-  '0136:名字沿用 0135(trigger 已绑),语义已从「级联物理删除 catalog」改为「软退役」。';
+  '0144:名字沿用 0143(trigger 已绑),语义已从「级联物理删除 catalog」改为「软退役」。';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 5. 受控存储过程(应用角色的**唯一**写入口)
 -- ═══════════════════════════════════════════════════════════════════════════
+
+-- 平台运行必需模型：默认/隐藏审查/codex 队长/官方 seed/CCB secondary utility。
+-- 用 deferred constraint trigger 校验**事务最终态**，因此版本切换可在同一事务里先下旧行
+-- 再上新行，但任何 disable/retire/delete/price 删除若让最终态缺失都会在 COMMIT 被拒。
+CREATE TABLE model_runtime_requirements (
+  model_id TEXT NOT NULL,
+  requirement TEXT NOT NULL,
+  PRIMARY KEY (model_id, requirement)
+);
+INSERT INTO model_runtime_requirements(model_id, requirement) VALUES
+  ('glm-5.2', 'platform_default_and_hidden_reviewer'),
+  ('gpt-5.6-sol', 'default_codex_engine'),
+  ('deepseek-v4-pro', 'official_seed_agent'),
+  ('MiniMax-M3', 'official_seed_agent'),
+  ('kimi-k2.7-code', 'official_seed_agent'),
+  ('deepseek-v4-flash', 'ccb_secondary_utility');
+
+CREATE OR REPLACE FUNCTION fn_model_runtime_requirements_guard() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE v_missing TEXT;
+BEGIN
+  SELECT string_agg(r.model_id || ':' || r.requirement, ', ' ORDER BY r.model_id, r.requirement)
+    INTO v_missing
+    FROM model_runtime_requirements r
+   WHERE NOT EXISTS (
+           SELECT 1 FROM model_catalog c
+            WHERE c.model_id = r.model_id AND c.state = 'active'
+         )
+      OR NOT EXISTS (
+           SELECT 1 FROM model_pricing p
+            WHERE p.model_id = r.model_id AND p.enabled = TRUE
+         );
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION 'required runtime models must remain active and priced: %', v_missing
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE CONSTRAINT TRIGGER trg_model_runtime_requirements_catalog
+AFTER INSERT OR UPDATE OR DELETE ON model_catalog
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION fn_model_runtime_requirements_guard();
+
+CREATE CONSTRAINT TRIGGER trg_model_runtime_requirements_pricing
+AFTER INSERT OR UPDATE OR DELETE ON model_pricing
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION fn_model_runtime_requirements_guard();
+
 -- 全部 SECURITY DEFINER:割接后应用角色对 catalog/aliases/epoch 只有 SELECT,
 -- 一切写经这些过程 —— 状态机不再是「约定」,而是**唯一可达的路径**。
 
@@ -602,7 +673,7 @@ BEGIN
   RETURN v_entry;
 END $$;
 
--- 激活/禁用:复用 0135 的「当前 live 版本」选择规则(单一权威,不另写一份)。
+-- 激活/禁用:复用 0143 的「当前 live 版本」选择规则(单一权威,不另写一份)。
 CREATE OR REPLACE FUNCTION fn_model_activate(p_model_id TEXT, p_updated_by BIGINT DEFAULT NULL) RETURNS VOID
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -761,7 +832,9 @@ BEGIN
   DELETE FROM model_aliases WHERE alias = p_alias;
 END $$;
 
--- 版本切换(0135 §6):函数体不变,补 SECURITY DEFINER + search_path。
+-- 版本切换:乐观锁检查必须在持锁的 SECURITY DEFINER 过程内部完成。admin role 没有
+-- UPDATE/FOR UPDATE 表权限,TS 预读只能用于语义校验,不能承担线性化。
+DROP FUNCTION IF EXISTS fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT);
 CREATE OR REPLACE FUNCTION fn_model_switch_version(
   p_model_id                  TEXT,
   p_engine                    TEXT,
@@ -770,7 +843,8 @@ CREATE OR REPLACE FUNCTION fn_model_switch_version(
   p_context_window            INTEGER,
   p_capability_profile        JSONB,
   p_capability_schema_version INTEGER,
-  p_updated_by                BIGINT
+  p_updated_by                BIGINT,
+  p_expected_lock_version     INTEGER
 ) RETURNS BIGINT
   LANGUAGE plpgsql
   SECURITY DEFINER
@@ -792,6 +866,10 @@ BEGIN
   IF v_old_entry IS NULL THEN
     RAISE EXCEPTION 'fn_model_switch_version: no live entry for model %', p_model_id
       USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF (SELECT lock_version FROM model_catalog WHERE entry_id = v_old_entry) <> p_expected_lock_version THEN
+    RAISE EXCEPTION 'fn_model_switch_version: lock_version conflict for entry %', v_old_entry
+      USING ERRCODE = 'serialization_failure';
   END IF;
   IF v_old_state = 'staged' THEN
     RAISE EXCEPTION 'fn_model_switch_version: model % already has a pending staged version (entry %); activate or drop it first',
@@ -827,6 +905,16 @@ END $$;
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 6. 权限策略
 -- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE model_authority_deploy_state (
+  key         TEXT PRIMARY KEY CHECK (key IN ('observation', 'cutover')),
+  value       JSONB NOT NULL,
+  description TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+COMMENT ON TABLE model_authority_deploy_state IS
+  'deploy-role-only model authority observation/cutover evidence; app cannot read or forge';
+
 -- 默认 PG 把新函数的 EXECUTE 授予 PUBLIC —— 对 SECURITY DEFINER 函数而言这等于「谁都能
 -- 以 owner 身份改 catalog」。逐个 REVOKE。
 REVOKE ALL ON FUNCTION fn_model_security_epoch_bump()                                     FROM PUBLIC;
@@ -835,7 +923,7 @@ REVOKE ALL ON FUNCTION fn_model_catalog_apply_enabled(TEXT, BOOLEAN, BIGINT)    
 REVOKE ALL ON FUNCTION fn_model_catalog_ensure_for_pricing(TEXT, BOOLEAN, BIGINT)         FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_model_catalog_retire_all(TEXT, BIGINT)                          FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_model_stage_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT, INTEGER) FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_model_activate(TEXT, BIGINT)                                    FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_model_disable(TEXT, BIGINT)                                     FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_model_activate_entry(BIGINT, INTEGER, BIGINT)                   FROM PUBLIC;
@@ -847,15 +935,14 @@ REVOKE ALL ON FUNCTION fn_model_alias_remove(TEXT)                              
 
 -- 表级:PUBLIC 默认本来就没有权限,显式 REVOKE 只是把「意图」写进 schema(防止将来
 -- 有人 GRANT ... TO PUBLIC 时忘了这三张表是安全权威表)。
-REVOKE ALL ON TABLE model_catalog, model_aliases, model_security_epoch FROM PUBLIC;
+REVOKE ALL ON TABLE model_catalog, model_aliases, model_security_epoch, model_runtime_requirements,
+  model_authority_deploy_state FROM PUBLIC;
 
 /**
  * 应用角色的权限策略 —— **单一权威**。
  *
- * 割接后 app 角色在本模块只有:
- *   · SELECT   catalog / aliases / epoch(快照加载、epoch fence)
- *   · EXECUTE  受控状态机过程(stage / switch / activate / disable / retire / drop / alias)
- *   · 零表级 DML —— 直接 INSERT/UPDATE/DELETE/TRUNCATE 一律 permission denied
+ * 割接后普通 app 角色在本模块只有 SELECT。catalog mutation 只授予独立 admin DB role；
+ * 否则任一被攻陷的请求进程都能绕过 TS 语义校验直接调用低层 SECURITY DEFINER 过程。
  *
  * model_pricing / model_visibility_grants **保持 app 角色可直写**(admin PATCH / grants CRUD
  * 是它们的合法业务面);写进去的安全后果由本模块的 trigger 接管(enabled → 状态机路由、
@@ -873,12 +960,35 @@ BEGIN
   END IF;
 
   EXECUTE format(
-    'REVOKE ALL ON TABLE model_catalog, model_aliases, model_security_epoch FROM %I', p_role);
+    'REVOKE ALL ON TABLE model_catalog, model_aliases, model_security_epoch, model_runtime_requirements, model_authority_deploy_state FROM %I', p_role);
   EXECUTE format(
-    'GRANT SELECT ON TABLE model_catalog, model_aliases, model_security_epoch TO %I', p_role);
+    'GRANT SELECT ON TABLE model_catalog, model_aliases, model_security_epoch, model_runtime_requirements TO %I', p_role);
 
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_stage_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT, INTEGER) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_activate(TEXT, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_disable(TEXT, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_activate_entry(BIGINT, INTEGER, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_disable_entry(BIGINT, INTEGER, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_retire_entry(BIGINT, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_drop_staged(TEXT, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_alias_set(TEXT, TEXT, BIGINT) FROM %I', p_role);
+  EXECUTE format('REVOKE EXECUTE ON FUNCTION fn_model_alias_remove(TEXT) FROM %I', p_role);
+
+END $$;
+
+REVOKE ALL ON FUNCTION fn_model_authority_grant_app_role(TEXT) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION fn_model_authority_grant_admin_role(p_role TEXT) RETURNS VOID
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM fn_model_authority_grant_app_role(p_role);
+  EXECUTE format('GRANT SELECT ON TABLE model_pricing, model_authority_deploy_state TO %I', p_role);
+  EXECUTE format('GRANT INSERT ON TABLE admin_audit TO %I', p_role);
+  EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE admin_audit_id_seq TO %I', p_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_stage_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) TO %I', p_role);
-  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT, INTEGER) TO %I', p_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_activate(TEXT, BIGINT) TO %I', p_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_disable(TEXT, BIGINT) TO %I', p_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_activate_entry(BIGINT, INTEGER, BIGINT) TO %I', p_role);
@@ -889,7 +999,39 @@ BEGIN
   EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_alias_remove(TEXT) TO %I', p_role);
 END $$;
 
-REVOKE ALL ON FUNCTION fn_model_authority_grant_app_role(TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_model_authority_grant_admin_role(TEXT) FROM PUBLIC;
+
+/** deploy role:观察/割接证据与受限 canary 的唯一写方；catalog 仍只能走过程。 */
+CREATE OR REPLACE FUNCTION fn_model_authority_grant_deploy_role(p_role TEXT) RETURNS VOID
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_role) THEN
+    RAISE EXCEPTION 'fn_model_authority_grant_deploy_role: role % does not exist', p_role
+      USING ERRCODE = 'undefined_object';
+  END IF;
+  EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', p_role);
+  EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA public TO %I', p_role);
+  EXECUTE format('REVOKE ALL ON TABLE model_catalog, model_aliases, model_security_epoch, model_runtime_requirements, model_authority_deploy_state FROM %I', p_role);
+  EXECUTE format('GRANT SELECT ON TABLE model_catalog, model_aliases, model_security_epoch, model_runtime_requirements TO %I', p_role);
+  -- cutover 事务用 SELECT ... FOR UPDATE 锁 epoch；guard 仍只允许严格 +1，deploy 不写 catalog。
+  EXECUTE format('GRANT UPDATE ON TABLE model_security_epoch TO %I', p_role);
+  EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE model_authority_deploy_state TO %I', p_role);
+  EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE model_pricing, model_visibility_grants TO %I', p_role);
+  EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_stage_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_switch_version(TEXT, TEXT, TEXT, TEXT, INTEGER, JSONB, INTEGER, BIGINT, INTEGER) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_activate(TEXT, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_disable(TEXT, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_activate_entry(BIGINT, INTEGER, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_disable_entry(BIGINT, INTEGER, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_retire_entry(BIGINT, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_drop_staged(TEXT, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_alias_set(TEXT, TEXT, BIGINT) TO %I', p_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION fn_model_alias_remove(TEXT) TO %I', p_role);
+END $$;
+
+REVOKE ALL ON FUNCTION fn_model_authority_grant_deploy_role(TEXT) FROM PUBLIC;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 7. 自检(迁移期断言:不满足即整个迁移事务回滚)
@@ -902,10 +1044,10 @@ BEGIN
   -- ① 直插 active 必须被拒
   BEGIN
     INSERT INTO model_catalog (model_id, engine, provider_id, capability_profile, state)
-    VALUES ('__0136_probe__', 'ccb', 'deepseek',
-            '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null}}'::jsonb,
+    VALUES ('__0144_probe__', 'ccb', 'deepseek',
+            '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null},"ccb":{"capability_zero":false,"supports_thinking":true}}'::jsonb,
             'active');
-    RAISE EXCEPTION '0136 self-check FAILED: direct INSERT of an active catalog row was accepted';
+    RAISE EXCEPTION '0144 self-check FAILED: direct INSERT of an active catalog row was accepted';
   EXCEPTION WHEN check_violation THEN
     NULL;  -- 期望路径
   END;
@@ -915,7 +1057,7 @@ BEGIN
     BEGIN
       DELETE FROM model_catalog
        WHERE entry_id = (SELECT MIN(entry_id) FROM model_catalog WHERE state = 'active');
-      RAISE EXCEPTION '0136 self-check FAILED: DELETE of an active catalog row was accepted';
+      RAISE EXCEPTION '0144 self-check FAILED: DELETE of an active catalog row was accepted';
     EXCEPTION WHEN check_violation THEN
       NULL;
     END;
@@ -925,22 +1067,28 @@ BEGIN
   SELECT epoch INTO v_epoch FROM model_security_epoch WHERE id;
   BEGIN
     UPDATE model_security_epoch SET epoch = v_epoch WHERE id;
-    RAISE EXCEPTION '0136 self-check FAILED: epoch UPDATE without +1 was accepted';
+    RAISE EXCEPTION '0144 self-check FAILED: epoch UPDATE without +1 was accepted';
   EXCEPTION WHEN check_violation THEN
     NULL;
   END;
 
-  -- ④ grants trigger 已装(行为断言在 modelAuthorityDbGuards.integ.test.ts,
+  -- ④ grants / users.role trigger 已装(行为断言在 modelAuthorityDbGuards.integ.test.ts,
   --    这里只做结构断言 —— 迁移不该往业务表塞探针数据)
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger
      WHERE tgname = 'trg_model_grants_security_after' AND NOT tgisinternal
   ) THEN
-    RAISE EXCEPTION '0136 self-check FAILED: trg_model_grants_security_after missing';
+    RAISE EXCEPTION '0144 self-check FAILED: trg_model_grants_security_after missing';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+     WHERE tgname = 'trg_users_model_role_security_after' AND NOT tgisinternal
+  ) THEN
+    RAISE EXCEPTION '0144 self-check FAILED: trg_users_model_role_security_after missing';
   END IF;
 EXCEPTION WHEN OTHERS THEN
   GET STACKED DIAGNOSTICS v_err = MESSAGE_TEXT;
-  RAISE EXCEPTION '0136 self-check: %', v_err;
+  RAISE EXCEPTION '0144 self-check: %', v_err;
 END $$;
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -952,14 +1100,19 @@ END $$;
 --
 --   -- 1) 以 owner(现 DATABASE_URL 的角色)连库:
 --   CREATE ROLE openclaude_app LOGIN PASSWORD '<强随机>';
+--   CREATE ROLE openclaude_model_admin LOGIN PASSWORD '<强随机>';
+--   CREATE ROLE openclaude_model_deploy LOGIN PASSWORD '<强随机>';
 --   -- 2) 业务表按现状授权(app 的合法写面):
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO openclaude_app;
 --   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO openclaude_app;
 --   ALTER DEFAULT PRIVILEGES IN SCHEMA public
 --     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO openclaude_app;
---   -- 3) 模型权威三表收窄(SELECT + 受控过程 EXECUTE,零 DML):
+--   -- 3) 三角色模型权威策略(角色必须互不相同):
 --   SELECT fn_model_authority_grant_app_role('openclaude_app');
---   -- 4) 把 commercial-v5.env / commercial.env 的 DATABASE_URL 换成 openclaude_app;
+--   SELECT fn_model_authority_grant_admin_role('openclaude_model_admin');
+--   SELECT fn_model_authority_grant_deploy_role('openclaude_model_deploy');
+--   -- 4) commercial-v5.env 设置 DATABASE_URL / MODEL_CATALOG_ADMIN_DATABASE_URL /
+--   --    MODEL_AUTHORITY_DEPLOY_DATABASE_URL；三个 URL 必须分别使用上述三个角色。
 --   --    迁移仍用 owner 角色跑(migrate 需要 DDL)。
 --
 -- 割接前:trigger 层(§1/§3/§4)已是不可绕边界的**主要**依据 —— 它对 owner 同样生效,

@@ -465,6 +465,10 @@ async function buildHarness(opts: HarnessOpts = {}): Promise<Harness> {
     preCheckRedis: buildFakePreCheckRedis(),
     scheduler: buildFakeScheduler(),
     identity: apiKeyStrategy,
+    loadUserModelAuthz: async () => ({
+      role: authzRole,
+      grantedModelIds: new Set<string>([FIXED_MODEL]),
+    }),
     rateLimitRedis: buildFakeRateLimitRedis(),
     fetchImpl: async () => sseResponse(200, makeFullSseChunks()),
     upstreamEndpoint: "https://upstream.test/v1/messages",

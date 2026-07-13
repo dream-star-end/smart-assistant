@@ -44,6 +44,10 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, getPool } from "./db/index.js";
+import {
+  assertModelCatalogAdminPoolConfigured,
+  closeModelCatalogAdminPool,
+} from "./db/modelCatalogAdmin.js";
 import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
@@ -1493,7 +1497,7 @@ export async function registerCommercial(
       //   - enforce(OC_MODEL_AUTHORITY=1)→ 抛,拒启(半开状态 = 全站被 fence 拒,
       //     不如启动就响亮失败);
       //   - 影子期 → **fail-soft**:catalog 只是观测面,没有任何判定依赖它;此时因为
-      //     0135 未 apply 就把 master 拒启,是纯自伤(零安全收益)。记 error 继续跑 legacy。
+      //     0143 未 apply 就把 master 拒启,是纯自伤(零安全收益)。记 error 继续跑 legacy。
       const modelAuthorityEnforce = isModelAuthorityEnforced();
       let modelCatalogForProxy: Awaited<ReturnType<typeof getModelCatalogCache>> | undefined;
       try {
@@ -1514,6 +1518,7 @@ export async function registerCommercial(
         modelAuthorityEnforce,
         authorityKeyring: authorityKeyringProvider(),
         identity: identityStrategy,
+        loadUserModelAuthz,
         rateLimitRedis,
         // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
         //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
@@ -1807,7 +1812,7 @@ export async function registerCommercial(
       // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
       // turn 的判定随 inbound 的签名 descriptor 下来,不经这条路。
       //
-      // catalog 未装配(影子期 + 0135 未 apply)→ **不注册**:path fall through 到
+      // catalog 未装配(影子期 + 0143 未 apply)→ **不注册**:path fall through 到
       // internalProxyHandler 返 404,容器侧 catalog client 把 404 当"拿不到权威快照" →
       // 本地路径拒新 turn(fail-closed,与"未部署"等价)。
       //
@@ -2153,6 +2158,7 @@ export async function registerCommercial(
         preCheckRedis,
         scheduler,
         identity: apiKeyStrategy,
+        loadUserModelAuthz,
         rateLimitRedis: sharedRateLimitRedis,
         // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
         refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
@@ -2355,7 +2361,7 @@ export async function registerCommercial(
   //   ③ bridge 对每条 inbound.message 签发并注入 `__oc_model_authority`,codex 分类
   //      改用 catalog descriptor.engine(与签发同源)。
   //
-  // fail-closed 启动:catalog 首次快照拉不起来(0135 迁移未 apply / DB 不可达)→ **抛**,
+  // fail-closed 启动:catalog 首次快照拉不起来(0143 迁移未 apply / DB 不可达)→ **抛**,
   // 不允许「flag 开着但 catalog 空转」这种半开状态(那会让每条帧都被 fence 拒,等于全站
   // 静默不可用,还不如启动就响亮失败)。
   //
@@ -2364,15 +2370,11 @@ export async function registerCommercial(
   let modelAuthoritySigner: AuthoritySigner | undefined;
   let modelCatalogCache: ModelCatalogCache | undefined;
   if (modelAuthorityFlag) {
+    // catalog HTTP mutation 必须走独立低权 admin role；缺失/串用 app role 时拒绝启动。
+    await assertModelCatalogAdminPoolConfigured();
     modelAuthoritySigner = AuthoritySigner.loadOrCreate();
-    modelCatalogCache = new ModelCatalogCache();
-    modelCatalogCache.onError = (err) => {
-      rootLogger.error("[commercial] model catalog cache error", {
-        err: (err as Error)?.message ?? String(err),
-      });
-    };
-    await modelCatalogCache.rebuild();
-    await modelCatalogCache.startListener();
+    // 与 proxy/internal catalog 共用进程级单例，禁止 bridge 另起一份快照。
+    modelCatalogCache = await getModelCatalogCache();
     // eslint-disable-next-line no-console
     console.log("[commercial] model authority ENABLED", {
       activeKeyId: modelAuthoritySigner.activeKeyId,
@@ -3863,18 +3865,28 @@ export async function registerCommercial(
     incidentSnapshotProvider: incidentSnapshot
       ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
       : undefined,
-    // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
-    // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
-    // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
-    // 的 sync closure,后续每条 inbound.message 帧 sync 校验。pricing 是进程级
-    // singleton,grants 失败 throw → bridge 关 1011(不做 silent 放行)。
-    loadAllowedModelChecker: async (uid, role) => {
-      const { listGrantsForUser } = await import("./admin/modelGrants.js");
+    // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
+    // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
+    loadAllowedModelChecker: async (uid, requiredEpoch) => {
+      if (modelCatalogCache) {
+        const snapshot = await modelCatalogCache.assertFresh();
+        if (requiredEpoch !== undefined && snapshot.securityEpoch < requiredEpoch) {
+          throw new Error(
+            `catalog snapshot epoch ${snapshot.securityEpoch} < required ${requiredEpoch}`,
+          );
+        }
+        const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+        return (modelId: string) => snapshot.canUseModel({
+          uid: uid.toString(),
+          role: authz.role,
+          grantedModelIds: authz.grantedModelIds,
+        }, modelId);
+      }
+      // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。
       const { canUseModel } = await import("./billing/authzModels.js");
-      const grants = await listGrantsForUser(uid);
-      const grantedSet = new Set(grants.map((g) => g.model_id));
+      const authz = await loadUserModelAuthz(uid);
       return (modelId: string) =>
-        canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
+        canUseModel({ pricing }, { ...authz, modelId });
     },
     // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
     // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
@@ -4554,6 +4566,7 @@ export async function registerCommercial(
       try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
+      await closeModelCatalogAdminPool();
       await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */

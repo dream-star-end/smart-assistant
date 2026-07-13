@@ -1,5 +1,5 @@
 /**
- * 模型权威批次 · 切片 6 —— usage_records 的四列权威留证(0135;方案 §4 / R3-m11)。
+ * 模型权威批次 · 切片 6 —— usage_records 的四列权威留证(0143;方案 §4 / R3-m11)。
  *
  * 跑法:npx tsx --test packages/commercial/src/__tests__/modelAuthorityUsageColumns.test.ts
  *

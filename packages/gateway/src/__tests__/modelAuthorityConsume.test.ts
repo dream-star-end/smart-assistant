@@ -70,6 +70,7 @@ const DESCRIPTOR: ModelExecutionDescriptor = {
   capabilityProfile: {
     supportsVision: false,
     reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: null },
+    ccb: { capabilityZero: true, supportsThinking: true },
   },
   capabilitySchemaVersion: 1,
   contextWindow: 200_000,
@@ -81,6 +82,7 @@ const CODEX_DESCRIPTOR: ModelExecutionDescriptor = {
   capabilityProfile: {
     supportsVision: true,
     reasoning: { supported: ['medium', 'xhigh'], codexModelDefault: 'xhigh' },
+    ccb: { capabilityZero: false, supportsThinking: false },
   },
   capabilitySchemaVersion: 1,
   contextWindow: 400_000,
@@ -127,6 +129,9 @@ function mintFrame(
   return {
     type: 'inbound.message',
     model: payload.canonicalModel,
+    ...(payload.engine === 'codex' && typeof payload.billingRequestId === 'string'
+      ? { requestId: payload.billingRequestId }
+      : {}),
     [MODEL_AUTHORITY_FIELD]: {
       authority: encodeAuthorityEnvelope(
         payload,
@@ -365,6 +370,21 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
     expectReject(() => consumer.consume(frame2, conn), 'model_mismatch')
   })
 
+  test('codex billingRequestId 必须与 server-owned frame.requestId 精确绑定', () => {
+    const key = makeKey('mak1_a')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'gpt-5.6-sol',
+      engine: 'codex',
+      billingRequestId: '0123456789abcdef0123456789abcdef',
+      executionDescriptor: CODEX_DESCRIPTOR,
+    })
+    frame.requestId = 'fedcba9876543210fedcba9876543210'
+    expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
+  })
+
   test('capability schema 未来版本 → unknown_capability_version(fail-closed,不尽力解析)', () => {
     const key = makeKey('mak1_a')
     const consumer = makeConsumer(key)
@@ -505,6 +525,7 @@ describe('descriptor 驱动执行选择(engine / model)', () => {
         connectionChallenge: conn.challenge,
         canonicalModel: 'gpt-5.6-sol',
         engine: 'codex',
+        billingRequestId: '0123456789abcdef0123456789abcdef',
         executionDescriptor: CODEX_DESCRIPTOR,
       }),
       conn,

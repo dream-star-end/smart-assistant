@@ -41,7 +41,7 @@ import { ADMIN_AUDIT_ACTIONS } from "../admin/auditActions.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
-/** capability_profile 的 DB 形状(snake_case,与 0135 fn_model_catalog_capability 同源)。 */
+/** capability_profile 的 DB 形状(snake_case,与 0143 fn_model_catalog_capability 同源)。 */
 function profile(
   supportsVision: boolean,
   supported: string[],
@@ -50,6 +50,7 @@ function profile(
   return {
     supports_vision: supportsVision,
     reasoning: { supported, codex_model_default: codexDefault },
+    ccb: { capability_zero: true, supports_thinking: true },
   };
 }
 
@@ -82,7 +83,7 @@ describe("model catalog admin — 形状门(normalizeVersionInput)", () => {
     assert.throws(() => normalizeVersionInput(glm52({ provider_id: "Ark Cloud" })), RangeError);
   });
 
-  test("engine='ccb' 必须带 provider_id(0135 CHECK 的应用层同构)", () => {
+  test("engine='ccb' 必须带 provider_id(0143 CHECK 的应用层同构)", () => {
     assert.throws(() => normalizeVersionInput(glm52({ provider_id: null })), RangeError);
   });
 
@@ -118,8 +119,7 @@ describe("model catalog admin — 激活期四条语义门", () => {
     assert.ok(v.some((x) => /∉ engine='ccb' 的服务端机制集/.test(x)));
   });
 
-  test("matchesRoute 不符 → 拒(hint 缺失的回落路径会打到另一个上游)", () => {
-    // minimax-m3 的 protocol 路由是 minimax,catalog 却声明 ark
+  test("显式 provider hint 取代 matchesRoute baked 判定", () => {
     const v = validateVersionSemantics(
       normalizeVersionInput({
         model_id: "minimax-m3",
@@ -131,10 +131,10 @@ describe("model catalog admin — 激活期四条语义门", () => {
       }),
       true,
     );
-    assert.ok(v.some((x) => /matchesRoute\(minimax-m3\) → 'minimax'/.test(x)));
+    assert.deepEqual(v, []);
   });
 
-  test("未知 model + 静态 provider → 拒;未知 model + OAuth → 放行", () => {
+  test("未知 model id 可由 catalog 显式 provider/upstream 零代码接入", () => {
     const staticClaim = validateVersionSemantics(
       normalizeVersionInput({
         model_id: "brand-new-model",
@@ -146,7 +146,7 @@ describe("model catalog admin — 激活期四条语义门", () => {
       }),
       true,
     );
-    assert.ok(staticClaim.some((x) => /matchesRoute\(brand-new-model\)/.test(x)));
+    assert.deepEqual(staticClaim, []);
 
     const oauthClaim = validateVersionSemantics(
       normalizeVersionInput({
@@ -184,7 +184,7 @@ describe("model catalog admin — 激活期四条语义门", () => {
     assert.ok(v.some((x) => /不得声明 codex_model_default/.test(x)));
   });
 
-  test("codex engine:白名单内型号放行,白名单外拒(容器 codex adapter 起不来)", () => {
+  test("codex engine 不再受 baked 型号白名单限制", () => {
     const sol = validateVersionSemantics(
       normalizeVersionInput({
         model_id: "gpt-5.6-sol",
@@ -209,10 +209,10 @@ describe("model catalog admin — 激活期四条语义门", () => {
       }),
       true,
     );
-    assert.ok(unknown.some((x) => /∉ protocol CODEX_ENGINE_MODEL_IDS/.test(x)));
+    assert.deepEqual(unknown, []);
   });
 
-  test("protocol 声明的 codex 型号不得挂 engine='ccb'", () => {
+  test("engine 由 catalog descriptor 决定,不按 model id 前缀猜", () => {
     const v = validateVersionSemantics(
       normalizeVersionInput({
         model_id: "gpt-5.6-luna",
@@ -224,7 +224,7 @@ describe("model catalog admin — 激活期四条语义门", () => {
       }),
       true,
     );
-    assert.ok(v.some((x) => /engine 不能是 'ccb'/.test(x)));
+    assert.deepEqual(v, []);
   });
 
   test("codex_model_default 必须 ∈ reasoning.supported", () => {
@@ -279,7 +279,7 @@ describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
       );
     }
     assert.deepEqual(meta.runtimeCapabilities, [MODEL_AUTHORITY_CAPABILITY]);
-    assert.ok(meta.requiredMigrations.includes("0135_model_catalog"));
+    assert.ok(meta.requiredMigrations.includes("0143_model_catalog"));
   });
 
   test("cutover marker 置位 + flag 关 → 拒启(不可逆地板);其余组合放行", () => {

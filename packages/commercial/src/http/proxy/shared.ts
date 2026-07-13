@@ -1272,6 +1272,8 @@ export interface AnthropicProxyDeps {
    * AuthzDeniedError → 403。
    */
   identity: IdentityStrategy;
+  /** identity authorize 与 model-authority gate 共用的 epoch-aware 权威加载器。 */
+  loadUserModelAuthz: import("../../auth/userModelAuthz.js").UserModelAuthzLoader;
   rateLimitRedis: RateLimitRedis;
   /** 注入 fetch(测试用)。 */
   fetchImpl?: typeof fetch;

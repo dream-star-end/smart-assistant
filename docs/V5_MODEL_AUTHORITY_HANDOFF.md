@@ -1,85 +1,96 @@
-# 模型权威批次 · 交接文档（2026-07-12 阶段性收尾）
+# v5 模型执行权威 · 上线交接（2026-07-13）
 
-分支 `feat/v5-model-authority`（worktree `/opt/openclaude/openclaude-v5-modelauth`）
-基于 canonical `c67b9428`。**代码全绿、未合并、未部署、零现网影响**（所有新机制默认关）。
+分支：`feat/v5-model-authority`
 
-## 一、这批在做什么
+worktree：`/opt/openclaude/openclaude-v5-modelauth`
 
-根治「模型清单散在 6 处人工同步」+「可路由（编译期硬编码，改要重启+重建镜像）与
-可计费（DB 热重载）分裂」。目标：既有 provider 内加/停/改模型 = 纯 DB 操作全链热生效。
+同步基线：canonical `87d44375`（连接器平台 + P3 双 master + 隔离预发 Caddy 端口）
 
-核心机制（设计审 5 轮 PASS，方案见 `docs/V5_MODEL_AUTHORITY_PLAN.md`）：
-1. **model_catalog 单一权威**（版本化 entry_id + state 状态机 + DB trigger 强制 + security_epoch）
-2. **Ed25519 签名 execution descriptor**：bridge 每 inbound 铸票，容器该 turn 全部执行语义
-   取自 descriptor（不查本地 catalog）→ master 计费判定与容器执行判定物理同一次判定
-3. **双进程 epoch fence**（master + egress）：每请求直读单行 epoch，安全变更零 stale 窗口
-4. **六步上线 + 四面兼容地板**（DB/master/egress/runtime release）
+## 目标与完成态
 
-## 二、已完成（代码全绿）
+本批把模型的可用性、执行路由、能力、上下文窗口、用户可见性和安全版本收口到
+`model_catalog`，由 master 对每个 turn 签发 Ed25519 execution descriptor；gateway/CCB
+只消费已签 descriptor，egress 对每个上游请求执行 security epoch fence。
 
-| 面 | 内容 | 测试 |
-|---|---|---|
-| DB | 0135 catalog/aliases/epoch + 0136 guards（状态机 trigger、权限边界、grants epoch） | 真 PG：guards 24/24、catalog 33/33、admin 12/12 |
-| protocol | modelAuthority.ts（JCS/验签/lease/auxModels） | 36 |
-| master | authoritySigner（keyring/轮换/census）、bridge 签发+fence+补偿、admin catalog 入口、投影收口 | signer 20、bridge 21、codex billing 42、admin 5 suite |
-| egress | 每请求 fence + 验票 + provider_id 数据驱动路由 + capability 上限 + usage 四列 | gate 29 |
-| 容器 | catalog client（TTL/LKG/epoch 验证）、验签消费（WeakMap/replay/水位）、本地路径投影判定、CCB per-turn 票据（stdin env 通道） | gateway 1741 全绿 |
-| seed | schema v2 声明化 + master 按容器实际 bundle_rev 推导 | 87 + 8 |
-| 部署 | release-metadata capability、四面 preflight、flag 开关、cutover marker、不可逆地板 | drill 160、v5ReleaseSafety |
+已完成的关键闭环：
 
-**四层测试**：tsc 0 / gateway 1741 / storage 292 / commercial gate「PASS: no new failures beyond baseline」
+- `0143_model_catalog.sql`：版本化 catalog、alias、security epoch、定价兼容镜像。
+- `0144_model_authority_guards.sql`：状态机、epoch 单调守卫、grant 写 bump epoch、受控
+  `SECURITY DEFINER` 过程、app/admin/deploy 三角色最小权限策略。
+- app 进程只读 catalog；catalog mutation 使用独立 `MODEL_CATALOG_ADMIN_DATABASE_URL`；
+  部署证据/canary/cutover 使用独立 `MODEL_AUTHORITY_DEPLOY_DATABASE_URL`。
+- 本地路径授权加载器以 fenced epoch 原子读取 epoch + role + grants；撤权不会继承 60s TTL。
+- descriptor 的 engine/upstream/context/effort/thinking/vision 全部进入 gateway/CCB 执行路径；
+  vision 变化会 recycle 既有 subprocess，保证 spawn-time prompt 与新能力一致。
+- 私钥只留 master；验签侧只读公钥投影。旧 key 停签后必须等待一个完整 turn-lease TTL
+  才能删除，并强制提供审计回调。
+- cutover 证据从通用 `system_settings` 移到 app 不可见的
+  `model_authority_deploy_state`；观察与割接均由 deploy role 写入。
+- authority gate 通过后的 proxy/Codex 计费直接消费同一 fenced snapshot 价格；Codex journal
+  持久化已复合 agent multiplier 的最终价格，跨 bridge 恢复不再跨 billing generation。
+- catalog NOTIFY 与 admin 同步 rebuild 的竞态已收口：已覆盖 epoch 的迟到通知不反向打空新快照，
+  在飞重建期间的新通知排队补跑，避免 superseded rebuild 留下永久 unknown。
+- deploy 脚本具备四面 preflight、受限 canary、15 分钟观察、全 fleet（含 stopped）
+  seed census、emergency image drill 证据和不可逆兼容地板。
+- 模型权威开关、seed、emergency 与 preflight 全部拒绝和 P3 rollout 交错，并跟随
+  `deploy_state` 的稳定 active lane；P3 candidate 激活同样经过 cutover 兼容地板。
+- 全局 egress 不再永久钉在 slot A：`--egress` 使用独立原子 release 指针，从目标
+  `BUILT_RELEASE` 安装 unit，并以进程 cwd/health/capability 验证；失败回切起手锁定的旧 release。
+- 跨 bridge 结算按 journal 持久化的 `authorityKind` 判定创建代次，而不是接收帧时的当前
+  flag：上线前 legacy journal 可跨 enable 恢复，authority journal 也不会在 flag 回退后被
+  当成 legacy；畸形分类/绑定/价格统一免单 fail-closed。
+- 已合并 P3 双 master 最新 canonical；本地 deploy-state 恢复矩阵与 model-authority deploy gate
+  共存通过。生产前仍须在 kl-hk 用最终 canonical 完成 canary/promote/finalize/abort/recover 全演练。
 
-## 三、剩余工作（交接给下一位）
+## 已通过验证
 
-### A. Codex 代码审 R2（必须，R1 已整改完但未复审）
-`mcp__codex__codex-reply` 续 thread `019f560c-ff93-7fd1-8072-493559bae509`，
-发增量 `git diff a766229f^..a766229f`。R1 是 3B+8M+6m 全整改，需复审确认闭合。
+- `npm run check:v5`：PASS
+  - typecheck：PASS
+  - gateway：1753/1753
+  - mcp-memory：25/25
+  - storage：292/292
+  - web-react：1285/1285
+  - commercial unit gate：`PASS: no new failures beyond baseline`
+- 模型权威安全/计费定向套件：159/159（含精确定价、跨 bridge 恢复、flag 跨版本恢复及
+  畸形 journal 免单）。
+- 真 PostgreSQL（必须逐文件串行，避免 schema reset 互锁）：
+  - `modelCatalogDb.integ.test.ts`：33/33
+  - `modelAuthorityDbGuards.integ.test.ts`：28/28
+  - `modelCatalogAdmin.integ.test.ts`：12/12，连续两轮通过（锁 NOTIFY/rebuild 竞态修复）
+- CCB 定向 Bun 测试：static model 12/12、effort 51/51、thinking 5/5。
+- `modelCatalog.test.ts + scripts/__tests__/v5ReleaseSafety.test.ts`：68/68。
+- `scripts/v5-deploy-state-smoke.sh`：116/116；`v5-caddy-apply.sh --self-check`：PASS。
+- `bash -n scripts/deploy-v5.sh`、`git diff --check`：PASS。
 
-### B. R1 遗留的两个 MAJOR（因文件冲突未做，现在无冲突可做）
-1. **MAJOR-4 descriptor 未真正完整消费**：gateway 只消费了 signed engine/model/effort；
-   `contextWindow`/vision/capability_profile **没有进入 CCB spawn override**（CCB 仍读本地
-   staticKeyModels 表）。`context_window=NULL` 被签成自造语义的 `0`（协议应显式表达 NULL）。
-2. **MAJOR-6 codex usage 无权威留证**：新的 execution_revision/security_epoch/authority_kind
-   四列只接到了 proxy billing insert，**codex bridge settle 没传** → 相应列为空。
-   且 gateway 未断言 `billingRequestId === frame.requestId`。
+商业 integ 全量 runner 的 `preCheck` fake SQL / `v3EnsureRunning` 失败为 canonical 已知基线；
+本批安全相关的三套真 PG 测试已独立严格通过，不用并行 runner 的 schema-reset 假死结论代替。
 
-### C. 各 agent 报告里的登记项
-- **master 侧 aliases 未下发**：容器 client 消费面已做齐（缺席=空 map，不放宽判定），
-  master 补 `WireCatalogResponse.aliases` 即闭环。当前 model_aliases 表为空 → 生产零影响。
-- **`OC_MODEL_AUTHORITY` 第二份拷贝**（subprocessRunner.ts:202）→ 收口到 `isModelAuthorityRequired()`。
-- **egress authz loader** 用 gate 内进程级默认实例（与 identity strategy 各一份 60s 缓存，
-  规则同源无分叉）→ wiring 批次收口为同一实例。
-- **权限层割接**（0136 文件尾有 runbook）：建低权角色 → `fn_model_authority_grant_app_role`
-  → 换 DATABASE_URL。割接前必须先把 `admin/modelCatalogOps.ts` 的直写改为受控过程（过程已就位）。
-- **0135 双向 trigger 锁序耦合**：admin pricing 写与 catalog 写并发可能 40P01（已翻 409 可重试，
-  非数据损坏）；根治=给 admin/pricing.ts 统一锁序（catalog → pricing）。
-- **新增 model_id 仍需一次代码发版**：gateway inbound 白名单走 protocol `matchesRoute`、
-  codex adapter 走 `CODEX_ENGINE_MODEL_IDS`，catalog 尚未接管这两处判定源。纯 DB 可改的是
-  upstream_model_id/context_window/capability/上下线/价格/alias。**放开前必须先 descriptor 化
-  这两处**，否则会静默放行一个"影子/回落路径打到 OAuth 池烧真钱"的行。
+## 正式上线顺序
 
-### D. 部署（六步矩阵，agent C 已写可执行 runbook）
-见 `scripts/deploy-v5.sh` 的 `--model-authority-preflight` / `--enable-model-authority` /
-`--model-authority-cutover`。**关键**：
-- 步骤 2/4 必须 `--egress`（生产 `/v1/messages` 全在 egress，只重启 master 等于没上线）
-- 步骤 4 前四面 capability preflight 全绿
-- **步骤 5 后不可逆**（cutover marker 置位 → 缺 capability 的任何一面拒绝激活）
-- 步骤 6 seed 阶段 A 核验「全部 managed 容器（含 stopped）带有效 bundle_rev label」
+1. Codex 最终 full-diff review（相对 canonical `87d44375`）必须 PASS；随后 commit、push、合并到
+   `/opt/openclaude/openclaude-v5-aurora`。
+2. 先在 kl-hk 对**最终 canonical**完成 P3 全路径（canary → promote → finalize、下一轮 abort、
+   finalize 断点 recover、真 WS 跨 lane resume）；未通过不得碰生产。
+3. 备份生产 DB；用 owner 手工执行生产尚缺的 0135/0143/0144 并登记 `schema_migrations`。
+4. 建三个随机独立登录角色，按 0144 runbook 授权；原子写入三个 URL：
+   `DATABASE_URL`、`MODEL_CATALOG_ADMIN_DATABASE_URL`、
+   `MODEL_AUTHORITY_DEPLOY_DATABASE_URL`。owner URL 只留迁移用途。
+5. touched path 分类：commercial master + egress + gateway/CCB/protocol/runtime + migration +
+   deploy script + web-react。**runtime source release 必须重建；egress 与 dist 必须部署。**
+6. 从 canonical 唯一入口执行 `scripts/deploy-v5.sh --egress --with-dist`；禁止 rsync 或手工重启
+   作为最终部署。
+7. 用 `OC_EMBED_SOURCE=1` 构建并登记 emergency embedded image，完成激活/恢复 drill 并留证。
+8. `--model-authority-preflight` 四面全绿后，先 egress enforce，再 master 签发；开始 observation。
+9. 收集至少 15 分钟、10 个 signed request、1 个 canary usage、1 个已提交且超过 5 分钟的
+   CCB authority turn。
+10. 枚举全部 v5 runtime（含 stopped）完成 bundle-rev census，启用 seed authority-by-rev。
+11. 执行 `--model-authority-cutover` 原子锁 observation + epoch 并置位 DB/env marker。
+12. smoke：v5/public/egress/Caddy/三 DB 角色/证据行；确认 v3 仍 retired，观察日志与监控。
 
-### E. 运维铁律（实现期发现，务必进 runbook）
-1. **先 recycle 后 retire**：阶段 B 下旧容器跑旧 rev 的 seed 声明，退役 seed 模型前先确认无容器引用。
-2. **禁 disable 平台必需模型**：`deepseek-v4-flash`（次级模型，WebFetch/WebSearch）被 disable
-   → 全站 ccb turn 签发期 fail-closed 拒帧（有意设计，但 blast radius 大 → 建议加 trigger 护栏）。
-3. **keyring 轮换五步**：keyring env 只在 provision 注入 → "下发新公钥" = 换 env + 全量 recycle；
-   census（`authorityKeyCensus.isFullyCovered`）是步骤② 的 gate。
-4. **价格变更打断在途 turn**：epoch bump → 长 CCB turn 下次上游请求被拒
-   （`MODEL_CONFIG_CHANGED_RETRY_TURN`，前端已有引导重开）。监控需区分安全撤销 vs 价格版本变化。
+## 回滚边界
 
-## 四、上个批次（hotcfg）顺带修的既有漏洞（已在本批 commit 里）
-hotcfg 的 master symlink 翻转走 saga `extra_apply`，**从不经过 `activate_release`**
-→ sessions-pg 割接地板的 capability 断言此前被完全绕过。已在 tuple 激活/回滚两处补挂。
-
-## 五、并行 agent 工作流的坑（已修，值得记住）
-- `commercial-unit-gate.sh` 的 TAP 默认写仓根固定名 → 并发跑互相截断报假 infrastructure failure。
-  已改进程隔离；**worktree 的 `.git` 是文件不是目录**，必须用 `git rev-parse --git-dir`。
-- integ 测试必须走 `scripts/test-mutex.sh`（直跑会 deadlock）。
+- cutover 前：可关闭 `OC_MODEL_AUTHORITY`，顺序仍需先 egress、后 master。
+- cutover 后：不得直接关 flag 或激活缺 capability 的旧 release/runtime tuple。必须先事务性
+  恢复 catalog 到 baked 等价值、bump epoch、等待所有快照与容器收敛，再按 runbook 清 marker。
+- 本批上线不主动通知用户；若出现真实影响，也必须只定位真实受影响用户，并在企业微信取得
+  dx 审批后才可发送，禁止全员群发。

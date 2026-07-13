@@ -69,6 +69,7 @@ function entry(over: Partial<ModelCatalogEntry> & { entryId: number; modelId: st
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["low", "medium", "high"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",
@@ -108,6 +109,7 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       capabilityProfile: {
         supportsVision: true,
         reasoning: { supported: ["medium", "xhigh"], codexModelDefault: "xhigh" },
+        ccb: { capabilityZero: false, supportsThinking: false },
       },
     }),
   ];
@@ -727,7 +729,7 @@ describe("bridge 模型执行权威 — keyring census(轮换步骤② gate)", (
 
       // 轮换步骤①:master 加了新公钥但容器还没换 env → 步骤② 的 gate 必须为 false,
       // 否则运维会在容器认不得新钥的情况下切私钥 = 全站 UnknownKey。
-      const newKeyId = rig.signer.addKey({ activate: false });
+      const newKeyId = rig.signer.addKey();
       assert.equal(rig.census.isFullyCovered(newKeyId), false);
 
       ws.close();

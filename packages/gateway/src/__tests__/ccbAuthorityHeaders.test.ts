@@ -35,12 +35,26 @@ import {
 } from '../modelCatalogClient.js'
 import {
   AuthorityHeaderRejected,
+  MODEL_EXECUTION_DESCRIPTOR_ENV,
   SubprocessRunner,
+  shouldRecycleForVisionCapability,
   type TurnModelAuthority,
   _buildAnthropicCustomHeadersEnv,
 } from '../subprocessRunner.js'
 
 const AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
+const EXECUTION_DESCRIPTOR = {
+  canonicalModel: 'glm-5.2',
+  contextWindow: 1_000_000,
+  capabilityZero: true,
+  supportsThinking: true,
+  supportsVision: false,
+  supportedEfforts: ['high', 'max'],
+} as const
+
+function authority(authorityEnvelope: string, leaseEnvelope: string): TurnModelAuthority {
+  return { authorityEnvelope, leaseEnvelope, executionDescriptor: EXECUTION_DESCRIPTOR }
+}
 
 // ---------------------------------------------------------------------------
 // harness:一个只捕获 stdin 写入的假子进程(不 spawn 真 CCB)
@@ -49,26 +63,36 @@ const AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
 interface Harness {
   runner: SubprocessRunner
   writes: string[]
+  destroyed: { value: boolean }
 }
 
-function createHarness(): Harness {
+function createHarness(failWrite?: number, spawnedDescriptor: unknown = EXECUTION_DESCRIPTOR): Harness {
   const runner = new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
     agentBaseDir: '/tmp',
+    model: 'glm-5.2',
     config: {} as never,
   } as never)
   const writes: string[] = []
+  const destroyed = { value: false }
+  let writeNo = 0
   // proc 非空 ⇒ submit() 不会去 start() 真进程。
   ;(runner as unknown as { proc: unknown }).proc = {
     stdin: {
-      write(chunk: string) {
+      write(chunk: string, callback?: (err?: Error | null) => void) {
+        writeNo += 1
         writes.push(chunk)
+        queueMicrotask(() => callback?.(writeNo === failWrite ? new Error(`write-${writeNo}`) : null))
         return true
       },
+      destroy() { destroyed.value = true },
     },
+    kill() { destroyed.value = true },
   }
-  return { runner, writes }
+  ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor =
+    spawnedDescriptor
+  return { runner, writes, destroyed }
 }
 
 /** 假 catalog client(本地路径 token 的来源;生产是 master 的 /internal/v3/model-catalog)。 */
@@ -84,6 +108,23 @@ function fakeCatalog(opts: {
     async getToken() {
       if (opts.throws) throw opts.throws
       return opts.token ?? 'tok'
+    },
+    async getView() {
+      if (opts.throws) throw opts.throws
+      return {
+        canonicalize: (model: string) => model,
+        resolve: (model: string) => model === EXECUTION_DESCRIPTOR.canonicalModel
+          ? {
+              modelId: model,
+              engine: 'ccb',
+              contextWindow: EXECUTION_DESCRIPTOR.contextWindow,
+              capabilityZero: EXECUTION_DESCRIPTOR.capabilityZero,
+              supportsThinking: EXECUTION_DESCRIPTOR.supportsThinking,
+              supportsVision: EXECUTION_DESCRIPTOR.supportsVision,
+              supportedEfforts: [...EXECUTION_DESCRIPTOR.supportedEfforts],
+            }
+          : null,
+      }
     },
   } as unknown as ModelCatalogClient
 }
@@ -116,18 +157,27 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('CCB authority headers — stdin 写入序列', () => {
+  it('prewarm/长驻进程的 vision capability 漂移必须 recycle', () => {
+    assert.equal(shouldRecycleForVisionCapability(undefined, EXECUTION_DESCRIPTOR), true)
+    assert.equal(shouldRecycleForVisionCapability(EXECUTION_DESCRIPTOR, EXECUTION_DESCRIPTOR), false)
+    assert.equal(
+      shouldRecycleForVisionCapability(
+        EXECUTION_DESCRIPTOR,
+        { ...EXECUTION_DESCRIPTOR, supportsVision: true },
+      ),
+      true,
+    )
+  })
   it('每个 turn 都先写 update_environment_variables,再写 user message', async () => {
     const { runner, writes } = createHarness()
-    await runner.submit('hello', undefined, {
-      authorityEnvelope: 'AUTH1',
-      leaseEnvelope: 'LEASE1',
-    })
+    await runner.submit('hello', undefined, authority('AUTH1', 'LEASE1'))
 
     assert.equal(writes.length, 2)
     // 顺序是本方案的正确性根基:同一条 stdin 按行处理 ⇒ CCB 在解析 user message 之前
     // 已经把 env 写进 process.env ⇒ 本 turn 的第一个 /v1/messages 必带本 turn 的票。
     const vars = parseEnvLine(writes[0]!)
     assert.ok('ANTHROPIC_CUSTOM_HEADERS' in vars)
+    assert.deepEqual(JSON.parse(vars[MODEL_EXECUTION_DESCRIPTOR_ENV]!), EXECUTION_DESCRIPTOR)
     const userMsg = JSON.parse(writes[1]!) as { type: string; message: { role: string } }
     assert.equal(userMsg.type, 'user')
     assert.equal(userMsg.message.role, 'user')
@@ -143,10 +193,7 @@ describe('CCB authority headers — stdin 写入序列', () => {
 describe('CCB authority headers — bridge turn', () => {
   it('authority + lease 各一行 `Name: Value`,不带 local_catalog', async () => {
     const { runner, writes } = createHarness()
-    await runner.submit('hi', 'req-1', {
-      authorityEnvelope: 'eyJhdXRoIjoxfQ',
-      leaseEnvelope: 'eyJsZWFzZSI6MX0',
-    })
+    await runner.submit('hi', 'req-1', authority('eyJhdXRoIjoxfQ', 'eyJsZWFzZSI6MX0'))
 
     const raw = parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS!
     assert.equal(raw.split('\n').length, 2)
@@ -166,7 +213,7 @@ describe('CCB authority headers — bridge turn', () => {
       fakeCatalog({ configured: true, throws: new ModelCatalogUnavailableError('boom') }),
     )
     const { runner, writes } = createHarness()
-    await runner.submit('hi', undefined, { authorityEnvelope: 'A', leaseEnvelope: 'L' })
+    await runner.submit('hi', undefined, authority('A', 'L'))
     const headers = parseCustomHeaders(parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS!)
     assert.equal(headers[AUTHORITY_HEADER], 'A')
     assert.equal(headers[TURN_LEASE_HEADER], 'L')
@@ -180,10 +227,9 @@ describe('CCB authority headers — bridge turn', () => {
 describe('CCB authority headers — 清位语义', () => {
   it('turn1 有票 → turn2 无票:第二次 env 写入必须是空串(旧 envelope 不残留)', async () => {
     const { runner, writes } = createHarness()
-    await runner.submit('turn1', undefined, {
-      authorityEnvelope: 'AUTH1',
-      leaseEnvelope: 'LEASE1',
-    })
+    await runner.submit('turn1', undefined, authority('AUTH1', 'LEASE1'))
+    // 本用例只验证 env 清位；视觉能力变化触发的真实 recycle 由独立用例覆盖。
+    ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor = undefined
     await runner.submit('turn2') // 本地路径 / flag 未开
 
     assert.equal(writes.length, 4)
@@ -209,18 +255,21 @@ describe('CCB authority headers — 清位语义', () => {
         return 'tok'
       },
     } as unknown as ModelCatalogClient)
-    const { runner, writes } = createHarness()
+    const { runner, writes } = createHarness(undefined, null)
     await runner.submit('local turn')
     assert.equal(parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS, '')
     assert.equal(touched, false)
   })
 
-  it('flag 开但 catalog 未装配(非托管容器)→ 空串,不拒 turn', async () => {
+  it('flag 开但 catalog 未装配 → fail-closed 拒 turn', async () => {
     process.env[AUTHORITY_ENV] = '1'
     _setModelCatalogClientForTests(fakeCatalog({ configured: false }))
     const { runner, writes } = createHarness()
-    await runner.submit('local turn')
-    assert.equal(parseEnvLine(writes[0]!).ANTHROPIC_CUSTOM_HEADERS, '')
+    await assert.rejects(
+      runner.submit('local turn'),
+      (err: unknown) => err instanceof ModelCatalogUnavailableError,
+    )
+    assert.equal(writes.length, 0)
   })
 })
 
@@ -234,8 +283,7 @@ describe('CCB authority headers — fail-closed', () => {
     await assert.rejects(
       runner.submit('hi', undefined, {
         // ANTHROPIC_CUSTOM_HEADERS 按 \n 切行 → 值里的 \n 可以凭空造出第二个 header。
-        authorityEnvelope: 'GOOD\nx-injected: evil',
-        leaseEnvelope: 'LEASE',
+        ...authority('GOOD\nx-injected: evil', 'LEASE'),
       }),
       (err: unknown) => err instanceof AuthorityHeaderRejected,
     )
@@ -245,7 +293,7 @@ describe('CCB authority headers — fail-closed', () => {
   it('envelope 含 \\r → 同样拒发', async () => {
     const { runner, writes } = createHarness()
     await assert.rejects(
-      runner.submit('hi', undefined, { authorityEnvelope: 'A\rB', leaseEnvelope: 'L' }),
+      runner.submit('hi', undefined, authority('A\rB', 'L')),
       (err: unknown) => err instanceof AuthorityHeaderRejected,
     )
     assert.equal(writes.length, 0)
@@ -263,6 +311,18 @@ describe('CCB authority headers — fail-closed', () => {
     )
     assert.equal(writes.length, 0)
   })
+
+  for (const failWrite of [1, 2]) {
+    it(`stdin 第 ${failWrite} 次异步写失败 → reject 且销毁子进程`, async () => {
+      const { runner, writes, destroyed } = createHarness(failWrite)
+      await assert.rejects(
+        runner.submit('hi', undefined, authority('A', 'L')),
+        new RegExp(`write-${failWrite}`),
+      )
+      assert.equal(writes.length, failWrite)
+      assert.equal(destroyed.value, true)
+    })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -288,6 +348,7 @@ describe('CCB authority headers — 本地路径(cron/synthetic/delegate)', () =
   it('token 每 turn 现取(携当前 epoch;缓存下来会在安全变更后撞 fence)', async () => {
     process.env[AUTHORITY_ENV] = '1'
     let n = 0
+    const base = fakeCatalog({ configured: true })
     _setModelCatalogClientForTests({
       get configured() {
         return true
@@ -296,6 +357,7 @@ describe('CCB authority headers — 本地路径(cron/synthetic/delegate)', () =
         n += 1
         return `tok-${n}`
       },
+      getView: () => base.getView(),
     } as unknown as ModelCatalogClient)
     const { runner, writes } = createHarness()
     await runner.submit('t1')
@@ -330,7 +392,7 @@ describe('CcbAdapter — modelAuthority 透传', () => {
     })()
     const adapter = new CcbAdapter({} as never, fakeRunner as unknown as SubprocessRunner)
 
-    const bridge: TurnModelAuthority = { authorityEnvelope: 'A', leaseEnvelope: 'L' }
+    const bridge: TurnModelAuthority = authority('A', 'L')
     await adapter.submitTurn({
       input: 'hi',
       modelAuthority: bridge,

@@ -48,6 +48,7 @@ function entry(
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",
@@ -89,6 +90,7 @@ const CODEX = entry({
   capabilityProfile: {
     supportsVision: true,
     reasoning: { supported: ["low", "high"], codexModelDefault: "high" },
+    ccb: { capabilityZero: false, supportsThinking: false },
   },
 });
 const STAGED = entry({ entryId: 4, modelId: "glm-6.0-preview", state: "staged" });

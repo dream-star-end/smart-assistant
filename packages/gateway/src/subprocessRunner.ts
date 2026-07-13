@@ -11,6 +11,7 @@ import { modelHintAppliedTotal } from './metrics.js'
 import {
   AUTHORITY_HEADER,
   LOCAL_CATALOG_HEADER,
+  ModelCatalogUnavailableError,
   TURN_LEASE_HEADER,
   getModelCatalogClient,
 } from './modelCatalogClient.js'
@@ -200,6 +201,23 @@ export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
 
 /** `OC_MODEL_AUTHORITY=1`(supervisor 在 flag 开启时注入容器;与 modelAuthority.ts 同名 env)。 */
 const REQUIRE_AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
+export const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
+
+export interface CcbExecutionDescriptor {
+  readonly canonicalModel: string
+  readonly contextWindow: number | null
+  readonly capabilityZero: boolean
+  readonly supportsThinking: boolean
+  readonly supportsVision: boolean
+  readonly supportedEfforts: readonly string[]
+}
+
+export function shouldRecycleForVisionCapability(
+  spawned: CcbExecutionDescriptor | undefined,
+  next: CcbExecutionDescriptor | undefined,
+): boolean {
+  return spawned?.supportsVision !== next?.supportsVision
+}
 
 /**
  * 一个 bridge turn 的两张签名票(master 铸,inbound 帧携带,gateway 验签后经
@@ -210,6 +228,8 @@ export interface TurnModelAuthority {
   readonly authorityEnvelope: string
   /** turn lease envelope(base64url;TTL = 最大 turn 窗口 + grace)。 */
   readonly leaseEnvelope: string
+  /** 已验签的 CCB 执行语义；与两张 envelope 同一份 descriptor。 */
+  readonly executionDescriptor: CcbExecutionDescriptor
 }
 
 /** 本 turn 要挂到每个上游请求上的 header 集合(三者互斥使用见 resolveTurnUpstreamHeaders)。 */
@@ -280,18 +300,41 @@ export function _buildUpdateEnvStdinLine(vars: Record<string, string>): string {
  *     取不到(master 不可达 / epoch 验不出)→ 抛 → **拒新 turn**(方案 §3:无 baked 回落);
  *   - flag 未开 / 个人版 / 非托管容器   → undefined → 写空串(egress 侧 gate 未装配,零行为变化)。
  */
-async function resolveTurnUpstreamHeaders(
+async function resolveTurnRuntime(
   authority: TurnModelAuthority | undefined,
+  model: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<TurnUpstreamHeaders | undefined> {
+): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
-    return { authority: authority.authorityEnvelope, lease: authority.leaseEnvelope }
+    return {
+      headers: { authority: authority.authorityEnvelope, lease: authority.leaseEnvelope },
+      descriptor: authority.executionDescriptor,
+    }
   }
-  if (env[REQUIRE_AUTHORITY_ENV] !== '1') return undefined
+  if (env[REQUIRE_AUTHORITY_ENV] !== '1') return {}
   const client = getModelCatalogClient()
-  // 装配不全(个人版 / 非托管容器)→ 本来就没有 egress fence 这条链路。
-  if (!client.configured) return undefined
-  return { localCatalog: await client.getToken() }
+  // flag 已开却没装配 catalog = 半开拓扑。此时写空串会让本地 turn 不带任何票据
+  // 进入 egress；宁可本地拒绝，也不能把“非托管”当成授权旁路。
+  if (!client.configured) {
+    throw new ModelCatalogUnavailableError('authority flag enabled but catalog client is not configured')
+  }
+  if (!model) throw new ModelCatalogUnavailableError('local CCB turn has no canonical model')
+  const view = await client.getView()
+  const row = view.resolve(view.canonicalize(model))
+  if (!row || row.engine !== 'ccb') {
+    throw new ModelCatalogUnavailableError('local CCB model missing from current projection')
+  }
+  return {
+    headers: { localCatalog: await client.getToken() },
+    descriptor: {
+      canonicalModel: row.modelId,
+      contextWindow: row.contextWindow,
+      capabilityZero: row.capabilityZero,
+      supportsThinking: row.supportsThinking,
+      supportsVision: row.supportsVision,
+      supportedEfforts: [...row.supportedEfforts],
+    },
+  }
 }
 
 export interface HostSpawnProviderEnvInput {
@@ -718,6 +761,10 @@ const MAX_STDERR_BUF_BYTES = MAX_STDOUT_BUF_BYTES // same cap applies to stderr
 
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
+  /** 本 turn 解析后的 descriptor；首次 spawn 也必须看到，不能等 stdin 才补。 */
+  private currentExecutionDescriptorEnv = ''
+  private currentExecutionDescriptor: CcbExecutionDescriptor | undefined
+  private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private stdoutBuf = ''
   /**
    * Cached UTF-8 byte count of `stdoutBuf`. Updated incrementally on append
@@ -1064,6 +1111,7 @@ export class SubprocessRunner extends EventEmitter {
           // process.env 继承)。空串 = "本 spawn 无 trace stash",见
           // `_buildCcbSpawnTraceEnv` JSDoc。
           ..._buildCcbSpawnTraceEnv(this.opts.traceId),
+          [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
@@ -1076,6 +1124,7 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
+    this.spawnedExecutionDescriptor = this.currentExecutionDescriptor
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
     // manager's per-CCB cost-tracker reset) run strictly before any 'message'
     // or 'session_id' event of the new process can arrive.
@@ -1111,6 +1160,7 @@ export class SubprocessRunner extends EventEmitter {
 
     proc.on('exit', (code, signal) => {
       this.proc = null
+      this.spawnedExecutionDescriptor = undefined
       this.closed = true
       // Phase 5:进程死了,清 binding。下次 start 会按当时 repo state 重新评估。
       // 哪怕本次是 graceful (recycle),session.lock 已经在 caller 那边持有,
@@ -1335,9 +1385,23 @@ export class SubprocessRunner extends EventEmitter {
   ): Promise<void> {
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
-    const upstreamHeaders = await resolveTurnUpstreamHeaders(authority)
+    const runtime = await resolveTurnRuntime(authority, this.opts.model)
+    if (
+      this.proc &&
+      shouldRecycleForVisionCapability(this.spawnedExecutionDescriptor, runtime.descriptor)
+    ) {
+      // vision 决定 spawn-time prompt/upload fallback；长驻进程不能只靠 stdin env 热改。
+      await this.shutdown()
+    }
+    this.currentExecutionDescriptor = runtime.descriptor
+    this.currentExecutionDescriptorEnv = runtime.descriptor
+      ? JSON.stringify(runtime.descriptor)
+      : ''
     const envUpdateLine = _buildUpdateEnvStdinLine(
-      _buildAnthropicCustomHeadersEnv(upstreamHeaders),
+      {
+        ..._buildAnthropicCustomHeadersEnv(runtime.headers),
+        [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
+      },
     )
 
     if (!this.proc) await this.start()
@@ -1353,24 +1417,43 @@ export class SubprocessRunner extends EventEmitter {
         content,
       },
     }
-    try {
-      this.proc.stdin.write(envUpdateLine)
-    } catch (err: any) {
-      // env 没写进去 = CCB 仍持有上一 turn 的 header(或没有 header)。宁可拒本 turn,
-      // 也不让它带着**错的票**去打上游(egress 会拒 → 用户看到的是同一条故障,但计费/
-      // 安全语义在这里就已经被守住了)。
-      runnerLog.error(
-        'authority env stdin write failed — refusing to submit turn',
-        { sessionKey: this.opts.sessionKey },
-        err,
-      )
-      throw err
-    }
-    try {
-      this.proc.stdin.write(`${JSON.stringify(userMsg)}\n`)
-    } catch (err: any) {
-      runnerLog.warn('stdin write failed', { sessionKey: this.opts.sessionKey }, err)
-    }
+    // Writable.write 的失败大多经 callback 异步报告，try/catch 只能抓同步 throw。
+    // 两行都必须逐一等 callback：env 写失败不能继续写 user；user 写失败也必须 reject。
+    // 任一失败都销毁进程，避免它保留“env 已更新但 user 未收到”或旧 header 的半态。
+    await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+    await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message')
+  }
+
+  private async writeTurnLineOrDestroy(
+    line: string,
+    phase: 'authority_env' | 'user_message',
+  ): Promise<void> {
+    const proc = this.proc
+    if (!proc) throw new Error('CCB subprocess disappeared before stdin write')
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const done = (err?: Error | null): void => {
+        if (settled) return
+        settled = true
+        if (!err) {
+          resolve()
+          return
+        }
+        runnerLog.error(
+          'CCB stdin write failed — destroying subprocess and refusing turn',
+          { sessionKey: this.opts.sessionKey, phase },
+          err,
+        )
+        try { proc.stdin.destroy(err) } catch { /* best effort */ }
+        try { proc.kill('SIGKILL') } catch { /* exit handler/next submit will recover */ }
+        reject(err)
+      }
+      try {
+        proc.stdin.write(line, done)
+      } catch (err) {
+        done(err as Error)
+      }
+    })
   }
 
   // ─── Build per-session learning-loop context files ───
@@ -1435,6 +1518,7 @@ export class SubprocessRunner extends EventEmitter {
         persona: this.opts.persona,
         provider: effectiveProvider,
         model: this.opts.model,
+        modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
         availableMcpTools: [...availableMcpTools],
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
@@ -1680,6 +1764,7 @@ export class SubprocessRunner extends EventEmitter {
       })
     })
     this.proc = null
+    this.spawnedExecutionDescriptor = undefined
     this.closed = true
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null

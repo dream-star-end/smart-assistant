@@ -56,7 +56,7 @@ import {
   type ModelCatalogSnapshot,
   type ModelExecutionDescriptor,
 } from "../../billing/modelCatalog.js";
-import { makeLoadUserModelAuthz, type UserModelAuthz } from "../../auth/userModelAuthz.js";
+import type { UserModelAuthz, UserModelAuthzLoader } from "../../auth/userModelAuthz.js";
 import { rootLogger, type Logger } from "../../logging/logger.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,36 +254,16 @@ export interface EnforceArgs {
   /**
    * role + grants 的**服务端权威**加载器(本地路径重算 projectionRevision 用)。
    *
-   * 不传 → 用本模块的进程级默认实例(`makeLoadUserModelAuthz()`,与 identity strategy
-   * 同一份业务规则模块 = 单一权威;两个实例各自持 60s soft-TTL 缓存,只是多一次同规则读,
-   * 不产生语义分叉)。**默认实例走 DB**,单测必须显式注入,否则会真连库。
-   *
-   * 之所以做成"可选 + 模块内默认"而不是从 handler 注入:生产的 `/v1/messages` 装配在
-   * `egress/main.ts`,它构造 `AnthropicProxyDeps` 时不认识本 gate 的内部依赖;把 loader
-   * 做成必填会把 wiring 改动摊到 egress 装配面(本批次不动那面)。登记债:wiring 批次收口时
-   * 改为注入 identity strategy 已持有的同一个 loader 实例,消掉重复缓存。
+   * bridge 凭据不需要它；local_catalog 路径缺失则 503 fail-closed。生产 master/egress/
+   * external 三条装配都显式注入 identity strategy 共用的同一实例，避免两份 TTL 缓存。
+   * loader 接收 fenced securityEpoch，只有缓存 epoch 精确相等才能命中；否则单 SQL 重读
+   * epoch + role + grants，撤权不会继承旧的 60s soft TTL。
    */
-  loadUserModelAuthz?: (uid: bigint) => Promise<UserModelAuthz>;
+  loadUserModelAuthz?: UserModelAuthzLoader;
   /** 日志(默认 rootLogger 子 logger)。projectionRevision 不一致的告警从这里出。 */
   logger?: Logger;
   /** 测试注入。 */
   now?: number;
-}
-
-/** 进程级默认 authz 加载器(懒建 —— 单测不注入就不会拉起 DB 依赖链)。 */
-let defaultAuthzLoader: ((uid: bigint) => Promise<UserModelAuthz>) | null = null;
-
-function resolveAuthzLoader(
-  injected?: (uid: bigint) => Promise<UserModelAuthz>,
-): (uid: bigint) => Promise<UserModelAuthz> {
-  if (injected) return injected;
-  if (!defaultAuthzLoader) defaultAuthzLoader = makeLoadUserModelAuthz();
-  return defaultAuthzLoader;
-}
-
-/** 测试用:清掉进程级默认 loader(避免跨用例串缓存)。 */
-export function _resetGateAuthzLoaderForTests(): void {
-  defaultAuthzLoader = null;
 }
 
 /**
@@ -292,7 +272,8 @@ export function _resetGateAuthzLoaderForTests(): void {
  * 顺序不可换:
  *   ① 先 fence(assertFresh = 单行 SELECT epoch + 漂移则同步重建)—— 拿到与 DB 线性化的快照;
  *   ② 再判模型可路由性(用①的快照);
- *   ③ 最后验凭据并把凭据里的 epoch/revision 与①对齐。
+ *   ③ 验凭据并把凭据里的 epoch/revision 与①对齐;
+ *   ④ 用同一 fenced epoch 原子读取 role/grants，并用快照内 visibility 做最终授权。
  * 反过来(先验票再 fence)会让"票是旧 epoch 签的、但本进程快照恰好也旧"的双旧场景蒙混过关。
  */
 export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAuthorityDecision> {
@@ -341,7 +322,7 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
   const localRaw = readHeader(args.headers, LOCAL_CATALOG_HEADER);
 
   if (authorityRaw || leaseRaw) {
-    return verifyBridgeAuthority({
+    const decision = verifyBridgeAuthority({
       authorityRaw,
       leaseRaw,
       keyring: args.keyring,
@@ -352,18 +333,23 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       descriptor,
       snapshot,
     });
+    await loadAndAssertFencedAuthz(args, snapshot, canonicalModel);
+    return decision;
   }
 
   if (localRaw) {
     const token = parseLocalCatalogToken(localRaw);
     assertEpochMatches(BigInt(token.securityEpoch), snapshot.securityEpoch, "local_catalog");
+    // role/grants 与 visibility 都绑定本次 fenced snapshot，PricingCache 的异步 reload
+    // 不再参与安全授权结论。
+    const authz = await loadAndAssertFencedAuthz(args, snapshot, canonicalModel);
     // MAJOR-7:落库的 projectionRevision 必须由**服务端**按已认证 uid 重算,token 的自称值
     // 只作比对。见 recomputeProjectionRevision。
     const projectionRevision = await recomputeProjectionRevision({
       snapshot,
       uid: args.uid,
       claimed: token.projectionRevision,
-      loadAuthz: resolveAuthzLoader(args.loadUserModelAuthz),
+      authz,
       logger: args.logger ?? rootLogger.child({ subsys: "modelAuthorityGate" }),
     });
     return {
@@ -383,6 +369,38 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
 }
 
 /**
+ * role/grants 与 visibility 的最终授权闸。三者必须绑定同一个 securityEpoch：
+ * loader(requiredEpoch) 禁止命中旧 role/grants TTL；snapshot.canUseModel 使用同一
+ * 快照内的 visibility，禁止回读异步 PricingCache。
+ */
+async function loadAndAssertFencedAuthz(
+  args: EnforceArgs,
+  snapshot: ModelCatalogSnapshot,
+  canonicalModel: string,
+): Promise<UserModelAuthz> {
+  if (!args.loadUserModelAuthz) {
+    throw new ModelGateReject("catalog_unavailable", "epoch-aware authz loader not configured");
+  }
+  let authz: UserModelAuthz;
+  try {
+    authz = await args.loadUserModelAuthz(args.uid, snapshot.securityEpoch);
+  } catch (err) {
+    throw new ModelGateReject(
+      "catalog_unavailable",
+      `fenced authz load failed: ${(err as Error)?.message ?? String(err)}`,
+    );
+  }
+  if (!snapshot.canUseModel({
+    uid: args.uid.toString(),
+    role: authz.role,
+    grantedModelIds: authz.grantedModelIds,
+  }, canonicalModel)) {
+    throw new ModelGateReject("not_available", `model '${canonicalModel}' not authorized`);
+  }
+  return authz;
+}
+
+/**
  * 按**已认证 uid 的当前 role/grants** + 本请求 fence 到的快照重算 per-uid projectionRevision
  * (与 `/internal/v3/model-catalog` 下发时同一个 `snapshot.projectionRevisionFor`,单一算法)。
  *
@@ -390,32 +408,21 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
  * 污染面;也不能"退回 null 继续跑"——审计列会静默变空,事故无痕。语义与 internalModelCatalog
  * 的 authz_load_failed → 503 对齐(同一条"授权读不到就别放行"的纪律)。
  *
- * **不一致不拒**,只告警:epoch 相等下二者仍可能合法不等 —— 状态机只对"收窄类"写
- * (state 离开 active / visibility 收紧 / grant 撤销 / 价格·execution·alias 变更)bump epoch,
- * 而**放宽类**(新 grant、新模型 staged→active)不 bump → 容器手里的投影少一行、epoch 却相等。
- * 这类漂移对安全无害(执行仍由服务端权威判定),拒了反而误伤正常 turn。真正的越权尝试
- * (伪造一个"更宽的" projectionRevision)本来就落不了库,也拿不到任何额外授权。
+ * **不一致即 409 拒绝并要求重开 turn**。0144 已让 grant/visibility/catalog/价格等所有会
+ * 改变投影或执行结论的写入同步 bump epoch，所以同一 fenced epoch 下合法投影必须一致；
+ * 继续放行只会掩盖容器旧投影或伪造 token。
  */
 async function recomputeProjectionRevision(a: {
   snapshot: ModelCatalogSnapshot;
   uid: bigint;
   claimed: string;
-  loadAuthz: (uid: bigint) => Promise<UserModelAuthz>;
+  authz: UserModelAuthz;
   logger: Logger;
 }): Promise<string> {
-  let authz: UserModelAuthz;
-  try {
-    authz = await a.loadAuthz(a.uid);
-  } catch (err) {
-    throw new ModelGateReject(
-      "catalog_unavailable",
-      `authz load failed for projection revision: ${(err as Error)?.message ?? String(err)}`,
-    );
-  }
   const computed = a.snapshot.projectionRevisionFor({
     uid: a.uid.toString(),
-    role: authz.role,
-    grantedModelIds: authz.grantedModelIds,
+    role: a.authz.role,
+    grantedModelIds: a.authz.grantedModelIds,
   });
   if (computed !== a.claimed) {
     a.logger.warn("local_catalog_projection_revision_mismatch", {
@@ -424,6 +431,10 @@ async function recomputeProjectionRevision(a: {
       computed: computed.slice(0, 12),
       securityEpoch: a.snapshot.securityEpoch.toString(),
     });
+    throw new ModelGateReject(
+      "config_changed",
+      "local catalog projection revision differs from the fenced server projection",
+    );
   }
   return computed;
 }
@@ -492,7 +503,7 @@ function verifyBridgeAuthority(a: {
   assertEpochMatches(BigInt(principal.securityEpoch), a.snapshot.securityEpoch, "bridge_signed");
 
   // executionRevision 只在完整 envelope 里有。相等 epoch 下它必然相等(execution 字段变更
-  // 一定 bump epoch,0135 trigger 保证)—— 不等 = 签发方与本进程有一方快照陈旧(R4-m6:
+  // 一定 bump epoch,0143 trigger 保证)—— 不等 = 签发方与本进程有一方快照陈旧(R4-m6:
   // "master 新 / egress 旧" 必须拒),按配置漂移处理。
   if (authority && authority.executionRevision !== a.snapshot.executionRevision) {
     throw new ModelGateReject(

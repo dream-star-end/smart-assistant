@@ -78,6 +78,8 @@ export interface LocalCatalogModel {
   readonly contextWindow: number | null
   readonly supportedEfforts: readonly string[]
   readonly supportsVision: boolean
+  readonly capabilityZero: boolean
+  readonly supportsThinking: boolean
   readonly defaultEffort: string | null
 }
 
@@ -394,6 +396,8 @@ interface WireRow {
   context_window: number | null
   supported_efforts: string[]
   supports_vision: boolean
+  capability_zero: boolean
+  supports_thinking: boolean
   default_effort: string | null
 }
 
@@ -401,17 +405,7 @@ interface WireResponse {
   models: WireRow[]
   projection_revision: string
   security_epoch: string
-  /**
-   * alias → canonical model_id(**可选**)。
-   *
-   * master 的 per-uid 投影端点(commercial `http/internalModelCatalog.ts`)当前**尚未**
-   * 下发该字段(WireCatalogResponse 只有 models/projection_revision/security_epoch),
-   * DB `model_aliases` 表在上线态也是空的 —— 故生产语义上 canonicalize 恒等于 identity,
-   * 与"gateway 历史上根本没有 alias 概念"完全一致(零行为变化)。
-   *
-   * 客户端先把消费面做齐(缺席 = 空 map,**不放宽**任何判定),master 侧一旦补上 aliases
-   * 就自然生效,不需要再动容器镜像。
-   */
+  /** alias → canonical model_id；旧 master 兼容期可缺席，缺席 = 空 map。 */
   aliases?: Record<string, string>
 }
 
@@ -430,6 +424,8 @@ function toWire(view: LocalCatalogView): WireResponse {
       context_window: m.contextWindow,
       supported_efforts: [...m.supportedEfforts],
       supports_vision: m.supportsVision,
+      capability_zero: m.capabilityZero,
+      supports_thinking: m.supportsThinking,
       default_effort: m.defaultEffort,
     })),
     projection_revision: view.projectionRevision,
@@ -457,6 +453,8 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
       typeof r.model_id !== 'string' ||
       (r.engine !== 'ccb' && r.engine !== 'codex') ||
       typeof r.supports_vision !== 'boolean' ||
+      typeof r.capability_zero !== 'boolean' ||
+      typeof r.supports_thinking !== 'boolean' ||
       !Array.isArray(r.supported_efforts)
     ) {
       throw new ModelCatalogUnavailableError('catalog row shape invalid')
@@ -469,6 +467,8 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
       contextWindow: typeof r.context_window === 'number' ? r.context_window : null,
       supportedEfforts: r.supported_efforts.filter((e): e is string => typeof e === 'string'),
       supportsVision: r.supports_vision,
+      capabilityZero: r.capability_zero,
+      supportsThinking: r.supports_thinking,
       defaultEffort: typeof r.default_effort === 'string' ? r.default_effort : null,
     }
   })

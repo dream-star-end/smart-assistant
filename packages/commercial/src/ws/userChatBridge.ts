@@ -409,7 +409,7 @@ export interface BridgeModelAuthorityDeps {
  *
  * 修法(与 catalog 同一条 fence 语义):
  *   - grants 快照带 **epoch 戳**(= 读 grants 之前观察到的 DB security epoch 的下界);
- *   - 0136 起任何 grant 写(含 DELETE)都 bump epoch;
+ *   - 0144 起任何 grant 写(含 DELETE)都 bump epoch;
  *   - 每个 turn 在 catalog epoch fence **之后**比对:checker.epoch < 权威 epoch → 说明
  *     期间发生过安全写(可能就是撤权)→ `reloadAtLeast(权威 epoch)` 同步重载并**重新判定**;
  *   - 重载失败 / 达不到目标 epoch → **拒帧**(禁止 keep-LKG 放行)。
@@ -418,7 +418,7 @@ export interface BridgeModelAuthorityDeps {
  * 收窄面(reloadAtLeast)一律 fail-closed。
  */
 export interface ModelCheckerHandle {
-  /** 已绑定本连接 uid+role+grants 的 sync 判定闭包。 */
+  /** 已绑定本连接 uid+DB role+grants+fenced visibility 的 sync 判定闭包。 */
   isAllowed: (modelId: string) => boolean;
   /** 当前 grants 快照的 epoch 下界(0 = 尚未观察到任何 epoch,视作最陈旧)。 */
   epoch: () => bigint;
@@ -444,8 +444,7 @@ const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
  *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
  * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
  *
- * `contextWindow` 的 null(catalog 未声明)映射为 0 —— protocol 载荷要求 safe integer,
- * 0 语义 = 「未声明」(容器当前不消费该字段;声明后由切片 5 的 spawn 侧使用)。
+ * `contextWindow` 的 null 原样进入签名载荷；0 不是合法窗口，不能拿哨兵值混淆语义。
  */
 function toProtocolDescriptor(
   d: import("../billing/modelCatalog.js").ModelExecutionDescriptor,
@@ -458,9 +457,13 @@ function toProtocolDescriptor(
         supported: [...profile.reasoning.supported],
         codexModelDefault: profile.reasoning.codexModelDefault,
       },
+      ccb: {
+        capabilityZero: profile.ccb.capabilityZero,
+        supportsThinking: profile.ccb.supportsThinking,
+      },
     },
     capabilitySchemaVersion: d.capabilitySchemaVersion,
-    contextWindow: d.contextWindow ?? 0,
+    contextWindow: d.contextWindow,
     supportedEfforts: [...profile.reasoning.supported],
     ...(profile.reasoning.codexModelDefault === null
       ? {}
@@ -474,6 +477,10 @@ interface ResolvedTurnExecution {
   canonicalModel: string;
   engine: ModelAuthorityEngine;
   descriptor: ModelExecutionDescriptor;
+  /** 与 descriptor / epoch 来自同一个 fenced snapshot generation 的原始模型价格。 */
+  pricing: ModelPricing;
+  /** 只进 journal/audit，不对容器暴露。 */
+  billingRevision: string;
   /** 该 turn 的平台次级模型放行集(见 billing/modelCatalog.ts platformAuxModels)。 */
   auxModels: string[];
   executionRevision: string;
@@ -501,11 +508,14 @@ async function resolveTurnExecution(
   const snapshot: ModelCatalogSnapshot = await catalog.assertFresh();
   const canonicalModel = snapshot.aliasToCanonical(modelIdOrAlias);
   const descriptor = snapshot.resolve(canonicalModel);
-  if (descriptor === null) throw new ModelNotAvailableError(modelIdOrAlias);
+  const pricing = snapshot.billingPricingFor(canonicalModel);
+  if (descriptor === null || pricing === null) throw new ModelNotAvailableError(modelIdOrAlias);
   return {
     canonicalModel: descriptor.canonicalModel,
     engine: descriptor.engine,
     descriptor: toProtocolDescriptor(descriptor),
+    pricing,
+    billingRevision: snapshot.billingRevision,
     // 次级模型只对 **ccb** 引擎有意义:CCB 的 WebFetch/WebSearch 等隐藏调用读
     // ANTHROPIC_SMALL_FAST_MODEL 打 anthropic proxy;codex turn 走 /internal/v3/codex-relay,
     // 根本不产生 `/v1/messages` —— 给它签 aux 只会白白撑大放行集合(最小权限)。
@@ -513,6 +523,71 @@ async function resolveTurnExecution(
     auxModels: descriptor.engine === "ccb" ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
+  };
+}
+
+/**
+ * journal 中的 server-owned 精确定价。BigInt 显式转十进制串，确保 JSON 可序列化；这里
+ * 持久化的是已复合 agent multiplier 的最终价格，所以跨 bridge 恢复时不能再查当前
+ * PricingCache / agent override（两者都可能已换 generation）。
+ */
+interface PersistedBillingPricingV1 {
+  v: 1;
+  modelId: string;
+  displayName: string;
+  inputPerMtok: string;
+  outputPerMtok: string;
+  cacheReadPerMtok: string;
+  cacheWritePerMtok: string;
+  multiplier: string;
+}
+
+function serializeBillingPricing(pricing: ModelPricing): PersistedBillingPricingV1 {
+  return {
+    v: 1,
+    modelId: pricing.model_id,
+    displayName: pricing.display_name,
+    inputPerMtok: pricing.input_per_mtok.toString(),
+    outputPerMtok: pricing.output_per_mtok.toString(),
+    cacheReadPerMtok: pricing.cache_read_per_mtok.toString(),
+    cacheWritePerMtok: pricing.cache_write_per_mtok.toString(),
+    multiplier: pricing.multiplier,
+  };
+}
+
+const BILLING_AMOUNT_RE = /^\d+$/;
+const BILLING_MULTIPLIER_RE = /^\d+(?:\.\d{1,3})?$/;
+
+/** 严格解析 journal 定价；任何畸形都返回 null，由 authority 恢复路径 fail-closed 免单。 */
+function parseBillingPricing(raw: unknown, expectedModel: string): ModelPricing | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const p = raw as Record<string, unknown>;
+  if (
+    p.v !== 1 ||
+    p.modelId !== expectedModel ||
+    typeof p.displayName !== "string" ||
+    typeof p.inputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.inputPerMtok) ||
+    typeof p.outputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.outputPerMtok) ||
+    typeof p.cacheReadPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheReadPerMtok) ||
+    typeof p.cacheWritePerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheWritePerMtok) ||
+    typeof p.multiplier !== "string" || !BILLING_MULTIPLIER_RE.test(p.multiplier)
+  ) {
+    return null;
+  }
+  return {
+    model_id: expectedModel,
+    display_name: p.displayName,
+    input_per_mtok: BigInt(p.inputPerMtok),
+    output_per_mtok: BigInt(p.outputPerMtok),
+    cache_read_per_mtok: BigInt(p.cacheReadPerMtok),
+    cache_write_per_mtok: BigInt(p.cacheWritePerMtok),
+    multiplier: p.multiplier,
+    enabled: true,
+    sort_order: 0,
+    visibility: "hidden",
+    extra_system_prompt: null,
+    default_effort: null,
+    updated_at: new Date(0),
   };
 }
 
@@ -613,8 +688,8 @@ export interface UserChatBridgeDeps {
    *   - 容器内 personal-version gateway 没有 commercial DB 连接,查不了 grants
    *   - HTTP message-create handler 在 v3 不存在(用户消息走 WS,不走 REST)
    *
-   * caller(commercial/index.ts)在 bridge 启动连接时**只调一次** loadAllowedModelChecker,
-   * 拿到一个**已绑定 uid+role+grants 集合**的纯同步 closure;后续每条 user→container
+   * caller(commercial/index.ts)在 bridge 启动连接时加载 checker，拿到一个**已绑定
+   * uid+DB role+grants+catalog visibility**的纯同步 closure;后续每条 user→container
    * 文本帧若是 inbound.message 且带 `model` 字段,就 sync 调一次 checker。返 false →
    * 桥发 error frame + close(1008),不把帧 forward 进容器(避免容器侧 inferAgentForModel
    * 错误信息泄漏 codex agent / config 状态;plan v3 §B4 review v3 补)。
@@ -630,7 +705,8 @@ export interface UserChatBridgeDeps {
    */
   loadAllowedModelChecker?: (
     uid: bigint,
-    role: "user" | "admin",
+    /** checker 必须至少绑定到该 security epoch；未启模型权威时为 undefined。 */
+    requiredEpoch?: bigint,
   ) => Promise<(modelId: string) => boolean>;
   /**
    * P0 计费旁路封堵(bridge 可信模型推导)—— master 侧 agent 权威:
@@ -943,6 +1019,9 @@ interface CodexTurnSnapshot {
   traceId: string;
   /** Opaque Codex API relay route token for this turn, if the turn used an API relay group. */
   codexRouteToken: string | null;
+  /** 计费留证；flag 未开的 legacy/shadow turn 为 null。 */
+  authority: import("../billing/proxyBilling.js").BillingAuthorityStamp | null;
+  authorityTurnId: string | null;
   /**
    * M2 — 首次调用用 billing 帧的 engineSessionId 构造 codexFinalizer 并 memoize
    * (同 handle 复用 → _done 幂等语义与旧"构造期单 finalizer"完全一致)。
@@ -1327,12 +1406,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         //   - 桥每 GRANTS_REFRESH_INTERVAL_MS ms 重新加载一次,使 admin 取消授权能
         //     在窗口内对**已开 ws 连接**生效(plan v3 review v1 §F4 follow-up)。
         //     refresh 失败保留上次 checker(**放宽面**的可用性取舍)。
-        //   - **epoch 联动(0136 / 代码审 R1 BLOCKER-1)**:周期刷新 + keep-LKG 对
+        //   - **epoch 联动(0144 / 代码审 R1 BLOCKER-1)**:周期刷新 + keep-LKG 对
         //     「撤权」是不够的 —— 见 ModelCheckerHandle 头注。
         let modelCheckerHandle: ModelCheckerHandle | null = null;
         if (deps.loadAllowedModelChecker) {
           const loader = deps.loadAllowedModelChecker;
-          const role = claims.role;
 
           // grants 快照的 epoch 戳 = **读 grants 之前**观察到的 DB epoch 的保守下界。
           //   · catalog 快照 epoch ≤ DB epoch(单调、只会落后)→ 用它盖戳只会盖低,不会盖高;
@@ -1353,7 +1431,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const startLoad = (minEpoch: bigint): Promise<void> => {
             const entry: { minEpoch: bigint; p: Promise<void> } = { minEpoch, p: Promise.resolve() };
             entry.p = (async () => {
-              const next = await loader(uid, role);
+              const next = await loader(uid, minEpoch === 0n ? undefined : minEpoch);
               applyLoad(minEpoch, next);
             })().finally(() => {
               if (loadInflight === entry) loadInflight = null;
@@ -1849,6 +1927,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const signAuthorityBundle = (
       exec: ResolvedTurnExecution,
       billingRequestId?: string,
+      authorityTurnId?: string,
     ): ModelAuthorityBundle => {
       if (authorityDeps === undefined || containerChallenge === null || containerId === undefined) {
         throw new Error(
@@ -1865,6 +1944,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         auxModels: exec.auxModels,
         executionRevision: exec.executionRevision,
         securityEpoch: exec.securityEpoch,
+        ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
         ...(billingRequestId === undefined ? {} : { billingRequestId }),
       }).bundle;
     };
@@ -1897,6 +1977,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const sealAuthorityFieldsOrReject = async (args: {
       exec: ResolvedTurnExecution;
       billingRequestId?: string;
+      authorityTurnId?: string;
       log: Logger | null;
       /** 拒帧时的补偿(abort journal / release preCheck / 还槽);无预扣的路径不传。 */
       compensate?: (reason: string) => Promise<void> | void;
@@ -1945,7 +2026,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // (还没补偿)"两种 null 语义混在一起 —— 正是漏账最爱的那种歧义。
       return {
         model: args.exec.canonicalModel,
-        [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(args.exec, args.billingRequestId),
+        [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(
+          args.exec,
+          args.billingRequestId,
+          args.authorityTurnId,
+        ),
       };
     };
 
@@ -2009,7 +2094,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // ── grants 授权快照的 epoch fence(代码审 R1 BLOCKER-1)────────────────
       // 上面 fence 的是 **catalog**(模型是否可执行);授权(visibility ∨ per-user grants)
       // 是**另一份**快照 —— 连接级 checker,原本只有 30s 周期刷新 + 刷新失败 keep-LKG。
-      // 0136 起任何 grant 写(尤其 DELETE = 撤权)都 bump security epoch,于是:
+      // 0144 起任何 grant 写(尤其 DELETE = 撤权)都 bump security epoch,于是:
       //   checker.epoch < 权威 epoch  ⟺  自本连接读 grants 之后发生过安全写
       //                                  (可能就是针对本用户的撤权)
       // → 同步重载 grants 并**用新快照重新判定**;重载失败 → 拒帧(**不 keep-LKG 放行**:
@@ -3107,7 +3192,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               const effectiveModel = effectiveModelCapture;
 
-              const modelPricing = pricingCache.get(effectiveModel);
+              // authority turn 的执行、授权、基础价格必须来自同一个 fenced snapshot；
+              // PricingCache 只服务 flag 关闭的 legacy 路径。
+              const modelPricing = authorityExec !== null
+                ? authorityExec.pricing
+                : pricingCache.get(effectiveModel);
               if (!modelPricing) {
                 // pricing 缓存 miss(authz 通过但 cache 未含此 model — race 窗口
                 // / DB 配置漂移)。fail-closed:不放行 codex turn,免漏扣。
@@ -3151,6 +3240,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               };
 
               const requestId = ensureRequestIdServerSide();
+              // 先铸 turnId 再落 journal；随后签票必须复用同一值，并把 billingRequestId
+              // 绑到 requestId。这样进程崩溃后只读 journal 也能复原“哪张票对应哪笔账”。
+              const authorityTurnId = authorityExec !== null
+                ? authorityDeps!.signer.mintAuthorityTurnId()
+                : null;
               let maxCost: bigint;
               try {
                 maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
@@ -3222,11 +3316,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         ? null
                         : accountIdForQuota.toString(),
                     source: "codex_bridge",
+                    // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
+                    // server-owned 快照，不能在结算时回读已换代的 cache/override。
+                    billingPricing: serializeBillingPricing(derivedPricing),
                     // P0 修复(2026-07-03)— 跨桥 settle 需要:billing 帧到达新桥
                     // (旧桥已关)时,journal ctx 是恢复 settle 的唯一权威上下文,
                     // traceId 让跨桥的 cost_charged 广播 / billing 日志仍钉回本
                     // turn 的 canonical trace。CG2c invariant 保证此处非 null。
                     traceId: turnTraceIdCapture,
+                    ...(authorityExec === null
+                      ? {}
+                      : {
+                          authorityKind: "bridge_signed",
+                          authorityTurnId,
+                          billingRequestId: requestId,
+                          executionRevision: authorityExec.executionRevision,
+                          billingRevision: authorityExec.billingRevision,
+                          securityEpoch: String(authorityExec.securityEpoch),
+                        }),
                   },
                 });
               } catch (err) {
@@ -3272,6 +3379,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // 这里读出来 TS 推断为 string。本 turn 整个生命周期内固定不可变。
                 traceId: turnTraceIdCapture,
                 codexRouteToken: codexRoute?.token ?? null,
+                authority: authorityExec === null
+                  ? null
+                  : {
+                      executionRevision: authorityExec.executionRevision,
+                      projectionRevision: null,
+                      securityEpoch: BigInt(authorityExec.securityEpoch),
+                      kind: "bridge_signed",
+                    },
+                authorityTurnId,
                 getFinalizer(engineSessionIdFromFrame: string): CodexFinalizeHandle | null {
                   if (snapState !== null) {
                     return snapState.kind === "handle" ? snapState.handle : null;
@@ -3285,6 +3401,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     model: effectiveModel,
                     derivedPricing,
                     reservation: reservationForTurn,
+                    authority: snap.authority,
                   });
                   snapState = { kind: "handle", handle };
                   return handle;
@@ -3315,6 +3432,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               };
               inflightCodexTurns.set(requestId, snap);
 
+              // 从 journal/map 注册完成起，到物理 forward 被本桥接受为止，任何 return/throw
+              // 都必须走同一补偿状态机。历史装配、签发、JSON 序列化、帧上限、socket 同步
+              // send 任一失败都不能把 journal / reservation / codex slot 留在半态。
+              let forwardCommitted = false;
+              let abandonReason = "codex_forward_not_committed";
+              try {
+
               // Frame rewrite:server-owned requestId 覆盖 client 任意值。容器侧
               // 把这个 requestId 透传到 outbound.codex_billing,master 用它从
               // inflightCodexTurns Map 找回 snapshot 落账。
@@ -3334,20 +3458,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 const sealed = await sealAuthorityFieldsOrReject({
                   exec: authorityExec,
                   billingRequestId: requestId,
+                  ...(authorityTurnId === null ? {} : { authorityTurnId }),
                   log: turnLogCapture,
-                  compensate: async (reason) => {
-                    inflightCodexTurns.delete(requestId);
-                    await snap.abandon(reason);
-                    releaseAcquiredSlotForFailure();
-                  },
+                  // seal 只报告拒因；真正的资源补偿统一由下方 finally 状态机执行。
+                  compensate: (reason) => { abandonReason = reason; },
                 });
-                if (sealed === null) return; // 已拒帧 + 已补偿
+                if (sealed === null) {
+                  return;
+                }
                 authorityFields = sealed;
               }
               if (cleaned) {
-                inflightCodexTurns.delete(requestId);
-                await snap.abandon("bridge_disconnect_before_forward").catch(() => {});
-                releaseAcquiredSlotForFailure();
+                abandonReason = "bridge_disconnect_before_forward";
                 return;
               }
               const rewrittenObj = {
@@ -3367,8 +3489,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 turnLogCapture?.error("user-chat-bridge: rewritten codex frame too big", {
                   rewrittenLen, max: maxFrameBytes,
                 });
-                inflightCodexTurns.delete(requestId);
-                snap.abandon("rewritten_frame_too_big").catch(() => {});
+                abandonReason = "rewritten_frame_too_big";
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                   sendErrorFrame(
                     userWs,
@@ -3377,13 +3498,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   );
                   try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
                 }
-                releaseAcquiredSlotForFailure();
                 return;
               }
               // ws lib RawData = Buffer | ArrayBuffer | Buffer[];string 不匹配。
               // 转 Buffer 走文本帧(isBinary=false)— 接收端 .toString() 行为一致。
               frameForwardData = Buffer.from(rewrittenStr, "utf8");
               frameForwardLen = rewrittenLen;
+              forwardCommitted = forwardInboundFrame(
+                frameForwardData,
+                frameForwardIsBinary,
+                frameForwardLen,
+              );
+              if (!forwardCommitted) abandonReason = "container_forward_rejected";
+              } finally {
+                if (!forwardCommitted) {
+                  inflightCodexTurns.delete(requestId);
+                  await snap.abandon(abandonReason).catch((err) => {
+                    turnLogCapture?.error(
+                      "user-chat-bridge: pre-forward billing compensation failed",
+                      { requestId, abandonReason, err },
+                    );
+                  });
+                  releaseAcquiredSlotForFailure();
+                }
+              }
+              return;
             } else {
               // CG2a — billing 未启用(legacy NULL 容器无三件套 / 测试)路径仍要 rewrite
               // 注入 traceId(合同硬门);不动 requestId(client 提供的 requestId 保留 raw)。
@@ -3583,7 +3722,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 不重复 frame size / authz / codex 单飞校验:那些必须在帧到达 onUserMessage 时
      * 立刻判定(同步上下文),已在调用本函数前完成。本函数只关心"放行后的物理转发"。
      */
-    function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): void {
+    function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): boolean {
       if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
       if (markActivity && containerId !== undefined) {
         const now = Date.now();
@@ -3602,17 +3741,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
           // backpressure → force final;一般无 inflight,即便有也异常态不 drain
           cleanup("backpressure", true);
-          return;
+          return false;
         }
         bufferedUC += len;
         metrics.onBufferedBytes?.(uid, "user_to_container", bufferedUC);
         preopenQueue.push({ data, isBinary, len });
-        return;
+        return true;
       }
-      sendToContainer(data, isBinary, len);
+      return sendToContainer(data, isBinary, len);
     }
 
-    const sendToContainer = (data: RawData, isBinary: boolean, len: number): void => {
+    const sendToContainer = (data: RawData, isBinary: boolean, len: number): boolean => {
       try {
         containerWs.send(data, { binary: isBinary }, (err) => {
           if (err) {
@@ -3621,11 +3760,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
         bytesUC += len;
         metrics.onUserFrame?.(uid, len, isBinary);
+        return true;
       } catch (err) {
         bridgeLog?.warn("user-chat-bridge: container send threw", { err });
         try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent send failed"); } catch { /* */ }
         // 容器 send 抛 = 容器 socket 已不可用,billing 帧也来不了 → force final
         cleanup("container_error", true);
+        return false;
       }
     };
 
@@ -4505,6 +4646,62 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             await abortInflightJournal(pgPool, requestId, reason).catch(() => {});
             await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
           };
+
+          // journal 的创建代次由**持久字段**裁决，不能看接收 billing 帧的这个新 bridge
+          // 当前 flag。否则 enable 后会把存量 legacy journal 当 authority 拒掉；disable 后又会
+          // 把存量 authority journal 当 legacy，用新 PricingCache 结算另一代价格。
+          const journalAuthority = ctx.authorityKind === "bridge_signed";
+          const authorityMetadataPresent = [
+            "authorityTurnId",
+            "billingRequestId",
+            "executionRevision",
+            "billingRevision",
+            "securityEpoch",
+          ].some((key) => Object.prototype.hasOwnProperty.call(ctx, key));
+          if (
+            (ctx.authorityKind !== undefined && !journalAuthority) ||
+            (!journalAuthority && authorityMetadataPresent)
+          ) {
+            billingLog?.error(
+              "user-chat-bridge: cross-bridge journal authority classification invalid — waiving turn",
+              { authorityKind: ctx.authorityKind },
+            );
+            await waive("cross_bridge_authority_classification_invalid");
+            return;
+          }
+
+          let recoveredAuthority: import("../billing/proxyBilling.js").BillingAuthorityStamp | null = null;
+          if (journalAuthority) {
+            const bindingOk =
+              typeof ctx.authorityTurnId === "string" &&
+              /^[0-9a-f]{32}$/.test(ctx.authorityTurnId) &&
+              ctx.billingRequestId === requestId &&
+              typeof ctx.executionRevision === "string" &&
+              /^[0-9a-f]{64}$/.test(ctx.executionRevision) &&
+              typeof ctx.billingRevision === "string" &&
+              /^[0-9a-f]{64}$/.test(ctx.billingRevision) &&
+              typeof ctx.securityEpoch === "string" &&
+              /^\d+$/.test(ctx.securityEpoch);
+            if (!bindingOk) {
+              bridgeLog?.error(
+                "user-chat-bridge: cross-bridge journal authority binding invalid — waiving turn",
+                { requestId },
+              );
+              await abortInflightJournal(
+                pgPool,
+                requestId,
+                "cross_bridge_authority_binding_invalid",
+              ).catch(() => {});
+              await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
+              return;
+            }
+            recoveredAuthority = {
+              executionRevision: ctx.executionRevision as string,
+              projectionRevision: null,
+              securityEpoch: BigInt(ctx.securityEpoch as string),
+              kind: "bridge_signed",
+            };
+          }
           if (frame.engineSid === null) {
             billingLog?.error("user-chat-bridge: cross-bridge codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
               engineSessionId: typeof frame.engineSidRaw === "string"
@@ -4519,31 +4716,57 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             await waive("cross_bridge_journal_ctx_model_missing");
             return;
           }
-          const modelPricing = pricingCache.get(model);
-          if (!modelPricing) {
-            billingLog?.error("user-chat-bridge: cross-bridge codex_billing pricing missing — waiving turn", {
-              model,
-            });
-            await waive("cross_bridge_pricing_missing");
+          let derivedPricing = parseBillingPricing(ctx.billingPricing, model);
+          if (derivedPricing === null && journalAuthority) {
+            // authority journal 缺/坏精确定价时绝不回退异步 cache：那会把同一笔 turn
+            // 跨到另一 billing generation。钱安全方向取免单 + 响亮日志。
+            billingLog?.error(
+              "user-chat-bridge: cross-bridge authority billing pricing invalid — waiving turn",
+              { model, billingRevision: ctx.billingRevision },
+            );
+            await waive("cross_bridge_authority_billing_pricing_invalid");
             return;
           }
-          let agentMul: string;
-          try {
-            agentMul = await getAgentCostMultiplier(pgPool, agentId);
-          } catch (err) {
-            // 瞬态 DB 错误:**不** abort —— journal 保持 inflight,reconciler 兜底
-            // 终态化(与"桥断不 abort 存活 turn"同一裁决权归属),不把临时故障
-            // 固化成免单。
-            billingLog?.error("user-chat-bridge: cross-bridge getAgentCostMultiplier failed — journal left inflight for reconciler", {
-              agentId,
-              err: (err as Error)?.message,
-            });
+          if (derivedPricing === null && ctx.billingPricing !== undefined) {
+            // 本版本起 legacy journal 也会持久化最终价格；字段存在但畸形说明 journal
+            // 已损坏，不能伪装成“上线前旧 journal”回退当前 cache。只有字段完全缺失的
+            // pre-deployment legacy 行保留兼容回退。
+            billingLog?.error(
+              "user-chat-bridge: cross-bridge persisted billing pricing invalid — waiving turn",
+              { model },
+            );
+            await waive("cross_bridge_billing_pricing_invalid");
             return;
           }
-          const derivedPricing: ModelPricing = {
-            ...modelPricing,
-            multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
-          };
+          if (derivedPricing === null) {
+            // 仅兼容本版本上线前遗留、完全没有 billingPricing 字段的 legacy inflight
+            // journal；新 journal（含 legacy）都持久化最终价格，不会走这条分支。
+            const modelPricing = pricingCache.get(model);
+            if (!modelPricing) {
+              billingLog?.error("user-chat-bridge: cross-bridge codex_billing pricing missing — waiving turn", {
+                model,
+              });
+              await waive("cross_bridge_pricing_missing");
+              return;
+            }
+            let agentMul: string;
+            try {
+              agentMul = await getAgentCostMultiplier(pgPool, agentId);
+            } catch (err) {
+              // 瞬态 DB 错误:**不** abort —— journal 保持 inflight,reconciler 兜底
+              // 终态化(与"桥断不 abort 存活 turn"同一裁决权归属),不把临时故障
+              // 固化成免单。
+              billingLog?.error("user-chat-bridge: cross-bridge getAgentCostMultiplier failed — journal left inflight for reconciler", {
+                agentId,
+                err: (err as Error)?.message,
+              });
+              return;
+            }
+            derivedPricing = {
+              ...modelPricing,
+              multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
+            };
+          }
           // rateLimits piggyback(best-effort,与主路径同语义;accountId 权威取
           // journal ctx.codexAccountId —— null = legacy / api_relay 无关联账号)。
           if (frame.billingRl && typeof frame.billingRl === "object") {
@@ -4574,6 +4797,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             model,
             derivedPricing,
             reservation,
+            authority: recoveredAuthority,
           });
           const result = await finalizer.commit(
             frame.usage, frame.codexStatus, frame.errorReason,

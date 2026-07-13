@@ -37,6 +37,14 @@ function urlStringWithProtocols(allowedProtocols: ReadonlyArray<string>, field: 
 }
 
 const databaseUrl = urlStringWithProtocols(["postgres:", "postgresql:"], "DATABASE_URL");
+const modelCatalogAdminDatabaseUrl = urlStringWithProtocols(
+  ["postgres:", "postgresql:"],
+  "MODEL_CATALOG_ADMIN_DATABASE_URL",
+).optional();
+const modelAuthorityDeployDatabaseUrl = urlStringWithProtocols(
+  ["postgres:", "postgresql:"],
+  "MODEL_AUTHORITY_DEPLOY_DATABASE_URL",
+).optional();
 const redisUrl = urlStringWithProtocols(["redis:", "rediss:"], "REDIS_URL");
 
 /**
@@ -410,6 +418,10 @@ const wechatBrokerEnabled = z.enum(["0", "1"]).optional().transform((v) => v ===
 export const commercialConfigSchema = z
   .object({
     DATABASE_URL: databaseUrl,
+    /** catalog admin API 专用低权角色；模型权威开启时由启动装配强制要求。 */
+    MODEL_CATALOG_ADMIN_DATABASE_URL: modelCatalogAdminDatabaseUrl,
+    /** 仅 deploy-v5.sh 观察/割接使用；运行时不会打开此连接。 */
+    MODEL_AUTHORITY_DEPLOY_DATABASE_URL: modelAuthorityDeployDatabaseUrl,
     REDIS_URL: redisUrl,
     COMMERCIAL_ENABLED: enabledFlag,
     /**

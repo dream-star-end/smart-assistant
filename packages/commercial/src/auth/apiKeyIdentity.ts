@@ -48,6 +48,7 @@ import {
 import { type ApiKeyRepo, hashApiKeySecret } from "./apiKeyRepo.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { Logger } from "../logging/logger.js";
+import type { UserModelAuthzLoader } from "./userModelAuthz.js";
 
 /** 5 分钟。SSE 长连接 + 频繁 /v1/messages 高峰下,这是 last_used_at 节流窗口。 */
 const TOUCH_THROTTLE_MS = 5 * 60 * 1000;
@@ -61,12 +62,7 @@ export interface ApiKeyIdentityStrategyDeps {
   /** 价格表 — 共享 authz 用 */
   pricing: PricingCache;
   /** 服务端权威源 role + grants */
-  loadUserModelAuthz: (
-    uid: bigint,
-  ) => Promise<{
-    role: "user" | "admin";
-    grantedModelIds: ReadonlySet<string>;
-  }>;
+  loadUserModelAuthz: UserModelAuthzLoader;
   /**
    * `touchLastUsed` 失败时的 best-effort 日志。
    * Production 注入 strategy 装配处 logger;测试可注入 spy / no-op。
@@ -266,13 +262,14 @@ export function makeApiKeyIdentityStrategy(
       return { uid: row.userId, containerId: null };
     },
 
-    async authorize(identity, _pricing, model) {
+    async authorize(identity, _pricing, model, requiredEpoch) {
       // 共享 authz 业务规则(plan §3.2.3 + Phase 2 Codex):任何 strategy
       // 走同一份 loadUserModelAuthz + canUseModel,authz 不允许分裂。
       await authorizeProxyIdentity(
         { pricing: deps.pricing, loadUserModelAuthz: deps.loadUserModelAuthz },
         identity,
         model,
+        requiredEpoch,
       );
     },
   };

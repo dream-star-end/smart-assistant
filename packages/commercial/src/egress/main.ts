@@ -190,6 +190,7 @@ export async function startEgress(): Promise<void> {
     preCheckRedis,
     scheduler,
     identity: identityStrategy,
+    loadUserModelAuthz,
     rateLimitRedis,
     modelCatalog,
     modelAuthorityEnforce,

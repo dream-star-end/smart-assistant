@@ -51,7 +51,7 @@ import type { UsageObservation } from "../http/proxy/shared.js";
 // ─── finalizer(single-shot + journal) ────────────────────────────────────
 
 /**
- * 模型权威留证(0135 usage_records 四列;方案 §4 / R3-m11)。
+ * 模型权威留证(0143 usage_records 四列;方案 §4 / R3-m11)。
  *
  * 语义:这一笔钱是**按哪个执行快照、哪个安全 epoch、凭哪类权威**扣的。
  *   - `bridge_signed`  = 浏览器 turn,凭 master Ed25519 签名的 authority/lease;
@@ -119,7 +119,7 @@ export interface FinalizeContext {
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
   /**
-   * 模型权威留证(0135 四列)。null / 缺省 = gate 未生效 → 四列写 NULL。
+   * 模型权威留证(0143 四列)。null / 缺省 = gate 未生效 → 四列写 NULL。
    * handler(http/proxy/index.ts)从每请求 gate 结果透传;codexFinalizer 等其它 settle
    * 调用方不传 → 行为与本批次之前一致。
    */
@@ -170,10 +170,10 @@ interface FinalizeDeps {
 export async function startInflightJournal(
   pool: Pool,
   ctx: Pick<FinalizeContext, "requestId" | "userId" | "containerId" | "model" | "precheckCredits"> & {
-    /** PR2 v1.0.66 — codex 路径透传 {agentId, codexAccountId, source} 到 ctx JSONB,
-     *  reconciler 重跑 / 排障可从 journal 复原 codex turn 上下文。anthropic 路径不传,
-     *  保持现状(默认 ctx 只含 model)。**注意**:settle 时不信 ctxJson(以本地 Map
-     *  snapshot 为准),ctxJson 只服务 reconciler / audit。 */
+    /** PR2 v1.0.66 — codex 路径透传 agent/account/source 到 ctx JSONB，reconciler
+     *  重跑 / 排障可复原 turn 上下文。模型权威开启后还会持久化 server-owned 的精确
+     *  billing pricing；跨 bridge settle 必须消费它，不能回读另一代异步缓存。普通同桥
+     *  settle 仍以本地 inflight Map 中的 pricing 为准。anthropic 路径默认只含 model。 */
     ctxJson?: Record<string, unknown>;
   },
 ): Promise<void> {
@@ -514,7 +514,7 @@ export async function settleUsageAndLedger(
     parentSessionId?: string | null;
     delegateAgentId?: string | null;
     /**
-     * 模型权威留证(0135 四列;方案 §4)。缺省/null → 四列写 NULL —— codexFinalizer、
+     * 模型权威留证(0143 四列;方案 §4)。缺省/null → 四列写 NULL —— codexFinalizer、
      * 旧测试、影子期的 CCB 路径都不传,落库形状与本批次之前完全一致。
      */
     authority?: BillingAuthorityStamp | null;
@@ -562,7 +562,7 @@ export async function settleUsageAndLedger(
           args.status,
           // org 语境即打戳(orgCtx 非空),不受 billing_enabled 影响。
           orgCtx?.orgId ?? null,
-          // 0135 模型权威留证(不适用置 NULL)。BIGINT 列用十进制字符串绑,避免 JS number 丢精度。
+          // 0143 模型权威留证(不适用置 NULL)。BIGINT 列用十进制字符串绑,避免 JS number 丢精度。
           args.authority?.executionRevision ?? null,
           args.authority?.projectionRevision ?? null,
           args.authority ? args.authority.securityEpoch.toString() : null,

@@ -42,6 +42,8 @@ const CATALOG_BODY = {
       context_window: 1_000_000,
       supported_efforts: ['high', 'max'],
       supports_vision: false,
+      capability_zero: true,
+      supports_thinking: true,
       default_effort: 'high',
     },
     {
@@ -52,11 +54,14 @@ const CATALOG_BODY = {
       context_window: null,
       supported_efforts: ['low', 'high'],
       supports_vision: false,
+      capability_zero: false,
+      supports_thinking: false,
       default_effort: null,
     },
   ],
   projection_revision: 'proj-rev-1',
   security_epoch: '5',
+  aliases: { 'glm-latest': 'glm-5.2' },
 }
 
 interface Call {

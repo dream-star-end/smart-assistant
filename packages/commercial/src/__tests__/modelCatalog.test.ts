@@ -39,6 +39,7 @@ function entry(over: Partial<ModelCatalogEntry> & Pick<ModelCatalogEntry, "entry
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",
@@ -87,6 +88,7 @@ const SOL = entry({
   capabilityProfile: {
     supportsVision: false,
     reasoning: { supported: ["low", "medium", "high", "xhigh", "max"], codexModelDefault: "xhigh" },
+    ccb: { capabilityZero: false, supportsThinking: false },
   },
 });
 
@@ -152,6 +154,7 @@ describe("executionRevision", () => {
           capabilityProfile: {
             supportsVision: false,
             reasoning: { supported: ["low", "medium", "high", "max"], codexModelDefault: null },
+            ccb: { capabilityZero: true, supportsThinking: true },
           },
         }),
       ],
@@ -244,6 +247,44 @@ describe("视图 API", () => {
     assert.equal(s.isRoutable("glm-latest"), true);
     assert.equal(s.resolve("glm-latest")?.canonicalModel, "glm-5.2");
   });
+
+  test("billingPricingFor 从同一快照精确投影价格(alias 也归一)", () => {
+    const loadedAt = new Date("2026-07-13T12:34:56.000Z");
+    const s = new ModelCatalogSnapshot({
+      entries: [GLM],
+      aliases: new Map([["glm-latest", 1]]),
+      pricing: new Map([["glm-5.2", price("glm-5.2", {
+        displayName: "GLM 5.2",
+        inputPerMtok: 123n,
+        outputPerMtok: 456n,
+        cacheReadPerMtok: 7n,
+        cacheWritePerMtok: 8n,
+        multiplier: "1.250",
+        visibility: "hidden",
+        sortOrder: 42,
+        defaultEffort: "max",
+      })]]),
+      securityEpoch: 9n,
+      loadedAt,
+    });
+
+    assert.deepEqual(s.billingPricingFor("glm-latest"), {
+      model_id: "glm-5.2",
+      display_name: "GLM 5.2",
+      input_per_mtok: 123n,
+      output_per_mtok: 456n,
+      cache_read_per_mtok: 7n,
+      cache_write_per_mtok: 8n,
+      multiplier: "1.250",
+      enabled: true,
+      sort_order: 42,
+      visibility: "hidden",
+      extra_system_prompt: null,
+      default_effort: "max",
+      updated_at: loadedAt,
+    });
+    assert.equal(s.billingPricingFor("unknown"), null);
+  });
 });
 
 // ─── listForUser + projectionRevision ────────────────────────────────────
@@ -263,8 +304,14 @@ describe("per-uid 投影", () => {
   const ids = (rows: Array<{ modelId: string }>): string[] => rows.map((r) => r.modelId);
 
   test("visibility 默认范围 OR 显式 grants(与 authzModels 同源)", () => {
+    const user = { uid: 1, role: "user" as const, grantedModelIds: new Set<string>() };
+    const admin = { uid: 1, role: "admin" as const, grantedModelIds: new Set<string>() };
+    assert.equal(s.canUseModel(user, "pub-model"), true);
+    assert.equal(s.canUseModel(user, "admin-model"), false);
+    assert.equal(s.canUseModel(admin, "admin-model"), true);
+    assert.equal(s.canUseModel(admin, "hidden-model"), false);
     assert.deepEqual(
-      ids(s.listForUser({ uid: 1, role: "user", grantedModelIds: new Set() })),
+      ids(s.listForUser(user)),
       ["pub-model"],
     );
     assert.deepEqual(
@@ -316,6 +363,7 @@ describe("parseCapabilityProfile", () => {
     const p = parseCapabilityProfile("m", {
       supports_vision: true,
       reasoning: { supported: ["high", "max"], codex_model_default: null },
+      ccb: { capability_zero: false, supports_thinking: true },
     });
     assert.equal(p.supportsVision, true);
     assert.deepEqual(p.reasoning.supported, ["high", "max"]);

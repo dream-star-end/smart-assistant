@@ -843,7 +843,7 @@ export function createCommercialHandler(
     // 0106 轻量在飞快照(前端 30s 轮询)
     { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
-    // 0135 模型 catalog 状态机(方案 §7 步 5:staged→active→disabled + 版本切换)。
+    // 0143 模型 catalog 状态机(方案 §7 步 5:staged→active→disabled + 版本切换)。
     // exact(list/create)必须排在 prefix(switch / :id/activate / :id/disable)之前。
     { method: 'GET', path: '/api/admin/model-catalog', handler: handleAdminListModelCatalog },
     { method: 'POST', path: '/api/admin/model-catalog', handler: handleAdminCreateModelCatalogEntry },

@@ -440,6 +440,7 @@ export interface LocalExecutionDecision {
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
   readonly engine: 'ccb' | 'codex'
+  readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
 }
@@ -480,12 +481,13 @@ export function decideLocalExecution(args: {
     if (typeof raw !== 'string' || raw === '') continue
     const canonicalModel = view.canonicalize(raw)
     if (!view.isRoutable(canonicalModel)) continue // 未 active / 未授权 / 未知 → 下一档
-    const engine = view.resolve(canonicalModel)?.engine
-    if (engine === undefined) continue
-    if (engine !== 'codex') return { canonicalModel, engine }
+    const descriptor = view.resolve(canonicalModel)
+    const engine = descriptor?.engine
+    if (engine === undefined || descriptor == null) continue
+    if (engine !== 'codex') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
 
     // codex 意图(engine 取自投影,不看 baked)。
-    if (kind === 'prewarm') return { canonicalModel, engine }
+    if (kind === 'prewarm') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
     if (kind === 'turn') {
       throw new LocalExecutionRejected(
         'DELEGATE_CODEX_UNSUPPORTED',
@@ -526,9 +528,10 @@ function downgradeSyntheticCodex(
     if (typeof raw !== 'string' || raw === '') continue
     const canonicalModel = view.canonicalize(raw)
     if (!view.isRoutable(canonicalModel)) continue
-    const engine = view.resolve(canonicalModel)?.engine
-    if (engine !== 'ccb') continue // 兜底自身是 codex → 忽略(防"把 bug 换个门再引入")
-    return { canonicalModel, engine, downgradedFrom: from }
+    const descriptor = view.resolve(canonicalModel)
+    const engine = descriptor?.engine
+    if (engine !== 'ccb' || descriptor == null) continue // 兜底自身是 codex → 忽略
+    return { canonicalModel, engine, supportsVision: descriptor.supportsVision, downgradedFrom: from }
   }
   throw new LocalExecutionRejected(
     'MODEL_NOT_AVAILABLE',
@@ -615,7 +618,10 @@ export function collectAvailableMcpToolNames(
   config: OpenClaudeConfig,
   agent?: AgentDef,
   model?: string,
-  opts: { resolveVisionEntry?: (claudeCodePath?: string) => string | null } = {},
+  opts: {
+    resolveVisionEntry?: (claudeCodePath?: string) => string | null
+    modelSupportsVision?: boolean
+  } = {},
 ): string[] {
   const tools = new Set<string>()
   const effectiveProvider = agent?.provider ?? config.provider
@@ -640,7 +646,11 @@ export function collectAvailableMcpToolNames(
 
   const resolveVisionEntry = opts.resolveVisionEntry ?? resolveOpenClaudeVisionEntry
   if (
-    shouldEnableOpenClaudeVision(effectiveProvider, effectiveModel) &&
+    shouldEnableOpenClaudeVision(
+      effectiveProvider,
+      effectiveModel,
+      opts.modelSupportsVision,
+    ) &&
     resolveVisionEntry(config.auth.claudeCodePath)
   ) {
     // bypassToolset=true:vision 是内置平台工具,豁免 toolset 过滤(与 subprocessRunner 注入侧一致;
@@ -4012,7 +4022,15 @@ export class Gateway {
       return
     }
     const model = body.model
-    if (model !== undefined && (typeof model !== 'string' || !ALLOWED_INBOUND_MODELS.has(model))) {
+    const modelAllowedByShape =
+      typeof model === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(model)
+    if (
+      model !== undefined &&
+      (typeof model !== 'string' ||
+        (isModelAuthorityRequired()
+          ? !modelAllowedByShape
+          : !ALLOWED_INBOUND_MODELS.has(model)))
+    ) {
       this.sendJson(res, 400, { error: 'model unsupported for inbound dispatch' })
       return
     }
@@ -11298,7 +11316,12 @@ export class Gateway {
 
     let finalText = text
     if (savedMedia.length > 0) {
-      const activeMcpTools = collectAvailableMcpToolNames(this.deps.config, effectiveAgent, safeModel)
+      const activeMcpTools = collectAvailableMcpToolNames(
+        this.deps.config,
+        effectiveAgent,
+        safeModel,
+        { modelSupportsVision: turnAuthority?.supportsVision ?? localExec?.supportsVision },
+      )
       const hasUnderstandImage = activeMcpTools.includes('understand_image')
 
       const images = savedMedia.filter((m) => m.kind === 'image')
@@ -11845,6 +11868,18 @@ export class Gateway {
             modelAuthority: {
               authorityEnvelope: turnAuthority.authorityEnvelope,
               leaseEnvelope: turnAuthority.leaseEnvelope,
+              executionDescriptor: {
+                canonicalModel: turnAuthority.canonicalModel,
+                contextWindow: turnAuthority.contextWindow,
+                capabilityZero:
+                  (turnAuthority.capabilityProfile.ccb as { capabilityZero?: unknown } | undefined)
+                    ?.capabilityZero === true,
+                supportsThinking:
+                  (turnAuthority.capabilityProfile.ccb as { supportsThinking?: unknown } | undefined)
+                    ?.supportsThinking === true,
+                supportsVision: turnAuthority.supportsVision,
+                supportedEfforts: [...turnAuthority.supportedEfforts],
+              },
             },
           }
         : {}),

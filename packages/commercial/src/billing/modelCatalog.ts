@@ -1,10 +1,10 @@
 /**
  * 模型权威批次 · 切片 1 — ModelExecutionCatalog 快照层。
- * 方案:docs/V5_MODEL_AUTHORITY_PLAN.md §1.2 / §2 / §6。DB 层:migrations/0135_model_catalog.sql。
+ * 方案:docs/V5_MODEL_AUTHORITY_PLAN.md §1.2 / §2 / §6。DB 层:migrations/0143_model_catalog.sql。
  *
  * 单一权威:
  *   - **可执行性(engine / provider / upstream / context / capability / 可用性)= model_catalog**。
- *     `model_pricing.enabled` 自 0135 起是 catalog 的派生镜像(为旧 master 回滚而留),
+ *     `model_pricing.enabled` 自 0143 起是 catalog 的派生镜像(为旧 master 回滚而留),
  *     本模块与 pricing.ts **一律不读镜像列**,而是直接从 catalog.state 派生 —— 镜像即使
  *     被外力写歪,v5 运行时判定也不受影响。
  *   - 价格 / visibility / default_effort 仍在 model_pricing(catalog 只管 execution)。
@@ -37,7 +37,7 @@ import {
 import { loadConfig } from "../config.js";
 import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
-import type { ModelVisibility } from "./pricing.js";
+import type { ModelPricing, ModelVisibility } from "./pricing.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型
@@ -54,7 +54,7 @@ export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
  */
 export const CAPABILITY_SCHEMA_VERSION = 1;
 
-/** capability_profile(JSONB)的 v1 形状 —— 与 0135 fn_model_catalog_capability 同源。 */
+/** capability_profile(JSONB)的 v1 形状 —— 与 0143 fn_model_catalog_capability 同源。 */
 export interface ModelCapabilityProfile {
   /** 上游是否原生支持图像识别。false → master proxy strip 图 + understand_image 工具兜底。 */
   supportsVision: boolean;
@@ -63,6 +63,11 @@ export interface ModelCapabilityProfile {
     supported: readonly PlatformReasoningEffort[];
     /** 仅 codex 型号有值;用户未覆盖时 runner 必须沿用它。 */
     codexModelDefault: PlatformReasoningEffort | null;
+  };
+  /** CCB 本地曾经 baked 的执行开关；权威化后随 descriptor 每 turn 下发。 */
+  ccb: {
+    capabilityZero: boolean;
+    supportsThinking: boolean;
   };
 }
 
@@ -124,6 +129,8 @@ export interface ModelProjectionRow {
   contextWindow: number | null;
   supportedEfforts: readonly string[];
   supportsVision: boolean;
+  capabilityZero: boolean;
+  supportsThinking: boolean;
   defaultEffort: string | null;
   sortOrder: number;
 }
@@ -272,11 +279,25 @@ export function parseCapabilityProfile(modelId: string, raw: unknown): ModelCapa
   if (def !== null && (typeof def !== "string" || !EFFORT_SET.has(def))) {
     throw new TypeError(`model ${modelId}: invalid codex_model_default ${String(def)}`);
   }
+  const ccb = obj.ccb as Record<string, unknown> | undefined;
+  if (
+    !ccb ||
+    typeof ccb !== "object" ||
+    Array.isArray(ccb) ||
+    typeof ccb.capability_zero !== "boolean" ||
+    typeof ccb.supports_thinking !== "boolean"
+  ) {
+    throw new TypeError(`model ${modelId}: capability_profile.ccb must declare capability_zero/supports_thinking`);
+  }
   return {
     supportsVision: vision,
     reasoning: {
       supported,
       codexModelDefault: (def as PlatformReasoningEffort | null) ?? null,
+    },
+    ccb: {
+      capabilityZero: ccb.capability_zero,
+      supportsThinking: ccb.supports_thinking,
     },
   };
 }
@@ -426,6 +447,36 @@ export class ModelCatalogSnapshot {
   }
 
   /**
+   * 把**本次 fenced catalog 快照**里的价格投影成既有计费器消费的形状。
+   *
+   * 模型权威开启后,授权、执行描述符与价格必须来自同一个 snapshot generation；调用方
+   * 不得在 gate 通过后再回读异步 `PricingCache`，否则改价 NOTIFY 延迟时会出现“新授权、
+   * 旧价格”的跨 generation 结算。返回新对象，避免计费侧改写快照里的不可变投影。
+   */
+  billingPricingFor(modelIdOrAlias: string): ModelPricing | null {
+    const canonical = this.aliasToCanonical(modelIdOrAlias);
+    if (!this.isRoutable(canonical)) return null;
+    const p = this.pricing.get(canonical);
+    if (!p) return null;
+    return {
+      model_id: p.modelId,
+      display_name: p.displayName,
+      input_per_mtok: p.inputPerMtok,
+      output_per_mtok: p.outputPerMtok,
+      cache_read_per_mtok: p.cacheReadPerMtok,
+      cache_write_per_mtok: p.cacheWritePerMtok,
+      multiplier: p.multiplier,
+      enabled: true,
+      sort_order: p.sortOrder,
+      visibility: p.visibility,
+      // 这两个字段不参与金额计算；仍给出完整 ModelPricing 形状，避免另造计费 DTO。
+      extra_system_prompt: null,
+      default_effort: p.defaultEffort,
+      updated_at: this.loadedAt,
+    };
+  }
+
+  /**
    * canonical id → 完整 execution descriptor(签名 envelope 的载荷)。
    * 不可路由 → null;capability schema 未来版本 → 抛 UnknownCapabilitySchemaError(fail-closed,
    * 与"未知模型 → null"区分开:前者是配置事故,必须响亮)。
@@ -462,6 +513,24 @@ export class ModelCatalogSnapshot {
   }
 
   /**
+   * fenced 快照内的最终模型授权判定。visibility 与 role/grants 必须和 securityEpoch
+   * 来自同一次安全版本；执行面不能再回读异步 PricingCache，否则 public→hidden 时会
+   * 在 pricing reload 失败后无限沿用旧 public 结论。
+   */
+  canUseModel(scope: UserModelScope, modelIdOrAlias: string): boolean {
+    const canonical = this.aliasToCanonical(modelIdOrAlias);
+    if (!this.isRoutable(canonical)) return false;
+    const p = this.pricing.get(canonical);
+    if (!p) return false;
+    return (
+      p.visibility === "public" ||
+      (p.visibility === "admin" &&
+        (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
+      (p.visibility === "hidden" && scope.grantedModelIds.has(canonical))
+    );
+  }
+
+  /**
    * per-uid 可见模型投影(§6:active && (public ∨ granted))。
    * 语义与 pricing.listForUser / authzModels.canUseModel 同源:visibility 的默认范围 OR 显式 grants。
    * 不可路由(无价 / capability 未来版本)的行**不出现**在投影里(fail-closed,不给用户看到选不了的模型)。
@@ -472,12 +541,7 @@ export class ModelCatalogSnapshot {
       if (!this.isRoutable(e.modelId)) continue;
       const p = this.pricing.get(e.modelId);
       if (!p) continue;
-      const visible =
-        p.visibility === "public" ||
-        (p.visibility === "admin" &&
-          (scope.role === "admin" || scope.grantedModelIds.has(e.modelId))) ||
-        (p.visibility === "hidden" && scope.grantedModelIds.has(e.modelId));
-      if (!visible) continue;
+      if (!this.canUseModel(scope, e.modelId)) continue;
       rows.push({
         modelId: e.modelId,
         displayName: p.displayName,
@@ -486,6 +550,8 @@ export class ModelCatalogSnapshot {
         contextWindow: e.contextWindow,
         supportedEfforts: e.capabilityProfile.reasoning.supported,
         supportsVision: e.capabilityProfile.supportsVision,
+        capabilityZero: e.capabilityProfile.ccb.capabilityZero,
+        supportsThinking: e.capabilityProfile.ccb.supportsThinking,
         defaultEffort: p.defaultEffort,
         sortOrder: p.sortOrder,
       });
@@ -507,6 +573,8 @@ export class ModelCatalogSnapshot {
       contextWindow: r.contextWindow,
       supportedEfforts: [...r.supportedEfforts],
       supportsVision: r.supportsVision,
+      capabilityZero: r.capabilityZero,
+      supportsThinking: r.supportsThinking,
       defaultEffort: r.defaultEffort,
     }));
     return sha256Hex(canonicalJson({ v: 1, uid: String(scope.uid), models: rows }));
@@ -515,6 +583,17 @@ export class ModelCatalogSnapshot {
   /** 全部 active 行(用于 seed 校验 / admin 视图)。 */
   activeModelIds(): string[] {
     return [...this.activeByModel.keys()].sort();
+  }
+
+  /** 只下发指向该 uid 可见投影行的 alias，避免通过别名泄露 hidden 型号。 */
+  aliasesForUser(scope: UserModelScope): Record<string, string> {
+    const visible = new Set(this.listForUser(scope).map((row) => row.modelId));
+    const out: Record<string, string> = {};
+    for (const [alias, entryId] of this.aliases) {
+      const canonical = this.byEntryId.get(entryId)?.modelId;
+      if (canonical && visible.has(canonical)) out[alias] = canonical;
+    }
+    return out;
   }
 }
 
@@ -673,7 +752,7 @@ export async function assertEpochFresh(
 // 进程级缓存 + NOTIFY(复用 pricing.ts 的 LISTEN 基建形状)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** epoch 变更通道(payload = 新 epoch 的十进制文本)。0135 trigger 发。 */
+/** epoch 变更通道(payload = 新 epoch 的十进制文本)。0143 trigger 发。 */
 export const EPOCH_CHANNEL = "model_security_epoch";
 /** catalog/alias/价格任何变更(payload 空)。 */
 export const CATALOG_CHANNEL = "model_catalog_changed";
@@ -692,6 +771,14 @@ export class ModelCatalogCache {
   private lastError: unknown = null;
   private listener: Client | null = null;
   private rebuildInFlight: Promise<void> | null = null;
+  /** 在已有后台重建期间又收到 NOTIFY 时，完成后必须再跑一轮，不能把通知吞掉。 */
+  private rebuildQueued = false;
+  /**
+   * rebuild() 刻意不做单飞，但完成顺序可能与启动顺序相反：例如 staged 的 NOTIFY
+   * 重建先启动，activate 提交后的同步重建后启动却先完成。旧重建绝不能随后把新快照
+   * 覆盖回去，所以只允许最后启动的一次提交结果（失败同理，旧失败不能打掉新快照）。
+   */
+  private rebuildGeneration = 0;
 
   onError: (err: unknown) => void = (e) => {
     // eslint-disable-next-line no-console
@@ -712,22 +799,30 @@ export class ModelCatalogCache {
 
   /** 同步重建。失败 → 保持/进入 unknown 并抛(admin 写后"激活成功才返回成功"靠它)。 */
   async rebuild(): Promise<ModelCatalogSnapshot> {
+    const generation = ++this.rebuildGeneration;
     try {
       const next = await loadCatalogSnapshot();
-      this.snapshot = next;
-      this.lastError = null;
-      this.onRebuild(next);
+      if (generation === this.rebuildGeneration) {
+        this.snapshot = next;
+        this.lastError = null;
+        this.onRebuild(next);
+      }
       return next;
     } catch (err) {
-      this.snapshot = null; // fail-closed:重建失败 = unknown,拒新请求
-      this.lastError = err;
+      if (generation === this.rebuildGeneration) {
+        this.snapshot = null; // fail-closed:最新重建失败 = unknown,拒新请求
+        this.lastError = err;
+      }
       throw err;
     }
   }
 
   /** 合并并发重建;失败只记不抛(NOTIFY 驱动的后台路径)。 */
   private scheduleRebuild(): void {
-    if (this.rebuildInFlight) return;
+    if (this.rebuildInFlight) {
+      this.rebuildQueued = true;
+      return;
+    }
     this.rebuildInFlight = this.rebuild()
       .then(() => undefined)
       .catch((err) => {
@@ -735,13 +830,17 @@ export class ModelCatalogCache {
       })
       .finally(() => {
         this.rebuildInFlight = null;
+        if (this.rebuildQueued) {
+          this.rebuildQueued = false;
+          this.scheduleRebuild();
+        }
       });
   }
 
   /**
    * unknown 时**等在飞重建**(而不是立刻抛)。
    *
-   * 为什么(0136):自「grant 写也 bump epoch」起,每一次 admin 授权/撤权都会让 master 与
+   * 为什么(0144):自「grant 写也 bump epoch」起,每一次 admin 授权/撤权都会让 master 与
    * egress 的快照瞬间进入 unknown → 若执行面直接拒帧,一次后台点击就会给正在聊天的用户
    * 抛一个 MODEL_AUTHORITY_UNAVAILABLE。等待在飞重建的语义与 fail-closed **完全不冲突**:
    * 期间绝不使用旧快照(零 stale),只是把「重建完成」这几十毫秒等掉;重建失败 → 照抛。
@@ -810,8 +909,20 @@ export class ModelCatalogCache {
     });
     c.on("notification", (msg) => {
       if (msg.channel === EPOCH_CHANNEL) {
-        // 安全变更:先失效再重建 —— unknown 窗口内一律拒,零 stale window(R3-B2)。
-        this.snapshot = null;
+        // 安全变更:新 epoch 才先失效再重建 —— unknown 窗口内一律拒,零 stale window。
+        // admin 写提交后会同步 rebuild；该提交的 NOTIFY 可能随后才送达。若 payload epoch
+        // 已被当前快照覆盖，不能反过来把已激活的新快照打成 unknown（否则后台旧 rebuild
+        // 又因 generation supersede 不提交时会永久空窗）。仍 schedule 一轮吸收同 tx 的
+        // catalog 通知；真正更大的/畸形 epoch 一律先失效，fail-closed。
+        const payload = msg.payload ?? "";
+        const payloadEpoch = /^\d+$/.test(payload) ? BigInt(payload) : null;
+        if (
+          this.snapshot === null ||
+          payloadEpoch === null ||
+          this.snapshot.securityEpoch < payloadEpoch
+        ) {
+          this.snapshot = null;
+        }
         this.scheduleRebuild();
       } else if (msg.channel === CATALOG_CHANNEL) {
         this.scheduleRebuild();

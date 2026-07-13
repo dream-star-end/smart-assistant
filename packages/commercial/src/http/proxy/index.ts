@@ -373,6 +373,7 @@ export function makeAnthropicProxyHandler(
             uid,
             containerId: containerIdBig,
             model: body.model,
+            loadUserModelAuthz: deps.loadUserModelAuthz,
           });
         } catch (err) {
           if (err instanceof ModelGateReject) {
@@ -397,12 +398,15 @@ export function makeAnthropicProxyHandler(
         observeCatalogShadow(deps.modelCatalog, body.model, deps.pricing, userLog);
       }
 
-      // 5) 取 pricing(catalog 判定通过后,价格仍来自 model_pricing —— catalog 只管 execution)。
+      // 5) 取 pricing。authority 路径必须消费 gate 所在**同一 fenced snapshot**里的价格，
+      // 不再回读异步 PricingCache；否则改价 NOTIFY 延迟时会以另一 generation 结算。
       //
-      // enforce 路径不再看 `pricing.enabled`:可用性的唯一权威是 catalog.state(0135 起
-      // enabled 只是派生镜像),且 gate 的 isRoutable 已经断言"有价格行"。此处 pricing 为空
-      // 只可能是 PricingCache 尚未收到 NOTIFY 的瞬时窗口 → 仍按 unknown_model 拒(fail-closed)。
-      const pricing = deps.pricing.get(body.model);
+      // enforce 路径不再看 `pricing.enabled`:可用性的唯一权威是 catalog.state(0143 起
+      // enabled 只是派生镜像),且 gate 的 isRoutable 已经断言"有价格行"。snapshot 投影为空
+      // 代表内部不变量破坏；legacy cache miss 则仍按 unknown_model 拒(fail-closed)。
+      const pricing = gate
+        ? gate.snapshot.billingPricingFor(body.model)
+        : deps.pricing.get(body.model);
       if (!pricing || (!gate && !pricing.enabled)) {
         userLog.warn("proxy_unknown_model", { model: body.model, catalogGated: gate !== null });
         incrAnthropicProxyReject("unknown_model");
@@ -469,7 +473,7 @@ export function makeAnthropicProxyHandler(
       //   AuthzLoadError(loadUserModelAuthz throw) → 500 INTERNAL
       //   AuthzDeniedError(canUseModel false)     → 403 NOT_AUTHORIZED
       try {
-        await deps.identity.authorize(identity, pricing, body.model);
+        await deps.identity.authorize(identity, pricing, body.model, gate?.securityEpoch);
       } catch (err) {
         if (err instanceof AuthzLoadError) {
           userLog.error("proxy_authz_load_failed", { err: errSummary(err.cause) });
@@ -920,6 +924,16 @@ export function makeAnthropicProxyHandler(
           containerId: containerIdBig,
           model: body.model,
           precheckCredits: pre.maxCost,
+          ctxJson: gate
+            ? {
+                authorityKind: gate.authorityKind,
+                executionRevision: gate.executionRevision,
+                projectionRevision: gate.projectionRevision,
+                billingRevision: gate.snapshot.billingRevision,
+                securityEpoch: gate.securityEpoch.toString(),
+                source: "ccb_proxy",
+              }
+            : undefined,
         });
       } catch (err) {
         await releaseUpstreamSession(
@@ -981,7 +995,7 @@ export function makeAnthropicProxyHandler(
           mode: attribution.mode,
           parentSessionId: attribution.parentSessionId,
           delegateAgentId: attribution.delegateAgentId,
-          // 模型权威留证(0135 四列;方案 §4 / R3-m11)。gate 未生效(legacy / 影子期)→ 全 NULL,
+          // 模型权威留证(0143 四列;方案 §4 / R3-m11)。gate 未生效(legacy / 影子期)→ 全 NULL,
           // 与本批次之前的落库形状一致。有值时可事后回答:这一笔是按哪个执行快照、哪个 epoch、
           // 凭哪类权威扣的钱。
           authority: gate

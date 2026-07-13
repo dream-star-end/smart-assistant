@@ -12,7 +12,7 @@
  * (catalog 照常加载并与 legacy 对比打日志,但不参与拒绝)。**两种模式都会加载 catalog** ——
  * 影子期的价值就在于用真实流量证明"切过去不会改变任何请求的命运"。
  *
- * fail-closed 启动:catalog 首次快照拉不起来(0135 未 apply / DB 不可达)→ 抛。
+ * fail-closed 启动:catalog 首次快照拉不起来(0143 未 apply / DB 不可达)→ 抛。
  * 不允许"flag 开着但 catalog 空转"这种半开状态(每条请求都会被 fence 拒 = 全站静默不可用,
  * 还不如启动就响亮失败)。
  */

@@ -43,13 +43,14 @@ export const EGRESS_CAPABILITIES: readonly string[] = [MODEL_AUTHORITY_EGRESS_CA
  * 步骤 5 cutover marker(持久化,双源):
  *   - env 键(本常量):写在 /etc/openclaude/commercial-v5.env,**进程侧唯一可见的信号**
  *     (DB 不可达时部署守卫也还能判定地板已生效 → fail-closed 不依赖 DB 活着);
- *   - DB 单行(system_settings.'model_authority.cutover'):跨主机重建/DR 后仍在,
- *     与它保护的 model_catalog 同库同命运(见 scripts/deploy-v5.sh --model-authority-cutover)。
+ *   - DB 单行(model_authority_deploy_state.key='cutover'):跨主机重建/DR 后仍在,
+ *     且普通 app 角色不可读写,与它保护的 model_catalog 同库同命运
+ *     (见 scripts/deploy-v5.sh --model-authority-cutover)。
  * 判定 = 任一为真(OR)。deploy 侧两源都查;进程侧只查 env(启动路径不引入 DB 依赖)。
  */
 export const MODEL_AUTHORITY_CUTOVER_ENV = "OC_MODEL_AUTHORITY_CUTOVER";
-/** DB 侧 marker 的 system_settings key(deploy 写;不进 KEY_SCHEMAS = admin API 改不动它)。 */
-export const MODEL_AUTHORITY_CUTOVER_SETTING_KEY = "model_authority.cutover";
+/** DB 侧 marker 的 model_authority_deploy_state key(只有 deploy role 可写)。 */
+export const MODEL_AUTHORITY_CUTOVER_SETTING_KEY = "cutover";
 
 /** env 侧 marker 是否置位。 */
 export function isModelAuthorityCutoverDone(env: NodeJS.ProcessEnv = process.env): boolean {

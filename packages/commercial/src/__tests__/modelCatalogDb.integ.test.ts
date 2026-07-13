@@ -81,7 +81,7 @@ before(async () => {
   }
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 5 }));
-  // 全量迁移一次(含 0135),把"刚回填完"的 catalog/pricing 存成 fixture 快照,
+  // 全量迁移一次(含 0143),把"刚回填完"的 catalog/pricing 存成 fixture 快照,
   // 每个用例从该快照原样还原(状态机是单向的,不能靠 UPDATE 复位 —— retired 行不可逆)。
   await dropSchema();
   await runMigrations();
@@ -143,7 +143,7 @@ function expectedContextWindow(modelId: string): number | null {
   return 200_000;
 }
 
-describe("0135 回填 == protocol 常量", () => {
+describe("0143 回填 == protocol 常量", () => {
   test("每个 model_pricing 行都有唯一 live catalog 行,engine/provider/context/capability 与 protocol 逐一等价", async (t) => {
     if (skipIfNoPg(t)) return;
 
@@ -253,7 +253,7 @@ async function epoch(): Promise<bigint> {
   return BigInt(r.rows[0].epoch);
 }
 
-describe("0135 状态机 trigger", () => {
+describe("0143 状态机 trigger", () => {
   test("合法转移:active→disabled→active→disabled→retired", async (t) => {
     if (skipIfNoPg(t)) return;
     await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
@@ -268,16 +268,16 @@ describe("0135 状态机 trigger", () => {
   test("非法转移全拒:active→retired / active→staged / disabled→staged / staged 直接跳过校验", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.2'"),
+      () => query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'"),
       /illegal state transition active→retired/,
     );
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.2'"),
+      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'"),
       /illegal state transition active→staged/,
     );
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.2'"),
+      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'"),
       /illegal state transition disabled→staged/,
     );
   });
@@ -296,9 +296,9 @@ describe("0135 状态机 trigger", () => {
     );
   });
 
-  // 0136 收紧:新行**只能生于 staged**(0135 允许直插 active/disabled,只拒 retired)。
+  // 0144 收紧:新行**只能生于 staged**(0143 允许直插 active/disabled,只拒 retired)。
   // 边界矩阵与权限层的完整覆盖在 modelAuthorityDbGuards.integ.test.ts。
-  test("新行只能生于 staged(retired/active/disabled 直插全拒;0136)", async (t) => {
+  test("新行只能生于 staged(retired/active/disabled 直插全拒;0144)", async (t) => {
     if (skipIfNoPg(t)) return;
     for (const state of ["retired", "active", "disabled"]) {
       await assert.rejects(
@@ -313,7 +313,7 @@ describe("0135 状态机 trigger", () => {
     }
   });
 
-  test("execution 字段:active **与 disabled** 都不可变,只有 staged 可编辑(0136 收紧)", async (t) => {
+  test("execution 字段:active **与 disabled** 都不可变,只有 staged 可编辑(0144 收紧)", async (t) => {
     if (skipIfNoPg(t)) return;
     const mutations: Array<[string, RegExp]> = [
       ["engine='codex', provider_id='codex'", /execution fields of a active entry are immutable/],
@@ -326,17 +326,17 @@ describe("0135 状态机 trigger", () => {
     ];
     for (const [set, re] of mutations) {
       await assert.rejects(
-        () => query(`UPDATE model_catalog SET ${set} WHERE model_id='glm-5.2'`),
+        () => query(`UPDATE model_catalog SET ${set} WHERE model_id='glm-5.1'`),
         re,
         `mutation should be rejected: ${set}`,
       );
     }
-    // 0136:**disabled 行也冻结**。0135 允许原地改写 disabled 行再 disabled→active,
+    // 0144:**disabled 行也冻结**。0143 允许原地改写 disabled 行再 disabled→active,
     // 同一 entry_id 的执行语义被静默篡改(历史不再是历史,usage_records 的
     // execution_revision 归因失效)。改执行语义必须产生新版本(fn_model_switch_version)。
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await assert.rejects(
-      () => query("UPDATE model_catalog SET context_window=123456 WHERE model_id='glm-5.2'"),
+      () => query("UPDATE model_catalog SET context_window=123456 WHERE model_id='glm-5.1'"),
       /execution fields of a disabled entry are immutable/,
     );
     // staged 行是唯一的编辑面
@@ -381,7 +381,7 @@ describe("0135 状态机 trigger", () => {
   });
 });
 
-describe("0135 alias trigger", () => {
+describe("0143 alias trigger", () => {
   async function activeEntryId(modelId: string): Promise<number> {
     const r = await query<{ entry_id: string }>(
       "SELECT entry_id::text AS entry_id FROM model_catalog WHERE model_id=$1 AND state='active'",
@@ -392,7 +392,7 @@ describe("0135 alias trigger", () => {
 
   test("alias 可指向 active/staged;不可指向 disabled/retired", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.2");
+    const glm = await activeEntryId("glm-5.1");
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [glm]);
 
     await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
@@ -419,7 +419,7 @@ describe("0135 alias trigger", () => {
 
   test("被 alias 引用的行禁止 retire;但允许 disable(disable 不需要先删 alias)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.2");
+    const glm = await activeEntryId("glm-5.1");
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [glm]);
 
     await query("UPDATE model_catalog SET state='disabled' WHERE entry_id=$1", [glm]); // 允许
@@ -445,11 +445,11 @@ describe("0135 alias trigger", () => {
 // ③ epoch bump 语义
 // ─────────────────────────────────────────────────────────────────────────
 
-describe("0135 security epoch", () => {
+describe("0143 security epoch", () => {
   test("state 离开 active → bump", async (t) => {
     if (skipIfNoPg(t)) return;
     const before = await epoch();
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     assert.equal(await epoch(), before + 1n);
   });
 
@@ -481,15 +481,15 @@ describe("0135 security epoch", () => {
     const before = await epoch();
     await tx(async (c) => {
       await c.query("UPDATE model_pricing SET multiplier=3.000 WHERE model_id IN ('glm-5.2','glm-5.1','MiniMax-M3')");
-      await c.query("UPDATE model_catalog SET state='disabled' WHERE model_id='deepseek-v4-pro'");
+      await c.query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     });
     assert.equal(await epoch(), before + 1n);
   });
 
-  // 0136:epoch 表加 guard —— 只接受 fn_model_security_epoch_bump 的 +1 写。
-  // (0135 只有 CHECK(epoch >= 1):`SET epoch = 1` 这种**回退**是合法的,而回退会让
+  // 0144:epoch 表加 guard —— 只接受 fn_model_security_epoch_bump 的 +1 写。
+  // (0143 只有 CHECK(epoch >= 1):`SET epoch = 1` 这种**回退**是合法的,而回退会让
   //  所有陈旧快照重新通过 fence = fence 机制被直接旁路。)
-  test("epoch 单调:回退/清零/跳变全拒(0136)", async (t) => {
+  test("epoch 单调:回退/清零/跳变全拒(0144)", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(
       () => query("UPDATE model_security_epoch SET epoch = 0 WHERE id"),
@@ -507,7 +507,7 @@ describe("0135 security epoch", () => {
 // ④ 版本切换存储过程(R3-M8)
 // ─────────────────────────────────────────────────────────────────────────
 
-describe("0135 fn_model_switch_version", () => {
+describe("0143 fn_model_switch_version", () => {
   test("engine 变更:旧行 retired + 新行 active + alias 重指 + 可用性不变 + epoch bump 一次", async (t) => {
     if (skipIfNoPg(t)) return;
     const old = await query<{ entry_id: string }>(
@@ -520,7 +520,7 @@ describe("0135 fn_model_switch_version", () => {
     const r = await query<{ new_entry: string }>(
       `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,
          '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "high"}}'::jsonb,
-         1, NULL)::text AS new_entry`,
+         1, NULL, 0)::text AS new_entry`,
     );
     const newId = Number(r.rows[0].new_entry);
     assert.notEqual(newId, oldId);
@@ -555,7 +555,7 @@ describe("0135 fn_model_switch_version", () => {
     if (skipIfNoPg(t)) return;
     await query(
       `SELECT fn_model_switch_version('gpt-5.5','codex','codex',NULL,NULL,
-         '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL)`,
+         '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
     );
     assert.deepEqual(await stateOf("gpt-5.5"), ["retired", "staged"]);
     const mirror = await query<{ enabled: boolean }>(
@@ -567,12 +567,12 @@ describe("0135 fn_model_switch_version", () => {
   test("已有 staged 版本时再切 → 拒(禁止多请求手工拼装)", async (t) => {
     if (skipIfNoPg(t)) return;
     await query(
-      `SELECT fn_model_switch_version('gpt-5.5','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL)`,
+      `SELECT fn_model_switch_version('gpt-5.5','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
     );
     await assert.rejects(
       () =>
         query(
-          `SELECT fn_model_switch_version('gpt-5.5','ccb','deepseek',NULL,200000,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL)`,
+          `SELECT fn_model_switch_version('gpt-5.5','ccb','deepseek',NULL,200000,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
         ),
       /already has a pending staged version/,
     );
@@ -583,7 +583,7 @@ describe("0135 fn_model_switch_version", () => {
     await assert.rejects(
       () =>
         query(
-          `SELECT fn_model_switch_version('nope','ccb','ark',NULL,1,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL)`,
+          `SELECT fn_model_switch_version('nope','ccb','ark',NULL,1,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
         ),
       /no live entry for model/,
     );
@@ -596,7 +596,7 @@ describe("0135 fn_model_switch_version", () => {
       () =>
         tx(async (c) => {
           await c.query(
-            `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL)`,
+            `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
           );
           throw new Error("boom");
         }),
@@ -610,7 +610,7 @@ describe("0135 fn_model_switch_version", () => {
 // ⑤ 兼容地板:既有代码 SQL 一字不改照跑
 // ─────────────────────────────────────────────────────────────────────────
 
-describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
+describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
   async function enabledOf(modelId: string): Promise<boolean> {
     const r = await query<{ enabled: boolean }>("SELECT enabled FROM model_pricing WHERE model_id=$1", [modelId]);
     return r.rows[0].enabled;
@@ -636,10 +636,10 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
 
   test("catalog 状态机写 → enabled 镜像同步(反向)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k2.7-code'");
-    assert.equal(await enabledOf("kimi-k2.7-code"), false);
-    await query("UPDATE model_catalog SET state='active' WHERE model_id='kimi-k2.7-code'");
-    assert.equal(await enabledOf("kimi-k2.7-code"), true);
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    assert.equal(await enabledOf("glm-5.1"), false);
+    await query("UPDATE model_catalog SET state='active' WHERE model_id='glm-5.1'");
+    assert.equal(await enabledOf("glm-5.1"), true);
   });
 
   test("INSERT ... ON CONFLICT DO UPDATE(adminPricing.integ / 历史 seed 迁移的写法)照跑", async (t) => {
@@ -677,12 +677,12 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
     if (skipIfNoPg(t)) return;
     const out = await tx(async (c) => {
       const before = await c.query<{ lock_version: number; enabled: boolean }>(
-        "SELECT model_id, enabled, lock_version FROM model_pricing WHERE model_id='glm-5.2' FOR UPDATE",
+        "SELECT model_id, enabled, lock_version FROM model_pricing WHERE model_id='glm-5.1' FOR UPDATE",
       );
       assert.equal(before.rows.length, 1);
       const after = await c.query<{ enabled: boolean; lock_version: number; multiplier: string }>(
         `UPDATE model_pricing SET multiplier=$1, enabled=$2, lock_version = lock_version + 1, updated_at = NOW()
-          WHERE model_id='glm-5.2'
+          WHERE model_id='glm-5.1'
           RETURNING enabled, lock_version, multiplier::text AS multiplier`,
         ["3.000", false],
       );
@@ -690,17 +690,17 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
     });
     assert.equal(out.after.enabled, false, "RETURNING 必须反映权威后态");
     assert.equal(out.after.lock_version, out.before.lock_version + 1);
-    assert.equal(await catalogState("glm-5.2"), "disabled");
+    assert.equal(await catalogState("glm-5.1"), "disabled");
   });
 
-  // 0136:DELETE FROM model_pricing 从「级联物理删除 catalog 全部版本」改为**软退役**。
-  //   0135 的形态:一条 `DELETE FROM model_pricing` 就能把该模型的**全部历史**(含 retired)
+  // 0144:DELETE FROM model_pricing 从「级联物理删除 catalog 全部版本」改为**软退役**。
+  //   0143 的形态:一条 `DELETE FROM model_pricing` 就能把该模型的**全部历史**(含 retired)
   //   抹掉 —— 计费行(usage_records.execution_revision)从此无从回溯。
-  test("DELETE FROM model_pricing → catalog 行**软退役**(历史保留,不留孤儿 active;0136)", async (t) => {
+  test("DELETE FROM model_pricing → catalog 行**软退役**(历史保留,不留孤儿 active;0144)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("DELETE FROM model_pricing WHERE model_id='kimi-k2.7-code'");
+    await query("DELETE FROM model_pricing WHERE model_id='glm-5.1'");
     const r = await query<{ state: string }>(
-      "SELECT state FROM model_catalog WHERE model_id='kimi-k2.7-code'",
+      "SELECT state FROM model_catalog WHERE model_id='glm-5.1'",
     );
     assert.equal(r.rows.length, 1, "历史行必须还在");
     assert.equal(r.rows[0].state, "retired", "不再可路由,但不物理删除");
@@ -708,17 +708,17 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
     await query(
       `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility)
-       VALUES ('kimi-k2.7-code','Kimi K2.7 Code (256k)',684,2880,137,0,1.000,TRUE,88,'public')`,
+       VALUES ('glm-5.1','GLM 5.1',684,2880,137,0,1.000,TRUE,88,'public')`,
     );
     const revived = await query<{ state: string }>(
-      "SELECT state FROM model_catalog WHERE model_id='kimi-k2.7-code' ORDER BY entry_id",
+      "SELECT state FROM model_catalog WHERE model_id='glm-5.1' ORDER BY entry_id",
     );
     assert.deepEqual(revived.rows.map((x) => x.state), ["retired", "active"]);
   });
 
   test("不变量:model_pricing.enabled 恒等于 (catalog 有 active 行)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_pricing SET enabled=false WHERE model_id='MiniMax-M3'");
+    await query("UPDATE model_pricing SET enabled=false WHERE model_id='qwen3.7-plus'");
     await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await query("UPDATE model_catalog SET state='active' WHERE model_id='gpt-5.5'");
     const drift = await query<{ model_id: string }>(
@@ -734,7 +734,7 @@ describe("0135 兼容地板(旧 master 回滚后的读写路径)", () => {
 // ⑥ 消费侧:snapshot / PricingCache 都走 catalog 权威
 // ─────────────────────────────────────────────────────────────────────────
 
-describe("0135 消费侧", () => {
+describe("0143 消费侧", () => {
   test("loadCatalogSnapshot:一致快照 + revision 稳定 + epoch 随载", async (t) => {
     if (skipIfNoPg(t)) return;
     const s1 = await loadCatalogSnapshot(getPool());
@@ -749,40 +749,40 @@ describe("0135 消费侧", () => {
     assert.equal(d?.capabilityProfile.reasoning.codexModelDefault, "xhigh");
 
     // 安全写 → epoch + revision 都变
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     const s3 = await loadCatalogSnapshot(getPool());
     assert.equal(s3.securityEpoch, 2n);
     assert.notEqual(s3.executionRevision, s1.executionRevision);
-    assert.equal(s3.isRoutable("glm-5.2"), false);
+    assert.equal(s3.isRoutable("glm-5.1"), false);
   });
 
   test("PricingCache.enabled 来自 catalog 权威(镜像列被写歪也不受影响)", async (t) => {
     if (skipIfNoPg(t)) return;
     const cache = new PricingCache();
     await cache.load();
-    assert.equal(cache.get("glm-5.2")?.enabled, true);
+    assert.equal(cache.get("glm-5.1")?.enabled, true);
 
     // 绕过 trigger 直接把镜像列写歪(模拟外力/回滚事故):catalog 仍是 active。
     // 必须同一 client(session GUC),故走 tx() 而不是 pool 上的两条独立 query()。
     await tx(async (c) => {
       await c.query("SET LOCAL session_replication_role = replica");
-      await c.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.2'");
+      await c.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
     });
     const crooked = await query<{ enabled: boolean }>(
-      "SELECT enabled FROM model_pricing WHERE model_id='glm-5.2'",
+      "SELECT enabled FROM model_pricing WHERE model_id='glm-5.1'",
     );
     assert.equal(crooked.rows[0].enabled, false, "前提:镜像列确实被写歪了");
 
     await cache.load();
     assert.equal(
-      cache.get("glm-5.2")?.enabled,
+      cache.get("glm-5.1")?.enabled,
       true,
       "PricingCache 必须读 catalog.state,而不是被写歪的 enabled 镜像列",
     );
 
     // 真正的权威写 → 立刻反映
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await cache.load();
-    assert.equal(cache.get("glm-5.2")?.enabled, false);
+    assert.equal(cache.get("glm-5.1")?.enabled, false);
   });
 });

@@ -2,14 +2,14 @@
  * admin 模型 catalog 运维 —— 业务层(模型权威批次 · 方案 §7 步 5)。
  *
  * 步骤 5 = "开放 admin INSERT/状态机操作(staged 流程)"。在此之前 catalog 只能由迁移回填
- * (0135)与 model_pricing.enabled 兼容 trigger 间接改;本模块是**唯一**的显式写入口。
+ * (0143)与 model_pricing.enabled 兼容 trigger 间接改;本模块是**唯一**的显式写入口。
  *
  * ── 三层校验(缺一不可)──────────────────────────────────────────────────────
- *  1. DB(0135 trigger):状态机合法性(staged→active→disabled→{active|retired})、
+ *  1. DB(0143 trigger):状态机合法性(staged→active→disabled→{active|retired})、
  *     active 行 execution 字段不可变、retired 单向、alias 引用禁退休、epoch 自动 bump。
  *     —— 权威在 DB,任何绕过本模块的写(psql / 兼容 trigger)也逃不掉。
  *  2. 本模块(激活期语义校验):DB 管不了的**跨表/跨代码事实**——
- *       · provider_id ∈ 服务端 provider 机制集(机制集是代码事实,0135 有意不建 DB 枚举);
+ *       · provider_id ∈ 服务端 provider 机制集(机制集是代码事实,0143 有意不建 DB 枚举);
  *       · matchesRoute 命中(catalog 不得与 protocol 路由规则互相矛盾:hint 缺失的兼容
  *         回落路径(影子期 / 非 catalog 入口)会按 matchesRoute 走 —— 两者不一致 =
  *         同一个模型在两条路径上打到不同上游,轻则 400,重则烧 OAuth 账号池的真钱);
@@ -32,11 +32,9 @@
 import type { PoolClient } from "pg";
 import {
   STATIC_KEY_PROVIDERS,
-  findRouteProviderForModel,
-  isCodexEngineModel,
 } from "@openclaude/protocol";
-
 import { query, tx } from "../db/queries.js";
+import { getModelCatalogAdminPool } from "../db/modelCatalogAdmin.js";
 import { writeAdminAudit } from "./audit.js";
 import { CODEX_PROVIDER_ID } from "./modelOps.js";
 import {
@@ -58,9 +56,9 @@ import {
   selectUpstreamRoute,
 } from "../http/proxy/upstream.js";
 
-// ─── provider 机制集(代码事实,0135 有意不 DB 化)────────────────────────────
+// ─── provider 机制集(代码事实,0143 有意不 DB 化)────────────────────────────
 
-/** OAuth(Anthropic 官方账号池)虚拟 provider —— 与 0135 fn_model_catalog_provider 的 'anthropic' 同源。 */
+/** OAuth(Anthropic 官方账号池)虚拟 provider —— 与 0143 fn_model_catalog_provider 的 'anthropic' 同源。 */
 export const OAUTH_PROVIDER_ID = "anthropic";
 
 /** engine='ccb' 合法 provider_id 集:静态 key provider(protocol 注册表)+ OAuth 虚拟条目。 */
@@ -113,7 +111,7 @@ export interface CatalogVersionInput {
   provider_id: string | null;
   upstream_model_id: string | null;
   context_window: number | null;
-  /** DB 形状(snake_case JSONB),与 0135 fn_model_catalog_capability 同源。 */
+  /** DB 形状(snake_case JSONB),与 0143 fn_model_catalog_capability 同源。 */
   capability_profile: unknown;
   capability_schema_version?: number;
 }
@@ -143,6 +141,12 @@ export class CatalogValidationError extends Error {
     super(`model_catalog validation failed: ${violations.join("; ")}`);
     this.name = "CatalogValidationError";
     this.violations = violations;
+  }
+}
+export class CatalogCutoverRequiredError extends Error {
+  constructor() {
+    super("model catalog writes are locked until model-authority cutover is committed");
+    this.name = "CatalogCutoverRequiredError";
   }
 }
 
@@ -226,17 +230,8 @@ export function validateVersionSemantics(
   const out: string[] = [];
   const { model_id: modelId, engine, provider_id: providerId, capability } = v;
 
-  // ① engine ↔ 型号白名单(codex adapter 的判定源仍在 protocol,见文件头"保守面")
-  if (engine === "codex" && !isCodexEngineModel(modelId)) {
-    out.push(
-      `engine='codex' but ${modelId} ∉ protocol CODEX_ENGINE_MODEL_IDS —— 容器 codex adapter 起不来`,
-    );
-  }
-  if (engine === "ccb" && isCodexEngineModel(modelId)) {
-    out.push(`${modelId} 是 protocol 声明的 codex 型号,engine 不能是 'ccb'`);
-  }
-
-  // ② provider_id ∈ 机制集
+  // ① provider_id ∈ 机制集。model_id/engine 的合法性由签名 descriptor 驱动，
+  // 不再拿 baked CODEX_ENGINE_MODEL_IDS 做第二次审判。
   const allowed = engine === "codex" ? codexProviderIds() : ccbProviderIds();
   if (providerId === null || !allowed.includes(providerId)) {
     out.push(
@@ -244,18 +239,7 @@ export function validateVersionSemantics(
     );
   }
 
-  // ③ matchesRoute 命中(catalog 与 protocol 路由规则不得互相矛盾)
-  if (engine === "ccb" && providerId !== null) {
-    const routed = findRouteProviderForModel(modelId)?.id ?? OAUTH_PROVIDER_ID;
-    if (routed !== providerId) {
-      out.push(
-        `matchesRoute(${modelId}) → '${routed}',与 provider_id='${providerId}' 不符 —— ` +
-          "hint 缺失的兼容回落路径会打到另一个上游(双路由源分叉)",
-      );
-    }
-  }
-
-  // ④ capability ⊆ provider 机制上限(codex engine 不走 anthropic proxy 机制,跳过)
+  // ② capability ⊆ provider 机制上限(codex engine 不走 anthropic proxy 机制,跳过)
   if (engine === "ccb" && providerId !== null && allowed.includes(providerId)) {
     try {
       const route = selectUpstreamRoute(modelId, {
@@ -284,7 +268,7 @@ export function validateVersionSemantics(
     }
   }
 
-  // ⑤ 有价格行(activate 前置)
+  // ③ 有价格行(activate 前置)
   if (hasPricing === false) {
     out.push(`model_pricing 无 '${modelId}' 行 —— active 却无价 = 计费面 fail-closed 拒服务`);
   }
@@ -382,13 +366,22 @@ async function loadHasPricing(client: PoolClient, modelId: string): Promise<bool
   return r.rows[0]?.ok === true;
 }
 
-async function loadEntryForUpdate(client: PoolClient, entryId: string): Promise<RawRow> {
+/** 写 gate 必须与写操作处于同一事务；GET 列表不受影响。 */
+async function assertCatalogWritesEnabled(client: PoolClient): Promise<void> {
+  if (!isModelAuthorityEnforced()) throw new CatalogCutoverRequiredError();
+  const marker = await client.query(
+    `SELECT 1 FROM model_authority_deploy_state WHERE key = 'cutover'`,
+  );
+  if (marker.rowCount !== 1) throw new CatalogCutoverRequiredError();
+}
+
+async function loadEntry(client: PoolClient, entryId: string): Promise<RawRow> {
   const r = await client.query<RawRow>(
     `SELECT entry_id::text AS entry_id, model_id, engine, provider_id, upstream_model_id,
             context_window, capability_profile, capability_schema_version, state, lock_version,
             created_at, updated_at, updated_by::text AS updated_by,
             NULL::text[] AS aliases, FALSE AS has_pricing
-       FROM model_catalog WHERE entry_id = $1::bigint FOR UPDATE`,
+       FROM model_catalog WHERE entry_id = $1::bigint`,
     [entryId],
   );
   const row = r.rows[0];
@@ -407,12 +400,16 @@ export async function createStaged(
   if (violations.length > 0) throw new CatalogValidationError(violations);
 
   const entryId = await tx(async (client: PoolClient) => {
+    await assertCatalogWritesEnabled(client);
+    const existing = await client.query(
+      `SELECT 1 FROM model_catalog WHERE model_id=$1 AND state IN ('staged','active','disabled') LIMIT 1`,
+      [v.model_id],
+    );
+    if (existing.rowCount !== 0) {
+      throw new CatalogConflictError(`model '${v.model_id}' already has a live version`);
+    }
     const r = await client.query<{ entry_id: string }>(
-      `INSERT INTO model_catalog
-         (model_id, engine, provider_id, upstream_model_id, context_window,
-          capability_profile, capability_schema_version, state, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'staged', $8::bigint)
-       RETURNING entry_id::text AS entry_id`,
+      `SELECT fn_model_stage_version($1,$2,$3,$4,$5,$6::jsonb,$7,$8::bigint)::text AS entry_id`,
       [
         v.model_id,
         v.engine,
@@ -444,7 +441,7 @@ export async function createStaged(
       userAgent: ctx.userAgent ?? null,
     });
     return id;
-  });
+  }, getModelCatalogAdminPool());
   // staged 行不进执行投影(executionRevision 只含 active 行),但 catalog 变更仍要让本进程
   // 快照与 DB 对齐(后续 activate 会读它)。
   await activateSnapshotOrThrow();
@@ -458,7 +455,8 @@ export async function activateEntry(
   ctx: AdminOpsCtx,
 ): Promise<void> {
   await tx(async (client: PoolClient) => {
-    const row = await loadEntryForUpdate(client, entryId);
+    await assertCatalogWritesEnabled(client);
+    const row = await loadEntry(client, entryId);
     if (row.state !== "staged" && row.state !== "disabled") {
       throw new CatalogConflictError(
         `entry ${entryId} state='${row.state}' —— 只有 staged / disabled 可以 activate`,
@@ -482,14 +480,10 @@ export async function activateEntry(
     const violations = validateVersionSemantics(v, hasPricing);
     if (violations.length > 0) throw new CatalogValidationError(violations);
 
-    const upd = await client.query(
-      `UPDATE model_catalog SET state = 'active', updated_by = $2::bigint
-        WHERE entry_id = $1::bigint AND lock_version = $3`,
-      [entryId, String(ctx.adminId), expectedLockVersion],
+    await client.query(
+      `SELECT fn_model_activate_entry($1::bigint,$2,$3::bigint)`,
+      [entryId, expectedLockVersion, String(ctx.adminId)],
     );
-    if (upd.rowCount !== 1) {
-      throw new CatalogConflictError(`entry ${entryId} 并发修改,activate 未生效`);
-    }
     await writeAdminAudit(client, {
       adminId: ctx.adminId,
       action: "model_catalog.activate",
@@ -499,7 +493,7 @@ export async function activateEntry(
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
-  });
+  }, getModelCatalogAdminPool());
   await activateSnapshotOrThrow();
 }
 
@@ -510,7 +504,8 @@ export async function disableEntry(
   ctx: AdminOpsCtx,
 ): Promise<void> {
   await tx(async (client: PoolClient) => {
-    const row = await loadEntryForUpdate(client, entryId);
+    await assertCatalogWritesEnabled(client);
+    const row = await loadEntry(client, entryId);
     if (row.state !== "active") {
       throw new CatalogConflictError(
         `entry ${entryId} state='${row.state}' —— 只有 active 可以 disable`,
@@ -521,14 +516,10 @@ export async function disableEntry(
         `lock_version 不符(期望 ${expectedLockVersion},当前 ${row.lock_version})`,
       );
     }
-    const upd = await client.query(
-      `UPDATE model_catalog SET state = 'disabled', updated_by = $2::bigint
-        WHERE entry_id = $1::bigint AND lock_version = $3`,
-      [entryId, String(ctx.adminId), expectedLockVersion],
+    await client.query(
+      `SELECT fn_model_disable_entry($1::bigint,$2,$3::bigint)`,
+      [entryId, expectedLockVersion, String(ctx.adminId)],
     );
-    if (upd.rowCount !== 1) {
-      throw new CatalogConflictError(`entry ${entryId} 并发修改,disable 未生效`);
-    }
     await writeAdminAudit(client, {
       adminId: ctx.adminId,
       action: "model_catalog.disable",
@@ -538,7 +529,7 @@ export async function disableEntry(
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
-  });
+  }, getModelCatalogAdminPool());
   await activateSnapshotOrThrow();
 }
 
@@ -556,13 +547,14 @@ export async function switchVersion(
 ): Promise<{ entry_id: string }> {
   const v = normalizeVersionInput(input);
   const entryId = await tx(async (client: PoolClient) => {
+    await assertCatalogWritesEnabled(client);
     // 锁住当前 live 行(staged/active/disabled),乐观并发按它的 lock_version 判。
     const cur = await client.query<{ entry_id: string; state: string; lock_version: number }>(
       `SELECT entry_id::text AS entry_id, state, lock_version
          FROM model_catalog
         WHERE model_id = $1 AND state IN ('staged','active','disabled')
         ORDER BY (state = 'active') DESC, (state = 'staged') DESC, entry_id DESC
-        LIMIT 1 FOR UPDATE`,
+        LIMIT 1`,
       [v.model_id],
     );
     const live = cur.rows[0];
@@ -582,7 +574,7 @@ export async function switchVersion(
     if (violations.length > 0) throw new CatalogValidationError(violations);
 
     const r = await client.query<{ entry_id: string }>(
-      `SELECT fn_model_switch_version($1, $2, $3, $4, $5, $6::jsonb, $7, $8::bigint)::text AS entry_id`,
+      `SELECT fn_model_switch_version($1, $2, $3, $4, $5, $6::jsonb, $7, $8::bigint, $9)::text AS entry_id`,
       [
         v.model_id,
         v.engine,
@@ -592,6 +584,7 @@ export async function switchVersion(
         JSON.stringify(v.capability_profile),
         v.capability_schema_version,
         String(ctx.adminId),
+        expectedLockVersion,
       ],
     );
     const newId = r.rows[0]!.entry_id;
@@ -614,7 +607,7 @@ export async function switchVersion(
       userAgent: ctx.userAgent ?? null,
     });
     return newId;
-  });
+  }, getModelCatalogAdminPool());
   await activateSnapshotOrThrow();
   return { entry_id: entryId };
 }

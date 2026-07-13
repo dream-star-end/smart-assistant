@@ -5,7 +5,7 @@
  *
  * 被修的洞:连接级 grants checker 只有 30s 周期刷新,且**刷新失败永久保留旧 checker**。
  * 撤销授权后 —— CCB 还有 egress 的每请求授权兜底,**codex 完全不经 /v1/messages egress** ——
- * 旧连接照样签票、照样执行。0136 让任何 grant 写都 bump security epoch,bridge 在每个 turn
+ * 旧连接照样签票、照样执行。0144 让任何 grant 写都 bump security epoch,bridge 在每个 turn
  * 的 catalog fence 之后比对 checker 的 epoch 戳:漂移 → 同步重载 + 重新判定;重载失败 →
  * **拒帧**(禁止 keep-LKG 放行)。
  *
@@ -58,6 +58,7 @@ function entry(over: Partial<ModelCatalogEntry> & { entryId: number; modelId: st
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: false, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",
@@ -309,7 +310,7 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
     const forwardedBefore = forwardedInbound(rig.containerSeen).length;
     assert.equal(forwardedBefore, 1);
 
-    // admin 撤权 → 0136 的 trigger bump epoch(catalog 快照随之前进)
+    // admin 撤权 → 0144 的 trigger bump epoch(catalog 快照随之前进)
     rig.revoke(11n);
 
     const frames = await send(ws, "s-2");

@@ -38,6 +38,7 @@ function entry(
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["high"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",

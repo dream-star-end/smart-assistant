@@ -9,7 +9,7 @@ import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getAntModelOverrideConfig } from './model/antModels.js'
-import { isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import { getAuthorityModelCapabilities, isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
 
 export type { EffortLevel }
 
@@ -25,6 +25,8 @@ export type EffortValue = EffortLevel | number
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.supportedEfforts.length > 0
   const m = model.toLowerCase()
   // glm-5.x(火山方舟 ark)虽在 capabilityZero 集,但火山端点支持 output_config.effort(high/max,
   // 端点 error message 实测合法值 low/medium/high/max)。**例外放行**(在 capabilityZero return 之前),
@@ -68,6 +70,8 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6+ only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.supportedEfforts.includes('max')
   // glm-5.x(火山 ark)支持 effort=max(端点合法值含 max)。例外放行。
   if (isArkGlmModel(model)) {
     return true
@@ -101,6 +105,8 @@ export function modelSupportsMaxEffort(model: string): boolean {
 // gain xhigh support. Used by resolveAppliedEffort to downgrade xhigh→high
 // for non-supporting models so we never send a value the API will reject.
 export function modelSupportsXhighEffort(model: string): boolean {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.supportedEfforts.includes('xhigh')
   if (isCapabilityZeroStaticModel(model)) {
     return false
   }

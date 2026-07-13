@@ -1,4 +1,4 @@
--- 0135_model_catalog.sql
+-- 0143_model_catalog.sql
 -- 模型权威批次 · 切片 1(DB 层)。方案:docs/V5_MODEL_AUTHORITY_PLAN.md §1。
 --
 -- 建立「模型可执行性(execution authority)」的单一权威:
@@ -94,7 +94,7 @@ CREATE INDEX idx_model_catalog_active   ON model_catalog (model_id) WHERE state 
 
 COMMENT ON TABLE  model_catalog IS
   '模型可执行性(engine/provider/execution descriptor)的单一权威。可用性 = state=active;'
-  'model_pricing.enabled 是本表的派生镜像,不是权威(0135)。';
+  'model_pricing.enabled 是本表的派生镜像,不是权威(0143)。';
 COMMENT ON COLUMN model_catalog.state IS
   '状态机:staged→active→disabled→{active|retired};retired 单向终态。active 行 execution 字段不可变。';
 
@@ -201,7 +201,7 @@ CREATE OR REPLACE FUNCTION fn_model_catalog_context_window(p_model_id TEXT) RETU
   END
 $$ LANGUAGE sql IMMUTABLE;
 
--- capability_profile:protocol modelReasoningPolicy(p_model_id) + supportsVision 的**当前值**。
+-- capability_profile:protocol modelReasoningPolicy + supportsVision + CCB 本地执行开关的当前值。
 --   supports_vision = findRouteProviderForModel(id)?.supportsVision ?? false
 --                     (仅 minimax=true;codex/claude 无该 protocol 常量 → false,与现状 strip 口径一致)
 --   reasoning.supported:
@@ -212,17 +212,17 @@ $$ LANGUAGE sql IMMUTABLE;
 CREATE OR REPLACE FUNCTION fn_model_catalog_capability(p_model_id TEXT) RETURNS JSONB AS $$
   SELECT CASE
     WHEN p_model_id IN ('gpt-5.6-sol', 'gpt-5.6-terra') THEN
-      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "xhigh"}}'::jsonb
+      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "xhigh"}, "ccb": {"capability_zero": false, "supports_thinking": false}}'::jsonb
     WHEN p_model_id = 'gpt-5.6-luna' THEN
-      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "medium"}}'::jsonb
+      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "medium"}, "ccb": {"capability_zero": false, "supports_thinking": false}}'::jsonb
     WHEN lower(p_model_id) = 'minimax-m3' THEN
-      '{"supports_vision": true, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb
+      '{"supports_vision": true, "reasoning": {"supported": [], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
     WHEN lower(p_model_id) IN ('glm-5.1', 'glm-5.2') THEN
-      '{"supports_vision": false, "reasoning": {"supported": ["high","max"], "codex_model_default": null}}'::jsonb
+      '{"supports_vision": false, "reasoning": {"supported": ["high","max"], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
     WHEN lower(p_model_id) IN ('qwen3.7-max', 'qwen3.7-plus', 'kimi-k2.7-code') THEN
-      '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb
+      '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
     ELSE
-      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": null}}'::jsonb
+      '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": null}, "ccb": {"capability_zero": false, "supports_thinking": true}}'::jsonb
   END
 $$ LANGUAGE sql IMMUTABLE;
 
@@ -642,7 +642,7 @@ BEGIN
       WHERE c.model_id = p.model_id AND c.state IN ('staged', 'active', 'disabled')
    );
   IF v_missing <> 0 THEN
-    RAISE EXCEPTION '0135: % model_pricing row(s) without a live catalog entry', v_missing;
+    RAISE EXCEPTION '0143: % model_pricing row(s) without a live catalog entry', v_missing;
   END IF;
 
   SELECT COUNT(*) INTO v_drift
@@ -651,7 +651,7 @@ BEGIN
      SELECT 1 FROM model_catalog c WHERE c.model_id = p.model_id AND c.state = 'active'
    );
   IF v_drift <> 0 THEN
-    RAISE EXCEPTION '0135: % model_pricing row(s) drift from catalog state', v_drift;
+    RAISE EXCEPTION '0143: % model_pricing row(s) drift from catalog state', v_drift;
   END IF;
 END $$;
 

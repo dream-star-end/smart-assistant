@@ -66,6 +66,7 @@ function entry(over: Partial<ModelCatalogEntry> & Pick<ModelCatalogEntry, "entry
     capabilityProfile: {
       supportsVision: false,
       reasoning: { supported: ["high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
     },
     capabilitySchemaVersion: 1,
     state: "active",
@@ -98,7 +99,10 @@ function snapshot(epoch = 5n): ModelCatalogSnapshot {
       entry({ entryId: 2, modelId: "secret-model", upstreamModelId: "vendor-x-1" }),
       entry({ entryId: 3, modelId: "admin-model" }),
     ],
-    aliases: new Map(),
+    aliases: new Map([
+      ["glm-latest", 1],
+      ["secret-latest", 2],
+    ]),
     pricing: new Map(
       [
         price("glm-5.2", { defaultEffort: "high" }),
@@ -178,6 +182,7 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     assert.ok(body.projection_revision.length > 0);
     assert.equal(body.security_epoch, "5");
     assert.equal(res.headers[SECURITY_EPOCH_HEADER], "5");
+    assert.deepEqual(body.aliases, { "glm-latest": "glm-5.2" });
   });
 
   test("有 grant 的 hidden 模型 → 出现在该 uid 的投影里(且带执行语义字段)", async () => {
@@ -197,6 +202,10 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     assert.equal(glm.default_effort, "high");
     assert.deepEqual([...glm.supported_efforts], ["high", "max"]);
     assert.equal(glm.supports_vision, false);
+    assert.deepEqual(body.aliases, {
+      "glm-latest": "glm-5.2",
+      "secret-latest": "secret-model",
+    });
   });
 
   test("admin 角色 → 见 admin 可见模型(与 canUseModel 同源规则)", async () => {

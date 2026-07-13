@@ -5,9 +5,10 @@ import { Client, Pool } from "pg";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
 
 /**
- * 模型权威批次 · 0136 加固(Codex 代码审 R1:BLOCKER-1 + MAJOR-1)—— 真实 PG。
+ * 模型权威批次 · 0144 加固(Codex 代码审 R1:BLOCKER-1 + MAJOR-1)—— 真实 PG。
  *
  * 覆盖:
  *   ① BLOCKER-1:model_visibility_grants 的 INSERT/UPDATE/DELETE → 同事务 bump security epoch
@@ -17,8 +18,8 @@ import { runMigrations } from "../db/migrate.js";
  *      · DELETE 只允许 staged(active/disabled/retired = 历史,不可物理删除)
  *      · TRUNCATE 三表全拒
  *      · epoch 只能 +1 单调(回退/跳变/删行全拒)
- *      · execution 字段只有 staged 行可改(0135 只冻 active → disabled 行可被原地改写)
- *      · DELETE FROM model_pricing 改**软退役**(0135 会物理删光全部版本历史)
+ *      · execution 字段只有 staged 行可改(0143 只冻 active → disabled 行可被原地改写)
+ *      · DELETE FROM model_pricing 改**软退役**(0143 会物理删光全部版本历史)
  *   ③ MAJOR-1 权限层(**割接后**的形态,用真实受限角色连库验证):
  *      应用角色对 catalog/aliases/epoch 零 DML、内部 DEFINER 过程不可直接调,
  *      但既有业务写(model_pricing / grants)与受控状态机过程全部照常可用
@@ -35,12 +36,18 @@ const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB
 /** 受限角色(模拟割接后的 app 角色)。名字带后缀防与并行套件撞车。 */
 const APP_ROLE = "oc_authz_probe_role";
 const APP_ROLE_PW = "probe-pw";
+const ADMIN_ROLE = "oc_authz_admin_probe_role";
+const ADMIN_ROLE_PW = "admin-probe-pw";
+const DEPLOY_ROLE = "oc_authz_deploy_probe_role";
+const DEPLOY_ROLE_PW = "deploy-probe-pw";
 
 let pgAvailable = false;
 let appPool: Pool | null = null;
+let adminPool: Pool | null = null;
+let deployPool: Pool | null = null;
 let testUserId: string | null = null;
 
-const CAPABILITY = '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null}}';
+const CAPABILITY = '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null},"ccb":{"capability_zero":true,"supports_thinking":true}}';
 
 function skipIfNoPg(t: TestContext): boolean {
   if (!pgAvailable) {
@@ -133,17 +140,31 @@ before(async () => {
   // 受限角色(割接后的 app 角色形态)。CREATE ROLE 需要 superuser —— 本地/CI 的 fixture
   // PG 都是 POSTGRES_USER=test 引导的超级用户(见 packages/commercial/README.md)。
   await query(`DROP ROLE IF EXISTS ${APP_ROLE}`).catch(() => undefined);
+  await query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`).catch(() => undefined);
+  await query(`DROP ROLE IF EXISTS ${DEPLOY_ROLE}`).catch(() => undefined);
   await query(`CREATE ROLE ${APP_ROLE} LOGIN PASSWORD '${APP_ROLE_PW}'`);
+  await query(`CREATE ROLE ${ADMIN_ROLE} LOGIN PASSWORD '${ADMIN_ROLE_PW}'`);
+  await query(`CREATE ROLE ${DEPLOY_ROLE} LOGIN PASSWORD '${DEPLOY_ROLE_PW}'`);
   await query(`GRANT USAGE ON SCHEMA public TO ${APP_ROLE}`);
+  await query(`GRANT USAGE ON SCHEMA public TO ${ADMIN_ROLE}`);
+  await query(`GRANT USAGE ON SCHEMA public TO ${DEPLOY_ROLE}`);
   await query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${APP_ROLE}`);
   await query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${APP_ROLE}`);
-  // 0136 的权限策略(单一权威):三张权威表只留 SELECT + 受控过程 EXECUTE。
+  // 0144 的权限策略(单一权威):三张权威表只留 SELECT + 受控过程 EXECUTE。
   await query(`SELECT fn_model_authority_grant_app_role('${APP_ROLE}')`);
+  await query(`SELECT fn_model_authority_grant_admin_role('${ADMIN_ROLE}')`);
+  await query(`SELECT fn_model_authority_grant_deploy_role('${DEPLOY_ROLE}')`);
 
   const url = new URL(TEST_DB_URL);
   url.username = APP_ROLE;
   url.password = APP_ROLE_PW;
   appPool = new Pool({ connectionString: url.toString(), max: 2 });
+  url.username = ADMIN_ROLE;
+  url.password = ADMIN_ROLE_PW;
+  adminPool = new Pool({ connectionString: url.toString(), max: 2 });
+  url.username = DEPLOY_ROLE;
+  url.password = DEPLOY_ROLE_PW;
+  deployPool = new Pool({ connectionString: url.toString(), max: 2 });
 });
 
 after(async () => {
@@ -152,9 +173,21 @@ after(async () => {
     await appPool.end();
     appPool = null;
   }
+  if (adminPool) {
+    await adminPool.end();
+    adminPool = null;
+  }
+  if (deployPool) {
+    await deployPool.end();
+    deployPool = null;
+  }
   try {
     await query(`DROP OWNED BY ${APP_ROLE}`);
+    await query(`DROP OWNED BY ${ADMIN_ROLE}`);
+    await query(`DROP OWNED BY ${DEPLOY_ROLE}`);
     await query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
+    await query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
+    await query(`DROP ROLE IF EXISTS ${DEPLOY_ROLE}`);
   } catch {
     /* ignore */
   }
@@ -176,6 +209,7 @@ beforeEach(async () => {
   await tx(async (c) => {
     await c.query("SET LOCAL session_replication_role = replica");
     await c.query("DELETE FROM model_visibility_grants");
+    await c.query("DELETE FROM model_authority_deploy_state");
     await c.query("DELETE FROM model_aliases");
     await c.query("DELETE FROM model_catalog");
     await c.query("DELETE FROM model_pricing");
@@ -192,7 +226,7 @@ beforeEach(async () => {
 // ① BLOCKER-1:grants → epoch + NOTIFY
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("0136 ① grants 写 → security epoch", () => {
+describe("0144 ① grants 写 → security epoch", () => {
   test("INSERT / UPDATE / DELETE 三种写都 bump epoch(撤权不再有 stale window)", async (t) => {
     if (skipIfNoPg(t)) return;
     const e0 = await epochNow();
@@ -261,13 +295,51 @@ describe("0136 ① grants 写 → security epoch", () => {
     });
     assert.equal(await epochNow(), e0 + 1n, "事务内幂等:多条写只抬一格");
   });
+
+  test("epoch-aware authz loader 不继承 60s 缓存:撤权后新 epoch 立即看不到 grant", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const load = makeLoadUserModelAuthz();
+    await query(
+      "INSERT INTO model_visibility_grants (user_id, model_id) VALUES ($1::bigint,'gpt-5.5')",
+      [testUserId],
+    );
+    const grantedEpoch = await epochNow();
+    const warm = await load(BigInt(testUserId!), grantedEpoch);
+    assert.equal(warm.grantedModelIds.has("gpt-5.5"), true);
+
+    await query(
+      "DELETE FROM model_visibility_grants WHERE user_id=$1::bigint AND model_id='gpt-5.5'",
+      [testUserId],
+    );
+    const revokedEpoch = await epochNow();
+    assert.ok(revokedEpoch > grantedEpoch);
+    const fresh = await load(BigInt(testUserId!), revokedEpoch);
+    assert.equal(fresh.grantedModelIds.has("gpt-5.5"), false);
+  });
+
+  test("users.role 降权同事务 bump epoch：热缓存 admin 在新 epoch 立即变 user", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const load = makeLoadUserModelAuthz();
+    const beforePromote = await epochNow();
+    await query("UPDATE users SET role='admin' WHERE id=$1::bigint", [testUserId]);
+    const adminEpoch = await epochNow();
+    assert.equal(adminEpoch, beforePromote + 1n);
+    const warm = await load(BigInt(testUserId!), adminEpoch);
+    assert.equal(warm.role, "admin");
+
+    await query("UPDATE users SET role='user' WHERE id=$1::bigint", [testUserId]);
+    const userEpoch = await epochNow();
+    assert.equal(userEpoch, adminEpoch + 1n);
+    const fresh = await load(BigInt(testUserId!), userEpoch);
+    assert.equal(fresh.role, "user", "降权不得继承同一 loader 的 60s admin cache");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ② MAJOR-1:trigger 层边界(owner 也绕不过)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("0136 ② catalog 状态机边界", () => {
+describe("0144 ② catalog 状态机边界", () => {
   test("INSERT 只能生于 staged(直插 active / disabled 拒)", async (t) => {
     if (skipIfNoPg(t)) return;
     await expectRejected(
@@ -340,7 +412,7 @@ describe("0136 ② catalog 状态机边界", () => {
     assert.equal(await epochNow(), 1n, "epoch 原封不动");
   });
 
-  test("execution 字段只有 staged 行可改(0135 只冻 active → disabled 行可被原地改写后 activate)", async (t) => {
+  test("execution 字段只有 staged 行可改(0143 只冻 active → disabled 行可被原地改写后 activate)", async (t) => {
     if (skipIfNoPg(t)) return;
     await expectRejected(
       "UPDATE model_catalog SET engine='codex' WHERE model_id='gpt-5.5'", // disabled
@@ -365,22 +437,34 @@ describe("0136 ② catalog 状态机边界", () => {
   test("状态转移矩阵不变(retired 单向;被 alias 引用禁退休)", async (t) => {
     if (skipIfNoPg(t)) return;
     // alias 必须在行还是 active/staged 时挂上(alias 不可指向 disabled/retired)
-    await query("SELECT fn_model_alias_set('glm-latest','glm-5.2')");
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("SELECT fn_model_alias_set('glm-latest','glm-5.1')");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await expectRejected(
-      "UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.2'",
+      "UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'",
       "illegal state transition",
     );
     // 被 alias 引用的行禁止退休(alias 在 disable 后保留 —— disable 不需要先删 alias)
     await expectRejected(
-      "UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.2'",
+      "UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'",
       "referenced by alias",
     );
     await query("SELECT fn_model_alias_remove('glm-latest')");
-    await query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'");
     await expectRejected(
-      "UPDATE model_catalog SET updated_by=1 WHERE model_id='glm-5.2'",
+      "UPDATE model_catalog SET updated_by=1 WHERE model_id='glm-5.1'",
       "retired entry .* is immutable",
+    );
+  });
+
+  test("平台运行必需模型不能被禁用或删价(事务最终态 deferred guard)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await assert.rejects(
+      () => query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.2'"),
+      /required runtime models must remain active and priced: glm-5\.2/i,
+    );
+    await assert.rejects(
+      () => query("DELETE FROM model_pricing WHERE model_id='gpt-5.6-sol'"),
+      /required runtime models must remain active and priced: gpt-5\.6-sol/i,
     );
   });
 });
@@ -389,16 +473,16 @@ describe("0136 ② catalog 状态机边界", () => {
 // ③ 兼容层:pricing 写路由 + 软退役
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("0136 ③ model_pricing 兼容层", () => {
-  test("DELETE FROM model_pricing → **软退役**(0135 会物理删光全部版本历史)", async (t) => {
+describe("0144 ③ model_pricing 兼容层", () => {
+  test("DELETE FROM model_pricing → **软退役**(0143 会物理删光全部版本历史)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const before = await statesOf("kimi-k2.7-code");
+    const before = await statesOf("glm-5.1");
     assert.equal(before.length, 1);
     assert.equal(before[0].state, "active");
 
-    await query("DELETE FROM model_pricing WHERE model_id='kimi-k2.7-code'");
+    await query("DELETE FROM model_pricing WHERE model_id='glm-5.1'");
 
-    const after = await statesOf("kimi-k2.7-code");
+    const after = await statesOf("glm-5.1");
     assert.equal(after.length, 1, "catalog 历史行必须还在(不是物理删除)");
     assert.equal(after[0].state, "retired");
     assert.equal(after[0].entry_id, before[0].entry_id, "同一 entry_id —— 历史可回溯");
@@ -407,9 +491,9 @@ describe("0136 ③ model_pricing 兼容层", () => {
     await query(
       `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility)
-       VALUES ('kimi-k2.7-code','Kimi',684,2880,137,0,1.000,TRUE,88,'public')`,
+       VALUES ('glm-5.1','GLM 5.1',1,1,1,0,1.000,TRUE,88,'hidden')`,
     );
-    const revived = await statesOf("kimi-k2.7-code");
+    const revived = await statesOf("glm-5.1");
     assert.equal(revived.length, 2, "旧 retired 历史 + 新 active");
     assert.deepEqual(revived.map((r) => r.state), ["retired", "active"]);
   });
@@ -442,9 +526,9 @@ describe("0136 ③ model_pricing 兼容层", () => {
 
   test("不变量:model_pricing.enabled 恒等于 (catalog 有 active 行)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.2'");
+    await query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
     await query("UPDATE model_pricing SET enabled=true  WHERE model_id='gpt-5.5'");
-    await query("DELETE FROM model_pricing WHERE model_id='kimi-k2.7-code'");
+    await query("DELETE FROM model_pricing WHERE model_id='gpt-5.6-terra'");
     const drift = await query<{ model_id: string }>(
       `SELECT p.model_id FROM model_pricing p
         WHERE p.enabled IS DISTINCT FROM EXISTS (
@@ -458,7 +542,7 @@ describe("0136 ③ model_pricing 兼容层", () => {
 // ④ 受控存储过程
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("0136 ④ 受控状态机过程", () => {
+describe("0144 ④ 受控状态机过程", () => {
   test("stage → activate → disable → retire 全链 + epoch 只在可执行性变化时抬", async (t) => {
     if (skipIfNoPg(t)) return;
     const e0 = await epochNow();
@@ -498,8 +582,8 @@ describe("0136 ④ 受控状态机过程", () => {
 
     await query(
       `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,
-         '{"supports_vision":false,"reasoning":{"supported":["low","medium","high","xhigh","max"],"codex_model_default":"xhigh"}}'::jsonb,
-         1,NULL)`,
+         '{"supports_vision":false,"reasoning":{"supported":["low","medium","high","xhigh","max"],"codex_model_default":"xhigh"},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
+         1,NULL,0)`,
     );
 
     const rows = await query<{ entry_id: string; engine: string; state: string }>(
@@ -576,9 +660,9 @@ describe("0136 ④ 受控状态机过程", () => {
 
   test("alias 不可指向 disabled/retired 行", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
     await assert.rejects(
-      () => query("SELECT fn_model_alias_set('glm-latest','glm-5.2')"),
+      () => query("SELECT fn_model_alias_set('glm-latest','glm-5.1')"),
       /has no staged\/active version/i,
     );
   });
@@ -588,7 +672,7 @@ describe("0136 ④ 受控状态机过程", () => {
 // ⑤ 权限边界(真实受限角色连库)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("0136 ⑤ 应用角色权限边界(割接后形态)", () => {
+describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
   /** 期望受限角色执行 SQL 被权限拒绝。 */
   async function expectDenied(sql: string, params: unknown[] = []): Promise<void> {
     assert.ok(appPool);
@@ -632,20 +716,46 @@ describe("0136 ⑤ 应用角色权限边界(割接后形态)", () => {
     const e = await appPool.query("SELECT epoch FROM model_security_epoch");
     assert.equal(e.rows.length, 1);
     await appPool.query("SELECT alias FROM model_aliases");
+    await expectDenied("SELECT * FROM model_authority_deploy_state");
+  });
+
+  test("observation/cutover 证据只有 deploy role 可写；app 不可伪造、admin 只读", async (t) => {
+    if (skipIfNoPg(t)) return;
+    assert.ok(appPool && adminPool && deployPool);
+    await expectDenied(
+      "INSERT INTO model_authority_deploy_state(key,value) VALUES ('observation','{}')",
+    );
+    await assert.rejects(
+      () => adminPool!.query(
+        "INSERT INTO model_authority_deploy_state(key,value) VALUES ('observation','{}')",
+      ),
+      /permission denied/i,
+    );
+    await deployPool!.query(
+      "INSERT INTO model_authority_deploy_state(key,value) VALUES ('observation','{}')",
+    );
+    assert.equal(
+      (await adminPool!.query("SELECT key FROM model_authority_deploy_state WHERE key='observation'")).rowCount,
+      1,
+    );
+    await assert.rejects(
+      () => deployPool!.query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'"),
+      /permission denied/i,
+    );
   });
 
   test("既有业务写照常:model_pricing.enabled → 状态机 + epoch bump(admin PATCH 的真实路径)", async (t) => {
     if (skipIfNoPg(t)) return;
     assert.ok(appPool);
     const e0 = await epochNow();
-    await appPool.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.2'");
-    assert.equal((await statesOf("glm-5.2"))[0].state, "disabled", "写 pricing 镜像列 → 路由到 catalog 状态机");
+    await appPool.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
+    assert.equal((await statesOf("glm-5.1"))[0].state, "disabled", "写 pricing 镜像列 → 路由到 catalog 状态机");
     assert.ok((await epochNow()) > e0, "安全写 → epoch bump(经 DEFINER trigger,受限角色也能触发)");
 
     // admin/pricing.ts 的真实形状:SELECT FOR UPDATE + UPDATE ... RETURNING
     const out = await appPool.query<{ enabled: boolean }>(
       `UPDATE model_pricing SET multiplier=$1, lock_version=lock_version+1, updated_at=NOW()
-        WHERE model_id='glm-5.2' RETURNING enabled`,
+        WHERE model_id='glm-5.1' RETURNING enabled`,
       ["3.000"],
     );
     assert.equal(out.rows[0].enabled, false, "RETURNING 反映权威后态");
@@ -663,22 +773,26 @@ describe("0136 ⑤ 应用角色权限边界(割接后形态)", () => {
     assert.ok((await epochNow()) > e1, "受限角色撤权同样 bump epoch");
   });
 
-  test("受控状态机过程可用(应用角色的唯一 catalog 写入口)", async (t) => {
+  test("普通应用角色不能调用状态机;独立 admin 角色才是唯一 catalog 写入口", async (t) => {
     if (skipIfNoPg(t)) return;
     assert.ok(appPool);
-    await appPool.query(
+    assert.ok(adminPool);
+    await expectDenied(
+      `SELECT fn_model_stage_version('app-mod','ccb','deepseek',NULL,200000,'${CAPABILITY}'::jsonb,1,NULL)`,
+    );
+    await adminPool.query(
       `SELECT fn_model_stage_version('app-mod','ccb','deepseek',NULL,200000,'${CAPABILITY}'::jsonb,1,NULL)`,
     );
     assert.equal((await statesOf("app-mod"))[0].state, "staged");
-    await appPool.query("SELECT fn_model_activate('app-mod')");
+    await adminPool.query("SELECT fn_model_activate('app-mod')");
     assert.equal((await statesOf("app-mod"))[0].state, "active");
-    await appPool.query("SELECT fn_model_disable('app-mod')");
-    await appPool.query("SELECT fn_model_alias_set('app-alias','glm-5.2')");
-    await appPool.query("SELECT fn_model_alias_remove('app-alias')");
+    await adminPool.query("SELECT fn_model_disable('app-mod')");
+    await adminPool.query("SELECT fn_model_alias_set('app-alias','glm-5.2')");
+    await adminPool.query("SELECT fn_model_alias_remove('app-alias')");
     // 过程内部照样受 trigger 约束(状态机不因 DEFINER 而放宽)
     await assert.rejects(
       () =>
-        appPool!.query(
+        adminPool!.query(
           `SELECT fn_model_stage_version('glm-5.2','codex','codex',NULL,NULL,'${CAPABILITY}'::jsonb,1,NULL)`,
         ),
       /already has a active version/i,

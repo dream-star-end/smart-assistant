@@ -467,6 +467,28 @@ describe("makeCodexFinalizer / usage field plumbing", () => {
     assert.equal(ins.params?.[6], "33");
     assert.equal(ins.params?.[7], "44");
   });
+
+  test("codex authority stamp 写入 usage_records 四个证据列", async () => {
+    const { poolCtrl, ctx } = await makeFixture();
+    const fz = makeCodexFinalizer({
+      ...ctx,
+      authority: {
+        executionRevision: "a".repeat(64),
+        projectionRevision: null,
+        securityEpoch: 9007199254740993n,
+        kind: "bridge_signed",
+      },
+    });
+    await fz.commit(usage(11, 22), "success");
+    const ins = poolCtrl.queries.find((q) => q.sql.trim().startsWith("INSERT INTO usage_records"));
+    assert.ok(ins);
+    assert.deepEqual(ins.params?.slice(16, 20), [
+      "a".repeat(64),
+      null,
+      "9007199254740993",
+      "bridge_signed",
+    ]);
+  });
 });
 
 describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {

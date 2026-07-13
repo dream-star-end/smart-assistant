@@ -99,7 +99,8 @@ export type ModelAuthorityEngine = 'ccb' | 'codex'
 export interface ModelExecutionDescriptor {
   readonly capabilityProfile: { readonly [key: string]: JsonValue }
   readonly capabilitySchemaVersion: number
-  readonly contextWindow: number
+  /** null = catalog 有意未声明；禁止用 0 伪装成一个真实窗口。 */
+  readonly contextWindow: number | null
   readonly supportedEfforts: readonly PlatformReasoningEffort[]
   readonly codexDefaultEffort?: PlatformReasoningEffort
   readonly supportsVision: boolean
@@ -758,7 +759,7 @@ function parseDescriptor(raw: unknown): ModelExecutionDescriptor {
   const descriptor: ModelExecutionDescriptor = {
     capabilityProfile: profile as { [key: string]: JsonValue },
     capabilitySchemaVersion: int(o, 'capabilitySchemaVersion'),
-    contextWindow: int(o, 'contextWindow'),
+    contextWindow: o.contextWindow === null ? null : int(o, 'contextWindow'),
     supportedEfforts: efforts as PlatformReasoningEffort[],
     supportsVision: o.supportsVision,
     ...(o.codexDefaultEffort === undefined

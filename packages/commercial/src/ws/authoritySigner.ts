@@ -88,6 +88,8 @@ import {
 } from 'node:fs'
 import { dirname } from 'node:path'
 
+import type { AuthorityKeyCoverage } from './authorityKeyCensus.js'
+
 import {
   AUTHORITY_TTL_MS,
   type AuthorityKeyring,
@@ -112,6 +114,9 @@ import { checkDirIntegrity } from '../bridgeSecret.js'
 
 /** keyring 落盘路径 —— 与 bridge secret 同域(systemd StateDirectory=openclaude)。 */
 export const DEFAULT_MODEL_AUTHORITY_KEYS_PATH = '/var/lib/openclaude/.v5-model-authority-keys'
+/** 验签进程只允许打开这份公钥投影；绝不解析含 PKCS#8 私钥的 master 文件。 */
+export const DEFAULT_MODEL_AUTHORITY_PUBLIC_KEYS_PATH =
+  `${DEFAULT_MODEL_AUTHORITY_KEYS_PATH}.public`
 
 /** keyId 前缀:`mak1_`(model authority key v1)+ sha256(pubRaw) 前 8 字节 hex。 */
 const KEY_ID_PREFIX = 'mak1_'
@@ -127,12 +132,19 @@ interface StoredKey {
   /** Ed25519 raw 32B 公钥(base64url)—— 注入容器的就是这个。 */
   publicRawB64u: string
   createdAt: number
+  /** 该 key 停止签发的持久时间；删除 TTL 由此计算，进程重启不丢。 */
+  deactivatedAt?: number
 }
 
 interface KeyringFile {
   v: number
   activeKeyId: string
   keys: StoredKey[]
+}
+
+interface PublicKeyringFile {
+  v: number
+  keys: Array<Pick<StoredKey, 'keyId' | 'publicRawB64u' | 'createdAt'>>
 }
 
 // ---------------------------------------------------------------------------
@@ -237,15 +249,27 @@ class KeyringStore {
    * 整份覆盖掉 —— 丢一把在跑容器正在用的公钥 = 那批容器全站验签失败。锁内重读保证
    * mutator 看到的一定是磁盘现状。
    */
-  mutate(fn: (current: KeyringFile) => KeyringFile): KeyringFile {
+  mutate(
+    fn: (current: KeyringFile) => KeyringFile,
+    afterWrite?: (next: KeyringFile) => void,
+    beforeWrite?: (next: KeyringFile) => void,
+  ): KeyringFile {
     if (this.path === null) {
-      this.memory = fn(this.memory as KeyringFile)
+      const next = fn(this.memory as KeyringFile)
+      beforeWrite?.(next)
+      this.memory = next
+      afterWrite?.(this.memory)
       return this.memory
     }
     return withKeyringLock(this.path, () => {
       const cur = this.forceRead()
       const next = fn(cur)
+      // 审计类 precondition 在持锁状态、持久写之前执行。callback 抛错 → ring 完全不变。
+      beforeWrite?.(next)
       this.write(next)
+      // 公钥镜像与私钥 RMW 共用同一把锁，避免两个并发 addKey 以旧投影最后写覆盖
+      // 新投影。私钥先落、公钥后落是安全顺序：active 仍是旧钥，最多短暂看不到新 staged key。
+      afterWrite?.(next)
       return next
     })
   }
@@ -280,6 +304,60 @@ class KeyringStore {
   /** 唯一 tmp 名:固定 `.tmp` 会让并发写者互相截断对方的半成品。 */
   private tmpPath(): string {
     return `${String(this.path)}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+  }
+}
+
+/** 只含公钥的独立落盘投影。egress 的进程内存从物理文件边界上拿不到私钥字段。 */
+class PublicKeyringStore {
+  private cached: PublicKeyringFile | null = null
+  private cachedStamp: string | null = null
+  private memory: PublicKeyringFile | null = null
+
+  constructor(readonly path: string | null) {}
+
+  static ephemeral(file: PublicKeyringFile): PublicKeyringStore {
+    const store = new PublicKeyringStore(null)
+    store.memory = file
+    return store
+  }
+
+  read(opts: { allowMissing?: boolean } = {}): PublicKeyringFile | null {
+    if (this.path === null) return this.memory
+    let stamp: string
+    try {
+      const st = statSync(this.path)
+      stamp = `${st.ino}:${st.mtimeMs}:${st.size}`
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.cached = null
+        this.cachedStamp = null
+        if (opts.allowMissing === true) return null
+        throw new Error(`[model-authority] public keyring file missing: ${this.path}`)
+      }
+      throw err
+    }
+    if (this.cached !== null && this.cachedStamp === stamp) return this.cached
+    const parsed = parsePublicKeyringFile(readFileSync(this.path, 'utf8'), this.path)
+    this.cached = parsed
+    this.cachedStamp = stamp
+    return parsed
+  }
+
+  write(file: PublicKeyringFile): void {
+    if (this.path === null) {
+      this.memory = file
+      return
+    }
+    const tmp = `${this.path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`
+    try {
+      writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 })
+      renameSync(tmp, this.path)
+    } catch (err) {
+      safeUnlink(tmp)
+      throw err
+    }
+    this.cached = null
+    this.cachedStamp = null
   }
 }
 
@@ -350,31 +428,37 @@ function serializeKeyringFile(file: KeyringFile): string {
  * 文件**损坏** → 抛(与 signer 同语义:密钥材料异常必须由运维显式处置,不静默降级)。
  */
 export class AuthorityKeyringReader {
-  private readonly store: KeyringStore
+  private readonly store: PublicKeyringStore
   private readonly log: (msg: string) => void
   private warnedMissing = false
 
-  private constructor(store: KeyringStore, log: (msg: string) => void) {
+  private constructor(store: PublicKeyringStore, log: (msg: string) => void) {
     this.store = store
     this.log = log
   }
 
   /** 打开(**不创建**)。目录完整性异常 → 抛(与 signer 同域校验)。 */
   static open(
-    path: string = DEFAULT_MODEL_AUTHORITY_KEYS_PATH,
+    path: string = DEFAULT_MODEL_AUTHORITY_PUBLIC_KEYS_PATH,
     log: (msg: string) => void = (m) => console.warn(m),
   ): AuthorityKeyringReader {
     checkDirIntegrity(dirname(path), log)
-    return new AuthorityKeyringReader(new KeyringStore(path), log)
+    return new AuthorityKeyringReader(new PublicKeyringStore(path), log)
   }
 
   /** 内部/测试:复用一个已有 store(signer.reader() 的实现体)。 */
-  private static forStore(store: KeyringStore, log: (msg: string) => void): AuthorityKeyringReader {
+  private static forStore(
+    store: PublicKeyringStore,
+    log: (msg: string) => void,
+  ): AuthorityKeyringReader {
     return new AuthorityKeyringReader(store, log)
   }
 
   /** @internal signer 用来暴露自己的只读视图(同一 store = 同一份热重载状态)。 */
-  static _viewOf(store: KeyringStore, log: (msg: string) => void = () => {}): AuthorityKeyringReader {
+  static _viewOf(
+    store: PublicKeyringStore,
+    log: (msg: string) => void = () => {},
+  ): AuthorityKeyringReader {
     return AuthorityKeyringReader.forStore(store, log)
   }
 
@@ -389,7 +473,7 @@ export class AuthorityKeyringReader {
       return new Map()
     }
     this.warnedMissing = false
-    return toPublicKeyring(file)
+    return toAuthorityKeyring(file.keys)
   }
 
   /** ring 里的 keyId(字典序;census 对账维度,protocol 单一实现)。 */
@@ -466,15 +550,17 @@ export interface MintedAuthority {
  * master 独占的 Ed25519 签发器 + keyring(多 keyId 并存,支持 R3-M7 轮换五步)。
  *
  * 轮换五步与本类的映射:
- *   ① 下发新公钥(旧钥保留) → `addKey({ activate: false })`;新 provision 的容器由
+ *   ① 下发新公钥(旧钥保留) → `addKey()`;新 provision 的容器由
  *      supervisor **现取** `publicKeyringEnvAssignment()`(index.ts 传函数而非启动期
  *      快照字符串),在跑容器靠 recycle 换 env;
  *   ② 全容器 attest 新 keyId → `ws/authorityKeyCensus.ts`:容器 hello attestation 上报
  *      自己 ring 的 keyIds/指纹,census 统计覆盖 —— `isFullyCovered(newKeyId)` 为 true
  *      才允许进第③步(**这是 gate,不是目测**);
- *   ③ master 切新私钥       → `setActiveKey(newKeyId)`(文件锁内改,其它进程立刻可见)
+ *   ③ master 切新私钥       → `activateKeyAfterCensus(newKeyId, coverage, audit)`
+ *                              (非空且全覆盖的 census 是不可绕过参数)
  *   ④ 等旧签名 TTL 耗尽      → 等待 ≥ TURN_LEASE_TTL_MS(lease 是最长命的票据)
- *   ⑤ 删旧公钥              → `removeKey(oldKeyId)` + recycle/重注入 env
+ *   ⑤ 停签满一个 turn-lease TTL 后删旧公钥
+ *                            → `removeKey(oldKeyId,{audit})` + recycle/重注入 env
  * 任一步顺序颠倒(尤其 ③ 早于 ①②)= 在跑容器验不了新签名 → 全站 UnknownKey 拒帧。
  *
  * **热重载**:所有读(activeKeyId / keyIds / publicKeyring / 签名取私钥)都经 KeyringStore
@@ -482,10 +568,18 @@ export interface MintedAuthority {
  */
 export class AuthoritySigner {
   private readonly store: KeyringStore
+  private readonly publicStore: PublicKeyringStore
   private readonly privateKeyCache = new Map<string, KeyObject>()
+  private readonly now: () => number
 
-  private constructor(store: KeyringStore) {
+  private constructor(
+    store: KeyringStore,
+    publicStore: PublicKeyringStore,
+    now: () => number = Date.now,
+  ) {
     this.store = store
+    this.publicStore = publicStore
+    this.now = now
   }
 
   /** 生产入口:加载(或首启生成)落盘 keyring。文件损坏 → 抛(fail-closed,见文件头)。 */
@@ -497,21 +591,28 @@ export class AuthoritySigner {
     checkDirIntegrity(dir, log)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
     const store = new KeyringStore(path)
-    store.initIfMissing(log)
-    return new AuthoritySigner(store)
+    const file = store.initIfMissing(log)
+    const publicStore = new PublicKeyringStore(`${path}.public`)
+    // 每次 master 启动都由经过私钥/公钥一致性校验的私钥 ring 重建公钥投影。
+    // 旧版本升级时这一步创建新文件；egress 在此之前只会空 ring fail-closed。
+    publicStore.write(toPublicKeyringFile(file))
+    return new AuthoritySigner(store, publicStore, Date.now)
   }
 
   /** 测试/内存态入口(不落盘)。 */
-  static createEphemeral(): AuthoritySigner {
+  static createEphemeral(now: () => number = Date.now): AuthoritySigner {
     const first = generateStoredKey()
+    const file: KeyringFile = { v: 1, activeKeyId: first.keyId, keys: [first] }
     return new AuthoritySigner(
-      KeyringStore.ephemeral({ v: 1, activeKeyId: first.keyId, keys: [first] }),
+      KeyringStore.ephemeral(file),
+      PublicKeyringStore.ephemeral(toPublicKeyringFile(file)),
+      now,
     )
   }
 
   /** 同一份 keyring 的**只读视图**(要 keyring 的地方一律拿它,别传 signer)。 */
   reader(): AuthorityKeyringReader {
-    return AuthorityKeyringReader._viewOf(this.store)
+    return AuthorityKeyringReader._viewOf(this.publicStore)
   }
 
   get activeKeyId(): string {
@@ -524,7 +625,7 @@ export class AuthoritySigner {
 
   /** 公钥 keyring(keyId → raw32)—— verifyAuthority / verifyTurnLease 的入参形状。 */
   publicKeyring(): AuthorityKeyring {
-    return toPublicKeyring(this.store.current())
+    return toAuthorityKeyring(this.publicStore.read()!.keys)
   }
 
   /** ring 指纹(轮换 census 的对账串;与容器 attestation 上报值同源)。 */
@@ -632,13 +733,12 @@ export class AuthoritySigner {
   // --- 轮换五步(R3-M7)-----------------------------------------------------
 
   /** 步①:加一把新钥进 ring(默认**不**切签发,先让公钥下发到全部容器)。 */
-  addKey(opts: { activate?: boolean } = {}): string {
+  addKey(): string {
     const key = generateStoredKey()
-    this.store.mutate((cur) => ({
-      ...cur,
-      keys: [...cur.keys, key],
-      ...(opts.activate === true ? { activeKeyId: key.keyId } : {}),
-    }))
+    this.store.mutate(
+      (cur) => ({ ...cur, keys: [...cur.keys, key] }),
+      (next) => this.publicStore.write(toPublicKeyringFile(next)),
+    )
     return key.keyId
   }
 
@@ -647,29 +747,116 @@ export class AuthoritySigner {
    * **前提 = 该 keyId 的公钥已下发到全部在跑容器**(轮换步骤②;gate = census.isFullyCovered)。
    * 切早了 = 在跑容器全部 UnknownKey 拒帧。
    */
-  setActiveKey(keyId: string): void {
-    this.store.mutate((cur) => {
-      if (!cur.keys.some((k) => k.keyId === keyId)) {
-        throw new Error(`[model-authority] setActiveKey: unknown keyId ${keyId}`)
-      }
-      return { ...cur, activeKeyId: keyId }
-    })
+  activateKeyAfterCensus(
+    keyId: string,
+    coverage: AuthorityKeyCoverage,
+    audit: (entry: {
+      action: 'model_authority.key.activate'
+      oldKeyId: string
+      newKeyId: string
+      censusTotal: number
+      censusCovering: number
+      activatedAt: number
+    }) => void,
+  ): void {
+    const now = this.now()
+    if (!this.store.current().keys.some((key) => key.keyId === keyId)) {
+      throw new Error(`[model-authority] activateKeyAfterCensus: unknown keyId ${keyId}`)
+    }
+    if (coverage.keyId !== keyId) {
+      throw new Error(`[model-authority] census keyId mismatch: ${coverage.keyId} != ${keyId}`)
+    }
+    if (coverage.total <= 0) {
+      throw new Error('[model-authority] refusing activation without a non-empty census')
+    }
+    if (
+      !coverage.fullyCovered ||
+      coverage.covering !== coverage.total ||
+      coverage.missing.length !== 0
+    ) {
+      throw new Error(
+        `[model-authority] key ${keyId} is not fully covered ` +
+          `(${coverage.covering}/${coverage.total})`,
+      )
+    }
+    const publicFile = this.publicStore.read()
+    if (!publicFile?.keys.some((key) => key.keyId === keyId)) {
+      throw new Error(`[model-authority] public projection missing keyId ${keyId}`)
+    }
+    let oldKeyId = ''
+    this.store.mutate(
+      (cur) => {
+        if (!cur.keys.some((k) => k.keyId === keyId)) {
+          throw new Error(`[model-authority] activateKeyAfterCensus: unknown keyId ${keyId}`)
+        }
+        oldKeyId = cur.activeKeyId
+        return {
+          ...cur,
+          activeKeyId: keyId,
+          keys: cur.keys.map((key) =>
+            key.keyId === oldKeyId
+              ? { ...key, deactivatedAt: now }
+              : key.keyId === keyId
+                ? { ...key, deactivatedAt: undefined }
+                : key,
+          ),
+        }
+      },
+      undefined,
+      () => audit({
+        action: 'model_authority.key.activate',
+        oldKeyId,
+        newKeyId: keyId,
+        censusTotal: coverage.total,
+        censusCovering: coverage.covering,
+        activatedAt: now,
+      }),
+    )
   }
 
   /**
    * 步⑤:移除旧公钥(此后该 keyId 的旧签名 → UnknownKey)。
    * 前提 = 已过 ④「旧签名 TTL 耗尽」(最长命票据 = turn lease)。禁止移除 active 钥。
    */
-  removeKey(keyId: string): void {
-    this.store.mutate((cur) => {
-      if (keyId === cur.activeKeyId) {
-        throw new Error(`[model-authority] removeKey: refusing to remove active keyId ${keyId}`)
-      }
-      if (!cur.keys.some((k) => k.keyId === keyId)) {
-        throw new Error(`[model-authority] removeKey: unknown keyId ${keyId}`)
-      }
-      return { ...cur, keys: cur.keys.filter((k) => k.keyId !== keyId) }
-    })
+  removeKey(
+    keyId: string,
+    opts: {
+      audit: (entry: {
+        action: 'model_authority.key.remove'
+        keyId: string
+        deactivatedAt: number
+        removedAt: number
+      }) => void
+    },
+  ): void {
+    const now = this.now()
+    let deactivatedAt = 0
+    this.store.mutate(
+      (cur) => {
+        if (keyId === cur.activeKeyId) {
+          throw new Error(`[model-authority] removeKey: refusing to remove active keyId ${keyId}`)
+        }
+        const key = cur.keys.find((k) => k.keyId === keyId)
+        if (!key) {
+          throw new Error(`[model-authority] removeKey: unknown keyId ${keyId}`)
+        }
+        if (key.deactivatedAt === undefined) {
+          throw new Error(`[model-authority] removeKey: key ${keyId} has no persisted deactivation time`)
+        }
+        if (now - key.deactivatedAt < TURN_LEASE_TTL_MS) {
+          throw new Error(`[model-authority] removeKey: turn lease TTL has not elapsed for ${keyId}`)
+        }
+        deactivatedAt = key.deactivatedAt
+        return { ...cur, keys: cur.keys.filter((k) => k.keyId !== keyId) }
+      },
+      (next) => this.publicStore.write(toPublicKeyringFile(next)),
+      () => opts.audit({
+        action: 'model_authority.key.remove',
+        keyId,
+        deactivatedAt,
+        removedAt: now,
+      }),
+    )
     this.privateKeyCache.delete(keyId)
   }
 
@@ -697,12 +884,25 @@ export class AuthoritySigner {
   }
 }
 
-function toPublicKeyring(file: KeyringFile): AuthorityKeyring {
+function toAuthorityKeyring(
+  keys: ReadonlyArray<Pick<StoredKey, 'keyId' | 'publicRawB64u'>>,
+): AuthorityKeyring {
   const map = new Map<string, Uint8Array>()
-  for (const k of file.keys) {
+  for (const k of keys) {
     map.set(k.keyId, new Uint8Array(Buffer.from(k.publicRawB64u, 'base64url')))
   }
   return map
+}
+
+function toPublicKeyringFile(file: KeyringFile): PublicKeyringFile {
+  return {
+    v: 1,
+    keys: file.keys.map(({ keyId, publicRawB64u, createdAt }) => ({
+      keyId,
+      publicRawB64u,
+      createdAt,
+    })),
+  }
 }
 
 /**
@@ -764,7 +964,14 @@ function parseKeyringFile(raw: string, path: string): KeyringFile {
     if (
       typeof k?.keyId !== 'string' ||
       typeof k?.privatePkcs8B64 !== 'string' ||
-      typeof k?.publicRawB64u !== 'string'
+      typeof k?.publicRawB64u !== 'string' ||
+      typeof k?.createdAt !== 'number' ||
+      !Number.isFinite(k.createdAt) ||
+      k.createdAt <= 0 ||
+      (k.deactivatedAt !== undefined &&
+        (typeof k.deactivatedAt !== 'number' ||
+          !Number.isFinite(k.deactivatedAt) ||
+          k.deactivatedAt <= 0))
     ) {
       throw new Error(`[model-authority] keyring entry shape invalid: ${path}`)
     }
@@ -791,4 +998,40 @@ function parseKeyringFile(raw: string, path: string): KeyringFile {
     throw new Error(`[model-authority] keyring activeKeyId not in ring: ${path}`)
   }
   return { v: 1, activeKeyId: file.activeKeyId, keys: file.keys as StoredKey[] }
+}
+
+/** 公钥投影解析：形状与 keyId 派生关系仍严格校验，但类型上根本不存在私钥字段。 */
+function parsePublicKeyringFile(raw: string, path: string): PublicKeyringFile {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error(`[model-authority] public keyring file is not valid JSON: ${path}`)
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new Error(`[model-authority] public keyring file is not an object: ${path}`)
+  }
+  const file = parsed as Partial<PublicKeyringFile>
+  if (file.v !== 1 || !Array.isArray(file.keys)) {
+    throw new Error(`[model-authority] public keyring file shape invalid: ${path}`)
+  }
+  const seen = new Set<string>()
+  for (const key of file.keys) {
+    if (
+      typeof key?.keyId !== 'string' ||
+      typeof key?.publicRawB64u !== 'string' ||
+      typeof key?.createdAt !== 'number'
+    ) {
+      throw new Error(`[model-authority] public keyring entry shape invalid: ${path}`)
+    }
+    if (seen.has(key.keyId)) {
+      throw new Error(`[model-authority] duplicate public keyId ${key.keyId}: ${path}`)
+    }
+    seen.add(key.keyId)
+    const rawKey = Buffer.from(key.publicRawB64u, 'base64url')
+    if (rawKey.length !== 32 || deriveKeyId(rawKey) !== key.keyId) {
+      throw new Error(`[model-authority] public keyring keyId/publicKey mismatch: ${path}`)
+    }
+  }
+  return { v: 1, keys: file.keys }
 }

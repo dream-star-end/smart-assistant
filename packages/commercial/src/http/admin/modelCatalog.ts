@@ -23,6 +23,7 @@ import { HttpError, readJsonBody, sendJson } from "../util.js";
 import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import {
   CatalogConflictError,
+  CatalogCutoverRequiredError,
   CatalogNotFoundError,
   CatalogValidationError,
   activateEntry,
@@ -37,15 +38,15 @@ import { translateRangeError } from "./_shared.js";
 /**
  * ops 层错误 → HTTP 错误(单一映射点:新增 ops 错误类型必须在这里显式落位)。
  *
- * **0135 trigger 的拒绝也要落位**:状态机/唯一索引是 DB 强制的(应用层校验只是前置的
+ * **0143 trigger 的拒绝也要落位**:状态机/唯一索引是 DB 强制的(应用层校验只是前置的
  * 好错误信息),真正的并发竞态一定是被 DB 拦下的 —— 那些 PG 错误码必须翻成 409/422,
  * 而不是 500(500 = "服务器坏了",会误导运维去查 master,而其实是"你和别人抢同一行")。
  */
 const PG_STATE_MACHINE_CODES: Record<string, string> = {
   "23505": "该 model 已有 live 行(staged/active 唯一)——先激活或退役它",
-  "23514": "0135 状态机拒绝(非法状态转移 / active 行 execution 字段不可变 / retired 终态)",
-  "23503": "0135 引用约束拒绝(被 alias 引用的行禁退休 / 无 live 行可切换)",
-  // 0135 的 enabled 镜像是**双向 trigger**:catalog 写会回写 model_pricing,而 pricing 写
+  "23514": "0143 状态机拒绝(非法状态转移 / active 行 execution 字段不可变 / retired 终态)",
+  "23503": "0143 引用约束拒绝(被 alias 引用的行禁退休 / 无 live 行可切换)",
+  // 0143 的 enabled 镜像是**双向 trigger**:catalog 写会回写 model_pricing,而 pricing 写
   // 会路由回 catalog —— 两个 admin 写并发时锁序相反,PG 可能判死锁。它是可重试的并发冲突,
   // 不是服务器故障:翻 409 让 admin 重试(500 会把人误导去查 master)。
   "40P01": "与另一处 admin 写(pricing / catalog)抢同一模型行,PG 判定死锁 —— 直接重试",
@@ -54,6 +55,9 @@ const PG_STATE_MACHINE_CODES: Record<string, string> = {
 function translateCatalogError(err: unknown): never {
   if (err instanceof CatalogNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
   if (err instanceof CatalogConflictError) throw new HttpError(409, "CONFLICT", err.message);
+  if (err instanceof CatalogCutoverRequiredError) {
+    throw new HttpError(409, "MODEL_AUTHORITY_CUTOVER_REQUIRED", err.message);
+  }
   if (err instanceof CatalogValidationError) {
     throw new HttpError(422, "CATALOG_VALIDATION", err.message, {
       issues: err.violations.map((v) => ({ path: "catalog", message: v })),

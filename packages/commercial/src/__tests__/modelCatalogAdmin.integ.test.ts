@@ -1,9 +1,9 @@
 /**
  * 集成:/api/admin/model-catalog 状态机端到端(方案 §7 步 5 的 admin 入口)。
  *
- * 覆盖(真 PG + 真 0135 trigger + 真 HTTP 路由):
+ * 覆盖(真 PG + 真 0143 trigger + 真 HTTP 路由):
  *   1. 权限门:无 JWT → 401;普通用户 → 403(读也按写档:requireAdminVerifyDb)
- *   2. GET:0135 回填行可见(state 与 model_pricing.enabled 等价)+ security_epoch
+ *   2. GET:0143 回填行可见(state 与 model_pricing.enabled 等价)+ security_epoch
  *   3. POST 建 staged:语义校验拒(capability 超上限 / matchesRoute 不符)→ 422
  *   4. staged → activate 缺价格行 → 422(active 却无价 = 计费面拒服务)
  *   5. 补价格行 → activate → 200:state=active + **epoch bump** + model_pricing.enabled 镜像=true
@@ -34,8 +34,12 @@ const JWT_SECRET = "z".repeat(64);
 process.env.DATABASE_URL = TEST_DB_URL;
 process.env.REDIS_URL ??= TEST_REDIS_URL;
 process.env.JWT_SECRET ??= JWT_SECRET;
+process.env.OC_MODEL_AUTHORITY = "1";
 
 const { createPool, closePool, setPoolOverride, resetPool } = await import("../db/index.js");
+const { setModelCatalogAdminPoolOverride, resetModelCatalogAdminPoolOverride } = await import(
+  "../db/modelCatalogAdmin.js"
+);
 const { query } = await import("../db/queries.js");
 const { runMigrations } = await import("../db/migrate.js");
 const { signAccess } = await import("../auth/jwt.js");
@@ -84,11 +88,18 @@ before(async () => {
     return;
   }
   await resetPool();
-  setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
-  // schema 级重置(helpers/db.ts):手工 COMMERCIAL_TABLES 清单会随新迁移漂移(0135 的
+  const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
+  setPoolOverride(pool);
+  setModelCatalogAdminPoolOverride(pool);
+  // schema 级重置(helpers/db.ts):手工 COMMERCIAL_TABLES 清单会随新迁移漂移(0143 的
   // model_catalog/model_aliases/model_security_epoch 就是新增),漏一张就撞 already exists。
   await resetTestSchemaForTest();
   await runMigrations();
+  await query(
+    `INSERT INTO model_authority_deploy_state(key,value,description)
+     VALUES ('cutover','{}'::jsonb,'test cutover')
+     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+  );
   _resetModelCatalogRuntimeForTests();
 
   redis = new IORedis(TEST_REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
@@ -158,6 +169,7 @@ after(async () => {
     } catch {
       /* */
     }
+    resetModelCatalogAdminPoolOverride();
     await closePool();
   }
 });
@@ -219,6 +231,7 @@ const NEW_ENTRY = {
   capability_profile: {
     supports_vision: false,
     reasoning: { supported: ["low", "high"], codex_model_default: null },
+    ccb: { capability_zero: false, supports_thinking: true },
   },
 };
 
@@ -235,12 +248,12 @@ describe("admin model-catalog — 权限门", () => {
 });
 
 describe("admin model-catalog — 状态机全路径", () => {
-  test("GET 列表:0135 回填行可见 + epoch", async (t) => {
+  test("GET 列表:0143 回填行可见 + epoch", async (t) => {
     if (skipIfNoHttp(t)) return;
     const r = await api("GET", "/api/admin/model-catalog", { token: adminToken });
     assert.equal(r.status, 200);
     const entries = r.json.entries as Array<Json>;
-    assert.ok(entries.length > 0, "0135 应从 model_pricing 回填 catalog");
+    assert.ok(entries.length > 0, "0143 应从 model_pricing 回填 catalog");
     assert.ok(BigInt(r.json.security_epoch as string) >= 1n);
     // 回填不变量:state 与 model_pricing.enabled 等价
     const drift = await query<{ n: string }>(
@@ -263,6 +276,7 @@ describe("admin model-catalog — 状态机全路径", () => {
         capability_profile: {
           supports_vision: false,
           reasoning: { supported: ["low"], codex_model_default: null },
+          ccb: { capability_zero: true, supports_thinking: true },
         },
       },
     });
@@ -289,7 +303,7 @@ describe("admin model-catalog — 状态机全路径", () => {
     assert.equal(r.json.state, "staged");
     const staged = await entryOf(NEW_MODEL, "staged");
     assert.ok(staged, "staged 行应落库");
-    // 新增 staged 行 = catalog 变更 → epoch bump(0135 把任何 catalog 写都当安全敏感)
+    // 新增 staged 行 = catalog 变更 → epoch bump(0143 把任何 catalog 写都当安全敏感)
     assert.ok((await epoch()) >= before);
     // executionRevision 只含 active 行 → staged 不进投影
     const snap = peekModelCatalogCache()?.peek();
@@ -417,6 +431,7 @@ describe("admin model-catalog — 状态机全路径", () => {
           // deepseek 机制上限 supportsVision=false —— 声明 vision 必拒
           supports_vision: true,
           reasoning: { supported: ["low"], codex_model_default: null },
+          ccb: { capability_zero: false, supports_thinking: true },
         },
         lock_version: active.lock,
       },
@@ -434,7 +449,7 @@ describe("admin model-catalog — 状态机全路径", () => {
       body: NEW_ENTRY, // 此时该 model 已有 active 行
     });
     assert.equal(r.status, 409, JSON.stringify(r.json));
-    assert.match(JSON.stringify(r.json), /live 行/);
+    assert.match(JSON.stringify(r.json), /live (?:行|version)/);
   });
 
   test("admin_audit:stage/activate/disable/switch 全部留痕", async (t) => {

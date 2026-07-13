@@ -11,7 +11,9 @@ Wants=postgresql.service redis-server.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/openclaude/openclaude-v5
+# egress 是全局单实例，不属于 A/B 任一 master lane。deploy-v5.sh --egress 原子翻转
+# 这条独立 symlink 到本次不可变 release；禁止永久钉在 slot A。
+WorkingDirectory=/opt/openclaude/openclaude-v5-egress
 EnvironmentFile=/etc/openclaude/commercial-v5.env
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="NODE_ENV=production"

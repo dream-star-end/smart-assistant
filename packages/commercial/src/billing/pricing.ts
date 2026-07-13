@@ -37,9 +37,9 @@ export interface ModelPricing {
   /** NUMERIC(6,3),保留字符串形式,避免 JS number 丢精度。T-21 会用它算账。 */
   multiplier: string;
   /**
-   * 可用性。**权威 = model_catalog.state='active'**(0135 起)。
+   * 可用性。**权威 = model_catalog.state='active'**(0143 起)。
    *
-   * 本字段**不是**从 `model_pricing.enabled` 列读来的 —— 那一列自 0135 起退役为 catalog 的
+   * 本字段**不是**从 `model_pricing.enabled` 列读来的 —— 那一列自 0143 起退役为 catalog 的
    * 派生镜像(只为旧 master 回滚 / admin 展示 / 外部 SQL 而留)。load() 直接 JOIN catalog 派生,
    * 因此即使镜像列被外力写歪,v5 的路由/授权/计费判定也不会跟着歪(单一权威 R2-M7)。
    */
@@ -237,7 +237,7 @@ export class PricingCache {
    * 一次性加载全表。成功后替换内部 map。
    *
    * `enabled` **不读 model_pricing.enabled 镜像列**,而是从 model_catalog 的 active 行派生
-   * (0135 单一权威 R2-M7)。镜像列由 DB trigger 维护、语义上恒等,但运行时判定只认权威 ——
+   * (0143 单一权威 R2-M7)。镜像列由 DB trigger 维护、语义上恒等,但运行时判定只认权威 ——
    * 少一个可被写歪的信任源。
    */
   async load(): Promise<void> {
@@ -276,8 +276,8 @@ export class PricingCache {
   /**
    * 开始监听 pricing_changed 通知。
    *
-   * 0135 起同时监听 model_catalog_changed:可用性权威已迁到 catalog,catalog 的状态机写
-   * 必须同样让本缓存失效(0135 的 epoch bump 也会补发 pricing_changed 兜底旧 master,
+   * 0143 起同时监听 model_catalog_changed:可用性权威已迁到 catalog,catalog 的状态机写
+   * 必须同样让本缓存失效(0143 的 epoch bump 也会补发 pricing_changed 兜底旧 master,
    * 这里显式再听一路 —— 通道名的单一权威在 modelCatalog.ts)。
    *
    * @param connectionString 可选,默认 loadConfig().DATABASE_URL

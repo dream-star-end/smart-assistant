@@ -80,6 +80,8 @@ function row(
     context_window: 200_000,
     supported_efforts: ['high'],
     supports_vision: false,
+    capability_zero: engine === 'ccb',
+    supports_thinking: engine === 'ccb',
     default_effort: 'high',
     ...extra,
   }
@@ -359,7 +361,7 @@ describe('③ flag 开 + catalog 不可用 → 拒新 turn(无 baked 回落)', (
         agent: { id: 'main', model: 'glm-5.2' } as AgentDef,
         channel: 'cron',
         peerId: 'withproj',
-        ...localExecutionOverride({ canonicalModel: 'deepseek-v4-pro', engine: 'ccb' }),
+        ...localExecutionOverride({ canonicalModel: 'deepseek-v4-pro', engine: 'ccb', supportsVision: false }),
       })
       assert.equal(session.providerTag, 'ccb')
       assert.equal(session.model, 'deepseek-v4-pro', 'model 取投影的 canonicalModel')

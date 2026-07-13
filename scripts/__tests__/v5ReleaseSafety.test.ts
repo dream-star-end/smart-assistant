@@ -191,8 +191,16 @@ describe('v5 release safety lanes', () => {
       [
         '#!/bin/bash',
         'cmd="$*"',
+        'stdin="$(cat)"',
+        'if [[ "$stdin" == *"FROM deploy_state"* ]]; then',
+        '  printf "%s\\n" "${MA_DS_ROW:-1|stable|A||/rel/a||A|A|0|salt|0||1|}"',
+        '  exit 0',
+        'fi',
         'case "$cmd" in',
-        '  *schema_migrations*) printf "%s\\n" "${MA_DB:-1}" ;;',
+        '  *schema_migrations*) printf "%s\\n" "${MA_DB_READY:-true}" ;;',
+        "  *\"name='DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_app|${MA_APP_ROLE_READY:-true}\" ;;",
+        "  *\"name='MODEL_CATALOG_ADMIN_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_admin|${MA_ADMIN_ROLE_READY:-true}\" ;;",
+        "  *\"name='MODEL_AUTHORITY_DEPLOY_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_deploy|${MA_DEPLOY_ROLE_READY:-true}\" ;;",
         '  *"/healthz"*) printf "%s\\n" "{\\"ok\\":true,\\"runtime\\":{\\"capabilities\\":[${MA_MASTER_CAPS-\\"model_authority_v1\\"}]}}" ;;',
         '  *egress-health*) printf "%s\\n" "{\\"ok\\":true,\\"role\\":\\"egress\\",\\"capabilities\\":[${MA_EGRESS_CAPS-\\"model_authority_v1-egress\\"}]}" ;;',
         '  *OC_RUNTIME_RELEASE*) printf "%s\\n" "${MA_RT_RELEASE-/var/lib/openclaude-v5/runtime-releases/rel-abc}" ;;',
@@ -221,10 +229,15 @@ describe('v5 release safety lanes', () => {
       assert.ok(green.stdout.includes(line), `missing "${line}" in:\n${green.stdout}`)
     }
 
-    // ① DB:0135 未 apply
-    const noDb = await maFixture({ MA_DB: '0' })
+    // ① DB:catalog + guards 任一迁移/关键对象未就绪
+    const noDb = await maFixture({ MA_DB_READY: 'false' })
     assert.notEqual(noDb.status, 0)
-    assert.match(noDb.stdout + noDb.stderr, /① DB:迁移 0135_model_catalog 未 apply/)
+    assert.match(noDb.stdout + noDb.stderr, /① DB:.*0143_model_catalog.*0144_model_authority_guards/)
+
+    // ① DB 还必须证明 app/admin/deploy 三个独立角色的最小权限边界。
+    const badAppRole = await maFixture({ MA_APP_ROLE_READY: 'false' })
+    assert.notEqual(badAppRole.status, 0)
+    assert.match(badAppRole.stdout + badAppRole.stderr, /① DB:/)
 
     // ② master:旧版本不广播 capability
     const oldMaster = await maFixture({ MA_MASTER_CAPS: '' })
@@ -250,9 +263,9 @@ describe('v5 release safety lanes', () => {
 
   test('step-5 compat floor is irreversible and guards every activation path', async () => {
     const source = await readFile(deploy, 'utf8')
-    // 地板挂在**全部**激活/回滚路径:蓝绿 activate_release、hotcfg tuple 激活、tuple 回滚。
-    for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple']) {
-      const body = source.match(new RegExp(`${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+    // 地板挂在**全部**激活/回滚路径:传统激活、hotcfg tuple、tuple 回滚、P3 candidate。
+    for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
+      const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
     }
     // marker 探测 fail-closed:psql 失败 → 按已置位处理(不确定即拒)
@@ -264,15 +277,108 @@ describe('v5 release safety lanes', () => {
     assert.match(disableFn, /兼容地板不可逆/)
   })
 
-  test('release metadata declares the 0135 migration and both authority capabilities', async () => {
+  test('model-authority operations pin the stable P3 active lane', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const egressUnit = await readFile(path.join(root, 'deploy/v5/openclaude-v5-egress.service'), 'utf8')
+    const preflight = source.match(/model_authority_preflight\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(preflight, /assert_no_rollout_in_progress/)
+    assert.match(preflight, /ACTIVE_PORT/)
+    assert.doesNotMatch(preflight, /\$\{?V5_PORT\}?/)
+
+    const enable = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const enableSeed = source.match(/enable_seed_authority_by_rev\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const disable = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(enable, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.match(enable, /smoke "\$ACTIVE_PORT"/)
+    assert.match(enableSeed, /assert_no_rollout_in_progress/)
+    assert.match(enableSeed, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.doesNotMatch(enableSeed, /systemctl restart '\$V5_UNIT'/)
+    assert.match(enableSeed, /cd '\$ACTIVE_SRC'/)
+    assert.doesNotMatch(enableSeed, /cd '\$REMOTE_SRC'/)
+    assert.match(enableSeed, /smoke "\$ACTIVE_PORT"/)
+    assert.match(disable, /assert_no_rollout_in_progress/)
+    assert.match(disable, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.match(disable, /smoke "\$ACTIVE_PORT"/)
+
+    const activeB = await maFixture({
+      MA_DS_ROW: '2|stable|B||/rel/b||B|B|0|salt|0||2|/rel/a',
+    })
+    assert.equal(activeB.status, 0, activeB.stdout + activeB.stderr)
+    assert.match(activeB.stdout, /active lane:slot=B.*port=18795/)
+
+    const rollout = await maFixture({
+      MA_DS_ROW: '3|canary|A|B|/rel/a|/rel/b|A|A|10|salt|10|op|3|',
+    })
+    assert.notEqual(rollout.status, 0)
+    assert.match(rollout.stdout + rollout.stderr, /cohort rollout\/候选状态未收敛/)
+
+    // egress 是全局单实例：不得再永久从 slot A 工作目录启动。普通 --egress 必须把
+    // 独立指针钉到本次 BUILT_RELEASE，并具备 cwd/capability 活体验证与旧 release 回切。
+    assert.match(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5-egress$/m)
+    assert.doesNotMatch(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5$/m)
+    const egressStart = source.indexOf('activate_egress_release()')
+    const deployStart = source.indexOf('\ndeploy()', egressStart)
+    const egressActivate = source.slice(egressStart, deployStart)
+    const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
+    const deployBody = source.slice(deployStart, deployEnd)
+    assert.ok(egressStart >= 0 && deployStart > egressStart)
+    assert.match(egressActivate, /mv -T '\$tmplink' '\$V5_EGRESS_SRC'/)
+    assert.match(egressActivate, /\/proc\/\$pid\/cwd/)
+    assert.match(egressActivate, /MODEL_AUTHORITY_EGRESS_CAP/)
+    assert.match(egressActivate, /ln -s '\$prev' '\$tmplink'/)
+    assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
+    assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
+  })
+
+  test('release metadata declares both authority migrations and both authority capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
-    assert.ok(meta.requiredMigrations.includes('0135_model_catalog'))
+    assert.ok(meta.requiredMigrations.includes('0143_model_catalog'))
+    assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
+  test('authority enable is fail-closed: egress enforces before master starts signing', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const body = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const egressRestart = body.indexOf("systemctl restart '$V5_EGRESS_UNIT'")
+    const enforceProbe = body.indexOf('modelAuthority.enforced')
+    const masterRestart = body.indexOf("systemctl restart '$ACTIVE_UNIT'")
+    assert.ok(egressRestart >= 0, 'enable must restart egress')
+    assert.ok(enforceProbe > egressRestart, 'enable must probe egress enforced=true after restart')
+    assert.ok(masterRestart > enforceProbe, 'master may sign only after egress is enforcing')
+  })
+
+  test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const enableStart = source.indexOf('enable_model_authority()')
+    const enableEnd = source.indexOf('disable_model_authority()', enableStart)
+    const enableBody = source.slice(enableStart, enableEnd)
+    assert.ok(enableBody.indexOf('install_model_authority_canary') < enableBody.indexOf('remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1'))
+    assert.ok(enableBody.indexOf('start_model_authority_observation') > enableBody.indexOf('smoke'))
+
+    const cutoverStart = source.indexOf('model_authority_cutover()')
+    const cutoverEnd = source.indexOf('activate_release()', cutoverStart)
+    const cutoverBody = source.slice(cutoverStart, cutoverEnd)
+    assert.match(cutoverBody, /MODEL_AUTHORITY_OBSERVATION_KEY[\s\S]*FOR UPDATE/)
+    assert.match(cutoverBody, /model_security_epoch WHERE id FOR UPDATE/)
+    assert.match(cutoverBody, /observation window shorter than.*MODEL_AUTHORITY_MIN_OBSERVE_SECONDS/)
+    assert.match(cutoverBody, /signed request evidence.*MODEL_AUTHORITY_MIN_REQUESTS/)
+    assert.match(cutoverBody, /catalog canary has no signed usage/)
+    assert.match(cutoverBody, /updated_at-created_at >= interval '5 minutes'/)
+    assert.match(cutoverBody, /emergency activate\/restore drill evidence missing/)
+    assert.match(cutoverBody, /INSERT INTO model_authority_deploy_state\(key,value,description\)/)
+
+    const censusStart = source.indexOf('enable_seed_authority_by_rev()')
+    const censusEnd = source.indexOf('record_model_authority_emergency_drill()', censusStart)
+    const censusBody = source.slice(censusStart, censusEnd)
+    assert.match(censusBody, /docker ps -aq/)
+    assert.match(censusBody, /fleet 含旧\/缺 bundle_rev 容器\(含 stopped\)/)
   })
 
   test('Caddy fallback is transport-error-only and installer dry-run is inert', async () => {
