@@ -126,6 +126,27 @@ describe('v5 release safety lanes', () => {
     assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
   })
 
+  test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ssh() { return 23; }',
+      'assert_repo_required_migrations || exit 1',
+      'printf "%s\\n" SIDE_EFFECT',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    const combined = result.stdout + result.stderr
+    assert.notEqual(result.status, 0)
+    assert.match(combined, /requiredMigrations 远端校验失败/)
+    assert.doesNotMatch(combined, /requiredMigrations 已应用/)
+    assert.doesNotMatch(combined, /SIDE_EFFECT/)
+  })
+
   test('finalize/abort verify the target before irreversible state changes', async () => {
     const source = await readFile(deploy, 'utf8')
     const finalizeBody = source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''
