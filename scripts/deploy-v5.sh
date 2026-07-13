@@ -1686,7 +1686,7 @@ model_authority_observation_status() {
     'observation',(SELECT value FROM o),
     'elapsed_seconds',COALESCE((SELECT floor(extract(epoch FROM (NOW()-(value->>'started_at')::timestamptz)))::bigint FROM o),0),
     'signed_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.authority_kind='bridge_signed' AND u.execution_revision IS NOT NULL AND u.security_epoch::text=o.value->>'security_epoch'),0),
-    'canary_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.model_id=o.value->>'canary_model' AND u.authority_kind='bridge_signed'),0),
+    'canary_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.model=o.value->>'canary_model' AND u.authority_kind='bridge_signed'),0),
     'long_ccb_turns',COALESCE((SELECT count(*) FROM request_finalize_journal j,o WHERE j.created_at >= (o.value->>'started_at')::timestamptz AND j.state='committed' AND j.ctx->>'source'='ccb_proxy' AND j.ctx->>'authorityKind'='bridge_signed' AND j.updated_at-j.created_at >= interval '5 minutes'),0),
     'minimums',jsonb_build_object('elapsed_seconds',$MODEL_AUTHORITY_MIN_OBSERVE_SECONDS,'signed_requests',$MODEL_AUTHORITY_MIN_REQUESTS,'canary_requests',1,'long_ccb_turns',1)
   )::text")" || { echo "✗ observation status 查询失败" >&2; return 1; }
@@ -2078,7 +2078,7 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM usage_records
      WHERE created_at >= (v_obs->>'started_at')::timestamptz
-       AND model_id=v_obs->>'canary_model' AND authority_kind='bridge_signed'
+       AND model=v_obs->>'canary_model' AND authority_kind='bridge_signed'
   ) THEN RAISE EXCEPTION 'catalog canary has no signed usage'; END IF;
   IF NOT EXISTS (
     SELECT 1 FROM request_finalize_journal
