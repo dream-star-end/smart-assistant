@@ -22,6 +22,7 @@
 #   scripts/v5-caddy-apply.sh --verify        # 仅探活(默认落 active;若有 candidate 附带 lane 探测)
 #   scripts/v5-caddy-apply.sh --rollback      # 还原最近一次本脚本备份 + reload
 #   scripts/v5-caddy-apply.sh --dry-run       # 只打印将执行的动作
+#   CADDY_HTTP_PORT=18081 ...                 # 仅隔离预发；非 80 自动 bind 127.0.0.1
 #
 # deploy-v5.sh 的 canary/finalize/abort lane 在 CAS deploy_state 后调用本脚本(--apply)把状态
 # 反映进 Caddy —— CAS 与 Caddy 渲染分离,权威恒在 PG。
@@ -30,6 +31,7 @@ set -euo pipefail
 KL_HOST="${KL_HOST:-kl-mirror}"
 V5_ENV="${V5_ENV:-/etc/openclaude/commercial-v5.env}"
 CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 BACKUP_TAG="pre-v5-p3"
 # 共享资产池(union;deploy-v5.sh dist lane 加法式 rsync 各 release 的 dist/assets → 此处 assets/)。
 ASSETS_POOL="${ASSETS_POOL:-/opt/openclaude/openclaude-v5-assets}"
@@ -50,6 +52,8 @@ for a in "$@"; do case "$a" in
   --apply)      MODE="apply" ;;
   *) echo "未知参数 $a" >&2; exit 2 ;;
 esac; done
+[[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
+  || { echo "✗ CADDY_HTTP_PORT 必须是 1..65535 的规范十进制端口" >&2; exit 2; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
 
 slot_port() { case "$1" in A) echo 18790 ;; B) echo 18795 ;; *) echo "" ;; esac; }
@@ -81,6 +85,8 @@ BODY
 gen_caddyfile() {
   local generation="$1" phase="$2" step="$3" active_slot="$4" candidate_slot="$5"
   local active_port candidate_port default_slot="$4" default_port emit_canary=0
+  local site_address="http://claudeai.chat"
+  [[ "$CADDY_HTTP_PORT" == 80 ]] || site_address="${site_address}:${CADDY_HTTP_PORT}"
   active_port="$(slot_port "$active_slot")"
   [[ -n "$active_port" ]] || { echo "gen_caddyfile: 非法 active_slot='$active_slot'" >&2; return 2; }
   # ── 相位感知的 matcher / 默认 upstream 决策(transition_step 是 phase 内步序,须按 phase 解释)──
@@ -115,7 +121,11 @@ gen_caddyfile() {
 	auto_https off
 }
 
-http://claudeai.chat {
+${site_address} {
+CADDY
+  # 非默认端口仅服务隔离预发，强制 loopback bind；生产默认 80 不输出此行，保持 golden 不变。
+  [[ "$CADDY_HTTP_PORT" == 80 ]] || printf '\tbind 127.0.0.1\n'
+  cat <<CADDY
 	log {
 		output file /var/log/caddy/claudeai-access.log {
 			roll_size 100mb
@@ -330,7 +340,7 @@ verify_routing() {
   if [[ "$DS_phase" == "finalizing" && -n "$DS_candidate_slot" && "$step" -ge 2 ]]; then exp_default="$DS_candidate_slot"; fi
   local exp_default_port; exp_default_port="$(slot_port "$exp_default")"
   # 默认(无 lane cookie):经 Caddy 回源应命中 exp_default,healthz ok
-  local dresp; dresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' http://127.0.0.1:80/healthz" 2>/dev/null || true)"
+  local dresp; dresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' http://127.0.0.1:${CADDY_HTTP_PORT}/healthz" 2>/dev/null || true)"
   echo "  默认 /healthz(应 slot=$exp_default:$exp_default_port): $dresp"
   [[ -z "$dresp" ]] && { echo "✗ 默认请求无响应(受影响!)" >&2; return 1; }
   echo "$dresp" | grep -q '"ok":true' || { echo "✗ 默认 /healthz ok!=true" >&2; return 1; }
@@ -343,7 +353,7 @@ verify_routing() {
   if [[ "$DS_phase" == "canary" || "$DS_phase" == "finalizing" ]] && [[ -n "$DS_candidate_slot" ]] && [[ "$step" -ge "$DS_STEP_CANARY_READY" ]]; then
     local cport cookie cresp; cport="$(slot_port "$DS_candidate_slot")"
     cookie="oc_v5lane=g${DS_generation}.${DS_candidate_slot}"
-    cresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' -H 'Cookie: $cookie' http://127.0.0.1:80/healthz" 2>/dev/null || true)"
+    cresp="$(ssh "$KL_HOST" "curl -fsS -H 'Host: claudeai.chat' -H 'Cookie: $cookie' http://127.0.0.1:${CADDY_HTTP_PORT}/healthz" 2>/dev/null || true)"
     echo "  lane cookie=$cookie /healthz(应 candidate=$DS_candidate_slot:$cport): $cresp"
     echo "$cresp" | grep -q '"ok":true' || { echo "✗ lane cookie 未命中健康 candidate" >&2; return 1; }
     echo "$cresp" | grep -q "\"slot\":\"$DS_candidate_slot\"" || {
@@ -381,7 +391,7 @@ case "$MODE" in
     sshk "diff <(caddy adapt --config '$CADDYFILE' --adapter caddyfile 2>/dev/null | jq -S .) <(caddy adapt --config /tmp/Caddyfile.v5p3new --adapter caddyfile 2>/dev/null | jq -S .) || true"
     sshk "cp '$CADDYFILE' '$CADDYFILE.$BACKUP_TAG.bak'"
     # reload 期间后台探默认路由不掉线
-    sshk "( for i in \$(seq 1 30); do curl -fsS -H 'Host: claudeai.chat' http://127.0.0.1:80/healthz >/dev/null 2>&1 || echo \"  [probe] 默认 miss @\$i\"; sleep 0.3; done ) & PROBE=\$!; cp /tmp/Caddyfile.v5p3new '$CADDYFILE' && systemctl reload caddy; wait \$PROBE; echo '  (reload 期间默认路由探活完成,上面无 miss 即零中断)'"
+    sshk "( for i in \$(seq 1 30); do curl -fsS -H 'Host: claudeai.chat' http://127.0.0.1:${CADDY_HTTP_PORT}/healthz >/dev/null 2>&1 || echo \"  [probe] 默认 miss @\$i\"; sleep 0.3; done ) & PROBE=\$!; cp /tmp/Caddyfile.v5p3new '$CADDYFILE' && systemctl reload caddy; wait \$PROBE; echo '  (reload 期间默认路由探活完成,上面无 miss 即零中断)'"
     verify_routing
     echo "✓ Caddy 已按 deploy_state 渲染安装。回滚:scripts/v5-caddy-apply.sh --rollback"
     ;;
