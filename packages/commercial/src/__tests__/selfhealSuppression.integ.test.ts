@@ -412,7 +412,7 @@ describe("incident 生命周期不再写全员 inbox", () => {
   test("opened/updated 都只留运维账本，不创建用户 delivery", async (t) => {
     if (skipIfNoPg(t)) return;
     const KEY = opsMonitorKey("mem"); // severity_floor=warning → level 变化才可观察 update
-    const sweep = () => sweepOnce({ broadcastAll: () => 0, broadcastToUsers: () => 0 });
+    const sweep = () => sweepOnce({});
 
     await writeCond(KEY, true, { level: "warning" });
     await reconcile();

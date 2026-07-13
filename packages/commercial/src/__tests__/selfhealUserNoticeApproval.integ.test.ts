@@ -93,14 +93,16 @@ describe("selfheal user notice approval end-to-end",()=>{
     if(!available){t.skip("pg unavailable");return;}
     const s=await seed();
     let inbound:AibotInboundHandler=async()=>null;
-    const wecom:string[]=[]; const sent:string[]=[];
+    const wecom:string[]=[]; const sent:string[]=[]; const payloads:Record<string,unknown>[]=[];
     const manager={
       setInboundHandler(h:AibotInboundHandler|null){if(h) inbound=h;},
       async send(_id:string,md:string){wecom.push(md);},
     } as unknown as WecomAibotConnectionManager;
     const handle=startUserNoticeApproval(manager,{
       onlineUserSubset:(ids)=>ids.filter((id)=>id===s.user),
-      broadcastToUsers:(ids)=>{sent.push(...ids);return ids.length;},
+      broadcastToUsers:(ids,payload)=>{
+        sent.push(...ids); payloads.push(payload as Record<string,unknown>); return ids.length;
+      },
       sendWecom:async(_id,chatId,chatType,md)=>{
         assert.equal(chatId,'chat-dx'); assert.equal(chatType,'single'); wecom.push(md);
       },
@@ -118,6 +120,11 @@ describe("selfheal user notice approval end-to-end",()=>{
     assert.match(await inbound(ok) ?? "",/重复回调/);
     await handle.runNow();
     assert.deepEqual(sent,[s.user]);
+    assert.equal(payloads.length,1);
+    assert.equal(payloads[0].type,"sys.incident");
+    assert.equal(payloads[0].status,"resolved");
+    assert.equal(payloads[0].noticeKind,"approved_recovery");
+    assert.equal(payloads[0].incidentId,s.inc);
     const fin=(await query<{status:string;sent_recipient_count:number}>(`SELECT status,sent_recipient_count FROM selfheal_user_notice_proposals WHERE id=$1`,[p.id])).rows[0];
     assert.equal(fin.status,"sent"); assert.equal(fin.sent_recipient_count,1);
     assert.ok(wecom.some((x)=>x.includes("确认在线发送:1 人")));

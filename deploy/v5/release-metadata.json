@@ -10,7 +10,8 @@
     "0135_deploy_state",
     "0137_selfheal_user_notice_approval",
     "0143_model_catalog",
-    "0144_model_authority_guards"
+    "0144_model_authority_guards",
+    "0145_retire_legacy_incident_notices"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
