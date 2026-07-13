@@ -68,6 +68,27 @@ async function seed() {
 }
 
 describe("selfheal user notice approval end-to-end",()=>{
+  test("accepts an exact binding command after the WeCom group mention prefix",async(t)=>{
+    if(!available){t.skip("pg unavailable");return;}
+    const admin=(await query<{id:string}>(`INSERT INTO users(email,password_hash,credits,role,status)
+      VALUES('binding-admin@test.local','x',0,'admin','active') RETURNING id::text`)).rows[0].id;
+    const ch=(await query<{id:string}>(`INSERT INTO admin_alert_channels
+      (admin_id,channel_type,label,enabled,severity_min,event_types,aibot_bot_id,activation_status)
+      VALUES($1,'wecom_aibot','approval',TRUE,'info','[]','bot-binding-test','active') RETURNING id::text`,[admin])).rows[0].id;
+    let inbound:AibotInboundHandler=async()=>null;
+    const manager={setInboundHandler(h:AibotInboundHandler|null){if(h) inbound=h;}} as unknown as WecomAibotConnectionManager;
+    const handle=startUserNoticeApproval(manager,{onlineUserSubset:()=>[],broadcastToUsers:()=>0,sendWecom:async()=>{}});
+    await handle.runNow();
+    const binding=(await query<{binding_code:string}>(`SELECT binding_code FROM selfheal_notice_approver_bindings WHERE channel_id=$1`,[ch])).rows[0];
+    const msg:AibotInboundMessage={channelId:ch,reqId:'bind-mentioned',chatId:'group-dx',chatType:'group',fromUserId:'dx-wecom',text:`@openclaude 绑定审批 ${binding.binding_code}`};
+    assert.match(await inbound(msg) ?? "",/已绑定/);
+    const active=(await query<{active:boolean;chat_id:string;chat_type:string;from_user_id:string}>(
+      `SELECT active,chat_id,chat_type,from_user_id FROM selfheal_notice_approver_bindings WHERE channel_id=$1`,[ch])).rows[0];
+    assert.deepEqual(active,{active:true,chat_id:'group-dx',chat_type:'group',from_user_id:'dx-wecom'});
+    assert.equal(await inbound({...msg,reqId:'not-a-command',text:'@openclaude 请聊天'}),null);
+    await handle.stop();
+  });
+
   test("freezes actual online evidence, requires exact bound WeCom approval, then sends only frozen+online",async(t)=>{
     if(!available){t.skip("pg unavailable");return;}
     const s=await seed();
@@ -92,7 +113,7 @@ describe("selfheal user notice approval end-to-end",()=>{
     const wrong: AibotInboundMessage={channelId:s.ch,reqId:'cmd-wrong',chatId:'chat-dx',chatType:'single',fromUserId:'intruder',text:`同意 ${p.short_code}`};
     assert.match(await inbound(wrong) ?? "",/无权审批/);
     assert.match(await inbound({...wrong,reqId:'cmd-no-type',fromUserId:'dx-wecom',chatType:null}) ?? "",/缺少企微原始 chat_type/);
-    const ok={...wrong,reqId:'cmd-ok',fromUserId:'dx-wecom'};
+    const ok={...wrong,reqId:'cmd-ok',fromUserId:'dx-wecom',text:`@openclaude 同意 ${p.short_code}`};
     assert.match(await inbound(ok) ?? "",/已同意/);
     assert.match(await inbound(ok) ?? "",/重复回调/);
     await handle.runNow();
