@@ -36,6 +36,9 @@ BROKER_SOCK="$RUN_DIR/broker.sock"
 OCHEAL_USER=ocheal
 OCHEAL_HOME=/home/ocheal
 SELFHEAL_HOME_DIR="$OCHEAL_HOME/selfheal"
+OCHEAL_CODEX_DIR="$OCHEAL_HOME/.codex"
+OCHEAL_CODEX_AUTH="$OCHEAL_CODEX_DIR/auth.json"
+ROOT_CODEX_AUTH=/root/.codex/auth.json
 VERIFY_DIR=/var/lib/openclaude-selfheal/verifications
 CLI_SRC_REL="ops/oc-selfheal.mjs"
 CLI_DST=/usr/local/bin/oc-selfheal
@@ -183,6 +186,163 @@ step_dirs() {
       systemd-tmpfiles --create "$TMPFILES_CONF"
       ok "tmpfiles.d $TMPFILES_CONF (written + applied)"
     fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 2b. ocheal Codex auth(只在缺失时从 root 安全引导,绝不覆盖刷新后的凭据)
+# ---------------------------------------------------------------------------
+step_codex_auth() {
+  log "--- step 2b: ocheal Codex auth ---"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ -L "$OCHEAL_CODEX_DIR" ] || { [ -e "$OCHEAL_CODEX_DIR" ] && [ ! -d "$OCHEAL_CODEX_DIR" ]; }; then
+      die "$OCHEAL_CODEX_DIR must be a real directory, not a symlink/non-directory"
+    fi
+    if [ -L "$OCHEAL_CODEX_AUTH" ] || { [ -e "$OCHEAL_CODEX_AUTH" ] && [ ! -f "$OCHEAL_CODEX_AUTH" ]; }; then
+      die "$OCHEAL_CODEX_AUTH must be a regular file, not a symlink/non-file"
+    fi
+    if [ -f "$OCHEAL_CODEX_AUTH" ]; then
+      ok "$OCHEAL_CODEX_AUTH exists (dry-run preserved)"
+    elif [ -f "$ROOT_CODEX_AUTH" ] && [ ! -L "$ROOT_CODEX_AUTH" ]; then
+      todo "$OCHEAL_CODEX_AUTH (would bootstrap from root auth; contents redacted)"
+      return 0
+    else
+      warn "neither $OCHEAL_CODEX_AUTH nor a safe $ROOT_CODEX_AUTH exists"
+      todo "Codex auth for $OCHEAL_USER (login root Codex first, then re-run provision)"
+      return 0
+    fi
+  else
+    # All privileged operations below are descriptor-relative and O_NOFOLLOW.
+    # This anchors them to the directory inode opened under /home/ocheal, so an
+    # unprivileged concurrent rename/symlink swap cannot redirect root chmod,
+    # chown, or credential writes to another file (TOCTOU hardening).
+    local auth_state
+    auth_state="$(python3 - "$OCHEAL_HOME" "$ROOT_CODEX_AUTH" \
+      "$(id -u "$OCHEAL_USER")" "$(id -g "$OCHEAL_USER")" <<'PY'
+import os
+import stat
+import sys
+
+home, source, uid_s, gid_s = sys.argv[1:]
+uid, gid = int(uid_s), int(gid_s)
+flags_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+home_fd = os.open(home, flags_dir)
+try:
+    try:
+        os.mkdir('.codex', 0o700, dir_fd=home_fd)
+    except FileExistsError:
+        pass
+    codex_fd = os.open('.codex', flags_dir, dir_fd=home_fd)
+    try:
+        if not stat.S_ISDIR(os.fstat(codex_fd).st_mode):
+            raise RuntimeError('.codex is not a directory')
+        os.fchown(codex_fd, uid, gid)
+        os.fchmod(codex_fd, 0o700)
+
+        try:
+            auth_fd = os.open(
+                'auth.json',
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=codex_fd,
+            )
+        except FileNotFoundError:
+            auth_fd = None
+        if auth_fd is not None:
+            try:
+                if not stat.S_ISREG(os.fstat(auth_fd).st_mode):
+                    raise RuntimeError('auth.json is not a regular file')
+                os.fchown(auth_fd, uid, gid)
+                os.fchmod(auth_fd, 0o600)
+            finally:
+                os.close(auth_fd)
+            print('existing')
+            raise SystemExit(0)
+
+        try:
+            source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            print('missing-source')
+            raise SystemExit(0)
+        try:
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise RuntimeError('root auth source is not a regular file')
+            tmp_name = f'.auth.json.tmp.{os.getpid()}'
+            tmp_fd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=codex_fd,
+            )
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(tmp_fd, view):]
+                os.fchown(tmp_fd, uid, gid)
+                os.fchmod(tmp_fd, 0o600)
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            try:
+                # linkat is atomic and refuses to replace a concurrently-created
+                # target. The temp inode is never reachable outside this dirfd.
+                os.link(
+                    tmp_name,
+                    'auth.json',
+                    src_dir_fd=codex_fd,
+                    dst_dir_fd=codex_fd,
+                    follow_symlinks=False,
+                )
+                print('bootstrapped')
+            except FileExistsError:
+                raced_fd = os.open(
+                    'auth.json',
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=codex_fd,
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(raced_fd).st_mode):
+                        raise RuntimeError('concurrent auth.json is not a regular file')
+                    os.fchown(raced_fd, uid, gid)
+                    os.fchmod(raced_fd, 0o600)
+                finally:
+                    os.close(raced_fd)
+                print('existing')
+            finally:
+                os.unlink(tmp_name, dir_fd=codex_fd)
+        finally:
+            os.close(source_fd)
+    finally:
+        os.close(codex_fd)
+finally:
+    os.close(home_fd)
+PY
+    )" || die "secure Codex auth bootstrap failed"
+    case "$auth_state" in
+      existing) ok "$OCHEAL_CODEX_AUTH exists (preserved; owner/mode verified by fd)" ;;
+      bootstrapped) ok "$OCHEAL_CODEX_AUTH bootstrapped (contents redacted; $OCHEAL_USER:$OCHEAL_USER 600)" ;;
+      missing-source)
+        warn "neither $OCHEAL_CODEX_AUTH nor a safe $ROOT_CODEX_AUTH exists"
+        todo "Codex auth for $OCHEAL_USER (login root Codex first, then re-run provision)"
+        return 0
+        ;;
+      *) die "unexpected secure auth bootstrap result" ;;
+    esac
+  fi
+
+  if ! command -v codex >/dev/null 2>&1; then
+    todo "codex login status for $OCHEAL_USER (codex binary not found)"
+    return 0
+  fi
+  if setpriv --reuid="$(id -u "$OCHEAL_USER")" --regid="$(id -g "$OCHEAL_USER")" \
+      --init-groups env HOME="$OCHEAL_HOME" codex login status >/dev/null 2>&1; then
+    ok "Codex login status valid for $OCHEAL_USER"
+  else
+    warn "Codex login status is not valid for $OCHEAL_USER"
+    todo "refresh $OCHEAL_USER Codex login before enabling self-heal dispatch"
   fi
 }
 
@@ -423,6 +583,7 @@ step_tunnel_key() {
 # ---------------------------------------------------------------------------
 step_user
 step_dirs
+step_codex_auth
 step_cli
 step_agents
 step_env

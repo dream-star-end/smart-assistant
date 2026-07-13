@@ -53,6 +53,7 @@ function fakeSessionManager() {
       session: { sessionKey: string },
       prompt: string,
       executionId: string,
+      _onEvent?: (event: unknown) => void,
     ) => {
       state.submits.push({ sessionKey: session.sessionKey, prompt, executionId })
       return { executionId, status: 'done', ranHere: true }
@@ -77,11 +78,12 @@ function fakeFetch() {
 function makeWorker(opts: {
   sessions: ReturnType<typeof fakeSessionManager>
   fetchImpl: typeof fetch
+  resolveAgent?: () => Promise<AgentDefLike | null>
   prepareClone?: (input: { repairId: string }) => Promise<{ clonePath: string }>
 }) {
   return new SelfhealJobWorker({
     sessions: opts.sessions as unknown as SessionManagerLike,
-    resolveAgent: async () => AGENT,
+    resolveAgent: opts.resolveAgent ?? (async () => AGENT),
     callbackBaseUrl: 'http://127.0.0.1:1',
     hmacSecret: 'test-secret-of-decent-length-123456',
     canonicalRepo: '/canon',
@@ -96,7 +98,11 @@ function makeWorker(opts: {
 }
 
 function claimFetch(payload: unknown): typeof fetch {
-  return (async () => ({ ok: true, status: 200, json: async () => payload })) as unknown as typeof fetch
+  return (async () => ({
+    ok: true,
+    status: 200,
+    json: async () => payload,
+  })) as unknown as typeof fetch
 }
 
 describe('claim-capability wire response', () => {
@@ -234,13 +240,89 @@ describe('clone failure — job failed + best-effort failed callback, no session
 
     assert.equal((await getJob('w-clonefail'))?.status, 'failed')
     assert.equal(sessions.state.submits.length, 0)
-    // Best-effort failed callback went to the master with the capability.
-    await new Promise((r) => setTimeout(r, 10)) // the report is fire-and-forget
+    // Best-effort failed callback went to the master with the capability before
+    // processJob settled.
     const failedCall = calls.find((c) => c.url.includes('/repairs/w-clonefail/failed'))
     assert.ok(failedCall, 'reported failed to v5')
     assert.equal(
       (failedCall?.init?.headers as Record<string, string>)?.Authorization,
       'Bearer cap-test',
     )
+  })
+
+  it('does not report failed when cancel wins while clone preparation is failing', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch()
+    let releaseClone: () => void = () => {}
+    const cloneGate = new Promise<void>((resolve) => {
+      releaseClone = resolve
+    })
+    const worker = makeWorker({
+      sessions,
+      fetchImpl: impl,
+      prepareClone: async () => {
+        await cloneGate
+        throw new Error('disk full after cancel')
+      },
+    }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-clone-cancel')
+    const run = worker.processJob(job)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    await executeSelfhealCancel({ repairId: 'w-clone-cancel', incidentId: 'i' }, sessions)
+    releaseClone()
+    await run
+
+    assert.equal((await getJob('w-clone-cancel'))?.status, 'cancelled')
+    assert.equal(
+      calls.some((c) => c.url.includes('/repairs/w-clone-cancel/failed')),
+      false,
+      'cancel owns terminal status and callback',
+    )
+  })
+})
+
+describe('terminal worker failures are reported exactly when the failed CAS wins', () => {
+  it('reports a missing repair agent', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch()
+    const worker = makeWorker({
+      sessions,
+      fetchImpl: impl,
+      resolveAgent: async () => null,
+    }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-no-agent')
+    await worker.processJob(job)
+
+    assert.equal((await getJob('w-no-agent'))?.status, 'failed')
+    assert.equal(calls.filter((c) => c.url.includes('/repairs/w-no-agent/failed')).length, 1)
+  })
+
+  it('reports a thrown repair turn', async () => {
+    const sessions = fakeSessionManager()
+    sessions.submitWithExecutionId = async () => {
+      throw new Error('upstream auth failed')
+    }
+    const { impl, calls } = fakeFetch()
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-turn-throw')
+    await worker.processJob(job)
+
+    assert.equal((await getJob('w-turn-throw'))?.status, 'failed')
+    assert.equal(calls.filter((c) => c.url.includes('/repairs/w-turn-throw/failed')).length, 1)
+  })
+
+  it('reports an authoritative final isError result', async () => {
+    const sessions = fakeSessionManager()
+    sessions.submitWithExecutionId = async (_session, _prompt, executionId, onEvent) => {
+      onEvent?.({ kind: 'final', meta: { isError: true } } as never)
+      return { executionId, status: 'done', ranHere: true }
+    }
+    const { impl, calls } = fakeFetch()
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-final-error')
+    await worker.processJob(job)
+
+    assert.equal((await getJob('w-final-error'))?.status, 'failed')
+    assert.equal(calls.filter((c) => c.url.includes('/repairs/w-final-error/failed')).length, 1)
   })
 })

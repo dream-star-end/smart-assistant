@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import type { SelfhealCallbackPhase } from '@openclaude/storage'
 import {
   type BrokerRequest,
   type BrokerResponse,
@@ -12,7 +13,6 @@ import {
   releaseHttpStatusFor,
 } from '../selfheal/broker.js'
 import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
-import type { SelfhealCallbackPhase } from '@openclaude/storage'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
@@ -491,13 +491,21 @@ describe('broker context kind — root-held capability, transparent JSON', () =>
 
 describe('broker verify kind — de-privileged four-layer run via verifier', () => {
   it('returns allPassed + verificationRef + signed file path + layer summary', async () => {
-    const seen: { repairId: string; sha: string; clonePath: string }[] = []
+    const seen: {
+      repairId: string
+      sha: string
+      clonePath: string
+      canonicalRepo: string
+      canonicalBranch: string
+    }[] = []
     const SHA = 'd'.repeat(40)
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
       repairAuthority: activeAuthority,
       verificationDir: '/var/lib/test-verifications',
+      canonicalRepo: '/trusted/v5',
+      canonicalBranch: 'repair-main',
       verifyRunner: async (input) => {
         seen.push(input)
         return {
@@ -533,7 +541,15 @@ describe('broker verify kind — de-privileged four-layer run via verifier', () 
       { name: 'lint', ok: true, code: 0 },
       { name: 'typecheck', ok: true, code: 0 },
     ])
-    assert.deepEqual(seen, [{ repairId: 'v-1', sha: SHA, clonePath: '/home/ocheal/selfheal/v-1' }])
+    assert.deepEqual(seen, [
+      {
+        repairId: 'v-1',
+        sha: SHA,
+        clonePath: '/home/ocheal/selfheal/v-1',
+        canonicalRepo: '/trusted/v5',
+        canonicalBranch: 'repair-main',
+      },
+    ])
   })
 
   it('rejects a malformed sha', async () => {

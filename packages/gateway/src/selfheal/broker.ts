@@ -385,6 +385,8 @@ export interface SelfhealBrokerOpts {
     repairId: string
     sha: string
     clonePath: string
+    canonicalRepo: string
+    canonicalBranch: string
   }) => Promise<VerifyOutcome>
   /** Report free-text caps (defaults 2000 / 8192 chars). */
   reportMessageMaxChars?: number
@@ -854,9 +856,13 @@ export class SelfhealBroker {
     if (!healthCheck || typeof healthCheck !== 'object' || Array.isArray(healthCheck)) return null
     const h = healthCheck as Record<string, unknown>
     if (
-      h.kind !== 'deploy-v5-smoke' || h.ok !== true || h.target !== 'service:v5' ||
-      typeof h.checkedAt !== 'string' || !Number.isFinite(Date.parse(h.checkedAt))
-    ) return null
+      h.kind !== 'deploy-v5-smoke' ||
+      h.ok !== true ||
+      h.target !== 'service:v5' ||
+      typeof h.checkedAt !== 'string' ||
+      !Number.isFinite(Date.parse(h.checkedAt))
+    )
+      return null
     const context = await this.handleContext(
       { repairId, actionKind: CONTEXT_KIND, params: {} },
       authority,
@@ -966,7 +972,13 @@ export class SelfhealBroker {
     const clonePath = join(this.ochealSelfhealRoot, req.repairId)
     const runVerify =
       this.opts.verifyRunner ??
-      (async (input: { repairId: string; sha: string; clonePath: string }) => {
+      (async (input: {
+        repairId: string
+        sha: string
+        clonePath: string
+        canonicalRepo: string
+        canonicalBranch: string
+      }) => {
         if (this.ochealUid === undefined || this.ochealGid === undefined) {
           throw new Error('ochealUid/ochealGid not configured — refusing a root-privileged verify')
         }
@@ -974,6 +986,8 @@ export class SelfhealBroker {
           repairId: input.repairId,
           sha: input.sha,
           clonePath: input.clonePath,
+          canonicalRepo: input.canonicalRepo,
+          canonicalBranch: input.canonicalBranch,
           ochealUid: this.ochealUid,
           ochealGid: this.ochealGid,
           verificationDir: this.opts.verificationDir,
@@ -982,7 +996,13 @@ export class SelfhealBroker {
         })
       })
     try {
-      const outcome = await runVerify({ repairId: req.repairId, sha, clonePath })
+      const outcome = await runVerify({
+        repairId: req.repairId,
+        sha,
+        clonePath,
+        canonicalRepo: this.canonicalRepo,
+        canonicalBranch: this.canonicalBranch,
+      })
       const result = outcome.signed.result
       const dir =
         this.opts.verificationDir ??
@@ -1297,7 +1317,6 @@ export class SelfhealBroker {
     this.log.warn('cutover rejected', { repairId: req.repairId, reason })
     return { ok: false, status: 'rejected', detail: { reason } }
   }
-
 
   /**
    * Verify `sha` descends from the canonical branch WITHOUT root ever running git

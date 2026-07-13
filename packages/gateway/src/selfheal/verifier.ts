@@ -269,6 +269,10 @@ export interface VerifyOpts {
   /** Directory (root-owned, 0600) where the signed result is written. Default:
    *  OC_SELFHEAL_VERIFY_DIR or /var/lib/openclaude-selfheal/verifications. */
   verificationDir?: string
+  /** Root-trusted canonical checkout/branch used as the complete candidate
+   *  delta base for changed-file lint. */
+  canonicalRepo?: string
+  canonicalBranch?: string
   layers?: VerificationLayer[]
   installStep?: VerificationLayer | null
   signingKey?: string
@@ -279,6 +283,69 @@ export interface VerifyOutcome {
   /** Opaque handle the broker later resolves via {@link loadSignedVerification}. */
   verificationRef: string
   signed: SignedVerification
+}
+
+const BIOME_FILE_RE = /\.(?:[cm]?[jt]sx?|jsonc?|css)$/
+
+async function runChangedFileLint(
+  run: CommandRunner,
+  input: {
+    canonicalRepo: string
+    canonicalBranch: string
+    worktreeDir: string
+    sha: string
+    deprivOpts: RunOpts
+  },
+): Promise<RunResult> {
+  // Resolve the base only in the root-trusted canonical checkout. Candidate
+  // refs are ocheal-writable and therefore cannot define the verification span.
+  const base = await run('git', [
+    '-C',
+    input.canonicalRepo,
+    'rev-parse',
+    '--verify',
+    input.canonicalBranch,
+  ])
+  const baseSha = base.stdout.trim()
+  if (base.code !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+    return { code: base.code || 1, stdout: '', stderr: 'trusted canonical base resolution failed' }
+  }
+
+  // The current trusted branch must be the candidate's ancestor. If canonical
+  // advanced while a repair was running, fail closed and let it redrive from a
+  // fresh clone (the later cutover gate requires the same ancestry).
+  const ancestry = await run(
+    'git',
+    ['-C', input.worktreeDir, 'merge-base', '--is-ancestor', baseSha, input.sha],
+    input.deprivOpts,
+  )
+  if (ancestry.code !== 0) {
+    return { code: ancestry.code, stdout: '', stderr: 'candidate is not based on canonical head' }
+  }
+
+  const changed = await run(
+    'git',
+    [
+      '-C',
+      input.worktreeDir,
+      'diff',
+      '--name-only',
+      '-z',
+      '--diff-filter=ACMRT',
+      `${baseSha}..${input.sha}`,
+      '--',
+      'packages',
+    ],
+    input.deprivOpts,
+  )
+  if (changed.code !== 0) return changed
+  const files = changed.stdout.split('\0').filter((path) => BIOME_FILE_RE.test(path))
+  if (files.length === 0) return { code: 0, stdout: 'no changed Biome files', stderr: '' }
+
+  return run(join(input.worktreeDir, 'node_modules/.bin/biome'), ['check', ...files], {
+    ...input.deprivOpts,
+    cwd: input.worktreeDir,
+  })
 }
 
 function verificationDirOf(opts: VerifyOpts): string {
@@ -301,6 +368,7 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
   const run = opts.run ?? defaultCommandRunner
   const worktreeDir = opts.worktreeDir ?? `${opts.clonePath}.verify`
   const layers = opts.layers ?? DEFAULT_VERIFICATION_LAYERS
+  const usingDefaultLayers = opts.layers === undefined
   const installStep = opts.installStep === undefined ? DEFAULT_INSTALL_STEP : opts.installStep
   // Every candidate-executing command drops to ocheal with a curated, secret-free
   // env (the runner additionally scrubs OC_SELFHEAL_* as a second line of defense).
@@ -338,7 +406,22 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
   let allPassed = true
   for (const layer of steps) {
     const started = Date.now()
-    const r = await run(layer.cmd, layer.args, { ...deprivOpts, cwd: worktreeDir })
+    const r =
+      usingDefaultLayers && layer.name === 'lint'
+        ? await runChangedFileLint(run, {
+            canonicalRepo:
+              opts.canonicalRepo ??
+              process.env.OC_SELFHEAL_CANONICAL_DIR ??
+              '/opt/openclaude/openclaude-v5-aurora',
+            canonicalBranch:
+              opts.canonicalBranch ??
+              process.env.OC_SELFHEAL_CANONICAL_BRANCH ??
+              'feat/v5-aurora-rewrite',
+            worktreeDir,
+            sha: opts.sha,
+            deprivOpts,
+          })
+        : await run(layer.cmd, layer.args, { ...deprivOpts, cwd: worktreeDir })
     const ok = r.code === 0
     results.push({
       name: layer.name,

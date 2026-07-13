@@ -302,7 +302,7 @@ export class SelfhealJobWorker {
     const agent = await this.deps.resolveAgent(SELFHEAL_AGENT_ID)
     if (!agent) {
       log.error('repair agent not found — cannot execute', { repairId, agentId: SELFHEAL_AGENT_ID })
-      await setJobStatus(repairId, 'failed', ['starting', 'running'])
+      await this.markFailedAndReport(repairId, capability, 'repair agent not found')
       return
     }
 
@@ -315,8 +315,7 @@ export class SelfhealJobWorker {
       clonePath = await this.ensureRepairClone(repairId)
     } catch (err) {
       log.error('repair clone preparation failed', { repairId }, err as Error)
-      await setJobStatus(repairId, 'failed', ['starting', 'running'])
-      this.reportFailed(repairId, capability, 'prepare clone failed').catch(() => {})
+      await this.markFailedAndReport(repairId, capability, 'prepare clone failed')
       return
     }
 
@@ -378,10 +377,13 @@ export class SelfhealJobWorker {
     const leaseTimer = this.startLeaseRenew(repairId)
     try {
       const result = await started.turn
-      await this.finalizeJob(repairId, result, sink.getError())
+      const finalStatus = await this.finalizeJob(repairId, result, sink.getError())
+      if (finalStatus === 'failed') {
+        await this.reportFailed(repairId, capability, sink.getError() ?? 'repair execution failed')
+      }
     } catch (err) {
       log.error('repair turn threw', { repairId }, err as Error)
-      await setJobStatus(repairId, 'failed', ['starting', 'running'])
+      await this.markFailedAndReport(repairId, capability, 'repair turn failed')
     } finally {
       clearInterval(leaseTimer)
     }
@@ -441,6 +443,17 @@ export class SelfhealJobWorker {
     }
   }
 
+  /** Terminalize locally and notify the master only when this worker actually
+   *  won the failed CAS. A concurrent cancel owns both status and callbacks. */
+  private async markFailedAndReport(
+    repairId: string,
+    capability: string,
+    message: string,
+  ): Promise<void> {
+    const changed = await setJobStatus(repairId, 'failed', ['starting', 'running'])
+    if (changed) await this.reportFailed(repairId, capability, message)
+  }
+
   /**
    * Map the execution outcome onto a terminal job status.
    *   - ran here + no error   → succeeded
@@ -457,11 +470,11 @@ export class SelfhealJobWorker {
     repairId: string,
     result: { ranHere: boolean; status: string },
     turnError: string | undefined,
-  ): Promise<void> {
+  ): Promise<'succeeded' | 'failed' | 'unchanged'> {
     if (result.ranHere) {
       const status = turnError ? 'failed' : 'succeeded'
-      await setJobStatus(repairId, status, ['starting', 'running'])
-      return
+      const changed = await setJobStatus(repairId, status, ['starting', 'running'])
+      return changed ? status : 'unchanged'
     }
     // Deduped: another drive already consumed the turn. Reach a terminal job
     // state that reflects the execution ledger so the job is not re-claimed.
@@ -469,7 +482,8 @@ export class SelfhealJobWorker {
     const execStatus = exec?.status ?? 'failed'
     const jobStatus = execStatus === 'done' ? 'succeeded' : 'failed'
     log.info('repair turn deduped', { repairId, execStatus, jobStatus })
-    await setJobStatus(repairId, jobStatus, ['starting', 'running'])
+    const changed = await setJobStatus(repairId, jobStatus, ['starting', 'running'])
+    return changed ? jobStatus : 'unchanged'
   }
 
   private startLeaseRenew(repairId: string): ReturnType<typeof setInterval> {
