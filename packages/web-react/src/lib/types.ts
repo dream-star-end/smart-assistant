@@ -1071,7 +1071,7 @@ export type MarketplaceAgentPublishInput = MarketplaceHumanMetaInput & {
   greeting?: string;
 };
 
-/** 连接器技术发布入参；securityDecision 是发布者建议，最终以管理员签名决定为准。 */
+/** 连接器技术发布入参；securityDecision 是发布者建议，最终以平台审核签名决定为准。 */
 export type MarketplaceConnectorPublishInput = MarketplaceHumanMetaInput & {
   version: string;
   spec: Record<string, unknown>;

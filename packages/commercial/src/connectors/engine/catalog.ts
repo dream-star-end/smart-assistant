@@ -67,7 +67,7 @@ export async function listDeclarativeCatalog(
         AND v.status = 'approved'
         AND l.current_approved_version_id = v.id
         AND v.security_review_state = 'security_approved'
-        AND v.functional_verify_state = 'verified'
+        AND v.functional_verify_state IN ('verified','declarative_verified')
         AND v.exec_revoked_at IS NULL
         AND (
           EXISTS (

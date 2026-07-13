@@ -41,6 +41,7 @@ import {
   installApprovedVersion,
   listInstalled,
   marketplaceAgentsEnabled,
+  marketplaceConnectorsEnabled,
   publishSkillVersion,
   recordUninstall,
   resolveCallerOrgId,
@@ -51,6 +52,7 @@ import {
   parseHumanMeta,
 } from '../marketplace/marketplaceMeta.js'
 import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
+import { prepareConnectorPublish } from '../marketplace/publishConnectorPipeline.js'
 import {
   PUBLISH_MAX_REQUEST_BYTES,
   prepareSkillPublish,
@@ -175,13 +177,21 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
       // ── read-only ──
       if (req.method === 'GET' && op === 'search') {
         const kindParam = url.searchParams.get('kind')
-        if (kindParam !== null && kindParam !== 'skill' && kindParam !== 'agent') {
+        if (
+          kindParam !== null &&
+          kindParam !== 'skill' &&
+          kindParam !== 'agent' &&
+          kindParam !== 'connector'
+        ) {
           send(res, 200, { results: [] }, requestId)
           return
         }
-        // 无 kind → 默认 'skill';agent 类仅 v5(v3 容器无对应能力,装了即坏)。
-        const kind = kindParam === 'agent' ? 'agent' : 'skill'
-        if (kind === 'agent' && !marketplaceAgentsEnabled()) {
+        // 无 kind → 默认 'skill';agent/connector 都是 v5-only。
+        const kind = kindParam === 'agent' || kindParam === 'connector' ? kindParam : 'skill'
+        if (
+          (kind === 'agent' && !marketplaceAgentsEnabled()) ||
+          (kind === 'connector' && !marketplaceConnectorsEnabled())
+        ) {
           send(res, 200, { results: [] }, requestId)
           return
         }
@@ -205,23 +215,21 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           res,
           200,
           {
-            results: filtered
-              .slice(0, limit)
-              .map((c) => ({
-                slug: c.slug,
-                kind: c.kind,
-                name: c.name,
-                description: c.description,
-                tags: c.tags,
-                // 人向导购字段:容器 AI 据 category/useCases 解释「为什么适配你的需求」。
-                category: c.category,
-                useCases: c.useCases,
-                // 真实使用信号:容器 AI 据 30 天使用/评分反馈解释「为什么推荐(多少人在用/口碑)」。
-                // rating 样本不足时服务端已置 null,AI 不应据 null 编造好评率。
-                usage30d: c.usage30d,
-                users30d: c.users30d,
-                rating: c.rating,
-              })),
+            results: filtered.slice(0, limit).map((c) => ({
+              slug: c.slug,
+              kind: c.kind,
+              name: c.name,
+              description: c.description,
+              tags: c.tags,
+              // 人向导购字段:容器 AI 据 category/useCases 解释「为什么适配你的需求」。
+              category: c.category,
+              useCases: c.useCases,
+              // 真实使用信号:容器 AI 据 30 天使用/评分反馈解释「为什么推荐(多少人在用/口碑)」。
+              // rating 样本不足时服务端已置 null,AI 不应据 null 编造好评率。
+              usage30d: c.usage30d,
+              users30d: c.users30d,
+              rating: c.rating,
+            })),
           },
           requestId,
         )
@@ -233,7 +241,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         // org 可见性收口:org-private listing 对非本 org 容器视同不存在(404)。
         const detail = await getListingDetail(slug, callerOrgId)
         // agent 类仅 v5 露出:v3 渠道视同不存在(防 slug→detail→versionId 旁路装坏 agent)。
-        if (!detail || (detail.kind === 'agent' && !marketplaceAgentsEnabled()))
+        if (
+          !detail ||
+          (detail.kind === 'agent' && !marketplaceAgentsEnabled()) ||
+          (detail.kind === 'connector' && !marketplaceConnectorsEnabled())
+        )
           return send(
             res,
             404,
@@ -244,7 +256,17 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         return
       }
       if (req.method === 'GET' && op === 'installed') {
-        send(res, 200, { installed: await listInstalled(userId) }, requestId)
+        const installed = await listInstalled(userId)
+        send(
+          res,
+          200,
+          {
+            installed: marketplaceConnectorsEnabled()
+              ? installed
+              : installed.filter((item) => item.kind !== 'connector'),
+          },
+          requestId,
+        )
         return
       }
 
@@ -256,7 +278,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
         // org 可见性收口:org-private 技能仅本 org 容器可见/可装(非成员 → detail null → 404)。
         const detail = await getListingDetail(slug, callerOrgId)
-        if (!detail)
+        if (
+          !detail ||
+          (detail.kind === 'agent' && !marketplaceAgentsEnabled()) ||
+          (detail.kind === 'connector' && !marketplaceConnectorsEnabled())
+        )
           return send(
             res,
             404,
@@ -307,6 +333,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         const slug = asStr(body.slug, 64)
         if (!slug || !SLUG_RE.test(slug))
           return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
+        if (!marketplaceConnectorsEnabled()) {
+          const installed = await listInstalled(userId)
+          if (installed.some((item) => item.slug === slug && item.kind === 'connector'))
+            return send(res, 404, { error: { code: 'NOT_INSTALLABLE' } }, requestId)
+        }
         send(res, 200, { ok: await recordUninstall(userId, slug) }, requestId)
         return
       }
@@ -351,7 +382,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
   }
 }
 
-/** Publish a skill OR agent on the user's behalf → PENDING (admin review) + static scan. */
+/** Publish a skill, agent or connector on the user's behalf → PENDING + static scan. */
 async function handlePublish(
   req: IncomingMessage,
   res: ServerResponse,
@@ -363,10 +394,14 @@ async function handlePublish(
   // 发布是唯一携带 bundle(正文 + 附属文件)的 op,读取上限随发布管线放大;
   // 其余 op 维持默认 64KB。
   const body = await readBody(req, PUBLISH_MAX_REQUEST_BYTES)
-  const kind = body.kind === 'agent' ? 'agent' : 'skill'
-  const slug = asStr(body.slug, 64)
-  if (!slug || !SLUG_RE.test(slug))
-    return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
+  const kind = body.kind
+  if (kind !== 'skill' && kind !== 'agent' && kind !== 'connector')
+    return send(
+      res,
+      400,
+      { error: { code: 'BAD_KIND', message: 'kind must be skill|agent|connector' } },
+      requestId,
+    )
   // 可见范围(企业版 P3.1):visibility='org' 要求容器用户是 org active 成员 → listing.org_id=其 org。
   const orgId = body.visibility === 'org' ? callerOrgId : null
   if (body.visibility === 'org' && !orgId)
@@ -376,6 +411,64 @@ async function handlePublish(
       { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的技能' } },
       requestId,
     )
+
+  if (kind === 'connector') {
+    if (!marketplaceConnectorsEnabled())
+      return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
+    const prepared = prepareConnectorPublish(body)
+    if (!prepared.ok)
+      return send(
+        res,
+        prepared.status,
+        {
+          error: { code: prepared.code, message: prepared.message },
+          ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+        },
+        requestId,
+      )
+    const { versionId } = await publishSkillVersion({
+      slug: prepared.slug,
+      ownerUserId: userId,
+      version: prepared.version,
+      name: prepared.name,
+      description: prepared.description,
+      tags: prepared.tags,
+      rawSkillMd: null,
+      rawArtifact: prepared.rawArtifact,
+      manifest: {
+        connector: true,
+        proposedSecurityDecision: prepared.proposedSecurityDecision,
+      },
+      kind: 'connector',
+      artifactHash: prepared.artifactHash,
+      embeddingHash: prepared.embeddingHash,
+      riskFlags: prepared.riskFlags,
+      policyVersion: prepared.policyVersion,
+      submittedBy: userId,
+      orgId,
+      category: prepared.humanMeta.category,
+      useCases: prepared.humanMeta.useCases,
+      outcomeExamples: prepared.humanMeta.outcomeExamples,
+      humanMd: prepared.humanMeta.humanMd,
+    })
+    send(
+      res,
+      200,
+      {
+        ok: true,
+        versionId,
+        status: 'pending',
+        riskFlags: prepared.riskFlags,
+        note: '已提交 AI 自动审核；不确定或高风险项会转人工复核。',
+      },
+      requestId,
+    )
+    return
+  }
+
+  const slug = asStr(body.slug, 64)
+  if (!slug || !SLUG_RE.test(slug))
+    return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
 
   if (kind === 'skill') {
     // 内容校验/扫描/规范化走与浏览器发布路由同一条权威管线 —— 容器路径由此获得
@@ -458,7 +551,10 @@ async function handlePublish(
     return send(
       res,
       422,
-      { error: { code: 'SCAN_BLOCKED', message: '商品页文案被静态扫描拦截' }, riskFlags: metaScan.flags },
+      {
+        error: { code: 'SCAN_BLOCKED', message: '商品页文案被静态扫描拦截' },
+        riskFlags: metaScan.flags,
+      },
       requestId,
     )
 
@@ -477,7 +573,15 @@ async function handlePublish(
   const manifestInput: Record<string, unknown> = { ...body }
   // category/useCases/outcomeExamples/humanMd/visibility 是发布级字段,不进 manifest —— 与
   // kind/slug 一样在严格 allowlist 校验前 delete,否则会被拒为「未知字段」。
-  for (const k of ['kind', 'slug', 'category', 'useCases', 'outcomeExamples', 'humanMd', 'visibility'])
+  for (const k of [
+    'kind',
+    'slug',
+    'category',
+    'useCases',
+    'outcomeExamples',
+    'humanMd',
+    'visibility',
+  ])
     delete manifestInput[k]
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,

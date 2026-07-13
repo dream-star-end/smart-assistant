@@ -2044,7 +2044,7 @@ export const api = {
       ),
     ),
 
-  /** 发布声明式连接器（人工安全+功能审核，不进 AI 自动审批）。 */
+  /** 发布声明式连接器（进入 AI 自动审核；不确定或高风险项转人工复核）。 */
   publishMarketplaceConnector: (a: AuthSession, input: MarketplaceConnectorPublishInput) =>
     jsonOrThrow<MarketplacePublishResult>(
       callWithRefresh(a, (t) =>

@@ -36,7 +36,7 @@ export function MarketplaceCenter({
   /** Which category the 发现 tab opens to (e.g. 'agent' when opened via「从市场添加智能体」). */
   initialBrowseKind?: MarketplaceKind
   /** 「在对话中创建」:关闭市场 → 新会话 → 输入框预填引导模板。 */
-  onCreateInChat?: (kind: Exclude<MarketplaceKind, 'connector'>) => void
+  onCreateInChat?: (kind: MarketplaceKind) => void
   /** AI 导购入口(批3):关闭市场 → 新会话 → 输入框预填(text 已拼好);不 autoSend。 */
   onAskAiInChat?: (text: string) => void
   /** 安装连接器后跳到管理中心完成账号绑定。 */

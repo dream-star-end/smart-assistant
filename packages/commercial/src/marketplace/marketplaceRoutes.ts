@@ -9,9 +9,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
-import { requiredBindSources } from '../connectors/engine/credentialBag.js'
-import { canonicalBytes } from '../connectors/spec/canonical.js'
-import { compileSpec } from '../connectors/spec/compiler.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 
 import { writeAdminAuditBestEffort } from '../admin/audit.js'
@@ -62,6 +59,7 @@ import {
   parseHumanMeta,
 } from './marketplaceMeta.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
+import { prepareConnectorPublish } from './publishConnectorPipeline.js'
 import { PUBLISH_MAX_REQUEST_BYTES, prepareSkillPublish } from './publishSkillPipeline.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
@@ -397,98 +395,49 @@ export async function handleMarketplaceConnectorPublish(
     throw new HttpError(404, 'NOT_FOUND', 'connector marketplace is not available')
   const user = await requireAuth(req, deps.jwtSecret)
   const body = (await readJsonBody(req, PUBLISH_MAX_REQUEST_BYTES)) as Record<string, unknown>
-  const version = asStr(body.version, 'version', 32)
-  if (!VERSION_RE.test(version)) throw new HttpError(400, 'BAD_VERSION', 'version 须为 x.y.z')
-  const specInput = body.spec
-  if (!specInput || typeof specInput !== 'object' || Array.isArray(specInput))
-    throw new HttpError(400, 'BAD_REQUEST', 'spec must be a ConnectorSpec JSON object')
-  const spec = specInput as Record<string, unknown>
-  const slug = typeof spec.id === 'string' ? spec.id : ''
-  if (!SLUG_RE.test(slug))
-    throw new HttpError(400, 'BAD_SLUG', 'spec.id 须为小写字母数字连字符(2-64)')
-  if (!spec.identity || typeof spec.identity !== 'object')
-    throw new HttpError(422, 'IDENTITY_REQUIRED', '连接器必须声明 identity probe 才能绑定账号')
-  const proposedSecurityDecision = body.securityDecision
-  let compiled: ReturnType<typeof compileSpec>
-  try {
-    compiled = compileSpec(specInput, proposedSecurityDecision)
-    // 只允许当前平台真正可绑定的 authMode；避免审核通过后才发现管理中心无法安装。
-    requiredBindSources(compiled.execContract)
-  } catch (e) {
-    if (e instanceof ConnectorSpecError) throw new HttpError(422, e.code, e.code)
-    throw e
-  }
-  if (
-    compiled.execContract.authMode === 'oauth2-auth-code' &&
-    compiled.execContract.oauth2?.clientProvisioning !== 'byoa'
-  ) {
-    throw new HttpError(
-      422,
-      'PLATFORM_OAUTH_RESERVED',
-      '社区 OAuth2 连接器必须使用 BYOA；平台代管应用仅限官方预装连接器',
-    )
-  }
-
-  const label = typeof spec.label === 'string' ? spec.label : slug
-  const description = typeof spec.description === 'string' ? spec.description : ''
-  const tags = Array.isArray(body.tags)
-    ? body.tags
-        .filter((x): x is string => typeof x === 'string')
-        .map((x) => x.trim())
-        .filter(Boolean)
-        .slice(0, 20)
-    : ['连接器']
-  const humanMeta = parseHumanMetaOr400(body)
-  const rawArtifact = canonicalBytes(specInput).toString('utf8')
-  const scan = scanSkillArtifact({ name: label, description, tags, body: rawArtifact })
-  if (scan.blocked) {
+  const prepared = prepareConnectorPublish(body)
+  if (!prepared.ok) {
+    if (prepared.status === 400) throw new HttpError(400, prepared.code, prepared.message)
     sendJson(res, 422, {
-      error: { code: 'SCAN_BLOCKED', message: '连接器声明被静态安全扫描拦截,请修正后重试' },
-      riskFlags: scan.flags,
+      error: { code: prepared.code, message: prepared.message },
+      ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
     })
     return
   }
-  if (humanMetaScanBlocked(res, label, humanMeta)) return
   const orgId = await resolvePublishOrgId(uid(user), body.visibility)
   try {
     const { versionId } = await publishSkillVersion({
-      slug,
+      slug: prepared.slug,
       ownerUserId: uid(user),
-      version,
-      name: label,
-      description,
-      tags,
+      version: prepared.version,
+      name: prepared.name,
+      description: prepared.description,
+      tags: prepared.tags,
       rawSkillMd: null,
-      rawArtifact,
+      rawArtifact: prepared.rawArtifact,
       manifest: {
         connector: true,
         // 仅供 reviewer 起草，绝不是已批准事实；详情用户面只读签名 contract 投影。
-        proposedSecurityDecision,
+        proposedSecurityDecision: prepared.proposedSecurityDecision,
       },
       kind: 'connector',
-      artifactHash: compiled.specHash,
-      embeddingHash: skillContentHash({
-        name: label,
-        description,
-        tags,
-        use_cases: humanMeta.useCases,
-      }),
-      riskFlags: scan.flags,
-      policyVersion: scan.policyVersion,
+      artifactHash: prepared.artifactHash,
+      embeddingHash: prepared.embeddingHash,
+      riskFlags: prepared.riskFlags,
+      policyVersion: prepared.policyVersion,
       submittedBy: uid(user),
       orgId,
-      category: humanMeta.category,
-      useCases: humanMeta.useCases,
-      outcomeExamples: humanMeta.outcomeExamples,
-      humanMd: humanMeta.humanMd,
-      queueAiReview: false,
+      category: prepared.humanMeta.category,
+      useCases: prepared.humanMeta.useCases,
+      outcomeExamples: prepared.humanMeta.outcomeExamples,
+      humanMd: prepared.humanMeta.humanMd,
     })
     sendJson(res, 200, {
       ok: true,
       versionId,
       status: 'pending',
-      riskFlags: scan.flags,
-      note: '已提交。连接器须由管理员完成人工安全决策与隔离账号功能验收后才会上架。',
+      riskFlags: prepared.riskFlags,
+      note: '已提交 AI 自动审核；不确定或高风险项会转交管理员复核。',
     })
   } catch (e) {
     throw mapMarketplaceError(e)

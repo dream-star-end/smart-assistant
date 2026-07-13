@@ -22,6 +22,7 @@ import { hashSecret } from '../auth/containerIdentity.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
 import { publishSkillVersion, reviewVersion } from '../marketplace/marketplaceDb.js'
 import {
   MARKETPLACE_AGENT_PREFIX,
@@ -97,6 +98,47 @@ function skillInput(slug: string, owner: number) {
     rawSkillMd, artifactHash: marketplaceArtifactHash(rawSkillMd),
     embeddingHash: skillContentHash({ name, description, tags: ['t1'] }),
     riskFlags: [], policyVersion: 1, submittedBy: owner,
+  }
+}
+
+const CONNECTOR_API_ORIGIN = 'https://api.internal-market.test:443'
+const connectorDecision = {
+  audience: {
+    authorizationOrigins: [],
+    tokenOrigins: [],
+    apiOrigins: [CONNECTOR_API_ORIGIN],
+    unauthenticatedUploadOrigins: [],
+  },
+  actions: {},
+}
+function connectorSpec(slug: string): Record<string, unknown> {
+  return {
+    id: slug,
+    label: `Connector ${slug}`,
+    description: 'connector published by the in-container AI',
+    authMode: 'static-token',
+    auth: {
+      apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+    },
+    originMode: 'fixed-reviewed',
+    credentialPipeline: {
+      nodes: [{ id: 'api-token', authMode: 'static-token', subject: 'user', audience: 'api' }],
+    },
+    actions: [
+      {
+        id: 'whoami',
+        description: 'identity probe',
+        request: { method: 'GET', pathTemplate: '/v1/me' },
+        params: { type: 'object', additionalProperties: false },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' } },
+        },
+        usesSlot: 'api-token',
+      },
+    ],
+    identity: { probeActionId: 'whoami', accountKeyPointer: '/id' },
   }
 }
 
@@ -456,6 +498,131 @@ describe('internalMarketplaceAgent (integ)', () => {
       if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
       else process.env.OC_RUNTIME_CHANNEL = savedChannel
     }
+  })
+
+  test('v5 connector:AI 容器可发布→专审后搜索/详情/安装/列出/卸载；v3 gate 关闭', async (t) => {
+    if (skip(t)) return
+    const previous = process.env.OC_RUNTIME_CHANNEL
+    const previousKms = process.env.OPENCLAUDE_KMS_KEY
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    process.env.OPENCLAUDE_KMS_KEY = Buffer.alloc(32, 7).toString('base64')
+    try {
+      const owner = await createUser('connector-owner@x.com')
+      const installer = await createUser('connector-installer@x.com')
+      const admin = await createUser('connector-admin@x.com')
+      await query("UPDATE users SET role='admin' WHERE id=$1", [admin])
+      const slug = 'internal-ai-connector'
+      const spec = connectorSpec(slug)
+      const ownerHandler = await handlerFor(owner, 201)
+      let res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'publish', {
+          token: tokenFor(201),
+          body: {
+            kind: 'connector',
+            version: '1.0.0',
+            spec,
+            securityDecision: connectorDecision,
+            tags: ['连接器'],
+            category: 'daily-tools',
+            useCases: ['连接外部服务并查询当前身份'],
+          },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+      const versionId = String(res.body.versionId)
+      const stored = await query<{
+        kind: string
+        owner_user_id: string
+        submitted_by: string
+        ai_review_state: string
+        proposed: unknown
+        artifact_hash: string
+      }>(
+        `SELECT l.kind, l.owner_user_id::text, v.submitted_by::text, v.ai_review_state,
+                v.manifest->'proposedSecurityDecision' AS proposed, v.artifact_hash
+           FROM marketplace_skill_versions v
+           JOIN marketplace_skill_listings l ON l.slug=v.slug WHERE v.id=$1`,
+        [versionId],
+      )
+      assert.equal(stored.rows[0]!.kind, 'connector')
+      assert.equal(stored.rows[0]!.owner_user_id, String(owner))
+      assert.equal(stored.rows[0]!.submitted_by, String(owner))
+      assert.equal(stored.rows[0]!.ai_review_state, 'queued')
+      assert.deepEqual(stored.rows[0]!.proposed, connectorDecision)
+
+      await approveMarketplaceConnectorVersion({
+        versionId,
+        reviewerUserId: admin,
+        securityDecision: connectorDecision,
+        expectedSpecHash: stored.rows[0]!.artifact_hash,
+        functionalVerified: true,
+        env: process.env,
+      })
+
+      const h = await handlerFor(installer, 202)
+      res = makeRes()
+      await h(makeReq('GET', 'search?kind=connector', { token: tokenFor(202) }), res, CTX)
+      assert.equal(res.statusCode, 200)
+      assert.ok(res.body.results.some((row: { slug: string }) => row.slug === slug))
+      res = makeRes()
+      await h(makeReq('GET', `detail?slug=${slug}`, { token: tokenFor(202) }), res, CTX)
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.body.detail.kind, 'connector')
+      res = makeRes()
+      await h(makeReq('POST', 'install', { token: tokenFor(202), body: { slug } }), res, CTX)
+      assert.equal(res.statusCode, 200)
+      res = makeRes()
+      await h(makeReq('GET', 'installed', { token: tokenFor(202) }), res, CTX)
+      assert.ok(res.body.installed.some((row: { slug: string }) => row.slug === slug))
+      res = makeRes()
+      await h(makeReq('POST', 'uninstall', { token: tokenFor(202), body: { slug } }), res, CTX)
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.body.ok, true)
+
+      process.env.OC_RUNTIME_CHANNEL = 'v3'
+      res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'publish', {
+          token: tokenFor(201),
+          body: {
+            kind: 'connector',
+            version: '1.0.0',
+            spec: connectorSpec('v3-hidden-connector'),
+            securityDecision: connectorDecision,
+            category: 'daily-tools',
+            useCases: ['验证非 v5 渠道发布被关闭'],
+          },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 404)
+    } finally {
+      if (previous === undefined) delete process.env.OC_RUNTIME_CHANNEL
+      else process.env.OC_RUNTIME_CHANNEL = previous
+      if (previousKms === undefined) delete process.env.OPENCLAUDE_KMS_KEY
+      else process.env.OPENCLAUDE_KMS_KEY = previousKms
+    }
+  })
+
+  test('publish unknown kind → 400，而不是静默按 skill 处理', async (t) => {
+    if (skip(t)) return
+    const u = await createUser('unknown-kind@x.com')
+    const h = await handlerFor(u, 303)
+    const res = makeRes()
+    await h(
+      makeReq('POST', 'publish', {
+        token: tokenFor(303),
+        body: { kind: 'widget', slug: 'should-not-publish' },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.body.error.code, 'BAD_KIND')
   })
 
   test('unknown op → 404', async (t) => {

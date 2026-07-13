@@ -7,7 +7,8 @@
  * 合法迁移:
  *   draft
  *    →(securityApprove:**同事务**编译+签名+写 exec_contract/hash/sig) security_approved
- *        →(markFunctionalVerified) functional_verified
+ *        →(markFunctionalVerified) verified(人工隔离账号实测)
+ *        →(markDeclarativeVerified) declarative_verified(AI 声明式验证；bind 时跑真实 identity probe)
  *   exec_revoked_at 置位 = per-version kill(bind/execute 每次复核)。
  *
  * loadVerifiedContract = **载入即验**:状态 + 未 revoke + hash 自洽 + 验签 + policy≥当前,
@@ -28,6 +29,15 @@ import { ConnectorSpecError, ExecContract, type ExecContractT } from './types.js
  * 不自动继续信任,§1.1)。
  */
 export const CURRENT_SECURITY_POLICY_VERSION = 1
+
+/**
+ * `verified` = 管理员使用隔离账号做过真实功能验收；`declarative_verified` = AI 仅对
+ * 完整声明、编译产物与安全决定做过自动验证，真实凭据有效性在用户 bind 时由 identity
+ * probe 强制验证。两者都可签发执行契约，但审计语义不能混写。
+ */
+export function isAcceptedFunctionalVerificationState(state: string): boolean {
+  return state === 'verified' || state === 'declarative_verified'
+}
 
 export interface SecurityApproveInput {
   versionId: number
@@ -220,6 +230,37 @@ export async function markFunctionalVerifiedWithRunner(
     throw new ConnectorSpecError('INVALID_STATE', 'cannot mark functional-verified')
 }
 
+/**
+ * AI 声明式验证：不冒充隔离账号实测。后续 bind 仍必须成功执行已签 identity probe，
+ * 在此之前不会产生可执行连接。
+ */
+export async function markDeclarativeVerifiedWithRunner(
+  versionId: number,
+  verifierUserId: number,
+  client: QueryRunner,
+): Promise<void> {
+  const verifier = await client.query<{ role: string; status: string }>(
+    'SELECT role, status FROM users WHERE id = $1',
+    [verifierUserId],
+  )
+  if (verifier.rows[0]?.role !== 'admin' || verifier.rows[0]?.status !== 'active') {
+    throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'verifier must be an active admin')
+  }
+  const r = await client.query(
+    `UPDATE marketplace_skill_versions
+          SET functional_verify_state = 'declarative_verified',
+              functional_verified_by = $2,
+              functional_verified_at = now()
+        WHERE id = $1
+          AND security_review_state = 'security_approved'
+          AND functional_verify_state = 'unverified'
+          AND exec_revoked_at IS NULL`,
+    [versionId, verifierUserId],
+  )
+  if (r.rowCount !== 1)
+    throw new ConnectorSpecError('INVALID_STATE', 'cannot mark declarative-verified')
+}
+
 /** security_approved → functional_verified；只允许 active admin，并留 verifier/time 审计。 */
 export async function markFunctionalVerified(
   versionId: number,
@@ -318,7 +359,7 @@ function verifyStoredContractRow(
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
   if (row.security_review_state !== 'security_approved')
     throw new ConnectorSpecError('NOT_SECURITY_APPROVED', `state=${row.security_review_state}`)
-  if (row.functional_verify_state !== 'verified')
+  if (!isAcceptedFunctionalVerificationState(row.functional_verify_state))
     throw new ConnectorSpecError(
       'NOT_FUNCTIONALLY_VERIFIED',
       `state=${row.functional_verify_state}`,

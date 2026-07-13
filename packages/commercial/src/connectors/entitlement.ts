@@ -8,6 +8,7 @@
 import type { QueryRunner } from '../db/queries.js'
 import { isDefaultConnectorArtifact } from './defaults/index.js'
 import { ConnectorError } from './errors.js'
+import { isAcceptedFunctionalVerificationState } from './spec/review.js'
 
 interface EntitlementRow {
   slug: string
@@ -62,7 +63,7 @@ function assertExecutableState(row: EntitlementRow | null): asserts row is Entit
     row.version_status !== 'approved' ||
     row.listing_state !== 'active' ||
     row.security_review_state !== 'security_approved' ||
-    row.functional_verify_state !== 'verified' ||
+    !isAcceptedFunctionalVerificationState(row.functional_verify_state) ||
     row.exec_revoked_at !== null
   ) {
     throw new ConnectorError('RELINK_REQUIRED', 'connector version is not executable')
