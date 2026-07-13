@@ -355,27 +355,27 @@ describe("full migration suite", () => {
     }
   });
 
-  test("production 0134 → connector 0135–0139 upgrades in order and preserves v1 rows", async (t) => {
+  test("production 0137 → connector 0138–0142 upgrades in order and preserves v1 rows", async (t) => {
     if (skipIfNoPg(t)) return;
     const here = path.dirname(fileURLToPath(import.meta.url));
     const sourceDir = path.resolve(here, "../db/migrations");
     const stagedDir = await mkdtemp(path.join(tmpdir(), "oc-connector-migrations-"));
     const connectorMigrations = [
-      "0135_connector_platform.sql",
-      "0136_connector_declarative_binding.sql",
-      "0137_connector_token_cache.sql",
-      "0138_connector_oauth_pending_slug.sql",
-      "0139_connector_platform_oauth_apps.sql",
+      "0138_connector_platform.sql",
+      "0139_connector_declarative_binding.sql",
+      "0140_connector_token_cache.sql",
+      "0141_connector_oauth_pending_slug.sql",
+      "0142_connector_platform_oauth_apps.sql",
     ];
 
     try {
       const files = (await readdir(sourceDir)).filter((file) => file.endsWith(".sql")).sort();
-      for (const file of files.filter((name) => name <= "0134_sessions_master_pg.sql")) {
+      for (const file of files.filter((name) => name <= "0137_selfheal_user_notice_approval.sql")) {
         await copyFile(path.join(sourceDir, file), path.join(stagedDir, file));
       }
 
       const baseline = await runMigrations({ dir: stagedDir });
-      assert.equal(baseline.applied.at(-1), "0134_sessions_master_pg");
+      assert.equal(baseline.applied.at(-1), "0137_selfheal_user_notice_approval");
 
       const user = await query<{ id: string }>(
         "INSERT INTO users(email, password_hash) VALUES ($1, $2) RETURNING id::text AS id",

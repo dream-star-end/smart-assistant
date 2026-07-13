@@ -29,6 +29,9 @@ import { writeAdminAudit } from "./audit.js";
 import { SENSITIVE_KEY_RE } from "./auditRedact.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
+import { writeCondition } from "../selfheal/conditions.js";
+import { SYSTEM_MAINTENANCE_ON } from "../selfheal/conditionKeys.js";
+import { rootLogger } from "../logging/logger.js";
 
 // ─── Allowlist + per-key schema ───────────────────────────────────────
 
@@ -525,6 +528,24 @@ function emitSystemSettingChangeAlert(
       payload: { key, before: beforeValue, after: afterValue, admin_id: String(adminId) },
       // dedupe 按分钟桶,避免 admin 快速开关刷屏
       dedupe_key: `system.maintenance_mode_changed:${new Date().toISOString().slice(0, 16)}`,
+    });
+    // selfheal 检测桥(收尾批 B1):维护开关 → condition 单写权威。开维护 firing=true
+    // → reconciler 投影全站 banner incident;关维护 firing=false → 自动 resolve
+    // (policy resolve_mode='manual' 不冲突:reconciler 只看 firing)。若 admin 在
+    // 维护期间 resolve 该 incident,判定表按 mode='probe' 走 suppression:banner 压制、
+    // 维护继续,关维护翻转时压制自动清,语义自洽。失败只警告(告警不拖垮设置写主链)。
+    void writeCondition(SYSTEM_MAINTENANCE_ON, {
+      mode: "probe",
+      firing: on,
+      level: "warning",
+      snapshot: { key, admin_id: String(adminId) },
+      // observedAt 缺省 → PG NOW()(单一时钟权威,免 0134 乱序守卫误伤)。
+      observedAt: null,
+    }).catch((err) => {
+      rootLogger.warn("selfheal_maintenance_condition_write_failed", {
+        subsys: "systemSettings",
+        err: (err as Error)?.message ?? String(err),
+      });
     });
   }
 }

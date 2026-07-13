@@ -30,7 +30,8 @@ interface Harness {
 
 function makeDeps(h: Harness) {
   const firing = new Map<string, boolean>();
-  if (h.initialFiring) firing.set("provider_health:deepseek", true);
+  // 收尾批 B1:condition key 迁 conditionKeys.providerDegradedKey(policy seed 对齐)。
+  if (h.initialFiring) firing.set("health.provider_degraded:deepseek", true);
   const query = (async (sql: string, params: unknown[] = []) => {
     const s = sql.trim();
     if (s.startsWith("INSERT INTO provider_ops") || s.startsWith("UPDATE provider_ops")) {

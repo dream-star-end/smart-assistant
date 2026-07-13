@@ -27,6 +27,7 @@ import {
   type AlertChannelRow,
   type Severity,
 } from "./alertChannels.js";
+import { writeCondition, coerceConditionLevel } from "../selfheal/conditions.js";
 
 const SEVERITY_ORDER: Record<Severity, number> = { info: 0, warning: 1, critical: 2 };
 
@@ -742,50 +743,34 @@ export interface RuleStateRow {
   last_payload: Record<string, unknown>;
 }
 
-/** 原子翻转 rule state;返回 true 表示"发生了 false→true 或 true→false 翻转"。 */
+/**
+ * 原子翻转 rule state;返回 true 表示"发生了 false→true 或 true→false 翻转"。
+ *
+ * v5 自愈体系(0133)后:检测状态单写权威下沉为 PG function
+ * `write_alert_condition`(TS 与 shell 都只调它),此处经 `writeCondition` adapter
+ * 走同一 function。**导出签名/返回形状完全不变**(alertRules.ts / providerHealthScheduler /
+ * alertOutboxAck.integ.test 依赖)。ack 重置语义(同 phase 保留 ack、firing 翻转清 ack)
+ * 由 function 保证,与旧手写 SQL 字节等价。
+ *
+ * polled rule 归 `mode='probe'`(可重复求值);level 从 payload.severity 取(缺省
+ * 'warning'),供 incident 派生投影用。observedAt=now。
+ */
 export async function transitionRuleState(
   rule_id: string,
   firing: boolean,
   dedupe_key: string | null,
   payload: Record<string, unknown>,
 ): Promise<{ transitioned: boolean; previous: boolean }> {
-  return tx(async (client: PoolClient) => {
-    const cur = await client.query<{ firing: boolean }>(
-      `SELECT firing FROM admin_alert_rule_state WHERE rule_id = $1 FOR UPDATE`,
-      [rule_id],
-    );
-    const prev = cur.rows.length === 0 ? false : cur.rows[0].firing;
-    if (prev === firing) {
-      // 即使没翻转也刷新 last_evaluated_at,便于诊断
-      await client.query(
-        `INSERT INTO admin_alert_rule_state(rule_id, firing, dedupe_key, last_evaluated_at, last_payload)
-         VALUES ($1, $2, $3, NOW(), $4::jsonb)
-         ON CONFLICT (rule_id) DO UPDATE SET
-           last_evaluated_at = NOW(),
-           last_payload = EXCLUDED.last_payload`,
-        [rule_id, firing, dedupe_key, JSON.stringify(payload)],
-      );
-      return { transitioned: false, previous: prev };
-    }
-    // 翻转(任意方向)清掉 ack 三态. M8.3/P2-21:
-    //   false→true 必须清, 否则新一轮告警继承旧 ack.
-    //   true→false 也清, 因为 acked 字段在 resolved 状态下没意义.
-    await client.query(
-      `INSERT INTO admin_alert_rule_state(rule_id, firing, dedupe_key, last_transition_at, last_evaluated_at, last_payload)
-       VALUES ($1, $2, $3, NOW(), NOW(), $4::jsonb)
-       ON CONFLICT (rule_id) DO UPDATE SET
-         firing = EXCLUDED.firing,
-         dedupe_key = EXCLUDED.dedupe_key,
-         last_transition_at = NOW(),
-         last_evaluated_at = NOW(),
-         last_payload = EXCLUDED.last_payload,
-         acked = FALSE,
-         acked_at = NULL,
-         acked_by = NULL`,
-      [rule_id, firing, dedupe_key, JSON.stringify(payload)],
-    );
-    return { transitioned: true, previous: prev };
+  const level = coerceConditionLevel((payload as { severity?: unknown }).severity);
+  const r = await writeCondition(rule_id, {
+    mode: "probe",
+    firing,
+    level,
+    snapshot: payload,
+    observedAt: new Date(),
+    dedupeKey: dedupe_key,
   });
+  return { transitioned: r.transitioned, previous: r.previousFiring };
 }
 
 export async function listRuleStates(): Promise<RuleStateRow[]> {
