@@ -1236,7 +1236,7 @@ smoke() {
   #     确认过期销毁 params、OAuth pending 过期清理、ledger retention。关停:OC_CONNECTOR_SWEEPER_DISABLED=1)
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert cronWake connectorSweeper sessionsGcSweep"
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert userNoticeApproval cronWake connectorSweeper sessionsGcSweep"
   if [[ "$leader" == "1" ]]; then
     allowed="$allowed containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
   fi

@@ -26,6 +26,7 @@ import {
   listConditions,
   adminUnsuppressCondition,
   adminReleaseRepair,
+  getUserNoticeApprovalState,
   INCIDENTS_MAX_LIMIT,
 } from "../../admin/selfhealOps.js";
 
@@ -206,3 +207,15 @@ export async function handleAdminReleaseRepair(
 
 /** router prefix 派发(POST /api/admin/selfheal/repairs/:id/release)。 */
 export const SELFHEAL_REPAIRS_ADMIN_PREFIX = "/api/admin/selfheal/repairs/";
+
+
+// ─── GET /api/admin/selfheal/user-notices ──────────────────────────
+
+export async function handleAdminGetSelfhealUserNotices(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  _deps: CommercialHttpDeps,
+): Promise<void> {
+  sendJson(res, 200, await getUserNoticeApprovalState());
+}

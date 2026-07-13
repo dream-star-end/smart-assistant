@@ -133,6 +133,12 @@
   },
   {
     "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/user-notices",
+    "handler": "handleAdminGetSelfhealUserNotices"
+  },
+  {
+    "method": "GET",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/selfheal/incidents/",
     "handler": "handleAdminGetIncident"

@@ -73,7 +73,7 @@ bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:5543
    - ② v5:PG apply `0133`→`0134`→`0135`(additive,在线;记账 `schema_migrations`,version=文件名去 `.sql`)→ env 先写 `OC_SELFHEAL_*`(**`OC_SELFHEAL_DISABLED=1` + `DISPATCH_DISABLED=1` 双关**)→ deploy → 核对 effective config
    - ③ 观察层激活:stale firing condition 逐行处置 → `V5MON_CONDITIONS=1` + 删 `OC_SELFHEAL_DISABLED` → restart → 全链 smoke(无派单)
    - ④ 执行侧激活:`scripts/selfheal-provision.sh`(个人版仓,幂等,有 `--dry-run`)→ safe-restart → `apt install autossh` + 隧道单元 → kl-mirror 侧 `DISPATCH_DISABLED=0` + restart → **合成 incident 全链 E2E**
-   - ⑤ **0136 writer-guard:双重门未过前只进仓不 apply**(门① 新 master 上线 ✅ 部署后即达成;门② 回滚池核对:`deploy-v5.sh --rollback` 候选全部 ≥ selfheal 合并点。未过 → 登记 playbook §5 债表)
+   - ⑤ **writer-guard:双重门未过前不启用**(0136 保留为不可改写的历史迁移；0137 显式删除旧 trigger 以收敛环境，真实 SQL 位于 `db/deferred/selfheal_writer_guard.sql`。门① 新 master 上线 ✅；门② 回滚池核对通过后，才以新的迁移版本号重新启用)
    - ⑥ watchdog + egress selector 迁移(独立小窗口,走 release-checklist)
 3. **收尾**:playbook 登记新机制/新坑 + 记忆固化。
 
@@ -81,7 +81,7 @@ bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:5543
 
 ## 5. 接手必须知道的红线
 
-1. **0136 严禁随 0135 一起 apply**。旧 master 直写检测列会被 trigger 拒绝 → 全告警链熔断。双重门写在 `0136_selfheal_writer_guard.sql` 文件头。
+1. **writer-guard 在回滚双重门通过前必须保持禁用**。0136 是不可改写的历史迁移；0137 会显式删除其 trigger/function，使已应用和未应用过 0136 的环境收敛。真实 SQL 位于 `db/deferred/selfheal_writer_guard.sql`，双重门通过后再用新的迁移版本号上线。
 2. **`OC_SELFHEAL_DISPATCH_DISABLED` 默认 = 1(禁派单)**,`OC_SELFHEAL_AUTO_DEPLOY_TIER2` 默认 = 0(生产 cutover 需人工一键放行)。首次上线两者都不要动。
 3. **commercial 测试必经 `test-mutex.sh`**(跨 worktree 共享 octest PG)。
 4. **跨仓契约(改一侧必须同步另一侧)**:
@@ -99,7 +99,7 @@ bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:5543
 
 ## 6. 本批架构要点(为什么这么做,防止接手者改坏)
 
-- **检测状态单一权威** = PG function `write_alert_condition`。TS 与 shell 都只调它;incident 是它的只读派生投影(reconciler 单向)。0136 用 trigger 把这条约定升级为 DB 级强制(反向白名单:除 `ack_*`/`suppressed_*` 外任何列都不可直写)。
+- **检测状态单一权威** = PG function `write_alert_condition`。TS 与 shell 都只调它;incident 是它的只读派生投影(reconciler 单向)。deferred writer-guard 将在回滚双重门通过后以新的迁移版本号把这条约定升级为 DB 级强制(反向白名单:除 `ack_*`/`suppressed_*` 外任何列都不可直写)。
 - **H1b suppression**:probe 类 condition 仍 firing 时 admin resolve,**绝不能写 `firing=false`**(那是篡改探测权威,下一轮观测必然推翻 → resolve/重开风暴)。正确语义 = 压制投影直至真实恢复,`write_alert_condition` 在 true→false 翻转时自动清压制。
 - **release 权限模型**:`release` **不是 broker socket action**(ocheal 能连 socket,不可信其自称来源)。仅两个入口 → broker 进程内 `releaseApproved()`:① v5 admin 点击 → HMAC 签名 webhook;② root break-glass。
 - **deployDriver 信任链**:部署工具链 denylist(`scripts/**`/`deploy/**`/`.github/**`/根 `package.json`/任意 `*.sh`)—— 候选触碰即永不自动部署(证明 merge 后 `deploy-v5.sh` 字节不变,root 才敢执行它);全程持 `/var/lock/oc-selfheal-cutover.lock`,merge 后与 deploy 后双断言 `HEAD===sha`(验证 SHA = 合并 SHA = 部署 SHA)。

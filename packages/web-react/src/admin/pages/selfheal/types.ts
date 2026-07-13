@@ -116,6 +116,30 @@ export interface SuppressedConditionsResp {
   items: SuppressedConditionRow[];
 }
 
+export interface UserNoticeProposalRow {
+  id: string;
+  incidentId: string;
+  repairId: string;
+  shortCode: string;
+  status: string;
+  recipientCount: number;
+  sentRecipientCount: number | null;
+  recipientsHash: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface UserNoticeApprovalResp {
+  binding: {
+    channelId: string;
+    bindingCode: string;
+    active: boolean;
+    boundIdentity: string | null;
+    boundAt: string | null;
+  } | null;
+  proposals: UserNoticeProposalRow[];
+}
+
 /** repair 是否处于活跃（进行中）态——用于「正在修复」卡与 resolve 禁用判断。 */
 export const ACTIVE_REPAIR_STATUSES: ReadonlySet<RepairStatus> = new Set<RepairStatus>([
   "pending",

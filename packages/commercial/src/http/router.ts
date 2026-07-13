@@ -85,6 +85,7 @@ import {
   handleAdminListSelfhealConditions,
   handleAdminUnsuppressCondition,
   handleAdminReleaseRepair,
+  handleAdminGetSelfhealUserNotices,
 } from './admin/selfheal.js'
 // 切片②ⓐ:codex 修复回调端点(/internal/v5/repairs/*,capability/webhook HMAC 自鉴权,非 admin gate)。
 import {
@@ -811,6 +812,7 @@ export function createCommercialHandler(
     // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
     // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
     { method: 'GET', path: '/api/admin/selfheal/incidents', handler: handleAdminListIncidents },
+    { method: 'GET', path: '/api/admin/selfheal/user-notices', handler: handleAdminGetSelfhealUserNotices },
     { method: 'GET', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminGetIncident },
     { method: 'POST', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminResolveIncident },
     // 收尾批(H1b/§B):condition 压制运维 + repair 一键放行。exact 在 prefix 前

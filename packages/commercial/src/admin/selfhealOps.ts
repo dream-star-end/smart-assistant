@@ -580,3 +580,62 @@ export async function adminReleaseRepair(
     }
   }
 }
+
+// ─── user recovery notice approval audit ────────────────────────────
+
+export interface UserNoticeApprovalState {
+  binding: {
+    channelId: string;
+    bindingCode: string;
+    active: boolean;
+    boundIdentity: string | null;
+    boundAt: string | null;
+  } | null;
+  proposals: Array<{
+    id: string;
+    incidentId: string;
+    repairId: string;
+    shortCode: string;
+    status: string;
+    recipientCount: number;
+    sentRecipientCount: number | null;
+    recipientsHash: string;
+    expiresAt: string;
+    createdAt: string;
+  }>;
+}
+
+export async function getUserNoticeApprovalState(): Promise<UserNoticeApprovalState> {
+  const binding = await query<{
+    channel_id: string; binding_code: string; active: boolean;
+    from_user_id: string; bound_at: Date | null;
+  }>(
+    `SELECT channel_id::text,binding_code,active,from_user_id,bound_at
+       FROM selfheal_notice_approver_bindings ORDER BY active DESC,id DESC LIMIT 1`,
+  );
+  const proposals = await query<{
+    id: string; incident_id: string; repair_id: string; short_code: string; status: string;
+    recipient_count: number; sent_recipient_count: number | null; recipients_hash: string;
+    expires_at: Date; created_at: Date;
+  }>(
+    `SELECT id::text,incident_id::text,repair_id::text,short_code,status,recipient_count,
+            sent_recipient_count,recipients_hash,expires_at,created_at
+       FROM selfheal_user_notice_proposals ORDER BY id DESC LIMIT 50`,
+  );
+  const b = binding.rows[0];
+  return {
+    binding: b ? {
+      channelId: b.channel_id,
+      bindingCode: b.binding_code,
+      active: b.active,
+      boundIdentity: b.active ? `${b.from_user_id.slice(0, 2)}***` : null,
+      boundAt: b.bound_at?.toISOString() ?? null,
+    } : null,
+    proposals: proposals.rows.map((r) => ({
+      id: r.id, incidentId: r.incident_id, repairId: r.repair_id,
+      shortCode: r.short_code, status: r.status, recipientCount: r.recipient_count,
+      sentRecipientCount: r.sent_recipient_count, recipientsHash: r.recipients_hash,
+      expiresAt: r.expires_at.toISOString(), createdAt: r.created_at.toISOString(),
+    })),
+  };
+}

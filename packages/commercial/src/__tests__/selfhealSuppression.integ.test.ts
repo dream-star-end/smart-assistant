@@ -5,7 +5,7 @@
  *   A2 resolveIncident 同事务取消活跃修复(verifying 不动)
  *   A1 dispatcher 压制守卫(suppressed 不派单)
  *   A9/L1 inbox 幂等键带 rev(updated:N 各一条,同 rev 重放仍一条)
- *   M1/0136 writer-guard(检测列直写拒/operator 列放行)
+ *   M1 writer-guard 兼容覆盖(已部署 trigger 时验证检测列拒绝/operator 列放行)
  *   B1 policy 覆盖契约(每个生产 producer key 必命中 policy,防 key 域再漂移)
  *   §B adminReleaseRepair 放行链(pending_release 门 + HMAC 签名 POST + audit)
  *
@@ -406,10 +406,10 @@ describe("A1 dispatcher:suppressed 不派单", () => {
   });
 });
 
-// ═══ A9/L1 — inbox 幂等键带 rev ════════════════════════════════════════
+// ═══ 用户通知出口默认关闭 ═════════════════════════════════════════════
 
-describe("L1 inbox:updated 相位幂等键带 incident_rev", () => {
-  test("rev2/rev3 两条 updated 各落一条 inbox;同 rev 重放仍一条", async (t) => {
+describe("incident 生命周期不再写全员 inbox", () => {
+  test("opened/updated 都只留运维账本，不创建用户 delivery", async (t) => {
     if (skipIfNoPg(t)) return;
     const KEY = opsMonitorKey("mem"); // severity_floor=warning → level 变化才可观察 update
     const sweep = () => sweepOnce({ broadcastAll: () => 0, broadcastToUsers: () => 0 });
@@ -428,34 +428,19 @@ describe("L1 inbox:updated 相位幂等键带 incident_rev", () => {
     const rows = await query<{ source_phase: string }>(
       `SELECT source_phase FROM inbox_messages WHERE source_type='incident' ORDER BY id`,
     );
-    const phases = rows.rows.map((r) => r.source_phase);
-    assert.deepEqual(phases, ["opened", "updated:2", "updated:3"], "updated 带 rev,各一条");
-
-    // 同 rev 重放(delivery 重置为 pending)→ inbox 不再新增(source 幂等键最终防线)。
-    await query(`UPDATE incident_deliveries SET status='pending', claimed_at=NULL WHERE phase='updated'`);
-    await sweep();
-    const again = await query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM inbox_messages WHERE source_type='incident'`);
-    assert.equal(again.rows[0].n, "3", "重放零新增");
+    assert.deepEqual(rows.rows, []);
+    const deliveries = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM incident_deliveries`);
+    assert.equal(deliveries.rows[0].n, "0");
   });
 });
 
-// ═══ M1/0136 — writer-guard(经 TS 写路径行为断言)═════════════════════
+// ═══ writer guard deferred ═══════════════════════════════════════════
 
-describe("M1 writer-guard(0136 trigger,测试库已 apply)", () => {
-  test("检测列直写被拒;operator 列直写放行;function 路径放行", async (t) => {
+describe("writer-guard 在 rollback 历史收敛前保持 deferred", () => {
+  test("function 权威写路径仍工作，operator 列保持可写", async (t) => {
     if (skipIfNoPg(t)) return;
     await writeCond("t.guard.ts", true); // function 路径 INSERT ✓
-    await assert.rejects(
-      query(`UPDATE admin_alert_rule_state SET firing=FALSE WHERE rule_id='t.guard.ts'`),
-      /single-writer/,
-      "检测列直写必须被 trigger 拒绝",
-    );
-    await assert.rejects(
-      query(`INSERT INTO admin_alert_rule_state (rule_id, firing, mode) VALUES ('t.direct.ts', TRUE, 'probe')`),
-      /write_alert_condition/,
-      "直 INSERT 必须被拒",
-    );
     // operator 列(ack + suppression)直写放行。
     await query(`UPDATE admin_alert_rule_state SET acked=TRUE, acked_at=NOW() WHERE rule_id='t.guard.ts'`);
     await query(`UPDATE admin_alert_rule_state SET suppressed_until_clear=TRUE, suppressed_at=NOW(), suppressed_by='1' WHERE rule_id='t.guard.ts'`);

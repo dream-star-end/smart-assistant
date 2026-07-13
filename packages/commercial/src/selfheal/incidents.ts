@@ -4,9 +4,8 @@
  * incident 是 alert_conditions 的**只读派生投影**:reconciler 单向据 condition 当前值
  * open/resolve/update。全部走 DB 级 CAS + 幂等键,重叠 tick / 崩溃重放安全。
  *
- * 每次 open/resolve/update 在**同事务**内 INSERT incident_deliveries(durable outbox),
- * sweeper 再 at-least-once 投递 WS/inbox。delivery 唯一键 (incident_id, incident_rev, channel)
- * 挡重复。open 时 materialize incident_recipients 快照(open/resolved 用同一批)。
+ * 事故生命周期本身不再产生任何用户通知。用户通知只允许在可信全自动修复完成、
+ * 精确影响证据被冻结且管理员企微审批后，由 userNoticeApproval 单独定向发送。
  *
  * 审计账本永久保留(见 auditRetention PERMANENT_OPS_LEDGER_TABLES),不进 admin_audit 合规域。
  */
@@ -17,7 +16,6 @@ import type { IncidentPolicy } from "./policy.js";
 export type IncidentStatus = "open" | "repairing" | "resolved";
 export type IncidentSeverity = "info" | "warning" | "critical";
 export type ResolveSource = "probe" | "codex" | "admin" | "auto";
-export type DeliveryPhase = "opened" | "updated" | "resolved";
 
 const SEVERITY_RANK: Record<IncidentSeverity, number> = { info: 0, warning: 1, critical: 2 };
 
@@ -37,25 +35,6 @@ export function maxSeverity(a: IncidentSeverity, b: IncidentSeverity): IncidentS
  *     归 **切片②**(此处 ws 已覆盖在线用户)。
  * 唯一键 (incident_id, incident_rev, channel) ON CONFLICT DO NOTHING 挡重叠 tick 重复。
  */
-async function insertDeliveries(
-  client: PoolClient,
-  incidentId: string,
-  rev: number,
-  phase: DeliveryPhase,
-  audience: string,
-): Promise<void> {
-  const channels: string[] = ["ws"];
-  if (audience === "all") channels.push("inbox");
-  for (const channel of channels) {
-    await client.query(
-      `INSERT INTO incident_deliveries (incident_id, incident_rev, channel, phase, status)
-       VALUES ($1::bigint, $2::bigint, $3, $4, 'pending')
-       ON CONFLICT (incident_id, incident_rev, channel) DO NOTHING`,
-      [incidentId, rev, channel, phase],
-    );
-  }
-}
-
 /**
  * open 时把收件人快照钉进 incident_recipients(open/resolved 复用同一批)。
  *   - audience='all'        → 不填(广播,sweeper 走 broadcastAll)。
@@ -151,7 +130,6 @@ export async function openIncident(
     const row = ins.rows[0];
     const rev = Number(row.rev);
     await materializeRecipients(client, row.id, policy, input.snapshot);
-    await insertDeliveries(client, row.id, rev, "opened", policy.audience);
     return { incidentId: row.id, created: true, rev, severity: input.severity };
   }
 
@@ -180,12 +158,11 @@ export interface UpdateIncidentResult {
 
 /**
  * bump incident rev(condition.level 变导致 severity/文案变化时)。CAS WHERE status<>'resolved'。
- * 同事务写 updated delivery。
+ * 仅更新事故审计投影；不触发用户通知。
  */
 export async function updateIncident(
   incidentId: string,
   fields: { severity: IncidentSeverity; userTitle: string; userMessage: string; opsDetail: string | null },
-  audience: string,
   client: PoolClient,
 ): Promise<UpdateIncidentResult> {
   const r = await client.query<{ rev: string }>(
@@ -198,7 +175,6 @@ export async function updateIncident(
   );
   if (r.rows.length === 0) return { updated: false, rev: 0 };
   const rev = Number(r.rows[0].rev);
-  await insertDeliveries(client, incidentId, rev, "updated", audience);
   return { updated: true, rev };
 }
 
@@ -226,18 +202,16 @@ export async function resolveIncident(
   source: ResolveSource,
   client: PoolClient,
 ): Promise<ResolveIncidentResult> {
-  const r = await client.query<{ rev: string; audience: string }>(
+  const r = await client.query<{ rev: string }>(
     `UPDATE incidents
         SET status = 'resolved', resolved_at = NOW(), resolve_source = $2,
             rev = rev + 1, updated_at = NOW()
       WHERE id = $1::bigint AND status <> 'resolved'
-      RETURNING rev::text AS rev, audience`,
+      RETURNING rev::text AS rev`,
     [incidentId, source],
   );
   if (r.rows.length === 0) return { resolved: false, rev: 0 };
   const rev = Number(r.rows[0].rev);
-  await insertDeliveries(client, incidentId, rev, "resolved", r.rows[0].audience);
-
   // H2-cancel:活跃修复 → cancel_requested(同事务;verifying 有意不含)。
   // release_claimed 的 repair 同样有意不含(与 adminReleaseRepair 的 claim CAS
   // 真互斥:claim 先赢 → resolve 不取消,放行后由 done→verifying→探测 fence 裁决;

@@ -160,7 +160,6 @@ import {
   selfhealTickMs,
   type IncidentReconcilerHandle,
   type IncidentReconcilerSnapshotHandle,
-  type IncidentPayload,
 } from "./selfheal/index.js";
 import {
   startWecomAlertDispatcher,
@@ -170,6 +169,10 @@ import {
   getWecomAibotConnectionManager,
   type WecomAibotConnectionManager,
 } from "./admin/wecomAibotConnection.js";
+import {
+  startUserNoticeApproval,
+  type UserNoticeApprovalHandle,
+} from "./selfheal/userNoticeApproval.js";
 import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
@@ -1249,15 +1252,11 @@ export async function registerCommercial(
   };
   // v5 自愈体系(RFC §5):selfheal sweeper 经 forward-ref 拿 bridge 的全站/定向广播入口
   // (与 bridgeBroadcastRef 同型;bridge 在下方装配后回填,未就绪时 no-op 返回 0)。
-  const broadcastAllRef: { current: (payload: unknown) => number } = { current: () => 0 };
   const broadcastToUsersRef: { current: (uids: string[], payload: unknown) => number } = {
     current: () => 0,
   };
   // activeIncidents 内存快照 getter(sweeper 装配后回填):供 bridge 鉴权后补发在线用户
   // 未见过的活跃事故(RFC §5 [解 M4] 补发位置在 WS 注册之后)。bridge 侧集成读此 ref。
-  const selfhealActiveIncidentsRef: { current: (uid: string) => IncidentPayload[] } = {
-    current: () => [],
-  };
   // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
   // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
   // (MASTER_USER_PREFIX),而 proxy/bridge 传进来的是裸 uid(与 PG 计费同口径)。
@@ -3399,7 +3398,6 @@ export async function registerCommercial(
     // 鉴权后补发当前活跃事故——**per-uid** 过滤(forward-ref:bridge 创建早于
     // sweeper 赋值,故走闭包读 ref.current)。ref 默认 () => [],装配后为
     // getActiveIncidentsForUser,只返该 uid 可见事故,绝不泄露他人定向事故(Codex B2)。
-    incidentSnapshotProvider: (uid: string) => selfhealActiveIncidentsRef.current(uid),
     // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
     // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
     // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
@@ -3451,7 +3449,6 @@ export async function registerCommercial(
     userChatBridge.broadcastToUser(uid, payload);
   };
   // v5 自愈:把 selfheal sweeper 的广播 forward-ref 指向 bridge 真实入口。
-  broadcastAllRef.current = (payload) => userChatBridge.broadcastAll(payload);
   broadcastToUsersRef.current = (uids, payload) => userChatBridge.broadcastToUsers(uids, payload);
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
@@ -3759,12 +3756,10 @@ export async function registerCommercial(
     );
     incidentSweeper = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
       intervalMs: tickMs,
-      broadcastAll: (payload) => broadcastAllRef.current(payload),
+      // 事故 open/update/resolve 不再创建用户投递；保留 sweeper 兼容入口但钉死 no-op。
+      broadcastAll: () => 0,
       broadcastToUsers: (uids, payload) => broadcastToUsersRef.current(uids, payload),
     }));
-    // 暴露 per-uid activeIncidents getter 供 bridge 鉴权后补发(audience 过滤,
-    // 见 selfhealActiveIncidentsRef 注释;forward-ref 装配,bridge 创建早于此赋值)。
-    selfhealActiveIncidentsRef.current = incidentSweeper.getActiveIncidentsForUser;
   }
 
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
@@ -3800,6 +3795,7 @@ export async function registerCommercial(
   // 详见 wecomAibotConnection 头注(单连接约束 + 国内域名直连出口红线)。
   let wecomAlertDispatcher: WecomAlertDispatcherHandle | undefined;
   let wecomAibotConn: WecomAibotConnectionManager | undefined;
+  let userNoticeApproval: UserNoticeApprovalHandle | undefined;
   if (
     runtimeChannel === "v5" &&
     process.env.OC_WECOM_ALERT_DISABLED !== "1"
@@ -3809,6 +3805,13 @@ export async function registerCommercial(
     wecomAibotConn = getWecomAibotConnectionManager();
     void wecomAibotConn.start();
     wecomAlertDispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({ dispatchIntervalMs: intervalMs, deps: { sendAibotAlert: (id, md) => wecomAibotConn!.send(id, md) } }));
+    userNoticeApproval = trackScheduler("userNoticeApproval", "v5-owned", startUserNoticeApproval(
+      wecomAibotConn,
+      {
+        onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),
+        broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
+      },
+    ));
   }
 
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
@@ -3959,6 +3962,9 @@ export async function registerCommercial(
       }
       if (wecomAlertDispatcher) {
         try { await wecomAlertDispatcher.stop(); } catch { /* ignore */ }
+      }
+      if (userNoticeApproval) {
+        try { await userNoticeApproval.stop(); } catch { /* ignore */ }
       }
       if (wecomAibotConn) {
         try { await wecomAibotConn.stop(); } catch { /* ignore */ }

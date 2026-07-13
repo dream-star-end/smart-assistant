@@ -144,19 +144,12 @@ export async function sweepOnce(deps: SweeperDeps): Promise<SweepResult> {
   const log = deps.logger ?? rootLogger.child({ subsys: "selfheal", module: "sweeper" });
   const out: SweepResult = { ws: 0, inbox: 0, errors: 0 };
 
-  const claimed = await query<ClaimedDeliveryRow>(
-    `UPDATE incident_deliveries d SET claimed_at = NOW()
-      WHERE d.id IN (
-        SELECT id FROM incident_deliveries
-         WHERE status = 'pending'
-           AND (claimed_at IS NULL OR claimed_at < NOW() - INTERVAL '${CLAIM_LEASE}')
-         ORDER BY id
-         LIMIT ${CLAIM_BATCH}
-         FOR UPDATE SKIP LOCKED
-      )
-      RETURNING d.id::text AS id, d.incident_id::text AS incident_id,
-                d.incident_rev::text AS incident_rev, d.channel, d.phase`,
-  );
+  // Legacy incident deliveries are permanently retired. Mark any pre-upgrade
+  // residue failed before doing repair-state housekeeping; never replay an old
+  // all-user WS/inbox notice after the new approval gate is installed.
+  await query(`UPDATE incident_deliveries SET status='failed', claimed_at=NOW()
+    WHERE status='pending'`);
+  const claimed = { rows: [] as ClaimedDeliveryRow[] };
 
   // 注意:claimed 为空**不 early-return**——修复状态机看护(verify fence/timeout/
   // cancel 推进)与 nonce 保洁必须每 tick 跑,否则"无 pending 投递"的安静时段里

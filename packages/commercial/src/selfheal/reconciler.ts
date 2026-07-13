@@ -143,7 +143,6 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
               userMessage: policy!.userMessage,
               opsDetail: policy!.repairHint,
             },
-            existing.audience,
             client,
           ),
         );
