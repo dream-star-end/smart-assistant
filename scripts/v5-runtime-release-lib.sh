@@ -665,8 +665,11 @@ oc_hotcfg_write_emergency_tuple() {
 }
 
 # ─────────────────────────── tuple history(§1.1)───────────────────────────
-# schemaVersion 编码(R2-M3):
-#   v2(现行,append 恒写 v2):checksum = sha256( 2\0seq\0ts\0image\0image_id\0release\0bundle\0masterRelease )
+# schemaVersion 编码(R2-M3/R5):
+#   v3(现行,append 恒写 v3):v2 八字段后追加 transitionKind + previousMasterRelease。
+#     transitionKind=joint|master-only|tuple-only|prestate；父 master 与类型一起进 checksum，
+#     让 rollback 区分“只切 master(P3)”与“只切 tuple(emergency)”，连续反向也不丢血缘。
+#   v2(只读兼容):checksum = sha256( 2\0seq\0ts\0image\0image_id\0release\0bundle\0masterRelease )
 #     前 64 hex。masterRelease(M7)= 激活时当前 master 蓝绿 release 目录 —— 与 tuple 同属一次 deploy
 #     的孪生产物,进 checksum 保证篡改被拒;rollback 从**同一条**记录同时取 master 与 tuple。
 #   v1(只读兼容,旧编码**无 masterRelease 字段**):checksum = sha256( 1\0seq\0ts\0image\0image_id\0
@@ -675,6 +678,7 @@ oc_hotcfg_write_emergency_tuple() {
 #   被静默丢弃 —— R2-M3 起编码变更必须 bump schemaVer 并在 verify 按行内 schemaVer 分支。
 oc_hotcfg_history_checksum() {
   local schemaVer="$1" seq="$2" ts="$3" image="$4" image_id="$5" release="$6" bundle="$7" masterRelease="${8:-}"
+  local transitionKind="${9:-}" previousMasterRelease="${10:-}"
   # 未知 schemaVer **显式拒绝**(R3-m2):否则伪造/未来版本只要沿用 v2 编码即被静默接受,
   # "按版本分支验证"失去升版语义(编码变更必 bump schemaVer + 必在此显式登记)。
   case "$schemaVer" in
@@ -684,26 +688,39 @@ oc_hotcfg_history_checksum() {
     2)
       printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
         "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$masterRelease" | sha256sum | cut -c1-64 ;;
+    3)
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+        "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$masterRelease" \
+        "$transitionKind" "$previousMasterRelease" | sha256sum | cut -c1-64 ;;
     *)
-      oc_hotcfg__die "history_checksum: 未知 schemaVer=$schemaVer(已知 1|2)"; return 1 ;;
+      oc_hotcfg__die "history_checksum: 未知 schemaVer=$schemaVer(已知 1|2|3)"; return 1 ;;
   esac
 }
 
 # 校验单行 history 条目(R2-M3 单一权威:last/nth/GC 三处共用,禁再散装内联)。
-# 按行内 schemaVer 分支验 v1/v2;通过 → stdout 输出**归一化** JSON(v1 补 masterRelease="")并 return 0。
+# 按行内 schemaVer 分支验 v1/v2/v3；旧格式归一化补 transitionKind/previousMasterRelease。
 oc_hotcfg__history_verify_line() {
-  local line="$1" schemaVer seq ts image image_id release bundle master want sum
+  local line="$1" schemaVer seq ts image image_id release bundle master kind previous want sum
   schemaVer="$(jq -r '.schemaVer // empty' <<<"$line" 2>/dev/null)" || return 1
   [ -n "$schemaVer" ] || return 1
   seq="$(jq -r '.seq' <<<"$line")"; ts="$(jq -r '.ts' <<<"$line")"
   image="$(jq -r '.image' <<<"$line")"; image_id="$(jq -r '.image_id' <<<"$line")"
   release="$(jq -r '.release' <<<"$line")"; bundle="$(jq -r '.bundle' <<<"$line")"
-  # v1 无 masterRelease 字段(不进 checksum):即使行里被塞了该字段也**视为空**,防注入未验值。
+  # v1/v2 没有受 checksum 保护的类型/父字段，必须忽略任何注入值并按旧语义归一化。
   if [ "$schemaVer" = 1 ]; then master=""; else master="$(jq -r '.masterRelease // ""' <<<"$line")"; fi
+  if [ "$schemaVer" = 3 ]; then
+    kind="$(jq -r '.transitionKind // ""' <<<"$line")"
+    previous="$(jq -r '.previousMasterRelease // ""' <<<"$line")"
+    case "$kind" in joint|master-only|tuple-only|prestate) : ;; *) return 1 ;; esac
+  else
+    kind="$(jq -r 'if .preState == true then "prestate" else "joint" end' <<<"$line")"
+    previous=""
+  fi
   want="$(jq -r '.checksum' <<<"$line")"
-  sum="$(oc_hotcfg_history_checksum "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master")"
+  sum="$(oc_hotcfg_history_checksum "$schemaVer" "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master" "$kind" "$previous")"
   [ "$sum" = "$want" ] || return 1
-  if [ "$schemaVer" = 1 ]; then jq -c '.masterRelease = ""' <<<"$line"; else printf '%s\n' "$line"; fi
+  jq -c --arg master "$master" --arg kind "$kind" --arg previous "$previous" \
+    '.masterRelease=$master | .transitionKind=$kind | .previousMasterRelease=$previous' <<<"$line"
 }
 
 # 返回最后一条 checksum 通过的 committed 条目(归一化 JSON 单行)到 stdout;无则空。
@@ -743,23 +760,26 @@ oc_hotcfg_env_tuple_json() {  # $1=env_file $2=master_release
     '{image:$image,image_id:$image_id,release:$release,bundle:$bundle,masterRelease:$masterRelease}'
 }
 
-# 追加一条 committed tuple(schemaVer=2,R2-M3):seq=上一 committed +1,temp+fsync+rename 落盘。
-# 用法:oc_hotcfg_history_append <hist> <image> <image_id> <release> <bundle> [masterRelease] [prestate]
+# 追加一条 committed tuple(schemaVer=3):seq=上一 committed +1,temp+fsync+rename 落盘。
+# 用法:... [masterRelease] [prestate] [transitionKind] [previousMasterRelease]
 # masterRelease(M7)= 激活时 master 蓝绿 release 目录名;rollback 从同一条记录取回对齐 master 源码。
-# $7 传字面 "prestate" → 条目附 preState:true(R2-B2 首次启用前的 live 现场记录;纯注记字段,
-# **不进 checksum** —— 恢复语义只由四键+masterRelease 承载,该旗标只供人读/审计定位)。
+# $7 传字面 "prestate" → 条目附 preState:true(布尔仅供审计)且 transitionKind=prestate
+# 进入 checksum；恢复语义由四键+master+kind+parent 共同承载。
 oc_hotcfg_history_append() {
   local hist="$1" image="$2" image_id="$3" release="$4" bundle="$5" master="${6:-}" flag="${7:-}"
+  local kind="${8:-joint}" previous="${9:-}"
   local last seq ts sum line dir prestate=false
-  [ "$flag" = prestate ] && prestate=true
+  if [ "$flag" = prestate ]; then prestate=true; kind=prestate; fi
+  case "$kind" in joint|master-only|tuple-only|prestate) : ;; *) oc_hotcfg__die "history_append: 非法 transitionKind=$kind"; return 1 ;; esac
   last="$(oc_hotcfg_history_last_committed "$hist")"
   if [ -n "$last" ]; then seq=$(( $(jq -r '.seq' <<<"$last") + 1 )); else seq=1; fi
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sum="$(oc_hotcfg_history_checksum 2 "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master")"
-  line="$(jq -cn --argjson schemaVer 2 --argjson seq "$seq" --arg ts "$ts" \
+  sum="$(oc_hotcfg_history_checksum 3 "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master" "$kind" "$previous")"
+  line="$(jq -cn --argjson schemaVer 3 --argjson seq "$seq" --arg ts "$ts" \
     --arg image "$image" --arg image_id "$image_id" --arg release "$release" --arg bundle "$bundle" \
-    --arg masterRelease "$master" --arg checksum "$sum" --argjson preState "$prestate" \
-    '{schemaVer:$schemaVer, seq:$seq, ts:$ts, image:$image, image_id:$image_id, release:$release, bundle:$bundle, masterRelease:$masterRelease, checksum:$checksum}
+    --arg masterRelease "$master" --arg transitionKind "$kind" --arg previousMasterRelease "$previous" \
+    --arg checksum "$sum" --argjson preState "$prestate" \
+    '{schemaVer:$schemaVer, seq:$seq, ts:$ts, image:$image, image_id:$image_id, release:$release, bundle:$bundle, masterRelease:$masterRelease, transitionKind:$transitionKind, previousMasterRelease:$previousMasterRelease, checksum:$checksum}
      + (if $preState then {preState:true} else {} end)')"
   dir="$(dirname "$hist")"; mkdir -p "$dir"
   local tmp="$hist.append.$$"
@@ -840,15 +860,16 @@ oc_hotcfg_assert_tuple_viable() {
 # 用法:oc_hotcfg_activate_saga <env_file> <platform_root> <flip_rev> <hist> \
 #         <image> <image_id> <release> <bundle_value> <restart_cmd> <smoke_cmd> \
 #         [extra_apply_cmd] [extra_revert_cmd] [master_release] [prev_master_release] \
-#         [commit_apply_cmd] [commit_revert_cmd] [manual_recovery_marker]
+#         [commit_apply_cmd] [commit_revert_cmd] [manual_recovery_marker] [transition_kind]
 # master_release(M7):激活时 master 蓝绿 release 目录,进 history 条目;rollback 从同一条记录取回对齐。
-# prev_master_release(R2-B2):激活**前**的 live master 目录,只用于首次启用的 pre-state 记录。
+# prev_master_release:激活前 live master；既供首次 pre-state，也作为 v3 previousMasterRelease 入账。
 oc_hotcfg_activate_saga() {
   local env_file="$1" platform_root="$2" flip_rev="$3" hist="$4"
   local image="$5" image_id="$6" release="$7" bundle_value="$8"
   local restart_cmd="$9" smoke_cmd="${10}"
   local extra_apply="${11:-}" extra_revert="${12:-}" master_release="${13:-}" prev_master_release="${14:-}"
-  local commit_apply="${15:-}" commit_revert="${16:-}" recovery_marker="${17:-}"
+  local commit_apply="${15:-}" commit_revert="${16:-}" recovery_marker="${17:-}" transition_kind="${18:-joint}"
+  case "$transition_kind" in joint|master-only|tuple-only) : ;; *) oc_hotcfg__die "activate_saga: 非法 transition_kind=$transition_kind"; return 1 ;; esac
 
   # 上一次外部权威提交若处于 unknown，禁止覆盖现场证据或开始另一轮激活。
   if [ -n "$recovery_marker" ] && [ -e "$recovery_marker" ]; then
@@ -878,7 +899,7 @@ oc_hotcfg_activate_saga() {
     pre_image_id="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE_ID)"
     pre_release="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_RELEASE)"
     pre_bundle="$(oc_hotcfg_env_get "$env_file" OC_PLATFORM_BUNDLE)"
-    if ! oc_hotcfg_history_append "$hist" "$pre_image" "$pre_image_id" "$pre_release" "$pre_bundle" "$prev_master_release" prestate; then
+    if ! oc_hotcfg_history_append "$hist" "$pre_image" "$pre_image_id" "$pre_release" "$pre_bundle" "$prev_master_release" prestate prestate ""; then
       oc_hotcfg__die "activate_saga: pre-state history 记录写入失败(现场未动,拒绝继续激活)"; return 1
     fi
     oc_hotcfg__log "pre-state 已记账(首次启用;--rollback=1 可退回启用前)"
@@ -982,12 +1003,12 @@ oc_hotcfg_activate_saga() {
     fi
   fi
   # 7) commit:history append(fsync,含 masterRelease)。写失败仍触发回滚(覆盖到 history fsync+外部权威)
-  if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value" "$master_release"; then
+  if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value" "$master_release" "" "$transition_kind" "$prev_master_release"; then
     _hotcfg_saga_rollback; return 1; fi
   # 8) 提交成功 → 轮转 env.bak(m6:只在 commit 成功路径,保留最近 10 份;失败现场备份最近 → 恒保留)
   oc_hotcfg_rotate_env_baks "$env_file" 10 || true
   rm -f "$snap"
-  oc_hotcfg__log "激活 saga 提交完成 image_id=$image_id release=$release bundle=${flip_rev:-<unchanged>} master=${master_release:-<unchanged>}"
+  oc_hotcfg__log "激活 saga 提交完成 kind=$transition_kind image_id=$image_id release=$release bundle=${flip_rev:-<unchanged>} master=${master_release:-<unchanged>} parent=${prev_master_release:-<none>}"
   return 0
 }
 

@@ -176,6 +176,8 @@ smoke() {
 ssh() {
   local _host="$1" cmd="${2:-}" link_target
   echo "ssh:$cmd" >> "$FAKE_EFFECT_LOG"
+  if [[ -n "${FAKE_EMERGENCY_JSON:-}" && "$cmd" == *"OC_RUNTIME_EMERGENCY_TUPLE="* ]]; then printf '%s\n' "$FAKE_EMERGENCY_JSON"; return 0; fi
+  if [[ -n "${FAKE_EMERGENCY_IMAGE_ID:-}" && "$cmd" == *"docker image inspect"* ]]; then printf '%s\n' "$FAKE_EMERGENCY_IMAGE_ID"; return 0; fi
   if [[ "$cmd" == *"cat '$RELEASES_ROOT/.prev-release'"* ]]; then printf '%s\n' "$FAKE_PREV_FILE"; return 0; fi
   if [[ "$cmd" == *"readlink -f"* ]]; then printf '%s\n' "$FAKE_CURRENT"; return 0; fi
   if [[ "$cmd" == *"ln -s '"* ]]; then
@@ -283,37 +285,67 @@ rm -f "$DS_FAIL_MARK"
 eq "D7 DB active 已恢复 oldB" "$(ds_exec <<<"SELECT active_release FROM deploy_state WHERE singleton=true")" "/rel/oldB"
 eq "D7 DB previous 已恢复 oldA" "$(ds_exec <<<"SELECT previous_active_release FROM deploy_state WHERE singleton=true")" "/rel/oldA"
 
-# D8:hotcfg history 落后于 P3 master 切换时，N=1 必须用 state.previous，保留当前 env tuple；
-# A→B 与 B→A 两向都跑完整 rollback_runtime_tuple 编排到 saga 调用。
-HOTCFG_LAST_MASTER=""; HOTCFG_CURRENT_IMAGE="img:LIVE"; HOTCFG_CURRENT_RELEASE="/runtime/LIVE"; HOTCFG_CAPTURE="/tmp/p3-hotcfg-capture-$$"
+# D8:用真实 v3 history 追加/读取 + mock 外部 saga，覆盖 master-only 连续反向、tuple-only
+# emergency 回退与 emergency marker 参数接线。
+HOTCFG_HIST="/tmp/p3-hotcfg-history-$$"; HOTCFG_CAPTURE="/tmp/p3-hotcfg-capture-$$"; : > "$HOTCFG_HIST"
 hotcfg_rmt() {
   local fn="$1"; shift
   case "$fn" in
-    oc_hotcfg_history_last_committed)
-      jq -cn --arg m "$HOTCFG_LAST_MASTER" '{image:"img:HIST",image_id:"id:HIST",release:"/runtime/HIST",bundle:"",masterRelease:$m}' ;;
-    oc_hotcfg_env_tuple_json)
-      jq -cn --arg i "$HOTCFG_CURRENT_IMAGE" --arg r "$HOTCFG_CURRENT_RELEASE" --arg m "$2" \
-        '{image:$i,image_id:"id:LIVE",release:$r,bundle:"",masterRelease:$m}' ;;
+    oc_hotcfg_history_last_committed|oc_hotcfg_history_nth_committed|oc_hotcfg_env_tuple_json)
+      "$fn" "$@" ;;
     oc_hotcfg_activate_saga)
-      printf '%s|%s|%s|%s\n' "${13}" "${5}" "${7}" "$ACTIVE_SLOT" > "$HOTCFG_CAPTURE" ;;
+      printf '%s|%s|%s|%s|%s|%s|%s\n' "${13}" "${5}" "${7}" "$ACTIVE_SLOT" "${18}" "${15:+state}" "${17}" > "$HOTCFG_CAPTURE"
+      oc_hotcfg_history_append "${4}" "${5}" "${6}" "${7}" "${8}" "${13}" "" "${18}" "${14}" >/dev/null
+      FAKE_CURRENT="${13}" ;;
     *) return 1 ;;
   esac
 }
-V5_ENV="$TEST_V5_ENV"
-# A(old) → B(new) finalize 后：history.last 仍 A；rollback target=A，tuple 保持 LIVE。
+V5_ENV="$TEST_V5_ENV"; OC_HOTCFG_HISTORY="$HOTCFG_HIST"
+cat >> "$TEST_V5_ENV" <<EOF
+OC_RUNTIME_IMAGE=img:LIVE
+OC_RUNTIME_IMAGE_ID=id:LIVE
+OC_RUNTIME_RELEASE=/runtime/LIVE
+OC_PLATFORM_BUNDLE=
+EOF
+oc_hotcfg_history_append "$HOTCFG_HIST" img:LIVE id:LIVE /runtime/LIVE "" /rel/oldA "" joint /rel/older >/dev/null
+# A(old) → B(new) finalize 后 history 仍 A；第一次回退 B→A 记 master-only(parent=B)。
 ACTIVE_SLOT=B; ACTIVE_SRC="$(slot_src B)"; ACTIVE_UNIT="$(slot_unit B)"; ACTIVE_PORT="$(slot_port B)"
 ACTIVE_STATE_RELEASE="/rel/newB"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/oldA"; ACTIVE_STATE_LOCK_VERSION=60
-FAKE_CURRENT="/rel/newB"; HOTCFG_LAST_MASTER="/rel/oldA"
+FAKE_CURRENT="/rel/newB"
 if rollback_runtime_tuple 1; then ok "D8 A→B finalize 后 hotcfg rollback 编排成功"; else bad "D8 A→B rollback 不应多退"; fi
-eq "D8 A→B target=state.previous A 且保留 live tuple" "$(cat "$HOTCFG_CAPTURE")" "/rel/oldA|img:LIVE|/runtime/LIVE|B"
-# B(old) → A(new) finalize 后：history.last 可仍更老 A；rollback target=B，tuple 仍保持 LIVE。
-ACTIVE_SLOT=A; ACTIVE_SRC="$(slot_src A)"; ACTIVE_UNIT="$(slot_unit A)"; ACTIVE_PORT="$(slot_port A)"
-ACTIVE_STATE_RELEASE="/rel/newA"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/oldB"; ACTIVE_STATE_LOCK_VERSION=70
-FAKE_CURRENT="/rel/newA"; HOTCFG_LAST_MASTER="/rel/olderA"
-if rollback_runtime_tuple 1; then ok "D8 B→A finalize 后 hotcfg rollback 编排成功"; else bad "D8 B→A rollback 不应多退"; fi
-eq "D8 B→A target=state.previous B 且保留 live tuple" "$(cat "$HOTCFG_CAPTURE")" "/rel/oldB|img:LIVE|/runtime/LIVE|A"
+eq "D8 B→A target=state.previous A+current tuple+master-only" "$(cut -d'|' -f1-5 "$HOTCFG_CAPTURE")" "/rel/oldA|img:LIVE|/runtime/LIVE|B|master-only"
+D8_LAST="$(oc_hotcfg_history_last_committed "$HOTCFG_HIST")"
+eq "D8 history 记录父 master=B" "$(jq -r '.previousMasterRelease' <<<"$D8_LAST")" "/rel/newB"
+# 立刻再次 rollback：last=A/master-only(parent=B)，必须合法反向 A→B，不因 history 前驱缺 B 被拒。
+if rollback_runtime_tuple 1; then ok "D8 master-only 连续第二次反向成功"; else bad "D8 连续第二次 rollback 应回 B"; fi
+eq "D8 连续反向 target=B+master-only" "$(cut -d'|' -f1-5 "$HOTCFG_CAPTURE")" "/rel/newB|img:LIVE|/runtime/LIVE|B|master-only"
+eq "D8 连续反向后 state.previous=A" "$ACTIVE_STATE_PREVIOUS_RELEASE" "/rel/oldA"
 
-rm -rf "$PSQL_WRAP"; rm -f "$TEST_V5_ENV" "$FAKE_EFFECT_LOG" "$HOTCFG_CAPTURE"
+# emergency tuple-only：master=A/state.previous=B 不动，只恢复上一 tuple；history v3 明示 tuple-only。
+: > "$HOTCFG_HIST"
+oc_hotcfg_history_append "$HOTCFG_HIST" img:OLD id:OLD /runtime/OLD "" /rel/activeA "" joint /rel/oldB >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:EM id:EM "" /bundle/EM /rel/activeA "" tuple-only /rel/activeA >/dev/null
+sed -i '/^OC_RUNTIME_/d;/^OC_PLATFORM_BUNDLE=/d' "$TEST_V5_ENV"
+cat >> "$TEST_V5_ENV" <<EOF
+OC_RUNTIME_IMAGE=img:EM
+OC_RUNTIME_IMAGE_ID=id:EM
+OC_RUNTIME_RELEASE=
+OC_PLATFORM_BUNDLE=/bundle/EM
+EOF
+ACTIVE_SLOT=A; ACTIVE_SRC="$(slot_src A)"; ACTIVE_UNIT="$(slot_unit A)"; ACTIVE_PORT="$(slot_port A)"
+ACTIVE_STATE_RELEASE="/rel/activeA"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/oldB"; ACTIVE_STATE_LOCK_VERSION=80; FAKE_CURRENT="/rel/activeA"
+if rollback_runtime_tuple 1; then ok "D8 emergency tuple-only rollback 成功"; else bad "D8 tuple-only 应可回上一 tuple"; fi
+eq "D8 tuple-only 保持 master=A 且不装 state hook" "$(cut -d'|' -f1,2,3,5,6 "$HOTCFG_CAPTURE")" "/rel/activeA|img:OLD|/runtime/OLD|tuple-only|"
+eq "D8 tuple-only 后 state.previous 仍 B" "$ACTIVE_STATE_PREVIOUS_RELEASE" "/rel/oldB"
+
+# 真实 activate_emergency_tuple 编排必须把 marker 作为第17参传入 saga。
+FAKE_EMERGENCY_IMAGE_ID="id:EM"; FAKE_EMERGENCY_JSON="$(jq -cn --arg b "$OC_HOTCFG_PLATFORM_ROOT/bundles/aaaaaaaaaaaa" '{image:"img:EM",image_id:"id:EM",bundle:$b}')"
+ACTIVE_STATE_LOADED=1; ACTIVE_STATE_PHASE=stable; ACTIVE_STATE_CANDIDATE_SLOT=""; ACTIVE_STATE_CANDIDATE_RELEASE=""
+if activate_emergency_tuple >/dev/null; then ok "D8 emergency 激活编排成功"; else bad "D8 emergency 编排不应失败"; fi
+eq "D8 emergency saga 接线 tuple-only+持久 marker" "$(cut -d'|' -f5,7 "$HOTCFG_CAPTURE")" "tuple-only|$DEPLOY_RECOVERY_MARKER"
+unset FAKE_EMERGENCY_IMAGE_ID FAKE_EMERGENCY_JSON
+
+rm -rf "$PSQL_WRAP"; rm -f "$TEST_V5_ENV" "$FAKE_EFFECT_LOG" "$HOTCFG_CAPTURE" "$HOTCFG_HIST"
 
 echo "── E) 真 PG 恢复路径:journal 原基线 / 缺失基线 / step6 candidate 异常 ──"
 # 外部效果全部换成可观测 fake；状态推进仍打本地真 PG。

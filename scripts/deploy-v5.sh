@@ -1262,7 +1262,7 @@ activate_runtime_tuple() {
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle_val" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" \
+    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "joint" \
     || { echo "✗ 激活 saga 失败,已自动回滚旧 tuple(env/current/master 源码/.prev-release/重启旧 master)" >&2; return 1; }
   ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
   ACTIVE_STATE_RELEASE="$BUILT_RELEASE"
@@ -1328,6 +1328,7 @@ activate_emergency_tuple() {
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "" "" "$prev_src" "$prev_src" \
+    "" "" "$DEPLOY_RECOVERY_MARKER" "tuple-only" \
     || { echo "✗ emergency 激活 saga 失败,已自动回滚" >&2; exit 1; }
   echo "✓ emergency tuple 已激活(image=$image release=<empty> bundle=$rev);存量容器按 runtimeStale 滚动。"
 }
@@ -1916,13 +1917,12 @@ rollback() {
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
 }
 
-# tuple 感知回滚：N=1 的 master 目标**永远**以 deploy_state.previous_active_release 为权威。
-# 若 history.last.masterRelease==active_release，说明最近一次 master+tuple 由 hotcfg 同步激活，
-# 上一条 history 必须与 previous 匹配并整条恢复；若不相等，说明中间经过 P3 finalize/传统
-# master-only 切换，runtime tuple 没变，故保留 env 当前四键、只回 previous master。N>1 只有
-# history.last 与 active 对齐时才允许相对寻址，否则 ancestry 已被 P3 插入，fail-closed 要求逐次 N=1。
+# tuple 感知回滚：history v3 用 transitionKind+previousMasterRelease 区分 joint/master-only/
+# tuple-only。tuple-only 只恢复上一 tuple，master/state 不动；master-only 用 state.previous+
+# current tuple 对称反向；joint 恢复上一条同源 master+tuple。P3 finalize 未写 history 时由
+# history.last.master!=active 识别为未记账 master-only。N>1 仅允许纯 joint 起点。
 rollback_runtime_tuple() {
-  local n="$1" nth prev last last_master image image_id release bundle master source_desc
+  local n="$1" nth prev last last_master last_kind last_previous image image_id release bundle master source_desc transition_kind state_commit=1
   nth=$((n+1))
   local flip_rev prev_src old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
@@ -1934,30 +1934,66 @@ rollback_runtime_tuple() {
   last="$(hotcfg_rmt oc_hotcfg_history_last_committed "$OC_HOTCFG_HISTORY")"
   [[ -n "$last" ]] || { echo "✗ hotcfg history 无 committed tuple，无法安全回滚" >&2; return 1; }
   last_master="$(jq -r '.masterRelease // ""' <<<"$last")"
+  last_kind="$(jq -r '.transitionKind // "joint"' <<<"$last")"
+  last_previous="$(jq -r '.previousMasterRelease // ""' <<<"$last")"
   if [[ "$n" == 1 ]]; then
-    master="$ACTIVE_STATE_PREVIOUS_RELEASE"
-    [[ -n "$master" ]] || { echo "✗ deploy_state.previous_active_release 为空，N=1 无权威回滚目标" >&2; return 1; }
-    if [[ "$last_master" == "$ACTIVE_STATE_RELEASE" ]]; then
-      prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
-      [[ -n "$prev" ]] || { echo "✗ history 缺上一条 committed tuple，但 state.previous=$master" >&2; return 1; }
-      [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$master" ]] || {
-        echo "✗ history 上一条 master 与 state.previous 不一致，拒绝多退/错配(history=$(jq -r '.masterRelease // ""' <<<"$prev") state=$master)" >&2
-        return 1
-      }
-      source_desc="history previous(同条 master+tuple)"
-    else
+    if [[ "$last_master" != "$ACTIVE_STATE_RELEASE" ]]; then
+      # P3 finalize 不写 tuple history：history 落后于 live master 即为未记账的 master-only 转换。
+      master="$ACTIVE_STATE_PREVIOUS_RELEASE"
+      [[ -n "$master" ]] || { echo "✗ P3 master-only 回滚缺 state.previous 权威目标" >&2; return 1; }
       prev="$(hotcfg_rmt oc_hotcfg_env_tuple_json "$V5_ENV" "$master")"
       [[ -n "$prev" ]] || { echo "✗ 无法读取当前 live tuple，拒绝 P3 master-only 回滚" >&2; return 1; }
-      source_desc="deploy_state previous + current env tuple(P3/master-only)"
+      transition_kind="master-only"
+      source_desc="unrecorded P3 master-only(state.previous + current tuple)"
+    elif [[ "$last_kind" == tuple-only ]]; then
+      # emergency 等只改 tuple 的事件：回到上一条 tuple，但 master/state 血缘完全不动。
+      prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
+      [[ -n "$prev" ]] || { echo "✗ tuple-only history 缺上一条 tuple 可恢复" >&2; return 1; }
+      master="$ACTIVE_STATE_RELEASE"
+      state_commit=0
+      transition_kind="tuple-only"
+      source_desc="tuple-only history previous(master/state 不动)"
+    elif [[ "$last_kind" == master-only ]]; then
+      master="$ACTIVE_STATE_PREVIOUS_RELEASE"
+      [[ -n "$master" && "$last_previous" == "$master" ]] || {
+        echo "✗ master-only history 父 master 与 state.previous 不一致(history=$last_previous state=${master:-<empty>})" >&2
+        return 1
+      }
+      prev="$(hotcfg_rmt oc_hotcfg_env_tuple_json "$V5_ENV" "$master")"
+      [[ -n "$prev" ]] || { echo "✗ 无法读取当前 live tuple，拒绝 master-only 反向" >&2; return 1; }
+      transition_kind="master-only"
+      source_desc="recorded master-only(parent=$master,current tuple)"
+    elif [[ "$last_kind" == joint ]]; then
+      master="$ACTIVE_STATE_PREVIOUS_RELEASE"
+      [[ -n "$master" ]] || { echo "✗ joint 回滚缺 state.previous 权威目标" >&2; return 1; }
+      prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
+      [[ -n "$prev" ]] || { echo "✗ joint history 缺上一条 committed tuple" >&2; return 1; }
+      if [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" != "$master" ]]; then
+        # v2 没有 transitionKind；同 master 的旧 emergency 条目按 tuple-only 兼容恢复。
+        if [[ "$(jq -r '.schemaVer // 0' <<<"$last")" -le 2 && "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$ACTIVE_STATE_RELEASE" ]]; then
+          master="$ACTIVE_STATE_RELEASE"; state_commit=0; transition_kind="tuple-only"
+          source_desc="legacy-v2 inferred tuple-only"
+        else
+          echo "✗ joint history 上一 master 与 state.previous 不一致(history=$(jq -r '.masterRelease // ""' <<<"$prev") state=$master)" >&2
+          return 1
+        fi
+      else
+        transition_kind="joint"
+        source_desc="joint history previous(同条 master+tuple)"
+      fi
+    else
+      echo "✗ last transitionKind=$last_kind 不可作为 rollback 起点" >&2
+      return 1
     fi
   else
-    [[ "$last_master" == "$ACTIVE_STATE_RELEASE" ]] || {
+    [[ "$last_master" == "$ACTIVE_STATE_RELEASE" && "$last_kind" == joint ]] || {
       echo "✗ N=$n 相对 history 回滚不安全：history.last.master=$last_master 与 active=$ACTIVE_STATE_RELEASE 不同。请逐次 --rollback=1。" >&2
       return 1
     }
     prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$nth")"
     [[ -n "$prev" ]] || { echo "✗ history 无倒数第 $nth 条 committed tuple 可回滚(N=$n)" >&2; return 1; }
     master="$(jq -r '.masterRelease // ""' <<<"$prev")"
+    transition_kind="joint"
     source_desc="history nth=$nth"
   fi
   image="$(jq -r '.image' <<<"$prev")"; image_id="$(jq -r '.image_id' <<<"$prev")"
@@ -1971,8 +2007,8 @@ rollback_runtime_tuple() {
   if [[ -n "$bundle" && "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT"/bundles/* ]]; then
     flip_rev="${bundle##*/}"
   fi
-  # M7c:快照翻转前的 .prev-release,saga 失败时一并还原
-  if [[ "$ACTIVE_SLOT" == A ]]; then
+  # M7c:只有 master 变更才维护 .prev-release；tuple-only 不碰 master 血缘。
+  if [[ "$state_commit" == 1 && "$ACTIVE_SLOT" == A ]]; then
     old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
     prev_apply="printf '%s\\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release';"
     if [[ -n "$old_prev" ]]; then
@@ -1983,10 +2019,15 @@ rollback_runtime_tuple() {
   fi
   restart_cmd="systemctl restart '$ACTIVE_UNIT'"
   smoke_cmd="$(hotcfg_core_smoke_cmd)"
-  extra_apply="$prev_apply rm -f '$ACTIVE_SRC.hotlink'; ln -s '$master' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
-  extra_revert="$prev_revert rm -f '$ACTIVE_SRC.hotlink'; ln -s '$prev_src' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
+  if [[ "$state_commit" == 1 ]]; then
+    extra_apply="$prev_apply rm -f '$ACTIVE_SRC.hotlink'; ln -s '$master' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
+    extra_revert="$prev_revert rm -f '$ACTIVE_SRC.hotlink'; ln -s '$prev_src' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
+  else
+    extra_apply=""; extra_revert=""
+  fi
   sync_assets_to_pool "$master" || return 1
-  build_hotcfg_state_hooks "$master"
+  HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
+  [[ "$state_commit" == 1 ]] && build_hotcfg_state_hooks "$master"
   echo "  回滚计划($source_desc): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
   # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
@@ -1994,10 +2035,12 @@ rollback_runtime_tuple() {
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" || return 1
-  ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
-  ACTIVE_STATE_RELEASE="$master"
-  ACTIVE_STATE_LOCK_VERSION=$((ACTIVE_STATE_LOCK_VERSION + 1))
+    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind" || return 1
+  if [[ "$state_commit" == 1 ]]; then
+    ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
+    ACTIVE_STATE_RELEASE="$master"
+    ACTIVE_STATE_LOCK_VERSION=$((ACTIVE_STATE_LOCK_VERSION + 1))
+  fi
 }
 
 # ═══════════════════════ P3 双 master cohort lane(RFC-v5-dual-master-cohort §D5/§8)═══════════════════════
