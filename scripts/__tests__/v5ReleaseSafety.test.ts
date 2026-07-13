@@ -670,7 +670,23 @@ describe('v5 release safety lanes', () => {
       CREATE SCHEMA ${schema};
       CREATE TABLE ${schema}.model_security_epoch (id BOOLEAN PRIMARY KEY, epoch BIGINT NOT NULL);
       CREATE TABLE ${schema}.model_visibility_grants (user_id BIGINT NOT NULL, model_id TEXT NOT NULL);
-      CREATE TABLE ${schema}.usage_records (authority_kind TEXT);
+      CREATE TABLE ${schema}.usage_records (
+        model TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        execution_revision TEXT,
+        security_epoch BIGINT,
+        authority_kind TEXT
+      );
+      CREATE TABLE ${schema}.request_finalize_journal (
+        state TEXT NOT NULL,
+        ctx JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE ${schema}.model_catalog (entry_id BIGINT PRIMARY KEY, model_id TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE TABLE ${schema}.model_aliases (alias TEXT NOT NULL, entry_id BIGINT NOT NULL);
+      CREATE TABLE ${schema}.model_runtime_requirements (model_id TEXT NOT NULL);
+      CREATE TABLE ${schema}.model_pricing (model_id TEXT NOT NULL, enabled BOOLEAN NOT NULL);
       CREATE TABLE ${schema}.model_authority_deploy_state (
         key TEXT PRIMARY KEY,
         value JSONB NOT NULL,
@@ -690,22 +706,22 @@ describe('v5 release safety lanes', () => {
       assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout)
     })
 
-    const harness = [
+    const shellPrelude = [
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
       'model_authority_release_sha() { printf %s test-release-sha; }',
-      'model_authority_runtime_tuple() { printf "%s\\n" \'{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"/test/bundle"}\'; }',
+      'model_authority_runtime_tuple() { printf "%s\\n" \'{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"/test/test-bundle"}\'; }',
       'remote_model_authority_psql() {',
       '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc "$1" 2>/dev/null | tr -d \'[:space:]\'',
       '}',
-      'start_model_authority_observation',
-    ].join('\n')
-    const runObservation = () => spawnSync('bash', ['-c', harness], {
+    ]
+    const runShell = (body: string[]) => spawnSync('bash', ['-c', [...shellPrelude, ...body].join('\n')], {
       cwd: root,
       encoding: 'utf8',
       env: { ...process.env, ALLOW_ANY_BRANCH: '1', TEST_DATABASE_URL: databaseUrl, TEST_SCHEMA: schema },
     })
+    const runObservation = () => runShell(['start_model_authority_observation'])
 
     const success = runObservation()
     assert.equal(success.status, 0, success.stderr || success.stdout)
@@ -725,8 +741,61 @@ describe('v5 release safety lanes', () => {
       image: 'test-image',
       image_id: 'sha256:test',
       release: '/test/release',
-      bundle: '/test/bundle',
+      bundle: '/test/test-bundle',
     })
+
+    const addCanaryUsage = psql(`
+      INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
+      VALUES ('oc-catalog-canary-glm52','revision-canary',3,'bridge_signed')
+    `, true)
+    assert.equal(addCanaryUsage.status, 0, addCanaryUsage.stderr || addCanaryUsage.stdout)
+    const status = runShell(['model_authority_observation_status'])
+    assert.equal(status.status, 0, status.stderr || status.stdout)
+    const statusJson = JSON.parse(status.stdout) as Record<string, unknown>
+    assert.equal(statusJson.signed_requests, 1)
+    assert.equal(statusJson.canary_requests, 1)
+
+    const prepareCutover = psql(`
+      INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
+      SELECT 'glm-5.2','revision-' || n,3,'bridge_signed' FROM generate_series(1,9) AS n;
+      INSERT INTO request_finalize_journal(state,ctx,created_at,updated_at)
+      VALUES (
+        'committed',
+        '{"source":"ccb_proxy","authorityKind":"bridge_signed","executionRevision":"revision-long","securityEpoch":"3"}',
+        NOW()-interval '6 minutes',NOW()
+      );
+      INSERT INTO model_catalog(entry_id,model_id,state)
+      VALUES (1,'oc-catalog-canary-glm52','active');
+      INSERT INTO model_aliases(alias,entry_id) VALUES ('oc-catalog-canary',1);
+      UPDATE model_authority_deploy_state SET value=value || jsonb_build_object(
+        'started_at',(NOW()-interval '901 seconds')::text,
+        'seed_census',jsonb_build_object(
+          'container_count',1,
+          'fleet',jsonb_build_array(jsonb_build_object('id','test-container','bundle_rev','test-bundle'))
+        ),
+        'emergency_drill',jsonb_build_object('activated_and_restored',true)
+      ) WHERE key='observation';
+    `, true)
+    assert.equal(prepareCutover.status, 0, prepareCutover.stderr || prepareCutover.stdout)
+
+    const cutover = runShell([
+      'remote_env_get() { case "$1" in "$MODEL_AUTHORITY_FLAG_KEY"|OC_SEED_AUTHORITY_BY_REV) printf 1 ;; *) printf "" ;; esac; }',
+      'model_authority_preflight() { return 0; }',
+      'model_authority_fleet_census() { printf "%s\\n" \'[{"id":"test-container","bundle_rev":"test-bundle"}]\'; }',
+      'remote_model_authority_psql_script() {',
+      '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -q',
+      '}',
+      'remote_env_set() { return 0; }',
+      'model_authority_cutover_done() { return 0; }',
+      'model_authority_cutover',
+    ])
+    assert.equal(cutover.status, 0, cutover.stderr || cutover.stdout)
+    const cutoverMarker = psql(
+      "SELECT value->>'release_sha' FROM model_authority_deploy_state WHERE key='cutover'",
+      true,
+    )
+    assert.equal(cutoverMarker.status, 0, cutoverMarker.stderr || cutoverMarker.stdout)
+    assert.equal(cutoverMarker.stdout.trim(), 'test-release-sha')
 
     const legacy = psql(`
       INSERT INTO model_authority_deploy_state(key,value)
