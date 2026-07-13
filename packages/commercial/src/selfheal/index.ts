@@ -4,14 +4,14 @@
  * 分层:
  *   conditions.ts — 检测状态单写权威 adapter(writeCondition → PG write_alert_condition)
  *   policy.ts     — incident_policies 加载 + condition_key → policy 匹配(exact/longest-prefix)
- *   incidents.ts  — incident 生命周期(open/update/resolve,CAS 幂等 + 收件人快照 + delivery)
+ *   incidents.ts  — incident 生命周期(open/update/resolve,CAS 幂等，仅内部运维账本)
  *   reconciler.ts — level-triggered 投影(condition 当前值 → incidents)
- *   sweeper.ts    — durable 投递(WS broadcast 注入 + 同事务 inbox + activeIncidents 快照)
+ *   sweeper.ts    — 自愈状态机推进 + legacy 用户 delivery 永久封存
+ *   userNoticeApproval.ts — 唯一用户通知出口(真实影响 + 自动修复 + 企微审批 + 在线定向)
  *
  * 集成边界(index.ts 装配):
  *   - reconciler + sweeper scheduler gate = runtimeChannel==='v5'(v5-owned),tick 10s。
- *   - sweeper 注入 broadcastAll / broadcastToUsers(bridge handler,forward-ref 装配)。
- *   - sweeper.getActiveIncidents() 供 bridge 鉴权后补发。
+ *   - incident 生命周期不注入 bridge，也不做鉴权后补发。
  */
 
 export {
@@ -81,13 +81,8 @@ export {
 export {
   sweepOnce,
   startIncidentSweeper,
-  startIncidentSnapshot,
   isSelfhealDispatchDisabled,
-  type IncidentPayload,
   type SweepResult,
   type SweeperDeps,
-  type BroadcastAllFn,
-  type BroadcastToUsersFn,
-  type IncidentReconcilerSnapshotHandle,
-  type IncidentSnapshotHandle,
+  type IncidentSweeperHandle,
 } from "./sweeper.js";
