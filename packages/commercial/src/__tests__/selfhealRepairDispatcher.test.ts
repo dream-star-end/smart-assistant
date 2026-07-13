@@ -25,6 +25,7 @@ function qr<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
 interface FakeOpts {
   incidentStatus?: string;
   failedCount?: number;
+  fuseAlertExists?: boolean;
   cooldownHit?: boolean;
   insertError?: { code?: string };
   /** Guarded INSERT…SELECT matched 0 rows (incident recovered mid-dispatch). */
@@ -53,6 +54,9 @@ function makeFake(opts: FakeOpts = {}) {
     }
     if (/COUNT\(\*\)::text AS n FROM codex_repairs/.test(sql)) {
       return qr([{ n: String(opts.failedCount ?? 0) }]);
+    }
+    if (/FROM admin_alert_outbox/.test(sql)) {
+      return qr(opts.fuseAlertExists ? [{ one: 1 }] : []);
     }
     if (/SELECT 1 AS one FROM codex_repairs r/.test(sql)) {
       return qr(opts.cooldownHit ? [{ one: 1 }] : []);
@@ -124,6 +128,20 @@ describe("repairDispatcher.dispatchRepair", () => {
     assert.equal(alerts.length, 1);
     assert.equal(alerts[0].event_type, "ops.repair_failed");
     assert.equal(alerts[0].severity, "critical");
+  });
+
+  test("保险丝:历史 sent 告警已存在 → 永久去重,不重复推送", async () => {
+    const { fakeQuery, fakeTx } = makeFake({ failedCount: 2, fuseAlertExists: true });
+    const { fetchFn, calls } = makeFetch(202);
+    const alerts: AlertEventInput[] = [];
+    const r = await dispatchRepair("1", {
+      query: fakeQuery, tx: fakeTx, fetch: fetchFn, now: () => NOW,
+      enqueueAlert: (e) => alerts.push(e),
+    });
+    assert.equal(r.status, "skipped");
+    assert.equal((r as { reason: string }).reason, "fuse_failed");
+    assert.equal(calls.length, 0, "熔断不 POST 修复");
+    assert.equal(alerts.length, 0, "已发送过的 incident 保险丝告警不再重复入队");
   });
 
   test("冷却:同 event_type 30min 内已派单 → skipped:cooldown", async () => {
