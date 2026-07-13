@@ -81,6 +81,7 @@ export {
 export {
   sweepOnce,
   startIncidentSweeper,
+  startIncidentSnapshot,
   isSelfhealDispatchDisabled,
   type IncidentPayload,
   type SweepResult,
@@ -88,4 +89,5 @@ export {
   type BroadcastAllFn,
   type BroadcastToUsersFn,
   type IncidentReconcilerSnapshotHandle,
+  type IncidentSnapshotHandle,
 } from "./sweeper.js";

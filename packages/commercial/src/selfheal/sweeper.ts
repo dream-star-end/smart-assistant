@@ -592,7 +592,7 @@ function alertTimeout(
 // ─── activeIncidents 内存快照(供 bridge accept 补发)──────────────────
 
 export interface IncidentReconcilerSnapshotHandle {
-  stop(): void;
+  stop(): Promise<void>;
   runNow(): Promise<SweepResult>;
   /**
    * 当前活跃(未 resolved)incident 中**该 uid 可见**的 WS payload 快照,供 bridge
@@ -674,12 +674,85 @@ export function startIncidentSweeper(
   if (opts.runOnStart) void tick();
 
   return {
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      if (inflight) await inflight;
     },
     runNow: tick,
     // Per-user visibility filter (Codex B2) — see visibleIncidentsForUser.
     getActiveIncidentsForUser: (uid: string) => visibleIncidentsForUser(activeSnapshot, uid),
+  };
+}
+
+/**
+ * 每槽只读 active incident 快照。与 leader-only sweeper 分离：双 master 下 follower 也要
+ * 在 WS 鉴权后补发本用户可见事故，但绝不能 claim delivery / 推进 repair 状态机。
+ */
+export interface IncidentSnapshotHandle {
+  stop(): Promise<void>;
+  runNow(): Promise<void>;
+  getActiveIncidentsForUser(uid: string): IncidentPayload[];
+}
+
+export function startIncidentSnapshot(opts: {
+  intervalMs?: number;
+  query?: typeof _query;
+  logger?: Logger;
+} = {}): IncidentSnapshotHandle {
+  const interval = Math.max(2_000, opts.intervalMs ?? DEFAULT_INTERVAL_MS);
+  const query = opts.query ?? _query;
+  const log = opts.logger ?? rootLogger.child({ subsys: "selfheal", module: "snapshot" });
+  let stopped = false;
+  let inflight: Promise<void> | null = null;
+  let activeSnapshot: ActiveIncidentEntry[] = [];
+
+  async function refresh(): Promise<void> {
+    if (inflight) return inflight;
+    inflight = (async () => {
+      const r = await query<IncidentRow>(
+        `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
+                user_title, user_message
+           FROM incidents WHERE status <> 'resolved'`,
+      );
+      const entries: ActiveIncidentEntry[] = [];
+      for (const inc of r.rows) {
+        const payload = buildPayload(inc, Number(inc.rev), "opened");
+        let recipients = new Set<string>();
+        if (inc.audience === "user_ids") {
+          const rr = await query<{ user_id: string }>(
+            `SELECT user_id::text AS user_id FROM incident_recipients WHERE incident_id=$1::bigint`,
+            [inc.id],
+          );
+          recipients = new Set(rr.rows.map((x) => x.user_id));
+        }
+        entries.push({ payload, audience: inc.audience, recipients });
+      }
+      activeSnapshot = entries;
+    })()
+      .catch((err) => {
+        log.warn("selfheal_snapshot_refresh_failed", {
+          err: (err as Error)?.message ?? String(err),
+        });
+      })
+      .finally(() => {
+        inflight = null;
+      });
+    return inflight;
+  }
+
+  const timer = setInterval(() => {
+    if (!stopped) void refresh();
+  }, interval);
+  if (typeof timer.unref === "function") timer.unref();
+
+  return {
+    async stop() {
+      stopped = true;
+      clearInterval(timer);
+      if (inflight) await inflight;
+    },
+    runNow: refresh,
+    getActiveIncidentsForUser: (uid) => visibleIncidentsForUser(activeSnapshot, uid),
   };
 }

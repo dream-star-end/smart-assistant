@@ -198,6 +198,15 @@ export class ChatSocket {
   private provisioning = false;
   private started = false;
   private gateReady = false;
+  /**
+   * cohort lane 就绪闸（P3 RFC D1）：与 gateReady 正交的 WS 连接前置——只有 auth 流程完成
+   * lane 决策（cookie 已下发）才允许建连，防首连落错 slot 再被 cookie 纠正的抖动。
+   * **默认 true**：直连 socket 的既有测试无 lane 概念，保持行为不变；生产由 useChatSocket
+   * 依 useAuth.laneReady 驱动 setLaneReady（决策前置 false，达成后 true）。
+   * connect 需 gateReady ∧ laneReady 双真才建连，两闸各自上升沿都尝试 connect（另一闸未就绪则
+   * connect 内部 no-op），故两者到位顺序无关、无竞态。
+   */
+  private laneReady = true;
 
   // ── 重连退避（§1）──
   private reconnectAttempts = 0;
@@ -468,6 +477,19 @@ export class ChatSocket {
       }
       this.setStatus("未连接", "disconnected");
     }
+  }
+
+  /**
+   * cohort lane 就绪闸（P3 RFC D1）。gateReady 之外的第二连接前置：ready→true 且 gateReady
+   * 已就绪时尝试 connect（connect 内部仍校验 gateReady，未就绪则 no-op）。
+   * **lane 不就绪不主动断开**：lane 落 false 仅发生在登出/换号，此时 setGateReady(false) 已负责
+   * 断开；lane 是 per-session 一次性上升沿（promote 重评只更新 cookie，不 mid-session 拉 false），
+   * 无需在此重复断连逻辑。
+   */
+  setLaneReady(ready: boolean): void {
+    const was = this.laneReady;
+    this.laneReady = ready;
+    if (ready && !was) this.connect();
   }
 
   // ═══════════════ safeWsSend（唯一发送入口，2MB 背压，§2）═══════════════
@@ -762,7 +784,8 @@ export class ChatSocket {
   // ═══════════════ connect / onopen / onclose / onmessage ═══════════════
   connect(): void {
     if (!this.deps.getToken()) return;
-    if (!this.gateReady) return; // 硬前置
+    if (!this.gateReady) return; // 硬前置：容器 ready + 注水完成
+    if (!this.laneReady) return; // 硬前置：cohort lane 决策达成（P3 RFC D1，防落错 slot）
     if (this.wsAuthRefreshInFlight) return; // 续期中禁止用旧 token 起新连
     if (this.ws && this.ws.readyState < 2) return; // 已连/连接中
     if (!this.isBrowserOnline) {

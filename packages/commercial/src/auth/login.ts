@@ -329,6 +329,8 @@ export interface RefreshDeps {
 }
 
 export interface RefreshResult {
+  /** 令牌所属用户 id(string 化)。P3:HTTP 层用它评估 cohort lane 并下发 oc_v5lane。 */
+  user_id: string;
   access_token: string;
   access_exp: number;
   /**
@@ -587,6 +589,7 @@ export async function refresh(
   );
 
   return {
+    user_id: result.user_id,
     access_token: access.token,
     access_exp: access.exp,
     refresh_token: result.newRefresh.token,

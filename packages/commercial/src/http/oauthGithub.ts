@@ -30,6 +30,8 @@ import {
   startGithubOAuth,
 } from '../auth/github.js'
 import { getPool } from '../db/index.js'
+import type { QueryRunner } from '../db/queries.js'
+import { consumeOAuthPendingState, putOAuthPendingState } from '../auth/oauthPendingStore.js'
 import { saveGithubLink } from '../github/tokenStore.js'
 import { requireAuth } from './auth.js'
 import { invalidateReposCacheForUser } from './githubApi.js'
@@ -38,9 +40,19 @@ import { HttpError } from './util.js'
 
 // ─── test-injectable overrides ────────────────────────────────────────
 // Production code passes nothing; tests inject mocks to avoid real DB / fetch.
+export interface GithubStartOverrides {
+  /** 注入 pending store 的 QueryRunner(测试用),默认走 pool。 */
+  pendingRunner?: QueryRunner
+  /** 注入 KMS key(测试用),默认 loadKmsKey()。 */
+  pendingKey?: Buffer
+}
 export interface GithubCallbackOverrides {
   exchanger?: typeof exchangeGithubOAuth
   poolFactory?: () => Pool
+  /** 注入 pending store 的 QueryRunner(测试用),默认走 pool。 */
+  pendingRunner?: QueryRunner
+  /** 注入 KMS key(测试用),默认 loadKmsKey()。 */
+  pendingKey?: Buffer
 }
 
 // ─── helper ──────────────────────────────────────────────────────────
@@ -81,6 +93,7 @@ export async function handleGithubStart(
   res: ServerResponse,
   ctx: RequestContext,
   deps: CommercialHttpDeps,
+  overrides: GithubStartOverrides = {},
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
 
@@ -95,7 +108,17 @@ export async function handleGithubStart(
     throw err
   }
 
-  const result = startGithubOAuth({ userId: Number(user.id), cfg })
+  const result = startGithubOAuth({ cfg })
+  // pending state 迁 PG:state→userId 绑定原子落库(跨 slot callback 天然成立)。
+  // MINOR 1:payload 里 userId **保持字符串**(user.id 本就是 bigint-as-string)——不 Number() 强转,
+  // 避免大 uid 精度丢失;到 DB 边界(saveGithubLink 要 number)再局部收敛。
+  await putOAuthPendingState({
+    provider: 'github',
+    state: result.state,
+    payload: { userId: user.id },
+    runner: overrides.pendingRunner,
+    key: overrides.pendingKey,
+  })
   setGithubStateCookie(res, result.state, { secure: deps.refreshCookieSecure })
   ctx.log.info('github_start', { sub: user.id })
   sendJson(res, 200, { authorizeUrl: result.authorizeUrl, state: result.state })
@@ -147,6 +170,14 @@ export async function handleGithubCallback(
   // 2) GitHub 把用户带回时带 ?error=… (如用户拒绝授权)
   if (queryError) {
     ctx.log.info('github_callback_provider_error', { error: queryError })
+    // MINOR 2:state 已双因素校验通过,顺手消费(原子 DELETE)对应 pending row —— 用户拒授权后
+    // 那条 pending 已无用,best-effort 清掉不留悬挂行(不成功也不影响错误跳转)。
+    await consumeOAuthPendingState({
+      provider: 'github',
+      state: queryState,
+      runner: overrides.pendingRunner,
+      key: overrides.pendingKey,
+    }).catch(() => { /* best-effort 清理,失败由 TTL/GC 兜底 */ })
     sendRedirect(res, githubErrorRedirect('exchange_failed'))
     return
   }
@@ -169,10 +200,27 @@ export async function handleGithubCallback(
     throw err
   }
 
-  // 4) 用 code 换 access_token + user profile
+  // 4) 原子消费 pending state(server 端一次性 + TTL + userId 绑定)。
+  // 命中 0 行(不存在 / 过期 / 已消费=重放)→ state_mismatch(与旧 pending Map 行为一致)。
+  const pending = await consumeOAuthPendingState({
+    provider: 'github',
+    state: queryState,
+    runner: overrides.pendingRunner,
+    key: overrides.pendingKey,
+  })
+  const rawUserId = pending?.userId
+  if (typeof rawUserId !== 'string') {
+    ctx.log.warn('github_callback_pending_miss', {})
+    sendRedirect(res, githubErrorRedirect('state_mismatch'))
+    return
+  }
+  // MINOR 1:payload userId 是字符串;DB 边界(saveGithubLink 要 number)在此局部收敛。
+  const userId: string = rawUserId
+
+  // 5) 用 code 换 access_token + user profile
   let exchanged: Awaited<ReturnType<typeof exchangeGithubOAuth>>
   try {
-    exchanged = await exchanger({ code: queryCode, state: queryState, cfg })
+    exchanged = await exchanger({ code: queryCode, cfg })
   } catch (err) {
     if (err instanceof GithubOAuthError) {
       ctx.log.warn('github_callback_exchange_failed', { code: err.code })
@@ -182,23 +230,23 @@ export async function handleGithubCallback(
     throw err
   }
 
-  // 5) 写 github_links
+  // 6) 写 github_links
   const pool = poolFactory()
   try {
     await saveGithubLink({
       pool,
-      userId: exchanged.userId,
+      userId: Number(userId), // tokenStore 以 number 建模 user_id;payload 侧保持字符串,仅此边界收敛
       profile: {
-        githubUserId: exchanged.result.githubUser.id,
-        login: exchanged.result.githubUser.login,
-        avatarUrl: exchanged.result.githubUser.avatar_url,
-        scopes: exchanged.result.scopes,
+        githubUserId: exchanged.githubUser.id,
+        login: exchanged.githubUser.login,
+        avatarUrl: exchanged.githubUser.avatar_url,
+        scopes: exchanged.scopes,
       },
-      accessToken: exchanged.result.accessToken,
+      accessToken: exchanged.accessToken,
     })
   } catch (err) {
     if (err instanceof Error && err.message === 'GITHUB_ACCOUNT_ALREADY_LINKED') {
-      ctx.log.warn('github_callback_account_conflict', { sub: exchanged.userId })
+      ctx.log.warn('github_callback_account_conflict', { sub: userId })
       sendRedirect(res, githubErrorRedirect('account_already_linked'))
       return
     }
@@ -211,11 +259,11 @@ export async function handleGithubCallback(
 
   // 换绑失效缓存:relink 到新 GitHub 账号后,旧账号的 repos 60s 缓存不能再命中
   // (跨账号数据残留;失效纪律见 githubApi.ts invalidateReposCacheForUser)。
-  invalidateReposCacheForUser(exchanged.userId)
+  invalidateReposCacheForUser(userId)
   ctx.log.info('github_callback_success', {
-    sub: exchanged.userId,
-    ghId: exchanged.result.githubUser.id,
-    login: exchanged.result.githubUser.login,
+    sub: userId,
+    ghId: exchanged.githubUser.id,
+    login: exchanged.githubUser.login,
   })
   sendRedirect(res, '/?github_linked=1')
 }

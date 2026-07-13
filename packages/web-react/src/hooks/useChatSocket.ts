@@ -120,6 +120,11 @@ export function useChatSocket(opts: {
   auth: AuthSession | null;
   /** gate.ready：容器 running —— WS 连接硬前置。*/
   ready: boolean;
+  /**
+   * cohort lane 就绪（P3 RFC D1，来自 useAuth.laneReady）：与 ready 正交的 WS 连接前置。
+   * lane 决策达成前不建 WS（防首连落错 slot）；3s 兜底放行防死锁（见 useLaneGate）。
+   */
+  laneReady: boolean;
   /** 进入工作区且非 demo。*/
   enabled: boolean;
   defaultAgentId?: string;
@@ -134,7 +139,7 @@ export function useChatSocket(opts: {
   /** GitHub 绑定校验失败帧回调。*/
   onRepoBindError?: (frame: RepoBindErrorWire) => void;
 }): UseChatSocket {
-  const { auth, ready, enabled, defaultAgentId, refreshBalance, userId, onHydrated } = opts;
+  const { auth, ready, laneReady, enabled, defaultAgentId, refreshBalance, userId, onHydrated } = opts;
 
   // authRef / refreshBalanceRef：让 service deps 永远读到最新闭包，无 stale。
   const authRef = useRef(auth);
@@ -281,6 +286,13 @@ export function useChatSocket(opts: {
     if (userId && !hydrationDone) return;
     socket.setGateReady(ready);
   }, [enabled, auth, ready, socket, userId, hydrationDone]);
+
+  // cohort lane 就绪闸（P3 RFC D1）：与 gateReady 正交的第二连接前置，独立喂给 service。
+  // 未登录/登出 → 复位 false（下次认证经 laneReady 重新上升沿放行）。两闸在 socket.connect
+  // 里双真才建连，谁后到位谁触发 connect，故与 gate effect 的执行顺序无关、无竞态。
+  useEffect(() => {
+    socket.setLaneReady(!!(enabled && auth) && laneReady);
+  }, [enabled, auth, laneReady, socket]);
 
   // 持久存储生命周期：登录(enabled+userId)→开 store + 从 IndexedDB 注水会话（reload 不丢）；
   // 卸载/登出→flush + close。pagehide / 切到后台时同步 flush，保 mid-stream reload 不丢。

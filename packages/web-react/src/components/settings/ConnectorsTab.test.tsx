@@ -434,7 +434,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
         }),
       ],
     });
-    mockedDelete.mockResolvedValue({ ok: true });
+    mockedDelete.mockResolvedValue();
     render(<ConnectorsTab auth={auth} />);
 
     await screen.findByText("Notion（声明式）");

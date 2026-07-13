@@ -478,6 +478,8 @@ type WireUser = {
     billing_enabled: boolean;
     billing_delegate?: boolean;
   } | null;
+  /** cohort lane（P3 RFC D1）：兼容后端把 lane 嵌进 user 对象的情形（body 级优先）。 */
+  lane?: string | null;
 };
 
 /** v5 `/api/me` / login user → 前端 User。displayName/roles 由后端字段适配，组件层零改动。 */
@@ -494,6 +496,8 @@ function adaptUser(u: WireUser): User {
     createdAt: u.created_at,
     // org 字段原样透传(大数已是字符串);无归属 → null。
     org: u.org ?? null,
+    // cohort lane（P3 RFC D1）：兼容 lane 嵌在 user 对象内的情形；body 级 lane 由调用点覆盖。
+    lane: u.lane ?? null,
   };
 }
 
@@ -531,13 +535,19 @@ export const api = {
       access_exp: number;
       refresh_exp: number;
       remember: boolean;
+      /** cohort lane（P3 RFC D1）：body 级下发；缺失=后端未部署 lane（向后兼容，见 useLaneGate）。 */
+      lane?: string | null;
     };
+    const user = adaptUser(b.user);
+    // body 级 lane 优先于嵌套在 user 内的 lane；两者皆缺=null（向后兼容视为已就绪）。
+    const lane = b.lane ?? user.lane ?? null;
     return {
       accessToken: b.access_token,
       accessExp: b.access_exp,
       refreshExp: b.refresh_exp,
       remember: b.remember,
-      user: adaptUser(b.user),
+      user: { ...user, lane },
+      lane,
     };
   },
 
@@ -672,13 +682,17 @@ export const api = {
 
   // ── 账户 ───────────────────────────────────────────────────────────
 
-  /** 当前用户（GET /api/me，Bearer）。credits 为字符串大数，adaptUser 原样保留。 */
+  /** 当前用户（GET /api/me，Bearer）。credits 为字符串大数，adaptUser 原样保留。
+   *  P3 RFC D1：响应体附带 cohort `lane`（body 级优先，兼容嵌套在 user 内）；缺失=后端未部署=null。 */
   getMe: (a: AuthSession) =>
-    jsonOrThrow<{ user: WireUser }>(
+    jsonOrThrow<{ user: WireUser; lane?: string | null }>(
       callWithRefresh(a, (t) =>
         fetch("/api/me", { credentials: "include", headers: bearerHeaders(t) }),
       ),
-    ).then((r) => adaptUser(r.user)),
+    ).then((r) => {
+      const user = adaptUser(r.user);
+      return { ...user, lane: r.lane ?? user.lane ?? null };
+    }),
 
   /** 偏好快照（GET /api/me/preferences，Bearer）。 */
   getPreferences: (a: AuthSession) =>

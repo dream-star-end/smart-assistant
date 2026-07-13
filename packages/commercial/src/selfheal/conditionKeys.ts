@@ -6,9 +6,10 @@
  * 写 `provider_health:<id>` 而 policy seed 是 `health.provider_degraded`,永不命中)。
  *
  * ── bash ⇄ TS 契约(跨语言同源,改一侧必同步另一侧)─────────────────────
- *   scripts/v5-monitor.sh 每轮对 11 项 check 直接 `SELECT write_alert_condition(...)`,
+ *   scripts/v5-monitor.sh 每轮对 serving-lane + 宿主检查直接 `SELECT write_alert_condition(...)`,
  *   其 condition key 派生规则 = `ops.monitor:<check_name>`(check_name ∈ svc_v5/svc_egress/
- *   http_v5/http_egress/public_route/disk_root/disk_var/mem/pool/image/mail[,http_v3])。
+ *   svc_candidate_v5/http_v5/http_candidate_v5/http_egress/public_route/disk_root/disk_var/
+ *   mem/pool/image/mail[,http_v3])。
  *   本文件的 OPS_MONITOR_PREFIX / opsMonitorKey 是该规则的 TS 侧权威;monitor.sh 文件头
  *   有对应登记。policy seed(0133/0135)的 `ops.monitor:*` prefix 行依赖此规则。
  *

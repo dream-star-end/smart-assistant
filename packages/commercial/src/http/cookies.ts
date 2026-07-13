@@ -119,6 +119,62 @@ export function readRefreshCookie(req: IncomingMessage): string | null {
   return null;
 }
 
+// ─── P3 cohort lane cookie(RFC-v5-dual-master-cohort §4 D1）──────────────
+//
+// oc_v5lane=g<generation>.<slot>(如 g42.B)——Caddy matcher 只认当前 generation
+// 的 candidate 值路由到 candidate slot;陈旧/缺失 → 落 active。Path=/ 让 Caddy 在
+// 全站请求上都能读到(与 oc_v5user 同层)。HttpOnly + SameSite=Lax(顶层导航需带,
+// 与 oc_v5user 一致);非安全边界(RFC m2:cookie 可被手工构造,candidate 按"可被
+// 任意生产用户访问"运维,allowlist 只是流量选择)。
+
+/** oc_v5lane = OpenClaude v5 cohort lane routing hint */
+export const LANE_COOKIE_NAME = "oc_v5lane";
+const LANE_COOKIE_MAX_AGE_SECONDS = 86_400; // 1d;每次 /api/me 重评刷新,陈旧代次由 Caddy 自动落 active
+
+/**
+ * 下发 lane cookie(candidate 决策时)。value = 'g<generation>.<slot>'。
+ * 每次评估都刷新 Max-Age,长会话不丢 candidate 归属;代次推进后旧值由 Caddy 兜底失效。
+ */
+export function setLaneCookie(res: ServerResponse, value: string, opts: { secure?: boolean } = {}): void {
+  const secure = opts.secure ?? true;
+  const parts = [
+    `${LANE_COOKIE_NAME}=${encodeURIComponent(value)}`,
+    `Max-Age=${LANE_COOKIE_MAX_AGE_SECONDS}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+  ];
+  if (secure) parts.push("Secure");
+  appendSetCookie(res, parts.join("; "));
+}
+
+/** 清除 lane cookie(active 决策且请求确实带了 oc_v5lane 时);属性须与下发严格一致才会被浏览器删除。 */
+export function clearLaneCookie(res: ServerResponse, opts: { secure?: boolean } = {}): void {
+  const secure = opts.secure ?? true;
+  const parts = [`${LANE_COOKIE_NAME}=`, "Max-Age=0", "Path=/", "HttpOnly", "SameSite=Lax"];
+  if (secure) parts.push("Secure");
+  appendSetCookie(res, parts.join("; "));
+}
+
+/** 从请求里读 oc_v5lane 当前值,没有 → null(下发点据此判断是否需要清除)。 */
+export function readLaneCookie(req: IncomingMessage): string | null {
+  const header = req.headers.cookie;
+  if (typeof header !== "string" || header.length === 0) return null;
+  for (const segment of header.split(";")) {
+    const trimmed = segment.trim();
+    if (trimmed.length === 0) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) continue;
+    if (trimmed.slice(0, eqIdx) !== LANE_COOKIE_NAME) continue;
+    try {
+      return decodeURIComponent(trimmed.slice(eqIdx + 1));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * 把一行 Set-Cookie 追加到响应头。
  * res.setHeader("Set-Cookie", ...) 单独调用第二次会**覆盖**第一次,
