@@ -171,6 +171,12 @@ bash scripts/selfheal-provision.sh                    # 低风险面落盘(目�
 bash scripts/selfheal-provision.sh --apply-agents --apply-unit --apply-packages
 ```
 
+Provision 还会检查 `ocheal` 的 Codex 登录。目标
+`/home/ocheal/.codex/auth.json` 已存在时只校验/修正 owner 和 `0600` 权限，绝不覆盖；
+缺失时才从 root 当前有效的 Codex 登录做一次不回显内容的安全引导。任何 `.codex` / `auth.json`
+软链接或非预期文件类型都会 fail closed。开派发闸前，清单必须出现
+`Codex login status valid for ocheal`。
+
 **预期输出**:结尾 checklist 除 "kl-mirror authorized_keys"、"tunnel unit" 两条 TODO(4.3 处置)外全 OK。
 
 ### 4.2 safe-restart 个人版 + 核对
