@@ -216,6 +216,11 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 > **代码+前端一起上 → 用 `--with-dist`**(单次重启双生效面);`deploy` 后紧跟 `--dist`
 > 的两段式成对重启会把"刚被第一次重启打断、自动续写刚跑起来"的 turn 第二次掐死
 > (2026-07-10 事故放大器),除非只改了单一生效面,否则不要拆开跑。
+> **部署告警隔离**：deploy/dist/rollback 在首个 restart 前自动写最长 180s 的
+> schema=2 planned-maintenance marker，只纳入即时确认健康且本次会中断的检查；部署前
+> 已坏项继续告警，monitor/部署/cutover 共用远端 flock，smoke 后按 schema+nonce 清理，
+> 超时仍坏立即升级真实事故；可信且全健康的 stale schema=1 可自动清，其他 stale marker
+> 保留但不阻塞部署、全程 fail-open。禁止人工造 marker。
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
@@ -395,7 +400,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 市场审核审计是 handler 层 best-effort | marketplace.skill.review/revoke 的业务 tx 在 marketplaceDb 内部,审计在 handler 层补写(失败有 critical 告警,非静默,但非同事务原子) | 若出现"审过了但无痕"实证:reviewVersion/revokeListing 事务内接 writeAdminAudit(需把审计上下文穿透 storage 层,评估耦合代价) |
 | ~~deploy 源码同步非原子~~ **蓝绿已激活**(07-11 迁移完成 rel-278a1085-…-migrated+已合 canonical 8fe7e2e3) | 原半同步窗口(26522660 --delay-updates 仅缓解)已被蓝绿根治:REMOTE_SRC=symlink→RELEASES_ROOT/rel-<sha>-<ts>;deploy=git archive **锁定 sha** 建不可变 release(staging→.complete→mv -T 改名;dist 在 staging pinned 源远端 vite build)→原子 symlink 翻转→restart。消崩溃循环+部署树 HEAD 漂移+混源。**未激活**:须先在受控窗口(无并发部署)跑 `deploy-v5.sh --migrate-bluegreen`(几秒停机把实目录转 symlink 布局)再合并该分支;合并前跑 migrate 否则老 canonical deploy 会因 assert_bluegreen_layout 失败 | —(已激活;首次远端 staging vite build 待下一次 dist 部署实证) |
 | 蓝绿:bootstrap 未收口 | 新机 `--bootstrap` 仍建实目录,首次 deploy 会被 assert_bluegreen_layout 挡(fail-closed 无声破坏已防);须手动再跑一次 --migrate-bluegreen | bootstrap 直接建首个 release+symlink(下次碰 bootstrap 顺手) |
-| deploy 重启窗口监控告警噪音 | 每次普通 deploy restart 触发 monitor critical(svc_v5/http_v5/public_route)×3 条;maintenance marker 静默仅覆盖 offline-cutover lane | 告警疲劳成为实际问题时:deploy-v5.sh restart 前落短时 planned-maintenance marker(复用既有 marker 机制,窗口 ≤2min) |
+| ~~deploy 重启窗口监控告警噪音~~ **已偿还**(07-13) | deploy/dist/rollback 在 restart 前写 schema=2 marker(TTL≤180s),scope=即时健康快照;`--egress`才纳入 egress 两项。monitor 锁内单 snapshot 严验 schema/权限/host/commit/TTL/scope,部署前 bad 不压,smoke 后 schema+nonce+flock 清理,cutover recovery 同锁只清自己；超时仍坏 planned→bad 立即告警，stale schema=1 可信+全健康才自动清,否则保留但部署/告警 fail-open；schema=1 offline-cutover 向后兼容 | — |
 | 蓝绿:offline cutover lane 未适配 | stage/activate-staged/offline-recycle/prepare-offline-cutover 仍按实目录 in-place+mv 语义操作 REMOTE_SRC,symlink 布局下会破坏不变量 → 已 assert_not_bluegreen_for_cutover **fail-closed 拒绝**(不静默破坏);但也就用不了该 lane 做 GPT56 类离线大切换 | 做下一次离线大切换(image codex 版本切换等)前,把 stage/activate_staged 也改为 build_release+原子 symlink |
 
 ### 审计体系速记(2026-07-11 整改批)

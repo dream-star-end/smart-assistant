@@ -91,11 +91,22 @@ scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_M
 
 ## 计划维护与静默
 
-`deploy-v5.sh` 的受控离线状态机会原子写入 root:root 0600 的
-`/run/openclaude-v5/planned-maintenance.json`（host+nonce+deadline）。有效期内只把
-`svc_v5/http_v5/public_route` 标成 planned；`svc_egress/http_egress/disk/mem/pool/image`
-始终正常报警。marker 解析失败、权限不对、host 不匹配或过期一律 fail-open。激活或
-恢复后脚本自动删除 marker；不要为了普通部署手工创建它。
+`deploy-v5.sh` 会在真正 restart 前原子写入 root:root 0600 的
+`/run/openclaude-v5/planned-maintenance.json`：
+
+- schema=1：受控离线状态机使用，固定覆盖 `svc_v5/http_v5/public_route`。
+- schema=2：普通 deploy/dist/rollback 使用，TTL 最长 180 秒；writer 会在写 marker
+  前即时探测，只把当时明确健康、且本次操作会短暂中断的检查写入 `checks`。`--egress`
+  部署才可能额外包含 `svc_egress/http_egress`。
+
+有效窗口内，新出现的 scoped 失败标成 planned，不发 outbox/inbox，也不写 firing
+condition；部署前已经是 bad 的检查绝不被压制。smoke 完成后脚本按 schema+nonce 在远端
+共享锁内清理 marker；monitor 也在同一锁下只读复制一次 JSON snapshot 再校验。异常退出会
+best-effort 清理，SIGKILL/断网则由 TTL 兜底。过期 schema=1 只有在 marker/manifest 可信且
+master+公网三项已恢复健康时才由下次普通部署安全清除；否则保留 marker、但部署继续且告警
+fail-open，不会形成永久部署死锁。窗口结束后
+仍 bad 会立即按真实事故告警，已经恢复则安静回到 ok。marker 类型、权限、host、commit、
+TTL、scope 任一不合法或过期都 fail-open。不要手工创建或删除 marker。
 
 ```bash
 # 只有排障噪音时才人工单项 SKIP；不要停整个监控 timer。
