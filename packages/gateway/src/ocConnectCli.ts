@@ -1,11 +1,12 @@
 /**
- * oc-connect — 容器内应用连接器 CLI。列出用户已绑定的第三方应用连接、按 provider/action
- * 调用(读操作直执行,写操作走 propose-then-commit 确认门)。
+ * oc-connect — 容器内应用连接器 CLI。发现可绑连接器(catalog)、列出用户已绑定的第三方应用连接
+ * (list)、按 provider/action 调用(call;读操作直执行,写操作走 propose-then-commit 确认门)。
  *
  * 所有第三方凭据只在 master(容器内没有);本 CLI 只经容器身份 bearer 走 master
- * `/v3/connectors/{list|call}`(传输见 ocConnectorsClient.ts,与 oc-lit/oc-market 同款薄传输)。
+ * `/v3/connectors/{catalog|list|call}`(传输见 ocConnectorsClient.ts,与 oc-lit/oc-market 同款薄传输)。
  *
  * 用法(baseline skill `app-connectors` 文档化):
+ *   oc-connect catalog [query]   # 发现/搜索可绑连接器;绑定由用户在设置里完成(凭据永不进容器)
  *   oc-connect list
  *   oc-connect call <provider> <action> [--account <connectionId>] [--confirm <id>] [--out <file>]
  *
@@ -50,6 +51,14 @@ export interface OcConnectDeps {
 }
 
 const EMPTY_LIST_TEXT = '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。'
+const EMPTY_CATALOG_TEXT = '暂无可用的应用连接器。'
+/** 绑定凭据字段名(source)→ 面向用户的中文提示(catalog 展示"用户需提供什么")。 */
+const BIND_SOURCE_HINT: Record<string, string> = {
+  access_token: '访问令牌 / API Token',
+  client_id: '应用 ID (Client ID)',
+  client_secret: '应用密钥 (Client Secret)',
+  refresh_token: '刷新令牌 (Refresh Token)',
+}
 
 // 仅 call 子命令带取值 flag;无布尔 flag(--help 单列处理)。
 const VALUE_FLAGS = new Set(['account', 'confirm', 'out'])
@@ -59,6 +68,7 @@ const USAGE = [
   '',
   'Commands:',
   '  list                                    列出已绑定的应用连接与可用操作',
+  '  catalog [query]                         列出可绑定的应用连接器(可选关键词搜索)',
   '  call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)',
   '',
   'Options (call):',
@@ -189,6 +199,40 @@ function formatConnections(connections: any[]): string {
         const desc = a?.description ? `  ${a.description}` : ''
         lines.push(`      - ${a?.id ?? '?'}  ${mark}${desc}`)
       }
+    }
+    lines.push('')
+  }
+  return lines.join('\n').replace(/\n+$/, '')
+}
+
+/**
+ * catalog 输出:可**绑定**的连接器目录(≠已绑 list)。供 AI 感知"有哪些应用可用"并**引导用户
+ * 去绑定**——凭据永不进容器,agent 不能代绑,只能告知用户去 设置 → 应用连接器 填凭据。
+ */
+function formatCatalog(connectors: any[], query?: string): string {
+  if (!connectors.length) {
+    return query
+      ? `未找到匹配「${query}」的应用连接器。可不带关键词再列全部。`
+      : EMPTY_CATALOG_TEXT
+  }
+  const lines: string[] = [
+    query ? `匹配「${query}」的应用连接器:` : '可绑定的应用连接器:',
+    '（绑定需用户在 设置 → 应用连接器 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
+    '',
+  ]
+  for (const c of connectors) {
+    const label = strOrUndef(c?.label)?.trim() || c?.slug || '?'
+    lines.push(`${c?.slug ?? '?'} · ${label}`)
+    if (c?.description) lines.push(`    ${c.description}`)
+    const sources = Array.isArray(c?.requiredBindSources) ? c.requiredBindSources : []
+    if (sources.length) {
+      const hints = sources.map((s: string) => BIND_SOURCE_HINT[s] ?? s)
+      lines.push(`    用户需提供:${hints.join('、')}`)
+    }
+    const actions = Array.isArray(c?.actions) ? c.actions : []
+    if (actions.length) {
+      const names = actions.map((a: any) => `${a?.id ?? '?'}${a?.readOnly ? '' : '(写·需确认)'}`)
+      lines.push(`    操作:${names.join('、')}`)
     }
     lines.push('')
   }
@@ -368,6 +412,13 @@ export async function runOcConnectCli(argv: string[], deps: OcConnectDeps = {}):
       const resp = await transport('list', {})
       const connections: any[] = Array.isArray(resp?.connections) ? resp.connections : []
       return ok(`${formatConnections(connections)}\n`)
+    }
+    if (command === 'catalog') {
+      if (positional.length > 1) return usageError('catalog takes at most one <query>')
+      const query = positional[0]?.trim() || undefined
+      const resp = await transport('catalog', query ? { query } : {})
+      const connectors: any[] = Array.isArray(resp?.connectors) ? resp.connectors : []
+      return ok(`${formatCatalog(connectors, query)}\n`)
     }
     if (command === 'call') {
       return await cmdCall(positional, flags, { transport, readStdin, writeOut })

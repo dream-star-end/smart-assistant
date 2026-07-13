@@ -128,6 +128,48 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/incidents",
+    "handler": "handleAdminListIncidents"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/user-notices",
+    "handler": "handleAdminGetSelfhealUserNotices"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/incidents/",
+    "handler": "handleAdminGetIncident"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/incidents/",
+    "handler": "handleAdminResolveIncident"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/conditions",
+    "handler": "handleAdminListSelfhealConditions"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/conditions/unsuppress",
+    "handler": "handleAdminUnsuppressCondition"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/repairs/",
+    "handler": "handleAdminReleaseRepair"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/pricing",
     "handler": "handleAdminListPricing"
   },
@@ -154,6 +196,24 @@
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/providers/",
     "handler": "handleAdminPutProviderOps"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps",
+    "handler": "handleAdminListPlatformOauthApps"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps/",
+    "handler": "handleAdminPutPlatformOauthApp"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/connectors/platform-oauth-apps/",
+    "handler": "handleAdminDeletePlatformOauthApp"
   },
   {
     "method": "GET",

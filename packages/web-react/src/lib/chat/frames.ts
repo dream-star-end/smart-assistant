@@ -137,6 +137,28 @@ export type ContextRebuiltWire = {
   messageCount?: number;
 } & WireRuntimeFields;
 
+/**
+ * 自愈事故推送帧（master→user，切片①）：容器/服务面异常(open)与恢复(resolved)的**用户可见**
+ * 信号。前端据此在连接横幅槽上方渲染异常 Alert(open)、恢复时弹一次性 success toast(resolved)。
+ *
+ * `rev` = incident 单调修订号（server 权威）：incidentStore **按 incidentId 只接受更高 rev**，
+ * 旧 rev 丢弃——防重连乱序 / 迟到的 open 帧把已 resolved 的事故重新挂起（RFC §5 [解 M4]）。
+ * `title`/`message` 文案权威在服务端（master 从 incident_policies 表 materialize），前端只透传渲染；
+ * resolved 帧携带的是恢复态文案。帧结构对齐 protocol SysIncident——protocol 就绪前本地补声明即
+ * 消费契约（同 FrontendBuildWire / ContextRebuiltWire 的本地补声明模式）。
+ */
+export type IncidentWire = {
+  type: "sys.incident";
+  incidentId: string;
+  rev: number;
+  status: "open" | "resolved";
+  severity: "info" | "warning" | "critical";
+  surface: string;
+  title: string;
+  message: string;
+  ts: number;
+};
+
 /** server 已去重的 ack（drain 对账 + auto-continue 对账）。*/
 export type AckWire = {
   type: "outbound.ack";
@@ -188,6 +210,7 @@ export type OutboundWire =
   | RelayReadyWire
   | FrontendBuildWire
   | ContextRebuiltWire
+  | IncidentWire
   | AckWire
   | PongWire
   | RepoStatusWire

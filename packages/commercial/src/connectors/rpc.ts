@@ -30,6 +30,15 @@ import {
 import { getPool } from '../db/index.js'
 import { getGithubLinkPublic } from '../github/tokenStore.js'
 import { canonicalDigestHex } from './canonicalJson.js'
+import {
+  type DeclarativeConnectionRow,
+  getDeclarativeConnection,
+  listDeclarativeConnections,
+} from './engine/binding.js'
+import { listDeclarativeCatalog } from './engine/catalog.js'
+import type { EngineHttpDeps } from './engine/driver.js'
+import { executeDeclarativeAction, loadContractForConnection } from './engine/execute.js'
+import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
 import type { DnsResolver } from './outboundPolicy.js'
@@ -42,6 +51,7 @@ import {
   executeGithubAction,
   requireAction,
 } from './service.js'
+import { loadVerifiedContractWithMeta } from './spec/review.js'
 import {
   getActiveConnection,
   getConnectionAnyStatus,
@@ -52,6 +62,7 @@ import {
 export const CONNECTORS_RPC_PREFIX = '/v3/connectors/'
 const LIST_PATH = '/v3/connectors/list'
 const CALL_PATH = '/v3/connectors/call'
+const CATALOG_PATH = '/v3/connectors/catalog'
 
 /** call body 上限:put_file contentBase64 ≤6MB + JSON 包装余量。 */
 const MAX_CALL_BODY_BYTES = 8 * 1024 * 1024
@@ -324,6 +335,17 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         })
         return
       }
+      if (path === CATALOG_PATH) {
+        const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
+        const query =
+          body !== null &&
+          typeof body === 'object' &&
+          typeof (body as { query?: unknown }).query === 'string'
+            ? (body as { query: string }).query
+            : undefined
+        await handleCatalog(res, pool, query)
+        return
+      }
       sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' })
     } catch (err) {
       const ce = toConnectorError(err)
@@ -344,10 +366,41 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
 // ─── list ────────────────────────────────────────────────────────────────
 
 async function handleList(res: ServerResponse, userId: number, pool: Pool): Promise<void> {
+  // 声明式连接:动作由 pin 的 contract 派生(readOnly = effect==='read')。
+  const declConns = await listDeclarativeConnections(userId, pool)
+  const declIds = new Set(declConns.map((c) => c.id))
+  const declEntries: Array<Record<string, unknown>> = []
+  for (const c of declConns) {
+    let actions: Array<{ id: string; description: string; readOnly: boolean }> = []
+    try {
+      if (c.connectorVersionId) {
+        const meta = await loadVerifiedContractWithMeta(Number(c.connectorVersionId), pool)
+        actions = meta.contract.actions.map((a) => ({
+          id: a.id,
+          description: '',
+          readOnly: a.effect === 'read',
+        }))
+      }
+    } catch {
+      // 版本被 revoke / 不可载 → 空动作(连接仍列出,提示需重绑)。
+    }
+    declEntries.push({
+      id: c.id,
+      provider: c.slug,
+      displayName: c.displayName || c.slug,
+      accountHint: typeof c.meta.account_hint === 'string' ? c.meta.account_hint : '',
+      status: 'active',
+      actions,
+    })
+  }
+
+  // v1 连接(排除已单列的声明式行——同一张表)。
   const rows = await listConnections(userId, pool)
-  const connections: Array<Record<string, unknown>> = rows.map((row) => {
+  const connections: Array<Record<string, unknown>> = []
+  for (const row of rows) {
+    if (declIds.has(row.id)) continue
     const decl = getProviderDecl(row.provider)
-    return {
+    connections.push({
       id: row.id, // 字符串化 bigint(契约)
       provider: row.provider,
       displayName: row.display_name || (decl?.label ?? row.provider),
@@ -358,8 +411,9 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
         description: a.description,
         readOnly: a.readOnly,
       })),
-    }
-  })
+    })
+  }
+  connections.push(...declEntries)
   // github 虚拟连接(§4:无 connections 行;id 用保留字符串 'github')
   const gh = await getGithubLinkPublic(pool, userId)
   if (gh.linked) {
@@ -378,6 +432,27 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
     })
   }
   sendEnvelope(res, { connections })
+}
+
+// ─── catalog(agent 发现/搜索可装连接器;只读,不含凭据) ─────────────────────
+
+/**
+ * agent 目录发现:列出**可绑**连接器(≠已绑 list)。供 AI 感知"有哪些应用可用"、按关键词
+ * 搜索、并引导用户去管理界面绑定(凭据永不进容器 → agent 不能代绑)。与前端 REST catalog
+ * 共用 listDeclarativeCatalog 单一权威。
+ */
+async function handleCatalog(res: ServerResponse, pool: Pool, query?: string): Promise<void> {
+  const connectors = await listDeclarativeCatalog(pool, query ? { query } : {})
+  sendEnvelope(res, {
+    connectors: connectors.map((c) => ({
+      slug: c.slug,
+      label: c.label,
+      description: c.description,
+      authMode: c.authMode,
+      requiredBindSources: c.requiredBindSources,
+      actions: c.actions.map((a) => ({ id: a.id, readOnly: a.effect === 'read' })),
+    })),
+  })
 }
 
 // ─── call ────────────────────────────────────────────────────────────────
@@ -438,6 +513,101 @@ function parseCallBody(raw: unknown): CallBody {
   }
 }
 
+/**
+ * 声明式连接的 RPC 执行分支(agent 经 oc-connect 调)。与 v1 同一 CALL 信封:
+ *   - confirmId → executeDeclarativeWrite(ok→result / in_progress / replay);
+ *   - 无 confirmId + read action → executeDeclarativeAction → result(过限流);
+ *   - 无 confirmId + write/send action → proposeDeclarativeWrite → confirmation_required。
+ * 执行/pin/凭据全部由引擎收口(权威=pin 的 contract);此处只做限流 + 信封映射。
+ */
+async function handleDeclarativeCall(
+  res: ServerResponse,
+  who: { userId: number; containerId: number },
+  body: CallBody,
+  rt: { deps: ConnectorsRpcDeps; limiter: PerContainerLimiter; now: () => number; log: RpcLog },
+  pool: Pool,
+  declRow: DeclarativeConnectionRow,
+): Promise<void> {
+  const engineDeps: EngineHttpDeps = {
+    resolver: rt.deps.resolver,
+    fetchImpl: rt.deps.fetchImpl,
+  }
+
+  if (body.confirmId) {
+    const confirmId = body.confirmId
+    const r = await withConnectionSlot(`c:${declRow.id}`, () =>
+      executeDeclarativeWrite(
+        {
+          connectionId: declRow.id,
+          userId: who.userId,
+          confirmId,
+          deps: engineDeps,
+          beforeDispatch: async (effect) => {
+            if (effect === 'send')
+              await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
+          },
+        },
+        pool,
+      ),
+    )
+    if (r.kind === 'in_progress') {
+      sendEnvelope(res, { kind: 'in_progress', id: body.confirmId })
+      return
+    }
+    if (r.kind === 'replay') {
+      sendEnvelope(res, {
+        kind: 'replay',
+        status: r.status,
+        ...(r.errorCode ? { errorCode: r.errorCode } : {}),
+        ...(r.resultDigest ? { resultDigest: r.resultDigest } : {}),
+      })
+      return
+    }
+    sendEnvelope(res, { kind: 'result', result: r.result })
+    return
+  }
+
+  const actionId = requireBodyAction(body.action)
+  const { contract } = await loadContractForConnection(declRow, pool)
+  const action = contract.actions.find((a) => a.id === actionId)
+  if (action === undefined) throw new ConnectorError('ACTION_UNKNOWN', `unknown action ${actionId}`)
+
+  if (action.effect === 'read') {
+    if (!rt.limiter.check(who.containerId, rt.now()))
+      throw new ConnectorError('RATE_LIMITED', 'per-container window exceeded')
+    await checkRedisWindow(rt.deps.redis, 'read', who.userId, rt.now(), rt.log)
+    const result = await withConnectionSlot(`c:${declRow.id}`, () =>
+      executeDeclarativeAction(
+        {
+          connectionId: declRow.id,
+          userId: who.userId,
+          actionId,
+          params: body.params ?? {},
+          deps: engineDeps,
+        },
+        pool,
+      ),
+    )
+    sendEnvelope(res, { kind: 'result', result })
+    return
+  }
+
+  // write/send → 走确认门(propose)。
+  await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
+  const prop = await proposeDeclarativeWrite(
+    { connectionId: declRow.id, userId: who.userId, actionId, params: body.params ?? {} },
+    pool,
+  )
+  sendEnvelope(res, {
+    kind: 'confirmation_required',
+    id: prop.confirmId,
+    provider: declRow.provider,
+    action: actionId,
+    summary: prop.summary,
+    expiresAt: prop.expiresAt.toISOString(),
+  })
+}
+
 async function handleCall(
   req: IncomingMessage,
   res: ServerResponse,
@@ -477,6 +647,14 @@ async function handleCall(
   // ── DB 连接 ──
   if (!/^\d{1,19}$/.test(body.connectionId)) {
     throw new ConnectorError('CONNECTION_NOT_FOUND', 'malformed connection id')
+  }
+  // 声明式连接(connector_version_id 非空)优先路由到声明式引擎(与 v1 provider 同一张表,
+  // 靠 pin 列区分;声明式 slug 可能与 v1 provider 名撞,但本查询只命中 connector_version_id 非空行)。
+  const declRow = await getDeclarativeConnection(body.connectionId, who.userId, pool)
+  if (declRow) {
+    await assertNotRevoking(rt.deps.redis, declRow.id)
+    await handleDeclarativeCall(res, who, body, rt, pool, declRow)
+    return
   }
   const row = await getActiveConnection(body.connectionId, who.userId, pool)
   if (!row) {

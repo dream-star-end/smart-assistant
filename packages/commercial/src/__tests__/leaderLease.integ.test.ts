@@ -159,6 +159,13 @@ before(async () => {
   await admin.query(`CREATE SCHEMA ${SCHEMA}`);
   await admin.end();
   pool = new Pool({ connectionString: TEST_DB_URL, max: 12, options: `-c search_path=${SCHEMA}` });
+  // 本套件会主动 pg_terminate_backend() 模拟 lease 连接崩溃。连接若恰好已归还为 idle，
+  // pg-pool 会把 57P01 转发到 Pool 的 error 事件；没有 listener 时 Node 会把预期的
+  // 管理员终止误报成套件结束后的 uncaughtException。生产路径仍由 controller 的
+  // client error listener 验证，这里只吞掉测试主动制造的 57P01。
+  pool.on("error", (err: Error & { code?: string }) => {
+    if (err.code !== "57P01") throw err;
+  });
   const sql = await readFile(MIGRATION_0135, { encoding: "utf8" });
   await pool.query(sql);
 });
@@ -494,6 +501,56 @@ describe("leaderLease epoch 协议", () => {
     assert.equal(after.instance, idB);
     assert.ok(elapsed < 10000, `后继靠短连接 ACK 秒级接管(非 45s liveness,实际 ${elapsed}ms)`);
     assert.deepEqual(fatals, [], "lease-conn ACK 失败但短连接 ACK 成功 → 不 fail-stop");
+  });
+
+  test("shutdown 命中 acquiring/onAcquire 窗口 → 等启动收敛并 drain 后才 ACK/unlock", async (t) => {
+    if (!pgAvailable) return t.skip("no PG");
+    const events: Ev[] = [];
+    const fatals: string[] = [];
+    const wA = fakeWatch(snap("A"));
+    let releaseAcquire!: () => void;
+    const acquireGate = new Promise<void>((res) => { releaseAcquire = res; });
+    const c = mkController({
+      slot: "A",
+      watch: wA,
+      instanceId: randomUUID(),
+      label: "shutdown-acquiring",
+      pid: 15001,
+      startTicks: 1511,
+      events,
+      acquireGate,
+      onFatal: (reason) => fatals.push(reason),
+    });
+    c.start();
+    await waitFor(() => events.some((e) => e.type === "acquire"));
+    await waitFor(async () => (await readLease()).epoch === 1);
+    assert.equal(c.status().state, "acquiring");
+
+    let shutdownDone = false;
+    const shutdown = c.shutdown().then(() => { shutdownDone = true; });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(shutdownDone, false, "onAcquire 未收敛前不得直接 unlock 返回");
+    releaseAcquire();
+    await shutdown;
+
+    assert.ok(
+      events.some((e) => e.type === "fence" && e.slot === "shutdown-acquiring"),
+      "acquiring 期间已可能启动 bundle，shutdown 必须调用 onFence drain",
+    );
+    assert.deepEqual(fatals, []);
+    const lease = await readLease();
+    assert.equal(lease.ack, 1, "drain 后写本 epoch ACK");
+    const probe = await pool.connect();
+    try {
+      const got = await probe.query<{ ok: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS ok",
+        ["oc_leader_lease_v5"],
+      );
+      assert.equal(got.rows[0]?.ok, true, "ACK 后 advisory 才释放");
+      await probe.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", ["oc_leader_lease_v5"]);
+    } finally {
+      probe.release();
+    }
   });
 
   test("ineligible(env kill-switch)恒不竞锁", async (t) => {

@@ -709,6 +709,45 @@ export const SysContextRebuilt = Type.Object({
 export type SysContextRebuilt = Static<typeof SysContextRebuilt>
 
 // ───────────────────────────────────────────────
+// V5 自愈体系(RFC-v5-selfheal-ops §5)— 运维事故用户推送
+// ───────────────────────────────────────────────
+// 与 sys.context_rebuilt 一样是 gateway/master authored 的 sys.* 观察帧,但**不经容器
+// 透传** —— 由 master 侧 selfheal sweeper 主动 broadcast(broadcastAll / broadcastToUsers)
+// 或新连接认证后补发,直接注入 user WS。因此 ts 在构造时就必须落地(非 deliver() wire
+// stamp 路径),声明为**必填** Number。
+//
+// rev = 同一 incidentId 的单调修订号 [RFC 解 M4]。前端按 incidentId 存最高 rev、丢弃旧
+// rev,防"迟到的 open 帧把已 resolved 的横幅重新挂起"。at-least-once 投递 + rev 幂等。
+//
+// 前科提醒(见上 sys.context_rebuilt 注释):sys.* 帧历史上漏补 TypeScript 类型
+// (sys.frontend_build),故这里显式建 TypeBox schema + Static 类型 + 进 AnyFrame 联合。
+// ───────────────────────────────────────────────
+export const SysIncident = Type.Object({
+  type: Type.Literal('sys.incident'),
+  /** incidents 表主键(稳定标识,前端按此聚合同一事故的多次 rev)。 */
+  incidentId: Type.String(),
+  /** 同一 incidentId 的单调修订号;前端只保留最高 rev,旧 rev 丢弃(幂等)。 */
+  rev: Type.Number(),
+  /** 事故生命周期:open=挂横幅,resolved=清横幅 + success toast。 */
+  status: Type.Union([Type.Literal('open'), Type.Literal('resolved')]),
+  /** 展示强度:info/warning/critical → 前端横幅 tone。 */
+  severity: Type.Union([
+    Type.Literal('info'),
+    Type.Literal('warning'),
+    Type.Literal('critical'),
+  ]),
+  /** 受影响能力面(如 'image' / 'egress' / 'account_pool'),用于 audience 归因与前端分组。 */
+  surface: Type.String(),
+  /** 面向用户的标题。 */
+  title: Type.String(),
+  /** 面向用户的正文说明。 */
+  message: Type.String(),
+  /** 构造时落地的服务端时间戳(ms)。非 deliver() wire stamp 路径 → 必填。 */
+  ts: Type.Number(),
+})
+export type SysIncident = Static<typeof SysIncident>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -736,6 +775,7 @@ export const AnyFrame = Type.Union([
   OutboundCodexBilling,
   OutboundTurnStatus,
   SysContextRebuilt,
+  SysIncident,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

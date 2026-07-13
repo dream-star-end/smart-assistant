@@ -69,6 +69,7 @@ V5_ASSETS_POOL="/opt/openclaude/openclaude-v5-assets"
 CUTOVER_ROOT="/var/lib/openclaude-v5/cutovers"
 CUTOVER_LOCK="/var/lib/openclaude-v5/cutover.lock"
 MAINTENANCE_MARKER="/run/openclaude-v5/planned-maintenance.json"
+MAINTENANCE_LOCK="/run/openclaude-v5/planned-maintenance.lock"
 
 # ── 定位 worktree 根 ──
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -218,6 +219,217 @@ fi
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
 
+# 发布元数据是所有写/激活 lane 的统一数据库前置。AUTO_MIGRATE=0，因此部署脚本只读
+# schema_migrations 并 fail-closed，绝不替操作者偷偷迁库。既校验当前 checkout，也可校验
+# rollback/canary 的远端 release，避免“当前库够新”被误当成“目标 release 依赖已满足”。
+required_migrations_csv() { # <metadata-path> <local|remote>
+  local metadata="$1" location="$2" jq_filter
+  jq_filter='if (.requiredMigrations | type) == "array" and (.requiredMigrations | length) > 0 and all(.requiredMigrations[]; type == "string" and test("^[0-9]{4}_[a-z0-9_]+$")) then .requiredMigrations | unique | join(",") else error("invalid requiredMigrations") end'
+  case "$location" in
+    local) jq -er "$jq_filter" "$metadata" ;;
+    remote) ssh "$KL_HOST" "jq -er '$jq_filter' '$metadata'" ;;
+    *) echo "✗ required_migrations_csv location 非法:$location" >&2; return 2 ;;
+  esac
+}
+
+assert_required_migrations() { # <metadata-path> <local|remote>
+  local metadata="$1" location="$2" required_csv
+  if [[ "$DRY" == 1 && "$location" == remote ]]; then
+    echo "  [dry-run] 校验远端 release metadata=$metadata 的 requiredMigrations 已全部记录"
+    return 0
+  fi
+  if ! required_csv="$(required_migrations_csv "$metadata" "$location")"; then
+    echo "✗ release metadata 缺失/损坏或 requiredMigrations 非法:$metadata($location)" >&2
+    return 1
+  fi
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 requiredMigrations 已全部记录:$required_csv"
+    return 0
+  fi
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" "$required_csv" <<'REMOTE'
+set -Eeuo pipefail
+env_file="$1"; required_csv="$2"
+[[ -r "$env_file" ]] || { echo "FATAL: env 不可读:$env_file" >&2; exit 1; }
+dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+[[ -n "$dburl" ]] || { echo "FATAL: DATABASE_URL missing:$env_file" >&2; exit 1; }
+IFS=',' read -ra required <<<"$required_csv"
+for migration in "${required[@]}"; do
+  [[ "$migration" =~ ^[0-9]{4}_[a-z0-9_]+$ ]] || { echo "FATAL: invalid migration id:$migration" >&2; exit 1; }
+  applied="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT count(*) FROM schema_migrations WHERE version='${migration}'" | tr -d '[:space:]')"
+  [[ "$applied" == 1 ]] || { echo "FATAL: required migration not applied:$migration" >&2; exit 1; }
+done
+REMOTE
+  echo "  ✓ requiredMigrations 已应用:$required_csv"
+}
+
+assert_repo_required_migrations() { assert_required_migrations "$RELEASE_METADATA" local; }
+assert_release_required_migrations() { assert_required_migrations "$1/deploy/v5/release-metadata.json" remote; }
+
+# 普通 deploy/dist/rollback 的短维护窗。只把 restart 前“即时确认健康”的检查写进
+# marker，部署前已坏/无法确认的项继续正常告警。schema=2 与 offline cutover 的
+# schema=1 共用一把远端锁，但互不覆盖、互不清理。
+PLANNED_MAINTENANCE_NONCE=""
+PLANNED_MAINTENANCE_ACTIVE=0
+DEPLOY_HOLDER_OWNED=0
+
+begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
+  local maintenance_mode="$1" include_egress="$2" target_commit nonce result healthy_checks
+  target_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  nonce="$(openssl rand -hex 16)"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] begin planned-maintenance schema=2 mode=$maintenance_mode ttl<=180s checks=svc_v5,http_v5,public_route$([[ "$include_egress" == 1 ]] && printf ',svc_egress,http_egress')"
+    PLANNED_MAINTENANCE_NONCE="$nonce"
+    PLANNED_MAINTENANCE_ACTIVE=1
+    return 0
+  fi
+
+  if ! result="$(ssh "$KL_HOST" bash -s -- \
+      "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$maintenance_mode" \
+      "$target_commit" "$nonce" "$include_egress" "${ACTIVE_UNIT:-$V5_UNIT}" "${ACTIVE_PORT:-$V5_PORT}" "$CUTOVER_ROOT" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; mode="$3"; target_commit="$4"; nonce="$5"; include_egress="$6"
+v5_unit="$7"; v5_port="$8"; cutover_root="$9"; ttl=180
+[[ "$mode" =~ ^(deploy|dist|rollback)$ && "$target_commit" =~ ^[0-9a-f]{40}$ &&
+   "$nonce" =~ ^[0-9a-f]{32}$ && "$include_egress" =~ ^[01]$ ]] || exit 2
+mkdir -p -m 700 "$(dirname "$marker")"
+touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+now="$(date +%s)"
+healthy=()
+body=""
+systemctl is-active --quiet "$v5_unit" 2>/dev/null && healthy+=(svc_v5)
+body="$(curl -fsS --max-time 5 "http://127.0.0.1:${v5_port}/healthz" 2>/dev/null || true)"
+jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_v5)
+body="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' 'http://127.0.0.1/healthz' 2>/dev/null || true)"
+jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(public_route)
+if [[ "$include_egress" == 1 ]]; then
+  systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
+  body="$(curl -fsS --max-time 5 'http://172.31.0.1:18892/internal/v5/egress-health' 2>/dev/null || true)"
+  jq -e '.ok == true and .role == "egress"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_egress)
+fi
+is_healthy() {
+  local wanted="$1" item
+  for item in "${healthy[@]}"; do [[ "$item" == "$wanted" ]] && return 0; done
+  return 1
+}
+if [[ -f "$marker" ]]; then
+  schema="$(jq -r '.schema // empty' "$marker" 2>/dev/null || true)"
+  if [[ "$schema" == 1 ]]; then
+    old_nonce="$(jq -r '.nonce // empty' "$marker" 2>/dev/null || true)"
+    manifest="$cutover_root/$old_nonce/manifest.json"
+    trusted_schema1=0
+    if [[ "$(stat -c '%U:%G' "$marker" 2>/dev/null || true)" == root:root &&
+          "$(stat -c '%a' "$marker" 2>/dev/null || true)" == 600 &&
+          "$old_nonce" =~ ^[0-9a-f]{32}$ && -f "$manifest" &&
+          "$(stat -c '%U:%G' "$manifest" 2>/dev/null || true)" == root:root &&
+          "$(stat -c '%a' "$manifest" 2>/dev/null || true)" == 600 ]] &&
+       jq -e --arg host "$(hostname -f)" --arg nonce "$old_nonce" '
+         .schema == 1 and .host == $host and .nonce == $nonce
+       ' "$marker" >/dev/null 2>&1 &&
+       jq -e --arg host "$(hostname -f)" --arg nonce "$old_nonce" '
+         .schema == 1 and .host == $host and .nonce == $nonce
+       ' "$manifest" >/dev/null 2>&1; then
+      trusted_schema1=1
+    fi
+    if [[ "$trusted_schema1" == 1 ]] && jq -e --argjson now "$now" '
+        (.deadline | type) == "number" and .deadline >= $now
+      ' "$marker" >/dev/null 2>&1; then
+      echo "CONFLICT:active trusted schema1 cutover marker exists" >&2
+      exit 20
+    fi
+    if [[ "$trusted_schema1" == 1 ]] && jq -e --argjson now "$now" '
+        (.deadline | type) == "number" and .deadline < $now
+      ' "$marker" >/dev/null 2>&1 &&
+       is_healthy svc_v5 && is_healthy http_v5 && is_healthy public_route; then
+      rm -f "$marker"
+      echo "STALE:safely cleared expired schema1 marker nonce=$old_nonce after full v5/public health" >&2
+    else
+      echo "SKIPPED:stale/untrusted schema1 marker preserved; deployment continues fail-open"
+      exit 0
+    fi
+  elif [[ "$schema" == 2 ]]; then
+    if jq -e --argjson now "$now" '
+        .schema == 2 and (.deadline | type) == "number" and .deadline >= $now
+      ' "$marker" >/dev/null 2>&1; then
+      echo "CONFLICT:active schema2 deploy marker exists" >&2
+      exit 20
+    fi
+  else
+    echo "SKIPPED:unknown maintenance marker preserved; deployment continues fail-open"
+    exit 0
+  fi
+fi
+if (( ${#healthy[@]} == 0 )); then
+  echo "SKIPPED:no currently healthy checks"
+  exit 0
+fi
+
+started_at="$(date +%s)"; deadline=$((started_at + ttl))
+checks_json="$(printf '%s\n' "${healthy[@]}" | jq -R . | jq -s .)"
+tmp="${marker}.tmp.$$"
+jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --arg kind deploy \
+  --arg mode "$mode" --arg target_commit "$target_commit" \
+  --argjson started_at "$started_at" --argjson deadline "$deadline" \
+  --argjson checks "$checks_json" \
+  '{schema:2,host:$host,nonce:$nonce,kind:$kind,mode:$mode,target_commit:$target_commit,
+    started_at:$started_at,deadline:$deadline,checks:$checks}' >"$tmp"
+chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$marker"
+echo "SET:$nonce:${healthy[*]}"
+REMOTE
+  )"; then
+    echo "✗ 无法开启 planned-maintenance；保留现有 marker，拒绝冒险覆盖" >&2
+    return 1
+  fi
+  if [[ "$result" == SKIPPED:* ]]; then
+    echo "  ⚠ planned-maintenance 未开启(${result#SKIPPED:});所有检查继续 fail-open 告警"
+    return 0
+  fi
+  [[ "$result" == "SET:$nonce:"* ]] || { echo "✗ planned-maintenance 返回异常:$result" >&2; return 1; }
+  PLANNED_MAINTENANCE_NONCE="$nonce"
+  PLANNED_MAINTENANCE_ACTIVE=1
+  healthy_checks="${result#SET:"$nonce":}"
+  echo "  ✓ planned-maintenance 已开启(mode=$maintenance_mode,checks=$healthy_checks)"
+}
+
+end_planned_maintenance() {
+  local nonce="$PLANNED_MAINTENANCE_NONCE" result
+  [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 && -n "$nonce" ]] || return 0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] end planned-maintenance schema=2 nonce=$nonce(nonce-match)"
+    PLANNED_MAINTENANCE_ACTIVE=0; PLANNED_MAINTENANCE_NONCE=""
+    return 0
+  fi
+  if result="$(ssh "$KL_HOST" bash -s -- "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$nonce" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; nonce="$3"
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+    '.schema == 2 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"; echo CLEARED
+else
+  echo PRESERVED
+fi
+REMOTE
+  )"; then
+    PLANNED_MAINTENANCE_ACTIVE=0; PLANNED_MAINTENANCE_NONCE=""
+    [[ "$result" == CLEARED ]] && echo "  ✓ planned-maintenance 已清除" \
+      || echo "  · planned-maintenance 已被替换/不存在，按 nonce 保留现场"
+    return 0
+  fi
+  echo "⚠ planned-maintenance 清理失败；保留 active 供 EXIT 再试，marker 最迟按 TTL 失效" >&2
+  return 1
+}
+
+cleanup_deploy_process() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 ]] && end_planned_maintenance >/dev/null 2>&1
+  [[ "$DEPLOY_HOLDER_OWNED" == 1 ]] && rm -f "${DEPLOY_LOCK}.holder"
+  exit "$rc"
+}
+
 # ───────────────────────── dangerous offline cutover guard ────────────────
 # 普通 deploy/smoke/dist/rollback 永远不会调用本段。只有显式离线三步需要一次性
 # nonce；prepare 必须在服务在线健康、目标镜像已构建后执行，确保构建时间不可能
@@ -346,10 +558,18 @@ recover_cutover() {
   local reason="${1:-offline cutover failed}"
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
   echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"
 mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$maintenance_lock"; chmod 600 "$maintenance_lock"
+exec 8>"$maintenance_lock"; flock -x 8
+clear_own_marker() {
+  if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+      '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+    rm -f "$marker"
+  fi
+}
 bundle="$root/$nonce"
 secure=0
 if [[ "$nonce" =~ ^[0-9a-f]{32}$ && -d "$bundle" && -f "$bundle/manifest.json" &&
@@ -359,7 +579,7 @@ if [[ "$nonce" =~ ^[0-9a-f]{32}$ && -d "$bundle" && -f "$bundle/manifest.json" &
   secure=1
 fi
 if [[ "$secure" != 1 ]]; then
-  rm -f "$marker" || true
+  clear_own_marker || true
   echo 'FATAL: no trusted rollback bundle; refusing to start an unverified/mixed activation' >&2
   exit 1
 fi
@@ -409,7 +629,7 @@ if [[ "$secure" == 1 ]]; then
     if [[ "$restore_failed" == 0 ]]; then
       systemctl start "$unit" || restore_failed=1
     fi
-    rm -f "$marker" || true
+    clear_own_marker || true
     if [[ "$restore_failed" == 0 ]]; then
       echo 'FATAL: old activation restore failed before commit; verified pre-recovery activation restored and started' >&2
       exit "$rc"
@@ -448,7 +668,7 @@ fi
 # Once the old activation is committed, never stop it again merely because
 # start/health is slow. Alerting is re-enabled and manual repair can continue.
 start_rc=0; systemctl start "$unit" || start_rc=$?
-rm -f "$marker"
+clear_own_marker
 [[ "$start_rc" == 0 ]] || { echo 'FATAL: restored activation could not be started' >&2; exit "$start_rc"; }
 for _ in $(seq 1 10); do
   body="$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/healthz" 2>/dev/null)"
@@ -466,10 +686,18 @@ REMOTE
 set_cutover_maintenance() {
   cutover_break_glass && return 0
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] set planned-maintenance marker for nonce=$CUTOVER_NONCE"; return 0; }
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_NONCE" "$MAINTENANCE_MARKER" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_NONCE" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; nonce="$2"; marker="$3"; manifest="$root/$nonce/manifest.json"
+root="$1"; nonce="$2"; marker="$3"; lock="$4"; manifest="$root/$nonce/manifest.json"
 [[ -f "$manifest" && "$(jq -r '.host' "$manifest")" == "$(hostname -f)" ]] || exit 1
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]]; then
+  existing_schema="$(jq -r '.schema // empty' "$marker" 2>/dev/null || true)"
+  existing_nonce="$(jq -r '.nonce // empty' "$marker" 2>/dev/null || true)"
+  [[ "$existing_schema" == 1 && "$existing_nonce" == "$nonce" ]] \
+    || { echo 'FATAL: another planned-maintenance marker exists' >&2; exit 1; }
+fi
 deadline="$(jq -r '.expires_at' "$manifest")"; mkdir -p -m 700 "$(dirname "$marker")"
 jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --argjson deadline "$deadline" \
   '{schema:1,host:$host,nonce:$nonce,deadline:$deadline}' >"$marker.tmp"
@@ -479,7 +707,16 @@ REMOTE
 
 clear_cutover_maintenance() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] clear planned-maintenance marker"; return 0; }
-  ssh "$KL_HOST" "rm -f '$MAINTENANCE_MARKER'"
+  ssh "$KL_HOST" bash -s -- "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$CUTOVER_NONCE" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; nonce="$3"
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+    '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"
+fi
+REMOTE
 }
 
 install_cutover_target_image_env() {
@@ -933,6 +1170,7 @@ activate_release() {
     echo "  [dry-run] 校验+assets 先就位→翻转 $ACTIVE_SRC(slot=$ACTIVE_SLOT)→restart/smoke $ACTIVE_UNIT:$ACTIVE_PORT→严格 state CAS；任一步失败回切旧 release"
     return 0
   fi
+  assert_release_required_migrations "$reldir" || return 1
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
@@ -1209,6 +1447,7 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  assert_release_required_migrations "$BUILT_RELEASE" || return 1
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
@@ -1469,8 +1708,14 @@ dist_handshake_smoke() {
   local sport="${1:-$V5_PORT}"
   echo "── 版本握手 smoke:线上 oc-build == 本地构建(fail-closed;port=$sport)──"
   local live_id
-  live_id="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1)"
-  [[ "$live_id" == "$DIST_BUILD_ID" ]] || { echo "✗ 线上 oc-build=${live_id:-空} ≠ 本地 $DIST_BUILD_ID(rsync 目标/静态层缓存有诈)" >&2; exit 1; }
+  if ! live_id="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1)"; then
+    echo "✗ 无法读取线上 oc-build(port=$sport)" >&2
+    return 1
+  fi
+  [[ -n "$DIST_BUILD_ID" && "$live_id" == "$DIST_BUILD_ID" ]] || {
+    echo "✗ 线上 oc-build=${live_id:-空} ≠ 期望 ${DIST_BUILD_ID:-空}(release/dist 握手失败)" >&2
+    return 1
+  }
   echo "  ✓ 线上 oc-build: $live_id"
 }
 
@@ -1483,8 +1728,10 @@ smoke() {
   local hz=""; local i
   for i in $(seq 1 10); do
     hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/healthz" 2>/dev/null || true)"
-    [[ -n "$hz" ]] && break
-    echo "  /healthz 未就绪,重试 $i/10..."; sleep 2
+    if [[ -n "$hz" ]] && echo "$hz" | jq -e '.ok == true and .runtime.leadership.state == "leader"' >/dev/null 2>&1; then
+      break
+    fi
+    echo "  /healthz/leadership 未就绪,重试 $i/10..."; sleep 2
   done
   echo "  /healthz: $hz"
   [[ -z "$hz" ]] && { echo "✗ v5 /healthz 无响应(10 次重试后)" >&2; return 1; }
@@ -1510,10 +1757,17 @@ smoke() {
   # 隔离不变量升级为**白名单**:schedulers 出现任何名单外条目 = shared 域泄漏,FAIL。
   # (服务端 index.ts 有同语义的 fail-closed 拒启断言,本处是部署面第二道防线。)
   echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ channel != v5" >&2; return 1; }
-  # v3 退役后 leader 形态(OC_CONTROL_PLANE_LEADER=1,9ecfc97d):v5 接管 shared 域调度器,
-  # 白名单语义不变(名单外条目仍 FAIL),只是 leader 下名单扩入 shared 域合法集。
-  local leader
-  leader="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_CONTROL_PLANE_LEADER=' '$V5_ENV' | tail -n 1 | cut -d= -f2-" 2>/dev/null || true)"
+  # 双 master 下两槽 env 都是 eligibility=1，静态 OC_CONTROL_PLANE_LEADER 已不能代表此刻
+  # 的单 leader。以 healthz.runtime.leadership.state 为唯一实时判据；follower 只允许
+  # local/v5-owned eager 项，LeaderBundle 成员只能出现在 state=leader 的实例。
+  local leadership
+  leadership="$(jq -r '.runtime.leadership.state // empty' <<<"$hz" 2>/dev/null || true)"
+  [[ "$leadership" =~ ^(leader|standby|ineligible|acquiring|fenced)$ ]] || {
+    echo "✗ healthz.runtime.leadership.state 缺失/非法:${leadership:-<empty>}" >&2; return 1; }
+  [[ "$leadership" == leader ]] || {
+    echo "✗ stable active leadership=$leadership(必须为 leader；candidate standby 使用 candidate_self_check)" >&2
+    return 1
+  }
   local scheds allowed bad
   scheds="$(echo "$hz" | grep -o '"schedulers":\[[^]]*\]' | sed 's/.*\[//;s/\]//;s/"//g')"
   #   cronWake(cron 触发权威上移,dae6d97d:cron_wake_index 为 v5 引入表(0119)且按
@@ -1522,10 +1776,8 @@ smoke() {
   #     确认过期销毁 params、OAuth pending 过期清理、ledger retention。关停:OC_CONNECTOR_SWEEPER_DISABLED=1)
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert cronWake connectorSweeper sessionsGcSweep"
-  if [[ "$leader" == "1" ]]; then
-    allowed="$allowed containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
-  fi
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper wecomAlert userNoticeApproval"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -1533,11 +1785,7 @@ smoke() {
     grep -qw "$s" <<<"$allowed" || bad="$bad $s"
   done
   [[ -n "$bad" ]] && { echo "✗ shared 域 scheduler 泄漏到 v5:$bad" >&2; return 1; }
-  if [[ "$leader" == "1" ]]; then
-    echo "$hz" | grep -q '"controlPlaneEnabled":true' || { echo "✗ leader 模式下 controlPlaneEnabled 非 true" >&2; return 1; }
-  else
-    echo "$hz" | grep -q '"controlPlaneEnabled":false' || { echo "✗ controlPlaneEnabled 非 false" >&2; return 1; }
-  fi
+  echo "$hz" | grep -q '"controlPlaneEnabled":true' || { echo "✗ 双 master eligibility(controlPlaneEnabled)非 true" >&2; return 1; }
   echo "$hz" | grep -q '"agentRuntime":"disabled"' || { echo "✗ agentRuntime 非 disabled(不应起 legacy agent 运行时)" >&2; return 1; }
   local ver; ver="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/version" 2>/dev/null || true)"
   echo "  /version: $ver"
@@ -1598,6 +1846,8 @@ bootstrap() {
   local rmpat; rmpat="$(IFS='|'; echo "${REMOVE_KEYS[*]}")"
   run "rsync -az '$REPO_ROOT/deploy/v5/commercial-v5.env.overrides' '$KL_HOST:/tmp/commercial-v5.env.overrides'"
   sshk "set -e; if [ -f '$V5_ENV' ]; then echo '  ⚠ $V5_ENV 已存在 → 保留现网 env(权威=现网文件,含热修密钥),跳过派生;如确要重建请先手动移走该文件'; exit 0; fi; preserved_secret=''; pid=\$(systemctl show -p MainPID --value openclaude-v5-egress 2>/dev/null || true); if [ -n \"\$pid\" ] && [ \"\$pid\" != 0 ] && [ -r /proc/\$pid/environ ]; then preserved_secret=\$(tr '\\0' '\\n' < /proc/\$pid/environ | sed -n 's/^OC_EGRESS_SECRET=//p' | tail -n 1 || true); fi; if [ -z \"\$preserved_secret\" ]; then preserved_secret=\$(openssl rand -hex 32); fi; grep -Ev '^[[:space:]]*(${rmpat})=' '$V3_ENV' > '$V5_ENV.tmp' && { echo ''; echo '# ===== v5 overrides (deploy-v5.sh) ====='; cat /tmp/commercial-v5.env.overrides; printf '\nOC_EGRESS_SECRET=%s\n' \"\$preserved_secret\"; } >> '$V5_ENV.tmp' && mv '$V5_ENV.tmp' '$V5_ENV' && chmod 600 '$V5_ENV'"
+  echo "── 4.5) release metadata 数据库前置硬门 ──"
+  assert_repo_required_migrations
   # 5) systemd unit(master + egress 一并装:见 V5_EGRESS_UNIT 定义处的踩雷说明)
   echo "── 5) 安装 $V5_UNIT + $V5_EGRESS_UNIT ──"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_UNIT' '$KL_HOST:/etc/systemd/system/$V5_UNIT'"
@@ -1648,6 +1898,9 @@ deploy() {
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
+  fi
+  begin_planned_maintenance deploy "$RESTART_EGRESS"
+  if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
   else
     activate_release "$BUILT_RELEASE"   # 原子 symlink 翻转 + restart(master 只从完整不可变 release 启动)
@@ -1661,6 +1914,7 @@ deploy() {
   if [[ "$WITH_DIST" == 1 ]]; then
     dist_handshake_smoke "$ACTIVE_PORT"
   fi
+  end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -1846,12 +2100,16 @@ deploy_dist() {
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
+  fi
+  begin_planned_maintenance dist 0
+  if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
   else
     activate_release "$BUILT_RELEASE"
   fi
   [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
   dist_handshake_smoke "$ACTIVE_PORT"
+  end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -1874,8 +2132,10 @@ rollback() {
       echo "  [dry-run] hotcfg rollback(slot=$ACTIVE_SLOT):N=1 以 state.previous 为 master 权威(P3 master-only 则保留当前 tuple)→slot-aware saga+三态 state commit/reconcile"
       return 0
     fi
+    begin_planned_maintenance rollback 0
     rollback_runtime_tuple "$ROLLBACK_N" || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
     smoke "$ACTIVE_PORT"
+    end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
     return 0
   fi
@@ -1906,14 +2166,20 @@ rollback() {
     target="$(ssh "$KL_HOST" "ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | sed -n '$((ROLLBACK_N+1))p'")"
   fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] rollback(slot=$ACTIVE_SLOT)→ ${target:-<第$ROLLBACK_N个更老release>}"; activate_release "${target:-<dry>}"; return 0
+    echo "  [dry-run] rollback(slot=$ACTIVE_SLOT)→ ${target:-<第$ROLLBACK_N个更老release>}"
+    begin_planned_maintenance rollback 0
+    activate_release "${target:-<dry>}"
+    end_planned_maintenance
+    return 0
   fi
   [[ -n "$target" ]] || { echo "✗ 找不到回滚目标(N=$ROLLBACK_N;previous_active_release/.prev-release 或第 N 个更老 release 不存在)" >&2; exit 1; }
   ssh "$KL_HOST" "test -d '$target'" || { echo "✗ 回滚目标目录不存在: $target" >&2; exit 1; }
   # activate_release 内 ds_commit_active_release 会把 previous_active_release←旧 active(=回滚前的 release)、
   # active_release←target 原子对调(BLOCKER 4:rollback 成功后 CAS 更新 active_release+previous 对调)。
+  begin_planned_maintenance rollback 0
   activate_release "$target"
   smoke "$ACTIVE_PORT"
+  end_planned_maintenance
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
 }
 
@@ -2037,6 +2303,7 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
+  assert_release_required_migrations "$master" || return 1
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
   # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
   flip_rev=""
@@ -2463,6 +2730,11 @@ canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
   assert_bluegreen_layout
   assert_runtime_channel_column
+  if [[ -n "$CANARY_RELEASE" ]]; then
+    local requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
+    [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
+    assert_release_required_migrations "$requested_release"
+  fi
   ds_snapshot
   ds_assert_phase stable
   # BLOCKER 6:canary 起手断言 active_release 非 NULL 且目录存在(seed=NULL;基建版须先跑一次传统
@@ -2637,7 +2909,7 @@ finalize() {
             echo "  ⚠ 无法从 journal 恢复 egress 基线,但 OC_FINALIZE_SKIP_EGRESS_GATE=1 已放行(危险,登记债)"
           else
             echo "✗ finalize resume 无法恢复 step0 egress 原基线(journal 缺失/损坏)→ fail-closed 转 aborting(§8)" >&2
-            ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize resume: egress baseline unrecoverable → aborting"
+            ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize resume: egress baseline unrecoverable → aborting"
             sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
             abort_continue "$old" "$cand"
             exit 1
@@ -2656,6 +2928,23 @@ finalize() {
 # finalize step1..7 主体(每步 `-lt N` 幂等守卫;fresh 全跑,resume 从断点前滚)。$1=cand $2=old。
 finalize_run_steps() {
   local cand="$1" old="$2"
+
+  # 独立 --finalize 是新 shell，不能依赖 --canary 时的内存变量。始终从 deploy_state 钉死的
+  # candidate_release 读取期望 dist build id，且在停旧 slot / commit stable 前做严格握手。
+  if [[ "$DRY" != 1 ]]; then
+    local candidate_release="$DS_candidate_release"
+    [[ -n "$candidate_release" ]] || {
+      echo "✗ finalize 缺 candidate_release，无法建立 dist 版本权威" >&2
+      exit 1
+    }
+    [[ "$candidate_release" == /* ]] || candidate_release="$RELEASES_ROOT/$candidate_release"
+    DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$candidate_release/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
+    [[ -n "$DIST_BUILD_ID" ]] || {
+      echo "✗ candidate_release dist 缺 oc-build:$candidate_release" >&2
+      exit 1
+    }
+    echo "  · candidate release oc-build 权威:$DIST_BUILD_ID"
+  fi
 
   # ① percent=100 观察窗(step1)
   if [[ "$DRY" == 1 || "$DS_transition_step" -lt 1 ]]; then
@@ -2676,7 +2965,7 @@ finalize_run_steps() {
     unset DS_RENDER_STEP_OVERRIDE
     if [[ "$step2_ok" != 1 ]]; then
       echo "✗ finalize step2 验证失败(默认未确认切到 candidate)→ 转 aborting 补偿(§8)" >&2
-      ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize step2 verify FAILED → aborting"
+      ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize step2 verify FAILED → aborting"
       sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
       abort_continue "$old" "$cand"
       exit 1
@@ -2709,7 +2998,7 @@ finalize_run_steps() {
     wait_for_slot_leadership "$cand" 1 60 || echo "  · 轮询超时,交由四门槛裁决"
     if ! ( vip_control_gate "$cand" && egress_gate_conservation ); then
       echo "✗ finalize 四门槛未过 → 补偿:desired 收回旧 slot + 重启旧 unit + 转 aborting(§8)" >&2
-      ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize gate FAILED → compensate → aborting"
+      ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize gate FAILED → compensate → aborting"
       sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
       abort_continue "$old" "$cand"
       exit 1
@@ -2727,7 +3016,19 @@ finalize_run_steps() {
       echo "── (resume step6)提交 stable 前重新核验 candidate($cand)liveness+leadership+VIP+control-probe ──"
       if ! ( wait_for_slot_leadership "$cand" 1 60 && vip_control_gate "$cand" ); then
         echo "✗ (resume step6)candidate 异常 → 转 aborting(§8:先起旧 unit 核验健康再切回)" >&2
-        ds_cas_or_die "phase='aborting', desired_leader_slot='$old', desired_control_slot='$old', transition_step=0" 0 "finalize resume step6 candidate UNHEALTHY → aborting"
+        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize resume step6 candidate UNHEALTHY → aborting"
+        sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
+        abort_continue "$old" "$cand"
+        exit 1
+      fi
+    fi
+    # fresh step5 与 resume step6 都在 commit stable 前跑完整 leader smoke + release/dist 握手。
+    # 任一失败都保留/拉起旧 slot 并进入 aborting，不制造“已切换但命令判失败”的终态。
+    if [[ "$DRY" != 1 ]]; then
+      echo "── 提交 stable 前完整 smoke + candidate release/dist 握手 ──"
+      if ! smoke "$(slot_port "$cand")" || ! dist_handshake_smoke "$(slot_port "$cand")"; then
+        echo "✗ finalize 提交前 smoke/版本握手失败 → 转 aborting，保留恢复路径" >&2
+        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit smoke/dist handshake FAILED → aborting"
         sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
         abort_continue "$old" "$cand"
         exit 1
@@ -2744,9 +3045,6 @@ finalize_run_steps() {
     ds_cas_or_die "active_slot='$cand', previous_active_release=active_release, active_release=candidate_release, candidate_slot=NULL, candidate_release=NULL, phase='stable', transition_step=0, cohort_percent=0" 7 "finalize commit active_slot=$cand phase=stable (previous←old active)"
     # 收敛后 Caddy re-render(此刻 active=cand,无 candidate → 回 seed 形态,默认→新 active)
     caddy_render_reload
-    # 新 active(=原 candidate)完整 smoke(参数化端口)+ 版本握手
-    [[ "$DRY" == 1 ]] || smoke "$(slot_port "$cand")"
-    dist_handshake_smoke "$(slot_port "$cand")" || true
   fi
   echo "✓ --finalize 完成:active_slot=$cand(原 candidate 已成新主+leader+VIP),旧 slot=$old 已停。"
 }
@@ -2803,6 +3101,12 @@ abort_continue() {
     echo "  核查旧 slot lease 竞争 / desired 是否已=$old / 旧 unit 是否健康;修复后重跑 deploy-v5.sh --abort(或 --recover)。" >&2
     exit 1
   fi
+  # candidate 仍保持运行、phase 仍为 aborting 时先做完整旧 active smoke。任何不变量失败都
+  # 停在可恢复态并返回非零，绝不吞错后停 candidate / commit stable。
+  if [[ "$DRY" != 1 ]] && ! smoke "$(slot_port "$old")"; then
+    echo "✗ 旧 slot($old)完整 smoke 未过；保持 phase=aborting 且 candidate 继续运行，人工修复后重跑 --abort/--recover" >&2
+    exit 1
+  fi
   # ③ stop candidate unit(仅在旧 slot 已确认 leader+VIP 后)——guard -lt 3
   if [[ "$DRY" == 1 || "$DS_transition_step" -lt 3 ]]; then
     echo "── ③ stop candidate unit $(slot_unit "$cand")──"
@@ -2814,7 +3118,6 @@ abort_continue() {
   # ④ CAS phase=stable,candidate_*=NULL,percent=0(cookie 靠 generation 不匹配自动失效)——guard -lt 4
   if [[ "$DRY" == 1 || "$DS_transition_step" -lt 4 ]]; then
     ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, cohort_percent=0, transition_step=0, operation_id=NULL" 4 "abort commit → stable (old active=$old)"
-    [[ "$DRY" == 1 ]] || smoke "$(slot_port "$old")" || echo "  ⚠ 旧 active smoke 有告警,人工核查"
   fi
   echo "✓ --abort 完成:回退到旧 active_slot=$old;candidate=$cand 已停。cohort cookie 靠 generation 失配自动失效。"
 }
@@ -2871,6 +3174,7 @@ if [[ "${V5_DEPLOY_SOURCE_ONLY:-0}" == 1 ]]; then
   if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; else exit 0; fi
 fi
 DEPLOY_LOCK="/var/lock/oc-v5-deploy.lock"
+trap cleanup_deploy_process EXIT
 if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
   exec 8>"$DEPLOY_LOCK"
   if ! flock -n 8; then
@@ -2879,7 +3183,13 @@ if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
     flock -w 900 8 || { echo "✗ 900s 未取得部署锁 —— 另一会话的部署可能挂死,人工核查 ${DEPLOY_LOCK}.holder 后处置" >&2; exit 3; }
   fi
   printf 'pid=%s mode=%s tree=%s started=%s\n' "$$" "$MODE" "$REPO_ROOT" "$(date -Is)" > "${DEPLOY_LOCK}.holder"
-  trap 'rm -f "${DEPLOY_LOCK}.holder"' EXIT
+  DEPLOY_HOLDER_OWNED=1
+fi
+
+# bootstrap 必须先生成/保留 V5_ENV，故在 bootstrap() 的 4.5 步单独执行；其余所有写 lane
+# 在任何 release/symlink/unit/Caddy/状态机副作用前统一 fail-closed。
+if [[ "$MODE" != "smoke" && "$MODE" != "bootstrap" ]]; then
+  assert_repo_required_migrations || exit 1
 fi
 
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新

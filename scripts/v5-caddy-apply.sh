@@ -148,7 +148,7 @@ CADDY
   cat <<CADDY
 
 	handle @v5pay {
-		reverse_proxy localhost:${default_port} {
+		reverse_proxy localhost:${active_port} {
 			header_up Host {host}
 			header_up X-Real-IP {remote_host}
 			header_up X-Forwarded-For {remote_host}
@@ -281,6 +281,8 @@ self_check() {
   _need "$fin2" '@v5canary'                'finalizing-2'
   # finalizing step2 默认块 → candidate(18795)
   grep -A6 'handle {' "$fin2" | grep -q 'localhost:18795' || { echo "  ✗ [finalizing-2] 默认应→candidate(18795)" >&2; ok=0; }
+  # 支付回调是无 lane cookie 的外部请求，finalizing 默认切 candidate 后仍必须钉 active。
+  grep -A2 'handle @v5pay' "$fin2" | grep -q 'localhost:18790' || { echo "  ✗ [finalizing-2] 支付回调必须恒→active(18790)" >&2; ok=0; }
   _deny "$abo" '@v5canary'                 'aborting'
   grep -A6 'handle {' "$abo" | grep -q 'localhost:18790' || { echo "  ✗ [aborting] 默认应回 active(18790)" >&2; ok=0; }
   echo "  ✓ finalizing step1 默认→active、step2 默认→candidate、aborting 摘 matcher 默认回 active"

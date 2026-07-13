@@ -2,7 +2,10 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { createLeaderBundle } from "../deploy/leaderBundle.js";
+import {
+  createLeaderBundle,
+  LeaderBundleRollbackIncompleteError,
+} from "../deploy/leaderBundle.js";
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -116,6 +119,44 @@ describe("LeaderBundle", () => {
     assert.deepEqual(removed, ["ok1"]);
     assert.equal(bundle.isRunning(), false);
     assert.deepEqual(bundle.runningNames(), []);
+  });
+
+  test("required start 失败且回滚 stop 超时 → 保留 stuck 并抛 unsafe 错误供 lease fail-stop", async () => {
+    const stopGate = deferred<void>();
+    const removed: string[] = [];
+    const bundle = createLeaderBundle({
+      startupRollbackMs: 20,
+      onMemberStopped: (n) => removed.push(n),
+    });
+    bundle.add({
+      name: "started",
+      domain: "shared",
+      start: () => ({ stop: () => stopGate.promise }),
+    });
+    bundle.add({
+      name: "boom",
+      domain: "shared",
+      start: () => { throw new Error("boom"); },
+    });
+
+    const keepAlive = setTimeout(() => {}, 100);
+    try {
+      await assert.rejects(
+        () => bundle.start(),
+        (err: unknown) => {
+          assert.ok(err instanceof LeaderBundleRollbackIncompleteError);
+          assert.deepEqual(err.stuck, ["started"]);
+          return true;
+        },
+      );
+    } finally {
+      clearTimeout(keepAlive);
+    }
+    assert.deepEqual(removed, [], "未确认 stop 成功时不得从 schedulerRegistry 摘除");
+    assert.deepEqual(bundle.runningNames(), ["started"], "超时成员仍按可能在跑处理");
+
+    stopGate.resolve();
+    await bundle.stopAndDrain(100);
   });
 
   test("best-effort 成员(required:false)start 抛错不阻断其余(保留旧 eager 语义)", async () => {

@@ -308,6 +308,16 @@ export interface AibotConnStatus {
   bound: boolean
 }
 
+export interface AibotInboundMessage {
+  channelId: string
+  reqId: string | null
+  chatId: string
+  chatType: 'single' | 'group' | null
+  fromUserId: string | null
+  text: string | null
+}
+export type AibotInboundHandler = (message: AibotInboundMessage) => Promise<string | null>
+
 /** ws 工厂:测试可注入假 socket;默认直连(不传 agent)。 */
 export type SocketFactory = (url: string) => WebSocket
 
@@ -353,6 +363,7 @@ export class WecomAibotConnectionManager {
   private started = false
   private readonly conns = new Map<string, Conn>()
   private readonly deps: WecomAibotManagerDeps
+  private inboundHandler: AibotInboundHandler | null = null
 
   constructor(deps?: Partial<WecomAibotManagerDeps>) {
     this.deps = {
@@ -374,6 +385,11 @@ export class WecomAibotConnectionManager {
 
   isStarted(): boolean {
     return this.started
+  }
+
+  /** Install the authenticated command handler used by selfheal notice approvals. */
+  setInboundHandler(handler: AibotInboundHandler | null): void {
+    this.inboundHandler = handler
   }
 
   /** 加载所有 enabled 的 wecom_aibot 通道并各起一条连接。幂等:重复 start 不重复连。 */
@@ -446,13 +462,24 @@ export class WecomAibotConnectionManager {
     })
     // assert 通过 → conn 一定 connected 且已绑定。
     const c = conn as Conn
+    return this.sendTo(id, c.boundChatId as string, c.boundChatType ?? 'single', markdown)
+  }
+
+  /** Send to an explicitly persisted destination (used by approval workflows). */
+  async sendTo(
+    id: string | number | bigint,
+    chatId: string,
+    chatType: 'single' | 'group',
+    markdown: string,
+  ): Promise<void> {
+    const key = String(id)
+    const conn = this.conns.get(key)
+    if (conn?.state !== 'connected') {
+      throw new AibotSendError('等待连接:企业微信智能机器人长连接未就绪,稍后自动重试')
+    }
+    const c = conn as Conn
     const reqId = newReqId()
-    const frame = buildSendMsgFrame(
-      c.boundChatId as string,
-      c.boundChatType ?? 'single',
-      markdown,
-      reqId,
-    )
+    const frame = buildSendMsgFrame(chatId, chatType, markdown, reqId)
     const ack = await this.sendAndAwaitAck(c, frame, reqId)
     const cls = classifyAibotAck(ack.errcode)
     if (cls === 'ok') return
@@ -627,12 +654,26 @@ export class WecomAibotConnectionManager {
       } catch (err) {
         this.deps.onError(`updateBinding ch=${conn.channelId}`, err)
       }
-      // 回首绑确认(proactive:用户刚发过消息,前提满足)。
-      this.proactiveSend(conn, BINDING_CONFIRM_TEXT)
-    } else {
-      // 同一会话再发消息 → 礼貌回复,不接聊天。
-      this.proactiveSend(conn, POLITE_REPLY_TEXT)
     }
+    const commandReply = this.inboundHandler
+      ? await this.inboundHandler({
+          channelId: conn.channelId,
+          reqId: cb.reqId,
+          chatId: learned.chatId,
+          // 审批身份必须绑定企微原始四元组。通用通道绑定仍可对缺省 chattype
+          // 兼容回退 single，但审批命令绝不使用推导值。
+          chatType: cb.chatType,
+          fromUserId: cb.fromUserId,
+          text: cb.text,
+        }).catch((err) => {
+          this.deps.onError(`inboundHandler ch=${conn.channelId}`, err)
+          return '审批命令处理失败，请稍后重试。'
+        })
+      : null
+    this.proactiveSend(
+      conn,
+      commandReply ?? (isNewBinding ? BINDING_CONFIRM_TEXT : POLITE_REPLY_TEXT),
+    )
   }
 
   /** fire-and-forget 主动推送(确认 / 礼貌回复;不等 ack,不影响告警投递路径)。 */

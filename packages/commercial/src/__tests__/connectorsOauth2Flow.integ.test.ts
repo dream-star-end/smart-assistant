@@ -1,0 +1,1166 @@
+/**
+ * 声明式连接器 · oauth2-auth-code **HTTP 授权流**端到端(切片 B;真 PG + 受控本地上游)。
+ *
+ * 走的是真实路由入口(dispatchConnectorsRoute),不是直接调引擎:
+ *   POST /api/connectors/declarative/oauth/start  → 落 pending(AEAD draft)+ Set-Cookie + authorizeUrl
+ *   GET  /api/connectors/oauth/callback?state&code → 四因子消费 → exchangeAuthCode(mock token 端点)
+ *                                                   → identity 探针(mock api 端点)→ 加密落 pin 连接 → 302
+ *
+ * 凭据不变量(本文件的核心价值):
+ *   - authorizeUrl(要交给浏览器)里有 client_id / state / code_challenge(S256),**绝无**
+ *     client_secret、**绝无** code_verifier(只有它的单向派生 challenge);
+ *   - client_secret / code / code_verifier **只**出现在发往 **token origin** 的 form body 里
+ *     (受众隔离:api origin 的探针请求里 grep 不到 client_secret);
+ *   - 落库的 connections.secret_enc 是密文:**明文 grep 不到 client_secret**;解密后袋形状 =
+ *     storedBagSources(access_token + client_id + client_secret + refresh_token)。
+ *
+ * 对抗:
+ *   - 重放同一 state(第二次回调)→ 失败且**不重复绑定**(连接数不变);
+ *   - cookie nonce 不匹配 → 失败,不落连接;
+ *   - 非 oauth2 契约的 versionId 调 oauth/start → BAD_REQUEST;
+ *   - oauth2 契约走直填 bind → BAD_REQUEST(直绑禁止,必须走授权流)。
+ *
+ * 无 PG → skip(REQUIRE_TEST_DB=1 时硬失败),照仓内 integ 惯例。
+ */
+
+import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
+import { type Server, createServer } from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { Readable } from 'node:stream'
+import { after, before, describe, test } from 'node:test'
+import { fetch as undiciFetch } from 'undici'
+
+// KMS key 必须在任何 sign/verify/encrypt 前就位。
+process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
+// OAuth 回跳地址(authorize 与 token 交换两阶段必须同值)。
+process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI =
+  'https://app.oauth2.test/api/connectors/oauth/callback'
+
+import { signAccess } from '../auth/jwt.js'
+import { bindDeclarativeConnector, bindWithBag } from '../connectors/engine/bind.js'
+import {
+  META_TOKEN_EXPIRES_AT,
+  decryptBagFromRow,
+  getDeclarativeConnection,
+} from '../connectors/engine/binding.js'
+import type { EngineHttpDeps } from '../connectors/engine/driver.js'
+import { executeDeclarativeAction } from '../connectors/engine/execute.js'
+import { ConnectorError } from '../connectors/errors.js'
+import { dispatchConnectorsRoute } from '../connectors/handlers.js'
+import { oauthCookieName } from '../connectors/oauthPending.js'
+import type { DnsResolver } from '../connectors/outboundPolicy.js'
+import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
+import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
+import {
+  loadVerifiedContractWithMeta,
+  markFunctionalVerified,
+  securityApprove,
+} from '../connectors/spec/review.js'
+import { computeAccountKey } from '../connectors/store.js'
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
+import { runMigrations } from '../db/migrate.js'
+import { query } from '../db/queries.js'
+import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
+import { HttpError } from '../http/util.js'
+
+const TEST_DB_URL =
+  process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
+const PUBLIC_IP = '93.184.216.34'
+/** HS256 要求 ≥32 字节。 */
+const JWT_SECRET = 'test-jwt-secret-oauth2-flow-0123456789abcdef'
+
+/** canary:用户 BYOA 应用的 client_secret。跑完必须只在 token 请求 body 里出现过。 */
+const CLIENT_SECRET = 'CS-CANARY-7d3e91a4-DO-NOT-LEAK-fedcba9876543210'
+const CLIENT_ID = 'cid-public-abc123'
+/** canary:上游发的 access/refresh token。 */
+const ACCESS_TOKEN = 'AT-CANARY-2f8b60c1-DO-NOT-LEAK-0011223344556677'
+const REFRESH_TOKEN = 'RT-CANARY-5a1d47e9-DO-NOT-LEAK-8899aabbccddeeff'
+/** canary:**续期换回**的新 access/refresh token(轮换后旧的必须从袋里消失)。 */
+const NEW_ACCESS_TOKEN = 'AT2-CANARY-9c4e17b3-DO-NOT-LEAK-a1b2c3d4e5f60718'
+const NEW_REFRESH_TOKEN = 'RT2-CANARY-6b0f83da-DO-NOT-LEAK-1122334455667788'
+/** canary:platform 模式的平台 App 凭据(存平台表,**绝不进用户袋**)。 */
+const PLATFORM_CLIENT_ID = 'platform-cid-refresh-001'
+const PLATFORM_CLIENT_SECRET = 'PS-CANARY-0d7a52ef-DO-NOT-LEAK-99aabbccddeeff00'
+
+const AUTHZ_ORIGIN = 'https://auth.oauth2.test:443'
+const TOKEN_ORIGIN = 'https://token.oauth2.test:443'
+const API_ORIGIN = 'https://api.oauth2.test:443'
+const AUTHORIZE_ENDPOINT = 'https://auth.oauth2.test/oauth/authorize'
+const TOKEN_ENDPOINT = 'https://token.oauth2.test/oauth/token'
+/** refresh 端点与 token 端点**分开**(同 token origin 不同 path):这样能数清到底打了哪一个。 */
+const REFRESH_ENDPOINT = 'https://token.oauth2.test/oauth/refresh'
+
+/**
+ * 受控上游的**可变脚本**(每个用例 before 用 resetUpstream 重置)。
+ * `null` 一律表示"这个字段上游不回"(如 GitHub 不回 expires_in / refresh_token)。
+ */
+interface UpstreamCfg {
+  tokenExpiresIn: number | null
+  tokenRefreshToken: string | null
+  refreshStatus: number
+  refreshAccessToken: string
+  refreshRefreshToken: string | null
+  refreshExpiresIn: number | null
+}
+const DEFAULT_UPSTREAM: UpstreamCfg = {
+  tokenExpiresIn: 3600,
+  tokenRefreshToken: REFRESH_TOKEN,
+  refreshStatus: 200,
+  refreshAccessToken: NEW_ACCESS_TOKEN,
+  refreshRefreshToken: NEW_REFRESH_TOKEN,
+  refreshExpiresIn: 3600,
+}
+let upstream: UpstreamCfg = { ...DEFAULT_UPSTREAM }
+
+let pgAvailable = false
+
+async function probePg(): Promise<boolean> {
+  const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
+  try {
+    await p.query('SELECT 1')
+    await p.end()
+    return true
+  } catch {
+    try {
+      await p.end()
+    } catch {
+      /* */
+    }
+    return false
+  }
+}
+
+async function dropAllTables(): Promise<void> {
+  const db = await query<{ db: string }>('SELECT current_database() AS db')
+  if (!/_test$/.test(db.rows[0]?.db ?? '')) throw new Error('refusing to drop non-test db')
+  await query(`DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP
+      EXECUTE 'DROP TABLE IF EXISTS public.'||quote_ident(r.tablename)||' CASCADE'; END LOOP; END $$;`)
+}
+
+// ─── 受控本地上游(同时扮演 token origin 与 api origin,按 path 分流) ──────────
+
+interface Captured {
+  method: string
+  path: string
+  authorization: string | undefined
+  body: string
+}
+interface TestServer {
+  port: number
+  requests: Captured[]
+  close(): Promise<void>
+}
+
+function startServer(): Promise<TestServer> {
+  return new Promise((resolve) => {
+    const requests: Captured[] = []
+    const server: Server = createServer((req, res) => {
+      const u = new URL(req.url ?? '/', 'http://127.0.0.1')
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', () => {
+        requests.push({
+          method: req.method ?? '',
+          path: u.pathname,
+          authorization: req.headers.authorization,
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+        res.setHeader('content-type', 'application/json')
+        if (u.pathname === '/oauth/token') {
+          // token 端点(授权码交换):按脚本回 access/refresh/expires。
+          res.statusCode = 200
+          res.end(
+            JSON.stringify({
+              access_token: ACCESS_TOKEN,
+              ...(upstream.tokenRefreshToken !== null
+                ? { refresh_token: upstream.tokenRefreshToken }
+                : {}),
+              ...(upstream.tokenExpiresIn !== null ? { expires_in: upstream.tokenExpiresIn } : {}),
+            }),
+          )
+          return
+        }
+        if (u.pathname === '/oauth/refresh') {
+          // refresh 端点(RFC 6749 §6):按脚本回新 token / 失败码。
+          res.statusCode = upstream.refreshStatus
+          res.end(
+            JSON.stringify(
+              upstream.refreshStatus === 200
+                ? {
+                    access_token: upstream.refreshAccessToken,
+                    ...(upstream.refreshRefreshToken !== null
+                      ? { refresh_token: upstream.refreshRefreshToken }
+                      : {}),
+                    ...(upstream.refreshExpiresIn !== null
+                      ? { expires_in: upstream.refreshExpiresIn }
+                      : {}),
+                  }
+                : { error: 'invalid_grant' },
+            ),
+          )
+          return
+        }
+        if (u.pathname === '/user') {
+          // identity 探针端点(api origin);多回一个 secret_field 验证 allowlist 剥字段。
+          res.statusCode = 200
+          res.end(
+            JSON.stringify({ id: 'U-99887', login: 'octocat', secret_field: 'must-be-stripped' }),
+          )
+          return
+        }
+        res.statusCode = 404
+        res.end('{}')
+      })
+    })
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as AddressInfo).port
+      resolve({
+        port,
+        requests,
+        close: () => new Promise<void>((r) => server.close(() => r())),
+      })
+    })
+  })
+}
+
+/** 把引擎的 https 目标改写到本地 http 服务器(保留 path/headers/body)。 */
+function localFetch(port: number): NonNullable<EngineHttpDeps['fetchImpl']> {
+  return async (input, init) => {
+    const u = new URL(input)
+    u.protocol = 'http:'
+    u.hostname = '127.0.0.1'
+    u.port = String(port)
+    return undiciFetch(u.toString(), {
+      method: init.method as string,
+      headers: init.headers as Record<string, string> | undefined,
+      body: init.body as string | undefined,
+      redirect: 'error',
+      signal: init.signal as AbortSignal | undefined,
+    }) as unknown as Promise<Response>
+  }
+}
+
+function okResolver(): DnsResolver {
+  return {
+    resolve4: async () => [PUBLIC_IP],
+    resolve6: async () => {
+      const e = new Error('nodata') as NodeJS.ErrnoException
+      e.code = 'ENODATA'
+      throw e
+    },
+  }
+}
+
+// ─── 假 req/res/ctx/deps ────────────────────────────────────────────────────
+
+function makeReq(opts: {
+  method: string
+  url: string
+  authorization?: string
+  cookie?: string
+  body?: unknown
+}): IncomingMessage {
+  const bodyStr = opts.body === undefined ? '' : JSON.stringify(opts.body)
+  const stream = Readable.from(bodyStr ? [Buffer.from(bodyStr, 'utf8')] : [])
+  Object.assign(stream, {
+    method: opts.method,
+    url: opts.url,
+    headers: {
+      host: 'app.oauth2.test',
+      ...(opts.authorization ? { authorization: opts.authorization } : {}),
+      ...(opts.cookie ? { cookie: opts.cookie } : {}),
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+  })
+  return stream as unknown as IncomingMessage
+}
+
+interface FakeRes {
+  statusCode: number
+  headers: Record<string, string | string[] | number>
+  body: string
+  res: ServerResponse
+}
+
+function makeRes(): FakeRes {
+  const out = { statusCode: 200, headers: {}, body: '' } as FakeRes
+  const res = {
+    statusCode: 200,
+    setHeader(name: string, value: string | string[] | number) {
+      out.headers[name] = value
+    },
+    getHeader(name: string) {
+      return out.headers[name]
+    },
+    end(chunk?: string) {
+      if (chunk) out.body = chunk
+      out.statusCode = (this as unknown as { statusCode: number }).statusCode
+    },
+  } as unknown as ServerResponse
+  out.res = res
+  return out
+}
+
+function makeCtx(): RequestContext {
+  const log = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+    child: () => log,
+  } as unknown as RequestContext['log']
+  return {
+    requestId: 'test-req',
+    clientIp: '127.0.0.1',
+    authBoundIp: '127.0.0.1',
+    userAgent: 'test',
+    log,
+  } as unknown as RequestContext
+}
+
+function makeDeps(port: number): CommercialHttpDeps {
+  return {
+    jwtSecret: JWT_SECRET,
+    mailer: {} as CommercialHttpDeps['mailer'],
+    redis: {} as CommercialHttpDeps['redis'],
+    refreshCookieSecure: false,
+    connectorEngineDeps: { resolver: okResolver(), fetchImpl: localFetch(port) },
+  } as CommercialHttpDeps
+}
+
+// ─── fixture:oauth2-auth-code / static-token 两个声明式 connector ─────────────
+
+function oauth2Spec(slug: string): Record<string, unknown> {
+  return {
+    id: slug,
+    label: 'Demo OAuth2',
+    description: 'oauth2 authorization code declarative connector',
+    authMode: 'oauth2-auth-code',
+    auth: {
+      authorizeEndpoint: AUTHORIZE_ENDPOINT,
+      tokenEndpoint: TOKEN_ENDPOINT,
+      // 独立 refresh 端点(同 token origin,不同 path)→ 能数清续期到底打没打。
+      refreshEndpoint: REFRESH_ENDPOINT,
+      // BYOA(用户自带 App):本文件全部用例的原语义。platform 模式见 connectorsPlatformOauth.integ。
+      clientProvisioning: 'byoa',
+      clientAuth: 'form',
+      scopeSeparator: ' ',
+      scopes: ['read:user'],
+      refreshRotation: true,
+      refreshEncoding: 'form',
+      pkce: 'required',
+      tokenOutputs: {
+        accessToken: '/access_token',
+        refreshToken: '/refresh_token',
+        expiresIn: '/expires_in',
+      },
+      apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+    },
+    originMode: 'fixed-reviewed',
+    credentialPipeline: {
+      nodes: [{ id: 'api-token', authMode: 'oauth2-auth-code', subject: 'user', audience: 'api' }],
+    },
+    actions: [
+      {
+        id: 'whoami',
+        description: 'identity probe',
+        request: { method: 'GET', pathTemplate: '/user' },
+        params: { type: 'object', additionalProperties: false },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' }, login: { type: 'string' } },
+        },
+        usesSlot: 'api-token',
+      },
+    ],
+    identity: { probeActionId: 'whoami', accountKeyPointer: '/id', accountHintPointer: '/login' },
+  }
+}
+
+function staticTokenSpec(slug: string): Record<string, unknown> {
+  return {
+    id: slug,
+    label: 'Demo Static',
+    description: 'static token declarative connector',
+    authMode: 'static-token',
+    auth: {
+      apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+    },
+    originMode: 'fixed-reviewed',
+    credentialPipeline: {
+      nodes: [{ id: 'api-token', authMode: 'static-token', subject: 'user', audience: 'api' }],
+    },
+    actions: [
+      {
+        id: 'whoami',
+        description: 'identity probe',
+        request: { method: 'GET', pathTemplate: '/user' },
+        params: { type: 'object', additionalProperties: false },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' }, login: { type: 'string' } },
+        },
+        usesSlot: 'api-token',
+      },
+    ],
+    identity: { probeActionId: 'whoami', accountKeyPointer: '/id', accountHintPointer: '/login' },
+  }
+}
+
+const oauth2Decision = {
+  audience: {
+    // 三集互斥:authorize(浏览器)/ token(发 client_secret)/ api(发 access_token)。
+    authorizationOrigins: [AUTHZ_ORIGIN],
+    tokenOrigins: [TOKEN_ORIGIN],
+    apiOrigins: [API_ORIGIN],
+    unauthenticatedUploadOrigins: [],
+  },
+  actions: {},
+}
+const staticDecision = {
+  audience: {
+    authorizationOrigins: [],
+    tokenOrigins: [],
+    apiOrigins: [API_ORIGIN],
+    unauthenticatedUploadOrigins: [],
+  },
+  actions: {},
+}
+
+let seq = 0
+async function mkUser(role: 'user' | 'admin' = 'user'): Promise<number> {
+  seq += 1
+  const r = await query<{ id: string }>(
+    `INSERT INTO users(email, password_hash, email_verified, role)
+     VALUES ($1, 'x', TRUE, $2) RETURNING id::text AS id`,
+    [`oauth2-u${seq}-${Date.now()}@t.local`, role],
+  )
+  return Number(r.rows[0]!.id)
+}
+
+/** 建 listing+version 并 securityApprove → 可绑的 versionId。 */
+async function approvedConnector(
+  make: (slug: string) => Record<string, unknown>,
+  decision: unknown,
+  prefix: string,
+): Promise<{ versionId: number; slug: string }> {
+  seq += 1
+  const slug = `${prefix}-${seq}-${Date.now() % 1_000_000}`
+  const spec = make(slug)
+  const author = await mkUser()
+  const reviewer = await mkUser('admin')
+  const raw = JSON.stringify(spec)
+  const specHash = canonicalSha256Hex(spec)
+  await query(
+    'INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind) VALUES ($1,$2,$3)',
+    [slug, author, 'connector'],
+  )
+  const v = await query<{ id: string }>(
+    `INSERT INTO marketplace_skill_versions
+       (slug, version, name, description, raw_artifact, artifact_hash, embedding_hash, submitted_by, status)
+     VALUES ($1,'1.0.0',$2,'d',$3,$4,$4,$5,'pending') RETURNING id::text AS id`,
+    [slug, slug, raw, specHash, author],
+  )
+  const versionId = Number(v.rows[0]!.id)
+  await securityApprove({
+    versionId,
+    reviewerUserId: reviewer,
+    securityDecision: decision,
+    expectedSpecHash: specHash,
+    pool: getPool(),
+  })
+  await markFunctionalVerified(versionId, reviewer, getPool())
+  return { versionId, slug }
+}
+
+async function bearerFor(userId: number): Promise<string> {
+  const { token } = await signAccess({ sub: String(userId), role: 'user' }, JWT_SECRET)
+  return `Bearer ${token}`
+}
+
+/** 从 Set-Cookie 头里取某 cookie 的值。 */
+function cookieValue(headers: Record<string, string | string[] | number>, name: string): string {
+  const raw = headers['Set-Cookie']
+  const lines = Array.isArray(raw) ? raw : [String(raw)]
+  for (const line of lines) {
+    const m = new RegExp(`(?:^|; )${name}=([^;]*)`).exec(line)
+    if (m?.[1]) return decodeURIComponent(m[1])
+  }
+  throw new Error(`cookie ${name} not found in ${JSON.stringify(lines)}`)
+}
+
+let server: TestServer
+let deps: CommercialHttpDeps
+
+before(async () => {
+  pgAvailable = await probePg()
+  if (!pgAvailable) {
+    if (REQUIRE_TEST_DB) throw new Error('Postgres test fixture required')
+    return
+  }
+  await resetPool()
+  setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
+  await query('CREATE SCHEMA IF NOT EXISTS public')
+  await dropAllTables()
+  await runMigrations() // 全量迁移含 0138(pending.provider → slug 形状)
+  server = await startServer()
+  deps = makeDeps(server.port)
+})
+
+after(async () => {
+  if (server) await server.close()
+  if (pgAvailable) {
+    try {
+      await dropAllTables()
+    } catch {
+      /* */
+    }
+    await closePool()
+  }
+})
+
+function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {
+  if (!pgAvailable) {
+    t.skip('pg not available')
+    return true
+  }
+  return false
+}
+
+/** 调 oauth/start,回 { authorizeUrl, state, cookieNonce }。 */
+async function oauthStart(
+  userId: number,
+  versionId: number,
+  slug: string,
+  displayName?: string,
+): Promise<{ authorizeUrl: string; state: string; cookieNonce: string }> {
+  const res = makeRes()
+  await dispatchConnectorsRoute(
+    makeReq({
+      method: 'POST',
+      url: '/api/connectors/declarative/oauth/start',
+      authorization: await bearerFor(userId),
+      body: {
+        versionId,
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        ...(displayName ? { displayName } : {}),
+      },
+    }),
+    res.res,
+    makeCtx(),
+    deps,
+  )
+  assert.equal(res.statusCode, 200)
+  const { authorizeUrl } = JSON.parse(res.body) as { authorizeUrl: string }
+  const state = new URL(authorizeUrl).searchParams.get('state') ?? ''
+  const cookieNonce = cookieValue(res.headers, oauthCookieName(slug))
+  return { authorizeUrl, state, cookieNonce }
+}
+
+/** 调 oauth/callback(浏览器导航),回 302 Location。 */
+async function oauthCallback(opts: {
+  state: string
+  code: string
+  cookie?: string
+}): Promise<string> {
+  const res = makeRes()
+  const url = `/api/connectors/oauth/callback?state=${encodeURIComponent(opts.state)}&code=${encodeURIComponent(opts.code)}`
+  await dispatchConnectorsRoute(
+    makeReq({ method: 'GET', url, ...(opts.cookie ? { cookie: opts.cookie } : {}) }),
+    res.res,
+    makeCtx(),
+    deps,
+  )
+  assert.equal(res.statusCode, 302)
+  return String(res.headers.Location)
+}
+
+async function activeConnectionCount(userId: number): Promise<number> {
+  const r = await query<{ n: string }>(
+    'SELECT count(*)::text AS n FROM connections WHERE user_id = $1 AND revoked_at IS NULL',
+    [userId],
+  )
+  return Number(r.rows[0]!.n)
+}
+
+// ─── 主流程 ─────────────────────────────────────────────────────────────────
+
+describe('oauth2-auth-code · start → callback → bound', () => {
+  test('声明式 catalog 未登录返回 UNAUTHORIZED', async (t) => {
+    if (skipIfNoDb(t)) return
+    const res = makeRes()
+    await assert.rejects(
+      dispatchConnectorsRoute(
+        makeReq({ method: 'GET', url: '/api/connectors/declarative/catalog' }),
+        res.res,
+        makeCtx(),
+        deps,
+      ),
+      (e: unknown) =>
+        e !== null && typeof e === 'object' && (e as { status?: unknown }).status === 401,
+    )
+  })
+
+  test('端到端授权流:authorizeUrl 零 secret → 换 token → 探针 → 落 pin 连接', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'demo-oauth2')
+    const userId = await mkUser()
+    server.requests.length = 0
+
+    // ① start:authorizeUrl 只带公开标识 + state + PKCE challenge。
+    const started = await oauthStart(userId, versionId, slug, '我的 OAuth 连接')
+    const au = new URL(started.authorizeUrl)
+    assert.equal(`${au.protocol}//${au.host}`, 'https://auth.oauth2.test')
+    assert.equal(au.pathname, '/oauth/authorize')
+    assert.equal(au.searchParams.get('response_type'), 'code')
+    assert.equal(au.searchParams.get('client_id'), CLIENT_ID)
+    assert.equal(au.searchParams.get('redirect_uri'), process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI)
+    assert.equal(au.searchParams.get('scope'), 'read:user')
+    assert.equal(au.searchParams.get('code_challenge_method'), 'S256')
+    const challenge = au.searchParams.get('code_challenge') ?? ''
+    assert.ok(challenge.length > 0, 'code_challenge present')
+    assert.ok(started.state.length > 0, 'state present')
+    // **零凭据**:authorize URL 里既无 client_secret,也无 code_verifier(只有单向派生的 challenge)。
+    assert.equal(started.authorizeUrl.includes(CLIENT_SECRET), false)
+    // start 阶段引擎不发任何网络请求(纯组 URL)。
+    assert.equal(server.requests.length, 0)
+
+    // pending 行落库:只存 hash,draft 是密文,provider = slug(0138 放开后合法)。
+    const pending = await query<{
+      provider: string
+      draft_enc: Buffer | null
+      consumed_at: Date | null
+      connector_version_id: string | null
+      spec_hash: Buffer | null
+      exec_contract_hash: Buffer | null
+      auth_contract_version: number | null
+    }>(
+      `SELECT provider, draft_enc, consumed_at,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version
+         FROM connector_oauth_pending WHERE user_id = $1`,
+      [userId],
+    )
+    assert.equal(pending.rowCount, 1)
+    assert.equal(pending.rows[0]!.provider, slug)
+    assert.equal(pending.rows[0]!.consumed_at, null)
+    const pendingMeta = await loadVerifiedContractWithMeta(versionId, getPool())
+    assert.equal(pending.rows[0]!.connector_version_id, String(versionId))
+    assert.equal(pending.rows[0]!.spec_hash?.toString('hex'), pendingMeta.contract.spec_hash)
+    assert.equal(pending.rows[0]!.exec_contract_hash?.toString('hex'), pendingMeta.execContractHash)
+    assert.equal(pending.rows[0]!.auth_contract_version, pendingMeta.authContractVersion)
+    const draftEnc = pending.rows[0]!.draft_enc
+    assert.ok(draftEnc && draftEnc.length > 0, 'draft encrypted')
+    // draft 密文里 grep 不到 client_secret 明文。
+    assert.equal(draftEnc!.toString('latin1').includes(CLIENT_SECRET), false)
+
+    // ② callback:带 state + code + cookie nonce。
+    const location = await oauthCallback({
+      state: started.state,
+      code: 'AUTH-CODE-xyz-123',
+      cookie: `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`,
+    })
+    assert.equal(location, `/?connector_linked=${encodeURIComponent(slug)}`)
+
+    // ③ 上游流量:token 端点(form body 含交换凭据)+ api 探针(只带 Bearer)。
+    const tokenReq = server.requests.find((r) => r.path === '/oauth/token')
+    const probeReq = server.requests.find((r) => r.path === '/user')
+    assert.ok(tokenReq, 'token endpoint called')
+    assert.ok(probeReq, 'identity probe called')
+    assert.equal(tokenReq!.method, 'POST')
+    const form = new URLSearchParams(tokenReq!.body)
+    assert.equal(form.get('grant_type'), 'authorization_code')
+    assert.equal(form.get('code'), 'AUTH-CODE-xyz-123')
+    assert.equal(form.get('client_id'), CLIENT_ID)
+    assert.equal(form.get('client_secret'), CLIENT_SECRET) // 交换凭据只在这里
+    assert.equal(form.get('redirect_uri'), process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI)
+    const verifier = form.get('code_verifier') ?? ''
+    assert.ok(verifier.length >= 43, 'code_verifier sent to token origin')
+    // PKCE 对账:发到 token origin 的 verifier 正是 authorize URL 里 challenge 的原像。
+    const { createHash } = await import('node:crypto')
+    assert.equal(createHash('sha256').update(verifier, 'ascii').digest('base64url'), challenge)
+
+    // **受众隔离**:探针(api origin)只带换回的 access_token,body 里没有任何 client 凭据。
+    assert.equal(probeReq!.authorization, `Bearer ${ACCESS_TOKEN}`)
+    assert.equal(probeReq!.body.includes(CLIENT_SECRET), false)
+    assert.equal(probeReq!.body, '')
+    // token 请求没带 Bearer(client 凭据走 form,不是 API token)。
+    assert.equal(tokenReq!.authorization, undefined)
+
+    // ④ 连接落库:四个 pin + accountKey/accountHint + 密文。
+    const conn = await query<{
+      id: string
+      provider: string
+      display_name: string
+      account_key: string
+      connector_version_id: string | null
+      spec_hash: Buffer | null
+      exec_contract_hash: Buffer | null
+      auth_contract_version: number | null
+      secret_enc: Buffer | null
+      meta: Record<string, unknown>
+    }>(
+      `SELECT id::text AS id, provider, display_name, account_key,
+              connector_version_id::text AS connector_version_id, spec_hash, exec_contract_hash,
+              auth_contract_version, secret_enc, meta
+         FROM connections WHERE user_id = $1 AND revoked_at IS NULL`,
+      [userId],
+    )
+    assert.equal(conn.rowCount, 1)
+    const row = conn.rows[0]!
+    assert.equal(row.provider, slug)
+    assert.equal(row.display_name, '我的 OAuth 连接')
+    assert.equal(row.connector_version_id, String(versionId))
+    assert.equal(row.account_key, computeAccountKey(`${slug}:U-99887`))
+    assert.equal(row.meta.account_hint, 'octocat')
+    const meta = await loadVerifiedContractWithMeta(versionId, getPool())
+    assert.equal(row.spec_hash?.toString('hex'), meta.contract.spec_hash)
+    assert.equal(row.exec_contract_hash?.toString('hex'), meta.execContractHash)
+    assert.equal(row.auth_contract_version, meta.authContractVersion)
+
+    // **密文里 grep 不到 client_secret / access_token 明文**。
+    const cipher = row.secret_enc!.toString('latin1')
+    assert.equal(cipher.includes(CLIENT_SECRET), false)
+    assert.equal(cipher.includes(ACCESS_TOKEN), false)
+    assert.equal(cipher.includes(REFRESH_TOKEN), false)
+
+    // 解密后的袋 == storedBagSources 形状(含 refresh_token,上游给了)。
+    const declRow = await getDeclarativeConnection(row.id, userId, getPool())
+    assert.ok(declRow)
+    const bag = decryptBagFromRow(declRow!, meta.contract)
+    assert.deepEqual(bag, {
+      access_token: ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: REFRESH_TOKEN,
+    })
+
+    // pending 行已消费:draft 密文销毁。
+    const after = await query<{ consumed_at: Date | null; draft_enc: Buffer | null }>(
+      'SELECT consumed_at, draft_enc FROM connector_oauth_pending WHERE user_id = $1',
+      [userId],
+    )
+    assert.notEqual(after.rows[0]!.consumed_at, null)
+    assert.equal(after.rows[0]!.draft_enc, null)
+  })
+})
+
+// ─── 对抗 ───────────────────────────────────────────────────────────────────
+
+describe('oauth2-auth-code · 对抗', () => {
+  test('pending 契约 pin 被篡改 → 回调 fail-closed，零 token 请求/零绑定', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'pin-drift')
+    const userId = await mkUser()
+    const started = await oauthStart(userId, versionId, slug)
+    server.requests.length = 0
+    await query(
+      `UPDATE connector_oauth_pending
+          SET exec_contract_hash = decode(repeat('00', 32), 'hex')
+        WHERE user_id = $1`,
+      [userId],
+    )
+    const location = await oauthCallback({
+      state: started.state,
+      code: 'code-pin-drift',
+      cookie: `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`,
+    })
+    assert.equal(location, '/?connector_error=RELINK_REQUIRED')
+    assert.equal(server.requests.length, 0)
+    assert.equal(await activeConnectionCount(userId), 0)
+  })
+
+  test('重放同一 state(第二次回调)→ 失败且不重复绑定', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'replay')
+    const userId = await mkUser()
+    const started = await oauthStart(userId, versionId, slug)
+    const cookie = `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`
+
+    const first = await oauthCallback({ state: started.state, code: 'code-1', cookie })
+    assert.equal(first, `/?connector_linked=${encodeURIComponent(slug)}`)
+    assert.equal(await activeConnectionCount(userId), 1)
+
+    // 重放:state 已消费 → STATE_MISMATCH,连接数不变(不重复绑定)。
+    const replayed = await oauthCallback({ state: started.state, code: 'code-1', cookie })
+    assert.equal(replayed, '/?connector_error=STATE_MISMATCH')
+    assert.equal(await activeConnectionCount(userId), 1)
+  })
+
+  test('cookie nonce 不匹配 → 失败,不落连接', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, 'badnonce')
+    const userId = await mkUser()
+    const started = await oauthStart(userId, versionId, slug)
+
+    const location = await oauthCallback({
+      state: started.state,
+      code: 'code-2',
+      cookie: `${oauthCookieName(slug)}=attacker-guessed-nonce`,
+    })
+    assert.equal(location, '/?connector_error=STATE_MISMATCH')
+    assert.equal(await activeConnectionCount(userId), 0)
+
+    // 缺 cookie(纯 CSRF:攻击者只有 state)→ 同样拒。
+    const noCookie = await oauthCallback({ state: started.state, code: 'code-2' })
+    assert.equal(noCookie, '/?connector_error=STATE_MISMATCH')
+    assert.equal(await activeConnectionCount(userId), 0)
+  })
+
+  test('非 oauth2 契约的 versionId 调 oauth/start → BAD_REQUEST', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(staticTokenSpec, staticDecision, 'static')
+    const userId = await mkUser()
+    await assert.rejects(
+      oauthStart(userId, versionId, slug),
+      (e: unknown) => e instanceof HttpError && e.status === 400 && e.code === 'BAD_REQUEST',
+    )
+    // 没落 pending,没落连接。
+    const pending = await query('SELECT 1 FROM connector_oauth_pending WHERE user_id = $1', [
+      userId,
+    ])
+    assert.equal(pending.rowCount, 0)
+    assert.equal(await activeConnectionCount(userId), 0)
+  })
+
+  test('oauth2 契约走直填 bind → BAD_REQUEST(直绑禁止,必须走授权流)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId } = await approvedConnector(oauth2Spec, oauth2Decision, 'directbind')
+    const userId = await mkUser()
+    await assert.rejects(
+      bindDeclarativeConnector(
+        {
+          userId,
+          connectorVersionId: versionId,
+          // 攻击者即便手里有一个 access_token,也无法经直填路径落库。
+          secrets: {
+            access_token: ACCESS_TOKEN,
+            client_id: CLIENT_ID,
+            client_secret: CLIENT_SECRET,
+          },
+          deps: { resolver: okResolver(), fetchImpl: localFetch(server.port) },
+        },
+        getPool(),
+      ),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal(await activeConnectionCount(userId), 0)
+  })
+})
+
+// ─── refresh 轮换(access_token 过期 → 自动续期,用户无感) ─────────────────────
+//
+// 判过期的权威 = 连接 meta.token_expires_at(bind 时由上游 expires_in 换算)。skew=60s ⇒ 让
+// token 端点回 `expires_in: 1` 就等价于"这条连接的 token 立刻算过期",无需 sleep。
+// refresh 端点与 token 端点是**不同 path**(/oauth/refresh vs /oauth/token)⇒ 能精确数出
+// "到底续了几次"—— 并发只续一次的断言全靠这个。
+
+/** platform 供给模式变体(client 凭据留平台表,袋里结构上没有)。 */
+function platformOauth2Spec(slug: string): Record<string, unknown> {
+  const s = oauth2Spec(slug)
+  ;(s.auth as Record<string, unknown>).clientProvisioning = 'platform'
+  return s
+}
+
+function engineDeps(): EngineHttpDeps {
+  return { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+}
+
+/** 重置上游脚本 + 清空请求记录(每个用例开头调)。 */
+function resetUpstream(patch: Partial<UpstreamCfg> = {}): void {
+  upstream = { ...DEFAULT_UPSTREAM, ...patch }
+  server.requests.length = 0
+}
+
+function countPath(p: string): number {
+  return server.requests.filter((r) => r.path === p).length
+}
+
+/** 走完整授权流绑一条 byoa oauth2 连接(上游行为由当前 upstream 脚本决定)。 */
+async function bindViaOauth(
+  prefix: string,
+): Promise<{ userId: number; connectionId: string; versionId: number }> {
+  const { versionId, slug } = await approvedConnector(oauth2Spec, oauth2Decision, prefix)
+  const userId = await mkUser()
+  const started = await oauthStart(userId, versionId, slug)
+  const loc = await oauthCallback({
+    state: started.state,
+    code: `code-${prefix}`,
+    cookie: `${oauthCookieName(slug)}=${encodeURIComponent(started.cookieNonce)}`,
+  })
+  assert.equal(loc, `/?connector_linked=${encodeURIComponent(slug)}`)
+  const r = await query<{ id: string }>(
+    'SELECT id::text AS id FROM connections WHERE user_id = $1 AND revoked_at IS NULL',
+    [userId],
+  )
+  assert.equal(r.rowCount, 1)
+  return { userId, connectionId: r.rows[0]!.id, versionId }
+}
+
+async function whoami(connectionId: string, userId: number): Promise<unknown> {
+  return executeDeclarativeAction(
+    { connectionId, userId, actionId: 'whoami', params: {}, deps: engineDeps() },
+    getPool(),
+  )
+}
+
+/** 解密某连接当前的落库袋 + meta(断言"袋真的换了/真的没换"用)。 */
+async function readBag(
+  connectionId: string,
+  userId: number,
+  versionId: number,
+): Promise<{ bag: Record<string, string>; meta: Record<string, unknown>; cipher: string }> {
+  const meta = await loadVerifiedContractWithMeta(versionId, getPool())
+  const row = await getDeclarativeConnection(connectionId, userId, getPool())
+  assert.ok(row)
+  return {
+    bag: decryptBagFromRow(row!, meta.contract),
+    meta: row!.meta,
+    cipher: row!.secret_enc!.toString('latin1'),
+  }
+}
+
+describe('oauth2-auth-code · refresh 轮换', () => {
+  test('过期 → 自动 refresh:打 refresh 端点、用新 token 打 API、新袋落库、meta 前推', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 }) // 1s 有效期 → 减 60s skew ⇒ 立刻判"将过期"
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-auto')
+    const boundExpiry = (await readBag(connectionId, userId, versionId)).meta[META_TOKEN_EXPIRES_AT]
+    assert.equal(typeof boundExpiry, 'string') // bind 就写了过期时刻
+
+    server.requests.length = 0
+    const result = await whoami(connectionId, userId)
+    // ① 结果正常(用户完全无感:没有 401、没有重新授权)。
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+
+    // ② refresh 端点被打了恰好一次,body 是 RFC 6749 §6 形状 + 用**旧** refresh_token 去换。
+    assert.equal(countPath('/oauth/refresh'), 1)
+    const rr = server.requests.find((r) => r.path === '/oauth/refresh')!
+    assert.equal(rr.method, 'POST')
+    const form = new URLSearchParams(rr.body)
+    assert.equal(form.get('grant_type'), 'refresh_token')
+    assert.equal(form.get('refresh_token'), REFRESH_TOKEN)
+    assert.equal(form.get('client_id'), CLIENT_ID)
+    assert.equal(form.get('client_secret'), CLIENT_SECRET)
+    // 授权码交换端点没被重打(续期不是重新授权)。
+    assert.equal(countPath('/oauth/token'), 0)
+
+    // ③ API 请求带的是**新** access_token(不是袋里那个旧的)。
+    const probe = server.requests.find((r) => r.path === '/user')!
+    assert.equal(probe.authorization, `Bearer ${NEW_ACCESS_TOKEN}`)
+    // 受众隔离照旧:api origin 的请求里没有任何 client 凭据 / refresh_token。
+    assert.equal(probe.body.includes(CLIENT_SECRET), false)
+    assert.equal(probe.body.includes(REFRESH_TOKEN), false)
+
+    // ④ 新袋落库(**轮换**:refresh_token 换成新的,旧的从袋里消失)。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: NEW_REFRESH_TOKEN,
+    })
+    // 仍是密文:明文 grep 不到任何 token/secret。
+    for (const s of [
+      NEW_ACCESS_TOKEN,
+      NEW_REFRESH_TOKEN,
+      ACCESS_TOKEN,
+      REFRESH_TOKEN,
+      CLIENT_SECRET,
+    ])
+      assert.equal(after.cipher.includes(s), false)
+
+    // ⑤ meta.token_expires_at 前推(新的 3600s);account_hint **没被覆盖掉**(增量合并,非整块覆盖)。
+    const newExpiry = after.meta[META_TOKEN_EXPIRES_AT]
+    assert.equal(typeof newExpiry, 'string')
+    assert.ok(Date.parse(newExpiry as string) > Date.now() + 3000, 'expiry pushed forward')
+    assert.notEqual(newExpiry, boundExpiry)
+    assert.equal(after.meta.account_hint, 'octocat')
+  })
+
+  test('不轮换(上游不回新 refresh_token)→ 旧 refresh_token 原样留在袋里', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1, refreshRefreshToken: null })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-norotate')
+
+    server.requests.length = 0
+    await whoami(connectionId, userId)
+    assert.equal(countPath('/oauth/refresh'), 1)
+
+    const after = await readBag(connectionId, userId, versionId)
+    // access_token 换新;refresh_token 保持旧的(上游没发新的 ⇒ 旧的仍然有效)。
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: REFRESH_TOKEN,
+    })
+  })
+
+  test('未过期 → **不打** refresh 端点(零额外开销)', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 3600 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-fresh')
+
+    server.requests.length = 0
+    await whoami(connectionId, userId)
+    assert.equal(countPath('/oauth/refresh'), 0)
+    // 用的还是袋里那个 access_token。
+    assert.equal(
+      server.requests.find((r) => r.path === '/user')!.authorization,
+      `Bearer ${ACCESS_TOKEN}`,
+    )
+    // 袋原封不动。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.equal(after.bag.access_token, ACCESS_TOKEN)
+    assert.equal(after.bag.refresh_token, REFRESH_TOKEN)
+  })
+
+  test('GitHub 情形(无 expires_in、无 refresh_token)→ 永不过期,**不打** refresh', async (t) => {
+    if (skipIfNoDb(t)) return
+    // GitHub OAuth App 默认:access_token 长期有效、不下发 refresh_token、不回 expires_in。
+    resetUpstream({ tokenExpiresIn: null, tokenRefreshToken: null })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-github')
+
+    const bound = await readBag(connectionId, userId, versionId)
+    // 袋里结构上没有 refresh_token;meta 里没有过期时刻(= 永不过期)。
+    assert.deepEqual(bound.bag, {
+      access_token: ACCESS_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    })
+    assert.equal(bound.meta[META_TOKEN_EXPIRES_AT], undefined)
+
+    server.requests.length = 0
+    const result = await whoami(connectionId, userId)
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+    // 没有过期时刻 ⇒ 引擎绝不会去 refresh(那类 provider 连 refresh 端点都没有)。
+    assert.equal(countPath('/oauth/refresh'), 0)
+    assert.equal(
+      server.requests.find((r) => r.path === '/user')!.authorization,
+      `Bearer ${ACCESS_TOKEN}`,
+    )
+  })
+
+  test('refresh 失败(上游 400)→ RELINK_REQUIRED,且**袋没被写坏**(事务回滚)', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-fail')
+    const before = await readBag(connectionId, userId, versionId)
+
+    // refresh_token 被上游吊销 → 400 invalid_grant。
+    resetUpstream({ tokenExpiresIn: 1, refreshStatus: 400 })
+    await assert.rejects(
+      whoami(connectionId, userId),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'RELINK_REQUIRED',
+    )
+    assert.equal(countPath('/oauth/refresh'), 1)
+    // API 请求根本没发出(续期失败 → 绝不拿坏 token 去打上游)。
+    assert.equal(countPath('/user'), 0)
+
+    // **袋原封不动**:仍是旧 token,meta 的过期时刻也没动 —— 事务回滚了,没留下半吊子状态。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, before.bag)
+    assert.equal(after.meta[META_TOKEN_EXPIRES_AT], before.meta[META_TOKEN_EXPIRES_AT])
+  })
+
+  test('上游回**带控制符**的 access_token → 写袋前挡下,袋没被写坏', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-crlf')
+    const before = await readBag(connectionId, userId, versionId)
+
+    // 换回的 token 是**不可信输入**。含 CRLF 的 token 一旦落袋:注入层每次都硬拒(连接实质死掉),
+    // 且解密期形状复校验也会炸 —— 必须在写袋前挡下,让事务回滚保住旧袋。
+    resetUpstream({ tokenExpiresIn: 1, refreshAccessToken: 'AT-EVIL\r\nX-Injected: 1' })
+    await assert.rejects(
+      whoami(connectionId, userId),
+      (e: unknown) => e instanceof ConnectorError && e.code === 'BAD_REQUEST',
+    )
+    assert.equal(countPath('/user'), 0) // 坏 token 一次都没被拿去打上游
+
+    const after = await readBag(connectionId, userId, versionId)
+    assert.deepEqual(after.bag, before.bag) // 袋原封不动(旧 token 仍可用)
+    assert.equal(after.meta[META_TOKEN_EXPIRES_AT], before.meta[META_TOKEN_EXPIRES_AT])
+  })
+
+  test('**并发**:两个请求同时命中过期 → 行锁串行化,只 refresh 一次,两者都拿到有效 token', async (t) => {
+    if (skipIfNoDb(t)) return
+    resetUpstream({ tokenExpiresIn: 1 })
+    const { userId, connectionId, versionId } = await bindViaOauth('refresh-race')
+
+    server.requests.length = 0
+    const [a, b] = await Promise.all([whoami(connectionId, userId), whoami(connectionId, userId)])
+    assert.deepEqual(a, { id: 'U-99887', login: 'octocat' })
+    assert.deepEqual(b, { id: 'U-99887', login: 'octocat' })
+
+    // **核心断言**:refresh 端点只被打了一次。后到的那个请求在 FOR UPDATE 上排队,拿到锁后重查
+    // meta 发现已经不过期了 → 直接用前者续好的 token,不再打上游。若网络调用在锁外,这里会是 2 ——
+    // 而对轮换型 provider,那第二次会拿着**已失效的旧 refresh_token** 去换 → 用户被无辜踢去重新授权。
+    assert.equal(countPath('/oauth/refresh'), 1)
+
+    // 两个 API 请求都带着**同一个新** access_token。
+    const probes = server.requests.filter((r) => r.path === '/user')
+    assert.equal(probes.length, 2)
+    for (const p of probes) assert.equal(p.authorization, `Bearer ${NEW_ACCESS_TOKEN}`)
+
+    // 袋里是这一次轮换的结果(不是两次连续轮换)。
+    const after = await readBag(connectionId, userId, versionId)
+    assert.equal(after.bag.access_token, NEW_ACCESS_TOKEN)
+    assert.equal(after.bag.refresh_token, NEW_REFRESH_TOKEN)
+  })
+
+  test('platform 模式 refresh:client 凭据取自**平台表**(用户袋里结构上没有)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId, slug } = await approvedConnector(
+      platformOauth2Spec,
+      oauth2Decision,
+      'refresh-plat',
+    )
+    await upsertPlatformOauthApp(
+      { slug, clientId: PLATFORM_CLIENT_ID, clientSecret: PLATFORM_CLIENT_SECRET },
+      getPool(),
+    )
+    const userId = await mkUser()
+    resetUpstream({ tokenExpiresIn: 1 })
+
+    // platform 袋 = access_token (+refresh_token),**无 client 凭据**;tokenExpiresAt 走 bind 的 meta 通路。
+    const contractMeta = await loadVerifiedContractWithMeta(versionId, getPool())
+    const bound = await bindWithBag(
+      {
+        userId,
+        meta: contractMeta,
+        bag: { access_token: ACCESS_TOKEN, refresh_token: REFRESH_TOKEN },
+        tokenExpiresAt: new Date(Date.now() + 1000), // 1s ⇒ 立刻判"将过期"
+        deps: engineDeps(),
+      },
+      getPool(),
+    )
+
+    server.requests.length = 0
+    const result = await whoami(bound.connectionId, userId)
+    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
+
+    // 续期用的 client 凭据来自平台表 —— 袋里根本没有它们,只能从 connector_platform_oauth_apps 取。
+    assert.equal(countPath('/oauth/refresh'), 1)
+    const form = new URLSearchParams(server.requests.find((r) => r.path === '/oauth/refresh')!.body)
+    assert.equal(form.get('client_id'), PLATFORM_CLIENT_ID)
+    assert.equal(form.get('client_secret'), PLATFORM_CLIENT_SECRET)
+    assert.equal(form.get('refresh_token'), REFRESH_TOKEN)
+
+    // 新袋仍是 platform 形状:**平台 secret 没有被顺手写进用户袋**(泄露面不按用户数放大)。
+    const after = await readBag(bound.connectionId, userId, versionId)
+    assert.deepEqual(after.bag, {
+      access_token: NEW_ACCESS_TOKEN,
+      refresh_token: NEW_REFRESH_TOKEN,
+    })
+    assert.equal(after.cipher.includes(PLATFORM_CLIENT_SECRET), false)
+  })
+})

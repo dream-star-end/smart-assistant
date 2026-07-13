@@ -20,6 +20,7 @@ import { fetch as undiciFetch } from 'undici'
 import { directEgressDispatcher } from '../../account-pool/egressDispatcher.js'
 import { ConnectorError } from '../errors.js'
 import { TOTAL_TIMEOUT_MS, assertFixedDomainUrl } from '../outboundPolicy.js'
+import { pkceChallengeS256 } from '../pkce.js'
 import {
   type ConnectionRow,
   type FeishuSecret,
@@ -156,16 +157,9 @@ async function feishuJson(
   return (await readBoundedJson(res, MAX_UPSTREAM_JSON_BYTES, 'feishu')) as Record<string, unknown>
 }
 
-// ─── PKCE ────────────────────────────────────────────────────────────────
-
-export function generatePkceVerifier(): string {
-  return randomBytes(48).toString('base64url') // 64 chars ∈ [43,128]
-}
-
-export async function pkceChallengeS256(verifier: string): Promise<string> {
-  const { createHash } = await import('node:crypto')
-  return createHash('sha256').update(verifier, 'ascii').digest('base64url')
-}
+// ─── authorize ───────────────────────────────────────────────────────────
+// PKCE 助手(generatePkceVerifier / pkceChallengeS256)已上移 connectors/pkce.ts
+// (通用,非 feishu 专属;声明式 oauth2 引擎同用),此处只消费。
 
 /** 组 authorize URL(浏览器跳转)。 */
 export async function buildFeishuAuthorizeUrl(opts: {

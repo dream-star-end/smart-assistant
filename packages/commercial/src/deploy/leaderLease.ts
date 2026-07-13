@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Pool, PoolClient } from "pg";
 import type { DesiredWatch, Slot } from "./deployState.js";
+import { LeaderBundleRollbackIncompleteError } from "./leaderBundle.js";
 
 const LEASE_ADVISORY_KEY = "oc_leader_lease_v5";
 
@@ -198,6 +199,9 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
   let heldEpoch: number | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let recompeteTimer: ReturnType<typeof setTimeout> | null = null;
+  // shutdown 必须等待“已安装 lease、onAcquire 仍在启动 bundle”的窗口收敛，再 drain 后交权。
+  // 仅看 state=leader 会在 acquiring 窗口直接 unlock，造成后继与旧 bundle 双跑。
+  let acquisitionInFlight: Promise<void> | null = null;
   // 串行化 compete/stepDown,避免 heartbeat 与 desired-change 并发触发两条让位路径。
   let transitioning = false;
   let unsubDesired: (() => void) | null = null;
@@ -234,6 +238,21 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
 
   // ── 竞争 + 安装 ────────────────────────────────────────────────────────────
   async function compete(): Promise<void> {
+    if (acquisitionInFlight) return acquisitionInFlight;
+    let finish!: () => void;
+    const marker = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    acquisitionInFlight = marker;
+    try {
+      await competeOnce();
+    } finally {
+      if (acquisitionInFlight === marker) acquisitionInFlight = null;
+      finish();
+    }
+  }
+
+  async function competeOnce(): Promise<void> {
     if (stopped || leaseClient || transitioning) return;
     if (!opts.eligibleEnv) {
       setState("ineligible");
@@ -290,6 +309,18 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
         try {
           await Promise.resolve(opts.callbacks.onAcquire());
         } catch (err) {
+          // required start 失败后的 bundle 回滚若仍有 stuck mutator，绝不能先 unlock；保持
+          // advisory 到 fail-stop 退进程，由后继凭 PID liveness 接管，避免双跑。
+          if (err instanceof LeaderBundleRollbackIncompleteError) {
+            log.error("[leaderLease] onAcquire 回滚未停净 → 保持 lease + fail-stop", {
+              failedMember: err.failedMember,
+              stuck: err.stuck,
+            });
+            clearHeartbeat();
+            setState("fenced");
+            failStop(`onAcquire rollback incomplete: stuck=[${err.stuck.join(",")}]`, err);
+            return;
+          }
           log.error("[leaderLease] onAcquire(bundle start)失败 → 释放 lease + fail-stop", err);
           leaseClient = null;
           heldEpoch = null;
@@ -718,14 +749,13 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
         clearTimeout(recompeteTimer);
         recompeteTimer = null;
       }
-      if (state === "leader" && leaseClient) {
-        // graceful:drain + 写本 epoch ACK + unlock(新 holder 零等待接管)。
+      // 如果 lease 已安装而 onAcquire 仍在跑，先等它落定。competeOnce 看到 stopped 后不会
+      // 进入 leader；随后本路径统一 drain + ACK + unlock，绝不从 acquiring 直接放锁。
+      const acquiring = acquisitionInFlight;
+      if (acquiring) await acquiring;
+      if (leaseClient) {
+        // graceful:无论当前 state 是 leader 还是刚结束 acquiring，都先 drain，再 ACK/unlock。
         await stepDown("shutdown", { writeAck: true });
-      } else if (leaseClient) {
-        const c = leaseClient;
-        leaseClient = null;
-        clearHeartbeat();
-        await unlockAndRelease(c);
       } else {
         clearHeartbeat();
       }

@@ -65,11 +65,33 @@ export interface LeaderBundleOptions {
   onError?: (ctx: string, err: unknown) => void;
   logger?: { info: (m: string) => void; warn: (m: string, meta?: unknown) => void };
   now?: () => number;
+  /** required start 失败后的回滚总预算；生产默认与正常 drain 相同，测试可缩短。 */
+  startupRollbackMs?: number;
 }
 
 type BundleState = "idle" | "starting" | "running" | "stopping";
 
 const DEFAULT_DRAIN_MS = 30_000;
+
+/**
+ * required member 启动失败且已启动成员未能在预算内停净。
+ * lease controller 必须识别此错误并保持 advisory lock，直接 fail-stop；绝不能先 unlock。
+ */
+export class LeaderBundleRollbackIncompleteError extends Error {
+  readonly code = "OC_LEADER_BUNDLE_ROLLBACK_INCOMPLETE";
+
+  constructor(
+    readonly failedMember: string,
+    readonly stuck: string[],
+    options?: ErrorOptions,
+  ) {
+    super(
+      `[leaderBundle] required member ${failedMember} start failed and rollback incomplete: stuck=[${stuck.join(",")}]`,
+      options,
+    );
+    this.name = "LeaderBundleRollbackIncompleteError";
+  }
+}
 
 export function createLeaderBundle(opts: LeaderBundleOptions = {}): LeaderBundle {
   const now = opts.now ?? (() => Date.now());
@@ -131,8 +153,12 @@ export function createLeaderBundle(opts: LeaderBundleOptions = {}): LeaderBundle
           // 让 leaseController step-down + fail-stop(systemd 拉起后以 standby 重来)。
           opts.onError?.(`bundle.start:${spec.name}`, err);
           log.warn(`[leaderBundle] required member start FAILED, rolling back bundle: ${spec.name}`, err);
-          await rollbackStarted();
-          state = "idle";
+          const rollback = await doStop(opts.startupRollbackMs ?? DEFAULT_DRAIN_MS);
+          if (!rollback.drained) {
+            throw new LeaderBundleRollbackIncompleteError(spec.name, rollback.stuck, {
+              cause: err,
+            });
+          }
           throw err instanceof Error
             ? err
             : new Error(`[leaderBundle] required member start failed: ${spec.name}`);
@@ -145,16 +171,6 @@ export function createLeaderBundle(opts: LeaderBundleOptions = {}): LeaderBundle
     if ((state as BundleState) !== "stopping") {
       state = "running";
       log.info(`[leaderBundle] started members=[${[...running.keys()].join(",")}]`);
-    }
-  }
-
-  /** required 成员起不来 → 回滚:停掉已成功启动的全部成员并摘除。 */
-  async function rollbackStarted(): Promise<void> {
-    for (const name of [...running.keys()]) {
-      const handle = running.get(name);
-      running.delete(name);
-      if (handle) await stopMember(name, handle);
-      opts.onMemberStopped?.(name);
     }
   }
 

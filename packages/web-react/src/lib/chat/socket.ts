@@ -77,6 +77,7 @@ import type {
   ContextRebuiltWire,
   CostChargedWire,
   CostWaivedWire,
+  IncidentWire,
   InboundMessage,
   LegacyBridgeErrorWire,
   OutboundErrorWire,
@@ -89,6 +90,7 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
 } from "./frames";
+import { incidentStore } from "../incidentStore";
 import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 export type { ChatStatusClass };
@@ -1160,6 +1162,12 @@ export class ChatSocket {
         // 全部防无限刷新守卫(形态/目标一次性/冷却/安全点/storage)在 appUpdate governor
         // 内收口,这里只透传,不允许出现第二套判断。
         appUpdate.onServerBuild((f as { build?: unknown }).build);
+        return;
+      }
+      case "sys.incident": {
+        // 自愈事故推送(open/resolved)。写入 incidentStore(按 incidentId 只接受更高 rev,
+        // 旧 rev 丢弃);横幅/恢复 toast 的渲染权威在 store,socket 层不维护 UI 态。
+        incidentStore.ingest(f as IncidentWire);
         return;
       }
       case "sys.context_rebuilt": {

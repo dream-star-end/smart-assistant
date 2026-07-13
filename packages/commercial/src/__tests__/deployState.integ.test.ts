@@ -19,6 +19,33 @@ import { Pool } from "pg";
 import { casDeployState, readDeployState, startDesiredWatch } from "../deploy/deployState.js";
 import type { DesiredSnapshot } from "../deploy/deployState.js";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function rawRow(desiredControlSlot: "A" | "B", lockVersion: number) {
+  return {
+    generation: "1",
+    phase: "stable" as const,
+    active_slot: "A" as const,
+    candidate_slot: null,
+    active_release: "bootstrap",
+    candidate_release: null,
+    previous_active_release: null,
+    desired_leader_slot: "A" as const,
+    desired_control_slot: desiredControlSlot,
+    cohort_percent: 0,
+    cohort_salt: "",
+    cohort_allowlist: [],
+    lock_version: String(lockVersion),
+    transition_step: 0,
+    operation_id: null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
@@ -161,6 +188,32 @@ describe("deployState readDeployState / casDeployState", () => {
 });
 
 describe("deployState startDesiredWatch", () => {
+  test("interval 慢读与 refreshNow 串行，旧快照不能迟到覆盖新快照", async () => {
+    const first = deferred<{ rowCount: number; rows: ReturnType<typeof rawRow>[] }>();
+    let queries = 0;
+    const fakePool = {
+      query: () => {
+        queries += 1;
+        if (queries === 1) return first.promise;
+        return Promise.resolve({ rowCount: 1, rows: [rawRow("B", 2)] });
+      },
+    } as unknown as Pool;
+    const watch = startDesiredWatch({ pool: fakePool, intervalMs: 60_000 });
+    try {
+      await new Promise((r) => setImmediate(r));
+      assert.equal(queries, 1, "首轮慢读已发出");
+      const refreshed = watch.refreshNow();
+      await new Promise((r) => setImmediate(r));
+      assert.equal(queries, 1, "refreshNow 必须排在首轮之后，不能并发查询");
+      first.resolve({ rowCount: 1, rows: [rawRow("A", 1)] });
+      const next = await refreshed;
+      assert.equal(next.desiredControlSlot, "B");
+      assert.equal(watch.current()?.desiredControlSlot, "B", "最终缓存保持新快照，不被旧读反向覆盖");
+    } finally {
+      watch.stop();
+    }
+  });
+
   maybe("desired_control_slot 变更后 refreshNow 立即反映 + onChange 恰一次", async () => {
     const watch = startDesiredWatch({ pool, intervalMs: 50 });
     try {

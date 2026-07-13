@@ -64,6 +64,13 @@ export const ADMIN_AUDIT_ACTIONS = {
   "alert_rule.ack": { kind: "write", mode: "tx" },
   "alert_outbox.retry": { kind: "write", mode: "best-effort" },
 
+  // ── 自愈体系(v5 selfheal)—— 全部 tx fail-closed(运维处置必须留痕)─
+  "incident.resolve": { kind: "write", mode: "tx" },
+  // 收尾批 H1b:解除 condition 压制(误压回滚;target=condition:<key>)。
+  "condition.unsuppress": { kind: "write", mode: "tx" },
+  // 收尾批 §B:一键放行 pending_release 的 Tier2 修复部署(target=repair:<id>)。
+  "repair.release": { kind: "write", mode: "tx" },
+
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },
@@ -107,6 +114,13 @@ export const ADMIN_AUDIT_ACTIONS = {
   "marketplace.skill.review_batch": { kind: "write", mode: "best-effort" },
   "marketplace.skill.revoke": { kind: "write", mode: "best-effort" },
   "marketplace.skill.featured": { kind: "write", mode: "best-effort" },
+
+  // ── 连接器平台 OAuth App(平台自有 client 凭据 provisioning)────────
+  // 这是 clientProvisioning='platform' 的**信任闸**:有没有这一行,决定用户能不能用平台
+  // 身份一键授权某个连接器。等同 literature_config.secret 的分量(平台级密钥写入)→ 强制
+  // tx fail-closed:审计写不下,provision/删除一律不许成功(单语句业务,包 tx 无成本)。
+  "connector_platform_oauth.put": { kind: "write", mode: "tx" },
+  "connector_platform_oauth.delete": { kind: "write", mode: "tx" },
 
   // ── 敏感读取────────────────────────────────────────────────────────
   // sessions.read 有意 fail-closed(直接 await writeAdminAudit,失败 → 500):

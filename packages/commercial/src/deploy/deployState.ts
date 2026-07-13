@@ -263,13 +263,16 @@ export function startDesiredWatch(opts: DesiredWatchOptions): DesiredWatch {
   let snap: DesiredSnapshot | null = null;
   let stopped = false;
   let timer: ReturnType<typeof setInterval> | null = null;
+  // interval poll 与关键路径 refreshNow 共用单飞链。否则较早发出的慢查询可能在较新的
+  // refreshNow 之后返回，用旧 deploy_state 快照反向覆盖缓存并触发错误交接。
+  let pollChain: Promise<void> = Promise.resolve();
   const subs = new Set<(s: DesiredSnapshot) => void>();
   let readyResolve: ((s: DesiredSnapshot) => void) | null = null;
   const ready = new Promise<DesiredSnapshot>((res) => {
     readyResolve = res;
   });
 
-  async function pollOnce(): Promise<DesiredSnapshot> {
+  async function readAndPublish(): Promise<DesiredSnapshot> {
     const row = await readDeployState(opts.pool);
     const next = toSnapshot(row);
     const changed = !snapshotEq(snap, next);
@@ -288,6 +291,15 @@ export function startDesiredWatch(opts: DesiredWatchOptions): DesiredWatch {
       }
     }
     return next;
+  }
+
+  function pollOnce(): Promise<DesiredSnapshot> {
+    const run = pollChain.then(readAndPublish, readAndPublish);
+    pollChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   function scheduleTick(): void {

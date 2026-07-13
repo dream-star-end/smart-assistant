@@ -79,6 +79,25 @@ import {
   handleAdminTraceLookup,
 } from './admin/audit.js'
 import {
+  handleAdminDeletePlatformOauthApp,
+  handleAdminListPlatformOauthApps,
+  handleAdminPutPlatformOauthApp,
+} from './admin/connectorPlatformOauth.js'
+import {
+  handleAdminListIncidents,
+  handleAdminGetIncident,
+  handleAdminResolveIncident,
+  handleAdminListSelfhealConditions,
+  handleAdminUnsuppressCondition,
+  handleAdminReleaseRepair,
+  handleAdminGetSelfhealUserNotices,
+} from './admin/selfheal.js'
+// 切片②ⓐ:codex 修复回调端点(/internal/v5/repairs/*,capability/webhook HMAC 自鉴权,非 admin gate)。
+import {
+  dispatchSelfhealRepairsRoute,
+  SELFHEAL_REPAIRS_PREFIX,
+} from './internal/selfhealRepairs.js'
+import {
   handleAdminAgentContainerAction,
   handleAdminContainerLogs,
   handleAdminContainersStats,
@@ -795,6 +814,22 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
+    // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
+    // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
+    { method: 'GET', path: '/api/admin/selfheal/incidents', handler: handleAdminListIncidents },
+    { method: 'GET', path: '/api/admin/selfheal/user-notices', handler: handleAdminGetSelfhealUserNotices },
+    { method: 'GET', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminGetIncident },
+    { method: 'POST', pathPrefix: '/api/admin/selfheal/incidents/', handler: handleAdminResolveIncident },
+    // 收尾批(H1b/§B):condition 压制运维 + repair 一键放行。exact 在 prefix 前
+    // (matchRoute exact-first);release 走 prefix,handler 内 regex 抠 :id + /release 尾段。
+    { method: 'GET', path: '/api/admin/selfheal/conditions', handler: handleAdminListSelfhealConditions },
+    { method: 'POST', path: '/api/admin/selfheal/conditions/unsuppress', handler: handleAdminUnsuppressCondition },
+    // 字面量 path(不用常量):admin-route-inventory 基线静态抽取只认字符串字面量。
+    { method: 'POST', pathPrefix: '/api/admin/selfheal/repairs/', handler: handleAdminReleaseRepair },
+    // 切片②ⓐ:codex 修复回调(经 SSH 隧道 loopback 到达)。ANY_METHOD 通配转发,method/子路由
+    // (ack/progress/verify/done/failed/claim-capability/context)权威 + capability/webhook HMAC
+    // 鉴权全部收口在 dispatchSelfhealRepairsRoute。**不是** /api/admin/*,不套 admin gate。
+    { method: ANY_METHOD, pathPrefix: SELFHEAL_REPAIRS_PREFIX, handler: dispatchSelfhealRepairsRoute },
     // T-60 超管定价
     { method: 'GET', path: '/api/admin/pricing', handler: handleAdminListPricing },
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
@@ -803,6 +838,23 @@ export function createCommercialHandler(
     // 0106 轻量在飞快照(前端 30s 轮询)
     { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
+    // 0139 连接器平台 OAuth App provisioning(clientProvisioning='platform' 的信任闸)。
+    // exact list 排在 :slug prefix 之前(matchRoute exact-first)。
+    {
+      method: 'GET',
+      path: '/api/admin/connectors/platform-oauth-apps',
+      handler: handleAdminListPlatformOauthApps,
+    },
+    {
+      method: 'PUT',
+      pathPrefix: '/api/admin/connectors/platform-oauth-apps/',
+      handler: handleAdminPutPlatformOauthApp,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/connectors/platform-oauth-apps/',
+      handler: handleAdminDeletePlatformOauthApp,
+    },
     // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
     { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
     { method: 'PATCH', path: '/api/admin/literature', handler: handleAdminPatchLiterature },
@@ -1198,6 +1250,9 @@ export function createCommercialHandler(
     //   - 末尾 isOurs 兜底命中,无 route 命中时返 404 而非 fall through 给 gateway。
     // 实际 dispatch 由 pre-route adapter 处理(见下方 `CC 外接 endpoint` 块)。
     '/api/anthropic/',
+    // 切片②ⓐ:codex 修复回调命名空间(经 SSH 隧道 loopback 到达)。必须列此使 isOurs()=true,
+    // 否则 commercialHandler 返回 false → fall through gateway 404。鉴权在 handler 内自理。
+    SELFHEAL_REPAIRS_PREFIX,
   ]
 
   return async function commercialHandler(req, res): Promise<boolean> {
@@ -1231,7 +1286,10 @@ export function createCommercialHandler(
       path.startsWith('/api/admin/') ||
       path === '/api/public/config' ||
       path === '/api/auth/logout' ||
-      path === '/api/auth/refresh'
+      path === '/api/auth/refresh' ||
+      // 切片②ⓐ:codex 修复回调不受维护期闸门约束 —— 维护期正是需要自愈进行/收尾的时候,
+      // 且这些是机器回调(无 admin JWT),被 503 会中断修复状态机。鉴权由 capability/HMAC 兜住。
+      path.startsWith(SELFHEAL_REPAIRS_PREFIX)
     if (isOursForMaintenance && !isAllowlistForMaintenance && (await isInMaintenance())) {
       const token = extractTokenFromReq(req)
       const adminOk = await isActiveAdmin(req, token, deps.jwtSecret)

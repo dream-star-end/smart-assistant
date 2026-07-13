@@ -15,6 +15,7 @@
 
 import { STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query as _query } from "../db/queries.js";
+import { providerDegradedKey } from "../selfheal/conditionKeys.js";
 import { enqueueAlert as _enqueueAlert, transitionRuleState as _transitionRuleState } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
 import {
@@ -114,7 +115,10 @@ export function startProviderHealthScheduler(
     });
     if (evaln.transition === "none") return;
 
-    const ruleId = `provider_health:${providerId}`;
+    // condition key 走 conditionKeys 注册表(收尾批 B1):此前 `provider_health:<id>`
+    // 与 policy seed `health.provider_degraded` 永不命中 → provider 降级从不进 incident。
+    // 现 per-provider key 命中 0135 的 prefix policy(旧 provider_health:* 行成无 policy 死行,良性)。
+    const ruleId = providerDegradedKey(providerId);
 
     if (evaln.transition === "to_degraded") {
       // 稀疏 upsert;ON CONFLICT WHERE 再次守 health_mode='auto'(防 read→write 间 admin 强制的 TOCTOU)。

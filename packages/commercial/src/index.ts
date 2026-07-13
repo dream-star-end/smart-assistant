@@ -23,7 +23,16 @@ import {
   type LeaderLeaseController,
   type LeadershipStatus,
 } from "./deploy/leaderLease.js";
-import { createControlListener, type ControlListener } from "./deploy/controlListener.js";
+import {
+  createControlListener,
+  privatePortForSlot,
+  type ControlListener,
+} from "./deploy/controlListener.js";
+import {
+  createSlotRelayClient,
+  handleSlotRelayRequest,
+  type SlotRelayLocal,
+} from "./deploy/slotRelay.js";
 import type { TLSSocket } from "node:tls";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
@@ -165,13 +174,24 @@ import {
   type ProviderHealthSchedulerHandle,
 } from "./admin/providerHealthScheduler.js";
 import {
+  startIncidentReconciler,
+  startIncidentSweeper,
+  startIncidentSnapshot,
+  assertSelfhealConfig,
+  selfhealTickMs,
+  type IncidentReconcilerHandle,
+  type IncidentReconcilerSnapshotHandle,
+  type IncidentSnapshotHandle,
+} from "./selfheal/index.js";
+import {
   startWecomAlertDispatcher,
-  type WecomAlertDispatcherHandle,
 } from "./admin/wecomAlertDispatcher.js";
 import {
   getWecomAibotConnectionManager,
-  type WecomAibotConnectionManager,
 } from "./admin/wecomAibotConnection.js";
+import {
+  startUserNoticeApproval,
+} from "./selfheal/userNoticeApproval.js";
 import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
@@ -303,6 +323,7 @@ import {
   makeConnectorsRpcHandler,
   type ConnectorsRpcHandler,
 } from "./connectors/rpc.js";
+import { seedDefaultConnectors } from "./connectors/declarativeSeed.js";
 import {
   startConnectorSweeper,
 } from "./connectors/sweeper.js";
@@ -1317,6 +1338,14 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
+  // 双槽私有 relay 的本槽 bridge forward-ref。控制口先起、bridge 后装配，窗口内安全返空。
+  const slotRelayLocalRef: { current: SlotRelayLocal } = {
+    current: { onlineUserSubset: () => [], broadcastToUsers: () => 0 },
+  };
+  const slotRelayClient = createSlotRelayClient({
+    secret: cfg.OC_EGRESS_SECRET ?? "",
+    logger: rootLogger.child({ subsys: "commercial", module: "slotRelay" }),
+  });
   // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
   // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
   // (MASTER_USER_PREFIX),而 proxy/bridge 传进来的是裸 uid(与 PG 计费同口径)。
@@ -1666,6 +1695,17 @@ export async function registerCommercial(
           console.error("[commercial] seedPlatformGeneralAgents failed:", err);
         }
       })();
+      // 声明式**默认连接器**(notion/feishu/github)的幂等 seed —— 走完整 securityApprove 审计
+      // 路径落 security_approved,catalog 才有可绑连接器、用户/agent 才发现得到。无此调用则生产
+      // 目录为空(整套端到端不成立)。fire-and-forget,失败只 log 不阻断启动;幂等,重启可反复跑。
+      void (async () => {
+        try {
+          const seeded = await seedDefaultConnectors(getPool());
+          console.log("[commercial] default connectors seed:", JSON.stringify(seeded));
+        } catch (err) {
+          console.error("[commercial] seedDefaultConnectors failed:", err);
+        }
+      })();
       // egress split:cost 回执接收端(egress finalize 后的 SQLite 持久化 + WS 广播
       // 回投)。仅 split 模式挂载;秘钥头校验在 handler 内(loopback + egress 剥头 +
       // 秘钥三层)。
@@ -1873,6 +1913,19 @@ export async function registerCommercial(
           });
           return;
         }
+        // 双槽定向通知 relay 只允许走本 slot 私有控制口；VIP/普通 proxy 端口不暴露该面。
+        if (
+          dualMasterEnabled &&
+          req.socket.localPort === privatePortForSlot(ocSlot) &&
+          handleSlotRelayRequest(req, res, {
+            secret: cfg.OC_EGRESS_SECRET ?? "",
+            local: {
+              onlineUserSubset: (uids) => slotRelayLocalRef.current.onlineUserSubset(uids),
+              broadcastToUsers: (uids, payload) => slotRelayLocalRef.current.broadcastToUsers(uids, payload),
+            },
+            logger: rootLogger.child({ subsys: "commercial", module: "slotRelayServer" }),
+          })
+        ) return;
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
         // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
@@ -3568,6 +3621,18 @@ export async function registerCommercial(
       }
     : undefined;
 
+  // 每槽 read-only incident snapshot：follower 也可在 WS 鉴权后补发，但不 claim/repair/send。
+  let incidentSnapshot: IncidentSnapshotHandle | undefined;
+  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
+    assertSelfhealConfig();
+    incidentSnapshot = trackScheduler(
+      "incidentSnapshot",
+      "local",
+      startIncidentSnapshot({ intervalMs: selfhealTickMs() }),
+    );
+    await incidentSnapshot.runNow();
+  }
+
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
@@ -3592,6 +3657,11 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
+    // 鉴权后补发当前活跃事故——每槽本地 read-only snapshot 做 **per-uid** 过滤，
+    // 只返该 uid 可见事故，绝不泄露他人定向事故(Codex B2)。
+    incidentSnapshotProvider: incidentSnapshot
+      ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
+      : undefined,
     // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
     // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
     // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
@@ -3641,6 +3711,10 @@ export async function registerCommercial(
   // 扣费事件会实时推到用户前端。
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
+  };
+  slotRelayLocalRef.current = {
+    onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),
+    broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
   };
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
@@ -3969,6 +4043,43 @@ export async function registerCommercial(
     providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
   }
 
+  // v5 全链路自愈体系(RFC-v5-selfheal-ops)切片① — incidentReconciler + deliveries sweeper。
+  // 【域归属 v5-owned】gate 在 runtimeChannel==='v5'(**不是** controlPlaneEnabled——v5 是 follower
+  // 恒 false 会让整链真空,RFC 已论证:incident/policy/deliveries 皆 v5 引入表,v3 无对应代码 →
+  // 不写共享现网,v5 必须自跑)。reconciler 读 alert_conditions 当前值 level-triggered 投影 incidents;
+  // sweeper durable 投递 WS(bridge broadcast forward-ref)+ inbox(同事务幂等)。tick 10s。
+  // 关停:OC_SELFHEAL_DISABLED=1。派单(codex 修复)是切片②,sweeper 内 stub 默认关。
+  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
+    // M5+B3(收尾批):装配前配置硬校验——dispatch 启用时密钥长度/互异/派单 URL
+    // loopback 钉死,违规 throw fail-fast 拒启;禁用时仅 warn。数值 env 解析统一
+    // 收口 selfheal/config.ts。
+    assertSelfhealConfig();
+    leaderBundle.add({
+      name: "incidentReconciler",
+      domain: "v5-owned",
+      start: () => {
+        const h: IncidentReconcilerHandle = trackScheduler(
+          "incidentReconciler",
+          "v5-owned",
+          startIncidentReconciler({ intervalMs: selfhealTickMs() }),
+        );
+        return { stop: () => h.stop() };
+      },
+    });
+    leaderBundle.add({
+      name: "incidentSweeper",
+      domain: "v5-owned",
+      start: () => {
+        const h: IncidentReconcilerSnapshotHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+          intervalMs: selfhealTickMs(),
+          broadcastAll: () => 0,
+          broadcastToUsers: () => 0,
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
   // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
   // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
@@ -3981,7 +4092,7 @@ export async function registerCommercial(
     leaderBundle.add({
       name: "connectorSweeper",
       domain: "v5-owned",
-      start: () => {
+      start: async () => {
         const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
         const h = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
@@ -4006,22 +4117,44 @@ export async function registerCommercial(
   // 详见 wecomAibotConnection 头注(单连接约束 + 国内域名直连出口红线)。
   // P3:wecomAlert(+ wecomAibot 长连接)需交接(RFC §2)→ 收口 LeaderBundle 单 leader。
   // aibot 单连接约束:双 master 各起一条 wss = 双投递/连接抢占,故必须随 leader 单实例启停。
-  // 二者同一 member 内启停(aibotConn 不进 schedulerRegistry,由本 member 的 stop 一并回收)。
+  // dispatcher/aibot/approval 同一 member 内有序启停；approval 经 loopback slot relay
+  // 并行查询/投递 A/B 两槽，只记录真实 deliveredUids，peer down/half-open 有界降级为空。
   if (runtimeChannel === "v5" && process.env.OC_WECOM_ALERT_DISABLED !== "1") {
     leaderBundle.add({
       name: "wecomAlert",
       domain: "v5-owned",
-      start: () => {
+      start: async () => {
         const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
         const aibotConn = getWecomAibotConnectionManager();
-        void aibotConn.start();
-        const dispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({
-          dispatchIntervalMs: intervalMs,
-          deps: { sendAibotAlert: (id, md) => aibotConn.send(id, md) },
-        }));
+        let dispatcher: ReturnType<typeof startWecomAlertDispatcher> | undefined;
+        let approval: ReturnType<typeof startUserNoticeApproval> | undefined;
+        try {
+          await aibotConn.start();
+          dispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({
+            dispatchIntervalMs: intervalMs,
+            deps: { sendAibotAlert: (id, md) => aibotConn.send(id, md) },
+          }));
+          approval = trackScheduler("userNoticeApproval", "v5-owned", startUserNoticeApproval(
+            aibotConn,
+            {
+              onlineUserSubset: (uids) => slotRelayClient.onlineUserSubset(uids),
+              broadcastToUsers: (uids, payload) => slotRelayClient.broadcastToUsers(uids, payload),
+            },
+          ));
+        } catch (err) {
+          unregisterMutator("userNoticeApproval");
+          unregisterMutator("wecomAlert");
+          try { await approval?.stop(); } catch { /* ignore */ }
+          try { await dispatcher?.stop(); } catch { /* ignore */ }
+          try { await aibotConn.stop(); } catch { /* ignore */ }
+          throw err;
+        }
+        if (!dispatcher || !approval) throw new Error("wecom leader member incomplete startup");
         return {
           stop: async () => {
+            try { await approval.stop(); } catch { /* ignore */ }
+            unregisterMutator("userNoticeApproval");
             try { await dispatcher.stop(); } catch { /* ignore */ }
             try { await aibotConn.stop(); } catch { /* ignore */ }
           },
@@ -4173,7 +4306,10 @@ export async function registerCommercial(
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
-      // connectorSweeper 已迁入 LeaderBundle(P3 MAJOR 3),由 leaderLease.shutdown()→stopAndDrain 回收,此处不再单独 stop。
+      // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
+      if (incidentSnapshot) {
+        try { await incidentSnapshot.stop(); } catch { /* ignore */ }
+      }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
       }

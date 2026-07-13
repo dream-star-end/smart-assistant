@@ -175,10 +175,11 @@ export function isEmailDomainBlocked(
   email: string,
   blocklist: readonly string[],
 ): boolean {
-  if (blocklist.length === 0) return false;
   const at = email.lastIndexOf("@");
   if (at < 0) return false; // 不应发生(emailSchema 已校验);防御性
   const domain = email.slice(at + 1).toLowerCase();
+  // 平台服务主体专用命名空间：永远保留，不能依赖可变的运营黑名单配置。
+  if (domain === "system.openclaude" || domain.endsWith(".system.openclaude")) return true;
   for (const rule of blocklist) {
     if (domain === rule || domain.endsWith(`.${rule}`)) return true;
   }
@@ -232,7 +233,7 @@ export async function register(
   //
   // verify 路径(verify.ts)在赠金发放前会再走一次同一函数,处理上线**前**
   // 已注册未验证的 disposable 邮箱存量。见 verify.ts:verifyEmail。
-  if (deps.emailDomainBlocklist && isEmailDomainBlocked(input.email, deps.emailDomainBlocklist)) {
+  if (isEmailDomainBlocked(input.email, deps.emailDomainBlocklist ?? [])) {
     throw new RegisterError(
       "EMAIL_DOMAIN_BLOCKED",
       "该邮箱域名暂不支持注册",
