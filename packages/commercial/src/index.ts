@@ -182,12 +182,10 @@ import {
 import {
   startIncidentReconciler,
   startIncidentSweeper,
-  startIncidentSnapshot,
   assertSelfhealConfig,
   selfhealTickMs,
   type IncidentReconcilerHandle,
-  type IncidentReconcilerSnapshotHandle,
-  type IncidentSnapshotHandle,
+  type IncidentSweeperHandle,
 } from "./selfheal/index.js";
 import {
   startWecomAlertDispatcher,
@@ -3821,18 +3819,6 @@ export async function registerCommercial(
     })();
   };
 
-  // 每槽 read-only incident snapshot：follower 也可在 WS 鉴权后补发，但不 claim/repair/send。
-  let incidentSnapshot: IncidentSnapshotHandle | undefined;
-  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
-    assertSelfhealConfig();
-    incidentSnapshot = trackScheduler(
-      "incidentSnapshot",
-      "local",
-      startIncidentSnapshot({ intervalMs: selfhealTickMs() }),
-    );
-    await incidentSnapshot.runNow();
-  }
-
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
@@ -3867,11 +3853,6 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
-    // 鉴权后补发当前活跃事故——每槽本地 read-only snapshot 做 **per-uid** 过滤，
-    // 只返该 uid 可见事故，绝不泄露他人定向事故(Codex B2)。
-    incidentSnapshotProvider: incidentSnapshot
-      ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
-      : undefined,
     // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
     // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
     loadAllowedModelChecker: async (uid, requiredEpoch) => {
@@ -4300,10 +4281,8 @@ export async function registerCommercial(
       name: "incidentSweeper",
       domain: "v5-owned",
       start: () => {
-        const h: IncidentReconcilerSnapshotHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+        const h: IncidentSweeperHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
           intervalMs: selfhealTickMs(),
-          broadcastAll: () => 0,
-          broadcastToUsers: () => 0,
         }));
         return { stop: () => h.stop() };
       },
@@ -4538,9 +4517,6 @@ export async function registerCommercial(
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
       // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
-      if (incidentSnapshot) {
-        try { await incidentSnapshot.stop(); } catch { /* ignore */ }
-      }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
       }

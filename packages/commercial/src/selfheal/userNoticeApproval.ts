@@ -310,7 +310,8 @@ async function sendApproved(deps: UserNoticeApprovalDeps): Promise<void> {
       const online = await deps.onlineUserSubset(recips.rows.map((x) => x.user_id));
       const payload = {
         type: "sys.incident", incidentId: row.incident_id, rev: Number(row.incident_rev), status: "resolved",
-        severity: "info", surface: "recovery", title: row.title, message: row.message, ts: Date.now(),
+        noticeKind: "approved_recovery", severity: "info", surface: "recovery",
+        title: row.title, message: row.message, ts: Date.now(),
       };
       // recordUserImpact marks the fence synchronously before its async INSERT. A failure that
       // starts while the DB revalidation is in flight therefore aborts this send even before
