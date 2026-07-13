@@ -213,18 +213,32 @@ export async function listDeclarativeManagement(
       row.latest_security_state === 'security_approved' &&
       row.latest_functional_state === 'verified' &&
       row.latest_exec_revoked_at === null
-    let contract: CatalogEntry | null = null
-    let canBind = executableLatest && (official || exactInstall)
-    if (canBind && row.latest_version_id) {
+    let verifiedContract: CatalogEntry | null = null
+    let verifiedLatest = false
+    if (executableLatest && row.latest_version_id) {
       try {
         const meta = await loadVerifiedContractWithMeta(Number(row.latest_version_id), pool)
-        contract = projectContract(meta, row.latest_name ?? row.slug, row.latest_description ?? '')
-        if (contract.clientProvisioning === 'platform') {
-          provisionedSlugs ??= await listPlatformOauthAppSlugs(pool)
-          if (!provisionedSlugs.has(row.slug)) {
-            canBind = false
-            contract = null
-          }
+        verifiedContract = projectContract(
+          meta,
+          row.latest_name ?? row.slug,
+          row.latest_description ?? '',
+        )
+        verifiedLatest = true
+      } catch {
+        // lifecycle 列通过但工件 hash / policy / key / signature 任一失效，管理面也标为不可用。
+      }
+    }
+    const available = executableLatest && verifiedLatest
+    let canBind = available && (official || exactInstall)
+    let contract = canBind ? verifiedContract : null
+    if (canBind && contract?.clientProvisioning === 'platform') {
+      // loadVerifiedContractWithMeta 已保证 platform 模式只能是精确官方工件；这里再要求
+      // 平台 App 已真实 provision，避免管理中心展示一个点了必失败的一键授权入口。
+      try {
+        provisionedSlugs ??= await listPlatformOauthAppSlugs(pool)
+        if (!provisionedSlugs.has(row.slug)) {
+          canBind = false
+          contract = null
         }
       } catch {
         canBind = false
@@ -237,7 +251,7 @@ export async function listDeclarativeManagement(
       description: row.latest_description ?? '',
       installation: official ? 'default' : hasInstall ? 'marketplace' : 'orphan',
       official,
-      available: executableLatest,
+      available,
       canBind,
       listingState: row.state ?? 'missing',
       installedVersion: official ? row.latest_version : row.installed_version,
@@ -245,11 +259,7 @@ export async function listDeclarativeManagement(
       latestVersion: row.latest_version,
       latestVersionId: row.latest_version_id,
       updateAvailable:
-        !official &&
-        hasInstall &&
-        row.latest_version_id !== null &&
-        !exactInstall &&
-        executableLatest,
+        !official && hasInstall && row.latest_version_id !== null && !exactInstall && available,
       connectionCount: Number.parseInt(row.connection_count, 10) || 0,
       contract,
     })

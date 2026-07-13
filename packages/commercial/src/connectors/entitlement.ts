@@ -14,6 +14,7 @@ interface EntitlementRow {
   kind: string
   version_status: string
   artifact_hash: string
+  exec_contract: unknown
   security_review_state: string
   functional_verify_state: string
   exec_revoked_at: Date | null
@@ -26,7 +27,7 @@ async function loadEntitlementRow(
   runner: QueryRunner,
 ): Promise<EntitlementRow | null> {
   const r = await runner.query<EntitlementRow>(
-    `SELECT v.slug, l.kind, v.status AS version_status, v.artifact_hash,
+    `SELECT v.slug, l.kind, v.status AS version_status, v.artifact_hash, v.exec_contract,
             v.security_review_state, v.functional_verify_state, v.exec_revoked_at,
             l.state AS listing_state, l.current_approved_version_id::text
        FROM marketplace_skill_versions v
@@ -35,6 +36,23 @@ async function loadEntitlementRow(
     [versionId],
   )
   return r.rows[0] ?? null
+}
+
+function assertPlatformOauthIdentity(row: EntitlementRow): void {
+  const contract = row.exec_contract as {
+    authMode?: unknown
+    oauth2?: { clientProvisioning?: unknown }
+  } | null
+  if (
+    contract?.authMode === 'oauth2-auth-code' &&
+    contract.oauth2?.clientProvisioning === 'platform' &&
+    !isDefaultConnectorArtifact(row.slug, row.artifact_hash)
+  ) {
+    throw new ConnectorError(
+      'RELINK_REQUIRED',
+      'platform-managed OAuth connector is not an exact built-in artifact',
+    )
+  }
 }
 
 function assertExecutableState(row: EntitlementRow | null): asserts row is EntitlementRow {
@@ -59,6 +77,7 @@ export async function assertConnectorBindEntitlement(
 ): Promise<{ slug: string; artifactHash: string; official: boolean }> {
   const row = await loadEntitlementRow(versionId, runner)
   assertExecutableState(row)
+  assertPlatformOauthIdentity(row)
   if (row.current_approved_version_id !== String(versionId))
     throw new ConnectorError('RELINK_REQUIRED', 'connector version is no longer current')
 
@@ -89,6 +108,7 @@ export async function assertConnectorExecutionEntitlement(
 ): Promise<void> {
   const row = await loadEntitlementRow(versionId, runner)
   assertExecutableState(row)
+  assertPlatformOauthIdentity(row)
   if (row.slug !== slug)
     throw new ConnectorError('RELINK_REQUIRED', 'connection slug/version mismatch')
   if (isDefaultConnectorArtifact(slug, row.artifact_hash)) return

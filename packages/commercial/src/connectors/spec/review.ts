@@ -17,6 +17,7 @@
 import { Value } from '@sinclair/typebox/value'
 import type { Pool } from 'pg'
 import { type QueryRunner, tx } from '../../db/queries.js'
+import { isDefaultConnectorArtifact } from '../defaults/index.js'
 import { canonicalSha256Hex } from './canonical.js'
 import { COMPILER_VERSION, compileSpec } from './compiler.js'
 import { signContract, verifyContract } from './signer.js'
@@ -272,43 +273,47 @@ export interface VerifiedContract {
   authContractVersion: number
 }
 
-/**
- * 与 loadVerifiedContract 同一套 4 闸(kind=connector / security_approved / 未 revoke /
- * hash 自洽 + 验签 + policy 下限),但**多返回** slug/versionId/hash 供三表 pin。
- * loadVerifiedContract 是它的薄封装(只取 .contract),保证闸门单一权威。
- */
-export async function loadVerifiedContractWithMeta(
-  versionId: number,
-  pool: Pool,
-  opts: LoadContractOptions = {},
-): Promise<VerifiedContract> {
-  // P0-1:下限只能抬高,传入值绝不能把它压到 CURRENT 以下。
-  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
-  const env = opts.env ?? process.env
-  const r = await pool.query<{
-    slug: string
-    kind: string
-    security_review_state: string
-    functional_verify_state: string
-    exec_revoked_at: Date | null
-    exec_contract: unknown
-    exec_contract_hash: Buffer | null
-    compiler_version: number | null
-    security_policy_version: number | null
-    signature: Buffer | null
-    key_id: string | null
-  }>(
-    `SELECT v.slug, l.kind, v.security_review_state, v.functional_verify_state,
+interface StoredContractRow {
+  id: string
+  slug: string
+  kind: string
+  artifact_hash: string
+  raw_artifact: string
+  security_review_state: string
+  functional_verify_state: string
+  exec_revoked_at: Date | null
+  exec_contract: unknown
+  exec_contract_hash: Buffer | null
+  compiler_version: number | null
+  security_policy_version: number | null
+  signature: Buffer | null
+  key_id: string | null
+}
+
+async function readStoredContractRows(
+  versionIds: readonly number[],
+  runner: QueryRunner,
+): Promise<StoredContractRow[]> {
+  if (versionIds.length === 0) return []
+  const r = await runner.query<StoredContractRow>(
+    `SELECT v.id::text, v.slug, l.kind, v.artifact_hash, v.raw_artifact,
+            v.security_review_state, v.functional_verify_state,
             v.exec_revoked_at, v.exec_contract,
             v.exec_contract_hash, v.compiler_version, v.security_policy_version, v.signature, v.key_id
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
-      WHERE v.id = $1`,
-    [versionId],
+      WHERE v.id = ANY($1::bigint[])`,
+    [versionIds],
   )
-  const row = r.rows[0]
-  if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${versionId}`)
-  // P0-2:kind 是 DB 事实;非 connector(含被篡改成 skill/agent)→ fail-closed。
+  return r.rows
+}
+
+function verifyStoredContractRow(
+  row: StoredContractRow,
+  policyFloor: number,
+  env: NodeJS.ProcessEnv,
+): VerifiedContract {
+  const versionId = Number(row.id)
   if (row.kind !== 'connector')
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
   if (row.security_review_state !== 'security_approved')
@@ -329,25 +334,43 @@ export async function loadVerifiedContractWithMeta(
     row.security_policy_version == null
   )
     throw new ConnectorSpecError('CONTRACT_MISSING', 'signed contract columns incomplete')
-
   if (Number(row.security_policy_version) < policyFloor)
     throw new ConnectorSpecError(
       'POLICY_STALE',
       `policy ${row.security_policy_version} < floor ${policyFloor}`,
     )
 
-  // contract 结构自校验。
   const execContract = row.exec_contract
   if (!Value.Check(ExecContract, execContract))
     throw new ConnectorSpecError('EXEC_CONTRACT_INVALID', 'stored exec_contract invalid')
 
-  // hash 自洽:从载入的 contract 重算,与存列对比(JSONB 被篡改 → 不符)。
+  let rawArtifact: unknown
+  try {
+    rawArtifact = JSON.parse(row.raw_artifact)
+  } catch {
+    throw new ConnectorSpecError('ARTIFACT_HASH_MISMATCH', 'stored raw artifact is invalid JSON')
+  }
+  if (canonicalSha256Hex(rawArtifact) !== row.artifact_hash)
+    throw new ConnectorSpecError('ARTIFACT_HASH_MISMATCH', 'raw artifact hash mismatch')
+  if ((execContract as ExecContractT).spec_hash !== row.artifact_hash)
+    throw new ConnectorSpecError('SPEC_HASH_MISMATCH', 'contract is not bound to artifact hash')
+
+  if (
+    (execContract as ExecContractT).authMode === 'oauth2-auth-code' &&
+    (execContract as ExecContractT).oauth2?.clientProvisioning === 'platform' &&
+    !isDefaultConnectorArtifact(row.slug, row.artifact_hash)
+  ) {
+    throw new ConnectorSpecError(
+      'PLATFORM_OAUTH_FORBIDDEN',
+      'platform-managed OAuth is reserved for an exact built-in connector artifact',
+    )
+  }
+
   const recomputedHash = canonicalSha256Hex(execContract)
   const storedHashHex = Buffer.from(row.exec_contract_hash).toString('hex')
   if (recomputedHash !== storedHashHex)
     throw new ConnectorSpecError('HASH_MISMATCH', 'exec_contract_hash mismatch')
 
-  // 验签:覆盖字段(含 DB 读到的 kind)与存储一致(任一字节篡改 → false)。
   const ok = verifyContract(
     {
       listingSlug: row.slug,
@@ -374,10 +397,52 @@ export async function loadVerifiedContractWithMeta(
   }
 }
 
+/**
+ * 与 loadVerifiedContract 同一套 4 闸(kind=connector / security_approved / 未 revoke /
+ * hash 自洽 + 验签 + policy 下限),但**多返回** slug/versionId/hash 供三表 pin。
+ * loadVerifiedContract 是它的薄封装(只取 .contract),保证闸门单一权威。
+ */
+export async function loadVerifiedContractWithMeta(
+  versionId: number,
+  pool: QueryRunner,
+  opts: LoadContractOptions = {},
+): Promise<VerifiedContract> {
+  // P0-1:下限只能抬高,传入值绝不能把它压到 CURRENT 以下。
+  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
+  const env = opts.env ?? process.env
+  const row = (await readStoredContractRows([versionId], pool))[0]
+  if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${versionId}`)
+  return verifyStoredContractRow(row, policyFloor, env)
+}
+
+/**
+ * 批量目录校验：一次 DB 读取后逐条走与单版本完全相同的 hash/policy/key/signature 闸。
+ * 不可信/缺失版本从 Map 省略，基础设施查询错误仍抛出；用于市场搜索避免最多 500 次 N+1。
+ */
+export async function listVerifiedContractsWithMeta(
+  versionIds: readonly number[],
+  pool: QueryRunner,
+  opts: LoadContractOptions = {},
+): Promise<Map<number, VerifiedContract>> {
+  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
+  const env = opts.env ?? process.env
+  const rows = await readStoredContractRows(versionIds, pool)
+  const out = new Map<number, VerifiedContract>()
+  for (const row of rows) {
+    try {
+      const verified = verifyStoredContractRow(row, policyFloor, env)
+      out.set(verified.versionId, verified)
+    } catch (error) {
+      if (!(error instanceof ConnectorSpecError)) throw error
+    }
+  }
+  return out
+}
+
 /** 薄封装:只取验签后的 contract(不需要 DB 事实的调用方用它)。 */
 export async function loadVerifiedContract(
   versionId: number,
-  pool: Pool,
+  pool: QueryRunner,
   opts: LoadContractOptions = {},
 ): Promise<ExecContractT> {
   return (await loadVerifiedContractWithMeta(versionId, pool, opts)).contract

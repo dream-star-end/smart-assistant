@@ -40,10 +40,7 @@ process.env.OC_CONNECTORS_OAUTH_REDIRECT_URI =
 process.env.OC_RUNTIME_CHANNEL = 'v5'
 
 import { signAccess } from '../auth/jwt.js'
-import {
-  bindDeclarativeConnector as bindDeclarativeConnectorCore,
-  bindWithBag as bindWithBagCore,
-} from '../connectors/engine/bind.js'
+import { bindDeclarativeConnector as bindDeclarativeConnectorCore } from '../connectors/engine/bind.js'
 import {
   META_TOKEN_EXPIRES_AT,
   decryptBagFromRow,
@@ -55,7 +52,6 @@ import { ConnectorError } from '../connectors/errors.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { oauthCookieName } from '../connectors/oauthPending.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
-import { upsertPlatformOauthApp } from '../connectors/platformOauthApps.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
 import { computeAccountKey } from '../connectors/store.js'
@@ -83,10 +79,6 @@ const REFRESH_TOKEN = 'RT-CANARY-5a1d47e9-DO-NOT-LEAK-8899aabbccddeeff'
 /** canary:**续期换回**的新 access/refresh token(轮换后旧的必须从袋里消失)。 */
 const NEW_ACCESS_TOKEN = 'AT2-CANARY-9c4e17b3-DO-NOT-LEAK-a1b2c3d4e5f60718'
 const NEW_REFRESH_TOKEN = 'RT2-CANARY-6b0f83da-DO-NOT-LEAK-1122334455667788'
-/** canary:platform 模式的平台 App 凭据(存平台表,**绝不进用户袋**)。 */
-const PLATFORM_CLIENT_ID = 'platform-cid-refresh-001'
-const PLATFORM_CLIENT_SECRET = 'PS-CANARY-0d7a52ef-DO-NOT-LEAK-99aabbccddeeff00'
-
 const AUTHZ_ORIGIN = 'https://auth.oauth2.test:443'
 const TOKEN_ORIGIN = 'https://token.oauth2.test:443'
 const API_ORIGIN = 'https://api.oauth2.test:443'
@@ -491,16 +483,6 @@ async function bindDeclarativeConnector(
   return bindDeclarativeConnectorCore(...args)
 }
 
-async function bindWithBag(
-  ...args: Parameters<typeof bindWithBagCore>
-): Promise<Awaited<ReturnType<typeof bindWithBagCore>>> {
-  await installApprovedVersion({
-    userId: args[0].userId,
-    versionId: String(args[0].meta.versionId),
-  })
-  return bindWithBagCore(...args)
-}
-
 async function bearerFor(userId: number): Promise<string> {
   const { token } = await signAccess({ sub: String(userId), role: 'user' }, JWT_SECRET)
   return `Bearer ${token}`
@@ -885,13 +867,6 @@ describe('oauth2-auth-code · 对抗', () => {
 // refresh 端点与 token 端点是**不同 path**(/oauth/refresh vs /oauth/token)⇒ 能精确数出
 // "到底续了几次"—— 并发只续一次的断言全靠这个。
 
-/** platform 供给模式变体(client 凭据留平台表,袋里结构上没有)。 */
-function platformOauth2Spec(slug: string): Record<string, unknown> {
-  const s = oauth2Spec(slug)
-  ;(s.auth as Record<string, unknown>).clientProvisioning = 'platform'
-  return s
-}
-
 function engineDeps(): EngineHttpDeps {
   return { resolver: okResolver(), fetchImpl: localFetch(server.port) }
 }
@@ -1138,52 +1113,5 @@ describe('oauth2-auth-code · refresh 轮换', () => {
     const after = await readBag(connectionId, userId, versionId)
     assert.equal(after.bag.access_token, NEW_ACCESS_TOKEN)
     assert.equal(after.bag.refresh_token, NEW_REFRESH_TOKEN)
-  })
-
-  test('platform 模式 refresh:client 凭据取自**平台表**(用户袋里结构上没有)', async (t) => {
-    if (skipIfNoDb(t)) return
-    const { versionId, slug } = await approvedConnector(
-      platformOauth2Spec,
-      oauth2Decision,
-      'refresh-plat',
-    )
-    await upsertPlatformOauthApp(
-      { slug, clientId: PLATFORM_CLIENT_ID, clientSecret: PLATFORM_CLIENT_SECRET },
-      getPool(),
-    )
-    const userId = await mkUser()
-    resetUpstream({ tokenExpiresIn: 1 })
-
-    // platform 袋 = access_token (+refresh_token),**无 client 凭据**;tokenExpiresAt 走 bind 的 meta 通路。
-    const contractMeta = await loadVerifiedContractWithMeta(versionId, getPool())
-    const bound = await bindWithBag(
-      {
-        userId,
-        meta: contractMeta,
-        bag: { access_token: ACCESS_TOKEN, refresh_token: REFRESH_TOKEN },
-        tokenExpiresAt: new Date(Date.now() + 1000), // 1s ⇒ 立刻判"将过期"
-        deps: engineDeps(),
-      },
-      getPool(),
-    )
-
-    server.requests.length = 0
-    const result = await whoami(bound.connectionId, userId)
-    assert.deepEqual(result, { id: 'U-99887', login: 'octocat' })
-
-    // 续期用的 client 凭据来自平台表 —— 袋里根本没有它们,只能从 connector_platform_oauth_apps 取。
-    assert.equal(countPath('/oauth/refresh'), 1)
-    const form = new URLSearchParams(server.requests.find((r) => r.path === '/oauth/refresh')!.body)
-    assert.equal(form.get('client_id'), PLATFORM_CLIENT_ID)
-    assert.equal(form.get('client_secret'), PLATFORM_CLIENT_SECRET)
-    assert.equal(form.get('refresh_token'), REFRESH_TOKEN)
-
-    // 新袋仍是 platform 形状:**平台 secret 没有被顺手写进用户袋**(泄露面不按用户数放大)。
-    const after = await readBag(bound.connectionId, userId, versionId)
-    assert.deepEqual(after.bag, {
-      access_token: NEW_ACCESS_TOKEN,
-      refresh_token: NEW_REFRESH_TOKEN,
-    })
-    assert.equal(after.cipher.includes(PLATFORM_CLIENT_SECRET), false)
   })
 })

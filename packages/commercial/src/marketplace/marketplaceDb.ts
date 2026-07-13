@@ -1,5 +1,11 @@
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
+import {
+  listVerifiedContractsWithMeta,
+  loadVerifiedContractWithMeta,
+} from '../connectors/spec/review.js'
+import { ConnectorSpecError } from '../connectors/spec/types.js'
+import { getPool } from '../db/index.js'
 import { type QueryRunner, query, tx } from '../db/queries.js'
 import { getActiveMembership } from '../org/memberships.js'
 import {
@@ -188,6 +194,8 @@ export interface PublishInput {
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
 export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
   const kind: ArtifactKind = input.kind ?? 'skill'
+  if (kind === 'connector' && !marketplaceConnectorsEnabled())
+    throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
   const rawArtifact = input.rawArtifact ?? input.rawSkillMd
   if (rawArtifact == null)
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
@@ -895,29 +903,41 @@ export async function listApprovedForSearch(
     )
     r.rows.length = SEARCH_CATALOG_CAP
   }
-  return r.rows.map((x) => ({
-    versionId: x.id,
-    slug: x.slug,
-    kind: x.kind as ArtifactKind,
-    name: x.name,
-    description: x.description,
-    tags: (x.tags as string[]) ?? [],
-    artifactHash: x.artifact_hash,
-    embeddingHash: x.embedding_hash,
-    installCount: Number.parseInt(x.install_count ?? '0', 10) || 0,
-    benchmark:
-      (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
-      null,
-    category: x.category ?? null,
-    useCases: (x.use_cases as string[]) ?? [],
-    featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
-    usage30d: Number.parseInt(x.usage30d ?? '0', 10) || 0,
-    users30d: Number.parseInt(x.users30d ?? '0', 10) || 0,
-    rating: toRating(
-      Number.parseInt(x.rating_up ?? '0', 10) || 0,
-      Number.parseInt(x.rating_down ?? '0', 10) || 0,
-    ),
-  }))
+  const out: ApprovedSearchRow[] = []
+  const pool = getPool()
+  const connectorVersionIds = r.rows
+    .filter((row) => row.kind === 'connector')
+    .map((row) => Number(row.id))
+  const verifiedConnectors = await listVerifiedContractsWithMeta(connectorVersionIds, pool)
+  for (const x of r.rows) {
+    // lifecycle 列只是快筛；公开目录必须经过与 bind/execute 相同的工件 hash、策略、
+    // key 与签名权威校验。批量读取避免目录上限 500 条时产生 N+1。
+    if (x.kind === 'connector' && !verifiedConnectors.has(Number(x.id))) continue
+    out.push({
+      versionId: x.id,
+      slug: x.slug,
+      kind: x.kind as ArtifactKind,
+      name: x.name,
+      description: x.description,
+      tags: (x.tags as string[]) ?? [],
+      artifactHash: x.artifact_hash,
+      embeddingHash: x.embedding_hash,
+      installCount: Number.parseInt(x.install_count ?? '0', 10) || 0,
+      benchmark:
+        (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
+        null,
+      category: x.category ?? null,
+      useCases: (x.use_cases as string[]) ?? [],
+      featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
+      usage30d: Number.parseInt(x.usage30d ?? '0', 10) || 0,
+      users30d: Number.parseInt(x.users30d ?? '0', 10) || 0,
+      rating: toRating(
+        Number.parseInt(x.rating_up ?? '0', 10) || 0,
+        Number.parseInt(x.rating_down ?? '0', 10) || 0,
+      ),
+    })
+  }
+  return out
 }
 
 export interface ListingDetail {
@@ -1003,18 +1023,13 @@ export async function getListingDetail(
     users30d: string
     rating_up: string
     rating_down: string
-    exec_contract: unknown
-    security_review_state: string
-    functional_verify_state: string
-    exec_revoked_at: Date | null
   }>(
     // detail 是单行读:usage/rating 用 LEFT JOIN LATERAL 按 l.slug 直取(命中 idx_mkt_usage_slug_time,
     // 不做全表 GROUP BY),与 install_count 的单 slug 相关子查询同量级。rt 内先 DISTINCT 去重同
     // turn 同 slug 的多次 view(与 catalog 同语义);LATERAL 聚合恒返一行,LEFT JOIN 不会放大结果。
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
-            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark, v.exec_contract,
-            v.security_review_state, v.functional_verify_state, v.exec_revoked_at,
+            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
             v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count,
@@ -1048,11 +1063,16 @@ export async function getListingDetail(
   )
   const x = r.rows[0]
   if (!x) return null
-  const connectorExecutable =
-    x.kind === 'connector' &&
-    x.security_review_state === 'security_approved' &&
-    x.functional_verify_state === 'verified' &&
-    x.exec_revoked_at === null
+  let verifiedConnectorContract: Awaited<ReturnType<typeof loadVerifiedContractWithMeta>> | null =
+    null
+  if (x.kind === 'connector') {
+    try {
+      verifiedConnectorContract = await loadVerifiedContractWithMeta(Number(x.vid), getPool())
+    } catch (error) {
+      if (error instanceof ConnectorSpecError) return null
+      throw error
+    }
+  }
   return {
     slug: x.slug,
     kind: x.kind as ArtifactKind,
@@ -1089,9 +1109,7 @@ export async function getListingDetail(
     ...(x.kind === 'connector'
       ? {
           official: isDefaultConnectorArtifact(x.slug, x.artifact_hash),
-          connectorContract: connectorExecutable
-            ? projectSignedConnectorContract(x.exec_contract)
-            : null,
+          connectorContract: projectSignedConnectorContract(verifiedConnectorContract!.contract),
         }
       : {}),
   }
@@ -1157,6 +1175,14 @@ export async function installApprovedVersion(args: {
         version.execRevokedAt !== null
       ) {
         throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')
+      }
+      try {
+        // 与 listing/version 行锁处于同一事务，验签成功到安装落库之间不存在撤销/换版窗口。
+        await loadVerifiedContractWithMeta(Number(version.id), c)
+      } catch (error) {
+        if (error instanceof ConnectorSpecError)
+          throw new MarketplaceError('NOT_INSTALLABLE', 'connector 执行契约不可验证')
+        throw error
       }
     }
 
@@ -1285,7 +1311,7 @@ export async function updateInstalledAgentScope(
     const row = existing.rows[0]
     if (!row) return false
     await query(
-      `UPDATE marketplace_installs SET agent_ids = $2::jsonb WHERE id = $1`,
+      'UPDATE marketplace_installs SET agent_ids = $2::jsonb WHERE id = $1',
       [row.id, JSON.stringify(finalScope)],
       c,
     )
@@ -1311,8 +1337,12 @@ export async function recordUninstall(userId: number, slug: string): Promise<boo
     const listing = await lockMarketplaceListing(c, slug)
     if (!listing)
       throw new MarketplaceError('INSTALL_CONFLICT', '安装 listing 已不存在，请联系平台处理')
-    if (listing.kind === 'connector' && isDefaultConnectorSlug(slug))
-      throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器不可卸载')
+    if (listing.kind === 'connector') {
+      if (!marketplaceConnectorsEnabled())
+        throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
+      if (isDefaultConnectorSlug(slug))
+        throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器不可卸载')
+    }
 
     const install = await query<{ id: string }>(
       `SELECT id::text FROM marketplace_installs
@@ -1495,6 +1525,8 @@ export async function ownerUnlistListing(
       throw new MarketplaceError('NOT_INSTALLABLE', `slug "${slug}" 当前版本已变化`)
     const listing = await lockMarketplaceListing(c, slug)
     if (!listing) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+    if (listing.kind === 'connector' && !marketplaceConnectorsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
     if (BigInt(listing.ownerUserId) !== BigInt(ownerUserId))
       throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${slug}" 不属于当前用户`)
     if (listing.state === 'revoked')
@@ -1528,6 +1560,8 @@ export async function withdrawPublishVersion(
     if (!version) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
     const listing = await lockMarketplaceListing(c, version.slug)
     if (!listing) throw new MarketplaceError('VERSION_NOT_FOUND', 'listing 不存在')
+    if (listing.kind === 'connector' && !marketplaceConnectorsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
     if (
       BigInt(version.submittedBy) !== BigInt(ownerUserId) ||
       BigInt(listing.ownerUserId) !== BigInt(ownerUserId)
@@ -1731,12 +1765,14 @@ export async function revokeListing(slug: string, reason: string): Promise<numbe
   return tx(async (c) => {
     // kill-switch 同样遵循 version → listing；按 id 排序锁住该 slug 全部版本。
     await query(
-      `SELECT id FROM marketplace_skill_versions WHERE slug = $1 ORDER BY id FOR UPDATE`,
+      'SELECT id FROM marketplace_skill_versions WHERE slug = $1 ORDER BY id FOR UPDATE',
       [slug],
       c,
     )
     const listing = await lockMarketplaceListing(c, slug)
     if (!listing) return []
+    if (listing.kind === 'connector' && !marketplaceConnectorsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
     await query(
       `UPDATE marketplace_skill_listings
           SET state = 'revoked', revoked_reason = $2, updated_at = NOW()
@@ -1789,13 +1825,15 @@ export async function setListingFeaturedRank(slug: string, rank: number | null):
     )
   }
   await tx(async (c) => {
-    const listing = await query<{ state: string }>(
-      `SELECT state FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE`,
+    const listing = await query<{ state: string; kind: string }>(
+      'SELECT state, kind FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE',
       [slug],
       c,
     )
     const row = listing.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+    if (row.kind === 'connector' && !marketplaceConnectorsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
     if (row.state !== 'active')
       throw new MarketplaceError(
         'LISTING_REVOKED',

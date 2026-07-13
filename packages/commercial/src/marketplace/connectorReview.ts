@@ -1,15 +1,16 @@
 /** 原子连接器审核：安全编译/签名、功能验收、市场上架在同一事务提交。 */
 import type { Pool, PoolClient } from 'pg'
-import { getPool } from '../db/index.js'
-import { tx, type QueryRunner } from '../db/queries.js'
+import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
+import { compileSpec } from '../connectors/spec/compiler.js'
 import {
   markFunctionalVerifiedWithRunner,
   securityApproveWithRunner,
 } from '../connectors/spec/review.js'
-import { compileSpec } from '../connectors/spec/compiler.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
-import { MarketplaceError } from './marketplaceDb.js'
+import { getPool } from '../db/index.js'
+import { type QueryRunner, tx } from '../db/queries.js'
 import { lockMarketplaceListing, lockMarketplaceVersion } from './locking.js'
+import { MarketplaceError } from './marketplaceDb.js'
 
 export async function getMarketplaceArtifactKind(
   versionId: string,
@@ -97,6 +98,16 @@ export async function approveMarketplaceConnectorVersionWithRunner(
     version.slug,
     version.artifactHash,
   )
+  if (
+    compiled.execContract.authMode === 'oauth2-auth-code' &&
+    compiled.execContract.oauth2?.clientProvisioning === 'platform' &&
+    !isDefaultConnectorArtifact(version.slug, version.artifactHash)
+  ) {
+    throw new ConnectorSpecError(
+      'PLATFORM_OAUTH_FORBIDDEN',
+      'platform-managed OAuth is reserved for an exact built-in connector artifact',
+    )
+  }
 
   if (version.status === 'approved') {
     const storedHash = version.execContractHash?.toString('hex') ?? ''

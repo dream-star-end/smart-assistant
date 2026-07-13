@@ -27,10 +27,13 @@ import {
 import { ConnectorError } from '../connectors/errors.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
+import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { handleAdminPutPlatformOauthApp } from '../http/admin/connectorPlatformOauth.js'
+import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
 import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
 import {
@@ -40,6 +43,7 @@ import {
   listApprovedForSearch,
   listInstalled,
   listPendingVersions,
+  publishSkillVersion,
   recordUninstall,
   reviewVersion,
   revokeListing,
@@ -51,6 +55,8 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 const JWT_SECRET = 'connector-marketplace-integ-secret-0123456789abcdef'
 const API_ORIGIN = 'https://api.connector-market.test:443'
+const AUTHZ_ORIGIN = 'https://auth.connector-market.test:443'
+const TOKEN_ORIGIN = 'https://token.connector-market.test:443'
 
 let pgAvailable = false
 let seq = 0
@@ -171,6 +177,65 @@ const securityDecision = {
     unauthenticatedUploadOrigins: [],
   },
   actions: {},
+}
+
+const platformOauthDecision = {
+  audience: {
+    authorizationOrigins: [AUTHZ_ORIGIN],
+    tokenOrigins: [TOKEN_ORIGIN],
+    apiOrigins: [API_ORIGIN],
+    unauthenticatedUploadOrigins: [],
+  },
+  actions: {},
+}
+
+function platformOauthSpec(slug: string): Record<string, unknown> {
+  return {
+    id: slug,
+    label: `Platform OAuth ${slug}`,
+    description: 'community connector must not receive a platform-managed OAuth identity',
+    authMode: 'oauth2-auth-code',
+    auth: {
+      authorizeEndpoint: `${AUTHZ_ORIGIN}/oauth/authorize`,
+      tokenEndpoint: `${TOKEN_ORIGIN}/oauth/token`,
+      clientProvisioning: 'platform',
+      clientAuth: 'form',
+      scopeSeparator: ' ',
+      scopes: ['read'],
+      refreshRotation: false,
+      refreshEncoding: 'form',
+      pkce: 'required',
+      tokenOutputs: {
+        accessToken: '/access_token',
+        refreshToken: '/refresh_token',
+        expiresIn: '/expires_in',
+      },
+      apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+    },
+    originMode: 'fixed-reviewed',
+    credentialPipeline: {
+      nodes: [{ id: 'api-token', authMode: 'oauth2-auth-code', subject: 'user', audience: 'api' }],
+    },
+    actions: [
+      {
+        id: 'whoami',
+        description: 'identity probe',
+        request: { method: 'GET', pathTemplate: '/v1/me' },
+        params: { type: 'object', additionalProperties: false },
+        result: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { id: { type: 'string' }, name: { type: 'string' } },
+        },
+        usesSlot: 'api-token',
+      },
+    ],
+    identity: {
+      probeActionId: 'whoami',
+      accountKeyPointer: '/id',
+      accountHintPointer: '/name',
+    },
+  }
 }
 
 function makeRequest(body: unknown, bearer: string): IncomingMessage {
@@ -528,6 +593,115 @@ describe('v5 connector marketplace', () => {
     assert.equal(rowAfter.installedVersion, '2.0.0')
   })
 
+  test('签名/key 失效后搜索、详情、安装和管理中心全部 fail-closed', async (t) => {
+    if (skipIfNoDb(t)) return
+    const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const installedUser = await createUser()
+    const newUser = await createUser()
+    const slug = `tamper-${Date.now() % 1_000_000}`
+    const { versionId } = await publishApproved({
+      ownerUserId: owner,
+      reviewerUserId: reviewer,
+      slug,
+    })
+    await installApprovedVersion({ userId: installedUser, versionId })
+
+    await query('UPDATE marketplace_skill_versions SET key_id = $2 WHERE id = $1', [
+      versionId,
+      'retired-key',
+    ])
+
+    assert.equal(
+      (await listApprovedForSearch('connector')).some((row) => row.slug === slug),
+      false,
+    )
+    assert.equal(await getListingDetail(slug), null)
+    await expectMarketplaceError(
+      () => installApprovedVersion({ userId: newUser, versionId }),
+      'NOT_INSTALLABLE',
+    )
+    assert.equal(
+      (await listDeclarativeCatalog(getPool(), installedUser)).some((row) => row.slug === slug),
+      false,
+    )
+    const managed = (await listDeclarativeManagement(getPool(), installedUser)).connectors.find(
+      (row) => row.slug === slug,
+    )
+    assert.ok(managed)
+    assert.equal(managed.available, false)
+    assert.equal(managed.canBind, false)
+    assert.equal(managed.contract, null)
+  })
+
+  test('社区 platform OAuth 不能经专审或 admin provisioning 提升为平台身份', async (t) => {
+    if (skipIfNoDb(t)) return
+    const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const slug = `platform-reserved-${Date.now() % 1_000_000}`
+    const spec = platformOauthSpec(slug)
+    const compiled = compileSpec(spec, platformOauthDecision)
+    const published = await publishSkillVersion({
+      slug,
+      ownerUserId: owner,
+      version: '1.0.0',
+      name: String(spec.label),
+      description: String(spec.description),
+      tags: ['连接器', 'OAuth'],
+      rawSkillMd: null,
+      rawArtifact: JSON.stringify(spec),
+      manifest: { connector: true, proposedSecurityDecision: platformOauthDecision },
+      artifactHash: compiled.specHash,
+      embeddingHash: compiled.specHash,
+      riskFlags: [],
+      policyVersion: 1,
+      submittedBy: owner,
+      kind: 'connector',
+      queueAiReview: false,
+    })
+
+    await assert.rejects(
+      approveMarketplaceConnectorVersion({
+        versionId: published.versionId,
+        reviewerUserId: reviewer,
+        securityDecision: platformOauthDecision,
+        expectedSpecHash: compiled.specHash,
+        functionalVerified: true,
+        pool: getPool(),
+      }),
+      (error: unknown) =>
+        error instanceof ConnectorSpecError && error.code === 'PLATFORM_OAUTH_FORBIDDEN',
+    )
+    const pending = await query<{ status: string; signature: Buffer | null }>(
+      'SELECT status, signature FROM marketplace_skill_versions WHERE id = $1',
+      [published.versionId],
+    )
+    assert.deepEqual(pending.rows[0], { status: 'pending', signature: null })
+
+    const { token } = await signAccess({ sub: String(reviewer), role: 'admin' }, JWT_SECRET)
+    const req = makeRequest(
+      { clientId: 'platform-client-id', clientSecret: 'platform-client-secret' },
+      `Bearer ${token}`,
+    )
+    req.method = 'PUT'
+    req.url = `/api/admin/connectors/platform-oauth-apps/${slug}`
+    const { res } = makeResponse()
+    await assert.rejects(
+      handleAdminPutPlatformOauthApp(
+        req,
+        res,
+        { clientIp: '127.0.0.1', userAgent: 'test' } as RequestContext,
+        { jwtSecret: JWT_SECRET } as CommercialHttpDeps,
+      ),
+      (error: unknown) =>
+        error instanceof HttpError &&
+        error.status === 409 &&
+        error.code === 'PLATFORM_OAUTH_RESERVED',
+    )
+    const app = await query('SELECT 1 FROM connector_platform_oauth_apps WHERE slug = $1', [slug])
+    assert.equal(app.rowCount, 0)
+  })
+
   test('并发 bind/uninstall 串行化，不会产生“有连接但未安装”状态', async (t) => {
     if (skipIfNoDb(t)) return
     const owner = await createUser()
@@ -615,9 +789,18 @@ describe('v5 connector marketplace', () => {
     }
   })
 
-  test('非 v5 渠道关闭连接器发布入口', async (t) => {
+  test('非 v5 渠道关闭连接器发布与卸载入口且不改共享安装状态', async (t) => {
     if (skipIfNoDb(t)) return
     const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const user = await createUser()
+    const existingSlug = `v3-installed-${Date.now() % 1_000_000}`
+    const existing = await publishApproved({
+      ownerUserId: owner,
+      reviewerUserId: reviewer,
+      slug: existingSlug,
+    })
+    await installApprovedVersion({ userId: user, versionId: existing.versionId })
     const { token } = await signAccess({ sub: String(owner), role: 'user' }, JWT_SECRET)
     const previous = process.env.OC_RUNTIME_CHANNEL
     process.env.OC_RUNTIME_CHANNEL = 'v3'
@@ -640,6 +823,13 @@ describe('v5 connector marketplace', () => {
         ),
         (error: unknown) => error instanceof HttpError && error.status === 404,
       )
+      await expectMarketplaceError(() => recordUninstall(user, existingSlug), 'NOT_INSTALLABLE')
+      const activeInstall = await query(
+        `SELECT 1 FROM marketplace_installs
+          WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+        [user, existingSlug],
+      )
+      assert.equal(activeInstall.rowCount, 1)
     } finally {
       process.env.OC_RUNTIME_CHANNEL = previous
     }
