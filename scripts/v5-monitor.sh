@@ -34,8 +34,8 @@
 #   激活门 V5MON_CONDITIONS(默认关):非 '1' 时整段 condition 写入完全跳过。
 #     读取顺序 = 进程环境变量直接覆盖(测试用)> ENV_FILE 里 V5MON_CONDITIONS=
 #     (同 DATABASE_URL 手法;oneshot 每轮重读,改 env 即时生效,无需 reload)。
-#   计划维护窗口内被压制的 check(svc_v5/http_v5/public_route)与 V5MON_SKIP
-#   静默项同样跳过 condition 写(部署窗口/显式静默不误开 incident)。
+#   计划维护窗口内由 marker 精确列出的 check 与 V5MON_SKIP 静默项同样跳过
+#   condition 写(普通部署默认 master 三项，--egress 可含 egress 两项)。
 #   写入失败只 log 不阻断(绝不影响既有 outbox/inbox 告警流程)。
 #
 # 详见 docs/V5_MONITORING.md(安装 / 阈值调整 / 静默)。
@@ -60,6 +60,8 @@ EGRESS_HEALTH_URL="${V5MON_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egres
 V3_HEALTH_URL="${V5MON_V3_URL:-http://127.0.0.1:18789/healthz}"
 PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
 MAINTENANCE_FILE="${V5MON_MAINTENANCE_FILE:-/run/openclaude-v5/planned-maintenance.json}"
+MAINTENANCE_LOCK="${V5MON_MAINTENANCE_LOCK:-/run/openclaude-v5/planned-maintenance.lock}"
+CUTOVER_ROOT="${V5MON_CUTOVER_ROOT:-/var/lib/openclaude-v5/cutovers}"
 
 # 统一告警管道(方案 §2.3-2):除站内信外,发告警时 psql 直插 admin_alert_outbox,
 # master 挂掉也照落行,恢复后 dispatcher 补投企微。fan-out 判定复刻 enqueueAlert
@@ -246,39 +248,115 @@ EVENTS=()          # 本轮要进告警正文的行
 HAS_BAD_EVENT=0    # 有新坏/持续坏提醒 → level=warning;纯恢复 → info
 BAD_LIST=()        # 当前所有坏项(进日志摘要)
 
-# Planned maintenance 只压住三项“预期随 master 停机”的检查。marker 必须
-# root:root 0600、绑定本机、nonce 合法且未过期；任何解析/权限/过期问题都
-# fail-open，即继续正常报警。egress/disk/mem/pool/image 永远不受影响。
+# Planned maintenance schema=1(offline cutover)固定压 master 三项；schema=2
+# (deploy/dist/rollback)只压 writer 在 restart 前即时确认健康并写入 checks 的项。
+# 两者都要求 root:root 0600、绑定本机、nonce 合法且未过期；schema=2 额外
+# 限死 180s TTL/模式/scope/commit。任何解析、权限或字段问题都 fail-open。
 MAINTENANCE_ACTIVE=0
-if [[ -f "$MAINTENANCE_FILE" ]]; then
-  marker_owner="$(stat -c '%U:%G' "$MAINTENANCE_FILE" 2>/dev/null || true)"
-  marker_mode="$(stat -c '%a' "$MAINTENANCE_FILE" 2>/dev/null || true)"
-  marker_schema="$(jq -r '.schema // 0' "$MAINTENANCE_FILE" 2>/dev/null || echo 0)"
-  marker_host="$(jq -r '.host // empty' "$MAINTENANCE_FILE" 2>/dev/null || true)"
-  marker_nonce="$(jq -r '.nonce // empty' "$MAINTENANCE_FILE" 2>/dev/null || true)"
-  marker_deadline="$(jq -r '.deadline // 0' "$MAINTENANCE_FILE" 2>/dev/null || echo 0)"
+MAINTENANCE_NONCE=""
+MAINTENANCE_CHECKS=","
+MARKER_PRESENT=0
+MARKER_JSON=""
+CUTOVER_MANIFEST_JSON=""
+CUTOVER_MANIFEST_OWNER=""
+CUTOVER_MANIFEST_MODE=""
+# 与 deploy/cutover writer 共用锁，锁内一次复制不可变 JSON snapshot；后续所有校验和
+# 字段提取只消费该 snapshot，避免“验证旧 marker、读取新 marker”的 TOCTOU。
+maintenance_lock_dir="$(dirname "$MAINTENANCE_LOCK")"
+if mkdir -p "$maintenance_lock_dir" 2>/dev/null && chmod 700 "$maintenance_lock_dir" 2>/dev/null &&
+   touch "$MAINTENANCE_LOCK" 2>/dev/null && chmod 600 "$MAINTENANCE_LOCK" 2>/dev/null &&
+   exec 7>"$MAINTENANCE_LOCK" && flock -n -s 7; then
+  if [[ -f "$MAINTENANCE_FILE" ]]; then
+    marker_owner="$(stat -c '%U:%G' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+    marker_mode="$(stat -c '%a' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+    MARKER_JSON="$(cat "$MAINTENANCE_FILE" 2>/dev/null || true)"
+    MARKER_PRESENT=1
+    snapshot_schema="$(jq -r '.schema // 0' <<<"$MARKER_JSON" 2>/dev/null || echo 0)"
+    snapshot_nonce="$(jq -r '.nonce // empty' <<<"$MARKER_JSON" 2>/dev/null || true)"
+    if [[ "$snapshot_schema" == 1 && "$snapshot_nonce" =~ ^[0-9a-f]{32}$ ]]; then
+      cutover_manifest="$CUTOVER_ROOT/$snapshot_nonce/manifest.json"
+      if [[ -f "$cutover_manifest" ]]; then
+        CUTOVER_MANIFEST_OWNER="$(stat -c '%U:%G' "$cutover_manifest" 2>/dev/null || true)"
+        CUTOVER_MANIFEST_MODE="$(stat -c '%a' "$cutover_manifest" 2>/dev/null || true)"
+        CUTOVER_MANIFEST_JSON="$(cat "$cutover_manifest" 2>/dev/null || true)"
+      fi
+    fi
+  fi
+  flock -u 7
+else
+  log "WARN cannot snapshot maintenance marker under lock; fail-open to normal alerts"
+fi
+if [[ "$MARKER_PRESENT" == 1 ]]; then
+  marker_schema="$(jq -r '.schema // 0' <<<"$MARKER_JSON" 2>/dev/null || echo 0)"
   if [[ "$marker_owner" == root:root && "$marker_mode" == 600 && "$marker_schema" == 1 &&
-        "$marker_host" == "$(hostname -f)" && "$marker_nonce" =~ ^[0-9a-f]{32}$ &&
-        "$marker_deadline" =~ ^[0-9]+$ && "$marker_deadline" -ge "$NOW" ]]; then
+        "$CUTOVER_MANIFEST_OWNER" == root:root && "$CUTOVER_MANIFEST_MODE" == 600 ]] &&
+     jq -e --arg host "$(hostname -f)" --argjson now "$NOW" '
+       .schema == 1 and (.host | type) == "string" and .host == $host and
+       (.nonce | type) == "string" and (.nonce | test("^[0-9a-f]{32}$")) and
+       (.deadline | type) == "number" and (.deadline | floor) == .deadline and
+       .deadline >= $now
+     ' <<<"$MARKER_JSON" >/dev/null 2>&1 &&
+     jq -e --arg host "$(hostname -f)" --arg nonce "$(jq -r '.nonce' <<<"$MARKER_JSON")" '
+       .schema == 1 and .host == $host and .nonce == $nonce
+     ' <<<"$CUTOVER_MANIFEST_JSON" >/dev/null 2>&1; then
     MAINTENANCE_ACTIVE=1
-    log "PLANNED maintenance nonce=$marker_nonce deadline=$marker_deadline"
+    MAINTENANCE_NONCE="$(jq -r '.nonce' <<<"$MARKER_JSON")"
+    MAINTENANCE_CHECKS=",svc_v5,http_v5,public_route,"
+    marker_deadline="$(jq -r '.deadline' <<<"$MARKER_JSON")"
+    log "PLANNED maintenance schema=1 nonce=$MAINTENANCE_NONCE deadline=$marker_deadline checks=svc_v5,http_v5,public_route"
+  elif [[ "$marker_owner" == root:root && "$marker_mode" == 600 && "$marker_schema" == 2 ]] &&
+       jq -e --arg host "$(hostname -f)" --argjson now "$NOW" '
+         .started_at as $started | .deadline as $deadline |
+         .schema == 2 and .kind == "deploy" and
+         (.host | type) == "string" and .host == $host and
+         (.nonce | type) == "string" and (.nonce | test("^[0-9a-f]{32}$")) and
+         (.mode | type) == "string" and (.mode == "deploy" or .mode == "dist" or .mode == "rollback") and
+         (.target_commit | type) == "string" and (.target_commit | test("^[0-9a-f]{40}$")) and
+         ($started | type) == "number" and ($started | floor) == $started and
+         ($deadline | type) == "number" and ($deadline | floor) == $deadline and
+         $started <= $now and $now <= $deadline and
+         ($deadline - $started) >= 1 and ($deadline - $started) <= 180 and
+         (.checks | type) == "array" and (.checks | length) > 0 and
+         (.checks | unique | length) == (.checks | length) and
+         all(.checks[];
+           type == "string" and
+           (. == "svc_v5" or . == "http_v5" or . == "public_route" or
+            . == "svc_egress" or . == "http_egress"))
+       ' <<<"$MARKER_JSON" >/dev/null 2>&1; then
+    MAINTENANCE_ACTIVE=1
+    MAINTENANCE_NONCE="$(jq -r '.nonce' <<<"$MARKER_JSON")"
+    MAINTENANCE_CHECKS=",$(jq -r '.checks | join(",")' <<<"$MARKER_JSON"),"
+    marker_deadline="$(jq -r '.deadline' <<<"$MARKER_JSON")"
+    marker_deploy_mode="$(jq -r '.mode' <<<"$MARKER_JSON")"
+    log "PLANNED maintenance schema=2 mode=$marker_deploy_mode nonce=$MAINTENANCE_NONCE deadline=$marker_deadline checks=${MAINTENANCE_CHECKS#,}"
   else
     log "WARN invalid/expired maintenance marker; fail-open to normal alerts"
   fi
 fi
 
+maintenance_suppresses() { # <check-name>
+  [[ "$MAINTENANCE_ACTIVE" == 1 && "$MAINTENANCE_CHECKS" == *",$1,"* ]]
+}
+
+declare -A PLANNED_SUPPRESSED
+PLANNED_LIST=()
+
 for name in "${CHECK_NAMES[@]}"; do
   st="${CHECK_ST[$name]}"; detail="${CHECK_DETAIL[$name]}"
   case "$SKIP" in *",$name,"*) log "SKIP  $name(V5MON_SKIP)"; continue;; esac
-  if [[ "$MAINTENANCE_ACTIVE" == 1 && "$name" =~ ^(svc_v5|http_v5|public_route)$ ]]; then
-    log "PLANNED $name: $detail"
-    NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" \
-      '.checks[$k] = {status:"planned", since:0, last_alert:0}')"
-    continue
-  fi
   prev="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].status // "ok"')"
   since="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].since // 0')"
   last_alert="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].last_alert // 0')"
+  # 已有 bad 是部署前真实故障，marker 绝不能把它改写成 planned。schema=2 writer
+  # 的即时健康快照是第一道门，这里用上一轮状态做第二道门。
+  if maintenance_suppresses "$name" && [[ "$prev" != bad ]]; then
+    log "PLANNED $name: $detail"
+    PLANNED_SUPPRESSED["$name"]=1
+    PLANNED_LIST+=("$name")
+    NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" --arg nonce "$MAINTENANCE_NONCE" \
+      '.checks[$k] = {status:"planned", since:0, last_alert:0, maintenance_nonce:$nonce}')"
+    continue
+  fi
 
   if [ "$st" = bad ]; then
     BAD_LIST+=("$name")
@@ -334,10 +412,10 @@ write_conditions() {
   sqlf="$(mktemp)" || { log "COND-FAIL mktemp 失败"; return 0; }
   wrote=0
   for name in "${CHECK_NAMES[@]}"; do
-    # 与告警流程同一套静默语义:V5MON_SKIP 显式静默 / 维护窗口压制的三项,
+    # 与告警流程同一套静默语义:V5MON_SKIP 显式静默 / 本轮实际 planned 的项,
     # 都不投影 condition(部署窗口/静默不误开 incident)。
     case "$SKIP" in *",$name,"*) continue;; esac
-    if [[ "$MAINTENANCE_ACTIVE" == 1 && "$name" =~ ^(svc_v5|http_v5|public_route)$ ]]; then
+    if [[ "${PLANNED_SUPPRESSED[$name]:-0}" == 1 ]]; then
       continue
     fi
     st="${CHECK_ST[$name]}"; detail="${CHECK_DETAIL[$name]}"
@@ -374,6 +452,8 @@ write_conditions || true
 if [ "${#BAD_LIST[@]}" -gt 0 ]; then
   log "RUN bad=${#BAD_LIST[@]} [${BAD_LIST[*]}]"
   for name in "${BAD_LIST[@]}"; do log "  BAD $name: ${CHECK_DETAIL[$name]}"; done
+elif [ "${#PLANNED_LIST[@]}" -gt 0 ]; then
+  log "RUN planned=${#PLANNED_LIST[@]} [${PLANNED_LIST[*]}] nonce=$MAINTENANCE_NONCE"
 else
   log "RUN ok(${#CHECK_NAMES[@]} 项全过)"
 fi

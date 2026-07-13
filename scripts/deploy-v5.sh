@@ -56,6 +56,7 @@ V5_PORT="18790"
 CUTOVER_ROOT="/var/lib/openclaude-v5/cutovers"
 CUTOVER_LOCK="/var/lib/openclaude-v5/cutover.lock"
 MAINTENANCE_MARKER="/run/openclaude-v5/planned-maintenance.json"
+MAINTENANCE_LOCK="/run/openclaude-v5/planned-maintenance.lock"
 
 # ── 定位 worktree 根 ──
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -186,6 +187,171 @@ fi
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
 
+# 普通 deploy/dist/rollback 的短维护窗。只把 restart 前“即时确认健康”的检查写进
+# marker，部署前已坏/无法确认的项继续正常告警。schema=2 与 offline cutover 的
+# schema=1 共用一把远端锁，但互不覆盖、互不清理。
+PLANNED_MAINTENANCE_NONCE=""
+PLANNED_MAINTENANCE_ACTIVE=0
+DEPLOY_HOLDER_OWNED=0
+
+begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
+  local maintenance_mode="$1" include_egress="$2" target_commit nonce result healthy_checks
+  target_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  nonce="$(openssl rand -hex 16)"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] begin planned-maintenance schema=2 mode=$maintenance_mode ttl<=180s checks=svc_v5,http_v5,public_route$([[ "$include_egress" == 1 ]] && printf ',svc_egress,http_egress')"
+    PLANNED_MAINTENANCE_NONCE="$nonce"
+    PLANNED_MAINTENANCE_ACTIVE=1
+    return 0
+  fi
+
+  if ! result="$(ssh "$KL_HOST" bash -s -- \
+      "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$maintenance_mode" \
+      "$target_commit" "$nonce" "$include_egress" "$V5_UNIT" "$V5_PORT" "$CUTOVER_ROOT" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; mode="$3"; target_commit="$4"; nonce="$5"; include_egress="$6"
+v5_unit="$7"; v5_port="$8"; cutover_root="$9"; ttl=180
+[[ "$mode" =~ ^(deploy|dist|rollback)$ && "$target_commit" =~ ^[0-9a-f]{40}$ &&
+   "$nonce" =~ ^[0-9a-f]{32}$ && "$include_egress" =~ ^[01]$ ]] || exit 2
+mkdir -p -m 700 "$(dirname "$marker")"
+touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+now="$(date +%s)"
+healthy=()
+body=""
+systemctl is-active --quiet "$v5_unit" 2>/dev/null && healthy+=(svc_v5)
+body="$(curl -fsS --max-time 5 "http://127.0.0.1:${v5_port}/healthz" 2>/dev/null || true)"
+jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_v5)
+body="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' 'http://127.0.0.1/healthz' 2>/dev/null || true)"
+jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(public_route)
+if [[ "$include_egress" == 1 ]]; then
+  systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
+  body="$(curl -fsS --max-time 5 'http://172.31.0.1:18892/internal/v5/egress-health' 2>/dev/null || true)"
+  jq -e '.ok == true and .role == "egress"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_egress)
+fi
+is_healthy() {
+  local wanted="$1" item
+  for item in "${healthy[@]}"; do [[ "$item" == "$wanted" ]] && return 0; done
+  return 1
+}
+if [[ -f "$marker" ]]; then
+  schema="$(jq -r '.schema // empty' "$marker" 2>/dev/null || true)"
+  if [[ "$schema" == 1 ]]; then
+    old_nonce="$(jq -r '.nonce // empty' "$marker" 2>/dev/null || true)"
+    manifest="$cutover_root/$old_nonce/manifest.json"
+    trusted_schema1=0
+    if [[ "$(stat -c '%U:%G' "$marker" 2>/dev/null || true)" == root:root &&
+          "$(stat -c '%a' "$marker" 2>/dev/null || true)" == 600 &&
+          "$old_nonce" =~ ^[0-9a-f]{32}$ && -f "$manifest" &&
+          "$(stat -c '%U:%G' "$manifest" 2>/dev/null || true)" == root:root &&
+          "$(stat -c '%a' "$manifest" 2>/dev/null || true)" == 600 ]] &&
+       jq -e --arg host "$(hostname -f)" --arg nonce "$old_nonce" '
+         .schema == 1 and .host == $host and .nonce == $nonce
+       ' "$marker" >/dev/null 2>&1 &&
+       jq -e --arg host "$(hostname -f)" --arg nonce "$old_nonce" '
+         .schema == 1 and .host == $host and .nonce == $nonce
+       ' "$manifest" >/dev/null 2>&1; then
+      trusted_schema1=1
+    fi
+    if [[ "$trusted_schema1" == 1 ]] && jq -e --argjson now "$now" '
+        (.deadline | type) == "number" and .deadline >= $now
+      ' "$marker" >/dev/null 2>&1; then
+      echo "CONFLICT:active trusted schema1 cutover marker exists" >&2
+      exit 20
+    fi
+    if [[ "$trusted_schema1" == 1 ]] && jq -e --argjson now "$now" '
+        (.deadline | type) == "number" and .deadline < $now
+      ' "$marker" >/dev/null 2>&1 &&
+       is_healthy svc_v5 && is_healthy http_v5 && is_healthy public_route; then
+      rm -f "$marker"
+      echo "STALE:safely cleared expired schema1 marker nonce=$old_nonce after full v5/public health" >&2
+    else
+      echo "SKIPPED:stale/untrusted schema1 marker preserved; deployment continues fail-open"
+      exit 0
+    fi
+  elif [[ "$schema" == 2 ]]; then
+    if jq -e --argjson now "$now" '
+        .schema == 2 and (.deadline | type) == "number" and .deadline >= $now
+      ' "$marker" >/dev/null 2>&1; then
+      echo "CONFLICT:active schema2 deploy marker exists" >&2
+      exit 20
+    fi
+  else
+    echo "SKIPPED:unknown maintenance marker preserved; deployment continues fail-open"
+    exit 0
+  fi
+fi
+if (( ${#healthy[@]} == 0 )); then
+  echo "SKIPPED:no currently healthy checks"
+  exit 0
+fi
+
+started_at="$(date +%s)"; deadline=$((started_at + ttl))
+checks_json="$(printf '%s\n' "${healthy[@]}" | jq -R . | jq -s .)"
+tmp="${marker}.tmp.$$"
+jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --arg kind deploy \
+  --arg mode "$mode" --arg target_commit "$target_commit" \
+  --argjson started_at "$started_at" --argjson deadline "$deadline" \
+  --argjson checks "$checks_json" \
+  '{schema:2,host:$host,nonce:$nonce,kind:$kind,mode:$mode,target_commit:$target_commit,
+    started_at:$started_at,deadline:$deadline,checks:$checks}' >"$tmp"
+chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$marker"
+echo "SET:$nonce:${healthy[*]}"
+REMOTE
+  )"; then
+    echo "✗ 无法开启 planned-maintenance；保留现有 marker，拒绝冒险覆盖" >&2
+    return 1
+  fi
+  if [[ "$result" == SKIPPED:* ]]; then
+    echo "  ⚠ planned-maintenance 未开启(${result#SKIPPED:});所有检查继续 fail-open 告警"
+    return 0
+  fi
+  [[ "$result" == "SET:$nonce:"* ]] || { echo "✗ planned-maintenance 返回异常:$result" >&2; return 1; }
+  PLANNED_MAINTENANCE_NONCE="$nonce"
+  PLANNED_MAINTENANCE_ACTIVE=1
+  healthy_checks="${result#SET:"$nonce":}"
+  echo "  ✓ planned-maintenance 已开启(mode=$maintenance_mode,checks=$healthy_checks)"
+}
+
+end_planned_maintenance() {
+  local nonce="$PLANNED_MAINTENANCE_NONCE" result
+  [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 && -n "$nonce" ]] || return 0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] end planned-maintenance schema=2 nonce=$nonce(nonce-match)"
+    PLANNED_MAINTENANCE_ACTIVE=0; PLANNED_MAINTENANCE_NONCE=""
+    return 0
+  fi
+  if result="$(ssh "$KL_HOST" bash -s -- "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$nonce" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; nonce="$3"
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+    '.schema == 2 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"; echo CLEARED
+else
+  echo PRESERVED
+fi
+REMOTE
+  )"; then
+    PLANNED_MAINTENANCE_ACTIVE=0; PLANNED_MAINTENANCE_NONCE=""
+    [[ "$result" == CLEARED ]] && echo "  ✓ planned-maintenance 已清除" \
+      || echo "  · planned-maintenance 已被替换/不存在，按 nonce 保留现场"
+    return 0
+  fi
+  echo "⚠ planned-maintenance 清理失败；保留 active 供 EXIT 再试，marker 最迟按 TTL 失效" >&2
+  return 1
+}
+
+cleanup_deploy_process() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 ]] && end_planned_maintenance >/dev/null 2>&1
+  [[ "$DEPLOY_HOLDER_OWNED" == 1 ]] && rm -f "${DEPLOY_LOCK}.holder"
+  exit "$rc"
+}
+
 # ───────────────────────── dangerous offline cutover guard ────────────────
 # 普通 deploy/smoke/dist/rollback 永远不会调用本段。只有显式离线三步需要一次性
 # nonce；prepare 必须在服务在线健康、目标镜像已构建后执行，确保构建时间不可能
@@ -314,10 +480,18 @@ recover_cutover() {
   local reason="${1:-offline cutover failed}"
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
   echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"
 mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$maintenance_lock"; chmod 600 "$maintenance_lock"
+exec 8>"$maintenance_lock"; flock -x 8
+clear_own_marker() {
+  if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+      '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+    rm -f "$marker"
+  fi
+}
 bundle="$root/$nonce"
 secure=0
 if [[ "$nonce" =~ ^[0-9a-f]{32}$ && -d "$bundle" && -f "$bundle/manifest.json" &&
@@ -327,7 +501,7 @@ if [[ "$nonce" =~ ^[0-9a-f]{32}$ && -d "$bundle" && -f "$bundle/manifest.json" &
   secure=1
 fi
 if [[ "$secure" != 1 ]]; then
-  rm -f "$marker" || true
+  clear_own_marker || true
   echo 'FATAL: no trusted rollback bundle; refusing to start an unverified/mixed activation' >&2
   exit 1
 fi
@@ -377,7 +551,7 @@ if [[ "$secure" == 1 ]]; then
     if [[ "$restore_failed" == 0 ]]; then
       systemctl start "$unit" || restore_failed=1
     fi
-    rm -f "$marker" || true
+    clear_own_marker || true
     if [[ "$restore_failed" == 0 ]]; then
       echo 'FATAL: old activation restore failed before commit; verified pre-recovery activation restored and started' >&2
       exit "$rc"
@@ -416,7 +590,7 @@ fi
 # Once the old activation is committed, never stop it again merely because
 # start/health is slow. Alerting is re-enabled and manual repair can continue.
 start_rc=0; systemctl start "$unit" || start_rc=$?
-rm -f "$marker"
+clear_own_marker
 [[ "$start_rc" == 0 ]] || { echo 'FATAL: restored activation could not be started' >&2; exit "$start_rc"; }
 for _ in $(seq 1 10); do
   body="$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/healthz" 2>/dev/null)"
@@ -434,10 +608,18 @@ REMOTE
 set_cutover_maintenance() {
   cutover_break_glass && return 0
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] set planned-maintenance marker for nonce=$CUTOVER_NONCE"; return 0; }
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_NONCE" "$MAINTENANCE_MARKER" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_NONCE" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; nonce="$2"; marker="$3"; manifest="$root/$nonce/manifest.json"
+root="$1"; nonce="$2"; marker="$3"; lock="$4"; manifest="$root/$nonce/manifest.json"
 [[ -f "$manifest" && "$(jq -r '.host' "$manifest")" == "$(hostname -f)" ]] || exit 1
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]]; then
+  existing_schema="$(jq -r '.schema // empty' "$marker" 2>/dev/null || true)"
+  existing_nonce="$(jq -r '.nonce // empty' "$marker" 2>/dev/null || true)"
+  [[ "$existing_schema" == 1 && "$existing_nonce" == "$nonce" ]] \
+    || { echo 'FATAL: another planned-maintenance marker exists' >&2; exit 1; }
+fi
 deadline="$(jq -r '.expires_at' "$manifest")"; mkdir -p -m 700 "$(dirname "$marker")"
 jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --argjson deadline "$deadline" \
   '{schema:1,host:$host,nonce:$nonce,deadline:$deadline}' >"$marker.tmp"
@@ -447,7 +629,16 @@ REMOTE
 
 clear_cutover_maintenance() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] clear planned-maintenance marker"; return 0; }
-  ssh "$KL_HOST" "rm -f '$MAINTENANCE_MARKER'"
+  ssh "$KL_HOST" bash -s -- "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$CUTOVER_NONCE" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; lock="$2"; nonce="$3"
+mkdir -p -m 700 "$(dirname "$marker")"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" \
+    '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"
+fi
+REMOTE
 }
 
 install_cutover_target_image_env() {
@@ -1357,6 +1548,9 @@ deploy() {
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
+  fi
+  begin_planned_maintenance deploy "$RESTART_EGRESS"
+  if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
   else
     activate_release "$BUILT_RELEASE"   # 原子 symlink 翻转 + restart(master 只从完整不可变 release 启动)
@@ -1370,6 +1564,7 @@ deploy() {
   if [[ "$WITH_DIST" == 1 ]]; then
     dist_handshake_smoke
   fi
+  end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE)。"
@@ -1551,12 +1746,16 @@ deploy_dist() {
   if [[ "$hc_any" == 1 ]]; then
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
+  fi
+  begin_planned_maintenance dist 0
+  if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
   else
     activate_release "$BUILT_RELEASE"
   fi
   [[ "$DRY" == 1 ]] || smoke
   dist_handshake_smoke
+  end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE)。"
@@ -1575,8 +1774,10 @@ rollback() {
       echo "  [dry-run] hotcfg rollback:读 history 倒数第 $((ROLLBACK_N+1)) 条 committed(master+tuple 同源)→ saga 全量恢复(env 四键逐字面含空值+current+master 源码+.prev-release+restart+smoke)"
       return 0
     fi
+    begin_planned_maintenance rollback 0
     rollback_runtime_tuple "$ROLLBACK_N" || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
     smoke
+    end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
     return 0
   fi
@@ -1588,12 +1789,18 @@ rollback() {
     target="$(ssh "$KL_HOST" "ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | sed -n '$((ROLLBACK_N+1))p'")"
   fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] rollback → ${target:-<第$ROLLBACK_N个更老release>}"; activate_release "${target:-<dry>}"; return 0
+    echo "  [dry-run] rollback → ${target:-<第$ROLLBACK_N个更老release>}"
+    begin_planned_maintenance rollback 0
+    activate_release "${target:-<dry>}"
+    end_planned_maintenance
+    return 0
   fi
   [[ -n "$target" ]] || { echo "✗ 找不到回滚目标(N=$ROLLBACK_N;.prev-release 或第 N 个更老 release 不存在)" >&2; exit 1; }
   ssh "$KL_HOST" "test -d '$target'" || { echo "✗ 回滚目标目录不存在: $target" >&2; exit 1; }
+  begin_planned_maintenance rollback 0
   activate_release "$target"
   smoke
+  end_planned_maintenance
   echo "✓ rollback 完成 → $target。"
 }
 
@@ -1638,6 +1845,7 @@ rollback_runtime_tuple() {
 # fail-loud。只读模式(--dry-run / --smoke)不抢锁。cutover 自有的 CUTOVER_LOCK 是
 # 远端状态机锁,与本地这把互斥锁正交,两把都要。
 DEPLOY_LOCK="/var/lock/oc-v5-deploy.lock"
+trap cleanup_deploy_process EXIT
 if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
   exec 8>"$DEPLOY_LOCK"
   if ! flock -n 8; then
@@ -1646,7 +1854,7 @@ if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
     flock -w 900 8 || { echo "✗ 900s 未取得部署锁 —— 另一会话的部署可能挂死,人工核查 ${DEPLOY_LOCK}.holder 后处置" >&2; exit 3; }
   fi
   printf 'pid=%s mode=%s tree=%s started=%s\n' "$$" "$MODE" "$REPO_ROOT" "$(date -Is)" > "${DEPLOY_LOCK}.holder"
-  trap 'rm -f "${DEPLOY_LOCK}.holder"' EXIT
+  DEPLOY_HOLDER_OWNED=1
 fi
 
 case "$MODE" in
