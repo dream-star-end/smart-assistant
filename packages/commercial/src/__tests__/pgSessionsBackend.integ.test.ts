@@ -1,7 +1,8 @@
 // pgSessionsBackend 集成 + 并发契约测试(RFC-v5-sessions-pg §9)。
 //
 // 需 PG fixture(openclaude_test，与其它 integ 同库)。为不污染共享 public schema，本套件在
-// 专用 schema `oc_p2_sessions_test` 里 apply 0134 六表 + 状态机表(pool 走 search_path 隔离)，
+// 专用 schema `oc_p2_sessions_test` 里 apply 0066/0078 WeChat outbox + 0134 六表 + 状态机表
+// (pool 走 search_path 隔离)，
 // 收尾 DROP SCHEMA CASCADE。无 PG → skip（与既有 integ 模式一致）。
 //
 // 覆盖:
@@ -32,6 +33,8 @@ const SCHEMA = "oc_p2_sessions_test";
 const GENERATION = 1;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_outbox_audit.sql");
+const MIGRATION_0078 = path.resolve(here, "../db/migrations/0078_wechat_outbox_backoff_hol.sql");
 const MIGRATION_0134 = path.resolve(here, "../db/migrations/0134_sessions_master_pg.sql");
 const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_tapes.sql");
 
@@ -69,8 +72,9 @@ before(async () => {
 
   // 业务 pool 走 search_path 隔离 —— 0134 的 unqualified CREATE TABLE 落进本 schema。
   pool = new Pool({ connectionString: TEST_DB_URL, max: 10, options: `-c search_path=${SCHEMA}` });
-  const sql = await readFile(MIGRATION_0134, { encoding: "utf8" });
-  await pool.query(sql);
+  await pool.query(await readFile(MIGRATION_0066, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0078, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0134, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
