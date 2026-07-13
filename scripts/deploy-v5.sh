@@ -2217,9 +2217,28 @@ build_platform_bundle() {
 BUILT_RUNTIME_RELEASE=""; RUNTIME_IMAGE_REF=""; RUNTIME_IMAGE_ID=""
 build_runtime_release() {
   BUILT_RUNTIME_RELEASE=""; RUNTIME_IMAGE_REF=""; RUNTIME_IMAGE_ID=""
-  local full_sha nonce raw staging
+  local full_sha nonce raw staging runtime_caps
   local excl='packages/commercial/agent-sandbox/runtime-src-excludes.txt'
   full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  # runtime capability 是随 pinned 源码 commit 交付的制品声明。必须读该 commit 自己的
+  # metadata，而非可并发变化的 working tree；整列透传，避免新增 capability 时被旧接线抹掉。
+  if ! runtime_caps="$(
+    git -C "$REPO_ROOT" show "${full_sha}:deploy/v5/release-metadata.json" \
+      | jq -er --arg required "$MODEL_AUTHORITY_CAP" '
+          .runtimeCapabilities as $caps
+          | if (($caps | type) != "array") then error("runtimeCapabilities must be an array")
+            elif (($caps | length) == 0) then error("runtimeCapabilities must not be empty")
+            elif any($caps[]; type != "string") then error("runtimeCapabilities must contain only strings")
+            elif any($caps[]; test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not) then error("invalid runtime capability token")
+            elif (($caps | unique | length) != ($caps | length)) then error("duplicate runtime capability token")
+            elif (($caps | index($required)) == null) then error("required runtime capability is missing")
+            else $caps | join(" ")
+            end
+        '
+  )"; then
+    echo "✗ pinned release metadata 的 runtimeCapabilities 非法或缺 '$MODEL_AUTHORITY_CAP':$full_sha" >&2
+    return 1
+  fi
   echo "── build runtime release(源钉死 git archive $full_sha)──"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] archive→prune(--exclude-from=$excl)→敏感扫描→docker npm ci(root 一套)→ccb host bun build 仅拷 dist(无 ccb node_modules)→manifest→rel-<digest>"
@@ -2241,7 +2260,7 @@ build_runtime_release() {
     test -f '$raw/$excl' || { echo 'FATAL: 缺 runtime-src-excludes.txt(agent B 未就位?): $excl' >&2; exit 1; }
     rsync -a --exclude-from='$raw/$excl' '$raw/' '$staging/'
     rm -rf '$raw'" || { echo "✗ release 源钉死/prune 失败" >&2; ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null; return 1; }
-  BUILT_RUNTIME_RELEASE="$(hotcfg_rmt oc_hotcfg_finalize_release "$staging" "$RUNTIME_IMAGE_ID" "$full_sha" "${prev:-}" "$MODEL_AUTHORITY_CAP")" \
+  BUILT_RUNTIME_RELEASE="$(hotcfg_rmt oc_hotcfg_finalize_release "$staging" "$RUNTIME_IMAGE_ID" "$full_sha" "${prev:-}" "$runtime_caps")" \
     || { echo "✗ release finalize 失败(npm ci / ccb build / manifest)" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
   [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] || { echo "✗ release 目录非法: '$BUILT_RUNTIME_RELEASE'" >&2; return 1; }

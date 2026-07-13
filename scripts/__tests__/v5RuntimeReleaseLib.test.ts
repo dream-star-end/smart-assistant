@@ -13,16 +13,16 @@ import { fileURLToPath } from 'node:url'
 // 激活 saga 成功/失败点回滚 + M7c .prev-release 还原 + R2-M2③ canary boot 成功/失败/跳过 +
 // **R3-B4 模型权威兼容地板**(MANIFEST.capabilities 写入/补写 + tuple 守卫③:cutover 后
 // release MANIFEST / 镜像 features label 必须自证 model_authority_v1,不确定即拒))。
-// drill 用 /tmp 假树 + docker/bun stub 全本地跑,断言 160 项全绿。
+// drill 用 /tmp 假树 + docker/bun stub 全本地跑,断言 179 项全绿。
 const here = path.dirname(fileURLToPath(import.meta.url))
 const drill = path.join(here, 'v5-runtime-release-lib-drill.sh')
 const imageGcDrill = path.join(here, 'build-image-gc-drill.sh')
 
 describe('v5 runtime-release lib (hotcfg core)', () => {
-  test('bundle/digest/selfcheck/GC/saga/model-authority-floor drill passes (160 assertions)', () => {
+  test('bundle/digest/selfcheck/GC/saga/model-authority-floor drill passes (179 assertions)', () => {
     const r = spawnSync('bash', [drill], { encoding: 'utf8' })
     assert.equal(r.status, 0, r.stdout + r.stderr)
-    assert.match(r.stdout, /PASS=160 FAIL=0/)
+    assert.match(r.stdout, /PASS=179 FAIL=0/)
   })
 
   // build-image.sh image GC(R2-M1):immutable ID 保护 / inspect 失败保守跳过 /
