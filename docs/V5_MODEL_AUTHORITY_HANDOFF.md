@@ -4,7 +4,8 @@
 
 worktree：`/opt/openclaude/openclaude-v5-modelauth`
 
-同步基线：canonical `87d44375`（连接器平台 + P3 双 master + 隔离预发 Caddy 端口）
+同步基线：canonical `40cc11ec`（连接器平台 + P3 双 master + 隔离预发 Caddy 端口 +
+candidate 有界 fail-closed readiness/recovery）
 
 ## 目标与完成态
 
@@ -58,7 +59,7 @@ worktree：`/opt/openclaude/openclaude-v5-modelauth`
   - `modelAuthorityDbGuards.integ.test.ts`：28/28
   - `modelCatalogAdmin.integ.test.ts`：12/12，连续两轮通过（锁 NOTIFY/rebuild 竞态修复）
 - CCB 定向 Bun 测试：static model 12/12、effort 51/51、thinking 5/5。
-- `modelCatalog.test.ts + scripts/__tests__/v5ReleaseSafety.test.ts`：68/68。
+- `modelCatalog.test.ts + scripts/__tests__/v5ReleaseSafety.test.ts`：71/71。
 - `scripts/v5-deploy-state-smoke.sh`：116/116；`v5-caddy-apply.sh --self-check`：PASS。
 - `bash -n scripts/deploy-v5.sh`、`git diff --check`：PASS。
 
@@ -67,7 +68,7 @@ worktree：`/opt/openclaude/openclaude-v5-modelauth`
 
 ## 正式上线顺序
 
-1. Codex 最终 full-diff review（相对 canonical `87d44375`）必须 PASS；随后 commit、push、合并到
+1. Codex 最终 full-diff review（相对 canonical `40cc11ec`）必须 PASS；随后 commit、push、合并到
    `/opt/openclaude/openclaude-v5-aurora`。
 2. 先在 kl-hk 对**最终 canonical**完成 P3 全路径（canary → promote → finalize、下一轮 abort、
    finalize 断点 recover、真 WS 跨 lane resume）；未通过不得碰生产。

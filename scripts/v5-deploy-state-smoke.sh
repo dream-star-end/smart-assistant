@@ -134,7 +134,7 @@ recover_case() { # $1=phase $2=step $3=candidate $4=路由提示关键字 [$5=�
 }
 recover_case stable     0 ""  "无需恢复"
 recover_case canary     5 B   "canary<READY"    "phase='stable'"        # 前滚清理 → 回 stable(state 终态)
-recover_case canary    10 B   "canary≥READY"    "candidate(B)自检"     # 核验 candidate(unit 状态探活)
+recover_case canary    10 B   "canary≥READY"    "private healthz"      # 核验 candidate 严格私有口状态探活
 recover_case finalizing 0 B   "finalizing 0-1"  "active_slot='B'"       # 前滚 finalize → commit(state 翻转)
 recover_case finalizing 2 B   "finalizing 2-3"  "active_slot='B'"
 recover_case finalizing 4 B   "finalizing 4-5"  "active_slot='B'"
