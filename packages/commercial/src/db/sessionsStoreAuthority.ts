@@ -218,8 +218,10 @@ export function decideSessionsStorePgUnreachable(
   );
 }
 
-/** 本地权威 manifest 默认路径($OPENCLAUDE_HOME/sessions-store-authority.json)。 */
-export function defaultManifestPath(): string {
+/** 本地权威 manifest 路径；双 slot 可用 env 覆盖为同一份 A-slot 权威文件。 */
+export function defaultManifestPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.OC_SESSIONS_MANIFEST_PATH?.trim();
+  if (override) return override;
   return join(paths.home, "sessions-store-authority.json");
 }
 
@@ -325,9 +327,10 @@ export interface ResolveSessionsStoreOptions {
 export async function resolveSessionsStoreAuthority(
   opts: ResolveSessionsStoreOptions = {},
 ): Promise<SessionsStoreDecision> {
-  const env = parseSessionsStoreEnv((opts.env ?? process.env).OC_SESSIONS_STORE);
+  const effectiveEnv = opts.env ?? process.env;
+  const env = parseSessionsStoreEnv(effectiveEnv.OC_SESSIONS_STORE);
   const pool = opts.pool ?? getPool();
-  const manifestPath = opts.manifestPath ?? defaultManifestPath();
+  const manifestPath = opts.manifestPath ?? defaultManifestPath(effectiveEnv);
   // 灾难 nonce 与 manifest 同目录(backfill disaster-restore 写在 dirname(manifest) 下)。
   const noncePath = opts.noncePath ?? join(dirname(manifestPath), "sessions-disaster-nonce.json");
 

@@ -237,6 +237,11 @@ CADDY_HTTP_PORT=18081 KL_HOST=kl-hk bash scripts/deploy-v5.sh --canary
 # V5MON_PUBLIC_URL=http://127.0.0.1:18081/healthz。生产不得设置 CADDY_HTTP_PORT，恒用默认 80。
 # 此覆盖不支持 prepare/offline-cutover lane（该紧急通道仍固定生产 80）。
 
+# P3 canary 起 B slot 时，B 的独立 OPENCLAUDE_HOME 不得产生第二份会话权威：unit 必须用
+# OC_SESSIONS_MANIFEST_PATH 指向 A 的 sessions-store-authority.json。candidate 启动采用有界
+# 私有口轮询，不可改回固定 sleep；若超时，先看 /var/log/openclaude-v5-b.log 与 18897/healthz。
+# 在 transition_step<READY 时 candidate 对流量不可见，脚本会 fail-closed 回 stable。
+
 # 版本握手(2026-07-07):bridge 每次 WS accept 下发 sys.frontend_build(服务端读 dist
 # index.html 的 <meta name="oc-build">,vite build 插件按最终 HTML 内容 sha256 注入),
 # 前端 lib/appUpdate.ts governor 在安全点软刷新拿新前端。防无限刷新硬上限=URL hash
