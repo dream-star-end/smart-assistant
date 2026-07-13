@@ -10,7 +10,7 @@ import { ReviewPanel } from './marketplace/ReviewPanel'
 import { Tabs } from './ui'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
-export type MarketplaceKind = 'skill' | 'agent'
+export type MarketplaceKind = 'skill' | 'agent' | 'connector'
 
 /**
  * AI 市场：发现 / 已安装 / 发布 /（管理员）审核。
@@ -25,6 +25,7 @@ export function MarketplaceCenter({
   initialBrowseKind = 'skill',
   onCreateInChat,
   onAskAiInChat,
+  onOpenConnectors,
   onTabChange,
   onClose,
 }: {
@@ -38,6 +39,8 @@ export function MarketplaceCenter({
   onCreateInChat?: (kind: MarketplaceKind) => void
   /** AI 导购入口(批3):关闭市场 → 新会话 → 输入框预填(text 已拼好);不 autoSend。 */
   onAskAiInChat?: (text: string) => void
+  /** 安装连接器后跳到管理中心完成账号绑定。 */
+  onOpenConnectors?: () => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
@@ -68,7 +71,7 @@ export function MarketplaceCenter({
             <div>
               <Dialog.Title className="text-[15px] font-semibold text-fg">AI 市场</Dialog.Title>
               <p className="mt-0.5 text-[12px] text-faint">
-                发现并安装技能与智能体，也可以把自己的作品分享给大家。
+                发现并安装技能、智能体与连接器，也可以把自己的作品分享给大家。
               </p>
             </div>
             <Dialog.Close asChild>
@@ -99,7 +102,7 @@ export function MarketplaceCenter({
                 {safeTab === 'browse' && (
                   <div className="flex flex-col">
                     <div className="flex gap-1 px-4 pt-3">
-                      {(['skill', 'agent'] as const).map((k) => (
+                      {(['skill', 'agent', 'connector'] as const).map((k) => (
                         <button
                           type="button"
                           key={k}
@@ -111,7 +114,7 @@ export function MarketplaceCenter({
                               : 'text-muted hover:bg-hover hover:text-fg',
                           )}
                         >
-                          {k === 'skill' ? '技能' : '智能体'}
+                          {k === 'skill' ? '技能' : k === 'agent' ? '智能体' : '连接器'}
                         </button>
                       ))}
                     </div>
@@ -119,11 +122,16 @@ export function MarketplaceCenter({
                       auth={auth}
                       kind={browseKind}
                       onAskAiInChat={onAskAiInChat}
+                      onOpenConnectors={onOpenConnectors}
                     />
                   </div>
                 )}
                 {safeTab === 'installed' && (
-                  <InstalledPanel auth={auth} onGoBrowse={() => onTabChange('browse')} />
+                  <InstalledPanel
+                    auth={auth}
+                    onGoBrowse={() => onTabChange('browse')}
+                    onOpenConnectors={onOpenConnectors}
+                  />
                 )}
                 {safeTab === 'publish' && (
                   <PublishPanel auth={auth} onCreateInChat={onCreateInChat} />

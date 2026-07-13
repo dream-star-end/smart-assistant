@@ -9,9 +9,10 @@
 
 import type { Pool } from 'pg'
 import { getPool } from '../db/index.js'
+import { tx } from '../db/queries.js'
+import { approveMarketplaceConnectorVersionWithRunner } from '../marketplace/connectorReview.js'
 import { DEFAULT_CONNECTORS } from './defaults/index.js'
 import { canonicalSha256Hex } from './spec/canonical.js'
-import { markFunctionalVerified, securityApprove } from './spec/review.js'
 
 const SEED_AUTHOR_EMAIL = 'connectors-seed-author@system.openclaude'
 const SEED_REVIEWER_EMAIL = 'connectors-seed-reviewer@system.openclaude'
@@ -64,90 +65,117 @@ export async function seedDefaultConnectors(pool: Pool = getPool()): Promise<See
   const seeded: string[] = []
   const skipped: string[] = []
 
-  for (const d of DEFAULT_CONNECTORS) {
+  for (const [index, d] of DEFAULT_CONNECTORS.entries()) {
     const slug = d.spec.id
     const raw = JSON.stringify(d.spec)
     const specHash = canonicalSha256Hex(d.spec)
-    // 只跳过“当前字节 + 两阶段验收完成 + 未撤销”的版本；旧 spec 不能永久卡住升级。
-    const existing = await pool.query<{ n: string }>(
-      `SELECT count(*)::text AS n FROM marketplace_skill_versions
-        WHERE slug = $1
-          AND artifact_hash = $2
-          AND security_review_state = 'security_approved'
-          AND functional_verify_state = 'verified'
-          AND exec_revoked_at IS NULL`,
-      [slug, specHash],
-    )
-    if (Number(existing.rows[0]?.n ?? '0') > 0) {
-      skipped.push(slug)
-      continue
-    }
-
-    await pool.query(
-      `INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind)
-         VALUES ($1, $2, 'connector') ON CONFLICT (slug) DO NOTHING`,
-      [slug, author],
-    )
-    const listing = await pool.query<{ owner_user_id: string; kind: string }>(
-      `SELECT owner_user_id::text AS owner_user_id, kind
-         FROM marketplace_skill_listings WHERE slug = $1`,
-      [slug],
-    )
-    if (
-      listing.rows[0]?.kind !== 'connector' ||
-      Number(listing.rows[0]?.owner_user_id) !== author
-    ) {
-      throw new Error(`connector seed listing collision: ${slug}`)
-    }
-
     const version = `1.0.0+platform.${specHash.slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO marketplace_skill_versions
-         (slug, version, name, description, raw_artifact, artifact_hash, embedding_hash, submitted_by, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $6, $7, 'pending')
-       ON CONFLICT (slug, version) DO NOTHING`,
-      [slug, version, d.spec.label, d.spec.description.slice(0, 2000), raw, specHash, author],
-    )
-    const v = await pool.query<{
-      id: string
-      raw_artifact: string
-      artifact_hash: string
-      submitted_by: string
-      security_review_state: string
-      functional_verify_state: string
-      exec_revoked_at: Date | null
-    }>(
-      `SELECT id::text AS id, raw_artifact, artifact_hash, submitted_by::text AS submitted_by,
-              security_review_state, functional_verify_state, exec_revoked_at
-         FROM marketplace_skill_versions WHERE slug = $1 AND version = $2`,
-      [slug, version],
-    )
-    const row = v.rows[0]
-    if (
-      !row ||
-      row.raw_artifact !== raw ||
-      row.artifact_hash !== specHash ||
-      Number(row.submitted_by) !== author ||
-      row.exec_revoked_at !== null
-    ) {
-      throw new Error(`connector seed version collision: ${slug}@${version}`)
-    }
-    const versionId = Number(row.id)
-    if (row.security_review_state === 'draft') {
-      await securityApprove({
-        versionId,
-        reviewerUserId: reviewer,
-        securityDecision: d.decision,
-        expectedSpecHash: specHash,
-        pool,
-      })
-    } else if (row.security_review_state !== 'security_approved') {
-      throw new Error(`connector seed version cannot resume: ${slug}@${version}`)
-    }
-    if (row.functional_verify_state === 'unverified') {
-      await markFunctionalVerified(versionId, reviewer, pool)
-    }
-    seeded.push(slug)
+    const changed = await tx(async (client) => {
+      await client.query(
+        `INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind)
+           VALUES ($1, $2, 'connector') ON CONFLICT (slug) DO NOTHING`,
+        [slug, author],
+      )
+      await client.query(
+        `INSERT INTO marketplace_skill_versions
+           (slug, version, name, description, tags, raw_artifact, artifact_hash,
+            embedding_hash, submitted_by, status, ai_review_state,
+            category, use_cases, outcome_examples)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$7,$8,'pending',NULL,$9,$10::jsonb,'[]'::jsonb)
+         ON CONFLICT (slug, version) DO NOTHING`,
+        [
+          slug,
+          version,
+          d.spec.label,
+          d.spec.description.slice(0, 2000),
+          JSON.stringify(d.tags),
+          raw,
+          specHash,
+          author,
+          d.category,
+          JSON.stringify(d.useCases),
+        ],
+      )
+      const before = await client.query<{
+        id: string
+        owner_user_id: string
+        kind: string
+        raw_artifact: string
+        artifact_hash: string
+        submitted_by: string
+        status: string
+        security_review_state: string
+        functional_verify_state: string
+        exec_revoked_at: Date | null
+        current_approved_version_id: string | null
+        state: string
+      }>(
+        `SELECT v.id::text, l.owner_user_id::text, l.kind, v.raw_artifact, v.artifact_hash,
+                v.submitted_by::text, v.status, v.security_review_state,
+                v.functional_verify_state, v.exec_revoked_at,
+                l.current_approved_version_id::text, l.state
+           FROM marketplace_skill_versions v
+           JOIN marketplace_skill_listings l ON l.slug = v.slug
+          WHERE v.slug = $1 AND v.version = $2`,
+        [slug, version],
+      )
+      const row = before.rows[0]
+      if (
+        !row ||
+        row.kind !== 'connector' ||
+        Number(row.owner_user_id) !== author ||
+        Number(row.submitted_by) !== author ||
+        row.raw_artifact !== raw ||
+        row.artifact_hash !== specHash ||
+        row.exec_revoked_at !== null ||
+        row.state === 'revoked'
+      ) {
+        throw new Error(`connector seed collision: ${slug}@${version}`)
+      }
+      const wasComplete =
+        row.status === 'approved' &&
+        row.security_review_state === 'security_approved' &&
+        row.functional_verify_state === 'verified' &&
+        row.current_approved_version_id === row.id &&
+        row.state === 'active'
+
+      // 同一外层事务内完成 version→listing 锁、编译签名、功能验收和 marketplace 上架；
+      // 可从 security/function 已完成但 status 仍 pending 的历史半状态继续收敛。
+      await approveMarketplaceConnectorVersionWithRunner(
+        {
+          versionId: row.id,
+          reviewerUserId: reviewer,
+          securityDecision: d.decision,
+          expectedSpecHash: specHash,
+          functionalVerified: true,
+          note: 'platform-official connector seed',
+          allowPlatformConvergence: true,
+        },
+        client,
+      )
+      await client.query(
+        `UPDATE marketplace_skill_versions
+            SET name = $2, description = $3, tags = $4::jsonb,
+                category = $5, use_cases = $6::jsonb
+          WHERE id = $1`,
+        [
+          row.id,
+          d.spec.label,
+          d.spec.description.slice(0, 2000),
+          JSON.stringify(d.tags),
+          d.category,
+          JSON.stringify(d.useCases),
+        ],
+      )
+      await client.query(
+        `UPDATE marketplace_skill_listings
+            SET featured_rank = $2, updated_at = NOW()
+          WHERE slug = $1`,
+        [slug, d.featured ? 100 + index : null],
+      )
+      return !wasComplete
+    }, pool)
+    ;(changed ? seeded : skipped).push(slug)
   }
   return { seeded, skipped }
 }

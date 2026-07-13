@@ -7,7 +7,8 @@
  * 合法迁移:
  *   draft
  *    →(securityApprove:**同事务**编译+签名+写 exec_contract/hash/sig) security_approved
- *        →(markFunctionalVerified) functional_verified
+ *        →(markFunctionalVerified) verified(人工隔离账号实测)
+ *        →(markDeclarativeVerified) declarative_verified(AI 声明式验证；bind 时跑真实 identity probe)
  *   exec_revoked_at 置位 = per-version kill(bind/execute 每次复核)。
  *
  * loadVerifiedContract = **载入即验**:状态 + 未 revoke + hash 自洽 + 验签 + policy≥当前,
@@ -16,7 +17,8 @@
 
 import { Value } from '@sinclair/typebox/value'
 import type { Pool } from 'pg'
-import { tx } from '../../db/queries.js'
+import { type QueryRunner, tx } from '../../db/queries.js'
+import { isDefaultConnectorArtifact } from '../defaults/index.js'
 import { canonicalSha256Hex } from './canonical.js'
 import { COMPILER_VERSION, compileSpec } from './compiler.js'
 import { signContract, verifyContract } from './signer.js'
@@ -27,6 +29,15 @@ import { ConnectorSpecError, ExecContract, type ExecContractT } from './types.js
  * 不自动继续信任,§1.1)。
  */
 export const CURRENT_SECURITY_POLICY_VERSION = 1
+
+/**
+ * `verified` = 管理员使用隔离账号做过真实功能验收；`declarative_verified` = AI 仅对
+ * 完整声明、编译产物与安全决定做过自动验证，真实凭据有效性在用户 bind 时由 identity
+ * probe 强制验证。两者都可签发执行契约，但审计语义不能混写。
+ */
+export function isAcceptedFunctionalVerificationState(state: string): boolean {
+  return state === 'verified' || state === 'declarative_verified'
+}
 
 export interface SecurityApproveInput {
   versionId: number
@@ -60,83 +71,85 @@ export interface ApprovedContract {
  *   ⑥ CAS 写 contract/hash/sig/state(WHERE 复核 draft + artifact_hash)
  * 任一失败整事务回滚。policyVersion **恒为** CURRENT_SECURITY_POLICY_VERSION(不接受 override,P0-1)。
  */
-export async function securityApprove(input: SecurityApproveInput): Promise<ApprovedContract> {
+export async function securityApproveWithRunner(
+  input: Omit<SecurityApproveInput, 'pool'>,
+  client: QueryRunner,
+): Promise<ApprovedContract> {
   const policyVersion = CURRENT_SECURITY_POLICY_VERSION
   const env = input.env ?? process.env
-  return tx(async (client) => {
-    const r = await client.query<{
-      slug: string
-      submitted_by: string
-      security_review_state: string
-      raw_artifact: string
-      artifact_hash: string
-      kind: string
-    }>(
-      `SELECT v.slug, v.submitted_by, v.security_review_state, v.raw_artifact, v.artifact_hash,
+  const r = await client.query<{
+    slug: string
+    submitted_by: string
+    security_review_state: string
+    raw_artifact: string
+    artifact_hash: string
+    kind: string
+  }>(
+    `SELECT v.slug, v.submitted_by, v.security_review_state, v.raw_artifact, v.artifact_hash,
               l.kind
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1
           FOR UPDATE OF v`,
-      [input.versionId],
+    [input.versionId],
+  )
+  const row = r.rows[0]
+  if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${input.versionId}`)
+  // P0-2:kind 是 DB 事实,skill/agent version 调本函数必败。
+  if (row.kind !== 'connector')
+    throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
+  if (row.security_review_state !== 'draft')
+    throw new ConnectorSpecError('NOT_DRAFT', `state=${row.security_review_state}`)
+
+  // P0-3③:reviewer 必须是 active admin(事务内,防越权签发)。
+  const rev = await client.query<{ role: string; status: string }>(
+    'SELECT role, status FROM users WHERE id = $1',
+    [input.reviewerUserId],
+  )
+  const revRow = rev.rows[0]
+  if (!revRow || revRow.role !== 'admin' || revRow.status !== 'active')
+    throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'reviewer must be an active admin')
+  if (Number(row.submitted_by) === input.reviewerUserId)
+    throw new ConnectorSpecError('REVIEWER_IS_AUTHOR', 'reviewer must differ from author')
+
+  let rawSpec: unknown
+  try {
+    rawSpec = JSON.parse(row.raw_artifact)
+  } catch {
+    throw new ConnectorSpecError('SPEC_SCHEMA_INVALID', 'raw_artifact is not valid JSON')
+  }
+
+  // 同事务:编译 + 签名(§6.1 信任产物与状态迁移同事务)。
+  const compiled = compileSpec(rawSpec, input.securityDecision)
+
+  // P0-3①:artifact_hash 绑定 —— 编译 spec_hash 必须 == version.artifact_hash(封发布后改 raw)。
+  if (compiled.specHash !== row.artifact_hash)
+    throw new ConnectorSpecError(
+      'ARTIFACT_HASH_MISMATCH',
+      'compiled spec_hash != version.artifact_hash',
     )
-    const row = r.rows[0]
-    if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${input.versionId}`)
-    // P0-2:kind 是 DB 事实,skill/agent version 调本函数必败。
-    if (row.kind !== 'connector')
-      throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
-    if (row.security_review_state !== 'draft')
-      throw new ConnectorSpecError('NOT_DRAFT', `state=${row.security_review_state}`)
+  // P0-3②:TOCTOU —— 必须 == reviewer 看到的 expectedSpecHash。
+  if (compiled.specHash !== input.expectedSpecHash)
+    throw new ConnectorSpecError('SPEC_HASH_MISMATCH', 'spec changed since review (TOCTOU)')
+  // spec.id 必须 == listing.slug(防挂靠他人 slug)。
+  if ((rawSpec as { id?: unknown }).id !== row.slug)
+    throw new ConnectorSpecError('SPEC_ID_MISMATCH', 'spec.id != listing slug')
 
-    // P0-3③:reviewer 必须是 active admin(事务内,防越权签发)。
-    const rev = await client.query<{ role: string; status: string }>(
-      'SELECT role, status FROM users WHERE id = $1',
-      [input.reviewerUserId],
-    )
-    const revRow = rev.rows[0]
-    if (!revRow || revRow.role !== 'admin' || revRow.status !== 'active')
-      throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'reviewer must be an active admin')
-    if (Number(row.submitted_by) === input.reviewerUserId)
-      throw new ConnectorSpecError('REVIEWER_IS_AUTHOR', 'reviewer must differ from author')
+  const sig = signContract(
+    {
+      listingSlug: row.slug,
+      versionId: input.versionId,
+      kind: row.kind, // P0-2:签 DB 读到的真实 kind
+      specHash: compiled.specHash,
+      execContractHash: compiled.execContractHash,
+      compilerVersion: COMPILER_VERSION,
+      policyVersion,
+    },
+    { env },
+  )
 
-    let rawSpec: unknown
-    try {
-      rawSpec = JSON.parse(row.raw_artifact)
-    } catch {
-      throw new ConnectorSpecError('SPEC_SCHEMA_INVALID', 'raw_artifact is not valid JSON')
-    }
-
-    // 同事务:编译 + 签名(§6.1 信任产物与状态迁移同事务)。
-    const compiled = compileSpec(rawSpec, input.securityDecision)
-
-    // P0-3①:artifact_hash 绑定 —— 编译 spec_hash 必须 == version.artifact_hash(封发布后改 raw)。
-    if (compiled.specHash !== row.artifact_hash)
-      throw new ConnectorSpecError(
-        'ARTIFACT_HASH_MISMATCH',
-        'compiled spec_hash != version.artifact_hash',
-      )
-    // P0-3②:TOCTOU —— 必须 == reviewer 看到的 expectedSpecHash。
-    if (compiled.specHash !== input.expectedSpecHash)
-      throw new ConnectorSpecError('SPEC_HASH_MISMATCH', 'spec changed since review (TOCTOU)')
-    // spec.id 必须 == listing.slug(防挂靠他人 slug)。
-    if ((rawSpec as { id?: unknown }).id !== row.slug)
-      throw new ConnectorSpecError('SPEC_ID_MISMATCH', 'spec.id != listing slug')
-
-    const sig = signContract(
-      {
-        listingSlug: row.slug,
-        versionId: input.versionId,
-        kind: row.kind, // P0-2:签 DB 读到的真实 kind
-        specHash: compiled.specHash,
-        execContractHash: compiled.execContractHash,
-        compilerVersion: COMPILER_VERSION,
-        policyVersion,
-      },
-      { env },
-    )
-
-    const upd = await client.query(
-      `UPDATE marketplace_skill_versions
+  const upd = await client.query(
+    `UPDATE marketplace_skill_versions
           SET exec_contract = $2,
               exec_contract_hash = $3,
               compiler_version = $4,
@@ -147,30 +160,105 @@ export async function securityApprove(input: SecurityApproveInput): Promise<Appr
               security_reviewed_at = now(),
               security_review_state = 'security_approved'
         WHERE id = $1 AND security_review_state = 'draft' AND artifact_hash = $9`,
-      [
-        input.versionId,
-        JSON.stringify(compiled.execContract),
-        Buffer.from(compiled.execContractHash, 'hex'),
-        COMPILER_VERSION,
-        policyVersion,
-        Buffer.from(sig.signature, 'hex'),
-        sig.keyId,
-        input.reviewerUserId,
-        row.artifact_hash,
-      ],
-    )
-    // CAS:并发把它推离 draft / 改 artifact_hash → rowCount 0 → 回滚 fail-closed。
-    if (upd.rowCount !== 1)
-      throw new ConnectorSpecError('CAS_CONFLICT', 'version left draft concurrently')
-
-    return {
-      execContract: compiled.execContract,
-      specHash: compiled.specHash,
-      execContractHash: compiled.execContractHash,
+    [
+      input.versionId,
+      JSON.stringify(compiled.execContract),
+      Buffer.from(compiled.execContractHash, 'hex'),
+      COMPILER_VERSION,
       policyVersion,
-      compilerVersion: COMPILER_VERSION,
-    }
-  }, input.pool)
+      Buffer.from(sig.signature, 'hex'),
+      sig.keyId,
+      input.reviewerUserId,
+      row.artifact_hash,
+    ],
+  )
+  // CAS:并发把它推离 draft / 改 artifact_hash → rowCount 0 → 回滚 fail-closed。
+  if (upd.rowCount !== 1)
+    throw new ConnectorSpecError('CAS_CONFLICT', 'version left draft concurrently')
+
+  return {
+    execContract: compiled.execContract,
+    specHash: compiled.specHash,
+    execContractHash: compiled.execContractHash,
+    policyVersion,
+    compilerVersion: COMPILER_VERSION,
+  }
+}
+
+export async function securityApprove(input: SecurityApproveInput): Promise<ApprovedContract> {
+  return tx(
+    (client) =>
+      securityApproveWithRunner(
+        {
+          versionId: input.versionId,
+          reviewerUserId: input.reviewerUserId,
+          securityDecision: input.securityDecision,
+          expectedSpecHash: input.expectedSpecHash,
+          ...(input.env ? { env: input.env } : {}),
+        },
+        client,
+      ),
+    input.pool,
+  )
+}
+
+/** security_approved → functional_verified；只允许 active admin，并留 verifier/time 审计。 */
+export async function markFunctionalVerifiedWithRunner(
+  versionId: number,
+  verifierUserId: number,
+  client: QueryRunner,
+): Promise<void> {
+  const verifier = await client.query<{ role: string; status: string }>(
+    'SELECT role, status FROM users WHERE id = $1',
+    [verifierUserId],
+  )
+  if (verifier.rows[0]?.role !== 'admin' || verifier.rows[0]?.status !== 'active') {
+    throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'verifier must be an active admin')
+  }
+  const r = await client.query(
+    `UPDATE marketplace_skill_versions
+          SET functional_verify_state = 'verified',
+              functional_verified_by = $2,
+              functional_verified_at = now()
+        WHERE id = $1
+          AND security_review_state = 'security_approved'
+          AND functional_verify_state = 'unverified'
+          AND exec_revoked_at IS NULL`,
+    [versionId, verifierUserId],
+  )
+  if (r.rowCount !== 1)
+    throw new ConnectorSpecError('INVALID_STATE', 'cannot mark functional-verified')
+}
+
+/**
+ * AI 声明式验证：不冒充隔离账号实测。后续 bind 仍必须成功执行已签 identity probe，
+ * 在此之前不会产生可执行连接。
+ */
+export async function markDeclarativeVerifiedWithRunner(
+  versionId: number,
+  verifierUserId: number,
+  client: QueryRunner,
+): Promise<void> {
+  const verifier = await client.query<{ role: string; status: string }>(
+    'SELECT role, status FROM users WHERE id = $1',
+    [verifierUserId],
+  )
+  if (verifier.rows[0]?.role !== 'admin' || verifier.rows[0]?.status !== 'active') {
+    throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'verifier must be an active admin')
+  }
+  const r = await client.query(
+    `UPDATE marketplace_skill_versions
+          SET functional_verify_state = 'declarative_verified',
+              functional_verified_by = $2,
+              functional_verified_at = now()
+        WHERE id = $1
+          AND security_review_state = 'security_approved'
+          AND functional_verify_state = 'unverified'
+          AND exec_revoked_at IS NULL`,
+    [versionId, verifierUserId],
+  )
+  if (r.rowCount !== 1)
+    throw new ConnectorSpecError('INVALID_STATE', 'cannot mark declarative-verified')
 }
 
 /** security_approved → functional_verified；只允许 active admin，并留 verifier/time 审计。 */
@@ -179,28 +267,7 @@ export async function markFunctionalVerified(
   verifierUserId: number,
   pool: Pool,
 ): Promise<void> {
-  await tx(async (client) => {
-    const verifier = await client.query<{ role: string; status: string }>(
-      'SELECT role, status FROM users WHERE id = $1',
-      [verifierUserId],
-    )
-    if (verifier.rows[0]?.role !== 'admin' || verifier.rows[0]?.status !== 'active') {
-      throw new ConnectorSpecError('REVIEWER_NOT_ADMIN', 'verifier must be an active admin')
-    }
-    const r = await client.query(
-      `UPDATE marketplace_skill_versions
-          SET functional_verify_state = 'verified',
-              functional_verified_by = $2,
-              functional_verified_at = now()
-        WHERE id = $1
-          AND security_review_state = 'security_approved'
-          AND functional_verify_state = 'unverified'
-          AND exec_revoked_at IS NULL`,
-      [versionId, verifierUserId],
-    )
-    if (r.rowCount !== 1)
-      throw new ConnectorSpecError('INVALID_STATE', 'cannot mark functional-verified')
-  }, pool)
+  await tx((client) => markFunctionalVerifiedWithRunner(versionId, verifierUserId, client), pool)
 }
 
 /** per-version kill switch(§1.1):置 exec_revoked_at。幂等(已 revoke 视作成功)。 */
@@ -247,48 +314,52 @@ export interface VerifiedContract {
   authContractVersion: number
 }
 
-/**
- * 与 loadVerifiedContract 同一套 4 闸(kind=connector / security_approved / 未 revoke /
- * hash 自洽 + 验签 + policy 下限),但**多返回** slug/versionId/hash 供三表 pin。
- * loadVerifiedContract 是它的薄封装(只取 .contract),保证闸门单一权威。
- */
-export async function loadVerifiedContractWithMeta(
-  versionId: number,
-  pool: Pool,
-  opts: LoadContractOptions = {},
-): Promise<VerifiedContract> {
-  // P0-1:下限只能抬高,传入值绝不能把它压到 CURRENT 以下。
-  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
-  const env = opts.env ?? process.env
-  const r = await pool.query<{
-    slug: string
-    kind: string
-    security_review_state: string
-    functional_verify_state: string
-    exec_revoked_at: Date | null
-    exec_contract: unknown
-    exec_contract_hash: Buffer | null
-    compiler_version: number | null
-    security_policy_version: number | null
-    signature: Buffer | null
-    key_id: string | null
-  }>(
-    `SELECT v.slug, l.kind, v.security_review_state, v.functional_verify_state,
+interface StoredContractRow {
+  id: string
+  slug: string
+  kind: string
+  artifact_hash: string
+  raw_artifact: string
+  security_review_state: string
+  functional_verify_state: string
+  exec_revoked_at: Date | null
+  exec_contract: unknown
+  exec_contract_hash: Buffer | null
+  compiler_version: number | null
+  security_policy_version: number | null
+  signature: Buffer | null
+  key_id: string | null
+}
+
+async function readStoredContractRows(
+  versionIds: readonly number[],
+  runner: QueryRunner,
+): Promise<StoredContractRow[]> {
+  if (versionIds.length === 0) return []
+  const r = await runner.query<StoredContractRow>(
+    `SELECT v.id::text, v.slug, l.kind, v.artifact_hash, v.raw_artifact,
+            v.security_review_state, v.functional_verify_state,
             v.exec_revoked_at, v.exec_contract,
             v.exec_contract_hash, v.compiler_version, v.security_policy_version, v.signature, v.key_id
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
-      WHERE v.id = $1`,
-    [versionId],
+      WHERE v.id = ANY($1::bigint[])`,
+    [versionIds],
   )
-  const row = r.rows[0]
-  if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${versionId}`)
-  // P0-2:kind 是 DB 事实;非 connector(含被篡改成 skill/agent)→ fail-closed。
+  return r.rows
+}
+
+function verifyStoredContractRow(
+  row: StoredContractRow,
+  policyFloor: number,
+  env: NodeJS.ProcessEnv,
+): VerifiedContract {
+  const versionId = Number(row.id)
   if (row.kind !== 'connector')
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
   if (row.security_review_state !== 'security_approved')
     throw new ConnectorSpecError('NOT_SECURITY_APPROVED', `state=${row.security_review_state}`)
-  if (row.functional_verify_state !== 'verified')
+  if (!isAcceptedFunctionalVerificationState(row.functional_verify_state))
     throw new ConnectorSpecError(
       'NOT_FUNCTIONALLY_VERIFIED',
       `state=${row.functional_verify_state}`,
@@ -304,25 +375,43 @@ export async function loadVerifiedContractWithMeta(
     row.security_policy_version == null
   )
     throw new ConnectorSpecError('CONTRACT_MISSING', 'signed contract columns incomplete')
-
   if (Number(row.security_policy_version) < policyFloor)
     throw new ConnectorSpecError(
       'POLICY_STALE',
       `policy ${row.security_policy_version} < floor ${policyFloor}`,
     )
 
-  // contract 结构自校验。
   const execContract = row.exec_contract
   if (!Value.Check(ExecContract, execContract))
     throw new ConnectorSpecError('EXEC_CONTRACT_INVALID', 'stored exec_contract invalid')
 
-  // hash 自洽:从载入的 contract 重算,与存列对比(JSONB 被篡改 → 不符)。
+  let rawArtifact: unknown
+  try {
+    rawArtifact = JSON.parse(row.raw_artifact)
+  } catch {
+    throw new ConnectorSpecError('ARTIFACT_HASH_MISMATCH', 'stored raw artifact is invalid JSON')
+  }
+  if (canonicalSha256Hex(rawArtifact) !== row.artifact_hash)
+    throw new ConnectorSpecError('ARTIFACT_HASH_MISMATCH', 'raw artifact hash mismatch')
+  if ((execContract as ExecContractT).spec_hash !== row.artifact_hash)
+    throw new ConnectorSpecError('SPEC_HASH_MISMATCH', 'contract is not bound to artifact hash')
+
+  if (
+    (execContract as ExecContractT).authMode === 'oauth2-auth-code' &&
+    (execContract as ExecContractT).oauth2?.clientProvisioning === 'platform' &&
+    !isDefaultConnectorArtifact(row.slug, row.artifact_hash)
+  ) {
+    throw new ConnectorSpecError(
+      'PLATFORM_OAUTH_FORBIDDEN',
+      'platform-managed OAuth is reserved for an exact built-in connector artifact',
+    )
+  }
+
   const recomputedHash = canonicalSha256Hex(execContract)
   const storedHashHex = Buffer.from(row.exec_contract_hash).toString('hex')
   if (recomputedHash !== storedHashHex)
     throw new ConnectorSpecError('HASH_MISMATCH', 'exec_contract_hash mismatch')
 
-  // 验签:覆盖字段(含 DB 读到的 kind)与存储一致(任一字节篡改 → false)。
   const ok = verifyContract(
     {
       listingSlug: row.slug,
@@ -349,10 +438,52 @@ export async function loadVerifiedContractWithMeta(
   }
 }
 
+/**
+ * 与 loadVerifiedContract 同一套 4 闸(kind=connector / security_approved / 未 revoke /
+ * hash 自洽 + 验签 + policy 下限),但**多返回** slug/versionId/hash 供三表 pin。
+ * loadVerifiedContract 是它的薄封装(只取 .contract),保证闸门单一权威。
+ */
+export async function loadVerifiedContractWithMeta(
+  versionId: number,
+  pool: QueryRunner,
+  opts: LoadContractOptions = {},
+): Promise<VerifiedContract> {
+  // P0-1:下限只能抬高,传入值绝不能把它压到 CURRENT 以下。
+  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
+  const env = opts.env ?? process.env
+  const row = (await readStoredContractRows([versionId], pool))[0]
+  if (!row) throw new ConnectorSpecError('VERSION_NOT_FOUND', `version ${versionId}`)
+  return verifyStoredContractRow(row, policyFloor, env)
+}
+
+/**
+ * 批量目录校验：一次 DB 读取后逐条走与单版本完全相同的 hash/policy/key/signature 闸。
+ * 不可信/缺失版本从 Map 省略，基础设施查询错误仍抛出；用于市场搜索避免最多 500 次 N+1。
+ */
+export async function listVerifiedContractsWithMeta(
+  versionIds: readonly number[],
+  pool: QueryRunner,
+  opts: LoadContractOptions = {},
+): Promise<Map<number, VerifiedContract>> {
+  const policyFloor = Math.max(CURRENT_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0)
+  const env = opts.env ?? process.env
+  const rows = await readStoredContractRows(versionIds, pool)
+  const out = new Map<number, VerifiedContract>()
+  for (const row of rows) {
+    try {
+      const verified = verifyStoredContractRow(row, policyFloor, env)
+      out.set(verified.versionId, verified)
+    } catch (error) {
+      if (!(error instanceof ConnectorSpecError)) throw error
+    }
+  }
+  return out
+}
+
 /** 薄封装:只取验签后的 contract(不需要 DB 事实的调用方用它)。 */
 export async function loadVerifiedContract(
   versionId: number,
-  pool: Pool,
+  pool: QueryRunner,
   opts: LoadContractOptions = {},
 ): Promise<ExecContractT> {
   return (await loadVerifiedContractWithMeta(versionId, pool, opts)).contract

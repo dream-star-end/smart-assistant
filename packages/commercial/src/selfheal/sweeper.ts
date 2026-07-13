@@ -1,14 +1,9 @@
 /**
- * v5 自愈体系切片① — incident deliveries sweeper:durable 投递(WS + inbox)。
+ * v5 自愈状态机 sweeper。
  *
- * 消费 incident_deliveries(status='pending'):claim(claimed_at 租约 CAS)→ 投递 → 标 sent。
- *   - channel='ws':调注入的 broadcastAll / broadcastToUsers(at-least-once,前端按 rev 幂等)。
- *   - channel='inbox':**同 PG 事务**内 INSERT inbox_messages(source_type/source_id/source_phase
- *     幂等键 = 最终防线)+ 标 delivery sent(M-inbox-atomic:消除崩溃窗口)。仅 audience='all'
- *     建 inbox delivery(见 incidents.insertDeliveries)。opened/updated→level='warning'(写异常),
- *     resolved→level='info'(恢复通知)。
- *
- * 另维护内存 activeIncidents 快照(每 tick 刷新),供 bridge accept 补发(index.ts 暴露 getter)。
+ * incident 生命周期是内部运维账本，绝不直接产生用户 WS、站内信或重连快照。升级前遗留的
+ * incident_deliveries 每轮统一标 failed，避免旧版 all-user 投递被意外恢复。唯一用户通知出口
+ * 是 userNoticeApproval：可信全自动修复完成 + 精确影响证据 + 企业微信审批后定向发送。
  *
  * autoRepair 派单 + 修复状态机时序看护 = **切片②ⓐ**(本文件 sweepRepairsOnce):env
  * OC_SELFHEAL_DISPATCH_DISABLED 默认视为 disabled(未设=关);启用后每 tick 跑
@@ -36,97 +31,15 @@ import {
   totalBudgetMs,
 } from "./config.js";
 
-// B3:配置解析已收口 selfheal/config.ts;此处 re-export 保持既有 import 站点
-// (index barrel / bridge)不动。
+// B3:配置解析已收口 selfheal/config.ts;此处 re-export 保持既有 index barrel import。
 export { isSelfhealDispatchDisabled };
 
 const DEFAULT_INTERVAL_MS = 10_000;
-const CLAIM_LEASE = "2 minutes";
-const CLAIM_BATCH = 50;
-const RECOVERY_MESSAGE = "相关功能已恢复正常,感谢您的耐心等待。";
-
-/** WS 帧(protocol SysIncident / web-react IncidentWire 契约,字段/类型严格对齐)。 */
-export interface IncidentPayload {
-  type: "sys.incident";
-  incidentId: string;
-  rev: number;
-  status: "open" | "resolved";
-  severity: "info" | "warning" | "critical";
-  surface: string;
-  title: string;
-  message: string;
-  ts: number;
-}
-
-export type BroadcastAllFn = (payload: unknown) => number;
-export type BroadcastToUsersFn = (uids: string[], payload: unknown) => number;
-
-/** One active incident in the backfill snapshot: its WS payload plus the routing
- *  facts needed to filter visibility per user. */
-export interface ActiveIncidentEntry {
-  payload: IncidentPayload;
-  audience: string;
-  /** Materialized recipient uids for audience='user_ids' (empty otherwise). */
-  recipients: Set<string>;
-}
-
-/**
- * Per-user visibility filter for the post-auth backfill (Codex B2 — a global
- * snapshot leaked targeted incidents to every reconnecting user). Rules:
- *   - audience='all'           → visible to everyone;
- *   - audience='user_ids'      → visible ONLY to a materialized recipient;
- *   - audience='surface_cohort'/anything else → visible to NOBODY (fail closed:
- *     cohort attribution isn't materialized, so we never leak a targeted incident
- *     by treating it as broadcast).
- */
-export function visibleIncidentsForUser(
-  entries: ActiveIncidentEntry[],
-  uid: string,
-): IncidentPayload[] {
-  return entries
-    .filter((e) => e.audience === "all" || (e.audience === "user_ids" && e.recipients.has(uid)))
-    .map((e) => e.payload);
-}
 
 export interface SweeperDeps {
-  broadcastAll: BroadcastAllFn;
-  broadcastToUsers: BroadcastToUsersFn;
   query?: typeof _query;
   tx?: typeof _tx;
   logger?: Logger;
-}
-
-interface IncidentRow {
-  id: string;
-  rev: string;
-  status: "open" | "repairing" | "resolved";
-  severity: "info" | "warning" | "critical";
-  surface: string;
-  audience: string;
-  user_title: string;
-  user_message: string;
-}
-interface ClaimedDeliveryRow {
-  id: string;
-  incident_id: string;
-  incident_rev: string;
-  channel: "ws" | "inbox";
-  phase: "opened" | "updated" | "resolved";
-}
-
-function buildPayload(inc: IncidentRow, deliveryRev: number, phase: string): IncidentPayload {
-  const status: "open" | "resolved" = phase === "resolved" ? "resolved" : "open";
-  return {
-    type: "sys.incident",
-    incidentId: inc.id,
-    rev: deliveryRev,
-    status,
-    severity: inc.severity,
-    surface: inc.surface,
-    title: inc.user_title,
-    message: status === "resolved" ? RECOVERY_MESSAGE : inc.user_message,
-    ts: Date.now(),
-  };
 }
 
 export interface SweepResult {
@@ -135,9 +48,7 @@ export interface SweepResult {
   errors: number;
 }
 
-/**
- * 单次 sweep。幂等(claim 租约 + delivery 唯一键 + inbox source 幂等键)。
- */
+/** 单次 sweep：先永久封存 legacy 用户投递，再推进内部修复状态机。 */
 export async function sweepOnce(deps: SweeperDeps): Promise<SweepResult> {
   const query = deps.query ?? _query;
   const tx = deps.tx ?? _tx;
@@ -149,50 +60,6 @@ export async function sweepOnce(deps: SweeperDeps): Promise<SweepResult> {
   // all-user WS/inbox notice after the new approval gate is installed.
   await query(`UPDATE incident_deliveries SET status='failed', claimed_at=NOW()
     WHERE status='pending'`);
-  const claimed = { rows: [] as ClaimedDeliveryRow[] };
-
-  // 注意:claimed 为空**不 early-return**——修复状态机看护(verify fence/timeout/
-  // cancel 推进)与 nonce 保洁必须每 tick 跑,否则"无 pending 投递"的安静时段里
-  // cancel/verify 永远卡住(收尾批修:此前 early-return 让 repair sweep 饿死)。
-  if (claimed.rows.length > 0) {
-    // 批量取 incident 详情(payload materialize)。
-    const incidentIds = [...new Set(claimed.rows.map((d) => d.incident_id))];
-    const incR = await query<IncidentRow>(
-      `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
-              user_title, user_message
-         FROM incidents WHERE id = ANY($1::bigint[])`,
-      [incidentIds],
-    );
-    const incById = new Map<string, IncidentRow>();
-    for (const r of incR.rows) incById.set(r.id, r);
-
-    for (const d of claimed.rows) {
-      const inc = incById.get(d.incident_id);
-      if (!inc) {
-        // 理论不可达(FK CASCADE);标 sent 防死循环。
-        await query(`UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`, [d.id]);
-        continue;
-      }
-      const payload = buildPayload(inc, Number(d.incident_rev), d.phase);
-      try {
-        if (d.channel === "ws") {
-          await deliverWs(query, deps, inc, d.id, payload);
-          out.ws++;
-        } else {
-          await deliverInbox(tx, inc, d, payload);
-          out.inbox++;
-        }
-      } catch (err) {
-        out.errors++;
-        // 失败留 pending(claimed_at 租约到期后重投,at-least-once);不置 failed 以免丢投递。
-        log.warn("selfheal_delivery_failed", {
-          delivery: d.id,
-          channel: d.channel,
-          err: (err as Error)?.message ?? String(err),
-        });
-      }
-    }
-  }
 
   // M3:webhook nonce 保洁(selfheal_webhook_nonces,ts 窗口 ±2min << 10min 保留余量)。
   // 失败只 warn,不拖垮主链。
@@ -213,76 +80,6 @@ export async function sweepOnce(deps: SweeperDeps): Promise<SweepResult> {
   }
 
   return out;
-}
-
-/** WS 投递:按 audience 分流 broadcastAll / broadcastToUsers;完成后标 sent(fire-and-forget,0 在线仍算送达)。 */
-async function deliverWs(
-  query: typeof _query,
-  deps: SweeperDeps,
-  inc: IncidentRow,
-  deliveryId: string,
-  payload: IncidentPayload,
-): Promise<void> {
-  if (inc.audience === "user_ids") {
-    const recips = await query<{ user_id: string }>(
-      `SELECT user_id::text AS user_id FROM incident_recipients WHERE incident_id = $1::bigint`,
-      [inc.id],
-    );
-    deps.broadcastToUsers(recips.rows.map((r) => r.user_id), payload);
-  } else if (inc.audience === "all") {
-    deps.broadcastAll(payload);
-  } else {
-    // surface_cohort: cohort attribution not implemented → fail CLOSED. NEVER
-    // broadcast a targeted incident to every user (Codex B2). The incident still
-    // exists for admins; realtime targeted delivery awaits cohort materialization
-    // (RFC M-recipients). Marked sent below to avoid a delivery retry loop.
-    deps.logger?.warn("selfheal_ws_surface_cohort_failclosed", {
-      incidentId: payload.incidentId,
-    });
-  }
-  await query(`UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`, [deliveryId]);
-}
-
-/**
- * inbox 投递:同事务 INSERT inbox(source 幂等键)+ 标 delivery sent。
- * created_by = MIN active admin(与 inboxPostHandler / writeSystemInbox 系统收件人语义一致;
- * inbox_messages.created_by 有 FK → users,不硬编码 1,现解析更稳)。无 admin → 跳过 inbox
- * (WS 已覆盖在线用户),标 sent 防死循环。
- */
-async function deliverInbox(
-  tx: typeof _tx,
-  inc: IncidentRow,
-  d: ClaimedDeliveryRow,
-  payload: IncidentPayload,
-): Promise<void> {
-  const resolved = payload.status === "resolved";
-  const level = resolved ? "info" : "warning";
-  const title = (resolved ? `${inc.user_title}(已恢复)` : inc.user_title).slice(0, 190) || inc.surface;
-  const body = (resolved ? RECOVERY_MESSAGE : inc.user_message).slice(0, 16000) || title;
-  // L1(收尾批):'updated' 相位的 inbox 幂等键带上 incident_rev——同一 incident 的
-  // 多次 update(severity/文案升级)各落一条站内信;同 rev 重放仍只一条。
-  // opened/resolved 每 incident 语义唯一,保持裸相位不变。
-  const sourcePhase = d.phase === "updated" ? `updated:${d.incident_rev}` : d.phase;
-  await tx(async (client: PoolClient) => {
-    const adminR = await client.query<{ id: string }>(
-      `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
-    );
-    const createdBy = adminR.rows[0]?.id;
-    if (createdBy) {
-      await client.query(
-        `INSERT INTO inbox_messages
-           (audience, user_id, title, body_md, level, created_by, source_type, source_id, source_phase)
-         VALUES ('all', NULL, $1, $2, $3, $4::bigint, 'incident', $5::bigint, $6)
-         ON CONFLICT (source_type, source_id, source_phase) WHERE source_type IS NOT NULL
-           DO NOTHING`,
-        [title, body, level, createdBy, inc.id, sourcePhase],
-      );
-    }
-    await client.query(
-      `UPDATE incident_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1::bigint`,
-      [d.id],
-    );
-  });
 }
 
 // ─── 切片②ⓐ:修复派单 + 状态机时序看护 ─────────────────────────────────
@@ -589,67 +386,24 @@ function alertTimeout(
   });
 }
 
-// ─── activeIncidents 内存快照(供 bridge accept 补发)──────────────────
+// ─── leader sweeper lifecycle ───────────────────────────────────────
 
-export interface IncidentReconcilerSnapshotHandle {
+export interface IncidentSweeperHandle {
   stop(): Promise<void>;
   runNow(): Promise<SweepResult>;
-  /**
-   * 当前活跃(未 resolved)incident 中**该 uid 可见**的 WS payload 快照,供 bridge
-   * 鉴权后补发。可见性 = audience='all' 或(audience='user_ids' 且 uid 在
-   * incident_recipients)。surface_cohort 未 materialize 归因 → 对任何具体用户
-   * fail-closed 不可见(绝不把定向事故补发给全站,Codex B2)。
-   */
-  getActiveIncidentsForUser(uid: string): IncidentPayload[];
 }
 
 export function startIncidentSweeper(
   opts: { intervalMs?: number; runOnStart?: boolean } & SweeperDeps,
-): IncidentReconcilerSnapshotHandle {
+): IncidentSweeperHandle {
   const interval = Math.max(2_000, opts.intervalMs ?? DEFAULT_INTERVAL_MS);
-  const query = opts.query ?? _query;
   const log = opts.logger ?? rootLogger.child({ subsys: "selfheal", module: "sweeper" });
   let stopped = false;
   let inflight: Promise<SweepResult> | null = null;
-  // Per-incident snapshot carries audience + materialized recipients so the
-  // bridge re-send can be filtered PER USER (Codex B2 — a global array leaked
-  // targeted incidents to every reconnecting user).
-  let activeSnapshot: ActiveIncidentEntry[] = [];
-
-  async function refreshActive(): Promise<void> {
-    try {
-      const r = await query<IncidentRow>(
-        `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
-                user_title, user_message
-           FROM incidents WHERE status <> 'resolved'`,
-      );
-      const entries: ActiveIncidentEntry[] = [];
-      for (const inc of r.rows) {
-        const payload = buildPayload(inc, Number(inc.rev), "opened");
-        let recipients = new Set<string>();
-        if (inc.audience === "user_ids") {
-          const rr = await query<{ user_id: string }>(
-            `SELECT user_id::text AS user_id FROM incident_recipients WHERE incident_id = $1::bigint`,
-            [inc.id],
-          );
-          recipients = new Set(rr.rows.map((x) => x.user_id));
-        }
-        entries.push({ payload, audience: inc.audience, recipients });
-      }
-      activeSnapshot = entries;
-    } catch (err) {
-      log.warn("selfheal_active_snapshot_refresh_failed", {
-        err: (err as Error)?.message ?? String(err),
-      });
-    }
-  }
 
   async function tick(): Promise<SweepResult> {
     if (inflight) return inflight;
-    inflight = (async () => {
-      await refreshActive();
-      return sweepOnce({ ...opts, logger: log });
-    })()
+    inflight = sweepOnce({ ...opts, logger: log })
       .then((r) => {
         if (r.ws || r.inbox || r.errors) {
           log.info("selfheal_sweep", { ws: r.ws, inbox: r.inbox, errors: r.errors });
@@ -680,79 +434,5 @@ export function startIncidentSweeper(
       if (inflight) await inflight;
     },
     runNow: tick,
-    // Per-user visibility filter (Codex B2) — see visibleIncidentsForUser.
-    getActiveIncidentsForUser: (uid: string) => visibleIncidentsForUser(activeSnapshot, uid),
-  };
-}
-
-/**
- * 每槽只读 active incident 快照。与 leader-only sweeper 分离：双 master 下 follower 也要
- * 在 WS 鉴权后补发本用户可见事故，但绝不能 claim delivery / 推进 repair 状态机。
- */
-export interface IncidentSnapshotHandle {
-  stop(): Promise<void>;
-  runNow(): Promise<void>;
-  getActiveIncidentsForUser(uid: string): IncidentPayload[];
-}
-
-export function startIncidentSnapshot(opts: {
-  intervalMs?: number;
-  query?: typeof _query;
-  logger?: Logger;
-} = {}): IncidentSnapshotHandle {
-  const interval = Math.max(2_000, opts.intervalMs ?? DEFAULT_INTERVAL_MS);
-  const query = opts.query ?? _query;
-  const log = opts.logger ?? rootLogger.child({ subsys: "selfheal", module: "snapshot" });
-  let stopped = false;
-  let inflight: Promise<void> | null = null;
-  let activeSnapshot: ActiveIncidentEntry[] = [];
-
-  async function refresh(): Promise<void> {
-    if (inflight) return inflight;
-    inflight = (async () => {
-      const r = await query<IncidentRow>(
-        `SELECT id::text AS id, rev::text AS rev, status, severity, surface, audience,
-                user_title, user_message
-           FROM incidents WHERE status <> 'resolved'`,
-      );
-      const entries: ActiveIncidentEntry[] = [];
-      for (const inc of r.rows) {
-        const payload = buildPayload(inc, Number(inc.rev), "opened");
-        let recipients = new Set<string>();
-        if (inc.audience === "user_ids") {
-          const rr = await query<{ user_id: string }>(
-            `SELECT user_id::text AS user_id FROM incident_recipients WHERE incident_id=$1::bigint`,
-            [inc.id],
-          );
-          recipients = new Set(rr.rows.map((x) => x.user_id));
-        }
-        entries.push({ payload, audience: inc.audience, recipients });
-      }
-      activeSnapshot = entries;
-    })()
-      .catch((err) => {
-        log.warn("selfheal_snapshot_refresh_failed", {
-          err: (err as Error)?.message ?? String(err),
-        });
-      })
-      .finally(() => {
-        inflight = null;
-      });
-    return inflight;
-  }
-
-  const timer = setInterval(() => {
-    if (!stopped) void refresh();
-  }, interval);
-  if (typeof timer.unref === "function") timer.unref();
-
-  return {
-    async stop() {
-      stopped = true;
-      clearInterval(timer);
-      if (inflight) await inflight;
-    },
-    runNow: refresh,
-    getActiveIncidentsForUser: (uid) => visibleIncidentsForUser(activeSnapshot, uid),
   };
 }

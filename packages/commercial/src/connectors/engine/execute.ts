@@ -17,6 +17,7 @@
 
 import type { Pool } from 'pg'
 import { getPool } from '../../db/index.js'
+import { assertConnectorExecutionEntitlement } from '../entitlement.js'
 import { ConnectorError } from '../errors.js'
 import { loadVerifiedContractWithMeta } from '../spec/review.js'
 import { ConnectorSpecError, type ExecActionT, type ExecContractT } from '../spec/types.js'
@@ -46,6 +47,7 @@ export async function loadContractForConnection(
   if (!Number.isInteger(versionId))
     throw new ConnectorError('RELINK_REQUIRED', 'connection has no pinned version')
   try {
+    await assertConnectorExecutionEntitlement(row.user_id, row.provider, versionId, pool)
     const meta = await loadVerifiedContractWithMeta(versionId, pool)
     const specHash = row.spec_hash?.toString('hex') ?? ''
     const execContractHash = row.exec_contract_hash?.toString('hex') ?? ''

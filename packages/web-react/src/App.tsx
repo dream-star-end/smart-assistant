@@ -63,7 +63,7 @@ import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveConnBanner } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
-import { type ActiveIncident, incidentStore, useActiveIncidents } from "./lib/incidentStore";
+import { incidentStore } from "./lib/incidentStore";
 import {
   clearTeamModeForSession,
   readTeamModeForSession,
@@ -131,29 +131,6 @@ function DialogFallback() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
       <Spinner size={22} />
-    </div>
-  );
-}
-
-/** incident severity → Alert tone（critical→danger / warning→warning / info→info）。 */
-const INCIDENT_TONE = { critical: "danger", warning: "warning", info: "info" } as const;
-
-/**
- * 自愈事故横幅（切片①）——渲染当前活跃事故（sys.incident open/updated）。挂在连接状态条
- * **上方**、composer 上沿，用与连接条同款 <Alert>；多条按 severity 降序堆叠、互不遮挡，
- * 且不阻断输入（inline 流式，非遮罩）。事故 resolved 时由 incidentStore 从活跃集移除、横幅
- * 自动消失（App 另发一次性恢复 toast），无需手动关闭——避免用户误关活跃告警而漏掉真问题。
- */
-function IncidentBanners() {
-  const incidents = useActiveIncidents();
-  if (incidents.length === 0) return null;
-  return (
-    <div className="mx-auto mb-2 flex max-w-3xl flex-col gap-2 px-4">
-      {incidents.map((it: ActiveIncident) => (
-        <Alert key={it.incidentId} tone={INCIDENT_TONE[it.severity]} title={it.title}>
-          {it.message}
-        </Alert>
-      ))}
     </div>
   );
 }
@@ -241,9 +218,8 @@ export function App() {
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
   const sockRef = useRef<UseChatSocket | null>(null);
   const toast = useToast();
-  // 自愈事故恢复（sys.incident resolved）→ 一次性 success toast。恢复文案权威在服务端
-  // （resolved 帧的 message，master 从 policy 表 materialize）；缺省兜底“已恢复”。横幅由
-  // incidentStore 从活跃集移除后自动消失，此处只补一条转瞬即逝的正向反馈。
+  // 只有 userNoticeApproval 完整门禁后的 approved_recovery 才进入一次性 success toast。
+  // 内部 incident 的 open/resolved 均由 store 静默忽略，不展示负面运维状态。
   useEffect(
     () =>
       incidentStore.onResolved((e) => {
@@ -728,6 +704,8 @@ export function App() {
     // /?connector_error=<code>（错误码经 connectorErrorText 映射中文，不裸露码）。
     if (sp.has("connector_linked")) {
       toast("应用已连接", "success");
+      setManageTab("connectors");
+      setManageOpen(true);
       sp.delete("connector_linked");
       touched = true;
     }
@@ -1571,9 +1549,6 @@ export function App() {
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
             </div>
           )}
-          {/* 自愈事故横幅：服务面异常(open)时在连接条上方提示，恢复(resolved)自动清除并弹 toast。
-              additive 帧驱动，与连接条独立并存，不阻断输入。demo/gated 不显。*/}
-          {!demo && !gated && <IncidentBanners />}
           {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。*/}
           {!gated && connBanner && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
@@ -1679,6 +1654,10 @@ export function App() {
             agentId={agent.id}
             agents={myAgents}
             onTabChange={setManageTab}
+            onOpenMarketplace={() => {
+              setManageOpen(false);
+              openMarketplace("browse", "connector");
+            }}
             onClose={() => setManageOpen(false)}
           />
         </LazyBoundary>
@@ -1703,6 +1682,10 @@ export function App() {
               setMarketplaceOpen(false);
               newSession();
               setComposerPrefill({ text, nonce: Date.now() });
+            }}
+            onOpenConnectors={() => {
+              setMarketplaceOpen(false);
+              openManage("connectors");
             }}
             onTabChange={setMarketplaceTab}
             onClose={() => {

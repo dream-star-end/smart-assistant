@@ -1,5 +1,5 @@
 import { HardDrive, Mail, MessagesSquare, NotebookText, Plug } from "lucide-react";
-import { createElement, type ComponentType, type ReactElement } from "react";
+import { type ComponentType, type ReactElement, createElement } from "react";
 
 /**
  * 应用连接器（App Connectors）的**纯逻辑 + 展示元数据层**（框架无关、可单测）。
@@ -137,11 +137,36 @@ export type DeclarativeConnection = {
   slug: string;
   displayName: string;
   accountHint?: string;
+  connectorVersionId?: string | null;
   createdAt: string;
 };
 
 /** GET /api/connectors/declarative/connections 回包。 */
 export type DeclarativeConnectionsResponse = { connections: DeclarativeConnection[] };
+
+/** 管理中心连接器聚合项（default ∪ marketplace install ∪ orphan binding）。 */
+export type DeclarativeManagementConnector = {
+  slug: string;
+  label: string;
+  description: string;
+  installation: "default" | "marketplace" | "orphan";
+  official: boolean;
+  available: boolean;
+  canBind: boolean;
+  listingState: string;
+  installedVersion: string | null;
+  installedVersionId: string | null;
+  latestVersion: string | null;
+  latestVersionId: string | null;
+  updateAvailable: boolean;
+  connectionCount: number;
+  contract: DeclarativeCatalogEntry | null;
+};
+
+export type DeclarativeManagementResponse = {
+  connectors: DeclarativeManagementConnector[];
+  connections: DeclarativeConnection[];
+};
 
 /** POST /api/connectors/declarative/bind 回包。 */
 export type DeclarativeBindResult = {
@@ -254,6 +279,7 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   VERIFY_FAILED: "连接校验失败，请检查填写信息后重试",
   RELINK_REQUIRED: "授权已失效，请重新绑定",
   ACCOUNT_ALREADY_LINKED: "该账号已绑定，请勿重复绑定",
+  CONNECTOR_NOT_INSTALLED: "请先从 AI 市场安装或更新该连接器",
   DUPLICATE_CONNECTION: "该账号已绑定，请勿重复绑定",
   TOO_MANY_CONNECTIONS: "绑定数量已达上限，请先解绑部分账号",
   QUOTA_EXCEEDED: "绑定数量已达上限，请先解绑部分账号",

@@ -18,8 +18,8 @@ import {
   marketAskAiPrefill,
   updateAvailable,
 } from "../../lib/marketplace";
-import { cn } from "../../lib/utils";
 import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
+import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, EmptyState, Input, Skeleton } from "../ui";
 import { DetailModal } from "./DetailModal";
 
@@ -82,6 +82,7 @@ function CardTile({
         </div>
         <div className="flex flex-wrap items-center gap-1">
           {card.preset && <Badge tone="success">预设 · 开箱即用</Badge>}
+          {card.preinstalled && <Badge tone="success">官方 · 已预装</Badge>}
           {canUpdate && <Badge tone="accent">可更新</Badge>}
           {catLabel && (
             <Badge tone="info">
@@ -171,12 +172,14 @@ export function BrowsePanel({
   auth,
   kind = "skill",
   onAskAiInChat,
+  onOpenConnectors,
 }: {
   auth: AuthSession;
   /** 仅展示该类目。M2 默认且仅 'skill'（agent 投递在 M3，M4 才开 agent Tab）。 */
-  kind?: "skill" | "agent";
+  kind?: "skill" | "agent" | "connector";
   /** AI 导购入口(批3):有查询词时结果区顶部「让 AI 帮我找并装好」;缺省则不渲染入口。 */
   onAskAiInChat?: (text: string) => void;
+  onOpenConnectors?: () => void;
 }) {
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
@@ -244,7 +247,7 @@ export function BrowsePanel({
     [debouncedQ, cards],
   );
 
-  const noun = kind === "agent" ? "智能体" : "技能";
+  const noun = kind === "agent" ? "智能体" : kind === "connector" ? "连接器" : "技能";
 
   // 当前平铺(chips 选中某类,或搜索态)的卡片集。
   const flatCards = useMemo(() => {
@@ -268,7 +271,9 @@ export function BrowsePanel({
             placeholder={
               kind === "agent"
                 ? "搜索智能体（试试「写作」「编程」「研究」）…"
-                : "搜索技能（试试「翻译」「论文」「写作」）…"
+                : kind === "connector"
+                  ? "搜索连接器（试试「文档」「代码」「沟通」）…"
+                  : "搜索技能（试试「翻译」「论文」「写作」）…"
             }
             className="pl-9"
           />
@@ -396,6 +401,7 @@ export function BrowsePanel({
         onClose={() => setActive(null)}
         onInstalled={onInstalled}
         onAskAiInChat={onAskAiInChat}
+        onOpenConnectors={onOpenConnectors}
       />
     </div>
   );

@@ -1,12 +1,12 @@
 import { MARKETPLACE_CATEGORIES } from "@openclaude/protocol";
 import { CheckCircle2, ChevronRight, Loader2, Plus, Sparkles, Upload, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { api, ApiError, apiErrorMessage } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import {
   type HumanMetaDraft,
-  suggestSlug,
-  USE_CASES_MAX,
   OUTCOMES_MAX,
+  USE_CASES_MAX,
+  suggestSlug,
   validateHumanMeta,
 } from "../../lib/marketplace";
 import type {
@@ -178,13 +178,15 @@ const TOOLSET_OPTIONS: { value: string; label: string; hint: string; locked?: bo
 ];
 
 /** 发布成功后的通用完成态。 */
-function DoneScreen({ onAgain }: { onAgain: () => void }) {
+function DoneScreen({ onAgain, connector = false }: { onAgain: () => void; connector?: boolean }) {
   return (
     <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
       <CheckCircle2 size={32} className="text-success" />
       <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
       <p className="max-w-sm text-[12.5px] text-muted">
-        AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。审核进度可随时回到本页「我的发布」查看。
+        {connector
+          ? "连接器会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度可在「我的发布」查看。"
+          : "AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。审核进度可随时回到本页「我的发布」查看。"}
       </p>
       <Button variant="secondary" size="sm" onClick={onAgain}>
         继续发布
@@ -204,9 +206,9 @@ export function PublishPanel({
 }: {
   auth: AuthSession;
   /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
-  onCreateInChat?: (kind: "skill" | "agent") => void;
+  onCreateInChat?: (kind: "skill" | "agent" | "connector") => void;
 }) {
-  const [kind, setKind] = useState<"skill" | "agent">("skill");
+  const [kind, setKind] = useState<"skill" | "agent" | "connector">("skill");
   const [publishReload, setPublishReload] = useState(0);
   const bump = () => setPublishReload((n) => n + 1);
 
@@ -215,7 +217,7 @@ export function PublishPanel({
       <MyPublishes auth={auth} reload={publishReload} />
 
       <div className="flex gap-1">
-        {(["skill", "agent"] as const).map((k) => (
+        {(["skill", "agent", "connector"] as const).map((k) => (
           <button
             type="button"
             key={k}
@@ -225,7 +227,7 @@ export function PublishPanel({
               kind === k ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
-            {k === "skill" ? "发布技能" : "发布智能体"}
+            {k === "skill" ? "发布技能" : k === "agent" ? "发布智能体" : "发布连接器"}
           </button>
         ))}
       </div>
@@ -241,21 +243,28 @@ export function PublishPanel({
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[13.5px] font-semibold text-fg">
-              在对话中创建{kind === "skill" ? "技能" : "智能体"}(推荐)
+              在对话中创建
+              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : "连接器"}(推荐)
             </span>
             <span className="mt-0.5 block text-[12px] leading-snug text-muted">
-              回答几个选择题,AI 帮你完成起草、创建{kind === "skill" ? "、评测用例" : "和发布"}
+              回答几个选择题,AI 帮你完成起草、创建
+              {kind === "skill" ? "、评测用例" : kind === "agent" ? "和发布" : "技术声明、安全决策和发布"}
               —— 无需了解格式规范。
             </span>
           </span>
-          <ChevronRight size={16} className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5" />
+          <ChevronRight
+            size={16}
+            className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5"
+          />
         </button>
       )}
 
       {kind === "skill" ? (
         <SkillPublishForm auth={auth} onPublished={bump} />
-      ) : (
+      ) : kind === "agent" ? (
         <AgentPublishForm auth={auth} onPublished={bump} />
+      ) : (
+        <ConnectorPublishForm auth={auth} onPublished={bump} />
       )}
     </div>
   );
@@ -278,7 +287,11 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   // 附属文件(references/assets/evals;scripts 暂不支持)。导入技能时自动带上其
   // 评测用例与上次实测结果(可删),让「实测有效」成为市场卖点而不是口说无凭。
   const [files, setFiles] = useState<Array<{ path: string; content: string }>>([]);
-  const [benchmark, setBenchmark] = useState<{ withPassRate: number; withoutPassRate: number; cases: number } | null>(null);
+  const [benchmark, setBenchmark] = useState<{
+    withPassRate: number;
+    withoutPassRate: number;
+    cases: number;
+  } | null>(null);
   const [bundleErrors, setBundleErrors] = useState<string[]>([]);
 
   const [submitting, setSubmitting] = useState(false);
@@ -563,7 +576,11 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
                     placeholder="references/guide.md"
                     className="h-8 font-mono text-[12px]"
                   />
-                  <Button variant="ghost" size="sm" onClick={() => setFiles((fs) => fs.filter((_, j) => j !== i))}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setFiles((fs) => fs.filter((_, j) => j !== i))}
+                  >
                     删除
                   </Button>
                 </div>
@@ -584,9 +601,14 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         {benchmark && (
           <div className="mt-2 flex items-center gap-2 text-[12px] text-muted">
             <Badge tone="info">
-              实测:通过率 {Math.round(benchmark.withoutPassRate * 100)}% → {Math.round(benchmark.withPassRate * 100)}%（{benchmark.cases} 用例,发布者自报）
+              实测:通过率 {Math.round(benchmark.withoutPassRate * 100)}% →{" "}
+              {Math.round(benchmark.withPassRate * 100)}%（{benchmark.cases} 用例,发布者自报）
             </Badge>
-            <button type="button" className="text-faint hover:text-fg" onClick={() => setBenchmark(null)}>
+            <button
+              type="button"
+              className="text-faint hover:text-fg"
+              onClick={() => setBenchmark(null)}
+            >
               移除
             </button>
           </div>
@@ -871,7 +893,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         </p>
         {installedSkills.length === 0 ? (
           <p className="text-[12px] text-faint">
-            你还没有可作依赖的市场技能 —— 先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(智能体可不带依赖技能)。
+            你还没有可作依赖的市场技能 ——
+            先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(智能体可不带依赖技能)。
           </p>
         ) : (
           <div className="flex flex-wrap gap-1.5">
@@ -939,6 +962,125 @@ const STATUS_META: Record<
  * 我的发布记录（最近 50 条）。默认折叠成一行摘要,点开看每次提交的状态与
  * 审核理由(rejected 的 review_note 按纯文本渲染)。无记录时整段隐藏。
  */
+function ConnectorPublishForm({
+  auth,
+  onPublished,
+}: { auth: AuthSession; onPublished: () => void }) {
+  const [version, setVersion] = useState("1.0.0");
+  const [tags, setTags] = useState("连接器");
+  const [specJson, setSpecJson] = useState("");
+  const [decisionJson, setDecisionJson] = useState("");
+  const [meta, setMeta] = useState<HumanMetaDraft>(emptyHumanMeta());
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [ok, setOk] = useState(false);
+
+  const reset = () => {
+    setVersion("1.0.0");
+    setTags("连接器");
+    setSpecJson("");
+    setDecisionJson("");
+    setMeta(emptyHumanMeta());
+    setErr(null);
+    setOk(false);
+  };
+
+  const submit = async () => {
+    setErr(null);
+    if (!VERSION_RE.test(version)) return setErr("版本号须为 x.y.z，例如 1.0.0。");
+    const metaError = validateHumanMeta(meta);
+    if (metaError) return setErr(metaError);
+    let spec: unknown;
+    let securityDecision: unknown;
+    try {
+      spec = JSON.parse(specJson);
+      securityDecision = JSON.parse(decisionJson);
+    } catch {
+      return setErr("ConnectorSpec 与安全决策都必须是合法 JSON。");
+    }
+    if (!spec || typeof spec !== "object" || Array.isArray(spec))
+      return setErr("ConnectorSpec 必须是 JSON 对象。");
+    if (
+      !securityDecision ||
+      typeof securityDecision !== "object" ||
+      Array.isArray(securityDecision)
+    )
+      return setErr("安全决策必须是 JSON 对象。");
+    setSubmitting(true);
+    try {
+      await api.publishMarketplaceConnector(auth, {
+        version,
+        spec: spec as Record<string, unknown>,
+        securityDecision: securityDecision as Record<string, unknown>,
+        tags: tags
+          .split(/[,，]/)
+          .map((x) => x.trim())
+          .filter(Boolean),
+        category: meta.category,
+        useCases: meta.useCases.map((x) => x.trim()).filter(Boolean),
+        outcomeExamples: meta.outcomeExamples.map((x) => x.trim()).filter(Boolean),
+        humanMd: meta.humanMd.trim() || undefined,
+      });
+      setOk(true);
+      onPublished();
+    } catch (e) {
+      setErr(apiErrorMessage(e, "发布连接器失败，请检查技术声明与安全决策。"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (ok) return <DoneScreen connector onAgain={reset} />;
+  return (
+    <div className="flex flex-col gap-3.5">
+      <Alert tone="info" title="技术发布 · AI 自动审核">
+        发布者填写的安全决策只是审核建议。AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
+        通过后编译并签名上架，用户绑定时再由身份探针验证真实凭据；不确定或高风险项转人工复核。OAuth2 社区连接器必须使用 BYOA。
+      </Alert>
+      {err && <Alert tone="danger">{err}</Alert>}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label="版本号">
+          <Input value={version} onChange={(e) => setVersion(e.target.value)} placeholder="1.0.0" />
+        </Field>
+        <Field label="标签（逗号分隔）">
+          <Input
+            value={tags}
+            onChange={(e) => setTags(e.target.value)}
+            placeholder="连接器, 文档"
+          />
+        </Field>
+      </div>
+      <Field label="ConnectorSpec JSON（必须含 id、identity 与 actions）">
+        <Textarea
+          value={specJson}
+          onChange={(e) => setSpecJson(e.target.value)}
+          rows={15}
+          className="font-mono text-[12px]"
+          placeholder={'{"id":"my-connector","label":"我的连接器",…}'}
+        />
+      </Field>
+      <Field label="发布者建议的 SecurityDecision JSON">
+        <Textarea
+          value={decisionJson}
+          onChange={(e) => setDecisionJson(e.target.value)}
+          rows={9}
+          className="font-mono text-[12px]"
+          placeholder={
+            '{"audience":{"apiOrigins":["https://api.example.com:443"],…},"actions":{"list":{"effect":"read"}}}'
+          }
+        />
+      </Field>
+      <HumanMetaFields meta={meta} onChange={setMeta} />
+      <div className="flex justify-end">
+        <Button variant="primary" onClick={() => void submit()} disabled={submitting}>
+          {submitting && <Loader2 size={14} className="animate-spin" />}
+          提交 AI 审核
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
   const [rows, setRows] = useState<MarketplaceMyPublish[] | null>(null);
   const [open, setOpen] = useState(false);
@@ -981,8 +1123,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
   const unlist = async (r: MarketplaceMyPublish) => {
     const ok = await confirmDialog({
       title: `下架「${r.name}」?`,
-      body:
-        "下架后其他用户不能再搜索或安装；已安装用户的容器下次同步会移除该条目。以后提交新版本并通过审核可重新上架。",
+      body: "下架后其他用户不能再搜索或安装；已安装用户的容器下次同步会移除该条目。以后提交新版本并通过审核可重新上架。",
       confirmText: "下架",
       danger: true,
     });
@@ -1042,11 +1183,15 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
             const canWithdraw = r.status === "pending";
             const canUnlist = r.status === "approved" && r.isCurrent && r.listingState === "active";
             return (
-              <li key={r.versionId} className="border-b border-border px-3.5 py-2.5 last:border-b-0">
+              <li
+                key={r.versionId}
+                className="border-b border-border px-3.5 py-2.5 last:border-b-0"
+              >
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[13px] font-medium text-fg">{r.name}</span>
                   <Badge tone="neutral">v{r.version}</Badge>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                  {r.kind === "connector" && <Badge tone="info">连接器</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
                   {r.status === "approved" && !r.isCurrent && !revoked && !unlisted && (
                     <Badge tone="neutral">已被新版本取代</Badge>

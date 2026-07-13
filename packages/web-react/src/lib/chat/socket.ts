@@ -1165,8 +1165,8 @@ export class ChatSocket {
         return;
       }
       case "sys.incident": {
-        // 自愈事故推送(open/resolved)。写入 incidentStore(按 incidentId 只接受更高 rev,
-        // 旧 rev 丢弃);横幅/恢复 toast 的渲染权威在 store,socket 层不维护 UI 态。
+        // 仅审批后的 approved_recovery resolved 帧会被 store 接受并弹一次 success toast；
+        // 普通/open incident 静默丢弃，socket 层不维护任何运维横幅 UI。
         incidentStore.ingest(f as IncidentWire);
         return;
       }

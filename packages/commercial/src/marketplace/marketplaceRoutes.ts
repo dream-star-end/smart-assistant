@@ -9,44 +9,57 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
+import { ConnectorSpecError } from '../connectors/spec/types.js'
 
 import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { requireAuth } from '../http/auth.js'
 import { HttpError, clientIpOf, readJsonBody, sendJson, userAgentOf } from '../http/util.js'
 import {
+  VETTED_AGENT_TOOLSETS,
+  canonicalizeAgentManifest,
+  validateAgentManifest,
+} from './agentManifest.js'
+import {
+  approveMarketplaceConnectorVersion,
+  getMarketplaceArtifactKind,
+  rejectMarketplaceConnectorVersion,
+} from './connectorReview.js'
+import {
+  FEATURED_RANK_MAX,
+  FEATURED_RANK_MIN,
   MarketplaceError,
   getApprovedSkillVersions,
   getInstallableVersionTarget,
   getListingDetail,
   installApprovedVersion,
-  marketplaceAgentsEnabled,
   listActiveInstalledAgents,
   listInstalled,
   listMyPublishes,
   listPendingVersions,
-  listRecentAiReviews,
   listPlatformPresetAgents,
+  listRecentAiReviews,
+  marketplaceAgentsEnabled,
+  marketplaceConnectorsEnabled,
   ownerUnlistListing,
   publishSkillVersion,
   recordUninstall,
   resolveCallerOrgId,
   reviewVersion,
-  reviewVersions,
+  type reviewVersions,
   revokeListing,
   setListingFeaturedRank,
   updateInstalledAgentScope,
   withdrawPublishVersion,
-  FEATURED_RANK_MIN,
-  FEATURED_RANK_MAX,
 } from './marketplaceDb.js'
 import {
-  VETTED_AGENT_TOOLSETS,
-  canonicalizeAgentManifest,
-  validateAgentManifest,
-} from './agentManifest.js'
-import { HumanMetaError, type HumanMeta, humanMetaScanBody, parseHumanMeta } from './marketplaceMeta.js'
+  type HumanMeta,
+  HumanMetaError,
+  humanMetaScanBody,
+  parseHumanMeta,
+} from './marketplaceMeta.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
+import { prepareConnectorPublish } from './publishConnectorPipeline.js'
 import { PUBLISH_MAX_REQUEST_BYTES, prepareSkillPublish } from './publishSkillPipeline.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
@@ -92,7 +105,8 @@ function asAgentIds(v: unknown, fallback: string[] = ['main']): string[] {
   const out: string[] = []
   const seen = new Set<string>()
   for (const item of raw) {
-    if (typeof item !== 'string') throw new HttpError(400, 'BAD_AGENT_SCOPE', 'agentIds must be strings')
+    if (typeof item !== 'string')
+      throw new HttpError(400, 'BAD_AGENT_SCOPE', 'agentIds must be strings')
     const id = item.trim()
     if (!id || !AGENT_ID_RE.test(id))
       throw new HttpError(400, 'BAD_AGENT_SCOPE', `invalid agentId: ${id}`)
@@ -128,6 +142,15 @@ function slugFromPrefix(req: IncomingMessage, prefix: string): string {
 }
 
 function mapMarketplaceError(e: unknown): HttpError {
+  if (e instanceof ConnectorSpecError) {
+    const status =
+      e.code === 'REVIEWER_IS_AUTHOR' || e.code === 'REVIEWER_NOT_ADMIN'
+        ? 403
+        : e.code === 'CAS_CONFLICT' || e.code === 'INVALID_STATE' || e.code === 'NOT_DRAFT'
+          ? 409
+          : 422
+    return new HttpError(status, e.code, e.code)
+  }
   if (e instanceof MarketplaceError) {
     const status =
       e.code === 'SLUG_OWNED_BY_OTHER' || e.code === 'REVIEWER_IS_AUTHOR'
@@ -360,6 +383,67 @@ export async function handleMarketplaceAgentPublish(
   }
 }
 
+// ── POST /api/marketplace/connector/publish ────────────────────────────────
+// ConnectorSpec 与 publisher-proposed SecurityDecision 都是不可信输入。发布时编译只负责
+// 严格校验；真正可执行 contract 必须由 admin 在专用原子审核流中用“实际决定”重新编译并签名。
+export async function handleMarketplaceConnectorPublish(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  if (!marketplaceConnectorsEnabled())
+    throw new HttpError(404, 'NOT_FOUND', 'connector marketplace is not available')
+  const user = await requireAuth(req, deps.jwtSecret)
+  const body = (await readJsonBody(req, PUBLISH_MAX_REQUEST_BYTES)) as Record<string, unknown>
+  const prepared = prepareConnectorPublish(body)
+  if (!prepared.ok) {
+    if (prepared.status === 400) throw new HttpError(400, prepared.code, prepared.message)
+    sendJson(res, 422, {
+      error: { code: prepared.code, message: prepared.message },
+      ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+    })
+    return
+  }
+  const orgId = await resolvePublishOrgId(uid(user), body.visibility)
+  try {
+    const { versionId } = await publishSkillVersion({
+      slug: prepared.slug,
+      ownerUserId: uid(user),
+      version: prepared.version,
+      name: prepared.name,
+      description: prepared.description,
+      tags: prepared.tags,
+      rawSkillMd: null,
+      rawArtifact: prepared.rawArtifact,
+      manifest: {
+        connector: true,
+        // 仅供 reviewer 起草，绝不是已批准事实；详情用户面只读签名 contract 投影。
+        proposedSecurityDecision: prepared.proposedSecurityDecision,
+      },
+      kind: 'connector',
+      artifactHash: prepared.artifactHash,
+      embeddingHash: prepared.embeddingHash,
+      riskFlags: prepared.riskFlags,
+      policyVersion: prepared.policyVersion,
+      submittedBy: uid(user),
+      orgId,
+      category: prepared.humanMeta.category,
+      useCases: prepared.humanMeta.useCases,
+      outcomeExamples: prepared.humanMeta.outcomeExamples,
+      humanMd: prepared.humanMeta.humanMd,
+    })
+    sendJson(res, 200, {
+      ok: true,
+      versionId,
+      status: 'pending',
+      riskFlags: prepared.riskFlags,
+      note: '已提交 AI 自动审核；不确定或高风险项会转交管理员复核。',
+    })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
+}
+
 // ── GET /api/marketplace/my-agents ─────────────────────────────────────────
 // Per-user agent list for the picker (B-positioning): the default 全能助手 plus
 // the user's installed marketplace agents. Master-assembled from installs+manifest
@@ -442,9 +526,12 @@ export async function handleMarketplaceInstall(
     // org 可见性收口:org-private 版本仅本 org 成员可装(非成员 → target null → NOT_INSTALLABLE 404)。
     const callerOrgId = await resolveCallerOrgId(userId)
     const target = await getInstallableVersionTarget(versionId, callerOrgId)
-    if (!target) throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
+    if (!target)
+      throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
     const selectedAgentIds =
-      target.kind === 'skill' ? await validateAssignableAgentScope(userId, body.agentIds) : undefined
+      target.kind === 'skill'
+        ? await validateAssignableAgentScope(userId, body.agentIds)
+        : undefined
     const v = await installApprovedVersion({
       userId,
       versionId,
@@ -608,6 +695,8 @@ export async function handleMarketplaceDetail(
   // agent 类仅 v5 露出:v3 渠道上视同不存在(防止据 slug 取 detail→versionId 旁路)。
   if (detail.kind === 'agent' && !marketplaceAgentsEnabled())
     throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
+  if (detail.kind === 'connector' && !marketplaceConnectorsEnabled())
+    throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
   // 平台预设标记(加法字段):前端据此显示「开箱即用」而非安装按钮。
   const preset = detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(slug)
   sendJson(res, 200, { detail: preset ? { ...detail, preset: true } : detail })
@@ -626,8 +715,12 @@ export async function handleMarketplaceUninstall(
   if ((await platformPresetAgentSlugs()).includes(slug))
     throw new HttpError(400, 'PRESET_AGENT', '平台预设智能体不可卸载')
   // P2.2 will also remove the on-disk hub copy; this records the soft-uninstall.
-  const ok = await recordUninstall(uid(user), slug)
-  sendJson(res, 200, { ok })
+  try {
+    const ok = await recordUninstall(uid(user), slug)
+    sendJson(res, 200, { ok })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
 }
 
 // ── GET /api/admin/marketplace/pending ─────────────────────────────────────
@@ -675,16 +768,39 @@ export async function handleAdminMarketplaceReview(
         ? body.note.trim().slice(0, 2000) || undefined
         : undefined
   try {
-    await reviewVersion({
-      versionId: id,
-      reviewerUserId: uid(admin),
-      approve: decision === 'approve',
-      note,
-      // This route is already protected by requireAdminVerifyDb. Admins are allowed
-      // to approve/reject their own marketplace submissions so platform-owned
-      // skills can be published without a second admin account.
-      allowSelfReview: true,
-    })
+    const kind = await getMarketplaceArtifactKind(id)
+    if (kind === 'connector') {
+      if (decision === 'approve') {
+        const expectedSpecHash =
+          typeof body.expectedSpecHash === 'string' ? body.expectedSpecHash.trim() : ''
+        if (!/^[0-9a-f]{64}$/.test(expectedSpecHash))
+          throw new HttpError(400, 'BAD_REQUEST', 'expectedSpecHash required')
+        if (body.functionalVerified !== true)
+          throw new HttpError(400, 'BAD_REQUEST', '必须确认已使用隔离账号完成功能验收')
+        await approveMarketplaceConnectorVersion({
+          versionId: id,
+          reviewerUserId: uid(admin),
+          securityDecision: body.securityDecision,
+          expectedSpecHash,
+          functionalVerified: true,
+          note,
+        })
+      } else {
+        await rejectMarketplaceConnectorVersion({
+          versionId: id,
+          reviewerUserId: uid(admin),
+          note: note!,
+        })
+      }
+    } else {
+      await reviewVersion({
+        versionId: id,
+        reviewerUserId: uid(admin),
+        approve: decision === 'approve',
+        note,
+        allowSelfReview: true,
+      })
+    }
     await writeAdminAuditBestEffort(
       { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
       'marketplace.skill.review',
@@ -739,15 +855,43 @@ export async function handleAdminMarketplaceReviewBatch(
       : typeof body.note === 'string'
         ? body.note.trim().slice(0, 2000) || undefined
         : undefined
-  const results = await reviewVersions({
-    versionIds,
-    reviewerUserId: uid(admin),
-    approve: decision === 'approve',
-    note,
-    // Same policy as the single admin review route: this route is admin-only,
-    // so platform-owned submissions can be reviewed without a second admin.
-    allowSelfReview: true,
-  })
+  const kinds = new Map<string, Awaited<ReturnType<typeof getMarketplaceArtifactKind>>>()
+  for (const id of versionIds) kinds.set(id, await getMarketplaceArtifactKind(id))
+  if (decision === 'approve' && [...kinds.values()].includes('connector'))
+    throw new HttpError(
+      400,
+      'CONNECTOR_BATCH_APPROVE_FORBIDDEN',
+      '连接器需逐个填写实际安全决策并确认功能验收',
+    )
+  const results = [] as Awaited<ReturnType<typeof reviewVersions>>
+  for (const id of versionIds) {
+    try {
+      if (kinds.get(id) === 'connector') {
+        await rejectMarketplaceConnectorVersion({
+          versionId: id,
+          reviewerUserId: uid(admin),
+          note: note!,
+        })
+      } else {
+        await reviewVersion({
+          versionId: id,
+          reviewerUserId: uid(admin),
+          approve: decision === 'approve',
+          note,
+          allowSelfReview: true,
+        })
+      }
+      results.push({ versionId: id, ok: true })
+    } catch (e) {
+      const mapped = mapMarketplaceError(e)
+      results.push({
+        versionId: id,
+        ok: false,
+        code: e instanceof MarketplaceError ? e.code : 'KIND_MISMATCH',
+        message: mapped.message,
+      })
+    }
+  }
   const failed = results.filter((r) => !r.ok).length
   const reviewed = results.length - failed
   // 一批一行:审计整批决定(decision + 提交的 version_ids + 成/败计数),不逐 version 展开。

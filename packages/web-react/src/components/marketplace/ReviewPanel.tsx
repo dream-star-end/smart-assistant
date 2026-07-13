@@ -10,7 +10,17 @@ import type {
   MarketplacePending,
 } from "../../lib/types";
 import { Markdown } from "../Markdown";
-import { Alert, Badge, Button, EmptyState, Input, Spinner, useConfirm, usePrompt } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  EmptyState,
+  Input,
+  Spinner,
+  Textarea,
+  useConfirm,
+  usePrompt,
+} from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
 /** 人向元数据是否缺失(存量/平台 seed 行没有 category 或 useCases)。 */
@@ -21,7 +31,9 @@ function humanMetaMissing(r: MarketplacePending): boolean {
 /** 审核展开区:人向商品元数据(分类/适用场景/效果示例/详细介绍)只读展示。 */
 function PendingHumanMeta({ r }: { r: MarketplacePending }) {
   const useCases = Array.isArray(r.useCases) ? r.useCases.filter((s) => s.trim()) : [];
-  const outcomes = Array.isArray(r.outcomeExamples) ? r.outcomeExamples.filter((s) => s.trim()) : [];
+  const outcomes = Array.isArray(r.outcomeExamples)
+    ? r.outcomeExamples.filter((s) => s.trim())
+    : [];
   const humanMd = r.humanMd?.trim();
   return (
     <div className="mb-2 flex flex-col gap-1.5 rounded-lg border border-border bg-surface px-2.5 py-2 text-[12px] leading-relaxed">
@@ -75,6 +87,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   const [reload, setReload] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [connectorDecisions, setConnectorDecisions] = useState<Record<string, string>>({});
+  const [connectorVerified, setConnectorVerified] = useState<Set<string>>(new Set());
   const [promptText, promptTextEl] = usePrompt();
 
   useEffect(() => {
@@ -93,6 +107,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
   const review = useCallback(
     async (versionId: string, decision: "approve" | "reject") => {
+      const row = rows?.find((r) => r.versionId === versionId);
       let note: string | undefined;
       if (decision === "reject") {
         // 拒绝必须给理由:回显到发布者「我的发布」,否则拒绝对发布者是黑盒。
@@ -109,7 +124,34 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       setBusy(versionId);
       setErr(null);
       try {
-        await api.adminMarketplaceReview(auth, versionId, decision, note);
+        if (row?.kind === "connector" && decision === "approve") {
+          if (!connectorVerified.has(versionId)) {
+            setErr("批准连接器前，必须确认已使用隔离账号完成真实功能验收。");
+            return;
+          }
+          const suggested = (row.manifest as { proposedSecurityDecision?: unknown } | null)
+            ?.proposedSecurityDecision;
+          let actual: unknown;
+          try {
+            actual = JSON.parse(
+              connectorDecisions[versionId] ?? JSON.stringify(suggested ?? {}, null, 2),
+            );
+          } catch {
+            setErr("实际 SecurityDecision 不是合法 JSON。");
+            return;
+          }
+          if (!actual || typeof actual !== "object" || Array.isArray(actual)) {
+            setErr("实际 SecurityDecision 必须是 JSON 对象。");
+            return;
+          }
+          await api.adminMarketplaceReview(auth, versionId, decision, note, {
+            securityDecision: actual as Record<string, unknown>,
+            expectedSpecHash: row.artifactHash,
+            functionalVerified: true,
+          });
+        } else {
+          await api.adminMarketplaceReview(auth, versionId, decision, note);
+        }
         setReload((n) => n + 1);
       } catch (e) {
         setErr(apiErrorMessage(e, "审核失败"));
@@ -117,7 +159,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         setBusy(null);
       }
     },
-    [auth, promptText],
+    [auth, connectorDecisions, connectorVerified, promptText, rows],
   );
 
   const batchReview = useCallback(
@@ -156,6 +198,9 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
   const visibleIds = rows?.map((r) => r.versionId) || [];
   const selectedVisibleIds = visibleIds.filter((id) => selected.has(id));
+  const selectedHasConnector = (rows ?? []).some(
+    (r) => selected.has(r.versionId) && r.kind === "connector",
+  );
   const allSelected = visibleIds.length > 0 && selectedVisibleIds.length === visibleIds.length;
   const toggleAll = (checked: boolean) => {
     setSelected(checked ? new Set(visibleIds) : new Set());
@@ -212,7 +257,10 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 size="sm"
                 variant="primary"
                 onClick={() => batchReview("approve")}
-                disabled={selectedVisibleIds.length === 0 || busy !== null}
+                disabled={selectedVisibleIds.length === 0 || selectedHasConnector || busy !== null}
+                title={
+                  selectedHasConnector ? "连接器必须逐个填写实际安全决策并确认功能验收" : undefined
+                }
               >
                 {busy === "batch:approve" ? <Loader2 size={14} className="animate-spin" /> : null}
                 批量批准
@@ -246,14 +294,20 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                       />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
-                          <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
+                          <span className="truncate text-[13.5px] font-medium text-fg">
+                            {r.name}
+                          </span>
                           {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                          {r.kind === "connector" && <Badge tone="info">连接器 · 人工安全审</Badge>}
                           <Badge tone="neutral">v{r.version}</Badge>
                           {/* 存量/平台 seed 行缺人向元数据 → 中性提示徽章(非阻断,仅提示补齐)。 */}
                           {humanMetaMissing(r) && <Badge tone="neutral">人向元数据缺失</Badge>}
                           {/* 供给凸显:附带 evals/ 评测用例 → 中性徽章(鼓励供给,不做质量背书)。 */}
                           {bundleHasEvals(r.rawBundle) && (
-                            <Badge tone="neutral" title="附带 evals/ 评测用例（发布者提供，未复跑验证）">
+                            <Badge
+                              tone="neutral"
+                              title="附带 evals/ 评测用例（发布者提供，未复跑验证）"
+                            >
                               带 evals
                             </Badge>
                           )}
@@ -298,61 +352,107 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     </Button>
                   </div>
 
-                {isOpen && (
-                  <div className="border-t border-border px-3.5 py-3">
-                    <p className="mb-2 text-[12.5px] text-fg">{r.description}</p>
-                    {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
-                    <PendingHumanMeta r={r} />
-                    {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
+                  {isOpen && (
+                    <div className="border-t border-border px-3.5 py-3">
+                      <p className="mb-2 text-[12.5px] text-fg">{r.description}</p>
+                      {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
+                      <PendingHumanMeta r={r} />
+                      {r.kind === "connector" && (
+                        <div className="mb-3 flex flex-col gap-2 rounded-lg border border-warning/30 bg-warning-soft/40 p-3">
+                          <div className="text-[12.5px] font-medium text-fg">
+                            实际 SecurityDecision
+                          </div>
+                          <p className="text-[11.5px] leading-relaxed text-muted">
+                            下方初值来自发布者建议，不是平台事实。请核对每个 origin 与 action effect
+                            后再批准。
+                          </p>
+                          <Textarea
+                            rows={10}
+                            className="font-mono text-[11.5px]"
+                            value={
+                              connectorDecisions[r.versionId] ??
+                              JSON.stringify(
+                                (r.manifest as { proposedSecurityDecision?: unknown } | null)
+                                  ?.proposedSecurityDecision ?? {},
+                                null,
+                                2,
+                              )
+                            }
+                            onChange={(e) =>
+                              setConnectorDecisions((prev) => ({
+                                ...prev,
+                                [r.versionId]: e.target.value,
+                              }))
+                            }
+                          />
+                          <label className="flex items-start gap-2 text-[12px] leading-relaxed text-fg">
+                            <input
+                              type="checkbox"
+                              checked={connectorVerified.has(r.versionId)}
+                              onChange={(e) =>
+                                setConnectorVerified((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.currentTarget.checked) next.add(r.versionId);
+                                  else next.delete(r.versionId);
+                                  return next;
+                                })
+                              }
+                            />
+                            我已使用隔离测试账号完成绑定、身份探针及声明动作的真实功能验收。
+                          </label>
+                        </div>
+                      )}
+                      {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
                         仅在待审队列里出现的项 = AI 未直接放行,人审据此复核。 */}
-                    {r.aiNote && (
-                      <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 px-2.5 py-2">
-                        <Sparkles size={14} className="mt-0.5 shrink-0 text-accent" />
-                        <p className="text-[12px] leading-relaxed text-fg">
-                          <span className="font-medium text-accent">AI 意见（供参考）：</span>
-                          {r.aiNote}
+                      {r.aiNote && (
+                        <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 px-2.5 py-2">
+                          <Sparkles size={14} className="mt-0.5 shrink-0 text-accent" />
+                          <p className="text-[12px] leading-relaxed text-fg">
+                            <span className="font-medium text-accent">AI 意见（供参考）：</span>
+                            {r.aiNote}
+                          </p>
+                        </div>
+                      )}
+                      {flags.length > 0 && (
+                        <div className="mb-2 flex flex-col gap-1.5">
+                          {flags.map((f) => (
+                            <Alert key={f.label} tone={f.tone}>
+                              <span className="font-medium">{f.label}：</span>
+                              {f.message}
+                              {f.sample && (
+                                <code className="mt-1 block break-all rounded bg-code px-1.5 py-0.5 text-[11px]">
+                                  {f.sample}
+                                </code>
+                              )}
+                            </Alert>
+                          ))}
+                        </div>
+                      )}
+                      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
+                        {r.rawArtifact}
+                      </pre>
+                      {r.benchmark && (
+                        <p className="mt-2 text-[12px] text-muted">
+                          发布者自报实测:通过率 {Math.round(r.benchmark.withoutPassRate * 100)}% →{" "}
+                          {Math.round(r.benchmark.withPassRate * 100)}%（{r.benchmark.cases}{" "}
+                          用例;未经平台验证）
                         </p>
-                      </div>
-                    )}
-                    {flags.length > 0 && (
-                      <div className="mb-2 flex flex-col gap-1.5">
-                        {flags.map((f) => (
-                          <Alert key={f.label} tone={f.tone}>
-                            <span className="font-medium">{f.label}：</span>
-                            {f.message}
-                            {f.sample && (
-                              <code className="mt-1 block break-all rounded bg-code px-1.5 py-0.5 text-[11px]">
-                                {f.sample}
-                              </code>
-                            )}
-                          </Alert>
+                      )}
+                      {r.rawBundle &&
+                        Object.entries(r.rawBundle).map(([path, content]) => (
+                          <details key={path} className="mt-2">
+                            <summary className="cursor-pointer font-mono text-[11.5px] text-muted hover:text-fg">
+                              附属文件:{path}
+                            </summary>
+                            <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[11.5px] text-fg">
+                              {content}
+                            </pre>
+                          </details>
                         ))}
-                      </div>
-                    )}
-                    <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
-                      {r.rawArtifact}
-                    </pre>
-                    {r.benchmark && (
-                      <p className="mt-2 text-[12px] text-muted">
-                        发布者自报实测:通过率 {Math.round(r.benchmark.withoutPassRate * 100)}% →{" "}
-                        {Math.round(r.benchmark.withPassRate * 100)}%（{r.benchmark.cases} 用例;未经平台验证）
-                      </p>
-                    )}
-                    {r.rawBundle &&
-                      Object.entries(r.rawBundle).map(([path, content]) => (
-                        <details key={path} className="mt-2">
-                          <summary className="cursor-pointer font-mono text-[11.5px] text-muted hover:text-fg">
-                            附属文件:{path}
-                          </summary>
-                          <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[11.5px] text-fg">
-                            {content}
-                          </pre>
-                        </details>
-                      ))}
-                  </div>
-                )}
-              </li>
-            );
+                    </div>
+                  )}
+                </li>
+              );
             })}
           </ul>
         </div>
@@ -409,9 +509,7 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
       </button>
       {open && (
         <div className="mt-3">
-          {err && (
-            <Alert tone="danger">{err}</Alert>
-          )}
+          {err && <Alert tone="danger">{err}</Alert>}
           {loading ? (
             <div className="flex items-center gap-2 py-3 text-[12.5px] text-faint">
               <Spinner /> 加载中…
@@ -433,7 +531,9 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
                       {r.status === "approved" ? "已批准" : "已拒绝"}
                     </Badge>
                     {r.reviewedAt && (
-                      <span className="ml-auto text-[11px] text-faint">{fmtDateTime(r.reviewedAt)}</span>
+                      <span className="ml-auto text-[11px] text-faint">
+                        {fmtDateTime(r.reviewedAt)}
+                      </span>
                     )}
                   </div>
                   <p className="mt-0.5 text-[11.5px] text-muted">{r.slug}</p>
@@ -470,7 +570,7 @@ function fmtDateTime(t: string): string {
 
 /**
  * 下架(kill-switch)：撤销一个已上架条目,下次容器同步自动从所有用户移除。
- * slug 输入带已上架目录 datalist 提示(技能+智能体),确认框回显条目名防误下架。
+ * slug 输入带已上架目录 datalist 提示(技能+智能体+连接器),确认框回显条目名防误下架。
  */
 function RevokeBox({ auth }: { auth: AuthSession }) {
   const [slug, setSlug] = useState("");
@@ -484,10 +584,17 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   useEffect(() => {
     let alive = true;
     Promise.all([
-      api.searchMarketplace(auth, "", "skill", 50).catch(() => ({ results: [] as MarketplaceCard[] })),
-      api.searchMarketplace(auth, "", "agent", 50).catch(() => ({ results: [] as MarketplaceCard[] })),
-    ]).then(([s, a]) => {
-      if (alive) setCatalog([...s.results, ...a.results]);
+      api
+        .searchMarketplace(auth, "", "skill", 50)
+        .catch(() => ({ results: [] as MarketplaceCard[] })),
+      api
+        .searchMarketplace(auth, "", "agent", 50)
+        .catch(() => ({ results: [] as MarketplaceCard[] })),
+      api
+        .searchMarketplace(auth, "", "connector", 50)
+        .catch(() => ({ results: [] as MarketplaceCard[] })),
+    ]).then(([s, a, c]) => {
+      if (alive) setCatalog([...s.results, ...a.results, ...c.results]);
     });
     return () => {
       alive = false;
@@ -540,7 +647,8 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
         <datalist id="revoke-slug-options">
           {catalog.map((c) => (
             <option key={c.slug} value={c.slug}>
-              {c.name}（{c.kind === "agent" ? "智能体" : "技能"}）
+              {c.name}（{c.kind === "agent" ? "智能体" : c.kind === "connector" ? "连接器" : "技能"}
+              ）
             </option>
           ))}
         </datalist>

@@ -19,6 +19,7 @@ import type {
   MarketplaceDetail,
   MarketplaceInstalled,
   MarketplaceAgentPublishInput,
+  MarketplaceConnectorPublishInput,
   MarketplaceMyAgent,
   SkillDraftDetail,
   SkillDraftSummary,
@@ -90,6 +91,7 @@ import type {
   DeclarativeBindResult,
   DeclarativeCatalogResponse,
   DeclarativeConnectionsResponse,
+  DeclarativeManagementResponse,
   DeclarativeOauthStartResult,
 } from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
@@ -1935,7 +1937,7 @@ export const api = {
   // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ─────────
 
   /** 市场检索/浏览（GET /api/marketplace/search?q=&limit=&kind=，空 q 返该 kind 全部目录）。 */
-  searchMarketplace: (a: AuthSession, q = "", kind?: "skill" | "agent", limit = 50) =>
+  searchMarketplace: (a: AuthSession, q = "", kind?: "skill" | "agent" | "connector", limit = 50) =>
     jsonOrThrow<MarketplaceSearchResult>(
       callWithRefresh(a, (t) =>
         fetch(
@@ -2042,6 +2044,19 @@ export const api = {
       ),
     ),
 
+  /** 发布声明式连接器（进入 AI 自动审核；不确定或高风险项转人工复核）。 */
+  publishMarketplaceConnector: (a: AuthSession, input: MarketplaceConnectorPublishInput) =>
+    jsonOrThrow<MarketplacePublishResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/connector/publish", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ),
+
   /** 我的发布记录（GET /api/marketplace/my-publishes：状态 + 审核理由，发布闭环）。 */
   listMarketplaceMyPublishes: (a: AuthSession) =>
     jsonOrThrow<{ publishes: MarketplaceMyPublish[] }>(
@@ -2120,6 +2135,11 @@ export const api = {
     versionId: string,
     decision: "approve" | "reject",
     note?: string,
+    connectorReview?: {
+      securityDecision: Record<string, unknown>;
+      expectedSpecHash: string;
+      functionalVerified: true;
+    },
   ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (t) =>
@@ -2127,7 +2147,7 @@ export const api = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ decision, note }),
+          body: JSON.stringify({ decision, note, ...(connectorReview ?? {}) }),
         }),
       ),
     ),
@@ -2463,6 +2483,17 @@ export const api = {
     jsonOrThrow<DeclarativeConnectionsResponse>(
       callWithRefresh(a, (t) =>
         fetch("/api/connectors/declarative/connections", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 管理中心统一读模型（官方默认 + 市场安装 + 历史绑定 fallback）。 */
+  getDeclarativeManagement: (a: AuthSession): Promise<DeclarativeManagementResponse> =>
+    jsonOrThrow<DeclarativeManagementResponse>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/management", {
           credentials: "include",
           headers: bearerHeaders(t),
         }),

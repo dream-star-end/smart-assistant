@@ -138,20 +138,17 @@ export type ContextRebuiltWire = {
 } & WireRuntimeFields;
 
 /**
- * 自愈事故推送帧（master→user，切片①）：容器/服务面异常(open)与恢复(resolved)的**用户可见**
- * 信号。前端据此在连接横幅槽上方渲染异常 Alert(open)、恢复时弹一次性 success toast(resolved)。
- *
- * `rev` = incident 单调修订号（server 权威）：incidentStore **按 incidentId 只接受更高 rev**，
- * 旧 rev 丢弃——防重连乱序 / 迟到的 open 帧把已 resolved 的事故重新挂起（RFC §5 [解 M4]）。
- * `title`/`message` 文案权威在服务端（master 从 incident_policies 表 materialize），前端只透传渲染；
- * resolved 帧携带的是恢复态文案。帧结构对齐 protocol SysIncident——protocol 就绪前本地补声明即
- * 消费契约（同 FrontendBuildWire / ContextRebuiltWire 的本地补声明模式）。
+ * 审批后的用户恢复通知（master→user）。内部 incident 生命周期不再对用户可见；只有
+ * userNoticeApproval 在可信全自动修复、精确影响证据、企微审批和在线收件人门禁全部通过后，
+ * 才发送 `status='resolved' + noticeKind='approved_recovery'`。普通/open incident 一律忽略。
+ * `rev` 按 incidentId 幂等，防重投或乱序导致重复 toast。
  */
 export type IncidentWire = {
   type: "sys.incident";
   incidentId: string;
   rev: number;
   status: "open" | "resolved";
+  noticeKind?: "approved_recovery";
   severity: "info" | "warning" | "critical";
   surface: string;
   title: string;

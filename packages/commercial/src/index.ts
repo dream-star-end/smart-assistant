@@ -182,12 +182,10 @@ import {
 import {
   startIncidentReconciler,
   startIncidentSweeper,
-  startIncidentSnapshot,
   assertSelfhealConfig,
   selfhealTickMs,
   type IncidentReconcilerHandle,
-  type IncidentReconcilerSnapshotHandle,
-  type IncidentSnapshotHandle,
+  type IncidentSweeperHandle,
 } from "./selfheal/index.js";
 import {
   startWecomAlertDispatcher,
@@ -2362,7 +2360,9 @@ export async function registerCommercial(
   // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7 步 4)────────────────
   //
   // flag `OC_MODEL_AUTHORITY=1` 才装配。装配 = 三件事同时生效(方案的原子开关):
-  //   ① supervisor 往新容器注入公钥 keyring + OC_USER_ID + OC_MODEL_AUTHORITY;
+  //   ① supervisor 往新容器注入公钥 keyring + OC_USER_ID，并在 provision-required=true
+  //      时注入 OC_MODEL_AUTHORITY；回滚清退期显式设 provision-required=false，新容器仍拿
+  //      公钥消费已签票据，但不再成为必须 attest 的强制容器；
   //   ② bridge 对每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
   //      超时/不支持 → 拒连接 + stale recycle);
   //   ③ bridge 对每条 inbound.message 签发并注入 `__oc_model_authority`,codex 分类
@@ -2374,6 +2374,11 @@ export async function registerCommercial(
   //
   // 关 flag → 全部旧行为(容器不 attest 也不会被拒;帧不带 envelope;判定回 baked)。
   const modelAuthorityFlag = process.env.OC_MODEL_AUTHORITY === "1";
+  // 缺省为 true，保持既有原子开关语义。只允许 deploy-v5.sh 的回滚闭环短暂写 0：
+  // master 继续签发/验 attest，同时停止制造新的 OC_MODEL_AUTHORITY=1 容器，等旧容器
+  // 经 authenticated drain 全量退出后才真正关总 flag，消除回滚 census 的尾巴竞态。
+  const modelAuthorityProvisionRequired =
+    modelAuthorityFlag && process.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
   let modelAuthoritySigner: AuthoritySigner | undefined;
   let modelCatalogCache: ModelCatalogCache | undefined;
   if (modelAuthorityFlag) {
@@ -2479,7 +2484,7 @@ export async function registerCommercial(
               // 立刻拿到含新公钥的 ring —— 传字符串的话要等 master 重启才生效,步骤②
               // 的 census 永远收敛不到 100%,整条轮换卡死。signer 内部按文件 stat 热重载。
               keyringEnvAssignment: () => modelAuthoritySigner!.publicKeyringEnvAssignment(),
-              required: true,
+              required: modelAuthorityProvisionRequired,
               // 次级模型 master 单向下发(注入 OPENCLAUDE_SECONDARY_MODEL);与签发 authority 的
               // auxModels 同源,消除 master/runtime 版本 skew 的 WebFetch/WebSearch 403。
               auxModels: PLATFORM_AUX_MODEL_IDS,
@@ -3832,18 +3837,6 @@ export async function registerCommercial(
     })();
   };
 
-  // 每槽 read-only incident snapshot：follower 也可在 WS 鉴权后补发，但不 claim/repair/send。
-  let incidentSnapshot: IncidentSnapshotHandle | undefined;
-  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
-    assertSelfhealConfig();
-    incidentSnapshot = trackScheduler(
-      "incidentSnapshot",
-      "local",
-      startIncidentSnapshot({ intervalMs: selfhealTickMs() }),
-    );
-    await incidentSnapshot.runNow();
-  }
-
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
@@ -3878,11 +3871,6 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
-    // 鉴权后补发当前活跃事故——每槽本地 read-only snapshot 做 **per-uid** 过滤，
-    // 只返该 uid 可见事故，绝不泄露他人定向事故(Codex B2)。
-    incidentSnapshotProvider: incidentSnapshot
-      ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
-      : undefined,
     // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
     // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
     loadAllowedModelChecker: async (uid, requiredEpoch) => {
@@ -4311,10 +4299,8 @@ export async function registerCommercial(
       name: "incidentSweeper",
       domain: "v5-owned",
       start: () => {
-        const h: IncidentReconcilerSnapshotHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+        const h: IncidentSweeperHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
           intervalMs: selfhealTickMs(),
-          broadcastAll: () => 0,
-          broadcastToUsers: () => 0,
         }));
         return { stop: () => h.stop() };
       },
@@ -4549,9 +4535,6 @@ export async function registerCommercial(
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
       // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
-      if (incidentSnapshot) {
-        try { await incidentSnapshot.stop(); } catch { /* ignore */ }
-      }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
       }

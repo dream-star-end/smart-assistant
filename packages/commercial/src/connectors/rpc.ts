@@ -343,7 +343,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
           typeof (body as { query?: unknown }).query === 'string'
             ? (body as { query: string }).query
             : undefined
-        await handleCatalog(res, pool, query)
+        await handleCatalog(res, userId, pool, query)
         return
       }
       sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' })
@@ -441,8 +441,13 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
  * 搜索、并引导用户去管理界面绑定(凭据永不进容器 → agent 不能代绑)。与前端 REST catalog
  * 共用 listDeclarativeCatalog 单一权威。
  */
-async function handleCatalog(res: ServerResponse, pool: Pool, query?: string): Promise<void> {
-  const connectors = await listDeclarativeCatalog(pool, query ? { query } : {})
+async function handleCatalog(
+  res: ServerResponse,
+  userId: number,
+  pool: Pool,
+  query?: string,
+): Promise<void> {
+  const connectors = await listDeclarativeCatalog(pool, userId, query ? { query } : {})
   sendEnvelope(res, {
     connectors: connectors.map((c) => ({
       slug: c.slug,

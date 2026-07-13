@@ -1,4 +1,12 @@
-import { AlertTriangle, ArrowUpCircle, Loader2, PackageOpen, Settings2, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowUpCircle,
+  Loader2,
+  PackageOpen,
+  Settings2,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { updateAvailable } from "../../lib/marketplace";
@@ -10,7 +18,15 @@ import { Alert, Badge, Button, EmptyState, Modal, Spinner, useConfirm } from "..
  * 我的已安装：列出当前安装的技能/智能体,可卸载;有新上架版本的给「更新」按钮
  * （复用 install 的幂等替换语义,以后端校验为准）;被平台下架(revoked)的醒目提醒。
  */
-export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBrowse: () => void }) {
+export function InstalledPanel({
+  auth,
+  onGoBrowse,
+  onOpenConnectors,
+}: {
+  auth: AuthSession;
+  onGoBrowse: () => void;
+  onOpenConnectors?: () => void;
+}) {
   const [rows, setRows] = useState<MarketplaceInstalled[] | null>(null);
   const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -20,6 +36,8 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
   const [editScope, setEditScope] = useState<string[]>(["main"]);
   const [reload, setReload] = useState(0);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  const connectorCount = rows?.filter((r) => r.kind === "connector").length ?? 0;
+  const visibleRows = rows?.filter((r) => r.kind !== "connector") ?? null;
 
   useEffect(() => {
     let alive = true;
@@ -32,7 +50,20 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       .then(([r, a]) => {
         if (!alive) return;
         setRows(r);
-        setAgents(a.length ? a : [{ id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true }]);
+        setAgents(
+          a.length
+            ? a
+            : [
+                {
+                  id: "main",
+                  slug: "main",
+                  name: "全能助手",
+                  description: "",
+                  installed: true,
+                  isDefault: true,
+                },
+              ],
+        );
       })
       .catch((e) => alive && setErr(apiErrorMessage(e, "加载已安装失败")))
       .finally(() => alive && setLoading(false));
@@ -72,7 +103,11 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       setBusy(row.slug);
       setErr(null);
       try {
-        await api.installMarketplace(auth, row.latestVersionId, row.kind === "skill" ? normalizeAgentScope(row.agentIds) : undefined);
+        await api.installMarketplace(
+          auth,
+          row.latestVersionId,
+          row.kind === "skill" ? normalizeAgentScope(row.agentIds) : undefined,
+        );
         setReload((n) => n + 1);
       } catch (e) {
         setErr(apiErrorMessage(e, "更新失败"));
@@ -117,7 +152,11 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
             <Button variant="ghost" onClick={() => setEditing(null)}>
               取消
             </Button>
-            <Button variant="primary" onClick={saveScope} disabled={!editing || busy === editing.slug}>
+            <Button
+              variant="primary"
+              onClick={saveScope}
+              disabled={!editing || busy === editing.slug}
+            >
               {editing && busy === editing.slug && <Loader2 size={14} className="animate-spin" />}
               保存
             </Button>
@@ -131,14 +170,26 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
           <Alert tone="danger">{err}</Alert>
         </div>
       )}
+      {connectorCount > 0 && (
+        <div className="mx-4 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-accent/30 bg-accent-soft/40 px-3 py-2.5">
+          <span className="text-[12.5px] text-muted">
+            {connectorCount} 个已安装连接器已移至管理中心统一绑定、更新与卸载。
+          </span>
+          {onOpenConnectors && (
+            <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+              打开连接器管理
+            </Button>
+          )}
+        </div>
+      )}
       {loading ? (
         <div className="flex items-center justify-center gap-2 py-16 text-faint">
           <Spinner /> 加载已安装…
         </div>
-      ) : !rows || rows.length === 0 ? (
+      ) : !visibleRows || visibleRows.length === 0 ? (
         <EmptyState
           icon={PackageOpen}
-          title="还没有安装任何技能或智能体"
+          title={connectorCount > 0 ? "技能与智能体暂无安装" : "还没有安装任何技能或智能体"}
           hint="去市场发现别人沉淀好的能力，一键安装即可使用。"
           action={
             <Button variant="secondary" size="sm" onClick={onGoBrowse}>
@@ -148,7 +199,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
         />
       ) : (
         <ul className="flex flex-col gap-2 px-4 py-4">
-          {rows.map((r) => {
+          {visibleRows.map((r) => {
             const revoked = r.listingState === "revoked";
             const canUpdate = updateAvailable(r);
             return (
@@ -194,7 +245,11 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                     onClick={() => update(r)}
                     disabled={busy === r.slug}
                   >
-                    {busy === r.slug ? <Loader2 size={14} className="animate-spin" /> : <ArrowUpCircle size={14} />}
+                    {busy === r.slug ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <ArrowUpCircle size={14} />
+                    )}
                     更新
                   </Button>
                 )}

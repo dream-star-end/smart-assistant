@@ -126,6 +126,27 @@ describe('v5 release safety lanes', () => {
     assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
   })
 
+  test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ssh() { return 23; }',
+      'assert_repo_required_migrations || exit 1',
+      'printf "%s\\n" SIDE_EFFECT',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    const combined = result.stdout + result.stderr
+    assert.notEqual(result.status, 0)
+    assert.match(combined, /requiredMigrations 远端校验失败/)
+    assert.doesNotMatch(combined, /requiredMigrations 已应用/)
+    assert.doesNotMatch(combined, /SIDE_EFFECT/)
+  })
+
   test('finalize/abort verify the target before irreversible state changes', async () => {
     const source = await readFile(deploy, 'utf8')
     const finalizeBody = source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''
@@ -296,9 +317,7 @@ describe('v5 release safety lanes', () => {
     assert.match(enableSeed, /cd '\$ACTIVE_SRC'/)
     assert.doesNotMatch(enableSeed, /cd '\$REMOTE_SRC'/)
     assert.match(enableSeed, /smoke "\$ACTIVE_PORT"/)
-    assert.match(disable, /assert_no_rollout_in_progress/)
-    assert.match(disable, /systemctl restart '\$ACTIVE_UNIT'/)
-    assert.match(disable, /smoke "\$ACTIVE_PORT"/)
+    assert.match(disable, /rollback_model_authority_before_cutover/)
 
     const activeB = await maFixture({
       MA_DS_ROW: '2|stable|B||/rel/b||B|B|0|salt|0||2|/rel/a',
@@ -316,42 +335,725 @@ describe('v5 release safety lanes', () => {
     // 独立指针钉到本次 BUILT_RELEASE，并具备 cwd/capability 活体验证与旧 release 回切。
     assert.match(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5-egress$/m)
     assert.doesNotMatch(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5$/m)
-    const egressStart = source.indexOf('activate_egress_release()')
+    const egressStart = source.indexOf('egress_release_ready_once()')
     const deployStart = source.indexOf('\ndeploy()', egressStart)
     const egressActivate = source.slice(egressStart, deployStart)
     const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
     const deployBody = source.slice(deployStart, deployEnd)
     assert.ok(egressStart >= 0 && deployStart > egressStart)
     assert.match(egressActivate, /mv -T '\$tmplink' '\$V5_EGRESS_SRC'/)
-    assert.match(egressActivate, /\/proc\/\$pid\/cwd/)
+    assert.match(egressActivate, /readlink -f .*\/proc\/.*pid.*\/cwd/)
     assert.match(egressActivate, /MODEL_AUTHORITY_EGRESS_CAP/)
     assert.match(egressActivate, /ln -s '\$prev' '\$tmplink'/)
+    assert.match(egressActivate, /wait_for_egress_release_ready "\$reldir" "\$require_cap" 30/)
+    assert.match(egressActivate, /wait_for_egress_release_ready "\$prev" 0 30/)
+    assert.doesNotMatch(egressActivate, /run "sleep 3"/)
     assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
     assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
     assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
   })
 
+  test('egress release readiness tolerates delayed startup and has a hard deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-ready-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    await writeFile(path.join(bin, 'ssh'), [
+      '#!/bin/sh',
+      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
+      'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
+      'case "$n" in',
+      '  1) state=activating; pid=0; cwd=""; health="" ;;',
+      '  2) cwd=/release/wrong ;;',
+      '  3) health=\'{"ok":true,"role":"egress","capabilities":[]}\' ;;',
+      'esac',
+      'printf "%s\\n%s\\n%s\\n" "$state" "$pid" "$cwd"',
+      'printf "%s" "$health" | base64 -w0',
+      'printf "\\n"',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+
+    const delayed = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sleep() { :; }',
+      'wait_for_egress_release_ready "$EXPECTED_RELEASE" 1 5',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        PATH: `${bin}:${process.env.PATH}`,
+        COUNTER: counter,
+        EXPECTED_RELEASE: '/release/new',
+      },
+    })
+    assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '4')
+    assert.match(delayed.stdout, /egress ready\(state=active pid=4321 cwd=\/release\/new\)/)
+
+    const started = Date.now()
+    const timedOut = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'wait_for_egress_release_ready /release/new 1 1',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        PATH: `${bin}:${process.env.PATH}`,
+        COUNTER: counter,
+        EXPECTED_RELEASE: '/release/new',
+        SLOW_PROBE: '1',
+      },
+    })
+    const elapsed = Date.now() - started
+    assert.notEqual(timedOut.status, 0)
+    assert.ok(elapsed < 2500, `one-second egress deadline took ${elapsed}ms`)
+    assert.match(timedOut.stderr, /last state=<empty> pid=<empty> cwd=<empty>/)
+    assert.match(timedOut.stderr, /last egress health: <empty>/)
+  })
+
+  test('runtime release finalization propagates the full pinned capability list and rejects invalid metadata', async () => {
+    async function runBuild(runtimeCapabilities: unknown) {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-caps-')); dirs.push(dir)
+      const capture = path.join(dir, 'finalize.args')
+      await writeFile(capture, '')
+      const harness = [
+        'set -euo pipefail',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'git() {',
+        '  case "$*" in',
+        '    *"rev-parse HEAD"*) printf "%s\\n" pinned-commit ;;',
+        '    *"show pinned-commit:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
+        '    *"archive --format=tar pinned-commit"*) : ;;',
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'hotcfg_ship_lib() { :; }',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"grep \'^OC_RUNTIME_IMAGE=\'"*) printf "%s\\n" runtime:test ;;',
+        '    *"docker image inspect"*) printf "%s\\n" sha256:test ;;',
+        '    *"grep \'^OC_RUNTIME_RELEASE=\'"*) printf "%s\\n" /runtime/prev ;;',
+        '    *) cat >/dev/null || true ;;',
+        '  esac',
+        '}',
+        'hotcfg_rmt() { printf "%s\\n" "$@" >"$CAPTURE"; printf "%s\\n" "$OC_HOTCFG_RELEASES_ROOT/rel-test"; }',
+        'build_runtime_release',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CAPTURE: capture,
+          PINNED_METADATA: JSON.stringify({ runtimeCapabilities }),
+        },
+      })
+      return {
+        result,
+        args: (await readFile(capture, 'utf8')).trim().split('\n').filter(Boolean),
+      }
+    }
+
+    const valid = await runBuild(['model_authority_v1', 'future.runtime-cap'])
+    assert.equal(valid.result.status, 0, valid.result.stderr || valid.result.stdout)
+    assert.equal(valid.args[0], 'oc_hotcfg_finalize_release')
+    assert.equal(valid.args[5], 'model_authority_v1 future.runtime-cap')
+
+    for (const invalid of [
+      'model_authority_v1',
+      ['model_authority_v1', 'model_authority_v1'],
+      ['future.runtime-cap'],
+      ['model_authority_v1', 'bad token'],
+    ]) {
+      const rejected = await runBuild(invalid)
+      assert.notEqual(rejected.result.status, 0, rejected.result.stdout + rejected.result.stderr)
+      assert.deepEqual(rejected.args, [], 'invalid metadata must fail before finalize')
+      assert.match(rejected.result.stderr, /runtimeCapabilities 非法或缺/)
+    }
+  })
+
   test('release metadata declares both authority migrations and both authority capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
+    const source = await readFile(deploy, 'utf8')
+    const buildRuntimeStart = source.indexOf('build_runtime_release()')
+    const buildRuntimeEnd = source.indexOf('\n# ── 3. activate_runtime_tuple', buildRuntimeStart)
     assert.ok(meta.requiredMigrations.includes('0143_model_catalog'))
     assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
+    assert.match(
+      source.slice(buildRuntimeStart, buildRuntimeEnd),
+      /oc_hotcfg_finalize_release "\$staging" "\$RUNTIME_IMAGE_ID" "\$full_sha" "\$\{prev:-\}" "\$runtime_caps"/,
+    )
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
+  test('model-authority readiness tolerates startup delay, rejects PID churn, and has a hard deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-ready-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    await writeFile(path.join(bin, 'ssh'), [
+      '#!/bin/sh',
+      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
+      'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
+      'case "$PROBE_MODE" in',
+      '  master-delayed)',
+      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\n\\n\\n\\nactivating\\n0\\n"',
+      '    elif [ "$n" -eq 2 ]; then printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health"',
+      '    else printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4321\\n" "$master_health"; fi ;;',
+      '  master-churn) printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health" ;;',
+      '  master-invalid) printf "inactive\\n0\\n1\\n1\\n0\\n%s\\ninactive\\n0\\n" "$master_health" ;;',
+      '  egress-delayed)',
+      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\nactivating\\n0\\n"',
+      '    elif [ "$n" -eq 2 ]; then printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health"',
+      '    else printf "active\\n5321\\n%s\\nactive\\n5321\\n" "$egress_health"; fi ;;',
+      '  egress-churn) printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health" ;;',
+      '  egress-invalid) printf "inactive\\n0\\n%s\\ninactive\\n0\\n" "$egress_health" ;;',
+      '  *) exit 2 ;;',
+      'esac',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+
+    async function runProbe(body: string, mode: string, slow = false) {
+      await writeFile(counter, '0')
+      return spawnSync('bash', ['-c', [
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        body,
+      ].join('\n')], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          KL_HOST: 'fake-v5',
+          COUNTER: counter,
+          PROBE_MODE: mode,
+          SLOW_PROBE: slow ? '1' : '0',
+        },
+      })
+    }
+
+    const masterDelayed = await runProbe(
+      'sleep() { :; }; wait_for_model_authority_master_ready openclaude-v5.service 1 1 - 5',
+      'master-delayed',
+    )
+    assert.equal(masterDelayed.status, 0, masterDelayed.stderr || masterDelayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(masterDelayed.stdout, /master ready\(pid=4321 authority=1 provision=1 seed=-\)/)
+
+    for (const mode of ['master-churn', 'master-invalid']) {
+      const rejected = await runProbe(
+        'model_authority_master_ready_once openclaude-v5.service 1 1 - 2',
+        mode,
+      )
+      assert.notEqual(rejected.status, 0, `${mode} must be rejected`)
+    }
+
+    const egressDelayed = await runProbe(
+      'sleep() { :; }; wait_for_model_authority_egress_ready true 5',
+      'egress-delayed',
+    )
+    assert.equal(egressDelayed.status, 0, egressDelayed.stderr || egressDelayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(egressDelayed.stdout, /egress authority ready\(pid=5321 enforced=true\)/)
+
+    for (const mode of ['egress-churn', 'egress-invalid']) {
+      const rejected = await runProbe('model_authority_egress_ready_once true 2', mode)
+      assert.notEqual(rejected.status, 0, `${mode} must be rejected`)
+    }
+
+    for (const [body, mode] of [
+      ['wait_for_model_authority_master_ready openclaude-v5.service 1 1 - 1', 'master-delayed'],
+      ['wait_for_model_authority_egress_ready true 1', 'egress-delayed'],
+    ] as const) {
+      const started = Date.now()
+      const timedOut = await runProbe(body, mode, true)
+      const elapsed = Date.now() - started
+      assert.notEqual(timedOut.status, 0)
+      assert.ok(elapsed < 2500, `one-second ${mode} deadline took ${elapsed}ms`)
+    }
   })
 
   test('authority enable is fail-closed: egress enforces before master starts signing', async () => {
     const source = await readFile(deploy, 'utf8')
     const body = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     const egressRestart = body.indexOf("systemctl restart '$V5_EGRESS_UNIT'")
-    const enforceProbe = body.indexOf('modelAuthority.enforced')
+    const enforceProbe = body.indexOf('wait_for_model_authority_egress_ready true')
     const masterRestart = body.indexOf("systemctl restart '$ACTIVE_UNIT'")
     assert.ok(egressRestart >= 0, 'enable must restart egress')
     assert.ok(enforceProbe > egressRestart, 'enable must probe egress enforced=true after restart')
     assert.ok(masterRestart > enforceProbe, 'master may sign only after egress is enforcing')
+  })
+
+  test('authority enable readiness failures take the correct verified rollback path', async () => {
+    async function enableHarness(failAt: 'egress-true' | 'master-ready') {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-enable-')); dirs.push(dir)
+      const log = path.join(dir, 'order.log')
+      const body = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790',
+        'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+        'model_authority_preflight() { record preflight; return 0; }',
+        'install_model_authority_canary() { record canary; return 0; }',
+        'remote_env_set() { record "env:$1=$2"; return 0; }',
+        'ssh() { record "ssh:$*"; return 0; }',
+        'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; [[ ! ( "$FAIL_AT" == egress-true && "$1" == true ) ]]; }',
+        'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$FAIL_AT" != master-ready ]]; }',
+        'rollback_model_authority_before_cutover() { record "full-rollback:$1"; return 0; }',
+        'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+        'smoke() { record smoke; return 0; }',
+        'start_model_authority_observation() { record observation; return 0; }',
+        'enable_model_authority',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', body], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+      })
+      return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
+    }
+
+    const egressFailure = await enableHarness('egress-true')
+    assert.notEqual(egressFailure.result.status, 0)
+    assert.match(
+      egressFailure.order.join('\n'),
+      /openclaude-v5-egress[\s\S]*egress-ready:true[\s\S]*env:OC_MODEL_AUTHORITY=0[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false/,
+    )
+    assert.equal(egressFailure.order.some((line) => line.includes("restart 'openclaude-v5.service'")), false)
+
+    const masterFailure = await enableHarness('master-ready')
+    assert.notEqual(masterFailure.result.status, 0)
+    assert.match(
+      masterFailure.order.join('\n'),
+      /egress-ready:true[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/-[\s\S]*full-rollback:post-enable master readiness failed/,
+    )
+    assert.doesNotMatch(masterFailure.order.join('\n'), /smoke|observation/)
+  })
+
+  test('model-authority evidence persistence survives real psql command tags and stays fail-closed without a canary', (t) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+    const schema = `oc_ma_observation_${process.pid}_${Date.now()}`
+    const bundleRev = 'abcdef123456'
+    const bundlePath = `/var/lib/openclaude-v5/platform/bundles/${bundleRev}`
+    const psql = (sql: string, searchPath = false) => spawnSync(
+      'psql',
+      [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...(searchPath ? { PGOPTIONS: `-c search_path=${schema}` } : {}),
+        },
+      },
+    )
+
+    const setup = psql(`
+      CREATE SCHEMA ${schema};
+      CREATE TABLE ${schema}.model_security_epoch (id BOOLEAN PRIMARY KEY, epoch BIGINT NOT NULL);
+      CREATE TABLE ${schema}.model_visibility_grants (user_id BIGINT NOT NULL, model_id TEXT NOT NULL);
+      CREATE TABLE ${schema}.usage_records (
+        model TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        execution_revision TEXT,
+        security_epoch BIGINT,
+        authority_kind TEXT
+      );
+      CREATE TABLE ${schema}.request_finalize_journal (
+        state TEXT NOT NULL,
+        ctx JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE ${schema}.model_catalog (entry_id BIGINT PRIMARY KEY, model_id TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE TABLE ${schema}.model_aliases (alias TEXT NOT NULL, entry_id BIGINT NOT NULL);
+      CREATE TABLE ${schema}.model_runtime_requirements (model_id TEXT NOT NULL);
+      CREATE TABLE ${schema}.model_pricing (model_id TEXT NOT NULL, enabled BOOLEAN NOT NULL);
+      CREATE TABLE ${schema}.model_authority_deploy_state (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        description TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      INSERT INTO ${schema}.model_security_epoch(id,epoch) VALUES (TRUE,3);
+      INSERT INTO ${schema}.model_visibility_grants(user_id,model_id)
+      VALUES (42,'oc-catalog-canary-glm52');
+      INSERT INTO ${schema}.usage_records(authority_kind) VALUES ('bridge_signed'),('legacy');
+    `)
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout)
+
+    t.after(() => {
+      const cleanup = psql(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
+      assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout)
+    })
+
+    const shellPrelude = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'model_authority_release_sha() { printf %s test-release-sha; }',
+      `model_authority_runtime_tuple() { printf "%s\\n" '{"image":"test-image","image_id":"sha256:test","release":"/test/release","bundle":"${bundlePath}"}'; }`,
+      'remote_model_authority_psql() {',
+      '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc "$1" 2>/dev/null | tr -d \'[:space:]\'',
+      '}',
+    ]
+    const runShell = (body: string[]) => spawnSync('bash', ['-c', [...shellPrelude, ...body].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TEST_DATABASE_URL: databaseUrl, TEST_SCHEMA: schema },
+    })
+    const runObservation = () => runShell(['start_model_authority_observation'])
+
+    const success = runObservation()
+    assert.equal(success.status, 0, success.stderr || success.stdout)
+    assert.match(success.stdout, /observation 已开始/)
+
+    const persisted = psql(
+      "SELECT value::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persisted.status, 0, persisted.stderr || persisted.stdout)
+    const observation = JSON.parse(persisted.stdout.trim()) as Record<string, unknown>
+    assert.equal(observation.release_sha, 'test-release-sha')
+    assert.equal(observation.security_epoch, '3')
+    assert.equal(observation.canary_uid, '42')
+    assert.equal(observation.request_baseline, '1')
+    assert.deepEqual(observation.runtime_tuple, {
+      image: 'test-image',
+      image_id: 'sha256:test',
+      release: '/test/release',
+      bundle: bundlePath,
+    })
+
+    const addCanaryUsage = psql(`
+      INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
+      VALUES ('oc-catalog-canary-glm52','revision-canary',3,'bridge_signed')
+    `, true)
+    assert.equal(addCanaryUsage.status, 0, addCanaryUsage.stderr || addCanaryUsage.stdout)
+    const status = runShell(['model_authority_observation_status'])
+    assert.equal(status.status, 0, status.stderr || status.stdout)
+    const statusJson = JSON.parse(status.stdout) as Record<string, unknown>
+    assert.equal(statusJson.signed_requests, 1)
+    assert.equal(statusJson.canary_requests, 1)
+
+    const legacyUpdate = psql(`
+      UPDATE model_authority_deploy_state SET value=value
+      WHERE key='observation'
+      RETURNING 'ok'
+    `, true)
+    assert.equal(legacyUpdate.status, 0, legacyUpdate.stderr || legacyUpdate.stdout)
+    assert.equal(legacyUpdate.stdout.replace(/\s/g, ''), 'okUPDATE1')
+
+    const seed = runShell([
+      'OC_HOTCFG_PLATFORM_ROOT=/var/lib/openclaude-v5/platform',
+      'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/test/release',
+      'assert_no_rollout_in_progress() { return 0; }',
+      `remote_env_get() { case "$1" in OC_PLATFORM_BUNDLE) printf "%s\\n" '${bundlePath}' ;; OC_SEED_AUTHORITY_BY_REV) printf 0 ;; *) printf "" ;; esac; }`,
+      'remote_env_set() { return 0; }',
+      'ssh() { return 0; }',
+      `model_authority_fleet_census() { printf "%s\\n" '[{"id":"test-container","name":"oc-v5-test","status":"running","bundle_rev":"${bundleRev}"}]'; }`,
+      'wait_for_model_authority_master_ready() { return 0; }',
+      'smoke() { return 0; }',
+      'enable_seed_authority_by_rev',
+    ])
+    assert.equal(seed.status, 0, seed.stderr || seed.stdout)
+    assert.match(seed.stdout, /seed authority by rev 已开启并留证/)
+    const persistedSeed = psql(
+      "SELECT (value->'seed_census')::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persistedSeed.status, 0, persistedSeed.stderr || persistedSeed.stdout)
+    const seedEvidence = JSON.parse(persistedSeed.stdout.trim()) as Record<string, unknown>
+    assert.equal(seedEvidence.bundle_rev, bundleRev)
+    assert.equal(seedEvidence.container_count, '1')
+    assert.deepEqual(seedEvidence.fleet, [
+      { id: 'test-container', name: 'oc-v5-test', status: 'running', bundle_rev: bundleRev },
+    ])
+
+    const currentTuple = JSON.stringify({
+      image: 'test-image',
+      image_id: 'sha256:test',
+      release: '/test/release',
+      bundle: bundlePath,
+    })
+    const emergencyTuple = JSON.stringify({
+      image: 'test-emergency-image',
+      image_id: 'sha256:emergency',
+      release: '',
+      bundle: bundlePath,
+    })
+    const emergency = runShell([
+      'assert_no_rollout_in_progress() { return 0; }',
+      `hotcfg_rmt() { case "$3" in 1|3) printf "%s\\n" '${currentTuple}' ;; 2) printf "%s\\n" '${emergencyTuple}' ;; *) return 1 ;; esac; }`,
+      `ssh() { case "$*" in *OC_RUNTIME_EMERGENCY_TUPLE*) printf "%s\\n" '${emergencyTuple}' ;; *) return 0 ;; esac; }`,
+      'record_model_authority_emergency_drill',
+    ])
+    assert.equal(emergency.status, 0, emergency.stderr || emergency.stdout)
+    assert.match(emergency.stdout, /激活与原 tuple 恢复已由三条 committed history/)
+    const persistedEmergency = psql(
+      "SELECT (value->'emergency_drill')::text FROM model_authority_deploy_state WHERE key='observation'",
+      true,
+    )
+    assert.equal(persistedEmergency.status, 0, persistedEmergency.stderr || persistedEmergency.stdout)
+    const emergencyEvidence = JSON.parse(persistedEmergency.stdout.trim()) as Record<string, unknown>
+    assert.equal(emergencyEvidence.activated_and_restored, true)
+    assert.deepEqual(emergencyEvidence.emergency_tuple, JSON.parse(emergencyTuple))
+
+    const prepareCutover = psql(`
+      INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
+      SELECT 'glm-5.2','revision-' || n,3,'bridge_signed' FROM generate_series(1,9) AS n;
+      INSERT INTO request_finalize_journal(state,ctx,created_at,updated_at)
+      VALUES (
+        'committed',
+        '{"source":"ccb_proxy","authorityKind":"bridge_signed","executionRevision":"revision-long","securityEpoch":"3"}',
+        NOW()-interval '6 minutes',NOW()
+      );
+      INSERT INTO model_catalog(entry_id,model_id,state)
+      VALUES (1,'oc-catalog-canary-glm52','active');
+      INSERT INTO model_aliases(alias,entry_id) VALUES ('oc-catalog-canary',1);
+      UPDATE model_authority_deploy_state SET value=value || jsonb_build_object(
+        'started_at',(NOW()-interval '901 seconds')::text
+      ) WHERE key='observation';
+    `, true)
+    assert.equal(prepareCutover.status, 0, prepareCutover.stderr || prepareCutover.stdout)
+
+    const cutover = runShell([
+      'remote_env_get() { case "$1" in "$MODEL_AUTHORITY_FLAG_KEY"|OC_SEED_AUTHORITY_BY_REV) printf 1 ;; *) printf "" ;; esac; }',
+      'model_authority_preflight() { return 0; }',
+      `model_authority_fleet_census() { printf "%s\\n" '[{"id":"test-container","bundle_rev":"${bundleRev}"}]'; }`,
+      'remote_model_authority_psql_script() {',
+      '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -q',
+      '}',
+      'remote_env_set() { return 0; }',
+      'model_authority_cutover_done() { return 0; }',
+      'model_authority_cutover',
+    ])
+    assert.equal(cutover.status, 0, cutover.stderr || cutover.stdout)
+    const cutoverMarker = psql(
+      "SELECT value->>'release_sha' FROM model_authority_deploy_state WHERE key='cutover'",
+      true,
+    )
+    assert.equal(cutoverMarker.status, 0, cutoverMarker.stderr || cutoverMarker.stdout)
+    assert.equal(cutoverMarker.stdout.trim(), 'test-release-sha')
+
+    const legacy = psql(`
+      INSERT INTO model_authority_deploy_state(key,value)
+      VALUES ('cutover','{}')
+      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+      RETURNING 'ok'
+    `, true)
+    assert.equal(legacy.status, 0, legacy.stderr || legacy.stdout)
+    assert.equal(legacy.stdout.replace(/\s/g, ''), 'okINSERT01')
+
+    const removeGrant = psql('DELETE FROM model_visibility_grants', true)
+    assert.equal(removeGrant.status, 0, removeGrant.stderr || removeGrant.stdout)
+    const missingCanary = runObservation()
+    assert.notEqual(missingCanary.status, 0)
+    assert.match(missingCanary.stderr, /observation 未写入/)
+    assert.doesNotMatch(missingCanary.stdout, /observation 已开始/)
+  })
+
+  async function modelAuthorityRollbackHarness(fail = '') {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-rollback-')); dirs.push(dir)
+    const log = path.join(dir, 'order.log')
+    const body = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+      'authority_flag=1',
+      'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+      'assert_no_rollout_in_progress() { record stable; return 0; }',
+      'remote_env_get() { [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && printf "%s\\n" "$authority_flag"; }',
+      'remote_env_set() { record "env:$1=$2"; [[ "$FAIL_AT" != "env:$1=$2" ]] || return 1; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
+      'ssh() {',
+      '  record "ssh:$*"',
+      '  if [[ "$*" == *"restart \'$ACTIVE_UNIT\'"* && "$FAIL_AT" == master_first && "$(grep -c "restart \'$ACTIVE_UNIT\'" "$ORDER_LOG")" == 1 ]]; then return 1; fi',
+      '  return 0',
+      '}',
+      'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$FAIL_AT" != "master-ready:$2/$3/$4" ]]; }',
+      'run_model_authority_container_rollback() { record census; [[ "$FAIL_AT" != census ]]; }',
+      'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; [[ "$FAIL_AT" != "egress-ready:$1" ]]; }',
+      'smoke() { record smoke; [[ "$FAIL_AT" != smoke ]]; }',
+      'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+      'rollback_model_authority_before_cutover test',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', body], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: fail },
+    })
+    return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
+  }
+
+  test('authority rollback behavior is provision-stop → census → master-first → egress, with full smoke', async () => {
+    const { result, order } = await modelAuthorityRollbackHarness()
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const expected = [
+      'stable',
+      'env:OC_MODEL_AUTHORITY_PROVISION_REQUIRED=0',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
+      'master-ready:1/0/-',
+      'census',
+      'env:OC_MODEL_AUTHORITY=0',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
+      'master-ready:0/0/-',
+      "ssh:fake-v5 systemctl restart 'openclaude-v5-egress.service'",
+      'egress-ready:false',
+      'smoke',
+    ]
+    assert.deepEqual(order, expected)
+  })
+
+  test('authority rollback short-circuits safely on env/master/census/smoke failures', async () => {
+    const envFail = await modelAuthorityRollbackHarness('env:OC_MODEL_AUTHORITY=0')
+    assert.notEqual(envFail.result.status, 0)
+    const flagWrite = envFail.order.indexOf('env:OC_MODEL_AUTHORITY=0')
+    assert.ok(flagWrite >= 0)
+    assert.equal(envFail.order.slice(flagWrite + 1).some((v) => v.includes('restart')), false)
+
+    const masterFail = await modelAuthorityRollbackHarness('master_first')
+    assert.notEqual(masterFail.result.status, 0)
+    assert.doesNotMatch(masterFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress:false/)
+
+    const masterReadinessFail = await modelAuthorityRollbackHarness('master-ready:1/0/-')
+    assert.notEqual(masterReadinessFail.result.status, 0)
+    assert.doesNotMatch(masterReadinessFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress-ready:false/)
+
+    const censusFail = await modelAuthorityRollbackHarness('census')
+    assert.notEqual(censusFail.result.status, 0)
+    assert.doesNotMatch(censusFail.order.join('\n'), /env:OC_MODEL_AUTHORITY=0|egress:false/)
+
+    const smokeFail = await modelAuthorityRollbackHarness('smoke')
+    assert.notEqual(smokeFail.result.status, 0)
+    assert.match(smokeFail.order.join('\n'), /egress-ready:false[\s\S]*smoke[\s\S]*diagnostic:/)
+  })
+
+  test('authority rollback is resumable after flag0 when egress recovery previously failed', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-resume-')); dirs.push(dir)
+    const log = path.join(dir, 'order.log')
+    const body = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+      'authority_flag=1; egress_fail=1',
+      'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+      'assert_no_rollout_in_progress() { return 0; }',
+      'remote_env_get() { printf "%s\\n" "$authority_flag"; }',
+      'remote_env_set() { record "env:$1=$2"; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
+      'ssh() { record "ssh:$*"; if [[ "$*" == *"restart \'$V5_EGRESS_UNIT\'"* && "$egress_fail" == 1 ]]; then return 1; fi; return 0; }',
+      'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$authority_flag" == "$2" ]]; }',
+      'run_model_authority_container_rollback() { record census; return 0; }',
+      'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; return 0; }',
+      'smoke() { record smoke; return 0; }',
+      'model_authority_rollback_diagnostics() { record "diagnostic:$1"; }',
+      'rollback_model_authority_before_cutover first || true',
+      'record retry',
+      'egress_fail=0',
+      'rollback_model_authority_before_cutover retry',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', body], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log },
+    })
+    const order = (await readFile(log, 'utf8')).trim().split('\n')
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const retryAt = order.indexOf('retry')
+    const retried = order.slice(retryAt + 1).join('\n')
+    assert.match(retried, /master-ready:0\/0\/-[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false[\s\S]*smoke/)
+    assert.doesNotMatch(retried, /master-ready:1\/0\/-/)
+  })
+
+  test('seed authority failures compensate commit-unknown writes and verify live seed=0', async () => {
+    async function seedHarness(failAt: 'write-unknown' | 'seed-ready' | 'comp-ready' | 'evidence-read') {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-seed-')); dirs.push(dir)
+      const log = path.join(dir, 'order.log')
+      const body = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
+        'OC_HOTCFG_PLATFORM_ROOT=/platform; seed_state=0',
+        'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
+        'assert_no_rollout_in_progress() { record stable; return 0; }',
+        'remote_env_get() { case "$1" in OC_PLATFORM_BUNDLE) printf "%s\\n" /platform/bundles/aaaaaaaaaaaa ;; OC_SEED_AUTHORITY_BY_REV) printf "%s\\n" "$seed_state" ;; esac; }',
+        'remote_env_set() { record "env:$1=$2"; if [[ "$1" == OC_SEED_AUTHORITY_BY_REV ]]; then seed_state="$2"; [[ ! ( "$FAIL_AT" == write-unknown && "$2" == 1 ) ]]; else return 0; fi; }',
+        'ssh() { record "ssh:$*"; return 0; }',
+        'model_authority_fleet_census() { printf "%s\\n" \'[{"id":"cid","name":"oc-v5-u1","status":"running","bundle_rev":"aaaaaaaaaaaa"}]\'; }',
+        'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; if [[ "$4" == 1 && ( "$FAIL_AT" == seed-ready || "$FAIL_AT" == comp-ready ) ]]; then return 1; fi; [[ ! ( "$4" == 0 && "$FAIL_AT" == comp-ready ) ]]; }',
+        'smoke() { record smoke; return 0; }',
+        'model_authority_release_sha() { record release-read; [[ "$FAIL_AT" != evidence-read ]] || return 1; printf %s release-sha; }',
+        'model_authority_runtime_tuple() { record tuple-read; printf "%s\\n" \'{"image":"i","image_id":"id","release":"r","bundle":"b"}\'; }',
+        'remote_model_authority_psql() { record psql; return 1; }',
+        'enable_seed_authority_by_rev',
+      ].join('\n')
+      const result = spawnSync('bash', ['-c', body], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+      })
+      return {
+        result,
+        order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean),
+        output: result.stdout + result.stderr,
+      }
+    }
+
+    const commitUnknown = await seedHarness('write-unknown')
+    assert.notEqual(commitUnknown.result.status, 0)
+    assert.match(
+      commitUnknown.order.join('\n'),
+      /env:OC_SEED_AUTHORITY_BY_REV=1[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.doesNotMatch(commitUnknown.order.join('\n'), /psql/)
+    assert.match(commitUnknown.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(commitUnknown.output, /seed authority by rev 已开启并留证/)
+
+    const readinessFailure = await seedHarness('seed-ready')
+    assert.notEqual(readinessFailure.result.status, 0)
+    assert.match(
+      readinessFailure.order.join('\n'),
+      /master-ready:1\/1\/1[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.match(readinessFailure.output, /seed authority 已验证回滚/)
+
+    const evidenceReadFailure = await seedHarness('evidence-read')
+    assert.notEqual(evidenceReadFailure.result.status, 0)
+    assert.match(
+      evidenceReadFailure.order.join('\n'),
+      /master-ready:1\/1\/1[\s\S]*smoke[\s\S]*release-read[\s\S]*env:OC_SEED_AUTHORITY_BY_REV=0[\s\S]*restart 'openclaude-v5.service'[\s\S]*master-ready:1\/1\/0/,
+    )
+    assert.match(evidenceReadFailure.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(evidenceReadFailure.output, /seed authority by rev 已开启并留证/)
+
+    const compensationFailure = await seedHarness('comp-ready')
+    assert.notEqual(compensationFailure.result.status, 0)
+    assert.match(compensationFailure.order.join('\n'), /master-ready:1\/1\/1[\s\S]*master-ready:1\/1\/0/)
+    assert.doesNotMatch(compensationFailure.output, /seed authority 已验证回滚/)
+    assert.doesNotMatch(compensationFailure.output, /seed authority by rev 已开启并留证/)
   })
 
   test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {

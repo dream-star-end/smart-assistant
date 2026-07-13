@@ -19,6 +19,7 @@ import {
 } from '@openclaude/storage'
 
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
+import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
 import { requireAuth } from '../http/auth.js'
 import { makePgSkillEmbedCache } from '../http/skillEmbedCachePg.js'
 import { sendJson } from '../http/util.js'
@@ -26,6 +27,7 @@ import {
   type ApprovedSearchRow,
   type ArtifactKind,
   marketplaceAgentsEnabled,
+  marketplaceConnectorsEnabled,
   resolveCallerOrgId,
 } from './marketplaceDb.js'
 import { listMarketBrowseCatalog } from './platformPresets.js'
@@ -46,6 +48,8 @@ function toCard(c: ApprovedSearchRow): {
   usage30d: number
   users30d: number
   rating: { up: number; down: number } | null
+  official?: boolean
+  preinstalled?: boolean
 } {
   // installCount 是加法字段(v3 vanilla UI 忽略);排序服务端权威(featured→30天使用人数→热度→新),前端信任此序。
   // 平台预设 agent 已在 handleMarketplaceSearch 收口剔除,不会走到这里,故无 preset 字段。
@@ -53,6 +57,7 @@ function toCard(c: ApprovedSearchRow): {
   // 前端徽记须标注"发布者提供·未经平台验证"(v3 vanilla UI 忽略该加法字段)。
   // 人向导购字段(category/useCases/featuredRank)卡片透出;outcomeExamples/humanMd 仅 detail(卡片保持轻)。
   // 真实使用信号(usage30d/users30d/rating)卡片透出;rating 样本 <RATING_MIN_SAMPLE 时服务端已置 null。
+  const official = c.kind === 'connector' && isDefaultConnectorArtifact(c.slug, c.artifactHash)
   return {
     slug: c.slug,
     kind: c.kind,
@@ -67,6 +72,7 @@ function toCard(c: ApprovedSearchRow): {
     usage30d: c.usage30d,
     users30d: c.users30d,
     rating: c.rating,
+    ...(official ? { official: true, preinstalled: true } : {}),
   }
 }
 
@@ -85,7 +91,12 @@ export async function handleMarketplaceSearch(
   )
   const kindParam = url.searchParams.get('kind')
   // An explicit but unknown kind returns empty (not a silent fall-through to all).
-  if (kindParam !== null && kindParam !== 'skill' && kindParam !== 'agent') {
+  if (
+    kindParam !== null &&
+    kindParam !== 'skill' &&
+    kindParam !== 'agent' &&
+    kindParam !== 'connector'
+  ) {
     sendJson(res, 200, { results: [], method: 'all' })
     return
   }
@@ -94,9 +105,14 @@ export async function handleMarketplaceSearch(
   // "全部"会把 v5 专属 agent(如平台科研 agent)混进 v3 技能市场——而 v3 容器没有对应能力,
   // 装了即坏。v5 web-react BrowsePanel 每个分页都显式传 kind('skill'/'agent'),不受影响。
   // 共享 DB 下,这是"v5 专属 agent 不泄漏给 v3"收敛到单一权威的最小改。
-  const kind: ArtifactKind = kindParam === 'agent' ? 'agent' : 'skill'
+  const kind: ArtifactKind =
+    kindParam === 'agent' ? 'agent' : kindParam === 'connector' ? 'connector' : 'skill'
   // agent 类市场仅 v5 可用(共享 DB,v3 容器无对应能力)。v3 渠道上 agent 搜索一律返空。
   if (kind === 'agent' && !marketplaceAgentsEnabled()) {
+    sendJson(res, 200, { results: [], method: 'all' })
+    return
+  }
+  if (kind === 'connector' && !marketplaceConnectorsEnabled()) {
     sendJson(res, 200, { results: [], method: 'all' })
     return
   }

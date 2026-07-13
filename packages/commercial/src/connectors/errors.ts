@@ -18,6 +18,7 @@ export type ConnectorErrorCode =
   | 'CONNECTION_ERROR'
   | 'RELINK_REQUIRED'
   | 'ACCOUNT_ALREADY_LINKED'
+  | 'CONNECTOR_NOT_INSTALLED'
   // 上游(稳定映射,绝不透传原始 body)
   | 'UPSTREAM_ERROR'
   | 'UPSTREAM_TIMEOUT'
@@ -84,6 +85,7 @@ function defaultHttpStatus(code: ConnectorErrorCode): number {
     case 'CONFIRMATION_ALREADY_FINALIZED':
     case 'REVISION_MISMATCH':
     case 'ACCOUNT_ALREADY_LINKED':
+    case 'CONNECTOR_NOT_INSTALLED':
       return 409
     case 'CONFIRMATION_IN_PROGRESS':
       return 409

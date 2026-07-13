@@ -855,6 +855,9 @@ export type MarketplaceCard = {
   installCount?: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
+  /** 官方默认连接器：平台预装，无 install/uninstall。 */
+  official?: boolean;
+  preinstalled?: boolean;
   /** 发布者自报评测摘要(仅有数据时渲染徽记;展示须标注"发布者提供·未经平台验证")。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
   // ── 人向商品层（storefront 元数据；权威枚举见 @openclaude/protocol taxonomy） ──
@@ -881,7 +884,7 @@ export type MarketplaceSearchResult = {
 };
 
 /** 市场条目类型（技能 / 智能体）。 */
-export type MarketplaceKind = "skill" | "agent";
+export type MarketplaceKind = "skill" | "agent" | "connector";
 
 /** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整工件供安装确认）。 */
 export type MarketplaceDetail = {
@@ -905,6 +908,12 @@ export type MarketplaceDetail = {
   installCount: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
+  official?: boolean;
+  connectorContract?: {
+    authMode: string;
+    approvedOrigins: string[];
+    actions: Array<{ id: string; effect: string }>;
+  } | null;
   /** 附属文件(references/assets/evals;path → content)。 */
   rawBundle?: Record<string, string> | null;
   /** 发布者自报评测摘要(展示须标注"发布者提供")。 */
@@ -983,6 +992,7 @@ export type MarketplacePending = {
   tags: string[];
   /** 通用原始工件（技能=SKILL.md；智能体=manifest）。 */
   rawArtifact: string;
+  artifactHash: string;
   rawSkillMd?: string | null;
   manifest?: unknown;
   riskFlags: MarketplaceRiskFlag[];
@@ -1059,6 +1069,14 @@ export type MarketplaceAgentPublishInput = MarketplaceHumanMetaInput & {
   displayName?: string;
   avatarEmoji?: string;
   greeting?: string;
+};
+
+/** 连接器技术发布入参；securityDecision 是发布者建议，最终以平台审核签名决定为准。 */
+export type MarketplaceConnectorPublishInput = MarketplaceHumanMetaInput & {
+  version: string;
+  spec: Record<string, unknown>;
+  securityDecision: Record<string, unknown>;
+  tags: string[];
 };
 
 /** 发布入参（POST /api/marketplace/publish；含 storefront 元数据）。 */

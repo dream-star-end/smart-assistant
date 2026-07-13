@@ -11,6 +11,8 @@
     "0137_selfheal_user_notice_approval",
     "0143_model_catalog",
     "0144_model_authority_guards",
+    "0145_retire_legacy_incident_notices",
+    "0146_connector_ai_declarative_verification",
     "0147_lossless_turn_tapes"
   ],
   "capabilities": [
@@ -19,9 +21,7 @@
     "model_authority_v1",
     "model_authority_v1-egress"
   ],
-  "runtimeCapabilities": [
-    "model_authority_v1"
-  ],
+  "runtimeCapabilities": ["model_authority_v1"],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
 }

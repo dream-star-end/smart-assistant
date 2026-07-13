@@ -84,7 +84,6 @@ import {
   type ModelAuthorityBundle,
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
-  type SysIncident,
   type TraceIdIssue,
 } from "@openclaude/protocol";
 import type { AuthoritySigner } from "./authoritySigner.js";
@@ -610,21 +609,6 @@ export interface UserChatBridgeDeps {
    * 未注入(v3 / 测试)或返回 null → 不发帧,零行为变化。
    */
   getFrontendBuildId?: () => string | null;
-  /**
-   * V5 自愈体系(RFC-v5-selfheal-ops §5)— 当前活跃事故快照 provider。
-   * 注入后 bridge 在**每个 userWs 完成 JWT + 封号复核 + WS 注册之后**(不在 pre-auth
-   * 的 sys.frontend_build 处,否则向未认证连接泄漏事故)对新连接逐条补发 `sys.incident`
-   * open 帧,让刚上线的前端立即看到已存在的横幅。
-   *
-   * 返回的每一项即一枚完整 `sys.incident` 帧(含 type/status:'open'/rev/ts…),bridge 直接
-   * `JSON.stringify` 发出。快照经此 provider 闭包获取(与 getFrontendBuildId 同注入范式),
-   * **不让 bridge 直连 PG**:集成者在 index.ts 从 selfheal sweeper 的内存快照 forward-ref
-   * 装配。未注入(v3 / 测试)→ 不补发,零行为变化。
-   */
-  /** Returns the active incidents VISIBLE TO this uid (audience-filtered), for
-   *  post-auth backfill. Must never return another user's targeted incident
-   *  (Codex B2) — the provider filters by recipient. */
-  incidentSnapshotProvider?: (uid: string) => SysIncident[];
   /** 可选:每用户最大并发(默认 3)。 */
   maxPerUser?: number;
   /** 可选:单帧上限(双向,默认 1MB)。 */
@@ -1062,16 +1046,11 @@ export interface UserChatBridgeHandler {
    * 非 JSON-serializable 输入会吞 JSON.stringify 异常,不抛。
    */
   broadcastToUser(uid: bigint, payload: unknown): number;
-  /**
-   * V5 自愈体系(RFC-v5-selfheal-ops §5)— 全站广播:给**所有**在线用户的每个 OPEN
-   * user WS 发一帧 JSON payload(遍历 uidToUserWs)。selfheal sweeper 用它推 audience=all
-   * 的 `sys.incident`。返回实际发送成功的连接数。非 JSON-serializable 输入吞异常返 0,不抛。
-   */
+  /** 给所有在线用户的每个 OPEN user WS 广播 JSON payload。不得用于用户事故通知。 */
   broadcastAll(payload: unknown): number;
   /**
-   * V5 自愈体系(RFC-v5-selfheal-ops §5)— 定向广播:只给 uids 集合中在线用户的 OPEN
-   * user WS 发 payload(audience=user_ids / surface_cohort)。uid 以字符串给出(uidToUserWs
-   * 的 key 口径)。返回实际发送成功的连接数。非 JSON-serializable 输入吞异常返 0,不抛。
+   * 只给 uids 集合中在线用户的 OPEN user WS 发 payload。用户恢复通知仅允许
+   * userNoticeApproval 在审批后调用。uid 以字符串给出(uidToUserWs 的 key 口径)。
    */
   broadcastToUsers(uids: string[], payload: unknown): number;
   /** Return only requested users that currently own at least one OPEN user websocket. */
@@ -2308,32 +2287,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
-    }
-
-    // V5 自愈体系(RFC-v5-selfheal-ops §5)— 认证后补发当前活跃事故快照。
-    //   安全红线:此处已过 JWT 验证 + 封号复核 + registry.register(WS 注册)——**绝不**能
-    //   把补发挪到 pre-auth 的 sys.frontend_build(handleUpgrade 内 :982),那会向未认证连接
-    //   泄漏事故内容。快照经注入的 provider 闭包获取(不让 bridge 直连 PG;集成者从 selfheal
-    //   sweeper 内存快照 forward-ref 装配),未注入 → 跳过(向后兼容,零行为变化)。
-    //   provider 返回的即完整 sys.incident 帧(active 即 status:'open'),逐条直发。
-    //   best-effort:provider 抛错 / 单帧 send 失败都只记日志,绝不影响桥主链路。
-    if (deps.incidentSnapshotProvider) {
-      try {
-        // Per-uid: only incidents THIS user may see (audience-filtered), never a
-        // global snapshot (Codex B2 — targeted incidents leaked to all).
-        const activeIncidents = deps.incidentSnapshotProvider(uid.toString());
-        for (const incident of activeIncidents) {
-          if (userWs.readyState !== WebSocket.OPEN) break;
-          try { userWs.send(JSON.stringify(incident)); }
-          catch (err) {
-            bridgeLog?.warn("user-chat-bridge: incident backfill send failed", {
-              incidentId: incident.incidentId, err,
-            });
-          }
-        }
-      } catch (err) {
-        bridgeLog?.warn("user-chat-bridge: incidentSnapshotProvider threw", { err });
-      }
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -3776,6 +3729,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
 
     const preopenQueue: Array<{ data: RawData; isBinary: boolean; len: number }> = [];
+    let loggedRejectedContainerIncident = false;
 
     const onContainerMessage = (data: RawData, isBinary: boolean): void => {
       const len = rawDataLen(data);
@@ -3811,6 +3765,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
+      }
+      // `sys.incident` is a master-authored, approval-gated user-notice namespace.
+      // Containers are tenant-controlled execution surfaces and must never forge it.
+      // Reject before TTFT accounting, outboundRing.storeStamped and live forwarding,
+      // so a forged approved_recovery cannot reach the user now or on reconnect replay.
+      const incidentCandidate = Buffer.isBuffer(data)
+        ? data.toString("utf8")
+        : data instanceof ArrayBuffer
+          ? Buffer.from(data).toString("utf8")
+          : Buffer.concat(data).toString("utf8");
+      let parsedIncident: unknown = null;
+      try { parsedIncident = JSON.parse(incidentCandidate); } catch { /* non-JSON remains normal traffic */ }
+      if (
+        parsedIncident !== null && typeof parsedIncident === "object" &&
+        (parsedIncident as { type?: unknown }).type === "sys.incident"
+      ) {
+        if (!loggedRejectedContainerIncident) {
+          loggedRejectedContainerIncident = true;
+          bridgeLog?.warn("user-chat-bridge: rejected container-authored sys.incident");
+        }
+        return;
       }
       // Bridge TTFT 终点:首个 container→user 帧。
       // 守卫 firstUserFrameAtMs !== null 防御容器在用户发帧前主动 push(理论不发生,
