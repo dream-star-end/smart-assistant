@@ -380,7 +380,7 @@ export async function handleNoticeApprovalCommand(
   msg: AibotInboundMessage,
   deps: Pick<UserNoticeApprovalDeps,"tx">,
 ): Promise<string | null> {
-  const text = msg.text?.trim();
+  const text = msg.text?.trim().replace(/^(?:@\S+\s+)+/, "");
   if (!text || !msg.reqId || !msg.fromUserId) return null;
   const bind = /^绑定审批\s+([0-9A-F]{8})$/i.exec(text);
   const decision = /^(同意|拒绝)\s+([0-9A-F]{6})$/i.exec(text);
