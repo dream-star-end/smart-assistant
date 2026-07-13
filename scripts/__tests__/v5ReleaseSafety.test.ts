@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -11,6 +12,7 @@ const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
+const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -18,11 +20,53 @@ afterEach(async () => {
 })
 
 function run(script: string, args: string[], env: NodeJS.ProcessEnv = {}) {
+  const childEnv = { ...process.env, ALLOW_ANY_BRANCH: '1', ...env }
+  for (const [key, value] of Object.entries(childEnv)) {
+    if (value === undefined) delete childEnv[key]
+  }
   return spawnSync('bash', [script, ...args], {
     cwd: root,
     encoding: 'utf8',
-    env: { ...process.env, ALLOW_ANY_BRANCH: '1', ...env },
+    env: childEnv,
   })
+}
+
+async function caddyRemoteFixture() {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-caddy-port-')); dirs.push(dir)
+  const bin = path.join(dir, 'bin'); await mkdir(bin)
+  const sshLog = path.join(dir, 'ssh.log')
+  const sshStdinLog = path.join(dir, 'ssh.stdin.log')
+  const scpLog = path.join(dir, 'scp.log')
+  await writeFile(path.join(bin, 'ssh'), [
+    '#!/bin/sh',
+    'printf "%s\\n" "$*" >>"$FAKE_SSH_LOG"',
+    'if [ "${2:-}" = bash ] && [ "${3:-}" = -s ]; then',
+    '  cat >"$FAKE_SSH_STDIN_LOG"',
+    '  printf "SET:%s:svc_v5 http_v5 public_route\\n" "${9:-}"',
+    '  exit 0',
+    'fi',
+    'case "$*" in',
+    '  *psql*) cat >/dev/null; printf "%s\\n" "$FAKE_DS_ROW" ;;',
+    '  *Cookie:*) printf "%s\\n" \'{"ok":true,"slot":"B"}\' ;;',
+    '  *curl*) printf "%s\\n" \'{"ok":true,"slot":"A"}\' ;;',
+    'esac',
+  ].join('\n') + '\n')
+  await writeFile(path.join(bin, 'scp'), '#!/bin/sh\nprintf "%s\\n" "$*" >>"$FAKE_SCP_LOG"\n')
+  await chmod(path.join(bin, 'ssh'), 0o755)
+  await chmod(path.join(bin, 'scp'), 0o755)
+  return {
+    dir,
+    sshLog,
+    sshStdinLog,
+    scpLog,
+    env: {
+      PATH: `${bin}:${process.env.PATH}`,
+      KL_HOST: 'fake-v5',
+      FAKE_SSH_LOG: sshLog,
+      FAKE_SSH_STDIN_LOG: sshStdinLog,
+      FAKE_SCP_LOG: scpLog,
+    } satisfies NodeJS.ProcessEnv,
+  }
 }
 
 describe('v5 release safety lanes', () => {
@@ -240,6 +284,90 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(source, /@v5_upstream_unavailable status/)
     const result = run(caddy, ['--dry-run'])
     assert.equal(result.status, 0, result.stderr)
+  })
+
+  test('P3 Caddy port keeps the production render golden and validates boundaries', () => {
+    const production = run(caddyApply, ['--render', '--dry-run'], { CADDY_HTTP_PORT: undefined })
+    assert.equal(production.status, 0, production.stderr)
+    assert.equal(
+      createHash('sha256').update(production.stdout).digest('hex'),
+      '60c9853f4b3bca511bf9f2cd6fad50dade596b99fb2f487f7dd0227919cc9d7b',
+    )
+    assert.doesNotMatch(production.stdout, /\tbind /)
+
+    const staging = run(caddyApply, ['--render', '--dry-run'], { CADDY_HTTP_PORT: '18081' })
+    assert.equal(staging.status, 0, staging.stderr)
+    assert.match(staging.stdout, /http:\/\/claudeai\.chat:18081 \{\n\tbind 127\.0\.0\.1\n/)
+
+    for (const port of ['1', '65535']) {
+      const valid = run(caddyApply, ['--render', '--dry-run'], { CADDY_HTTP_PORT: port })
+      assert.equal(valid.status, 0, `port=${port}: ${valid.stderr}`)
+    }
+    for (const port of ['0', '65536', '08', 'not-a-port']) {
+      const invalid = run(caddyApply, ['--render', '--dry-run'], { CADDY_HTTP_PORT: port })
+      assert.notEqual(invalid.status, 0, `port=${port} should fail`)
+      assert.match(invalid.stderr, /CADDY_HTTP_PORT 必须是 1\.\.65535/)
+    }
+  })
+
+  test('P3 Caddy verify and reload probes honor the configured port', async () => {
+    const fixture = await caddyRemoteFixture()
+    const canaryRow = '42|canary|A|B|/rel/a|/rel/b|A|A|0|salt|10||7|'
+
+    const defaultVerify = run(caddyApply, ['--verify'], {
+      ...fixture.env,
+      CADDY_HTTP_PORT: undefined,
+      FAKE_DS_ROW: canaryRow,
+    })
+    assert.equal(defaultVerify.status, 0, defaultVerify.stderr || defaultVerify.stdout)
+    let log = await readFile(fixture.sshLog, 'utf8')
+    assert.match(log, /http:\/\/127\.0\.0\.1:80\/healthz/)
+    assert.doesNotMatch(log, /:18081\/healthz/)
+
+    await writeFile(fixture.sshLog, '')
+    const stagingVerify = run(caddyApply, ['--verify'], {
+      ...fixture.env,
+      CADDY_HTTP_PORT: '18081',
+      FAKE_DS_ROW: canaryRow,
+    })
+    assert.equal(stagingVerify.status, 0, stagingVerify.stderr || stagingVerify.stdout)
+    log = await readFile(fixture.sshLog, 'utf8')
+    assert.equal((log.match(/http:\/\/127\.0\.0\.1:18081\/healthz/g) ?? []).length, 2)
+
+    await writeFile(fixture.sshLog, '')
+    const apply = run(caddyApply, ['--apply'], {
+      ...fixture.env,
+      CADDY_HTTP_PORT: '18081',
+      FAKE_DS_ROW: '42|stable|A||/rel/a||A|A|0|salt|0||7|',
+    })
+    assert.equal(apply.status, 0, apply.stderr || apply.stdout)
+    log = await readFile(fixture.sshLog, 'utf8')
+    assert.match(log, /for i in .*http:\/\/127\.0\.0\.1:18081\/healthz/)
+  })
+
+  test('planned-maintenance public probe receives the same staging Caddy port', async () => {
+    const fixture = await caddyRemoteFixture()
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'begin_planned_maintenance deploy 0',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...fixture.env,
+        ALLOW_ANY_BRANCH: '1',
+        CADDY_HTTP_PORT: '18081',
+      },
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const args = await readFile(fixture.sshLog, 'utf8')
+    const remoteBody = await readFile(fixture.sshStdinLog, 'utf8')
+    assert.match(args, /\/var\/lib\/openclaude-v5\/cutovers 18081\n$/)
+    assert.match(remoteBody, /http:\/\/127\.0\.0\.1:\$\{caddy_http_port\}\/healthz/)
   })
 })
 

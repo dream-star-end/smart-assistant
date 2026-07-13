@@ -61,6 +61,9 @@ V5_UNIT="openclaude-v5.service"
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
 V5_EGRESS_UNIT="openclaude-v5-egress.service"
 V5_PORT="18790"
+# Caddy 对外 HTTP 监听端口。生产固定默认 80；仅隔离预发在宿主 80 被占用时覆盖。
+# 在线 deploy 的 planned-maintenance public probe 与 P3 Caddy apply/verify 必须共用此值。
+CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 # ── P3 双 master slot 静态映射(RFC-v5-dual-master-cohort §3)──
 # A={openclaude-v5.service, 18790, 私有 18896, HOME /root/.openclaude-v5, 源码 /opt/openclaude/openclaude-v5}
 # B={openclaude-v5-b.service, 18795, 私有 18897, HOME /root/.openclaude-v5-b, 源码 /opt/openclaude/openclaude-v5-b}
@@ -210,6 +213,8 @@ done
 [[ "$MODE" == "rollback" && ! "$ROLLBACK_N" =~ ^[1-5]$ ]] && { echo "✗ --rollback=N 需 N∈1..5" >&2; exit 2; }
 [[ "$MODE" == "promote" && ! "$PROMOTE_PCT" =~ ^([0-9]|[1-9][0-9]|100)$ ]] && { echo "✗ --promote=<pct> 需 pct∈0..100" >&2; exit 2; }
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
+[[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
+  || { echo "✗ CADDY_HTTP_PORT 必须是 1..65535 的规范十进制端口" >&2; exit 2; }
 # R2-B1/R2-M1 旗标一致性
 [[ "$ENABLE_RELEASE_FLAG" == 1 && "$DISABLE_RELEASE_FLAG" == 1 ]] && { echo "✗ --enable-runtime-release 与 --disable-runtime-release 互斥" >&2; exit 2; }
 [[ "$ENABLE_BUNDLE_FLAG" == 1 && "$DISABLE_BUNDLE_FLAG" == 1 ]] && { echo "✗ --enable-platform-bundle 与 --disable-platform-bundle 互斥" >&2; exit 2; }
@@ -298,12 +303,13 @@ begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
 
   if ! result="$(ssh "$KL_HOST" bash -s -- \
       "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$maintenance_mode" \
-      "$target_commit" "$nonce" "$include_egress" "${ACTIVE_UNIT:-$V5_UNIT}" "${ACTIVE_PORT:-$V5_PORT}" "$CUTOVER_ROOT" <<'REMOTE'
+      "$target_commit" "$nonce" "$include_egress" "${ACTIVE_UNIT:-$V5_UNIT}" "${ACTIVE_PORT:-$V5_PORT}" "$CUTOVER_ROOT" "$CADDY_HTTP_PORT" <<'REMOTE'
 set -Eeuo pipefail
 marker="$1"; lock="$2"; mode="$3"; target_commit="$4"; nonce="$5"; include_egress="$6"
-v5_unit="$7"; v5_port="$8"; cutover_root="$9"; ttl=180
+v5_unit="$7"; v5_port="$8"; cutover_root="$9"; caddy_http_port="${10}"; ttl=180
 [[ "$mode" =~ ^(deploy|dist|rollback)$ && "$target_commit" =~ ^[0-9a-f]{40}$ &&
    "$nonce" =~ ^[0-9a-f]{32}$ && "$include_egress" =~ ^[01]$ ]] || exit 2
+[[ "$caddy_http_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( caddy_http_port <= 65535 )) || exit 2
 mkdir -p -m 700 "$(dirname "$marker")"
 touch "$lock"; chmod 600 "$lock"
 exec 9>"$lock"; flock -x 9
@@ -313,7 +319,7 @@ body=""
 systemctl is-active --quiet "$v5_unit" 2>/dev/null && healthy+=(svc_v5)
 body="$(curl -fsS --max-time 5 "http://127.0.0.1:${v5_port}/healthz" 2>/dev/null || true)"
 jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_v5)
-body="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' 'http://127.0.0.1/healthz' 2>/dev/null || true)"
+body="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' "http://127.0.0.1:${caddy_http_port}/healthz" 2>/dev/null || true)"
 jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(public_route)
 if [[ "$include_egress" == 1 ]]; then
   systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
@@ -2896,11 +2902,12 @@ caddy_render_reload() {
     # dry:透传当前 lane 的 DS_* 占位,让 caddy 预览反映 phase/candidate(绝不碰 PG)
     DS_DRY_GEN="$DS_generation" DS_DRY_PHASE="$DS_phase" DS_DRY_STEP="$DS_transition_step" \
     DS_DRY_ACTIVE="$DS_active_slot" DS_DRY_CAND="$DS_candidate_slot" \
-    KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" \
+    KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
       bash "$SCRIPT_DIR/v5-caddy-apply.sh" --apply --dry-run
     return 0
   fi
-  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" bash "$SCRIPT_DIR/v5-caddy-apply.sh" --apply
+  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
+    bash "$SCRIPT_DIR/v5-caddy-apply.sh" --apply
 }
 
 # 初始化 candidate slot 实例形态(RFC D2):HOME + openclaude.json(端口)+ unit + 源码 symlink→release。
@@ -3104,7 +3111,8 @@ canary() {
   caddy_render_reload
   # 内部账号验证:带当前代次 lane cookie 探 candidate(BLOCKER 5②:硬门,去 || true)
   echo "── 内部账号验证(lane cookie 命中 candidate)──"
-  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || {
+  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
+    bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || {
     echo "✗ canary READY 验证失败(默认未命中 active / lane cookie 未命中健康 candidate)。candidate 已 READY 但不可服务。" >&2
     echo "  用 deploy-v5.sh --abort 撤下 candidate,或核查 candidate 健康后重跑 --canary。" >&2
     exit 1
@@ -3264,7 +3272,7 @@ finalize_run_steps() {
     export DS_RENDER_STEP_OVERRIDE=2
     caddy_render_reload
     local step2_ok=1
-    KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" \
+    KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
       bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || step2_ok=0
     unset DS_RENDER_STEP_OVERRIDE
     if [[ "$step2_ok" != 1 ]]; then
