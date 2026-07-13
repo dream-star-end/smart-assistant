@@ -97,8 +97,14 @@ export function isTextOnlyStaticVisionModel(model?: string): boolean {
  *   - 非静态 provider(codex/claude/gpt 原生多模态,或自定义 Anthropic 兼容层):
  *     默认 false;仅 `OPENCLAUDE_VISION_MCP_PROVIDERS` 显式 opt-in 的 provider 走工具兜底。
  */
-export function shouldEnableOpenClaudeVision(provider?: string, model?: string): boolean {
+export function shouldEnableOpenClaudeVision(
+  provider?: string,
+  model?: string,
+  supportsVisionOverride?: boolean,
+): boolean {
   if (process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1') return false
+  // 已验签/已 fence 的 catalog capability 优先于 baked 路由表和 provider opt-in。
+  if (supportsVisionOverride !== undefined) return !supportsVisionOverride
   // 已注册静态模型:protocol supportsVision 是唯一权威(纯文本 → 注入)。
   if (isTextOnlyStaticVisionModel(model)) return true
   // 非静态 provider 的显式 opt-in(自定义 Anthropic 兼容纯文本上游)。

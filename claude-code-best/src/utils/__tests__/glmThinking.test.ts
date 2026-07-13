@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 
 // glm-5.1(火山 Ark)与 MiniMax-M3 都是 thinking 模型:modelSupportsThinking 应为 true
 // (其余 betas/effort/adaptive-thinking 仍关 —— 它们仍在 isCapabilityZeroStaticModel 集合)。
@@ -27,8 +27,20 @@ mock.module("src/utils/model/model.js", () => ({
 const { modelSupportsThinking, modelSupportsAdaptiveThinking } = await import(
   "src/utils/thinking.js"
 );
+afterEach(() => { delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR; });
 
 describe("glm-5.1 (Ark) thinking capability", () => {
+  test("catalog 新 id 的 thinking 只认 descriptor", () => {
+    process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify({
+      canonicalModel: "new-ccb-model",
+      contextWindow: null,
+      capabilityZero: false,
+      supportsThinking: false,
+      supportsVision: false,
+      supportedEfforts: [],
+    });
+    expect(modelSupportsThinking("new-ccb-model")).toBe(false);
+  });
   test("modelSupportsThinking glm-5.1 = true(大小写不敏感)", () => {
     expect(modelSupportsThinking("glm-5.1")).toBe(true);
     expect(modelSupportsThinking("GLM-5.1")).toBe(true);

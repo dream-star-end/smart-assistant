@@ -54,10 +54,24 @@ function readSeedDoc() {
   return pb.validatePlatformSeed(parseYaml(readFileSync(PLATFORM_SEED_YAML, "utf8")));
 }
 
-describe("platform-seed.yaml schema + validatePlatformSeed", () => {
-  test("actual platform-seed.yaml validates and declares main/codex/hidden-reviewer + scientist skills", () => {
+/** 最小合法 v2 agent 声明(执行三元组必填)+ 覆写。 */
+const A = (extra: Record<string, unknown> = {}) => ({
+  id: "a",
+  model: "glm-5.2",
+  provider: "ark",
+  ...extra,
+});
+/** 最小合法 v2 文档。 */
+const DOC = (agents: unknown[], extra: Record<string, unknown> = {}) => ({
+  schemaVersion: 2,
+  agents,
+  ...extra,
+});
+
+describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
+  test("actual platform-seed.yaml validates (schema v2) and declares main/codex/hidden-reviewer + scientist skills", () => {
     const doc = readSeedDoc();
-    assert.equal(doc.schemaVersion, 1);
+    assert.equal(doc.schemaVersion, 2);
     const ids = doc.agents.map((a: { id: string }) => a.id).sort();
     assert.deepEqual(ids, ["codex", "hidden-reviewer", "main"]);
     assert.deepEqual([...(doc.seedSkills.scientist as string[])].sort(), [
@@ -66,42 +80,103 @@ describe("platform-seed.yaml schema + validatePlatformSeed", () => {
     ]);
   });
 
-  test("agent declarations carry only non-billing fields (persona ref / permissionMode / display / toolsets)", () => {
+  test("agent declarations carry the execution triple (model/provider/runnerKind) + non-billing fields", () => {
     const doc = readSeedDoc();
     const byId = (id: string) => doc.agents.find((a: { id: string }) => a.id === id);
     const main = byId("main");
+    // 执行三元组(声明 = 容器侧唯一权威;值的一致性锚在 runtimeEntrypointPolicy.test.ts)。
+    assert.equal(main.model, "glm-5.2");
+    assert.equal(main.provider, "ark");
+    assert.equal(main.runnerKind, undefined, "main 走默认 runner");
     assert.equal(main.persona, "personas/main.md");
     assert.equal(main.permissionMode, "bypassPermissions");
     assert.equal(main.displayName, "全能助手");
     assert.equal(main.toolsets, undefined, "main declares no toolsets (matches legacy inline shape)");
     const hr = byId("hidden-reviewer");
+    assert.equal(hr.model, "glm-5.2");
+    assert.equal(hr.provider, "ark");
     assert.equal(hr.persona, "personas/hidden-reviewer.md");
-    assert.equal(hr.forcePersona, true);
+    assert.equal(hr.forcePersona, true, "裁决词汇必须每 boot 强制刷新");
     assert.equal(hr.permissionMode, "bypassPermissions");
     assert.deepEqual(hr.toolsets, ["core"]);
     const codex = byId("codex");
+    assert.equal(codex.provider, "codex-native", "codex 引擎 pin");
+    assert.equal(codex.runnerKind, "app-server", "gateway runner 路由依据必须落声明");
     assert.equal(codex.persona, undefined, "codex has no persona (dynamic display, no persona)");
     assert.equal(codex.avatarEmoji, "🤖");
+    assert.equal(codex.displayName, undefined, "codex 显示名由 entrypoint 按声明的 model 反查 protocol 型号表");
   });
 
-  test("validatePlatformSeed FAILS LOUD on any billing/engine key (model/engine/provider/runnerKind)", () => {
-    for (const banned of ["model", "engine", "provider", "runnerKind"]) {
+  test("validatePlatformSeed 仍硬拒 engine 键(engine 由 model 推导,禁第二权威源)", () => {
+    assert.equal(pb.REJECTED_SEED_AGENT_KEYS.length, 1);
+    assert.equal(pb.REJECTED_SEED_AGENT_KEYS[0], "engine");
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([A({ engine: "codex" })])),
+      /forbidden key "engine"/,
+      "engine 声明化 = 与 model 推导出的 engine 两个权威源,漂移无法裁决",
+    );
+  });
+
+  test("schema v2 值校验矩阵:缺 model 拒 / 未知 provider 拒 / 非法 runnerKind 拒", () => {
+    // 缺 model(或空串)
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([{ id: "a", provider: "ark" }])),
+      /must declare a non-empty string model/,
+    );
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([{ id: "a", model: "  ", provider: "ark" }])),
+      /must declare a non-empty string model/,
+    );
+    // 缺 provider / provider 不在已知集
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([{ id: "a", model: "glm-5.2" }])),
+      /provider .* not in known set/,
+    );
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([A({ provider: "openai" })])),
+      /provider "openai" not in known set/,
+    );
+    // runnerKind 只允许 app-server
+    assert.throws(
+      () => pb.validatePlatformSeed(DOC([A({ runnerKind: "subprocess" })])),
+      /runnerKind "subprocess" not supported/,
+    );
+    // 合法:三元组齐全
+    const ok = pb.validatePlatformSeed(
+      DOC([{ id: "codex", model: "gpt-5.6-sol", provider: "codex-native", runnerKind: "app-server" }]),
+    );
+    assert.deepEqual(
+      { ...ok.agents[0] },
+      { id: "codex", model: "gpt-5.6-sol", provider: "codex-native", runnerKind: "app-server" },
+    );
+  });
+
+  test("未知 schemaVersion fail-loud(含旧 v1 —— v1 文档没有执行三元组,静默接受会 seed 出无模型 agent)", () => {
+    assert.equal(pb.PLATFORM_SEED_SCHEMA_VERSION, 2);
+    for (const bad of [1, 3, "2", undefined]) {
       assert.throws(
-        () => pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "x", [banned]: "sneaky" }] }),
-        new RegExp(`forbidden key "${banned}"`),
-        `声明含 ${banned} 必须抛(防绕道声明化计费字段 → 滚动窗口计费分叉)`,
+        () => pb.validatePlatformSeed({ schemaVersion: bad, agents: [] }),
+        /unsupported schemaVersion/,
+        `schemaVersion=${String(bad)} 必须拒`,
       );
     }
   });
 
-  test("validatePlatformSeed rejects wrong schemaVersion / non-object root / bad agent shape", () => {
-    assert.throws(() => pb.validatePlatformSeed({ schemaVersion: 2, agents: [] }), /unsupported schemaVersion/);
+  test("validatePlatformSeed rejects non-object root / bad agent shape", () => {
     assert.throws(() => pb.validatePlatformSeed(null), /root must be a mapping/);
-    assert.throws(() => pb.validatePlatformSeed({ schemaVersion: 1, agents: [{}] }), /non-empty string id/);
+    assert.throws(() => pb.validatePlatformSeed(DOC([{}])), /non-empty string id/);
     assert.throws(
-      () => pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "a", toolsets: "core" }] }),
+      () => pb.validatePlatformSeed(DOC([A({ toolsets: "core" })])),
       /toolsets must be a string array/,
     );
+  });
+
+  test("DEV_FALLBACK_SEED_DOC 自身是一份合法 v2 声明(dev 路径与生产走同一装配)", () => {
+    const doc = pb.validatePlatformSeed(JSON.parse(JSON.stringify(pb.DEV_FALLBACK_SEED_DOC)));
+    assert.equal(doc.schemaVersion, 2);
+    assert.deepEqual(doc.agents.map((a: { id: string }) => a.id), ["main"]);
+    assert.equal(doc.agents[0].model, "glm-5.2");
+    assert.equal(doc.agents[0].provider, "ark");
   });
 });
 
@@ -154,33 +229,33 @@ describe("validatePlatformSeed confinement 强化(M5:slug / persona-ref / 未知
   const V = (doc: unknown) => () => pb.validatePlatformSeed(doc);
   test("agent id 必须严格 slug(拒大写/点/斜杠/空白/过长)", () => {
     for (const bad of ["BadCase", "a.b", "a/b", "a b", "-lead", "a".repeat(65)]) {
-      assert.throws(V({ schemaVersion: 1, agents: [{ id: bad }] }), /must match slug/, `id "${bad}" 必须拒`);
+      assert.throws(V(DOC([A({ id: bad })])), /must match slug/, `id "${bad}" 必须拒`);
     }
     // 合法 slug 通过
-    assert.equal(pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "a-1b" }] }).agents[0].id, "a-1b");
+    assert.equal(pb.validatePlatformSeed(DOC([A({ id: "a-1b" })])).agents[0].id, "a-1b");
   });
   test("persona 引用只允许 personas/<slug>.md(拒 ../ / 绝对路径 / 子目录)", () => {
     for (const bad of ["../x.md", "/etc/x.md", "personas/sub/x.md", "personas/x.txt", "x.md", "personas/BAD.md"]) {
-      assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", persona: bad }] }), /must be personas\/<slug>\.md/, `persona "${bad}" 必须拒`);
+      assert.throws(V(DOC([A({ persona: bad })])), /must be personas\/<slug>\.md/, `persona "${bad}" 必须拒`);
     }
     assert.equal(
-      pb.validatePlatformSeed({ schemaVersion: 1, agents: [{ id: "a", persona: "personas/main.md" }] }).agents[0].persona,
+      pb.validatePlatformSeed(DOC([A({ persona: "personas/main.md" })])).agents[0].persona,
       "personas/main.md",
     );
   });
   test("未知顶层字段 / 未知 agent 字段 fail-loud", () => {
-    assert.throws(V({ schemaVersion: 1, agents: [], extra: 1 }), /unknown top-level field "extra"/);
-    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", bogus: 1 }] }), /unknown field "bogus"/);
+    assert.throws(V(DOC([], { extra: 1 })), /unknown top-level field "extra"/);
+    assert.throws(V(DOC([A({ bogus: 1 })])), /unknown field "bogus"/);
   });
   test("重复 agent id 拒", () => {
-    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }, { id: "a" }] }), /duplicate agent id "a"/);
+    assert.throws(V(DOC([A(), A()])), /duplicate agent id "a"/);
   });
-  test("banned 计费键仍走专属报错(先于 slug/unknown 检查)", () => {
-    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a", provider: "x" }] }), /forbidden key "provider"/);
+  test("banned engine 键走专属报错(先于 slug/unknown 检查)", () => {
+    assert.throws(V(DOC([A({ id: "BAD", engine: "ccb" })])), /forbidden key "engine"/);
   });
   test("seedSkills key/skill 名必须 slug", () => {
-    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }], seedSkills: { BadAgent: ["x"] } }), /seedSkills agent id "BadAgent" must match slug/);
-    assert.throws(V({ schemaVersion: 1, agents: [{ id: "a" }], seedSkills: { sci: ["Bad_Name"] } }), /skill name "Bad_Name" must match slug/);
+    assert.throws(V(DOC([A()], { seedSkills: { BadAgent: ["x"] } })), /seedSkills agent id "BadAgent" must match slug/);
+    assert.throws(V(DOC([A()], { seedSkills: { sci: ["Bad_Name"] } })), /skill name "Bad_Name" must match slug/);
   });
 });
 
@@ -218,33 +293,71 @@ describe("decidePersonaWrite (M4b:persona 三态升级矩阵)", () => {
   });
 });
 
-describe("buildSeedAgent (yaml 非计费声明 + billing 计费权威合并)", () => {
-  test("merges decl non-billing fields, injects billing, copies toolsets by value, sets id/persona", () => {
+describe("buildSeedAgent (schema v2:执行三元组恒取自声明,dynamic 只许展示字段)", () => {
+  test("装配 = 声明的执行三元组 + 非计费字段 + persona 卷路径(toolsets 按值拷贝)", () => {
     const out = pb.buildSeedAgent({
       id: "main",
-      decl: { id: "main", permissionMode: "bypassPermissions", displayName: "全能助手", avatarEmoji: "🧠", toolsets: ["core"] },
-      billing: { model: "glm-5.2", provider: "ark" },
+      decl: {
+        id: "main",
+        model: "glm-5.2",
+        provider: "ark",
+        permissionMode: "bypassPermissions",
+        displayName: "全能助手",
+        avatarEmoji: "🧠",
+        toolsets: ["core"],
+      },
       personaPath: "/vol/agents/main/CLAUDE.md",
     });
     assert.equal(out.id, "main");
     assert.equal(out.persona, "/vol/agents/main/CLAUDE.md");
     assert.equal(out.permissionMode, "bypassPermissions");
     assert.equal(out.displayName, "全能助手");
-    assert.equal(out.model, "glm-5.2");
+    assert.equal(out.model, "glm-5.2", "model 来自声明(entrypoint 已无本地常量)");
     assert.equal(out.provider, "ark");
+    assert.equal(out.runnerKind, undefined, "声明没 runnerKind → 产物不带该字段");
     assert.deepEqual(out.toolsets, ["core"]);
   });
-  test("billing wins over declaration (dynamic displayName) and undefined decl → id-only base", () => {
+
+  test("codex:runnerKind 落产物;dynamic displayName(protocol 型号表)覆盖声明的 displayName", () => {
     const out = pb.buildSeedAgent({
       id: "codex",
-      decl: { id: "codex", displayName: "SHOULD_LOSE", avatarEmoji: "🤖" },
-      billing: { model: "gpt", provider: "codex-native", runnerKind: "app-server", displayName: "GPT 队长" },
+      decl: {
+        id: "codex",
+        model: "gpt-5.6-sol",
+        provider: "codex-native",
+        runnerKind: "app-server",
+        displayName: "SHOULD_LOSE",
+        avatarEmoji: "🤖",
+      },
+      dynamic: { displayName: "GPT-5.6-Sol 队长" },
     });
-    assert.equal(out.displayName, "GPT 队长", "billing displayName overrides declaration");
+    assert.equal(out.model, "gpt-5.6-sol");
+    assert.equal(out.provider, "codex-native");
     assert.equal(out.runnerKind, "app-server");
+    assert.equal(out.displayName, "GPT-5.6-Sol 队长", "dynamic 展示字段覆盖声明");
     assert.equal(out.persona, undefined, "no personaPath → no persona field");
-    const bare = pb.buildSeedAgent({ id: "x", billing: { model: "m" } });
-    assert.deepEqual(bare, { id: "x", model: "m" });
+  });
+
+  test("回潮防线:dynamic 面禁止携带任何执行键(model/provider/runnerKind/engine)", () => {
+    for (const forbidden of ["model", "provider", "runnerKind", "engine"]) {
+      assert.throws(
+        () =>
+          pb.buildSeedAgent({
+            id: "main",
+            decl: { id: "main", model: "glm-5.2", provider: "ark" },
+            dynamic: { [forbidden]: "sneaky" },
+          }),
+        new RegExp(`must not carry execution key "${forbidden}"`),
+        `dynamic.${forbidden} 必须抛(否则又造出第二个执行权威源)`,
+      );
+    }
+  });
+
+  test("decl.id 与 args.id 不符 → 抛(装配错位保护)", () => {
+    assert.throws(
+      () => pb.buildSeedAgent({ id: "main", decl: { id: "codex", model: "m", provider: "ark" } }),
+      /decl id "codex" != requested id "main"/,
+    );
   });
 });
 
@@ -361,8 +474,8 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.match(src, /mkdirSync\(defaultWorkspace, \{ recursive: true \}\)/);
     // codex overlay + 平台 seed skill 共用 shouldWriteSeededSkill("hash-overwrite");原生 populate 仍 skip-if-exists。
     assert.match(src, /shouldWriteSeededSkill\("hash-overwrite"/);
-    // dev fallback:platformSeed 缺失回落最小内置集(仅 main)+ dev-only 日志。
-    assert.match(src, /if \(!platformSeed\) \{/);
+    // dev fallback:platformSeed 缺失回落 DEV_FALLBACK_SEED_DOC(仍是一份**声明**,与生产同一条装配路径)。
+    assert.match(src, /const seedDoc: PlatformSeedDoc = platformSeed \?\? DEV_FALLBACK_SEED_DOC/);
     assert.match(src, /minimal main-only/);
   });
 
@@ -396,8 +509,11 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
 describe("R2-M2 validateSeedAssetsExist(persona/seed skill 引用存在性 + containment,纯函数)", () => {
   const j = (...p: string[]) => p.join("/");
   const doc = {
-    schemaVersion: 1,
-    agents: [{ id: "main", persona: "personas/main.md" }, { id: "codex" }],
+    schemaVersion: 2,
+    agents: [
+      { id: "main", model: "glm-5.2", provider: "ark", persona: "personas/main.md" },
+      { id: "codex", model: "gpt-5.6-sol", provider: "codex-native", runnerKind: "app-server" },
+    ],
     seedSkills: { scientist: ["demo"] },
   };
   const presentSet = (paths: string[]) => (p: string) => new Set(paths).has(p);
@@ -539,7 +655,8 @@ describe("R2-M2b validatePlatformSeedCli.ts(deploy prepare 离线语义校验 CL
     mkdirSync(join(root, "seed", "skills", "scientist", "demo"), { recursive: true });
     writeFileSync(
       join(root, "seed", "platform-seed.yaml"),
-      "schemaVersion: 1\nagents:\n  - id: main\n    persona: personas/main.md\nseedSkills:\n  scientist:\n    - demo\n",
+      "schemaVersion: 2\nagents:\n  - id: main\n    model: glm-5.2\n    provider: ark\n    persona: personas/main.md\n" +
+        "seedSkills:\n  scientist:\n    - demo\n",
     );
     writeFileSync(join(root, "seed", "personas", "main.md"), "# main\n");
     if (opts.withSkill) writeFileSync(join(root, "seed", "skills", "scientist", "demo", "SKILL.md"), "# demo\n");
@@ -553,7 +670,7 @@ describe("R2-M2b validatePlatformSeedCli.ts(deploy prepare 离线语义校验 CL
       return { status: err.status ?? -1, stderr: String(err.stderr ?? "") };
     }
   }
-  test("引用齐全 → exit 0", () => {
+  test("引用齐全 → exit 0(stderr 留证执行三元组)", () => {
     const dir = mkdtempSync(join(tmpdir(), "oc-cli-ok-"));
     try {
       buildBundle(dir, { withSkill: true });
@@ -573,16 +690,44 @@ describe("R2-M2b validatePlatformSeedCli.ts(deploy prepare 离线语义校验 CL
       rmSync(dir, { recursive: true, force: true });
     }
   });
-  test("声明含 banned 计费键(model)→ schema 校验 exit 1", () => {
+  test("声明含 banned engine 键 → schema 校验 exit 1", () => {
     const dir = mkdtempSync(join(tmpdir(), "oc-cli-schema-"));
     try {
       mkdirSync(join(dir, "seed"), { recursive: true });
-      writeFileSync(join(dir, "seed", "platform-seed.yaml"), "schemaVersion: 1\nagents:\n  - id: main\n    model: sneaky\n");
+      writeFileSync(
+        join(dir, "seed", "platform-seed.yaml"),
+        "schemaVersion: 2\nagents:\n  - id: main\n    model: glm-5.2\n    provider: ark\n    engine: ccb\n",
+      );
       const r = runCli(dir);
       assert.equal(r.status, 1);
-      assert.match(r.stderr, /forbidden key "model"/);
+      assert.match(r.stderr, /forbidden key "engine"/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("schema v2 值校验也在 CLI 生效:缺 model / 未知 provider / 旧 v1 文档 → exit 1", () => {
+    const cases: [string, string, RegExp][] = [
+      ["oc-cli-nomodel-", "schemaVersion: 2\nagents:\n  - id: main\n    provider: ark\n", /non-empty string model/],
+      [
+        "oc-cli-badprov-",
+        "schemaVersion: 2\nagents:\n  - id: main\n    model: glm-5.2\n    provider: openai\n",
+        /not in known set/,
+      ],
+      // 旧 v1 文档(无执行三元组)必须被 deploy 期 fail-closed 拦下,而不是静默 seed 出无模型 agent。
+      ["oc-cli-v1-", "schemaVersion: 1\nagents:\n  - id: main\n", /unsupported schemaVersion/],
+    ];
+    for (const [prefix, yaml, want] of cases) {
+      const dir = mkdtempSync(join(tmpdir(), prefix));
+      try {
+        mkdirSync(join(dir, "seed"), { recursive: true });
+        writeFileSync(join(dir, "seed", "platform-seed.yaml"), yaml);
+        const r = runCli(dir);
+        assert.equal(r.status, 1, `${prefix} 必须 exit 1`);
+        assert.match(r.stderr, want);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 });

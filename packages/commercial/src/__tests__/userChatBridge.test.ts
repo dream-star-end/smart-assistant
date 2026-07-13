@@ -32,6 +32,7 @@ import {
   _rawDataLen,
   _sanitizeMasterHistoricalMessagesForFrame,
   type ResolveContainerEndpoint,
+  type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import {
@@ -60,10 +61,7 @@ async function startRig(opts: {
   maxPerUser?: number;
   maxFrameBytes?: number;
   markContainerActivity?: (containerId: number) => void;
-  loadAllowedModelChecker?: (
-    uid: bigint,
-    role: "user" | "admin",
-  ) => Promise<(modelId: string) => boolean>;
+  loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
   logger?: Logger;
   getFrontendBuildId?: () => string | null;

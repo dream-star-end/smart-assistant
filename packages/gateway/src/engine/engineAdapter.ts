@@ -20,6 +20,7 @@
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
+import type { TurnModelAuthority } from '../subprocessRunner.js'
 import type {
   EngineEvent,
   PartialSnapshot,
@@ -57,6 +58,16 @@ export interface TurnParams {
   input: string | Array<{ type: string; [k: string]: unknown }>
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
+  /**
+   * 模型权威批次 §4 —— 本 turn 的**上游请求凭据**(master 签名的 authority + turn lease)。
+   *
+   * 有值 = bridge turn(inbound 帧带 `__oc_model_authority`,gateway 验签后原样带下来);
+   * 无值 = 本地路径 turn(cron/synthetic/delegate)→ CCB 侧自取 `x-oc-local-catalog` token。
+   *
+   * 只有 CCB 路径消费(经 ANTHROPIC_CUSTOM_HEADERS 挂到每个 `/v1/messages`);codex 路径的
+   * 请求绑定走 bridge journal / codex-relay,不读本字段(engine 中立 = 允许底座忽略)。
+   */
+  modelAuthority?: TurnModelAuthority
   traceId?: string
   /** V3 v7 — canonical assistant/thinking row id(见 sessionManager.runOneTurnWithRetry)。 */
   assistantMessageId?: string

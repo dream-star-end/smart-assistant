@@ -19,7 +19,13 @@ import type { SessionManager } from './sessionManager.js'
 // 合成首帧执行模型解析:openai-compat 首帧绕过 master bridge 计费编排,落 codex 会被
 // CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。server.ts 已 import 本文件,live
 // binding 在运行期调用安全(同 cron.ts 沿用的既有循环容忍模式)。
-import { resolveSyntheticTurnModel } from './server.js'
+import {
+  localExecutionOverride,
+  resolveLocalExecutionIfEnforced,
+  resolveSyntheticTurnModel,
+  type LocalExecutionDecision,
+} from './server.js'
+import { localExecutionRejectCode } from './modelCatalogClient.js'
 
 export interface OpenAICompatDeps {
   config: OpenClaudeConfig
@@ -134,11 +140,29 @@ async function handleChatCompletions(
 
   const sessionKey = `agent:${agentId}:openai:dm:${Date.now()}`
   const _oaiRoute = resolveSyntheticTurnModel(agent, deps.config.defaults?.model)
-  const _oaiModel = _oaiRoute?.model
+  // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影
+  // (归一/可用性/engine 全取投影;codex 意图仍按真值表降级)。拒 → 结构化 4xx/503,不 spawn。
+  // flag 未开 → undefined → 沿用 baked 合成降级,零变化。
+  let _oaiExec: LocalExecutionDecision | undefined
+  try {
+    _oaiExec = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'synthetic',
+      model: _oaiRoute?.model,
+      defaultModel: deps.config.defaults?.model,
+    })
+  } catch (err) {
+    const code = localExecutionRejectCode(err)
+    if (!code) throw err
+    const status = code === 'MODEL_CATALOG_UNAVAILABLE' ? 503 : 403
+    return deps.sendError(res, status, code)
+  }
+  const _oaiModel = _oaiExec?.canonicalModel ?? _oaiRoute?.model
   const session = await deps.sessions.getOrCreate({
     sessionKey,
     agent,
     ...(_oaiModel ? { model: _oaiModel } : {}),
+    ...localExecutionOverride(_oaiExec),
     channel: 'openai-compat',
     peerId: 'openai-client',
     title: lastUser.content.slice(0, 40),

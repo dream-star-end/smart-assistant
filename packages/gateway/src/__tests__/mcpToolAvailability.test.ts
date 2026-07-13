@@ -12,6 +12,15 @@ const baseConfig: any = {
 }
 
 describe('collectAvailableMcpToolNames', () => {
+  it('catalog vision override 驱动动态模型的 upload/tool hint', () => {
+    const tools = collectAvailableMcpToolNames(
+      baseConfig,
+      { id: 'main', provider: 'unknown' } as any,
+      'dynamic-model',
+      { modelSupportsVision: false, resolveVisionEntry: () => '/vision' },
+    )
+    assert.ok(tools.includes('understand_image'))
+  })
   it('includes built-in openclaude-vision understand_image by default', () => {
     const tools = collectAvailableMcpToolNames(baseConfig, { id: 'main' } as any)
     assert.ok(tools.includes('understand_image'))

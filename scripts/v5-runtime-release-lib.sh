@@ -32,6 +32,18 @@
 OC_HOTCFG_TUPLE_KEYS=(OC_RUNTIME_IMAGE OC_RUNTIME_IMAGE_ID OC_RUNTIME_RELEASE OC_PLATFORM_BUNDLE)
 OC_HOTCFG_EMERGENCY_KEY="OC_RUNTIME_EMERGENCY_TUPLE"
 
+# ── 模型权威兼容地板(方案 §7 步 5,R3-B4 + R4-M2)────────────────────────────
+# 容器面 capability token(= protocol MODEL_AUTHORITY_CAPABILITY = hello attestation 字符串)。
+# 容器代码的来源有两处,故 capability 的自证也有两处(取哪处取决于 tuple 的 release 是否为空):
+#   - release 轴启用 → 容器跑 release 树的源码 → 声明在 release 的 MANIFEST.capabilities;
+#   - release 为空(内嵌源码镜像 / emergency 逃生)→ 容器跑镜像 baked 源码 → 声明在
+#     镜像 label `oc.runtime.features`(build-image.sh 写,token 空格分隔)。
+# cutover marker(env 键)置位后,任何 tuple 激活/回滚都必须证明容器面带该 capability,
+# 否则 = 容器退回 baked 判定,而 DB catalog 里已经有 baked 不认识的行 → 判定源分叉。
+OC_HOTCFG_MODEL_AUTHORITY_CAP="model_authority_v1"
+OC_HOTCFG_MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
+OC_HOTCFG_IMAGE_FEATURES_LABEL="oc.runtime.features"
+
 # bundle 顶层目录白名单(§1.2:与 TS 侧 platformBundle.ts 校验语义一致的 bash 版)。
 OC_HOTCFG_BUNDLE_TOPDIRS="bin entrypoint etc-codex codex-skills seed prompts"
 # 允许扩展名(§1.3)。
@@ -123,10 +135,15 @@ oc_hotcfg__digest_from_rows() {
 }
 
 # 在 <root> 写 MANIFEST.json 并 echo digest。
-# 用法:oc_hotcfg_build_manifest <root> <schemaVersion> <sourceCommit> [bunVersion] [depsCacheKey]
+# 用法:oc_hotcfg_build_manifest <root> <schemaVersion> <sourceCommit> [bunVersion] [depsCacheKey] [ccbDistKey] [capabilities]
+# capabilities:空格分隔 token(如 "model_authority_v1")→ MANIFEST.capabilities 数组。
+#   **不进 digest**(digest 只认文件内容行)—— capability 是"这棵树实现了什么协议"的**声明**,
+#   由制品的权威源(deploy/v5/release-metadata.json.runtimeCapabilities,与源码同 commit)提供;
+#   digest 相同的树声明必然相同,故同 rev 复用时若发现声明漂移(旧制品建于本特性之前)可就地补写。
 oc_hotcfg_build_manifest() {
-  local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}" ccbkey="${6:-}"
-  local rows digest boothash builtAt files_tmp
+  local root="$1" schema="$2" commit="$3" bun="${4:-}" cache="${5:-}" ccbkey="${6:-}" caps="${7:-}"
+  local rows digest boothash builtAt files_tmp caps_json
+  caps_json="$(printf '%s' "$caps" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')" || return 1
   rows="$(oc_hotcfg__file_rows "$root")" || return 1
   digest="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows all)" || return 1
   boothash="$(printf '%s\n' "$rows" | oc_hotcfg__digest_from_rows boot)" || return 1
@@ -140,9 +157,10 @@ oc_hotcfg_build_manifest() {
     --arg digest "$digest" --arg bootHash "$boothash" \
     --arg sourceCommit "$commit" --arg builtAt "$builtAt" \
     --arg bunVersion "$bun" --arg depsCacheKey "$cache" --arg ccbDistKey "$ccbkey" \
+    --argjson capabilities "$caps_json" \
     --slurpfile files "$files_tmp" '
     {schemaVersion: $schemaVersion, digest: $digest, bootHash: $bootHash,
-     sourceCommit: $sourceCommit, builtAt: $builtAt, files: $files[0]}
+     sourceCommit: $sourceCommit, builtAt: $builtAt, capabilities: $capabilities, files: $files[0]}
     + (if $bunVersion == "" then {} else {bunVersion: $bunVersion} end)
     + (if $depsCacheKey == "" then {} else {depsCacheKey: $depsCacheKey} end)
     + (if $ccbDistKey == "" then {} else {ccbDistKey: $ccbDistKey} end)
@@ -150,6 +168,21 @@ oc_hotcfg_build_manifest() {
   rm -f "$files_tmp"
   mv -f "$root/MANIFEST.json.tmp" "$root/MANIFEST.json" || return 1
   printf '%s\n' "$digest"
+}
+
+# MANIFEST.capabilities 就地补写(幂等)。MANIFEST.json 不进 file_rows/digest,故改它不动 digest,
+# 也不影响 verify_manifest_full/sampled(两者只比对 .files[] 与实际文件)。
+oc_hotcfg__patch_manifest_capabilities() {
+  local root="$1" caps="${2:-}" want have tmp
+  [ -f "$root/MANIFEST.json" ] || { oc_hotcfg__die "patch_capabilities: 缺 MANIFEST.json @ $root"; return 1; }
+  want="$(printf '%s' "$caps" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0)) | sort')" || return 1
+  have="$(jq -c '(.capabilities // []) | sort' "$root/MANIFEST.json")" || return 1
+  [ "$have" = "$want" ] && return 0
+  tmp="$root/MANIFEST.json.tmp"
+  jq --argjson capabilities "$(printf '%s' "$caps" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')" \
+     '.capabilities = $capabilities' "$root/MANIFEST.json" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$root/MANIFEST.json" || return 1
+  oc_hotcfg__log "MANIFEST.capabilities 补写 @ $root: $have → $want"
 }
 
 # 全量重校验:重算 digest 并与 MANIFEST.json.digest 比对(用于同 rev 目录已存在时的幂等信任前置,
@@ -449,7 +482,7 @@ oc_hotcfg_build_ccb_dist() {
 # 幂等:同 digest 已存在 → 抽样重校验后复用。echo releaseDir。
 # 用法:oc_hotcfg_finalize_release <staging> <image_id> <sourceCommit> <prev_release_or_empty>
 oc_hotcfg_finalize_release() {
-  local staging="$1" image_id="$2" commit="$3" prev="${4:-}"
+  local staging="$1" image_id="$2" commit="$3" prev="${4:-}" caps="${5:-}"
   [ -d "$staging" ] || { oc_hotcfg__die "finalize_release: staging 不存在 $staging"; return 1; }
   local cache reuse=0 bunver
   cache="$(oc_hotcfg_deps_cache_key "$staging" "$image_id")" || return 1
@@ -485,12 +518,17 @@ oc_hotcfg_finalize_release() {
   oc_hotcfg_normalize_release_perms "$staging"
 
   local digest target
-  digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache" "$ccb_key")" || return 1
+  digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache" "$ccb_key" "$caps")" || return 1
   target="$OC_HOTCFG_RELEASES_ROOT/rel-$digest"
   mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
   if [ -d "$target" ]; then
     oc_hotcfg__log "release rel-$digest 已存在 → 抽样重校验后复用"
     if oc_hotcfg_verify_manifest_sampled "$target" 64; then
+      # capability 声明补写(幂等自愈):同 digest = 同源码树 ⇒ 同 capability。旧制品建于本
+      # 特性之前(MANIFEST 无 capabilities)会被兼容地板判为"容器面不具备能力"而拒绝激活 ——
+      # 那是**假阴性**(树里明明有代码)。此处按当前 caps 就地补写(MANIFEST 不进 digest,
+      # 文件内容与校验语义均不受影响)。声明不同 → 同样以本次为准并记日志。
+      oc_hotcfg__patch_manifest_capabilities "$target" "$caps" || return 1
       rm -rf "$staging"; printf '%s\n' "$target"; return 0
     fi
     oc_hotcfg__die "release rel-$digest 存在但抽样校验失败 → 人工处置"; return 1
@@ -816,12 +854,15 @@ oc_hotcfg_canary_boot() {
     || { oc_hotcfg__die "canary boot 冒烟失败(entrypoint validate-only 非 0)→ 拒绝激活"; return 1; }
 }
 
-# tuple 可行性守卫(R3-B1 + R4-B1):saga 一切现场改动之前(**两轴全空也要跑**)拦两类坏 tuple:
+# tuple 可行性守卫(R3-B1 + R4-B1 + R3-B4):saga 一切现场改动之前(**两轴全空也要跑**)拦三类坏 tuple:
 #   ① tag↔ID 漂移:tuple 记 {image(tag), image_id(权威)},但容器最终以 tag 起(supervisor
 #      deps.image)——若 tag 已被重打到别的镜像,提交后=运行镜像与 stale 权威 ID 不同,
 #      错误镜像启动 + 存量容器持续 runtimeStale 循环。强制 inspect(image).Id == image_id。
 #   ② 瘦身镜像(embed_source=0)+ 空 release:新容器无源码可跑,provision 真空。
-# 缺 label 视为内嵌镜像(兼容旧镜像)放行;inspect 失败 = 无法证明可行,拒绝。
+#   ③ **模型权威兼容地板**(cutover marker 置位后):容器面必须自证 model_authority_v1 ——
+#      release 非空看 MANIFEST.capabilities,release 空(内嵌/emergency)看镜像 features label。
+#      不满足 = 该 tuple 的容器会退回 baked 判定,而 catalog 里已有 baked 不认识的行 → 拒。
+# 缺 label 视为内嵌镜像(兼容旧镜像)放行 ①②;inspect 失败 = 无法证明可行,拒绝。
 oc_hotcfg_assert_tuple_viable() {
   local image="$1" image_id="$2" release="$3" live_id embed
   # ① tag↔ID 一致性(image/image_id 都非空才可验;正常 saga 两者恒非空)。
@@ -831,6 +872,8 @@ oc_hotcfg_assert_tuple_viable() {
     [ "$live_id" = "$image_id" ] \
       || { oc_hotcfg__die "tuple_viable: tag↔ID 漂移(inspect($image).Id=$live_id ≠ tuple.image_id=$image_id)—— tag 已被重打,拒绝提交错位 tuple"; return 1; }
   fi
+  # ③ 模型权威地板(先于 ② 的 early-return,两种 release 形态都要过)。
+  oc_hotcfg_assert_tuple_model_authority "$image_id" "$release" || return 1
   # ② 瘦身+空 release(按权威 immutable ID 查 label,不再信 tag)。
   [ -n "$release" ] && return 0
   embed="$("$OC_DOCKER_BIN" image inspect --format '{{index .Config.Labels "oc.runtime.embed_source"}}' "$image_id" 2>/dev/null)" \
@@ -840,6 +883,32 @@ oc_hotcfg_assert_tuple_viable() {
     return 1
   fi
   return 0
+}
+
+# 容器面(runtime tuple)的模型权威 capability 地板。marker 未置位 → 放行(步骤 5 之前无地板)。
+# fail-closed:探测不到声明(MANIFEST 缺失 / inspect 失败)一律拒 —— 不确定即拒。
+oc_hotcfg_assert_tuple_model_authority() {
+  local image_id="$1" release="$2" cutover caps
+  [ -f "$OC_HOTCFG_ENV_FILE" ] || return 0
+  cutover="$(oc_hotcfg_env_get "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_MODEL_AUTHORITY_CUTOVER_KEY")"
+  [ "$cutover" = "1" ] || return 0
+  if [ -n "$release" ]; then
+    [ -f "$release/MANIFEST.json" ] \
+      || { oc_hotcfg__die "tuple_viable: cutover 已置位,但 release 无 MANIFEST.json,无法自证 $OC_HOTCFG_MODEL_AUTHORITY_CAP: $release"; return 1; }
+    caps="$(jq -r '(.capabilities // []) | join(" ")' "$release/MANIFEST.json" 2>/dev/null)" \
+      || { oc_hotcfg__die "tuple_viable: 读 release MANIFEST.capabilities 失败: $release"; return 1; }
+    case " $caps " in
+      *" $OC_HOTCFG_MODEL_AUTHORITY_CAP "*) return 0 ;;
+      *) oc_hotcfg__die "tuple_viable: 兼容地板拒绝 —— 步骤 5 已 cutover($OC_HOTCFG_MODEL_AUTHORITY_CUTOVER_KEY=1),但目标 runtime release 未声明 '$OC_HOTCFG_MODEL_AUTHORITY_CAP'(caps=[${caps}]):$release。该 release 的容器不认签名 execution descriptor → 退回 baked 判定。回滚只能翻到同样声明该 capability 的 release。"; return 1 ;;
+    esac
+  fi
+  # release 为空:容器跑镜像内嵌源码 → 声明在镜像 features label。
+  caps="$("$OC_DOCKER_BIN" image inspect --format "{{index .Config.Labels \"$OC_HOTCFG_IMAGE_FEATURES_LABEL\"}}" "$image_id" 2>/dev/null)" \
+    || { oc_hotcfg__die "tuple_viable: cutover 已置位,但无法 inspect 镜像 $image_id 的 $OC_HOTCFG_IMAGE_FEATURES_LABEL label"; return 1; }
+  case " $caps " in
+    *" $OC_HOTCFG_MODEL_AUTHORITY_CAP "*) return 0 ;;
+    *) oc_hotcfg__die "tuple_viable: 兼容地板拒绝 —— 步骤 5 已 cutover,但内嵌源码镜像 $image_id 的 $OC_HOTCFG_IMAGE_FEATURES_LABEL=[${caps}] 不含 '$OC_HOTCFG_MODEL_AUTHORITY_CAP'。逃生镜像必须由带该能力的 commit 构建(build-image.sh 写 label)。"; return 1 ;;
+  esac
 }
 
 # ─────────────────────────── 激活 saga(§1.5)───────────────────────────

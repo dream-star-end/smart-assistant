@@ -31,6 +31,7 @@ import {
 } from "../http/internalServerAuthored.js";
 import type { V3SinkPersistOutcome, V3SinkPersistRole } from "../admin/metrics.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
+import type { Logger } from "../logging/logger.js";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
 
@@ -1555,6 +1556,18 @@ describe("internalServerAuthored handler — tool durability", () => {
     };
   }
 
+  function segments(count: number, prefix = "segment"): Array<{
+    index: number;
+    text: string;
+    ts: number;
+  }> {
+    return Array.from({ length: count }, (_, index) => ({
+      index,
+      text: `${prefix}-${index}`,
+      ts: 1_000 + index,
+    }));
+  }
+
   /** Recording storage keyed by role + blockId for tool-aware overrides. */
   function recStore(): {
     storage: ServerAuthoredStorage;
@@ -2047,6 +2060,174 @@ describe("internalServerAuthored handler — tool durability", () => {
   //   tools=[tool-x@arrivedAt=T2, tool-y@arrivedAt=T4]
   // Master writes ONE assistant row per segment (3 rows) + one tool row
   // per tool (2 rows); the LAST assistant segment carries usage/_truncated.
+
+  test("oversized thinkingSegments degrades to thinkingText and preserves assistant", async () => {
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      text: "final answer",
+      thinkingText: "aggregate thinking",
+      thinkingSegments: segments(65),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 200);
+    const thinking = rec.rows.filter((row) => row.role === "thinking");
+    const assistant = rec.rows.filter((row) => row.role === "assistant");
+    assert.equal(thinking.length, 1);
+    assert.equal(thinking[0].id, "srv-sess12345-main-t11-thinking");
+    assert.equal(thinking[0].text, "aggregate thinking");
+    assert.equal(assistant.length, 1);
+    assert.equal(assistant[0].text, "final answer");
+  });
+
+  test("oversized thinkingSegments without thinkingText still preserves assistant", async () => {
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 12,
+      status: "completed",
+      text: "final answer survives",
+      thinkingSegments: segments(65),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.filter((row) => row.role === "thinking").length, 0);
+    const assistant = rec.rows.filter((row) => row.role === "assistant");
+    assert.equal(assistant.length, 1);
+    assert.equal(assistant[0].text, "final answer survives");
+  });
+
+  test("oversized assistantSegments degrades to aggregate text", async () => {
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 13,
+      status: "completed",
+      text: "aggregate assistant",
+      assistantSegments: segments(65),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 200);
+    const assistant = rec.rows.filter((row) => row.role === "assistant");
+    assert.equal(assistant.length, 1);
+    assert.equal(assistant[0].id, "srv-sess12345-main-t13");
+    assert.equal(assistant[0].text, "aggregate assistant");
+  });
+
+  test("oversized thinking-only segments without a fallback remain rejected", async () => {
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 14,
+      status: "completed",
+      text: "",
+      thinkingSegments: segments(65),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+  });
+
+  test("exactly 64 thinkingSegments keep the segmented persistence path", async () => {
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 15,
+      status: "completed",
+      text: "",
+      thinkingSegments: segments(64),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 200);
+    const thinking = rec.rows.filter((row) => row.role === "thinking");
+    assert.equal(thinking.length, 64);
+    assert.equal(thinking[0].id, "srv-sess12345-main-t15-thinking-s0");
+    assert.equal(thinking[63].id, "srv-sess12345-main-t15-thinking-s63");
+  });
+
+  test("oversized segment warnings expose metadata only", async () => {
+    const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      trace() {},
+      debug() {},
+      info() {},
+      warn(msg, fields) { warnings.push({ msg, fields }); },
+      error() {},
+      child() { return logger; },
+    };
+    const rec = recStore();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      logger,
+    });
+    const { res, rec: resRec } = makeRes();
+    await h(authed(JSON.stringify({
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 16,
+      status: "completed",
+      text: "DO_NOT_LOG aggregate assistant",
+      thinkingText: "DO_NOT_LOG aggregate thinking",
+      assistantSegments: segments(65, "DO_NOT_LOG-assistant"),
+      thinkingSegments: segments(65, "DO_NOT_LOG-thinking"),
+    })), res, CTX);
+
+    assert.equal(resRec.status, 200);
+    assert.equal(warnings.length, 2);
+    assert.deepEqual(
+      warnings.map(({ msg, fields }) => ({ msg, fields })),
+      [
+        {
+          msg: "oversized_segments_degraded",
+          fields: { sessionId: "sess12345", field: "assistantSegments", count: 65, cap: 64 },
+        },
+        {
+          msg: "oversized_segments_degraded",
+          fields: { sessionId: "sess12345", field: "thinkingSegments", count: 65, cap: 64 },
+        },
+      ],
+    );
+    for (const warning of warnings) {
+      assert.deepEqual(
+        Object.keys(warning.fields ?? {}).sort(),
+        ["cap", "count", "field", "sessionId"],
+      );
+    }
+    assert.equal(JSON.stringify(warnings).includes("DO_NOT_LOG"), false);
+  });
 
   test("Fix B: assistantSegments writes one assistant row per segment, last segment carries usage", async () => {
     const rec = recStore();

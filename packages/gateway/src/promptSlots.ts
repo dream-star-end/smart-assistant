@@ -175,6 +175,8 @@ export interface PromptSlotContext {
   persona?: string // path to CLAUDE.md / SOUL.md
   provider?: string
   model?: string
+  /** catalog/签名 descriptor 的视觉能力；存在时覆盖 baked 静态表。 */
+  modelSupportsVision?: boolean
   /** CCB effort level — 'xhigh' / 'max' 触发科研守则 slot,其它值(含 undefined)不触发。
    *  仅在 Opus 4.7 + 用户在"思考深度"菜单里选到 xhigh/max 档位时才会是这两个值
    *  (UI 入口见 packages/web/public/modules/effortMode.js)。 */
@@ -266,7 +268,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // 显式 opt-in 的 provider),所以 `needsVisionCli` 与旧 `availableMcpTools.includes(
   // 'understand_image')` 语义完全等价。**原生多模态模型(gpt-5.5/claude 等)默认 false**,
   // 不会拿到误导性的"用 CLI 识图"提示(保持迁移前行为,不给它们加噪音)。
-  const needsVisionCli = shouldEnableOpenClaudeVision(provider, ctx.model)
+  const needsVisionCli = shouldEnableOpenClaudeVision(
+    provider,
+    ctx.model,
+    ctx.modelSupportsVision,
+  )
   // 平台静态能力文案(`# Platform capabilities` 头部 + 多媒体/微信/富内容/子 Agent/
   // 浏览器/网页提取诸段)已上移 platform bundle(商业版真热),商业版权威 =
   // prompts/platform-capabilities.md,个人版权威 = 下方 PLATFORM_CAPABILITIES_FALLBACK。
@@ -340,7 +346,10 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // staticKeyProviders 的 supportsVision(经 isTextOnlyStaticVisionModel 派生),与
   // mcpVisionServer 注入侧同源 —— 消掉此前逐字面量硬编码的第二权威源(新增静态
   // 模型忘同步就漏发提示的漂移)。
-  if (needsVisionCli && isTextOnlyStaticVisionModel(ctx.model)) {
+  if (
+    needsVisionCli &&
+    (ctx.modelSupportsVision === false || isTextOnlyStaticVisionModel(ctx.model))
+  ) {
     lines.push('')
     lines.push('## 图片理解提示')
     lines.push('')

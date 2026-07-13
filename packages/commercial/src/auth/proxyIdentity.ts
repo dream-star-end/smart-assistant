@@ -30,6 +30,7 @@ import {
 import { canUseModel } from "../billing/authzModels.js";
 import type { ModelPricing, PricingCache } from "../billing/pricing.js";
 import { recordHostRequest as defaultRecordHostRequest } from "../compute-pool/hostReqCounter.js";
+import type { UserModelAuthzLoader } from "./userModelAuthz.js";
 
 /**
  * Identity 解析结果。**只**包含下游业务逻辑要消费的最小字段。
@@ -89,6 +90,7 @@ export interface IdentityStrategy {
     identity: ProxyIdentity,
     pricing: ModelPricing,
     model: string,
+    requiredEpoch?: bigint,
   ): Promise<void>;
 }
 
@@ -165,22 +167,18 @@ export class AuthzDeniedError extends Error {
  */
 export interface SharedAuthorizeDeps {
   pricing: PricingCache;
-  loadUserModelAuthz: (
-    uid: bigint,
-  ) => Promise<{
-    role: "user" | "admin";
-    grantedModelIds: ReadonlySet<string>;
-  }>;
+  loadUserModelAuthz: UserModelAuthzLoader;
 }
 
 export async function authorizeProxyIdentity(
   deps: SharedAuthorizeDeps,
   identity: ProxyIdentity,
   model: string,
+  requiredEpoch?: bigint,
 ): Promise<void> {
   let authz;
   try {
-    authz = await deps.loadUserModelAuthz(identity.uid);
+    authz = await deps.loadUserModelAuthz(identity.uid, requiredEpoch);
   } catch (err) {
     throw new AuthzLoadError(err);
   }
@@ -203,12 +201,7 @@ export interface ContainerIdentityStrategyDeps {
   /** 模型价格 / visibility 表(canUseModel 内部用) */
   pricing: PricingCache;
   /** 服务端权威源 role + grants 查询(失败 fail-closed) */
-  loadUserModelAuthz: (
-    uid: bigint,
-  ) => Promise<{
-    role: "user" | "admin";
-    grantedModelIds: ReadonlySet<string>;
-  }>;
+  loadUserModelAuthz: UserModelAuthzLoader;
   /**
    * Post-auth 流量计数 hook —— **test seam,production 不传**。
    *
@@ -261,13 +254,14 @@ export function makeContainerIdentityStrategy(
         containerId: BigInt(identity.containerId),
       };
     },
-    async authorize(identity, _pricing, model) {
+    async authorize(identity, _pricing, model, requiredEpoch) {
       // 共享 authz 业务规则(2026-05-18 CC 外接 plan Phase 2):任何 strategy
       // 都走同一份 loadUserModelAuthz + canUseModel,避免身份维度的 authz 分裂。
       await authorizeProxyIdentity(
         { pricing: deps.pricing, loadUserModelAuthz: deps.loadUserModelAuthz },
         identity,
         model,
+        requiredEpoch,
       );
     },
   };

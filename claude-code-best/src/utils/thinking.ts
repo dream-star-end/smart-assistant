@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
+import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -91,6 +91,8 @@ export function getRainbowColor(
 // TODO(inigo): add support for probing unknown models via API error detection
 // Provider-aware thinking support detection (aligns with modelSupportsISP in betas.ts)
 export function modelSupportsThinking(model: string): boolean {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.supportsThinking
   // glm-5.1(火山 Ark)是 thinking 模型 —— 它虽在 isCapabilityZeroStaticModel 集合里
   // (betas/effort/adaptive-thinking 仍全关)，但 thinking 是例外:火山 Ark Anthropic 兼容层
   // 实测支持 thinking:{type:enabled,budget_tokens}。故先判，让 CCB 默认发 enabled(claude.ts

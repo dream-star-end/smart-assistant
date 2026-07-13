@@ -597,6 +597,19 @@ export function friendlyBridgeErrorMessage(code: unknown, message?: string): str
   if (n === "insufficient_credits") return "余额不足，充值后即可继续使用。";
   if (n === "unauthorized_model") return "当前账号尚未开通这个模型，请切换模型或联系管理员。";
   if (n === "maintenance") return "服务正在维护中，请稍后再试。";
+  // ── 模型权威 gate 的拒帧(bridge / egress;方案 §4 R3-m12)────────────────────────
+  // 这四个码此前没有用户向文案，全部落进下面的通用兜底「系统暂时不可用」——用户既不知道
+  // 发生了什么，也不知道能不能重发（config_changed 明明是**可原样重发**的）。
+  // 闭环靠既有入口：出错时 reducer 会把本轮那条用户消息置为 status='error'，用户气泡下方
+  // 就带「重试」按钮（cards.tsx onRetrySend，复用原 payload 含附件原地重发），文案直接指向它。
+  if (n === "model_config_changed_retry_turn")
+    return "平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。";
+  if (n === "model_not_available")
+    return "这个模型当前不可用（已下架或未对你的账号开通），请在上方切换一个模型后重发。";
+  if (n === "unresolved_agent_model")
+    return "没能确定本轮要用的模型，请在上方选择模型后重发。";
+  if (n === "model_authority_unavailable" || n === "model_catalog_unavailable")
+    return "模型配置正在同步，请稍后点「重试」重发本条消息。";
   // 遗留兼容文案(新 bridge 不再发该帧):如实告知会自动恢复,不再误导用户手动刷新。
   if (n === "conn_kicked") return "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。";
   if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";
@@ -611,6 +624,13 @@ export const EXPECTED_TURN_ERR_CODES = new Set([
   "insufficient_credits",
   "unauthorized_model",
   "maintenance",
+  // 模型配置在 turn 中途变更（admin 改价/停用/调权限）→ 拒本轮 + 引导重发：是**预期业务态**，
+  // 不是故障（一次 admin 改配置会让所有在途 turn 各上报一次，污染错误监控口径）。
+  // 同理 model_not_available = 模型下架/未开通（与 unauthorized_model 同类）。
+  // **不含** model_authority_unavailable / model_catalog_unavailable：那两个是 catalog 拉不起来
+  // 的基建故障，必须上报告警。
+  "model_config_changed_retry_turn",
+  "model_not_available",
   // 连接态瞬态(遗留残帧才会出现):部署/踢连接不是 turn 故障,不进错误监控
   // (曾经每次发版让所有 mid-turn 客户端各上报一次,污染口径)。
   "conn_kicked",

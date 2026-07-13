@@ -64,6 +64,7 @@ import type { Pool } from "pg";
 import type { TokenUsage } from "./calculator.js";
 import { computeCost } from "./calculator.js";
 import type { ModelPricing } from "./pricing.js";
+import type { BillingAuthorityStamp } from "./proxyBilling.js";
 import {
   type PreCheckRedis,
   type ReservationHandle,
@@ -113,6 +114,8 @@ export interface CodexFinalizeContext {
   derivedPricing: ModelPricing;
   /** preCheck 返回的 reservation handle — commit/fail 完都要 release。 */
   reservation: ReservationHandle;
+  /** 模型权威开启时必传；写入 usage_records 四个留证列。 */
+  authority?: BillingAuthorityStamp | null;
   // v5(M1b):不再携带 accountId —— codex 记账 usage_records.account_id 恒写
   // SQL NULL(0044 SET NULL FK 语义,与 deepseek/minimax 静态 provider 同型),
   // 不再用 v3 的 `accountId=0n` 假账号占位。
@@ -231,6 +234,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
           costCredits: effectiveCredits,
           status: settleStatus,
           sessionId: ctx.engineSessionId,
+          authority: ctx.authority ?? null,
         });
         await finalizeInflightJournal(ctx.pgPool, {
           requestId: ctx.requestId,

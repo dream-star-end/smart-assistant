@@ -528,6 +528,17 @@ export type ProxyRejectReason =
   | "account_pool_busy"
   | "unknown_model"
   | "unauthorized_model"
+  // ── 模型权威批次(docs/V5_MODEL_AUTHORITY_PLAN.md §4)——每请求 authority + epoch fence ──
+  /** 模型不在 catalog active / 不可路由(fence 后的可用性判定)。 */
+  | "model_not_available"
+  /** 无 authority 凭据 / 验签失败 / 绑定字段(uid/containerId/model)不符。 */
+  | "model_authority_invalid"
+  /** epoch 或 executionRevision 漂移 —— 安全/计费配置在 turn 中途变了(前端引导重开 turn)。 */
+  | "model_config_changed"
+  /** 本进程 catalog 快照 unknown(NOTIFY 后重建未成 / DB 不可达)→ fail-closed。 */
+  | "model_catalog_unavailable"
+  /** catalog 声明了本进程不认识的 provider 机制,或 capability 超出 provider 上限(配置事故)。 */
+  | "model_config_invalid"
   | "bad_body"
   | "too_large"
   | "identity"

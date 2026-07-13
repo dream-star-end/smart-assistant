@@ -1,32 +1,47 @@
-# platform-seed.yaml — v5 平台 seed agent 的**非计费声明**(P2a 缩,设计 §4.1)。
+# platform-seed.yaml — v5 平台 seed agent 声明(schema v2:执行三元组声明化,模型权威批次 §5 阶段 A)。
 #
 # 不变量(硬边界,fail loud):
-#   - 本文件**只**声明 persona 文件引用 + 非计费 defaults(permissionMode / toolsets /
-#     displayName / avatarEmoji / forcePersona)+ seedSkills 清单。
-#   - **禁止**出现 model / engine / provider / runnerKind 键 —— 计费/引擎路由权威留在
-#     entrypoint.ts 常量硬编码,与 master agentModelAuthority 双端同构(见 §4.1)。出现即
-#     validatePlatformSeed() 抛错拒启(防止绕道声明化回潮计费分叉,设计 R2-B1)。
-#   - 消费方 = entrypoint.ts(经 platformBundle.ts 的 validatePlatformSeed / buildSeedAgent);
-#     persona 文件在 personas/<id>.md,scientist seed skill 内容在 skills/scientist/<name>/SKILL.md。
-#   - 改本文件 → bundle rev 变 → boot_hash 变 → 容器温滚动生效(无计费面)。
-schemaVersion: 1
+#   - 本文件声明 persona 文件引用 + 非计费 defaults(permissionMode / toolsets / displayName /
+#     avatarEmoji / forcePersona)+ seedSkills 清单 + **每个 agent 的执行三元组**
+#     (`model` 必填 / `provider` 必填 ∈ 已知集 / `runnerKind` 可选,仅 'app-server')。
+#   - **`engine` 键仍硬拒**:engine 由 model 推导(protocol 型号表 + gateway registry 唯一权威),
+#     声明化只会开出第二权威源。出现即 validatePlatformSeed() 抛错拒启。
+#   - **值必须与 master 侧常量一致(阶段 A 一致性锚)**:
+#       main.model / main.provider             == platformDefaults.PLATFORM_DEFAULT_MODEL / _PROVIDER
+#       hidden-reviewer.model / .provider      == platformDefaults.PLATFORM_HIDDEN_REVIEWER_MODEL / _PROVIDER
+#       codex.model                            == @openclaude/protocol DEFAULT_CODEX_ENGINE_MODEL
+#     漂移即 src/__tests__/runtimeEntrypointPolicy.test.ts 的一致性锚测试红。
+#     **阶段 B 之后**:master 不再靠这些常量判定 —— 按容器 label 上的 bundle_rev 读**该 rev 的本文件**
+#     推导计费模型(src/ws/seedDeclarationLoader.ts),滚动窗口新旧容器各按自己的 rev 计费,无分叉。
+#   - 消费方 = entrypoint.ts(经 platformBundle.ts 的 validatePlatformSeed / buildSeedAgent)
+#     + master 的 seedDeclarationLoader(阶段 B);persona 文件在 personas/<id>.md,scientist seed
+#     skill 内容在 skills/scientist/<name>/SKILL.md。
+#   - 改本文件 → bundle rev 变 → boot_hash 变 → 容器温滚动生效。
+schemaVersion: 2
 
 agents:
-  # 默认全能助手。model/provider 由 entrypoint COMMERCIAL_DEFAULT_MODEL/PROVIDER 注入。
+  # 默认全能助手。其 model 同时是容器 config.defaults.model(平台默认模型)的来源。
   - id: main
+    model: glm-5.2
+    provider: ark
     persona: personas/main.md
     permissionMode: bypassPermissions
     displayName: 全能助手
     avatarEmoji: "🧠"
-  # GPT-5.6(Codex)默认队长。model/provider/runnerKind + 动态 displayName(由 protocol
-  # DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME 拼「队长」)全部由 entrypoint 注入,故此处只留
-  # 非计费的 permissionMode + avatarEmoji。
+  # GPT-5.6(Codex)默认队长。provider=codex-native + runnerKind=app-server 是 gateway runner 路由依据。
+  # displayName 仍由 entrypoint 动态拼:按**本处声明的 model** 反查 protocol 型号目录取显示名 +「队长」
+  # —— 显示名权威留 protocol,换型号只改本文件一处。
   - id: codex
+    model: gpt-5.6-sol
+    provider: codex-native
+    runnerKind: app-server
     permissionMode: bypassPermissions
     avatarEmoji: "🤖"
   # 团队模式隐藏审查员(reserved system id;不带 source:marketplace,不进协作列表)。
   # persona 每次 boot 强制刷新(forcePersona),裁决词汇与 @openclaude/protocol 两源一致。
   - id: hidden-reviewer
+    model: glm-5.2
+    provider: ark
     persona: personas/hidden-reviewer.md
     forcePersona: true
     permissionMode: bypassPermissions

@@ -107,11 +107,11 @@ const SCHEMA_TOOL_INPUT_PREVIEW_MAX_CHARS = 2_000;
  *  Read/Grep fan-outs + a few Edits); 50 leaves plenty of headroom. */
 const SCHEMA_TOOLS_MAX_LEN = 50;
 
-/** Fix B (2026-05-25) — defensive upper bound on per-turn text segments. A
- *  segment opens after every tool_use boundary that follows non-empty text,
- *  so segments.length ≤ tools.length + 1. With SCHEMA_TOOLS_MAX_LEN = 50 a
- *  hard ceiling of 64 leaves headroom for synthetic-error appends without
- *  risk of legitimate turns getting 400-rejected. */
+/** Fix B (2026-05-25) — defensive upper bound on per-turn text segments.
+ *  Assistant segments normally follow tool boundaries, but Codex can emit
+ *  more independent thinking segments than tools. Oversized segment arrays
+ *  are degraded to their aggregate fallback before schema validation when
+ *  doing so cannot discard the turn's only content. */
 const SCHEMA_SEGMENTS_MAX_LEN = 64;
 
 /** P2 债A — per-turn agent-group (team card) caps. A leader turn can fan out
@@ -634,7 +634,62 @@ export function makeServerAuthoredHandler(
     // 2) Read + schema-validate body
     let body: ServerAuthoredBody;
     try {
-      const raw = await readBoundedJson(req, MAX_BODY_BYTES);
+      let raw = await readBoundedJson(req, MAX_BODY_BYTES);
+      if (
+        typeof raw === "object" &&
+        raw !== null &&
+        !Array.isArray(raw) &&
+        Object.getPrototypeOf(raw) === Object.prototype
+      ) {
+        const normalized = { ...(raw as Record<string, unknown>) };
+        const sessionId =
+          typeof normalized.sessionId === "string" &&
+          normalized.sessionId.length >= 8 &&
+          normalized.sessionId.length <= 50
+            ? normalized.sessionId
+            : "<unparsed>";
+
+        if (
+          Array.isArray(normalized.assistantSegments) &&
+          normalized.assistantSegments.length > SCHEMA_SEGMENTS_MAX_LEN &&
+          typeof normalized.text === "string" &&
+          normalized.text.length > 0
+        ) {
+          const count = normalized.assistantSegments.length;
+          normalized.assistantSegments = undefined;
+          userLog.warn("oversized_segments_degraded", {
+            sessionId,
+            field: "assistantSegments",
+            count,
+            cap: SCHEMA_SEGMENTS_MAX_LEN,
+          });
+        }
+
+        if (
+          Array.isArray(normalized.thinkingSegments) &&
+          normalized.thinkingSegments.length > SCHEMA_SEGMENTS_MAX_LEN
+        ) {
+          const hasOtherPersistableContent =
+            (typeof normalized.thinkingText === "string" &&
+              normalized.thinkingText.length > 0) ||
+            (typeof normalized.text === "string" && normalized.text.length > 0) ||
+            (Array.isArray(normalized.assistantSegments) &&
+              normalized.assistantSegments.length > 0) ||
+            (Array.isArray(normalized.tools) && normalized.tools.length > 0) ||
+            (Array.isArray(normalized.agentGroups) && normalized.agentGroups.length > 0);
+          if (hasOtherPersistableContent) {
+            const count = normalized.thinkingSegments.length;
+            normalized.thinkingSegments = undefined;
+            userLog.warn("oversized_segments_degraded", {
+              sessionId,
+              field: "thinkingSegments",
+              count,
+              cap: SCHEMA_SEGMENTS_MAX_LEN,
+            });
+          }
+        }
+        raw = normalized;
+      }
       const parsed = BodySchema.safeParse(raw);
       if (!parsed.success) {
         userLog.warn("bad_body", { issues: parsed.error.issues });

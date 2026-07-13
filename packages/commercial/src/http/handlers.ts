@@ -69,7 +69,16 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import { FallbackRateLimiter } from "./proxy/shared.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
-import type { PricingCache, PublicModel } from "../billing/pricing.js";
+import { perKtokCredits, type PricingCache, type PublicModel } from "../billing/pricing.js";
+import {
+  CatalogUnknownError,
+  type ModelCatalogSnapshot,
+  type UserModelScope,
+} from "../billing/modelCatalog.js";
+
+/** 匿名 /api/public/models 的展示面 fence 微缓存窗口(方案 §1.2:安全/计费面禁缓存,展示面许)。 */
+const PUBLIC_MODELS_FENCE_TTL_MS = 2_000;
+import type { CatalogSource } from "./internalModelCatalog.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import { getDegradedProviders } from "../admin/providerHealthGate.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
@@ -103,6 +112,16 @@ export interface CommercialHttpDeps {
    * (表示模块尚未加载完毕),便于 gateway 在 start 阶段早期也能挂上路由。
    */
   pricing?: PricingCache;
+  /**
+   * 模型执行 catalog(模型权威批次 · 方案 §6)。**注入后即为 `/api/public/models` 的
+   * 唯一投影权威**:行集 = catalog active ∧ 该 uid 可见 ∧ 有价 ——
+   * staged/retired/无价行恒不出现,alias 不作为独立条目,provider 归属取 catalog.provider_id
+   * (不再用 route registry 的 `findRouteProviderForModel` 推断)。
+   *
+   * 未注入 → 退回 legacy PricingCache 投影(装配尚未接线的旧路径 / 单测)。生产 master
+   * 在 index.ts 注入进程级唯一快照(modelCatalogRuntime 单例)。
+   */
+  modelCatalog?: CatalogSource;
   /**
    * T-23: chat 预检用 Redis。未注入时 /api/chat 返 503。
    * 测试可注入 `InMemoryPreCheckRedis` 跳过真 Redis。
@@ -1122,10 +1141,19 @@ export async function handleGetPublicConfig(
 
 // ─── GET /api/public/models ─────────────────────────────────────────
 // 公开路径,不限流、不需要登录;返回启用模型的公开视图(含 per-ktok 积分估价)。
-
-// (P1f 的 dropGptForV5Channel 已随 codex 重接入删除 —— v5 有 codex 底座后,
-// 模型可见性回归单一权威:model_pricing.visibility + enabled(0049 语义),
-// 不再按 channel 硬编码剔除 gpt-*。engine 可用性由 gateway registry fail-closed 兜底。)
+//
+// **投影权威 = model_catalog(方案 §6;MAJOR-5 收口 2026-07-12)**。此前这里走
+// PricingCache.listPublic/listForUser + findRouteProviderForModel 推断 provider 归属 ——
+// 那是 legacy 投影:①可用性来自 pricing 的派生镜像语义而非 catalog.state;②supported_efforts
+// 来自 protocol 静态 modelReasoningPolicy 而非 catalog 的 capability_profile;③provider 归属
+// 靠 route registry 的名字前缀推断,catalog 里自定义 provider_id 的行会被推断错 → degraded
+// 注解打在错误的模型上。现在三者全部改由 fenced catalog snapshot + pricing join 派生:
+//   · 行集 = snapshot.listForUser(scope) = active ∧ 有价 ∧ (public ∨ granted)
+//     → **staged / retired / disabled / 无价行恒不出现**;alias 不是独立条目(只归一,不成行)。
+//   · supported_efforts / provider_id 取 catalog;价格取同一事务读进来的 pricing 行。
+//   · degraded 按 catalog 的 provider_id 查 provider 健康(只注解不过滤,UX 红线)。
+//
+// catalog 未注入(装配未接线 / 单测)→ 退回 legacy 投影(下方 legacy 分支),语义与本批次前一致。
 
 export async function handleListPublicModels(
   req: IncomingMessage,
@@ -1133,15 +1161,15 @@ export async function handleListPublicModels(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  if (!deps.pricing) {
+  if (!deps.pricing && !deps.modelCatalog) {
     throw new HttpError(503, "PRICING_NOT_READY", "pricing cache not initialized");
   }
-  // 0049/0050:登录用户走 listForUser(visibility OR grants 语义),
-  //          匿名 / 无 token / 过期 token 走 listPublic。
+  // 0049/0050:登录用户走 per-uid 投影(visibility OR grants 语义),
+  //          匿名 / 无 token / 过期 token 走 public 投影。
   // **不**对 token 失败抛 401:这是公开端点,即便 token 过期也允许列模型,
   // 退化到 public 视图(避免每次登录态过期就 401 把前端 model 列表打没)。
   // jwt 解析走 sync 校验(同 router.ts 的 verifyCommercialJwtSync 路径),
-  // 失败/过期/未提供 token 都视作匿名;不验 DB(只读 + listForUser 失败兜底由 grants 空集合保护)。
+  // 失败/过期/未提供 token 都视作匿名;不验 DB(只读 + 失败兜底由 grants 空集合保护)。
   const authHeader = req.headers.authorization;
   let token = "";
   if (typeof authHeader === "string") {
@@ -1151,25 +1179,103 @@ export async function handleListPublicModels(
   // 0108 provider 健康度:degraded provider 的模型附 degraded:true(**只注解不过滤**;
   // 前端标「暂不可用」+ 禁选)。fail-soft:读失败返回空集 → 不误标降级(UX 红线)。
   const degraded = await getDegradedProviders();
-  if (!claims) {
-    sendJson(res, 200, { models: annotateDegraded(deps.pricing.listPublic(), degraded) });
+
+  // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
+  let scope: UserModelScope | null = null;
+  if (claims) {
+    const { listGrantsForUser } = await import("../admin/modelGrants.js");
+    const grants = await listGrantsForUser(claims.sub);
+    scope = {
+      uid: claims.sub,
+      role: claims.role,
+      grantedModelIds: new Set(grants.map((g) => g.model_id)),
+    };
+  }
+
+  if (deps.modelCatalog) {
+    // fence 后取快照(与 /internal/v3/model-catalog 同一道消费契约):admin 刚 disable 的模型
+    // 不能还挂在前端选择器里被点。unknown / DB 不可达 → 503(fail-closed;**不**回落 legacy
+    // 投影 —— 那会让"第二套判定源"在故障窗口悄悄复活,正是本次收口要消灭的东西)。
+    //
+    // **纯展示面微缓存(方案 §1.2 明许)**:本端点**匿名且不限流**,逐请求直读 epoch 会把
+    // "以前零 DB 查询的匿名路径"变成可被放大的 DB 打点。fence 的"零 stale 窗口"铁律只约束
+    // **安全/计费面**(签发/preCheck/journal/egress 每请求);展示面晚 ≤2s 看到 disable 无
+    // 金钱/授权后果(真正的执行闸在 bridge 签发与 egress fence,前端点了也跑不了)。
+    let snapshot: ModelCatalogSnapshot;
+    try {
+      // 微缓存不可用(测试 double / 非 cache 实现)→ 退回严格 fence(更保守,不放宽)。
+      snapshot = deps.modelCatalog.assertFreshCached
+        ? await deps.modelCatalog.assertFreshCached(PUBLIC_MODELS_FENCE_TTL_MS)
+        : await deps.modelCatalog.assertFresh();
+    } catch (err) {
+      const unknown = err instanceof CatalogUnknownError;
+      rootLogger
+        .child({ subsys: "publicModels" })
+        .error("catalog_unavailable", {
+          unknown,
+          err: (err as Error)?.message ?? String(err),
+        });
+      throw new HttpError(503, "MODEL_CATALOG_UNAVAILABLE", "model catalog unavailable");
+    }
+    const effective: UserModelScope = scope ?? {
+      uid: 0,
+      role: "user",
+      grantedModelIds: new Set<string>(),
+    };
+    sendJson(res, 200, { models: projectPublicModels(snapshot, effective, degraded) });
     return;
   }
-  // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
-  const { listGrantsForUser } = await import("../admin/modelGrants.js");
-  const grants = await listGrantsForUser(claims.sub);
-  const grantedSet = new Set(grants.map((g) => g.model_id));
-  sendJson(res, 200, {
-    models: annotateDegraded(
-      deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
-      degraded,
-    ),
-  });
+
+  // ── legacy 投影(catalog 未接线)────────────────────────────────────────
+  const pricing = deps.pricing!;
+  const models = scope
+    ? pricing.listForUser({ role: scope.role, grantedModelIds: scope.grantedModelIds })
+    : pricing.listPublic();
+  sendJson(res, 200, { models: annotateDegraded(models, degraded) });
+}
+
+/** `/api/public/models` 的 catalog 投影行:PublicModel + catalog 的 provider 归属(方案 §6)。 */
+export interface PublicModelProjection extends PublicModel {
+  /** catalog.provider_id(engine='codex' 的虚拟条目也有值;null = 未归属静态 provider)。 */
+  provider_id: string | null;
 }
 
 /**
- * 给受影响模型注解 degraded:true(归属 provider 生效降级时)。归属只认静态 provider
- * (findRouteProviderForModel 命中);OAuth/claude 由 account-pool 健康体系管,不在此标注。
+ * active catalog + pricing join → 公共/用户投影(单一权威;不经 PricingCache)。
+ *
+ * 价格来自快照里随 catalog 同一个 REPEATABLE READ 事务读进来的 pricing 行 —— 与
+ * `snapshot.listForUser` 的行集天然一致(不会出现"catalog 说有、pricing 说无"的半行)。
+ */
+function projectPublicModels(
+  snapshot: ModelCatalogSnapshot,
+  scope: UserModelScope,
+  degraded: ReadonlySet<string>,
+): PublicModelProjection[] {
+  const out: PublicModelProjection[] = [];
+  for (const row of snapshot.listForUser(scope)) {
+    // listForUser 已保证可路由(有价);这里 get 只是取值,理论不可能 miss。
+    const p = snapshot.pricing.get(row.modelId);
+    if (!p) continue;
+    out.push({
+      id: row.modelId,
+      display_name: row.displayName,
+      input_per_ktok_credits: perKtokCredits(p.inputPerMtok, p.multiplier),
+      output_per_ktok_credits: perKtokCredits(p.outputPerMtok, p.multiplier),
+      cache_read_per_ktok_credits: perKtokCredits(p.cacheReadPerMtok, p.multiplier),
+      cache_write_per_ktok_credits: perKtokCredits(p.cacheWritePerMtok, p.multiplier),
+      multiplier: p.multiplier,
+      supported_efforts: [...row.supportedEfforts],
+      provider_id: row.providerId,
+      ...(row.providerId && degraded.has(row.providerId) ? { degraded: true } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * **legacy 分支专用**(catalog 未接线时)。给受影响模型注解 degraded:true —— 归属靠
+ * route registry 推断(findRouteProviderForModel),catalog 自定义 provider_id 的行会推断错;
+ * catalog 接线后走 projectPublicModels 的 provider_id 归属,不再经过这里。
  */
 function annotateDegraded(models: PublicModel[], degraded: ReadonlySet<string>): PublicModel[] {
   if (degraded.size === 0) return models;

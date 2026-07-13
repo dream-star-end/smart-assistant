@@ -61,7 +61,7 @@ export function computeInboundNonce(secret: string, containerId: number | string
  * - mode ≠ 0o700 或 owner ≠ root:**log 警告继续** —— 降级环境手工 mkdir 常见,
  *   运维看 journalctl 自行调整,不值得拖垮整个 HOST 启动。
  */
-function checkDirIntegrity(dir: string, log: (msg: string) => void): void {
+export function checkDirIntegrity(dir: string, log: (msg: string) => void): void {
   let st;
   try {
     st = lstatSync(dir);

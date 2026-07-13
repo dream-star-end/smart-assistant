@@ -177,6 +177,210 @@ describe('v5 release safety lanes', () => {
     }
   })
 
+  // ── 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)──────────────
+  //
+  // 用 ssh stub 模拟 kl-mirror:preflight 的四面探测(DB/master/egress/容器 runtime)全部
+  // 经 `ssh $KL_HOST <cmd>` 出口,故一个 stub 即可把"四面缺任一 → 拒绝开 flag"的矩阵实跑出来。
+  // 锁走 OC_V5_DEPLOY_LOCK_FILE(hermetic,不抢真实部署锁)。
+  async function maFixture(over: Record<string, string> = {}) {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-')); dirs.push(dir)
+    const ssh = path.join(dir, 'ssh')
+    // stub 收到的是 `ssh <host> <cmd...>`;按命令特征回放各面的探测结果。
+    await writeFile(
+      ssh,
+      [
+        '#!/bin/bash',
+        'cmd="$*"',
+        'stdin="$(cat)"',
+        'if [[ "$stdin" == *"FROM deploy_state"* ]]; then',
+        '  printf "%s\\n" "${MA_DS_ROW:-1|stable|A||/rel/a||A|A|0|salt|0||1|}"',
+        '  exit 0',
+        'fi',
+        'case "$cmd" in',
+        '  *schema_migrations*) printf "%s\\n" "${MA_DB_READY:-true}" ;;',
+        "  *\"name='DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_app|${MA_APP_ROLE_READY:-true}\" ;;",
+        "  *\"name='MODEL_CATALOG_ADMIN_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_admin|${MA_ADMIN_ROLE_READY:-true}\" ;;",
+        "  *\"name='MODEL_AUTHORITY_DEPLOY_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_deploy|${MA_DEPLOY_ROLE_READY:-true}\" ;;",
+        '  *"/healthz"*) printf "%s\\n" "{\\"ok\\":true,\\"runtime\\":{\\"capabilities\\":[${MA_MASTER_CAPS-\\"model_authority_v1\\"}]}}" ;;',
+        '  *egress-health*) printf "%s\\n" "{\\"ok\\":true,\\"role\\":\\"egress\\",\\"capabilities\\":[${MA_EGRESS_CAPS-\\"model_authority_v1-egress\\"}]}" ;;',
+        '  *OC_RUNTIME_RELEASE*) printf "%s\\n" "${MA_RT_RELEASE-/var/lib/openclaude-v5/runtime-releases/rel-abc}" ;;',
+        '  *OC_RUNTIME_IMAGE_ID*) printf "%s\\n" "sha256:emb" ;;',
+        '  *OC_MODEL_AUTHORITY_CUTOVER*) printf "%s\\n" "${MA_CUTOVER:-}" ;;',
+        '  *OC_MODEL_AUTHORITY=*) printf "%s\\n" "${MA_FLAG:-}" ;;',
+        '  *MANIFEST.json*) printf "%s\\n" "${MA_RT_CAPS-model_authority_v1}" ;;',
+        '  *oc.runtime.features*) printf "%s\\n" "${MA_IMG_FEATURES-v3-sink model_authority_v1}" ;;',
+        '  *) printf "\\n" ;;',
+        'esac',
+        'exit 0',
+      ].join('\n'),
+    )
+    await chmod(ssh, 0o755)
+    return run(deploy, ['--model-authority-preflight'], {
+      PATH: `${dir}:${process.env.PATH}`,
+      OC_V5_DEPLOY_LOCK_FILE: path.join(dir, 'lock'),
+      ...over,
+    })
+  }
+
+  test('model-authority preflight passes only when all four faces declare capability', async () => {
+    const green = await maFixture()
+    assert.equal(green.status, 0, green.stdout + green.stderr)
+    for (const line of ['✓ ① DB', '✓ ② master', '✓ ③ egress', '✓ ④ runtime']) {
+      assert.ok(green.stdout.includes(line), `missing "${line}" in:\n${green.stdout}`)
+    }
+
+    // ① DB:catalog + guards 任一迁移/关键对象未就绪
+    const noDb = await maFixture({ MA_DB_READY: 'false' })
+    assert.notEqual(noDb.status, 0)
+    assert.match(noDb.stdout + noDb.stderr, /① DB:.*0143_model_catalog.*0144_model_authority_guards/)
+
+    // ① DB 还必须证明 app/admin/deploy 三个独立角色的最小权限边界。
+    const badAppRole = await maFixture({ MA_APP_ROLE_READY: 'false' })
+    assert.notEqual(badAppRole.status, 0)
+    assert.match(badAppRole.stdout + badAppRole.stderr, /① DB:/)
+
+    // ② master:旧版本不广播 capability
+    const oldMaster = await maFixture({ MA_MASTER_CAPS: '' })
+    assert.notEqual(oldMaster.status, 0)
+    assert.match(oldMaster.stdout + oldMaster.stderr, /② master:\/healthz 未广播/)
+
+    // ③ egress:旧进程无 epoch fence(deploy 默认不重启 egress —— 最易错配的一面,R4-m6)
+    const oldEgress = await maFixture({ MA_EGRESS_CAPS: '' })
+    assert.notEqual(oldEgress.status, 0)
+    assert.match(oldEgress.stdout + oldEgress.stderr, /③ egress:未广播/)
+    assert.match(oldEgress.stdout + oldEgress.stderr, /--egress/)
+
+    // ④ 容器 runtime release 未声明
+    const oldRelease = await maFixture({ MA_RT_CAPS: '' })
+    assert.notEqual(oldRelease.status, 0)
+    assert.match(oldRelease.stdout + oldRelease.stderr, /④ runtime release:.*未声明/)
+
+    // ④ release 轴关闭时回落镜像 label:旧镜像(无 model_authority_v1 token)同样拒
+    const oldImage = await maFixture({ MA_RT_RELEASE: '', MA_IMG_FEATURES: 'v3-sink' })
+    assert.notEqual(oldImage.status, 0)
+    assert.match(oldImage.stdout + oldImage.stderr, /④ runtime 镜像/)
+  })
+
+  test('step-5 compat floor is irreversible and guards every activation path', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // 地板挂在**全部**激活/回滚路径:传统激活、hotcfg tuple、tuple 回滚、P3 candidate。
+    for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
+      const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+      assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
+    }
+    // marker 探测 fail-closed:psql 失败 → 按已置位处理(不确定即拒)
+    const cutoverFn = source.match(/model_authority_cutover_done\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(cutoverFn, /fail-closed/)
+    // 关 flag 在 cutover 后必须被拒(不可逆地板)
+    const disableFn = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(disableFn, /model_authority_cutover_done/)
+    assert.match(disableFn, /兼容地板不可逆/)
+  })
+
+  test('model-authority operations pin the stable P3 active lane', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const egressUnit = await readFile(path.join(root, 'deploy/v5/openclaude-v5-egress.service'), 'utf8')
+    const preflight = source.match(/model_authority_preflight\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(preflight, /assert_no_rollout_in_progress/)
+    assert.match(preflight, /ACTIVE_PORT/)
+    assert.doesNotMatch(preflight, /\$\{?V5_PORT\}?/)
+
+    const enable = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const enableSeed = source.match(/enable_seed_authority_by_rev\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const disable = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(enable, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.match(enable, /smoke "\$ACTIVE_PORT"/)
+    assert.match(enableSeed, /assert_no_rollout_in_progress/)
+    assert.match(enableSeed, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.doesNotMatch(enableSeed, /systemctl restart '\$V5_UNIT'/)
+    assert.match(enableSeed, /cd '\$ACTIVE_SRC'/)
+    assert.doesNotMatch(enableSeed, /cd '\$REMOTE_SRC'/)
+    assert.match(enableSeed, /smoke "\$ACTIVE_PORT"/)
+    assert.match(disable, /assert_no_rollout_in_progress/)
+    assert.match(disable, /systemctl restart '\$ACTIVE_UNIT'/)
+    assert.match(disable, /smoke "\$ACTIVE_PORT"/)
+
+    const activeB = await maFixture({
+      MA_DS_ROW: '2|stable|B||/rel/b||B|B|0|salt|0||2|/rel/a',
+    })
+    assert.equal(activeB.status, 0, activeB.stdout + activeB.stderr)
+    assert.match(activeB.stdout, /active lane:slot=B.*port=18795/)
+
+    const rollout = await maFixture({
+      MA_DS_ROW: '3|canary|A|B|/rel/a|/rel/b|A|A|10|salt|10|op|3|',
+    })
+    assert.notEqual(rollout.status, 0)
+    assert.match(rollout.stdout + rollout.stderr, /cohort rollout\/候选状态未收敛/)
+
+    // egress 是全局单实例：不得再永久从 slot A 工作目录启动。普通 --egress 必须把
+    // 独立指针钉到本次 BUILT_RELEASE，并具备 cwd/capability 活体验证与旧 release 回切。
+    assert.match(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5-egress$/m)
+    assert.doesNotMatch(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5$/m)
+    const egressStart = source.indexOf('activate_egress_release()')
+    const deployStart = source.indexOf('\ndeploy()', egressStart)
+    const egressActivate = source.slice(egressStart, deployStart)
+    const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
+    const deployBody = source.slice(deployStart, deployEnd)
+    assert.ok(egressStart >= 0 && deployStart > egressStart)
+    assert.match(egressActivate, /mv -T '\$tmplink' '\$V5_EGRESS_SRC'/)
+    assert.match(egressActivate, /\/proc\/\$pid\/cwd/)
+    assert.match(egressActivate, /MODEL_AUTHORITY_EGRESS_CAP/)
+    assert.match(egressActivate, /ln -s '\$prev' '\$tmplink'/)
+    assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
+    assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
+  })
+
+  test('release metadata declares both authority migrations and both authority capabilities', async () => {
+    const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(meta.requiredMigrations.includes('0143_model_catalog'))
+    assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
+    assert.ok(meta.capabilities.includes('model_authority_v1'))
+    assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
+    // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
+    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
+    assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
+  test('authority enable is fail-closed: egress enforces before master starts signing', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const body = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const egressRestart = body.indexOf("systemctl restart '$V5_EGRESS_UNIT'")
+    const enforceProbe = body.indexOf('modelAuthority.enforced')
+    const masterRestart = body.indexOf("systemctl restart '$ACTIVE_UNIT'")
+    assert.ok(egressRestart >= 0, 'enable must restart egress')
+    assert.ok(enforceProbe > egressRestart, 'enable must probe egress enforced=true after restart')
+    assert.ok(masterRestart > enforceProbe, 'master may sign only after egress is enforcing')
+  })
+
+  test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const enableStart = source.indexOf('enable_model_authority()')
+    const enableEnd = source.indexOf('disable_model_authority()', enableStart)
+    const enableBody = source.slice(enableStart, enableEnd)
+    assert.ok(enableBody.indexOf('install_model_authority_canary') < enableBody.indexOf('remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1'))
+    assert.ok(enableBody.indexOf('start_model_authority_observation') > enableBody.indexOf('smoke'))
+
+    const cutoverStart = source.indexOf('model_authority_cutover()')
+    const cutoverEnd = source.indexOf('activate_release()', cutoverStart)
+    const cutoverBody = source.slice(cutoverStart, cutoverEnd)
+    assert.match(cutoverBody, /MODEL_AUTHORITY_OBSERVATION_KEY[\s\S]*FOR UPDATE/)
+    assert.match(cutoverBody, /model_security_epoch WHERE id FOR UPDATE/)
+    assert.match(cutoverBody, /observation window shorter than.*MODEL_AUTHORITY_MIN_OBSERVE_SECONDS/)
+    assert.match(cutoverBody, /signed request evidence.*MODEL_AUTHORITY_MIN_REQUESTS/)
+    assert.match(cutoverBody, /catalog canary has no signed usage/)
+    assert.match(cutoverBody, /updated_at-created_at >= interval '5 minutes'/)
+    assert.match(cutoverBody, /emergency activate\/restore drill evidence missing/)
+    assert.match(cutoverBody, /INSERT INTO model_authority_deploy_state\(key,value,description\)/)
+
+    const censusStart = source.indexOf('enable_seed_authority_by_rev()')
+    const censusEnd = source.indexOf('record_model_authority_emergency_drill()', censusStart)
+    const censusBody = source.slice(censusStart, censusEnd)
+    assert.match(censusBody, /docker ps -aq/)
+    assert.match(censusBody, /fleet 含旧\/缺 bundle_rev 容器\(含 stopped\)/)
+  })
+
   test('Caddy fallback is transport-error-only and installer dry-run is inert', async () => {
     const source = await readFile(caddy, 'utf8')
     assert.match(source, /handle_errors/)
@@ -270,6 +474,204 @@ describe('v5 release safety lanes', () => {
     const remoteBody = await readFile(fixture.sshStdinLog, 'utf8')
     assert.match(args, /\/var\/lib\/openclaude-v5\/cutovers 18081\n$/)
     assert.match(remoteBody, /http:\/\/127\.0\.0\.1:\$\{caddy_http_port\}\/healthz/)
+  })
+
+  test('candidate readiness predicate is fail-closed for every required field', () => {
+    const check = (payload: string) => spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'candidate_health_ready "$PAYLOAD"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PAYLOAD: payload },
+    })
+    const valid = '{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}'
+    assert.equal(check(valid).status, 0)
+    for (const invalid of [
+      '{"ok":false,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}',
+      '{"channel":"v5","leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"channel":"v3","leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"leader"},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"owner"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"standby"}}',
+      '{not-json',
+      '',
+    ]) {
+      assert.notEqual(check(invalid).status, 0, `payload must fail closed: ${invalid}`)
+    }
+  })
+
+  test('candidate readiness polling supports delayed success and a hard wall-clock deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-ready-')); dirs.push(dir)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    const delayed = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'slot_priv_healthz() {',
+      '  n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      '  if [ "$n" -lt 3 ]; then echo \'{"ok":true,"channel":"v5","leadership":{"state":"acquiring"},"vip":"released"}\';',
+      '  else echo \'{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}\'; fi',
+      '}',
+      'sleep() { :; }',
+      'wait_for_candidate_ready B 5',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', COUNTER: counter },
+    })
+    assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(delayed.stdout, /candidate=B 已 standby\+VIP released/)
+
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nsleep 3\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+    const started = Date.now()
+    const transportTimedOut = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'wait_for_candidate_ready B 1',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
+    })
+    const elapsed = Date.now() - started
+    assert.notEqual(transportTimedOut.status, 0)
+    assert.ok(elapsed < 2500, `one-second deadline took ${elapsed}ms`)
+    assert.match(transportTimedOut.stderr, /last private healthz: <empty>/)
+
+    const diagnostic = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'slot_priv_healthz() { sleep 1; echo \'{"ok":false,"probe":"last-seen"}\'; }',
+      'wait_for_candidate_ready B 1',
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    assert.notEqual(diagnostic.status, 0)
+    assert.match(diagnostic.stderr, /last private healthz: .*last-seen/)
+  })
+
+  test('candidate readiness dry-run is immediate and canary failure retains pre-READY recovery', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-dry-')); dirs.push(dir)
+    const touched = path.join(dir, 'touched')
+    const started = Date.now()
+    const dry = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=1',
+      'slot_priv_healthz() { touch "$TOUCHED"; return 1; }',
+      'wait_for_candidate_ready B 90',
+      'test ! -e "$TOUCHED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TOUCHED: touched },
+    })
+    assert.equal(dry.status, 0, dry.stderr || dry.stdout)
+    assert.ok(Date.now() - started < 1000)
+
+    const recovery = path.join(dir, 'recovered')
+    const failedStart = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { :; }',
+      'wait_for_candidate_ready() { return 1; }',
+      'recover_canary_prep() { printf "%s" "$1" >"$RECOVERY"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test "$(cat "$RECOVERY")" = B',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', RECOVERY: recovery },
+    })
+    assert.equal(failedStart.status, 0, failedStart.stderr || failedStart.stdout)
+
+    const startFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { return 42; }',
+      'wait_for_candidate_ready() { touch "$WAITED"; return 0; }',
+      'recover_canary_prep() { touch "$RECOVERED"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test ! -e "$WAITED"',
+      'test ! -e "$RECOVERED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        WAITED: path.join(dir, 'waited'),
+        RECOVERED: path.join(dir, 'recovered-after-start-failure'),
+      },
+    })
+    assert.equal(startFailure.status, 0, startFailure.stderr || startFailure.stdout)
+
+    const stopFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=0',
+      'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
+      'wait_for_candidate_ready() { return 1; }',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test "$calls" -eq 2',
+      'test ! -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'cassed-after-stop-failure') },
+    })
+    assert.equal(stopFailure.status, 0, stopFailure.stderr || stopFailure.stdout)
+
+    const dispatcherStopFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
+      'recover_canary_prep() { return 42; }',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'set +e; recover; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test ! -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'dispatcher-cassed-after-stop-failure') },
+    })
+    assert.equal(dispatcherStopFailure.status, 0, dispatcherStopFailure.stderr || dispatcherStopFailure.stdout)
+
+    const missingUnit = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { eval "$*"; }',
+      'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
+      'export -f systemctl',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'recover_canary_prep B',
+      'test ! -e "$SYSTEMCTL_CALLED"',
+      'test -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        SYSTEMCTL_CALLED: path.join(dir, 'systemctl-called-for-missing-unit'),
+        CASSED: path.join(dir, 'cassed-for-missing-unit'),
+      },
+    })
+    assert.equal(missingUnit.status, 0, missingUnit.stderr || missingUnit.stdout)
+
+    const source = await readFile(deploy, 'utf8')
+    const startBody = source.match(/start_candidate_unit_and_wait\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(startBody, /wait_for_candidate_ready "\$cand" 90/)
+    assert.doesNotMatch(startBody, /run "sleep 4"/)
   })
 })
 

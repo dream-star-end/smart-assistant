@@ -34,11 +34,17 @@ import {
   PLATFORM_PROMPT_SLOTS_PATH,
   makePlatformPromptSlotsHandler,
   type PlatformPromptSlotsResponseBody,
+  type PlatformSlotResponse,
 } from "../http/internalPlatformPromptSlots.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { LiteratureSkillConfig } from "../admin/literatureConfig.js";
 import { PricingCache } from "../billing/pricing.js";
 import type { ModelPricing } from "../billing/pricing.js";
+import {
+  ModelCatalogSnapshot,
+  type ModelCatalogEntry,
+  type ModelCatalogPricing,
+} from "../billing/modelCatalog.js";
 
 // ─── Fixtures ──────────────────────────────────────────────────────
 
@@ -532,5 +538,150 @@ describe("internalPlatformPromptSlots — combined behavior", () => {
       res.headers["content-type"] ?? "",
       /application\/json; ?charset=utf-8/,
     );
+  });
+});
+
+// ─── MODEL_HINT · catalog 归一(R1 MAJOR-5)─────────────────────────
+
+/**
+ * `?model=` 可能是 **alias**。alias→canonical 的权威 = model_aliases(catalog),
+ * **不是** PricingCache 内部的 legacy canonicalizeModelId(它只认 anthropic 日期后缀 /
+ * 静态 provider 前缀 → 对 alias 静默 miss,该模型的行为补丁就此丢失)。
+ *
+ * 契约:
+ *   - alias → 命中 canonical 行的 extra_system_prompt,canonicalModelId = catalog canonical;
+ *   - catalog 里不可路由的模型(staged/retired/disabled/无价)→ **不出** MODEL_HINT;
+ *   - catalog fence 失败 → 不出 MODEL_HINT(fail-soft),literature 仍照常出;
+ *   - catalog 未注入 → legacy PricingCache 路径(既有行为不变)。
+ */
+function catalogFixture(): ModelCatalogSnapshot {
+  const mk = (
+    entryId: number,
+    modelId: string,
+    state: "active" | "staged" | "retired" = "active",
+  ): ModelCatalogEntry => ({
+    entryId,
+    modelId,
+    engine: "ccb",
+    providerId: "ark",
+    upstreamModelId: null,
+    contextWindow: 1_000_000,
+    capabilityProfile: {
+      supportsVision: false,
+      reasoning: { supported: ["high"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true },
+    },
+    capabilitySchemaVersion: 1,
+    state,
+    lockVersion: 0,
+  });
+  const px = (modelId: string): ModelCatalogPricing => ({
+    modelId,
+    displayName: modelId,
+    inputPerMtok: 1n,
+    outputPerMtok: 1n,
+    cacheReadPerMtok: 0n,
+    cacheWritePerMtok: 0n,
+    multiplier: "1.000",
+    visibility: "public",
+    sortOrder: 1,
+    defaultEffort: null,
+  });
+  return new ModelCatalogSnapshot({
+    entries: [mk(1, "glm-5.2"), mk(2, "glm-6.0-preview", "staged")],
+    aliases: new Map([
+      ["glm-latest", 1],
+      ["glm-next", 2], // 指向 staged 行
+    ]),
+    pricing: new Map([px("glm-5.2"), px("glm-6.0-preview")].map((p) => [p.modelId, p])),
+    securityEpoch: 5n,
+  });
+}
+
+function catalogSource(s: ModelCatalogSnapshot | Error) {
+  return {
+    async assertFresh(): Promise<ModelCatalogSnapshot> {
+      if (s instanceof Error) throw s;
+      return s;
+    },
+  };
+}
+
+async function hintFor(
+  model: string,
+  opts: { catalog?: ReturnType<typeof catalogSource>; rows?: ModelPricing[] } = {},
+): Promise<PlatformSlotResponse | undefined> {
+  const { repo, auth } = setupValidIdentity();
+  const handler = makePlatformPromptSlotsHandler({
+    identityRepo: repo,
+    pricingCache: makePricing(
+      opts.rows ?? [
+        pricingRow({ model_id: "glm-5.2", extra_system_prompt: "不要过早 yield。" }),
+        pricingRow({ model_id: "glm-6.0-preview", extra_system_prompt: "预览版补丁。" }),
+      ],
+    ),
+    catalog: opts.catalog,
+    readLiteratureSkillConfig: async () => litDisabled,
+  });
+  const req = makeReq({
+    authorization: auth,
+    url: `${PLATFORM_PROMPT_SLOTS_PATH}?model=${encodeURIComponent(model)}`,
+  });
+  const res = makeRes();
+  await handler(req, res, { hostUuid: HOST, boundIp: IP });
+  assert.equal(res.statusCode, 200);
+  return parseBody(res.body).slots.find((s) => s.name === "MODEL_HINT");
+}
+
+describe("internalPlatformPromptSlots — MODEL_HINT alias 经 catalog 归一", () => {
+  test("alias(model_aliases)→ canonical:命中 hint,canonicalModelId = catalog canonical", async () => {
+    const slot = await hintFor("glm-latest", { catalog: catalogSource(catalogFixture()) });
+    assert.ok(slot, "alias 必须能拿到行为补丁");
+    assert.equal(slot.canonicalModelId, "glm-5.2");
+    assert.match(slot.content, /不要过早 yield/);
+  });
+
+  test("同一 alias 在 legacy(无 catalog)路径下 miss —— 正是本次要消灭的漂移", async () => {
+    const slot = await hintFor("glm-latest");
+    assert.equal(slot, undefined);
+  });
+
+  test("canonical id 直传(非 alias)→ 与 legacy 行为等价", async () => {
+    const slot = await hintFor("glm-5.2", { catalog: catalogSource(catalogFixture()) });
+    assert.equal(slot?.canonicalModelId, "glm-5.2");
+  });
+
+  test("catalog 里不可路由(staged)→ 不出 MODEL_HINT(即便 pricing 有文案)", async () => {
+    assert.equal(
+      await hintFor("glm-6.0-preview", { catalog: catalogSource(catalogFixture()) }),
+      undefined,
+    );
+    // 指向 staged 行的 alias 同样不出
+    assert.equal(await hintFor("glm-next", { catalog: catalogSource(catalogFixture()) }), undefined);
+  });
+
+  test("catalog 未知模型 → 不出(不回落 legacy 归一)", async () => {
+    assert.equal(await hintFor("no-such-model", { catalog: catalogSource(catalogFixture()) }), undefined);
+  });
+
+  test("catalog fence 失败 → MODEL_HINT 静默不出(fail-soft),literature 不受影响", async () => {
+    const { repo, auth } = setupValidIdentity();
+    const handler = makePlatformPromptSlotsHandler({
+      identityRepo: repo,
+      pricingCache: makePricing([
+        pricingRow({ model_id: "glm-5.2", extra_system_prompt: "不要过早 yield。" }),
+      ]),
+      catalog: catalogSource(new Error("catalog unknown")),
+      readLiteratureSkillConfig: async () => litEnabled,
+    });
+    const req = makeReq({
+      authorization: auth,
+      url: `${PLATFORM_PROMPT_SLOTS_PATH}?model=glm-5.2`,
+    });
+    const res = makeRes();
+    await handler(req, res, { hostUuid: HOST, boundIp: IP });
+    assert.equal(res.statusCode, 200);
+    const names = parseBody(res.body).slots.map((s) => s.name);
+    assert.deepEqual(names, ["SKILLS_LITERATURE"]);
   });
 });

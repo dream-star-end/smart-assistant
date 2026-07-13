@@ -10,17 +10,59 @@
  * 硬约束(本模块自持不变量):
  *   - **零 import 副作用**:只 export 纯函数/常量,import 本模块不触发任何 fs / env / 网络动作。
  *   - **零平台绝对路径硬依赖**:所有路径/存在性判定经参数或注入式回调传入,便于 host 侧测试。
- *   - **计费/引擎权威不进声明**:validatePlatformSeed 硬拒 model/engine/provider/runnerKind 键
- *     (设计 §4.1 R2-B1:声明化会破坏 master/容器双端同构 → 计费分叉;fail loud 防回潮)。
+ *   - **零跨包 import**:本文件被 host 侧单测(commercial)与容器 entrypoint(tsx)双向消费,
+ *     绝不能 import 绝对路径的 protocol/commercial 源 —— host 上那会解析到 canonical 树而非本
+ *     worktree。跨源一致性(KNOWN_SEED_PROVIDERS ↔ protocol STATIC_KEY_PROVIDERS、seed 声明 ↔
+ *     master platformDefaults)由 runtimeEntrypointPolicy.test.ts 的**一致性锚测试**守护。
+ *
+ * ── schema v2(模型权威批次 §5 阶段 A,2026-07-12)──────────────────────────────
+ * v1 的边界是"计费/引擎权威**不进**声明"(model/engine/provider/runnerKind 全部硬拒,权威在
+ * entrypoint 本地常量 + master 常量双端硬编码)。v2 **反转**该边界:
+ *   - seed agent 的执行三元组 `model` / `provider` / `runnerKind?` **必填于声明**(值校验),
+ *     entrypoint 本地 billing 常量删除 —— 声明成为容器侧唯一权威;
+ *   - `engine` 仍硬拒:engine 由 model 推导(protocol isCodexEngineModel / gateway registry),
+ *     独立声明只会开出第二个权威源;
+ *   - 阶段 A:声明值 == master platformDefaults/protocol 常量(一致性锚测试锁死),行为零变化;
+ *     阶段 B:master 按容器 label 上的 bundle_rev 读**该 rev 的**声明推导计费模型
+ *     (ws/seedDeclarationLoader.ts),滚动窗口新旧容器各按自己的 rev 计费,无分叉。
  */
 import { createHash } from "node:crypto";
 import { resolve, sep } from "node:path";
 
-/** platform-seed.yaml 当前 schema 版本(不兼容变更须 bump + 刷新 emergency tuple)。 */
-export const PLATFORM_SEED_SCHEMA_VERSION = 1;
+/**
+ * platform-seed.yaml 当前 schema 版本(不兼容变更须 bump + 刷新 emergency tuple)。
+ * v2 = 执行三元组(model/provider/runnerKind)声明化。**未知版本一律 fail-loud**
+ * (含旧 v1:v1 文档没有 model/provider,静默接受会让容器 seed 出没有模型的 agent)。
+ */
+export const PLATFORM_SEED_SCHEMA_VERSION = 2;
 
-/** 声明里**禁止**出现的键 —— model/engine 权威留 entrypoint 常量,provider/runnerKind 是引擎路由。 */
-export const REJECTED_SEED_AGENT_KEYS = ["model", "engine", "provider", "runnerKind"] as const;
+/**
+ * 声明里**禁止**出现的键 —— `engine` 由 model 推导(protocol 的 codex 型号表 + gateway registry
+ * 是唯一权威),声明化 = 第二权威源 → 与 model 漂移时无法裁决。model/provider/runnerKind 自 v2
+ * 起改为**必填字段**(见下 ALLOWED_AGENT_KEYS + 值校验),不再在此拒。
+ */
+export const REJECTED_SEED_AGENT_KEYS = ["engine"] as const;
+
+/**
+ * provider 已知集(值校验白名单)。= protocol STATIC_KEY_PROVIDERS 的 id 全集 ∪ {codex-native}。
+ * 本文件不能 import protocol(见文件头"零跨包 import"),故此处是**镜像**,由
+ * runtimeEntrypointPolicy.test.ts 的一致性锚测试与 protocol 锁死(新增静态 provider 必须同步本集)。
+ */
+export const KNOWN_SEED_PROVIDERS: readonly string[] = [
+  "deepseek",
+  "minimax",
+  "ark",
+  "opencodego",
+  "kimi",
+  // 引擎路由 pin(非静态 key provider):gateway registry 按 provider==='codex-native' 硬 pin codex engine。
+  "codex-native",
+];
+
+/**
+ * runnerKind 允许值。gateway registry 对 codex-native 只接受 缺省 / 'app-server'(其余 fail-closed),
+ * 故声明面同样只放行这一个值 —— 声明能表达的 ⊆ 消费端能接受的。
+ */
+export const KNOWN_SEED_RUNNER_KINDS: readonly string[] = ["app-server"];
 
 /**
  * seed id / seed skill 名严格 slug(M5 confinement):小写字母数字起头,后续字母数字或连字符,
@@ -36,9 +78,13 @@ export const PLATFORM_SEED_PERSONA_RE = /^personas\/[a-z0-9][a-z0-9-]{0,63}\.md$
 
 /** 顶层允许字段白名单 —— 未知顶层字段 fail-loud(防 typo 静默失效 / 走私新语义)。 */
 const ALLOWED_TOP_KEYS = new Set(["schemaVersion", "agents", "seedSkills"]);
-/** agent 声明允许字段白名单 —— banned 计费键另有专属报错,其余未知字段 fail-loud。 */
+/** agent 声明允许字段白名单 —— banned 键(engine)另有专属报错,其余未知字段 fail-loud。 */
 const ALLOWED_AGENT_KEYS = new Set([
   "id",
+  // v2 执行三元组(model/provider 必填,runnerKind 可选)。
+  "model",
+  "provider",
+  "runnerKind",
   "persona",
   "forcePersona",
   "permissionMode",
@@ -62,6 +108,12 @@ export const PLATFORM_CODEX_SKILLS_FALLBACK_DIR = "/usr/local/share/openclaude-p
 
 export interface PlatformSeedAgentDecl {
   id: string;
+  /** v2 必填:该 seed agent 的计费/路由模型(容器 agents.yaml 的 agent.model)。 */
+  model: string;
+  /** v2 必填:provider ∈ KNOWN_SEED_PROVIDERS(静态 key provider 或 codex-native 引擎 pin)。 */
+  provider: string;
+  /** v2 可选:仅 'app-server'(codex-native runner 路由);缺省 = 默认 runner。 */
+  runnerKind?: string;
   /** persona 文件相对 seed 根的路径(如 personas/main.md);无 persona 的 agent(如 codex)省略。 */
   persona?: string;
   /** true = 每次 boot 强制刷新 persona(hidden-reviewer 裁决词须稳定同步)。 */
@@ -79,15 +131,40 @@ export interface PlatformSeedDoc {
   seedSkills: Record<string, string[]>;
 }
 
+/**
+ * dev fallback 的**最小内置声明**(仅 bundle/fallback 路径上都没有 platform-seed.yaml 时用,
+ * = 本地开发/裸镜像跑)。生产恒有 bundle(PLATFORM_BUNDLE_REQUIRED_LEAVES 含 seed/platform-seed.yaml,
+ * 缺即 resolvePlatformBundleMount 拒),故本常量在生产**不可达**。
+ *
+ * 它仍是一份"声明"而非散落常量:entrypoint 对有/无 bundle 两条路径走**同一套** buildSeedAgent
+ * 装配(model/provider 一律来自 decl)。值与 master platformDefaults 的一致性同样由一致性锚测试守护。
+ */
+export const DEV_FALLBACK_SEED_DOC: PlatformSeedDoc = {
+  schemaVersion: PLATFORM_SEED_SCHEMA_VERSION,
+  agents: [
+    {
+      id: "main",
+      model: "glm-5.2",
+      provider: "ark",
+      permissionMode: "bypassPermissions",
+      displayName: "全能助手",
+      avatarEmoji: "🧠",
+    },
+  ],
+  seedSkills: {},
+};
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
 /**
- * 校验并规范化 platform-seed.yaml 已解析对象。**fail loud**(M5 confinement 强化):
- *   - 非对象 / schemaVersion 不符 / agents 非数组 → 抛。
+ * 校验并规范化 platform-seed.yaml 已解析对象。**fail loud**(M5 confinement + v2 值校验):
+ *   - 非对象 / schemaVersion 不符(未知版本含旧 v1 一律拒)/ agents 非数组 → 抛。
  *   - 未知顶层字段 / 未知 agent 字段 → 抛(防 typo 静默失效、走私新语义)。
- *   - 任一 agent 声明含 model/engine/provider/runnerKind → 抛(防绕道声明化计费字段)。
+ *   - 任一 agent 声明含 `engine` → 抛(engine 由 model 推导,禁第二权威源)。
+ *   - **v2 执行三元组**:model 缺失/非非空字符串 → 抛;provider ∉ KNOWN_SEED_PROVIDERS → 抛;
+ *     runnerKind 出现但 ∉ KNOWN_SEED_RUNNER_KINDS → 抛(声明能表达的 ⊆ 消费端能接受的)。
  *   - agent id / seedSkills key / skill 名非严格 slug → 抛(id 直接拼进卷内路径)。
  *   - persona 引用非 `personas/<slug>.md` 单层形态(../、绝对路径、子目录)→ 抛。
  *   - 重复 agent id → 抛。
@@ -116,12 +193,12 @@ export function validatePlatformSeed(parsed: unknown): PlatformSeedDoc {
     if (!isRecord(raw) || typeof raw.id !== "string" || raw.id.trim() === "") {
       throw new Error("platform-seed: each agent must be a mapping with a non-empty string id");
     }
-    // banned 计费键**先于** slug/unknown 检查:保留专属报错文案(计费分叉防线,测试锁定)。
+    // banned 键**先于** slug/unknown 检查:保留专属报错文案(第二权威源防线,测试锁定)。
     for (const banned of REJECTED_SEED_AGENT_KEYS) {
       if (Object.prototype.hasOwnProperty.call(raw, banned)) {
         throw new Error(
-          `platform-seed: agent "${raw.id}" declares forbidden key "${banned}" — model/engine/provider/runnerKind ` +
-            `权威只在 entrypoint 常量 + master(计费同构),声明化会造成滚动窗口计费分叉(设计 §4.1)`,
+          `platform-seed: agent "${raw.id}" declares forbidden key "${banned}" — engine 由 model 推导` +
+            `(protocol 型号表 + gateway registry 唯一权威),声明化会开出第二权威源(设计 §5)`,
         );
       }
     }
@@ -135,7 +212,28 @@ export function validatePlatformSeed(parsed: unknown): PlatformSeedDoc {
         throw new Error(`platform-seed: agent "${raw.id}" has unknown field "${key}"`);
       }
     }
-    const decl: PlatformSeedAgentDecl = { id: raw.id };
+    // v2 执行三元组:model/provider 必填 + 值校验;runnerKind 可选且值受限。
+    if (typeof raw.model !== "string" || raw.model.trim() === "") {
+      throw new Error(
+        `platform-seed: agent "${raw.id}" must declare a non-empty string model (schema v2:执行三元组声明化)`,
+      );
+    }
+    if (typeof raw.provider !== "string" || !KNOWN_SEED_PROVIDERS.includes(raw.provider)) {
+      throw new Error(
+        `platform-seed: agent "${raw.id}" provider ${JSON.stringify(raw.provider)} not in known set ` +
+          `(${KNOWN_SEED_PROVIDERS.join("/")})`,
+      );
+    }
+    const decl: PlatformSeedAgentDecl = { id: raw.id, model: raw.model, provider: raw.provider };
+    if (raw.runnerKind !== undefined) {
+      if (typeof raw.runnerKind !== "string" || !KNOWN_SEED_RUNNER_KINDS.includes(raw.runnerKind)) {
+        throw new Error(
+          `platform-seed: agent "${raw.id}" runnerKind ${JSON.stringify(raw.runnerKind)} not supported ` +
+            `(only ${KNOWN_SEED_RUNNER_KINDS.join("/")} or omitted)`,
+        );
+      }
+      decl.runnerKind = raw.runnerKind;
+    }
     if (raw.persona !== undefined) {
       if (typeof raw.persona !== "string") throw new Error(`platform-seed: agent "${raw.id}" persona must be a string path`);
       if (!PLATFORM_SEED_PERSONA_RE.test(raw.persona)) {
@@ -298,27 +396,58 @@ export function decidePersonaWrite(args: {
   return "skip-customized";
 }
 
+/** buildSeedAgent 的 `dynamic` 覆写面 —— 只允许**展示层**字段(执行三元组恒来自声明)。 */
+export interface SeedAgentDynamicFields {
+  /** 如 codex 队长:显示名跟随 protocol 型号目录(按声明的 model 反查),避免型号表/声明两处抄。 */
+  displayName?: string;
+}
+
+/** dynamic 覆写面里**禁止**出现的执行键(声明化回潮防线;运行时硬拒,非仅类型约束)。 */
+const DYNAMIC_FORBIDDEN_KEYS = ["model", "provider", "runnerKind", "engine"] as const;
+
 /**
- * 合并单个 seed agent:yaml 非计费声明 + entrypoint 注入的计费/动态字段 + 已写好的 persona 卷路径。
- * `billing`(model/provider/runnerKind/动态 displayName 等)是**计费/引擎权威**,永远覆盖声明。
- * 产物与旧内联 desiredXAgent 对象字段一致(下游 patchPlatformSeedAgent merge 逻辑零改动)。
+ * 装配单个 seed agent(schema v2):**执行三元组(model/provider/runnerKind)恒取自声明** +
+ * 声明的非计费字段 + 已写好的 persona 卷路径 + 可选的展示层动态覆写。
+ *
+ * v1 → v2 的权威反转:旧签名有个 `billing: Record<string, unknown>` 参数,由 entrypoint 本地常量
+ * 注入 model/provider/runnerKind 并**覆盖**声明;v2 里 entrypoint 已无 billing 常量,声明即权威。
+ * `dynamic` 只留给展示层(displayName),且运行时硬拒任何执行键 —— 防"绕道 dynamic 再造第二权威源"。
+ *
+ * 产物字段与旧内联 desiredXAgent 对象一致(下游 patchPlatformSeedAgent merge 逻辑零改动)。
  */
 export function buildSeedAgent(args: {
   id: string;
-  decl?: PlatformSeedAgentDecl;
-  billing: Record<string, unknown>;
+  decl: PlatformSeedAgentDecl;
   personaPath?: string;
+  dynamic?: SeedAgentDynamicFields;
 }): Record<string, unknown> {
-  const decl = args.decl ?? { id: args.id };
+  const { decl } = args;
+  if (decl.id !== args.id) {
+    throw new Error(`buildSeedAgent: decl id "${decl.id}" != requested id "${args.id}"`);
+  }
+  if (args.dynamic) {
+    for (const forbidden of DYNAMIC_FORBIDDEN_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(args.dynamic, forbidden)) {
+        throw new Error(
+          `buildSeedAgent: dynamic override must not carry execution key "${forbidden}" — ` +
+            `执行权威只在 platform-seed 声明(schema v2),覆盖面仅限展示字段`,
+        );
+      }
+    }
+  }
   const out: Record<string, unknown> = { id: args.id };
   if (args.personaPath !== undefined) out.persona = args.personaPath;
+  // 执行三元组(声明权威)。
+  out.model = decl.model;
+  out.provider = decl.provider;
+  if (decl.runnerKind !== undefined) out.runnerKind = decl.runnerKind;
+  // 非计费声明字段。
   if (decl.permissionMode !== undefined) out.permissionMode = decl.permissionMode;
   if (decl.displayName !== undefined) out.displayName = decl.displayName;
   if (decl.avatarEmoji !== undefined) out.avatarEmoji = decl.avatarEmoji;
   if (decl.toolsets !== undefined) out.toolsets = [...decl.toolsets];
-  for (const [k, v] of Object.entries(args.billing)) {
-    if (v !== undefined) out[k] = v;
-  }
+  // 展示层动态覆写(赢声明的 displayName)。
+  if (args.dynamic?.displayName !== undefined) out.displayName = args.dynamic.displayName;
   return out;
 }
 

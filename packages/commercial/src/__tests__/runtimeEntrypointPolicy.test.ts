@@ -273,41 +273,56 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds main + codex + hidden reviewer agents (v5 纯市场:其它可见子 agent 走市场安装)", () => {
+  test("entrypoint.ts 的 seed 装配全部来自 platform-seed 声明(schema v2:本地 billing 常量已删)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    // 默认模型仍是 glm-5.2 / ark(火山方舟)
+    // ── 模型权威批次 §5 阶段 A:entrypoint **不得再持有任何本地计费/引擎常量** ──
+    // 双端硬编码(entrypoint 常量 + master platformDefaults)正是滚动窗口计费分叉的根;
+    // 权威已下沉到 bundle 内的 platform-seed.yaml 声明,master 阶段 B 按 bundle_rev 读同一份。
+    for (const retired of [
+      "COMMERCIAL_DEFAULT_MODEL",
+      "COMMERCIAL_DEFAULT_PROVIDER",
+      "COMMERCIAL_CODEX_MODEL",
+      "COMMERCIAL_HIDDEN_REVIEWER_MODEL",
+      "COMMERCIAL_HIDDEN_REVIEWER_PROVIDER",
+    ]) {
+      assert.doesNotMatch(
+        src,
+        new RegExp(`const ${retired}\\s*=`),
+        `${retired} 必须已删除 —— 执行三元组权威在 platform-seed.yaml 声明(schema v2),不得回潮为本地常量`,
+      );
+    }
+    // 裸模型字面量回潮防线:entrypoint 源码里不得再出现任何模型 id 字面量。
+    assert.doesNotMatch(src, /"glm-5\.2"/, "entrypoint 不得再硬编码 glm-5.2(权威在 seed 声明)");
+    assert.doesNotMatch(src, /"gpt-5\.6-[a-z]+"/, "entrypoint 不得再硬编码 codex 型号(权威在 seed 声明)");
+
+    // seed 装配:遍历声明 → buildSeedAgent(decl),执行三元组恒由 decl 带入。
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"glm-5\.2"/,
-      "commercial runtime default model must be glm-5.2",
+      /for \(const decl of seedDoc\.agents\)/,
+      "seed 集合必须来自声明(生产 = main + codex + hidden-reviewer;其它可见 agent 走市场安装)",
     );
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
-      "commercial runtime default provider must be ark (火山方舟)",
+      /buildSeedAgent\(\{\s*id: decl\.id,\s*decl,/,
+      "buildSeedAgent 必须以声明为执行权威(不再有 billing 常量注入面)",
     );
-    // 纯市场 + M1b codex 复活 + 团队模式隐藏审查员:
-    // 初始 agents.yaml 只 seed main + codex + hidden-reviewer。其它用户可见 agent 一律走市场安装。
-    // 纯市场 + M1b codex 复活 + 团队模式隐藏审查员:seed 装配恰为 main + codex + hidden-reviewer。
-    // runtime hotcfg 后:非计费字段(persona/permissionMode/displayName/toolsets)来自 platform-seed.yaml
-    // (见 entrypointPlatform.test.ts),此处只守 entrypoint **保留的计费/引擎权威注入** 与 seed 装配。
+    // 容器 config.defaults.model 同样从 main 的声明派生(不再是本地常量)。
     assert.match(
       src,
-      /desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\]/,
-      "v5 纯市场:seed 装配恰为 main + codex + hidden reviewer(其它可见 agent 走市场安装)",
+      /const CONTAINER_DEFAULT_MODEL = seedMainDecl\.model/,
+      "容器默认模型必须取自 main seed agent 的声明",
     );
-    // 计费/引擎权威(model/provider)由 buildSeedAgent 的 billing 常量注入 —— 声明化禁迁(§4.1)。
+    assert.match(src, /model: CONTAINER_DEFAULT_MODEL/, "bootstrap 的 config.defaults.model 必须用声明派生值");
+    // codex 队长显示名:按**声明的 model** 反查 protocol 型号目录(显示名权威留 protocol,不抄第二份)。
     assert.match(
       src,
-      /buildSeedAgent\(\{\s*id:\s*"main",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_DEFAULT_MODEL[\s\S]*?provider:\s*COMMERCIAL_DEFAULT_PROVIDER/,
-      "main billing must inject DEFAULT model+provider (glm-5.2/ark) via buildSeedAgent",
+      /CODEX_ENGINE_MODELS\.find\(\(m\) => m\.id === model\)/,
+      "codex displayName 必须按声明的 model 反查 protocol 型号目录",
     );
-    assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_MODEL\s*=\s*"glm-5\.2"/, "hidden reviewer model must pin GLM");
-    assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER\s*=\s*"ark"/, "hidden reviewer provider must pin ark");
     assert.match(
       src,
-      /buildSeedAgent\(\{\s*id:\s*"hidden-reviewer",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_HIDDEN_REVIEWER_MODEL[\s\S]*?provider:\s*COMMERCIAL_HIDDEN_REVIEWER_PROVIDER/,
-      "hidden reviewer billing must inject pinned GLM/ark via buildSeedAgent",
+      /decl\.provider === "codex-native"/,
+      "codex-native 的动态显示名派生必须按 provider 判定(不硬编码 agent id)",
     );
     // 隐藏 agent 保留 id 修复路径(reserved-id repair)仍在 patchPlatformSeedAgent(merge 逻辑不迁)。
     assert.match(src, /desired\.id === "hidden-reviewer"/, "hidden reviewer must have a dedicated reserved-id repair path");
@@ -316,11 +331,9 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(src, /setField\("toolsets", desired\.toolsets\)/, "hidden reviewer repair must force core-only toolsets");
     assert.match(
       src,
-      /ensureAgentPersona\(\s*"hidden-reviewer",[\s\S]*?force:\s*hrDecl\?\.forcePersona \?\? true/,
-      "hidden reviewer persona must be force-refreshed (forcePersona 来自 yaml,默认 true)",
+      /ensureAgentPersona\(decl\.id, personaContent, \{ force: decl\.forcePersona \?\? false \}\)/,
+      "persona 强制刷新与否由声明的 forcePersona 决定(hidden-reviewer 声明 true,见一致性锚)",
     );
-    // 计费/引擎权威声明化回潮防线:desiredSeedAgents 装配处禁止内联 model/provider 到 yaml 侧。
-    // (validatePlatformSeed 已硬拒声明里出现 model/provider,见 entrypointPlatform.test.ts。)
     // P2 债E 收口:隐藏 agent id 权威已上移 @openclaude/protocol,entrypoint 不再手抄
     // 黑名单,改 import 共享权威;本地 isHiddenSystemAgentId(id:unknown) 只做类型收窄后
     // 委派。守护意图从「entrypoint 自持一份识别逻辑(两源约定同步)」升级为「entrypoint
@@ -468,29 +481,27 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds the codex/GPT-5.6 default agent with app-server routing fields", () => {
+  test("codex/GPT-5.6 默认队长的路由字段(provider/runnerKind)落在 seed 声明里(schema v2)", () => {
+    // 模型权威 §5 阶段 A:codex 的 model/provider/runnerKind 已从 entrypoint 常量迁到 platform-seed.yaml。
+    // provider/runnerKind 是 gateway runner seam 的路由依据,缺失/写错 = 落错 runner(CCB 跑 codex 模型)。
+    // 声明值与 protocol DEFAULT_CODEX_ENGINE_MODEL 的一致性由本文件末尾的**一致性锚**守护;
+    // 这里守的是"声明里确实带着这三个字段",与 entrypoint 源码里显示名的动态派生。
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    assert.match(
-      src,
-      /const COMMERCIAL_CODEX_MODEL\s*=\s*DEFAULT_CODEX_ENGINE_MODEL/,
-      "codex seed model must consume the protocol default",
+    const seedYaml = readFileSync(
+      join(__dirname, "..", "..", "agent-sandbox", "platform-runtime", "seed", "platform-seed.yaml"),
+      "utf-8",
     );
-    // codex 计费/引擎权威(model/provider/runnerKind + 动态 displayName)由 buildSeedAgent 的 billing
-    // 常量注入,声明化禁迁(§4.1)。provider/runnerKind 是 gateway runner seam 路由依据,缺失落错 runner。
+    assert.match(seedYaml, /- id: codex\n\s+model: gpt-5\.6-[a-z]+\n\s+provider: codex-native\n\s+runnerKind: app-server/,
+      "codex 声明必须带 model + codex-native provider + app-server runnerKind(gateway runner 路由依据)");
     assert.match(
       src,
-      /buildSeedAgent\(\{\s*id:\s*"codex",[\s\S]*?billing:\s*\{[\s\S]*?model:\s*COMMERCIAL_CODEX_MODEL[\s\S]*?provider:\s*"codex-native"[\s\S]*?runnerKind:\s*"app-server"/,
-      "codex billing must inject protocol model + codex-native provider + app-server runnerKind via buildSeedAgent",
+      /return `\$\{spec\.displayName\} 队长`/,
+      "codex display name must be derived from the protocol engine display name (按声明的 model 反查)",
     );
-    assert.match(
+    assert.doesNotMatch(
       src,
-      /displayName:\s*`\$\{DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME\} 队长`/,
-      "codex display name must be derived from the protocol engine display name (dynamic, injected as billing)",
-    );
-    assert.match(
-      src,
-      /desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\];/,
-      "codex agent must be part of the seed list",
+      /DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME/,
+      "显示名不得再钉死在 protocol 的『默认型号』常量上 —— 必须按**声明的** model 反查(换型号只改 yaml)",
     );
   });
 
@@ -664,53 +675,98 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
   });
 });
 
-// 平台全局默认模型单一权威源守护:entrypoint.ts(runtime 镜像里本地常量,无法 import master src)
-// 必须与 master 侧 platformDefaults.ts 的 PLATFORM_DEFAULT_MODEL/PROVIDER 一致。改一处忘改另一处 → 这里 fail。
-describe("platform default model — entrypoint ↔ platformDefaults 一致性", () => {
-  function extractConst(src: string, name: string): string {
-    const m = src.match(new RegExp(`${name}\\s*=\\s*"([^"]+)"`));
-    if (!m) throw new Error(`${name} not found in entrypoint.ts`);
-    return m[1];
+// ───────────────────────────────────────────────────────────────────────
+// 模型权威 §5 阶段 A —— **一致性锚**:platform-seed.yaml 声明 == master platformDefaults/protocol 常量
+// ───────────────────────────────────────────────────────────────────────
+//
+// 取代旧的"entrypoint 本地常量 ↔ platformDefaults 双源文本守护"(entrypoint 常量已删)。
+//
+// 阶段 A 的核心保证:seed 声明化后**行为零变化** —— 因为声明的值与 master 判定用的常量字面相等。
+// 这条锚成立,阶段 B(master 改按 bundle_rev 读声明)才是"判定源切换但集合等值"的安全切换;
+// 锚一旦断(有人只改一边),阶段 B 开 flag 的瞬间计费模型就会跳变。
+//
+// 声明是**唯一**权威(容器侧);master 常量在阶段 B 之后退化为回落路径 + 本锚的对照值。
+// 改模型的正确姿势:改 platform-seed.yaml + 同步改 platformDefaults.ts,两边一起过本测试。
+describe("模型权威阶段 A 一致性锚:platform-seed 声明 == master 常量", () => {
+  const SEED_YAML_PATH = join(
+    __dirname, "..", "..", "agent-sandbox", "platform-runtime", "seed", "platform-seed.yaml",
+  );
+  // 非字面量路径 → tsc 不解析(any);tsx 运行时按 .ts 载入(与 entrypointPlatform.test.ts 同款)。
+  const PLATFORM_BUNDLE_PATH = join(
+    __dirname, "..", "..", "agent-sandbox", "platform-runtime", "entrypoint", "platformBundle.ts",
+  );
+
+  async function loadSeed(): Promise<{
+    pb: any;
+    agents: Record<string, { model: string; provider: string; runnerKind?: string; forcePersona?: boolean }>;
+  }> {
+    const pb = await import(PLATFORM_BUNDLE_PATH);
+    const { parse } = await import("yaml");
+    const doc = pb.validatePlatformSeed(parse(readFileSync(SEED_YAML_PATH, "utf-8")));
+    const agents: Record<string, any> = {};
+    for (const a of doc.agents) agents[a.id] = a;
+    return { pb, agents };
   }
 
-  test("entrypoint COMMERCIAL_DEFAULT_MODEL/PROVIDER == platformDefaults 常量", async () => {
-    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    const epModel = extractConst(src, "COMMERCIAL_DEFAULT_MODEL");
-    const epProvider = extractConst(src, "COMMERCIAL_DEFAULT_PROVIDER");
-    const epHiddenReviewerModel = extractConst(src, "COMMERCIAL_HIDDEN_REVIEWER_MODEL");
-    const epHiddenReviewerProvider = extractConst(src, "COMMERCIAL_HIDDEN_REVIEWER_PROVIDER");
-
+  test("main / hidden-reviewer 声明 == platformDefaults;codex 声明 == protocol DEFAULT_CODEX_ENGINE_MODEL", async () => {
+    const { agents } = await loadSeed();
     const {
       PLATFORM_DEFAULT_MODEL,
       PLATFORM_DEFAULT_PROVIDER,
       PLATFORM_HIDDEN_REVIEWER_MODEL,
       PLATFORM_HIDDEN_REVIEWER_PROVIDER,
     } = await import("../platformDefaults.js");
+    const { DEFAULT_CODEX_ENGINE_MODEL } = await import("@openclaude/protocol");
 
     assert.equal(
-      epModel,
+      agents.main?.model,
       PLATFORM_DEFAULT_MODEL,
-      "entrypoint.ts COMMERCIAL_DEFAULT_MODEL 与 platformDefaults.PLATFORM_DEFAULT_MODEL 漂移 —— 两处都要改",
+      "platform-seed main.model 与 platformDefaults.PLATFORM_DEFAULT_MODEL 漂移 —— 两处必须同改",
     );
+    assert.equal(agents.main?.provider, PLATFORM_DEFAULT_PROVIDER, "platform-seed main.provider 漂移");
     assert.equal(
-      epProvider,
-      PLATFORM_DEFAULT_PROVIDER,
-      "entrypoint.ts COMMERCIAL_DEFAULT_PROVIDER 与 platformDefaults.PLATFORM_DEFAULT_PROVIDER 漂移",
-    );
-    assert.equal(
-      epHiddenReviewerModel,
+      agents["hidden-reviewer"]?.model,
       PLATFORM_HIDDEN_REVIEWER_MODEL,
-      "entrypoint.ts COMMERCIAL_HIDDEN_REVIEWER_MODEL 与 platformDefaults.PLATFORM_HIDDEN_REVIEWER_MODEL 漂移",
+      "platform-seed hidden-reviewer.model 与 platformDefaults 漂移",
     );
     assert.equal(
-      epHiddenReviewerProvider,
+      agents["hidden-reviewer"]?.provider,
       PLATFORM_HIDDEN_REVIEWER_PROVIDER,
-      "entrypoint.ts COMMERCIAL_HIDDEN_REVIEWER_PROVIDER 与 platformDefaults.PLATFORM_HIDDEN_REVIEWER_PROVIDER 漂移",
+      "platform-seed hidden-reviewer.provider 与 platformDefaults 漂移",
     );
+    assert.equal(
+      agents.codex?.model,
+      DEFAULT_CODEX_ENGINE_MODEL,
+      "platform-seed codex.model 与 protocol DEFAULT_CODEX_ENGINE_MODEL 漂移(队长型号唯一权威在 protocol 型号表)",
+    );
+    assert.equal(agents.codex?.provider, "codex-native", "codex 必须 pin codex-native(gateway registry 路由依据)");
+    assert.equal(agents.codex?.runnerKind, "app-server", "codex runner 必须是 app-server");
+    assert.equal(agents["hidden-reviewer"]?.forcePersona, true, "隐藏审查员 persona 必须每 boot 强刷(裁决词同步)");
+
     // 当前期望值(2026-06-17 起 glm-5.2 / ark —— boss 决定替换 glm-5.1、队长全切 glm-5.2,接受跨境风险)
     assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.2");
     assert.equal(PLATFORM_DEFAULT_PROVIDER, "ark");
     assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.2");
     assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "ark");
+  });
+
+  test("dev fallback 内置声明 == platformDefaults(无 bundle 的 dev 路径也不许漂)", async () => {
+    const { pb } = await loadSeed();
+    const { PLATFORM_DEFAULT_MODEL, PLATFORM_DEFAULT_PROVIDER } = await import("../platformDefaults.js");
+    const main = pb.DEV_FALLBACK_SEED_DOC.agents.find((a: { id: string }) => a.id === "main");
+    assert.equal(main.model, PLATFORM_DEFAULT_MODEL, "DEV_FALLBACK_SEED_DOC.main.model 漂移");
+    assert.equal(main.provider, PLATFORM_DEFAULT_PROVIDER, "DEV_FALLBACK_SEED_DOC.main.provider 漂移");
+  });
+
+  test("KNOWN_SEED_PROVIDERS == protocol 静态 provider 全集 ∪ {codex-native}(新增 provider 必须同步)", async () => {
+    const { pb } = await loadSeed();
+    const { STATIC_KEY_PROVIDERS } = await import("@openclaude/protocol");
+    const expected = [...STATIC_KEY_PROVIDERS.map((p) => p.id), "codex-native"].sort();
+    assert.deepEqual(
+      [...(pb.KNOWN_SEED_PROVIDERS as string[])].sort(),
+      expected,
+      "platformBundle.KNOWN_SEED_PROVIDERS 是 protocol provider 集的镜像(entrypoint 侧不能 import protocol)——" +
+        "protocol 新增/删除静态 provider 必须同步该镜像,否则新 provider 的 seed 声明会被误拒/漏校验",
+    );
   });
 });

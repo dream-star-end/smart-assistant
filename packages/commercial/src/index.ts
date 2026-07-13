@@ -44,6 +44,10 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, getPool } from "./db/index.js";
+import {
+  assertModelCatalogAdminPoolConfigured,
+  closeModelCatalogAdminPool,
+} from "./db/modelCatalogAdmin.js";
 import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
@@ -124,6 +128,8 @@ import {
   ocGatewayIpForChannel,
   ocInternalProxyPortForChannel,
 } from "./agent-sandbox/v3supervisor.js";
+import { AuthoritySigner } from "./ws/authoritySigner.js";
+import { ModelCatalogCache, PLATFORM_AUX_MODEL_IDS } from "./billing/modelCatalog.js";
 import { getCodexAccountRuntimeChannel, getRuntimeChannel } from "./runtimeChannel.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
@@ -275,6 +281,23 @@ import {
   makeInboxPostHandler,
   type InboxPostHandler,
 } from "./http/internalInboxPost.js";
+import {
+  MODEL_CATALOG_EPOCH_PATH,
+  MODEL_CATALOG_PATH,
+  assertSeedModelsActive,
+  makeModelCatalogHandler,
+  type ModelCatalogHandler,
+} from "./http/internalModelCatalog.js";
+import {
+  authorityKeyringProvider,
+  getModelCatalogCache,
+  isModelAuthorityEnforced,
+  peekModelCatalogCache,
+} from "./billing/modelCatalogRuntime.js";
+import {
+  MASTER_CAPABILITIES,
+  assertModelAuthorityCutoverFloor,
+} from "./runtimeCapabilities.js";
 import {
   makePgSkillEmbedCache,
   makePgSkillSearchLogger,
@@ -532,6 +555,13 @@ export interface CommercialRuntimeStatus {
   containerRuntime: "enabled" | "disabled";
   /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。live getter:反映 LeaderBundle 实时启停。 */
   schedulers: string[];
+  /**
+   * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
+   * deploy 的四面 capability 守卫读 `/healthz` 的 `runtime.capabilities` 判断"这个 master
+   * 版本认不认模型权威协议",据此拒绝把不认的旧版本翻上来(方案 §7 步 5 兼容地板)。
+   * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
+   */
+  capabilities: string[];
   /**
    * P3 leader lease 归属(RFC-v5-dual-master-cohort D4)。healthz 只读断言面:
    * state=ineligible(env kill-switch)|standby(有 env 资格但 desired 非本 slot)|
@@ -925,6 +955,10 @@ export async function registerCommercial(
   } = {},
 ): Promise<RegisterCommercialResult> {
   void app;
+
+  // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
+  // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
+  assertModelAuthorityCutoverFloor();
 
   const cfg = loadConfig();
 
@@ -1451,12 +1485,40 @@ export async function registerCommercial(
         // recordHostRequest 不显式注入,strategy 内部走模块级 default
         // (../compute-pool/hostReqCounter.recordHostRequest)。
       });
+      // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4/§6)──────────────────────
+      //
+      // 进程内唯一一份(modelCatalogRuntime 单例)—— bridge 签发 / 内部下发端点 /
+      // 本 handler 共用同一快照,避免同进程两份快照一新一旧导致 fence 结论互斥。
+      //
+      // **生产的 /v1/messages 不走这个 handler**(走独立 egress 进程,egress/main.ts 里
+      // 有同构装配);这里是非 split 拓扑(dev/测试)的对等实现。
+      //
+      // 失败策略的非对称(有意):
+      //   - enforce(OC_MODEL_AUTHORITY=1)→ 抛,拒启(半开状态 = 全站被 fence 拒,
+      //     不如启动就响亮失败);
+      //   - 影子期 → **fail-soft**:catalog 只是观测面,没有任何判定依赖它;此时因为
+      //     0143 未 apply 就把 master 拒启,是纯自伤(零安全收益)。记 error 继续跑 legacy。
+      const modelAuthorityEnforce = isModelAuthorityEnforced();
+      let modelCatalogForProxy: Awaited<ReturnType<typeof getModelCatalogCache>> | undefined;
+      try {
+        modelCatalogForProxy = await getModelCatalogCache();
+      } catch (err) {
+        if (modelAuthorityEnforce) throw err;
+        console.error(
+          "[commercial] model catalog load failed (shadow mode → legacy 判定继续):",
+          err,
+        );
+      }
       internalProxyHandler = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
         preCheckRedis,
         scheduler,
+        modelCatalog: modelCatalogForProxy,
+        modelAuthorityEnforce,
+        authorityKeyring: authorityKeyringProvider(),
         identity: identityStrategy,
+        loadUserModelAuthz,
         rateLimitRedis,
         // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
         //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
@@ -1568,6 +1630,10 @@ export async function registerCommercial(
         makePlatformPromptSlotsHandler({
           identityRepo,
           pricingCache: pricing,
+          // MODEL_HINT 的 alias→canonical 单一权威 = catalog(model_aliases);
+          // pricingCache 只留 extra_system_prompt 文案。未装配(shadow 期 catalog
+          // 拉不起来)→ handler 内部退 legacy 归一。
+          catalog: modelCatalogForProxy,
         });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
@@ -1742,10 +1808,45 @@ export async function registerCommercial(
           });
         },
       });
+      // /internal/v3/model-catalog{,-epoch} —— 容器 catalog client 的 per-uid 投影下发
+      // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
+      // turn 的判定随 inbound 的签名 descriptor 下来,不经这条路。
+      //
+      // catalog 未装配(影子期 + 0143 未 apply)→ **不注册**:path fall through 到
+      // internalProxyHandler 返 404,容器侧 catalog client 把 404 当"拿不到权威快照" →
+      // 本地路径拒新 turn(fail-closed,与"未部署"等价)。
+      //
+      // **这两条 path 不进 browser→container 代理 allowlist**:那份 allowlist(gateway
+      // bridgeApiAllowlist + commercial containerApiProxy)只收 /api/*,结构上不可能命中
+      // /internal/v3/*;__tests__/internalModelCatalog.test.ts 有显式断言把它钉死。
+      const modelCatalogHandler: ModelCatalogHandler | null = modelCatalogForProxy
+        ? makeModelCatalogHandler({
+            identityRepo,
+            catalog: modelCatalogForProxy,
+            loadUserModelAuthz,
+          })
+        : null;
+      // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
+      // 点开预设助手第一句话就被 gate 拒。**全局**断言(per-uid 下发仍严格过滤、不强塞)。
+      // 影子期只告警(判定还没切过去,不该因此拒启);enforce 期 → 抛。
+      if (modelCatalogForProxy) {
+        try {
+          assertSeedModelsActive(modelCatalogForProxy.current());
+        } catch (err) {
+          if (modelAuthorityEnforce) throw err;
+          console.error("[commercial] seed model catalog check failed (shadow):", err);
+        }
+      }
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (egressSplitEnabled && path === COST_EVENT_PATH) {
           return costEventHandler(req, res);
+        }
+        if (
+          modelCatalogHandler &&
+          (path === MODEL_CATALOG_PATH || path === MODEL_CATALOG_EPOCH_PATH)
+        ) {
+          return modelCatalogHandler(req, res, ctx);
         }
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
@@ -2057,6 +2158,7 @@ export async function registerCommercial(
         preCheckRedis,
         scheduler,
         identity: apiKeyStrategy,
+        loadUserModelAuthz,
         rateLimitRedis: sharedRateLimitRedis,
         // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
         refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
@@ -2250,6 +2352,38 @@ export async function registerCommercial(
     }
   }
 
+  // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7 步 4)────────────────
+  //
+  // flag `OC_MODEL_AUTHORITY=1` 才装配。装配 = 三件事同时生效(方案的原子开关):
+  //   ① supervisor 往新容器注入公钥 keyring + OC_USER_ID + OC_MODEL_AUTHORITY;
+  //   ② bridge 对每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
+  //      超时/不支持 → 拒连接 + stale recycle);
+  //   ③ bridge 对每条 inbound.message 签发并注入 `__oc_model_authority`,codex 分类
+  //      改用 catalog descriptor.engine(与签发同源)。
+  //
+  // fail-closed 启动:catalog 首次快照拉不起来(0143 迁移未 apply / DB 不可达)→ **抛**,
+  // 不允许「flag 开着但 catalog 空转」这种半开状态(那会让每条帧都被 fence 拒,等于全站
+  // 静默不可用,还不如启动就响亮失败)。
+  //
+  // 关 flag → 全部旧行为(容器不 attest 也不会被拒;帧不带 envelope;判定回 baked)。
+  const modelAuthorityFlag = process.env.OC_MODEL_AUTHORITY === "1";
+  let modelAuthoritySigner: AuthoritySigner | undefined;
+  let modelCatalogCache: ModelCatalogCache | undefined;
+  if (modelAuthorityFlag) {
+    // catalog HTTP mutation 必须走独立低权 admin role；缺失/串用 app role 时拒绝启动。
+    await assertModelCatalogAdminPoolConfigured();
+    modelAuthoritySigner = AuthoritySigner.loadOrCreate();
+    // 与 proxy/internal catalog 共用进程级单例，禁止 bridge 另起一份快照。
+    modelCatalogCache = await getModelCatalogCache();
+    // eslint-disable-next-line no-console
+    console.log("[commercial] model authority ENABLED", {
+      activeKeyId: modelAuthoritySigner.activeKeyId,
+      keyIds: modelAuthoritySigner.keyIds.length,
+      securityEpoch: modelCatalogCache.current().securityEpoch.toString(),
+      executionRevision: modelCatalogCache.current().executionRevision.slice(0, 12),
+    });
+  }
+
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
@@ -2329,6 +2463,22 @@ export async function registerCommercial(
       // bridgeSecret 注入后,provisionV3Container 会写 OC_CONTAINER_ID / OC_BRIDGE_NONCE
       // 到容器 env;未注入则容器侧 /healthz 不广播 file-proxy-v1,代理自动 OUTDATED。
       bridgeSecret,
+      // 模型执行权威:公钥 keyring + uid + 强制门注入新容器 env(方案 §7 步 4)。
+      // flag 关 → undefined → 容器 env 完全同旧。
+      ...(modelAuthoritySigner
+        ? {
+            modelAuthority: {
+              // **函数**而非启动期快照:轮换步骤①(addKey)之后新 provision 的容器必须
+              // 立刻拿到含新公钥的 ring —— 传字符串的话要等 master 重启才生效,步骤②
+              // 的 census 永远收敛不到 100%,整条轮换卡死。signer 内部按文件 stat 热重载。
+              keyringEnvAssignment: () => modelAuthoritySigner!.publicKeyringEnvAssignment(),
+              required: true,
+              // 次级模型 master 单向下发(注入 OPENCLAUDE_SECONDARY_MODEL);与签发 authority 的
+              // auxModels 同源,消除 master/runtime 版本 skew 的 WebFetch/WebSearch 403。
+              auxModels: PLATFORM_AUX_MODEL_IDS,
+            },
+          }
+        : {}),
       // V5 runtime tuple(启动期已解析);未配 → undefined → provision/ensureRunning 走旧路径。
       ...(runtimeTuple ? { runtimeTuple } : {}),
       // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
@@ -2745,6 +2895,11 @@ export async function registerCommercial(
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,
+    // `/api/public/models` 的投影权威(方案 §6):active catalog + pricing join,
+    // provider 归属/能力/可用性全部来自 catalog(不再用 route registry 推断)。
+    // 取进程级唯一快照(modelCatalogRuntime 单例;上面 internal-proxy 装配段已 get 过)——
+    // 未装配(skipInternalProxy / catalog 拉不起来的 shadow 期)→ undefined → handler 退 legacy 投影。
+    modelCatalog: peekModelCatalogCache() ?? undefined,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
     // 2026-05-06:admin reset-cooldown 修 bug 时新接的依赖。adminResetCooldown
@@ -3621,6 +3776,44 @@ export async function registerCommercial(
       }
     : undefined;
 
+  /**
+   * 容器不支持 model authority attestation(旧 release / 旧 env)→ 销毁它。
+   *
+   * 复用既有的 codex stale recycle 范式:DB 翻 vanished + docker 清实体,用户下一条
+   * 消息触发 ensureRunning 重新 provision(此时 supervisor 会注入 keyring env)。
+   * best-effort:清不干净也无妨 —— ensureRunning 会撞名字冲突后自己重试清理(与
+   * orphanReconcile 路径一致)。
+   */
+  const recycleUnattestedContainer = (containerId: number, reason: string): void => {
+    if (!v3Deps) return;
+    const depsForRecycle = v3Deps;
+    void (async () => {
+      try {
+        const { rows } = await getPool().query<{
+          id: number;
+          container_internal_id: string | null;
+          host_uuid: string | null;
+        }>(
+          "SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE id = $1",
+          [containerId],
+        );
+        const row = rows[0];
+        if (!row) return;
+        await stopAndRemoveV3Container(depsForRecycle, row);
+        rootLogger.warn("[commercial] recycled container without model-authority attestation", {
+          containerId,
+          reason,
+        });
+      } catch (err) {
+        rootLogger.error("[commercial] model-authority recycle failed", {
+          containerId,
+          reason,
+          err: (err as Error)?.message ?? String(err),
+        });
+      }
+    })();
+  };
+
   // 每槽 read-only incident snapshot：follower 也可在 WS 鉴权后补发，但不 claim/repair/send。
   let incidentSnapshot: IncidentSnapshotHandle | undefined;
   if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
@@ -3636,6 +3829,16 @@ export async function registerCommercial(
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
+    // 模型执行权威(方案 §2):注入即开启 flag —— 签发 + attestation 门 + descriptor 分类。
+    ...(modelAuthoritySigner && modelCatalogCache
+      ? {
+          modelAuthority: {
+            signer: modelAuthoritySigner,
+            catalog: modelCatalogCache,
+            recycleContainer: recycleUnattestedContainer,
+          },
+        }
+      : {}),
     metrics: bridgeMetrics,
     markContainerActivity: markActivityForBridge,
     // 版本握手:cli launcher 注入 dist 目录(spa 才有)→ probe 读 index.html 的
@@ -3662,26 +3865,46 @@ export async function registerCommercial(
     incidentSnapshotProvider: incidentSnapshot
       ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
       : undefined,
-    // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
-    // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
-    // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
-    // 的 sync closure,后续每条 inbound.message 帧 sync 校验。pricing 是进程级
-    // singleton,grants 失败 throw → bridge 关 1011(不做 silent 放行)。
-    loadAllowedModelChecker: async (uid, role) => {
-      const { listGrantsForUser } = await import("./admin/modelGrants.js");
+    // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
+    // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
+    loadAllowedModelChecker: async (uid, requiredEpoch) => {
+      if (modelCatalogCache) {
+        const snapshot = await modelCatalogCache.assertFresh();
+        if (requiredEpoch !== undefined && snapshot.securityEpoch < requiredEpoch) {
+          throw new Error(
+            `catalog snapshot epoch ${snapshot.securityEpoch} < required ${requiredEpoch}`,
+          );
+        }
+        const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+        return (modelId: string) => snapshot.canUseModel({
+          uid: uid.toString(),
+          role: authz.role,
+          grantedModelIds: authz.grantedModelIds,
+        }, modelId);
+      }
+      // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。
       const { canUseModel } = await import("./billing/authzModels.js");
-      const grants = await listGrantsForUser(uid);
-      const grantedSet = new Set(grants.map((g) => g.model_id));
+      const authz = await loadUserModelAuthz(uid);
       return (modelId: string) =>
-        canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
+        canUseModel({ pricing }, { ...authz, modelId });
     },
-    // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 常量 +
+    // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
     // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
     // bridge 用它推导「帧无 model 时该 agentId 的有效模型」参与 codex 分类
     // (与容器 resolveEngine 同构),推导不出且帧无 model → fail-closed 拒帧。
-    loadAgentModelResolver: async (uid) => {
+    //
+    // 模型权威批次 §5 阶段 B(flag OC_SEED_AUTHORITY_BY_REV=1):bridge 在 ensureRunning
+    // 之后把容器 label 上的 bundleRev 传进来 → seed 层按**该 rev 的 platform-seed 声明**
+    // 推导(bundle 全量校验复用 resolvePlatformBundleMount)。rev 缺失 / bundle 坏 →
+    // 抛 SeedDeclarationError → bridge close(1011) fail-closed,绝不回落 master 常量。
+    // flag 未设 → opts.bundleRev 被忽略,走旧的 master 常量路径(零行为变化)。
+    loadAgentModelResolver: async (uid, opts) => {
       const { loadAgentModelResolverForUser } = await import("./ws/agentModelAuthority.js");
-      return loadAgentModelResolverForUser(uid);
+      return loadAgentModelResolverForUser(uid, {
+        bundleRev: opts.bundleRev ?? null,
+        // 与 supervisor / bundle 校验器同一稳定根(见上方 runtimeTuple 装配)。
+        platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
+      });
     },
     loadMasterSessionMessages: async (uid, sessionId) => {
       const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
@@ -4186,6 +4409,7 @@ export async function registerCommercial(
     get schedulers(): string[] {
       return schedulerRegistry.map((s) => s.name);
     },
+    capabilities: [...MASTER_CAPABILITIES],
     get leadership(): LeadershipStatus {
       return leaderLease ? leaderLease.status() : legacyLeadership();
     },
@@ -4342,6 +4566,7 @@ export async function registerCommercial(
       try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
+      await closeModelCatalogAdminPool();
       await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */

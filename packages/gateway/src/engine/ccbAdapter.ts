@@ -255,7 +255,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     this._routeTurn = ctx
     this._activeTurn = ctx
     // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
-    const submitted = this.runner.submit(params.input, params.requestId)
+    // 模型权威批次 §4 — modelAuthority 由 runner.submit 转成本 turn 的
+    // ANTHROPIC_CUSTOM_HEADERS(先于 user message 写 stdin);无值 = 本地路径,
+    // runner 侧自取 local_catalog token 并清位(单一收口,adapter 不做判定)。
+    const submitted = this.runner.submit(params.input, params.requestId, params.modelAuthority)
     return {
       submitted,
       summary,

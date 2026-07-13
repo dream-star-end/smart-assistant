@@ -22,6 +22,7 @@ import { Client } from "pg";
 import { modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
+import { CATALOG_CHANNEL } from "./modelCatalog.js";
 
 export type ModelVisibility = "public" | "admin" | "hidden";
 
@@ -35,6 +36,13 @@ export interface ModelPricing {
   cache_write_per_mtok: bigint;
   /** NUMERIC(6,3),保留字符串形式,避免 JS number 丢精度。T-21 会用它算账。 */
   multiplier: string;
+  /**
+   * 可用性。**权威 = model_catalog.state='active'**(0143 起)。
+   *
+   * 本字段**不是**从 `model_pricing.enabled` 列读来的 —— 那一列自 0143 起退役为 catalog 的
+   * 派生镜像(只为旧 master 回滚 / admin 展示 / 外部 SQL 而留)。load() 直接 JOIN catalog 派生,
+   * 因此即使镜像列被外力写歪,v5 的路由/授权/计费判定也不会跟着歪(单一权威 R2-M7)。
+   */
   enabled: boolean;
   sort_order: number;
   /**
@@ -225,17 +233,27 @@ export class PricingCache {
   };
   onReload: (count: number) => void = () => {};
 
-  /** 一次性加载全表。成功后替换内部 map。 */
+  /**
+   * 一次性加载全表。成功后替换内部 map。
+   *
+   * `enabled` **不读 model_pricing.enabled 镜像列**,而是从 model_catalog 的 active 行派生
+   * (0143 单一权威 R2-M7)。镜像列由 DB trigger 维护、语义上恒等,但运行时判定只认权威 ——
+   * 少一个可被写歪的信任源。
+   */
   async load(): Promise<void> {
     const r = await query<RawRow>(
-      `SELECT model_id, display_name,
-              input_per_mtok::text       AS input_per_mtok,
-              output_per_mtok::text      AS output_per_mtok,
-              cache_read_per_mtok::text  AS cache_read_per_mtok,
-              cache_write_per_mtok::text AS cache_write_per_mtok,
-              multiplier::text           AS multiplier,
-              enabled, sort_order, visibility, extra_system_prompt, default_effort, updated_at
-         FROM model_pricing`,
+      `SELECT p.model_id, p.display_name,
+              p.input_per_mtok::text       AS input_per_mtok,
+              p.output_per_mtok::text      AS output_per_mtok,
+              p.cache_read_per_mtok::text  AS cache_read_per_mtok,
+              p.cache_write_per_mtok::text AS cache_write_per_mtok,
+              p.multiplier::text           AS multiplier,
+              EXISTS (
+                SELECT 1 FROM model_catalog c
+                 WHERE c.model_id = p.model_id AND c.state = 'active'
+              ) AS enabled,
+              p.sort_order, p.visibility, p.extra_system_prompt, p.default_effort, p.updated_at
+         FROM model_pricing p`,
     );
     const next = new Map<string, ModelPricing>();
     for (const row of r.rows) next.set(row.model_id, rowToPricing(row));
@@ -258,6 +276,10 @@ export class PricingCache {
   /**
    * 开始监听 pricing_changed 通知。
    *
+   * 0143 起同时监听 model_catalog_changed:可用性权威已迁到 catalog,catalog 的状态机写
+   * 必须同样让本缓存失效(0143 的 epoch bump 也会补发 pricing_changed 兜底旧 master,
+   * 这里显式再听一路 —— 通道名的单一权威在 modelCatalog.ts)。
+   *
    * @param connectionString 可选,默认 loadConfig().DATABASE_URL
    */
   async startListener(connectionString?: string): Promise<void> {
@@ -265,11 +287,14 @@ export class PricingCache {
     const cs = connectionString ?? loadConfig().DATABASE_URL;
     const c = new Client({ connectionString: cs, application_name: "openclaude-commercial-pricing" });
     c.on("notification", (msg) => {
-      if (msg.channel === "pricing_changed") this.scheduleReload();
+      if (msg.channel === "pricing_changed" || msg.channel === CATALOG_CHANNEL) {
+        this.scheduleReload();
+      }
     });
     c.on("error", (err) => this.onError(err));
     await c.connect();
     await c.query("LISTEN pricing_changed");
+    await c.query(`LISTEN ${CATALOG_CHANNEL}`);
     this.listener = c;
   }
 
