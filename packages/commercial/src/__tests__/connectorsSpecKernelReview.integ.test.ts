@@ -435,6 +435,21 @@ describe('loadVerifiedContract', () => {
     await assert.rejects(loadVerifiedContract(versionId, getPool()), isCode('HASH_MISMATCH'))
   })
 
+  test('审核后篡改 raw_artifact → ARTIFACT_HASH_MISMATCH', async (t) => {
+    if (skipIfNoDb(t)) return
+    const { versionId } = await approved()
+    await query(
+      `UPDATE marketplace_skill_versions
+          SET raw_artifact = (raw_artifact::jsonb || '{"description":"tampered"}'::jsonb)::text
+        WHERE id = $1`,
+      [versionId],
+    )
+    await assert.rejects(
+      loadVerifiedContract(versionId, getPool()),
+      isCode('ARTIFACT_HASH_MISMATCH'),
+    )
+  })
+
   test('篡改 exec_contract_hash 列 → HASH_MISMATCH', async (t) => {
     if (skipIfNoDb(t)) return
     const { versionId } = await approved()

@@ -17,7 +17,9 @@ const ORIGIN = 'https://open.feishu.cn:443'
 
 export const feishuDefault: DefaultConnector = {
   featured: true,
-  category: 'communication',
+  category: 'daily-tools',
+  useCases: ['让 AI 读取飞书会话，并在逐次确认后发送消息'],
+  tags: ['连接器', '飞书', '沟通'],
   spec: {
     id: 'feishu',
     label: '飞书',

@@ -5,8 +5,9 @@
  *   - `byoa`     用户自带 OAuth App:client_id/client_secret 由用户在授权表单直填,进加密 pending draft;
  *   - `platform` 平台注册 OAuth App:凭据存**本表**(按 slug 一行),用户一键授权、什么都不填。
  *
- * 安全不变量(本模块是 platform 模式凭据的**唯一权威**):
- *   - 唯一写入口 = admin API(admin provisioning 本身就是信任闸);未 provision 的 slug 一律
+ * 安全不变量(本模块是 platform 模式凭据的存储权威):
+ *   - 生产唯一写入口 = admin API；它额外校验精确官方工件 + 已签 platform 契约。本模块保留
+ *     可注入 QueryRunner 的低层存储原语供事务与加密测试使用。未 provision 的 slug 一律
  *     fail-closed(oauth/start → OAUTH_NOT_CONFIGURED;catalog 直接不展示该连接器)。
  *   - client_secret **只**出现在:本表密文、内存里的一次交换、发往 **token origin** 的请求体/basic 头。
  *     它**绝不**进用户连接袋(connections.secret_enc)、绝不进 oauth pending draft、绝不进

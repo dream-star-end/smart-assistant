@@ -23,6 +23,12 @@ import { decryptToBuffer, encrypt } from '../../crypto/aead.js'
 import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { getPool } from '../../db/index.js'
 import { type QueryRunner, tx } from '../../db/queries.js'
+import {
+  lockMarketplaceListing,
+  lockMarketplaceUserSlug,
+  lockMarketplaceVersion,
+} from '../../marketplace/locking.js'
+import { assertConnectorBindEntitlement } from '../entitlement.js'
 import { ConnectorError } from '../errors.js'
 import type { ExecContractT } from '../spec/types.js'
 import { connectionAad } from '../store.js'
@@ -122,6 +128,30 @@ export async function insertDeclarativeConnection(
   const execHash = Buffer.from(input.execContractHashHex, 'hex')
 
   return tx(async (c: PoolClient) => {
+    await lockMarketplaceUserSlug(c, input.userId, input.slug)
+    const version = await lockMarketplaceVersion(c, input.connectorVersionId)
+    if (!version || version.slug !== input.slug)
+      throw new ConnectorError('RELINK_REQUIRED', 'connector version changed before bind')
+    const listing = await lockMarketplaceListing(c, input.slug)
+    if (!listing)
+      throw new ConnectorError('RELINK_REQUIRED', 'connector listing disappeared before bind')
+    await assertConnectorBindEntitlement(input.userId, input.connectorVersionId, c)
+
+    const storedExecHash = version.execContractHash?.toString('hex') ?? ''
+    const storedAuthVersion =
+      version.execContract && typeof version.execContract === 'object'
+        ? Number(
+            (version.execContract as { auth_contract_version?: unknown }).auth_contract_version,
+          )
+        : Number.NaN
+    if (
+      version.artifactHash !== input.specHashHex ||
+      storedExecHash !== input.execContractHashHex ||
+      storedAuthVersion !== input.authContractVersion
+    ) {
+      throw new ConnectorError('RELINK_REQUIRED', 'connector pins changed before bind')
+    }
+
     // 撤销同账号旧活跃行(若有)→ 让唯一索引腾位;记 rebound。
     const revoked = await c.query(
       `UPDATE connections

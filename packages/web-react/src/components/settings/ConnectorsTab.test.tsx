@@ -22,6 +22,7 @@ import type {
   ConnectorProvider,
   ConnectorsResponse,
   DeclarativeCatalogEntry,
+  DeclarativeManagementConnector,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { ConnectorsTab } from "./ConnectorsTab";
@@ -41,6 +42,9 @@ vi.mock("../../lib/api", async (importOriginal) => {
       // 声明式引擎（统一界面第二套后端）
       getDeclarativeCatalog: vi.fn(),
       getDeclarativeConnections: vi.fn(),
+      getDeclarativeManagement: vi.fn(),
+      installMarketplace: vi.fn(),
+      uninstallMarketplace: vi.fn(),
       bindDeclarativeConnector: vi.fn(),
       startDeclarativeOauth: vi.fn(),
       unbindDeclarativeConnector: vi.fn(),
@@ -58,6 +62,9 @@ const mockedRename = vi.mocked(api.renameConnector);
 const mockedDelete = vi.mocked(api.deleteConnector);
 const mockedDeclCatalog = vi.mocked(api.getDeclarativeCatalog);
 const mockedDeclConnections = vi.mocked(api.getDeclarativeConnections);
+const mockedDeclManagement = vi.mocked(api.getDeclarativeManagement);
+const mockedInstallMarketplace = vi.mocked(api.installMarketplace);
+const mockedUninstallMarketplace = vi.mocked(api.uninstallMarketplace);
 const mockedDeclBind = vi.mocked(api.bindDeclarativeConnector);
 const mockedDeclOauthStart = vi.mocked(api.startDeclarativeOauth);
 const mockedDeclUnbind = vi.mocked(api.unbindDeclarativeConnector);
@@ -68,6 +75,34 @@ beforeEach(() => {
   // 声明式默认降级为空（现有 v1 用例不受第二套后端影响）；声明式用例各自 override。
   mockedDeclCatalog.mockResolvedValue({ connectors: [] });
   mockedDeclConnections.mockResolvedValue({ connections: [] });
+  // 旧目录 fixture 转成管理中心聚合契约，既保留既有交互覆盖，也钉住新读模型。
+  mockedDeclManagement.mockImplementation(async (session) => {
+    const [catalogResponse, connectionsResponse] = await Promise.all([
+      mockedDeclCatalog(session),
+      mockedDeclConnections(session),
+    ]);
+    return {
+      connectors: catalogResponse.connectors.map((entry) => ({
+        slug: entry.slug,
+        label: entry.label,
+        description: entry.description,
+        installation: "default" as const,
+        official: true,
+        available: true,
+        canBind: true,
+        listingState: "active",
+        installedVersion: "1.0.0",
+        installedVersionId: String(entry.versionId),
+        latestVersion: "1.0.0",
+        latestVersionId: String(entry.versionId),
+        updateAvailable: false,
+        connectionCount: connectionsResponse.connections.filter((c) => c.slug === entry.slug)
+          .length,
+        contract: entry,
+      })),
+      connections: connectionsResponse.connections,
+    };
+  });
 });
 
 const auth: AuthSession = {
@@ -164,6 +199,30 @@ function declEntry(overrides: Partial<DeclarativeCatalogEntry> = {}): Declarativ
     authMode: "static-token",
     requiredBindSources: ["access_token"],
     actions: [{ id: "search", effect: "read" }],
+    ...overrides,
+  };
+}
+
+function managementEntry(
+  overrides: Partial<DeclarativeManagementConnector> = {},
+): DeclarativeManagementConnector {
+  const contract = declEntry();
+  return {
+    slug: contract.slug,
+    label: contract.label,
+    description: contract.description,
+    installation: "marketplace",
+    official: false,
+    available: true,
+    canBind: true,
+    listingState: "active",
+    installedVersion: "1.0.0",
+    installedVersionId: "42",
+    latestVersion: "1.0.0",
+    latestVersionId: "42",
+    updateAvailable: false,
+    connectionCount: 0,
+    contract,
     ...overrides,
   };
 }
@@ -371,6 +430,56 @@ describe("ConnectorsTab 已绑管理", () => {
 });
 
 describe("ConnectorsTab 声明式连接器（统一界面）", () => {
+  test("市场连接器有新版本时从管理中心更新精确版本 pin", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclManagement.mockResolvedValue({
+      connectors: [
+        managementEntry({
+          installedVersion: "1.0.0",
+          installedVersionId: "42",
+          latestVersion: "2.0.0",
+          latestVersionId: "84",
+          updateAvailable: true,
+        }),
+      ],
+      connections: [],
+    });
+    mockedInstallMarketplace.mockResolvedValue({
+      ok: true,
+      slug: "linear",
+      version: "2.0.0",
+      note: "updated",
+    });
+    render(<ConnectorsTab auth={auth} />);
+
+    await screen.findByText("Linear");
+    const card = providerCard("Linear");
+    expect(within(card).getByText("可更新 v2.0.0")).toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "更新" }));
+
+    await waitFor(() => expect(mockedInstallMarketplace).toHaveBeenCalledWith(auth, "84"));
+    await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
+  });
+
+  test("无绑定账号的市场连接器可从管理中心二次确认卸载", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclManagement.mockResolvedValue({
+      connectors: [managementEntry()],
+      connections: [],
+    });
+    mockedUninstallMarketplace.mockResolvedValue({ ok: true });
+    render(<ConnectorsTab auth={auth} />);
+
+    await screen.findByText("Linear");
+    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "卸载" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/卸载连接器「Linear」/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "卸载" }));
+
+    await waitFor(() => expect(mockedUninstallMarketplace).toHaveBeenCalledWith(auth, "linear"));
+    await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
+  });
+
   test("声明式 catalog 渲染成卡片:label/描述/能力标注(只读动作→只读)", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry()] });

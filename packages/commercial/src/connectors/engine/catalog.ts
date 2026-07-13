@@ -1,104 +1,278 @@
 /**
- * 连接器平台 · 声明式目录(可绑连接器)单一权威。
+ * 声明式连接器目录与管理聚合。
  *
- * "有哪些可装的连接器"这一读面被**两处消费**:前端管理界面(declarativeHandlers.handleCatalog)
- * 与 agent 容器 RPC(rpc.ts catalog op,供 AI 发现/搜索)。查询+投影逻辑收口在此,避免两处漂移。
- *
- * 只读、不含任何凭据:目录条目=已 security_approved 且未 revoke 的 kind='connector' 版本,
- * 投影出 slug/label/description/authMode/需填凭据字段(requiredBindSources)/动作(id+effect)。
- * 载入失败(被 revoke/篡改)的版本跳过,不阻塞整目录。
- *
- * **platform 模式 oauth2 连接器的 fail-closed 过滤**(见下 listDeclarativeCatalog):平台未
- * provision OAuth App 的条目直接不进目录 —— 用户不该看见一个"点了必报 503"的连接器,
- * AI 也不该把它推荐出去。判据与 oauth/start 的 503 完全同源(平台表有没有那一行)。
+ * catalog 只返回「官方默认 current + 当前用户精确安装 pin」的可绑定连接器；management
+ * 额外并集活跃绑定，因此已下架/被撤销/已卸载但仍有历史绑定的条目不会从管理界面消失。
  */
-
 import type { Pool } from 'pg'
+import {
+  DEFAULT_CONNECTOR_ARTIFACT_HASHES,
+  DEFAULT_CONNECTOR_SLUGS,
+  isDefaultConnectorArtifact,
+} from '../defaults/index.js'
 import { listPlatformOauthAppSlugs } from '../platformOauthApps.js'
-import { loadVerifiedContractWithMeta } from '../spec/review.js'
+import { type VerifiedContract, loadVerifiedContractWithMeta } from '../spec/review.js'
+import { listDeclarativeConnections } from './binding.js'
 import { oauth2ClientProvisioning, requiredBindSources } from './credentialBag.js'
 
-/** 目录里的一个可绑连接器(前端 + agent 共用形状)。 */
 export interface CatalogEntry {
   versionId: number
   slug: string
   label: string
   description: string
   authMode: string
-  /** bind 时用户要填的凭据字段名(source 名);凭据永不进容器,由用户在管理界面填写。 */
   requiredBindSources: string[]
-  /**
-   * 仅 authMode='oauth2-auth-code' 时存在:client 供给模式。
-   *   'platform' → **一键授权**(平台已 provision App;能出现在目录里就意味着已 provision,
-   *                见下方 fail-closed 过滤)。前端渲染"直接授权"按钮,零表单字段。
-   *   'byoa'     → 用户自带 App:前端渲染 client_id/client_secret 表单(= requiredBindSources)。
-   * **显式给出**,而不是让前端从 `requiredBindSources.length === 0` 反推 —— 那是隐式契约,
-   * 将来任何一个 authMode 的必填字段变空都会让前端误判成"一键授权"。
-   */
   clientProvisioning?: 'byoa' | 'platform'
   actions: Array<{ id: string; effect: string }>
 }
 
 export interface ListCatalogOptions {
-  /** 可选子串过滤(agent "搜索":对 slug/label/description 大小写不敏感匹配)。 */
   query?: string
 }
 
-/** 已审可绑连接器目录(可选子串搜索)。单一权威:前端 REST 与 agent RPC 共用。 */
+function projectContract(meta: VerifiedContract, name: string, description: string): CatalogEntry {
+  const provisioning =
+    meta.contract.authMode === 'oauth2-auth-code'
+      ? oauth2ClientProvisioning(meta.contract)
+      : undefined
+  return {
+    versionId: meta.versionId,
+    slug: meta.slug,
+    label: name,
+    description,
+    authMode: meta.contract.authMode,
+    requiredBindSources: requiredBindSources(meta.contract),
+    ...(provisioning !== undefined ? { clientProvisioning: provisioning } : {}),
+    actions: meta.contract.actions.map((a) => ({ id: a.id, effect: a.effect })),
+  }
+}
+
+/** 前端 REST 与 agent RPC 共用；第三方条目必须是该用户当前活跃 install 的精确 pin。 */
 export async function listDeclarativeCatalog(
   pool: Pool,
+  userId: number,
   opts: ListCatalogOptions = {},
 ): Promise<CatalogEntry[]> {
-  const rows = await pool.query<{ id: string; slug: string; name: string; description: string }>(
+  const rows = await pool.query<{
+    id: string
+    slug: string
+    name: string
+    description: string
+  }>(
     `SELECT v.id::text AS id, v.slug, v.name, v.description
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE l.kind = 'connector'
+        AND l.state = 'active'
+        AND v.status = 'approved'
+        AND l.current_approved_version_id = v.id
         AND v.security_review_state = 'security_approved'
         AND v.functional_verify_state = 'verified'
         AND v.exec_revoked_at IS NULL
+        AND (
+          EXISTS (
+            SELECT 1
+              FROM unnest($2::text[], $3::text[]) AS d(slug, artifact_hash)
+             WHERE d.slug = v.slug AND d.artifact_hash = v.artifact_hash
+          )
+          OR EXISTS (
+            SELECT 1 FROM marketplace_installs i
+             WHERE i.user_id = $1 AND i.slug = v.slug AND i.version_id = v.id
+               AND i.artifact_hash = v.artifact_hash AND i.uninstalled_at IS NULL
+          )
+        )
       ORDER BY v.slug`,
+    [userId, DEFAULT_CONNECTOR_SLUGS, DEFAULT_CONNECTOR_ARTIFACT_HASHES],
   )
   const q = opts.query?.trim().toLowerCase()
   const catalog: CatalogEntry[] = []
-  /**
-   * 已 provision 的平台 OAuth App slug 集合。**懒加载 + 全表一次**:
-   *   - 懒:目录里一个 platform 条目都没有(当前默认连接器全是 static-token/token-exchange)→ 零额外查询;
-   *   - 一次:遇到第一个 platform 条目就一把捞全集缓存进闭包,后续条目查内存 Set —— 不是 N+1。
-   * (表规模 = 平台自建 OAuth App 数,几十条量级,全量取回代价可忽略。)
-   */
   let provisionedSlugs: Set<string> | null = null
   for (const row of rows.rows) {
     try {
       const meta = await loadVerifiedContractWithMeta(Number(row.id), pool)
-      // fail-closed:platform 模式但平台没 provision → 该条目根本不进目录(与 oauth/start 503 同源判据)。
-      const provisioning =
-        meta.contract.authMode === 'oauth2-auth-code'
-          ? oauth2ClientProvisioning(meta.contract)
-          : undefined
-      if (provisioning === 'platform') {
+      const entry = projectContract(meta, row.name, row.description)
+      if (entry.clientProvisioning === 'platform') {
         provisionedSlugs ??= await listPlatformOauthAppSlugs(pool)
         if (!provisionedSlugs.has(row.slug)) continue
       }
-      const entry: CatalogEntry = {
-        versionId: Number(row.id),
-        slug: row.slug,
-        label: row.name,
-        description: row.description,
-        authMode: meta.contract.authMode,
-        requiredBindSources: requiredBindSources(meta.contract),
-        ...(provisioning !== undefined ? { clientProvisioning: provisioning } : {}),
-        actions: meta.contract.actions.map((a) => ({ id: a.id, effect: a.effect })),
-      }
-      // 子串搜索:命中 slug/label/description 任一即保留(空 query → 全量)。
       if (q) {
         const hay = `${entry.slug}\n${entry.label}\n${entry.description}`.toLowerCase()
         if (!hay.includes(q)) continue
       }
       catalog.push(entry)
     } catch {
-      // 某版本载入失败(被 revoke/篡改)→ 跳过,不阻塞整目录。
+      // 单条 contract 不可信时 fail-closed 跳过，不拖垮目录。
     }
   }
   return catalog
+}
+
+export interface ManagementConnectorEntry {
+  slug: string
+  label: string
+  description: string
+  installation: 'default' | 'marketplace' | 'orphan'
+  official: boolean
+  available: boolean
+  canBind: boolean
+  listingState: string
+  installedVersion: string | null
+  installedVersionId: string | null
+  latestVersion: string | null
+  latestVersionId: string | null
+  updateAvailable: boolean
+  connectionCount: number
+  contract: CatalogEntry | null
+}
+
+export interface DeclarativeManagement {
+  connectors: ManagementConnectorEntry[]
+  connections: Array<{
+    id: string
+    slug: string
+    displayName: string
+    connectorVersionId: string | null
+    accountHint?: string
+    createdAt: string
+  }>
+}
+
+/** 管理中心的统一读模型：defaults ∪ active installs ∪ active declarative bindings。 */
+export async function listDeclarativeManagement(
+  pool: Pool,
+  userId: number,
+): Promise<DeclarativeManagement> {
+  const rows = await pool.query<{
+    slug: string
+    state: string | null
+    latest_version_id: string | null
+    latest_version: string | null
+    latest_name: string | null
+    latest_description: string | null
+    latest_status: string | null
+    latest_security_state: string | null
+    latest_functional_state: string | null
+    latest_exec_revoked_at: Date | null
+    installed_version_id: string | null
+    installed_version: string | null
+    installed_artifact_hash: string | null
+    latest_artifact_hash: string | null
+    connection_count: string
+  }>(
+    `WITH wanted AS (
+       SELECT unnest($2::text[]) AS slug
+       UNION
+       SELECT slug FROM marketplace_installs
+        WHERE user_id = $1 AND uninstalled_at IS NULL
+       UNION
+       SELECT provider AS slug FROM connections
+        WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
+     ), active_install AS (
+       SELECT i.slug, i.version_id, i.artifact_hash
+         FROM marketplace_installs i
+        WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
+     ), binding_count AS (
+       SELECT provider AS slug, count(*)::text AS n
+         FROM connections
+        WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
+        GROUP BY provider
+     )
+     SELECT w.slug, l.state,
+            cv.id::text AS latest_version_id, cv.version AS latest_version,
+            cv.name AS latest_name, cv.description AS latest_description,
+            cv.status AS latest_status, cv.security_review_state AS latest_security_state,
+            cv.functional_verify_state AS latest_functional_state,
+            cv.exec_revoked_at AS latest_exec_revoked_at,
+            iv.id::text AS installed_version_id, iv.version AS installed_version,
+            ai.artifact_hash AS installed_artifact_hash, cv.artifact_hash AS latest_artifact_hash,
+            COALESCE(bc.n, '0') AS connection_count
+       FROM wanted w
+       LEFT JOIN marketplace_skill_listings l ON l.slug = w.slug AND l.kind = 'connector'
+       LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
+       LEFT JOIN active_install ai ON ai.slug = w.slug
+       LEFT JOIN marketplace_skill_versions iv ON iv.id = ai.version_id
+       LEFT JOIN binding_count bc ON bc.slug = w.slug
+      ORDER BY w.slug`,
+    [userId, DEFAULT_CONNECTOR_SLUGS],
+  )
+
+  let provisionedSlugs: Set<string> | null = null
+  const connectors: ManagementConnectorEntry[] = []
+  for (const row of rows.rows) {
+    const official =
+      row.latest_artifact_hash !== null &&
+      isDefaultConnectorArtifact(row.slug, row.latest_artifact_hash)
+    const hasInstall = row.installed_version_id !== null
+    const exactInstall =
+      hasInstall &&
+      row.installed_version_id === row.latest_version_id &&
+      row.installed_artifact_hash === row.latest_artifact_hash
+    const executableLatest =
+      row.state === 'active' &&
+      row.latest_status === 'approved' &&
+      row.latest_security_state === 'security_approved' &&
+      row.latest_functional_state === 'verified' &&
+      row.latest_exec_revoked_at === null
+    let verifiedContract: CatalogEntry | null = null
+    let verifiedLatest = false
+    if (executableLatest && row.latest_version_id) {
+      try {
+        const meta = await loadVerifiedContractWithMeta(Number(row.latest_version_id), pool)
+        verifiedContract = projectContract(
+          meta,
+          row.latest_name ?? row.slug,
+          row.latest_description ?? '',
+        )
+        verifiedLatest = true
+      } catch {
+        // lifecycle 列通过但工件 hash / policy / key / signature 任一失效，管理面也标为不可用。
+      }
+    }
+    const available = executableLatest && verifiedLatest
+    let canBind = available && (official || exactInstall)
+    let contract = canBind ? verifiedContract : null
+    if (canBind && contract?.clientProvisioning === 'platform') {
+      // loadVerifiedContractWithMeta 已保证 platform 模式只能是精确官方工件；这里再要求
+      // 平台 App 已真实 provision，避免管理中心展示一个点了必失败的一键授权入口。
+      try {
+        provisionedSlugs ??= await listPlatformOauthAppSlugs(pool)
+        if (!provisionedSlugs.has(row.slug)) {
+          canBind = false
+          contract = null
+        }
+      } catch {
+        canBind = false
+        contract = null
+      }
+    }
+    connectors.push({
+      slug: row.slug,
+      label: row.latest_name ?? row.slug,
+      description: row.latest_description ?? '',
+      installation: official ? 'default' : hasInstall ? 'marketplace' : 'orphan',
+      official,
+      available,
+      canBind,
+      listingState: row.state ?? 'missing',
+      installedVersion: official ? row.latest_version : row.installed_version,
+      installedVersionId: official ? row.latest_version_id : row.installed_version_id,
+      latestVersion: row.latest_version,
+      latestVersionId: row.latest_version_id,
+      updateAvailable:
+        !official && hasInstall && row.latest_version_id !== null && !exactInstall && available,
+      connectionCount: Number.parseInt(row.connection_count, 10) || 0,
+      contract,
+    })
+  }
+
+  const connectionRows = await listDeclarativeConnections(userId, pool)
+  const connections = connectionRows.map((r) => ({
+    id: r.id,
+    slug: r.slug,
+    displayName: r.displayName,
+    connectorVersionId: r.connectorVersionId,
+    ...(typeof r.meta.account_hint === 'string' ? { accountHint: r.meta.account_hint } : {}),
+    createdAt: r.createdAt.toISOString(),
+  }))
+  return { connectors, connections }
 }

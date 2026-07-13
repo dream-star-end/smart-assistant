@@ -22,6 +22,7 @@
 
 import type { Pool } from 'pg'
 import { getPool } from '../../db/index.js'
+import { assertConnectorBindEntitlement } from '../entitlement.js'
 import { ConnectorError } from '../errors.js'
 import type { VerifiedContract } from '../spec/review.js'
 import { loadVerifiedContractWithMeta } from '../spec/review.js'
@@ -83,6 +84,10 @@ export async function bindWithBag(
 ): Promise<BindDeclarativeResult> {
   const { meta } = input
   const contract = meta.contract
+
+  // OAuth 回调与直填绑定都会经过这里。探针发网前再次复核安装/上架资格；最终 INSERT
+  // 事务还会在统一锁域内做最后一次复核，分别封住外部副作用和落库 TOCTOU。
+  await assertConnectorBindEntitlement(input.userId, meta.versionId, pool)
 
   const identity: ConnectorIdentityT | undefined = contract.identity
   if (identity === undefined)
@@ -170,6 +175,7 @@ export async function bindDeclarativeConnector(
   pool: Pool = getPool(),
 ): Promise<BindDeclarativeResult> {
   const meta = await loadVerifiedContractWithMeta(input.connectorVersionId, pool)
+  await assertConnectorBindEntitlement(input.userId, input.connectorVersionId, pool)
   const contract = meta.contract
 
   if (contract.authMode === 'oauth2-auth-code')

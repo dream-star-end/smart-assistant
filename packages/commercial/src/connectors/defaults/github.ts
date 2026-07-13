@@ -22,7 +22,9 @@ const GH_HEADERS = {
 
 export const githubDefault: DefaultConnector = {
   featured: true,
-  category: 'developer',
+  category: 'coding-dev',
+  useCases: ['让 AI 查询当前账号可见的 GitHub 仓库与仓库信息'],
+  tags: ['连接器', 'GitHub', '开发'],
   spec: {
     id: 'github',
     label: 'GitHub',

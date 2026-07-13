@@ -25,10 +25,11 @@ import {
   listDeclarativeConnections,
   revokeDeclarativeConnection,
 } from './engine/binding.js'
-import { listDeclarativeCatalog } from './engine/catalog.js'
+import { listDeclarativeCatalog, listDeclarativeManagement } from './engine/catalog.js'
 import { oauth2ClientProvisioning } from './engine/credentialBag.js'
 import { buildAuthorizeUrl } from './engine/oauth2.js'
 import { clearTokenCache } from './engine/tokenEngine.js'
+import { assertConnectorBindEntitlement } from './entitlement.js'
 import { ConnectorError } from './errors.js'
 import {
   readConnectorsOauthRedirectUri,
@@ -77,10 +78,21 @@ async function handleCatalog(
   deps: CommercialHttpDeps,
   pool: Pool,
 ): Promise<void> {
-  await requireAuth(req, deps.jwtSecret)
+  const user = await requireAuth(req, deps.jwtSecret)
   // 目录查询/投影单一权威(与 agent RPC catalog 共用 listDeclarativeCatalog)。
-  const catalog = await listDeclarativeCatalog(pool)
+  const catalog = await listDeclarativeCatalog(pool, Number(user.id))
   sendJson(res, 200, { connectors: catalog })
+}
+
+/** GET declarative/management —— 管理中心统一连接器+绑定读模型。 */
+async function handleManagement(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: CommercialHttpDeps,
+  pool: Pool,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  sendJson(res, 200, await listDeclarativeManagement(pool, Number(user.id)))
 }
 
 /**
@@ -155,6 +167,7 @@ async function handleOauthStart(
 
   // 载入即验签(4 闸 fail-closed);slug/versionId/provisioning 全取 DB 事实,不信任调用方。
   const meta = await loadVerifiedContractWithMeta(versionId, pool)
+  await assertConnectorBindEntitlement(userId, versionId, pool)
   if (meta.contract.authMode !== 'oauth2-auth-code')
     throw new HttpError(400, 'BAD_REQUEST', 'connector does not use oauth2 authorization code flow')
   const provisioning = oauth2ClientProvisioning(meta.contract)
@@ -265,6 +278,10 @@ export async function dispatchDeclarativeConnectors(
   try {
     if (subSegs.length === 1 && subSegs[0] === 'catalog' && method === 'GET') {
       await handleCatalog(req, res, deps, pool)
+      return
+    }
+    if (subSegs.length === 1 && subSegs[0] === 'management' && method === 'GET') {
+      await handleManagement(req, res, deps, pool)
       return
     }
     if (subSegs.length === 1 && subSegs[0] === 'bind' && method === 'POST') {
