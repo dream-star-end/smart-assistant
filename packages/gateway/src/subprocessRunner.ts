@@ -220,11 +220,12 @@ export function shouldRecycleForVisionCapability(
 }
 
 /**
- * 一个 bridge turn 的两张签名票(master 铸,inbound 帧携带,gateway 验签后经
- * `TurnExecutionDescriptor` 原样带到这里)。本地路径 turn 无此物(见 `resolveTurnUpstreamHeaders`)。
+ * 一个 bridge turn 的已验签凭据束(master 铸,inbound 帧携带,gateway 验签后经
+ * `TurnExecutionDescriptor` 原样带到这里)。短 authority 只用于启动 turn；CCB 上游请求
+ * 仅投影长 lease。本地路径 turn 无此物(见 `resolveTurnRuntime`)。
  */
 export interface TurnModelAuthority {
-  /** 完整签名 authority envelope(base64url)。 */
+  /** 完整签名 authority envelope(base64url；仅作已消费的入站启动凭据保留)。 */
   readonly authorityEnvelope: string
   /** turn lease envelope(base64url;TTL = 最大 turn 窗口 + grace)。 */
   readonly leaseEnvelope: string
@@ -294,7 +295,9 @@ export function _buildUpdateEnvStdinLine(vars: Record<string, string>): string {
 /**
  * 本 turn 的上游凭据(单一收口 —— 所有 CCB submit 都经此,任何调用方都不可能漏清位)。
  *
- *   - bridge turn(有 descriptor)      → authority + lease 两张票;
+ *   - bridge turn(有 descriptor)      → 只挂长命 lease。短 authority 已由 gateway 在
+ *     开始执行前验签 + 单次消费;若继续把它挂到每个 CCB 请求,2min 后它过期会让仍有效的
+ *     lease 一起被 egress 拒绝;
  *   - 本地路径 turn(cron/synthetic/delegate)且 flag 开 → 现取 `x-oc-local-catalog` token
  *     (**每 turn 现取**:它携带 epoch,缓存下来会在安全变更后带旧 epoch 撞 fence);
  *     取不到(master 不可达 / epoch 验不出)→ 抛 → **拒新 turn**(方案 §3:无 baked 回落);
@@ -307,7 +310,7 @@ async function resolveTurnRuntime(
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
     return {
-      headers: { authority: authority.authorityEnvelope, lease: authority.leaseEnvelope },
+      headers: { lease: authority.leaseEnvelope },
       descriptor: authority.executionDescriptor,
     }
   }

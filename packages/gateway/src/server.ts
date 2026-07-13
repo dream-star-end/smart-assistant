@@ -11857,8 +11857,8 @@ export class Gateway {
       // 模型权威批次 §4 —— bridge turn 的上游请求凭据。
       //
       // descriptor 是**验签产物**(_consumeAuthority → attachTurnAuthority),它原样保留了
-      // 两张 envelope 串;这里只是把它们透传到 CCB runner(→ ANTHROPIC_CUSTOM_HEADERS →
-      // 每个 `/v1/messages` 的 x-oc-model-authority / x-oc-turn-lease)。**不重签、不改写**:
+      // 两张 envelope 串。短 authority 已在开始执行前验签 + 单次消费;CCB runner 只把
+      // 长 lease 透传到 ANTHROPIC_CUSTOM_HEADERS → 每个 `/v1/messages`。**不重签、不改写**:
       // egress 的验签根是 master 私钥,容器只是搬运工。
       //
       // 无 descriptor(本地路径 / flag 未开)→ 不传 → runner 写空串清位 + (flag 开时)自取
