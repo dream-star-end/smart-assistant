@@ -188,11 +188,11 @@ export async function claimSelfhealCapability(input: {
       }
       throw new Error(`claim-capability HTTP ${res.status}`)
     }
-    const data = (await res.json()) as { capability?: unknown }
-    if (typeof data.capability !== 'string' || !data.capability) {
-      throw new Error('claim-capability response missing capability')
+    const data = (await res.json()) as { token?: unknown }
+    if (typeof data.token !== 'string' || !data.token) {
+      throw new Error('claim-capability response missing token')
     }
-    return data.capability
+    return data.token
   } finally {
     clearTimeout(timeout)
   }
