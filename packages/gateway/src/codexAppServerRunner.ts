@@ -6,7 +6,7 @@ export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void 
   _spawnFn = fn ?? spawn
 }
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, chownSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -664,6 +664,16 @@ export class CodexAppServerRunner extends EventEmitter {
         delegationDepth: this.opts.delegationDepth,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
+      if (this.opts.runAsUser) {
+        const { gid } = resolveRunAsUserIds(this.opts.runAsUser)
+        // The gateway creates this temp tree as root, while the app-server is
+        // deliberately dropped to ocheal. Grant only root + ocheal-group read
+        // access; never make the model instructions world-readable.
+        chownSync(dir, process.getuid?.() ?? 0, gid)
+        chmodSync(dir, 0o750)
+        chownSync(overrides.instructionsFile, process.getuid?.() ?? 0, gid)
+        chmodSync(overrides.instructionsFile, 0o640)
+      }
       this.sessionDir = dir
       this.cachedOverrides = overrides
       return overrides

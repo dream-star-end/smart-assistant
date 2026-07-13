@@ -893,7 +893,18 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     const calls: { url: string; init?: RequestInit }[] = []
     const impl = (async (url: string | URL, init?: RequestInit) => {
       calls.push({ url: String(url), init })
-      return { ok: true, status: 200, text: async () => '{}', json: async () => ({}) }
+      const repairId = /\/repairs\/([^/]+)\/context/.exec(String(url))?.[1] ?? ''
+      const context = {
+        repairId,
+        incidentId: '88',
+        conditionKey: 'ops.monitor:svc_v5',
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(context),
+        json: async () => context,
+      }
     }) as unknown as typeof fetch
     // Atomic commit model (审计R2 BLOCKER): the outbox row is written INSIDE the
     // claim store's finalizeWithCallback transaction. The in-memory store keeps
@@ -934,7 +945,19 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       fetchImpl: impl,
       deployDriver: async (sha) => {
         deployed.push(sha)
-        return { ok: true, status: 'deployed', detail: { sha } }
+        return {
+          ok: true,
+          status: 'deployed',
+          detail: {
+            sha,
+            healthCheck: {
+              kind: 'deploy-v5-smoke',
+              ok: true,
+              target: 'service:v5',
+              checkedAt: '2026-07-13T02:00:00.000Z',
+            },
+          },
+        }
       },
     })
     function park(repairId: string) {
@@ -1012,6 +1035,22 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     assert.equal(resp.status, 'deployed')
     const done = fx.enqueued.find((e) => e.phase === 'done')
     assert.equal(done?.detail.phase, 'deployed')
+    assert.deepEqual(done?.detail.trusted_attestation, {
+      version: 1,
+      repairId: 'seam-auto',
+      incidentId: '88',
+      conditionKey: 'ops.monitor:svc_v5',
+      target: 'service:v5',
+      action: 'deploy_v5',
+      executionMode: 'fully_automatic',
+      executed: true,
+      remoteResult: {
+        ok: true,
+        target: 'service:v5',
+        healthOk: true,
+        checkedAt: (done?.detail.trusted_attestation as any).remoteResult.checkedAt,
+      },
+    })
     assert.equal(
       fx.enqueued.some((e) => e.phase === 'pending_release'),
       false,

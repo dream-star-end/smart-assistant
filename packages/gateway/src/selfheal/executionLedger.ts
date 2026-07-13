@@ -103,6 +103,9 @@ export function createRepairTurnSink(): RepairTurnSink {
     onEvent: (e: SessionStreamEvent) => {
       if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
       if (e.kind === 'error' && !error) error = e.error
+      if (e.kind === 'final' && e.meta?.isError === true && !error) {
+        error = 'repair turn returned is_error=true'
+      }
     },
     getOutput: () => output,
     getError: () => error,

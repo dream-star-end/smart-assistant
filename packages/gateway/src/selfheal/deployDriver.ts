@@ -307,7 +307,23 @@ export function createDeployDriver(opts: DeployDriverOpts): DeployDriver {
 
       ctx.log.info('deploy driver cutover complete', { sha })
       opts.notify?.(`[selfheal] repair ${who} 自动上线完成。sha=${sha}`)
-      return { ok: true, status: 'deployed', detail: { sha, headAfterDeploy } }
+      return {
+        ok: true,
+        status: 'deployed',
+        detail: {
+          sha,
+          headAfterDeploy,
+          // deploy-v5.sh returns 0 only after its built-in v5 health/public
+          // smoke passes. Preserve that root-observed result for the narrow
+          // trusted user-notice attestation path.
+          healthCheck: {
+            kind: 'deploy-v5-smoke',
+            ok: true,
+            target: 'service:v5',
+            checkedAt: new Date().toISOString(),
+          },
+        },
+      }
     }
   }
 }
