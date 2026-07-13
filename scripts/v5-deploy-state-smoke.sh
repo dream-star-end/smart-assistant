@@ -321,6 +321,41 @@ if rollback_runtime_tuple 1; then ok "D8 master-only 连续第二次反向成功
 eq "D8 连续反向 target=B+master-only" "$(cut -d'|' -f1-5 "$HOTCFG_CAPTURE")" "/rel/newB|img:LIVE|/runtime/LIVE|B|master-only"
 eq "D8 连续反向后 state.previous=A" "$ACTIVE_STATE_PREVIOUS_RELEASE" "/rel/oldA"
 
+# 未记账 P3 master-only 后再做 joint deploy：last.parent/state.previous 是权威 master，
+# 倒数第二条只提供旧 tuple；即使其 master 更老也必须能回滚。A/B 两 slot 都覆盖。
+: > "$HOTCFG_HIST"
+oc_hotcfg_history_append "$HOTCFG_HIST" img:TY id:TY /runtime/TY "" /rel/Y "" joint /rel/olderY >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:TC id:TC /runtime/TC "" /rel/C "" joint /rel/A >/dev/null
+ACTIVE_SLOT=B; ACTIVE_SRC="$(slot_src B)"; ACTIVE_UNIT="$(slot_unit B)"; ACTIVE_PORT="$(slot_port B)"
+ACTIVE_STATE_RELEASE="/rel/C"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/A"; ACTIVE_STATE_LOCK_VERSION=70; FAKE_CURRENT="/rel/C"
+if rollback_runtime_tuple 1; then ok "D8 B slot:未记账 P3→joint 后可回滚"; else bad "D8 B slot joint 应跨 history master gap"; fi
+eq "D8 B slot:parent A + 旧 tuple TY" "$(cut -d'|' -f1-5 "$HOTCFG_CAPTURE")" "/rel/A|img:TY|/runtime/TY|B|joint"
+
+: > "$HOTCFG_HIST"
+oc_hotcfg_history_append "$HOTCFG_HIST" img:TX id:TX /runtime/TX "" /rel/X "" joint /rel/olderX >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:TD id:TD /runtime/TD "" /rel/D "" joint /rel/B >/dev/null
+ACTIVE_SLOT=A; ACTIVE_SRC="$(slot_src A)"; ACTIVE_UNIT="$(slot_unit A)"; ACTIVE_PORT="$(slot_port A)"
+ACTIVE_STATE_RELEASE="/rel/D"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/B"; ACTIVE_STATE_LOCK_VERSION=75; FAKE_CURRENT="/rel/D"
+if rollback_runtime_tuple 1; then ok "D8 A slot:未记账 P3→joint 后可回滚"; else bad "D8 A slot joint 应跨 history master gap"; fi
+eq "D8 A slot:parent B + 旧 tuple TX" "$(cut -d'|' -f1-5 "$HOTCFG_CAPTURE")" "/rel/B|img:TX|/runtime/TX|A|joint"
+
+# N>1 不允许跨未记账 P3 gap：逐边 parent 与下一 history.master 不同即 fail-closed。
+: > "$HOTCFG_HIST"
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T0 id:T0 /runtime/T0 "" /rel/M0 "" joint /rel/older >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T1 id:T1 /runtime/T1 "" /rel/M1 "" joint /rel/GAP >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T2 id:T2 /runtime/T2 "" /rel/M2 "" joint /rel/M1 >/dev/null
+ACTIVE_STATE_RELEASE="/rel/M2"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/M1"; FAKE_CURRENT="/rel/M2"
+if rollback_runtime_tuple 2 >/dev/null 2>&1; then bad "D8 N>1 不应跨断裂 parent"; else ok "D8 N>1 parent 断链 fail-closed"; fi
+
+# 连续 v3 joint 父链则允许 N>1，并恢复目标记录的 master+tuple。
+: > "$HOTCFG_HIST"
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T0 id:T0 /runtime/T0 "" /rel/M0 "" joint /rel/older >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T1 id:T1 /runtime/T1 "" /rel/M1 "" joint /rel/M0 >/dev/null
+oc_hotcfg_history_append "$HOTCFG_HIST" img:T2 id:T2 /runtime/T2 "" /rel/M2 "" joint /rel/M1 >/dev/null
+ACTIVE_STATE_RELEASE="/rel/M2"; ACTIVE_STATE_PREVIOUS_RELEASE="/rel/M1"; ACTIVE_STATE_LOCK_VERSION=78; FAKE_CURRENT="/rel/M2"
+if rollback_runtime_tuple 2; then ok "D8 N>1 连续 v3 joint 父链可回滚"; else bad "D8 N>1 连续父链不应被拒"; fi
+eq "D8 N>1 恢复 M0+T0" "$(cut -d'|' -f1-3,5 "$HOTCFG_CAPTURE")" "/rel/M0|img:T0|/runtime/T0|joint"
+
 # emergency tuple-only：master=A/state.previous=B 不动，只恢复上一 tuple；history v3 明示 tuple-only。
 : > "$HOTCFG_HIST"
 oc_hotcfg_history_append "$HOTCFG_HIST" img:OLD id:OLD /runtime/OLD "" /rel/activeA "" joint /rel/oldB >/dev/null

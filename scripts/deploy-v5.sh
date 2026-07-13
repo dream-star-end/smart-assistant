@@ -1922,7 +1922,7 @@ rollback() {
 # current tuple 对称反向；joint 恢复上一条同源 master+tuple。P3 finalize 未写 history 时由
 # history.last.master!=active 识别为未记账 master-only。N>1 仅允许纯 joint 起点。
 rollback_runtime_tuple() {
-  local n="$1" nth prev last last_master last_kind last_previous image image_id release bundle master source_desc transition_kind state_commit=1
+  local n="$1" nth prev last last_master last_kind last_previous last_schema image image_id release bundle master source_desc transition_kind state_commit=1
   nth=$((n+1))
   local flip_rev prev_src old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
@@ -1936,6 +1936,7 @@ rollback_runtime_tuple() {
   last_master="$(jq -r '.masterRelease // ""' <<<"$last")"
   last_kind="$(jq -r '.transitionKind // "joint"' <<<"$last")"
   last_previous="$(jq -r '.previousMasterRelease // ""' <<<"$last")"
+  last_schema="$(jq -r '.schemaVer // 0' <<<"$last")"
   if [[ "$n" == 1 ]]; then
     if [[ "$last_master" != "$ACTIVE_STATE_RELEASE" ]]; then
       # P3 finalize 不写 tuple history：history 落后于 live master 即为未记账的 master-only 转换。
@@ -1968,9 +1969,23 @@ rollback_runtime_tuple() {
       [[ -n "$master" ]] || { echo "✗ joint 回滚缺 state.previous 权威目标" >&2; return 1; }
       prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
       [[ -n "$prev" ]] || { echo "✗ joint history 缺上一条 committed tuple" >&2; return 1; }
-      if [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" != "$master" ]]; then
-        # v2 没有 transitionKind；同 master 的旧 emergency 条目按 tuple-only 兼容恢复。
-        if [[ "$(jq -r '.schemaVer // 0' <<<"$last")" -le 2 && "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$ACTIVE_STATE_RELEASE" ]]; then
+      if [[ "$last_schema" -ge 3 ]]; then
+        # v3 的 parent 是当前 joint 事件真正的前一 master。中间若有未记账 P3 finalize，
+        # 倒数第二条仍携带正确旧 tuple、但其 master 会更老；此时以 parent/state.previous
+        # 作为 master 目标并保留该 tuple，而不是因 history 中没有 P3 节点而拒绝。
+        [[ -n "$last_previous" && "$last_previous" == "$master" ]] || {
+          echo "✗ joint history 父 master 与 state.previous 不一致(history=${last_previous:-<empty>} state=$master)" >&2
+          return 1
+        }
+        transition_kind="joint"
+        if [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$master" ]]; then
+          source_desc="joint history previous(同条 master+tuple)"
+        else
+          source_desc="joint previous tuple + parent master(跨未记账 P3 master-only)"
+        fi
+      elif [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" != "$master" ]]; then
+        # v2 没有 transitionKind/parent；同 master 的旧 emergency 条目按 tuple-only 兼容恢复。
+        if [[ "$(jq -r '.masterRelease // ""' <<<"$prev")" == "$ACTIVE_STATE_RELEASE" ]]; then
           master="$ACTIVE_STATE_RELEASE"; state_commit=0; transition_kind="tuple-only"
           source_desc="legacy-v2 inferred tuple-only"
         else
@@ -1986,12 +2001,33 @@ rollback_runtime_tuple() {
       return 1
     fi
   else
-    [[ "$last_master" == "$ACTIVE_STATE_RELEASE" && "$last_kind" == joint ]] || {
-      echo "✗ N=$n 相对 history 回滚不安全：history.last.master=$last_master 与 active=$ACTIVE_STATE_RELEASE 不同。请逐次 --rollback=1。" >&2
+    [[ "$last_schema" -ge 3 && "$last_master" == "$ACTIVE_STATE_RELEASE" && "$last_kind" == joint ]] || {
+      echo "✗ N=$n 相对 history 回滚仅接受 v3 连续 joint 血缘：last(schema=$last_schema kind=$last_kind master=$last_master) active=$ACTIVE_STATE_RELEASE。请逐次 --rollback=1。" >&2
       return 1
     }
-    prev="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$nth")"
-    [[ -n "$prev" ]] || { echo "✗ history 无倒数第 $nth 条 committed tuple 可回滚(N=$n)" >&2; return 1; }
+    # 逐边验证 result.previousMasterRelease == 下一条 result.masterRelease；任一 P3
+    # 未记账 gap / tuple-only / master-only 都不能安全跨越，要求操作者逐次 N=1 收敛。
+    local edge=1 edge_cur edge_next edge_parent edge_next_master
+    while [[ "$edge" -le "$n" ]]; do
+      edge_cur="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$edge")"
+      edge_next="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$((edge+1))")"
+      [[ -n "$edge_cur" && -n "$edge_next" ]] || {
+        echo "✗ history 无倒数第 $((edge+1)) 条 committed tuple 可回滚(N=$n)" >&2; return 1; }
+      [[ "$(jq -r '.schemaVer // 0' <<<"$edge_cur")" -ge 3 && "$(jq -r '.transitionKind // ""' <<<"$edge_cur")" == joint ]] || {
+        echo "✗ N=$n 第 $edge 条边不是 v3 joint，拒绝跨轴/旧格式多步回滚" >&2; return 1; }
+      edge_parent="$(jq -r '.previousMasterRelease // ""' <<<"$edge_cur")"
+      edge_next_master="$(jq -r '.masterRelease // ""' <<<"$edge_next")"
+      [[ -n "$edge_parent" && "$edge_parent" == "$edge_next_master" ]] || {
+        echo "✗ N=$n 第 $edge 条 history 父链断裂(parent=${edge_parent:-<empty>} next=$edge_next_master)，请逐次 --rollback=1" >&2
+        return 1
+      }
+      if [[ "$edge" == 1 && "$edge_parent" != "$ACTIVE_STATE_PREVIOUS_RELEASE" ]]; then
+        echo "✗ N=$n 首边 parent=$edge_parent 与 state.previous=$ACTIVE_STATE_PREVIOUS_RELEASE 不一致" >&2
+        return 1
+      fi
+      edge=$((edge+1))
+    done
+    prev="$edge_next"
     master="$(jq -r '.masterRelease // ""' <<<"$prev")"
     transition_kind="joint"
     source_desc="history nth=$nth"
