@@ -273,7 +273,7 @@ assert_required_migrations() { # <metadata-path> <local|remote>
     echo "  [dry-run] 校验 requiredMigrations 已全部记录:$required_csv"
     return 0
   fi
-  ssh "$KL_HOST" bash -s -- "$V5_ENV" "$required_csv" <<'REMOTE'
+  if ssh "$KL_HOST" bash -s -- "$V5_ENV" "$required_csv" <<'REMOTE'
 set -Eeuo pipefail
 env_file="$1"; required_csv="$2"
 [[ -r "$env_file" ]] || { echo "FATAL: env 不可读:$env_file" >&2; exit 1; }
@@ -286,7 +286,12 @@ for migration in "${required[@]}"; do
   [[ "$applied" == 1 ]] || { echo "FATAL: required migration not applied:$migration" >&2; exit 1; }
 done
 REMOTE
-  echo "  ✓ requiredMigrations 已应用:$required_csv"
+  then
+    echo "  ✓ requiredMigrations 已应用:$required_csv"
+  else
+    echo "✗ requiredMigrations 远端校验失败:$required_csv" >&2
+    return 1
+  fi
 }
 
 assert_repo_required_migrations() { assert_required_migrations "$RELEASE_METADATA" local; }
