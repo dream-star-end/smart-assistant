@@ -96,6 +96,22 @@ describe("config.loadConfig", () => {
     assert.equal(cfg.REDIS_URL, "rediss://localhost:6380/0");
   });
 
+  test("OC_RUNTIME_RELEASE treats blank values as a disabled release axis", () => {
+    for (const value of ["", "   \t"]) {
+      const cfg = loadConfig({ ...VALID_ENV, OC_RUNTIME_RELEASE: value });
+      assert.equal(cfg.OC_RUNTIME_RELEASE, undefined);
+    }
+  });
+
+  test("OC_RUNTIME_RELEASE keeps absolute paths and rejects non-empty relative paths", () => {
+    const release = "/var/lib/openclaude-v5/runtime-releases/rel-abc123def456";
+    assert.equal(loadConfig({ ...VALID_ENV, OC_RUNTIME_RELEASE: release }).OC_RUNTIME_RELEASE, release);
+    assert.throws(
+      () => loadConfig({ ...VALID_ENV, OC_RUNTIME_RELEASE: "runtime-releases/rel-abc123def456" }),
+      ConfigError,
+    );
+  });
+
   test("ConfigError carries a structured issues list", () => {
     try {
       loadConfig({});

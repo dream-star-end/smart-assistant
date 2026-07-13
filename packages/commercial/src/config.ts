@@ -329,7 +329,10 @@ const ocRuntimeImage = z.string().trim().min(1).max(256).optional();
  */
 const ocRuntimeImageId = z.string().trim().min(1).max(256).optional();
 const ocPlatformBundle = absolutePath("OC_PLATFORM_BUNDLE");
-const ocRuntimeRelease = absolutePath("OC_RUNTIME_RELEASE");
+const ocRuntimeRelease = z.preprocess(
+  (v) => typeof v === "string" && v.trim() === "" ? undefined : v,
+  absolutePath("OC_RUNTIME_RELEASE"),
+);
 const ocPlatformRoot = absolutePath("OC_PLATFORM_ROOT");
 const ocRuntimeReleasesRoot = absolutePath("OC_RUNTIME_RELEASES_ROOT");
 const ocRuntimeEmergencyTuple = z.string().trim().min(1).max(2048).optional();
