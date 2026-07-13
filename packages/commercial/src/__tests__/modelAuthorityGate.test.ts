@@ -347,7 +347,9 @@ describe("modelAuthorityGate — 每请求 epoch fence", () => {
 describe("modelAuthorityGate — bridge 签名凭据", () => {
   test("合法 authority + lease → 放行,kind=bridge_signed,带 executionRevision/epoch", async () => {
     const s = snap();
-    const { minted, keyring } = signerFor(s);
+    const issuedAt = 1_800_000_000_000;
+    const verifiedAt = issuedAt + 1234;
+    const { minted, keyring } = signerFor(s, {}, { now: issuedAt });
     const d = await enforceModelAuthority({
       catalog: source(s),
       keyring,
@@ -358,6 +360,7 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
       uid: UID,
       containerId: CONTAINER_ID,
       model: "glm-5.2",
+      now: verifiedAt,
     });
     assert.equal(d.authorityKind, "bridge_signed");
     assert.equal(d.canonicalModel, "glm-5.2");
@@ -365,6 +368,8 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
     assert.equal(d.securityEpoch, EPOCH);
     assert.equal(d.projectionRevision, null); // 全局 revision 不下发,bridge 路径无 per-uid 投影
     assert.equal(d.authorityTurnId, minted.payload.authorityTurnId);
+    assert.equal(d.turnLeaseIssuedAtMs, issuedAt);
+    assert.equal(d.turnLeaseVerifiedAtMs, verifiedAt);
     assert.equal(d.descriptor.providerId, "ark");
   });
 
@@ -380,12 +385,15 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
       model: "glm-latest",
     });
     assert.equal(d.canonicalModel, "glm-5.2");
+    assert.equal(d.turnLeaseIssuedAtMs, null);
+    assert.equal(d.turnLeaseVerifiedAtMs, null);
   });
 
   test("长 turn:authority 已过期、lease 仍有效 → 放行(R4-M1)", async () => {
     const s = snap();
-    const { minted, keyring } = signerFor(s);
-    const later = Date.now() + AUTHORITY_TTL_MS + 60_000; // 超过 authority TTL,远未到 lease TTL
+    const issuedAt = 1_800_000_000_000;
+    const { minted, keyring } = signerFor(s, {}, { now: issuedAt });
+    const later = issuedAt + AUTHORITY_TTL_MS + 60_000; // 超过 authority TTL,远未到 lease TTL
     const d = await enforceModelAuthority({
       catalog: source(s),
       keyring,
@@ -396,6 +404,8 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
       now: later,
     });
     assert.equal(d.authorityKind, "bridge_signed");
+    assert.equal(d.turnLeaseIssuedAtMs, issuedAt);
+    assert.equal(d.turnLeaseVerifiedAtMs, later);
     // 同一时刻带**过期的 authority** → 必须拒(不能"有 lease 就不看 authority 的过期")
     await expectReject(
       enforceModelAuthority({
@@ -687,6 +697,8 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
     // 落库的那一份 = 按已认证 uid 的当前 role/grants + 本请求快照重算(与 /internal/v3/model-catalog 同源)
     assert.equal(d.projectionRevision, expected);
     assert.equal(d.claimedProjectionRevision, expected);
+    assert.equal(d.turnLeaseIssuedAtMs, null);
+    assert.equal(d.turnLeaseVerifiedAtMs, null);
   });
 
   test("visibility 授权取 fenced snapshot：旧 PricingCache 即使仍 public 也不能放行 admin 模型", async () => {

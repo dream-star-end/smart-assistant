@@ -82,8 +82,11 @@ candidate 有界 fail-closed readiness/recovery）
    作为最终部署。
 7. 用 `OC_EMBED_SOURCE=1` 构建并登记 emergency embedded image，完成激活/恢复 drill 并留证。
 8. `--model-authority-preflight` 四面全绿后，先 egress enforce，再 master 签发；开始 observation。
-9. 收集至少 15 分钟、10 个 signed request、1 个 canary usage、1 个已提交且超过 5 分钟的
-   CCB authority turn。
+9. 收集至少 15 分钟、10 个 signed request、1 个 canary usage，并由受限 canary admin
+   实跑 1 个多请求 CCB turn：同一条已验签 lease 在签发后 2 分钟内有早期 committed request，
+   且 5 分钟后仍有另一条不同 request_id 的 committed request。该门是可信运维 rollout
+   liveness 证据，不是抵抗已攻陷 admin 容器的远程证明；安全授权仍由签名与逐请求 epoch
+   fence 保证。
 10. 枚举全部 v5 runtime（含 stopped）完成 bundle-rev census，启用 seed authority-by-rev。
 11. 执行 `--model-authority-cutover` 原子锁 observation + epoch 并置位 DB/env marker。
 12. smoke：v5/public/egress/Caddy/三 DB 角色/证据行；确认 v3 仍 retired，观察日志与监控。

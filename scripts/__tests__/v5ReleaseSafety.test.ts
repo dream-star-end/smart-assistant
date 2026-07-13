@@ -13,6 +13,7 @@ const deploy = path.join(root, 'scripts/deploy-v5.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
+const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -726,6 +727,8 @@ describe('v5 release safety lanes', () => {
         authority_kind TEXT
       );
       CREATE TABLE ${schema}.request_finalize_journal (
+        request_id TEXT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
         state TEXT NOT NULL,
         ctx JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
@@ -869,22 +872,79 @@ describe('v5 release safety lanes', () => {
     const prepareCutover = psql(`
       INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
       SELECT 'glm-5.2','revision-' || n,3,'bridge_signed' FROM generate_series(1,9) AS n;
-      INSERT INTO request_finalize_journal(state,ctx,created_at,updated_at)
-      VALUES (
-        'committed',
-        '{"source":"ccb_proxy","authorityKind":"bridge_signed","executionRevision":"revision-long","securityEpoch":"3"}',
-        NOW()-interval '6 minutes',NOW()
-      );
       INSERT INTO model_catalog(entry_id,model_id,state)
       VALUES (1,'oc-catalog-canary-glm52','active');
       INSERT INTO model_aliases(alias,entry_id) VALUES ('oc-catalog-canary',1);
       UPDATE model_authority_deploy_state SET value=value || jsonb_build_object(
         'started_at',(NOW()-interval '901 seconds')::text
       ) WHERE key='observation';
+
+      -- 这些行逐项模拟旧证据/畸形字段/错误绑定/reconciler 晚改 updated_at。
+      -- 它们都不得满足“同一 canary lease 的早期请求 + 5min 后另一请求”。
+      WITH t AS (
+        SELECT floor(extract(epoch FROM NOW())*1000)::bigint-360000 AS issued,
+               floor(extract(epoch FROM NOW())*1000)::bigint-1260000 AS pre_observation_issued
+      )
+      INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,created_at,updated_at)
+      SELECT * FROM (
+        SELECT 'legacy-no-lease',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','legacy','securityEpoch','3'),
+          NOW()-interval '6 minutes',NOW()
+        FROM t
+        UNION ALL SELECT 'malformed-early',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','bad-time','securityEpoch','3','authorityTurnId',repeat('a',32),'turnLeaseIssuedAtMs','not-a-number','turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'malformed-late',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','bad-time','securityEpoch','3','authorityTurnId',repeat('a',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'wrong-epoch-early',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-epoch','securityEpoch','4','authorityTurnId',repeat('b',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'wrong-epoch-late',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-epoch','securityEpoch','4','authorityTurnId',repeat('b',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'empty-revision-early',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','','securityEpoch','3','authorityTurnId',repeat('c',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'empty-revision-late',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','','securityEpoch','3','authorityTurnId',repeat('c',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'wrong-user-early',43,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-user','securityEpoch','3','authorityTurnId',repeat('d',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'wrong-user-late',43,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-user','securityEpoch','3','authorityTurnId',repeat('d',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'wrong-model-early',42,'committed',
+          jsonb_build_object('model','glm-5.2','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-model','securityEpoch','3','authorityTurnId',repeat('e',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'wrong-model-late',42,'committed',
+          jsonb_build_object('model','glm-5.2','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','wrong-model','securityEpoch','3','authorityTurnId',repeat('e',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'single-request-only',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','single','securityEpoch','3','authorityTurnId',repeat('f',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+          NOW()-interval '30 seconds',NOW() FROM t
+        UNION ALL SELECT 'reconciler-early',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','reconciled','securityEpoch','3','authorityTurnId',repeat('1',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'reconciler-late-update',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','reconciled','securityEpoch','3','authorityTurnId',repeat('1',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+2000),
+          NOW()-interval '6 minutes',NOW() FROM t
+        UNION ALL SELECT 'pre-observation-verified-early',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','pre-observation','securityEpoch','3','authorityTurnId',repeat('3',32),'turnLeaseIssuedAtMs',pre_observation_issued,'turnLeaseVerifiedAtMs',pre_observation_issued+1000),
+          NOW()-interval '10 minutes',NOW() FROM t
+        UNION ALL SELECT 'pre-observation-verified-late',42,'committed',
+          jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','pre-observation','securityEpoch','3','authorityTurnId',repeat('3',32),'turnLeaseIssuedAtMs',pre_observation_issued,'turnLeaseVerifiedAtMs',pre_observation_issued+301000),
+          NOW()-interval '10 minutes',NOW() FROM t
+      ) AS rows(request_id,user_id,state,ctx,created_at,updated_at);
     `, true)
     assert.equal(prepareCutover.status, 0, prepareCutover.stderr || prepareCutover.stdout)
 
-    const cutover = runShell([
+    const beforeLongEvidence = runShell(['model_authority_observation_status'])
+    assert.equal(beforeLongEvidence.status, 0, beforeLongEvidence.stderr || beforeLongEvidence.stdout)
+    assert.equal(JSON.parse(beforeLongEvidence.stdout).long_ccb_turns, 0)
+
+    const cutoverBody = [
       'remote_env_get() { case "$1" in "$MODEL_AUTHORITY_FLAG_KEY"|OC_SEED_AUTHORITY_BY_REV) printf 1 ;; *) printf "" ;; esac; }',
       'model_authority_preflight() { return 0; }',
       `model_authority_fleet_census() { printf "%s\\n" '[{"id":"test-container","bundle_rev":"${bundleRev}"}]'; }`,
@@ -894,7 +954,27 @@ describe('v5 release safety lanes', () => {
       'remote_env_set() { return 0; }',
       'model_authority_cutover_done() { return 0; }',
       'model_authority_cutover',
-    ])
+    ]
+    const missingLong = runShell(cutoverBody)
+    assert.notEqual(missingLong.status, 0)
+    assert.match(missingLong.stderr, /no committed multi-request CCB turn/)
+
+    const addValidLongTurn = psql(`
+      WITH t AS (SELECT floor(extract(epoch FROM NOW())*1000)::bigint-360000 AS issued)
+      INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,created_at,updated_at)
+      SELECT 'valid-early',42,'committed',
+        jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','valid-long','securityEpoch','3','authorityTurnId',repeat('2',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+1000),
+        NOW()-interval '6 minutes',NOW() FROM t
+      UNION ALL SELECT 'valid-late',42,'committed',
+        jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','valid-long','securityEpoch','3','authorityTurnId',repeat('2',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
+        NOW()-interval '30 seconds',NOW() FROM t
+    `, true)
+    assert.equal(addValidLongTurn.status, 0, addValidLongTurn.stderr || addValidLongTurn.stdout)
+    const afterLongEvidence = runShell(['model_authority_observation_status'])
+    assert.equal(afterLongEvidence.status, 0, afterLongEvidence.stderr || afterLongEvidence.stdout)
+    assert.equal(JSON.parse(afterLongEvidence.stdout).long_ccb_turns, 1)
+
+    const cutover = runShell(cutoverBody)
     assert.equal(cutover.status, 0, cutover.stderr || cutover.stdout)
     const cutoverMarker = psql(
       "SELECT value->>'release_sha' FROM model_authority_deploy_state WHERE key='cutover'",
@@ -1104,6 +1184,7 @@ describe('v5 release safety lanes', () => {
 
   test('authority cutover is evidence-bound and linearized on observation + epoch locks', async () => {
     const source = await readFile(deploy, 'utf8')
+    const proxySource = await readFile(anthropicProxy, 'utf8')
     const enableStart = source.indexOf('enable_model_authority()')
     const enableEnd = source.indexOf('disable_model_authority()', enableStart)
     const enableBody = source.slice(enableStart, enableEnd)
@@ -1118,9 +1199,16 @@ describe('v5 release safety lanes', () => {
     assert.match(cutoverBody, /observation window shorter than.*MODEL_AUTHORITY_MIN_OBSERVE_SECONDS/)
     assert.match(cutoverBody, /signed request evidence.*MODEL_AUTHORITY_MIN_REQUESTS/)
     assert.match(cutoverBody, /catalog canary has no signed usage/)
-    assert.match(cutoverBody, /updated_at-created_at >= interval '5 minutes'/)
+    assert.match(cutoverBody, /turnLeaseIssuedAtMs/)
+    assert.match(cutoverBody, /turnLeaseVerifiedAtMs/)
+    assert.match(cutoverBody, /late\.request_id<>early\.request_id/)
+    assert.match(cutoverBody, /user_id::text=v_obs->>'canary_uid'/)
+    assert.match(cutoverBody, /ctx->>'model'=v_obs->>'canary_model'/)
     assert.match(cutoverBody, /emergency activate\/restore drill evidence missing/)
     assert.match(cutoverBody, /INSERT INTO model_authority_deploy_state\(key,value,description\)/)
+    assert.match(proxySource, /authorityTurnId: gate\.authorityTurnId/)
+    assert.match(proxySource, /turnLeaseIssuedAtMs: gate\.turnLeaseIssuedAtMs/)
+    assert.match(proxySource, /turnLeaseVerifiedAtMs: gate\.turnLeaseVerifiedAtMs/)
 
     const censusStart = source.indexOf('enable_seed_authority_by_rev()')
     const censusEnd = source.indexOf('record_model_authority_emergency_drill()', censusStart)

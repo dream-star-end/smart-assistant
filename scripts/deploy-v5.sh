@@ -1202,6 +1202,10 @@ MODEL_AUTHORITY_CANARY_MODEL="oc-catalog-canary-glm52"
 MODEL_AUTHORITY_CANARY_ALIAS="oc-catalog-canary"
 MODEL_AUTHORITY_MIN_OBSERVE_SECONDS=900
 MODEL_AUTHORITY_MIN_REQUESTS=10
+# long-turn rollout 证据:同一 lease 须有一条短 authority TTL 内的早期请求，且 5min 后
+# 仍有另一条请求通过 egress 验签并提交。前者须与 protocol AUTHORITY_TTL_MS(120s)同步。
+MODEL_AUTHORITY_EARLY_REQUEST_MAX_MS=120000
+MODEL_AUTHORITY_LONG_TURN_MIN_MS=300000
 
 # 远端 env 取键值(末行为准,与 hotcfg env_get 同法)。缺失 → 空。
 remote_env_get() {
@@ -1725,13 +1729,39 @@ record_model_authority_emergency_drill() {
 
 model_authority_observation_status() {
   local raw
-  raw="$(remote_model_authority_psql "WITH o AS (SELECT value FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY')
+  raw="$(remote_model_authority_psql "WITH o AS (SELECT value FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY'),
+  lease_requests AS (
+    SELECT j.request_id,j.ctx->>'authorityTurnId' AS authority_turn_id,
+      CASE WHEN jsonb_typeof(j.ctx->'turnLeaseIssuedAtMs')='number'
+           THEN (j.ctx->>'turnLeaseIssuedAtMs')::numeric END AS issued_ms,
+      CASE WHEN jsonb_typeof(j.ctx->'turnLeaseVerifiedAtMs')='number'
+           THEN (j.ctx->>'turnLeaseVerifiedAtMs')::numeric END AS verified_ms,
+      floor(extract(epoch FROM (o.value->>'started_at')::timestamptz)*1000)::numeric AS observation_started_ms
+    FROM request_finalize_journal j,o
+    WHERE j.created_at >= (o.value->>'started_at')::timestamptz
+      AND j.state='committed' AND j.user_id::text=o.value->>'canary_uid'
+      AND j.ctx->>'model'=o.value->>'canary_model'
+      AND j.ctx->>'source'='ccb_proxy' AND j.ctx->>'authorityKind'='bridge_signed'
+      AND NULLIF(j.ctx->>'executionRevision','') IS NOT NULL
+      AND j.ctx->>'securityEpoch'=o.value->>'security_epoch'
+  ), long_turns AS (
+    SELECT DISTINCT late.authority_turn_id
+    FROM lease_requests early JOIN lease_requests late
+      ON late.authority_turn_id=early.authority_turn_id
+     AND late.request_id<>early.request_id AND late.issued_ms=early.issued_ms
+    WHERE early.authority_turn_id ~ '^[0-9a-f]{32}$'
+      AND early.verified_ms>=early.observation_started_ms
+      AND late.verified_ms>=late.observation_started_ms
+      AND early.verified_ms>=early.issued_ms
+      AND early.verified_ms<early.issued_ms+$MODEL_AUTHORITY_EARLY_REQUEST_MAX_MS
+      AND late.verified_ms>=late.issued_ms+$MODEL_AUTHORITY_LONG_TURN_MIN_MS
+  )
   SELECT jsonb_build_object(
     'observation',(SELECT value FROM o),
     'elapsed_seconds',COALESCE((SELECT floor(extract(epoch FROM (NOW()-(value->>'started_at')::timestamptz)))::bigint FROM o),0),
     'signed_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.authority_kind='bridge_signed' AND u.execution_revision IS NOT NULL AND u.security_epoch::text=o.value->>'security_epoch'),0),
     'canary_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.model=o.value->>'canary_model' AND u.authority_kind='bridge_signed'),0),
-    'long_ccb_turns',COALESCE((SELECT count(*) FROM request_finalize_journal j,o WHERE j.created_at >= (o.value->>'started_at')::timestamptz AND j.state='committed' AND j.ctx->>'source'='ccb_proxy' AND j.ctx->>'authorityKind'='bridge_signed' AND j.updated_at-j.created_at >= interval '5 minutes'),0),
+    'long_ccb_turns',COALESCE((SELECT count(*) FROM long_turns),0),
     'minimums',jsonb_build_object('elapsed_seconds',$MODEL_AUTHORITY_MIN_OBSERVE_SECONDS,'signed_requests',$MODEL_AUTHORITY_MIN_REQUESTS,'canary_requests',1,'long_ccb_turns',1)
   )::text")" || { echo "✗ observation status 查询失败" >&2; return 1; }
   jq . <<<"$raw"
@@ -2125,12 +2155,30 @@ BEGIN
        AND model=v_obs->>'canary_model' AND authority_kind='bridge_signed'
   ) THEN RAISE EXCEPTION 'catalog canary has no signed usage'; END IF;
   IF NOT EXISTS (
-    SELECT 1 FROM request_finalize_journal
-     WHERE created_at >= (v_obs->>'started_at')::timestamptz AND state='committed'
-       AND ctx->>'source'='ccb_proxy' AND ctx->>'authorityKind'='bridge_signed'
-       AND ctx->>'executionRevision' IS NOT NULL AND ctx->>'securityEpoch'=v_epoch::text
-       AND updated_at-created_at >= interval '5 minutes'
-  ) THEN RAISE EXCEPTION 'no committed >5m CCB authority turn'; END IF;
+    WITH lease_requests AS (
+      SELECT request_id,ctx->>'authorityTurnId' AS authority_turn_id,
+        CASE WHEN jsonb_typeof(ctx->'turnLeaseIssuedAtMs')='number'
+             THEN (ctx->>'turnLeaseIssuedAtMs')::numeric END AS issued_ms,
+        CASE WHEN jsonb_typeof(ctx->'turnLeaseVerifiedAtMs')='number'
+             THEN (ctx->>'turnLeaseVerifiedAtMs')::numeric END AS verified_ms
+      FROM request_finalize_journal
+      WHERE created_at >= (v_obs->>'started_at')::timestamptz
+        AND state='committed' AND user_id::text=v_obs->>'canary_uid'
+        AND ctx->>'model'=v_obs->>'canary_model'
+        AND ctx->>'source'='ccb_proxy' AND ctx->>'authorityKind'='bridge_signed'
+        AND NULLIF(ctx->>'executionRevision','') IS NOT NULL
+        AND ctx->>'securityEpoch'=v_epoch::text
+    )
+    SELECT 1 FROM lease_requests early JOIN lease_requests late
+      ON late.authority_turn_id=early.authority_turn_id
+     AND late.request_id<>early.request_id AND late.issued_ms=early.issued_ms
+    WHERE early.authority_turn_id ~ '^[0-9a-f]{32}$'
+      AND early.verified_ms>=floor(extract(epoch FROM (v_obs->>'started_at')::timestamptz)*1000)::numeric
+      AND late.verified_ms>=floor(extract(epoch FROM (v_obs->>'started_at')::timestamptz)*1000)::numeric
+      AND early.verified_ms>=early.issued_ms
+      AND early.verified_ms<early.issued_ms+$MODEL_AUTHORITY_EARLY_REQUEST_MAX_MS
+      AND late.verified_ms>=late.issued_ms+$MODEL_AUTHORITY_LONG_TURN_MIN_MS
+  ) THEN RAISE EXCEPTION 'no committed multi-request CCB turn continuing on a verified lease after 5m'; END IF;
   IF NOT EXISTS (
     SELECT 1 FROM model_catalog c
     JOIN model_aliases a ON a.entry_id=c.entry_id

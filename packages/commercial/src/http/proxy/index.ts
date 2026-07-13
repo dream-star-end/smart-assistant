@@ -937,6 +937,13 @@ export function makeAnthropicProxyHandler(
                 billingRevision: gate.snapshot.billingRevision,
                 securityEpoch: gate.securityEpoch.toString(),
                 source: "ccb_proxy",
+                ...(gate.authorityKind === "bridge_signed"
+                  ? {
+                      authorityTurnId: gate.authorityTurnId,
+                      turnLeaseIssuedAtMs: gate.turnLeaseIssuedAtMs,
+                      turnLeaseVerifiedAtMs: gate.turnLeaseVerifiedAtMs,
+                    }
+                  : {}),
               }
             : undefined,
         });
