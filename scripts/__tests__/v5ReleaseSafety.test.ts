@@ -314,19 +314,87 @@ describe('v5 release safety lanes', () => {
     // 独立指针钉到本次 BUILT_RELEASE，并具备 cwd/capability 活体验证与旧 release 回切。
     assert.match(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5-egress$/m)
     assert.doesNotMatch(egressUnit, /^WorkingDirectory=\/opt\/openclaude\/openclaude-v5$/m)
-    const egressStart = source.indexOf('activate_egress_release()')
+    const egressStart = source.indexOf('egress_release_ready_once()')
     const deployStart = source.indexOf('\ndeploy()', egressStart)
     const egressActivate = source.slice(egressStart, deployStart)
     const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
     const deployBody = source.slice(deployStart, deployEnd)
     assert.ok(egressStart >= 0 && deployStart > egressStart)
     assert.match(egressActivate, /mv -T '\$tmplink' '\$V5_EGRESS_SRC'/)
-    assert.match(egressActivate, /\/proc\/\$pid\/cwd/)
+    assert.match(egressActivate, /readlink -f .*\/proc\/.*pid.*\/cwd/)
     assert.match(egressActivate, /MODEL_AUTHORITY_EGRESS_CAP/)
     assert.match(egressActivate, /ln -s '\$prev' '\$tmplink'/)
+    assert.match(egressActivate, /wait_for_egress_release_ready "\$reldir" "\$require_cap" 30/)
+    assert.match(egressActivate, /wait_for_egress_release_ready "\$prev" 0 30/)
+    assert.doesNotMatch(egressActivate, /run "sleep 3"/)
     assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
     assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
     assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
+  })
+
+  test('egress release readiness tolerates delayed startup and has a hard deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-ready-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    await writeFile(path.join(bin, 'ssh'), [
+      '#!/bin/sh',
+      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
+      'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
+      'case "$n" in',
+      '  1) state=activating; pid=0; cwd=""; health="" ;;',
+      '  2) cwd=/release/wrong ;;',
+      '  3) health=\'{"ok":true,"role":"egress","capabilities":[]}\' ;;',
+      'esac',
+      'printf "%s\\n%s\\n%s\\n" "$state" "$pid" "$cwd"',
+      'printf "%s" "$health" | base64 -w0',
+      'printf "\\n"',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+
+    const delayed = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sleep() { :; }',
+      'wait_for_egress_release_ready "$EXPECTED_RELEASE" 1 5',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        PATH: `${bin}:${process.env.PATH}`,
+        COUNTER: counter,
+        EXPECTED_RELEASE: '/release/new',
+      },
+    })
+    assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '4')
+    assert.match(delayed.stdout, /egress ready\(state=active pid=4321 cwd=\/release\/new\)/)
+
+    const started = Date.now()
+    const timedOut = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'wait_for_egress_release_ready /release/new 1 1',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        PATH: `${bin}:${process.env.PATH}`,
+        COUNTER: counter,
+        EXPECTED_RELEASE: '/release/new',
+        SLOW_PROBE: '1',
+      },
+    })
+    const elapsed = Date.now() - started
+    assert.notEqual(timedOut.status, 0)
+    assert.ok(elapsed < 2500, `one-second egress deadline took ${elapsed}ms`)
+    assert.match(timedOut.stderr, /last state=<empty> pid=<empty> cwd=<empty>/)
+    assert.match(timedOut.stderr, /last egress health: <empty>/)
   })
 
   test('release metadata declares both authority migrations and both authority capabilities', async () => {

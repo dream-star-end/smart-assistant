@@ -2746,8 +2746,74 @@ bootstrap() {
 # --egress 才把独立 symlink 原子切到本次不可变 release；restart/活体/进程 cwd 任一
 # 失败都回切调用方在部署起手时钉住的旧 release。unit 本身也从目标 release 安装，
 # 防止源码与 systemd 声明跨代。
+EGRESS_READY_LAST_STATE=""; EGRESS_READY_LAST_PID=""; EGRESS_READY_LAST_CWD=""; EGRESS_READY_LAST_HEALTH=""
+
+# egress 冷启动会先加载 pricing/catalog/host identity，再 bind 18892；固定 sleep 会在宿主
+# 抖动时把“尚未 ready”误判成坏 release。单次探针把 systemd/PID/cwd/health 绑在同一轮，
+# 整个 SSH+curl transport 由本地 timeout 钉死，供下面绝对截止轮询消费。
+egress_release_ready_once() { # <expected-release> <require-authority-cap:0|1> <request-timeout-seconds>
+  local expected="$1" require_cap="$2" request_timeout="${3:-2}" raw health_b64
+  raw="$(timeout --signal=KILL "${request_timeout}s" ssh "$KL_HOST" "set +e
+    state=\$(systemctl is-active '$V5_EGRESS_UNIT' 2>/dev/null || true)
+    pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || true)
+    cwd=''
+    if [[ \"\$pid\" =~ ^[1-9][0-9]*\$ ]]; then cwd=\$(readlink -f \"/proc/\$pid/cwd\" 2>/dev/null || true); fi
+    hz=\$(curl -fsS --max-time '$request_timeout' http://172.31.0.1:18892/internal/v5/egress-health 2>/dev/null || true)
+    printf '%s\\n%s\\n%s\\n' \"\$state\" \"\$pid\" \"\$cwd\"
+    printf '%s' \"\$hz\" | base64 -w0
+    printf '\\n'" 2>/dev/null)" || raw=""
+
+  local -a lines=()
+  mapfile -t lines <<<"$raw"
+  EGRESS_READY_LAST_STATE="${lines[0]:-}"
+  EGRESS_READY_LAST_PID="${lines[1]:-}"
+  EGRESS_READY_LAST_CWD="${lines[2]:-}"
+  health_b64="${lines[3]:-}"
+  EGRESS_READY_LAST_HEALTH=""
+  if [[ -n "$health_b64" ]]; then
+    EGRESS_READY_LAST_HEALTH="$(printf '%s' "$health_b64" | base64 -d 2>/dev/null || true)"
+  fi
+
+  [[ "$EGRESS_READY_LAST_STATE" == active \
+    && "$EGRESS_READY_LAST_PID" =~ ^[1-9][0-9]*$ \
+    && "$EGRESS_READY_LAST_CWD" == "$expected" ]] || return 1
+  jq -e '.ok == true and .role == "egress"' >/dev/null 2>&1 \
+    <<<"$EGRESS_READY_LAST_HEALTH" || return 1
+  if [[ "$require_cap" == 1 ]]; then
+    jq -e --arg cap "$MODEL_AUTHORITY_EGRESS_CAP" '.capabilities | index($cap) != null' \
+      >/dev/null 2>&1 <<<"$EGRESS_READY_LAST_HEALTH" || return 1
+  fi
+  return 0
+}
+
+wait_for_egress_release_ready() { # <expected-release> <require-authority-cap:0|1> [timeout-seconds]
+  local expected="$1" require_cap="$2" wait_seconds="${3:-30}" deadline remaining request_timeout
+  [[ "$require_cap" =~ ^[01]$ && "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ egress readiness 参数非法(require_cap=$require_cap timeout=$wait_seconds)" >&2
+    return 2
+  }
+  deadline=$((SECONDS + wait_seconds))
+  EGRESS_READY_LAST_STATE=""; EGRESS_READY_LAST_PID=""; EGRESS_READY_LAST_CWD=""; EGRESS_READY_LAST_HEALTH=""
+  echo "── 有界轮询等待 egress release ready(≤${wait_seconds}s,cwd=$expected,cap=$require_cap)──"
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    request_timeout="$remaining"; (( request_timeout > 2 )) && request_timeout=2
+    (( request_timeout < 1 )) && request_timeout=1
+    if egress_release_ready_once "$expected" "$require_cap" "$request_timeout"; then
+      echo "  ✓ egress ready(state=$EGRESS_READY_LAST_STATE pid=$EGRESS_READY_LAST_PID cwd=$EGRESS_READY_LAST_CWD)"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep 1
+  done
+  echo "✗ egress 在 ${wait_seconds}s 内未从预期 release 就绪:$expected" >&2
+  echo "  last state=${EGRESS_READY_LAST_STATE:-<empty>} pid=${EGRESS_READY_LAST_PID:-<empty>} cwd=${EGRESS_READY_LAST_CWD:-<empty>}" >&2
+  echo "  last egress health: ${EGRESS_READY_LAST_HEALTH:-<empty>}" >&2
+  return 1
+}
+
 activate_egress_release() {
-  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" hz pid cwd caps
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps require_cap=0
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
     return 0
@@ -2767,19 +2833,13 @@ activate_egress_release() {
     systemctl restart '$V5_EGRESS_UNIT'"; then
     echo "✗ egress 新 release 安装/restart 失败，尝试回切 $prev" >&2
   else
-    run "sleep 3"
-    pid="$(ssh "$KL_HOST" "systemctl show -p MainPID --value '$V5_EGRESS_UNIT'" 2>/dev/null || true)"
-    cwd="$(ssh "$KL_HOST" "test '${pid:-0}' -gt 0 && readlink -f '/proc/$pid/cwd'" 2>/dev/null || true)"
-    hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
     caps="$(release_declared_caps "$reldir" 2>/dev/null || true)"
-    if [[ "$cwd" == "$reldir" ]] \
-      && jq -e '.ok == true and .role == "egress"' >/dev/null 2>&1 <<<"$hz" \
-      && { ! caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" \
-        || jq -e --arg cap "$MODEL_AUTHORITY_EGRESS_CAP" '.capabilities | index($cap) != null' >/dev/null 2>&1 <<<"$hz"; }; then
-      echo "  ✓ egress 已从独立指针运行目标 release:$cwd"
+    caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" && require_cap=1
+    if wait_for_egress_release_ready "$reldir" "$require_cap" 30; then
+      echo "  ✓ egress 已从独立指针运行目标 release:$reldir"
       return 0
     fi
-    echo "✗ egress 新 release 活体/进程 cwd/capability 不匹配(cwd=${cwd:-<none>})，尝试回切 $prev" >&2
+    echo "✗ egress 新 release 活体/进程 cwd/capability 未就绪，尝试回切 $prev" >&2
   fi
 
   # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切只需原子翻回旧 release；
@@ -2790,11 +2850,7 @@ activate_egress_release() {
     mv -T '$tmplink' '$V5_EGRESS_SRC'
     systemctl daemon-reload
     systemctl restart '$V5_EGRESS_UNIT'"; then
-    run "sleep 3"
-    pid="$(ssh "$KL_HOST" "systemctl show -p MainPID --value '$V5_EGRESS_UNIT'" 2>/dev/null || true)"
-    cwd="$(ssh "$KL_HOST" "test '${pid:-0}' -gt 0 && readlink -f '/proc/$pid/cwd'" 2>/dev/null || true)"
-    hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
-    if [[ "$cwd" == "$prev" ]] && jq -e '.ok == true and .role == "egress"' >/dev/null 2>&1 <<<"$hz"; then
+    if wait_for_egress_release_ready "$prev" 0 30; then
       echo "  ✓ egress 已回切旧 release:$prev" >&2
       return 1
     fi
