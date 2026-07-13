@@ -87,6 +87,12 @@ export const EVENTS = {
   OPS_MONITOR_RECOVERED: "ops.monitor_recovered",
   OPS_DAILY_ANOMALY: "ops.daily_anomaly",
   OPS_DAILY_REPORT: "ops.daily_report",
+  // ── 运维(v5 自愈体系 incident 生命周期通报;reconciler open/resolve 时 safeEnqueueAlert)──
+  OPS_INCIDENT_OPENED: "ops.incident_opened",
+  OPS_INCIDENT_RESOLVED: "ops.incident_resolved",
+  // ── 运维(v5 自愈体系 codex 修复升级;修复终态失败/超时时 safeEnqueueAlert,需人工介入)──
+  OPS_REPAIR_FAILED: "ops.repair_failed",
+  OPS_REPAIR_TIMEOUT: "ops.repair_timeout",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -166,6 +172,17 @@ export const EVENT_META: EventMeta[] = [
     description: "v5 日检异常(计费突增 / 免单率超标 / 取数失败),每日北京时间 09:00", trigger: "polled" },
   { event_type: EVENTS.OPS_DAILY_REPORT, severity: "info", group: "ops",
     description: "v5 每日运行日报(活跃度 / 计费量 / 错误日志),无异常也发", trigger: "polled" },
+  // v5 自愈体系:incident 派生投影生命周期通报(企微,ops_detail 进正文)。severity 为目录默认,
+  // 实际按 incident 当前 severity 传入(open);resolved 恒 info。
+  { event_type: EVENTS.OPS_INCIDENT_OPENED, severity: "critical", group: "ops",
+    description: "v5 自愈事故打开(condition firing 命中 incident_policies → 派生 incident);severity 随 incident 实际等级", trigger: "passive" },
+  { event_type: EVENTS.OPS_INCIDENT_RESOLVED, severity: "info", group: "ops",
+    description: "v5 自愈事故恢复(condition 当前值 firing=false → reconciler resolve incident)", trigger: "passive" },
+  // v5 自愈体系:codex 自动修复升级 —— 修复终态失败或超时,自愈已尽力,需人工介入。
+  { event_type: EVENTS.OPS_REPAIR_FAILED, severity: "critical", group: "ops",
+    description: "v5 自愈 codex 修复达到失败保险丝阈值(连续失败终态),已停止自动重试,需人工介入", trigger: "passive" },
+  { event_type: EVENTS.OPS_REPAIR_TIMEOUT, severity: "critical", group: "ops",
+    description: "v5 自愈 codex 修复超时未收敛(verify_failed / 超过修复时限),已升级,需人工介入", trigger: "passive" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);

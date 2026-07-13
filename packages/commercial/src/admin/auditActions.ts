@@ -70,6 +70,13 @@ export const ADMIN_AUDIT_ACTIONS = {
   "alert_rule.ack": { kind: "write", mode: "tx" },
   "alert_outbox.retry": { kind: "write", mode: "best-effort" },
 
+  // ── 自愈体系(v5 selfheal)—— 全部 tx fail-closed(运维处置必须留痕)─
+  "incident.resolve": { kind: "write", mode: "tx" },
+  // 收尾批 H1b:解除 condition 压制(误压回滚;target=condition:<key>)。
+  "condition.unsuppress": { kind: "write", mode: "tx" },
+  // 收尾批 §B:一键放行 pending_release 的 Tier2 修复部署(target=repair:<id>)。
+  "repair.release": { kind: "write", mode: "tx" },
+
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },

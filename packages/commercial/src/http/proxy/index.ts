@@ -95,6 +95,7 @@ import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.
 
 import { runUpstreamRoundTrip } from "./core.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
+import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -431,6 +432,14 @@ export function makeAnthropicProxyHandler(
             });
             userLog.warn("proxy_provider_degraded", { model: body.model, provider: providerId });
             incrAnthropicProxyReject("provider_degraded");
+            recordUserImpactBestEffort({
+              conditionKey: `health.provider_degraded:${providerId}`,
+              userId: uid,
+              requestId,
+              target: `provider:${providerId}`,
+              failureCode: "PROVIDER_DEGRADED",
+              detail: { model: body.model, provider: providerId },
+            });
             sendJsonError(
               res,
               503,
@@ -464,6 +473,10 @@ export function makeAnthropicProxyHandler(
       } catch (err) {
         if (err instanceof AuthzLoadError) {
           userLog.error("proxy_authz_load_failed", { err: errSummary(err.cause) });
+          recordUserImpactBestEffort({
+            conditionKey: "ops.monitor:svc_v5", userId: uid, requestId,
+            target: "service:v5", failureCode: "INTERNAL_AUTHZ_LOAD",
+          });
           sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
           return;
         }
@@ -810,6 +823,14 @@ export function makeAnthropicProxyHandler(
               reason,
             });
             incrAnthropicProxyReject(label);
+            recordUserImpactBestEffort({
+              conditionKey: "account_pool.all_down",
+              userId: uid,
+              requestId,
+              target: `model:${body.model}`,
+              failureCode: "ACCOUNT_POOL_UNAVAILABLE",
+              detail: { model: body.model, reason },
+            });
             sendJsonError(res, 503, "ACCOUNT_POOL_UNAVAILABLE", "account pool unavailable, try again", requestId);
             return;
           }
@@ -912,6 +933,10 @@ export function makeAnthropicProxyHandler(
           userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
         });
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
+        recordUserImpactBestEffort({
+          conditionKey: "ops.monitor:svc_v5", userId: uid, requestId,
+          target: "service:v5", failureCode: "INTERNAL_JOURNAL_WRITE",
+        });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
         return;
       }

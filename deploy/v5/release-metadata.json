@@ -4,7 +4,12 @@
     "0123_gpt56_models",
     "0124_gpt56_xhigh_defaults",
     "0134_sessions_master_pg",
-    "0135_model_catalog"
+    "0133_selfheal_incidents",
+    "0134_selfheal_condition_concurrency",
+    "0135_selfheal_hardening",
+    "0137_selfheal_user_notice_approval",
+    "0138_model_catalog",
+    "0139_model_authority_guards"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -130,7 +130,7 @@ test('login localizes a known auth code to friendly Chinese and strips the trace
     message: '邮箱或密码错误',
   })
   // 把 promise 再取一次断言「不含英文/追踪号」。
-  const err = await api.login('a@b.com', 'wrong', 'bypass').catch((e) => e as ApiError)
+  const err = (await api.login('a@b.com', 'wrong', 'bypass').catch((e) => e)) as ApiError
   expect(err).toBeInstanceOf(ApiError)
   expect(err.message).toBe('邮箱或密码错误')
   expect(err.message).not.toContain('invalid credentials')
@@ -141,7 +141,7 @@ test('login keeps the raw message + trace id for an UNKNOWN code (排障兜底)'
   const fetchMock = vi.fn(async () => authErr(500, 'SOME_UNKNOWN_CODE', 'weird backend failure', 'req-xyz789'))
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
-  const err = await api.login('a@b.com', 'pw', 'bypass').catch((e) => e as ApiError)
+  const err = (await api.login('a@b.com', 'pw', 'bypass').catch((e) => e)) as ApiError
   expect(err).toBeInstanceOf(ApiError)
   expect(err.code).toBe('SOME_UNKNOWN_CODE')
   // 未知 code：原 message + 追踪号原样保留（追踪号只服务未知错误排障）。
