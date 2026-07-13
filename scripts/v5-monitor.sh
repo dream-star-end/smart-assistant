@@ -3,8 +3,8 @@
 #
 # 干啥(简单粗暴,ops 极简,不引外部监控系统):
 #   每 2 分钟(openclaude-v5-monitor.timer)跑一轮检查:
-#     1. systemd:openclaude-v5 / openclaude-v5-egress 必须 active
-#     2. HTTP 探活:v5 healthz("ok":true + channel=v5)、egress("role":"egress")、
+#     1. systemd:deploy_state 派生的 serving A/B master / openclaude-v5-egress 必须 active
+#     2. HTTP 探活:全部 serving lane healthz("ok":true + channel=v5)、egress("role":"egress")、
 #        公网 Caddy route；v3 已退役，只有 V5MON_CHECK_V3=1 才探测
 #     3. 磁盘 / 与 /var 使用率 >85% 告警;内存 available <10% 告警
 #     4. 容器池:v5-ccb 容器数 >20 告警(异常暴涨);OC_RUNTIME_IMAGE 指向的镜像
@@ -56,6 +56,7 @@ LOG_FILE="${V5MON_LOG_FILE:-/var/log/openclaude-v5-monitor.log}"
 MEMINFO="${V5MON_MEMINFO:-/proc/meminfo}"
 
 V5_HEALTH_URL="${V5MON_V5_URL:-http://127.0.0.1:18790/healthz}"
+V5_B_HEALTH_URL="${V5MON_V5_B_URL:-http://127.0.0.1:18795/healthz}"
 EGRESS_HEALTH_URL="${V5MON_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 V3_HEALTH_URL="${V5MON_V3_URL:-http://127.0.0.1:18789/healthz}"
 PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
@@ -81,6 +82,7 @@ MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
 POOL_MAX=20            # v5-ccb 容器数上限(线上稳态 ~1-5,>20 = 回收失灵/被刷)
 REALERT_SECS=21600     # 坏状态持续时的重复提醒间隔(6h)
 CURL_TIMEOUT=5
+DS_STEP_CANARY_READY="${DS_STEP_CANARY_READY:-10}"
 MAIL_ERR_WINDOW_SECS="${V5MON_MAIL_ERR_WINDOW:-1800}"  # 邮件发送失败回看窗口(30min)
 MAIL_LOG="${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}"
 
@@ -193,12 +195,81 @@ EOF
   fi
 }
 
+slot_unit() { case "$1" in A) echo openclaude-v5 ;; B) echo openclaude-v5-b ;; *) return 1 ;; esac; }
+slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEALTH_URL" ;; *) return 1 ;; esac; }
+
+# deploy_state 是“此刻哪些 master 真正在服务”的唯一权威。监控不再固定盯 A lane：
+# - stable / canary<READY:active；canary>=READY:active+candidate
+# - finalizing<6:两者；>=6:candidate 已是唯一 serving lane
+# - aborting<2:Caddy 尚未确认回旧，两者；>=2:active(old)唯一 serving lane
+# PG/状态损坏时绝不猜 A：独立 deploy_state key 告警，generic v5 保留最后已知状态，
+# candidate 记 not-serving；绝不把“状态不可读”冒充服务故障触发自动部署修复。
+MON_PHASE=""; MON_STEP=""; MON_ACTIVE=""; MON_CANDIDATE=""; MON_STATE_UNAVAILABLE=0
+load_serving_state() {
+  local row
+  [[ -n "$DBURL" ]] || { CHECK_DETAIL[deploy_state_error]="DATABASE_URL missing"; return 1; }
+  if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
+      "SELECT phase,transition_step,active_slot,COALESCE(candidate_slot,'') FROM deploy_state WHERE singleton=true" 2>&1)"; then
+    CHECK_DETAIL[deploy_state_error]="psql 失败:$(echo "$row" | head -c 120)"; return 1
+  fi
+  IFS='|' read -r MON_PHASE MON_STEP MON_ACTIVE MON_CANDIDATE extra <<<"$row"
+  [[ -z "${extra:-}" && "$MON_PHASE" =~ ^(stable|canary|finalizing|aborting)$ &&
+     "$MON_STEP" =~ ^[0-9]+$ && "$MON_ACTIVE" =~ ^[AB]$ &&
+     ( -z "$MON_CANDIDATE" || "$MON_CANDIDATE" =~ ^[AB]$ ) &&
+     ( -z "$MON_CANDIDATE" || "$MON_CANDIDATE" != "$MON_ACTIVE" ) ]] || {
+    CHECK_DETAIL[deploy_state_error]="非法 deploy_state 行:$(echo "$row" | head -c 120)"; return 1; }
+  if [[ "$MON_PHASE" == stable ]]; then
+    [[ -z "$MON_CANDIDATE" ]] || { CHECK_DETAIL[deploy_state_error]="stable 却有 candidate=$MON_CANDIDATE"; return 1; }
+  else
+    [[ -n "$MON_CANDIDATE" ]] || { CHECK_DETAIL[deploy_state_error]="$MON_PHASE 缺 candidate"; return 1; }
+  fi
+}
+
+check_serving_masters() {
+  local primary secondary="" unit url
+  if ! load_serving_state; then
+    local detail="deploy_state 不可裁决:${CHECK_DETAIL[deploy_state_error]}"
+    MON_STATE_UNAVAILABLE=1
+    # 状态权威不可读 ≠ 已知 serving master 进程/HTTP 故障。用独立、无 auto-repair policy
+    # 的 key 告警人工裁决；不要把 svc_v5/http_v5 写 firing 误触发 deploy_v5 自愈。
+    record deploy_state bad "$detail"
+    record svc_candidate_v5 ok "candidate not-serving(state unavailable)"
+    record http_candidate_v5 ok "candidate not-serving(state unavailable)"
+    return 0
+  fi
+
+  primary="$MON_ACTIVE"
+  case "$MON_PHASE:$MON_STEP" in
+    canary:*)
+      (( MON_STEP >= DS_STEP_CANARY_READY )) && secondary="$MON_CANDIDATE" ;;
+    finalizing:*)
+      if (( MON_STEP >= 6 )); then primary="$MON_CANDIDATE"; else secondary="$MON_CANDIDATE"; fi ;;
+    aborting:*)
+      (( MON_STEP < 2 )) && secondary="$MON_CANDIDATE" ;;
+  esac
+
+  unit="$(slot_unit "$primary")"; url="$(slot_health_url "$primary")"
+  check_service svc_v5 "$unit"
+  CHECK_DETAIL[svc_v5]="serving slot=$primary phase=$MON_PHASE step=$MON_STEP; ${CHECK_DETAIL[svc_v5]}"
+  check_http http_v5 "$url" '.ok == true and .channel == "v5"' "serving slot=$primary healthz"
+
+  if [[ -n "$secondary" ]]; then
+    unit="$(slot_unit "$secondary")"; url="$(slot_health_url "$secondary")"
+    check_service svc_candidate_v5 "$unit"
+    CHECK_DETAIL[svc_candidate_v5]="serving candidate=$secondary phase=$MON_PHASE step=$MON_STEP; ${CHECK_DETAIL[svc_candidate_v5]}"
+    check_http http_candidate_v5 "$url" '.ok == true and .channel == "v5"' "serving candidate=$secondary healthz"
+  else
+    record svc_candidate_v5 ok "candidate not-serving(phase=$MON_PHASE step=$MON_STEP primary=$primary)"
+    record http_candidate_v5 ok "candidate not-serving(phase=$MON_PHASE step=$MON_STEP primary=$primary)"
+  fi
+}
+
 # 检查项 → 告警 severity(方案 §2.3-2):服务/HTTP/公网/池/镜像 = critical(聊天全挂),
 # 磁盘/内存 = warning(容量预警,尚未致命)。未知项保守按 warning。
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    svc_v5|svc_egress|http_v5|http_egress|http_v3|public_route|pool|image|mail) echo critical ;;
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail) echo critical ;;
     disk_root|disk_var|mem) echo warning ;;
     *) echo warning ;;
   esac
@@ -220,9 +291,8 @@ fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_
   fi
 }
 
-check_service svc_v5     openclaude-v5
+check_serving_masters
 check_service svc_egress openclaude-v5-egress
-check_http http_v5     "$V5_HEALTH_URL"     '.ok == true and .channel == "v5"'   "v5 healthz"
 check_http http_egress "$EGRESS_HEALTH_URL" '.ok == true and .role == "egress"'  "egress health"
 check_public_route
 if [[ "${V5MON_CHECK_V3:-0}" == 1 ]]; then
@@ -244,6 +314,11 @@ echo "$OLD_STATE" | jq -e . >/dev/null 2>&1 || OLD_STATE='{"checks":{}}'   # 状
 
 SKIP=",${V5MON_SKIP:-},"
 NEW_STATE='{"checks":{}}'
+# deploy_state 本轮不可裁决时，generic serving 两项没有新证据：保留上轮最后已知状态，
+# 既不误报 firing，也不把历史诊断抹掉。其余本轮实际检查仍按下方结果覆盖。
+if [[ "$MON_STATE_UNAVAILABLE" == 1 ]]; then
+  NEW_STATE="$(echo "$OLD_STATE" | jq '{checks: ((.checks // {}) | with_entries(select(.key == "svc_v5" or .key == "http_v5")))}')"
+fi
 EVENTS=()          # 本轮要进告警正文的行
 HAS_BAD_EVENT=0    # 有新坏/持续坏提醒 → level=warning;纯恢复 → info
 BAD_LIST=()        # 当前所有坏项(进日志摘要)

@@ -2221,6 +2221,44 @@ describe("ChatSocket bearer subprotocol auth (#4)", () => {
   });
 });
 
+// ═══════════════ cohort lane 就绪闸（P3 RFC D1）═══════════════
+describe("ChatSocket laneReady gate (P3 RFC D1)", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("默认 laneReady=true：setGateReady(true) 直接建连（既有行为回归保护）", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    expect(FakeWS.instances.length).toBe(1);
+    sock.stop();
+  });
+
+  test("laneReady=false 阻断建连；lane 决策达成（setLaneReady(true)）后才建连", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setLaneReady(false); // lane 决策未达
+    sock.setGateReady(true); // 容器就绪，但 lane 未决 → 不建 WS（防落错 slot）
+    expect(FakeWS.instances.length).toBe(0);
+    sock.setLaneReady(true); // lane 决策达成 → 上升沿触发建连
+    expect(FakeWS.instances.length).toBe(1);
+    sock.stop();
+  });
+
+  test("双闸缺一不连：laneReady 先到、gateReady 未就绪时 no-op，gateReady 到位才建", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setLaneReady(false);
+    sock.setLaneReady(true); // gateReady 仍 false → connect 内部 no-op
+    expect(FakeWS.instances.length).toBe(0);
+    sock.setGateReady(true); // 现在双闸就绪 → 建连
+    expect(FakeWS.instances.length).toBe(1);
+    sock.stop();
+  });
+});
+
 // ═══════════════ §5 close 4503 server-hinted 退避（无 12 分钟死循环）═══════════════
 describe("ChatSocket 4503 server-hinted reconnect (no 12-min loop)", () => {
   afterEach(() => {

@@ -74,8 +74,12 @@ interface ProposalRow {
 export interface UserNoticeApprovalDeps {
   query: typeof realQuery;
   tx: typeof realTx;
-  onlineUserSubset: (uids: string[]) => string[];
-  broadcastToUsers: (uids: string[], payload: unknown) => number;
+  onlineUserSubset: (uids: string[]) => string[] | Promise<string[]>;
+  /** 新双槽实现返回确实至少发到一个 OPEN WS 的 uid；number 保留旧单槽测试兼容。 */
+  broadcastToUsers: (
+    uids: string[],
+    payload: unknown,
+  ) => string[] | number | Promise<string[] | number>;
   sendWecom: (
     channelId: string,
     chatId: string,
@@ -139,7 +143,7 @@ async function createProposal(deps: UserNoticeApprovalDeps): Promise<number> {
       [row.incident_id, row.policy_id, row.condition_key, att.target],
     );
     const byUser = new Map(evidence.rows.map((x) => [x.user_id, x.id]));
-    const frozen = deps.onlineUserSubset([...byUser.keys()]).sort();
+    const frozen = (await deps.onlineUserSubset([...byUser.keys()])).sort();
     if (frozen.length === 0) continue;
     const hash = recipientHash(frozen);
     const inserted = await deps.tx(async (client: PoolClient) => {
@@ -303,8 +307,7 @@ async function sendApproved(deps: UserNoticeApprovalDeps): Promise<void> {
         `SELECT user_id::text FROM selfheal_user_notice_recipients
           WHERE proposal_id=$1::bigint ORDER BY user_id`, [row.id],
       );
-      const online = deps.onlineUserSubset(recips.rows.map((x) => x.user_id));
-      const delivered: string[] = [];
+      const online = await deps.onlineUserSubset(recips.rows.map((x) => x.user_id));
       const payload = {
         type: "sys.incident", incidentId: row.incident_id, rev: Number(row.incident_rev), status: "resolved",
         severity: "info", surface: "recovery", title: row.title, message: row.message, ts: Date.now(),
@@ -317,7 +320,12 @@ async function sendApproved(deps: UserNoticeApprovalDeps): Promise<void> {
           WHERE id=$1::bigint AND status='sending' AND send_by>=NOW()`,[row.id]);
         return [] as string[];
       }
-      for (const uid of online) if (deps.broadcastToUsers([uid], payload) > 0) delivered.push(uid);
+      const broadcastResult = await deps.broadcastToUsers(online, payload);
+      const delivered = Array.isArray(broadcastResult)
+        ? [...new Set(broadcastResult.filter((uid) => online.includes(uid)))]
+        : broadcastResult > 0
+          ? online
+          : [];
       if (delivered.length) await client.query(
         `UPDATE selfheal_user_notice_recipients SET sent_at=NOW()
           WHERE proposal_id=$1::bigint AND user_id=ANY($2::bigint[])`, [row.id,delivered],

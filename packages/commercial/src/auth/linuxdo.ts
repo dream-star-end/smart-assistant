@@ -8,8 +8,9 @@
  *   - LDC 接受 form-urlencoded(OAuth 2.0 标准),admin 那边用 JSON
  *   - LDC userinfo 在 connect.linux.do/api/user
  *
- * Login CSRF 防御(2026-04-28 codex review R2):
- *   - server 端 pending Map 校验 state(防重放、防过期)
+ * Login CSRF 防御(2026-04-28 codex review R2;P3 pending state 迁 PG):
+ *   - server 端 pending state(PG oauth_pending_states)校验 state(原子单次消费 +
+ *     短 TTL,防重放/防过期;跨 slot callback 天然成立),生命周期由 handler 编排
  *   - **同时**种 HttpOnly + SameSite=Lax + Path=/api/auth/linuxdo/callback 的
  *     state cookie,callback 时双因素校验:query.state == cookie.state
  *   - 仅靠 server Map 不足以防"攻击者把自己的 callback URL 诱导受害者打开 →
@@ -78,38 +79,6 @@ export function readLinuxdoConfig(env: NodeJS.ProcessEnv = process.env): LdcConf
   return { clientId, clientSecret, redirectUri }
 }
 
-// ─── Pending state(server-side anti-replay / TTL)──────────────────────
-
-interface PendingState {
-  createdAt: number
-}
-
-const PENDING_TTL_MS = 10 * 60 * 1000
-/**
- * 容量上限 200 — codex R4 NB:50 偏紧,生产偶发短时高并发 OAuth start 会
- * 把合法 state 挤出。200 仍是常数级内存(~11KB),配合 IP rate limit 双兜底。
- */
-const PENDING_MAX = 200
-const pending = new Map<string, PendingState>()
-
-function gcPending(): void {
-  while (pending.size >= PENDING_MAX) {
-    const oldest = pending.keys().next().value
-    if (!oldest) break
-    pending.delete(oldest)
-  }
-}
-
-/** 测试 hook:清空 Map(每个 test 之间隔离) */
-export function _resetPendingForTesting(): void {
-  pending.clear()
-}
-
-/** 测试 hook:观察 size */
-export function _pendingSizeForTesting(): number {
-  return pending.size
-}
-
 // ─── State cookie helpers(CSRF 双因素的"绑浏览器"那一极)──────────────
 
 const STATE_COOKIE_NAME = 'oc_oauth_ld_state'
@@ -175,23 +144,16 @@ export interface OAuthStartResult {
 }
 
 /**
- * 生成 state、写 pending Map、返回 LDC authorize URL + state(handler 用 state
- * 写 cookie)。**handler 必须**:
- *   1. setOAuthStateCookie(res, result.state)
- *   2. 302 Location: result.authUrl
+ * 生成 state、返回 LDC authorize URL + state。**纯函数,无副作用**——pending state
+ * 的持久化由 handler 调 putOAuthPendingState 完成。**handler 必须**:
+ *   1. putOAuthPendingState({ provider:'linuxdo', state, payload:{} })
+ *   2. setOAuthStateCookie(res, result.state)
+ *   3. 302 Location: result.authUrl
  *
  * 若 env 缺失抛 LinuxdoConfigMissingError,handler 转 503 Service Unavailable。
  */
 export function startLinuxdoOAuth(config: LdcConfig = readLinuxdoConfig()): OAuthStartResult {
   const state = randomBytes(16).toString('hex')
-  gcPending()
-  const now = Date.now()
-  pending.set(state, { createdAt: now })
-  // best-effort 自动 GC(双层防御)
-  setTimeout(() => {
-    const cur = pending.get(state)
-    if (cur && cur.createdAt === now) pending.delete(state)
-  }, PENDING_TTL_MS).unref?.()
 
   const params = new URLSearchParams({
     client_id: config.clientId,
@@ -245,41 +207,30 @@ export interface ExchangeDeps {
 }
 
 /**
- * 用 callback 收到的 code 换 LDC userinfo。
+ * 用 callback 收到的 code 换 LDC userinfo。**纯外部 I/O**——state 的一次性消费
+ * (原 pending Map)已上移到 handler(consumeOAuthPendingState),本函数不再持有进程内
+ * 状态,也不做 state 校验。
  *
  * 流程:
- *   1. 校 state 是否在 pending Map(server 端一次性 + TTL 校验)
- *      —— **删除**这条 entry,后续重放无效
- *   2. POST tokenUrl(form-urlencoded)拿 access_token
- *   3. GET userinfoUrl(Bearer)拿 user 信息
- *   4. 解析返合法字段,失败抛 USERINFO_INVALID
+ *   1. POST tokenUrl(form-urlencoded)拿 access_token
+ *   2. GET userinfoUrl(Bearer)拿 user 信息
+ *   3. 解析返合法字段,失败抛 USERINFO_INVALID
  *
- * **不**在这里写 cookie / DB —— 业务编排留给 socialLogin.ts。
+ * **不**在这里写 cookie / DB —— 业务编排留给 handler / socialLogin.ts。
  *
- * **不**校验 query.state == cookie.state —— 那是 handler 的责任(handler 既能拿
- * cookie 又能拿 query;此函数纯业务)。
+ * **不**校验 query.state == cookie.state / pending 消费 —— 那是 handler 的责任
+ * (handler 既能拿 cookie 又能拿 query,并负责 PG pending 的原子消费)。
  *
  * 错误语义:全部 status >= 400 但具体 code 让 handler 区分(map LDC error → 用户友好提示)。
  */
 export async function exchangeLinuxdoOAuth(
   code: string,
-  state: string,
   deps: ExchangeDeps = {},
 ): Promise<LdcUserInfo> {
   const fetchImpl = deps.fetchImpl ?? fetch
   const config = deps.config ?? readLinuxdoConfig()
 
-  // 1) state 校验(server side)
-  const entry = pending.get(state)
-  if (!entry) {
-    throw new LinuxdoOAuthError(400, 'INVALID_STATE', 'invalid or expired state')
-  }
-  pending.delete(state)
-  if (Date.now() - entry.createdAt > PENDING_TTL_MS) {
-    throw new LinuxdoOAuthError(400, 'INVALID_STATE', 'state expired')
-  }
-
-  // 2) Token exchange — OAuth 2.0 标准 form-urlencoded
+  // 1) Token exchange — OAuth 2.0 标准 form-urlencoded
   const tokenBody = new URLSearchParams({
     grant_type: 'authorization_code',
     code,

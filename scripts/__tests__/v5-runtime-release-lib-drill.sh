@@ -163,11 +163,13 @@ chk "翻转到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'b
 
 echo "== T6 history append + checksum 校验(含 masterRelease,M7)=="
 oc_hotcfg_history_append "$OC_HOTCFG_HISTORY" img:1 sha256:id1 "$OC_HOTCFG_RELEASES_ROOT/rel-r1" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "$OC_HOTCFG_RELEASES_ROOT/rel-master1"
-oc_hotcfg_history_append "$OC_HOTCFG_HISTORY" img:2 sha256:id2 "$OC_HOTCFG_RELEASES_ROOT/rel-r2" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV2" "$OC_HOTCFG_RELEASES_ROOT/rel-master2"
+oc_hotcfg_history_append "$OC_HOTCFG_HISTORY" img:2 sha256:id2 "$OC_HOTCFG_RELEASES_ROOT/rel-r2" "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV2" "$OC_HOTCFG_RELEASES_ROOT/rel-master2" "" joint "$OC_HOTCFG_RELEASES_ROOT/rel-master1"
 chk "history 有 2 行" "[ \"\$(wc -l < '$OC_HOTCFG_HISTORY')\" = 2 ]"
 LAST="$(oc_hotcfg_history_last_committed "$OC_HOTCFG_HISTORY")"
 chk "last committed seq=2" "[ \"\$(jq -r .seq <<<'$LAST')\" = 2 ]"
 chk "last committed 带 masterRelease" "[ \"\$(jq -r .masterRelease <<<'$LAST')\" = '$OC_HOTCFG_RELEASES_ROOT/rel-master2' ]"
+chk "last committed v3 默认 transitionKind=joint" "[ \"\$(jq -r .schemaVer <<<'$LAST')\" = 3 ] && [ \"\$(jq -r .transitionKind <<<'$LAST')\" = joint ]"
+chk "last committed previousMasterRelease 进 v3" "[ \"\$(jq -r .previousMasterRelease <<<'$LAST')\" = '$OC_HOTCFG_RELEASES_ROOT/rel-master1' ]"
 # 篡改末行 → last_committed 应回退到 seq=1
 printf '{\"schemaVer\":1,\"seq\":3,\"ts\":\"x\",\"image\":\"tampered\",\"image_id\":\"z\",\"release\":\"r\",\"bundle\":\"b\",\"masterRelease\":\"m\",\"checksum\":\"deadbeef\"}\n' >> "$OC_HOTCFG_HISTORY"
 LAST2="$(oc_hotcfg_history_last_committed "$OC_HOTCFG_HISTORY")"
@@ -186,6 +188,11 @@ chk "nth=2 的 release/bundle/master 同属 B 记录(同条恢复)" "[ \"\$(jq -
 chk "last committed masterRelease=masterC" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$HM')\")\" = masterC ]"
 sed -i 's/masterC/HACKEDMASTER/' "$HM"   # 只改 masterRelease 值 → checksum 应失配
 chk "篡改 masterRelease 被 checksum 拒(回退 seq=2)" "[ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HM')\")\" = 2 ]"
+HP="$WORK/hist-parent"; : > "$HP"
+oc_hotcfg_history_append "$HP" imgA idA relA bunA masterA
+oc_hotcfg_history_append "$HP" imgB idB relB bunB masterB "" master-only masterA
+{ head -n1 "$HP"; tail -n1 "$HP" | jq -c '.previousMasterRelease="HACKED"'; } > "$HP.bad" && mv "$HP.bad" "$HP"
+chk "篡改 v3 previousMasterRelease 被 checksum 拒(回退 seq=1)" "[ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HP')\")\" = 1 ]"
 
 echo "== TR2B1 env_write_tuple 三态写:四键恒写,禁用轴写空值(R2-B1,取代旧 B2 空值跳过)=="
 cat > "$WORK/b2.env" <<EOF
@@ -212,20 +219,25 @@ chk "bundle 非空且原无键 → 新建 OC_PLATFORM_BUNDLE" "[ \"\$(grep ^OC_P
 oc_hotcfg_env_write_tuple "$WORK/b2.env" img:NEW2 sha256:NEW2 "" "" >/dev/null 2>&1
 chk "双轴禁用 → release/bundle 皆空值键" "grep -q '^OC_RUNTIME_RELEASE=$' '$WORK/b2.env' && grep -q '^OC_PLATFORM_BUNDLE=$' '$WORK/b2.env'"
 
-echo "== TM3 history schemaVersion 2 + v1 旧行混存(R2-M3)=="
+echo "== TM3 history schemaVersion 3 + v1/v2 旧行混存(R2-M3/R5)=="
 HV="$WORK/hist-m3"; : > "$HV"
 # 手工造一条 v1 旧行(旧编码:checksum 7 字段、**无 masterRelease 字段**)
 V1SUM="$(oc_hotcfg_history_checksum 1 1 2026-01-01T00:00:00Z imgV1 idV1 relV1 bunV1)"
 printf '{"schemaVer":1,"seq":1,"ts":"2026-01-01T00:00:00Z","image":"imgV1","image_id":"idV1","release":"relV1","bundle":"bunV1","checksum":"%s"}\n' "$V1SUM" >> "$HV"
 oc_hotcfg_history_append "$HV" imgV2 idV2 relV2 bunV2 masterV2
-chk "append 写 schemaVer=2" "[ \"\$(tail -n1 '$HV' | jq -r .schemaVer)\" = 2 ]"
-chk "v2 last committed=imgV2(seq 接续 v1)" "[ \"\$(jq -r .image <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = imgV2 ] && [ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = 2 ]"
+chk "append 写 schemaVer=3+joint" "[ \"\$(tail -n1 '$HV' | jq -r .schemaVer)\" = 3 ] && [ \"\$(tail -n1 '$HV' | jq -r .transitionKind)\" = joint ]"
+chk "v3 last committed=imgV2(seq 接续 v1)" "[ \"\$(jq -r .image <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = imgV2 ] && [ \"\$(jq -r .seq <<<\"\$(oc_hotcfg_history_last_committed '$HV')\")\" = 2 ]"
 P_V1="$(oc_hotcfg_history_nth_committed "$HV" 2)"
 chk "v1 旧行 checksum(7 字段)验过,nth=2 命中" "[ \"\$(jq -r .image <<<'$P_V1')\" = imgV1 ]"
 chk "v1 条目读出 masterRelease 归一化为空" "[ \"\$(jq -r .masterRelease <<<'$P_V1')\" = '' ]"
 # v1 行被塞 masterRelease 也视为空(不进 v1 checksum,防注入未验值)
 HV2="$WORK/hist-m3b"; printf '{"schemaVer":1,"seq":1,"ts":"2026-01-01T00:00:00Z","image":"imgV1","image_id":"idV1","release":"relV1","bundle":"bunV1","masterRelease":"INJECTED","checksum":"%s"}\n' "$V1SUM" > "$HV2"
 chk "v1 行注入 masterRelease → 读出仍视为空" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$HV2')\")\" = '' ]"
+# v2 旧行也可读；未受 checksum 保护的类型/父字段必须被忽略并归一化为 joint/空。
+HV3="$WORK/hist-m3c"; V2SUM="$(oc_hotcfg_history_checksum 2 1 2026-01-01T00:00:00Z imgV2 idV2 relV2 bunV2 masterV2)"
+printf '{"schemaVer":2,"seq":1,"ts":"2026-01-01T00:00:00Z","image":"imgV2","image_id":"idV2","release":"relV2","bundle":"bunV2","masterRelease":"masterV2","transitionKind":"tuple-only","previousMasterRelease":"INJECTED","checksum":"%s"}\n' "$V2SUM" > "$HV3"
+V2READ="$(oc_hotcfg_history_last_committed "$HV3")"
+chk "v2 旧行可读且类型/父字段安全归一化" "[ \"\$(jq -r .transitionKind <<<'$V2READ')\" = joint ] && [ -z \"\$(jq -r .previousMasterRelease <<<'$V2READ')\" ]"
 # 篡改 v1 行字段 → checksum 拒
 sed -i 's/imgV1/imgHACK/' "$HV2"
 chk "篡改 v1 行被 checksum 拒(无 committed)" "[ -z \"\$(oc_hotcfg_history_last_committed '$HV2')\" ]"
@@ -510,6 +522,81 @@ else ok "smoke 失败返回非 0(extra_apply 已成功)"; fi
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
 chk "M7c:.prev-release 指针经 extra_revert 还原为 OLDPREV" "[ \"\$(cat '$PREVPTR')\" = 'OLDPREV' ]"
 
+echo "== TP3 hotcfg 外部权威 commit/revert 钩子纳入 saga 补偿边界 =="
+STATEPTR="$WORK/deploy-state.ptr"; echo OLD > "$STATEPTR"
+HHOOK="$WORK/hook-history"; : > "$HHOOK"
+# 成功路径:smoke 后 commit hook 生效，history 随后提交。
+DOCKER_STUB_IMAGE_ID=sha256:HOOK oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
+  img:HOOK sha256:HOOK /rel/HOOK "" "true" "true" "" "" "/rel/masterHOOK" "/rel/masterOLD" \
+  "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1 \
+  && ok "TP3 commit hook 成功路径" || bad "TP3 commit hook 应成功"
+chk "TP3 commit 后外部权威=NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
+
+# commit hook 自身失败:env/current/extra 全回滚，外部权威仍 OLD。
+echo OLD > "$STATEPTR"
+if DOCKER_STUB_IMAGE_ID=sha256:HOOK2 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
+  img:HOOK2 sha256:HOOK2 /rel/HOOK2 "" "true" "true" "" "" "/rel/masterHOOK2" "/rel/masterHOOK" \
+  "false" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
+  bad "TP3 commit hook 失败不应返回成功"
+else ok "TP3 commit hook 失败触发 saga 回滚"; fi
+chk "TP3 commit 失败后外部权威仍 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+
+# history fsync/append 位于 commit 之后；注入 append 失败，必须调用 commit_revert。
+HFAIL="$WORK/hook-history-fail"; : > "$HFAIL"
+oc_hotcfg_history_append "$HFAIL" img:BASE sha256:BASE /rel/BASE "" /rel/masterBASE prestate >/dev/null
+echo OLD > "$STATEPTR"
+oc_hotcfg_history_append() { return 1; }
+if DOCKER_STUB_IMAGE_ID=sha256:HOOK3 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:HOOK3 sha256:HOOK3 /rel/HOOK3 "" "true" "true" "" "" "/rel/masterHOOK3" "/rel/masterBASE" \
+  "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
+  bad "TP3 history 失败不应返回成功"
+else ok "TP3 history 失败触发 commit_revert"; fi
+chk "TP3 history 失败后外部权威补偿回 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+
+echo "== TP3b post-commit 丢回执 / reconcile unknown 的三态补偿 =="
+# apply 实际写 NEW 后返回非零(模拟 PG 已提交但客户端断连)；幂等 revert 确认 OLD 后，
+# saga 才能回切 env/master，且不应留下人工恢复标记。
+RECOVERY_MARK="$WORK/manual-recovery"; rm -f "$RECOVERY_MARK"
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD
+OC_RUNTIME_IMAGE_ID=sha256:OLD
+OC_RUNTIME_RELEASE=/rel/OLD
+OC_PLATFORM_BUNDLE=
+EOF
+MASTERPTR="$WORK/master.ptr"; echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"
+if DOCKER_STUB_IMAGE_ID=sha256:LOST oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:LOST sha256:LOST /rel/LOST "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
+  "/rel/masterLOST" "/rel/masterOLD" "echo NEW > '$STATEPTR'; false" \
+  "[ \"\$(cat '$STATEPTR')\" = NEW ] && echo OLD > '$STATEPTR'" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b post-commit 丢回执应让本次激活失败"
+else ok "TP3b post-commit 丢回执经 reconcile 后安全失败"; fi
+chk "TP3b reconcile 后 state=OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]"
+chk "TP3b state 确认 OLD 后才回切 master/env" "[ \"\$(cat '$MASTERPTR')\" = OLD ] && [ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = img:OLD ]"
+chk "TP3b 已安全收敛不落人工恢复标记" "[ ! -e '$RECOVERY_MARK' ]"
+
+# history 失败后 revert/回读也失败：必须保持新运行面，不得盲回 OLD，并持久阻断后续激活。
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:OLD2
+OC_RUNTIME_IMAGE_ID=sha256:OLD2
+OC_RUNTIME_RELEASE=/rel/OLD2
+OC_PLATFORM_BUNDLE=
+EOF
+echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"; rm -f "$RECOVERY_MARK"
+if DOCKER_STUB_IMAGE_ID=sha256:UNKNOWN oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:UNKNOWN sha256:UNKNOWN /rel/UNKNOWN "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
+  "/rel/masterUNKNOWN" "/rel/masterOLD" "echo NEW > '$STATEPTR'" "false" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b revert unknown 不应报告成功"
+else ok "TP3b revert unknown 进入人工恢复态"; fi
+chk "TP3b unknown 时 state 保持 NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
+chk "TP3b unknown 时禁止盲回运行面(master/env 仍 NEW)" "[ \"\$(cat '$MASTERPTR')\" = NEW ] && [ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = img:UNKNOWN ]"
+chk "TP3b unknown 落持久人工恢复标记" "[ -s '$RECOVERY_MARK' ] && grep -q 'master_target=/rel/masterUNKNOWN' '$RECOVERY_MARK'"
+if DOCKER_STUB_IMAGE_ID=sha256:BLOCKED oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
+  img:BLOCKED sha256:BLOCKED /rel/BLOCKED "" "true" "true" "" "" "/rel/masterBLOCKED" "" "" "" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  bad "TP3b 有恢复标记时不应允许下一次激活"
+else ok "TP3b 恢复标记阻断后续激活"; fi
+# 恢复真实函数，避免污染后续 drill。
+source "$LIB"
+
 echo "== TR2M2c canary boot 冒烟两路径(R2-M2③)=="
 # 成功路径:双轴启用 → docker run 带 bundle 挂载(platform_root+rev)+ release 挂载 + validate-only env
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
@@ -611,10 +698,10 @@ else
 fi
 
 # R3-m2:未知 schemaVer 拒绝
-BADLINE='{"schemaVer":3,"seq":9,"ts":"t","image":"i","image_id":"d","release":"","bundle":"","masterRelease":"","checksum":"00"}'
+BADLINE='{"schemaVer":4,"seq":9,"ts":"t","image":"i","image_id":"d","release":"","bundle":"","masterRelease":"","checksum":"00"}'
 if oc_hotcfg__history_verify_line "$BADLINE" >/dev/null 2>&1; then
-  bad "schemaVer=3 应被拒"
-else ok "R3-m2 未知 schemaVer=3 被拒"; fi
+  bad "schemaVer=4 应被拒"
+else ok "R3-m2 未知 schemaVer=4 被拒"; fi
 
 echo "== TR4 GC 遇空轴条目(pre-state)不炸严格壳 =="
 # 生产首启实证:pre-state 条目 release/bundle 皆空,_hotcfg_protect '' '' 末条 [ -n '' ]

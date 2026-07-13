@@ -2,7 +2,7 @@
 
 > ops 极简哲学:两个 systemd timer + 两个 bash 脚本,不引外部监控系统。
 > 告警首选 v5 站内信(发给 boss),全量兜底落 `/var/log/openclaude-v5-monitor.log`。
-> 最后校准:2026-07-11。
+> 最后校准:2026-07-13。
 
 ## 组成
 
@@ -27,9 +27,9 @@ systemctl enable --now openclaude-v5-monitor.timer openclaude-v5-daily.timer
 
 # 验证
 systemctl list-timers 'openclaude-v5-*'          # 两个 timer 排上了
-bash scripts/v5-monitor.sh --dry-run             # 手跑一轮,10 项应全 ok
+bash scripts/v5-monitor.sh --dry-run             # 手跑一轮,全部 serving/宿主项应全 ok
 bash scripts/v5-daily-check.sh --dry-run         # 日报正文预览(不发信)
-tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(10 项全过)"
+tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(...项全过)"
 ```
 
 依赖:`bash / curl / jq / psql / sqlite3 / docker / systemctl / df / iconv`,kl-mirror 全都有。
@@ -40,9 +40,12 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 
 | 项 | 检查 | 阈值 | 理由 |
 |---|---|---|---|
-| `svc_v5` | `systemctl is-active openclaude-v5` | ≠active | master 进程死 = v5 全站不可用 |
+| `deploy_state` | 读取并校验 serving lane 权威单行 | PG 不可达、行缺失或字段非法 | 独立 critical 人工告警；无 auto-repair policy，不把状态不可读冒充服务故障 |
+| `svc_v5` | 按 `deploy_state` 探测当前主 serving slot(A/B)的 unit | ≠active | 不再固定猜 A；stable 跟 active，finalizing step≥6 跟 candidate；状态不可裁决时保留最后已知值 |
+| `svc_candidate_v5` | 仅 candidate 真实 serving 时独立探测其 unit | ≠active；不 serving 时记 `ok/not-serving` | canary READY、finalizing/aborting 的双服务窗口不能被主 lane 绿灯遮蔽；命名刻意不落入 `svc_v5` 自愈 policy prefix |
 | `svc_egress` | `systemctl is-active openclaude-v5-egress` | ≠active | LLM 出站面死 = 所有生成挂 |
-| `http_v5` | `GET 127.0.0.1:18790/healthz` | 非 `"ok":true` + `channel:"v5"` | 进程活但端口不响应/串台(channel 断言防 v3/v5 错位)。`ok` 含 **sessions.db 深度探活**(`deps.sessionsDb`,master 形态 open+SELECT 1):DB open 失败 = list/save/落库全崩但进程活着,2026-07-06 事故正是此形态两小时无告警;探活失败 healthz 仍回 HTTP 200(不给 LB 摘流量信号),仅 `ok:false` 供本监控与 deploy smoke 消费 |
+| `http_v5` | 按 `deploy_state` GET 当前主 serving slot 的 healthz(A=18790/B=18795) | 非 `"ok":true` + `channel:"v5"` | 进程活但端口不响应/串台；`ok` 含 sessions.db 深度探活 |
+| `http_candidate_v5` | candidate 真实 serving 时独立 GET 其 healthz | 同上；不 serving 时记 `ok/not-serving` | 双 lane 独立故障边，候选坏不会被 active 正常掩盖；不会误命中 `http_v5` 的全站自动修复 policy |
 | `http_egress` | `GET 172.31.0.1:18892/internal/v5/egress-health` | 非 `"ok":true` + `role:"egress"` | 容器出站面探活(容器网段视角) |
 | `public_route` | `Host: claudeai.chat GET 127.0.0.1/healthz` | 非 `"ok":true` + `channel:"v5"` | 覆盖 Caddy→v5 的真实公网路由，能直接发现 Cloudflare 502 的源头 |
 | `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | v3 已退役，默认不运行；仅显式 `V5MON_CHECK_V3=1` 时保留兼容检查 |
@@ -50,6 +53,12 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 | `mem` | MemAvailable/MemTotal | <10% | OOM 前兆;容器池机器内存吃紧会连环 OOM kill |
 | `pool` | `docker ps` 中 v5-ccb 镜像容器数 | >20 | 灰度期稳态 ~1-5;>20 = 回收失灵或被刷。docker daemon 不响应也在此项报 |
 | `image` | `OC_RUNTIME_IMAGE`(env)必须在 `docker images` | 不存在 | tag 漂移(镜像被误删/env 手滑)→ 起新容器全挂,平时无症状,出事才发现 |
+
+Serving lane 派生矩阵：`stable` 与 `canary step<READY(10)` 只看 active；`canary
+step>=10`、`finalizing step<6`、`aborting step<2` 同时看 active+candidate；
+`finalizing step>=6` 只把 candidate 作为 generic serving；`aborting step>=2` 只看旧
+active。`deploy_state` 读取失败或字段非法时，独立 `deploy_state` check 立即 bad；
+`svc_v5/http_v5` 不写新 condition、保留状态文件里的最后已知值，绝不回退猜 A 或误触发自动部署。
 
 **去重语义**:状态翻转才发信 —— 好→坏立即告警(warning),坏→好发恢复(info);坏状态持续时每 **6 小时**重复提醒一次。一轮多项翻转合并为一条站内信。状态文件损坏时自动当首轮重建(坏项会重报一次,安全方向的失误)。
 

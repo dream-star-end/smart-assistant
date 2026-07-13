@@ -329,6 +329,13 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 ```
 版本记账格式=文件名去 `.sql`(必须与既有行一致,否则 runner 对账守卫会炸);psql 造数/迁移**必须显式 COMMIT**。
 
+`deploy/v5/release-metadata.json.requiredMigrations` 是所有 deploy/dist/rollback/canary/
+finalize/abort/recover 等写 lane 的统一硬门；目标 rollback/canary release 还会按自己的 metadata
+再验一次。任一缺行都在 symlink/unit/Caddy/状态机副作用前 fail-closed。若新迁移编号低于线上
+`MAX(schema_migrations.version)`（例如后补 `0135_deploy_state`，线上已经到 0142），普通 migration
+runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板手工执行 SQL + 同事务记账，随后
+重新跑部署硬门，不能仅补记账或用 AUTO_MIGRATE 绕过。
+
 ### 4.6 发版节奏(2026-07-06 起,P1.5 制度化)
 全量现网后告别"随改随发"。规则(可按运营数据调整):
 - **常规批次攒窗口发**:非紧急改动合并 canonical 后不立即部署,攒到当日发版窗口(默认每日 1-2 个,北京时间午后/晚间)一次上线;一窗一条面向用户 changelog(改动可感知时)。

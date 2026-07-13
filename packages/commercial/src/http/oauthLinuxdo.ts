@@ -30,6 +30,8 @@ import {
   LinuxdoOAuthError,
 } from '../auth/linuxdo.js'
 import { socialLoginOrCreate, SocialLoginError } from '../auth/socialLogin.js'
+import { consumeOAuthPendingState, putOAuthPendingState } from '../auth/oauthPendingStore.js'
+import type { QueryRunner } from '../db/queries.js'
 import { enforceRateLimit, type CommercialHttpDeps, type RequestContext } from './handlers.js'
 import type { RateLimitConfig } from '../middleware/rateLimit.js'
 import { getSystemSetting } from '../admin/systemSettings.js'
@@ -38,6 +40,17 @@ const LINUXDO_START_RATE_LIMIT: RateLimitConfig = {
   scope: 'linuxdo_start',
   windowSeconds: 60,
   max: 30,
+}
+
+// ─── test-injectable overrides ────────────────────────────────────────
+// 生产不传;测试注入以绕开真 PG / 真 LDC。
+export interface LinuxdoOverrides {
+  /** 注入 pending store 的 QueryRunner,默认走 pool。 */
+  pendingRunner?: QueryRunner
+  /** 注入 KMS key,默认 loadKmsKey()。 */
+  pendingKey?: Buffer
+  /** 注入 code→userinfo 交换(避免打 LDC)。 */
+  exchanger?: typeof exchangeLinuxdoOAuth
 }
 
 /**
@@ -95,6 +108,7 @@ export async function handleLinuxdoStart(
   res: ServerResponse,
   ctx: RequestContext,
   deps: CommercialHttpDeps,
+  overrides: LinuxdoOverrides = {},
 ): Promise<void> {
   await enforceRateLimit(deps, LINUXDO_START_RATE_LIMIT, ctx.clientIp)
 
@@ -111,6 +125,15 @@ export async function handleLinuxdoStart(
     throw err
   }
 
+  // pending state 迁 PG:LDC 登录无 userId 绑定(登录非关联),payload 空,只靠原子
+  // 单次消费 + TTL + state cookie 防重放/CSRF。跨 slot callback 天然成立。
+  await putOAuthPendingState({
+    provider: 'linuxdo',
+    state: result.state,
+    payload: {},
+    runner: overrides.pendingRunner,
+    key: overrides.pendingKey,
+  })
   setOAuthStateCookie(res, result.state, { secure: deps.refreshCookieSecure })
   ctx.log.info('linuxdo_start', {})
   sendRedirect(res, result.authUrl)
@@ -123,6 +146,7 @@ export async function handleLinuxdoCallback(
   res: ServerResponse,
   ctx: RequestContext,
   deps: CommercialHttpDeps,
+  overrides: LinuxdoOverrides = {},
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
   const queryState = url.searchParams.get('state') ?? ''
@@ -153,6 +177,14 @@ export async function handleLinuxdoCallback(
   // ── 2) LDC 把用户回退过来时带 ?error=… —— 多半是用户在 LDC 上拒绝授权
   if (queryError) {
     ctx.log.info('linuxdo_callback_provider_error', { error: queryError })
+    // MINOR 2:state 双因素已过 → 顺手 best-effort 消费(原子 DELETE)对应 pending row,
+    // 不给用户拒授权后的 pending(含 PKCE verifier)留悬挂行(不成功由 TTL/GC 兜底)。
+    await consumeOAuthPendingState({
+      provider: 'linuxdo',
+      state: queryState,
+      runner: overrides.pendingRunner,
+      key: overrides.pendingKey,
+    }).catch(() => { /* best-effort */ })
     sendRedirect(res, loginErrorRedirect(mapErrorCode(queryError)))
     return
   }
@@ -162,10 +194,25 @@ export async function handleLinuxdoCallback(
     return
   }
 
+  // ── 2.5) 原子消费 pending state(server 端一次性 + TTL);命中 0 行(不存在/过期/
+  // 已消费=重放)→ invalid_state(与旧 pending Map 语义一致,跨 slot 也成立)。
+  const pending = await consumeOAuthPendingState({
+    provider: 'linuxdo',
+    state: queryState,
+    runner: overrides.pendingRunner,
+    key: overrides.pendingKey,
+  })
+  if (!pending) {
+    ctx.log.warn('linuxdo_callback_pending_miss', {})
+    sendRedirect(res, loginErrorRedirect('invalid_state'))
+    return
+  }
+
   // ── 3) 用 code 换 LDC userinfo
+  const exchanger = overrides.exchanger ?? exchangeLinuxdoOAuth
   let userInfo
   try {
-    userInfo = await exchangeLinuxdoOAuth(queryCode, queryState)
+    userInfo = await exchanger(queryCode)
   } catch (err) {
     if (err instanceof LinuxdoOAuthError) {
       // 只 log code + status,不带 err.message —— 网络/SDK error.message 不是稳定

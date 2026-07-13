@@ -13,6 +13,26 @@
 import type { IncomingMessage } from "node:http";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+// P3 双 master 蓝绿交接 + cohort 分批切流(RFC-v5-dual-master-cohort)。
+import type { Slot } from "./deploy/deployState.js";
+import { startDesiredWatch, type DesiredWatch } from "./deploy/deployState.js";
+import { createLeaderBundle, type LeaderBundle, type BundleMemberHandle } from "./deploy/leaderBundle.js";
+import {
+  createLeaderLeaseController,
+  resolveLeaderEnvEligibility,
+  type LeaderLeaseController,
+  type LeadershipStatus,
+} from "./deploy/leaderLease.js";
+import {
+  createControlListener,
+  privatePortForSlot,
+  type ControlListener,
+} from "./deploy/controlListener.js";
+import {
+  createSlotRelayClient,
+  handleSlotRelayRequest,
+  type SlotRelayLocal,
+} from "./deploy/slotRelay.js";
 import type { TLSSocket } from "node:tls";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
@@ -158,22 +178,21 @@ import {
 import {
   startIncidentReconciler,
   startIncidentSweeper,
+  startIncidentSnapshot,
   assertSelfhealConfig,
   selfhealTickMs,
   type IncidentReconcilerHandle,
   type IncidentReconcilerSnapshotHandle,
+  type IncidentSnapshotHandle,
 } from "./selfheal/index.js";
 import {
   startWecomAlertDispatcher,
-  type WecomAlertDispatcherHandle,
 } from "./admin/wecomAlertDispatcher.js";
 import {
   getWecomAibotConnectionManager,
-  type WecomAibotConnectionManager,
 } from "./admin/wecomAibotConnection.js";
 import {
   startUserNoticeApproval,
-  type UserNoticeApprovalHandle,
 } from "./selfheal/userNoticeApproval.js";
 import {
   makeAnthropicProxyHandler,
@@ -299,6 +318,7 @@ import {
   startSessionsGcSweeper,
 } from "./db/pgSessionsBackend.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
+import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -325,7 +345,6 @@ import {
 import { seedDefaultConnectors } from "./connectors/declarativeSeed.js";
 import {
   startConnectorSweeper,
-  type ConnectorSweeperHandle,
 } from "./connectors/sweeper.js";
 import {
   RESEARCH_PREFIX,
@@ -530,7 +549,7 @@ export interface CommercialRuntimeStatus {
   agentRuntime: "enabled" | "disabled";
   /** v3 supervisor 容器运行时(OC_RUNTIME_IMAGE)状态。 */
   containerRuntime: "enabled" | "disabled";
-  /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。 */
+  /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。live getter:反映 LeaderBundle 实时启停。 */
   schedulers: string[];
   /**
    * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
@@ -539,6 +558,14 @@ export interface CommercialRuntimeStatus {
    * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
    */
   capabilities: string[];
+  /**
+   * P3 leader lease 归属(RFC-v5-dual-master-cohort D4)。healthz 只读断言面:
+   * state=ineligible(env kill-switch)|standby(有 env 资格但 desired 非本 slot)|
+   * acquiring|leader|fenced。env=1 不再等同 active leader(smoke 断言随之改为断言 state=leader)。
+   */
+  leadership: LeadershipStatus;
+  /** P3 lane 放量观测快照(evaluateLane 命中计数,详见 deploy/laneEvaluate.ts)。 */
+  laneMetrics: LaneMetricsSnapshot;
 }
 
 export interface RegisterCommercialResult {
@@ -1060,6 +1087,66 @@ export async function registerCommercial(
     }
   }
 
+  // ── P3 双 master 蓝绿:LeaderBundle + lease + desired watch + 控制口 VIP(RFC D3/D4)─────────
+  // 本 slot 静态身份(RFC §3:A/B)。默认 'A'——基建版现有 unit 即 A slot。非法值 fail-closed。
+  const ocSlotRaw = process.env.OC_SLOT?.trim() || "A";
+  if (ocSlotRaw !== "A" && ocSlotRaw !== "B") {
+    throw new Error(`[commercial] OC_SLOT 必须是 'A'|'B'(当前=${JSON.stringify(process.env.OC_SLOT)}),拒起`);
+  }
+  const ocSlot: Slot = ocSlotRaw;
+  // 双 master 是 v5 特性:v5 走 lease-gated bundle + 控制口 VIP;非 v5(v3/个人版)保持旧 eager 语义。
+  const dualMasterEnabled = runtimeChannel === "v5";
+  // LeaderBundle 始终构造(统一收口 shared+4 特例调度器的启动);触发方式按 channel 分流(见文末)。
+  // onMemberStopped:成员 drain 后从 schedulerRegistry 摘除,让 healthz schedulers getter 实时反映让位。
+  const leaderBundle: LeaderBundle = createLeaderBundle({
+    onMemberStopped: (name) => unregisterMutator(name),
+    onError: (ctx, err) => rootLogger.warn(`[leaderBundle] ${ctx}`, { err: (err as Error)?.message ?? String(err) }),
+    logger: {
+      info: (m) => rootLogger.info(m, { subsys: "leaderBundle" }),
+      warn: (m, meta) => rootLogger.warn(m, { subsys: "leaderBundle", meta }),
+    },
+  });
+  // desired watch(5s 轮询缓存):lease 读 desired_leader_slot,控制口读 desired_control_slot。仅 v5 需要。
+  let deployDesiredWatch: DesiredWatch | undefined;
+  let leaderLease: LeaderLeaseController | undefined;
+  let controlListener: ControlListener | undefined;
+  if (dualMasterEnabled) {
+    deployDesiredWatch = startDesiredWatch({
+      pool: getPool(),
+      onError: (err) => rootLogger.warn("[deployDesiredWatch] poll 失败(保留旧缓存)", { err: (err as Error)?.message ?? String(err) }),
+    });
+    // env 资格严格解析('1'|'0';unset/非法=fail-closed 拒起)。与 controlPlaneEnabled 分职:
+    // controlPlaneEnabled 仍供 auto-migrate 等一次性启动分支(读 env 资格不动);lease 用严格版。
+    const eligibleEnv = resolveLeaderEnvEligibility(process.env);
+    leaderLease = createLeaderLeaseController({
+      pool: getPool(),
+      slot: ocSlot,
+      desiredWatch: deployDesiredWatch,
+      eligibleEnv,
+      callbacks: {
+        // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
+        // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
+        onAcquire: () => leaderBundle.start(),
+        onFence: (reason) => {
+          rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
+          return leaderBundle.stopAndDrain();
+        },
+      },
+      // fail-stop:无法安全持有/交出 leadership(bundle 半启动 / drain 有 stuck / 掉线后 ACK 也失败)时
+      // 退进程,systemd Restart=on-failure 拉起后因 desired 判定以 standby 起,后继经 PID liveness 接管。
+      onFatal: (reason, detail) => {
+        rootLogger.error(`[leaderLease] FAIL-STOP: ${reason}`, { subsys: "leaderLease", detail: (detail as Error)?.message ?? detail });
+        // eslint-disable-next-line no-process-exit
+        process.exit(1);
+      },
+      logger: {
+        info: (m, meta) => rootLogger.info(m, { subsys: "leaderLease", meta }),
+        warn: (m, meta) => rootLogger.warn(m, { subsys: "leaderLease", meta }),
+        error: (m, meta) => rootLogger.error(m, { subsys: "leaderLease", meta }),
+      },
+    });
+  }
+
   const jwtSecret =
     options.jwtSecret ??
     process.env.COMMERCIAL_JWT_SECRET ??
@@ -1281,13 +1368,14 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
-  // v5 自愈体系(RFC §5):selfheal sweeper 经 forward-ref 拿 bridge 的全站/定向广播入口
-  // (与 bridgeBroadcastRef 同型;bridge 在下方装配后回填,未就绪时 no-op 返回 0)。
-  const broadcastToUsersRef: { current: (uids: string[], payload: unknown) => number } = {
-    current: () => 0,
+  // 双槽私有 relay 的本槽 bridge forward-ref。控制口先起、bridge 后装配，窗口内安全返空。
+  const slotRelayLocalRef: { current: SlotRelayLocal } = {
+    current: { onlineUserSubset: () => [], broadcastToUsers: () => 0 },
   };
-  // activeIncidents 内存快照 getter(sweeper 装配后回填):供 bridge 鉴权后补发在线用户
-  // 未见过的活跃事故(RFC §5 [解 M4] 补发位置在 WS 注册之后)。bridge 侧集成读此 ref。
+  const slotRelayClient = createSlotRelayClient({
+    secret: cfg.OC_EGRESS_SECRET ?? "",
+    logger: rootLogger.child({ subsys: "commercial", module: "slotRelay" }),
+  });
   // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
   // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
   // (MASTER_USER_PREFIX),而 proxy/bridge 传进来的是裸 uid(与 PG 计费同口径)。
@@ -1841,18 +1929,106 @@ export async function registerCommercial(
         }
         return internalProxyHandler!(req, res, ctx);
       };
-      internalProxyServer = createHttpServer((req, res) => {
+      // ── P3 控制口只读端点(RFC D3;私有口 + VIP 共用此 handler)────────────────────
+      // 这两个是 Agent A/C 之间掉的球,现在补上:deploy lane 的 finalize 四门槛 / candidate 自检 /
+      // abort 健康核验都靠它们。在 dispatchInternal(anthropic proxy 路由,不认这些路径)之前拦截。
+      const currentLeadership = (): LeadershipStatus =>
+        leaderLease
+          ? leaderLease.status()
+          : { state: "ineligible", slot: ocSlot, generation: null, leasePid: null };
+      // 私有口 healthz:leadership + vip(owner|released)+ slot —— deploy 脚本据此判断 standby/leader/VIP 归属。
+      const respondControlHealthz = (res: ServerResponse): void => {
+        const vip = controlListener?.status().vipBound ? "owner" : "released";
+        const body = {
+          ok: true, // 本控制口在响应即证明进程存活;深度依赖探活走 /internal/v5/control-probe。
+          channel: runtimeChannel,
+          slot: ocSlot,
+          leadership: currentLeadership(),
+          vip,
+        };
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify(body));
+      };
+      // control-probe:egress secret 校验后自检 dispatcher 路由表 + PG SELECT 1 + "本实例持有 VIP"。
+      const respondControlProbe = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+        const reply = (code: number, obj: Record<string, unknown>): void => {
+          res.statusCode = code;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(obj));
+        };
+        const secret = cfg.OC_EGRESS_SECRET;
+        if (!secret) return reply(503, { ok: false, error: "EGRESS_SECRET_UNSET" });
+        const presented = req.headers["x-oc-egress-secret"];
+        const okSecret =
+          typeof presented === "string" &&
+          (() => {
+            const pBuf = Buffer.from(presented);
+            const eBuf = Buffer.from(secret);
+            return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf);
+          })();
+        if (!okSecret) return reply(401, { ok: false, error: "UNAUTHORIZED" });
+        // ① dispatcher 路由表已装配 ② PG 连通 ③ 本实例持有 VIP
+        const routeTable = typeof dispatchInternal === "function" && typeof internalProxyHandler === "function";
+        let pgOk = false;
+        try {
+          await getPool().query("SELECT 1");
+          pgOk = true;
+        } catch {
+          pgOk = false;
+        }
+        const vipOwner = controlListener?.status().vipBound === true;
+        return reply(200, {
+          ok: routeTable && pgOk && vipOwner,
+          routeTable,
+          pg: pgOk ? "ok" : "error",
+          vipOwner,
+          slot: ocSlot,
+          leadership: currentLeadership(),
+        });
+      };
+      // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
+      const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
+        // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
+        const urlPath = (req.url ?? "").split("?")[0];
+        if (req.method === "GET" && urlPath === "/healthz") {
+          try { respondControlHealthz(res); } catch { /* socket gone */ }
+          return;
+        }
+        if (req.method === "GET" && urlPath === "/internal/v5/control-probe") {
+          void respondControlProbe(req, res).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error("[commercial] control-probe handler threw:", err);
+            if (!res.headersSent) {
+              try {
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ ok: false, error: "PROBE_INTERNAL" }));
+              } catch { /* socket gone */ }
+            }
+          });
+          return;
+        }
+        // 双槽定向通知 relay 只允许走本 slot 私有控制口；VIP/普通 proxy 端口不暴露该面。
+        if (
+          dualMasterEnabled &&
+          req.socket.localPort === privatePortForSlot(ocSlot) &&
+          handleSlotRelayRequest(req, res, {
+            secret: cfg.OC_EGRESS_SECRET ?? "",
+            local: {
+              onlineUserSubset: (uids) => slotRelayLocalRef.current.onlineUserSubset(uids),
+              broadcastToUsers: (uids, payload) => slotRelayLocalRef.current.broadcastToUsers(uids, payload),
+            },
+            logger: rootLogger.child({ subsys: "commercial", module: "slotRelayServer" }),
+          })
+        ) return;
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
-        // selfHostUuid 在外层闭包已取,保证非 undefined(否则根本走不到 createHttpServer 这行)。
         // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
-        // 真实容器 ip 由 egress 注入 x-v5-egress-peer-ip(它同时会剥掉入站同名头,
-        // 容器伪造不进来)。verifyContainerIdentity 的 bound_ip 因子依赖这个值。
+        // 真实容器 ip 由 egress 注入 x-v5-egress-peer-ip(它同时会剥掉入站同名头,容器伪造不进来)。
         const fwdPeer = egressSplitEnabled ? req.headers["x-v5-egress-peer-ip"] : undefined;
         const peerIp =
           (typeof fwdPeer === "string" && fwdPeer.trim()) || req.socket.remoteAddress || "";
-        // dispatchInternal 在外层闭包已被赋值;TS 不能静态证明 closure 内非 undefined,
-        // 但 createHttpServer 只能在赋值之后被回调触发,故 ! 安全。
         Promise.resolve(
           dispatchInternal!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
         ).catch((err) => {
@@ -1868,21 +2044,56 @@ export async function registerCommercial(
             try { res.end(); } catch { /* */ }
           }
         });
-      });
-      // 同步监听 + 转 promise:监听失败立即 throw,主流程 catch 后降级
-      await new Promise<void>((resolve, reject) => {
-        internalProxyServer!.once("error", reject);
-        internalProxyServer!.listen(proxyPort, proxyBind, () => {
-          internalProxyServer!.removeListener("error", reject);
-          resolve();
+      };
+      if (dualMasterEnabled && egressSplitEnabled && deployDesiredWatch) {
+        // ── P3 双 master 控制口:VIP + 私有双 listener(RFC D3)────────────────────
+        // VIP=proxyBind:proxyPort(egress 唯一目标,零改动),仅 desired_control_slot==本 slot bind;
+        // 私有口=127.0.0.1:privatePortForSlot(slot)(本 slot 常驻自检口)。基建版 A slot+desired=A →
+        // 启动即 bind proxyPort(与今日单 listener 同)+ 新增 18896。EADDRINUSE 交接窗重试,余错 fail-loud。
+        controlListener = createControlListener({
+          slot: ocSlot,
+          desiredWatch: deployDesiredWatch,
+          handler: internalRequestHandler,
+          vip: { host: proxyBind, port: proxyPort },
+          logger: {
+            info: (m, meta) => rootLogger.info(m, { subsys: "controlListener", meta }),
+            warn: (m, meta) => rootLogger.warn(m, { subsys: "controlListener", meta }),
+            error: (m, meta) => rootLogger.error(m, { subsys: "controlListener", meta }),
+          },
         });
-      });
-      internalProxyAddress = { host: proxyBind, port: proxyPort };
-      // eslint-disable-next-line no-console
-      console.log(
-        `[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`,
-      );
+        // 首绑前 prime desired 缓存:确保 controlListener 的 firstAttempt VIP 判定看到真实
+        // desired_control_slot(而非 watch 尚未首轮轮询的 null)。首读失败(PG 抖)不阻塞——
+        // current() 保持 null → VIP 首绑跳过,由 watch onChange 后补 bind。
+        try { await deployDesiredWatch.refreshNow(); } catch { /* 首读失败,后补 */ }
+        await controlListener.start();
+        internalProxyAddress = { host: proxyBind, port: proxyPort };
+        // eslint-disable-next-line no-console
+        console.log(`[commercial] P3 控制口 VIP+私有双 listener 就绪 (slot=${ocSlot}, vip=${proxyBind}:${proxyPort})`);
+      } else {
+        internalProxyServer = createHttpServer(internalRequestHandler);
+        // 同步监听 + 转 promise:监听失败立即 throw,主流程 catch 后降级
+        await new Promise<void>((resolve, reject) => {
+          internalProxyServer!.once("error", reject);
+          internalProxyServer!.listen(proxyPort, proxyBind, () => {
+            internalProxyServer!.removeListener("error", reject);
+            resolve();
+          });
+        });
+        internalProxyAddress = { host: proxyBind, port: proxyPort };
+        // eslint-disable-next-line no-console
+        console.log(
+          `[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`,
+        );
+      }
     } catch (err) {
+      // P3:控制口(VIP+私有)bind 失败 = 部署故障,fail-loud 拒起(私有口是本 slot 自检基础设施,
+      // egress 靠 VIP 送 cost 事件——静默 disable 会让 v5 master 带病运行)。单 listener 路径保持
+      // 旧"降级 disable"语义(容器直连非 split,失败退化为无内部代理,/healthz 反映)。
+      if (dualMasterEnabled && egressSplitEnabled) {
+        try { await controlListener?.close(); } catch { /* */ }
+        controlListener = undefined;
+        throw err;
+      }
       // eslint-disable-next-line no-console
       console.error("[commercial] internal proxy listener failed; disabling:", err);
       try { internalProxyServer?.close(); } catch { /* */ }
@@ -2361,13 +2572,32 @@ export async function registerCommercial(
       }
     }
 
+    // ── P3 MAJOR 4(compute-pool 三件套双 master 护栏 + 收口债)───────────────────────
+    // preheatV3Image / initComputePool / imagePromote 都向共享 compute_hosts 写状态(desired/loaded
+    // image、quarantine、backfill),属 v3 控制面;它们仍以 **静态 controlPlaneEnabled eager-start,
+    // 未纳入 LeaderBundle**。双 master(v5)下两 slot 的 OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled
+    // 两 slot 都 true → 两 slot 都 eager 跑 = 双写 compute_hosts 竞态;且 imagePromote 以 shared 域 eager
+    // 注册会违反下方"非 leader 不跑 shared"实时不变量。在纳入 bundle 前的硬护栏:v5 下 candidate/incumbent
+    // 任一 slot 都必须显式关掉这些开关,否则 fail-loud 拒起。v3 已下线、v5 镜像本机常驻,compute-pool
+    // 对 v5 本就无用(preheat 是 noop)。【收口债】后续应将 compute-pool 纳入 LeaderBundle 或从 v5 剥离。
+    if (dualMasterEnabled && controlPlaneEnabled) {
+      const preheatOn = process.env.OC_PREHEAT_DISABLED !== "1";
+      const distributeOn = process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1";
+      if (preheatOn || distributeOn) {
+        throw new Error(
+          "[commercial] v5 双 master:compute-pool 三件套(preheat/initComputePool/imagePromote)未纳入 " +
+            "LeaderBundle,eager 跑会在两 slot 双写 v3 compute_hosts 且违反 shared 单跑不变量。须在 v5 " +
+            "drop-in 显式关闭:OC_PREHEAT_DISABLED=1 且 OC_IMAGE_DISTRIBUTE_DISABLED=1(v3 已下线、v5 镜像本机常驻)。拒起。",
+        );
+      }
+    }
+
     // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
     // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。
     // OC_PREHEAT_DISABLED=1 关闭(测试 / 网络受限 / CI)。失败不影响 gateway。
     // P1d 单一权威:preheat + 其内嵌的 compute pool init / image-promote scheduler 都向
-    // 共享 compute_hosts 写状态(desired/loaded image、quarantine、backfill),属 v3 控制面。
-    // 必须先过 controlPlaneEnabled(channel=v5 恒 false → 整块跳过,v5 绝不写共享控制面;
-    // v5 镜像本就在本机,preheat 对 v5 也是 noop)。
+    // 共享 compute_hosts 写状态。v5(dualMaster)已由上方 MAJOR 4 护栏要求显式关闭这些开关;
+    // 走到此处的 v5 一定 preheatOn=false,故本块实际只在非双 master(v3/legacy leader)执行。
     if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== "1") {
       void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
         info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
@@ -2723,98 +2953,101 @@ export async function registerCommercial(
   //
   // 注:v3Deps 已在 createCommercialHandler 之前装配(HIGH#6 admin v3 dispatch 需要)。
 
-  // V3 Phase 3F:idle 30min stop+remove ephemeral 容器(MVP 单轨)。
-  // 仅在 v3 supervisor 装配后启用;cfg.OC_IDLE_SWEEP_DISABLED=1 可手动关掉
-  // (运维灾备时用,默认 60s tick / 30min idle cutoff)。
-  // P1d 单一权威:容器面后台 mutator 一律先过 controlPlaneEnabled(channel=v5 恒 false →
-  // 永不启动,连 runOnStart mutate 都不会发生),env *_DISABLED 仅作 v3 运维二级开关。
-  let idleSweepScheduler: IdleSweepScheduler | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
-    const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
-    idleSweepScheduler = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(v3Deps, {
-      logger: idleSweepLog,
-      runOnStart: false,
-    }));
-    idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30 });
-  }
-
-  // V3 Phase 3G:volume GC(banned 7d / no-login 90d)。1h 一跑,删孤立 volume。
-  // cfg.OC_VOLUME_GC_DISABLED=1 可手动关掉(运维灾备 / 数据回滚演练时用)。
-  let volumeGcScheduler: VolumeGcScheduler | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
-    const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
-    volumeGcScheduler = trackScheduler("volumeGc", "shared", startVolumeGcScheduler(v3Deps, {
-      logger: volumeGcLog,
-      runOnStart: false,
-    }));
-    volumeGcLog.info("scheduler started", {
-      tickSec: 3600, bannedDays: 7, noLoginDays: 90,
-    });
-  }
-
-  // V3 Phase 3H:orphan reconcile(gateway 启动立刻 + 1h tick)。docker↔DB 双向对账。
-  // cfg.OC_ORPHAN_RECONCILE_DISABLED=1 可关闭(运维灾备 / 数据冷恢复时用)。
-  // 归属域 v5-owned(07-06 债偿):扫描/写入两侧全程 runtime_channel 隔离(listManagedContainers
-  // dockerContainerOwnedByChannel + listActiveRows/stopAndRemove SQL 均带 channel 过滤),
-  // v3(leader)与 v5 双跑各扫各的,互不可见;SAFETY_RACE_WINDOW(300s)与进程内 409 自愈
-  // (createV3ContainerLocalWithSelfHeal)天然错峰,双方 rm 均 404 吞幂等。idleSweep/volumeGc
-  // 仍留 shared 钉死(活跃容器误杀窗口/不可逆删卷,见 roadmap 07-06 晚登记)。
-  let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
-  if ((controlPlaneEnabled || runtimeChannel === "v5") && v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
-    const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
-    orphanReconcileScheduler = trackScheduler("orphanReconcile", "v5-owned", startOrphanReconcileScheduler(v3Deps, {
-      logger: orphanReconcileLog,
-      // 默认 runOnStart=true(§3H 明确"gateway 启动 reconcile")
-    }));
-    orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
-  }
-
-  // V3 R6.11 §14.2.6:agent_migrations stale ledger reconciler(gateway 启动立刻 + 60s tick)。
-  // 进程崩重启 / 长时间 alive 中途崩过的兜底:扫 `phase NOT IN closed` + updated_at 超
-  // `supervisor_stale_migrate_threshold_sec`(默认 600s)的行,planned 阶段直接
-  // markRolledBack +(pausedAt 非空时)unpause 旧容器 — 这是 R6.11 reader 二选一硬约束的
-  // 单点权威闭环(02-DEVELOPMENT-PLAN.md §14.2.6:2093)。
-  // OC_MIGRATION_RECONCILER_DISABLED=1 关闭(运维灾备 / writer 上线前的紧急回滚开关)。
-  let migrationReconcileScheduler: MigrationReconcileScheduler | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
-    const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
-    migrationReconcileScheduler = trackScheduler("migrationReconcile", "shared", startMigrationReconcileScheduler(v3Deps, {
-      logger: migrationReconcileLog,
-      // 默认 runOnStart=true + 60s tick + staleSec=600(R6.11 默认)
-    }));
-    migrationReconcileLog.info("scheduler started", {
-      tickSec: 60, staleSec: 600, runOnStart: true,
-    });
-  }
-
-  // fix:HealthPoller(compute-pool/nodeHealth.ts)在 5029a69 引入但从未在 service
-  // boot 接 .start() — last_health_at 一直 NULL,自动 quarantine/recovery 状态机失效,
-  // mTLS cert 临近过期的自动 renewal 也跟着失效。OC_HEALTH_POLLER_DISABLED=1 给单
-  // host / dev 场景保留 disable。
-  let healthPoller: HealthPoller | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
-    healthPoller = trackScheduler("healthPoller", "shared", getHealthPoller());
-    healthPoller.start();
-    rootLogger.child({ subsys: "node-health" }).info("scheduler started", {
-      intervalMs: 30_000,
-    });
-  }
-
-  // T-63 Phase 2:订阅 docker container events → `container.oom_exited` 告警。
-  // cfg.OC_CONTAINER_EVENTS_DISABLED=1 可关闭(运维灾备 / docker daemon 异常时用)。
-  let containerEventsWorker: V3ContainerEventsWorker | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
-    containerEventsWorker = trackScheduler("containerEvents", "shared", startV3ContainerEventsWorker({
-      docker: v3Deps.docker,
-      logger: {
-        debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
-        info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
-        warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
-        error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+  // ── P3:容器面 shared 调度器收口 LeaderBundle(RFC D4)──────────────────────────
+  // 旧模型每个都 `if (controlPlaneEnabled && ...)` eager-start;双 master 下会双跑(双误杀/双删卷/
+  // 双对账竞态)。改造:membership = 各自 deps(v3Deps)+ *_DISABLED(不含 leadership),启动时机
+  // 交给 lease(v5)/ controlPlaneEnabled(legacy)统一触发。trackScheduler 留在 start 闭包内
+  // (注册进 schedulerRegistry + 满足 scheduler-wiring lint);drain 时 bundle 经 onMemberStopped 摘除。
+  // orphanReconcile 曾以 v5-owned `||v5` 双跑(错峰缓解),P3 归入 leader 单跑=正解(消错峰假设)。
+  if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
+    const deps = v3Deps;
+    leaderBundle.add({
+      name: "idleSweep",
+      domain: "shared",
+      start: () => {
+        const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
+        const h = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(deps, { logger: idleSweepLog, runOnStart: false }));
+        idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30 });
+        return { stop: () => h.stop() };
       },
-    }));
-    // eslint-disable-next-line no-console
-    console.log("[commercial] v3 container events worker started (oom/die → alerts)");
+    });
+  }
+
+  if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
+    const deps = v3Deps;
+    leaderBundle.add({
+      name: "volumeGc",
+      domain: "shared",
+      start: () => {
+        const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
+        const h = trackScheduler("volumeGc", "shared", startVolumeGcScheduler(deps, { logger: volumeGcLog, runOnStart: false }));
+        volumeGcLog.info("scheduler started", { tickSec: 3600, bannedDays: 7, noLoginDays: 90 });
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+    const deps = v3Deps;
+    leaderBundle.add({
+      name: "orphanReconcile",
+      domain: "v5-owned",
+      start: () => {
+        const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
+        const h = trackScheduler("orphanReconcile", "v5-owned", startOrphanReconcileScheduler(deps, { logger: orphanReconcileLog }));
+        orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
+    const deps = v3Deps;
+    leaderBundle.add({
+      name: "migrationReconcile",
+      domain: "shared",
+      start: () => {
+        const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
+        const h = trackScheduler("migrationReconcile", "shared", startMigrationReconcileScheduler(deps, { logger: migrationReconcileLog }));
+        migrationReconcileLog.info("scheduler started", { tickSec: 60, staleSec: 600, runOnStart: true });
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "healthPoller",
+      domain: "shared",
+      start: () => {
+        const hp = trackScheduler("healthPoller", "shared", getHealthPoller());
+        hp.start();
+        rootLogger.child({ subsys: "node-health" }).info("scheduler started", { intervalMs: 30_000 });
+        return { stop: () => hp.stop() };
+      },
+    });
+  }
+
+  if (v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
+    const deps = v3Deps;
+    leaderBundle.add({
+      name: "containerEvents",
+      domain: "shared",
+      start: () => {
+        const h = trackScheduler("containerEvents", "shared", startV3ContainerEventsWorker({
+          docker: deps.docker,
+          logger: {
+            debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+            info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+            warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+            error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+          },
+        }));
+        // eslint-disable-next-line no-console
+        console.log("[commercial] v3 container events worker started (oom/die → alerts)");
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // v1.0.191:复用 sharedEnsureRunning(与 /api/media-signed ensureContainerReady
@@ -3151,6 +3384,11 @@ export async function registerCommercial(
   let wechatBroker: WechatBroker | undefined;
   // controlPlaneEnabled 纳入:broker 启动 outbox worker/reconcile/housekeeping(写 wechat_outbox /
   // soft-delete session / 发 iLink)属共享-state mutator,v5 follower 必须静默。
+  // 【P3 MINOR 3 收口债】wechatBroker 目前以 controlPlaneEnabled 静态 gate + eager start(未纳入
+  // LeaderBundle),且 v5 下被 follower 硬 block(WECHAT_BROKER_ENABLED=1 是禁忌项,见文首 v5 env
+  // 守卫)——即 v5 当前根本不跑 broker,故无双 master 双跑面。**未来若为 v5 解除该 legacy gate
+  // 让 broker 在 v5 上线,它是 shared-domain 单跑 mutator,必须同步纳入 LeaderBundle(add 成 member,
+  // 交给 lease 单 leader 启停),绝不能沿用这套静态 eager gate**,否则双 master 会双发 iLink / 双写 outbox。
   if (controlPlaneEnabled && cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
     // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
     //   sendText → broker
@@ -3574,6 +3812,18 @@ export async function registerCommercial(
     })();
   };
 
+  // 每槽 read-only incident snapshot：follower 也可在 WS 鉴权后补发，但不 claim/repair/send。
+  let incidentSnapshot: IncidentSnapshotHandle | undefined;
+  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
+    assertSelfhealConfig();
+    incidentSnapshot = trackScheduler(
+      "incidentSnapshot",
+      "local",
+      startIncidentSnapshot({ intervalMs: selfhealTickMs() }),
+    );
+    await incidentSnapshot.runNow();
+  }
+
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     resolveContainerEndpoint,
@@ -3608,9 +3858,11 @@ export async function registerCommercial(
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
     logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
-    // 鉴权后补发当前活跃事故——**per-uid** 过滤(forward-ref:bridge 创建早于
-    // sweeper 赋值,故走闭包读 ref.current)。ref 默认 () => [],装配后为
-    // getActiveIncidentsForUser,只返该 uid 可见事故,绝不泄露他人定向事故(Codex B2)。
+    // 鉴权后补发当前活跃事故——每槽本地 read-only snapshot 做 **per-uid** 过滤，
+    // 只返该 uid 可见事故，绝不泄露他人定向事故(Codex B2)。
+    incidentSnapshotProvider: incidentSnapshot
+      ? (uid) => incidentSnapshot!.getActiveIncidentsForUser(uid)
+      : undefined,
     // 0049 模型授权(plan v3 §B3/§B4)— bridge 层是 v3 commercial 唯一同时拿得到
     // user role 与 grants 的位置(容器内个人版 gateway 没 commercial DB 连接)。
     // 每次新桥连接时调一次:拉本 user grants → 返回一个绑定 pricing+role+grants
@@ -3671,8 +3923,10 @@ export async function registerCommercial(
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
-  // v5 自愈:把 selfheal sweeper 的广播 forward-ref 指向 bridge 真实入口。
-  broadcastToUsersRef.current = (uids, payload) => userChatBridge.broadcastToUsers(uids, payload);
+  slotRelayLocalRef.current = {
+    onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),
+    broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
+  };
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
   // then one-shot DeepSeek V4 Flash context polish after stop.
@@ -3690,32 +3944,46 @@ export async function registerCommercial(
     logger: rootLogger.child({ subsys: "commercial", module: "voiceTranscribe" }),
   });
 
-  // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
-  let alertScheduler: AlertScheduler | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
-    // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
-    const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
-    const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-    alertScheduler = trackScheduler("alert", "shared", startAlertScheduler({
-      intervalMs: tickMs,
-      runOnStart: false,
-    }));
+  // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)。P3:收口 LeaderBundle。
+  if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "alert",
+      domain: "shared",
+      start: () => {
+        // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
+        const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
+        const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("alert", "shared", startAlertScheduler({ intervalMs: tickMs, runOnStart: false }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
-  // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。
-  // boot 不立即跑,等 24h 后第一次 tick(不会冲启动 DB 负载)。
-  let refreshEventsSweeper: RefreshEventsSweeperHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
-    refreshEventsSweeper = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
+  // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。P3:收口 LeaderBundle。
+  if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "refreshEventsSweep",
+      domain: "shared",
+      start: () => {
+        const h = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 审计体系整改批 — 审计/事件表统一 retention sweeper(24h tick,unref,boot 不立即跑)。
   // 政策注册表=admin/auditRetention.ts(security_events 180d/agent_audit 90d/
   // compute_host_audit 90d/turn_traces 90d/rate_limit_events 30d;admin_audit 显式
   // 永久,不允许出现在删除政策)。shared 域:删的是共享审计表,仅 leader 运行。
-  let auditRetentionSweeper: AuditRetentionSweeperHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED !== "1") {
-    auditRetentionSweeper = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper());
+  if (process.env.COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "auditRetentionSweep",
+      domain: "shared",
+      start: () => {
+        const h = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper());
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // plan G2/G4 — codex token refresh actor(单进程独占,60s tick,unref)。
@@ -3749,25 +4017,34 @@ export async function registerCommercial(
   // 账号池 cooldown 半开恢复 actor —— 周期扫 cooldown_until 已过期的账号 → active。
   // 默认 5min tick(下限 1s 防 typo)。
   // 关闭:`COMMERCIAL_COOLDOWN_RECOVERY_DISABLED=1`(测试 / 应急)。
-  let cooldownRecoveryActor: CooldownRecoveryActorHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
-    const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
-    cooldownRecoveryActor = trackScheduler("cooldownRecovery", "shared", startCooldownRecoveryActor({
-      tracker: healthTracker,
-      intervalMs,
-    }));
+  if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "cooldownRecovery",
+      domain: "shared",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
+        const h = trackScheduler("cooldownRecovery", "shared", startCooldownRecoveryActor({ tracker: healthTracker, intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
   // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
-  let pendingOrdersExpirer: PendingOrdersExpirerHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
-    const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-    pendingOrdersExpirer = trackScheduler("pendingOrdersExpirer", "shared", startPendingOrdersExpirer({ intervalMs }));
+  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "pendingOrdersExpirer",
+      domain: "shared",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("pendingOrdersExpirer", "shared", startPendingOrdersExpirer({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 0096 / 0115 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
@@ -3809,28 +4086,40 @@ export async function registerCommercial(
   // 把崩溃后卡 inflight/finalizing 的 journal 行终态化(有结算记录→committed,无→aborted),
   // 并 GC 老终态行。stuck 阈值对 env 向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min),
   // 因为 journal 不心跳、不能把存活长流误判成 stuck。
-  let finalizeJournalReconciler: FinalizeJournalReconcilerHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
-    const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
-    const intervalMs =
-      Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
-        ? rawInterval
-        : DEFAULT_RECONCILE_INTERVAL_MS;
-    const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
-    const thresholdMs = resolveStuckThresholdMs(
-      process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
-      Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
-    );
-    finalizeJournalReconciler = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({ intervalMs, thresholdMs }));
+  if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "finalizeReconciler",
+      domain: "shared",
+      start: () => {
+        const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
+        const intervalMs =
+          Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
+            ? rawInterval
+            : DEFAULT_RECONCILE_INTERVAL_MS;
+        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
+        const thresholdMs = resolveStuckThresholdMs(
+          process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
+          Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
+        );
+        const h = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({ intervalMs, thresholdMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
-  // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。
-  let onboardingScheduler: OnboardingSchedulerHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
-    const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
-    onboardingScheduler = trackScheduler("onboarding", "shared", startOnboardingScheduler({ intervalMs }));
+  // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。P3:收口 LeaderBundle。
+  if (process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "onboarding",
+      domain: "shared",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
+        const h = trackScheduler("onboarding", "shared", startOnboardingScheduler({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // Plan C — inbox 站内信邮件推送 worker.
@@ -3838,14 +4127,17 @@ export async function registerCommercial(
   // 本 scheduler 周期 drain;启动时一次 stale cleanup(sending>5min → interrupted).
   // 关闭:COMMERCIAL_INBOX_EMAIL_DISABLED=1.默认 30s tick / 50 条/batch / 600ms 间隔.
   // mailer 走 stub 也能跑(打 stdout),只有禁用 worker 时不跑.
-  let inboxEmailScheduler: InboxEmailSchedulerHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
-    const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
-    inboxEmailScheduler = trackScheduler("inboxEmail", "shared", startInboxEmailScheduler({
-      mailer,
-      intervalMs,
-    }));
+  if (process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "inboxEmail",
+      domain: "shared",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
+        const h = trackScheduler("inboxEmail", "shared", startInboxEmailScheduler({ mailer, intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 科研 durable job worker(v5 科研 agent 子系统)。
@@ -3878,19 +4170,20 @@ export async function registerCommercial(
   // researchJobs:(controlPlaneEnabled || channel==='v5')。ensureContainerReady 不可用(无 docker
   // 运行时,如 external-proxy-only 拓扑)则不启(唤醒无从谈起)。关停:COMMERCIAL_CRON_WAKE_DISABLED=1。
   // rescan 是 self-host 假设(v5 现状全本机卷);多机化时改走 node-agent 读卷(方案已登记为已知边界)。
-  let cronWakeScheduler: CronWakeSchedulerHandle | undefined;
-  if (
-    (controlPlaneEnabled || runtimeChannel === "v5") &&
-    process.env.COMMERCIAL_CRON_WAKE_DISABLED !== "1" &&
-    ensureContainerReady
-  ) {
+  // P3:cronWake 需交接调度器(RFC §2)→ 收口 LeaderBundle(单 leader 唤醒,消双 master 双唤醒烧钱)。
+  // membership = ensureContainerReady 在手 + !DISABLED(不含 leadership;lease/legacy 触发启动)。
+  if (process.env.COMMERCIAL_CRON_WAKE_DISABLED !== "1" && ensureContainerReady) {
     const wakeFn = ensureContainerReady; // 已 guard 非空
+    leaderBundle.add({
+      name: "cronWake",
+      domain: "v5-owned",
+      start: () => {
     const cronWakeRunner = getPool() as unknown as CronWakeRunner;
     const maxRaw = Number(process.env.COMMERCIAL_CRON_WAKE_MAX_PER_TICK);
     const maxPerTick = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.trunc(maxRaw) : undefined;
     const cdRaw = Number(process.env.COMMERCIAL_CRON_WAKE_COOLDOWN_MIN);
     const cooldownMs = Number.isFinite(cdRaw) && cdRaw >= 0 ? Math.trunc(cdRaw) * 60_000 : undefined;
-    cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler({
+    const cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler({
       findDueUsers: (scanLimit, horizonSec) =>
         findDueCronWakeUsers(cronWakeRunner, {
           runtimeChannel: getRuntimeChannel(),
@@ -3911,6 +4204,9 @@ export async function registerCommercial(
       maxPerTick,
       cooldownMs,
     }));
+        return { stop: () => cronWakeScheduler.stop() };
+      },
+    });
   }
 
   // 市场发布 AI 自动审批 worker(deepseek-v4-pro)。仅 v5 启动:marketplace 表 v3/v5 共享
@@ -3964,42 +4260,56 @@ export async function registerCommercial(
   // 不写共享现网,v5 必须自跑)。reconciler 读 alert_conditions 当前值 level-triggered 投影 incidents;
   // sweeper durable 投递 WS(bridge broadcast forward-ref)+ inbox(同事务幂等)。tick 10s。
   // 关停:OC_SELFHEAL_DISABLED=1。派单(codex 修复)是切片②,sweeper 内 stub 默认关。
-  let incidentReconciler: IncidentReconcilerHandle | undefined;
-  let incidentSweeper: IncidentReconcilerSnapshotHandle | undefined;
   if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
     // M5+B3(收尾批):装配前配置硬校验——dispatch 启用时密钥长度/互异/派单 URL
     // loopback 钉死,违规 throw fail-fast 拒启;禁用时仅 warn。数值 env 解析统一
     // 收口 selfheal/config.ts。
     assertSelfhealConfig();
-    const tickMs = selfhealTickMs();
-    incidentReconciler = trackScheduler(
-      "incidentReconciler",
-      "v5-owned",
-      startIncidentReconciler({ intervalMs: tickMs }),
-    );
-    incidentSweeper = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
-      intervalMs: tickMs,
-      // 事故 open/update/resolve 不再创建用户投递；保留 sweeper 兼容入口但钉死 no-op。
-      broadcastAll: () => 0,
-      broadcastToUsers: (uids, payload) => broadcastToUsersRef.current(uids, payload),
-    }));
+    leaderBundle.add({
+      name: "incidentReconciler",
+      domain: "v5-owned",
+      start: () => {
+        const h: IncidentReconcilerHandle = trackScheduler(
+          "incidentReconciler",
+          "v5-owned",
+          startIncidentReconciler({ intervalMs: selfhealTickMs() }),
+        );
+        return { stop: () => h.stop() };
+      },
+    });
+    leaderBundle.add({
+      name: "incidentSweeper",
+      domain: "v5-owned",
+      start: () => {
+        const h: IncidentReconcilerSnapshotHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+          intervalMs: selfhealTickMs(),
+          broadcastAll: () => 0,
+          broadcastToUsers: () => 0,
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
   // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
   // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
   // 90 天终态 retention 已迁至统一 auditRetention 注册表(带终态谓词),此处不再删。
-  // 【域归属 v5-owned】connectors 三表是 0130 v5 引入,v3 无代码 → 不写共享现网;
-  // 但 gate 在 controlPlaneEnabled(OC_CONTROL_PLANE_LEADER)防多 v5 实例双跑
-  // (设计 §3:v5 leader 门控)。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
-  let connectorSweeper: ConnectorSweeperHandle | undefined;
-  if (
-    controlPlaneEnabled &&
-    process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1"
-  ) {
-    const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
-    connectorSweeper = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+  // 【域归属 v5-owned + P3 MAJOR 3:迁入 LeaderBundle】connectors 三表是 0130 v5 引入,v3 无代码。
+  // 旧实现 eager-start + gate 在 controlPlaneEnabled(静态 env):双 master 下两 slot env 都=1 →
+  // 双跑(双 expire / 双 DELETE 竞态)。收口进 bundle(单 leader 单跑,与 wecomAlert/cronWake 同),
+  // 启停交给 lease。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
+  if (runtimeChannel === "v5" && process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "connectorSweeper",
+      domain: "v5-owned",
+      start: async () => {
+        const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+        const h = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
   }
 
   // 企业微信群机器人告警投递(v5-owned)。偿「v5 告警只入库不推送」债(playbook 债表
@@ -4016,65 +4326,126 @@ export async function registerCommercial(
   // **不注册为 scheduler**(命名 *Manager,不进 schedulerRegistry / smoke 白名单)。每个
   // wecom_aibot 通道一条 wss 长连接;dispatcher 的 wecom_aibot 行经 aibotConn.send 投递。
   // 详见 wecomAibotConnection 头注(单连接约束 + 国内域名直连出口红线)。
-  let wecomAlertDispatcher: WecomAlertDispatcherHandle | undefined;
-  let wecomAibotConn: WecomAibotConnectionManager | undefined;
-  let userNoticeApproval: UserNoticeApprovalHandle | undefined;
-  if (
-    runtimeChannel === "v5" &&
-    process.env.OC_WECOM_ALERT_DISABLED !== "1"
-  ) {
-    const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
-    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
-    wecomAibotConn = getWecomAibotConnectionManager();
-    void wecomAibotConn.start();
-    wecomAlertDispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({ dispatchIntervalMs: intervalMs, deps: { sendAibotAlert: (id, md) => wecomAibotConn!.send(id, md) } }));
-    userNoticeApproval = trackScheduler("userNoticeApproval", "v5-owned", startUserNoticeApproval(
-      wecomAibotConn,
-      {
-        onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),
-        broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
+  // P3:wecomAlert(+ wecomAibot 长连接)需交接(RFC §2)→ 收口 LeaderBundle 单 leader。
+  // aibot 单连接约束:双 master 各起一条 wss = 双投递/连接抢占,故必须随 leader 单实例启停。
+  // dispatcher/aibot/approval 同一 member 内有序启停；approval 经 loopback slot relay
+  // 并行查询/投递 A/B 两槽，只记录真实 deliveredUids，peer down/half-open 有界降级为空。
+  if (runtimeChannel === "v5" && process.env.OC_WECOM_ALERT_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "wecomAlert",
+      domain: "v5-owned",
+      start: async () => {
+        const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
+        const aibotConn = getWecomAibotConnectionManager();
+        let dispatcher: ReturnType<typeof startWecomAlertDispatcher> | undefined;
+        let approval: ReturnType<typeof startUserNoticeApproval> | undefined;
+        try {
+          await aibotConn.start();
+          dispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({
+            dispatchIntervalMs: intervalMs,
+            deps: { sendAibotAlert: (id, md) => aibotConn.send(id, md) },
+          }));
+          approval = trackScheduler("userNoticeApproval", "v5-owned", startUserNoticeApproval(
+            aibotConn,
+            {
+              onlineUserSubset: (uids) => slotRelayClient.onlineUserSubset(uids),
+              broadcastToUsers: (uids, payload) => slotRelayClient.broadcastToUsers(uids, payload),
+            },
+          ));
+        } catch (err) {
+          unregisterMutator("userNoticeApproval");
+          unregisterMutator("wecomAlert");
+          try { await approval?.stop(); } catch { /* ignore */ }
+          try { await dispatcher?.stop(); } catch { /* ignore */ }
+          try { await aibotConn.stop(); } catch { /* ignore */ }
+          throw err;
+        }
+        if (!dispatcher || !approval) throw new Error("wecom leader member incomplete startup");
+        return {
+          stop: async () => {
+            try { await approval.stop(); } catch { /* ignore */ }
+            unregisterMutator("userNoticeApproval");
+            try { await dispatcher.stop(); } catch { /* ignore */ }
+            try { await aibotConn.stop(); } catch { /* ignore */ }
+          },
+        };
       },
-    ));
+    });
   }
 
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
   // enabledSchedulers 由归属登记表派生 —— 不再手工维护清单(此前 subscriptionRollover /
   // imagePromote 漏登记,让下方 fail-closed 断言出现盲区)。
-  const enabledSchedulers: string[] = schedulerRegistry.map((s) => s.name);
-  // 注:shared 域(compute-pool init / image-promote / preheat / 容器面全部 scheduler /
-  // 订单·账号池·邮件 sweeper)一律 gate 在 controlPlaneEnabled(= 当前 leader,由
-  // OC_CONTROL_PLANE_LEADER 决定;follower 恒 false)→ follower 下不会启动,连 runOnStart
-  // mutate 都不发生。follower 下合法存活的只有 v5-owned(subscriptionRollover:0096 订阅域
-  // v3 无代码,v5 不跑则全网真空)与 local(accountSlotReaper:纯进程内自愈)。下方
-  // fail-closed 按域断言,防 gate 漏配让 follower 的 shared mutator 写共享现网 —— 宁可拒启。
-  // baseline server 不是 mutator(只读 serve ccb tarball + mTLS/PSK 鉴权),不在此列。
+  // P3:schedulers 改 **live getter** —— LeaderBundle 的成员随 lease 竞得/让位动态启停,
+  // schedulerRegistry 由 bundle onMemberStopped(drain)+ start 闭包内 trackScheduler(拉起)实时增删。
+  // gateway 每次 /healthz 都 `body.runtime=c.runtimeStatus` 再 JSON.stringify(会调 getter)→ 实时反映。
+  // leadership:非 v5(无 lease)给合成态(controlPlaneEnabled→leader);v5 走 leaseController.status()。
+  const legacyLeadership = (): LeadershipStatus => ({
+    state: controlPlaneEnabled ? "leader" : "ineligible",
+    slot: ocSlot,
+    generation: null,
+    leasePid: controlPlaneEnabled ? process.pid : null,
+  });
   const runtimeStatus: CommercialRuntimeStatus = {
     channel: runtimeChannel,
     controlPlaneEnabled,
     autoMigrate: autoMigrateEffective,
     agentRuntime: agentRuntime ? "enabled" : "disabled",
     containerRuntime: v3Deps ? "enabled" : "disabled",
-    schedulers: enabledSchedulers,
+    get schedulers(): string[] {
+      return schedulerRegistry.map((s) => s.name);
+    },
     capabilities: [...MASTER_CAPABILITIES],
+    get leadership(): LeadershipStatus {
+      return leaderLease ? leaderLease.status() : legacyLeadership();
+    },
+    // P3 放量观测(RFC D1):lane_evaluations(请求次)+lane_users((generation,uid) 去重),
+    // operator 据此判断 promote N% 已覆盖多少活跃用户。只读快照,零成本。
+    get laneMetrics(): ReturnType<typeof getLaneMetricsSnapshot> {
+      return getLaneMetricsSnapshot();
+    },
   };
-  // fail-closed:非 leader(controlPlaneEnabled=false)绝不允许任何 shared 域 mutator 存活 ——
-  // 防 gate 漏 controlPlaneEnabled 让 follower 写共享现网(订单/账号池/容器面/邮件)。宁可拒启,
-  // 也不污染现网。channel 无关:leader 权威已由 OC_CONTROL_PLANE_LEADER 解耦,v5 作为 leader
-  // 运行 shared 是合法的;此断言只拦"follower 却跑了 shared"这类 gate 漏配。
-  // v5-owned(订阅轮转)与 local(进程内自愈)域任何角色都合法,放行。
-  const sharedOnFollower = schedulerRegistry.filter((s) => s.domain === "shared").map((s) => s.name);
-  if (!controlPlaneEnabled && sharedOnFollower.length > 0) {
+  // fail-closed:非 leader 绝不允许 shared mutator 存活 —— 拦"gate 漏配让 follower 写共享现网"。
+  // P3 MAJOR 5:判据从**静态 controlPlaneEnabled 改为实时 leadership**。原因:双 master 下两 slot 的
+  // OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled 两 slot 都 true,`!controlPlaneEnabled` 恒 false
+  // → 断言对 v5 follower 完全失效(follower 带 shared mutator 也不报)。改用 leaseController.status()
+  // 的实时 state:!=='leader' 即非 leader。
+  // 【bundle deferred 语义】bundle 的 shared 成员仅在竞得 lease(onAcquire)后才 trackScheduler 注册,
+  // 竞得那刻 state 已='leader' → 不违反。此刻(lease 未 start)state=standby/ineligible,bundle 成员必不在册;
+  // 本同步断言据此拦"bundle shared 成员被漏配成 eager 存活"的情形。
+  // eager 残留(compute-pool 三件套=imagePromote/preheat 已由 MAJOR 4 在 v5 双 master fail-loud 拒起;
+  // lifecycle=agent 容器 GC 仍 eager 跑在所有 v5 slot,收口债未迁 bundle)——它们不是"follower 违规",
+  // 对 v5 从覆盖集剔除;非 v5(无 lease)保持全覆盖旧语义。
+  const liveLeader = leaderLease ? leaderLease.status().state === "leader" : controlPlaneEnabled;
+  const eagerResidual = leaderLease ? new Set(["lifecycle", "imagePromote"]) : new Set<string>();
+  const sharedOnFollower = schedulerRegistry
+    .filter((s) => s.domain === "shared" && !eagerResidual.has(s.name))
+    .map((s) => s.name);
+  if (!liveLeader && sharedOnFollower.length > 0) {
     throw new Error(
-      `[commercial] control-plane invariant violated: follower has shared-domain schedulers active=[${sharedOnFollower.join(
-        ",",
-      )}]. 非 leader 只允许 v5-owned/local 域 mutator。`,
+      `[commercial] control-plane invariant violated: 非 leader(leadership=${
+        leaderLease ? leaderLease.status().state : `env:${controlPlaneEnabled}`
+      })却有 shared-domain 调度器在册=[${sharedOnFollower.join(",")}]。非 leader 只允许 v5-owned/local 域 mutator。`,
     );
   }
   rootLogger.info(
-    `commercial runtime status: channel=${runtimeChannel} controlPlane=${controlPlaneEnabled} agentRuntime=${runtimeStatus.agentRuntime} containerRuntime=${runtimeStatus.containerRuntime} schedulers=[${enabledSchedulers.join(",")}]`,
+    `commercial runtime status: channel=${runtimeChannel} controlPlane=${controlPlaneEnabled} slot=${ocSlot} dualMaster=${dualMasterEnabled} agentRuntime=${runtimeStatus.agentRuntime} containerRuntime=${runtimeStatus.containerRuntime} schedulers=[${runtimeStatus.schedulers.join(",")}]`,
     { subsys: "commercial", runtimeStatus },
   );
+
+  // ── P3 触发:LeaderBundle 启动时机(RFC D4/§5)────────────────────────────────
+  // v5:交给 lease controller——env 资格 ∧ desired_leader_slot==本 slot → 竞 advisory → 安装 lease →
+  //    onAcquire=bundle.start;fence=bundle.stopAndDrain。基建版(seed desired=A / slot=A / env=1)
+  //    数秒内竞得并 start = 现状行为等价。
+  // 非 v5(v3/个人版遗留):无 lease,保持旧 eager 语义——controlPlaneEnabled(leader)即同步 start 全部
+  //    bundle 成员(与改造前"每个 shared 都 if(controlPlaneEnabled) eager-start"净效果一致)。
+  if (dualMasterEnabled) {
+    leaderLease!.start();
+  } else if (controlPlaneEnabled) {
+    await leaderBundle.start();
+  }
 
   return {
     handle: handler,
@@ -4104,46 +4475,30 @@ export async function registerCommercial(
       }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
+      // ── P3:LeaderBundle + lease + 控制口 teardown(RFC D4)──────────────────────
+      // v5:leaderLease.shutdown() graceful=(若持 lease)drain bundle(有界 30s)+写本 epoch ACK
+      //    +unlock advisory —— 新 holder 拿锁即见 ACK,零等待零重叠;非 leader 则只清连接/timer。
+      // 非 v5:无 lease,直接 stopAndDrain bundle(幂等)。二者都把 shared+4 特例调度器逐个 stop。
+      if (leaderLease) {
+        try { await leaderLease.shutdown(); } catch { /* ignore */ }
+      } else {
+        try { await leaderBundle.stopAndDrain(); } catch { /* ignore */ }
+      }
+      if (controlListener) {
+        try { await controlListener.close(); } catch { /* ignore */ }
+      }
+      if (deployDesiredWatch) {
+        try { deployDesiredWatch.stop(); } catch { /* ignore */ }
+      }
+      // 非 bundle 的常驻调度器(v5-owned 安全双跑 + local + eager shared 例外)照旧逐个 stop。
       if (lifecycleScheduler) {
         try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
       }
-      if (idleSweepScheduler) {
-        try { await idleSweepScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (volumeGcScheduler) {
-        try { await volumeGcScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (orphanReconcileScheduler) {
-        try { await orphanReconcileScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (migrationReconcileScheduler) {
-        try { await migrationReconcileScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (healthPoller) {
-        try { healthPoller.stop(); } catch { /* ignore */ }
-      }
       // 0042 — ImagePromoteScheduler 是 module 级单例,getImagePromoteScheduler() 拿到实例后调 stop
+      // (compute-pool trio 保留 controlPlaneEnabled gate,未入 bundle——见文首 P3 residual 说明)
       try { getImagePromoteScheduler().stop(); } catch { /* ignore */ }
-      if (containerEventsWorker) {
-        try { await containerEventsWorker.stop(); } catch { /* ignore */ }
-      }
-      if (alertScheduler) {
-        try { await alertScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (refreshEventsSweeper) {
-        try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
-      }
-      if (auditRetentionSweeper) {
-        try { auditRetentionSweeper.stop(); } catch { /* ignore */ }
-      }
       if (codexRefreshActor) {
         try { codexRefreshActor.stop(); } catch { /* ignore */ }
-      }
-      if (cooldownRecoveryActor) {
-        try { cooldownRecoveryActor.stop(); } catch { /* ignore */ }
-      }
-      if (pendingOrdersExpirer) {
-        try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
       }
       if (subscriptionRolloverSweeper) {
         try { subscriptionRolloverSweeper.stop(); } catch { /* ignore */ }
@@ -4151,23 +4506,11 @@ export async function registerCommercial(
       if (accountSlotReaper) {
         try { accountSlotReaper.stop(); } catch { /* ignore */ }
       }
-      if (finalizeJournalReconciler) {
-        try { finalizeJournalReconciler.stop(); } catch { /* ignore */ }
-      }
       if (codexDriftReconciler) {
         try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }
-      if (onboardingScheduler) {
-        try { onboardingScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (inboxEmailScheduler) {
-        try { inboxEmailScheduler.stop(); } catch { /* ignore */ }
-      }
       if (researchJobScheduler) {
         try { researchJobScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (cronWakeScheduler) {
-        try { cronWakeScheduler.stop(); } catch { /* ignore */ }
       }
       if (marketplaceAiReviewScheduler) {
         try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
@@ -4175,23 +4518,9 @@ export async function registerCommercial(
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
-      if (incidentReconciler) {
-        try { incidentReconciler.stop(); } catch { /* ignore */ }
-      }
-      if (incidentSweeper) {
-        try { incidentSweeper.stop(); } catch { /* ignore */ }
-      }
-      if (connectorSweeper) {
-        try { connectorSweeper.stop(); } catch { /* ignore */ }
-      }
-      if (wecomAlertDispatcher) {
-        try { await wecomAlertDispatcher.stop(); } catch { /* ignore */ }
-      }
-      if (userNoticeApproval) {
-        try { await userNoticeApproval.stop(); } catch { /* ignore */ }
-      }
-      if (wecomAibotConn) {
-        try { await wecomAibotConn.stop(); } catch { /* ignore */ }
+      // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
+      if (incidentSnapshot) {
+        try { await incidentSnapshot.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

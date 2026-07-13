@@ -7,16 +7,20 @@
     "0133_selfheal_incidents",
     "0134_selfheal_condition_concurrency",
     "0135_selfheal_hardening",
+    "0135_deploy_state",
     "0137_selfheal_user_notice_approval",
     "0138_model_catalog",
     "0139_model_authority_guards"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
+    "dual-master-v1",
     "model_authority_v1",
     "model_authority_v1-egress"
   ],
   "runtimeCapabilities": [
     "model_authority_v1"
-  ]
+  ],
+  "bridgeFrameSchema": "1",
+  "runtimeApi": "1"
 }

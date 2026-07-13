@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { AuthSession, User } from "../lib/types";
+import { useLaneGate } from "./useLaneGate";
 
 /**
  * 鉴权状态机（从 App.tsx 整体收口，语义逐条保留）：
@@ -44,6 +45,13 @@ export type UseAuth = {
   authError: string | null;
   /** 启动静默续期进行中（App 渲染极简 splash）。 */
   booting: boolean;
+  /**
+   * cohort 分批切流 lane 就绪（P3 RFC D1）。auth 流程完成 lane 决策（cookie 已下发）→ true，
+   * 作为 useChatSocket 建立 WS 的前置之一（防首连落错 slot）。3s 兜底放行防死锁（见 useLaneGate）。
+   */
+  laneReady: boolean;
+  /** 当前 cohort lane（`g<generation>.<slot>` 或 null；null=未分配/后端未部署 lane）。观测用。 */
+  lane: string | null;
   clearAuth: () => void;
   login: (email: string, password: string, turnstileToken: string) => Promise<void>;
   register: (input: {
@@ -78,6 +86,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const [authError, setAuthError] = useState<string | null>(null);
   // demo/重置链接跳过静默续期（重置场景用户就是要走 reset 流程，不劫持进工作区）。
   const [booting, setBooting] = useState(!demo && !resetToken);
+  // cohort lane 决策信号（P3 RFC D1）：undefined=决策进行中；{lane}=已拿到 auth 响应
+  // （lane 为 string 或 null——字段缺失=后端未部署=向后兼容仍算已决策）。login/boot 成功时置，
+  // clearAuth 复位。laneReady 由 useLaneGate 据此 + authed + 3s 兜底派生。
+  const [laneSignal, setLaneSignal] = useState<{ lane: string | null } | undefined>(undefined);
 
   // 清空全部鉴权状态，回到登录/首页（静默刷新失败或主动登出都走这里）。
   // 会话/消息/面板等 chat 域收尾经 onClearAuth 注入（在 App 层完成）。
@@ -85,6 +97,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     tokenRef.current = null;
     setAuthed(false);
     setUser(null);
+    setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
     cbRef.current.onClearAuth();
   }, []);
 
@@ -103,6 +116,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 仅当已认证时把 session 暴露给业务逻辑；未认证时为 null。P3/P4 的 REST/WS 调用消费它。
   const auth = authed ? authRef.current : null;
 
+  // cohort lane 就绪闸（P3 RFC D1）：已认证 + lane 决策达成（或 3s 兜底）才放行 WS 连接。
+  const laneReady = useLaneGate(authed, laneSignal);
+  const lane = laneSignal?.lane ?? null;
+
   const login = useCallback(
     async (email: string, password: string, turnstileToken: string) => {
       setAuthLoading(true);
@@ -113,10 +130,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         // 为真实 Cloudflare Turnstile widget 的 onSuccess token。canary 登录行为不变。
         // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
         // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
-        const { accessToken, user: me } = await api.login(email, password, turnstileToken);
-        tokenRef.current = accessToken;
+        const res = await api.login(email, password, turnstileToken);
+        tokenRef.current = res.accessToken;
         setAuthed(true);
-        setUser(me);
+        setUser(res.user);
+        // lane 决策达成（cookie 已随登录响应 Set-Cookie 下发）：解锁 WS 连接前置。
+        setLaneSignal({ lane: res.lane ?? null });
         cbRef.current.onLoginSuccess?.();
       } catch (e) {
         setAuthError((e as Error).message || "登录失败");
@@ -145,6 +164,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         if (cancelled) return;
         setUser(me);
         setAuthed(true);
+        // lane 决策达成（cookie 随 /api/me 响应下发）：解锁 WS 连接前置。
+        setLaneSignal({ lane: me.lane ?? null });
         cbRef.current.onBootAuthed?.();
       } catch {
         // token 换到了但 getMe 失败（瞬时网络/服务端抖动）：不半开登录态，回首页手动登录。
@@ -228,6 +249,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     authLoading,
     authError,
     booting,
+    laneReady,
+    lane,
     clearAuth,
     login,
     register,

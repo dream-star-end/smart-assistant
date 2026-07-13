@@ -1,26 +1,26 @@
 /**
  * GitHub OAuth client 单元测试。覆盖:
  *   1. readGithubConfig: env 缺失抛 GithubConfigMissingError;全有时解析正确。
- *   2. startGithubOAuth: 生成合法 authorizeUrl + state 写入 pending Map。
+ *   2. startGithubOAuth: 生成合法 authorizeUrl + state(纯函数,pending 迁 PG 后不写进程内 Map)。
  *   3. Cookie helpers: setGithubStateCookie / readGithubStateCookie / clearGithubStateCookie。
- *   4. exchangeGithubOAuth:
- *      a) 未知 state → state_mismatch
- *      b) state replay → 第二次 state_mismatch
- *      c) token endpoint 400 → exchange_failed
- *      d) token endpoint body.error → exchange_failed
- *      e) GitHub user endpoint 401 → exchange_failed
- *      f) user endpoint missing id → exchange_failed
- *      g) happy path → 正确返回 accessToken + scopes + githubUser
+ *   4. exchangeGithubOAuth(纯外部 I/O,不再消费 pending state):
+ *      a) token endpoint 400 → exchange_failed
+ *      b) token endpoint body.error → exchange_failed
+ *      c) 网络超时 → exchange_failed
+ *      d) GitHub user endpoint 401 → exchange_failed
+ *      e) user endpoint missing id → exchange_failed
+ *      f) happy path → 正确返回 accessToken + scopes + githubUser
+ *
+ * 注:state 的原子单次消费(anti-replay/TTL)已迁 PG,单测见 oauthPendingStore.test.ts;
+ * handler 端编排见 oauthGithub.test.ts。
  */
 
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { beforeEach, describe, test } from 'node:test'
+import { describe, test } from 'node:test'
 import {
   GithubConfigMissingError,
   GithubOAuthError,
-  _test_clearPending,
-  _test_pendingSize,
   clearGithubStateCookie,
   exchangeGithubOAuth,
   readGithubConfig,
@@ -54,10 +54,6 @@ const testCfg = {
   redirectUri: 'https://test.example/api/auth/github/callback',
   scopes: ['repo', 'read:user'],
 }
-
-beforeEach(() => {
-  _test_clearPending()
-})
 
 // ─── readGithubConfig ─────────────────────────────────────────────────
 
@@ -111,8 +107,8 @@ describe('readGithubConfig', () => {
 // ─── startGithubOAuth ────────────────────────────────────────────────
 
 describe('startGithubOAuth', () => {
-  test('emits authorizeUrl with required params + populates pending Map', () => {
-    const result = startGithubOAuth({ userId: 42, cfg: testCfg })
+  test('emits authorizeUrl with required params (纯函数,无进程内副作用)', () => {
+    const result = startGithubOAuth({ cfg: testCfg })
     const u = new URL(result.authorizeUrl)
     assert.equal(u.host, 'github.com')
     assert.equal(u.pathname, '/login/oauth/authorize')
@@ -121,25 +117,12 @@ describe('startGithubOAuth', () => {
     assert.equal(u.searchParams.get('response_type'), 'code')
     assert.equal(u.searchParams.get('state'), result.state)
     assert.match(result.state, /^[a-f0-9]{32}$/)
-    assert.equal(_test_pendingSize(), 1)
   })
 
-  test('state includes userId (via pending Map)', async () => {
-    const result = startGithubOAuth({ userId: 99, cfg: testCfg })
-    // exchangeGithubOAuth will return the userId from pending Map
-    const fetcher = makeFetch({
-      tokenStatus: 200,
-      tokenBody: { access_token: 'tok', scope: 'repo' },
-      userStatus: 200,
-      userBody: { id: 99, login: 'testuser', avatar_url: null },
-    })
-    const { userId } = await exchangeGithubOAuth({
-      code: 'c',
-      state: result.state,
-      cfg: testCfg,
-      deps: { fetchImpl: fetcher },
-    })
-    assert.equal(userId, 99)
+  test('每次调用 state 唯一(16 字节随机)', () => {
+    const a = startGithubOAuth({ cfg: testCfg })
+    const b = startGithubOAuth({ cfg: testCfg })
+    assert.notEqual(a.state, b.state)
   })
 })
 
@@ -191,40 +174,10 @@ describe('GitHub state cookie helpers', () => {
 // ─── exchangeGithubOAuth ─────────────────────────────────────────────
 
 describe('exchangeGithubOAuth', () => {
-  test('unknown state → state_mismatch', async () => {
-    await assert.rejects(
-      exchangeGithubOAuth({
-        code: 'c',
-        state: 'never-issued',
-        cfg: testCfg,
-        deps: { fetchImpl: failFetch },
-      }),
-      (err: unknown) => err instanceof GithubOAuthError && err.code === 'state_mismatch',
-    )
-  })
-
-  test('state replay → second call state_mismatch', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
-    const fetcher = makeFetch({
-      tokenStatus: 200,
-      tokenBody: { access_token: 'AT', scope: 'repo' },
-      userStatus: 200,
-      userBody: { id: 1, login: 'u', avatar_url: null },
-    })
-    await exchangeGithubOAuth({ code: 'c', state, cfg: testCfg, deps: { fetchImpl: fetcher } })
-    // second call must fail
-    await assert.rejects(
-      exchangeGithubOAuth({ code: 'c', state, cfg: testCfg, deps: { fetchImpl: fetcher } }),
-      (err: unknown) => err instanceof GithubOAuthError && err.code === 'state_mismatch',
-    )
-  })
-
   test('token endpoint 400 → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'bad',
-        state,
         cfg: testCfg,
         deps: { fetchImpl: makeFetch({ tokenStatus: 400 }) },
       }),
@@ -233,11 +186,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('token endpoint body.error → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'bad',
-        state,
         cfg: testCfg,
         deps: {
           fetchImpl: makeFetch({
@@ -251,11 +202,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('network timeout on token endpoint → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'c',
-        state,
         cfg: testCfg,
         deps: { fetchImpl: throwingFetch('network timeout') },
       }),
@@ -264,11 +213,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('GitHub user endpoint 401 → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'c',
-        state,
         cfg: testCfg,
         deps: {
           fetchImpl: makeFetch({
@@ -283,11 +230,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('user endpoint missing id → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'c',
-        state,
         cfg: testCfg,
         deps: {
           fetchImpl: makeFetch({
@@ -303,10 +248,8 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('happy path: returns accessToken + scopes + githubUser', async () => {
-    const { state } = startGithubOAuth({ userId: 77, cfg: testCfg })
-    const { result, userId } = await exchangeGithubOAuth({
+    const result = await exchangeGithubOAuth({
       code: 'validcode',
-      state,
       cfg: testCfg,
       deps: {
         fetchImpl: makeFetch({
@@ -321,7 +264,6 @@ describe('exchangeGithubOAuth', () => {
         }),
       },
     })
-    assert.equal(userId, 77)
     assert.equal(result.accessToken, 'ghp_mytoken')
     assert.equal(result.scopes, 'repo read:user')
     assert.equal(result.githubUser.id, 12345)
@@ -330,10 +272,8 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('happy path: missing avatar_url → null', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
-    const { result } = await exchangeGithubOAuth({
+    const result = await exchangeGithubOAuth({
       code: 'c',
-      state,
       cfg: testCfg,
       deps: {
         fetchImpl: makeFetch({
@@ -348,10 +288,8 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('comma-separated scope (real GitHub OAuth App format) → canonicalized to space', async () => {
-    const { state } = startGithubOAuth({ userId: 5, cfg: testCfg })
-    const { result } = await exchangeGithubOAuth({
+    const result = await exchangeGithubOAuth({
       code: 'c',
-      state,
       cfg: testCfg,
       deps: {
         fetchImpl: makeFetch({
@@ -366,11 +304,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('missing required scope (no repo) → exchange_failed', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'c',
-        state,
         cfg: testCfg,
         deps: {
           fetchImpl: makeFetch({
@@ -386,11 +322,9 @@ describe('exchangeGithubOAuth', () => {
   })
 
   test('empty scope string → exchange_failed (no required scope granted)', async () => {
-    const { state } = startGithubOAuth({ userId: 1, cfg: testCfg })
     await assert.rejects(
       exchangeGithubOAuth({
         code: 'c',
-        state,
         cfg: testCfg,
         deps: {
           fetchImpl: makeFetch({
@@ -407,10 +341,6 @@ describe('exchangeGithubOAuth', () => {
 })
 
 // ─── fetch mock helpers ───────────────────────────────────────────────
-
-function failFetch(): Promise<Response> {
-  throw new Error('fetch should not be called')
-}
 
 function throwingFetch(message: string): typeof fetch {
   return (async () => {

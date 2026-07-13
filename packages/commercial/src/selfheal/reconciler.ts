@@ -209,7 +209,7 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
 // ─── scheduler(照 providerHealthScheduler 模式:setInterval + unref + inflight 保护)──
 
 export interface IncidentReconcilerHandle {
-  stop(): void;
+  stop(): Promise<void>;
   runNow(): Promise<ReconcileResult>;
 }
 
@@ -254,9 +254,10 @@ export function startIncidentReconciler(
   if (opts.runOnStart) void tick();
 
   return {
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      if (inflight) await inflight;
     },
     runNow: tick,
   };

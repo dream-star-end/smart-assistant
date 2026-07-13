@@ -20,6 +20,7 @@
  */
 
 import { createServer as createHttpServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import IORedis from "ioredis";
 
 import { loadConfig } from "../config.js";
@@ -72,6 +73,9 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
+  // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
+  // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
+  const processStartId = process.env.INVOCATION_ID ?? randomUUID();
   // 出口拓扑与拆分前的 master 完全对齐(packages/cli gateway.ts 同款):
   // 有 HTTP(S)_PROXY env(日本 sing-box 节点)→ 装全局 EnvHttpProxyAgent,给
   // Anthropic/OpenAI 等出海上游用;国内静态 provider(ark glm/deepseek/minimax)
@@ -328,6 +332,9 @@ export async function startEgress(): Promise<void> {
       return;
     }
     if (path === "/internal/v5/egress-health") {
+      // D3④:finalize 门槛差分数据源。processStartId + 单调计数器一并暴露,
+      // 部署脚本据此判断队列真排空(startId 未变 ∧ pendingEnd=0 ∧ enqueuedDelta==sentDelta
+      // ∧ expired/overflow delta=0)。
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       // capabilities:**构建级事实**(本 egress 版本实现了模型权威协议:每请求 epoch fence +
@@ -338,7 +345,8 @@ export async function startEgress(): Promise<void> {
         JSON.stringify({
           ok: true,
           role: "egress",
-          pendingCostEvents: costSink.pending,
+          processStartId,
+          ...costSink.healthCounters(),
           capabilities: [...EGRESS_CAPABILITIES],
           modelAuthority: { enforced: isModelAuthorityEnforced() },
         }),

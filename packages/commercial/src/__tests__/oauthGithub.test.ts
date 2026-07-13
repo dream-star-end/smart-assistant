@@ -3,37 +3,73 @@
  *
  * 覆盖:
  *   1. handleGithubStart: 未登录 → 401; GitHub env 未配 → 503; 成功 → 200 JSON + Set-Cookie
+ *      + pending state 落库(内存版 store)。
  *   2. handleGithubCallback: state 不匹配 → redirect github_error=state_mismatch
  *   3. handleGithubCallback: provider error(?error=access_denied) → redirect github_error=exchange_failed
- *   4. handleGithubCallback: exchange 成功 + saveGithubLink 成功 → redirect /?github_linked=1
- *   5. handleGithubCallback: saveGithubLink conflict → redirect github_error=account_already_linked
+ *   4. handleGithubCallback: start→callback 真回环(pending 消费拿回 userId)+ exchange + save → /?github_linked=1
+ *   5. handleGithubCallback: pending 已消费(重放)→ state_mismatch
+ *   6. handleGithubCallback: saveGithubLink conflict → github_error=account_already_linked
  *
  * 策略:
- *   - mock process.env GitHub OAuth 变量
- *   - mock getPool() 以避免真 DB
- *   - mock github.ts 的 pending Map 状态(通过 _test_clearPending / startGithubOAuth)
- *   - mock fetch 避免打 github.com
+ *   - mock process.env GitHub OAuth 变量 + OPENCLAUDE_KMS_KEY(pending payload 加密)
+ *   - 注入内存版 oauth_pending_states runner(忠实实现 INSERT / 原子 DELETE…RETURNING / GC)
+ *   - mock exchanger 避免打 github.com;mock poolFactory 避免真 DB(github_links)
  */
 
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { beforeEach, describe, test } from 'node:test'
+import { describe, test } from 'node:test'
 import type { Pool } from 'pg'
-import {
-  _test_clearPending,
-  exchangeGithubOAuth,
-  startGithubOAuth,
-} from '../auth/github.js'
+import type { QueryRunner } from '../db/queries.js'
+import { exchangeGithubOAuth } from '../auth/github.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { handleGithubCallback, handleGithubStart } from '../http/oauthGithub.js'
+import { consumeOAuthPendingState } from '../auth/oauthPendingStore.js'
 
-// ─── Test KMS key (needed for saveGithubLink encrypt) ─────────────────
+// ─── Test KMS key (pending payload 加密) ─────────────────────────────
 const TEST_KMS_KEY = Buffer.alloc(32, 0xcd)
 process.env.OPENCLAUDE_KMS_KEY = TEST_KMS_KEY.toString('base64')
 // Inject GitHub OAuth env
 process.env.GITHUB_OAUTH_CLIENT_ID = 'test_client_id'
 process.env.GITHUB_OAUTH_CLIENT_SECRET = 'test_client_secret'
 process.env.GITHUB_OAUTH_REDIRECT_URI = 'https://test.example/api/auth/github/callback'
+
+// ─── 内存版 oauth_pending_states runner(对齐 0135:单 payload TEXT 列)─────────
+// 忠实模拟三条 SQL:INSERT / 原子 DELETE…RETURNING(带 expires_at>now())/ GC。
+function makeFakePendingRunner(): QueryRunner {
+  const rows = new Map<string, { payload: string; expires_at: Date }>()
+  return {
+    // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+    async query(sql: string, params: readonly unknown[] = []): Promise<any> {
+      if (sql.includes('INSERT INTO oauth_pending_states')) {
+        const [stateHash, payload, expiresAt] = params as [string, string, Date]
+        rows.set(stateHash, { payload, expires_at: expiresAt })
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('RETURNING payload')) {
+        const [stateHash] = params as [string]
+        const row = rows.get(stateHash)
+        if (row && row.expires_at.getTime() > Date.now()) {
+          rows.delete(stateHash)
+          return { rows: [{ payload: row.payload }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('DELETE FROM oauth_pending_states WHERE expires_at')) {
+        const [cutoff] = params as [Date]
+        let n = 0
+        for (const [k, v] of rows) {
+          if (v.expires_at.getTime() <= cutoff.getTime()) {
+            rows.delete(k)
+            n += 1
+          }
+        }
+        return { rows: [], rowCount: n }
+      }
+      throw new Error(`unexpected sql: ${sql}`)
+    },
+  } as unknown as QueryRunner
+}
 
 // ─── Mock helpers ─────────────────────────────────────────────────────
 
@@ -124,8 +160,6 @@ function makeReq(opts: {
   } as unknown as IncomingMessage
 }
 
-// A minimal valid JWT for testing — we'll use a real JWT signed with test secret
-// instead of mocking requireAuth, we sign a token properly
 import { SignJWT } from 'jose'
 
 async function makeJwt(userId: string, secret: string): Promise<string> {
@@ -136,49 +170,53 @@ async function makeJwt(userId: string, secret: string): Promise<string> {
     .sign(new TextEncoder().encode(secret))
 }
 
-beforeEach(() => {
-  _test_clearPending()
-})
+const SECRET = 'test_jwt_secret_that_is_long_enough_for_hs256_at_least_32_bytes'
+
+/** 发起 start,返回下发的 state(pending 已写进 runner)。 */
+async function doStart(userId: string, runner: QueryRunner): Promise<string> {
+  const token = await makeJwt(userId, SECRET)
+  const req = makeReq({ method: 'POST', url: '/api/auth/github/start', authorization: `Bearer ${token}` })
+  const res = makeRes()
+  await handleGithubStart(req, res.res, makeCtx(), makeDeps({ jwtSecret: SECRET }), {
+    pendingRunner: runner,
+  })
+  assert.equal(res.statusCode, 200)
+  return (JSON.parse(res.body) as { state: string }).state
+}
 
 // ─── handleGithubStart tests ──────────────────────────────────────────
 
 describe('handleGithubStart', () => {
   test('no auth header → 401', async () => {
     const req = makeReq({ method: 'POST', url: '/api/auth/github/start' })
-    const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
-    await assert.rejects(handleGithubStart(req, fakeRes.res, ctx, deps), (err: unknown) => {
-      // requireAuth throws HttpError(401)
-      return err instanceof Error && err.message.includes('missing')
-    })
+    await assert.rejects(
+      handleGithubStart(req, makeRes().res, makeCtx(), makeDeps(), {
+        pendingRunner: makeFakePendingRunner(),
+      }),
+      (err: unknown) => err instanceof Error && err.message.includes('missing'),
+    )
   })
 
   test('GitHub env missing → 503', async () => {
-    // Temporarily clear env vars using Reflect.deleteProperty (biome-safe alternative to delete)
     const savedId = process.env.GITHUB_OAUTH_CLIENT_ID
     const savedSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET
     const savedUri = process.env.GITHUB_OAUTH_REDIRECT_URI
     Reflect.deleteProperty(process.env, 'GITHUB_OAUTH_CLIENT_ID')
     Reflect.deleteProperty(process.env, 'GITHUB_OAUTH_CLIENT_SECRET')
     Reflect.deleteProperty(process.env, 'GITHUB_OAUTH_REDIRECT_URI')
-
     try {
-      const secret = 'test_jwt_secret_that_is_long_enough_for_hs256_at_least_32_bytes'
-      const token = await makeJwt('1', secret)
+      const token = await makeJwt('1', SECRET)
       const req = makeReq({
         method: 'POST',
         url: '/api/auth/github/start',
         authorization: `Bearer ${token}`,
       })
-      const fakeRes = makeRes()
-      const ctx = makeCtx()
-      const deps = makeDeps({ jwtSecret: secret })
-
-      await assert.rejects(handleGithubStart(req, fakeRes.res, ctx, deps), (err: unknown) => {
-        return err instanceof Error && (err as unknown as { status?: number }).status === 503
-      })
+      await assert.rejects(
+        handleGithubStart(req, makeRes().res, makeCtx(), makeDeps({ jwtSecret: SECRET }), {
+          pendingRunner: makeFakePendingRunner(),
+        }),
+        (err: unknown) => (err as { status?: number }).status === 503,
+      )
     } finally {
       if (savedId !== undefined) process.env.GITHUB_OAUTH_CLIENT_ID = savedId
       if (savedSecret !== undefined) process.env.GITHUB_OAUTH_CLIENT_SECRET = savedSecret
@@ -187,25 +225,20 @@ describe('handleGithubStart', () => {
   })
 
   test('success → 200 JSON with authorizeUrl + state + Set-Cookie', async () => {
-    const secret = 'test_jwt_secret_that_is_long_enough_for_hs256_at_least_32_bytes'
-    const token = await makeJwt('42', secret)
+    const token = await makeJwt('42', SECRET)
     const req = makeReq({
       method: 'POST',
       url: '/api/auth/github/start',
       authorization: `Bearer ${token}`,
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps({ jwtSecret: secret, refreshCookieSecure: false })
-
-    await handleGithubStart(req, fakeRes.res, ctx, deps)
-
+    await handleGithubStart(req, fakeRes.res, makeCtx(), makeDeps({ jwtSecret: SECRET }), {
+      pendingRunner: makeFakePendingRunner(),
+    })
     assert.equal(fakeRes.statusCode, 200)
     const body = JSON.parse(fakeRes.body) as { authorizeUrl: string; state: string }
     assert.ok(body.authorizeUrl.includes('github.com/login/oauth/authorize'))
     assert.match(body.state, /^[a-f0-9]{32}$/)
-
-    // Should set state cookie
     const cookie = fakeRes.headers['Set-Cookie']
     const cookieStr = Array.isArray(cookie) ? cookie[0] : (cookie as string)
     assert.match(cookieStr ?? '', /oc_oauth_gh_state=/)
@@ -219,14 +252,9 @@ describe('handleGithubCallback', () => {
   test('state mismatch (no cookie) → redirect ?github_error=state_mismatch', async () => {
     const req = makeReq({ url: '/api/auth/github/callback?state=abc&code=xyz' })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
-    await handleGithubCallback(req, fakeRes.res, ctx, deps)
-
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps())
     assert.equal(fakeRes.statusCode, 302)
-    const location = fakeRes.headers.Location as string
-    assert.match(location, /github_error=state_mismatch/)
+    assert.match(fakeRes.headers.Location as string, /github_error=state_mismatch/)
   })
 
   test('state mismatch (cookie ≠ query state) → redirect ?github_error=state_mismatch', async () => {
@@ -235,63 +263,38 @@ describe('handleGithubCallback', () => {
       cookie: 'oc_oauth_gh_state=different_state',
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
-    await handleGithubCallback(req, fakeRes.res, ctx, deps)
-
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps())
     assert.equal(fakeRes.statusCode, 302)
-    const location = fakeRes.headers.Location as string
-    assert.match(location, /github_error=state_mismatch/)
+    assert.match(fakeRes.headers.Location as string, /github_error=state_mismatch/)
   })
 
-  test('provider error param → redirect ?github_error=exchange_failed', async () => {
-    // Use a valid state (put in pending Map)
-    const { state } = startGithubOAuth({
-      userId: 1,
-      cfg: {
-        clientId: 'test_client_id',
-        clientSecret: 'test_client_secret',
-        redirectUri: 'https://test.example/api/auth/github/callback',
-        scopes: ['repo', 'read:user'],
-      },
-    })
+  test('provider error param → redirect ?github_error=exchange_failed + 顺手消费 pending(MINOR 2)', async () => {
+    const runner = makeFakePendingRunner()
+    const state = await doStart('7', runner) // 先 seed 一条 pending
     const encoded = encodeURIComponent(state)
     const req = makeReq({
       url: `/api/auth/github/callback?state=${encoded}&error=access_denied`,
       cookie: `oc_oauth_gh_state=${encoded}`,
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
-    await handleGithubCallback(req, fakeRes.res, ctx, deps)
-
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps(), { pendingRunner: runner })
     assert.equal(fakeRes.statusCode, 302)
-    const location = fakeRes.headers.Location as string
-    assert.match(location, /github_error=exchange_failed/)
+    assert.match(fakeRes.headers.Location as string, /github_error=exchange_failed/)
+    // MINOR 2:state 双因素已过 → provider-error 分支 best-effort 消费 pending row(原子 DELETE);
+    // 再次 consume 命中 0 行(null),证明悬挂行已清。
+    const replay = await consumeOAuthPendingState({ provider: 'github', state, runner })
+    assert.equal(replay, null, 'provider-error 分支应已消费 pending row')
   })
 
-  test('exchange + save success → redirect /?github_linked=1', async () => {
-    // 使用 handleGithubCallback 的 overrides 注入 mock exchanger + poolFactory,
-    // 验证整条 happy path:state 校验通过 → exchange OK → saveGithubLink OK → 302 /?github_linked=1
-    const { state } = startGithubOAuth({
-      userId: 7,
-      cfg: {
-        clientId: 'test_client_id',
-        clientSecret: 'test_client_secret',
-        redirectUri: 'https://test.example/api/auth/github/callback',
-        scopes: ['repo', 'read:user'],
-      },
-    })
+  test('start→callback 真回环:consume 拿回 userId → exchange + save → /?github_linked=1', async () => {
+    const runner = makeFakePendingRunner()
+    const state = await doStart('7', runner)
     const encoded = encodeURIComponent(state)
     const req = makeReq({
       url: `/api/auth/github/callback?state=${encoded}&code=goodcode`,
       cookie: `oc_oauth_gh_state=${encoded}`,
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
 
     let savedRow: unknown[] | null = null
     const fakePool = {
@@ -302,47 +305,63 @@ describe('handleGithubCallback', () => {
     } as unknown as Pool
 
     const fakeExchanger: typeof exchangeGithubOAuth = async () => ({
-      result: {
-        accessToken: 'ghp_token_xyz',
-        scopes: 'repo read:user',
-        githubUser: { id: 12345, login: 'octocat', avatar_url: null },
-      },
-      userId: 7,
+      accessToken: 'ghp_token_xyz',
+      scopes: 'repo read:user',
+      githubUser: { id: 12345, login: 'octocat', avatar_url: null },
     })
 
-    await handleGithubCallback(req, fakeRes.res, ctx, deps, {
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps(), {
       exchanger: fakeExchanger,
       poolFactory: () => fakePool,
+      pendingRunner: runner,
     })
 
     assert.equal(fakeRes.statusCode, 302)
     assert.equal(fakeRes.headers.Location, '/?github_linked=1')
     assert.ok(savedRow, 'pool.query must be invoked to write github_links')
-    assert.equal((savedRow as unknown[])[0], 7) // user_id
+    assert.equal((savedRow as unknown[])[0], 7) // user_id 来自 consume 出来的 pending payload
     assert.equal((savedRow as unknown[])[1], 12345) // github_user_id
     assert.equal((savedRow as unknown[])[2], 'octocat') // login
   })
 
-  test('exchange success but saveGithubLink throws conflict → redirect ?github_error=account_already_linked', async () => {
-    const { state } = startGithubOAuth({
-      userId: 8,
-      cfg: {
-        clientId: 'test_client_id',
-        clientSecret: 'test_client_secret',
-        redirectUri: 'https://test.example/api/auth/github/callback',
-        scopes: ['repo', 'read:user'],
-      },
+  test('pending 重放:同一 state 第二次 callback → state_mismatch(原子单次消费)', async () => {
+    const runner = makeFakePendingRunner()
+    const state = await doStart('7', runner)
+    const encoded = encodeURIComponent(state)
+    const mkReq = () =>
+      makeReq({
+        url: `/api/auth/github/callback?state=${encoded}&code=goodcode`,
+        cookie: `oc_oauth_gh_state=${encoded}`,
+      })
+    const fakeExchanger: typeof exchangeGithubOAuth = async () => ({
+      accessToken: 'ghp',
+      scopes: 'repo',
+      githubUser: { id: 1, login: 'u', avatar_url: null },
     })
+    const okOverrides = {
+      exchanger: fakeExchanger,
+      poolFactory: () => ({ query: async () => ({ rowCount: 1, rows: [] }) }) as unknown as Pool,
+      pendingRunner: runner,
+    }
+    // 第一次消费成功
+    const res1 = makeRes()
+    await handleGithubCallback(mkReq(), res1.res, makeCtx(), makeDeps(), okOverrides)
+    assert.equal(res1.headers.Location, '/?github_linked=1')
+    // 第二次同 state:pending 已被删 → state_mismatch
+    const res2 = makeRes()
+    await handleGithubCallback(mkReq(), res2.res, makeCtx(), makeDeps(), okOverrides)
+    assert.match(res2.headers.Location as string, /github_error=state_mismatch/)
+  })
+
+  test('saveGithubLink conflict → redirect ?github_error=account_already_linked', async () => {
+    const runner = makeFakePendingRunner()
+    const state = await doStart('8', runner)
     const encoded = encodeURIComponent(state)
     const req = makeReq({
       url: `/api/auth/github/callback?state=${encoded}&code=goodcode`,
       cookie: `oc_oauth_gh_state=${encoded}`,
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
-    // Pool 模拟 partial UNIQUE INDEX 冲突 — 抛出带 23505 + 约束名的 pg 错
     const pgErr = Object.assign(new Error('duplicate key'), {
       code: '23505',
       constraint: 'github_links_github_user_id_unique',
@@ -352,57 +371,39 @@ describe('handleGithubCallback', () => {
         throw pgErr
       },
     } as unknown as Pool
-
     const fakeExchanger: typeof exchangeGithubOAuth = async () => ({
-      result: {
-        accessToken: 'ghp_token',
-        scopes: 'repo',
-        githubUser: { id: 999, login: 'taken', avatar_url: null },
-      },
-      userId: 8,
+      accessToken: 'ghp_token',
+      scopes: 'repo',
+      githubUser: { id: 999, login: 'taken', avatar_url: null },
     })
-
-    await handleGithubCallback(req, fakeRes.res, ctx, deps, {
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps(), {
       exchanger: fakeExchanger,
       poolFactory: () => fakePool,
+      pendingRunner: runner,
     })
-
     assert.equal(fakeRes.statusCode, 302)
-    const location = fakeRes.headers.Location as string
-    assert.match(location, /github_error=account_already_linked/)
+    assert.match(fakeRes.headers.Location as string, /github_error=account_already_linked/)
   })
 
   test('exchanger throws GithubOAuthError → redirect ?github_error=exchange_failed', async () => {
-    const { state } = startGithubOAuth({
-      userId: 9,
-      cfg: {
-        clientId: 'test_client_id',
-        clientSecret: 'test_client_secret',
-        redirectUri: 'https://test.example/api/auth/github/callback',
-        scopes: ['repo', 'read:user'],
-      },
-    })
+    const runner = makeFakePendingRunner()
+    const state = await doStart('9', runner)
     const encoded = encodeURIComponent(state)
     const req = makeReq({
       url: `/api/auth/github/callback?state=${encoded}&code=goodcode`,
       cookie: `oc_oauth_gh_state=${encoded}`,
     })
     const fakeRes = makeRes()
-    const ctx = makeCtx()
-    const deps = makeDeps()
-
     const { GithubOAuthError } = await import('../auth/github.js')
     const fakeExchanger: typeof exchangeGithubOAuth = async () => {
       throw new GithubOAuthError('exchange_failed', 'simulated')
     }
-
-    await handleGithubCallback(req, fakeRes.res, ctx, deps, {
+    await handleGithubCallback(req, fakeRes.res, makeCtx(), makeDeps(), {
       exchanger: fakeExchanger,
       poolFactory: () => ({}) as unknown as Pool,
+      pendingRunner: runner,
     })
-
     assert.equal(fakeRes.statusCode, 302)
-    const location = fakeRes.headers.Location as string
-    assert.match(location, /github_error=exchange_failed/)
+    assert.match(fakeRes.headers.Location as string, /github_error=exchange_failed/)
   })
 })

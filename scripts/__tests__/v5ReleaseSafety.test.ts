@@ -64,6 +64,51 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /safely cleared expired schema1 marker/)
   })
 
+  test('requiredMigrations gate includes deploy_state and precedes every write dispatch', async () => {
+    const metadata = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8')) as {
+      requiredMigrations: string[]
+    }
+    assert.ok(metadata.requiredMigrations.includes('0135_deploy_state'))
+    const source = await readFile(deploy, 'utf8')
+    const gateAt = source.indexOf('assert_repo_required_migrations || exit 1')
+    const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
+    assert.ok(gateAt > 0 && dispatchAt > gateAt, '统一迁移门必须在模式 dispatch 前')
+    assert.match(source, /activate_release\(\)[\s\S]*assert_release_required_migrations "\$reldir"/)
+    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*assert_release_required_migrations "\$master"/)
+
+    const dry = run(deploy, ['--dry-run'])
+    assert.equal(dry.status, 0, dry.stderr || dry.stdout)
+    const combined = dry.stdout + dry.stderr
+    assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
+  })
+
+  test('finalize/abort verify the target before irreversible state changes', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const finalizeBody = source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''
+    const expectedAt = finalizeBody.indexOf('candidate release oc-build 权威')
+    const smokeAt = finalizeBody.indexOf('提交 stable 前完整 smoke')
+    const stopAt = finalizeBody.indexOf('systemctl stop $(slot_unit "$old")')
+    const commitAt = finalizeBody.indexOf("active_slot='$cand', previous_active_release=active_release")
+    assert.ok(expectedAt >= 0 && smokeAt > expectedAt, 'finalize 必须从 candidate release 建立 build 权威')
+    assert.ok(stopAt > smokeAt && commitAt > smokeAt, '完整 smoke/版本握手必须早于 stop old 与 stable commit')
+    assert.doesNotMatch(finalizeBody, /dist_handshake_smoke[^\n]*\|\| true/)
+    assert.doesNotMatch(
+      finalizeBody,
+      /phase='aborting'[^\n]*desired_leader_slot/,
+      'finalize 补偿必须先仅切 aborting，让 abort_continue 先回 Caddy 再收 desired',
+    )
+
+    const abortBody = source.match(/abort_continue\(\) \{([\s\S]*?)\n\}\n\n# ═+ --recover/)?.[1] ?? ''
+    const abortSmokeAt = abortBody.indexOf('旧 slot($old)完整 smoke')
+    const abortStopAt = abortBody.indexOf('systemctl stop $(slot_unit "$cand")')
+    const abortCommitAt = abortBody.indexOf("phase='stable', candidate_slot=NULL")
+    assert.ok(abortSmokeAt >= 0 && abortStopAt > abortSmokeAt && abortCommitAt > abortSmokeAt)
+    assert.doesNotMatch(abortBody, /smoke[^\n]*\|\| echo/)
+
+    const smokeBody = source.match(/smoke\(\) \{([\s\S]*?)\n\}\n\n# ─+ bootstrap/)?.[1] ?? ''
+    assert.match(smokeBody, /\[\[ "\$leadership" == leader \]\]/)
+  })
+
   test('dangerous offline mode fails closed without one-shot nonce', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-deploy-safety-')); dirs.push(dir)
     await writeFile(path.join(dir, 'ssh'), '#!/bin/sh\necho active\n')
@@ -206,6 +251,8 @@ interface MonitorFixtureOptions {
   egressBad?: boolean
   conditions?: boolean
   schema1Manifest?: boolean
+  deployState?: { phase: string; step: number; active: string; candidate?: string } | 'error'
+  healthyHttpPorts?: number[]
 }
 
 function schema1Marker(overrides: Record<string, unknown> = {}) {
@@ -243,6 +290,8 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     egressBad = false,
     conditions = false,
     schema1Manifest = true,
+    deployState = { phase: 'stable', step: 0, active: 'A' },
+    healthyHttpPorts = [],
   } = options
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
   const bin = path.join(dir, 'bin'); await writeFile(path.join(dir, 'meminfo'), 'MemTotal: 1000 kB\nMemAvailable: 900 kB\n')
@@ -267,9 +316,21 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
   spawnSync('mkdir', ['-p', bin])
   const scripts: Record<string, string> = {
     systemctl: `#!/bin/sh\ncase "$2" in openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}) echo inactive; exit 3;; *) echo active;; esac\n`,
-    curl: egressBad
-      ? '#!/bin/sh\necho refused >&2; exit 7\n'
-      : '#!/bin/sh\ncase "$*" in *18892*) echo \'{"ok":true,"role":"egress"}\';; *) echo refused >&2; exit 7;; esac\n',
+    curl: `#!/bin/sh
+case "$*" in
+  ${egressBad ? '' : '*18892*) echo \'{"ok":true,"role":"egress"}\';;'}
+  ${healthyHttpPorts.map((port) => `*${port}*) echo '{"ok":true,"channel":"v5"}';;`).join('\n  ')}
+  *) echo refused >&2; exit 7;;
+esac
+`,
+    psql: deployState === 'error'
+      ? '#!/bin/sh\necho database-down >&2; exit 2\n'
+      : `#!/bin/sh
+case "$*" in
+  *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  *) exit 0 ;;
+esac
+`,
     df: '#!/bin/sh\necho "Use%"; echo "10%"\n',
     docker: '#!/bin/sh\ncase "$1" in images) echo test/runtime:v5;; ps) :;; esac\n',
   }
@@ -397,5 +458,89 @@ describe('v5 monitor planned-maintenance scope', () => {
     assert.match(result.stdout, /invalid\/expired maintenance marker; fail-open/)
     assert.match(result.stdout, /EVENT ❌ \*\*svc_v5\*\*/)
     assert.match(result.stdout, /write_alert_condition\('ops\.monitor:svc_v5','probe',true/)
+  })
+})
+
+describe('v5 monitor deploy_state serving lanes', () => {
+  test('stable follows active B instead of assuming A', async () => {
+    const result = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'stable', step: 0, active: 'B' },
+      healthyHttpPorts: [18795],
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /svc_v5\s+ok\s+serving slot=B/)
+    assert.match(result.stdout, /http_v5\s+ok\s+serving slot=B healthz 正常/)
+    assert.match(result.stdout, /svc_candidate_v5\s+ok\s+candidate not-serving/)
+  })
+
+  test('canary READY monitors active and candidate independently', async () => {
+    const result = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'canary', step: 10, active: 'A', candidate: 'B' },
+      healthyHttpPorts: [18790],
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /EVENT ❌ \*\*svc_v5\*\*/)
+    assert.match(result.stdout, /EVENT ❌ \*\*http_candidate_v5\*\*/)
+    assert.match(result.stdout, /serving candidate=B phase=canary step=10/)
+  })
+
+  test('canary preparation step below READY does not monitor candidate', async () => {
+    const result = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'canary', step: 5, active: 'A', candidate: 'B' },
+      healthyHttpPorts: [18790],
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /svc_candidate_v5\s+ok\s+candidate not-serving\(phase=canary step=5/)
+    assert.doesNotMatch(result.stdout, /serving candidate=B phase=canary step=5/)
+  })
+
+  test('finalizing step6 treats candidate as the generic sole serving lane', async () => {
+    const result = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'finalizing', step: 6, active: 'A', candidate: 'B' },
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /EVENT ❌ \*\*http_v5\*\* serving slot=B/)
+    assert.match(result.stdout, /http_candidate_v5\s+ok\s+candidate not-serving/)
+  })
+
+  test('aborting monitors both until Caddy restore is recorded, then old active only', async () => {
+    const before = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'aborting', step: 0, active: 'A', candidate: 'B' },
+      healthyHttpPorts: [18790],
+    })
+    assert.match(before.stdout, /EVENT ❌ \*\*http_candidate_v5\*\*/)
+
+    const after = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: { phase: 'aborting', step: 2, active: 'A', candidate: 'B' },
+      healthyHttpPorts: [18790],
+    })
+    assert.doesNotMatch(after.stdout, /EVENT ❌ \*\*http_candidate_v5\*\*/)
+    assert.match(after.stdout, /http_candidate_v5\s+ok\s+candidate not-serving/)
+  })
+
+  test('PG failure is fail-open alert and never guesses slot A', async () => {
+    const result = await monitorFixture({
+      marker: schema1Marker({ schema: 3 }),
+      deployState: 'error',
+      conditions: true,
+      state: {
+        checks: {
+          svc_v5: { status: 'ok', since: 0, last_alert: 0 },
+          http_v5: { status: 'ok', since: 0, last_alert: 0 },
+        },
+      },
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /EVENT ❌ \*\*deploy_state\*\* deploy_state 不可裁决:psql 失败/)
+    assert.match(result.stdout, /svc_candidate_v5\s+ok\s+candidate not-serving\(state unavailable\)/)
+    assert.doesNotMatch(result.stdout, /openclaude-v5 状态=/)
+    assert.match(result.stdout, /write_alert_condition\('ops\.monitor:deploy_state','probe',true/)
+    assert.doesNotMatch(result.stdout, /write_alert_condition\('ops\.monitor:(svc_v5|http_v5)'/)
   })
 })

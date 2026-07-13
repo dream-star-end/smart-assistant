@@ -58,6 +58,15 @@ describe("selfheal policy — matchPolicyIn", () => {
     assert.equal(matchPolicyIn(s, "no.match_here"), null);
   });
 
+  test("candidate monitor keys do not inherit whole-service auto-repair prefixes", () => {
+    const s = state(
+      [],
+      [pol("prefix", "ops.monitor:svc_v5"), pol("prefix", "ops.monitor:http_v5")],
+    );
+    assert.equal(matchPolicyIn(s, "ops.monitor:svc_candidate_v5"), null);
+    assert.equal(matchPolicyIn(s, "ops.monitor:http_candidate_v5"), null);
+  });
+
   test("同长度且同为前缀(重复 key)→ fail-fast 抛错", () => {
     // 人造两条等长且都命中的 prefix(现实由 DB 唯一键挡;此处验裁决防线)。
     const s = state([], [pol("prefix", "dup.key"), pol("prefix", "dup.key")]);

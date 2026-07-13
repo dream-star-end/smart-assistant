@@ -2894,6 +2894,9 @@ export class Gateway {
       // v5 灰度可观测 — channel 标签 + commercial 运行时状态(控制面静默 / 运行时隔离 /
       // 灰度归属的只读断言面)。无标签默认 "v3";commercial 未注入 runtimeStatus 时省略。
       body.channel = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3'
+      // P3(RFC D3/D5):v5 双 master 下 healthz 顶层暴露 slot 身份(与 commercial ocSlot 同权威源
+      // OC_SLOT,A 默认)。Caddy verifier 经此断言"经分流命中的响应确实来自目标 slot"(去 || true 后严格)。
+      if (body.channel === 'v5') body.slot = process.env.OC_SLOT?.trim() || 'A'
       const instanceId = process.env.OC_INSTANCE_ID?.trim()
       if (instanceId) body.instance = instanceId
       if (c?.runtimeStatus) body.runtime = c.runtimeStatus

@@ -41,6 +41,26 @@ export interface CostEventSinkOpts {
   now?: () => number;
 }
 
+/**
+ * egress /healthz 暴露的单调计数器快照(RFC-v5-dual-master-cohort §4 D3④)。
+ * finalize 门槛按"两次采样差分 + startId 未变"判断队列是否真排空(计数归零假绿被
+ * startId 变化拦截)。全部单调递增,drop 分类计数;不改任何计费行为,纯观测。
+ */
+export interface CostSinkHealthCounters {
+  /** 当前队列长度(= 尚未成功发送的回执数)。 */
+  pendingCostEvents: number;
+  /** 累计入队事件数(单调)。 */
+  enqueuedTotal: number;
+  /** 累计成功发送到 master 的事件数(单调)。 */
+  sentTotal: number;
+  /** 累计因 TTL 过期被丢弃的事件数(单调)。 */
+  expiredDropsTotal: number;
+  /** 累计因队列上限溢出被丢弃(丢最老)的事件数(单调)。 */
+  overflowDropsTotal: number;
+  /** 队首事件已等待的毫秒数(队列空 → 0);判断 backlog 老化。 */
+  oldestPendingAgeMs: number;
+}
+
 export class CostEventSink {
   private readonly queue: QueuedEvent[] = [];
   private readonly log: Logger;
@@ -51,6 +71,11 @@ export class CostEventSink {
   private retryMs = BASE_RETRY_MS;
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
+  // ── 单调计数器(D3④ finalize 门槛差分用;纯观测,不影响计费/发送行为)──
+  private enqueuedTotal = 0;
+  private sentTotal = 0;
+  private expiredDropsTotal = 0;
+  private overflowDropsTotal = 0;
 
   constructor(private readonly opts: CostEventSinkOpts) {
     this.log = (opts.logger ?? rootLogger).child({ subsys: "costEventSink" });
@@ -61,8 +86,10 @@ export class CostEventSink {
   enqueue(ev: CostEvent): void {
     if (this.stopped) return;
     this.queue.push({ ev, enqueuedAt: this.now() });
+    this.enqueuedTotal += 1;
     if (this.queue.length > MAX_QUEUE) {
       const dropped = this.queue.shift();
+      this.overflowDropsTotal += 1;
       this.log.warn("cost_event_queue_overflow_drop_oldest", { kind: dropped?.ev.kind });
     }
     void this.pump();
@@ -85,6 +112,20 @@ export class CostEventSink {
     return this.queue.length;
   }
 
+  /** D3④ finalize 门槛用的健康计数器快照(单调计数 + 队首老化 + 当前 pending)。 */
+  healthCounters(): CostSinkHealthCounters {
+    const oldestPendingAgeMs =
+      this.queue.length > 0 ? this.now() - this.queue[0]!.enqueuedAt : 0;
+    return {
+      pendingCostEvents: this.queue.length,
+      enqueuedTotal: this.enqueuedTotal,
+      sentTotal: this.sentTotal,
+      expiredDropsTotal: this.expiredDropsTotal,
+      overflowDropsTotal: this.overflowDropsTotal,
+      oldestPendingAgeMs,
+    };
+  }
+
   private scheduleRetry(): void {
     if (this.timer || this.stopped) return;
     this.timer = setTimeout(() => {
@@ -99,6 +140,7 @@ export class CostEventSink {
     const cutoff = this.now() - EVENT_TTL_MS;
     while (this.queue.length > 0 && this.queue[0]!.enqueuedAt < cutoff) {
       const dropped = this.queue.shift()!;
+      this.expiredDropsTotal += 1;
       this.log.warn("cost_event_expired_dropped", {
         kind: dropped.ev.kind,
         ageMs: this.now() - dropped.enqueuedAt,
@@ -137,6 +179,7 @@ export class CostEventSink {
           await r.body.text().catch(() => "");
           if (r.statusCode !== 200) throw new Error(`HTTP ${r.statusCode}`);
           this.queue.splice(0, batch.length);
+          this.sentTotal += batch.length;
           this.retryMs = BASE_RETRY_MS;
         } catch (err) {
           this.log.warn("cost_event_send_failed_will_retry", {

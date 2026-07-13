@@ -72,6 +72,98 @@ describe("CostEventSink — FIFO 保序 + 失败重试", () => {
   });
 });
 
+// ─── CostEventSink health counters(D3④ finalize 门槛差分)─────────────────────
+
+describe("CostEventSink — health 单调计数器", () => {
+  test("初始全零;成功发送 → enqueued==sent,无 drop,oldestPendingAgeMs=0", async () => {
+    const okFetcher = (async () => ({ statusCode: 200, body: { text: async () => "{}" } })) as never;
+    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: okFetcher });
+    let c = sink.healthCounters();
+    assert.deepEqual(
+      {
+        pendingCostEvents: c.pendingCostEvents,
+        enqueuedTotal: c.enqueuedTotal,
+        sentTotal: c.sentTotal,
+        expiredDropsTotal: c.expiredDropsTotal,
+        overflowDropsTotal: c.overflowDropsTotal,
+        oldestPendingAgeMs: c.oldestPendingAgeMs,
+      },
+      { pendingCostEvents: 0, enqueuedTotal: 0, sentTotal: 0, expiredDropsTotal: 0, overflowDropsTotal: 0, oldestPendingAgeMs: 0 },
+    );
+    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    sink.enqueue({ kind: "broadcast", uid: "7", payload: { type: "outbound.cost_charged" } });
+    await sink.flush();
+    c = sink.healthCounters();
+    assert.equal(c.enqueuedTotal, 2);
+    assert.equal(c.sentTotal, 2);
+    assert.equal(c.pendingCostEvents, 0);
+    assert.equal(c.expiredDropsTotal, 0);
+    assert.equal(c.overflowDropsTotal, 0);
+    assert.equal(c.oldestPendingAgeMs, 0);
+    sink.stop();
+  });
+
+  test("发送失败 → pending 保留,oldestPendingAgeMs 反映队首等待时长", async () => {
+    let t = 1_000;
+    const failFetcher = (async () => {
+      throw new Error("down");
+    }) as never;
+    const sink = new CostEventSink({
+      controlBaseUrl: "http://x",
+      secret: "s".repeat(16),
+      fetcher: failFetcher,
+      now: () => t,
+    });
+    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.flush();
+    t = 1_500;
+    const c = sink.healthCounters();
+    assert.equal(c.enqueuedTotal, 1);
+    assert.equal(c.sentTotal, 0);
+    assert.equal(c.pendingCostEvents, 1);
+    assert.equal(c.oldestPendingAgeMs, 500);
+    sink.stop();
+  });
+
+  test("TTL 过期丢弃 → expiredDropsTotal 计数", async () => {
+    let t = 1_000_000;
+    const failFetcher = (async () => {
+      throw new Error("down");
+    }) as never;
+    const sink = new CostEventSink({
+      controlBaseUrl: "http://x",
+      secret: "s".repeat(16),
+      fetcher: failFetcher,
+      now: () => t,
+    });
+    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.flush();
+    t += 121_000; // 越过 120s TTL
+    await sink.flush();
+    const c = sink.healthCounters();
+    assert.equal(c.pendingCostEvents, 0);
+    assert.equal(c.expiredDropsTotal, 1);
+    assert.equal(c.sentTotal, 0);
+    sink.stop();
+  });
+
+  test("队列上限溢出丢最老 → overflowDropsTotal 计数(enqueuedTotal 仍单调计全量)", () => {
+    const failFetcher = (async () => {
+      throw new Error("down");
+    }) as never;
+    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: failFetcher });
+    // MAX_QUEUE=2000;入队 2001 触发一次溢出丢弃(同步发生在 enqueue)。
+    for (let i = 0; i < 2001; i++) {
+      sink.enqueue({ kind: "persist", requestId: `r${i}`, uid: "7", costCredits: "1", sessionId: null });
+    }
+    const c = sink.healthCounters();
+    assert.equal(c.enqueuedTotal, 2001);
+    assert.equal(c.overflowDropsTotal, 1);
+    assert.equal(c.pendingCostEvents, 2000);
+    sink.stop();
+  });
+});
+
 // ─── internalCostEvent handler ──────────────────────────────────────────────
 
 async function invokeHandler(
