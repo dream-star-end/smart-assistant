@@ -1349,24 +1349,38 @@ describe("stripNonTextContentBlocks", () => {
     assert.ok(estimateIdx >= 0, "必须存在 const inputTokens = estimateInputTokens(body) 调用");
     assert.ok(stripIdx < estimateIdx, "strip 必须在 estimateInputTokens(body) 之前");
 
-    // strip 必须 gated 在 `if (route.kind === "static" && !route.provider.supportsVision)` 内:
-    // 只对静态**纯文本** provider strip;MiniMax-M3 等 supportsVision provider 不 strip(原生识图)。
+    // strip 必须 gated 在 `if (route.kind === "static" && !modelSupportsVision)` 内:
+    // 只对静态**纯文本**模型 strip;MiniMax-M3 等原生识图的模型不 strip。
+    //
+    // 2026-07-12 模型权威批次:gate 从 **provider 级** `route.provider.supportsVision` 收窄成
+    // **per-model** `modelSupportsVision` —— catalog 生效时取该行的 capability_profile
+    // (方案 §4 "proxy 清洗消费 catalog 行 per-model"),legacy 期回落 provider 级 spec。
+    // 语义没变(纯文本模型才 strip),但表达力升级:同一 provider 下未来会同时有多模态与
+    // 纯文本型号,provider 级 flag 表达不了。
     const gateIdx = src.lastIndexOf(
-      'if (route.kind === "static" && !route.provider.supportsVision)',
+      'if (route.kind === "static" && !modelSupportsVision)',
       stripIdx,
     );
     assert.ok(
       gateIdx >= 0 && gateIdx < stripIdx,
-      'strip 必须 gated 在 if (route.kind === "static" && !route.provider.supportsVision) 内',
+      'strip 必须 gated 在 if (route.kind === "static" && !modelSupportsVision) 内',
     );
 
-    // input cap guard 也必须 gated 在 !route.provider.supportsVision —— vision 请求含大 base64 图,
+    // input cap guard 也必须 gated 在 !modelSupportsVision —— vision 请求含大 base64 图,
     // estimateInputTokens(JSON.length/4)把图当文本 token 高估(2MB 图≈725k),误撞文本 context cap → 413。
-    // 期望源码里有**两处** !route.provider.supportsVision:strip gate + input cap gate。
-    const supportsVisionGates = (src.match(/!route\.provider\.supportsVision/g) ?? []).length;
+    // 期望源码里有**两处** !modelSupportsVision:strip gate + input cap gate。
+    const supportsVisionGates = (src.match(/!modelSupportsVision/g) ?? []).length;
     assert.ok(
       supportsVisionGates >= 2,
-      'strip 与 static input cap guard 两处都必须 gated 在 !route.provider.supportsVision',
+      'strip 与 static input cap guard 两处都必须 gated 在 !modelSupportsVision',
+    );
+
+    // modelSupportsVision 的**权威来源**:catalog descriptor(gate 生效)→ 否则 provider spec。
+    // 这条断言防止未来有人把它改回 provider 级或写死 true(后者会让纯文本上游收到图 → 400 打死会话)。
+    assert.match(
+      src,
+      /const modelSupportsVision = gate[\s\S]{0,200}capabilityProfile\.supportsVision/,
+      "modelSupportsVision 必须优先取 catalog descriptor 的 per-model capability",
     );
   });
 });

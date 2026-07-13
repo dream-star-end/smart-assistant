@@ -35,6 +35,10 @@ async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => T
 }
 
 describe('shouldEnableOpenClaudeVision gating', () => {
+  it('catalog supportsVision override 是最高权威(动态 model id 不查 baked 表)', () => {
+    assert.equal(vision.shouldEnableOpenClaudeVision('unknown', 'dynamic-model', false), true)
+    assert.equal(vision.shouldEnableOpenClaudeVision('deepseek', 'deepseek-v4-pro', true), false)
+  })
   it('纯文本静态模型(deepseek/glm-5.1/glm-5.2)→ true', () => {
     assert.equal(vision.shouldEnableOpenClaudeVision('deepseek', 'deepseek-v4-pro'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.1'), true)

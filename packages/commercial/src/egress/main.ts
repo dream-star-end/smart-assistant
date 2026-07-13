@@ -26,6 +26,11 @@ import IORedis from "ioredis";
 import { loadConfig } from "../config.js";
 import { getPool } from "../db/index.js";
 import { PricingCache } from "../billing/pricing.js";
+import {
+  authorityKeyringProvider,
+  getModelCatalogCache,
+  isModelAuthorityEnforced,
+} from "../billing/modelCatalogRuntime.js";
 import { wrapIoredisForPreCheck } from "../billing/preCheck.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
@@ -39,6 +44,10 @@ import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
+import {
+  EGRESS_CAPABILITIES,
+  assertModelAuthorityCutoverFloor,
+} from "../runtimeCapabilities.js";
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
 import { rootLogger } from "../logging/logger.js";
@@ -87,6 +96,8 @@ export async function startEgress(): Promise<void> {
   if (!cfg.OC_EGRESS_SPLIT) {
     throw new Error("[egress] OC_EGRESS_SPLIT!=1 — egress 进程只在 split 模式下运行,拒启");
   }
+  // 步骤 5 兼容地板(方案 §7 步 5,R4-M2:egress 是四面之一)。marker 置位却 flag 关 = 拒启。
+  assertModelAuthorityCutoverFloor();
   const bind = cfg.INTERNAL_PROXY_BIND;
   const port = cfg.INTERNAL_PROXY_PORT;
   const controlBind = cfg.INTERNAL_CONTROL_BIND;
@@ -156,13 +167,35 @@ export async function startEgress(): Promise<void> {
     kimi: cfg.ARK_AGENT_PLAN_KEY,
   };
 
+  // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)────────────────────────────
+  //
+  // **这里才是 fence 真正生效的地方**:生产的 `/v1/messages` 全部走本进程,每个独立 HTTP
+  // 请求在授权/路由前做一次 epoch fence(单行 SELECT,不做时间微缓存)+ authority 校验。
+  // master 侧的同一份 handler 只服务非 split 拓扑。
+  //
+  // 两个模式都加载 catalog(影子期用真实流量证明"切判定源不改变任何请求的命运");
+  // 加载失败 → 抛 → egress 拒启(fail-closed:半开状态会让每条请求都被 fence 拒)。
+  // **生效面**:改本段或 gate/路由代码,部署必须 `deploy-v5.sh --egress`。
+  const modelCatalog = await getModelCatalogCache();
+  const modelAuthorityEnforce = isModelAuthorityEnforced();
+  log.info("model_catalog_ready", {
+    enforce: modelAuthorityEnforce,
+    securityEpoch: modelCatalog.current().securityEpoch.toString(),
+    executionRevision: modelCatalog.current().executionRevision.slice(0, 12),
+  });
+
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
     preCheckRedis,
     scheduler,
     identity: identityStrategy,
+    loadUserModelAuthz,
     rateLimitRedis,
+    modelCatalog,
+    modelAuthorityEnforce,
+    // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
+    authorityKeyring: authorityKeyringProvider(),
     refreshDeps: { health: healthTracker },
     // 跨进程 post-commit hooks:两者都收敛到 costSink FIFO(persist 先入队,
     // broadcast 后入队;master 端按序 apply,与原进程内顺序一致)。
@@ -305,12 +338,18 @@ export async function startEgress(): Promise<void> {
       // ∧ expired/overflow delta=0)。
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
+      // capabilities:**构建级事实**(本 egress 版本实现了模型权威协议:每请求 epoch fence +
+      // catalog 数据驱动路由)。deploy 的四面守卫在开 flag / 走 cutover 前读它 —— 一个旧
+      // egress 进程(无 fence)会让 master 签发的权威在出站面失效,必须在启用前被拒。
+      // enforced 是**开关态**(诊断用),与 capability 语义正交。
       res.end(
         JSON.stringify({
           ok: true,
           role: "egress",
           processStartId,
           ...costSink.healthCounters(),
+          capabilities: [...EGRESS_CAPABILITIES],
+          modelAuthority: { enforced: isModelAuthorityEnforced() },
         }),
       );
       return;

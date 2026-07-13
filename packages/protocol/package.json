@@ -10,7 +10,8 @@
     "./teamCards": "./src/teamCards.ts",
     "./sessionKey": "./src/sessionKey.ts",
     "./traceId": "./src/traceId.ts",
-    "./research": "./src/research.ts"
+    "./research": "./src/research.ts",
+    "./modelAuthority": "./src/modelAuthority.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

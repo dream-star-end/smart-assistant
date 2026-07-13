@@ -59,6 +59,7 @@ import {
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import {
   findRouteProviderForModel,
+  getStaticProvider,
   type StaticKeyProviderSpec,
   type StaticProviderId,
   type StaticProviderKeys,
@@ -81,18 +82,176 @@ import {
 // ─── 路由决策 + 早拒绝 ────────────────────────────────────────────────────────
 
 export type UpstreamRoute =
-  | { kind: "oauth" }
-  | { kind: "static"; provider: StaticKeyProviderSpec };
+  | { kind: "oauth"; upstreamModel?: string }
+  | { kind: "static"; provider: StaticKeyProviderSpec; upstreamModel?: string };
 
 /**
- * 纯函数,基于 model 决定走哪条 upstream。**preCheck 前**调用。
+ * catalog 行给出的路由事实(模型权威批次 · 方案 §1.3 / R1-B4)。
  *
- * 命中任一静态 key provider(@openclaude/protocol 注册表的 matchesRoute) → static;否则 oauth。
- * deepseek 大小写敏感前缀 / minimax,ark 精确(大小写不敏感) —— 判定逻辑在注册表里,与现状逐字节等价。
+ * 语义分工(必须记牢,否则会重新长出第二权威源):
+ *   - **哪个 provider / 上游用什么 model 名**:DB catalog 说了算(本结构);
+ *   - **该 provider 的机制**(endpoint / 鉴权风格 / strip 规则 / 能力上限):protocol
+ *     STATIC_KEY_PROVIDERS 说了算(凭据与端点不 DB 化,方案 §1 冷面边界)。
  */
-export function selectUpstreamRoute(model: string): UpstreamRoute {
+export interface CatalogRouteHint {
+  /** engine='ccb' 时非空;'anthropic' = OAuth 池虚拟条目;其余 = 静态 provider 机制 id。 */
+  providerId: string | null;
+  /** 转发给上游的 model 名(catalog 的 upstream_model_id ?? model_id,调用方已解析)。 */
+  upstreamModelId: string;
+}
+
+/** catalog 声明了一个本进程不认识的 provider 机制 → fail-closed(不猜、不回落 OAuth)。 */
+export class UnroutableProviderError extends Error {
+  constructor(readonly providerId: string) {
+    super(`model catalog declares unknown provider mechanism '${providerId}'`);
+    this.name = "UnroutableProviderError";
+  }
+}
+
+/** OAuth 账号池在 catalog 里的虚拟 provider id(非静态 key provider)。 */
+const OAUTH_PROVIDER_ID = "anthropic";
+
+const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
+  "deepseek",
+  "minimax",
+  "ark",
+  "opencodego",
+  "kimi",
+]);
+
+/**
+ * 纯函数,决定走哪条 upstream。**preCheck 前**调用。
+ *
+ * **权威优先级(方案 §1.3 数据驱动路由)**:
+ *   1. `hint`(catalog active 行)存在 → 按 `provider_id` 选 provider **机制**,上游 model 名
+ *      取 `upstream_model_id ?? model_id` —— 新增模型/换上游只改 DB,不改代码,也不再依赖
+ *      `matchesRoute` 那套"按 id 猜 provider"的字符串规则。
+ *   2. 无 hint(flag 未开 / 影子期 / 非 catalog 路径)→ 现状 `findRouteProviderForModel`
+ *      (matchesRoute)。**它自此降级为迁移期的兼容回落,不再是路由权威**。
+ *
+ * hint 里的 providerId 不认识 → 抛 UnroutableProviderError(handler → 503):静默回落
+ * OAuth 会把"配错 provider 的新模型"发到 Anthropic 账号池上烧真钱。
+ */
+export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): UpstreamRoute {
+  if (hint) {
+    const pid = hint.providerId;
+    if (pid === null || pid === OAUTH_PROVIDER_ID) {
+      return { kind: "oauth", upstreamModel: hint.upstreamModelId };
+    }
+    if (!STATIC_PROVIDER_IDS.has(pid)) {
+      throw new UnroutableProviderError(pid);
+    }
+    return {
+      kind: "static",
+      provider: getStaticProvider(pid as StaticProviderId),
+      upstreamModel: hint.upstreamModelId,
+    };
+  }
   const provider = findRouteProviderForModel(model);
   return provider ? { kind: "static", provider } : { kind: "oauth" };
+}
+
+// ─── 能力上限(catalog capability ⊆ provider 机制上限)────────────────────────
+
+/**
+ * provider **机制**能给到的能力天花板(方案 §4 "能力上限校验")。
+ *
+ * 这是一条机制事实,不是产品选择:catalog 可以声明比它**窄**的能力(如某 glm 型号只开
+ * high 一档),但绝不能声明比它**宽**的(声明 vision=true 而上游是纯文本端点 → 图片直接
+ * 400 打死会话;声明 effort 档位而上游 strip 掉 output_config → 用户选了没效果)。
+ *
+ * 规则与 protocol `modelReasoningPolicy` 的 provider 分支同源(那里是 per-model 入口,
+ * 这里是 per-provider 机制上限)。**两处必须同步** —— 新增 provider 或改 spec 的
+ * allowedOutputConfigEfforts / stripBodyFields 时,`__tests__/modelAuthorityRouting.test.ts`
+ * 的 parity 断言会挡住漂移。
+ */
+export interface ProviderCapabilityCeiling {
+  supportsVision: boolean;
+  /** null = 平台全部档位(无机制限制);数组 = 仅这些档位。 */
+  efforts: readonly string[] | null;
+}
+
+export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabilityCeiling {
+  if (route.kind === "oauth") {
+    // OAuth(Anthropic 官方)端点:原生多模态,无 output_config 白名单机制。
+    return { supportsVision: true, efforts: null };
+  }
+  const spec = route.provider;
+  const efforts = spec.allowedOutputConfigEfforts
+    ? spec.allowedOutputConfigEfforts
+    : spec.stripBodyFields.includes("output_config")
+      ? [] // 整体 strip output_config ⇒ 该 provider 机制上不支持思考档位
+      : null;
+  return { supportsVision: spec.supportsVision === true, efforts };
+}
+
+/**
+ * catalog 行的 capability ⊆ provider 机制上限?返回违规说明(null = 通过)。
+ * 启动 / 激活期断言 + proxy 每请求消费(便宜:两个集合比较)。
+ */
+export function checkCapabilityWithinCeiling(
+  capability: { supportsVision: boolean; supportedEfforts: readonly string[] },
+  ceiling: ProviderCapabilityCeiling,
+): string | null {
+  if (capability.supportsVision && !ceiling.supportsVision) {
+    return "capability declares vision but provider mechanism is text-only";
+  }
+  if (ceiling.efforts !== null) {
+    const allowed = new Set(ceiling.efforts);
+    const over = capability.supportedEfforts.filter((e) => !allowed.has(e));
+    if (over.length > 0) {
+      return `capability declares efforts [${over.join(",")}] beyond provider mechanism limit`;
+    }
+  }
+  return null;
+}
+
+/**
+ * 全量快照的能力上限体检(**启动断言 + 每次激活/重建**;方案 §4)。
+ *
+ * 请求级的 gate 只体检"这一条请求用到的模型";这里在快照层把**所有 active 行**过一遍 ——
+ * 一个配错的 catalog 行(声明 vision 而上游纯文本 / effort 超出白名单 / provider 机制不存在)
+ * 应该在它被第一个用户撞到之前就被喊出来。
+ *
+ * 返回违规说明数组(空 = 全部合规)。codex engine 行不参与(它不走 anthropic proxy 机制)。
+ */
+export function checkSnapshotCapabilities(snapshot: {
+  entries: readonly {
+    modelId: string;
+    engine: string;
+    providerId: string | null;
+    state: string;
+    capabilityProfile: {
+      supportsVision: boolean;
+      reasoning: { supported: readonly string[] };
+    };
+  }[];
+}): string[] {
+  const violations: string[] = [];
+  for (const e of snapshot.entries) {
+    if (e.state !== "active" || e.engine !== "ccb") continue;
+    let route: UpstreamRoute;
+    try {
+      route = selectUpstreamRoute(e.modelId, {
+        providerId: e.providerId,
+        upstreamModelId: e.modelId,
+      });
+    } catch (err) {
+      violations.push(
+        `${e.modelId}: ${err instanceof UnroutableProviderError ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    const v = checkCapabilityWithinCeiling(
+      {
+        supportsVision: e.capabilityProfile.supportsVision,
+        supportedEfforts: e.capabilityProfile.reasoning.supported,
+      },
+      providerCapabilityCeiling(route),
+    );
+    if (v) violations.push(`${e.modelId}: ${v}`);
+  }
+  return violations;
 }
 
 /**
@@ -142,6 +301,18 @@ export interface PreparedUpstreamSession {
   readonly pinnedUserId: string | null;
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
+  /**
+   * **转发给上游的 model 名**(模型权威批次 §1.3)。
+   *
+   * = catalog 的 `upstream_model_id ?? model_id`;无 catalog hint 时 = 调用方 body.model
+   * (逐字节等于本批次之前的行为 —— 那时上游永远原样透传 caller 的 model)。
+   *
+   * 为什么要与 `body.model` 分离:平台对外的 id(计费/授权/展示的键)与上游真实型号名不必
+   * 相同(上游改名 / 同一上游型号在平台起两个档位)。分离后"换上游型号"只改 DB 一行,
+   * 而计费与授权继续认平台 id —— 不再靠"平台 id 必须恰好等于上游 id"这条隐式耦合。
+   * core.ts 在构造 upstream body 时用它覆盖 `model` 字段。
+   */
+  readonly upstreamModel: string;
   /**
    * undici dispatcher。OAuth = 绑账号 egress IP(account egress dispatcher)。
    * 静态 = 按 STATIC_PROVIDER_META[spec.id].egress:"direct" 挂无代理直连 dispatcher
@@ -320,6 +491,7 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
 function makeStaticKeyUpstream(
   spec: StaticKeyProviderSpec,
   apiKey: string,
+  upstreamModel: string,
 ): PreparedUpstreamSession {
   // 出口策略(commercial 部署拓扑权威源):国内/亚洲静态 provider 必须显式直连,绕开 gateway
   // 启动装的全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),否则双重跨境长流式易半路断。
@@ -332,6 +504,7 @@ function makeStaticKeyUpstream(
     slotId: null,
     pinnedUserId: null,
     endpoint: spec.upstreamEndpoint,
+    upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,
     applyUpstreamAuth(safeHeaders, body, _log) {
@@ -402,6 +575,7 @@ function makeOAuthPoolUpstream(
   dispatcher: Dispatcher | undefined,
   endpoint: string,
   phase6Enforce: Phase6AccountUuidEnforce,
+  upstreamModel: string,
 ): PreparedUpstreamSession {
   // 注意 `pick` 通过闭包持有;refresh 成功后 pickUpstream 内部 **rebind** 旧引用
   // 已经被 fill(0) → 这里持有的就是新 buffer。zeroizeSecrets idempotent 由 flag 守。
@@ -413,6 +587,7 @@ function makeOAuthPoolUpstream(
     slotId: pick.slotId,
     pinnedUserId: pick.pinned_user_id,
     endpoint,
+    upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: true,
     applyUpstreamAuth(safeHeaders, body, log) {
@@ -570,7 +745,12 @@ export async function pickUpstream(
     // validateUpstreamConfig 已保证该 provider 的 key 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
     const apiKey = deps.staticProviderKeys?.[route.provider.id] ?? "";
-    return { ok: true, session: makeStaticKeyUpstream(route.provider, apiKey) };
+    // upstreamModel:catalog 有 hint → upstream_model_id ?? model_id;无 hint(legacy 路径)
+    // → 原样透传 body.model(与本批次之前逐字节一致)。
+    return {
+      ok: true,
+      session: makeStaticKeyUpstream(route.provider, apiKey, route.upstreamModel ?? body.model),
+    };
   }
 
   // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream
@@ -844,7 +1024,13 @@ export async function pickUpstream(
     const endpoint = deps.upstreamEndpoint ?? DEFAULT_UPSTREAM_ENDPOINT;
     return {
       ok: true,
-      session: makeOAuthPoolUpstream(pick, dispatcher, endpoint, phase6Enforce),
+      session: makeOAuthPoolUpstream(
+        pick,
+        dispatcher,
+        endpoint,
+        phase6Enforce,
+        route.upstreamModel ?? body.model,
+      ),
     };
   } catch (err) {
     // (b₂) preparation 期任意 throw 兜底:

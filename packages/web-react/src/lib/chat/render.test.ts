@@ -206,6 +206,13 @@ describe("errorLabel / stripMarkdown", () => {
     expect(errorLabel("some_new_code")).toBe("出错了"); // 未知码不再回退裸码,统一友好
     expect(errorLabel(undefined)).toBe("出错了");
   });
+  test("模型权威拒帧的标题(类别)—— 不再回退「出错了」", () => {
+    expect(errorLabel("model_config_changed_retry_turn")).toBe("模型配置已更新，请重发");
+    expect(errorLabel("model_not_available")).toBe("模型不可用");
+    expect(errorLabel("unresolved_agent_model")).toBe("未能确定模型");
+    expect(errorLabel("model_authority_unavailable")).toBe("模型服务暂时不可用");
+    expect(errorLabel("model_catalog_unavailable")).toBe("模型服务暂时不可用");
+  });
   test("stripMarkdown 去标记取纯文本", () => {
     expect(stripMarkdown("# 标题")).toBe("标题");
     expect(stripMarkdown("**粗** 和 `代码`")).toBe("粗 和 代码");

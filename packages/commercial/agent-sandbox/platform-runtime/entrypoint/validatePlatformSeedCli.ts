@@ -6,10 +6,17 @@
  *
  * 职责(纯离线,不 spawn / 不写盘 / 不要求容器运行时):
  *   1. 解析 `<bundle根>/seed/platform-seed.yaml`,复用 validatePlatformSeed 做 schema 校验
- *      (含 slug / persona-ref / 未知字段 / banned 计费键 fail-loud);
+ *      —— **schema v2**(模型权威 §5 阶段 A):除 slug / persona-ref / 未知字段 / banned `engine` 键外,
+ *      还校验每个 agent 的**执行三元组**(model 非空 / provider ∈ 已知集 / runnerKind 仅 app-server),
+ *      schemaVersion 未知(含旧 v1)一律 fail-loud;
  *   2. 复用 validateSeedAssetsExist 校验每个 persona 引用与 seed skill 文件在 bundle 内**实际存在**
  *      且 realpath 不逃逸 seed 子树。
- *   全过 → exit 0;任一失败 → stderr 打原因、exit 1;参数缺失 → exit 2。
+ *   全过 → exit 0(stderr 打印每个 agent 的执行三元组,供 deploy prepare 日志留证);
+ *   任一失败 → stderr 打原因、exit 1;参数缺失 → exit 2。
+ *
+ * **不做**的事(边界):不校验"声明的 model 是否在 catalog active / 是否与 master 常量一致" ——
+ * 前者是 deploy prepare 的 master 侧 DB 断言(方案 §5),后者是 runtimeEntrypointPolicy 一致性锚
+ * 单测。本 CLI 只回答"bundle 内的 seed 声明自洽且资产齐全"。
  *
  * 与 entrypoint validate-only 模式**共用同一对纯函数**(validatePlatformSeed + validateSeedAssetsExist):
  * 本 CLI 是 host 侧离线门(deploy prepare,F2 接线),validate-only 是容器内 canary boot 冒烟门,
@@ -74,9 +81,18 @@ function main(): void {
     fail(`platform-seed asset references unresolved:\n  ${errors.join("\n  ")}`);
   }
 
+  // schema v2 留证:把每个 seed agent 的执行三元组打进 deploy 日志(上线后追溯"这个 rev 的容器
+  // 按什么模型计费"的第一手证据;master 阶段 B 读的就是同一份声明)。
+  const triples = doc.agents
+    .map(
+      (a) =>
+        `${a.id}=${a.model}/${a.provider}${a.runnerKind ? `/${a.runnerKind}` : ""}`,
+    )
+    .join(" ");
   console.error(
-    `[validate-platform-seed] OK: ${doc.agents.length} agents, ` +
-      `${Object.values(doc.seedSkills).reduce((n, arr) => n + arr.length, 0)} seed skills — all persona/skill refs resolved`,
+    `[validate-platform-seed] OK: schemaVersion=${doc.schemaVersion} ${doc.agents.length} agents, ` +
+      `${Object.values(doc.seedSkills).reduce((n, arr) => n + arr.length, 0)} seed skills — ` +
+      `all persona/skill refs resolved; execution: ${triples}`,
   );
   process.exit(0);
 }

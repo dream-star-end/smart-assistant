@@ -35,6 +35,19 @@ const {
 // ─── EFFORT_LEVELS constant ────────────────────────────────────────────
 
 describe("EFFORT_LEVELS", () => {
+  test("catalog 新 id 的 effort/max 只认 descriptor", () => {
+    process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify({
+      canonicalModel: "new-ccb-model",
+      contextWindow: null,
+      capabilityZero: false,
+      supportsThinking: true,
+      supportsVision: false,
+      supportedEfforts: ["high", "max"],
+    });
+    expect(modelSupportsEffort("new-ccb-model")).toBe(true);
+    expect(modelSupportsMaxEffort("new-ccb-model")).toBe(true);
+    delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+  });
   test("contains the five canonical levels", () => {
     // 'xhigh' added in commit 4bcf507 (Opus 4.7 + xhigh effort 等级)
     expect(EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh", "max"]);

@@ -200,6 +200,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/model-catalog",
+    "handler": "handleAdminListModelCatalog"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/model-catalog",
+    "handler": "handleAdminCreateModelCatalogEntry"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/model-catalog/",
+    "handler": "handleAdminModelCatalogAction"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/connectors/platform-oauth-apps",
     "handler": "handleAdminListPlatformOauthApps"
   },

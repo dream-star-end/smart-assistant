@@ -635,6 +635,7 @@ function buildHarness(opts: HarnessOpts = {}) {
     preCheckRedis: preCheckSpy.redis,
     scheduler: schedulerSpy.scheduler,
     identity: identityStrategy,
+    loadUserModelAuthz: (uid) => authzImpl(uid),
     rateLimitRedis,
     fetchImpl: opts.fetchImpl ?? (async () =>
       sseResponse(200, makeFullSseChunks())),

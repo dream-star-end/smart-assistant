@@ -134,7 +134,7 @@ recover_case() { # $1=phase $2=step $3=candidate $4=路由提示关键字 [$5=�
 }
 recover_case stable     0 ""  "无需恢复"
 recover_case canary     5 B   "canary<READY"    "phase='stable'"        # 前滚清理 → 回 stable(state 终态)
-recover_case canary    10 B   "canary≥READY"    "candidate(B)自检"     # 核验 candidate(unit 状态探活)
+recover_case canary    10 B   "canary≥READY"    "private healthz"      # 核验 candidate 严格私有口状态探活
 recover_case finalizing 0 B   "finalizing 0-1"  "active_slot='B'"       # 前滚 finalize → commit(state 翻转)
 recover_case finalizing 2 B   "finalizing 2-3"  "active_slot='B'"
 recover_case finalizing 4 B   "finalizing 4-5"  "active_slot='B'"
@@ -176,6 +176,9 @@ smoke() {
 ssh() {
   local _host="$1" cmd="${2:-}" link_target
   echo "ssh:$cmd" >> "$FAKE_EFFECT_LOG"
+  # finalize 自 87d44375 起在推进任何状态前钉死 candidate dist 的 oc-build；本 smoke
+  # 只测恢复状态机，不访问真实 release，故由 fake 返回一个合法 build id。
+  if [[ "$cmd" == *'name="oc-build"'* ]]; then printf '%s\n' "abcdef12"; return 0; fi
   if [[ -n "${FAKE_EMERGENCY_JSON:-}" && "$cmd" == *"OC_RUNTIME_EMERGENCY_TUPLE="* ]]; then printf '%s\n' "$FAKE_EMERGENCY_JSON"; return 0; fi
   if [[ -n "${FAKE_EMERGENCY_IMAGE_ID:-}" && "$cmd" == *"docker image inspect"* ]]; then printf '%s\n' "$FAKE_EMERGENCY_IMAGE_ID"; return 0; fi
   if [[ "$cmd" == *"cat '$RELEASES_ROOT/.prev-release'"* ]]; then printf '%s\n' "$FAKE_PREV_FILE"; return 0; fi

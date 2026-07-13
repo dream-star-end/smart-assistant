@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -8,7 +8,32 @@ import {
   isCapabilityZeroStaticModel,
   isOpencodeQwenModel,
   getStaticModelContextWindow,
+  getAuthorityModelCapabilities,
 } from "../staticKeyModels";
+
+const AUTH_ENV = "OC_MODEL_EXECUTION_DESCRIPTOR";
+afterEach(() => { delete process.env[AUTH_ENV]; });
+
+describe("signed execution descriptor override", () => {
+  test("新 model id 不查 baked 表:context/capability 全取 descriptor", () => {
+    process.env[AUTH_ENV] = JSON.stringify({
+      canonicalModel: "oc-catalog-canary-glm52",
+      contextWindow: 777_000,
+      capabilityZero: true,
+      supportsThinking: true,
+      supportsVision: false,
+      supportedEfforts: ["high", "max"],
+    });
+    expect(getAuthorityModelCapabilities("oc-catalog-canary-glm52")?.supportsThinking).toBe(true);
+    expect(isCapabilityZeroStaticModel("oc-catalog-canary-glm52")).toBe(true);
+    expect(getStaticModelContextWindow("oc-catalog-canary-glm52")).toBe(777_000);
+  });
+
+  test("畸形非空 descriptor fail-closed", () => {
+    process.env[AUTH_ENV] = "{bad";
+    expect(() => isCapabilityZeroStaticModel("glm-5.2")).toThrow();
+  });
+});
 
 describe("isArkGlmModel", () => {
   test("精确匹配 glm-5.1 + glm-5.2,大小写/空白不敏感", () => {

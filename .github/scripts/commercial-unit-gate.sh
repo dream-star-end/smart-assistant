@@ -10,7 +10,13 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-tap_out="${TAP_OUT:-commercial-unit.tap}"
+# TAP 产物默认落**进程隔离**路径:仓根固定名会被并发跑(多 agent / 多 worktree 共享树)
+# 互相截断 → diff 阶段报假的 "infrastructure failure"(2026-07-12 并行 agent 实测踩中)。
+# **坑**:worktree 里 `.git` 是**文件**不是目录,不能直接写 `.git/xxx`(Not a directory)——
+# 必须用 `git rev-parse --git-dir` 拿真实 git dir(worktree 下会指向 .../worktrees/<name>)。
+# CI 单跑不受影响;要固定路径显式传 TAP_OUT=。
+_gitdir="$(git rev-parse --git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}")"
+tap_out="${TAP_OUT:-$_gitdir/commercial-unit.$$.tap}"
 baseline="${KNOWN_FAILURES:-.github/known-failures/commercial-unit.txt}"
 
 # 防静默 skip:商业测试的 DB 门控是 CI==='true' || REQUIRE_TEST_DB==='1',

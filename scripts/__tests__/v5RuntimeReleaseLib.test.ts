@@ -10,17 +10,19 @@ import { fileURLToPath } from 'node:url'
 // (M7)+ R2-M3 schemaVer v1/v2 混存 + R2-B1 env 三态写(禁用轴写空值)+ R2-B2 首启 pre-state→
 // rollback 退回启用前 + B4 basename label GC + m5 退休台账 + B6 ccb 隔离构建 + B7/R2-M1 emergency
 // 硬验(显式候选 + immutable ID 钉死 + R2-m1 bak 轮转)+ M6 symlink digest + m6 env.bak 轮转 +
-// 激活 saga 成功/失败点回滚 + M7c .prev-release 还原 + R2-M2③ canary boot 成功/失败/跳过)。
-// drill 用 /tmp 假树 + docker/bun stub 全本地跑,断言 149 项全绿。
+// 激活 saga 成功/失败点回滚 + M7c .prev-release 还原 + R2-M2③ canary boot 成功/失败/跳过 +
+// **R3-B4 模型权威兼容地板**(MANIFEST.capabilities 写入/补写 + tuple 守卫③:cutover 后
+// release MANIFEST / 镜像 features label 必须自证 model_authority_v1,不确定即拒))。
+// drill 用 /tmp 假树 + docker/bun stub 全本地跑,断言 160 项全绿。
 const here = path.dirname(fileURLToPath(import.meta.url))
 const drill = path.join(here, 'v5-runtime-release-lib-drill.sh')
 const imageGcDrill = path.join(here, 'build-image-gc-drill.sh')
 
 describe('v5 runtime-release lib (hotcfg core)', () => {
-  test('bundle/digest/selfcheck/GC/saga drill passes (149 assertions)', () => {
+  test('bundle/digest/selfcheck/GC/saga/model-authority-floor drill passes (160 assertions)', () => {
     const r = spawnSync('bash', [drill], { encoding: 'utf8' })
     assert.equal(r.status, 0, r.stdout + r.stderr)
-    assert.match(r.stdout, /PASS=149 FAIL=0/)
+    assert.match(r.stdout, /PASS=160 FAIL=0/)
   })
 
   // build-image.sh image GC(R2-M1):immutable ID 保护 / inspect 失败保守跳过 /

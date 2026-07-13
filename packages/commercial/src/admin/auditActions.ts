@@ -46,6 +46,12 @@ export const ADMIN_AUDIT_ACTIONS = {
   "model_grant.add": { kind: "write", mode: "tx" },
   "model_grant.remove": { kind: "write", mode: "tx" },
   "provider_ops.put": { kind: "write", mode: "tx" },
+  // 模型 catalog 状态机(0143 / 方案 §7 步 5)。catalog 是**执行与计费的安全权威表**
+  // (哪个模型能跑、跑成什么样、按什么价扣),全部 tx fail-closed:审计写不下去 = 业务回滚。
+  "model_catalog.stage": { kind: "write", mode: "tx" },
+  "model_catalog.activate": { kind: "write", mode: "tx" },
+  "model_catalog.disable": { kind: "write", mode: "tx" },
+  "model_catalog.switch": { kind: "write", mode: "tx" },
 
   // ── 系统配置(tx)─────────────────────────────────────────────────
   "system_settings.set": { kind: "write", mode: "tx" },

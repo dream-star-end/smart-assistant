@@ -49,9 +49,12 @@ case "$1" in
       eval "echo \"\${DOCKER_STUB_BUN_${cid}:-}\""
     else echo ""; fi ;;
   image)
-    # image inspect --format '...'(B7 embed_source / R2-M1 {{.Id}};扫全部 args 稳妥)
+    # image inspect --format '...'(B7 embed_source / R2-M1 {{.Id}} / R3-B4 features 标签;扫全部 args 稳妥)
     case "$*" in
       *embed_source*) printf '%s\n' "${DOCKER_STUB_EMBED-1}" ;;
+      *oc.runtime.features*)
+        if [ -n "${DOCKER_STUB_IMAGE_INSPECT_FAIL:-}" ]; then echo "no such image" >&2; exit 1; fi
+        printf '%s\n' "${DOCKER_STUB_FEATURES-v3-sink model_authority_v1}" ;;
       *'{{.Id}}'*)
         if [ -n "${DOCKER_STUB_IMAGE_INSPECT_FAIL:-}" ]; then echo "no such image" >&2; exit 1; fi
         printf '%s\n' "${DOCKER_STUB_IMAGE_ID-sha256:emb}" ;;
@@ -708,6 +711,50 @@ if oc_hotcfg_gc "$WORK/pre.env" "$HPRE" >/dev/null 2>&1; then
 else
   bad "TR4 GC 遇空轴条目不应失败"
 fi
+
+echo "== TR5 模型权威兼容地板(R3-B4:MANIFEST.capabilities + tuple 守卫③)=="
+# 独立 env 文件,避免污染前面的 tuple/emergency 断言。
+MAENV="$WORK/ma.env"; : > "$MAENV"
+MAENV_PREV="$OC_HOTCFG_ENV_FILE"
+export OC_HOTCFG_ENV_FILE="$MAENV"
+
+# (1) build_manifest 落 capabilities 数组;(2) 不传 → 空数组(旧制品形态)
+MADIR="$WORK/ma-rel"; mkdir -p "$MADIR"; echo hello > "$MADIR/f.txt"
+oc_hotcfg_build_manifest "$MADIR" 1 deadbeef "" "" "" "model_authority_v1" >/dev/null
+chk "capabilities 写入 MANIFEST" "[ \"\$(jq -c '.capabilities' '$MADIR/MANIFEST.json')\" = '[\"model_authority_v1\"]' ]"
+MADIR0="$WORK/ma-rel0"; mkdir -p "$MADIR0"; echo hello > "$MADIR0/f.txt"
+oc_hotcfg_build_manifest "$MADIR0" 1 deadbeef >/dev/null
+chk "不传 caps → MANIFEST.capabilities=[]" "[ \"\$(jq -c '.capabilities' '$MADIR0/MANIFEST.json')\" = '[]' ]"
+
+# (3) 复用旧制品时就地补写(幂等自愈:同 digest = 同源码树 ⇒ 同能力)
+oc_hotcfg__patch_manifest_capabilities "$MADIR0" "model_authority_v1" >/dev/null 2>&1
+chk "patch_manifest_capabilities 补写旧 MANIFEST" "[ \"\$(jq -c '.capabilities' '$MADIR0/MANIFEST.json')\" = '[\"model_authority_v1\"]' ]"
+# digest 不受 MANIFEST 改写影响(MANIFEST 不进 file_rows)
+chk "补写后 MANIFEST 全量校验仍通过(digest 未变)" "oc_hotcfg_verify_manifest_full '$MADIR0' >/dev/null 2>&1"
+
+# (4) marker 未置位:缺 capability 的 release 也放行(步骤 5 之前无地板)
+MABAD="$WORK/ma-relbad"; mkdir -p "$MABAD"; echo x > "$MABAD/f.txt"
+oc_hotcfg_build_manifest "$MABAD" 1 deadbeef >/dev/null
+chk "marker 未置位 → 缺 cap 的 release 放行" "oc_hotcfg_assert_tuple_viable img:A sha256:emb '$MABAD' >/dev/null 2>&1"
+
+# 置位 marker(env 键)
+printf 'OC_MODEL_AUTHORITY_CUTOVER=1\n' >> "$MAENV"
+
+# (5) 置位 + release 声明 cap → 放行
+chk "cutover 后:release 声明 cap → 放行" "oc_hotcfg_assert_tuple_viable img:A sha256:emb '$MADIR' >/dev/null 2>&1"
+# (6) 置位 + release 缺 cap → 拒
+chk "cutover 后:release 缺 cap → 拒绝激活" "! oc_hotcfg_assert_tuple_viable img:A sha256:emb '$MABAD' >/dev/null 2>&1"
+# (7) 置位 + release 无 MANIFEST → fail-closed 拒
+MANOMF="$WORK/ma-nomanifest"; mkdir -p "$MANOMF"
+chk "cutover 后:release 无 MANIFEST → fail-closed 拒" "! oc_hotcfg_assert_tuple_viable img:A sha256:emb '$MANOMF' >/dev/null 2>&1"
+# (8) 置位 + release 空(内嵌镜像):features label 含 cap → 放行
+chk "cutover 后:内嵌镜像 features 含 cap → 放行" "oc_hotcfg_assert_tuple_viable img:A sha256:emb '' >/dev/null 2>&1"
+# (9) 置位 + release 空 + features 不含 cap(旧镜像)→ 拒
+chk "cutover 后:旧镜像(features 无 cap)→ 拒绝激活" "! DOCKER_STUB_FEATURES='v3-sink' oc_hotcfg_assert_tuple_viable img:A sha256:emb '' >/dev/null 2>&1"
+# (10) 置位 + release 空 + inspect 失败 → fail-closed 拒
+chk "cutover 后:features inspect 失败 → fail-closed 拒" "! DOCKER_STUB_IMAGE_INSPECT_FAIL=1 oc_hotcfg_assert_tuple_viable '' sha256:emb '' >/dev/null 2>&1"
+
+export OC_HOTCFG_ENV_FILE="$MAENV_PREV"
 
 echo ""
 echo "════════ 结果:PASS=$PASS FAIL=$FAIL ════════"

@@ -39,6 +39,17 @@
 #   --emergency-tuple [--image=REF --image-id=ID --bundle=DIR]
 #       # 登记逃生 tuple。缺省取当前 env 四键;显式候选(R2-M1)供瘦身稳态直接登记内嵌镜像逃生点,
 #       # 不必先把现网翻到空 release。硬验含 immutable ID 钉死(inspect .Id == image_id)。
+#
+# 模型权威(docs/V5_MODEL_AUTHORITY_PLAN.md §7 六步上线;四面 = DB/master/egress/容器 runtime):
+#   --model-authority-preflight   # 只读:四面活体 capability 逐面结论(不抢部署锁)
+#   --enable-model-authority      # 步骤 4:四面全绿 → OC_MODEL_AUTHORITY=1 → 重启 master+egress → smoke
+#   --disable-model-authority     # 步骤 4 回滚:关 flag(**cutover 后拒绝执行**)
+#   --model-authority-observation-status # 只读:观察窗/请求/长 turn/canary/seed/emergency 证据
+#   --enable-seed-authority-by-rev # 全 fleet(含 stopped)bundle census 后开启 seed 阶段 B
+#   --record-model-authority-emergency-drill # emergency 激活+恢复后核验 history 并登记证据
+#   --model-authority-cutover     # 步骤 5:置位不可逆兼容地板 marker(DB 单行 + env 键)
+#                                 # 置位后:deploy/rollback 拒绝激活缺 capability 的 release/tuple;
+#                                 #        master/egress 在 flag 关闭态拒启;admin catalog 状态机开放。
 set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
@@ -52,6 +63,9 @@ V5_UNIT="openclaude-v5.service"
 # overrides 无条件 OC_EGRESS_SPLIT=1,unit 缺失 → master 以 split 模式起但 18892
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
 V5_EGRESS_UNIT="openclaude-v5-egress.service"
+# 全局 egress 独立 release 指针。它不能跟随 A/B candidate 自动切换；只有显式
+# --egress 才原子翻转到本次 release，避免 P3 stable=B 时仍从 slot A 跑旧代码。
+V5_EGRESS_SRC="/opt/openclaude/openclaude-v5-egress"
 V5_PORT="18790"
 # Caddy 对外 HTTP 监听端口。生产固定默认 80；仅隔离预发在宿主 80 被占用时覆盖。
 # 在线 deploy 的 planned-maintenance public probe 与 P3 Caddy apply/verify 必须共用此值。
@@ -180,6 +194,14 @@ for arg in "$@"; do
     --activate-staged) MODE="activate-staged" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
+    # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
+    --model-authority-preflight) MODE="model-authority-preflight" ;;
+    --enable-model-authority) MODE="enable-model-authority" ;;
+    --disable-model-authority) MODE="disable-model-authority" ;;
+    --model-authority-observation-status) MODE="model-authority-observation-status" ;;
+    --enable-seed-authority-by-rev) MODE="enable-seed-authority-by-rev" ;;
+    --record-model-authority-emergency-drill) MODE="record-model-authority-emergency-drill" ;;
+    --model-authority-cutover) MODE="model-authority-cutover" ;;
     # ── P3 双 master cohort lane(全部经 deploy_state CAS + journal;§D5 逐步)──
     --canary) MODE="canary" ;;
     --canary=*) MODE="canary"; CANARY_RELEASE="${arg#*=}" ;;
@@ -1106,6 +1128,711 @@ assert_release_capability_for_sessions_pg() {
   echo "  ✓ capability 门:目标 release 声明 sessions-store-pg-v1(已割接前置满足)。"
 }
 
+# ═════════════════ 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)═════════════
+#
+# 四面 = {DB schema, master, egress, 容器 runtime}。判定单点化后 master 签发签名 execution
+# descriptor、容器验签消费、egress 每请求 epoch fence —— 任一面回到 legacy/baked 判定 =
+# 判定源分叉(签发的人与执行的人不同源),轻则模型不可用,重则按已撤销的价格/能力执行。
+#
+# 两个不同强度的门:
+#   ① **preflight**(开 flag / 走 cutover 前):四面**活体**全绿才允许 —— 活体证据来自
+#      /healthz.runtime.capabilities(master)、egress-health.capabilities(egress)、
+#      schema_migrations(DB)、env tuple 指向的 release MANIFEST / 镜像 label(容器)。
+#   ② **地板**(cutover marker 置位后,不可逆):**每一次**激活/回滚都要求目标制品声明
+#      capability —— master release 看 deploy/v5/release-metadata.json;容器 tuple 由
+#      v5-runtime-release-lib.sh 的 assert_tuple_viable ③ 覆盖(release MANIFEST / 镜像 label)。
+#      egress 与 master 同源同树(同一 release symlink),故 master release 的声明同时覆盖
+#      egress 制品面;egress **进程**是否真的带上了新代码,由 smoke 的活体断言兜底。
+#
+# marker 双源(env 键 + DB 单行):env 让 DB 不可达时也能判定地板已生效,DB 让主机重建/DR 后
+# marker 不丢(它和它保护的 model_catalog 同库同命运)。任一为真即地板生效(OR)。
+MODEL_AUTHORITY_CAP="model_authority_v1"
+MODEL_AUTHORITY_EGRESS_CAP="model_authority_v1-egress"
+MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
+MODEL_AUTHORITY_FLAG_KEY="OC_MODEL_AUTHORITY"
+MODEL_AUTHORITY_CATALOG_MIGRATION="0143_model_catalog"
+MODEL_AUTHORITY_GUARDS_MIGRATION="0144_model_authority_guards"
+MODEL_AUTHORITY_SETTING_KEY="cutover"
+MODEL_AUTHORITY_OBSERVATION_KEY="observation"
+MODEL_AUTHORITY_CANARY_MODEL="oc-catalog-canary-glm52"
+MODEL_AUTHORITY_CANARY_ALIAS="oc-catalog-canary"
+MODEL_AUTHORITY_MIN_OBSERVE_SECONDS=900
+MODEL_AUTHORITY_MIN_REQUESTS=10
+
+# 远端 env 取键值(末行为准,与 hotcfg env_get 同法)。缺失 → 空。
+remote_env_get() {
+  ssh "$KL_HOST" "grep -E '^[[:space:]]*$1=' '$V5_ENV' 2>/dev/null | tail -n1 | cut -d= -f2-" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# 远端 env 原子写单键(备份 + tmp + mv;值只允许 [0-9A-Za-z_.-])。
+remote_env_set() {
+  local key="$1" val="$2"
+  [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { echo "✗ remote_env_set: 非法键 '$key'" >&2; return 1; }
+  [[ "$val" =~ ^[0-9A-Za-z_.-]*$ ]] || { echo "✗ remote_env_set: 非法值 '$val'" >&2; return 1; }
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    ts=\$(date -u +%Y%m%d%H%M%S)
+    cp -a '$V5_ENV' '$V5_ENV.bak-\$ts'
+    tmp='$V5_ENV.keyset.\$\$'
+    cp -a '$V5_ENV' \"\$tmp\"
+    if grep -Eq '^[[:space:]]*$key=' \"\$tmp\"; then
+      sed -i 's|^[[:space:]]*$key=.*|$key=$val|' \"\$tmp\"
+    else
+      printf '%s=%s\n' '$key' '$val' >> \"\$tmp\"
+    fi
+    chmod --reference='$V5_ENV' \"\$tmp\" 2>/dev/null || true
+    mv -f \"\$tmp\" '$V5_ENV'" || { echo "✗ 写 env 键 $key 失败" >&2; return 1; }
+  echo "  ✓ env $key=$val(已备份 $V5_ENV.bak-<ts>)"
+}
+
+# 模型权威 DB 三角色。任何 URL 缺失都 fail-closed，绝不回退 DATABASE_URL/owner。
+remote_model_authority_psql_as() {
+  local url_var="$1" sql="$2"
+  ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
+    name='$url_var'; url=\"\${!name:-}\"; test -n \"\$url\"
+    psql \"\$url\" -X -v ON_ERROR_STOP=1 -tAc \"$sql\"" 2>/dev/null | tr -d '[:space:]'
+}
+
+remote_model_authority_psql() {
+  remote_model_authority_psql_as MODEL_AUTHORITY_DEPLOY_DATABASE_URL "$1"
+}
+
+remote_model_authority_psql_app() {
+  remote_model_authority_psql_as DATABASE_URL "$1"
+}
+
+remote_model_authority_psql_admin() {
+  remote_model_authority_psql_as MODEL_CATALOG_ADMIN_DATABASE_URL "$1"
+}
+
+remote_model_authority_psql_script() {
+  ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
+    test -n \"\${MODEL_AUTHORITY_DEPLOY_DATABASE_URL:-}\"
+    psql \"\$MODEL_AUTHORITY_DEPLOY_DATABASE_URL\" -X -v ON_ERROR_STOP=1 -q"
+}
+
+model_authority_release_sha() {
+  local sha
+  [[ "$ACTIVE_STATE_LOADED" == 1 ]] || assert_no_rollout_in_progress || return 1
+  sha="$(ssh "$KL_HOST" "jq -er '.commit' '$ACTIVE_SRC/VERSION.json'" 2>/dev/null || true)"
+  [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || {
+    echo "✗ 无法从 live VERSION.json 取得 release sha(实收 '${sha:-<empty>}')" >&2
+    return 1
+  }
+  printf '%s' "$sha"
+}
+
+model_authority_runtime_tuple() {
+  jq -cn \
+    --arg image "$(remote_env_get OC_RUNTIME_IMAGE)" \
+    --arg image_id "$(remote_env_get OC_RUNTIME_IMAGE_ID)" \
+    --arg release "$(remote_env_get OC_RUNTIME_RELEASE)" \
+    --arg bundle "$(remote_env_get OC_PLATFORM_BUNDLE)" \
+    '{image:$image,image_id:$image_id,release:$release,bundle:$bundle}'
+}
+
+model_authority_b64() { printf '%s' "$1" | base64 -w0; }
+
+# release 制品声明的 capabilities(空格分隔)。文件缺失/无法解析 → 非 0(fail-closed)。
+release_declared_caps() {
+  local reldir="$1"
+  ssh "$KL_HOST" "jq -er '(.capabilities // []) | join(\" \")' '$reldir/deploy/v5/release-metadata.json'" 2>/dev/null
+}
+
+caps_contain() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+
+# DB 面就绪不只看 schema_migrations 记账行。0144 里的 grants epoch /
+# epoch 单调守卫 / 受控过程才是安全边界；记账误写但对象缺失时必须拒绝开启。
+model_authority_db_ready() {
+  local schema app admin deploy app_user admin_user deploy_user app_ok admin_ok deploy_ok
+  schema="$(remote_model_authority_psql "SELECT (
+    EXISTS (SELECT 1 FROM schema_migrations WHERE version='$MODEL_AUTHORITY_CATALOG_MIGRATION')
+    AND EXISTS (SELECT 1 FROM schema_migrations WHERE version='$MODEL_AUTHORITY_GUARDS_MIGRATION')
+    AND EXISTS (
+      SELECT 1 FROM pg_trigger
+       WHERE tgname='trg_model_grants_security_after' AND NOT tgisinternal
+    )
+    AND EXISTS (
+      SELECT 1 FROM pg_trigger
+       WHERE tgname='trg_users_model_role_security_after' AND NOT tgisinternal
+    )
+    AND EXISTS (
+      SELECT 1 FROM pg_trigger
+       WHERE tgname='trg_model_security_epoch_guard' AND NOT tgisinternal
+    )
+    AND to_regprocedure('fn_model_activate_entry(bigint,integer,bigint)') IS NOT NULL
+    AND to_regprocedure('fn_model_stage_version(text,text,text,text,integer,jsonb,integer,bigint)') IS NOT NULL
+    AND to_regprocedure('fn_model_authority_grant_admin_role(text)') IS NOT NULL
+    AND to_regprocedure('fn_model_authority_grant_deploy_role(text)') IS NOT NULL
+    AND to_regprocedure('fn_model_switch_version(text,text,text,text,integer,jsonb,integer,bigint,integer)') IS NOT NULL
+    AND to_regclass('model_authority_deploy_state') IS NOT NULL
+    AND to_regclass('model_runtime_requirements') IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM pg_trigger
+       WHERE tgname='trg_model_runtime_requirements_catalog' AND NOT tgisinternal
+    )
+    AND EXISTS (
+      SELECT 1 FROM pg_trigger
+       WHERE tgname='trg_model_runtime_requirements_pricing' AND NOT tgisinternal
+    )
+  )::text")" || { printf false; return 1; }
+  [[ "$schema" == "true" ]] || { printf false; return 0; }
+
+  app="$(remote_model_authority_psql_app "SELECT current_user || '|' || (
+    has_table_privilege(current_user,'model_catalog','SELECT')
+    AND NOT has_table_privilege(current_user,'model_catalog','INSERT,UPDATE,DELETE')
+    AND NOT has_function_privilege(current_user,'fn_model_switch_version(text,text,text,text,integer,jsonb,integer,bigint,integer)','EXECUTE')
+    AND NOT has_table_privilege(current_user,'model_authority_deploy_state','SELECT,INSERT,UPDATE')
+  )::text")" || { printf false; return 1; }
+  admin="$(remote_model_authority_psql_admin "SELECT current_user || '|' || (
+    has_table_privilege(current_user,'model_catalog','SELECT')
+    AND NOT has_table_privilege(current_user,'model_catalog','INSERT,UPDATE,DELETE')
+    AND has_function_privilege(current_user,'fn_model_switch_version(text,text,text,text,integer,jsonb,integer,bigint,integer)','EXECUTE')
+    AND has_table_privilege(current_user,'model_authority_deploy_state','SELECT')
+    AND NOT has_table_privilege(current_user,'model_authority_deploy_state','INSERT,UPDATE')
+    AND has_table_privilege(current_user,'admin_audit','INSERT')
+  )::text")" || { printf false; return 1; }
+  deploy="$(remote_model_authority_psql "SELECT current_user || '|' || (
+    has_table_privilege(current_user,'model_catalog','SELECT')
+    AND NOT has_table_privilege(current_user,'model_catalog','INSERT,UPDATE,DELETE')
+    AND has_function_privilege(current_user,'fn_model_switch_version(text,text,text,text,integer,jsonb,integer,bigint,integer)','EXECUTE')
+    AND has_table_privilege(current_user,'model_authority_deploy_state','SELECT')
+    AND has_table_privilege(current_user,'model_authority_deploy_state','INSERT')
+    AND has_table_privilege(current_user,'model_authority_deploy_state','UPDATE')
+    AND has_table_privilege(current_user,'model_security_epoch','UPDATE')
+    AND has_table_privilege(current_user,'model_visibility_grants','SELECT')
+    AND has_table_privilege(current_user,'model_visibility_grants','INSERT')
+    AND has_table_privilege(current_user,'model_visibility_grants','UPDATE')
+    AND has_table_privilege(current_user,'model_visibility_grants','DELETE')
+    AND has_table_privilege(current_user,'model_pricing','SELECT')
+    AND has_table_privilege(current_user,'model_pricing','INSERT')
+    AND has_table_privilege(current_user,'model_pricing','UPDATE')
+    AND has_table_privilege(current_user,'model_pricing','DELETE')
+  )::text")" || { printf false; return 1; }
+  IFS='|' read -r app_user app_ok <<<"$app"
+  IFS='|' read -r admin_user admin_ok <<<"$admin"
+  IFS='|' read -r deploy_user deploy_ok <<<"$deploy"
+  if [[ "$app_ok" == true && "$admin_ok" == true && "$deploy_ok" == true \
+        && -n "$app_user" && -n "$admin_user" && -n "$deploy_user" \
+        && "$app_user" != "$admin_user" && "$app_user" != "$deploy_user" \
+        && "$admin_user" != "$deploy_user" ]]; then
+    printf true
+  else
+    printf false
+  fi
+}
+
+# cutover marker 是否置位(env OR DB)。**fail-closed**:env≠1 且 DB 探测失败 → 视为置位并拒
+# (不确定即拒;与 sessions-pg capability 门同口径)。返回 0=已置位 / 1=未置位。
+model_authority_cutover_done() {
+  local env_marker db_marker
+  env_marker="$(remote_env_get "$MODEL_AUTHORITY_CUTOVER_KEY")"
+  [[ "$env_marker" == "1" ]] && return 0
+  if ! db_marker="$(remote_model_authority_psql "SELECT EXISTS (SELECT 1 FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_SETTING_KEY')::text")"; then
+    echo "✗ 无法探测 cutover marker(psql 失败;env $MODEL_AUTHORITY_CUTOVER_KEY≠1)" >&2
+    echo "  fail-closed:无法证明步骤 5 尚未执行 → 按已置位处理(拒绝激活缺 capability 的版本)。" >&2
+    echo "  请先恢复 DB 连通性,或直接在 $V5_ENV 写 $MODEL_AUTHORITY_CUTOVER_KEY=0/1 明示状态。" >&2
+    return 0
+  fi
+  [[ "$db_marker" == "true" ]]
+}
+
+# 地板:cutover 后任何 master release 激活/回滚都必须声明 master + egress 两个 capability,
+# 且 catalog + guards 两条迁移与关键 DB 对象已就绪。容器面在 lib 的
+# assert_tuple_viable ③(release MANIFEST / 镜像 label)。
+assert_model_authority_floor() {
+  local reldir="$1" caps db_ready
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过模型权威兼容地板"; return 0; }
+  if ! model_authority_cutover_done; then
+    echo "  · 模型权威地板:cutover marker 未置位(步骤 5 之前)→ 不设限。"
+    return 0
+  fi
+  echo "  · 模型权威地板生效(步骤 5 已 cutover):校验目标 release 与 DB schema。"
+  # ① DB schema 面
+  db_ready="$(model_authority_db_ready)" \
+    || { echo "✗ 激活中止:无法核验模型权威 DB 边界(DB 不可达)—— 不确定即拒。" >&2; exit 1; }
+  [[ "$db_ready" == "true" ]] || {
+    echo "✗ 激活中止:cutover 已置位但 DB 未就绪(需 $MODEL_AUTHORITY_CATALOG_MIGRATION + $MODEL_AUTHORITY_GUARDS_MIGRATION 及关键 trigger/procedure)。" >&2
+    exit 1
+  }
+  # ②③ master / egress 制品面(同一 release 树,一个文件两个 token)
+  caps="$(release_declared_caps "$reldir")" || {
+    echo "✗ 激活中止:目标 release 无法读取 deploy/v5/release-metadata.json:$reldir" >&2
+    echo "  cutover 后必须能自证 capability;不确定即拒。" >&2
+    exit 1
+  }
+  caps_contain "$caps" "$MODEL_AUTHORITY_CAP" || {
+    echo "✗ 激活中止:目标 release 未声明 '$MODEL_AUTHORITY_CAP'(caps=[$caps]):$reldir" >&2
+    echo "  步骤 5 后 catalog 里已有 baked 判定不认识的行,回退到 legacy master = 判定源分叉。" >&2
+    echo "  回滚只能翻到同样声明该 capability 的前序 release。" >&2
+    exit 1
+  }
+  caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" || {
+    echo "✗ 激活中止:目标 release 未声明 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[$caps]):$reldir" >&2
+    echo "  egress 与 master 同树同源:该 release 的 egress 进程没有每请求 epoch fence," >&2
+    echo "  下线/收窄一个模型后出站面仍会放行(安全变更有 stale window)。" >&2
+    exit 1
+  }
+  echo "  ✓ 模型权威地板:release 声明 [$caps],catalog+guards DB 边界已就绪。"
+}
+
+# ── 活体四面探测(preflight:开 flag / cutover 前)──────────────────────────────
+# 打印每一面的结论;全绿 → 0,任一红 → 1。**只读**,不改现场。
+model_authority_preflight() {
+  local ok=1 hz caps rt_release rt_image_id eg
+  echo "── 模型权威四面 preflight(活体)──"
+  # P3 后 serving master 不再恒为 A；同时模型权威开关/cutover 不能与 cohort rollout
+  # 交错，否则两个 slot 会读同一 env 却只重启其中一个，形成 split authority。
+  assert_no_rollout_in_progress || return 1
+  echo "  · 稳定 active lane:slot=$ACTIVE_SLOT unit=$ACTIVE_UNIT port=$ACTIVE_PORT"
+  # ① DB schema
+  local db_ready
+  if db_ready="$(model_authority_db_ready)" && [[ "$db_ready" == "true" ]]; then
+    echo "  ✓ ① DB:$MODEL_AUTHORITY_CATALOG_MIGRATION + $MODEL_AUTHORITY_GUARDS_MIGRATION 及关键 trigger/procedure 已就绪"
+  else
+    echo "  ✗ ① DB:$MODEL_AUTHORITY_CATALOG_MIGRATION + $MODEL_AUTHORITY_GUARDS_MIGRATION 或关键 trigger/procedure 未就绪(psql 结果='${db_ready:-<err>}')" >&2; ok=0
+  fi
+  # ② master 活体 capability(/healthz.runtime.capabilities —— commercial 广播,gateway 透传)
+  hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${ACTIVE_PORT}/healthz" 2>/dev/null || true)"
+  caps="$(printf '%s' "$hz" | jq -r '(.runtime.capabilities // []) | join(" ")' 2>/dev/null || true)"
+  if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+    echo "  ✓ ② master:/healthz runtime.capabilities=[$caps]"
+  else
+    echo "  ✗ ② master:/healthz 未广播 '$MODEL_AUTHORITY_CAP'(caps=[${caps:-<none>}])—— 现网 master 版本不认模型权威协议" >&2; ok=0
+  fi
+  # ③ egress 活体 capability(独立进程:deploy 默认不重启它 → 必须单独证明)
+  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+  caps="$(printf '%s' "$eg" | jq -r '(.capabilities // []) | join(" ")' 2>/dev/null || true)"
+  if caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP"; then
+    echo "  ✓ ③ egress:capabilities=[$caps]"
+  else
+    echo "  ✗ ③ egress:未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${caps:-<none>}])—— 旧 egress 进程无 epoch fence" >&2
+    echo "      修法:scripts/deploy-v5.sh --egress(把 egress 重启到当前 release)" >&2; ok=0
+  fi
+  # ④ 容器 runtime:env tuple 指向的 release MANIFEST(release 轴启用)或镜像 features label
+  rt_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+  rt_image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  if [[ -n "$rt_release" ]]; then
+    caps="$(ssh "$KL_HOST" "jq -r '(.capabilities // []) | join(\" \")' '$rt_release/MANIFEST.json'" 2>/dev/null || true)"
+    if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+      echo "  ✓ ④ runtime release:$rt_release capabilities=[$caps]"
+    else
+      echo "  ✗ ④ runtime release:$rt_release 未声明 '$MODEL_AUTHORITY_CAP'(caps=[${caps:-<none>}])" >&2
+      echo "      修法:scripts/deploy-v5.sh(带 runtime release 轴)重建 release 并激活" >&2; ok=0
+    fi
+  else
+    [[ -n "$rt_image_id" ]] || rt_image_id="$(remote_env_get OC_RUNTIME_IMAGE)"
+    caps="$(ssh "$KL_HOST" "docker image inspect --format '{{index .Config.Labels \"oc.runtime.features\"}}' '$rt_image_id'" 2>/dev/null || true)"
+    if caps_contain "$caps" "$MODEL_AUTHORITY_CAP"; then
+      echo "  ✓ ④ runtime 镜像(内嵌源码):$rt_image_id features=[$caps]"
+    else
+      echo "  ✗ ④ runtime 镜像:$rt_image_id 的 oc.runtime.features=[${caps:-<none>}] 不含 '$MODEL_AUTHORITY_CAP'" >&2
+      echo "      修法:用带该能力的 commit 重建镜像(build-image.sh 写 label)后写入 env" >&2; ok=0
+    fi
+  fi
+  [[ "$ok" == 1 ]]
+}
+
+# bootstrap 专用:DB marker(跨主机权威)存在 → 把 flag + marker 回写到**新派生**的 env。
+# 不确定即拒(DB 探不到 → 拒绝 bootstrap:宁可不起,也不让一个判定源不明的 master 上线)。
+restore_model_authority_env_after_bootstrap() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 查 DB cutover marker → 必要时回写 env(flag + marker)"; return 0; }
+  local db_marker
+  db_marker="$(remote_model_authority_psql "SELECT EXISTS (SELECT 1 FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_SETTING_KEY')::text")" \
+    || { echo "✗ bootstrap 中止:无法探测 cutover marker(DB 不可达)—— 不确定即拒。" >&2; exit 1; }
+  if [[ "$db_marker" != "true" ]]; then
+    echo "  · DB 无 cutover marker(步骤 5 之前)→ env 不动。"
+    return 0
+  fi
+  echo "  · DB cutover marker 已置位 → 回写 env(否则重建实例会以 baked 判定静默起来)。"
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1 || exit 1
+  remote_env_set "$MODEL_AUTHORITY_CUTOVER_KEY" 1 || exit 1
+}
+
+install_model_authority_canary() {
+  echo "── 安装受限 catalog canary($MODEL_AUTHORITY_CANARY_MODEL)──"
+  remote_model_authority_psql_script <<'SQL'
+DO $do$
+DECLARE
+  v_entry BIGINT;
+  v_uid BIGINT;
+  v_bad BOOLEAN;
+BEGIN
+  SELECT id INTO v_uid FROM users
+   WHERE role = 'admin' AND status = 'active' ORDER BY id LIMIT 1;
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'model authority canary requires one active admin user';
+  END IF;
+
+  SELECT entry_id,
+         NOT (engine='ccb' AND provider_id='ark' AND upstream_model_id='glm-5.2'
+              AND context_window=1000000 AND capability_schema_version=1)
+    INTO v_entry, v_bad
+    FROM model_catalog
+   WHERE model_id='oc-catalog-canary-glm52' AND state='active'
+   ORDER BY entry_id DESC LIMIT 1;
+  IF v_entry IS NOT NULL AND v_bad THEN
+    RAISE EXCEPTION 'existing model authority canary has unexpected execution descriptor';
+  END IF;
+
+  IF v_entry IS NULL THEN
+    v_entry := fn_model_stage_version(
+      'oc-catalog-canary-glm52', 'ccb', 'ark', 'glm-5.2', 1000000,
+      '{"supports_vision":false,"reasoning":{"supported":["high","max"],"codex_model_default":null},"ccb":{"capability_zero":true,"supports_thinking":true}}'::jsonb,
+      1, NULL
+    );
+    INSERT INTO model_pricing(
+      model_id, display_name, input_per_mtok, output_per_mtok,
+      cache_read_per_mtok, cache_write_per_mtok, multiplier,
+      enabled, sort_order, visibility, default_effort
+    )
+    SELECT 'oc-catalog-canary-glm52', 'Catalog Canary (restricted)', input_per_mtok,
+           output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, multiplier,
+           FALSE, 9999, 'hidden', default_effort
+      FROM model_pricing WHERE model_id='glm-5.2'
+    ON CONFLICT (model_id) DO UPDATE SET
+      display_name=EXCLUDED.display_name,
+      input_per_mtok=EXCLUDED.input_per_mtok,
+      output_per_mtok=EXCLUDED.output_per_mtok,
+      cache_read_per_mtok=EXCLUDED.cache_read_per_mtok,
+      cache_write_per_mtok=EXCLUDED.cache_write_per_mtok,
+      multiplier=EXCLUDED.multiplier,
+      enabled=FALSE,
+      sort_order=EXCLUDED.sort_order,
+      visibility=EXCLUDED.visibility,
+      default_effort=EXCLUDED.default_effort;
+    PERFORM fn_model_activate_entry(v_entry, NULL, NULL);
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM model_pricing WHERE model_id='oc-catalog-canary-glm52' AND enabled) THEN
+    RAISE EXCEPTION 'model authority canary is not priced/enabled';
+  END IF;
+  PERFORM fn_model_alias_set('oc-catalog-canary', 'oc-catalog-canary-glm52', NULL);
+  INSERT INTO model_visibility_grants(user_id, model_id)
+  VALUES (v_uid, 'oc-catalog-canary-glm52') ON CONFLICT DO NOTHING;
+END $do$;
+SQL
+  echo "  ✓ canary active + hidden + alias + 单 admin grant"
+}
+
+start_model_authority_observation() {
+  local release tuple epoch rel64 tuple64 out
+  release="$(model_authority_release_sha)" || return 1
+  tuple="$(model_authority_runtime_tuple)" || return 1
+  epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")" || return 1
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { echo "✗ 无法读取 observation epoch" >&2; return 1; }
+  rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$tuple")"
+  out="$(remote_model_authority_psql "WITH f AS (
+    SELECT convert_from(decode('$rel64','base64'),'UTF8') AS release_sha,
+           convert_from(decode('$tuple64','base64'),'UTF8')::jsonb AS runtime_tuple,
+           '$epoch'::text AS security_epoch,
+           (SELECT user_id::text FROM model_visibility_grants WHERE model_id='$MODEL_AUTHORITY_CANARY_MODEL' ORDER BY user_id LIMIT 1) AS canary_uid,
+           (SELECT count(*)::text FROM usage_records WHERE authority_kind='bridge_signed') AS request_baseline
+  )
+  INSERT INTO model_authority_deploy_state(key,value,description)
+  SELECT '$MODEL_AUTHORITY_OBSERVATION_KEY', jsonb_build_object(
+    'release_sha',release_sha,'runtime_tuple',runtime_tuple,'security_epoch',security_epoch,
+    'canary_model','$MODEL_AUTHORITY_CANARY_MODEL','canary_alias','$MODEL_AUTHORITY_CANARY_ALIAS',
+    'canary_uid',canary_uid,'started_at',NOW()::text,'request_baseline',request_baseline,
+    'seed_census',NULL,'emergency_drill',NULL
+  ), 'model authority reversible observation evidence; cutover locks this row + security epoch'
+  FROM f WHERE canary_uid IS NOT NULL
+  ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,description=EXCLUDED.description,updated_at=NOW()
+  RETURNING 'ok'")" || return 1
+  [[ "$out" == "ok" ]] || { echo "✗ observation 未写入(canary grant 缺失?)" >&2; return 1; }
+  echo "  ✓ observation 已开始(release=$release epoch=$epoch;最短 ${MODEL_AUTHORITY_MIN_OBSERVE_SECONDS}s / ${MODEL_AUTHORITY_MIN_REQUESTS} requests)"
+}
+
+model_authority_fleet_census() {
+  ssh "$KL_HOST" 'ids=$(docker ps -aq --filter label=com.openclaude.runtime_channel=v5); if [ -z "$ids" ]; then printf "[]\n"; else docker inspect $ids | jq -c '\''[.[] | {id:.Id,name:(.Name|ltrimstr("/")),status:.State.Status,bundle_rev:(.Config.Labels["com.openclaude.runtime.bundle_rev"] // "")} ] | sort_by(.id)'\''; fi'
+}
+
+enable_seed_authority_by_rev() {
+  echo "══ seed authority 阶段 B:全 fleet bundle-rev census(含 stopped)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 枚举 docker ps -aq runtime_channel=v5 → 全部 bundle_rev=current → 校验 seed → env OC_SEED_AUTHORITY_BY_REV=1 → restart master → observation 留证"
+    return 0
+  fi
+  assert_no_rollout_in_progress || exit 1
+  local bundle rev census count bad release tuple epoch rel64 tuple64 census64 out
+  bundle="$(remote_env_get OC_PLATFORM_BUNDLE)"; rev="${bundle##*/}"
+  [[ "$bundle" == "$OC_HOTCFG_PLATFORM_ROOT/bundles/$rev" && "$rev" =~ ^[0-9a-f]{12}$ ]] || {
+    echo "✗ current OC_PLATFORM_BUNDLE 不是 canonical bundles/<12hex>:$bundle" >&2; exit 1;
+  }
+  ssh "$KL_HOST" "test -f '$bundle/MANIFEST.json'" || { echo "✗ current bundle 缺 MANIFEST:$bundle" >&2; exit 1; }
+  census="$(model_authority_fleet_census)" || { echo "✗ fleet census 失败" >&2; exit 1; }
+  count="$(jq -r 'length' <<<"$census")"
+  [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || { echo "✗ fleet census 为空,不能把零容器当作已验证覆盖" >&2; exit 1; }
+  bad="$(jq -r --arg rev "$rev" '[.[] | select(.bundle_rev != $rev)] | map(.name+":"+.status+":"+(.bundle_rev|if .=="" then "<missing>" else . end)) | join(",")' <<<"$census")"
+  [[ -z "$bad" ]] || { echo "✗ fleet 含旧/缺 bundle_rev 容器(含 stopped):$bad" >&2; echo "  先 recycle/remove 后重试;禁止部分 fleet 开 seed 阶段 B。" >&2; exit 1; }
+  ssh "$KL_HOST" "cd '$ACTIVE_SRC' && npx --no-install tsx packages/commercial/agent-sandbox/platform-runtime/entrypoint/validatePlatformSeedCli.ts '$bundle'" \
+    || { echo "✗ current bundle seed 声明校验失败" >&2; exit 1; }
+
+  remote_env_set OC_SEED_AUTHORITY_BY_REV 1 || exit 1
+  if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
+    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
+    echo "✗ master 重启失败,seed flag 已回滚" >&2; exit 1
+  fi
+  sleep 4
+  if ! smoke "$ACTIVE_PORT"; then
+    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
+    echo "✗ seed 阶段 B smoke 失败,flag 已回滚" >&2; exit 1
+  fi
+
+  release="$(model_authority_release_sha)"; tuple="$(model_authority_runtime_tuple)"
+  epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")"
+  rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$tuple")"; census64="$(model_authority_b64 "$census")"
+  out="$(remote_model_authority_psql "UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{seed_census}',jsonb_build_object(
+    'recorded_at',NOW()::text,'bundle_rev','$rev','container_count','$count',
+    'fleet',convert_from(decode('$census64','base64'),'UTF8')::jsonb
+  )),updated_at=NOW()
+  WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY'
+    AND value->>'release_sha'=convert_from(decode('$rel64','base64'),'UTF8')
+    AND value->'runtime_tuple'=convert_from(decode('$tuple64','base64'),'UTF8')::jsonb
+    AND value->>'security_epoch'='$epoch'
+  RETURNING 'ok'")" || true
+  if [[ "$out" != "ok" ]]; then
+    remote_env_set OC_SEED_AUTHORITY_BY_REV 0 || true
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
+    echo "✗ observation 绑定漂移,seed flag 已回滚;重新开启 observation" >&2; exit 1
+  fi
+  echo "✓ seed authority by rev 已开启并留证(bundle=$rev fleet=$count,含 stopped)。"
+}
+
+record_model_authority_emergency_drill() {
+  echo "══ 登记 emergency 激活→恢复实跑证据══"
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] history last=third=current,second=emergency → observation 留证"; return 0; }
+  assert_no_rollout_in_progress || exit 1
+  local last emergency before registered current norm_last norm_emergency norm_before norm_registered release epoch rel64 tuple64 image64 out
+  last="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 1)"
+  emergency="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 2)"
+  before="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" 3)"
+  registered="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_EMERGENCY_TUPLE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
+  current="$(model_authority_runtime_tuple)"
+  norm_last="$(jq -c '{image,image_id,release,bundle}' <<<"$last")"
+  norm_emergency="$(jq -c '{image,image_id,release,bundle}' <<<"$emergency")"
+  norm_before="$(jq -c '{image,image_id,release,bundle}' <<<"$before")"
+  norm_registered="$(jq -c '{image,image_id,release:"",bundle}' <<<"$registered")"
+  [[ "$norm_last" == "$norm_before" && "$norm_last" == "$current" ]] || {
+    echo "✗ history 不证明已恢复原 tuple(last != third/current)" >&2; exit 1;
+  }
+  [[ "$norm_emergency" == "$norm_registered" ]] || {
+    echo "✗ history 倒数第 2 条不是当前登记的 emergency tuple" >&2; exit 1;
+  }
+  release="$(model_authority_release_sha)"; epoch="$(remote_model_authority_psql "SELECT epoch::text FROM model_security_epoch WHERE id")"
+  rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$current")"; image64="$(model_authority_b64 "$norm_emergency")"
+  out="$(remote_model_authority_psql "UPDATE model_authority_deploy_state SET value=jsonb_set(value,'{emergency_drill}',jsonb_build_object(
+    'recorded_at',NOW()::text,'activated_and_restored',true,
+    'emergency_tuple',convert_from(decode('$image64','base64'),'UTF8')::jsonb
+  )),updated_at=NOW()
+  WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY'
+    AND value->>'release_sha'=convert_from(decode('$rel64','base64'),'UTF8')
+    AND value->'runtime_tuple'=convert_from(decode('$tuple64','base64'),'UTF8')::jsonb
+    AND value->>'security_epoch'='$epoch'
+  RETURNING 'ok'")" || true
+  [[ "$out" == "ok" ]] || { echo "✗ observation 绑定漂移,拒绝登记 emergency drill" >&2; exit 1; }
+  echo "✓ emergency 激活与原 tuple 恢复已由三条 committed history 交叉核验并留证。"
+}
+
+model_authority_observation_status() {
+  local raw
+  raw="$(remote_model_authority_psql "WITH o AS (SELECT value FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY')
+  SELECT jsonb_build_object(
+    'observation',(SELECT value FROM o),
+    'elapsed_seconds',COALESCE((SELECT floor(extract(epoch FROM (NOW()-(value->>'started_at')::timestamptz)))::bigint FROM o),0),
+    'signed_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.authority_kind='bridge_signed' AND u.execution_revision IS NOT NULL AND u.security_epoch::text=o.value->>'security_epoch'),0),
+    'canary_requests',COALESCE((SELECT count(*) FROM usage_records u,o WHERE u.created_at >= (o.value->>'started_at')::timestamptz AND u.model_id=o.value->>'canary_model' AND u.authority_kind='bridge_signed'),0),
+    'long_ccb_turns',COALESCE((SELECT count(*) FROM request_finalize_journal j,o WHERE j.created_at >= (o.value->>'started_at')::timestamptz AND j.state='committed' AND j.ctx->>'source'='ccb_proxy' AND j.ctx->>'authorityKind'='bridge_signed' AND j.updated_at-j.created_at >= interval '5 minutes'),0),
+    'minimums',jsonb_build_object('elapsed_seconds',$MODEL_AUTHORITY_MIN_OBSERVE_SECONDS,'signed_requests',$MODEL_AUTHORITY_MIN_REQUESTS,'canary_requests',1,'long_ccb_turns',1)
+  )::text")" || { echo "✗ observation status 查询失败" >&2; return 1; }
+  jq . <<<"$raw"
+}
+
+# --enable-model-authority:四面全绿 → 写 OC_MODEL_AUTHORITY=1 → 重启 master + egress → smoke。
+# (方案 §7 步 4:判定源切换。egress 也读该 flag —— /v1/messages 在 egress 进程,必须一起重启。)
+enable_model_authority() {
+  echo "══ 开启模型权威 flag(方案 §7 步 4)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] preflight → 安装受限 canary → env flag=1 → egress enforce → master → smoke → 持久 observation"
+    return 0
+  fi
+  model_authority_preflight || { echo "✗ preflight 未全绿,拒绝开启 flag(见上方逐面结论)" >&2; exit 1; }
+  install_model_authority_canary || { echo "✗ canary 安装失败,flag 尚未改动" >&2; exit 1; }
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1 || exit 1
+  echo "── 先重启 egress 并确认 enforce=true(允许短暂 fail-closed,禁止新 master+旧 egress fail-open)──"
+  if ! ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"; then
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || true
+    echo "✗ egress 重启失败,flag 已回滚为 0" >&2
+    exit 1
+  fi
+  run "sleep 2"
+  local eg
+  eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+  if [[ "$(printf '%s' "$eg" | jq -r '.modelAuthority.enforced // false' 2>/dev/null || true)" != "true" ]]; then
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || true
+    echo "✗ egress 未活体确认 modelAuthority.enforced=true,flag 已回滚" >&2
+    exit 1
+  fi
+  echo "  ✓ egress 已 enforce=true;现在才允许 master 开始签发"
+  if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' '$ACTIVE_UNIT'" || true
+    echo "✗ master 重启失败,flag 已回滚为 0" >&2
+    exit 1
+  fi
+  run "sleep 4"
+  smoke "$ACTIVE_PORT" || { echo "✗ 开启后 smoke 失败 —— 立刻 --disable-model-authority 回退" >&2; exit 1; }
+  if ! start_model_authority_observation; then
+    remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' '$ACTIVE_UNIT'" || true
+    echo "✗ observation 无法持久化,flag 已回滚;禁止无证据运行后 cutover" >&2
+    exit 1
+  fi
+  echo "✓ $MODEL_AUTHORITY_FLAG_KEY=1 已生效(判定源 = catalog),observation 已开始。"
+}
+
+# --disable-model-authority:关 flag(步骤 4 的回滚)。**cutover 后禁用**(地板不可逆)。
+disable_model_authority() {
+  echo "══ 关闭模型权威 flag(步骤 4 回滚)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 cutover marker 未置位 → env $MODEL_AUTHORITY_FLAG_KEY=0 → restart master+egress"
+    return 0
+  fi
+  if model_authority_cutover_done; then
+    echo "✗ 拒绝:cutover marker 已置位(步骤 5 已执行),兼容地板不可逆。" >&2
+    echo "  catalog 里可能已有 baked 判定不认识的行,关 flag = 容器按旧表执行 → 判定源分叉。" >&2
+    echo "  合法退路(方案 §7 步 5 回滚列):事务性把 catalog 恢复到 baked 等价值 + bump epoch +" >&2
+    echo "  等全部快照与运行容器收敛,再清 marker(env 键 + model_authority_deploy_state 行),才允许关 flag。" >&2
+    exit 1
+  fi
+  assert_no_rollout_in_progress || exit 1
+  remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || exit 1
+  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT' && systemctl restart '$ACTIVE_UNIT'" \
+    || { echo "✗ 重启失败,人工核查" >&2; exit 1; }
+  run "sleep 4"
+  smoke "$ACTIVE_PORT"
+  echo "✓ flag 已关(容器无 envelope → 回落 baked 判定,集合同值)。"
+}
+
+# --model-authority-cutover:步骤 5 的持久化 marker。置位后地板不可逆(见 assert_model_authority_floor)。
+# 前置:flag 已开 + 四面活体全绿。写 DB 单行(权威)+ env 键(DB 不可达时的本地信号)。
+model_authority_cutover() {
+  echo "══ 步骤 5:置位模型权威 cutover marker(不可逆兼容地板)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言 flag/preflight + fleet/seed → DB 原子锁 observation+epoch 并验证 15m/请求/canary/长 CCB/emergency → marker → env"
+    return 0
+  fi
+  local flag db_marker release tuple rel64 tuple64 census observation current_fp observed_fp rev
+  flag="$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")"
+  [[ "$flag" == "1" ]] || {
+    echo "✗ 拒绝:$MODEL_AUTHORITY_FLAG_KEY≠1(当前='${flag:-<unset>}')—— 步骤 5 必须在步骤 4 之后。" >&2
+    exit 1
+  }
+  model_authority_preflight || { echo "✗ preflight 未全绿,拒绝 cutover" >&2; exit 1; }
+  db_marker="$(remote_model_authority_psql "SELECT EXISTS(SELECT 1 FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_SETTING_KEY')::text")" || exit 1
+  if [[ "$db_marker" == "true" ]]; then
+    echo "  · DB marker 已存在(上次可能只差 env),跳过不可逆事务重放。"
+    remote_env_set "$MODEL_AUTHORITY_CUTOVER_KEY" 1 || exit 1
+    model_authority_cutover_done || exit 1
+    return 0
+  fi
+  [[ "$(remote_env_get OC_SEED_AUTHORITY_BY_REV)" == "1" ]] || {
+    echo "✗ seed 阶段 B 尚未开启;先 --enable-seed-authority-by-rev" >&2; exit 1;
+  }
+  tuple="$(model_authority_runtime_tuple)"; release="$(model_authority_release_sha)"
+  rev="$(jq -r '.bundle|split("/")[-1]' <<<"$tuple")"
+  census="$(model_authority_fleet_census)"; observation="$(remote_model_authority_psql "SELECT value::text FROM model_authority_deploy_state WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY'")"
+  [[ -n "$observation" ]] || { echo "✗ 缺 observation;重新 --enable-model-authority" >&2; exit 1; }
+  [[ "$(jq -r 'length' <<<"$census")" -gt 0 ]] || { echo "✗ cutover fleet census 为空" >&2; exit 1; }
+  [[ "$(jq -r --arg rev "$rev" '[.[]|select(.bundle_rev!=$rev)]|length' <<<"$census")" == "0" ]] || {
+    echo "✗ cutover 瞬时 census 出现旧 bundle_rev;重新完成 seed census" >&2; exit 1;
+  }
+  current_fp="$(jq -c '[.[]|{id,bundle_rev}]|sort_by(.id)' <<<"$census")"
+  observed_fp="$(jq -c '[.seed_census.fleet[]|{id,bundle_rev}]|sort_by(.id)' <<<"$observation")"
+  [[ "$current_fp" == "$observed_fp" ]] || {
+    echo "✗ fleet 在 seed census 后发生增删/换 rev;重新跑 --enable-seed-authority-by-rev 取得新证据" >&2; exit 1;
+  }
+  rel64="$(model_authority_b64 "$release")"; tuple64="$(model_authority_b64 "$tuple")"
+  echo "── DB 原子线性化:锁 observation + security epoch → 全证据校验 → marker ──"
+  remote_model_authority_psql_script <<SQL
+DO \$cutover\$
+DECLARE
+  v_obs JSONB;
+  v_epoch BIGINT;
+  v_n BIGINT;
+BEGIN
+  SELECT value INTO v_obs FROM model_authority_deploy_state
+   WHERE key='$MODEL_AUTHORITY_OBSERVATION_KEY' FOR UPDATE;
+  IF v_obs IS NULL THEN RAISE EXCEPTION 'model authority observation missing'; END IF;
+  SELECT epoch INTO v_epoch FROM model_security_epoch WHERE id FOR UPDATE;
+  IF v_obs->>'release_sha' <> convert_from(decode('$rel64','base64'),'UTF8')
+     OR v_obs->'runtime_tuple' <> convert_from(decode('$tuple64','base64'),'UTF8')::jsonb
+     OR v_obs->>'security_epoch' <> v_epoch::text THEN
+    RAISE EXCEPTION 'observation binding drifted (release/runtime tuple/security epoch)';
+  END IF;
+  IF NOW() - (v_obs->>'started_at')::timestamptz < interval '${MODEL_AUTHORITY_MIN_OBSERVE_SECONDS} seconds' THEN
+    RAISE EXCEPTION 'observation window shorter than ${MODEL_AUTHORITY_MIN_OBSERVE_SECONDS}s';
+  END IF;
+  IF COALESCE((v_obs->'seed_census'->>'container_count')::int,0) < 1 THEN
+    RAISE EXCEPTION 'seed fleet census evidence missing';
+  END IF;
+  IF COALESCE((v_obs->'emergency_drill'->>'activated_and_restored')::boolean,FALSE) IS NOT TRUE THEN
+    RAISE EXCEPTION 'emergency activate/restore drill evidence missing';
+  END IF;
+  SELECT count(*) INTO v_n FROM usage_records
+   WHERE created_at >= (v_obs->>'started_at')::timestamptz
+     AND authority_kind='bridge_signed' AND execution_revision IS NOT NULL
+     AND security_epoch::text=v_epoch::text;
+  IF v_n < $MODEL_AUTHORITY_MIN_REQUESTS THEN
+    RAISE EXCEPTION 'signed request evidence % < ${MODEL_AUTHORITY_MIN_REQUESTS}', v_n;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM usage_records
+     WHERE created_at >= (v_obs->>'started_at')::timestamptz
+       AND model_id=v_obs->>'canary_model' AND authority_kind='bridge_signed'
+  ) THEN RAISE EXCEPTION 'catalog canary has no signed usage'; END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM request_finalize_journal
+     WHERE created_at >= (v_obs->>'started_at')::timestamptz AND state='committed'
+       AND ctx->>'source'='ccb_proxy' AND ctx->>'authorityKind'='bridge_signed'
+       AND ctx->>'executionRevision' IS NOT NULL AND ctx->>'securityEpoch'=v_epoch::text
+       AND updated_at-created_at >= interval '5 minutes'
+  ) THEN RAISE EXCEPTION 'no committed >5m CCB authority turn'; END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM model_catalog c
+    JOIN model_aliases a ON a.entry_id=c.entry_id
+    JOIN model_visibility_grants g ON g.model_id=c.model_id
+     WHERE c.model_id='$MODEL_AUTHORITY_CANARY_MODEL' AND c.state='active'
+       AND a.alias='$MODEL_AUTHORITY_CANARY_ALIAS' AND g.user_id::text=v_obs->>'canary_uid'
+  ) THEN RAISE EXCEPTION 'catalog canary active/alias/grant invariant failed'; END IF;
+  IF EXISTS (
+    SELECT 1 FROM model_runtime_requirements r
+     WHERE NOT EXISTS (SELECT 1 FROM model_catalog c WHERE c.model_id=r.model_id AND c.state='active')
+        OR NOT EXISTS (SELECT 1 FROM model_pricing p WHERE p.model_id=r.model_id AND p.enabled)
+  ) THEN RAISE EXCEPTION 'required runtime model invariant failed'; END IF;
+  INSERT INTO model_authority_deploy_state(key,value,description)
+  VALUES ('$MODEL_AUTHORITY_SETTING_KEY',jsonb_build_object(
+    'at',NOW()::text,'by','deploy-v5.sh','release_sha',v_obs->>'release_sha',
+    'runtime_tuple',v_obs->'runtime_tuple','security_epoch',v_epoch::text,
+    'observation',v_obs
+  ),'model authority step-5 cutover: atomic observation+epoch evidence; baked rollback forbidden');
+END \$cutover\$;
+SQL
+  echo "  ✓ DB marker 与 observation/epoch 锁在同一事务提交"
+  echo "── 写 env marker ──"
+  remote_env_set "$MODEL_AUTHORITY_CUTOVER_KEY" 1 || {
+    echo "✗ env marker 写失败(DB marker 已置位 → 地板已生效);重试本命令即可补齐 env" >&2; exit 1
+  }
+  model_authority_cutover_done || { echo "✗ 复核失败:marker 写完却读不到" >&2; exit 1; }
+  echo "✓ cutover marker 已置位(DB + env)。此后:"
+  echo "   · deploy/rollback 拒绝激活缺 capability 的 master release / runtime tuple;"
+  echo "   · master 与 egress 在 flag 关闭态下**拒启**(runtimeCapabilities.ts 地板断言);"
+  echo "   · admin catalog 状态机(/api/admin/model-catalog)即为开放状态。"
+}
+
 # release 激活补偿:恢复旧 symlink/.prev-release 并 restart 旧 unit；失败必须显式报出混合现场。
 restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason
   local old_release="$1" old_prev_file="$2" reason="$3" tmplink="$ACTIVE_SRC.rollback.$$"
@@ -1180,6 +1907,8 @@ activate_release() {
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
+  # 模型权威兼容地板(步骤 5 后):同上,激活/回滚同一处收口。
+  assert_model_authority_floor "$reldir"
   prev="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev" ]] || { echo "✗ 无法解析 active slot 当前 release，拒绝激活。" >&2; return 1; }
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
@@ -1258,6 +1987,7 @@ SQL
     protect_paths() { for p in \"\$@\"; do [ -n \"\$p\" ] || continue; case \"\$p\" in /*) echo \"\$p\" ;; *) echo '$RELEASES_ROOT/'\"\$p\" ;; esac; done; }
     curA=\$(readlink -f '$srcA' 2>/dev/null || true)
     curB=\$(readlink -f '$srcB' 2>/dev/null || true)
+    curE=\$(readlink -f '$V5_EGRESS_SRC' 2>/dev/null || true)
     prev=\$(readlink -f \"\$(cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true)\" 2>/dev/null || true)
     dsa=\$(readlink -f \"\$(protect_paths '$(ds_lit "$ds_active")')\" 2>/dev/null || true)
     dsc=\$(readlink -f \"\$(protect_paths '$(ds_lit "$ds_candidate")')\" 2>/dev/null || true)
@@ -1270,7 +2000,7 @@ SQL
     ecwd=\$([ \"\${epid:-0}\" -gt 0 ] && readlink -f /proc/\$epid/cwd 2>/dev/null || true)
     ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | tail -n +$((RELEASES_KEEP+1)) | while read -r d; do
       rd=\$(readlink -f \"\$d\" 2>/dev/null || echo \"\$d\")
-      case \"\$rd\" in \"\$curA\"|\"\$curB\"|\"\$prev\"|\"\$dsa\"|\"\$dsc\"|\"\$dsp\"|\"\$mcwdA\"|\"\$mcwdB\"|\"\$ecwd\") continue ;; esac
+      case \"\$rd\" in \"\$curA\"|\"\$curB\"|\"\$curE\"|\"\$prev\"|\"\$dsa\"|\"\$dsc\"|\"\$dsp\"|\"\$mcwdA\"|\"\$mcwdB\"|\"\$ecwd\") continue ;; esac
       [ -f \"\$d/.complete\" ] || continue
       rm -rf \"\$d\"
     done
@@ -1454,6 +2184,11 @@ activate_runtime_tuple() {
     return 0
   fi
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
+  # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
+  # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
+  # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
+  assert_release_capability_for_sessions_pg "$BUILT_RELEASE"
+  assert_model_authority_floor "$BUILT_RELEASE"
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
@@ -1818,6 +2553,26 @@ smoke() {
     local eg; eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
     echo "  egress-health: $eg"
     echo "$eg" | grep -q '"role":"egress"' || { echo "✗ egress 进程不健康(18892 无响应或非 egress)" >&2; return 1; }
+    EGRESS_HEALTH_JSON="$eg"
+  fi
+  # 模型权威(flag 开启后):master 与 egress 两个**活体进程**都必须广播 capability。
+  # 制品面(release metadata / MANIFEST / 镜像 label)由激活期地板守卫;这里补的是"进程真的
+  # 换上了新代码"——egress 默认不随 deploy 重启,最容易出现"master 新 / egress 旧"的错配
+  # (R4-m6:master 新 + egress 旧必拒)。flag 未开 → 影子期,不断言(旧 egress 合法存活)。
+  local ma_flag
+  ma_flag="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_MODEL_AUTHORITY=' '$V5_ENV' | tail -n 1 | cut -d= -f2-" 2>/dev/null || true)"
+  if [[ "$ma_flag" == "1" ]]; then
+    local mcaps
+    mcaps="$(printf '%s' "$hz" | jq -r '(.runtime.capabilities // []) | join(" ")' 2>/dev/null || true)"
+    caps_contain "$mcaps" "$MODEL_AUTHORITY_CAP" \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 master /healthz 未广播 '$MODEL_AUTHORITY_CAP'(caps=[${mcaps:-<none>}])—— 旧 master 版本" >&2; return 1; }
+    [[ "$split" == "1" ]] \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 OC_EGRESS_SPLIT≠1 —— /v1/messages 的 epoch fence 面无法证明" >&2; return 1; }
+    local ecaps
+    ecaps="$(printf '%s' "${EGRESS_HEALTH_JSON:-}" | jq -r '(.capabilities // []) | join(" ")' 2>/dev/null || true)"
+    caps_contain "$ecaps" "$MODEL_AUTHORITY_EGRESS_CAP" \
+      || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
+    echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
@@ -1858,10 +2613,19 @@ bootstrap() {
   echo "── 5) 安装 $V5_UNIT + $V5_EGRESS_UNIT ──"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_UNIT' '$KL_HOST:/etc/systemd/system/$V5_UNIT'"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_EGRESS_UNIT' '$KL_HOST:/etc/systemd/system/$V5_EGRESS_UNIT'"
+  # bootstrap 没有旧 egress release 可做 saga；先把独立指针绑定初始 A 源码。后续普通
+  # deploy --egress 会把它钉到对应不可变 release，且失败自动回切。
+  sshk "set -e; rm -f '$V5_EGRESS_SRC.newlink.bootstrap'; ln -s '$REMOTE_SRC' '$V5_EGRESS_SRC.newlink.bootstrap'; mv -Tf '$V5_EGRESS_SRC.newlink.bootstrap' '$V5_EGRESS_SRC'"
   sshk "systemctl daemon-reload"
   # 5.5) 部署顺序守卫:P1a channel-aware 代码需共享库已加 runtime_channel 列(0088)。
   echo "── 5.5) 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
+  # 5.6) 模型权威地板的 DR 守卫(方案 §7 步 5)。
+  # bootstrap 是**唯一**会重新派生 env 的路径(从 v3 env + overrides),而 cutover marker 的
+  # 进程侧信号就在 env 里 —— 不补回来,重建后的 master 会以 baked 判定**静默**起来(flag 丢了,
+  # 地板断言也看不到 marker),正是 R3-B4 要根治的那类分叉。DB marker 是跨主机权威,故以它为准。
+  echo "── 5.6) 模型权威:按 DB cutover marker 回填 env(flag + marker)──"
+  restore_model_authority_env_after_bootstrap
   # 6) 启动 + 环境隔离断言(egress 先起:master split 模式依赖 18892 已有人监听)
   echo "── 6) 启动 openclaude-v5-egress + openclaude-v5 + 环境隔离断言 ──"
   sshk "systemctl enable --now $V5_EGRESS_UNIT"
@@ -1871,6 +2635,67 @@ bootstrap() {
   sshk "grep -q 'COMMERCIAL_AUTO_MIGRATE=0' '$V5_ENV' && echo '  ✓ AUTO_MIGRATE=0' || echo '  ✗ AUTO_MIGRATE 未关'"
   [[ "$DRY" == 1 ]] || smoke
   echo "✓ bootstrap 完成。下一步:Caddy 标签分流(独立、人工、加法式)。"
+}
+
+# egress 是全局单实例，不能直接使用任何 master slot 的 WorkingDirectory。显式
+# --egress 才把独立 symlink 原子切到本次不可变 release；restart/活体/进程 cwd 任一
+# 失败都回切调用方在部署起手时钉住的旧 release。unit 本身也从目标 release 安装，
+# 防止源码与 systemd 声明跨代。
+activate_egress_release() {
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" hz pid cwd caps
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
+    return 0
+  fi
+  ssh "$KL_HOST" "test -f '$reldir/.complete' && test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
+    echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
+  }
+  ssh "$KL_HOST" "test -n '$prev' && test -f '$prev/.complete'" || {
+    echo "✗ 无法证明旧 egress cwd 是完整 release:$prev；拒绝在无回退点时切换" >&2; return 1;
+  }
+  if ! ssh "$KL_HOST" "set -Eeuo pipefail
+    rm -f '$tmplink'
+    ln -s '$reldir' '$tmplink'
+    mv -T '$tmplink' '$V5_EGRESS_SRC'
+    install -m 0644 '$reldir/deploy/v5/$V5_EGRESS_UNIT' '/etc/systemd/system/$V5_EGRESS_UNIT'
+    systemctl daemon-reload
+    systemctl restart '$V5_EGRESS_UNIT'"; then
+    echo "✗ egress 新 release 安装/restart 失败，尝试回切 $prev" >&2
+  else
+    run "sleep 3"
+    pid="$(ssh "$KL_HOST" "systemctl show -p MainPID --value '$V5_EGRESS_UNIT'" 2>/dev/null || true)"
+    cwd="$(ssh "$KL_HOST" "test '${pid:-0}' -gt 0 && readlink -f '/proc/$pid/cwd'" 2>/dev/null || true)"
+    hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+    caps="$(release_declared_caps "$reldir" 2>/dev/null || true)"
+    if [[ "$cwd" == "$reldir" ]] \
+      && jq -e '.ok == true and .role == "egress"' >/dev/null 2>&1 <<<"$hz" \
+      && { ! caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" \
+        || jq -e --arg cap "$MODEL_AUTHORITY_EGRESS_CAP" '.capabilities | index($cap) != null' >/dev/null 2>&1 <<<"$hz"; }; then
+      echo "  ✓ egress 已从独立指针运行目标 release:$cwd"
+      return 0
+    fi
+    echo "✗ egress 新 release 活体/进程 cwd/capability 不匹配(cwd=${cwd:-<none>})，尝试回切 $prev" >&2
+  fi
+
+  # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切只需原子翻回旧 release；
+  # 不必恢复旧 unit 文件（旧代码仍由同一个 ExecStart 入口启动）。
+  if ssh "$KL_HOST" "set -Eeuo pipefail
+    rm -f '$tmplink'
+    ln -s '$prev' '$tmplink'
+    mv -T '$tmplink' '$V5_EGRESS_SRC'
+    systemctl daemon-reload
+    systemctl restart '$V5_EGRESS_UNIT'"; then
+    run "sleep 3"
+    pid="$(ssh "$KL_HOST" "systemctl show -p MainPID --value '$V5_EGRESS_UNIT'" 2>/dev/null || true)"
+    cwd="$(ssh "$KL_HOST" "test '${pid:-0}' -gt 0 && readlink -f '/proc/$pid/cwd'" 2>/dev/null || true)"
+    hz="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+    if [[ "$cwd" == "$prev" ]] && jq -e '.ok == true and .role == "egress"' >/dev/null 2>&1 <<<"$hz"; then
+      echo "  ✓ egress 已回切旧 release:$prev" >&2
+      return 1
+    fi
+  fi
+  mark_deploy_recovery_required "egress release 切换失败且旧 release 回切未确认(target=$reldir prev=$prev)"
+  return 1
 }
 
 # ───────────────────────── deploy:增量 ─────────────────────────
@@ -1883,6 +2708,15 @@ deploy() {
   # BLOCKER 4:解析 active slot(A/B;蓝绿 finalize 后可能是 B)→ 后续 build/activate/smoke 全 slot-aware。
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  local egress_prev_release=""
+  if [[ "$RESTART_EGRESS" == 1 && "$DRY" != 1 ]]; then
+    # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
+    egress_prev_release="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    ssh "$KL_HOST" "test -n '$egress_prev_release' && test -f '$egress_prev_release/.complete'" || {
+      echo "✗ --egress 起手无法钉住完整旧 egress cwd:$egress_prev_release；拒绝先改 master" >&2; exit 1;
+    }
+    echo "  · egress 回退点:$egress_prev_release"
+  fi
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
   # build_release:从锁定 sha 的 git archive 建不可变 release(--with-dist 时 vite build 进
@@ -1912,9 +2746,8 @@ deploy() {
     activate_release "$BUILT_RELEASE"   # 原子 symlink 翻转 + restart(master 只从完整不可变 release 启动)
   fi
   if [[ "$RESTART_EGRESS" == 1 ]]; then
-    echo "── restart openclaude-v5-egress(显式 --egress;SIGTERM drain 在飞流)──"
-    sshk "systemctl restart openclaude-v5-egress"
-    run "sleep 3"
+    echo "── 激活 openclaude-v5-egress 独立 release(显式 --egress;SIGTERM drain 在飞流)──"
+    activate_egress_release "$BUILT_RELEASE" "$egress_prev_release" || exit 1
   fi
   [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
   if [[ "$WITH_DIST" == 1 ]]; then
@@ -2310,6 +3143,10 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_required_migrations "$master" || return 1
+  # 回滚同样过两个 capability 门(地板的核心场景就是"拒绝把旧版本翻回来")。
+  # 容器 tuple(image/release)面在 saga 内由 lib 的 assert_tuple_viable ③ 覆盖。
+  assert_release_capability_for_sessions_pg "$master"
+  assert_model_authority_floor "$master"
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
   # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
   flip_rev=""
@@ -2822,6 +3659,8 @@ canary() {
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
   assert_release_capability_for_sessions_pg "$reldir"
+  # cutover 后 P3 candidate 也是一条真实激活路径；不能绕过模型权威兼容地板。
+  assert_model_authority_floor "$reldir"
   # assets → union 池(candidate 与 active 前端 chunk 并集,跨 lane 可得)
   sync_assets_to_pool "$reldir"
 
@@ -3232,9 +4071,12 @@ recover() {
 if [[ "${V5_DEPLOY_SOURCE_ONLY:-0}" == 1 ]]; then
   if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; else exit 0; fi
 fi
-DEPLOY_LOCK="/var/lock/oc-v5-deploy.lock"
+# 锁文件路径:生产恒为全局 /var/lock/oc-v5-deploy.lock(env 不设 → 与旧行为逐字节一致)。
+# OC_V5_DEPLOY_LOCK_FILE 仅供**本地 hermetic 测试**注入独立锁文件(与 v5-runtime-release-lib.sh
+# 的 OC_HOTCFG_* 根路径同款"自测可覆盖"约定),避免测试去抢真实部署锁而挂死 900s。
+DEPLOY_LOCK="${OC_V5_DEPLOY_LOCK_FILE:-/var/lock/oc-v5-deploy.lock}"
 trap cleanup_deploy_process EXIT
-if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" ]]; then
   exec 8>"$DEPLOY_LOCK"
   if ! flock -n 8; then
     echo "⏳ 部署锁被占:$(cat "${DEPLOY_LOCK}.holder" 2>/dev/null || echo '持有者未知')"
@@ -3263,6 +4105,13 @@ case "$MODE" in
   smoke)     resolve_active_lane; smoke "$ACTIVE_PORT" ;;
   deploy)    deploy ;;
   dist)      deploy_dist ;;
+  model-authority-preflight) model_authority_preflight ;;
+  enable-model-authority)    enable_model_authority ;;
+  disable-model-authority)   disable_model_authority ;;
+  model-authority-observation-status) model_authority_observation_status ;;
+  enable-seed-authority-by-rev) enable_seed_authority_by_rev ;;
+  record-model-authority-emergency-drill) record_model_authority_emergency_drill ;;
+  model-authority-cutover)   model_authority_cutover ;;
   emergency-tuple) emergency_tuple ;;
   activate-emergency-tuple) activate_emergency_tuple ;;
   prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;

@@ -26,6 +26,7 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
+import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -40,7 +41,7 @@ import {
   RemoteTargetUnavailableError,
 } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
-import type { UsageAttributionTag } from './subprocessRunner.js'
+import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -1512,6 +1513,28 @@ export class SessionManager {
      */
     model?: string
     /**
+     * **master 的执行权威**(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§3)。两个来源:
+     *   - `source:'bridge_signed'`:server.ts dispatchInbound 从验签通过的 inbound
+     *     authority(签名 descriptor)取出;
+     *   - `source:'local_catalog'`:无 envelope 的本地路径(cron/synthetic/delegate/
+     *     wechat/prewarm)在**创建 runner 之前**从 master catalog 投影现取
+     *     (server.ts `resolveLocalExecutionIfEnforced`)。
+     *
+     * 存在 → 该 turn 的 canonicalModel + engine **全部取自它**,容器不再查 baked
+     * 白名单/MODEL_ENGINE_MAP(两处 baked 表是 master 之外的第二信任源,与 catalog
+     * 快照必然漂移)。
+     *
+     * 缺省的语义按 flag 分岔(registry.resolveEngine 的 requireAuthority 门):
+     *   - flag 未开(个人版 / 过渡期)→ 现状 baked 判定,**行为零变化**;
+     *   - flag 开(托管)→ **fail-closed 抛 ModelAuthorityRequiredError**(= 调用方漏了
+     *     catalog 判定,不许回落 baked)。
+     */
+    executionAuthority?: {
+      canonicalModel: string
+      engine: 'ccb' | 'codex'
+      source?: 'bridge_signed' | 'local_catalog'
+    }
+    /**
      * Authenticated userId owning the client_sessions row. When provided,
      * stored on the resulting AgentSession so the durable server-authored-
      * append path can bypass the `getClientSession` short-circuit on
@@ -1578,18 +1601,31 @@ export class SessionManager {
     //     收敛到白名单内(白名单只拦入站帧、agent.model 绕过的教训)。
     //   - resolveEngine:model→engine 映射 + agentDef.provider 显式 pin 的单一
     //     权威(gpt-5.5 → 'codex';codex-native pin 仅接受 app-server 形态)。
+    //   - executionAuthority(有则唯一权威):master 签名 descriptor 的 canonicalModel /
+    //     engine 直接落地,两个 baked 表(ALLOWED_INBOUND_MODELS / MODEL_ENGINE_MAP)
+    //     在该 turn **完全不参与** —— 判定单点化(方案 §2)。
     const executionModel = resolveExecutionModel(
       opts.model ?? opts.agent.model,
       this.config.defaults.model,
+      opts.executionAuthority,
     )
-    const engineId = resolveEngine(executionModel, opts.agent)
+    // flag 门(§3):托管 + OC_MODEL_AUTHORITY=1 时,**无 master 权威一律不许创建 runner**。
+    // 判定放在 resolveEngine 内部(engine 判定的单一收口),这里只把 flag 传进去 ——
+    // 于是"所有无 envelope 的 runner 创建入口"的完整性不再依赖人工枚举:createEngine 的
+    // 唯一调用者就是本函数,任何漏取 catalog 投影的入口都会在这里 fail-closed 炸出来。
+    const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
+      requireAuthority: isModelAuthorityRequired(),
+    })
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
-      // 跨 engine 切换判定:只有"caller 明确给了 model"或"agent 显式 pin 到
-      // codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见
-      // opts.model JSDoc)。
+      // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
+      // 到 codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见 opts.model
+      // JSDoc)。authority 在场必权威 —— master 说这个 turn 跑 codex,就不能因为 caller
+      // 没显式带 model 而沿用现存 ccb runner(那正是执行与计费分裂的形状)。
       const desiredEngine =
-        opts.model !== undefined || opts.agent.provider === 'codex-native'
+        opts.model !== undefined ||
+        opts.executionAuthority !== undefined ||
+        opts.agent.provider === 'codex-native'
           ? engineId
           : existing.providerTag
       if (existing.providerTag !== desiredEngine) {
@@ -1850,6 +1886,11 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
+      /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
+       *  只有 **bridge turn** 有(server.ts dispatchInbound 从验签产物 TurnExecutionDescriptor
+       *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
+       *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
+      modelAuthority?: TurnModelAuthority
       /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
        *  (server.ts)发 sys.context_rebuilt 提示帧(boss 硬指标 3:引擎无法原生续接、
        *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
@@ -2148,6 +2189,7 @@ export class SessionManager {
             requestId,
             traceId,
             opts?.collabAgentPolicy,
+            opts?.modelAuthority,
           ),
           livenessPromise,
         ])
@@ -2204,6 +2246,11 @@ export class SessionManager {
      *  Sub-30 minute lifetime — scoped to this turn's retry budget. */
     traceId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
+    /** 模型权威批次 §4:本 turn 的上游凭据。**跨 retry 复用同一张票**是有意的 ——
+     *  authority 的短 TTL 只约束「开始执行」,turn 内(含 phantom/transient 重试)的
+     *  续跑认 lease(TTL = 最大 turn 窗口 + grace);安全撤销由 egress 每请求 epoch
+     *  fence 兜住,不靠票据过期。 */
+    modelAuthority?: TurnModelAuthority,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -2259,6 +2306,7 @@ export class SessionManager {
           assistantMessageId,
           thinkingMessageId,
           toolMessageIdFactory,
+          modelAuthority,
         )
         return // success
       } catch (err: any) {
@@ -2392,6 +2440,8 @@ export class SessionManager {
      *  `srv-${peerId}-${agentId}-t${turnIndex}-tool-${blockId}` format).
      *  Undefined for personal-version legacy callers. */
     toolMessageIdFactory?: (blockId: string) => string,
+    /** 模型权威批次 §4:本 turn 的上游凭据(见 runOneTurnWithRetry 注释)。 */
+    modelAuthority?: TurnModelAuthority,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -3050,6 +3100,9 @@ export class SessionManager {
       const turn = runner.submitTurn({
         input: userTextOrBlocks,
         requestId,
+        // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
+        // 自取 local_catalog token;codex adapter 不消费本字段)。
+        ...(modelAuthority !== undefined ? { modelAuthority } : {}),
         traceId,
         assistantMessageId,
         thinkingMessageId,

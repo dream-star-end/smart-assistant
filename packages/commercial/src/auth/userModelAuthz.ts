@@ -1,10 +1,9 @@
 /**
- * 用户模型授权(role + model grants)加载器 —— 60s soft-TTL 缓存 + inflight 去重。
+ * 用户模型授权(role + grants)加载器。
  *
- * 原先内联在 index.ts(anthropicProxy 装配段);2026-07-02 egress 进程解耦时抽出:
- * master 与 egress 两个进程的 /v1/messages 鉴权必须走同一份业务规则,单一权威收口
- * 在这里。语义与原实现逐行等价(fail-closed:user 不存在 → role=user + 空 grants;
- * 缓存未命中/过期照走权威 DB;size 上限防御性 clear)。
+ * 无 fence 的展示/管理调用可用 60s soft TTL；安全执行面必须传入已经 fence 的
+ * requiredEpoch。缓存仅在 epoch 精确相等时命中，DB 返回的 epoch 不相等则 fail-closed，
+ * 从而 grant 撤销不会继承旧 TTL。
  */
 
 export type UserModelAuthz = {
@@ -12,41 +11,82 @@ export type UserModelAuthz = {
   grantedModelIds: ReadonlySet<string>;
 };
 
+export type UserModelAuthzLoader = (
+  uid: bigint,
+  requiredEpoch?: bigint,
+) => Promise<UserModelAuthz>;
+
+export class UserModelAuthzEpochMismatchError extends Error {
+  constructor(
+    readonly requiredEpoch: bigint,
+    readonly loadedEpoch: bigint,
+  ) {
+    super(`user model authz epoch mismatch: required=${requiredEpoch} loaded=${loadedEpoch}`);
+    this.name = "UserModelAuthzEpochMismatchError";
+  }
+}
+
 const AUTHZ_TTL_MS = 60_000;
 
-export function makeLoadUserModelAuthz(): (uid: bigint) => Promise<UserModelAuthz> {
-  const loadUncached = async (uid: bigint): Promise<UserModelAuthz> => {
+interface LoadedAuthz {
+  value: UserModelAuthz;
+  epoch: bigint;
+}
+
+export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
+  const loadUncached = async (uid: bigint): Promise<LoadedAuthz> => {
     const { query } = await import("../db/queries.js");
-    const { listGrantsForUser } = await import("../admin/modelGrants.js");
-    const r = await query<{ role: string }>("SELECT role FROM users WHERE id = $1", [uid]);
-    if (r.rows.length === 0) {
-      // user 在 DB 里不存在(理论被 verifyContainerIdentity 截掉,这里是防御编程)。
-      // fail-closed:认 user role,grants 空集 → 公开 model 还能用,admin/hidden 一律拒。
-      return { role: "user", grantedModelIds: new Set<string>() };
-    }
-    const roleRaw = r.rows[0].role;
-    const role: "user" | "admin" = roleRaw === "admin" ? "admin" : "user";
-    const grants = await listGrantsForUser(uid);
-    return { role, grantedModelIds: new Set(grants.map((g) => g.model_id)) };
+    const r = await query<{ role: string | null; epoch: string; grants: string[] }>(
+      `SELECT u.role,
+              e.epoch::text AS epoch,
+              COALESCE(array_agg(g.model_id ORDER BY g.model_id)
+                FILTER (WHERE g.model_id IS NOT NULL), ARRAY[]::text[]) AS grants
+         FROM model_security_epoch e
+         LEFT JOIN users u ON u.id = $1::bigint
+         LEFT JOIN model_visibility_grants g ON g.user_id = u.id
+        WHERE e.id
+        GROUP BY u.role, e.epoch`,
+      [uid],
+    );
+    const row = r.rows[0];
+    if (!row) throw new Error("model security epoch singleton missing");
+    return {
+      epoch: BigInt(row.epoch),
+      value: {
+        role: row.role === "admin" ? "admin" : "user",
+        grantedModelIds: new Set(row.grants),
+      },
+    };
   };
 
-  const cache = new Map<string, { v: UserModelAuthz; exp: number }>();
-  const inflight = new Map<string, Promise<UserModelAuthz>>();
+  const cache = new Map<string, { loaded: LoadedAuthz; exp: number }>();
+  const inflight = new Map<string, Promise<LoadedAuthz>>();
 
-  return async (uid: bigint): Promise<UserModelAuthz> => {
-    const k = uid.toString();
-    const hit = cache.get(k);
-    if (hit && hit.exp > Date.now()) return hit.v;
-    const pending = inflight.get(k);
-    if (pending) return pending;
-    const p = loadUncached(uid)
-      .then((v) => {
-        if (cache.size > 5000) cache.clear();
-        cache.set(k, { v, exp: Date.now() + AUTHZ_TTL_MS });
-        return v;
-      })
-      .finally(() => inflight.delete(k));
-    inflight.set(k, p);
-    return p;
+  return async (uid: bigint, requiredEpoch?: bigint): Promise<UserModelAuthz> => {
+    const userKey = uid.toString();
+    const hit = cache.get(userKey);
+    if (
+      hit &&
+      hit.exp > Date.now() &&
+      (requiredEpoch === undefined || hit.loaded.epoch === requiredEpoch)
+    ) {
+      return hit.loaded.value;
+    }
+
+    const requestKey = `${userKey}:${requiredEpoch?.toString() ?? "soft"}`;
+    const pending = inflight.get(requestKey);
+    const load = pending ?? loadUncached(uid);
+    if (!pending) inflight.set(requestKey, load);
+    try {
+      const loaded = await load;
+      if (requiredEpoch !== undefined && loaded.epoch !== requiredEpoch) {
+        throw new UserModelAuthzEpochMismatchError(requiredEpoch, loaded.epoch);
+      }
+      if (cache.size > 5000) cache.clear();
+      cache.set(userKey, { loaded, exp: Date.now() + AUTHZ_TTL_MS });
+      return loaded.value;
+    } finally {
+      if (!pending) inflight.delete(requestKey);
+    }
   };
 }

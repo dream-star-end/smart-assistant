@@ -7,6 +7,7 @@ import {
   contextRebuiltNotice,
   countAnswerBlocks,
   deriveConnBanner,
+  EXPECTED_TURN_ERR_CODES,
   findOrCreateStreamingRow,
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
@@ -251,6 +252,38 @@ describe("onopenSetInitialStatus / bridge error", () => {
   test("normalize + friendly", () => {
     expect(normalizeBridgeErrorCode("ERR_INSUFFICIENT_CREDITS")).toBe("insufficient_credits");
     expect(friendlyBridgeErrorMessage("INSUFFICIENT_CREDITS")).toMatch(/余额不足/);
+  });
+});
+
+// 模型权威 gate 的拒帧(bridge / egress;方案 §4 R3-m12)。此前这些码全落进"系统暂时不可用"
+// 的通用兜底 —— 用户既不知道发生了什么,也不知道 config_changed 是**可原样重发**的。
+describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN 等)", () => {
+  test("MODEL_CONFIG_CHANGED_RETRY_TURN → 归一 + 明确告知可重发,且不是通用兜底", () => {
+    expect(normalizeBridgeErrorCode("MODEL_CONFIG_CHANGED_RETRY_TURN")).toBe(
+      "model_config_changed_retry_turn",
+    );
+    const msg = friendlyBridgeErrorMessage("MODEL_CONFIG_CHANGED_RETRY_TURN");
+    expect(msg).toMatch(/模型配置/);
+    expect(msg).toMatch(/重试|重发/); // 指向用户气泡下方既有的「重试」入口(原样重发)
+    expect(msg).not.toMatch(/系统暂时不可用/);
+  });
+
+  test("MODEL_NOT_AVAILABLE / UNRESOLVED_AGENT_MODEL → 引导换模型,而非「稍后重试」", () => {
+    expect(friendlyBridgeErrorMessage("MODEL_NOT_AVAILABLE")).toMatch(/模型/);
+    expect(friendlyBridgeErrorMessage("MODEL_NOT_AVAILABLE")).not.toMatch(/系统暂时不可用/);
+    expect(friendlyBridgeErrorMessage("UNRESOLVED_AGENT_MODEL")).toMatch(/选择模型/);
+  });
+
+  test("MODEL_AUTHORITY_UNAVAILABLE / MODEL_CATALOG_UNAVAILABLE → 稍后重试文案", () => {
+    expect(friendlyBridgeErrorMessage("MODEL_AUTHORITY_UNAVAILABLE")).toMatch(/稍后/);
+    expect(friendlyBridgeErrorMessage("MODEL_CATALOG_UNAVAILABLE")).toMatch(/稍后/);
+  });
+
+  test("配置变更/模型下架 = 预期业务态(不自动上报);catalog 不可用 = 基建故障(要上报)", () => {
+    expect(EXPECTED_TURN_ERR_CODES.has("model_config_changed_retry_turn")).toBe(true);
+    expect(EXPECTED_TURN_ERR_CODES.has("model_not_available")).toBe(true);
+    expect(EXPECTED_TURN_ERR_CODES.has("model_authority_unavailable")).toBe(false);
+    expect(EXPECTED_TURN_ERR_CODES.has("model_catalog_unavailable")).toBe(false);
   });
 });
 

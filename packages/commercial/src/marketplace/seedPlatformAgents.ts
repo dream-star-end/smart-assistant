@@ -392,6 +392,26 @@ export const PLATFORM_RESEARCH_AGENT_SLUGS: readonly string[] = PLATFORM_RESEARC
   (a) => a.slug,
 )
 
+/**
+ * 平台 seed agent 引用的模型 id 集(**从上面的 seed 定义派生**,不另抄一份清单)。
+ *
+ * 模型权威批次 §6 "seed 完整性":这些模型必须存在于 model_catalog 且 state='active' ——
+ * 否则平台自带的预设 agent 一开口就被 catalog 拒(用户视角 = 平台自己坏了)。
+ * 启动断言 + deploy 门都消费本常量(见 http/internalModelCatalog.assertSeedModelsActive)。
+ */
+export const PLATFORM_SEED_AGENT_MODEL_IDS: readonly string[] = [
+  ...PLATFORM_GENERAL_AGENTS,
+  ...PLATFORM_RESEARCH_AGENTS,
+].map((a) => {
+  // body 是宽类型(Record<string, unknown>,manifest 形状);seed 定义漏写 model 是编译期
+  // 抓不到的事故 → 模块加载即抛(fail-closed:宁可启动失败也不要一个"模型为空"的预设 agent)。
+  const model = a.body.model
+  if (typeof model !== 'string' || model === '') {
+    throw new Error(`[seedPlatformAgents] preset '${a.slug}' has no model in its manifest body`)
+  }
+  return model
+})
+
 export async function seedPlatformGeneralAgents(
   deps: SeedPlatformAgentsDeps,
 ): Promise<SeedPlatformAgentsResult> {

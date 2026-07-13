@@ -1,5 +1,52 @@
 import { isMiniMaxM3Model } from './minimax.js'
 
+const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
+
+export interface AuthorityModelCapabilities {
+  canonicalModel: string
+  contextWindow: number | null
+  capabilityZero: boolean
+  supportsThinking: boolean
+  supportsVision: boolean
+  supportedEfforts: string[]
+}
+
+/**
+ * Gateway 在每个 turn 开始前写入的已验签执行描述符。只对 exact canonical model 生效；
+ * CCB 的 secondary utility model 仍按自己的模型语义处理，不能误套主模型 descriptor。
+ * 非空但畸形必须抛错，避免悄悄退回 baked 表。
+ */
+export function getAuthorityModelCapabilities(
+  model: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AuthorityModelCapabilities | undefined {
+  const raw = env[MODEL_EXECUTION_DESCRIPTOR_ENV]
+  if (!raw) return undefined
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('OC_MODEL_EXECUTION_DESCRIPTOR is not valid JSON')
+  }
+  const d = value as Partial<AuthorityModelCapabilities> | null
+  if (
+    !d ||
+    typeof d !== 'object' ||
+    typeof d.canonicalModel !== 'string' ||
+    !(d.contextWindow === null ||
+      (typeof d.contextWindow === 'number' && Number.isInteger(d.contextWindow) && d.contextWindow > 0)) ||
+    typeof d.capabilityZero !== 'boolean' ||
+    typeof d.supportsThinking !== 'boolean' ||
+    typeof d.supportsVision !== 'boolean' ||
+    !Array.isArray(d.supportedEfforts) ||
+    !d.supportedEfforts.every((effort) => typeof effort === 'string')
+  ) {
+    throw new Error('OC_MODEL_EXECUTION_DESCRIPTOR has invalid shape')
+  }
+  if (d.canonicalModel.trim().toLowerCase() !== model.trim().toLowerCase()) return undefined
+  return d as AuthorityModelCapabilities
+}
+
 // CCB 侧「静态 key 文本 provider」本地镜像表。
 //
 // CANONICAL 路由元数据源 = packages/protocol/src/staticKeyProviders.ts(commercial+gateway 共享)。
@@ -49,6 +96,8 @@ export function isArkPlanKimiModel(model: string): boolean {
  * 实测 enabled/disabled 语义均正确)。所以"是否在本集合"不直接等于"是否支持 thinking"。
  */
 export function isCapabilityZeroStaticModel(model: string): boolean {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.capabilityZero
   return (
     isMiniMaxM3Model(model) ||
     isArkGlmModel(model) ||
@@ -78,5 +127,7 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
 
 /** 命中静态模型 context 特判表 → 返回其 contextWindow;否则 undefined(由 caller 落默认)。 */
 export function getStaticModelContextWindow(model: string): number | undefined {
+  const authority = getAuthorityModelCapabilities(model)
+  if (authority) return authority.contextWindow ?? undefined
   return STATIC_MODEL_CONTEXT_WINDOW.find((e) => e.matches(model))?.contextWindow
 }

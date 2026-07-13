@@ -20,11 +20,52 @@
  *
  * 不做 grant 时间窗 / 自动过期:plan v3 §F2 没要求。如未来需要,加 `expires_at` + 后台
  * sweeper(NOTIFY pricing_changed-style)清理 + canUseModel 加 expires_at 比较。
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * security epoch(0144 / 代码审 R1 BLOCKER-1)
+ *
+ * grant 写(尤其 **DELETE = 撤权**)是安全事件:撤权后 CCB 有 egress 的每请求授权兜底,
+ * 但 **codex 根本不经 /v1/messages egress** —— 唯一的授权闸是 bridge 的连接级 grants
+ * checker(30s 周期刷新 + 刷新失败 keep-LKG)。0143 只给 catalog/alias/pricing 挂了 epoch
+ * trigger,grants 没有 → 撤权不 bump epoch → 消费侧的 fence 感知不到 → 旧连接继续签票执行。
+ *
+ * 修法**不在本文件**:epoch bump 的单一权威 = DB trigger(0144 `trg_model_grants_security_after`,
+ * INSERT/UPDATE/DELETE 全覆盖,与写在同一事务)。这里**不许**再补一次 TS 侧的 bump ——
+ * 两个 bump 源 = 又一次权威分裂(漏一条写路径就是一个洞;而 DB trigger 覆盖所有写路径,
+ * 包括迁移脚本、手工 psql、users CASCADE 删除带出的 grants 清理)。
+ *
+ * 本文件唯一的补充动作:写提交后**同步收敛本进程 catalog 快照**(epoch 已变),让 admin
+ * 拿到 200 时,至少本进程的 fence 已经站在新 epoch 上(方案 §1.2「提交后本进程 snapshot
+ * 同步激活成功才返回成功」)。其余进程(egress / 其他 master 实例)靠 epoch NOTIFY 收敛。
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
+
+/**
+ * grant 写提交后收敛本进程 catalog 快照(epoch 已被 0144 的 trigger bump)。
+ *
+ * - 动态 import:admin/modelGrants 被 http/proxy 的授权路径引用,静态引入
+ *   modelCatalogRuntime(它又引 http/proxy/upstream)会形成 import 环。
+ * - `peek` 而非 `get`:本进程没装 catalog(旧拓扑 / 测试)→ 无快照可收敛,直接跳过,
+ *   **不**懒初始化(admin 写不该顺手把一个 catalog 缓存拉起来)。
+ * - 失败只 warn 不抛:写已提交(撤权已生效),报 500 反而误导 admin;快照重建失败会让
+ *   本进程进入 unknown → 执行面 fail-closed(拒帧),这正是撤权时想要的方向,且
+ *   epoch NOTIFY 会持续重试收敛。
+ */
+async function convergeCatalogSnapshotAfterGrantWrite(): Promise<void> {
+  try {
+    const { peekModelCatalogCache } = await import('../billing/modelCatalogRuntime.js')
+    const cache = peekModelCatalogCache()
+    if (!cache) return
+    await cache.rebuild()
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[model-grants] catalog snapshot rebuild after grant write failed', err)
+  }
+}
 
 const ID_RE = /^[1-9][0-9]{0,19}$/
 const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/
@@ -123,7 +164,7 @@ export async function addGrant(
 ): Promise<{ inserted: boolean; row: ModelGrantRowView }> {
   const uid = normalizeUserId(userId)
   const mid = normalizeModelId(modelId)
-  return tx(async (client: PoolClient) => {
+  const out = await tx(async (client: PoolClient) => {
     // 用户存在性 —— FK 会兜底,但提前抛清晰错误码,前端 UX 友好
     const userR = await client.query<{ id: string }>(
       'SELECT id::text AS id FROM users WHERE id = $1::bigint',
@@ -173,6 +214,10 @@ export async function addGrant(
     })
     return { inserted: true, row }
   })
+  // 0144:trigger 已在同事务 bump epoch(即使 inserted=false 的 ON CONFLICT DO NOTHING
+  // 路径没触发 trigger,收敛也无害:快照本就该是最新的)。
+  if (out.inserted) await convergeCatalogSnapshotAfterGrantWrite()
+  return out
 }
 
 /**
@@ -192,7 +237,7 @@ export async function removeGrant(
 ): Promise<{ deleted: boolean }> {
   const uid = normalizeUserId(userId)
   const mid = normalizeModelId(modelId)
-  return tx(async (client: PoolClient) => {
+  const out = await tx(async (client: PoolClient) => {
     const before = await client.query<ModelGrantRowView>(
       `SELECT user_id::text       AS user_id,
               model_id,
@@ -222,4 +267,8 @@ export async function removeGrant(
     })
     return { deleted: true }
   })
+  // 撤权 = 安全收窄。epoch 已由 0144 trigger 在同事务 bump;这里等本进程快照站到新 epoch
+  // 上再返回 200 —— 之后到达的 turn 会在 bridge 的 grants fence 上被强制重载 + 重新判定。
+  if (out.deleted) await convergeCatalogSnapshotAfterGrantWrite()
+  return out
 }

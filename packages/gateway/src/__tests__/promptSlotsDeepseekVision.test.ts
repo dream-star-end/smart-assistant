@@ -7,6 +7,19 @@ import { buildAgentsSlot } from '../promptSlots.js'
 //    (shouldEnableOpenClaudeVision:纯文本静态模型 → 发;原生多模态 → 不发)。
 //  - 提示文案从 `understand_image` MCP 工具改成 `oc-vision understand` CLI。
 describe('buildAgentsSlot 纯文本模型 vision hint(oc-vision CLI)', () => {
+  it('动态 catalog 模型 supportsVision=false 也拿到 CLI 提示', async () => {
+    const slot = await buildAgentsSlot({
+      agentId: 'main', provider: 'dynamic', model: 'dynamic-model', modelSupportsVision: false,
+    })
+    assert.match(slot.content, /oc-vision understand/)
+  })
+
+  it('catalog supportsVision=true 覆盖 baked 纯文本表，不发 CLI 提示', async () => {
+    const slot = await buildAgentsSlot({
+      agentId: 'main', provider: 'deepseek', model: 'deepseek-v4-pro', modelSupportsVision: true,
+    })
+    assert.doesNotMatch(slot.content, /当前模型按纯文本接入、看不到图/)
+  })
   it('deepseek(纯文本静态)给 oc-vision 图片理解提示', async () => {
     const slot = await buildAgentsSlot({
       agentId: 'main',

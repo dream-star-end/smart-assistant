@@ -57,6 +57,16 @@ import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 import { _resetAgentMultiplierCacheForTests } from "../billing/agentMultiplier.js";
 import { deriveEngineSessionId } from "../billing/codexFinalizer.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
+import { AuthoritySigner } from "../ws/authoritySigner.js";
+import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
+import { ModelAuthorityConsumer, buildContainerAttestFrame } from "@openclaude/gateway";
+import { MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
+import {
+  ModelCatalogSnapshot,
+  type ModelCatalogCache,
+  type ModelCatalogEntry,
+  type ModelCatalogPricing,
+} from "../billing/modelCatalog.js";
 
 const JWT_SECRET = "x".repeat(32);
 
@@ -244,6 +254,61 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
   return { pool: fakePool as Pool, queries, journalRows };
 }
 
+// ---------- 模型执行权威夹具(签发边界 epoch 重读 / journal 补偿用) ----------
+
+/** 快照 epoch;签发边界重读到别的值 = turn 途中发生了安全写 → 必须整单放弃。 */
+const AUTH_EPOCH = 42n;
+
+/** 只含本套件用的 codex 模型(gpt-5.6-sol),engine=codex → 走 codex 计费编排。 */
+function fakeAuthorityCatalog(): ModelCatalogCache {
+  const entries: ModelCatalogEntry[] = [
+    {
+      entryId: 1,
+      modelId: "gpt-5.6-sol",
+      engine: "codex",
+      providerId: "codex",
+      upstreamModelId: null,
+      contextWindow: 400_000,
+      capabilityProfile: {
+        supportsVision: true,
+        reasoning: { supported: ["medium", "xhigh"], codexModelDefault: "xhigh" },
+        ccb: { capabilityZero: false, supportsThinking: false },
+      },
+      capabilitySchemaVersion: 1,
+      state: "active",
+      lockVersion: 1,
+    } as ModelCatalogEntry,
+  ];
+  const pricing = new Map<string, ModelCatalogPricing>([
+    [
+      "gpt-5.6-sol",
+      {
+        modelId: "gpt-5.6-sol",
+        displayName: "GPT 5.6",
+        inputPerMtok: 1000n,
+        outputPerMtok: 5000n,
+        cacheReadPerMtok: 100n,
+        cacheWritePerMtok: 500n,
+        multiplier: "1.000",
+        visibility: "public",
+        sortOrder: 0,
+        defaultEffort: null,
+      },
+    ],
+  ]);
+  const snapshot = new ModelCatalogSnapshot({
+    entries,
+    aliases: new Map(),
+    pricing,
+    securityEpoch: AUTH_EPOCH,
+  });
+  return {
+    peek: () => snapshot,
+    current: () => snapshot,
+    assertFresh: async () => snapshot,
+  } as unknown as ModelCatalogCache;
+}
+
 // ---------- Rig with billing deps ------------------------------------------
 
 interface BillingRig {
@@ -257,6 +322,8 @@ interface BillingRig {
   preCheckRedis: InMemoryPreCheckRedis;
   pricing: PricingCache;
   binding: { acquireCalls: number; releaseCalls: number; acquireGroupIds: Array<string | null | undefined> };
+  /** 模型执行权威(仅 modelAuthority:true 的 rig 有);epochAtSign 可中途改 = 模拟 admin 安全写。 */
+  authority?: { signer: AuthoritySigner; epochAtSign: { value: bigint } };
 }
 
 // CG2c — 测试用最小 logger,记 fields(含 child 累计 bindings)。
@@ -303,13 +370,36 @@ async function startRig(opts: {
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   // P0 跨桥修复 — displacement 用例把 per-user 连接上限压到 1,新连接必踢旧桥。
   maxPerUser?: number;
+  /**
+   * 模型执行权威(flag 开)。开了之后:容器必须 attest(rig 用**真 gateway 代码**发帧),
+   * 每条 inbound 注入签名 envelope,且**签发边界重读 epoch**(MAJOR-2)。
+   */
+  modelAuthority?: boolean;
 } = {}): Promise<BillingRig> {
+  // 模型执行权威装配(flag 关 → 全部 undefined,rig 行为与本批次之前完全一致)
+  const authoritySigner = opts.modelAuthority === true ? AuthoritySigner.createEphemeral() : null;
+  const epochAtSign = { value: AUTH_EPOCH };
+
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
   const containerWss = new WebSocketServer({ port: 0 });
   await new Promise<void>((r) => containerWss.once("listening", () => r()));
   const containerPort = (containerWss.address() as { port: number }).port;
-  containerWss.on("connection", (ws) => { containerSockets.push(ws); });
+  containerWss.on("connection", (ws) => {
+    containerSockets.push(ws);
+    if (authoritySigner !== null) {
+      // 真容器行为:连上就 attest(keyring = master 注入的公钥 ring)。
+      const consumer = new ModelAuthorityConsumer({
+        keyring: authoritySigner.publicKeyring(),
+        containerId: 999,
+        uid: 11,
+        required: true,
+      });
+      ws.send(
+        JSON.stringify(buildContainerAttestFrame(consumer, consumer.newConnection(), 999)),
+      );
+    }
+  });
 
   // billing deps
   const poolCtrl = makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits });
@@ -359,6 +449,18 @@ async function startRig(opts: {
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
     maxPerUser: opts.maxPerUser,
+    ...(authoritySigner !== null
+      ? {
+          modelAuthority: {
+            signer: authoritySigner,
+            catalog: fakeAuthorityCatalog(),
+            census: new AuthorityKeyCensus(),
+            // **签发边界**的 epoch 直读(MAJOR-2)。默认 = 快照 epoch(无安全写);
+            // 用例把它改掉 = turn 途中 admin 禁用/撤销/改价 → 签发前必须拒 + 补偿。
+            readSecurityEpoch: async () => epochAtSign.value,
+          },
+        }
+      : {}),
   });
 
   const gateway = http.createServer((_, res) => res.end());
@@ -373,6 +475,7 @@ async function startRig(opts: {
     containerWss, containerPort, containerSockets,
     poolCtrl, preCheckRedis, pricing,
     binding: bindingState,
+    ...(authoritySigner !== null ? { authority: { signer: authoritySigner, epochAtSign } } : {}),
   };
 }
 
@@ -1051,18 +1154,21 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
   let rig: BillingRig;
   before(async () => {
     process.env.DRAIN_BILLING_MS = "200";
-    rig = await startRig({ userBalance: 1_000_000n });
+    rig = await startRig({ userBalance: 1_000_000n, modelAuthority: true });
   });
   after(async () => {
     delete process.env.DRAIN_BILLING_MS;
     await stopRig(rig);
   });
-  beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    rig.pricing._setForTests([PRICING]);
+  });
 
   test("旧桥 drain 超时关闭 → 新桥收 billing 帧 → journal 回查 settle + cost_charged 广播(duplicate 帧防重)", async () => {
     // ── turn 在桥 1 开启 ──
     const container1P = waitNextContainerSocket(rig);
-    const token = await makeJwt("41");
+    const token = await makeJwt("11");
     const ws1 = openClient(rig.gatewayPort, token);
     await waitOpen(ws1);
     const container1 = await container1P;
@@ -1075,6 +1181,16 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     assert.match(serverReqId, /^[0-9a-f]{32}$/);
     // journal ctx 必须已带 traceId(跨桥 settle 的 trace 贯穿依赖)
     assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.ctx.traceId, turnTraceId);
+    assert.deepEqual(rig.poolCtrl.journalRows.get(serverReqId)?.ctx.billingPricing, {
+      v: 1,
+      modelId: "gpt-5.6-sol",
+      displayName: "GPT 5.6",
+      inputPerMtok: "1000",
+      outputPerMtok: "5000",
+      cacheReadPerMtok: "100",
+      cacheWritePerMtok: "500",
+      multiplier: "1.000",
+    });
 
     // ── 用户断线,旧桥 drain 超时收尾(billing 帧尚未产生)──
     ws1.close();
@@ -1087,6 +1203,14 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     const ws2 = openClient(rig.gatewayPort, token);
     await waitOpen(ws2);
     const container2 = await container2P;
+
+    // 模拟 journal 开笔后异步 PricingCache 已切到另一代价格。跨桥 settle 必须仍用
+    // journal 中与 authority snapshot 同代的 5000/1.000，而不是这份 1/0.001。
+    rig.pricing._setForTests([{
+      ...PRICING,
+      output_per_mtok: 1n,
+      multiplier: "0.001",
+    }]);
 
     // ── 容器跑完 turn,billing 帧到达**新桥**(发两次:duplicate 防重一并验证)──
     const billing = JSON.stringify({
@@ -1115,9 +1239,183 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     // settle 口径与主路径一致:session_id = 帧 engineSessionId,account_id NULL
     assert.equal(usageInserts(rig)[0]!.params?.[2], null);
     assert.equal(usageInserts(rig)[0]!.params?.[10], ENGINE_SID);
+    const settledPrice = JSON.parse(String(usageInserts(rig)[0]!.params?.[8])) as Record<string, unknown>;
+    assert.equal(settledPrice.output_per_mtok, "5000");
+    assert.equal(settledPrice.multiplier, "1.000");
+    assert.equal(usageInserts(rig)[0]!.params?.[9], "2", "must settle with persisted authority price");
     // journal 权威终态 committed
     assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "committed");
 
+    ws2.close();
+  });
+
+  test("authority journal 的精确定价缺失/畸形 → 跨桥恢复免单，不回退 PricingCache", async () => {
+    const usageBefore = usageInserts(rig).length;
+    const container1P = waitNextContainerSocket(rig);
+    const token = await makeJwt("11");
+    const ws1 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws1);
+    const container1 = await container1P;
+    ws1.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
+    }));
+    const forwarded = JSON.parse(
+      (await waitContainerNextFrame(container1)).data,
+    ) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    const journal = rig.poolCtrl.journalRows.get(requestId)!;
+    journal.ctx.billingPricing = {
+      ...(journal.ctx.billingPricing as Record<string, unknown>),
+      outputPerMtok: "-1",
+    };
+
+    ws1.close();
+    assert.equal(await waitContainerClose(container1, 2_000), true);
+
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws2);
+    const container2 = await container2P;
+    container2.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+
+    await waitUntil(() => rig.poolCtrl.journalRows.get(requestId)?.state === "aborted");
+    assert.equal(
+      rig.poolCtrl.journalRows.get(requestId)?.error_msg,
+      "cross_bridge_authority_billing_pricing_invalid",
+    );
+    assert.equal(usageInserts(rig).length, usageBefore, "invalid persisted authority price must not settle");
+    await assert.rejects(
+      () => waitJsonFrameOfType(ws2, "outbound.cost_charged", 200),
+      /timeout/i,
+    );
+    ws2.close();
+  });
+
+  test("flag 开启后仍按持久分类恢复上线前 legacy journal，并仅对完全缺失价格字段回退 cache", async () => {
+    const usageBefore = usageInserts(rig).length;
+    const container1P = waitNextContainerSocket(rig);
+    const token = await makeJwt("11");
+    const ws1 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws1);
+    const container1 = await container1P;
+    ws1.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
+    }));
+    const forwarded = JSON.parse(
+      (await waitContainerNextFrame(container1)).data,
+    ) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    const journal = rig.poolCtrl.journalRows.get(requestId)!;
+    // 模拟本版本部署前写下的 legacy inflight 行：没有 authority 分类/绑定，也没有
+    // 新增的 server-owned billingPricing。接收帧的新 bridge 此时 authority flag 已开。
+    for (const key of [
+      "authorityKind",
+      "authorityTurnId",
+      "billingRequestId",
+      "executionRevision",
+      "billingRevision",
+      "securityEpoch",
+      "billingPricing",
+    ]) {
+      delete journal.ctx[key];
+    }
+
+    ws1.close();
+    assert.equal(await waitContainerClose(container1, 2_000), true);
+
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws2);
+    const container2 = await container2P;
+    container2.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+
+    const cost = await waitJsonFrameOfType(ws2, "outbound.cost_charged");
+    assert.equal(cost.requestId, requestId);
+    assert.equal(rig.poolCtrl.journalRows.get(requestId)?.state, "committed");
+    assert.equal(usageInserts(rig).length, usageBefore + 1);
+    ws2.close();
+  });
+});
+
+describe("userChatBridge / codex billing — P0 authority journal 跨 flag 关闭恢复", () => {
+  let rig: BillingRig;
+  before(async () => {
+    process.env.DRAIN_BILLING_MS = "200";
+    rig = await startRig({ userBalance: 1_000_000n });
+  });
+  after(async () => {
+    delete process.env.DRAIN_BILLING_MS;
+    await stopRig(rig);
+  });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    rig.pricing._setForTests([PRICING]);
+  });
+
+  test("flag 关闭后仍按持久分类校验 authority journal，坏快照免单且不回退 cache", async () => {
+    const usageBefore = usageInserts(rig).length;
+    const container1P = waitNextContainerSocket(rig);
+    const token = await makeJwt("12");
+    const ws1 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws1);
+    const container1 = await container1P;
+    ws1.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
+    }));
+    const forwarded = JSON.parse(
+      (await waitContainerNextFrame(container1)).data,
+    ) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    const journal = rig.poolCtrl.journalRows.get(requestId)!;
+    // 模拟 flag 打开时已写入、随后跨重启由 flag-off bridge 接收 billing 的 authority 行。
+    journal.ctx.authorityKind = "bridge_signed";
+    journal.ctx.authorityTurnId = "1".repeat(32);
+    journal.ctx.billingRequestId = requestId;
+    journal.ctx.executionRevision = "a".repeat(64);
+    journal.ctx.billingRevision = "b".repeat(64);
+    journal.ctx.securityEpoch = "42";
+    journal.ctx.billingPricing = {
+      ...(journal.ctx.billingPricing as Record<string, unknown>),
+      outputPerMtok: "-1",
+    };
+
+    ws1.close();
+    assert.equal(await waitContainerClose(container1, 2_000), true);
+
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws2);
+    const container2 = await container2P;
+    container2.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+
+    await waitUntil(() => rig.poolCtrl.journalRows.get(requestId)?.state === "aborted");
+    assert.equal(
+      rig.poolCtrl.journalRows.get(requestId)?.error_msg,
+      "cross_bridge_authority_billing_pricing_invalid",
+    );
+    assert.equal(usageInserts(rig).length, usageBefore);
+    await assert.rejects(
+      () => waitJsonFrameOfType(ws2, "outbound.cost_charged", 200),
+      /timeout/i,
+    );
     ws2.close();
   });
 });
@@ -2229,5 +2527,143 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     } finally {
       await stopRig(rig);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 代码审 R1 MAJOR-2 —— 签发边界 epoch 重读 + journal 补偿
+//
+// 起手 fence(resolveTurnExecution)之后,codex turn 还要走 route → acquire →
+// getAgentCostMultiplier → preCheck → startInflightJournal → 历史装配 一连串 await。
+// 安全写(admin 禁用模型 / 撤销授权 / 改价 → bump epoch)完全可能落在这中间。
+// 只 fence 一次的实现会:**照样开 journal、照样按旧价签出 lease 50min 的票**。
+//
+// 本组测试锁死的不变量:签之前重读 epoch,不一致就整单放弃 —— 且**不留悬空 journal**
+// (悬空 = 要等 reconciler 30min 才终态化,期间对账口径是错的)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("userChatBridge / 模型执行权威 — 签发边界 epoch 重读(MAJOR-2)", () => {
+  let rig: BillingRig;
+  before(async () => { rig = await startRig({ modelAuthority: true }); });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    rig.poolCtrl.queries.length = 0;
+    rig.poolCtrl.journalRows.clear();
+    rig.binding.acquireCalls = 0;
+    rig.binding.releaseCalls = 0;
+    rig.authority!.epochAtSign.value = AUTH_EPOCH;
+    rig.pricing._setForTests([PRICING]);
+  });
+
+  test("epoch 未变 → 正常签发:envelope 注入 + journal 保持 inflight", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    // 异步 legacy cache 故意放一份完全不同的价格；authority turn 必须无视它。
+    rig.pricing._setForTests([{
+      ...PRICING,
+      input_per_mtok: 1n,
+      output_per_mtok: 2n,
+      multiplier: "0.001",
+    }]);
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-ok", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "hi" }, ts: Date.now(),
+    }));
+
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.equal(forwarded.type, "inbound.message");
+    assert.ok(forwarded[MODEL_AUTHORITY_FIELD], "epoch 没变就该签票");
+    const rows = [...rig.poolCtrl.journalRows.values()];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].state, "inflight", "正常 turn 的 journal 留 inflight 等 settle");
+    assert.deepEqual(rows[0].ctx.billingPricing, {
+      v: 1,
+      modelId: "gpt-5.6-sol",
+      displayName: "GPT 5.6",
+      inputPerMtok: "1000",
+      outputPerMtok: "5000",
+      cacheReadPerMtok: "100",
+      cacheWritePerMtok: "500",
+      multiplier: "1.000",
+    });
+    assert.match(String(rows[0].ctx.billingRevision), /^[0-9a-f]{64}$/);
+    ws.close();
+  });
+
+  test("journal 开了之后 epoch 变了 → 拒帧 + **journal 关闭(aborted)** + 还槽 + 不转发", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    const containerFrames: string[] = [];
+    containerWs.on("message", (d) => containerFrames.push(String(d)));
+
+    // admin 在 turn 途中禁用了这个模型 / 撤销了授权 / 改了价 → DB epoch 前进。
+    rig.authority!.epochAtSign.value = AUTH_EPOCH + 1n;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-epoch", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "hi" }, ts: Date.now(),
+    }));
+
+    const err = await waitJsonFrameOfType(ws, "error", 3000);
+    assert.equal(err.code, "MODEL_CONFIG_CHANGED_RETRY_TURN");
+
+    // ① journal 必须被**补偿关闭** —— 悬空 inflight = 漏账/错账(reconciler 30min 才兜底)
+    const rows = [...rig.poolCtrl.journalRows.values()];
+    assert.equal(rows.length, 1, "journal 已经开过(证明拒帧发生在 journal 之后)");
+    assert.equal(rows[0].state, "aborted", "epoch 变了必须 abort journal,绝不留悬空 inflight");
+    assert.match(String(rows[0].error_msg), /sign_boundary_epoch_changed/);
+
+    // ② 不扣费:没有任何 usage_records 落笔
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /INSERT INTO usage_records/i.test(q.sql)),
+      false,
+      "拒帧的 turn 不许产生扣费记录",
+    );
+
+    // ③ codex 槽还回去(否则该用户后续 codex turn 全被单飞门挡住)
+    assert.equal(rig.binding.acquireCalls, 1);
+    assert.equal(rig.binding.releaseCalls, 1, "拒帧必须还槽");
+
+    // ④ 帧绝不进容器(既不带 envelope 转发,也不降级为无 envelope 转发)
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(
+      containerFrames.some((s) => s.includes("inbound.message")),
+      false,
+      "epoch 变了就不许把这条 turn 送进容器",
+    );
+    ws.close();
+  });
+
+  test("补偿后用户可重开 turn:下一条(epoch 已稳定)照常计费转发", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    rig.authority!.epochAtSign.value = AUTH_EPOCH + 1n;
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-retry", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "one" }, ts: Date.now(),
+    }));
+    const err = await waitJsonFrameOfType(ws, "error", 3000);
+    assert.equal(err.code, "MODEL_CONFIG_CHANGED_RETRY_TURN");
+
+    // 管理员的变更已被快照吸收(生产里 = NOTIFY 重建;这里直接把两边对齐)
+    rig.authority!.epochAtSign.value = AUTH_EPOCH;
+    ws.send(JSON.stringify({
+      type: "inbound.message", channel: "webchat", peer: { id: "p-retry", kind: "dm" },
+      agentId: "codex", model: "gpt-5.6-sol", content: { text: "two" }, ts: Date.now(),
+    }));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.ok(forwarded[MODEL_AUTHORITY_FIELD], "重开的 turn 必须能正常签发(单飞槽已释放)");
+    // 前一轮 aborted + 本轮 inflight,两行互不干扰
+    const states = [...rig.poolCtrl.journalRows.values()].map((r) => r.state).sort();
+    assert.deepEqual(states, ["aborted", "inflight"]);
+    ws.close();
   });
 });
