@@ -28,6 +28,8 @@ import {
   type ResolveResp,
   type SuppressedConditionRow,
   type SuppressedConditionsResp,
+  type UserNoticeApprovalResp,
+  type UserNoticeProposalRow,
 } from "./types";
 
 type BadgeTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info";
@@ -56,10 +58,10 @@ const STATUS_OPTS: { label: string; value: "" | IncidentStatus }[] = [
  */
 const RESOLVE_TOAST: Record<string, string> = {
   suppressed_until_clear: "已压制该检测项并标记恢复；检测真实恢复后压制自动解除",
-  condition_closed: "已关闭检测项并标记恢复，恢复通知将下发",
+  condition_closed: "已关闭检测项并标记恢复；不会因此直接向用户发通知",
   condition_already_clear: "检测项已恢复，事故已标记恢复",
 };
-const RESOLVE_TOAST_FALLBACK = "已标记为已恢复，恢复通知将下发";
+const RESOLVE_TOAST_FALLBACK = "已标记为已恢复；不会因此直接向用户发通知";
 
 /** repair 状态 → 徽标色（未知回落 neutral）。 */
 const REPAIR_STATUS_TONE: Record<string, BadgeTone> = {
@@ -377,10 +379,15 @@ export default function SelfhealPage() {
     () => adminGet("/selfheal/conditions", { suppressed: 1 }),
     { intervalMs: POLL_MS },
   );
+  const { data: noticeData, error: noticeError, loading: noticeLoading } =
+    useAdminPoll<UserNoticeApprovalResp>(() => adminGet("/selfheal/user-notices"), {
+      intervalMs: POLL_MS,
+    });
 
   const incidents = data?.incidents ?? [];
   const canLoadMore = !!data?.nextBeforeId && limit < MAX_LIMIT;
   const suppressedRows = suppressedData?.items ?? [];
+  const noticeRows = noticeData?.proposals ?? [];
 
   // 列表刷新后同步弹窗选中行的状态（如已被后台标记 resolved，footer 的 resolve 钮随之禁用）。
   useEffect(() => {
@@ -395,7 +402,7 @@ export default function SelfhealPage() {
       title: "手动标记为已恢复？",
       body: (
         <span className="text-[13px] text-muted">
-          将向受影响用户推送恢复通知，并结束该事故。仅在确认异常已消除时操作。
+          只结束事故，不会直接向任何用户推送通知。用户恢复通知必须另行通过精确影响证据和企业微信审批。
         </span>
       ),
       confirmText: "标记已恢复",
@@ -488,6 +495,14 @@ export default function SelfhealPage() {
         </Button>
       ),
     },
+  ];
+
+  const noticeColumns: Column<UserNoticeProposalRow>[] = [
+    { key: "shortCode", title: "审批码", width: 96, render: (r) => <CopyChip value={r.shortCode} /> },
+    { key: "status", title: "状态", width: 92, render: (r) => <Badge tone={r.status === "sent" ? "success" : r.status === "pending" ? "warning" : "neutral"}>{r.status}</Badge> },
+    { key: "incidentId", title: "事故/修复", render: (r) => <span className="font-mono text-[12px]">#{r.incidentId} / #{r.repairId}</span> },
+    { key: "recipientCount", title: "冻结/实发", width: 100, render: (r) => <span>{r.recipientCount} / {r.sentRecipientCount ?? "—"}</span> },
+    { key: "createdAt", title: "创建时间", width: 96, render: (r) => <TimeAgo value={r.createdAt} /> },
   ];
 
   const columns: Column<IncidentRow>[] = [
@@ -598,6 +613,35 @@ export default function SelfhealPage() {
           </div>
         )}
       </div>
+
+      <SectionCard
+        title="用户恢复通知审批"
+        hint="仅真实失败且已全自动恢复的在线用户可进入冻结人群；企微同意后才定向发送"
+        bodyClassName="p-0"
+      >
+        <div className="border-b border-line px-4 py-3 text-[13px] text-muted">
+          {noticeData?.binding?.active ? (
+            <>审批人已绑定：{noticeData.binding.boundIdentity ?? "已绑定"}</>
+          ) : noticeData?.binding ? (
+            <>请在企业微信发送 <CopyChip value={`绑定审批 ${noticeData.binding.bindingCode}`} /> 完成唯一审批人绑定。</>
+          ) : (
+            <>等待可用的企业微信智能机器人通道。</>
+          )}
+        </div>
+        {noticeError ? (
+          <div className="px-4 py-3 text-[13px] text-danger">加载用户通知审批状态失败：{apiErrorMessage(noticeError, "请求失败")}</div>
+        ) : (
+          <DataTable
+            columns={noticeColumns}
+            rows={noticeRows}
+            rowKey={(r) => r.id}
+            loading={noticeLoading && noticeRows.length === 0}
+            emptyTitle="暂无用户通知审批"
+            emptyHint="默认不发用户告警；只有可信自动恢复与真实影响证据闭合后才会出现审批单。"
+            className="rounded-none border-0"
+          />
+        )}
+      </SectionCard>
 
       {/* 已压制的 conditions(H1b suppression 审计面:压制中 = 不投影/不派修,
           真实恢复自动解除;误压可在此手动解除)。 */}

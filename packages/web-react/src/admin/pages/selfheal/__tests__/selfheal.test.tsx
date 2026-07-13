@@ -74,6 +74,10 @@ let detail: IncidentDetailResp = detailWith([]);
 function routeGet(path: string): Promise<unknown> {
   if (path === "/selfheal/incidents") return Promise.resolve({ incidents: [INC] });
   if (path === "/selfheal/conditions") return Promise.resolve({ items: SUPPRESSED });
+  if (path === "/selfheal/user-notices") return Promise.resolve({
+    binding: { channelId: "5", bindingCode: "A1B2C3D4", active: false, boundIdentity: null, boundAt: null },
+    proposals: [],
+  });
   if (path.startsWith("/selfheal/incidents/")) return Promise.resolve(detail);
   return Promise.resolve({});
 }
@@ -128,7 +132,7 @@ describe("resolve 的 mode-aware toast 文案", () => {
     },
     {
       resolution: "condition_closed",
-      toastText: "已关闭检测项并标记恢复，恢复通知将下发",
+      toastText: "已关闭检测项并标记恢复；不会因此直接向用户发通知",
     },
     {
       resolution: "condition_already_clear",
@@ -156,7 +160,7 @@ describe("resolve 的 mode-aware toast 文案", () => {
     fireEvent.click(screen.getByRole("button", { name: "标记恢复" }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "标记已恢复" }));
-    expect(await screen.findByText("已标记为已恢复，恢复通知将下发")).toBeTruthy();
+    expect(await screen.findByText("已标记为已恢复；不会因此直接向用户发通知")).toBeTruthy();
   });
 });
 

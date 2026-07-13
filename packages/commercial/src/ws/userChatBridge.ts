@@ -779,6 +779,8 @@ export interface UserChatBridgeHandler {
    * 的 key 口径)。返回实际发送成功的连接数。非 JSON-serializable 输入吞异常返 0,不抛。
    */
   broadcastToUsers(uids: string[], payload: unknown): number;
+  /** Return only requested users that currently own at least one OPEN user websocket. */
+  onlineUserSubset(uids: string[]): string[];
 }
 
 // ---------- 内部工具 --------------------------------------------------------
@@ -4093,7 +4095,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return sent;
   }
 
-  return { handleUpgrade, shutdown, registry, broadcastToUser, broadcastAll, broadcastToUsers };
+  function onlineUserSubset(uids: string[]): string[] {
+    const out: string[] = [];
+    for (const uid of new Set(uids)) {
+      const set = uidToUserWs.get(uid);
+      if (set && [...set].some((ws) => ws.readyState === WebSocket.OPEN)) out.push(uid);
+    }
+    return out;
+  }
+
+  return { handleUpgrade, shutdown, registry, broadcastToUser, broadcastAll, broadcastToUsers, onlineUserSubset };
 }
 
 // ---------- 测试 re-exports ------------------------------------------------

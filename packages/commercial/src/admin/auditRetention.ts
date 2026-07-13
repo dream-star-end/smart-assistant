@@ -47,6 +47,7 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
   { table: "rate_limit_events", column: "created_at", days: 30 },
+  { table: "selfheal_wecom_inbound_dedupe", column: "received_at", days: 90 },
   // P1#11:连接器写账本 90 天终态 retention 统一收口到这里(connectorSweeper 只做
   // 活跃→终态转换,不再自删)。谓词保证只删终态行——活跃态(pending/approved/executing)
   // 仍持 params 密文,绝不在此删除。
@@ -77,6 +78,9 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   "codex_repair_events",
   "incident_recipients",
   "incident_deliveries",
+  "selfheal_user_impact_evidence",
+  "selfheal_user_notice_proposals",
+  "selfheal_user_notice_recipients",
 ] as const;
 
 // 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。

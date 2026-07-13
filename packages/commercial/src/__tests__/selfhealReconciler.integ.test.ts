@@ -5,8 +5,7 @@
  *   - condition firing=true → open incident(severity=max(level, severity_floor))
  *   - 同 condition 再对账 → 不重开(幂等)
  *   - condition firing=false → resolve incident(source='probe',level-triggered 当前值对账)
- *   - open 建 ws+inbox(audience='all')durable delivery;sweeper 投递 + 标 sent + 幂等
- *   - inbox source 唯一键 (source_type,source_id,source_phase) 挡重复
+ *   - incident 生命周期绝不直接创建用户 delivery / inbox / 全员广播
  *   - condition.level 变(warning→critical)→ update incident severity + rev++
  *
  * pg 不可用时 skip(本机无 PG 时结构正确但不跑)。
@@ -163,8 +162,8 @@ describe("selfheal reconciler — open/resolve/idempotent projection", () => {
   });
 });
 
-describe("selfheal sweeper — durable delivery + 幂等", () => {
-  test("open 建 ws+inbox delivery;sweep 投递 + 标 sent + 幂等", async (t) => {
+describe("selfheal user notification exit is closed by default", () => {
+  test("open 不建 delivery;sweep 不广播且不写全员 inbox", async (t) => {
     if (skipIfNoPg(t)) return;
     await writeCondition(KEY, { mode: "probe", firing: true, level: "critical", snapshot: {} });
     await reconcileOnce(NOOP_DEPS);
@@ -172,9 +171,7 @@ describe("selfheal sweeper — durable delivery + 幂等", () => {
     const pend = await query<{ channel: string; phase: string; status: string }>(
       `SELECT channel, phase, status FROM incident_deliveries ORDER BY channel`,
     );
-    const channels = pend.rows.map((r) => r.channel).sort();
-    assert.deepEqual(channels, ["inbox", "ws"], "audience=all 建 ws + inbox delivery");
-    assert.ok(pend.rows.every((r) => r.status === "pending"));
+    assert.deepEqual(pend.rows, [], "incident lifecycle must not enqueue user notifications");
 
     const wsCalls: IncidentPayload[] = [];
     const deps = {
@@ -182,60 +179,26 @@ describe("selfheal sweeper — durable delivery + 幂等", () => {
       broadcastToUsers: () => 0,
     };
     const s1 = await sweepOnce(deps);
-    assert.equal(s1.ws, 1);
-    assert.equal(s1.inbox, 1);
-    assert.equal(wsCalls.length, 1);
-    assert.equal(wsCalls[0].type, "sys.incident");
-    assert.equal(wsCalls[0].status, "open");
-    assert.equal(wsCalls[0].severity, "critical");
-    assert.equal(typeof wsCalls[0].incidentId, "string");
+    assert.equal(s1.ws, 0);
+    assert.equal(s1.inbox, 0);
+    assert.equal(wsCalls.length, 0);
 
     // 全部 sent
     const sent = (await query<{ c: string }>(
       `SELECT COUNT(*)::text AS c FROM incident_deliveries WHERE status = 'sent'`,
     )).rows[0].c;
-    assert.equal(sent, "2");
+    assert.equal(sent, "0");
 
     // inbox 落一条 opened 广播
     const inbox = await query<{ audience: string; source_phase: string; level: string }>(
       `SELECT audience, source_phase, level FROM inbox_messages WHERE source_type = 'incident'`,
     );
-    assert.equal(inbox.rows.length, 1);
-    assert.equal(inbox.rows[0].audience, "all");
-    assert.equal(inbox.rows[0].source_phase, "opened");
-    assert.equal(inbox.rows[0].level, "warning");
+    assert.equal(inbox.rows.length, 0);
 
     // 再 sweep:无 pending → 无副作用(幂等)
     const s2 = await sweepOnce(deps);
     assert.equal(s2.ws, 0);
     assert.equal(s2.inbox, 0);
-    assert.equal(wsCalls.length, 1, "no re-broadcast");
-  });
-
-  test("inbox source 唯一键挡重复(同 source_phase 只一条)", async (t) => {
-    if (skipIfNoPg(t)) return;
-    await writeCondition(KEY, { mode: "probe", firing: true, level: "critical", snapshot: {} });
-    await reconcileOnce(NOOP_DEPS);
-    const inc = await activeIncidentFor(KEY);
-    assert.ok(inc);
-
-    const deps = { broadcastAll: () => 1, broadcastToUsers: () => 0 };
-    await sweepOnce(deps); // 投递 opened(rev1)inbox 一条
-
-    // 人造第二条 inbox delivery(同 incident,不同 rev,phase='opened')→ sweep 应被 inbox 唯一键挡
-    await query(
-      `INSERT INTO incident_deliveries (incident_id, incident_rev, channel, phase, status)
-       VALUES ($1::bigint, 999, 'inbox', 'opened', 'pending')`,
-      [inc.id],
-    );
-    const s = await sweepOnce(deps);
-    assert.equal(s.inbox, 1, "claimed + processed the injected delivery");
-
-    const cnt = (await query<{ c: string }>(
-      `SELECT COUNT(*)::text AS c FROM inbox_messages
-        WHERE source_type='incident' AND source_id=$1::bigint AND source_phase='opened'`,
-      [inc.id],
-    )).rows[0].c;
-    assert.equal(cnt, "1", "inbox source 唯一键:同 (incident,phase) 仍只一条");
+    assert.equal(wsCalls.length, 0, "no re-broadcast");
   });
 });

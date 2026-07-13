@@ -6,7 +6,8 @@
     "0134_sessions_master_pg",
     "0133_selfheal_incidents",
     "0134_selfheal_condition_concurrency",
-    "0135_selfheal_hardening"
+    "0135_selfheal_hardening",
+    "0137_selfheal_user_notice_approval"
   ],
   "capabilities": [
     "sessions-store-pg-v1"
