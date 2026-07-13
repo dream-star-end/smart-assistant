@@ -185,7 +185,7 @@ function DoneScreen({ onAgain, connector = false }: { onAgain: () => void; conne
       <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
       <p className="max-w-sm text-[12.5px] text-muted">
         {connector
-          ? "连接器不会自动批准；管理员会核对实际网络与读写范围，并用隔离账号完成功能验收。审核进度可在「我的发布」查看。"
+          ? "连接器会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度可在「我的发布」查看。"
           : "AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。审核进度可随时回到本页「我的发布」查看。"}
       </p>
       <Button variant="secondary" size="sm" onClick={onAgain}>
@@ -206,7 +206,7 @@ export function PublishPanel({
 }: {
   auth: AuthSession;
   /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
-  onCreateInChat?: (kind: "skill" | "agent") => void;
+  onCreateInChat?: (kind: "skill" | "agent" | "connector") => void;
 }) {
   const [kind, setKind] = useState<"skill" | "agent" | "connector">("skill");
   const [publishReload, setPublishReload] = useState(0);
@@ -232,7 +232,7 @@ export function PublishPanel({
         ))}
       </div>
 
-      {onCreateInChat && kind !== "connector" && (
+      {onCreateInChat && (
         <button
           type="button"
           onClick={() => onCreateInChat(kind)}
@@ -243,10 +243,12 @@ export function PublishPanel({
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[13.5px] font-semibold text-fg">
-              在对话中创建{kind === "skill" ? "技能" : "智能体"}(推荐)
+              在对话中创建
+              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : "连接器"}(推荐)
             </span>
             <span className="mt-0.5 block text-[12px] leading-snug text-muted">
-              回答几个选择题,AI 帮你完成起草、创建{kind === "skill" ? "、评测用例" : "和发布"}
+              回答几个选择题,AI 帮你完成起草、创建
+              {kind === "skill" ? "、评测用例" : kind === "agent" ? "和发布" : "技术声明、安全决策和发布"}
               —— 无需了解格式规范。
             </span>
           </span>
@@ -1031,9 +1033,9 @@ function ConnectorPublishForm({
   if (ok) return <DoneScreen connector onAgain={reset} />;
   return (
     <div className="flex flex-col gap-3.5">
-      <Alert tone="info" title="技术发布 · 人工审核">
-        发布者填写的安全决策只是审核建议。平台管理员会重新确认允许的网络来源与每个动作的读写效果，
-        并用隔离账号完成真实功能验收后签名上架。OAuth2 社区连接器必须使用 BYOA。
+      <Alert tone="info" title="技术发布 · AI 自动审核">
+        发布者填写的安全决策只是审核建议。AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
+        通过后编译并签名上架，用户绑定时再由身份探针验证真实凭据；不确定或高风险项转人工复核。OAuth2 社区连接器必须使用 BYOA。
       </Alert>
       {err && <Alert tone="danger">{err}</Alert>}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -1072,7 +1074,7 @@ function ConnectorPublishForm({
       <div className="flex justify-end">
         <Button variant="primary" onClick={() => void submit()} disabled={submitting}>
           {submitting && <Loader2 size={14} className="animate-spin" />}
-          提交人工审核
+          提交 AI 审核
         </Button>
       </div>
     </div>

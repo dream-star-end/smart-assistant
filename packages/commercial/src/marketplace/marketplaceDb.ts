@@ -1,6 +1,7 @@
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
 import {
+  isAcceptedFunctionalVerificationState,
   listVerifiedContractsWithMeta,
   loadVerifiedContractWithMeta,
 } from '../connectors/spec/review.js'
@@ -886,7 +887,7 @@ export async function listApprovedForSearch(
       WHERE l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (
               v.security_review_state = 'security_approved'
-              AND v.functional_verify_state = 'verified'
+              AND v.functional_verify_state IN ('verified','declarative_verified')
               AND v.exec_revoked_at IS NULL
             ))
             AND ($1::text IS NULL OR l.kind = $1)
@@ -1055,7 +1056,7 @@ export async function getListingDetail(
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (
               v.security_review_state = 'security_approved'
-              AND v.functional_verify_state = 'verified'
+              AND v.functional_verify_state IN ('verified','declarative_verified')
               AND v.exec_revoked_at IS NULL
             ))
             AND ${orgVisibleFrag('l', 2)}`,
@@ -1171,7 +1172,7 @@ export async function installApprovedVersion(args: {
         throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
       if (
         version.securityReviewState !== 'security_approved' ||
-        version.functionalVerifyState !== 'verified' ||
+        !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
         version.execRevokedAt !== null
       ) {
         throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')
@@ -1273,7 +1274,7 @@ export async function getInstallableVersionTarget(
       throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
     if (
       row.security_review_state !== 'security_approved' ||
-      row.functional_verify_state !== 'verified' ||
+      !isAcceptedFunctionalVerificationState(row.functional_verify_state) ||
       row.exec_revoked_at !== null
     )
       throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')

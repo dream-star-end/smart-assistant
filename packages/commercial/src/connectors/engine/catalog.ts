@@ -11,7 +11,11 @@ import {
   isDefaultConnectorArtifact,
 } from '../defaults/index.js'
 import { listPlatformOauthAppSlugs } from '../platformOauthApps.js'
-import { type VerifiedContract, loadVerifiedContractWithMeta } from '../spec/review.js'
+import {
+  type VerifiedContract,
+  isAcceptedFunctionalVerificationState,
+  loadVerifiedContractWithMeta,
+} from '../spec/review.js'
 import { listDeclarativeConnections } from './binding.js'
 import { oauth2ClientProvisioning, requiredBindSources } from './credentialBag.js'
 
@@ -67,7 +71,7 @@ export async function listDeclarativeCatalog(
         AND v.status = 'approved'
         AND l.current_approved_version_id = v.id
         AND v.security_review_state = 'security_approved'
-        AND v.functional_verify_state = 'verified'
+        AND v.functional_verify_state IN ('verified','declarative_verified')
         AND v.exec_revoked_at IS NULL
         AND (
           EXISTS (
@@ -211,7 +215,7 @@ export async function listDeclarativeManagement(
       row.state === 'active' &&
       row.latest_status === 'approved' &&
       row.latest_security_state === 'security_approved' &&
-      row.latest_functional_state === 'verified' &&
+      isAcceptedFunctionalVerificationState(row.latest_functional_state ?? '') &&
       row.latest_exec_revoked_at === null
     let verifiedContract: CatalogEntry | null = null
     let verifiedLatest = false

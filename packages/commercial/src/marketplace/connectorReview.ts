@@ -1,8 +1,9 @@
-/** 原子连接器审核：安全编译/签名、功能验收、市场上架在同一事务提交。 */
+/** 原子连接器审核：安全编译/签名、功能验证方式留痕、市场上架在同一事务提交。 */
 import type { Pool, PoolClient } from 'pg'
 import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import {
+  markDeclarativeVerifiedWithRunner,
   markFunctionalVerifiedWithRunner,
   securityApproveWithRunner,
 } from '../connectors/spec/review.js'
@@ -11,6 +12,56 @@ import { getPool } from '../db/index.js'
 import { type QueryRunner, tx } from '../db/queries.js'
 import { lockMarketplaceListing, lockMarketplaceVersion } from './locking.js'
 import { MarketplaceError } from './marketplaceDb.js'
+
+export const AI_CONNECTOR_REVIEWER_EMAIL = 'marketplace-ai-reviewer@users.claudeai.chat'
+export const AI_CONNECTOR_REVIEWER_PASSWORD_SENTINEL =
+  '!openclaude-system-principal:marketplace-ai-reviewer:v1!'
+
+/**
+ * 连接器 AI 审核需要 active-admin FK 才能写既有安全/功能审计表。该主体不可登录：
+ * 合成域禁止密码重置，password_hash 是刻意无效的非 Argon2 sentinel，且不允许存在
+ * OAuth identity 或有效 refresh token。冲突时只 fail-closed，绝不接管/提权已有账号。
+ */
+export async function ensureAiConnectorReviewer(pool: Pool = getPool()): Promise<number> {
+  await pool.query(
+    `INSERT INTO users(email, password_hash, email_verified, role, status)
+       VALUES ($1, $2, TRUE, 'admin', 'active')
+     ON CONFLICT (email) DO NOTHING`,
+    [AI_CONNECTOR_REVIEWER_EMAIL, AI_CONNECTOR_REVIEWER_PASSWORD_SENTINEL],
+  )
+  const r = await pool.query<{
+    id: string
+    email: string
+    password_hash: string
+    email_verified: boolean
+    role: string
+    status: string
+    has_oauth_identity: boolean
+    has_active_refresh: boolean
+  }>(
+    `SELECT u.id::text AS id, u.email, u.password_hash, u.email_verified, u.role, u.status,
+            EXISTS(SELECT 1 FROM oauth_identities oi WHERE oi.user_id = u.id) AS has_oauth_identity,
+            EXISTS(SELECT 1 FROM refresh_tokens rt
+                    WHERE rt.user_id = u.id AND rt.revoked_at IS NULL AND rt.expires_at > NOW())
+              AS has_active_refresh
+       FROM users u WHERE u.email = $1`,
+    [AI_CONNECTOR_REVIEWER_EMAIL],
+  )
+  const row = r.rows[0]
+  if (
+    !row ||
+    row.email !== AI_CONNECTOR_REVIEWER_EMAIL ||
+    row.password_hash !== AI_CONNECTOR_REVIEWER_PASSWORD_SENTINEL ||
+    row.email_verified !== true ||
+    row.role !== 'admin' ||
+    row.status !== 'active' ||
+    row.has_oauth_identity ||
+    row.has_active_refresh
+  ) {
+    throw new Error('marketplace AI reviewer principal collision')
+  }
+  return Number(row.id)
+}
 
 export async function getMarketplaceArtifactKind(
   versionId: string,
@@ -67,8 +118,12 @@ export interface ApproveMarketplaceConnectorInput {
   reviewerUserId: number
   securityDecision: unknown
   expectedSpecHash: string
-  functionalVerified: boolean
+  /** 人工路径必须显式确认隔离账号实测；AI 路径改用 declarative-ai，不得伪造该确认。 */
+  functionalVerified?: boolean
+  functionalVerificationMode?: 'live' | 'declarative-ai'
   note?: string
+  source?: 'human' | 'ai'
+  aiNote?: string | null
   env?: NodeJS.ProcessEnv
   /** 仅平台 seed：允许把同一已签版本重新收敛为 active/current。 */
   allowPlatformConvergence?: boolean
@@ -79,8 +134,16 @@ export async function approveMarketplaceConnectorVersionWithRunner(
   input: Omit<ApproveMarketplaceConnectorInput, 'pool'>,
   client: PoolClient,
 ): Promise<void> {
-  if (!input.functionalVerified)
+  const verificationMode = input.functionalVerificationMode ?? 'live'
+  if (verificationMode === 'live' && input.functionalVerified !== true)
     throw new ConnectorSpecError('INVALID_STATE', 'functional verification attestation required')
+  if (verificationMode === 'declarative-ai' && input.source !== 'ai')
+    throw new ConnectorSpecError(
+      'INVALID_STATE',
+      'declarative verification is reserved for AI review',
+    )
+  const expectedFunctionalState =
+    verificationMode === 'declarative-ai' ? 'declarative_verified' : 'verified'
 
   const version = await lockMarketplaceVersion(client, input.versionId)
   if (!version) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
@@ -114,7 +177,7 @@ export async function approveMarketplaceConnectorVersionWithRunner(
     if (!input.allowPlatformConvergence) {
       const signedStateInvalid =
         version.securityReviewState !== 'security_approved' ||
-        version.functionalVerifyState !== 'verified' ||
+        version.functionalVerifyState !== expectedFunctionalState ||
         version.execRevokedAt !== null ||
         storedHash !== compiled.execContractHash
       if (signedStateInvalid)
@@ -145,9 +208,11 @@ export async function approveMarketplaceConnectorVersionWithRunner(
     ) {
       throw new MarketplaceError('NOT_PENDING', '已审核版本与本次决定不一致')
     }
-    if (version.functionalVerifyState === 'unverified')
-      await markFunctionalVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
-    else if (version.functionalVerifyState !== 'verified')
+    if (version.functionalVerifyState === 'unverified') {
+      if (verificationMode === 'declarative-ai')
+        await markDeclarativeVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
+      else await markFunctionalVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
+    } else if (version.functionalVerifyState !== expectedFunctionalState)
       throw new MarketplaceError('NOT_PENDING', '已审核版本功能验收状态无效')
     await client.query(
       `UPDATE marketplace_skill_listings
@@ -179,18 +244,32 @@ export async function approveMarketplaceConnectorVersionWithRunner(
     throw new ConnectorSpecError('INVALID_STATE', 'connector security review was rejected')
   }
 
-  if (version.functionalVerifyState === 'unverified')
-    await markFunctionalVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
-  else if (version.functionalVerifyState !== 'verified')
+  if (version.functionalVerifyState === 'unverified') {
+    if (verificationMode === 'declarative-ai')
+      await markDeclarativeVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
+    else await markFunctionalVerifiedWithRunner(Number(version.id), input.reviewerUserId, client)
+  } else if (version.functionalVerifyState !== expectedFunctionalState)
     throw new ConnectorSpecError('INVALID_STATE', 'invalid functional verification state')
 
   await client.query(
     `UPDATE marketplace_skill_versions
         SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(),
-            review_note = $3, review_source = 'human',
-            ai_review_state = CASE WHEN ai_review_state IN ('queued','running') THEN 'done' ELSE ai_review_state END
+            review_note = $3, review_source = $4,
+            ai_review_state = CASE
+              WHEN $4 = 'ai' THEN 'done'
+              WHEN ai_review_state IN ('queued','running') THEN 'done'
+              ELSE ai_review_state END,
+            ai_note = CASE WHEN $4 = 'ai' THEN $5 ELSE ai_note END,
+            ai_reviewed_at = CASE WHEN $4 = 'ai' THEN NOW() ELSE ai_reviewed_at END,
+            ai_locked_at = CASE WHEN $4 = 'ai' THEN NULL ELSE ai_locked_at END
       WHERE id = $1 AND status = 'pending'`,
-    [version.id, input.reviewerUserId, input.note ?? null],
+    [
+      version.id,
+      input.reviewerUserId,
+      input.note ?? null,
+      input.source ?? 'human',
+      input.source === 'ai' ? (input.aiNote ?? null) : null,
+    ],
   )
   const listingUpdate = await client.query(
     `UPDATE marketplace_skill_listings
@@ -217,8 +296,15 @@ export async function approveMarketplaceConnectorVersion(
           reviewerUserId: input.reviewerUserId,
           securityDecision: input.securityDecision,
           expectedSpecHash: input.expectedSpecHash,
-          functionalVerified: input.functionalVerified,
+          ...(input.functionalVerified !== undefined
+            ? { functionalVerified: input.functionalVerified }
+            : {}),
+          ...(input.functionalVerificationMode !== undefined
+            ? { functionalVerificationMode: input.functionalVerificationMode }
+            : {}),
           ...(input.note !== undefined ? { note: input.note } : {}),
+          ...(input.source !== undefined ? { source: input.source } : {}),
+          ...(input.aiNote !== undefined ? { aiNote: input.aiNote } : {}),
           ...(input.env ? { env: input.env } : {}),
           ...(input.allowPlatformConvergence ? { allowPlatformConvergence: true } : {}),
         },
@@ -232,6 +318,8 @@ export async function rejectMarketplaceConnectorVersion(args: {
   versionId: string
   reviewerUserId: number
   note: string
+  source?: 'human' | 'ai'
+  aiNote?: string | null
   pool?: Pool
 }): Promise<void> {
   const pool = args.pool ?? getPool()
@@ -246,16 +334,28 @@ export async function rejectMarketplaceConnectorVersion(args: {
     await client.query(
       `UPDATE marketplace_skill_versions
           SET status = 'rejected', reviewed_by = $2, reviewed_at = NOW(),
-              review_note = $3, review_source = 'human',
+              review_note = $3, review_source = $4,
               security_review_state = CASE
                 WHEN security_review_state = 'draft' THEN 'security_rejected'
                 ELSE security_review_state END,
               exec_revoked_at = CASE
                 WHEN security_review_state = 'security_approved' THEN COALESCE(exec_revoked_at, NOW())
                 ELSE exec_revoked_at END,
-              ai_review_state = CASE WHEN ai_review_state IN ('queued','running') THEN 'done' ELSE ai_review_state END
+              ai_review_state = CASE
+                WHEN $4 = 'ai' THEN 'done'
+                WHEN ai_review_state IN ('queued','running') THEN 'done'
+                ELSE ai_review_state END,
+              ai_note = CASE WHEN $4 = 'ai' THEN $5 ELSE ai_note END,
+              ai_reviewed_at = CASE WHEN $4 = 'ai' THEN NOW() ELSE ai_reviewed_at END,
+              ai_locked_at = CASE WHEN $4 = 'ai' THEN NULL ELSE ai_locked_at END
         WHERE id = $1`,
-      [version.id, args.reviewerUserId, args.note],
+      [
+        version.id,
+        args.reviewerUserId,
+        args.note,
+        args.source ?? 'human',
+        args.source === 'ai' ? (args.aiNote ?? null) : null,
+      ],
     )
   }, pool)
 }

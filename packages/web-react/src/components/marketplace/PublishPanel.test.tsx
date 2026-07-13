@@ -86,3 +86,18 @@ test("填齐必填(分类+适用场景)→ 提交,请求体带 category/useCases
   // 成功后进入完成态
   expect(await screen.findByText("已提交，等待平台审核")).toBeInTheDocument();
 });
+
+test("连接器展示 AI 创建入口并把 connector kind 回传当前对话", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  const onCreateInChat = vi.fn();
+  render(<PublishPanel auth={auth} onCreateInChat={onCreateInChat} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+
+  fireEvent.click(screen.getByRole("button", { name: "发布连接器" }));
+  const create = screen.getByRole("button", { name: /在对话中创建连接器/ });
+  expect(create).toBeInTheDocument();
+  fireEvent.click(create);
+  expect(onCreateInChat).toHaveBeenCalledWith("connector");
+  expect(screen.getByText("技术发布 · AI 自动审核")).toBeInTheDocument();
+});
