@@ -71,6 +71,10 @@ export interface LedgerRow {
   connection_revision: number
   provider: string
   action: string
+  connector_version_id: string | null
+  spec_hash: Buffer | null
+  exec_contract_hash: Buffer | null
+  auth_contract_version: number | null
   params_enc: Buffer | null
   params_nonce: Buffer | null
   params_key_version: number
@@ -90,7 +94,8 @@ export interface LedgerRow {
 }
 
 const ROW_COLS = `id::text AS id, user_id::int AS user_id, connection_id::text AS connection_id,
-  connection_revision, provider, action, params_enc, params_nonce, params_key_version,
+  connection_revision, provider, action, connector_version_id::text AS connector_version_id,
+  spec_hash, exec_contract_hash, auth_contract_version, params_enc, params_nonce, params_key_version,
   params_aad_seed::text AS params_aad_seed, params_hash, canonicalization_version, summary,
   idempotency_key, status, error_code, result_digest, created_at, approved_at, started_at,
   finished_at, expires_at`
@@ -134,6 +139,12 @@ export interface ProposeWriteInput {
   action: string
   params: Record<string, unknown>
   summary: string
+  contractPins?: {
+    connectorVersionId: number
+    specHashHex: string
+    execContractHashHex: string
+    authContractVersion: number
+  }
 }
 
 export interface ProposedWrite {
@@ -183,11 +194,12 @@ export async function proposeWrite(
     }
     const r = await client.query<{ expires_at: Date }>(
       `INSERT INTO connector_write_ledger
-         (id, user_id, connection_id, connection_revision, provider, action,
+       (id, user_id, connection_id, connection_revision, provider, action,
           params_enc, params_nonce, params_aad_seed, params_hash, canonicalization_version,
-          summary, idempotency_key, status, expires_at)
+          summary, idempotency_key, status, expires_at,
+          connector_version_id, spec_hash, exec_contract_hash, auth_contract_version)
        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13, 'pending',
-               now() + interval '10 minutes')
+               now() + interval '10 minutes', $14, $15, $16, $17)
        RETURNING expires_at`,
       [
         id,
@@ -203,6 +215,10 @@ export async function proposeWrite(
         CANONICALIZATION_VERSION,
         input.summary.slice(0, 2000),
         idempotencyKey,
+        input.contractPins?.connectorVersionId ?? null,
+        input.contractPins ? Buffer.from(input.contractPins.specHashHex, 'hex') : null,
+        input.contractPins ? Buffer.from(input.contractPins.execContractHashHex, 'hex') : null,
+        input.contractPins?.authContractVersion ?? null,
       ],
     )
     return r.rows[0]!.expires_at
@@ -342,6 +358,10 @@ interface ConnCheckRow {
   revision: number
   status: string
   revoked_at: Date | null
+  connector_version_id: string | null
+  spec_hash: Buffer | null
+  exec_contract_hash: Buffer | null
+  auth_contract_version: number | null
 }
 
 /**
@@ -425,10 +445,24 @@ export async function beginExecute(
 
     // connection 复核(同事务快照;不锁 connections 行 —— 锁序纪律:不跨表持锁)
     const c = await client.query<ConnCheckRow>(
-      'SELECT revision, status, revoked_at FROM connections WHERE id = $1 AND user_id = $2',
+      `SELECT revision, status, revoked_at,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version
+         FROM connections WHERE id = $1 AND user_id = $2`,
       [row.connection_id, opts.userId],
     )
     const conn = c.rows[0]
+    const pinsMatch =
+      conn !== undefined &&
+      row.connector_version_id === conn.connector_version_id &&
+      (row.spec_hash === null
+        ? conn.spec_hash === null
+        : conn.spec_hash !== null && row.spec_hash.equals(conn.spec_hash)) &&
+      (row.exec_contract_hash === null
+        ? conn.exec_contract_hash === null
+        : conn.exec_contract_hash !== null &&
+          row.exec_contract_hash.equals(conn.exec_contract_hash)) &&
+      row.auth_contract_version === conn.auth_contract_version
     const connProblem =
       !conn || conn.revoked_at !== null
         ? ('CONNECTION_REVOKED' as const)
@@ -436,7 +470,9 @@ export async function beginExecute(
           ? ('CONNECTION_ERROR' as const)
           : conn.revision !== row.connection_revision
             ? ('REVISION_MISMATCH' as const)
-            : null
+            : !pinsMatch
+              ? ('RELINK_REQUIRED' as const)
+              : null
     if (connProblem) {
       await client.query(
         `UPDATE connector_write_ledger
@@ -476,6 +512,7 @@ type ConnectorErrorCodeForExecute =
   | 'CONNECTION_REVOKED'
   | 'CONNECTION_ERROR'
   | 'REVISION_MISMATCH'
+  | 'RELINK_REQUIRED'
 
 /**
  * 终态 CAS:executing → succeeded|failed|unknown + finished_at + **销毁 params**。

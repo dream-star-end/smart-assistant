@@ -87,6 +87,10 @@ import type {
   ConnectorDecisionResult,
   ConnectorOAuthStartResult,
   ConnectorsResponse,
+  DeclarativeBindResult,
+  DeclarativeCatalogResponse,
+  DeclarativeConnectionsResponse,
+  DeclarativeOauthStartResult,
 } from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 
@@ -2418,6 +2422,82 @@ export const api = {
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>
         fetch(`/api/connectors/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── 声明式连接器引擎（未来单一权威；REST 前缀 /api/connectors/declarative/*） ──
+  // 契约与后端钉死（类型权威在 lib/connectors.ts）；错误码经 ApiError.code 上抛，
+  // 由调用方走 connectorErrorText 映射中文，本层不做文案。
+
+  /** 声明式目录（GET /api/connectors/declarative/catalog，Bearer）。 */
+  getDeclarativeCatalog: (a: AuthSession): Promise<DeclarativeCatalogResponse> =>
+    jsonOrThrow<DeclarativeCatalogResponse>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/catalog", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 已绑声明式连接（GET /api/connectors/declarative/connections，Bearer）。 */
+  getDeclarativeConnections: (a: AuthSession): Promise<DeclarativeConnectionsResponse> =>
+    jsonOrThrow<DeclarativeConnectionsResponse>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/connections", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 绑定声明式连接器（POST /api/connectors/declarative/bind，Bearer）。 */
+  bindDeclarativeConnector: (
+    a: AuthSession,
+    body: { versionId: number; secrets: Record<string, string>; displayName?: string },
+  ): Promise<DeclarativeBindResult> =>
+    jsonOrThrow<DeclarativeBindResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/bind", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /**
+   * oauth2-auth-code 授权流起点（POST /api/connectors/declarative/oauth/start，Bearer）。
+   * body 带用户 BYOA 自建应用的 client 凭据（clientSecret 只进服务端 AEAD 加密的 pending
+   * draft，绝不进 authorize URL）。返回 authorizeUrl，调用方**整页跳转**；授权后后端 302 回
+   * `/?connector_linked=<slug>` 或 `/?connector_error=<code>`（App 层统一 toast）。
+   * 注：oauth2-auth-code 连接器走直填 bind 会被后端硬拒，必须走本端点。
+   */
+  startDeclarativeOauth: (
+    a: AuthSession,
+    body: { versionId: number; clientId: string; clientSecret: string; displayName?: string },
+  ): Promise<DeclarativeOauthStartResult> =>
+    jsonOrThrow<DeclarativeOauthStartResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors/declarative/oauth/start", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 解绑声明式连接（DELETE /api/connectors/declarative/connections/:id，Bearer）。 */
+  unbindDeclarativeConnector: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/declarative/connections/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),

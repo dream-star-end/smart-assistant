@@ -511,6 +511,11 @@ describe("auth.register (integ)", () => {
 
 // ─── isEmailDomainBlocked 纯函数单元测试(无 DB) ─────────────────────
 describe("isEmailDomainBlocked", () => {
+  test("平台系统主体域名始终保留，不依赖动态黑名单", () => {
+    assert.equal(isEmailDomainBlocked("x@system.openclaude", []), true);
+    assert.equal(isEmailDomainBlocked("x@sub.system.openclaude", []), true);
+  });
+
   test("empty blocklist → never blocked", () => {
     assert.equal(isEmailDomainBlocked("anyone@any.com", []), false);
   });
