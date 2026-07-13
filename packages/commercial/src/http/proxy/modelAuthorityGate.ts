@@ -228,6 +228,10 @@ export interface ModelAuthorityDecision {
   securityEpoch: bigint;
   /** bridge 路径的 turn 标识(日志/对账用;本地路径 null)。 */
   authorityTurnId: string | null;
+  /** 已验签 turn lease 的签发时间(ms);authority-only/local_catalog 路径为 null。 */
+  turnLeaseIssuedAtMs: number | null;
+  /** 本次请求在 egress 完成 turn lease 验签的服务端时间(ms);无 lease 时为 null。 */
+  turnLeaseVerifiedAtMs: number | null;
 }
 
 /**
@@ -362,6 +366,8 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       claimedProjectionRevision: token.projectionRevision,
       securityEpoch: snapshot.securityEpoch,
       authorityTurnId: null,
+      turnLeaseIssuedAtMs: null,
+      turnLeaseVerifiedAtMs: null,
     };
   }
 
@@ -524,6 +530,10 @@ function verifyBridgeAuthority(a: {
     claimedProjectionRevision: null,
     securityEpoch: a.snapshot.securityEpoch,
     authorityTurnId: principal.authorityTurnId,
+    // 只投影真正通过 verifyTurnLease 的局部变量。principal 可能是短 authority，
+    // 其 issuedAt 不能冒充长 lease 的 rollout 续跑证据。
+    turnLeaseIssuedAtMs: lease?.issuedAt ?? null,
+    turnLeaseVerifiedAtMs: lease === null ? null : a.now,
   };
 }
 
