@@ -475,6 +475,204 @@ describe('v5 release safety lanes', () => {
     assert.match(args, /\/var\/lib\/openclaude-v5\/cutovers 18081\n$/)
     assert.match(remoteBody, /http:\/\/127\.0\.0\.1:\$\{caddy_http_port\}\/healthz/)
   })
+
+  test('candidate readiness predicate is fail-closed for every required field', () => {
+    const check = (payload: string) => spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'candidate_health_ready "$PAYLOAD"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PAYLOAD: payload },
+    })
+    const valid = '{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}'
+    assert.equal(check(valid).status, 0)
+    for (const invalid of [
+      '{"ok":false,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}',
+      '{"channel":"v5","leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"channel":"v3","leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"leadership":{"state":"standby"},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"leader"},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{},"vip":"released"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"owner"}',
+      '{"ok":true,"channel":"v5","leadership":{"state":"standby"}}',
+      '{not-json',
+      '',
+    ]) {
+      assert.notEqual(check(invalid).status, 0, `payload must fail closed: ${invalid}`)
+    }
+  })
+
+  test('candidate readiness polling supports delayed success and a hard wall-clock deadline', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-ready-')); dirs.push(dir)
+    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
+    const delayed = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'slot_priv_healthz() {',
+      '  n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+      '  if [ "$n" -lt 3 ]; then echo \'{"ok":true,"channel":"v5","leadership":{"state":"acquiring"},"vip":"released"}\';',
+      '  else echo \'{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}\'; fi',
+      '}',
+      'sleep() { :; }',
+      'wait_for_candidate_ready B 5',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', COUNTER: counter },
+    })
+    assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
+    assert.equal(await readFile(counter, 'utf8'), '3')
+    assert.match(delayed.stdout, /candidate=B 已 standby\+VIP released/)
+
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nsleep 3\n')
+    await chmod(path.join(bin, 'ssh'), 0o755)
+    const started = Date.now()
+    const transportTimedOut = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'wait_for_candidate_ready B 1',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
+    })
+    const elapsed = Date.now() - started
+    assert.notEqual(transportTimedOut.status, 0)
+    assert.ok(elapsed < 2500, `one-second deadline took ${elapsed}ms`)
+    assert.match(transportTimedOut.stderr, /last private healthz: <empty>/)
+
+    const diagnostic = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'slot_priv_healthz() { sleep 1; echo \'{"ok":false,"probe":"last-seen"}\'; }',
+      'wait_for_candidate_ready B 1',
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    assert.notEqual(diagnostic.status, 0)
+    assert.match(diagnostic.stderr, /last private healthz: .*last-seen/)
+  })
+
+  test('candidate readiness dry-run is immediate and canary failure retains pre-READY recovery', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-dry-')); dirs.push(dir)
+    const touched = path.join(dir, 'touched')
+    const started = Date.now()
+    const dry = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=1',
+      'slot_priv_healthz() { touch "$TOUCHED"; return 1; }',
+      'wait_for_candidate_ready B 90',
+      'test ! -e "$TOUCHED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TOUCHED: touched },
+    })
+    assert.equal(dry.status, 0, dry.stderr || dry.stdout)
+    assert.ok(Date.now() - started < 1000)
+
+    const recovery = path.join(dir, 'recovered')
+    const failedStart = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { :; }',
+      'wait_for_candidate_ready() { return 1; }',
+      'recover_canary_prep() { printf "%s" "$1" >"$RECOVERY"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test "$(cat "$RECOVERY")" = B',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', RECOVERY: recovery },
+    })
+    assert.equal(failedStart.status, 0, failedStart.stderr || failedStart.stdout)
+
+    const startFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { return 42; }',
+      'wait_for_candidate_ready() { touch "$WAITED"; return 0; }',
+      'recover_canary_prep() { touch "$RECOVERED"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test ! -e "$WAITED"',
+      'test ! -e "$RECOVERED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        WAITED: path.join(dir, 'waited'),
+        RECOVERED: path.join(dir, 'recovered-after-start-failure'),
+      },
+    })
+    assert.equal(startFailure.status, 0, startFailure.stderr || startFailure.stdout)
+
+    const stopFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=0',
+      'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
+      'wait_for_candidate_ready() { return 1; }',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test "$calls" -eq 2',
+      'test ! -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'cassed-after-stop-failure') },
+    })
+    assert.equal(stopFailure.status, 0, stopFailure.stderr || stopFailure.stdout)
+
+    const dispatcherStopFailure = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
+      'recover_canary_prep() { return 42; }',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'set +e; recover; rc=$?; set -e',
+      'test "$rc" -ne 0',
+      'test ! -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'dispatcher-cassed-after-stop-failure') },
+    })
+    assert.equal(dispatcherStopFailure.status, 0, dispatcherStopFailure.stderr || dispatcherStopFailure.stdout)
+
+    const missingUnit = spawnSync('bash', ['-c', [
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'sshk() { eval "$*"; }',
+      'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
+      'export -f systemctl',
+      'ds_cas_or_die() { touch "$CASSED"; }',
+      'recover_canary_prep B',
+      'test ! -e "$SYSTEMCTL_CALLED"',
+      'test -e "$CASSED"',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        SYSTEMCTL_CALLED: path.join(dir, 'systemctl-called-for-missing-unit'),
+        CASSED: path.join(dir, 'cassed-for-missing-unit'),
+      },
+    })
+    assert.equal(missingUnit.status, 0, missingUnit.stderr || missingUnit.stdout)
+
+    const source = await readFile(deploy, 'utf8')
+    const startBody = source.match(/start_candidate_unit_and_wait\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(startBody, /wait_for_candidate_ready "\$cand" 90/)
+    assert.doesNotMatch(startBody, /run "sleep 4"/)
+  })
 })
 
 interface MonitorFixtureOptions {

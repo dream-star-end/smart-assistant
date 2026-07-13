@@ -3248,9 +3248,11 @@ ds_assert_phase() {
 
 # 私有诊断控制口 healthz(RFC D3;$1=slot)。dry:合成健康体。
 slot_priv_healthz() {
-  local slot="$1" priv; priv="$(slot_priv "$slot")"
+  local slot="$1" request_timeout="${2:-5}" priv; priv="$(slot_priv "$slot")"
   if [[ "$DRY" == 1 ]]; then echo '{"ok":true,"channel":"v5","leadership":{"state":"standby","slot":"'"$slot"'"},"vip":"released"}'; return 0; fi
-  ssh "$KL_HOST" "curl -fsS --max-time 5 http://127.0.0.1:${priv}/healthz" 2>/dev/null || true
+  # 远端 curl 的 max-time 不覆盖 SSH 建连/握手；本地 timeout(KILL)钉死整个 transport 墙钟。
+  timeout --signal=KILL "${request_timeout}s" \
+    ssh "$KL_HOST" "curl -fsS --max-time '$request_timeout' http://127.0.0.1:${priv}/healthz" 2>/dev/null || true
 }
 
 # BLOCKER 5⑤:有界轮询等待某 slot 私有口 healthz 到达 leadership=leader(want_vip=1 时并要求 vip=owner)。
@@ -3273,20 +3275,60 @@ wait_for_slot_leadership() {
   return 1
 }
 
-# candidate 起手自检(RFC D5 canary step3):私有口健康 + channel=v5 + leadership=standby + VIP 未 bind。
+# candidate 起手自检(RFC D5 canary step3):四项必须同时成立；缺字段/畸形 JSON 一律 fail-closed。
+candidate_health_ready() {
+  jq -e '.ok == true and .channel == "v5" and .leadership.state == "standby" and .vip == "released"' \
+    >/dev/null 2>&1 <<<"$1"
+}
+
+# 单次诊断供 --recover 展示；真实 canary 起活使用下面的有界轮询。
 candidate_self_check() {
   local slot="$1" hz
-  echo "── candidate($slot)自检:私有口 healthz / channel=v5 / leadership=standby / VIP 未 bind ──"
   hz="$(slot_priv_healthz "$slot")"
   echo "  private healthz: $hz"
-  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] 跳过断言"; return 0; fi
-  [[ -n "$hz" ]] || { echo "✗ candidate 私有口无响应" >&2; return 1; }
-  echo "$hz" | grep -q '"ok":true' || { echo "✗ candidate healthz ok!=true" >&2; return 1; }
-  echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ candidate channel!=v5" >&2; return 1; }
-  echo "$hz" | grep -q '"state":"standby"' || { echo "✗ candidate leadership!=standby(不应竞得 leader:desired 仍指 active)" >&2; return 1; }
-  # VIP 未被本 candidate bind:candidate 私有口应报告 vip 非 owner(desired_control_slot 仍是 active)。
-  echo "$hz" | grep -q '"vip":"owner"' && { echo "✗ candidate 竟持有 VIP(desired_control_slot 应仍是 active)" >&2; return 1; }
-  echo "  ✓ candidate 自检通过(standby,未抢 VIP)"
+  candidate_health_ready "$hz"
+}
+
+# 冷启动时间随宿主/tsx 缓存变化，不能靠固定 sleep。以 SECONDS 绝对截止控制总墙钟，
+# 每次 curl 与 sleep 都不超过剩余时间；超时仍处于 canary<READY，对流量不可见。
+wait_for_candidate_ready() {
+  local slot="$1" timeout="${2:-90}" deadline
+  deadline=$((SECONDS + timeout))
+  local hz="" remaining request_timeout sleep_for
+  echo "── 有界轮询等待 candidate=$slot standby+VIP released(≤${timeout}s,2s 间隔)──"
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] 轮询等待(跳过)"; return 0; fi
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    request_timeout="$remaining"; (( request_timeout > 2 )) && request_timeout=2
+    (( request_timeout < 1 )) && request_timeout=1
+    hz="$(slot_priv_healthz "$slot" "$request_timeout")"
+    if candidate_health_ready "$hz"; then
+      echo "  ✓ candidate=$slot 已 standby+VIP released"
+      echo "  private healthz: $hz"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && break
+    remaining=$((deadline - SECONDS))
+    sleep_for="$remaining"; (( sleep_for > 2 )) && sleep_for=2
+    (( sleep_for > 0 )) && sleep "$sleep_for"
+  done
+  echo "✗ candidate=$slot 在 ${timeout}s 内未达 standby+VIP released" >&2
+  echo "  last private healthz: ${hz:-<empty>}" >&2
+  return 1
+}
+
+# canary step3 单一收口：候选起活超时必须执行 §8 pre-READY 恢复，而不是只返回错误留脏状态。
+start_candidate_unit_and_wait() {
+  local cand="$1"
+  echo "── 起 candidate unit $(slot_unit "$cand") ──"
+  if ! sshk "systemctl enable --now $(slot_unit "$cand")"; then
+    echo "✗ candidate unit 启动失败:$(slot_unit "$cand")" >&2
+    return 1
+  fi
+  if wait_for_candidate_ready "$cand" 90; then return 0; fi
+  echo "✗ candidate 自检失败;stop candidate + 回 stable(§8 canary<READY)" >&2
+  recover_canary_prep "$cand" || return 1
+  return 1
 }
 
 # 版本兼容判定(MAJOR 7):candidate 与 active 的某版本字段必须**相等**,或命中显式兼容表
@@ -3627,10 +3669,7 @@ canary() {
   ds_cas_or_die "transition_step=2" 2 "candidate slot $cand initialized"
 
   # step3:起 candidate unit + 自检(私有口 healthz/standby/VIP 未 bind)
-  echo "── 起 candidate unit $(slot_unit "$cand") ──"
-  sshk "systemctl enable --now $(slot_unit "$cand")"
-  run "sleep 4"
-  candidate_self_check "$cand" || { echo "✗ candidate 自检失败;stop candidate + 回 stable(§8 canary<READY)" >&2; recover_canary_prep "$cand"; exit 1; }
+  start_candidate_unit_and_wait "$cand" || exit 1
   ds_cas_or_die "transition_step=3" 3 "candidate unit started + self-check ok"
 
   # step4:capability matrix preflight(sessions-pg + dual-master + sw.js 字节一致)
@@ -3666,11 +3705,19 @@ _internal_allowlist_sql() {
 # canary 准备期(<READY)恢复:stop candidate unit + 只清本 operation 产物(symlink/未激活),回 stable。
 # 【铁律】HOME 绝不递归删(RFC §8 R4:HOME 是持久 slot 状态含 uploads/诊断,可能是上一轮 active 的家)。
 recover_canary_prep() {
-  local cand="$1" csrc; csrc="$(slot_src "$cand")"
+  local cand="$1" csrc cunit; csrc="$(slot_src "$cand")"; cunit="$(slot_unit "$cand")"
   echo "── 恢复(canary<READY):stop candidate + 清本 operation 产物(不删 HOME)→ 回 stable ──"
-  sshk "systemctl disable --now $(slot_unit "$cand") 2>/dev/null || true"
-  sshk "rm -f '$csrc.newlink.'* 2>/dev/null || true"   # 只清未激活临时 symlink;不动 HOME/release
-  ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, transition_step=0, operation_id=NULL" 0 "recovered canary<READY → stable"
+  # step0-1 尚未执行 init_candidate_slot，candidate unit 可能从未安装；这种“确实无 unit 文件”
+  # 是已清理状态而非失败。unit 文件存在时 stop/disable 必须成功；SSH/远端命令失败仍 fail-closed。
+  if ! sshk "if [ -e '/etc/systemd/system/$cunit' ] || [ -e '/run/systemd/system/$cunit' ] || [ -e '/usr/lib/systemd/system/$cunit' ] || [ -e '/lib/systemd/system/$cunit' ]; then systemctl disable --now '$cunit'; else echo '  · candidate unit 未安装(step0-1)，无需 stop'; fi"; then
+    echo "✗ candidate stop/disable 失败，保持 canary 准备态供 --recover 重试" >&2
+    return 1
+  fi
+  if ! sshk "rm -f '$csrc.newlink.'*"; then   # 只清未激活临时 symlink;不动 HOME/release
+    echo "✗ candidate 临时 symlink 清理失败，保持 canary 准备态" >&2
+    return 1
+  fi
+  ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, transition_step=0, operation_id=NULL" 0 "recovered canary<READY → stable" || return 1
   echo "  ✓ 已回 stable(零流量影响)"
 }
 
@@ -3982,7 +4029,11 @@ recover() {
     canary)
       if [[ "$s" -lt "$DS_STEP_CANARY_READY" ]]; then
         echo "  · canary<READY(准备期,candidate 对流量不可见)→ §8:stop/清本 operation 产物 → 回 stable(零影响)"
-        [[ -n "$cand" ]] && recover_canary_prep "$cand" || ds_cas_or_die "phase='stable', transition_step=0, operation_id=NULL" 0 "recover canary<READY (no candidate) → stable"
+        if [[ -n "$cand" ]]; then
+          recover_canary_prep "$cand"
+        else
+          ds_cas_or_die "phase='stable', transition_step=0, operation_id=NULL" 0 "recover canary<READY (no candidate) → stable"
+        fi
       else
         echo "  · canary≥READY:§8=candidate 死则重启 unit 或 --abort;活则继续 --promote/--finalize(operator 裁决)"
         [[ -n "$cand" ]] && candidate_self_check "$cand" || true

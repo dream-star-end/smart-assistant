@@ -10,9 +10,11 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pool } from "pg";
+import { paths } from "@openclaude/storage";
 import {
   decideSessionsStore,
   decideSessionsStorePgUnreachable,
+  defaultManifestPath,
   parseSessionsStoreEnv,
   resolveSessionsStoreAuthority,
   SessionsStoreAuthorityError,
@@ -70,6 +72,20 @@ describe("parseSessionsStoreEnv", () => {
     assert.equal(parseSessionsStoreEnv("PG"), "pg");
     assert.equal(parseSessionsStoreEnv("postgres"), "invalid");
     assert.equal(parseSessionsStoreEnv("1"), "invalid");
+  });
+});
+
+describe("defaultManifestPath", () => {
+  test("显式共享路径优先；空白覆盖回退 OPENCLAUDE_HOME 默认", () => {
+    assert.equal(
+      defaultManifestPath({ OC_SESSIONS_MANIFEST_PATH: "  /root/.openclaude-v5/sessions-store-authority.json  " }),
+      "/root/.openclaude-v5/sessions-store-authority.json",
+    );
+    assert.equal(defaultManifestPath({}), join(paths.home, "sessions-store-authority.json"));
+    assert.equal(
+      defaultManifestPath({ OC_SESSIONS_MANIFEST_PATH: "   " }),
+      defaultManifestPath({}),
+    );
   });
 });
 
@@ -207,6 +223,24 @@ describe("resolveSessionsStoreAuthority PG 读取失败兜底", () => {
   }
 
   const legalManifest = JSON.stringify({ authority: "pg_authoritative", generation: GEN, cutoverId: CUT });
+
+  test("env 共享 manifest 覆盖贯穿真实 resolver 装配", async () => {
+    await withTmpManifest(legalManifest, async (manifestPath) => {
+      const pool = {
+        query: async () => ({
+          rows: [{ authority: "pg_authoritative", generation: String(GEN), cutover_id: CUT }],
+        }),
+      } as unknown as Pool;
+      const decision = await resolveSessionsStoreAuthority({
+        pool,
+        env: {
+          OC_SESSIONS_STORE: "pg",
+          OC_SESSIONS_MANIFEST_PATH: `  ${manifestPath}  `,
+        },
+      });
+      assert.deepEqual(decision, { store: "pg", generation: GEN });
+    });
+  });
 
   test("连接错误 + 无 manifest + env unset → SQLite(真·基建先行期,PG 未 provision)", async () => {
     await withTmpManifest(null, async (manifestPath) => {
