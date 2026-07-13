@@ -122,10 +122,12 @@ function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): Turn
     assistantSegments: result.assistantSegments,
     thinkingSegments: result.thinkingSegments,
     tools: result.tools,
+    runtimeEvents: result.runtimeEvents,
     stopReason: result.stopReason,
     numTurns: result.numTurns,
     isError: result.isError,
     ...(errorKind ? { errorKind } : {}),
+    ...(result.errorDetail !== undefined ? { errorDetail: result.errorDetail } : {}),
     staleResumeId: result.staleResumeId,
     phantomSignals: toPhantomSignals(telemetry),
     // apiState='called' 且零输出时 sessionManager 的 warn 日志字段(与旧代码
@@ -143,9 +145,10 @@ function snapshotOf(parser: CcbMessageParser): PartialSnapshot {
   return {
     assistantText: parser.assistantBuf,
     thinkingText: parser.thinkingBuf,
-    completedTools: [...parser.completedTools],
+    completedTools: parser.snapshotToolsForPersistence(),
     assistantSegments: parser.assistantSegments.map((s) => ({ ...s })),
     thinkingSegments: parser.thinkingSegments.map((s) => ({ ...s })),
+    runtimeEvents: parser.runtimeEvents.map((event) => structuredClone(event)),
   }
 }
 
@@ -155,6 +158,7 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
   completedTools: [],
   assistantSegments: [],
   thinkingSegments: [],
+  runtimeEvents: [],
 }
 
 /** runner 事件直通转发清单(getOrCreate / _runOneTurn 消费面)。 */
@@ -236,6 +240,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       assistantMessageId: params.assistantMessageId,
       thinkingMessageId: params.thinkingMessageId,
       toolMessageIdFactory: params.toolMessageIdFactory,
+      nextDurableEventOrdinal: params.nextDurableEventOrdinal,
       // 旧 parser 回调升格为一等事件,与内容事件同一条同步顺序流:
       // tool_use_detected 先于 finalized tool_use block,tool_result block 先于
       // tool_result_detected —— 与旧回调触发点逐一对位。
@@ -258,7 +263,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     // 模型权威批次 §4 — modelAuthority 由 runner.submit 转成本 turn 的
     // ANTHROPIC_CUSTOM_HEADERS(先于 user message 写 stdin);无值 = 本地路径,
     // runner 侧自取 local_catalog token 并清位(单一收口,adapter 不做判定)。
-    const submitted = this.runner.submit(params.input, params.requestId, params.modelAuthority)
+    const submitted = this.runner.submit(
+      params.input,
+      params.requestId,
+      params.modelAuthority,
+      params.turnKey,
+    )
     return {
       submitted,
       summary,
@@ -282,6 +292,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   shutdown(): Promise<void> {
     return this.runner.shutdown()
+  }
+
+  waitForOutputDrain(): Promise<void> {
+    return this.runner.waitForOutputDrain()
   }
 
   // ── resume ─────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
  * 关键不变量(slice 7b + Codex 7b plan PASS):
  *   1. 成功 → `{ok:true}`
  *   2. `iLink HTTP 401|403|404|410` 前缀 → permanent:true (broker forceFail 不复活)
- *   3. `iLink HTTP 5xx` 前缀 → permanent:false (transient,outbox 按 attempts cap 重试)
+ *   3. `iLink HTTP 5xx` 前缀 → permanent:false (transient,outbox 无上限保留重试)
  *   4. `iLink returned non-JSON: ...` → permanent:false
  *   5. 网络层 throw(无 iLink HTTP 前缀)→ permanent:false
  *   6. 调用入参 (botToken/toUserId/contextToken/text) 透传正确
@@ -96,10 +96,10 @@ describe("classifyIlinkError", () => {
     }
   })
 
-  it("classifies other 4xx as transient (429 / 400 fall through to outbox attempts cap)", () => {
+  it("classifies other 4xx as transient for uncapped outbox retry", () => {
     for (const status of [400, 408, 413, 429]) {
       const r = classifyIlinkError(new Error(`iLink HTTP ${status}: rate-limited`))
-      assert.equal(r.permanent, false, `${status} stays transient (attempts cap eventually terminates)`)
+      assert.equal(r.permanent, false, `${status} stays transient for uncapped retry`)
     }
   })
 

@@ -829,6 +829,11 @@ export interface UserChatBridgeDeps {
     requestId: string,
     userId: string,
     costCredits: string,
+    sessionId?: string | null,
+    parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
 }
 
@@ -3839,6 +3844,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             const billing = parsedBilling as {
               requestId?: unknown;
+              turnKey?: unknown;
+              parentTurnKey?: unknown;
+              parentSessionId?: unknown;
+              delegateAgentId?: unknown;
               engineSessionId?: unknown;
               status?: unknown;
               errorReason?: unknown;
@@ -3855,6 +3864,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               bridgeLog?.warn("user-chat-bridge: codex_billing missing requestId");
               return;
             }
+            const billingTurnKey =
+              typeof billing.turnKey === "string" && /^[0-9a-f]{64}$/.test(billing.turnKey)
+                ? billing.turnKey
+                : null;
+            const billingParentTurnKey =
+              typeof billing.parentTurnKey === "string" && /^[0-9a-f]{64}$/.test(billing.parentTurnKey)
+                ? billing.parentTurnKey
+                : null;
+            const billingParentSessionId =
+              typeof billing.parentSessionId === "string" &&
+              billing.parentSessionId.length > 0 && billing.parentSessionId.length <= 256
+                ? billing.parentSessionId
+                : null;
+            const billingDelegateAgentId =
+              typeof billing.delegateAgentId === "string" &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(billing.delegateAgentId)
+                ? billing.delegateAgentId
+                : null;
             // —— 与 snapshot 无关的帧字段解析(主路径与跨桥 fallback 共用)——
             // M2 — engineSessionId fail-closed 校验(方案 §D 红线 2)。
             // settle 落 usage_records.session_id 的**唯一**权威 = 帧上的
@@ -3917,6 +3944,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 errorReason,
                 usage,
                 billingRl,
+                turnKey: billingTurnKey,
+                parentTurnKey: billingParentTurnKey,
+                parentSessionId: billingParentSessionId,
+                delegateAgentId: billingDelegateAgentId,
               });
               return;
             }
@@ -4002,6 +4033,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
                 const result = await finalizer.commit(
                   usage, codexStatus, errorReason,
+                  {
+                    turnKey: billingTurnKey,
+                    parentTurnKey: billingParentTurnKey,
+                    parentSessionId: billingParentSessionId,
+                    delegateAgentId: billingDelegateAgentId,
+                  },
                 );
                 // 仅 debit > 0 才广播 cost_charged;0 token / 零输出免单 / 重入 /
                 // settle 失败 / commit-after-fail 合成 skipped(debitedCredits=null)
@@ -4019,6 +4056,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         reqId,
                         uid.toString(),
                         result.debitedCredits.toString(),
+                        engineSid,
+                        billingParentSessionId,
+                        billingDelegateAgentId,
+                        billingTurnKey,
+                        billingParentTurnKey,
                       );
                     } catch (err) {
                       billingLog?.warn("user-chat-bridge: codex persist costCredits threw", {
@@ -4556,6 +4598,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       errorReason: string | undefined;
       usage: TokenUsage;
       billingRl: unknown;
+      turnKey: string | null;
+      parentTurnKey: string | null;
+      parentSessionId: string | null;
+      delegateAgentId: string | null;
     }): void {
       const { requestId } = frame;
       if (!codexBillingEnabled) {
@@ -4801,6 +4847,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           });
           const result = await finalizer.commit(
             frame.usage, frame.codexStatus, frame.errorReason,
+            {
+              turnKey: frame.turnKey,
+              parentTurnKey: frame.parentTurnKey,
+              parentSessionId: frame.parentSessionId,
+              delegateAgentId: frame.delegateAgentId,
+            },
           );
           // settle 已收口 → 后续同桥 duplicate 帧同步丢弃(与主路径簿记同构)。
           locallySettledCodexTurns.add(requestId);
@@ -4817,6 +4869,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   requestId,
                   uid.toString(),
                   result.debitedCredits.toString(),
+                  frame.engineSid,
+                  frame.parentSessionId,
+                  frame.delegateAgentId,
+                  frame.turnKey,
+                  frame.parentTurnKey,
                 );
               } catch (err) {
                 billingLog?.warn("user-chat-bridge: cross-bridge persist costCredits threw", {

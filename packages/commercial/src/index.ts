@@ -320,6 +320,7 @@ import {
 import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
+  type LosslessTurnTapeStorage,
 } from "./db/pgSessionsBackend.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
@@ -1074,12 +1075,13 @@ export async function registerCommercial(
   // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   if (runtimeChannel === "v5") {
     const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
     if (decision.store === "pg") {
-      setClientSessionsBackend(
-        createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation }),
-      );
+      const pgSessionsBackend = createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation });
+      setClientSessionsBackend(pgSessionsBackend);
+      losslessTurnTapeStorage = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
       sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({ pool: getPool() }));
@@ -1396,6 +1398,8 @@ export async function registerCommercial(
     parentSessionId?: string | null,
     // P2 债D — 委派目标 agent id(与 parentSessionId 同源);普通 chat / codex 自费恒 undefined。
     delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) =>
     appendCostCredits(
       requestId,
@@ -1405,6 +1409,8 @@ export async function registerCommercial(
       sessionId,
       parentSessionId,
       delegateAgentId,
+      turnKey,
+      parentTurnKey,
     );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
@@ -1571,6 +1577,7 @@ export async function registerCommercial(
       // 详见 packages/commercial/src/http/internalServerAuthored.ts。
       const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
         identityRepo,
+        losslessTurnTapeStorage,
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
@@ -3222,6 +3229,12 @@ export async function registerCommercial(
         usage,
         body.status === "error" ? "error" : "success",
         body.errorReason,
+        {
+          turnKey: body.turnKey ?? null,
+          parentTurnKey: body.parentTurnKey ?? null,
+          parentSessionId: body.parentSessionId ?? null,
+          delegateAgentId: body.delegateAgentId ?? null,
+        },
       );
       if (result.debitedCredits !== null && result.debitedCredits > 0n) {
         try {
@@ -3229,6 +3242,11 @@ export async function registerCommercial(
             body.requestId,
             snap.userId.toString(),
             result.debitedCredits.toString(),
+            null,
+            body.parentSessionId ?? null,
+            body.delegateAgentId ?? null,
+            body.turnKey ?? null,
+            body.parentTurnKey ?? null,
           );
         } catch (err) {
           codexRouteLog.warn("wechat_codex_persist_cost_credits_failed", {

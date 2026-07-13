@@ -65,13 +65,21 @@ export interface TurnToolEntry {
    *  toolUseId across protocol layers. */
   blockId: string
   toolName: string
-  /** Possibly-capped tool input. May be a structured object or a JSON-encoded
-   *  string when the original exceeded the parser's input-json byte cap. */
+  /** Exact structured tool input as received from the model protocol. */
   inputJson: unknown
-  /** Truncated string preview of the input for compact rendering */
+  /** Derived short preview for compact live rendering; inputJson is canonical. */
   inputPreview: string
-  /** Tool stdout / textual output, capped by the parser */
+  /** Full textual rendering of the tool output, never capped. */
   output: string
+  /** Exact structured tool_result content before textual rendering. */
+  outputJson?: unknown
+  /** Exact raw input_json_delta bytes accumulated before an interrupted tool
+   * call reached its final structured input snapshot. Kept in addition to
+   * inputJson because the raw prefix may intentionally be incomplete JSON. */
+  partialInputJson?: string
+  /** Omitted/true for a matched tool_result; false when the turn ended while
+   * the model-authored tool call was still pending. */
+  completed?: boolean
   isError: boolean
   /** ms between tool_use finalization and tool_result arrival; 0 if unknown */
   durationMs: number
@@ -85,6 +93,9 @@ export interface TurnToolEntry {
    *  refresh order matches the live emit order; falls back to a computed
    *  offset when absent (pre-Fix-B gateway). Plan §3.5.4. */
   arrivedAt: number
+  /** Global, monotonic ordinal in the user-visible turn. Unlike millisecond
+   * timestamps this cannot tie, so refresh can reconstruct exact live order. */
+  eventOrdinal?: number
   inputTruncated?: boolean
   outputTruncated?: boolean
 }
@@ -97,6 +108,18 @@ export interface SegmentRecord {
   index: number
   text: string
   ts: number
+  /** Global, monotonic ordinal of the segment's first emitted byte. */
+  eventOrdinal?: number
+}
+
+/** Exact opaque engine/protocol event retained alongside UI projections.
+ * `payload` is structured-cloned from the parsed wire object and is never
+ * summarized or capped. */
+export interface DurableRuntimeEvent {
+  ordinal: number
+  observedAt: number
+  source: 'ccb' | 'codex-jsonrpc' | 'gateway'
+  payload: unknown
 }
 
 /** turn 终态 meta(原 SessionStreamEvent 'final' 变体的 meta,逐字段不变)。 */
@@ -149,12 +172,19 @@ export type EngineEvent =
  */
 export interface EngineBillingEvent {
   requestId: string
+  /** Stable logical paid-turn key shared with lossless turn-tape persistence. */
+  turnKey?: string
+  /** Delegate spend belongs to the root user-visible turn, not the transient
+   * child session turn. These locators originate from AgentSession creation,
+   * never from model output. */
+  parentTurnKey?: string
+  parentSessionId?: string
+  delegateAgentId?: string
   /** engine-reported 计费的稳定记账键 = engine/engineSessionId.ts 的
    *  `engineSessionId(sessionKey)`(唯一 helper,禁止各处自行 hash)。M2 双钱包
    *  settle 落 usage_records.session_id 与 idle-timeout turn-waive 上报都用它 ——
    *  不用 containerId/threadId 占位(refund.ts 按 session_id 圈退款窗口)。
-   *  M1a 阶段 wire 帧(outbound.codex_billing)暂不携带本字段(protocol 包
-   *  不在本批改动范围),master 侧接线在 M2。 */
+   *  master 侧用它圈定退款窗口。 */
   engineSessionId: string
   status: 'success' | 'error'
   durationMs: number
@@ -221,6 +251,7 @@ export interface TurnSummary {
   assistantSegments: SegmentRecord[]
   thinkingSegments: SegmentRecord[]
   tools: TurnToolEntry[]
+  runtimeEvents: DurableRuntimeEvent[]
   stopReason: string | null
   numTurns: number | null
   isError: boolean
@@ -228,6 +259,8 @@ export interface TurnSummary {
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */
   errorKind?: 'auth' | 'other'
+  /** Complete engine-reported error object/string, never truncated. */
+  errorDetail?: string
   /** 底座报告 --resume/thread id 已失效(CCB: "No conversation found with
    *  session ID")。sessionManager 据此逐出 resume-map 条目。 */
   staleResumeId: boolean
@@ -244,7 +277,10 @@ export interface TurnSummary {
 export interface PartialSnapshot {
   assistantText: string
   thinkingText: string
+  /** Every observed top-level tool call. Includes unmatched/in-progress calls
+   * so crash and interrupt tapes do not discard paid model output. */
   completedTools: TurnToolEntry[]
   assistantSegments: SegmentRecord[]
   thinkingSegments: SegmentRecord[]
+  runtimeEvents: DurableRuntimeEvent[]
 }

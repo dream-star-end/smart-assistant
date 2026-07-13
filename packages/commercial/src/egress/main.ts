@@ -13,7 +13,7 @@
  * 部署语义:deploy-v5.sh 默认只重启 master;egress 只在其相关代码变更时显式重启
  * (--egress),重启前 SIGTERM 走 drain(停接新连接,在飞流最多等 EGRESS_DRAIN_MS)。
  * master 重启期间:/v1/messages 完全无感;转发路径 503 transient(容器侧调用方
- * 均按 transient 重试);cost 回执进队列重试(120s TTL 覆盖重启窗口)。
+ * 均按 transient 重试);cost 持久化回执先 fsync 到本地 outbox,无 TTL 重试到 ACK。
  *
  * fail-closed:split 模式必须配齐 INTERNAL_PROXY_* / INTERNAL_CONTROL_* /
  * OC_EGRESS_SECRET,任一缺失拒启(比"静默半配跑起来"好排查)。
@@ -154,6 +154,7 @@ export async function startEgress(): Promise<void> {
 
   const controlBaseUrl = `http://${controlBind}:${controlPort}`;
   const costSink = new CostEventSink({ controlBaseUrl, secret });
+  await costSink.init();
 
   // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
   const staticProviderKeys = {
@@ -208,17 +209,23 @@ export async function startEgress(): Promise<void> {
       costCredits: string,
       sessionId?: string | null,
       parentSessionId?: string | null,
+      delegateAgentId?: string | null,
+      turnKey?: string | null,
+      parentTurnKey?: string | null,
     ) => {
       // 裸 uid 原样传;master 侧 appendCostCreditsForUser 统一加 c: 前缀(命名
       // 空间对齐逻辑留在唯一写入方,防两处漂移)。parentSessionId(委派父客户端会话)
       // 随 persist 事件过 egress→master,不能在 egress 边界丢弃否则 durable 归并失效。
-      costSink.enqueue({
+      await costSink.enqueueDurable({
         kind: "persist",
         requestId,
         uid: rawUserId,
         costCredits,
         sessionId: sessionId ?? null,
         parentSessionId: parentSessionId ?? null,
+        delegateAgentId: delegateAgentId ?? null,
+        turnKey: turnKey ?? null,
+        parentTurnKey: parentTurnKey ?? null,
       });
     },
     staticProviderKeys,

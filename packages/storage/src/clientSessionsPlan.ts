@@ -195,6 +195,48 @@ export type AppendServerAuthoredPlan =
     }
 
 /**
+ * Atomic multi-record variant used by lossless turn-tape finalization.  A
+ * turn can contain hundreds of thinking/text/tool/delegate records; planning
+ * them as one mutation assigns all `_seq` values and performs at most one
+ * spill/write of the hot session tail.
+ */
+export type AppendServerAuthoredBatchPlan = AppendServerAuthoredPlan
+
+export function planAppendServerAuthoredBatch(
+  existingMsgs: MessageLike[],
+  messages: Array<MessageLike & { id: string }>,
+  currentNextSeq: number,
+  currentArchivedThroughSeq: number,
+): AppendServerAuthoredBatchPlan {
+  let next = existingMsgs
+  let applied = false
+  for (const message of messages) {
+    const result = appendServerAuthoredPure(next, message)
+    if (!result.applied) continue
+    next = result.messages
+    applied = true
+  }
+  if (!applied) return { kind: 'already_exists' }
+
+  const dedupedMessages = mergePreservingServerAuthored(next, next) as MessageLike[]
+  const normalized = normalizeAndAssignSeqs(existingMsgs, dedupedMessages, currentNextSeq)
+  const spill = planSpillOverflow(normalized.messages, currentArchivedThroughSeq)
+  const finalJson = JSON.stringify(spill.tail)
+  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
+    return { kind: 'oversized' }
+  }
+  return {
+    kind: 'write',
+    tail: spill.tail,
+    finalJson,
+    nextSeq: normalized.nextSeq,
+    archivedThroughSeq: spill.archivedThroughSeq,
+    chunksToInsert: spill.chunksToInsert,
+    idsToInsert: spill.idsToInsert,
+  }
+}
+
+/**
  * **server-authored append 决策**(纯) —— 由 {@link _appendServerAuthoredCore} 的判定部分抽出
  * (append 叠加 → 幻影去重自合并 → _seq 规范化 → spill 决策 → 超限判定)。**不触碰 DB**。
  *

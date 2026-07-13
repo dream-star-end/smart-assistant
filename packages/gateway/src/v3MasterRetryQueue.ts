@@ -29,10 +29,11 @@
  *   v3-sink retries get TTL-dropped with the same logic that broke us
  *   originally. Separate dir = separate semantics.
  *
- * TTL:
- *   24h for both `transient` and `session_missing` (Codex review tweak,
- *   Plan v2.1). Beyond that the entry is unlinked with a structured warn
- *   so ops sees we lost data — but at least the loss is loud.
+ * Retention:
+ *   Valid paid-turn entries have no age-based deletion. They remain until
+ *   master acknowledges the write or explicitly returns 410 SESSION_DELETED.
+ *   Only locally malformed bytes are renamed to *.quarantine. Valid entries
+ *   remain actively retryable across every non-410 remote response.
  *
  * Single-flight drainer:
  *   In-memory boolean lock. Enqueue can kick a fresh drain attempt that
@@ -62,9 +63,8 @@ import {
 
 const log = createLogger({ module: 'v3MasterRetryQueue' })
 
-/** Per-entry TTL. Beyond this the entry is unlinked with a structured
- *  warn. 24h covers most operational glitches (long master outage,
- *  prolonged auth misconfig, etc.) without keeping bytes around forever. */
+/** Kept for source compatibility with older tests/metrics. Valid entries are
+ * no longer deleted at this age (lossless paid-output retention policy). */
 export const ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 
 /** Periodic drain interval. The drainer is also kicked on enqueue
@@ -82,8 +82,7 @@ export const DEFAULT_DRAIN_INTERVAL_MS = 30_000
  * ~18/s(27k+/25min),旁路了 30s 周期。
  *
  * 对策:每个 entry 失败后按 attempts 退避,未到下次重试时刻就跳过本轮 attemptSend(不调
- * master)。这只**推迟**重试、**不改 drop 语义**,仍重试到 ENTRY_TTL_MS(24h)兜底,
- * 不丢迟建会话的消息(保持 Plan v2.1 数据安全意图)。借鉴 Claude Code AutoCompact
+ * master)。这只**推迟**重试、绝不按年龄删除;有效内容一直保留到 ACK。借鉴 Claude Code AutoCompact
  * 断路器思想(小概率异常路径在规模下也是大浪费)。
  */
 export const RETRY_BACKOFF_BASE_MS = 5_000
@@ -134,6 +133,10 @@ export interface DrainStats {
 }
 
 export interface V3MasterRetryQueue {
+  /** Persist before the first network attempt. Returns an opaque receipt. */
+  stageDurable(entry: V3MasterRetryEntry): Promise<string>
+  /** Remove only after master success or an explicit 410 deletion ACK. */
+  ackDurable(receipt: string): Promise<void>
   enqueueDurable(entry: V3MasterRetryEntry): Promise<void>
   drainOnce(): Promise<DrainStats>
   /** Fire-and-forget kick. Used by enqueue+post-attempt callers and the
@@ -192,12 +195,38 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
       await fh.close()
     }
     await rename(tmp, filepath)
+    await fsyncDir()
+  }
+
+  async function fsyncDir(): Promise<void> {
+    const fh = await open(dir, 'r')
+    try {
+      await fh.sync()
+    } finally {
+      await fh.close()
+    }
+  }
+
+  async function stageDurable(entry: V3MasterRetryEntry): Promise<string> {
+    await ensureDir()
+    const receipt = entryFilename()
+    const filepath = join(dir, receipt)
+    await atomicWriteJson(filepath, entry)
+    return receipt
+  }
+
+  async function ackDurable(receipt: string): Promise<void> {
+    if (!/^[0-9]+-[0-9a-f]+\.json$/.test(receipt)) {
+      throw new Error('invalid v3 master retry receipt')
+    }
+    await unlinkIgnoreEnoent(join(dir, receipt))
+    await fsyncDir().catch((err) => {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    })
   }
 
   async function enqueueDurable(entry: V3MasterRetryEntry): Promise<void> {
-    await ensureDir()
-    const filepath = join(dir, entryFilename())
-    await atomicWriteJson(filepath, entry)
+    await stageDurable(entry)
     // Don't await the kick — it's single-flight inside the queue and
     // drains in its own promise chain. Awaiting would couple the
     // caller's turn-end to the entire drain pass which can be long.
@@ -231,11 +260,11 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
    * One drain pass. ENOENT-tolerant throughout: entries can vanish under
    * us (concurrent kick, manual ops cleanup, simultaneous gateway
    * instance) and that's fine. Each file independently:
-   *   - read JSON; malformed → unlink + warn (it'll never parse).
-   *   - TTL-check by firstSeenAt → unlink + warn if exceeded.
+   *   - read JSON; malformed → quarantine + warn (bytes retained).
    *   - call attemptSend(payload):
    *     - success → unlink.
-   *     - V3SinkError fatal → unlink + warn.
+   *     - V3SinkError fatal+410 → unlink (confirmed deleted session).
+   *     - any other fatal → quarantine (contract repair required).
    *     - V3SinkError transient/session_missing → bump attempts, rewrite.
    *     - other throw → bump attempts, rewrite (defensive).
    *
@@ -293,27 +322,14 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
         entry = parsed
       } catch (err) {
         stats.fatalDropped++
-        log.warn('v3MasterRetryQueue: malformed entry, unlinking', { name }, err)
-        await unlinkIgnoreEnoent(filepath)
-        continue
-      }
-      // TTL check.
-      if (now() - entry.firstSeenAt > ENTRY_TTL_MS) {
-        stats.ttlDropped++
-        log.warn('v3MasterRetryQueue: entry TTL exceeded, dropping', {
-          name,
-          sessionId: entry.payload.sessionId,
-          turnIndex: entry.payload.turnIndex,
-          attempts: entry.attempts,
-          lastErrorClass: entry.lastErrorClass,
-          firstSeenAt: entry.firstSeenAt,
-        })
-        await unlinkIgnoreEnoent(filepath)
+        log.warn('v3MasterRetryQueue: malformed entry, quarantining', { name }, err)
+        await quarantine(filepath, 'malformed')
+        await fsyncDir()
         continue
       }
       // Per-entry 指数退避:刚失败过(attempts>0)且未到下次重试时刻 → 跳过本轮 attemptSend
       // (不调 master),计为 pending。这是消除"频繁 kick → 无间隔背靠背重发"风暴的关键;
-      // 退避不丢数据(TTL 仍兜底)。新 entry(attempts=0)或退避已过 → 正常重试。
+      // 退避不丢数据且没有 TTL。新 entry(attempts=0)或退避已过 → 正常重试。
       if (entry.attempts > 0 && typeof entry.lastErrorAt === 'number') {
         if (now() < entry.lastErrorAt + retryBackoffMs(entry.attempts)) {
           stats.pending++
@@ -324,12 +340,16 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
       try {
         await deps.attemptSend(entry.payload)
         stats.drained++
-        await unlinkIgnoreEnoent(filepath)
+        await ackDurable(name)
       } catch (err) {
-        if (err instanceof V3SinkError && err.errorClass === 'fatal') {
+        if (
+          err instanceof V3SinkError &&
+          err.errorClass === 'fatal' &&
+          err.httpStatus === 410
+        ) {
           stats.fatalDropped++
           log.warn(
-            'v3MasterRetryQueue: fatal sink error, unlinking',
+            'v3MasterRetryQueue: session deletion acknowledged, unlinking',
             {
               name,
               sessionId: entry.payload.sessionId,
@@ -338,10 +358,12 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
             },
             err,
           )
-          await unlinkIgnoreEnoent(filepath)
+          await ackDurable(name)
           continue
         }
-        // transient / session_missing / unknown — bump attempts + rewrite.
+        // Every non-410 response can be caused by a rolling deployment,
+        // migration skew or repaired contract bug. Keep the valid paid tape
+        // on the active queue and retry without an age/count cap.
         stats.retried++
         stats.pending++
         const cls: V3SinkErrorClass =
@@ -351,7 +373,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
           attempts: entry.attempts + 1,
           lastErrorClass: cls,
           lastErrorAt: now(),
-          lastErrorMessage: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+          lastErrorMessage: err instanceof Error ? err.message : String(err),
         }
         try {
           await atomicWriteJson(filepath, updated)
@@ -394,12 +416,24 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
   }
 
   return {
+    stageDurable,
+    ackDurable,
     enqueueDurable,
     drainOnce,
     kick,
     startPeriodic,
     stopPeriodic,
     pendingCount,
+  }
+}
+
+async function quarantine(path: string, reason: string): Promise<void> {
+  const quarantined = `${path}.quarantine-${reason}-${Date.now()}`
+  try {
+    await rename(path, quarantined)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw err
   }
 }
 
@@ -439,4 +473,3 @@ function isV3MasterRetryEntry(v: unknown): v is V3MasterRetryEntry {
   }
   return true
 }
-

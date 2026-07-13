@@ -95,7 +95,7 @@ export type ProactiveReceiverBody = z.infer<typeof BodySchema>
 
 /**
  * outcome 供容器 onDeliver 决策(全部 HTTP 200,除 identity 401 / body 400):
- *   queued / already_sent / pending / already_failed — outbox 状态机(同 outboundReceiver)
+ *   queued / already_sent / pending — outbox 状态机(同 outboundReceiver)
  *   pref_off          — 用户关了主动微信推送 → 容器走正常 web(不标注)
  *   no_binding        — 无 active 微信绑定 → 容器回退 web + 标注
  *   no_context_token  — 会话过期/未入站过,iLink 发不出 → 容器回退 web + 标注
@@ -106,7 +106,6 @@ export type ProactiveOutcome =
   | "queued"
   | "already_sent"
   | "pending"
-  | "already_failed"
   | "pref_off"
   | "no_binding"
   | "no_context_token"
@@ -127,7 +126,7 @@ export interface ProactiveReceiverDeps {
   isProactiveEnabled: (userId: number) => Promise<boolean>
   /** binding 当前 wsess 指针;从未入站过 → null。 */
   getSessionId: (pool: Pool, bindingUserId: string) => Promise<string | null>
-  /** outbox 最大尝试数;default = DEFAULT_MAX_ATTEMPTS。 */
+  /** @deprecated 仅保留滚动升级配置兼容;出站重试不再封顶。 */
   maxAttempts?: number
   logger?: Logger
   now?: () => number
@@ -262,6 +261,7 @@ export function makeProactiveReceiverHandler(
           senderId: recipient.senderId,
           sessionId,
           payload: parts,
+          rawPayload: body,
           now: now(),
         },
         deps.maxAttempts,

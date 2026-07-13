@@ -938,6 +938,100 @@ describe('mergePreservingServerAuthored — agent-group local-wins (P2 债A)', (
     )
   })
 
+  it('lossless tape-backed server row wins and its durable reference survives a client PUT', () => {
+    const local = cliAgentGroup('m-local', 240, 'dlg1', {
+      childBlocks: [{ kind: 'text', text: 'streamed placeholder' }],
+    })
+    const tapeRef = srvAgentGroup('srv-p-main-t0-agentgroup-dlg1', 250, 'dlg1', {
+      _turnTapeId: 'tape-1',
+      _turnTapeMsgId: 'srv-p-main-t0-agentgroup-dlg1',
+      _turnTapeSha256: 'a'.repeat(64),
+    })
+    const out = mergePreservingServerAuthored(
+      [cli('u1', 100), tapeRef],
+      [cli('u1', 100), local],
+    ) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    assert.equal(ag.length, 1)
+    assert.equal(ag[0].id, tapeRef.id)
+    assert.equal(ag[0]._turnTapeId, 'tape-1')
+  })
+
+  it('one complete tape anchor supersedes every streamed generated row in its turn', () => {
+    const anchor = {
+      id: 'srv-turn-billing',
+      role: 'assistant',
+      text: '',
+      ts: 9,
+      _source: 'server',
+      _turnTapeId: 'tape-complete',
+      _turnTapeSha256: 'b'.repeat(64),
+      _turnTapeComplete: true,
+      _turnTapeRecordCount: 5000,
+      _turnTapeStructuredRoles: ['plan', 'goal'],
+    } as Msg
+    const server: Msg[] = [cli('u1', 1), anchor]
+    const client: Msg[] = [
+      cli('u1', 1),
+      { id: 'm-thinking', role: 'thinking', text: 'partial thought', ts: 2 },
+      { id: 'm-tool', role: 'tool', text: 'partial tool', blockId: 'different-id', ts: 3 },
+      cliAgentGroup('m-group', 4, 'different-run', {
+        childBlocks: [{ kind: 'text', text: 'partial child' }],
+      }),
+      plan('m-plan', 5, 'plan-live', ['inProgress'], {
+        explanation: 'browser-only plan copy',
+      }),
+      {
+        id: 'm-goal',
+        role: 'goal',
+        text: 'browser-only goal copy',
+        blockId: 'goal-live',
+        ts: 6,
+      },
+      { id: 'm-unknown', role: 'status-card', text: 'unrelated client row', ts: 7 },
+      { id: 'm-answer', role: 'assistant', text: 'partial answer', ts: 5 },
+    ]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(out.map((m) => m.id), ['u1', 'm-unknown', 'srv-turn-billing'])
+    assert.equal(out[2]._turnTapeComplete, true)
+  })
+
+  it('drops hydrated tape projections on browser PUT and keeps only the hot anchor', () => {
+    const anchor = {
+      id: 'srv-turn-billing',
+      role: 'assistant',
+      ts: 9,
+      _source: 'server',
+      _turnTapeId: 'tape-complete',
+      _turnTapeSha256: 'b'.repeat(64),
+      _turnTapeComplete: true,
+      _turnTapeRecordCount: 3,
+    } as Msg
+    const projected = (id: string, role: string, ts: number) => ({
+      id,
+      role,
+      text: '完整生成内容'.repeat(1000),
+      ts,
+      _source: 'server',
+      _turnTapeId: 'tape-complete',
+      _turnTapeMsgId: id,
+      _turnTapeSha256: 'b'.repeat(64),
+      _turnTapeExpanded: true,
+    } as Msg)
+    const out = mergePreservingServerAuthored(
+      [cli('u1', 1), anchor],
+      [
+        cli('u1', 1),
+        projected('srv-thinking', 'thinking', 2),
+        projected('srv-tool', 'tool', 3),
+        projected('srv-turn-billing', 'assistant', 9),
+      ],
+    ) as Msg[]
+    assert.deepEqual(out.map((m) => m.id), ['u1', 'srv-turn-billing'])
+    assert.equal(out[1]._turnTapeComplete, true)
+    assert.equal(out[1]._turnTapeExpanded, undefined)
+  })
+
   it('keeps both when runIds differ (distinct delegations)', () => {
     const local = cliAgentGroup('m-1', 240, 'dlgA', { childBlocks: [{ kind: 'text', text: 'A' }] })
     const server: Msg[] = [

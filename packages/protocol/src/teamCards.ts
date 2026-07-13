@@ -70,9 +70,9 @@ export type TeamCardClientDisplayField = (typeof TEAM_CARD_CLIENT_DISPLAY_FIELDS
 // persistServerAuthoredTurn 下发给 master;master 落库为 role 'agent-group'
 // 的 server 行,字段映射成上面的 TEAM_CARD_CLIENT_DISPLAY_FIELDS 展示名。
 //
-// 显式权衡(见 docs/plans batch2 §2.1):childBlocks 过程树不进本载荷
-// (sink body cap 256KB;live 富树仍走 delegate_progress 帧 + 本设备 IndexedDB)。
-// 跨设备/清缓存时 server 行提供"完整团队结构 + 结果摘要 + 终态",过程细节降级。
+// v2 lossless turn tape 已取消旧 sink 256KB 整体正文限制。当前载荷同时携带
+// resultSummary 与 transcript 完整过程树；跨设备/清缓存后仍能恢复子 Agent 的正文、
+// 思考、工具输入输出及嵌套委派，不再依赖本设备 IndexedDB。
 //
 // 契约不可擅改字段语义:gateway(V3MasterSinkWirePayload.agentGroups[])与 master
 // (internalServerAuthored BodySchema,.strict())两侧同批同步。
@@ -121,12 +121,15 @@ export interface DurableAgentGroup {
   goal: string
   /** 委派终态(落库 `_delegateStatus`;并派生 `_isError = status !== 'ok'`)。 */
   status: AgentGroupStatus
-  /** 结果/错误摘要,生成点已截断 ≤ 2KB(落库 `_resultPreview`)。可空
-   *  (无文本输出的成功委派)。 */
+  /** 完整结果/错误文本。UI 可以另做预览,持久化权威不得截断。 */
   resultSummary?: string
+  /** 子 Agent 本次执行产生的完整 block 序列(思考/正文/工具输入输出)。 */
+  transcript?: unknown[]
   /** 委派实际完成时刻(epoch ms)。落库同时作行 `ts`(turn 内插序)与
    *  `completedAt`(展示)。 */
   completedAt: number
+  /** Global monotonic order within the owning leader turn. */
+  _ocEventOrdinal?: number
   /** P2 债C — 隐藏审查员委派专属:gateway 硬编排 review pass 从审查输出解析出的
    *  结构化裁决(落库 `_reviewVerdict`)。仅审查员委派行携带,普通成员委派恒
    *  undefined。与 `status`(执行态)正交:一次成功执行的审查照样可裁决 NEEDS_FIX。 */

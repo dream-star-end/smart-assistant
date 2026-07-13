@@ -334,6 +334,8 @@ export function extractSessionId(
 export const OC_ATTR_MODE_KEY = "oc_mode";
 export const OC_ATTR_PARENT_SESSION_KEY = "oc_parent_session_id";
 export const OC_ATTR_DELEGATE_AGENT_KEY = "oc_delegate_agent_id";
+export const OC_ATTR_TURN_KEY = "oc_turn_key";
+export const OC_ATTR_PARENT_TURN_KEY = "oc_parent_turn_key";
 
 /**
  * 计费归因(usage_records 落库维度)。
@@ -356,18 +358,26 @@ export interface UsageAttribution {
   mode: "chat" | "delegate";
   parentSessionId: string | null;
   delegateAgentId: string | null;
+  turnKey: string | null;
+  parentTurnKey: string | null;
 }
 
 const CHAT_ATTRIBUTION: Omit<UsageAttribution, "sessionId"> = {
   mode: "chat",
   parentSessionId: null,
   delegateAgentId: null,
+  turnKey: null,
+  parentTurnKey: null,
 };
 
 function cleanAttrString(v: unknown): string | null {
   if (typeof v !== "string") return null;
   const trimmed = v.trim();
   return trimmed ? trimmed.slice(0, 256) : null;
+}
+
+function cleanTurnKey(v: unknown): string | null {
+  return typeof v === "string" && /^[0-9a-f]{64}$/.test(v) ? v : null;
 }
 
 export function extractUsageAttribution(
@@ -395,13 +405,19 @@ export function extractUsageAttribution(
     : cleanAttrString(parsed?.session_id);
 
   if (parsed?.[OC_ATTR_MODE_KEY] !== "delegate") {
-    return { sessionId, ...CHAT_ATTRIBUTION };
+    return {
+      sessionId,
+      ...CHAT_ATTRIBUTION,
+      turnKey: cleanTurnKey(parsed?.[OC_ATTR_TURN_KEY]),
+    };
   }
   return {
     sessionId,
     mode: "delegate",
     parentSessionId: cleanAttrString(parsed[OC_ATTR_PARENT_SESSION_KEY]),
     delegateAgentId: cleanAttrString(parsed[OC_ATTR_DELEGATE_AGENT_KEY]),
+    turnKey: cleanTurnKey(parsed[OC_ATTR_TURN_KEY]),
+    parentTurnKey: cleanTurnKey(parsed[OC_ATTR_PARENT_TURN_KEY]),
   };
 }
 
@@ -1321,6 +1337,9 @@ export interface AnthropicProxyDeps {
     sessionId?: string | null,
     // delegate 子会话的父客户端会话 id(web-*)→ pending.parent_session_id,队长助手行按父会话归并。
     parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
   /**
    * 静态 key 文本 provider(deepseek/minimax/ark)的 key 解析表。

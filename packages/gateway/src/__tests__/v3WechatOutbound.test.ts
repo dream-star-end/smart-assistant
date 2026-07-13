@@ -2,11 +2,10 @@
  * V3 commercial container → master /internal/v3/wechat-outbound adapter unit tests.
  *
  * Slice 7c lock-in invariants (Codex plan v3 PASS):
- *   1. 2xx (both 200 + 202) → success → no enqueue
- *   2. 401 / 403 / 404 / 410 → fatal → log + drop (no enqueue)
- *   3. 429 + 5xx + network error + timeout → transient → enqueue durable
- *   4. peer.id 不是 wsess- → log + drop (build payload 失败)
- *   5. peer.displayName 缺失 / 非 senderId 字符集 → log + drop
+ *   1. every valid message/billing payload is fsync-staged before first POST
+ *   2. only the durable queue owns send/retry/ACK deletion
+ *   3. no request-body semantic size cap
+ *   4. invalid routing payloads throw instead of silently dropping
  *   6. peer.displayName 正确 → wire body.peer.meta.senderId 出现该值
  *   7. shutdown() 后 send() 仍可调,attempt 失败仍可 enqueueDurable
  *   8. readV3WechatOutboundConfig:两 env 都缺 → null;尾斜杠 strip
@@ -359,8 +358,8 @@ describe("attemptSend — transient classification", () => {
   })
 })
 
-describe("attemptSend — body cap", () => {
-  test("payload > 64 KB → fatal before POST", async () => {
+describe("attemptSend — uncapped request body", () => {
+  test("payload > former 64 KB cap is posted byte-exactly", async () => {
     const PAYLOAD: V3WechatSinkWirePayload = {
       sessionId: SESSION_ID,
       channel: "wechat",
@@ -369,69 +368,62 @@ describe("attemptSend — body cap", () => {
       blocks: [{ kind: "text", text: "x".repeat(80 * 1024) }],
       createdAt: 1_700_000_000_000,
     }
-    let postCalled = false
-    const fetcher = (async () => {
-      postCalled = true
+    let postedBody = ""
+    const fetcher = (async (_url: unknown, init: { body?: string }) => {
+      postedBody = init.body ?? ""
       return { statusCode: 200, headers: {}, body: { async *[Symbol.asyncIterator]() {} } as any }
     }) as unknown as typeof import("undici").request
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
-      (err: unknown) => {
-        assert.ok(err instanceof V3WechatSinkError)
-        assert.equal(err.errorClass, "fatal")
-        return true
-      },
-    )
-    assert.equal(postCalled, false, "must not POST when payload over cap")
+    await attemptSend(PAYLOAD, { config: CFG, fetcher })
+    assert.deepEqual(JSON.parse(postedBody), PAYLOAD)
   })
 })
 
 // ─── adapter.send orchestration ─────────────────────────────────────────
 
 describe("makeV3WechatOutboundAdapter — send orchestration", () => {
-  test("codex billing frame posts compact sideband and bypasses message payload validation", async () => {
+  test("codex billing frame is durably staged before delivery", async () => {
     const q = fakeQueue()
-    const captured: any[] = []
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
       retryQueue: q,
-      attemptSendImpl: async (payload) => {
-        captured.push(payload)
-      },
     })
     await adapter.init!(makeCtx())
     await adapter.send!({
       type: "outbound.codex_billing",
       channel: "wechat",
       requestId: "0123456789abcdef0123456789abcdef",
+      turnKey: "ab".repeat(32),
+      parentTurnKey: "cd".repeat(32),
+      parentSessionId: "web-parent-1",
+      delegateAgentId: "researcher",
       status: "success",
       durationMs: 321,
       usage: { input_tokens: 10, output_tokens: 20 },
       rateLimits: { util5h: 0.1, reset5h: "2026-06-01T00:00:00Z" },
       traceId: "trc-codex-billing",
     } as unknown as OutboundMessage)
-    assert.equal(captured.length, 1)
-    assert.deepEqual(captured[0], {
+    assert.equal(q.enqueued.length, 1)
+    assert.equal(q.enqueued[0]!.attempts, 0)
+    assert.deepEqual(q.enqueued[0]!.payload, {
       type: "outbound.codex_billing",
       requestId: "0123456789abcdef0123456789abcdef",
+      turnKey: "ab".repeat(32),
+      parentTurnKey: "cd".repeat(32),
+      parentSessionId: "web-parent-1",
+      delegateAgentId: "researcher",
       status: "success",
       durationMs: 321,
       usage: { input_tokens: 10, output_tokens: 20 },
       rateLimits: { util5h: 0.1, reset5h: "2026-06-01T00:00:00Z" },
       traceId: "trc-codex-billing",
     })
-    assert.equal(q.enqueued.length, 0)
   })
 
   test("webchat codex billing frame is accepted when sent through v3 WeChat adapter", async () => {
     const q = fakeQueue()
-    const captured: any[] = []
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
       retryQueue: q,
-      attemptSendImpl: async (payload) => {
-        captured.push(payload)
-      },
     })
     await adapter.init!(makeCtx())
     await adapter.send!({
@@ -441,12 +433,11 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       status: "success",
       durationMs: 321,
     } as unknown as OutboundMessage)
-    assert.equal(captured.length, 1)
-    assert.equal(captured[0].type, "outbound.codex_billing")
-    assert.equal(q.enqueued.length, 0)
+    assert.equal(q.enqueued.length, 1)
+    assert.equal((q.enqueued[0]!.payload as { type?: string }).type, "outbound.codex_billing")
   })
 
-  test("invalid codex billing requestId is dropped before POST", async () => {
+  test("invalid codex billing requestId throws instead of silently dropping", async () => {
     const q = fakeQueue()
     let attempted = false
     const adapter = makeV3WechatOutboundAdapter({
@@ -457,18 +448,18 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!({
-      type: "outbound.codex_billing",
-      channel: "wechat",
-      requestId: "BAD",
-      status: "success",
-      durationMs: 1,
-    } as unknown as OutboundMessage)
+    await assert.rejects(() => adapter.send!({
+        type: "outbound.codex_billing",
+        channel: "wechat",
+        requestId: "BAD",
+        status: "success",
+        durationMs: 1,
+      } as unknown as OutboundMessage), /cannot durably stage codex billing frame/)
     assert.equal(attempted, false)
     assert.equal(q.enqueued.length, 0)
   })
 
-  test("transient codex billing sink error enqueues durable retry", async () => {
+  test("codex billing entry starts at attempts=0 before any delivery", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -490,8 +481,8 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     assert.equal(q.enqueued.length, 1)
     const entry = q.enqueued[0]!
     assert.equal(entry.schemaVersion, 1)
-    assert.equal(entry.attempts, 1)
-    assert.equal(entry.lastErrorClass, "transient")
+    assert.equal(entry.attempts, 0)
+    assert.equal(entry.lastErrorClass, undefined)
     assert.deepEqual(entry.payload, {
       type: "outbound.codex_billing",
       requestId: "0123456789abcdef0123456789abcdef",
@@ -501,7 +492,7 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     })
   })
 
-  test("2xx success → no enqueue", async () => {
+  test("even an immediately healthy master receives only after durable stage", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -510,10 +501,11 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     })
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut())
-    assert.equal(q.enqueued.length, 0)
+    assert.equal(q.enqueued.length, 1)
+    assert.equal(q.enqueued[0]!.attempts, 0)
   })
 
-  test("fatal error → log + drop, no enqueue", async () => {
+  test("non-final output is staged regardless of future fatal classification", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -524,10 +516,11 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     })
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut({ isFinal: false }))
-    assert.equal(q.enqueued.length, 0, "non-final fatal must NOT enqueue (would just retry-loop until TTL)")
+    assert.equal(q.enqueued.length, 1)
+    assert.equal(messagePayload(q.enqueued[0]!).isFinal, undefined)
   })
 
-  test("fatal final error → enqueue terminal retry so master can clear running state", async () => {
+  test("final output is staged with terminal marker and no pre-attempt error mutation", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -540,11 +533,12 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut({ isFinal: true }))
     assert.equal(q.enqueued.length, 1)
-    assert.equal(q.enqueued[0]!.lastErrorClass, "fatal")
+    assert.equal(q.enqueued[0]!.attempts, 0)
+    assert.equal(q.enqueued[0]!.lastErrorClass, undefined)
     assert.equal(messagePayload(q.enqueued[0]!).isFinal, true)
   })
 
-  test("transient error → enqueueDurable", async () => {
+  test("message payload is fully staged before transient delivery can occur", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -559,8 +553,8 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     assert.equal(q.enqueued.length, 1)
     const entry = q.enqueued[0]!
     assert.equal(entry.schemaVersion, 1)
-    assert.equal(entry.attempts, 1)
-    assert.equal(entry.lastErrorClass, "transient")
+    assert.equal(entry.attempts, 0)
+    assert.equal(entry.lastErrorClass, undefined)
     const payload = messagePayload(entry)
     assert.equal(payload.sessionId, SESSION_ID)
     assert.equal(payload.peer.meta.senderId, SENDER_ID)
@@ -568,8 +562,7 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     assert.equal(payload.agentId, "main")
   })
 
-  test("non-V3WechatSinkError thrown by attempt → enqueue as transient", async () => {
-    // 防御性:任何未分类的 throw 走 transient,保数据不丢
+  test("delivery implementation cannot run before injected durable queue accepts", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({
       config: CFG,
@@ -581,10 +574,10 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut())
     assert.equal(q.enqueued.length, 1)
-    assert.equal(q.enqueued[0]!.lastErrorClass, "transient")
+    assert.equal(q.enqueued[0]!.attempts, 0)
   })
 
-  test("peer.id 不是 wsess- → log + drop, no POST attempt, no enqueue", async () => {
+  test("peer.id 不是 wsess- → reject, never silently drop", async () => {
     const q = fakeQueue()
     let attempted = false
     const adapter = makeV3WechatOutboundAdapter({
@@ -595,14 +588,14 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!(
-      makeOut({ peer: { id: "personal-sess-xyz", kind: "dm", displayName: SENDER_ID } }),
-    )
+    await assert.rejects(() => adapter.send!(
+        makeOut({ peer: { id: "personal-sess-xyz", kind: "dm", displayName: SENDER_ID } }),
+      ), /cannot durably stage WeChat output/)
     assert.equal(attempted, false, "non-wsess- must short-circuit before POST")
     assert.equal(q.enqueued.length, 0)
   })
 
-  test("peer.displayName 缺失 → log + drop (senderId carrier broken)", async () => {
+  test("peer.displayName 缺失 → reject (senderId carrier broken)", async () => {
     const q = fakeQueue()
     let attempted = false
     const adapter = makeV3WechatOutboundAdapter({
@@ -613,30 +606,15 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!(makeOut({ peer: { id: SESSION_ID, kind: "dm" } }))
-    assert.equal(attempted, false)
-    assert.equal(q.enqueued.length, 0)
-  })
-
-  test("peer.displayName 非 senderId 字符集 → log + drop", async () => {
-    const q = fakeQueue()
-    let attempted = false
-    const adapter = makeV3WechatOutboundAdapter({
-      config: CFG,
-      retryQueue: q,
-      attemptSendImpl: async () => {
-        attempted = true
-      },
-    })
-    await adapter.init!(makeCtx())
-    await adapter.send!(
-      makeOut({ peer: { id: SESSION_ID, kind: "dm", displayName: "has spaces!" } }),
+    await assert.rejects(
+      () => adapter.send!(makeOut({ peer: { id: SESSION_ID, kind: "dm" } })),
+      /cannot durably stage WeChat output/,
     )
     assert.equal(attempted, false)
     assert.equal(q.enqueued.length, 0)
   })
 
-  test("blocks 空数组 → log + drop", async () => {
+  test("peer.displayName 非 senderId 字符集 → reject", async () => {
     const q = fakeQueue()
     let attempted = false
     const adapter = makeV3WechatOutboundAdapter({
@@ -647,7 +625,28 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!(makeOut({ blocks: [] }))
+    await assert.rejects(() => adapter.send!(
+        makeOut({ peer: { id: SESSION_ID, kind: "dm", displayName: "has spaces!" } }),
+      ), /cannot durably stage WeChat output/)
+    assert.equal(attempted, false)
+    assert.equal(q.enqueued.length, 0)
+  })
+
+  test("blocks 空数组 → reject", async () => {
+    const q = fakeQueue()
+    let attempted = false
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        attempted = true
+      },
+    })
+    await adapter.init!(makeCtx())
+    await assert.rejects(
+      () => adapter.send!(makeOut({ blocks: [] })),
+      /cannot durably stage WeChat output/,
+    )
     assert.equal(attempted, false)
     assert.equal(q.enqueued.length, 0)
   })

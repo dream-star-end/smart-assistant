@@ -11,11 +11,11 @@
  *   - `log`(broker.ts 注入,P1 简单 console)
  *
  * **关键设计**:
- *   - Worker 不做 DB 级 retry backoff;失败行 release 回 'queued',但 transient fail
- *     会结束当前 tick,避免同一 tick 内把 ret=-2 这类 iLink 业务失败重试到 attempts cap。
+ *   - Transient failure records an uncapped DB backoff and ends the current
+ *     tick,so one row cannot hot-loop inside a tick.
  *   - 每 tick 拉到 `maxPerTick` 条就 yield(防 event loop 长 block 影响 broker.reconcile / inbound)
- *   - 失败分类:`SendResult.permanent=true` → 立即 force-fail(attempts=maxAttempts,不复活);
- *     否则 attempts+1,< maxAttempts release 'queued',>= maxAttempts 转 'failed' 终态
+ *   - 失败分类:`SendResult.permanent=true` → retained failed(内容不清理);
+ *     其它失败 attempts+1 后永远 release queued,无次数/时长上限
  *   - "binding 失踪" / "no context_token" 视为 permanent(用户没绑定或未入站过,broker 重试无意义)
  */
 
@@ -40,7 +40,7 @@ export const DEFAULT_INTER_ROW_DELAY_MS = DEFAULT_INTER_PART_DELAY_MS
 export const DEFAULT_TRANSIENT_BACKOFF_BASE_MS = 5000
 export const DEFAULT_TRANSIENT_BACKOFF_MAX_MS = 60_000
 
-/** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
+/** sendText 实装返回。permanent 表示当前 owner/payload 不可投递,但 PG 原文仍永久保留。 */
 export interface SendResult {
   ok: boolean
   errMessage?: string
@@ -85,7 +85,7 @@ export interface OutboxWorkerOptions {
   maxPerTick?: number
   /** 周期 tick 间隔 ms。默认 1000。 */
   pollIntervalMs?: number
-  /** 重试 cap。默认 DEFAULT_MAX_ATTEMPTS。 */
+  /** @deprecated 仅保留配置兼容;出站不再按次数停止。 */
   maxAttempts?: number
   /** 同一 outbox row 内连续 iLink sendmessage 之间的 pacing。默认 1000ms。 */
   interPartDelayMs?: number
@@ -105,7 +105,6 @@ export type DrainOutcome =
   | { kind: 'sent'; outboxId: number }
   | { kind: 'failed_permanent'; outboxId: number; reason: string }
   | { kind: 'failed_transient'; outboxId: number; attempts: number; errMessage: string }
-  | { kind: 'failed_terminal'; outboxId: number; attempts: number; errMessage: string }
   /** markSent / markFailed 命中 0 row(状态机漂移,真正罕见);broker 只 log 不 throw。 */
   | { kind: 'noop'; outboxId: number; reason: string }
 
@@ -128,7 +127,7 @@ export function stableIlinkClientId(
 }
 
 /**
- * 强制把一行翻成 'failed' 终态(attempts = maxAttempts,后续 enqueue 永走 already_failed)。
+ * 把明确不可投递的行翻成 retained `failed` 状态。
  *
  * 用于 permanent 错误(binding 失踪 / no context_token / sendText 标 permanent),
  * markFailed 自然路径走不到的兜底。
@@ -138,19 +137,19 @@ async function forceFail(
   id: number,
   errMessage: string,
   now: number,
-  maxAttempts: number,
+  _maxAttempts: number,
 ): Promise<boolean> {
   const truncErr = errMessage.length > 1000 ? errMessage.slice(0, 1000) : errMessage
   const res = await pool.query(
     `UPDATE wechat_outbox SET
        status     = 'failed',
-       attempts   = GREATEST(attempts + 1, $1),
-       last_error = $2,
+       attempts   = attempts + 1,
+       last_error = $1,
        locked_at  = NULL,
        next_attempt_at = NULL,
-       updated_at = $3
-     WHERE id = $4 AND status = 'sending'`,
-    [maxAttempts, truncErr, now, id],
+       updated_at = $2
+     WHERE id = $3 AND status = 'sending'`,
+    [truncErr, now, id],
   )
   return (res.rowCount ?? 0) > 0
 }
@@ -246,18 +245,13 @@ export async function drainOne(
       }
       const failureNow = now()
       const attemptsAfterFailure = row.attempts + 1
-      const nextAttemptAt =
-        attemptsAfterFailure >= maxAttempts
-          ? null
-          : computeTransientNextAttemptAt(failureNow, attemptsAfterFailure, {
-              baseMs: deps.transientBackoffBaseMs,
-              maxMs: deps.transientBackoffMaxMs,
-            })
+      const nextAttemptAt = computeTransientNextAttemptAt(failureNow, attemptsAfterFailure, {
+        baseMs: deps.transientBackoffBaseMs,
+        maxMs: deps.transientBackoffMaxMs,
+      })
       const r = await markFailed(pool, row.id, errMsg, failureNow, maxAttempts, nextAttemptAt)
       if (!r) return { kind: 'noop', outboxId: row.id, reason: 'markFailed_drift' }
-      return r.permanent
-        ? { kind: 'failed_terminal', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
-        : { kind: 'failed_transient', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
+      return { kind: 'failed_transient', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
     }
     sentParts++
     if (interPartDelayMs > 0 && hasLaterSendablePart(row.payload, i, Boolean(sendMedia && resolveMediaPart))) {
@@ -413,8 +407,8 @@ export class OutboxWorker {
 }
 
 /**
- * 周期 housekeeping(daemon 角色):dropAgedPending + releaseStaleSending + purge 两路 tombstone。
- * broker.ts 单独 schedule(默认 5min 一次),不和 drain loop 混进同一 timer 减少抢锁。
+ * 周期 housekeeping(daemon 角色)。只有 releaseStaleSending 会改库;其余三个
+ * compatibility hook 均为 no-op,确保付费输出及幂等 tombstone 不因时间被删除。
  */
 export async function runHousekeeping(
   pool: Pool,
@@ -427,7 +421,7 @@ export async function runHousekeeping(
   purgedFailed: number
 }> {
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
-  // 顺序:先 release stale sending(可能让 drop/queued 抓到老 row),再 drop aged,最后 purge tombstones。
+  // 保留原调用形状便于滚动升级;后三个函数在无损模式下恒为 no-op。
   const staleReleased = await releaseStaleSending(pool, now)
   const aged = await dropAgedPending(pool, now, undefined, maxAttempts)
   const purgedSent = await purgeSentTombstones(pool, now)

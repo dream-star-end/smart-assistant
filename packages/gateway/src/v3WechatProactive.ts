@@ -69,7 +69,6 @@ function classifyOutcome(outcome: string): ProactiveDeliveryResult {
     case "pref_off":
     case "no_binding":
     case "empty_render":
-    case "already_failed":
     default:
       return { kind: "fallback", marked: false }
   }

@@ -22,6 +22,54 @@ import { type TerminalBackend, createBackend } from './terminalBackend.js'
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
 
+const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
+const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
+
+type RunnerExitInfo = {
+  code: number | null
+  signal: NodeJS.Signals | null
+  crashed: boolean
+}
+
+function runnerShutdownTimeoutMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+}
+
+function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (closed: boolean) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(closed)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    closePromise.then(() => finish(true))
+  })
+}
+
+function killRunnerProcessGroup(
+  proc: ChildProcessWithoutNullStreams,
+  signal: NodeJS.Signals,
+): void {
+  try {
+    if (typeof proc.pid === 'number' && proc.pid > 0) {
+      process.kill(-proc.pid, signal)
+      return
+    }
+  } catch {
+    // Fall back to the direct child if the detached process group is already
+    // gone or unavailable on this platform.
+  }
+  try {
+    proc.kill(signal)
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * 构造容器侧 OC_REMOTE_* env。
  *
@@ -101,6 +149,8 @@ export interface UsageAttributionTag {
   parentSessionId?: string
   /** 委派目标 agent id(hidden-reviewer 同样打标)。 */
   delegateAgentId: string
+  /** Leader logical turn that owns this delegate's spend. */
+  parentTurnKey?: string
 }
 
 /**
@@ -127,14 +177,22 @@ export interface UsageAttributionTag {
  */
 export function _buildCcbUsageAttributionEnv(
   tag: UsageAttributionTag | undefined,
+  turnKey?: string,
 ): { CLAUDE_CODE_EXTRA_METADATA: string } {
-  if (!tag) return { CLAUDE_CODE_EXTRA_METADATA: '' }
-  const extra: Record<string, string> = {
-    oc_mode: tag.mode,
-    oc_delegate_agent_id: tag.delegateAgentId.slice(0, 64),
+  if (!tag && !turnKey) return { CLAUDE_CODE_EXTRA_METADATA: '' }
+  const extra: Record<string, string> = {}
+  if (tag) {
+    extra.oc_mode = tag.mode
+    extra.oc_delegate_agent_id = tag.delegateAgentId.slice(0, 64)
+    if (tag.parentSessionId) {
+      extra.oc_parent_session_id = tag.parentSessionId.slice(0, 128)
+    }
+    if (tag.parentTurnKey && /^[0-9a-f]{64}$/.test(tag.parentTurnKey)) {
+      extra.oc_parent_turn_key = tag.parentTurnKey
+    }
   }
-  if (tag.parentSessionId) {
-    extra.oc_parent_session_id = tag.parentSessionId.slice(0, 128)
+  if (turnKey && /^[0-9a-f]{64}$/.test(turnKey)) {
+    extra.oc_turn_key = turnKey
   }
   return { CLAUDE_CODE_EXTRA_METADATA: JSON.stringify(extra) }
 }
@@ -742,22 +800,23 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   return args
 }
 
-// Cap for in-memory stdout/stderr accumulation per runner. If CCB ever emits
-// a chunk without newline (malformed output, corrupt base64, wedged write),
-// the buffer can grow unboundedly and eat gigabytes of RSS. When we cross
-// the limit we kill the subprocess and log "ccb.overflow".
+// Stderr is operational logging, not paid model output, so retain a bounded
+// single-line guard for a wedged/corrupt child. Stdout is intentionally NOT
+// capped: every valid stream-json line may contain model-authored text or a
+// tool result and must reach the lossless turn tape byte-for-byte. The old
+// shared 8 MiB cap killed CCB before parsing an oversized but valid JSON line,
+// irreversibly discarding exactly the content this persistence path protects.
 //
-// Configurable via OPENCLAUDE_CCB_MAX_STDOUT_BUF_BYTES (default 8 MiB,
-// clamped to [1 MiB, 256 MiB]).
-function readStdoutBufCap(): number {
+// Keep the existing env name for rolling operational compatibility; it now
+// controls stderr only.
+function readStderrBufCap(): number {
   const raw = Number(process.env.OPENCLAUDE_CCB_MAX_STDOUT_BUF_BYTES)
   if (Number.isFinite(raw) && raw > 0) {
     return Math.min(Math.max(raw, 1 << 20), 256 << 20)
   }
   return 8 << 20
 }
-const MAX_STDOUT_BUF_BYTES = readStdoutBufCap()
-const MAX_STDERR_BUF_BYTES = MAX_STDOUT_BUF_BYTES // same cap applies to stderr
+const MAX_STDERR_BUF_BYTES = readStderrBufCap()
 
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
@@ -766,11 +825,6 @@ export class SubprocessRunner extends EventEmitter {
   private currentExecutionDescriptor: CcbExecutionDescriptor | undefined
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private stdoutBuf = ''
-  /**
-   * Cached UTF-8 byte count of `stdoutBuf`. Updated incrementally on append
-   * and line-flush so per-chunk cap checks are O(1) instead of O(len).
-   */
-  private stdoutBufBytes = 0
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
   private currentSessionId: string | null = null
@@ -784,6 +838,11 @@ export class SubprocessRunner extends EventEmitter {
   private starting = false
   private closed = false
   private shuttingDown = false
+  /** Current process generation's stdout-close barrier. A bounded shutdown
+   * may return while an escaped descendant still owns the pipe; persistence
+   * awaits this promise so those late paid bytes remain part of the turn. */
+  private outputDrainPromise: Promise<void> = Promise.resolve()
+  private resolveOutputDrain: (() => void) | null = null
   // ── Crash-loop supervision (exponential backoff) ──
   // Every time the subprocess exits unexpectedly (or start() throws before a
   // successful spawn) we increment _consecutiveCrashes and push _backoffUntil
@@ -799,7 +858,7 @@ export class SubprocessRunner extends EventEmitter {
   private static BACKOFF_BASE_MS = 500
   private static BACKOFF_MAX_MS = 30_000
   private static STABLE_UPTIME_MS = 5 * 60_000
-  /** True once we force-killed due to buffer overflow; prevents double-kill. */
+  /** True once we force-killed due to stderr overflow; prevents double-kill. */
   private overflowKilled = false
   private sessionDir: string | null = null
   /** Timestamp of last stdout activity — used for liveness detection */
@@ -928,7 +987,6 @@ export class SubprocessRunner extends EventEmitter {
     this.closed = false
     this.overflowKilled = false
     this.stdoutBuf = ''
-    this.stdoutBufBytes = 0
     this.stderrBufBytes = 0
 
     // Wrap the entire setup in try/catch so ANY pre-spawn failure (config
@@ -1124,6 +1182,9 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
+    this.outputDrainPromise = new Promise<void>((resolve) => {
+      this.resolveOutputDrain = resolve
+    })
     this.spawnedExecutionDescriptor = this.currentExecutionDescriptor
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
     // manager's per-CCB cost-tracker reset) run strictly before any 'message'
@@ -1135,21 +1196,55 @@ export class SubprocessRunner extends EventEmitter {
     // gateway's per-session cost-delta baseline must NOT be reset to 0.
     this.emit('spawn', { resumed: !!this.currentSessionId })
 
+    // The OS process 'exit' event can precede delivery of bytes already in
+    // its stdout pipe. Forward the runner-level exit only after stdout closes,
+    // which is Node's guarantee that every preceding data chunk was emitted.
+    // Crash persistence can then snapshot a closed stream rather than guess
+    // with a timer and risk omitting a paid final JSONL frame.
+    let pendingExitInfo: RunnerExitInfo | null = null
+    let stdoutClosed = false
+    let exitForwarded = false
+    const forwardDrainedExit = () => {
+      if (exitForwarded || !stdoutClosed || !pendingExitInfo) return
+      exitForwarded = true
+      // The direct child may exit before a descendant releases stdout. If a
+      // bounded shutdown detaches it, the eventual stdout-close callback must
+      // not finalize a newly spawned turn.
+      this._forwardDrainedExitForProcess(proc, pendingExitInfo)
+    }
+
     proc.stdin.on('error', (err) =>
       runnerLog.warn('stdin error', { sessionKey: this.opts.sessionKey }, err),
     )
     proc.stdout.setEncoding('utf-8')
-    proc.stdout.on('data', (chunk: string) => this.handleStdout(chunk))
+    proc.stdout.on('data', (chunk: string) => {
+      // A terminal shutdown deadline can detach an old proc whose escaped
+      // descendant still owns stdout. Never parse those late bytes against a
+      // newly spawned runner state.
+      if (this.proc !== proc) return
+      this.handleStdout(chunk)
+    })
+    proc.stdout.once('close', () => {
+      // A process killed immediately after writing a complete JSON object may
+      // omit the conventional trailing newline. Feed one delimiter through
+      // the normal parser before declaring the stream drained.
+      if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n')
+      stdoutClosed = true
+      this.resolveOutputDrain?.()
+      this.resolveOutputDrain = null
+      forwardDrainedExit()
+    })
 
     proc.stderr.setEncoding('utf-8')
     this.stderrBufBytes = 0
     proc.stderr.on('data', (chunk: string) => {
+      if (this.proc !== proc) return
       this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
       this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
       // If stderr goes pathological (single burst > cap), kill to avoid RSS
       // blow-up from downstream listeners that might buffer all of it.
       if (this.stderrBufBytes > MAX_STDERR_BUF_BYTES) {
-        this.handleBufferOverflow('stderr', this.stderrBufBytes)
+        this.handleStderrOverflow(this.stderrBufBytes)
         this.stderrBufBytes = 0
         return
       }
@@ -1159,7 +1254,17 @@ export class SubprocessRunner extends EventEmitter {
     })
 
     proc.on('exit', (code, signal) => {
-      this.proc = null
+      // shutdown() may have reached its terminal post-SIGKILL deadline and a
+      // later submit may already own a new proc. A delayed exit from the old
+      // process must not mark the new turn crashed or reset its binding.
+      if (this.proc !== proc) {
+        runnerLog.info('stale subprocess exit ignored', {
+          sessionKey: this.opts.sessionKey,
+          code,
+          signal,
+        })
+        return
+      }
       this.spawnedExecutionDescriptor = undefined
       this.closed = true
       // Phase 5:进程死了,清 binding。下次 start 会按当时 repo state 重新评估。
@@ -1171,10 +1276,13 @@ export class SubprocessRunner extends EventEmitter {
       // - SIGSEGV/SIGKILL → code=null but NOT graceful
       // - CCB may exit with non-0 code on normal termination
       const crashed = !this.shuttingDown
-      this.shuttingDown = false
       if (crashed) {
         this._recordCrash()
       } else {
+        // Keep `shuttingDown` true until the stdout-drained `close` boundary.
+        // A descendant can retain the pipe after the direct child exits; if
+        // we clear this flag here, a new submit may replace `this.proc` and
+        // the identity guard will discard those late paid bytes.
         // Graceful shutdown wipes any accumulated backoff — the operator is
         // in control, not a crash-loop, so the next start() should not be gated.
         // Also zero _lastStartAt so a post-restart crash can't consult a stale
@@ -1183,10 +1291,18 @@ export class SubprocessRunner extends EventEmitter {
         this._backoffUntil = 0
         this._lastStartAt = 0
       }
-      this.emit('exit', { code, signal, crashed })
+      pendingExitInfo = { code, signal, crashed }
+      forwardDrainedExit()
     })
 
     proc.on('error', (err) => {
+      if (this.proc !== proc) {
+        runnerLog.info('stale subprocess error ignored', {
+          sessionKey: this.opts.sessionKey,
+          err: err.message,
+        })
+        return
+      }
       this.emit('error', err)
     })
 
@@ -1245,36 +1361,24 @@ export class SubprocessRunner extends EventEmitter {
   private handleStdout(chunk: string): void {
     this.lastActivityAt = Date.now()
 
-    // We scan `chunk` in place WITHOUT doing `stdoutBuf += chunk` first.
-    // For each complete line formed by `stdoutBuf + chunk[0..nl]` (first line)
-    // or `chunk[prev..nl]` (subsequent lines), we check the byte length
-    // BEFORE materializing the full line. Only the trailing partial (no
-    // newline) is appended to `stdoutBuf`. This guarantees the in-memory
-    // working set never exceeds MAX_STDOUT_BUF_BYTES even if the chunk itself
-    // contains multiple oversized lines.
+    // Scan `chunk` in place rather than first concatenating the entire chunk
+    // onto stdoutBuf. Complete lines are parsed one by one and only the final
+    // unterminated suffix remains buffered. There is deliberately no semantic
+    // byte ceiling: a valid line may itself be an arbitrarily large paid tool
+    // result, and killing/dropping it would violate lossless persistence.
     let offset = 0
-    let firstLineConsumesBuf = this.stdoutBufBytes > 0
+    let firstLineConsumesBuf = this.stdoutBuf.length > 0
     while (true) {
       const nlIdx = chunk.indexOf('\n', offset)
       if (nlIdx < 0) break
 
       const tail = chunk.slice(offset, nlIdx)
-      const tailBytes = Buffer.byteLength(tail, 'utf8')
-      const lineBytes =
-        (firstLineConsumesBuf ? this.stdoutBufBytes : 0) + tailBytes
-      if (lineBytes > MAX_STDOUT_BUF_BYTES) {
-        this.handleBufferOverflow('stdout', lineBytes)
-        this.stdoutBuf = ''
-        this.stdoutBufBytes = 0
-        return
-      }
-
-      // Materialize the full line (≤ cap bytes), emit parsed message
+      // Materialize the complete JSON line, then immediately release it after
+      // parsing/emitting. Physical host memory is the only unavoidable bound.
       let fullLine: string
       if (firstLineConsumesBuf) {
         fullLine = this.stdoutBuf + tail
         this.stdoutBuf = ''
-        this.stdoutBufBytes = 0
         firstLineConsumesBuf = false
       } else {
         fullLine = tail
@@ -1324,34 +1428,25 @@ export class SubprocessRunner extends EventEmitter {
       offset = nlIdx + 1
     }
 
-    // Trailing partial (no newline) — append to stdoutBuf after cap check.
+    // Trailing partial (no newline) — retain it until the next stdout chunk.
     if (offset < chunk.length) {
       const trailing = offset === 0 ? chunk : chunk.slice(offset)
-      const trailingBytes = Buffer.byteLength(trailing, 'utf8')
-      const projected = this.stdoutBufBytes + trailingBytes
-      if (projected > MAX_STDOUT_BUF_BYTES) {
-        this.handleBufferOverflow('stdout', projected)
-        this.stdoutBuf = ''
-        this.stdoutBufBytes = 0
-        return
-      }
       this.stdoutBuf += trailing
-      this.stdoutBufBytes += trailingBytes
     }
   }
 
   /**
-   * Called when stdout or stderr accumulates beyond the buffer cap.
+   * Called when non-user-visible stderr accumulates beyond its line guard.
    * Emits an `overflow` event with details and kills the subprocess group.
    * Idempotent — a second trigger during the same kill window is a no-op.
    */
-  private handleBufferOverflow(stream: 'stdout' | 'stderr', size: number): void {
+  private handleStderrOverflow(size: number): void {
     if (this.overflowKilled || this.closed) return
     this.overflowKilled = true
     const proc = this.proc
     const pid = proc?.pid
-    const info = { stream, size, cap: MAX_STDOUT_BUF_BYTES, pid, sessionKey: this.opts.sessionKey }
-    runnerLog.error('ccb.overflow — force-killing subprocess', info)
+    const info = { stream: 'stderr' as const, size, cap: MAX_STDERR_BUF_BYTES, pid, sessionKey: this.opts.sessionKey }
+    runnerLog.error('ccb.stderr_overflow — force-killing subprocess', info)
     this.emit('overflow', info)
     // Trigger an exit path: force-kill the process group so MCP children die too.
     try {
@@ -1382,6 +1477,7 @@ export class SubprocessRunner extends EventEmitter {
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     _requestId?: string,
     authority?: TurnModelAuthority,
+    turnKey?: string,
   ): Promise<void> {
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
@@ -1400,6 +1496,7 @@ export class SubprocessRunner extends EventEmitter {
     const envUpdateLine = _buildUpdateEnvStdinLine(
       {
         ..._buildAnthropicCustomHeadersEnv(runtime.headers),
+        ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
         [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
       },
     )
@@ -1730,6 +1827,26 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
+  /** Forward a fully-drained child exit only while that exact child still owns
+   * runner state. Kept as one method so the late-exit race is directly
+   * regression-testable without spawning a real CCB process. */
+  private _forwardDrainedExitForProcess(
+    proc: ChildProcessWithoutNullStreams,
+    info: RunnerExitInfo,
+  ): boolean {
+    if (this.proc !== proc) {
+      runnerLog.info('stale drained subprocess exit ignored', {
+        sessionKey: this.opts.sessionKey,
+        code: info.code,
+        signal: info.signal,
+      })
+      return false
+    }
+    this.emit('exit', info)
+    if (this.proc === proc) this.proc = null
+    return true
+  }
+
   async shutdown(): Promise<void> {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
@@ -1745,29 +1862,64 @@ export class SubprocessRunner extends EventEmitter {
       this.proc.stdin.end()
     } catch {}
     const proc = this.proc
-    const pid = proc.pid
-    await new Promise<void>((res) => {
-      const timer = setTimeout(() => {
-        // Kill entire process group (including MCP subprocesses)
-        try {
-          if (pid) process.kill(-pid, 'SIGKILL') // negative pid = process group
-        } catch {
-          try {
-            proc.kill('SIGKILL')
-          } catch {}
-        }
-        res()
-      }, 3000)
-      proc.once('exit', () => {
-        clearTimeout(timer)
-        res()
+    // ChildProcess 'close' is emitted only after every stdio stream closes.
+    // Waiting for 'exit' used to let shutdown resolve while paid stdout bytes
+    // were still queued in Node, allowing callers to freeze a partial tape.
+    // The wait must also be terminal: a descendant can otherwise retain the
+    // pipe forever even after the direct child exits.
+    let resolveClose!: () => void
+    const closePromise = new Promise<void>((resolve) => { resolveClose = resolve })
+    const onClose = () => resolveClose()
+    proc.once('close', onClose)
+    let closed = await waitForCloseWithin(
+      closePromise,
+      runnerShutdownTimeoutMs(
+        'OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS',
+        RUNNER_SHUTDOWN_GRACE_DEFAULT_MS,
+      ),
+    )
+    if (!closed) {
+      killRunnerProcessGroup(proc, 'SIGKILL')
+      closed = await waitForCloseWithin(
+        closePromise,
+        runnerShutdownTimeoutMs(
+          'OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS',
+          RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS,
+        ),
+      )
+    }
+    if (!closed) {
+      proc.removeListener('close', onClose)
+      runnerLog.error('subprocess close did not arrive after process-group SIGKILL', {
+        sessionKey: this.opts.sessionKey,
+        pid: proc.pid,
       })
-    })
-    this.proc = null
+      // Preserve process ownership and the stdout parser until the real close
+      // boundary. Late bytes from a descendant holding the pipe remain part of
+      // this turn; the existing stdout-close handler will forward the terminal
+      // event only after they have all been parsed. Do cleanup in the
+      // background instead of detaching and losing them.
+      proc.once('close', () => {
+        if (this.proc === proc) this.proc = null
+        this.spawnedExecutionDescriptor = undefined
+        this.closed = true
+        this.shuttingDown = false
+        this._boundRepoBinding = null
+        this.cleanupSessionDir()
+      })
+      return
+    }
+    if (this.proc === proc) this.proc = null
     this.spawnedExecutionDescriptor = undefined
     this.closed = true
+    this.shuttingDown = false
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null
     this.cleanupSessionDir()
+  }
+
+  /** Capture-by-value barrier for the current process generation. */
+  waitForOutputDrain(): Promise<void> {
+    return this.outputDrainPromise
   }
 }

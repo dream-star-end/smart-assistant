@@ -116,6 +116,13 @@ export interface CodexFinalizeContext {
   reservation: ReservationHandle;
   /** 模型权威开启时必传；写入 usage_records 四个留证列。 */
   authority?: BillingAuthorityStamp | null;
+  /** Default lossless cost locators. Billing-time attribution passed to
+   * commit() overrides these so deferred WeChat/Codex finalizers can still
+   * bind the debit atomically to the exact turn. */
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
   // v5(M1b):不再携带 accountId —— codex 记账 usage_records.account_id 恒写
   // SQL NULL(0044 SET NULL FK 语义,与 deepseek/minimax 静态 provider 同型),
   // 不再用 v3 的 `accountId=0n` 假账号占位。
@@ -148,6 +155,12 @@ export interface CodexFinalizeHandle {
     usage: TokenUsage,
     codexStatus: "success" | "error",
     errorReason?: string,
+    attribution?: {
+      turnKey?: string | null;
+      parentTurnKey?: string | null;
+      parentSessionId?: string | null;
+      delegateAgentId?: string | null;
+    },
   ): Promise<CodexFinalizeResult>;
   /**
    * 无 usage 的失败收尾(用户 ws 断开 / 容器 crash / runner spawn 失败等)。
@@ -186,6 +199,12 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
     usage: TokenUsage,
     codexStatus: "success" | "error",
     errorReason?: string,
+    attribution?: {
+      turnKey?: string | null;
+      parentTurnKey?: string | null;
+      parentSessionId?: string | null;
+      delegateAgentId?: string | null;
+    },
   ): Promise<CodexFinalizeResult> {
     return (async (): Promise<CodexFinalizeResult> => {
       const { cost_credits, snapshot } = computeCost(usage, ctx.derivedPricing);
@@ -234,6 +253,16 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
           costCredits: effectiveCredits,
           status: settleStatus,
           sessionId: ctx.engineSessionId,
+          mode:
+            (attribution?.parentTurnKey ?? ctx.parentTurnKey) ||
+            (attribution?.parentSessionId ?? ctx.parentSessionId) ||
+            (attribution?.delegateAgentId ?? ctx.delegateAgentId)
+              ? "delegate"
+              : "chat",
+          parentSessionId: attribution?.parentSessionId ?? ctx.parentSessionId ?? null,
+          delegateAgentId: attribution?.delegateAgentId ?? ctx.delegateAgentId ?? null,
+          turnKey: attribution?.turnKey ?? ctx.turnKey ?? null,
+          parentTurnKey: attribution?.parentTurnKey ?? ctx.parentTurnKey ?? null,
           authority: ctx.authority ?? null,
         });
         await finalizeInflightJournal(ctx.pgPool, {
@@ -273,7 +302,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
   }
 
   return {
-    async commit(usage, codexStatus, errorReason) {
+    async commit(usage, codexStatus, errorReason, attribution) {
       if (_done !== null) {
         if (_done.kind === "commit") {
           // commit-after-commit:duplicate billing 帧场景 — 共享首次 promise,
@@ -288,7 +317,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       }
       const promise = (async (): Promise<CodexFinalizeResult> => {
         try {
-          return await commitOnce(usage, codexStatus, errorReason);
+          return await commitOnce(usage, codexStatus, errorReason, attribution);
         } finally {
           // 无论 commit 成 / 失败,都 release preCheck(否则 Redis 锁卡 300s)。
           await releasePreCheck(ctx.preCheckRedis, ctx.reservation).catch(

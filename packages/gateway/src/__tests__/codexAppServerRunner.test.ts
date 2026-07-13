@@ -37,19 +37,25 @@ interface Harness {
   exits: any[]
   sessionIds: any[]
   written: string[] // lines written to the (fake) proc.stdin
+  killSignals: NodeJS.Signals[]
   cleanup: () => Promise<void>
 }
 
 interface FakeProc {
   killed: boolean
+  exitCode: number | null
+  signalCode: NodeJS.Signals | null
   stdin: { write: (line: string) => void }
-  kill: (sig?: string) => void
+  once: (event: 'close', listener: () => void) => FakeProc
+  removeListener: (event: 'close', listener: () => void) => FakeProc
+  kill: (sig?: NodeJS.Signals) => boolean
 }
 
 async function makeHarness(
   opts: {
     resumeSessionId?: string
     withFakeProc?: boolean
+    fakeProcNeverCloses?: boolean
     model?: string
   } = {},
 ): Promise<Harness> {
@@ -68,6 +74,7 @@ async function makeHarness(
   const exits: any[] = []
   const sessionIds: any[] = []
   const written: string[] = []
+  const killSignals: NodeJS.Signals[] = []
 
   runner.on('message', (m: any) => messages.push(m))
   runner.on('error', (e: any) => errors.push(e))
@@ -77,15 +84,36 @@ async function makeHarness(
   runner.on('session_id', (id: any) => sessionIds.push(id))
 
   if (opts.withFakeProc) {
+    let closeListener: (() => void) | null = null
     const fakeProc: FakeProc = {
       killed: false,
+      exitCode: null,
+      signalCode: null,
       stdin: {
         write: (line: string) => {
           written.push(line.replace(/\n$/, ''))
         },
       },
-      kill: () => {
+      once: (event, listener) => {
+        if (event === 'close') closeListener = listener
+        return fakeProc
+      },
+      removeListener: (event, listener) => {
+        if (event === 'close' && closeListener === listener) closeListener = null
+        return fakeProc
+      },
+      kill: (signal = 'SIGTERM') => {
         fakeProc.killed = true
+        fakeProc.signalCode = signal
+        killSignals.push(signal)
+        if (!opts.fakeProcNeverCloses) {
+          setImmediate(() => {
+            const listener = closeListener
+            closeListener = null
+            listener?.()
+          })
+        }
+        return true
       },
     }
     ;(runner as any).proc = fakeProc
@@ -101,6 +129,7 @@ async function makeHarness(
     exits,
     sessionIds,
     written,
+    killSignals,
     cleanup: () => rm(baseTmp, { recursive: true, force: true }),
   }
 }
@@ -509,9 +538,9 @@ describe('handleNotification — native plan updates', () => {
   })
 })
 
-// Reasoning streaming: codex emits either `textDelta` (raw chain-of-thought)
-// or `summaryTextDelta` (model-distilled summary) depending on the reasoning
-// mode. Both are surfaced to the UI as CCB `thinking_delta` so the frontend
+// Reasoning streaming: codex can emit `textDelta` (raw reasoning text),
+// `summaryTextDelta` (model-distilled summary), or both for the same item.
+// Every delta is surfaced to the UI as CCB `thinking_delta` so the frontend
 // renders a 💭 thinking card — same surface claude-code uses. `summaryPartAdded`
 // inserts a paragraph separator (`\n\n`) between named summary sections.
 describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surface)', () => {
@@ -613,10 +642,9 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
     await h.cleanup()
   })
 
-  it('summary mode locks: textDelta after summaryTextDelta is dropped (codex review CONCERN #1)', async () => {
-    // If codex emits both raw text and summary for the same reasoning item,
-    // we surface only the summary — splicing raw chain-of-thought into the
-    // distilled summary would corrupt the rendered thinking card.
+  it('retains textDelta after summaryTextDelta in wire order', async () => {
+    // Both streams are paid model output. Retain both rather than choosing
+    // one representation and silently discarding the other.
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-r'
     feed(h.runner, {
@@ -629,8 +657,9 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
       method: 'item/reasoning/textDelta',
       params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw-cot' },
     })
-    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages.length, 2)
     assert.equal(h.messages[0].event.delta.thinking, 'distilled')
+    assert.equal(h.messages[1].event.delta.thinking, 'raw-cot')
     await h.cleanup()
   })
 
@@ -711,9 +740,9 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
     await h.cleanup()
   })
 
-  it('summaryPartAdded first-call locks mode to summary even before content arrives', async () => {
-    // First summaryPartAdded (no \n\n emit) must still flip the item into
-    // summary mode so a subsequent stray textDelta is suppressed.
+  it('summaryPartAdded first-call does not suppress a later textDelta', async () => {
+    // The initial part marker is structural and emits no leading separator,
+    // but it must not cause subsequent paid model content to be discarded.
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-r'
     feed(h.runner, {
@@ -724,17 +753,16 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
     feed(h.runner, {
       jsonrpc: '2.0',
       method: 'item/reasoning/textDelta',
-      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'should-be-dropped' },
+      params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'must-be-kept' },
     })
-    assert.equal(h.messages.length, 0)
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].event.delta.thinking, 'must-be-kept')
     await h.cleanup()
   })
 
-  it('text mode locks: summaryTextDelta after textDelta is dropped (codex review v2 — symmetric lock)', async () => {
-    // v1 only blocked summary→text. v2 review caught that text→summary
-    // would still splice (raw CoT + distilled summary concatenation).
-    // Verifies the symmetric direction: once text is locked, summary is
-    // dropped just like the other way around.
+  it('retains summaryTextDelta after textDelta in wire order', async () => {
+    // A distilled summary arriving after raw reasoning is separate generated
+    // content, so retain it instead of applying a symmetric mode lock.
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-r'
     feed(h.runner, {
@@ -747,17 +775,15 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
       method: 'item/reasoning/summaryTextDelta',
       params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'late-summary' },
     })
-    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages.length, 2)
     assert.equal(h.messages[0].event.delta.thinking, 'raw-cot')
+    assert.equal(h.messages[1].event.delta.thinking, 'late-summary')
     await h.cleanup()
   })
 
-  it('text mode drops summaryPartAdded entirely (codex review v2 — orphan \\n\\n guard)', async () => {
-    // If the item already streamed raw textDelta(s), a stray
-    // summaryPartAdded must NOT inject \n\n — there's no second part
-    // coming (the matching summaryTextDelta would also be dropped by the
-    // symmetric mode lock), so the separator would be a noise paragraph
-    // break wedged between text deltas.
+  it('retains summaryPartAdded after textDelta as a structural separator', async () => {
+    // Once content exists, every later part boundary is part of the emitted
+    // reasoning structure and remains in the exact wire order.
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-r'
     feed(h.runner, {
@@ -775,10 +801,11 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
       method: 'item/reasoning/textDelta',
       params: { threadId: 'thr-1', turnId: 't-r', itemId: 'r-1', delta: 'raw2' },
     })
-    // Expect only raw1, raw2 — no \n\n between them.
-    assert.equal(h.messages.length, 2)
+    // Expect raw1, the part boundary, then raw2.
+    assert.equal(h.messages.length, 3)
     assert.equal(h.messages[0].event.delta.thinking, 'raw1')
-    assert.equal(h.messages[1].event.delta.thinking, 'raw2')
+    assert.equal(h.messages[1].event.delta.thinking, '\n\n')
+    assert.equal(h.messages[2].event.delta.thinking, 'raw2')
     await h.cleanup()
   })
 
@@ -1338,6 +1365,26 @@ describe('runTurn re-attach after respawn (Codex review #019dde20 BLOCKER 1)', (
     assert.equal((h.runner as any).stdoutBuf, '', 'shutdown must clear partial-line buffer')
     await h.cleanup()
   })
+
+  it('shutdown retains process ownership when SIGKILL has not produced stdout close', async () => {
+    const oldGrace = process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS = '5'
+    process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS = '5'
+    const h = await makeHarness({ withFakeProc: true, fakeProcNeverCloses: true })
+    try {
+      await h.runner.shutdown()
+      assert.deepEqual(h.killSignals, ['SIGTERM', 'SIGKILL'])
+      assert.notEqual((h.runner as any).proc, null)
+      assert.equal((h.runner as any).shuttingDown, true)
+    } finally {
+      if (oldGrace === undefined) delete process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS
+      else process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS = oldGrace
+      if (oldFinal === undefined) delete process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS
+      else process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS = oldFinal
+      await h.cleanup()
+    }
+  })
 })
 
 describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKER 1)', () => {
@@ -1669,7 +1716,31 @@ describe('shutdown', () => {
     assert.ok(queuedErr instanceof Error, 'queued turn should reject')
 
     assert.equal((h.runner as any).proc, null)
-    assert.equal(h.exits.length, 1)
+    // This harness injects a proc after construction, so it has no spawned
+    // process close-handler to emit runner-level exit. Real spawned procs do.
+    assert.equal(h.exits.length, 0)
+    await h.cleanup()
+  })
+})
+
+describe('lossless Codex JSON-RPC side channel', () => {
+  it('emits every original turn-scoped JSON-RPC object before compact projection', async () => {
+    const h = await makeHarness()
+    const rawEvents: unknown[] = []
+    h.runner.on('runtime_event', (payload) => rawEvents.push(payload))
+    ;(h.runner as any).activeTurnId = 'turn-raw'
+    const raw = {
+      jsonrpc: '2.0',
+      method: 'future/protocol/event',
+      params: {
+        turnId: 'turn-raw',
+        output: 'z'.repeat(25_000),
+        exitCode: 23,
+        future: { nested: ['kept'] },
+      },
+    }
+    feed(h.runner, raw)
+    assert.deepEqual(rawEvents, [raw])
     await h.cleanup()
   })
 })
@@ -2489,7 +2560,7 @@ describe('runTurn token usage propagation (PR1 v1.0.65 A.3)', () => {
 })
 
 describe('shutdown — token state cleared (PR1 v1.0.65 A.2)', () => {
-  it('shutdown PROMOTES activeTurnTotal to priorTurnTotal when mid-turn (avoid next-turn over-bill)', async () => {
+  it('forced terminal result bills activeTurnTotal delta before promoting baseline', async () => {
     // Mid-turn shutdown scenario: tokenUsage notification arrived once
     // (activeTurnTotal=200), then runner is killed before turn/completed.
     // The killed turn's tokens (200 - 100 = 100) must be folded into the
@@ -2505,6 +2576,19 @@ describe('shutdown — token state cleared (PR1 v1.0.65 A.2)', () => {
     }
     runner.activeTurnTotal = { ...runner.priorTurnTotal, inputTokens: 200 }
     runner.currentTurnUsage = { ...runner.priorTurnTotal, inputTokens: 100 }
+    runner.activeTurnId = 'turn-forced'
+    runner.activeRequestId = '0123456789abcdef0123456789abcdef'
+    runner.currentTurnCompleter = { resolve: () => {}, reject: () => {} }
+    runner.emitForcedShutdownResult('forced unit shutdown')
+    const result = h.messages.find((message) => message.type === 'result')
+    assert.ok(result)
+    assert.deepEqual(result.usage, {
+      input_tokens: 100,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      reasoning_output_tokens: 0,
+    })
     await h.runner.shutdown()
     assert.deepEqual(
       runner.priorTurnTotal,
@@ -2996,8 +3080,8 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
   })
 })
 
-describe('item/completed — 大 result 完成事件保持合法 JSON(_stringifyItemBounded)', () => {
-  it('mcpToolCall result 文本超 2000 字符 → payload 可 JSON.parse,内层截断带尾标,wrapper 字段完整', async () => {
+describe('item/completed — result JSON lossless persistence', () => {
+  it('mcpToolCall result over 2000 chars remains complete and parseable', async () => {
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-mcp-big'
     // 混入换行/引号,验证转义膨胀后整体仍不超预算
@@ -3025,8 +3109,6 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
     )
     assert.ok(result, 'tool_result must be emitted')
     const payload = result.message.content[0].content as string
-    assert.ok(payload.length <= 2000, `payload ${payload.length} chars exceeds budget`)
-    // 核心契约:整体 slice 时代这里必然 throw(截成非法 JSON)
     const parsed = JSON.parse(payload)
     assert.equal(parsed.id, 'mcp-1')
     assert.equal(parsed.type, 'mcpToolCall')
@@ -3034,8 +3116,7 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
     assert.equal(parsed.tool, 'web_search')
     assert.equal(parsed.status, 'completed')
     const innerText = parsed.result.content[0].text as string
-    assert.ok(innerText.endsWith('…[truncated]'), 'inner text must carry truncate tail')
-    assert.ok(innerText.length < bigText.length, 'inner text must actually shrink')
+    assert.equal(innerText, bigText)
     await h.cleanup()
   })
 
@@ -3064,7 +3145,7 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
     await h.cleanup()
   })
 
-  it('webSearch 多条大 results 走同一发射点 → 合法 JSON 且逐条截断', async () => {
+  it('webSearch 多条大 results 走同一发射点并完整保留', async () => {
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-ws-big'
     feed(h.runner, {
@@ -3090,16 +3171,18 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
     )
     assert.ok(result)
     const payload = result.message.content[0].content as string
-    assert.ok(payload.length <= 2000)
     const parsed = JSON.parse(payload)
     assert.equal(parsed.type, 'webSearch')
     assert.equal(parsed.query, '深度检索')
     assert.equal(parsed.results.length, 6, 'array structure preserved')
-    assert.ok(parsed.results[0].snippet.endsWith('…[truncated]'))
+    assert.deepEqual(parsed.results, Array.from({ length: 6 }, (_, i) => ({
+      title: `结果${i}`,
+      snippet: `摘要内容${i} `.repeat(120),
+    })))
     await h.cleanup()
   })
 
-  it('_stringifyItemBounded 病态形状(海量键,叶子截完仍超预算)退化为骨架且仍合法', () => {
+  it('_stringifyItemBounded 完整保留海量键', () => {
     const pathological: Record<string, unknown> = {
       id: 'mcp-3',
       type: 'mcpToolCall',
@@ -3108,32 +3191,16 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
     }
     for (let i = 0; i < 500; i++) pathological[`key_${i}`] = `value_${i}`
     const out = _stringifyItemBounded(pathological)
-    assert.ok(out.length <= 2000)
-    const parsed = JSON.parse(out)
-    assert.equal(parsed.truncated, true)
-    assert.equal(parsed.type, 'mcpToolCall')
-    assert.equal(parsed.tool, 'web_fetch')
+    assert.equal(out, JSON.stringify(pathological))
+    assert.deepEqual(JSON.parse(out), pathological)
   })
 
-  it('_stringifyItemBounded 不在代理对中间断字符串', () => {
-    // 全 emoji(代理对)长文本:任何截断点都可能落在代理对中间,守卫必须让
-    // 截断后的文本仍是成对的码点(JSON.parse 后无孤立代理)。
+  it('_stringifyItemBounded 完整保留代理对字符串', () => {
     const item = { id: 'e-1', type: 'mcpToolCall', result: '😀'.repeat(3000) }
     const out = _stringifyItemBounded(item)
-    assert.ok(out.length <= 2000)
     const parsed = JSON.parse(out)
-    const text = parsed.result as string
-    const body = text.slice(0, -'…[truncated]'.length)
-    for (let i = 0; i < body.length; i++) {
-      const code = body.charCodeAt(i)
-      if (code >= 0xd800 && code <= 0xdbff) {
-        const next = body.charCodeAt(i + 1)
-        assert.ok(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate at ${i}`)
-        i++
-      } else {
-        assert.ok(!(code >= 0xdc00 && code <= 0xdfff), `lone low surrogate at ${i}`)
-      }
-    }
+    assert.equal(parsed.result, item.result)
+    assert.equal(out, JSON.stringify(item))
   })
 })
 

@@ -263,7 +263,7 @@ describe('outboxWorker.drainOne', () => {
     })
     assert.equal(outcome.kind, 'failed_transient')
     assert.ok(markFailedParams)
-    assert.equal(markFailedParams![4], 15_000, 'attempt #2 backs off by 10s from now=5000')
+    assert.equal(markFailedParams![3], 15_000, 'attempt #2 backs off by 10s from now=5000')
   })
 
   test('binding gone → forceFail to terminal failed_permanent (no retry)', async () => {
@@ -278,12 +278,12 @@ describe('outboxWorker.drainOne', () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, { kind: 'failed_permanent', outboxId: 1, reason: 'binding_gone' })
-    // forceFail SQL pins attempts to maxAttempts (no-revive)
+    // Explicitly undeliverable rows remain retained, without pinning a cap.
     const forceFailQ = captured.find((c) =>
       /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'failed'/.test(c.sql),
     )!
-    assert.match(forceFailQ.sql, /attempts\s*=\s*GREATEST\(attempts \+ 1, \$1\)/)
-    assert.equal(forceFailQ.params[0], 10) // maxAttempts pin
+    assert.match(forceFailQ.sql, /attempts\s*=\s*attempts \+ 1/)
+    assert.equal(forceFailQ.params[0], 'binding_gone')
   })
 
   test('no context_token for sender → forceFail terminal', async () => {
@@ -329,12 +329,12 @@ describe('outboxWorker.drainOne', () => {
       outboxId: 1,
       reason: 'token expired',
     })
-    // forceFail used (not markFailed),attempts pinned via GREATEST
+    // forceFail retains the exact row and increments diagnostics only.
     const failQ = captured.find((c) => /status\s*=\s*'failed'/.test(c.sql))!
-    assert.match(failQ.sql, /GREATEST/)
+    assert.match(failQ.sql, /attempts\s*=\s*attempts \+ 1/)
   })
 
-  test('sendText transient error, attempts < maxAttempts → markFailed → failed_transient', async () => {
+  test('sendText transient error → queued retry with incremented attempts', async () => {
     const { pool } = makeFakePool((sql) => {
       if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
         return { rows: [{ attempts: 3, status: 'queued' }], rowCount: 1 }
@@ -361,10 +361,10 @@ describe('outboxWorker.drainOne', () => {
     })
   })
 
-  test('sendText transient error, attempts cap → markFailed → failed_terminal', async () => {
+  test('sendText transient error above legacy attempts cap still retries', async () => {
     const { pool } = makeFakePool((sql) => {
       if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
-        return { rows: [{ attempts: 10, status: 'failed' }], rowCount: 1 }
+        return { rows: [{ attempts: 10, status: 'queued' }], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
     })
@@ -381,7 +381,7 @@ describe('outboxWorker.drainOne', () => {
       maxAttempts: 10,
     })
     assert.deepEqual(outcome, {
-      kind: 'failed_terminal',
+      kind: 'failed_transient',
       outboxId: 1,
       attempts: 10,
       errMessage: '5xx',
@@ -925,43 +925,33 @@ describe('outboxWorker.computeTransientNextAttemptAt', () => {
 })
 
 describe('outboxWorker.runHousekeeping', () => {
-  test('runs releaseStaleSending → dropAgedPending → purgeSent → purgeFailed in order', async () => {
+  test('releases stale sending but never ages or purges paid output', async () => {
     const sqls: string[] = []
     const { pool } = makeFakePool((sql) => {
       sqls.push(sql.replace(/\s+/g, ' ').trim().slice(0, 100))
-      // 让 4 个 UPDATE/DELETE 都汇报 rowCount > 0 便于断言数字
       if (/UPDATE wechat_outbox/.test(sql)) {
         if (/status\s*=\s*'queued'/.test(sql)) return { rows: [], rowCount: 1 } // release stale
-        if (/status\s*=\s*'failed'/.test(sql)) return { rows: [], rowCount: 2 } // drop aged
         return { rows: [], rowCount: 0 }
       }
-      if (/DELETE FROM wechat_outbox WHERE status = 'sent'/.test(sql))
-        return { rows: [], rowCount: 3 }
-      if (/DELETE FROM wechat_outbox WHERE status = 'failed'/.test(sql))
-        return { rows: [], rowCount: 4 }
       return { rows: [], rowCount: 0 }
     })
     const result = await runHousekeeping(pool, 1_000_000)
-    assert.deepEqual(result, { staleReleased: 1, aged: 2, purgedSent: 3, purgedFailed: 4 })
-    // 顺序断言:第 1 个 SQL 含 sending → queued,第 2 个含 'failed' UPDATE,然后 DELETE sent,DELETE failed
+    assert.deepEqual(result, { staleReleased: 1, aged: 0, purgedSent: 0, purgedFailed: 0 })
     assert.match(sqls[0]!, /status\s*=\s*'queued'/)
-    assert.match(sqls[1]!, /status\s*=\s*'failed'/)
-    assert.match(sqls[2]!, /DELETE.+status.+'sent'/)
-    assert.match(sqls[3]!, /DELETE.+status.+'failed'/)
+    assert.equal(sqls.length, 1)
   })
 })
 
 describe('DrainOutcome type completeness', () => {
-  // 类型层 sanity:DrainOutcome 7 个 branch 都被前述测试覆盖
+  // 类型层 sanity:all DrainOutcome branches are covered above.
   test('kinds covered by tests above', () => {
     const kinds: DrainOutcome['kind'][] = [
       'sent',
       'failed_permanent',
       'failed_transient',
-      'failed_terminal',
       'noop',
     ]
     // 编译器/纯运行时 sanity
-    assert.equal(kinds.length, 5)
+    assert.equal(kinds.length, 4)
   })
 })

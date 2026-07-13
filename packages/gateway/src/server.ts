@@ -36,6 +36,7 @@ import {
   type SysContextRebuilt,
   type Peer,
   type AgentGroupStatus,
+  type DurableAgentGroup,
   type ReviewVerdict,
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
@@ -1110,6 +1111,13 @@ function readDelegateMemoryPressure(): { current: number; max: number; ratio: nu
 const DELEGATE_QUEUE_WAIT_DEFAULT_MS = 90_000
 /** 排队复查间隔(每 2-3s 复查一次两道闸)。 */
 const DELEGATE_QUEUE_POLL_DEFAULT_MS = 2_500
+/** After a delegate timeout, first allow the cooperative interrupt to drain
+ * frames already produced by the model. A non-settling runner is then
+ * force-shut down under a diagnostic deadline. That deadline never authorizes
+ * materialization: the delegate still waits for the generation's real stdout
+ * close barrier and turn settlement before freezing its transcript. */
+const DELEGATE_INTERRUPT_DRAIN_DEFAULT_MS = 5_000
+const DELEGATE_SHUTDOWN_WAIT_DEFAULT_MS = 8_000
 /** 同时排队者上限:内存高压期每个等待者都挂着一条 HTTP 请求,不设上限会把
  *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
 export const DELEGATE_QUEUE_MAX_WAITERS = 8
@@ -1117,6 +1125,31 @@ export const DELEGATE_QUEUE_MAX_WAITERS = 8
 function parseDelegateQueueWaitMs(): number {
   const raw = Number(process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS)
   return Number.isFinite(raw) && raw >= 0 ? raw : DELEGATE_QUEUE_WAIT_DEFAULT_MS
+}
+
+function parseNonNegativeMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+}
+
+function waitForDelegateSettlement(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<{ settled: boolean; error?: unknown }> {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (result: { settled: boolean; error?: unknown }) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const timer = setTimeout(() => finish({ settled: false }), timeoutMs)
+    promise.then(
+      () => finish({ settled: true }),
+      (error) => finish({ settled: true, error }),
+    )
+  })
 }
 
 // ── P2 债C — hidden reviewer 硬编排 review pass 参数/文案 ──────────────────
@@ -1205,22 +1238,6 @@ export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8
 function resolveMemberDelegationsPerTurn(): number {
   const raw = Number(process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN)
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MEMBER_DELEGATIONS_PER_TURN_DEFAULT
-}
-
-/** P2 批次4 — 委派回传给队长的 output 兜底封顶(字符数)。消"回传全量不裁剪"债:
- *  子 agent 的大产物应落文件、回传只给路径 + 蒸馏摘要(prompt 已教);本封顶是模型
- *  不照做时的最后一道保险,防超大回传把队长上下文撑爆 / 拖慢。仅对普通成员委派生效,
- *  **不裁 review 委派**(其 output 作为送审工具结果全量回给队长,截断会丢审查意见)。
- *  截断时尾注引导落文件。默认 4000,env 可配(下限 500)。 */
-export const DELEGATE_OUTPUT_CAP_DEFAULT = 4000
-function resolveDelegateOutputCap(): number {
-  const raw = Number(process.env.OPENCLAUDE_DELEGATE_OUTPUT_CAP)
-  return Number.isFinite(raw) && raw >= 500 ? Math.floor(raw) : DELEGATE_OUTPUT_CAP_DEFAULT
-}
-function capDelegateOutput(raw: string): string {
-  const cap = resolveDelegateOutputCap()
-  if (raw.length <= cap) return raw
-  return `${raw.slice(0, cap)}\n\n[输出过长已截断至 ${cap} 字;完整产物应落文件——若上文无文件路径,请让该成员重做并把大产物写入 /home/agent/.openclaude/generated/ 后只回传路径+摘要]`
 }
 
 /** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
@@ -7555,7 +7572,7 @@ export class Gateway {
   private _resolveDelegateParent(args: {
     parentSessionKey?: unknown
     sourceAgent?: unknown
-  }): { sessionKey: string; repoSessionId?: string } | null {
+  }): { sessionKey: string; repoSessionId?: string; billingParentTurnKey?: string } | null {
     if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
     const parent = this.sessions.getByKey(args.parentSessionKey)
     if (!parent) return null
@@ -7566,6 +7583,10 @@ export class Gateway {
     return {
       sessionKey: parent.sessionKey,
       repoSessionId: parent.repoSessionId ?? parent.peerId,
+      // A nested delegate must keep charging the root user-visible turn. Its
+      // direct parent turn is an ephemeral delegate session and has no master
+      // tape/anchor of its own.
+      billingParentTurnKey: parent._billingParentTurnKey ?? parent._currentTurnKey,
     }
   }
 
@@ -7989,6 +8010,7 @@ export class Gateway {
     }
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
+    const durableTranscript: unknown[] = []
     let session
     try {
       session = await this.sessions.getOrCreate({
@@ -8007,8 +8029,12 @@ export class Gateway {
           mode: 'delegate',
           delegateAgentId: targetAgentId,
           ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
+          ...(delegateParent?.billingParentTurnKey
+            ? { parentTurnKey: delegateParent.billingParentTurnKey }
+            : {}),
         },
       })
+      session._durableDelegateTranscript = durableTranscript
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
       if (streamProgress) {
@@ -8045,8 +8071,8 @@ export class Gateway {
     // 共享 FS(generated/uploads 天然共享)但历史上 prompt 零教学 → 子 agent 常把完整大产物
     // 整段回传,撑爆队长上下文。这里教:大产物落文件、回传只给路径+蒸馏摘要;小结果直接回传。
     // review 委派豁免(其 goal/context 已由 buildTeamReviewContext 精确指定为"审查+输出 VERDICT",
-    // 不产文件产物,加纪律只会稀释指令)。与 _runDelegateTask 回传封顶(capDelegateOutput)配套:
-    // prompt 是"请正确落文件"的软引导,封顶是"没照做时"的硬保险。
+    // 不产文件产物,加纪律只会稀释指令)。这只是模型侧的产物组织建议;平台不再
+    // 截断成员回传,所以即使模型没照做,完整输出仍进入队长上下文与 durable transcript。
     const artifactDiscipline = isReview
       ? ''
       : '\n\n【产物纪律】你和委派方在同一台容器、共享文件系统。若本任务会产出大产物(完整代码/长文档/数据文件/报告),请写入 `/home/agent/.openclaude/generated/<描述性文件名>`,回传只给「文件路径 + ≤1500 字的蒸馏摘要」(委派方可用 Read 按路径取回完整内容);小结果(结论/短答案)直接回传即可,不要把超长完整内容整段回传。'
@@ -8097,6 +8123,9 @@ export class Gateway {
       session,
       prompt,
       (e) => {
+        if (e.kind === 'block') durableTranscript.push(e.block)
+        else if (e.kind === 'error') durableTranscript.push({ kind: 'error', error: e.error })
+        else if (e.kind === 'final') durableTranscript.push({ kind: 'final', meta: e.meta })
         const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
         if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
         if (!timedOut) {
@@ -8152,13 +8181,54 @@ export class Gateway {
         try {
           session.runner.interrupt()
         } catch {}
-        void submitPromise.catch((lateErr) => {
+        // Preserve every frame racing with the timeout. Cooperative interrupt
+        // gets one bounded window. If it still has not settled,
+        // runner.shutdown() gets a diagnostic deadline and kills the complete
+        // process group. Crucially, neither deadline is a persistence cutoff:
+        // after shutdown starts we wait for the exact process generation's
+        // stdout-close barrier and then for SessionManager to settle the turn.
+        // Freezing a delegate card while the spool is still open would turn a
+        // temporary runner stall into permanent loss of already-paid output.
+        const drainMs = parseNonNegativeMs(
+          'OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS',
+          DELEGATE_INTERRUPT_DRAIN_DEFAULT_MS,
+        )
+        let settlement = await waitForDelegateSettlement(submitPromise, drainMs)
+        if (!settlement.settled) {
+          const shutdown = await waitForDelegateSettlement(
+            Promise.resolve().then(() => session.runner.shutdown()),
+            parseNonNegativeMs(
+              'OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS',
+              DELEGATE_SHUTDOWN_WAIT_DEFAULT_MS,
+            ),
+          )
+          if (!shutdown.settled) {
+            this.log.error('delegate force shutdown exceeded terminal deadline', {
+              targetAgentId,
+              sessionKey,
+            })
+          } else if (shutdown.error !== undefined) {
+            this.log.error('delegate force shutdown failed after timeout', {
+              targetAgentId,
+              sessionKey,
+              error: (shutdown.error as Error)?.message ?? String(shutdown.error),
+            })
+          }
+          await session.runner.waitForOutputDrain()
+          try {
+            await submitPromise
+            settlement = { settled: true }
+          } catch (submitError) {
+            settlement = { settled: true, error: submitError }
+          }
+        }
+        if (settlement.error !== undefined && settlement.error !== err) {
           this.log.warn('delegate submit settled after timeout with error', {
             targetAgentId,
             sessionKey,
-            error: lateErr?.message ?? String(lateErr),
+            error: (settlement.error as Error)?.message ?? String(settlement.error),
           })
-        })
+        }
       }
       if (streamProgress) {
         emitProgress(
@@ -8175,6 +8245,9 @@ export class Gateway {
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
       clearTimeoutTimer()
+      if (session._durableDelegateTranscript === durableTranscript) {
+        session._durableDelegateTranscript = undefined
+      }
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
@@ -8205,41 +8278,60 @@ export class Gateway {
 
     // ── P2 债A — buffer this delegation as a server-authored team card ──
     //
-    // Attach it to the LEADER (parent webchat) session so it drains into that
-    // session's turn-end persist (persistServerAuthoredTurn). Only a **first-level**
-    // delegation (direct webchat parent) durably persists a team card, matching
-    // MASTER_SINK_PERSIST_CHANNELS. A nested/嵌套 delegation (`nestedProgress`) —
-    // whose `progressTarget` now resolves to a webchat *ancestor* rather than null —
-    // must NOT buffer its own durable card: its live progress已作为文本行挂到一级卡,
-    // 用 progressRunId(≠ 一级 runId)另铸一张 server 行反而会折叠失败 → 冗余卡。故显式
-    // 用 `!nestedProgress` 保持旧「嵌套 → client-only(无回归)」语义。非嵌套(一级)时
-    // runId 复用本委派 progressRunId,server 行 `_delegateRunId` 折叠到同一张本地 `m-*`
-    // agent-group 行(mergePreservingServerAuthored 里 local-wins)。resultSummary 在生成点
-    // 截断(master 上限 2KB;前端本地 m-* 行仍保 200 字预览)。
+    // A first-level group is buffered on the webchat leader and drains with
+    // that turn's tape. Nested groups append their complete transcript to the
+    // direct parent delegate's live collector; recursively this produces one
+    // top-level card containing every descendant in execution order. If that
+    // collector is unexpectedly absent, persist a separate top-level card
+    // instead of silently losing the nested reply.
+    const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
+    const resultSummary = error ? error : output.trim()
+    const durableGroup: DurableAgentGroup = {
+      runId: progressRunId,
+      agentId: targetAgentId,
+      goal,
+      status,
+      ...(resultSummary.length > 0 ? { resultSummary } : {}),
+      ...(durableTranscript.length > 0 ? { transcript: durableTranscript } : {}),
+      completedAt: Date.now(),
+      // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
+      ...(verdict ? { verdict } : {}),
+    }
     if (progressTarget && !nestedProgress) {
-      const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
-      const rawSummary = error ? error : output.trim()
-      const resultSummary =
-        rawSummary.length > 2000 ? `${rawSummary.slice(0, 2000)}…` : rawSummary
-      this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, {
-        runId: progressRunId,
-        agentId: targetAgentId,
-        goal,
-        status,
-        ...(resultSummary.length > 0 ? { resultSummary } : {}),
-        completedAt: Date.now(),
-        // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
-        ...(verdict ? { verdict } : {}),
-      })
+      this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+    } else if (nestedProgress && delegateParent) {
+      const directParent = this.sessions.getByKey(delegateParent.sessionKey)
+      const parentTranscript = directParent?._durableDelegateTranscript
+      if (Array.isArray(parentTranscript)) {
+        // Flatten nested cards into the direct parent's child transcript in
+        // execution order. Keep the original child blocks byte-for-byte and
+        // add only a structural marker; failed/timeout text is repeated in
+        // the marker because raw `kind:error` blocks are not UI-rendered.
+        parentTranscript.push({
+          kind: 'text',
+          text:
+            `【嵌套委派 · ${targetAgentId}】\n目标：${goal}\n状态：${status}` +
+            (status !== 'ok' && resultSummary ? `\n结果：\n${resultSummary}` : ''),
+          _nestedDelegateRunId: progressRunId,
+          _nestedDelegateAgentId: targetAgentId,
+          _nestedDelegateStatus: status,
+          _nestedDelegateCompletedAt: durableGroup.completedAt,
+        })
+        if (durableGroup.transcript) parentTranscript.push(...durableGroup.transcript)
+      } else if (progressTarget) {
+        // A broken/old direct-parent collector must degrade to a separate
+        // durable card, never to silent loss.
+        this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      }
     }
 
     return {
       kind: 'completed',
       ok: !error,
-      // P2 批次4(1b)— 回传封顶:普通成员委派的 output 兜底截断(env 默认 4000 字,截断尾注
-      // 引导落文件)。**不裁 review**:review.output 作为送审工具结果全量回给队长
-      // (内部流程,不面向用户),截断会丢审查意见。团队卡 resultSummary(上方 2KB)独立。
-      output: isReview ? output.trim() : capDelegateOutput(output.trim()),
+      // Every child reply is paid output. Return it to the leader verbatim;
+      // artifact-discipline prompting may encourage files but never authorizes
+      // the platform to cut the actual response.
+      output: output.trim(),
       error: error || undefined,
       timedOut,
       runId: progressRunId,
@@ -11781,6 +11873,10 @@ export class Gateway {
           type: 'outbound.codex_billing',
           ..._inheritOutboundRouting(out),
           requestId: e.requestId,
+          ...(e.turnKey ? { turnKey: e.turnKey } : {}),
+          ...(e.parentTurnKey ? { parentTurnKey: e.parentTurnKey } : {}),
+          ...(e.parentSessionId ? { parentSessionId: e.parentSessionId } : {}),
+          ...(e.delegateAgentId ? { delegateAgentId: e.delegateAgentId } : {}),
           engineSessionId: e.engineSessionId,
           status: e.status,
           durationMs: e.durationMs,

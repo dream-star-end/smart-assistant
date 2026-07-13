@@ -526,7 +526,8 @@ describe("CodexAdapter — billing 侧信道边界", () => {
 
   test("rateLimits 快照 piggy-back 到 billing 帧(NaN 拒收)", async () => {
     const h = makeHarness();
-    const turn = beginTurn(h, { requestId: "req-rl" });
+    const turnKey = "ab".repeat(32);
+    const turn = beginTurn(h, { requestId: "req-rl", turnKey });
     await waitForRequest(h, "turn/start");
     const p = h.proc();
     p.notify("account/rateLimits/updated", {
@@ -541,6 +542,7 @@ describe("CodexAdapter — billing 侧信道边界", () => {
     assert.equal(h.billing[0].rateLimits?.util5h, 37);
     assert.equal(h.billing[0].rateLimits?.util7d, 12);
     assert.ok(h.billing[0].rateLimits?.reset5h?.startsWith("2027-"));
+    assert.equal(h.billing[0].turnKey, turnKey);
   });
 
   test("buildCodexBillingEvent 纯函数:usage typeof 防御 + errorReason", () => {
@@ -555,12 +557,23 @@ describe("CodexAdapter — billing 侧信道边界", () => {
       },
       "req-x",
       "oceng-abc",
+      "cd".repeat(32),
+      {
+        mode: "delegate",
+        parentTurnKey: "ef".repeat(32),
+        parentSessionId: "web-parent-1",
+        delegateAgentId: "researcher",
+      },
     );
     assert.equal(ev.status, "error");
     assert.equal(ev.errorReason, "codex turn failed");
     assert.deepEqual(ev.usage, { input_tokens: 3, reasoning_output_tokens: 2 });
     assert.deepEqual(ev.rateLimits, { reset5h: "2026-01-01T00:00:00Z" }, "NaN util 必须拒收");
     assert.equal(ev.engineSessionId, "oceng-abc");
+    assert.equal(ev.turnKey, "cd".repeat(32));
+    assert.equal(ev.parentTurnKey, "ef".repeat(32));
+    assert.equal(ev.parentSessionId, "web-parent-1");
+    assert.equal(ev.delegateAgentId, "researcher");
   });
 
   test("classifyCodexErrorKind:lastErrorText(catch 路径无 delta)也参与分类", () => {

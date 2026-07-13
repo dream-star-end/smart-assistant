@@ -91,6 +91,8 @@ class FakeTurnRunner extends EventEmitter {
 
   async shutdown(): Promise<void> {}
 
+  async waitForOutputDrain(): Promise<void> {}
+
   async submit(
     textOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     requestId?: string,
@@ -253,12 +255,16 @@ describe("SessionManager pending-persistence tracking", () => {
       (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
 
       const guard = await sm.beginExternalTurn(session);
-      await sm.recordExternalTurn(session, {
-        userText: "把天空圈选区域改成晚霞",
-        assistantText: "已完成圈选区域的精确修改。\n\n/api/media/edited.png",
-        requestId: "1234567890abcdef1234567890abcdef",
-        model: "gpt-image-2",
-      });
+      await assert.rejects(
+        sm.recordExternalTurn(session, {
+          userText: "把天空圈选区域改成晚霞",
+          assistantText: "已完成圈选区域的精确修改。\n\n/api/media/edited.png",
+          requestId: "1234567890abcdef1234567890abcdef",
+          model: "gpt-image-2",
+        }),
+        /durably queued but master has not acknowledged/,
+        "queued-only persistence must not masquerade as a refresh-visible ACK",
+      );
       guard.finish("completed");
       assert.equal(payloads.length, 1);
 

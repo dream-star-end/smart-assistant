@@ -995,6 +995,8 @@ export function makeAnthropicProxyHandler(
           mode: attribution.mode,
           parentSessionId: attribution.parentSessionId,
           delegateAgentId: attribution.delegateAgentId,
+          turnKey: attribution.turnKey,
+          parentTurnKey: attribution.parentTurnKey,
           // 模型权威留证(0143 四列;方案 §4 / R3-m11)。gate 未生效(legacy / 影子期)→ 全 NULL,
           // 与本批次之前的落库形状一致。有值时可事后回答:这一笔是按哪个执行快照、哪个 epoch、
           // 凭哪类权威扣的钱。
@@ -1030,6 +1032,8 @@ export function makeAnthropicProxyHandler(
         // P2 债D — 委派目标 agent id(与 parentSessionId 同源 attribution);普通 chat 恒 null。
         // core park 进 pending.delegate_agent_id,drain 产出 usage.delegates[] 明细。
         delegateAgentId: attribution.delegateAgentId,
+        turnKey: attribution.turnKey,
+        parentTurnKey: attribution.parentTurnKey,
         userLog,
       });
     } finally {

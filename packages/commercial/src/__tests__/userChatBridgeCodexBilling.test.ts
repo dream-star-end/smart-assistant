@@ -172,6 +172,13 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("UPDATE usage_records SET ledger_id")) {
         return { rows: [], rowCount: 1 };
       }
+      // 0147: the exact turn locator is inserted in the same transaction as
+      // the debit. Session-store reconciliation itself is covered by the PG
+      // backend integration suite; this bridge fake only needs to acknowledge
+      // the atomic insert.
+      if (trimmed.startsWith("INSERT INTO pending_usage_patches")) {
+        return { rows: [], rowCount: 1 };
+      }
       // settle 23505 重入读(不该在本套件触发,兜住防 unhandled)
       if (trimmed.startsWith("SELECT id::text AS id, ledger_id")) {
         return { rows: [], rowCount: 0 };
@@ -360,9 +367,7 @@ async function startRig(opts: {
   acquireResult?: "account" | "legacy" | "throw" | "stale";
   logger?: Logger;
   // CG2c — 注入 deps.appendCostCredits,可用于触发 billingLog.warn 路径(persist 抛错)。
-  appendCostCredits?: (
-    requestId: string, userId: string, debited: string,
-  ) => Promise<void>;
+  appendCostCredits?: UserChatBridgeDeps["appendCostCredits"];
   createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
   expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
@@ -703,7 +708,15 @@ describe("userChatBridge / annotated Image 2 — forward only", () => {
 
 describe("userChatBridge / codex billing — happy path(双钱包 settle)", () => {
   let rig: BillingRig;
-  before(async () => { rig = await startRig({ userBalance: 1_000_000n }); });
+  const persisted: unknown[][] = [];
+  before(async () => {
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      appendCostCredits: async (...args) => {
+        persisted.push(args);
+      },
+    });
+  });
   after(async () => { await stopRig(rig); });
   beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
 
@@ -730,6 +743,7 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     assert.equal(parsed.model, "gpt-5.6-sol");
     // server-owned 32-hex requestId 覆盖 client 值
     const serverReqId = parsed.requestId as string;
+    const turnKey = "ab".repeat(32);
     assert.match(serverReqId, /^[0-9a-f]{32}$/);
     assert.notEqual(serverReqId, "client-supplied-evil-id");
 
@@ -737,6 +751,7 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     containerWs.send(JSON.stringify({
       type: "outbound.codex_billing",
       requestId: serverReqId,
+      turnKey,
       engineSessionId: ENGINE_SID,
       status: "success",
       usage: {
@@ -772,6 +787,11 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     // 同一入参 ⇒ settle=waive 同值,refund.refundSessionWindow 才能圈到本记录。
     assert.equal(inserts[0]!.params?.[10], ENGINE_SID, "usage_records.session_id must equal wire engineSessionId");
     assert.equal(inserts[0]!.params?.[13], serverReqId);
+    assert.deepEqual(
+      persisted[0],
+      [serverReqId, "11", cost.debitedCredits, ENGINE_SID, null, null, turnKey, null],
+      "Codex cost persistence must join the same lossless turn key",
+    );
 
     ws.close();
   });

@@ -1,0 +1,54 @@
+/**
+ * Lossless turn-tape wire contract (runtime container -> commercial master).
+ *
+ * A completed/interrupted/crashed turn is canonical JSON bytes split into
+ * independently content-addressed parts.  The per-request part cap is a
+ * resource guard; it is not a per-turn data cap.
+ */
+
+export const LOSSLESS_TURN_TAPE_VERSION = 2 as const
+export const LOSSLESS_TURN_TAPE_PART_BYTES = 192 * 1024
+export const LOSSLESS_TURN_TAPE_SHA256_RE = /^[0-9a-f]{64}$/
+/** Reserved envelope identity used only when upgrading a pre-agentId v1
+ * retry entry to the v2 tape protocol. Materialization maps it back to the
+ * historical `srv-${sessionId}-tN` record namespace so an ACK-lost v1 write
+ * is replaced idempotently rather than duplicated. */
+export const LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID = "__legacy_v1__" as const
+
+export interface LosslessTurnTapePartRequest {
+  protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
+  action: 'part'
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed' | 'interrupted' | 'crashed'
+  turnKey: string
+  tapeId: string
+  tapeSha256: string
+  totalBytes: number
+  partCount: number
+  partIndex: number
+  partSha256: string
+  /** Standard base64 (not base64url) of this part's raw canonical bytes. */
+  data: string
+  createdAt: number
+}
+
+export interface LosslessTurnTapeFinalizeRequest {
+  protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
+  action: 'finalize'
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed' | 'interrupted' | 'crashed'
+  turnKey: string
+  tapeId: string
+  tapeSha256: string
+  totalBytes: number
+  partCount: number
+  createdAt: number
+}
+
+export type LosslessTurnTapeRequest =
+  | LosslessTurnTapePartRequest
+  | LosslessTurnTapeFinalizeRequest

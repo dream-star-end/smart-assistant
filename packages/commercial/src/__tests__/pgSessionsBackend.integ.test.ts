@@ -16,8 +16,14 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Pool } from "pg";
-import type { ClientSession, ClientSessionsBackend, MessageLike } from "@openclaude/storage";
-import { createPgSessionsBackend, startSessionsGcSweeper } from "../db/pgSessionsBackend.js";
+import type { ClientSession, MessageLike } from "@openclaude/storage";
+import { LOSSLESS_TURN_TAPE_PART_BYTES, LOSSLESS_TURN_TAPE_VERSION } from "@openclaude/protocol";
+import { createHash } from "node:crypto";
+import {
+  createPgSessionsBackend,
+  startSessionsGcSweeper,
+  type PgSessionsBackend,
+} from "../db/pgSessionsBackend.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -27,9 +33,10 @@ const GENERATION = 1;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION_0134 = path.resolve(here, "../db/migrations/0134_sessions_master_pg.sql");
+const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_tapes.sql");
 
 let pool: Pool;
-let backend: ClientSessionsBackend;
+let backend: PgSessionsBackend;
 let pgAvailable = false;
 
 async function probeAvailability(): Promise<boolean> {
@@ -64,6 +71,7 @@ before(async () => {
   pool = new Pool({ connectionString: TEST_DB_URL, max: 10, options: `-c search_path=${SCHEMA}` });
   const sql = await readFile(MIGRATION_0134, { encoding: "utf8" });
   await pool.query(sql);
+  await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
     `INSERT INTO sessions_store_migration_state (singleton, authority, generation, cutover_id, source_digest, completed_at)
@@ -85,7 +93,7 @@ beforeEach(async () => {
   if (!pgAvailable) return;
   await pool.query(
     `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-             server_authored_request_map, pending_usage_patches, wechat_bindings`,
+             server_authored_request_map, pending_usage_patches, wechat_bindings CASCADE`,
   );
 });
 
@@ -102,6 +110,51 @@ function mkSession(over: Partial<ClientSession> = {}): ClientSession {
     lastAt: over.lastAt ?? now,
     messages: over.messages ?? [],
     updatedAt: over.updatedAt ?? now,
+  };
+}
+
+function sha256(value: Buffer | string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function buildTape(payload: Record<string, unknown>) {
+  const canonical = Buffer.from(JSON.stringify(payload), "utf8");
+  const turnKey = payload.turnKey as string;
+  const tapeSha256 = sha256(canonical);
+  const tapeId = sha256(`test-tape\0${turnKey}`);
+  const partCount = Math.ceil(canonical.length / LOSSLESS_TURN_TAPE_PART_BYTES);
+  const base = {
+    protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+    sessionId: payload.sessionId as string,
+    agentId: payload.agentId as string,
+    turnIndex: payload.turnIndex as number,
+    status: payload.status as "completed" | "interrupted" | "crashed",
+    turnKey,
+    tapeId,
+    tapeSha256,
+    totalBytes: canonical.length,
+    partCount,
+    createdAt: payload.createdAt as number,
+  } as const;
+  return {
+    canonical,
+    parts: Array.from({ length: partCount }, (_, partIndex) => {
+      const bytes = canonical.subarray(
+        partIndex * LOSSLESS_TURN_TAPE_PART_BYTES,
+        Math.min(canonical.length, (partIndex + 1) * LOSSLESS_TURN_TAPE_PART_BYTES),
+      );
+      return {
+        request: {
+          ...base,
+          action: "part" as const,
+          partIndex,
+          partSha256: sha256(bytes),
+          data: bytes.toString("base64"),
+        },
+        bytes,
+      };
+    }),
+    finalize: { ...base, action: "finalize" as const },
   };
 }
 
@@ -374,6 +427,374 @@ describe("pgSessionsBackend contract", () => {
     assert.deepEqual(await backend.appendCostCredits("req-late", "u-1", "42"), { applied: "noop" });
     const pend = await pool.query("SELECT 1 FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2", ["req-late", "u-1"]);
     assert.equal(pend.rowCount, 0, "软删会话 late-cost 不应 park pending");
+  });
+});
+
+describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("multipart finalize hydrates every full detail and exact turn billing", async () => {
+    const sessionId = "s-lossless1";
+    const userId = "u-lossless";
+    const turnKey = "a".repeat(64);
+    const thinking = "思考😀".repeat(70_000);
+    const answer = "完整回答".repeat(60_000);
+    const toolOutput = "stdout\n".repeat(70_000);
+    const toolInput = { command: "echo exact".repeat(40_000) };
+    const child = "child-detail".repeat(50_000);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+
+    // Billing may arrive before the tape. The exact key must park without a
+    // TTL that can delete it, then finalize must consume it atomically.
+    assert.deepEqual(
+      await backend.appendCostCredits("cost-before", userId, "7", "ccb-1", null, null, turnKey),
+      { applied: "pending" },
+    );
+    assert.deepEqual(
+      await backend.appendCostCredits("cost-before", userId, "07", "ccb-1", null, null, turnKey),
+      { applied: "pending" },
+    );
+    await assert.rejects(
+      backend.appendCostCredits("cost-before", userId, "8", "ccb-1", null, null, turnKey),
+      /pending cost component refuses remapping/,
+    );
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      text: answer,
+      thinkingText: thinking,
+      createdAt: 1_783_944_000_000,
+      requestId: "top-request",
+      agentSessionId: "ccb-1",
+      usage: { inputTokens: 10, outputTokens: 20 },
+      tools: [{
+        toolUseId: "tool-1",
+        blockId: "tool-1",
+        toolName: "Bash",
+        inputJson: toolInput,
+        inputPreview: "preview",
+        output: toolOutput,
+        isError: false,
+        durationMs: 1,
+        ts: 2,
+        arrivedAt: 2,
+      }],
+      agentGroups: [{
+        runId: "dlg-1",
+        agentId: "reviewer",
+        goal: "review",
+        status: "ok",
+        resultSummary: child,
+        transcript: [{ kind: "thinking", text: child }, { kind: "text", text: child }],
+        completedAt: 3,
+      }],
+    });
+    assert.ok(tape.parts.length > 3);
+    for (const part of tape.parts) {
+      assert.deepEqual(
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes),
+        { applied: "stored" },
+      );
+    }
+    assert.deepEqual(
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      { applied: "finalized", recordCount: 4 },
+    );
+
+    let hydrated = await backend.getClientSession(sessionId, userId);
+    assert.ok(hydrated);
+    const messages = hydrated.messages as MessageLike[];
+    assert.equal(messages.find((m) => m.role === "thinking")?.text, thinking);
+    const tool = messages.find((m) => m.role === "tool")!;
+    assert.deepEqual(tool.inputJson, toolInput);
+    assert.equal(tool.output, toolOutput);
+    const group = messages.find((m) => m.role === "agent-group")!;
+    assert.equal(group._resultPreview, child);
+    assert.deepEqual(group.childBlocks, [
+      { kind: "thinking", text: child },
+      { kind: "text", text: child },
+    ]);
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    assert.equal(assistant.text, answer);
+    assert.equal((assistant.usage as Record<string, unknown>).costCredits, "7");
+
+    // The hot session only stores small refs; canonical bytes remain intact
+    // in content-addressed part rows.
+    const hot = await pool.query<{ messages: string }>(
+      "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    assert.ok(Buffer.byteLength(hot.rows[0]!.messages, "utf8") < 16 * 1024);
+    assert.doesNotMatch(hot.rows[0]!.messages, /完整回答完整回答完整回答/);
+    const hotAnchors = JSON.parse(hot.rows[0]!.messages) as MessageLike[];
+    assert.equal(hotAnchors.length, 1, "one constant-size hot anchor represents the whole turn");
+    assert.equal(hotAnchors[0]!._turnTapeComplete, true);
+    assert.equal(hotAnchors[0]!._turnTapeRecordCount, 4);
+    const rawParts = await pool.query<{ payload: Buffer }>(
+      `SELECT payload FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 ORDER BY part_index`,
+      [sessionId, userId],
+    );
+    assert.deepEqual(Buffer.concat(rawParts.rows.map((row) => Buffer.from(row.payload))), tape.canonical);
+
+    // A browser may immediately PUT the fully hydrated GET projection back.
+    // Expanded rows are read-only projections and must not be copied into the
+    // hot JSON tail; otherwise one refresh would defeat out-of-line storage.
+    const hydratedProjectionSyncedAt = hydrated.updatedAt;
+    assert.equal(
+      await backend.upsertClientSession(
+        mkSession({
+          id: sessionId,
+          userId,
+          createdAt: hydrated.createdAt,
+          lastAt: hydrated.lastAt,
+          updatedAt: hydratedProjectionSyncedAt,
+          messages: hydrated.messages,
+        }),
+        hydratedProjectionSyncedAt,
+      ),
+      "applied",
+    );
+    const hotAfterProjectionPut = await pool.query<{ messages: string }>(
+      "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    assert.equal((JSON.parse(hotAfterProjectionPut.rows[0]!.messages) as MessageLike[]).length, 1);
+    hydrated = await backend.getClientSession(sessionId, userId);
+    assert.ok(hydrated);
+    assert.equal((hydrated.messages as MessageLike[]).find((m) => m.role === "assistant")?.text, answer);
+
+    // A later browser PUT contains only its streamed placeholders. The
+    // tape-backed server refs must win by semantic role/blockId/runId and
+    // remain hydratable; otherwise a routine sync would recreate the exact
+    // "reply disappears after relogin" failure.
+    const syncedAt = hydrated.updatedAt;
+    assert.equal(
+      await backend.upsertClientSession(
+        mkSession({
+          id: sessionId,
+          userId,
+          createdAt: hydrated.createdAt,
+          lastAt: hydrated.lastAt,
+          updatedAt: syncedAt,
+          messages: [
+            { id: "m-think", role: "thinking", text: "placeholder", ts: 1 },
+            { id: "m-tool", role: "tool", text: "placeholder", toolName: "Bash", blockId: "tool-1", ts: 2 },
+            {
+              id: "m-group",
+              role: "agent-group",
+              text: "review",
+              ts: 3,
+              _delegateRunId: "dlg-1",
+              childBlocks: [{ kind: "text", text: "placeholder" }],
+            },
+            { id: "m-answer", role: "assistant", text: "placeholder", ts: 4 },
+          ],
+        }),
+        syncedAt,
+      ),
+      "applied",
+    );
+    hydrated = await backend.getClientSession(sessionId, userId);
+    assert.ok(hydrated);
+    assert.equal((hydrated.messages as MessageLike[]).filter((m) => m.role === "thinking").length, 1);
+    assert.equal((hydrated.messages as MessageLike[]).find((m) => m.role === "thinking")?.text, thinking);
+    assert.equal((hydrated.messages as MessageLike[]).filter((m) => m.role === "tool").length, 1);
+    assert.equal((hydrated.messages as MessageLike[]).find((m) => m.role === "tool")?.output, toolOutput);
+    assert.equal((hydrated.messages as MessageLike[]).filter((m) => m.role === "agent-group").length, 1);
+    assert.equal((hydrated.messages as MessageLike[]).filter((m) => m.role === "assistant").length, 1);
+    assert.equal((hydrated.messages as MessageLike[]).find((m) => m.role === "assistant")?.text, answer);
+    const beforeLateCostSeq = Math.max(
+      ...(hydrated.messages as MessageLike[]).map((m) => typeof m._seq === "number" ? m._seq : 0),
+    );
+
+    // Late normal + delegate components join this exact leader turn and sum;
+    // idempotent retry cannot remap or change a component's amount.
+    assert.deepEqual(
+      await backend.appendCostCredits("cost-late", userId, "5", "ccb-1", null, null, turnKey),
+      { applied: "patched" },
+    );
+    const costDelta = await backend.getClientSessionPartial(sessionId, userId, beforeLateCostSeq);
+    assert.ok(costDelta?.isPartial);
+    const deltaAssistant = (costDelta.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.ok(deltaAssistant, "late exact cost must bump the billing anchor sequence");
+    assert.equal((deltaAssistant.usage as Record<string, unknown>).costCredits, "12");
+    assert.deepEqual(
+      await backend.appendCostCredits(
+        "cost-delegate",
+        userId,
+        "3",
+        "ccb-child",
+        sessionId,
+        "reviewer",
+        "b".repeat(64),
+        turnKey,
+      ),
+      { applied: "patched" },
+    );
+    assert.deepEqual(
+      await backend.appendCostCredits(
+        "cost-delegate",
+        userId,
+        "3",
+        "ccb-child",
+        sessionId,
+        "reviewer",
+        "b".repeat(64),
+        turnKey,
+      ),
+      { applied: "noop" },
+    );
+    await assert.rejects(
+      backend.appendCostCredits(
+        "cost-delegate",
+        userId,
+        "4",
+        "ccb-child",
+        sessionId,
+        "reviewer",
+        "b".repeat(64),
+        turnKey,
+      ),
+      /refuses remapping/,
+    );
+    hydrated = await backend.getClientSession(sessionId, userId);
+    const billed = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
+    assert.equal((billed.usage as Record<string, unknown>).costCredits, "15");
+    assert.deepEqual((billed.usage as Record<string, unknown>).delegates, [
+      { agentId: "reviewer", costCredits: "3" },
+    ]);
+    const components = await pool.query(
+      "SELECT 1 FROM turn_tape_cost_components WHERE user_id=$1",
+      [userId],
+    );
+    assert.equal(components.rowCount, 3);
+  });
+
+  maybe("GC never hard-deletes exact turn-key pending cost", async () => {
+    const userId = "u-retain";
+    const turnKey = "c".repeat(64);
+    await backend.appendCostCredits("retain-cost", userId, "9", null, null, null, turnKey);
+    await pool.query(
+      "UPDATE pending_usage_patches SET created_at=$1 WHERE request_id=$2 AND user_id=$3",
+      [1, "retain-cost", userId],
+    );
+    const stats = await backend.sweepUsageAggregationGc(Date.now());
+    assert.equal(stats.pendingExpired, 0);
+    const retained = await pool.query(
+      "SELECT cost_credits FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+      ["retain-cost", userId],
+    );
+    assert.equal(retained.rowCount, 1);
+  });
+
+  maybe("ledger-atomic pending remains refresh-visible after tape finalize and reconciles without double count", async () => {
+    const sessionId = "s-cost-atomic";
+    const userId = "c:42";
+    const turnKey = "d".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      text: "atomic cost answer",
+      createdAt: 1_783_944_000_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+
+    // Simulates settleUsageAndLedger committing the debit+pending row, then
+    // the egress process crashing before appendCostCredits can run.
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,session_id,turn_key,cost_credits)
+       VALUES ($1,$2,$3,$4,$5)`,
+      ["atomic-cost", userId, "ccb-atomic", turnKey, "11"],
+    );
+    let hydrated = await backend.getClientSession(sessionId, userId);
+    let assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
+    assert.equal((assistant.usage as Record<string, unknown>).costCredits, "11");
+
+    assert.deepEqual(
+      await backend.appendCostCredits(
+        "atomic-cost", userId, "11", "ccb-atomic", null, null, turnKey,
+      ),
+      { applied: "patched" },
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+        ["atomic-cost", userId],
+      )).rowCount,
+      0,
+    );
+    hydrated = await backend.getClientSession(sessionId, userId);
+    assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
+    assert.equal((assistant.usage as Record<string, unknown>).costCredits, "11");
+  });
+
+  maybe("rolling v1 ACK-loss replay upgrades hot legacy rows to one v2 tape without duplicates", async () => {
+    const sessionId = "s-rolling-v1-v2";
+    const userId = "u-rolling";
+    const turnKey = "e".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const prefix = `srv-${sessionId}-main-t1`;
+    await backend.appendServerAuthoredMessage(sessionId, userId, {
+      id: `${prefix}-thinking`, role: "thinking", text: "legacy thought", ts: 1,
+    });
+    await backend.appendServerAuthoredMessage(sessionId, userId, {
+      id: `${prefix}-tool-tool-1`, role: "tool", text: "legacy tool", blockId: "tool-1", ts: 2,
+    });
+    await backend.appendServerAuthoredMessage(sessionId, userId, {
+      id: prefix, role: "assistant", text: "legacy answer", ts: 3,
+    });
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      text: "exact v2 answer",
+      thinkingText: "exact v2 thought",
+      createdAt: 3,
+      tools: [{
+        toolUseId: "tool-1",
+        blockId: "tool-1",
+        toolName: "Bash",
+        inputJson: { command: "printf exact" },
+        inputPreview: "printf exact",
+        output: "exact v2 tool",
+        isError: false,
+        durationMs: 1,
+        ts: 2,
+        arrivedAt: 2,
+      }],
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    assert.deepEqual(
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      { applied: "finalized", recordCount: 3 },
+    );
+    const hot = await pool.query<{ messages: string }>(
+      "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    assert.equal((JSON.parse(hot.rows[0]!.messages) as MessageLike[]).length, 1);
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const messages = hydrated!.messages as MessageLike[];
+    assert.equal(messages.filter((m) => m.role === "thinking").length, 1);
+    assert.equal(messages.filter((m) => m.role === "tool").length, 1);
+    assert.equal(messages.filter((m) => m.role === "assistant").length, 1);
+    assert.equal(messages.find((m) => m.role === "thinking")?.text, "exact v2 thought");
+    assert.equal(messages.find((m) => m.role === "tool")?.output, "exact v2 tool");
+    assert.equal(messages.find((m) => m.role === "assistant")?.text, "exact v2 answer");
   });
 });
 

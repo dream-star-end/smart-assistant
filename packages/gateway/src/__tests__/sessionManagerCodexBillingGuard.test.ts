@@ -23,6 +23,7 @@ import {
 import type { EngineCapabilities, EngineTurnRun, TurnParams } from "../engine/engineAdapter.js";
 import type { SessionStreamEvent, TurnSummary } from "../engine/engineEvents.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
+import { setV3MasterSinkSingleton, type V3MasterSink } from "../v3MasterSink.js";
 
 function makeConfigStub(): OpenClaudeConfig {
   return {
@@ -68,6 +69,7 @@ class FakeEngineAdapter extends EventEmitter {
       assistantSegments: [],
       thinkingSegments: [],
       tools: [],
+      runtimeEvents: [],
       stopReason: "end_turn",
       numTurns: 1,
       isError: false,
@@ -86,6 +88,7 @@ class FakeEngineAdapter extends EventEmitter {
         completedTools: [],
         assistantSegments: [],
         thinkingSegments: [],
+        runtimeEvents: [],
       }),
       getPhantomSignals: () => ({ apiState: "skipped" as const, skipReason: "unit-test" }),
       finalized: true,
@@ -152,12 +155,21 @@ const savedEnv = new Map<string, string | undefined>(
 );
 
 afterEach(() => {
+  setV3MasterSinkSingleton(null);
   for (const k of ENV_KEYS) {
     const v = savedEnv.get(k);
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
 });
+
+function enableCommercialWithLosslessSink(): void {
+  process.env.OC_RUNTIME_CHANNEL = "v5";
+  setV3MasterSinkSingleton({
+    persistOrQueue: async () => ({ ok: true }),
+    attemptOnce: async () => {},
+  } as V3MasterSink);
+}
 
 describe("isCommercialManagedRuntime(commercial 判定惯例)", () => {
   test("个人版 / 测试环境(两组信号全缺)→ false", () => {
@@ -190,8 +202,22 @@ describe("isCommercialManagedRuntime(commercial 判定惯例)", () => {
 });
 
 describe("submit() codex 计费 guard(fail-closed)", () => {
-  test("commercial + needsServerRequestId + 无 requestId → 拒 turn(error 事件),不触 submitTurn", async () => {
+  test("commercial runtime without lossless sink rejects before any engine execution", async () => {
     process.env.OC_RUNTIME_CHANNEL = "v5";
+    setV3MasterSinkSingleton(null);
+    const runner = new FakeEngineAdapter("ccb", CCB_CAPS, "glm-5.2");
+    const session = makeSession(runner);
+    const events: SessionStreamEvent[] = [];
+
+    await makeSm().submit(session, "paid prompt", (event) => events.push(event));
+
+    assert.equal(runner.submitTurnCalls.length, 0);
+    assert.ok(events.some((event) =>
+      event.kind === "error" && /LOSSLESS_SINK_UNAVAILABLE/.test(event.error)));
+  });
+
+  test("commercial + needsServerRequestId + 无 requestId → 拒 turn(error 事件),不触 submitTurn", async () => {
+    enableCommercialWithLosslessSink();
     const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
     const session = makeSession(runner);
     const sm = makeSm();
@@ -215,7 +241,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
   });
 
   test("commercial + needsServerRequestId + 畸形 requestId(空串/非 32hex)→ 同样拒 turn", async () => {
-    process.env.OC_RUNTIME_CHANNEL = "v5";
+    enableCommercialWithLosslessSink();
     const sm = makeSm();
     // seam 合同校验形状:bridge 生成的 server-owned requestId 恒为 32 hex;
     // 空串/短串/大写/非 hex 都意味着没走 bridge preCheck/journal → fail-closed。
@@ -233,7 +259,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
   });
 
   test("commercial + needsServerRequestId + 带 requestId → 放行,requestId 透传 submitTurn", async () => {
-    process.env.OC_RUNTIME_CHANNEL = "v5";
+    enableCommercialWithLosslessSink();
     const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
     const session = makeSession(runner);
     const sm = makeSm();
@@ -257,7 +283,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
   });
 
   test("commercial + CCB(needsServerRequestId=false)+ 无 requestId → 不受影响(CCB 路径零回归)", async () => {
-    process.env.OC_RUNTIME_CHANNEL = "v5";
+    enableCommercialWithLosslessSink();
     const runner = new FakeEngineAdapter("ccb", CCB_CAPS, "glm-5.2");
     const session = makeSession(runner);
     const sm = makeSm();
