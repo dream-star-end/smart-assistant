@@ -1133,6 +1133,44 @@ assert_release_capability_for_sessions_pg() {
   echo "  ✓ capability 门:目标 release 声明 sessions-store-pg-v1(已割接前置满足)。"
 }
 
+# Lossless turn-tape compatibility floor. A finalized v2 tape is represented
+# in client_sessions by a textless constant-size anchor; an older master would
+# return that anchor verbatim and make an already-paid reply disappear after
+# login. Likewise, an older runtime would resume lossy v1 writes. Therefore the
+# first finalized tape makes reader+writer capability irreversible.
+LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
+assert_lossless_turn_tape_floor() {
+  local reldir="$1" finalized rc master_has runtime_has
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过 lossless turn-tape 兼容地板"; return 0; }
+  if finalized="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
+      test -n \"\${DATABASE_URL:-}\"
+      psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL)::text\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  finalized="$(printf '%s' "$finalized" | tr -d '[:space:]')"
+  if [[ $rc -eq 0 && "$finalized" == "false" ]]; then
+    echo "  · lossless turn-tape 地板:尚无 finalized v2 tape,暂不设限。"
+    return 0
+  fi
+  if [[ $rc -ne 0 || "$finalized" != "true" ]]; then
+    echo "  · lossless turn-tape 状态不可核验(rc=$rc result=${finalized:-<empty>})→ 对旧目标 fail-closed。"
+  else
+    echo "  · lossless turn-tape 地板生效:已存在 finalized v2 tape。"
+  fi
+  master_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.capabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  runtime_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.runtimeCapabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "$master_has" || -z "$runtime_has" ]]; then
+    echo "✗ 激活中止:目标 release 未同时声明 reader/writer capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
+    echo "    $reldir/deploy/v5/release-metadata.json" >&2
+    echo "  finalized tape 的 hot row 只有 textless anchor;旧 master 重登会丢回复,旧 runtime 会恢复有损写入。" >&2
+    echo "  数据库不可读时也只允许激活明确具备该 capability 的目标。" >&2
+    exit 1
+  fi
+  echo "  ✓ lossless turn-tape 地板:目标 release reader+writer 均声明 $LOSSLESS_TURN_TAPE_CAP。"
+}
+
 # ═════════════════ 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)═════════════
 #
 # 四面 = {DB schema, master, egress, 容器 runtime}。判定单点化后 master 签发签名 execution
@@ -2199,6 +2237,7 @@ activate_release() {
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
+  assert_lossless_turn_tape_floor "$reldir"
   # 模型权威兼容地板(步骤 5 后):同上,激活/回滚同一处收口。
   assert_model_authority_floor "$reldir"
   prev="$(bg_current_release "$ACTIVE_SRC")"
@@ -2499,6 +2538,7 @@ activate_runtime_tuple() {
   # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
   # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
   assert_release_capability_for_sessions_pg "$BUILT_RELEASE"
+  assert_lossless_turn_tape_floor "$BUILT_RELEASE"
   assert_model_authority_floor "$BUILT_RELEASE"
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
@@ -3513,6 +3553,7 @@ rollback_runtime_tuple() {
   # 回滚同样过两个 capability 门(地板的核心场景就是"拒绝把旧版本翻回来")。
   # 容器 tuple(image/release)面在 saga 内由 lib 的 assert_tuple_viable ③ 覆盖。
   assert_release_capability_for_sessions_pg "$master"
+  assert_lossless_turn_tape_floor "$master"
   assert_model_authority_floor "$master"
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
   # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
@@ -4026,6 +4067,7 @@ canary() {
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
   assert_release_capability_for_sessions_pg "$reldir"
+  assert_lossless_turn_tape_floor "$reldir"
   # cutover 后 P3 candidate 也是一条真实激活路径；不能绕过模型权威兼容地板。
   assert_model_authority_floor "$reldir"
   # assets → union 池(candidate 与 active 前端 chunk 并集,跨 lane 可得)

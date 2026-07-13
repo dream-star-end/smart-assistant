@@ -44,6 +44,7 @@ CREATE TABLE client_session_turn_tapes (
   part_count INTEGER NOT NULL CHECK (part_count > 0),
   billing_anchor_id TEXT,
   usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+  engine_billings JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at BIGINT NOT NULL,
   finalized_at BIGINT,
   PRIMARY KEY (session_id, user_id, tape_id),

@@ -19,10 +19,12 @@
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
+import type { OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
   EngineEvent,
+  DurableRuntimeEvent,
   PartialSnapshot,
   PhantomSignals,
   TurnSummary,
@@ -87,6 +89,13 @@ export interface TurnParams {
   collabAgentPolicy?: CollabAgentPolicy
   /** turn 事件流(内容事件 + tool_use/result_detected)。同步、按底座输出顺序回调。 */
   onEvent: (e: EngineEvent) => void
+  /** Runtime output that legitimately arrives after the engine's terminal
+   * result. The orchestrator must durably continue the finalized turn before
+   * surfacing the projected live block. */
+  onPostTerminalRuntimeEvent?: (
+    event: DurableRuntimeEvent,
+    block: OutboundContentBlock,
+  ) => void
   /**
    * Session 级跨 turn 累计(engine 中立;见 EngineSessionTotals)。CCB 路径
    * parser 直接 mutate 此引用(totalCostUSD += delta / turns += 1,另经

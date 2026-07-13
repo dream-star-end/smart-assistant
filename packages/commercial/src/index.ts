@@ -415,6 +415,7 @@ import {
   makeCodexFinalizer,
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
+import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
 import type { TokenUsage } from "./billing/calculator.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -1576,6 +1577,18 @@ export async function registerCommercial(
       const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
         identityRepo,
         losslessTurnTapeStorage,
+        settleCodexBilling: async (userId, billing) => {
+          await settleDurableCodexBilling(
+            {
+              pgPool: getPool(),
+              preCheckRedis,
+              pricing,
+              logger: rootLogger.child({ subsys: "durableCodexBilling" }),
+            },
+            userId,
+            billing,
+          );
+        },
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,

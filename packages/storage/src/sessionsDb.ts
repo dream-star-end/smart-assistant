@@ -1018,9 +1018,41 @@ export function _stripClientPutMessage(msg: unknown): MessageLike | null {
  * Strip an entire `messages` array from a client PUT to the allow-list.
  * Returns a new array with malformed entries removed.
  */
-export function _stripClientPutMessages(messages: readonly unknown[]): MessageLike[] {
+export function _stripClientPutMessages(
+  messages: readonly unknown[],
+  serverSideMsgs: readonly MessageLike[] = [],
+): MessageLike[] {
+  // GET expands each immutable tape record into a normal message so existing
+  // clients can render it. A client can immediately PUT that projection back.
+  // Identify projections while their server-only tape markers are still
+  // present; `_stripClientPutMessage` intentionally removes those markers.
+  // The complete anchor in the already-stored hot tail is the authority for
+  // which tape ids are safe to discard here.
+  const completeTapeIds = new Set<string>()
+  for (const message of serverSideMsgs) {
+    if (
+      message?._source === 'server' &&
+      (message as { _turnTapeComplete?: unknown })._turnTapeComplete === true &&
+      typeof (message as { _turnTapeId?: unknown })._turnTapeId === 'string'
+    ) {
+      completeTapeIds.add((message as { _turnTapeId: string })._turnTapeId)
+    }
+  }
   const out: MessageLike[] = []
   for (const m of messages) {
+    if (m && typeof m === 'object') {
+      const projected = m as {
+        _turnTapeExpanded?: unknown
+        _turnTapeId?: unknown
+      }
+      if (
+        projected._turnTapeExpanded === true &&
+        typeof projected._turnTapeId === 'string' &&
+        completeTapeIds.has(projected._turnTapeId)
+      ) {
+        continue
+      }
+    }
     const cleaned = _stripClientPutMessage(m)
     if (cleaned !== null) out.push(cleaned)
   }
@@ -1769,7 +1801,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     // the single chokepoint for `_source/_seq/usage/_truncated/_errorCode/
     // _errorDetail/status='replied'/_rawMeta/...` rejection. See
     // _stripClientPutMessage above for the full deny/ephemeral matrix.
-    const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[])
+    const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[], oldMsgs)
     // PUT 防复活:剔除 id 已归档的 incoming 消息(客户端全量 PUT 会带回完整历史,含已搬走
     // 的归档行;不剔除则被重新并入 → 行回涨 → 又 spill,来回震荡)。见 _filterOutArchivedIncoming。
     const clientMsgs = _filterOutArchivedIncoming(db, session.id, clientMsgsRaw)

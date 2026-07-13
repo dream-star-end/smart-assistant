@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  LOSSLESS_TURN_TAPE_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_EGRESS_CAPABILITY,
 } from "@openclaude/protocol";
@@ -264,7 +265,10 @@ describe("model catalog admin — provider 机制集 parity(禁止第二份枚�
 
 describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
   test("master / egress 广播各自的 capability token(protocol 常量单一权威)", () => {
-    assert.deepEqual(MASTER_CAPABILITIES, [MODEL_AUTHORITY_CAPABILITY]);
+    assert.deepEqual(MASTER_CAPABILITIES, [
+      MODEL_AUTHORITY_CAPABILITY,
+      LOSSLESS_TURN_TAPE_CAPABILITY,
+    ]);
     assert.deepEqual(EGRESS_CAPABILITIES, [MODEL_AUTHORITY_EGRESS_CAPABILITY]);
   });
 
@@ -278,7 +282,10 @@ describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
         `release-metadata.capabilities 缺 ${cap} —— deploy 守卫会拒绝激活本 release`,
       );
     }
-    assert.deepEqual(meta.runtimeCapabilities, [MODEL_AUTHORITY_CAPABILITY]);
+    assert.deepEqual(meta.runtimeCapabilities, [
+      MODEL_AUTHORITY_CAPABILITY,
+      LOSSLESS_TURN_TAPE_CAPABILITY,
+    ]);
     assert.ok(meta.requiredMigrations.includes("0143_model_catalog"));
   });
 

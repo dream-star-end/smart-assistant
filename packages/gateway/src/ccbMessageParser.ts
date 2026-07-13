@@ -17,6 +17,22 @@ import type {
 } from './engine/engineEvents.js'
 import type { SdkMessage } from './subprocessRunner.js'
 
+function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
+  const toolUseId = raw.tool_use_id
+  if (typeof toolUseId !== 'string' || toolUseId.length === 0) return null
+  const block: Record<string, unknown> = {
+    kind: 'tool_output_tail',
+    toolUseBlockId: toolUseId,
+    tail: typeof raw.tail === 'string' ? raw.tail : '',
+    totalBytes: typeof raw.total_bytes === 'number' ? raw.total_bytes : 0,
+    truncatedHead: !!raw.truncated_head,
+  }
+  if (typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id.length > 0) {
+    block.parentToolUseId = raw.parent_tool_use_id
+  }
+  return block as OutboundContentBlock
+}
+
 // M0 engine 适配层:事件/工具快照类型的权威源迁至 engine/engineEvents.ts(engine
 // 中立模块);此处 re-export 兼容存量 import(server/v3MasterSink/commercial/测试)。
 export type {
@@ -240,6 +256,10 @@ export class CcbMessageParser {
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
+  private onPostFinalRuntimeEvent?: (
+    event: DurableRuntimeEvent,
+    block: OutboundContentBlock,
+  ) => void
   private onFinish: (result: TurnResult | null) => void
 
   /** V3 v7 — canonical assistant row id for this turn, minted server-side
@@ -274,6 +294,10 @@ export class CcbMessageParser {
     onEvent: (e: SessionStreamEvent) => void
     onToolUse?: (tool: DetectedToolUse) => void
     onToolResult?: (result: DetectedToolResult) => void
+    onPostFinalRuntimeEvent?: (
+      event: DurableRuntimeEvent,
+      block: OutboundContentBlock,
+    ) => void
     onFinish: (result: TurnResult | null) => void
     /** Running totals from session (for computing totalCost in final meta).
      *  - totalCostUSD: gateway-side per-session cumulative cost (we mutate +=delta)
@@ -299,6 +323,7 @@ export class CcbMessageParser {
     this.onEvent = opts.onEvent
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
+    this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
     this.assistantMessageId = opts.assistantMessageId
@@ -346,7 +371,18 @@ export class CcbMessageParser {
         (msg as any)?.subtype === 'bash_output_tail'
       ) {
         try {
-          this._parseInner(msg)
+          const block = bashOutputTailBlock(msg as Record<string, any>)
+          if (!block) return
+          if (this.onPostFinalRuntimeEvent) {
+            this.onPostFinalRuntimeEvent({
+              ordinal: this.nextDurableEventOrdinal(),
+              observedAt: Date.now(),
+              source: 'ccb',
+              payload: structuredClone(msg),
+            }, block)
+          } else {
+            this.onEvent({ kind: 'block', block })
+          }
         } catch (err) {
           this.onEvent({ kind: 'error', error: String(err) })
         }
@@ -449,18 +485,8 @@ export class CcbMessageParser {
     //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
       if (raw.subtype === 'bash_output_tail') {
-        const toolUseId = raw.tool_use_id
-        if (typeof toolUseId === 'string' && toolUseId.length > 0) {
-          const block: Record<string, unknown> = {
-            kind: 'tool_output_tail',
-            toolUseBlockId: toolUseId,
-            tail: typeof raw.tail === 'string' ? raw.tail : '',
-            totalBytes: typeof raw.total_bytes === 'number' ? raw.total_bytes : 0,
-            truncatedHead: !!raw.truncated_head,
-          }
-          if (parentToolUseId) block.parentToolUseId = parentToolUseId
-          this.onEvent({ kind: 'block', block: block as any })
-        }
+        const block = bashOutputTailBlock(raw)
+        if (block) this.onEvent({ kind: 'block', block })
       } else if (raw.subtype === 'status') {
         // CCB SDKStatus 当前只有 'compacting' | null(coreSchemas.ts:1268)。
         // 任何其它值都 normalize 到 null —— 防止未来 CCB 加新 status 字面量

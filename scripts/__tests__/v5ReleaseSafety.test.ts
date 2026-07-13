@@ -288,6 +288,7 @@ describe('v5 release safety lanes', () => {
     for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
       const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
+      assert.match(body, /assert_lossless_turn_tape_floor/, `${fn} 未挂 lossless tape 兼容地板`)
     }
     // marker 探测 fail-closed:psql 失败 → 按已置位处理(不确定即拒)
     const cutoverFn = source.match(/model_authority_cutover_done\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
@@ -296,6 +297,50 @@ describe('v5 release safety lanes', () => {
     const disableFn = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(disableFn, /model_authority_cutover_done/)
     assert.match(disableFn, /兼容地板不可逆/)
+  })
+
+  test('lossless tape floor permits pre-cutover targets but rejects old readers/writers after first finalize', () => {
+    function runFloor(dbResult: 'true' | 'false' | 'error', master = '1', runtime = '1') {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes"*)',
+        dbResult === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${dbResult}' ;;`,
+        '    *".runtimeCapabilities"*) printf "%s\\n" "$FLOOR_RUNTIME" ;;',
+        '    *".capabilities"*) printf "%s\\n" "$FLOOR_MASTER" ;;',
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'assert_lossless_turn_tape_floor /release/target',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          FLOOR_MASTER: master,
+          FLOOR_RUNTIME: runtime,
+        },
+      })
+    }
+
+    const beforeFirstTape = runFloor('false', '', '')
+    assert.equal(beforeFirstTape.status, 0, beforeFirstTape.stderr || beforeFirstTape.stdout)
+    const capable = runFloor('true')
+    assert.equal(capable.status, 0, capable.stderr || capable.stdout)
+    for (const rejected of [
+      runFloor('true', '', '1'),
+      runFloor('true', '1', ''),
+      runFloor('error', '', ''),
+    ]) {
+      assert.notEqual(rejected.status, 0)
+      assert.match(rejected.stdout + rejected.stderr, /目标 release 未同时声明 reader\/writer capability/)
+    }
   })
 
   test('model-authority operations pin the stable P3 active lane', async () => {
@@ -482,7 +527,7 @@ describe('v5 release safety lanes', () => {
     }
   })
 
-  test('release metadata declares both authority migrations and both authority capabilities', async () => {
+  test('release metadata declares authority plus lossless persistence capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
     const source = await readFile(deploy, 'utf8')
     const buildRuntimeStart = source.indexOf('build_runtime_release()')
@@ -491,8 +536,9 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
+    assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
-    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
     assert.match(
       source.slice(buildRuntimeStart, buildRuntimeEnd),

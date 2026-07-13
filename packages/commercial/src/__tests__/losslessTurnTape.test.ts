@@ -284,4 +284,96 @@ describe("materializeLosslessTurn", () => {
     ]);
     assert.ok(turn.records.every((record) => !record.id.includes(LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID)));
   });
+
+  test("materializes post-terminal runtime continuations without inventing visible text", () => {
+    const continuationOfTurnKey = "b".repeat(64);
+    const rawTail = {
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "tool-bg",
+      tail: "late complete stdout",
+      total_bytes: 20,
+      truncated_head: false,
+      futureExactField: { keep: true },
+    };
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-123",
+      agentId: "tail_deadbeef",
+      turnIndex: 13,
+      status: "completed",
+      turnKey: TURN_KEY,
+      continuationOfTurnKey,
+      text: "",
+      createdAt: 1_783_944_000_000,
+      runtimeEvents: [{
+        ordinal: 99,
+        observedAt: 1_783_944_000_000,
+        source: "ccb",
+        payload: rawTail,
+      }],
+    });
+    assert.equal(turn.records.length, 1);
+    assert.equal(turn.records[0]!.role, "runtime-event");
+    assert.deepEqual(turn.records[0]!.payload._runtimeEvent, rawTail);
+    assert.equal(turn.records[0]!.payload._continuationOfTurnKey, continuationOfTurnKey);
+    assert.equal(turn.engineBillings.length, 0);
+  });
+
+  test("retains and validates root plus every delegate engine billing frame", () => {
+    const sessionId = "web-lossless-123";
+    const rootBilling = {
+      requestId: "1".repeat(32),
+      turnKey: TURN_KEY,
+      engineSessionId: `oceng-${"2".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 5,
+      usage: { input_tokens: 10, output_tokens: 4, reasoning_output_tokens: 3 },
+      rateLimits: { util5h: 12.5, reset5h: "2026-07-14T00:00:00.000Z" },
+    };
+    const delegateBilling = {
+      requestId: "3".repeat(32),
+      turnKey: "4".repeat(64),
+      parentTurnKey: TURN_KEY,
+      parentSessionId: sessionId,
+      delegateAgentId: "reviewer",
+      engineSessionId: `oceng-${"5".repeat(48)}`,
+      status: "error" as const,
+      durationMs: 9,
+      usage: { input_tokens: 8, output_tokens: 2 },
+      errorReason: "exact delegate failure",
+    };
+    const turn = materializeLosslessTurn({
+      sessionId,
+      agentId: "codex",
+      turnIndex: 14,
+      status: "completed",
+      turnKey: TURN_KEY,
+      requestId: rootBilling.requestId,
+      text: "paid answer",
+      createdAt: 1_783_944_000_000,
+      engineBilling: rootBilling,
+      agentGroups: [{
+        runId: "dlg-billing",
+        agentId: "reviewer",
+        goal: "review",
+        status: "failed",
+        completedAt: 1_783_944_000_001,
+        engineBillings: [delegateBilling],
+      }],
+    });
+    assert.deepEqual(turn.engineBillings, [rootBilling, delegateBilling]);
+    const group = turn.records.find((record) => record.role === "agent-group")!;
+    assert.deepEqual(group.payload.engineBillings, [delegateBilling]);
+    assert.throws(() => materializeLosslessTurn({
+      sessionId,
+      agentId: "codex",
+      turnIndex: 15,
+      status: "completed",
+      turnKey: TURN_KEY,
+      requestId: "6".repeat(32),
+      text: "must reject mismatched billing",
+      createdAt: 1_783_944_000_000,
+      engineBilling: rootBilling,
+    }), /does not match requestId/);
+  });
 });

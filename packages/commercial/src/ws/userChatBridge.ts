@@ -58,6 +58,10 @@ import {
 } from "../billing/preCheck.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import {
+  parseBillingPricing,
+  serializeBillingPricing,
+} from "../billing/persistedBillingPricing.js";
+import {
   getAgentCostMultiplier,
   composeMultiplier,
 } from "../billing/agentMultiplier.js";
@@ -522,71 +526,6 @@ async function resolveTurnExecution(
     auxModels: descriptor.engine === "ccb" ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
-  };
-}
-
-/**
- * journal 中的 server-owned 精确定价。BigInt 显式转十进制串，确保 JSON 可序列化；这里
- * 持久化的是已复合 agent multiplier 的最终价格，所以跨 bridge 恢复时不能再查当前
- * PricingCache / agent override（两者都可能已换 generation）。
- */
-interface PersistedBillingPricingV1 {
-  v: 1;
-  modelId: string;
-  displayName: string;
-  inputPerMtok: string;
-  outputPerMtok: string;
-  cacheReadPerMtok: string;
-  cacheWritePerMtok: string;
-  multiplier: string;
-}
-
-function serializeBillingPricing(pricing: ModelPricing): PersistedBillingPricingV1 {
-  return {
-    v: 1,
-    modelId: pricing.model_id,
-    displayName: pricing.display_name,
-    inputPerMtok: pricing.input_per_mtok.toString(),
-    outputPerMtok: pricing.output_per_mtok.toString(),
-    cacheReadPerMtok: pricing.cache_read_per_mtok.toString(),
-    cacheWritePerMtok: pricing.cache_write_per_mtok.toString(),
-    multiplier: pricing.multiplier,
-  };
-}
-
-const BILLING_AMOUNT_RE = /^\d+$/;
-const BILLING_MULTIPLIER_RE = /^\d+(?:\.\d{1,3})?$/;
-
-/** 严格解析 journal 定价；任何畸形都返回 null，由 authority 恢复路径 fail-closed 免单。 */
-function parseBillingPricing(raw: unknown, expectedModel: string): ModelPricing | null {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const p = raw as Record<string, unknown>;
-  if (
-    p.v !== 1 ||
-    p.modelId !== expectedModel ||
-    typeof p.displayName !== "string" ||
-    typeof p.inputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.inputPerMtok) ||
-    typeof p.outputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.outputPerMtok) ||
-    typeof p.cacheReadPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheReadPerMtok) ||
-    typeof p.cacheWritePerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheWritePerMtok) ||
-    typeof p.multiplier !== "string" || !BILLING_MULTIPLIER_RE.test(p.multiplier)
-  ) {
-    return null;
-  }
-  return {
-    model_id: expectedModel,
-    display_name: p.displayName,
-    input_per_mtok: BigInt(p.inputPerMtok),
-    output_per_mtok: BigInt(p.outputPerMtok),
-    cache_read_per_mtok: BigInt(p.cacheReadPerMtok),
-    cache_write_per_mtok: BigInt(p.cacheWritePerMtok),
-    multiplier: p.multiplier,
-    enabled: true,
-    sort_order: 0,
-    visibility: "hidden",
-    extra_system_prompt: null,
-    default_effort: null,
-    updated_at: new Date(0),
   };
 }
 

@@ -61,6 +61,7 @@ import {
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
   type DurableAgentGroup,
+  type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
 } from '@openclaude/protocol'
@@ -118,6 +119,10 @@ export interface V3MasterSinkWirePayload {
   status: 'completed' | 'interrupted' | 'crashed'
   /** Stable logical turn identity used by lossless persistence and exact billing. */
   turnKey?: string
+  /** This tape is an immutable post-terminal continuation of an already
+   * finalized paid turn (currently CCB background Bash tail events). It is
+   * content-only and must never consume or redirect billing patches. */
+  continuationOfTurnKey?: string
   /** Delegate usage is attributed to this leader turn when present. */
   parentTurnKey?: string
   /** Assistant text — the user-visible content. Always written if non-empty.
@@ -214,6 +219,8 @@ export interface V3MasterSinkWirePayload {
   structuredBlocks?: Array<Record<string, unknown>>
   /** Exact opaque CCB/Codex protocol stream, globally ordered and uncapped. */
   runtimeEvents?: DurableRuntimeEvent[]
+  /** Final engine-reported usage, durably co-located with the paid turn. */
+  engineBilling?: DurableCodexBilling
 }
 
 /**

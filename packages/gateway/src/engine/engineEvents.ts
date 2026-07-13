@@ -19,7 +19,8 @@
  * 硬约束:底座原生消息形状(CCB stream-json SdkMessage、codex fake-SDK RunnerMessage)
  * 只允许存在于各 adapter 内部,不得出现在本模块的任何类型里。
  */
-import type { OutboundContentBlock } from '@openclaude/protocol'
+import type { DurableCodexBilling, DurableRuntimeEvent, OutboundContentBlock } from '@openclaude/protocol'
+export type { DurableRuntimeEvent } from '@openclaude/protocol'
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
 export interface PermissionRequest {
@@ -112,16 +113,6 @@ export interface SegmentRecord {
   eventOrdinal?: number
 }
 
-/** Exact opaque engine/protocol event retained alongside UI projections.
- * `payload` is structured-cloned from the parsed wire object and is never
- * summarized or capped. */
-export interface DurableRuntimeEvent {
-  ordinal: number
-  observedAt: number
-  source: 'ccb' | 'codex-jsonrpc' | 'gateway'
-  payload: unknown
-}
-
 /** turn 终态 meta(原 SessionStreamEvent 'final' 变体的 meta,逐字段不变)。 */
 export interface EngineFinalMeta {
   cost?: number
@@ -170,8 +161,7 @@ export type EngineEvent =
  * 终态经独立 'billing' 事件通道 emit;server.ts 仍包装为 outbound.codex_billing
  * wire 帧(帧名不变)。M0 阶段无 emitter(CCB 是 proxy 计费),M1 CodexAdapter 接线。
  */
-export interface EngineBillingEvent {
-  requestId: string
+export interface EngineBillingEvent extends DurableCodexBilling {
   /** Stable logical paid-turn key shared with lossless turn-tape persistence. */
   turnKey?: string
   /** Delegate spend belongs to the root user-visible turn, not the transient
@@ -185,26 +175,9 @@ export interface EngineBillingEvent {
    *  settle 落 usage_records.session_id 与 idle-timeout turn-waive 上报都用它 ——
    *  不用 containerId/threadId 占位(refund.ts 按 session_id 圈退款窗口)。
    *  master 侧用它圈定退款窗口。 */
-  engineSessionId: string
-  status: 'success' | 'error'
-  durationMs: number
-  usage?: {
-    input_tokens?: number
-    output_tokens?: number
-    cache_read_input_tokens?: number
-    cache_creation_input_tokens?: number
-    reasoning_output_tokens?: number
-  }
-  errorReason?: string
   // Issue A v1.0.108 — codex account/rateLimits/updated 快照,piggy-back 到 billing
   // 终态帧让 master.userChatBridge 落库到 claude_accounts。utilization 0..100,
   // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
-  rateLimits?: {
-    util5h?: number
-    reset5h?: string
-    util7d?: number
-    reset7d?: string
-  }
 }
 
 /**

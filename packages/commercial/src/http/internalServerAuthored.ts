@@ -65,6 +65,7 @@ import {
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   LOSSLESS_TURN_TAPE_VERSION,
+  type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
 } from "@openclaude/protocol";
@@ -503,6 +504,9 @@ export interface ServerAuthoredHandlerDeps {
   storage: ServerAuthoredStorage;
   /** v5 PG-only lossless v2 tape store. v1 remains available for rolling old containers. */
   losslessTurnTapeStorage?: LosslessTurnTapeStorage;
+  /** Durable billing fallback. Finalize is ACKed only after every billing
+   * frame co-located with the immutable tape is settled or proven terminal. */
+  settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
@@ -648,9 +652,11 @@ export function makeServerAuthoredHandler(
         await handleLosslessTurnTapeRequest({
           raw,
           userId,
+          numericUserId: BigInt(uid),
           requestId,
           res,
           storage: deps.losslessTurnTapeStorage,
+          settleCodexBilling: deps.settleCodexBilling,
           userLog,
           metric,
         });
@@ -1696,9 +1702,11 @@ function isLosslessTurnTapeWireBody(raw: unknown): boolean {
 async function handleLosslessTurnTapeRequest(args: {
   raw: unknown;
   userId: string;
+  numericUserId: bigint;
   requestId: string;
   res: ServerResponse;
   storage?: LosslessTurnTapeStorage;
+  settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
   userLog: Logger;
   metric: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
 }): Promise<void> {
@@ -1786,6 +1794,39 @@ async function handleLosslessTurnTapeRequest(args: {
       }
       if (result.applied !== "finalized" && result.applied !== "idempotent") {
         throw new Error("unexpected lossless turn tape finalize result");
+      }
+      if (result.engineBillings.length > 0) {
+        if (!args.settleCodexBilling) {
+          sendJsonError(
+            args.res,
+            503,
+            "TURN_TAPE_BILLING_UNAVAILABLE",
+            "durable codex billing settlement unavailable",
+            args.requestId,
+          );
+          return;
+        }
+        try {
+          for (const billing of result.engineBillings) {
+            await args.settleCodexBilling(args.numericUserId, billing);
+          }
+        } catch (err) {
+          args.userLog.error("lossless_turn_tape_billing_settle_failed", {
+            tapeId: body.tapeId,
+            err: err as Error,
+          });
+          // Tape+final usage are already immutable. A 503 deliberately keeps
+          // the container's fsynced queue entry so idempotent finalize retries
+          // until every billing journal reaches a terminal state.
+          sendJsonError(
+            args.res,
+            503,
+            "TURN_TAPE_BILLING_PENDING",
+            "durable codex billing settlement pending",
+            args.requestId,
+          );
+          return;
+        }
       }
       args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
       sendJsonOk(args.res, 200, {

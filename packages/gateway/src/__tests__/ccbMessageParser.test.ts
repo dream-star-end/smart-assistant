@@ -10,7 +10,10 @@ import {
   type SessionStreamEvent,
 } from '../ccbMessageParser.js'
 
-function createParser(opts?: { onToolUse?: (t: any) => void }) {
+function createParser(opts?: {
+  onToolUse?: (t: any) => void
+  onPostFinalRuntimeEvent?: (event: any, block: any) => void
+}) {
   const events: SessionStreamEvent[] = []
   let finished = false
   let finishResult: any = null
@@ -20,6 +23,7 @@ function createParser(opts?: { onToolUse?: (t: any) => void }) {
     toolUseIdToName,
     onEvent: (e) => events.push(e),
     onToolUse: opts?.onToolUse,
+    onPostFinalRuntimeEvent: opts?.onPostFinalRuntimeEvent,
     onFinish: (result) => {
       finished = true
       finishResult = result
@@ -710,6 +714,29 @@ describe('CcbMessageParser: system', () => {
       assert.equal(b.truncatedHead, false)
       assert.equal(b.parentToolUseId, undefined)
     }
+  })
+
+  it('routes post-final bash tails through the durable continuation callback before live delivery', () => {
+    const continuations: Array<{ event: any; block: any }> = []
+    const { parser, events } = createParser({
+      onPostFinalRuntimeEvent: (event, block) => continuations.push({ event, block }),
+    })
+    parser.finish()
+    const raw = {
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: 'toolu_bg',
+      tail: 'late paid output',
+      total_bytes: 16,
+      truncated_head: false,
+    }
+    parser.parse(raw as any)
+    assert.equal(events.length, 0, 'callback owns delivery after durable staging')
+    assert.equal(continuations.length, 1)
+    assert.deepEqual(continuations[0].event.payload, raw)
+    assert.equal(continuations[0].event.source, 'ccb')
+    assert.equal(continuations[0].block.kind, 'tool_output_tail')
+    assert.equal(continuations[0].block.tail, 'late paid output')
   })
 
   it('forwards parent_tool_use_id on bash_output_tail for subagent routing', () => {

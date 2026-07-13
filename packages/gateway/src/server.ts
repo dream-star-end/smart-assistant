@@ -37,6 +37,8 @@ import {
   type Peer,
   type AgentGroupStatus,
   type DurableAgentGroup,
+  type DurableCodexBilling,
+  type DurableRuntimeEvent,
   type ReviewVerdict,
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
@@ -8011,6 +8013,8 @@ export class Gateway {
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
     const durableTranscript: unknown[] = []
+    const durableRuntimeEvents: DurableRuntimeEvent[] = []
+    const durableEngineBillings: DurableCodexBilling[] = []
     let session
     try {
       session = await this.sessions.getOrCreate({
@@ -8035,6 +8039,8 @@ export class Gateway {
         },
       })
       session._durableDelegateTranscript = durableTranscript
+      session._durableDelegateRuntimeEvents = durableRuntimeEvents
+      session._durableDelegateEngineBillings = durableEngineBillings
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
       if (streamProgress) {
@@ -8248,6 +8254,12 @@ export class Gateway {
       if (session._durableDelegateTranscript === durableTranscript) {
         session._durableDelegateTranscript = undefined
       }
+      if (session._durableDelegateRuntimeEvents === durableRuntimeEvents) {
+        session._durableDelegateRuntimeEvents = undefined
+      }
+      if (session._durableDelegateEngineBillings === durableEngineBillings) {
+        session._durableDelegateEngineBillings = undefined
+      }
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
@@ -8293,6 +8305,8 @@ export class Gateway {
       status,
       ...(resultSummary.length > 0 ? { resultSummary } : {}),
       ...(durableTranscript.length > 0 ? { transcript: durableTranscript } : {}),
+      ...(durableRuntimeEvents.length > 0 ? { runtimeEvents: durableRuntimeEvents } : {}),
+      ...(durableEngineBillings.length > 0 ? { engineBillings: durableEngineBillings } : {}),
       completedAt: Date.now(),
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
       ...(verdict ? { verdict } : {}),
@@ -8301,6 +8315,11 @@ export class Gateway {
       this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
     } else if (nestedProgress && delegateParent) {
       const directParent = this.sessions.getByKey(delegateParent.sessionKey)
+      if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
+        directParent._durableDelegateEngineBillings.push(
+          ...durableGroup.engineBillings.map((billing) => structuredClone(billing)),
+        )
+      }
       const parentTranscript = directParent?._durableDelegateTranscript
       if (Array.isArray(parentTranscript)) {
         // Flatten nested cards into the direct parent's child transcript in
@@ -8316,6 +8335,9 @@ export class Gateway {
           _nestedDelegateAgentId: targetAgentId,
           _nestedDelegateStatus: status,
           _nestedDelegateCompletedAt: durableGroup.completedAt,
+          ...(durableGroup.runtimeEvents
+            ? { _nestedDelegateRuntimeEvents: durableGroup.runtimeEvents }
+            : {}),
         })
         if (durableGroup.transcript) parentTranscript.push(...durableGroup.transcript)
       } else if (progressTarget) {

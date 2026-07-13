@@ -404,7 +404,7 @@ echo "[build-image] docker build → $IMAGE_FULL"
 #   (cutover 后)按这两处之一验证容器面能力,拒绝把 baked 判定的旧容器翻回来。
 RUNTIME_FEATURES="v3-sink"
 if [ "${OC_EMBED_SOURCE:-1}" != "0" ]; then
-  RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1"
+  RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1 lossless-turn-tape-v2"
 fi
 docker build \
   ${OC_BUILD_NETWORK_HOST:+--network=host} \

@@ -19,9 +19,10 @@
     "sessions-store-pg-v1",
     "dual-master-v1",
     "model_authority_v1",
-    "model_authority_v1-egress"
+    "model_authority_v1-egress",
+    "lossless-turn-tape-v2"
   ],
-  "runtimeCapabilities": ["model_authority_v1"],
+  "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2"],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
 }

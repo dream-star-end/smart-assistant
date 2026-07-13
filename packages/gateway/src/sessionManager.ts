@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -27,6 +28,7 @@ import type {
   DurableRuntimeEvent,
   EngineBillingEvent,
   EngineEvent,
+  SegmentRecord,
   SessionStreamEvent,
   TurnSummary,
   TurnToolEntry,
@@ -409,6 +411,13 @@ export interface AgentSession {
    * Nested delegates append their full transcript here in execution order so
    * the first-level durable team card survives reload with every descendant. */
   _durableDelegateTranscript?: unknown[]
+  /** Complete raw event stream for this one-shot delegate turn. The delegate
+   * channel is not persisted as its own chat session, so handleDelegateTask
+   * moves this collector into the parent DurableAgentGroup. */
+  _durableDelegateRuntimeEvents?: DurableRuntimeEvent[]
+  /** Complete engine-reported billing frames for this delegate subtree.
+   * handleDelegateTask moves them into the parent DurableAgentGroup. */
+  _durableDelegateEngineBillings?: EngineBillingEvent[]
   lock: Promise<void>
   lastUsedAt: number
   // 跨 turn 累积
@@ -557,6 +566,30 @@ function takeDurableEventOrdinal(session: AgentSession): number {
   return ordinal
 }
 
+function combineRetryAssistantOutput(
+  retrySegments: readonly SegmentRecord[],
+  terminalText: string,
+  terminalSegments: readonly SegmentRecord[],
+  fallbackTs: number,
+): { text: string; segments: SegmentRecord[] } {
+  if (retrySegments.length === 0) {
+    return { text: terminalText, segments: terminalSegments.map((segment) => ({ ...segment })) }
+  }
+  const tail = terminalSegments.length > 0
+    ? terminalSegments
+    : terminalText.length > 0
+      ? [{ index: 0, text: terminalText, ts: fallbackTs }]
+      : []
+  const segments = [...retrySegments, ...tail].map((segment, index) => ({
+    ...segment,
+    index,
+  }))
+  return {
+    text: retrySegments.map((segment) => segment.text).join('') + terminalText,
+    segments,
+  }
+}
+
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
 
@@ -623,6 +656,8 @@ function persistServerAuthoredTurn(args: {
   userId: string | undefined
   turnIndex: number
   turnKey?: string
+  continuationOfTurnKey?: string
+  createdAt?: number
   text: string
   /** Optional full reasoning/thinking text for the same turn. Persisted as a
    *  separate `_source: 'server'` message with `role: 'thinking'`,
@@ -684,6 +719,10 @@ function persistServerAuthoredTurn(args: {
   /** Exact plan/goal block update stream emitted by the main agent. */
   structuredBlocks?: Array<Record<string, unknown>>
   runtimeEvents?: DurableRuntimeEvent[]
+  /** Final usage from an engine-reported billing adapter (Codex). It is
+   * co-located with the immutable turn tape so a bridge disconnect or
+   * bounded outbound-ring eviction cannot erase the only settle evidence. */
+  engineBilling?: EngineBillingEvent
 }): Promise<boolean> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -692,12 +731,15 @@ function persistServerAuthoredTurn(args: {
       agentId: args.agentId,
       turnIndex: args.turnIndex,
       ...(args.turnKey ? { turnKey: args.turnKey } : {}),
+      ...(args.continuationOfTurnKey
+        ? { continuationOfTurnKey: args.continuationOfTurnKey }
+        : {}),
       status: args.status,
       text: args.text,
       ...(args.thinkingText && args.thinkingText.length > 0
         ? { thinkingText: args.thinkingText }
         : {}),
-      createdAt: Date.now(),
+      createdAt: args.createdAt ?? Date.now(),
       // Plan §4.4 改动 7 — propagate requestId/usage/truncated/errorCode/
       // errorDetail to master. Master schema treats requestId as required
       // when text is non-empty (assistant write), optional otherwise
@@ -728,6 +770,9 @@ function persistServerAuthoredTurn(args: {
         : {}),
       ...(args.runtimeEvents && args.runtimeEvents.length > 0
         ? { runtimeEvents: args.runtimeEvents }
+        : {}),
+      ...(args.engineBilling !== undefined
+        ? { engineBilling: structuredClone(args.engineBilling) }
         : {}),
     }
     return sink
@@ -875,6 +920,42 @@ function persistServerAuthoredTurn(args: {
       )
       return false
     })
+}
+
+function persistPostTerminalRuntimeEvent(args: {
+  sessionKey: string
+  sessionId: string
+  turnIndex: number
+  continuationOfTurnKey: string
+  event: DurableRuntimeEvent
+}): Promise<boolean> {
+  const raw = JSON.stringify(args.event.payload)
+  const identity = createHash('sha256')
+    .update('oc-post-terminal-runtime-v1\0')
+    .update(args.continuationOfTurnKey)
+    .update('\0')
+    .update(String(args.event.ordinal))
+    .update('\0')
+    .update(String(args.event.observedAt))
+    .update('\0')
+    .update(raw)
+    .digest('hex')
+  return persistServerAuthoredTurn({
+    sessionKey: args.sessionKey,
+    peerId: args.sessionId,
+    agentId: `tail_${identity.slice(0, 24)}`,
+    userId: undefined,
+    turnIndex: args.turnIndex,
+    turnKey: createHash('sha256')
+      .update('oc-post-terminal-tape-v1\0')
+      .update(identity)
+      .digest('hex'),
+    continuationOfTurnKey: args.continuationOfTurnKey,
+    createdAt: args.event.observedAt,
+    text: '',
+    status: 'completed',
+    runtimeEvents: [structuredClone(args.event)],
+  })
 }
 
 /**
@@ -2413,15 +2494,24 @@ export class SessionManager {
     // Keep exact failed-attempt protocol events and gateway retry notices, then
     // prepend them to the terminal attempt's snapshot.
     const retryRuntimeEvents: DurableRuntimeEvent[] = []
+    const retryAssistantSegments: SegmentRecord[] = []
     const emitRetryStatus = (text: string, code: string): void => {
       const block: OutboundContentBlock = {
         kind: 'text',
         text,
         messageId: assistantMessageId,
       }
+      const ordinal = takeDurableEventOrdinal(session)
+      const observedAt = Date.now()
+      retryAssistantSegments.push({
+        index: retryAssistantSegments.length,
+        text,
+        ts: observedAt,
+        eventOrdinal: ordinal,
+      })
       retryRuntimeEvents.push({
-        ordinal: takeDurableEventOrdinal(session),
-        observedAt: Date.now(),
+        ordinal,
+        observedAt,
         source: 'gateway',
         payload: { type: 'retry_status', code, event: { kind: 'block', block } },
       })
@@ -2443,6 +2533,7 @@ export class SessionManager {
           turnKey,
           modelAuthority,
           retryRuntimeEvents,
+          retryAssistantSegments,
           attempt < MAX_RETRIES,
           !phantomRetryUsed,
         )
@@ -2567,6 +2658,8 @@ export class SessionManager {
     modelAuthority?: TurnModelAuthority,
     /** Exact events from earlier attempts of this same logical turn. */
     retryRuntimeEvents: DurableRuntimeEvent[] = [],
+    /** User-visible retry notices already emitted before this attempt. */
+    retryAssistantSegments: SegmentRecord[] = [],
     /** Whether an auth result may reject for another credential-refresh try. */
     retryAuthErrors = true,
     /** Whether an empty phantom result may reject for its one clean-process try. */
@@ -2582,6 +2675,42 @@ export class SessionManager {
     // merely the last card projection) so a disconnected browser is never the
     // sole durable copy.
     const structuredBlocks: Array<Record<string, unknown>> = []
+    let postTerminalRuntimeChain: Promise<void> = Promise.resolve()
+    const onPostTerminalRuntimeEvent = (
+      event: DurableRuntimeEvent,
+      block: OutboundContentBlock,
+    ): void => {
+      session._durableDelegateRuntimeEvents?.push(structuredClone(event))
+      const ownerTurnKey = session.channel === 'delegate'
+        ? session._billingParentTurnKey
+        : turnKey
+      const ownerSessionId = session.channel === 'delegate'
+        ? session._usageAttribution?.parentSessionId
+        : session.peerId
+      if (!ownerTurnKey || !ownerSessionId) {
+        onEvent({ kind: 'block', block })
+        return
+      }
+      postTerminalRuntimeChain = postTerminalRuntimeChain.then(async () => {
+        await persistPostTerminalRuntimeEvent({
+          sessionKey: session.sessionKey,
+          sessionId: ownerSessionId,
+          turnIndex: prevTurns + 1,
+          continuationOfTurnKey: ownerTurnKey,
+          event,
+        })
+        // Never show a post-terminal snapshot before its exact raw event is
+        // fsynced in the sink queue (and normally ACKed by master).
+        onEvent({ kind: 'block', block })
+      }).catch((err) => {
+        log.error(
+          'post-terminal runtime continuation persist failed',
+          { sessionKey: session.sessionKey, turnKey: ownerTurnKey },
+          err as Error,
+        )
+      })
+      this._trackPersistence(postTerminalRuntimeChain)
+    }
 
     // Snapshot session totals so we can roll back on auth error / phantom turn
     // (CcbAdapter 的 per-turn parser 经 TurnParams.sessionTotals 引用直接 mutate
@@ -2727,8 +2856,15 @@ export class SessionManager {
       //     turnPermissionCount,phantom 判定不把 billing 当"输出"(旧语义)。
       //   - `!detached` guard:turn 已 idle/error 收尾后不再补发,防二次 settle。
       //   - CCB(billingMode:'proxy')永不 emit 'billing',本 listener 是 no-op。
+      let terminalEngineBilling: EngineBillingEvent | undefined
       const handleBilling = (b: EngineBillingEvent) => {
-        if (!detached) onEvent({ kind: 'codex_billing', ...b })
+        if (detached) return
+        // The live bridge frame is only a latency optimization: its outbound
+        // ring is bounded and may be gone after a reconnect. Keep an exact
+        // immutable copy in the same turn tape before terminal persistence.
+        terminalEngineBilling = structuredClone(b)
+        session._durableDelegateEngineBillings?.push(structuredClone(b))
+        onEvent({ kind: 'codex_billing', ...b })
       }
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
@@ -2828,6 +2964,17 @@ export class SessionManager {
             ...retryRuntimeEvents.map((event) => structuredClone(event)),
             ...snap.runtimeEvents,
           ]
+          const partialAssistant = combineRetryAssistantOutput(
+            retryAssistantSegments,
+            snap.assistantText,
+            snap.assistantSegments,
+            Date.now(),
+          )
+          if (session._durableDelegateRuntimeEvents) {
+            session._durableDelegateRuntimeEvents.push(
+              ...terminalRuntimeEvents.map((event) => structuredClone(event)),
+            )
+          }
           try {
             if (MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) {
               const turnIndex = prevTurns + 1
@@ -2839,7 +2986,7 @@ export class SessionManager {
               userId: session.userId,
               turnIndex,
               ...(turnKey ? { turnKey } : {}),
-              text: snap.assistantText,
+              text: partialAssistant.text,
               ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
               status,
               errorCode,
@@ -2848,8 +2995,8 @@ export class SessionManager {
               ...(requestId ? { requestId } : {}),
               ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
               ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
-              ...(snap.assistantSegments.length > 0
-                ? { assistantSegments: snap.assistantSegments }
+              ...(partialAssistant.segments.length > 0
+                ? { assistantSegments: partialAssistant.segments }
                 : {}),
               ...(snap.thinkingSegments.length > 0
                 ? { thinkingSegments: snap.thinkingSegments }
@@ -2857,6 +3004,9 @@ export class SessionManager {
               ...(partialAgentGroups.length > 0 ? { agentGroups: partialAgentGroups } : {}),
               ...(structuredBlocks.length > 0 ? { structuredBlocks } : {}),
               runtimeEvents: terminalRuntimeEvents,
+              ...(terminalEngineBilling !== undefined
+                ? { engineBilling: terminalEngineBilling }
+                : {}),
               })
             }
           } finally {
@@ -3103,11 +3253,17 @@ export class SessionManager {
           // Update session accumulators from turn result
           if (result) {
             terminalPersistenceClaim = 'complete'
+            const completedAssistant = combineRetryAssistantOutput(
+              retryAssistantSegments,
+              result.assistantText,
+              result.assistantSegments,
+              Date.now(),
+            )
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens
             session.totalCacheCreationTokens += result.usage.cacheCreationTokens
-            session.currentAssistantBuf = result.assistantText
+            session.currentAssistantBuf = completedAssistant.text
             // Persist cost-delta baseline after every successful turn so that
             // a gateway crash + restart can re-seed the correct baseline for
             // the resumed CCB (whose restoreCostStateForSession will target
@@ -3134,7 +3290,7 @@ export class SessionManager {
                 turnCount: session.turns,
                 totalCostUSD: session.totalCostUSD,
               }),
-              indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
+              indexTurn(sessId, session.turns, session.currentUserText ?? '', completedAssistant.text),
             ]).catch((err) =>
               log.error(
                 'FTS5 index failed',
@@ -3161,8 +3317,7 @@ export class SessionManager {
             // 不是 client_sessions.id,master 端 WHERE id=? 永远命不中,只会浪费 outbox
             // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
             // sessions_meta / event_log 路径(已存在,不在本 if 内)。
-            const completedHasAssistant =
-              !!result.assistantText && result.assistantText.length > 0
+            const completedHasAssistant = completedAssistant.text.length > 0
             const completedHasThinking =
               !!result.thinkingText && result.thinkingText.length > 0
             // Tools-only turn is rare but real: a turn that emits tool_use
@@ -3186,6 +3341,11 @@ export class SessionManager {
               ...retryRuntimeEvents.map((event) => structuredClone(event)),
               ...result.runtimeEvents,
             ]
+            if (session._durableDelegateRuntimeEvents) {
+              session._durableDelegateRuntimeEvents.push(
+                ...completedRuntimeEvents.map((event) => structuredClone(event)),
+              )
+            }
             const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
             const completedHasError = result.isError || result.errorDetail !== undefined
             if (completedHasError) {
@@ -3202,7 +3362,7 @@ export class SessionManager {
                 completedHasError)
             ) {
               const peerId = session.peerId
-              const assistantText = result.assistantText ?? ''
+              const assistantText = completedAssistant.text
               const thinkingText = result.thinkingText ?? ''
               const turnIndex = session.turns
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
@@ -3265,8 +3425,8 @@ export class SessionManager {
                   : {}),
                 ...(completedHasTools ? { tools: result.tools } : {}),
                 // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
-                ...(result.assistantSegments.length > 0
-                  ? { assistantSegments: result.assistantSegments }
+                ...(completedAssistant.segments.length > 0
+                  ? { assistantSegments: completedAssistant.segments }
                   : {}),
                 ...(result.thinkingSegments.length > 0
                   ? { thinkingSegments: result.thinkingSegments }
@@ -3275,6 +3435,9 @@ export class SessionManager {
                 ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
                 ...(completedHasStructuredBlocks ? { structuredBlocks } : {}),
                 ...(completedHasRuntimeEvents ? { runtimeEvents: completedRuntimeEvents } : {}),
+                ...(terminalEngineBilling !== undefined
+                  ? { engineBilling: terminalEngineBilling }
+                  : {}),
               })
               this._trackPersistence(persistence)
               // Do not declare the paid turn complete until master has
@@ -3418,6 +3581,7 @@ export class SessionManager {
         thinkingMessageId,
         toolMessageIdFactory,
         nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
+        onPostTerminalRuntimeEvent,
         collabAgentPolicy,
         ...(session._usageAttribution
           ? { usageAttribution: session._usageAttribution }

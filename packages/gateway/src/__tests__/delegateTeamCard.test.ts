@@ -61,6 +61,8 @@ function makeGateway(opts: {
     progressRunId: 'dlg-root',
     _billingParentTurnKey: 'a'.repeat(64),
     _durableDelegateTranscript: [] as unknown[],
+    _durableDelegateRuntimeEvents: [] as unknown[],
+    _durableDelegateEngineBillings: [] as unknown[],
   }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false
@@ -339,6 +341,53 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     assert.equal((buffered[0].group.transcript?.[0] as any).text, long)
   })
 
+  it('委派原始 runtime 事件和最终计费证据随父 turn 卡完整持久化', async () => {
+    const runtimeEvent = {
+      ordinal: 7,
+      observedAt: 1_783_930_000_007,
+      source: 'codex-jsonrpc' as const,
+      payload: {
+        method: 'item/completed',
+        params: {
+          item: {
+            id: 'delegate-item-1',
+            type: 'reasoning',
+            summary: ['原始委派思考'],
+            content: [{ type: 'reasoning_text', text: '逐字保留' }],
+          },
+        },
+      },
+    }
+    const engineBilling = {
+      requestId: 'delegate-request-1',
+      parentTurnKey: 'a'.repeat(64),
+      parentSessionId: PARENT_PEER,
+      delegateAgentId: 'coding-assistant',
+      engineSessionId: 'delegate-engine-session-1',
+      status: 'success' as const,
+      durationMs: 1_234,
+      usage: {
+        input_tokens: 101,
+        output_tokens: 202,
+        cache_read_input_tokens: 33,
+        reasoning_output_tokens: 44,
+      },
+    }
+    const { gw, buffered } = makeGateway({
+      submit: async (session: any, _p, onEvent) => {
+        session._durableDelegateRuntimeEvents.push(structuredClone(runtimeEvent))
+        session._durableDelegateEngineBillings.push(structuredClone(engineBilling))
+        onEvent({ kind: 'block', block: { kind: 'text', text: '委派正文' } })
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 101, outputTokens: 202, turn: 1 } })
+      },
+    })
+    const r = await delegate(gw, 'coding-assistant', taskBody())
+    assert.equal(r.status, 200)
+    assert.equal(buffered.length, 1)
+    assert.deepEqual(buffered[0].group.runtimeEvents, [runtimeEvent])
+    assert.deepEqual(buffered[0].group.engineBillings, [engineBilling])
+  })
+
   it('无 webchat 父(progressTarget 缺席)→ 不物化 buffer(降级 client-only,无回归)', async () => {
     const { gw, buffered } = makeGateway({
       withParent: false,
@@ -357,7 +406,17 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     const nestedText = '嵌套完整输出'.repeat(10_000)
     const { gw, buffered, directDelegate, getOrCreateCalls } = makeGateway({
       nested: true,
-      submit: async (_s, _p, onEvent) => {
+      submit: async (session: any, _p, onEvent) => {
+        session._durableDelegateEngineBillings.push({
+          requestId: 'nested-request-1',
+          parentTurnKey: 'a'.repeat(64),
+          parentSessionId: PARENT_PEER,
+          delegateAgentId: 'researcher',
+          engineSessionId: 'nested-engine-session-1',
+          status: 'success',
+          durationMs: 456,
+          usage: { input_tokens: 2, output_tokens: 3 },
+        })
         onEvent({ kind: 'block', block: { kind: 'thinking', text: '完整嵌套思考' } })
         onEvent({ kind: 'block', block: { kind: 'text', text: nestedText } })
         onEvent({ kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } })
@@ -385,5 +444,15 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
       { kind: 'text', text: nestedText },
       { kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } },
     ])
+    assert.deepEqual(directDelegate._durableDelegateEngineBillings, [{
+      requestId: 'nested-request-1',
+      parentTurnKey: 'a'.repeat(64),
+      parentSessionId: PARENT_PEER,
+      delegateAgentId: 'researcher',
+      engineSessionId: 'nested-engine-session-1',
+      status: 'success',
+      durationMs: 456,
+      usage: { input_tokens: 2, output_tokens: 3 },
+    }])
   })
 })

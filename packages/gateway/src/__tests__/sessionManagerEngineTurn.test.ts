@@ -306,6 +306,174 @@ function makeCapturingSink(): CapturedSink {
 }
 
 describe("crash/interrupt partial persistence", () => {
+  test("co-locates the exact engine billing frame with the immutable paid turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const requestId = "a".repeat(32);
+      let emittedTurnKey: string | undefined;
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          const billing = {
+            requestId,
+            turnKey: session._currentTurnKey!,
+            engineSessionId: `oceng-${"b".repeat(48)}`,
+            status: "success" as const,
+            durationMs: 321,
+            usage: {
+              input_tokens: 10,
+              output_tokens: 4,
+              reasoning_output_tokens: 7,
+            },
+            rateLimits: { util5h: 17.5, reset5h: "2026-07-14T00:00:00.000Z" },
+          };
+          emittedTurnKey = billing.turnKey;
+          session.runner.emit("billing", billing);
+          r.text("answer with durable billing");
+          r.result({ stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 4 } });
+        });
+      });
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await sm.submit(session, "paid request", (event) => events.push(event), undefined, undefined, requestId);
+
+      assert.equal(captured.payloads.length, 1);
+      const persisted = captured.payloads[0]!;
+      assert.equal(persisted.turnKey, emittedTurnKey);
+      assert.deepEqual(persisted.engineBilling, {
+        requestId,
+        turnKey: persisted.turnKey,
+        engineSessionId: `oceng-${"b".repeat(48)}`,
+        status: "success",
+        durationMs: 321,
+        usage: { input_tokens: 10, output_tokens: 4, reasoning_output_tokens: 7 },
+        rateLimits: { util5h: 17.5, reset5h: "2026-07-14T00:00:00.000Z" },
+      });
+      assert.ok(events.some((event) => event.kind === "codex_billing"));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("persists every visible retry notice as assistant text and as a raw gateway event", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.msg({
+              type: "assistant",
+              error: "auth",
+              message: { content: [{ type: "text", text: "Failed to authenticate. run /login" }] },
+            });
+            r.result({ is_error: true, total_cost_usd: 0 });
+          } else {
+            r.text("retry succeeded exactly");
+            r.result({ stop_reason: "end_turn", usage: { output_tokens: 2 } });
+          }
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "retry me",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "c".repeat(32),
+      );
+
+      assert.equal(submits, 2);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      const retryText = "\n\n🔄 认证已过期,正在刷新凭据并重试...\n";
+      assert.equal(payload.text, retryText + "retry succeeded exactly");
+      assert.deepEqual(payload.assistantSegments?.map((segment) => segment.text), [
+        retryText,
+        "retry succeeded exactly",
+      ]);
+      assert.ok(payload.runtimeEvents?.some((event) => {
+        const raw = event.payload as { type?: unknown; code?: unknown };
+        return raw.type === "retry_status" && raw.code === "AUTH_RETRY";
+      }));
+      assert.ok(events.some((event) =>
+        event.kind === "block" && event.block.kind === "text" && event.block.text === retryText
+      ));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("writes post-terminal Bash tails as immutable continuations before live delivery", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const rawTail = {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-bg",
+        tail: "late complete stdout",
+        total_bytes: 20,
+        truncated_head: false,
+        futureExactField: { keep: true },
+      };
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.toolPair("tool-bg", "Bash", "initial output");
+          r.text("the command continues in background");
+          r.result({ stop_reason: "end_turn", usage: { output_tokens: 3 } });
+          setTimeout(() => r.msg(rawTail), 10);
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "start background command",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "d".repeat(32),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 2);
+      const [main, continuation] = captured.payloads;
+      assert.equal(continuation!.continuationOfTurnKey, main!.turnKey);
+      assert.equal(continuation!.text, "");
+      assert.equal(continuation!.status, "completed");
+      assert.deepEqual(continuation!.runtimeEvents?.map((event) => event.payload), [rawTail]);
+      assert.ok(events.some((event) =>
+        event.kind === "block" &&
+        event.block.kind === "tool_output_tail" &&
+        event.block.tail === rawTail.tail
+      ));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("crash(code!=0)→ 部分 text/thinking/tools/segments 以 status='crashed' 落 sink", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

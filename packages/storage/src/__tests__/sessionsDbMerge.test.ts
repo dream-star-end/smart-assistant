@@ -13,6 +13,7 @@ import { describe, it } from 'node:test'
 import {
   appendServerAuthoredPure,
   mergePreservingServerAuthored,
+  _stripClientPutMessages,
   type MessageLike,
 } from '../sessionsDb.js'
 
@@ -996,7 +997,7 @@ describe('mergePreservingServerAuthored — agent-group local-wins (P2 债A)', (
     assert.equal(out[2]._turnTapeComplete, true)
   })
 
-  it('drops hydrated tape projections on browser PUT and keeps only the hot anchor', () => {
+  it('drops hydrated tape projections before PUT stripping, including runtime events', () => {
     const anchor = {
       id: 'srv-turn-billing',
       role: 'assistant',
@@ -1018,15 +1019,17 @@ describe('mergePreservingServerAuthored — agent-group local-wins (P2 债A)', (
       _turnTapeSha256: 'b'.repeat(64),
       _turnTapeExpanded: true,
     } as Msg)
-    const out = mergePreservingServerAuthored(
-      [cli('u1', 1), anchor],
-      [
+    const server = [cli('u1', 1), anchor]
+    const browserGetProjection = [
         cli('u1', 1),
         projected('srv-thinking', 'thinking', 2),
         projected('srv-tool', 'tool', 3),
+        projected('srv-runtime', 'runtime-event', 4),
         projected('srv-turn-billing', 'assistant', 9),
-      ],
-    ) as Msg[]
+      ]
+    const strippedPut = _stripClientPutMessages(browserGetProjection, server) as Msg[]
+    assert.deepEqual(strippedPut.map((m) => m.id), ['u1'])
+    const out = mergePreservingServerAuthored(server, strippedPut) as Msg[]
     assert.deepEqual(out.map((m) => m.id), ['u1', 'srv-turn-billing'])
     assert.equal(out[1]._turnTapeComplete, true)
     assert.equal(out[1]._turnTapeExpanded, undefined)

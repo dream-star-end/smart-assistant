@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
-import { LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID } from "@openclaude/protocol";
+import {
+  LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
+  type DurableCodexBilling,
+} from "@openclaude/protocol";
 import type { MessageLike } from "@openclaude/storage";
 
 export type LosslessTurnPayload = {
@@ -9,6 +12,7 @@ export type LosslessTurnPayload = {
   turnIndex: number;
   status: "completed" | "interrupted" | "crashed";
   turnKey: string;
+  continuationOfTurnKey?: string;
   parentTurnKey?: string;
   text: string;
   thinkingText?: string;
@@ -30,6 +34,7 @@ export type LosslessTurnPayload = {
     source: "ccb" | "codex-jsonrpc" | "gateway";
     payload: unknown;
   }>;
+  engineBilling?: DurableCodexBilling;
 };
 
 export type LosslessTurnRecord = {
@@ -46,6 +51,9 @@ export type MaterializedLosslessTurn = {
   payload: LosslessTurnPayload;
   records: LosslessTurnRecord[];
   billingAnchorId: string;
+  /** Root + delegate final billing frames, each validated against the owning
+   * tape locator. Master must settle all of them before ACKing finalize. */
+  engineBillings: DurableCodexBilling[];
 };
 
 const SAFE_AGENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -139,6 +147,97 @@ function parseRuntimeEvents(obj: Record<string, unknown>): LosslessTurnPayload["
   });
 }
 
+function parseEngineBillingValue(value: unknown, path: string): DurableCodexBilling {
+  const prefix = `turn tape payload.${path}`;
+  if (!isObject(value)) throw new Error(`${prefix} must be an object`);
+  const finiteInt = (raw: unknown, field: string): number | undefined => {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) {
+      throw new Error(`${prefix}.${field} is invalid`);
+    }
+    return raw;
+  };
+  const requestId = requiredString(value, "requestId");
+  const engineSessionId = requiredString(value, "engineSessionId");
+  if (!/^[0-9a-f]{32}$/.test(requestId)) throw new Error(`${prefix}.requestId is invalid`);
+  if (!/^oceng-[0-9a-f]{48}$/.test(engineSessionId)) {
+    throw new Error(`${prefix}.engineSessionId is invalid`);
+  }
+  if (value.status !== "success" && value.status !== "error") {
+    throw new Error(`${prefix}.status is invalid`);
+  }
+  for (const key of ["turnKey", "parentTurnKey"] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || !SAFE_TURN_KEY.test(value[key] as string))) {
+      throw new Error(`${prefix}.${key} is invalid`);
+    }
+  }
+  if (value.parentSessionId !== undefined &&
+      (typeof value.parentSessionId !== "string" || value.parentSessionId.length < 1 || value.parentSessionId.length > 256)) {
+    throw new Error(`${prefix}.parentSessionId is invalid`);
+  }
+  if (value.delegateAgentId !== undefined &&
+      (typeof value.delegateAgentId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(value.delegateAgentId))) {
+    throw new Error(`${prefix}.delegateAgentId is invalid`);
+  }
+  finiteInt(value.durationMs, "durationMs");
+  if (value.errorReason !== undefined && typeof value.errorReason !== "string") {
+    throw new Error(`${prefix}.errorReason is invalid`);
+  }
+  if (value.usage !== undefined) {
+    if (!isObject(value.usage)) throw new Error(`${prefix}.usage is invalid`);
+    for (const key of [
+      "input_tokens",
+      "output_tokens",
+      "cache_read_input_tokens",
+      "cache_creation_input_tokens",
+      "reasoning_output_tokens",
+    ]) finiteInt(value.usage[key], `usage.${key}`);
+  }
+  if (value.rateLimits !== undefined) {
+    if (!isObject(value.rateLimits)) throw new Error(`${prefix}.rateLimits is invalid`);
+    for (const key of ["util5h", "util7d"] as const) {
+      const raw = value.rateLimits[key];
+      if (raw !== undefined && (typeof raw !== "number" || !Number.isFinite(raw))) {
+        throw new Error(`${prefix}.rateLimits.${key} is invalid`);
+      }
+    }
+    for (const key of ["reset5h", "reset7d"] as const) {
+      const raw = value.rateLimits[key];
+      if (raw !== undefined && typeof raw !== "string") {
+        throw new Error(`${prefix}.rateLimits.${key} is invalid`);
+      }
+    }
+  }
+  return structuredClone(value) as unknown as DurableCodexBilling;
+}
+
+function parseEngineBilling(obj: Record<string, unknown>): DurableCodexBilling | undefined {
+  const value = obj.engineBilling;
+  if (value === undefined) return undefined;
+  return parseEngineBillingValue(value, "engineBilling");
+}
+
+function parseAgentGroups(obj: Record<string, unknown>): Array<Record<string, unknown>> | undefined {
+  const groups = optionalObjectArray(obj, "agentGroups");
+  if (groups === undefined) return undefined;
+  return groups.map((group, groupIndex) => {
+    const exact = structuredClone(group);
+    const rawBillings = group.engineBillings;
+    if (rawBillings === undefined) return exact;
+    if (!Array.isArray(rawBillings)) {
+      throw new Error(`turn tape payload.agentGroups[${groupIndex}].engineBillings must be an array`);
+    }
+    return {
+      ...exact,
+      engineBillings: rawBillings.map((billing, billingIndex) =>
+        parseEngineBillingValue(
+          billing,
+          `agentGroups[${groupIndex}].engineBillings[${billingIndex}]`,
+        )),
+    };
+  });
+}
+
 /** Strictly validates routing/identity fields while leaving generated content unbounded. */
 export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (!isObject(raw)) throw new Error("turn tape payload must be an object");
@@ -157,6 +256,10 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (parentTurnKey !== undefined && !SAFE_TURN_KEY.test(parentTurnKey)) {
     throw new Error("turn tape payload.parentTurnKey is invalid");
   }
+  const continuationOfTurnKey = optionalString(raw, "continuationOfTurnKey");
+  if (continuationOfTurnKey !== undefined && !SAFE_TURN_KEY.test(continuationOfTurnKey)) {
+    throw new Error("turn tape payload.continuationOfTurnKey is invalid");
+  }
   const truncated = raw.truncated;
   if (truncated !== undefined && typeof truncated !== "boolean") {
     throw new Error("turn tape payload.truncated must be boolean");
@@ -172,15 +275,72 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   const tools = optionalObjectArray(raw, "tools");
   const assistantSegments = parseSegments(raw, "assistantSegments");
   const thinkingSegments = parseSegments(raw, "thinkingSegments");
-  const agentGroups = optionalObjectArray(raw, "agentGroups");
+  const agentGroups = parseAgentGroups(raw);
   const structuredBlocks = optionalObjectArray(raw, "structuredBlocks");
   const runtimeEvents = parseRuntimeEvents(raw);
+  const engineBilling = parseEngineBilling(raw);
+  if (engineBilling !== undefined) {
+    if (requestId !== engineBilling.requestId) {
+      throw new Error("turn tape payload engineBilling.requestId does not match requestId");
+    }
+    if (engineBilling.turnKey !== turnKey || engineBilling.parentTurnKey !== undefined) {
+      throw new Error("turn tape payload root engineBilling turn locator is invalid");
+    }
+  }
+  const seenBillingRequestIds = new Set<string>();
+  if (engineBilling) seenBillingRequestIds.add(engineBilling.requestId);
+  for (let groupIndex = 0; groupIndex < (agentGroups ?? []).length; groupIndex++) {
+    const group = agentGroups![groupIndex]!;
+    const billings = group.engineBillings;
+    if (billings === undefined) continue;
+    for (let billingIndex = 0; billingIndex < (billings as DurableCodexBilling[]).length; billingIndex++) {
+      const billing = (billings as DurableCodexBilling[])[billingIndex]!;
+      if (billing.parentTurnKey !== turnKey || billing.parentSessionId !== sessionId) {
+        throw new Error(
+          `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
+        );
+      }
+      if (!billing.delegateAgentId) {
+        throw new Error(
+          `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] delegateAgentId is required`,
+        );
+      }
+      if (seenBillingRequestIds.has(billing.requestId)) {
+        throw new Error("turn tape payload contains duplicate engine billing requestId");
+      }
+      seenBillingRequestIds.add(billing.requestId);
+    }
+  }
+  if (continuationOfTurnKey !== undefined) {
+    if (
+      status !== "completed" ||
+      requiredString(raw, "text") !== "" ||
+      parentTurnKey !== undefined ||
+      requestId !== undefined ||
+      agentSessionId !== undefined ||
+      usage !== undefined ||
+      thinkingText !== undefined ||
+      truncated !== undefined ||
+      errorCode !== undefined ||
+      errorDetail !== undefined ||
+      tools !== undefined ||
+      assistantSegments !== undefined ||
+      thinkingSegments !== undefined ||
+      agentGroups !== undefined ||
+      structuredBlocks !== undefined ||
+      engineBilling !== undefined ||
+      !runtimeEvents?.length
+    ) {
+      throw new Error("turn tape continuation must contain only completed runtimeEvents");
+    }
+  }
   return {
     sessionId,
     agentId,
     turnIndex,
     status,
     turnKey,
+    ...(continuationOfTurnKey !== undefined ? { continuationOfTurnKey } : {}),
     ...(parentTurnKey !== undefined ? { parentTurnKey } : {}),
     text: requiredString(raw, "text"),
     ...(thinkingText !== undefined ? { thinkingText } : {}),
@@ -197,6 +357,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     ...(agentGroups !== undefined ? { agentGroups } : {}),
     ...(structuredBlocks !== undefined ? { structuredBlocks } : {}),
     ...(runtimeEvents !== undefined ? { runtimeEvents } : {}),
+    ...(engineBilling !== undefined ? { engineBilling } : {}),
   };
 }
 
@@ -431,6 +592,9 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
       _runtimeEvent: event.payload,
       _ocEventOrdinal: event.ordinal,
       _hiddenRuntimeEvent: true,
+      ...(body.continuationOfTurnKey
+        ? { _continuationOfTurnKey: body.continuationOfTurnKey }
+        : {}),
     }, event.ordinal));
   }
   if (records.length === 0) throw new Error("turn tape contains no persistable records");
@@ -448,5 +612,12 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
     return a.id.localeCompare(b.id);
   });
   const billingAnchorId = assistantRecords.at(-1)?.id ?? records.at(-1)!.id;
-  return { payload: body, records, billingAnchorId };
+  const engineBillings = [
+    ...(body.engineBilling ? [structuredClone(body.engineBilling)] : []),
+    ...(body.agentGroups ?? []).flatMap((group) =>
+      Array.isArray(group.engineBillings)
+        ? (group.engineBillings as DurableCodexBilling[]).map((billing) => structuredClone(billing))
+        : []),
+  ];
+  return { payload: body, records, billingAnchorId, engineBillings };
 }

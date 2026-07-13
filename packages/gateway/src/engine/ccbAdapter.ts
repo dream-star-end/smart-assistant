@@ -246,6 +246,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // tool_result_detected —— 与旧回调触发点逐一对位。
       onToolUse: (tool) => params.onEvent({ kind: 'tool_use_detected', tool }),
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
+      onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。

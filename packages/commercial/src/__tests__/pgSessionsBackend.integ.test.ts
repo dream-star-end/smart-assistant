@@ -503,7 +503,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
     }
     assert.deepEqual(
       await backend.finalizeLosslessTurnTape(userId, tape.finalize),
-      { applied: "finalized", recordCount: 4 },
+      { applied: "finalized", recordCount: 4, engineBillings: [] },
     );
 
     let hydrated = await backend.getClientSession(sessionId, userId);
@@ -784,7 +784,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
     }
     assert.deepEqual(
       await backend.finalizeLosslessTurnTape(userId, tape.finalize),
-      { applied: "finalized", recordCount: 3 },
+      { applied: "finalized", recordCount: 3, engineBillings: [] },
     );
     const hot = await pool.query<{ messages: string }>(
       "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
@@ -799,6 +799,93 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal(messages.find((m) => m.role === "thinking")?.text, "exact v2 thought");
     assert.equal(messages.find((m) => m.role === "tool")?.output, "exact v2 tool");
     assert.equal(messages.find((m) => m.role === "assistant")?.text, "exact v2 answer");
+  });
+
+  maybe("post-terminal Bash tail continuation survives relogin and updates the owning tool exactly", async () => {
+    const sessionId = "s-lossless-bash-tail";
+    const userId = "u-lossless-bash-tail";
+    const originalTurnKey = "f".repeat(64);
+    const continuationTurnKey = "9".repeat(64);
+    const rawTail = {
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "tool-bg",
+      tail: "后台命令迟到的完整 stdout\n第二行😀",
+      total_bytes: 45,
+      truncated_head: false,
+      future_exact_field: { nested: ["逐字", "保留"] },
+    };
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+
+    const original = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: originalTurnKey,
+      text: "先返回主回复",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "tool-bg",
+        blockId: "tool-bg",
+        toolName: "Bash",
+        inputJson: { command: "long-running-command" },
+        inputPreview: "long-running-command",
+        output: "命令仍在后台运行",
+        isError: false,
+        durationMs: 1,
+        ts: 1_783_944_000_001,
+        arrivedAt: 1_783_944_000_001,
+      }],
+    });
+    for (const part of original.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    assert.deepEqual(
+      await backend.finalizeLosslessTurnTape(userId, original.finalize),
+      { applied: "finalized", recordCount: 2, engineBillings: [] },
+    );
+
+    const continuation = buildTape({
+      sessionId,
+      agentId: "tail_deadbeef",
+      turnIndex: 2,
+      status: "completed",
+      turnKey: continuationTurnKey,
+      continuationOfTurnKey: originalTurnKey,
+      text: "",
+      createdAt: 1_783_944_000_100,
+      runtimeEvents: [{
+        ordinal: 99,
+        observedAt: 1_783_944_000_100,
+        source: "ccb",
+        payload: rawTail,
+      }],
+    });
+    for (const part of continuation.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    assert.deepEqual(
+      await backend.finalizeLosslessTurnTape(userId, continuation.finalize),
+      { applied: "finalized", recordCount: 1, engineBillings: [] },
+    );
+
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    assert.ok(hydrated);
+    const messages = hydrated.messages as MessageLike[];
+    const tool = messages.find((message) => message.role === "tool" && message.blockId === "tool-bg");
+    assert.ok(tool);
+    assert.deepEqual(tool.bashTail, {
+      tail: rawTail.tail,
+      totalBytes: rawTail.total_bytes,
+      truncatedHead: false,
+    });
+    const runtime = messages.find((message) => message.role === "runtime-event");
+    assert.ok(runtime, "continuation raw event remains reload-visible, not only reduced into bashTail");
+    assert.deepEqual(runtime._runtimeEvent, rawTail);
+    assert.equal(runtime._continuationOfTurnKey, originalTurnKey);
+    assert.equal(messages.filter((message) => message.role === "assistant").length, 1,
+      "runtime continuation must not invent or duplicate a visible assistant reply");
   });
 });
 

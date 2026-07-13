@@ -140,6 +140,7 @@ describe("full migration suite", () => {
           AND (table_name,column_name) IN (
             ('pending_usage_patches','turn_key'),
             ('pending_usage_patches','parent_turn_key'),
+            ('client_session_turn_tapes','engine_billings'),
             ('wechat_outbox','raw_payload')
           )`,
     );
@@ -148,6 +149,7 @@ describe("full migration suite", () => {
       new Set([
         "pending_usage_patches.turn_key",
         "pending_usage_patches.parent_turn_key",
+        "client_session_turn_tapes.engine_billings",
         "wechat_outbox.raw_payload",
       ]),
     );

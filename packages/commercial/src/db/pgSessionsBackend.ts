@@ -43,6 +43,7 @@ import type { Pool, PoolClient } from "pg";
 import { createHash } from "node:crypto";
 import {
   LOSSLESS_TURN_TAPE_SHA256_RE,
+  type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
 } from "@openclaude/protocol";
@@ -458,6 +459,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["pending_usage_patches", "turn_key", "text"],
   ["client_session_turn_tapes", "tape_id", "text"],
   ["client_session_turn_tapes", "turn_key", "text"],
+  ["client_session_turn_tapes", "engine_billings", "jsonb"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
@@ -477,7 +479,11 @@ export type LosslessTurnTapeStageResult =
   | { applied: "session_not_found" | "session_deleted" };
 
 export type LosslessTurnTapeFinalizeResult =
-  | { applied: "finalized" | "idempotent"; recordCount: number }
+  | {
+      applied: "finalized" | "idempotent";
+      recordCount: number;
+      engineBillings: DurableCodexBilling[];
+    }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
 export interface LosslessTurnTapeStorage {
@@ -670,7 +676,7 @@ async function hydrateTurnTapeMessages(
     byTape.set(row.tape_id, tapeRows);
   }
 
-  return messages.flatMap((anchor) => {
+  const hydrated = messages.flatMap((anchor) => {
     if (
       typeof anchor?._turnTapeId !== "string" ||
       typeof anchor?._turnTapeSha256 !== "string"
@@ -707,6 +713,59 @@ async function hydrateTurnTapeMessages(
     if (!row) throw new Error(`[pgSessions] lossless turn tape record missing: ${key}`);
     return [hydrateTapeRecord(row, anchor, true)];
   });
+
+  // A CCB background Bash process can emit tail snapshots after its owning
+  // model turn has finalized. Those exact raw messages live in immutable
+  // runtime-event continuation tapes. Reapply every monotonic snapshot to the
+  // same tool projection the live reducer updated, while retaining the hidden
+  // runtime-event rows themselves for byte-exact inspection/replay.
+  const topLevelTools = new Map<string, MessageLike>();
+  const childTools = new Map<string, Record<string, unknown>>();
+  const indexChildTools = (blocks: unknown): void => {
+    if (!Array.isArray(blocks)) return;
+    for (const rawBlock of blocks) {
+      if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) continue;
+      const block = rawBlock as Record<string, unknown>;
+      if (block.kind === "tool_use" && typeof block.blockId === "string") {
+        childTools.set(block.blockId, block);
+      }
+      indexChildTools(block.childBlocks);
+    }
+  };
+  for (const message of hydrated) {
+    if (message.role === "tool" && typeof message.blockId === "string") {
+      topLevelTools.set(message.blockId, message);
+    }
+    indexChildTools(message.childBlocks);
+  }
+  for (const message of hydrated) {
+    if (message.role !== "runtime-event") continue;
+    const runtime = message._runtimeEvent;
+    if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) continue;
+    const raw = runtime as Record<string, unknown>;
+    if (raw.type !== "system" || raw.subtype !== "bash_output_tail") continue;
+    const toolUseId = raw.tool_use_id;
+    if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
+    const target = typeof raw.parent_tool_use_id === "string" && raw.parent_tool_use_id.length > 0
+      ? childTools.get(toolUseId)
+      : topLevelTools.get(toolUseId) ?? childTools.get(toolUseId);
+    if (!target) continue;
+    const totalBytes = typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
+      ? raw.total_bytes
+      : 0;
+    const previous = target.bashTail;
+    const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
+      typeof (previous as Record<string, unknown>).totalBytes === "number"
+      ? (previous as Record<string, unknown>).totalBytes as number
+      : 0;
+    if (totalBytes < previousBytes) continue;
+    target.bashTail = {
+      tail: typeof raw.tail === "string" ? raw.tail : "",
+      totalBytes,
+      truncatedHead: raw.truncated_head === true,
+    };
+  }
+  return hydrated;
 }
 
 /**
@@ -841,9 +900,10 @@ export function createPgSessionsBackend(
             part_count: number;
             created_at: string;
             finalized_at: string | null;
+            engine_billings: unknown;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at, finalized_at
+                    total_bytes, part_count, created_at, finalized_at, engine_billings
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -867,7 +927,14 @@ export function createPgSessionsBackend(
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3`,
             [request.sessionId, userId, request.tapeId],
           );
-          return { applied: "idempotent", recordCount: Number(count.rows[0]?.count ?? 0) };
+          if (!Array.isArray(tape.engine_billings)) {
+            throw new Error("lossless turn tape finalized engine billings malformed");
+          }
+          return {
+            applied: "idempotent",
+            recordCount: Number(count.rows[0]?.count ?? 0),
+            engineBillings: structuredClone(tape.engine_billings) as DurableCodexBilling[],
+          };
         }
 
         const parts = (
@@ -942,12 +1009,18 @@ export function createPgSessionsBackend(
           }
         }
 
-        const pending = (
-          await client.query<{
-            request_id: string;
-            cost_credits: string;
-            delegate_agent_id: string | null;
-          }>(
+        type PendingTapeCost = {
+          request_id: string;
+          cost_credits: string;
+          delegate_agent_id: string | null;
+        };
+        // Continuation tapes carry post-terminal runtime output only. They
+        // share the chat session with the paid turn but must never consume a
+        // legacy by-session pending cost intended for that original turn.
+        const pending: PendingTapeCost[] = turn.payload.continuationOfTurnKey
+          ? []
+          : (
+          await client.query<PendingTapeCost>(
             `SELECT request_id, cost_credits, delegate_agent_id
                FROM pending_usage_patches
               WHERE user_id = $1 AND (
@@ -1090,23 +1163,25 @@ export function createPgSessionsBackend(
           );
         }
 
-        const mapInsert = await client.query(
-          `INSERT INTO server_authored_turn_anchor_map
-             (user_id,turn_key,session_id,tape_id,billing_anchor_id,written_at)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           ON CONFLICT (user_id,turn_key) DO NOTHING`,
-          [userId, request.turnKey, request.sessionId, request.tapeId, turn.billingAnchorId, Date.now()],
-        );
-        if ((mapInsert.rowCount ?? 0) === 0) {
-          const map = (
-            await client.query<{ session_id: string; tape_id: string; billing_anchor_id: string }>(
-              `SELECT session_id,tape_id,billing_anchor_id FROM server_authored_turn_anchor_map
-                WHERE user_id=$1 AND turn_key=$2 FOR UPDATE`,
-              [userId, request.turnKey],
-            )
-          ).rows[0];
-          if (!map || map.session_id !== request.sessionId || map.tape_id !== request.tapeId || map.billing_anchor_id !== turn.billingAnchorId) {
-            throw new Error("lossless turn tape turnKey mapping conflict");
+        if (!turn.payload.continuationOfTurnKey) {
+          const mapInsert = await client.query(
+            `INSERT INTO server_authored_turn_anchor_map
+               (user_id,turn_key,session_id,tape_id,billing_anchor_id,written_at)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (user_id,turn_key) DO NOTHING`,
+            [userId, request.turnKey, request.sessionId, request.tapeId, turn.billingAnchorId, Date.now()],
+          );
+          if ((mapInsert.rowCount ?? 0) === 0) {
+            const map = (
+              await client.query<{ session_id: string; tape_id: string; billing_anchor_id: string }>(
+                `SELECT session_id,tape_id,billing_anchor_id FROM server_authored_turn_anchor_map
+                  WHERE user_id=$1 AND turn_key=$2 FOR UPDATE`,
+                [userId, request.turnKey],
+              )
+            ).rows[0];
+            if (!map || map.session_id !== request.sessionId || map.tape_id !== request.tapeId || map.billing_anchor_id !== turn.billingAnchorId) {
+              throw new Error("lossless turn tape turnKey mapping conflict");
+            }
           }
         }
         if (turn.payload.requestId) {
@@ -1136,19 +1211,25 @@ export function createPgSessionsBackend(
         }
         await client.query(
           `UPDATE client_session_turn_tapes
-              SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3, finalized_at=$4
-            WHERE session_id=$5 AND user_id=$6 AND tape_id=$7`,
+              SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
+                  engine_billings=$4, finalized_at=$5
+            WHERE session_id=$6 AND user_id=$7 AND tape_id=$8`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
             turn.payload.parentTurnKey ?? null,
+            JSON.stringify(turn.engineBillings),
             Date.now(),
             request.sessionId,
             userId,
             request.tapeId,
           ],
         );
-        return { applied: "finalized", recordCount: turn.records.length };
+        return {
+          applied: "finalized",
+          recordCount: turn.records.length,
+          engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
+        };
       });
     },
     // ── probe(D5)──────────────────────────────────────────────────────────
@@ -1236,7 +1317,7 @@ export function createPgSessionsBackend(
               /* malformed existing → 视为空 */
             }
           }
-          const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[]);
+          const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[], oldMsgs);
           const clientMsgs = await filterOutArchivedIncoming(client, session.id, clientMsgsRaw);
           const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[];
           const currentNextSeq =

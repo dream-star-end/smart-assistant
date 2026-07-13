@@ -143,7 +143,7 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
           return { applied: "stored" };
         },
         async finalizeLosslessTurnTape() {
-          return { applied: "finalized", recordCount: 1 };
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
         },
       },
     });
@@ -191,6 +191,75 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     );
     assert.equal(finalRes.rec.status, 200);
     assert.equal(JSON.parse(finalRes.rec.body).recordCount, 1);
+  });
+
+  test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {
+    const billing = {
+      requestId: "c".repeat(32),
+      turnKey: "a".repeat(64),
+      engineSessionId: `oceng-${"d".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 12,
+      usage: { input_tokens: 3, output_tokens: 4 },
+    };
+    let finalizeCalls = 0;
+    let settleCalls = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          finalizeCalls++;
+          return {
+            applied: finalizeCalls === 1 ? "finalized" : "idempotent",
+            recordCount: 2,
+            engineBillings: [billing],
+          };
+        },
+      },
+      async settleCodexBilling(userId, exact) {
+        settleCalls++;
+        assert.equal(userId, 42n);
+        assert.deepEqual(exact, billing);
+        if (settleCalls === 1) throw new Error("temporary billing database outage");
+      },
+    });
+    const finalize: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: "web-test1",
+      agentId: "codex",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "e".repeat(64),
+      totalBytes: 1,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+    };
+
+    const first = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      first.res,
+      CTX,
+    );
+    assert.equal(first.rec.status, 503, "transient settle failure must keep the fsynced tape queued");
+
+    const retry = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      retry.res,
+      CTX,
+    );
+    assert.equal(retry.rec.status, 200);
+    assert.equal(JSON.parse(retry.rec.body).idempotent, true);
+    assert.equal(finalizeCalls, 2);
+    assert.equal(settleCalls, 2, "idempotent finalize must replay durable billing evidence");
   });
 });
 
