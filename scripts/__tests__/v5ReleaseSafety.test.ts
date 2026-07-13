@@ -399,12 +399,20 @@ describe('v5 release safety lanes', () => {
 
   test('release metadata declares both authority migrations and both authority capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
+    const source = await readFile(deploy, 'utf8')
+    const buildRuntimeStart = source.indexOf('build_runtime_release()')
+    const buildRuntimeEnd = source.indexOf('\n# ── 3. activate_runtime_tuple', buildRuntimeStart)
     assert.ok(meta.requiredMigrations.includes('0143_model_catalog'))
     assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
+    assert.match(
+      source.slice(buildRuntimeStart, buildRuntimeEnd),
+      /oc_hotcfg_finalize_release "\$staging" "\$RUNTIME_IMAGE_ID" "\$full_sha" "\$\{prev:-\}" "\$MODEL_AUTHORITY_CAP"/,
+    )
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
   })
