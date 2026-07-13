@@ -560,6 +560,7 @@ describe('v5 connector marketplace', () => {
   test('连接器 AI approve：声明式验证、签名、审计与不可登录系统 reviewer 原子落地', async (t) => {
     if (skipIfNoDb(t)) return
     const owner = await createUser()
+    const user = await createUser()
     const slug = `ai-approved-${Date.now() % 1_000_000}`
     const spec = connectorSpec(slug)
     const versionId = await publishViaRoute({ ownerUserId: owner, version: '1.0.0', spec })
@@ -644,6 +645,18 @@ describe('v5 connector marketplace', () => {
       true,
       'declarative_verified connector 可上架；真实账号在 bind identity probe 时验证',
     )
+    await installApprovedVersion({ userId: user, versionId })
+    const managed = (await listDeclarativeManagement(getPool(), user)).connectors.find(
+      (entry) => entry.slug === slug,
+    )
+    assert.equal(managed?.available, true)
+    assert.equal(managed?.canBind, true)
+    assert.ok(managed?.contract)
+    assert.deepEqual(await assertConnectorBindEntitlement(user, versionId, getPool()), {
+      slug,
+      artifactHash: compileSpec(spec, securityDecision).specHash,
+      official: false,
+    })
   })
 
   test('商品页高风险信号会持久化并在调用模型前转人工', async (t) => {
