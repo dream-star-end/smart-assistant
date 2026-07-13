@@ -8,11 +8,12 @@
  *      - 无 delegate → 与现状一致；旧后端缺字段兼容；
  *      - 含 delegate 父行 → 徽标 + 展开 per-agent；delegate_only pill。
  *
- * api 网络层全 mock；chart.js/auto 走轻量桩（jsdom 无 canvas 2d）。
+ * api 网络层全 mock；useChart 走保留 deps/ref effect 语义的可观测桩。
  */
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { DependencyList, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
   AuthSession,
@@ -23,12 +24,26 @@ import type {
 } from "../../lib/types";
 import { UsageTab, topModelsWithOther } from "./UsageTab";
 
-// chart.js 走 canvas，jsdom 无 2d context —— 轻量桩替掉，避免 useChart 抛错。
-vi.mock("chart.js/auto", () => ({
-  default: class {
-    destroy() {}
-  },
-}));
+const { chartConstructed } = vi.hoisted(() => ({ chartConstructed: vi.fn() }));
+
+// 精确保留 useChart 的 effect/deps/ref 语义，仅把真实 Chart.js 构造替换为可观测桩。
+vi.mock("../charts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../charts")>();
+  const { useEffect } = await import("react");
+  return {
+    ...actual,
+    useChart: (
+      canvasRef: RefObject<HTMLCanvasElement | null>,
+      _configBuilder: unknown,
+      deps: DependencyList,
+    ) => {
+      useEffect(() => {
+        if (canvasRef.current) chartConstructed(canvasRef.current);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, deps);
+    },
+  };
+});
 
 vi.mock("../../lib/api", () => ({
   api: {
@@ -48,6 +63,14 @@ const auth: AuthSession = {
   setToken: () => {},
   onExpired: () => {},
 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function makeResponse(rows: UsageSessionRow[]): UsageResponse {
   return {
@@ -137,6 +160,33 @@ beforeEach(() => {
 });
 
 describe("UsageTab 图表化窗口口径", () => {
+  test("报表先于用量摘要返回时，摘要完成后仍会首次绘制四张图", async () => {
+    const usage = deferred<UsageResponse>();
+    const report = deferred<UsageReport>();
+    mockedGetUsage.mockReturnValue(usage.promise);
+    mockedGetReport.mockReturnValue(report.promise);
+
+    render(<UsageTab auth={auth} />);
+
+    await act(async () => {
+      report.resolve(makeReport("7d"));
+      await report.promise;
+      // 冲刷报表状态与对应 useChart effect；此时摘要仍 loading，canvas 尚未挂载。
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.querySelectorAll("canvas")).toHaveLength(0);
+    expect(chartConstructed).not.toHaveBeenCalled();
+
+    await act(async () => {
+      usage.resolve(makeResponse([chatRow()]));
+      await usage.promise;
+    });
+
+    await waitFor(() => expect(document.querySelectorAll("canvas")).toHaveLength(4));
+    await waitFor(() => expect(chartConstructed).toHaveBeenCalledTimes(4));
+  });
+
   test("首屏默认 7d 拉取，stat 卡渲染窗口数据", async () => {
     render(<UsageTab auth={auth} />);
     // 首屏默认窗口 7d

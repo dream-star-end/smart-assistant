@@ -168,6 +168,9 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const windowTokenTotal = rs
     ? sumBig(rs.input_tokens, rs.output_tokens, rs.cache_read_tokens, rs.cache_write_tokens)
     : "0";
+  // 两个首屏请求都完成后 canvas 才会挂载；把这个可见性边沿纳入图表 effect 依赖，
+  // 避免 report 先返回时 useChart 因 ref=null no-op，随后仅 loading 变化却永不重画。
+  const chartReady = !loading && !reportLoading && report !== null;
 
   const creditRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<HTMLCanvasElement>(null);
@@ -181,7 +184,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         labels: trendLabels,
         series: [{ label: "积分消耗", data: creditTrend, colorToken: "accent", fill: true }],
       }),
-    [report, window],
+    [report, window, chartReady],
   );
   useChart(
     requestRef,
@@ -190,7 +193,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         labels: trendLabels,
         series: [{ label: "请求次数", data: requestTrend, colorToken: "info" }],
       }),
-    [report, window],
+    [report, window, chartReady],
   );
   useChart(
     modelRef,
@@ -200,7 +203,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         data: modelSlices.map((m) => m.credits),
         legend: "bottom",
       }),
-    [report, window],
+    [report, window, chartReady],
   );
   useChart(
     tokenRef,
@@ -218,7 +221,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         colorTokens: ["accent", "info", "success", "warning"],
         legend: "bottom",
       }),
-    [report, window],
+    [report, window, chartReady],
   );
 
   if (loading) {
