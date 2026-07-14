@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "../../lib/api";
+import { ApiError, api } from "../../lib/api";
 import type { AuthSession, AutoDreamReportResponse, MemoryFileMeta } from "../../lib/types";
 import { MemoryPanel } from "./MemoryPanel";
 
@@ -14,6 +14,7 @@ const auth = {
 const agents = [{ id: "main", name: "全能助手" }];
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   vi.restoreAllMocks();
 });
@@ -182,6 +183,53 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
     expect(within(report).getByText(/无法确认记忆是否发生变化/)).toBeInTheDocument();
     expect(within(report).queryByText(/记忆没有改动/)).not.toBeInTheDocument();
+  });
+
+  test("容器冷启动连续两次 503 后按 3s + 7s 退避，记忆与梦境报告自动恢复", async () => {
+    vi.useFakeTimers();
+    mockUser();
+    const transient = () => new ApiError({ status: 503, message: "container starting", retryAfterSec: 0 });
+    const index = vi
+      .spyOn(api, "getMemoryIndex")
+      .mockRejectedValueOnce(transient())
+      .mockRejectedValueOnce(transient())
+      .mockResolvedValue({
+        kind: "index",
+        text: "<!-- oc-memdir-index v1 -->",
+        files: [
+          {
+            file: "recovered.md",
+            name: "冷启动后恢复的记忆",
+            description: "重试成功",
+            type: "project",
+            mtimeMs: Date.now(),
+            size: 100,
+          },
+        ],
+        version: "idx-recovered",
+      });
+    const dream = vi
+      .spyOn(api, "getAutoDreamReport")
+      .mockRejectedValueOnce(transient())
+      .mockRejectedValueOnce(transient())
+      .mockResolvedValue({ status: "idle", pendingSessions: 0 });
+
+    render(<MemoryPanel auth={auth} agentId="main" agents={agents} />);
+    await act(async () => Promise.resolve());
+    expect(index).toHaveBeenCalledTimes(1);
+    expect(dream).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(index).toHaveBeenCalledTimes(2);
+    expect(dream).toHaveBeenCalledTimes(2);
+
+    await act(async () => vi.advanceTimersByTimeAsync(7_000));
+    expect(index).toHaveBeenCalledTimes(3);
+    expect(dream).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("冷启动后恢复的记忆")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Auto-Dream 梦境报告" })).toHaveTextContent(
+      "尚未生成梦境报告",
+    );
   });
 });
 
