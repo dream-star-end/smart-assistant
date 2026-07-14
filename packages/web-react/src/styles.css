@@ -236,6 +236,36 @@ body {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
+/* Container-local CDP preview controls live on a fixed dark inspection
+   surface, independent of the app theme. Keep the repeated hit targets here
+   so PC and touch layouts share the same 36px/40px interaction contract. */
+.preview-icon-button {
+  display: flex;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.62);
+}
+.preview-icon-button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); color: #fff; }
+.preview-icon-button:disabled { cursor: not-allowed; opacity: 0.3; }
+.preview-tool-button {
+  display: inline-flex;
+  min-height: 36px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 12px;
+}
+.preview-tool-button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); color: #fff; }
+.preview-tool-button:disabled { cursor: not-allowed; opacity: 0.35; }
+
 /* ── Markdown prose (assistant body) ── */
 .prose { font-size: 15.5px; line-height: 1.7; color: var(--fg); word-break: break-word; }
 .prose > :first-child { margin-top: 0; }

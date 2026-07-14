@@ -83,6 +83,7 @@ import type {
   OrgSubscriptionInfo,
   OrgPayResult,
 } from "./types";
+import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
 import type {
   ConnectorBindResult,
   ConnectorConfirmationDetail,
@@ -526,6 +527,14 @@ function adaptUser(u: WireUser): User {
     lane: u.lane ?? null,
   };
 }
+
+export type ContainerPreviewTicketResponse = {
+  ticket: string;
+  expiresAt: number;
+  url: string;
+  viewport: ContainerPreviewViewport;
+  protocol: "preview-v1";
+};
 
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
@@ -2887,6 +2896,23 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ seats: seatsDelta }),
+        }),
+      ),
+    ),
+
+  /** Mint a 30-second, single-use ticket for a container-local Chromium preview. */
+  createContainerPreviewTicket: (
+    a: AuthSession,
+    url: string,
+    viewport: ContainerPreviewViewport,
+  ): Promise<ContainerPreviewTicketResponse> =>
+    jsonOrThrow<ContainerPreviewTicketResponse>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/container-preview/ticket", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({ url, viewport }),
         }),
       ),
     ),

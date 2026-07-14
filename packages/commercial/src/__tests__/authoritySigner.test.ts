@@ -32,6 +32,10 @@ import {
   verifyAuthority,
   verifyTurnLease,
 } from '@openclaude/protocol'
+import {
+  containerPreviewTargetHash,
+  verifyContainerPreviewAssertion,
+} from '@openclaude/protocol/containerPreviewAuth'
 
 import { AuthorityKeyringReader, type AuthorityMintInput, AuthoritySigner } from '../ws/authoritySigner.js'
 
@@ -76,6 +80,28 @@ function fullCoverage(keyId: string) {
 }
 
 describe('AuthoritySigner 铸票 + 验签(签发/验证两侧拆开)', () => {
+  test('container preview assertion uses the same public ring but a domain-separated short TTL', () => {
+    const signer = AuthoritySigner.createEphemeral()
+    const targetHash = containerPreviewTargetHash('http://localhost:3000/', {
+      width: 1280,
+      height: 800,
+      deviceScaleFactor: 1,
+      isMobile: false,
+    })
+    const signed = signer.signContainerPreviewAssertion({
+      uid: 1001,
+      containerId: 55,
+      sessionId: 'a'.repeat(32),
+      targetHash,
+    }, { now: NOW, ttlMs: 10_000 })
+    const verified = verifyContainerPreviewAssertion(signed.envelope, signer.publicKeyring(), NOW + 1_000)
+    assert.equal(verified.uid, 1001)
+    assert.equal(verified.containerId, 55)
+    assert.equal(verified.targetHash, targetHash)
+    assert.equal(verified.expiresAt, NOW + 10_000)
+    assert.throws(() => verifyContainerPreviewAssertion(signed.envelope, signer.publicKeyring(), NOW + 10_001))
+  })
+
   test('signBundle → 容器只用公钥 ring 就能验通 authority + lease,并对账绑定字段', () => {
     const signer = AuthoritySigner.createEphemeral()
     const minted = signer.signBundle(mintInput(), { now: NOW })

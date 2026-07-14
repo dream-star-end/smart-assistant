@@ -54,6 +54,7 @@ import { readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
+import { OPENCLAUDE_CONTAINER_GATEWAY_PORT } from "@openclaude/protocol";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
   RUNTIME_CHANNEL_LABEL_KEY,
@@ -171,7 +172,7 @@ export function gatewayIpFromV3Cidr(cidr: string): string {
  * 容器内 OpenClaude gateway 监听端口(默认 18789,见 personal-version
  * `packages/storage/src/config.ts`,容器侧 entrypoint.ts bootstrap config 也是这个值)。
  */
-export const V3_CONTAINER_PORT = 18789;
+export const V3_CONTAINER_PORT = OPENCLAUDE_CONTAINER_GATEWAY_PORT;
 
 /**
  * active + container_internal_id IS NULL 的 grace 窗口(ms)—— young/old 二分**唯一权威**。

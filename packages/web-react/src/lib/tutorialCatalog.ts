@@ -268,7 +268,7 @@ export const TUTORIAL_TOPICS = {
   },
   'artifacts-download': {
     featureId: 'artifacts-download',
-    contentVersion: 1,
+    contentVersion: 2,
     intro:
       'AI 可以把结果写成文件、代码、网页、图表、Office 文档或其他可下载成果。消息里的文件与预览卡片是交付入口；长按或点击相应操作可下载、查看原图或继续让 AI 修改同一成果。',
     outcome: '从“得到建议”升级为“拿到能直接使用的文件”。',
@@ -294,7 +294,48 @@ export const TUTORIAL_TOPICS = {
     ],
     cautions: ['浏览器可能拦截新标签或下载；看到提示时允许 claudeai.chat 下载文件。'],
     media: 'research',
-    related: ['files-media', 'github-repository', 'sessions-history'],
+    related: ['files-media', 'container-web-preview', 'sessions-history'],
+  },
+  'container-web-preview': {
+    featureId: 'container-web-preview',
+    contentVersion: 1,
+    intro:
+      '当智能体在你的运行容器里启动开发服务器并给出 localhost、127.0.0.1 或 0.0.0.0 地址时，直接点击带“容器预览”标识的链接即可打开独立 Chromium。画面不会错误地访问你手机或电脑的本机地址，并且可在桌面与移动视口之间切换、操作真实网页、点选具体元素逐条留下修改评论。',
+    outcome: '在同一条开发闭环里完成真实页面验收、精确元素标注和可执行的修改反馈。',
+    scenarios: [
+      '检查 AI 刚启动的前端页面',
+      '逐个标注布局、文案与样式问题',
+      '对比桌面端和移动端适配效果',
+    ],
+    steps: [
+      {
+        title: '让智能体启动网页并给出地址',
+        body: '要求它在容器内运行开发服务器，并在回复中提供完整的 HTTP(S) loopback 地址和端口。',
+      },
+      {
+        title: '点击“容器预览”链接',
+        body: '平台会签发一次性授权，在当前用户容器内启动隔离浏览器；外部网址和平台管理端口不会进入该通道。',
+      },
+      {
+        title: '操作页面并切换设备',
+        body: '使用“操作网页”点击、滚动或输入；用桌面/移动按钮重新载入对应视口，检查响应式布局和触控目标。',
+      },
+      {
+        title: '选择元素并提交修改评论',
+        body: '切到“选元素评论”，点选具体元素、写下期望修改，可累计多条；最后添加到输入框，确认内容后再发送给智能体实现并复测。',
+      },
+    ],
+    tips: [
+      '尽量选择最具体的按钮、标题或容器，并在评论里同时写明预期效果和设备范围。',
+      '一次预览最多保留 20 条评论；可先编辑或删除重复项，加入输入框后也能继续修改。',
+    ],
+    cautions: [
+      '加入对话时不会附带截图，只会写入页面地址、元素选择器、可见文本、位置和你的评论；依赖外部跨域资源的本地页面可能显示不完整。',
+    ],
+    example:
+      '启动前端后给我可访问地址。我会在移动视口标注需要修改的导航和主按钮；收到元素评论后直接改源码、跑测试并重新启动页面验证。',
+    media: 'github',
+    related: ['github-repository', 'artifacts-download', 'chat-basics'],
   },
   'image-create-edit': {
     featureId: 'image-create-edit',

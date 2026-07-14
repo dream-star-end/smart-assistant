@@ -430,6 +430,12 @@ import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
 import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
+  CONTAINER_PREVIEW_MAX_FRAME_BYTES,
+  createContainerPreviewBridge,
+  type ContainerPreviewBridgeHandler,
+} from "./ws/containerPreviewBridge.js";
+import { ContainerPreviewTicketStore } from "./ws/containerPreviewTickets.js";
+import {
   DEFAULT_V3_CCB_BASELINE_DIR,
   resolveCcbBaselineMounts,
   makePrewarmContainer,
@@ -2923,8 +2929,25 @@ export async function registerCommercial(
     }
   };
 
+  // V5 container-local web preview is intentionally atomic: the HTTP ticket
+  // endpoint stays unavailable until the authenticated public WS bridge has
+  // been assembled below. Model authority provides the existing Ed25519 trust
+  // root; without it, a same-UID process inside the user container could forge
+  // preview capabilities.
+  const containerPreviewBaseUrl = process.env.COMMERCIAL_BASE_URL?.trim();
+  const containerPreviewTickets =
+    runtimeChannel === "v5"
+    && modelAuthoritySigner
+    && v3Deps
+    && containerPreviewBaseUrl
+      ? new ContainerPreviewTicketStore()
+      : undefined;
+  let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined;
+
   const handler = createCommercialHandler({
     jwtSecret,
+    containerPreviewTickets,
+    containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     mailer,
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
@@ -3102,6 +3125,43 @@ export async function registerCommercial(
     ?? (async (_uid: bigint) => {
       throw new ContainerUnreadyError(5, "supervisor_not_wired");
     });
+
+  if (
+    containerPreviewTickets
+    && modelAuthoritySigner
+    && containerPreviewBaseUrl
+  ) {
+    try {
+      containerPreviewBridge = createContainerPreviewBridge({
+        tickets: containerPreviewTickets,
+        signer: modelAuthoritySigner,
+        resolveContainerEndpoint,
+        allowedOrigin: containerPreviewBaseUrl,
+        maxGlobalSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
+        createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
+          createTunnelContainerSocket(
+            tunnel.nodeAgent,
+            tunnel.containerInternalId,
+            port,
+            signal,
+            {
+              maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
+              connectionTraceId,
+              containerWsPath: "/ws/container-preview",
+              previewAssertion: assertion,
+            },
+          ),
+        logger: rootLogger.child({ subsys: "commercial", module: "containerPreviewBridge" }),
+      });
+      // eslint-disable-next-line no-console
+      console.log("[commercial] V5 container web preview ENABLED");
+    } catch (err) {
+      // Ticket issuance remains fail-closed through containerPreviewAvailable.
+      rootLogger.error("[commercial] container web preview disabled", {
+        error: (err as Error)?.message ?? String(err),
+      });
+    }
+  }
 
 
   // ─── wechat codex(gpt-*)turn:api_relay 路由 + 真扣费 ─────────────────────
@@ -4528,6 +4588,9 @@ export async function registerCommercial(
     handle: handler,
     runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
+      // Preview uses its own short-lived one-time ticket and must never fall
+      // through to the ordinary cookie/JWT bridges.
+      if (containerPreviewBridge?.handleUpgrade(req, socket, head)) return true;
       // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E)。legacy /ws/agent 已删除。
       if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;
       if (userChatBridge.handleUpgrade(req, socket, head)) return true;
@@ -4550,6 +4613,9 @@ export async function registerCommercial(
       if (wechatBroker) {
         try { await wechatBroker.stop(); } catch { /* ignore */ }
       }
+      const previewBridge = containerPreviewBridge;
+      containerPreviewBridge = undefined;
+      try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       // ── P3:LeaderBundle + lease + 控制口 teardown(RFC D4)──────────────────────

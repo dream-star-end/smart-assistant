@@ -18,6 +18,7 @@ import {
   MessageCircle,
   MessageSquare,
   Mic,
+  Monitor,
   Paperclip,
   Plug,
   Search,
@@ -74,6 +75,7 @@ const ICONS: Record<string, LucideIcon> = {
   wallet: Wallet,
   building: Building2,
   'message-square': MessageSquare,
+  monitor: Monitor,
 }
 
 function normalizeSearch(value: string): string {

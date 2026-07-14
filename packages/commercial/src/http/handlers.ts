@@ -98,9 +98,14 @@ import {
   inboxAssetIdFromPath,
   readInboxAssetForViewer,
 } from "../inbox/assets.js";
+import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
+  /** Short-lived one-time browser tickets for V5 container-local preview. */
+  containerPreviewTickets?: ContainerPreviewTicketStore;
+  /** Prevent issuing a ticket until the public WS bridge is fully assembled. */
+  containerPreviewAvailable?: () => boolean;
   mailer: Mailer;
   redis: RateLimitRedis;
   turnstileSecret?: string;

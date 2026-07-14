@@ -101,6 +101,7 @@ import {
   type ModelExecutionDescriptor,
   TURN_LEASE_TTL_MS,
   type TurnLease,
+  CONTAINER_PREVIEW_PROTOCOL_VERSION,
   authoritySigningInput,
   encodeAuthorityEnvelope,
   encodeAuthorityKeyring,
@@ -109,6 +110,12 @@ import {
   keyringKeyIds,
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
+import {
+  CONTAINER_PREVIEW_ASSERTION_MAX_TTL_MS,
+  type ContainerPreviewBridgeAssertionPayload,
+  containerPreviewAssertionSigningInput,
+  encodeContainerPreviewAssertion,
+} from '@openclaude/protocol/containerPreviewAuth'
 
 import { checkDirIntegrity } from '../bridgeSecret.js'
 
@@ -546,6 +553,13 @@ export interface MintedAuthority {
   bundle: ModelAuthorityBundle
 }
 
+export interface ContainerPreviewAssertionInput {
+  uid: number
+  containerId: number
+  sessionId: string
+  targetHash: string
+}
+
 /**
  * master 独占的 Ed25519 签发器 + keyring(多 keyId 并存,支持 R3-M7 轮换五步)。
  *
@@ -728,6 +742,50 @@ export class AuthoritySigner {
   signTurnLease(lease: TurnLease): string {
     const sig = cryptoSign(null, turnLeaseSigningInput(lease), this.privateKey(lease.keyId))
     return encodeTurnLeaseEnvelope(lease, sig)
+  }
+
+  /**
+   * Domain-separated, short-lived master → container preview assertion.
+   * The container only has the public keyring, so same-UID user processes
+   * cannot mint or alter this capability.
+   */
+  signContainerPreviewAssertion(
+    input: ContainerPreviewAssertionInput,
+    opts: { now?: number; ttlMs?: number } = {},
+  ): { payload: ContainerPreviewBridgeAssertionPayload; envelope: string } {
+    const now = opts.now ?? this.now()
+    const ttlMs = opts.ttlMs ?? CONTAINER_PREVIEW_ASSERTION_MAX_TTL_MS
+    if (!Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > CONTAINER_PREVIEW_ASSERTION_MAX_TTL_MS) {
+      throw new Error('[container-preview] assertion TTL out of range')
+    }
+    if (!Number.isSafeInteger(input.uid) || input.uid < 1) {
+      throw new Error('[container-preview] invalid uid')
+    }
+    if (!Number.isSafeInteger(input.containerId) || input.containerId < 1) {
+      throw new Error('[container-preview] invalid containerId')
+    }
+    if (!/^[0-9a-f]{32}$/.test(input.sessionId)) {
+      throw new Error('[container-preview] invalid sessionId')
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.targetHash)) {
+      throw new Error('[container-preview] invalid targetHash')
+    }
+    const payload: ContainerPreviewBridgeAssertionPayload = {
+      v: CONTAINER_PREVIEW_PROTOCOL_VERSION,
+      keyId: this.activeKeyId,
+      uid: input.uid,
+      containerId: input.containerId,
+      sessionId: input.sessionId,
+      targetHash: input.targetHash,
+      issuedAt: now,
+      expiresAt: now + ttlMs,
+    }
+    const signature = cryptoSign(
+      null,
+      containerPreviewAssertionSigningInput(payload),
+      this.privateKey(payload.keyId),
+    )
+    return { payload, envelope: encodeContainerPreviewAssertion(payload, signature) }
   }
 
   // --- 轮换五步(R3-M7)-----------------------------------------------------

@@ -31,7 +31,7 @@ describe("_buildTunnelHeaders — CG4 connection trace 头注入", () => {
   test("pskHex 有效 hex → 写 Authorization: Bearer <hex>", () => {
     const pskHex = "deadbeefcafebabe1234567890abcdef";
     const headers = _buildTunnelHeaders(pskHex, "11111111-1111-1111-1111-111111111111");
-    assert.equal(headers["Authorization"], `Bearer ${pskHex}`);
+    assert.equal(headers.Authorization, `Bearer ${pskHex}`);
     // trace 头同时写入,不应被 Authorization 路径互斥掉
     assert.equal(
       headers["X-Connection-Trace-Id"],
@@ -64,5 +64,16 @@ describe("_buildTunnelHeaders — CG4 connection trace 头注入", () => {
       headers["X-Connection-Trace-Id"],
       "33333333-3333-3333-3333-333333333333",
     );
+  });
+
+  test("preview assertion is forwarded only through the explicit preview seam", () => {
+    const assertion = "signed_preview_assertion";
+    const headers = _buildTunnelHeaders(
+      "deadbeef",
+      "44444444-4444-4444-4444-444444444444",
+      assertion,
+    );
+    assert.equal(headers["X-OpenClaude-Preview-Assertion"], assertion);
+    assert.equal(headers.Authorization, "Bearer deadbeef");
   });
 });

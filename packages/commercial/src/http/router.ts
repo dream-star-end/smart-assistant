@@ -211,6 +211,7 @@ import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.j
 import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import { handleClientErrorReport } from './clientErrors.js'
+import { handleCreateContainerPreviewTicket } from './containerPreview.js'
 import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
 import { containerFileProxy } from './containerFileProxy.js'
 import {
@@ -692,6 +693,7 @@ export function createCommercialHandler(
     { method: 'POST', path: '/api/agent/open', handler: handleAgentOpen },
     { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
     { method: 'POST', path: '/api/agent/cancel', handler: handleAgentCancel },
+    { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     // ── Skill marketplace (B2) — browser-only user/admin routes ──
     // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
     // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that
@@ -1260,6 +1262,7 @@ export function createCommercialHandler(
     '/api/payment/',
     '/api/subscription/',
     '/api/agent/',
+    '/api/container-preview/',
     '/api/admin/',
     // 企业版(P3.1)org 管理面。匹配 exact `/api/org` 与 prefix `/api/org/*`。
     // 注:BLOCKED_FOR_USER_RULES 不含 /api/org,BRIDGE 白名单也不含 → 容器无法代理,
