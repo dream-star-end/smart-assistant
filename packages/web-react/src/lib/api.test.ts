@@ -100,6 +100,30 @@ test('concurrent 401s trigger only ONE /api/auth/refresh (singleflight) and both
   expect(b.id).toBe('u1')
 })
 
+test('orgTopup preserves mutually exclusive desktop/mobile payment URLs from the unified response envelope', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+    ok({
+      ok: true,
+      data: {
+        order_no: 'org-order-1',
+        qrcode_url: 'https://pay.test/qr.png',
+        mobile_url: 'https://pay.test/mobile',
+        amount_cents: '3800',
+      },
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session } = makeSession('tok1')
+  await expect(api.orgTopup(session, '3800')).resolves.toEqual({
+    orderNo: 'org-order-1',
+    qr: 'https://pay.test/qr.png',
+    mobileUrl: 'https://pay.test/mobile',
+    amountCents: '3800',
+  })
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/org/topup')
+})
+
 test('a failed refresh calls onExpired exactly once and surfaces the original error', async () => {
   let refreshCalls = 0
   const fetchMock = vi.fn(async (url: string) => {

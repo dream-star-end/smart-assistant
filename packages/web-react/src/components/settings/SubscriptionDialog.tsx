@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
+import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner } from "../ui";
 
 type Stage =
@@ -192,7 +193,7 @@ export function SubscriptionDialog({
     setStage({ kind: "plans" });
   }
 
-  const title = stage.kind === "paid" ? "开通成功" : stage.kind === "qr" ? "微信扫码支付" : "套餐订阅";
+  const title = stage.kind === "paid" ? "开通成功" : stage.kind === "qr" ? "微信支付" : "套餐订阅";
 
   return (
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-lg">
@@ -319,32 +320,16 @@ export function SubscriptionDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="rounded-xl border border-border bg-white p-3">
-              <img
-                src={stage.order.qrcodeUrl}
-                alt="微信支付二维码"
-                width={200}
-                height={200}
-                className="size-[200px] object-contain"
-              />
-            </div>
             <div className="text-center">
               <div className="text-[20px] font-semibold text-fg">
                 {formatCentsYuan(stage.order.amountCents)}
               </div>
               <div className="text-[12.5px] text-faint">{stage.note}</div>
             </div>
-            <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
-              <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
-            </div>
-            {stage.order.mobileUrl && (
-              <a
-                href={stage.order.mobileUrl}
-                className="text-[12.5px] text-accent underline-offset-4 hover:underline"
-              >
-                手机端点此直接支付
-              </a>
-            )}
+            <HupijiaoPaymentEntry
+              qrcodeUrl={stage.order.qrcodeUrl}
+              mobileUrl={stage.order.mobileUrl}
+            />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 返回套餐
             </Button>
