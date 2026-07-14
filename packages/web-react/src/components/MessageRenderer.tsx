@@ -28,7 +28,7 @@ import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
-import { loadedArchivedCount, planLoadMore } from "./chat/archivePaging";
+import { loadedArchivedMetrics, planLoadMore } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput, stripShellWrapperForDisplay } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
@@ -329,26 +329,38 @@ export function MessageList({
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 }) {
-  // 溢出：默认只挂最近 LOAD_MORE_STEP 条，"加载更多历史"递增（长会话首屏不卡）。
+  // lossless tape 会把 runtime-event 原始帧一并水合进 messages,供精确留存/工具 tail 重放；
+  // 这些 messageKind=unknown 的行本来就不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
+  // reducer 会就地 mutation messages,这里故意每次 render 重算轻量投影,不以数组引用 memo。
+  // 权威 messages 数组从不改写/过滤,持久化与逐字节原始记录仍完整保留。
+  const renderableMessages = messages.filter((m) => messageKind(m) !== "unknown");
+  // 溢出：默认只挂最近 LOAD_MORE_STEP 条**可见**消息,"加载更多历史"递增。
   const [visible, setVisible] = useState(LOAD_MORE_STEP);
-  const total = messages.length;
-  // 归档分页:已拉回的归档行数(带 _seq 且 ≤ 水位)。据此把「本地翻页」与「云端加载」两态收口到
-  // planLoadMore 单一权威——归档行前插使 total、archivedLoaded 同增,窗口 start 不因拉归档回升。
+  const total = renderableMessages.length;
+  // 归档分页:tape 的一个归档 anchor 可展开成多条共享 `_seq` 的可见行。窗口裁剪扣除已加载
+  // 可见行数,归档 remaining 则从完整原始数组按 distinct `_seq` 扣 anchor 数；runtime-only tape
+  // 即使没有可见投影,也会正确推进云端游标/计数。
   const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
-  const archivedLoaded = archive ? loadedArchivedCount(messages, archivedThroughSeq) : 0;
+  const archivedVisible = archive
+    ? loadedArchivedMetrics(renderableMessages, archivedThroughSeq)
+    : { rows: 0, anchors: 0 };
+  const archivedAnchors = archive
+    ? loadedArchivedMetrics(messages, archivedThroughSeq).anchors
+    : 0;
   const { sliceStart: start, button: loadMore } = planLoadMore({
     total,
     visible,
-    archivedLoaded,
+    archivedLoadedRows: archivedVisible.rows,
+    archivedLoadedAnchors: archivedAnchors,
     archivedCount: archive?.archivedCount ?? 0,
   });
-  const last = messages[total - 1];
+  const last = renderableMessages[total - 1];
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
-  const turnStart = currentTurnStartIndex(messages);
+  const turnStart = currentTurnStartIndex(renderableMessages);
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
-  const ratingFinal = turnFinalAssistantFlags(messages);
+  const ratingFinal = turnFinalAssistantFlags(renderableMessages);
   // typing 指示：本轮进行中、且末条不是会自渲流式态的卡（assistant/thinking 自带光标，
   // permission 处于等待用户决策态）。
   const showTyping =
@@ -396,7 +408,7 @@ export function MessageList({
       )}
       {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,
           不让 React 卸载整棵树白屏。key 稳定在 boundary 上;memo 比较仍由内层组件承担。 */}
-      {coalesceTeam(messages, start, sending).map((it) => {
+      {coalesceTeam(renderableMessages, start, sending).map((it) => {
         // 生成占位卡(需求 C，本地专属行):拦在 MessageRenderer(memo)之前,用自算签名(含 status/
         // startedAt/aspect)驱动 running→failed 重渲——占位状态不进 render.ts messageSignature,
         // 走通用 memo 会漏渲失败态。coalesceTeam 已把它归为 single(role 'system' → 非面板/思考)。
