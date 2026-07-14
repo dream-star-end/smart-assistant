@@ -2760,7 +2760,7 @@ export const api = {
   //
   // 到账判定统一复用 GET /api/payment/orders/:order_no(getOrder,status→'paid')。
   // 下单响应形(与 F issueOrderQr 对齐):{ ok, data: { order_no, qrcode_url, ... } }。
-  // 经 parseOrgOrder 归一为 {orderNo, qr, mobileUrl};客户端按终端二选一,禁止同时使用两条路径。
+  // 经 parseOrgOrder 归一为 {orderNo, qr, mobileUrl};现行 UI 仅消费 qr，mobileUrl 只保留协议兼容。
   // GET plans / subscription 为顶层裸对象(无 ok/data 包裹)。大数全字符串贯穿。
   // owner 门在 UI 层按 role 控制,403 响应兜底 toast(防降权窗口)。
 

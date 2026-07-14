@@ -22,7 +22,7 @@ afterEach(() => {
   });
 });
 
-test("组织支付在手机首次渲染只消费 mobileUrl，不挂载二维码", () => {
+test("组织支付在手机只展示截图相册扫码，不显示手机跳转", () => {
   Object.defineProperties(window.navigator, {
     userAgent: {
       configurable: true,
@@ -45,6 +45,10 @@ test("组织支付在手机首次渲染只消费 mobileUrl，不挂载二维码"
     />,
   );
 
-  expect(screen.queryByRole("img")).not.toBeInTheDocument();
-  expect(screen.getByTestId("mobile-payment-link")).toHaveAttribute("href", "https://pay.test/mobile");
+  expect(screen.getByRole("img", { name: "微信支付二维码" })).toHaveAttribute(
+    "src",
+    "https://pay.test/qr.png",
+  );
+  expect(screen.getByTestId("mobile-screenshot-payment-hint")).toHaveTextContent("从相册选择");
+  expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
 });

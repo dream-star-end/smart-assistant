@@ -93,7 +93,7 @@ export function OrgPayQr({
         <div className="text-[20px] font-semibold text-fg">{formatCentsYuan(amountCents)}</div>
         <div className="text-[12.5px] text-faint">{note}</div>
       </div>
-      <HupijiaoPaymentEntry qrcodeUrl={order.qr} mobileUrl={order.mobileUrl} />
+      <HupijiaoPaymentEntry qrcodeUrl={order.qr} />
       {onBack && (
         <Button variant="ghost" size="sm" onClick={onBack} className="text-muted">
           <RefreshCw size={14} /> {backLabel}
