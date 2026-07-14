@@ -10,13 +10,13 @@
       "sourceHash": "670869de8b346129afb86d30a3786103cb04396d235ca29cb8225be22ccf237f"
     },
     "artifacts-download": {
-      "contentHash": "7cea135d242d13a168612cf7f86080c0afac474c1c9e1160f8cc549a5193758e",
-      "contentVersion": 1,
+      "contentHash": "fb6c240f20301f5a2846ba6ff37bd28f1380782224cfe1d73f1498038a55a358",
+      "contentVersion": 2,
       "mediaHash": "f1ac57ca72e1cac6cb49b56ec9225f3265b86f791aee967aa6eb52ed386bb5dc",
       "mediaKey": "research",
       "mediaVersion": 1,
       "registryHash": "60f71929b1b4a3a38611c575b5b906becb708bfe3578987be8873ec427ab245b",
-      "sourceHash": "4f9e97367abfb1aadaf20d0ab5210973ebda689b49bb2d55d52b1ba4eba49c40"
+      "sourceHash": "39ec7fb44cd309cebd10ba23debca7e249334f9fc19fc8addc2d4131090f4911"
     },
     "billing-usage": {
       "contentHash": "ee57de680f6cce2edc9126ac67f20e3415ff12eb2177f04e4362ebfa4f181e2b",
@@ -44,6 +44,15 @@
       "mediaVersion": 1,
       "registryHash": "f28eb9b5a5e50b5e907f3867f331c100a80df727a69ea50043e74555dbaff7c5",
       "sourceHash": "a8ac569bb6e22e46bc82339860125096462b4efa16ca458b9451abb3d7488d55"
+    },
+    "container-web-preview": {
+      "contentHash": "0d44434b68eb67a9c2f935c903ca46042f05ec8f928cb129d6d0c626374d1f33",
+      "contentVersion": 1,
+      "mediaHash": "f443129bc402b16ff46bccd54a8525a0ce0b93d44b5252d85d8671723c9cad4d",
+      "mediaKey": "github",
+      "mediaVersion": 1,
+      "registryHash": "f44f07c883d58b006303e3909c6de2a06689b3d23bec6f0d5694dd05f73aeb16",
+      "sourceHash": "e23bd4433a1f6523dc1bd2b94813af2dd7fb806c9e42af0605b912d789b0f651"
     },
     "feedback-support": {
       "contentHash": "4f57681803edd77d80cc26a73e73e30e9908f5d130badc2907c7db2c6434dba1",

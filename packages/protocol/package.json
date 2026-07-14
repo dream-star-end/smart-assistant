@@ -11,7 +11,9 @@
     "./sessionKey": "./src/sessionKey.ts",
     "./traceId": "./src/traceId.ts",
     "./research": "./src/research.ts",
-    "./modelAuthority": "./src/modelAuthority.ts"
+    "./modelAuthority": "./src/modelAuthority.ts",
+    "./containerPreview": "./src/containerPreview.ts",
+    "./containerPreviewAuth": "./src/containerPreviewAuth.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

@@ -51,6 +51,7 @@ import {
   isCodexEngineModel,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
+import { ContainerPreviewHandler } from './containerPreview.js'
 // 合成首帧降级兜底模型的 routable 自检(MAJOR-1):兜底模型在当前进程形态下不可路由
 // (host 无对应平台静态 key)时**不降级**,保持 CODEX_BILLING_GUARD fail-closed。
 import { isHostRoutableStaticModel } from './hostStaticProviders.js'
@@ -1345,6 +1346,7 @@ export class Gateway {
   private skillDrafts = new SkillDraftStore()
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
+  private _containerPreview: ContainerPreviewHandler
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
@@ -1638,6 +1640,13 @@ export class Gateway {
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
       log: (event, fields) => this.log.info(event, fields),
     })
+    this._containerPreview = new ContainerPreviewHandler({
+      log: {
+        info: (message, fields) => this.log.info(message, fields),
+        warn: (message, fields) => this.log.warn(message, fields),
+        error: (message, fields, err) => this.log.error(message, fields, err),
+      },
+    })
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
     void this.skillTrainJobs.loadAll(Date.now())
     void this.skillEvalJobs.loadAll(Date.now())
@@ -1845,7 +1854,16 @@ export class Gateway {
         try { socket.destroy() } catch {}
         return
       }
-      // 2) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
+      // 2) V5 container-only Chromium preview. The handler itself requires a
+      // signed master assertion + exact trusted bridge IP before accepting.
+      try {
+        if (this._containerPreview.handleUpgrade(req, socket, head)) return
+      } catch (err) {
+        this.log.error('containerPreview.handleUpgrade threw', undefined, err)
+        try { socket.destroy() } catch {}
+        return
+      }
+      // 3) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
       const url = req.url ?? '/'
       // 只接受 exact `/ws` 或 `/ws?…` 路径,剩余的 4xx + close
       const path = (() => { try { return new URL(url, 'http://x').pathname } catch { return url } })()
@@ -1853,7 +1871,7 @@ export class Gateway {
         this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req))
         return
       }
-      // 3) 不认识的 ws path:401 + close(对齐 ws lib 默认对未匹配路径的处理)
+      // 4) 不认识的 ws path:401 + close(对齐 ws lib 默认对未匹配路径的处理)
       try {
         socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
         socket.destroy()
@@ -2430,6 +2448,13 @@ export class Gateway {
       } catch (err) {
         this.log.warn('commercial shutdown error', undefined, err)
       }
+    }
+
+    // ── Stage 3.75: close isolated preview Chromium/CDP sessions ──
+    try {
+      await this._containerPreview.shutdown()
+    } catch (err) {
+      this.log.warn('container preview shutdown error', undefined, err)
     }
 
     // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──

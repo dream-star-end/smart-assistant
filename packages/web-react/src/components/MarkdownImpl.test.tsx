@@ -31,8 +31,21 @@ describe('MarkdownImpl readOnly', () => {
 
   test('只读外链图片使用 no-referrer 原生渲染', () => {
     const { container } = render(
-      <MarkdownImpl signMedia readOnly>{'![外链](//cdn.test/image.png)'}</MarkdownImpl>,
+      <MarkdownImpl signMedia readOnly>
+        {'![外链](//cdn.test/image.png)'}
+      </MarkdownImpl>,
     )
     expect(container.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
   })
+})
+
+test('容器 loopback 链接显示预览标识且不交给浏览器新标签页', () => {
+  const { container } = render(
+    <MarkdownImpl>{'[打开应用](http://0.0.0.0:3000/dashboard)'}</MarkdownImpl>,
+  )
+  const anchor = container.querySelector('a')
+  expect(anchor).toHaveAttribute('data-container-local-preview', 'true')
+  expect(anchor).toHaveAttribute('data-product-feature', 'container-web-preview')
+  expect(anchor).not.toHaveAttribute('target')
+  expect(anchor).toHaveTextContent('容器预览')
 })

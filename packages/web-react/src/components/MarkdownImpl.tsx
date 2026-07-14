@@ -13,6 +13,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import type { ReactNode } from "react";
+import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
@@ -209,11 +211,30 @@ export default function MarkdownImpl({ children, signMedia, live, readOnly }: Ma
               </code>
             );
           },
-          a: ({ children, ...props }) => (
-            <a target="_blank" rel="noreferrer" {...props}>
-              {children}
-            </a>
-          ),
+          a: ({ children, href, ...props }) => {
+            const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
+            if (containerLocal) {
+              return (
+                <a
+                  {...props}
+                  href={href}
+                  data-container-local-preview="true"
+                  data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
+                  title="在容器内安全预览"
+                >
+                  {children}
+                  <span className="ml-1 inline-flex rounded-full bg-accent-soft px-1.5 py-0.5 align-middle text-[10px] font-medium text-accent">
+                    容器预览
+                  </span>
+                </a>
+              );
+            }
+            return (
+              <a {...props} href={href} target="_blank" rel="noreferrer">
+                {children}
+              </a>
+            );
+          },
         }}
       >
         {typeof children === "string" ? normalizeMathDelimiters(children) : children}

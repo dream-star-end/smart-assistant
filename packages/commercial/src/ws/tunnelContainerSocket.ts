@@ -50,6 +50,10 @@ export interface CreateTunnelContainerSocketOpts {
    * - CG4 数据面 tunnel,caller 单一固定(bridge connId),server-trusted → 直写
    */
   connectionTraceId: string;
+  /** Strict internal target; ordinary chat remains /ws. */
+  containerWsPath?: '/ws' | '/ws/container-preview';
+  /** Required only for /ws/container-preview; forwarded after verified mTLS dial. */
+  previewAssertion?: string;
 }
 
 /**
@@ -69,12 +73,16 @@ export interface CreateTunnelContainerSocketOpts {
 export function _buildTunnelHeaders(
   pskHex: string | null,
   connectionTraceId: string,
+  previewAssertion?: string,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     "X-Connection-Trace-Id": connectionTraceId,
   };
   if (pskHex !== null && pskHex.length > 0) {
-    headers["Authorization"] = `Bearer ${pskHex}`;
+    headers.Authorization = `Bearer ${pskHex}`;
+  }
+  if (previewAssertion !== undefined) {
+    headers['X-OpenClaude-Preview-Assertion'] = previewAssertion;
   }
   return headers;
 }
@@ -123,6 +131,17 @@ export async function createTunnelContainerSocket(
   if (signal.aborted) {
     throw new DOMException("aborted", "AbortError");
   }
+  const containerWsPath = opts.containerWsPath ?? '/ws';
+  if (containerWsPath !== '/ws' && containerWsPath !== '/ws/container-preview') {
+    throw new InvalidTunnelArgsError('invalid containerWsPath');
+  }
+  if (containerWsPath === '/ws/container-preview') {
+    if (!opts.previewAssertion || !/^[A-Za-z0-9_-]{1,4096}$/.test(opts.previewAssertion)) {
+      throw new InvalidTunnelArgsError('preview assertion missing or malformed');
+    }
+  } else if (opts.previewAssertion !== undefined) {
+    throw new InvalidTunnelArgsError('preview assertion is only valid for preview path');
+  }
 
   // pre-dial:全部安全检查(CA + SPIFFE URI + 指纹 pin)在此 await 内完成。
   // dial 期间 abort:先转换 reject,然后 finally 段销毁 socket。
@@ -162,7 +181,7 @@ export async function createTunnelContainerSocket(
   // node-agent 的 tunnel route。
   const url =
     `wss://${target.host}:${target.agentPort}` +
-    `/tunnel/containers/${cid}/ws?port=${containerPort}`;
+    `/tunnel/containers/${cid}${containerWsPath}?port=${containerPort}`;
 
   // PSK Buffer → hex string 是一次内存 copy(.toString 不持有原 Buffer 引用)。
   // 拷贝完立即 fill(0) 清原 Buffer:hex 字符串还在 ws 内部 headers 对象里,但
@@ -176,7 +195,7 @@ export async function createTunnelContainerSocket(
     pskHex = target.psk.toString("hex");
     try { target.psk.fill(0); } catch { /* */ }
   }
-  const headers = _buildTunnelHeaders(pskHex, opts.connectionTraceId);
+  const headers = _buildTunnelHeaders(pskHex, opts.connectionTraceId, opts.previewAssertion);
 
   // 防御:new WebSocket 同步抛错(URL 异常 / options 校验失败)→ preDialed
   // 还没移交给 ws 库,必须自己 destroy,避免 socket 半开 + listener 泄漏。

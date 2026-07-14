@@ -61,6 +61,7 @@ import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
 import { imageByteCache } from "./lib/chat/imageBytes";
+import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
@@ -109,6 +110,9 @@ const MarketplaceCenter = lazy(() =>
 const OrgCenter = lazy(() => import("./components/OrgCenter").then((m) => ({ default: m.OrgCenter })));
 const TutorialCenter = lazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
+);
+const ContainerWebPreview = lazy(() =>
+  import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
 );
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
@@ -211,6 +215,7 @@ export function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
+  const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -295,6 +300,7 @@ export function App() {
       sessionsResetRef.current(); // 清列表/选中/已拉历史标记,允许下次登录重新自动选中
       setMessages([]);
       setChatError(null);
+      setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setOrgOpen(false);
       setTutorialOpen(false);
@@ -320,6 +326,24 @@ export function App() {
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
   // 多处 useCallback/useEffect 误报 useExhaustiveDependencies（lint 只认本地 useRef 为稳定）。
   const authRef = useRef(authSessionRef.current);
+
+  // Assistant/tool markdown often exposes a dev-server URL such as
+  // http://localhost:3000. That address belongs to the user's container, not
+  // the viewer's phone or PC. Capture only explicit, validated loopback links
+  // and route them into the authenticated isolated-Chromium preview.
+  useEffect(() => {
+    if (demo || !authed) return;
+    const onClick = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const previewUrl = containerPreviewHrefFromTarget(event.target);
+      if (!previewUrl) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setContainerPreviewUrl(previewUrl);
+    };
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  }, [authed, demo]);
 
   const interrupt = useCallback(() => {
     stopRef.current = true;
@@ -1899,6 +1923,20 @@ export function App() {
         onOpenChange={(next) => !next && setImageAnnotationSource(null)}
         onSubmit={submitImageEdit}
       />
+      {containerPreviewUrl && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ContainerWebPreview
+            open
+            sourceUrl={containerPreviewUrl}
+            auth={auth}
+            onClose={() => setContainerPreviewUrl(null)}
+            onUseComments={(text) => {
+              setComposerPrefill({ text, nonce: Date.now() });
+              setContainerPreviewUrl(null);
+            }}
+          />
+        </LazyBoundary>
+      )}
     </div>
     </ImageEditActionsContext.Provider>
     </ChatInteractionContext.Provider>

@@ -113,6 +113,16 @@ export const PRODUCT_CAPABILITIES = {
     destination: { kind: 'new-chat' },
     requirements: ['authenticated'],
   },
+  containerPreview: {
+    id: 'container-web-preview',
+    title: '预览容器网页并按元素评论',
+    shortTitle: '容器网页预览',
+    category: 'create',
+    icon: 'monitor',
+    aliases: ['localhost', '网页预览', '开发服务器', '元素选择', 'UI 评论', '移动端适配'],
+    destination: { kind: 'new-chat' },
+    requirements: ['authenticated'],
+  },
   images: {
     id: 'image-create-edit',
     title: '生成、圈选与修改图片',
