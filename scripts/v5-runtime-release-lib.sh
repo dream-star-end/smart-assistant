@@ -910,19 +910,35 @@ oc_hotcfg_assert_tuple_lossless_capability() {
   esac
 }
 
+# Tri-state master reader probe: 0=present, 1=metadata explicitly absent/lacks
+# the declaration, 2=read/parse failure. Callers deciding whether a candidate
+# may have served must treat 2 like 0. Missing, malformed, or unreadable
+# metadata is unknown; only a parsed artifact lacking the token is explicit.
+oc_hotcfg_probe_master_lossless_capability() {
+  local master_release="$1" metadata caps
+  [ -n "$master_release" ] || return 2
+  metadata="$master_release/deploy/v5/release-metadata.json"
+  [ -e "$metadata" ] || return 2
+  [ -r "$metadata" ] || return 2
+  caps="$(jq -r '(.capabilities // []) | join(" ")' "$metadata" 2>/dev/null)" || return 2
+  case " $caps " in
+    *" $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Master reader capability is separate from the actual runtime writer tuple.
 # Both are required before an automatic compensation may restore a stack after
 # a lossless-capable candidate has possibly accepted traffic.
 oc_hotcfg_assert_master_lossless_capability() {
-  local master_release="$1" caps
-  [ -n "$master_release" ] && [ -f "$master_release/deploy/v5/release-metadata.json" ] \
-    || { oc_hotcfg__die "lossless rollback: master release metadata 不存在:${master_release:-<empty>}"; return 1; }
-  caps="$(jq -r '(.capabilities // []) | join(" ")' "$master_release/deploy/v5/release-metadata.json" 2>/dev/null)" \
-    || { oc_hotcfg__die "lossless rollback: 读 master release capability 失败:$master_release"; return 1; }
-  case " $caps " in
-    *" $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP "*) return 0 ;;
-    *) oc_hotcfg__die "lossless rollback: master release 未声明 '$OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP':$master_release"; return 1 ;;
+  local master_release="$1" rc=0
+  oc_hotcfg_probe_master_lossless_capability "$master_release" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) oc_hotcfg__die "lossless rollback: master release 未声明 '$OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP':${master_release:-<empty>}" ;;
+    *) oc_hotcfg__die "lossless rollback: master release capability 不可核验(读/解析失败):${master_release:-<empty>}" ;;
   esac
+  return 1
 }
 
 # DB 中首个 finalized v2 tape 是不可逆地板。无 DATABASE_URL 仅用于本地 fixture/
@@ -1045,14 +1061,14 @@ oc_hotcfg_activate_saga() {
 
   # 已完成阶段的进度旗标,回滚只逆做已生效者。这些是本函数的局部状态,rollback 闭包内引用。
   local extra_done=0 env_done=0 current_done=0 commit_state=none
-  local lossless_writer_candidate=0 lossless_writer_may_have_served=0
-  # A declared master reader plus the actual target runtime writer is the
-  # protocol boundary. Existing generic fixtures/legacy tuples that declare
-  # neither cannot emit v2 tapes; production v5 targets declare both.
-  if oc_hotcfg_assert_master_lossless_capability "$master_release" >/dev/null 2>&1 \
-      && oc_hotcfg_assert_tuple_lossless_capability "$image_id" "$release" >/dev/null 2>&1; then
-    lossless_writer_candidate=1
-  fi
+  local lossless_writer_candidate=0 lossless_writer_may_have_served=0 lossless_writer_probe_rc=0
+  # A capable master can accept v2 tapes. Arm conservatively even if the actual
+  # runtime tuple later proves incapable; that only makes rollback stricter.
+  # Critically, metadata read/parse failure (rc=2) is "may have served", not
+  # "legacy": otherwise a transient probe failure lets compensation fail open.
+  oc_hotcfg_probe_master_lossless_capability "$master_release" >/dev/null 2>&1 \
+    || lossless_writer_probe_rc=$?
+  [ "$lossless_writer_probe_rc" != 1 ] && lossless_writer_candidate=1
 
   _hotcfg_mark_manual_recovery() { # $1=reason；保持新运行面不动，供人工按标记收敛。
     local reason="$1" tmp

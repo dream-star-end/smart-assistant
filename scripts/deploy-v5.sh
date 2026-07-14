@@ -1140,26 +1140,101 @@ assert_release_capability_for_sessions_pg() {
 # first finalized tape makes reader+writer capability irreversible.
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 
-# Unconditional artifact check used once a capable writer may have served.
-# Unlike the DB floor below, this must not observe "no tape yet" and then race
-# a finalization while automatic compensation is switching back to an old
-# reader/writer stack.
-release_has_lossless_turn_tape_capability() {
-  local reldir="$1" master_has runtime_has
-  master_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.capabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
-  runtime_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.runtimeCapabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
-  [[ -n "$master_has" && -n "$runtime_has" ]]
+# Tri-state artifact probe. Return codes are part of the safety contract:
+#   0 = capability is explicitly present
+#   1 = immutable metadata was read successfully and explicitly lacks it
+#   2 = transport/read/parse/output failure, so capability is unknown
+# Missing/unreadable/malformed metadata is unknown (2); only a successfully
+# parsed artifact that lacks the token is definitive absence (1). Callers that
+# decide whether a writer may have served MUST treat 2 like 0; collapsing both
+# to false re-opens a fail-open compensation path.
+probe_release_lossless_capability_field() {  # $1=release $2=capabilities|runtimeCapabilities
+  local reldir="$1" field="$2" result="" rc=0
+  [[ "$field" == capabilities || "$field" == runtimeCapabilities ]] || return 2
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$LOSSLESS_TURN_TAPE_CAP' 'if (((.$field // []) | index(\$c)) != null) then \"capable\" else \"incapable\" end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+probe_release_lossless_master_capability() {
+  probe_release_lossless_capability_field "$1" capabilities
+}
+
+probe_release_lossless_runtime_capability() {
+  probe_release_lossless_capability_field "$1" runtimeCapabilities
+}
+
+# True when a candidate may have accepted v2 writes. Only a successfully read
+# explicit absence proves it could not; probe failure is conservatively armed.
+lossless_release_may_have_served() {
+  local rc=0
+  probe_release_lossless_master_capability "$1" || rc=$?
+  [[ $rc -ne 1 ]]
+}
+
+assert_lossless_master_release_capability() {
+  local reldir="$1" rc=0
+  probe_release_lossless_master_capability "$reldir" || rc=$?
+  if [[ $rc -eq 0 ]]; then return 0; fi
+  if [[ $rc -eq 2 ]]; then
+    echo "✗ 目标 master release 的 lossless capability 状态不可核验(探测失败):" >&2
+  else
+    echo "✗ 目标 master release 未声明 reader capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
+  fi
+  echo "    $reldir/deploy/v5/release-metadata.json" >&2
+  return 1
 }
 
 assert_lossless_release_capability() {
-  local reldir="$1"
-  if ! release_has_lossless_turn_tape_capability "$reldir"; then
-    echo "✗ 目标 release 未同时声明 reader/writer capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
+  local reldir="$1" master_rc=0 runtime_rc=0
+  probe_release_lossless_master_capability "$reldir" || master_rc=$?
+  probe_release_lossless_runtime_capability "$reldir" || runtime_rc=$?
+  if [[ $master_rc -ne 0 || $runtime_rc -ne 0 ]]; then
+    if [[ $master_rc -eq 2 || $runtime_rc -eq 2 ]]; then
+      echo "✗ 目标 release 的 lossless reader/writer capability 状态不可核验(探测失败):" >&2
+    else
+      echo "✗ 目标 release 未同时声明 reader/writer capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
+    fi
     echo "    $reldir/deploy/v5/release-metadata.json" >&2
     echo "  finalized tape 的 hot row 只有 textless anchor;旧 master 重登会丢回复,旧 runtime 会恢复有损写入。" >&2
     return 1
   fi
   return 0
+}
+
+# Close the explicit-rollback check-then-first-write race. When the live master
+# is capable (or its declaration cannot be read), a concurrent turn may finalize
+# immediately after any DB floor query. Therefore prove the rollback target
+# reader and the actual target runtime tuple unconditionally, before maintenance
+# or any symlink/env/state mutation. Only a successfully read legacy live master
+# can use the DB floor alone: it cannot finalize v2 concurrently.
+assert_lossless_explicit_rollback_target() {  # $1=live master $2=target master $3=image id $4=runtime release
+  local live_master="$1" target_master="$2" image_id="$3" runtime_release="$4" live_rc=0
+  probe_release_lossless_master_capability "$live_master" || live_rc=$?
+  if [[ $live_rc -eq 1 ]]; then
+    echo "  · 当前 master 明确不具备 $LOSSLESS_TURN_TAPE_CAP；显式回滚继续由 finalized tape 地板裁决。"
+    return 0
+  fi
+  if [[ $live_rc -eq 2 ]]; then
+    echo "  · 当前 master capability 不可核验 → 按可能正在写 v2 tape fail-closed。" >&2
+  else
+    echo "  · 当前 master 已具备 $LOSSLESS_TURN_TAPE_CAP → 回滚目标须无条件兼容。"
+  fi
+  assert_lossless_master_release_capability "$target_master" || return 1
+  assert_lossless_runtime_tuple_capability "$image_id" "$runtime_release" || return 1
+  echo "  ✓ 显式回滚目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(不查询 DB,无首写竞态)。"
 }
 
 assert_lossless_turn_tape_floor() {
@@ -2275,10 +2350,12 @@ restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=c
   local tmplink="$ACTIVE_SRC.rollback.$$" image_id runtime_release
   echo "⚠ 激活未提交($reason)→ 补偿恢复 slot=$ACTIVE_SLOT old=$old_release" >&2
   # The candidate may have accepted traffic as soon as restart was attempted.
-  # If it is a v2 writer, require the compensation target unconditionally;
-  # a DB "no finalized tape" probe would race a concurrent first finalize.
-  if release_has_lossless_turn_tape_capability "$candidate_release"; then
-    if ! assert_lossless_release_capability "$old_release"; then
+  # If it is a v2 writer OR its capability probe failed, require the
+  # compensation target unconditionally. Unknown must be armed: treating a
+  # transient ssh/jq failure as "not capable" would fail open. A DB
+  # "no finalized tape" probe would also race a concurrent first finalize.
+  if lossless_release_may_have_served "$candidate_release"; then
+    if ! assert_lossless_master_release_capability "$old_release"; then
       mark_deploy_recovery_required "lossless writer 已可能对外服务,禁止自动回切旧 master:$old_release"
       return 1
     fi
@@ -3516,7 +3593,7 @@ rollback() {
   fi
   # 非 hotcfg:N=1 → deploy_state.previous_active_release(state 权威;蓝绿 slot-aware);
   #            .prev-release 文件仅作 A-slot 传统 lane 兼容兜底(state 未 seed 时)。N>1 → 按 mtime 第 N 个更老 release。
-  local target
+  local target live_master image_id runtime_release
   if [[ "$ROLLBACK_N" == 1 ]]; then
     if [[ "$DRY" == 1 ]]; then
       target="${DRY_DS_PREV_RELEASE:-$RELEASES_ROOT/rel-prev-dry}"
@@ -3549,6 +3626,15 @@ rollback() {
   fi
   [[ -n "$target" ]] || { echo "✗ 找不到回滚目标(N=$ROLLBACK_N;previous_active_release/.prev-release 或第 N 个更老 release 不存在)" >&2; exit 1; }
   ssh "$KL_HOST" "test -d '$target'" || { echo "✗ 回滚目标目录不存在: $target" >&2; exit 1; }
+  # This guard is deliberately independent of the finalized-tape DB query in
+  # activate_release. If the live v2 master can still finish a concurrent turn,
+  # a query returning false is stale before the later symlink switch.
+  live_master="$(bg_current_release "$ACTIVE_SRC")"
+  [[ -n "$live_master" ]] || { echo "✗ 显式回滚前无法解析当前 live master" >&2; exit 1; }
+  image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+  assert_lossless_explicit_rollback_target \
+    "$live_master" "$target" "$image_id" "$runtime_release" || exit 1
   # activate_release 内 ds_commit_active_release 会把 previous_active_release←旧 active(=回滚前的 release)、
   # active_release←target 原子对调(BLOCKER 4:rollback 成功后 CAS 更新 active_release+previous 对调)。
   begin_planned_maintenance rollback 0
@@ -3679,6 +3765,11 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_required_migrations "$master" || return 1
+  # Current-capable/unknown → target reader+actual writer are proved without a
+  # DB observation, before any history/state/env/symlink mutation. This closes
+  # "floor query=false → concurrent first finalize → rollback".
+  assert_lossless_explicit_rollback_target \
+    "$prev_src" "$master" "$image_id" "$release" || return 1
   # 回滚同样过两个 capability 门(地板的核心场景就是"拒绝把旧版本翻回来")。
   # 容器 tuple(image/release)面在 saga 内由 lib 的 assert_tuple_viable ③ 覆盖。
   assert_release_capability_for_sessions_pg "$master"
