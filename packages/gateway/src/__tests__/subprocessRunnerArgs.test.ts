@@ -192,6 +192,41 @@ describe('buildCcbCliArgs', () => {
     assert.equal(args[args.length - 1], '')
   })
 
+  it('hermeticNoTools emits only the explicit bare isolation surface', () => {
+    const args = buildCcbCliArgs({
+      ...BASE,
+      model: 'deepseek-v4-flash',
+      permissionMode: 'bypassPermissions',
+      extraPromptFile: '/tmp/persona.md',
+      mcpConfigFile: '/tmp/empty-mcp.json',
+      settingsFile: '/tmp/api-key-helper.json',
+      addDir: '/workspace/private-agent-dir',
+      resumeSessionId: 'must-not-resume',
+      restrictedMemorySources: true,
+      workload: 'auto-dream',
+      hermeticNoTools: true,
+    })
+
+    assert.ok(args.includes('--bare'))
+    assert.ok(hasFlagWithValue(args, '--tools', ''))
+    assert.ok(args.includes('--strict-mcp-config'))
+    assert.ok(hasFlagWithValue(args, '--settings', '/tmp/api-key-helper.json'))
+    assert.ok(hasFlagWithValue(args, '--mcp-config', '/tmp/empty-mcp.json'))
+    assert.ok(hasFlagWithValue(args, '--workload', 'auto-dream'))
+    for (const forbidden of [
+      '--permission-mode',
+      '--dangerously-skip-permissions',
+      '--permission-prompt-tool',
+      '--append-system-prompt-file',
+      '--add-dir',
+      '--resume',
+      '--setting-sources',
+    ]) {
+      assert.equal(args.includes(forbidden), false, `${forbidden} must be absent in hermetic mode`)
+    }
+    assert.equal(args[args.length - 1], '')
+  })
+
   it('omits --workload entirely when workload is null/undefined/empty', () => {
     for (const w of [null, undefined, '']) {
       const args = buildCcbCliArgs({ ...BASE, workload: w as string | undefined })

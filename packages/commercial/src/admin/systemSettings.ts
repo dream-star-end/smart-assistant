@@ -32,6 +32,10 @@ import { EVENTS } from "./alertEvents.js";
 import { writeCondition } from "../selfheal/conditions.js";
 import { SYSTEM_MAINTENANCE_ON } from "../selfheal/conditionKeys.js";
 import { rootLogger } from "../logging/logger.js";
+import {
+  DEFAULT_AUTO_DREAM_MODEL,
+  assertAutoDreamModelSelectable,
+} from "../billing/autoDreamModels.js";
 
 // ─── Allowlist + per-key schema ───────────────────────────────────────
 
@@ -126,6 +130,8 @@ export const KEY_SCHEMAS = {
    * < 0.5% 安全)→ enforce。
    */
   session_pin_mode: z.enum(["off", "observe", "enforce"]),
+  /** V5 Auto-Dream background consolidator model; validated against the live catalog on write. */
+  auto_dream_model: z.string().min(1).max(64),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -190,6 +196,7 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   // v3 反关联根治 — 默认 off,与原 env-only 字段默认一致(零迁移)
   phase6_account_uuid_enforce: "off",
   session_pin_mode: "off",
+  auto_dream_model: DEFAULT_AUTO_DREAM_MODEL,
 };
 
 /**
@@ -204,7 +211,7 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
 export const KEY_META: Record<
   SystemSettingKey,
   {
-    kind: "boolean" | "number" | "enum" | "string_array";
+    kind: "boolean" | "number" | "enum" | "string_array" | "model";
     enumValues?: string[];
     min?: number;
     max?: number;
@@ -268,6 +275,10 @@ export const KEY_META: Record<
     enumValues: ["off", "observe", "enforce"],
     description:
       "csap chat_session_account_pin 三态调度。灰度 off → observe(只观测打点)→ enforce(锁 sticky;409 让客户端 x-force-repin 重试)",
+  },
+  auto_dream_model: {
+    kind: "model",
+    description: "Auto-Dream 后台记忆整理模型（仅可选择 active/public/CCB 模型）",
   },
 };
 
@@ -417,6 +428,15 @@ export async function setSystemSetting<K extends SystemSettingKey>(
     );
   }
   const value = parsed.data as SystemSettingValue<K>;
+  if (key === "auto_dream_model") {
+    try {
+      await assertAutoDreamModelSelectable(String(value));
+    } catch (err) {
+      throw new SystemSettingValidationError([
+        err instanceof Error ? err.message : "auto-dream model is unavailable",
+      ]);
+    }
+  }
 
   return tx(async (client: PoolClient) => {
     const before = await client.query<{

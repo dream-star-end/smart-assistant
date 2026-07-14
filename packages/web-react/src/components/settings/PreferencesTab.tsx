@@ -1,10 +1,11 @@
-import { Monitor, Moon, Sun, X } from "lucide-react";
+import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import type { Theme } from "../../hooks/useTheme";
 import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, PublicModel } from "../../lib/types";
 import {
   initialModelFromPreferences,
+  type AutoDreamFeatureView,
   type PreferenceEffort,
   type PrefsView,
 } from "../../lib/modelPreferences";
@@ -46,16 +47,20 @@ const MAX_HOTKEYS = 32;
 export function PreferencesTab({
   auth,
   prefs,
+  autoDream,
   theme,
   onSetTheme,
   onPatch,
+  onUpgrade,
 }: {
   auth: AuthSession;
   prefs: PrefsView;
+  autoDream: AutoDreamFeatureView | null;
   theme: Theme;
   onSetTheme: (t: Theme) => void;
   /** 透传 patch 到后端（null 删除该字段）；父组件用返回快照刷新 prefs。 */
   onPatch: (patch: Record<string, unknown>) => Promise<void>;
+  onUpgrade: () => void;
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -173,6 +178,72 @@ export function PreferencesTab({
             ))}
           </Select>
         </label>
+      </div>
+
+      {/* Max+ 特色功能：V5 原生后台记忆整理（默认关闭，真实调用按实际积分计费）。 */}
+      <div className="border-t border-border px-5 py-4">
+        <div className="overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-sm">
+          <div className="flex items-start gap-3 px-4 pb-3 pt-4">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-sm">
+              <MoonStar size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[14px] font-semibold text-fg">Auto‑Dream</span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-[10.5px] font-semibold text-accent">
+                  <Sparkles size={10} /> Max+
+                </span>
+              </div>
+              <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
+                在你完成新的对话后，后台归纳跨会话偏好、反馈与长期信息，让记忆保持精炼、准确。
+              </p>
+            </div>
+            {autoDream?.enabled || (autoDream?.eligible && autoDream.available) ? (
+              <Switch
+                aria-label="Auto-Dream"
+                checked={autoDream?.enabled === true}
+                onCheckedChange={(checked) => {
+                  if (checked && (!autoDream?.eligible || !autoDream.available)) return;
+                  void patch({ auto_dream_enabled: checked });
+                }}
+              />
+            ) : (
+              <LockKeyhole size={17} className="mt-1 shrink-0 text-faint" />
+            )}
+          </div>
+
+          <div className="border-t border-accent/15 bg-surface/60 px-4 py-3">
+            <div className="flex items-center justify-between gap-3 text-[12px]">
+              <span className="text-faint">整理模型</span>
+              <span className="truncate font-medium text-fg">
+                {autoDream?.model_name || "暂不可用"}
+              </span>
+            </div>
+            <div className="mt-2 flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
+              <span className="mt-0.5 size-1.5 shrink-0 rounded-full bg-accent/70" />
+              <span>
+                至多每 {autoDream?.min_interval_hours ?? 24} 小时运行一次；累计至少 {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。模型调用按实际用量扣除积分。
+              </span>
+            </div>
+            {autoDream && !autoDream.eligible && (
+              <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
+                <span className="text-[12px] text-muted">升级到 Max 即可解锁后台记忆整理。</span>
+                <button
+                  type="button"
+                  onClick={onUpgrade}
+                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  升级到 Max
+                </button>
+              </div>
+            )}
+            {autoDream?.eligible && !autoDream.available && (
+              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-[12px] text-warning">
+                管理员配置的整理模型当前不可用，功能已安全暂停。
+              </p>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* 通知 */}

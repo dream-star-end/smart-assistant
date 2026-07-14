@@ -275,6 +275,11 @@ import {
   type SkillFeedbackHandler,
 } from "./http/internalSkillFeedback.js";
 import {
+  AUTO_DREAM_POLICY_PATH,
+  makeAutoDreamPolicyHandler,
+  type AutoDreamPolicyHandler,
+} from "./http/internalAutoDreamPolicy.js";
+import {
   CRON_INDEX_PATH,
   makeCronIndexHandler,
   type CronIndexHandler,
@@ -1749,6 +1754,9 @@ export async function registerCommercial(
         identityRepo,
         queryRunner: getPool(),
       });
+      const autoDreamPolicyHandler: AutoDreamPolicyHandler = makeAutoDreamPolicyHandler({
+        identityRepo,
+      });
       // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
       // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
       // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
@@ -1916,6 +1924,9 @@ export async function registerCommercial(
         }
         if (path === SKILL_FEEDBACK_PATH) {
           return skillFeedbackHandler(req, res, ctx);
+        }
+        if (path === AUTO_DREAM_POLICY_PATH) {
+          return autoDreamPolicyHandler(req, res, ctx);
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);

@@ -4,7 +4,12 @@ import { useCallback, useEffect, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { api, apiErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
-import { type PrefsView, extractPrefs } from "../lib/modelPreferences";
+import {
+  type AutoDreamFeatureView,
+  type PrefsView,
+  extractAutoDreamFeature,
+  extractPrefs,
+} from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
 import { AccountTab } from "./settings/AccountTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
@@ -60,6 +65,7 @@ export function SettingsCenter({
 
   // preferences 集中持有：偏好分区首次激活时拉一次，patch 后用返回快照刷新。
   const [prefs, setPrefs] = useState<PrefsView | null>(null);
+  const [autoDream, setAutoDream] = useState<AutoDreamFeatureView | null>(null);
   const [prefsLoading, setPrefsLoading] = useState(false);
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
 
@@ -88,6 +94,7 @@ export function SettingsCenter({
         if (!alive) return;
         const next = extractPrefs(snap);
         setPrefs(next);
+        setAutoDream(extractAutoDreamFeature(snap));
         onPreferencesChange?.(next);
       })
       .catch((e) => {
@@ -107,6 +114,7 @@ export function SettingsCenter({
       const snap = await api.patchPreferences(auth, patch);
       const next = extractPrefs(snap);
       setPrefs(next);
+      setAutoDream(extractAutoDreamFeature(snap));
       onPreferencesChange?.(next, patch);
     },
     [auth, onPreferencesChange],
@@ -178,9 +186,11 @@ export function SettingsCenter({
                     <PreferencesTab
                       auth={auth}
                       prefs={prefs}
+                      autoDream={autoDream}
                       theme={theme}
                       onSetTheme={onSetTheme}
                       onPatch={patchPref}
+                      onUpgrade={() => setSubOpen(true)}
                     />
                   ))}
 

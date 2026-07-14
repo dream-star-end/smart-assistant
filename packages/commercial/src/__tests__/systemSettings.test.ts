@@ -118,10 +118,23 @@ describe("KEY_META", () => {
         // textarea 模式:必须有 max 项数约束(admin UI / server zod 都要靠它)
         assert.equal(typeof m.max, "number");
         assert.ok((m.max ?? 0) > 0);
+      } else if (m.kind === "model") {
+        assert.equal(k, "auto_dream_model");
       } else {
         assert.equal(m.kind, "boolean");
       }
     }
+  });
+});
+
+describe("KEY_SCHEMAS — auto_dream_model", () => {
+  test("defaults to DeepSeek V4 Flash and enforces a bounded model id", () => {
+    const s = KEY_SCHEMAS.auto_dream_model;
+    assert.equal(DEFAULTS.auto_dream_model, "deepseek-v4-flash");
+    assert.ok(s.safeParse("deepseek-v4-flash").success);
+    assert.equal(s.safeParse("").success, false);
+    assert.equal(s.safeParse("x".repeat(65)).success, false);
+    assert.equal(s.safeParse(null).success, false);
   });
 });
 
