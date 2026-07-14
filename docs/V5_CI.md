@@ -31,10 +31,12 @@ ledger / v3Supervisor / userChatBridge 一带,尚未在 v5 轨修复)。为了�
 **新增回归**敏感而不被存量失败刷屏,commercial-unit job 不直接看测试退出码,
 而是走基线 diff:
 
-1. `.github/scripts/commercial-unit-gate.sh` 跑套件,把 TAP 输出落到
-   `commercial-unit.tap`(CI 里无论成败都作为 artifact 上传,名为
-   `commercial-unit-tap`;本地跑 gate 会把它落在仓库根,未被 git 跟踪,
-   用完可删,或用 `TAP_OUT=/path/xx.tap` 重定向);
+1. `.github/scripts/commercial-unit-gate.sh` 跑套件并生成 TAP。为避免多 worktree /
+   多 agent 并发互相截断,本地默认写到当前 worktree 的 Git 目录;可用
+   `TAP_OUT=/path/xx.tap` 显式重定向。CI job 通过唯一变量
+   `COMMERCIAL_UNIT_TAP=commercial-unit.tap` 把 `TAP_OUT` 和 artifact 上传路径绑在
+   一起;无论测试成败都上传名为 `commercial-unit-tap` 的产物,产物缺失本身也会让
+   job 失败,避免门禁只报套件名却丢失真实断言详情;
 2. `.github/scripts/diff-known-failures.sh` 从 TAP 提取**顶层**失败集
    (`^not ok` 只匹配列 0 = 顶层 test/suite 名;嵌套子测试是缩进的,不参与),
    与 `.github/known-failures/commercial-unit.txt` 逐行比较;
