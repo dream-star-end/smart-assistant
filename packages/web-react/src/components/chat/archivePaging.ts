@@ -7,26 +7,34 @@
  * 关键不变量(决定分页 UI 无跳变):
  *  - 归档行携带 server 权威 `_seq` 且 `_seq ≤ archivedThroughSeq`(水位线);热尾巴行的
  *    `_seq > 水位` 或本地乐观行无 `_seq`。据此可纯函数判定「已拉回多少归档行」。
- *  - 拉一页归档 = total 与 archivedLoaded **同量增加** → (total − archivedLoaded) 恒定 →
- *    既有可见窗口 `visible` 不需 bump,刚拉回的归档行天然落在挂载窗口内(不会被再次藏进
- *    「加载更多」按钮),也就无闪烁 / 无需在渲染期改状态。见 planLoadMore.sliceStart。
+ *  - 拉一页归档后,新加载的**可见行**全部从窗口裁剪量中扣除 → 既有可见窗口 `visible`
+ *    不需 bump,刚拉回的归档行天然落在挂载窗口内(不会被再次藏进「加载更多」按钮)。
+ *  - lossless tape 的一个归档 anchor 会展开成多条可见行且共享同一 `_seq`;因此窗口计算按
+ *    已加载可见行数,而「还有 N 条归档」按 distinct `_seq` anchor 数,两者不可混用。
  */
 import type { ChatMessage } from "../../lib/chat/model";
 
 /**
- * 当前 messages 数组里「已从云端拉回」的归档行数(带 `_seq` 且 `_seq ≤ 水位线`)。
- * archivedThroughSeq ≤ 0 或无归档时恒 0。O(n),n 为已挂载行数(有界)。
+ * 当前 messages 数组里「已从云端拉回」的归档投影统计。
+ * - rows:匹配水位的投影行数,用于保证刚拉回的可见行全部挂载。
+ * - anchors:distinct `_seq` 数。lossless tape 的所有展开行共享 anchor `_seq`,用于从
+ *   `archivedCount` 扣除真正已加载的归档 anchor。
+ * archivedThroughSeq ≤ 0 或无归档时恒 0。O(n),n 为当前会话内存行数。
  */
-export function loadedArchivedCount(
+export function loadedArchivedMetrics(
   messages: Pick<ChatMessage, "_seq">[],
   archivedThroughSeq: number,
-): number {
-  if (!(archivedThroughSeq > 0)) return 0;
-  let n = 0;
+): { rows: number; anchors: number } {
+  if (!(archivedThroughSeq > 0)) return { rows: 0, anchors: 0 };
+  let rows = 0;
+  const anchors = new Set<number>();
   for (const m of messages) {
-    if (typeof m._seq === "number" && m._seq <= archivedThroughSeq) n++;
+    if (typeof m._seq === "number" && m._seq <= archivedThroughSeq) {
+      rows++;
+      anchors.add(m._seq);
+    }
   }
-  return n;
+  return { rows, anchors: anchors.size };
 }
 
 /**
@@ -55,20 +63,23 @@ export type LoadMorePlan = {
 
 /**
  * 「加载更多」按钮状态机 + 挂载窗口切片起点(单一权威,组件与单测共用)。
- *  - localUnmounted = 尾巴(与已拉归档)里尚未挂载的行数 = max(0, (total − archivedLoaded) − visible)。
- *  - remainingArchived = 云端还没拉回的归档行数 = max(0, archivedCount − archivedLoaded)。
+ *  - localUnmounted = 尾巴里尚未挂载的可见行数
+ *    = max(0, (total − archivedLoadedRows) − visible)。
+ *  - remainingArchived = 云端还没拉回的归档 anchor 数
+ *    = max(0, archivedCount − archivedLoadedAnchors)。
  * 优先本地翻页(count = 本地未挂 + 归档未拉,§4 计数含归档数);本地翻尽再走云端(§5 文案)。
- * sliceStart === localUnmounted:归档行前插使 total、archivedLoaded 同增 → 差恒定 →
- * localUnmounted 不因拉归档回升,刚拉回的行不会被重新藏起来。
+ * sliceStart === localUnmounted:归档可见行前插使 total、archivedLoadedRows 同增 → 差恒定 →
+ * localUnmounted 不因拉归档回升,刚拉回的可见行不会被重新藏起来。
  */
 export function planLoadMore(input: {
   total: number;
   visible: number;
-  archivedLoaded: number;
+  archivedLoadedRows: number;
+  archivedLoadedAnchors: number;
   archivedCount: number;
 }): LoadMorePlan {
-  const localUnmounted = Math.max(0, input.total - input.archivedLoaded - input.visible);
-  const remainingArchived = Math.max(0, input.archivedCount - input.archivedLoaded);
+  const localUnmounted = Math.max(0, input.total - input.archivedLoadedRows - input.visible);
+  const remainingArchived = Math.max(0, input.archivedCount - input.archivedLoadedAnchors);
   const button: LoadMoreDescriptor =
     localUnmounted > 0
       ? { mode: "local", count: localUnmounted + remainingArchived }

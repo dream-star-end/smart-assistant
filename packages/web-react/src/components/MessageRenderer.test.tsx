@@ -639,6 +639,37 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.getByRole("button", { name: /加载更多历史（还有 30 条）/ })).toBeInTheDocument();
   });
 
+  test("lossless tape 的隐藏 runtime-event 不占最近100条窗口,首屏仍显示真实回复", () => {
+    const visible: ChatMessage[] = [
+      mk("user", { id: "u-visible", text: "可见提问", status: "sent", ts: 1 }),
+      mk("thinking", { id: "th-visible", text: "**可见思考**", ts: 2 }),
+      mk("tool", {
+        id: "tool-visible",
+        text: "",
+        toolName: "exec_command",
+        inputJson: { cmd: "printf ok" },
+        output: "ok",
+        _completed: true,
+        ts: 3,
+      }),
+      mk("assistant", { id: "a-visible", text: "可见最终答复", ts: 4 }),
+    ];
+    const hidden = Array.from({ length: 120 }, (_, i) => ({
+      id: `runtime-${i}`,
+      role: "runtime-event",
+      text: "",
+      ts: 5 + i,
+      _runtimeEvent: { type: "system", subtype: "raw_frame", index: i },
+    })) as unknown as ChatMessage[];
+
+    renderList([...visible, ...hidden]);
+
+    expect(screen.getByText("可见提问")).toBeInTheDocument();
+    expect(screen.getByText("可见最终答复")).toBeInTheDocument();
+    expect(screen.getByText(/已思考/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /加载更多历史/ })).toBeNull();
+  });
+
   test("本地翻尽 + 有归档未拉 → 云端加载按钮,还有 M 条(§5 文案)", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(
