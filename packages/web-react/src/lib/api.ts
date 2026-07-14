@@ -202,6 +202,22 @@ export type ResponseRatingInput = {
 /** 会话已评回读结果：messageId → {rating, tags}（不含 comment）。 */
 export type SessionRatingsMap = Record<string, { rating: "up" | "down"; tags: string[] }>;
 
+/** 设置中心自由文本反馈。身份关联沿用后端 best-effort Bearer 语义。 */
+export type FeedbackCategory = "bug" | "feature" | "ux" | "other";
+
+export type FeedbackSubmitInput = {
+  category: FeedbackCategory;
+  description: string;
+  version?: string;
+  meta?: {
+    source: "settings";
+    locale?: string;
+    timezone?: string;
+  };
+};
+
+export type FeedbackSubmitResult = { ok: true; id: string };
+
 /**
  * 统一的网络错误类型 —— 唯一权威，承载 status / code / issues / requestId，
  * 让上层按 **状态码 + 机器码** 分支（402 余额不足 / 409 已订阅 / 409 conflict /
@@ -720,6 +736,40 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(patch),
+        }),
+      ),
+    ),
+
+  /**
+   * 设置中心自由文本反馈（POST /api/feedback）。该公共端点允许匿名提交；Bearer 只用于
+   * best-effort 关联 user_id，因此过期 token 仍可能由后端按匿名反馈接收，不能把
+   * callWithRefresh 当作身份关联保证。显式重建 body，避免未来调用方意外夹带会话正文、
+   * request_id 或诊断堆栈。
+   */
+  submitFeedback: (
+    a: AuthSession,
+    input: FeedbackSubmitInput,
+  ): Promise<FeedbackSubmitResult> =>
+    jsonOrThrow<FeedbackSubmitResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/feedback", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({
+            category: input.category,
+            description: input.description,
+            ...(input.version ? { version: input.version } : {}),
+            ...(input.meta
+              ? {
+                  meta: {
+                    source: input.meta.source,
+                    ...(input.meta.locale ? { locale: input.meta.locale } : {}),
+                    ...(input.meta.timezone ? { timezone: input.meta.timezone } : {}),
+                  },
+                }
+              : {}),
+          }),
         }),
       ),
     ),
