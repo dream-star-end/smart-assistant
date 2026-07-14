@@ -247,6 +247,7 @@ import {
 } from './mcpVisionServer.js'
 import {
   AutoDreamService,
+  formatAutoDreamReceipt,
   isAutoDreamSuccessfulTurn,
   type AutoDreamModelRun,
 } from './autoDream.js'
@@ -1634,6 +1635,7 @@ export class Gateway {
     this.sessions = new SessionManager(deps.config)
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
+      notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
       log: (event, fields) => this.log.info(event, fields),
     })
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
@@ -3372,6 +3374,15 @@ export class Gateway {
     if (memoryMatch) {
       this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
         (err) => this.sendInternalError(res, err),
+      )
+      return
+    }
+    const autoDreamReportMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-report$/,
+    )
+    if (autoDreamReportMatch) {
+      this.handleAutoDreamReport(req, res, autoDreamReportMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -5942,6 +5953,17 @@ export class Gateway {
       return this.sendError(res, 410, 'memory index is auto-managed; edit memory/<file> instead')
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
+  private async handleAutoDreamReport(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    this.sendJson(res, 200, await this.autoDream.getPublicStatus(agentId))
   }
 
   // GET    /api/agents/:id/memory/files/:file → { file, content, version } | 404

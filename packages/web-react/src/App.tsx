@@ -1630,6 +1630,10 @@ export function App() {
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
+            onOpenMemory={() => {
+              setSettingsOpen(false);
+              openManage("memory");
+            }}
           />
         </LazyBoundary>
       )}

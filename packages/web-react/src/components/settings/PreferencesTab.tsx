@@ -52,6 +52,7 @@ export function PreferencesTab({
   onSetTheme,
   onPatch,
   onUpgrade,
+  onOpenMemory,
 }: {
   auth: AuthSession;
   prefs: PrefsView;
@@ -61,6 +62,7 @@ export function PreferencesTab({
   /** 透传 patch 到后端（null 删除该字段）；父组件用返回快照刷新 prefs。 */
   onPatch: (patch: Record<string, unknown>) => Promise<void>;
   onUpgrade: () => void;
+  onOpenMemory: () => void;
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -213,17 +215,23 @@ export function PreferencesTab({
           </div>
 
           <div className="border-t border-accent/15 bg-surface/60 px-4 py-3">
-            <div className="flex items-center justify-between gap-3 text-[12px]">
-              <span className="text-faint">整理模型</span>
-              <span className="truncate font-medium text-fg">
-                {autoDream?.model_name || "暂不可用"}
-              </span>
-            </div>
-            <div className="mt-2 flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
+            <div className="flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
               <span className="mt-0.5 size-1.5 shrink-0 rounded-full bg-accent/70" />
               <span>
-                至多每 {autoDream?.min_interval_hours ?? 24} 小时运行一次；累计至少 {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。模型调用按实际用量扣除积分。
+                至多每 {autoDream?.min_interval_hours ?? 24} 小时运行一次；累计至少 {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。整理按实际用量扣除积分。
               </span>
+            </div>
+            <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
+              <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-muted">
+                每次正常结束都会生成可见的梦境报告；即使没有产生新记忆，也会说明结果。
+              </p>
+              <button
+                type="button"
+                onClick={onOpenMemory}
+                className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-[12px] font-medium text-fg outline-none transition-colors hover:border-accent hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                查看整理记录
+              </button>
             </div>
             {autoDream && !autoDream.eligible && (
               <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
@@ -239,7 +247,7 @@ export function PreferencesTab({
             )}
             {autoDream?.eligible && !autoDream.available && (
               <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-[12px] text-warning">
-                管理员配置的整理模型当前不可用，功能已安全暂停。
+                Auto‑Dream 当前暂不可用，功能已安全暂停。
               </p>
             )}
           </div>

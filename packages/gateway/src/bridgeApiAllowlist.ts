@@ -76,6 +76,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Auto-Dream 用户侧只读报告。容器 handler 只返回严格白名单投影，不暴露模型、
+    // prompt、原始会话/记忆正文或内部错误；商业宿主仍按登录 uid 只代理进自己的容器。
+    label: '/api/agents/:id/auto-dream-report',
+    re: /^\/api\/agents\/[^/]+\/auto-dream-report$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/agents/:id/skills',
     re: /^\/api\/agents\/[^/]+\/skills$/,
     methods: M('GET'),

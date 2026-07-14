@@ -3,20 +3,20 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import {
+  type AutoDreamSuccessfulSession,
+  type KernelFileLock,
+  MEMORY_FILE_RE,
+  MemoryDir,
+  type MemoryType,
   acquireKernelFileLock,
   loadSessionTurns,
-  MemoryDir,
-  MEMORY_FILE_RE,
   paths,
   pruneAutoDreamSuccessEvents,
   scanAutoDreamSuccessfulSessions,
   scanMemoryContent,
-  type AutoDreamSuccessfulSession,
-  type KernelFileLock,
-  type MemoryType,
 } from '@openclaude/storage'
 
-import { AutoDreamPolicyClient, type AutoDreamPolicy } from './autoDreamPolicy.js'
+import { type AutoDreamPolicy, AutoDreamPolicyClient } from './autoDreamPolicy.js'
 
 const USER_CHANNELS = new Set(['webchat', 'wechat', 'telegram'])
 const SCAN_THROTTLE_MS = 10 * 60_000
@@ -31,8 +31,44 @@ const MAX_DELETES = 8
 const MAX_BODY_CHARS = 8_000
 const MAX_TOTAL_BODY_CHARS = 40_000
 const MEMORY_TYPES: ReadonlySet<MemoryType> = new Set(['user', 'feedback', 'project', 'reference'])
+const MAX_REPORT_SUMMARY_CHARS = 1_000
+const MAX_REPORT_CHANGES = MAX_UPSERTS + MAX_DELETES
+export const MAX_AUTO_DREAM_RUN_MS = 2 * 60 * 60_000
+const REPORT_SUCCESS_CHANGED = '已完成本次长期记忆整理。'
+const REPORT_SUCCESS_NOOP = '已检查近期会话，没有发现需要调整的长期记忆。'
+const REPORT_FAILED_NO_CHANGE = '本次整理未完成，没有改动记忆。'
+const REPORT_FAILED_UNKNOWN = '整理被中断，无法确认记忆是否发生变化，请查看记忆列表。'
+const SAFE_REPORT_SUMMARIES = new Set([
+  REPORT_SUCCESS_CHANGED,
+  REPORT_SUCCESS_NOOP,
+  REPORT_FAILED_NO_CHANGE,
+  REPORT_FAILED_UNKNOWN,
+])
 
 type AutoDreamStatus = 'idle' | 'running' | 'success' | 'failed'
+
+export interface AutoDreamMemoryChange {
+  file: string
+  action: 'created' | 'updated' | 'deleted'
+  type?: MemoryType
+}
+
+export interface AutoDreamLastReport {
+  status: 'success' | 'failed'
+  finishedAt: string
+  sessionsReviewed: number
+  summary: string
+  created: AutoDreamMemoryChange[]
+  updated: AutoDreamMemoryChange[]
+  deleted: AutoDreamMemoryChange[]
+}
+
+export interface AutoDreamPublicStatus {
+  status: AutoDreamStatus
+  startedAt?: string
+  pendingSessions: number
+  lastReport?: AutoDreamLastReport
+}
 
 export interface AutoDreamState {
   schemaVersion: 1
@@ -47,9 +83,11 @@ export interface AutoDreamState {
   startedAt?: string
   finishedAt?: string
   model?: string
-  counts?: { sessionsSinceLastSuccess: number; memoryFiles: number }
+  counts?: { sessionsSinceLastSuccess: number; memoryFiles: number; sessionsReviewed?: number }
   summary?: string
   error?: string
+  /** Sanitized user-visible receipt. Never contains model/prompt/raw memory/internal errors. */
+  lastReport?: AutoDreamLastReport
 }
 
 export interface AutoDreamTrigger {
@@ -72,6 +110,7 @@ export interface AutoDreamModelRun {
 export interface AutoDreamDeps {
   policyClient?: AutoDreamPolicyClient
   runModel: (input: AutoDreamModelRun) => Promise<string>
+  notifyResult?: (report: AutoDreamLastReport) => Promise<void>
   now?: () => number
   log?: (event: string, fields: Record<string, unknown>) => void
 }
@@ -100,6 +139,7 @@ export function isAutoDreamSuccessfulTurn(result: AutoDreamTurnResult): boolean 
 interface MemorySnapshot {
   rendered: Array<{ file: string; content: string }>
   versions: Map<string, string>
+  metadata: Map<string, { type: MemoryType }>
 }
 
 interface ProposalUpsert {
@@ -121,18 +161,26 @@ interface Proposal {
 export class AutoDreamService {
   private readonly policyClient: AutoDreamPolicyClient
   private readonly runModel: AutoDreamDeps['runModel']
+  private readonly notifyResult: NonNullable<AutoDreamDeps['notifyResult']>
   private readonly now: () => number
   private readonly log: (event: string, fields: Record<string, unknown>) => void
 
   constructor(deps: AutoDreamDeps) {
     this.policyClient = deps.policyClient ?? new AutoDreamPolicyClient()
     this.runModel = deps.runModel
+    this.notifyResult = deps.notifyResult ?? (async () => {})
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? (() => {})
   }
 
   async maybeSchedule(trigger: AutoDreamTrigger): Promise<void> {
     if (!USER_CHANNELS.has(trigger.channel)) return
+    await this.reconcileStaleRun(trigger.agentId).catch((err) => {
+      this.log('auto_dream_stale_reconcile_failed', {
+        agentId: trigger.agentId,
+        error: safeError(err),
+      })
+    })
     const policy = await this.policyClient.get()
     if (!policy.enabled) return
     try {
@@ -142,6 +190,45 @@ export class AutoDreamService {
         agentId: trigger.agentId,
         error: safeError(err),
       })
+    }
+  }
+
+  /** Identity-bound container API projection; stale paid attempts converge to a visible failure. */
+  async getPublicStatus(agentId: string): Promise<AutoDreamPublicStatus> {
+    await this.reconcileStaleRun(agentId)
+    return projectAutoDreamPublicStatus(await readState(paths.agentAutoDreamState(agentId)))
+  }
+
+  private async reconcileStaleRun(agentId: string): Promise<void> {
+    let lock: KernelFileLock
+    try {
+      lock = await acquireKernelFileLock(paths.agentAutoDreamLock(agentId))
+    } catch {
+      return
+    }
+    try {
+      const statePath = paths.agentAutoDreamState(agentId)
+      const state = await readState(statePath)
+      if (state.status !== 'running') return
+      const startedAt = parseTime(state.startedAt)
+      const now = this.now()
+      if (startedAt !== null && now - startedAt < MAX_AUTO_DREAM_RUN_MS) return
+      const finishedAt = new Date(now).toISOString()
+      const report = failedReport(
+        finishedAt,
+        boundedSessionsReviewed(state.counts?.sessionsReviewed),
+        REPORT_FAILED_UNKNOWN,
+      )
+      await writeState(statePath, {
+        ...state,
+        status: 'failed',
+        finishedAt,
+        summary: report.summary,
+        error: 'AUTO_DREAM_INTERRUPTED',
+        lastReport: report,
+      })
+    } finally {
+      await lock.release().catch(() => {})
     }
   }
 
@@ -199,6 +286,7 @@ export class AutoDreamService {
         counts: {
           sessionsSinceLastSuccess: sessionCount,
           memoryFiles: state.counts?.memoryFiles ?? 0,
+          sessionsReviewed: state.counts?.sessionsReviewed,
         },
       })
       if (sessionCount < policy.minNewSessions) return
@@ -213,6 +301,7 @@ export class AutoDreamService {
     const memory = await snapshotMemory(trigger.agentId)
     const excerpts = await buildExcerpts(trigger, recentSessions)
     const prompt = buildPrompt(memory, excerpts)
+    const sessionsReviewed = excerpts.length
 
     // Enabled results are never cached, and the paid claim uses an explicit
     // fresh read so opt-out, plan loss, or an unavailable admin model takes
@@ -242,7 +331,11 @@ export class AutoDreamService {
         startedAt: new Date(now).toISOString(),
         finishedAt: undefined,
         model: freshPolicy.modelId,
-        counts: { sessionsSinceLastSuccess: sessionCount, memoryFiles: memory.versions.size },
+        counts: {
+          sessionsSinceLastSuccess: sessionCount,
+          memoryFiles: memory.versions.size,
+          sessionsReviewed,
+        },
         summary: undefined,
         error: undefined,
       })
@@ -261,13 +354,20 @@ export class AutoDreamService {
       })
       proposal = validateProposal(output, memory)
     } catch (err) {
-      await this.finishFailed(trigger.agentId, attemptId, safeError(err))
+      const report = await this.finishFailed(
+        trigger.agentId,
+        attemptId,
+        sessionsReviewed,
+        safeError(err),
+      )
+      if (report) await this.notifyBestEffort(trigger.agentId, report)
       return
     }
 
     // Apply/terminal phase. Reacquire, reload and verify ownership before the
     // first mutation; keep the kernel lock through every bounded CAS and the
     // success state write. A superseded attempt is a strict no-op.
+    let receipt: AutoDreamLastReport | null = null
     try {
       lock = await acquireKernelFileLock(lockPath)
     } catch {
@@ -277,6 +377,7 @@ export class AutoDreamService {
       const state = await readState(statePath)
       if (state.attemptId !== attemptId || state.status !== 'running') return
       const memdir = new MemoryDir(trigger.agentId)
+      let applyError: unknown = null
       try {
         const result = await memdir.applyBatchCas({
           upserts: proposal.upserts.map((upsert) => ({
@@ -295,8 +396,14 @@ export class AutoDreamService {
               ? `AUTO_DREAM_MEMORY_CAS_CONFLICT:${result.conflict.file}`
               : `AUTO_DREAM_MEMORY_BATCH_FAILED:${result.error}`,
           )
+      } catch (err) {
+        applyError = err
+      }
+
+      if (applyError === null) {
         const finishedAt = new Date(this.now()).toISOString()
-        await writeState(statePath, {
+        const report = successReport(finishedAt, sessionsReviewed, proposal, memory)
+        const successState: AutoDreamState = {
           ...state,
           status: 'success',
           lastSuccessAt: finishedAt,
@@ -305,7 +412,21 @@ export class AutoDreamService {
           counts: { sessionsSinceLastSuccess: 0, memoryFiles: memory.versions.size },
           summary: proposal.summary,
           error: undefined,
-        })
+          lastReport: report,
+        }
+        try {
+          await writeState(statePath, successState)
+        } catch (err) {
+          // The memory batch is already committed. Never turn a transient
+          // bookkeeping failure into a false “no memory changed” result.
+          this.log('auto_dream_success_state_retry', {
+            agentId: trigger.agentId,
+            attemptId,
+            error: safeError(err),
+          })
+          await writeState(statePath, successState)
+        }
+        receipt = report
         await pruneAutoDreamSuccessEvents(trigger.agentId, sessionsProcessedThroughSeq).catch(
           (err) => {
             this.log('auto_dream_marker_prune_failed', {
@@ -321,40 +442,278 @@ export class AutoDreamService {
           upserts: proposal.upserts.length,
           deletes: proposal.deletes.length,
         })
-      } catch (err) {
+      } else {
+        const finishedAt = new Date(this.now()).toISOString()
+        const report = failedReport(finishedAt, sessionsReviewed, REPORT_FAILED_NO_CHANGE)
         await writeState(statePath, {
           ...state,
           status: 'failed',
-          finishedAt: new Date(this.now()).toISOString(),
-          error: safeError(err),
+          finishedAt,
+          summary: report.summary,
+          error: safeError(applyError),
+          lastReport: report,
         })
+        receipt = report
       }
+    } finally {
+      await lock.release().catch(() => {})
+    }
+    if (receipt) await this.notifyBestEffort(trigger.agentId, receipt)
+  }
+
+  private async finishFailed(
+    agentId: string,
+    attemptId: string,
+    sessionsReviewed: number,
+    error: string,
+  ): Promise<AutoDreamLastReport | null> {
+    let lock: KernelFileLock
+    try {
+      lock = await acquireKernelFileLock(paths.agentAutoDreamLock(agentId))
+    } catch {
+      return null
+    }
+    try {
+      const statePath = paths.agentAutoDreamState(agentId)
+      const state = await readState(statePath)
+      if (state.attemptId !== attemptId || state.status !== 'running') return null
+      const finishedAt = new Date(this.now()).toISOString()
+      const report = failedReport(finishedAt, sessionsReviewed, REPORT_FAILED_NO_CHANGE)
+      await writeState(statePath, {
+        ...state,
+        status: 'failed',
+        finishedAt,
+        summary: report.summary,
+        error,
+        lastReport: report,
+      })
+      return report
     } finally {
       await lock.release().catch(() => {})
     }
   }
 
-  private async finishFailed(agentId: string, attemptId: string, error: string): Promise<void> {
-    let lock: KernelFileLock
+  private async notifyBestEffort(agentId: string, report: AutoDreamLastReport): Promise<void> {
     try {
-      lock = await acquireKernelFileLock(paths.agentAutoDreamLock(agentId))
-    } catch {
-      return
-    }
-    try {
-      const statePath = paths.agentAutoDreamState(agentId)
-      const state = await readState(statePath)
-      if (state.attemptId !== attemptId || state.status !== 'running') return
-      await writeState(statePath, {
-        ...state,
-        status: 'failed',
-        finishedAt: new Date(this.now()).toISOString(),
-        error,
-      })
-    } finally {
-      await lock.release().catch(() => {})
+      await this.notifyResult(report)
+    } catch (err) {
+      this.log('auto_dream_receipt_failed', { agentId, error: safeError(err) })
     }
   }
+}
+
+function boundedSessionsReviewed(value: unknown): number {
+  return Number.isSafeInteger(value) ? Math.max(0, Math.min(MAX_EXCERPTS, Number(value))) : 0
+}
+
+function cleanReportText(value: unknown, max: number): string {
+  if (typeof value !== 'string') return ''
+  let printable = ''
+  for (const char of value) {
+    const code = char.charCodeAt(0)
+    printable += code <= 31 || (code >= 127 && code <= 159) ? ' ' : char
+  }
+  return printable.replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+function normalizeIso(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const n = Date.parse(value)
+  return Number.isFinite(n) ? new Date(n).toISOString() : undefined
+}
+
+function reportChange(row: ProposalUpsert, action: 'created' | 'updated'): AutoDreamMemoryChange {
+  return {
+    file: row.file,
+    action,
+    type: row.type,
+  }
+}
+
+function successReport(
+  finishedAt: string,
+  sessionsReviewed: number,
+  proposal: Proposal,
+  memory: MemorySnapshot,
+): AutoDreamLastReport {
+  const created: AutoDreamMemoryChange[] = []
+  const updated: AutoDreamMemoryChange[] = []
+  for (const row of proposal.upserts) {
+    const action = memory.versions.has(row.file) ? 'updated' : 'created'
+    if (action === 'created') created.push(reportChange(row, action))
+    else updated.push(reportChange(row, action))
+  }
+  const deleted = proposal.deletes.map((file): AutoDreamMemoryChange => {
+    const meta = memory.metadata.get(file)
+    return {
+      file,
+      action: 'deleted',
+      ...(meta?.type ? { type: meta.type } : {}),
+    }
+  })
+  return {
+    status: 'success',
+    finishedAt,
+    sessionsReviewed: boundedSessionsReviewed(sessionsReviewed),
+    summary:
+      created.length + updated.length + deleted.length === 0
+        ? REPORT_SUCCESS_NOOP
+        : REPORT_SUCCESS_CHANGED,
+    created,
+    updated,
+    deleted,
+  }
+}
+
+function failedReport(
+  finishedAt: string,
+  sessionsReviewed: number,
+  summary: string,
+): AutoDreamLastReport {
+  return {
+    status: 'failed',
+    finishedAt,
+    sessionsReviewed: boundedSessionsReviewed(sessionsReviewed),
+    summary: cleanReportText(summary, MAX_REPORT_SUMMARY_CHARS),
+    created: [],
+    updated: [],
+    deleted: [],
+  }
+}
+
+function sanitizeReportChange(
+  raw: unknown,
+  action: AutoDreamMemoryChange['action'],
+): AutoDreamMemoryChange | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const row = raw as Record<string, unknown>
+  if (row.action !== action || typeof row.file !== 'string' || !MEMORY_FILE_RE.test(row.file))
+    return null
+  const type =
+    typeof row.type === 'string' && MEMORY_TYPES.has(row.type as MemoryType)
+      ? (row.type as MemoryType)
+      : undefined
+  return {
+    file: row.file,
+    action,
+    ...(type ? { type } : {}),
+  }
+}
+
+function sanitizeLastReport(raw: unknown): AutoDreamLastReport | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const row = raw as Record<string, unknown>
+  if (row.status !== 'success' && row.status !== 'failed') return undefined
+  const finishedAt = normalizeIso(row.finishedAt)
+  if (!finishedAt) return undefined
+  let remaining = MAX_REPORT_CHANGES
+  const take = (
+    value: unknown,
+    action: AutoDreamMemoryChange['action'],
+  ): AutoDreamMemoryChange[] => {
+    if (!Array.isArray(value) || remaining <= 0) return []
+    const out: AutoDreamMemoryChange[] = []
+    for (const item of value) {
+      if (remaining <= 0) break
+      const change = sanitizeReportChange(item, action)
+      if (!change) continue
+      out.push(change)
+      remaining--
+    }
+    return out
+  }
+  const created = take(row.created, 'created')
+  const updated = take(row.updated, 'updated')
+  const deleted = take(row.deleted, 'deleted')
+  const fallbackSummary =
+    row.status === 'success'
+      ? created.length + updated.length + deleted.length === 0
+        ? REPORT_SUCCESS_NOOP
+        : REPORT_SUCCESS_CHANGED
+      : REPORT_FAILED_UNKNOWN
+  const rawSummary = cleanReportText(row.summary, MAX_REPORT_SUMMARY_CHARS)
+  return {
+    status: row.status,
+    finishedAt,
+    sessionsReviewed: boundedSessionsReviewed(row.sessionsReviewed),
+    summary: SAFE_REPORT_SUMMARIES.has(rawSummary) ? rawSummary : fallbackSummary,
+    created,
+    updated,
+    deleted,
+  }
+}
+
+/** Strict whitelist projection used by the browser-facing container route. */
+export function projectAutoDreamPublicStatus(raw: unknown): AutoDreamPublicStatus {
+  const row =
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  const status = ['idle', 'running', 'success', 'failed'].includes(String(row.status))
+    ? (row.status as AutoDreamStatus)
+    : 'idle'
+  const counts =
+    row.counts && typeof row.counts === 'object' && !Array.isArray(row.counts)
+      ? (row.counts as Record<string, unknown>)
+      : {}
+  const pendingSessions = Number.isSafeInteger(counts.sessionsSinceLastSuccess)
+    ? Math.max(0, Math.min(101, Number(counts.sessionsSinceLastSuccess)))
+    : 0
+  const startedAt = status === 'running' ? normalizeIso(row.startedAt) : undefined
+  const lastReport = sanitizeLastReport(row.lastReport)
+  return {
+    status,
+    ...(startedAt ? { startedAt } : {}),
+    pendingSessions,
+    ...(lastReport ? { lastReport } : {}),
+  }
+}
+
+function escapeReceiptText(value: string): string {
+  return cleanReportText(value, 320).replace(/([\\`*_\[\]<>#|])/g, '\\$1')
+}
+
+/** User-facing secondary receipt; the persisted report endpoint remains authoritative. */
+export function formatAutoDreamReceipt(report: AutoDreamLastReport): {
+  title: string
+  bodyMd: string
+} {
+  const safe =
+    sanitizeLastReport(report) ??
+    failedReport(new Date(0).toISOString(), 0, REPORT_FAILED_NO_CHANGE)
+  const lines = ['运行结果已保存到「管理中心 → 记忆」。']
+  if (safe.status === 'failed') {
+    lines.push(
+      '',
+      `本次参考了 ${safe.sessionsReviewed} 个近期会话，但整理未完成，没有改动任何记忆，也不会立即自动重试。`,
+    )
+  } else {
+    const total = safe.created.length + safe.updated.length + safe.deleted.length
+    lines.push('', `本次参考了 ${safe.sessionsReviewed} 个近期会话。`)
+    if (total === 0) {
+      lines.push('没有发现值得长期保存的新信息，本次没有改动记忆。')
+    } else {
+      lines.push(
+        `新增 ${safe.created.length} 条、更新 ${safe.updated.length} 条、清理 ${safe.deleted.length} 条记忆。`,
+      )
+      const labels: Record<AutoDreamMemoryChange['action'], string> = {
+        created: '新增',
+        updated: '更新',
+        deleted: '清理',
+      }
+      const changes = [...safe.created, ...safe.updated, ...safe.deleted].slice(0, 8)
+      if (changes.length > 0) {
+        lines.push('', '**记忆变化**')
+        for (const change of changes) {
+          const name = escapeReceiptText(change.file.replace(/\.md$/i, ''))
+          lines.push(`- ${labels[change.action]}「${name}」`)
+        }
+        if (total > changes.length)
+          lines.push(`- 另有 ${total - changes.length} 条变化，请到记忆中心查看。`)
+      }
+    }
+  }
+  if (safe.summary) lines.push('', `整理摘要：${escapeReceiptText(safe.summary)}`)
+  lines.push('', '本次实际用量可在「设置 → 用量」查看。')
+  return { title: 'Auto‑Dream 梦境报告', bodyMd: lines.join('\n') }
 }
 
 async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
@@ -362,6 +721,7 @@ async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
   const files = (await memdir.list()).slice(0, MAX_MEMORY_FILES)
   const rendered: MemorySnapshot['rendered'] = []
   const versions = new Map<string, string>()
+  const metadata: MemorySnapshot['metadata'] = new Map()
   let used = 0
   for (const meta of files) {
     const row = await memdir.read(meta.file)
@@ -373,10 +733,13 @@ async function snapshotMemory(agentId: string): Promise<MemorySnapshot> {
     // upsert becomes create-only CAS and a delete fails proposal validation.
     if (row.content.length > MAX_MEMORY_FILE_CHARS || row.content.length > remaining) continue
     versions.set(meta.file, row.version)
+    metadata.set(meta.file, {
+      type: MEMORY_TYPES.has(meta.type as MemoryType) ? (meta.type as MemoryType) : 'project',
+    })
     rendered.push({ file: meta.file, content: row.content })
     used += row.content.length
   }
-  return { rendered, versions }
+  return { rendered, versions, metadata }
 }
 
 async function buildExcerpts(
@@ -426,6 +789,7 @@ function buildPrompt(
     '{"upserts":[{"file":"slug.md","name":"...","description":"...","type":"user|feedback|project|reference","body":"..."}],"deletes":["obsolete.md"],"summary":"short audit summary"}',
     `Limits: upserts<=${MAX_UPSERTS}, deletes<=${MAX_DELETES}, each body<=${MAX_BODY_CHARS} chars, aggregate bodies<=${MAX_TOTAL_BODY_CHARS} chars.`,
     'Only delete a file when its durable facts are preserved elsewhere or clearly obsolete. A no-op is valid: empty arrays.',
+    'The summary must describe memory changes only. Never mention the model, system prompt, billing, or internal implementation.',
     '',
     '<current_memory_json>',
     JSON.stringify(memory.rendered),

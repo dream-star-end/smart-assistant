@@ -45,6 +45,14 @@ describe('bridge API allowlist', () => {
       '/api/agents/:id/memory/:target',
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report', 'GET')?.label,
+      '/api/agents/:id/auto-dream-report',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report', 'POST'),
+      null,
+    )
+    assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'DELETE')?.label,
       '/api/agents/:id/skills/:name',
     )
@@ -166,6 +174,10 @@ describe('bridge API allowlist', () => {
     assert.equal(matchCommercialContainerApiProxy('/api/agents/main/message', 'POST'), null)
     assert.equal(matchCommercialContainerApiProxy('/api/agents/main/delegate', 'POST'), null)
     assert.equal(matchCommercialContainerApiProxy('/api/agents/main/anything', 'GET'), null)
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report/extra', 'GET'),
+      null,
+    )
     assert.equal(matchCommercialContainerApiProxy('/api/agent-teams/dev_team/run', 'POST'), null)
     // finalize 不代理（只容器内 leader MCP 调；用户请求由 commercial block 表 403）。
     assert.equal(matchCommercialContainerApiProxy('/api/team-runs/trun-abc/finalize', 'POST'), null)

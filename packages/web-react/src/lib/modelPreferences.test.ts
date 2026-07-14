@@ -64,12 +64,22 @@ describe("model preferences", () => {
       enabled: true,
       effective: true,
       minimum_plan_code: "max",
-      model_id: "deepseek-v4-flash",
-      model_name: "DeepSeek V4 Flash",
       min_interval_hours: 24,
       min_new_sessions: 5,
     };
     expect(extractAutoDreamFeature({ prefs: {}, features: { auto_dream: feature } })).toEqual(feature);
+    expect(
+      extractAutoDreamFeature({
+        prefs: {},
+        features: {
+          auto_dream: {
+            ...feature,
+            model_id: "must-not-leak",
+            model_name: "Must Not Leak",
+          },
+        },
+      }),
+    ).toEqual(feature);
     expect(extractAutoDreamFeature({ prefs: {} })).toBeNull();
   });
 });

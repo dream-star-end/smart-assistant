@@ -1,7 +1,14 @@
-import { Check, ChevronRight, Loader2, Plus, Trash2 } from "lucide-react";
+import { Check, ChevronRight, Loader2, MoonStar, Plus, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import type { AuthSession, MemoryFileMeta, MemoryIndexResponse } from "../../lib/types";
+import type {
+  AuthSession,
+  AutoDreamLastReport,
+  AutoDreamMemoryChange,
+  AutoDreamReportResponse,
+  MemoryFileMeta,
+  MemoryIndexResponse,
+} from "../../lib/types";
 import { cn, relativeTime } from "../../lib/utils";
 import { Alert, Badge, Button, Input, Modal, PanelHeader, Textarea, useConfirm } from "../ui";
 
@@ -124,6 +131,7 @@ function CoreMemorySection({
   picker?: React.ReactNode;
 }) {
   const [index, setIndex] = useState<MemoryIndexResponse | null>(null);
+  const [dream, setDream] = useState<AutoDreamReportResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [editing, setEditing] = useState<MemoryFileMeta | null>(null);
@@ -133,6 +141,7 @@ function CoreMemorySection({
   const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
   useEffect(() => {
+    void reloadKey;
     let alive = true;
     setLoading(true);
     setErr(null);
@@ -146,6 +155,23 @@ function CoreMemorySection({
       })
       .finally(() => {
         if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, agentId, reloadKey]);
+
+  // 梦境报告是附加可感知结果：旧容器滚动升级或临时失败时不阻断核心记忆本身。
+  useEffect(() => {
+    void reloadKey;
+    let alive = true;
+    api
+      .getAutoDreamReport(auth, agentId)
+      .then((d) => {
+        if (alive) setDream(d);
+      })
+      .catch(() => {
+        if (alive) setDream(null);
       });
     return () => {
       alive = false;
@@ -169,6 +195,7 @@ function CoreMemorySection({
           {err}
         </Alert>
       )}
+      {dream && <AutoDreamReportCard value={dream} files={files} onOpenMemory={setEditing} />}
       {loading ? (
         <LoadingRow />
       ) : (
@@ -236,6 +263,148 @@ function CoreMemorySection({
         />
       )}
     </div>
+  );
+}
+
+const DREAM_ACTION_META: Record<
+  AutoDreamMemoryChange["action"],
+  { label: string; className: string }
+> = {
+  created: { label: "新增", className: "border-success/25 bg-success-soft text-success" },
+  updated: { label: "更新", className: "border-accent/25 bg-accent-soft text-accent" },
+  deleted: { label: "清理", className: "border-border bg-hover text-faint" },
+};
+
+function AutoDreamReportCard({
+  value,
+  files,
+  onOpenMemory,
+}: {
+  value: AutoDreamReportResponse;
+  files: MemoryFileMeta[];
+  onOpenMemory: (file: MemoryFileMeta) => void;
+}) {
+  const report = value.lastReport;
+  const running = value.status === "running";
+  const changes = report ? [...report.created, ...report.updated, ...report.deleted] : [];
+  const total = changes.length;
+
+  return (
+    <section
+      aria-label="Auto-Dream 梦境报告"
+      className="mt-3 overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-soft"
+    >
+      <div className="flex items-start gap-3 px-3.5 py-3">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-sm">
+          {running ? <Loader2 size={17} className="animate-spin" /> : <MoonStar size={17} />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="text-[13px] font-semibold text-fg">Auto‑Dream 梦境报告</span>
+            {running ? (
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-accent">
+                <Sparkles size={11} /> 正在整理近期对话
+              </span>
+            ) : report ? (
+              <span className="text-[11px] text-faint">{relativeTime(report.finishedAt)}</span>
+            ) : null}
+          </div>
+          {running ? (
+            <p className="mt-1 text-[12px] leading-relaxed text-muted">
+              正在提炼值得长期保留的信息。完成后会在这里显示变化，并发送一封站内梦境报告。
+            </p>
+          ) : report ? (
+            <DreamReportResult report={report} total={total} />
+          ) : (
+            <p className="mt-1 text-[12px] leading-relaxed text-muted">
+              尚未生成梦境报告。满足触发条件并完成一次整理后，这里会显示实际结果。
+            </p>
+          )}
+          {!running && value.pendingSessions > 0 && (
+            <p className="mt-1.5 text-[11px] text-faint">
+              下一次整理已积累 {value.pendingSessions >= 101 ? "至少 101" : value.pendingSessions}{" "}
+              个新会话。
+            </p>
+          )}
+        </div>
+      </div>
+
+      {!running && changes.length > 0 && (
+        <ul className="border-t border-accent/15 bg-surface/65 px-3.5 py-2.5">
+          {changes.map((change, index) => {
+            const meta =
+              change.action === "deleted"
+                ? undefined
+                : files.find((file) => file.file === change.file);
+            const action = DREAM_ACTION_META[change.action];
+            const title = change.file.replace(/\.md$/i, "");
+            const content = (
+              <>
+                <span
+                  className={cn(
+                    "rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                    action.className,
+                  )}
+                >
+                  {action.label}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12px] font-medium text-fg">{title}</span>
+                  <span className="mt-0.5 block truncate font-mono text-[10.5px] text-faint">
+                    {change.file}
+                  </span>
+                </span>
+                {meta && <ChevronRight size={14} className="shrink-0 text-faint" />}
+              </>
+            );
+            return (
+              <li key={`${change.action}:${change.file}:${index}`}>
+                {meta ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenMemory(meta)}
+                    className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {content}
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-2 px-1.5 py-1.5">{content}</div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function DreamReportResult({ report, total }: { report: AutoDreamLastReport; total: number }) {
+  if (report.status === "failed") {
+    const outcome = report.summary === "整理被中断，无法确认记忆是否发生变化，请查看记忆列表。"
+      ? report.summary
+      : "本次整理未完成，记忆没有改动。";
+    return (
+      <>
+        <p className="mt-1 text-[12px] font-medium text-warning">{outcome}</p>
+        <p className="mt-1 text-[11px] text-faint">已参考 {report.sessionsReviewed} 个近期会话。</p>
+      </>
+    );
+  }
+  return (
+    <>
+      <p className="mt-1 text-[12px] leading-relaxed text-muted">
+        {total === 0
+          ? "已完成检查，没有发现值得长期保存的新信息。"
+          : `已新增 ${report.created.length} 条、更新 ${report.updated.length} 条、清理 ${report.deleted.length} 条记忆。`}
+      </p>
+      {report.summary?.trim() && (
+        <p className="mt-1 line-clamp-2 text-[11.5px] leading-relaxed text-faint">
+          {report.summary}
+        </p>
+      )}
+      <p className="mt-1 text-[11px] text-faint">已参考 {report.sessionsReviewed} 个近期会话。</p>
+    </>
   );
 }
 
@@ -632,7 +801,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
     } finally {
       setSaving(false);
     }
-  }, [auth, agentId, text, baseline.text, baseline.version]);
+  }, [auth, agentId, text, baseline.version]);
 
   return (
     <div className="px-5 py-4">
