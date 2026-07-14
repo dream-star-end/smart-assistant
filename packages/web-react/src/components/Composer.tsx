@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
@@ -268,8 +269,13 @@ export function Composer({
             ))}
           </div>
         )}
-        <div className="flex items-end gap-1.5 px-2.5 py-2">
+        <div
+          className="flex items-end gap-1.5 px-2.5 py-2"
+          data-product-entry-scope="composer-primary"
+          data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+        >
           <input
+            data-product-feature={PRODUCT_CAPABILITIES.files.id}
             ref={fileRef}
             type="file"
             multiple
@@ -277,6 +283,7 @@ export function Composer({
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           <IconButton
+            data-product-feature={PRODUCT_CAPABILITIES.files.id}
             aria-label="添加附件"
             title={onUpload ? "添加附件" : "附件暂不可用"}
             disabled={!onUpload || disabled}
@@ -286,6 +293,7 @@ export function Composer({
             <Plus size={20} />
           </IconButton>
           <textarea
+            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             ref={ref}
             rows={1}
             value={value}
@@ -304,6 +312,7 @@ export function Composer({
             className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
           />
           <IconButton
+            data-product-feature={PRODUCT_CAPABILITIES.voice.id}
             aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
             title={voiceEnabled ? (voice.state === "recording" ? "停止录音" : "语音输入") : "语音输入暂不可用"}
             disabled={!voiceEnabled || disabled || voice.state === "transcribing"}
@@ -320,6 +329,7 @@ export function Composer({
           </IconButton>
           <button
             type="button"
+            data-product-control
             aria-label={busy ? "停止" : "发送"}
             onClick={() => (busy ? onStop?.() : submit())}
             disabled={(!canSend && !busy) || disabled}

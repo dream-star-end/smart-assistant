@@ -1,4 +1,9 @@
 import { useEffect, useRef } from "react";
+import {
+  PRODUCT_CAPABILITIES,
+  isProductFeatureId,
+  type ProductFeatureId,
+} from "../lib/productCapabilities";
 import type { Session } from "../lib/types";
 
 /**
@@ -18,11 +23,12 @@ import type { Session } from "../lib/types";
  *   恢复正常判定）。恢复未决期间 URL 深链优先于最近会话（holdAutoSelect）。
  * - popstate：按 URL 切会话（/s/<id> 且会话存在 → selectSession；已删除的死条目 →
  *   清选中 + replaceState 修正 URL；/ → 清选中回空会话态）。
- * - 面板深链 `?panel=settings|market|manage`：boot 由 App 在 useState 初始化时读取
- *   （parsePanelParam），打开/关闭经本 hook replaceState 同步回 query（面板不压栈）。
+ * - 面板深链 `?panel=settings|market|manage|org|help`：boot 由 App 在 useState 初始化时读取
+ *   （parsePanelParam）；教程另带稳定 `topic`。打开/关闭经本 hook replaceState 同步回 query
+ *   （面板不压栈，且保留其他无关 query）。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
-export type PanelParam = "settings" | "market" | "manage" | "org";
+export type PanelParam = "settings" | "market" | "manage" | "org" | "help";
 
 /** `/s/<id>` → 会话 id（形态对齐后端 peer.id 约束 `[A-Za-z0-9_-]`；不匹配返回 null）。 */
 export function parseSessionPath(pathname: string): string | null {
@@ -33,7 +39,30 @@ export function parseSessionPath(pathname: string): string | null {
 /** `?panel=` → 面板名（未知值一律当没有，防深链打开不存在的面板）。 */
 export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
   const v = sp.get("panel");
-  return v === "settings" || v === "market" || v === "manage" || v === "org" ? v : null;
+  return v === "settings" || v === "market" || v === "manage" || v === "org" || v === "help"
+    ? v
+    : null;
+}
+
+/** `?panel=help&topic=` → 稳定教程 id；非 help / 未知 id 返回 null。 */
+export function parseTutorialTopic(sp: URLSearchParams): ProductFeatureId | null {
+  if (parsePanelParam(sp) !== "help") return null;
+  const topic = sp.get("topic");
+  return isProductFeatureId(topic) ? topic : null;
+}
+
+/** 保留其他 query；非 help 时清 topic，help 的空/未知 topic 规范化为默认教程。 */
+export function withPanelParams(
+  input: URLSearchParams,
+  panel: PanelParam | null,
+  topic?: ProductFeatureId | null,
+): URLSearchParams {
+  const next = new URLSearchParams(input);
+  if (panel) next.set("panel", panel);
+  else next.delete("panel");
+  if (panel === "help") next.set("topic", topic ?? PRODUCT_CAPABILITIES.chatBasics.id);
+  else next.delete("topic");
+  return next;
 }
 
 export type UseAppRouteOptions = {
@@ -51,13 +80,17 @@ export type UseAppRouteOptions = {
   selectSession: (id: string) => void;
   /** popstate 回到 `/`：清除选中（回空会话态）。 */
   onPopToRoot: () => void;
-  /** 当前打开的面板（App 派生；同开多个时取单一优先级 settings > market > manage）。 */
+  /** 当前打开的面板（App 派生；顶层中心互斥并按单一优先级镜像）。 */
   activePanel: PanelParam | null;
+  /** help 打开时的当前教程；其他面板忽略。 */
+  activeTopic?: ProductFeatureId | null;
+  /** popstate 反灌面板/query（外部 help 深链恢复时使用）。 */
+  onPopPanel?: (panel: PanelParam | null, topic: ProductFeatureId | null) => void;
 };
 
 export function useAppRoute(opts: UseAppRouteOptions): void {
   const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts;
-  const { activePanel } = opts;
+  const { activePanel, activeTopic } = opts;
   // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
   const cbRef = useRef(opts);
   cbRef.current = opts;
@@ -68,6 +101,8 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     if (!enabled) return;
     const onPop = () => {
       if (!cbRef.current.inWorkspace) return;
+      const query = new URLSearchParams(location.search);
+      cbRef.current.onPopPanel?.(parsePanelParam(query), parseTutorialTopic(query));
       const id = parseSessionPath(location.pathname);
       if (id) {
         if (cbRef.current.sessions.some((s) => s.id === id)) {
@@ -137,12 +172,10 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
   // no-op 保参；登出后面板关闭 → 参数即时清理。
   useEffect(() => {
     if (!enabled) return;
-    const sp = new URLSearchParams(location.search);
-    const cur = parsePanelParam(sp);
-    if (cur === activePanel) return;
-    if (activePanel) sp.set("panel", activePanel);
-    else sp.delete("panel");
-    const q = sp.toString();
+    const current = new URLSearchParams(location.search);
+    const next = withPanelParams(current, activePanel, activeTopic);
+    const q = next.toString();
+    if (q === current.toString()) return;
     history.replaceState({}, "", location.pathname + (q ? `?${q}` : "") + location.hash);
-  }, [enabled, activePanel]);
+  }, [enabled, activePanel, activeTopic]);
 }

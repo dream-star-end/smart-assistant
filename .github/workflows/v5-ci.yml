@@ -38,11 +38,14 @@ jobs:
             run: npm run test:storage
             timeout: 15
           - name: web-react
-            run: npm run test:web-react
+            run: npm run check:tutorials && npm run test:web-react
             timeout: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 教程审计门禁要读取 PR/push 前的可信历史，验证 JSONL 只能追加。
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -54,6 +57,8 @@ jobs:
         run: npm ci
 
       - name: Run ${{ matrix.name }}
+        env:
+          TUTORIAL_HISTORY_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: ${{ matrix.run }}
 
   commercial-unit:

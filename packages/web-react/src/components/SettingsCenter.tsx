@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { api, apiErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from "../lib/productCapabilities";
 import {
   type AutoDreamFeatureView,
   type PrefsView,
@@ -18,13 +19,13 @@ import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Spinner, Tabs } from "./ui";
 
-type Section = "account" | "usage" | "preferences" | "feedback" | "about";
+export type SettingsSection = "account" | "usage" | "preferences" | "feedback" | "about";
 
-const SECTIONS: { id: Section; label: string }[] = [
-  { id: "account", label: "账户与计费" },
-  { id: "usage", label: "用量" },
-  { id: "preferences", label: "偏好" },
-  { id: "feedback", label: "反馈" },
+const SECTIONS: { id: SettingsSection; label: string; featureId?: ProductFeatureId }[] = [
+  { id: "account", label: "账户与计费", featureId: PRODUCT_CAPABILITIES.billing.id },
+  { id: "usage", label: "用量", featureId: PRODUCT_CAPABILITIES.billing.id },
+  { id: "preferences", label: "偏好", featureId: PRODUCT_CAPABILITIES.preferences.id },
+  { id: "feedback", label: "反馈", featureId: PRODUCT_CAPABILITIES.feedback.id },
   { id: "about", label: "关于" },
 ];
 
@@ -48,6 +49,7 @@ export function SettingsCenter({
   onRefreshMe,
   onPreferencesChange,
   onOpenMemory,
+  initialSection = "account",
 }: {
   open: boolean;
   auth: AuthSession | null;
@@ -63,8 +65,10 @@ export function SettingsCenter({
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
   /** 从 Auto-Dream 偏好卡跳转到管理中心的记忆/梦境报告。 */
   onOpenMemory: () => void;
+  /** 教程等外部入口可直达具体分区；普通设置入口默认账户页。 */
+  initialSection?: SettingsSection;
 }) {
-  const [section, setSection] = useState<Section>("account");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [subOpen, setSubOpen] = useState(false);
   const [ledgerReload, setLedgerReload] = useState(0);
 
@@ -76,11 +80,13 @@ export function SettingsCenter({
 
   // 关闭面板：复位分区与瞬态（避免重开残留）。
   useEffect(() => {
-    if (!open) {
+    if (open) {
+      setSection(initialSection);
+    } else {
       setSection("account");
       setSubOpen(false);
     }
-  }, [open]);
+  }, [open, initialSection]);
 
   // 偏好分区懒加载 prefs。
   // 注意：依赖数组**绝不能含 prefsLoading**——effect 自身 setPrefsLoading(true) 会改它，
@@ -156,8 +162,8 @@ export function SettingsCenter({
               <Tabs
                 aria-label="设置分区"
                 value={section}
-                onValueChange={(v) => setSection(v as Section)}
-                items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
+                onValueChange={(v) => setSection(v as SettingsSection)}
+                items={SECTIONS.map((s) => ({ value: s.id, label: s.label, featureId: s.featureId }))}
                 className="min-w-max [&_[role=tab]]:px-3"
               />
             </div>
@@ -169,42 +175,55 @@ export function SettingsCenter({
             ) : (
               <>
                 {section === "account" && (
-                  <AccountTab
-                    auth={auth}
-                    user={user}
-                    onManageSub={() => setSubOpen(true)}
-                    reloadKey={ledgerReload}
-                    onRefreshMe={onRefreshMe}
-                  />
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
+                    <AccountTab
+                      auth={auth}
+                      user={user}
+                      onManageSub={() => setSubOpen(true)}
+                      reloadKey={ledgerReload}
+                      onRefreshMe={onRefreshMe}
+                    />
+                  </div>
                 )}
 
-                {section === "usage" && <UsageTab auth={auth} />}
+                {section === "usage" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
+                    <UsageTab auth={auth} />
+                  </div>
+                )}
 
-                {section === "preferences" &&
-                  (prefsLoading || !prefs ? (
-                    <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
-                      {prefsErr ? (
-                        <span className="text-danger">{prefsErr}</span>
-                      ) : (
-                        <>
-                          <Spinner /> 加载偏好…
-                        </>
-                      )}
-                    </div>
-                  ) : (
-                    <PreferencesTab
-                      auth={auth}
-                      prefs={prefs}
-                      autoDream={autoDream}
-                      theme={theme}
-                      onSetTheme={onSetTheme}
-                      onPatch={patchPref}
-                      onUpgrade={() => setSubOpen(true)}
-                      onOpenMemory={onOpenMemory}
-                    />
-                  ))}
+                {section === "preferences" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
+                    {prefsLoading || !prefs ? (
+                      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+                        {prefsErr ? (
+                          <span className="text-danger">{prefsErr}</span>
+                        ) : (
+                          <>
+                            <Spinner /> 加载偏好…
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <PreferencesTab
+                        auth={auth}
+                        prefs={prefs}
+                        autoDream={autoDream}
+                        theme={theme}
+                        onSetTheme={onSetTheme}
+                        onPatch={patchPref}
+                        onUpgrade={() => setSubOpen(true)}
+                        onOpenMemory={onOpenMemory}
+                      />
+                    )}
+                  </div>
+                )}
 
-                {section === "feedback" && <FeedbackTab auth={auth} />}
+                {section === "feedback" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.feedback.id}>
+                    <FeedbackTab auth={auth} />
+                  </div>
+                )}
 
                 {section === "about" && <AboutSection />}
               </>

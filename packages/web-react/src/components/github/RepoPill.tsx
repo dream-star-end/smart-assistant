@@ -1,4 +1,5 @@
 import { formatRepoLabel, type RepoDot } from "../../lib/github";
+import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import type { RepoSelection } from "../../lib/types";
 import { cn } from "../../lib/utils";
 
@@ -50,6 +51,7 @@ export function RepoPill({
   return (
     <button
       type="button"
+      data-product-feature={PRODUCT_CAPABILITIES.github.id}
       onClick={onClick}
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}
       title={sel ? `${sel.owner}/${sel.repo} @ ${sel.branch}` : "关联 GitHub 仓库"}

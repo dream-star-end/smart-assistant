@@ -1,6 +1,7 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { BrowsePanel } from './marketplace/BrowsePanel'
@@ -44,10 +45,10 @@ export function MarketplaceCenter({
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
-  const tabs: { value: MarketplaceTab; label: string }[] = [
-    { value: 'browse', label: '发现' },
-    { value: 'installed', label: '已安装' },
-    { value: 'publish', label: '发布' },
+  const tabs: { value: MarketplaceTab; label: string; featureId?: ProductFeatureId }[] = [
+    { value: 'browse', label: '发现', featureId: PRODUCT_CAPABILITIES.marketplace.id },
+    { value: 'installed', label: '已安装', featureId: PRODUCT_CAPABILITIES.marketplace.id },
+    { value: 'publish', label: '发布', featureId: PRODUCT_CAPABILITIES.publish.id },
     ...(isAdmin ? [{ value: 'review' as const, label: '审核' }] : []),
   ]
   // admin 关闭时若停在 review，回落到 browse。
@@ -90,7 +91,7 @@ export function MarketplaceCenter({
               aria-label="市场分区"
               value={safeTab}
               onValueChange={(v) => onTabChange(v as MarketplaceTab)}
-              items={tabs.map((t) => ({ value: t.value, label: t.label }))}
+              items={tabs.map((t) => ({ value: t.value, label: t.label, featureId: t.featureId }))}
             />
           </div>
 
@@ -100,7 +101,7 @@ export function MarketplaceCenter({
             ) : (
               <>
                 {safeTab === 'browse' && (
-                  <div className="flex flex-col">
+                  <div className="flex flex-col" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>
                     <div className="flex gap-1 px-4 pt-3">
                       {(['skill', 'agent', 'connector'] as const).map((k) => (
                         <button
@@ -127,14 +128,18 @@ export function MarketplaceCenter({
                   </div>
                 )}
                 {safeTab === 'installed' && (
-                  <InstalledPanel
-                    auth={auth}
-                    onGoBrowse={() => onTabChange('browse')}
-                    onOpenConnectors={onOpenConnectors}
-                  />
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>
+                    <InstalledPanel
+                      auth={auth}
+                      onGoBrowse={() => onTabChange('browse')}
+                      onOpenConnectors={onOpenConnectors}
+                    />
+                  </div>
                 )}
                 {safeTab === 'publish' && (
-                  <PublishPanel auth={auth} onCreateInChat={onCreateInChat} />
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.publish.id}>
+                    <PublishPanel auth={auth} onCreateInChat={onCreateInChat} />
+                  </div>
                 )}
                 {safeTab === 'review' && isAdmin && <ReviewPanel auth={auth} />}
               </>

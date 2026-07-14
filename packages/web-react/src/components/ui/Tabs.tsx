@@ -1,9 +1,12 @@
 import { type KeyboardEvent, type ReactNode, useRef } from "react";
+import type { ProductFeatureId } from "../../lib/productCapabilities";
 import { cn } from "../../lib/utils";
 
 export interface TabItem {
   value: string;
   label: ReactNode;
+  /** 顶层用户能力入口；教程契约 checker 会验证它与 catalog/action/target 的对应关系。 */
+  featureId?: ProductFeatureId;
 }
 
 /**
@@ -56,6 +59,7 @@ export function Tabs({
             }}
             type="button"
             role="tab"
+            data-product-feature={it.featureId}
             aria-selected={active}
             tabIndex={active ? 0 : -1}
             onClick={() => onValueChange(it.value)}

@@ -1,0 +1,332 @@
+{
+  "capabilities": {
+    "agents": {
+      "contentHash": "960d76fc609c8d968d8b75cc486824de68fa969634d7311f45fa86f5da397177",
+      "contentVersion": 1,
+      "mediaHash": "a538cfaed5263e948b2483439018ed333ea5d87934a4be53feae1c8aa438723e",
+      "mediaKey": "agents",
+      "mediaVersion": 1,
+      "registryHash": "94e8049f80ed0fcaca43608b1796cdd361d6f8dbb0fcb9a10b3e86121eb5aea6",
+      "sourceHash": "670869de8b346129afb86d30a3786103cb04396d235ca29cb8225be22ccf237f"
+    },
+    "artifacts-download": {
+      "contentHash": "7cea135d242d13a168612cf7f86080c0afac474c1c9e1160f8cc549a5193758e",
+      "contentVersion": 1,
+      "mediaHash": "f1ac57ca72e1cac6cb49b56ec9225f3265b86f791aee967aa6eb52ed386bb5dc",
+      "mediaKey": "research",
+      "mediaVersion": 1,
+      "registryHash": "60f71929b1b4a3a38611c575b5b906becb708bfe3578987be8873ec427ab245b",
+      "sourceHash": "4f9e97367abfb1aadaf20d0ab5210973ebda689b49bb2d55d52b1ba4eba49c40"
+    },
+    "billing-usage": {
+      "contentHash": "ee57de680f6cce2edc9126ac67f20e3415ff12eb2177f04e4362ebfa4f181e2b",
+      "contentVersion": 1,
+      "mediaHash": "27ff5a0a9e91d83f3629541d22b1e48c9674410fde8d458c00f2ad553f3cd6cf",
+      "mediaKey": "settings",
+      "mediaVersion": 1,
+      "registryHash": "7df12d4762b37530312c1a0af52a058e29e2c362d9600d5deb8a741100037930",
+      "sourceHash": "55fae3502716d8fc5c552e29df7abee14e107ebe880a7714fe21ca90c5bdd286"
+    },
+    "chat-basics": {
+      "contentHash": "df5d1a7fd8ec3296b2650b0eea8d7e9eb33fc3e4880e99df085df0a48ef3052d",
+      "contentVersion": 1,
+      "mediaHash": "553a4a88e19189a0d32b34e3b3c7b1be562cd4429217e483da49b19fdc6e70d9",
+      "mediaKey": "workspace",
+      "mediaVersion": 1,
+      "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
+      "sourceHash": "b30b43f0b1ff1f094e7c85d76c5bf4e289977096cd22e9490aa3624d21950300"
+    },
+    "connectors": {
+      "contentHash": "f957dcbfc771d756349ad0891a2ece061bee710e4120e487118bcc280ee84db8",
+      "contentVersion": 1,
+      "mediaHash": "0a29eacf733f44bf46d4f990ae3893d5c42ab2424b902fdbc58c1be26ae46f78",
+      "mediaKey": "manage",
+      "mediaVersion": 1,
+      "registryHash": "f28eb9b5a5e50b5e907f3867f331c100a80df727a69ea50043e74555dbaff7c5",
+      "sourceHash": "a8ac569bb6e22e46bc82339860125096462b4efa16ca458b9451abb3d7488d55"
+    },
+    "feedback-support": {
+      "contentHash": "4f57681803edd77d80cc26a73e73e30e9908f5d130badc2907c7db2c6434dba1",
+      "contentVersion": 1,
+      "mediaHash": "27ff5a0a9e91d83f3629541d22b1e48c9674410fde8d458c00f2ad553f3cd6cf",
+      "mediaKey": "settings",
+      "mediaVersion": 1,
+      "registryHash": "06b635f667df212565e73986d193397de5a01db705957c6db54e919c567701ca",
+      "sourceHash": "11cbeaf53df875a58364971ef85cc16d408c05f23ae21ed97606a374bd8a89b3"
+    },
+    "files-media": {
+      "contentHash": "547b5d2cde9ec0b422918bb6bf2ae807a3e83058da90a8d5d0e5ee4d1b040859",
+      "contentVersion": 1,
+      "mediaHash": "d11e3eb0e6934d7dbb0d40d2f6a245a1dff91948ecf9b11694789bbf5d9c7755",
+      "mediaKey": "composer",
+      "mediaVersion": 1,
+      "registryHash": "a4788dc8e858a3a4a7fea3d3871867574bc6482b8dd239b053d234321febc305",
+      "sourceHash": "ad1f4a147a6ad4a7eb345289401ee98baac7a50032a1adfe9fbe8075cb22f122"
+    },
+    "github-repository": {
+      "contentHash": "0607118b9f7d3dcb95f6e0f48bebe43d49319ca7537acc54db87d948b0bb3001",
+      "contentVersion": 1,
+      "mediaHash": "f443129bc402b16ff46bccd54a8525a0ce0b93d44b5252d85d8671723c9cad4d",
+      "mediaKey": "github",
+      "mediaVersion": 1,
+      "registryHash": "d2a4d08cdbe9fe8f304ce573f8c818d55007b22f60680c6f5225b59cfc4b6d40",
+      "sourceHash": "cc265cbe1ea3ed091edeae373a3d101017d7cc080ed139de87eb4daee2f1fdd8"
+    },
+    "image-create-edit": {
+      "contentHash": "aba5ded746fb07ca8b142ade42db3be60555b166df34bd831080a82958c91ca6",
+      "contentVersion": 1,
+      "mediaHash": "d11e3eb0e6934d7dbb0d40d2f6a245a1dff91948ecf9b11694789bbf5d9c7755",
+      "mediaKey": "composer",
+      "mediaVersion": 1,
+      "registryHash": "4933b3c325a324213a0a3214712bea30aa3e9d6bec7926dd0ac5bb0d46072e36",
+      "sourceHash": "0088b921da07d070500617e3e490db527a3697c0e4c86eb6eb1b362b20f98d99"
+    },
+    "inbox": {
+      "contentHash": "bf7514893791a41b8af94113f33c5d4267e9bb5a95b38b6948fdc989f74f153a",
+      "contentVersion": 1,
+      "mediaHash": "27ff5a0a9e91d83f3629541d22b1e48c9674410fde8d458c00f2ad553f3cd6cf",
+      "mediaKey": "settings",
+      "mediaVersion": 1,
+      "registryHash": "a8a5a10f6db81c8adae5e129d9df1b6d8165d09edcbab9c7ac845ae833303d15",
+      "sourceHash": "3312fd9f864f5b01cd3896b661c02dbbe305c71b34081c3efeeefc2a39d188d9"
+    },
+    "marketplace-discovery": {
+      "contentHash": "7cc03345fa698997b0d28be1d383b639ca472f9b4da0b79e86e629ffe84861c2",
+      "contentVersion": 1,
+      "mediaHash": "4d39aaaeab3befa91910faecb79d5aa389b263e16b56646725df606296b4c14b",
+      "mediaKey": "market",
+      "mediaVersion": 1,
+      "registryHash": "f0d6cab99cf8e5d4d6c0d6a31a71644f6561131a682a9d2d7f3765fe5106674b",
+      "sourceHash": "cebab499c5996b7e1504455cff99c223a017bb61da463901e845c309e4ded8d0"
+    },
+    "marketplace-publishing": {
+      "contentHash": "7e42470767723135a2d710beae048a780714b4d5bd9567fe8578b1184d80a4b3",
+      "contentVersion": 1,
+      "mediaHash": "4d39aaaeab3befa91910faecb79d5aa389b263e16b56646725df606296b4c14b",
+      "mediaKey": "market",
+      "mediaVersion": 1,
+      "registryHash": "15579d20598d9c879cf2f42b9258ee8229fbd1bcc7993be389e27982f8346ca4",
+      "sourceHash": "7b1ce6928d4255e8e27218baacc72eba219beb9220f01d22d7b865c52e1b3c9f"
+    },
+    "memory-auto-dream": {
+      "contentHash": "22be402e0b3dd15dfc572bf471546ba36989ec43fe1fe62d6d2a783c2c63df2f",
+      "contentVersion": 1,
+      "mediaHash": "0a29eacf733f44bf46d4f990ae3893d5c42ab2424b902fdbc58c1be26ae46f78",
+      "mediaKey": "manage",
+      "mediaVersion": 1,
+      "registryHash": "d6eedd237f502594cdeabe6703344d61ca8d511710e70ed1b9a56e2827d33fee",
+      "sourceHash": "f23cc60d57e26c9fc3fcaff78e4018a3df5b235da3bc29858555f94ee496c9f0"
+    },
+    "models-reasoning": {
+      "contentHash": "af8354890ca5b1bfc1e11e80c22c0bd18e250e5512dd36a149be8fd67aeb3b95",
+      "contentVersion": 1,
+      "mediaHash": "553a4a88e19189a0d32b34e3b3c7b1be562cd4429217e483da49b19fdc6e70d9",
+      "mediaKey": "workspace",
+      "mediaVersion": 1,
+      "registryHash": "e7810af073bb4425162754c943fdd589c374280ccb614bf6e17596eac69ca180",
+      "sourceHash": "2891793bcabb8b95185a61a2202e3ee56df4d63978a81fdec32ad9c192ed11f3"
+    },
+    "organization": {
+      "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
+      "contentVersion": 1,
+      "mediaHash": "af8a270f33c12005cc2e05f6c9698f749128327434066d70a3c38100aae62d11",
+      "mediaKey": "organization",
+      "mediaVersion": 1,
+      "registryHash": "a3f5cc6541c0312420474feb09df4b7660b9fee476444ab0c69da1b64bf88fd8",
+      "sourceHash": "1f4997e3b02b9a531a7d8ba266dac1b03826feb676fc80dd809eeab168f9655f"
+    },
+    "preferences": {
+      "contentHash": "aba2ad9a181e7ffb0922e396969ca3d7444a39a3565d11bc0b8733cfb869eec7",
+      "contentVersion": 1,
+      "mediaHash": "27ff5a0a9e91d83f3629541d22b1e48c9674410fde8d458c00f2ad553f3cd6cf",
+      "mediaKey": "settings",
+      "mediaVersion": 1,
+      "registryHash": "b773ea726b08ce32161d1826096be03c535f7a40ccad1d0f2c15d8bca6d8c1fa",
+      "sourceHash": "0227ef8a04d1a96d200dfc7187cc066095369c889c0954f18fa4b65f7cb65a0c"
+    },
+    "schedules-reminders": {
+      "contentHash": "70c6af6fd0bb5907002a9d146ed90c79e12772420562ee479f9666036323f224",
+      "contentVersion": 1,
+      "mediaHash": "0a29eacf733f44bf46d4f990ae3893d5c42ab2424b902fdbc58c1be26ae46f78",
+      "mediaKey": "manage",
+      "mediaVersion": 1,
+      "registryHash": "7bd425366e0f70cbf2e087a5e133fd7e2b6a4c1bb789b629d26e9580f6f4bde9",
+      "sourceHash": "0db3c91088d3624505a2389dd17e59063ec14b5a2a62f0ed694559a0dbf8b449"
+    },
+    "sessions-history": {
+      "contentHash": "0d4a08748c9825467bf419eff3beada0edbf8c291968e268d7be4244a3a73082",
+      "contentVersion": 1,
+      "mediaHash": "553a4a88e19189a0d32b34e3b3c7b1be562cd4429217e483da49b19fdc6e70d9",
+      "mediaKey": "workspace",
+      "mediaVersion": 1,
+      "registryHash": "35fab636ddeba4b50639aa74096f650b5c342fa42457f15dd7e8265ed9c42828",
+      "sourceHash": "c2f6416ce7ce176da93c3cf35196b0644b1ebaaefaf2166c73bdf4b63a7a2a1a"
+    },
+    "skills-training": {
+      "contentHash": "36464b94bc095874eeecac794cd79180dfc36ca2038e332318107ba37957b9fa",
+      "contentVersion": 1,
+      "mediaHash": "0a29eacf733f44bf46d4f990ae3893d5c42ab2424b902fdbc58c1be26ae46f78",
+      "mediaKey": "manage",
+      "mediaVersion": 1,
+      "registryHash": "8a53ced07b08480a052d6a3cd4e63e74341c8944a071aa1a47f49c8e2aa75772",
+      "sourceHash": "8c96d6795b7d66ae763ee8282c023b1844e1ffc8cbd9fc286c3e9cdefa61f7f7"
+    },
+    "team-mode": {
+      "contentHash": "3b14d189479c17dc6c7ce1e8f69aeaedc61610cf613e6502a6835284f19228d6",
+      "contentVersion": 1,
+      "mediaHash": "a538cfaed5263e948b2483439018ed333ea5d87934a4be53feae1c8aa438723e",
+      "mediaKey": "agents",
+      "mediaVersion": 1,
+      "registryHash": "b72bb329d18eb6d2bc79156b0b78af40408734514e3e711c176ae71a04c0132a",
+      "sourceHash": "02557b0c171777754ce472becfb4241eb2560f8aa78aa02e5f24bbddaa5b5584"
+    },
+    "voice-input": {
+      "contentHash": "aef09ecd06aeee417563768cbe18bdc12aceede8626548205cc977c004d946cf",
+      "contentVersion": 1,
+      "mediaHash": "d11e3eb0e6934d7dbb0d40d2f6a245a1dff91948ecf9b11694789bbf5d9c7755",
+      "mediaKey": "composer",
+      "mediaVersion": 1,
+      "registryHash": "bc6e3626e99cea857c0173706af3cb95a69bd1218643e3d1b6313378acd760e2",
+      "sourceHash": "5f3d1944740360612e2744d4f009d9bb80eb434b032f30eeaaebd7034383138d"
+    },
+    "web-research": {
+      "contentHash": "56485d7bc19de494c557aa9e4cd2c3d8b7659589f49ffb6b8847acbe909a7c68",
+      "contentVersion": 1,
+      "mediaHash": "f1ac57ca72e1cac6cb49b56ec9225f3265b86f791aee967aa6eb52ed386bb5dc",
+      "mediaKey": "research",
+      "mediaVersion": 1,
+      "registryHash": "0d442d5e7699292d2eab309437af6525b131b17b1ac12949456b98a850881664",
+      "sourceHash": "b5692bea7cab32117b2b161943bc1b456195df3f92f17edfc481010de6dcd636"
+    }
+  },
+  "catalogSchema": 1,
+  "media": {
+    "agents": {
+      "caption": "切换专业智能体，或开启团队模式让多位专家协作。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/agents.webp",
+      "posterBytes": 16656,
+      "posterSha256": "ce51e7c28a407ec7cc1adb5cd4b0e6354b0e6f1b8c81ac3185a9c0a3982b20fd",
+      "version": 1,
+      "video": "/tutorials/agents.webm",
+      "videoBytes": 21879,
+      "videoSha256": "198830cab7fa1a10de12557e11c497417b0a9c96d1a051365b091861d6c8375a",
+      "width": 960
+    },
+    "composer": {
+      "caption": "从输入框添加附件、语音或图片，再把任务交给助手。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/composer.webp",
+      "posterBytes": 27146,
+      "posterSha256": "35e5ddc53a5139a3487cfbeccbb749ecae41934380151d712acc073640dfa8a1",
+      "version": 1,
+      "video": "/tutorials/composer.webm",
+      "videoBytes": 42852,
+      "videoSha256": "a87c640b004847c53124e1d0efbb5432ed855651ba686e07bd4202a8b2ab361d",
+      "width": 960
+    },
+    "github": {
+      "caption": "授权 GitHub，选择仓库和分支，再让助手在真实代码上工作。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/github.webp",
+      "posterBytes": 20586,
+      "posterSha256": "d43389332b8208b0b406c41d14f1710cfee85a2812c303c6d2f06220aaebc3aa",
+      "version": 1,
+      "video": "/tutorials/github.webm",
+      "videoBytes": 34051,
+      "videoSha256": "945caa97292df396119a5164e678257ce4609038b50c34642387e652604477ae",
+      "width": 960
+    },
+    "manage": {
+      "caption": "在管理中心查看记忆、定时任务、技能、连接器和文献库。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/manage.webp",
+      "posterBytes": 21288,
+      "posterSha256": "48f0699c4bd20fabd541db97c7785ebba20ea06db5dc5fdc21bc1dfa8c5e1c35",
+      "version": 1,
+      "video": "/tutorials/manage.webm",
+      "videoBytes": 48831,
+      "videoSha256": "da7a1abffae945aedc0e27d1c01021e56b5c5dab7560ccbc16a78846106642a4",
+      "width": 960
+    },
+    "market": {
+      "caption": "浏览、安装、更新并发布市场里的技能与智能体。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/market.webp",
+      "posterBytes": 20692,
+      "posterSha256": "7f80ca4136a8a99b75eb05092397feec1cdca5289afbf6aacd96b4e4464d0e29",
+      "version": 1,
+      "video": "/tutorials/market.webm",
+      "videoBytes": 49589,
+      "videoSha256": "6fba82a3d1f47b8952481e448a28ab56e7f9ef42fb56ecef4ffbd38605250c3e",
+      "width": 960
+    },
+    "organization": {
+      "caption": "创建组织并管理成员、席位、共享积分、报表与发票。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/organization.webp",
+      "posterBytes": 21692,
+      "posterSha256": "28afe580f97ca09d5943cd0ec97ea91c4688be48600b802fc4bc983078d4ad06",
+      "version": 1,
+      "video": "/tutorials/organization.webm",
+      "videoBytes": 49201,
+      "videoSha256": "94239fc6846639ae57779f16b2d12876ad3e5e161a7bd177d0cad801251bfb6e",
+      "width": 960
+    },
+    "research": {
+      "caption": "让助手联网调研、核对来源并把文献沉淀进资料库。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/research.webp",
+      "posterBytes": 21650,
+      "posterSha256": "dabdcbc45738682d9ebbf17f59dbc1dd50fbeca9ff0fd1931814cc7518ba08a4",
+      "version": 1,
+      "video": "/tutorials/research.webm",
+      "videoBytes": 50324,
+      "videoSha256": "c02c73162079f56b7b374639e2905d42422aeb75f91b7d19227742501bfb7efb",
+      "width": 960
+    },
+    "settings": {
+      "caption": "在设置里管理账户、用量、偏好、API Key 与反馈。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/settings.webp",
+      "posterBytes": 19890,
+      "posterSha256": "ea33118437234eec2d0fcc91230e4b994c58346d26157a6dc36d5a5d9684bb82",
+      "version": 1,
+      "video": "/tutorials/settings.webm",
+      "videoBytes": 48291,
+      "videoSha256": "f03d928a43b4de5d3fac9a80e6a1783e9cd7c17f0663c357025dd64727aab6ca",
+      "width": 960
+    },
+    "workspace": {
+      "caption": "在 Aurora 工作区里新建会话、选择模型并发送任务。",
+      "codec": "VP8",
+      "durationSeconds": 3.25,
+      "height": 540,
+      "poster": "/tutorials/workspace.webp",
+      "posterBytes": 22896,
+      "posterSha256": "366cf8cafd11dc867f49acf34e5a97dc3d9b38a16a9df96f48b75f4e81e18813",
+      "version": 1,
+      "video": "/tutorials/workspace.webm",
+      "videoBytes": 35070,
+      "videoSha256": "cd112ca3201b3572e219824aa4d5d2154e779a0e12c7600f086a6d0ae7d6a466",
+      "width": 960
+    }
+  },
+  "schema": 1
+}

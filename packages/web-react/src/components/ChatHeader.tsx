@@ -1,7 +1,8 @@
-import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, BookOpen, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
@@ -25,6 +26,7 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
+  onOpenTutorial,
   unreadCount,
   theme,
   onCycleTheme,
@@ -55,6 +57,8 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
+  /** 打开与真实功能联动的教程中心。 */
+  onOpenTutorial?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   theme: Theme;
@@ -66,25 +70,29 @@ export function ChatHeader({
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
   const engineLabel = teamEngineLabel(models ?? []);
   return (
-    <header className="flex h-14 shrink-0 items-center gap-1 px-3 pb-2.5 header-safe-t">
+    <header
+      className="flex h-14 shrink-0 items-center gap-1 px-3 pb-2.5 header-safe-t"
+      data-product-entry-scope="chat-header"
+    >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
-        <IconButton onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">
+        <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">
           <Menu size={18} />
         </IconButton>
       )}
       {/* 桌面折叠态：展开 + 新建（仅 md+，移动端用抽屉）。 */}
       {sidebarCollapsed && (
         <div className="hidden items-center gap-1 md:flex">
-          <IconButton onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
+          <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
             <PanelLeft size={18} />
           </IconButton>
-          <IconButton onClick={onNew} aria-label="新建会话" shape="square">
+          <IconButton data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id} onClick={onNew} aria-label="新建会话" shape="square">
             <PenSquare size={18} />
           </IconButton>
         </div>
       )}
       <button
+        data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
         className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
       >
@@ -102,6 +110,7 @@ export function ChatHeader({
           <PopoverTrigger asChild>
             <button
               type="button"
+              data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
               aria-label="团队模式已开启"
               className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
             >
@@ -116,6 +125,7 @@ export function ChatHeader({
             </p>
             {onDisableTeamMode && (
               <Button
+                data-product-control
                 size="sm"
                 variant="secondary"
                 className="mt-2.5 w-full"
@@ -140,9 +150,20 @@ export function ChatHeader({
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+        {onOpenTutorial && (
+          <IconButton
+            data-product-control
+            onClick={onOpenTutorial}
+            aria-label="打开使用教程"
+            title="使用教程"
+            shape="square"
+          >
+            <BookOpen size={18} />
+          </IconButton>
+        )}
         {onOpenInbox && (
           <div className="relative">
-            <IconButton onClick={onOpenInbox} aria-label="站内信" shape="square">
+            <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
             {!!unreadCount && unreadCount > 0 && (
@@ -154,6 +175,7 @@ export function ChatHeader({
         )}
         {credits != null && (
           <button
+            data-product-feature={PRODUCT_CAPABILITIES.billing.id}
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"

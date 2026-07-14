@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from "../lib/productCapabilities";
 import type { AuthSession } from "../lib/types";
 import { CronPanel } from "./manage/CronPanel";
 import { LibraryPanel } from "./manage/LibraryPanel";
@@ -10,12 +11,12 @@ import { Tabs } from "./ui";
 
 export type ManageTab = "memory" | "cron" | "skills" | "connectors" | "library";
 
-const TABS: { id: ManageTab; label: string }[] = [
-  { id: "memory", label: "记忆" },
-  { id: "cron", label: "定时任务" },
-  { id: "skills", label: "技能" },
-  { id: "connectors", label: "连接器" },
-  { id: "library", label: "文献库" },
+const TABS: { id: ManageTab; label: string; featureId: ProductFeatureId }[] = [
+  { id: "memory", label: "记忆", featureId: PRODUCT_CAPABILITIES.memory.id },
+  { id: "cron", label: "定时任务", featureId: PRODUCT_CAPABILITIES.schedules.id },
+  { id: "skills", label: "技能", featureId: PRODUCT_CAPABILITIES.skills.id },
+  { id: "connectors", label: "连接器", featureId: PRODUCT_CAPABILITIES.connectors.id },
+  { id: "library", label: "文献库", featureId: PRODUCT_CAPABILITIES.research.id },
 ];
 
 /**
@@ -69,7 +70,7 @@ export function ManageCenter({
               aria-label="管理分区"
               value={tab}
               onValueChange={(v) => onTabChange(v as ManageTab)}
-              items={TABS.map((t) => ({ value: t.id, label: t.label }))}
+              items={TABS.map((t) => ({ value: t.id, label: t.label, featureId: t.featureId }))}
             />
           </div>
 
@@ -78,13 +79,31 @@ export function ManageCenter({
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : (
               <>
-                {tab === "memory" && <MemoryPanel auth={auth} agentId={agentId} agents={agents} />}
-                {tab === "cron" && <CronPanel auth={auth} />}
-                {tab === "skills" && <SkillsPanel auth={auth} />}
-                {tab === "connectors" && (
-                  <ConnectorsTab auth={auth} onOpenMarketplace={onOpenMarketplace} />
+                {tab === "memory" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                    <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
+                  </div>
                 )}
-                {tab === "library" && <LibraryPanel auth={auth} />}
+                {tab === "cron" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.schedules.id}>
+                    <CronPanel auth={auth} />
+                  </div>
+                )}
+                {tab === "skills" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
+                    <SkillsPanel auth={auth} />
+                  </div>
+                )}
+                {tab === "connectors" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
+                    <ConnectorsTab auth={auth} onOpenMarketplace={onOpenMarketplace} />
+                  </div>
+                )}
+                {tab === "library" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
+                    <LibraryPanel auth={auth} />
+                  </div>
+                )}
               </>
             )}
           </div>

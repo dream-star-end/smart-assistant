@@ -3,6 +3,7 @@ import {
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
 } from "@openclaude/protocol";
 import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
 import {
@@ -89,6 +90,7 @@ export function ModelSelector({
       <DropdownMenuTrigger asChild>
         <button
           type="button"
+          data-product-feature={PRODUCT_CAPABILITIES.models.id}
           disabled={disabled}
           aria-label="选择对话模型"
           className={cn(

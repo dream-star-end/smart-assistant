@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
+import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { AgentAvatar } from './AgentAvatar'
@@ -85,6 +86,7 @@ export function AgentPicker({
       >
         <button
           type="button"
+          data-product-feature={PRODUCT_CAPABILITIES.agents.id}
           onClick={() => onPick(defaultAgent)}
           className={cn(
             'flex w-full items-start gap-3 p-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
@@ -120,7 +122,12 @@ export function AgentPicker({
                 开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
               </span>
             </span>
-            <Switch checked={teamMode} onCheckedChange={onToggleTeamMode} aria-label="启用团队模式" />
+            <Switch
+              data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
+              checked={teamMode}
+              onCheckedChange={onToggleTeamMode}
+              aria-label="启用团队模式"
+            />
           </div>
         )}
       </div>
@@ -132,6 +139,7 @@ export function AgentPicker({
           return (
             <button
               type="button"
+              data-product-feature={PRODUCT_CAPABILITIES.agents.id}
               key={a.id}
               onClick={() => onPick(a)}
               className={cn(
@@ -159,6 +167,7 @@ export function AgentPicker({
         {onAddFromMarket && (
           <button
             type="button"
+            data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
             onClick={onAddFromMarket}
             className="group flex items-center justify-center gap-2 rounded-xl border border-dashed border-border p-3.5 text-[13.5px] text-muted outline-none transition-colors hover:border-accent/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >

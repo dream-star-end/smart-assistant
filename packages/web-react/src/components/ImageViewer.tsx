@@ -26,6 +26,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { nativeDownload, openInNewTab, saveBlob } from '../lib/chat/download'
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import { byteCacheKey, isMediaSignedUrl } from '../lib/chat/imageBytes'
 import { type ResolveSignedSrc, fetchImageBlobWithResign } from '../lib/chat/media'
 import { useProgressiveImage } from '../lib/chat/useProgressiveImage'
@@ -140,16 +141,19 @@ function ActionButton({
   onClick,
   disabled,
   reason,
+  featureId,
 }: {
   label: string
   icon: React.ReactNode
   onClick: () => void
   disabled?: boolean
   reason?: string
+  featureId?: ProductFeatureId
 }) {
   return (
     <button
       type="button"
+      data-product-feature={featureId}
       onClick={onClick}
       disabled={disabled}
       title={disabled ? reason : label}
@@ -483,6 +487,7 @@ export function ImageViewer({
                   <Dialog.Close asChild>
                     <button
                       type="button"
+                      data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
                       aria-label="关闭预览"
                       title="关闭 (Esc)"
                       className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
@@ -582,6 +587,7 @@ export function ImageViewer({
                 {!readOnly && <div className="flex shrink-0 items-start justify-center gap-3 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:gap-6">
                   <ActionButton
                     label="编辑"
+                    featureId={PRODUCT_CAPABILITIES.images.id}
                     icon={<Pencil size={20} />}
                     disabled={!submitImageEdit}
                     reason={editDisabledReason}
