@@ -663,6 +663,8 @@ export interface SubprocessRunnerOpts {
   skillEvalExclude?: string
   /** Skill-eval 'draft' arm:以草稿目录替换该技能。 */
   skillEvalDraft?: { name: string; dir: string }
+  /** V5 Auto-Dream one-shot isolation profile (CCB only). */
+  hermeticNoTools?: boolean
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -730,6 +732,10 @@ export interface CcbCliArgsInput {
    * (currently only `'cron'`).
    */
   workload?: string
+  /** V5 Auto-Dream one-shot: no ambient prompt, filesystem context, tools, MCPs or resume. */
+  hermeticNoTools?: boolean
+  /** Explicit bare-mode settings containing only the env-backed apiKeyHelper. */
+  settingsFile?: string
 }
 
 /**
@@ -759,6 +765,8 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     resumeSessionId,
     restrictedMemorySources,
     workload,
+    hermeticNoTools,
+    settingsFile,
   } = input
   const args: string[] = [
     runtime === 'bun' ? 'run' : '--experimental-strip-types',
@@ -770,7 +778,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     '--verbose',
   ]
   if (model) args.push('--model', model)
-  if (permissionMode) {
+  if (!hermeticNoTools && permissionMode) {
     args.push('--permission-mode', permissionMode)
     // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正放行所有工具
     if (permissionMode === 'bypassPermissions') {
@@ -781,17 +789,21 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   // emits `can_use_tool` control_requests on stdout that the gateway bridges
   // to the web frontend. Required even under bypassPermissions for
   // interactive tools like AskUserQuestion.
-  args.push('--permission-prompt-tool', 'stdio')
+  if (!hermeticNoTools) args.push('--permission-prompt-tool', 'stdio')
+  if (hermeticNoTools) {
+    args.push('--bare', '--tools', '', '--strict-mcp-config')
+    if (settingsFile) args.push('--settings', settingsFile)
+  }
   // Single merged prompt file: persona + identity + platform + skills + memory
   // (Cannot pass --append-system-prompt-file twice; Commander takes last value only)
-  if (extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
+  if (!hermeticNoTools && extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
   // Wire up MCP memory/skills/search server
   if (mcpConfigFile) args.push('--mcp-config', mcpConfigFile)
-  if (addDir) args.push('--add-dir', addDir)
-  if (resumeSessionId) args.push('--resume', resumeSessionId)
+  if (!hermeticNoTools && addDir) args.push('--add-dir', addDir)
+  if (!hermeticNoTools && resumeSessionId) args.push('--resume', resumeSessionId)
   // v3 商业版用户容器: 只允许 User memory(=平台 baseline ro mount), Project/Local 全跳过。
   // 见 CcbCliArgsInput.restrictedMemorySources 注释。
-  if (restrictedMemorySources) args.push('--setting-sources', 'user')
+  if (!hermeticNoTools && restrictedMemorySources) args.push('--setting-sources', 'user')
   // CCB `--workload <tag>` is a hidden CLI flag intended for SDK daemon
   // callers that spawn CCB for background work (cron / scheduled tasks).
   // The tag is wrapped around every turn via runWithWorkload() in print.ts
@@ -1026,7 +1038,7 @@ export class SubprocessRunner extends EventEmitter {
     // _boundRepoBinding 只在 ready 时记录,recycle 决策(sessionManager.recyclePeerForRepoChange)
     // 据此判断是否 cwd-version 错位。
     let repoSnapshot: RepoSnapshot | null = null
-    if (this.opts.sessionId && this.opts.getRepoSnapshot) {
+    if (!this.opts.hermeticNoTools && this.opts.sessionId && this.opts.getRepoSnapshot) {
       try {
         repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
       } catch (err) {
@@ -1052,7 +1064,12 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
-    let learningContext: { extraPromptFile?: string; mcpConfigFile?: string }
+    let learningContext: {
+      extraPromptFile?: string
+      mcpConfigFile?: string
+      settingsFile?: string
+      workingDir?: string
+    }
     try {
       learningContext = await this.buildLearningContext(repoSnapshot)
     } catch (err) {
@@ -1076,6 +1093,8 @@ export class SubprocessRunner extends EventEmitter {
       // hostStaticProviders.isV3ContainerRuntime(注释/语义见该函数 JSDoc)。
       restrictedMemorySources: isV3ContainerRuntime(),
       workload: this.opts.workload,
+      hermeticNoTools: this.opts.hermeticNoTools,
+      settingsFile: learningContext.settingsFile,
     })
 
     // ── Provider-aware auth injection ──
@@ -1118,12 +1137,12 @@ export class SubprocessRunner extends EventEmitter {
         ccbBinaryDir: ccbDir,
         // Docker /workspace mount + Local --add-dir 内容统一用 effectiveAddDir;
         // ready 时是 repo workspaceDir,其它情况 = agentBaseDir。
-        workspaceHostDir: effectiveAddDir,
+        workspaceHostDir: learningContext.workingDir ?? effectiveAddDir,
         // Phase 5:Local 模式子进程的真 cwd。Docker 模式 backend 忽略此字段
         // (容器 cwd 由 -w /workspace 控制,与 workspaceHostDir 同源)。
         // 这样 CCB 启动后 process.cwd() 就直接指向项目目录,STATE.cwd
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
-        subprocessCwd: effectiveAddDir,
+        subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
           ...process.env,
           ...providerEnv,
@@ -1563,8 +1582,15 @@ export class SubprocessRunner extends EventEmitter {
   private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null): Promise<{
     extraPromptFile?: string
     mcpConfigFile?: string
+    settingsFile?: string
+    workingDir?: string
   }> {
-    const out: { extraPromptFile?: string; mcpConfigFile?: string } = {}
+    const out: {
+      extraPromptFile?: string
+      mcpConfigFile?: string
+      settingsFile?: string
+      workingDir?: string
+    } = {}
     // Use mkdtempSync for a unique per-run directory: prevents a restarted runner
     // for the same sessionKey from racing with the old runner's shutdown cleanup.
     // Clean up any previous session directory before creating a new one
@@ -1573,6 +1599,25 @@ export class SubprocessRunner extends EventEmitter {
     const safeDirName = this.opts.sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')
     const sessionDir = mkdtempSync(resolve(tmpdir(), `openclaude-${safeDirName}-`))
     this.sessionDir = sessionDir
+
+    if (this.opts.hermeticNoTools) {
+      const mcpPath = resolve(sessionDir, 'mcp-config.json')
+      const settingsPath = resolve(sessionDir, 'settings.json')
+      writeFileSync(mcpPath, JSON.stringify({ mcpServers: {} }), { mode: 0o600 })
+      // --bare deliberately ignores ANTHROPIC_AUTH_TOKEN as an auth source.
+      // Restore the existing commercial bearer through an explicit flag
+      // setting without copying its value into argv or onto disk.
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ apiKeyHelper: `printf '%s' "$ANTHROPIC_AUTH_TOKEN"` }),
+        { mode: 0o600 },
+      )
+      return {
+        mcpConfigFile: mcpPath,
+        settingsFile: settingsPath,
+        workingDir: sessionDir,
+      }
+    }
 
     // Resolve provider/toolset-scoped MCP availability before building the
     // prompt, so provider hints only mention tools that will really exist.

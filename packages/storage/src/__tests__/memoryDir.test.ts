@@ -232,6 +232,20 @@ describe('MemoryDir — write 三态 + 文件名校验', () => {
     assert.ok(!r.ok && 'conflict' in r, '对不存在文件的版本化写返回冲突')
   })
 
+  it('write expectedVersion=null 是 create-only CAS,并发创建后拒绝覆盖', async () => {
+    const md = new MemoryDir('write-create-only-agent')
+    const file = 'new-fact-0001.md'
+
+    const created = await md.write(file, FM('new', '首次创建', '原始内容'), null)
+    assert.ok(created.ok, '文件不存在时 create-only CAS 成功')
+
+    const conflicted = await md.write(file, FM('new', '错误覆盖', '不应落盘'), null)
+    assert.ok(!conflicted.ok && 'conflict' in conflicted, '文件已存在时 create-only CAS 冲突')
+    const current = await md.read(file)
+    assert.ok(current?.content.includes('原始内容'), '保留首次创建内容')
+    assert.ok(!current?.content.includes('不应落盘'), '冲突内容未写盘')
+  })
+
   it('非法文件名:write/read/remove 全部拒绝', async () => {
     const md = new MemoryDir('illegal-agent')
     const bad = [
@@ -264,5 +278,90 @@ describe('MemoryDir — write 三态 + 文件名校验', () => {
     assert.ok(!idx.includes(`memory/${file}`), '索引行已剔除')
 
     assert.equal(await md.remove(file), false, '再次删除返回 false')
+  })
+
+  it('removeIfVersion:陈旧版本不删除,当前版本才删除', async () => {
+    const md = new MemoryDir('remove-cas-agent')
+    const file = 'delete-cas-0001.md'
+    const created = await md.write(file, FM('delete-cas', '待删', '版本一'))
+    assert.ok(created.ok)
+    const v1 = created.ok ? created.version : ''
+    const updated = await md.write(file, FM('delete-cas', '待删', '版本二'), v1)
+    assert.ok(updated.ok)
+
+    const stale = await md.removeIfVersion(file, v1)
+    assert.ok(!stale.ok && 'conflict' in stale, '陈旧版本删除被拒绝')
+    assert.ok((await md.read(file))?.content.includes('版本二'), '最新内容仍在盘上')
+
+    const currentVersion = updated.ok ? updated.version : ''
+    const removed = await md.removeIfVersion(file, currentVersion)
+    assert.deepEqual(removed, { ok: true, removed: true })
+    assert.equal(await md.read(file), null, '匹配当前版本后文件被删除')
+  })
+
+  it('applyBatchCas:先校验全部版本,任一冲突时零文件被修改', async () => {
+    const md = new MemoryDir('batch-conflict-agent')
+    const a1 = await md.write('a.md', FM('a', 'a', 'A1'))
+    const b1 = await md.write('b.md', FM('b', 'b', 'B1'))
+    assert.ok(a1.ok && b1.ok)
+    const a2 = await md.write('a.md', FM('a', 'a', 'A2'), a1.ok ? a1.version : '')
+    assert.ok(a2.ok)
+
+    const result = await md.applyBatchCas({
+      upserts: [
+        { file: 'a.md', content: FM('a', 'a', 'AUTO-A'), expectedVersion: a1.ok ? a1.version : '' },
+        { file: 'b.md', content: FM('b', 'b', 'AUTO-B'), expectedVersion: b1.ok ? b1.version : '' },
+      ],
+      deletes: [],
+    })
+    assert.ok(!result.ok && 'conflict' in result)
+    assert.ok((await md.read('a.md'))?.content.includes('A2'))
+    assert.ok((await md.read('b.md'))?.content.includes('B1'))
+    assert.ok(!(await md.read('b.md'))?.content.includes('AUTO-B'))
+  })
+
+  it('applyBatchCas:更新/新建/删除作为一个批次提交', async () => {
+    const md = new MemoryDir('batch-success-agent')
+    const a = await md.write('a.md', FM('a', 'a', 'A1'))
+    const b = await md.write('b.md', FM('b', 'b', 'B1'))
+    assert.ok(a.ok && b.ok)
+    const result = await md.applyBatchCas({
+      upserts: [
+        { file: 'a.md', content: FM('a', 'a', 'A2'), expectedVersion: a.ok ? a.version : '' },
+        { file: 'c.md', content: FM('c', 'c', 'C1'), expectedVersion: null },
+      ],
+      deletes: [{ file: 'b.md', expectedVersion: b.ok ? b.version : '' }],
+    })
+    assert.deepEqual(result, { ok: true })
+    assert.ok((await md.read('a.md'))?.content.includes('A2'))
+    assert.ok((await md.read('c.md'))?.content.includes('C1'))
+    assert.equal(await md.read('b.md'), null)
+  })
+
+  it('prepared batch journal is rolled back before any read after a process crash', async () => {
+    const agentId = 'batch-recovery-agent'
+    const md = new MemoryDir(agentId)
+    const created = await md.write('a.md', FM('a', 'a', 'ORIGINAL'))
+    assert.ok(created.ok)
+    const original = (await md.read('a.md'))?.content ?? ''
+    const indexOriginal = await readFile(md.indexPath(), 'utf8')
+
+    // Simulate a crash after the prepare journal and two partial mutations.
+    await writeFile(paths.agentMemoryBatchJournal(agentId), JSON.stringify({
+      schemaVersion: 1,
+      phase: 'prepared',
+      indexOriginal,
+      entries: [
+        { file: 'a.md', original },
+        { file: 'new.md', original: null },
+      ],
+    }))
+    await writeFile(paths.agentMemoryFile(agentId, 'a.md'), FM('a', 'a', 'PARTIAL'))
+    await writeFile(paths.agentMemoryFile(agentId, 'new.md'), FM('new', 'new', 'PARTIAL-NEW'))
+
+    assert.ok((await md.read('a.md'))?.content.includes('ORIGINAL'))
+    assert.equal(await md.read('new.md'), null)
+    assert.equal(await readFile(md.indexPath(), 'utf8'), indexOriginal)
+    assert.equal(existsSync(paths.agentMemoryBatchJournal(agentId)), false)
   })
 })

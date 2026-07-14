@@ -9,8 +9,10 @@ import {
   getClientSession,
   getMaxTurnIdx,
   indexTurn,
+  MemoryDir,
   reserveTurnIndex,
   paths,
+  type KernelFileLock,
   upsertSessionMeta,
 } from '@openclaude/storage'
 // M0 engine 适配层:CCB 私有件(parser/telemetry/auth 分类)已下沉 CcbAdapter,
@@ -1735,6 +1737,8 @@ export class SessionManager {
     skillEvalMode?: boolean
     skillEvalExclude?: string
     skillEvalDraft?: { name: string; dir: string }
+    /** V5 Auto-Dream one-shot isolation profile (CCB only). */
+    hermeticNoTools?: boolean
     /** delegate 子会话计费归因(仅 handleDelegateTask 设置)→ runner
      *  CLAUDE_CODE_EXTRA_METADATA env → master 计费点落
      *  usage_records.mode/parent_session_id/delegate_agent_id。
@@ -1809,7 +1813,9 @@ export class SessionManager {
     // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
     // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
     const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd()
-    const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
+    const persona = opts.hermeticNoTools
+      ? undefined
+      : opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
     const repoSessionId = opts.repoSessionId ?? opts.peerId
     // M0/M1a engine 适配层:runner 构造收口到 registry factory。
     //   - executionModel / engineId 已在函数头部一次收口(见上方注释)——
@@ -1832,7 +1838,9 @@ export class SessionManager {
       // (resume-map 按 engine 维度隔离,防 codex thread_id 与 CCB session_id
       // 互喂)。_resumeIdFor also drops the entry silently when the CCB JSONL
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
-      resumeSessionId: this._resumeIdFor(opts.sessionKey, engineId),
+      resumeSessionId: opts.hermeticNoTools
+        ? undefined
+        : this._resumeIdFor(opts.sessionKey, engineId),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -1845,6 +1853,7 @@ export class SessionManager {
       skillEvalExclude: opts.skillEvalExclude,
       skillEvalDraft: opts.skillEvalDraft,
       usageAttribution: opts.usageAttribution,
+      hermeticNoTools: opts.hermeticNoTools,
     })
     const now = Date.now()
     const session: AgentSession = {
@@ -2110,6 +2119,7 @@ export class SessionManager {
 
     const prev = session.lock
     let release!: () => void
+    let memoryTurnBarrier: KernelFileLock | undefined
     session.lock = new Promise<void>((r) => (release = r))
     // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
     // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
@@ -2123,6 +2133,14 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      // V5 native Write/Edit bypasses MemoryDir's userspace CAS lock. Hold a
+      // shared kernel barrier for the complete foreground turn so Auto-Dream's
+      // exclusive batch/recovery can neither overwrite nor roll back a live
+      // model edit. The hermetic Auto-Dream model turn has no tools/memory and
+      // must release before its later exclusive apply phase.
+      if (isCommercialManagedRuntime() && session.channel !== 'auto-dream') {
+        memoryTurnBarrier = await new MemoryDir(session.agentId).acquireSharedBarrier()
+      }
       // V3 S12e CG8 — contract C(best-effort)stash latest turn trace on runner
       // so that ANY re-spawn triggered inside this turn — effort/model change
       // shutdown(下方 effortChanged/modelChanged 分支)、phantom restart
@@ -2400,6 +2418,7 @@ export class SessionManager {
         throw err
       }
     } finally {
+      await memoryTurnBarrier?.release().catch(() => {})
       // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 --。
       // 配对的 ++ 在 submit() 头部。`?? 0` 容忍字段缺失:历史 session 对象 /
       // 测试 fake / 未来误删初始化的场景。`Math.max(0, n - 1)` 是 defense-in-
@@ -3283,27 +3302,29 @@ export class SessionManager {
             // and across provider switches, while ccbSessionId rotates and
             // would split one logical session's history into multiple rows
             // — also breaking getMaxTurnIdx() lookup on resume.
-            const sessId = session.sessionKey
-            Promise.all([
-              upsertSessionMeta({
-                id: sessId,
-                agentId: session.agentId,
-                channel: session.channel,
-                peerId: session.peerId,
-                title: session.title,
-                startedAt: session.startedAt,
-                lastAt: Date.now(),
-                turnCount: session.turns,
-                totalCostUSD: session.totalCostUSD,
-              }),
-              indexTurn(sessId, session.turns, session.currentUserText ?? '', completedAssistant.text),
-            ]).catch((err) =>
-              log.error(
-                'FTS5 index failed',
-                { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
-                err,
-              ),
-            )
+            if (session.channel !== 'auto-dream') {
+              const sessId = session.sessionKey
+              Promise.all([
+                upsertSessionMeta({
+                  id: sessId,
+                  agentId: session.agentId,
+                  channel: session.channel,
+                  peerId: session.peerId,
+                  title: session.title,
+                  startedAt: session.startedAt,
+                  lastAt: Date.now(),
+                  turnCount: session.turns,
+                  totalCostUSD: session.totalCostUSD,
+                }),
+                indexTurn(sessId, session.turns, session.currentUserText ?? '', completedAssistant.text),
+              ]).catch((err) =>
+                log.error(
+                  'FTS5 index failed',
+                  { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
+                  err,
+                ),
+              )
+            }
 
             // ── Phase 0.1: persist server-authored assistant message ──
             // Write the authoritative assistant text into the client_sessions

@@ -74,6 +74,19 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_sessions_last_at ON sessions_meta(last_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions_meta(agent_id);
 
+    -- Success-only cadence authority for V5 Auto-Dream. sessions_meta is
+    -- intentionally not reused: it is written before terminal errors are
+    -- evaluated and therefore contains failed sessions too.
+    CREATE TABLE IF NOT EXISTS auto_dream_success_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      completed_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_auto_dream_success_agent_seq
+      ON auto_dream_success_events(agent_id, seq);
+
     -- Crash-safe allocator for user-visible turn ids.  FTS rows are written
     -- after a model result and therefore cannot reserve the id of an
     -- interrupted turn (or a completed turn whose async index write has not
@@ -465,6 +478,105 @@ export interface SessionMeta {
   lastAt: number
   turnCount: number
   totalCostUSD: number
+}
+
+export interface AutoDreamSuccessfulSession {
+  seq: number
+  id: string
+  agentId: string
+  channel: string
+  completedAt: number
+}
+
+/** Persisted only from the signed, proven-success gateway terminal hook. */
+export async function recordAutoDreamSuccessfulSession(input: {
+  agentId: string
+  sessionId: string
+  channel: string
+  completedAt: number
+}): Promise<number> {
+  const db = await getSessionsDb()
+  const result = db.prepare(`
+    INSERT INTO auto_dream_success_events (agent_id, session_id, channel, completed_at)
+    VALUES (@agentId, @sessionId, @channel, @completedAt)
+  `).run(input)
+  return Number(result.lastInsertRowid)
+}
+
+/**
+ * Capture a monotonic upper sequence, then return the first occurrence of
+ * each distinct successful session inside that closed sequence interval.
+ * Inserts racing after the capture have a larger seq and remain for next run.
+ */
+export async function scanAutoDreamSuccessfulSessions(opts: {
+  agentId: string
+  channels: readonly string[]
+  afterSeq?: number
+  limit?: number
+}): Promise<{ sessions: AutoDreamSuccessfulSession[]; throughSeq: number }> {
+  const channels = [...new Set(opts.channels.filter(Boolean))]
+  if (channels.length === 0) return { sessions: [], throughSeq: Math.max(0, opts.afterSeq ?? 0) }
+  const limit = Math.max(1, Math.min(100, Math.floor(opts.limit ?? 32)))
+  const afterSeq = Math.max(0, Math.floor(opts.afterSeq ?? 0))
+  const db = await getSessionsDb()
+  const placeholders = channels.map(() => '?').join(',')
+  const upperRow = db.prepare(
+    `SELECT COALESCE(MAX(seq), 0) AS seq
+       FROM auto_dream_success_events
+      WHERE agent_id = ?
+        AND channel IN (${placeholders})`,
+  ).get(opts.agentId, ...channels) as { seq: number }
+  const throughSeq = Math.max(afterSeq, Number(upperRow.seq) || 0)
+  if (throughSeq <= afterSeq) return { sessions: [], throughSeq }
+  const rows = db.prepare(
+    `WITH first_events AS (
+       SELECT session_id, MIN(seq) AS seq
+         FROM auto_dream_success_events
+        WHERE agent_id = ?
+          AND channel IN (${placeholders})
+          AND seq > ?
+          AND seq <= ?
+        GROUP BY session_id
+     )
+     SELECT e.seq, e.session_id, e.agent_id, e.channel, e.completed_at
+       FROM first_events f
+       JOIN auto_dream_success_events e ON e.seq = f.seq
+      ORDER BY e.seq ASC
+      LIMIT ?`,
+  ).all(
+    opts.agentId,
+    ...channels,
+    afterSeq,
+    throughSeq,
+    limit,
+  ) as Array<{
+    seq: number
+    session_id: string
+    agent_id: string
+    channel: string
+    completed_at: number
+  }>
+  return {
+    sessions: rows.map((row) => ({
+      seq: row.seq,
+      id: row.session_id,
+      agentId: row.agent_id,
+      channel: row.channel,
+      completedAt: row.completed_at,
+    })),
+    throughSeq,
+  }
+}
+
+/** Best-effort compaction after the durable state watermark has advanced. */
+export async function pruneAutoDreamSuccessEvents(
+  agentId: string,
+  throughSeq: number,
+): Promise<void> {
+  const db = await getSessionsDb()
+  db.prepare(
+    `DELETE FROM auto_dream_success_events WHERE agent_id = ? AND seq <= ?`,
+  ).run(agentId, Math.max(0, Math.floor(throughSeq)))
 }
 
 export async function upsertSessionMeta(meta: SessionMeta): Promise<void> {

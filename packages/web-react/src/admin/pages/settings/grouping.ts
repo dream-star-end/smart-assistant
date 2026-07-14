@@ -30,6 +30,7 @@ const GROUP_LABELS: Record<string, string> = {
   memory: "记忆",
   skill: "技能",
   research: "科研",
+  auto: "自动化",
 };
 
 const OTHER_ID = "__other__";

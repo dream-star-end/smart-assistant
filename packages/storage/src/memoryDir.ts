@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
+import { acquireKernelFileLock, type KernelFileLock } from './kernelFileLock.js'
 import { acquireFileLock, scanMemoryContent } from './memoryShared.js'
 import { paths } from './paths.js'
 
@@ -45,6 +46,35 @@ type WriteResult =
   | { ok: true; version: string }
   | { ok: false; conflict: { current: string; version: string } }
   | { ok: false; error: string }
+
+export type RemoveIfVersionResult =
+  | { ok: true; removed: boolean }
+  | { ok: false; conflict: { current: string; version: string } }
+  | { ok: false; error: string }
+
+export interface MemoryBatchUpsert {
+  file: string
+  content: string
+  /** null means create-only; a string requires an exact content version. */
+  expectedVersion: string | null
+}
+
+export interface MemoryBatchDelete {
+  file: string
+  expectedVersion: string
+}
+
+export type MemoryBatchResult =
+  | { ok: true }
+  | { ok: false; conflict: { file: string; current: string; version: string } }
+  | { ok: false; error: string }
+
+interface MemoryBatchJournal {
+  schemaVersion: 1
+  phase: 'prepared' | 'committed'
+  indexOriginal: string
+  entries: Array<{ file: string; original: string | null }>
+}
 
 /** sha256 前 16 位十六进制:内容指纹,用于乐观并发 version。空串也可算(确定值)。 */
 function sha16(s: string): string {
@@ -127,12 +157,75 @@ export class MemoryDir {
     return paths.agentMemoryLock(this.agentId)
   }
 
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+  private batchJournalPath(): string {
+    return paths.agentMemoryBatchJournal(this.agentId)
+  }
+
+  private async withFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const release = await acquireFileLock(this.lockPath())
     try {
       return await fn()
     } finally {
       await release()
+    }
+  }
+
+  private async batchJournalExists(): Promise<boolean> {
+    try {
+      await stat(this.batchJournalPath())
+      return true
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw err
+    }
+  }
+
+  private async recoverBatchWithExclusiveBarrier(timeoutMs = 5_000): Promise<void> {
+    const barrier = await acquireKernelFileLock(
+      paths.agentMemoryBarrier(this.agentId),
+      timeoutMs,
+      'exclusive',
+    )
+    try {
+      await this.withFileLock(() => this.recoverBatchLocked())
+    } finally {
+      await barrier.release().catch(() => {})
+    }
+  }
+
+  /**
+   * Shared cross-process barrier for a normal model turn or MemoryDir read/write.
+   * A journal observed before/after acquisition is recovered under an exclusive
+   * barrier first; once shared is held, no Auto-Dream batch can begin.
+   */
+  async acquireSharedBarrier(timeoutMs = 5_000): Promise<KernelFileLock> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await this.batchJournalExists()) {
+        await this.recoverBatchWithExclusiveBarrier(timeoutMs)
+        continue
+      }
+      const barrier = await acquireKernelFileLock(
+        paths.agentMemoryBarrier(this.agentId),
+        timeoutMs,
+        'shared',
+      )
+      try {
+        if (!(await this.batchJournalExists())) return barrier
+      } catch (err) {
+        await barrier.release().catch(() => {})
+        throw err
+      }
+      await barrier.release().catch(() => {})
+    }
+    throw new Error('memory batch recovery did not quiesce')
+  }
+
+  private async withSharedBarrier<T>(fn: () => Promise<T>): Promise<T> {
+    const barrier = await this.acquireSharedBarrier()
+    try {
+      return await this.withFileLock(fn)
+    } finally {
+      await barrier.release().catch(() => {})
     }
   }
 
@@ -163,6 +256,63 @@ export class MemoryDir {
     }
   }
 
+  private async writeBatchJournal(journal: MemoryBatchJournal): Promise<void> {
+    const p = this.batchJournalPath()
+    const tmp = `${p}.tmp-${randomUUID()}`
+    await mkdir(join(p, '..'), { recursive: true })
+    try {
+      await writeFile(tmp, JSON.stringify(journal), { mode: 0o600 })
+      await rename(tmp, p)
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {})
+      throw err
+    }
+  }
+
+  /**
+   * Recover a batch whose process died after its durable prepare marker but
+   * before the atomic commit marker. Restoring the complete before-image is
+   * idempotent, so another crash during recovery is safe to retry.
+   */
+  private async recoverBatchLocked(): Promise<void> {
+    let raw: string
+    try {
+      raw = await readFile(this.batchJournalPath(), 'utf-8')
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw err
+    }
+    const parsed = JSON.parse(raw) as Partial<MemoryBatchJournal>
+    if (
+      parsed.schemaVersion !== 1 ||
+      (parsed.phase !== 'prepared' && parsed.phase !== 'committed') ||
+      typeof parsed.indexOriginal !== 'string' ||
+      !Array.isArray(parsed.entries) ||
+      parsed.entries.some((entry) =>
+        !entry ||
+        typeof entry !== 'object' ||
+        typeof entry.file !== 'string' ||
+        !MEMORY_FILE_RE.test(entry.file) ||
+        basename(entry.file) !== entry.file ||
+        (entry.original !== null && typeof entry.original !== 'string')
+      )
+    ) {
+      throw new Error('invalid memory batch recovery journal')
+    }
+    if (parsed.phase === 'committed') {
+      await rm(this.batchJournalPath(), { force: true })
+      return
+    }
+    await mkdir(this.dirPath(), { recursive: true })
+    for (const entry of parsed.entries as MemoryBatchJournal['entries']) {
+      const full = join(this.dirPath(), entry.file)
+      if (entry.original === null) await rm(full, { force: true })
+      else await this.atomicWrite(full, entry.original)
+    }
+    await this.writeIndexText(parsed.indexOriginal)
+    await rm(this.batchJournalPath(), { force: true })
+  }
+
   private renderFileBody(name: string, description: string, type: string, body: string): string {
     // description 是单行(迁移时来自首行 slice;API 写入时模型自填),这里不做转义,
     // 只保证不含换行(调用方已保证)。frontmatter 用手写解析,无需 YAML 引号。
@@ -190,7 +340,7 @@ export class MemoryDir {
 
   /** 公开入口:锁内做一次幂等懒迁移。 */
   async ensureMigrated(): Promise<void> {
-    await this.withLock(() => this.ensureMigratedLocked())
+    await this.withSharedBarrier(() => this.ensureMigratedLocked())
   }
 
   /**
@@ -254,11 +404,8 @@ export class MemoryDir {
 
   // ── 列表 / 读 / 写 / 删 ──────────────────────────────────────────────
 
-  /**
-   * 读记忆目录,逐文件解析 frontmatter(容错)。非法文件名 / 备份 / 目录项跳过。
-   * 按 mtime 倒序(最近优先)。无锁快照读(每个文件原子写,单文件视图一致)。
-   */
-  async list(): Promise<MemoryFileMeta[]> {
+  /** 锁内目录快照；调用方负责先完成迁移/批恢复。 */
+  private async listLocked(): Promise<MemoryFileMeta[]> {
     let names: string[] = []
     try {
       names = await readdir(this.dirPath())
@@ -296,31 +443,47 @@ export class MemoryDir {
     return out
   }
 
+  /**
+   * 读记忆目录,逐文件解析 frontmatter(容错)。非法文件名 / 备份 / 目录项跳过。
+   * 按 mtime 倒序(最近优先)。读前进入同一把锁并恢复未提交批次，因此进程
+   * 崩溃后不会把半批结果暴露给 UI / prompt 构建器。
+   */
+  async list(): Promise<MemoryFileMeta[]> {
+    return this.withSharedBarrier(async () => {
+      await this.ensureMigratedLocked()
+      return this.listLocked()
+    })
+  }
+
   /** 读单条记忆全文 + version。文件名非法或不存在 → null。 */
   async read(file: string): Promise<{ content: string; version: string } | null> {
     if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) return null
-    try {
-      const content = await readFile(join(this.dirPath(), file), 'utf-8')
-      return { content, version: sha16(content) }
-    } catch {
-      return null
-    }
+    return this.withSharedBarrier(async () => {
+      await this.ensureMigratedLocked()
+      try {
+        const content = await readFile(join(this.dirPath(), file), 'utf-8')
+        return { content, version: sha16(content) }
+      } catch {
+        return null
+      }
+    })
   }
 
   /**
    * 写单条记忆(受控三态):
    *  - 文件名非法 / 写侧 scan 命中 → { ok:false, error }(scan 只作友好提示,读侧兜底才是权威)。
-   *  - expectedVersion 传入且与盘上当前 version 不符 → { ok:false, conflict }(不写盘)。
-   *  - 新建应传 expectedVersion=undefined → 跳过冲突检查直接写(last-writer-wins)。
+   *  - expectedVersion=string:盘上必须存在且 version 相等。
+   *  - expectedVersion=null: create-only CAS,盘上必须仍不存在。
+   *  - expectedVersion=undefined:兼容旧调用,last-writer-wins。
    *  写盘后锁内 reconcile 索引,保证新增/编辑文件的索引行在位。
    */
-  async write(file: string, content: string, expectedVersion?: string): Promise<WriteResult> {
+  async write(file: string, content: string, expectedVersion?: string | null): Promise<WriteResult> {
     if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) {
       return { ok: false, error: `invalid memory file name: ${file}` }
     }
     const scan = scanMemoryContent(content)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
-    return this.withLock(async () => {
+    return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       const full = join(this.dirPath(), file)
       let current: string | null = null
@@ -330,7 +493,11 @@ export class MemoryDir {
         current = null
       }
       const currentVersion = current === null ? undefined : sha16(current)
-      if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
+      const conflicts =
+        expectedVersion === null
+          ? current !== null
+          : expectedVersion !== undefined && expectedVersion !== currentVersion
+      if (conflicts) {
         return {
           ok: false as const,
           conflict: { current: current ?? '', version: currentVersion ?? sha16('') },
@@ -345,7 +512,7 @@ export class MemoryDir {
   /** 删除单条记忆。返回是否真的删除了(文件原本存在)。删后锁内 reconcile 索引剔除悬挂行。 */
   async remove(file: string): Promise<boolean> {
     if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) return false
-    return this.withLock(async () => {
+    return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       const full = join(this.dirPath(), file)
       let existed = false
@@ -361,11 +528,163 @@ export class MemoryDir {
     })
   }
 
+  /**
+   * Versioned delete for background reconcilers.  The read/version check and
+   * unlink happen under the same memdir lock, so a foreground edit can never
+   * be deleted after the caller's snapshot went stale.
+   */
+  async removeIfVersion(file: string, expectedVersion: string): Promise<RemoveIfVersionResult> {
+    if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) {
+      return { ok: false, error: `invalid memory file name: ${file}` }
+    }
+    return this.withSharedBarrier(async () => {
+      await this.ensureMigratedLocked()
+      const full = join(this.dirPath(), file)
+      let current: string | null = null
+      try {
+        current = await readFile(full, 'utf-8')
+      } catch {
+        current = null
+      }
+      if (current === null) return { ok: true as const, removed: false }
+      const version = sha16(current)
+      if (version !== expectedVersion) {
+        return { ok: false as const, conflict: { current, version } }
+      }
+      await rm(full, { force: true })
+      await this.reconcileIndexLocked()
+      return { ok: true as const, removed: true }
+    })
+  }
+
+  /**
+   * All-or-nothing multi-file CAS used by background reconcilers.
+   *
+   * Every expected version is checked under the exclusive cross-process
+   * barrier and memdir lock before the first mutation. A durable before-image
+   * journal makes a process crash recoverable: prepared batches roll back on
+   * the next memdir operation, while a committed marker means the complete
+   * batch is authoritative.
+   */
+  async applyBatchCas(input: {
+    upserts: readonly MemoryBatchUpsert[]
+    deletes: readonly MemoryBatchDelete[]
+  }): Promise<MemoryBatchResult> {
+    const seen = new Set<string>()
+    for (const row of input.upserts) {
+      if (!MEMORY_FILE_RE.test(row.file) || basename(row.file) !== row.file) {
+        return { ok: false, error: `invalid memory file name: ${row.file}` }
+      }
+      if (seen.has(row.file)) return { ok: false, error: `duplicate memory file: ${row.file}` }
+      seen.add(row.file)
+      const scan = scanMemoryContent(row.content)
+      if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
+      if (row.expectedVersion !== null && typeof row.expectedVersion !== 'string') {
+        return { ok: false, error: `invalid expected version: ${row.file}` }
+      }
+    }
+    for (const row of input.deletes) {
+      if (!MEMORY_FILE_RE.test(row.file) || basename(row.file) !== row.file) {
+        return { ok: false, error: `invalid memory file name: ${row.file}` }
+      }
+      if (seen.has(row.file)) return { ok: false, error: `duplicate memory file: ${row.file}` }
+      seen.add(row.file)
+      if (!row.expectedVersion) return { ok: false, error: `invalid expected version: ${row.file}` }
+    }
+    if (seen.size === 0) return { ok: true }
+
+    const barrier = await acquireKernelFileLock(
+      paths.agentMemoryBarrier(this.agentId),
+      5_000,
+      'exclusive',
+    )
+    try {
+      return await this.withFileLock(async () => {
+        await this.recoverBatchLocked()
+        await this.ensureMigratedLocked()
+        const originals = new Map<string, string | null>()
+        for (const file of seen) {
+          try {
+            originals.set(file, await readFile(join(this.dirPath(), file), 'utf-8'))
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') originals.set(file, null)
+            else throw err
+          }
+        }
+        for (const row of input.upserts) {
+          const current = originals.get(row.file) ?? null
+          const version = current === null ? sha16('') : sha16(current)
+          const conflicts = row.expectedVersion === null
+            ? current !== null
+            : current === null || version !== row.expectedVersion
+          if (conflicts) {
+            return {
+              ok: false as const,
+              conflict: { file: row.file, current: current ?? '', version },
+            }
+          }
+        }
+        for (const row of input.deletes) {
+          const current = originals.get(row.file) ?? null
+          const version = current === null ? sha16('') : sha16(current)
+          if (current === null || version !== row.expectedVersion) {
+            return {
+              ok: false as const,
+              conflict: { file: row.file, current: current ?? '', version },
+            }
+          }
+        }
+
+        let indexOriginal = `${MEMDIR_INDEX_MARKER}\n`
+        try {
+          indexOriginal = await readFile(this.indexPath(), 'utf-8')
+        } catch {
+          // ensureMigratedLocked normally created it; marker-only is a safe
+          // before-image if external code removed it between those operations.
+        }
+        const prepared: MemoryBatchJournal = {
+          schemaVersion: 1,
+          phase: 'prepared',
+          indexOriginal,
+          entries: [...originals].map(([file, original]) => ({ file, original })),
+        }
+        await this.writeBatchJournal(prepared)
+        try {
+          for (const row of input.upserts) {
+            await this.atomicWrite(join(this.dirPath(), row.file), row.content)
+          }
+          for (const row of input.deletes) {
+            await rm(join(this.dirPath(), row.file), { force: true })
+          }
+          await this.reconcileIndexLocked()
+          await this.writeBatchJournal({ ...prepared, phase: 'committed' })
+          // Cleanup is not part of commit correctness. If unlink fails, the
+          // committed marker is safely discarded by the next memdir operation.
+          await rm(this.batchJournalPath(), { force: true }).catch(() => {})
+          return { ok: true as const }
+        } catch (err) {
+          try {
+            await this.recoverBatchLocked()
+          } catch {
+            // Keep the prepared journal in place. The next memdir operation will
+            // retry the idempotent rollback before exposing or mutating memory.
+          }
+          return {
+            ok: false as const,
+            error: err instanceof Error ? err.message : String(err),
+          }
+        }
+      })
+    } finally {
+      await barrier.release().catch(() => {})
+    }
+  }
+
   // ── 索引对账 ────────────────────────────────────────────────────────
 
   /** 公开入口:锁内先 ensureMigrated 再双向对账,返回索引全文。 */
   async reconcileIndex(): Promise<string> {
-    return this.withLock(async () => {
+    return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       return this.reconcileIndexLocked()
     })
@@ -389,7 +708,7 @@ export class MemoryDir {
    *  写回磁盘并返回索引全文。
    */
   private async reconcileIndexLocked(): Promise<string> {
-    const files = await this.list()
+    const files = await this.listLocked()
     const byFile = new Map(files.map((f) => [f.file, f]))
     let raw = ''
     try {
@@ -443,7 +762,7 @@ export class MemoryDir {
    *  索引为空(仅 marker、无有效行)→ 返回 null(由 gateway 决定是否仍注入指令段)。
    */
   async renderForInjection(maxChars: number): Promise<string | null> {
-    return this.withLock(async () => {
+    return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       const indexText = await this.reconcileIndexLocked()
       const kept: string[] = []
