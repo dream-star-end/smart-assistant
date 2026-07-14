@@ -34,7 +34,9 @@ function ocBuildMeta(): Plugin {
   }
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const tutorialCapture = mode === 'tutorial-capture'
+  return {
   plugins: [react(), tailwindcss(), ocBuildMeta()],
   server: {
     host: '127.0.0.1',
@@ -47,7 +49,8 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
-    outDir: 'dist',
+    // 教程媒体生成使用独立 capture 入口/输出目录；生产构建永远不包含该舞台。
+    outDir: tutorialCapture ? 'dist-tutorial-capture' : 'dist',
     sourcemap: true,
     manifest: true,
     // 双 Vite 入口:用户端 SPA(index.html)+ 管理后台(admin.html)。两者共享
@@ -64,10 +67,12 @@ export default defineConfig({
     //  is-plain-obj / extend）」一并圈进同一块、从而经该 util 在 entry 建立静态边、把整块
     //  markdown 拽回首屏的风险（已实测复现）。故让动态 import 自然成块，最稳。
     rolldownOptions: {
-      input: {
-        main: fileURLToPath(new URL('./index.html', import.meta.url)),
-        admin: fileURLToPath(new URL('./admin.html', import.meta.url)),
-      },
+      input: tutorialCapture
+        ? { tutorialCapture: fileURLToPath(new URL('./tutorial-capture.html', import.meta.url)) }
+        : {
+            main: fileURLToPath(new URL('./index.html', import.meta.url)),
+            admin: fileURLToPath(new URL('./admin.html', import.meta.url)),
+          },
       output: {
         codeSplitting: {
           groups: [
@@ -97,4 +102,5 @@ export default defineConfig({
     // 时序竞态一律修在交互语义上(等 enabled 再点/先等 boot 选中落定),不靠串行掩盖。
     testTimeout: 15_000,
   },
+  }
 })

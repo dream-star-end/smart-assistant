@@ -26,6 +26,8 @@ import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import type { ManageTab } from "./components/ManageCenter";
+import type { SettingsSection } from "./components/SettingsCenter";
+import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
@@ -46,6 +48,7 @@ import {
   type PanelParam,
   parsePanelParam,
   parseSessionPath,
+  parseTutorialTopic,
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
@@ -71,6 +74,12 @@ import {
   writeTeamMode,
 } from "./lib/teamMode";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
+import {
+  PRODUCT_CAPABILITIES,
+  type ProductCapability,
+  type ProductFeatureId,
+} from "./lib/productCapabilities";
+import { resolveTutorialAction } from "./lib/tutorialActions";
 import { api } from "./lib/api";
 import {
   effectiveEffortModelId,
@@ -83,7 +92,7 @@ import {
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
-// 首屏瘦身:四大中心（营销首页 + 三个全屏对话框）改按需异步加载,移出 entry chunk。
+// 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
 // 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
@@ -98,9 +107,12 @@ const MarketplaceCenter = lazy(() =>
 );
 // 企业版(P3.1)第四中心。仅 org owner/admin 有入口(成员在设置·账户页只读展示)。
 const OrgCenter = lazy(() => import("./components/OrgCenter").then((m) => ({ default: m.OrgCenter })));
+const TutorialCenter = lazy(() =>
+  import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
+);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
-// loading 瞬间。首屏渲染完成后在浏览器空闲期预取四个懒块——Vite 对同一 specifier
+// loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
 // 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;弱网下预取失败静默,
 // 行为退化为按需加载,不比没有预取更差。
 export function prefetchLazyCentersOnIdle(): void {
@@ -110,6 +122,7 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/ManageCenter").catch(() => {});
     void import("./components/MarketplaceCenter").catch(() => {});
     void import("./components/OrgCenter").catch(() => {});
+    void import("./components/TutorialCenter").catch(() => {});
   };
   if (typeof requestIdleCallback === "function") {
     requestIdleCallback(prefetch, { timeout: 8000 });
@@ -157,6 +170,9 @@ export function App() {
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
   const routingEnabled = !demo && !resetToken;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
+  const bootTutorialTopic = routingEnabled
+    ? (parseTutorialTopic(params) ?? PRODUCT_CAPABILITIES.chatBasics.id)
+    : PRODUCT_CAPABILITIES.chatBasics.id;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -198,12 +214,16 @@ export function App() {
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [inboxOpen, setInboxOpen] = useState(false);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
   const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
+  const [orgSection, setOrgSection] = useState<OrgSection>("overview");
+  const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
+  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId>(bootTutorialTopic);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -277,6 +297,7 @@ export function App() {
       setChatError(null);
       setSettingsOpen(false);
       setOrgOpen(false);
+      setTutorialOpen(false);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -647,8 +668,9 @@ export function App() {
   }, [demo, messages, activeId, send]);
 
   // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
-  const openSettings = useCallback(() => {
+  const openSettings = useCallback((section: SettingsSection = "account") => {
     void refreshMe();
+    setSettingsSection(section);
     setSettingsOpen(true);
   }, [refreshMe]);
 
@@ -679,13 +701,123 @@ export function App() {
   }, []);
 
   // 打开组织中心(企业版第四中心;仅 owner/admin 有入口)。顺带刷新余额/归属。
-  const openOrg = useCallback(() => {
+  const openOrg = useCallback((section: OrgSection = "overview") => {
     void refreshMe();
+    setOrgSection(section);
     setOrgOpen(true);
   }, [refreshMe]);
 
+  const openTutorial = useCallback((id: ProductFeatureId = PRODUCT_CAPABILITIES.chatBasics.id) => {
+    // 教程是单一顶层中心：打开前收起其他中心，避免多层 Radix Dialog 叠加与焦点陷阱互抢。
+    setSettingsOpen(false);
+    setManageOpen(false);
+    setMarketplaceOpen(false);
+    setOrgOpen(false);
+    setTutorialTopic(id);
+    setTutorialOpen(true);
+  }, []);
+
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
+
+  const tutorialActionContext = useMemo(
+    () => ({
+      authenticated: inWorkspace,
+      featureImage2: image2Available,
+      microphone:
+        typeof navigator !== "undefined" &&
+        !!navigator.mediaDevices?.getUserMedia &&
+        typeof MediaRecorder !== "undefined",
+      orgRole: user?.org?.role ?? null,
+    }),
+    [inWorkspace, image2Available, user?.org?.role],
+  );
+
+  const focusProductFeature = useCallback((id: string) => {
+    const focus = (attempt = 0) => {
+      // 若用户已在等待期间主动聚焦别处，不再抢焦点；只有 body/目标本身才允许重试。
+      const active = document.activeElement as HTMLElement | null;
+      if (
+        attempt > 0 &&
+        active &&
+        active !== document.body &&
+        active.dataset.productFeature !== id
+      ) {
+        return;
+      }
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>(`[data-product-feature="${id}"]`),
+      );
+      const target = candidates.find((element) => element.getClientRects().length > 0);
+      target?.focus({ preventScroll: false });
+      // Radix Dialog 的 inert/focus-scope 清理可能跨帧完成；首次 focus 被浏览器拒绝时小步重试。
+      if (target && document.activeElement !== target && attempt < 3) {
+        window.setTimeout(() => focus(attempt + 1), 160);
+        return;
+      }
+      target?.scrollIntoView({
+        block: "nearest",
+        inline: "nearest",
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+      });
+    };
+    // Dialog 卸载后的 Radix 焦点恢复会晚于当前 click 栈；等关闭过渡/门户清理完成再把焦点
+    // 交给真实功能，否则最终会落回 <body>，视觉上“跳过去了”但键盘用户没有抵达。
+    requestAnimationFrame(() => requestAnimationFrame(() => window.setTimeout(() => focus(), 120)));
+  }, []);
+
+  const runTutorialAction = useCallback(
+    (feature: ProductCapability) => {
+      const resolved = resolveTutorialAction(feature, tutorialActionContext);
+      if (!resolved.enabled) return;
+      setTutorialOpen(false);
+      const destination = feature.destination;
+      switch (destination.kind) {
+        case "new-chat":
+          newSession();
+          focusProductFeature(PRODUCT_CAPABILITIES.chatBasics.id);
+          break;
+        case "focus":
+          if (destination.target === PRODUCT_CAPABILITIES.sessions.id) {
+            if (window.matchMedia("(max-width: 767px)").matches) setMobileNavOpen(true);
+            else setCollapsed(false);
+          }
+          focusProductFeature(destination.target);
+          break;
+        case "agent-picker":
+          setPickerOpen(true);
+          break;
+        case "settings":
+          openSettings(destination.section);
+          break;
+        case "manage":
+          openManage(destination.tab);
+          break;
+        case "market":
+          openMarketplace(destination.tab, destination.marketKind ?? "skill");
+          break;
+        case "inbox":
+          setInboxOpen(true);
+          break;
+        case "github":
+          openRepo();
+          break;
+        case "org":
+          openOrg(destination.section);
+          break;
+      }
+    },
+    [
+      tutorialActionContext,
+      newSession,
+      focusProductFeature,
+      openSettings,
+      openManage,
+      openMarketplace,
+      openRepo,
+      openOrg,
+    ],
+  );
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
   const inbox = useInbox(auth, inWorkspace && !demo);
@@ -1082,7 +1214,7 @@ export function App() {
     () => ({
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
-      onTopUp: demo ? undefined : openSettings,
+      onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
     }),
@@ -1267,16 +1399,18 @@ export function App() {
   }, [inWorkspace, sending, newSession, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
-  // 面板深链单选优先级：settings > market > manage（同时开多个时 URL 反映最先者）。
-  const activePanel: PanelParam | null = settingsOpen
-    ? "settings"
-    : marketplaceOpen
-      ? "market"
-      : manageOpen
-        ? "manage"
-        : orgOpen
-          ? "org"
-          : null;
+  // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
+  const activePanel: PanelParam | null = tutorialOpen
+    ? "help"
+    : settingsOpen
+      ? "settings"
+      : marketplaceOpen
+        ? "market"
+        : manageOpen
+          ? "manage"
+          : orgOpen
+            ? "org"
+            : null;
   useAppRoute({
     enabled: routingEnabled,
     inWorkspace,
@@ -1293,6 +1427,15 @@ export function App() {
       setChatError(null);
     },
     activePanel,
+    activeTopic: tutorialOpen ? tutorialTopic : null,
+    onPopPanel: (panel, topic) => {
+      setSettingsOpen(panel === "settings");
+      setMarketplaceOpen(panel === "market");
+      setManageOpen(panel === "manage");
+      setOrgOpen(panel === "org");
+      setTutorialOpen(panel === "help");
+      if (panel === "help") setTutorialTopic(topic ?? PRODUCT_CAPABILITIES.chatBasics.id);
+    },
   });
 
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
@@ -1400,13 +1543,14 @@ export function App() {
     activeId,
     user,
     credits: user?.credits ?? null,
-    onOpenAccount: demo ? undefined : openSettings,
+    onOpenAccount: demo ? undefined : () => openSettings(),
     onNew: newSession,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
+    onOpenTutorial: demo ? undefined : () => openTutorial(),
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
     // (web-react 第二 Vite 入口 /admin.html)。非 admin / demo 一律不渲染。
     showAdmin: !demo && user?.role === "admin",
@@ -1414,7 +1558,7 @@ export function App() {
     onOpenOrg:
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
-        : openOrg,
+        : () => openOrg(),
   };
   return (
     <MediaSignProvider
@@ -1469,12 +1613,13 @@ export function App() {
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
           credits={demo ? null : (user?.credits ?? null)}
-          onOpenBilling={demo ? undefined : openSettings}
+          onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
           onNew={newSession}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
+          onOpenTutorial={demo ? undefined : () => openTutorial()}
           unreadCount={inbox.unreadCount}
           theme={theme}
           onCycleTheme={cycle}
@@ -1494,7 +1639,7 @@ export function App() {
               phase={gate.phase}
               onOpen={gate.open}
               onRetry={gate.check}
-              onTopUp={openSettings}
+              onTopUp={() => openSettings()}
             />
           ) : loadingHistory ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
@@ -1622,6 +1767,7 @@ export function App() {
         <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
             open={settingsOpen}
+            initialSection={settingsSection}
             auth={auth}
             user={user}
             theme={theme}
@@ -1725,10 +1871,23 @@ export function App() {
         <LazyBoundary fallback={<DialogFallback />}>
           <OrgCenter
             open={orgOpen}
+            initialSection={orgSection}
             auth={auth}
             user={user}
             onClose={() => setOrgOpen(false)}
             onRefreshMe={refreshMe}
+          />
+        </LazyBoundary>
+      )}
+      {tutorialOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <TutorialCenter
+            open={tutorialOpen}
+            topicId={tutorialTopic}
+            onTopicChange={setTutorialTopic}
+            onClose={() => setTutorialOpen(false)}
+            actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
+            onRunAction={runTutorialAction}
           />
         </LazyBoundary>
       )}

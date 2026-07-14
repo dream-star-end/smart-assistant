@@ -10,6 +10,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/chat/media";
+import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import { useImageEditActions } from "./imageEditActions";
 import {
   downloadPercent,
@@ -327,6 +328,7 @@ export function ZoomableImage({
         {canEdit && (
           <button
             type="button"
+            data-product-feature={PRODUCT_CAPABILITIES.images.id}
             aria-label="编辑图片"
             title="编辑 · Image 2"
             onClick={() => openViewer()}
@@ -603,6 +605,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
   // idle：拦截点击 → start()（内部按尺寸决定流式或原生兜底）。
   return (
     <a
+      data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
       href={resolved}
       download={name}
       target="_blank"

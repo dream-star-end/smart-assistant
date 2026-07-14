@@ -1,6 +1,7 @@
-import { Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
+import { BookOpen, Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { Session, User } from "../lib/types";
 import { cn, formatCredits, groupLabel } from "../lib/utils";
 import { Avatar, Button, IconButton } from "./ui";
@@ -19,6 +20,7 @@ export function Sidebar({
   onOpenAccount,
   onOpenManage,
   onOpenMarketplace,
+  onOpenTutorial,
   onOpenOrg,
   showAdmin,
 }: {
@@ -38,6 +40,8 @@ export function Sidebar({
   onOpenManage?: () => void;
   /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
   onOpenMarketplace?: () => void;
+  /** 打开使用教程。省略则不渲染入口（demo）。 */
+  onOpenTutorial?: () => void;
   /** 打开组织中心（企业版）。仅 org owner/admin 提供，省略则不渲染入口。 */
   onOpenOrg?: () => void;
   /** 平台超管入口。仅 user.role === 'admin' 时为 true，false/省略则不渲染。 */
@@ -57,7 +61,7 @@ export function Sidebar({
 
   return (
     <aside className="flex h-full w-[268px] shrink-0 flex-col bg-sidebar">
-      <div className="flex flex-col gap-2 p-3">
+      <div className="flex flex-col gap-2 p-3" data-product-entry-scope="sidebar-primary">
         <div className="flex items-center justify-between px-1.5 pb-1">
           <div className="flex items-center gap-2">
             <span className="flex size-7 items-center justify-center rounded-lg bg-grad-cta text-white">
@@ -66,13 +70,14 @@ export function Sidebar({
             <span className="text-[15px] font-semibold tracking-tight">{BRAND.name}</span>
           </div>
           {onCollapse && (
-            <IconButton onClick={onCollapse} aria-label="折叠侧栏" variant="muted" size="sm" shape="square">
+            <IconButton data-product-control onClick={onCollapse} aria-label="折叠侧栏" variant="muted" size="sm" shape="square">
               <PanelLeftClose size={17} />
             </IconButton>
           )}
         </div>
 
         <Button
+          data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
           variant="secondary"
           onClick={onNew}
           className="h-auto w-full justify-start gap-2.5 rounded-xl px-3 py-2.5 text-[14px] font-medium"
@@ -84,6 +89,7 @@ export function Sidebar({
         <div className="flex items-center gap-2 rounded-xl bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
           <Search size={15} className="text-faint" />
           <input
+            data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="搜索会话"
@@ -93,6 +99,7 @@ export function Sidebar({
 
         {onOpenManage && (
           <button
+            data-product-feature={PRODUCT_CAPABILITIES.memory.id}
             onClick={onOpenManage}
             className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -104,6 +111,7 @@ export function Sidebar({
 
         {onOpenMarketplace && (
           <button
+            data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
             onClick={onOpenMarketplace}
             className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -113,8 +121,22 @@ export function Sidebar({
           </button>
         )}
 
+        {onOpenTutorial && (
+          <button
+            type="button"
+            data-product-control
+            onClick={onOpenTutorial}
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <BookOpen size={16} className="text-faint" />
+            使用教程
+            <span className="ml-auto text-[11px] text-faint">边看边用</span>
+          </button>
+        )}
+
         {onOpenOrg && (
           <button
+            data-product-feature={PRODUCT_CAPABILITIES.organization.id}
             onClick={onOpenOrg}
             className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -126,6 +148,7 @@ export function Sidebar({
 
         {showAdmin && (
           <a
+            data-product-control
             href="/admin.html"
             className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -136,7 +159,10 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3">
+      <div
+        className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
+        data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
+      >
         {groups.length === 0 && (
           <p className="px-3 py-6 text-center text-[13px] text-faint">暂无会话</p>
         )}
@@ -197,8 +223,12 @@ export function Sidebar({
         ))}
       </div>
 
-      <div className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b">
+      <div
+        className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
+        data-product-entry-scope="sidebar-account"
+      >
         <button
+          data-product-feature={PRODUCT_CAPABILITIES.billing.id}
           onClick={onOpenAccount}
           disabled={!onOpenAccount}
           aria-label="设置"
@@ -218,6 +248,7 @@ export function Sidebar({
         </button>
         {onLogout && (
           <button
+            data-product-control
             onClick={onLogout}
             aria-label="退出登录"
             className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"

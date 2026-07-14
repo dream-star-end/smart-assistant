@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { canManageOrgBilling } from "../lib/orgBilling";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
 import { Tabs } from "./ui";
 import { CreateOrgWizard } from "./org/CreateOrgWizard";
@@ -17,9 +18,9 @@ import { SkillsTab } from "./org/SkillsTab";
 // 共享 helper 已迁至叶子模块 org/orgShared(权威源);此处 re-export 兼容既有引用点。
 export { orgErrText, orgRoleLabel } from "./org/orgShared";
 
-type Section = "overview" | "members" | "skills" | "reports" | "invoices";
+export type OrgSection = "overview" | "members" | "skills" | "reports" | "invoices";
 
-const SECTIONS: { id: Section; label: string }[] = [
+const SECTIONS: { id: OrgSection; label: string }[] = [
   { id: "overview", label: "概览" },
   { id: "members", label: "成员" },
   { id: "skills", label: "技能" },
@@ -47,6 +48,7 @@ export function OrgCenter({
   user,
   onClose,
   onRefreshMe,
+  initialSection = "overview",
 }: {
   open: boolean;
   auth: AuthSession | null;
@@ -54,8 +56,10 @@ export function OrgCenter({
   onClose: () => void;
   /** 充值到账 / 成员变更后调用（App 重拉 /api/me）。 */
   onRefreshMe?: () => void;
+  /** 教程等外部入口可直达具体分区；无组织用户仍优先显示创建向导。 */
+  initialSection?: OrgSection;
 }) {
-  const [section, setSection] = useState<Section>("overview");
+  const [section, setSection] = useState<OrgSection>(initialSection);
 
   const noOrg = !user?.org;
   const callerRole: OrgRole = user?.org?.role ?? "member";
@@ -74,11 +78,13 @@ export function OrgCenter({
 
   // 关闭面板：复位分区（避免重开残留在非概览页）。
   useEffect(() => {
-    if (!open) {
+    if (open) {
+      setSection(initialSection);
+    } else {
       setSection("overview");
       setPayDialog(null);
     }
-  }, [open]);
+  }, [open, initialSection]);
 
   // 有 org 时拉订阅(member 可读)。依赖不含 subLoading(防转圈);noOrg / 未登录不拉。
   useEffect(() => {
@@ -143,14 +149,21 @@ export function OrgCenter({
                 <Tabs
                   aria-label="组织分区"
                   value={section}
-                  onValueChange={(v) => setSection(v as Section)}
-                  items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
+                  onValueChange={(v) => setSection(v as OrgSection)}
+                  items={SECTIONS.map((s) => ({
+                    value: s.id,
+                    label: s.label,
+                    featureId: PRODUCT_CAPABILITIES.organization.id,
+                  }))}
                 />
               </div>
             </div>
           )}
 
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div
+            className="min-h-0 flex-1 overflow-y-auto"
+            data-product-feature={PRODUCT_CAPABILITIES.organization.id}
+          >
             {!auth ? (
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : showWizard ? (

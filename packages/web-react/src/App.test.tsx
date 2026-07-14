@@ -707,4 +707,72 @@ describe('Aurora v5 — P7 最小路由', () => {
     // 打开态与 URL 参数一致（同步 effect no-op 保参）。
     expect(window.location.search).toContain('panel=settings')
   })
+
+  test('教程深链：?panel=help&topic=<稳定 id> 打开对应教程并保留可分享 URL', async () => {
+    window.history.replaceState({}, '', '/?campaign=docs&panel=help&topic=models-reasoning')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () => expect(screen.getByRole('heading', { name: '选择模型与思考深度' })).toBeInTheDocument(),
+      { timeout: 5000 },
+    )
+    expect(window.location.search).toContain('panel=help')
+    expect(window.location.search).toContain('topic=models-reasoning')
+    expect(window.location.search).toContain('campaign=docs')
+  })
+
+  test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
+    window.history.replaceState({}, '', '/?panel=help&topic=feedback-support')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole('heading', { name: '提交问题、建议与体验反馈' }),
+        ).toBeInTheDocument(),
+      { timeout: 5000 },
+    )
+    fireEvent.click(screen.getByRole('button', { name: '打开设置' }))
+
+    await waitFor(() => expect(screen.getByRole('form', { name: '反馈表单' })).toBeInTheDocument())
+    expect(screen.getByLabelText('反馈内容')).toHaveValue('')
+    expect(window.location.search).toContain('panel=settings')
+    expect(window.location.search).not.toContain('topic=')
+  })
+
+  test('教程 CTA 回到页面功能时，把键盘焦点交给真实入口', async () => {
+    window.history.replaceState({}, '', '/?panel=help&topic=chat-basics')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, 'getClientRects')
+      .mockImplementation(function getClientRects() {
+        return (this.hasAttribute('data-product-feature') ? [{}] : []) as unknown as DOMRectList
+      })
+
+    try {
+      render(<App />)
+      await waitFor(
+        () =>
+          expect(screen.getByRole('heading', { name: '开始一场高质量对话' })).toBeInTheDocument(),
+        { timeout: 5000 },
+      )
+      fireEvent.click(screen.getByRole('button', { name: '回到功能位置' }))
+
+      await waitFor(
+        () =>
+          expect((document.activeElement as HTMLElement | null)?.dataset.productFeature).toBe(
+            'chat-basics',
+          ),
+        { timeout: 3000 },
+      )
+      expect(window.location.search).not.toContain('panel=help')
+    } finally {
+      rectSpy.mockRestore()
+    }
+  })
 })
