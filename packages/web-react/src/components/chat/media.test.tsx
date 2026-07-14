@@ -7,13 +7,18 @@
  * 契约:下载/开原图发生的那一刻解析签名 URL(缓存过期自动重签);fetch 拿到
  * 410/403 → 强制重签一次再试。禁止任何交互路径冻结挂载时的旧 URL。
  */
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import type { MediaRef } from "../../lib/chat/frames";
+import {
+  authScopedImageIdentity,
+  byteCacheKey,
+  imageByteCache,
+} from "../../lib/chat/imageBytes";
 import { ImageEditActionsContext } from "./imageEditActions";
 import { Media, MediaSignProvider, SignedFileCard, ZoomableImage } from "./media";
-import type { MediaRef } from "../../lib/chat/frames";
 
 afterEach(() => {
   cleanup();
@@ -23,9 +28,9 @@ afterEach(() => {
 
 let __objUrlSeq = 0;
 /** 流式 image Response(缩略 fetch 用):默认 1KB webp。 */
-function streamImageResponse(): Response {
+function streamImageResponse(size = 1024): Response {
   let done = false;
-  const headers = new Headers({ "content-length": "1024", "content-type": "image/webp" });
+  const headers = new Headers({ "content-length": String(size), "content-type": "image/webp" });
   return {
     ok: true,
     status: 200,
@@ -34,14 +39,23 @@ function streamImageResponse(): Response {
       getReader() {
         return {
           read: async () =>
-            done ? { done: true, value: undefined } : ((done = true), { done: false, value: new Uint8Array(1024) }),
+            done ? { done: true, value: undefined } : ((done = true), { done: false, value: new Uint8Array(size) }),
         };
       },
     },
   } as unknown as Response;
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 beforeEach(() => {
+  imageByteCache.clear();
   __objUrlSeq = 0;
   // 渐进加载完成后 blob→objectURL:jsdom 未实现 createObjectURL,桩成可辨识值。
   vi.stubGlobal("URL", {
@@ -263,6 +277,49 @@ describe("用户气泡媒体缩略图:/api/media 收口签名管线(iOS/CF 下 4
 });
 
 describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", () => {
+  test("authKey 换号后 A 原图迟到写回，也不能覆盖 B 的相同 signPath", async () => {
+    const path = "/home/agent/same.png";
+    const gateA = deferred<Response>();
+    const fetchMock = vi.fn((url: string) =>
+      url.includes("t=account-a") ? gateA.promise : Promise.resolve(streamImageResponse(7)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const view = render(
+      <MediaSignProvider sign={null} authKey="account-a">
+        <ZoomableImage
+          src="/api/media-signed?t=account-a"
+          alt="同路径图"
+          signPath={path}
+          thumbWidth={640}
+        />
+      </MediaSignProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <MediaSignProvider sign={null} authKey="account-b">
+        <ZoomableImage
+          src="/api/media-signed?t=account-b"
+          alt="同路径图"
+          signPath={path}
+          thumbWidth={640}
+        />
+      </MediaSignProvider>,
+    );
+    const keyA = byteCacheKey(authScopedImageIdentity("account-a", path), 640);
+    const keyB = byteCacheKey(authScopedImageIdentity("account-b", path), 640);
+    await waitFor(() => expect(imageByteCache.get(keyB)?.size).toBe(7));
+
+    // fetch mock 故意无视 AbortSignal，让旧账号请求在 B 完成后才返回并写缓存。
+    await act(async () => {
+      gateA.resolve(streamImageResponse(3));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(imageByteCache.get(keyA)?.size).toBe(3));
+    expect(imageByteCache.get(keyB)?.size).toBe(7);
+  });
+
   test("传 signPath → 开查看器现场重签,大图 src 用新 URL", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const sign = makeSignMock();
@@ -282,7 +339,7 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
     });
   });
 
-  test("点下载 → 手势内现签,交原生下载用最新签名 URL", async () => {
+  test("点下载 → 复用查看器已拉原图 Blob,不再导航重下 signed URL", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const sign = makeSignMock();
     const hrefs: string[] = [];
@@ -294,9 +351,11 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
         <ZoomableImage src="/api/media-signed?t=stale" alt="图表" signPath="/home/agent/a.png" />
       </MediaSignProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: /放大查看/ })); // 开查看器 → 现签 v1
-    fireEvent.click(screen.getByRole("button", { name: "下载" })); // 点下载 → 复用/重签后交原生下载
+    fireEvent.click(screen.getByRole("button", { name: /放大查看/ })); // 开查看器 → 现签并拉原图
+    fireEvent.click(screen.getByRole("button", { name: "下载" })); // 点下载 → pending 复用同一原图 fetch
     await waitFor(() => expect(hrefs.length).toBeGreaterThan(0));
-    expect(hrefs.some((h) => h.includes("/api/media-signed?t=v"))).toBe(true);
+    expect(hrefs.some((h) => h.startsWith("blob:"))).toBe(true);
+    // 气泡缩略 + 查看器原图各一次；下载本身不得再产生第三个网络请求。
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
   });
 });

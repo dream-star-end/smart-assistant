@@ -17,11 +17,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { downloadPercent } from './download'
 import { fetchProgressiveBlob } from './fetchImageProgressive'
 import {
+  type ResolveSignedSrc,
   THUMBNAIL_RENDER_WIDTHS,
   byteCacheKey,
   imageByteCache,
   isMediaSignedUrl,
-  type ResolveSignedSrc,
 } from './imageBytes'
 
 export type ProgressiveStatus = 'idle' | 'loading' | 'loaded' | 'error'
@@ -33,6 +33,11 @@ export interface UseProgressiveImageResult {
   objectUrl: string | null
   /** 已下载完成的 Blob(编辑器取原图字节用;透传/未完成 → null)。 */
   blob: Blob | null
+  /**
+   * blob 对应的 byteCacheKey。与 blob 原子更新,让下载等调用方在 src/cacheIdentity
+   * 切换后的 effect 窗口内拒绝复用上一张图的旧 Blob。
+   */
+  blobKey: string | null
   percent: number | null
   loadedBytes: number
   status: ProgressiveStatus
@@ -59,7 +64,9 @@ export function useProgressiveImage(params: {
   const [active, setActive] = useState<boolean>(!lazy || !hasIO)
   const [status, setStatus] = useState<ProgressiveStatus>('idle')
   const [objectUrl, setObjectUrl] = useState<string | null>(null)
-  const [blob, setBlob] = useState<Blob | null>(null)
+  // Blob 与身份必须原子提交:分成两个 state 会出现新 blob + 旧 key(或反向)的中间帧,
+  // 下载路径可能把上一张图片保存成当前文件名。
+  const [blobState, setBlobState] = useState<{ blob: Blob; key: string | null } | null>(null)
   const [percent, setPercent] = useState<number | null>(null)
   const [loadedBytes, setLoadedBytes] = useState(0)
   const [attempt, setAttempt] = useState(0)
@@ -103,12 +110,12 @@ export function useProgressiveImage(params: {
         ownedUrlRef.current = null
       }
     }
-    const adoptBlob = (b: Blob) => {
+    const adoptBlob = (b: Blob, key: string | null) => {
       revokePrev()
       const objUrl = URL.createObjectURL(b)
       ownedUrlRef.current = objUrl
       setObjectUrl(objUrl)
-      setBlob(b)
+      setBlobState({ blob: b, key })
       setStatus('loaded')
       setPercent(100)
       setLoadedBytes(b.size)
@@ -117,7 +124,7 @@ export function useProgressiveImage(params: {
     if (!src) {
       revokePrev()
       setObjectUrl(null)
-      setBlob(null)
+      setBlobState(null)
       setStatus('idle')
       setPercent(null)
       setLoadedBytes(0)
@@ -128,7 +135,7 @@ export function useProgressiveImage(params: {
     if (!isMediaSignedUrl(src)) {
       revokePrev()
       setObjectUrl(src)
-      setBlob(null)
+      setBlobState(null)
       setStatus('loaded')
       setPercent(100)
       setLoadedBytes(0)
@@ -145,7 +152,7 @@ export function useProgressiveImage(params: {
     const key = byteCacheKey(cacheIdentity, width)
     const cached = imageByteCache.get(key)
     if (cached) {
-      adoptBlob(cached)
+      adoptBlob(cached, key)
       return
     }
 
@@ -184,7 +191,7 @@ export function useProgressiveImage(params: {
     })
       .then((got) => {
         if (!alive) return
-        adoptBlob(got)
+        adoptBlob(got, key)
       })
       .catch((err) => {
         if (!alive || controller.signal.aborted || (err as Error)?.name === 'AbortError') return
@@ -209,5 +216,14 @@ export function useProgressiveImage(params: {
 
   const reload = useCallback(() => setAttempt((n) => n + 1), [])
 
-  return { containerRef, objectUrl, blob, percent, loadedBytes, status, reload }
+  return {
+    containerRef,
+    objectUrl,
+    blob: blobState?.blob ?? null,
+    blobKey: blobState?.key ?? null,
+    percent,
+    loadedBytes,
+    status,
+    reload,
+  }
 }

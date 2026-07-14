@@ -6,7 +6,7 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/chat/media";
@@ -19,7 +19,7 @@ import {
   saveBlob,
 } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
-import { pickThumbnailWidth } from "../../lib/chat/imageBytes";
+import { authScopedImageIdentity, pickThumbnailWidth } from "../../lib/chat/imageBytes";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import { ImageViewer } from "../ImageViewer";
 
@@ -44,9 +44,16 @@ type MediaSignCtx = {
   invalidate: (path: string) => void;
   /** 同步读缓存:有未过期条目回 URL,否则 null(不触发签名)。点击手势内的快路径用 —— 锚点原生导航前校正 href。 */
   peek: (path: string) => string | null;
+  /** 图片字节缓存的租户命名空间；与签名 URL 缓存共用同一 authKey 边界。 */
+  authKey: string | number | null;
 };
 
-const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null };
+const noop: MediaSignCtx = {
+  resolve: async () => null,
+  invalidate: () => {},
+  peek: () => null,
+  authKey: null,
+};
 const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
@@ -112,10 +119,16 @@ export function MediaSignProvider({
       const hit = cacheRef.current.get(path);
       return hit && hit.expiresAt > Date.now() ? hit.url : null;
     },
+    authKey: authKey ?? null,
   });
 
-  // ctxRef.current 跨重渲稳定(内部读 ref,不闭包 props),直接下传即可。
-  return <Ctx.Provider value={ctxRef.current}>{children}</Ctx.Provider>;
+  // resolve/invalidate/peek 跨重渲稳定；authKey 变时换 context value，让子树在同一 render
+  // 立即得到新字节缓存命名空间。旧异步闭包则保留旧 identity，只能写旧账号 key。
+  const value = useMemo<MediaSignCtx>(
+    () => ({ ...ctxRef.current, authKey: authKey ?? null }),
+    [authKey],
+  );
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
 /**
@@ -182,8 +195,9 @@ export function useSignedSrc(src: string | null | undefined): {
 function useFreshSignedUrl(src: string | null | undefined): {
   get: (opts?: { forceResign?: boolean }) => Promise<string | null>;
   peek: () => string | null;
+  cacheIdentity: string | null;
 } {
-  const { resolve, invalidate, peek } = useContext(Ctx);
+  const { resolve, invalidate, peek, authKey } = useContext(Ctx);
   const get = useCallback(
     async (opts?: { forceResign?: boolean }) => {
       if (!src) return null;
@@ -197,7 +211,8 @@ function useFreshSignedUrl(src: string | null | undefined): {
     () => (src ? (needsSignedSrc(src) ? peek(src) : src) : null),
     [src, peek],
   );
-  return { get, peek: peekFresh };
+  const cacheIdentity = authScopedImageIdentity(authKey, src && needsSignedSrc(src) ? src : null);
+  return { get, peek: peekFresh, cacheIdentity };
 }
 
 /**
@@ -234,7 +249,7 @@ export function ZoomableImage({
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
   // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
   const canEdit = !readOnly && !!useImageEditActions().submitImageEdit;
-  const { get, peek } = useFreshSignedUrl(signPath ?? null);
+  const { get, peek, cacheIdentity } = useFreshSignedUrl(signPath ?? null);
 
   // 缩略分级 + 流式进度 + 字节复用(单一 hook 收口)。签名 URL 请求 ?w=<640|1280>;
   // 直链/本地 blob 零网络透传。懒加载:进视口才拉,避免长会话多图打爆 per-uid 6 并发闸。
@@ -242,7 +257,7 @@ export function ZoomableImage({
   const { containerRef, objectUrl, percent, status, reload } = useProgressiveImage({
     src,
     width,
-    cacheIdentity: signPath ?? null,
+    cacheIdentity,
     resolveSrc: get,
     lazy: true,
   });
@@ -333,6 +348,7 @@ export function ZoomableImage({
         src={display}
         alt={alt}
         signPath={signPath ?? null}
+        cacheIdentity={cacheIdentity}
         get={get}
         peek={peek}
         initialMode="view"

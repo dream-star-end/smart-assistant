@@ -57,6 +57,7 @@ import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
+import { imageByteCache } from "./lib/chat/imageBytes";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
@@ -267,6 +268,9 @@ export function App() {
     initialUser: demo ? DEMO_USER : null,
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/面板态,回首页。
     onClearAuth: () => {
+      // signPath 只在单一租户内唯一；鉴权身份退出/过期时必须丢弃内存图片字节，避免
+      // 同一 SPA 随后登录另一账号后以相同容器路径命中上一账号的 Blob。
+      imageByteCache.clear();
       localStore.current.clear();
       sessionsResetRef.current(); // 清列表/选中/已拉历史标记,允许下次登录重新自动选中
       setMessages([]);
@@ -278,10 +282,14 @@ export function App() {
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
     // 启动静默续期成功 → 直接恢复工作区。
-    onBootAuthed: () => setView("app"),
+    onBootAuthed: () => {
+      imageByteCache.clear();
+      setView("app");
+    },
     // 登录成功不预载会话：由 useChatSocket IndexedDB 注水（onHydrated）+ listSessions
     // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
     onLoginSuccess: () => {
+      imageByteCache.clear();
       sessionsResetRef.current();
       setMessages([]);
     },

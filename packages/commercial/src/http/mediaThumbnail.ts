@@ -3,7 +3,9 @@
  *
  * **背景**:聊天气泡渲染的是容器盘上的**全尺寸 PNG**(生图/上传常有几 MB),用户在跨境
  * 链路上(仓内已知「下载慢 = 跨境带宽」)每张图都要拉完整字节 → 灰骨架长时间「加载中…」。
- * 缩略图把气泡渲染尺寸压到 webp(640/1280 宽,质量 82),字节量掉一个数量级,首屏即出图。
+ * 缩略图把气泡渲染尺寸压到 webp(640/1280 宽、最高 4096px,质量 82),字节量掉一个数量级,
+ * 首屏即出图。高度上限专门兜住长截图:只限宽会把 2160×19302 的图缩成约
+ * 1280×11438(仍有 1460 万像素),编码/传输/移动端解码都很慢。
  *
  * **单一权威 / 语义边界**:
  *   - `w` 是**渲染参数**,不进签名语义(sign/verify 只覆盖 path+user+exp)。验签通过后
@@ -39,6 +41,12 @@ export type ThumbnailWidth = (typeof THUMBNAIL_WIDTHS)[number]
 
 /** 缩略 webp 质量(spec ~82)。 */
 const THUMBNAIL_WEBP_QUALITY = 82
+
+/**
+ * 长图缩略高度上限。与 width 一起组成 fit-inside bounding box:普通横/竖图仍由 width
+ * 决定尺寸,只有按 width 缩放后仍高于 4096px 的长截图才继续等比缩小。
+ */
+export const THUMBNAIL_MAX_HEIGHT_PX = 4096
 
 /**
  * 允许缓冲 + resize 的原图字节上限。超过 → 不缩、直接透传原字节(避免把超大图整个入
@@ -103,14 +111,20 @@ export function thumbnailCacheKey(input: {
 }
 
 /**
- * 等比缩到宽 ≤ width 的 webp。`withoutEnlargement` 保证不放大(原图窄于 width → 原样,
- * 只换 webp 编码)。`rotate()` 吃 EXIF 方向(手机竖拍不至于横过来)。
+ * 等比缩到 `width × THUMBNAIL_MAX_HEIGHT_PX` bounding box 内的 webp。
+ * `withoutEnlargement` 保证不放大(普通小图只换 webp 编码),`fit:inside` 保持宽高比。
+ * `rotate()` 吃 EXIF 方向(手机竖拍不至于横过来)。
  * sharp 已是 master 依赖(imageEdit 在用),无新增 npm 依赖。
  */
 export async function resizeToWebpThumbnail(input: Buffer, width: number): Promise<Buffer> {
   return sharp(input, { failOn: 'error' })
     .rotate()
-    .resize({ width, withoutEnlargement: true })
+    .resize({
+      width,
+      height: THUMBNAIL_MAX_HEIGHT_PX,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
     .webp({ quality: THUMBNAIL_WEBP_QUALITY })
     .toBuffer()
 }
