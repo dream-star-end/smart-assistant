@@ -41,9 +41,12 @@ function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
 export function PermissionCard({
   msg,
   onRespond,
+  readOnly = false,
 }: {
   msg: ChatMessage;
   onRespond: PermissionRespond;
+  /** 管理端会话查看等只读 surface：保留历史状态，但绝不弹框或提供审批动作。 */
+  readOnly?: boolean;
 }) {
   const questions = useMemo(() => asAskUserQuestion(msg), [msg]);
   const resolved = !!msg._resolved;
@@ -52,8 +55,8 @@ export function PermissionCard({
 
   // 待审批 → 挂载即自动弹审批框（agent 此刻被阻塞，等用户决策）。
   useEffect(() => {
-    if (!resolved) setOpen(true);
-  }, [resolved]);
+    if (!resolved && !readOnly) setOpen(true);
+  }, [resolved, readOnly]);
 
   const statusIcon = !resolved ? "⏳" : behavior === "allow" ? "✓" : "✗";
   const statusText = !resolved
@@ -97,7 +100,7 @@ export function PermissionCard({
       </div>
 
       {/* 待审批：内联快捷 + 打开审批框 */}
-      {!resolved && (
+      {!resolved && !readOnly && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
           <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
             {questions ? "回答" : "审批"}
@@ -112,6 +115,11 @@ export function PermissionCard({
               拒绝
             </Button>
           )}
+        </div>
+      )}
+      {!resolved && readOnly && (
+        <div className="border-t border-border px-3.5 py-2 text-[11.5px] text-faint">
+          只读查看 · 需由用户在原会话中处理
         </div>
       )}
 
@@ -139,6 +147,7 @@ export function PermissionCard({
 
       {/* 审批 modal */}
       {!resolved &&
+        !readOnly &&
         (questions ? (
           <AskUserQuestionModal
             open={open}

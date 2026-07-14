@@ -65,15 +65,17 @@ export type UserDetail = {
     session_id: string | null
     created_at: string
   }>
-  recent_sessions: Array<{
-    session_id: string
-    title: string
-    agent_id: string
-    message_count: number
-    created_at: string
-    last_at: string
-    updated_at: string
-  }>
+  recent_sessions: UserSessionSummary[]
+}
+
+export type UserSessionSummary = {
+  session_id: string
+  title: string
+  agent_id: string
+  message_count: number
+  created_at: string
+  last_at: string
+  updated_at: string
 }
 
 export type ModelGrant = {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
@@ -110,6 +110,15 @@ function installFixtures() {
             last_at: '2026-07-09T00:00:00.000Z',
             updated_at: '2026-07-09T00:00:00.000Z',
           },
+          {
+            session_id: 'web-2',
+            title: '会话二',
+            agent_id: 'codex',
+            message_count: 2,
+            created_at: '2026-07-02T00:00:00.000Z',
+            last_at: '2026-07-08T00:00:00.000Z',
+            updated_at: '2026-07-08T00:00:00.000Z',
+          },
         ],
       })
     if (/^\/users\/\d+\/model-grants$/.test(path))
@@ -122,6 +131,90 @@ function installFixtures() {
             granted_by: '9',
           },
         ],
+      })
+    if (path === '/sessions/web-1')
+      return Promise.resolve({
+        session: {
+          id: 'web-1',
+          user_id: 'c:1',
+          agent_id: 'main',
+          title: '会话一',
+          pinned: false,
+          created_at: 1,
+          last_at: 4,
+          updated_at: 4,
+          archived_count: 1,
+          archived_through_seq: 1,
+          messages: [
+            {
+              id: 'hot-user',
+              role: 'user',
+              text: '管理员看到的用户问题',
+              ts: 2,
+              _seq: 2,
+              status: 'sent',
+            },
+            {
+              id: 'hot-assistant',
+              role: 'assistant',
+              text: '管理员看到的助手回答',
+              ts: 3,
+              _seq: 3,
+            },
+            {
+              id: 'hot-permission',
+              role: 'permission',
+              text: '',
+              ts: 4,
+              _seq: 4,
+              requestId: 'perm-1',
+              toolName: 'Bash',
+              _resolved: false,
+              inputPreview: 'ls -la',
+            },
+          ],
+        },
+      })
+    if (path === '/sessions/web-1/archive')
+      return Promise.resolve({
+        session_id: 'web-1',
+        messages: [
+          {
+            id: 'archived-user',
+            role: 'user',
+            text: '云端更早的问题',
+            ts: 1,
+            _seq: 1,
+            status: 'sent',
+          },
+        ],
+        oldest_seq: 1,
+        has_more: false,
+      })
+    if (path === '/sessions/web-2')
+      return Promise.resolve({
+        session: {
+          id: 'web-2',
+          user_id: 'c:1',
+          agent_id: 'codex',
+          title: '会话二',
+          pinned: false,
+          created_at: 10,
+          last_at: 11,
+          updated_at: 11,
+          archived_count: 0,
+          archived_through_seq: 0,
+          messages: [
+            {
+              id: 'session-b-user',
+              role: 'user',
+              text: '会话 B 的独立消息',
+              ts: 11,
+              _seq: 1,
+              status: 'sent',
+            },
+          ],
+        },
       })
     return Promise.reject(new Error(`unexpected path ${path}`))
   })
@@ -211,5 +304,104 @@ describe('UserDetailSheet — 封禁', () => {
 
     await waitFor(() => expect(mockSend).toHaveBeenCalledTimes(1))
     expect(mockSend).toHaveBeenCalledWith('PATCH', '/users/1', { status: 'banned' })
+  })
+})
+
+describe('UserDetailSheet — 会话只读查看器', () => {
+  const noop = () => {}
+
+  test('点击会话后复用聊天 UI 展示完整消息，可加载归档且不暴露审批动作', async () => {
+    renderPage(
+      <UserDetailSheet
+        userId="1"
+        onClose={noop}
+        onChanged={noop}
+        onAdjust={noop}
+        onNavigate={noop}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看会话：会话一' }))
+
+    expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
+    expect(await screen.findByText('管理员看到的助手回答')).toBeTruthy()
+    expect(screen.getByText('只读')).toBeTruthy()
+    expect(screen.getByText(/只读查看 · 需由用户在原会话中处理/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '允许' })).toBeNull()
+    expect(mockGet).toHaveBeenCalledWith('/sessions/web-1', {
+      user_id: '1',
+      view: 'chat',
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    expect(await screen.findByText('云端更早的问题')).toBeTruthy()
+    expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
+      user_id: '1',
+      before: 0,
+      limit: 100,
+    })
+    expect(screen.queryByRole('button', { name: /从云端加载更早的历史/ })).toBeNull()
+  })
+
+  test('切换会话后丢弃上一会话迟到的归档响应，绝不混入当前会话', async () => {
+    let resolveArchive!: (value: unknown) => void
+    const delayedArchive = new Promise((resolve) => {
+      resolveArchive = resolve
+    })
+    const fixtureGet = mockGet.getMockImplementation()!
+    mockGet.mockImplementation((path: string, params?: Record<string, unknown>) => {
+      if (path === '/sessions/web-1/archive') return delayedArchive
+      return fixtureGet(path, params)
+    })
+
+    renderPage(
+      <UserDetailSheet
+        userId="1"
+        onClose={noop}
+        onChanged={noop}
+        onAdjust={noop}
+        onNavigate={noop}
+      />,
+    )
+
+    const sessionA = await screen.findByRole('button', { name: '查看会话：会话一' })
+    const sessionB = screen.getByRole('button', { name: '查看会话：会话二' })
+    fireEvent.click(sessionA)
+    expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    await waitFor(() =>
+      expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
+        user_id: '1',
+        before: 0,
+        limit: 100,
+      }),
+    )
+
+    const closeButtons = screen.getAllByRole('button', { name: '关闭' })
+    fireEvent.click(closeButtons[closeButtons.length - 1])
+    fireEvent.click(sessionB)
+    expect(await screen.findByText('会话 B 的独立消息')).toBeTruthy()
+
+    await act(async () => {
+      resolveArchive({
+        session_id: 'web-1',
+        messages: [
+          {
+            id: 'late-session-a',
+            role: 'user',
+            text: '不应混入 B 的 A 归档消息',
+            ts: 1,
+            _seq: 1,
+            status: 'sent',
+          },
+        ],
+        oldest_seq: 1,
+        has_more: false,
+      })
+      await delayedArchive
+    })
+
+    expect(screen.getByText('会话 B 的独立消息')).toBeTruthy()
+    expect(screen.queryByText('不应混入 B 的 A 归档消息')).toBeNull()
   })
 })

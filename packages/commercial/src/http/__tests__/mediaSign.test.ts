@@ -10,6 +10,7 @@ import {
   buildSignedUrl,
   computeSignature,
   deriveMediaSignKey,
+  extractApiMediaFilename,
   isContainerPathAllowed,
   isMediaFilenameAllowed,
   normalizeSignBatchInput,
@@ -288,12 +289,7 @@ describe('buildOpaqueInboxAssetUrl + verifySignedUrl(站内信图片)', () => {
   })
 
   test('过期 token 立即 gone', () => {
-    const { url } = buildOpaqueInboxAssetUrl(
-      key,
-      '550e8400-e29b-41d4-a716-446655440000',
-      'c:1',
-      -1,
-    )
+    const { url } = buildOpaqueInboxAssetUrl(key, '550e8400-e29b-41d4-a716-446655440000', 'c:1', -1)
     const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
     assert.equal(verifySignedUrl(key, { t }).kind, 'gone')
   })
@@ -314,6 +310,23 @@ describe('isMediaFilenameAllowed', () => {
     assert.equal(isMediaFilenameAllowed('x\n.png'), false)
     assert.equal(isMediaFilenameAllowed(''), false)
     assert.equal(isMediaFilenameAllowed('a'.repeat(257)), false)
+  })
+})
+
+describe('extractApiMediaFilename', () => {
+  test('提取持久化 /api/media URL，并兼容 query/hash/编码文件名', () => {
+    assert.equal(extractApiMediaFilename('/api/media/abc123.png'), 'abc123.png')
+    assert.equal(
+      extractApiMediaFilename('/api/media/%E6%8A%A5%E8%A1%A8%20100%25.png?legacy=1#preview'),
+      '报表 100%.png',
+    )
+  })
+
+  test('拒绝非 media URL、坏编码、路径分隔符与 traversal', () => {
+    assert.equal(extractApiMediaFilename('/api/file?path=x.png'), null)
+    assert.equal(extractApiMediaFilename('/api/media/%E0%A4%A'), null)
+    assert.equal(extractApiMediaFilename('/api/media/a%2Fb.png'), null)
+    assert.equal(extractApiMediaFilename('/api/media/..%2Fpasswd'), null)
   })
 })
 

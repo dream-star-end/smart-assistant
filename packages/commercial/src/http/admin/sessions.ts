@@ -1,7 +1,11 @@
 /**
  * /api/admin/sessions — admin 侧只读查看用户会话内容。
  *
- * 入口: GET /api/admin/sessions/:id[?user_id=:userId]
+ * 入口:
+ *   - GET  /api/admin/sessions/:id[?user_id=:userId&offset&limit] 旧诊断分页
+ *   - GET  /api/admin/sessions/:id?user_id=:userId&view=chat      对话 UI 热尾快照
+ *   - GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
+ *   - POST /api/admin/sessions/:id/media-sign?user_id=:userId     目标用户媒体短签
  *
  * 鉴权:
  *   - requireAdminVerifyDb(每次 DB 复核 admin 角色)
@@ -41,27 +45,51 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { HttpError, sendJson } from "../util.js";
+import { resolve as resolvePath } from "node:path";
+import { HttpError, readJsonBody, sendJson } from "../util.js";
 import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { getClientSession, readArchivedMessages } from "@openclaude/storage";
 import { parseBigintIdParam } from "./_shared.js";
 import { getPool } from "../../db/index.js";
 import { writeAdminAudit } from "../../admin/audit.js";
+import {
+  DEFAULT_SIGN_TTL_MS,
+  buildOpaqueMediaFileUrl,
+  buildOpaqueSignedUrl,
+  extractApiMediaFilename,
+  isContainerPathAllowed,
+  normalizeSignBatchInput,
+} from "../mediaSign.js";
 
 // session id 在 client_sessions 表是 TEXT PRIMARY KEY,
 // 实际格式有 UUID / web-... / nanoid 等,统一收口为字母数字 + '-_',
 // 1..128 字符。bigint extractTailId 不适用。
-const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const SESSION_PATH_RE = /^([A-Za-z0-9_-]{1,128})(?:\/(archive|media-sign))?$/;
+const COMMERCIAL_SESSION_USER_RE = /^c:[1-9][0-9]{0,18}$/;
 
-function parseSessionIdFromUrl(url: URL): string {
+export type AdminSessionRoute = {
+  sessionId: string;
+  kind: "detail" | "archive" | "media-sign";
+};
+
+export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
   const tail = url.pathname.slice("/api/admin/sessions/".length);
-  if (!SESSION_ID_RE.test(tail)) {
+  const match = SESSION_PATH_RE.exec(tail);
+  if (!match) {
     throw new HttpError(400, "VALIDATION", "invalid session id in URL", {
       issues: [{ path: "id", message: tail }],
     });
   }
-  return tail;
+  return {
+    sessionId: match[1]!,
+    kind:
+      match[2] === "archive"
+        ? "archive"
+        : match[2] === "media-sign"
+          ? "media-sign"
+          : "detail",
+  };
 }
 
 /** offset / limit 解析,失败抛 400 VALIDATION。 */
@@ -91,6 +119,37 @@ function parsePagingParams(url: URL): { offset: number; limit: number } {
   return { offset, limit };
 }
 
+export function parseArchivePagingParams(url: URL): { before: number; limit: number } {
+  const beforeRaw = url.searchParams.get("before");
+  const limitRaw = url.searchParams.get("limit");
+  let before = 0;
+  let limit = 100;
+  if (beforeRaw != null && beforeRaw !== "") {
+    const n = Number(beforeRaw);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new HttpError(400, "VALIDATION", "before must be a non-negative safe integer", {
+        issues: [{ path: "before", message: beforeRaw }],
+      });
+    }
+    before = n;
+  }
+  if (limitRaw != null && limitRaw !== "") {
+    const n = Number(limitRaw);
+    if (!Number.isInteger(n) || n < 1 || n > 200) {
+      throw new HttpError(400, "VALIDATION", "limit must be integer in [1, 200]", {
+        issues: [{ path: "limit", message: limitRaw }],
+      });
+    }
+    limit = n;
+  }
+  return { before, limit };
+}
+
+function scopedSessionUserId(url: URL): { rawUserId?: string; scopedUserId?: string } {
+  const rawUserId = parseBigintIdParam(url.searchParams.get("user_id"), "user_id");
+  return { rawUserId, scopedUserId: rawUserId ? `c:${rawUserId}` : undefined };
+}
+
 export async function handleAdminGetSession(
   req: IncomingMessage,
   res: ServerResponse,
@@ -99,15 +158,100 @@ export async function handleAdminGetSession(
 ): Promise<void> {
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const sessionId = parseSessionIdFromUrl(url);
+  const route = parseAdminSessionRoute(url);
+  if (route.kind === "media-sign") {
+    throw new HttpError(405, "METHOD_NOT_ALLOWED", "media-sign requires POST");
+  }
+  const sessionId = route.sessionId;
   // 可选 user_id scope —— 带就走 cross-check 路径(避免点 A 用户行看到 B 用户 session)。
   // 注意 namespace:URL 接收裸 bigint,内部拼 `c:${id}` 喂 storage(避免 `c:undefined`,
   // 不带 user_id 仍走 admin override = getClientSession 的 userId 形参 undefined 分支)。
-  const userId = parseBigintIdParam(url.searchParams.get("user_id"), "user_id");
-  const scopedUserId = userId ? `c:${userId}` : undefined;
+  const { scopedUserId } = scopedSessionUserId(url);
+
+  if (route.kind === "archive") {
+    const { before, limit } = parseArchivePagingParams(url);
+    // owner 必须经 storage backend 从权威会话行派生，不能信任前端 user_id；同时避免
+    // HTTP 层直连 client_sessions，保持 SQLite/PG backend 的单一抽象边界。
+    const session = await getClientSession(sessionId, scopedUserId);
+    if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
+    const page = await readArchivedMessages(sessionId, session.userId, before, limit);
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: "archive",
+        session_id: sessionId,
+        target_user_id: session.userId,
+        scoped_user_id: scopedUserId ?? null,
+        before_seq: before,
+        limit,
+        returned_messages: page.messages.length,
+        oldest_seq: page.oldestSeq,
+        has_more: page.hasMore,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, {
+      session_id: sessionId,
+      messages: page.messages,
+      oldest_seq: page.oldestSeq,
+      has_more: page.hasMore,
+    });
+    return;
+  }
+
+  const view = url.searchParams.get("view");
+  if (view !== null && view !== "chat") {
+    throw new HttpError(400, "VALIDATION", "view must be chat", {
+      issues: [{ path: "view", message: view }],
+    });
+  }
   const { offset, limit } = parsePagingParams(url);
   const s = await getClientSession(sessionId, scopedUserId);
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
+
+  // chat 模式与用户端 GET /api/sessions/:id 同源：一次返回完整热尾（含 lossless tape
+  // hydration），更早历史只走 /archive 的 _seq 游标。禁止再按 response offset 切 tape。
+  if (view === "chat") {
+    const messages = Array.isArray(s.messages) ? s.messages : [];
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: "chat",
+        session_id: sessionId,
+        target_user_id: s.userId,
+        scoped_user_id: scopedUserId ?? null,
+        returned_messages: messages.length,
+        archived_count: s.archivedCount ?? 0,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, {
+      session: {
+        id: s.id,
+        user_id: s.userId,
+        agent_id: s.agentId,
+        title: s.title,
+        pinned: s.pinned,
+        created_at: s.createdAt,
+        last_at: s.lastAt,
+        updated_at: s.updatedAt,
+        messages,
+        archived_count: s.archivedCount ?? 0,
+        archived_through_seq: s.archivedThroughSeq ?? 0,
+      },
+    });
+    return;
+  }
   // 长会话热尾巴+归档:getClientSession 返回的 s.messages 只是**尾巴**(spill 后老消息
   // 搬去归档表),完整会话 = 归档(更老)+ 尾巴。admin 诊断需要看到全部。
   //   - 虚拟全量数组 = [尾巴(时序 old→new)] ++ [归档(newest-first)],offset 越过
@@ -174,6 +318,77 @@ export async function handleAdminGetSession(
       has_more,
     },
   });
+}
+
+export async function handleAdminSignSessionMedia(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
+  if (!deps.mediaSignKey) {
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
+  }
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const route = parseAdminSessionRoute(url);
+  if (route.kind !== "media-sign") {
+    throw new HttpError(405, "METHOD_NOT_ALLOWED", "admin session detail and archive require GET");
+  }
+  const { scopedUserId } = scopedSessionUserId(url);
+  // 与 archive 相同：签名主体只取权威 session owner，URL user_id 仅用于 fail-closed scope。
+  const session = await getClientSession(route.sessionId, scopedUserId);
+  if (!session || !COMMERCIAL_SESSION_USER_RE.test(session.userId)) {
+    throw new HttpError(404, "NOT_FOUND", "session not found");
+  }
+
+  const body = (await readJsonBody(req)) as { paths?: unknown } | undefined;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "body must be a JSON object");
+  }
+  const norm = normalizeSignBatchInput(body.paths);
+  if (!norm.ok) throw new HttpError(400, "VALIDATION", norm.message);
+
+  const urls: Record<string, string> = {};
+  let expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  for (const path of norm.paths) {
+    const mediaFile = extractApiMediaFilename(path);
+    if (mediaFile) {
+      const signed = buildOpaqueMediaFileUrl(deps.mediaSignKey, mediaFile, session.userId);
+      urls[path] = signed.url;
+      expMs = Math.min(expMs, signed.expMs);
+      continue;
+    }
+    let resolved: string;
+    try {
+      resolved = resolvePath(path);
+    } catch {
+      continue;
+    }
+    if (!isContainerPathAllowed(resolved)) continue;
+    const signed = buildOpaqueSignedUrl(deps.mediaSignKey, path, session.userId);
+    urls[path] = signed.url;
+    expMs = Math.min(expMs, signed.expMs);
+  }
+
+  await writeAdminAudit(getPool(), {
+    adminId: admin.id,
+    action: "sessions.read",
+    target: `session:${route.sessionId}`,
+    before: null,
+    after: {
+      mode: "media-sign",
+      session_id: route.sessionId,
+      target_user_id: session.userId,
+      scoped_user_id: scopedUserId ?? null,
+      requested_paths: norm.paths.length,
+      signed_paths: Object.keys(urls).length,
+      request_id: ctx.requestId,
+    },
+    ip: ctx.clientIp,
+    userAgent: ctx.userAgent,
+  });
+  sendJson(res, 200, { urls, expMs });
 }
 
 /**

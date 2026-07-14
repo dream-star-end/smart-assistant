@@ -56,10 +56,24 @@ type RendererProps = {
   turnFinalAssistant?: boolean;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
+  /** 只读会话查看：禁止权限/问答卡触发任何写动作。 */
+  readOnly?: boolean;
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, sig, isLast, sending, inActiveTurn, turnActivity, delegateCost, turnFinalAssistant, cb, onRespondPermission }: RendererProps) {
+  function MessageRenderer({
+    message,
+    sig,
+    isLast,
+    sending,
+    inActiveTurn,
+    turnActivity,
+    delegateCost,
+    turnFinalAssistant,
+    cb,
+    onRespondPermission,
+    readOnly = false,
+  }: RendererProps) {
     const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
     switch (messageKind(message)) {
       case "user":
@@ -106,7 +120,7 @@ export const MessageRenderer = memo(
         if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
         return <PlanCard msg={message} />;
       case "permission":
-        return <PermissionCard msg={message} onRespond={onRespondPermission} />;
+        return <PermissionCard msg={message} onRespond={onRespondPermission} readOnly={readOnly} />;
       case "agent-group":
         return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
       case "delegate-progress":
@@ -126,6 +140,7 @@ export const MessageRenderer = memo(
     // 债D 委派成本来自别的行(助手行 usage.delegates),不进 message sig,单列比较,
     // 否则成本在 agent-group 完成后才到达时 memo 会跳过重渲、单卡不显示「N 积分」。
     a.delegateCost === b.delegateCost &&
+    a.readOnly === b.readOnly &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
 );
@@ -317,6 +332,7 @@ export function MessageList({
   archive,
   cb,
   onRespondPermission,
+  readOnly = false,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -328,6 +344,8 @@ export function MessageList({
   archive?: MessageListArchive | null;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
+  /** 管理端等只读 surface；默认 false，用户端行为不变。 */
+  readOnly?: boolean;
 }) {
   // lossless tape 会把 runtime-event 原始帧一并水合进 messages,供精确留存/工具 tail 重放；
   // 这些 messageKind=unknown 的行本来就不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
@@ -458,6 +476,7 @@ export function MessageList({
               turnFinalAssistant={turnFinalAssistant}
               cb={cb}
               onRespondPermission={onRespondPermission}
+              readOnly={readOnly}
             />
           </MessageBoundary>
         );
