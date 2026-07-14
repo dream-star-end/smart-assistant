@@ -26,6 +26,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
       theme="light"
       onClose={() => {}}
       onSetTheme={() => {}}
+      onOpenMemory={() => {}}
     />,
   )
 
