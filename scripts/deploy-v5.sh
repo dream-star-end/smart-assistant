@@ -1154,7 +1154,11 @@ probe_release_lossless_capability_field() {  # $1=release $2=capabilities|runtim
   if result="$(ssh "$KL_HOST" "set -e
       metadata='$reldir/deploy/v5/release-metadata.json'
       [ -r \"\$metadata\" ]
-      jq -er --arg c '$LOSSLESS_TURN_TAPE_CAP' 'if (((.$field // []) | index(\$c)) != null) then \"capable\" else \"incapable\" end' \"\$metadata\"" 2>/dev/null)"; then
+      jq -er --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.$field // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capability field must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
     rc=0
   else
     rc=$?
@@ -2344,11 +2348,12 @@ SQL
   echo "   · admin catalog 状态机(/api/admin/model-catalog)即为开放状态。"
 }
 
-# release 激活补偿:恢复旧 symlink/.prev-release 并 restart 旧 unit；失败必须显式报出混合现场。
-restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=candidate_release
-  local old_release="$1" old_prev_file="$2" reason="$3" candidate_release="$4"
-  local tmplink="$ACTIVE_SRC.rollback.$$" image_id runtime_release
-  echo "⚠ 激活未提交($reason)→ 补偿恢复 slot=$ACTIVE_SLOT old=$old_release" >&2
+# 自动回切的 lossless 能力门。candidate 一旦可能服务过 v2 写入，必须在任何
+# deploy_state/symlink/unit 补偿之前证明旧 master 和**当前实际** runtime tuple 都兼容。
+# 调用方持有 deploy lock，release metadata 不可变；同一次补偿只检查一次，避免状态已
+# 回退后第二次瞬态探测失败而留下 state=old/runtime=new 的分裂现场。
+assert_release_activation_compensation_compatible() {  # $1=old_release $2=candidate_release
+  local old_release="$1" candidate_release="$2" image_id runtime_release
   # The candidate may have accepted traffic as soon as restart was attempted.
   # If it is a v2 writer OR its capability probe failed, require the
   # compensation target unconditionally. Unknown must be armed: treating a
@@ -2367,6 +2372,14 @@ restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=c
     fi
     echo "  ✓ 自动补偿目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(无条件检查,无首写竞态)。" >&2
   fi
+}
+
+# 仅供紧邻的已通过能力门的补偿路径调用：恢复旧 symlink/.prev-release 并 restart 旧 unit。
+# 此函数故意不重新探测，见 assert_release_activation_compensation_compatible 的一次性检查说明。
+restore_release_runtime_after_compatibility_guard() {  # $1=old_release $2=old_prev_file $3=reason
+  local old_release="$1" old_prev_file="$2" reason="$3"
+  local tmplink="$ACTIVE_SRC.rollback.$$"
+  echo "⚠ 激活未提交($reason)→ 补偿恢复 slot=$ACTIVE_SLOT old=$old_release" >&2
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
       rm -f '$tmplink'
       ln -s '$old_release' '$tmplink'
@@ -2388,6 +2401,13 @@ restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=c
     return 1
   fi
   echo "  ✓ 补偿完成:slot=$ACTIVE_SLOT 已恢复 $old_release" >&2
+}
+
+# restart/smoke 失败发生在 deploy_state 提交前：先过能力门，再恢复运行面。
+restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=candidate_release
+  local old_release="$1" old_prev_file="$2" reason="$3" candidate_release="$4"
+  assert_release_activation_compensation_compatible "$old_release" "$candidate_release" || return 1
+  restore_release_runtime_after_compatibility_guard "$old_release" "$old_prev_file" "$reason"
 }
 
 # 状态提交回执丢失时做三态裁决，并把 state 收敛回提交前值。只有确认 original/reverted
@@ -2469,8 +2489,12 @@ activate_release() {
     return 1
   fi
   if ! ds_commit_active_release "$reldir"; then
-    if restore_release_state_if_committed "$reldir"; then
-      restore_release_activation "$prev" "$old_prev_file" "deploy_state commit failed" "$reldir" \
+    # PG 可能已经提交但 ACK 丢失。candidate 已对外服务过时，必须先证明旧栈兼容，
+    # 再触碰 deploy_state；否则会留下 state=old/runtime=new 的权威分裂。
+    if ! assert_release_activation_compensation_compatible "$prev" "$reldir"; then
+      echo "FATAL:旧栈兼容性未证明，保持 deploy_state 与新运行面不动；禁止盲目补偿。" >&2
+    elif restore_release_state_if_committed "$reldir"; then
+      restore_release_runtime_after_compatibility_guard "$prev" "$old_prev_file" "deploy_state commit failed" \
         || mark_deploy_recovery_required "state 已恢复但 slot=$ACTIVE_SLOT 运行面回切失败(target=$reldir)"
     else
       echo "FATAL:state 未确认恢复，保持新运行面不动；禁止盲目回切旧 symlink/unit。" >&2
