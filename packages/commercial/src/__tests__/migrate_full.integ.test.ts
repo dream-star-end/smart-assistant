@@ -114,6 +114,7 @@ describe("full migration suite", () => {
       "client_session_turn_tapes",
       "credit_ledger",
       "email_verifications",
+      "inbox_message_assets",
       "model_pricing",
       "orders",
       "rate_limit_events",

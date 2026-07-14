@@ -180,6 +180,7 @@ export function ImageViewer({
   peek,
   submitImageEdit: submitProp,
   initialMode = 'view',
+  readOnly = false,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -193,12 +194,14 @@ export function ImageViewer({
   submitImageEdit?: (value: ImageEditSubmit) => void | Promise<void>
   /** 开图即进入的模式;'edit' = 直达圈选编辑器(左下角「编辑」浮钮用)。默认 'view'。 */
   initialMode?: ViewerMode
+  /** 只读媒体(站内信/后台预览)：不从聊天上下文继承编辑、评论、分享动作。 */
+  readOnly?: boolean
 }) {
   const ctx = useContext(ImageEditActionsContext)
-  const submitImageEdit = submitProp ?? ctx.submitImageEdit
+  const submitImageEdit = readOnly ? undefined : submitProp ?? ctx.submitImageEdit
   // 评论 = 普通模型 turn(原图 media + 百分比坐标文本),不走 submitImageEdit 帧链路。
   // 与 submitImageEdit 同门控(image2/GPT),存在即评论动作可用。
-  const submitImageComment = ctx.submitImageComment
+  const submitImageComment = readOnly ? undefined : ctx.submitImageComment
 
   const [mode, setMode] = useState<ViewerMode>('view')
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
@@ -497,16 +500,18 @@ export function ImageViewer({
                     >
                       <Download size={18} />
                     </button>
-                    <button
-                      type="button"
-                      aria-label="分享"
-                      title="分享"
-                      onClick={() => void handleShare()}
-                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
-                    >
-                      <Share2 size={18} />
-                    </button>
-                    <div className="relative">
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        aria-label="分享"
+                        title="分享"
+                        onClick={() => void handleShare()}
+                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                      >
+                        <Share2 size={18} />
+                      </button>
+                    )}
+                    {!readOnly && <div className="relative">
                       <button
                         type="button"
                         aria-label="更多"
@@ -544,7 +549,7 @@ export function ImageViewer({
                           </div>
                         </>
                       )}
-                    </div>
+                    </div>}
                   </div>
                 </header>
 
@@ -574,7 +579,7 @@ export function ImageViewer({
                 </div>
 
                 {/* 底部动作条:编辑 / 评论 / 调整大小(「移除」已按 boss 判定下线)。 */}
-                <div className="flex shrink-0 items-start justify-center gap-3 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:gap-6">
+                {!readOnly && <div className="flex shrink-0 items-start justify-center gap-3 px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:gap-6">
                   <ActionButton
                     label="编辑"
                     icon={<Pencil size={20} />}
@@ -596,7 +601,7 @@ export function ImageViewer({
                     reason={editDisabledReason}
                     onClick={() => setMode('resize')}
                   />
-                </div>
+                </div>}
               </>
             )}
 

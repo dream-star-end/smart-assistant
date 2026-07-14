@@ -231,6 +231,7 @@ export function ZoomableImage({
   onError,
   signPath,
   thumbWidth,
+  readOnly = false,
 }: {
   src: string;
   alt: string;
@@ -241,11 +242,13 @@ export function ZoomableImage({
   signPath?: string | null;
   /** 缩略请求宽度(640/1280);缺省按 dpr 自选。null = 直接取原图(不缩)。 */
   thumbWidth?: number | null;
+  /** 站内信等只读上下文：保留灯箱/下载，不暴露聊天图片编辑入口。 */
+  readOnly?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
   // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
-  const canEdit = !!useImageEditActions().submitImageEdit;
+  const canEdit = !readOnly && !!useImageEditActions().submitImageEdit;
   const { get, peek, cacheIdentity } = useFreshSignedUrl(signPath ?? null);
 
   // 缩略分级 + 流式进度 + 字节复用(单一 hook 收口)。签名 URL 请求 ?w=<640|1280>;
@@ -349,14 +352,17 @@ export function ZoomableImage({
         get={get}
         peek={peek}
         initialMode="view"
+        readOnly={readOnly}
       />
     </>
   );
 }
 
 /** markdown 行内 <img>：容器路径主动签名后渲染，否则直渲。签不出时显示替代文本。 */
-export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
-  const { src, alt, ...rest } = props;
+export function SignedImg(
+  props: React.ImgHTMLAttributes<HTMLImageElement> & { readOnly?: boolean },
+) {
+  const { src, alt, readOnly, ...rest } = props;
   const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
   if (!resolved) {
     return (
@@ -372,6 +378,7 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
       onError={onError}
       signPath={typeof src === "string" && needsSignedSrc(src) ? src : null}
       imgClassName={typeof rest.className === "string" ? rest.className : undefined}
+      readOnly={readOnly}
     />
   );
 }

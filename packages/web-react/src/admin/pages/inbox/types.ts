@@ -50,6 +50,12 @@ export interface CreateMessagePayload {
   user_id?: string;
   expires_at?: string;
   notify_email?: boolean;
+  assets?: Array<{
+    client_id: string;
+    filename: string;
+    mime_type: "image/png" | "image/jpeg" | "image/webp";
+    data_base64: string;
+  }>;
 }
 
 // 级别文案 / 色调收口至 lib/inboxLevels —— 用户侧通知抽屉（InboxDialog）与本页共用同一权威源，

@@ -4,6 +4,7 @@ import { describe, test } from 'node:test'
 import { extractRawQueryParam } from '../handlers.js'
 import {
   MEDIA_SIGN_BATCH_MAX,
+  buildOpaqueInboxAssetUrl,
   buildOpaqueMediaFileUrl,
   buildOpaqueSignedUrl,
   buildSignedUrl,
@@ -263,6 +264,38 @@ describe('buildOpaqueMediaFileUrl + verifySignedUrl(内容寻址媒体)', () => 
     const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t') ?? ''
     const flipped = `${t.slice(0, -1)}${t.endsWith('A') ? 'B' : 'A'}`
     assert.equal(verifySignedUrl(key, { t: flipped }).kind, 'forbidden')
+  })
+})
+
+describe('buildOpaqueInboxAssetUrl + verifySignedUrl(站内信图片)', () => {
+  const key = deriveMediaSignKey(VALID_BRIDGE_SECRET)
+
+  test('asset UUID 与 user 均保持 opaque，验签得到 inbox kind', () => {
+    const assetId = '550e8400-e29b-41d4-a716-446655440000'
+    const { url, expMs } = buildOpaqueInboxAssetUrl(key, assetId, 'c:42')
+    assert.ok(url.startsWith('/api/media-signed?t='))
+    assert.ok(!url.includes(assetId))
+    assert.ok(!url.includes('c%3A42'))
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
+    const result = verifySignedUrl(key, { t })
+    assert.equal(result.kind, 'ok')
+    if (result.kind === 'ok') {
+      assert.equal(result.mediaKind, 'inbox')
+      assert.equal(result.decodedPath, assetId)
+      assert.equal(result.userId, 'c:42')
+      assert.equal(result.expMs, expMs)
+    }
+  })
+
+  test('过期 token 立即 gone', () => {
+    const { url } = buildOpaqueInboxAssetUrl(
+      key,
+      '550e8400-e29b-41d4-a716-446655440000',
+      'c:1',
+      -1,
+    )
+    const t = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('t')
+    assert.equal(verifySignedUrl(key, { t }).kind, 'gone')
   })
 })
 

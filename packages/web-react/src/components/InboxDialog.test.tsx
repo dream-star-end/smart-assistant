@@ -19,7 +19,19 @@ vi.mock("../lib/api", () => ({
 
 // Markdown 走懒加载 + Suspense；测试里替身为直渲 children，专注面板行为。
 vi.mock("./Markdown", () => ({
-  Markdown: ({ children }: { children: string }) => <div data-testid="md-body">{children}</div>,
+  Markdown: ({
+    children,
+    signMedia,
+    readOnly,
+  }: {
+    children: string;
+    signMedia?: boolean;
+    readOnly?: boolean;
+  }) => (
+    <div data-testid="md-body" data-sign-media={String(!!signMedia)} data-read-only={String(!!readOnly)}>
+      {children}
+    </div>
+  ),
 }));
 
 import { InboxDialog } from "./InboxDialog";
@@ -80,6 +92,29 @@ describe("InboxDialog", () => {
     expect(markInboxRead).not.toHaveBeenCalled();
     // 首屏拉取不带 unread_only（全部 Tab）。
     expect(listInboxMessages).toHaveBeenCalledWith(auth, { limit: 30, unreadOnly: false });
+  });
+
+  test("富消息以卡片标出图片/图表，展开后交给 Markdown 渲染", async () => {
+    listInboxMessages.mockResolvedValue({
+      messages: [
+        mk("rich", {
+          body_md:
+            "![趋势](/api/inbox-assets/550e8400-e29b-41d4-a716-446655440000)\n```chart\n{\"type\":\"bar\"}\n```",
+        }),
+      ],
+      unread_count: 1,
+    });
+    markInboxRead.mockResolvedValue({ ok: true, already: false });
+    render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
+
+    await screen.findByText("标题rich");
+    expect(screen.getByText("图片")).toBeInTheDocument();
+    expect(screen.getByText("图表")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /标题rich/ }));
+    const rendered = await screen.findByTestId("md-body");
+    expect(rendered).toHaveTextContent("/api/inbox-assets/");
+    expect(rendered).toHaveAttribute("data-sign-media", "true");
+    expect(rendered).toHaveAttribute("data-read-only", "true");
   });
 
   test("展开未读条目：渲染全文 + 恰好一次单条已读 + 回调；已读条目展开不再标记", async () => {

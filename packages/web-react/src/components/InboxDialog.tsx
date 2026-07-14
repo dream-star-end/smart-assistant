@@ -1,7 +1,10 @@
 import {
+  BarChart3,
   Bell,
   BellOff,
   CheckCheck,
+  ChevronDown,
+  ImageIcon,
   Inbox,
   type LucideIcon,
   Megaphone,
@@ -242,7 +245,7 @@ export function InboxDialog({
       onOpenChange={(o) => !o && onClose()}
       side="right"
       srTitle="站内信"
-      className="w-[100vw] max-w-[100vw] bg-surface sm:w-[26rem] sm:max-w-[26rem]"
+      className="w-[100vw] max-w-[100vw] bg-surface sm:w-[44rem] sm:max-w-[44rem]"
     >
       {/* 头部：铃铛 + 标题 + 未读数 + 全部已读 + 关闭 */}
       <div className="flex items-center gap-2 border-b border-border px-4 py-3">
@@ -277,7 +280,7 @@ export function InboxDialog({
       </div>
 
       {/* 列表区 */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-1.5">
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
         {!auth ? (
           <EmptyState icon={Bell} title="请先登录" hint="登录后可查看你的站内信。" />
         ) : loading ? (
@@ -297,7 +300,7 @@ export function InboxDialog({
           )
         ) : (
           <>
-            <ul className="flex flex-col gap-0.5 py-0.5">
+            <ul className="flex flex-col gap-3">
               {messages.map((m) => (
                 <InboxItem
                   key={m.id}
@@ -339,7 +342,7 @@ export function InboxDialog({
   );
 }
 
-/** 单条：紧凑行（图标容器 + 标题 + 两行摘要 + 相对时间），点击展开手风琴渲染全文。 */
+/** 单条卡片：摘要态轻扫，点击后在卡内展开只读 Markdown / 图片 / 图表。 */
 function InboxItem({
   message: m,
   expanded,
@@ -352,72 +355,102 @@ function InboxItem({
   const meta = INBOX_LEVEL_META[m.level] ?? INBOX_LEVEL_META.info;
   const Icon = LEVEL_ICON[m.level] ?? Bell;
   const summary = useMemo(() => stripMarkdownSummary(m.body_md), [m.body_md]);
+  const hasImage = useMemo(
+    () => /!\[[^\]]*\]\([^)]*\)|\/api\/inbox-assets\//i.test(m.body_md),
+    [m.body_md],
+  );
+  const hasChart = useMemo(() => /```(?:chart|mermaid)\b/i.test(m.body_md), [m.body_md]);
 
   return (
-    <li>
+    <li
+      className={cn(
+        "relative overflow-hidden rounded-xl border bg-elevated shadow-soft transition-[border-color,box-shadow]",
+        expanded ? "border-border-strong shadow-float" : "border-border hover:border-border-strong",
+        !m.read && "border-l-2 border-l-accent",
+      )}
+    >
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
         className={cn(
-          "flex w-full gap-3 rounded-lg px-2.5 py-2.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring",
-          expanded && "bg-hover",
+          "flex w-full gap-3.5 px-3.5 py-3.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-4",
+          expanded && "bg-hover/60",
         )}
       >
         <span
           className={cn(
-            "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full",
+            "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl",
             LEVEL_ICON_CLASS[meta.tone],
           )}
           title={meta.label}
         >
-          <Icon size={16} aria-hidden />
+          <Icon size={17} aria-hidden />
         </span>
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="flex items-center gap-1.5">
+          <span className="flex items-start gap-2">
             {!m.read && <span className="size-1.5 shrink-0 rounded-full bg-accent" aria-hidden />}
             <span
               className={cn(
-                "min-w-0 flex-1 truncate text-[13.5px] text-fg",
+                "min-w-0 flex-1 truncate text-[14px] leading-5 text-fg",
                 m.read ? "font-medium" : "font-semibold",
               )}
             >
               {m.title}
             </span>
             <span
-              className="shrink-0 text-[11px] tabular-nums text-faint"
+              className="shrink-0 pt-0.5 text-[11px] tabular-nums text-faint"
               title={fmtAbsTime(m.created_at)}
             >
               {fmtRelativeTime(m.created_at)}
             </span>
           </span>
           {!expanded && summary && (
-            <span className="mt-1 line-clamp-2 text-[12.5px] leading-relaxed text-muted">
+            <span className="mt-1.5 line-clamp-2 text-[12.5px] leading-relaxed text-muted">
               {summary}
             </span>
           )}
+          <span className="mt-2 flex min-h-5 flex-wrap items-center gap-1.5">
+            <Badge tone={meta.tone}>{meta.label}</Badge>
+            {hasImage && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+                <ImageIcon size={12} /> 图片
+              </span>
+            )}
+            {hasChart && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+                <BarChart3 size={12} /> 图表
+              </span>
+            )}
+          </span>
         </span>
+        <ChevronDown
+          size={16}
+          aria-hidden
+          className={cn("mt-1 shrink-0 text-faint transition-transform", expanded && "rotate-180")}
+        />
       </button>
       {expanded && (
-        <div className="px-2.5 pb-3 pl-[3.25rem] pt-1 text-[13px] leading-relaxed text-fg">
-          <Markdown>{m.body_md}</Markdown>
+        <div className="min-w-0 overflow-hidden border-t border-border bg-surface px-4 py-4 text-[13px] leading-relaxed text-fg sm:px-5">
+          <Markdown signMedia readOnly>{m.body_md}</Markdown>
         </div>
       )}
     </li>
   );
 }
 
-/** 首屏加载骨架：4 条占位行，形状对齐真实列表（图标圆 + 标题 + 两行摘要）。 */
+/** 首屏加载骨架：4 张卡片，形状对齐真实摘要态。 */
 function SkeletonRows() {
   return (
-    <ul className="flex flex-col gap-0.5 py-0.5" aria-hidden>
+    <ul className="flex flex-col gap-3" aria-hidden>
       {[0, 1, 2, 3].map((i) => (
-        <li key={i} className="flex gap-3 px-2.5 py-2.5">
-          <Skeleton className="size-8 shrink-0 rounded-full" />
+        <li key={i} className="flex gap-3 rounded-xl border border-border bg-elevated px-4 py-4">
+          <Skeleton className="size-9 shrink-0 rounded-xl" />
           <div className="min-w-0 flex-1">
             <Skeleton className="h-3.5 w-1/2" />
             <Skeleton className="mt-2 h-3 w-full" />
             <Skeleton className="mt-1.5 h-3 w-3/4" />
+            <Skeleton className="mt-2.5 h-5 w-14 rounded-full" />
           </div>
         </li>
       ))}

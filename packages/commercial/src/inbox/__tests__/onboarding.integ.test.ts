@@ -51,6 +51,7 @@ const COMMERCIAL_TABLES = [
   "egress_proxies",
   "email_verifications",
   "feedback",
+  "inbox_message_assets",
   "inbox_message_reads",
   "inbox_messages",
   "model_pricing",

@@ -48,10 +48,11 @@ describe('fetchImageBlobWithResign（图片编辑取图过期自愈）', () => {
 })
 
 describe('needsSignedSrc（签名管线单一权威判定）', () => {
-  test('容器绝对路径 + /api/media 上传/生成媒体都需签名(凭证进 URL,不靠 SameSite cookie)', () => {
+  test('容器路径、/api/media 与站内信资产都需签名(凭证进 URL,不靠 SameSite cookie)', () => {
     expect(needsSignedSrc('/home/agent/.openclaude/generated/a.png')).toBe(true)
     expect(needsSignedSrc('/api/media/abc123.png')).toBe(true)
     expect(needsSignedSrc('/api/media/b99bc530.mp3')).toBe(true) // 非图媒体条(那条 401 的 mp3)同样走通
+    expect(needsSignedSrc('/api/inbox-assets/550e8400-e29b-41d4-a716-446655440000')).toBe(true)
   })
   test('http/data/blob 与其它 /api 端点不走签名', () => {
     expect(needsSignedSrc('https://cdn.test/x.png')).toBe(false)

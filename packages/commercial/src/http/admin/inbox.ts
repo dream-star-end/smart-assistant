@@ -26,6 +26,9 @@ import {
   extractTailId,
 } from "./_shared.js";
 
+/** 15 MiB 原图经 base64 后约 20 MiB；只放大创建站内信这一条路由。 */
+export const INBOX_CREATE_BODY_MAX_BYTES = 22 * 1024 * 1024;
+
 function serializeAdminInboxMessage(
   m: import("../../inbox/inbox.js").InboxMessage,
 ): Record<string, unknown> {
@@ -76,7 +79,7 @@ export async function handleAdminCreateInbox(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
-  const body = (await readJsonBody(req)) ?? {};
+  const body = (await readJsonBody(req, INBOX_CREATE_BODY_MAX_BYTES)) ?? {};
   if (typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "VALIDATION", "request body must be JSON object");
   }

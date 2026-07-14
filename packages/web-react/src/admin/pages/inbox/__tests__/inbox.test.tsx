@@ -58,6 +58,14 @@ function stubApi() {
 beforeEach(() => {
   adminGet.mockReset();
   adminSend.mockReset();
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:inbox-preview"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
+  });
 });
 afterEach(cleanup);
 
@@ -80,7 +88,7 @@ describe("InboxPage", () => {
     await screen.findByText("系统维护通知");
 
     fireEvent.change(screen.getByPlaceholderText("≤200 字"), { target: { value: "上线公告" } });
-    fireEvent.change(screen.getByPlaceholderText(/支持完整 Markdown/), {
+    fireEvent.change(screen.getByPlaceholderText(/输入 Markdown/), {
       target: { value: "正文内容" },
     });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
@@ -108,7 +116,7 @@ describe("InboxPage", () => {
     renderPage(<InboxPage />);
     await screen.findByText("系统维护通知");
     // 只填正文，标题留空
-    fireEvent.change(screen.getByPlaceholderText(/支持完整 Markdown/), {
+    fireEvent.change(screen.getByPlaceholderText(/输入 Markdown/), {
       target: { value: "正文" },
     });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
@@ -128,5 +136,55 @@ describe("InboxPage", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "删除" }));
 
     await waitFor(() => expect(adminSend).toHaveBeenCalledWith("DELETE", "/messages/1"));
+  });
+
+  test("图表模板写入 Markdown，并在预览侧保留 chart fence", async () => {
+    stubApi();
+    renderPage(<InboxPage />);
+    await screen.findByText("系统维护通知");
+
+    fireEvent.click(screen.getByRole("button", { name: "插入数据图表模板" }));
+    const value = (screen.getByPlaceholderText(/输入 Markdown/) as HTMLTextAreaElement).value;
+    expect(value).toContain("```chart");
+    expect(value).toContain('"type":"bar"');
+  });
+
+  test("选择图片后插入占位符，发送 payload 带 base64 asset", async () => {
+    stubApi();
+    adminSend.mockResolvedValue({ message: {} });
+    renderPage(<InboxPage />);
+    await screen.findByText("系统维护通知");
+
+    const file = new File([new Uint8Array([1, 2, 3, 4])], "demo.png", { type: "image/png" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+    });
+    fireEvent.change(screen.getByLabelText("选择站内信图片"), { target: { files: [file] } });
+    expect(await screen.findByText("demo.png")).toBeInTheDocument();
+    expect((screen.getByPlaceholderText(/输入 Markdown/) as HTMLTextAreaElement).value).toMatch(
+      /!\[demo\.png\]\(inbox-asset:\/\/[0-9a-f-]{36}\)/,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText("≤200 字"), { target: { value: "图片公告" } });
+    fireEvent.click(screen.getByRole("button", { name: /^发送$/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(adminSend).toHaveBeenCalledWith(
+        "POST",
+        "/messages",
+        expect.objectContaining({
+          title: "图片公告",
+          assets: [
+            expect.objectContaining({
+              filename: "demo.png",
+              mime_type: "image/png",
+              data_base64: "AQIDBA==",
+            }),
+          ],
+        }),
+      ),
+    );
   });
 });
