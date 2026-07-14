@@ -58,10 +58,10 @@ describe("paymentClientKind", () => {
   });
 });
 
-describe("HupijiaoPaymentEntry 首次渲染互斥", () => {
-  test("桌面只挂载二维码，不暴露手机链接", () => {
+describe("HupijiaoPaymentEntry 当前微信支付能力", () => {
+  test("桌面挂载二维码，不暴露已停用的手机链接", () => {
     setNavigator({ userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" });
-    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" mobileUrl="https://pay.test/mobile" />);
+    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" />);
 
     expect(screen.getByRole("img", { name: "微信支付二维码" })).toHaveAttribute(
       "src",
@@ -70,28 +70,24 @@ describe("HupijiaoPaymentEntry 首次渲染互斥", () => {
     expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
   });
 
-  test("普通手机只挂载手机链接，绝不挂载二维码", () => {
+  test("普通手机挂载二维码并引导截图后从微信相册扫码", () => {
     setNavigator({ userAgent: "Mozilla/5.0 (Linux; Android 16) Chrome/140.0 Mobile" });
-    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" mobileUrl="https://pay.test/mobile" />);
+    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" />);
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    expect(screen.getByTestId("mobile-payment-link")).toHaveAttribute("href", "https://pay.test/mobile");
-  });
-
-  test("微信 WebView 安全失败，不加载二维码也不跳手机链接", () => {
-    setNavigator({ userAgent: "Mozilla/5.0 (iPhone) Mobile MicroMessenger/8.0.60", mobile: true });
-    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" mobileUrl="https://pay.test/mobile" />);
-
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "微信支付二维码" })).toHaveAttribute(
+      "src",
+      "https://pay.test/qr.png",
+    );
     expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
-    expect(screen.getByTestId("wechat-payment-browser-hint")).toHaveTextContent("在浏览器打开");
+    expect(screen.getByTestId("mobile-screenshot-payment-hint")).toHaveTextContent("从相册选择");
   });
 
-  test("手机订单缺 mobileUrl 时不回退加载二维码", () => {
-    setNavigator({ userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) Mobile" });
-    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" mobileUrl={null} />);
+  test("微信 WebView 挂载二维码并提示截图后关闭当前页", () => {
+    setNavigator({ userAgent: "Mozilla/5.0 (iPhone) Mobile MicroMessenger/8.0.60", mobile: true });
+    render(<HupijiaoPaymentEntry qrcodeUrl="https://pay.test/qr.png" />);
 
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
-    expect(screen.getByTestId("mobile-payment-unavailable")).toHaveTextContent("电脑端");
+    expect(screen.getByRole("img", { name: "微信支付二维码" })).toBeInTheDocument();
+    expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
+    expect(screen.getByTestId("wechat-screenshot-payment-hint")).toHaveTextContent("关闭当前页");
   });
 });

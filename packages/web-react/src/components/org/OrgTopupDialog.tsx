@@ -249,10 +249,7 @@ export function OrgTopupDialog({
               </div>
               <div className="text-[12.5px] text-faint">订单号 {stage.result.orderNo}</div>
             </div>
-            <HupijiaoPaymentEntry
-              qrcodeUrl={stage.result.qr}
-              mobileUrl={stage.result.mobileUrl}
-            />
+            <HupijiaoPaymentEntry qrcodeUrl={stage.result.qr} />
             <Button variant="ghost" size="sm" onClick={backToInput} className="text-muted">
               <RefreshCw size={14} /> 改充值金额
             </Button>
