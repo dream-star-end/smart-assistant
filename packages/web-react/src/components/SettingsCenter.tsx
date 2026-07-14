@@ -12,22 +12,24 @@ import {
 } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
 import { AccountTab } from "./settings/AccountTab";
+import { FeedbackTab } from "./settings/FeedbackTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Spinner, Tabs } from "./ui";
 
-type Section = "account" | "usage" | "preferences" | "about";
+type Section = "account" | "usage" | "preferences" | "feedback" | "about";
 
 const SECTIONS: { id: Section; label: string }[] = [
   { id: "account", label: "账户与计费" },
   { id: "usage", label: "用量" },
   { id: "preferences", label: "偏好" },
+  { id: "feedback", label: "反馈" },
   { id: "about", label: "关于" },
 ];
 
 /**
- * 设置中心（v5 商业版）：账户与计费 / 用量 / 偏好 / 关于 四分区。
+ * 设置中心（v5 商业版）：账户与计费 / 用量 / 偏好 / 反馈 / 关于五分区。
  * 数据全部走 v5 REST（/api/me · /api/me/preferences · /api/me/usage · /api/me/api-keys ·
  * /api/payment/*），各分区懒加载（仅在 open 且激活时拉），demo / 未登录态不发任何请求。
  *
@@ -140,6 +142,7 @@ export function SettingsCenter({
             <Dialog.Title className="text-[15px] font-semibold text-fg">设置</Dialog.Title>
             <Dialog.Close asChild>
               <button
+                type="button"
                 aria-label="关闭"
                 className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -149,12 +152,15 @@ export function SettingsCenter({
           </div>
 
           <div className="border-b border-border px-4 pb-3">
-            <Tabs
-              aria-label="设置分区"
-              value={section}
-              onValueChange={(v) => setSection(v as Section)}
-              items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
-            />
+            <div className="no-scrollbar overflow-x-auto">
+              <Tabs
+                aria-label="设置分区"
+                value={section}
+                onValueChange={(v) => setSection(v as Section)}
+                items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
+                className="min-w-max [&_[role=tab]]:px-3"
+              />
+            </div>
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto">
@@ -197,6 +203,8 @@ export function SettingsCenter({
                       onOpenMemory={onOpenMemory}
                     />
                   ))}
+
+                {section === "feedback" && <FeedbackTab auth={auth} />}
 
                 {section === "about" && <AboutSection />}
               </>
