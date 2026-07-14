@@ -119,7 +119,7 @@ function parseOptionsBlock(
   }
 }
 
-export function OptionsBlock({ code }: { code: string }) {
+export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
   const { sendUserText, busy } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
@@ -130,11 +130,11 @@ export function OptionsBlock({ code }: { code: string }) {
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
   useEffect(() => {
-    if (!group || !parsed) return;
+    if (readOnly || !group || !parsed) return;
     group.register(blockKey, { question: parsed.question, multi: parsed.multi });
     return () => group.unregister(blockKey);
     // question/multi 变化(流式补全)时重登;blockKey 稳定。
-  }, [group, blockKey, parsed?.question, parsed?.multi, !parsed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [group, blockKey, parsed, readOnly]);
 
   if (!parsed) {
     return (
@@ -148,7 +148,7 @@ export function OptionsBlock({ code }: { code: string }) {
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
   const sent = grouped ? (groupSnap?.sent ?? false) : sentLocal !== null;
   const sentText = grouped ? (groupEntry?.labels.join("、") ?? null) : sentLocal;
-  const interactive = !!sendUserText && !sent;
+  const interactive = !readOnly && !!sendUserText && !sent;
 
   const report = (labels: string[]) => group?.setAnswer(blockKey, labels);
 
@@ -228,7 +228,7 @@ export function OptionsBlock({ code }: { code: string }) {
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
         <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(答完全部问题后统一发送)</p>
       )}
-      {!sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
+      {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
     </div>
   );
 }

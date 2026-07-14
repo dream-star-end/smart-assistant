@@ -198,9 +198,10 @@ export function computeSignature(
  *     走容器 `/api/file?path=`。
  *   - `'media'` → `decodedPath` 是**内容寻址媒体文件名**(`<digest>.<ext>`),走容器
  *     `/api/media/<file>`(uploads/generated 双目录 + tenant scope 在容器内做)。
+ *   - `'inbox'` → `decodedPath` 是站内信资产 UUID，由 master 从 PG 读取并再次检查消息可见性。
  */
 export type VerifyResult =
-  | { kind: 'ok'; userId: string; expMs: number; decodedPath: string; mediaKind: 'file' | 'media' }
+  | { kind: 'ok'; userId: string; expMs: number; decodedPath: string; mediaKind: 'file' | 'media' | 'inbox' }
   | { kind: 'bad-request'; reason: string }
   | { kind: 'forbidden'; reason: string }
   | { kind: 'gone'; reason: string }
@@ -276,7 +277,7 @@ interface OpaqueMediaPayload {
    * `'media'` = 内容寻址媒体文件名(走容器 `/api/media/<file>`)。legacy token 无此字段
    * → 解出 undefined → 归 `'file'`,向后兼容。
    */
-  k?: 'file' | 'media'
+  k?: 'file' | 'media' | 'inbox'
 }
 
 function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): VerifyResult {
@@ -322,11 +323,11 @@ function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): Veri
   if (!Number.isSafeInteger(expMs)) {
     return { kind: 'bad-request', reason: 'bad-exp' }
   }
-  // k 缺省(legacy token)→ 'file';显式值只接受 file/media,其余判伪造。
-  if (k !== undefined && k !== 'file' && k !== 'media') {
+  // k 缺省(legacy token)→ 'file';显式值只接受已知三类,其余判伪造。
+  if (k !== undefined && k !== 'file' && k !== 'media' && k !== 'inbox') {
     return { kind: 'bad-request', reason: 'bad-kind' }
   }
-  const mediaKind: 'file' | 'media' = k === 'media' ? 'media' : 'file'
+  const mediaKind: 'file' | 'media' | 'inbox' = k === 'media' ? 'media' : k === 'inbox' ? 'inbox' : 'file'
   const now = nowMs ?? Date.now()
   if (expMs <= now) return { kind: 'gone', reason: 'expired' }
   return { kind: 'ok', userId: u, expMs, decodedPath: p, mediaKind }
@@ -397,6 +398,23 @@ export function buildOpaqueMediaFileUrl(
 ): { url: string; expMs: number } {
   const expMs = Date.now() + ttlMs
   const payload: OpaqueMediaPayload = { v: 2, p: filename, u: userId, e: expMs, k: 'media' }
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
+  const ct = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  const token = Buffer.concat([iv, tag, ct]).toString('base64url')
+  return { url: `/api/media-signed?t=${encodeURIComponent(token)}`, expMs }
+}
+
+/** 站内信 PG 图片的短期 opaque bearer URL；assetId/用户身份均不出现在查询串明文中。 */
+export function buildOpaqueInboxAssetUrl(
+  key: Buffer,
+  assetId: string,
+  userId: string,
+  ttlMs: number = DEFAULT_SIGN_TTL_MS,
+): { url: string; expMs: number } {
+  const expMs = Date.now() + ttlMs
+  const payload: OpaqueMediaPayload = { v: 2, p: assetId, u: userId, e: expMs, k: 'inbox' }
   const iv = randomBytes(12)
   const cipher = createCipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
   const ct = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()])

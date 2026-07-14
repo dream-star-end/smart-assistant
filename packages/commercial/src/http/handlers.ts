@@ -45,6 +45,7 @@ import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
   buildOpaqueSignedUrl,
   buildOpaqueMediaFileUrl,
+  buildOpaqueInboxAssetUrl,
   verifySignedUrl,
   normalizeSignBatchInput,
   isContainerPathAllowed,
@@ -57,6 +58,7 @@ import {
   THUMBNAIL_MAX_SOURCE_BYTES,
   parseThumbnailWidth,
   renderThumbnail,
+  resizeToWebpThumbnail,
   thumbnailCacheKey,
 } from "./mediaThumbnail.js";
 import { BufferingResponseSink } from "./bufferingResponseSink.js";
@@ -90,6 +92,11 @@ import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import type { RemoteHostTester } from "../remoteHosts/service.js";
 import type { AccountHealthTracker } from "../account-pool/health.js";
 import type { AnthropicProxyHandler } from "./proxy/shared.js";
+import {
+  canAccessInboxAsset,
+  inboxAssetIdFromPath,
+  readInboxAssetForViewer,
+} from "../inbox/assets.js";
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -2353,6 +2360,19 @@ export async function handleMediaSign(
   const expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
   const urls: Record<string, string> = {};
   for (const p of norm.paths) {
+    const inboxAssetId = inboxAssetIdFromPath(p);
+    if (inboxAssetId) {
+      if (await canAccessInboxAsset(verified.id, verified.role, inboxAssetId)) {
+        const { url } = buildOpaqueInboxAssetUrl(
+          deps.mediaSignKey,
+          inboxAssetId,
+          userId,
+          DEFAULT_SIGN_TTL_MS,
+        );
+        urls[p] = url;
+      }
+      continue;
+    }
     // 内容寻址媒体(`/api/media/<file>`)与容器绝对路径共用同一签名端点,只是转发目标不同。
     // 存库历史消息里的裸 `/api/media/` URL 在渲染时经此归一为签名 URL,零数据迁移。
     const mediaFile = extractApiMediaFilename(p);
@@ -2443,6 +2463,46 @@ export async function handleMediaSigned(
   );
   if (!verified) {
     throw new HttpError(403, "FORBIDDEN", "account not active");
+  }
+
+  // 站内信图片由 master PG 直接出字节，不触发容器 provision。签名只证明 URL 未篡改；
+  // 每次 GET 仍按当前消息可见性复核，所以消息删除/过期会让尚在 TTL 内的 URL 立即失效。
+  if (mediaKind === "inbox") {
+    const parsedWidth = parseThumbnailWidth(url.searchParams.get("w"));
+    if (parsedWidth.kind === "invalid") {
+      throw new HttpError(400, "BAD_REQUEST", "signed URL: bad-w");
+    }
+    const asset = await readInboxAssetForViewer(verified.id, verified.role, decodedPath);
+    if (!asset) {
+      throw new HttpError(403, "FORBIDDEN", "inbox asset is no longer visible");
+    }
+    const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+    const ageSec = Math.min(240, remainSec);
+    const cacheControl = ageSec > 0 ? `private, max-age=${ageSec}` : undefined;
+
+    if (parsedWidth.kind === "width" && deps.thumbnailCache) {
+      const cacheKey = thumbnailCacheKey({
+        userId,
+        mediaKind,
+        decodedPath,
+        width: parsedWidth.width,
+      });
+      const cached = await deps.thumbnailCache.get(cacheKey);
+      if (cached) {
+        sendMediaBytes(res, cached.buffer, "image/webp", cacheControl);
+        return;
+      }
+      try {
+        const thumbnail = await resizeToWebpThumbnail(asset.data, parsedWidth.width);
+        await deps.thumbnailCache.put(cacheKey, thumbnail);
+        sendMediaBytes(res, thumbnail, "image/webp", cacheControl);
+        return;
+      } catch {
+        // 数据入库时已做过 sharp 归一化；缓存/缩略偶发失败时回原图，不把正文渲染打断。
+      }
+    }
+    sendMediaBytes(res, asset.data, asset.mimeType, cacheControl);
+    return;
   }
 
   // Path/filename sanity check —— **不是 ACL**,真正访问控制由容器内 handler 做

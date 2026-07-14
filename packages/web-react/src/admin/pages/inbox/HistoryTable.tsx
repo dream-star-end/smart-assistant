@@ -1,10 +1,12 @@
-import { Trash2 } from "lucide-react";
+import { Code2, Eye, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { Markdown } from "../../../components/Markdown";
 import {
   Badge,
   Button,
   IconButton,
   Modal,
+  Tabs,
   useConfirm,
   useToast,
 } from "../../../components/ui";
@@ -68,6 +70,12 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
   const [error, setError] = useState<Error | null>(null);
   const [offset, setOffset] = useState(0);
   const [detail, setDetail] = useState<InboxMessage | null>(null);
+  const [detailMode, setDetailMode] = useState<"preview" | "source">("preview");
+
+  const openDetail = (message: InboxMessage) => {
+    setDetail(message);
+    setDetailMode("preview");
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -155,7 +163,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       align: "right",
       render: (m) => (
         <div className="flex justify-end gap-1">
-          <Button variant="ghost" size="sm" onClick={() => setDetail(m)}>
+          <Button variant="ghost" size="sm" onClick={() => openDetail(m)}>
             查看
           </Button>
           <IconButton size="sm" aria-label="删除" onClick={() => del(m)} className="text-danger">
@@ -208,6 +216,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
         open={detail !== null}
         onOpenChange={(o) => !o && setDetail(null)}
         title={detail ? `站内信 #${detail.id}` : undefined}
+        className="max-w-3xl"
       >
         {detail && (
           <div className="flex flex-col gap-3">
@@ -235,11 +244,27 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
               )}
             </div>
             <div>
-              <p className="mb-1 text-[13px] font-medium text-fg">{detail.title}</p>
-              <p className="mb-1.5 text-[12px] font-medium text-faint">正文（Markdown 源码）</p>
-              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 text-[12px] leading-relaxed text-fg">
-                {detail.body_md}
-              </pre>
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[14px] font-semibold text-fg">{detail.title}</p>
+                <Tabs
+                  value={detailMode}
+                  onValueChange={(value) => setDetailMode(value as "preview" | "source")}
+                  items={[
+                    { value: "preview", label: <span className="inline-flex items-center gap-1"><Eye size={12} />预览</span> },
+                    { value: "source", label: <span className="inline-flex items-center gap-1"><Code2 size={12} />源码</span> },
+                  ]}
+                  aria-label="正文显示方式"
+                />
+              </div>
+              {detailMode === "preview" ? (
+                <div className="max-h-[55vh] min-h-40 overflow-auto rounded-xl border border-border bg-surface px-4 py-4 text-[13px] text-fg">
+                  <Markdown signMedia readOnly>{detail.body_md}</Markdown>
+                </div>
+              ) : (
+                <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-border bg-code px-4 py-3 text-[12px] leading-relaxed text-fg">
+                  {detail.body_md}
+                </pre>
+              )}
             </div>
           </div>
         )}

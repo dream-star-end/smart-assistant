@@ -142,7 +142,7 @@ function rehypeEmbedMedia() {
   }
 }
 
-export default function MarkdownImpl({ children, signMedia, live }: MarkdownProps) {
+export default function MarkdownImpl({ children, signMedia, live, readOnly }: MarkdownProps) {
   return (
     <div className="prose">
       <ReactMarkdown
@@ -152,13 +152,30 @@ export default function MarkdownImpl({ children, signMedia, live }: MarkdownProp
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           [rehypeKatex, { strict: false, throwOnError: false }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
-          ...(signMedia ? [rehypeEmbedMedia] : []),
+          ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
         ]}
         components={{
           pre: ({ children }) => <>{children}</>,
           ...(signMedia
             ? {
-                img: ({ node: _node, ...props }) => <SignedImg {...props} />,
+                img: ({ node: _node, ...props }) => {
+                  const src = typeof props.src === "string" ? props.src : "";
+                  if (readOnly && /^(?:https?:)?\/\//i.test(src)) {
+                    return (
+                      <img
+                        {...props}
+                        alt={props.alt ?? ""}
+                        loading="lazy"
+                        referrerPolicy="no-referrer"
+                        className="max-w-full rounded-lg border border-border"
+                      />
+                    );
+                  }
+                  if (readOnly && !src.startsWith("/api/inbox-assets/")) {
+                    return <span className="text-faint">[{props.alt || "不支持的图片来源"}]</span>;
+                  }
+                  return <SignedImg {...props} readOnly={readOnly} />;
+                },
                 video: ({ node: _node, ...props }) => <SignedVideo {...props} />,
                 audio: ({ node: _node, ...props }) => <SignedAudio {...props} />,
                 // 自定义 filecard 元素(rehypeEmbedMedia 产出)→ 可下载文件卡。
@@ -174,8 +191,9 @@ export default function MarkdownImpl({ children, signMedia, live }: MarkdownProp
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
-              if (lang === "options") return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} />;
-              if (lang === "html" || lang === "htmlpreview")
+              if (lang === "options")
+                return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} readOnly={readOnly} />;
+              if (!readOnly && (lang === "html" || lang === "htmlpreview"))
                 return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={live} />;
               return (
                 <CodeBlock language={lang}>

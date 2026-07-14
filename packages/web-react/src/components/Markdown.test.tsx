@@ -36,4 +36,12 @@ describe("Markdown fallback", () => {
     expect(container.textContent).toContain("生成完成后显示 HTML 预览");
     expect(container.textContent).not.toContain("body{color:red}");
   });
+
+  test("readOnly 站内信 fallback 不执行 htmlpreview", () => {
+    const text = "```htmlpreview\n<script>fetch('https://tracker.test')</script>\n```";
+    const { container } = render(<Markdown readOnly>{text}</Markdown>);
+
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(container.textContent).toContain("tracker.test");
+  });
 });

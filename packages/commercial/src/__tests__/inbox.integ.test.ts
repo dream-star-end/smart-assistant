@@ -34,15 +34,19 @@
 
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import IORedis from "ioredis";
+import sharp from "sharp";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
+import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
+import { deriveMediaSignKey } from "../http/mediaSign.js";
 import {
   listMyInbox,
   countMyUnread,
@@ -54,16 +58,23 @@ import {
   InboxError,
 } from "../inbox/inbox.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
+import {
+  canAccessInboxAsset,
+  readInboxAssetForViewer,
+} from "../inbox/assets.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const JWT_SECRET = "i".repeat(64);
+const TEST_BRIDGE_SECRET = "a".repeat(64);
+const TEST_MEDIA_SIGN_KEY = deriveMediaSignKey(TEST_BRIDGE_SECRET);
 
 // 完整表列表(0001..0046)。`DROP TABLE IF EXISTS ... CASCADE` 对未列出的表
 // 不会自动级联删表本身,只会断 FK,所以必须显式枚举所有表名。
 const COMMERCIAL_TABLES = [
+  "inbox_message_assets",
   "inbox_message_reads",
   "inbox_messages",
   "oauth_identities",
@@ -141,6 +152,9 @@ before(async () => {
       turnstileBypass: true,
       verifyEmailUrlBase: "https://test.local",
       resetPasswordUrlBase: "https://test.local",
+      v3Supervisor: { pool } as unknown as V3SupervisorDeps,
+      bridgeSecret: TEST_BRIDGE_SECRET,
+      mediaSignKey: TEST_MEDIA_SIGN_KEY,
       rateLimits: {
         register: { scope: "register_inbox", windowSeconds: 60, max: 100 },
         login: { scope: "login_inbox", windowSeconds: 60, max: 100 },
@@ -251,6 +265,96 @@ describe("inbox DB ops (integ)", () => {
     assert.equal(b.messages.length, 0);
     assert.equal(a.unread_count, 1);
     assert.equal(b.unread_count, 0);
+  });
+
+  test("富图片与消息同事务写入，按收件人隔离且删除级联失效", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const source = await sharp({
+      create: { width: 12, height: 8, channels: 3, background: { r: 10, g: 120, b: 220 } },
+    })
+      .png()
+      .toBuffer();
+    const clientId = "550e8400-e29b-41d4-a716-446655440000";
+    const message = await createInboxMessage(admin, {
+      audience: "user",
+      user_id: alice.toString(),
+      title: "带图单发",
+      body_md: `![示意图](inbox-asset://${clientId})`,
+      assets: [
+        {
+          client_id: clientId,
+          filename: "demo.png",
+          mime_type: "image/png",
+          data_base64: source.toString("base64"),
+        },
+      ],
+    });
+    const match = /\/api\/inbox-assets\/([0-9a-f-]{36})/.exec(message.body_md);
+    assert.ok(match, "正文必须只保存平台资产 URL");
+    const assetId = match[1]!;
+    const row = await query<{ mime_type: string; size_bytes: number; data: Buffer }>(
+      `SELECT mime_type, size_bytes, data FROM inbox_message_assets WHERE id=$1::uuid`,
+      [assetId],
+    );
+    assert.equal(row.rows.length, 1);
+    assert.equal(row.rows[0]!.mime_type, "image/webp");
+    assert.equal(row.rows[0]!.size_bytes, row.rows[0]!.data.length);
+    assert.equal(await canAccessInboxAsset(alice.toString(), "user", assetId), true);
+    assert.equal(await canAccessInboxAsset(bob.toString(), "user", assetId), false);
+    assert.equal(await canAccessInboxAsset(admin.toString(), "admin", assetId), true);
+    assert.ok(await readInboxAssetForViewer(alice.toString(), "user", assetId));
+
+    await query("UPDATE users SET status='banned' WHERE id=$1::bigint", [alice.toString()]);
+    assert.equal(await canAccessInboxAsset(alice.toString(), "user", assetId), false);
+    assert.equal(await readInboxAssetForViewer(alice.toString(), "user", assetId), null);
+    await query("UPDATE users SET status='active' WHERE id=$1::bigint", [alice.toString()]);
+
+    await adminDeleteInbox(message.id);
+    assert.equal(await canAccessInboxAsset(alice.toString(), "user", assetId), false);
+    assert.equal(
+      (await query(`SELECT 1 FROM inbox_message_assets WHERE id=$1::uuid`, [assetId])).rows.length,
+      0,
+    );
+  });
+
+  test("图片引用校验失败时不留下消息或资产；过期后用户立即不可读", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await assert.rejects(
+      () =>
+        createInboxMessage(admin, {
+          audience: "all",
+          title: "坏引用",
+          body_md: "![](inbox-asset://550e8400-e29b-41d4-a716-446655440000)",
+        }),
+      (error: unknown) => error instanceof InboxError && error.code === "VALIDATION",
+    );
+    assert.equal((await query(`SELECT 1 FROM inbox_messages`)).rows.length, 0);
+    assert.equal((await query(`SELECT 1 FROM inbox_message_assets`)).rows.length, 0);
+
+    const source = await sharp({
+      create: { width: 2, height: 2, channels: 3, background: "#111827" },
+    })
+      .png()
+      .toBuffer();
+    const clientId = "550e8400-e29b-41d4-a716-446655440000";
+    const message = await createInboxMessage(admin, {
+      audience: "all",
+      title: "过期图片",
+      body_md: `![](inbox-asset://${clientId})`,
+      expires_at: new Date(Date.now() - 1_000).toISOString(),
+      assets: [
+        {
+          client_id: clientId,
+          filename: "expired.png",
+          mime_type: "image/png",
+          data_base64: source.toString("base64"),
+        },
+      ],
+    });
+    const assetId = /\/api\/inbox-assets\/([0-9a-f-]{36})/.exec(message.body_md)![1]!;
+    assert.equal(await canAccessInboxAsset(alice.toString(), "user", assetId), false);
+    assert.equal(await readInboxAssetForViewer(alice.toString(), "user", assetId), null);
+    assert.equal(await canAccessInboxAsset(admin.toString(), "admin", assetId), true);
   });
 
   test("audience='all' 不补已注册前的广播", async (t) => {
@@ -496,6 +600,100 @@ describe("inbox HTTP (integ)", () => {
     );
     assert.equal(aud.rows.length, 1);
     assert.equal(aud.rows[0]!.target, `message:${j.message.id}`);
+  });
+
+  test("POST /api/admin/messages 图片 payload 可超过默认 64 KiB，响应不泄露 base64/BYTEA", async (t) => {
+    if (skipIfNoPg(t) || !redis || !server) { t.skip("fixtures"); return; }
+    const pixels = randomBytes(256 * 256 * 3);
+    const source = await sharp(pixels, { raw: { width: 256, height: 256, channels: 3 } })
+      .png()
+      .toBuffer();
+    assert.ok(source.length > 65_536, "fixture 应越过默认 JSON 64 KiB 上限");
+    const clientId = "550e8400-e29b-41d4-a716-446655440000";
+    const dataBase64 = source.toString("base64");
+    const response = await fetch(`${baseUrl}/api/admin/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        audience: "user",
+        user_id: alice.toString(),
+        title: "图片消息",
+        body_md: `![随机图](inbox-asset://${clientId})`,
+        assets: [
+          {
+            client_id: clientId,
+            filename: "noise.png",
+            mime_type: "image/png",
+            data_base64: dataBase64,
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 201);
+    const raw = await response.text();
+    assert.ok(!raw.includes(dataBase64.slice(0, 128)), "创建响应不得回显图片字节");
+    const json = JSON.parse(raw) as { message: { body_md: string } };
+    assert.match(json.message.body_md, /\/api\/inbox-assets\/[0-9a-f-]{36}/);
+
+    const list = await fetch(`${baseUrl}/api/admin/messages?limit=10`, {
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    const listRaw = await list.text();
+    assert.ok(!listRaw.includes(dataBase64.slice(0, 128)), "列表响应不得回显图片字节");
+  });
+
+  test("站内信图片经短期签名读取，其他用户签不到且删除后旧 URL 立即失效", async (t) => {
+    if (skipIfNoPg(t) || !redis || !server) { t.skip("fixtures"); return; }
+    const source = await sharp({
+      create: { width: 8, height: 6, channels: 3, background: "#2563eb" },
+    })
+      .png()
+      .toBuffer();
+    const clientId = "550e8400-e29b-41d4-a716-446655440000";
+    const message = await createInboxMessage(admin, {
+      audience: "user",
+      user_id: alice.toString(),
+      title: "签名图片",
+      body_md: `![私有图](inbox-asset://${clientId})`,
+      assets: [
+        {
+          client_id: clientId,
+          filename: "private.png",
+          mime_type: "image/png",
+          data_base64: source.toString("base64"),
+        },
+      ],
+    });
+    const assetPath = /\/api\/inbox-assets\/[0-9a-f-]{36}/.exec(message.body_md)?.[0];
+    assert.ok(assetPath);
+
+    const sign = await fetch(`${baseUrl}/api/media-sign`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${aliceToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ paths: [assetPath] }),
+    });
+    assert.equal(sign.status, 200);
+    const signedUrl = ((await sign.json()) as { urls: Record<string, string> }).urls[assetPath];
+    assert.ok(signedUrl?.startsWith("/api/media-signed?t="));
+
+    const image = await fetch(`${baseUrl}${signedUrl}`);
+    assert.equal(image.status, 200);
+    assert.match(image.headers.get("content-type") ?? "", /^image\/webp/);
+    assert.match(image.headers.get("cache-control") ?? "", /private/);
+    assert.equal((await sharp(Buffer.from(await image.arrayBuffer())).metadata()).format, "webp");
+
+    const bob = await makeUser(`bob-media-${Date.now()}@inbox.test`);
+    const bobToken = (await signAccess({ sub: bob.toString(), role: "user" }, JWT_SECRET)).token;
+    const denied = await fetch(`${baseUrl}/api/media-sign`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${bobToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ paths: [assetPath] }),
+    });
+    assert.equal(denied.status, 200);
+    assert.deepEqual((await denied.json() as { urls: Record<string, string> }).urls, {});
+
+    await adminDeleteInbox(message.id);
+    assert.equal((await fetch(`${baseUrl}${signedUrl}`)).status, 403);
   });
 
   test("end-to-end: admin POST → alice GET → POST :id/read → unread 归 0", async (t) => {

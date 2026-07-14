@@ -13,7 +13,8 @@
     "0144_model_authority_guards",
     "0145_retire_legacy_incident_notices",
     "0146_connector_ai_declarative_verification",
-    "0147_lossless_turn_tapes"
+    "0147_lossless_turn_tapes",
+    "0148_inbox_rich_assets"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

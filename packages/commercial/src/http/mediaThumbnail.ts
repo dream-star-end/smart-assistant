@@ -87,7 +87,7 @@ export function isThumbnailableImage(contentType: string | undefined | null): bo
  */
 export function thumbnailCacheKey(input: {
   userId: string
-  mediaKind: 'file' | 'media'
+  mediaKind: 'file' | 'media' | 'inbox'
   decodedPath: string
   width: number
 }): string {

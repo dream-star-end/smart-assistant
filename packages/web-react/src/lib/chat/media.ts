@@ -30,16 +30,17 @@ export function isContainerPath(s: string): boolean {
  * 需要经 /api/media-sign 换成带 token 的签名 URL 才能可靠渲染的来源。**单一权威**判定,
  * 供渲染器(classifyMediaRef)与签名 hook(useSignedSrc/useFreshSignedUrl)共用,避免漂移。
  *
- * 覆盖两类:
+ * 覆盖三类:
  *   1. 容器内绝对路径(/home/agent/... 等)—— 浏览器直接取不到容器盘。
  *   2. `/api/media/<digest>` —— 内容寻址的用户上传/生成媒体。裸 `<img src>` 直取要靠
  *      HttpOnly `oc_session` SameSite=Strict cookie,iOS Safari + Cloudflare 下该 cookie
  *      在媒体子资源请求里被 drop → master 收不到凭证 → 持久 401 裂图(现网实锤,de16e2be
  *      同类)。收口到签名管线后凭证进 URL,不再依赖 cookie。
+ *   3. `/api/inbox-assets/<uuid>` —— 站内信 PG 图片；签名与每次读取都复核消息可见性。
  */
 export function needsSignedSrc(s: string): boolean {
   if (typeof s !== "string" || !s) return false;
-  return isContainerPath(s) || s.startsWith("/api/media/");
+  return isContainerPath(s) || s.startsWith("/api/media/") || s.startsWith("/api/inbox-assets/");
 }
 
 /** 已可直接用于 <img src> 的 URL（http/https/data/blob）。 */

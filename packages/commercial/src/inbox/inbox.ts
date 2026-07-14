@@ -20,6 +20,11 @@
 
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
+import {
+  InboxAssetValidationError,
+  prepareInboxRichBody,
+  type InboxAssetInput,
+} from "./assets.js";
 
 // ─── 公共类型 ────────────────────────────────────────────────────────
 
@@ -95,6 +100,19 @@ const createSchema = z
     // Plan C:勾选后同事务给 audience 对应的 active+email_verified 用户写
     // inbox_email_jobs 快照,worker drain 后异步发邮件。详见 0065 migration 注释。
     notify_email: z.boolean().optional(),
+    assets: z
+      .array(
+        z
+          .object({
+            client_id: z.string().uuid(),
+            filename: z.string().min(1).max(512),
+            mime_type: z.enum(["image/png", "image/jpeg", "image/webp"]),
+            data_base64: z.string().min(1).max(7_100_000),
+          })
+          .strict(),
+      )
+      .max(8)
+      .optional(),
   })
   .strict()
   .superRefine((v, ctx) => {
@@ -338,6 +356,15 @@ export async function createInboxMessage(
   const v = parsed.data;
   const userId = v.audience === "user" ? String(v.user_id) : null;
   const notifyEmail = v.notify_email === true;
+  let richBody: Awaited<ReturnType<typeof prepareInboxRichBody>>;
+  try {
+    richBody = await prepareInboxRichBody(v.body_md, v.assets as InboxAssetInput[] | undefined);
+  } catch (err) {
+    if (err instanceof InboxAssetValidationError) {
+      throw new InboxError("VALIDATION", err.message, { issues: err.issues });
+    }
+    throw err;
+  }
 
   if (userId !== null) {
     // 校验收件人存在且活跃
@@ -349,8 +376,8 @@ export async function createInboxMessage(
     }
   }
 
-  // 不开启邮件推送:走老路径(单 INSERT,不开 tx,与历史行为字节等价)
-  if (!notifyEmail) {
+  // 纯文本且不推邮件:保留历史单 INSERT 路径。只要带图片就必须开事务，保证消息与资产原子写。
+  if (!notifyEmail && richBody.assets.length === 0) {
     const r = await query<{
       id: string;
       audience: Audience;
@@ -370,7 +397,7 @@ export async function createInboxMessage(
         v.audience,
         userId,
         v.title,
-        v.body_md,
+        richBody.bodyMd,
         v.level ?? null,
         String(adminId),
         v.expires_at ?? null,
@@ -394,7 +421,7 @@ export async function createInboxMessage(
     };
   }
 
-  // notify_email=true:tx() 包住 message 写入 + 收件人快照 + summary 回填
+  // 富图片和/或 notify_email=true:tx() 包住 message + assets + 邮件收件人快照。
   return tx(async (client) => {
     const r = await client.query<{
       id: string;
@@ -407,24 +434,58 @@ export async function createInboxMessage(
       created_at: Date;
       expires_at: Date | null;
     }>(
-      // notify_email 先置 TRUE,但 email_send_status 等快照行数定下来再 UPDATE,
-      // 避免快照 0 行时仍残留 'queued' 状态(worker 永远不可能命中)
       `INSERT INTO inbox_messages
          (audience, user_id, title, body_md, level, created_by, expires_at, notify_email)
-       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz, TRUE)
+       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz, $8)
        RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
                  created_by::text AS created_by, created_at, expires_at`,
       [
         v.audience,
         userId,
         v.title,
-        v.body_md,
+        richBody.bodyMd,
         v.level ?? null,
         String(adminId),
         v.expires_at ?? null,
+        notifyEmail,
       ],
     );
     const row = r.rows[0];
+
+    for (const asset of richBody.assets) {
+      await client.query(
+        `INSERT INTO inbox_message_assets
+           (id, message_id, filename, mime_type, size_bytes, sha256, data)
+         VALUES ($1::uuid, $2::bigint, $3, $4, $5, $6, $7)`,
+        [
+          asset.id,
+          row.id,
+          asset.filename,
+          asset.mimeType,
+          asset.sizeBytes,
+          asset.sha256,
+          asset.data,
+        ],
+      );
+    }
+
+    if (!notifyEmail) {
+      return {
+        id: row.id,
+        audience: row.audience,
+        user_id: row.user_id,
+        title: row.title,
+        body_md: row.body_md,
+        level: row.level,
+        created_by: row.created_by,
+        created_at: row.created_at.toISOString(),
+        expires_at: row.expires_at ? row.expires_at.toISOString() : null,
+        notify_email: false,
+        email_send_status: null,
+        email_sent_at: null,
+        email_summary: null,
+      };
+    }
 
     // 收件人快照:`u.email <> ''` 防 NOT NULL 但空串(0001 schema 只有 UNIQUE 没 CHECK)
     // 这一刻 INSERT...SELECT 的行集 = 该 message 永久邮件收件人(后续注册或改邮箱不补)。

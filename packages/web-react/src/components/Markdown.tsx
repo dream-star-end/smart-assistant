@@ -20,6 +20,8 @@ export type MarkdownProps = {
    * 稳定占位,生成结束（false）再一次性挂载渲染。缺省 false（历史/静态消息立即渲染）。
    */
   live?: boolean;
+  /** 站内信/后台预览等只读上下文：仅渲染站内资产/外链图，禁 HTML 执行与聊天交互。 */
+  readOnly?: boolean;
 };
 
 const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
@@ -75,9 +77,13 @@ function HtmlPreviewFallback({ code, live }: { code: string; live?: boolean }) {
   );
 }
 
-/** 重 chunk 加载中 / 加载失败时的轻量占位：纯文本（pre-wrap 保留换行）；htmlpreview 仍给沙盒预览。 */
-function MarkdownFallback({ children, live }: { children: string; live?: boolean }) {
-  const html = extractHtmlFenceFallback(children);
+/** 重 chunk 加载中 / 加载失败时的轻量占位；只读站内信绝不执行 HTML 预览脚本。 */
+function MarkdownFallback({
+  children,
+  live,
+  readOnly,
+}: { children: string; live?: boolean; readOnly?: boolean }) {
+  const html = readOnly ? null : extractHtmlFenceFallback(children);
   if (html) {
     return (
       <div className="prose">
@@ -109,12 +115,12 @@ class MarkdownBoundary extends Component<{ fallback: ReactNode; children: ReactN
   }
 }
 
-export const Markdown = memo(function Markdown({ children, signMedia, live }: MarkdownProps) {
-  const fallback = <MarkdownFallback live={live}>{children}</MarkdownFallback>;
+export const Markdown = memo(function Markdown({ children, signMedia, live, readOnly }: MarkdownProps) {
+  const fallback = <MarkdownFallback live={live} readOnly={readOnly}>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback}>
       <Suspense fallback={fallback}>
-        <MarkdownImpl signMedia={signMedia} live={live}>
+        <MarkdownImpl signMedia={signMedia} live={live} readOnly={readOnly}>
           {children}
         </MarkdownImpl>
       </Suspense>

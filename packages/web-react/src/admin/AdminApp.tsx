@@ -1,7 +1,9 @@
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
+import { MediaSignProvider } from "../components/chat/media";
 import { Spinner } from "../components/ui";
+import { api } from "../lib/api";
 import { AdminShell } from "./AdminShell";
-import { useAdminAuth } from "./auth";
+import { adminSession, useAdminAuth } from "./auth";
 
 /**
  * 鉴权引导壳：
@@ -12,6 +14,10 @@ import { useAdminAuth } from "./auth";
  */
 export function AdminApp() {
   const { user, ready, authed, logout } = useAdminAuth();
+  const signMedia = useCallback(
+    (paths: string[]) => api.mediaSign(adminSession, paths).then((result) => result.urls),
+    [],
+  );
 
   // 引导完成且无权限时跳首页。放 effect 里避免在 render 阶段做副作用（StrictMode 双调用安全）。
   useEffect(() => {
@@ -26,5 +32,9 @@ export function AdminApp() {
     );
   }
 
-  return <AdminShell user={user} onLogout={logout} />;
+  return (
+    <MediaSignProvider sign={signMedia} authKey={user?.id ?? "admin"}>
+      <AdminShell user={user} onLogout={logout} />
+    </MediaSignProvider>
+  );
 }

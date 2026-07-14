@@ -368,6 +368,17 @@ async function markJobDropped(jobId: string, reason: string): Promise<boolean> {
 
 // ─── 邮件正文构造(从 inbox_messages 拉 title/body_md) ──────────────
 
+/** 邮件是纯文本通道：保留普通 Markdown 文本，把站内富图片/图表降级成登录查看提示。 */
+export function inboxMarkdownToEmailText(bodyMd: string): string {
+  return bodyMd
+    .replace(/```(?:chart|mermaid)[^\n]*\n[\s\S]*?```/gi, "\n[图表请登录站内信查看]\n")
+    .replace(/!\[([^\]]*)\]\([^\n)]*\)/g, (_whole, alt: string) => {
+      const label = alt.trim();
+      return label ? `[图片：${label}，请登录站内信查看]` : "[图片请登录站内信查看]";
+    })
+    .replace(/\/api\/inbox-assets\/[0-9a-f-]{36}/gi, "[图片请登录站内信查看]");
+}
+
 /**
  * 邮件主题 / 正文:从 inbox_messages 直接读 title + body_md。
  *
@@ -392,7 +403,7 @@ async function loadMessageForMail(messageId: string): Promise<{ subject: string;
   }
   return {
     subject: row.title,
-    text: row.body_md,
+    text: inboxMarkdownToEmailText(row.body_md),
   };
 }
 
