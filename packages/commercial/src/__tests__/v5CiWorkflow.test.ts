@@ -17,4 +17,10 @@ describe("Aurora v5 CI artifact contract", () => {
     assert.match(WORKFLOW, /^ {10}path: \$\{\{ env\.COMMERCIAL_UNIT_TAP \}\}$/m);
     assert.match(WORKFLOW, /^ {10}if-no-files-found: error$/m);
   });
+
+  test("commercial-unit runs with the production root permission model", () => {
+    assert.match(WORKFLOW, /^ {10}sudo env \\$/m);
+    assert.match(WORKFLOW, /^ {12}"TAP_OUT=\$TAP_OUT" \\$/m);
+    assert.match(WORKFLOW, /^ {12}npm run test:commercial:unit:gate$/m);
+  });
 });

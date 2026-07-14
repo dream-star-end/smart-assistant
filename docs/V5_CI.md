@@ -51,6 +51,13 @@ process.env.REQUIRE_TEST_DB === "1"` —— 命中门控时 PG 不可用会直�
 `export REQUIRE_TEST_DB=1`,CI job 又设 `CI=true` + 起 PG/Redis services,
 双保险:DB 门控测试要么真跑,要么显式红,绝不静默绿。
 
+CI 的 commercial-unit 命令通过 `sudo env ...` 以 root 执行。这不是放宽测试:
+v5 master 的 systemd unit 明确是 `User=root`,而 container provision 的真实权限契约
+会创建 `/run/ccb-ssh/u<uid>` 并 `chown root:1000`。GitHub 托管 runner 的普通用户既
+不能在 `/run` 建目录也不能 chown,会让所有触发 provision 的单测稳定报 `EACCES`,
+形成“本机(root)绿、CI(runner)红”的假回归。root 运行同时让标记为 requires-root 的
+artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接触生产主机。
+
 ### known-failures 清单维护
 
 文件:`.github/known-failures/commercial-unit.txt`
