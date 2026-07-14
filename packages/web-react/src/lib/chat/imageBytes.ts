@@ -9,8 +9,9 @@
  * **单一收口**:useProgressiveImage(气泡缩略 + 查看器)、fetchImageBlobWithResign(编辑/评论/
  * 调整大小取字节)都经本模块存/取,**不做第二套缓存**。
  *
- * 键规范化:`identity ∥ variant`。identity = 签名路径(signPath / `/api/media/<digest>`)——
- * 与渲染出的签名 URL(带随机 token/过期戳)无关,故同一图的不同签名 URL 命中同一条目。
+ * 键规范化:`identity ∥ variant`。identity = `authKey ∥ signPath`(或 `/api/media/<digest>`)——
+ * 与渲染出的签名 URL(带随机 token/过期戳)无关,故同账号同一图的不同签名 URL 命中同一条目，
+ * 但同一 SPA 换账号后即使容器路径相同也绝不命中旧账号字节。
  * variant 区分尺寸变体(`w640`/`w1280`)与原图(`orig`)—— 缩略与原图是不同字节,分开存。
  */
 
@@ -54,6 +55,18 @@ export function byteCacheVariant(width: number | null | undefined): string {
 /** 键分隔符:NUL —— 路径/标识不可能含 NUL,杜绝 identity 与 variant 拼接歧义。 */
 const KEY_SEP = '\u0000'
 
+/**
+ * 给签名媒体缓存身份加鉴权命名空间。容器内路径只在单租户内唯一，不能裸作浏览器全局
+ * LRU key；把稳定 user/authKey 编入 identity 后，旧账号迟到的异步写回也只能落旧命名空间。
+ */
+export function authScopedImageIdentity(
+  authKey: string | number | null | undefined,
+  identity: string | null | undefined,
+): string | null {
+  if (!identity) return null
+  return `${String(authKey ?? 'anon')}${KEY_SEP}${identity}`
+}
+
 /** 规范化字节缓存键:`identity ∥ variant`。identity 为空 → null(不缓存,如纯本地 blob)。 */
 export function byteCacheKey(identity: string | null | undefined, width: number | null | undefined): string | null {
   if (!identity) return null
@@ -73,6 +86,7 @@ type Entry = { blob: Blob; size: number }
  */
 export class ImageByteCache {
   private map = new Map<string, Entry>()
+  private epoch = 0
   constructor(
     private readonly maxEntries = IMAGE_BYTE_CACHE_MAX_ENTRIES,
     private readonly maxEntryBytes = IMAGE_BYTE_CACHE_MAX_ENTRY_BYTES,
@@ -105,6 +119,21 @@ export class ImageByteCache {
     }
   }
 
+  /** 捕获当前鉴权缓存代次；异步 miss 在发请求前调用。 */
+  captureEpoch(): number {
+    return this.epoch
+  }
+
+  /**
+   * 只允许同一代次的异步结果写回。登出/换号 clear 后，旧账号在途请求即使迟到也不能
+   * 把字节重新塞进已清空的 LRU。同步调用方仍可使用 set。
+   */
+  setIfCurrentEpoch(key: string | null | undefined, blob: Blob, epoch: number): boolean {
+    if (epoch !== this.epoch) return false
+    this.set(key, blob)
+    return true
+  }
+
   has(key: string | null | undefined): boolean {
     return !!key && this.map.has(key)
   }
@@ -112,6 +141,7 @@ export class ImageByteCache {
   /** 测试用:清空。 */
   clear(): void {
     this.map.clear()
+    this.epoch += 1
   }
 
   /** 测试用:当前条目数。 */

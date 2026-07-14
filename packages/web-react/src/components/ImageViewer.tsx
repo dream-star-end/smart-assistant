@@ -13,7 +13,6 @@
  * (下载/分享/进编辑前都用 get() 现签,禁冻结挂载态 URL;编辑器取图再有 403/410 重签兜底)。
  */
 import * as Dialog from '@radix-ui/react-dialog'
-import { useContext, useEffect, useRef, useState } from 'react'
 import {
   ArrowUpRight,
   Download,
@@ -25,14 +24,20 @@ import {
   Share2,
   X,
 } from 'lucide-react'
-import { nativeDownload, openInNewTab } from '../lib/chat/download'
-import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
+import { useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { nativeDownload, openInNewTab, saveBlob } from '../lib/chat/download'
+import { byteCacheKey, isMediaSignedUrl } from '../lib/chat/imageBytes'
+import { type ResolveSignedSrc, fetchImageBlobWithResign } from '../lib/chat/media'
 import { useProgressiveImage } from '../lib/chat/useProgressiveImage'
 import { cn } from '../lib/utils'
 import { ImageAnnotationEditor, type ImageAnnotationSource } from './ImageAnnotationEditor'
-import { ImageEditActionsContext, type ImageCommentSubmit, type ImageEditSubmit } from './chat/imageEditActions'
 import { ImageCommentMode } from './ImageCommentMode'
 import { ImageResizeMode } from './ImageResizeMode'
+import {
+  type ImageCommentSubmit,
+  ImageEditActionsContext,
+  type ImageEditSubmit,
+} from './chat/imageEditActions'
 
 // ImageEditSubmit 单一权威在 chat/imageEditActions.tsx(P/V 共用);此处再导出给 comment/resize 复用。
 export type { ImageEditSubmit } from './chat/imageEditActions'
@@ -160,7 +165,7 @@ function ActionButton({
 }
 
 /**
- * §4 契约:{open,onOpenChange,src,alt,signPath,get,peek,submitImageEdit,initialMode}。
+ * §4 契约:{open,onOpenChange,src,alt,signPath,cacheIdentity,get,peek,submitImageEdit,initialMode}。
  * submitImageEdit 允许经 prop 直传,缺省回落 ImageEditActionsContext(App 供给)。
  * initialMode='edit' → 开图即直接进圈选编辑器(聊天缩略图左下角「编辑」浮钮的直达入口)。
  */
@@ -170,6 +175,7 @@ export function ImageViewer({
   src,
   alt,
   signPath,
+  cacheIdentity,
   get,
   peek,
   submitImageEdit: submitProp,
@@ -180,6 +186,8 @@ export function ImageViewer({
   src: string
   alt: string
   signPath?: string | null
+  /** authKey+signPath 的租户隔离字节缓存身份；签名媒体必须由 MediaSignProvider 下传。 */
+  cacheIdentity: string | null
   get: (opts?: { forceResign?: boolean }) => Promise<string | null>
   peek: () => string | null
   submitImageEdit?: (value: ImageEditSubmit) => void | Promise<void>
@@ -196,15 +204,27 @@ export function ImageViewer({
   const [editSource, setEditSource] = useState<ImageAnnotationSource | null>(null)
   const [moreOpen, setMoreOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  // 下载 pending 必须绑定逻辑图片身份,不能是裸 boolean。否则 A 原图迟到可能被保存成 B。
+  const [pendingDownloadKey, setPendingDownloadKey] = useState<string | null>(null)
+  const [nativeFallbackKey, setNativeFallbackKey] = useState<string | null>(null)
   // 原图渐进加载(单一 hook 收口):点开先复用气泡已载缩略字节做即时预览(零请求、非灰屏),
   // 后台流式拉原图带百分比,到达后无缝换。lazy=false(查看器打开即可见)。signPath 作字节缓存身份。
-  const { objectUrl: viewerUrl, percent: viewerPercent, status: viewerStatus } = useProgressiveImage({
+  const {
+    objectUrl: viewerUrl,
+    blob: viewerBlob,
+    blobKey: viewerBlobKey,
+    percent: viewerPercent,
+    status: viewerStatus,
+  } = useProgressiveImage({
     src: open ? src : null,
     width: null,
-    cacheIdentity: signPath ?? null,
+    cacheIdentity,
     resolveSrc: get,
     lazy: false,
   })
+  // 只复用同源签名媒体的原图 Blob。direct URL 没有稳定租户内 identity,维持原生下载。
+  const currentOriginalKey = isMediaSignedUrl(src) ? byteCacheKey(cacheIdentity, null) : null
+  const downloadName = deriveDownloadName(alt, signPath)
   // Radix DismissableLayer 的 onEscapeKeyDown 会绑定挂载时那一版闭包(不随 mode/moreOpen
   // 重渲刷新),直接读 state 会拿到陈旧值 → ESC 误把子模式当 view 直接关掉整个查看器。用
   // ref 存最新值,闭包读 ref.current 永远最新(ref 对象跨渲染稳定)。
@@ -230,6 +250,8 @@ export function ImageViewer({
       setEditSource(null)
       setMoreOpen(false)
       setNotice(null)
+      setPendingDownloadKey(null)
+      setNativeFallbackKey(null)
       autoEditRef.current = false
       return
     }
@@ -242,10 +264,66 @@ export function ImageViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialMode])
 
-  const flash = (text: string) => {
+  const flash = useCallback((text: string) => {
     setNotice(text)
     window.setTimeout(() => setNotice((cur) => (cur === text ? null : cur)), 1800)
-  }
+  }, [])
+
+  // pending 只消费同一 generation 的原图 Blob。首帧 idle / loading 都复用 Viewer 已启动的
+  // fetch；关闭、换图、旧请求迟到一律因 key/open 不匹配被清掉,不产生下载。
+  useEffect(() => {
+    if (!pendingDownloadKey) return
+    if (!open || !currentOriginalKey || pendingDownloadKey !== currentOriginalKey) {
+      setPendingDownloadKey(null)
+      return
+    }
+    if (viewerBlob && viewerBlobKey === currentOriginalKey) {
+      setPendingDownloadKey(null)
+      saveBlob(viewerBlob, downloadName)
+      flash('已开始下载')
+      return
+    }
+    if (viewerStatus === 'error') {
+      // 先同步退出 pending,再由独立 fallback effect 现签；同 key 重复点击不会重入。
+      setPendingDownloadKey(null)
+      setNativeFallbackKey(currentOriginalKey)
+    }
+  }, [
+    pendingDownloadKey,
+    open,
+    currentOriginalKey,
+    viewerBlob,
+    viewerBlobKey,
+    viewerStatus,
+    downloadName,
+    flash,
+  ])
+
+  // 原图流式失败时保留原生下载逃生门。effect cleanup 在关闭/换图时取消落地；不回退到
+  // 挂载态 src(它可能已过期),只用点击后 get() 解析出的当前签名 URL。
+  useEffect(() => {
+    if (!nativeFallbackKey) return
+    if (!open || nativeFallbackKey !== currentOriginalKey) {
+      setNativeFallbackKey(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const url = await get()
+        if (!cancelled && url) nativeDownload(url, downloadName)
+      } catch {
+        // provider 正常会把签名失败收敛成 null；自定义 resolver 抛错时也不能留下未处理 rejection。
+      } finally {
+        if (!cancelled) {
+          setNativeFallbackKey((cur) => (cur === nativeFallbackKey ? null : cur))
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [nativeFallbackKey, open, currentOriginalKey, get, downloadName])
 
   // 提交任一模式 → 进主对话(需求 B)→ 关整个查看器。
   const handleSubmit = async (value: ImageEditSubmit) => {
@@ -264,8 +342,23 @@ export function ImageViewer({
   }
 
   const handleDownload = async () => {
+    if (open && currentOriginalKey) {
+      if (viewerBlob && viewerBlobKey === currentOriginalKey) {
+        saveBlob(viewerBlob, downloadName)
+        flash('已开始下载')
+        return
+      }
+      if (viewerStatus !== 'error') {
+        // 包含 Viewer 首帧 effect 尚未把 idle 推到 loading 的窗口；只登记一次,不另开网络。
+        setPendingDownloadKey(currentOriginalKey)
+        flash('正在准备下载…')
+        return
+      }
+      setNativeFallbackKey(currentOriginalKey)
+      return
+    }
     const url = (await get()) ?? src
-    nativeDownload(url, deriveDownloadName(alt, signPath))
+    nativeDownload(url, downloadName)
   }
 
   const absolute = (url: string) => {
@@ -365,7 +458,7 @@ export function ImageViewer({
                 src={src}
                 alt={alt}
                 resolveSrc={get}
-                cacheIdentity={signPath ?? null}
+                cacheIdentity={cacheIdentity}
                 canSubmit={!!submitImageComment}
                 onBack={() => setMode('view')}
                 onSubmit={handleCommentSubmit}
@@ -375,7 +468,7 @@ export function ImageViewer({
                 src={src}
                 alt={alt}
                 resolveSrc={get}
-                cacheIdentity={signPath ?? null}
+                cacheIdentity={cacheIdentity}
                 canSubmit={!!submitImageEdit}
                 onBack={() => setMode('view')}
                 onSubmit={handleSubmit}
@@ -528,7 +621,7 @@ export function ImageViewer({
         source={editSource}
         open={open && mode === 'edit'}
         resolveSrc={get}
-        cacheIdentity={signPath ?? null}
+        cacheIdentity={cacheIdentity}
         onOpenChange={(o) => {
           if (!o) setMode('view')
         }}
