@@ -2058,13 +2058,14 @@ export class SessionManager {
     // legacy SQLite fallback is intentionally personal-only and is invisible
     // after a commercial relogin.
     if (isCommercialManagedRuntime() && getV3MasterSinkOrNull() === null) {
-      const error = 'LOSSLESS_SINK_UNAVAILABLE: 回复存储链路尚未就绪，本次未执行也未扣费，请稍后重试。'
       log.error('commercial turn rejected: lossless sink unavailable', {
         sessionKey: session.sessionKey,
         agentId: session.agentId,
         channel: session.channel,
       })
-      onEvent({ kind: 'error', error })
+      // Do not add a persistence-specific user notice. The turn never ran or
+      // billed, and exposing a synthetic terminal frame would itself become
+      // an unacknowledged reply that disappears after reconnect.
       return
     }
     // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
@@ -2949,6 +2950,7 @@ export class SessionManager {
         }
         terminalPersistenceClaim = 'partial'
         partialPersistencePromise = (async () => {
+          let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
           detach()
           const snap = turn?.getPartialSnapshot() ?? {
             assistantText: '',
@@ -2979,38 +2981,42 @@ export class SessionManager {
             if (MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) {
               const turnIndex = prevTurns + 1
               session.turns = Math.max(session.turns, turnIndex)
-              await persistServerAuthoredTurn({
-              sessionKey: session.sessionKey,
-              peerId: session.peerId,
-              agentId: session.agentId,
-              userId: session.userId,
-              turnIndex,
-              ...(turnKey ? { turnKey } : {}),
-              text: partialAssistant.text,
-              ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
-              status,
-              errorCode,
-              errorDetail: reason,
-              ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
-              ...(requestId ? { requestId } : {}),
-              ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
-              ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
-              ...(partialAssistant.segments.length > 0
-                ? { assistantSegments: partialAssistant.segments }
-                : {}),
-              ...(snap.thinkingSegments.length > 0
-                ? { thinkingSegments: snap.thinkingSegments }
-                : {}),
-              ...(partialAgentGroups.length > 0 ? { agentGroups: partialAgentGroups } : {}),
-              ...(structuredBlocks.length > 0 ? { structuredBlocks } : {}),
-              runtimeEvents: terminalRuntimeEvents,
-              ...(terminalEngineBilling !== undefined
-                ? { engineBilling: terminalEngineBilling }
-                : {}),
+              persistenceAcknowledged = await persistServerAuthoredTurn({
+                sessionKey: session.sessionKey,
+                peerId: session.peerId,
+                agentId: session.agentId,
+                userId: session.userId,
+                turnIndex,
+                ...(turnKey ? { turnKey } : {}),
+                text: partialAssistant.text,
+                ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
+                status,
+                errorCode,
+                errorDetail: reason,
+                ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
+                ...(requestId ? { requestId } : {}),
+                ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
+                ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
+                ...(partialAssistant.segments.length > 0
+                  ? { assistantSegments: partialAssistant.segments }
+                  : {}),
+                ...(snap.thinkingSegments.length > 0
+                  ? { thinkingSegments: snap.thinkingSegments }
+                  : {}),
+                ...(partialAgentGroups.length > 0 ? { agentGroups: partialAgentGroups } : {}),
+                ...(structuredBlocks.length > 0 ? { structuredBlocks } : {}),
+                runtimeEvents: terminalRuntimeEvents,
+                ...(terminalEngineBilling !== undefined
+                  ? { engineBilling: terminalEngineBilling }
+                  : {}),
               })
             }
           } finally {
-            onEvent({ kind: 'error', error: reason })
+            // A queued tape is durable locally but not yet visible from the
+            // authoritative PG history. Never expose a terminal frame until
+            // the master has ACKed it; reconnect/relogin must not turn a live
+            // "finished" reply into a missing one.
+            if (persistenceAcknowledged) onEvent({ kind: 'error', error: reason })
             if (settleAfter) settle(() => resolve())
           }
         })()

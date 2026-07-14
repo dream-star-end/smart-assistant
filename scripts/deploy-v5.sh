@@ -1139,8 +1139,31 @@ assert_release_capability_for_sessions_pg() {
 # login. Likewise, an older runtime would resume lossy v1 writes. Therefore the
 # first finalized tape makes reader+writer capability irreversible.
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
+
+# Unconditional artifact check used once a capable writer may have served.
+# Unlike the DB floor below, this must not observe "no tape yet" and then race
+# a finalization while automatic compensation is switching back to an old
+# reader/writer stack.
+release_has_lossless_turn_tape_capability() {
+  local reldir="$1" master_has runtime_has
+  master_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.capabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  runtime_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.runtimeCapabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$master_has" && -n "$runtime_has" ]]
+}
+
+assert_lossless_release_capability() {
+  local reldir="$1"
+  if ! release_has_lossless_turn_tape_capability "$reldir"; then
+    echo "✗ 目标 release 未同时声明 reader/writer capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
+    echo "    $reldir/deploy/v5/release-metadata.json" >&2
+    echo "  finalized tape 的 hot row 只有 textless anchor;旧 master 重登会丢回复,旧 runtime 会恢复有损写入。" >&2
+    return 1
+  fi
+  return 0
+}
+
 assert_lossless_turn_tape_floor() {
-  local reldir="$1" finalized rc master_has runtime_has
+  local reldir="$1" finalized rc
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过 lossless turn-tape 兼容地板"; return 0; }
   if finalized="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
       test -n \"\${DATABASE_URL:-}\"
@@ -1159,12 +1182,7 @@ assert_lossless_turn_tape_floor() {
   else
     echo "  · lossless turn-tape 地板生效:已存在 finalized v2 tape。"
   fi
-  master_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.capabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
-  runtime_has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.runtimeCapabilities // []) | index(\$c) // empty' '$reldir/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
-  if [[ -z "$master_has" || -z "$runtime_has" ]]; then
-    echo "✗ 激活中止:目标 release 未同时声明 reader/writer capability '$LOSSLESS_TURN_TAPE_CAP':" >&2
-    echo "    $reldir/deploy/v5/release-metadata.json" >&2
-    echo "  finalized tape 的 hot row 只有 textless anchor;旧 master 重登会丢回复,旧 runtime 会恢复有损写入。" >&2
+  if ! assert_lossless_release_capability "$reldir"; then
     echo "  数据库不可读时也只允许激活明确具备该 capability 的目标。" >&2
     exit 1
   fi
@@ -2252,9 +2270,26 @@ SQL
 }
 
 # release 激活补偿:恢复旧 symlink/.prev-release 并 restart 旧 unit；失败必须显式报出混合现场。
-restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason
-  local old_release="$1" old_prev_file="$2" reason="$3" tmplink="$ACTIVE_SRC.rollback.$$"
+restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=candidate_release
+  local old_release="$1" old_prev_file="$2" reason="$3" candidate_release="$4"
+  local tmplink="$ACTIVE_SRC.rollback.$$" image_id runtime_release
   echo "⚠ 激活未提交($reason)→ 补偿恢复 slot=$ACTIVE_SLOT old=$old_release" >&2
+  # The candidate may have accepted traffic as soon as restart was attempted.
+  # If it is a v2 writer, require the compensation target unconditionally;
+  # a DB "no finalized tape" probe would race a concurrent first finalize.
+  if release_has_lossless_turn_tape_capability "$candidate_release"; then
+    if ! assert_lossless_release_capability "$old_release"; then
+      mark_deploy_recovery_required "lossless writer 已可能对外服务,禁止自动回切旧 master:$old_release"
+      return 1
+    fi
+    image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+    runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+    if ! assert_lossless_runtime_tuple_capability "$image_id" "$runtime_release"; then
+      mark_deploy_recovery_required "lossless writer 已可能对外服务,禁止自动恢复无能力 runtime tuple"
+      return 1
+    fi
+    echo "  ✓ 自动补偿目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(无条件检查,无首写竞态)。" >&2
+  fi
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
       rm -f '$tmplink'
       ln -s '$old_release' '$tmplink'
@@ -2346,19 +2381,19 @@ activate_release() {
   echo "  ✓ 原子翻转:$ACTIVE_SRC(slot=$ACTIVE_SLOT)→ $reldir(旧=$prev)"
   echo "── restart $ACTIVE_UNIT(仅 v5 active slot=$ACTIVE_SLOT,绝不碰 v3)──"
   if ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'"; then
-    restore_release_activation "$prev" "$old_prev_file" "restart new failed" \
+    restore_release_activation "$prev" "$old_prev_file" "restart new failed" "$reldir" \
       || mark_deploy_recovery_required "新 release restart 失败且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
     return 1
   fi
   run "sleep 4"
   if ! smoke "$ACTIVE_PORT"; then
-    restore_release_activation "$prev" "$old_prev_file" "new release smoke failed" \
+    restore_release_activation "$prev" "$old_prev_file" "new release smoke failed" "$reldir" \
       || mark_deploy_recovery_required "新 release smoke 失败且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
     return 1
   fi
   if ! ds_commit_active_release "$reldir"; then
     if restore_release_state_if_committed "$reldir"; then
-      restore_release_activation "$prev" "$old_prev_file" "deploy_state commit failed" \
+      restore_release_activation "$prev" "$old_prev_file" "deploy_state commit failed" "$reldir" \
         || mark_deploy_recovery_required "state 已恢复但 slot=$ACTIVE_SLOT 运行面回切失败(target=$reldir)"
     else
       echo "FATAL:state 未确认恢复，保持新运行面不动；禁止盲目回切旧 symlink/unit。" >&2

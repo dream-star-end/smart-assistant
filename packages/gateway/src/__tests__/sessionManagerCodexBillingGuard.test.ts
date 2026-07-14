@@ -202,7 +202,7 @@ describe("isCommercialManagedRuntime(commercial 判定惯例)", () => {
 });
 
 describe("submit() codex 计费 guard(fail-closed)", () => {
-  test("commercial runtime without lossless sink rejects before any engine execution", async () => {
+  test("commercial runtime without lossless sink rejects silently before any engine execution", async () => {
     process.env.OC_RUNTIME_CHANNEL = "v5";
     setV3MasterSinkSingleton(null);
     const runner = new FakeEngineAdapter("ccb", CCB_CAPS, "glm-5.2");
@@ -212,8 +212,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
     await makeSm().submit(session, "paid prompt", (event) => events.push(event));
 
     assert.equal(runner.submitTurnCalls.length, 0);
-    assert.ok(events.some((event) =>
-      event.kind === "error" && /LOSSLESS_SINK_UNAVAILABLE/.test(event.error)));
+    assert.deepEqual(events, [], "must not invent a user-visible persistence notice");
   });
 
   test("commercial + needsServerRequestId + 无 requestId → 拒 turn(error 事件),不触 submitTurn", async () => {

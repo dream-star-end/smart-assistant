@@ -291,12 +291,14 @@ interface CapturedSink {
   payloads: V3MasterSinkPayload[];
 }
 
-function makeCapturingSink(): CapturedSink {
+type CapturedSinkOutcome = Awaited<ReturnType<V3MasterSink["persistOrQueue"]>>;
+
+function makeCapturingSink(outcome: CapturedSinkOutcome = { ok: true }): CapturedSink {
   const payloads: V3MasterSinkPayload[] = [];
   const sink = {
     persistOrQueue: async (payload: V3MasterSinkPayload) => {
       payloads.push(payload);
-      return { ok: true as const };
+      return outcome;
     },
     attemptOnce: async () => {
       throw new Error("not used in this test");
@@ -626,6 +628,52 @@ describe("crash/interrupt partial persistence", () => {
       setV3MasterSinkSingleton(null);
     }
   });
+
+  for (const [status, exit, expectedReason] of [
+    ["crashed", { code: 1, signal: null, crashed: true }, "code 1"],
+    ["interrupted", { code: null, signal: "SIGTERM", crashed: true }, "SIGTERM"],
+  ] as const) {
+    test(`queued ${status} tape is not exposed as a terminal reply before master ACK`, async () => {
+      const captured = makeCapturingSink({
+        ok: false,
+        queued: true,
+        errorClass: "transient",
+      });
+      setV3MasterSinkSingleton(captured.sink);
+      try {
+        const sm = new SessionManager(makeConfigStub());
+        const events: SessionStreamEvent[] = [];
+        const runner = new FakeCcbRunner((r) => {
+          setImmediate(() => {
+            r.text(`partial ${status}`);
+            r.emitExit(exit);
+          });
+        });
+        const session = makeSession(runner, {
+          channel: "webchat",
+          userId: "user-queued",
+        } as Partial<AgentSession>);
+
+        await runOneTurn(sm, session, events);
+
+        assert.equal(captured.payloads.length, 1);
+        assert.equal(captured.payloads[0].status, status);
+        assert.equal(captured.payloads[0].text, `partial ${status}`);
+        assert.ok(captured.payloads[0].runtimeEvents?.some((event) =>
+          (event.payload as { type?: unknown }).type === "terminal_error"));
+        assert.equal(
+          events.some((event) =>
+            (event.kind === "error" && event.error.includes(expectedReason)) ||
+            event.kind === "final"),
+          false,
+          "locally queued data is not an authoritative terminal ACK",
+        );
+        await sm.awaitPendingPersistence();
+      } finally {
+        setV3MasterSinkSingleton(null);
+      }
+    });
+  }
 
   test("completed structured-only turn persists every plan/goal update", async () => {
     const captured = makeCapturingSink();

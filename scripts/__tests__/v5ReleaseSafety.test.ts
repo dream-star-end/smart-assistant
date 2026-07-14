@@ -368,6 +368,33 @@ describe('v5 release safety lanes', () => {
     assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
     assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
 
+    const restoreStart = source.indexOf('restore_release_activation()')
+    const restoreBody = source.slice(
+      restoreStart,
+      source.indexOf('\n# 状态提交回执', restoreStart),
+    )
+    const ordinaryGuardAt = restoreBody.indexOf('release_has_lossless_turn_tape_capability "$candidate_release"')
+    const ordinaryFlipAt = restoreBody.indexOf('if ! ssh "$KL_HOST"')
+    assert.ok(ordinaryGuardAt >= 0 && ordinaryGuardAt < ordinaryFlipAt,
+      'ordinary compensation must prove the old stack before flipping its symlink')
+    assert.match(restoreBody, /assert_lossless_release_capability "\$old_release"/)
+    assert.match(restoreBody, /assert_lossless_runtime_tuple_capability "\$image_id" "\$runtime_release"/)
+    assert.match(source, /restore_release_activation "\$prev" "\$old_prev_file" "restart new failed" "\$reldir"/)
+
+    const sagaRollbackStart = runtimeLib.indexOf('_hotcfg_saga_rollback()')
+    const sagaRollbackBody = runtimeLib.slice(
+      sagaRollbackStart,
+      runtimeLib.indexOf('\n  # 2) extra:', sagaRollbackStart),
+    )
+    const sagaGuardAt = sagaRollbackBody.indexOf('lossless_writer_may_have_served')
+    const stateRevertAt = sagaRollbackBody.indexOf('if [ "$commit_state" = applied ]')
+    assert.ok(sagaGuardAt >= 0 && sagaGuardAt < stateRevertAt,
+      'hotcfg compensation must block an incapable old stack before state/runtime rollback')
+    assert.match(sagaRollbackBody, /oc_hotcfg_assert_master_lossless_capability "\$prev_master_release"/)
+    assert.match(sagaRollbackBody, /oc_hotcfg_assert_tuple_lossless_capability "\$old_image_id" "\$old_release"/)
+    assert.doesNotMatch(sagaRollbackBody, /assert_tuple_lossless_floor/,
+      'post-exposure rollback must be unconditional, not a racy DB floor probe')
+
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-tuple-')); dirs.push(dir)
     const capable = path.join(dir, 'capable'); const old = path.join(dir, 'old')
     await mkdir(capable); await mkdir(old)

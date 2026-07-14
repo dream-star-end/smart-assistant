@@ -487,6 +487,39 @@ chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current'
 chk "激活未提交:history 仅 pre-state 1 条(R2-B2,失败不回滚 pre-state)" "[ \"\$(grep -c . '$OC_HOTCFG_HISTORY')\" = 1 ] && [ \"\$(jq -r .preState <<<\"\$(oc_hotcfg_history_last_committed '$OC_HOTCFG_HISTORY')\")\" = true ]"
 chk "回滚后 restart 被调用 2 次(新+旧)" "[ \"\$(grep -c restart '$RESTART_LOG')\" = 2 ]"
 
+echo "== T9L lossless writer 已可能服务 → 旧栈无 capability 时禁止自动补偿 =="
+LNEW_MASTER="$WORK/lossless-master-new"; LOLD_MASTER="$WORK/lossless-master-old"
+LNEW_RUNTIME="$WORK/lossless-runtime-new"; LOLD_RUNTIME="$WORK/lossless-runtime-old"
+mkdir -p "$LNEW_MASTER/deploy/v5" "$LOLD_MASTER/deploy/v5" "$LNEW_RUNTIME" "$LOLD_RUNTIME"
+printf '{"capabilities":["lossless-turn-tape-v2"],"runtimeCapabilities":["lossless-turn-tape-v2"]}\n' \
+  > "$LNEW_MASTER/deploy/v5/release-metadata.json"
+printf '{"capabilities":[],"runtimeCapabilities":[]}\n' \
+  > "$LOLD_MASTER/deploy/v5/release-metadata.json"
+printf '{"capabilities":["lossless-turn-tape-v2"]}\n' > "$LNEW_RUNTIME/MANIFEST.json"
+printf '{"capabilities":[]}\n' > "$LOLD_RUNTIME/MANIFEST.json"
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:LOSSLESS-OLD
+OC_RUNTIME_IMAGE_ID=sha256:LOSSLESS-OLD
+OC_RUNTIME_RELEASE=$LOLD_RUNTIME
+OC_PLATFORM_BUNDLE=
+EOF
+LHIST="$WORK/lossless-rollback.history"; : > "$LHIST"
+LMASTER_PTR="$WORK/lossless-master.ptr"; echo OLD > "$LMASTER_PTR"
+LRESTART_LOG="$WORK/lossless-restart.log"; : > "$LRESTART_LOG"
+LRECOVERY="$WORK/lossless-recovery-required"; rm -f "$LRECOVERY"
+if DOCKER_STUB_IMAGE_ID=sha256:LOSSLESS-NEW oc_hotcfg_activate_saga \
+    "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$LHIST" \
+    img:LOSSLESS-NEW sha256:LOSSLESS-NEW "$LNEW_RUNTIME" "" \
+    "echo restart >>'$LRESTART_LOG'" "false" \
+    "echo NEW > '$LMASTER_PTR'" "echo OLD > '$LMASTER_PTR'" \
+    "$LNEW_MASTER" "$LOLD_MASTER" "" "" "$LRECOVERY" joint >/dev/null 2>&1; then
+  bad "T9L smoke 失败不应返回成功"
+else ok "T9L 拒绝自动回切无能力旧栈"; fi
+chk "T9L 候选 master 保持 NEW(禁止 extra_revert)" "[ \"\$(cat '$LMASTER_PTR')\" = NEW ]"
+chk "T9L 候选 runtime env 保持 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '$LNEW_RUNTIME' ]"
+chk "T9L 不重启旧 master" "[ \"\$(grep -c restart '$LRESTART_LOG')\" = 1 ]"
+chk "T9L 落人工恢复标记" "[ -s '$LRECOVERY' ] && grep -q 'lossless writer' '$LRECOVERY'"
+
 echo "== T10 saga 回滚(第 3 步 extra_apply 失败)=="
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
 OC_RUNTIME_IMAGE=img:OLD

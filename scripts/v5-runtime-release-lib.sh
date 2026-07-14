@@ -910,6 +910,21 @@ oc_hotcfg_assert_tuple_lossless_capability() {
   esac
 }
 
+# Master reader capability is separate from the actual runtime writer tuple.
+# Both are required before an automatic compensation may restore a stack after
+# a lossless-capable candidate has possibly accepted traffic.
+oc_hotcfg_assert_master_lossless_capability() {
+  local master_release="$1" caps
+  [ -n "$master_release" ] && [ -f "$master_release/deploy/v5/release-metadata.json" ] \
+    || { oc_hotcfg__die "lossless rollback: master release metadata 不存在:${master_release:-<empty>}"; return 1; }
+  caps="$(jq -r '(.capabilities // []) | join(" ")' "$master_release/deploy/v5/release-metadata.json" 2>/dev/null)" \
+    || { oc_hotcfg__die "lossless rollback: 读 master release capability 失败:$master_release"; return 1; }
+  case " $caps " in
+    *" $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP "*) return 0 ;;
+    *) oc_hotcfg__die "lossless rollback: master release 未声明 '$OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP':$master_release"; return 1 ;;
+  esac
+}
+
 # DB 中首个 finalized v2 tape 是不可逆地板。无 DATABASE_URL 仅用于本地 fixture/
 # bootstrap，放行；生产 env 有 URL 但查询失败则按地板已生效处理。
 oc_hotcfg_assert_tuple_lossless_floor() {
@@ -1030,6 +1045,14 @@ oc_hotcfg_activate_saga() {
 
   # 已完成阶段的进度旗标,回滚只逆做已生效者。这些是本函数的局部状态,rollback 闭包内引用。
   local extra_done=0 env_done=0 current_done=0 commit_state=none
+  local lossless_writer_candidate=0 lossless_writer_may_have_served=0
+  # A declared master reader plus the actual target runtime writer is the
+  # protocol boundary. Existing generic fixtures/legacy tuples that declare
+  # neither cannot emit v2 tapes; production v5 targets declare both.
+  if oc_hotcfg_assert_master_lossless_capability "$master_release" >/dev/null 2>&1 \
+      && oc_hotcfg_assert_tuple_lossless_capability "$image_id" "$release" >/dev/null 2>&1; then
+    lossless_writer_candidate=1
+  fi
 
   _hotcfg_mark_manual_recovery() { # $1=reason；保持新运行面不动，供人工按标记收敛。
     local reason="$1" tmp
@@ -1053,7 +1076,22 @@ oc_hotcfg_activate_saga() {
   # trap 语义(§1.5)由"任一步失败→_saga_rollback→return 1"等价实现,且覆盖到 history 写为止:
   # history 写在最后一步,其失败同样走本回滚 → 满足"trap 持续到 history fsync 成功后才解除"。
   _hotcfg_saga_rollback() {
-    local rb_failed=0
+    local rb_failed=0 old_image_id old_release
+    # Check before deploy_state or any runtime compensation. Once restart was
+    # attempted, the candidate may have finalized the first v2 tape. The old
+    # stack therefore has to prove reader+writer support unconditionally; a
+    # DB floor query here would have a check-then-first-write race.
+    if [ "$lossless_writer_may_have_served" = 1 ]; then
+      old_image_id="$(oc_hotcfg_env_get "$snap" OC_RUNTIME_IMAGE_ID)"
+      old_release="$(oc_hotcfg_env_get "$snap" OC_RUNTIME_RELEASE)"
+      [ "$old_image_id" = "<UNSET>" ] && old_image_id=""
+      [ "$old_release" = "<UNSET>" ] && old_release=""
+      if ! oc_hotcfg_assert_master_lossless_capability "$prev_master_release" \
+          || ! oc_hotcfg_assert_tuple_lossless_capability "$old_image_id" "$old_release"; then
+        _hotcfg_mark_manual_recovery "lossless writer 已可能对外服务,旧 master/runtime 未证明 $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP,禁止自动补偿"
+        return 1
+      fi
+    fi
     # deploy_state 是 release 血缘权威。只要提交已尝试且未明确 original，就先用幂等
     # reconcile 钩子把 applied/不确定回执裁决并收敛到 old；未确认前绝不回切运行面。
     if [ "$commit_state" = applied ] || [ "$commit_state" = uncertain ]; then
@@ -1102,6 +1140,7 @@ oc_hotcfg_activate_saga() {
     current_done=1
   fi
   # 5) restart 新 master
+  [ "$lossless_writer_candidate" = 1 ] && lossless_writer_may_have_served=1
   if ! eval "$restart_cmd"; then _hotcfg_saga_rollback; return 1; fi
   # 6) smoke
   if ! eval "$smoke_cmd"; then _hotcfg_saga_rollback; return 1; fi
