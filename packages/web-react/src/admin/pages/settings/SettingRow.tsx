@@ -20,6 +20,8 @@ function rangeHint(r: Row): string {
       return `max=${m.max ?? "?"} 项`;
     case "boolean":
       return "true / false";
+    case "model":
+      return `${m.options?.length ?? 0} 个可用模型`;
     default:
       return "JSON";
   }
@@ -33,7 +35,7 @@ function initialDraft(r: Row): string | boolean {
     const items = Array.isArray(r.value) ? (r.value as unknown[]) : [];
     return items.map((x) => String(x)).join("\n");
   }
-  if (m.kind === "number" || m.kind === "enum") {
+  if (m.kind === "number" || m.kind === "enum" || m.kind === "model") {
     return r.value == null ? "" : String(r.value);
   }
   // 未知 kind：回落等宽 JSON textarea
@@ -65,6 +67,10 @@ function convert(r: Row, draft: string | boolean): Converted {
     }
     case "enum":
       return { ok: true, value: String(draft) };
+    case "model":
+      return String(draft).trim()
+        ? { ok: true, value: String(draft) }
+        : { ok: false, msg: `${key}: 请选择可用模型` };
     default: {
       // 未知 kind：等宽 Textarea + JSON.parse 校验
       try {
@@ -121,7 +127,13 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
         <span className="font-mono text-[13px] text-muted">{on ? "true" : "false"}</span>
       </div>
     );
-  } else if (kind === "enum") {
+  } else if (kind === "enum" || kind === "model") {
+    const options = kind === "model"
+      ? (row.meta.options ?? [])
+      : (row.meta.enumValues ?? []).map((value) => ({ value, label: value }));
+    const currentValue = String(draft);
+    const currentModelUnavailable =
+      kind === "model" && !options.some((option) => option.value === currentValue);
     editor = (
       <select
         aria-label={`${row.key} 取值`}
@@ -129,9 +141,12 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
         value={String(draft)}
         onChange={(e) => setDraft(e.target.value)}
       >
-        {(row.meta.enumValues ?? []).map((v) => (
-          <option key={v} value={v}>
-            {v}
+        {currentModelUnavailable && (
+          <option value={currentValue}>当前模型不可用（{currentValue}）</option>
+        )}
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}（{option.value}）
           </option>
         ))}
       </select>

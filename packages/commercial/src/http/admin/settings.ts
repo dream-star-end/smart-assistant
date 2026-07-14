@@ -21,8 +21,15 @@ import {
 } from "../../admin/systemSettings.js";
 import { invalidateRuntimeFlagsCache } from "../../admin/runtimeFlags.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
+import { listAutoDreamModelOptions } from "../../billing/autoDreamModels.js";
 
-function serializeSetting(row: SystemSettingRow): Record<string, unknown> {
+function serializeSetting(
+  row: SystemSettingRow,
+  autoDreamOptions: Awaited<ReturnType<typeof listAutoDreamModelOptions>> = [],
+): Record<string, unknown> {
+  const meta = row.key === "auto_dream_model"
+    ? { ...KEY_META[row.key], options: autoDreamOptions }
+    : KEY_META[row.key];
   return {
     key: row.key,
     value: row.value,
@@ -30,8 +37,16 @@ function serializeSetting(row: SystemSettingRow): Record<string, unknown> {
     updated_at: row.updated_at,
     updated_by: row.updated_by,
     is_default: row.is_default,
-    meta: KEY_META[row.key],
+    meta,
   };
+}
+
+async function safeAutoDreamOptions(): Promise<Awaited<ReturnType<typeof listAutoDreamModelOptions>>> {
+  try {
+    return await listAutoDreamModelOptions();
+  } catch {
+    return [];
+  }
 }
 
 function extractTailKey(url: URL, prefix: string): SystemSettingKey {
@@ -66,7 +81,8 @@ export async function handleAdminListSettings(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const rows = await listSystemSettings();
-  sendJson(res, 200, { rows: rows.map(serializeSetting) });
+  const options = await safeAutoDreamOptions();
+  sendJson(res, 200, { rows: rows.map((row) => serializeSetting(row, options)) });
 }
 
 // ─── GET /api/admin/settings/:key ─────────────────────────────────
@@ -82,7 +98,7 @@ export async function handleAdminGetSetting(
   const key = extractTailKey(url, "/api/admin/settings/");
   try {
     const row = await getSystemSetting(key);
-    sendJson(res, 200, { setting: serializeSetting(row) });
+    sendJson(res, 200, { setting: serializeSetting(row, await safeAutoDreamOptions()) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {
       // 理论上 extractTailKey 已挡住未知 key,这里兜底:与 allowlist 失败一致 400。
@@ -140,7 +156,7 @@ export async function handleAdminPutSetting(
     // runtime flag cache 只有 2 个 entry(system_settings 表本身 19 个 key,但
     // 只有这 2 个走 cache),无脑 clear 开销可忽略,不需要按 key 分支。
     invalidateRuntimeFlagsCache();
-    sendJson(res, 200, { setting: serializeSetting(row) });
+    sendJson(res, 200, { setting: serializeSetting(row, await safeAutoDreamOptions()) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {
       // 理论上 extractTailKey 已挡住未知 key,这里兜底:与 allowlist 失败一致 400。

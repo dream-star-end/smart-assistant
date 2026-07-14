@@ -90,6 +90,7 @@ import {
   appendServerAuthoredMessage,
   deleteClientSession,
   renameClientSession,
+  recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
   probeSessionsDb,
@@ -244,6 +245,11 @@ import {
   OPENCLAUDE_VISION_TOOLS,
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
+import {
+  AutoDreamService,
+  isAutoDreamSuccessfulTurn,
+  type AutoDreamModelRun,
+} from './autoDream.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -1325,6 +1331,7 @@ export class Gateway {
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
+  private autoDream: AutoDreamService
   private cron: CronScheduler | null = null
   private webhookRouter: WebhookRouter | null = null
   private _taskStore = new TaskStore()
@@ -1625,6 +1632,10 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    this.autoDream = new AutoDreamService({
+      runModel: (input) => this._runAutoDreamModel(input),
+      log: (event, fields) => this.log.info(event, fields),
+    })
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
     void this.skillTrainJobs.loadAll(Date.now())
     void this.skillEvalJobs.loadAll(Date.now())
@@ -6584,6 +6595,87 @@ export class Gateway {
       })
     } finally {
       // 评测会话一次性:立即销毁,释放子进程/pids;失败不影响结果。
+      await this.sessions.destroySession(sessionKey).catch(() => {})
+    }
+  }
+
+  /**
+   * Auto-Dream paid turn: exact local catalog authority path, but a hermetic
+   * CCB process (`--bare --tools "" --strict-mcp-config`) with no ambient
+   * persona/repo/memory/skills/MCP/resume context.
+   */
+  private async _runAutoDreamModel(input: AutoDreamModelRun): Promise<string> {
+    const cfg = await this._getAgentsConfig()
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === input.agentId) ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
+    const agent: AgentDef = {
+      ...sourceAgent,
+      model: input.model,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model: input.model,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    if (execution && execution.engine !== 'ccb') throw new Error('AUTO_DREAM_MODEL_NOT_CCB')
+    const model = execution?.canonicalModel ?? input.model
+    const sessionKey = `auto-dream:${input.attemptId}`
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'auto-dream',
+      peerId: sessionKey,
+      userId: input.userId,
+      effortLevel: 'medium',
+      workload: 'auto-dream',
+      hermeticNoTools: true,
+    })
+    let text = ''
+    let finals = 0
+    let invalidEvent: string | null = null
+    let stopReason: string | undefined
+    try {
+      await this.sessions.submit(
+        session,
+        input.prompt,
+        (event) => {
+          if (event.kind === 'block') {
+            // Reasoning is allowed but never part of the strict JSON payload.
+            // Every other non-text block remains a hermeticity violation.
+            if (event.block.kind === 'thinking') return
+            if (event.block.kind !== 'text' || typeof event.block.text !== 'string') {
+              invalidEvent = `non_text:${event.block.kind}`
+              return
+            }
+            text += event.block.text
+            return
+          }
+          if (event.kind === 'final') {
+            finals++
+            stopReason = event.meta?.stopReason
+            return
+          }
+          if (event.kind === 'turn_status') return
+          invalidEvent = event.kind
+        },
+        'medium',
+        model,
+      )
+      if (finals !== 1) throw new Error(`AUTO_DREAM_FINAL_COUNT_${finals}`)
+      if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
+      if (stopReason === 'tool_use') throw new Error('AUTO_DREAM_TOOL_USE_STOP')
+      if (!text.trim()) throw new Error('AUTO_DREAM_EMPTY_TEXT')
+      return text.trim()
+    } finally {
       await this.sessions.destroySession(sessionKey).catch(() => {})
     }
   }
@@ -11616,6 +11708,9 @@ export class Gateway {
     session._currentTurnUserText = (text ?? '').slice(0, 8000)
     const currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     let turnErrored = false
+    let leaderFinalCount = 0
+    let autoDreamAssistantText = ''
+    let autoDreamHasCanonicalApiError = false
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
     // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
     // 因此走的是 e.kind === 'block' + 'final' 的正常 turn 路径,绕开了下面
@@ -11665,8 +11760,12 @@ export class Gateway {
         if (
           _b0.kind === 'text' &&
           typeof _b0.text === 'string' &&
-          _b0.text.startsWith('API Error: ')
+          _b0.text.startsWith('API Error:')
         ) {
+          // Auto-Dream cadence is stricter than the user-facing classifier:
+          // every canonical CCB API error is a failed source turn, including
+          // unknown 4xx variants that intentionally keep the legacy UX.
+          autoDreamHasCanonicalApiError = true
           const _cls = classifyRunError(_b0.text)
           if (_cls.code !== 'unknown') {
             _apiErrorIntercepted = true
@@ -11686,6 +11785,10 @@ export class Gateway {
           }
         }
 
+        if (b.kind === 'text' && typeof b.text === 'string') {
+          autoDreamAssistantText += b.text
+        }
+
         if (liveWechatAdapter) {
           // WeChat itself only gets final/error text.  The linked Web session
           // receives the full detailed stream (thinking/tool/tool_result/text)
@@ -11703,6 +11806,7 @@ export class Gateway {
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         }
       } else if (e.kind === 'final') {
+        leaderFinalCount++
         // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
         // emit setSDKStatus(null)(parser → kind:'turn_status' status:null),
         // cache 在那一帧已经清空;这里是兜底:如果 CCB 因任何原因没发 status:null
@@ -12043,6 +12147,46 @@ export class Gateway {
         session,
         turnErrored || clientTurnThrew ? 'errored' : 'completed',
       )
+    }
+    if (
+      (frame.channel === 'webchat' || frame.channel === 'wechat' || frame.channel === 'telegram') &&
+      isAutoDreamSuccessfulTurn({
+        signed: turnAuthority !== undefined,
+        turnErrored,
+        clientTurnThrew,
+        leaderFinalCount,
+        assistantText: autoDreamAssistantText,
+        hasCanonicalApiError: autoDreamHasCanonicalApiError,
+      })
+    ) {
+      const autoDreamTrigger = {
+        agentId: agent.id,
+        userId: activeUserId,
+        sessionKey,
+        channel: frame.channel,
+        userText: text ?? '',
+        assistantText: autoDreamAssistantText,
+      }
+      // Durably await the success-only marker before detaching background scan.
+      // This prevents process shutdown from losing an untracked insertion and
+      // makes its database-generated sequence visible to the captured watermark.
+      let markerPersisted = false
+      try {
+        await recordAutoDreamSuccessfulSession({
+          agentId: agent.id,
+          sessionId: sessionKey,
+          channel: frame.channel,
+          completedAt: Date.now(),
+        })
+        markerPersisted = true
+      } catch (err) {
+        this.log.warn('auto_dream_background_failed', { agentId: agent.id }, err)
+      }
+      if (markerPersisted) {
+        void this.autoDream.maybeSchedule(autoDreamTrigger).catch((err) => {
+          this.log.warn('auto_dream_background_failed', { agentId: agent.id }, err)
+        })
+      }
     }
     if (liveWechatAdapter) {
       await liveWechatSendQueue

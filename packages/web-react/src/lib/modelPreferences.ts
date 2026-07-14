@@ -12,7 +12,20 @@ export type PrefsView = {
   notify_telegram?: boolean;
   wechat_show_tool_calls?: boolean;
   wechat_proactive_push?: boolean;
+  auto_dream_enabled?: boolean;
   hotkeys?: Record<string, string>;
+};
+
+export type AutoDreamFeatureView = {
+  eligible: boolean;
+  available: boolean;
+  enabled: boolean;
+  effective: boolean;
+  minimum_plan_code: string;
+  model_id: string;
+  model_name: string;
+  min_interval_hours: number;
+  min_new_sessions: number;
 };
 
 /** preferences 快照 → 内层 prefs（兼容 {prefs,updated_at} 包裹 / 平铺历史形态）。 */
@@ -22,6 +35,25 @@ export function extractPrefs(snap: unknown): PrefsView {
   const inner = obj.prefs;
   if (inner && typeof inner === "object") return inner as PrefsView;
   return obj as PrefsView;
+}
+
+export function extractAutoDreamFeature(snap: unknown): AutoDreamFeatureView | null {
+  if (!snap || typeof snap !== "object") return null;
+  const feature = (snap as { features?: { auto_dream?: unknown } }).features?.auto_dream;
+  if (!feature || typeof feature !== "object") return null;
+  const row = feature as Record<string, unknown>;
+  if (
+    typeof row.eligible !== "boolean" ||
+    typeof row.available !== "boolean" ||
+    typeof row.enabled !== "boolean" ||
+    typeof row.effective !== "boolean" ||
+    typeof row.model_id !== "string" ||
+    typeof row.model_name !== "string" ||
+    typeof row.minimum_plan_code !== "string" ||
+    typeof row.min_interval_hours !== "number" ||
+    typeof row.min_new_sessions !== "number"
+  ) return null;
+  return row as AutoDreamFeatureView;
 }
 
 /** 只接受当前用户模型列表中仍可见且健康的偏好；否则回落首个健康模型。 */

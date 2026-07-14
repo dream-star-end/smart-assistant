@@ -27,6 +27,7 @@ describe("PreferencesSchema (full)", () => {
       notify_email: true,
       notify_telegram: false,
       wechat_show_tool_calls: true,
+      auto_dream_enabled: true,
       hotkeys: { send: "Ctrl+Enter" },
     });
     assert.equal(r.success, true);
@@ -88,6 +89,7 @@ describe("PreferencesPatchSchema", () => {
       theme: null,
       default_model: null,
       wechat_show_tool_calls: null,
+      auto_dream_enabled: null,
       hotkeys: null,
     });
     assert.equal(r.success, true);
@@ -99,6 +101,7 @@ describe("PreferencesPatchSchema", () => {
       default_model: null,
       notify_email: true,
       wechat_show_tool_calls: false,
+      auto_dream_enabled: true,
     });
     assert.equal(r.success, true);
   });
@@ -111,5 +114,12 @@ describe("PreferencesPatchSchema", () => {
   test("非法 enum 值不变,拒绝", () => {
     const r = PreferencesPatchSchema.safeParse({ theme: "neon" });
     assert.equal(r.success, false);
+  });
+
+  test("auto_dream_enabled 只接受 boolean 或删除标记 null", () => {
+    assert.equal(PreferencesPatchSchema.safeParse({ auto_dream_enabled: true }).success, true);
+    assert.equal(PreferencesPatchSchema.safeParse({ auto_dream_enabled: false }).success, true);
+    assert.equal(PreferencesPatchSchema.safeParse({ auto_dream_enabled: null }).success, true);
+    assert.equal(PreferencesPatchSchema.safeParse({ auto_dream_enabled: "true" }).success, false);
   });
 });

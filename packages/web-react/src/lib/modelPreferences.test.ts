@@ -3,6 +3,7 @@ import type { PublicModel } from "./types";
 import {
   effectiveEffortModelId,
   effortForModel,
+  extractAutoDreamFeature,
   extractPrefs,
   initialModelFromPreferences,
 } from "./modelPreferences";
@@ -54,5 +55,21 @@ describe("model preferences", () => {
   test("team leader effort is resolved against the actual Sol execution model", () => {
     expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-5.6-sol");
     expect(effectiveEffortModelId("gpt-5.6-terra", false)).toBe("gpt-5.6-terra");
+  });
+
+  test("extracts Auto-Dream feature projection from preference snapshots", () => {
+    const feature = {
+      eligible: true,
+      available: true,
+      enabled: true,
+      effective: true,
+      minimum_plan_code: "max",
+      model_id: "deepseek-v4-flash",
+      model_name: "DeepSeek V4 Flash",
+      min_interval_hours: 24,
+      min_new_sessions: 5,
+    };
+    expect(extractAutoDreamFeature({ prefs: {}, features: { auto_dream: feature } })).toEqual(feature);
+    expect(extractAutoDreamFeature({ prefs: {} })).toBeNull();
   });
 });

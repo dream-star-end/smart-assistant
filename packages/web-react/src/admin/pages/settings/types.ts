@@ -2,11 +2,12 @@
 // 权威语义见 vanilla admin.js renderSettingsTab / _renderSettingRow / saveSetting。
 
 /** 后端已知的 editor 类型；未知值回落等宽 JSON Textarea（保存前 JSON.parse 校验）。 */
-export type SettingKind = "boolean" | "enum" | "number" | "string_array";
+export type SettingKind = "boolean" | "enum" | "number" | "string_array" | "model";
 
 export type SettingMeta = {
   kind: SettingKind | string;
   enumValues?: string[];
+  options?: Array<{ value: string; label: string }>;
   min?: number;
   max?: number;
   description?: string;

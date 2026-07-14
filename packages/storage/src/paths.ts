@@ -35,6 +35,19 @@ export const paths = {
   // 该文件被容器 gateway(UI PUT overwrite)与 mcp-memory 子进程(AI add/replace/remove)
   // 两个进程写,不再是单 writer → 写路径必须取此锁做 read-modify-write 互斥。
   agentMemoryLock: (agentId: string) => join(HOME, 'agents', agentId, 'MEMORY.md.lock'),
+  // Crash-recovery journal for one all-or-nothing MemoryDir batch. The file is
+  // intentionally outside memory/ so list()/injection can never treat it as a
+  // user memory entry.
+  agentMemoryBatchJournal: (agentId: string) =>
+    join(HOME, 'agents', agentId, '.memory-batch-journal.json'),
+  // Foreground native Write/Edit holds this inode shared for the whole turn;
+  // Auto-Dream batch apply/recovery takes it exclusive.
+  agentMemoryBarrier: (agentId: string) => join(HOME, 'agents', agentId, 'memory-barrier.lock'),
+  // V5 Auto-Dream keeps its own scheduler state/serialization lock beside the
+  // agent memory.  The lock file is a stable inode used by kernel flock: never
+  // unlink or atomically replace it (doing so would split the lock domain).
+  agentAutoDreamState: (agentId: string) => join(HOME, 'agents', agentId, 'auto-dream-state.json'),
+  agentAutoDreamLock: (agentId: string) => join(HOME, 'agents', agentId, 'auto-dream.lock'),
   // Skills system (L3): per-agent skill directory.
   // NOTE: with the user-level shared skill library (see sharedSkillsDir below),
   // this per-agent dir is a read-only "legacy" overlay layer kept only for

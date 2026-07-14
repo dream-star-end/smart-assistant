@@ -60,6 +60,7 @@ ENV TZ=Asia/Shanghai \
 # 必装工具(精挑,避免镜像膨胀):
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
 #   - ripgrep / jq / unzip: 个人版 grep tool / 通用 shell 工具链; unzip 也用于 DOCX smoke/验证
+#   - util-linux:提供 kernel flock，V5 Auto-Dream 跨 gateway 进程串行化的硬依赖
 #   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
 #   - bash: entrypoint.sh 用 bash
 #   - sudo: 见下方 sudoers 段。agent 用户 NOPASSWD ALL,因为 codex 频繁需要
@@ -78,6 +79,7 @@ RUN apt-get update \
         ripgrep \
         jq \
         unzip \
+        util-linux \
         tini \
         bash \
         sudo \
@@ -85,6 +87,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         fonts-noto-cjk \
+    && flock --version \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
     # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root

@@ -1306,8 +1306,10 @@ export async function handleGetMyPreferences(
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
   const { getPreferences } = await import("../user/preferences.js");
+  const { getAutoDreamFeature } = await import("../user/autoDream.js");
   const snap = await getPreferences(user.id);
-  sendJson(res, 200, snap);
+  const autoDream = await getAutoDreamFeature(user.id, snap.prefs.auto_dream_enabled === true);
+  sendJson(res, 200, { ...snap, features: { auto_dream: autoDream } });
 }
 
 export async function handlePatchMyPreferences(
@@ -1321,10 +1323,23 @@ export async function handlePatchMyPreferences(
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
   }
+  const requestedAutoDream = (body as Record<string, unknown>).auto_dream_enabled;
+  if (requestedAutoDream === true) {
+    const { getAutoDreamFeature } = await import("../user/autoDream.js");
+    const feature = await getAutoDreamFeature(user.id, true);
+    if (!feature.eligible) {
+      throw new HttpError(403, "AUTO_DREAM_MAX_REQUIRED", "Auto-Dream requires Max or above");
+    }
+    if (!feature.available) {
+      throw new HttpError(503, "AUTO_DREAM_UNAVAILABLE", "Auto-Dream model is unavailable");
+    }
+  }
   const { patchPreferences, PreferencesError } = await import("../user/preferences.js");
   try {
     const snap = await patchPreferences(user.id, body);
-    sendJson(res, 200, snap);
+    const { getAutoDreamFeature } = await import("../user/autoDream.js");
+    const autoDream = await getAutoDreamFeature(user.id, snap.prefs.auto_dream_enabled === true);
+    sendJson(res, 200, { ...snap, features: { auto_dream: autoDream } });
   } catch (err) {
     if (err instanceof PreferencesError) {
       if (err.code === "VALIDATION") {
