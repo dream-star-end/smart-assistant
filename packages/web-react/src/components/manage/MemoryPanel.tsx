@@ -1,6 +1,6 @@
 import { Check, ChevronRight, Loader2, MoonStar, Plus, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api, apiErrorMessage } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type {
   AuthSession,
   AutoDreamLastReport,
@@ -100,6 +100,37 @@ const TYPE_META: Record<string, { label: string; tone: "info" | "warning" | "acc
 /** 记忆文件名规则（与后端 MEMORY_FILE_RE 一致,防路径穿越）。 */
 const MEMORY_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.md$/;
 
+// 首次打开管理中心时，按需容器可能刚好还在冷启/滚动升级。桥接请求本身会等待约 10 秒，
+// 但生产实测容器可能在首个 503 后约 7 秒才 ready；固定 3s + 7s 的两次重试覆盖该窗口。
+// Retry-After 只允许把等待拉长（最多 30s），不能把这个已验证的安全下限压短。
+const COLD_START_RETRY_DELAYS_MS = [3_000, 7_000] as const;
+const MAX_RETRY_AFTER_MS = 30_000;
+
+async function loadWithColdStartRetry<T>(
+  load: () => Promise<T>,
+  isActive: () => boolean,
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await load();
+    } catch (error) {
+      const fallbackMs = COLD_START_RETRY_DELAYS_MS[attempt];
+      if (
+        fallbackMs === undefined ||
+        !(error instanceof ApiError) ||
+        (error.status !== 502 && error.status !== 503)
+      ) {
+        throw error;
+      }
+      const retryAfterMs = Number.isFinite(error.retryAfterSec)
+        ? Math.min(Math.max(0, error.retryAfterSec! * 1_000), MAX_RETRY_AFTER_MS)
+        : 0;
+      await new Promise((resolve) => window.setTimeout(resolve, Math.max(fallbackMs, retryAfterMs)));
+      if (!isActive()) throw new DOMException("aborted", "AbortError");
+    }
+  }
+}
+
 /** epoch ms → 中文相对时间。 */
 function relTime(ms: number): string {
   if (!ms || ms <= 0) return "";
@@ -145,8 +176,7 @@ function CoreMemorySection({
     let alive = true;
     setLoading(true);
     setErr(null);
-    api
-      .getMemoryIndex(auth, agentId)
+    loadWithColdStartRetry(() => api.getMemoryIndex(auth, agentId), () => alive)
       .then((d) => {
         if (alive) setIndex(d);
       })
@@ -165,8 +195,7 @@ function CoreMemorySection({
   useEffect(() => {
     void reloadKey;
     let alive = true;
-    api
-      .getAutoDreamReport(auth, agentId)
+    loadWithColdStartRetry(() => api.getAutoDreamReport(auth, agentId), () => alive)
       .then((d) => {
         if (alive) setDream(d);
       })
