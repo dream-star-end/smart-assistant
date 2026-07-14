@@ -5,6 +5,7 @@ import { describe, expect, test, beforeEach } from "vitest";
 import {
   ImageByteCache,
   appendThumbnailWidth,
+  authScopedImageIdentity,
   byteCacheKey,
   byteCacheVariant,
   getCachedThumbnail,
@@ -60,6 +61,15 @@ describe("byteCacheKey / variant — 变体隔离", () => {
   });
 });
 
+describe("authScopedImageIdentity — 跨账号隔离", () => {
+  test("同路径在不同 authKey 下生成不同 identity", () => {
+    const path = "/home/agent/same.png";
+    expect(authScopedImageIdentity("user-a", path)).not.toBe(authScopedImageIdentity("user-b", path));
+    expect(authScopedImageIdentity("user-a", path)).toBe(authScopedImageIdentity("user-a", path));
+    expect(authScopedImageIdentity("user-a", null)).toBeNull();
+  });
+});
+
 describe("ImageByteCache — LRU", () => {
   test("put→get 往返;null 键不缓存", () => {
     const c = new ImageByteCache(3, 1024);
@@ -89,6 +99,18 @@ describe("ImageByteCache — LRU", () => {
     expect(c.get("b")).toBeNull(); // 被逐
     expect(c.get("c")).not.toBeNull();
     expect(c.size).toBe(2);
+  });
+
+  test("clear 推进代次，旧异步结果不得迟到写回", () => {
+    const c = new ImageByteCache(3, 1024);
+    const oldEpoch = c.captureEpoch();
+    c.clear();
+    expect(c.setIfCurrentEpoch("same-path", blobOf(8), oldEpoch)).toBe(false);
+    expect(c.get("same-path")).toBeNull();
+
+    const currentEpoch = c.captureEpoch();
+    expect(c.setIfCurrentEpoch("same-path", blobOf(9), currentEpoch)).toBe(true);
+    expect(c.get("same-path")?.size).toBe(9);
   });
 });
 

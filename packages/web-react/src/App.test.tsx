@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
+import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 
 // ---------------------------------------------------------------------------
 // v5 商业版前端骨架（P2）测试
@@ -141,11 +142,13 @@ let fetchMock: FetchMock
 beforeEach(() => {
   window.history.replaceState({}, '', '/')
   localStorage.clear()
+  imageByteCache.clear()
   document.documentElement.classList.remove('dark')
 })
 
 afterEach(() => {
   cleanup()
+  imageByteCache.clear()
   vi.unstubAllGlobals()
   window.history.replaceState({}, '', '/')
 })
@@ -178,6 +181,23 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
 })
 
 describe('Aurora v5 skeleton — auth → workspace', () => {
+  test('登录与退出清空图片 Blob 缓存，跨账号相同容器路径不得复用', async () => {
+    const key = byteCacheKey('/home/agent/same-path.png', null)
+    imageByteCache.set(key, new Blob(['account-a']))
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    expect(imageByteCache.get(key)).toBeNull()
+
+    imageByteCache.set(key, new Blob(['account-b']))
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
+    expect(imageByteCache.get(key)).toBeNull()
+  })
+
   test('login posts to v5 /api/auth/login (credentials include) and enters workspace', async () => {
     fetchMock = vi.fn(async (url: string) =>
       String(url).includes('/api/auth/refresh')

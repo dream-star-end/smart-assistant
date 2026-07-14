@@ -100,6 +100,8 @@ export async function fetchProgressiveBlob(opts: {
   signal?: AbortSignal
   onProgress?: ProgressFn
 }): Promise<Blob> {
+  // 与缓存 miss 同时捕获代次；鉴权身份切换会 clear+推进 epoch，旧请求迟到不得回填。
+  const cacheEpoch = imageByteCache.captureEpoch()
   const key = byteCacheKey(opts.cacheIdentity ?? null, opts.width ?? null)
   const cached = imageByteCache.get(key)
   if (cached) {
@@ -114,7 +116,7 @@ export async function fetchProgressiveBlob(opts: {
     signal,
     onProgress: opts.onProgress,
   })
-  imageByteCache.set(key, blob)
+  imageByteCache.setIfCurrentEpoch(key, blob, cacheEpoch)
   return blob
 }
 
