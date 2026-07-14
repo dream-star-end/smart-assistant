@@ -150,7 +150,7 @@ import {
   handleAdminListModelCatalog,
   handleAdminModelCatalogAction,
 } from './admin/modelCatalog.js'
-import { handleAdminGetSession } from './admin/sessions.js'
+import { handleAdminGetSession, handleAdminSignSessionMedia } from './admin/sessions.js'
 import {
   handleAdminGetSetting,
   handleAdminListSettings,
@@ -1238,11 +1238,18 @@ export function createCommercialHandler(
     { method: 'DELETE', pathPrefix: '/api/admin/messages/', handler: handleAdminDeleteInbox },
 
     // ── /api/admin/sessions/:id —— admin 只读看用户对话内容 ────────────────
-    //   GET /api/admin/sessions/:id[?user_id=:userId]
+    //   GET  /api/admin/sessions/:id[?user_id=:userId]
+    //   GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
+    //   POST /api/admin/sessions/:id/media-sign?user_id=:userId
     //   - rendering session_id 是 TEXT(UUID/nanoid),handler 自带正则校验
-    //   - 不写 admin_audit("3 不留痕")
+    //   - 只写不含正文/媒体路径的 sessions.read admin_audit
     //   - 详见 admin/sessions.ts header comment
     { method: 'GET', pathPrefix: '/api/admin/sessions/', handler: handleAdminGetSession },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/sessions/',
+      handler: handleAdminSignSessionMedia,
+    },
   ]
   // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
   const prefixes = [

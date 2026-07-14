@@ -1,10 +1,21 @@
-import { Ban, Container, ExternalLink, ShieldCheck, ShieldOff, Undo2, Wallet } from 'lucide-react'
-import { type ReactNode, useState } from 'react'
+import {
+  Ban,
+  ChevronRight,
+  Container,
+  ExternalLink,
+  MessageSquareText,
+  ShieldCheck,
+  ShieldOff,
+  Undo2,
+  Wallet,
+} from 'lucide-react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { Badge, Button, Sheet, Switch, useConfirm, useToast } from '../../../components/ui'
 import { KeyValue, LevelBadge, SectionCard, TimeAgo } from '../../components'
 import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtDateTime, fmtInt, fmtYuan } from './format'
-import type { ModelGrant, UserDetail, UserRow } from './types'
+import { SessionViewerModal } from './SessionViewerModal'
+import type { ModelGrant, UserDetail, UserRow, UserSessionSummary } from './types'
 import { useLoad } from './useLoad'
 
 const STATUS_TONE: Record<string, 'success' | 'danger' | 'warning' | 'neutral'> = {
@@ -40,6 +51,12 @@ export function UserDetailSheet({
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
   const [busy, setBusy] = useState(false)
+  const [viewingSession, setViewingSession] = useState<UserSessionSummary | null>(null)
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 会话选择严格从属于当前 userId，切用户必须清空。
+  useEffect(() => {
+    setViewingSession(null)
+  }, [userId])
 
   const detail = useLoad<UserDetail>(
     () => adminGet<UserDetail>(`/users/${userId}/detail`),
@@ -386,10 +403,14 @@ export function UserDetailSheet({
               rows={detail.data?.recent_sessions ?? []}
             >
               {(s) => (
-                <div
+                <button
+                  type="button"
                   key={s.session_id}
-                  className="flex items-center justify-between gap-3 py-1.5 text-[12.5px]"
+                  onClick={() => setViewingSession(s)}
+                  aria-label={`查看会话：${s.title || s.session_id}`}
+                  className="-mx-2 flex w-[calc(100%+1rem)] items-center justify-between gap-3 rounded-lg px-2 py-2 text-left text-[12.5px] outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
                 >
+                  <MessageSquareText size={14} className="shrink-0 text-accent" />
                   <span className="min-w-0 flex-1 truncate text-fg" title={s.title}>
                     {s.title || <span className="text-faint">(无标题)</span>}
                   </span>
@@ -398,12 +419,19 @@ export function UserDetailSheet({
                     {fmtInt(s.message_count)} 条
                   </span>
                   <TimeAgo value={s.last_at} className="shrink-0 text-faint" />
-                </div>
+                  <ChevronRight size={14} className="shrink-0 text-faint" aria-hidden />
+                </button>
               )}
             </MiniTableCard>
           </div>
         ) : null}
       </div>
+      <SessionViewerModal
+        session={userId ? viewingSession : null}
+        userId={userId}
+        userEmail={u?.email}
+        onClose={() => setViewingSession(null)}
+      />
     </Sheet>
   )
 }

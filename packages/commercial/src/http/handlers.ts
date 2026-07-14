@@ -50,6 +50,7 @@ import {
   normalizeSignBatchInput,
   isContainerPathAllowed,
   isMediaFilenameAllowed,
+  extractApiMediaFilename,
   DEFAULT_SIGN_TTL_MS,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
@@ -2251,33 +2252,6 @@ function _logMediaSignSubjectMismatch(
  * 谓词不通过的 path **从 response map 里 drop**,不抛 403 —— 前端按 cache miss
  * 处理。这避免单条非法 path 让整个 batch 失败(媒体 URL 渲染应尽可能优雅)。
  */
-/** `/api/media/<file>` 前缀。用户上传/生成媒体存库即此形态的裸 URL。 */
-const API_MEDIA_URL_PREFIX = "/api/media/";
-
-/**
- * 若 entry 是 `/api/media/<file>` 形态,decode 出 file 段并过注入形态 sanity,返回 decoded
- * 文件名;否则 null。
- *
- * 存库的 `_media.url` 是内容寻址裸 URL(`/api/media/<digest>.<ext>`)。渲染层不能靠
- * `<img>` 的 SameSite cookie 取(iOS Safari + CF 下被 drop),必须换成带 opaque token 的
- * 签名 URL —— 这里把 `/api/media/<file>` 归一成"文件名",交 buildOpaqueMediaFileUrl 签。
- */
-function extractApiMediaFilename(entry: string): string | null {
-  if (!entry.startsWith(API_MEDIA_URL_PREFIX)) return null;
-  let seg = entry.slice(API_MEDIA_URL_PREFIX.length);
-  const q = seg.indexOf("?");
-  if (q >= 0) seg = seg.slice(0, q);
-  const hash = seg.indexOf("#");
-  if (hash >= 0) seg = seg.slice(0, hash);
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(seg);
-  } catch {
-    return null;
-  }
-  return isMediaFilenameAllowed(decoded) ? decoded : null;
-}
-
 export async function handleMediaSign(
   req: IncomingMessage,
   res: ServerResponse,

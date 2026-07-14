@@ -139,6 +139,30 @@ export function isMediaFilenameAllowed(f: string): boolean {
   return true
 }
 
+const API_MEDIA_URL_PREFIX = '/api/media/'
+
+/**
+ * 从消息里持久化的内容寻址 URL 提取文件名。
+ *
+ * 输入可带 query/hash；只接受单段安全文件名。用户端 `/api/media-sign` 与 admin
+ * 会话只读查看共用这一解析，避免两条签名管线对同一个存量 URL 产生漂移。
+ */
+export function extractApiMediaFilename(entry: string): string | null {
+  if (!entry.startsWith(API_MEDIA_URL_PREFIX)) return null
+  let seg = entry.slice(API_MEDIA_URL_PREFIX.length)
+  const q = seg.indexOf('?')
+  if (q >= 0) seg = seg.slice(0, q)
+  const hash = seg.indexOf('#')
+  if (hash >= 0) seg = seg.slice(0, hash)
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(seg)
+  } catch {
+    return null
+  }
+  return isMediaFilenameAllowed(decoded) ? decoded : null
+}
+
 /**
  * 从 bridgeSecret (64-char lowercase hex, see bridgeSecret.ts)派生 MEDIA_SIGN_KEY。
  *

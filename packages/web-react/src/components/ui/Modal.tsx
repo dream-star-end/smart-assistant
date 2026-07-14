@@ -17,6 +17,7 @@ export function Modal({
   children,
   footer,
   className,
+  bodyClassName,
   hideClose,
 }: {
   open: boolean;
@@ -27,6 +28,8 @@ export function Modal({
   children?: ReactNode;
   footer?: ReactNode;
   className?: string;
+  /** 内容区附加类；大尺寸对话查看器可用来接管 padding/滚动容器。 */
+  bodyClassName?: string;
   hideClose?: boolean;
 }) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
@@ -61,7 +64,9 @@ export function Modal({
           ) : (
             <RD.Title className="sr-only">{srTitle}</RD.Title>
           )}
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
+          <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", bodyClassName)}>
+            {children}
+          </div>
           {footer && (
             <div className="flex justify-end gap-2 border-t border-border px-5 py-4">{footer}</div>
           )}
