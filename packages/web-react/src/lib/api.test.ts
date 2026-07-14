@@ -124,6 +124,44 @@ test('orgTopup preserves mutually exclusive desktop/mobile payment URLs from the
   expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/org/topup')
 })
 
+test('submitFeedback sends only the allowlisted settings payload with Bearer auth', async () => {
+  const fetchMock = vi.fn(async () => ok({ ok: true, id: '901' }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session } = makeSession('tok-feedback')
+  const input = {
+    category: 'feature',
+    description: '希望设置中心增加更清晰的反馈入口。',
+    version: 'a1b2c3d4',
+    session_id: 'must-not-send',
+    meta: {
+      source: 'settings',
+      locale: 'zh-CN',
+      timezone: 'Asia/Shanghai',
+      conversation: 'must-not-send',
+    },
+  } as unknown as Parameters<typeof api.submitFeedback>[1]
+  const result = await api.submitFeedback(session, input)
+
+  expect(result).toEqual({ ok: true, id: '901' })
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+  expect(url).toBe('/api/feedback')
+  expect(init.method).toBe('POST')
+  expect(init.credentials).toBe('include')
+  expect(init.headers).toMatchObject({
+    Accept: 'application/json',
+    Authorization: 'Bearer tok-feedback',
+    'content-type': 'application/json',
+  })
+  expect(JSON.parse(String(init.body))).toEqual({
+    category: 'feature',
+    description: '希望设置中心增加更清晰的反馈入口。',
+    version: 'a1b2c3d4',
+    meta: { source: 'settings', locale: 'zh-CN', timezone: 'Asia/Shanghai' },
+  })
+})
+
 test('a failed refresh calls onExpired exactly once and surfaces the original error', async () => {
   let refreshCalls = 0
   const fetchMock = vi.fn(async (url: string) => {
