@@ -26,6 +26,7 @@ function renderMsg(
     inActiveTurn?: boolean;
     cb?: CardCallbacks;
     onRespond?: PermissionRespond;
+    readOnly?: boolean;
   } = {},
 ) {
   const isLast = opts.isLast ?? true;
@@ -39,6 +40,7 @@ function renderMsg(
       inActiveTurn={opts.inActiveTurn ?? true}
       cb={opts.cb ?? {}}
       onRespondPermission={opts.onRespond ?? (() => {})}
+      readOnly={opts.readOnly}
     />,
   );
 }
@@ -281,6 +283,25 @@ describe("permission 审批", () => {
     // 自动弹出的 modal（Radix portal）含「允许」。
     fireEvent.click(screen.getByRole("button", { name: "允许" }));
     expect(onRespond).toHaveBeenCalledWith({ requestId: "r1", behavior: "allow" });
+  });
+
+  test("只读 surface 的待审批工具只展示历史状态，不弹框也不提供写动作", () => {
+    const onRespond = vi.fn();
+    renderMsg(
+      mk("permission", {
+        toolName: "Bash",
+        requestId: "r-readonly",
+        _resolved: false,
+        inputPreview: "rm -rf /tmp/example",
+      }),
+      { onRespond, readOnly: true },
+    );
+    expect(screen.getByText("等待审批…")).toBeInTheDocument();
+    expect(screen.getByText(/只读查看/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "审批" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "允许" })).not.toBeInTheDocument();
+    expect(screen.queryByText("工具权限请求")).not.toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("AskUserQuestion → 答题框，选项提交回送 updatedInput.answers", () => {
