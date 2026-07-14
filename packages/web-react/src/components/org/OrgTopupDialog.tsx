@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, OrgTopupResult } from "../../lib/types";
 import { cn, formatCentsYuan } from "../../lib/utils";
+import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner } from "../ui";
 import { orgErrText } from "./orgShared";
 
@@ -164,7 +165,7 @@ export function OrgTopupDialog({
   };
 
   const title =
-    stage.kind === "paid" ? "充值成功" : stage.kind === "qr" ? "微信扫码支付" : "组织充值";
+    stage.kind === "paid" ? "充值成功" : stage.kind === "qr" ? "微信支付" : "组织充值";
 
   return (
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-md">
@@ -242,25 +243,16 @@ export function OrgTopupDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="rounded-xl border border-border bg-white p-3">
-              {/* 批次 B 的 qr 约定为可扫码二维码图片 URL（对齐个人版虎皮椒 qrcodeUrl），直接 <img>。 */}
-              <img
-                src={stage.result.qr}
-                alt="微信支付二维码"
-                width={200}
-                height={200}
-                className="size-[200px] object-contain"
-              />
-            </div>
             <div className="text-center">
               <div className="text-[20px] font-semibold text-fg">
                 {formatCentsYuan(stage.amountCents)}
               </div>
               <div className="text-[12.5px] text-faint">订单号 {stage.result.orderNo}</div>
             </div>
-            <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
-              <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
-            </div>
+            <HupijiaoPaymentEntry
+              qrcodeUrl={stage.result.qr}
+              mobileUrl={stage.result.mobileUrl}
+            />
             <Button variant="ghost" size="sm" onClick={backToInput} className="text-muted">
               <RefreshCw size={14} /> 改充值金额
             </Button>

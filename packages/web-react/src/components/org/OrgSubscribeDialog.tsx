@@ -123,7 +123,7 @@ export function OrgSubscribeDialog({
     phase.kind === "done"
       ? "支付成功"
       : phase.kind === "qr"
-        ? "微信扫码支付"
+        ? "微信支付"
         : mode === "subscribe"
           ? currentSub
             ? "续费 / 变更套餐"
@@ -259,7 +259,7 @@ export function OrgSubscribeDialog({
 
             <p className="text-[11.5px] leading-relaxed text-faint">
               {mode === "subscribe"
-                ? "扫码即时开通,席位积分整份入组织期内池;续费顺延一个计费周期。期内池到期清零,超额与非订阅用量由组织钱包承接。"
+                ? "支付后即时开通,席位积分整份入组织期内池;续费顺延一个计费周期。期内池到期清零,超额与非订阅用量由组织钱包承接。"
                 : "加席按整席全价购,整份积分即时入池,当前计费周期不变。"}
             </p>
           </div>

@@ -1271,9 +1271,15 @@ export type OrgInvoiceRequest = {
 };
 
 // ─── 计费(批次 B 契约,前端只调用)────────────────────────────────────────
-// POST /api/org/topup {amount_cents} → {order_no, qr};GET /api/org/balance → {credits};
+// POST /api/org/topup {amount_cents} → {ok,data:{order_no,qrcode_url,mobile_url}};
+// GET /api/org/balance → {credits};
 // GET /api/org/orders(keyset)。前端按此契约调用,字段名以方案 §3 为准。
-export type OrgTopupResult = { orderNo: string; qr: string; amountCents?: string };
+export type OrgTopupResult = {
+  orderNo: string;
+  qr: string;
+  mobileUrl: string | null;
+  amountCents?: string;
+};
 export type OrgOrder = {
   order_no: string;
   status: string;
@@ -1343,6 +1349,11 @@ export type OrgSubscriptionInfo = {
   plans: OrgPlan[];
 };
 
-/** 席位订单下单结果(provision/subscribe/seats 统一形):{order_no, qr}。
+/** 席位订单下单结果(provision/subscribe/seats 统一形):{order_no, qrcode_url, mobile_url}。
  *  到账判定复用 GET /api/payment/orders/:order_no(api.getOrder,status→'paid')。 */
-export type OrgPayResult = { orderNo: string; qr: string };
+export type OrgPayResult = {
+  orderNo: string;
+  qr: string;
+  mobileUrl: string | null;
+  amountCents?: string;
+};

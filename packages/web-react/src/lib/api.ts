@@ -431,15 +431,22 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
 /**
  * 企业席位订单下单响应 → OrgPayResult。与批次 F issueOrderQr 同形：
  * `{ ok, data: { order_no, qrcode_url, mobile_url, amount_cents, credits, expires_at } }`。
- * 归一为 {orderNo, qr}(qr=qrcode_url,可扫码二维码图片 URL);到账轮询走 getOrder。
+ * 归一为 {orderNo, qr, mobileUrl};到账轮询走 getOrder。
  */
 function parseOrgOrder(p: Promise<Response>): Promise<OrgPayResult> {
   return jsonOrThrow<{
     ok?: boolean;
-    data?: { order_no: string; qrcode_url: string };
+    data?: {
+      order_no: string;
+      qrcode_url: string;
+      mobile_url: string | null;
+      amount_cents?: string;
+    };
   }>(p).then((b) => ({
     orderNo: b.data?.order_no ?? "",
     qr: b.data?.qrcode_url ?? "",
+    mobileUrl: b.data?.mobile_url ?? null,
+    amountCents: b.data?.amount_cents,
   }));
 }
 
@@ -2691,9 +2698,9 @@ export const api = {
       ),
     ).then((b) => b.invoice),
 
-  // ── 充值(批次 B 契约;topup 返 {order_no, qr},orders keyset 轮询到账) ──
+  // ── 充值(统一支付契约;topup 返 {ok,data:{order_no,qrcode_url,mobile_url}},轮询到账) ──
   orgTopup: (a: AuthSession, amountCents: string): Promise<OrgTopupResult> =>
-    jsonOrThrow<{ order_no: string; qr: string; amount_cents?: string }>(
+    parseOrgOrder(
       callWithRefresh(a, (t) =>
         fetch("/api/org/topup", {
           method: "POST",
@@ -2702,7 +2709,7 @@ export const api = {
           body: JSON.stringify({ amount_cents: amountCents }),
         }),
       ),
-    ).then((b) => ({ orderNo: b.order_no, qr: b.qr, amountCents: b.amount_cents })),
+    ),
 
   /** GET /api/org/balance → {credits}(批次 B)。轮询到账用。 */
   getOrgBalance: (a: AuthSession): Promise<string> =>
@@ -2753,7 +2760,7 @@ export const api = {
   //
   // 到账判定统一复用 GET /api/payment/orders/:order_no(getOrder,status→'paid')。
   // 下单响应形(与 F issueOrderQr 对齐):{ ok, data: { order_no, qrcode_url, ... } }。
-  // qrcode_url = 可扫码二维码图片 URL(个人版虎皮椒同款),经 parseOrgOrder 归一为 {orderNo, qr}。
+  // 经 parseOrgOrder 归一为 {orderNo, qr, mobileUrl};客户端按终端二选一,禁止同时使用两条路径。
   // GET plans / subscription 为顶层裸对象(无 ok/data 包裹)。大数全字符串贯穿。
   // owner 门在 UI 层按 role 控制,403 响应兜底 toast(防降权窗口)。
 

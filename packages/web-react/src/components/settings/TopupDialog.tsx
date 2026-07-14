@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, HupiCreateResult, PaymentPlan } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
+import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner } from "../ui";
 
 type Stage =
@@ -157,7 +158,7 @@ export function TopupDialog({
   }
 
   const title =
-    stage.kind === "paid" ? "充值成功" : stage.kind === "qr" ? "微信扫码支付" : "充值积分";
+    stage.kind === "paid" ? "充值成功" : stage.kind === "qr" ? "微信支付" : "充值积分";
 
   return (
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-md">
@@ -210,16 +211,6 @@ export function TopupDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="rounded-xl border border-border bg-white p-3">
-              {/* 虎皮椒返回的 qrcodeUrl 本身就是一张 QR PNG，直接 <img>，不要再二维码化。 */}
-              <img
-                src={stage.order.qrcodeUrl}
-                alt="微信支付二维码"
-                width={200}
-                height={200}
-                className="size-[200px] object-contain"
-              />
-            </div>
             <div className="text-center">
               <div className="text-[20px] font-semibold text-fg">
                 {formatCentsYuan(stage.order.amountCents)}
@@ -228,17 +219,10 @@ export function TopupDialog({
                 到账 {formatCredits(stage.order.credits)} 积分
               </div>
             </div>
-            <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
-              <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
-            </div>
-            {stage.order.mobileUrl && (
-              <a
-                href={stage.order.mobileUrl}
-                className="text-[12.5px] text-accent underline-offset-4 hover:underline"
-              >
-                手机端点此直接支付
-              </a>
-            )}
+            <HupijiaoPaymentEntry
+              qrcodeUrl={stage.order.qrcodeUrl}
+              mobileUrl={stage.order.mobileUrl}
+            />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 换个套餐
             </Button>

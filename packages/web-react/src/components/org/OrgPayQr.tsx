@@ -3,7 +3,8 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, OrgPayResult } from "../../lib/types";
 import { formatCentsYuan } from "../../lib/utils";
-import { Alert, Button, Spinner } from "../ui";
+import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
+import { Alert, Button } from "../ui";
 
 const POLL_INTERVAL_MS = 3000;
 /** 轮询上限(防悬挂):超时停轮询,提示已支付则稍后核对。 */
@@ -88,23 +89,11 @@ export function OrgPayQr({
           {err}
         </Alert>
       )}
-      <div className="rounded-xl border border-border bg-white p-3">
-        {/* qr = 可扫码二维码图片 URL(对齐批次 B topup 的 qr 约定),直接 <img>。 */}
-        <img
-          src={order.qr}
-          alt="微信支付二维码"
-          width={200}
-          height={200}
-          className="size-[200px] object-contain"
-        />
-      </div>
       <div className="text-center">
         <div className="text-[20px] font-semibold text-fg">{formatCentsYuan(amountCents)}</div>
         <div className="text-[12.5px] text-faint">{note}</div>
       </div>
-      <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
-        <Spinner size={13} /> 请用微信扫码支付,到账后自动确认…
-      </div>
+      <HupijiaoPaymentEntry qrcodeUrl={order.qr} mobileUrl={order.mobileUrl} />
       {onBack && (
         <Button variant="ghost" size="sm" onClick={onBack} className="text-muted">
           <RefreshCw size={14} /> {backLabel}
