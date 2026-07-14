@@ -221,6 +221,7 @@ const CodexBillingBodySchema = z
     }).optional(),
     parentSessionId: z.string().min(1).max(256).optional(),
     delegateAgentId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional(),
+    engineSessionId: z.string().regex(/^oceng-[0-9a-f]{48}$/).optional(),
     status: z.union([z.literal("success"), z.literal("error")]),
     durationMs: z.number().finite().nonnegative(),
     usage: z

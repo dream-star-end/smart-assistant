@@ -1171,6 +1171,46 @@ assert_lossless_turn_tape_floor() {
   echo "  ✓ lossless turn-tape 地板:目标 release reader+writer 均声明 $LOSSLESS_TURN_TAPE_CAP。"
 }
 
+# 核验**实际** runtime tuple，而不是仅看 master release metadata 里的期望声明。
+# release 非空读其 MANIFEST；空 release 读 immutable image label。
+assert_lossless_runtime_tuple_capability() {
+  local image_id="$1" release="$2"
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 核验实际 runtime tuple 声明 $LOSSLESS_TURN_TAPE_CAP"; return 0; }
+  hotcfg_rmt oc_hotcfg_assert_tuple_lossless_capability "$image_id" "$release" \
+    || { echo "✗ 实际 runtime tuple 未证明 capability '$LOSSLESS_TURN_TAPE_CAP'(image_id=${image_id:-<none>} release=${release:-<embedded>})" >&2; return 1; }
+  echo "  ✓ 实际 runtime tuple 声明 $LOSSLESS_TURN_TAPE_CAP。"
+}
+
+# 仅在首个 finalized tape 后要求实际 tuple；DB 不可读由 runtime lib fail-closed。
+assert_lossless_runtime_tuple_floor() {
+  local image_id="$1" release="$2"
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 核验实际 runtime tuple 的 lossless 不可逆地板"; return 0; }
+  hotcfg_rmt oc_hotcfg_assert_tuple_lossless_floor "$image_id" "$release" \
+    || { echo "✗ lossless 不可逆地板拒绝实际 runtime tuple(image_id=${image_id:-<none>} release=${release:-<embedded>})" >&2; return 1; }
+}
+
+# Canary 一旦可见，candidate 可能接受由 lossless runtime 产生的 v2 tape。为消除
+# “查询时尚无 tape → candidate 写入首条 → abort 回旧 reader”的竞态，READY 前无条件
+# 要求 active/candidate 两个 master release 及其 runtime 声明都具备 capability，并核验
+# 当前真实 runtime tuple。首批引入该协议应走原子全量 deploy，不能拿旧 active 做 canary。
+assert_lossless_canary_pair() {
+  local active_rel="$1" candidate_rel="$2" rel kind has image_id runtime_release
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 核验 active+candidate master/runtime 与实际 tuple 的 lossless capability"; return 0; }
+  for rel in "$active_rel" "$candidate_rel"; do
+    for kind in capabilities runtimeCapabilities; do
+      has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.${kind} // []) | index(\$c) // empty' '$rel/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+      [[ -n "$has" ]] || {
+        echo "✗ canary 拒绝:$rel 的 $kind 未声明 '$LOSSLESS_TURN_TAPE_CAP'。首批协议升级须先走原子全量 deploy。" >&2
+        return 1
+      }
+    done
+  done
+  image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+  assert_lossless_runtime_tuple_capability "$image_id" "$runtime_release" || return 1
+  echo "  ✓ canary active/candidate reader+writer 与实际 runtime tuple 均具备 lossless capability。"
+}
+
 # ═════════════════ 模型权威:四面 capability 守卫(方案 §7 步 4/5,R3-B4 + R4-M2)═════════════
 #
 # 四面 = {DB schema, master, egress, 容器 runtime}。判定单点化后 master 签发签名 execution
@@ -2620,6 +2660,10 @@ activate_runtime_tuple() {
     # 注:saga 内 oc_hotcfg_assert_tuple_viable 会对"镜像 embed_source=0 + 空 release"fail-loud(R3-B1)。
     release=""
   fi
+  # This activation introduces a v2 writer together with its capable master.
+  # Prove the actual target tuple before any saga side effect, even before the
+  # first tape exists; metadata-only declarations are insufficient.
+  assert_lossless_runtime_tuple_capability "$image_id" "$release" || return 1
   # bundle 轴:启用则翻新 rev + 写新绝对路径;禁用/未启用 → flip_rev 空(不翻 current)+ 写空值(R2-B1)。
   if hotcfg_bundle_axis_on; then
     flip_rev="$BUILT_BUNDLE_REV"; bundle_val="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
@@ -2699,6 +2743,8 @@ activate_emergency_tuple() {
     || { echo "✗ emergency bundle 路径非 canonical bundles/<12hex> 形态: $bundle(重新 --emergency-tuple 登记)" >&2; exit 1; }
   ssh "$KL_HOST" "[ -d '$bundle' ]" || { echo "✗ emergency bundle 已不存在: $bundle(GC 保护集应含它,须排查)" >&2; exit 1; }
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
+  assert_lossless_turn_tape_floor "$prev_src"
+  assert_lossless_runtime_tuple_floor "$image_id" ""
   local restart_cmd smoke_cmd
   restart_cmd="systemctl restart '$ACTIVE_UNIT'"
   smoke_cmd="$(hotcfg_core_smoke_cmd)"  # R4-M2:与正常激活同强度(含 sessionsDb=ok)
@@ -3602,6 +3648,7 @@ rollback_runtime_tuple() {
   # 容器 tuple(image/release)面在 saga 内由 lib 的 assert_tuple_viable ③ 覆盖。
   assert_release_capability_for_sessions_pg "$master"
   assert_lossless_turn_tape_floor "$master"
+  assert_lossless_runtime_tuple_floor "$image_id" "$release"
   assert_model_authority_floor "$master"
   # R2-B1:是否翻 current 由**目标记录的 bundle 值**决定(逐字面恢复:目标空=当时该轴禁用 → 不翻;
   # 目标非空=当时启用 → 必翻回,即使当前 env 已被 --disable 清空)。不再看当前 enabled 态。
@@ -3819,6 +3866,7 @@ capability_matrix_preflight() {
   [[ -z "$miss" ]] || { echo "✗ candidate release 缺 capability:$miss" >&2; return 1; }
   ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$cma'" >/dev/null 2>&1 \
     || { echo "✗ active release 未声明 dual-master-v1 —— 双 master 不兼容,拒绝 canary(active 须先经基建版升级)" >&2; return 1; }
+  assert_lossless_canary_pair "$active_rel" "$candidate_rel" || return 1
   # ③ 版本字段兼容(MAJOR 7):bridgeFrameSchema / runtimeApi
   local key av cv
   for key in bridgeFrameSchema runtimeApi; do
@@ -4431,6 +4479,15 @@ abort() {
 # 是幂等核验,总是执行。abort transition_step 序:0(begin)→2(desired 收回)→3(candidate 停)→commit。
 abort_continue() {
   local old="$1" cand="$2" csrc; csrc="$(slot_src "$cand")"
+  local old_src image_id runtime_release
+  old_src="$(slot_src "$old")"
+  image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
+  # Must run before Caddy can route a single request back to old. The canary
+  # preflight already closes the first-tape race; this fresh fail-closed check
+  # also protects abort/recover after tapes exist.
+  assert_lossless_turn_tape_floor "$old_src"
+  assert_lossless_runtime_tuple_floor "$image_id" "$runtime_release"
   # MAJOR 1:**先** Caddy 摘 matcher + 默认回旧 slot(aborting 态 default→old)+ reload + verify_routing 断言,
   #         **再** CAS desired 收回 —— 消"CAS desired 先收回(candidate 失去 leader/VIP)但 Caddy 仍把公共流量
   #         全落 candidate"的短窗。caddy_render_reload(--apply)内含 verify_routing;失败即中止,绝不带此窗收 desired。

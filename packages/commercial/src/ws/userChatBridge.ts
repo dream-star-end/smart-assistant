@@ -70,8 +70,11 @@ import {
   abortInflightJournal,
 } from "../billing/proxyBilling.js";
 import {
+  DURABLE_CODEX_RECOVERY_VERSION,
   ENGINE_SESSION_ID_RE,
+  isPermanentCodexWaiver,
   makeCodexFinalizer,
+  permanentCodexWaiverReason,
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
@@ -3213,6 +3216,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         ? null
                         : accountIdForQuota.toString(),
                     source: "codex_bridge",
+                    durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
                     // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
                     // server-owned 快照，不能在结算时回读已换代的 cache/override。
                     billingPricing: serializeBillingPricing(derivedPricing),
@@ -3250,7 +3254,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 await abortInflightJournal(
                   pgPool,
                   requestId,
-                  "bridge_disconnect_before_finalize",
+                  permanentCodexWaiverReason("bridge_disconnect_before_finalize"),
                 ).catch(() => {});
                 await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
                 releaseAcquiredSlotForFailure();
@@ -3316,7 +3320,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                   const promise = (async (): Promise<void> => {
                     try {
-                      await abortInflightJournal(pgPool, requestId, reason.slice(0, 500));
+                      await abortInflightJournal(
+                        pgPool,
+                        requestId,
+                        permanentCodexWaiverReason(reason),
+                      );
                     } catch {
                       // journal abort 失败 — reconciler 会扫到 stuck inflight 兜底。
                     } finally {
@@ -4550,8 +4558,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             state: string;
             user_id: string;
             ctx: unknown;
+            error_msg: string | null;
           }>(
-            `SELECT state, user_id::text AS user_id, ctx
+            `SELECT state, user_id::text AS user_id, ctx, error_msg
                FROM request_finalize_journal
               WHERE request_id = $1`,
             [requestId],
@@ -4579,11 +4588,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
           if (row.state === "aborted") {
-            // 见函数头注释:免单 + 告警,不补收(钱安全红线)。
-            bridgeLog?.error("user-chat-bridge: codex_billing hit aborted journal — turn waived, needs investigation (money-safety: never charge over an aborted journal)", {
+            // Historical code also wrote `aborted` for transient settle errors.
+            // Only an explicit permanent marker is a waiver decision. Prefer
+            // permanent usage truth, otherwise reopen the unproven row so the
+            // exact frame can settle now (the immutable tape remains fallback).
+            const settled = await pgPool.query<{ present: boolean }>(
+              `SELECT EXISTS(
+                 SELECT 1 FROM usage_records WHERE user_id=$1 AND request_id=$2
+               ) AS present`,
+              [uid.toString(), requestId],
+            );
+            if (settled.rows[0]?.present === true) {
+              locallySettledCodexTurns.add(requestId);
+              return;
+            }
+            if (isPermanentCodexWaiver(row.error_msg)) {
+              bridgeLog?.info("user-chat-bridge: codex_billing hit proven permanent waiver — idempotent ignore", {
+                requestId,
+              });
+              return;
+            }
+            const reopened = await pgPool.query(
+              `UPDATE request_finalize_journal
+                  SET state='inflight', error_msg=NULL, final_credits=NULL, updated_at=NOW()
+                WHERE request_id=$1 AND user_id=$2 AND state='aborted'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM usage_records ur
+                     WHERE ur.user_id=$2 AND ur.request_id=$1
+                  )`,
+              [requestId, uid.toString()],
+            );
+            if (reopened.rowCount !== 1) {
+              bridgeLog?.warn("user-chat-bridge: codex_billing could not reopen unproven aborted journal — immutable tape will retry", {
+                requestId,
+              });
+              return;
+            }
+            bridgeLog?.warn("user-chat-bridge: reopened unproven aborted journal for exact billing replay", {
               requestId,
             });
-            return;
           }
           // state === 'inflight' — 跨桥恢复 settle。
           const ctx = (row.ctx !== null && typeof row.ctx === "object"
@@ -4603,7 +4646,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // 配置类不可恢复错误 → 与主路径 abandon 同语义:免单(abort journal)
           // + 释放软预扣 + error 告警。宁可少收不可乱扣。
           const waive = async (reason: string): Promise<void> => {
-            await abortInflightJournal(pgPool, requestId, reason).catch(() => {});
+            await abortInflightJournal(
+              pgPool,
+              requestId,
+              permanentCodexWaiverReason(reason),
+            ).catch(() => {});
             await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
           };
 
@@ -4650,7 +4697,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               await abortInflightJournal(
                 pgPool,
                 requestId,
-                "cross_bridge_authority_binding_invalid",
+                permanentCodexWaiverReason("cross_bridge_authority_binding_invalid"),
               ).catch(() => {});
               await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
               return;
@@ -4809,8 +4856,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
           }
         } catch (err) {
-          // settle 抛错:commitOnce 内部已 abort journal(codex_commit_failed)
-          // 兜底并 release reservation,这里只 log(与主路径 commit throw 同语义)。
+          // 瞬态 settle/finalize 错误保持 journal 可恢复；immutable turn tape 会
+          // 用同一精确帧重试。这里只记录低延迟 live path 的失败。
           bridgeLog?.error("user-chat-bridge: codex cross-bridge settle failed", {
             requestId,
             err: (err as Error)?.message,

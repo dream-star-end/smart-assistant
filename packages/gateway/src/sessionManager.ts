@@ -3500,15 +3500,15 @@ export class SessionManager {
               })
             }
           }
-          if (!persistenceAcknowledged) {
-            onEvent({
-              kind: 'error',
-              error: '本次回复已完整写入待同步队列，但服务器尚未确认持久化；请勿重发，系统会自动恢复。',
-            })
-          } else if (terminalErrorForClient) {
-            onEvent({ kind: 'error', error: terminalErrorForClient })
-          } else if (pendingFinal) {
-            onEvent(pendingFinal)
+          // A transient persistence failure stays in the unlimited fsynced
+          // retry queue. Do not emit a new user-facing notice and do not expose
+          // terminal completion until the authoritative master ACKs it.
+          if (persistenceAcknowledged) {
+            if (terminalErrorForClient) {
+              onEvent({ kind: 'error', error: terminalErrorForClient })
+            } else if (pendingFinal) {
+              onEvent(pendingFinal)
+            }
           }
           settle(() => resolve())
       }

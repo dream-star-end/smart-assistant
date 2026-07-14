@@ -7,6 +7,7 @@ import type { DurableCodexBilling } from "@openclaude/protocol";
 import {
   settleDurableCodexBilling,
 } from "../billing/durableCodexBilling.js";
+import { permanentCodexWaiverReason } from "../billing/codexFinalizer.js";
 import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { serializeBillingPricing } from "../billing/persistedBillingPricing.js";
@@ -54,7 +55,7 @@ function pricingCache(): PricingCache {
 }
 
 describe("settleDurableCodexBilling", () => {
-  test("committed / aborted journals are terminal and do not reconnect to the ledger", async () => {
+  test("committed / explicitly permanent-waived journals are terminal", async () => {
     for (const [state, expected] of [
       ["committed", "already_committed"],
       ["aborted", "waived"],
@@ -62,7 +63,12 @@ describe("settleDurableCodexBilling", () => {
       let connects = 0;
       const pool = {
         query: async () => ({
-          rows: [{ state, user_id: USER_ID.toString(), ctx: {} }],
+          rows: [{
+            state,
+            user_id: USER_ID.toString(),
+            ctx: {},
+            error_msg: state === "aborted" ? permanentCodexWaiverReason("terminal_no_usage") : null,
+          }],
           rowCount: 1,
         }),
         connect: async () => {
@@ -94,6 +100,60 @@ describe("settleDurableCodexBilling", () => {
       preCheckRedis: new InMemoryPreCheckRedis(),
       pricing: pricingCache(),
     }, USER_ID, frame()), "already_committed");
+    assert.equal(calls, 2);
+  });
+
+  test("an unmarked legacy aborted journal ACKs only when usage proves settlement", async () => {
+    let calls = 0;
+    const pool = {
+      query: async () => {
+        calls++;
+        if (calls === 1) {
+          return {
+            rows: [{
+              state: "aborted",
+              user_id: USER_ID.toString(),
+              ctx: {},
+              error_msg: "codex_commit_failed: transient outage",
+            }],
+            rowCount: 1,
+          };
+        }
+        return { rows: [{ present: true }], rowCount: 1 };
+      },
+    } as unknown as Pool;
+    assert.equal(await settleDurableCodexBilling({
+      pgPool: pool,
+      preCheckRedis: new InMemoryPreCheckRedis(),
+      pricing: pricingCache(),
+    }, USER_ID, frame()), "already_committed");
+    assert.equal(calls, 2);
+  });
+
+  test("a permanent waiver is not ACKed when its journal update is transiently unavailable", async () => {
+    let calls = 0;
+    const pool = {
+      query: async (sql: string) => {
+        calls++;
+        if (sql.includes("SELECT state, user_id::text")) {
+          return {
+            rows: [{
+              state: "inflight",
+              user_id: USER_ID.toString(),
+              ctx: {},
+              error_msg: null,
+            }],
+            rowCount: 1,
+          };
+        }
+        throw new Error("simulated journal outage");
+      },
+    } as unknown as Pool;
+    await assert.rejects(() => settleDurableCodexBilling({
+      pgPool: pool,
+      preCheckRedis: new InMemoryPreCheckRedis(),
+      pricing: pricingCache(),
+    }, USER_ID, frame()), /simulated journal outage/);
     assert.equal(calls, 2);
   });
 

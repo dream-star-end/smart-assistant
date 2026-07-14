@@ -475,6 +475,7 @@ describe("outboundReceiver — codex billing sideband", () => {
     parentTurnKey: "cd".repeat(32),
     parentSessionId: "web-parent-1",
     delegateAgentId: "researcher",
+    engineSessionId: `oceng-${"ef".repeat(24)}`,
     status: "success",
     durationMs: 123,
     usage: { input_tokens: 11, output_tokens: 22 },
@@ -507,6 +508,7 @@ describe("outboundReceiver — codex billing sideband", () => {
     assert.equal(calls[0]!.body.parentTurnKey, billingBody.parentTurnKey)
     assert.equal(calls[0]!.body.parentSessionId, billingBody.parentSessionId)
     assert.equal(calls[0]!.body.delegateAgentId, billingBody.delegateAgentId)
+    assert.equal(calls[0]!.body.engineSessionId, billingBody.engineSessionId)
     assert.equal(calls[0]!.body.usage?.input_tokens, 11)
     assert.equal(calls[0]!.userId, VALID_USER_ID)
     assert.equal(calls[0]!.containerId, 7)
@@ -518,6 +520,18 @@ describe("outboundReceiver — codex billing sideband", () => {
     await handler(authedReq(billingBody), res, CTX)
     assert.equal(rec.status, 503)
     assert.match(rec.body, /CODEX_BILLING_NOT_WIRED/)
+  })
+
+  test("billing handler failure returns non-2xx so the fsynced frame is retained", async () => {
+    const handler = makeOutboundReceiverHandler(makeDeps({
+      handleCodexBilling: async () => {
+        throw new Error("transient settlement outage")
+      },
+    }))
+    const { res, rec } = makeRes()
+    await handler(authedReq(billingBody), res, CTX)
+    assert.equal(rec.status, 500)
+    assert.match(rec.body, /CODEX_BILLING_FAILED/)
   })
 
   test("billing schema enforces requestId shape before handler", async () => {

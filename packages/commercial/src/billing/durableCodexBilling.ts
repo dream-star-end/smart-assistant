@@ -16,7 +16,11 @@ import type { Logger } from "../logging/logger.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { getAgentCostMultiplier, composeMultiplier } from "./agentMultiplier.js";
 import type { TokenUsage } from "./calculator.js";
-import { makeCodexFinalizer } from "./codexFinalizer.js";
+import {
+  isPermanentCodexWaiver,
+  makeCodexFinalizer,
+  permanentCodexWaiverReason,
+} from "./codexFinalizer.js";
 import { parseBillingPricing } from "./persistedBillingPricing.js";
 import type { PricingCache } from "./pricing.js";
 import {
@@ -64,8 +68,9 @@ export async function settleDurableCodexBilling(
     state: string;
     user_id: string;
     ctx: unknown;
+    error_msg: string | null;
   }>(
-    `SELECT state, user_id::text AS user_id, ctx
+    `SELECT state, user_id::text AS user_id, ctx, error_msg
        FROM request_finalize_journal
       WHERE request_id = $1`,
     [requestId],
@@ -87,17 +92,41 @@ export async function settleDurableCodexBilling(
   if (row.user_id !== userId.toString()) {
     throw new Error(`durable codex billing journal user mismatch for ${requestId}`);
   }
-  if (row.state === "committed") return "already_committed";
-  if (row.state === "finalizing") {
+  let journalState = row.state;
+  if (journalState === "committed") return "already_committed";
+  if (journalState === "finalizing") {
     throw new Error(`durable codex billing journal still finalizing for ${requestId}`);
   }
-  if (row.state === "aborted") {
-    log?.error("durable codex billing hit aborted journal; turn remains waived", {
-      requestId,
-    });
-    return "waived";
+  if (journalState === "aborted") {
+    // Old code used `aborted` for both permanent no-usage decisions and
+    // transient settle failures. Only the explicitly marked former is safe to
+    // ACK. First check permanent financial truth, then reopen an unmarked row
+    // so exact immutable evidence can be settled idempotently.
+    const settled = await deps.pgPool.query<{ present: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM usage_records WHERE user_id=$1 AND request_id=$2
+       ) AS present`,
+      [userId.toString(), requestId],
+    );
+    if (settled.rows[0]?.present === true) return "already_committed";
+    if (isPermanentCodexWaiver(row.error_msg)) return "waived";
+    const reopened = await deps.pgPool.query(
+      `UPDATE request_finalize_journal
+          SET state='inflight', error_msg=NULL, final_credits=NULL, updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND state='aborted'
+          AND NOT EXISTS (
+            SELECT 1 FROM usage_records ur
+             WHERE ur.user_id=$2 AND ur.request_id=$1
+          )`,
+      [requestId, userId.toString()],
+    );
+    if (reopened.rowCount !== 1) {
+      throw new Error(`durable codex billing could not reopen unproven aborted journal ${requestId}`);
+    }
+    journalState = "inflight";
+    log?.warn("durable codex billing reopened unproven aborted journal", { requestId });
   }
-  if (row.state !== "inflight") {
+  if (journalState !== "inflight") {
     throw new Error(`durable codex billing journal state invalid for ${requestId}`);
   }
 
@@ -108,9 +137,26 @@ export async function settleDurableCodexBilling(
   const agentId = typeof ctx.agentId === "string" ? ctx.agentId : "codex";
   const reservation: ReservationHandle = { userId: userId.toString(), requestId };
   const waive = async (reason: string): Promise<DurableCodexBillingSettleOutcome> => {
-    await abortInflightJournal(deps.pgPool, requestId, reason).catch(() => {});
+    const markedReason = permanentCodexWaiverReason(reason);
+    // Do not ACK merely because the UPDATE was attempted: a transient DB
+    // failure or concurrent state transition must leave the fsynced retry
+    // entry intact. Re-read and prove the durable terminal decision.
+    await abortInflightJournal(deps.pgPool, requestId, markedReason);
+    const decision = await deps.pgPool.query<{
+      state: string;
+      error_msg: string | null;
+    }>(
+      `SELECT state, error_msg FROM request_finalize_journal
+        WHERE request_id=$1 AND user_id=$2`,
+      [requestId, userId.toString()],
+    );
+    const decided = decision.rows[0];
+    if (decided?.state === "committed") return "already_committed";
+    if (decided?.state !== "aborted" || decided.error_msg !== markedReason) {
+      throw new Error(`durable codex billing permanent waiver was not durably recorded for ${requestId}`);
+    }
     await releasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
-    log?.error("durable codex billing waived because journal evidence is invalid", { reason });
+    log?.error("durable codex billing waived because journal evidence is permanently invalid", { reason });
     return "waived";
   };
 

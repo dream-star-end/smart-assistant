@@ -344,6 +344,45 @@ describe('v5 release safety lanes', () => {
     }
   })
 
+  test('lossless floor covers canary first-write race, abort, and actual runtime tuples', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
+    const canaryMatrix = source.slice(
+      source.indexOf('capability_matrix_preflight()'),
+      source.indexOf('\n# 同步某 release 的 dist/assets', source.indexOf('capability_matrix_preflight()')),
+    )
+    assert.match(canaryMatrix, /assert_lossless_canary_pair "\$active_rel" "\$candidate_rel"/)
+    const abortBody = source.slice(
+      source.indexOf('abort_continue()'),
+      source.indexOf('\n# ═════════ --recover', source.indexOf('abort_continue()')),
+    )
+    assert.ok(
+      abortBody.indexOf('assert_lossless_turn_tape_floor "$old_src"')
+        < abortBody.indexOf('caddy_render_reload'),
+      'abort must recheck the old reader before routing traffic back',
+    )
+    const rollbackBody = source.slice(
+      source.indexOf('rollback_runtime_tuple()'),
+      source.indexOf('\n# ═══════════════════════ P3', source.indexOf('rollback_runtime_tuple()')),
+    )
+    assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
+    assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-tuple-')); dirs.push(dir)
+    const capable = path.join(dir, 'capable'); const old = path.join(dir, 'old')
+    await mkdir(capable); await mkdir(old)
+    await writeFile(path.join(capable, 'MANIFEST.json'), JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }))
+    await writeFile(path.join(old, 'MANIFEST.json'), JSON.stringify({ capabilities: [] }))
+    const invoke = (release: string) => spawnSync('bash', ['-c', [
+      `source '${path.join(root, 'scripts/v5-runtime-release-lib.sh')}'`,
+      `oc_hotcfg_assert_tuple_lossless_capability ignored '${release}'`,
+    ].join('\n')], { cwd: root, encoding: 'utf8' })
+    assert.equal(invoke(capable).status, 0)
+    const rejected = invoke(old)
+    assert.notEqual(rejected.status, 0)
+    assert.match(rejected.stderr, /未声明 'lossless-turn-tape-v2'/)
+  })
+
   test('model-authority operations pin the stable P3 active lane', async () => {
     const source = await readFile(deploy, 'utf8')
     const egressUnit = await readFile(path.join(root, 'deploy/v5/openclaude-v5-egress.service'), 'utf8')

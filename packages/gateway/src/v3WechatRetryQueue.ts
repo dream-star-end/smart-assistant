@@ -90,6 +90,7 @@ export interface V3WechatCodexBillingWirePayload {
   parentTurnKey?: string
   parentSessionId?: string
   delegateAgentId?: string
+  engineSessionId?: string
   status: 'success' | 'error'
   durationMs: number
   usage?: {
@@ -388,6 +389,8 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!p || typeof p !== 'object') return false
   if (p.type === 'outbound.codex_billing') {
     if (typeof p.requestId !== 'string' || !/^[0-9a-f]{32}$/.test(p.requestId)) return false
+    if (p.engineSessionId !== undefined &&
+        (typeof p.engineSessionId !== 'string' || !/^oceng-[0-9a-f]{48}$/.test(p.engineSessionId))) return false
     if (p.status !== 'success' && p.status !== 'error') return false
     if (typeof p.durationMs !== 'number' || !Number.isFinite(p.durationMs) || p.durationMs < 0) return false
     return true

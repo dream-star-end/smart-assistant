@@ -349,6 +349,9 @@ function buildCodexBillingPayload(
   if (typeof out.delegateAgentId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(out.delegateAgentId)) {
     payload.delegateAgentId = out.delegateAgentId
   }
+  if (typeof out.engineSessionId === "string" && /^oceng-[0-9a-f]{48}$/.test(out.engineSessionId)) {
+    payload.engineSessionId = out.engineSessionId
+  }
   if (out.usage !== undefined) payload.usage = out.usage
   if (typeof out.errorReason === "string") payload.errorReason = out.errorReason
   if (out.rateLimits !== undefined) payload.rateLimits = out.rateLimits

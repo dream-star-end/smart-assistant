@@ -43,6 +43,7 @@ OC_HOTCFG_EMERGENCY_KEY="OC_RUNTIME_EMERGENCY_TUPLE"
 OC_HOTCFG_MODEL_AUTHORITY_CAP="model_authority_v1"
 OC_HOTCFG_MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
 OC_HOTCFG_IMAGE_FEATURES_LABEL="oc.runtime.features"
+OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 
 # bundle 顶层目录白名单(§1.2:与 TS 侧 platformBundle.ts 校验语义一致的 bash 版)。
 OC_HOTCFG_BUNDLE_TOPDIRS="bin entrypoint etc-codex codex-skills seed prompts"
@@ -874,6 +875,9 @@ oc_hotcfg_assert_tuple_viable() {
   fi
   # ③ 模型权威地板(先于 ② 的 early-return,两种 release 形态都要过)。
   oc_hotcfg_assert_tuple_model_authority "$image_id" "$release" || return 1
+  # ④ 无损 turn-tape 地板:一旦存在 finalized v2 tape,任何实际激活/回滚
+  # tuple 都必须自证 writer capability。DB 不可读时 fail-closed。
+  oc_hotcfg_assert_tuple_lossless_floor "$image_id" "$release" || return 1
   # ② 瘦身+空 release(按权威 immutable ID 查 label,不再信 tag)。
   [ -n "$release" ] && return 0
   embed="$("$OC_DOCKER_BIN" image inspect --format '{{index .Config.Labels "oc.runtime.embed_source"}}' "$image_id" 2>/dev/null)" \
@@ -883,6 +887,50 @@ oc_hotcfg_assert_tuple_viable() {
     return 1
   fi
   return 0
+}
+
+# 无条件核验一个实际 runtime tuple 是否声明 lossless writer capability。
+# release 轴开启看 MANIFEST.capabilities；空 release 看 immutable image label。
+oc_hotcfg_assert_tuple_lossless_capability() {
+  local image_id="$1" release="$2" caps
+  if [ -n "$release" ]; then
+    [ -f "$release/MANIFEST.json" ] \
+      || { oc_hotcfg__die "tuple_viable: runtime release 无 MANIFEST.json,无法自证 $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP: $release"; return 1; }
+    caps="$(jq -r '(.capabilities // []) | join(" ")' "$release/MANIFEST.json" 2>/dev/null)" \
+      || { oc_hotcfg__die "tuple_viable: 读 runtime release MANIFEST.capabilities 失败: $release"; return 1; }
+  else
+    [ -n "$image_id" ] \
+      || { oc_hotcfg__die "tuple_viable: release 为空且 image_id 为空,无法自证 $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP"; return 1; }
+    caps="$("$OC_DOCKER_BIN" image inspect --format "{{index .Config.Labels \"$OC_HOTCFG_IMAGE_FEATURES_LABEL\"}}" "$image_id" 2>/dev/null)" \
+      || { oc_hotcfg__die "tuple_viable: 无法 inspect 镜像 $image_id 的 $OC_HOTCFG_IMAGE_FEATURES_LABEL label"; return 1; }
+  fi
+  case " $caps " in
+    *" $OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP "*) return 0 ;;
+    *) oc_hotcfg__die "tuple_viable: 目标 runtime tuple 未声明 '$OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP'(caps=[${caps:-<none>}],release=${release:-<embedded>},image_id=${image_id:-<none>})"; return 1 ;;
+  esac
+}
+
+# DB 中首个 finalized v2 tape 是不可逆地板。无 DATABASE_URL 仅用于本地 fixture/
+# bootstrap，放行；生产 env 有 URL 但查询失败则按地板已生效处理。
+oc_hotcfg_assert_tuple_lossless_floor() {
+  local image_id="$1" release="$2" finalized="" rc=0
+  [ -f "$OC_HOTCFG_ENV_FILE" ] || return 0
+  finalized="$(
+    set -a
+    # shellcheck disable=SC1090
+    . "$OC_HOTCFG_ENV_FILE" 2>/dev/null || exit 21
+    set +a
+    [ -n "${DATABASE_URL:-}" ] || exit 22
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc \
+      "SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL)::text" 2>/dev/null
+  )" || rc=$?
+  finalized="$(printf '%s' "$finalized" | tr -d '[:space:]')"
+  [ "$rc" -eq 22 ] && return 0
+  if [ "$rc" -eq 0 ] && [ "$finalized" = false ]; then return 0; fi
+  if [ "$rc" -ne 0 ] || [ "$finalized" != true ]; then
+    oc_hotcfg__log "lossless tape 状态不可核验(rc=$rc result=${finalized:-<empty>})→ runtime tuple fail-closed"
+  fi
+  oc_hotcfg_assert_tuple_lossless_capability "$image_id" "$release"
 }
 
 # 容器面(runtime tuple)的模型权威 capability 地板。marker 未置位 → 放行(步骤 5 之前无地板)。

@@ -55,7 +55,10 @@ import { PricingCache } from "../billing/pricing.js";
 import type { ModelPricing } from "../billing/pricing.js";
 import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 import { _resetAgentMultiplierCacheForTests } from "../billing/agentMultiplier.js";
-import { deriveEngineSessionId } from "../billing/codexFinalizer.js";
+import {
+  deriveEngineSessionId,
+  permanentCodexWaiverReason,
+} from "../billing/codexFinalizer.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
@@ -221,9 +224,17 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("UPDATE request_finalize_journal")) {
         const reqId = (params as unknown[])[0] as string;
         const row = journalRows.get(reqId);
-        const casOk = row !== undefined && (row.state === "inflight" || row.state === "finalizing");
+        const reopening = /state='inflight'/.test(trimmed);
+        const casOk = row !== undefined && (
+          reopening
+            ? row.state === "aborted"
+            : row.state === "inflight" || row.state === "finalizing"
+        );
         if (casOk) {
-          if (/state='finalizing'/.test(trimmed)) row!.state = "finalizing";
+          if (reopening) {
+            row!.state = "inflight";
+            row!.error_msg = null;
+          } else if (/state='finalizing'/.test(trimmed)) row!.state = "finalizing";
           else if (/state='committed'/.test(trimmed)) row!.state = "committed";
           else if (/state='aborted'/.test(trimmed)) {
             row!.state = "aborted";
@@ -238,7 +249,18 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
         const row = journalRows.get(reqId);
         return row === undefined
           ? { rows: [], rowCount: 0 }
-          : { rows: [{ state: row.state, user_id: row.user_id, ctx: row.ctx }], rowCount: 1 };
+          : {
+              rows: [{
+                state: row.state,
+                user_id: row.user_id,
+                ctx: row.ctx,
+                error_msg: row.error_msg,
+              }],
+              rowCount: 1,
+            };
+      }
+      if (trimmed.startsWith("SELECT EXISTS(") && trimmed.includes("FROM usage_records")) {
+        return { rows: [{ present: false }], rowCount: 1 };
       }
       // preCheck 的 getSpendableBalance(0096 双钱包总可用)走 rootQuery 落
       // commercial/db getPool() —— 测试用 setPoolOverride 把 fakePool 装上。
@@ -1307,7 +1329,7 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     await waitUntil(() => rig.poolCtrl.journalRows.get(requestId)?.state === "aborted");
     assert.equal(
       rig.poolCtrl.journalRows.get(requestId)?.error_msg,
-      "cross_bridge_authority_billing_pricing_invalid",
+      permanentCodexWaiverReason("cross_bridge_authority_billing_pricing_invalid"),
     );
     assert.equal(usageInserts(rig).length, usageBefore, "invalid persisted authority price must not settle");
     await assert.rejects(
@@ -1429,7 +1451,7 @@ describe("userChatBridge / codex billing — P0 authority journal 跨 flag 关�
     await waitUntil(() => rig.poolCtrl.journalRows.get(requestId)?.state === "aborted");
     assert.equal(
       rig.poolCtrl.journalRows.get(requestId)?.error_msg,
-      "cross_bridge_authority_billing_pricing_invalid",
+      permanentCodexWaiverReason("cross_bridge_authority_billing_pricing_invalid"),
     );
     assert.equal(usageInserts(rig).length, usageBefore);
     await assert.rejects(
@@ -1505,6 +1527,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
   beforeEach(() => {
     _resetAgentMultiplierCacheForTests();
     logs.length = 0;
+    rig.poolCtrl.queries.length = 0;
   });
 
   async function openPair(uidStr: string): Promise<{ ws: WebSocket; containerWs: WebSocket }> {
@@ -1524,29 +1547,54 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
     }));
   }
 
-  test("billing 帧撞 aborted journal → 免单 + error 告警(不补收、不静默)", async () => {
+  test("billing 帧撞显式永久免单 journal → 幂等忽略且不补收", async () => {
     const { ws, containerWs } = await openPair("43");
     const reqId = "a".repeat(32);
-    // 预置 aborted 行(修复前旧桥 bridge_disconnect abort 的存量形态)
     rig.poolCtrl.journalRows.set(reqId, {
       state: "aborted",
       user_id: "43",
       ctx: { model: "gpt-5.6-sol", agentId: "codex", source: "codex_bridge" },
       precheck_credits: "100",
-      error_msg: "bridge_disconnect",
+      error_msg: permanentCodexWaiverReason("bridge_disconnect"),
     });
     sendBilling(containerWs, reqId);
 
     await waitUntil(() =>
-      logs.some((l) => l.level === "error" && l.msg.includes("aborted journal")), 1500);
-    // 钱安全:不补收
+      logs.some((l) => l.level === "info" && l.msg.includes("proven permanent waiver")), 1500);
     assert.equal(usageInserts(rig).length, 0);
     assert.equal(ledgerInserts(rig).length, 0);
     let cost: Record<string, unknown> | null = null;
     try { cost = await waitJsonFrameOfType(ws, "outbound.cost_charged", 200); } catch { /* */ }
-    assert.equal(cost, null, "aborted journal must not charge");
-    // 终态不被翻转
+    assert.equal(cost, null, "proven permanent waiver must not charge");
     assert.equal(rig.poolCtrl.journalRows.get(reqId)?.state, "aborted");
+    ws.close();
+  });
+
+  test("billing 帧撞无永久标记的 legacy aborted journal → 重开并按精确帧结算", async () => {
+    const { ws, containerWs } = await openPair("431");
+    const reqId = "d".repeat(32);
+    rig.poolCtrl.journalRows.set(reqId, {
+      state: "aborted",
+      user_id: "431",
+      ctx: {
+        model: "gpt-5.6-sol",
+        agentId: "codex",
+        source: "codex_bridge",
+      },
+      precheck_credits: "100",
+      error_msg: "codex_commit_failed:transient",
+    });
+    sendBilling(containerWs, reqId);
+
+    const cost = await waitJsonFrameOfType(ws, "outbound.cost_charged");
+    assert.equal(cost.requestId, reqId);
+    assert.equal(usageInserts(rig).length, 1);
+    assert.equal(ledgerInserts(rig).length, 1);
+    assert.equal(rig.poolCtrl.journalRows.get(reqId)?.state, "committed");
+    assert.equal(
+      logs.some((l) => l.level === "warn" && l.msg.includes("reopened unproven aborted")),
+      true,
+    );
     ws.close();
   });
 
@@ -1593,7 +1641,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
 
   test("无 journal 行(容器伪造 requestId)→ warn 丢弃,不 settle", async () => {
     const { ws, containerWs } = await openPair("46");
-    sendBilling(containerWs, "d".repeat(32));
+    sendBilling(containerWs, "e".repeat(32));
     await waitUntil(() =>
       logs.some((l) => l.level === "warn" && l.msg.includes("no journal row")), 1500);
     assert.equal(usageInserts(rig).length, 0);
