@@ -34,6 +34,7 @@ function extractMethodBody(source: string, methodName: string): string {
 
 const handleMemory = extractMethodBody(SERVER_TS, 'handleMemory')
 const handleMemoryFile = extractMethodBody(SERVER_TS, 'handleMemoryFile')
+const handleAutoDreamReport = extractMethodBody(SERVER_TS, 'handleAutoDreamReport')
 
 describe('handleMemory(memdir)', () => {
   it('user 目标底层换 userProfile(读/写),结构不变', () => {
@@ -98,5 +99,14 @@ describe('dispatch 注册 files/:file 路由', () => {
   it('/memory/files/:file 路由存在并派发到 handleMemoryFile', () => {
     assert.match(SERVER_TS, /\\\/memory\\\/files\\\/\(\[\^\/\]\+\)\$/)
     assert.match(SERVER_TS, /this\.handleMemoryFile\(/)
+  })
+})
+
+describe('Auto-Dream 用户可见报告路由', () => {
+  it('只允许 GET、隐藏系统 agent 返回 404，并调用严格投影服务', () => {
+    assert.match(SERVER_TS, /auto-dream-report/)
+    assert.match(handleAutoDreamReport, /isHiddenSystemAgentId\(agentId\)/)
+    assert.match(handleAutoDreamReport, /req\.method !== 'GET'/)
+    assert.match(handleAutoDreamReport, /this\.autoDream\.getPublicStatus\(agentId\)/)
   })
 })

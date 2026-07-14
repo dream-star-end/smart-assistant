@@ -45,6 +45,7 @@ export function SettingsCenter({
   onSetTheme,
   onRefreshMe,
   onPreferencesChange,
+  onOpenMemory,
 }: {
   open: boolean;
   auth: AuthSession | null;
@@ -58,6 +59,8 @@ export function SettingsCenter({
   onRefreshMe?: () => void;
   /** 偏好首次加载/保存后的完整快照；让 App 的对话默认值立即同步。 */
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
+  /** 从 Auto-Dream 偏好卡跳转到管理中心的记忆/梦境报告。 */
+  onOpenMemory: () => void;
 }) {
   const [section, setSection] = useState<Section>("account");
   const [subOpen, setSubOpen] = useState(false);
@@ -191,6 +194,7 @@ export function SettingsCenter({
                       onSetTheme={onSetTheme}
                       onPatch={patchPref}
                       onUpgrade={() => setSubOpen(true)}
+                      onOpenMemory={onOpenMemory}
                     />
                   ))}
 

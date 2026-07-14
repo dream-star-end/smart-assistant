@@ -43,6 +43,7 @@ import type {
   MemoryConflict,
   PutMemoryResult,
   MemoryIndexResponse,
+  AutoDreamReportResponse,
   MemoryFileContent,
   PutMemoryFileResult,
   PaymentOrder,
@@ -1503,6 +1504,17 @@ export const api = {
     jsonOrThrow<MemoryIndexResponse>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/memory`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** Auto-Dream 最近一次梦境报告与当前进度；响应经过容器端严格白名单投影。 */
+  getAutoDreamReport: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<AutoDreamReportResponse>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/auto-dream-report`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),

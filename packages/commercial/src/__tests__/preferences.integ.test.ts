@@ -266,9 +266,24 @@ describe("/api/me/preferences (http integ)", () => {
       headers: { authorization: `Bearer ${token}` },
     });
     assert.equal(r.status, 200);
-    const j = (await r.json()) as { prefs: Record<string, unknown>; updated_at: string };
+    const j = (await r.json()) as {
+      prefs: Record<string, unknown>;
+      updated_at: string;
+      features: { auto_dream: Record<string, unknown> };
+    };
     assert.deepEqual(j.prefs, {});
     assert.ok(typeof j.updated_at === "string");
+    assert.equal("model_id" in j.features.auto_dream, false);
+    assert.equal("model_name" in j.features.auto_dream, false);
+    assert.deepEqual(Object.keys(j.features.auto_dream).sort(), [
+      "available",
+      "effective",
+      "eligible",
+      "enabled",
+      "min_interval_hours",
+      "min_new_sessions",
+      "minimum_plan_code",
+    ]);
   });
 
   test("PATCH 写入 → GET 反读一致", async (t) => {

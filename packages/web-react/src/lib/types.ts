@@ -692,6 +692,30 @@ export type PutMemoryFileResult =
   | { ok: true; version: string }
   | { ok: false; conflict: MemoryFileConflict };
 
+/** GET .../auto-dream-report：不含整理模型、prompt、原始会话/记忆正文或内部错误。 */
+export type AutoDreamMemoryChange = {
+  file: string;
+  action: "created" | "updated" | "deleted";
+  type?: "user" | "feedback" | "project" | "reference";
+};
+
+export type AutoDreamLastReport = {
+  status: "success" | "failed";
+  finishedAt: string;
+  sessionsReviewed: number;
+  summary: string;
+  created: AutoDreamMemoryChange[];
+  updated: AutoDreamMemoryChange[];
+  deleted: AutoDreamMemoryChange[];
+};
+
+export type AutoDreamReportResponse = {
+  status: "idle" | "running" | "success" | "failed";
+  startedAt?: string;
+  pendingSessions: number;
+  lastReport?: AutoDreamLastReport;
+};
+
 /** 技能列表项（GET /api/skills 的 skills 项）。 */
 export type SkillSummary = {
   name: string;

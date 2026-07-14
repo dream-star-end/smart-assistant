@@ -12,10 +12,22 @@ export interface AutoDreamFeature {
   enabled: boolean
   effective: boolean
   minimum_plan_code: typeof AUTO_DREAM_MINIMUM_PLAN_CODE
-  model_id: string
-  model_name: string
   min_interval_hours: number
   min_new_sessions: number
+}
+
+async function resolveAutoDreamEntitlement(userId: bigint | number | string) {
+  const [eligible, setting] = await Promise.all([
+    isAutoDreamEligible(userId),
+    getSystemSetting('auto_dream_model'),
+  ])
+  let model: Awaited<ReturnType<typeof resolveAutoDreamModel>> = null
+  try {
+    model = await resolveAutoDreamModel(setting.value)
+  } catch {
+    model = null
+  }
+  return { eligible, modelId: setting.value, model }
 }
 
 /** Active, unexpired personal subscription at or above the Max tier. */
@@ -43,17 +55,7 @@ export async function getAutoDreamFeature(
   userId: bigint | number | string,
   enabled: boolean,
 ): Promise<AutoDreamFeature> {
-  const [eligible, setting] = await Promise.all([
-    isAutoDreamEligible(userId),
-    getSystemSetting('auto_dream_model'),
-  ])
-  const modelId = setting.value
-  let model: Awaited<ReturnType<typeof resolveAutoDreamModel>> = null
-  try {
-    model = await resolveAutoDreamModel(modelId)
-  } catch {
-    model = null
-  }
+  const { eligible, model } = await resolveAutoDreamEntitlement(userId)
   const available = model !== null
   return {
     eligible,
@@ -61,8 +63,6 @@ export async function getAutoDreamFeature(
     enabled,
     effective: eligible && available && enabled,
     minimum_plan_code: AUTO_DREAM_MINIMUM_PLAN_CODE,
-    model_id: modelId,
-    model_name: model?.label ?? modelId,
     min_interval_hours: AUTO_DREAM_MIN_INTERVAL_HOURS,
     min_new_sessions: AUTO_DREAM_MIN_NEW_SESSIONS,
   }
@@ -80,14 +80,21 @@ export type AutoDreamPolicy =
 
 export async function getAutoDreamPolicy(userId: bigint | number | string): Promise<AutoDreamPolicy> {
   const { getPreferences } = await import('./preferences.js')
-  const snap = await getPreferences(String(userId))
-  const feature = await getAutoDreamFeature(userId, snap.prefs.auto_dream_enabled === true)
-  if (!feature.effective) return { enabled: false }
+  const [snap, entitlement] = await Promise.all([
+    getPreferences(String(userId)),
+    resolveAutoDreamEntitlement(userId),
+  ])
+  if (
+    snap.prefs.auto_dream_enabled !== true ||
+    !entitlement.eligible ||
+    entitlement.model === null
+  )
+    return { enabled: false }
   return {
     enabled: true,
-    modelId: feature.model_id,
-    modelName: feature.model_name,
-    minIntervalHours: feature.min_interval_hours,
-    minNewSessions: feature.min_new_sessions,
+    modelId: entitlement.modelId,
+    modelName: entitlement.model.label,
+    minIntervalHours: AUTO_DREAM_MIN_INTERVAL_HOURS,
+    minNewSessions: AUTO_DREAM_MIN_NEW_SESSIONS,
   }
 }

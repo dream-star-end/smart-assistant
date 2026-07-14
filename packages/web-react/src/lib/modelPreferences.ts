@@ -22,8 +22,6 @@ export type AutoDreamFeatureView = {
   enabled: boolean;
   effective: boolean;
   minimum_plan_code: string;
-  model_id: string;
-  model_name: string;
   min_interval_hours: number;
   min_new_sessions: number;
 };
@@ -47,13 +45,20 @@ export function extractAutoDreamFeature(snap: unknown): AutoDreamFeatureView | n
     typeof row.available !== "boolean" ||
     typeof row.enabled !== "boolean" ||
     typeof row.effective !== "boolean" ||
-    typeof row.model_id !== "string" ||
-    typeof row.model_name !== "string" ||
     typeof row.minimum_plan_code !== "string" ||
     typeof row.min_interval_hours !== "number" ||
     typeof row.min_new_sessions !== "number"
   ) return null;
-  return row as AutoDreamFeatureView;
+  // 显式重建公开投影，旧版本服务端即使暂时仍返回 model_* 也不会流入 UI 状态。
+  return {
+    eligible: row.eligible,
+    available: row.available,
+    enabled: row.enabled,
+    effective: row.effective,
+    minimum_plan_code: row.minimum_plan_code,
+    min_interval_hours: row.min_interval_hours,
+    min_new_sessions: row.min_new_sessions,
+  };
 }
 
 /** 只接受当前用户模型列表中仍可见且健康的偏好；否则回落首个健康模型。 */

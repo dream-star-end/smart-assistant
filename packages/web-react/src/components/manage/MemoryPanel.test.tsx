@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
-import type { AuthSession, MemoryFileMeta } from "../../lib/types";
+import type { AuthSession, AutoDreamReportResponse, MemoryFileMeta } from "../../lib/types";
 import { MemoryPanel } from "./MemoryPanel";
 
 const auth = {
@@ -20,6 +20,7 @@ afterEach(() => {
 
 /** 造核心记忆索引响应（GET .../memory/memory）。 */
 function mockIndex(files: Partial<MemoryFileMeta>[], text = "<!-- oc-memdir-index v1 -->") {
+  if (!vi.isMockFunction(api.getAutoDreamReport)) mockDream();
   return vi.spyOn(api, "getMemoryIndex").mockResolvedValue({
     kind: "index",
     text,
@@ -33,6 +34,10 @@ function mockIndex(files: Partial<MemoryFileMeta>[], text = "<!-- oc-memdir-inde
     })),
     version: "idx1",
   });
+}
+
+function mockDream(value: AutoDreamReportResponse = { status: "idle", pendingSessions: 0 }) {
+  return vi.spyOn(api, "getAutoDreamReport").mockResolvedValue(value);
 }
 
 /** 造用户画像响应（GET .../memory/user）——每个用例都要 mock,否则画像区会真 fetch。 */
@@ -78,6 +83,105 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     render(<MemoryPanel auth={auth} agentId="main" agents={agents} />);
     expect(await screen.findByText(/暂无核心记忆/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /新建记忆/ })).toBeInTheDocument();
+  });
+
+  test("梦境报告显示实际变化、会话数与进度，且可直达仍存在的记忆", async () => {
+    mockUser();
+    mockDream({
+      status: "success",
+      pendingSessions: 2,
+      lastReport: {
+        status: "success",
+        finishedAt: new Date(Date.now() - 60_000).toISOString(),
+        sessionsReviewed: 5,
+        summary: "提炼长期偏好并清理重复信息",
+        created: [
+          {
+            file: "created.md",
+            action: "created",
+            type: "project",
+          },
+        ],
+        updated: [
+          {
+            file: "updated.md",
+            action: "updated",
+            type: "user",
+          },
+        ],
+        deleted: [
+          {
+            file: "deleted.md",
+            action: "deleted",
+            type: "reference",
+          },
+        ],
+      },
+    });
+    mockIndex([
+      { file: "created.md", name: "新项目背景", type: "project" },
+      { file: "updated.md", name: "当前偏好", type: "user" },
+    ]);
+    vi.spyOn(api, "getMemoryFile").mockResolvedValue({ content: "偏好正文", version: "fv1" });
+
+    render(<MemoryPanel auth={auth} agentId="main" agents={agents} />);
+
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(within(report).getByText(/新增 1 条、更新 1 条、清理 1 条/)).toBeInTheDocument();
+    expect(within(report).getByText(/已参考 5 个近期会话/)).toBeInTheDocument();
+    expect(within(report).getByText(/已积累 2 个新会话/)).toBeInTheDocument();
+    expect(within(report).getByText("updated")).toBeInTheDocument();
+    expect(within(report).getByText("deleted")).toBeInTheDocument();
+    expect(report).not.toHaveTextContent(/DeepSeek|整理模型|model/i);
+
+    fireEvent.click(within(report).getByRole("button", { name: /updated/ }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(api.getMemoryFile).toHaveBeenCalledWith(auth, "main", "updated.md");
+  });
+
+  test("无变化的成功报告也明确说明未扣出一堆不可见结果", async () => {
+    mockUser();
+    mockDream({
+      status: "success",
+      pendingSessions: 0,
+      lastReport: {
+        status: "success",
+        finishedAt: new Date().toISOString(),
+        sessionsReviewed: 5,
+        summary: "没有新的稳定信息",
+        created: [],
+        updated: [],
+        deleted: [],
+      },
+    });
+    mockIndex([]);
+
+    render(<MemoryPanel auth={auth} agentId="main" agents={agents} />);
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(within(report).getByText(/没有发现值得长期保存的新信息/)).toBeInTheDocument();
+  });
+
+  test("中断且结果不确定时不谎称记忆一定没有改动", async () => {
+    mockUser();
+    mockDream({
+      status: "failed",
+      pendingSessions: 5,
+      lastReport: {
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        sessionsReviewed: 4,
+        summary: "整理被中断，无法确认记忆是否发生变化，请查看记忆列表。",
+        created: [],
+        updated: [],
+        deleted: [],
+      },
+    });
+    mockIndex([]);
+
+    render(<MemoryPanel auth={auth} agentId="main" agents={agents} />);
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(within(report).getByText(/无法确认记忆是否发生变化/)).toBeInTheDocument();
+    expect(within(report).queryByText(/记忆没有改动/)).not.toBeInTheDocument();
   });
 });
 
