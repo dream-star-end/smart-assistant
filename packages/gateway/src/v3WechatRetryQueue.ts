@@ -10,12 +10,10 @@
  *
  * **架构对齐**:
  *   - 文件粒度原子:`<ms-ts>-<8-hex>.json`,enqueue 与 drainer 不会写碰撞
- *   - 24h TTL:超期 unlink + warn(operator 知道丢了什么),不静默续命
+ *   - no TTL or attempt cap: retain until success ACK or explicit 410 deletion
  *   - 单 flight drainer:在内存 boolean 锁 + pendingKick 合并多次 kick
  *   - 周期 30s + boot 时 kick(参 startPeriodic)
- *   - 错误分类:`fatal` → unlink + warn;`transient` / 未知 → 计数 + rewrite
- *   - 例外:message payload 的 `isFinal:true` 遇到 fatal 时做少量 bounded retry,
- *     给 master 短暂重启 / migration race 一个补偿窗口,但不能对永久 4xx 无限重试。
+ *   - every non-410 failure is counted and rewritten without deleting payload bytes
  *
  * **broker.send 与 shutdown 的契约**(Codex slice 7c plan v3 reminder):
  *   - shutdown() 只停 periodic 计时器,不阻塞 enqueueDurable —— 即使 adapter
@@ -41,18 +39,8 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'v3WechatRetryQueue' })
 
-/** Per-entry TTL = 24h(与 v3MasterRetryQueue 一致;master broker 长时间不可达
- *  时不无限堆积 disk)。 */
-export const ENTRY_TTL_MS = 24 * 60 * 60 * 1000
-
 /** Periodic drain interval。30s 同 v3MasterRetryQueue;boot 时也 kick。 */
 export const DEFAULT_DRAIN_INTERVAL_MS = 30_000
-
-/** Final frames are terminal cleanup signals for `wechat_running_sessions`, so a
- *  short fatal-retry window is useful when master is mid-restart and briefly
- *  rejects a schema/auth check. Keep it bounded: permanent 4xx (deleted binding,
- *  auth/config mismatch, stale schema) must not live until TTL. */
-export const FINAL_FATAL_MAX_ATTEMPTS = 3
 
 /** Default queue dir = ${HOME}/v3-wechat-retry.d。与 master sink 的
  *  v3-master-retry.d 严格区分:错混会让两条 retry 链共用 ENOENT-tolerant 路径,
@@ -98,6 +86,11 @@ export interface V3WechatSinkWirePayload {
 export interface V3WechatCodexBillingWirePayload {
   type: 'outbound.codex_billing'
   requestId: string
+  turnKey?: string
+  parentTurnKey?: string
+  parentSessionId?: string
+  delegateAgentId?: string
+  engineSessionId?: string
   status: 'success' | 'error'
   durationMs: number
   usage?: {
@@ -121,8 +114,8 @@ export type V3WechatOutboundPostPayload =
   | V3WechatSinkWirePayload
   | V3WechatCodexBillingWirePayload
 
-/** 错误分类。fatal → unlink + warn(master 永久拒绝:401/403/404/410/4xx 业务错);
- *  transient → 计数 retry(5xx / 网络 / 超时)。 */
+/** 错误分类仅作诊断; 除 master 明确返回 410 表示 owner 已删除外,
+ *  fatal/transient 都会无上限重试,不得丢弃已计费输出。 */
 export type V3WechatSinkErrorClass = 'fatal' | 'transient'
 
 export class V3WechatSinkError extends Error {
@@ -143,7 +136,7 @@ export interface V3WechatRetryEntry {
   attempts: number
   lastErrorClass?: V3WechatSinkErrorClass
   lastErrorAt?: number
-  /** Truncated error message,never the bearer / payload body。 */
+  /** 完整错误文本;never the bearer / payload body。 */
   lastErrorMessage?: string
 }
 
@@ -201,6 +194,12 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
       await fh.close()
     }
     await rename(tmp, filepath)
+    const dirHandle = await open(dir, 'r')
+    try {
+      await dirHandle.sync()
+    } finally {
+      await dirHandle.close()
+    }
   }
 
   async function enqueueDurable(entry: V3WechatRetryEntry): Promise<void> {
@@ -271,21 +270,14 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         }
         entry = parsed
       } catch (err) {
-        stats.fatalDropped++
-        log.warn('v3WechatRetryQueue: malformed entry, unlinking', { name }, err)
-        await unlinkIgnoreEnoent(filepath)
-        continue
-      }
-      if (now() - entry.firstSeenAt > ENTRY_TTL_MS) {
-        stats.ttlDropped++
-        log.warn('v3WechatRetryQueue: entry TTL exceeded, dropping', {
-          name,
-          ...payloadLogContext(entry.payload),
-          attempts: entry.attempts,
-          lastErrorClass: entry.lastErrorClass,
-          firstSeenAt: entry.firstSeenAt,
-        })
-        await unlinkIgnoreEnoent(filepath)
+        stats.errors++
+        const quarantine = `${filepath}.quarantine-${randomBytes(4).toString('hex')}`
+        log.error('v3WechatRetryQueue: malformed entry quarantined without deletion', { name }, err)
+        try {
+          await rename(filepath, quarantine)
+        } catch (renameErr) {
+          if ((renameErr as NodeJS.ErrnoException).code !== 'ENOENT') throw renameErr
+        }
         continue
       }
       try {
@@ -293,48 +285,14 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         stats.drained++
         await unlinkIgnoreEnoent(filepath)
       } catch (err) {
-        if (err instanceof V3WechatSinkError && err.errorClass === 'fatal') {
-          if (!isFinalMessagePayload(entry.payload)) {
-            stats.fatalDropped++
-            log.warn(
-              'v3WechatRetryQueue: fatal sink error, unlinking',
-              {
-                name,
-                ...payloadLogContext(entry.payload),
-                httpStatus: err.httpStatus,
-              },
-              err,
-            )
-            await unlinkIgnoreEnoent(filepath)
-            continue
-          }
-          if (entry.attempts >= FINAL_FATAL_MAX_ATTEMPTS) {
-            stats.fatalDropped++
-            log.warn(
-              'v3WechatRetryQueue: fatal final sink error max attempts exceeded, unlinking',
-              {
-                name,
-                ...payloadLogContext(entry.payload),
-                attempts: entry.attempts,
-                maxAttempts: FINAL_FATAL_MAX_ATTEMPTS,
-                httpStatus: err.httpStatus,
-              },
-              err,
-            )
-            await unlinkIgnoreEnoent(filepath)
-            continue
-          }
-          log.warn(
-            'v3WechatRetryQueue: fatal final sink error, retrying terminal cleanup',
-            {
-              name,
-              ...payloadLogContext(entry.payload),
-              attempts: entry.attempts,
-              maxAttempts: FINAL_FATAL_MAX_ATTEMPTS,
-              httpStatus: err.httpStatus,
-            },
-            err,
-          )
+        if (err instanceof V3WechatSinkError && err.httpStatus === 410) {
+          stats.fatalDropped++
+          log.warn('v3WechatRetryQueue: owner deletion acknowledged, removing entry', {
+            name,
+            ...payloadLogContext(entry.payload),
+          })
+          await unlinkIgnoreEnoent(filepath)
+          continue
         }
         stats.retried++
         stats.pending++
@@ -345,8 +303,7 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
           attempts: entry.attempts + 1,
           lastErrorClass: cls,
           lastErrorAt: now(),
-          lastErrorMessage:
-            err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+          lastErrorMessage: err instanceof Error ? err.message : String(err),
         }
         try {
           await atomicWriteJson(filepath, updated)
@@ -422,10 +379,6 @@ function isCodexBillingPayload(
   return 'type' in payload && payload.type === 'outbound.codex_billing'
 }
 
-function isFinalMessagePayload(payload: V3WechatOutboundPostPayload): payload is V3WechatSinkWirePayload {
-  return !isCodexBillingPayload(payload) && payload.isFinal === true
-}
-
 function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!v || typeof v !== 'object') return false
   const o = v as Record<string, unknown>
@@ -436,6 +389,8 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!p || typeof p !== 'object') return false
   if (p.type === 'outbound.codex_billing') {
     if (typeof p.requestId !== 'string' || !/^[0-9a-f]{32}$/.test(p.requestId)) return false
+    if (p.engineSessionId !== undefined &&
+        (typeof p.engineSessionId !== 'string' || !/^oceng-[0-9a-f]{48}$/.test(p.engineSessionId))) return false
     if (p.status !== 'success' && p.status !== 'error') return false
     if (typeof p.durationMs !== 'number' || !Number.isFinite(p.durationMs) || p.durationMs < 0) return false
     return true

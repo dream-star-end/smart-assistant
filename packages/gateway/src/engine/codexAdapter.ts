@@ -32,7 +32,7 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { createLogger } from '../logger.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
-import type { SdkMessage } from '../subprocessRunner.js'
+import type { SdkMessage, UsageAttributionTag } from '../subprocessRunner.js'
 import { asCcbSessionTotals } from './ccbAdapter.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import type { CodexProviderConfigOverride } from './codexShared.js'
@@ -84,6 +84,8 @@ const CODEX_PHANTOM_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
 interface CodexTurnContext {
   parser: CcbMessageParser
   lastErrorText: string | null
+  turnKey?: string
+  usageAttribution?: UsageAttributionTag
 }
 
 function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummary {
@@ -101,10 +103,12 @@ function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummar
     assistantSegments: result.assistantSegments,
     thinkingSegments: result.thinkingSegments,
     tools: result.tools,
+    runtimeEvents: result.runtimeEvents,
     stopReason: result.stopReason,
     numTurns: result.numTurns,
     isError: result.isError,
     ...(errorKind ? { errorKind } : {}),
+    ...(result.errorDetail !== undefined ? { errorDetail: result.errorDetail } : {}),
     // codex 的 stale-thread 自愈在内核内(thread/resume -32600 "no rollout
     // found" → 透明 thread/start + 重发 session_id),不经 resume-map 逐出路径;
     // parser 的 staleResumeId 检测词是 CCB 专属,codex 帧恒 false — 直通。
@@ -117,9 +121,10 @@ function snapshotOf(parser: CcbMessageParser): PartialSnapshot {
   return {
     assistantText: parser.assistantBuf,
     thinkingText: parser.thinkingBuf,
-    completedTools: [...parser.completedTools],
+    completedTools: parser.snapshotToolsForPersistence(),
     assistantSegments: parser.assistantSegments.map((s) => ({ ...s })),
     thinkingSegments: parser.thinkingSegments.map((s) => ({ ...s })),
+    runtimeEvents: parser.runtimeEvents.map((event) => structuredClone(event)),
   }
 }
 
@@ -129,6 +134,7 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
   completedTools: [],
   assistantSegments: [],
   thinkingSegments: [],
+  runtimeEvents: [],
 }
 
 /**
@@ -141,6 +147,8 @@ export function buildCodexBillingEvent(
   msg: Record<string, unknown>,
   requestId: string,
   sessionEngineId: string,
+  turnKey?: string,
+  usageAttribution?: UsageAttributionTag,
 ): EngineBillingEvent {
   const isOk = msg.is_error !== true
   const errReason =
@@ -185,6 +193,17 @@ export function buildCodexBillingEvent(
       : undefined
   return {
     requestId,
+    ...(typeof turnKey === 'string' && /^[0-9a-f]{64}$/.test(turnKey) ? { turnKey } : {}),
+    ...(typeof usageAttribution?.parentTurnKey === 'string' &&
+    /^[0-9a-f]{64}$/.test(usageAttribution.parentTurnKey)
+      ? { parentTurnKey: usageAttribution.parentTurnKey }
+      : {}),
+    ...(typeof usageAttribution?.parentSessionId === 'string'
+      ? { parentSessionId: usageAttribution.parentSessionId }
+      : {}),
+    ...(typeof usageAttribution?.delegateAgentId === 'string'
+      ? { delegateAgentId: usageAttribution.delegateAgentId }
+      : {}),
     engineSessionId: sessionEngineId,
     status: isOk ? 'success' : 'error',
     durationMs: typeof msg.duration_ms === 'number' ? msg.duration_ms : 0,
@@ -268,11 +287,25 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
           this._activeTurn === turn &&
           !turn.parser.finalized
         ) {
-          this.emit('billing', buildCodexBillingEvent(msg, requestId, this._engineSessionId))
+          this.emit(
+            'billing',
+            buildCodexBillingEvent(
+              msg,
+              requestId,
+              this._engineSessionId,
+              turn.turnKey,
+              turn.usageAttribution,
+            ),
+          )
         }
       }
       // fake-SDK RunnerMessage 是 SdkMessage 子集(内核注释明示),cast 内聚在此。
       turn?.parser.parse(msg as unknown as SdkMessage)
+    })
+    this.kernel.on('runtime_event', (payload: unknown) => {
+      this.emit('activity')
+      const turn = this._routeTurn
+      turn?.parser.captureRuntimeEvent(payload, 'codex-jsonrpc')
     })
     this.kernel.on('session_id', (id: string) => {
       this._threadId = typeof id === 'string' && id ? id : null
@@ -296,13 +329,21 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     const summary = new Promise<TurnSummary | null>((res) => {
       resolveSummary = res
     })
-    const ctx: CodexTurnContext = { parser: null as unknown as CcbMessageParser, lastErrorText: null }
+    const ctx: CodexTurnContext = {
+      parser: null as unknown as CcbMessageParser,
+      lastErrorText: null,
+      ...(params.turnKey ? { turnKey: params.turnKey } : {}),
+      ...(params.usageAttribution
+        ? { usageAttribution: { ...params.usageAttribution } }
+        : {}),
+    }
     const parser = new CcbMessageParser({
       toolUseIdToName: params.toolUseIdToName,
       onEvent: (e: SessionStreamEvent) => params.onEvent(e as EngineEvent),
       assistantMessageId: params.assistantMessageId,
       thinkingMessageId: params.thinkingMessageId,
       toolMessageIdFactory: params.toolMessageIdFactory,
+      nextDurableEventOrdinal: params.nextDurableEventOrdinal,
       onToolUse: (tool) => params.onEvent({ kind: 'tool_use_detected', tool }),
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
       onFinish: (result) => {
@@ -345,6 +386,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   shutdown(): Promise<void> {
     return this.kernel.shutdown()
+  }
+
+  waitForOutputDrain(): Promise<void> {
+    return this.kernel.waitForOutputDrain()
   }
 
   // ── resume ─────────────────────────────────────────────────────────────

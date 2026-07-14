@@ -60,6 +60,22 @@ test('buildCcbUsageAttributionEnv: undefined(普通 chat/cron/webhook 会话)→
   )
 })
 
+test('buildCcbUsageAttributionEnv: exact turn keys are preserved for chat and delegate billing', () => {
+  const turnKey = 'a'.repeat(64)
+  const parentTurnKey = 'b'.repeat(64)
+  assert.deepEqual(
+    JSON.parse(_buildCcbUsageAttributionEnv(undefined, turnKey).CLAUDE_CODE_EXTRA_METADATA),
+    { oc_turn_key: turnKey },
+  )
+  const delegate = JSON.parse(_buildCcbUsageAttributionEnv({
+    mode: 'delegate',
+    delegateAgentId: 'reviewer',
+    parentTurnKey,
+  }, turnKey).CLAUDE_CODE_EXTRA_METADATA)
+  assert.equal(delegate.oc_turn_key, turnKey)
+  assert.equal(delegate.oc_parent_turn_key, parentTurnKey)
+})
+
 test('buildCcbUsageAttributionEnv: 超长值截断(parent ≤128 / agent ≤64,守 512 字节 user_id 预算)', () => {
   const tag: UsageAttributionTag = {
     mode: 'delegate',

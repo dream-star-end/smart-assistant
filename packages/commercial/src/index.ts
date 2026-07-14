@@ -73,6 +73,7 @@ import {
   InsufficientCreditsError,
   preCheckWithCost,
   releasePreCheck,
+  type ReservationHandle,
   wrapIoredisForPreCheck,
 } from "./billing/preCheck.js";
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
@@ -201,7 +202,11 @@ import {
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
-import type { StaticProviderId, StaticProviderKeys } from "@openclaude/protocol";
+import type {
+  DurableCodexBilling,
+  StaticProviderId,
+  StaticProviderKeys,
+} from "@openclaude/protocol";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -318,6 +323,7 @@ import {
 import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
+  type LosslessTurnTapeStorage,
 } from "./db/pgSessionsBackend.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
@@ -410,11 +416,13 @@ import {
 } from "./billing/agentMultiplier.js";
 import { startInflightJournal } from "./billing/proxyBilling.js";
 import {
+  DURABLE_CODEX_RECOVERY_VERSION,
   deriveEngineSessionId,
   makeCodexFinalizer,
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
-import type { TokenUsage } from "./billing/calculator.js";
+import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
@@ -1072,12 +1080,13 @@ export async function registerCommercial(
   // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   if (runtimeChannel === "v5") {
     const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
     if (decision.store === "pg") {
-      setClientSessionsBackend(
-        createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation }),
-      );
+      const pgSessionsBackend = createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation });
+      setClientSessionsBackend(pgSessionsBackend);
+      losslessTurnTapeStorage = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
       sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({ pool: getPool() }));
@@ -1394,6 +1403,8 @@ export async function registerCommercial(
     parentSessionId?: string | null,
     // P2 债D — 委派目标 agent id(与 parentSessionId 同源);普通 chat / codex 自费恒 undefined。
     delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) =>
     appendCostCredits(
       requestId,
@@ -1403,6 +1414,8 @@ export async function registerCommercial(
       sessionId,
       parentSessionId,
       delegateAgentId,
+      turnKey,
+      parentTurnKey,
     );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
@@ -1569,6 +1582,19 @@ export async function registerCommercial(
       // 详见 packages/commercial/src/http/internalServerAuthored.ts。
       const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
         identityRepo,
+        losslessTurnTapeStorage,
+        settleCodexBilling: async (userId, billing) => {
+          await settleDurableCodexBilling(
+            {
+              pgPool: getPool(),
+              preCheckRedis,
+              pricing,
+              logger: rootLogger.child({ subsys: "durableCodexBilling" }),
+            },
+            userId,
+            billing,
+          );
+        },
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
@@ -3156,6 +3182,7 @@ export async function registerCommercial(
 
   type WechatCodexTurnSnapshot = {
     finalizer: CodexFinalizeHandle;
+    reservation: ReservationHandle;
     requestId: string;
     userId: bigint;
     containerId: number;
@@ -3188,66 +3215,102 @@ export async function registerCommercial(
     }
   };
 
-  const safeBillingNum = (v: unknown): bigint => {
-    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0n;
-    return BigInt(Math.trunc(v));
+  const expireWechatCodexRecoverySnapshot = async (requestId: string): Promise<void> => {
+    const snap = wechatCodexTurns.get(requestId);
+    if (!snap) return;
+    wechatCodexTurns.delete(requestId);
+    clearTimeout(snap.timeout);
+    // This is only an in-memory retention timeout, not a billing decision.
+    // Keep the durable journal inflight indefinitely; a delayed fsynced frame
+    // can reconstruct settlement after any master restart.
+    await releasePreCheck(preCheckRedis, snap.reservation).catch(() => {});
+    expireCodexRouteToken(snap.routeToken, "wechat_codex_snapshot_expired");
+  };
+
+  const safeBillingNum = (v: unknown): number => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0;
+    return Math.trunc(v);
   };
 
   const handleWechatCodexBilling = async (
     body: WechatCodexBillingBody,
     identity: { userId: number; containerId: number },
   ): Promise<void> => {
-    const snap = wechatCodexTurns.get(body.requestId);
-    if (!snap) {
-      codexRouteLog.info("wechat_codex_billing_unknown_turn", { requestId: body.requestId });
-      return;
+    const pool = getPool();
+    const journal = await pool.query<{
+      user_id: string;
+      container_id: string | null;
+      ctx: unknown;
+    }>(
+      `SELECT user_id::text AS user_id, container_id::text AS container_id, ctx
+         FROM request_finalize_journal WHERE request_id=$1`,
+      [body.requestId],
+    );
+    const row = journal.rows[0];
+    if (!row) throw new Error(`wechat codex billing journal missing for ${body.requestId}`);
+    if (row.user_id !== String(identity.userId) || row.container_id !== String(identity.containerId)) {
+      throw new Error(`wechat codex billing identity mismatch for ${body.requestId}`);
     }
-    if (snap.userId !== BigInt(identity.userId) || snap.containerId !== identity.containerId) {
-      codexRouteLog.warn("wechat_codex_billing_identity_mismatch", {
-        requestId: body.requestId,
-        expectedUserId: snap.userId.toString(),
-        gotUserId: identity.userId,
-        expectedContainerId: snap.containerId,
-        gotContainerId: identity.containerId,
-      });
-      return;
+    const ctx = row.ctx !== null && typeof row.ctx === "object" && !Array.isArray(row.ctx)
+      ? row.ctx as Record<string, unknown>
+      : {};
+    const agentId = typeof ctx.agentId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(ctx.agentId)
+      ? ctx.agentId
+      : "codex";
+    const derivedEngineSessionId = deriveEngineSessionId(
+      `wechat:${identity.userId}:${identity.containerId}:${agentId}`,
+    );
+    const journalEngineSessionId = typeof ctx.engineSessionId === "string"
+      && /^oceng-[0-9a-f]{48}$/.test(ctx.engineSessionId)
+      ? ctx.engineSessionId
+      : derivedEngineSessionId;
+    if (body.engineSessionId !== undefined && body.engineSessionId !== journalEngineSessionId) {
+      throw new Error(`wechat codex billing engine session mismatch for ${body.requestId}`);
     }
-    wechatCodexTurns.delete(body.requestId);
-    clearTimeout(snap.timeout);
-
     const u = body.usage ?? {};
-    const usage: TokenUsage = {
-      input_tokens: safeBillingNum(u.input_tokens),
-      output_tokens: safeBillingNum(u.output_tokens) + safeBillingNum(u.reasoning_output_tokens),
-      cache_read_tokens: safeBillingNum(u.cache_read_input_tokens),
-      cache_write_tokens: safeBillingNum(u.cache_creation_input_tokens),
+    const billing: DurableCodexBilling = {
+      requestId: body.requestId,
+      ...(body.turnKey ? { turnKey: body.turnKey } : {}),
+      ...(body.parentTurnKey ? { parentTurnKey: body.parentTurnKey } : {}),
+      ...(body.parentSessionId ? { parentSessionId: body.parentSessionId } : {}),
+      ...(body.delegateAgentId ? { delegateAgentId: body.delegateAgentId } : {}),
+      engineSessionId: journalEngineSessionId,
+      status: body.status,
+      durationMs: body.durationMs,
+      usage: {
+        input_tokens: safeBillingNum(u.input_tokens),
+        output_tokens: safeBillingNum(u.output_tokens),
+        reasoning_output_tokens: safeBillingNum(u.reasoning_output_tokens),
+        cache_read_input_tokens: safeBillingNum(u.cache_read_input_tokens),
+        cache_creation_input_tokens: safeBillingNum(u.cache_creation_input_tokens),
+      },
+      ...(body.errorReason !== undefined ? { errorReason: body.errorReason } : {}),
+      ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits } : {}),
     };
     try {
-      const result = await snap.finalizer.commit(
-        usage,
-        body.status === "error" ? "error" : "success",
-        body.errorReason,
+      await settleDurableCodexBilling(
+        {
+          pgPool: pool,
+          preCheckRedis,
+          pricing,
+          logger: rootLogger.child({ subsys: "wechatDurableCodexBilling" }),
+        },
+        BigInt(identity.userId),
+        billing,
       );
-      if (result.debitedCredits !== null && result.debitedCredits > 0n) {
-        try {
-          await appendCostCreditsForUser(
-            body.requestId,
-            snap.userId.toString(),
-            result.debitedCredits.toString(),
-          );
-        } catch (err) {
-          codexRouteLog.warn("wechat_codex_persist_cost_credits_failed", {
-            requestId: body.requestId,
-            errMessage: (err as Error)?.message ?? String(err),
-          });
-        }
-      }
     } catch (err) {
       codexRouteLog.error("wechat_codex_finalizer_commit_failed", {
         requestId: body.requestId,
         errMessage: (err as Error)?.message ?? String(err),
       });
-    } finally {
+      // Propagate so outboundReceiver returns non-2xx and the gateway retains
+      // its fsynced retry frame. Never ACK an unsettled/unknown journal.
+      throw err;
+    }
+    const snap = wechatCodexTurns.get(body.requestId);
+    if (snap) {
+      wechatCodexTurns.delete(body.requestId);
+      clearTimeout(snap.timeout);
       expireCodexRouteToken(snap.routeToken, "wechat_codex_billing_settled");
     }
   };
@@ -3321,6 +3384,9 @@ export async function registerCommercial(
       return { kind: "unavailable", reply: "GPT 模型计费检查暂时不可用，请稍后再试。" };
     }
 
+    const engineSessionId = deriveEngineSessionId(
+      `wechat:${args.bindingUserId}:${args.containerId}:${agentForCharge}`,
+    );
     try {
       await startInflightJournal(getPool(), {
         requestId,
@@ -3332,6 +3398,9 @@ export async function registerCommercial(
           agentId: agentForCharge,
           codexAccountId: null,
           source: "wechat_codex_api_relay",
+          durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
+          billingPricing: serializeBillingPricing(derivedPricing),
+          engineSessionId,
         },
       });
     } catch (err) {
@@ -3352,19 +3421,18 @@ export async function registerCommercial(
       // v5 计费口径:usage_records.session_id 单一权威 helper 派生(oceng-<48hex>)。
       // wechat 会话没有 ccb sessionKey,用 (binding, container, agent) 稳定三元组派生;
       // M2 gateway billing 事件接入后网页路径改用 gateway 传来的同算法值。
-      engineSessionId: deriveEngineSessionId(
-        `wechat:${args.bindingUserId}:${args.containerId}:${agentForCharge}`,
-      ),
+      engineSessionId,
       model: args.modelId,
       derivedPricing,
       reservation: preCheckResult.reservation,
     });
     const timeout = setTimeout(() => {
-      void failWechatCodexTurn(requestId, "wechat_codex_billing_timeout");
+      void expireWechatCodexRecoverySnapshot(requestId);
     }, readCodexSessionMaxMs());
     timeout.unref?.();
     wechatCodexTurns.set(requestId, {
       finalizer,
+      reservation: preCheckResult.reservation,
       requestId,
       userId: args.userId,
       containerId: args.containerId,

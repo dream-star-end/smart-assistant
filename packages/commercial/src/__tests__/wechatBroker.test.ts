@@ -1445,7 +1445,7 @@ describe("wechatBroker — onInbound", () => {
 })
 
 describe("wechatBroker — cleanupBinding", () => {
-  test("deletes pointer and terminal-fails queued/sending outbox without deleting tombstones", async () => {
+  test("deletes pointer and retains queued/sending payloads as failed rows", async () => {
     const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = []
     const pool = {
       query: async (sql: string, params?: ReadonlyArray<unknown>) => {
@@ -1476,7 +1476,8 @@ describe("wechatBroker — cleanupBinding", () => {
     assert.equal(del!.params?.[0], "42")
     assert.equal(runningDel!.params?.[0], "42")
     assert.equal(upd!.params?.[0], "42")
-    assert.equal(upd!.params?.[1], 7)
+    assert.equal(upd!.params?.[1], "binding unbound")
+    assert.match(upd!.sql, /attempts\s*=\s*attempts \+ 1/i)
     assert.match(upd!.sql, /status\s+IN\s+\('queued',\s*'sending'\)/i)
     assert.doesNotMatch(upd!.sql, /DELETE\s+FROM\s+wechat_outbox/i)
   })

@@ -1,14 +1,17 @@
 /**
  * Egress 进程解耦(2026-07-02)— 三个安全/正确性关键面:
- *   1. CostEventSink:FIFO 保序、失败重试不丢、TTL 过期丢弃。
+ *   1. CostEventSink:FIFO 保序、persist 先 fsync、失败/重启后无 TTL 重试。
  *   2. internalCostEvent handler:秘钥缺失 503 / 错误 401 / 正确才 apply。
  *   3. forwarder:/internal/v5/* 控制专用路径拒转(容器伪造控制调用的第一道闸)。
  */
 
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { CostEventSink } from "../egress/costEventSink.js";
 import { makeCostEventHandler, COST_EVENT_PATH, EGRESS_SECRET_HEADER } from "../http/internalCostEvent.js";
@@ -16,15 +19,25 @@ import { makeForwarder } from "../egress/forwarder.js";
 
 // ─── CostEventSink ──────────────────────────────────────────────────────────
 
+const costSinkTempDirs: string[] = [];
+async function costSinkDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "oc-cost-sink-"));
+  costSinkTempDirs.push(dir);
+  return dir;
+}
+afterEach(async () => {
+  await Promise.all(costSinkTempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
 describe("CostEventSink — FIFO 保序 + 失败重试", () => {
-  test("先 persist 后 broadcast,批内顺序与入队一致", async () => {
+  test("先 persist 后 broadcast,单事件请求顺序与入队一致", async () => {
     const batches: unknown[][] = [];
     const fakeFetcher = (async (_url: string, opts: { body?: unknown }) => {
       batches.push(JSON.parse(String(opts.body)).events);
       return { statusCode: 200, body: { text: async () => "{}" } };
     }) as never;
-    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: fakeFetcher });
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: fakeFetcher, dir: await costSinkDir() });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     sink.enqueue({ kind: "broadcast", uid: "7", payload: { type: "outbound.cost_charged" } });
     await sink.flush();
     assert.equal(sink.pending, 0);
@@ -40,8 +53,8 @@ describe("CostEventSink — FIFO 保序 + 失败重试", () => {
       sent.push(...JSON.parse(String(opts.body)).events);
       return { statusCode: 200, body: { text: async () => "{}" } };
     }) as never;
-    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: fakeFetcher });
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: fakeFetcher, dir: await costSinkDir() });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     await sink.flush();
     assert.equal(sink.pending, 1, "失败必须留队列");
     fail = false;
@@ -51,7 +64,7 @@ describe("CostEventSink — FIFO 保序 + 失败重试", () => {
     sink.stop();
   });
 
-  test("超过 TTL 的事件被丢弃(尽力而为语义)", async () => {
+  test("长时间故障不按 TTL 丢弃已计费事件", async () => {
     let t = 1_000_000;
     const fakeFetcher = (async () => {
       throw new Error("down");
@@ -60,15 +73,54 @@ describe("CostEventSink — FIFO 保序 + 失败重试", () => {
       controlBaseUrl: "http://x",
       secret: "s".repeat(16),
       fetcher: fakeFetcher,
+      dir: await costSinkDir(),
       now: () => t,
     });
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     await sink.flush();
     assert.equal(sink.pending, 1);
-    t += 121_000; // 越过 120s TTL
+    t += 10 * 60_000;
     await sink.flush();
-    assert.equal(sink.pending, 0, "过期事件必须被丢弃");
+    assert.equal(sink.pending, 1, "已计费事件必须无 TTL 保留");
     sink.stop();
+  });
+
+  test("进程重启从 fsync outbox 恢复 persist 事件", async () => {
+    const dir = await costSinkDir();
+    const down = (async () => { throw new Error("down"); }) as never;
+    const first = new CostEventSink({
+      controlBaseUrl: "http://x",
+      secret: "s".repeat(16),
+      fetcher: down,
+      dir,
+    });
+    await first.enqueueDurable({
+      kind: "persist",
+      requestId: "restart-r1",
+      uid: "7",
+      costCredits: "9",
+      turnKey: "ab".repeat(32),
+    });
+    await first.flush();
+    assert.equal(first.pending, 1);
+    first.stop();
+
+    const sent: unknown[] = [];
+    const up = (async (_url: string, opts: { body?: unknown }) => {
+      sent.push(...JSON.parse(String(opts.body)).events);
+      return { statusCode: 200, body: { text: async () => "{}" } };
+    }) as never;
+    const second = new CostEventSink({
+      controlBaseUrl: "http://x",
+      secret: "s".repeat(16),
+      fetcher: up,
+      dir,
+    });
+    await second.init();
+    await second.flush();
+    assert.equal(second.pending, 0);
+    assert.equal((sent[0] as { requestId?: string }).requestId, "restart-r1");
+    second.stop();
   });
 });
 
@@ -77,7 +129,7 @@ describe("CostEventSink — FIFO 保序 + 失败重试", () => {
 describe("CostEventSink — health 单调计数器", () => {
   test("初始全零;成功发送 → enqueued==sent,无 drop,oldestPendingAgeMs=0", async () => {
     const okFetcher = (async () => ({ statusCode: 200, body: { text: async () => "{}" } })) as never;
-    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: okFetcher });
+    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: okFetcher, dir: await costSinkDir() });
     let c = sink.healthCounters();
     assert.deepEqual(
       {
@@ -90,7 +142,7 @@ describe("CostEventSink — health 单调计数器", () => {
       },
       { pendingCostEvents: 0, enqueuedTotal: 0, sentTotal: 0, expiredDropsTotal: 0, overflowDropsTotal: 0, oldestPendingAgeMs: 0 },
     );
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     sink.enqueue({ kind: "broadcast", uid: "7", payload: { type: "outbound.cost_charged" } });
     await sink.flush();
     c = sink.healthCounters();
@@ -112,9 +164,10 @@ describe("CostEventSink — health 单调计数器", () => {
       controlBaseUrl: "http://x",
       secret: "s".repeat(16),
       fetcher: failFetcher,
+      dir: await costSinkDir(),
       now: () => t,
     });
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     await sink.flush();
     t = 1_500;
     const c = sink.healthCounters();
@@ -125,7 +178,7 @@ describe("CostEventSink — health 单调计数器", () => {
     sink.stop();
   });
 
-  test("TTL 过期丢弃 → expiredDropsTotal 计数", async () => {
+  test("长期 pending 仍保留且 drop 计数恒零", async () => {
     let t = 1_000_000;
     const failFetcher = (async () => {
       throw new Error("down");
@@ -134,32 +187,37 @@ describe("CostEventSink — health 单调计数器", () => {
       controlBaseUrl: "http://x",
       secret: "s".repeat(16),
       fetcher: failFetcher,
+      dir: await costSinkDir(),
       now: () => t,
     });
-    sink.enqueue({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
+    await sink.enqueueDurable({ kind: "persist", requestId: "r1", uid: "7", costCredits: "3", sessionId: null });
     await sink.flush();
-    t += 121_000; // 越过 120s TTL
+    t += 10 * 60_000;
     await sink.flush();
     const c = sink.healthCounters();
-    assert.equal(c.pendingCostEvents, 0);
-    assert.equal(c.expiredDropsTotal, 1);
+    assert.equal(c.pendingCostEvents, 1);
+    assert.equal(c.expiredDropsTotal, 0);
     assert.equal(c.sentTotal, 0);
     sink.stop();
   });
 
-  test("队列上限溢出丢最老 → overflowDropsTotal 计数(enqueuedTotal 仍单调计全量)", () => {
+  test("队列不因旧上限溢出删除事件", async () => {
     const failFetcher = (async () => {
       throw new Error("down");
     }) as never;
-    const sink = new CostEventSink({ controlBaseUrl: "http://x", secret: "s".repeat(16), fetcher: failFetcher });
-    // MAX_QUEUE=2000;入队 2001 触发一次溢出丢弃(同步发生在 enqueue)。
+    const sink = new CostEventSink({
+      controlBaseUrl: "http://x",
+      secret: "s".repeat(16),
+      fetcher: failFetcher,
+      dir: await costSinkDir(),
+    });
     for (let i = 0; i < 2001; i++) {
-      sink.enqueue({ kind: "persist", requestId: `r${i}`, uid: "7", costCredits: "1", sessionId: null });
+      sink.enqueue({ kind: "broadcast", uid: "7", payload: { requestId: `r${i}` } });
     }
     const c = sink.healthCounters();
     assert.equal(c.enqueuedTotal, 2001);
-    assert.equal(c.overflowDropsTotal, 1);
-    assert.equal(c.pendingCostEvents, 2000);
+    assert.equal(c.overflowDropsTotal, 0);
+    assert.equal(c.pendingCostEvents, 2001);
     sink.stop();
   });
 });
@@ -231,8 +289,25 @@ describe("internalCostEvent — 秘钥闸", () => {
     assert.deepEqual(applied, ["persist:r1", "broadcast"]);
   });
 
-  test("persist 事件 parentSessionId 经 egress→master 透传给 appendCostCredits(Fix A durable hop)", async () => {
-    const seen: Array<{ sessionId?: string | null; parentSessionId?: string | null }> = [];
+  test("persist apply 失败 → 非 2xx,egress 必须保留 durable receipt", async () => {
+    const h = makeCostEventHandler({
+      secret: "super-secret-egress-key",
+      appendCostCredits: async () => {
+        throw new Error("PG unavailable");
+      },
+      broadcastToUser: () => {},
+    });
+    const r = await invokeHandler(h, {
+      headers: { [EGRESS_SECRET_HEADER]: "super-secret-egress-key" },
+      body: {
+        events: [{ kind: "persist", requestId: "r-fail", uid: "7", costCredits: "3" }],
+      },
+    });
+    assert.equal(r.status, 503);
+  });
+
+  test("persist 的 session/agent/turn 定位键经 egress→master 完整透传", async () => {
+    const seen: Array<Record<string, string | null | undefined>> = [];
     const h = makeCostEventHandler({
       secret: "super-secret-egress-key",
       appendCostCredits: async (
@@ -241,8 +316,11 @@ describe("internalCostEvent — 秘钥闸", () => {
         _cents: string,
         sessionId?: string | null,
         parentSessionId?: string | null,
+        delegateAgentId?: string | null,
+        turnKey?: string | null,
+        parentTurnKey?: string | null,
       ) => {
-        seen.push({ sessionId, parentSessionId });
+        seen.push({ sessionId, parentSessionId, delegateAgentId, turnKey, parentTurnKey });
       },
       broadcastToUser: () => {},
     });
@@ -251,15 +329,36 @@ describe("internalCostEvent — 秘钥闸", () => {
       body: {
         events: [
           // 委派 persist:带 parent_session_id;缺 parentSessionId 的老事件解析成 null。
-          { kind: "persist", requestId: "rd", uid: "7", costCredits: "5", sessionId: "eng-d", parentSessionId: "web-parent-01" },
+          {
+            kind: "persist", requestId: "rd", uid: "7", costCredits: "5",
+            sessionId: "eng-d", parentSessionId: "web-parent-01", delegateAgentId: "researcher",
+            turnKey: "a".repeat(64), parentTurnKey: "b".repeat(64),
+          },
           { kind: "persist", requestId: "rc", uid: "7", costCredits: "9", sessionId: "eng-leader" },
         ],
       },
     });
     assert.equal(r.status, 200);
     assert.equal(seen.length, 2);
-    assert.deepEqual(seen[0], { sessionId: "eng-d", parentSessionId: "web-parent-01" }, "委派事件透传 parentSessionId");
-    assert.deepEqual(seen[1], { sessionId: "eng-leader", parentSessionId: null }, "无 parentSessionId → null(不丢字段)");
+    assert.deepEqual(seen[0], {
+      sessionId: "eng-d", parentSessionId: "web-parent-01", delegateAgentId: "researcher",
+      turnKey: "a".repeat(64), parentTurnKey: "b".repeat(64),
+    });
+    assert.deepEqual(seen[1], {
+      sessionId: "eng-leader", parentSessionId: null, delegateAgentId: null,
+      turnKey: null, parentTurnKey: null,
+    });
+  });
+
+  test("非法 turnKey 返回 400,不得静默清空定位键后 ACK", async () => {
+    const h = makeCostEventHandler(deps);
+    const r = await invokeHandler(h, {
+      headers: { [EGRESS_SECRET_HEADER]: "super-secret-egress-key" },
+      body: {
+        events: [{ kind: "persist", requestId: "bad-key", uid: "7", costCredits: "3", turnKey: "bad" }],
+      },
+    });
+    assert.equal(r.status, 400);
   });
 });
 

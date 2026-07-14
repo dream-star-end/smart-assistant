@@ -52,6 +52,12 @@ export async function getSessionsDb(): Promise<Database.Database> {
   if (_db) return _db
   await mkdir(dirname(paths.sessionsDb), { recursive: true })
   const db = new Database(paths.sessionsDb)
+  // Gateway, MCP memory workers, and migration helpers can legitimately open
+  // the same WAL database from separate processes.  A turn-id reservation is
+  // a durability prerequisite, so an instantaneous SQLITE_BUSY must wait for
+  // the current writer rather than reject a paid turn before it starts.  Keep
+  // this aligned with sessionsMigrate.ts.
+  db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_meta (
@@ -67,6 +73,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_last_at ON sessions_meta(last_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions_meta(agent_id);
+
+    -- Crash-safe allocator for user-visible turn ids.  FTS rows are written
+    -- after a model result and therefore cannot reserve the id of an
+    -- interrupted turn (or a completed turn whose async index write has not
+    -- landed yet).  Reserving before execution prevents a gateway restart
+    -- from reusing srv-<session>-<agent>-tN and conflicting with an immutable
+    -- lossless turn tape already ACKed or waiting in the durable outbox.
+    CREATE TABLE IF NOT EXISTS session_turn_counters (
+      session_id TEXT PRIMARY KEY,
+      last_reserved_turn INTEGER NOT NULL CHECK (last_reserved_turn >= 0)
+    );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
       session_id UNINDEXED,
@@ -361,6 +378,8 @@ export async function getSessionsDb(): Promise<Database.Database> {
       -- 仅委派行非空;普通 chat / codex 自费恒 NULL。drain 时按它分组求和,产出队长助手行
       -- usage.delegates[] 的 per-agent 明细(纯展示投影,不参与扣费)。
       delegate_agent_id TEXT,
+      turn_key TEXT,
+      parent_turn_key TEXT,
       cost_credits TEXT NOT NULL,
       created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000),
       PRIMARY KEY (request_id, user_id)
@@ -388,6 +407,12 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!cols.some(c => c.name === 'delegate_agent_id')) {
       db.exec('ALTER TABLE pending_usage_patches ADD COLUMN delegate_agent_id TEXT')
     }
+    if (!cols.some(c => c.name === 'turn_key')) {
+      db.exec('ALTER TABLE pending_usage_patches ADD COLUMN turn_key TEXT')
+    }
+    if (!cols.some(c => c.name === 'parent_turn_key')) {
+      db.exec('ALTER TABLE pending_usage_patches ADD COLUMN parent_turn_key TEXT')
+    }
   } catch { /* table just created with column already */ }
   // delegate drain(drainDelegateCostForClientSession 的 WHERE user_id AND parent_session_id)
   // 走部分索引(只覆盖委派行,普通/自费行 parent_session_id 为 NULL 不入索引)。
@@ -397,6 +422,12 @@ export async function getSessionsDb(): Promise<Database.Database> {
        ON pending_usage_patches(user_id, parent_session_id)
        WHERE parent_session_id IS NOT NULL`,
   )
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_pup_user_turn_key
+      ON pending_usage_patches(user_id, turn_key) WHERE turn_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_pup_user_parent_turn_key
+      ON pending_usage_patches(user_id, parent_turn_key) WHERE parent_turn_key IS NOT NULL;
+  `)
 
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
@@ -483,6 +514,75 @@ export async function getMaxTurnIdx(sessionIds: string[]): Promise<number> {
     )
     .get(...sessionIds) as { m: number | null } | undefined
   return row?.m == null ? 0 : Math.floor(row.m)
+}
+
+/**
+ * Atomically reserve the next never-reused turn index for one logical runner
+ * session.  The allocation is committed to the container's persistent SQLite
+ * volume before the model is allowed to run.
+ *
+ * `minimumLastTurn` covers in-memory completions whose asynchronous FTS write
+ * is still pending. `legacySessionIds` seeds the allocator from historical FTS
+ * identities used before sessionKey became the canonical index key.
+ * Gaps are intentional: once reserved, an index is never returned to the pool,
+ * even when a turn fails before producing output.
+ */
+export async function reserveTurnIndex(
+  sessionId: string,
+  opts: { minimumLastTurn?: number; legacySessionIds?: string[] } = {},
+): Promise<number> {
+  const db = await getSessionsDb()
+  const ids = [...new Set([
+    sessionId,
+    ...(opts.legacySessionIds ?? []).filter((id) => id.length > 0),
+  ])]
+  const reserve = db.transaction((): number => {
+    const placeholders = ids.map(() => '?').join(',')
+    const counter = db
+      .prepare(
+        `SELECT MAX(last_reserved_turn) AS m
+           FROM session_turn_counters
+          WHERE session_id IN (${placeholders})`,
+      )
+      .get(...ids) as { m: number | null } | undefined
+    const fts = db
+      .prepare(
+        `SELECT MAX(CAST(turn_idx AS INTEGER)) AS m
+           FROM sessions_fts
+          WHERE session_id IN (${placeholders})`,
+      )
+      .get(...ids) as { m: number | null } | undefined
+    const meta = db
+      .prepare(
+        `SELECT MAX(turn_count) AS m
+           FROM sessions_meta
+          WHERE id IN (${placeholders})`,
+      )
+      .get(...ids) as { m: number | null } | undefined
+    const minimum = Number.isSafeInteger(opts.minimumLastTurn) && (opts.minimumLastTurn ?? 0) > 0
+      ? opts.minimumLastTurn!
+      : 0
+    const last = Math.max(
+      minimum,
+      counter?.m == null ? 0 : Math.floor(counter.m),
+      fts?.m == null ? 0 : Math.floor(fts.m),
+      meta?.m == null ? 0 : Math.floor(meta.m),
+    )
+    const next = last + 1
+    db.prepare(
+      `INSERT INTO session_turn_counters(session_id,last_reserved_turn)
+       VALUES (?,?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         last_reserved_turn=MAX(session_turn_counters.last_reserved_turn,excluded.last_reserved_turn)`,
+    ).run(sessionId, next)
+    return next
+  })
+  // Acquire the WAL write reservation before the seed reads.  A deferred
+  // read-then-write transaction can lose the upgrade race to another process
+  // and SQLite correctly returns BUSY_SNAPSHOT without invoking busy_timeout.
+  // IMMEDIATE serializes allocators at the start, so the retry wait applies
+  // and two gateways can never derive the same `next` value.
+  return reserve.immediate()
 }
 
 export interface SearchHit {
@@ -918,9 +1018,41 @@ export function _stripClientPutMessage(msg: unknown): MessageLike | null {
  * Strip an entire `messages` array from a client PUT to the allow-list.
  * Returns a new array with malformed entries removed.
  */
-export function _stripClientPutMessages(messages: readonly unknown[]): MessageLike[] {
+export function _stripClientPutMessages(
+  messages: readonly unknown[],
+  serverSideMsgs: readonly MessageLike[] = [],
+): MessageLike[] {
+  // GET expands each immutable tape record into a normal message so existing
+  // clients can render it. A client can immediately PUT that projection back.
+  // Identify projections while their server-only tape markers are still
+  // present; `_stripClientPutMessage` intentionally removes those markers.
+  // The complete anchor in the already-stored hot tail is the authority for
+  // which tape ids are safe to discard here.
+  const completeTapeIds = new Set<string>()
+  for (const message of serverSideMsgs) {
+    if (
+      message?._source === 'server' &&
+      (message as { _turnTapeComplete?: unknown })._turnTapeComplete === true &&
+      typeof (message as { _turnTapeId?: unknown })._turnTapeId === 'string'
+    ) {
+      completeTapeIds.add((message as { _turnTapeId: string })._turnTapeId)
+    }
+  }
   const out: MessageLike[] = []
   for (const m of messages) {
+    if (m && typeof m === 'object') {
+      const projected = m as {
+        _turnTapeExpanded?: unknown
+        _turnTapeId?: unknown
+      }
+      if (
+        projected._turnTapeExpanded === true &&
+        typeof projected._turnTapeId === 'string' &&
+        completeTapeIds.has(projected._turnTapeId)
+      ) {
+        continue
+      }
+    }
     const cleaned = _stripClientPutMessage(m)
     if (cleaned !== null) out.push(cleaned)
   }
@@ -1066,15 +1198,22 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   const groupHasServerAsst: boolean[] = []
   const groupHasServerThinking: boolean[] = []
   const groupServerToolBlockIds: Array<Set<string>> = []
-  // P2 债A — 每组内**本地(非 server)**agent-group 行携带的 runId 集合。第二遍
-  // 据此把同 runId 的 server agent-group 行丢掉(local-wins:本地 m-* 富行带
-  // childBlocks 子树,server srv-* 行只有骨架摘要,禁止 server 行覆盖/吞子树)。
+  const groupHasCompleteTurnTape: boolean[] = []
+  // Legacy server agent-group rows are summary skeletons, so an equivalent
+  // rich local row wins. Lossless turn-tape rows invert that choice: their
+  // out-of-line record owns the complete child transcript and must survive a
+  // later client PUT. Track both sets per turn group.
   const groupClientAgentGroupRunIds: Array<Set<string>> = []
+  const groupTapeServerAgentGroupRunIds: Array<Set<string>> = []
+  const groupTapeStructuredRoles: Array<Set<string>> = []
   let groupId = 0
   let curGroupServerAsst = false
   let curGroupServerThinking = false
   let curGroupServerToolBlockIds = new Set<string>()
+  let curGroupHasCompleteTurnTape = false
   let curGroupClientAgentGroupRunIds = new Set<string>()
+  let curGroupTapeServerAgentGroupRunIds = new Set<string>()
+  let curGroupTapeStructuredRoles = new Set<string>()
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (cur && isTurnBoundary(cur)) {
@@ -1082,15 +1221,30 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       groupHasServerAsst.push(curGroupServerAsst)
       groupHasServerThinking.push(curGroupServerThinking)
       groupServerToolBlockIds.push(curGroupServerToolBlockIds)
+      groupHasCompleteTurnTape.push(curGroupHasCompleteTurnTape)
       groupClientAgentGroupRunIds.push(curGroupClientAgentGroupRunIds)
+      groupTapeServerAgentGroupRunIds.push(curGroupTapeServerAgentGroupRunIds)
+      groupTapeStructuredRoles.push(curGroupTapeStructuredRoles)
       groupId++
       curGroupServerAsst = false
       curGroupServerThinking = false
       curGroupServerToolBlockIds = new Set<string>()
+      curGroupHasCompleteTurnTape = false
       curGroupClientAgentGroupRunIds = new Set<string>()
+      curGroupTapeServerAgentGroupRunIds = new Set<string>()
+      curGroupTapeStructuredRoles = new Set<string>()
     }
     turnGroup[i] = groupId
     if (cur && cur._source === 'server') {
+      if ((cur as { _turnTapeComplete?: unknown })._turnTapeComplete === true) {
+        curGroupHasCompleteTurnTape = true
+        const roles = (cur as { _turnTapeStructuredRoles?: unknown })._turnTapeStructuredRoles
+        if (Array.isArray(roles)) {
+          for (const role of roles) {
+            if (role === 'plan' || role === 'goal') curGroupTapeStructuredRoles.add(role)
+          }
+        }
+      }
       if (isAssistant(cur)) curGroupServerAsst = true
       else if (isThinking(cur)) curGroupServerThinking = true
       else if (isTool(cur)) {
@@ -1098,6 +1252,9 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
         if (typeof bid === 'string' && bid.length > 0) {
           curGroupServerToolBlockIds.add(bid)
         }
+      } else if (isAgentGroup(cur) && typeof (cur as { _turnTapeId?: unknown })._turnTapeId === 'string') {
+        const rid = agentGroupRunId(cur)
+        if (rid !== null) curGroupTapeServerAgentGroupRunIds.add(rid)
       }
     } else if (cur && isAgentGroup(cur)) {
       // Non-server (client m-*) agent-group row — record its runId so the
@@ -1109,21 +1266,58 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   groupHasServerAsst.push(curGroupServerAsst)
   groupHasServerThinking.push(curGroupServerThinking)
   groupServerToolBlockIds.push(curGroupServerToolBlockIds)
+  groupHasCompleteTurnTape.push(curGroupHasCompleteTurnTape)
   groupClientAgentGroupRunIds.push(curGroupClientAgentGroupRunIds)
+  groupTapeServerAgentGroupRunIds.push(curGroupTapeServerAgentGroupRunIds)
+  groupTapeStructuredRoles.push(curGroupTapeStructuredRoles)
 
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
     const g = turnGroup[i]
-    // P2 债A — agent-group **local-wins**(与 assistant/thinking/tool 的
-    // server-wins 相反):当同组内存在同 runId 的本地 client agent-group 行时,
-    // 丢弃 server 行,保留本地富行(childBlocks 子树)。server 行只在本地行缺席
-    // (跨设备 / 清缓存 / 客户端 PUT 未落)时渲染,补齐团队历史。这条必须在下面
-    // "无条件保留 server 行"分支之前拦截,否则 server 行会与本地行重复出卡
-    // (2c73030d:禁止 role-mismatch server-wins 吞掉本地 agent-group 子树)。
+    // Hydrated tape records are a read projection returned to the browser.
+    // Never copy that projection back into the hot JSON tail on a later PUT;
+    // the complete anchor already rehydrates the same immutable records.
+    if (
+      (cur as { _turnTapeExpanded?: unknown })._turnTapeExpanded === true &&
+      groupHasCompleteTurnTape[g]
+    ) {
+      continue
+    }
+    // A complete turn-tape anchor is an atomic authority marker for every
+    // generated top-level row in this turn. Drop browser-streamed copies of
+    // all roles that the tape expands, regardless of their locally-generated
+    // ids/blockIds/runIds. This lets one constant-size hot anchor represent an
+    // arbitrarily large number of immutable records without a PUT erasing or
+    // duplicating them.
+    if (
+      cur._source !== 'server' &&
+      groupHasCompleteTurnTape[g] &&
+      (isAssistant(cur) || isThinking(cur) || isTool(cur) || isAgentGroup(cur))
+    ) {
+      continue
+    }
+    if (
+      cur._source !== 'server' &&
+      groupHasCompleteTurnTape[g] &&
+      typeof cur.role === 'string' &&
+      groupTapeStructuredRoles[g].has(cur.role)
+    ) {
+      continue
+    }
+    // A lossless tape-backed agent-group is authoritative and hydrates to the
+    // complete child transcript. Drop its matching client placeholder rather
+    // than letting a later PUT erase the durable reference.
+    if (cur._source !== 'server' && isAgentGroup(cur)) {
+      const rid = agentGroupRunId(cur)
+      if (rid !== null && groupTapeServerAgentGroupRunIds[g].has(rid)) continue
+    }
+    // Legacy server agent-group rows remain local-wins because they contain
+    // only a summary skeleton; this preserves the pre-tape contract.
     if (cur._source === 'server' && isAgentGroup(cur)) {
       const rid = agentGroupRunId(cur)
-      if (rid !== null && groupClientAgentGroupRunIds[g].has(rid)) {
+      const tapeBacked = typeof (cur as { _turnTapeId?: unknown })._turnTapeId === 'string'
+      if (!tapeBacked && rid !== null && groupClientAgentGroupRunIds[g].has(rid)) {
         continue // local rich row supersedes → drop server row
       }
       deduped.push(cur)
@@ -1607,7 +1801,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     // the single chokepoint for `_source/_seq/usage/_truncated/_errorCode/
     // _errorDetail/status='replied'/_rawMeta/...` rejection. See
     // _stripClientPutMessage above for the full deny/ephemeral matrix.
-    const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[])
+    const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[], oldMsgs)
     // PUT 防复活:剔除 id 已归档的 incoming 消息(客户端全量 PUT 会带回完整历史,含已搬走
     // 的归档行;不剔除则被重新并入 → 行回涨 → 又 spill,来回震荡)。见 _filterOutArchivedIncoming。
     const clientMsgs = _filterOutArchivedIncoming(db, session.id, clientMsgsRaw)
@@ -2079,6 +2273,8 @@ async function _sqliteAppendCostCredits(
   // drainDelegateCostForClientSession 据此按 agent 分组求和,产出队长助手行 usage.delegates[]
   // 的 per-agent 明细。纯展示投影 —— 不进任何扣费 WHERE,不影响 drain 的归并总额。
   delegateAgentId?: string | null,
+  turnKey?: string | null,
+  parentTurnKey?: string | null,
 ): Promise<AppendCostCreditsResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendCostCreditsResult => {
@@ -2142,15 +2338,28 @@ async function _sqliteAppendCostCredits(
     }
 
     db.prepare(
-      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, parent_session_id, delegate_agent_id, cost_credits)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO pending_usage_patches
+         (request_id, user_id, session_id, parent_session_id, delegate_agent_id,
+          turn_key, parent_turn_key, cost_credits)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (request_id, user_id) DO UPDATE SET
          cost_credits = excluded.cost_credits,
          session_id = excluded.session_id,
          parent_session_id = excluded.parent_session_id,
          delegate_agent_id = excluded.delegate_agent_id,
+         turn_key = excluded.turn_key,
+         parent_turn_key = excluded.parent_turn_key,
          created_at = (CAST(strftime('%s','now') AS INTEGER)*1000)`
-    ).run(requestId, userId, sessionId ?? null, parentSessionId ?? null, delegateAgentId ?? null, costCredits)
+    ).run(
+      requestId,
+      userId,
+      sessionId ?? null,
+      parentSessionId ?? null,
+      delegateAgentId ?? null,
+      turnKey ?? null,
+      parentTurnKey ?? null,
+      costCredits,
+    )
     return { applied: 'pending' }
   })
   return txn()
@@ -2311,7 +2520,8 @@ async function _sqliteSweepUsageAggregationGc(
 
     // Hard-delete rows older than 24h.
     const delPending = db.prepare(
-      'DELETE FROM pending_usage_patches WHERE created_at <= ?'
+      `DELETE FROM pending_usage_patches
+       WHERE created_at <= ? AND turn_key IS NULL AND parent_turn_key IS NULL`
     ).run(expiredThreshold)
 
     const delMap = db.prepare(

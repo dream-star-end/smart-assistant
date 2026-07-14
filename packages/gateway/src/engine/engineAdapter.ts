@@ -8,7 +8,7 @@
  *   - 'exit'       ({ code, signal, crashed })
  *   - 'error'      (err: Error)     底座进程级错误(spawn 失败等)
  *   - 'parse_error'({ line, err })  底座输出解析失败(CCB stdout 非法 JSONL)
- *   - 'overflow'   (info)           输出缓冲超限强杀
+ *   - 'overflow'   (info)           非用户可见 stderr 缓冲异常超限强杀
  *   - 'activity'   ()               底座每条原始消息(turn 内 30-min 硬背书 timer 的
  *                                   refresh 信号 —— 与旧 runner 'message' 逐条对齐,
  *                                   包括 parser 会忽略的消息)
@@ -19,10 +19,12 @@
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
+import type { OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
-import type { TurnModelAuthority } from '../subprocessRunner.js'
+import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
   EngineEvent,
+  DurableRuntimeEvent,
   PartialSnapshot,
   PhantomSignals,
   TurnSummary,
@@ -58,6 +60,12 @@ export interface TurnParams {
   input: string | Array<{ type: string; [k: string]: unknown }>
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
+  /** Stable logical paid-turn key shared by persistence and proxy billing. */
+  turnKey?: string
+  /** Trusted delegate billing attribution captured when the AgentSession was
+   * created. CCB already consumes this tag at runner spawn; engine-reported
+   * adapters carry it on their billing sideband. */
+  usageAttribution?: UsageAttributionTag
   /**
    * 模型权威批次 §4 —— 本 turn 的 master 签名 authority + turn lease bundle。
    *
@@ -75,10 +83,19 @@ export interface TurnParams {
   thinkingMessageId?: string
   /** V3 v7.1 — canonical tool row id factory。 */
   toolMessageIdFactory?: (blockId: string) => string
+  /** One turn-wide sequence shared by engine projections and delegation cards. */
+  nextDurableEventOrdinal?: () => number
   /** OpenClaude team-mode hint for Codex native collaboration tool calls. */
   collabAgentPolicy?: CollabAgentPolicy
   /** turn 事件流(内容事件 + tool_use/result_detected)。同步、按底座输出顺序回调。 */
   onEvent: (e: EngineEvent) => void
+  /** Runtime output that legitimately arrives after the engine's terminal
+   * result. The orchestrator must durably continue the finalized turn before
+   * surfacing the projected live block. */
+  onPostTerminalRuntimeEvent?: (
+    event: DurableRuntimeEvent,
+    block: OutboundContentBlock,
+  ) => void
   /**
    * Session 级跨 turn 累计(engine 中立;见 EngineSessionTotals)。CCB 路径
    * parser 直接 mutate 此引用(totalCostUSD += delta / turns += 1,另经
@@ -135,6 +152,11 @@ export interface EngineAdapter extends EventEmitter {
   /** 中断当前 turn(CCB: stdin control_request interrupt)。false = 无活进程。 */
   interrupt(): boolean
   shutdown(): Promise<void>
+  /** Resolves only after the current process generation's stdout has closed.
+   * `shutdown()` itself is deliberately bounded for process supervision, so
+   * terminal persistence must additionally await this barrier before freezing
+   * a paid turn's immutable tape. */
+  waitForOutputDrain(): Promise<void>
 
   // ── resume ──
   /** 底座原生可续传 id(CCB session_id / codex thread_id);未知为 null。 */

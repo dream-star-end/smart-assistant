@@ -1,9 +1,9 @@
 /**
- * P2 批次4 — 普通成员每 turn 委派上限 + effort 透传 + 回传输出封顶 的行为测试。
+ * P2 批次4 — 普通成员每 turn 委派上限 + effort 透传 + 回传输出无损 的行为测试。
  *
  * 沿用 hiddenDelegateLimit.test.ts 先例:`Object.create(Gateway.prototype)` + 手工 stub,
  * 直接驱动真实 handleDelegateTask / _runDelegateTask 方法体,断言行为(HTTP 状态/响应体/
- * 透传到 submit 的 effort/回传 output 是否封顶),不是源码正则。
+ * 透传到 submit 的 effort/回传 output 是否完整),不是源码正则。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/memberDelegateLimit.test.ts
  */
@@ -21,10 +21,7 @@ import {
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-member-limit'
 
-const ENV_KEYS = [
-  'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
-  'OPENCLAUDE_DELEGATE_OUTPUT_CAP',
-] as const
+const ENV_KEYS = ['OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN'] as const
 const ORIG_ENV: Record<string, string | undefined> = {}
 for (const k of ENV_KEYS) ORIG_ENV[k] = process.env[k]
 afterEach(() => {
@@ -67,7 +64,7 @@ function makeGateway(): any {
   gw._isIdempotencyDuplicate = () => false
   gw._markIdempotencyKey = () => {}
   gw._runLog = { start: () => ({}), complete: () => {} }
-  // 可控:提交时回传的文本(用于封顶测试)+ 捕获透传进来的 effortLevel。
+  // 可控:提交时回传的文本(用于无损测试)+ 捕获透传进来的 effortLevel。
   gw._submitOutputText = '子任务完成'
   gw._lastSubmitEffort = 'UNSET'
   gw.sessions = {
@@ -236,38 +233,26 @@ describe('effort 透传到 sessions.submit', () => {
   })
 })
 
-// ── 回传 output 兜底封顶 ─────────────────────────────────────────────────────
+// ── 回传 output 无损 ─────────────────────────────────────────────────────────
 
-describe('委派回传 output 封顶', () => {
-  it('普通成员超长回传被截断到默认 4000 字 + 尾注引导落文件', async () => {
+describe('委派回传 output 无损', () => {
+  it('普通成员超长回传完整交给队长', async () => {
     const gw = makeGateway()
-    gw._submitOutputText = 'A'.repeat(5000)
+    const full = 'A'.repeat(50_000)
+    gw._submitOutputText = full
     const r = await delegate(gw, 'coding-assistant', memberBody())
     assert.equal(r.status, 200)
-    assert.ok(r.body.output.length < 5000, '应被截断')
-    assert.ok(r.body.output.startsWith('A'.repeat(4000)), '保留前 4000 字')
-    assert.match(r.body.output, /\[输出过长已截断至 4000 字/)
-    assert.match(r.body.output, /generated\//)
+    assert.equal(r.body.output, full)
   })
 
-  it('短回传不被截断,不加尾注', async () => {
+  it('短回传原样保留', async () => {
     const gw = makeGateway()
     gw._submitOutputText = '简短结论'
     const r = await delegate(gw, 'coding-assistant', memberBody())
     assert.equal(r.body.output, '简短结论')
-    assert.doesNotMatch(r.body.output, /已截断/)
   })
 
-  it('env OPENCLAUDE_DELEGATE_OUTPUT_CAP 覆盖封顶阈值', async () => {
-    process.env.OPENCLAUDE_DELEGATE_OUTPUT_CAP = '1000'
-    const gw = makeGateway()
-    gw._submitOutputText = 'B'.repeat(3000)
-    const r = await delegate(gw, 'coding-assistant', memberBody())
-    assert.ok(r.body.output.startsWith('B'.repeat(1000)))
-    assert.match(r.body.output, /已截断至 1000 字/)
-  })
-
-  it('review 委派回传**不**封顶(要全量喂回队长续写)', async () => {
+  it('review 委派同样全量喂回队长续写', async () => {
     const gw = makeGateway()
     gw._submitOutputText = 'R'.repeat(6000)
     // 直接驱动内部编排入口 _runDelegateTask(isReview:true);HTTP 路径永不置 isReview。
@@ -282,6 +267,5 @@ describe('委派回传 output 封顶', () => {
     })
     assert.equal(result.kind, 'completed')
     assert.equal(result.output.length, 6000, 'review 输出必须全量保留')
-    assert.doesNotMatch(result.output, /已截断/)
   })
 })

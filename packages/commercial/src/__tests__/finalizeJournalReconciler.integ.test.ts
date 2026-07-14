@@ -16,6 +16,7 @@ import {
   gcFinalizeJournal,
   reconcileStuckFinalizeJournal,
 } from '../billing/finalizeJournalReconciler.js'
+import { DURABLE_CODEX_RECOVERY_VERSION } from '../billing/codexFinalizer.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
@@ -134,15 +135,25 @@ async function insertUsage(
 async function insertJournal(
   requestId: string,
   userId: bigint,
-  opts: { state?: string; ageMs?: number; precheck?: bigint } = {},
+  opts: { state?: string; ageMs?: number; precheck?: bigint; durable?: boolean } = {},
 ): Promise<void> {
   const state = opts.state ?? 'inflight'
   const ageMs = opts.ageMs ?? 0
   const precheck = opts.precheck ?? 200n
   await query(
     `INSERT INTO request_finalize_journal(request_id, user_id, ctx, precheck_credits, state, updated_at)
-     VALUES ($1, $2, '{"model":"claude-x"}'::jsonb, $3, $4, NOW() - ($5::bigint * INTERVAL '1 millisecond'))`,
-    [requestId, userId.toString(), precheck.toString(), state, String(ageMs)],
+     VALUES ($1, $2, $3::jsonb, $4, $5, NOW() - ($6::bigint * INTERVAL '1 millisecond'))`,
+    [
+      requestId,
+      userId.toString(),
+      JSON.stringify({
+        model: 'claude-x',
+        ...(opts.durable ? { durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION } : {}),
+      }),
+      precheck.toString(),
+      state,
+      String(ageMs),
+    ],
   )
 }
 
@@ -225,6 +236,19 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     assert.equal((await getJournal('r4'))?.state, 'inflight')
   })
 
+  test('durable Codex journal 无 usage 时不按年龄 abort', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('durable@t.co')
+    await insertJournal('r-durable', u, {
+      state: 'inflight',
+      ageMs: STUCK_MS,
+      durable: true,
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.equal(res.aborted, 0)
+    assert.equal((await getJournal('r-durable'))?.state, 'inflight')
+  })
+
   test('已终态行(committed/aborted)不被重复处理', async (t) => {
     if (skipIfNoPg(t)) return
     const u = await createUser('e@t.co')
@@ -261,5 +285,17 @@ describe('gcFinalizeJournal (integ)', () => {
     // fresh 终态 + 老 inflight 仍在
     assert.equal((await getJournal('g4'))?.state, 'committed')
     assert.equal((await getJournal('g5'))?.state, 'inflight')
+  })
+
+  test('durable Codex terminal decision is not TTL-GC\'d', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('durable-gc@t.co')
+    await insertJournal('g-durable', u, {
+      state: 'committed',
+      ageMs: OLD_TERMINAL_MS,
+      durable: true,
+    })
+    assert.equal(await gcFinalizeJournal(GC_AGE_MS, 10), 0)
+    assert.equal((await getJournal('g-durable'))?.state, 'committed')
   })
 })

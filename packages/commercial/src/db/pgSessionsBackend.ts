@@ -40,6 +40,13 @@
 //     Number()+MAX_SAFE_INTEGER 断言;**不改全局 type parser**(不影响 commercial 其它模块)。
 
 import type { Pool, PoolClient } from "pg";
+import { createHash } from "node:crypto";
+import {
+  LOSSLESS_TURN_TAPE_SHA256_RE,
+  type DurableCodexBilling,
+  type LosslessTurnTapeFinalizeRequest,
+  type LosslessTurnTapePartRequest,
+} from "@openclaude/protocol";
 import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
@@ -54,6 +61,7 @@ import {
   mergePreservingServerAuthored,
   normalizeAndAssignSeqs,
   planAppendServerAuthored,
+  planAppendServerAuthoredBatch,
   planCostPatch,
   planDelegateCostMerge,
   planSpillOverflow,
@@ -67,6 +75,10 @@ import {
   WechatAccountAlreadyBoundError,
   type WechatBinding,
 } from "@openclaude/storage";
+import {
+  materializeLosslessTurn,
+  type LosslessTurnRecord,
+} from "../http/losslessTurnTape.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -120,6 +132,83 @@ async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Pr
     throw err;
   } finally {
     if (!destroyed) client.release();
+  }
+}
+
+/**
+ * Stage an exact turn-cost locator on the caller's existing billing
+ * transaction. Keeping the SQL here preserves the sessions-backend ownership
+ * boundary while allowing the ledger debit and its refresh-visible locator to
+ * commit atomically.
+ */
+export async function stageUsageCostLocatorInBillingTransaction(
+  client: PoolClient,
+  args: {
+    requestId: string;
+    userId: string;
+    sessionId: string | null;
+    parentSessionId: string | null;
+    delegateAgentId: string | null;
+    turnKey: string | null;
+    parentTurnKey: string | null;
+    costCredits: bigint;
+  },
+): Promise<void> {
+  const targetTurnKey = args.parentTurnKey ?? args.turnKey;
+  if (targetTurnKey === null || !/^[0-9a-f]{64}$/.test(targetTurnKey)) {
+    throw new Error("stageUsageCostLocator: invalid lossless turn key");
+  }
+  if (args.turnKey !== null && !/^[0-9a-f]{64}$/.test(args.turnKey)) {
+    throw new Error("stageUsageCostLocator: invalid turnKey");
+  }
+  if (args.parentTurnKey !== null && !/^[0-9a-f]{64}$/.test(args.parentTurnKey)) {
+    throw new Error("stageUsageCostLocator: invalid parentTurnKey");
+  }
+  const inserted = await client.query(
+    `INSERT INTO pending_usage_patches
+       (request_id,user_id,session_id,parent_session_id,delegate_agent_id,
+        turn_key,parent_turn_key,cost_credits)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (request_id,user_id) DO NOTHING`,
+    [
+      args.requestId,
+      args.userId,
+      args.sessionId,
+      args.parentSessionId,
+      args.delegateAgentId,
+      args.turnKey,
+      args.parentTurnKey,
+      args.costCredits.toString(),
+    ],
+  );
+  if ((inserted.rowCount ?? 0) !== 0) return;
+
+  const existing = (
+    await client.query<{
+      session_id: string | null;
+      parent_session_id: string | null;
+      delegate_agent_id: string | null;
+      turn_key: string | null;
+      parent_turn_key: string | null;
+      cost_credits: string;
+    }>(
+      `SELECT session_id,parent_session_id,delegate_agent_id,turn_key,
+              parent_turn_key,cost_credits
+         FROM pending_usage_patches
+        WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+      [args.requestId, args.userId],
+    )
+  ).rows[0];
+  if (
+    !existing ||
+    existing.session_id !== args.sessionId ||
+    existing.parent_session_id !== args.parentSessionId ||
+    existing.delegate_agent_id !== args.delegateAgentId ||
+    existing.turn_key !== args.turnKey ||
+    existing.parent_turn_key !== args.parentTurnKey ||
+    BigInt(existing.cost_credits) !== args.costCredits
+  ) {
+    throw new Error("stageUsageCostLocator: immutable lossless cost locator conflict");
   }
 }
 
@@ -367,6 +456,14 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["pending_usage_patches", "request_id", "text"],
   ["pending_usage_patches", "cost_credits", "text"],
   ["pending_usage_patches", "created_at", "bigint"],
+  ["pending_usage_patches", "turn_key", "text"],
+  ["client_session_turn_tapes", "tape_id", "text"],
+  ["client_session_turn_tapes", "turn_key", "text"],
+  ["client_session_turn_tapes", "engine_billings", "jsonb"],
+  ["client_session_turn_tape_parts", "payload", "bytea"],
+  ["client_session_turn_tape_records", "payload", "bytea"],
+  ["server_authored_turn_anchor_map", "turn_key", "text"],
+  ["turn_tape_cost_components", "request_id", "text"],
   ["wechat_bindings", "user_id", "text"],
   ["wechat_bindings", "account_id", "text"],
   ["wechat_bindings", "bot_token", "text"],
@@ -377,6 +474,300 @@ export interface PgSessionsBackendOptions {
   expectedGeneration: number;
 }
 
+export type LosslessTurnTapeStageResult =
+  | { applied: "stored" | "idempotent" }
+  | { applied: "session_not_found" | "session_deleted" };
+
+export type LosslessTurnTapeFinalizeResult =
+  | {
+      applied: "finalized" | "idempotent";
+      recordCount: number;
+      engineBillings: DurableCodexBilling[];
+    }
+  | { applied: "session_not_found" | "session_deleted" | "incomplete" };
+
+export interface LosslessTurnTapeStorage {
+  stageLosslessTurnTapePart(
+    userId: string,
+    request: LosslessTurnTapePartRequest,
+    payload: Buffer,
+  ): Promise<LosslessTurnTapeStageResult>;
+  finalizeLosslessTurnTape(
+    userId: string,
+    request: LosslessTurnTapeFinalizeRequest,
+  ): Promise<LosslessTurnTapeFinalizeResult>;
+}
+
+export type PgSessionsBackend = ClientSessionsBackend & LosslessTurnTapeStorage;
+
+function sha256Bytes(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function tapeAnchor(
+  billingRecord: LosslessTurnRecord,
+  tapeId: string,
+  tapeSha256: string,
+  recordCount: number,
+  structuredRoles: string[],
+): MessageLike & { id: string } {
+  return {
+    // Reuse the billing record id so legacy request-id cost patching and the
+    // exact turn-key map both have one stable hot-row locator.
+    id: billingRecord.id,
+    role: billingRecord.role,
+    ts: billingRecord.ts,
+    _source: "server",
+    _turnTapeId: tapeId,
+    _turnTapeSha256: tapeSha256,
+    _turnTapeComplete: true,
+    _turnTapeRecordCount: recordCount,
+    ...(structuredRoles.length > 0 ? { _turnTapeStructuredRoles: structuredRoles } : {}),
+  };
+}
+
+type HydratedTapeRow = {
+  tape_id: string;
+  tape_sha256: string;
+  msg_id: string;
+  ordinal: number;
+  content_sha256: string;
+  payload: Buffer;
+  cost_credits: string;
+  delegate_costs: unknown;
+};
+
+function hydrateTapeRecord(
+  row: HydratedTapeRow,
+  anchor: MessageLike,
+  requireRecordHash: boolean,
+): MessageLike {
+  const payloadBytes = Buffer.from(row.payload);
+  const actualSha = sha256Bytes(payloadBytes);
+  if (
+    actualSha !== row.content_sha256 ||
+    (requireRecordHash && actualSha !== anchor._turnTapeSha256)
+  ) {
+    throw new Error(`[pgSessions] lossless turn tape record hash mismatch: ${row.tape_id}\0${row.msg_id}`);
+  }
+  let full: MessageLike;
+  try {
+    const parsed = JSON.parse(payloadBytes.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    full = parsed as MessageLike;
+  } catch (err) {
+    throw new Error(
+      `[pgSessions] lossless turn tape record malformed: ${row.tape_id}\0${row.msg_id}: ${(err as Error).message}`,
+    );
+  }
+  const recordUsage = full.usage && typeof full.usage === "object"
+    ? full.usage as Record<string, unknown>
+    : {};
+  const anchorUsage = full.id === anchor.id && anchor.usage && typeof anchor.usage === "object"
+    ? anchor.usage as Record<string, unknown>
+    : {};
+  const exactCostUsage = BigInt(row.cost_credits) > 0n ? { costCredits: row.cost_credits } : {};
+  const exactDelegates = Array.isArray(row.delegate_costs)
+    ? row.delegate_costs.flatMap((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+        const item = value as Record<string, unknown>;
+        return typeof item.agentId === "string" &&
+          typeof item.costCredits === "string" && /^\d+$/.test(item.costCredits)
+          ? [{ agentId: item.agentId, costCredits: item.costCredits }]
+          : [];
+      })
+    : [];
+  const exactDelegateUsage = exactDelegates.length > 0 ? { delegates: exactDelegates } : {};
+  return {
+    ...full,
+    _source: "server",
+    // Hydration is a read projection, not another hot-row authority record.
+    // Mark expanded rows so a later browser PUT can discard them and keep the
+    // single constant-size tape anchor instead of copying all generated bytes
+    // back into client_sessions.messages.
+    _turnTapeId: row.tape_id,
+    _turnTapeMsgId: row.msg_id,
+    _turnTapeSha256: row.tape_sha256,
+    _turnTapeExpanded: true,
+    // A tape is one atomic sync unit. Expanded records intentionally share
+    // its anchor sequence: partial sync either returns every record or none.
+    ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+    ...(Object.keys(recordUsage).length > 0 ||
+        Object.keys(anchorUsage).length > 0 ||
+        Object.keys(exactCostUsage).length > 0 ||
+        Object.keys(exactDelegateUsage).length > 0
+      ? { usage: { ...recordUsage, ...anchorUsage, ...exactCostUsage, ...exactDelegateUsage } }
+      : {}),
+  };
+}
+
+async function hydrateTurnTapeMessages(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  messages: MessageLike[],
+): Promise<MessageLike[]> {
+  const refs = messages.filter(
+    (m) =>
+      m &&
+      typeof m._turnTapeId === "string" &&
+      typeof m._turnTapeSha256 === "string",
+  );
+  if (refs.length === 0) return messages;
+  const tapeIds = [...new Set(refs.map((m) => m._turnTapeId as string))];
+  const rows = (
+    await pool.query<HydratedTapeRow>(
+      `SELECT r.tape_id, t.tape_sha256, r.msg_id, r.ordinal,
+              r.content_sha256, r.payload,
+              COALESCE((
+                SELECT SUM(exact_cost.cost_credits)::text
+                  FROM (
+                    SELECT c.cost_credits::numeric AS cost_credits
+                      FROM turn_tape_cost_components c
+                     WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                       AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                    UNION ALL
+                    SELECT p.cost_credits::numeric AS cost_credits
+                      FROM pending_usage_patches p
+                     WHERE p.user_id=r.user_id
+                       AND r.msg_id=t.billing_anchor_id
+                       AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                  ) exact_cost
+              ), '0') AS cost_credits,
+              COALESCE((
+                SELECT jsonb_agg(
+                         jsonb_build_object(
+                           'agentId', grouped.delegate_agent_id,
+                           'costCredits', grouped.cost_credits
+                         ) ORDER BY grouped.delegate_agent_id
+                       )
+                  FROM (
+                    SELECT exact_delegate.delegate_agent_id,
+                           SUM(exact_delegate.cost_credits)::text AS cost_credits
+                      FROM (
+                        SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                        UNION ALL
+                        SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                          FROM pending_usage_patches p
+                         WHERE p.user_id=r.user_id
+                           AND r.msg_id=t.billing_anchor_id
+                           AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                      ) exact_delegate
+                     WHERE exact_delegate.delegate_agent_id IS NOT NULL
+                     GROUP BY exact_delegate.delegate_agent_id
+                  ) grouped
+              ), '[]'::jsonb) AS delegate_costs
+         FROM client_session_turn_tape_records r
+         JOIN client_session_turn_tapes t
+           ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+        WHERE r.session_id = $1 AND r.user_id = $2 AND r.tape_id = ANY($3::text[])
+        ORDER BY r.tape_id, r.ordinal`,
+      [sessionId, userId, tapeIds],
+    )
+  ).rows;
+  const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
+  const byTape = new Map<string, HydratedTapeRow[]>();
+  for (const row of rows) {
+    const tapeRows = byTape.get(row.tape_id) ?? [];
+    tapeRows.push(row);
+    byTape.set(row.tape_id, tapeRows);
+  }
+
+  const hydrated = messages.flatMap((anchor) => {
+    if (
+      typeof anchor?._turnTapeId !== "string" ||
+      typeof anchor?._turnTapeSha256 !== "string"
+    ) {
+      return [anchor];
+    }
+    if (anchor._turnTapeComplete === true) {
+      const tapeRows = byTape.get(anchor._turnTapeId);
+      if (!tapeRows || tapeRows.length === 0) {
+        throw new Error(`[pgSessions] lossless turn tape records missing: ${anchor._turnTapeId}`);
+      }
+      const expectedCount = anchor._turnTapeRecordCount;
+      if (
+        typeof expectedCount !== "number" ||
+        !Number.isSafeInteger(expectedCount) ||
+        expectedCount <= 0 ||
+        tapeRows.length !== expectedCount
+      ) {
+        throw new Error(`[pgSessions] lossless turn tape record count mismatch: ${anchor._turnTapeId}`);
+      }
+      if (tapeRows.some((row) => row.tape_sha256 !== anchor._turnTapeSha256)) {
+        throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
+      }
+      return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false));
+    }
+
+    // Rolling compatibility with any per-record refs staged by an earlier
+    // pre-release runtime build.
+    if (typeof anchor._turnTapeMsgId !== "string") {
+      throw new Error(`[pgSessions] lossless turn tape anchor malformed: ${anchor._turnTapeId}`);
+    }
+    const key = `${anchor._turnTapeId}\0${anchor._turnTapeMsgId}`;
+    const row = byKey.get(key);
+    if (!row) throw new Error(`[pgSessions] lossless turn tape record missing: ${key}`);
+    return [hydrateTapeRecord(row, anchor, true)];
+  });
+
+  // A CCB background Bash process can emit tail snapshots after its owning
+  // model turn has finalized. Those exact raw messages live in immutable
+  // runtime-event continuation tapes. Reapply every monotonic snapshot to the
+  // same tool projection the live reducer updated, while retaining the hidden
+  // runtime-event rows themselves for byte-exact inspection/replay.
+  const topLevelTools = new Map<string, MessageLike>();
+  const childTools = new Map<string, Record<string, unknown>>();
+  const indexChildTools = (blocks: unknown): void => {
+    if (!Array.isArray(blocks)) return;
+    for (const rawBlock of blocks) {
+      if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) continue;
+      const block = rawBlock as Record<string, unknown>;
+      if (block.kind === "tool_use" && typeof block.blockId === "string") {
+        childTools.set(block.blockId, block);
+      }
+      indexChildTools(block.childBlocks);
+    }
+  };
+  for (const message of hydrated) {
+    if (message.role === "tool" && typeof message.blockId === "string") {
+      topLevelTools.set(message.blockId, message);
+    }
+    indexChildTools(message.childBlocks);
+  }
+  for (const message of hydrated) {
+    if (message.role !== "runtime-event") continue;
+    const runtime = message._runtimeEvent;
+    if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) continue;
+    const raw = runtime as Record<string, unknown>;
+    if (raw.type !== "system" || raw.subtype !== "bash_output_tail") continue;
+    const toolUseId = raw.tool_use_id;
+    if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
+    const target = typeof raw.parent_tool_use_id === "string" && raw.parent_tool_use_id.length > 0
+      ? childTools.get(toolUseId)
+      : topLevelTools.get(toolUseId) ?? childTools.get(toolUseId);
+    if (!target) continue;
+    const totalBytes = typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
+      ? raw.total_bytes
+      : 0;
+    const previous = target.bashTail;
+    const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
+      typeof (previous as Record<string, unknown>).totalBytes === "number"
+      ? (previous as Record<string, unknown>).totalBytes as number
+      : 0;
+    if (totalBytes < previousBytes) continue;
+    target.bashTail = {
+      tail: typeof raw.tail === "string" ? raw.tail : "",
+      totalBytes,
+      truncatedHead: raw.truncated_head === true,
+    };
+  }
+  return hydrated;
+}
+
 /**
  * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`(27 方法),
  * 由 registerCommercial 注入。方法内闭包持有 pool。
@@ -384,10 +775,463 @@ export interface PgSessionsBackendOptions {
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
-): ClientSessionsBackend {
+): PgSessionsBackend {
   const expectedGeneration = options.expectedGeneration;
 
-  const backend: ClientSessionsBackend = {
+  const backend: PgSessionsBackend = {
+    async stageLosslessTurnTapePart(
+      userId: string,
+      request: LosslessTurnTapePartRequest,
+      payload: Buffer,
+    ): Promise<LosslessTurnTapeStageResult> {
+      return withTx(pool, async (client) => {
+        const session = (
+          await client.query<{ deleted_at: string | null }>(
+            "SELECT deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            [request.sessionId, userId],
+          )
+        ).rows[0];
+        if (!session) return { applied: "session_not_found" };
+        if (session.deleted_at !== null) return { applied: "session_deleted" };
+
+        const existingTape = (
+          await client.query<{
+            agent_id: string;
+            turn_index: number;
+            status: string;
+            turn_key: string;
+            tape_sha256: string;
+            total_bytes: string;
+            part_count: number;
+            created_at: string;
+          }>(
+            `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
+                    total_bytes, part_count, created_at
+               FROM client_session_turn_tapes
+              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
+              FOR UPDATE`,
+            [request.sessionId, userId, request.tapeId],
+          )
+        ).rows[0];
+        if (existingTape) {
+          const same =
+            existingTape.agent_id === request.agentId &&
+            existingTape.turn_index === request.turnIndex &&
+            existingTape.status === request.status &&
+            existingTape.turn_key === request.turnKey &&
+            existingTape.tape_sha256 === request.tapeSha256 &&
+            bigIntNum(existingTape.total_bytes, "turn_tape.total_bytes") === request.totalBytes &&
+            existingTape.part_count === request.partCount &&
+            bigIntNum(existingTape.created_at, "turn_tape.created_at") === request.createdAt;
+          if (!same) throw new Error("lossless turn tape immutable header conflict");
+        } else {
+          await client.query(
+            `INSERT INTO client_session_turn_tapes
+               (session_id, user_id, tape_id, agent_id, turn_index, status,
+                turn_key, tape_sha256, total_bytes, part_count, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+            [
+              request.sessionId,
+              userId,
+              request.tapeId,
+              request.agentId,
+              request.turnIndex,
+              request.status,
+              request.turnKey,
+              request.tapeSha256,
+              request.totalBytes,
+              request.partCount,
+              request.createdAt,
+            ],
+          );
+        }
+
+        const existingPart = (
+          await client.query<{ part_sha256: string; payload: Buffer }>(
+            `SELECT part_sha256, payload
+               FROM client_session_turn_tape_parts
+              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3 AND part_index = $4
+              FOR UPDATE`,
+            [request.sessionId, userId, request.tapeId, request.partIndex],
+          )
+        ).rows[0];
+        if (existingPart) {
+          const same =
+            existingPart.part_sha256 === request.partSha256 &&
+            Buffer.from(existingPart.payload).equals(payload);
+          if (!same) throw new Error("lossless turn tape immutable part conflict");
+          return { applied: "idempotent" };
+        }
+        await client.query(
+          `INSERT INTO client_session_turn_tape_parts
+             (session_id, user_id, tape_id, part_index, part_sha256, payload, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [request.sessionId, userId, request.tapeId, request.partIndex, request.partSha256, payload, Date.now()],
+        );
+        return { applied: "stored" };
+      });
+    },
+
+    async finalizeLosslessTurnTape(
+      userId: string,
+      request: LosslessTurnTapeFinalizeRequest,
+    ): Promise<LosslessTurnTapeFinalizeResult> {
+      return withTx(pool, async (client) => {
+        // Serializes "cost parks while tape finalizes" on the logical turn.
+        await requestAdvisoryXactLock(client, userId, `turn:${request.turnKey}`);
+        const session = (
+          await client.query<SessionWriteRow>(
+            `SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count
+               FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+            [request.sessionId, userId],
+          )
+        ).rows[0];
+        if (!session) return { applied: "session_not_found" };
+        if (session.deleted_at !== null) return { applied: "session_deleted" };
+
+        const tape = (
+          await client.query<{
+            agent_id: string;
+            turn_index: number;
+            status: string;
+            turn_key: string;
+            tape_sha256: string;
+            total_bytes: string;
+            part_count: number;
+            created_at: string;
+            finalized_at: string | null;
+            engine_billings: unknown;
+          }>(
+            `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
+                    total_bytes, part_count, created_at, finalized_at, engine_billings
+               FROM client_session_turn_tapes
+              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
+              FOR UPDATE`,
+            [request.sessionId, userId, request.tapeId],
+          )
+        ).rows[0];
+        if (!tape) return { applied: "incomplete" };
+        const sameHeader =
+          tape.agent_id === request.agentId &&
+          tape.turn_index === request.turnIndex &&
+          tape.status === request.status &&
+          tape.turn_key === request.turnKey &&
+          tape.tape_sha256 === request.tapeSha256 &&
+          bigIntNum(tape.total_bytes, "turn_tape.total_bytes") === request.totalBytes &&
+          tape.part_count === request.partCount &&
+          bigIntNum(tape.created_at, "turn_tape.created_at") === request.createdAt;
+        if (!sameHeader) throw new Error("lossless turn tape finalize header conflict");
+        if (tape.finalized_at !== null) {
+          const count = await client.query<{ count: string }>(
+            `SELECT COUNT(*)::text AS count FROM client_session_turn_tape_records
+              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3`,
+            [request.sessionId, userId, request.tapeId],
+          );
+          if (!Array.isArray(tape.engine_billings)) {
+            throw new Error("lossless turn tape finalized engine billings malformed");
+          }
+          return {
+            applied: "idempotent",
+            recordCount: Number(count.rows[0]?.count ?? 0),
+            engineBillings: structuredClone(tape.engine_billings) as DurableCodexBilling[],
+          };
+        }
+
+        const parts = (
+          await client.query<{ part_index: number; part_sha256: string; payload: Buffer }>(
+            `SELECT part_index, part_sha256, payload
+               FROM client_session_turn_tape_parts
+              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
+              ORDER BY part_index FOR UPDATE`,
+            [request.sessionId, userId, request.tapeId],
+          )
+        ).rows;
+        if (parts.length !== request.partCount) return { applied: "incomplete" };
+        const chunks: Buffer[] = [];
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i]!;
+          if (part.part_index !== i) return { applied: "incomplete" };
+          const bytes = Buffer.from(part.payload);
+          if (sha256Bytes(bytes) !== part.part_sha256) throw new Error("lossless turn tape part hash mismatch");
+          chunks.push(bytes);
+        }
+        const canonical = Buffer.concat(chunks);
+        if (canonical.length !== request.totalBytes || sha256Bytes(canonical) !== request.tapeSha256) {
+          throw new Error("lossless turn tape aggregate hash mismatch");
+        }
+        let rawPayload: unknown;
+        try {
+          rawPayload = JSON.parse(canonical.toString("utf8"));
+        } catch (err) {
+          throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
+        }
+        const turn = materializeLosslessTurn(rawPayload);
+        if (
+          turn.payload.sessionId !== request.sessionId ||
+          turn.payload.agentId !== request.agentId ||
+          turn.payload.turnIndex !== request.turnIndex ||
+          turn.payload.status !== request.status ||
+          turn.payload.turnKey !== request.turnKey
+        ) {
+          throw new Error("lossless turn tape envelope/payload identity mismatch");
+        }
+
+        for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
+          const item = turn.records[ordinal]!;
+          const inserted = await client.query(
+            `INSERT INTO client_session_turn_tape_records
+               (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (session_id,user_id,tape_id,msg_id) DO NOTHING`,
+            [
+              request.sessionId,
+              userId,
+              request.tapeId,
+              item.id,
+              ordinal,
+              item.role,
+              item.ts,
+              item.payloadSha256,
+              item.payloadBytes,
+            ],
+          );
+          if ((inserted.rowCount ?? 0) === 0) {
+            const existing = (
+              await client.query<{ ordinal: number; content_sha256: string }>(
+                `SELECT ordinal, content_sha256 FROM client_session_turn_tape_records
+                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4`,
+                [request.sessionId, userId, request.tapeId, item.id],
+              )
+            ).rows[0];
+            if (!existing || existing.ordinal !== ordinal || existing.content_sha256 !== item.payloadSha256) {
+              throw new Error("lossless turn tape immutable record conflict");
+            }
+          }
+        }
+
+        type PendingTapeCost = {
+          request_id: string;
+          cost_credits: string;
+          delegate_agent_id: string | null;
+        };
+        // Continuation tapes carry post-terminal runtime output only. They
+        // share the chat session with the paid turn but must never consume a
+        // legacy by-session pending cost intended for that original turn.
+        const pending: PendingTapeCost[] = turn.payload.continuationOfTurnKey
+          ? []
+          : (
+          await client.query<PendingTapeCost>(
+            `SELECT request_id, cost_credits, delegate_agent_id
+               FROM pending_usage_patches
+              WHERE user_id = $1 AND (
+                    turn_key = $2 OR parent_turn_key = $2
+                    OR (turn_key IS NULL AND parent_turn_key IS NULL AND request_id = $3)
+                    OR (turn_key IS NULL AND parent_turn_key IS NULL AND session_id = $4)
+                    OR (turn_key IS NULL AND parent_turn_key IS NULL AND parent_session_id = $5)
+                  )
+              ORDER BY request_id FOR UPDATE`,
+            [
+              userId,
+              request.turnKey,
+              turn.payload.requestId ?? "",
+              turn.payload.agentSessionId ?? "",
+              request.sessionId,
+            ],
+          )
+        ).rows;
+        for (const cost of pending) {
+          const inserted = await client.query(
+            `INSERT INTO turn_tape_cost_components
+               (request_id,user_id,session_id,tape_id,billing_anchor_id,cost_credits,delegate_agent_id,updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT (request_id,user_id) DO NOTHING`,
+            [
+              cost.request_id,
+              userId,
+              request.sessionId,
+              request.tapeId,
+              turn.billingAnchorId,
+              cost.cost_credits,
+              cost.delegate_agent_id,
+              Date.now(),
+            ],
+          );
+          if ((inserted.rowCount ?? 0) === 0) {
+            const existing = (
+              await client.query<{
+                session_id: string;
+                tape_id: string;
+                billing_anchor_id: string;
+                cost_credits: string;
+                delegate_agent_id: string | null;
+              }>(
+                `SELECT session_id,tape_id,billing_anchor_id,cost_credits::text,delegate_agent_id
+                   FROM turn_tape_cost_components
+                  WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+                [cost.request_id, userId],
+              )
+            ).rows[0];
+            if (
+              !existing ||
+              existing.session_id !== request.sessionId ||
+              existing.tape_id !== request.tapeId ||
+              existing.billing_anchor_id !== turn.billingAnchorId ||
+              BigInt(existing.cost_credits) !== BigInt(cost.cost_credits) ||
+              existing.delegate_agent_id !== cost.delegate_agent_id
+            ) {
+              throw new Error("lossless turn tape cost component immutable conflict");
+            }
+          }
+        }
+        const billingRecord = turn.records.find((item) => item.id === turn.billingAnchorId);
+        if (!billingRecord) throw new Error("lossless turn tape billing record missing");
+        const anchors = [
+          tapeAnchor(
+            billingRecord,
+            request.tapeId,
+            request.tapeSha256,
+            turn.records.length,
+            [...new Set(turn.records
+              .map((item) => item.role)
+              .filter((role) => role === "plan" || role === "goal"))],
+          ),
+        ];
+        // Exactly one small hot anchor represents the whole turn. Full usage,
+        // records, generated content, and exact cost components stay out of
+        // line and are merged during hydration. Segment/tool count therefore
+        // cannot recreate the hot-row byte cap.
+
+        let existingMessages: MessageLike[];
+        try {
+          const parsed = JSON.parse(session.messages);
+          if (!Array.isArray(parsed)) throw new Error("not array");
+          existingMessages = parsed as MessageLike[];
+        } catch {
+          throw new Error("lossless turn tape target session row malformed");
+        }
+        const archived = await client.query<{ msg_id: string }>(
+          `SELECT msg_id FROM client_session_archived_ids
+            WHERE session_id=$1 AND msg_id = ANY($2::text[])`,
+          [request.sessionId, turn.records.map((item) => item.id)],
+        );
+        if (archived.rows.length > 0) throw new Error("lossless turn tape record id collides with archived row");
+        // Rolling v1→v2 replay: an old runtime may have committed the same
+        // deterministic server-authored ids through the legacy endpoint but
+        // lost its ACK. The upgraded runtime retries as a tape. Replace those
+        // hot legacy projections with the single tape anchor; keeping both
+        // would make hydration return duplicate paid records. Archived
+        // collisions stay fail-closed above because rewriting archive chunks
+        // is not part of this atomic finalize operation.
+        const recordIds = new Set(turn.records.map((item) => item.id));
+        existingMessages = existingMessages.filter(
+          (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+        );
+        const plan = planAppendServerAuthoredBatch(
+          existingMessages,
+          anchors,
+          typeof session.next_seq === "number" && session.next_seq > 0 ? session.next_seq : 1,
+          bigIntNumOr(session.archived_through_seq, 0),
+        );
+        if (plan.kind === "oversized") throw new Error("lossless turn tape anchor tail unexpectedly oversized");
+        if (plan.kind === "write") {
+          const nowMs = Date.now();
+          const archivedDelta = await execPgSpillPlan(
+            client,
+            request.sessionId,
+            userId,
+            plan.chunksToInsert,
+            plan.idsToInsert,
+            nowMs,
+          );
+          const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
+          await client.query(
+            `UPDATE client_sessions SET
+               messages=$1, message_count=$2, last_at=$3,
+               updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+               next_seq=$4, archived_through_seq=$5, archived_count=$6
+             WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
+            [
+              plan.finalJson,
+              plan.tail.length + archivedCount,
+              nowMs,
+              plan.nextSeq,
+              plan.archivedThroughSeq,
+              archivedCount,
+              request.sessionId,
+              userId,
+            ],
+          );
+        }
+
+        if (!turn.payload.continuationOfTurnKey) {
+          const mapInsert = await client.query(
+            `INSERT INTO server_authored_turn_anchor_map
+               (user_id,turn_key,session_id,tape_id,billing_anchor_id,written_at)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (user_id,turn_key) DO NOTHING`,
+            [userId, request.turnKey, request.sessionId, request.tapeId, turn.billingAnchorId, Date.now()],
+          );
+          if ((mapInsert.rowCount ?? 0) === 0) {
+            const map = (
+              await client.query<{ session_id: string; tape_id: string; billing_anchor_id: string }>(
+                `SELECT session_id,tape_id,billing_anchor_id FROM server_authored_turn_anchor_map
+                  WHERE user_id=$1 AND turn_key=$2 FOR UPDATE`,
+                [userId, request.turnKey],
+              )
+            ).rows[0];
+            if (!map || map.session_id !== request.sessionId || map.tape_id !== request.tapeId || map.billing_anchor_id !== turn.billingAnchorId) {
+              throw new Error("lossless turn tape turnKey mapping conflict");
+            }
+          }
+        }
+        if (turn.payload.requestId) {
+          const requestMap = await client.query(
+            `INSERT INTO server_authored_request_map (request_id,user_id,session_id,msg_id)
+             VALUES ($1,$2,$3,$4) ON CONFLICT (request_id,user_id) DO NOTHING`,
+            [turn.payload.requestId, userId, request.sessionId, turn.billingAnchorId],
+          );
+          if ((requestMap.rowCount ?? 0) === 0) {
+            const existing = (
+              await client.query<{ session_id: string; msg_id: string }>(
+                `SELECT session_id,msg_id FROM server_authored_request_map
+                  WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+                [turn.payload.requestId, userId],
+              )
+            ).rows[0];
+            if (!existing || existing.session_id !== request.sessionId || existing.msg_id !== turn.billingAnchorId) {
+              throw new Error("lossless turn tape request mapping conflict");
+            }
+          }
+        }
+        for (const cost of pending) {
+          await client.query(
+            "DELETE FROM pending_usage_patches WHERE user_id=$1 AND request_id=$2",
+            [userId, cost.request_id],
+          );
+        }
+        await client.query(
+          `UPDATE client_session_turn_tapes
+              SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
+                  engine_billings=$4, finalized_at=$5
+            WHERE session_id=$6 AND user_id=$7 AND tape_id=$8`,
+          [
+            turn.billingAnchorId,
+            JSON.stringify(turn.payload.usage ?? {}),
+            turn.payload.parentTurnKey ?? null,
+            JSON.stringify(turn.engineBillings),
+            Date.now(),
+            request.sessionId,
+            userId,
+            request.tapeId,
+          ],
+        );
+        return {
+          applied: "finalized",
+          recordCount: turn.records.length,
+          engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
+        };
+      });
+    },
     // ── probe(D5)──────────────────────────────────────────────────────────
     async probeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
       try {
@@ -405,6 +1249,11 @@ export function createPgSessionsBackend(
               "client_session_archived_ids",
               "server_authored_request_map",
               "pending_usage_patches",
+              "client_session_turn_tapes",
+              "client_session_turn_tape_parts",
+              "client_session_turn_tape_records",
+              "server_authored_turn_anchor_map",
+              "turn_tape_cost_components",
               "wechat_bindings",
             ],
           ],
@@ -468,7 +1317,7 @@ export function createPgSessionsBackend(
               /* malformed existing → 视为空 */
             }
           }
-          const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[]);
+          const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[], oldMsgs);
           const clientMsgs = await filterOutArchivedIncoming(client, session.id, clientMsgsRaw);
           const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[];
           const currentNextSeq =
@@ -703,18 +1552,239 @@ export function createPgSessionsBackend(
       sessionId?: string | null,
       parentSessionId?: string | null,
       delegateAgentId?: string | null,
+      turnKey?: string | null,
+      parentTurnKey?: string | null,
     ): Promise<AppendCostCreditsResult> {
+      if (!/^\d+$/.test(costCredits)) throw new Error("costCredits must be a non-negative integer");
+      const normalizedCostCredits = BigInt(costCredits).toString();
+      if (normalizedCostCredits.length > 78) throw new Error("costCredits exceeds NUMERIC(78,0)");
+      if (turnKey && !LOSSLESS_TURN_TAPE_SHA256_RE.test(turnKey)) {
+        throw new Error("turnKey must be a lowercase SHA-256 hex digest");
+      }
+      if (parentTurnKey && !LOSSLESS_TURN_TAPE_SHA256_RE.test(parentTurnKey)) {
+        throw new Error("parentTurnKey must be a lowercase SHA-256 hex digest");
+      }
       return withTx(pool, async (client): Promise<AppendCostCreditsResult> => {
         // ① request advisory(串行点)。
         await requestAdvisoryXactLock(client, userId, requestId);
 
+        // v2 exact path. Delegate spend belongs to the leader's parent turn;
+        // ordinary chat spend belongs to its own turnKey.
+        const targetTurnKey = parentTurnKey ?? turnKey ?? null;
+        if (targetTurnKey) {
+          await requestAdvisoryXactLock(client, userId, `turn:${targetTurnKey}`);
+          const map0 = (
+            await client.query<{
+              session_id: string;
+              tape_id: string;
+              billing_anchor_id: string;
+            }>(
+              `SELECT session_id,tape_id,billing_anchor_id
+                 FROM server_authored_turn_anchor_map
+                WHERE user_id=$1 AND turn_key=$2`,
+              [userId, targetTurnKey],
+            )
+          ).rows[0];
+          if (map0) {
+            const sess = (
+              await client.query<{
+                deleted_at: string | null;
+                messages: string;
+                next_seq: number | null;
+                archived_through_seq: number | null;
+                archived_count: number | null;
+              }>(
+                `SELECT deleted_at,messages,next_seq,archived_through_seq,archived_count
+                   FROM client_sessions
+                  WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+                [map0.session_id, userId],
+              )
+            ).rows[0];
+            if (sess && sess.deleted_at === null) {
+              const map = (
+                await client.query<{
+                  session_id: string;
+                  tape_id: string;
+                  billing_anchor_id: string;
+                }>(
+                  `SELECT session_id,tape_id,billing_anchor_id
+                     FROM server_authored_turn_anchor_map
+                    WHERE user_id=$1 AND turn_key=$2 FOR UPDATE`,
+                  [userId, targetTurnKey],
+                )
+              ).rows[0];
+              if (
+                !map ||
+                map.session_id !== map0.session_id ||
+                map.tape_id !== map0.tape_id ||
+                map.billing_anchor_id !== map0.billing_anchor_id
+              ) {
+                throw new Error("lossless turn billing anchor mapping changed while locked");
+              }
+              const existing = (
+                await client.query<{
+                  session_id: string;
+                  tape_id: string;
+                  billing_anchor_id: string;
+                  cost_credits: string;
+                  delegate_agent_id: string | null;
+                }>(
+                  `SELECT session_id,tape_id,billing_anchor_id,cost_credits::text,delegate_agent_id
+                     FROM turn_tape_cost_components
+                    WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+                  [requestId, userId],
+                )
+              ).rows[0];
+              const pendingExact = (
+                await client.query<{
+                  session_id: string | null;
+                  parent_session_id: string | null;
+                  delegate_agent_id: string | null;
+                  turn_key: string | null;
+                  parent_turn_key: string | null;
+                  cost_credits: string;
+                }>(
+                  `SELECT session_id,parent_session_id,delegate_agent_id,turn_key,
+                          parent_turn_key,cost_credits
+                     FROM pending_usage_patches
+                    WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+                  [requestId, userId],
+                )
+              ).rows[0];
+              if (
+                pendingExact &&
+                ((sessionId != null && pendingExact.session_id !== sessionId) ||
+                  (parentSessionId != null && pendingExact.parent_session_id !== parentSessionId) ||
+                  (delegateAgentId != null && pendingExact.delegate_agent_id !== delegateAgentId) ||
+                  (turnKey != null && pendingExact.turn_key !== turnKey) ||
+                  (parentTurnKey != null && pendingExact.parent_turn_key !== parentTurnKey) ||
+                  BigInt(pendingExact.cost_credits) !== BigInt(normalizedCostCredits))
+              ) {
+                throw new Error("lossless pending cost component refuses remapping");
+              }
+              if (existing) {
+                if (
+                  existing.session_id !== map.session_id ||
+                  existing.tape_id !== map.tape_id ||
+                  existing.billing_anchor_id !== map.billing_anchor_id ||
+                  BigInt(existing.cost_credits) !== BigInt(normalizedCostCredits) ||
+                  existing.delegate_agent_id !== (delegateAgentId ?? null)
+                ) {
+                  throw new Error("lossless turn cost component refuses remapping");
+                }
+                if (pendingExact) {
+                  await client.query(
+                    "DELETE FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+                    [requestId, userId],
+                  );
+                }
+                return { applied: "noop" };
+              }
+              await client.query(
+                `INSERT INTO turn_tape_cost_components
+                   (request_id,user_id,session_id,tape_id,billing_anchor_id,
+                    cost_credits,delegate_agent_id,updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+                [
+                  requestId,
+                  userId,
+                  map.session_id,
+                  map.tape_id,
+                  map.billing_anchor_id,
+                  normalizedCostCredits,
+                  delegateAgentId ?? null,
+                  Date.now(),
+                ],
+              );
+              if (pendingExact) {
+                await client.query(
+                  "DELETE FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+                  [requestId, userId],
+                );
+              }
+              let messages: MessageLike[] = [];
+              try {
+                const parsed = JSON.parse(sess.messages);
+                if (Array.isArray(parsed)) messages = parsed as MessageLike[];
+              } catch {
+                throw new Error("lossless turn billing target session row malformed");
+              }
+              const anchorIndex = messages.findIndex(
+                (message) =>
+                  message?.id === map.billing_anchor_id &&
+                  message?._turnTapeId === map.tape_id &&
+                  message?._source === "server",
+              );
+              if (anchorIndex >= 0) {
+                const nextSeq =
+                  typeof sess.next_seq === "number" && sess.next_seq > 0
+                    ? sess.next_seq
+                    : Math.max(0, ...messages.map((message) =>
+                        typeof message?._seq === "number" ? message._seq : 0
+                      )) + 1;
+                const touched = [...messages];
+                touched[anchorIndex] = { ...touched[anchorIndex], _seq: nextSeq };
+                const spill = planSpillOverflow(
+                  touched,
+                  bigIntNumOr(sess.archived_through_seq, 0),
+                );
+                const finalJson = JSON.stringify(spill.tail);
+                if (Buffer.byteLength(finalJson, "utf8") > MAX_SESSION_BYTES) {
+                  throw new Error("lossless turn billing anchor tail unexpectedly oversized");
+                }
+                const nowMs = Date.now();
+                const archivedDelta = await execPgSpillPlan(
+                  client,
+                  map.session_id,
+                  userId,
+                  spill.chunksToInsert,
+                  spill.idsToInsert,
+                  nowMs,
+                );
+                const archivedCount = bigIntNumOr(sess.archived_count, 0) + archivedDelta;
+                await client.query(
+                  `UPDATE client_sessions SET
+                     messages=$1,message_count=$2,last_at=$3,
+                     updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+                     next_seq=$4,archived_through_seq=$5,archived_count=$6
+                   WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
+                  [
+                    finalJson,
+                    spill.tail.length + archivedCount,
+                    nowMs,
+                    nextSeq + 1,
+                    spill.archivedThroughSeq,
+                    archivedCount,
+                    map.session_id,
+                    userId,
+                  ],
+                );
+              } else {
+                // The anchor may already be archived. The immutable component
+                // is still authoritative and archive hydration will expose it;
+                // bump the session version so full-sync clients revalidate.
+                await client.query(
+                  `UPDATE client_sessions
+                      SET updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                    WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+                  [map.session_id, userId],
+                );
+              }
+              return { applied: "patched" };
+            }
+            return { applied: "noop" };
+          }
+        }
+
         // ② 非锁定读 map,仅用于定位 session_id(禁先 FOR UPDATE map 破坏锁序)。
-        const mapRow0 = (
-          await client.query<{ session_id: string; msg_id: string }>(
-            "SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = $1 AND user_id = $2",
-            [requestId, userId],
-          )
-        ).rows[0];
+        const mapRow0 = targetTurnKey
+          ? undefined
+          : (
+              await client.query<{ session_id: string; msg_id: string }>(
+                "SELECT session_id, msg_id FROM server_authored_request_map WHERE request_id = $1 AND user_id = $2",
+                [requestId, userId],
+              )
+            ).rows[0];
 
         if (mapRow0) {
           // ③ 锁 client_sessions 行(**含软删行**:去 deleted_at IS NULL 过滤,读出 deleted_at)。
@@ -765,7 +1835,7 @@ export function createPgSessionsBackend(
             const currentNextSeq = typeof sess.next_seq === "number" && sess.next_seq > 0 ? sess.next_seq : 1;
             // 决策抽到引擎中立的 planCostPatch(RFC D6b):双 backend 复用(幂等判定 / patch 构造 /
             // spill / size guard 全在 plan;size guard 先行 → 命中 noop 不落孤儿 chunk)。
-            const plan = planCostPatch(msgs, mapRow.msg_id, costCredits, currentNextSeq, bigIntNumOr(sess.archived_through_seq, 0));
+            const plan = planCostPatch(msgs, mapRow.msg_id, normalizedCostCredits, currentNextSeq, bigIntNumOr(sess.archived_through_seq, 0));
             if (plan.kind === "noop") return { applied: "noop" };
             if (plan.kind === "patch") {
               const nowMs = Date.now();
@@ -795,18 +1865,89 @@ export function createPgSessionsBackend(
           // parent_session_id,24h 老化 GC 兜底;delegate pending 走 delete 级联,不受此影响)。
         }
 
-        // ⑤ park:UPSERT pending_usage_patches(created_at 冲突时重置为语句时刻)。
+        // v2 exact requests are immutable even before their tape arrives.
+        // A retry may repeat the same component, but it may never change its
+        // amount or locator under the same (requestId,userId).
+        if (targetTurnKey) {
+          const pending = (
+            await client.query<{
+              session_id: string | null;
+              parent_session_id: string | null;
+              delegate_agent_id: string | null;
+              turn_key: string | null;
+              parent_turn_key: string | null;
+              cost_credits: string;
+            }>(
+              `SELECT session_id,parent_session_id,delegate_agent_id,turn_key,parent_turn_key,
+                      cost_credits::text
+                 FROM pending_usage_patches
+                WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+              [requestId, userId],
+            )
+          ).rows[0];
+          const locator = {
+            sessionId: sessionId ?? null,
+            parentSessionId: parentSessionId ?? null,
+            delegateAgentId: delegateAgentId ?? null,
+            turnKey: turnKey ?? null,
+            parentTurnKey: parentTurnKey ?? null,
+          };
+          if (pending) {
+            if (
+              (locator.sessionId !== null && pending.session_id !== locator.sessionId) ||
+              (locator.parentSessionId !== null && pending.parent_session_id !== locator.parentSessionId) ||
+              (locator.delegateAgentId !== null && pending.delegate_agent_id !== locator.delegateAgentId) ||
+              (locator.turnKey !== null && pending.turn_key !== locator.turnKey) ||
+              (locator.parentTurnKey !== null && pending.parent_turn_key !== locator.parentTurnKey) ||
+              BigInt(pending.cost_credits) !== BigInt(normalizedCostCredits)
+            ) {
+              throw new Error("lossless pending cost component refuses remapping");
+            }
+            return { applied: "pending" };
+          }
+          await client.query(
+            `INSERT INTO pending_usage_patches
+               (request_id,user_id,session_id,parent_session_id,delegate_agent_id,
+                turn_key,parent_turn_key,cost_credits)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              requestId,
+              userId,
+              locator.sessionId,
+              locator.parentSessionId,
+              locator.delegateAgentId,
+              locator.turnKey,
+              locator.parentTurnKey,
+              normalizedCostCredits,
+            ],
+          );
+          return { applied: "pending" };
+        }
+
+        // ⑤ legacy park:UPSERT pending_usage_patches(created_at 冲突时重置为语句时刻)。
         await client.query(
           `INSERT INTO pending_usage_patches
-             (request_id, user_id, session_id, parent_session_id, delegate_agent_id, cost_credits)
-           VALUES ($1, $2, $3, $4, $5, $6)
+             (request_id, user_id, session_id, parent_session_id, delegate_agent_id,
+              turn_key, parent_turn_key, cost_credits)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT (request_id, user_id) DO UPDATE SET
              cost_credits = EXCLUDED.cost_credits,
              session_id = EXCLUDED.session_id,
              parent_session_id = EXCLUDED.parent_session_id,
              delegate_agent_id = EXCLUDED.delegate_agent_id,
+             turn_key = EXCLUDED.turn_key,
+             parent_turn_key = EXCLUDED.parent_turn_key,
              created_at = ${CLOCK_MS_SQL}`,
-          [requestId, userId, sessionId ?? null, parentSessionId ?? null, delegateAgentId ?? null, costCredits],
+          [
+            requestId,
+            userId,
+            sessionId ?? null,
+            parentSessionId ?? null,
+            delegateAgentId ?? null,
+            turnKey ?? null,
+            parentTurnKey ?? null,
+            normalizedCostCredits,
+          ],
         );
         return { applied: "pending" };
       });
@@ -963,6 +2104,8 @@ export function createPgSessionsBackend(
         }>(sql, userId ? [id, userId] : [id])
       ).rows[0];
       if (!row) return null;
+      const parsedMessages = JSON.parse(row.messages) as MessageLike[];
+      const messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages);
       return {
         id: row.id,
         userId: row.user_id,
@@ -971,7 +2114,7 @@ export function createPgSessionsBackend(
         pinned: row.pinned === 1,
         createdAt: bigIntNum(row.created_at, "created_at"),
         lastAt: bigIntNum(row.last_at, "last_at"),
-        messages: JSON.parse(row.messages),
+        messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
         archivedCount: bigIntNumOr(row.archived_count, 0),
         archivedThroughSeq: bigIntNumOr(row.archived_through_seq, 0),
@@ -1024,6 +2167,7 @@ export function createPgSessionsBackend(
         messages = allMsgs;
         isPartial = false;
       }
+      messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages);
       return {
         id: row.id,
         userId: row.user_id,
@@ -1083,7 +2227,8 @@ export function createPgSessionsBackend(
       const hasMore = messagePool.length > cappedLimit;
       const page = messagePool.slice(Math.max(0, messagePool.length - cappedLimit));
       const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null;
-      return { messages: page, hasMore, oldestSeq };
+      const hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page);
+      return { messages: hydrated, hasMore, oldestSeq };
     },
 
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
@@ -1102,6 +2247,7 @@ export function createPgSessionsBackend(
         // 指向该会话的 delegate pending(防永不 drain 的孤儿)。
         await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
+        await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
         await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
         return true;
       });
@@ -1501,6 +2647,10 @@ async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggreg
     )
   ).rows[0];
   const delMap = await client.query("DELETE FROM server_authored_request_map WHERE written_at <= $1", [mapThreshold]);
-  const delPending = await client.query("DELETE FROM pending_usage_patches WHERE created_at <= $1", [expiredThreshold]);
+  const delPending = await client.query(
+    `DELETE FROM pending_usage_patches
+      WHERE created_at <= $1 AND turn_key IS NULL AND parent_turn_key IS NULL`,
+    [expiredThreshold],
+  );
   return { pendingAging: aging?.n ?? 0, pendingExpired: delPending.rowCount ?? 0, mapExpired: delMap.rowCount ?? 0 };
 }

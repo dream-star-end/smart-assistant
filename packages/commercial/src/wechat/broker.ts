@@ -44,7 +44,6 @@ import type { DispatchOutcome, InboundDispatcher, InboundEvent } from "./inbound
 import { buildWechatLiveToken } from "./liveShare.js"
 import type { ResolveOutboundMediaPartFn } from "./outboundMedia.js"
 import type { OutboundReceiverCtx, OutboundReceiverHandler } from "./outboundReceiver.js"
-import { DEFAULT_MAX_ATTEMPTS } from "./outboxStore.js"
 import {
   type GetBindingFn,
   OutboxWorker,
@@ -951,15 +950,14 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     const outbox = await deps.pgPool.query(
       `UPDATE wechat_outbox
           SET status = 'failed',
-              attempts = GREATEST(attempts, $2),
-              last_error = $3,
+              attempts = attempts + 1,
+              last_error = $2,
               locked_at = NULL,
-              updated_at = $4
+              updated_at = $3
         WHERE binding_user_id = $1
           AND status IN ('queued', 'sending')`,
       [
         bindingUserId,
-        deps.outboxWorker?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
         "binding unbound",
         now(),
       ],

@@ -289,6 +289,7 @@ describe('v5 release safety lanes', () => {
     for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
       const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
+      assert.match(body, /assert_lossless_turn_tape_floor/, `${fn} 未挂 lossless tape 兼容地板`)
     }
     // marker 探测 fail-closed:psql 失败 → 按已置位处理(不确定即拒)
     const cutoverFn = source.match(/model_authority_cutover_done\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
@@ -297,6 +298,341 @@ describe('v5 release safety lanes', () => {
     const disableFn = source.match(/disable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(disableFn, /model_authority_cutover_done/)
     assert.match(disableFn, /兼容地板不可逆/)
+  })
+
+  test('lossless tape floor permits pre-cutover targets but rejects old readers/writers after first finalize', () => {
+    function runFloor(dbResult: 'true' | 'false' | 'error', master = '1', runtime = '1') {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes"*)',
+        dbResult === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${dbResult}' ;;`,
+        '    *".runtimeCapabilities"*) [[ "$FLOOR_RUNTIME" == 1 ]] && printf "capable\\n" || printf "incapable\\n" ;;',
+        '    *".capabilities"*) [[ "$FLOOR_MASTER" == 1 ]] && printf "capable\\n" || printf "incapable\\n" ;;',
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'assert_lossless_turn_tape_floor /release/target',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          FLOOR_MASTER: master,
+          FLOOR_RUNTIME: runtime,
+        },
+      })
+    }
+
+    const beforeFirstTape = runFloor('false', '', '')
+    assert.equal(beforeFirstTape.status, 0, beforeFirstTape.stderr || beforeFirstTape.stdout)
+    const capable = runFloor('true')
+    assert.equal(capable.status, 0, capable.stderr || capable.stdout)
+    for (const rejected of [
+      runFloor('true', '', '1'),
+      runFloor('true', '1', ''),
+      runFloor('error', '', ''),
+    ]) {
+      assert.notEqual(rejected.status, 0)
+      assert.match(
+        rejected.stdout + rejected.stderr,
+        /目标 release (?:未同时声明 reader\/writer capability|的 lossless reader\/writer capability 状态不可核验)/,
+      )
+    }
+  })
+
+  test('lossless compensation arms on capability probe failure and never flips the old stack', async () => {
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0',
+      'KL_HOST=fake',
+      'ACTIVE_SRC=/fixture/active',
+      'ACTIVE_SLOT=A',
+      'ACTIVE_UNIT=fixture.service',
+      'ACTIVE_PORT=19999',
+      'RELEASES_ROOT=/fixture/releases',
+      'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$1"; }',
+      'ssh() {',
+      '  case "$*" in',
+      '    *candidate*) return 23 ;;',
+      '    *old*) printf "%s\\n" incapable; return 0 ;;',
+      '    *) printf "MUTATION:%s\\n" "$*" >>"$MUTATION_LOG"; return 0 ;;',
+      '  esac',
+      '}',
+      'restore_release_activation /release/old "" smoke-failed /release/candidate',
+    ].join('\n')
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-probe-')); dirs.push(dir)
+    const mutationLog = path.join(dir, 'mutations.log')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', MUTATION_LOG: mutationLog },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stdout + result.stderr, /RECOVERY:lossless writer 已可能对外服务/)
+    assert.equal(spawnSync('bash', ['-c', `test ! -s '${mutationLog}'`]).status, 0,
+      `old-stack mutation unexpectedly ran:\n${result.stdout}\n${result.stderr}`)
+  })
+
+  test('ordinary commit ACK loss checks compatibility before deploy_state compensation', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-ack-loss-')); dirs.push(dir)
+    const mutationLog = path.join(dir, 'mutations.log')
+    const stateRevertMarker = path.join(dir, 'state-reverted')
+    const activeTarget = path.join(dir, 'active-target')
+    const recoveryLog = path.join(dir, 'recovery.log')
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      "source '" + deploy + "'",
+      'DRY=0',
+      'KL_HOST=fake',
+      'ACTIVE_SRC=/fixture/active',
+      'ACTIVE_SLOT=B',
+      'ACTIVE_UNIT=fixture.service',
+      'ACTIVE_PORT=19999',
+      'RELEASES_ROOT=/fixture/releases',
+      'ACTIVE_STATE_LOCK_VERSION=7',
+      'ACTIVE_STATE_RELEASE=/release/old',
+      'ACTIVE_STATE_PREVIOUS_RELEASE=/release/older',
+      'assert_release_required_migrations() { :; }',
+      'assert_release_capability_for_sessions_pg() { :; }',
+      'assert_lossless_turn_tape_floor() { :; }',
+      'assert_model_authority_floor() { :; }',
+      'bg_current_release() { printf "%s\\n" /release/old; }',
+      'sync_assets_to_pool() { :; }',
+      'run() { :; }',
+      'smoke() { :; }',
+      'mark_deploy_recovery_required() { printf "%s\\n" "$1" >>"$RECOVERY_LOG"; }',
+      'probe_release_lossless_master_capability() {',
+      '  case "$1" in',
+      '    /release/candidate) return 0 ;;',
+      '    /release/old) return 1 ;;',
+      '    *) return 2 ;;',
+      '  esac',
+      '}',
+      'ssh() {',
+      '  case "$*" in',
+      '    *"test -f"*"/release/candidate/.complete"*) return 0 ;;',
+      '    *"ln -s"*"/release/candidate"*)',
+      '      printf "%s\\n" candidate >"$ACTIVE_TARGET"',
+      '      printf "%s\\n" CANDIDATE_FLIP >>"$MUTATION_LOG"',
+      '      return 0 ;;',
+      '    *"ln -s"*"/release/old"*)',
+      '      printf "%s\\n" old >"$ACTIVE_TARGET"',
+      '      printf "%s\\n" OLD_STACK_FLIP >>"$MUTATION_LOG"',
+      '      return 0 ;;',
+      '    *"systemctl restart"*) printf "%s\\n" RESTART >>"$MUTATION_LOG"; return 0 ;;',
+      '    *) return 0 ;;',
+      '  esac',
+      '}',
+      'ds_commit_active_release() { printf "%s\\n" COMMIT_ACK_LOST; return 1; }',
+      'ds_stable_release_status_sql() { printf "%s\\n" STATUS; }',
+      'ds_exec() {',
+      '  if [[ -f "$STATE_REVERT_MARKER" ]]; then printf "%s\\n" reverted; else printf "%s\\n" applied; fi',
+      '}',
+      'ds_stable_release_revert() {',
+      '  printf "%s\\n" STATE_REVERTED >>"$MUTATION_LOG"',
+      '  : >"$STATE_REVERT_MARKER"',
+      '}',
+      'activate_release /release/candidate || true',
+      'printf "ACTIVE:%s\\n" "$(cat "$ACTIVE_TARGET")"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        MUTATION_LOG: mutationLog,
+        STATE_REVERT_MARKER: stateRevertMarker,
+        ACTIVE_TARGET: activeTarget,
+        RECOVERY_LOG: recoveryLog,
+      },
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    assert.match(result.stdout, /COMMIT_ACK_LOST/)
+    assert.match(result.stdout, /ACTIVE:candidate/)
+    assert.match(await readFile(recoveryLog, 'utf8'), /禁止自动回切旧 master/)
+    assert.doesNotMatch(await readFile(mutationLog, 'utf8'), /STATE_REVERTED|OLD_STACK_FLIP/)
+    assert.equal(await readFile(activeTarget, 'utf8'), 'candidate\n')
+    assert.equal(await readFile(stateRevertMarker, 'utf8').catch(() => ''), '')
+  })
+
+  test('lossless artifact probe treats a scalar capability field as unknown', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-metadata-')); dirs.push(dir)
+    const metadataDir = path.join(dir, 'deploy/v5')
+    await mkdir(metadataDir, { recursive: true })
+    const metadata = path.join(metadataDir, 'release-metadata.json')
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      "source '" + deploy + "'",
+      'KL_HOST=fake',
+      'ssh() { shift; bash -c "$1"; }',
+      'rc=0; probe_release_lossless_master_capability "$RELEASE" || rc=$?',
+      'printf "RC:%s\\n" "$rc"',
+    ].join('\n')
+    const invoke = () => spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', RELEASE: dir },
+    })
+
+    await writeFile(metadata, JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }))
+    assert.match(invoke().stdout, /RC:0/)
+    await writeFile(metadata, JSON.stringify({ capabilities: [] }))
+    assert.match(invoke().stdout, /RC:1/)
+    await writeFile(metadata, JSON.stringify({ capabilities: 'lossless-turn-tape-v2' }))
+    assert.match(invoke().stdout, /RC:2/)
+  })
+
+  test('explicit rollback uses the live capability, not a racy no-tape DB observation', () => {
+    const invoke = (live: 'capable' | 'incapable' | 'probe-error', target: 'capable' | 'incapable') => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'KL_HOST=fake',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"/release/live"*)',
+        live === 'probe-error' ? '      return 23 ;;' : `      printf '%s\\n' '${live}';;`,
+        '    *"/release/target"*) printf "%s\\n" "$TARGET_CAP" ;;',
+        '    *"SELECT EXISTS"*) printf "RACY_DB_QUERY\\n" >&2; return 99 ;;',
+        '    *) return 98 ;;',
+        '  esac',
+        '}',
+        'assert_lossless_runtime_tuple_capability() { printf "RUNTIME_PROVED\\n"; }',
+        'assert_lossless_explicit_rollback_target /release/live /release/target sha256:rt /runtime/release',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', TARGET_CAP: target },
+      })
+    }
+
+    const capableToOld = invoke('capable', 'incapable')
+    assert.notEqual(capableToOld.status, 0)
+    assert.doesNotMatch(capableToOld.stdout + capableToOld.stderr, /RACY_DB_QUERY/)
+    const unknownToOld = invoke('probe-error', 'incapable')
+    assert.notEqual(unknownToOld.status, 0)
+    assert.match(unknownToOld.stdout + unknownToOld.stderr, /按可能正在写 v2 tape fail-closed/)
+    const capableToCapable = invoke('capable', 'capable')
+    assert.equal(capableToCapable.status, 0, capableToCapable.stderr || capableToCapable.stdout)
+    assert.match(capableToCapable.stdout, /RUNTIME_PROVED/)
+    const legacyToLegacy = invoke('incapable', 'incapable')
+    assert.equal(legacyToLegacy.status, 0, legacyToLegacy.stderr || legacyToLegacy.stdout)
+    assert.doesNotMatch(legacyToLegacy.stdout, /RUNTIME_PROVED/)
+  })
+
+  test('lossless floor covers canary first-write race, abort, and actual runtime tuples', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
+    const canaryMatrix = source.slice(
+      source.indexOf('capability_matrix_preflight()'),
+      source.indexOf('\n# 同步某 release 的 dist/assets', source.indexOf('capability_matrix_preflight()')),
+    )
+    assert.match(canaryMatrix, /assert_lossless_canary_pair "\$active_rel" "\$candidate_rel"/)
+    const abortBody = source.slice(
+      source.indexOf('abort_continue()'),
+      source.indexOf('\n# ═════════ --recover', source.indexOf('abort_continue()')),
+    )
+    assert.ok(
+      abortBody.indexOf('assert_lossless_turn_tape_floor "$old_src"')
+        < abortBody.indexOf('caddy_render_reload'),
+      'abort must recheck the old reader before routing traffic back',
+    )
+    const rollbackBody = source.slice(
+      source.indexOf('rollback_runtime_tuple()'),
+      source.indexOf('\n# ═══════════════════════ P3', source.indexOf('rollback_runtime_tuple()')),
+    )
+    assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
+    assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
+
+    const compensationGuardStart = source.indexOf('assert_release_activation_compensation_compatible()')
+    const compensationGuardBody = source.slice(
+      compensationGuardStart,
+      source.indexOf('\n# 仅供紧邻', compensationGuardStart),
+    )
+    assert.match(compensationGuardBody, /lossless_release_may_have_served "\$candidate_release"/)
+    assert.match(compensationGuardBody, /assert_lossless_master_release_capability "\$old_release"/)
+    assert.match(compensationGuardBody, /assert_lossless_runtime_tuple_capability "\$image_id" "\$runtime_release"/)
+
+    const restoreStart = source.indexOf('restore_release_activation()')
+    const restoreBody = source.slice(
+      restoreStart,
+      source.indexOf('\n# 状态提交回执', restoreStart),
+    )
+    const ordinaryGuardAt = restoreBody.indexOf(
+      'assert_release_activation_compensation_compatible "$old_release" "$candidate_release"',
+    )
+    const ordinaryFlipAt = restoreBody.indexOf(
+      'restore_release_runtime_after_compatibility_guard "$old_release"',
+    )
+    assert.ok(ordinaryGuardAt >= 0 && ordinaryGuardAt < ordinaryFlipAt,
+      'ordinary compensation must prove the old stack before flipping its symlink')
+    assert.match(source, /restore_release_activation "\$prev" "\$old_prev_file" "restart new failed" "\$reldir"/)
+
+    const activateStart = source.indexOf('activate_release() {')
+    const activateBody = source.slice(
+      activateStart,
+      source.indexOf('\n# 传统 deploy/rollback', activateStart),
+    )
+    const ackLossGuardAt = activateBody.indexOf(
+      'assert_release_activation_compensation_compatible "$prev" "$reldir"',
+    )
+    const stateCompensationAt = activateBody.indexOf('restore_release_state_if_committed "$reldir"')
+    assert.ok(ackLossGuardAt >= 0 && ackLossGuardAt < stateCompensationAt,
+      'ordinary ACK-loss compensation must prove the old stack before reverting deploy_state')
+
+    const sagaRollbackStart = runtimeLib.indexOf('_hotcfg_saga_rollback()')
+    const sagaRollbackBody = runtimeLib.slice(
+      sagaRollbackStart,
+      runtimeLib.indexOf('\n  # 2) extra:', sagaRollbackStart),
+    )
+    const sagaGuardAt = sagaRollbackBody.indexOf('lossless_writer_may_have_served')
+    const stateRevertAt = sagaRollbackBody.indexOf('if [ "$commit_state" = applied ]')
+    assert.ok(sagaGuardAt >= 0 && sagaGuardAt < stateRevertAt,
+      'hotcfg compensation must block an incapable old stack before state/runtime rollback')
+    assert.match(sagaRollbackBody, /oc_hotcfg_assert_master_lossless_capability "\$prev_master_release"/)
+    assert.match(sagaRollbackBody, /oc_hotcfg_assert_tuple_lossless_capability "\$old_image_id" "\$old_release"/)
+    assert.doesNotMatch(sagaRollbackBody, /assert_tuple_lossless_floor/,
+      'post-exposure rollback must be unconditional, not a racy DB floor probe')
+
+    const ordinaryRollback = source.slice(
+      source.indexOf('rollback()'),
+      source.indexOf('\n# tuple 感知回滚', source.indexOf('rollback()')),
+    )
+    const ordinaryExplicitAt = ordinaryRollback.indexOf('assert_lossless_explicit_rollback_target')
+    const ordinaryMaintenanceAt = ordinaryRollback.indexOf('begin_planned_maintenance rollback 0', ordinaryExplicitAt)
+    assert.ok(ordinaryExplicitAt >= 0 && ordinaryMaintenanceAt > ordinaryExplicitAt,
+      'ordinary explicit rollback must prove the target before maintenance/symlink mutation')
+    assert.match(rollbackBody,
+      /assert_lossless_explicit_rollback_target[\s\\]*\n?[\s\\]*"\$prev_src" "\$master" "\$image_id" "\$release"/)
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-tuple-')); dirs.push(dir)
+    const capable = path.join(dir, 'capable'); const old = path.join(dir, 'old')
+    await mkdir(capable); await mkdir(old)
+    await writeFile(path.join(capable, 'MANIFEST.json'), JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }))
+    await writeFile(path.join(old, 'MANIFEST.json'), JSON.stringify({ capabilities: [] }))
+    const invoke = (release: string) => spawnSync('bash', ['-c', [
+      `source '${path.join(root, 'scripts/v5-runtime-release-lib.sh')}'`,
+      `oc_hotcfg_assert_tuple_lossless_capability ignored '${release}'`,
+    ].join('\n')], { cwd: root, encoding: 'utf8' })
+    assert.equal(invoke(capable).status, 0)
+    const rejected = invoke(old)
+    assert.notEqual(rejected.status, 0)
+    assert.match(rejected.stderr, /未声明 'lossless-turn-tape-v2'/)
   })
 
   test('model-authority operations pin the stable P3 active lane', async () => {
@@ -483,7 +819,7 @@ describe('v5 release safety lanes', () => {
     }
   })
 
-  test('release metadata declares both authority migrations and both authority capabilities', async () => {
+  test('release metadata declares authority plus lossless persistence capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
     const source = await readFile(deploy, 'utf8')
     const buildRuntimeStart = source.indexOf('build_runtime_release()')
@@ -492,8 +828,9 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.requiredMigrations.includes('0144_model_authority_guards'))
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
+    assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
-    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1'])
+    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
     assert.match(
       source.slice(buildRuntimeStart, buildRuntimeEnd),

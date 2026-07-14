@@ -109,6 +109,9 @@ describe("full migration suite", () => {
       "agent_containers",
       "agent_subscriptions",
       "claude_accounts",
+      "client_session_turn_tape_parts",
+      "client_session_turn_tape_records",
+      "client_session_turn_tapes",
       "credit_ledger",
       "email_verifications",
       "model_pricing",
@@ -116,13 +119,47 @@ describe("full migration suite", () => {
       "rate_limit_events",
       "refresh_tokens",
       "schema_migrations",
+      "server_authored_turn_anchor_map",
       "topup_plans",
+      "turn_tape_cost_components",
       "usage_records",
       "users",
     ];
     for (const t of expected) {
       assert.ok(names.has(t), `missing table: ${t}`);
     }
+  });
+
+  test("0147 installs lossless turn locators and uncapped WeChat payload storage", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runMigrations();
+    const columns = await query<{ table_name: string; column_name: string }>(
+      `SELECT table_name,column_name
+         FROM information_schema.columns
+        WHERE table_schema='public'
+          AND (table_name,column_name) IN (
+            ('pending_usage_patches','turn_key'),
+            ('pending_usage_patches','parent_turn_key'),
+            ('client_session_turn_tapes','engine_billings'),
+            ('wechat_outbox','raw_payload')
+          )`,
+    );
+    assert.deepEqual(
+      new Set(columns.rows.map((row) => `${row.table_name}.${row.column_name}`)),
+      new Set([
+        "pending_usage_patches.turn_key",
+        "pending_usage_patches.parent_turn_key",
+        "client_session_turn_tapes.engine_billings",
+        "wechat_outbox.raw_payload",
+      ]),
+    );
+    const constraints = await query<{ conname: string }>(
+      `SELECT conname
+         FROM pg_constraint
+        WHERE conrelid='wechat_outbox'::regclass
+          AND conname IN ('wox_attempts_chk','wox_attempts_nonnegative_chk')`,
+    );
+    assert.deepEqual(constraints.rows.map((row) => row.conname), ["wox_attempts_nonnegative_chk"]);
   });
 
   test("seed: key model pricing and topup rows exist", async (t) => {

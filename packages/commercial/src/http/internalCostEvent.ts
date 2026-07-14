@@ -18,9 +18,8 @@
  *
  * 语义:
  *   - events 数组按序处理(persist 先于 broadcast 的顺序由 egress 入队顺序保证)。
- *   - 单个 event 失败不阻塞后续(与原进程内 hook 的 fail-soft 一致:persist 失败
- *     只 log,broadcast 照发)。响应始终 200 {accepted} —— egress 不因个别失败重发
- *     整批(persist 幂等性依赖 requestId 去重,但 broadcast 重发会闪双帧,不值得)。
+ *   - 任一 event 非法或 apply 失败即返回非 2xx,egress 保留 fsync'd persist receipt
+ *     重试。生产 egress 每请求只发一个 event,所以不会因批内部分成功重放广播。
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -45,6 +44,9 @@ export interface CostEventPersist {
   /** delegate 子会话的父客户端会话 id(web-*);普通 chat / codex 自费为 null。
    *  egress→master 必须透传,否则委派成本 durable 归并(Fix A)在 split 模式失效。 */
   parentSessionId?: string | null;
+  delegateAgentId?: string | null;
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
 }
 
 export interface CostEventBroadcast {
@@ -65,6 +67,9 @@ export interface CostEventHandlerDeps {
     costCredits: string,
     sessionId?: string | null,
     parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
   broadcastToUser: (uid: bigint, payload: unknown) => void;
   logger?: Logger;
@@ -108,10 +113,18 @@ export function makeCostEventHandler(deps: CostEventHandlerDeps): CostEventHandl
       return;
     }
 
-    let accepted = 0;
+    const parsedEvents: CostEvent[] = [];
     for (const raw of events) {
       const ev = parseEvent(raw);
-      if (!ev) continue;
+      if (!ev) {
+        sendJson(res, 400, { error: { code: "INVALID_EVENT", message: "cost event schema rejected" } });
+        return;
+      }
+      parsedEvents.push(ev);
+    }
+
+    let accepted = 0;
+    for (const ev of parsedEvents) {
       try {
         if (ev.kind === "persist") {
           await deps.appendCostCredits(
@@ -120,15 +133,21 @@ export function makeCostEventHandler(deps: CostEventHandlerDeps): CostEventHandl
             ev.costCredits,
             ev.sessionId ?? null,
             ev.parentSessionId ?? null,
+            ev.delegateAgentId ?? null,
+            ev.turnKey ?? null,
+            ev.parentTurnKey ?? null,
           );
         } else {
           deps.broadcastToUser(BigInt(ev.uid), ev.payload);
         }
         accepted += 1;
       } catch (err) {
-        // fail-soft:与原进程内 hook 一致 —— persist 失败靠 pending_usage_patches
-        // GC sweep 兜底可见,broadcast 失败只是气泡不实时。
         log.warn("cost_event_apply_failed", { kind: ev.kind, err: (err as Error).message });
+        sendJson(res, 503, {
+          error: { code: "COST_EVENT_APPLY_FAILED", message: "cost event was not acknowledged" },
+          accepted,
+        });
+        return;
       }
     }
     sendJson(res, 200, { ok: true, accepted });
@@ -146,6 +165,19 @@ function parseEvent(raw: unknown): CostEvent | null {
     ) {
       return null;
     }
+    const nullableStrings = [raw.sessionId, raw.parentSessionId, raw.delegateAgentId];
+    if (nullableStrings.some((value) => value !== undefined && value !== null && typeof value !== "string")) {
+      return null;
+    }
+    if (
+      (raw.turnKey !== undefined && raw.turnKey !== null &&
+        (typeof raw.turnKey !== "string" || !/^[0-9a-f]{64}$/.test(raw.turnKey))) ||
+      (raw.parentTurnKey !== undefined && raw.parentTurnKey !== null &&
+        (typeof raw.parentTurnKey !== "string" || !/^[0-9a-f]{64}$/.test(raw.parentTurnKey)))
+    ) {
+      // Never ACK a persist event after silently erasing its exact join key.
+      return null;
+    }
     return {
       kind: "persist",
       requestId: raw.requestId,
@@ -153,6 +185,9 @@ function parseEvent(raw: unknown): CostEvent | null {
       costCredits: raw.costCredits,
       sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
       parentSessionId: typeof raw.parentSessionId === "string" ? raw.parentSessionId : null,
+      delegateAgentId: typeof raw.delegateAgentId === "string" ? raw.delegateAgentId : null,
+      turnKey: typeof raw.turnKey === "string" ? raw.turnKey : null,
+      parentTurnKey: typeof raw.parentTurnKey === "string" ? raw.parentTurnKey : null,
     };
   }
   if (raw.kind === "broadcast") {

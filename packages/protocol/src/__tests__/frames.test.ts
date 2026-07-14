@@ -273,6 +273,50 @@ describe('OutboundCodexBilling schema', () => {
       false,
     )
   })
+  it('accepts only a canonical optional lossless turnKey', () => {
+    assert.equal(
+      Value.Check(OutboundCodexBilling, {
+        ...(baseOutboundCodexBilling() as object),
+        turnKey: 'ab'.repeat(32),
+      }),
+      true,
+    )
+    for (const bad of ['a'.repeat(63), 'A'.repeat(64), 'g'.repeat(64)]) {
+      assert.equal(
+        Value.Check(OutboundCodexBilling, {
+          ...(baseOutboundCodexBilling() as object),
+          turnKey: bad,
+        }),
+        false,
+      )
+    }
+  })
+  it('accepts canonical delegate billing attribution and rejects malformed locators', () => {
+    assert.equal(
+      Value.Check(OutboundCodexBilling, {
+        ...(baseOutboundCodexBilling() as object),
+        turnKey: 'ab'.repeat(32),
+        parentTurnKey: 'cd'.repeat(32),
+        parentSessionId: 'web-parent-1',
+        delegateAgentId: 'researcher_2',
+      }),
+      true,
+    )
+    assert.equal(
+      Value.Check(OutboundCodexBilling, {
+        ...(baseOutboundCodexBilling() as object),
+        parentTurnKey: 'A'.repeat(64),
+      }),
+      false,
+    )
+    assert.equal(
+      Value.Check(OutboundCodexBilling, {
+        ...(baseOutboundCodexBilling() as object),
+        delegateAgentId: 'bad agent',
+      }),
+      false,
+    )
+  })
   // M2 — engineSessionId(engine-reported 计费记账键,settle=waive 同值红线)。
   // Optional(渐进部署:旧容器镜像不带)+ 形状钉死 'oceng-' + 48 hex 小写。
   it('accepts frame without engineSessionId (渐进部署兼容)', () => {

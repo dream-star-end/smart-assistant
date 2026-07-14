@@ -36,13 +36,11 @@
  *   drops with a structured warn rather than enqueueing a guaranteed-fatal
  *   payload.
  *
- * Failure semantics(Codex slice 7c plan v3 PASS):
- *   2xx (200 + 202) → success(200 = empty_render / dedup terminal;
- *       202 = queued / pending_dedup / sending). Both: drop local retry entry.
- *   401 / 403 / 404 / 410 → fatal(tenant_mismatch / session_not_found /
- *       session_deleted / auth_invalid)。Retrying is pointless.
- *   429 / 5xx / network / timeout → transient → enqueue durable retry。
- *   Other 4xx → fatal(schema bug;ops surfaces via warn,never auto-retry)。
+ * Failure semantics(lossless mode):
+ *   Every payload is fsync-staged before its first network attempt. The retry
+ *   queue removes it only after 2xx acknowledgement or explicit 410 owner
+ *   deletion. 401/403/404/429/5xx/schema/network/timeout errors remain staged
+ *   without attempt,age,byte,or entry-count limits;errorClass is diagnostic.
  *
  * Shutdown contract(Codex slice 7c plan v3 reminder #2):
  *   shutdown() stops the periodic drain timer **but DOES NOT** stop the
@@ -78,10 +76,8 @@ export const WECHAT_OUTBOUND_PATH = "/internal/v3/wechat-outbound"
  *  正常应 < 200 ms;超 3 s 必然是 master overload / 网络糟糕,落 durable retry。 */
 const ATTEMPT_TIMEOUT_MS = 3_000
 
-/** Body cap。broker enqueue 行只存渲染后 IlinkPart[],原始 blocks 走 audit。
- *  64 KB 留余地:assistant text + tool snapshots 极少超过。超过 cap → 400
- *  INVALID_BODY = fatal,与 master `MAX_BODY_BYTES` 同源策略。 */
-const MAX_BODY_BYTES = 64 * 1024
+/** Only bounds diagnostic response capture; outbound request content is uncapped. */
+const RESPONSE_BODY_CAPTURE_BYTES = 64 * 1024
 
 /** wsess- session regex,与 master/protocol/commercial 全栈同源。 */
 const WSESS_RE = /^wsess-[0-9a-f]{16}$/
@@ -144,14 +140,6 @@ export async function attemptSend(
   const timeoutMs = deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS
 
   const body = JSON.stringify(payload)
-  const bodyBytes = Buffer.byteLength(body, "utf8")
-  if (bodyBytes > MAX_BODY_BYTES) {
-    // master 会 413 → fatal;提前在这里截,日志看得清。
-    throw new V3WechatSinkError(
-      `payload exceeds body cap (${bodyBytes} > ${MAX_BODY_BYTES})`,
-      "fatal",
-    )
-  }
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -180,7 +168,7 @@ export async function attemptSend(
   // 同样 cap 防 master 异常巨型 body OOM 容器。
   let bodyText = ""
   try {
-    bodyText = await readBoundedBody(res.body, MAX_BODY_BYTES)
+    bodyText = await readBoundedBody(res.body, RESPONSE_BODY_CAPTURE_BYTES)
   } catch {
     // ignore — non-2xx 时丢掉 master 错误细节但 status code 已携带分类
   }
@@ -206,9 +194,8 @@ export async function attemptSend(
     )
   }
   if (status === 401 || status === 403) {
-    // 与 v3MasterSink 不同:wechat broker 401/403 在生产路径上不可能短暂出现
-    // (master 不会因为时钟漂移 reject;bearer 是容器启动期注入的稳定值)。
-    // 持续 401/403 = 运维错配,enqueue retry 24h 是噪声。判 fatal,让 ops 看到。
+    // Keep the diagnostic `fatal` class for operators. The durable queue does
+    // not discard on this class; only an explicit 410 owner deletion may do so.
     throw new V3WechatSinkError(
       `auth ${status}: ${truncateForLog(bodyText)}`,
       "fatal",
@@ -350,6 +337,21 @@ function buildCodexBillingPayload(
     status: out.status === "error" ? "error" : "success",
     durationMs: Number.isFinite(out.durationMs) && out.durationMs >= 0 ? out.durationMs : 0,
   }
+  if (typeof out.turnKey === "string" && /^[0-9a-f]{64}$/.test(out.turnKey)) {
+    payload.turnKey = out.turnKey
+  }
+  if (typeof out.parentTurnKey === "string" && /^[0-9a-f]{64}$/.test(out.parentTurnKey)) {
+    payload.parentTurnKey = out.parentTurnKey
+  }
+  if (typeof out.parentSessionId === "string" && out.parentSessionId.length > 0) {
+    payload.parentSessionId = out.parentSessionId
+  }
+  if (typeof out.delegateAgentId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(out.delegateAgentId)) {
+    payload.delegateAgentId = out.delegateAgentId
+  }
+  if (typeof out.engineSessionId === "string" && /^oceng-[0-9a-f]{48}$/.test(out.engineSessionId)) {
+    payload.engineSessionId = out.engineSessionId
+  }
   if (out.usage !== undefined) payload.usage = out.usage
   if (typeof out.errorReason === "string") payload.errorReason = out.errorReason
   if (out.rateLimits !== undefined) payload.rateLimits = out.rateLimits
@@ -409,123 +411,33 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
 
     async send(out: OutboundMessage) {
       const maybeBilling = out as unknown
+      let payload: V3WechatOutboundPostPayload
       if (isCodexBillingFrame(maybeBilling)) {
         if (maybeBilling.channel !== "wechat" && maybeBilling.channel !== "webchat") return
-        const payload = buildCodexBillingPayload(maybeBilling)
-        if ("error" in payload) {
-          log.warn("dropped: build codex billing payload failed", { reason: payload.error })
-          return
+        const built = buildCodexBillingPayload(maybeBilling)
+        if ("error" in built) {
+          throw new Error(`cannot durably stage codex billing frame: ${built.error}`)
         }
-        try {
-          await attempt(payload, { config: cfg })
-        } catch (err) {
-          if (err instanceof V3WechatSinkError && err.errorClass === "fatal") {
-            log.warn("send: fatal codex billing sink error, dropping", {
-              requestId: payload.requestId,
-              httpStatus: err.httpStatus,
-              err: err.message,
-            })
-            return
-          }
-          const entry: V3WechatRetryEntry = {
-            schemaVersion: 1,
-            payload,
-            firstSeenAt: now(),
-            attempts: 1,
-            lastErrorClass:
-              err instanceof V3WechatSinkError ? err.errorClass : "transient",
-            lastErrorAt: now(),
-            lastErrorMessage:
-              err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
-          }
-          try {
-            await retryQueue.enqueueDurable(entry)
-          } catch (enqErr) {
-            log.error(
-              "send: enqueueDurable failed after codex billing attempt",
-              { requestId: payload.requestId },
-              enqErr,
-            )
-          }
+        payload = built
+      } else {
+        if (out.channel !== "wechat" && out.channel !== "webchat") return
+        const built = buildWirePayload(out, cfg, now())
+        if ("error" in built) {
+          throw new Error(`cannot durably stage WeChat output: ${built.error}`)
         }
-        return
+        payload = built
       }
 
-      if (out.channel !== "wechat" && out.channel !== "webchat") return
-      const payload = buildWirePayload(out, cfg, now())
-      if ("error" in payload) {
-        // 拍 payload 失败 → 该消息进 retry 也注定 400 fatal,log + drop
-        log.warn("dropped: build payload failed", {
-          sessionId: out.peer?.id,
-          reason: payload.error,
-        })
-        return
+      // Write + fsync + directory-fsync before the first network attempt. The
+      // queue's kick performs delivery and removes the file only after a 2xx
+      // ACK (or explicit 410 owner deletion); all other failures remain forever.
+      const entry: V3WechatRetryEntry = {
+        schemaVersion: 1,
+        payload,
+        firstSeenAt: now(),
+        attempts: 0,
       }
-
-      // 1) 即时一次 attempt
-      try {
-        await attempt(payload, { config: cfg })
-        return
-      } catch (err) {
-        if (err instanceof V3WechatSinkError && err.errorClass === "fatal") {
-          if (payload.isFinal !== true) {
-            log.warn("send: fatal sink error, dropping", {
-              sessionId: payload.sessionId,
-              outboundId: payload.outboundId,
-              httpStatus: err.httpStatus,
-              err: err.message,
-            })
-            return
-          }
-          log.warn("send: fatal final sink error, enqueueing terminal retry", {
-            sessionId: payload.sessionId,
-            outboundId: payload.outboundId,
-            httpStatus: err.httpStatus,
-            err: err.message,
-          })
-          const entry: V3WechatRetryEntry = {
-            schemaVersion: 1,
-            payload,
-            firstSeenAt: now(),
-            attempts: 1,
-            lastErrorClass: "fatal",
-            lastErrorAt: now(),
-            lastErrorMessage: err.message.slice(0, 500),
-          }
-          try {
-            await retryQueue.enqueueDurable(entry)
-          } catch (enqErr) {
-            log.error(
-              "send: enqueueDurable failed after fatal final attempt",
-              { sessionId: payload.sessionId, outboundId: payload.outboundId },
-              enqErr,
-            )
-          }
-          return
-        }
-        // transient / 未知 → enqueue durable retry
-        const entry: V3WechatRetryEntry = {
-          schemaVersion: 1,
-          payload,
-          firstSeenAt: now(),
-          attempts: 1,
-          lastErrorClass:
-            err instanceof V3WechatSinkError ? err.errorClass : "transient",
-          lastErrorAt: now(),
-          lastErrorMessage:
-            err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
-        }
-        try {
-          await retryQueue.enqueueDurable(entry)
-        } catch (enqErr) {
-          // 落盘失败也只能 log;此时已经把数据丢了,但至少 alarm 出来
-          log.error(
-            "send: enqueueDurable failed after transient attempt",
-            { sessionId: payload.sessionId, outboundId: payload.outboundId },
-            enqErr,
-          )
-        }
-      }
+      await retryQueue.enqueueDurable(entry)
     },
 
     async shutdown() {

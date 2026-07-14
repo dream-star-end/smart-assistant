@@ -12,6 +12,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/subprocessRunnerSetters.test.ts
  */
 import * as assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 import { ALLOWED_INBOUND_MODELS, resolveExecutionModel } from '../server.js'
 import {
@@ -154,6 +155,83 @@ describe('SubprocessRunner.model getter / setModel', () => {
     r.setToolsets(undefined)
     assert.equal(r.toolsets, undefined)
     assert.equal(spawned, false, 'setToolsets must not spawn — caller owns restart via shutdown()')
+  })
+})
+
+describe('SubprocessRunner bounded shutdown', () => {
+  it('returns after SIGKILL but retains ownership until the real close boundary', async () => {
+    const oldGrace = process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS = '5'
+    process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS = '5'
+    const runner = createRunner()
+    const proc = new EventEmitter() as EventEmitter & {
+      pid?: number
+      stdin: { end: () => void }
+      kill: (signal: NodeJS.Signals) => boolean
+    }
+    const signals: NodeJS.Signals[] = []
+    proc.stdin = { end: () => {} }
+    proc.kill = (signal) => {
+      signals.push(signal)
+      return true
+    }
+    ;(runner as any).proc = proc
+    try {
+      await runner.shutdown()
+      assert.deepEqual(signals, ['SIGKILL'])
+      assert.equal((runner as any).proc, proc)
+      assert.equal((runner as any).shuttingDown, true)
+      proc.emit('close')
+      assert.equal((runner as any).proc, null)
+      assert.equal((runner as any).shuttingDown, false)
+    } finally {
+      if (oldGrace === undefined) delete process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS
+      else process.env.OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS = oldGrace
+      if (oldFinal === undefined) delete process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS
+      else process.env.OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS = oldFinal
+    }
+  })
+
+  it('ignores a drained exit from a detached old process after a new process owns the runner', () => {
+    const runner = createRunner()
+    const oldProc = new EventEmitter()
+    const newProc = new EventEmitter()
+    ;(runner as any).proc = newProc
+    const exits: unknown[] = []
+    runner.on('exit', (info) => exits.push(info))
+
+    const forwarded = (runner as any)._forwardDrainedExitForProcess(oldProc, {
+      code: 137,
+      signal: 'SIGKILL',
+      crashed: true,
+    })
+
+    assert.equal(forwarded, false)
+    assert.deepEqual(exits, [])
+    assert.equal((runner as any).proc, newProc)
+  })
+})
+
+describe('SubprocessRunner lossless stdout', () => {
+  it('parses a valid stream-json line larger than the former 8 MiB cap without dropping it', () => {
+    const runner = createRunner()
+    const text = '模型与工具完整输出😀'.repeat(600_000)
+    const messages: Array<Record<string, any>> = []
+    const overflows: unknown[] = []
+    runner.on('message', (message) => messages.push(message as Record<string, any>))
+    runner.on('overflow', (info) => overflows.push(info))
+
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text }] },
+    })
+    assert.ok(Buffer.byteLength(line, 'utf8') > 8 * 1024 * 1024)
+    ;(runner as any).handleStdout(`${line}\n`)
+
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0].message.content[0].text, text)
+    assert.deepEqual(overflows, [])
   })
 })
 

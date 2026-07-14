@@ -575,6 +575,12 @@ export const OutboundCodexBilling = Type.Object({
   /** master 写入的 server-owned id;container 必须原样回带。缺这个字段的帧
    *  master 会丢弃(无法定位 inflight 行)。 */
   requestId: Type.String(),
+  /** Stable logical paid-turn key shared with lossless turn-tape persistence.
+   * Optional only for rolling compatibility with older runtime images. */
+  turnKey: Type.Optional(Type.String({ pattern: '^[0-9a-f]{64}$' })),
+  parentTurnKey: Type.Optional(Type.String({ pattern: '^[0-9a-f]{64}$' })),
+  parentSessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  delegateAgentId: Type.Optional(Type.String({ pattern: '^[A-Za-z0-9_-]{1,64}$' })),
   /** M2(v5 codex 复活)— engine-reported 计费的稳定记账键。
    *
    *  值 = gateway engine/engineSessionId.ts 的 `engineSessionId(sessionKey)`

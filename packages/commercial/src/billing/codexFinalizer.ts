@@ -18,9 +18,8 @@
  *      debit(沿用 anthropic 既有 helper,(user_id, request_id) UNIQUE 防重复)
  *   2. finalizeInflightJournal:**独立** UPDATE 把 journal 由 inflight → committed
  *      (与 settle 不在同一 tx — 沿用 anthropic 既有架构;若 settle 已 COMMIT 而
- *      finalize 失败,会进 catch 走 abortInflightJournal,留下"用户已扣费 + journal=
- *      aborted"的窄窗口,reconciler 不会回滚已 COMMIT 的 ledger,日志可发现。统一
- *      模式与 anthropicProxy.makeFinalizer 一致,不在 PR2 范围内重构)
+ *      finalize 失败,journal 保持可恢复态。immutable turn tape 重放时依靠
+ *      usage_records(user_id,request_id) 幂等补齐,绝不把瞬态错误固化成免单)
  *   3. release preCheck reservation
  *
  * 与 anthropic 路径的 makeFinalizer 区别:
@@ -39,7 +38,8 @@
  *       - commit-after-fail:await fail 完成后返合成 SKIPPED_RESULT(debitedCredits
  *         =null caller 不广播);**不**把 Promise<void> cast 成 Promise<Result>
  *       - fail-after-commit:await commit 完成 + swallow,no-op 不再 abort journal
- *   - commit 内部 settle 失败 → 自动 abortInflightJournal,然后 throw 给 caller log
+ *   - commit 内部 settle/finalize 失败 → journal 保持可恢复态并 throw 给 caller;
+ *     immutable turn tape 会无限重试,不会因瞬态故障丢失计费终态
  *   - 无论 commit 成功 / 失败 / fail → 在 finally 里 releasePreCheck(否则
  *     Redis 锁卡 300s,影响下一 turn)
  *   - codex slot 已由 G6 early-release 路径(userChatBridge 看 outbound.message
@@ -76,6 +76,24 @@ import {
   settleUsageAndLedger,
   type SettleResult,
 } from "./proxyBilling.js";
+
+/** Journal marker written for Codex turns whose exact final billing evidence
+ * is carried by the immutable v2 turn tape. Reconciler/GC must never convert
+ * these rows into a time-based waiver or delete their recovery decision. */
+export const DURABLE_CODEX_RECOVERY_VERSION = "lossless_turn_tape_v2";
+
+/** `aborted` is ACK-safe only when the reason carries this explicit marker.
+ * Unmarked aborted rows may come from an older transient commit failure and
+ * are recoverable from the immutable billing frame. */
+export const PERMANENT_CODEX_WAIVER_PREFIX = "permanent_codex_waiver:";
+
+export function permanentCodexWaiverReason(reason: string): string {
+  return `${PERMANENT_CODEX_WAIVER_PREFIX}${reason}`.slice(0, 500);
+}
+
+export function isPermanentCodexWaiver(reason: unknown): reason is string {
+  return typeof reason === "string" && reason.startsWith(PERMANENT_CODEX_WAIVER_PREFIX);
+}
 
 /**
  * v5 计费口径(M1b):codex turn 的 usage_records.session_id 单一口径 ——
@@ -116,6 +134,13 @@ export interface CodexFinalizeContext {
   reservation: ReservationHandle;
   /** 模型权威开启时必传；写入 usage_records 四个留证列。 */
   authority?: BillingAuthorityStamp | null;
+  /** Default lossless cost locators. Billing-time attribution passed to
+   * commit() overrides these so deferred WeChat/Codex finalizers can still
+   * bind the debit atomically to the exact turn. */
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
   // v5(M1b):不再携带 accountId —— codex 记账 usage_records.account_id 恒写
   // SQL NULL(0044 SET NULL FK 语义,与 deepseek/minimax 静态 provider 同型),
   // 不再用 v3 的 `accountId=0n` 假账号占位。
@@ -148,6 +173,12 @@ export interface CodexFinalizeHandle {
     usage: TokenUsage,
     codexStatus: "success" | "error",
     errorReason?: string,
+    attribution?: {
+      turnKey?: string | null;
+      parentTurnKey?: string | null;
+      parentSessionId?: string | null;
+      delegateAgentId?: string | null;
+    },
   ): Promise<CodexFinalizeResult>;
   /**
    * 无 usage 的失败收尾(用户 ws 断开 / 容器 crash / runner spawn 失败等)。
@@ -186,6 +217,12 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
     usage: TokenUsage,
     codexStatus: "success" | "error",
     errorReason?: string,
+    attribution?: {
+      turnKey?: string | null;
+      parentTurnKey?: string | null;
+      parentSessionId?: string | null;
+      delegateAgentId?: string | null;
+    },
   ): Promise<CodexFinalizeResult> {
     return (async (): Promise<CodexFinalizeResult> => {
       const { cost_credits, snapshot } = computeCost(usage, ctx.derivedPricing);
@@ -234,6 +271,16 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
           costCredits: effectiveCredits,
           status: settleStatus,
           sessionId: ctx.engineSessionId,
+          mode:
+            (attribution?.parentTurnKey ?? ctx.parentTurnKey) ||
+            (attribution?.parentSessionId ?? ctx.parentSessionId) ||
+            (attribution?.delegateAgentId ?? ctx.delegateAgentId)
+              ? "delegate"
+              : "chat",
+          parentSessionId: attribution?.parentSessionId ?? ctx.parentSessionId ?? null,
+          delegateAgentId: attribution?.delegateAgentId ?? ctx.delegateAgentId ?? null,
+          turnKey: attribution?.turnKey ?? ctx.turnKey ?? null,
+          parentTurnKey: attribution?.parentTurnKey ?? ctx.parentTurnKey ?? null,
           authority: ctx.authority ?? null,
         });
         await finalizeInflightJournal(ctx.pgPool, {
@@ -243,14 +290,10 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
           usageId: settled.usageId,
         });
       } catch (err) {
-        // settle 或 journal CAS 失败 → 自动 abort journal 兜底,reservation 在外层
-        // finally 仍会 release。throw 给 caller 让它 log(billing 拦截块只 log 不
-        // 双重 release)。
-        await abortInflightJournal(
-          ctx.pgPool,
-          ctx.requestId,
-          `codex_commit_failed: ${(err as Error).message}`.slice(0, 500),
-        ).catch(() => {});
+        // A DB/network failure is not a waiver decision. Keep the journal
+        // recoverable so the immutable billing frame can retry after restart.
+        // If settle committed but the journal CAS failed, the next replay is
+        // still idempotent via usage_records(user_id,request_id).
         throw err;
       }
       return {
@@ -265,7 +308,15 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
 
   async function failOnce(reason: string): Promise<void> {
     try {
-      await abortInflightJournal(ctx.pgPool, ctx.requestId, reason.slice(0, 500));
+      // fail() is used only after a terminal no-usage decision (rejected before
+      // execution, explicit abandon, or a terminal engine failure). Mark it so
+      // durable replay can distinguish this proven waiver from legacy/transient
+      // `aborted` rows.
+      await abortInflightJournal(
+        ctx.pgPool,
+        ctx.requestId,
+        permanentCodexWaiverReason(reason),
+      );
     } catch {
       // journal abort 失败 — 数据库瞬断,reconciler 会扫到 stuck inflight 兜底。
       // 这里不 rethrow,让 cleanup 路径继续走完(Map 必须清空)。
@@ -273,7 +324,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
   }
 
   return {
-    async commit(usage, codexStatus, errorReason) {
+    async commit(usage, codexStatus, errorReason, attribution) {
       if (_done !== null) {
         if (_done.kind === "commit") {
           // commit-after-commit:duplicate billing 帧场景 — 共享首次 promise,
@@ -288,7 +339,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       }
       const promise = (async (): Promise<CodexFinalizeResult> => {
         try {
-          return await commitOnce(usage, codexStatus, errorReason);
+          return await commitOnce(usage, codexStatus, errorReason, attribution);
         } finally {
           // 无论 commit 成 / 失败,都 release preCheck(否则 Redis 锁卡 300s)。
           await releasePreCheck(ctx.preCheckRedis, ctx.reservation).catch(

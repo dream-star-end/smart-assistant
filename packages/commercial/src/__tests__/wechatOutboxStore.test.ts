@@ -18,9 +18,6 @@ import {
   purgeFailedAged,
   DEFAULT_MAX_ATTEMPTS,
   STALE_SENDING_MS,
-  AGE_CUTOFF_MS,
-  SENT_TOMBSTONE_MS,
-  FAILED_RETENTION_MS,
 } from "../wechat/outboxStore.js"
 import type { OutboxStatus } from "../wechat/types.js"
 
@@ -70,6 +67,7 @@ describe("outboxStore.enqueue", () => {
     senderId: "s1",
     sessionId: "wsess-0123456789abcdef",
     payload: [{ type: "text" as const, text: "hi" }],
+    rawPayload: { blocks: [{ kind: "text", text: "hi", futureField: "exact" }] },
     now: 1000,
   }
 
@@ -85,6 +83,8 @@ describe("outboxStore.enqueue", () => {
     assert.match(insert.sql, /RETURNING id/)
     assert.match(insert.sql, /'queued'/)
     assert.match(insert.sql, /payload/)
+    assert.match(insert.sql, /raw_payload/)
+    assert.equal(insert.params[5], JSON.stringify(params.rawPayload))
   })
 
   test("existing row, status='sent' → already_sent (INSERT ON CONFLICT skips, SELECT FOR UPDATE reads tombstone)", async () => {
@@ -118,7 +118,7 @@ describe("outboxStore.enqueue", () => {
     assert.deepEqual(result, { outcome: "pending", outboxId: 9, attempts: 1 })
   })
 
-  test("existing row, status='failed' & attempts < maxAttempts → reset to queued, preserve attempts", async () => {
+  test("existing failed row resets to queued and preserves attempts", async () => {
     const { pool, captured } = makeFakePool([
       { rows: [], rowCount: 0 }, // INSERT conflict
       { rows: [{ id: 5, status: "failed" as OutboxStatus, attempts: 3 }], rowCount: 1 }, // SELECT FOR UPDATE
@@ -134,27 +134,29 @@ describe("outboxStore.enqueue", () => {
     assert.ok(!/attempts\s*=\s*0/i.test(updateSql), "must NOT reset attempts to 0")
   })
 
-  test("existing row, status='failed' & attempts >= maxAttempts → already_failed (no revive)", async () => {
+  test("existing row, status='failed' revives regardless of attempt count", async () => {
     const { pool, captured } = makeFakePool([
       { rows: [], rowCount: 0 }, // INSERT conflict
       { rows: [{ id: 6, status: "failed" as OutboxStatus, attempts: 10 }], rowCount: 1 },
+      { rows: [], rowCount: 1 },
     ])
     const result = await enqueue(pool, params, 10)
-    assert.deepEqual(result, { outcome: "already_failed", outboxId: 6, attempts: 10 })
-    // 关键:不应该有 status='queued' 的 UPDATE(单纯读后返回)
+    assert.deepEqual(result, { outcome: "queued", outboxId: 6, attempts: 10 })
     const resetUpdates = captured.filter((c) =>
       /UPDATE wechat_outbox/.test(c.sql) && /SET\s+status\s*=\s*'queued'/.test(c.sql),
     )
-    assert.equal(resetUpdates.length, 0, "already_failed must not reset to queued")
+    assert.equal(resetUpdates.length, 1)
   })
 
-  test("status='failed' & attempts === maxAttempts boundary still already_failed (>= not >)", async () => {
+  test("status='failed' above legacy maxAttempts boundary still revives", async () => {
     const { pool } = makeFakePool([
       { rows: [], rowCount: 0 },
-      { rows: [{ id: 11, status: "failed" as OutboxStatus, attempts: 10 }], rowCount: 1 },
+      { rows: [{ id: 11, status: "failed" as OutboxStatus, attempts: 10_000 }], rowCount: 1 },
+      { rows: [], rowCount: 1 },
     ])
     const result = await enqueue(pool, params, 10)
-    assert.equal(result.outcome, "already_failed")
+    assert.equal(result.outcome, "queued")
+    assert.equal(result.attempts, 10_000)
   })
 
   test("INSERT payload serialized as JSONB ($5::jsonb cast)", async () => {
@@ -306,7 +308,7 @@ describe("outboxStore.markSent", () => {
 })
 
 describe("outboxStore.markFailed", () => {
-  test("attempts + 1 < maxAttempts → release back to queued, returns permanent=false", async () => {
+  test("every delivery failure releases back to queued with no attempt cap", async () => {
     const { pool, captured } = makeFakePool([
       { rows: [{ attempts: 1, status: "queued" }], rowCount: 1 },
     ])
@@ -314,17 +316,17 @@ describe("outboxStore.markFailed", () => {
     assert.deepEqual(result, { permanent: false, attempts: 1 })
     const sql = captured[0]!.sql
     assert.match(sql, /attempts\s*=\s*attempts \+ 1/)
-    assert.match(sql, /WHEN attempts \+ 1 >= \$1 THEN 'failed' ELSE 'queued'/)
-    assert.match(sql, /next_attempt_at\s*=\s*CASE WHEN attempts \+ 1 >= \$1 THEN NULL ELSE \$5::bigint END/)
-    assert.equal(captured[0]!.params[4], 14_999)
+    assert.match(sql, /status\s*=\s*'queued'/)
+    assert.match(sql, /next_attempt_at\s*=\s*\$4::bigint/)
+    assert.equal(captured[0]!.params[3], 14_999)
   })
 
-  test("attempts + 1 >= maxAttempts → permanent failed, returns permanent=true", async () => {
+  test("attempts above the legacy cap still retry", async () => {
     const { pool } = makeFakePool([
-      { rows: [{ attempts: 10, status: "failed" }], rowCount: 1 },
+      { rows: [{ attempts: 10_001, status: "queued" }], rowCount: 1 },
     ])
     const result = await markFailed(pool, 42, "exhausted", 9999, 10)
-    assert.deepEqual(result, { permanent: true, attempts: 10 })
+    assert.deepEqual(result, { permanent: false, attempts: 10_001 })
   })
 
   test("err message truncated to 1000 chars (matches DB CHECK)", async () => {
@@ -333,7 +335,7 @@ describe("outboxStore.markFailed", () => {
       { rows: [{ attempts: 1, status: "queued" }], rowCount: 1 },
     ])
     await markFailed(pool, 42, longErr, 9999, 10)
-    const errParam = captured[0]!.params[1] as string
+    const errParam = captured[0]!.params[0] as string
     assert.equal(errParam.length, 1000)
   })
 
@@ -369,68 +371,39 @@ describe("outboxStore.releaseStaleSending", () => {
 })
 
 describe("outboxStore.dropAgedPending", () => {
-  test("rotates queued/sending → failed with attempts = maxAttempts (no-revive)", async () => {
-    const { pool, captured } = makeFakePool([{ rows: [], rowCount: 5 }])
+  test("is a no-op: queued/sending rows never expire", async () => {
+    const { pool, captured } = makeFakePool([])
     const n = await dropAgedPending(pool, 1_000_000, undefined, 10)
-    assert.equal(n, 5)
-    const sql = captured[0]!.sql
-    assert.match(sql, /SET[\s\S]+status\s*=\s*'failed'[\s\S]+attempts\s*=\s*\$1/)
-    assert.match(sql, /WHERE status IN \('queued', 'sending'\)/)
-    assert.match(sql, /AND created_at < \$3/)
-    assert.equal(captured[0]!.params[0], 10) // maxAttempts
-    assert.equal(captured[0]!.params[2], 1_000_000 - AGE_CUTOFF_MS) // default cutoff
-  })
-
-  test("custom ageMs override is respected", async () => {
-    const { pool, captured } = makeFakePool([{ rows: [], rowCount: 0 }])
-    await dropAgedPending(pool, 1_000_000, 60_000, 10)
-    assert.equal(captured[0]!.params[2], 1_000_000 - 60_000)
+    assert.equal(n, 0)
+    assert.equal(captured.length, 0)
   })
 })
 
 describe("outboxStore.purgeSentTombstones", () => {
-  test("DELETE WHERE status='sent' AND sent_at < cutoff (default 24h)", async () => {
-    const { pool, captured } = makeFakePool([{ rows: [], rowCount: 17 }])
+  test("is a no-op: sent idempotency/content tombstones never expire", async () => {
+    const { pool, captured } = makeFakePool([])
     const n = await purgeSentTombstones(pool, 1_000_000)
-    assert.equal(n, 17)
-    const sql = captured[0]!.sql
-    assert.match(sql, /DELETE FROM wechat_outbox/)
-    assert.match(sql, /status = 'sent'/)
-    assert.match(sql, /sent_at IS NOT NULL AND sent_at < \$1/)
-    assert.equal(captured[0]!.params[0], 1_000_000 - SENT_TOMBSTONE_MS)
+    assert.equal(n, 0)
+    assert.equal(captured.length, 0)
   })
 })
 
 describe("outboxStore.purgeFailedAged", () => {
-  test("DELETE WHERE status='failed' AND updated_at < cutoff (default 7d)", async () => {
-    const { pool, captured } = makeFakePool([{ rows: [], rowCount: 4 }])
+  test("is a no-op: undeliverable payloads remain inspectable forever", async () => {
+    const { pool, captured } = makeFakePool([])
     const n = await purgeFailedAged(pool, 1_000_000)
-    assert.equal(n, 4)
-    const sql = captured[0]!.sql
-    assert.match(sql, /DELETE FROM wechat_outbox/)
-    assert.match(sql, /status = 'failed' AND updated_at < \$1/)
-    assert.equal(captured[0]!.params[0], 1_000_000 - FAILED_RETENTION_MS)
+    assert.equal(n, 0)
+    assert.equal(captured.length, 0)
   })
 })
 
 describe("outboxStore constants alignment", () => {
-  test("DEFAULT_MAX_ATTEMPTS is 10 (per RFC §4.6)", () => {
+  test("legacy DEFAULT_MAX_ATTEMPTS remains 10 for config compatibility", () => {
     assert.equal(DEFAULT_MAX_ATTEMPTS, 10)
-  })
-
-  test("SENT_TOMBSTONE_MS = 24h (matches migration comment)", () => {
-    assert.equal(SENT_TOMBSTONE_MS, 24 * 60 * 60 * 1000)
-  })
-
-  test("FAILED_RETENTION_MS = 7d", () => {
-    assert.equal(FAILED_RETENTION_MS, 7 * 24 * 60 * 60 * 1000)
   })
 
   test("STALE_SENDING_MS = 5min (worker crash recovery)", () => {
     assert.equal(STALE_SENDING_MS, 5 * 60 * 1000)
   })
 
-  test("AGE_CUTOFF_MS = 24h (drop pending older than 24h)", () => {
-    assert.equal(AGE_CUTOFF_MS, 24 * 60 * 60 * 1000)
-  })
 })

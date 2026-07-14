@@ -411,7 +411,7 @@ describe("makeCodexFinalizer / settleStatus selection", () => {
 });
 
 describe("makeCodexFinalizer / settle failure path", () => {
-  test("settle throw → abortInflightJournal called + rethrow + reservation released", async () => {
+  test("settle throw → journal stays recoverable + rethrow + reservation released", async () => {
     const { poolCtrl, redis, ctx } = await makeFixture();
     poolCtrl.injectInsertUsageError(new Error("simulated DB outage"));
     const fz = makeCodexFinalizer(ctx);
@@ -421,16 +421,16 @@ describe("makeCodexFinalizer / settle failure path", () => {
       /simulated DB outage/,
     );
 
-    // 自动 abort journal 兜底
+    // Transient/unknown commit failure must never become a permanent waiver.
     assert.ok(
-      poolCtrl.queries.some((q) => /state='aborted'/.test(q.sql)),
-      "settle throw must auto-abort journal",
+      !poolCtrl.queries.some((q) => /state='aborted'/.test(q.sql)),
+      "settle throw must leave journal recoverable for immutable replay",
     );
     // reservation 仍然被释放(finally 块)
     assert.equal(await reservationStillHeld(redis, ctx.reservation), false);
   });
 
-  test("settle throw 后 fail call no-op, 不再 abort", async () => {
+  test("settle throw 后 fail call no-op, journal remains recoverable", async () => {
     const { poolCtrl, ctx } = await makeFixture();
     poolCtrl.injectInsertUsageError(new Error("boom"));
     const fz = makeCodexFinalizer(ctx);

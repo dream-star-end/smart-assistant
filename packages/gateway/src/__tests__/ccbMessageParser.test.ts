@@ -3,16 +3,17 @@
  * Tests the CCB stream-json message parsing logic in isolation.
  * Run: npx tsx --test packages/gateway/src/__tests__/ccbMessageParser.test.ts
  */
-import { Buffer } from 'node:buffer'
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   CcbMessageParser,
-  MAX_THINKING_BUFFER_BYTES,
   type SessionStreamEvent,
 } from '../ccbMessageParser.js'
 
-function createParser(opts?: { onToolUse?: (t: any) => void }) {
+function createParser(opts?: {
+  onToolUse?: (t: any) => void
+  onPostFinalRuntimeEvent?: (event: any, block: any) => void
+}) {
   const events: SessionStreamEvent[] = []
   let finished = false
   let finishResult: any = null
@@ -22,6 +23,7 @@ function createParser(opts?: { onToolUse?: (t: any) => void }) {
     toolUseIdToName,
     onEvent: (e) => events.push(e),
     onToolUse: opts?.onToolUse,
+    onPostFinalRuntimeEvent: opts?.onPostFinalRuntimeEvent,
     onFinish: (result) => {
       finished = true
       finishResult = result
@@ -173,61 +175,34 @@ describe('CcbMessageParser: thinking accumulation', () => {
     assert.equal(parser.thinkingBuf, 'main agent thinks')
   })
 
-  it('caps thinkingBuf at MAX_THINKING_BUFFER_BYTES with truncation tail', () => {
+  it('retains an oversized thinking stream byte-for-byte', () => {
     const { parser } = createParser()
-    // Generate 16KB of ASCII (well over the 8KB cap)
     const giant = 'a'.repeat(16 * 1024)
     emitThinking(parser, giant)
-    const bufBytes = Buffer.byteLength(parser.thinkingBuf, 'utf8')
-    assert.ok(bufBytes <= MAX_THINKING_BUFFER_BYTES, `bufBytes ${bufBytes} <= cap ${MAX_THINKING_BUFFER_BYTES}`)
-    assert.ok(parser.thinkingBuf.endsWith('…[truncated]'), 'tail marker present')
+    assert.equal(parser.thinkingBuf, giant)
   })
 
-  it('truncated flag is sticky: subsequent deltas are dropped', () => {
+  it('retains every thinking delta after a large first delta', () => {
     const { parser } = createParser()
-    emitThinking(parser, 'a'.repeat(16 * 1024))
-    const lenAfter1 = parser.thinkingBuf.length
-    emitThinking(parser, 'should be ignored')
-    emitThinking(parser, 'also ignored')
-    assert.equal(parser.thinkingBuf.length, lenAfter1, 'no growth after first truncation')
+    const first = 'a'.repeat(16 * 1024)
+    emitThinking(parser, first)
+    emitThinking(parser, 'second')
+    emitThinking(parser, 'third')
+    assert.equal(parser.thinkingBuf, `${first}secondthird`)
   })
 
-  it('UTF-8 multi-byte boundary safe (does not split CJK characters)', () => {
+  it('retains large CJK thinking exactly', () => {
     const { parser } = createParser()
-    // Each Chinese char is 3 bytes in UTF-8. Build a string that lands the
-    // cap cut squarely inside a multi-byte sequence to verify we walk back
-    // to a leading byte instead of producing U+FFFD.
-    const cjk = '中' // 3 bytes
-    // Use enough '中' to push us well past the cap on a sub-byte alignment.
-    const giant = cjk.repeat(4096) // 12 KB total
+    const giant = '中'.repeat(4096)
     emitThinking(parser, giant)
-    // Decode round-trip should produce no replacement character before tail.
-    const beforeTail = parser.thinkingBuf.replace(/…\[truncated\]$/u, '')
-    assert.ok(!beforeTail.includes('\uFFFD'), 'no replacement character in truncated buffer')
-    // Every preserved byte triplet must form a valid CJK char.
-    for (const ch of beforeTail) {
-      assert.equal(ch, '中', `unexpected char ${ch.codePointAt(0)?.toString(16)}`)
-    }
+    assert.equal(parser.thinkingBuf, giant)
   })
 
-  it('UTF-8 4-byte sequence boundary safe (does not split emoji)', () => {
-    // Emoji like 😀 (U+1F600) is 4 bytes in UTF-8 and surfaces as a JS
-    // surrogate pair. The slice-back loop must walk all 3 continuation
-    // bytes back to the lead byte for a clean cut. Failing to do so would
-    // leave an orphan high surrogate or invalid byte sequence.
+  it('retains large emoji thinking exactly', () => {
     const { parser } = createParser()
-    const emoji = '😀' // 4 bytes UTF-8, 2 JS code units (surrogate pair)
-    const giant = emoji.repeat(2200) // ≈ 8800 bytes — over the 8KB cap
+    const giant = '😀'.repeat(2200)
     emitThinking(parser, giant)
-    const beforeTail = parser.thinkingBuf.replace(/…\[truncated\]$/u, '')
-    assert.ok(!beforeTail.includes('\uFFFD'), 'no replacement char in truncated buffer')
-    // Every code point must be the full emoji (not an orphan surrogate).
-    for (const ch of beforeTail) {
-      assert.equal(ch, emoji, `unexpected code point 0x${ch.codePointAt(0)?.toString(16)}`)
-    }
-    // Bytes still under cap.
-    const bufBytes = Buffer.byteLength(parser.thinkingBuf, 'utf8')
-    assert.ok(bufBytes <= MAX_THINKING_BUFFER_BYTES, `bufBytes ${bufBytes} <= cap`)
+    assert.equal(parser.thinkingBuf, giant)
   })
 
   it('thinkingText is forwarded into TurnResult on result event', () => {
@@ -378,6 +353,45 @@ describe('CcbMessageParser: tool_use', () => {
     assert.equal(delta2.block.partial, true)
     assert.equal(delta2.block.partialJsonDelta, ',"old_string":"hello')
     assert.equal(delta2.block.partialJsonOffset, '{"file_path":"/x"'.length)
+  })
+
+  it('retains an unmatched tool call and its exact raw partial JSON for crash persistence', () => {
+    const { parser } = createParser()
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tool-pending', name: 'Write' },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"file_path":"/tmp/full"' },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: ',"content":"全部细节' },
+      },
+    } as any)
+
+    const tools = parser.snapshotToolsForPersistence()
+    assert.equal(tools.length, 1)
+    assert.equal(tools[0].toolUseId, 'tool-pending')
+    assert.equal(tools[0].toolName, 'Write')
+    assert.equal(
+      tools[0].partialInputJson,
+      '{"file_path":"/tmp/full","content":"全部细节',
+    )
+    assert.equal(tools[0].completed, false)
+    assert.equal(tools[0].output, '')
   })
 
   it('keeps emitting partialJsonDelta past 64 KiB — no bandwidth cap', () => {
@@ -702,6 +716,29 @@ describe('CcbMessageParser: system', () => {
     }
   })
 
+  it('routes post-final bash tails through the durable continuation callback before live delivery', () => {
+    const continuations: Array<{ event: any; block: any }> = []
+    const { parser, events } = createParser({
+      onPostFinalRuntimeEvent: (event, block) => continuations.push({ event, block }),
+    })
+    parser.finish()
+    const raw = {
+      type: 'system',
+      subtype: 'bash_output_tail',
+      tool_use_id: 'toolu_bg',
+      tail: 'late paid output',
+      total_bytes: 16,
+      truncated_head: false,
+    }
+    parser.parse(raw as any)
+    assert.equal(events.length, 0, 'callback owns delivery after durable staging')
+    assert.equal(continuations.length, 1)
+    assert.deepEqual(continuations[0].event.payload, raw)
+    assert.equal(continuations[0].event.source, 'ccb')
+    assert.equal(continuations[0].block.kind, 'tool_output_tail')
+    assert.equal(continuations[0].block.tail, 'late paid output')
+  })
+
   it('forwards parent_tool_use_id on bash_output_tail for subagent routing', () => {
     const { parser, events } = createParser()
     parser.parse({
@@ -938,18 +975,12 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     assert.equal(parser.completedTools[0].output, 'partial')
   })
 
-  it('_capToolEntry truncates oversized output and stamps outputTruncated=true', () => {
-    const { parser, getResult } = createParser()
+  it('retains oversized tool output while keeping the live preview bounded', () => {
+    const { parser, getResult, events } = createParser()
     parser.parse({
       type: 'assistant',
       message: { content: [{ type: 'tool_use', id: 'tu_big', name: 'Bash', input: {} }] },
     } as any)
-    // 9 KB of content — _handleUser caps preview at 3000 chars, so
-    // _capToolEntry receives a 3001-char string and won't trigger output cap
-    // (PARSER_TOOL_OUTPUT_MAX_BYTES is 8 KB). Use 3000-cap-aware case below.
-    // To verify the parser-level cap actually fires, send the result with a
-    // very large content array — preview building converts each block to
-    // JSON, which can grow past the 3000 cap before slicing applies.
     const longContent = 'y'.repeat(20 * 1024)
     parser.parse({
       type: 'user',
@@ -960,16 +991,34 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     const result = getResult()
     assert.equal(result.tools.length, 1)
     const entry = result.tools[0]
-    // _handleUser caps preview to 3000 chars + `…`. Output is the preview, so
-    // it is bounded but may not trigger _capToolEntry's 8 KB cap.
-    assert.ok(entry.output.length <= 3001, 'preview cap applied at _handleUser level')
+    assert.equal(entry.output, longContent)
+    const liveResult = events.find(
+      (event) => event.kind === 'block' && event.block.kind === 'tool_result',
+    )
+    assert.ok(liveResult && liveResult.kind === 'block')
+    assert.ok(String((liveResult.block as any).preview).length <= 3001)
   })
 
-  it('inputJson cap: per-field cap shrinks oversized string values to 3000 chars + ellipsis', () => {
-    // Two-tier cap: _handleAssistant first applies a per-string-field 3000-char
-    // cap when the full input > 8000 chars. _capToolEntry's overall-bytes cap
-    // is a backstop for many-small-fields edge cases. The common path (one
-    // huge payload field) hits the per-field cap.
+  it('retains the exact structured tool_result content alongside its text rendering', () => {
+    const { parser, getResult } = createParser()
+    parser.parse({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tu_struct', name: 'Read', input: {} }] },
+    } as any)
+    const structured = [
+      { type: 'text', text: 'first' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+      { future_field: { nested: [1, 2, 3] } },
+    ]
+    parser.parse({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_struct', content: structured }] },
+    } as any)
+    parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+    assert.deepEqual(getResult().tools[0].outputJson, structured)
+  })
+
+  it('retains oversized tool input values exactly', () => {
     const { parser, getResult } = createParser()
     const big = 'z'.repeat(20 * 1024)
     parser.parse({
@@ -984,20 +1033,12 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
 
     const result = getResult()
     const entry = result.tools[0]
-    // _handleAssistant's per-field cap kicks in first → object preserved with
-    // each oversized string truncated to 3000 chars + '…' (3001 total).
     assert.equal(typeof entry.inputJson, 'object')
     const payload = (entry.inputJson as { payload: string }).payload
-    assert.equal(payload.length, 3001)
-    assert.ok(payload.endsWith('…'))
-    // Final blob fits well under the master schema cap (16 KB).
-    assert.ok(JSON.stringify(entry.inputJson).length <= 16 * 1024)
+    assert.equal(payload, big)
   })
 
-  it('inputJson backstop cap: many-small-fields path triggers _capToolEntry sentinel + inputTruncated=true', () => {
-    // Each value is < 3000 chars, so _handleAssistant's per-field cap does NOT
-    // fire; total serialized size still > PARSER_TOOL_INPUT_JSON_MAX_BYTES (8 KB).
-    // _capToolEntry's overall-byte cap kicks in with the JSON-encoded sentinel.
+  it('retains many-field tool input exactly', () => {
     const { parser, getResult } = createParser()
     const fields: Record<string, string> = {}
     // 200 fields × ~50 char value + ~5 char key ≈ 11 KB — over 8 KB cap
@@ -1017,10 +1058,7 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
 
     const result = getResult()
     const entry = result.tools[0]
-    // Backstop triggers: serialized string with sentinel suffix.
-    assert.equal(typeof entry.inputJson, 'string')
-    assert.ok((entry.inputJson as string).endsWith('…[truncated]'))
-    assert.equal(entry.inputTruncated, true)
+    assert.deepEqual(entry.inputJson, fields)
   })
 
   it('tool_result for a tool_use we never saw still records with empty input fallback', () => {
@@ -1066,6 +1104,81 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
     const result = getResult()
     assert.deepEqual(result.tools, [])
+  })
+})
+
+describe('CcbMessageParser: lossless raw runtime tape', () => {
+  it('retains assistant_error, progress, future system fields and exact result error', () => {
+    const { parser, events, getResult } = createParser()
+    const assistantError = {
+      type: 'assistant_error',
+      error: 'provider exact failure',
+      future: { nested: ['kept', 7] },
+    }
+    const progress = {
+      type: 'tool_progress',
+      tool_use_id: 'tu-progress',
+      elapsed_time_seconds: 12.5,
+      full_output: 'x'.repeat(20_000),
+    }
+    const futureSystem = {
+      type: 'system',
+      subtype: 'future_task_event',
+      payload: { every: 'field', values: Array.from({ length: 100 }, (_, i) => i) },
+    }
+    const resultMessage = {
+      type: 'result',
+      subtype: 'error_during_execution',
+      total_cost_usd: 0.25,
+      is_error: true,
+      result: 'full provider response',
+      errors: ['first exact error', 'second exact error'],
+      usage: { input_tokens: 4, output_tokens: 5 },
+    }
+    parser.parse(assistantError as any)
+    parser.parse(progress as any)
+    parser.parse(futureSystem as any)
+    parser.parse(resultMessage as any)
+
+    const result = getResult()
+    assert.deepEqual(result.runtimeEvents.map((event: any) => event.ordinal), [0, 1, 2, 3])
+    assert.deepEqual(result.runtimeEvents.map((event: any) => event.payload), [
+      assistantError,
+      progress,
+      futureSystem,
+      resultMessage,
+    ])
+    assert.equal(result.errorDetail, JSON.stringify({
+      subtype: 'error_during_execution',
+      result: 'full provider response',
+      errors: ['first exact error', 'second exact error'],
+    }))
+    assert.ok(events.some((event) =>
+      event.kind === 'error' && event.error === 'provider exact failure'))
+  })
+
+  it('captures exact Codex JSON-RPC on a side channel without perturbing live events', () => {
+    const { parser, events, getResult } = createParser()
+    const raw = {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'printf exact',
+          aggregatedOutput: 'y'.repeat(30_000),
+          exitCode: 17,
+          futureField: { untouched: true },
+        },
+      },
+    }
+    parser.captureRuntimeEvent(raw, 'codex-jsonrpc')
+    assert.deepEqual(events, [])
+    parser.parse({ type: 'result', total_cost_usd: 0, usage: {} } as any)
+    const result = getResult()
+    assert.equal(result.runtimeEvents[0].source, 'codex-jsonrpc')
+    assert.deepEqual(result.runtimeEvents[0].payload, raw)
   })
 })
 

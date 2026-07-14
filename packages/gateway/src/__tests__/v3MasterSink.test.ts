@@ -1,34 +1,31 @@
 /**
- * V3 commercial container → master sink unit tests.
- *
- * Covers:
- *   - readV3MasterSinkConfig env handling (both set / one missing /
- *     trailing slash normalisation)
- *   - attemptSend HTTP status classification (200 / 404 / 5xx / 4xx /
- *     401-403 / network err / timeout / payload-too-large)
- *   - persistOrQueue orchestration (success → ok / transient → queued /
- *     session_missing → queued / fatal → dropped / unexpected throw →
- *     queued-as-transient)
- *   - module singleton getter (set / clear)
+ * Commercial container → master lossless turn-tape sink tests.
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/v3MasterSink.test.ts
  */
 
-import { describe, test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
+import { describe, test } from "node:test";
 
 import {
+  LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
+  LOSSLESS_TURN_TAPE_PART_BYTES,
+} from "@openclaude/protocol";
+
+import {
+  SERVER_AUTHORED_PATH,
   attemptSend,
+  buildLosslessTurnTapeRequests,
   getV3MasterSinkOrNull,
   makeV3MasterSink,
   readV3MasterSinkConfig,
   setV3MasterSinkSingleton,
   V3SinkError,
   type V3MasterSinkPayload,
+  type V3MasterSinkWirePayload,
 } from "../v3MasterSink.js";
 import type { V3MasterRetryQueue } from "../v3MasterRetryQueue.js";
-
-// ─── tiny test fixtures ─────────────────────────────────────────────────
 
 const PAYLOAD: V3MasterSinkPayload = {
   sessionId: "sess12345",
@@ -38,17 +35,30 @@ const PAYLOAD: V3MasterSinkPayload = {
   text: "hello world",
 };
 
-const CFG = { baseUrl: "http://master.test:18791", bearer: "oc-v3.7." + "a".repeat(64) };
+const CFG = {
+  baseUrl: "http://master.test:18791",
+  bearer: "oc-v3.7." + "a".repeat(64),
+};
 
-function makeFakeFetcher(opts: {
+type Capture = { url: string; body: string; headers: Record<string, string> };
+
+function makeFetcher(opts: {
   status?: number;
   body?: string;
   throwError?: Error;
-}): typeof import("undici").request {
-  const fn = async () => {
+} = {}): {
+  fetcher: typeof import("undici").request;
+  captures: Capture[];
+} {
+  const captures: Capture[] = [];
+  const fn = async (url: string, init: any) => {
+    captures.push({
+      url,
+      body: typeof init?.body === "string" ? init.body : "",
+      headers: init?.headers ?? {},
+    });
     if (opts.throwError) throw opts.throwError;
     const text = opts.body ?? "";
-    const buf = Buffer.from(text, "utf8");
     return {
       statusCode: opts.status ?? 200,
       headers: {},
@@ -57,772 +67,334 @@ function makeFakeFetcher(opts: {
       context: {},
       body: {
         async *[Symbol.asyncIterator]() {
-          yield buf;
+          yield Buffer.from(text, "utf8");
         },
-        // Methods undici body has but our handler doesn't use — stubbed
-        // so structural typing passes if anything peeks.
         text: async () => text,
       } as any,
     };
   };
-  return fn as unknown as typeof import("undici").request;
+  return { fetcher: fn as unknown as typeof import("undici").request, captures };
 }
 
-function fakeQueue(): V3MasterRetryQueue & { enqueued: any[] } {
+function decodeCapturedTape(captures: Capture[]): {
+  envelopes: Array<Record<string, any>>;
+  canonical: Buffer;
+  payload: Record<string, any>;
+} {
+  const envelopes = captures.map((capture) => JSON.parse(capture.body) as Record<string, any>);
+  const parts = envelopes.filter((envelope) => envelope.action === "part");
+  const finalizes = envelopes.filter((envelope) => envelope.action === "finalize");
+  assert.equal(finalizes.length, 1);
+  assert.equal(parts.length, finalizes[0]!.partCount);
+  parts.sort((a, b) => a.partIndex - b.partIndex);
+  const canonical = Buffer.concat(parts.map((part) => Buffer.from(part.data, "base64")));
+  assert.equal(canonical.length, finalizes[0]!.totalBytes);
+  assert.equal(createHash("sha256").update(canonical).digest("hex"), finalizes[0]!.tapeSha256);
+  return { envelopes, canonical, payload: JSON.parse(canonical.toString("utf8")) };
+}
+
+function fakeQueue(): V3MasterRetryQueue & { enqueued: any[]; kicks: number } {
   const enqueued: any[] = [];
   return {
     enqueued,
+    kicks: 0,
+    async stageDurable(entry) {
+      enqueued.push(entry);
+      return `1-${String(enqueued.length).padStart(16, "0")}.json`;
+    },
+    async ackDurable() { enqueued.shift(); },
     async enqueueDurable(entry) { enqueued.push(entry); },
-    async drainOnce() { return { considered: 0, drained: 0, retried: 0, ttlDropped: 0, fatalDropped: 0, errors: 0, pending: 0 }; },
-    kick() {},
+    async drainOnce() {
+      return {
+        considered: 0,
+        drained: 0,
+        retried: 0,
+        ttlDropped: 0,
+        fatalDropped: 0,
+        errors: 0,
+        pending: 0,
+      };
+    },
+    kick() { this.kicks++; },
     startPeriodic() {},
     stopPeriodic() {},
     async pendingCount() { return enqueued.length; },
   };
 }
 
-// ─── readV3MasterSinkConfig ──────────────────────────────────────────────
+describe("lossless v2 turn tape", () => {
+  test("large thinking/tool/subagent payload is split and reconstructs byte-for-byte", () => {
+    const thinkingText = "推理😀".repeat(90_000);
+    const toolOutput = "tool-output\n".repeat(45_000);
+    const childText = "child-detail".repeat(40_000);
+    const tools = Array.from({ length: 75 }, (_, index) => ({
+      toolUseId: `tu-${index}`,
+      blockId: `tu-${index}`,
+      toolName: "Bash",
+      inputJson: { command: `${index}:` + "x".repeat(8_000) },
+      inputPreview: "derived preview",
+      output: index === 0 ? toolOutput : `result-${index}`,
+      isError: false,
+      durationMs: 1,
+      ts: index + 1,
+      arrivedAt: index + 1,
+    }));
+    const agentGroups = Array.from({ length: 75 }, (_, index) => ({
+      runId: `dlg-${index}`,
+      agentId: "reviewer",
+      goal: `review-${index}`,
+      status: "ok" as const,
+      resultSummary: index === 0 ? childText : `child-${index}`,
+      transcript: [{ kind: "text", text: index === 0 ? childText : `child-${index}` }],
+      completedAt: index + 100,
+    }));
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "final answer".repeat(30_000),
+      thinkingText,
+      tools,
+      agentGroups,
+      createdAt: 1_783_944_000_000,
+    };
 
-describe("readV3MasterSinkConfig", () => {
-  test("returns null when both env missing", () => {
-    assert.equal(readV3MasterSinkConfig({}), null);
+    const tape = buildLosslessTurnTapeRequests(payload);
+    assert.ok(tape.parts.length > 4);
+    const reconstructed = Buffer.concat(tape.parts.map((part) => {
+      const bytes = Buffer.from(part.data, "base64");
+      assert.ok(bytes.length <= LOSSLESS_TURN_TAPE_PART_BYTES);
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), part.partSha256);
+      return bytes;
+    }));
+    assert.deepEqual(reconstructed, tape.canonical);
+    const parsed = JSON.parse(reconstructed.toString("utf8"));
+    assert.equal(parsed.thinkingText, thinkingText);
+    assert.equal(parsed.tools.length, 75);
+    assert.equal(parsed.tools[0].output, toolOutput);
+    assert.equal(parsed.tools[0].inputJson.command, "0:" + "x".repeat(8_000));
+    assert.equal(parsed.agentGroups.length, 75);
+    assert.equal(parsed.agentGroups[0].resultSummary, childText);
+    assert.equal(parsed.agentGroups[0].transcript[0].text, childText);
+    assert.doesNotMatch(reconstructed.toString("utf8"), /…\[truncated\]/);
   });
 
-  test("returns null when only one env present", () => {
+  test("canonical bytes and identities are deterministic", () => {
+    const payload = { ...PAYLOAD, createdAt: 123, turnKey: "a".repeat(64) };
+    const first = buildLosslessTurnTapeRequests(payload);
+    const second = buildLosslessTurnTapeRequests({ ...payload });
+    assert.deepEqual(first.canonical, second.canonical);
+    assert.deepEqual(first.parts, second.parts);
+    assert.deepEqual(first.finalize, second.finalize);
+  });
+});
+
+describe("readV3MasterSinkConfig", () => {
+  test("requires both env values", () => {
+    assert.equal(readV3MasterSinkConfig({}), null);
     assert.equal(readV3MasterSinkConfig({ OPENCLAUDE_V3_MASTER_BASE_URL: "http://x" }), null);
     assert.equal(readV3MasterSinkConfig({ OPENCLAUDE_V3_CONTAINER_TOKEN: "tok" }), null);
   });
 
   test("returns config and strips trailing slashes", () => {
-    const cfg = readV3MasterSinkConfig({
+    assert.deepEqual(readV3MasterSinkConfig({
       OPENCLAUDE_V3_MASTER_BASE_URL: "http://m.test:18791///",
       OPENCLAUDE_V3_CONTAINER_TOKEN: "tok",
-    });
-    assert.deepEqual(cfg, { baseUrl: "http://m.test:18791", bearer: "tok" });
+    }), { baseUrl: "http://m.test:18791", bearer: "tok" });
   });
 });
 
-// ─── attemptSend classification ──────────────────────────────────────────
-
-describe("attemptSend — status classification", () => {
-  test("200 → resolves void", async () => {
-    await assert.doesNotReject(() =>
-      attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 200, body: '{"ok":true}' }) }),
-    );
-  });
-
-  test("204 → resolves void", async () => {
-    await assert.doesNotReject(() =>
-      attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 204 }) }),
-    );
-  });
-
-  test("404 → V3SinkError(session_missing)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 404, body: '{"error":"session_not_found"}' }) }),
-      (err: unknown) => {
-        assert.ok(err instanceof V3SinkError);
-        assert.equal((err as V3SinkError).errorClass, "session_missing");
-        assert.equal((err as V3SinkError).httpStatus, 404);
-        return true;
-      },
-    );
-  });
-
-  test("410 → V3SinkError(fatal)  // soft-deleted master row is terminal — retry won't resurrect it", async () => {
-    // Why fatal not session_missing: 404 is a recoverable race (frontend's
-    // debounced PUT may still land), but 410 is a stable tombstone — the
-    // master row exists with deleted_at != NULL. Classifying as fatal stops
-    // the 24h durable retry storm that was the original c:66 root cause.
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 410, body: '{"error":"session_deleted"}' }) }),
-      (err: unknown) => {
-        assert.ok(err instanceof V3SinkError);
-        assert.equal((err as V3SinkError).errorClass, "fatal");
-        assert.equal((err as V3SinkError).httpStatus, 410);
-        return true;
-      },
-    );
-  });
-
-  test("500 → V3SinkError(transient)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 500, body: "boom" }) }),
-      (err: unknown) => {
-        assert.ok(err instanceof V3SinkError);
-        assert.equal((err as V3SinkError).errorClass, "transient");
-        assert.equal((err as V3SinkError).httpStatus, 500);
-        return true;
-      },
-    );
-  });
-
-  test("502 → V3SinkError(transient)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 502 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "transient",
-    );
-  });
-
-  test("401 → V3SinkError(transient)  // auth misconfig is recoverable", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 401 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "transient",
-    );
-  });
-
-  test("403 → V3SinkError(transient)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 403 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "transient",
-    );
-  });
-
-  test("400 → V3SinkError(fatal)  // schema rejection — retry won't help", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 400 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
-    );
-  });
-
-  test("405 → V3SinkError(fatal)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 405 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
-    );
-  });
-
-  test("413 → V3SinkError(fatal)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ status: 413 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
-    );
-  });
-
-  test("network error throw → V3SinkError(transient)", async () => {
-    await assert.rejects(
-      () => attemptSend(PAYLOAD, { config: CFG, fetcher: makeFakeFetcher({ throwError: new Error("ECONNREFUSED") }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "transient",
-    );
-  });
-
-  test("client-side oversized payload → V3SinkError(fatal)", async () => {
-    const huge: V3MasterSinkPayload = { ...PAYLOAD, text: "x".repeat(300 * 1024) };
-    await assert.rejects(
-      () => attemptSend(huge, { config: CFG, fetcher: makeFakeFetcher({ status: 200 }) }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
-    );
-  });
-});
-
-// ─── body cap shrink (Phase 0.4 thinking durability) ────────────────────
-describe("attemptSend — body cap shrink", () => {
-  // Capture the actual JSON body that fetcher saw, so we can assert the
-  // shrink branch fired.
-  function makeCapturingFetcher(): {
-    fetcher: typeof import("undici").request;
-    captures: Array<{ url: string; body: string }>;
-  } {
-    const captures: Array<{ url: string; body: string }> = [];
-    const fn = async (url: string, init: any) => {
-      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
-      return {
-        statusCode: 200,
-        headers: {},
-        trailers: {},
-        opaque: undefined,
-        context: {},
-        body: {
-          async *[Symbol.asyncIterator]() {
-            yield Buffer.from('{"ok":true}', "utf8");
-          },
-          text: async () => '{"ok":true}',
-        } as any,
-      };
-    };
-    return { fetcher: fn as unknown as typeof import("undici").request, captures };
-  }
-
-  test("combined-over-cap drops thinkingText and preserves assistant (request body excludes thinkingText)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    // Assistant alone fits (< 256 KB), but assistant + thinking exceeds cap.
-    const oversizedThinking: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "x".repeat(200 * 1024), // 200 KB assistant alone (under cap)
-      thinkingText: "y".repeat(80 * 1024), // pushes combined over 256 KB
-    };
-    await attemptSend(oversizedThinking, { config: CFG, fetcher });
-    assert.equal(captures.length, 1);
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.text, "x".repeat(200 * 1024));
-    assert.equal(
-      sent.thinkingText,
-      undefined,
-      "thinkingText should be stripped when combined exceeds body cap",
-    );
-  });
-
-  test("combined-over-cap with assistant alone still over cap → fatal", async () => {
-    const { fetcher } = makeCapturingFetcher();
-    const giant: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "x".repeat(280 * 1024), // assistant alone over 256 KB
-      thinkingText: "y".repeat(8 * 1024),
-    };
-    await assert.rejects(
-      () => attemptSend(giant, { config: CFG, fetcher }),
-      (err: unknown) => err instanceof V3SinkError && (err as V3SinkError).errorClass === "fatal",
-    );
-  });
-
-  test("thinking-only over cap → fatal (parser cap leaked)", async () => {
-    const { fetcher } = makeCapturingFetcher();
-    // Empty assistant, thinking-only, over cap. Parser is supposed to cap
-    // thinking at 8 KB so this branch should never fire in production —
-    // but if it does we must NOT silently drop the only piece of data.
-    const thinkingOnly: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "",
-      thinkingText: "z".repeat(300 * 1024),
-    };
-    await assert.rejects(
-      () => attemptSend(thinkingOnly, { config: CFG, fetcher }),
-      (err: unknown) =>
-        err instanceof V3SinkError &&
-        (err as V3SinkError).errorClass === "fatal" &&
-        err.message.includes("thinking-only"),
-    );
-  });
-
-  test("under-cap body with thinkingText is forwarded as-is", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const small: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "answer",
-      thinkingText: "reasoning",
-    };
-    await attemptSend(small, { config: CFG, fetcher });
-    assert.equal(captures.length, 1);
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.text, "answer");
-    assert.equal(sent.thinkingText, "reasoning");
-  });
-
-  test("payload without thinkingText omits the key entirely (not null/empty)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend(PAYLOAD, { config: CFG, fetcher }); // no thinkingText set
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("thinkingText" in sent, false);
-  });
-
-  // ── Phase 1: tools[] drop precedes thinkingText drop ────────────────────
-  // Why: tools[] is durable redundancy of the live-streamed tool rows the
-  // client already has. Dropping it degrades refresh-recovery only. thinkingText
-  // is auxiliary debug content that has no other persistence — drop it last,
-  // before going fatal. Tests pin this priority order so a future cap refactor
-  // can't silently invert it.
-
-  function bigTool(blockId: string, payloadKb: number): import("../ccbMessageParser.js").TurnToolEntry {
-    return {
-      toolUseId: blockId,
-      blockId,
-      toolName: "Bash",
-      inputJson: { cmd: "x".repeat(payloadKb * 1024) },
-      inputPreview: "preview",
-      output: "y".repeat(payloadKb * 1024),
-      isError: false,
-      durationMs: 1,
-      ts: 1_000_000,
-      arrivedAt: 1_000_000,
-    };
-  }
-
-  test("oversized tools[] alone → drops tools[] only, thinkingText preserved", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
+describe("attemptSend — multipart upload", () => {
+  test("uploads every part then finalize with no semantic cap", async () => {
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
     const payload: V3MasterSinkPayload = {
       ...PAYLOAD,
-      text: "small assistant",
-      thinkingText: "small reasoning",
-      // Two big tools — together ~280 KB — push body over 256 KB cap.
-      tools: [bigTool("blk-A", 70), bigTool("blk-B", 70)],
+      text: "正文".repeat(150_000),
+      thinkingText: "思考".repeat(150_000),
+      tools: Array.from({ length: 80 }, (_, index) => ({
+        toolUseId: `tool-${index}`,
+        blockId: `tool-${index}`,
+        toolName: "Read",
+        inputJson: { path: `/tmp/${index}`, exact: "i".repeat(2_000) },
+        inputPreview: `/tmp/${index}`,
+        output: "o".repeat(2_000),
+        isError: false,
+        durationMs: index,
+        ts: index + 1,
+        arrivedAt: index + 1,
+      })),
+      agentGroups: Array.from({ length: 80 }, (_, index) => ({
+        runId: `run-${index}`,
+        agentId: "worker",
+        goal: `goal-${index}`,
+        status: "ok" as const,
+        resultSummary: "r".repeat(2_000),
+        transcript: [{ kind: "thinking", text: "d".repeat(2_000) }],
+        completedAt: index + 1,
+      })),
     };
+
     await attemptSend(payload, { config: CFG, fetcher });
-    assert.equal(captures.length, 1);
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("tools" in sent, false, "tools[] dropped to fit cap");
-    assert.equal(sent.thinkingText, "small reasoning", "thinking preserved");
-    assert.equal(sent.text, "small assistant", "assistant preserved");
+    assert.ok(captures.length > 2);
+    assert.ok(captures.every((capture) => capture.url === `${CFG.baseUrl}${SERVER_AUTHORED_PATH}`));
+    assert.ok(captures.every((capture) => capture.headers.authorization === `Bearer ${CFG.bearer}`));
+    const decoded = decodeCapturedTape(captures);
+    assert.equal(decoded.envelopes.at(-1)!.action, "finalize");
+    assert.equal(decoded.payload.text, payload.text);
+    assert.equal(decoded.payload.thinkingText, payload.thinkingText);
+    assert.deepEqual(decoded.payload.tools, payload.tools);
+    assert.deepEqual(decoded.payload.agentGroups, payload.agentGroups);
   });
 
-  test("agentSessionId 透传进 POST body(供 master 按 session 精确排空 pending cost)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "answer",
-      agentSessionId: "113cb35c-c1d0-41ff-9cda-a6f370b622e0",
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    assert.equal(captures.length, 1);
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.agentSessionId, "113cb35c-c1d0-41ff-9cda-a6f370b622e0");
-  });
-
-  test("无 agentSessionId 时 body 不带该键(老路径/缺省安全)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend({ ...PAYLOAD, text: "answer" }, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("agentSessionId" in sent, false);
-  });
-
-  test("tools[] + thinking together exceed cap → tools[] dropped first; if still over, thinkingText dropped second", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      // 200 KB assistant alone (under cap)
-      text: "x".repeat(200 * 1024),
-      // 50 KB thinking + 50 KB tools combined push to ~300 KB.
-      thinkingText: "y".repeat(50 * 1024),
-      tools: [bigTool("blk-A", 50)],
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    // Step 1: tools dropped → body ≈ 250 KB. Step 2 not needed (< cap).
-    assert.equal("tools" in sent, false, "tools dropped (step 1)");
-    assert.equal(sent.thinkingText, "y".repeat(50 * 1024), "thinking still present");
-  });
-
-  test("tools[] + thinking + assistant all together still over cap → drops tools, then thinking, sends assistant", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      // 200 KB assistant
-      text: "x".repeat(200 * 1024),
-      // 80 KB thinking → assistant + thinking alone ~280 KB > cap
-      thinkingText: "y".repeat(80 * 1024),
-      tools: [bigTool("blk-A", 50)], // adds another 50 KB
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    // Step 1: tools dropped (~330 → ~280, still > cap).
-    // Step 2: thinking dropped (~280 → ~200, < cap).
-    assert.equal("tools" in sent, false);
-    assert.equal("thinkingText" in sent, false);
-    assert.equal((sent.text as string).length, 200 * 1024, "assistant preserved");
-  });
-
-  test("under-cap with tools[] is forwarded as-is", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "answer",
-      thinkingText: "reasoning",
-      tools: [bigTool("blk-A", 1)], // tiny
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    const tools = sent.tools as Array<Record<string, unknown>>;
-    assert.equal(Array.isArray(tools), true);
-    assert.equal(tools.length, 1);
-    assert.equal(tools[0].blockId, "blk-A");
-  });
-
-  test("payload without tools[] omits the key entirely (not [] / null)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend(PAYLOAD, { config: CFG, fetcher }); // no tools set
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("tools" in sent, false);
-  });
-
-  test("empty tools[] array is also omitted (treated as no tools)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = { ...PAYLOAD, tools: [] };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("tools" in sent, false, "spread guard skips empty array");
-  });
-
-  // Count cap (must precede byte cap): master rejects > 50 tools with 400
-  // INVALID_BODY which classifier marks as fatal — that would also drop
-  // assistant text. Sink-side count cap drops the durable tool snapshot
-  // so the primary assistant write still goes through.
-  function tinyTool(blockId: string): import("../ccbMessageParser.js").TurnToolEntry {
-    return {
-      toolUseId: blockId,
-      blockId,
-      toolName: "Bash",
-      inputJson: { cmd: "ls" },
-      inputPreview: "ls",
-      output: "ok",
-      isError: false,
-      durationMs: 1,
-      ts: 1_000_000,
-      arrivedAt: 1_000_000,
-    };
-  }
-
-  test("51 tiny tools (under byte cap, over master count cap) → drops tools[], assistant preserved", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const tools = Array.from({ length: 51 }, (_, i) => tinyTool(`blk-${i}`));
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "answer",
-      thinkingText: "reasoning",
-      tools,
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    assert.equal(captures.length, 1, "POST proceeds (no fatal throw)");
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("tools" in sent, false, "tools[] dropped by count cap");
-    assert.equal(sent.thinkingText, "reasoning", "thinking preserved");
-    assert.equal(sent.text, "answer", "assistant preserved");
-  });
-
-  test("exactly 50 tools (at master count cap) → tools[] forwarded as-is", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const tools = Array.from({ length: 50 }, (_, i) => tinyTool(`blk-${i}`));
-    const payload: V3MasterSinkPayload = { ...PAYLOAD, text: "ok", tools };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(Array.isArray(sent.tools), true, "tools[] preserved at boundary");
-    assert.equal((sent.tools as unknown[]).length, 50);
-  });
-});
-
-// ─── agentId wire field (2026-05-13 mid-chat-model-switch fix) ──────────
-//
-// agentId is what disambiguates two AgentSessions that share a peerId
-// (chat-level identity) but each track session.turns from 0 — without it,
-// turn 1 of codex and turn 1 of main both stamp `srv-${peerId}-t1` and
-// master would UPSERT them into a single row, merging the two answers
-// the user actually saw as separate bubbles. Master folds agentId into
-// the persisted messageId; these tests pin that gateway puts it on the
-// wire in the right shape so master can do its part.
-describe("attemptSend — agentId wire shape", () => {
-  function makeCapturingFetcher(): {
-    fetcher: typeof import("undici").request;
-    captures: Array<{ url: string; body: string }>;
-  } {
-    const captures: Array<{ url: string; body: string }> = [];
-    const fn = async (url: string, init: any) => {
-      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
-      return {
-        statusCode: 200,
-        headers: {},
-        trailers: {},
-        opaque: undefined,
-        context: {},
-        body: {
-          async *[Symbol.asyncIterator]() {
-            yield Buffer.from('{"ok":true}', "utf8");
-          },
-          text: async () => '{"ok":true}',
-        } as any,
-      };
-    };
-    return { fetcher: fn as unknown as typeof import("undici").request, captures };
-  }
-
-  test("agentId from V3MasterSinkPayload is forwarded verbatim on the wire", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend(
-      { ...PAYLOAD, agentId: "codex" },
-      { config: CFG, fetcher },
-    );
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.agentId, "codex");
-  });
-
-  test("two payloads with same sessionId/turnIndex but different agentId both serialize their own id (no merge)", async () => {
-    // Regression: prior to 2026-05-13 these two POSTs would have arrived
-    // with byte-identical bodies (agentId field didn't exist), causing
-    // master to UPSERT both into `srv-${sessionId}-t1`. The gateway-side
-    // contribution to the fix is just making sure the bodies actually
-    // differ — master's idPart fold handles the messageId derivation.
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend(
-      { ...PAYLOAD, agentId: "codex", text: "codex answer" },
-      { config: CFG, fetcher },
-    );
-    await attemptSend(
-      { ...PAYLOAD, agentId: "main", text: "main answer" },
-      { config: CFG, fetcher },
-    );
-    assert.equal(captures.length, 2);
-    const a = JSON.parse(captures[0].body) as Record<string, unknown>;
-    const b = JSON.parse(captures[1].body) as Record<string, unknown>;
-    assert.equal(a.agentId, "codex");
-    assert.equal(b.agentId, "main");
-    assert.equal(a.sessionId, b.sessionId, "same chat-level identity");
-    assert.equal(a.turnIndex, b.turnIndex, "same turn index pre-disambig");
-    assert.notEqual(a.agentId, b.agentId, "disambiguation key differs");
-  });
-
-  test("legacy wire payload without agentId omits the key entirely (drainer back-compat)", async () => {
-    // The retry queue may hold pre-Fix-A entries (written before 2026-05-13
-    // by a now-replaced container image). Those entries have no agentId
-    // on disk. The drainer calls attemptSend with that legacy shape; we
-    // must not synthesize an agentId, and must not include the key as
-    // null/empty — master's schema accepts the optional but enforces
-    // charset when present, so a null would 400 fatal-drop the entry.
-    const { fetcher, captures } = makeCapturingFetcher();
-    const legacy: import("../v3MasterSink.js").V3MasterSinkWirePayload = {
+  test("pre-agentId retry entry upgrades to reserved v2 identity", async () => {
+    const { fetcher, captures } = makeFetcher();
+    const legacy: V3MasterSinkWirePayload = {
       sessionId: "sess12345",
-      turnIndex: 1,
+      turnIndex: 7,
       status: "completed",
-      text: "legacy",
+      text: "legacy exact reply",
+      thinkingText: "legacy exact thinking",
+      tools: [],
     };
     await attemptSend(legacy, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("agentId" in sent, false, "agentId omitted, not nulled");
+    const decoded = decodeCapturedTape(captures);
+    assert.equal(decoded.payload.agentId, LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID);
+    assert.equal(decoded.payload.text, legacy.text);
+    assert.equal(decoded.payload.thinkingText, legacy.thinkingText);
+    assert.ok(decoded.envelopes.every((envelope) => envelope.agentId === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID));
+  });
+
+  test("different agent ids retain distinct tape identities", async () => {
+    const a = buildLosslessTurnTapeRequests({ ...PAYLOAD, agentId: "codex", createdAt: 1 });
+    const b = buildLosslessTurnTapeRequests({ ...PAYLOAD, agentId: "main", createdAt: 1 });
+    assert.notEqual(a.finalize.turnKey, b.finalize.turnKey);
+    assert.notEqual(a.finalize.tapeId, b.finalize.tapeId);
+  });
+
+  for (const status of [200, 204]) {
+    test(`${status} on every envelope resolves`, async () => {
+      const { fetcher } = makeFetcher({ status });
+      await assert.doesNotReject(() => attemptSend(PAYLOAD, { config: CFG, fetcher }));
+    });
+  }
+
+  test("404 is session_missing", async () => {
+    const { fetcher } = makeFetcher({ status: 404, body: "session missing" });
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+      (error: unknown) => error instanceof V3SinkError
+        && error.errorClass === "session_missing"
+        && error.httpStatus === 404,
+    );
+  });
+
+  test("410 is the sole fatal owner-deletion acknowledgement", async () => {
+    const { fetcher } = makeFetcher({ status: 410, body: "session deleted" });
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+      (error: unknown) => error instanceof V3SinkError
+        && error.errorClass === "fatal"
+        && error.httpStatus === 410,
+    );
+  });
+
+  for (const status of [400, 401, 403, 409, 413, 429, 500, 502]) {
+    test(`${status} remains transient so staged bytes are retried`, async () => {
+      const { fetcher } = makeFetcher({ status, body: "repairable" });
+      await assert.rejects(
+        () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+        (error: unknown) => error instanceof V3SinkError
+          && error.errorClass === "transient"
+          && error.httpStatus === status,
+      );
+    });
+  }
+
+  test("network failure remains transient", async () => {
+    const { fetcher } = makeFetcher({ throwError: new Error("ECONNREFUSED") });
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+      (error: unknown) => error instanceof V3SinkError && error.errorClass === "transient",
+    );
   });
 });
-
-// ─── persistOrQueue orchestration ────────────────────────────────────────
 
 describe("makeV3MasterSink.persistOrQueue", () => {
-  test("ok on success — does NOT enqueue", async () => {
+  test("stages before send and ACK removes only after success", async () => {
     const queue = fakeQueue();
+    let stagedAtAttempt = false;
     const sink = makeV3MasterSink({
       config: CFG,
       retryQueue: queue,
-      attemptSendImpl: async () => undefined,
+      attemptSendImpl: async () => { stagedAtAttempt = queue.enqueued.length === 1; },
     });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, true);
+    const outcome = await sink.persistOrQueue(PAYLOAD);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(stagedAtAttempt, true);
     assert.equal(queue.enqueued.length, 0);
   });
 
-  test("queued on transient — enqueues with attempts=1 and stamps lastErrorClass", async () => {
-    const queue = fakeQueue();
-    const sink = makeV3MasterSink({
-      config: CFG,
-      retryQueue: queue,
-      attemptSendImpl: async () => {
-        throw new V3SinkError("master 502", "transient", 502);
-      },
+  for (const [name, error, expectedClass] of [
+    ["transient", new V3SinkError("master 502", "transient", 502), "transient"],
+    ["session_missing", new V3SinkError("session missing", "session_missing", 404), "session_missing"],
+    ["non-410 contract error", new V3SinkError("master 400", "fatal", 400), "transient"],
+  ] as const) {
+    test(`${name} remains durably queued`, async () => {
+      const queue = fakeQueue();
+      const sink = makeV3MasterSink({
+        config: CFG,
+        retryQueue: queue,
+        attemptSendImpl: async () => { throw error; },
+      });
+      const outcome = await sink.persistOrQueue(PAYLOAD);
+      assert.equal(outcome.ok, false);
+      if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
+      assert.equal(outcome.errorClass, expectedClass);
+      assert.equal(queue.enqueued.length, 1);
+      assert.equal(queue.enqueued[0].attempts, 0);
+      assert.equal(typeof queue.enqueued[0].payload.createdAt, "number");
     });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    assert.equal(out.queued, true);
-    if (!out.queued) return;
-    assert.equal(out.errorClass, "transient");
-    assert.equal(queue.enqueued.length, 1);
-    const entry = queue.enqueued[0];
-    assert.equal(entry.attempts, 1);
-    assert.equal(entry.lastErrorClass, "transient");
-    assert.equal(typeof entry.firstSeenAt, "number");
-    assert.equal(entry.payload.sessionId, PAYLOAD.sessionId);
-    // createdAt must be auto-stamped when caller didn't supply one
-    assert.equal(typeof entry.payload.createdAt, "number");
-  });
+  }
 
-  test("queued on session_missing", async () => {
+  test("explicit 410 owner deletion ACK removes the staged entry", async () => {
     const queue = fakeQueue();
     const sink = makeV3MasterSink({
       config: CFG,
       retryQueue: queue,
-      attemptSendImpl: async () => {
-        throw new V3SinkError("session_not_found", "session_missing", 404);
-      },
+      attemptSendImpl: async () => { throw new V3SinkError("session deleted", "fatal", 410); },
     });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    if (!out.queued) {
-      assert.fail("expected queued");
-      return;
-    }
-    assert.equal(out.errorClass, "session_missing");
-    assert.equal(queue.enqueued[0].lastErrorClass, "session_missing");
-  });
-
-  test("dropped on fatal — does NOT enqueue", async () => {
-    const queue = fakeQueue();
-    const sink = makeV3MasterSink({
-      config: CFG,
-      retryQueue: queue,
-      attemptSendImpl: async () => {
-        throw new V3SinkError("master rejected 400", "fatal", 400);
-      },
-    });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    assert.equal(out.queued, false);
-    if (out.queued) return;
-    assert.match(out.droppedReason, /400/);
+    const outcome = await sink.persistOrQueue(PAYLOAD);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok || outcome.queued) assert.fail("expected explicit dropped outcome");
+    assert.match(outcome.droppedReason, /deleted/);
     assert.equal(queue.enqueued.length, 0);
   });
 
-  test("dropped on 410 session_deleted (fatal) — does NOT enqueue", async () => {
-    // Pinning the end-to-end behavior at persistOrQueue: a 410 from master
-    // must short-circuit to drop, not queue. Otherwise replay loops would
-    // hammer the same tombstoned row for 24h (ENTRY_TTL_MS), exactly the
-    // pathology Plan A is designed to remove.
+  test("unknown throw is retained as transient", async () => {
     const queue = fakeQueue();
     const sink = makeV3MasterSink({
       config: CFG,
       retryQueue: queue,
-      attemptSendImpl: async () => {
-        throw new V3SinkError("master 410 session_deleted", "fatal", 410);
-      },
+      attemptSendImpl: async () => { throw new Error("unexpected"); },
     });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    assert.equal(out.queued, false);
-    if (out.queued) return;
-    assert.match(out.droppedReason, /410|session_deleted/);
-    assert.equal(queue.enqueued.length, 0, "tombstoned row must not enqueue — terminal");
-  });
-
-  test("unexpected (non-V3SinkError) throw → defensively queued as transient", async () => {
-    const queue = fakeQueue();
-    const sink = makeV3MasterSink({
-      config: CFG,
-      retryQueue: queue,
-      attemptSendImpl: async () => {
-        throw new Error("totally unexpected");
-      },
-    });
-    const out = await sink.persistOrQueue(PAYLOAD);
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    if (!out.queued) {
-      assert.fail("expected queued");
-      return;
-    }
-    assert.equal(out.errorClass, "transient");
+    const outcome = await sink.persistOrQueue(PAYLOAD);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
+    assert.equal(outcome.errorClass, "transient");
     assert.equal(queue.enqueued.length, 1);
   });
 });
 
-// ─── singleton getter ────────────────────────────────────────────────────
-
-describe("V3MasterSink module singleton", () => {
-  test("getter returns null by default and after clear", () => {
+describe("V3MasterSink singleton", () => {
+  test("set/get/clear", () => {
     setV3MasterSinkSingleton(null);
     assert.equal(getV3MasterSinkOrNull(), null);
-  });
-
-  test("getter returns set sink", () => {
-    const queue = fakeQueue();
     const sink = makeV3MasterSink({
       config: CFG,
-      retryQueue: queue,
+      retryQueue: fakeQueue(),
       attemptSendImpl: async () => undefined,
     });
     setV3MasterSinkSingleton(sink);
     assert.equal(getV3MasterSinkOrNull(), sink);
     setV3MasterSinkSingleton(null);
     assert.equal(getV3MasterSinkOrNull(), null);
-  });
-});
-
-// ── P2 债A — agentGroups[] serialization + body-cap drop ordering ──────────
-// Drop cascade order (least→most valuable): tools[] → thinking → agentGroups[]
-// → (fatal on assistant). agentGroups carries the cross-device team structure
-// (the whole point of 债A), so it's the LAST non-assistant artifact dropped —
-// but still yields to the assistant 正文. These tests pin that ordering so a
-// future cap refactor can't silently invert it.
-describe("attemptSend — agentGroups[] body cap ordering (P2 债A)", () => {
-  function makeCapturingFetcher(): {
-    fetcher: typeof import("undici").request;
-    captures: Array<{ url: string; body: string }>;
-  } {
-    const captures: Array<{ url: string; body: string }> = [];
-    const fn = async (url: string, init: any) => {
-      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
-      return {
-        statusCode: 200, headers: {}, trailers: {}, opaque: undefined, context: {},
-        body: {
-          async *[Symbol.asyncIterator]() { yield Buffer.from('{"ok":true}', "utf8"); },
-          text: async () => '{"ok":true}',
-        } as any,
-      };
-    };
-    return { fetcher: fn as unknown as typeof import("undici").request, captures };
-  }
-  function ag(runId: string, summaryKb: number): import("@openclaude/protocol").DurableAgentGroup {
-    return {
-      runId,
-      agentId: "coding-assistant",
-      goal: "子任务",
-      status: "ok",
-      completedAt: 1_720_000_000_000,
-      ...(summaryKb > 0 ? { resultSummary: "s".repeat(summaryKb * 1024) } : {}),
-    };
-  }
-  function tinyTool(blockId: string): import("../ccbMessageParser.js").TurnToolEntry {
-    return {
-      toolUseId: blockId, blockId, toolName: "Bash",
-      inputJson: { cmd: "x" }, inputPreview: "x", output: "y",
-      isError: false, durationMs: 1, ts: 1_000_000, arrivedAt: 1_000_000,
-    };
-  }
-
-  test("under-cap agentGroups forwarded as-is; absent → key omitted", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    await attemptSend({ ...PAYLOAD, text: "answer", agentGroups: [ag("dlg-1", 0)] }, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.ok(Array.isArray(sent.agentGroups));
-    assert.equal((sent.agentGroups as unknown[]).length, 1);
-
-    const { fetcher: f2, captures: c2 } = makeCapturingFetcher();
-    await attemptSend({ ...PAYLOAD, text: "answer" }, { config: CFG, fetcher: f2 });
-    assert.equal("agentGroups" in (JSON.parse(c2[0].body) as Record<string, unknown>), false);
-  });
-
-  test("assistant + big agentGroups over cap → agentGroups dropped, assistant preserved", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "x".repeat(200 * 1024),
-      agentGroups: [ag("dlg-big", 80)], // pushes combined over 256 KB
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.text, "x".repeat(200 * 1024), "assistant 正文 preserved");
-    assert.equal("agentGroups" in sent, false, "agentGroups dropped to fit cap");
-  });
-
-  test("dropping thinking alone suffices → agentGroups PRESERVED (thinking dropped before agentGroups)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "x".repeat(200 * 1024),
-      thinkingText: "y".repeat(80 * 1024), // dropping this alone brings under cap
-      agentGroups: [ag("dlg-keep", 2)],
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal(sent.thinkingText, undefined, "thinking dropped first");
-    assert.ok(Array.isArray(sent.agentGroups), "agentGroups preserved (more valuable than thinking)");
-    assert.equal(sent.text, "x".repeat(200 * 1024));
-  });
-
-  test("dropping tools alone suffices → agentGroups PRESERVED (tools dropped before agentGroups)", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const payload: V3MasterSinkPayload = {
-      ...PAYLOAD,
-      text: "x".repeat(200 * 1024),
-      // one big tool ~80 KB; dropping it brings under cap
-      tools: [{ ...tinyTool("blk-big"), output: "y".repeat(80 * 1024) }],
-      agentGroups: [ag("dlg-keep", 2)],
-    };
-    await attemptSend(payload, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("tools" in sent, false, "tools dropped first");
-    assert.ok(Array.isArray(sent.agentGroups), "agentGroups preserved (more valuable than tools)");
-  });
-
-  test("count > MAX_AGENT_GROUPS_PER_PAYLOAD → agentGroups dropped, assistant preserved", async () => {
-    const { fetcher, captures } = makeCapturingFetcher();
-    const many = Array.from({ length: 51 }, (_, i) => ag(`dlg-${i}`, 0));
-    await attemptSend({ ...PAYLOAD, text: "answer", agentGroups: many }, { config: CFG, fetcher });
-    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
-    assert.equal("agentGroups" in sent, false, "over count cap → dropped (best-effort)");
-    assert.equal(sent.text, "answer", "assistant preserved");
   });
 });

@@ -47,22 +47,29 @@
  *
  * 404 vs 410 semantics (split on 2026-05-07):
  *   - HTTP 404 SESSION_NOT_FOUND: master has NO row for (sessionId, userId).
- *     Container classifies this as `session_missing` and retries under a TTL —
- *     the frontend's debounced PUT may still be in flight when the first
- *     turn-end arrives, especially when a backgrounded tab wakes up.
- *     Eventually the PUT lands and the next retry succeeds; if it hasn't
- *     landed by the TTL expiry the entry is dropped.
+ *     Current v2 retains and retries without an age limit because the
+ *     frontend's debounced PUT may still be in flight.
  *   - HTTP 410 SESSION_DELETED: master HAS a row but it is soft-deleted
  *     (`deleted_at IS NOT NULL`). This is terminal: the user/admin removed
- *     the session, retrying will never make it writeable again. Container
- *     classifies this as `fatal` and drops the entry on first response,
- *     preventing 24h-TTL retry storms on stale durable-queue entries
+ *     the session, retrying will never make it writeable again. This explicit
+ *     owner-deletion acknowledgement is the only response that permits the
+ *     container to remove a valid v2 entry, preventing retry storms
  *     (historical incident: ~190K log lines from one user across 7
  *     successive container replacements draining the same dead session).
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { z } from "zod";
+import {
+  LOSSLESS_TURN_TAPE_PART_BYTES,
+  LOSSLESS_TURN_TAPE_SHA256_RE,
+  LOSSLESS_TURN_TAPE_VERSION,
+  type DurableCodexBilling,
+  type LosslessTurnTapeFinalizeRequest,
+  type LosslessTurnTapePartRequest,
+} from "@openclaude/protocol";
+import type { LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { enqueueAlert } from "../admin/alertOutbox.js";
@@ -86,10 +93,10 @@ import {
   type V3SinkPersistRole,
 } from "../admin/metrics.js";
 
-/** Master persists assistant messages no larger than this. Conservative — a
- *  single chat turn rarely exceeds 64 KB; cap at 256 KB to leave headroom for
- *  unusually long codex outputs without enabling DoS-by-body. */
+/** Legacy-v1 request cap. Current v2 admits one fixed-size multipart envelope
+ * per request and has no per-turn semantic content cap. */
 const MAX_BODY_BYTES = 256 * 1024;
+const LOSSLESS_TURN_TAPE_WIRE_MAX_BODY_BYTES = Math.ceil((LOSSLESS_TURN_TAPE_PART_BYTES * 4) / 3) + 16 * 1024;
 
 /** Path the container's V3MasterSink POSTs to. Mounted on both the plain
  *  self-host listener and the mTLS remote-host listener. */
@@ -107,7 +114,7 @@ const SCHEMA_TOOL_INPUT_PREVIEW_MAX_CHARS = 2_000;
  *  Read/Grep fan-outs + a few Edits); 50 leaves plenty of headroom. */
 const SCHEMA_TOOLS_MAX_LEN = 50;
 
-/** Fix B (2026-05-25) — defensive upper bound on per-turn text segments.
+/** Legacy-v1 only — defensive upper bound on per-turn text segments.
  *  Assistant segments normally follow tool boundaries, but Codex can emit
  *  more independent thinking segments than tools. Oversized segment arrays
  *  are degraded to their aggregate fallback before schema validation when
@@ -495,6 +502,11 @@ export interface ServerAuthoredStorage {
 export interface ServerAuthoredHandlerDeps {
   identityRepo: ContainerIdentityRepo;
   storage: ServerAuthoredStorage;
+  /** v5 PG-only lossless v2 tape store. v1 remains available for rolling old containers. */
+  losslessTurnTapeStorage?: LosslessTurnTapeStorage;
+  /** Durable billing fallback. Finalize is ACKed only after every billing
+   * frame co-located with the immutable tape is settled or proven terminal. */
+  settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
@@ -634,7 +646,29 @@ export function makeServerAuthoredHandler(
     // 2) Read + schema-validate body
     let body: ServerAuthoredBody;
     try {
-      let raw = await readBoundedJson(req, MAX_BODY_BYTES);
+      const decoded = await readBoundedJson(req, LOSSLESS_TURN_TAPE_WIRE_MAX_BODY_BYTES);
+      let raw = decoded.value;
+      if (isLosslessTurnTapeWireBody(raw)) {
+        await handleLosslessTurnTapeRequest({
+          raw,
+          userId,
+          numericUserId: BigInt(uid),
+          requestId,
+          res,
+          storage: deps.losslessTurnTapeStorage,
+          settleCodexBilling: deps.settleCodexBilling,
+          userLog,
+          metric,
+        });
+        return;
+      }
+      if (decoded.bytes > MAX_BODY_BYTES) {
+        throw new HttpError(
+          413,
+          "PAYLOAD_TOO_LARGE",
+          `request body exceeds ${MAX_BODY_BYTES} bytes`,
+        );
+      }
       if (
         typeof raw === "object" &&
         raw !== null &&
@@ -1635,10 +1669,190 @@ export function makeServerAuthoredHandler(
 
 // ─── private helpers ────────────────────────────────────────────────────────
 
+const LosslessTapeBaseSchema = z.object({
+  protocolVersion: z.literal(LOSSLESS_TURN_TAPE_VERSION),
+  sessionId: z.string().min(8).max(50),
+  agentId: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+  turnIndex: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  status: z.enum(["completed", "interrupted", "crashed"]),
+  turnKey: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
+  tapeId: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
+  tapeSha256: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
+  totalBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  partCount: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  createdAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+});
+
+const LosslessTapePartSchema = LosslessTapeBaseSchema.extend({
+  action: z.literal("part"),
+  partIndex: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  partSha256: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
+  data: z.string().min(1),
+}).strict();
+
+const LosslessTapeFinalizeSchema = LosslessTapeBaseSchema.extend({
+  action: z.literal("finalize"),
+}).strict();
+
+function isLosslessTurnTapeWireBody(raw: unknown): boolean {
+  return !!raw && typeof raw === "object" && !Array.isArray(raw)
+    && (raw as Record<string, unknown>).protocolVersion === LOSSLESS_TURN_TAPE_VERSION;
+}
+
+async function handleLosslessTurnTapeRequest(args: {
+  raw: unknown;
+  userId: string;
+  numericUserId: bigint;
+  requestId: string;
+  res: ServerResponse;
+  storage?: LosslessTurnTapeStorage;
+  settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
+  userLog: Logger;
+  metric: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
+}): Promise<void> {
+  if (!args.storage) {
+    sendJsonError(args.res, 503, "TURN_TAPE_UNAVAILABLE", "lossless turn tape store unavailable", args.requestId);
+    return;
+  }
+  const action = (args.raw as Record<string, unknown>).action;
+  if (action === "part") {
+    const parsed = LosslessTapePartSchema.safeParse(args.raw);
+    if (!parsed.success) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_PART", "turn tape part schema rejected", args.requestId);
+      return;
+    }
+    const body = parsed.data as LosslessTurnTapePartRequest;
+    if (
+      body.partCount !== Math.ceil(body.totalBytes / LOSSLESS_TURN_TAPE_PART_BYTES)
+      || body.partIndex >= body.partCount
+    ) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_LAYOUT", "turn tape part layout rejected", args.requestId);
+      return;
+    }
+    const bytes = Buffer.from(body.data, "base64");
+    const expectedBytes = body.partIndex === body.partCount - 1
+      ? body.totalBytes - LOSSLESS_TURN_TAPE_PART_BYTES * (body.partCount - 1)
+      : LOSSLESS_TURN_TAPE_PART_BYTES;
+    const canonicalBase64 = bytes.toString("base64");
+    const actualSha = createHash("sha256").update(bytes).digest("hex");
+    if (canonicalBase64 !== body.data || bytes.length !== expectedBytes || actualSha !== body.partSha256) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_PART", "turn tape part bytes rejected", args.requestId);
+      return;
+    }
+    try {
+      const result = await args.storage.stageLosslessTurnTapePart(args.userId, body, bytes);
+      if (result.applied === "session_not_found") {
+        sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
+        return;
+      }
+      if (result.applied === "session_deleted") {
+        sendJsonError(args.res, 410, "SESSION_DELETED", "client_sessions row is soft-deleted", args.requestId);
+        return;
+      }
+      sendJsonOk(args.res, 200, { ok: true, idempotent: result.applied === "idempotent" }, args.requestId);
+      return;
+    } catch (err) {
+      args.userLog.error("lossless_turn_tape_part_failed", {
+        tapeId: body.tapeId,
+        partIndex: body.partIndex,
+        err: err as Error,
+      });
+      sendJsonError(args.res, 409, "TURN_TAPE_CONFLICT", "turn tape immutable data conflict", args.requestId);
+      return;
+    }
+  }
+
+  if (action === "finalize") {
+    const parsed = LosslessTapeFinalizeSchema.safeParse(args.raw);
+    if (!parsed.success) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_FINALIZE", "turn tape finalize schema rejected", args.requestId);
+      return;
+    }
+    const body = parsed.data as LosslessTurnTapeFinalizeRequest;
+    if (body.partCount !== Math.ceil(body.totalBytes / LOSSLESS_TURN_TAPE_PART_BYTES)) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_LAYOUT", "turn tape finalize layout rejected", args.requestId);
+      return;
+    }
+    try {
+      const result = await args.storage.finalizeLosslessTurnTape(args.userId, body);
+      if (result.applied === "session_not_found") {
+        sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
+        return;
+      }
+      if (result.applied === "session_deleted") {
+        sendJsonError(args.res, 410, "SESSION_DELETED", "client_sessions row is soft-deleted", args.requestId);
+        return;
+      }
+      if (result.applied === "incomplete") {
+        sendJsonError(args.res, 409, "TURN_TAPE_INCOMPLETE", "turn tape is not fully staged", args.requestId);
+        return;
+      }
+      if (result.applied !== "finalized" && result.applied !== "idempotent") {
+        throw new Error("unexpected lossless turn tape finalize result");
+      }
+      if (result.engineBillings.length > 0) {
+        if (!args.settleCodexBilling) {
+          sendJsonError(
+            args.res,
+            503,
+            "TURN_TAPE_BILLING_UNAVAILABLE",
+            "durable codex billing settlement unavailable",
+            args.requestId,
+          );
+          return;
+        }
+        try {
+          for (const billing of result.engineBillings) {
+            await args.settleCodexBilling(args.numericUserId, billing);
+          }
+        } catch (err) {
+          args.userLog.error("lossless_turn_tape_billing_settle_failed", {
+            tapeId: body.tapeId,
+            err: err as Error,
+          });
+          // Tape+final usage are already immutable. A 503 deliberately keeps
+          // the container's fsynced queue entry so idempotent finalize retries
+          // until every billing journal reaches a terminal state.
+          sendJsonError(
+            args.res,
+            503,
+            "TURN_TAPE_BILLING_PENDING",
+            "durable codex billing settlement pending",
+            args.requestId,
+          );
+          return;
+        }
+      }
+      args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
+      sendJsonOk(args.res, 200, {
+        ok: true,
+        idempotent: result.applied === "idempotent",
+        recordCount: result.recordCount,
+      }, args.requestId);
+      return;
+    } catch (err) {
+      args.userLog.error("lossless_turn_tape_finalize_failed", {
+        tapeId: body.tapeId,
+        err: err as Error,
+      });
+      sendJsonError(args.res, 409, "TURN_TAPE_CONFLICT", "turn tape verification or materialization failed", args.requestId);
+      return;
+    }
+  }
+
+  args.metric("reject_bad_body");
+  sendJsonError(args.res, 400, "INVALID_TURN_TAPE_ACTION", "turn tape action rejected", args.requestId);
+}
+
 async function readBoundedJson(
   req: IncomingMessage,
   maxBytes: number,
-): Promise<unknown> {
+): Promise<{ value: unknown; bytes: number }> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -1658,8 +1872,18 @@ async function readBoundedJson(
   }
   const text = Buffer.concat(chunks, total).toString("utf-8");
   try {
-    return JSON.parse(text);
+    return { value: JSON.parse(text), bytes: total };
   } catch (err) {
+    // Preserve the legacy endpoint's 256 KiB body contract even though this
+    // reader also admits one base64-encoded v2 tape part. An invalid payload
+    // cannot identify itself as v2, so oversized invalid JSON remains 413.
+    if (total > MAX_BODY_BYTES) {
+      throw new HttpError(
+        413,
+        "PAYLOAD_TOO_LARGE",
+        `request body exceeds ${MAX_BODY_BYTES} bytes`,
+      );
+    }
     throw new HttpError(
       400,
       "INVALID_JSON",

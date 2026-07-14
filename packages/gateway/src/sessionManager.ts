@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -8,6 +9,7 @@ import {
   getClientSession,
   getMaxTurnIdx,
   indexTurn,
+  reserveTurnIndex,
   paths,
   upsertSessionMeta,
 } from '@openclaude/storage'
@@ -17,10 +19,16 @@ import {
 // ('ccb' / 'codex' factory)。
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
-import type { CollabAgentPolicy, EngineAdapter } from './engine/engineAdapter.js'
 import type {
+  CollabAgentPolicy,
+  EngineAdapter,
+  EngineTurnRun,
+} from './engine/engineAdapter.js'
+import type {
+  DurableRuntimeEvent,
   EngineBillingEvent,
   EngineEvent,
+  SegmentRecord,
   SessionStreamEvent,
   TurnSummary,
   TurnToolEntry,
@@ -32,8 +40,12 @@ import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
-import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
-import type { DurableAgentGroup } from '@openclaude/protocol'
+import {
+  deriveLosslessTurnKey,
+  getV3MasterSinkOrNull,
+  type V3MasterSinkPayload,
+} from './v3MasterSink.js'
+import type { DurableAgentGroup, OutboundContentBlock } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import {
   type ExecutionTarget,
@@ -372,10 +384,40 @@ export interface AgentSession {
    * 随同一 POST 下发给 master 落库为 role 'agent-group' 行。
    *
    * 只在 webchat 队长会话上累积(buffering 走 progressTarget,webchat-only,与
-   * MASTER_SINK_PERSIST_CHANNELS 一致);嵌套 delegate / 非 webchat 父不物化本
-   * 缓冲(团队结构仍走本地 IndexedDB + delegate_progress 帧,无回归)。
+   * MASTER_SINK_PERSIST_CHANNELS 一致)。嵌套 delegate 的完整 transcript 先写入
+   * 直接父 delegate 的 `_durableDelegateTranscript`,最终随一级团队卡一起入本缓冲。
    */
   _pendingAgentGroups?: DurableAgentGroup[]
+  /** Turn-wide monotonic sequence shared by engine output and delegation cards. */
+  _nextDurableEventOrdinal?: number
+  /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
+   * this instead of emitting an unpersisted error and abandoning the parser. */
+  _persistActiveTurn?: (
+    status: 'interrupted' | 'crashed',
+    reason: string,
+    errorCode: string,
+    settleAfter?: boolean,
+  ) => Promise<void>
+  /** Root user-visible turn that owns this delegate session's billed work.
+   * Every nested delegate inherits the same key instead of re-parenting cost
+   * to an ephemeral delegate turn that is never persisted as a chat tape. */
+  _billingParentTurnKey?: string
+  /** Trusted session-scoped billing attribution copied from getOrCreate().
+   * CCB consumes the same tag through its process environment; Codex needs it
+   * on each EngineTurn so the engine-reported billing frame can preserve the
+   * delegate parent locator as well. */
+  _usageAttribution?: UsageAttributionTag
+  /** Live, uncapped collector for a delegate session's complete transcript.
+   * Nested delegates append their full transcript here in execution order so
+   * the first-level durable team card survives reload with every descendant. */
+  _durableDelegateTranscript?: unknown[]
+  /** Complete raw event stream for this one-shot delegate turn. The delegate
+   * channel is not persisted as its own chat session, so handleDelegateTask
+   * moves this collector into the parent DurableAgentGroup. */
+  _durableDelegateRuntimeEvents?: DurableRuntimeEvent[]
+  /** Complete engine-reported billing frames for this delegate subtree.
+   * handleDelegateTask moves them into the parent DurableAgentGroup. */
+  _durableDelegateEngineBillings?: EngineBillingEvent[]
   lock: Promise<void>
   lastUsedAt: number
   // 跨 turn 累积
@@ -514,6 +556,38 @@ export interface AgentSession {
    *  中转 submit 已确定的 turnTraceId,不参与铸造。engine 中立(runner.traceId 是 CCB/
    *  codex 私有、不在 EngineAdapter 契约上,故落到 session 提供统一读点)。 */
   _currentTurnTraceId?: string
+  /** Stable logical turn key used by lossless persistence and cost joins. */
+  _currentTurnKey?: string
+}
+
+function takeDurableEventOrdinal(session: AgentSession): number {
+  const ordinal = session._nextDurableEventOrdinal ?? 0
+  session._nextDurableEventOrdinal = ordinal + 1
+  return ordinal
+}
+
+function combineRetryAssistantOutput(
+  retrySegments: readonly SegmentRecord[],
+  terminalText: string,
+  terminalSegments: readonly SegmentRecord[],
+  fallbackTs: number,
+): { text: string; segments: SegmentRecord[] } {
+  if (retrySegments.length === 0) {
+    return { text: terminalText, segments: terminalSegments.map((segment) => ({ ...segment })) }
+  }
+  const tail = terminalSegments.length > 0
+    ? terminalSegments
+    : terminalText.length > 0
+      ? [{ index: 0, text: terminalText, ts: fallbackTs }]
+      : []
+  const segments = [...retrySegments, ...tail].map((segment, index) => ({
+    ...segment,
+    index,
+  }))
+  return {
+    text: retrySegments.map((segment) => segment.text).join('') + terminalText,
+    segments,
+  }
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -539,9 +613,9 @@ export interface CronBridgeEvent {
  *   1. v3 commercial (container has OPENCLAUDE_V3_MASTER_BASE_URL +
  *      OPENCLAUDE_V3_CONTAINER_TOKEN env): send via the container→master
  *      sink (V3MasterSink). Master writes to its own SQLite where the
- *      authoritative session row lives. On transient/session_missing the
- *      sink enqueues durable retry; on fatal it drops with a structured
- *      warn. **userId is irrelevant on this path** — master derives it
+   *      authoritative session row lives. The sink stages every v2 turn
+   *      before its first network attempt and retains all non-410 failures.
+   *      **userId is irrelevant on this path** — master derives it
  *      from the verified container identity, so we don't even bother
  *      looking it up here.
  *
@@ -553,8 +627,9 @@ export interface CronBridgeEvent {
  *      `getClientSession` lookup when the AgentSession didn't carry
  *      userId (cron pre-warm, legacy webchat callers).
  *
- * Returns Promise<void> that always resolves (errors are logged
- * internally — never rejects). Callers MUST track it so shutdown can
+ * Returns Promise<boolean> that always resolves: true means the authoritative
+ * store acknowledged the write; false means it is only durably queued or the
+ * write failed. Errors are logged internally. Callers MUST track it so shutdown can
  * await pending writes via SessionManager.awaitPendingPersistence();
  * a process exit before the durable enqueue lands on disk would
  * silently lose the turn (Codex R2 BLOCK-1, the original bug we're
@@ -580,9 +655,11 @@ function persistServerAuthoredTurn(args: {
    *  Ignored on the v3 sink path (master derives it from identity). */
   userId: string | undefined
   turnIndex: number
+  turnKey?: string
+  continuationOfTurnKey?: string
+  createdAt?: number
   text: string
-  /** Optional reasoning/thinking text for the same turn (capped at
-   *  MAX_THINKING_BUFFER_BYTES = 8 KB by the parser). Persisted as a
+  /** Optional full reasoning/thinking text for the same turn. Persisted as a
    *  separate `_source: 'server'` message with `role: 'thinking'`,
    *  ts = assistantTs - 1. v3 sink path: passed through to master in the
    *  same POST body; master writes both rows in two storage calls.
@@ -639,19 +716,30 @@ function persistServerAuthoredTurn(args: {
    *  row. Legacy/personal path ignores it (team cards are client-owned there;
    *  no container→master sink). */
   agentGroups?: DurableAgentGroup[]
-}): Promise<void> {
+  /** Exact plan/goal block update stream emitted by the main agent. */
+  structuredBlocks?: Array<Record<string, unknown>>
+  runtimeEvents?: DurableRuntimeEvent[]
+  /** Final usage from an engine-reported billing adapter (Codex). It is
+   * co-located with the immutable turn tape so a bridge disconnect or
+   * bounded outbound-ring eviction cannot erase the only settle evidence. */
+  engineBilling?: EngineBillingEvent
+}): Promise<boolean> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
     const payload: V3MasterSinkPayload = {
       sessionId: args.peerId,
       agentId: args.agentId,
       turnIndex: args.turnIndex,
+      ...(args.turnKey ? { turnKey: args.turnKey } : {}),
+      ...(args.continuationOfTurnKey
+        ? { continuationOfTurnKey: args.continuationOfTurnKey }
+        : {}),
       status: args.status,
       text: args.text,
       ...(args.thinkingText && args.thinkingText.length > 0
         ? { thinkingText: args.thinkingText }
         : {}),
-      createdAt: Date.now(),
+      createdAt: args.createdAt ?? Date.now(),
       // Plan §4.4 改动 7 — propagate requestId/usage/truncated/errorCode/
       // errorDetail to master. Master schema treats requestId as required
       // when text is non-empty (assistant write), optional otherwise
@@ -677,14 +765,23 @@ function persistServerAuthoredTurn(args: {
       ...(args.agentGroups && args.agentGroups.length > 0
         ? { agentGroups: args.agentGroups }
         : {}),
+      ...(args.structuredBlocks && args.structuredBlocks.length > 0
+        ? { structuredBlocks: args.structuredBlocks }
+        : {}),
+      ...(args.runtimeEvents && args.runtimeEvents.length > 0
+        ? { runtimeEvents: args.runtimeEvents }
+        : {}),
+      ...(args.engineBilling !== undefined
+        ? { engineBilling: structuredClone(args.engineBilling) }
+        : {}),
     }
     return sink
       .persistOrQueue(payload)
       .then((outcome) => {
-        if (outcome.ok) return
+        if (outcome.ok) return true
         if (outcome.queued) {
           // Already info-logged inside the sink; nothing to do here.
-          return
+          return false
         }
         // dropped — fatal classification (4xx schema/method on our side).
         // Surface at warn so ops sees the contract violation but not as
@@ -697,6 +794,7 @@ function persistServerAuthoredTurn(args: {
           status: args.status,
           reason: outcome.droppedReason,
         })
+        return false
       })
       .catch((err) => {
         // makeV3MasterSink.persistOrQueue is supposed to swallow all
@@ -714,7 +812,11 @@ function persistServerAuthoredTurn(args: {
           },
           err,
         )
+        return false
       })
+  }
+  if (isCommercialManagedRuntime()) {
+    throw new Error('LOSSLESS_SINK_UNAVAILABLE: commercial turn tape sink is not initialized')
   }
   // Legacy / personal-version path — local SQLite is authoritative.
   //
@@ -779,9 +881,9 @@ function persistServerAuthoredTurn(args: {
   }
   return directWrite()
     .then((r) => {
-      if (!r) return
-      if (r.applied) return
-      if (r.reason === 'already_exists') return
+      if (!r) return true
+      if (r.applied) return true
+      if (r.reason === 'already_exists') return true
       if (r.reason === 'queued_to_outbox') {
         // 'queued_to_outbox' is an expected degraded-mode outcome
         // (DB unavailable); log as warn not error so we don't spam
@@ -794,7 +896,7 @@ function persistServerAuthoredTurn(args: {
           status: args.status,
           error: r.error,
         })
-        return
+        return false
       }
       log.warn('server-authored message not persisted', {
         sessionKey: args.sessionKey,
@@ -803,6 +905,7 @@ function persistServerAuthoredTurn(args: {
         status: args.status,
         reason: r.reason,
       })
+      return false
     })
     .catch((err) => {
       log.error(
@@ -815,7 +918,44 @@ function persistServerAuthoredTurn(args: {
         },
         err as Error,
       )
+      return false
     })
+}
+
+function persistPostTerminalRuntimeEvent(args: {
+  sessionKey: string
+  sessionId: string
+  turnIndex: number
+  continuationOfTurnKey: string
+  event: DurableRuntimeEvent
+}): Promise<boolean> {
+  const raw = JSON.stringify(args.event.payload)
+  const identity = createHash('sha256')
+    .update('oc-post-terminal-runtime-v1\0')
+    .update(args.continuationOfTurnKey)
+    .update('\0')
+    .update(String(args.event.ordinal))
+    .update('\0')
+    .update(String(args.event.observedAt))
+    .update('\0')
+    .update(raw)
+    .digest('hex')
+  return persistServerAuthoredTurn({
+    sessionKey: args.sessionKey,
+    peerId: args.sessionId,
+    agentId: `tail_${identity.slice(0, 24)}`,
+    userId: undefined,
+    turnIndex: args.turnIndex,
+    turnKey: createHash('sha256')
+      .update('oc-post-terminal-tape-v1\0')
+      .update(identity)
+      .digest('hex'),
+    continuationOfTurnKey: args.continuationOfTurnKey,
+    createdAt: args.event.observedAt,
+    text: '',
+    status: 'completed',
+    runtimeEvents: [structuredClone(args.event)],
+  })
 }
 
 /**
@@ -1097,7 +1237,7 @@ export class SessionManager {
   }
 
   // ── Server-authored turn persistence tracking ──────────────────────────
-  // Each `persistServerAuthoredTurn(...)` call returns a Promise<void> that
+  // Each `persistServerAuthoredTurn(...)` call returns a Promise<boolean> that
   // settles once the durable enqueue (sink → retry queue file write) lands
   // on disk. We add the promise to this set on dispatch and remove on
   // settle. Shutdown drains the set before clearing the v3 sink singleton
@@ -1107,9 +1247,9 @@ export class SessionManager {
   // The set is Promise-keyed not entry-keyed: turn-end + crash-flush can
   // both fire for the same (sessionKey, turnIndex), and idempotency lives
   // in the master's UPSERT keyed by msgId — we don't dedup on the client.
-  private _pendingPersistence = new Set<Promise<void>>()
+  private _pendingPersistence = new Set<Promise<unknown>>()
 
-  private _trackPersistence(p: Promise<void>): void {
+  private _trackPersistence(p: Promise<unknown>): void {
     this._pendingPersistence.add(p)
     // Two-handler `.then` instead of `.finally` so a rejected `p`
     // doesn't propagate through the chain and trigger an
@@ -1143,15 +1283,19 @@ export class SessionManager {
   ): Promise<{ turnIndex: number; messageId: string }> {
     // Caller owns session.lock through beginExternalTurn().
     {
-      if (session.turns === 0) {
-        const legacyId = this._resumeMap.get(session.sessionKey)
-        session.turns = await getMaxTurnIdx(
-          legacyId && legacyId !== session.sessionKey
-            ? [session.sessionKey, legacyId]
-            : [session.sessionKey],
-        )
-      }
-      const turnIndex = session.turns + 1
+      const legacyId = this._resumeMap.get(session.sessionKey)
+      const turnIndex = await reserveTurnIndex(session.sessionKey, {
+        minimumLastTurn: session.turns,
+        legacySessionIds:
+          legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+      })
+      const turnKey = deriveLosslessTurnKey({
+        sessionId: session.peerId,
+        agentId: session.agentId,
+        turnIndex,
+        status: 'completed',
+        text: args.assistantText,
+      })
       session.turns = turnIndex
       session.currentUserText = args.userText
       session.currentAssistantBuf = args.assistantText
@@ -1164,6 +1308,7 @@ export class SessionManager {
         agentId: session.agentId,
         userId: session.userId,
         turnIndex,
+        turnKey,
         text: args.assistantText,
         status: 'completed',
         requestId: args.requestId,
@@ -1174,10 +1319,12 @@ export class SessionManager {
         },
       })
       this._trackPersistence(persistence)
-      await persistence
-
       const messageId = `srv-${session.peerId}-${session.agentId}-t${turnIndex}`
       const createdAt = Date.now()
+      // Preserve the paid exchange in the next provider context even while
+      // master ACK is pending. Otherwise a transient sink outage would make
+      // the next model turn forget output that is safely present in the local
+      // spool but not yet refresh-visible.
       ;(session._pendingExternalExchanges ??= []).push({
         user: {
           id: `external-${args.requestId}-user`,
@@ -1194,6 +1341,9 @@ export class SessionManager {
           ts: createdAt,
         },
       })
+      if (!(await persistence)) {
+        throw new Error('external turn is durably queued but master has not acknowledged it')
+      }
 
       // The native provider thread did not execute this turn. Force a clean
       // resume so the next user message receives master history (including
@@ -1708,6 +1858,10 @@ export class SessionManager {
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
       // 可向上追溯 webchat 祖先;不影响 _sessionIdToKey / peerId 身份。
       parentSessionKey: opts.parentSessionKey,
+      _billingParentTurnKey: opts.usageAttribution?.parentTurnKey,
+      _usageAttribution: opts.usageAttribution
+        ? { ...opts.usageAttribution }
+        : undefined,
       startedAt: now,
       runner,
       ccbSessionId: null,
@@ -1899,6 +2053,21 @@ export class SessionManager {
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
+    // Commercial PG is the only authoritative history. Never execute a paid
+    // turn when the lossless container→master sink failed to initialize: the
+    // legacy SQLite fallback is intentionally personal-only and is invisible
+    // after a commercial relogin.
+    if (isCommercialManagedRuntime() && getV3MasterSinkOrNull() === null) {
+      log.error('commercial turn rejected: lossless sink unavailable', {
+        sessionKey: session.sessionKey,
+        agentId: session.agentId,
+        channel: session.channel,
+      })
+      // Do not add a persistence-specific user notice. The turn never ran or
+      // billed, and exposing a synthetic terminal frame would itself become
+      // an unacknowledged reply that disappears after reconnect.
+      return
+    }
     // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
     // engine-reported 计费的底座(codex,capabilities.needsServerRequestId=true)
     // 依赖 master bridge 注入的 server-owned requestId 关联 preCheck / inflight
@@ -2198,6 +2367,7 @@ export class SessionManager {
       }
     } catch (err: any) {
       if (err?.message?.includes('idle timeout')) {
+        const persistTimedOutTurn = session._persistActiveTurn
         // Actually interrupt the runner so the subprocess stops
         try { session.runner.interrupt() } catch {}
         // boss 红线:本轮模型无响应/超时不扣费。上报 master 冲正本 turn 已扣费用
@@ -2209,10 +2379,18 @@ export class SessionManager {
         const m = /\((\d+)s/.exec(String(err?.message))
         const minutes = m ? Math.round(Number(m[1]) / 60) : null
         const detail = minutes ? `约 ${minutes} 分钟无输出` : '长时间无输出'
-        onEvent({
-          kind: 'error',
-          error: `子进程${detail},已中断。请重试。`,
-        })
+        const reason = `子进程${detail},已中断。请重试。`
+        if (persistTimedOutTurn) {
+          const persistence = persistTimedOutTurn(
+            'interrupted',
+            reason,
+            'LIVENESS_TIMEOUT',
+          )
+          this._trackPersistence(persistence)
+          await persistence
+        } else {
+          onEvent({ kind: 'error', error: reason })
+        }
         log.error(
           'idle timeout, interrupted',
           { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
@@ -2230,6 +2408,7 @@ export class SessionManager {
       // 让真值源不依赖外部不变量。release() 之前归零,保证下一个 await prev
       // 的 submit 看到的是干净状态。
       session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
+      session._currentTurnKey = undefined
       release()
     }
   }
@@ -2267,11 +2446,11 @@ export class SessionManager {
     //      path + master internalServerAuthored.ts handler use the identical
     //      formula `srv-${peerId}-${agentId}-t${turnIndex}` and `${...}-thinking`)
     //
-    // `session.turns` at this point is the count of COMPLETED turns; the
-    // turn we're about to start is `session.turns + 1` (1-indexed, matching
-    // turn.completed semantics — see line 1516 / 1729 where
-    // `turnIndex = session.turns + 1` and `= session.turns` post-increment
-    // both resolve to the same value at persist time).
+    // Reserve the turn id durably before any model output. FTS/session metadata
+    // are post-result indexes and can lag or be absent for interrupted turns;
+    // using them alone lets a process restart reuse tN and collide with an
+    // immutable tape already ACKed (or queued locally). A reservation is never
+    // rolled back; failed/empty turns may leave harmless gaps.
     //
     // 2026-05-13 — agentId segment added to disambiguate mid-chat model
     // switches. A chat that flips from codex to main keeps the same
@@ -2284,7 +2463,25 @@ export class SessionManager {
     // Retry attempts within this loop SHARE these ids: a user turn that
     // gets retried for phantom/auth/transient errors is still one logical
     // assistant message from the user's perspective.
-    const projectedTurnIndex = session.turns + 1
+    const legacyId = this._resumeMap.get(session.sessionKey)
+    const projectedTurnIndex = await reserveTurnIndex(session.sessionKey, {
+      minimumLastTurn: session.turns,
+      legacySessionIds:
+        legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+    })
+    // CcbMessageParser increments this reference on a real result. Seed it to
+    // the slot immediately before the reservation so the result lands exactly
+    // on projectedTurnIndex; partial/crash persistence uses the same slot.
+    session.turns = projectedTurnIndex - 1
+    const turnKey = deriveLosslessTurnKey({
+      sessionId: session.peerId,
+      agentId: session.agentId,
+      turnIndex: projectedTurnIndex,
+      status: 'completed',
+      text: '',
+    })
+    session._currentTurnKey = turnKey
+    session._nextDurableEventOrdinal = 0
     const assistantMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}`
     const thinkingMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-thinking`
     // V3 v7.1 — canonical tool row id factory. Same lifecycle as the
@@ -2293,6 +2490,34 @@ export class SessionManager {
     // id branch so client + server tape agree on tool row id from frame 1.
     const toolMessageIdFactory = (blockId: string): string =>
       `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-tool-${blockId}`
+
+    // Every retry attempt belongs to one logical turn and one immutable tape.
+    // Keep exact failed-attempt protocol events and gateway retry notices, then
+    // prepend them to the terminal attempt's snapshot.
+    const retryRuntimeEvents: DurableRuntimeEvent[] = []
+    const retryAssistantSegments: SegmentRecord[] = []
+    const emitRetryStatus = (text: string, code: string): void => {
+      const block: OutboundContentBlock = {
+        kind: 'text',
+        text,
+        messageId: assistantMessageId,
+      }
+      const ordinal = takeDurableEventOrdinal(session)
+      const observedAt = Date.now()
+      retryAssistantSegments.push({
+        index: retryAssistantSegments.length,
+        text,
+        ts: observedAt,
+        eventOrdinal: ordinal,
+      })
+      retryRuntimeEvents.push({
+        ordinal,
+        observedAt,
+        source: 'gateway',
+        payload: { type: 'retry_status', code, event: { kind: 'block', block } },
+      })
+      onEvent({ kind: 'block', block })
+    }
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -2306,7 +2531,12 @@ export class SessionManager {
           assistantMessageId,
           thinkingMessageId,
           toolMessageIdFactory,
+          turnKey,
           modelAuthority,
+          retryRuntimeEvents,
+          retryAssistantSegments,
+          attempt < MAX_RETRIES,
+          !phantomRetryUsed,
         )
         return // success
       } catch (err: any) {
@@ -2324,28 +2554,19 @@ export class SessionManager {
           // 子进程重启时 runner 的 'spawn' 事件会自动把 _lastCcbCumulativeCost 归零。
           await session.runner.shutdown()
           if (phantomRetryUsed) {
-            // 重启过一次还是 phantom,不再循环。emit 终态 error(走和 idle_timeout 一样的路径,
-            // server.ts 会把 kind:'error' 转成 isFinal:true 的可见错误帧)。
-            onEvent({
-              kind: 'error',
-              error:
-                'CCB 子进程持续返回空响应,已重启子进程。请重新发送消息或检查 gateway 日志。',
-            })
+            // New adapters persist and resolve the terminal phantom inside
+            // _runOneTurn. Keep a visible fallback for legacy test doubles.
+            emitRetryStatus(
+              '\n\nCCB 子进程持续返回空响应,已重启子进程。\n',
+              'PHANTOM_TERMINAL',
+            )
             return
           }
           phantomRetryUsed = true
-          onEvent({
-            kind: 'block',
-            block: {
-              kind: 'text',
-              text: '\n\n🔄 CCB 子进程返回空响应(未调模型),已重启子进程并自动重试...\n',
-              // V3 v7 — stamp canonical id so this status text lands in the
-              // same client row that the upcoming retry's model text will
-              // populate, instead of forcing client to mint a separate m-*
-              // placeholder that would block canonical-id adoption.
-              messageId: assistantMessageId,
-            },
-          })
+          emitRetryStatus(
+            '\n\n🔄 CCB 子进程返回空响应(未调模型),已重启子进程并自动重试...\n',
+            'PHANTOM_RETRY',
+          )
           // Don't consume transient-retry budget on a phantom retry. The for-loop's
           // `attempt++` would otherwise eat one slot from MAX_RETRIES (originally
           // intended for 529/503/rate-limit), which would silently shorten the
@@ -2375,14 +2596,10 @@ export class SessionManager {
           // Runner 'spawn' listener resets _lastCcbCumulativeCost automatically.
           await session.runner.shutdown()
           if (attempt >= MAX_RETRIES) throw err
-          onEvent({
-            kind: 'block',
-            block: {
-              kind: 'text',
-              text: '\n\n🔄 认证已过期,正在刷新凭据并重试...\n',
-              messageId: assistantMessageId, // see phantom-retry rationale above
-            },
-          })
+          emitRetryStatus(
+            '\n\n🔄 认证已过期,正在刷新凭据并重试...\n',
+            'AUTH_RETRY',
+          )
           continue
         }
 
@@ -2398,14 +2615,10 @@ export class SessionManager {
           error: msg,
           ...(traceId ? { traceId } : {}),
         })
-        onEvent({
-          kind: 'block',
-          block: {
-            kind: 'text',
-            text: `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
-            messageId: assistantMessageId, // see phantom-retry rationale above
-          },
-        })
+        emitRetryStatus(
+          `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
+          'TRANSIENT_RETRY',
+        )
         await new Promise((r) => setTimeout(r, delay))
       }
     }
@@ -2440,14 +2653,65 @@ export class SessionManager {
      *  `srv-${peerId}-${agentId}-t${turnIndex}-tool-${blockId}` format).
      *  Undefined for personal-version legacy callers. */
     toolMessageIdFactory?: (blockId: string) => string,
+    /** Stable logical key shared by tape persistence and proxy billing. */
+    turnKey?: string,
     /** 模型权威批次 §4:本 turn 的上游凭据(见 runOneTurnWithRetry 注释)。 */
     modelAuthority?: TurnModelAuthority,
+    /** Exact events from earlier attempts of this same logical turn. */
+    retryRuntimeEvents: DurableRuntimeEvent[] = [],
+    /** User-visible retry notices already emitted before this attempt. */
+    retryAssistantSegments: SegmentRecord[] = [],
+    /** Whether an auth result may reject for another credential-refresh try. */
+    retryAuthErrors = true,
+    /** Whether an empty phantom result may reject for its one clean-process try. */
+    retryPhantomErrors = true,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
     let turnToolCallCount = 0
     let turnBlockCount = 0
     let turnPermissionCount = 0
+    // Plan/goal blocks are paid structured model output but are not contained
+    // in assistantText/thinkingText/tool snapshots. Keep every update (not
+    // merely the last card projection) so a disconnected browser is never the
+    // sole durable copy.
+    const structuredBlocks: Array<Record<string, unknown>> = []
+    let postTerminalRuntimeChain: Promise<void> = Promise.resolve()
+    const onPostTerminalRuntimeEvent = (
+      event: DurableRuntimeEvent,
+      block: OutboundContentBlock,
+    ): void => {
+      session._durableDelegateRuntimeEvents?.push(structuredClone(event))
+      const ownerTurnKey = session.channel === 'delegate'
+        ? session._billingParentTurnKey
+        : turnKey
+      const ownerSessionId = session.channel === 'delegate'
+        ? session._usageAttribution?.parentSessionId
+        : session.peerId
+      if (!ownerTurnKey || !ownerSessionId) {
+        onEvent({ kind: 'block', block })
+        return
+      }
+      postTerminalRuntimeChain = postTerminalRuntimeChain.then(async () => {
+        await persistPostTerminalRuntimeEvent({
+          sessionKey: session.sessionKey,
+          sessionId: ownerSessionId,
+          turnIndex: prevTurns + 1,
+          continuationOfTurnKey: ownerTurnKey,
+          event,
+        })
+        // Never show a post-terminal snapshot before its exact raw event is
+        // fsynced in the sink queue (and normally ACKed by master).
+        onEvent({ kind: 'block', block })
+      }).catch((err) => {
+        log.error(
+          'post-terminal runtime continuation persist failed',
+          { sessionKey: session.sessionKey, turnKey: ownerTurnKey },
+          err as Error,
+        )
+      })
+      this._trackPersistence(postTerminalRuntimeChain)
+    }
 
     // Snapshot session totals so we can roll back on auth error / phantom turn
     // (CcbAdapter 的 per-turn parser 经 TurnParams.sessionTotals 引用直接 mutate
@@ -2459,6 +2723,23 @@ export class SessionManager {
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
+      let turn: EngineTurnRun | null = null
+      let finalizationDone: Promise<void> | null = null
+      let persistTerminalSnapshot:
+        | ((
+            status: 'interrupted' | 'crashed',
+            reason: string,
+            errorCode: string,
+            settleAfter?: boolean,
+          ) => Promise<void>)
+        | null = null
+      let requestTerminalPersistence:
+        | ((
+            status: 'interrupted' | 'crashed',
+            reason: string,
+            errorCode: string,
+          ) => Promise<void>)
+        | null = null
 
       // Idle timeout — refreshed on every adapter 'activity'(底座每条原始消息,
       // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
@@ -2467,12 +2748,16 @@ export class SessionManager {
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
       const timer = setTimeout(
         () => {
-          if (!turn.finalized) {
-            try { runner.interrupt() } catch {}
+          if (!turn?.finalized) {
             this._reportTurnWaive(session, 'idle_timeout')
-            onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
-            detach()
-            settle(() => resolve())
+            const reason = '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。'
+            const persistence = requestTerminalPersistence?.(
+              'interrupted',
+              reason,
+              'IDLE_TIMEOUT',
+            )
+              ?? Promise.resolve()
+            this._trackPersistence(persistence)
           }
         },
         IDLE_TIMEOUT_MS,
@@ -2537,6 +2822,20 @@ export class SessionManager {
           }))
           return
         }
+        if (
+          e.kind === 'block' &&
+          (e.block.kind === 'plan' || e.block.kind === 'goal') &&
+          !e.block.parentToolUseId
+        ) {
+          structuredBlocks.push({
+            ...(structuredClone(e.block) as OutboundContentBlock),
+            _ocObservedAt: Date.now(),
+            _ocEventOrdinal:
+              typeof (e.block as Record<string, unknown>)._ocEventOrdinal === 'number'
+                ? (e.block as Record<string, unknown>)._ocEventOrdinal
+                : takeDurableEventOrdinal(session),
+          })
+        }
         // Track all observable output for phantom-turn detection.
         // permission_request counts as real output too (visible permission card),
         // so it must NOT be flagged as phantom even if usage is 0.
@@ -2558,14 +2857,32 @@ export class SessionManager {
       //     turnPermissionCount,phantom 判定不把 billing 当"输出"(旧语义)。
       //   - `!detached` guard:turn 已 idle/error 收尾后不再补发,防二次 settle。
       //   - CCB(billingMode:'proxy')永不 emit 'billing',本 listener 是 no-op。
+      let terminalEngineBilling: EngineBillingEvent | undefined
       const handleBilling = (b: EngineBillingEvent) => {
-        if (!detached) onEvent({ kind: 'codex_billing', ...b })
+        if (detached) return
+        // The live bridge frame is only a latency optimization: its outbound
+        // ring is bounded and may be gone after a reconnect. Keep an exact
+        // immutable copy in the same turn tape before terminal persistence.
+        terminalEngineBilling = structuredClone(b)
+        session._durableDelegateEngineBillings?.push(structuredClone(b))
+        onEvent({ kind: 'codex_billing', ...b })
       }
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
-      const handleParseError = (payload: { line: string; err: unknown }) => {
-        const err = payload.err as Error | undefined
+      const handleParseError = (payload: { line: string; err?: unknown; error?: unknown }) => {
+        const rawError = payload.err ?? payload.error
+        const err = rawError as Error | undefined
+        retryRuntimeEvents.push({
+          ordinal: takeDurableEventOrdinal(session),
+          observedAt: Date.now(),
+          source: 'gateway',
+          payload: {
+            type: 'parse_error',
+            line: payload.line,
+            error: err?.message ?? String(rawError ?? 'unknown parse error'),
+          },
+        })
         log.warn('ccb stdout parse_error', {
           sessionKey: session.sessionKey,
           msg: err?.message,
@@ -2575,14 +2892,23 @@ export class SessionManager {
       }
 
       let detached = false
+      // A subprocess exit and the final result line can cross in the stdout
+      // drain window. Exactly one terminal snapshot may own this logical turn;
+      // otherwise completed and crash-flush payloads would contend for the
+      // same immutable turn key. Normal completion wins until the crash timer
+      // explicitly freezes the parser and claims the partial snapshot.
+      let terminalPersistenceClaim: 'none' | 'complete' | 'partial' = 'none'
       const detach = () => {
         if (detached) return
         detached = true
+        if (session._persistActiveTurn === requestTerminalPersistence) {
+          session._persistActiveTurn = undefined
+        }
         clearTimeout(timer)
         // 等价旧 parser.finish():幂等终结本 turn(summary 以当前累积态 resolve)。
         // turn-scoped 句柄保证 stale detach 不波及后继 turn(旧
         // `session._currentParser === parser` identity guard 收在 adapter 内)。
-        turn.end()
+        turn?.end()
         // 故意不清 adapter 的 stdout 路由:CCB 的 bg bash 在 turn 结束后仍 emit
         // bash_output_tail,需要继续流经 finalized parser(放行 tail)→
         // handleEngineEvent → onEvent → this.deliver。下一轮 submitTurn 会替换
@@ -2595,6 +2921,178 @@ export class SessionManager {
         runner.off('parse_error', handleParseError)
       }
 
+      const retainedTerminalErrors = new Set<string>()
+      const retainTerminalError = (
+        status: 'interrupted' | 'crashed',
+        reason: string,
+        errorCode: string,
+      ): void => {
+        const identity = `${status}\0${errorCode}\0${reason}`
+        if (retainedTerminalErrors.has(identity)) return
+        retainedTerminalErrors.add(identity)
+        retryRuntimeEvents.push({
+          ordinal: takeDurableEventOrdinal(session),
+          observedAt: Date.now(),
+          source: 'gateway',
+          payload: { type: 'terminal_error', status, code: errorCode, detail: reason },
+        })
+      }
+
+      let partialPersistencePromise: Promise<void> | null = null
+      persistTerminalSnapshot = (
+        status: 'interrupted' | 'crashed',
+        reason: string,
+        errorCode: string,
+        settleAfter = true,
+      ): Promise<void> => {
+        if (terminalPersistenceClaim !== 'none') {
+          return partialPersistencePromise ?? Promise.resolve()
+        }
+        terminalPersistenceClaim = 'partial'
+        partialPersistencePromise = (async () => {
+          let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
+          detach()
+          const snap = turn?.getPartialSnapshot() ?? {
+            assistantText: '',
+            thinkingText: '',
+            completedTools: [],
+            assistantSegments: [],
+            thinkingSegments: [],
+            runtimeEvents: [],
+          }
+          const partialAgentGroups = this.drainPendingAgentGroups(session)
+          retainTerminalError(status, reason, errorCode)
+          const terminalRuntimeEvents = [
+            ...retryRuntimeEvents.map((event) => structuredClone(event)),
+            ...snap.runtimeEvents,
+          ]
+          const partialAssistant = combineRetryAssistantOutput(
+            retryAssistantSegments,
+            snap.assistantText,
+            snap.assistantSegments,
+            Date.now(),
+          )
+          if (session._durableDelegateRuntimeEvents) {
+            session._durableDelegateRuntimeEvents.push(
+              ...terminalRuntimeEvents.map((event) => structuredClone(event)),
+            )
+          }
+          try {
+            if (MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) {
+              const turnIndex = prevTurns + 1
+              session.turns = Math.max(session.turns, turnIndex)
+              persistenceAcknowledged = await persistServerAuthoredTurn({
+                sessionKey: session.sessionKey,
+                peerId: session.peerId,
+                agentId: session.agentId,
+                userId: session.userId,
+                turnIndex,
+                ...(turnKey ? { turnKey } : {}),
+                text: partialAssistant.text,
+                ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
+                status,
+                errorCode,
+                errorDetail: reason,
+                ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
+                ...(requestId ? { requestId } : {}),
+                ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
+                ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
+                ...(partialAssistant.segments.length > 0
+                  ? { assistantSegments: partialAssistant.segments }
+                  : {}),
+                ...(snap.thinkingSegments.length > 0
+                  ? { thinkingSegments: snap.thinkingSegments }
+                  : {}),
+                ...(partialAgentGroups.length > 0 ? { agentGroups: partialAgentGroups } : {}),
+                ...(structuredBlocks.length > 0 ? { structuredBlocks } : {}),
+                runtimeEvents: terminalRuntimeEvents,
+                ...(terminalEngineBilling !== undefined
+                  ? { engineBilling: terminalEngineBilling }
+                  : {}),
+              })
+            }
+          } finally {
+            // A queued tape is durable locally but not yet visible from the
+            // authoritative PG history. Never expose a terminal frame until
+            // the master has ACKed it; reconnect/relogin must not turn a live
+            // "finished" reply into a missing one.
+            if (persistenceAcknowledged) onEvent({ kind: 'error', error: reason })
+            if (settleAfter) settle(() => resolve())
+          }
+        })()
+        return partialPersistencePromise
+      }
+
+      let terminalRequestPromise: Promise<void> | null = null
+      requestTerminalPersistence = (
+        status: 'interrupted' | 'crashed',
+        reason: string,
+        errorCode: string,
+      ): Promise<void> => {
+        // Record the terminal observation immediately, before a cooperative
+        // interrupt can produce more engine events. Its global ordinal thus
+        // reconstructs the exact live ordering after refresh.
+        retainTerminalError(status, reason, errorCode)
+        if (terminalRequestPromise) return terminalRequestPromise
+        terminalRequestPromise = (async () => {
+          const activeTurn = turn
+          if (!activeTurn) {
+            await Promise.resolve()
+            if (!turn) {
+              await persistTerminalSnapshot?.(status, reason, errorCode)
+              return
+            }
+          }
+
+          try { runner.interrupt() } catch {}
+
+          // Give a cooperative interrupt one short window to produce its own
+          // usage-bearing terminal result. If it does, normal finalization is
+          // authoritative and already includes the gateway terminal event.
+          const targetTurn = turn!
+          let summaryFinished = false
+          let timerHandle: NodeJS.Timeout | null = null
+          await Promise.race([
+            targetTurn.summary.then(() => { summaryFinished = true }),
+            new Promise<void>((resolveWait) => {
+              timerHandle = setTimeout(resolveWait, 5_000)
+            }),
+          ])
+          if (timerHandle) clearTimeout(timerHandle)
+          if (summaryFinished) {
+            await finalizationDone
+            await partialPersistencePromise
+            return
+          }
+
+          // No result: terminate the process generation, then wait beyond the
+          // supervisor's bounded shutdown return until its stdout really
+          // closes. This is the no-loss barrier for escaped descendants that
+          // still hold the pipe after SIGKILL.
+          try {
+            await runner.shutdown()
+          } catch (err) {
+            retainTerminalError(
+              'crashed',
+              `runner shutdown failed: ${String(err)}`,
+              'RUNNER_SHUTDOWN_FAILED',
+            )
+          }
+          await runner.waitForOutputDrain()
+          // Let synchronously parsed final/result frames schedule their
+          // summary/finalization microtasks before deciding a partial is needed.
+          await Promise.resolve()
+          if (targetTurn.finalized) {
+            await finalizationDone
+            await partialPersistencePromise
+            return
+          }
+          await persistTerminalSnapshot?.(status, reason, errorCode)
+        })()
+        return terminalRequestPromise
+      }
+      session._persistActiveTurn = requestTerminalPersistence
+
       // == turn 终态后处理(原 parser onFinish 主体,改为消费 TurnSummary)==
       // 由下方 turn.summary.then(finalizeTurn) 触发:正常终态带 summary(engine
       // 中立汇总),异常终态(error/exit/timeout 经 detach → turn.end 强制收尾)
@@ -2602,8 +3100,11 @@ export class SessionManager {
       // summary resolve → microtask 执行本函数,期间不会有新的 stdout 宏任务插入,
       // 后处理相对底座输出流的顺序与旧同步实现一致(含 crash 路径下
       // _pendingStaleResumeClear 先于 getOrCreate 'exit' handler 可见)。
-      const finalizeTurn = (result: TurnSummary | null): void => {
+      const finalizeTurn = async (result: TurnSummary | null): Promise<void> => {
+          if (terminalPersistenceClaim === 'partial') return
           detach()
+          let persistenceAcknowledged = true
+          let terminalErrorForClient: string | undefined
 
           // Detect stale --resume session id. CCB emits an error result with
           // `errors: ["No conversation found with session ID: <id>"]` when
@@ -2621,6 +3122,12 @@ export class SessionManager {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
+            await persistTerminalSnapshot?.(
+              'crashed',
+              result.errorDetail ?? 'Previous engine session is no longer available',
+              'STALE_RESUME_ID',
+              false,
+            )
             settle(() => reject(new Error('STALE_RESUME_ID: Previous session file missing; next submit will start fresh')))
             return
           }
@@ -2628,7 +3135,10 @@ export class SessionManager {
           // Detect auth error — roll back counters and reject. 分类逻辑(isError +
           // 关键字宽匹配 / CCB 精确错误前缀)已下沉 CcbAdapter(底座私有知识),
           // 本层只消费 errorKind === 'auth'。
-          if (result?.errorKind === 'auth') {
+          if (result?.errorKind === 'auth' && retryAuthErrors) {
+            retryRuntimeEvents.push(
+              ...result.runtimeEvents.map((event) => structuredClone(event)),
+            )
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
@@ -2660,7 +3170,7 @@ export class SessionManager {
           // phantom 信号经 turn 句柄读(异常终态 result=null 时仍可读 —— 旧实现
           // 在 onFinish(null) 里同样消费 telemetry signals;正常终态与
           // result.phantomSignals 同源同值)。
-          const signals = turn.getPhantomSignals()
+          const signals = turn!.getPhantomSignals()
           let isPhantomTurn = false
           switch (signals.apiState) {
             case 'skipped':
@@ -2718,6 +3228,11 @@ export class SessionManager {
           }
 
           if (isPhantomTurn) {
+            if (result && retryPhantomErrors) {
+              retryRuntimeEvents.push(
+                ...result.runtimeEvents.map((event) => structuredClone(event)),
+              )
+            }
             // Roll back parser-mutated counters (parser already incremented
             // turns and may have touched cost/cumulative even if delta was 0).
             session.totalCostUSD = prevCostUSD
@@ -2729,20 +3244,32 @@ export class SessionManager {
               durationMs: Date.now() - turnStartTime,
               ...(traceId ? { traceId } : {}),
             })
-            settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
+            if (retryPhantomErrors) {
+              settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
+            } else {
+              await persistTerminalSnapshot?.(
+                'crashed',
+                'CCB 子进程持续返回空响应,已重启子进程。',
+                'PHANTOM_TURN',
+              )
+            }
             return
           }
 
-          // Forward the buffered 'final' event now that we know it's not an auth error
-          if (pendingFinal) onEvent(pendingFinal)
-
           // Update session accumulators from turn result
           if (result) {
+            terminalPersistenceClaim = 'complete'
+            const completedAssistant = combineRetryAssistantOutput(
+              retryAssistantSegments,
+              result.assistantText,
+              result.assistantSegments,
+              Date.now(),
+            )
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens
             session.totalCacheCreationTokens += result.usage.cacheCreationTokens
-            session.currentAssistantBuf = result.assistantText
+            session.currentAssistantBuf = completedAssistant.text
             // Persist cost-delta baseline after every successful turn so that
             // a gateway crash + restart can re-seed the correct baseline for
             // the resumed CCB (whose restoreCostStateForSession will target
@@ -2769,7 +3296,7 @@ export class SessionManager {
                 turnCount: session.turns,
                 totalCostUSD: session.totalCostUSD,
               }),
-              indexTurn(sessId, session.turns, session.currentUserText ?? '', result.assistantText),
+              indexTurn(sessId, session.turns, session.currentUserText ?? '', completedAssistant.text),
             ]).catch((err) =>
               log.error(
                 'FTS5 index failed',
@@ -2796,8 +3323,7 @@ export class SessionManager {
             // 不是 client_sessions.id,master 端 WHERE id=? 永远命不中,只会浪费 outbox
             // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
             // sessions_meta / event_log 路径(已存在,不在本 if 内)。
-            const completedHasAssistant =
-              !!result.assistantText && result.assistantText.length > 0
+            const completedHasAssistant = completedAssistant.text.length > 0
             const completedHasThinking =
               !!result.thinkingText && result.thinkingText.length > 0
             // Tools-only turn is rare but real: a turn that emits tool_use
@@ -2816,15 +3342,33 @@ export class SessionManager {
             // persists its team cards.
             const completedAgentGroups = this.drainPendingAgentGroups(session)
             const completedHasAgentGroups = completedAgentGroups.length > 0
+            const completedHasStructuredBlocks = structuredBlocks.length > 0
+            const completedRuntimeEvents = [
+              ...retryRuntimeEvents.map((event) => structuredClone(event)),
+              ...result.runtimeEvents,
+            ]
+            if (session._durableDelegateRuntimeEvents) {
+              session._durableDelegateRuntimeEvents.push(
+                ...completedRuntimeEvents.map((event) => structuredClone(event)),
+              )
+            }
+            const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
+            const completedHasError = result.isError || result.errorDetail !== undefined
+            if (completedHasError) {
+              terminalErrorForClient = result.errorDetail ?? 'engine reported an error'
+            }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
               (completedHasAssistant ||
                 completedHasThinking ||
                 completedHasTools ||
-                completedHasAgentGroups)
+                completedHasAgentGroups ||
+                completedHasStructuredBlocks ||
+                completedHasRuntimeEvents ||
+                completedHasError)
             ) {
               const peerId = session.peerId
-              const assistantText = result.assistantText ?? ''
+              const assistantText = completedAssistant.text
               const thinkingText = result.thinkingText ?? ''
               const turnIndex = session.turns
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
@@ -2841,12 +3385,13 @@ export class SessionManager {
               // dedupe. Threshold extended to "thinking-only" turns (Sonnet
               // 4.6 adaptive thinking that runs out of tokens before producing
               // assistant text) so those don't disappear either.
-              this._trackPersistence(persistServerAuthoredTurn({
+              const persistence = persistServerAuthoredTurn({
                 sessionKey: session.sessionKey,
                 peerId,
                 agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
+                ...(turnKey ? { turnKey } : {}),
                 text: assistantText,
                 ...(completedHasThinking ? { thinkingText } : {}),
                 status: 'completed',
@@ -2878,17 +3423,34 @@ export class SessionManager {
                   ...(traceId ? { traceId } : {}),
                 },
                 ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
+                ...(completedHasError
+                  ? {
+                      errorCode: result.errorKind === 'auth' ? 'AUTH_ERROR' : 'ENGINE_ERROR',
+                      errorDetail: result.errorDetail ?? 'engine reported an error',
+                    }
+                  : {}),
                 ...(completedHasTools ? { tools: result.tools } : {}),
                 // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
-                ...(result.assistantSegments.length > 0
-                  ? { assistantSegments: result.assistantSegments }
+                ...(completedAssistant.segments.length > 0
+                  ? { assistantSegments: completedAssistant.segments }
                   : {}),
                 ...(result.thinkingSegments.length > 0
                   ? { thinkingSegments: result.thinkingSegments }
                   : {}),
                 // P2 债A — team cards drained above.
                 ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
-              }))
+                ...(completedHasStructuredBlocks ? { structuredBlocks } : {}),
+                ...(completedHasRuntimeEvents ? { runtimeEvents: completedRuntimeEvents } : {}),
+                ...(terminalEngineBilling !== undefined
+                  ? { engineBilling: terminalEngineBilling }
+                  : {}),
+              })
+              this._trackPersistence(persistence)
+              // Do not declare the paid turn complete until master has
+              // durably finalized the immutable tape. A queued local spool is
+              // safe but not yet refresh-visible, so it must not masquerade as
+              // an acknowledged completion.
+              persistenceAcknowledged = await persistence
             }
 
             // Emit turn.completed event (triggers event_log + usage_log persistence)
@@ -2944,13 +3506,23 @@ export class SessionManager {
               })
             }
           }
+          // A transient persistence failure stays in the unlimited fsynced
+          // retry queue. Do not emit a new user-facing notice and do not expose
+          // terminal completion until the authoritative master ACKs it.
+          if (persistenceAcknowledged) {
+            if (terminalErrorForClient) {
+              onEvent({ kind: 'error', error: terminalErrorForClient })
+            } else if (pendingFinal) {
+              onEvent(pendingFinal)
+            }
+          }
           settle(() => resolve())
       }
 
       const handleError = (err: Error) => {
-        onEvent({ kind: 'error', error: err.message })
-        detach()
-        settle(() => resolve())
+        const persistence = requestTerminalPersistence?.('crashed', err.message, 'RUNNER_ERROR')
+          ?? Promise.resolve()
+        this._trackPersistence(persistence)
       }
 
       // Listen for subprocess crash mid-turn. Defer slightly to let remaining
@@ -2974,114 +3546,20 @@ export class SessionManager {
         // sink singleton before the setTimeout fires, sending the partial
         // through the legacy data-loss path. Codex R2 BLOCK-1.
         const flushP = new Promise<void>((resolveFlush) => {
-          setTimeout(async () => {
-            try {
-              if (!turn.finalized) {
-                const reason = info.signal
-                  ? `子进程被信号 ${info.signal} 终止`
-                  : info.code
-                    ? `子进程异常退出 (code ${info.code})`
-                    : '子进程意外退出'
-                // ── Phase 0.2: persist partial assistant text on interrupt/crash ──
-                // CCB was streaming into parser.assistantBuf when it died / was
-                // interrupted. Without this flush the partial text is only in RAM
-                // + whatever frames the ws client already received. If the client
-                // is backgrounded we lose it entirely. Persist with status marker
-                // 'interrupted' (user stop / SIGINT / idle-timeout signal) vs
-                // 'crashed' (unexpected exit code) so the UI can render a clear
-                // "[was interrupted]" trailer rather than showing a complete-
-                // looking bubble.
-                // turn-scoped 快照(= 旧 parser.assistantBuf/thinkingBuf/
-                // completedTools/segments 直读;快照在 150ms drain 之后取,
-                // 与旧读取时机一致,交叠 turn 场景只读本 turn 的 parser)。
-                const snap = turn.getPartialSnapshot()
-                const partial = snap.assistantText
-                const partialThinking = snap.thinkingText
-                const partialTools = snap.completedTools
-                const hasPartial = !!partial && partial.length > 0
-                const hasPartialThinking =
-                  !!partialThinking && partialThinking.length > 0
-                const hasPartialTools = partialTools.length > 0
-                // P2 债A — drain buffered team cards for delegations that
-                // completed before the crash/interrupt. Take-and-clear so they
-                // don't leak into the next turn; added to the gate so a leader
-                // that crashed right after delegating (no partial text/thinking/
-                // tools) still persists its team structure.
-                const partialAgentGroups = this.drainPendingAgentGroups(session)
-                const hasPartialAgentGroups = partialAgentGroups.length > 0
-                if (
-                  MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
-                  (hasPartial ||
-                    hasPartialThinking ||
-                    hasPartialTools ||
-                    hasPartialAgentGroups)
-                ) {
-                  const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
-                  const peerId = session.peerId
-                  const turnIndex = session.turns + 1 // turn hasn't been counted yet
-                  // Same P1-3 treatment as handleResult: prefer session.userId so
-                  // a pre-PUT crash still reaches the outbox; fall back to
-                  // getClientSession for legacy code paths.
-                  // Awaited here so flushP settles only after the durable
-                  // enqueue (or persistOrQueue resolution) — that's the
-                  // promise the pending-persistence set is gating shutdown on.
-                  // thinkingText forwarded so partial reasoning isn't lost
-                  // on crash/interrupt (Phase 0.4 thinking durability).
-                  await persistServerAuthoredTurn({
-                    sessionKey: session.sessionKey,
-                    peerId,
-                    agentId: session.agentId,
-                    userId: session.userId,
-                    turnIndex,
-                    text: partial ?? '',
-                    ...(hasPartialThinking ? { thinkingText: partialThinking } : {}),
-                    status,
-                    // Plan §4.4 改动 7 — propagate requestId so master can
-                    // still wire pending costCredits onto the partial turn
-                    // on the rare interrupt-after-cost-charged path.
-                    // No token/truncated usage on the interrupt path: token
-                    // counts aren't computed yet (parser hadn't run
-                    // handleResult), and 'truncated' specifically means
-                    // stop_reason=max_tokens — distinct from interrupt/crash
-                    // which use the `status` field instead. We DO carry the
-                    // per-turn traceId here so an interrupted/crashed turn —
-                    // exactly the case a user wants to report — still persists
-                    // a copyable "请求ID" on its assistant row for log lookup.
-                    ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
-                    ...(requestId ? { requestId } : {}),
-                    // CCB agent session id → master 按 session 精确排空 pending costCredits。
-                    ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
-                    // Tools that completed before the crash/interrupt — they
-                    // produced real outputs and deserve durable persistence
-                    // alongside the partial text.
-                    ...(hasPartialTools ? { tools: partialTools } : {}),
-                    // Fix B (2026-05-25) — per-segment durable rows for the
-                    // partial turn. Parser populates assistantSegments /
-                    // thinkingSegments incrementally as deltas arrive, so the
-                    // partial state at crash/interrupt already reflects every
-                    // tool-boundary split that completed before the crash.
-                    // (snapshot 数组已是拷贝,无需再 clone。)Plan §3.5.1.
-                    ...(snap.assistantSegments.length > 0
-                      ? { assistantSegments: snap.assistantSegments }
-                      : {}),
-                    ...(snap.thinkingSegments.length > 0
-                      ? { thinkingSegments: snap.thinkingSegments }
-                      : {}),
-                    // P2 债A — team cards drained above (delegations completed
-                    // before the crash/interrupt).
-                    ...(hasPartialAgentGroups ? { agentGroups: partialAgentGroups } : {}),
-                  })
-                }
-                onEvent({ kind: 'error', error: reason })
-                detach()
-                settle(() => resolve())
-              }
-              // Cost-tracker reset is handled by the `spawn` listener installed in
-              // createSession — it fires synchronously when the next submit() spawns
-              // a fresh CCB, with no timer-vs-new-process race.
-            } finally {
+          setTimeout(() => {
+            if (turn?.finalized || terminalPersistenceClaim !== 'none') {
               resolveFlush()
+              return
             }
+            const reason = info.signal
+              ? `子进程被信号 ${info.signal} 终止`
+              : info.code
+                ? `子进程异常退出 (code ${info.code})`
+                : '子进程意外退出'
+            const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
+            const code = info.signal ? 'RUNNER_INTERRUPTED' : 'RUNNER_CRASHED'
+            void (persistTerminalSnapshot?.(status, reason, code) ?? Promise.resolve())
+              .finally(resolveFlush)
           }, 150)
         })
         this._trackPersistence(flushP)
@@ -3097,9 +3575,10 @@ export class SessionManager {
       // 周期)并替换 stdout 路由目标 —— 旧 _currentMessageListener 的替换语义
       // (每 session 恒一个路由目标,旧 turn 闭包链自此可 GC)收进 adapter。
       // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
-      const turn = runner.submitTurn({
+      const submittedTurn = runner.submitTurn({
         input: userTextOrBlocks,
         requestId,
+        ...(turnKey ? { turnKey } : {}),
         // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
         // 自取 local_catalog token;codex adapter 不消费本字段)。
         ...(modelAuthority !== undefined ? { modelAuthority } : {}),
@@ -3107,22 +3586,31 @@ export class SessionManager {
         assistantMessageId,
         thinkingMessageId,
         toolMessageIdFactory,
+        nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
+        onPostTerminalRuntimeEvent,
         collabAgentPolicy,
+        ...(session._usageAttribution
+          ? { usageAttribution: session._usageAttribution }
+          : {}),
         onEvent: handleEngineEvent,
         // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /
         // _lastCcbCumulativeCost(单一权威;回滚由上方 finalizeTurn 就地恢复)。
         sessionTotals: session,
         toolUseIdToName: session.toolUseIdToName,
       })
+      turn = submittedTurn
 
       // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
-      turn.submitted.catch((err) => {
-        onEvent({ kind: 'error', error: String(err) })
-        detach()
-        settle(() => resolve())
+      submittedTurn.submitted.catch((err) => {
+        const persistence = requestTerminalPersistence?.(
+          'crashed',
+          String(err),
+          'TURN_SUBMIT_FAILED',
+        ) ?? Promise.resolve()
+        this._trackPersistence(persistence)
       })
 
-      turn.summary.then(finalizeTurn).catch((err) => {
+      finalizationDone = submittedTurn.summary.then(finalizeTurn).catch((err) => {
         // finalizeTurn 自身抛错(编排层内部 bug)时对位旧实现 parser._parseInner
         // 的 catch → error 事件;并 settle 防 session lock 悬挂(旧实现此路径
         // 会悬挂,这里顺手加固,正常路径行为不变)。
@@ -3163,7 +3651,11 @@ export class SessionManager {
   bufferPendingAgentGroup(parentSessionKey: string, group: DurableAgentGroup): boolean {
     const parent = this.sessions.get(parentSessionKey)
     if (!parent) return false
-    ;(parent._pendingAgentGroups ??= []).push(group)
+    ;(parent._pendingAgentGroups ??= []).push({
+      ...group,
+      _ocEventOrdinal:
+        group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),
+    })
     return true
   }
 

@@ -6,9 +6,9 @@
  * message parsing from session orchestration concerns.
  */
 import { performance } from 'node:perf_hooks'
-import { Buffer } from 'node:buffer'
 import type { OutboundContentBlock } from '@openclaude/protocol'
 import type {
+  DurableRuntimeEvent,
   DetectedToolResult,
   DetectedToolUse,
   SegmentRecord,
@@ -16,6 +16,22 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import type { SdkMessage } from './subprocessRunner.js'
+
+function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
+  const toolUseId = raw.tool_use_id
+  if (typeof toolUseId !== 'string' || toolUseId.length === 0) return null
+  const block: Record<string, unknown> = {
+    kind: 'tool_output_tail',
+    toolUseBlockId: toolUseId,
+    tail: typeof raw.tail === 'string' ? raw.tail : '',
+    totalBytes: typeof raw.total_bytes === 'number' ? raw.total_bytes : 0,
+    truncatedHead: !!raw.truncated_head,
+  }
+  if (typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id.length > 0) {
+    block.parentToolUseId = raw.parent_tool_use_id
+  }
+  return block as OutboundContentBlock
+}
 
 // M0 engine 适配层:事件/工具快照类型的权威源迁至 engine/engineEvents.ts(engine
 // 中立模块);此处 re-export 兼容存量 import(server/v3MasterSink/commercial/测试)。
@@ -28,50 +44,6 @@ export type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 
-/** Hard cap on accumulated main-agent thinking bytes per turn. Sonnet 4.6
- *  adaptive thinking can exceed 100 KB on complex turns; we don't want to
- *  hold that much in process memory or pump it through the v3 sink. 8 KB
- *  is enough for a "what was the model reasoning" snippet and keeps body
- *  well under the 256 KB sink cap when combined with assistant text.
- *
- *  Truncation guarantees:
- *    - UTF-8 code-point safe: we never split a multi-byte sequence (would
- *      produce U+FFFD on decode).
- *    - NOT grapheme-cluster safe: ZWJ family sequences (e.g., 👨‍👩‍👧)
- *      may be truncated mid-cluster, leaving a visually incomplete but
- *      valid Unicode string. Acceptable for a debug snippet.
- *    - Tail marker `…[truncated]` is always within the hard cap because
- *      we manage `MAX_THINKING_CONTENT_BYTES = MAX - tailBytes` separately. */
-export const MAX_THINKING_BUFFER_BYTES = 8 * 1024
-const THINKING_TRUNCATE_TAIL = '…[truncated]'
-const THINKING_TAIL_BYTES = Buffer.byteLength(THINKING_TRUNCATE_TAIL, 'utf8')
-const MAX_THINKING_CONTENT_BYTES = MAX_THINKING_BUFFER_BYTES - THINKING_TAIL_BYTES
-
-/** Per-tool budget for the persisted tool snapshot that's piped through the
- *  v3 sink as part of the server-authored turn payload. These caps are
- *  intentionally tight — sink body cap is 256 KB and one turn can have many
- *  tool calls. Output is the most variable (Bash stdout, Grep results, file
- *  reads), inputJson is usually small but Edit/Write can carry large strings,
- *  inputPreview is a debug-friendly truncated string. */
-const PARSER_TOOL_OUTPUT_MAX_BYTES = 4 * 1024
-const PARSER_TOOL_INPUT_JSON_MAX_BYTES = 8 * 1024
-const PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS = 500
-
-/**
- * Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-
- * byte sequence. Walks back from the byte budget to the last UTF-8 leading
- * byte (continuation bytes are 0x80-0xBF). Handles 4-byte sequences (emoji,
- * Han Extended) correctly because they're contiguous at the byte level.
- */
-function sliceUtf8Safe(s: string, maxBytes: number): string {
-  const buf = Buffer.from(s, 'utf8')
-  if (buf.length <= maxBytes) return s
-  let end = maxBytes
-  // buf[end] safely indexable: end < buf.length (since buf.length > maxBytes >= end)
-  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--
-  return buf.subarray(0, end).toString('utf8')
-}
-
 /** Accumulated turn result stats */
 export interface TurnResult {
   cost: number
@@ -81,7 +53,7 @@ export interface TurnResult {
   cacheCreationTokens: number
   assistantText: string
   /** Main-agent thinking text accumulated this turn from thinking_delta
-   *  events, capped at MAX_THINKING_BUFFER_BYTES. Empty string when the
+   *  events without semantic truncation. Empty string when the
    *  model didn't emit any thinking blocks (most non-Sonnet/non-extended-
    *  thinking turns). Subagent thinking is excluded — same rule as
    *  assistantText. Used by sessionManager.persistServerAuthoredTurn to
@@ -90,6 +62,7 @@ export interface TurnResult {
   thinkingText: string
   /** True if CCB marked the result as an error (e.g. API failure) */
   isError: boolean
+  errorDetail?: string
   /** Anthropic API stop_reason from CCB's result row; null if CCB didn't
    *  populate it (older CCB or pre-termination crash). Used for three-state
    *  phantom judgment and for precise empty-turn UI notices. */
@@ -119,69 +92,44 @@ export interface TurnResult {
   assistantSegments: SegmentRecord[]
   /** Same as `assistantSegments` for thinking. */
   thinkingSegments: SegmentRecord[]
+  /** Exact ordered engine/protocol messages observed during this turn. */
+  runtimeEvents: DurableRuntimeEvent[]
 }
 
-/** Apply per-tool byte/char caps for the persisted tool snapshot. Mutates a
- *  fresh shallow copy of the entry — caller passes raw values, gets back the
- *  capped version with `inputTruncated` / `outputTruncated` flags set when
- *  truncation actually happened. UTF-8 code-point safe. */
-function _capToolEntry(raw: {
+/** Full-authority durable tool snapshot. UI preview fields may be short, but
+ * inputJson/output are the exact model-visible values and are never cut. */
+function _snapshotToolEntry(raw: {
   toolUseId: string
   blockId: string
   toolName: string
   inputJson: unknown
   inputPreview: string
   output: string
+  outputJson?: unknown
+  partialInputJson?: string
+  completed?: boolean
   isError: boolean
   durationMs: number
   ts: number
   arrivedAt: number
+  eventOrdinal?: number
 }): TurnToolEntry {
-  let inputJson = raw.inputJson
-  let inputTruncated = false
-  // inputJson cap: serialize, measure, if too big keep as truncated string.
-  // Avoid mutating user-visible structure beyond the cap — sending the full
-  // JSON-encoded string with a sentinel suffix is the simplest way for the
-  // frontend to render "this was too big" without per-field heuristics.
-  try {
-    const serialized = typeof inputJson === 'string' ? inputJson : JSON.stringify(inputJson)
-    if (Buffer.byteLength(serialized, 'utf8') > PARSER_TOOL_INPUT_JSON_MAX_BYTES) {
-      inputJson = sliceUtf8Safe(serialized, PARSER_TOOL_INPUT_JSON_MAX_BYTES) + '…[truncated]'
-      inputTruncated = true
-    }
-  } catch {
-    // Unserializable input (cycles / BigInt) — drop to a sentinel string.
-    inputJson = '[unserializable]'
-    inputTruncated = true
-  }
-
-  let inputPreview = raw.inputPreview
-  if (inputPreview.length > PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS) {
-    inputPreview = inputPreview.slice(0, PARSER_TOOL_INPUT_PREVIEW_MAX_CHARS) + '…'
-  }
-
-  let output = raw.output
-  let outputTruncated = false
-  if (Buffer.byteLength(output, 'utf8') > PARSER_TOOL_OUTPUT_MAX_BYTES) {
-    output = sliceUtf8Safe(output, PARSER_TOOL_OUTPUT_MAX_BYTES) + '…[truncated]'
-    outputTruncated = true
-  }
-
-  const entry: TurnToolEntry = {
+  return {
     toolUseId: raw.toolUseId,
     blockId: raw.blockId,
     toolName: raw.toolName,
-    inputJson,
-    inputPreview,
-    output,
+    inputJson: raw.inputJson,
+    inputPreview: raw.inputPreview,
+    output: raw.output,
+    ...(raw.outputJson !== undefined ? { outputJson: raw.outputJson } : {}),
+    ...(raw.partialInputJson !== undefined ? { partialInputJson: raw.partialInputJson } : {}),
+    ...(raw.completed !== undefined ? { completed: raw.completed } : {}),
     isError: raw.isError,
     durationMs: raw.durationMs,
     ts: raw.ts,
     arrivedAt: raw.arrivedAt,
+    ...(raw.eventOrdinal !== undefined ? { eventOrdinal: raw.eventOrdinal } : {}),
   }
-  if (inputTruncated) entry.inputTruncated = true
-  if (outputTruncated) entry.outputTruncated = true
-  return entry
 }
 
 /**
@@ -206,7 +154,7 @@ export class CcbMessageParser {
    *  the same id arrives. Subagent tools never enter this map. */
   private pendingToolUses = new Map<
     string,
-    { toolName: string; inputJson: unknown; inputPreview: string; inputTruncated: boolean }
+    { toolName: string; inputJson: unknown; inputPreview: string }
   >()
   /** Top-level tools that have completed (both tool_use and tool_result seen)
    *  within this turn, in arrival order of the tool_result. Surfaced in the
@@ -214,6 +162,48 @@ export class CcbMessageParser {
    *  via the v3 sink. Public so the interrupt/crash path in SessionManager
    *  can flush whatever completed before CCB died. */
   public completedTools: TurnToolEntry[] = []
+
+  /**
+   * Durable snapshot of every top-level tool call observed so far. Completed
+   * entries retain their exact input/result. Unmatched entries retain the
+   * exact raw input_json_delta prefix (which may be incomplete JSON) plus any
+   * final structured input snapshot already received. This is used by normal
+   * error results and crash/interrupt persistence; previews remain derived UI
+   * fields and are never the authority.
+   */
+  public snapshotToolsForPersistence(): TurnToolEntry[] {
+    const snapshots = this.completedTools.map((tool) => ({ ...tool }))
+    const completedIds = new Set(snapshots.map((tool) => tool.toolUseId))
+    const pendingIds = new Set([
+      ...this.streamingToolUses.keys(),
+      ...this.pendingToolUses.keys(),
+    ])
+    for (const toolUseId of pendingIds) {
+      if (completedIds.has(toolUseId)) continue
+      const streamed = this.streamingToolUses.get(toolUseId)
+      const pending = this.pendingToolUses.get(toolUseId)
+      const toolName = pending?.toolName ?? streamed?.name ?? this.toolUseIdToName.get(toolUseId) ?? 'unknown'
+      const partialInputJson = streamed?.partialJson
+      const meta = this.toolUseMeta.get(toolUseId)
+      snapshots.push(_snapshotToolEntry({
+        toolUseId,
+        blockId: toolUseId,
+        toolName,
+        inputJson: pending?.inputJson ?? null,
+        inputPreview:
+          pending?.inputPreview ?? (partialInputJson === undefined ? '' : partialInputJson.slice(0, 500)),
+        output: '',
+        isError: false,
+        durationMs: meta ? Math.max(0, Math.round(performance.now() - meta.startAt)) : 0,
+        ts: Date.now(),
+        arrivedAt: this.toolArrivedAt.get(toolUseId) ?? Date.now(),
+        eventOrdinal: this.toolEventOrdinal.get(toolUseId),
+        ...(partialInputJson !== undefined ? { partialInputJson } : {}),
+        completed: false,
+      }))
+    }
+    return snapshots
+  }
   /** De-duplicate emitted tool_results within a turn */
   private emittedToolResultIds = new Set<string>()
   /** Count of tool_use blocks sent but not yet matched by a tool_result */
@@ -221,18 +211,10 @@ export class CcbMessageParser {
   /** Assistant text accumulated in this turn */
   public assistantBuf = ''
   /** Main-agent thinking text accumulated in this turn from thinking_delta
-   *  events. Capped at MAX_THINKING_BUFFER_BYTES with a `…[truncated]` tail.
+   *  events without semantic truncation.
    *  Subagent thinking (parentToolUseId set) is excluded — it lives inside
    *  child block rendering, not in the parent turn's authoritative buffer. */
   public thinkingBuf = ''
-  /** Running byte count of the CONTENT in thinkingBuf (excludes the tail
-   *  marker). Capped at MAX_THINKING_CONTENT_BYTES so adding the tail later
-   *  is guaranteed to fit under the hard cap. */
-  private thinkingBufBytes = 0
-  /** Once true, all subsequent thinking_delta events for this turn skip
-   *  accumulation. The tail marker is appended exactly once on the first
-   *  delta that pushes us over the content budget. */
-  private thinkingTruncated = false
   /** Whether this turn has been finalized */
   public finalized = false
   /** Accumulated turn result (set when finalized) */
@@ -264,10 +246,20 @@ export class CcbMessageParser {
    *  CARD APPEARANCE time, not tool COMPLETION time, so parallel tools
    *  that finish out of order still sort by their start position. */
   private toolArrivedAt = new Map<string, number>()
+  /** Tool card first-appearance order, sharing the turn-wide sequence. */
+  private toolEventOrdinal = new Map<string, number>()
+
+  /** Exact raw messages retained without projection or size/count limits. */
+  public runtimeEvents: DurableRuntimeEvent[] = []
+  private readonly nextDurableEventOrdinal: () => number
 
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
+  private onPostFinalRuntimeEvent?: (
+    event: DurableRuntimeEvent,
+    block: OutboundContentBlock,
+  ) => void
   private onFinish: (result: TurnResult | null) => void
 
   /** V3 v7 — canonical assistant row id for this turn, minted server-side
@@ -302,6 +294,10 @@ export class CcbMessageParser {
     onEvent: (e: SessionStreamEvent) => void
     onToolUse?: (tool: DetectedToolUse) => void
     onToolResult?: (result: DetectedToolResult) => void
+    onPostFinalRuntimeEvent?: (
+      event: DurableRuntimeEvent,
+      block: OutboundContentBlock,
+    ) => void
     onFinish: (result: TurnResult | null) => void
     /** Running totals from session (for computing totalCost in final meta).
      *  - totalCostUSD: gateway-side per-session cumulative cost (we mutate +=delta)
@@ -321,22 +317,42 @@ export class CcbMessageParser {
     thinkingMessageId?: string
     /** V3 v7.1 — see `toolMessageIdFactory` field-level docs. */
     toolMessageIdFactory?: (blockId: string) => string
+    nextDurableEventOrdinal?: () => number
   }) {
     this.toolUseIdToName = opts.toolUseIdToName
     this.onEvent = opts.onEvent
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
+    this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
     this.assistantMessageId = opts.assistantMessageId
     this.thinkingMessageId = opts.thinkingMessageId
     this.toolMessageIdFactory = opts.toolMessageIdFactory
+    let localOrdinal = 0
+    this.nextDurableEventOrdinal = opts.nextDurableEventOrdinal ?? (() => localOrdinal++)
   }
 
   private _sessionTotals: {
     totalCostUSD: number
     turns: number
     _lastCcbCumulativeCost: number
+  }
+
+  /** Capture an opaque runtime/protocol event without routing it through the
+   * SDK projection parser. Codex app-server uses a dedicated side channel so
+   * adding lossless retention cannot perturb legacy `message` consumers. */
+  captureRuntimeEvent(
+    payload: unknown,
+    source: DurableRuntimeEvent['source'] = 'ccb',
+  ): void {
+    if (this.finalized) return
+    this.runtimeEvents.push({
+      ordinal: this.nextDurableEventOrdinal(),
+      observedAt: Date.now(),
+      source,
+      payload: structuredClone(payload),
+    })
   }
 
   /**
@@ -355,7 +371,18 @@ export class CcbMessageParser {
         (msg as any)?.subtype === 'bash_output_tail'
       ) {
         try {
-          this._parseInner(msg)
+          const block = bashOutputTailBlock(msg as Record<string, any>)
+          if (!block) return
+          if (this.onPostFinalRuntimeEvent) {
+            this.onPostFinalRuntimeEvent({
+              ordinal: this.nextDurableEventOrdinal(),
+              observedAt: Date.now(),
+              source: 'ccb',
+              payload: structuredClone(msg),
+            }, block)
+          } else {
+            this.onEvent({ kind: 'block', block })
+          }
         } catch (err) {
           this.onEvent({ kind: 'error', error: String(err) })
         }
@@ -363,6 +390,7 @@ export class CcbMessageParser {
       return
     }
     try {
+      this.captureRuntimeEvent(msg)
       this._parseInner(msg)
     } catch (err) {
       this.onEvent({ kind: 'error', error: String(err) })
@@ -457,18 +485,8 @@ export class CcbMessageParser {
     //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
       if (raw.subtype === 'bash_output_tail') {
-        const toolUseId = raw.tool_use_id
-        if (typeof toolUseId === 'string' && toolUseId.length > 0) {
-          const block: Record<string, unknown> = {
-            kind: 'tool_output_tail',
-            toolUseBlockId: toolUseId,
-            tail: typeof raw.tail === 'string' ? raw.tail : '',
-            totalBytes: typeof raw.total_bytes === 'number' ? raw.total_bytes : 0,
-            truncatedHead: !!raw.truncated_head,
-          }
-          if (parentToolUseId) block.parentToolUseId = parentToolUseId
-          this.onEvent({ kind: 'block', block: block as any })
-        }
+        const block = bashOutputTailBlock(raw)
+        if (block) this.onEvent({ kind: 'block', block })
       } else if (raw.subtype === 'status') {
         // CCB SDKStatus 当前只有 'compacting' | null(coreSchemas.ts:1268)。
         // 任何其它值都 normalize 到 null —— 防止未来 CCB 加新 status 字面量
@@ -509,15 +527,18 @@ export class CcbMessageParser {
       this._handleControlRequest(msg)
       return
     }
-    // assistant_error / status / etc: ignore
-    // tool_progress: intentionally ignored. CCB emits this as a granular
-    // heartbeat for long-running Bash/PowerShell runs and (per CCB core
-    // schemas) carries its own parent_tool_use_id. Out of scope for the
-    // subagent-visibility routing — we define "subagent-attributable content"
-    // as text / thinking / tool_use / tool_result only. Progress ticks
-    // produce no user-visible artifact here today, so surfacing them would
-    // require matching protocol + frontend rendering work. Revisit if we
-    // add a dedicated bash-progress visualization.
+    // Every unprojected message (assistant_error, tool_progress, future system
+    // task events, etc.) is already in runtimeEvents. Surface assistant_error
+    // to the live UI as well; the opaque raw object remains the durable source.
+    if (raw.type === 'assistant_error') {
+      const detail =
+        typeof raw.error === 'string'
+          ? raw.error
+          : typeof raw.message === 'string'
+            ? raw.message
+            : JSON.stringify(raw)
+      this.onEvent({ kind: 'error', error: detail })
+    }
   }
 
   private _handleControlRequest(msg: SdkMessage): void {
@@ -548,6 +569,7 @@ export class CcbMessageParser {
   private _markToolBoundary(blockId: string): void {
     if (!this.toolArrivedAt.has(blockId)) {
       this.toolArrivedAt.set(blockId, Date.now())
+      this.toolEventOrdinal.set(blockId, this.nextDurableEventOrdinal())
     }
     if (this.assistantSegments.length > 0) {
       this.pendingTextSegmentBumpOnNextText = true
@@ -637,7 +659,12 @@ export class CcbMessageParser {
           // Append into the current segment, creating a record on first hit.
           let cur = this.assistantSegments[this.assistantSegments.length - 1]
           if (!cur || cur.index !== this.currentTextSegmentIndex) {
-            cur = { index: this.currentTextSegmentIndex, text: '', ts: Date.now() }
+            cur = {
+              index: this.currentTextSegmentIndex,
+              text: '',
+              ts: Date.now(),
+              eventOrdinal: this.nextDurableEventOrdinal(),
+            }
             this.assistantSegments.push(cur)
           }
           cur.text += textStr
@@ -659,43 +686,22 @@ export class CcbMessageParser {
           this.currentThinkingSegmentIndex++
           this.pendingThinkingSegmentBumpOnNextThinking = false
         }
-        // Accumulate main-agent thinking into thinkingBuf for v3 server-
-        // authored persistence. Subagent thinking (parentToolUseId set) is
-        // streamed to UI only — never merged into the parent's stored turn.
-        // Truncation: hard 8 KB cap with UTF-8 code-point-safe slice + tail
-        // marker. UI streams the FULL delta unchanged regardless of cap state;
-        // only the persisted buffer is bounded.
-        if (!parentToolUseId && !this.thinkingTruncated) {
-          const deltaBytes = Buffer.byteLength(thinkStr, 'utf8')
-          let segAppend = ''
-          if (this.thinkingBufBytes + deltaBytes <= MAX_THINKING_CONTENT_BYTES) {
-            this.thinkingBuf += thinkStr
-            this.thinkingBufBytes += deltaBytes
-            segAppend = thinkStr
-          } else {
-            const remaining = MAX_THINKING_CONTENT_BYTES - this.thinkingBufBytes
-            if (remaining > 0) {
-              const partial = sliceUtf8Safe(thinkStr, remaining)
-              this.thinkingBuf += partial
-              this.thinkingBufBytes += Buffer.byteLength(partial, 'utf8')
-              segAppend = partial
-            }
-            // thinkingBufBytes ≤ MAX_THINKING_CONTENT_BYTES guaranteed, so
-            // total bytes after appending tail ≤ MAX_THINKING_BUFFER_BYTES.
-            this.thinkingBuf += THINKING_TRUNCATE_TAIL
-            segAppend += THINKING_TRUNCATE_TAIL
-            this.thinkingTruncated = true
-          }
-          // Fix B: mirror into the current thinking segment so master can
-          // persist per-segment thinking rows with their own ts. Buffer cap
-          // already applied above; segment respects the same total cap.
-          if (segAppend.length > 0) {
+        // Full-authority persistence keeps every main-agent reasoning delta.
+        // Subagent thinking is retained by its DurableAgentGroup transcript.
+        if (!parentToolUseId) {
+          this.thinkingBuf += thinkStr
+          if (thinkStr.length > 0) {
             let cur = this.thinkingSegments[this.thinkingSegments.length - 1]
             if (!cur || cur.index !== this.currentThinkingSegmentIndex) {
-              cur = { index: this.currentThinkingSegmentIndex, text: '', ts: Date.now() }
+              cur = {
+                index: this.currentThinkingSegmentIndex,
+                text: '',
+                ts: Date.now(),
+                eventOrdinal: this.nextDurableEventOrdinal(),
+              }
               this.thinkingSegments.push(cur)
             }
-            cur.text += segAppend
+            cur.text += thinkStr
           }
         }
         this.onEvent({
@@ -789,17 +795,6 @@ export class CcbMessageParser {
           this.onToolUse({ name: c.name, id: c.id, input: inputRaw as Record<string, any> })
         }
 
-        // Cap inputJson to avoid sending excessively large payloads to the frontend.
-        // For tools with large content fields (Write, Edit), truncate string values.
-        let inputJson: unknown = inputRaw
-        if (inputStr.length > 8000) {
-          const capped: Record<string, unknown> = {}
-          for (const [k, v] of Object.entries(inputRaw as Record<string, unknown>)) {
-            capped[k] = typeof v === 'string' && v.length > 3000 ? v.slice(0, 3000) + '…' : v
-          }
-          inputJson = capped
-        }
-
         // Only track pending-tool-calls / tool.called metrics for the main
         // agent turn. pendingToolCalls gates turn completion in SessionManager;
         // counting subagent tools here would leave the counter permanently
@@ -823,9 +818,8 @@ export class CcbMessageParser {
         if (!parentToolUseId && !this.pendingToolUses.has(c.id)) {
           this.pendingToolUses.set(c.id, {
             toolName: c.name ?? 'unknown',
-            inputJson,
+            inputJson: inputRaw,
             inputPreview: inputStr.slice(0, 500),
-            inputTruncated: inputStr.length > 8000,
           })
         }
         const streamed = this.streamingToolUses.get(c.id)
@@ -834,7 +828,7 @@ export class CcbMessageParser {
           blockId: c.id,
           toolName: c.name ?? 'unknown',
           inputPreview,
-          inputJson,
+          inputJson: inputRaw,
           partial: false,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
@@ -871,7 +865,12 @@ export class CcbMessageParser {
           this.assistantBuf += c.text
           let cur = this.assistantSegments[this.assistantSegments.length - 1]
           if (!cur || cur.index !== this.currentTextSegmentIndex) {
-            cur = { index: this.currentTextSegmentIndex, text: '', ts: Date.now() }
+            cur = {
+              index: this.currentTextSegmentIndex,
+              text: '',
+              ts: Date.now(),
+              eventOrdinal: this.nextDurableEventOrdinal(),
+            }
             this.assistantSegments.push(cur)
           }
           cur.text += c.text
@@ -917,6 +916,7 @@ export class CcbMessageParser {
         } else {
           preview = JSON.stringify(previewRaw ?? '')
         }
+        const fullOutput = preview
         if (preview.length > 3000) preview = `${preview.slice(0, 3000)}…`
         const block: Record<string, unknown> = {
           kind: 'tool_result',
@@ -925,6 +925,7 @@ export class CcbMessageParser {
           toolName,
           isError: !!c.is_error,
           preview,
+          output: fullOutput,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
         this.onEvent({ kind: 'block', block: block as any })
@@ -979,17 +980,19 @@ export class CcbMessageParser {
             // (pre-Fix-B gateway). Plan §3.5.4.
             const arrivedAt = this.toolArrivedAt.get(useId) ?? Date.now()
             this.completedTools.push(
-              _capToolEntry({
+              _snapshotToolEntry({
                 toolUseId: useId,
                 blockId: useId,
                 toolName,
                 inputJson: pending?.inputJson ?? {},
                 inputPreview: pending?.inputPreview ?? '',
-                output: preview,
+                output: fullOutput,
+                outputJson: previewRaw,
                 isError: !!c.is_error,
                 durationMs,
                 ts: Date.now(),
                 arrivedAt,
+                eventOrdinal: this.toolEventOrdinal.get(useId),
               }),
             )
           }
@@ -1043,6 +1046,14 @@ export class CcbMessageParser {
     // Left unchecked, every subsequent submit() re-spawns CCB with the same
     // dead id and re-crashes, forming an infinite loop.
     const errorsField = (msg as any).errors
+    const isError = !!(msg as any).is_error
+    const errorDetail = isError
+      ? JSON.stringify({
+          subtype: (msg as any).subtype,
+          result: (msg as any).result,
+          errors: errorsField,
+        })
+      : undefined
     const staleResumeId =
       Array.isArray(errorsField) &&
       errorsField.some(
@@ -1057,16 +1068,18 @@ export class CcbMessageParser {
       cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
       assistantText: this.assistantBuf,
       thinkingText: this.thinkingBuf,
-      isError: !!(msg as any).is_error,
+      isError,
+      ...(errorDetail !== undefined ? { errorDetail } : {}),
       stopReason,
       numTurns,
       staleResumeId,
-      tools: [...this.completedTools],
+      tools: this.snapshotToolsForPersistence(),
       // Fix B: shallow-clone the per-segment arrays so downstream consumers
       // (sessionManager → v3MasterSink → master HTTP body) get a stable
       // snapshot; the parser may be retained after onFinish for diagnostics.
       assistantSegments: this.assistantSegments.map((s) => ({ ...s })),
       thinkingSegments: this.thinkingSegments.map((s) => ({ ...s })),
+      runtimeEvents: this.runtimeEvents.map((event) => structuredClone(event)),
     }
 
     this.finalized = true

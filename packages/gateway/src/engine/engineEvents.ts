@@ -19,7 +19,8 @@
  * 硬约束:底座原生消息形状(CCB stream-json SdkMessage、codex fake-SDK RunnerMessage)
  * 只允许存在于各 adapter 内部,不得出现在本模块的任何类型里。
  */
-import type { OutboundContentBlock } from '@openclaude/protocol'
+import type { DurableCodexBilling, DurableRuntimeEvent, OutboundContentBlock } from '@openclaude/protocol'
+export type { DurableRuntimeEvent } from '@openclaude/protocol'
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
 export interface PermissionRequest {
@@ -65,13 +66,21 @@ export interface TurnToolEntry {
    *  toolUseId across protocol layers. */
   blockId: string
   toolName: string
-  /** Possibly-capped tool input. May be a structured object or a JSON-encoded
-   *  string when the original exceeded the parser's input-json byte cap. */
+  /** Exact structured tool input as received from the model protocol. */
   inputJson: unknown
-  /** Truncated string preview of the input for compact rendering */
+  /** Derived short preview for compact live rendering; inputJson is canonical. */
   inputPreview: string
-  /** Tool stdout / textual output, capped by the parser */
+  /** Full textual rendering of the tool output, never capped. */
   output: string
+  /** Exact structured tool_result content before textual rendering. */
+  outputJson?: unknown
+  /** Exact raw input_json_delta bytes accumulated before an interrupted tool
+   * call reached its final structured input snapshot. Kept in addition to
+   * inputJson because the raw prefix may intentionally be incomplete JSON. */
+  partialInputJson?: string
+  /** Omitted/true for a matched tool_result; false when the turn ended while
+   * the model-authored tool call was still pending. */
+  completed?: boolean
   isError: boolean
   /** ms between tool_use finalization and tool_result arrival; 0 if unknown */
   durationMs: number
@@ -85,6 +94,9 @@ export interface TurnToolEntry {
    *  refresh order matches the live emit order; falls back to a computed
    *  offset when absent (pre-Fix-B gateway). Plan §3.5.4. */
   arrivedAt: number
+  /** Global, monotonic ordinal in the user-visible turn. Unlike millisecond
+   * timestamps this cannot tie, so refresh can reconstruct exact live order. */
+  eventOrdinal?: number
   inputTruncated?: boolean
   outputTruncated?: boolean
 }
@@ -97,6 +109,8 @@ export interface SegmentRecord {
   index: number
   text: string
   ts: number
+  /** Global, monotonic ordinal of the segment's first emitted byte. */
+  eventOrdinal?: number
 }
 
 /** turn 终态 meta(原 SessionStreamEvent 'final' 变体的 meta,逐字段不变)。 */
@@ -147,34 +161,23 @@ export type EngineEvent =
  * 终态经独立 'billing' 事件通道 emit;server.ts 仍包装为 outbound.codex_billing
  * wire 帧(帧名不变)。M0 阶段无 emitter(CCB 是 proxy 计费),M1 CodexAdapter 接线。
  */
-export interface EngineBillingEvent {
-  requestId: string
+export interface EngineBillingEvent extends DurableCodexBilling {
+  /** Stable logical paid-turn key shared with lossless turn-tape persistence. */
+  turnKey?: string
+  /** Delegate spend belongs to the root user-visible turn, not the transient
+   * child session turn. These locators originate from AgentSession creation,
+   * never from model output. */
+  parentTurnKey?: string
+  parentSessionId?: string
+  delegateAgentId?: string
   /** engine-reported 计费的稳定记账键 = engine/engineSessionId.ts 的
    *  `engineSessionId(sessionKey)`(唯一 helper,禁止各处自行 hash)。M2 双钱包
    *  settle 落 usage_records.session_id 与 idle-timeout turn-waive 上报都用它 ——
    *  不用 containerId/threadId 占位(refund.ts 按 session_id 圈退款窗口)。
-   *  M1a 阶段 wire 帧(outbound.codex_billing)暂不携带本字段(protocol 包
-   *  不在本批改动范围),master 侧接线在 M2。 */
-  engineSessionId: string
-  status: 'success' | 'error'
-  durationMs: number
-  usage?: {
-    input_tokens?: number
-    output_tokens?: number
-    cache_read_input_tokens?: number
-    cache_creation_input_tokens?: number
-    reasoning_output_tokens?: number
-  }
-  errorReason?: string
+   *  master 侧用它圈定退款窗口。 */
   // Issue A v1.0.108 — codex account/rateLimits/updated 快照,piggy-back 到 billing
   // 终态帧让 master.userChatBridge 落库到 claude_accounts。utilization 0..100,
   // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
-  rateLimits?: {
-    util5h?: number
-    reset5h?: string
-    util7d?: number
-    reset7d?: string
-  }
 }
 
 /**
@@ -221,6 +224,7 @@ export interface TurnSummary {
   assistantSegments: SegmentRecord[]
   thinkingSegments: SegmentRecord[]
   tools: TurnToolEntry[]
+  runtimeEvents: DurableRuntimeEvent[]
   stopReason: string | null
   numTurns: number | null
   isError: boolean
@@ -228,6 +232,8 @@ export interface TurnSummary {
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */
   errorKind?: 'auth' | 'other'
+  /** Complete engine-reported error object/string, never truncated. */
+  errorDetail?: string
   /** 底座报告 --resume/thread id 已失效(CCB: "No conversation found with
    *  session ID")。sessionManager 据此逐出 resume-map 条目。 */
   staleResumeId: boolean
@@ -244,7 +250,10 @@ export interface TurnSummary {
 export interface PartialSnapshot {
   assistantText: string
   thinkingText: string
+  /** Every observed top-level tool call. Includes unmatched/in-progress calls
+   * so crash and interrupt tapes do not discard paid model output. */
   completedTools: TurnToolEntry[]
   assistantSegments: SegmentRecord[]
   thinkingSegments: SegmentRecord[]
+  runtimeEvents: DurableRuntimeEvent[]
 }

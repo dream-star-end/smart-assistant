@@ -87,6 +87,8 @@ export interface RoundTripCtx {
     sessionId?: string | null,
     parentSessionId?: string | null,
     delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
   req: IncomingMessage;
@@ -110,6 +112,9 @@ export interface RoundTripCtx {
    *  delegate 模式非空。随 appendCostCredits park 进 pending.delegate_agent_id,供
    *  drain 时产出队长助手行 usage.delegates[] 的 per-agent 明细。普通 chat 恒 null。 */
   delegateAgentId: string | null;
+  /** Exact logical turn billing join keys. */
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
   userLog: Logger;
 }
 
@@ -147,6 +152,8 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     sessionId,
     parentSessionId,
     delegateAgentId,
+    turnKey,
+    parentTurnKey,
     userLog,
   } = ctx;
 
@@ -331,6 +338,8 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             // P2 债D — 委派目标 agent id → park 进 pending.delegate_agent_id,drain 时按 agent
             // 分组产出 usage.delegates[] 明细。普通 chat 恒 null(不进 delegates[])。
             delegateAgentId,
+            turnKey,
+            parentTurnKey,
           );
         } catch (err) {
           userLog.warn("proxy_persist_costcredits_failed", {

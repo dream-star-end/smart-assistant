@@ -10,12 +10,15 @@
  *     (b) 表无限增长(0015 自估 ~200MB/月)。
  *   migration 0015 规定了 reconciler + 7d GC,但调度器里从来没接(只有 admin/ledger.ts 读取做展示 join)。
  *
- * 本模块的定位(**terminalizer,不是 replay**):
- *   journal 只持久化了 model / codex 元信息,**没有**持久化最终 usage/pricing(结算用的是内存
- *   snapshot)。因此崩溃后**无法**重算真实用量、无法"replay 成 committed"。能安全做的是:
+ * 本模块的定位(**legacy terminalizer,不是 durable Codex replay**):
+ *   旧 journal 只持久化了 model / codex 元信息,**没有**持久化最终 usage/pricing(结算用的是
+ *   内存 snapshot)。因此旧请求崩溃后**无法**重算真实用量、无法"replay 成 committed"。
+ *   新 Codex paid-turn 用 immutable turn tape 保存精确 billing evidence,ctx 带
+ *   durableBillingRecovery 标记；这类行必须由 tape 无限重试,本 reconciler 不得按时间
+ *   abort,GC 也不得删除其恢复裁决。对其余 legacy/Anthropic journal 能安全做的是:
  *     - 已结算但 journal 没翻终态的(崩在 settle 提交与 journal 更新之间)→ 按 usage_records
  *       这个**持久财务真相**把 journal 补到 committed,并回填 usage_id/ledger_id/final_credits;
- *     - 从未结算的(崩在 observe/settle 之前,无 usage_records)→ 记为 aborted(error_msg=
+ *     - 非 durable 且从未结算的(崩在 observe/settle 之前,无 usage_records)→ 记为 aborted(error_msg=
  *       'reconciler_timeout'),**不退不扣**(precheck 只是估算预扣,非财务真相;Redis 预扣 300s
  *       TTL 早已过期)。这等于**接受这部分免费用量不可追回**,但至少把行终态化、可被 GC。
  *   想要真正可追回,需要另一改动:在 settle 之前把观测到的 usage/pricing 落进 journal。
@@ -30,13 +33,14 @@
  */
 
 import { query } from '../db/queries.js'
+import { DURABLE_CODEX_RECOVERY_VERSION } from './codexFinalizer.js'
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 60_000
 export const MIN_INTERVAL_MS = 5_000
 /** stuck 判定:行 updated_at 早于 now-threshold 才动。默认 30min。 */
 export const DEFAULT_STUCK_THRESHOLD_MS = 1_800_000
 export const DEFAULT_CODEX_SESSION_MAX_MS = 600_000
-/** GC:committed/aborted 老于该时长才删。 */
+/** GC:非 durable Codex 的 committed/aborted 老于该时长才删。 */
 export const DEFAULT_GC_AGE_MS = 7 * 24 * 3_600_000
 export const MIN_GC_AGE_MS = 3_600_000 // 永不删 1h 内的终态行(防误删)
 export const DEFAULT_GC_INTERVAL_MS = 3_600_000 // GC 比 reconcile 稀疏
@@ -77,7 +81,8 @@ export function resolveStuckThresholdMs(
  *   1) committed:有对应 usage_records(结算记录已落,只是 journal 没翻终态)→ 回填 ids；
  *      不按 status 过滤——journal 'committed' 语义就是"存在结算记录"(success/billing_failed/
  *      codex 0-cost error 都算),与现有 finalizer 一致。
- *   2) aborted:无 usage_records(从未结算的真泄漏)→ 记 'reconciler_timeout',不退不扣。
+ *   2) aborted:非 durable Codex 且无 usage_records(从未结算的真泄漏)→
+ *      记 'reconciler_timeout',不退不扣。带 durable recovery 标记的行保持可重放。
  * 返回各自受影响行数。
  */
 export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promise<ReconcileCounts> {
@@ -105,17 +110,18 @@ export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promis
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+        AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
         )
       RETURNING rfj.request_id`,
-    [ms],
+    [ms, DURABLE_CODEX_RECOVERY_VERSION],
   )
   return { committed: committedRes.rowCount ?? 0, aborted: abortedRes.rowCount ?? 0 }
 }
 
-/** GC:删 committed/aborted 且老于 olderThanMs 的行,单批 ≤ limit(最旧优先,确定性)。 */
+/** GC:删非 durable Codex 的终态老行,单批 ≤ limit(最旧优先,确定性)。 */
 export async function gcFinalizeJournal(olderThanMs: number, limit: number): Promise<number> {
   const ms = String(Math.max(0, Math.floor(olderThanMs)))
   const lim = Math.max(1, Math.floor(limit))
@@ -125,11 +131,12 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
         SELECT ctid FROM request_finalize_journal
          WHERE state IN ('committed', 'aborted')
            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+           AND COALESCE(ctx->>'durableBillingRecovery', '') <> $3
          ORDER BY updated_at ASC
          LIMIT $2
       )
       RETURNING request_id`,
-    [ms, lim],
+    [ms, lim, DURABLE_CODEX_RECOVERY_VERSION],
   )
   return res.rowCount ?? 0
 }

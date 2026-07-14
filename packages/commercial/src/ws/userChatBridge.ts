@@ -58,6 +58,10 @@ import {
 } from "../billing/preCheck.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import {
+  parseBillingPricing,
+  serializeBillingPricing,
+} from "../billing/persistedBillingPricing.js";
+import {
   getAgentCostMultiplier,
   composeMultiplier,
 } from "../billing/agentMultiplier.js";
@@ -66,8 +70,11 @@ import {
   abortInflightJournal,
 } from "../billing/proxyBilling.js";
 import {
+  DURABLE_CODEX_RECOVERY_VERSION,
   ENGINE_SESSION_ID_RE,
+  isPermanentCodexWaiver,
   makeCodexFinalizer,
+  permanentCodexWaiverReason,
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
@@ -525,71 +532,6 @@ async function resolveTurnExecution(
   };
 }
 
-/**
- * journal 中的 server-owned 精确定价。BigInt 显式转十进制串，确保 JSON 可序列化；这里
- * 持久化的是已复合 agent multiplier 的最终价格，所以跨 bridge 恢复时不能再查当前
- * PricingCache / agent override（两者都可能已换 generation）。
- */
-interface PersistedBillingPricingV1 {
-  v: 1;
-  modelId: string;
-  displayName: string;
-  inputPerMtok: string;
-  outputPerMtok: string;
-  cacheReadPerMtok: string;
-  cacheWritePerMtok: string;
-  multiplier: string;
-}
-
-function serializeBillingPricing(pricing: ModelPricing): PersistedBillingPricingV1 {
-  return {
-    v: 1,
-    modelId: pricing.model_id,
-    displayName: pricing.display_name,
-    inputPerMtok: pricing.input_per_mtok.toString(),
-    outputPerMtok: pricing.output_per_mtok.toString(),
-    cacheReadPerMtok: pricing.cache_read_per_mtok.toString(),
-    cacheWritePerMtok: pricing.cache_write_per_mtok.toString(),
-    multiplier: pricing.multiplier,
-  };
-}
-
-const BILLING_AMOUNT_RE = /^\d+$/;
-const BILLING_MULTIPLIER_RE = /^\d+(?:\.\d{1,3})?$/;
-
-/** 严格解析 journal 定价；任何畸形都返回 null，由 authority 恢复路径 fail-closed 免单。 */
-function parseBillingPricing(raw: unknown, expectedModel: string): ModelPricing | null {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const p = raw as Record<string, unknown>;
-  if (
-    p.v !== 1 ||
-    p.modelId !== expectedModel ||
-    typeof p.displayName !== "string" ||
-    typeof p.inputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.inputPerMtok) ||
-    typeof p.outputPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.outputPerMtok) ||
-    typeof p.cacheReadPerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheReadPerMtok) ||
-    typeof p.cacheWritePerMtok !== "string" || !BILLING_AMOUNT_RE.test(p.cacheWritePerMtok) ||
-    typeof p.multiplier !== "string" || !BILLING_MULTIPLIER_RE.test(p.multiplier)
-  ) {
-    return null;
-  }
-  return {
-    model_id: expectedModel,
-    display_name: p.displayName,
-    input_per_mtok: BigInt(p.inputPerMtok),
-    output_per_mtok: BigInt(p.outputPerMtok),
-    cache_read_per_mtok: BigInt(p.cacheReadPerMtok),
-    cache_write_per_mtok: BigInt(p.cacheWritePerMtok),
-    multiplier: p.multiplier,
-    enabled: true,
-    sort_order: 0,
-    visibility: "hidden",
-    extra_system_prompt: null,
-    default_effort: null,
-    updated_at: new Date(0),
-  };
-}
-
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
@@ -813,6 +755,11 @@ export interface UserChatBridgeDeps {
     requestId: string,
     userId: string,
     costCredits: string,
+    sessionId?: string | null,
+    parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
 }
 
@@ -3269,6 +3216,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         ? null
                         : accountIdForQuota.toString(),
                     source: "codex_bridge",
+                    durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
                     // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
                     // server-owned 快照，不能在结算时回读已换代的 cache/override。
                     billingPricing: serializeBillingPricing(derivedPricing),
@@ -3306,7 +3254,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 await abortInflightJournal(
                   pgPool,
                   requestId,
-                  "bridge_disconnect_before_finalize",
+                  permanentCodexWaiverReason("bridge_disconnect_before_finalize"),
                 ).catch(() => {});
                 await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
                 releaseAcquiredSlotForFailure();
@@ -3372,7 +3320,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                   const promise = (async (): Promise<void> => {
                     try {
-                      await abortInflightJournal(pgPool, requestId, reason.slice(0, 500));
+                      await abortInflightJournal(
+                        pgPool,
+                        requestId,
+                        permanentCodexWaiverReason(reason),
+                      );
                     } catch {
                       // journal abort 失败 — reconciler 会扫到 stuck inflight 兜底。
                     } finally {
@@ -3814,6 +3766,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             const billing = parsedBilling as {
               requestId?: unknown;
+              turnKey?: unknown;
+              parentTurnKey?: unknown;
+              parentSessionId?: unknown;
+              delegateAgentId?: unknown;
               engineSessionId?: unknown;
               status?: unknown;
               errorReason?: unknown;
@@ -3830,6 +3786,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               bridgeLog?.warn("user-chat-bridge: codex_billing missing requestId");
               return;
             }
+            const billingTurnKey =
+              typeof billing.turnKey === "string" && /^[0-9a-f]{64}$/.test(billing.turnKey)
+                ? billing.turnKey
+                : null;
+            const billingParentTurnKey =
+              typeof billing.parentTurnKey === "string" && /^[0-9a-f]{64}$/.test(billing.parentTurnKey)
+                ? billing.parentTurnKey
+                : null;
+            const billingParentSessionId =
+              typeof billing.parentSessionId === "string" &&
+              billing.parentSessionId.length > 0 && billing.parentSessionId.length <= 256
+                ? billing.parentSessionId
+                : null;
+            const billingDelegateAgentId =
+              typeof billing.delegateAgentId === "string" &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(billing.delegateAgentId)
+                ? billing.delegateAgentId
+                : null;
             // —— 与 snapshot 无关的帧字段解析(主路径与跨桥 fallback 共用)——
             // M2 — engineSessionId fail-closed 校验(方案 §D 红线 2)。
             // settle 落 usage_records.session_id 的**唯一**权威 = 帧上的
@@ -3892,6 +3866,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 errorReason,
                 usage,
                 billingRl,
+                turnKey: billingTurnKey,
+                parentTurnKey: billingParentTurnKey,
+                parentSessionId: billingParentSessionId,
+                delegateAgentId: billingDelegateAgentId,
               });
               return;
             }
@@ -3977,6 +3955,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
                 const result = await finalizer.commit(
                   usage, codexStatus, errorReason,
+                  {
+                    turnKey: billingTurnKey,
+                    parentTurnKey: billingParentTurnKey,
+                    parentSessionId: billingParentSessionId,
+                    delegateAgentId: billingDelegateAgentId,
+                  },
                 );
                 // 仅 debit > 0 才广播 cost_charged;0 token / 零输出免单 / 重入 /
                 // settle 失败 / commit-after-fail 合成 skipped(debitedCredits=null)
@@ -3994,6 +3978,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         reqId,
                         uid.toString(),
                         result.debitedCredits.toString(),
+                        engineSid,
+                        billingParentSessionId,
+                        billingDelegateAgentId,
+                        billingTurnKey,
+                        billingParentTurnKey,
                       );
                     } catch (err) {
                       billingLog?.warn("user-chat-bridge: codex persist costCredits threw", {
@@ -4531,6 +4520,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       errorReason: string | undefined;
       usage: TokenUsage;
       billingRl: unknown;
+      turnKey: string | null;
+      parentTurnKey: string | null;
+      parentSessionId: string | null;
+      delegateAgentId: string | null;
     }): void {
       const { requestId } = frame;
       if (!codexBillingEnabled) {
@@ -4565,8 +4558,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             state: string;
             user_id: string;
             ctx: unknown;
+            error_msg: string | null;
           }>(
-            `SELECT state, user_id::text AS user_id, ctx
+            `SELECT state, user_id::text AS user_id, ctx, error_msg
                FROM request_finalize_journal
               WHERE request_id = $1`,
             [requestId],
@@ -4594,11 +4588,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
           if (row.state === "aborted") {
-            // 见函数头注释:免单 + 告警,不补收(钱安全红线)。
-            bridgeLog?.error("user-chat-bridge: codex_billing hit aborted journal — turn waived, needs investigation (money-safety: never charge over an aborted journal)", {
+            // Historical code also wrote `aborted` for transient settle errors.
+            // Only an explicit permanent marker is a waiver decision. Prefer
+            // permanent usage truth, otherwise reopen the unproven row so the
+            // exact frame can settle now (the immutable tape remains fallback).
+            const settled = await pgPool.query<{ present: boolean }>(
+              `SELECT EXISTS(
+                 SELECT 1 FROM usage_records WHERE user_id=$1 AND request_id=$2
+               ) AS present`,
+              [uid.toString(), requestId],
+            );
+            if (settled.rows[0]?.present === true) {
+              locallySettledCodexTurns.add(requestId);
+              return;
+            }
+            if (isPermanentCodexWaiver(row.error_msg)) {
+              bridgeLog?.info("user-chat-bridge: codex_billing hit proven permanent waiver — idempotent ignore", {
+                requestId,
+              });
+              return;
+            }
+            const reopened = await pgPool.query(
+              `UPDATE request_finalize_journal
+                  SET state='inflight', error_msg=NULL, final_credits=NULL, updated_at=NOW()
+                WHERE request_id=$1 AND user_id=$2 AND state='aborted'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM usage_records ur
+                     WHERE ur.user_id=$2 AND ur.request_id=$1
+                  )`,
+              [requestId, uid.toString()],
+            );
+            if (reopened.rowCount !== 1) {
+              bridgeLog?.warn("user-chat-bridge: codex_billing could not reopen unproven aborted journal — immutable tape will retry", {
+                requestId,
+              });
+              return;
+            }
+            bridgeLog?.warn("user-chat-bridge: reopened unproven aborted journal for exact billing replay", {
               requestId,
             });
-            return;
           }
           // state === 'inflight' — 跨桥恢复 settle。
           const ctx = (row.ctx !== null && typeof row.ctx === "object"
@@ -4618,7 +4646,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // 配置类不可恢复错误 → 与主路径 abandon 同语义:免单(abort journal)
           // + 释放软预扣 + error 告警。宁可少收不可乱扣。
           const waive = async (reason: string): Promise<void> => {
-            await abortInflightJournal(pgPool, requestId, reason).catch(() => {});
+            await abortInflightJournal(
+              pgPool,
+              requestId,
+              permanentCodexWaiverReason(reason),
+            ).catch(() => {});
             await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
           };
 
@@ -4665,7 +4697,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               await abortInflightJournal(
                 pgPool,
                 requestId,
-                "cross_bridge_authority_binding_invalid",
+                permanentCodexWaiverReason("cross_bridge_authority_binding_invalid"),
               ).catch(() => {});
               await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
               return;
@@ -4776,6 +4808,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           });
           const result = await finalizer.commit(
             frame.usage, frame.codexStatus, frame.errorReason,
+            {
+              turnKey: frame.turnKey,
+              parentTurnKey: frame.parentTurnKey,
+              parentSessionId: frame.parentSessionId,
+              delegateAgentId: frame.delegateAgentId,
+            },
           );
           // settle 已收口 → 后续同桥 duplicate 帧同步丢弃(与主路径簿记同构)。
           locallySettledCodexTurns.add(requestId);
@@ -4792,6 +4830,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   requestId,
                   uid.toString(),
                   result.debitedCredits.toString(),
+                  frame.engineSid,
+                  frame.parentSessionId,
+                  frame.delegateAgentId,
+                  frame.turnKey,
+                  frame.parentTurnKey,
                 );
               } catch (err) {
                 billingLog?.warn("user-chat-bridge: cross-bridge persist costCredits threw", {
@@ -4813,8 +4856,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
           }
         } catch (err) {
-          // settle 抛错:commitOnce 内部已 abort journal(codex_commit_failed)
-          // 兜底并 release reservation,这里只 log(与主路径 commit throw 同语义)。
+          // 瞬态 settle/finalize 错误保持 journal 可恢复；immutable turn tape 会
+          // 用同一精确帧重试。这里只记录低延迟 live path 的失败。
           bridgeLog?.error("user-chat-bridge: codex cross-bridge settle failed", {
             requestId,
             err: (err as Error)?.message,

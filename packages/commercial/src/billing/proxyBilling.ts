@@ -47,6 +47,7 @@ import type { AccountScheduler, ReleaseResult } from "../account-pool/scheduler.
 import { incrBillingDebit } from "../admin/metrics.js";
 import { errSummary, errMessageShort, isObj } from "../http/util.js";
 import type { UsageObservation } from "../http/proxy/shared.js";
+import { stageUsageCostLocatorInBillingTransaction } from "../db/pgSessionsBackend.js";
 
 // ─── finalizer(single-shot + journal) ────────────────────────────────────
 
@@ -118,6 +119,11 @@ export interface FinalizeContext {
   mode?: "chat" | "delegate";
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
+  /** Stable lossless tape locators. When a real debit happens they are
+   * persisted in the same PG transaction as the ledger entry, closing the
+   * crash window before the egress cost outbox is fsynced. */
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
   /**
    * 模型权威留证(0143 四列)。null / 缺省 = gate 未生效 → 四列写 NULL。
    * handler(http/proxy/index.ts)从每请求 gate 结果透传;codexFinalizer 等其它 settle
@@ -325,6 +331,8 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         mode: ctx.mode,
         parentSessionId: ctx.parentSessionId,
         delegateAgentId: ctx.delegateAgentId,
+        turnKey: ctx.turnKey,
+        parentTurnKey: ctx.parentTurnKey,
         authority: ctx.authority ?? null,
       });
       await finalizeInflightJournal(deps.pgPool, {
@@ -513,6 +521,10 @@ export async function settleUsageAndLedger(
     mode?: "chat" | "delegate";
     parentSessionId?: string | null;
     delegateAgentId?: string | null;
+    /** Stable logical tape locators. Optional only for rolling compatibility
+     * with usage created before lossless turn tapes. */
+    turnKey?: string | null;
+    parentTurnKey?: string | null;
     /**
      * 模型权威留证(0143 四列;方案 §4)。缺省/null → 四列写 NULL —— codexFinalizer、
      * 旧测试、影子期的 CCB 路径都不传,落库形状与本批次之前完全一致。
@@ -629,6 +641,19 @@ export async function settleUsageAndLedger(
           usageId.toString(),
         ]);
       }
+    }
+    const targetTurnKey = args.parentTurnKey ?? args.turnKey ?? null;
+    if (debitedCredits !== null && debitedCredits > 0n && targetTurnKey !== null) {
+      await stageUsageCostLocatorInBillingTransaction(client, {
+        requestId: args.requestId,
+        userId: `c:${args.userId.toString()}`,
+        sessionId: args.sessionId,
+        parentSessionId: args.parentSessionId ?? null,
+        delegateAgentId: args.delegateAgentId ?? null,
+        turnKey: args.turnKey ?? null,
+        parentTurnKey: args.parentTurnKey ?? null,
+        costCredits: debitedCredits,
+      });
     }
     await client.query("COMMIT");
     return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };

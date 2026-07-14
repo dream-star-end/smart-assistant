@@ -32,6 +32,12 @@ import {
 import type { V3SinkPersistOutcome, V3SinkPersistRole } from "../admin/metrics.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { Logger } from "../logging/logger.js";
+import {
+  LOSSLESS_TURN_TAPE_PART_BYTES,
+  LOSSLESS_TURN_TAPE_VERSION,
+  type LosslessTurnTapeFinalizeRequest,
+  type LosslessTurnTapePartRequest,
+} from "@openclaude/protocol";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
 
@@ -120,6 +126,142 @@ function fakeStorage(impl: ServerAuthoredStorage["appendServerAuthoredMessage"])
     },
   };
 }
+
+describe("internalServerAuthored handler — lossless v2 multipart", () => {
+  test("accepts a full 192 KiB raw part without applying the legacy 256 KiB JSON-body cap", async () => {
+    const bytes = Buffer.from("x".repeat(LOSSLESS_TURN_TAPE_PART_BYTES), "utf8");
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    const turnKey = "a".repeat(64);
+    const tapeId = "b".repeat(64);
+    let staged: Buffer | null = null;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart(_userId, _body, payload) {
+          staged = Buffer.from(payload);
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
+        },
+      },
+    });
+    const part: LosslessTurnTapePartRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "part",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      tapeId,
+      tapeSha256: sha,
+      totalBytes: bytes.length,
+      partCount: 1,
+      partIndex: 0,
+      partSha256: sha,
+      data: bytes.toString("base64"),
+      createdAt: 1_783_944_000_000,
+    };
+    const { res, rec } = makeRes();
+    await handler(makeReq({ body: JSON.stringify(part), auth: `Bearer ${VALID_TOKEN}` }), res, CTX);
+    assert.equal(rec.status, 200);
+    assert.deepEqual(staged, bytes);
+
+    const finalize: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: part.sessionId,
+      agentId: part.agentId,
+      turnIndex: part.turnIndex,
+      status: part.status,
+      turnKey,
+      tapeId,
+      tapeSha256: sha,
+      totalBytes: bytes.length,
+      partCount: 1,
+      createdAt: part.createdAt,
+    };
+    const finalRes = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      finalRes.res,
+      CTX,
+    );
+    assert.equal(finalRes.rec.status, 200);
+    assert.equal(JSON.parse(finalRes.rec.body).recordCount, 1);
+  });
+
+  test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {
+    const billing = {
+      requestId: "c".repeat(32),
+      turnKey: "a".repeat(64),
+      engineSessionId: `oceng-${"d".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 12,
+      usage: { input_tokens: 3, output_tokens: 4 },
+    };
+    let finalizeCalls = 0;
+    let settleCalls = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          finalizeCalls++;
+          return {
+            applied: finalizeCalls === 1 ? "finalized" : "idempotent",
+            recordCount: 2,
+            engineBillings: [billing],
+          };
+        },
+      },
+      async settleCodexBilling(userId, exact) {
+        settleCalls++;
+        assert.equal(userId, 42n);
+        assert.deepEqual(exact, billing);
+        if (settleCalls === 1) throw new Error("temporary billing database outage");
+      },
+    });
+    const finalize: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: "web-test1",
+      agentId: "codex",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "e".repeat(64),
+      totalBytes: 1,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+    };
+
+    const first = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      first.res,
+      CTX,
+    );
+    assert.equal(first.rec.status, 503, "transient settle failure must keep the fsynced tape queued");
+
+    const retry = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      retry.res,
+      CTX,
+    );
+    assert.equal(retry.rec.status, 200);
+    assert.equal(JSON.parse(retry.rec.body).idempotent, true);
+    assert.equal(finalizeCalls, 2);
+    assert.equal(settleCalls, 2, "idempotent finalize must replay durable billing evidence");
+  });
+});
 
 // ─── tests ───────────────────────────────────────────────────────────────
 

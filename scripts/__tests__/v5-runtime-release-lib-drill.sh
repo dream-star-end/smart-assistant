@@ -73,6 +73,17 @@ chmod +x "$OC_DOCKER_BIN"
 # shellcheck source=/dev/null
 source "$LIB"
 
+# Legacy saga fixtures must declare their lack of the lossless capability in a
+# readable immutable artifact. A missing metadata file is intentionally
+# tri-state "unknown" and therefore arms fail-closed compensation.
+for master_name in BASE BLOCKED C EN HOOK HOOK2 HOOK3 LOST NEW OLD PRE PREV R UNKNOWN X Y Z; do
+  master_dir="$WORK/legacy-master-$master_name"
+  mkdir -p "$master_dir/deploy/v5"
+  printf '{"capabilities":[],"runtimeCapabilities":[]}\n' \
+    > "$master_dir/deploy/v5/release-metadata.json"
+  printf -v "MASTER_$master_name" '%s' "$master_dir"
+done
+
 # 初始 env(含旧 tuple 供 saga 快照/回滚)
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
 OC_RUNTIME_CHANNEL=v5
@@ -415,15 +426,15 @@ EOF
 oc_hotcfg_flip_current "$REV2"     # 旧 current=REV2
 NEWHIST="$OC_HOTCFG_HISTORY"
 if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$NEWHIST" \
-     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterNEW" "/rel/masterPREV"; then ok "saga 成功返回 0"; else bad "saga 应成功"; fi
+     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "$MASTER_NEW" "$MASTER_PREV"; then ok "saga 成功返回 0"; else bad "saga 应成功"; fi
 chk "env OC_RUNTIME_IMAGE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:NEW' ]"
 chk "env OC_RUNTIME_RELEASE 更新为 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/NEW' ]"
 chk "current 翻到 REV1" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV1' ]"
 chk "history 共 2 条(pre-state + committed,R2-B2)" "[ \"\$(grep -c . '$NEWHIST')\" = 2 ]"
 PRE_ENTRY="$(oc_hotcfg_history_nth_committed "$NEWHIST" 2)"
 chk "pre-state 条目 preState=true 且四键=激活前 env 逐字面" "[ \"\$(jq -r .preState <<<'$PRE_ENTRY')\" = true ] && [ \"\$(jq -r .image <<<'$PRE_ENTRY')\" = 'img:OLD' ] && [ \"\$(jq -r .release <<<'$PRE_ENTRY')\" = '/rel/OLD' ] && [ \"\$(jq -r .bundle <<<'$PRE_ENTRY')\" = '/bun/OLD' ]"
-chk "pre-state 条目 masterRelease=激活前 master(/rel/masterPREV)" "[ \"\$(jq -r .masterRelease <<<'$PRE_ENTRY')\" = '/rel/masterPREV' ]"
-chk "history 末条带 masterRelease=/rel/masterNEW" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$NEWHIST')\")\" = '/rel/masterNEW' ]"
+chk "pre-state 条目 masterRelease=激活前 master" "[ \"\$(jq -r .masterRelease <<<'$PRE_ENTRY')\" = '$MASTER_PREV' ]"
+chk "history 末条带新 masterRelease" "[ \"\$(jq -r .masterRelease <<<\"\$(oc_hotcfg_history_last_committed '$NEWHIST')\")\" = '$MASTER_NEW' ]"
 
 echo "== TR2B2 首次启用 pre-state → rollback=1 逐字面退回启用前(含空值,R2-B1+R2-B2)=="
 # 启用前形态:release 键**缺失**、bundle 空值(两轴皆禁用)
@@ -436,7 +447,7 @@ HPRE="$WORK/hist-pre"; : > "$HPRE"
 oc_hotcfg_flip_current "$REV2"
 # 首次启用(release+bundle 双轴)
 DOCKER_STUB_IMAGE_ID=sha256:EN oc_hotcfg_activate_saga "$WORK/pre.env" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$HPRE" \
-  img:EN sha256:EN /rel/EN "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterEN" "/rel/masterPRE" \
+  img:EN sha256:EN /rel/EN "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "$MASTER_EN" "$MASTER_PRE" \
   >/dev/null 2>&1 || bad "TR2B2 首次启用 saga 应成功"
 # 模拟 --rollback=1:取倒数第 2 条 committed(= pre-state),按其逐字面值再走一次 saga
 RB="$(oc_hotcfg_history_nth_committed "$HPRE" 2)"
@@ -462,7 +473,7 @@ EOF
 : > "$OC_HOTCFG_HISTORY"
 oc_hotcfg_flip_current "$REV2"
 DOCKER_STUB_IMAGE_ID=sha256:R oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
-  img:R sha256:R /rel/R "" "true" "true" "" "" "/rel/masterR" "/rel/masterPREV" >/dev/null 2>&1 && ok "release-only saga 成功" || bad "release-only saga 应成功"
+  img:R sha256:R /rel/R "" "true" "true" "" "" "$MASTER_R" "$MASTER_PREV" >/dev/null 2>&1 && ok "release-only saga 成功" || bad "release-only saga 应成功"
 chk "release-only:OC_RUNTIME_RELEASE 写入 /rel/R" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/R' ]"
 chk "release-only:OC_PLATFORM_BUNDLE 轴禁用 → 写空值(三态,旧值被清)" "grep -q '^OC_PLATFORM_BUNDLE=$' '$OC_HOTCFG_ENV_FILE'"
 chk "release-only:current 未翻转(仍 REV2)" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
@@ -478,7 +489,7 @@ EOF
 oc_hotcfg_flip_current "$REV2"   # 旧 current=REV2
 RESTART_LOG="$WORK/restart.log"; : > "$RESTART_LOG"
 if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$RESTART_LOG" "false" "" "" "/rel/masterNEW"; then
+     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$RESTART_LOG" "false" "" "" "$MASTER_NEW"; then
   bad "saga 应因 smoke 失败返回非 0"
 else ok "saga 因 smoke 失败返回非 0"; fi
 chk "env OC_RUNTIME_IMAGE 复原为 OLD" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:OLD' ]"
@@ -486,6 +497,68 @@ chk "env OC_RUNTIME_RELEASE 复原为 OLD" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$O
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
 chk "激活未提交:history 仅 pre-state 1 条(R2-B2,失败不回滚 pre-state)" "[ \"\$(grep -c . '$OC_HOTCFG_HISTORY')\" = 1 ] && [ \"\$(jq -r .preState <<<\"\$(oc_hotcfg_history_last_committed '$OC_HOTCFG_HISTORY')\")\" = true ]"
 chk "回滚后 restart 被调用 2 次(新+旧)" "[ \"\$(grep -c restart '$RESTART_LOG')\" = 2 ]"
+
+echo "== T9L lossless writer 已可能服务 → 旧栈无 capability 时禁止自动补偿 =="
+LNEW_MASTER="$WORK/lossless-master-new"; LOLD_MASTER="$WORK/lossless-master-old"
+LNEW_RUNTIME="$WORK/lossless-runtime-new"; LOLD_RUNTIME="$WORK/lossless-runtime-old"
+mkdir -p "$LNEW_MASTER/deploy/v5" "$LOLD_MASTER/deploy/v5" "$LNEW_RUNTIME" "$LOLD_RUNTIME"
+printf '{"capabilities":["lossless-turn-tape-v2"],"runtimeCapabilities":["lossless-turn-tape-v2"]}\n' \
+  > "$LNEW_MASTER/deploy/v5/release-metadata.json"
+printf '{"capabilities":[],"runtimeCapabilities":[]}\n' \
+  > "$LOLD_MASTER/deploy/v5/release-metadata.json"
+printf '{"capabilities":["lossless-turn-tape-v2"]}\n' > "$LNEW_RUNTIME/MANIFEST.json"
+printf '{"capabilities":[]}\n' > "$LOLD_RUNTIME/MANIFEST.json"
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:LOSSLESS-OLD
+OC_RUNTIME_IMAGE_ID=sha256:LOSSLESS-OLD
+OC_RUNTIME_RELEASE=$LOLD_RUNTIME
+OC_PLATFORM_BUNDLE=
+EOF
+LHIST="$WORK/lossless-rollback.history"; : > "$LHIST"
+LMASTER_PTR="$WORK/lossless-master.ptr"; echo OLD > "$LMASTER_PTR"
+LRESTART_LOG="$WORK/lossless-restart.log"; : > "$LRESTART_LOG"
+LRECOVERY="$WORK/lossless-recovery-required"; rm -f "$LRECOVERY"
+if DOCKER_STUB_IMAGE_ID=sha256:LOSSLESS-NEW oc_hotcfg_activate_saga \
+    "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$LHIST" \
+    img:LOSSLESS-NEW sha256:LOSSLESS-NEW "$LNEW_RUNTIME" "" \
+    "echo restart >>'$LRESTART_LOG'" "false" \
+    "echo NEW > '$LMASTER_PTR'" "echo OLD > '$LMASTER_PTR'" \
+    "$LNEW_MASTER" "$LOLD_MASTER" "" "" "$LRECOVERY" joint >/dev/null 2>&1; then
+  bad "T9L smoke 失败不应返回成功"
+else ok "T9L 拒绝自动回切无能力旧栈"; fi
+chk "T9L 候选 master 保持 NEW(禁止 extra_revert)" "[ \"\$(cat '$LMASTER_PTR')\" = NEW ]"
+chk "T9L 候选 runtime env 保持 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '$LNEW_RUNTIME' ]"
+chk "T9L 不重启旧 master" "[ \"\$(grep -c restart '$LRESTART_LOG')\" = 1 ]"
+chk "T9L 落人工恢复标记" "[ -s '$LRECOVERY' ] && grep -q 'lossless writer' '$LRECOVERY'"
+
+echo "== T9U candidate capability 探测失败 → 仍按可能服务,禁止自动补偿 =="
+LUNKNOWN_MASTER="$WORK/lossless-master-unknown"
+mkdir -p "$LUNKNOWN_MASTER/deploy/v5"
+# Existing but malformed immutable metadata reproduces a transient read/parse
+# failure (tri-state unknown), not an explicit legacy declaration.
+printf '{malformed\n' > "$LUNKNOWN_MASTER/deploy/v5/release-metadata.json"
+cat > "$OC_HOTCFG_ENV_FILE" <<EOF
+OC_RUNTIME_IMAGE=img:LOSSLESS-OLD
+OC_RUNTIME_IMAGE_ID=sha256:LOSSLESS-OLD
+OC_RUNTIME_RELEASE=$LOLD_RUNTIME
+OC_PLATFORM_BUNDLE=
+EOF
+LUHIST="$WORK/lossless-unknown-rollback.history"; : > "$LUHIST"
+LUMASTER_PTR="$WORK/lossless-unknown-master.ptr"; echo OLD > "$LUMASTER_PTR"
+LURESTART_LOG="$WORK/lossless-unknown-restart.log"; : > "$LURESTART_LOG"
+LURECOVERY="$WORK/lossless-unknown-recovery-required"; rm -f "$LURECOVERY"
+if DOCKER_STUB_IMAGE_ID=sha256:LOSSLESS-UNKNOWN oc_hotcfg_activate_saga \
+    "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$LUHIST" \
+    img:LOSSLESS-UNKNOWN sha256:LOSSLESS-UNKNOWN "$LNEW_RUNTIME" "" \
+    "echo restart >>'$LURESTART_LOG'" "false" \
+    "echo NEW > '$LUMASTER_PTR'" "echo OLD > '$LUMASTER_PTR'" \
+    "$LUNKNOWN_MASTER" "$LOLD_MASTER" "" "" "$LURECOVERY" joint >/dev/null 2>&1; then
+  bad "T9U smoke 失败不应返回成功"
+else ok "T9U 探测失败仍拒绝自动回切无能力旧栈"; fi
+chk "T9U 候选 master 保持 NEW" "[ \"\$(cat '$LUMASTER_PTR')\" = NEW ]"
+chk "T9U 候选 runtime env 保持 NEW" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '$LNEW_RUNTIME' ]"
+chk "T9U 不重启旧 master" "[ \"\$(grep -c restart '$LURESTART_LOG')\" = 1 ]"
+chk "T9U 落人工恢复标记" "[ -s '$LURECOVERY' ] && grep -q 'lossless writer' '$LURECOVERY'"
 
 echo "== T10 saga 回滚(第 3 步 extra_apply 失败)=="
 cat > "$OC_HOTCFG_ENV_FILE" <<EOF
@@ -496,7 +569,7 @@ OC_PLATFORM_BUNDLE=/bun/OLD
 EOF
 oc_hotcfg_flip_current "$REV2"
 if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "false" "echo revert" "/rel/masterNEW"; then
+     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "false" "echo revert" "$MASTER_NEW"; then
   bad "extra_apply 失败应返回非 0"
 else ok "extra_apply 失败返回非 0"; fi
 chk "env 未被改(仍 OLD)" "[ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = 'img:OLD' ]"
@@ -516,7 +589,7 @@ PREVPTR="$WORK/prevptr"; echo OLDPREV > "$PREVPTR"
 APPLY="echo NEWPREV > '$PREVPTR'"     # apply 成功(改指针)
 REVERT="echo OLDPREV > '$PREVPTR'"    # revert 还原指针
 if DOCKER_STUB_IMAGE_ID=sha256:NEW oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "false" "$APPLY" "$REVERT" "/rel/masterNEW"; then
+     img:NEW sha256:NEW /rel/NEW "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "false" "$APPLY" "$REVERT" "$MASTER_NEW"; then
   bad "smoke 失败应返回非 0"
 else ok "smoke 失败返回非 0(extra_apply 已成功)"; fi
 chk "current 复原到 REV2" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
@@ -527,7 +600,7 @@ STATEPTR="$WORK/deploy-state.ptr"; echo OLD > "$STATEPTR"
 HHOOK="$WORK/hook-history"; : > "$HHOOK"
 # 成功路径:smoke 后 commit hook 生效，history 随后提交。
 DOCKER_STUB_IMAGE_ID=sha256:HOOK oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
-  img:HOOK sha256:HOOK /rel/HOOK "" "true" "true" "" "" "/rel/masterHOOK" "/rel/masterOLD" \
+  img:HOOK sha256:HOOK /rel/HOOK "" "true" "true" "" "" "$MASTER_HOOK" "$MASTER_OLD" \
   "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1 \
   && ok "TP3 commit hook 成功路径" || bad "TP3 commit hook 应成功"
 chk "TP3 commit 后外部权威=NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
@@ -535,7 +608,7 @@ chk "TP3 commit 后外部权威=NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
 # commit hook 自身失败:env/current/extra 全回滚，外部权威仍 OLD。
 echo OLD > "$STATEPTR"
 if DOCKER_STUB_IMAGE_ID=sha256:HOOK2 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HHOOK" \
-  img:HOOK2 sha256:HOOK2 /rel/HOOK2 "" "true" "true" "" "" "/rel/masterHOOK2" "/rel/masterHOOK" \
+  img:HOOK2 sha256:HOOK2 /rel/HOOK2 "" "true" "true" "" "" "$MASTER_HOOK2" "$MASTER_HOOK" \
   "false" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
   bad "TP3 commit hook 失败不应返回成功"
 else ok "TP3 commit hook 失败触发 saga 回滚"; fi
@@ -543,11 +616,11 @@ chk "TP3 commit 失败后外部权威仍 OLD" "[ \"\$(cat '$STATEPTR')\" = OLD ]
 
 # history fsync/append 位于 commit 之后；注入 append 失败，必须调用 commit_revert。
 HFAIL="$WORK/hook-history-fail"; : > "$HFAIL"
-oc_hotcfg_history_append "$HFAIL" img:BASE sha256:BASE /rel/BASE "" /rel/masterBASE prestate >/dev/null
+oc_hotcfg_history_append "$HFAIL" img:BASE sha256:BASE /rel/BASE "" "$MASTER_BASE" prestate >/dev/null
 echo OLD > "$STATEPTR"
 oc_hotcfg_history_append() { return 1; }
 if DOCKER_STUB_IMAGE_ID=sha256:HOOK3 oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
-  img:HOOK3 sha256:HOOK3 /rel/HOOK3 "" "true" "true" "" "" "/rel/masterHOOK3" "/rel/masterBASE" \
+  img:HOOK3 sha256:HOOK3 /rel/HOOK3 "" "true" "true" "" "" "$MASTER_HOOK3" "$MASTER_BASE" \
   "echo NEW > '$STATEPTR'" "echo OLD > '$STATEPTR'" >/dev/null 2>&1; then
   bad "TP3 history 失败不应返回成功"
 else ok "TP3 history 失败触发 commit_revert"; fi
@@ -566,7 +639,7 @@ EOF
 MASTERPTR="$WORK/master.ptr"; echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"
 if DOCKER_STUB_IMAGE_ID=sha256:LOST oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
   img:LOST sha256:LOST /rel/LOST "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
-  "/rel/masterLOST" "/rel/masterOLD" "echo NEW > '$STATEPTR'; false" \
+  "$MASTER_LOST" "$MASTER_OLD" "echo NEW > '$STATEPTR'; false" \
   "[ \"\$(cat '$STATEPTR')\" = NEW ] && echo OLD > '$STATEPTR'" "$RECOVERY_MARK" >/dev/null 2>&1; then
   bad "TP3b post-commit 丢回执应让本次激活失败"
 else ok "TP3b post-commit 丢回执经 reconcile 后安全失败"; fi
@@ -584,14 +657,14 @@ EOF
 echo OLD > "$MASTERPTR"; echo OLD > "$STATEPTR"; rm -f "$RECOVERY_MARK"
 if DOCKER_STUB_IMAGE_ID=sha256:UNKNOWN oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
   img:UNKNOWN sha256:UNKNOWN /rel/UNKNOWN "" "true" "true" "echo NEW > '$MASTERPTR'" "echo OLD > '$MASTERPTR'" \
-  "/rel/masterUNKNOWN" "/rel/masterOLD" "echo NEW > '$STATEPTR'" "false" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  "$MASTER_UNKNOWN" "$MASTER_OLD" "echo NEW > '$STATEPTR'" "false" "$RECOVERY_MARK" >/dev/null 2>&1; then
   bad "TP3b revert unknown 不应报告成功"
 else ok "TP3b revert unknown 进入人工恢复态"; fi
 chk "TP3b unknown 时 state 保持 NEW" "[ \"\$(cat '$STATEPTR')\" = NEW ]"
 chk "TP3b unknown 时禁止盲回运行面(master/env 仍 NEW)" "[ \"\$(cat '$MASTERPTR')\" = NEW ] && [ \"\$(grep ^OC_RUNTIME_IMAGE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = img:UNKNOWN ]"
-chk "TP3b unknown 落持久人工恢复标记" "[ -s '$RECOVERY_MARK' ] && grep -q 'master_target=/rel/masterUNKNOWN' '$RECOVERY_MARK'"
+chk "TP3b unknown 落持久人工恢复标记" "[ -s '$RECOVERY_MARK' ] && grep -q 'master_target=$MASTER_UNKNOWN' '$RECOVERY_MARK'"
 if DOCKER_STUB_IMAGE_ID=sha256:BLOCKED oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$HFAIL" \
-  img:BLOCKED sha256:BLOCKED /rel/BLOCKED "" "true" "true" "" "" "/rel/masterBLOCKED" "" "" "" "$RECOVERY_MARK" >/dev/null 2>&1; then
+  img:BLOCKED sha256:BLOCKED /rel/BLOCKED "" "true" "true" "" "" "$MASTER_BLOCKED" "" "" "" "$RECOVERY_MARK" >/dev/null 2>&1; then
   bad "TP3b 有恢复标记时不应允许下一次激活"
 else ok "TP3b 恢复标记阻断后续激活"; fi
 # 恢复真实函数，避免污染后续 drill。
@@ -608,7 +681,7 @@ EOF
 oc_hotcfg_flip_current "$REV2"
 CRLOG="$WORK/canary-run.log"; : > "$CRLOG"
 DOCKER_STUB_RUN_LOG="$CRLOG" DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-  img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "/rel/masterC" "" \
+  img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "true" "true" "" "" "$MASTER_C" "" \
   >/dev/null 2>&1 && ok "canary 成功路径:saga 提交" || bad "canary 成功路径 saga 应成功"
 chk "canary 以 validate-only 跑 entrypoint" "grep -q 'OC_ENTRYPOINT_VALIDATE_ONLY=1' '$CRLOG' && grep -q -- '--entrypoint /usr/local/bin/entrypoint.sh' '$CRLOG'"
 chk "canary 带 bundle 轴挂载 + rev-pinned env" "grep -q -- '-v $OC_HOTCFG_PLATFORM_ROOT:/run/oc/platform:ro' '$CRLOG' && grep -q 'OC_PLATFORM_BUNDLE_REV=$REV1' '$CRLOG'"
@@ -625,7 +698,7 @@ EOF
 oc_hotcfg_flip_current "$REV2"
 CRESTART="$WORK/canary-restart.log"; : > "$CRESTART"
 if DOCKER_STUB_RUN_FAIL=1 DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-     img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$CRESTART" "true" "" "" "/rel/masterC" "" \
+     img:NEW sha256:NEWID /rel/NEWREL "$OC_HOTCFG_PLATFORM_ROOT/bundles/$REV1" "echo restart >>$CRESTART" "true" "" "" "$MASTER_C" "" \
      >/dev/null 2>&1; then bad "canary 失败应让 saga 返回非 0"; else ok "canary 失败 → saga 拒绝激活"; fi
 chk "canary 失败:env 未动(仍 OLD)" "[ \"\$(grep ^OC_RUNTIME_RELEASE= '$OC_HOTCFG_ENV_FILE'|cut -d= -f2-)\" = '/rel/OLD' ]"
 chk "canary 失败:current 未动(仍 REV2)" "[ \"\$(readlink '$OC_HOTCFG_PLATFORM_ROOT/current')\" = 'bundles/$REV2' ]"
@@ -633,7 +706,7 @@ chk "canary 失败:未无谓重启旧 master(现场未动无需 restart)" "[ ! -
 # 两轴皆禁用(release 空 + flip_rev 空)→ canary 跳过(docker run 不被调用)
 CRLOG2="$WORK/canary-run2.log"; : > "$CRLOG2"
 DOCKER_STUB_RUN_LOG="$CRLOG2" DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "" "$OC_HOTCFG_HISTORY" \
-  img:NEW sha256:NEWID "" "" "true" "true" "" "" "/rel/masterC" "" >/dev/null 2>&1 \
+  img:NEW sha256:NEWID "" "" "true" "true" "" "" "$MASTER_C" "" >/dev/null 2>&1 \
   && ok "双轴禁用 saga 成功(写空值)" || bad "双轴禁用 saga 应成功"
 chk "双轴禁用 → canary 跳过(无 docker run)" "[ ! -s '$CRLOG2' ]"
 
@@ -641,7 +714,7 @@ echo "== TR3 可行性守卫 + canary 先于 pre-state + emergency 完整门 + �
 # R3-B1:瘦身镜像(embed_source=0)+ 空 release → saga 在一切现场改动前拒绝(env/history 零变化)
 ENVSNAP="$(cat "$OC_HOTCFG_ENV_FILE")"; HISTSNAP="$(cat "$OC_HOTCFG_HISTORY" 2>/dev/null || true)"
 if DOCKER_STUB_EMBED=0 DOCKER_STUB_IMAGE_ID=sha256:SLIMID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-    img:SLIM sha256:SLIMID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterX" "" >/dev/null 2>&1; then
+    img:SLIM sha256:SLIMID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "$MASTER_X" "" >/dev/null 2>&1; then
   bad "R3-B1 瘦身+空release 应被拒"
 else ok "R3-B1 瘦身镜像+空 release → saga 拒绝"; fi
 chk "R3-B1 拒绝后 env 零变化" "[ \"\$(cat '$OC_HOTCFG_ENV_FILE')\" = \"\$ENVSNAP\" ]"
@@ -650,7 +723,7 @@ chk "R3-B1 拒绝后 history 零变化" "[ \"\$(cat '$OC_HOTCFG_HISTORY' 2>/dev/
 # R3-B2:首次启用(空 history)+ canary 失败 → history 仍空(pre-state 不被污染写入)
 FRESH_HIST="$WORK/fresh.history"
 if DOCKER_STUB_RUN_FAIL=1 DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$FRESH_HIST" \
-    img:NEW sha256:NEWID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterY" "/rel/masterOLD" >/dev/null 2>&1; then
+    img:NEW sha256:NEWID "" "$PLAT/bundles/$REV1" "true" "true" "" "" "$MASTER_Y" "$MASTER_OLD" >/dev/null 2>&1; then
   bad "R3-B2 canary 失败应拒绝激活"
 else ok "R3-B2 首启+canary 失败 → 拒绝"; fi
 chk "R3-B2 canary 失败后 history 仍空(pre-state 未污染)" "[ ! -s '$FRESH_HIST' ]"
@@ -680,13 +753,13 @@ fi
 # R4-B1:tag↔ID 漂移拒(stub:.Id 由 DOCKER_STUB_IMGID 控制)
 ENVSNAP2="$(cat "$OC_HOTCFG_ENV_FILE")"
 if DOCKER_STUB_IMAGE_ID=sha256:DRIFTED oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterZ" "" >/dev/null 2>&1; then
+    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "$MASTER_Z" "" >/dev/null 2>&1; then
   bad "R4-B1 tag↔ID 漂移应被拒"
 else ok "R4-B1 tag↔ID 漂移 → saga 拒绝"; fi
 chk "R4-B1 拒绝后 env 零变化" "[ \"\$(cat '$OC_HOTCFG_ENV_FILE')\" = \"\$ENVSNAP2\" ]"
 # R4-B1:tag↔ID 一致 → saga 正常提交
 DOCKER_STUB_IMAGE_ID=sha256:NEWID oc_hotcfg_activate_saga "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$REV1" "$OC_HOTCFG_HISTORY" \
-    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "/rel/masterZ" "" >/dev/null 2>&1 \
+    img:NEW sha256:NEWID "/rel/NEWREL" "$PLAT/bundles/$REV1" "true" "true" "" "" "$MASTER_Z" "" >/dev/null 2>&1 \
   && ok "R4-B1 tag↔ID 一致 → saga 提交" || bad "R4-B1 一致时 saga 应成功"
 # R4-M1:emergency 传 symlink → 登记 canonical digest 路径
 ln -sfn "bundles/$REV1" "$PLAT/curlink"

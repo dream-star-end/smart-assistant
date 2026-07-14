@@ -12,7 +12,7 @@
  * **错误分类**(决定 outbox 是 retry 还是 force-fail):
  *   - `iLink HTTP 401|403|404|410` → permanent:true(认证 / 路由 / 已废弃,retry 无意义)
  *   - `iLink HTTP 5xx` / `iLink returned non-JSON` / 任何其他 throw → permanent:false(transient,
- *     outbox 按 attempts cap 重试)
+ *     outbox 无次数/时长上限地重试)
  *
  * iLink 上游(`@openclaude/channel-wechat` iLink.ts)在 `resp.ok === false` 已经 throw 出统一格式
  * `iLink HTTP <status>: <truncated body>`,在 JSON parse 失败时 throw `iLink returned non-JSON: ...`,
@@ -166,7 +166,7 @@ export function classifyIlinkError(err: unknown): {
   if (m) {
     const status = Number(m[1])
     if (PERMANENT_STATUSES.has(status)) return { permanent: true, errMessage }
-    // 5xx + 其他 4xx 都按 transient 处理(429 / 400 等会被 outbox attempts cap 兜底)
+    // 5xx + 其他 4xx 都按 transient 处理;outbox 永久保留并按 backoff 重试。
     return { permanent: false, errMessage }
   }
   // 非 iLink HTTP 前缀的错(non-JSON / network / unknown)按 transient

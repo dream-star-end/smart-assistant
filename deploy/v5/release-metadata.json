@@ -12,15 +12,17 @@
     "0143_model_catalog",
     "0144_model_authority_guards",
     "0145_retire_legacy_incident_notices",
-    "0146_connector_ai_declarative_verification"
+    "0146_connector_ai_declarative_verification",
+    "0147_lossless_turn_tapes"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
     "dual-master-v1",
     "model_authority_v1",
-    "model_authority_v1-egress"
+    "model_authority_v1-egress",
+    "lossless-turn-tape-v2"
   ],
-  "runtimeCapabilities": ["model_authority_v1"],
+  "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2"],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
 }

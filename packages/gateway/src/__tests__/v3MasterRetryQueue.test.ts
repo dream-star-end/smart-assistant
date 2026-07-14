@@ -4,8 +4,9 @@
  * Covers:
  *   - enqueueDurable writes to dir as a single .json file (atomic rename)
  *   - drainOnce: success unlinks; transient bumps attempts and rewrites;
- *     fatal V3SinkError unlinks (terminal); TTL drops; ENOENT-tolerant;
- *     malformed-JSON unlinks; session_missing rewrites.
+ *     only fatal 410 unlinks; every other remote response remains retryable;
+ *     malformed local bytes quarantine;
+ *     age never deletes valid paid output; session_missing rewrites.
  *   - kick is single-flight (concurrent kicks coalesce to one drain pass)
  *   - pendingCount reflects on-disk state including after rewrites
  *   - skips .tmp-* and non-.json files
@@ -20,7 +21,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
-  ENTRY_TTL_MS,
   makeV3MasterRetryQueue,
   type V3MasterRetryEntry,
 } from "../v3MasterRetryQueue.js";
@@ -410,7 +410,7 @@ describe("drainOnce — transient retry", () => {
 // ─── drainOnce: fatal terminal ───────────────────────────────────────────
 
 describe("drainOnce — fatal terminal", () => {
-  test("fatal V3SinkError → file unlinked + fatalDropped++", async () => {
+  test("non-410 fatal V3SinkError → valid paid payload stays actively retryable", async () => {
     const q = makeV3MasterRetryQueue({
       dir,
       attemptSend: async () => {
@@ -419,17 +419,34 @@ describe("drainOnce — fatal terminal", () => {
     });
     await writeEntryDirect(entry());
     const stats = await q.drainOnce();
-    assert.equal(stats.fatalDropped, 1);
-    assert.equal(stats.retried, 0);
+    assert.equal(stats.fatalDropped, 0);
+    assert.equal(stats.retried, 1);
+    assert.equal(stats.pending, 1);
     const files = await listJsonFiles();
-    assert.equal(files.length, 0);
+    assert.equal(files.length, 1);
+    const reread = JSON.parse(await readFile(join(dir, files[0]), "utf8")) as V3MasterRetryEntry;
+    assert.equal(reread.payload.text, "hello");
+    assert.equal(reread.lastErrorClass, "fatal");
+  });
+
+  test("explicit 410 session deletion ACK is the only fatal unlink", async () => {
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3SinkError("session deleted", "fatal", 410);
+      },
+    });
+    await writeEntryDirect(entry());
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 1);
+    assert.deepEqual(await readdir(dir), []);
   });
 });
 
-// ─── drainOnce: TTL ──────────────────────────────────────────────────────
+// ─── drainOnce: age retention ────────────────────────────────────────────
 
-describe("drainOnce — TTL drop", () => {
-  test("entry past ENTRY_TTL_MS → unlinked + ttlDropped++ before attempt", async () => {
+describe("drainOnce — no age-based data loss", () => {
+  test("very old valid entry is still attempted and never TTL-dropped", async () => {
     let attemptCalls = 0;
     const fixedNow = 10_000_000_000;
     const q = makeV3MasterRetryQueue({
@@ -440,20 +457,19 @@ describe("drainOnce — TTL drop", () => {
     const stale: V3MasterRetryEntry = {
       schemaVersion: 1,
       payload: basePayload(),
-      // TTL = 24h. firstSeenAt 25h before now → expired.
-      firstSeenAt: fixedNow - ENTRY_TTL_MS - 60_000,
+      firstSeenAt: 1,
       attempts: 5,
       lastErrorClass: "transient",
     };
     await writeEntryDirect(stale);
     const stats = await q.drainOnce();
-    assert.equal(stats.ttlDropped, 1);
-    assert.equal(attemptCalls, 0); // attempt skipped — entry expired
+    assert.equal(stats.ttlDropped, 0);
+    assert.equal(attemptCalls, 1);
     const files = await listJsonFiles();
     assert.equal(files.length, 0);
   });
 
-  test("entry within TTL → attempt fires", async () => {
+  test("recent entry also attempts", async () => {
     let attemptCalls = 0;
     const fixedNow = 10_000_000_000;
     const q = makeV3MasterRetryQueue({
@@ -476,16 +492,18 @@ describe("drainOnce — TTL drop", () => {
 // ─── drainOnce: malformed entry ──────────────────────────────────────────
 
 describe("drainOnce — malformed entry", () => {
-  test("invalid JSON → unlinked + fatalDropped++", async () => {
+  test("invalid JSON → quarantined + fatalDropped++", async () => {
     const q = makeV3MasterRetryQueue({ dir, attemptSend: async () => undefined });
     await writeFile(join(dir, "1234567890123-deadbeef.json"), "{not json", "utf8");
     const stats = await q.drainOnce();
     assert.equal(stats.fatalDropped, 1);
     const files = await listJsonFiles();
     assert.equal(files.length, 0);
+    const allFiles = await readdir(dir);
+    assert.ok(allFiles.some((name) => name.includes(".quarantine-malformed-")));
   });
 
-  test("schema mismatch → unlinked", async () => {
+  test("schema mismatch → quarantined", async () => {
     const q = makeV3MasterRetryQueue({ dir, attemptSend: async () => undefined });
     await writeFile(
       join(dir, "1234567890123-cafebabe.json"),
@@ -494,6 +512,8 @@ describe("drainOnce — malformed entry", () => {
     );
     const stats = await q.drainOnce();
     assert.equal(stats.fatalDropped, 1);
+    const allFiles = await readdir(dir);
+    assert.ok(allFiles.some((name) => name.includes(".quarantine-malformed-")));
   });
 });
 

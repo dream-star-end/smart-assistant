@@ -3,10 +3,9 @@
  *
  * Mirrors v3MasterRetryQueue test scope, with wechat-specific payload schema:
  *   - enqueueDurable writes one .json file (atomic rename)
- *   - drainOnce: 2xx success → unlinks; transient → bumps attempts + rewrites;
- *     fatal V3WechatSinkError → unlinks except final message payloads, which
- *     get bounded retry so master can clear running-session state; TTL drops; ENOENT-tolerant;
- *     malformed JSON / schema mismatch drops.
+ *   - drainOnce: 2xx success → unlinks; explicit 410 owner deletion → unlinks;
+ *     every other failure retries forever without TTL/count caps;
+ *     malformed JSON / schema mismatch is quarantined byte-for-byte.
  *   - kick is single-flight (concurrent kicks coalesce to one drain pass)
  *   - pendingCount reflects on-disk state including after rewrites
  *   - skips .tmp-* and non-.json files
@@ -22,8 +21,6 @@ import { tmpdir } from "node:os"
 import { before, after, beforeEach, describe, test } from "node:test"
 
 import {
-  ENTRY_TTL_MS,
-  FINAL_FATAL_MAX_ATTEMPTS,
   makeV3WechatRetryQueue,
   V3WechatSinkError,
   type V3WechatCodexBillingWirePayload,
@@ -183,7 +180,7 @@ describe("drainOnce", () => {
     assert.match(raw.lastErrorMessage ?? "", /master 503/)
   })
 
-  test("fatal → unlink entry (terminal)", async () => {
+  test("non-410 fatal classification still retries without deleting", async () => {
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     await q.enqueueDurable(entry())
     const q2 = makeV3WechatRetryQueue({
@@ -193,11 +190,12 @@ describe("drainOnce", () => {
       },
     })
     const stats = await q2.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
-    assert.equal(await q.pendingCount(), 0, "fatal entry must be unlinked")
+    assert.equal(stats.fatalDropped, 0)
+    assert.equal(stats.retried, 1)
+    assert.equal(await q.pendingCount(), 1, "non-410 entry must stay on disk")
   })
 
-  test("fatal final message → bounded retry so final can clear running state", async () => {
+  test("fatal final message retries without a count cap", async () => {
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     await q.enqueueDurable(entry(basePayload({ isFinal: true })))
     const q2 = makeV3WechatRetryQueue({
@@ -219,10 +217,10 @@ describe("drainOnce", () => {
     assert.equal((raw.payload as V3WechatSinkWirePayload).isFinal, true)
   })
 
-  test("fatal final message at max attempts → unlink", async () => {
+  test("large attempt count does not delete a final message", async () => {
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const maxed = entry(basePayload({ isFinal: true }))
-    maxed.attempts = FINAL_FATAL_MAX_ATTEMPTS
+    maxed.attempts = 1_000_000
     await q.enqueueDurable(maxed)
     const q2 = makeV3WechatRetryQueue({
       dir,
@@ -231,54 +229,77 @@ describe("drainOnce", () => {
       },
     })
     const stats = await q2.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
-    assert.equal(stats.retried, 0)
-    assert.equal(stats.pending, 0)
-    assert.equal(await q.pendingCount(), 0, "permanent fatal final is bounded")
+    assert.equal(stats.fatalDropped, 0)
+    assert.equal(stats.retried, 1)
+    assert.equal(stats.pending, 1)
+    assert.equal(await q.pendingCount(), 1, "attempt count must not discard payload")
   })
 
-  test("TTL exceeded → drop + warn", async () => {
+  test("arbitrarily old entry is still attempted and retained", async () => {
     const old = entry()
-    old.firstSeenAt = Date.now() - (ENTRY_TTL_MS + 1_000) // 1s past TTL
+    old.firstSeenAt = 1
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     await q.enqueueDurable(old)
     const q2 = makeV3WechatRetryQueue({
       dir,
       attemptSend: async () => {
-        assert.fail("attemptSend must not be called for TTL-exceeded entry")
+        throw new V3WechatSinkError("still offline", "transient", 503)
       },
     })
     const stats = await q2.drainOnce()
-    assert.equal(stats.ttlDropped, 1)
-    assert.equal(await q.pendingCount(), 0)
+    assert.equal(stats.ttlDropped, 0)
+    assert.equal(stats.retried, 1)
+    assert.equal(await q.pendingCount(), 1)
   })
 
-  test("malformed JSON → unlink", async () => {
-    await writeFile(join(dir, "1700000000000-deadbeef.json"), "{not json")
+  test("explicit 410 owner deletion → unlink", async () => {
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
-    const stats = await q.drainOnce()
+    await q.enqueueDurable(entry())
+    const q2 = makeV3WechatRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3WechatSinkError("owner deleted", "fatal", 410)
+      },
+    })
+    const stats = await q2.drainOnce()
     assert.equal(stats.fatalDropped, 1)
     assert.equal(await q.pendingCount(), 0)
   })
 
-  test("schema mismatch (non-wsess sessionId) → unlink", async () => {
+  test("malformed JSON → quarantine without deleting bytes", async () => {
+    await writeFile(join(dir, "1700000000000-deadbeef.json"), "{not json")
+    const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
+    const stats = await q.drainOnce()
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
+    assert.equal(await q.pendingCount(), 0)
+    const names = await readdir(dir)
+    const quarantine = names.find((name) => name.includes(".quarantine-"))
+    assert.ok(quarantine)
+    assert.equal(await readFile(join(dir, quarantine), "utf8"), "{not json")
+  })
+
+  test("schema mismatch (non-wsess sessionId) → quarantine", async () => {
     // 防止旧 schema / 注入 entry 反复 POST 注定 400 fatal
     const bad = entry(basePayload({ sessionId: "personal-sess-xyz" as any }))
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
+    assert.ok((await readdir(dir)).some((name) => name.includes(".quarantine-")))
   })
 
-  test("schema mismatch (bad outboundId charset) → unlink", async () => {
+  test("schema mismatch (bad outboundId charset) → quarantine", async () => {
     const bad = entry(basePayload({ outboundId: "has spaces" }))
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
   })
 
-  test("schema mismatch (missing peer.meta.senderId) → unlink", async () => {
+  test("schema mismatch (missing peer.meta.senderId) → quarantine", async () => {
     const bad = {
       ...entry(),
       payload: {
@@ -289,23 +310,26 @@ describe("drainOnce", () => {
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
   })
 
-  test("schema mismatch (empty blocks) → unlink", async () => {
+  test("schema mismatch (empty blocks) → quarantine", async () => {
     const bad = entry(basePayload({ blocks: [] }))
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
   })
 
-  test("schema mismatch (bad billing requestId) → unlink", async () => {
+  test("schema mismatch (bad billing requestId) → quarantine", async () => {
     const bad = entry(billingPayload({ requestId: "BAD" }))
     await writeFile(join(dir, "1700000000000-cafecafe.json"), JSON.stringify(bad))
     const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
     const stats = await q.drainOnce()
-    assert.equal(stats.fatalDropped, 1)
+    assert.equal(stats.errors, 1)
+    assert.equal(stats.fatalDropped, 0)
   })
 
   test("ENOENT-tolerant when dir doesn't exist", async () => {

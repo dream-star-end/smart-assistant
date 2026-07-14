@@ -1,11 +1,11 @@
 /**
  * P2 债A — handleDelegateTask 收尾产出 server-authored 团队卡 durable 载荷。
  *
- * 委派完成/失败/超时收尾处,应把 `{runId, agentId, goal, status, resultSummary?,
- * completedAt}` 经 `bufferPendingAgentGroup` 挂到父(队长)会话,供其 turn 收尾
+ * 委派完成/失败/超时收尾处,应把完整结果和 block transcript 经
+ * `bufferPendingAgentGroup` 挂到父(队长)会话,供其 turn 收尾
  * 随 persistServerAuthoredTurn 一并下发。这里驱动真实 handleDelegateTask(沿用
  * delegateResourceQueue.test.ts 的 `Object.create(Gateway.prototype)` + 手工 stub
- * 脚手架),断言 buffering 行为(status 三分支 / resultSummary 截断 / 无 webchat 父
+ * 脚手架),断言 buffering 行为(status 三分支 / 长输出无损 / 无 webchat 父
  * 时不物化),不是源码正则。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateTeamCard.test.ts
@@ -18,6 +18,7 @@ import type { DurableAgentGroup } from '@openclaude/protocol'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-teamcard'
 const PARENT_PEER = 'wsess-teamcard'
+const DIRECT_DELEGATE_KEY = 'agent:coding-assistant:delegate:main:1783900000000'
 
 type SubmitImpl = (
   session: unknown,
@@ -25,11 +26,21 @@ type SubmitImpl = (
   onEvent: (e: any) => void,
 ) => Promise<unknown>
 
-function makeGateway(opts: { submit: SubmitImpl; withParent?: boolean }): {
+function makeGateway(opts: {
+  submit: SubmitImpl
+  withParent?: boolean
+  nested?: boolean
+  onInterrupt?: () => void
+  onShutdown?: () => void | Promise<void>
+  onWaitForOutputDrain?: () => void | Promise<void>
+}): {
   gw: any
   buffered: Array<{ sessionKey: string; group: DurableAgentGroup }>
+  directDelegate: any
+  getOrCreateCalls: any[]
 } {
   const buffered: Array<{ sessionKey: string; group: DurableAgentGroup }> = []
+  const getOrCreateCalls: any[] = []
   const parentSession = {
     sessionKey: PARENT_KEY,
     channel: 'webchat',
@@ -37,6 +48,21 @@ function makeGateway(opts: { submit: SubmitImpl; withParent?: boolean }): {
     agentId: 'main',
     userId: '1',
     repoSessionId: undefined,
+    _currentTurnKey: 'a'.repeat(64),
+  }
+  const directDelegate = {
+    sessionKey: DIRECT_DELEGATE_KEY,
+    channel: 'delegate',
+    peerId: 'main',
+    agentId: 'coding-assistant',
+    userId: '1',
+    repoSessionId: PARENT_PEER,
+    parentSessionKey: PARENT_KEY,
+    progressRunId: 'dlg-root',
+    _billingParentTurnKey: 'a'.repeat(64),
+    _durableDelegateTranscript: [] as unknown[],
+    _durableDelegateRuntimeEvents: [] as unknown[],
+    _durableDelegateEngineBillings: [] as unknown[],
   }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false
@@ -61,20 +87,33 @@ function makeGateway(opts: { submit: SubmitImpl; withParent?: boolean }): {
     agents: [
       { id: 'main', provider: 'anthropic', model: 'glm-5.2' },
       { id: 'coding-assistant' },
+      { id: 'researcher' },
     ],
   })
   gw._runLog = { start: () => ({}), complete: () => {} }
   gw.sessions = {
     // team-durability — 一次性委派子会话收尾即销毁(fake 为 no-op,防泄漏语义在生产实现)
     destroySession: async () => {},
-    getByKey: (key: string) =>
-      opts.withParent === false ? undefined : key === PARENT_KEY ? parentSession : undefined,
+    getByKey: (key: string) => {
+      if (opts.withParent === false) return undefined
+      if (key === PARENT_KEY) return parentSession
+      if (opts.nested && key === DIRECT_DELEGATE_KEY) return directDelegate
+      return undefined
+    },
     interrupt: () => false,
-    getOrCreate: async () => ({
-      agentId: 'coding-assistant',
-      currentTurnStatus: null,
-      runner: { interrupt: () => {}, sendPermissionResponse: () => {} },
-    }),
+    getOrCreate: async (input: any) => {
+      getOrCreateCalls.push(input)
+      return {
+        agentId: input.agent?.id ?? 'coding-assistant',
+        currentTurnStatus: null,
+        runner: {
+          interrupt: () => opts.onInterrupt?.(),
+          shutdown: async () => { await opts.onShutdown?.() },
+          waitForOutputDrain: async () => { await opts.onWaitForOutputDrain?.() },
+          sendPermissionResponse: () => {},
+        },
+      }
+    },
     submit: opts.submit,
     // P2 债A — record the durable team-card buffer calls.
     bufferPendingAgentGroup: (sessionKey: string, group: DurableAgentGroup) => {
@@ -84,7 +123,7 @@ function makeGateway(opts: { submit: SubmitImpl; withParent?: boolean }): {
   }
   gw.delivered = [] as any[]
   gw.deliver = (out: any) => gw.delivered.push(out)
-  return { gw, buffered }
+  return { gw, buffered, directDelegate, getOrCreateCalls }
 }
 
 async function delegate(
@@ -132,6 +171,10 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     assert.equal(group.goal, '重构模块')
     assert.equal(group.status, 'ok')
     assert.equal(group.resultSummary, '子任务结果摘要')
+    assert.deepEqual(group.transcript, [
+      { kind: 'text', text: '子任务结果摘要' },
+      { kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } },
+    ])
     assert.match(group.runId, /^dlg-/, 'runId = delegate progress runId')
     assert.ok(group.completedAt >= before && group.completedAt <= Date.now())
   })
@@ -163,7 +206,128 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     assert.equal(buffered[0].group.status, 'timeout', 'timeout 与 failed 可区分')
   })
 
-  it('resultSummary 在生成点截断 ≤2KB(超长输出 → 2000 字符 + 省略号)', async () => {
+  it('真实 timeout race 会等 interrupt 后 submit 收口再物化完整 transcript', async () => {
+    const realNow = Date.now
+    const oldIdle = process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
+    const oldHard = process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
+    const oldCheck = process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
+    let now = realNow()
+    let emit: ((event: any) => void) | undefined
+    let settle: (() => void) | undefined
+    let started!: () => void
+    const submitStarted = new Promise<void>((resolve) => { started = resolve })
+    try {
+      Date.now = () => now
+      process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = '60000'
+      process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = '300000'
+      process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = '1000'
+      const { gw, buffered } = makeGateway({
+        submit: async (_s, _p, onEvent) => {
+          emit = onEvent
+          started()
+          await new Promise<void>((resolve) => { settle = resolve })
+        },
+        onInterrupt: () => {
+          emit?.({ kind: 'block', block: { kind: 'thinking', text: '超时边界完整思考' } })
+          emit?.({ kind: 'block', block: { kind: 'text', text: '超时边界完整正文' } })
+          emit?.({ kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } })
+          settle?.()
+        },
+      })
+      const pending = delegate(gw, 'coding-assistant', taskBody())
+      await submitStarted
+      now += 61_000
+      const r = await pending
+      assert.equal(r.status, 200)
+      assert.equal(buffered.length, 1)
+      assert.equal(buffered[0].group.status, 'timeout')
+      assert.deepEqual(buffered[0].group.transcript, [
+        { kind: 'thinking', text: '超时边界完整思考' },
+        { kind: 'text', text: '超时边界完整正文' },
+        { kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } },
+      ])
+    } finally {
+      Date.now = realNow
+      if (oldIdle === undefined) delete process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
+      else process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = oldIdle
+      if (oldHard === undefined) delete process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
+      else process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = oldHard
+      if (oldCheck === undefined) delete process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
+      else process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = oldCheck
+    }
+  })
+
+  it('timeout 强停后等待真实 stdout drain，再物化 drain 边界内的全部帧', async () => {
+    const realNow = Date.now
+    const oldIdle = process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
+    const oldHard = process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
+    const oldCheck = process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
+    const oldDrain = process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS
+    const oldShutdown = process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS
+    let now = realNow()
+    let emit: ((event: any) => void) | undefined
+    let settle: (() => void) | undefined
+    let started!: () => void
+    let shutdowns = 0
+    const submitStarted = new Promise<void>((resolve) => { started = resolve })
+    try {
+      Date.now = () => now
+      process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = '60000'
+      process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = '300000'
+      process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = '1'
+      process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS = '5'
+      process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS = '5'
+      const { gw, buffered } = makeGateway({
+        submit: async (_s, _p, onEvent) => {
+          emit = onEvent
+          started()
+          await new Promise<void>((resolve) => { settle = resolve })
+        },
+        onShutdown: async () => {
+          shutdowns++
+          emit?.({ kind: 'block', block: { kind: 'thinking', text: '强停前最后思考' } })
+          emit?.({ kind: 'block', block: { kind: 'text', text: '强停前最后正文' } })
+          await new Promise<void>(() => {})
+        },
+        onWaitForOutputDrain: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          emit?.({ kind: 'block', block: { kind: 'thinking', text: '管道关闭前迟到思考' } })
+          emit?.({ kind: 'block', block: { kind: 'text', text: '管道关闭前迟到正文' } })
+          emit?.({ kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } })
+          settle?.()
+        },
+      })
+      const pending = delegate(gw, 'coding-assistant', taskBody())
+      await submitStarted
+      now += 61_000
+      const r = await pending
+      assert.equal(r.status, 200)
+      assert.equal(shutdowns, 1)
+      assert.equal(buffered.length, 1)
+      assert.equal(buffered[0].group.status, 'timeout')
+      assert.deepEqual(buffered[0].group.transcript, [
+        { kind: 'thinking', text: '强停前最后思考' },
+        { kind: 'text', text: '强停前最后正文' },
+        { kind: 'thinking', text: '管道关闭前迟到思考' },
+        { kind: 'text', text: '管道关闭前迟到正文' },
+        { kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } },
+      ])
+    } finally {
+      Date.now = realNow
+      for (const [key, value] of [
+        ['OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS', oldIdle],
+        ['OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS', oldHard],
+        ['OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS', oldCheck],
+        ['OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS', oldDrain],
+        ['OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS', oldShutdown],
+      ] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it('resultSummary 与 transcript 对超长输出完整保留', async () => {
     const long = 'x'.repeat(5000)
     const { gw, buffered } = makeGateway({
       submit: async (_s, _p, onEvent) => {
@@ -173,9 +337,55 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     })
     await delegate(gw, 'coding-assistant', taskBody())
     assert.equal(buffered.length, 1)
-    const summary = buffered[0].group.resultSummary!
-    assert.equal(summary.length, 2001, '2000 字符 + 1 省略号')
-    assert.ok(summary.endsWith('…'))
+    assert.equal(buffered[0].group.resultSummary, long)
+    assert.equal((buffered[0].group.transcript?.[0] as any).text, long)
+  })
+
+  it('委派原始 runtime 事件和最终计费证据随父 turn 卡完整持久化', async () => {
+    const runtimeEvent = {
+      ordinal: 7,
+      observedAt: 1_783_930_000_007,
+      source: 'codex-jsonrpc' as const,
+      payload: {
+        method: 'item/completed',
+        params: {
+          item: {
+            id: 'delegate-item-1',
+            type: 'reasoning',
+            summary: ['原始委派思考'],
+            content: [{ type: 'reasoning_text', text: '逐字保留' }],
+          },
+        },
+      },
+    }
+    const engineBilling = {
+      requestId: 'delegate-request-1',
+      parentTurnKey: 'a'.repeat(64),
+      parentSessionId: PARENT_PEER,
+      delegateAgentId: 'coding-assistant',
+      engineSessionId: 'delegate-engine-session-1',
+      status: 'success' as const,
+      durationMs: 1_234,
+      usage: {
+        input_tokens: 101,
+        output_tokens: 202,
+        cache_read_input_tokens: 33,
+        reasoning_output_tokens: 44,
+      },
+    }
+    const { gw, buffered } = makeGateway({
+      submit: async (session: any, _p, onEvent) => {
+        session._durableDelegateRuntimeEvents.push(structuredClone(runtimeEvent))
+        session._durableDelegateEngineBillings.push(structuredClone(engineBilling))
+        onEvent({ kind: 'block', block: { kind: 'text', text: '委派正文' } })
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 101, outputTokens: 202, turn: 1 } })
+      },
+    })
+    const r = await delegate(gw, 'coding-assistant', taskBody())
+    assert.equal(r.status, 200)
+    assert.equal(buffered.length, 1)
+    assert.deepEqual(buffered[0].group.runtimeEvents, [runtimeEvent])
+    assert.deepEqual(buffered[0].group.engineBillings, [engineBilling])
   })
 
   it('无 webchat 父(progressTarget 缺席)→ 不物化 buffer(降级 client-only,无回归)', async () => {
@@ -190,5 +400,59 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     const r = await delegate(gw, 'coding-assistant', taskBody())
     assert.equal(r.status, 200, '委派本身仍成功')
     assert.equal(buffered.length, 0, '无父会话 → 不 buffer 团队卡')
+  })
+
+  it('嵌套委派把完整后代 transcript 写入直接父卡,并沿用根 turnKey 计费', async () => {
+    const nestedText = '嵌套完整输出'.repeat(10_000)
+    const { gw, buffered, directDelegate, getOrCreateCalls } = makeGateway({
+      nested: true,
+      submit: async (session: any, _p, onEvent) => {
+        session._durableDelegateEngineBillings.push({
+          requestId: 'nested-request-1',
+          parentTurnKey: 'a'.repeat(64),
+          parentSessionId: PARENT_PEER,
+          delegateAgentId: 'researcher',
+          engineSessionId: 'nested-engine-session-1',
+          status: 'success',
+          durationMs: 456,
+          usage: { input_tokens: 2, output_tokens: 3 },
+        })
+        onEvent({ kind: 'block', block: { kind: 'thinking', text: '完整嵌套思考' } })
+        onEvent({ kind: 'block', block: { kind: 'text', text: nestedText } })
+        onEvent({ kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } })
+      },
+    })
+    const r = await delegate(gw, 'researcher', {
+      ...taskBody({
+        goal: '嵌套研究',
+        sourceAgent: 'coding-assistant',
+        parentSessionKey: DIRECT_DELEGATE_KEY,
+      }),
+    })
+    assert.equal(r.status, 200)
+    assert.equal(r.body.output, nestedText, '返回给直接父模型的正文不得截断')
+    assert.equal(buffered.length, 0, '正常嵌套写进一级卡,不另造重复顶层卡')
+    assert.equal(
+      getOrCreateCalls[0].usageAttribution.parentTurnKey,
+      'a'.repeat(64),
+      '嵌套成本仍归根 webchat turn',
+    )
+    const transcript = directDelegate._durableDelegateTranscript as any[]
+    assert.match(transcript[0].text, /嵌套委派 · researcher/)
+    assert.deepEqual(transcript.slice(1), [
+      { kind: 'thinking', text: '完整嵌套思考' },
+      { kind: 'text', text: nestedText },
+      { kind: 'final', meta: { cost: 1, inputTokens: 2, outputTokens: 3, turn: 1 } },
+    ])
+    assert.deepEqual(directDelegate._durableDelegateEngineBillings, [{
+      requestId: 'nested-request-1',
+      parentTurnKey: 'a'.repeat(64),
+      parentSessionId: PARENT_PEER,
+      delegateAgentId: 'researcher',
+      engineSessionId: 'nested-engine-session-1',
+      status: 'success',
+      durationMs: 456,
+      usage: { input_tokens: 2, output_tokens: 3 },
+    }])
   })
 })

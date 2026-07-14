@@ -1,34 +1,51 @@
 /**
- * Egress → master 的 cost 回执发送队列。
+ * Egress → master cost receipt transport.
  *
- * anthropicProxy 的两个 post-commit hook(appendCostCredits 持久化 /
- * broadcastToUser cost_charged 广播)在 split 模式下由本 sink 打包 POST 到
- * master 控制口 /internal/v5/cost-event(见 http/internalCostEvent.ts 头注)。
- *
- * 语义:
- *   - FIFO 单飞发送(保证同一请求 persist 先于 broadcast 到达 master —— 与原
- *     进程内 "persist first, broadcast second" 顺序一致)。
- *   - master 短暂不可达(正在重启 —— 这正是 split 要支撑的场景)→ 事件留队列,
- *     1s 起指数退避重试,单事件最多存活 EVENT_TTL_MS(120s,覆盖一次 master
- *     重启窗口)后丢弃并 warn。计费本身在 PG 早已落定,丢的只是徽章/气泡回执,
- *     且 persist 有 pending_usage_patches GC sweep 兜底路径。
- *   - 队列上限防内存失控;溢出丢最老(同 TTL 语义:回执尽力而为)。
+ * Persist events are written to a fsync'd file-per-event outbox before the
+ * proxy hook resolves. They have no TTL and no overflow eviction: a billed
+ * turn's refresh-visible cost component remains until master acknowledges it.
+ * Broadcast events are live UX hints only and stay in memory. FIFO single-
+ * event sends keep persist-before-broadcast ordering and make persist retries
+ * idempotent without replaying a whole mixed batch.
  */
 
+import { randomBytes } from "node:crypto";
+import {
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { join } from "node:path";
 import { request as undiciRequest } from "undici";
 
-import { rootLogger, type Logger } from "../logging/logger.js";
-import { COST_EVENT_PATH, EGRESS_SECRET_HEADER, type CostEvent } from "../http/internalCostEvent.js";
+import { paths } from "@openclaude/storage";
 
-const EVENT_TTL_MS = 120_000;
-const MAX_QUEUE = 2_000;
-const MAX_BATCH = 32;
+import { rootLogger, type Logger } from "../logging/logger.js";
+import {
+  COST_EVENT_PATH,
+  EGRESS_SECRET_HEADER,
+  type CostEvent,
+  type CostEventBroadcast,
+  type CostEventPersist,
+} from "../http/internalCostEvent.js";
+
 const BASE_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 10_000;
 const ATTEMPT_TIMEOUT_MS = 5_000;
 
 interface QueuedEvent {
   ev: CostEvent;
+  enqueuedAt: number;
+  /** Present only for fsync'd persist events. */
+  receipt?: string;
+}
+
+interface DurableCostEventFile {
+  schemaVersion: 1;
+  ev: CostEventPersist;
   enqueuedAt: number;
 }
 
@@ -39,25 +56,21 @@ export interface CostEventSinkOpts {
   logger?: Logger;
   fetcher?: typeof undiciRequest;
   now?: () => number;
+  /** Override only for tests. */
+  dir?: string;
 }
 
 /**
- * egress /healthz 暴露的单调计数器快照(RFC-v5-dual-master-cohort §4 D3④)。
- * finalize 门槛按"两次采样差分 + startId 未变"判断队列是否真排空(计数归零假绿被
- * startId 变化拦截)。全部单调递增,drop 分类计数;不改任何计费行为,纯观测。
+ * egress /healthz compatibility counters. Drop counters remain in the wire
+ * shape so deploy tooling can verify they stay exactly zero after the
+ * lossless policy removed TTL and queue-overflow deletion.
  */
 export interface CostSinkHealthCounters {
-  /** 当前队列长度(= 尚未成功发送的回执数)。 */
   pendingCostEvents: number;
-  /** 累计入队事件数(单调)。 */
   enqueuedTotal: number;
-  /** 累计成功发送到 master 的事件数(单调)。 */
   sentTotal: number;
-  /** 累计因 TTL 过期被丢弃的事件数(单调)。 */
   expiredDropsTotal: number;
-  /** 累计因队列上限溢出被丢弃(丢最老)的事件数(单调)。 */
   overflowDropsTotal: number;
-  /** 队首事件已等待的毫秒数(队列空 → 0);判断 backlog 老化。 */
   oldestPendingAgeMs: number;
 }
 
@@ -66,38 +79,56 @@ export class CostEventSink {
   private readonly log: Logger;
   private readonly fetcher: typeof undiciRequest;
   private readonly now: () => number;
+  private readonly dir: string;
   private sending = false;
   private inflightPump: Promise<void> | null = null;
+  private initPromise: Promise<void> | null = null;
   private retryMs = BASE_RETRY_MS;
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
-  // ── 单调计数器(D3④ finalize 门槛差分用;纯观测,不影响计费/发送行为)──
   private enqueuedTotal = 0;
   private sentTotal = 0;
-  private expiredDropsTotal = 0;
-  private overflowDropsTotal = 0;
 
   constructor(private readonly opts: CostEventSinkOpts) {
     this.log = (opts.logger ?? rootLogger).child({ subsys: "costEventSink" });
     this.fetcher = opts.fetcher ?? undiciRequest;
     this.now = opts.now ?? Date.now;
+    this.dir = opts.dir ?? join(paths.home, "v5-egress-cost-retry.d");
   }
 
-  enqueue(ev: CostEvent): void {
+  /** Load every durable persist receipt before accepting proxy traffic. */
+  init(): Promise<void> {
+    if (!this.initPromise) this.initPromise = this.loadDurableQueue();
+    return this.initPromise;
+  }
+
+  /** Live-only broadcast. The corresponding persist event is queued first. */
+  enqueue(ev: CostEventBroadcast): void {
     if (this.stopped) return;
     this.queue.push({ ev, enqueuedAt: this.now() });
     this.enqueuedTotal += 1;
-    if (this.queue.length > MAX_QUEUE) {
-      const dropped = this.queue.shift();
-      this.overflowDropsTotal += 1;
-      this.log.warn("cost_event_queue_overflow_drop_oldest", { kind: dropped?.ev.kind });
-    }
     void this.pump();
   }
 
-  /** 进程退出前尽力清空(不保证;不阻塞超过几秒由调用方控制)。
-   *  与 enqueue 触发的在飞 pump 汇合后再补一轮,保证"入队即 flush"不竞态漏发。 */
+  /** Fsync a billed-turn cost component before returning to the proxy hook. */
+  async enqueueDurable(ev: CostEventPersist): Promise<void> {
+    if (this.stopped) throw new Error("cost event sink is stopped");
+    await this.init();
+    const enqueuedAt = this.now();
+    const receipt = `${enqueuedAt}-${randomBytes(8).toString("hex")}.json`;
+    await this.atomicWriteJson(join(this.dir, receipt), {
+      schemaVersion: 1,
+      ev,
+      enqueuedAt,
+    } satisfies DurableCostEventFile);
+    this.queue.push({ ev, enqueuedAt, receipt });
+    this.enqueuedTotal += 1;
+    void this.pump();
+  }
+
+  /** Join the current attempt and run one more pass. Failure leaves receipts. */
   async flush(): Promise<void> {
+    await this.init();
     if (this.inflightPump) await this.inflightPump;
     await this.pump();
     if (this.inflightPump) await this.inflightPump;
@@ -112,18 +143,47 @@ export class CostEventSink {
     return this.queue.length;
   }
 
-  /** D3④ finalize 门槛用的健康计数器快照(单调计数 + 队首老化 + 当前 pending)。 */
   healthCounters(): CostSinkHealthCounters {
     const oldestPendingAgeMs =
-      this.queue.length > 0 ? this.now() - this.queue[0]!.enqueuedAt : 0;
+      this.queue.length > 0 ? Math.max(0, this.now() - this.queue[0]!.enqueuedAt) : 0;
     return {
       pendingCostEvents: this.queue.length,
       enqueuedTotal: this.enqueuedTotal,
       sentTotal: this.sentTotal,
-      expiredDropsTotal: this.expiredDropsTotal,
-      overflowDropsTotal: this.overflowDropsTotal,
+      expiredDropsTotal: 0,
+      overflowDropsTotal: 0,
       oldestPendingAgeMs,
     };
+  }
+
+  private async loadDurableQueue(): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+    const names = (await readdir(this.dir))
+      .filter((name) => name.endsWith(".json") && !name.includes(".tmp-"))
+      .sort();
+    for (const receipt of names) {
+      const filepath = join(this.dir, receipt);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await readFile(filepath, "utf8"));
+      } catch (err) {
+        this.log.warn("cost_event_durable_file_malformed_quarantined", {
+          receipt,
+          err: (err as Error).message,
+        });
+        await this.quarantine(filepath, "malformed");
+        continue;
+      }
+      if (!isDurableCostEventFile(parsed)) {
+        this.log.warn("cost_event_durable_file_schema_quarantined", { receipt });
+        await this.quarantine(filepath, "schema");
+        continue;
+      }
+      this.queue.push({ ev: parsed.ev, enqueuedAt: parsed.enqueuedAt, receipt });
+      this.enqueuedTotal += 1;
+    }
+    await this.fsyncDir();
+    if (this.queue.length > 0) void this.pump();
   }
 
   private scheduleRetry(): void {
@@ -134,18 +194,6 @@ export class CostEventSink {
     }, this.retryMs);
     this.timer.unref?.();
     this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
-  }
-
-  private evictExpired(): void {
-    const cutoff = this.now() - EVENT_TTL_MS;
-    while (this.queue.length > 0 && this.queue[0]!.enqueuedAt < cutoff) {
-      const dropped = this.queue.shift()!;
-      this.expiredDropsTotal += 1;
-      this.log.warn("cost_event_expired_dropped", {
-        kind: dropped.ev.kind,
-        ageMs: this.now() - dropped.enqueuedAt,
-      });
-    }
   }
 
   private pump(): Promise<void> {
@@ -162,9 +210,9 @@ export class CostEventSink {
     this.sending = true;
     try {
       while (this.queue.length > 0) {
-        this.evictExpired();
-        if (this.queue.length === 0) break;
-        const batch = this.queue.slice(0, MAX_BATCH);
+        // One event per request: a persist retry is idempotent, and a live
+        // broadcast is never replayed merely because a later persist failed.
+        const item = this.queue[0]!;
         try {
           const r = await this.fetcher(`${this.opts.controlBaseUrl}${COST_EVENT_PATH}`, {
             method: "POST",
@@ -172,26 +220,90 @@ export class CostEventSink {
               "content-type": "application/json",
               [EGRESS_SECRET_HEADER]: this.opts.secret,
             },
-            body: JSON.stringify({ events: batch.map((q) => q.ev) }),
+            body: JSON.stringify({ events: [item.ev] }),
             headersTimeout: ATTEMPT_TIMEOUT_MS,
             bodyTimeout: ATTEMPT_TIMEOUT_MS,
           });
           await r.body.text().catch(() => "");
           if (r.statusCode !== 200) throw new Error(`HTTP ${r.statusCode}`);
-          this.queue.splice(0, batch.length);
-          this.sentTotal += batch.length;
+          if (item.receipt) {
+            await this.unlinkIgnoreEnoent(join(this.dir, item.receipt));
+            await this.fsyncDir();
+          }
+          this.queue.shift();
+          this.sentTotal += 1;
           this.retryMs = BASE_RETRY_MS;
         } catch (err) {
           this.log.warn("cost_event_send_failed_will_retry", {
             pending: this.queue.length,
+            kind: item.ev.kind,
+            durable: item.receipt !== undefined,
             err: (err as Error).message,
           });
           this.scheduleRetry();
-          return; // 保序:失败即停,等重试 timer
+          return;
         }
       }
     } finally {
       this.sending = false;
     }
   }
+
+  private async atomicWriteJson(filepath: string, value: DurableCostEventFile): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+    const tmp = `${filepath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+    const fh = await open(tmp, "w");
+    try {
+      await fh.writeFile(JSON.stringify(value), "utf8");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, filepath);
+    await this.fsyncDir();
+  }
+
+  private async fsyncDir(): Promise<void> {
+    const fh = await open(this.dir, "r");
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  }
+
+  private async quarantine(filepath: string, reason: string): Promise<void> {
+    try {
+      await rename(filepath, `${filepath}.quarantine-${reason}-${this.now()}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  private async unlinkIgnoreEnoent(filepath: string): Promise<void> {
+    try {
+      await unlink(filepath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+}
+
+function isDurableCostEventFile(value: unknown): value is DurableCostEventFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (obj.schemaVersion !== 1 || typeof obj.enqueuedAt !== "number" || !Number.isFinite(obj.enqueuedAt)) {
+    return false;
+  }
+  const ev = obj.ev;
+  if (!ev || typeof ev !== "object" || Array.isArray(ev)) return false;
+  const event = ev as Record<string, unknown>;
+  return event.kind === "persist" &&
+    typeof event.requestId === "string" &&
+    typeof event.uid === "string" && /^\d+$/.test(event.uid) &&
+    typeof event.costCredits === "string" && /^\d+$/.test(event.costCredits) &&
+    (event.turnKey === undefined || event.turnKey === null ||
+      (typeof event.turnKey === "string" && /^[0-9a-f]{64}$/.test(event.turnKey))) &&
+    (event.parentTurnKey === undefined || event.parentTurnKey === null ||
+      (typeof event.parentTurnKey === "string" && /^[0-9a-f]{64}$/.test(event.parentTurnKey)));
 }

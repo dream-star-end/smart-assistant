@@ -31,6 +31,48 @@ import type { CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
+const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
+const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
+
+function runnerShutdownTimeoutMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+}
+
+function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (closed: boolean) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(closed)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    closePromise.then(() => finish(true))
+  })
+}
+
+function killCodexProcessGroup(
+  proc: ChildProcessWithoutNullStreams,
+  signal: NodeJS.Signals,
+): void {
+  try {
+    if (typeof proc.pid === 'number' && proc.pid > 0) {
+      process.kill(-proc.pid, signal)
+      return
+    }
+  } catch {
+    // Fall back to the direct child if the detached process group is already
+    // gone or unavailable on this platform.
+  }
+  try {
+    proc.kill(signal)
+  } catch {
+    /* ignore */
+  }
+}
+
 const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
   'You are in implementation mode, not plan-only mode.',
   'Decide autonomously whether the user request benefits from a visible plan/task list before or during execution.',
@@ -463,62 +505,13 @@ function _isContextCompactionItem(item: unknown): item is Record<string, unknown
   return _normaliseCodexItemType((item as Record<string, unknown>).type) === 'contextCompaction'
 }
 
-/** item 完成事件 fallback 发射的 JSON payload 预算(字符)。 */
-const _ITEM_RESULT_JSON_BUDGET = 2000
-/** 截断尾标 — 与 ccbMessageParser 的 `…[truncated]` 惯例一致。 */
-const _ITEM_TRUNCATE_TAIL = '…[truncated]'
-
-/** 递归截断字符串叶子(mcpToolCall 的 result.content[].text、webSearch 的
- *  results[].snippet 等大文本都在叶子上),结构与短 wrapper 字段原样保留。 */
-function _truncateStringLeaves(value: unknown, cap: number): unknown {
-  if (typeof value === 'string') {
-    if (value.length <= cap) return value
-    let head = value.slice(0, cap)
-    // 不在代理对中间断开(断开虽仍是合法 JSON——stringify 会把孤立代理转义成
-    // \uXXXX——但前端回显会出现 U+FFFD)。
-    const last = head.charCodeAt(head.length - 1)
-    if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1)
-    return head + _ITEM_TRUNCATE_TAIL
-  }
-  if (Array.isArray(value)) return value.map((v) => _truncateStringLeaves(v, cap))
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value)) out[k] = _truncateStringLeaves(v, cap)
-    return out
-  }
-  return value
-}
-
-/** 把 item 序列化成 ≤budget 字符的**合法 JSON**。历史实现对 stringify 结果整体
- *  `.slice(0, 2000)`,超预算的 item(大结果 MCP 调用如 web 检索)被截成非法 JSON,
- *  前端 pickCodexItem 解析失败退回丑 JSON dump。现改为先截内层字符串叶子再完整
- *  stringify:逐级收紧叶子上限直到整体进预算;极端形状(海量键/超长数组,叶子
- *  截完仍超)退化为只保留定位字段的骨架 —— 任何分支发出的都是可 parse 的 JSON。 */
+/** Full item JSON. The old 2,000-character preview budget silently discarded
+ * paid tool/MCP output; Turn Tape now handles transport/storage size instead. */
 export function _stringifyItemBounded(
   item: unknown,
-  budget = _ITEM_RESULT_JSON_BUDGET,
+  _legacyBudget?: number,
 ): string {
-  let full: string
-  try {
-    full = JSON.stringify(item) ?? 'null'
-  } catch {
-    // item 来自 JSON-RPC 解析,理论上必可序列化;纯防御。
-    return JSON.stringify({ truncated: true })
-  }
-  if (full.length <= budget) return full
-  // 叶子上限逐级减半:字符串转义(\n → \\n 等)可能放大序列化长度,一档不够就
-  // 收紧下一档。上限 1200 给 wrapper(type/server/tool/status 等)留足余量。
-  for (const cap of [1200, 600, 300, 120, 48]) {
-    const bounded = JSON.stringify(_truncateStringLeaves(item, cap))
-    if (bounded.length <= budget) return bounded
-  }
-  // 骨架兜底:类型/工具名等定位信息不丢,前端至少能渲染出正确的卡片标题。
-  const o = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
-  const skeleton: Record<string, unknown> = { truncated: true }
-  for (const key of ['id', 'type', 'status', 'server', 'tool', 'name', 'query']) {
-    if (typeof o[key] === 'string') skeleton[key] = (o[key] as string).slice(0, 120)
-  }
-  return JSON.stringify(skeleton)
+  return JSON.stringify(item) ?? 'null'
 }
 
 /** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
@@ -787,7 +780,14 @@ export class CodexAppServerRunner extends EventEmitter {
     resolve: (turn: { status?: string; durationMs?: number; error?: { message?: string } }) => void
     reject: (err: Error) => void
   } | null = null
+  /** Request id of the currently executing paid turn. Needed to settle usage
+   * correctly if shutdown wins the race with turn/completed. */
+  private activeRequestId: string | undefined
+  private forcedShutdownResultEmitted = false
   private stdoutBuf = ''
+  /** Current app-server generation's full stdio-close barrier. */
+  private outputDrainPromise: Promise<void> = Promise.resolve()
+  private resolveOutputDrain: (() => void) | null = null
   /** Accumulated assistant text for the current turn — used to dedupe
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
@@ -857,36 +857,11 @@ export class CodexAppServerRunner extends EventEmitter {
    *  id,跨 turn 保留会既泄漏又可能与新 turn 的 id 撞车漏发 tool_use。 */
   private emittedToolUseIds = new Set<string>()
 
-  /** Per-reasoning-item state for `item/reasoning/*` notifications. Keyed
-   *  by codex itemId so concurrent reasoning items (rare, but legal under
-   *  the protocol) don't cross-contaminate.
-   *
-   *  - `mode`: the first delta type observed for an item locks the channel:
-   *    `'summary'` after a `summaryTextDelta` / `summaryPartAdded`, or
-   *    `'text'` after a raw `textDelta`. Subsequent deltas of the OTHER
-   *    type are dropped — codex review CONCERN #1 (summary→text) +
-   *    v2 follow-up (text→summary): emitting BOTH for one item would
-   *    concatenate raw chain-of-thought with the model's distilled
-   *    summary in the UI. The lock is symmetric because we can't un-emit
-   *    a delta that already reached the wire, so whichever stream starts
-   *    first wins for that itemId. Codex CLI shows summary when both are
-   *    produced; raw text is the implicit fallback for models without a
-   *    summary surface (it locks `'text'` and any late summary is dropped).
-   *  - `sawContent`: true once at least one delta has reached the UI for
-   *    this itemId. The first `summaryPartAdded` for an item is a no-op
-   *    (codex review CONCERN #2: emitting `\n\n` before any content would
-   *    surface a leading blank line and could spawn an empty thinking
-   *    card). It still preemptively locks summary mode so a concurrent
-   *    `textDelta` is suppressed. Subsequent `summaryPartAdded` between
-   *    content blocks correctly inserts a paragraph separator. If the
-   *    item is already text-locked, `summaryPartAdded` is dropped entirely
-   *    (codex review v2 follow-up: orphan `\n\n` between text deltas).
-   *
-   *  Cleared in `runTurn` finally so each turn starts with an empty map. */
-  private reasoningItemState: Map<
-    string,
-    { mode: 'summary' | 'text' | null; sawContent: boolean }
-  > = new Map()
+  /** Per-reasoning-item state for `item/reasoning/*` notifications. Both raw
+   * text and summary deltas are paid model output and are therefore emitted
+   * in arrival order; the state only suppresses a leading empty paragraph
+   * before the first real delta. Cleared at every turn boundary. */
+  private reasoningItemState: Map<string, { sawContent: boolean }> = new Map()
   /** Codex 0.137 collaboration APIs model subagents as thread receivers.
    *  The web UI, however, already has a stable Agent-card contract keyed by
    *  the spawning tool_use id. Keep a small per-turn reverse index so later
@@ -1208,26 +1183,50 @@ export class CodexAppServerRunner extends EventEmitter {
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
     this.shuttingDown = true
-    if (this.proc && !this.proc.killed) {
-      try {
-        this.proc.kill('SIGTERM')
-      } catch {
-        /* ignore */
-      }
-      const p = this.proc
-      setTimeout(() => {
-        if (p && !p.killed) {
-          try {
-            p.kill('SIGKILL')
-          } catch {
-            /* ignore */
-          }
-        }
-      }, 3000)
-    }
-    const pending = this.queue
+    const pendingQueue = this.queue
     this.queue = []
-    for (const q of pending) q.reject(new Error('CodexAppServerRunner shutdown'))
+    for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    const proc = this.proc
+    if (proc) {
+      let resolveClose!: () => void
+      const closePromise = new Promise<void>((resolve) => { resolveClose = resolve })
+      const onClose = () => resolveClose()
+      proc.once('close', onClose)
+      if (proc.exitCode === null && proc.signalCode === null) {
+        killCodexProcessGroup(proc, 'SIGTERM')
+      }
+      let closed = await waitForCloseWithin(
+        closePromise,
+        runnerShutdownTimeoutMs(
+          'OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS',
+          RUNNER_SHUTDOWN_GRACE_DEFAULT_MS,
+        ),
+      )
+      if (!closed) {
+        killCodexProcessGroup(proc, 'SIGKILL')
+        closed = await waitForCloseWithin(
+          closePromise,
+          runnerShutdownTimeoutMs(
+            'OPENCLAUDE_RUNNER_SHUTDOWN_FINAL_DRAIN_MS',
+            RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS,
+          ),
+        )
+      }
+      if (!closed) {
+        proc.removeListener('close', onClose)
+        log.error('codex app-server close did not arrive after process-group SIGKILL', {
+          sessionKey: this.opts.sessionKey,
+          pid: proc.pid,
+        })
+        // Keep the exact process identity and stdout parser attached. A
+        // descendant may still own the pipe; clearing `this.proc` here used to
+        // discard those late bytes and let SessionManager finalize a partial
+        // immutable tape. The normal close handler will finish billing and the
+        // tape whenever the pipe actually closes. New submits remain queued
+        // behind `shuttingDown` rather than racing this unfinished turn.
+        return
+      }
+    }
     // Reject any in-flight JSON-RPC requests so callers don't hang forever.
     for (const [, p] of this.pending) {
       p.reject(new Error('CodexAppServerRunner shutdown'))
@@ -1244,7 +1243,10 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentCollabAgentPolicy = undefined
     this.initialized = false
     this.attached = false
-    this.proc = null
+    // The proc close event (awaited above) is the stdout-drained boundary.
+    // Only now may we clear the identity pointer; clearing it earlier made the
+    // stdout identity guard discard bytes already emitted by Codex.
+    if (this.proc === proc) this.proc = null
     this.spawnedProviderSignature = null
     this.stdoutBuf = ''
     // Per-turn 配对台账随进程一起丢弃(下一 turn 会在 runTurn 顶部重新清空)。
@@ -1256,16 +1258,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // every prior turn's tokens. Resetting our baseline would over-bill the
     // first turn after a respawn by the entire thread total.
     //
-    // Mid-turn shutdown: if activeTurnTotal has a value (we received at least
-    // one tokenUsage notification this turn before being killed), promote it
-    // to priorTurnTotal so the NEXT turn's delta baseline accounts for the
-    // tokens consumed by the killed turn. Without this, those tokens would
-    // be attributed to the next turn (skewing its bill upward) or lost if
-    // there is no next turn. The killed turn itself is NOT billed — its
-    // emitResult goes through the catch path with no usagePayload.
-    if (this.activeTurnTotal !== null) {
-      this.priorTurnTotal = this.activeTurnTotal
-    }
+    // The proc close handler emits a usage-bearing forced result before it
+    // rejects the completer, so killed-turn tokens are billed to this turn.
     this.activeTurnTotal = null
     this.currentTurnUsage = null
     // Tear down the per-spawn launch overrides so the next post-shutdown
@@ -1273,8 +1267,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // overrides reference after we rmSync the dir would point codex at a
     // deleted file on respawn.
     this.cleanupLaunchOverrides()
-    this.emit('exit', { code: 0, signal: null, crashed: false })
     this.shuttingDown = false
+  }
+
+  /** Capture-by-value barrier for the current app-server generation. */
+  waitForOutputDrain(): Promise<void> {
+    return this.outputDrainPromise
   }
 
   // ─── internals ────────────────────────────────
@@ -1389,6 +1387,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const proc = _spawnFn('codex', args, {
       cwd: effectiveCwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
       // buildCodexEnv() scrub 掉全部 OPENCLAUDE_*(安全红线,防内部 token/URL 泄漏给
       // codex/chatgpt 后端)。但 oc-memory CLI(模型经 bash 调,继承本进程 env)需要知道
       // 自己是哪个 agent 才能读写正确的 MEMORY.md/USER.md/archival —— 否则非 main agent
@@ -1399,6 +1398,9 @@ export class CodexAppServerRunner extends EventEmitter {
       env: { ...buildCodexEnv(), OC_AGENT_ID: this.opts.agentId },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    this.outputDrainPromise = new Promise<void>((resolve) => {
+      this.resolveOutputDrain = resolve
+    })
     this.spawnedProviderSignature = providerSignature
     proc.stdout.on('data', (chunk: Buffer) => {
       // Identity guard (Codex review #019dde20 BLOCKER round 2): a stale
@@ -1444,14 +1446,9 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       log.error('codex app-server proc error', { err: err.message })
       this.emit('error', err)
-      this.failAllPending(`codex app-server process error: ${err.message}`)
-      this.proc = null
-      this.spawnedProviderSignature = null
-      this.initialized = false
-      this.attached = false
-      // stdoutBuf cleared so any partial-line residue doesn't poison the
-      // next proc's first response (see ensureSpawned for fuller comment).
-      this.stdoutBuf = ''
+      // `error` can precede `close`. Keep the exact process identity, pending
+      // turn, and partial JSON line alive until the stdio-drained close
+      // boundary; otherwise late paid output is silently discarded.
     })
     proc.on('close', (code, signal) => {
       // Identity check: see the `error` handler comment. Without this, the
@@ -1470,13 +1467,22 @@ export class CodexAppServerRunner extends EventEmitter {
         code,
         signal,
       })
+      // Preserve a final complete JSON-RPC object even if the process died
+      // before writing its trailing newline.
+      if (this.stdoutBuf.length > 0) {
+        const trailing = this.stdoutBuf.trim()
+        this.stdoutBuf = ''
+        if (trailing) this.handleLine(trailing)
+      }
+      this.resolveOutputDrain?.()
+      this.resolveOutputDrain = null
       const wasShutdown = this.shuttingDown
       // Reject any remaining pending JSON-RPC requests AND the in-flight turn
       // promise so callers don't hang. emitResult is the responsibility of
       // runTurn's catch — we just unwedge promises here.
-      if (!wasShutdown) {
-        this.failAllPending(`codex app-server exited code=${code} signal=${signal ?? ''}`)
-      }
+      const closeReason = `codex app-server exited code=${code} signal=${signal ?? ''}`
+      if (wasShutdown) this.emitForcedShutdownResult(closeReason)
+      this.failAllPending(closeReason)
       this.proc = null
       this.spawnedProviderSignature = null
       this.initialized = false
@@ -1496,6 +1502,7 @@ export class CodexAppServerRunner extends EventEmitter {
         signal,
         crashed: code != null && code !== 0 && !wasShutdown,
       })
+      if (wasShutdown) this.shuttingDown = false
     })
 
     // JSON-RPC handshake. `collaborationMode` and related plan-first fields
@@ -1515,6 +1522,39 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter.reject(new Error(reason))
       this.currentTurnCompleter = null
     }
+  }
+
+  /** Emit one synthetic terminal result after a forced process shutdown. This
+   * runs only at the stdout `close` boundary, so every preceding notification
+   * has already updated `activeTurnTotal` and the parser buffers. */
+  private emitForcedShutdownResult(reason: string): void {
+    if (this.forcedShutdownResultEmitted) return
+    if (!this.currentTurnCompleter && this.activeTurnId === null) return
+    this.forcedShutdownResultEmitted = true
+    const turnUsage = this.consumeActiveTurnUsage()
+    const usage = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
+    this.emitResult({
+      durationMs: 0,
+      ok: false,
+      error: reason,
+      usage,
+      requestId: this.activeRequestId,
+      rateLimits: this._consumeRateLimitsForEmit(),
+      stopReason: 'interrupted',
+    })
+  }
+
+  /** Move the latest cumulative usage snapshot into this turn exactly once.
+   * Normal, crash, and forced-stop paths share this so killed-turn usage can
+   * never be promoted into the next baseline without a billing frame. */
+  private consumeActiveTurnUsage(): CodexTokenBreakdown | null {
+    if (this.activeTurnTotal === null) return null
+    const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
+    const delta = _subtractTokenBreakdown(this.activeTurnTotal, baseline)
+    this.currentTurnUsage = delta
+    this.priorTurnTotal = this.activeTurnTotal
+    this.activeTurnTotal = null
+    return delta
   }
 
   /**
@@ -1687,6 +1727,20 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private handleLine(line: string): void {
+    // Preserve the exact app-server JSON-RPC object before any UI projection,
+    // filtering or normalization. The per-turn parser stores this opaque event
+    // in the immutable tape, so command exit codes, full file-change objects,
+    // collaboration payloads, reasoning items and future protocol fields all
+    // survive refresh even when the compact UI card shows only a summary.
+    if (this.currentTurnCompleter || this.activeTurnId) {
+      let payload: unknown
+      try {
+        payload = JSON.parse(line)
+      } catch {
+        payload = { rawLine: line, parseError: true }
+      }
+      this.emit('runtime_event', payload)
+    }
     const msg = _classifyJsonRpcLine(line)
     if (msg.kind === 'unknown') {
       this.emit('parse_error', { line, error: 'unknown JSON-RPC shape' })
@@ -1919,28 +1973,15 @@ export class CodexAppServerRunner extends EventEmitter {
     // surface claude-code uses. Turn-level persistence is owned by
     // CcbMessageParser's `thinkingBuf`; the runner only routes packets.
     //
-    // Mode resolution (per-itemId): the FIRST delta type seen for an item
-    // locks the mode. Subsequent deltas of the opposite type are dropped.
-    // The lock is symmetric (codex review v2 CONCERN — text-first then
-    // late summary would otherwise still splice the two streams): we can't
-    // un-emit a delta that already reached the UI, so once one stream
-    // starts the other must be suppressed for that itemId. The protocol
-    // doesn't guarantee an order, so this avoids "raw chain-of-thought +
-    // distilled summary" concatenation in either direction. Different
-    // reasoning items track independently (each gets its own lock).
+    // Lossless policy: if codex emits both raw text and a distilled summary
+    // for the same item, preserve both in wire arrival order. They may be
+    // redundant, but choosing one would irreversibly discard paid output.
     if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
       const itemId = typeof p.itemId === 'string' ? p.itemId : ''
       if (itemId) {
-        const wantMode: 'summary' | 'text' =
-          method === 'item/reasoning/summaryTextDelta' ? 'summary' : 'text'
-        const st = this.reasoningItemState.get(itemId) ?? { mode: null, sawContent: false }
-        if (st.mode !== null && st.mode !== wantMode) {
-          // Item already committed to the other stream → drop to avoid splicing.
-          return
-        }
-        st.mode = wantMode
+        const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
         st.sawContent = true
         this.reasoningItemState.set(itemId, st)
       }
@@ -1955,25 +1996,13 @@ export class CodexAppServerRunner extends EventEmitter {
       } as unknown as RunnerMessage)
       return
     }
-    // Summary parts are emitted as a sequence of named sections. Two
-    // suppression conditions:
-    //   1. First `summaryPartAdded` for an item: skip the `\n\n` emit —
-    //      it's the start of part 1, so there's nothing to separate from
-    //      (codex review v2 CONCERN #2). Still locks the item into summary
-    //      mode preemptively so a concurrent textDelta is suppressed.
-    //   2. Item already locked to `text` mode (raw chain-of-thought already
-    //      streamed): drop the separator entirely — any subsequent
-    //      summaryTextDelta would be suppressed by the mode lock above, so
-    //      an orphan `\n\n` between text deltas would just inject a noise
-    //      paragraph break (codex review v2 follow-up).
+    // Summary parts are structural model events. Avoid only a leading empty
+    // paragraph; once any content exists, retain every part boundary.
     if (method === 'item/reasoning/summaryPartAdded') {
       const itemId = typeof p.itemId === 'string' ? p.itemId : ''
       if (!itemId) return
-      const st = this.reasoningItemState.get(itemId) ?? { mode: null, sawContent: false }
-      if (st.mode === 'text') return // condition 2 — item already on the text stream
+      const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
       if (!st.sawContent) {
-        // condition 1 — first part for this item, preemptively lock summary mode
-        st.mode = 'summary'
         this.reasoningItemState.set(itemId, st)
         return
       }
@@ -2023,6 +2052,14 @@ export class CodexAppServerRunner extends EventEmitter {
             itemType,
             itemId,
             err: (err as Error).message,
+          })
+          this.emit('runtime_event', {
+            type: 'openclaude_handler_error',
+            handler: 'handleItemCompleted',
+            item: structuredClone(itemUnk),
+            error: err instanceof Error
+              ? { name: err.name, message: err.message, stack: err.stack }
+              : { value: String(err) },
           })
         })
         .finally(() => {
@@ -2457,6 +2494,8 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
   ): Promise<void> {
     const startedAt = Date.now()
+    this.activeRequestId = requestId
+    this.forcedShutdownResultEmitted = false
     // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
     // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
     // 都会出现撕裂窗口(spawn cwd 用了 ready,attach cwd 拿到 cloning 之类)。
@@ -2610,17 +2649,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // thread/tokenUsage/updated snapshot we observed during this turn.
       // If codex never emitted one (e.g. an empty/no-LLM turn or a cancelled
       // turn before the first call settled), fall through with usage=undefined.
-      let turnUsage: CodexTokenBreakdown | null = null
-      if (this.activeTurnTotal) {
-        const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
-        turnUsage = _subtractTokenBreakdown(this.activeTurnTotal, baseline)
-        this.currentTurnUsage = turnUsage
-        // Promote the active total to the new baseline only on a settled turn
-        // — for failed/interrupted turns the codex thread state may still
-        // include partially-charged tokens, which is fine to baseline against.
-        this.priorTurnTotal = this.activeTurnTotal
-      }
-      this.activeTurnTotal = null
+      const turnUsage = this.consumeActiveTurnUsage()
       log.info('codex app-server turn end', {
         sessionKey: this.opts.sessionKey,
         status,
@@ -2712,6 +2741,7 @@ export class CodexAppServerRunner extends EventEmitter {
       if (this.inflightItemHandlers.size > 0) {
         await Promise.allSettled([...this.inflightItemHandlers])
       }
+      const failedTurnUsage = this.consumeActiveTurnUsage()
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
@@ -2723,6 +2753,9 @@ export class CodexAppServerRunner extends EventEmitter {
         durationMs,
         ok: false,
         error: `codex app-server: ${(err as Error).message}`,
+        usage: failedTurnUsage
+          ? _codexUsageToAnthropicShape(failedTurnUsage)
+          : undefined,
         requestId,
         // Issue A v1.0.108 — catch 路径也走 dedup helper(notification 与 turn 异常
         // 不耦合,init 阶段可能已经收到过快照,但若上一 turn 已发同值就别再发)。
@@ -2732,6 +2765,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // upstream sessionManager handles errors via the result message above.
     } finally {
       this.currentCollabAgentPolicy = undefined
+      this.activeRequestId = undefined
     }
   }
 

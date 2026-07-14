@@ -34,12 +34,14 @@ function ccbUserId(extra: Record<string, string> = {}): string {
 }
 
 describe("extractUsageAttribution — delegate 打标提取", () => {
-  test("完整 delegate 三键 → mode/parent/delegateAgent 全提取,sessionId 仍是引擎 UUID", () => {
+  test("完整 delegate 定位键 → session/parent/agent/turn 全提取", () => {
     const got = extractUsageAttribution({
       user_id: ccbUserId({
         oc_mode: "delegate",
         oc_parent_session_id: "web-mo7ho2z4-0fojstsu",
         oc_delegate_agent_id: "hidden-reviewer",
+        oc_turn_key: "a".repeat(64),
+        oc_parent_turn_key: "b".repeat(64),
       }),
     });
     assert.deepEqual(got, {
@@ -47,6 +49,8 @@ describe("extractUsageAttribution — delegate 打标提取", () => {
       mode: "delegate",
       parentSessionId: "web-mo7ho2z4-0fojstsu",
       delegateAgentId: "hidden-reviewer",
+      turnKey: "a".repeat(64),
+      parentTurnKey: "b".repeat(64),
     });
   });
 
@@ -69,6 +73,8 @@ describe("extractUsageAttribution — delegate 打标提取", () => {
       mode: "chat",
       parentSessionId: null,
       delegateAgentId: null,
+      turnKey: null,
+      parentTurnKey: null,
     });
   });
 
@@ -100,6 +106,8 @@ describe("extractUsageAttribution — delegate 打标提取", () => {
       mode: "chat",
       parentSessionId: null,
       delegateAgentId: null,
+      turnKey: null,
+      parentTurnKey: null,
     });
     assert.equal(extractUsageAttribution(undefined).mode, "chat");
   });

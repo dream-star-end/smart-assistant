@@ -30,7 +30,7 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
         skill:平台 baseline(OC_V3_CCB_BASELINE_DIR=v5 树 ro bind)+ marketplace hub(syncMarketplaceHub 落盘)
 ```
 
-**前端**:`packages/web-react`(React/Vite SPA)。chat 状态机 `lib/chat/reducer.ts`(帧翻译/守卫)+ `socket.ts`(WS/重连/持久化编排)+ `lib/persist.ts`(IndexedDB 镜像 + server-wins 合并纯函数)。服务端历史只含 `assistant|thinking|tool` 三种 role(server-authored 通道),**团队卡(agent-group/delegate-progress)是 client-owned**,只活在 IndexedDB——这是一整类"重开丢卡"问题的根源,见 §3.3。
+**前端**:`packages/web-react`(React/Vite SPA)。chat 状态机 `lib/chat/reducer.ts`(帧翻译/守卫)+ `socket.ts`(WS/重连/持久化编排)+ `lib/persist.ts`(IndexedDB 镜像 + server-wins 合并纯函数)。v2 lossless turn tape 将 `assistant|thinking|tool|agent-group|plan|goal` 及委派 transcript 作为 server-authored 权威；热行只放一个 tape anchor，完整内容在 PG 记录表按 hash 水合。`delegate-progress` 仍是 live 进度投影，但完成后的完整子 Agent block 序列归入 `agent-group` tape，不再依赖单设备 IndexedDB。
 
 **计费**:双钱包 `spendTwoBucket` 唯一扣费收口;period_credits(期内)优先于 users.credits(持久);turn 级 idle-timeout 免单;codex 计费经 bridge journal 收敛。
 
@@ -173,7 +173,7 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 5. **"客户端转圈不止但服务端其实跑完了"**(团队模式高发,2026-07-07 事故):turn 是否真在飞看 session 双计数(`_activeTurnCount` engine 级 + `_activeClientTurnCount` 客户 turn 级,含 review 编排窗口),**别看 runner.isRunning(warm runner 恒 true)**。恢复链权威:hello 重连对账(`_shouldPushTurnInterruptedFinal`→completed 推 meta.reconcile 静默 final / errored 推 service_restart 文案)+ resume_failed→REST 全量对账 + review 迟到团队卡 persistLateTurnArtifacts 补 drain。ring 帧分级(delegate_progress/turn_status=progress 级先淘,contentLossSeq 水位线判回放),团队进度帧 >15帧/s 冲穿 ring 属预期,content 不应受累。取证三件套:容器 docker logs 的 `delegate`/`team_review`/`verification verdict` 行 + master /var/log/openclaude-v5.log 的 `userChatBridge closed(cause)`/`resume replay miss` + client_sessions.last_at 对时间线。
 
 ### 3.3 会话历史/持久化问题(高频类)
-心智模型:**server 历史(sessions.db)只有 assistant|thinking|tool;用户行走 POST /user-message;团队卡只在客户端 IndexedDB**。合并语义在 `lib/persist.ts`:
+心智模型:**用户行走 POST /user-message；模型生成内容由 v2 lossless turn tape 在 PG 中完整保存，`client_sessions.messages` 只留常量大小 anchor，读取时水合为 assistant/thinking/tool/agent-group/plan/goal**。合并语义在 `lib/persist.ts`:
 - full 合并 `mergeFullServerWins`:server 权威在前,保留尾部乐观段 + 中段 local-only user 行 + 中段 local-only 团队卡;
 - 同 id"server tool 行 vs 本地已转 agent-group 富卡"→ 富卡为底回填完成态;
 - `syncSession`(resume_failed reconcile)走 applyServerMessages 同一收口,**禁止整段替换**。

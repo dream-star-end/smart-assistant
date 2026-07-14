@@ -122,7 +122,7 @@ beforeEach(async () => {
   // egress_proxies 一并 TRUNCATE — 0055 CHECK 强制 claude_accounts.egress_proxy_id
   // NOT NULL,FK 指向 egress_proxies(id),所以 fixture 必须一起重建。
   await query(
-    "TRUNCATE TABLE admin_audit, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
+    "TRUNCATE TABLE pending_usage_patches, admin_audit, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
   );
 });
 
@@ -259,6 +259,82 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(ur.rows[0].account_id, acctId.toString());
     assert.equal(ur.rows[0].session_id, "sess-1");
     assert.equal(ur.rows[0].cost_credits, "300");
+  });
+
+  test("lossless locator is committed atomically with the real ledger debit", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("lossless-cost@example.com", 1000n);
+    const turnKey = "a".repeat(64);
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-lossless-cost-1",
+      model: "test-model",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId: "ccb-lossless-1",
+      turnKey,
+    });
+    assert.equal(result.debitedCredits, 300n);
+    const pending = await query<{
+      user_id: string;
+      session_id: string | null;
+      turn_key: string | null;
+      cost_credits: string;
+    }>(
+      `SELECT user_id,session_id,turn_key,cost_credits
+         FROM pending_usage_patches WHERE request_id=$1`,
+      ["req-lossless-cost-1"],
+    );
+    assert.deepEqual(pending.rows, [{
+      user_id: `c:${uid.toString()}`,
+      session_id: "ccb-lossless-1",
+      turn_key: turnKey,
+      cost_credits: "300",
+    }]);
+  });
+
+  test("immutable lossless locator conflict rolls back usage and debit together", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("lossless-conflict@example.com", 1000n);
+    await query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,turn_key,cost_credits)
+       VALUES ($1,$2,$3,$4)`,
+      ["req-lossless-conflict", `c:${uid.toString()}`, "b".repeat(64), "999"],
+    );
+    await assert.rejects(
+      settleUsageAndLedger(getPool(), {
+        userId: uid,
+        accountId: null,
+        requestId: "req-lossless-conflict",
+        model: "test-model",
+        usage: makeUsage(),
+        snapshotJson: SNAPSHOT_JSON,
+        costCredits: 300n,
+        status: "success",
+        sessionId: "ccb-lossless-2",
+        turnKey: "a".repeat(64),
+      }),
+      /immutable lossless cost locator conflict/,
+    );
+    const user = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1",
+      [uid.toString()],
+    );
+    assert.equal(user.rows[0].credits, "1000");
+    const usage = await query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM usage_records WHERE user_id=$1",
+      [uid.toString()],
+    );
+    const ledger = await query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1",
+      [uid.toString()],
+    );
+    assert.equal(usage.rows[0].count, "0");
+    assert.equal(ledger.rows[0].count, "0");
   });
 
   test("23505 幂等: 同 (user_id, request_id) 二次进入 → 返回已有行 + debitedCredits=null", async (t) => {
