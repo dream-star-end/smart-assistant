@@ -93,6 +93,7 @@ jobs:
       REQUIRE_TEST_DB: '1'
       TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
       TEST_REDIS_URL: redis://127.0.0.1:56379/0
+      COMMERCIAL_UNIT_TAP: commercial-unit.tap
 
     steps:
       - name: Checkout
@@ -133,12 +134,26 @@ jobs:
           done
 
       - name: Run commercial unit tests (baseline diff gate)
-        run: npm run test:commercial:unit:gate
+        env:
+          TAP_OUT: ${{ env.COMMERCIAL_UNIT_TAP }}
+        # v5 master 生产 unit 以 User=root 运行;provision 契约会创建并 chown
+        # /run/ccb-ssh/u<uid>。GitHub runner 普通用户无法验证这条真实权限路径,
+        # 会稳定 EACCES。托管 runner 本身支持 passwordless sudo,这里只透传门禁必需 env。
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "TEST_REDIS_URL=$TEST_REDIS_URL" \
+            "TAP_OUT=$TAP_OUT" \
+            npm run test:commercial:unit:gate
 
       - name: Upload TAP output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: commercial-unit-tap
-          path: commercial-unit.tap
+          path: ${{ env.COMMERCIAL_UNIT_TAP }}
+          if-no-files-found: error
           retention-days: 14

@@ -31,10 +31,12 @@ ledger / v3Supervisor / userChatBridge 一带,尚未在 v5 轨修复)。为了�
 **新增回归**敏感而不被存量失败刷屏,commercial-unit job 不直接看测试退出码,
 而是走基线 diff:
 
-1. `.github/scripts/commercial-unit-gate.sh` 跑套件,把 TAP 输出落到
-   `commercial-unit.tap`(CI 里无论成败都作为 artifact 上传,名为
-   `commercial-unit-tap`;本地跑 gate 会把它落在仓库根,未被 git 跟踪,
-   用完可删,或用 `TAP_OUT=/path/xx.tap` 重定向);
+1. `.github/scripts/commercial-unit-gate.sh` 跑套件并生成 TAP。为避免多 worktree /
+   多 agent 并发互相截断,本地默认写到当前 worktree 的 Git 目录;可用
+   `TAP_OUT=/path/xx.tap` 显式重定向。CI job 通过唯一变量
+   `COMMERCIAL_UNIT_TAP=commercial-unit.tap` 把 `TAP_OUT` 和 artifact 上传路径绑在
+   一起;无论测试成败都上传名为 `commercial-unit-tap` 的产物,产物缺失本身也会让
+   job 失败,避免门禁只报套件名却丢失真实断言详情;
 2. `.github/scripts/diff-known-failures.sh` 从 TAP 提取**顶层**失败集
    (`^not ok` 只匹配列 0 = 顶层 test/suite 名;嵌套子测试是缩进的,不参与),
    与 `.github/known-failures/commercial-unit.txt` 逐行比较;
@@ -48,6 +50,13 @@ process.env.REQUIRE_TEST_DB === "1"` —— 命中门控时 PG 不可用会直�
 "Postgres test fixture required" 而不是 skip。gate 脚本无条件
 `export REQUIRE_TEST_DB=1`,CI job 又设 `CI=true` + 起 PG/Redis services,
 双保险:DB 门控测试要么真跑,要么显式红,绝不静默绿。
+
+CI 的 commercial-unit 命令通过 `sudo env ...` 以 root 执行。这不是放宽测试:
+v5 master 的 systemd unit 明确是 `User=root`,而 container provision 的真实权限契约
+会创建 `/run/ccb-ssh/u<uid>` 并 `chown root:1000`。GitHub 托管 runner 的普通用户既
+不能在 `/run` 建目录也不能 chown,会让所有触发 provision 的单测稳定报 `EACCES`,
+形成“本机(root)绿、CI(runner)红”的假回归。root 运行同时让标记为 requires-root 的
+artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接触生产主机。
 
 ### known-failures 清单维护
 
