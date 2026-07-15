@@ -13,7 +13,8 @@ import type { StoredSession } from "../persist";
 function socket(persistSession?: (id: string) => void): ChatSocket {
   return new ChatSocket({
     getToken: () => "tok",
-    silentRefresh: async () => null,
+    getAuthEpoch: () => 0,
+    silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
     onAuthExpired: () => {},
     persistSession,
     defaultAgentId: "main",

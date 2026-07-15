@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { MAIN_AGENT } from "../lib/agents";
+import { createMemoryAuthSession } from "../lib/authSession";
 import type { AuthSession } from "../lib/types";
 
 // api 网络层全 mock —— 只验证团队模式开关区块的文案与交互契约。
@@ -19,11 +20,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = {
-  getToken: () => "tok",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function renderPicker(extra: Partial<Parameters<typeof AgentPicker>[0]> = {}) {
   listMyAgents.mockResolvedValue([]);

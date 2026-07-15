@@ -71,7 +71,6 @@ import {
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
   VISIBILITY_RECONNECT_COOLDOWN_MS,
-  WS_AUTH_REFRESH_MIN_GAP_MS,
   WS_CLOSE_CODE_STALLED,
 } from "./pure";
 import type {
@@ -95,16 +94,19 @@ import type {
 } from "./frames";
 import { incidentStore } from "../incidentStore";
 import { DEFAULT_CODEX_ENGINE_MODEL, isClientMessageId } from "@openclaude/protocol";
+import type { RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
 
 export type ChatSocketDeps = {
   /** 当前内存态 access JWT（WS 子协议鉴权用）。*/
   getToken: () => string;
-  /** 1008 续期：成功回新 token，失败 null（内部已 setToken 回写 AuthSession）。*/
-  silentRefresh: () => Promise<string | null>;
-  /** 续期失败 / token teardown → 回登录。*/
-  onAuthExpired: () => void;
+  /** AuthSession epoch；与 socket 自身生命周期 epoch 双重隔离。 */
+  getAuthEpoch: () => number;
+  /** 1008 续期统一走 REST/boot 共用的 epoch-bound coordinator。 */
+  silentRefresh: (expectedEpoch: number) => Promise<RefreshOutcome>;
+  /** 仅明确 invalid 时按 expectedEpoch 幂等失效。*/
+  onAuthExpired: (expectedEpoch: number) => void;
   /** 商业版余额刷新（cost_charged / 4506 / insufficient_credits）。*/
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
@@ -224,7 +226,7 @@ export class ChatSocket {
 
   // ── 1008 续期闸门（§5）──
   private wsAuthRefreshInFlight = false;
-  private lastWsAuthRefreshAt = 0;
+  private wsAuthRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private authEpoch = 0;
 
   // ── ping watchdog（§6）──
@@ -429,6 +431,8 @@ export class ChatSocket {
 
   stop(): void {
     this.started = false;
+    this.authEpoch++;
+    this.cancelWsAuthRecovery();
     if (this.boundOnline) window.removeEventListener("online", this.boundOnline);
     if (this.boundOffline) window.removeEventListener("offline", this.boundOffline);
     if (this.boundVisible) document.removeEventListener("visibilitychange", this.boundVisible);
@@ -834,8 +838,6 @@ export class ChatSocket {
       return;
     }
     this.ws = ws;
-    let authRefreshTried = false;
-
     ws.onopen = () => {
       this.reconnectAttempts = 0;
       this.isBrowserOnline = true;
@@ -1024,29 +1026,8 @@ export class ChatSocket {
       }
 
       if (decision.action === "auth_1008") {
-        const now = Date.now();
-        const canRetry =
-          !!this.deps.getToken() && !authRefreshTried && now - this.lastWsAuthRefreshAt > WS_AUTH_REFRESH_MIN_GAP_MS;
-        if (canRetry) {
-          authRefreshTried = true;
-          this.lastWsAuthRefreshAt = now;
-          this.wsAuthRefreshInFlight = true;
-          const epochAtStart = this.authEpoch;
-          this.setStatus("会话续期中…", "connecting");
-          void (async () => {
-            let ok: string | null = null;
-            try {
-              ok = await this.deps.silentRefresh().catch(() => null);
-            } finally {
-              this.wsAuthRefreshInFlight = false;
-            }
-            if (this.authEpoch !== epochAtStart) return; // 身份已变，撤退
-            if (ok && this.deps.getToken()) this.connect();
-            else this.tearDownAuth();
-          })();
-          return;
-        }
-        this.tearDownAuth();
+        if (this.deps.getToken()) this.startWsAuthRecovery();
+        else this.tearDownAuth(this.deps.getAuthEpoch());
         return;
       }
 
@@ -1401,10 +1382,57 @@ export class ChatSocket {
     return sent;
   }
 
-  private tearDownAuth(): void {
+  private startWsAuthRecovery(): void {
+    if (this.wsAuthRefreshInFlight) return;
+    this.wsAuthRefreshInFlight = true;
+    const socketEpoch = this.authEpoch;
+    const sessionEpoch = this.deps.getAuthEpoch();
+    this.setStatus("会话续期中…", "connecting");
+
+    const attempt = async (): Promise<void> => {
+      let outcome: RefreshOutcome;
+      try {
+        outcome = await this.deps.silentRefresh(sessionEpoch);
+      } catch {
+        outcome = { kind: "transient", epoch: sessionEpoch, retryAfterMs: 1_000 };
+      }
+      if (this.authEpoch !== socketEpoch || this.deps.getAuthEpoch() !== sessionEpoch) return;
+
+      if (outcome.kind === "success") {
+        this.wsAuthRefreshInFlight = false;
+        if (this.deps.getToken()) this.connect();
+        return;
+      }
+      if (outcome.kind === "invalid") {
+        this.wsAuthRefreshInFlight = false;
+        this.tearDownAuth(outcome.epoch);
+        return;
+      }
+      if (outcome.kind === "stale") {
+        this.wsAuthRefreshInFlight = false;
+        return;
+      }
+
+      this.setStatus("会话续期中…", "connecting");
+      this.wsAuthRetryTimer = setTimeout(() => {
+        this.wsAuthRetryTimer = null;
+        void attempt();
+      }, Math.max(250, outcome.retryAfterMs));
+    };
+    void attempt();
+  }
+
+  private cancelWsAuthRecovery(): void {
+    if (this.wsAuthRetryTimer) clearTimeout(this.wsAuthRetryTimer);
+    this.wsAuthRetryTimer = null;
+    this.wsAuthRefreshInFlight = false;
+  }
+
+  private tearDownAuth(expectedEpoch: number): void {
     this.authEpoch++;
+    this.cancelWsAuthRecovery();
     this.setProvisioningBanner(false);
-    this.deps.onAuthExpired();
+    this.deps.onAuthExpired(expectedEpoch);
     this.setStatus("未连接", "disconnected");
   }
 
@@ -1502,6 +1530,7 @@ export class ChatSocket {
   /** 主动 bump epoch（登出/换号时由 hook 调，作废在飞续期）。*/
   bumpAuthEpoch(): void {
     this.authEpoch++;
+    this.cancelWsAuthRecovery();
   }
 
   // ═══════════════ 会话注册 ═══════════════

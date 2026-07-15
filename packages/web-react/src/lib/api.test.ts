@@ -1,8 +1,10 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { ApiError, api, apiErrorMessage, authErrorMessage } from './api'
+import { ApiError, api, apiErrorMessage, authErrorMessage, callWithRefresh } from './api'
+import { createMemoryAuthSession } from './authSession'
 import type { AuthSession } from './types'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -16,20 +18,21 @@ function authErr(status: number, code: string, message: string, reqId = 'req-abc
   }
 }
 
-function makeSession(initial: string): { session: AuthSession; expired: () => boolean } {
-  let token = initial
-  let expired = false
+function makeSession(initial: string): {
+  session: AuthSession
+  expired: () => boolean
+  expireCount: () => number
+  token: () => string
+} {
+  let expiredCount = 0
+  const session = createMemoryAuthSession(() => {
+    expiredCount += 1
+  }, initial)
   return {
-    session: {
-      getToken: () => token,
-      setToken: (t: string) => {
-        token = t
-      },
-      onExpired: () => {
-        expired = true
-      },
-    },
-    expired: () => expired,
+    session,
+    expired: () => expiredCount > 0,
+    expireCount: () => expiredCount,
+    token: () => session.snapshot().token,
   }
 }
 
@@ -100,6 +103,219 @@ test('concurrent 401s trigger only ONE /api/auth/refresh (singleflight) and both
   expect(b.id).toBe('u1')
 })
 
+test('REFRESH_RACE retries inside grace and commits the sibling-rotated cookie result', async () => {
+  vi.useFakeTimers()
+  let refreshCalls = 0
+  const fetchMock = vi.fn(async () => {
+    refreshCalls += 1
+    if (refreshCalls === 1) return authErr(401, 'REFRESH_RACE', 'refresh token rotation race')
+    return ok({ access_token: 'tok-race-winner', access_exp: 999, remember: true })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, token } = makeSession('tok-old')
+  const pending = api.refresh(session)
+  await vi.advanceTimersByTimeAsync(250)
+  await expect(pending).resolves.toMatchObject({ kind: 'success', epoch: 0 })
+  expect(refreshCalls).toBe(2)
+  expect(token()).toBe('tok-race-winner')
+})
+
+test('repeated REFRESH_RACE is bounded and degrades to transient, never expiry', async () => {
+  vi.useFakeTimers()
+  let refreshCalls = 0
+  const fetchMock = vi.fn(async () => {
+    refreshCalls += 1
+    return authErr(401, 'REFRESH_RACE', 'refresh token rotation race')
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, expireCount } = makeSession('tok-old')
+  const pending = api.refresh(session)
+  await vi.advanceTimersByTimeAsync(5_000)
+  await expect(pending).resolves.toMatchObject({ kind: 'transient', epoch: 0 })
+  expect(refreshCalls).toBe(6)
+  expect(expireCount()).toBe(0)
+})
+
+test('transient refresh preserves the original 401 response and applies a shared cooldown', async () => {
+  let refreshCalls = 0
+  const original = unauthorized()
+  const fetchMock = vi.fn(async () => {
+    refreshCalls += 1
+    return authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary outage')
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, expireCount } = makeSession('tok-old')
+  const first = await callWithRefresh(session, async () => original as unknown as Response)
+  const second = await callWithRefresh(session, async () => original as unknown as Response)
+  expect(first).toBe(original)
+  expect(second).toBe(original)
+  expect(refreshCalls).toBe(1)
+  expect(expireCount()).toBe(0)
+})
+
+test('malformed 200 refresh body is transient and never commits or expires auth', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => ok({ access_token: '', access_exp: 'bad' })) as unknown as typeof fetch)
+  const { session, token, expireCount } = makeSession('tok-old')
+  await expect(api.refresh(session)).resolves.toMatchObject({ kind: 'transient', epoch: 0 })
+  expect(token()).toBe('tok-old')
+  expect(expireCount()).toBe(0)
+})
+
+test('hung refresh is internally aborted and classified transient', async () => {
+  vi.useFakeTimers()
+  const fetchMock = vi.fn((_url: string, init?: RequestInit) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('timeout', 'AbortError')))
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session, expireCount } = makeSession('tok-old')
+
+  const pending = api.refresh(session)
+  await vi.advanceTimersByTimeAsync(30_000)
+  await expect(pending).resolves.toMatchObject({ kind: 'transient', epoch: 0 })
+  expect(expireCount()).toBe(0)
+})
+
+test('late refresh success cannot overwrite a newer identity', async () => {
+  let resolveRefresh!: (value: unknown) => void
+  const refreshResponse = new Promise((resolve) => {
+    resolveRefresh = resolve
+  })
+  vi.stubGlobal('fetch', vi.fn(async () => refreshResponse) as unknown as typeof fetch)
+
+  const { session, token } = makeSession('account-a')
+  const pending = api.refresh(session)
+  await Promise.resolve()
+  const nextEpoch = session.beginIdentity()
+  expect(session.commitToken(nextEpoch, 'account-b')).toBe(true)
+  resolveRefresh(ok({ access_token: 'late-account-a', access_exp: 999, remember: true }))
+
+  await expect(pending).resolves.toEqual({ kind: 'stale', epoch: 0 })
+  expect(token()).toBe('account-b')
+})
+
+test('late invalid refresh cannot expire a newer identity', async () => {
+  let resolveRefresh!: (value: unknown) => void
+  const refreshResponse = new Promise((resolve) => {
+    resolveRefresh = resolve
+  })
+  vi.stubGlobal('fetch', vi.fn(async () => refreshResponse) as unknown as typeof fetch)
+
+  const { session, token, expireCount } = makeSession('account-a')
+  const pending = api.refresh(session)
+  await Promise.resolve()
+  const nextEpoch = session.beginIdentity()
+  session.commitToken(nextEpoch, 'account-b')
+  resolveRefresh(authErr(401, 'INVALID_REFRESH', 'old family expired'))
+
+  await expect(pending).resolves.toEqual({ kind: 'stale', epoch: 0 })
+  expect(token()).toBe('account-b')
+  expect(expireCount()).toBe(0)
+})
+
+test('an old 401 is never replayed with a newly logged-in account token', async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const seen: string[] = []
+  const { session } = makeSession('account-a')
+  const pending = callWithRefresh(session, async (token) => {
+    seen.push(token)
+    await gate
+    return unauthorized() as unknown as Response
+  })
+
+  await Promise.resolve()
+  const nextEpoch = session.beginIdentity()
+  session.commitToken(nextEpoch, 'account-b')
+  release()
+  await expect(pending).resolves.toMatchObject({ status: 401 })
+  expect(seen).toEqual(['account-a'])
+})
+
+test('shared invalid refresh expires the matching epoch exactly once', async () => {
+  let refreshCalls = 0
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      return authErr(401, 'INVALID_REFRESH', 'refresh token invalid or expired')
+    }
+    return unauthorized()
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, expireCount } = makeSession('tok-old')
+  const settled = await Promise.allSettled([api.getMe(session), api.getMe(session)])
+  expect(settled.every((item) => item.status === 'rejected')).toBe(true)
+  expect(refreshCalls).toBe(1)
+  expect(expireCount()).toBe(1)
+})
+
+test('logout aborts and settles an in-flight refresh before its cookie-clear request', async () => {
+  const order: string[] = []
+  const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/auth/refresh')) {
+      order.push('refresh:start')
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          order.push('refresh:abort')
+          reject(new DOMException('aborted', 'AbortError'))
+        })
+      })
+    }
+    order.push('logout')
+    return Promise.resolve(ok({}))
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session } = makeSession('tok-old')
+  const refreshing = api.refresh(session)
+  await Promise.resolve()
+  session.beginIdentity()
+  const loggingOut = api.logout(session)
+  await Promise.all([refreshing, loggingOut])
+  expect(order).toEqual(['refresh:start', 'refresh:abort', 'logout'])
+})
+
+test('rapid logout then login is FIFO-ordered in the same tab', async () => {
+  let releaseLogout!: () => void
+  const logoutGate = new Promise<void>((resolve) => {
+    releaseLogout = resolve
+  })
+  const order: string[] = []
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes('/api/auth/logout')) {
+      order.push('logout:start')
+      await logoutGate
+      order.push('logout:end')
+      return ok({})
+    }
+    order.push('login')
+    return ok({
+      user: ME_BODY.user,
+      access_token: 'tok-login',
+      access_exp: 1234,
+      refresh_exp: 5678,
+      remember: true,
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const logout = api.logout()
+  await Promise.resolve()
+  const login = api.login('a@b.com', 'pw')
+  await Promise.resolve()
+  expect(order).toEqual(['logout:start'])
+  releaseLogout()
+  await Promise.all([logout, login])
+  expect(order).toEqual(['logout:start', 'logout:end', 'login'])
+})
+
 test('orgTopup preserves mutually exclusive desktop/mobile payment URLs from the unified response envelope', async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
     ok({
@@ -168,7 +384,7 @@ test('a failed refresh calls onExpired exactly once and surfaces the original er
     const u = String(url)
     if (u.includes('/api/auth/refresh')) {
       refreshCalls += 1
-      return unauthorized()
+      return authErr(401, 'INVALID_REFRESH', 'refresh token invalid or expired')
     }
     return unauthorized() // authed call also 401
   })

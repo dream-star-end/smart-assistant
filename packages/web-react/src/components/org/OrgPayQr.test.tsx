@@ -2,17 +2,14 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import { OrgPayQr } from "./OrgPayQr";
 
 vi.mock("../../lib/api", () => ({
   api: { getOrder: vi.fn(() => new Promise(() => {})) },
 }));
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 afterEach(() => {
   cleanup();

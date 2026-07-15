@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { AuthSession } from '../../lib/types'
+import { createMemoryAuthSession } from '../../lib/authSession'
 import { FEEDBACK_DESCRIPTION_MAX, FeedbackTab } from './FeedbackTab'
 
 vi.mock('../../lib/api', async (importOriginal) => {
@@ -15,11 +16,7 @@ vi.mock('../../lib/api', async (importOriginal) => {
 import { api } from '../../lib/api'
 
 const submitFeedback = vi.mocked(api.submitFeedback)
-const auth: AuthSession = {
-  getToken: () => 'token',
-  setToken: () => {},
-  onExpired: () => {},
-}
+const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
 
 function deferred<T>() {
   let resolve!: (value: T) => void

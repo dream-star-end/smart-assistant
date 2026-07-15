@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import type { AuthSession } from '../lib/types'
+import { createMemoryAuthSession } from '../lib/authSession'
 import { SettingsCenter } from './SettingsCenter'
 
 vi.mock('./settings/AccountTab', () => ({ AccountTab: () => <div>账户页</div> }))
@@ -9,11 +10,7 @@ vi.mock('./settings/UsageTab', () => ({ UsageTab: () => <div>用量页</div> }))
 vi.mock('./settings/PreferencesTab', () => ({ PreferencesTab: () => <div>偏好页</div> }))
 vi.mock('./settings/SubscriptionDialog', () => ({ SubscriptionDialog: () => null }))
 
-const auth: AuthSession = {
-  getToken: () => 'token',
-  setToken: () => {},
-  onExpired: () => {},
-}
+const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
 
 afterEach(cleanup)
 

@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceDetail, MarketplaceMyAgent } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 const getMarketplaceDetail = vi.fn();
 const listMyAgents = vi.fn();
@@ -24,7 +25,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function detail(over: Partial<MarketplaceDetail> = {}): MarketplaceDetail {
   return {

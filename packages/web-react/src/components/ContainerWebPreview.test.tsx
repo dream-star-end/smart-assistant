@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { AuthSession } from '../lib/types'
+import { createMemoryAuthSession } from '../lib/authSession'
 
 type Target = {
   selector: string
@@ -61,11 +62,7 @@ vi.mock('../hooks/useContainerPreview', () => ({
 
 import { ContainerWebPreview } from './ContainerWebPreview'
 
-const auth: AuthSession = {
-  getToken: () => 'token',
-  setToken: () => {},
-  onExpired: () => {},
-}
+const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
 
 const heroTarget: Target = {
   selector: '#hero-cta',

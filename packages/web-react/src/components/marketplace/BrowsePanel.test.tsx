@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 // api 网络层全 mock —— 只验证 BrowsePanel 的分区/筛选片行为,不打真实网络。
 const searchMarketplace = vi.fn();
@@ -31,7 +32,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function card(slug: string, over: Partial<MarketplaceCard> = {}): MarketplaceCard {
   return { slug, kind: "skill", name: slug, description: "d", tags: [], ...over };

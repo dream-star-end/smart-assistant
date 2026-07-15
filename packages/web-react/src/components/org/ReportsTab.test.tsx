@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, OrgUsageReport, OrgUsageTrendPoint } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 // chart.js 走 canvas，jsdom 无 2d context —— 轻量桩替掉，避免 useChart 抛错。
 vi.mock("chart.js/auto", () => ({
@@ -19,11 +20,7 @@ import { ReportsTab, sortByCreditsDesc, trendMax } from "./ReportsTab";
 
 const mockedGetOrgUsage = vi.mocked(api.getOrgUsage);
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 describe("sortByCreditsDesc（按扣费降序，BigInt 精确）", () => {
   test("大数降序（越过 2^53 仍正确，不 Number 化）", () => {

@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, HupiCreateResult, MySubscription } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import { SubscriptionDialog } from "./SubscriptionDialog";
 import { TopupDialog } from "./TopupDialog";
 
@@ -28,11 +29,7 @@ vi.mock("../../lib/api", () => {
   };
 });
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 const order: HupiCreateResult = {
   orderNo: "order-1",

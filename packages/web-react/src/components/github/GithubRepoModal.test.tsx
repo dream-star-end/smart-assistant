@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 const getGithubLink = vi.fn();
 const listGithubRepos = vi.fn();
@@ -24,7 +25,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "t", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 function renderModal(over: Partial<Parameters<typeof GithubRepoModal>[0]> = {}) {
   const onConfirm = vi.fn().mockResolvedValue(undefined);
