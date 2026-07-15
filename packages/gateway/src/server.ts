@@ -49,6 +49,7 @@ import {
   PLATFORM_REASONING_EFFORTS,
   MAX_ATTACHMENTS_PER_MESSAGE,
   isCodexEngineModel,
+  isClientMessageId,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
@@ -9455,7 +9456,13 @@ export class Gateway {
         // Phase 0.3: peers may carry `lastFrameSeq` — the highest frameSeq
         // this tab successfully processed before the disconnect. 0 = never
         // received one (first connect / localStorage wiped / legacy client).
-        const peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }> = hello.peers || []
+        const peers: Array<{
+          peerId: string
+          agentId: string
+          inFlight?: boolean
+          lastFrameSeq?: number
+          resumeActiveTurnCandidateMessageIds?: unknown
+        }> = hello.peers || []
         // Phase 4 — 把这些 peerId 记下来,bind 帧用 5s grace window 校验
         const peerIdSet = new Set<string>()
         for (const p of peers) {
@@ -10320,7 +10327,13 @@ export class Gateway {
   }
 
   private async autoResumeFromHello(
-    peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }>,
+    peers: Array<{
+      peerId: string
+      agentId: string
+      inFlight?: boolean
+      lastFrameSeq?: number
+      resumeActiveTurnCandidateMessageIds?: unknown
+    }>,
     ws: WebSocket,
   ): Promise<void> {
     // Register the reconnected WS client for each peer that has an active/resumable session.
@@ -10418,14 +10431,33 @@ export class Gateway {
       // durable server-side persistence from Phase 0.1/0.2 remains the
       // authoritative backstop for any duration of disconnect.
       const clientLastSeq = typeof peerLastFrameSeq === 'number' ? peerLastFrameSeq : 0
+      const activeReplayClientMessageId = _matchActiveTurnReplayCandidate(
+        session?._runningClientMessageId,
+        peer.resumeActiveTurnCandidateMessageIds,
+      )
       if (clientLastSeq >= 0) {
-        const replay = this._outboundRing.peekReplay(sessionKey, clientLastSeq)
+        const replay = activeReplayClientMessageId
+          ? this._outboundRing.peekActiveTurnReplay(sessionKey, activeReplayClientMessageId)
+          : this._outboundRing.peekReplay(sessionKey, clientLastSeq)
         // Read-path pruning may have evicted age-aged frames — record those
         // in metrics regardless of hit/miss outcome, otherwise the `age`
         // cause is severely under-counted for idle sessions whose ring is
         // only ever pruned on resume.
         this._recordRingEvictions(replay.evicted)
         if (replay.ok) {
+          if (activeReplayClientMessageId) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'outbound.active_turn_replay_start',
+                sessionKey,
+                channel: 'webchat',
+                peer: { id: peerId, kind: 'dm' },
+                clientMessageId: activeReplayClientMessageId,
+              }))
+            } catch {
+              continue
+            }
+          }
           // Only count as "hit" when the ring actually rescued frames.
           // `ok` with empty sent means the client was already caught up
           // (fromSeq===currentLast) — the ring did nothing useful, and
@@ -10437,7 +10469,10 @@ export class Gateway {
               try { ws.send(f.data) } catch { break }
             }
             this.log.info('resume replay served', {
-              sessionKey, from: clientLastSeq, to: replay.to, sent: replay.sent.length,
+              sessionKey,
+              from: activeReplayClientMessageId ? 'active-turn-start' : clientLastSeq,
+              to: replay.to,
+              sent: replay.sent.length,
             })
           }
         } else {
@@ -10454,7 +10489,10 @@ export class Gateway {
               ts: Date.now(),
             }))
             this.log.warn('resume replay miss — signalled resume_failed', {
-              sessionKey, from: clientLastSeq, to: replay.to, reason: replay.reason,
+              sessionKey,
+              from: activeReplayClientMessageId ? 'active-turn-start' : clientLastSeq,
+              to: replay.to,
+              reason: replay.reason,
             })
           } catch {}
         }
@@ -10896,6 +10934,10 @@ export class Gateway {
     const safeRequestId: string | undefined =
       typeof _frameRequestId === 'string' && _frameRequestId.length > 0
         ? _frameRequestId
+        : undefined
+    const safeClientMessageId: string | undefined =
+      frame.channel === 'webchat' && isClientMessageId((frame as any).clientMessageId)
+        ? (frame as any).clientMessageId
         : undefined
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
@@ -11756,6 +11798,7 @@ export class Gateway {
     const currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     let turnErrored = false
     let leaderFinalCount = 0
+    let replayTerminalizedUnhandledError = false
     let autoDreamAssistantText = ''
     let autoDreamHasCanonicalApiError = false
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
@@ -12164,6 +12207,36 @@ export class Gateway {
       emitContextRebuilt: (info: { messageCount: number }) => {
         this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount), adapter)
       },
+      ...(safeClientMessageId
+        ? {
+            replayLifecycle: {
+              clientMessageId: safeClientMessageId,
+              onStart: () => {
+                this._outboundRing.beginActiveTurn(sessionKey, safeClientMessageId)
+              },
+              onBeforeRelease: (unhandledError: unknown | undefined) => {
+                if (
+                  unhandledError === undefined ||
+                  turnErrored ||
+                  leaderFinalCount > 0
+                ) {
+                  return
+                }
+                const detail =
+                  unhandledError instanceof Error
+                    ? unhandledError.message
+                    : String(unhandledError)
+                onLeaderEvent({ kind: 'error', error: detail })
+                replayTerminalizedUnhandledError = true
+              },
+              onEnd: () => {
+                this._recordRingEvictions(
+                  this._outboundRing.endActiveTurn(sessionKey, safeClientMessageId),
+                )
+              },
+            },
+          }
+        : {}),
     }
     // team-durability — 客户 turn 级 in-flight 计数(与 engine 级 _activeTurnCount 双计数,
     // hello 重连对账据此判 turn 是否在飞)。历史上审查硬编排在 submit 之后还要跑数分钟,
@@ -12188,7 +12261,11 @@ export class Gateway {
 
     } catch (err) {
       clientTurnThrew = true
-      throw err
+      if (!replayTerminalizedUnhandledError) throw err
+      this.log.warn('accepted turn failed after replay-safe terminal delivery', {
+        sessionKey,
+        clientMessageId: safeClientMessageId,
+      }, err as Error)
     } finally {
       this.sessions.endClientTurn(
         session,
@@ -12617,6 +12694,33 @@ export function _buildContextRebuiltFrame(
     agentId,
     messageCount,
   }
+}
+
+// ── active-turn cold replay candidate matching ──
+
+export const ACTIVE_TURN_REPLAY_CANDIDATE_MAX = 32
+
+/** Match a bounded client history hint against the server-owned lock owner.
+ * The browser may name candidates, but only the exact runtime marker can
+ * authorize a cold replay. Malformed/oversized lists degrade to ordinary
+ * cursor replay. */
+export function _matchActiveTurnReplayCandidate(
+  runningClientMessageId: string | undefined,
+  rawCandidates: unknown,
+): string | undefined {
+  if (!isClientMessageId(runningClientMessageId)) return undefined
+  if (
+    !Array.isArray(rawCandidates) ||
+    rawCandidates.length === 0 ||
+    rawCandidates.length > ACTIVE_TURN_REPLAY_CANDIDATE_MAX
+  ) {
+    return undefined
+  }
+  return rawCandidates.some(
+    (candidate) => isClientMessageId(candidate) && candidate === runningClientMessageId,
+  )
+    ? runningClientMessageId
+    : undefined
 }
 
 // ── turn-alive-heartbeat (Plan 1) — autoResumeFromHello judgment helper ──

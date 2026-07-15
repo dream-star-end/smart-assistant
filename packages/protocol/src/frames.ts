@@ -11,6 +11,15 @@ import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 const TRACE_ID_PATTERN = '^[A-Za-z0-9_-]{16,64}$'
 const TraceIdString = Type.String({ pattern: TRACE_ID_PATTERN })
 
+/** Browser-authored user-message id carried across the active-turn replay
+ * protocol. Keep one validator for gateway ingress and lossless-tape parsing
+ * so the runtime marker and durable attribution cannot drift. */
+export const CLIENT_MESSAGE_ID_PATTERN = '^[A-Za-z0-9_-]{1,128}$'
+export const CLIENT_MESSAGE_ID_RE = new RegExp(CLIENT_MESSAGE_ID_PATTERN)
+export const isClientMessageId = (value: unknown): value is string =>
+  typeof value === 'string' && CLIENT_MESSAGE_ID_RE.test(value)
+const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
+
 // ───────────────────────────────────────────────
 // Common
 // ───────────────────────────────────────────────
@@ -150,6 +159,10 @@ export const InboundMessage = Type.Object({
   // 非法值 strip 后只记 `clientTraceIdIssue` 枚举(防 log injection)。
   // 不参与 turn-level canonical:master 永远 `newTraceId()` 重新生成。
   clientTraceId: Type.Optional(TraceIdString),
+  /** Stable id of the optimistic/persisted user row that started this turn.
+   * The commercial bridge preserves it; the container binds it to the
+   * session-lock owner for exact active-turn reconnect replay. */
+  clientMessageId: Type.Optional(ClientMessageId),
   // CG2a — master 铸造的 per-turn canonical traceId。商用版 master 在 inbound
   // sanitize **之后**注入再转发容器(与 requestId 同点位改写),是 turn_traces
   // 登记、billing 广播与 UI 底部"请求ID"的唯一权威。容器 gateway dispatchInbound
@@ -515,6 +528,19 @@ export const OutboundResumeFailed = Type.Object({
 })
 export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>
 
+// Server-verified boundary for a cold active-turn replay. This control frame
+// is sent directly to the reconnecting WS immediately before replay frames;
+// it is deliberately not frameSeq-stamped or inserted into the ring. The
+// client may reset its agent-scoped cursor only after receiving this proof.
+export const OutboundActiveTurnReplayStart = Type.Object({
+  type: Type.Literal('outbound.active_turn_replay_start'),
+  sessionKey: Type.String(),
+  channel: Type.Literal('webchat'),
+  peer: Peer,
+  clientMessageId: ClientMessageId,
+})
+export type OutboundActiveTurnReplayStart = Static<typeof OutboundActiveTurnReplayStart>
+
 // ───────────────────────────────────────────────
 // OutboundError — P1-3 流式错误专属帧。
 //
@@ -777,6 +803,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundResumeFailed,
+  OutboundActiveTurnReplayStart,
   OutboundError,
   OutboundCodexBilling,
   OutboundTurnStatus,

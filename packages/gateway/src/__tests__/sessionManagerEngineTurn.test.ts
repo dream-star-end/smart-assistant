@@ -165,6 +165,30 @@ async function runOneTurn(
   })._runOneTurn(session, input, (e) => events.push(e), "req-unit");
 }
 
+function submitWithReplayLifecycle(
+  sm: SessionManager,
+  session: AgentSession,
+  input: string,
+  clientMessageId: string,
+  hooks: {
+    onStart: () => void;
+    onBeforeRelease: (error: unknown | undefined) => void;
+    onEnd: () => void;
+  },
+): Promise<void> {
+  return sm.submit(
+    session,
+    input,
+    () => {},
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { replayLifecycle: { clientMessageId, ...hooks } },
+  );
+}
+
 // ── phantom 三态 ──────────────────────────────────────────────────────────
 
 describe("phantom three-state judgment", () => {
@@ -893,6 +917,104 @@ describe("crash/interrupt partial persistence", () => {
       await runOneTurn(sm, session, events);
       assert.equal(captured.payloads.length, 0);
       assert.ok(events.some((e) => e.kind === "error"));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+});
+
+describe("active-turn replay lock-owner lifecycle", () => {
+  test("a queued submit cannot replace the marker until it actually owns session.lock", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    let submitCount = 0;
+    let finishFirst!: () => void;
+    let firstEngineReady!: () => void;
+    const firstEngineStarted = new Promise<void>((resolve) => { firstEngineReady = resolve; });
+    const runner = new FakeCcbRunner((r) => {
+      submitCount++;
+      if (submitCount === 1) {
+        finishFirst = () => {
+          r.text("first complete");
+          r.result({ stop_reason: "end_turn", usage: { output_tokens: 1 } });
+        };
+        firstEngineReady();
+        return;
+      }
+      setImmediate(() => {
+        r.text("second complete");
+        r.result({ stop_reason: "end_turn", usage: { output_tokens: 1 } });
+      });
+    });
+    const session = makeSession(runner);
+    const lifecycle: string[] = [];
+    const hooks = (id: string) => ({
+      onStart: () => lifecycle.push(`start:${id}`),
+      onBeforeRelease: (error: unknown | undefined) => {
+        assert.equal(error, undefined);
+        lifecycle.push(`before:${id}`);
+      },
+      onEnd: () => lifecycle.push(`end:${id}`),
+    });
+
+    const first = submitWithReplayLifecycle(sm, session, "first", "m-user-1", hooks("u1"));
+    await firstEngineStarted;
+    const second = submitWithReplayLifecycle(sm, session, "second", "m-user-2", hooks("u2"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(lifecycle, ["start:u1"]);
+    assert.equal(session._runningClientMessageId, "m-user-1");
+
+    finishFirst();
+    await first;
+    await second;
+    assert.deepEqual(lifecycle, [
+      "start:u1", "before:u1", "end:u1",
+      "start:u2", "before:u2", "end:u2",
+    ]);
+    assert.equal(session._runningClientMessageId, undefined);
+    assert.equal(session._activeTurnCount, 0);
+  });
+
+  test("hook failures never mask the turn or strand the session lock", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    let submitCount = 0;
+    const runner = new FakeCcbRunner((r) => {
+      submitCount++;
+      setImmediate(() => {
+        r.text(`answer-${submitCount}`);
+        r.result({ stop_reason: "end_turn", usage: { output_tokens: 1 } });
+      });
+    });
+    const session = makeSession(runner);
+    await submitWithReplayLifecycle(sm, session, "first", "m-user-1", {
+      onStart: () => { throw new Error("start hook"); },
+      onBeforeRelease: () => { throw new Error("before hook"); },
+      onEnd: () => { throw new Error("end hook"); },
+    });
+    await sm.submit(session, "second", () => {});
+    assert.equal(submitCount, 2, "a second turn acquired the released lock");
+    assert.equal(session._runningClientMessageId, undefined);
+    assert.equal(session._activeTurnCount, 0);
+  });
+
+  test("the exact browser user-row id reaches the immutable terminal tape", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("durable exact answer");
+          r.result({ stop_reason: "end_turn", usage: { output_tokens: 2 } });
+        });
+      });
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+      await submitWithReplayLifecycle(sm, session, "question", "m-user-exact", {
+        onStart: () => {},
+        onBeforeRelease: () => {},
+        onEnd: () => {},
+      });
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.clientMessageId, "m-user-exact");
     } finally {
       setV3MasterSinkSingleton(null);
     }

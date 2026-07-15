@@ -44,6 +44,7 @@ export type StoredSession = {
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
   _sendingInFlight?: boolean;
+  _activeClientMessageId?: string;
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
@@ -214,7 +215,26 @@ export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
   archivedThroughSeq = 0,
+  completedClientMessageId?: string,
 ): ChatMessage[] {
+  const hasExactCompletionEvidence =
+    !!completedClientMessageId &&
+    server.some(
+      (m) =>
+        isServerAuthoredRow(m) &&
+        m._clientMessageId === completedClientMessageId &&
+        (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
+    );
+  if (hasExactCompletionEvidence) {
+    local = local.filter(
+      (m) =>
+        !(
+          m.id?.startsWith("m-") &&
+          m._clientMessageId === completedClientMessageId &&
+          (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
+        ),
+    );
+  }
   // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();

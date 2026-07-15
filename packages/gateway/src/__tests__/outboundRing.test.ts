@@ -177,6 +177,82 @@ describe('OutboundRingBuffer.peekReplay', () => {
   })
 })
 
+describe('OutboundRingBuffer active-turn cold replay', () => {
+  it('protects only current-turn content from age and reclaims old/progress frames behind it', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    const old = r.nextSeq('s1'); r.store('s1', old, 0, frame(old))
+    r.beginActiveTurn('s1', 'm-user-1')
+    const content = r.nextSeq('s1'); r.store('s1', content, 10, frame(content))
+    const progress = r.nextSeq('s1'); r.store('s1', progress, 20, frame(progress), 'progress')
+
+    const replay = r.peekActiveTurnReplay('s1', 'm-user-1', 1000)
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.deepEqual(replay.sent.map((entry) => entry.seq), [content])
+    assert.equal(replay.evicted.age, 2, 'previous-turn content and expired progress are reclaimed')
+    assert.equal(r.size('s1'), 1)
+  })
+
+  it('fails the whole active replay after an absolute hard cap drops current content', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 1, maxAgeMs: 1e9, maxBytes: 1e9 })
+    r.beginActiveTurn('s1', 'm-user-1')
+    const first = r.nextSeq('s1'); r.store('s1', first, 1, frame(first))
+    const second = r.nextSeq('s1'); r.store('s1', second, 2, frame(second))
+
+    const replay = r.peekActiveTurnReplay('s1', 'm-user-1', 2)
+    assert.equal(replay.ok, false)
+    if (replay.ok) return
+    assert.equal(replay.reason, 'buffer_miss')
+    assert.deepEqual(replay.sent, [])
+  })
+
+  it('keeps progress-only age loss replay-safe across pruneAll and later content', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    r.beginActiveTurn('s1', 'm-user-1')
+    const progress = r.nextSeq('s1'); r.store('s1', progress, 0, frame(progress), 'progress')
+
+    assert.equal(r.pruneAll(1000).age, 1)
+    assert.equal(r.size('s1'), 0)
+    const emptyReplay = r.peekActiveTurnReplay('s1', 'm-user-1', 1000)
+    assert.equal(emptyReplay.ok, true)
+    if (!emptyReplay.ok) return
+    assert.deepEqual(emptyReplay.sent, [])
+
+    const content = r.nextSeq('s1'); r.store('s1', content, 1001, frame(content))
+    const replay = r.peekActiveTurnReplay('s1', 'm-user-1', 1001)
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.deepEqual(replay.sent.map((entry) => entry.seq), [content])
+  })
+
+  it('requires exact identity and clears protection only for the matching owner', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 10, maxAgeMs: 100, maxBytes: 1e9 })
+    r.beginActiveTurn('s1', 'm-user-1')
+    const seq = r.nextSeq('s1'); r.store('s1', seq, 0, frame(seq))
+
+    const wrongReplay = r.peekActiveTurnReplay('s1', 'm-user-2', 1000)
+    assert.equal(wrongReplay.ok, false)
+    if (!wrongReplay.ok) assert.equal(wrongReplay.reason, 'no_buffer')
+    r.endActiveTurn('s1', 'm-user-2', 1000)
+    assert.equal(r.activeTurnClientMessageId('s1'), 'm-user-1')
+
+    const evicted = r.endActiveTurn('s1', 'm-user-1', 1000)
+    assert.equal(evicted.age, 1)
+    assert.equal(r.activeTurnClientMessageId('s1'), undefined)
+    assert.equal(r.size('s1'), 0)
+  })
+
+  it('supports an active lock owner before its first output and clear() removes the marker', () => {
+    const r = new OutboundRingBuffer()
+    r.beginActiveTurn('s1', 'm-user-1')
+    const replay = r.peekActiveTurnReplay('s1', 'm-user-1')
+    assert.equal(replay.ok, true)
+    if (replay.ok) assert.deepEqual(replay.sent, [])
+    r.clear('s1')
+    assert.equal(r.activeTurnClientMessageId('s1'), undefined)
+  })
+})
+
 describe('OutboundRingBuffer pruning', () => {
   it('prunes by maxEntries', () => {
     const r = new OutboundRingBuffer({ maxEntries: 2, maxAgeMs: 1e9, maxBytes: 1e9 })

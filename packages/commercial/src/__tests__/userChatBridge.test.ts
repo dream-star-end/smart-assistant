@@ -943,7 +943,11 @@ describe("userChatBridge — model authorization", () => {
         });
       });
 
-      ws.send(JSON.stringify({ type: "inbound.message", model: "glm-5.2" }));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        model: "glm-5.2",
+        clientMessageId: "m-user-exact",
+      }));
       const got = await seenP;
       const text = typeof got.data === "string" ? got.data : got.data.toString("utf8");
       // CG2a:inbound.message 现在会被 master 注入 traceId(32-hex)— 验类型 + model 透传 +
@@ -951,6 +955,7 @@ describe("userChatBridge — model authorization", () => {
       const forwarded = JSON.parse(text) as Record<string, unknown>;
       assert.equal(forwarded.type, "inbound.message");
       assert.equal(forwarded.model, "glm-5.2");
+      assert.equal(forwarded.clientMessageId, "m-user-exact");
       assert.match(forwarded.traceId as string, /^[a-f0-9]{32}$/);
 
       ws.close();
@@ -1472,7 +1477,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
 
       const helloFrame = JSON.stringify({
         type: "inbound.hello",
-        peers: [{ peerId: "peerH", agentId: "main", lastFrameSeq: 0 }],
+        peers: [{
+          peerId: "peerH",
+          agentId: "main",
+          lastFrameSeq: 0,
+          resumeActiveTurnCandidateMessageIds: ["m-queued", "m-running"],
+        }],
       });
       ws.send(helloFrame);
       // 等容器侧记到这条帧

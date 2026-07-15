@@ -9,6 +9,65 @@ import { materializeLosslessTurn } from "../http/losslessTurnTape.js";
 const TURN_KEY = "a".repeat(64);
 
 describe("materializeLosslessTurn", () => {
+  test("stamps exact client turn attribution into every immutable record and hash", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-123",
+      agentId: "main",
+      turnIndex: 6,
+      clientMessageId: "m-user-exact_1",
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "answer",
+      thinkingText: "thought",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "tool-exact",
+        blockId: "tool-exact",
+        toolName: "Read",
+        inputJson: { file: "x" },
+        inputPreview: "x",
+        output: "done",
+        isError: false,
+        durationMs: 1,
+        ts: 1,
+      }],
+    });
+    assert.ok(turn.records.length >= 3);
+    for (const record of turn.records) {
+      assert.equal(record.payload._clientMessageId, "m-user-exact_1");
+      assert.equal(
+        createHash("sha256").update(record.payloadBytes).digest("hex"),
+        record.payloadSha256,
+      );
+    }
+  });
+
+  test("rejects malformed attribution and forbids it on content-only continuations", () => {
+    const base = {
+      sessionId: "web-lossless-123",
+      agentId: "main",
+      turnIndex: 6,
+      status: "completed" as const,
+      turnKey: TURN_KEY,
+      text: "answer",
+      createdAt: 1_783_944_000_000,
+    };
+    assert.throws(
+      () => materializeLosslessTurn({ ...base, clientMessageId: "bad id" }),
+      /clientMessageId is invalid/,
+    );
+    assert.throws(
+      () => materializeLosslessTurn({
+        ...base,
+        clientMessageId: "m-user-exact",
+        continuationOfTurnKey: "b".repeat(64),
+        text: "",
+        runtimeEvents: [{ ordinal: 1, observedAt: 2, source: "ccb", payload: { type: "tail" } }],
+      }),
+      /continuation must contain only/,
+    );
+  });
+
   test("keeps full thinking, tool IO, assistant text and child transcript", () => {
     const thinking = "reasoning😀".repeat(20_000);
     const answer = "answer正文".repeat(20_000);

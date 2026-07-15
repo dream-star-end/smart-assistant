@@ -23,6 +23,7 @@ import {
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
   resetAgentFrameSeqCursorsForSession,
+  resetFrameSeqCursor,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -84,6 +85,7 @@ import type {
   OutboundMessageWire,
   OutboundPermissionRequestWire,
   OutboundPermissionSettledWire,
+  OutboundActiveTurnReplayStartWire,
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundWire,
@@ -91,7 +93,7 @@ import type {
   RepoStatusWire,
 } from "./frames";
 import { incidentStore } from "../incidentStore";
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, isClientMessageId } from "@openclaude/protocol";
 
 export type { ChatStatusClass };
 
@@ -107,7 +109,10 @@ export type ChatSocketDeps = {
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportClientError?: (p: { type: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
-  syncSession?: (sessId: string) => Promise<void> | void;
+  syncSession?: (
+    sessId: string,
+    context?: { clientMessageId?: string },
+  ) => Promise<void> | void;
   /**
    * 首次发消息前在主控创建 client_sessions 行（PUT /api/sessions/:id，messages:[]）。
    * v3 commercial 持久化契约：**前端 PUT 建行 + 元数据，容器 server-authored 往该行 append
@@ -241,6 +246,11 @@ export class ChatSocket {
   // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
   /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
   private readonly lastSyncAt = new Map<string, number>();
+  /** Exact active-turn candidate sets already attempted on the current WS.
+   * History can arrive after the initial shell hello; each new candidate set
+   * gets one targeted registration hello, then waits for a reconnect before
+   * retrying to avoid a resume_failed/sync loop. */
+  private readonly activeReplayAttemptKeys = new Set<string>();
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
 
@@ -717,6 +727,7 @@ export class ChatSocket {
     } = {},
   ): void {
     sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
     if (opts.clearTiming !== false) clearTurnTiming(sess);
     if (opts.resetTracker !== false) resetReplyTracker(sess);
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
@@ -729,7 +740,7 @@ export class ChatSocket {
   // ═══════════════ reducer effects ═══════════════
   private effects(): FrameEffects {
     return {
-      onFinal: (sess, _frame, isCronOrHeartbeat) => {
+      onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         if (this.reconnectInFlightSet) {
@@ -755,6 +766,17 @@ export class ChatSocket {
         if (!isCronOrHeartbeat) this.kickQueuedDrainIfIdle();
         // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
         this.deps.persistSession?.(sess.id);
+        // 真终态到达时 lossless tape 已完成，立即做一次精确 REST 对账，让
+        // server-authored srv-* 行替换这一轮的 m-* fallback。reconcile 已在
+        // forceSync 分支恰好拉一次；interrupted/cron 没有新权威 tape，均不拉。
+        if (
+          !isCronOrHeartbeat &&
+          frame.meta?.reconcile !== "turn_completed" &&
+          !frame.meta?.interrupted
+        ) {
+          if (clientMessageId) void this.deps.syncSession?.(sess.id, { clientMessageId });
+          else void this.deps.syncSession?.(sess.id);
+        }
       },
       onLiveFrame: (sess) => {
         if (sess._sendingInFlight) {
@@ -771,8 +793,8 @@ export class ChatSocket {
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", message: p.message, traceId: p.traceId, sessionId: p.sessionId }),
-      forceSync: (sessId) => {
-        void this.deps.syncSession?.(sessId);
+      forceSync: (sessId, context) => {
+        void this.deps.syncSession?.(sessId, context);
       },
       persistSession: (sessId) => this.deps.persistSession?.(sessId),
       onAuthControlError: () => {
@@ -799,6 +821,7 @@ export class ChatSocket {
     }
     this.setStatus("连接中…", "connecting");
     this.relayReady = false; // 新连接:relay 未确认,待 sys.relay_ready
+    this.activeReplayAttemptKeys.clear();
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     const url = `${proto}${location.host}${WS_PATH}`;
     // 鉴权 = Sec-WebSocket-Protocol 子协议 ['bearer', token]（非 ?token= 非 header）。
@@ -845,7 +868,7 @@ export class ChatSocket {
 
       // 发 hello（autoResume：每 peer 带 lastFrameSeq）。
       try {
-        this.safeWsSend(this.buildHelloFrame());
+        this.sendHelloFrame();
       } catch {
         /* ignore */
       }
@@ -1111,6 +1134,21 @@ export class ChatSocket {
         if (sess) applyPermissionSettled(sess, frame);
         return;
       }
+      case "outbound.active_turn_replay_start": {
+        const frame = f as OutboundActiveTurnReplayStartWire;
+        const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
+        if (!sess || !isClientMessageId(frame.clientMessageId)) return;
+        // Only this direct, server-verified boundary may move an agent-scoped
+        // cursor backwards. The following replay contains exclusively frames
+        // after that exact turn's server-owned baseSeq.
+        resetFrameSeqCursor(sess, frame);
+        sess._activeClientMessageId = frame.clientMessageId;
+        sess._sendingInFlight = true;
+        sess._localTeardownAt = undefined;
+        sess._liveStreamBroken = false;
+        this.deps.persistSession?.(sess.id);
+        return;
+      }
       case "outbound.resume_failed": {
         const frame = f as OutboundResumeFailedWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
@@ -1277,16 +1315,59 @@ export class ChatSocket {
    *  - false（bind 前的注册刷新）：所有 peer 强制 inFlight=false —— 纯 peer 注册副作用，
    *    绝不触发任何 synthetic 中断（对齐 v3 _buildHelloFrame includeInFlight=false）。
    */
-  private buildHelloFrame(includeInFlight = true): string {
-    const peers: Array<{ peerId: string; agentId: string; inFlight: boolean; lastFrameSeq: number }> = [];
+  private activeTurnReplayCandidates(sess: ChatSession): string[] {
+    const newestFirst: string[] = [];
+    let oldestValid: string | undefined;
+    let validCount = 0;
+    for (let i = sess.messages.length - 1; i >= 0; i--) {
+      const message = sess.messages[i];
+      if (message?._genPlaceholder) continue;
+      if (message?.role !== "user") break;
+      if (!isClientMessageId(message.id)) continue;
+      validCount++;
+      oldestValid = message.id;
+      // The lock owner is normally the oldest user in a contiguous queued
+      // block. Preserve it separately, then spend the remaining bounded hint
+      // budget on the newest rows for queue/drain races.
+      if (newestFirst.length < 31) newestFirst.push(message.id);
+    }
+    if (validCount > 31 && oldestValid) return [oldestValid, ...newestFirst.reverse()];
+    return newestFirst.reverse();
+  }
+
+  private composeHelloFrame(
+    includeInFlight = true,
+    onlySessionId?: string,
+    requireFreshActiveCandidate = false,
+  ): { data: string; attemptKeys: string[] } {
+    const peers: Array<{
+      peerId: string;
+      agentId: string;
+      inFlight: boolean;
+      lastFrameSeq: number;
+      resumeActiveTurnCandidateMessageIds?: string[];
+    }> = [];
+    const attemptKeys: string[] = [];
     for (const [pid, s] of this.sessions) {
+      if (onlySessionId && pid !== onlySessionId) continue;
       const safeId = String(pid).replace(/[^a-zA-Z0-9_-]/g, "_");
       const emitted = new Set<string>();
       const pushPeer = (agentId: string, lastFrameSeq: number) => {
         const aid = agentId || s.agentId || this.deps.defaultAgentId || "main";
         if (emitted.has(aid)) return;
         emitted.add(aid);
-        peers.push({ peerId: pid, agentId: aid, inFlight: includeInFlight ? !!s._sendingInFlight : false, lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0 });
+        const candidates = this.activeTurnReplayCandidates(s);
+        const attemptKey = candidates.length > 0 ? `${pid}:${aid}:${candidates.join(",")}` : "";
+        const hasFreshCandidates = !!attemptKey && !this.activeReplayAttemptKeys.has(attemptKey);
+        if (requireFreshActiveCandidate && !hasFreshCandidates) return;
+        if (hasFreshCandidates) attemptKeys.push(attemptKey);
+        peers.push({
+          peerId: pid,
+          agentId: aid,
+          inFlight: includeInFlight ? !!s._sendingInFlight : false,
+          lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0,
+          ...(hasFreshCandidates ? { resumeActiveTurnCandidateMessageIds: candidates } : {}),
+        });
       };
       const byKey = s._lastFrameSeqByKey;
       if (byKey && typeof byKey === "object") {
@@ -1300,7 +1381,23 @@ export class ChatSocket {
       const defKey = safeSessionKeyForAgent(s.id, defAgent);
       pushPeer(defAgent, byKey && Number.isFinite(byKey[defKey]) ? byKey[defKey] : 0);
     }
-    return JSON.stringify({ type: "inbound.hello", channel: "webchat", peers });
+    return { data: JSON.stringify({ type: "inbound.hello", channel: "webchat", peers }), attemptKeys };
+  }
+
+  private buildHelloFrame(includeInFlight = true, onlySessionId?: string): string {
+    return this.composeHelloFrame(includeInFlight, onlySessionId).data;
+  }
+
+  private sendHelloFrame(
+    includeInFlight = true,
+    onlySessionId?: string,
+    requireFreshActiveCandidate = false,
+  ): boolean {
+    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshActiveCandidate);
+    if (requireFreshActiveCandidate && hello.attemptKeys.length === 0) return false;
+    const sent = this.safeWsSend(hello.data);
+    if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
+    return sent;
   }
 
   private tearDownAuth(): void {
@@ -1433,6 +1530,9 @@ export class ChatSocket {
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
     this.lastSyncAt.delete(sessId);
+    for (const key of this.activeReplayAttemptKeys) {
+      if (key.startsWith(`${sessId}:`)) this.activeReplayAttemptKeys.delete(key);
+    }
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -1448,6 +1548,7 @@ export class ChatSocket {
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
     this.lastSyncAt.clear();
+    this.activeReplayAttemptKeys.clear();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
@@ -1496,6 +1597,9 @@ export class ChatSocket {
       _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
       _lastFrameSeq: s._lastFrameSeq,
       ...(s._sendingInFlight ? { _sendingInFlight: true } : {}),
+      ...(s._sendingInFlight && isClientMessageId(s._activeClientMessageId)
+        ? { _activeClientMessageId: s._activeClientMessageId }
+        : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
@@ -1551,6 +1655,9 @@ export class ChatSocket {
       Date.now() - inFlightReference < THINKING_SAFETY_MS;
     s._sendingInFlight = inFlightFresh;
     if (inFlightFresh) {
+      s._activeClientMessageId = isClientMessageId(stored._activeClientMessageId)
+        ? stored._activeClientMessageId
+        : undefined;
       s._turnStartedAt = typeof stored._turnStartedAt === "number" ? stored._turnStartedAt : Date.now();
       s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
     }
@@ -1585,7 +1692,11 @@ export class ChatSocket {
     msgs: ChatMessage[],
     full: boolean,
     maxSeq?: number,
-    archive?: { archivedThroughSeq?: number; archivedCount?: number },
+    archive?: {
+      archivedThroughSeq?: number;
+      archivedCount?: number;
+      completedClientMessageId?: string;
+    },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
     const archivedThroughSeq =
@@ -1593,7 +1704,12 @@ export class ChatSocket {
         ? archive.archivedThroughSeq
         : 0;
     s.messages = full
-      ? mergeFullServerWins(msgs, s.messages, archivedThroughSeq)
+      ? mergeFullServerWins(
+          msgs,
+          s.messages,
+          archivedThroughSeq,
+          archive?.completedClientMessageId,
+        )
       : applyServerIncremental(s.messages, msgs);
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
@@ -1613,6 +1729,14 @@ export class ChatSocket {
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
     expireGenPlaceholdersAgainstServerRows(s);
     this.scheduleNotify();
+    // Login/reload can open WS before REST history arrives. If that initial
+    // shell hello had no user-row identity it can only produce a generic
+    // resume_failed. Once full history exposes trailing persisted user rows,
+    // issue one targeted registration hello so the server can verify and
+    // replay the exact active turn from its protected boundary.
+    if (full && this.ws && this.ws.readyState === 1) {
+      this.sendHelloFrame(false, sessId, true);
+    }
   }
 
   /**
@@ -1683,7 +1807,7 @@ export class ChatSocket {
     // 不触发 auto-resume 合成中断），否则 bridge 5s 后回 SESSION_NOT_REGISTERED（对齐 v3
     // bind 前 refreshWebchatHelloForCurrentSession）。reconnect 兜底仍由 onopen/relay_ready flush 覆盖。
     this.ensureSession(sessId, agentId);
-    if (this.ws && this.ws.readyState === 1) this.safeWsSend(this.buildHelloFrame(false));
+    if (this.ws && this.ws.readyState === 1) this.sendHelloFrame(false);
     this.flushRepoBind(sessId);
   }
 
@@ -1784,6 +1908,7 @@ export class ChatSocket {
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
     });
+    payload.clientMessageId = userMsg.id;
     // 生成占位卡（需求 C）：imageEdit 提交紧随乐观 user 行注入一条**本地专属**占位行
     // （role 'system' 客户端域，空文本），jobId = clientJobId。生成期间 MessageList 拦截
     // 渲染 GeneratingPlaceholderCard；本会话 turn final 由 reducer 按 jobId 消解（结果图作为
@@ -1925,6 +2050,7 @@ export class ChatSocket {
         this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
       }
       sess._sendingInFlight = true;
+      sess._activeClientMessageId = userMsg.id;
       sess._localTeardownAt = undefined;
       sess._turnStartedAt = Date.now();
       // 新 turn 开始：清跨 turn 计费归因状态（与 drain / auto-continue turn-start 一致）。
@@ -1984,6 +2110,7 @@ export class ChatSocket {
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };
+    payload.clientMessageId = userMsg.id;
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
     // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
     this.ensureGenPlaceholder(sess, userMsg._imageEdit, true, userMsg.id);
@@ -2085,6 +2212,7 @@ export class ChatSocket {
       _modelText: RESTART_CONTINUE_PROMPT,
       _idem: idem,
     });
+    payload.clientMessageId = userMsg.id;
     const sent = this.safeWsSend(JSON.stringify(payload));
     if (!sent) {
       const ri = sess.messages.indexOf(userMsg);
@@ -2094,6 +2222,7 @@ export class ChatSocket {
     }
     userMsg.status = "sent";
     sess._sendingInFlight = true;
+    sess._activeClientMessageId = userMsg.id;
     sess._localTeardownAt = undefined;
     this.scheduleNotify();
   }
@@ -2149,6 +2278,7 @@ export class ChatSocket {
       _modelText: AUTO_CONTINUE_PROMPT,
       _idem: idem,
     });
+    payload.clientMessageId = userMsg.id;
     const sent = this.safeWsSend(JSON.stringify(payload));
     if (!sent) {
       const ri = sess.messages.indexOf(userMsg);
@@ -2158,6 +2288,7 @@ export class ChatSocket {
     }
     userMsg.status = "sent";
     sess._sendingInFlight = true;
+    sess._activeClientMessageId = userMsg.id;
     sess._localTeardownAt = undefined;
     sess._turnStartedAt = Date.now();
     sess._pendingCostCredits = "0";
@@ -2283,6 +2414,7 @@ export class ChatSocket {
       const msg = sess.messages.find((m) => m.id === item.msgId);
       if (msg) msg.status = "sent";
       sess._sendingInFlight = true;
+      sess._activeClientMessageId = item.msgId;
       sess._localTeardownAt = undefined;
       sess._turnStartedAt = Date.now();
       sess._pendingCostCredits = "0";

@@ -139,6 +139,10 @@ export type ChatMessage = {
    * 见 persist.stableSortByTs。
    */
   _seq?: number;
+  /** Exact persisted user row that owns this turn. Server-authored rows get
+   * this from the immutable lossless tape; local fallback m-* output rows are
+   * tagged while streaming so final sync can replace only the right turn. */
+  _clientMessageId?: string;
 
   // ── user ──
   status?: UserMsgStatus;
@@ -309,6 +313,8 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: string | null;
+  /** User-row id of the turn currently streaming in this browser. */
+  _activeClientMessageId?: string;
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
 
@@ -367,6 +373,14 @@ export function addMessage(
     { id: mintMsgId(), role, text: text || "", ts: Date.now() },
     extra || {},
   ) as ChatMessage;
+  if (
+    sess._activeClientMessageId &&
+    msg.id.startsWith("m-") &&
+    (role === "assistant" || role === "thinking" || role === "tool") &&
+    msg._source !== "server"
+  ) {
+    msg._clientMessageId ??= sess._activeClientMessageId;
+  }
   sess.messages.push(msg);
   sess.lastAt = Date.now();
   if (role === "user") {

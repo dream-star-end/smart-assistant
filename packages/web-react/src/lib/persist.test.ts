@@ -94,6 +94,47 @@ function stored(id: string, over: Partial<StoredSession> = {}): StoredSession {
 }
 
 describe("persist — 历史合并纯函数", () => {
+  test("exact terminal evidence replaces only that turn's m-* fallback, not a queued next turn", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "m-local-a1", role: "assistant", text: "fallback u1", ts: 2, _clientMessageId: "m-user-1" },
+      { id: "m-user-2", role: "user", text: "u2 queued", ts: 3, status: "queued" },
+      { id: "m-local-a2", role: "assistant", text: "fallback u2", ts: 4, _clientMessageId: "m-user-2" },
+    ];
+    const server: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "srv-u1", role: "assistant", text: "canonical u1", ts: 2, _source: "server", _clientMessageId: "m-user-1" },
+      { id: "m-user-2", role: "user", text: "u2 queued", ts: 3, status: "queued" },
+    ];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    expect(merged.some((m) => m.id === "m-local-a1")).toBe(false);
+    expect(merged.some((m) => m.id === "srv-u1")).toBe(true);
+    expect(merged.some((m) => m.id === "m-local-a2")).toBe(true);
+  });
+
+  test("another turn's server output is not completion evidence for the requested turn", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "m-local-a1", role: "assistant", text: "fallback u1", ts: 2, _clientMessageId: "m-user-1" },
+    ];
+    const server: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "srv-u2", role: "assistant", text: "canonical u2", ts: 3, _source: "server", _clientMessageId: "m-user-2" },
+    ];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    expect(merged.some((m) => m.id === "m-local-a1")).toBe(true);
+  });
+
+  test("user-only history does not erase a streaming fallback before terminal tape exists", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "m-local-a1", role: "assistant", text: "still streaming", ts: 2, _clientMessageId: "m-user-1" },
+    ];
+    const server = [{ id: "m-user-1", role: "user", text: "u1", ts: 1 } satisfies ChatMessage];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    expect(merged.some((m) => m.id === "m-local-a1")).toBe(true);
+  });
+
   test("mergeFullServerWins: server 权威 + 保留末尾乐观尾（server 不认识）", () => {
     const server = [msg("a", "S-a"), msg("b", "S-b")];
     // a 重叠（取 server），末尾 c 是本地乐观尾（server 还没持久化）→ 保留。
