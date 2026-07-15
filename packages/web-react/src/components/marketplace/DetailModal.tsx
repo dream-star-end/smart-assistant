@@ -70,6 +70,13 @@ const TOOLSET_LABEL: Record<string, string> = {
   web_context: '网页提取',
 }
 
+function scriptReviewCopy(source: MarketplaceDetail['reviewSource']): string {
+  if (source === 'manual') return '已通过平台危险模式扫描与管理员人工审核。'
+  if (source === 'ai') return '已通过平台危险模式扫描与 AI 自动审核。'
+  if (source === 'platform') return '这是平台官方内容，已通过发布校验与危险模式扫描。'
+  return '已通过平台危险模式扫描与发布审核。'
+}
+
 /** Friendly render of an agent manifest (model / toolsets / 依赖技能 / 人设). */
 function AgentManifestView({ manifest }: { manifest: unknown }) {
   const m = (manifest ?? {}) as {
@@ -269,7 +276,7 @@ export function DetailModal({
     <Modal
       open={!!slug}
       onOpenChange={(o) => !o && onClose()}
-      title={detail?.name ?? '技能详情'}
+      title={detail?.name ?? '市场详情'}
       description={detail ? `${detail.slug} · v${detail.version}` : undefined}
       footer={
         detail && (
@@ -290,7 +297,7 @@ export function DetailModal({
               <>
                 <Badge tone="success" className="self-center">
                   <ShieldCheck size={13} />
-                  {isOfficialConnector ? '官方连接器 · 已预装' : '平台预设 · 开箱即用'}
+                  {isOfficialConnector ? '官方 API 插件 · 已预装' : '平台预设 · 开箱即用'}
                 </Badge>
                 {isOfficialConnector && onOpenConnectors && (
                   <Button variant="primary" onClick={onOpenConnectors}>
@@ -348,7 +355,7 @@ export function DetailModal({
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span>
                   {detail.kind === 'connector'
-                    ? '已加入你的连接器，请到管理中心绑定应用账号。'
+                    ? 'API 连接插件已加入你的能力库，请到管理中心绑定应用账号。'
                     : isAgent
                       ? '可在输入框上方的智能体选择器中切换使用。'
                       : '将在你的下一次会话中对 AI 可用。'}
@@ -367,7 +374,7 @@ export function DetailModal({
             </Alert>
           )}
           {isOfficialConnector && (
-            <Alert tone="info" title="官方预装连接器">
+            <Alert tone="info" title="官方预装 API 插件">
               无需安装；可直接到管理中心绑定你的应用账号。
             </Alert>
           )}
@@ -445,8 +452,8 @@ export function DetailModal({
             Object.keys(detail.rawBundle).some((p) => p.startsWith('scripts/')) && (
               <Alert tone="warning" title="含可执行脚本">
                 该技能带 {Object.keys(detail.rawBundle).filter((p) => p.startsWith('scripts/')).length}{' '}
-                个脚本文件,安装后可能被智能体执行。脚本已过平台危险模式扫描与人工审核,
-                但建议安装前点开逐个查看内容。
+                个脚本文件，安装后可能被智能体执行。{scriptReviewCopy(detail.reviewSource)}
+                建议安装前点开逐个查看内容。
               </Alert>
             )}
           {detail.rawBundle && Object.keys(detail.rawBundle).length > 0 && (
@@ -469,7 +476,7 @@ export function DetailModal({
             <AgentManifestView manifest={detail.manifest} />
           ) : detail.kind === 'connector' ? (
             <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-3 py-2.5">
-              <div className="text-[12px] font-medium text-muted">平台已签安全范围</div>
+              <div className="text-[12px] font-medium text-muted">API 插件 · 平台已签安全范围</div>
               {detail.connectorContract ? (
                 <>
                   <div className="text-[12.5px] text-fg">

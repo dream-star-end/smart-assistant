@@ -126,7 +126,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       try {
         if (row?.kind === "connector" && decision === "approve") {
           if (!connectorVerified.has(versionId)) {
-            setErr("批准连接器前，必须确认已使用隔离账号完成真实功能验收。");
+            setErr("批准 API 插件前，必须确认已使用隔离账号完成真实功能验收。");
             return;
           }
           const suggested = (row.manifest as { proposedSecurityDecision?: unknown } | null)
@@ -259,7 +259,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 onClick={() => batchReview("approve")}
                 disabled={selectedVisibleIds.length === 0 || selectedHasConnector || busy !== null}
                 title={
-                  selectedHasConnector ? "连接器必须逐个填写实际安全决策并确认功能验收" : undefined
+                  selectedHasConnector ? "API 插件必须逐个填写实际安全决策并确认功能验收" : undefined
                 }
               >
                 {busy === "batch:approve" ? <Loader2 size={14} className="animate-spin" /> : null}
@@ -298,7 +298,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             {r.name}
                           </span>
                           {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
-                          {r.kind === "connector" && <Badge tone="info">连接器 · 人工安全审</Badge>}
+                          {r.kind === "connector" && <Badge tone="info">API 插件 · 人工安全审</Badge>}
                           <Badge tone="neutral">v{r.version}</Badge>
                           {/* 存量/平台 seed 行缺人向元数据 → 中性提示徽章(非阻断,仅提示补齐)。 */}
                           {humanMetaMissing(r) && <Badge tone="neutral">人向元数据缺失</Badge>}
@@ -647,7 +647,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
         <datalist id="revoke-slug-options">
           {catalog.map((c) => (
             <option key={c.slug} value={c.slug}>
-              {c.name}（{c.kind === "agent" ? "智能体" : c.kind === "connector" ? "连接器" : "技能"}
+              {c.name}（{c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}
               ）
             </option>
           ))}

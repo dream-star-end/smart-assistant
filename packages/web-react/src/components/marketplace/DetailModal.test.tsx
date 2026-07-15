@@ -153,3 +153,31 @@ test("信号徽章:旧后端缺字段 → 不渲染 usage/rating,仅保留安装
   expect(screen.queryByText(/次使用/)).not.toBeInTheDocument();
   expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
 });
+
+test.each([
+  ["ai", /AI 自动审核/, /管理员人工审核/],
+  ["manual", /管理员人工审核/, /AI 自动审核/],
+  ["platform", /平台官方内容/, /管理员人工审核/],
+  [undefined, /发布审核/, /管理员人工审核/],
+] as const)("脚本信任文案按 reviewSource=%s 如实展示", async (source, expected, forbidden) => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({
+      reviewSource: source,
+      rawBundle: { "scripts/run.sh": "echo ok" },
+    }),
+  );
+  listMyAgents.mockResolvedValue([]);
+
+  render(
+    <DetailModal
+      slug="academic-translate"
+      auth={auth}
+      onClose={() => {}}
+      onInstalled={() => {}}
+    />,
+  );
+
+  expect(await screen.findByText("含可执行脚本")).toBeInTheDocument();
+  expect(screen.getByText(expected)).toBeInTheDocument();
+  expect(screen.queryByText(forbidden)).not.toBeInTheDocument();
+});

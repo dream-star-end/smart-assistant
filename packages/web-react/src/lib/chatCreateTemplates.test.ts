@@ -11,7 +11,7 @@ describe('connector chat creation template', () => {
     expect(template).toContain('--spec-file /tmp/connector-spec.json')
     expect(template).toContain('--security-decision-file /tmp/connector-security-decision.json')
     expect(template).toContain('AI 自动审核')
-    expect(template).toContain('管理中心 → 连接器')
+    expect(template).toContain('管理中心 → 插件账号')
     expect(template).not.toContain('平台人工审核')
     expect(template).not.toContain('packages/commercial/src/connectors')
   })

@@ -675,23 +675,23 @@ export const TUTORIAL_TOPICS = {
   },
   connectors: {
     featureId: "connectors",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "连接器让智能体在获得授权后读取或写入外部服务。当前目录包含 Notion、飞书、GitHub 及通过审核的声明式连接器，实际可用项以管理中心和市场为准；账号与授权在管理中心统一维护。",
+      "API 连接插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装插件；管理中心只负责账号、凭据与授权。当前支持 Notion、飞书、GitHub 及通过审核的声明式 HTTP 插件。",
     outcome: "让 AI 在真实业务系统里查数据和执行动作，而不靠手工搬运。",
     scenarios: [
       "读取 Notion 或飞书文档",
       "在 GitHub 上协作开发",
-      "调用已审核的业务连接器",
+      "调用已审核的业务 API 插件",
     ],
     steps: [
       {
-        title: "从市场安装连接器",
+        title: "从市场安装插件",
         body: "先查看来源、允许的域名、读取/写入动作和认证方式，再确认安装。",
       },
       {
         title: "绑定账号",
-        body: "进入管理中心 → 连接器，按提示 OAuth 授权或填写凭据；可为多个账号设置备注名。",
+        body: "进入管理中心 → 插件账号，按提示 OAuth 授权或填写凭据；可为多个账号设置备注名。",
       },
       {
         title: "在任务里明确账号与动作",
@@ -699,7 +699,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "随时解绑",
-        body: "不再使用时在管理中心解绑账号或卸载连接器，撤销后后续调用立即失效。",
+        body: "不再使用时在管理中心解绑账号或卸载插件，撤销后后续调用立即失效。",
       },
     ],
     tips: [
@@ -707,7 +707,7 @@ export const TUTORIAL_TOPICS = {
       "首次先做只读查询，确认范围后再允许写入。",
     ],
     cautions: [
-      "连接器权限来自外部服务；高风险写操作务必检查目标、数量和影响范围。不要在对话里粘贴密钥。",
+      "插件权限来自外部服务；高风险写操作务必检查目标、数量和影响范围。不要在对话里粘贴密钥。",
     ],
     media: "connectors",
     related: [
@@ -718,15 +718,15 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-discovery": {
     featureId: "marketplace-discovery",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "AI 市场汇集技能、智能体和连接器。发现页按类别展示官方预设与社区作品，并提供搜索、使用信号、评分、评测信息和风险说明；已安装页用于更新、卸载和进入后续绑定。",
+      "AI 市场汇集三类能力：技能沉淀可复用的方法与流程；智能体组合模型、人设、工具权限和依赖；插件提供可安装、可授权、可审计的外部能力。当前插件分类先支持声明式 HTTP API。",
     outcome: "按任务快速加装专业能力，而不把所有功能塞进一个助手。",
     scenarios: ["寻找专业工作流", "安装领域智能体", "连接新的外部服务"],
     steps: [
       {
         title: "先选类型",
-        body: "技能是一套流程，智能体是一种角色，连接器负责外部服务；先判断自己缺哪一类。",
+        body: "缺方法与流程选技能；缺长期角色与编排选智能体；缺外部系统能力选插件。三者可以组合，而不是互相替代。",
       },
       {
         title: "搜索并阅读详情",
@@ -734,7 +734,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "安装后完成配置",
-        body: "技能可直接被智能体使用；智能体会出现在选择器；连接器还需到管理中心绑定账号。",
+        body: "技能可分配给智能体；智能体会出现在选择器；API 连接插件安装后还需到管理中心绑定账号。",
       },
       {
         title: "定期更新与清理",
@@ -753,15 +753,15 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-publishing": {
     featureId: "marketplace-publishing",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "你可以把自己的技能、智能体或连接器发布到公共市场。发布页支持在对话中由 AI 引导创建，也支持填写完整定义；提交后进入自动审核，高风险或不确定内容会转人工，状态和拒绝理由会持续显示。",
+      "你可以把自己的技能、智能体或插件发布到公共市场。发布页支持由 AI 在对话中生成结构化确认单；提交后自动审核，高风险或不确定内容转人工，状态变化会在市场内实时显示。当前插件发布支持声明式 HTTP API。",
     outcome: "把可复用能力版本化、接受审核，并分享给市场用户。",
-    scenarios: ["发布通用技能", "分享专业智能体", "封装受控 API 连接器"],
+    scenarios: ["发布通用技能", "分享专业智能体", "封装受控 API 连接插件"],
     steps: [
       {
         title: "先准备真实可用版本",
-        body: "在自己的账号里跑通技能评测、智能体任务或连接器身份探针。",
+        body: "在自己的账号里跑通技能评测、智能体任务或插件身份探针。",
       },
       {
         title: "完善介绍与边界",
@@ -781,7 +781,7 @@ export const TUTORIAL_TOPICS = {
       "版本号和变更说明要能让已安装用户判断是否更新。",
     ],
     cautions: [
-      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；连接器只能声明允许的固定域名和动作。",
+      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；API 插件只能声明允许的固定域名和动作。",
     ],
     media: "marketplace-publishing",
     related: ["skills-training", "connectors", "marketplace-discovery"],

@@ -2,6 +2,11 @@
  * v5 商业版前端类型。鉴权与账户形态对齐 v5 REST 契约
  * (packages/commercial/src/http/{handlers,agent}.ts)。
  */
+import type {
+  MarketplaceArtifactKind,
+  MarketplacePluginType,
+  MarketplaceReviewSource,
+} from "@openclaude/protocol";
 
 /**
  * 当前用户。`displayName` / `roles` 是 UI 既有展示字段（Sidebar / SettingsCenter 等读它），
@@ -869,6 +874,9 @@ export type MarketplaceRiskFlag = {
 /** 市场目录卡片（GET /api/marketplace/search 的 results 项）。 */
 export type MarketplaceCard = {
   slug: string;
+  /** 加法兼容投影；存量 `kind=connector` 在产品层展示为 plugin。 */
+  artifactKind?: MarketplaceArtifactKind;
+  pluginType?: MarketplacePluginType;
   kind: MarketplaceKind;
   name: string;
   description: string;
@@ -913,6 +921,8 @@ export type MarketplaceKind = "skill" | "agent" | "connector";
 /** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整工件供安装确认）。 */
 export type MarketplaceDetail = {
   slug: string;
+  artifactKind?: MarketplaceArtifactKind;
+  pluginType?: MarketplacePluginType;
   kind: MarketplaceKind;
   state: string;
   ownerUserId: string;
@@ -929,6 +939,8 @@ export type MarketplaceDetail = {
   /** 结构化元数据（智能体：model/toolsets/skillDeps；技能为 null）。 */
   manifest?: unknown;
   riskFlags: MarketplaceRiskFlag[];
+  /** 审核来源；旧后端缺字段时 UI 使用不夸大的通用文案。 */
+  reviewSource?: MarketplaceReviewSource | null;
   installCount: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
@@ -965,6 +977,8 @@ export type MarketplaceDetail = {
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
 export type MarketplaceInstalled = {
   slug: string;
+  artifactKind?: MarketplaceArtifactKind;
+  pluginType?: MarketplacePluginType;
   kind: MarketplaceKind;
   version: string;
   versionId: string;
@@ -982,6 +996,8 @@ export type MarketplaceInstalled = {
 export type MarketplaceMyPublish = {
   versionId: string;
   slug: string;
+  artifactKind?: MarketplaceArtifactKind;
+  pluginType?: MarketplacePluginType;
   kind: MarketplaceKind;
   version: string;
   name: string;
@@ -989,6 +1005,7 @@ export type MarketplaceMyPublish = {
   status: string;
   /** 审核备注（拒绝理由等）。 */
   reviewNote?: string | null;
+  reviewSource?: MarketplaceReviewSource | null;
   createdAt: string;
   reviewedAt?: string | null;
   /** 该版本是否 listing 当前上架版本。 */

@@ -173,11 +173,11 @@ export function InstalledPanel({
       {connectorCount > 0 && (
         <div className="mx-4 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-accent/30 bg-accent-soft/40 px-3 py-2.5">
           <span className="text-[12.5px] text-muted">
-            {connectorCount} 个已安装连接器已移至管理中心统一绑定、更新与卸载。
+            {connectorCount} 个 API 连接插件在管理中心统一绑定账号、更新与卸载。
           </span>
           {onOpenConnectors && (
             <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
-              打开连接器管理
+              管理插件账号
             </Button>
           )}
         </div>

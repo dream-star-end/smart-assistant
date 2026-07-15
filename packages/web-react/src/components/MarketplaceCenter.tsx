@@ -1,17 +1,37 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
-import type { AuthSession } from '../lib/types'
+import { marketplaceArtifactKind } from '../lib/marketplace'
+import type { AuthSession, MarketplaceMyPublish } from '../lib/types'
 import { cn } from '../lib/utils'
 import { BrowsePanel } from './marketplace/BrowsePanel'
 import { InstalledPanel } from './marketplace/InstalledPanel'
 import { PublishPanel } from './marketplace/PublishPanel'
 import { ReviewPanel } from './marketplace/ReviewPanel'
-import { Tabs } from './ui'
+import {
+  type MarketplacePublishTransition,
+  useMarketplacePublishes,
+} from './marketplace/useMarketplacePublishes'
+import { Alert, Button, Tabs } from './ui'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
+/** Legacy navigation/storage kind. Connector rows remain wire-compatible in PR1. */
 export type MarketplaceKind = 'skill' | 'agent' | 'connector'
+type MarketplaceBrowseKind = 'skill' | 'agent' | 'plugin'
+
+function browseKindFor(kind: MarketplaceKind): MarketplaceBrowseKind {
+  return kind === 'connector' ? 'plugin' : kind
+}
+
+function storageKindFor(kind: MarketplaceBrowseKind): MarketplaceKind {
+  return kind === 'plugin' ? 'connector' : kind
+}
+
+function artifactLabel(item: Pick<MarketplaceMyPublish, 'kind' | 'artifactKind'>): string {
+  const kind = marketplaceArtifactKind(item)
+  return kind === 'plugin' ? 'API 连接插件' : kind === 'agent' ? '智能体' : '技能'
+}
 
 /**
  * AI 市场：发现 / 已安装 / 发布 /（管理员）审核。
@@ -54,11 +74,44 @@ export function MarketplaceCenter({
   // admin 关闭时若停在 review，回落到 browse。
   const safeTab: MarketplaceTab = tab === 'review' && !isAdmin ? 'browse' : tab
 
-  const [browseKind, setBrowseKind] = useState<MarketplaceKind>(initialBrowseKind)
+  const [browseKind, setBrowseKind] = useState<MarketplaceBrowseKind>(() =>
+    browseKindFor(initialBrowseKind),
+  )
+  const [browseRevision, setBrowseRevision] = useState(0)
+  const [browseFocus, setBrowseFocus] = useState<{ slug: string; nonce: number } | null>(null)
+  const [publishNotices, setPublishNotices] = useState<MarketplacePublishTransition[]>([])
+  const publishNotice = publishNotices[0] ?? null
+
+  const onPublishTransition = useCallback((transition: MarketplacePublishTransition) => {
+    setBrowseRevision((revision) => revision + 1)
+    setPublishNotices((notices) => [...notices, transition])
+  }, [])
+  const publishes = useMarketplacePublishes({
+    auth,
+    enabled: open && !!auth,
+    onTransition: onPublishTransition,
+  })
+
   // when (re)opened, honor the requested category (e.g. opened to 智能体)
   useEffect(() => {
-    if (open) setBrowseKind(initialBrowseKind)
+    if (open) setBrowseKind(browseKindFor(initialBrowseKind))
+    else {
+      setPublishNotices([])
+      setBrowseFocus(null)
+    }
   }, [open, initialBrowseKind])
+
+  const openApprovedPublish = (transition: MarketplacePublishTransition) => {
+    setBrowseKind(browseKindFor(transition.publish.kind))
+    setBrowseFocus({ slug: transition.publish.slug, nonce: Date.now() })
+    setPublishNotices((notices) => notices.slice(1))
+    onTabChange('browse')
+  }
+
+  const dismissPublishNotice = () => setPublishNotices((notices) => notices.slice(1))
+  const consumeBrowseFocus = useCallback((nonce: number) => {
+    setBrowseFocus((current) => (current?.nonce === nonce ? null : current))
+  }, [])
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
@@ -72,7 +125,7 @@ export function MarketplaceCenter({
             <div>
               <Dialog.Title className="text-[15px] font-semibold text-fg">AI 市场</Dialog.Title>
               <p className="mt-0.5 text-[12px] text-faint">
-                发现并安装技能、智能体与连接器，也可以把自己的作品分享给大家。
+                发现并安装技能、智能体与插件，也可以把自己的作品分享给大家。
               </p>
             </div>
             <Dialog.Close asChild>
@@ -100,10 +153,52 @@ export function MarketplaceCenter({
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : (
               <>
+                {publishNotice && (
+                  <div className="px-4 pt-3" role="status">
+                    <Alert
+                      tone={publishNotice.publish.status === 'approved' ? 'success' : 'danger'}
+                      title={
+                        publishNotice.publish.status === 'approved'
+                          ? `${artifactLabel(publishNotice.publish)}已实时上架`
+                          : `${artifactLabel(publishNotice.publish)}未通过审核`
+                      }
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span>
+                          「{publishNotice.publish.name}」v{publishNotice.publish.version}
+                          {publishNotice.publish.status === 'approved'
+                            ? ' 已发布到市场。'
+                            : `：${publishNotice.publish.reviewNote || '请在「我的发布」查看并修改后重新提交。'}`}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => {
+                              if (publishNotice.publish.status === 'approved') {
+                                openApprovedPublish(publishNotice)
+                              } else {
+                                dismissPublishNotice()
+                                onTabChange('publish')
+                              }
+                            }}
+                          >
+                            {publishNotice.publish.status === 'approved'
+                              ? '在市场查看'
+                              : '查看我的发布'}
+                          </Button>
+                          <Button size="sm" variant="ghost" onClick={dismissPublishNotice}>
+                            关闭
+                          </Button>
+                        </div>
+                      </div>
+                    </Alert>
+                  </div>
+                )}
                 {safeTab === 'browse' && (
                   <div className="flex flex-col" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>
                     <div className="flex gap-1 px-4 pt-3">
-                      {(['skill', 'agent', 'connector'] as const).map((k) => (
+                      {(['skill', 'agent', 'plugin'] as const).map((k) => (
                         <button
                           type="button"
                           key={k}
@@ -115,13 +210,16 @@ export function MarketplaceCenter({
                               : 'text-muted hover:bg-hover hover:text-fg',
                           )}
                         >
-                          {k === 'skill' ? '技能' : k === 'agent' ? '智能体' : '连接器'}
+                          {k === 'skill' ? '技能' : k === 'agent' ? '智能体' : '插件'}
                         </button>
                       ))}
                     </div>
                     <BrowsePanel
                       auth={auth}
-                      kind={browseKind}
+                      kind={storageKindFor(browseKind)}
+                      revision={browseRevision}
+                      focusRequest={browseFocus}
+                      onFocusRequestConsumed={consumeBrowseFocus}
                       onAskAiInChat={onAskAiInChat}
                       onOpenConnectors={onOpenConnectors}
                     />
@@ -138,7 +236,15 @@ export function MarketplaceCenter({
                 )}
                 {safeTab === 'publish' && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.publish.id}>
-                    <PublishPanel auth={auth} onCreateInChat={onCreateInChat} />
+                    <PublishPanel
+                      auth={auth}
+                      onCreateInChat={onCreateInChat}
+                      publishes={publishes.rows}
+                      publishesLoading={publishes.loading}
+                      publishesError={publishes.error}
+                      onRefreshPublishes={publishes.refresh}
+                      onMutePublishTransition={publishes.muteTransition}
+                    />
                   </div>
                 )}
                 {safeTab === 'review' && isAdmin && <ReviewPanel auth={auth} />}

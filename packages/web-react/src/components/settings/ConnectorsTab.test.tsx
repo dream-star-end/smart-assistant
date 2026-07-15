@@ -473,7 +473,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     await screen.findByText("Linear");
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "卸载" }));
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/卸载连接器「Linear」/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/卸载 API 插件「Linear」/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "卸载" }));
 
     await waitFor(() => expect(mockedUninstallMarketplace).toHaveBeenCalledWith(auth, "linear"));

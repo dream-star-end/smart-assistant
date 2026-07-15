@@ -171,12 +171,21 @@ function Section({
 export function BrowsePanel({
   auth,
   kind = "skill",
+  revision = 0,
+  focusRequest,
+  onFocusRequestConsumed,
   onAskAiInChat,
   onOpenConnectors,
 }: {
   auth: AuthSession;
   /** 仅展示该类目。M2 默认且仅 'skill'（agent 投递在 M3，M4 才开 agent Tab）。 */
   kind?: "skill" | "agent" | "connector";
+  /** 审核状态转为终态时递增；即使查询词/kind 未变也重新拉市场目录。 */
+  revision?: number;
+  /** 审核通过通知的 CTA：切到对应分类并直接打开新条目详情。 */
+  focusRequest?: { slug: string; nonce: number } | null;
+  /** focusRequest 是一次性命令；详情打开后通知父层清除，避免重新挂载时重复执行。 */
+  onFocusRequestConsumed?: (nonce: number) => void;
   /** AI 导购入口(批3):有查询词时结果区顶部「让 AI 帮我找并装好」;缺省则不渲染入口。 */
   onAskAiInChat?: (text: string) => void;
   onOpenConnectors?: () => void;
@@ -193,6 +202,7 @@ export function BrowsePanel({
 
   // 防抖搜索
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cardRequestSeq = useRef(0);
   const [debouncedQ, setDebouncedQ] = useState("");
   useEffect(() => {
     if (debounce.current) clearTimeout(debounce.current);
@@ -207,23 +217,52 @@ export function BrowsePanel({
     setSelectedCat(null);
   }, [kind, debouncedQ]);
 
-  useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    setErr(null);
-    api
-      .searchMarketplace(auth, debouncedQ, kind)
-      .then((r) => {
-        if (!alive) return;
+  const loadCards = useCallback(
+    async (showLoading: boolean) => {
+      const seq = ++cardRequestSeq.current;
+      if (showLoading) setLoading(true);
+      setErr(null);
+      try {
+        const result = await api.searchMarketplace(auth, debouncedQ, kind);
+        if (seq !== cardRequestSeq.current) return;
         // 信任服务端顺序:目录态已按 featured_rank/热度排好,搜索态是相关度排序。
-        setCards(r.results);
-      })
-      .catch((e) => alive && setErr(apiErrorMessage(e, "加载市场失败")))
-      .finally(() => alive && setLoading(false));
+        setCards(result.results);
+      } catch (cause) {
+        if (seq === cardRequestSeq.current) {
+          setErr(apiErrorMessage(cause, "加载市场失败"));
+        }
+      } finally {
+        if (seq === cardRequestSeq.current) setLoading(false);
+      }
+    },
+    [auth, debouncedQ, kind],
+  );
+
+  useEffect(() => {
+    void loadCards(true);
     return () => {
-      alive = false;
+      cardRequestSeq.current += 1;
     };
-  }, [auth, debouncedQ, kind]);
+  }, [loadCards, revision]);
+
+  // 市场可能在另一个页签完成发布审核；回到窗口/标签页时主动校准目录。
+  useEffect(() => {
+    const refreshIfVisible = () => {
+      if (document.visibilityState !== "hidden") void loadCards(false);
+    };
+    window.addEventListener("focus", refreshIfVisible);
+    document.addEventListener("visibilitychange", refreshIfVisible);
+    return () => {
+      window.removeEventListener("focus", refreshIfVisible);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
+    };
+  }, [loadCards]);
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    setActive(focusRequest.slug);
+    onFocusRequestConsumed?.(focusRequest.nonce);
+  }, [focusRequest, onFocusRequestConsumed]);
 
   // 拉一次「我的已安装」用于卡片徽标（含版本信息 → 可更新徽标）
   useEffect(() => {
@@ -247,7 +286,7 @@ export function BrowsePanel({
     [debouncedQ, cards],
   );
 
-  const noun = kind === "agent" ? "智能体" : kind === "connector" ? "连接器" : "技能";
+  const noun = kind === "agent" ? "智能体" : kind === "connector" ? "插件" : "技能";
 
   // 当前平铺(chips 选中某类,或搜索态)的卡片集。
   const flatCards = useMemo(() => {
@@ -272,7 +311,7 @@ export function BrowsePanel({
               kind === "agent"
                 ? "搜索智能体（试试「写作」「编程」「研究」）…"
                 : kind === "connector"
-                  ? "搜索连接器（试试「文档」「代码」「沟通」）…"
+                  ? "搜索插件（试试「文档」「代码」「沟通」）…"
                   : "搜索技能（试试「翻译」「论文」「写作」）…"
             }
             className="pl-9"
