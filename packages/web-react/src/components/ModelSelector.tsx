@@ -71,7 +71,9 @@ export function ModelSelector({
   const selected = models.find((m) => m.id === selectedId);
   // 已选模型被降级(且非团队模式覆盖态)→ 菜单顶部提示条建议换模;可用替代 = 下方未降级模型。
   const selectedDegraded = selected ? isDegraded(selected) : false;
-  const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId);
+  const hasAlternatives = models.some(
+    (m) => !isDegraded(m) && m.id !== selectedId,
+  );
   const engineLabel = teamEngineLabel(models);
   // 团队态标签拆前缀/主体:移动端只显引擎名(前缀与头部 chip 冗余,Users 图标已表意),
   // sm+ 恢复"团队模式 · "全称。
@@ -105,12 +107,20 @@ export function ModelSelector({
           ) : (
             <Cpu size={14} className="text-faint" />
           )}
-          {teamEngineActive && <span className="hidden sm:inline">{"团队模式 · "}</span>}
-          <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">{label}</span>
+          {teamEngineActive && (
+            <span className="hidden sm:inline">{"团队模式 · "}</span>
+          )}
+          <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">
+            {label}
+          </span>
           <ChevronDown size={14} className="text-faint" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[15rem]">
+      <DropdownMenuContent
+        align="start"
+        data-product-feature={PRODUCT_CAPABILITIES.models.id}
+        className="min-w-[15rem]"
+      >
         <DropdownMenuLabel>对话模型</DropdownMenuLabel>
         {teamEngineActive && (
           <div
@@ -118,10 +128,12 @@ export function ModelSelector({
             className="mx-1 mb-1 rounded-md bg-accent-soft px-2.5 py-2 text-xs leading-relaxed"
           >
             <span className="flex items-center gap-1.5 font-medium text-accent">
-              <Users size={12} className="shrink-0" /> 团队模式 · 队长引擎 {engineLabel}
+              <Users size={12} className="shrink-0" /> 团队模式 · 队长引擎{" "}
+              {engineLabel}
             </span>
             <span className="mt-0.5 block text-muted">
-              当前会话按 {engineLabel} 执行与计费；下方自选模型将在团队模式关闭后生效。
+              当前会话按 {engineLabel}{" "}
+              执行与计费；下方自选模型将在团队模式关闭后生效。
             </span>
           </div>
         )}
@@ -156,7 +168,9 @@ export function ModelSelector({
                 {active && !degraded && (
                   <>
                     {teamEngineActive && (
-                      <span className="text-[11px] text-faint">团队模式关闭后生效</span>
+                      <span className="text-[11px] text-faint">
+                        团队模式关闭后生效
+                      </span>
                     )}
                     <Check size={14} className="shrink-0 text-accent" />
                   </>

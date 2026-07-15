@@ -15,10 +15,20 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../lib/api";
 import { INBOX_LEVEL_META, type InboxLevelTone } from "../lib/inboxLevels";
+import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, InboxLevel, InboxMessage } from "../lib/types";
 import { cn } from "../lib/utils";
 import { Markdown } from "./Markdown";
-import { Badge, Button, EmptyState, IconButton, Sheet, Skeleton, Spinner, Tabs } from "./ui";
+import {
+  Badge,
+  Button,
+  EmptyState,
+  IconButton,
+  Sheet,
+  Skeleton,
+  Spinner,
+  Tabs,
+} from "./ui";
 
 /** 每页拉取条数。列表滚到底靠「加载更多」翻页（返回条数 == LIMIT 视为可能还有）。 */
 const LIMIT = 30;
@@ -26,8 +36,8 @@ const LIMIT = 30;
 type InboxTab = "all" | "unread";
 
 const TAB_ITEMS = [
-  { value: "all", label: "全部" },
-  { value: "unread", label: "未读" },
+  { value: "all", label: "全部", featureId: PRODUCT_CAPABILITIES.inbox.id },
+  { value: "unread", label: "未读", featureId: PRODUCT_CAPABILITIES.inbox.id },
 ];
 
 /** 级别 → lucide 图标（label/tone 权威在 lib/inboxLevels，本表只补图标，UI 层持有）。 */
@@ -102,7 +112,8 @@ function fmtRelativeTime(iso: string): string {
   if (diffMin < 1) return "刚刚";
   if (diffMin < 60) return `${diffMin} 分钟前`;
   const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const startOfDay = (x: Date) =>
+    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
   const dayDiff = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
   if (dayDiff <= 0) return `今天 ${hm}`;
   if (dayDiff === 1) return `昨天 ${hm}`;
@@ -187,7 +198,9 @@ export function InboxDialog({
       // 未读 Tab 的 offset 用「已加载且仍未读」条数：本地点开转已读的条目已不在
       // 服务端未读列表里，按 messages.length 翻页会跳过等量的未读消息。
       const offset =
-        tab === "unread" ? messages.filter((m) => !m.read).length : messages.length;
+        tab === "unread"
+          ? messages.filter((m) => !m.read).length
+          : messages.length;
       const r = await api.listInboxMessages(auth, {
         limit: LIMIT,
         offset,
@@ -211,7 +224,9 @@ export function InboxDialog({
       setExpandedId(willExpand ? m.id : null);
       if (!willExpand || m.read || !auth) return;
       // 乐观置读（未读条目仍留在列表，样式转已读）。
-      setMessages((cur) => cur.map((x) => (x.id === m.id ? { ...x, read: true } : x)));
+      setMessages((cur) =>
+        cur.map((x) => (x.id === m.id ? { ...x, read: true } : x)),
+      );
       setUnreadCount((c) => Math.max(0, c - 1));
       api
         .markInboxRead(auth, m.id)
@@ -280,9 +295,16 @@ export function InboxDialog({
       </div>
 
       {/* 列表区 */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
+      <div
+        data-product-feature={PRODUCT_CAPABILITIES.inbox.id}
+        className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4"
+      >
         {!auth ? (
-          <EmptyState icon={Bell} title="请先登录" hint="登录后可查看你的站内信。" />
+          <EmptyState
+            icon={Bell}
+            title="请先登录"
+            hint="登录后可查看你的站内信。"
+          />
         ) : loading ? (
           <SkeletonRows />
         ) : err ? (
@@ -294,9 +316,17 @@ export function InboxDialog({
           </div>
         ) : messages.length === 0 ? (
           tab === "unread" ? (
-            <EmptyState icon={BellOff} title="没有未读消息" hint="你已读完所有消息。" />
+            <EmptyState
+              icon={BellOff}
+              title="没有未读消息"
+              hint="你已读完所有消息。"
+            />
           ) : (
-            <EmptyState icon={Inbox} title="暂无消息" hint="有新的通知、公告或活动会显示在这里。" />
+            <EmptyState
+              icon={Inbox}
+              title="暂无消息"
+              hint="有新的通知、公告或活动会显示在这里。"
+            />
           )
         ) : (
           <>
@@ -312,7 +342,12 @@ export function InboxDialog({
             </ul>
             {moreErr ? (
               <div className="px-2 py-2 text-center">
-                <Button variant="ghost" size="sm" onClick={loadMore} className="text-danger">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={loadMore}
+                  className="text-danger"
+                >
                   加载失败，点击重试
                 </Button>
               </div>
@@ -359,13 +394,18 @@ function InboxItem({
     () => /!\[[^\]]*\]\([^)]*\)|\/api\/inbox-assets\//i.test(m.body_md),
     [m.body_md],
   );
-  const hasChart = useMemo(() => /```(?:chart|mermaid)\b/i.test(m.body_md), [m.body_md]);
+  const hasChart = useMemo(
+    () => /```(?:chart|mermaid)\b/i.test(m.body_md),
+    [m.body_md],
+  );
 
   return (
     <li
       className={cn(
         "relative overflow-hidden rounded-xl border bg-elevated shadow-soft transition-[border-color,box-shadow]",
-        expanded ? "border-border-strong shadow-float" : "border-border hover:border-border-strong",
+        expanded
+          ? "border-border-strong shadow-float"
+          : "border-border hover:border-border-strong",
         !m.read && "border-l-2 border-l-accent",
       )}
     >
@@ -389,7 +429,12 @@ function InboxItem({
         </span>
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="flex items-start gap-2">
-            {!m.read && <span className="size-1.5 shrink-0 rounded-full bg-accent" aria-hidden />}
+            {!m.read && (
+              <span
+                className="size-1.5 shrink-0 rounded-full bg-accent"
+                aria-hidden
+              />
+            )}
             <span
               className={cn(
                 "min-w-0 flex-1 truncate text-[14px] leading-5 text-fg",
@@ -427,12 +472,17 @@ function InboxItem({
         <ChevronDown
           size={16}
           aria-hidden
-          className={cn("mt-1 shrink-0 text-faint transition-transform", expanded && "rotate-180")}
+          className={cn(
+            "mt-1 shrink-0 text-faint transition-transform",
+            expanded && "rotate-180",
+          )}
         />
       </button>
       {expanded && (
         <div className="min-w-0 overflow-hidden border-t border-border bg-surface px-4 py-4 text-[13px] leading-relaxed text-fg sm:px-5">
-          <Markdown signMedia readOnly>{m.body_md}</Markdown>
+          <Markdown signMedia readOnly>
+            {m.body_md}
+          </Markdown>
         </div>
       )}
     </li>
@@ -444,7 +494,10 @@ function SkeletonRows() {
   return (
     <ul className="flex flex-col gap-3" aria-hidden>
       {[0, 1, 2, 3].map((i) => (
-        <li key={i} className="flex gap-3 rounded-xl border border-border bg-elevated px-4 py-4">
+        <li
+          key={i}
+          className="flex gap-3 rounded-xl border border-border bg-elevated px-4 py-4"
+        >
           <Skeleton className="size-9 shrink-0 rounded-xl" />
           <div className="min-w-0 flex-1">
             <Skeleton className="h-3.5 w-1/2" />
