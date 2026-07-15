@@ -123,13 +123,13 @@ describe("AuditPage", () => {
     expect(same.className).not.toContain("bg-warning-soft");
   });
 
-  test("切到『Agent 工具审计』触发 /agent-audit 拉取并渲染", async () => {
+  test("切到『Agent 工具失败』触发 /agent-audit 拉取并渲染", async () => {
     renderPage(<AuditPage />);
     await screen.findByText("user.patch");
     // 初始不应请求 agent-audit
     expect(adminGet.mock.calls.some((c) => c[0] === "/agent-audit")).toBe(false);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Agent 工具审计" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Agent 工具失败" }));
 
     await waitFor(() => {
       expect(adminGet.mock.calls.some((c) => c[0] === "/agent-audit")).toBe(true);

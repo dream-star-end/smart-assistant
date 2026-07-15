@@ -229,14 +229,5 @@ export async function initComputePool(opts: InitOptions = {}): Promise<InitResul
     });
   }
 
-  await writeAuditStandalone(getPool(), {
-    hostId: null,
-    operation: "pool.init.done",
-    operationId,
-    reasonCode: null,
-    detail: { ...result, desiredImageId, imageTag },
-    actor,
-  });
-
   return result;
 }

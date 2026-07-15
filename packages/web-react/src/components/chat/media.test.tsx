@@ -149,6 +149,28 @@ function mockResponse(status: number, headers: Record<string, string> = {}): Res
   } as unknown as Response;
 }
 
+describe("MediaSignProvider 批签", () => {
+  test("同一轮挂载的不同路径合并成一次 sign(paths)", async () => {
+    const sign = vi.fn(async (paths: string[]) =>
+      Object.fromEntries(paths.map((path) => [path, `/api/media-signed?t=${encodeURIComponent(path)}`])),
+    );
+    const first = "/home/agent/.openclaude/generated/a.pdf";
+    const second = "/home/agent/.openclaude/generated/b.docx";
+
+    render(
+      <MediaSignProvider sign={sign} authKey="admin-session:1:s1">
+        <SignedFileCard src={first} filename="a.pdf" />
+        <SignedFileCard src={second} filename="b.docx" />
+      </MediaSignProvider>,
+    );
+
+    await waitFor(() => expect(sign).toHaveBeenCalledTimes(1));
+    expect(new Set(sign.mock.calls[0][0])).toEqual(new Set([first, second]));
+    expect(await screen.findByRole("link", { name: /a\.pdf/ })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: /b\.docx/ })).toBeInTheDocument();
+  });
+});
+
 describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
   const path = "/home/agent/.openclaude/generated/报表.html";
 

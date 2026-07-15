@@ -24,11 +24,18 @@ const PAGE_SIZE = 100;
 const TYPE_OPTIONS: SelectOption[] = [
   { label: "全部类型", value: "" },
   { label: SECURITY_EVENT_TYPE_LABELS.route_bypass, value: "route_bypass" },
+  { label: SECURITY_EVENT_TYPE_LABELS.route_blocked, value: "route_blocked" },
 ];
 
-/** 类型徽标：目前 route_bypass=warning，其余回落 neutral，原样显示。 */
+/** 类型徽标：放行=warning，拦截=danger，其余回落 neutral。 */
 function typeLabel(type: string): string {
   return SECURITY_EVENT_TYPE_LABELS[type] ?? type;
+}
+
+function typeTone(type: string): "warning" | "danger" | "neutral" {
+  if (type === "route_bypass") return "warning";
+  if (type === "route_blocked") return "danger";
+  return "neutral";
 }
 
 /** 安全事件详情：元信息 + 完整 detail JSON。 */
@@ -39,7 +46,7 @@ function EventDetail({ row }: { row: SecurityEventRow }) {
         <KeyValue
           label="类型"
           value={
-            <Badge tone={row.type === "route_bypass" ? "warning" : "neutral"}>
+            <Badge tone={typeTone(row.type)}>
               {typeLabel(row.type)}
             </Badge>
           }
@@ -161,7 +168,7 @@ export function SecurityEventsTab() {
       key: "type",
       title: "类型",
       render: (r) => (
-        <Badge tone={r.type === "route_bypass" ? "warning" : "neutral"}>{typeLabel(r.type)}</Badge>
+        <Badge tone={typeTone(r.type)}>{typeLabel(r.type)}</Badge>
       ),
     },
     {

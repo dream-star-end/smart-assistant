@@ -4,6 +4,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
@@ -15,7 +16,8 @@ import {
   isToolFailureAuditEnabled,
   makeToolFailureAuditHandler,
   type QueryRunner,
-  type ToolFailureAuditBody,
+  type ToolFailureAuditBodyV1,
+  type ToolFailureAuditBodyV2,
 } from '../http/internalToolFailureAudit.js'
 
 const SECRET = 'a'.repeat(64)
@@ -37,7 +39,7 @@ function repoFor(userId = 42): ContainerIdentityRepo {
   }
 }
 
-function body(overrides: Partial<ToolFailureAuditBody> = {}): ToolFailureAuditBody {
+function body(overrides: Partial<ToolFailureAuditBodyV1> = {}): ToolFailureAuditBodyV1 {
   return {
     schemaVersion: 1,
     eventId: 'evt-1',
@@ -49,6 +51,23 @@ function body(overrides: Partial<ToolFailureAuditBody> = {}): ToolFailureAuditBo
     inputPreview: '{"cmd":"bad"}',
     outputPreview: 'failed',
     timestamp: 123,
+    ...overrides,
+  }
+}
+
+function bodyV2(overrides: Partial<ToolFailureAuditBodyV2> = {}): ToolFailureAuditBodyV2 {
+  return {
+    schemaVersion: 2,
+    eventId: 'evt-v2',
+    sessionKey: 'agent:codex:webchat:dm:sess2',
+    agentId: 'codex',
+    turnIndex: 4,
+    toolName: 'Glob',
+    durationMs: 19,
+    inputHash: 'a'.repeat(64),
+    outputHash: 'b'.repeat(64),
+    errorClass: 'file_not_found',
+    timestamp: 456,
     ...overrides,
   }
 }
@@ -90,7 +109,7 @@ describe('isToolFailureAuditEnabled', () => {
 })
 
 describe('insertToolFailureAudit', () => {
-  test('inserts failed audit row and best-effort dedupes by event id', async () => {
+  test('accepts legacy v1 during rolling upgrade but persists hashes and category only', async () => {
     const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
     const runner: QueryRunner = {
       async query(sql, params) {
@@ -105,10 +124,31 @@ describe('insertToolFailureAudit', () => {
     assert.equal(calls[1].params?.[1], body().sessionKey)
     assert.equal(calls[1].params?.[2], 'Bash')
     assert.equal(calls[1].params?.[6], 12)
-    assert.equal(calls[1].params?.[7], 'failed')
+    const meta = JSON.parse(String(calls[1].params?.[3]))
+    assert.equal(meta.error_class, 'other')
+    assert.equal('input_preview' in meta, false)
+    assert.equal(calls[1].params?.[4], createHash('sha256').update('{"cmd":"bad"}').digest('hex'))
+    assert.equal(calls[1].params?.[5], createHash('sha256').update('failed').digest('hex'))
+    assert.equal(calls[1].params?.[7], null)
 
     const dupRunner: QueryRunner = { async query() { return fakeResult([{ id: '99' }]) } }
     assert.deepEqual(await insertToolFailureAudit(dupRunner, 42, body()), { duplicate: true })
+  })
+
+  test('persists v2 hashes and category without raw error text', async () => {
+    const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
+    const runner: QueryRunner = {
+      async query(sql, params) {
+        calls.push({ sql, params })
+        return fakeResult([])
+      },
+    }
+    assert.deepEqual(await insertToolFailureAudit(runner, 42, bodyV2()), { duplicate: false })
+    const meta = JSON.parse(String(calls[1].params?.[3]))
+    assert.deepEqual(meta.error_class, 'file_not_found')
+    assert.equal(calls[1].params?.[4], 'a'.repeat(64))
+    assert.equal(calls[1].params?.[5], 'b'.repeat(64))
+    assert.equal(calls[1].params?.[7], null)
   })
 })
 
@@ -143,6 +183,23 @@ describe('tool failure audit handler', () => {
     await h(makeReq({ auth: `Bearer ${TOKEN}`, body: body() }), res, CTX)
     assert.equal(res.statusCode, 200)
     assert.equal(res.body.duplicate, true)
+  })
+
+  test('accepts privacy-safe v2 and rejects malformed hashes/categories', async () => {
+    const runner: QueryRunner = { async query() { return fakeResult([]) } }
+    const h = makeToolFailureAuditHandler({ identityRepo: repoFor(), queryRunner: runner })
+
+    let res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV2() }), res, CTX)
+    assert.equal(res.statusCode, 200)
+
+    res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV2({ inputHash: 'raw-secret' }) }), res, CTX)
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { ...bodyV2(), errorClass: 'free-form error' } }), res, CTX)
+    assert.equal(res.statusCode, 400)
   })
 
   test('invalid body returns 400', async () => {

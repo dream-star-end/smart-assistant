@@ -29,6 +29,7 @@ import {
   setQuarantined,
   clearQuarantine,
   clearQuarantineByReason,
+  deleteHost,
   setLoadedImage,
   listSchedulableHosts,
   getSchedulableHostById,
@@ -38,34 +39,12 @@ import {
 } from "../compute-pool/queries.js";
 import { setDesiredImage } from "../compute-pool/poolState.js";
 import { listAuditEventsForHost } from "../compute-pool/audit.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
   "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "compute_host_audit",
-  "compute_pool_state",
-  "agent_containers",
-  "agent_subscriptions",
-  "agent_audit",
-  "rate_limit_events",
-  "admin_audit",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "compute_hosts",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 
@@ -89,15 +68,13 @@ before(async () => {
   }
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try {
-      await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
-    } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     await closePool();
   }
 });
@@ -562,11 +539,11 @@ describe("setLoadedImage", () => {
   test("写 loaded_image_id/at + audit operation='image.loaded'", async (t) => {
     if (skipIfNoDb(t)) return;
     const id = await insertTestHost("host-li-1");
-    await setLoadedImage(id, "sha256:zzz", "openclaude-runtime:v3.0.42", {
+    assert.equal(await setLoadedImage(id, "sha256:zzz", "openclaude-runtime:v3.0.42", {
       actor: "system:imagePromote",
       operationId: "op-li-1",
       source: "distribute",
-    });
+    }), true);
     const row = await getHostById(id);
     assert.equal(row!.loaded_image_id, "sha256:zzz");
     assert.ok(row!.loaded_image_at !== null);
@@ -575,6 +552,48 @@ describe("setLoadedImage", () => {
     assert.ok(ev, "应有 image.loaded audit");
     assert.equal(ev!.detail.imageId, "sha256:zzz");
     assert.equal(ev!.detail.source, "distribute");
+
+    const loadedAt = row!.loaded_image_at!.toISOString();
+    assert.equal(await setLoadedImage(id, "sha256:zzz", "openclaude-runtime:v3.0.42", {
+      actor: "system:initComputePool",
+      operationId: "op-li-2",
+      source: "pool.init.self",
+    }), false);
+    const afterRepeat = await getHostById(id);
+    assert.equal(afterRepeat!.loaded_image_at!.toISOString(), loadedAt);
+    const repeatedEvents = await listAuditEventsForHost(getPool(), id);
+    assert.equal(repeatedEvents.filter((e) => e.operation === "image.loaded").length, 1);
+  });
+});
+
+// ─── deleteHost ────────────────────────────────────────────────────────
+
+describe("deleteHost", () => {
+  test("锁行校验后 DELETE RETURNING 权威审计快照", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await insertTestHost("host-delete-1", { status: "draining", maxContainers: 7 });
+    const removed = await deleteHost(id);
+    assert.deepEqual(removed, {
+      id,
+      name: "host-delete-1",
+      host: "10.0.0.1",
+      ssh_port: 22,
+      ssh_user: "root",
+      agent_port: 9443,
+      status: "draining",
+      max_containers: 7,
+      bridge_cidr: "172.30.99.0/24",
+      expires_at: null,
+    });
+    assert.equal(await getHostById(id), null);
+    assert.equal(await deleteHost(id), null);
+  });
+
+  test("非 draining host 拒绝且不删除", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await insertTestHost("host-delete-2", { status: "ready" });
+    await assert.rejects(() => deleteHost(id), /draining status/);
+    assert.notEqual(await getHostById(id), null);
   });
 });
 

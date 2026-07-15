@@ -582,6 +582,14 @@ describe("provisionV3Container", () => {
       env.includes(`OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`),
       "supervisor must inject OPENCLAUDE_BASELINE_SKILLS_DIR so SkillStore can overlay platform baseline",
     );
+    assert.ok(
+      env.includes("OPENCLAUDE_USER_SKILLS_DIR=/home/agent/.openclaude/skills"),
+      "supervisor must expose the shared user skill store to CCB's explicit overlay",
+    );
+    assert.ok(
+      env.includes("USE_BUILTIN_RIPGREP=0"),
+      "supervisor must force CCB to use the system rg shipped in the runtime image",
+    );
     // 商用版容器必须默认跳过 personal-version 自反思 cron(否则用户没说话也每天扣 ~¥2-3)。
     // 处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。本地路径覆盖在这里;
     // remote 路径会把同一 env 数组转换成 ContainerSpec.env 透传给 node-agent。
@@ -756,6 +764,8 @@ describe("provisionV3Container", () => {
         !binds.some((b) => b.includes(":/run/oc/codex-auth:")),
         `v5 容器不得挂共享 codex auth fallback,got: ${JSON.stringify(binds)}`,
       );
+      assert.ok(env.includes("OPENCLAUDE_USER_SKILLS_DIR=/home/agent/.openclaude/skills"));
+      assert.ok(env.includes("USE_BUILTIN_RIPGREP=0"));
     } finally {
       if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
       else process.env.OC_RUNTIME_CHANNEL = savedChannel;

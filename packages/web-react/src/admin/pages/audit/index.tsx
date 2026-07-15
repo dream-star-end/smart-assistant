@@ -12,7 +12,7 @@ type AuditView = "admin" | "security" | "agent" | "host";
 const TABS: TabItem[] = [
   { value: "admin", label: "管理审计" },
   { value: "security", label: "安全事件" },
-  { value: "agent", label: "Agent 工具审计" },
+  { value: "agent", label: "Agent 工具失败" },
   { value: "host", label: "主机审计" },
 ];
 
@@ -21,7 +21,7 @@ const TABS: TabItem[] = [
  * 对应子区（懒拉数据），不做破坏性操作：
  *  - 管理审计：admin_audit 操作日志（操作者/对象/时间过滤 + before/after diff）；
  *  - 安全事件：security_events（route_bypass 等，语义三分层第二层）；
- *  - Agent 工具审计：agent_audit 工具调用；
+ *  - Agent 工具失败：agent_audit 失败遥测；
  *  - 主机审计：compute_host_audit 全量浏览。
  * 页头右侧常驻「请求ID反查」（turn_traces 一键定位归属）。
  */

@@ -2382,6 +2382,13 @@ export async function provisionV3Container(
       // baseline mount 本身若缺失/OPTIONAL=1,SkillStore 构造期会抛 → mcp-memory
       // catch 后 warn+fallback user-only,不影响容器启动。
       `OPENCLAUDE_BASELINE_SKILLS_DIR=${V3_CONFIG_TMPFS_PATH}/skills`,
+      // CCB 的 CLAUDE_CONFIG_DIR 固定指向上面的只读平台基线，因此它默认看不到
+      // OpenClaude SkillStore 写入用户 volume 的共享技能。显式给 CCB 一条商用版专用
+      // 只读发现路径；CCB 仅在此 env 存在时叠加读取，不改变 personal 版行为。
+      "OPENCLAUDE_USER_SKILLS_DIR=/home/agent/.openclaude/skills",
+      // release 源码树不携带 CCB vendor/ripgrep 二进制；镜像已安装系统 rg。
+      // 明确关闭内置 rg 路径，避免 Glob/Grep spawn .../vendor/ripgrep/.../rg ENOENT。
+      "USE_BUILTIN_RIPGREP=0",
       // v3 server-authored sink:容器内 sessionManager turn-end 把权威 assistant
       // 文本 POST 到 master 的 /internal/v3/server-authored-message。复用同一条
       // 出站通道(self-host plain 18791,远端 mTLS 18443),route splitter 按

@@ -37,6 +37,10 @@ type SignFn = (paths: string[]) => Promise<Record<string, string>>;
 const SIGN_TTL_MS = 4 * 60_000;
 
 type CacheEntry = { url: string; expiresAt: number };
+type SignBatch = {
+  sign: SignFn;
+  requests: Map<string, { resolve: (url: string | null) => void; reject: (error: unknown) => void }>;
+};
 
 type MediaSignCtx = {
   /** 返回 path→签名URL（命中未过期缓存直接回；未命中/已过期走 sign 并缓存）。被 ACL 拒的 path 缺失。 */
@@ -71,6 +75,7 @@ export function MediaSignProvider({
   // 缓存与 inflight 跨重渲存活；sign 或 authKey 变化（登录态/账号切换）时重置。
   const cacheRef = useRef<Map<string, CacheEntry>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
+  const batchRef = useRef<SignBatch | null>(null);
   const signRef = useRef<SignFn | null>(sign);
   const mountedRef = useRef(false);
   useEffect(() => {
@@ -87,7 +92,33 @@ export function MediaSignProvider({
     // Map(被 GC),新 resolve() 读到的是干净的新 Map,同 path 走新账号 token 重签。
     cacheRef.current = new Map();
     inflightRef.current = new Map();
+    batchRef.current = null;
   }, [sign, authKey]);
+
+  const enqueueSign = (path: string, fn: SignFn): Promise<string | null> =>
+    new Promise((resolve, reject) => {
+      let batch = batchRef.current;
+      if (!batch || batch.sign !== fn) {
+        batch = { sign: fn, requests: new Map() };
+        batchRef.current = batch;
+        const scheduled = batch;
+        queueMicrotask(() => {
+          if (batchRef.current === scheduled) batchRef.current = null;
+          const paths = [...scheduled.requests.keys()];
+          void scheduled.sign(paths).then(
+            (urls) => {
+              for (const [pendingPath, request] of scheduled.requests) {
+                request.resolve(urls?.[pendingPath] ?? null);
+              }
+            },
+            (error) => {
+              for (const request of scheduled.requests.values()) request.reject(error);
+            },
+          );
+        });
+      }
+      batch.requests.set(path, { resolve, reject });
+    });
 
   const ctxRef = useRef<MediaSignCtx>({
     resolve: async (path: string) => {
@@ -102,9 +133,8 @@ export function MediaSignProvider({
       if (pending) return pending;
       const fn = signRef.current;
       if (!fn) return null;
-      const p = fn([path])
-        .then((urls) => {
-          const url = urls?.[path] ?? null;
+      const p = enqueueSign(path, fn)
+        .then((url) => {
           if (url) cache.set(path, { url, expiresAt: Date.now() + SIGN_TTL_MS });
           return url;
         })

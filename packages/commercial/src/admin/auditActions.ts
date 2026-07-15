@@ -33,6 +33,7 @@ export interface AdminAuditActionSpec {
 
 export const ADMIN_AUDIT_ACTIONS = {
   // ── 用户/组织(资金与权限面,一律 tx fail-closed)─────────────────
+  "user.create": { kind: "write", mode: "tx" },
   "user.patch": { kind: "write", mode: "tx" },
   "user.credits.adjust": { kind: "write", mode: "tx" },
   "org.create": { kind: "write", mode: "tx" },
@@ -84,6 +85,7 @@ export const ADMIN_AUDIT_ACTIONS = {
 
   // ── 账号池/中继/出口代理(操作本身多步非事务,best-effort)────────
   "account.create": { kind: "write", mode: "best-effort" },
+  "account.migrate_to_pool": { kind: "write", mode: "best-effort" },
   "account.patch": { kind: "write", mode: "best-effort" },
   "account.reset_cooldown": { kind: "write", mode: "best-effort" },
   "account.delete": { kind: "write", mode: "best-effort" },

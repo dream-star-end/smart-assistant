@@ -27,6 +27,8 @@ import { incrSecurityEventWriteFailure } from "./metrics.js";
 export const SECURITY_EVENT_TYPES = {
   /** 用户/管理员命中 BLOCKED_FOR_USER_RULES 防火墙;admin 放行(bypass)也留痕。 */
   route_bypass: true,
+  /** 已认证普通用户命中 BLOCKED_FOR_USER_RULES 并被拒绝。 */
+  route_blocked: true,
 } as const;
 
 export type SecurityEventType = keyof typeof SECURITY_EVENT_TYPES;
