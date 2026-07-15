@@ -39,13 +39,51 @@ const AGENT_ROW = {
   user_id: "7",
   session_id: "sess-abc",
   tool: "Bash",
-  input_meta: { cmd: "ls" },
+  input_meta: {
+    error_class: "process_exit",
+    failure_kind: "process_exit",
+    exit_code: 2,
+    termination_reason: "exit_code",
+  },
   input_hash: "aaa111",
   output_hash: "bbb222",
   duration_ms: 120,
-  success: true,
+  success: false,
   error_msg: null,
   created_at: new Date().toISOString(),
+};
+const AGENT_STATS = {
+  window: "24h",
+  rollup: {
+    success_calls: 581,
+    failure_calls: 26,
+    total_calls: 607,
+    failure_rate: 26 / 607,
+  },
+  coverage: {
+    scope: "current_online_fleet",
+    mode: "best_effort",
+    partial: false,
+    expected_containers: 8,
+    covered_containers: 8,
+    started_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+    ended_at: new Date().toISOString(),
+  },
+  failures: {
+    events: 26,
+    affected_users: 6,
+    groups: [
+      {
+        tool: "Bash",
+        error_class: "process_exit",
+        events: 15,
+        users: 5,
+        sessions: 7,
+        p50_ms: 120,
+        p95_ms: 950,
+      },
+    ],
+  },
 };
 const SECURITY_ROW = {
   id: "3",
@@ -83,6 +121,7 @@ beforeEach(() => {
     if (path === "/audit") return Promise.resolve({ rows: [ADMIN_ROW], next_before: null });
     if (path === "/agent-audit")
       return Promise.resolve({ rows: [AGENT_ROW], next_before: null });
+    if (path === "/agent-audit/stats") return Promise.resolve(AGENT_STATS);
     if (path === "/security-events")
       return Promise.resolve({ rows: [SECURITY_ROW], next_before: null });
     if (path === "/host-audit")
@@ -134,8 +173,45 @@ describe("AuditPage", () => {
     await waitFor(() => {
       expect(adminGet.mock.calls.some((c) => c[0] === "/agent-audit")).toBe(true);
     });
-    // 工具行渲染
-    expect(await screen.findByText("Bash")).toBeTruthy();
+    // 聚合与失败明细都会显示工具名
+    expect((await screen.findAllByText("Bash")).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("已上报调用失败率")).toBeTruthy();
+    expect(screen.getByText("4.28%")).toBeTruthy();
+    expect(screen.getByText("8/8")).toBeTruthy();
+    expect(screen.getAllByText("进程异常退出").length).toBeGreaterThanOrEqual(2);
+    expect(
+      screen.getByText(/明细只记录失败调用，日志行数不等于平台事故数/),
+    ).toBeTruthy();
+  });
+
+  test("Agent 统计覆盖不完整时明确降级，且零样本不伪造失败率", async () => {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/audit") return Promise.resolve({ rows: [ADMIN_ROW], next_before: null });
+      if (path === "/agent-audit") return Promise.resolve({ rows: [], next_before: null });
+      if (path === "/agent-audit/stats") {
+        return Promise.resolve({
+          ...AGENT_STATS,
+          rollup: { success_calls: 0, failure_calls: 0, total_calls: 0, failure_rate: null },
+          coverage: {
+            ...AGENT_STATS.coverage,
+            partial: true,
+            expected_containers: 8,
+            covered_containers: 6,
+          },
+          failures: { events: 0, affected_users: 0, groups: [] },
+        });
+      }
+      return Promise.resolve({ rows: [], next_before: null });
+    });
+
+    renderPage(<AuditPage />);
+    await screen.findByText("user.patch");
+    fireEvent.click(screen.getByRole("tab", { name: "Agent 工具失败" }));
+
+    expect(await screen.findByText("6/8")).toBeTruthy();
+    expect(screen.getAllByText(/不是服务等级协议（SLA）/).length).toBe(2);
+    const rateCard = screen.getByText("已上报调用失败率").parentElement;
+    expect(rateCard?.textContent).toContain("—");
   });
 
   test("切到『安全事件』触发 /security-events 拉取并渲染", async () => {

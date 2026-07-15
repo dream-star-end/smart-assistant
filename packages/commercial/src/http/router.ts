@@ -184,7 +184,7 @@ import {
   handleAdminAlertsTestChannel,
   handleListEventCoverage,
 } from './adminAlerts.js'
-import { handleAdminAgentAudit } from './adminAudit.js'
+import { handleAdminAgentAudit, handleAdminAgentAuditStats } from './adminAudit.js'
 import {
   handleAdminAddComputeHost,
   handleAdminBaselineVersion,
@@ -801,6 +801,7 @@ export function createCommercialHandler(
     { method: 'DELETE', pathPrefix: '/api/remote-hosts/', handler: handleDeleteRemoteHost },
     { method: 'POST', pathPrefix: '/api/remote-hosts/', handler: handleRemoteHostAction },
     // T-54 Agent 审计(超管)
+    { method: 'GET', path: '/api/admin/agent-audit/stats', handler: handleAdminAgentAuditStats },
     { method: 'GET', path: '/api/admin/agent-audit', handler: handleAdminAgentAudit },
     // T-60 超管 API —— 用户管理
     { method: 'GET', path: '/api/admin/users', handler: handleAdminListUsers },

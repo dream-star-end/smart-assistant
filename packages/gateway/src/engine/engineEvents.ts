@@ -19,7 +19,12 @@
  * 硬约束:底座原生消息形状(CCB stream-json SdkMessage、codex fake-SDK RunnerMessage)
  * 只允许存在于各 adapter 内部,不得出现在本模块的任何类型里。
  */
-import type { DurableCodexBilling, DurableRuntimeEvent, OutboundContentBlock } from '@openclaude/protocol'
+import type {
+  DurableCodexBilling,
+  DurableRuntimeEvent,
+  OutboundContentBlock,
+  ToolTerminationReason,
+} from '@openclaude/protocol'
 export type { DurableRuntimeEvent } from '@openclaude/protocol'
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
@@ -50,6 +55,10 @@ export interface DetectedToolResult {
   durationMs: number
   /** Truncated preview of tool input at finalization (<=500 chars). */
   inputPreview?: string
+  /** Engine-authored process exit code; absent when the engine exposes text only. */
+  exitCode?: number
+  /** Engine-authored termination reason; never inferred by the parser. */
+  terminationReason?: ToolTerminationReason
 }
 
 /** Snapshot of one completed top-level tool call within a turn. Captured by

@@ -2899,6 +2899,10 @@ export class SessionManager {
             isError: tr.isError,
             inputPreview: tr.inputPreview,
             outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
+            ...(tr.exitCode !== undefined ? { exitCode: tr.exitCode } : {}),
+            ...(tr.terminationReason !== undefined
+              ? { terminationReason: tr.terminationReason }
+              : {}),
           }))
           return
         }

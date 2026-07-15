@@ -26,6 +26,12 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/agent-audit/stats",
+    "handler": "handleAdminAgentAuditStats"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/agent-audit",
     "handler": "handleAdminAgentAudit"
   },

@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { isToolExitCode, type ToolTerminationReason } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
 import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
@@ -311,6 +312,25 @@ function isErrorCollabAgentStatus(status: string): boolean {
   return status === 'errored' || status === 'notFound'
 }
 
+function codexToolOutcome(item: Record<string, unknown>): {
+  isError: boolean
+  terminationReason?: ToolTerminationReason
+} {
+  const status = typeof item.status === 'string' ? item.status.toLowerCase() : ''
+  if (status === 'cancelled' || status === 'canceled' || status === 'interrupted') {
+    return { isError: true, terminationReason: 'cancelled' }
+  }
+  if (
+    status === 'failed' ||
+    status === 'error' ||
+    status === 'errored' ||
+    (item.error !== undefined && item.error !== null)
+  ) {
+    return { isError: true, terminationReason: 'tool_error' }
+  }
+  return { isError: false }
+}
+
 /** Structured error produced by `sendRequest` when codex replies with a
  *  JSON-RPC error frame. Callers can branch on `rpcCode` / `rpcMessage` /
  *  `rpcMethod` without re-parsing `message`; the human-readable `message`
@@ -367,6 +387,9 @@ interface RunnerMessage {
       tool_use_id?: string
       content?: string | unknown
       is_error?: boolean
+      /** OpenClaude-only structured metadata on synthetic codex tool_result rows. */
+      exit_code?: number
+      termination_reason?: ToolTerminationReason
     }>
   }
   result?: string
@@ -2310,10 +2333,33 @@ export class CodexAppServerRunner extends EventEmitter {
     if (itemType === 'commandExecution') {
       const out = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : ''
       const exit = typeof item.exitCode === 'number' ? item.exitCode : undefined
-      this.emitToolResult(itemId, out, exit != null && exit !== 0)
+      const safeExit = isToolExitCode(exit) ? exit : undefined
+      const outcome = codexToolOutcome(item)
+      const failedExit = exit != null && exit !== 0
+      const isError = failedExit || outcome.isError
+      let engineMeta:
+        | { exitCode?: number; terminationReason?: ToolTerminationReason }
+        | undefined
+      if (failedExit) {
+        engineMeta =
+          safeExit === undefined
+            ? undefined
+            : { exitCode: safeExit, terminationReason: 'exit_code' }
+      } else if (outcome.isError) {
+        engineMeta = {
+          ...(safeExit !== undefined ? { exitCode: safeExit } : {}),
+          ...(outcome.terminationReason !== undefined
+            ? { terminationReason: outcome.terminationReason }
+            : {}),
+        }
+      } else if (safeExit !== undefined) {
+        engineMeta = { exitCode: safeExit, terminationReason: 'exit_code' }
+      }
+      this.emitToolResult(itemId, out, isError, undefined, engineMeta)
       return
     }
     if (itemType === 'fileChange') {
+      const outcome = codexToolOutcome(item)
       const changes = Array.isArray(item.changes) ? (item.changes as unknown[]) : []
       const summary = changes
         .map((c) => {
@@ -2322,7 +2368,15 @@ export class CodexAppServerRunner extends EventEmitter {
           return `${k ?? 'change'}: ${o.path ?? ''}`
         })
         .join('\n')
-      this.emitToolResult(itemId, summary || 'file changes applied', false)
+      this.emitToolResult(
+        itemId,
+        outcome.isError ? _stringifyItemBounded(item) : summary || 'file changes applied',
+        outcome.isError,
+        undefined,
+        outcome.terminationReason === undefined
+          ? undefined
+          : { terminationReason: outcome.terminationReason },
+      )
       return
     }
     if (itemType === 'collabAgentToolCall') {
@@ -2330,6 +2384,13 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'imageGeneration') {
+      const outcome = codexToolOutcome(item)
+      if (outcome.isError) {
+        this.emitToolResult(itemId, 'imageGeneration failed', true, undefined, {
+          terminationReason: outcome.terminationReason ?? 'tool_error',
+        })
+        return
+      }
       // codex's image_gen tool emits two notification shapes depending on the
       // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
       // 0.125.0):
@@ -2345,11 +2406,14 @@ export class CodexAppServerRunner extends EventEmitter {
       const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
       const resultB64 = typeof item.result === 'string' ? item.result : ''
       if (!this.threadId || (!saved && !resultB64)) {
-        this.emitToolResult(itemId, _stringifyItemBounded(item), false)
+        this.emitToolResult(itemId, _stringifyItemBounded(item), true, undefined, {
+          terminationReason: outcome.terminationReason ?? 'tool_error',
+        })
         return
       }
       let publicPaths: string[] = []
       let failedNames: string[] = []
+      let localFailure = false
       try {
         if (saved) {
           const { copied, failedNames: f } = await copyImagePathsToPublicDir(
@@ -2382,6 +2446,7 @@ export class CodexAppServerRunner extends EventEmitter {
               err: (err as Error).message,
             })
             failedNames = [baseName]
+            localFailure = true
           }
         }
         const newEmits = publicPaths.filter((p) => !this.currentAssistantBuf.includes(p))
@@ -2418,12 +2483,24 @@ export class CodexAppServerRunner extends EventEmitter {
           sessionKey: this.opts.sessionKey,
           err: (err as Error).message,
         })
+        localFailure = true
       }
       // Also emit the original tool_result for the imageGeneration card so
       // the UI's tool-call panel reflects the call. Prefer the codex on-disk
       // path when available, otherwise the public path we just wrote.
       const summary = saved || publicPaths[0] || '<base64>'
-      this.emitToolResult(itemId, `imageGeneration → ${summary}`, false)
+      const isError = outcome.isError || localFailure || failedNames.length > 0
+      this.emitToolResult(
+        itemId,
+        isError
+          ? `imageGeneration failed: ${failedNames.join(', ') || 'tool reported an error'}`
+          : `imageGeneration → ${summary}`,
+        isError,
+        undefined,
+        isError
+          ? { terminationReason: outcome.terminationReason ?? 'tool_error' }
+          : undefined,
+      )
       return
     }
     if (itemType === 'agentMessage' || itemType === 'reasoning') {
@@ -2431,7 +2508,16 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'contextCompaction') {
-      this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
+      const outcome = codexToolOutcome(item)
+      this.emitToolResult(
+        itemId,
+        _stringifyItemBounded(visibleItem),
+        outcome.isError,
+        undefined,
+        outcome.terminationReason === undefined
+          ? undefined
+          : { terminationReason: outcome.terminationReason },
+      )
       this.emitTurnStatus(null)
       return
     }
@@ -2445,10 +2531,19 @@ export class CodexAppServerRunner extends EventEmitter {
     // 的孤儿 'unknown' 裸 JSON 卡。itemType 为 null(item.type 非字符串)时退回
     // codex:unknown。
     const pairName = itemType ? `codex:${itemType}` : 'codex:unknown'
-    this.emitToolResult(itemId, _stringifyItemBounded(item), false, {
-      name: pairName,
-      input: visibleItem,
-    })
+    const outcome = codexToolOutcome(item)
+    this.emitToolResult(
+      itemId,
+      _stringifyItemBounded(item),
+      outcome.isError,
+      {
+        name: pairName,
+        input: visibleItem,
+      },
+      outcome.terminationReason === undefined
+        ? undefined
+        : { terminationReason: outcome.terminationReason },
+    )
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +
@@ -2792,6 +2887,7 @@ export class CodexAppServerRunner extends EventEmitter {
     content: string,
     isError: boolean,
     orphanPairing?: { name: string; input: unknown },
+    engineMeta?: { exitCode?: number; terminationReason?: ToolTerminationReason },
   ): void {
     if (!this.emittedToolUseIds.has(toolUseId)) {
       // 孤儿 result:先补一帧配对 tool_use(emitAssistantToolUse 内部会登记 id,
@@ -2813,6 +2909,10 @@ export class CodexAppServerRunner extends EventEmitter {
             tool_use_id: toolUseId,
             content,
             is_error: isError,
+            ...(engineMeta?.exitCode !== undefined ? { exit_code: engineMeta.exitCode } : {}),
+            ...(engineMeta?.terminationReason !== undefined
+              ? { termination_reason: engineMeta.terminationReason }
+              : {}),
           },
         ],
       },

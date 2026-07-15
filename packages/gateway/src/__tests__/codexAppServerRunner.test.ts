@@ -889,6 +889,37 @@ describe('handleNotification — item/completed', () => {
     )
     assert.ok(result)
     assert.equal(result.message.content[0].is_error, true)
+    assert.equal(result.message.content[0].exit_code, 1)
+    assert.equal(result.message.content[0].termination_reason, 'exit_code')
+    await h.cleanup()
+  })
+
+  it('commandExecution out-of-range exit stays an error without exporting invalid metadata', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-cmd-signal'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-cmd-signal',
+        item: {
+          id: 'cmd-signal',
+          type: 'commandExecution',
+          command: 'sleep 10',
+          aggregatedOutput: '',
+          exitCode: -1,
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result)
+    assert.equal(result.message.content[0].is_error, true)
+    assert.equal(result.message.content[0].exit_code, undefined)
+    assert.equal(result.message.content[0].termination_reason, undefined)
     await h.cleanup()
   })
 
@@ -918,6 +949,101 @@ describe('handleNotification — item/completed', () => {
     assert.ok(result)
     assert.match(result.message.content[0].content, /add: \/tmp\/new\.txt/)
     assert.match(result.message.content[0].content, /update: \/tmp\/old\.txt/)
+    await h.cleanup()
+  })
+
+  it('fileChange structured failure → errored tool_result with engine reason', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-fc-failed'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-fc-failed',
+        item: {
+          id: 'fc-failed',
+          type: 'fileChange',
+          status: 'failed',
+          error: { message: 'patch did not apply' },
+          changes: [],
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result)
+    assert.equal(result.message.content[0].is_error, true)
+    assert.equal(result.message.content[0].termination_reason, 'tool_error')
+    await h.cleanup()
+  })
+
+  it('generic Codex items honor failed and cancelled structured outcomes', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-generic-outcomes'
+    for (const item of [
+      {
+        id: 'mcp-failed',
+        type: 'mcpToolCall',
+        status: 'failed',
+        error: { message: 'server rejected request' },
+      },
+      { id: 'web-cancelled', type: 'webSearch', status: 'cancelled' },
+    ]) {
+      feed(h.runner, {
+        jsonrpc: '2.0',
+        method: 'item/completed',
+        params: { threadId: 'thr-1', turnId: 't-generic-outcomes', item },
+      })
+    }
+    await new Promise((r) => setImmediate(r))
+    const results = h.messages
+      .filter((m) => m.type === 'user' && m.message.content[0].type === 'tool_result')
+      .map((m) => m.message.content[0])
+    assert.equal(results.length, 2)
+    assert.deepEqual(
+      results.map((result) => [
+        result.tool_use_id,
+        result.is_error,
+        result.termination_reason,
+      ]),
+      [
+        ['mcp-failed', true, 'tool_error'],
+        ['web-cancelled', true, 'cancelled'],
+      ],
+    )
+    await h.cleanup()
+  })
+
+  it('commandExecution status failure wins over exit 0', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-cmd-status-failed'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-cmd-status-failed',
+        item: {
+          id: 'cmd-status-failed',
+          type: 'commandExecution',
+          status: 'failed',
+          error: { message: 'sandbox rejected command' },
+          aggregatedOutput: '',
+          exitCode: 0,
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result)
+    assert.equal(result.message.content[0].is_error, true)
+    assert.equal(result.message.content[0].exit_code, 0)
+    assert.equal(result.message.content[0].termination_reason, 'tool_error')
     await h.cleanup()
   })
 
@@ -1043,6 +1169,42 @@ describe('handleNotification — item/completed', () => {
       (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
     )
     assert.ok(tr)
+    await h.cleanup()
+  })
+
+  it('imageGeneration structured failure is bounded and never echoes base64 bytes', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-img-failed'
+    ;(h.runner as any).threadId = 'thr-img-failed'
+    const rawMarker = 'private-image-bytes-marker'
+    const resultB64 = Buffer.from(rawMarker).toString('base64')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-img-failed',
+        turnId: 't-img-failed',
+        item: {
+          id: 'img-failed',
+          type: 'imageGeneration',
+          status: 'failed',
+          error: { message: 'upstream failed' },
+          result: resultB64,
+        },
+      },
+    })
+    await waitFor(() =>
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+    )
+    const tr = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(tr)
+    assert.equal(tr.message.content[0].is_error, true)
+    assert.equal(tr.message.content[0].termination_reason, 'tool_error')
+    assert.equal(tr.message.content[0].content.includes(resultB64), false)
+    assert.equal(tr.message.content[0].content.includes(rawMarker), false)
+    await rm(join(paths.generatedDir, 'codex-thr-img-failed-img-failed.png'), { force: true })
     await h.cleanup()
   })
 

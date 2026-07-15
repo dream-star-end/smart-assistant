@@ -317,6 +317,12 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
       "ls -la",
     );
     assert.equal((toolBlocks[1].block as { toolName?: string }).toolName, "Write");
+    const detectedBash = h.events.find(
+      (event): event is Extract<EngineEvent, { kind: "tool_result_detected" }> =>
+        event.kind === "tool_result_detected" && event.result.toolName === "Bash",
+    );
+    assert.equal(detectedBash?.result.exitCode, 0);
+    assert.equal(detectedBash?.result.terminationReason, "exit_code");
 
     // TurnSummary parity
     assert.equal(summary.assistantText, "Hello world");
@@ -365,6 +371,55 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
     assert.deepEqual(
       toolUseBlocks.map((e) => (e.block as { toolName?: string }).toolName),
       ["codex:webSearch", "codex:mcpToolCall"],
+    );
+  });
+
+  test("structured item failures survive runner → parser with exact reasons", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+    p.notify("item/started", {
+      ...tid,
+      item: { id: "mc-failed", type: "mcpToolCall", server: "example", tool: "lookup" },
+    });
+    p.notify("item/completed", {
+      ...tid,
+      item: {
+        id: "mc-failed",
+        type: "mcpToolCall",
+        status: "failed",
+        error: { message: "remote rejected request" },
+      },
+    });
+    p.notify("item/started", {
+      ...tid,
+      item: { id: "web-cancelled", type: "webSearch", query: "cancel me" },
+    });
+    p.notify("item/completed", {
+      ...tid,
+      item: { id: "web-cancelled", type: "webSearch", status: "cancelled" },
+    });
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+
+    const results = h.events
+      .filter(
+        (event): event is Extract<EngineEvent, { kind: "tool_result_detected" }> =>
+          event.kind === "tool_result_detected",
+      )
+      .map((event) => event.result);
+    assert.deepEqual(
+      results.map((result) => [
+        result.toolName,
+        result.isError,
+        result.terminationReason,
+      ]),
+      [
+        ["codex:mcpToolCall", true, "tool_error"],
+        ["codex:webSearch", true, "cancelled"],
+      ],
     );
   });
 

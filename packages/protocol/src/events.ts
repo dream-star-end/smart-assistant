@@ -18,6 +18,7 @@
  *   - verification.* Plan/output verification results
  */
 import { type Static, Type } from '@sinclair/typebox'
+import type { ToolTerminationReason } from './toolFailureAudit.js'
 
 // ── Schema version ──────────────────────────────
 // Bump when adding/removing fields or event types.
@@ -164,6 +165,13 @@ export const ToolCalledEvent = Type.Intersect([
     isError: Type.Boolean(),
     inputPreview: Type.Optional(Type.String({ maxLength: 500 })),
     outputPreview: Type.Optional(Type.String({ maxLength: 500 })),
+    /** Engine-authored process exit status. Never inferred from preview text. */
+    exitCode: Type.Optional(Type.Integer({ minimum: 0, maximum: 255 })),
+    /** Engine-authored termination reason. Regex classification does not fill this field. */
+    terminationReason: Type.Optional(Type.Unsafe<ToolTerminationReason>({
+      type: 'string',
+      enum: ['exit_code', 'timeout', 'cancelled', 'signal', 'tool_error', 'unknown'],
+    })),
   }),
 ])
 export type ToolCalledEvent = Static<typeof ToolCalledEvent>
