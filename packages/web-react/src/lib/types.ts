@@ -81,16 +81,23 @@ export type ToolCard = {
 // 旧的本地 Billing/BillingLedgerEntry（分为单位、number）已废弃删除——计费 surface
 // 全程消费下方 v5 wire 类型，绝不再数值化大数。
 
+/** access token 与身份代次的原子快照。epoch 每次登录尝试/登出/失效都递增。 */
+export type AuthSnapshot = { token: string; epoch: number };
+
 /**
- * 鉴权会话：access token 的唯一权威源（仅存内存，绝不落地）。
- * - getToken/setToken：api 层在静默刷新成功后回写新 token，App 持有同一引用即可读到最新值。
- * - onExpired：刷新失败（refresh 返回 401）时回调，App 据此清理鉴权状态并回到登录页。
- * api 的鉴权请求统一吃 AuthSession，命中 401 时透明走一次 refresh + 重放。
+ * 鉴权会话：access token + 身份 epoch 的唯一权威源（仅存内存，绝不落地）。
+ *
+ * 所有异步 refresh / REST replay / WS 恢复都必须拿起始 epoch 做 commit/expire；这样旧账号的
+ * 晚到响应只能变成 stale no-op，绝不能覆盖新登录，也不能把新登录误判过期。
  */
 export type AuthSession = {
-  getToken: () => string;
-  setToken: (t: string) => void;
-  onExpired: () => void;
+  snapshot: () => AuthSnapshot;
+  /** 开始新身份边界（登录尝试/主动清理）：递增 epoch 并清 token，返回新 epoch。 */
+  beginIdentity: () => number;
+  /** 仅 expectedEpoch 仍为当前身份时写 token。 */
+  commitToken: (expectedEpoch: number, token: string) => boolean;
+  /** 仅 expectedEpoch 仍为当前身份时失效一次并通知 UI；重复/晚到调用返回 false。 */
+  expire: (expectedEpoch: number) => boolean;
 };
 
 /** @deprecated 历史命名，等同 AuthSession；保留以减小调用点改动面。 */
@@ -118,6 +125,13 @@ export type RefreshResult = {
   accessExp: number;
   remember: boolean;
 };
+
+/** 静默续期的可判别结果；只有 invalid 才允许把用户带回登录页。 */
+export type RefreshOutcome =
+  | { kind: "success"; epoch: number; result: RefreshResult }
+  | { kind: "invalid"; epoch: number }
+  | { kind: "transient"; epoch: number; retryAfterMs: number }
+  | { kind: "stale"; epoch: number };
 
 /** 注册（POST /api/auth/register，201）。 */
 export type RegisterResult = { userId: string; verifyEmailSent: boolean };

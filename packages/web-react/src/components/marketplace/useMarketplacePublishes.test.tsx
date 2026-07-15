@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceMyPublish } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 const listMarketplaceMyPublishes = vi.fn();
 vi.mock("../../lib/api", () => ({
@@ -17,7 +18,7 @@ import {
   useMarketplacePublishes,
 } from "./useMarketplacePublishes";
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function publish(status: string, over: Partial<MarketplaceMyPublish> = {}): MarketplaceMyPublish {
   return {

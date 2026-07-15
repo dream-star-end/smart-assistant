@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceAiReview, MarketplacePending } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 // api 网络层全 mock —— 只验证 ReviewPanel 与契约交互(待审 AI 意见区 + AI 审批记录折叠区)。
 const adminMarketplacePending = vi.fn();
@@ -26,7 +27,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function pending(over: Partial<MarketplacePending> = {}): MarketplacePending {
   return {

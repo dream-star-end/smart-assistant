@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, RepoSelection } from "../lib/types";
+import { createMemoryAuthSession } from "../lib/authSession";
 
 const getRepoSelection = vi.fn();
 const putRepoSelection = vi.fn();
@@ -20,7 +21,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "t", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 function setup(over: Partial<Parameters<typeof useRepoBinding>[0]> = {}) {
   const sendRepoBind = vi.fn();

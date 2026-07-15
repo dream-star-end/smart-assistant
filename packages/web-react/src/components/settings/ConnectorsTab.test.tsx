@@ -25,6 +25,7 @@ import type {
   DeclarativeManagementConnector,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import { ConnectorsTab } from "./ConnectorsTab";
 
 vi.mock("../../lib/api", async (importOriginal) => {
@@ -105,11 +106,7 @@ beforeEach(() => {
   });
 });
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 const PROVIDERS: ConnectorProvider[] = [
   {

@@ -53,6 +53,7 @@ import type {
   PublicModel,
   PutSessionInput,
   PutSessionResult,
+  RefreshOutcome,
   RefreshResult,
   RegisterResult,
   SessionArchivePage,
@@ -111,27 +112,217 @@ import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
  * user-chat-bridge（bearer 子协议），在 P4 接入；本文件保留清晰的 chat stub。
  */
 
-// ─── 静默刷新 + singleflight ─────────────────────────────────────────
-// 每个 AuthSession 的共享刷新锁：并发 401 只发一次 /api/auth/refresh。
-// 否则多个请求会用同一个 refresh cookie 并发刷新，第二个携带已轮换的旧 cookie
-// 到后端会被判 reuse → 撤销整个 token family → 正常用户被踢下线。
-const refreshInFlight = new WeakMap<AuthSession, Promise<string | null>>();
+// ─── 静默刷新 + epoch singleflight ───────────────────────────────────
+// refresh cookie 每次使用都会轮换。这里恢复旧前端已经验证过的三道闸：
+//   1) 同 AuthSession + 同 epoch 合并成一次网络调用；
+//   2) REFRESH_RACE 只在 server grace 内有界重试；
+//   3) 所有成功/失效都经 epoch fence，旧身份晚到响应只能 stale no-op。
+const REFRESH_TIMEOUT_MS = 30_000;
+const AUTH_COOKIE_REQUEST_TIMEOUT_MS = 30_000;
+const REFRESH_RACE_RETRY_DELAYS_MS = [250, 500, 1_000, 1_500, 1_750] as const;
+const REFRESH_TRANSIENT_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 
-function refreshOnce(a: AuthSession): Promise<string | null> {
-  let pending = refreshInFlight.get(a);
-  if (!pending) {
-    pending = (async () => {
-      const refreshed = await api.refresh();
-      if (refreshed) {
-        a.setToken(refreshed.accessToken);
-        return refreshed.accessToken;
-      }
-      a.onExpired();
-      return null;
-    })().finally(() => refreshInFlight.delete(a));
-    refreshInFlight.set(a, pending);
+type RawRefreshOutcome =
+  | { kind: "success"; result: RefreshResult }
+  | { kind: "invalid" }
+  | { kind: "race" }
+  | { kind: "transient"; retryAfterMs: number };
+
+type RefreshState = {
+  epoch: number;
+  flight: Promise<RefreshOutcome> | null;
+  controller: AbortController | null;
+  transientFailures: number;
+  nextAllowedAt: number;
+};
+
+const refreshStates = new WeakMap<AuthSession, RefreshState>();
+const authResponseFences = new WeakMap<Response, { session: AuthSession; epoch: number }>();
+
+// 本 tab 内所有会写 oc_rt 的调用按发起顺序落地。跨 tab 的 refresh 冲突由后端
+// REFRESH_RACE 协议处理；主动 logout 另有 token-free 广播让其它 tab 立即撤退。
+let authCookieMutationTail: Promise<void> = Promise.resolve();
+
+function withAuthCookieMutation<T>(run: () => Promise<T>): Promise<T> {
+  const result = authCookieMutationTail.then(run, run);
+  authCookieMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+/**
+ * login/logout 也是 FIFO 队首：必须自身有界，否则一个永不 settle 的 fetch 会永久饿死
+ * 后续 refresh/login/logout。超时从真正出队、开始 fetch 时计算，不消耗排队时间。
+ */
+function authCookieFetch(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("auth cookie request timeout", "TimeoutError")),
+    AUTH_COOKIE_REQUEST_TIMEOUT_MS,
+  );
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => clearTimeout(timeout));
+}
+
+function refreshStateFor(a: AuthSession, epoch: number): RefreshState {
+  const current = refreshStates.get(a);
+  if (current?.epoch === epoch) return current;
+  const next: RefreshState = {
+    epoch,
+    flight: null,
+    controller: null,
+    transientFailures: 0,
+    nextAllowedAt: 0,
+  };
+  refreshStates.set(a, next);
+  return next;
+}
+
+async function refreshAttempt(signal: AbortSignal): Promise<RawRefreshOutcome> {
+  let res: Response;
+  try {
+    res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      signal,
+    });
+  } catch {
+    return { kind: "transient", retryAfterMs: 0 };
   }
-  return pending;
+
+  if (res.ok) {
+    try {
+      const body = (await res.json()) as Record<string, unknown>;
+      if (
+        typeof body?.access_token !== "string" ||
+        !body.access_token ||
+        typeof body.access_exp !== "number" ||
+        !Number.isFinite(body.access_exp) ||
+        typeof body.remember !== "boolean"
+      ) {
+        return { kind: "transient", retryAfterMs: 0 };
+      }
+      return {
+        kind: "success",
+        result: {
+          accessToken: body.access_token,
+          accessExp: body.access_exp,
+          remember: body.remember,
+        },
+      };
+    } catch {
+      return { kind: "transient", retryAfterMs: 0 };
+    }
+  }
+
+  let code: string | undefined;
+  try {
+    const body = (await res.json()) as { error?: { code?: unknown } };
+    if (typeof body?.error?.code === "string") code = body.error.code;
+  } catch {
+    /* 非标准错误体属于瞬时/未知故障，绝不能据此清登录态。 */
+  }
+  if (code === "REFRESH_RACE") return { kind: "race" };
+  if (code === "INVALID_REFRESH" || code === "VALIDATION") return { kind: "invalid" };
+  return {
+    kind: "transient",
+    retryAfterMs: Math.max(0, (parseRetryAfter(res) ?? 0) * 1_000),
+  };
+}
+
+async function refreshWithRaceRetry(signal: AbortSignal): Promise<RawRefreshOutcome> {
+  let outcome = await refreshAttempt(signal);
+  for (const delayMs of REFRESH_RACE_RETRY_DELAYS_MS) {
+    if (outcome.kind !== "race") return outcome;
+    try {
+      await sleep(delayMs, signal);
+    } catch {
+      return { kind: "transient", retryAfterMs: 0 };
+    }
+    outcome = await refreshAttempt(signal);
+  }
+  return outcome.kind === "race" ? { kind: "transient", retryAfterMs: 0 } : outcome;
+}
+
+/** 中止当前 session 的旧身份 refresh；返回值可用于需要等待其真正 settle 的调用点。 */
+export function cancelAuthRefresh(a: AuthSession): Promise<void> {
+  const state = refreshStates.get(a);
+  if (!state) return Promise.resolve();
+  try {
+    state.controller?.abort(new DOMException("auth epoch changed", "AbortError"));
+  } catch {
+    state.controller?.abort();
+  }
+  return state.flight?.then(
+    () => undefined,
+    () => undefined,
+  ) ?? Promise.resolve();
+}
+
+/** REST、boot、admin、WS 共用的唯一静默续期入口。 */
+export function refreshAuth(a: AuthSession, expectedEpoch = a.snapshot().epoch): Promise<RefreshOutcome> {
+  const snapshot = a.snapshot();
+  if (snapshot.epoch !== expectedEpoch) {
+    return Promise.resolve({ kind: "stale", epoch: expectedEpoch });
+  }
+
+  const state = refreshStateFor(a, expectedEpoch);
+  if (state.flight) return state.flight;
+  const now = Date.now();
+  if (state.nextAllowedAt > now) {
+    return Promise.resolve({
+      kind: "transient",
+      epoch: expectedEpoch,
+      retryAfterMs: state.nextAllowedAt - now,
+    });
+  }
+
+  const controller = new AbortController();
+  state.controller = controller;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+
+  let flight!: Promise<RefreshOutcome>;
+  flight = withAuthCookieMutation(async (): Promise<RefreshOutcome> => {
+    // 排队不计入 refresh 自身网络期限；login/logout 队首也各自有同样的 30s 上限。
+    timeout = setTimeout(
+      () => controller.abort(new DOMException("refresh timeout", "TimeoutError")),
+      REFRESH_TIMEOUT_MS,
+    );
+    let raw: RawRefreshOutcome;
+    try {
+      raw = await refreshWithRaceRetry(controller.signal);
+    } catch {
+      raw = { kind: "transient", retryAfterMs: 0 };
+    }
+
+    if (a.snapshot().epoch !== expectedEpoch) return { kind: "stale", epoch: expectedEpoch };
+    if (raw.kind === "success") {
+      state.transientFailures = 0;
+      state.nextAllowedAt = 0;
+      return a.commitToken(expectedEpoch, raw.result.accessToken)
+        ? { kind: "success", epoch: expectedEpoch, result: raw.result }
+        : { kind: "stale", epoch: expectedEpoch };
+    }
+    if (raw.kind === "invalid") {
+      state.transientFailures = 0;
+      state.nextAllowedAt = 0;
+      return { kind: "invalid", epoch: expectedEpoch };
+    }
+
+    state.transientFailures = Math.min(state.transientFailures + 1, REFRESH_TRANSIENT_BACKOFF_MS.length);
+    const backoff = REFRESH_TRANSIENT_BACKOFF_MS[state.transientFailures - 1] ?? 10_000;
+    const retryAfterMs = Math.max(raw.kind === "transient" ? raw.retryAfterMs : 0, backoff);
+    state.nextAllowedAt = Date.now() + retryAfterMs;
+    return { kind: "transient", epoch: expectedEpoch, retryAfterMs };
+  }).finally(() => {
+    if (timeout) clearTimeout(timeout);
+    if (state.flight === flight) state.flight = null;
+    if (state.controller === controller) state.controller = null;
+  });
+  state.flight = flight;
+  return flight;
 }
 
 // export：admin 数据层（src/admin/lib/adminApi.ts）复用同一套透明刷新重放，
@@ -140,18 +331,54 @@ export async function callWithRefresh(
   a: AuthSession,
   make: (token: string) => Promise<Response>,
 ): Promise<Response> {
-  const usedToken = a.getToken();
-  const res = await make(usedToken);
-  if (res.status !== 401) return res;
-  // 若期间别的并发请求已刷新出新 token，直接用新 token 重放，不再触发 refresh。
-  const current = a.getToken();
-  const newToken = current && current !== usedToken ? current : await refreshOnce(a);
-  if (!newToken) {
-    // 刷新失败 → 会话过期（onExpired 已在 refreshOnce 内触发一次），把原始 401 交回上层。
-    return res;
+  const used = a.snapshot();
+  const res = await make(used.token);
+  // 普通 2xx/4xx 也可能在换号后才返回；旧身份响应不得交给调用方解析、写入当前 UI。
+  if (a.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError();
+  if (res.status !== 401) return fenceAuthResponse(res, a, used.epoch);
+  // 旧请求绝不能借 token-changed shortcut 跑到新账号名下。
+  const current = a.snapshot();
+  if (current.epoch !== used.epoch) throw new AuthEpochStaleError();
+  if (current.token && current.token !== used.token) {
+    const replay = await make(current.token);
+    if (a.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError();
+    return fenceAuthResponse(replay, a, used.epoch);
   }
-  // 用新 token 重放一次（最多一次，重放仍失败不再刷新）。
-  return make(newToken);
+
+  const refreshed = await refreshAuth(a, used.epoch);
+  if (refreshed.kind === "invalid") {
+    a.expire(used.epoch); // session 内部幂等：并发消费者只通知 UI 一次。
+    return fenceAuthResponse(res, a, used.epoch);
+  }
+  if (refreshed.kind === "stale") throw new AuthEpochStaleError();
+  if (refreshed.kind !== "success") return fenceAuthResponse(res, a, used.epoch);
+
+  const beforeReplay = a.snapshot();
+  if (beforeReplay.epoch !== used.epoch) throw new AuthEpochStaleError();
+  if (beforeReplay.token !== refreshed.result.accessToken) return fenceAuthResponse(res, a, used.epoch);
+  // 最多重放一次；重放仍 401 不递归刷新。
+  const replay = await make(beforeReplay.token);
+  if (a.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError();
+  return fenceAuthResponse(replay, a, used.epoch);
+}
+
+/** 身份在请求期间切换；旧响应必须静默丢弃，绝不能进入新身份的数据层。 */
+export class AuthEpochStaleError extends Error {
+  constructor() {
+    super("auth identity changed while request was in flight");
+    this.name = "AuthEpochStaleError";
+  }
+}
+
+function fenceAuthResponse(res: Response, session: AuthSession, epoch: number): Response {
+  authResponseFences.set(res, { session, epoch });
+  return res;
+}
+
+/** body 读取也可能跨越换号边界；解析前后都调用，避免大响应迟到污染新身份。 */
+export function assertAuthResponseCurrent(res: Response): void {
+  const fence = authResponseFences.get(res);
+  if (fence && fence.session.snapshot().epoch !== fence.epoch) throw new AuthEpochStaleError();
 }
 
 /** 可中断 sleep（用于冷启轮询退避）。abort 时 reject AbortError 并清理定时器。 */
@@ -372,6 +599,15 @@ function isNetworkError(err: unknown): boolean {
   );
 }
 
+/** 启动恢复可重试错误：网络/解析异常，以及 401、限流和服务端故障。 */
+export function isAuthRecoveryTransient(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return err.status === 401 || err.status === 408 || err.status === 429 || err.status >= 500;
+  }
+  if (err instanceof TypeError || err instanceof SyntaxError) return true;
+  return err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
 /**
  * 展示层错误文案的**单一权威**（面向所有业务/管理面板的 catch）。判据（见上方注释）：
  *   1. 网络失败（TypeError: Failed to fetch 等）        → 标准中文「网络不可用」，绝不外露英文。
@@ -405,6 +641,7 @@ export function apiErrorMessage(err: unknown, fallback: string): string {
 /** 读 !res.ok 的响应体，组装并抛出 ApiError（绝不返回）。 */
 // export：admin 数据层（adminText CSV 导出等非 JSON 路径）复用统一错误信封解包。仅加导出。
 export async function throwApi(res: Response): Promise<never> {
+  assertAuthResponseCurrent(res);
   let message = `请求失败 (${res.status})`;
   let code: string | undefined;
   let issues: ApiIssue[] | undefined;
@@ -428,6 +665,7 @@ export async function throwApi(res: Response): Promise<never> {
   } catch {
     /* 非 JSON 响应：保留默认 message */
   }
+  assertAuthResponseCurrent(res);
   throw new ApiError({
     status: res.status,
     message: withReqId(message, res),
@@ -442,8 +680,11 @@ export async function throwApi(res: Response): Promise<never> {
 // export：admin 数据层复用统一 JSON 解包 + 错误抛出。仅加导出。
 export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
   const res = await p;
+  assertAuthResponseCurrent(res);
   if (!res.ok) await throwApi(res);
-  return (await res.json()) as T;
+  const body = (await res.json()) as T;
+  assertAuthResponseCurrent(res);
+  return body;
 }
 
 /**
@@ -545,16 +786,18 @@ export const api = {
    * turnstileToken 可选：开启 Turnstile 时由调用方传入（生产必填）。
    */
   async login(email: string, password: string, turnstileToken?: string): Promise<LoginResult> {
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      credentials: "include",
-      headers: { Accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({
-        email,
-        password,
-        ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
+    const res = await withAuthCookieMutation(() =>
+      authCookieFetch("/api/auth/login", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({
+          email,
+          password,
+          ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
+        }),
       }),
-    });
+    );
     if (!res.ok) {
       // 登录错误的 code 会在 useAuth.login 的 catch 里被拍平成 message，故在此 auth 边界
       // 先按 code 换友好中文（单一权威表 AUTH_ERROR_MESSAGES）；未知 code 原样（带追踪号）。
@@ -589,32 +832,28 @@ export const api = {
   /**
    * 静默刷新（POST /api/auth/refresh）：无 body、无 Authorization，仅凭同源 HttpOnly refresh
    * cookie 换新 access token。浏览器在同源 fetch 上自动带 Origin（满足后端 CSRF 校验）。
-   * v5 仅回 access token（不回 user）。200 返回解析体，否则 null。
+   * v5 仅回 access token（不回 user）。所有调用面共享 epoch-bound singleflight；调用方必须
+   * 按 outcome.kind 区分真正失效与瞬时故障。
    * 该调用绝不经 callWithRefresh 包装，避免 401 时自我递归。
    */
-  async refresh(): Promise<RefreshResult | null> {
-    try {
-      const res = await fetch("/api/auth/refresh", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json" },
-      });
-      if (!res.ok) return null;
-      const b = (await res.json()) as { access_token: string; access_exp: number; remember: boolean };
-      return { accessToken: b.access_token, accessExp: b.access_exp, remember: b.remember };
-    } catch {
-      return null;
-    }
+  refresh(a: AuthSession, expectedEpoch?: number): Promise<RefreshOutcome> {
+    return refreshAuth(a, expectedEpoch);
   },
 
   /** 主动登出（POST /api/auth/logout）：吊销 refresh cookie。错误一律吞掉（前端清状态即视为已登出）。 */
-  async logout(): Promise<void> {
+  async logout(a?: AuthSession): Promise<void> {
+    // abort 是同步触发的；logout 随即排到同 tab mutation FIFO 尾部，因此一定在旧 refresh
+    // 真正 settle 之后才发出，避免晚到 refresh Set-Cookie 覆盖 logout 的清 cookie。
+    if (a) void cancelAuthRefresh(a);
     try {
-      await fetch("/api/auth/logout", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json" },
-      });
+      await withAuthCookieMutation(() =>
+        authCookieFetch("/api/auth/logout", {
+          method: "POST",
+          credentials: "include",
+          keepalive: true,
+          headers: { Accept: "application/json" },
+        }),
+      );
     } catch {
       /* ignore */
     }
@@ -1537,6 +1776,7 @@ export const api = {
     );
     if (res.status === 409) {
       const body = (await res.json().catch(() => null)) as { conflict?: Partial<MemoryConflict> } | null;
+      assertAuthResponseCurrent(res);
       const c = body?.conflict;
       if (c && typeof c.text === "string") {
         return {
@@ -1619,6 +1859,7 @@ export const api = {
       const body = (await res.json().catch(() => null)) as {
         conflict?: { content?: string; current?: string; text?: string; version?: unknown };
       } | null;
+      assertAuthResponseCurrent(res);
       const c = body?.conflict;
       // 存储层 conflict 用 `current`,路由若对齐 user 用 `text`,一律兼容取正文。
       const latest = c ? (c.content ?? c.current ?? c.text) : undefined;

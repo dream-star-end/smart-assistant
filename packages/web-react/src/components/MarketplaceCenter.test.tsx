@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceMyPublish } from "../lib/types";
+import { createMemoryAuthSession } from "../lib/authSession";
 
 const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),
@@ -54,7 +55,7 @@ vi.mock("./marketplace/ReviewPanel", () => ({ ReviewPanel: () => <div>review</di
 
 import { MarketplaceCenter } from "./MarketplaceCenter";
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function publish(status: "approved" | "rejected", over: Partial<MarketplaceMyPublish> = {}) {
   return {

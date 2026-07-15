@@ -60,12 +60,14 @@ describe("MarketplacePage", () => {
     renderPage(<MarketplacePage />);
     await screen.findByText("暂无待审版本");
     expect(adminMarketplacePending).toHaveBeenCalledTimes(1);
-    // 传入的 auth 即 adminSession（getToken/setToken/onExpired 三件套）
+    // 传入的 auth 即 epoch-fenced adminSession。
     const passed = adminMarketplacePending.mock.calls[0][0] as {
-      getToken?: unknown;
-      onExpired?: unknown;
+      snapshot?: unknown;
+      commitToken?: unknown;
+      expire?: unknown;
     };
-    expect(typeof passed.getToken).toBe("function");
-    expect(typeof passed.onExpired).toBe("function");
+    expect(typeof passed.snapshot).toBe("function");
+    expect(typeof passed.commitToken).toBe("function");
+    expect(typeof passed.expire).toBe("function");
   });
 });

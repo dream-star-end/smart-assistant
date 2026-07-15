@@ -2,14 +2,11 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { SkillsPanel } from "./SkillsPanel";
 
-const auth = {
-  getToken: () => "tok",
-  setToken: () => {},
-  onExpired: () => {},
-} as AuthSession;
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 afterEach(() => {
   cleanup();

@@ -168,16 +168,14 @@ export function useChatSocket(opts: {
   const socketRef = useRef<ChatSocket | null>(null);
   if (!socketRef.current) {
     socketRef.current = new ChatSocket({
-      getToken: () => authRef.current?.getToken() ?? "",
-      silentRefresh: async () => {
-        const r = await api.refresh();
-        if (r) {
-          authRef.current?.setToken(r.accessToken);
-          return r.accessToken;
-        }
-        return null;
+      getToken: () => authRef.current?.snapshot().token ?? "",
+      getAuthEpoch: () => authRef.current?.snapshot().epoch ?? -1,
+      silentRefresh: async (expectedEpoch) => {
+        const session = authRef.current;
+        if (!session) return { kind: "stale", epoch: expectedEpoch };
+        return api.refresh(session, expectedEpoch);
       },
-      onAuthExpired: () => authRef.current?.onExpired(),
+      onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
       refreshBalance: () => refreshBalanceRef.current?.(),
       reportClientError: (p) => {
         // 真 turn 失败自动上报（best-effort，端点 P6 接；这里静默兜底）。

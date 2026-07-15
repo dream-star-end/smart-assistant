@@ -1819,12 +1819,91 @@ class FakeWS {
 function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
-    silentRefresh: async () => null,
+    getAuthEpoch: () => 0,
+    silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
     onAuthExpired: () => {},
     defaultAgentId: "main",
     ...overrides,
   });
 }
+
+describe("ChatSocket 1008 auth recovery", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  test("transient refresh keeps auth, retries while disconnected, then reconnects on success", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let token = "expired-token";
+    const expired = vi.fn();
+    const silentRefresh = vi
+      .fn<ChatSocketDeps["silentRefresh"]>()
+      .mockResolvedValueOnce({ kind: "transient", epoch: 7, retryAfterMs: 500 })
+      .mockImplementationOnce(async () => {
+        token = "fresh-token";
+        return { kind: "success", epoch: 7, result: { accessToken: token, accessExp: 999, remember: true } };
+      });
+    const sock = makeSocket({
+      getToken: () => token,
+      getAuthEpoch: () => 7,
+      silentRefresh,
+      onAuthExpired: expired,
+    });
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.readyState = 3;
+    first.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+
+    expect(expired).not.toHaveBeenCalled();
+    expect(FakeWS.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(silentRefresh).toHaveBeenCalledTimes(2);
+    expect(expired).not.toHaveBeenCalled();
+    expect(FakeWS.instances).toHaveLength(2);
+    expect(FakeWS.instances[1].protocols).toEqual(["bearer", "fresh-token"]);
+    sock.stop();
+  });
+
+  test("explicit invalid refresh tears auth down exactly once", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const expired = vi.fn();
+    const sock = makeSocket({
+      getAuthEpoch: () => 3,
+      silentRefresh: async () => ({ kind: "invalid", epoch: 3 }),
+      onAuthExpired: expired,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 3;
+    ws.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(expired).toHaveBeenCalledTimes(1);
+    expect(expired).toHaveBeenCalledWith(3);
+    expect(FakeWS.instances).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("stop cancels a scheduled transient auth retry", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const silentRefresh = vi.fn(async (epoch: number) => ({ kind: "transient" as const, epoch, retryAfterMs: 500 }));
+    const sock = makeSocket({ getAuthEpoch: () => 2, silentRefresh });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 3;
+    ws.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+    sock.stop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(silentRefresh).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", () => {
   afterEach(() => {

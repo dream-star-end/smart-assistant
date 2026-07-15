@@ -348,7 +348,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     const delayedArchive = new Promise((resolve) => {
       resolveArchive = resolve
     })
-    const fixtureGet = mockGet.getMockImplementation()!
+    const fixtureGet = mockGet.getMockImplementation()! as (...args: any[]) => any
     mockGet.mockImplementation((path: string, params?: Record<string, unknown>) => {
       if (path === '/sessions/web-1/archive') return delayedArchive
       return fixtureGet(path, params)
