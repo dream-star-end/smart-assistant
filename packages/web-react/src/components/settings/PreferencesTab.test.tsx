@@ -2,17 +2,14 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession } from "../../lib/types";
 import { PreferencesTab } from "./PreferencesTab";
 
 const apiKeysSection = vi.hoisted(() => vi.fn(() => null));
 vi.mock("./ApiKeysSection", () => ({ ApiKeysSection: apiKeysSection }));
 
-const auth = {
-  getToken: () => "tok",
-  setToken: () => {},
-  onExpired: () => {},
-} as AuthSession;
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 afterEach(() => {
   cleanup();

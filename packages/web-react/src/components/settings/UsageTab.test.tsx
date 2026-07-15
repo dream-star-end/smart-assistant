@@ -54,15 +54,12 @@ vi.mock("../../lib/api", () => ({
 }));
 
 import { api } from "../../lib/api";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 const mockedGetUsage = vi.mocked(api.getUsage);
 const mockedGetReport = vi.mocked(api.getMyUsageReport);
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

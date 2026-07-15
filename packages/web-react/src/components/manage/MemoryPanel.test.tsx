@@ -2,14 +2,11 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api } from "../../lib/api";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, AutoDreamReportResponse, MemoryFileMeta } from "../../lib/types";
 import { MemoryPanel } from "./MemoryPanel";
 
-const auth = {
-  getToken: () => "tok",
-  setToken: () => {},
-  onExpired: () => {},
-} as AuthSession;
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 const agents = [{ id: "main", name: "全能助手" }];
 

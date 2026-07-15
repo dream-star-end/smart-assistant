@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, InboxMessage } from "../lib/types";
+import { createMemoryAuthSession } from "../lib/authSession";
 
 // api 网络层全 mock —— 只验证抽屉与契约的交互（拉列表 / 单条已读 / 全部已读 / 分页）。
 const listInboxMessages = vi.fn();
@@ -41,11 +42,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = {
-  getToken: () => "tok",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function mk(id: string, extra: Partial<InboxMessage> = {}): InboxMessage {
   return {

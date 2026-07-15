@@ -17,7 +17,6 @@ import {
   onopenSetInitialStatus,
   parsePartialJson,
   shouldAutoContinueEmptyTurn,
-  WS_AUTH_REFRESH_MIN_GAP_MS,
 } from "./pure";
 import { addMessage, type ChatMessage, createSession, isServerAuthoredRow, resetReplyTracker } from "./model";
 import {
@@ -1820,12 +1819,91 @@ class FakeWS {
 function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
-    silentRefresh: async () => ({ kind: "invalid" as const }),
+    getAuthEpoch: () => 0,
+    silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
     onAuthExpired: () => {},
     defaultAgentId: "main",
     ...overrides,
   });
 }
+
+describe("ChatSocket 1008 auth recovery", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  test("transient refresh keeps auth, retries while disconnected, then reconnects on success", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let token = "expired-token";
+    const expired = vi.fn();
+    const silentRefresh = vi
+      .fn<ChatSocketDeps["silentRefresh"]>()
+      .mockResolvedValueOnce({ kind: "transient", epoch: 7, retryAfterMs: 500 })
+      .mockImplementationOnce(async () => {
+        token = "fresh-token";
+        return { kind: "success", epoch: 7, result: { accessToken: token, accessExp: 999, remember: true } };
+      });
+    const sock = makeSocket({
+      getToken: () => token,
+      getAuthEpoch: () => 7,
+      silentRefresh,
+      onAuthExpired: expired,
+    });
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.readyState = 3;
+    first.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+
+    expect(expired).not.toHaveBeenCalled();
+    expect(FakeWS.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(silentRefresh).toHaveBeenCalledTimes(2);
+    expect(expired).not.toHaveBeenCalled();
+    expect(FakeWS.instances).toHaveLength(2);
+    expect(FakeWS.instances[1].protocols).toEqual(["bearer", "fresh-token"]);
+    sock.stop();
+  });
+
+  test("explicit invalid refresh tears auth down exactly once", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const expired = vi.fn();
+    const sock = makeSocket({
+      getAuthEpoch: () => 3,
+      silentRefresh: async () => ({ kind: "invalid", epoch: 3 }),
+      onAuthExpired: expired,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 3;
+    ws.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(expired).toHaveBeenCalledTimes(1);
+    expect(expired).toHaveBeenCalledWith(3);
+    expect(FakeWS.instances).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("stop cancels a scheduled transient auth retry", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const silentRefresh = vi.fn(async (epoch: number) => ({ kind: "transient" as const, epoch, retryAfterMs: 500 }));
+    const sock = makeSocket({ getAuthEpoch: () => 2, silentRefresh });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 3;
+    ws.onclose?.({ code: 1008, reason: "expired" });
+    await Promise.resolve();
+    sock.stop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(silentRefresh).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", () => {
   afterEach(() => {
@@ -2481,70 +2559,6 @@ describe("ChatSocket bearer subprotocol auth (#4)", () => {
     expect(ws.url).not.toContain("tok");
     expect(ws.url).not.toContain("token");
     expect(ws.url.endsWith("/ws/user-chat-bridge")).toBe(true);
-  });
-
-  test("repeated transient 1008 refreshes keep auth and stay bounded across open→close cycles", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-15T12:00:00Z"));
-    const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    let token = "expired-token";
-    const outcomes = ["transient", "transient", "success", "invalid"] as const;
-    const silentRefresh = vi.fn(async () => {
-      const kind = outcomes[silentRefresh.mock.calls.length - 1] ?? "invalid";
-      if (kind === "success") token = "fresh-token";
-      return kind === "success" ? { kind, token } : { kind };
-    });
-    const onAuthExpired = vi.fn();
-    const sock = makeSocket({ getToken: () => token, silentRefresh, onAuthExpired });
-    const settleRefresh = async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    };
-
-    sock.setGateReady(true);
-    const first = FakeWS.instances.at(-1)!;
-    first.open();
-    first.close(1008, "expired");
-    await settleRefresh();
-    expect(silentRefresh).toHaveBeenCalledTimes(1);
-    expect(onAuthExpired).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(WS_AUTH_REFRESH_MIN_GAP_MS - 1);
-    expect(FakeWS.instances).toHaveLength(1);
-    expect(silentRefresh).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const second = FakeWS.instances.at(-1)!;
-    second.open(); // ordinary reconnectAttempts resets here; auth attempts must not.
-    second.close(1008, "expired");
-    await settleRefresh();
-    expect(silentRefresh).toHaveBeenCalledTimes(2);
-    expect(onAuthExpired).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(WS_AUTH_REFRESH_MIN_GAP_MS - 1);
-    expect(FakeWS.instances).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(1);
-    const third = FakeWS.instances.at(-1)!;
-    third.open();
-    third.close(1008, "expired");
-    await settleRefresh();
-    expect(silentRefresh).toHaveBeenCalledTimes(3);
-    expect(onAuthExpired).not.toHaveBeenCalled();
-    expect(token).toBe("fresh-token");
-
-    // A successful refresh resets its independent cooldown/backoff: an
-    // immediate subsequent 1008 may classify the credential again instead
-    // of inheriting the previous transient window.
-    const afterSuccess = FakeWS.instances.at(-1)!;
-    expect(FakeWS.instances).toHaveLength(4);
-    afterSuccess.open();
-    afterSuccess.close(1008, "still rejected");
-    await settleRefresh();
-    expect(silentRefresh).toHaveBeenCalledTimes(4);
-    expect(onAuthExpired).toHaveBeenCalledTimes(1);
-
-    sock.stop();
-    random.mockRestore();
   });
 });
 

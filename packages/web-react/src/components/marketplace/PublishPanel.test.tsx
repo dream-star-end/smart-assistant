@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 const listSkills = vi.fn();
 const listMarketplaceMyPublishes = vi.fn();
@@ -22,7 +23,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 /** 填好会阻塞人向元数据校验之前的所有基础字段(slug 由英文名联动、正文、描述)。 */
 function fillBaseFields() {

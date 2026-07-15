@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { api, ApiError } from "../../lib/api";
+import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession } from "../../lib/types";
 import { friendlyRiskFlags } from "./riskFlags";
 
@@ -8,7 +9,7 @@ afterEach(() => {
 });
 
 function session(): AuthSession {
-  return { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+  return createMemoryAuthSession(() => {}, "tok");
 }
 function ok(body: unknown) {
   return { ok: true, status: 200, headers: { get: () => null }, json: async () => body };

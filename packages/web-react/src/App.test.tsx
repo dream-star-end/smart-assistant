@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
@@ -49,9 +50,9 @@ const PUBLIC_CONFIG = okJson({
   allow_registration: true,
 })
 
-// 启动静默续期(App boot):无 refresh cookie → 401。mock 必须显式处理本路径,否则
+// 启动静默续期(App boot):无 refresh cookie → 400 VALIDATION。mock 必须显式处理本路径,否则
 // catch-all 的 200 空体/LOGIN_OK 会让 boot 自动进工作区,登录流用例找不到 Landing。
-const REFRESH_401 = errJson(401, { error: { code: 'INVALID_REFRESH', message: '未登录' } })
+const REFRESH_401 = errJson(400, { error: { code: 'VALIDATION', message: 'refresh_token is required' } })
 // 静默续期成功(自动登录用例):v5 refresh 仅回 access token,user 由 GET /api/me 拿。
 const REFRESH_OK = okJson({ access_token: 'tok-r', access_exp: 1234, remember: true })
 
@@ -243,6 +244,75 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect((refreshCall![1] as RequestInit).credentials).toBe('include')
   })
 
+  test('boot transient refresh failure stays in recovery and does not flash the login page', async () => {
+    let refreshCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        if (refreshCalls === 1) {
+          return errJson(503, { error: { code: 'UPSTREAM_UNAVAILABLE', message: 'temporary outage' } })
+        }
+        return REFRESH_OK
+      }
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    expect(screen.queryByRole('button', { name: '登录' })).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument(), { timeout: 4_000 })
+    expect(refreshCalls).toBe(2)
+    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+  })
+
+  test('boot repeated transient failures surface a manual recovery action instead of false logout', async () => {
+    let refreshCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        return errJson(503, { error: { code: 'UPSTREAM_UNAVAILABLE', message: 'temporary outage' } })
+      }
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () => expect(screen.getByRole('button', { name: '重试恢复登录状态' })).toBeInTheDocument(),
+      { timeout: 4_000 },
+    )
+    expect(refreshCalls).toBe(2)
+    expect(screen.getByText('登录状态恢复失败，请检查网络后重试')).toBeInTheDocument()
+  })
+
+  test('StrictMode effect replay shares the same boot refresh flight', async () => {
+    let refreshCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        return REFRESH_OK
+      }
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<StrictMode><App /></StrictMode>)
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    expect(refreshCalls).toBe(1)
+  })
+
   test('login error localizes the backend code to friendly Chinese (no raw English / trace id)', async () => {
     // 生产实况：后端 message 是英文 "invalid credentials" + x-request-id 头（追踪号来源）。
     const invalidCreds = {
@@ -251,9 +321,10 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       headers: { get: (h: string) => (h === 'x-request-id' ? '0f0ac9caa' : null) },
       json: async () => ({ error: { code: 'INVALID_CREDENTIALS', message: 'invalid credentials' } }),
     }
-    fetchMock = vi.fn(async (url: string) =>
-      String(url).includes('/api/public/config') ? PUBLIC_CONFIG : invalidCreds,
-    ) as unknown as FetchMock // refresh 也命中该分支 → boot 落 Landing,符合本用例。
+    fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/api/auth/refresh')) return REFRESH_401
+      return String(url).includes('/api/public/config') ? PUBLIC_CONFIG : invalidCreds
+    }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
@@ -750,7 +821,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
     const rectSpy = vi
       .spyOn(HTMLElement.prototype, 'getClientRects')
-      .mockImplementation(function getClientRects() {
+      .mockImplementation(function getClientRects(this: HTMLElement) {
         return (this.hasAttribute('data-product-feature') ? [{}] : []) as unknown as DOMRectList
       })
 

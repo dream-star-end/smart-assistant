@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 // api 网络层全 mock —— 只验证 FeaturedPanel 的排序渲染 + 保存回写契约,不打真实网络。
 const searchMarketplace = vi.fn();
@@ -15,7 +16,7 @@ vi.mock("../../lib/api", () => ({
 
 import { FeaturedPanel } from "./FeaturedPanel";
 
-const auth: AuthSession = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} };
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 function card(slug: string, over: Partial<MarketplaceCard> = {}): MarketplaceCard {
   return { slug, kind: "skill", name: slug, description: "", tags: [], ...over };

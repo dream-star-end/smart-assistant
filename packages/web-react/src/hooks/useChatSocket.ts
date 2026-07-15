@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { api, refreshWithFriction } from "../lib/api";
+import { api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
@@ -169,20 +169,14 @@ export function useChatSocket(opts: {
   const socketRef = useRef<ChatSocket | null>(null);
   if (!socketRef.current) {
     socketRef.current = new ChatSocket({
-      getToken: () => authRef.current?.getToken() ?? "",
-      silentRefresh: async () => {
+      getToken: () => authRef.current?.snapshot().token ?? "",
+      getAuthEpoch: () => authRef.current?.snapshot().epoch ?? -1,
+      silentRefresh: async (expectedEpoch) => {
         const session = authRef.current;
-        if (!session) return { kind: "invalid" as const };
-        const r = await refreshWithFriction(session, "auth", session.getToken());
-        if (r.kind === "success") {
-          authRef.current?.setToken(r.result.accessToken);
-          return { kind: "success" as const, token: r.result.accessToken };
-        }
-        return r.kind === "invalid"
-          ? { kind: "invalid" as const }
-          : { kind: "transient" as const };
+        if (!session) return { kind: "stale", epoch: expectedEpoch };
+        return api.refresh(session, expectedEpoch, "ws_auth");
       },
-      onAuthExpired: () => authRef.current?.onExpired(),
+      onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
       refreshBalance: () => refreshBalanceRef.current?.(),
       reportClientError: (p) => {
         reportClientFriction({
@@ -191,7 +185,7 @@ export function useChatSocket(opts: {
           code: p.code,
           traceId: p.traceId,
           sessionId: p.sessionId,
-        }, authRef.current?.getToken());
+        }, authRef.current?.snapshot().token);
       },
       // resume_failed / 重连 reconcile：有游标走 REST 增量、无游标才全量；两者都以 server
       // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。

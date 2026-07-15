@@ -2,12 +2,13 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api } from "../lib/api";
+import { createMemoryAuthSession } from "../lib/authSession";
 import type { AuthSession } from "../lib/types";
 import { CronPanel } from "./manage/CronPanel";
 import { UsageTab } from "./settings/UsageTab";
 import { InstalledPanel } from "./marketplace/InstalledPanel";
 
-const auth = { getToken: () => "tok", setToken: () => {}, onExpired: () => {} } as AuthSession;
+const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
 afterEach(() => {
   cleanup();

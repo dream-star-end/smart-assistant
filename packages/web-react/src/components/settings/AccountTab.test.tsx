@@ -21,6 +21,7 @@ import type {
   User,
 } from "../../lib/types";
 import { AccountTab } from "./AccountTab";
+import { createMemoryAuthSession } from "../../lib/authSession";
 
 vi.mock("chart.js/auto", () => ({
   default: class {
@@ -43,11 +44,7 @@ const mockedGetSub = vi.mocked(api.getMySubscription);
 const mockedGetUsage = vi.mocked(api.getUsage);
 const mockedGetReport = vi.mocked(api.getMyUsageReport);
 
-const auth: AuthSession = {
-  getToken: () => "t",
-  setToken: () => {},
-  onExpired: () => {},
-};
+const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 const user = {
   id: "u1",

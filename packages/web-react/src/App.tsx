@@ -279,6 +279,7 @@ export function App() {
     authError,
     authRecoveryAvailable,
     retryBoot,
+    clearAuth,
     booting,
     laneReady,
     login,
@@ -324,7 +325,7 @@ export function App() {
     },
   });
 
-  // AuthSession 整个生命周期是同一引用（见 useAuth：useRef 初始化后仅就地改 onExpired）。
+  // AuthSession 整个生命周期是同一引用；token + epoch 在对象内部原子推进。
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
   // 多处 useCallback/useEffect 误报 useExhaustiveDependencies（lint 只认本地 useRef 为稳定）。
   const authRef = useRef(authSessionRef.current);
@@ -1472,7 +1473,9 @@ export function App() {
       </div>
     );
   }
-  if (!demo && view === "home") {
+  // A transient boot failure is not a logout. Surface the dedicated recovery
+  // action immediately instead of hiding it behind the ordinary landing page.
+  if (!demo && view === "home" && !authRecoveryAvailable) {
     return (
       <LazyBoundary fallback={<SplashFallback />}>
         <Landing
@@ -1513,6 +1516,7 @@ export function App() {
         error={authError}
         onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
         onBack={() => {
+          if (authRecoveryAvailable) clearAuth();
           setAuthMode("login");
           setView("home");
         }}
@@ -1755,7 +1759,7 @@ export function App() {
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
-            getVoiceToken={demo ? undefined : () => authRef.current.getToken()}
+            getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}

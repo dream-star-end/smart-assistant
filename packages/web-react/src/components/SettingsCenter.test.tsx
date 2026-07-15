@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, expect, test, vi } from 'vitest'
 import { api } from '../lib/api'
 import type { AuthSession } from '../lib/types'
+import { createMemoryAuthSession } from '../lib/authSession'
 import { SettingsCenter } from './SettingsCenter'
 
 vi.mock('./settings/AccountTab', () => ({ AccountTab: () => <div>账户页</div> }))
@@ -16,11 +17,7 @@ vi.mock('./settings/PreferencesTab', () => ({
 }))
 vi.mock('./settings/SubscriptionDialog', () => ({ SubscriptionDialog: () => null }))
 
-const auth: AuthSession = {
-  getToken: () => 'token',
-  setToken: () => {},
-  onExpired: () => {},
-}
+const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
 
 afterEach(() => {
   cleanup()
