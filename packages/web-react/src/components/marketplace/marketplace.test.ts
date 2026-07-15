@@ -42,6 +42,11 @@ test("installMarketplace POSTs versionId to the install route", async () => {
 
   const r = await api.installMarketplace(session(), "42");
   expect(r.ok).toBe(true);
+  expect(r.installedCapabilities).toEqual([]);
+  expect(r.skippedOptional).toEqual([]);
+  expect(r.needsAuthorization).toEqual([]);
+  expect(r.ready).toBe(true);
+  expect(r.installedDeps).toBe(0);
   const url = fetchMock.mock.calls[0][0];
   const init = fetchMock.mock.calls[0][1] as RequestInit;
   expect(String(url)).toBe("/api/marketplace/install");
@@ -60,6 +65,21 @@ test("installMarketplace can include selected agentIds", async () => {
   expect(JSON.parse(String(init.body))).toEqual({
     versionId: "42",
     agentIds: ["main", "office-assistant"],
+    manualAgentScope: true,
+  });
+});
+
+test("installMarketplace sends the compatibility union when preserving a Skill scope", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+    ok({ ok: true, slug: "x", version: "2.0.0", note: "ok" }),
+  );
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  await api.installMarketplace(session(), "43", ["writer", "dependency-agent"], true);
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  expect(JSON.parse(String(init.body))).toEqual({
+    versionId: "43",
+    agentIds: ["writer", "dependency-agent"],
   });
 });
 

@@ -10,6 +10,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { after, before, beforeEach, describe, test } from 'node:test'
 
+import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
+
 process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
 process.env.OC_RUNTIME_CHANNEL = 'v5'
 
@@ -45,11 +47,15 @@ import {
 } from '../marketplace/connectorReview.js'
 import {
   MarketplaceError,
+  getAgentCapabilityReadiness,
   getListingDetail,
   installApprovedVersion,
+  installMarketplaceBundle,
+  listActiveInstalledAgents,
   listApprovedForSearch,
   listInstalled,
   listPendingVersions,
+  listRuntimeReadyInstalledAgents,
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
@@ -673,7 +679,10 @@ describe('v5 connector marketplace', () => {
       'SELECT risk_flags FROM marketplace_skill_versions WHERE id = $1',
       [versionId],
     )
-    assert.equal(stored.rows[0]!.risk_flags.some((flag) => flag.code === 'ignore_prev'), true)
+    assert.equal(
+      stored.rows[0]!.risk_flags.some((flag) => flag.code === 'ignore_prev'),
+      true,
+    )
     let modelCalls = 0
     const result = await drainAiReviews({
       apiKey: 'test-key',
@@ -1038,5 +1047,240 @@ describe('v5 connector marketplace', () => {
     } finally {
       process.env.OC_RUNTIME_CHANNEL = previous
     }
+  })
+
+  test('Agent required Plugin installs atomically, reports authorization, and fails closed after revoke', async (t) => {
+    if (skipIfNoDb(t)) return
+    const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const installer = await createUser()
+    const other = await createUser()
+    const plugin = await publishApproved({
+      ownerUserId: owner,
+      reviewerUserId: reviewer,
+      slug: 'agent-required-plugin',
+    })
+    const manifest = {
+      model: 'glm-5.2',
+      toolsets: ['core'],
+      capabilities: [{ kind: 'plugin' as const, slug: 'agent-required-plugin', optional: false }],
+      skillDeps: [],
+      persona: 'Use the declared plugin when the user asks.',
+    }
+    const rawArtifact = JSON.stringify(manifest, null, 2)
+    const agent = await publishSkillVersion({
+      slug: 'agent-with-plugin',
+      ownerUserId: owner,
+      version: '1.0.0',
+      name: 'Agent with Plugin',
+      description: 'Uses one trusted Plugin',
+      tags: ['agent'],
+      rawSkillMd: null,
+      rawArtifact,
+      manifest,
+      kind: 'agent',
+      artifactHash: marketplaceArtifactHash(rawArtifact),
+      embeddingHash: skillContentHash({
+        name: 'Agent with Plugin',
+        description: 'Uses one trusted Plugin',
+        tags: ['agent'],
+      }),
+      riskFlags: [],
+      policyVersion: 1,
+      submittedBy: owner,
+    })
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+
+    const result = await installMarketplaceBundle({
+      userId: installer,
+      versionId: agent.versionId,
+    })
+    assert.equal(result.ready, false)
+    assert.deepEqual(result.needsAuthorization, ['agent-required-plugin'])
+    assert.deepEqual(result.installedCapabilities, [
+      { slug: 'agent-required-plugin', kind: 'plugin', optional: false },
+    ])
+    const rollbackProjection = await query<{
+      installed_hash: string
+      canonical_hash: string
+    }>(
+      `SELECT i.artifact_hash AS installed_hash, v.artifact_hash AS canonical_hash
+         FROM marketplace_installs i
+         JOIN marketplace_skill_versions v ON v.id = i.version_id
+        WHERE i.user_id = $1 AND i.slug = 'agent-with-plugin'
+          AND i.uninstalled_at IS NULL`,
+      [installer],
+    )
+    assert.equal(
+      rollbackProjection.rows[0]!.installed_hash,
+      `required-plugin-rollback-gate:${rollbackProjection.rows[0]!.canonical_hash}`,
+    )
+    assert.deepEqual(
+      (await listActiveInstalledAgents(installer)).map((item) => item.slug),
+      ['agent-with-plugin'],
+      'new source recognizes only the exact rollback gate and keeps the Agent repairable',
+    )
+    const oldReader = await query(
+      `SELECT 1 FROM marketplace_installs i
+        JOIN marketplace_skill_versions v ON v.id = i.version_id
+       WHERE i.user_id = $1 AND i.slug = 'agent-with-plugin'
+         AND i.uninstalled_at IS NULL AND i.artifact_hash = v.artifact_hash`,
+      [installer],
+    )
+    assert.equal(oldReader.rowCount, 0, 'rollback source must hide required-Plugin Agents')
+    assert.equal(
+      (await getAgentCapabilityReadiness(installer, 'agent-with-plugin', agent.versionId)).ready,
+      false,
+    )
+    assert.deepEqual(await listRuntimeReadyInstalledAgents(installer), [])
+    const connectionId = await insertPinnedConnection(installer, plugin.versionId, 'agent-auth')
+    const authorized = await getAgentCapabilityReadiness(
+      installer,
+      'agent-with-plugin',
+      agent.versionId,
+    )
+    assert.equal(authorized.ready, true)
+    assert.deepEqual(authorized.needsAuthorization, [])
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(installer)).map((item) => item.slug),
+      ['agent-with-plugin'],
+    )
+
+    await query(
+      `UPDATE connections
+          SET status = 'error', last_error_code = 'RELINK_REQUIRED', updated_at = NOW()
+        WHERE id = $1`,
+      [connectionId],
+    )
+    const errored = await getAgentCapabilityReadiness(
+      installer,
+      'agent-with-plugin',
+      agent.versionId,
+    )
+    assert.equal(errored.ready, false, 'an errored Plugin account must fail readiness closed')
+    assert.deepEqual(errored.needsAuthorization, ['agent-required-plugin'])
+    assert.deepEqual(await listRuntimeReadyInstalledAgents(installer), [])
+    const reinstallWhileErrored = await installMarketplaceBundle({
+      userId: installer,
+      versionId: agent.versionId,
+    })
+    assert.equal(reinstallWhileErrored.ready, false)
+    assert.deepEqual(reinstallWhileErrored.needsAuthorization, ['agent-required-plugin'])
+    await query(
+      `UPDATE connections
+          SET status = 'active', last_error_code = NULL, updated_at = NOW()
+        WHERE id = $1`,
+      [connectionId],
+    )
+    assert.equal(
+      (await getAgentCapabilityReadiness(installer, 'agent-with-plugin', agent.versionId)).ready,
+      true,
+    )
+
+    assert.equal(await recordUninstall(installer, 'agent-with-plugin'), true)
+    const retainedPlugin = (await listInstalled(installer)).find(
+      (item) => item.slug === 'agent-required-plugin',
+    )
+    assert.ok(retainedPlugin, 'account-level Plugin install survives Agent removal')
+    assert.deepEqual(retainedPlugin.manualAgentIds, [])
+    assert.deepEqual(retainedPlugin.agentIds, ['main'])
+    await assertConnectorExecutionEntitlement(
+      installer,
+      'agent-required-plugin',
+      plugin.versionId,
+      getPool(),
+    )
+    const reinstalled = await installMarketplaceBundle({
+      userId: installer,
+      versionId: agent.versionId,
+    })
+    assert.equal(reinstalled.ready, true, 'existing account authorization is reused after reinstall')
+
+    await revokeListing('agent-required-plugin', 'plugin kill switch')
+    assert.equal(
+      (await getAgentCapabilityReadiness(installer, 'agent-with-plugin', agent.versionId)).ready,
+      false,
+    )
+    assert.deepEqual(await listRuntimeReadyInstalledAgents(installer), [])
+    await expectMarketplaceError(
+      () => installMarketplaceBundle({ userId: other, versionId: agent.versionId }),
+      'NOT_INSTALLABLE',
+    )
+    assert.equal(
+      (await listInstalled(other)).length,
+      0,
+      'Agent root must roll back with its Plugin',
+    )
+  })
+
+  test('Agent can depend on an official preinstalled Plugin without creating a personal install', async (t) => {
+    if (skipIfNoDb(t)) return
+    await seedDefaultConnectors(getPool())
+    const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const installer = await createUser()
+    const manifest = {
+      model: 'glm-5.2',
+      toolsets: ['core'],
+      capabilities: [{ kind: 'plugin' as const, slug: 'notion', optional: false }],
+      skillDeps: [],
+      persona: 'Use the official Notion Plugin when requested.',
+    }
+    const rawArtifact = JSON.stringify(manifest, null, 2)
+    const agent = await publishSkillVersion({
+      slug: 'agent-with-official-plugin',
+      ownerUserId: owner,
+      version: '1.0.0',
+      name: 'Agent with official Plugin',
+      description: 'Uses the platform Notion Plugin',
+      tags: ['agent'],
+      rawSkillMd: null,
+      rawArtifact,
+      manifest,
+      kind: 'agent',
+      artifactHash: marketplaceArtifactHash(rawArtifact),
+      embeddingHash: skillContentHash({
+        name: 'Agent with official Plugin',
+        description: 'Uses the platform Notion Plugin',
+        tags: ['agent'],
+      }),
+      riskFlags: [],
+      policyVersion: 1,
+      submittedBy: owner,
+    })
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+
+    const result = await installMarketplaceBundle({
+      userId: installer,
+      versionId: agent.versionId,
+    })
+    assert.equal(result.ready, false)
+    assert.deepEqual(result.needsAuthorization, ['notion'])
+    assert.deepEqual(result.installedCapabilities, [
+      { slug: 'notion', kind: 'plugin', optional: false },
+    ])
+    const personalNotionInstall = await query(
+      `SELECT 1 FROM marketplace_installs
+        WHERE user_id = $1 AND slug = 'notion' AND uninstalled_at IS NULL`,
+      [installer],
+    )
+    assert.equal(personalNotionInstall.rowCount, 0)
+    const notionVersion = await query<{ id: string }>(
+      `SELECT current_approved_version_id::text AS id
+         FROM marketplace_skill_listings WHERE slug = 'notion'`,
+    )
+    await insertPinnedConnection(installer, notionVersion.rows[0]!.id, 'official-agent')
+    const readiness = await getAgentCapabilityReadiness(
+      installer,
+      'agent-with-official-plugin',
+      agent.versionId,
+    )
+    assert.equal(readiness.ready, true)
+    assert.equal(readiness.requirements[0]?.installed, true)
+    assert.deepEqual(readiness.needsAuthorization, [])
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(installer)).map((item) => item.slug),
+      ['agent-with-official-plugin'],
+    )
   })
 })

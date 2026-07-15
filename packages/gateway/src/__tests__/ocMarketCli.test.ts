@@ -244,6 +244,9 @@ describe('buildPublishAgentRequest — storefront metadata mapping', () => {
       model: 'glm-5.2',
       toolsets: 'core, web_context',
       'skill-deps': 'academic-translate',
+      'plugin-deps': 'paper-search',
+      'optional-skill-deps': 'citation-format',
+      'optional-plugin-deps': 'cloud-drive',
       category: 'office-docs',
       'use-cases': '润色中文稿件; 把要点扩写成成文',
       outcomes: '给它要点, 得到成文',
@@ -252,7 +255,13 @@ describe('buildPublishAgentRequest — storefront metadata mapping', () => {
     assert.equal(req.kind, 'agent')
     assert.equal(req.model, 'glm-5.2')
     assert.deepEqual(req.toolsets, ['core', 'web_context'])
-    assert.deepEqual(req.skillDeps, ['academic-translate'])
+    assert.deepEqual(req.capabilities, [
+      { kind: 'skill', slug: 'academic-translate', optional: false },
+      { kind: 'plugin', slug: 'paper-search', optional: false },
+      { kind: 'skill', slug: 'citation-format', optional: true },
+      { kind: 'plugin', slug: 'cloud-drive', optional: true },
+    ])
+    assert.deepEqual(req.skillDeps, ['academic-translate', 'citation-format'])
     assert.equal(req.category, 'office-docs')
     assert.deepEqual(req.useCases, ['润色中文稿件', '把要点扩写成成文'])
     assert.deepEqual(req.outcomeExamples, ['给它要点, 得到成文'])

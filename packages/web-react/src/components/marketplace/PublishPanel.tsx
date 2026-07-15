@@ -12,6 +12,7 @@ import {
 } from "../../lib/marketplace";
 import type {
   AuthSession,
+  MarketplaceCapabilityRef,
   MarketplaceMyPublish,
   MarketplaceRiskFlag,
   PublicModel,
@@ -656,10 +657,12 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   const [avatarEmoji, setAvatarEmoji] = useState("🤖");
   const [model, setModel] = useState("");
   const [toolsets, setToolsets] = useState<string[]>(["core"]);
-  // 依赖技能 = 多选「我已安装的市场技能」(后端硬校验 skillDeps 必须是已上架技能;
-  // 已安装集合必然满足,且是用户真实用过、知道好坏的技能)。
-  const [installedSkills, setInstalledSkills] = useState<Array<{ slug: string; name: string }>>([]);
-  const [skillDeps, setSkillDeps] = useState<string[]>([]);
+  // 直接从已安装能力选择,避免 Agent 先手写 slug 再猜是否可发布。每项可在
+  // 必需 → 可选 → 不依赖之间切换。
+  const [installedCapabilities, setInstalledCapabilities] = useState<
+    Array<{ kind: "skill" | "plugin"; slug: string; name: string }>
+  >([]);
+  const [capabilityDeps, setCapabilityDeps] = useState<MarketplaceCapabilityRef[]>([]);
   const [persona, setPersona] = useState("");
   // 人向商品元数据(与技能发布对称)——是发布级 storefront 字段,不进 manifest。
   const [meta, setMeta] = useState<HumanMetaDraft>(emptyHumanMeta());
@@ -680,15 +683,37 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         setModel((cur) => cur || ms[0]?.id || "");
       })
       .catch(() => {});
-    api
-      .listMarketplaceInstalled(auth)
-      .then((rows) => {
+    Promise.all([
+      api.listMarketplaceInstalled(auth),
+      api.getDeclarativeManagement(auth).catch(() => ({ connectors: [], connections: [] })),
+    ])
+      .then(([rows, management]) => {
         if (!alive) return;
-        setInstalledSkills(
-          rows
-            .filter((r) => r.kind === "skill" && r.listingState === "active")
-            .map((r) => ({ slug: r.slug, name: r.name })),
-        );
+        const capabilities = new Map<
+          string,
+          { kind: "skill" | "plugin"; slug: string; name: string }
+        >();
+        for (const row of rows) {
+          if ((row.kind !== "skill" && row.kind !== "connector") || row.listingState !== "active")
+            continue;
+          const item = {
+            kind: row.kind === "connector" ? ("plugin" as const) : ("skill" as const),
+            slug: row.slug,
+            name: row.name,
+          };
+          capabilities.set(`${item.kind}:${item.slug}`, item);
+        }
+        // 官方 Plugin 是平台预装能力，没有 marketplace_install 行；也必须能被 Agent
+        // 发布器直接选择，否则用户只能手写 slug，且审核能过、安装却曾失败。
+        for (const row of management.connectors) {
+          if (row.installation !== "default" || !row.official || !row.available) continue;
+          capabilities.set(`plugin:${row.slug}`, {
+            kind: "plugin",
+            slug: row.slug,
+            name: row.label,
+          });
+        }
+        setInstalledCapabilities([...capabilities.values()]);
       })
       .catch(() => {});
     return () => {
@@ -698,6 +723,24 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
 
   const toggleToolset = (v: string) =>
     setToolsets((ts) => (ts.includes(v) ? ts.filter((x) => x !== v) : [...ts, v]));
+
+  const cycleCapability = (capability: { kind: "skill" | "plugin"; slug: string }) => {
+    setCapabilityDeps((current) => {
+      const found = current.find(
+        (item) => item.kind === capability.kind && item.slug === capability.slug,
+      );
+      if (!found) return [...current, { ...capability, optional: false }];
+      if (!found.optional)
+        return current.map((item) =>
+          item.kind === capability.kind && item.slug === capability.slug
+            ? { ...item, optional: true }
+            : item,
+        );
+      return current.filter(
+        (item) => !(item.kind === capability.kind && item.slug === capability.slug),
+      );
+    });
+  };
 
   const validate = (): string | null => {
     if (!name.trim()) return "请填写智能体名称";
@@ -735,7 +778,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           .filter(Boolean),
         model,
         toolsets,
-        skillDeps,
+        capabilities: capabilityDeps,
+        skillDeps: capabilityDeps.filter((item) => item.kind === "skill").map((item) => item.slug),
         persona,
         category: meta.category,
         useCases,
@@ -779,7 +823,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setTags("");
           setDescription("");
           setPersona("");
-          setSkillDeps([]);
+          setCapabilityDeps([]);
           setMeta(emptyHumanMeta());
         }}
       />
@@ -788,8 +832,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   return (
     <div className="flex flex-col gap-4">
       <Alert tone="info">
-        智能体 = 模型 + 能力工具集 + 人设(+ 可选依赖技能)。发布后经平台审核上架，其他用户
-        安装即可在智能体选择器中使用。
+        智能体 = 模型 + 工具集 + 人设 + 可组合的 Skill / Plugin。安装时必需能力与智能体
+        原子落地；插件账号仍由每位用户在管理中心授权。
       </Alert>
 
       {err && <Alert tone="danger">{err}</Alert>}
@@ -903,39 +947,37 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
       </div>
 
       <div>
-        <div className="mb-1 text-[12px] font-medium text-muted">依赖技能（可选）</div>
+        <div className="mb-1 text-[12px] font-medium text-muted">组合能力（可选）</div>
         <p className="mb-1.5 text-[11.5px] leading-snug text-faint">
-          只能选「已上架市场」的技能:别人安装本智能体时,这些依赖会一并自动安装,所以必须是能公开安装的市场技能。
-          你自建的私有技能不会出现在这里 —— 需先在上方「发布技能」把它上架、审核通过后才能作为依赖。
+          从你已安装的市场 Skill / Plugin 中选择。点击一次设为「必需」，再点设为「可选」，
+          第三次移除。必需能力不可用时整包回滚；可选能力不可用时会明确跳过。
         </p>
-        {installedSkills.length === 0 ? (
+        {installedCapabilities.length === 0 ? (
           <p className="text-[12px] text-faint">
-            你还没有可作依赖的市场技能 ——
-            先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(智能体可不带依赖技能)。
+            你还没有可组合的市场能力 —— 先在「发现」安装 Skill 或
+            Plugin；也可以发布不带依赖的智能体。
           </p>
         ) : (
           <div className="flex flex-wrap gap-1.5">
-            {installedSkills.map((sk) => {
-              const checked = skillDeps.includes(sk.slug);
+            {installedCapabilities.map((capability) => {
+              const selected = capabilityDeps.find(
+                (item) => item.kind === capability.kind && item.slug === capability.slug,
+              );
               return (
                 <button
                   type="button"
-                  key={sk.slug}
-                  onClick={() =>
-                    setSkillDeps((ds) =>
-                      checked ? ds.filter((d) => d !== sk.slug) : [...ds, sk.slug],
-                    )
-                  }
+                  key={`${capability.kind}:${capability.slug}`}
+                  onClick={() => cycleCapability(capability)}
                   className={cn(
                     "rounded-full border px-2.5 py-1 text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-                    checked
+                    selected
                       ? "border-accent/50 bg-accent-soft text-accent"
                       : "border-border text-muted hover:border-accent/40 hover:text-fg",
                   )}
                 >
-                  {checked ? "✓ " : ""}
-                  {sk.name}
-                  <span className="ml-1 font-mono text-[10.5px] text-faint">{sk.slug}</span>
+                  {selected ? (selected.optional ? "可选 · " : "必需 · ") : ""}
+                  {capability.kind === "plugin" ? "Plugin" : "Skill"} · {capability.name}
+                  <span className="ml-1 font-mono text-[10.5px] text-faint">{capability.slug}</span>
                 </button>
               );
             })}

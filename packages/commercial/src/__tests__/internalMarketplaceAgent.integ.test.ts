@@ -101,6 +101,36 @@ function skillInput(slug: string, owner: number) {
   }
 }
 
+function agentInput(slug: string, owner: number) {
+  const name = slug
+  const description = `${slug} 智能体`
+  const tags = ['agent']
+  const manifest = {
+    model: 'glm-5.2',
+    toolsets: ['core'],
+    skillDeps: [],
+    persona: '你是一个测试智能体。',
+  }
+  const rawArtifact = JSON.stringify(manifest, null, 2)
+  return {
+    slug,
+    ownerUserId: owner,
+    version: '1.0.0',
+    name,
+    description,
+    tags,
+    rawSkillMd: null,
+    rawArtifact,
+    manifest,
+    kind: 'agent' as const,
+    artifactHash: marketplaceArtifactHash(rawArtifact),
+    embeddingHash: skillContentHash({ name, description, tags }),
+    riskFlags: [],
+    policyVersion: 1,
+    submittedBy: owner,
+  }
+}
+
 const CONNECTOR_API_ORIGIN = 'https://api.internal-market.test:443'
 const connectorDecision = {
   audience: {
@@ -216,6 +246,40 @@ describe('internalMarketplaceAgent (integ)', () => {
     const slugs = res.body.results.map((r: any) => r.slug)
     assert.ok(slugs.includes('ok-skill'))
     assert.ok(!slugs.includes('pending-skill')) // pending not searchable
+    assert.equal(
+      res.body.results.find((r: any) => r.slug === 'ok-skill')?.artifactKind,
+      'skill',
+    )
+  })
+
+  test('detail reports platform preset readiness without requiring a personal install', async (t) => {
+    if (skip(t)) return
+    const previous = process.env.OC_RUNTIME_CHANNEL
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    try {
+      const owner = await createUser('preset-detail-owner@x.com')
+      const reviewer = await createUser('preset-detail-reviewer@x.com')
+      const user = await createUser('preset-detail-user@x.com')
+      const version = await publishSkillVersion(agentInput('coding-assistant', owner))
+      await reviewVersion({
+        versionId: version.versionId,
+        reviewerUserId: reviewer,
+        approve: true,
+      })
+      const h = await handlerFor(user, 101)
+      const res = makeRes()
+      await h(
+        makeReq('GET', 'detail?slug=coding-assistant', { token: tokenFor(101) }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.body.detail.capabilityReadiness.installed, true)
+      assert.equal(res.body.detail.capabilityReadiness.ready, true)
+    } finally {
+      if (previous === undefined) delete process.env.OC_RUNTIME_CHANNEL
+      else process.env.OC_RUNTIME_CHANNEL = previous
+    }
   })
 
   test('install: approved works (scoped to token user); pending → NOT_INSTALLABLE', async (t) => {
@@ -228,6 +292,7 @@ describe('internalMarketplaceAgent (integ)', () => {
     await h(makeReq('POST', 'install', { token: tokenFor(100), body: { slug: 'ok-skill' } }), res, CTX)
     assert.equal(res.statusCode, 200)
     assert.equal(res.body.ok, true)
+    assert.equal(res.body.artifactKind, 'skill')
     // it is scoped to THIS user
     const r = await query<{ c: string }>(
       'SELECT count(*)::text AS c FROM marketplace_installs WHERE user_id=$1 AND slug=$2 AND uninstalled_at IS NULL',
@@ -566,17 +631,32 @@ describe('internalMarketplaceAgent (integ)', () => {
       res = makeRes()
       await h(makeReq('GET', 'search?kind=connector', { token: tokenFor(202) }), res, CTX)
       assert.equal(res.statusCode, 200)
-      assert.ok(res.body.results.some((row: { slug: string }) => row.slug === slug))
+      assert.ok(
+        res.body.results.some(
+          (row: { slug: string; artifactKind?: string; pluginType?: string }) =>
+            row.slug === slug &&
+            row.artifactKind === 'plugin' &&
+            row.pluginType === 'declarative-http',
+        ),
+      )
       res = makeRes()
       await h(makeReq('GET', `detail?slug=${slug}`, { token: tokenFor(202) }), res, CTX)
       assert.equal(res.statusCode, 200)
       assert.equal(res.body.detail.kind, 'connector')
+      assert.equal(res.body.detail.artifactKind, 'plugin')
+      assert.equal(res.body.detail.pluginType, 'declarative-http')
       res = makeRes()
       await h(makeReq('POST', 'install', { token: tokenFor(202), body: { slug } }), res, CTX)
       assert.equal(res.statusCode, 200)
+      assert.equal(res.body.artifactKind, 'plugin')
       res = makeRes()
       await h(makeReq('GET', 'installed', { token: tokenFor(202) }), res, CTX)
-      assert.ok(res.body.installed.some((row: { slug: string }) => row.slug === slug))
+      assert.ok(
+        res.body.installed.some(
+          (row: { slug: string; artifactKind?: string }) =>
+            row.slug === slug && row.artifactKind === 'plugin',
+        ),
+      )
       res = makeRes()
       await h(makeReq('POST', 'uninstall', { token: tokenFor(202), body: { slug } }), res, CTX)
       assert.equal(res.statusCode, 200)

@@ -31,6 +31,10 @@ export type Agent = {
   /** marketplace provenance (B-positioning picker). */
   installed?: boolean
   isDefault?: boolean
+  /** Required Skill/Plugin composition is executable for the current user. */
+  ready?: boolean
+  /** Required Plugins that still need an account authorization. */
+  needsAuthorization?: string[]
 }
 
 /**
@@ -204,6 +208,7 @@ export const MAIN_AGENT: Agent = {
   description: '通用全能智能体，内置工具齐全，可随时从市场加装技能与更多智能体。',
   isDefault: true,
   installed: true,
+  ready: true,
 }
 
 export const DEFAULT_AGENT = MAIN_AGENT
@@ -224,6 +229,7 @@ export function agentFromApiRow(row: {
   installed?: boolean
   isDefault?: boolean
   preset?: boolean
+  capabilityReadiness?: { ready: boolean; needsAuthorization?: string[] }
 }): Agent {
   if (row.id === 'main' || row.isDefault) return MAIN_AGENT
   return {
@@ -234,6 +240,8 @@ export function agentFromApiRow(row: {
     description: row.description ?? '',
     installed: row.installed,
     preset: row.preset,
+    ready: row.capabilityReadiness?.ready ?? true,
+    needsAuthorization: row.capabilityReadiness?.needsAuthorization ?? [],
   }
 }
 

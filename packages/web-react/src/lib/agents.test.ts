@@ -28,10 +28,13 @@ test('agentFromApiRow maps a market agent (emoji + installed) and folds default�
     description: '润色中文',
     avatarEmoji: '✍️',
     installed: true,
+    capabilityReadiness: { ready: false, needsAuthorization: ['docs-plugin'] },
   })
   expect(market.id).toBe('writer-bot')
   expect(market.avatarEmoji).toBe('✍️')
   expect(market.installed).toBe(true)
+  expect(market.ready).toBe(false)
+  expect(market.needsAuthorization).toEqual(['docs-plugin'])
   expect(market.icon).toBeUndefined() // market agents render via emoji, not a lucide icon
 
   // a row flagged default (or id main) collapses to the canonical MAIN_AGENT

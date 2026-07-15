@@ -4,8 +4,16 @@
  */
 import type {
   MarketplaceArtifactKind,
+  MarketplaceCapabilityInstallOutcome,
+  MarketplaceCapabilityReadiness,
+  MarketplaceCapabilityRef,
   MarketplacePluginType,
   MarketplaceReviewSource,
+} from "@openclaude/protocol";
+
+export type {
+  MarketplaceCapabilityReadiness,
+  MarketplaceCapabilityRef,
 } from "@openclaude/protocol";
 
 /**
@@ -932,6 +940,17 @@ export type MarketplaceSearchResult = {
 /** 市场条目类型（技能 / 智能体）。 */
 export type MarketplaceKind = "skill" | "agent" | "connector";
 
+export type MarketplaceInstallResult = MarketplaceCapabilityInstallOutcome & {
+  ok: boolean;
+  slug: string;
+  kind: MarketplaceKind;
+  artifactKind?: MarketplaceArtifactKind;
+  pluginType?: MarketplacePluginType;
+  version: string;
+  note: string;
+  installedDeps: number;
+};
+
 /** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整工件供安装确认）。 */
 export type MarketplaceDetail = {
   slug: string;
@@ -952,6 +971,7 @@ export type MarketplaceDetail = {
   rawSkillMd?: string | null;
   /** 结构化元数据（智能体：model/toolsets/skillDeps；技能为 null）。 */
   manifest?: unknown;
+  capabilityReadiness?: MarketplaceCapabilityReadiness;
   riskFlags: MarketplaceRiskFlag[];
   /** 审核来源；旧后端缺字段时 UI 使用不夸大的通用文案。 */
   reviewSource?: MarketplaceReviewSource | null;
@@ -998,12 +1018,16 @@ export type MarketplaceInstalled = {
   versionId: string;
   name: string;
   artifactHash: string;
+  /** 用户显式分配的归属；不含 Agent 依赖自动带来的绑定。 */
+  manualAgentIds?: string[];
+  /** 兼容展示投影：手动归属 + Agent 依赖归属。 */
   agentIds?: string[];
   installedAt: string;
   listingState: string;
   /** listing 当前上架版本（升级可见性；旧后端/无上架版本时缺省）。 */
   latestVersion?: string | null;
   latestVersionId?: string | null;
+  capabilityReadiness?: MarketplaceCapabilityReadiness;
 };
 
 /** 我的发布记录（GET /api/marketplace/my-publishes 的 publishes 项）。 */
@@ -1092,6 +1116,7 @@ export type MarketplaceMyAgent = {
   isDefault?: boolean;
   /** 平台预设(编程/办公/科研):开箱即用、不可卸载、恒为最新上架版本。 */
   preset?: boolean;
+  capabilityReadiness?: MarketplaceCapabilityReadiness;
 };
 
 /**
@@ -1119,6 +1144,7 @@ export type MarketplaceAgentPublishInput = MarketplaceHumanMetaInput & {
   tags: string[];
   model: string;
   toolsets: string[];
+  capabilities: MarketplaceCapabilityRef[];
   skillDeps: string[];
   persona: string;
   displayName?: string;
