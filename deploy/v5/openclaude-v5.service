@@ -4,8 +4,9 @@
 # (/opt/openclaude/openclaude-v5)、独立日志、独立 StateDirectory。共享 PG/Redis(身份/
 # 计费/账号池权威),但控制面静默(OC_RUNTIME_CHANNEL=v5 → 后台 mutator 全部不启)。
 Description=OpenClaude Gateway (v5 Aurora gray-scale)
-After=network.target postgresql.service redis-server.service openclaude.service
+After=network.target postgresql.service redis-server.service openclaude.service openclaude-v5-baseline-port-guard.socket
 Wants=postgresql.service redis-server.service
+Requires=openclaude-v5-baseline-port-guard.socket
 
 [Service]
 Type=simple
@@ -18,6 +19,12 @@ Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/b
 # 独立 HOME → 会话 SQLite / uploads / cron 全部隔离(聊天历史 v5 全新,符合已定方案 A)
 Environment="OPENCLAUDE_HOME=/root/.openclaude-v5"
 Environment="NODE_ENV=production"
+# CCB baseline 属于当前 master release；显式钉 A slot symlink，禁止共享 env 固定路径
+# 或 dev-only OPTIONAL 降级。deploy guard 会校验真实进程 env + 完整树权限。
+Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5/packages/commercial/agent-sandbox/ccb-baseline"
+# V5 永不提供跨主机 baseline 服务。独立 socket unit 先占住
+# 127.0.0.1:18893；即使自动回滚到尚含旧 BaselineServer 的 release，其
+# 0.0.0.0:18893 bind 也会 EADDRINUSE，且宿主没有远程可达 listener。
 # 端口/bind 由 $OPENCLAUDE_HOME/openclaude.json 的 gateway.port=18790,bind=127.0.0.1 决定
 ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
 Restart=on-failure

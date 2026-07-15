@@ -37,6 +37,10 @@ jobs:
           - name: storage
             run: npm run test:storage
             timeout: 15
+          - name: v5-ops
+            # baseline hardening must prove production root:root ownership.
+            run: sudo env "PATH=$PATH" npm run test:v5:ops
+            timeout: 20
           - name: web-react
             run: npm run check:tutorials && npm run test:web-react
             timeout: 25

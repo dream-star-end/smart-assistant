@@ -20,6 +20,8 @@
 #   scripts/deploy-v5.sh --with-dist   # 代码+前端两生效面、【单次】重启(首选;两段式成对重启会二次掐断在途 turn)
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
+#   scripts/deploy-v5.sh --census-ccb-baseline  # 只读统计缺 baseline mount 的 V5 容器
+#   scripts/deploy-v5.sh --remount-ccb-baseline # 持部署锁，逐个 drain/reprovision 后复验
 #
 # 并发:所有写模式过 /var/lock/oc-v5-deploy.lock 全局互斥(多会话并行开发硬保证),
 #       持有者信息在 .holder;等待 900s 超时 fail-loud。
@@ -59,6 +61,9 @@ V5_HOME="/root/.openclaude-v5"
 V5_ENV="/etc/openclaude/commercial-v5.env"
 V3_ENV="/etc/openclaude/commercial.env"
 V5_UNIT="openclaude-v5.service"
+V5_BASELINE_PORT="18893"
+V5_BASELINE_PORT_GUARD_SOCKET="openclaude-v5-baseline-port-guard.socket"
+V5_BASELINE_PORT_GUARD_SERVICE="openclaude-v5-baseline-port-guard.service"
 # egress split 独立进程 unit(容器 LLM 出站面 172.31.0.1:18892)。bootstrap 必装:
 # overrides 无条件 OC_EGRESS_SPLIT=1,unit 缺失 → master 以 split 模式起但 18892
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
@@ -87,11 +92,22 @@ CUTOVER_ROOT="/var/lib/openclaude-v5/cutovers"
 CUTOVER_LOCK="/var/lib/openclaude-v5/cutover.lock"
 MAINTENANCE_MARKER="/run/openclaude-v5/planned-maintenance.json"
 MAINTENANCE_LOCK="/run/openclaude-v5/planned-maintenance.lock"
+BASELINE_REMOUNT_TIMEOUT_SECONDS="${OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS:-2700}"
 
 # ── 定位 worktree 根 ──
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_METADATA="$REPO_ROOT/deploy/v5/release-metadata.json"
+BASELINE_GUARD_SCRIPT="$SCRIPT_DIR/v5-baseline-security.sh"
+[ -x "$BASELINE_GUARD_SCRIPT" ] || {
+  echo "FATAL: 缺或不可执行的 V5 baseline guard: $BASELINE_GUARD_SCRIPT" >&2
+  exit 1
+}
+RELEASE_GC_SCRIPT="$SCRIPT_DIR/v5-release-gc.sh"
+[ -x "$RELEASE_GC_SCRIPT" ] || {
+  echo "FATAL: 缺或不可执行的 V5 release GC guard: $RELEASE_GC_SCRIPT" >&2
+  exit 1
+}
 cd "$REPO_ROOT"
 
 # ── runtime tuple / platform bundle 纯函数库(宿主本地实现;真实部署 ship 到 kl-mirror 后跑)──
@@ -134,6 +150,9 @@ REMOVE_KEYS=(
   OC_CODEX_PREFERRED_AUTH_METHOD OC_CODEX_PROVIDER_NAME OC_CODEX_WIRE_API
   # v5-owned codex 刷新 actor / drift reconciler 必须自己跑,禁止从 v3 env 继承禁用旗标
   COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
+  # CCB baseline 是 slot-local release 内容。共享 env 里的固定 A 路径会让 B slot
+  # 挂错 release；OPTIONAL 是 dev-only fail-open；V5 local-only 不跑远程 baseline server。
+  OC_V3_CCB_BASELINE_DIR OC_V3_CCB_BASELINE_OPTIONAL OPENCLAUDE_MASTER_BASELINE_BASE_URL
 )
 
 # REMOVE_KEYS 有两类:①"剥 v3 值 → overrides 设 v5 专属值"(AGENT_*/OC_RUNTIME_IMAGE/
@@ -144,6 +163,7 @@ REMOVE_KEYS=(
 # token 无人续期,静默烂池。让这类矛盾在部署时爆而非 DR 时爆。
 FORBIDDEN_IN_OVERRIDES=(
   COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
+  OC_V3_CCB_BASELINE_DIR OC_V3_CCB_BASELINE_OPTIONAL OPENCLAUDE_MASTER_BASELINE_BASE_URL
 )
 assert_overrides_no_remove_keys() {
   local ov="$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" k bad=0
@@ -187,6 +207,8 @@ for arg in "$@"; do
     --bootstrap) MODE="bootstrap" ;;
     --migrate-bluegreen) MODE="migrate-bluegreen" ;;
     --smoke) MODE="smoke" ;;
+    --census-ccb-baseline) MODE="baseline-census" ;;
+    --remount-ccb-baseline) MODE="baseline-remount" ;;
     --dist) MODE="dist" ;;
     --prepare-offline-cutover) MODE="prepare-offline-cutover" ;;
     --offline-recycle) MODE="offline-recycle" ;;
@@ -224,6 +246,11 @@ done
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 [[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
   || { echo "✗ CADDY_HTTP_PORT 必须是 1..65535 的规范十进制端口" >&2; exit 2; }
+if [[ ! "$BASELINE_REMOUNT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] \
+  || (( BASELINE_REMOUNT_TIMEOUT_SECONDS < 60 || BASELINE_REMOUNT_TIMEOUT_SECONDS > 7200 )); then
+  echo "✗ OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS 必须为 60..7200 秒" >&2
+  exit 2
+fi
 # R2-B1/R2-M1 旗标一致性
 [[ "$ENABLE_RELEASE_FLAG" == 1 && "$DISABLE_RELEASE_FLAG" == 1 ]] && { echo "✗ --enable-runtime-release 与 --disable-runtime-release 互斥" >&2; exit 2; }
 [[ "$ENABLE_BUNDLE_FLAG" == 1 && "$DISABLE_BUNDLE_FLAG" == 1 ]] && { echo "✗ --enable-platform-bundle 与 --disable-platform-bundle 互斥" >&2; exit 2; }
@@ -245,6 +272,272 @@ fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
+
+slot_baseline_dir() { # <A|B>
+  printf '%s/packages/commercial/agent-sandbox/ccb-baseline\n' "$(slot_src "$1")"
+}
+
+run_baseline_guard_remote() { # <check-release|harden-release|check-dir|harden-dir> <absolute-path>
+  local guard_mode="$1" target="$2" qmode qtarget
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-dir|harden-dir)$ ]] \
+    || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
+  [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] baseline guard $guard_mode $target"
+    return 0
+  fi
+  printf -v qmode '%q' "$guard_mode"
+  printf -v qtarget '%q' "$target"
+  ssh "$KL_HOST" "bash -s -- $qmode $qtarget" < "$BASELINE_GUARD_SCRIPT"
+}
+
+assert_release_baseline_security() { # <absolute-release-root>
+  run_baseline_guard_remote check-release "$1" \
+    || { echo "✗ 目标 release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
+}
+
+harden_release_baseline() { # <absolute-release-root>
+  run_baseline_guard_remote harden-release "$1" \
+    || { echo "✗ release CCB baseline 权限收紧/复验失败:$1" >&2; return 1; }
+}
+
+install_v5_slot_units() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 安装 A/B slot + loopback baseline port guard units，启用并实测 18893 占位"
+    return 0
+  fi
+  local unit
+  for unit in openclaude-v5.service openclaude-v5-b.service \
+    "$V5_BASELINE_PORT_GUARD_SOCKET" "$V5_BASELINE_PORT_GUARD_SERVICE"; do
+    rsync -az "$REPO_ROOT/deploy/v5/$unit" \
+      "$KL_HOST:/etc/systemd/system/$unit" || return 1
+  done
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    test -x /usr/lib/systemd/systemd-socket-proxyd
+    systemd-analyze verify \
+      /etc/systemd/system/openclaude-v5.service \
+      /etc/systemd/system/openclaude-v5-b.service \
+      /etc/systemd/system/$V5_BASELINE_PORT_GUARD_SOCKET \
+      /etc/systemd/system/$V5_BASELINE_PORT_GUARD_SERVICE
+    systemctl daemon-reload
+    systemctl enable '$V5_BASELINE_PORT_GUARD_SOCKET' >/dev/null
+    # Restarting a required socket propagates to A/B dependents on systemd 255.
+    # Never hide a master restart in this pre-maintenance preparation lane.
+    if ! systemctl is-active --quiet '$V5_BASELINE_PORT_GUARD_SOCKET'; then
+      systemctl start '$V5_BASELINE_PORT_GUARD_SOCKET'
+    fi" || return 1
+  assert_v5_baseline_port_guard
+}
+
+strip_shared_baseline_env_keys() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 原子剥离 V5 shared env 的 baseline DIR/OPTIONAL/remote URL(保 owner/mode+备份)"
+    return 0
+  fi
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" <<'REMOTE'
+set -Eeuo pipefail
+env_file="$1"
+lock=/var/lock/oc-v5-baseline-env.lock
+mkdir -p "$(dirname "$lock")"
+touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+[[ -f "$env_file" && ! -L "$env_file" ]] || {
+  echo "FATAL: V5 env missing or symlink: $env_file" >&2; exit 1;
+}
+forbidden='^[[:space:]]*(OC_V3_CCB_BASELINE_DIR|OC_V3_CCB_BASELINE_OPTIONAL|OPENCLAUDE_MASTER_BASELINE_BASE_URL)='
+probe_rc=0
+grep -Eq "$forbidden" "$env_file" || probe_rc=$?
+if (( probe_rc == 0 )); then
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="${env_file}.bak-baseline-${ts}"
+  cp -a -- "$env_file" "$backup"
+  tmp="${env_file}.baseline.$$"
+  trap 'rm -f -- "$tmp"' EXIT
+  filter_rc=0
+  grep -Ev "$forbidden" "$env_file" > "$tmp" || filter_rc=$?
+  (( filter_rc <= 1 )) || {
+    echo "FATAL: failed to filter shared V5 env(rc=$filter_rc); original preserved" >&2
+    exit 1
+  }
+  [[ -s "$tmp" ]] || { echo "FATAL: stripped V5 env would be empty" >&2; exit 1; }
+  chown --reference="$env_file" "$tmp"
+  chmod --reference="$env_file" "$tmp"
+  sync -f "$tmp" 2>/dev/null || sync
+  mv -f -- "$tmp" "$env_file"
+  sync -f "$(dirname "$env_file")" 2>/dev/null || sync
+  trap - EXIT
+  echo "  ✓ shared baseline env keys removed(backup=$backup)"
+elif (( probe_rc == 1 )); then
+  echo "  · shared baseline env keys already absent"
+else
+  echo "FATAL: failed to inspect shared V5 env(rc=$probe_rc)" >&2
+  exit 1
+fi
+verify_rc=0
+grep -Eq "$forbidden" "$env_file" || verify_rc=$?
+case "$verify_rc" in
+  0) echo "FATAL: shared baseline env keys remain after migration" >&2; exit 1 ;;
+  1) : ;;
+  *) echo "FATAL: failed to verify migrated V5 env(rc=$verify_rc)" >&2; exit 1 ;;
+esac
+REMOTE
+}
+
+assert_v5_baseline_port_guard() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 18893 必须仅有 systemd loopback 占位，且 wildcard bind 实测 EADDRINUSE"
+    return 0
+  fi
+  ssh "$KL_HOST" bash -s -- "$V5_BASELINE_PORT_GUARD_SOCKET" "$V5_BASELINE_PORT" <<'REMOTE'
+set -Eeuo pipefail
+unit="$1"; port="$2"
+systemctl is-active --quiet "$unit" || {
+  echo "FATAL: V5 baseline port guard is not active: $unit" >&2
+  exit 1
+}
+command -v ss >/dev/null
+ss_rc=0
+listeners="$(ss -ltnH "sport = :$port")" || ss_rc=$?
+(( ss_rc == 0 )) || {
+  echo "FATAL: cannot inspect V5 baseline guard listener(rc=$ss_rc)" >&2
+  exit 1
+}
+count="$(printf '%s\n' "$listeners" | awk 'NF { n += 1 } END { print n + 0 }')"
+address="$(printf '%s\n' "$listeners" | awk 'NF { print $4 }')"
+[[ "$count" == 1 && "$address" == "127.0.0.1:$port" ]] || {
+  echo "FATAL: expected exactly one loopback V5 baseline guard on 127.0.0.1:$port; listeners=${listeners:-<none>}" >&2
+  exit 1
+}
+# This is the enforcement proof that SocketBindDeny could not provide on the
+# production kernel/systemd combination: the legacy wildcard bind must fail
+# specifically because the loopback reservation already owns this TCP port.
+python3 - "$port" <<'PY'
+import errno
+import socket
+import sys
+
+port = int(sys.argv[1])
+probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    probe.bind(("0.0.0.0", port))
+except OSError as exc:
+    if exc.errno != errno.EADDRINUSE:
+        raise
+else:
+    raise SystemExit(f"FATAL: wildcard bind unexpectedly succeeded on {port}")
+finally:
+    probe.close()
+PY
+REMOTE
+}
+
+# One-time-safe and idempotent transition for the historical V5 layout:
+# install the loopback-only 18893 reservation + slot-local units first (without
+# restarting master), then harden the serving release and remove shared keys.
+# Ordering matters: once the previously invalid tree becomes valid, an old
+# release would otherwise start its legacy BaselineServer during compensation.
+# The occupied loopback port makes its wildcard bind fail while staying remote-inaccessible.
+prepare_live_baseline_safety() {
+  local live_release
+  live_release="$(bg_current_release "$ACTIVE_SRC")"
+  [[ "$DRY" == 1 ]] && live_release="${live_release:-$RELEASES_ROOT/rel-active-dry}"
+  [[ -n "$live_release" ]] || { echo "✗ 无法解析当前 serving release,拒绝迁移 baseline 配置" >&2; return 1; }
+  if [[ "$DRY" != 1 ]]; then
+    [[ "$live_release" == "$RELEASES_ROOT"/rel-* ]] \
+      || { echo "✗ serving release 不在可信 releases 根:$live_release" >&2; return 1; }
+    ssh "$KL_HOST" "test -f '$live_release/.complete'" \
+      || { echo "✗ serving release 缺 .complete:$live_release" >&2; return 1; }
+  fi
+  echo "── V5 CCB baseline 一次性安全迁移(current=$live_release)──"
+  install_v5_slot_units || return 1
+  harden_release_baseline "$live_release" || return 1
+  strip_shared_baseline_env_keys || return 1
+  assert_release_baseline_security "$live_release" || return 1
+}
+
+assert_live_baseline_security_for_slot() { # <A|B>
+  local slot="$1" unit src expected
+  unit="$(slot_unit "$slot")"; src="$(slot_src "$slot")"; expected="$(slot_baseline_dir "$slot")"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] $unit /proc env baseline=$expected,OPTIONAL/remote URL absent,tree strict"
+    return 0
+  fi
+  ssh "$KL_HOST" bash -s -- "$unit" "$expected" "$V5_ENV" <<'REMOTE' || return 1
+set -Eeuo pipefail
+unit="$1"; expected="$2"; env_file="$3"
+pid="$(systemctl show -p MainPID --value "$unit")"
+[[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]] || {
+  echo "FATAL: $unit has no readable live process env" >&2; exit 1;
+}
+mapfile -t dirs < <(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^OC_V3_CCB_BASELINE_DIR=//p')
+[[ "${#dirs[@]}" == 1 && "${dirs[0]}" == "$expected" ]] || {
+  echo "FATAL: $unit effective baseline path mismatch(expected=$expected count=${#dirs[@]})" >&2; exit 1;
+}
+if tr '\0' '\n' < "/proc/$pid/environ" | grep -Eqi \
+    '^(OC_V3_CCB_BASELINE_OPTIONAL=(1|true|yes)|OPENCLAUDE_MASTER_BASELINE_BASE_URL=)'; then
+  echo "FATAL: $unit still has dev-only/remote baseline env" >&2; exit 1
+fi
+shared_rc=0
+grep -Eq '^[[:space:]]*(OC_V3_CCB_BASELINE_DIR|OC_V3_CCB_BASELINE_OPTIONAL|OPENCLAUDE_MASTER_BASELINE_BASE_URL)=' "$env_file" || shared_rc=$?
+case "$shared_rc" in
+  0) echo "FATAL: shared V5 env still contains slot/dev/remote baseline key" >&2; exit 1 ;;
+  1) : ;;
+  *) echo "FATAL: cannot inspect shared V5 env(rc=$shared_rc)" >&2; exit 1 ;;
+esac
+REMOTE
+  run_baseline_guard_remote check-dir "$expected" || return 1
+  # V5 is local-only (deploy/v5/P1-PLAN.md). A loopback-only reservation blocks
+  # the old wildcard BaselineServer bind across rollback and A/B canary masters.
+  assert_v5_baseline_port_guard || {
+    echo "✗ V5 baseline 历史端口未被可信回环守卫占位" >&2; return 1;
+  }
+  echo "  ✓ $unit baseline 生效路径/结构/fail-closed 配置完整"
+}
+
+run_ccb_baseline_remount() {
+  local action="$1"
+  [[ "$action" == census || "$action" == remount ]] \
+    || { echo "✗ baseline remount action 非法:$action" >&2; return 2; }
+  assert_no_rollout_in_progress
+  resolve_active_lane
+  assert_bluegreen_layout "$ACTIVE_SRC"
+  assert_live_baseline_security_for_slot "$ACTIVE_SLOT" || return 1
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] $action CCB baseline containers(slot=$ACTIVE_SLOT timeout=${BASELINE_REMOUNT_TIMEOUT_SECONDS}s)"
+    return 0
+  fi
+  # remount 只能从本脚本正式模式进入：调用进程在整个远端命令期间持有
+  # /var/lock/oc-v5-deploy.lock；独立 TS 工具拒绝无锁的破坏性直跑。
+  ssh "$KL_HOST" bash -s -- \
+    "$ACTIVE_UNIT" "$ACTIVE_SRC" "$V5_ENV" "$action" "$BASELINE_REMOUNT_TIMEOUT_SECONDS" <<'REMOTE'
+set -Eeuo pipefail
+unit="$1"; active_src="$2"; env_file="$3"; action="$4"; timeout="$5"
+pid="$(systemctl show -p MainPID --value "$unit")"
+[[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]] || {
+  echo "FATAL: active V5 unit has no readable process env" >&2; exit 1;
+}
+live_cwd="$(readlink -f "/proc/$pid/cwd")"
+expected_cwd="$(readlink -f "$active_src")"
+[[ "$live_cwd" == "$expected_cwd" ]] || {
+  echo "FATAL: active V5 process cwd does not match active slot" >&2; exit 1;
+}
+mapfile -t baseline_dirs < <(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^OC_V3_CCB_BASELINE_DIR=//p')
+[[ "${#baseline_dirs[@]}" == 1 ]] || {
+  echo "FATAL: active V5 process must expose exactly one baseline dir" >&2; exit 1;
+}
+set -a
+. "$env_file"
+set +a
+export OC_V3_CCB_BASELINE_DIR="${baseline_dirs[0]}"
+cd "$live_cwd"
+if [[ "$action" == census ]]; then
+  exec npx --no-install tsx scripts/v5-remount-ccb-baseline.ts --dry-run
+fi
+export OC_V5_DEPLOY_LOCK_HELD=1
+exec npx --no-install tsx scripts/v5-remount-ccb-baseline.ts --timeout-seconds "$timeout"
+REMOTE
+}
 
 # 发布元数据是所有写/激活 lane 的统一数据库前置。AUTO_MIGRATE=0，因此部署脚本只读
 # schema_migrations 并 fail-closed，绝不替操作者偷偷迁库。既校验当前 checkout，也可校验
@@ -1123,8 +1416,16 @@ build_release() {
   fi
   DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$staging/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
   [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ staging dist 缺 oc-build meta" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
-  # VERSION(钉死 short_sha)+ 完整性校验 + .complete + 原子改名 staging→rel-*
+  # VERSION(钉死 short_sha)；所有 npm/vite/dist 步骤完成后才收紧 baseline，随后用
+  # 当前 checkout 的可信 guard 做最终只读复验。guard 失败时 staging 必须清掉，绝不能
+  # 写 .complete 或进入 rel-* 命名空间。
   if ! write_version "$staging" "$short_sha" >&2; then ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  if ! harden_release_baseline "$staging"; then
+    echo "✗ staging CCB baseline hardening/validation 失败" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # 完整性校验 + .complete + 原子改名 staging→rel-*
   if ! ssh "$KL_HOST" "set -e
       test -f '$staging/package.json' && test -d '$staging/node_modules' && test -f '$staging/VERSION.json' && test -f '$staging/packages/web-react/dist/index.html'
       printf '{\"sha\":\"$short_sha\",\"builtAt\":\"$ts\"}\n' > '$staging/.complete'
@@ -2519,6 +2820,7 @@ activate_release() {
   fi
   assert_release_required_migrations "$reldir" || return 1
   ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
+  assert_release_baseline_security "$reldir" || return 1
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
   assert_lossless_turn_tape_floor "$reldir"
@@ -2585,14 +2887,15 @@ ds_commit_active_release() {
   echo "  ✓ deploy_state 提交:active_release=$reldir(slot=$ACTIVE_SLOT,lock=$out),previous←旧 active"
 }
 
-# GC:保留最近 RELEASES_KEEP 个 release,删更老;**绝不删** current / .prev-release / master 与
-# egress 进程 cwd 指向的(egress 默认不随 deploy 重启,cwd 可能停在更老 release,Codex P1#5)。
+# GC:保留最近 RELEASES_KEEP 个 release,删更老;**绝不删** current / .prev-release /
+# deploy_state / master+egress cwd，以及任一 managed V5 容器三条 baseline bind 引用的 release。
+# 删除前完整 Docker census；list/inspect/Source 解析任一异常都以 rc=75 整轮安全跳过、零删除。
 # 只删带 .complete 的正式 rel-*;顺带清超 1 天的孤儿 .staging-*。
 gc_releases() {
-  [[ "$DRY" == 1 ]] && { echo "  [dry-run] GC:保留最近 $RELEASES_KEEP 个,护 A/B slot current + .prev-release + deploy_state(active/candidate/previous)+ master/egress cwd"; return 0; }
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] GC:保留最近 $RELEASES_KEEP 个,护 A/B/deploy_state/cwd + 全部 V5 容器 baseline release 引用"; return 0; }
   # 双 master 下 A/B 两 slot symlink 都可能在役；previous_active_release 还可能是唯一指向 B
   # 直接回滚代的引用。删除型 GC 对 PG 读取必须 fail-closed：查询失败/零行就整轮跳过。
-  local dsrels ds_active ds_candidate ds_previous
+  local dsrels ds_active ds_candidate ds_previous gc_out gc_rc=0 quoted
   if ! dsrels="$(ds_exec 2>/dev/null <<'SQL'
 SELECT coalesce(active_release,'')||'|'||coalesce(candidate_release,'')||'|'||coalesce(previous_active_release,'') FROM deploy_state WHERE singleton = true;
 SQL
@@ -2602,31 +2905,23 @@ SQL
   fi
   IFS='|' read -r ds_active ds_candidate ds_previous <<<"${dsrels:-||}"
   local srcA srcB; srcA="$(slot_src A)"; srcB="$(slot_src B)"
-  if ! ssh "$KL_HOST" "set -e
-    protect_paths() { for p in \"\$@\"; do [ -n \"\$p\" ] || continue; case \"\$p\" in /*) echo \"\$p\" ;; *) echo '$RELEASES_ROOT/'\"\$p\" ;; esac; done; }
-    curA=\$(readlink -f '$srcA' 2>/dev/null || true)
-    curB=\$(readlink -f '$srcB' 2>/dev/null || true)
-    curE=\$(readlink -f '$V5_EGRESS_SRC' 2>/dev/null || true)
-    prev=\$(readlink -f \"\$(cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true)\" 2>/dev/null || true)
-    dsa=\$(readlink -f \"\$(protect_paths '$(ds_lit "$ds_active")')\" 2>/dev/null || true)
-    dsc=\$(readlink -f \"\$(protect_paths '$(ds_lit "$ds_candidate")')\" 2>/dev/null || true)
-    dsp=\$(readlink -f \"\$(protect_paths '$(ds_lit "$ds_previous")')\" 2>/dev/null || true)
-    mpidA=\$(systemctl show -p MainPID --value '$(slot_unit A)' 2>/dev/null || echo 0)
-    mpidB=\$(systemctl show -p MainPID --value '$(slot_unit B)' 2>/dev/null || echo 0)
-    epid=\$(systemctl show -p MainPID --value openclaude-v5-egress 2>/dev/null || echo 0)
-    mcwdA=\$([ \"\${mpidA:-0}\" -gt 0 ] && readlink -f /proc/\$mpidA/cwd 2>/dev/null || true)
-    mcwdB=\$([ \"\${mpidB:-0}\" -gt 0 ] && readlink -f /proc/\$mpidB/cwd 2>/dev/null || true)
-    ecwd=\$([ \"\${epid:-0}\" -gt 0 ] && readlink -f /proc/\$epid/cwd 2>/dev/null || true)
-    ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | tail -n +$((RELEASES_KEEP+1)) | while read -r d; do
-      rd=\$(readlink -f \"\$d\" 2>/dev/null || echo \"\$d\")
-      case \"\$rd\" in \"\$curA\"|\"\$curB\"|\"\$curE\"|\"\$prev\"|\"\$dsa\"|\"\$dsc\"|\"\$dsp\"|\"\$mcwdA\"|\"\$mcwdB\"|\"\$ecwd\") continue ;; esac
-      [ -f \"\$d/.complete\" ] || continue
-      rm -rf \"\$d\"
-    done
-    find '$RELEASES_ROOT' -maxdepth 1 -name '.staging-*' -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true" 2>&1 | sed 's/^/  /'; then
-    echo "✗ release GC 远端删除失败——中止 lane，不吞掉部分删除错误。" >&2
-    return 1
-  fi
+  printf -v quoted '%q ' \
+    "$RELEASES_ROOT" "$RELEASES_KEEP" "$srcA" "$srcB" "$V5_EGRESS_SRC" \
+    "$RELEASES_ROOT/.prev-release" "$(slot_unit A)" "$(slot_unit B)" "$V5_EGRESS_UNIT" \
+    "$ds_active" "$ds_candidate" "$ds_previous"
+  gc_out="$(ssh "$KL_HOST" "bash -s -- $quoted" < "$RELEASE_GC_SCRIPT" 2>&1)" || gc_rc=$?
+  [[ -z "$gc_out" ]] || printf '%s\n' "$gc_out" | sed 's/^/  /'
+  case "$gc_rc" in
+    0) return 0 ;;
+    75)
+      echo "  ⚠ release GC 引用 census/校验失败 → 已在首个 rm 前安全跳过整轮删除" >&2
+      return 0
+      ;;
+    *)
+      echo "✗ release GC 远端删除失败——中止 lane，不吞掉部分删除错误。" >&2
+      return 1
+      ;;
+  esac
 }
 
 # ═══════════════════ runtime tuple / platform bundle 编排(§1.1/1.2/1.5/3.1)═══════════════════
@@ -2822,6 +3117,7 @@ activate_runtime_tuple() {
     return 0
   fi
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
+  assert_release_baseline_security "$BUILT_RELEASE" || return 1
   # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
   # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
   # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
@@ -2972,6 +3268,13 @@ migrate_to_bluegreen() {
     fi
     echo "✗ $REMOTE_SRC 是 symlink 但非合法蓝绿布局(悬垂/非 rel-*/缺 .complete),拒绝自动迁移,人工处置" >&2; return 1
   fi
+  # Legacy real-directory migration is another old-code restart path. Establish
+  # the reservation before changing modes or stopping/starting that process.
+  echo "── 蓝绿迁移前建立 CCB baseline 安全边界 ──"
+  install_v5_slot_units || return 1
+  harden_release_baseline "$REMOTE_SRC" || return 1
+  strip_shared_baseline_env_keys || return 1
+  assert_release_baseline_security "$REMOTE_SRC" || return 1
   local sha ts reldir
   sha="$(ssh "$KL_HOST" "jq -r .commit '$REMOTE_SRC/VERSION.json' 2>/dev/null || echo unknown")"
   ts="$(date -u +%Y%m%d-%H%M%S)"
@@ -3221,6 +3524,13 @@ smoke() {
       || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
     echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
+  local baseline_slot
+  case "$sport" in
+    18790) baseline_slot=A ;;
+    18795) baseline_slot=B ;;
+    *) echo "✗ 无法由 smoke port=$sport 判定 slot baseline 路径" >&2; return 1 ;;
+  esac
+  assert_live_baseline_security_for_slot "$baseline_slot" || return 1
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
 
@@ -3229,6 +3539,10 @@ bootstrap() {
   echo "══ v5 bootstrap on $KL_HOST ══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
+  # bootstrap 也支持已有实例的恢复重跑。rsync 本身会改 baseline mode/内容，
+  # 因而端口占位必须早于任何 live tree 写入，而不只是早于显式 harden。
+  echo "── 0.5) live tree 写入前安装并实测 CCB 端口守卫 ──"
+  install_v5_slot_units
   # 1) 源码树
   echo "── 1) rsync v5 源码 → $REMOTE_SRC ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
@@ -3239,6 +3553,8 @@ bootstrap() {
   # commercial 包级 node_modules:dev worktree 可能有、kl-mirror prod 树通常没有(依赖 hoist 到 root)。
   # 仅当源存在且目标缺失才拷;否则跳过(root node_modules 已含全部依赖)。
   sshk "if [ ! -d '$REMOTE_SRC/packages/commercial/node_modules' ] && [ -d '$REMOTE_V3_SRC/packages/commercial/node_modules' ]; then cp -a '$REMOTE_V3_SRC/packages/commercial/node_modules' '$REMOTE_SRC/packages/commercial/node_modules' && echo '  ✓ commercial pkg node_modules 已拷'; else echo '  (commercial pkg node_modules 源不存在/目标已有 → 跳过;依赖在 root node_modules)'; fi"
+  echo "── 2.5) 收紧并验证初始 CCB baseline(端口守卫已生效)──"
+  harden_release_baseline "$REMOTE_SRC"
   # 3) HOME + openclaude.json(从 v3 派生:改 gateway.port/bind、清空 channels)
   #
   # 【存在性守卫,2026-07-11 事故】openclaude.json / env 一旦存在即为现网权威,
@@ -3257,14 +3573,14 @@ bootstrap() {
   echo "── 4.5) release metadata 数据库前置硬门 ──"
   assert_repo_required_migrations
   assert_0151_runtime_privileges
-  # 5) systemd unit(master + egress 一并装:见 V5_EGRESS_UNIT 定义处的踩雷说明)
-  echo "── 5) 安装 $V5_UNIT + $V5_EGRESS_UNIT ──"
-  run "rsync -az '$REPO_ROOT/deploy/v5/$V5_UNIT' '$KL_HOST:/etc/systemd/system/$V5_UNIT'"
+  # 5) A/B + baseline guard 已在首次 harden 前安装；此处补 egress unit。
+  echo "── 5) 安装 $V5_EGRESS_UNIT(A/B + baseline guard 已验证)──"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_EGRESS_UNIT' '$KL_HOST:/etc/systemd/system/$V5_EGRESS_UNIT'"
   # bootstrap 没有旧 egress release 可做 saga；先把独立指针绑定初始 A 源码。后续普通
   # deploy --egress 会把它钉到对应不可变 release，且失败自动回切。
   sshk "set -e; rm -f '$V5_EGRESS_SRC.newlink.bootstrap'; ln -s '$REMOTE_SRC' '$V5_EGRESS_SRC.newlink.bootstrap'; mv -Tf '$V5_EGRESS_SRC.newlink.bootstrap' '$V5_EGRESS_SRC'"
   sshk "systemctl daemon-reload"
+  strip_shared_baseline_env_keys
   # 5.5) 部署顺序守卫:P1a channel-aware 代码需共享库已加 runtime_channel 列(0088)。
   echo "── 5.5) 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
@@ -3428,6 +3744,10 @@ deploy() {
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
   # 蓝绿下天然一次翻转一次重启,不会再成对重启。
   build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  # 历史部署曾把 release 解成 775/664，并在共享 env 留 dev-only OPTIONAL=1。
+  # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
+  # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
+  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
@@ -3632,6 +3952,7 @@ deploy_dist() {
   assert_bluegreen_layout "$ACTIVE_SRC"
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
+  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
   # hotcfg 启用时同样走 tuple saga(master 源码翻转=extra_apply,单次重启)。纯前端变更下
   # bundle/release digest 不变 → 幂等复用零 churn;tuple env 不变 → 只是随本次重启一并生效。
   # R2-B1:--disable-* 同 deploy(),该轴不 build 但强制走 saga 写空值。
@@ -3666,6 +3987,7 @@ rollback() {
   # BLOCKER 4:解析 active slot(蓝绿 A→B finalize 后 active 可能是 B)→ 回滚操作 active slot 的 symlink/unit。
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 rollback" >&2; exit 1; }
   # hotcfg 启用 → tuple 感知回滚:master 源码 symlink 与 runtime tuple(env 四键+current)是同一
   # deploy 的一对孪生产物,必须从**同一条** history 记录一起翻回(M7:master 与 tuple 不再各取一源)。
   # R2-B1:两轴刚被 --disable(env 已空)时 enabled 判定全 0,但 history 有账 → 仍须走 tuple 感知
@@ -3856,6 +4178,7 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_required_migrations "$master" || return 1
+  assert_release_baseline_security "$master" || return 1
   # Current-capable/unknown → target reader+actual writer are proved without a
   # DB observation, before any history/state/env/symlink mutation. This closes
   # "floor query=false → concurrent first finalize → rollback".
@@ -4045,7 +4368,10 @@ start_candidate_unit_and_wait() {
     echo "✗ candidate unit 启动失败:$(slot_unit "$cand")" >&2
     return 1
   fi
-  if wait_for_candidate_ready "$cand" 90; then return 0; fi
+  if wait_for_candidate_ready "$cand" 90; then
+    if assert_live_baseline_security_for_slot "$cand"; then return 0; fi
+    echo "✗ candidate baseline 生效路径/结构不安全" >&2
+  fi
   echo "✗ candidate 自检失败;stop candidate + 回 stable(§8 canary<READY)" >&2
   recover_canary_prep "$cand" || return 1
   return 1
@@ -4335,8 +4661,10 @@ vip_control_gate() {
 # ═════════ lane: --canary ═════════
 canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
-  assert_bluegreen_layout
+  resolve_active_lane
+  assert_bluegreen_layout "$ACTIVE_SRC"
   assert_runtime_channel_column
+  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 canary" >&2; exit 1; }
   if [[ -n "$CANARY_RELEASE" ]]; then
     local requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
     [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
@@ -4376,6 +4704,11 @@ canary() {
     reldir="$BUILT_RELEASE"
   fi
   [[ "$DRY" == 1 ]] && reldir="$RELEASES_ROOT/rel-cand-dry"
+  assert_release_baseline_security "$reldir" || {
+    echo "✗ candidate release baseline 不安全;回 stable(§8 canary<READY)" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   ds_cas_or_die "candidate_release='$(ds_lit "$reldir")', transition_step=1" 1 "built candidate_release=$reldir"
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
@@ -4807,7 +5140,7 @@ fi
 # 的 OC_HOTCFG_* 根路径同款"自测可覆盖"约定),避免测试去抢真实部署锁而挂死 900s。
 DEPLOY_LOCK="${OC_V5_DEPLOY_LOCK_FILE:-/var/lock/oc-v5-deploy.lock}"
 trap cleanup_deploy_process EXIT
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" ]]; then
   exec 8>"$DEPLOY_LOCK"
   if ! flock -n 8; then
     echo "⏳ 部署锁被占:$(cat "${DEPLOY_LOCK}.holder" 2>/dev/null || echo '持有者未知')"
@@ -4831,7 +5164,7 @@ fi
 
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新
 # 发布覆盖现场证据。只读 smoke 仍允许，供人工诊断；dry-run 不访问远端。
-if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" ]]; then
   assert_no_deploy_recovery_marker || exit 1
 fi
 
@@ -4839,6 +5172,8 @@ case "$MODE" in
   bootstrap) bootstrap ;;
   migrate-bluegreen) migrate_to_bluegreen ;;
   smoke)     resolve_active_lane; smoke "$ACTIVE_PORT" ;;
+  baseline-census) run_ccb_baseline_remount census ;;
+  baseline-remount) run_ccb_baseline_remount remount ;;
   deploy)    deploy ;;
   dist)      deploy_dist ;;
   model-authority-preflight) model_authority_preflight ;;

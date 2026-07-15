@@ -27,7 +27,7 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
         容器内 gateway(packages/gateway)= 真正执行 turn 的进程
         引擎层 EngineAdapter:CcbAdapter(claude-code-best)/ CodexAdapter(codex app-server)
         /api/skills|cron|memory|agents 等管理面 = 容器代理路径(改了必须重建 runtime image!)
-        skill:平台 baseline(OC_V3_CCB_BASELINE_DIR=v5 树 ro bind)+ marketplace hub(syncMarketplaceHub 落盘)
+        skill:平台 baseline(A/B 当前 release 的 slot-local 路径 ro bind)+ marketplace hub(syncMarketplaceHub 落盘)
 ```
 
 **前端**:`packages/web-react`(React/Vite SPA)。chat 状态机 `lib/chat/reducer.ts`(帧翻译/守卫)+ `socket.ts`(WS/重连/持久化编排)+ `lib/persist.ts`(IndexedDB 镜像 + server-wins 合并纯函数)。v2 lossless turn tape 将 `assistant|thinking|tool|agent-group|plan|goal` 及委派 transcript 作为 server-authored 权威；热行只放一个 tape anchor，完整内容在 PG 记录表按 hash 水合。`delegate-progress` 仍是 live 进度投影，但完成后的完整子 Agent block 序列归入 `agent-group` tape，不再依赖单设备 IndexedDB。
@@ -202,7 +202,8 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | **管理后台**(`packages/web-react/src/admin/**`,admin.html 第二 Vite 入口,2026-07-10 起) | dist 静态资源 | 同上 `--dist`;vanilla admin(web/public/admin.js)与 gateway legacy 透传已删,`?v=` 戳/bump-version 不再涉 v5 |
 | 告警脚本(`scripts/v5-monitor.sh`/`v5-daily-check.sh`/`v5-alert-fanout.sql`/`v5-alert-fail.sh`) | kl-mirror 脚本树 | 随 deploy rsync 即生效;**systemd 单元(deploy/v5/)仍手动 cp+daemon-reload**(alert-fail@ 模板免 enable) |
 | 容器内 gateway/CCB/storage/protocol/mcp-memory 源码 | **runtime source release**(feat/v5-runtime-hotcfg 起) | deploy 自动构建 release(content digest 命名)+ tuple 激活;存量容器 runtimeStale 滚动(重连秒级/idle≤30min)。**启用前提:env 已有 OC_RUNTIME_RELEASE 或 deploy `--enable-runtime-release` 首次开启;未启用=旧行为(重建镜像)** |
-| 平台配置(agent-sandbox/platform-runtime/**:oc-* 薄壳、entrypoint.ts、seed 声明/persona/种子技能、prompts 文案) | **platform bundle** | deploy 自动打 bundle(digest 命名+current 原子翻转);bin/prompts **真热**(存量容器立即),entrypoint/seed 走 boot_hash 滚动。启用开关同上(`--enable-platform-bundle`)。baseline skill(ccb-baseline*)机制不变:rsync 即生效 |
+| 平台配置(agent-sandbox/platform-runtime/**:oc-* 薄壳、entrypoint.ts、seed 声明/persona/种子技能、prompts 文案) | **platform bundle** | deploy 自动打 bundle(digest 命名+current 原子翻转);bin/prompts **真热**(存量容器立即),entrypoint/seed 走 boot_hash 滚动。启用开关同上(`--enable-platform-bundle`)。 |
+| `agent-sandbox/ccb-baseline/**` | **master release + 用户容器只读 bind** | deploy 在 `.complete` 前收紧 owner/mode/manifest，并校验 A/B 进程只用自己的 slot-local 路径；`OC_V3_CCB_BASELINE_OPTIONAL`/共享 DIR/远程 URL 生产禁用。baseline 内容有变化时，部署后用下方 remount 工具逐容器认证 drain 后重建；禁止 bulk force。 |
 | 工具链(Dockerfile:apt/pip/Quarto/Typst/codex CLI pin/Chromium/sudoers) | **runtime image**(纯工具链面) | 重建镜像+切 tag(§4.3);v5 生产 build 传 `OC_EMBED_SOURCE=0`(瘦身,源码走 release 挂载);重建后必须刷新 emergency tuple(§4.3) |
 | `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
 | `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
@@ -248,6 +249,34 @@ CADDY_HTTP_PORT=18081 KL_HOST=kl-hk bash scripts/deploy-v5.sh --canary
 # 谱系计数(#ocr=N,失忆也生效,一条谱系 ≤2 次自动刷);只在版本匹配时清零。
 # 老 bundle(无 governor)收到帧会忽略 → 需一次手动刷新 bootstrap 到新 bundle,之后自愈。
 ```
+
+**CCB baseline 存量容器收敛**（仅 baseline 内容变化或修复历史漏挂时执行）：先确认
+`deploy_state.phase=stable`，按当前 active slot 选择 unit（A=`openclaude-v5.service`，
+B=`openclaude-v5-b.service`），先 dry-run 再真实执行。工具只处理
+`runtime_channel=v5`，逐个走容器内认证 drain；`busy/failed` 会重试并在 deadline 后
+失败退出，绝不强杀活跃 turn，命名卷、managed/uid/channel 身份 labels 和 runtime
+labels 会在每个容器重建后复验。真实 remount 只能经 deploy 正式模式运行：它会在
+整个 census/drain/reprovision 窗口持有 `/var/lock/oc-v5-deploy.lock`，避免 release、
+runtime tuple 或 slot 同时翻转；独立 TS 工具只允许 `--dry-run`，破坏性直跑会拒绝。
+V5 不启动远程 baseline server；正式 unit 会依赖
+`openclaude-v5-baseline-port-guard.socket`，仅在 `127.0.0.1:18893` 做端口占位。
+这是为旧 release 自动回滚准备的兼容保险：其 `0.0.0.0:18893` bind 必须得到
+`EADDRINUSE`。smoke 会同时核对 socket active、唯一回环 listener 和真实 wildcard
+bind 失败；不要把这个回环占位误删，也不要开放为 `0.0.0.0`。
+容器 bind 的 Source 是当次 master 的不可变 `rel-*` 真实路径；release GC 会先完整
+inspect 全部 managed V5 容器，把仍被三条 baseline bind 引用的 release 加入保护集。
+Docker census、inspect 或 Source 解析任一失败时，整轮 GC 在首个 `rm` 前安全跳过。
+
+```bash
+# deploy 脚本从 deploy_state 自动解析 active A/B，不手填 unit/path。
+scripts/deploy-v5.sh --census-ccb-baseline
+scripts/deploy-v5.sh --remount-ccb-baseline
+
+# 仅需调整总 deadline 时（单位：秒，允许 60..7200）：
+OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS=3600 \
+  scripts/deploy-v5.sh --remount-ccb-baseline
+```
+
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
 
 ### 4.2b 极少数跨 master/runtime/dist 的离线切换

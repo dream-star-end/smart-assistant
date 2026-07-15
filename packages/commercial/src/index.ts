@@ -2815,26 +2815,26 @@ export async function registerCommercial(
 
   // V3 多机路由:启动 BaselineServer,给远端 node-agent 提供
   // /internal/v3/baseline-{version,tarball} 端点。只在 v3Deps + selfHostUuid
-  // 都就绪时起(多机 wiring 前置条件),失败不阻断 gateway —— remote host 拉
+  // 都就绪且 runtimeChannel!=v5 时起(多机 wiring 前置条件),失败不阻断 gateway —— remote host 拉
   // baseline 失败时 provisionV3Container 会走 CcbBaselineMissing fail-closed。
-  // bind 0.0.0.0 + mTLS + PSK 双因子认证;GCP default-allow-internal 挡公网。
+  // V5 P1 是 local-only，明确不注册/调度 remote compute host，也不能在 A/B 双 master
+  // 同时抢占一个 baseline 端口；V5 本地容器直接 ro bind slot-local baseline，无需此 server。
+  // V3 bind 0.0.0.0 + mTLS + PSK 双因子认证;GCP default-allow-internal 挡公网。
   let baselineSrv: BaselineServer | undefined;
-  if (v3Deps && selfHostUuid) {
+  if (v3Deps && selfHostUuid && runtimeChannel !== "v5") {
     try {
       const baselineDir =
         process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
-      // v5 baseline 走 18893(避开 v3 占用的 0.0.0.0:18792);v3 仍 18792。
-      const baselinePort = runtimeChannel === "v5" ? 18893 : 18792;
       baselineSrv = getBaselineServer({
         baselineDir,
         bind: "0.0.0.0",
-        port: baselinePort,
+        port: 18792,
       });
       await baselineSrv.start();
       // eslint-disable-next-line no-console
       console.log("[commercial] baseline server started", {
         bind: "0.0.0.0",
-        port: baselinePort,
+        port: 18792,
         baselineDir,
       });
     } catch (err) {

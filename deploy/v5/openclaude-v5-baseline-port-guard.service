@@ -1,0 +1,22 @@
+[Unit]
+# 仅作为上方 socket 的安全接收端；正常路径无人连接。若本机误连，占位连接被
+# systemd-socket-proxyd 转向一个不存在的 root-owned /run 路径并立即关闭。
+Description=OpenClaude v5 disabled baseline port sink
+Requires=openclaude-v5-baseline-port-guard.socket
+After=openclaude-v5-baseline-port-guard.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=5s /run/openclaude-v5/baseline-port-disabled.sock
+DynamicUser=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=true
+MemoryDenyWriteExecute=true
