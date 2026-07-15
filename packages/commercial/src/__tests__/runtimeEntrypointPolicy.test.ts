@@ -176,7 +176,15 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
   });
 
   test("普通 env (PATH / HOME / NODE_ENV) 不被识别为 managed (假阳性告警)", () => {
-    for (const key of ["PATH", "HOME", "NODE_ENV", "TZ", "USER"]) {
+    const ordinary = [
+      "PATH",
+      "HOME",
+      "NODE_ENV",
+      "TZ",
+      "USER",
+      "OC_CONTAINER_PREVIEW_ENABLED",
+    ];
+    for (const key of ordinary) {
       assert.ok(
         !isProviderManagedEnvVar(key),
         `${key} 被误识别为 managed,会被 entrypoint 误删,导致 npm run gateway 起不来`,
