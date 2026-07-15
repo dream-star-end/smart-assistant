@@ -956,6 +956,145 @@ export type MessageLike = {
   [k: string]: unknown
 }
 
+/** Read projection for client-session history. Exact is the durable/admin
+ * surface; chat is the bounded browser presentation surface. */
+export type ClientSessionReadOptions = {
+  projection?: 'exact' | 'chat'
+}
+
+export type HistoryProjection =
+  | { kind: 'checkpoint' }
+  | {
+      kind: 'bash-tail'
+      toolUseId: string
+      parentToolUseId?: string
+      tail: string
+      totalBytes: number
+      truncatedHead: boolean
+    }
+
+const CHAT_BASH_TAIL_MAX_BYTES = 256 * 1024
+
+function utf8Tail(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  const bytes = Buffer.from(value, 'utf8')
+  if (bytes.length <= maxBytes) return { value, truncated: false }
+  let start = bytes.length - maxBytes
+  // A UTF-8 continuation byte cannot begin a decoded suffix. Move to the
+  // next code-point boundary; at most three additional bytes are skipped.
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
+  return { value: bytes.subarray(start).toString('utf8'), truncated: true }
+}
+
+function projectionAnchorKey(message: MessageLike): string {
+  if (typeof message._turnTapeId === 'string') return `tape:${message._turnTapeId}`
+  if (typeof message._seq === 'number' && Number.isFinite(message._seq)) return `seq:${message._seq}`
+  return `id:${String(message.id ?? '')}`
+}
+
+function projectionCheckpoint(message: MessageLike): MessageLike {
+  const tapeId = typeof message._turnTapeId === 'string' ? message._turnTapeId : undefined
+  const seq = typeof message._seq === 'number' && Number.isFinite(message._seq) ? message._seq : undefined
+  const suffix = tapeId ?? (seq !== undefined ? `seq-${seq}` : String(message.id ?? 'legacy'))
+  return {
+    id: `projection-checkpoint:${suffix}`,
+    role: 'runtime-event',
+    text: '',
+    ts: typeof message.ts === 'number' ? message.ts : 0,
+    _source: 'server',
+    ...(seq !== undefined ? { _seq: seq } : {}),
+    ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
+    ...(typeof message._turnTapeSha256 === 'string'
+      ? { _turnTapeSha256: message._turnTapeSha256 }
+      : {}),
+    _turnTapeExpanded: true,
+    _historyProjection: { kind: 'checkpoint' } satisfies HistoryProjection,
+  }
+}
+
+/**
+ * Remove exact hidden runtime frames from the browser history projection.
+ * Bash tail snapshots are coalesced to one sanitized, bounded patch per tool;
+ * runtime-only anchors keep one tiny checkpoint so incremental cursors advance.
+ * The input is never mutated and exact callers never invoke this helper.
+ */
+export function projectClientSessionMessagesForChat(messages: readonly MessageLike[]): MessageLike[] {
+  const visible: MessageLike[] = []
+  const anchors = new Map<string, MessageLike>()
+  const represented = new Set<string>()
+  const tailWinner = new Map<string, { message: MessageLike; projection: Extract<HistoryProjection, { kind: 'bash-tail' }>; order: number }>()
+
+  for (let order = 0; order < messages.length; order++) {
+    const message = messages[order]!
+    const key = projectionAnchorKey(message)
+    anchors.set(key, message)
+    if (message.role !== 'runtime-event') {
+      visible.push(message)
+      represented.add(key)
+      continue
+    }
+    const raw = message._runtimeEvent
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const event = raw as Record<string, unknown>
+    if (event.type !== 'system' || event.subtype !== 'bash_output_tail') continue
+    const toolUseId = event.tool_use_id
+    if (typeof toolUseId !== 'string' || toolUseId.length === 0) continue
+    const parentToolUseId = typeof event.parent_tool_use_id === 'string' && event.parent_tool_use_id.length > 0
+      ? event.parent_tool_use_id
+      : undefined
+    const totalBytes = typeof event.total_bytes === 'number' && Number.isFinite(event.total_bytes)
+      ? Math.max(0, event.total_bytes)
+      : 0
+    const tail = utf8Tail(typeof event.tail === 'string' ? event.tail : '', CHAT_BASH_TAIL_MAX_BYTES)
+    const projection: Extract<HistoryProjection, { kind: 'bash-tail' }> = {
+      kind: 'bash-tail',
+      toolUseId,
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+      tail: tail.value,
+      totalBytes,
+      truncatedHead: event.truncated_head === true || tail.truncated,
+    }
+    const target = `${parentToolUseId ?? ''}\0${toolUseId}`
+    const previous = tailWinner.get(target)
+    // Input order is the final deterministic tie-breaker. PG orders by the
+    // complete persisted chronology tuple before calling this helper.
+    if (!previous || totalBytes > previous.projection.totalBytes ||
+        (totalBytes === previous.projection.totalBytes && order > previous.order)) {
+      tailWinner.set(target, { message, projection, order })
+    }
+  }
+
+  for (const { message, projection } of tailWinner.values()) {
+    const key = projectionAnchorKey(message)
+    represented.add(key)
+    visible.push({
+      id: `projection-tail:${String(message.id ?? `${projection.parentToolUseId ?? ''}:${projection.toolUseId}`)}`,
+      role: 'runtime-event',
+      text: '',
+      ts: typeof message.ts === 'number' ? message.ts : 0,
+      _source: 'server',
+      ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
+      ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
+      ...(typeof message._turnTapeSha256 === 'string'
+        ? { _turnTapeSha256: message._turnTapeSha256 }
+        : {}),
+      _turnTapeExpanded: true,
+      _historyProjection: projection,
+    })
+  }
+
+  for (const [key, anchor] of anchors) {
+    if (!represented.has(key)) visible.push(projectionCheckpoint(anchor))
+  }
+  return visible.sort((a, b) => {
+    const seqA = typeof a._seq === 'number' ? a._seq : Number.MAX_SAFE_INTEGER
+    const seqB = typeof b._seq === 'number' ? b._seq : Number.MAX_SAFE_INTEGER
+    if (seqA !== seqB) return seqA - seqB
+    const tsA = typeof a.ts === 'number' ? a.ts : 0
+    const tsB = typeof b.ts === 'number' ? b.ts : 0
+    return tsA - tsB
+  })
+}
+
 /**
  * Hard cap on the serialized `messages` JSON blob inside a single
  * `client_sessions` row, in bytes. Writes that would push the blob past this
@@ -2928,7 +3067,11 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
   }))
 }
 
-async function _sqliteGetClientSession(id: string, userId?: string): Promise<ClientSession | null> {
+async function _sqliteGetClientSession(
+  id: string,
+  userId?: string,
+  options: ClientSessionReadOptions = {},
+): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
     ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
@@ -2939,6 +3082,7 @@ async function _sqliteGetClientSession(id: string, userId?: string): Promise<Cli
     archived_through_seq: number | null; archived_count: number | null
   } | undefined
   if (!row) return null
+  const exactMessages = JSON.parse(row.messages) as MessageLike[]
   return {
     id: row.id,
     userId: row.user_id,
@@ -2947,7 +3091,9 @@ async function _sqliteGetClientSession(id: string, userId?: string): Promise<Cli
     pinned: row.pinned === 1,
     createdAt: row.created_at,
     lastAt: row.last_at,
-    messages: JSON.parse(row.messages),
+    messages: options.projection === 'chat'
+      ? projectClientSessionMessagesForChat(exactMessages)
+      : exactMessages,
     updatedAt: row.updated_at,
     // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
     // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
@@ -2980,6 +3126,7 @@ async function _sqliteGetClientSessionPartial(
   id: string,
   userId: string,
   sinceSeq: number,
+  options: ClientSessionReadOptions = {},
 ): Promise<ClientSessionPartial | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
@@ -3022,6 +3169,8 @@ async function _sqliteGetClientSessionPartial(
     messages = allMsgs
     isPartial = false
   }
+
+  if (options.projection === 'chat') messages = projectClientSessionMessagesForChat(messages)
 
   return {
     id: row.id,
@@ -3072,6 +3221,7 @@ async function _sqliteReadArchivedMessages(
   userId: string,
   beforeSeq = 0,
   limit = 100,
+  options: ClientSessionReadOptions = {},
 ): Promise<ReadArchivedMessagesResult> {
   const db = await getSessionsDb()
   const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) ? limit : 100)))
@@ -3114,7 +3264,11 @@ async function _sqliteReadArchivedMessages(
   const hasMore = pool.length > cappedLimit
   const page = pool.slice(Math.max(0, pool.length - cappedLimit))
   const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null
-  return { messages: page, hasMore, oldestSeq }
+  return {
+    messages: options.projection === 'chat' ? projectClientSessionMessagesForChat(page) : page,
+    hasMore,
+    oldestSeq,
+  }
 }
 
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */

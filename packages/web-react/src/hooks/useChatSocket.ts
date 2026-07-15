@@ -187,9 +187,8 @@ export function useChatSocket(opts: {
           body: JSON.stringify(p),
         }).catch(() => {});
       },
-      // resume_failed / 重连 reconcile：REST 全量 sync 作最终权威源（server-wins **合并**,
-      // 不是整段替换——替换会抹掉 server 端根本没有的 client-owned 内容:乐观尾/用户行/
-      // 团队卡,走与 loadHistory 同一条 applyServerMessages 收口,含 normalizeDelegateCards）。
+      // resume_failed / 重连 reconcile：有游标走 REST 增量、无游标才全量；两者都以 server
+      // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。
       syncSession: async (sessId, context) => {
         const a = authRef.current;
         if (!a) return;
@@ -197,16 +196,24 @@ export function useChatSocket(opts: {
         const sess = socket?.sessions.get(sessId);
         if (!sess) return;
         try {
-          const detail = await api.getSession(a, sessId);
+          const sinceSeq = typeof sess._maxSeq === "number" && sess._maxSeq > 0 ? sess._maxSeq : 0;
+          const detail = await api.getSession(a, sessId, sinceSeq);
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
           // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。热尾巴:透传归档水位,
           // 本地 `_seq ≤ archivedThroughSeq`的旧行才不会被"server 不认识 = 丢弃"误杀。
-          if (serverMsgs && serverMsgs.length > 0) {
-            socket?.applyServerMessages(sessId, detail.agentId || sess.agentId, serverMsgs, true, detail.maxSeq, {
+          if (serverMsgs && (serverMsgs.length > 0 || detail.isPartial)) {
+            socket?.applyServerMessages(
+              sessId,
+              detail.agentId || sess.agentId,
+              serverMsgs,
+              !detail.isPartial,
+              detail.maxSeq,
+              {
               archivedThroughSeq: detail.archivedThroughSeq,
               archivedCount: detail.archivedCount,
               completedClientMessageId: context?.clientMessageId,
-            });
+              },
+            );
           }
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
