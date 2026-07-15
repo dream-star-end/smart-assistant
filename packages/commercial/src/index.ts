@@ -258,9 +258,12 @@ import {
   type MarketplaceAgentHandler,
 } from "./http/internalMarketplaceAgent.js";
 import {
+  TOOL_CALL_ROLLUP_PATH,
   TOOL_FAILURE_AUDIT_PATH,
   isToolFailureAuditEnabled,
+  makeToolCallRollupHandler,
   makeToolFailureAuditHandler,
+  type ToolCallRollupHandler,
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
 import {
@@ -1740,6 +1743,12 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      const toolCallRollupHandler: ToolCallRollupHandler | null = isToolFailureAuditEnabled()
+        ? makeToolCallRollupHandler({
+            identityRepo,
+            queryRunner: getPool(),
+          })
+        : null;
       // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
       // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
       // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
@@ -1924,6 +1933,9 @@ export async function registerCommercial(
         }
         if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
           return toolFailureAuditHandler(req, res, ctx);
+        }
+        if (toolCallRollupHandler && path === TOOL_CALL_ROLLUP_PATH) {
+          return toolCallRollupHandler(req, res, ctx);
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);

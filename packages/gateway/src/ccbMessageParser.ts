@@ -6,11 +6,15 @@
  * message parsing from session orchestration concerns.
  */
 import { performance } from 'node:perf_hooks'
-import type { OutboundContentBlock } from '@openclaude/protocol'
+import {
+  type OutboundContentBlock,
+  isToolExitCode,
+  isToolTerminationReason,
+} from '@openclaude/protocol'
 import type {
-  DurableRuntimeEvent,
   DetectedToolResult,
   DetectedToolUse,
+  DurableRuntimeEvent,
   SegmentRecord,
   SessionStreamEvent,
   TurnToolEntry,
@@ -997,6 +1001,10 @@ export class CcbMessageParser {
             )
           }
           if (this.onToolResult) {
+            const exitCode = isToolExitCode(c.exit_code) ? c.exit_code : undefined
+            const terminationReason = isToolTerminationReason(c.termination_reason)
+              ? c.termination_reason
+              : undefined
             this.onToolResult({
               toolUseId: useId,
               toolName,
@@ -1004,6 +1012,8 @@ export class CcbMessageParser {
               isError: !!c.is_error,
               durationMs,
               inputPreview: meta?.inputPreview,
+              ...(exitCode !== undefined ? { exitCode } : {}),
+              ...(terminationReason !== undefined ? { terminationReason } : {}),
             })
           }
         }

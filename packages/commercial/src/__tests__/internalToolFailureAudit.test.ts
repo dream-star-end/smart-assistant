@@ -9,20 +9,26 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 
-import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentity.js'
+import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
 import {
-  TOOL_FAILURE_AUDIT_PATH,
-  insertToolFailureAudit,
-  isToolFailureAuditEnabled,
-  makeToolFailureAuditHandler,
   type QueryRunner,
+  TOOL_AUDIT_SCHEMA_HEADER,
+  TOOL_FAILURE_AUDIT_PATH,
+  type ToolCallRollupBody,
   type ToolFailureAuditBodyV1,
   type ToolFailureAuditBodyV2,
+  type ToolFailureAuditBodyV3,
+  insertToolCallRollup,
+  insertToolFailureAudit,
+  isToolFailureAuditEnabled,
+  makeToolCallRollupHandler,
+  makeToolFailureAuditHandler,
 } from '../http/internalToolFailureAudit.js'
 
 const SECRET = 'a'.repeat(64)
 const TOKEN = `oc-v3.7.${SECRET}`
 const CTX = { hostUuid: 'host-1', boundIp: '172.31.0.7' }
+const NOW_MS = 1_750_000_000_000
 
 function repoFor(userId = 42): ContainerIdentityRepo {
   return {
@@ -50,7 +56,7 @@ function body(overrides: Partial<ToolFailureAuditBodyV1> = {}): ToolFailureAudit
     durationMs: 12,
     inputPreview: '{"cmd":"bad"}',
     outputPreview: 'failed',
-    timestamp: 123,
+    timestamp: NOW_MS - 3_000,
     ...overrides,
   }
 }
@@ -67,7 +73,57 @@ function bodyV2(overrides: Partial<ToolFailureAuditBodyV2> = {}): ToolFailureAud
     inputHash: 'a'.repeat(64),
     outputHash: 'b'.repeat(64),
     errorClass: 'file_not_found',
-    timestamp: 456,
+    timestamp: NOW_MS - 2_000,
+    ...overrides,
+  }
+}
+
+function bodyV3(overrides: Partial<ToolFailureAuditBodyV3> = {}): ToolFailureAuditBodyV3 {
+  return {
+    schemaVersion: 3,
+    eventId: 'evt-v3',
+    sessionKey: 'agent:codex:webchat:dm:sess3',
+    agentId: 'codex',
+    turnIndex: 5,
+    toolName: 'Bash',
+    durationMs: 23,
+    inputHash: 'c'.repeat(64),
+    outputHash: 'd'.repeat(64),
+    errorClass: 'command_not_found',
+    failureKind: 'process_exit',
+    exitCode: 127,
+    terminationReason: 'exit_code',
+    timestamp: NOW_MS - 1_000,
+    ...overrides,
+  }
+}
+
+function rollupBody(overrides: Partial<ToolCallRollupBody> = {}): ToolCallRollupBody {
+  return {
+    schemaVersion: 1,
+    reportId: '1'.repeat(32),
+    reporterRunId: '2'.repeat(32),
+    sequence: 1,
+    windowStartedAt: NOW_MS - 5 * 60_000,
+    windowEndedAt: NOW_MS,
+    counts: [
+      {
+        agentId: 'main',
+        toolName: 'Bash',
+        outcome: 'success',
+        errorClass: 'none',
+        failureKind: 'none',
+        count: 4,
+      },
+      {
+        agentId: 'main',
+        toolName: 'Bash',
+        outcome: 'failure',
+        errorClass: 'process_exit',
+        failureKind: 'process_exit',
+        count: 1,
+      },
+    ],
     ...overrides,
   }
 }
@@ -82,14 +138,21 @@ function makeReq(opts: { method?: string; auth?: string; body?: unknown }): Inco
   return req
 }
 
-function makeRes(): ServerResponse & { body: any } {
+function makeRes(): ServerResponse & { body: any; headers: Record<string, string | number> } {
   const res = {
     statusCode: 0,
     headers: {} as Record<string, string | number>,
-    setHeader(k: string, v: string | number) { this.headers[k.toLowerCase()] = v },
-    end(s?: string) { ;(this as any).body = s ? JSON.parse(s) : {} },
+    setHeader(k: string, v: string | number) {
+      this.headers[k.toLowerCase()] = v
+    },
+    end(s?: string) {
+      ;(this as any).body = s ? JSON.parse(s) : {}
+    },
   }
-  return res as unknown as ServerResponse & { body: any }
+  return res as unknown as ServerResponse & {
+    body: any
+    headers: Record<string, string | number>
+  }
 }
 
 function fakeResult(rows: any[] = []) {
@@ -131,7 +194,11 @@ describe('insertToolFailureAudit', () => {
     assert.equal(calls[1].params?.[5], createHash('sha256').update('failed').digest('hex'))
     assert.equal(calls[1].params?.[7], null)
 
-    const dupRunner: QueryRunner = { async query() { return fakeResult([{ id: '99' }]) } }
+    const dupRunner: QueryRunner = {
+      async query() {
+        return fakeResult([{ id: '99' }])
+      },
+    }
     assert.deepEqual(await insertToolFailureAudit(dupRunner, 42, body()), { duplicate: true })
   })
 
@@ -150,14 +217,77 @@ describe('insertToolFailureAudit', () => {
     assert.equal(calls[1].params?.[5], 'b'.repeat(64))
     assert.equal(calls[1].params?.[7], null)
   })
+
+  test('persists v3 bounded metadata without raw previews', async () => {
+    const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
+    const runner: QueryRunner = {
+      async query(sql, params) {
+        calls.push({ sql, params })
+        return fakeResult([])
+      },
+    }
+    assert.deepEqual(await insertToolFailureAudit(runner, 42, bodyV3()), { duplicate: false })
+    const meta = JSON.parse(String(calls[1].params?.[3]))
+    assert.deepEqual(meta, {
+      schema_version: 3,
+      event_id: 'evt-v3',
+      agent_id: 'codex',
+      turn_index: 5,
+      timestamp: NOW_MS - 1_000,
+      error_class: 'command_not_found',
+      failure_kind: 'process_exit',
+      exit_code: 127,
+      termination_reason: 'exit_code',
+    })
+    assert.equal(JSON.stringify(meta).includes('cmd'), false)
+    assert.equal(calls[1].params?.[7], null)
+    assert.equal(calls[1].params?.[8], NOW_MS - 1_000)
+  })
+})
+
+describe('insertToolCallRollup', () => {
+  test('uses one atomic CTE and derives user/container outside payload', async () => {
+    const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
+    const runner: QueryRunner = {
+      async query(sql, params) {
+        calls.push({ sql, params })
+        return fakeResult([{ inserted: true }])
+      },
+    }
+    assert.deepEqual(await insertToolCallRollup(runner, 42, 7, rollupBody()), { duplicate: false })
+    assert.equal(calls.length, 1)
+    assert.match(calls[0].sql, /WITH inserted_report AS/)
+    assert.match(calls[0].sql, /jsonb_to_recordset/)
+    assert.equal(calls[0].params?.[1], 42)
+    assert.equal(calls[0].params?.[2], 7)
+    assert.equal(String(calls[0].params?.[7]).includes('private'), false)
+
+    const duplicateRunner: QueryRunner = {
+      async query() {
+        return fakeResult([{ inserted: false }])
+      },
+    }
+    assert.deepEqual(await insertToolCallRollup(duplicateRunner, 42, 7, rollupBody()), {
+      duplicate: true,
+    })
+  })
 })
 
 describe('tool failure audit handler', () => {
   test('rejects missing bearer and non-POST', async () => {
-    const h = makeToolFailureAuditHandler({ identityRepo: repoFor(), queryRunner: { async query() { return fakeResult([]) } } })
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: {
+        async query() {
+          return fakeResult([])
+        },
+      },
+      now: () => NOW_MS,
+    })
     let res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, method: 'GET', body: body() }), res, CTX)
     assert.equal(res.statusCode, 405)
+    assert.equal(res.headers[TOOL_AUDIT_SCHEMA_HEADER.toLowerCase()], '3')
 
     res = makeRes()
     await h(makeReq({ body: body() }), res, CTX)
@@ -171,7 +301,11 @@ describe('tool failure audit handler', () => {
         return /SELECT/.test(sql) ? fakeResult(selectRows) : fakeResult([])
       },
     }
-    const h = makeToolFailureAuditHandler({ identityRepo: repoFor(99), queryRunner: runner })
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(99),
+      queryRunner: runner,
+      now: () => NOW_MS,
+    })
     let res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, body: body() }), res, CTX)
     assert.equal(res.statusCode, 200)
@@ -186,26 +320,214 @@ describe('tool failure audit handler', () => {
   })
 
   test('accepts privacy-safe v2 and rejects malformed hashes/categories', async () => {
-    const runner: QueryRunner = { async query() { return fakeResult([]) } }
-    const h = makeToolFailureAuditHandler({ identityRepo: repoFor(), queryRunner: runner })
+    const runner: QueryRunner = {
+      async query() {
+        return fakeResult([])
+      },
+    }
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: runner,
+      now: () => NOW_MS,
+    })
 
     let res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV2() }), res, CTX)
     assert.equal(res.statusCode, 200)
 
     res = makeRes()
-    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV2({ inputHash: 'raw-secret' }) }), res, CTX)
+    await h(
+      makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV2({ inputHash: 'raw-secret' }) }),
+      res,
+      CTX,
+    )
     assert.equal(res.statusCode, 400)
 
     res = makeRes()
-    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { ...bodyV2(), errorClass: 'free-form error' } }), res, CTX)
+    await h(
+      makeReq({ auth: `Bearer ${TOKEN}`, body: { ...bodyV2(), errorClass: 'free-form error' } }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+  })
+
+  test('accepts schema v3 and rejects unbounded structured metadata', async () => {
+    const runner: QueryRunner = {
+      async query() {
+        return fakeResult([])
+      },
+    }
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: runner,
+      now: () => NOW_MS,
+    })
+
+    let res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV3() }), res, CTX)
+    assert.equal(res.statusCode, 200)
+
+    res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV3({ exitCode: 256 }) }), res, CTX)
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: { ...bodyV3(), terminationReason: 'raw signal detail' },
+      }),
+      res,
+      CTX,
+    )
     assert.equal(res.statusCode, 400)
   })
 
   test('invalid body returns 400', async () => {
-    const h = makeToolFailureAuditHandler({ identityRepo: repoFor(), queryRunner: { async query() { return fakeResult([]) } } })
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: {
+        async query() {
+          return fakeResult([])
+        },
+      },
+      now: () => NOW_MS,
+    })
     const res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { schemaVersion: 1, eventId: '' } }), res, CTX)
+    assert.equal(res.statusCode, 400)
+  })
+
+  test('accepts queue-age/future-skew boundaries and rejects timestamps outside them', async () => {
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: { async query() { return fakeResult([]) } },
+      now: () => NOW_MS,
+    })
+    for (const timestamp of [NOW_MS - 25 * 60 * 60_000, NOW_MS + 10 * 60_000]) {
+      const res = makeRes()
+      await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV3({ timestamp }) }), res, CTX)
+      assert.equal(res.statusCode, 200)
+    }
+    for (const timestamp of [
+      NOW_MS - 25 * 60 * 60_000 - 1,
+      NOW_MS + 10 * 60_000 + 1,
+    ]) {
+      const res = makeRes()
+      await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV3({ timestamp }) }), res, CTX)
+      assert.equal(res.statusCode, 400)
+    }
+  })
+})
+
+describe('tool call rollup handler', () => {
+  test('accepts bounded counts and empty heartbeat, rejects raw/invalid shapes', async () => {
+    const runner: QueryRunner = {
+      async query() {
+        return fakeResult([{ inserted: true }])
+      },
+    }
+    const h = makeToolCallRollupHandler({
+      identityRepo: repoFor(99),
+      queryRunner: runner,
+      now: () => NOW_MS,
+    })
+
+    let res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: rollupBody() }), res, CTX)
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.duplicate, false)
+
+    res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: rollupBody({ counts: [] }) }), res, CTX)
+    assert.equal(res.statusCode, 200)
+
+    const maxCounts = Array.from({ length: 256 }, (_, index) => ({
+      agentId: 'main',
+      toolName: `Tool${index}`,
+      outcome: 'success' as const,
+      errorClass: 'none' as const,
+      failureKind: 'none' as const,
+      count: 1,
+    }))
+    res = makeRes()
+    await h(makeReq({ auth: `Bearer ${TOKEN}`, body: rollupBody({ counts: maxCounts }) }), res, CTX)
+    assert.equal(res.statusCode, 200)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: rollupBody({ counts: [...maxCounts, { ...maxCounts[0], toolName: 'overflow' }] }),
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: rollupBody({ counts: [maxCounts[0], { ...maxCounts[0] }] }),
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: {
+          ...rollupBody(),
+          counts: [{ ...rollupBody().counts[0], command: 'cat /private/path' }],
+        },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: {
+          ...rollupBody(),
+          counts: [{ ...rollupBody().counts[0], errorClass: 'other' }],
+        },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: rollupBody({ windowEndedAt: NOW_MS + 10 * 60_000 + 1 }),
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+
+    res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: rollupBody({
+          windowStartedAt: NOW_MS - 25 * 60 * 60_000 - 5 * 60_000 - 1,
+          windowEndedAt: NOW_MS - 25 * 60 * 60_000 - 1,
+        }),
+      }),
+      res,
+      CTX,
+    )
     assert.equal(res.statusCode, 400)
   })
 })

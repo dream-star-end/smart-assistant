@@ -27,6 +27,8 @@ import {
   type V3MasterSinkPayload,
 } from "../v3MasterSink.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
+import type { ToolCalledEvent } from "@openclaude/protocol";
+import { eventBus } from "../eventBus.js";
 
 function makeConfigStub(): OpenClaudeConfig {
   return {
@@ -188,6 +190,52 @@ function submitWithReplayLifecycle(
     { replayLifecycle: { clientMessageId, ...hooks } },
   );
 }
+
+describe("tool.called structured metadata", () => {
+  test("parser result metadata reaches the observability event unchanged", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const observed: ToolCalledEvent[] = [];
+    const listener = (event: ToolCalledEvent) => observed.push(event);
+    eventBus.on("tool.called", listener);
+    try {
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.msg({
+            type: "assistant",
+            message: {
+              content: [{ type: "tool_use", id: "failed-tool", name: "codex:mcpToolCall", input: {} }],
+            },
+          });
+          r.msg({
+            type: "user",
+            message: {
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "failed-tool",
+                  content: "bounded failure",
+                  is_error: true,
+                  termination_reason: "tool_error",
+                },
+              ],
+            },
+          });
+          r.result();
+        });
+      });
+      const session = makeSession(runner);
+      await runOneTurn(sm, session, events);
+    } finally {
+      eventBus.off("tool.called", listener);
+    }
+
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].toolName, "codex:mcpToolCall");
+    assert.equal(observed[0].isError, true);
+    assert.equal(observed[0].terminationReason, "tool_error");
+  });
+});
 
 // ── phantom 三态 ──────────────────────────────────────────────────────────
 

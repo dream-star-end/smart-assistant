@@ -214,7 +214,10 @@ import {
   decideSkillLocalRelay,
   SKILL_LOCAL_RELAY_PREFIX,
 } from './ocSkillLocalRelay.js'
-import { startToolFailureReporter } from './v3ToolFailureReporter.js'
+import {
+  startToolFailureReporter,
+  type ToolFailureReporter,
+} from './v3ToolFailureReporter.js'
 import {
   fetchUserSkillFeedbackRefs,
   startSkillUsageReporter,
@@ -1358,6 +1361,9 @@ export class Gateway {
    *  start(); called in shutdown stage 2 to cancel the periodic drain
    *  timer. null when v3 sink isn't configured (personal version). */
   private _stopV3RetryDrainer: (() => void) | null = null
+  /** Commercial tool telemetry stays subscribed through session drain, then
+   *  fsyncs its final aggregate batch before the process may exit. */
+  private _toolFailureReporter: ToolFailureReporter | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
   /** Host-controlled stale-image barrier: covers dispatch preprocessing. */
@@ -2077,8 +2083,8 @@ export class Gateway {
     // Start metrics collection (eventBus → prometheus counters)
     startMetricsCollection()
 
-    // Commercial container telemetry: failed tool calls → master agent_audit.
-    startToolFailureReporter()
+    // Commercial container telemetry: privacy-safe call rollups + failure rows.
+    this._toolFailureReporter = startToolFailureReporter()
 
     // Commercial container product signal: hub skill_view → master marketplace usage.
     // 默认开(OC_MARKET_SKILL_USAGE!='0');resolveTraceId 从活跃 session 读本 turn 的
@@ -2469,6 +2475,17 @@ export class Gateway {
     } catch (err) {
       this.log.warn('resume map flush error', undefined, err)
     }
+
+    // ── Stage 4.25: persist the final tool-call rollup ──
+    // Keep the reporter subscribed until every runner has stopped so late
+    // tool_result events are included. shutdown() atomically queues+fsyncs the
+    // final batch; HTTP delivery may resume from disk on the next boot.
+    try {
+      await this._toolFailureReporter?.shutdown()
+    } catch (err) {
+      this.log.warn('tool failure reporter shutdown error', undefined, err)
+    }
+    this._toolFailureReporter = null
 
     // ── Stage 4.5: clear v3 master sink singleton ──
     // shutdownAll above internally awaits awaitPendingPersistence(), so

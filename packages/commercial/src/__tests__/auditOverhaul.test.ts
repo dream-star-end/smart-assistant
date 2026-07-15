@@ -219,7 +219,14 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
     const tables = AUDIT_RETENTION_POLICIES.map((p) => p.table);
     assert.ok(!tables.includes("admin_audit"));
     assert.ok(PERMANENT_AUDIT_TABLES.includes("admin_audit"));
-    for (const t of ["security_events", "agent_audit", "compute_host_audit", "turn_traces", "rate_limit_events"]) {
+    for (const t of [
+      "security_events",
+      "agent_audit",
+      "agent_tool_rollup_reports",
+      "compute_host_audit",
+      "turn_traces",
+      "rate_limit_events",
+    ]) {
       assert.ok(tables.includes(t), `缺 retention 政策: ${t}`);
     }
   });

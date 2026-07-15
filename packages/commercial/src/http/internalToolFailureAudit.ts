@@ -8,20 +8,26 @@
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
+  type ToolFailureErrorClass,
+  type ToolFailureKind,
+  type ToolTerminationReason,
   classifyToolFailureError,
   isToolFailureErrorClass,
-  type ToolFailureErrorClass,
+  isToolFailureKind,
+  isToolTerminationReason,
 } from '@openclaude/protocol'
 
-import { rootLogger, type Logger } from '../logging/logger.js'
 import {
   ContainerIdentityError,
   type ContainerIdentityRepo,
   verifyContainerIdentity,
 } from '../auth/containerIdentity.js'
+import { type Logger, rootLogger } from '../logging/logger.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
+export const TOOL_CALL_ROLLUP_PATH = '/internal/v3/agent-audit/tool-rollup'
+export const TOOL_AUDIT_SCHEMA_HEADER = 'X-OpenClaude-Tool-Audit-Schema'
 
 /**
  * 遥测显式开关(与容器侧 v3ToolFailureReporter 同名 env,双端一致门控)。
@@ -35,7 +41,12 @@ export function isToolFailureAuditEnabled(env: NodeJS.ProcessEnv = process.env):
   return env.OC_TOOL_FAILURE_AUDIT === '1'
 }
 
-const MAX_BODY_BYTES = 32 * 1024
+// A rollup can contain at most 256 bounded dimensions. 512 KiB covers their
+// worst-case UTF-8 representation while keeping the authenticated endpoint
+// strictly memory-bounded; raw failure previews remain capped at 4 KiB each.
+const MAX_BODY_BYTES = 512 * 1024
+const REPORT_MAX_AGE_MS = 25 * 60 * 60 * 1000
+const REPORT_MAX_FUTURE_SKEW_MS = 10 * 60 * 1000
 
 interface ToolFailureAuditBase {
   eventId: string
@@ -60,7 +71,39 @@ export interface ToolFailureAuditBodyV2 extends ToolFailureAuditBase {
   errorClass: ToolFailureErrorClass
 }
 
-export type ToolFailureAuditBody = ToolFailureAuditBodyV1 | ToolFailureAuditBodyV2
+export interface ToolFailureAuditBodyV3 extends ToolFailureAuditBase {
+  schemaVersion: 3
+  inputHash?: string
+  outputHash?: string
+  errorClass: ToolFailureErrorClass
+  failureKind: ToolFailureKind
+  exitCode?: number
+  terminationReason?: ToolTerminationReason
+}
+
+export type ToolFailureAuditBody =
+  | ToolFailureAuditBodyV1
+  | ToolFailureAuditBodyV2
+  | ToolFailureAuditBodyV3
+
+export interface ToolCallRollupCountBody {
+  agentId: string
+  toolName: string
+  outcome: 'success' | 'failure'
+  errorClass: ToolFailureErrorClass | 'none'
+  failureKind: ToolFailureKind | 'none'
+  count: number
+}
+
+export interface ToolCallRollupBody {
+  schemaVersion: 1
+  reportId: string
+  reporterRunId: string
+  sequence: number
+  windowStartedAt: number
+  windowEndedAt: number
+  counts: ToolCallRollupCountBody[]
+}
 
 export interface ToolFailureAuditCtx {
   hostUuid: string
@@ -71,6 +114,7 @@ export interface ToolFailureAuditDeps {
   identityRepo: ContainerIdentityRepo
   queryRunner: QueryRunner
   logger?: Logger
+  now?: () => number
 }
 
 export interface QueryResultLike<Row = any> {
@@ -87,6 +131,8 @@ export type ToolFailureAuditHandler = (
   res: ServerResponse,
   ctx: ToolFailureAuditCtx,
 ) => Promise<void>
+
+export type ToolCallRollupHandler = ToolFailureAuditHandler
 
 function send(res: ServerResponse, status: number, body: unknown, requestId: string): void {
   res.statusCode = status
@@ -123,15 +169,34 @@ function requiredString(obj: Record<string, unknown>, key: string, max: number):
   return typeof v === 'string' && v.length > 0 && v.length <= max ? v : null
 }
 
-function optionalString(obj: Record<string, unknown>, key: string, max: number): string | undefined | null {
+function optionalString(
+  obj: Record<string, unknown>,
+  key: string,
+  max: number,
+): string | undefined | null {
   const v = obj[key]
   if (v === undefined) return undefined
   return typeof v === 'string' && v.length <= max ? v : null
 }
 
-function requiredInt(obj: Record<string, unknown>, key: string, min: number, max: number): number | null {
+function requiredInt(
+  obj: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number,
+): number | null {
   const v = obj[key]
-  return Number.isInteger(v) && (v as number) >= min && (v as number) <= max ? v as number : null
+  return Number.isInteger(v) && (v as number) >= min && (v as number) <= max ? (v as number) : null
+}
+
+function optionalInt(
+  obj: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number,
+): number | undefined | null {
+  if (obj[key] === undefined) return undefined
+  return requiredInt(obj, key, min, max)
 }
 
 const SHA256_RE = /^[0-9a-f]{64}$/
@@ -142,7 +207,14 @@ function optionalSha256(obj: Record<string, unknown>, key: string): string | und
   return typeof value === 'string' && SHA256_RE.test(value) ? value : null
 }
 
-function validateBody(raw: unknown): ToolFailureAuditBody | null {
+function reportTimeAccepted(timestamp: number, nowMs: number): boolean {
+  return (
+    timestamp >= nowMs - REPORT_MAX_AGE_MS &&
+    timestamp <= nowMs + REPORT_MAX_FUTURE_SKEW_MS
+  )
+}
+
+function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const obj = raw as Record<string, unknown>
   const commonAllowed = [
@@ -160,10 +232,20 @@ function validateBody(raw: unknown): ToolFailureAuditBody | null {
       ? [...commonAllowed, 'inputPreview', 'outputPreview']
       : obj.schemaVersion === 2
         ? [...commonAllowed, 'inputHash', 'outputHash', 'errorClass']
-        : commonAllowed,
+        : obj.schemaVersion === 3
+          ? [
+              ...commonAllowed,
+              'inputHash',
+              'outputHash',
+              'errorClass',
+              'failureKind',
+              'exitCode',
+              'terminationReason',
+            ]
+          : commonAllowed,
   )
   if (Object.keys(obj).some((k) => !allowed.has(k))) return null
-  if (obj.schemaVersion !== 1 && obj.schemaVersion !== 2) return null
+  if (obj.schemaVersion !== 1 && obj.schemaVersion !== 2 && obj.schemaVersion !== 3) return null
   const eventId = requiredString(obj, 'eventId', 128)
   const sessionKey = requiredString(obj, 'sessionKey', 512)
   const agentId = requiredString(obj, 'agentId', 128)
@@ -172,9 +254,16 @@ function validateBody(raw: unknown): ToolFailureAuditBody | null {
   const durationMs = requiredInt(obj, 'durationMs', 0, 24 * 60 * 60 * 1000)
   const timestamp = requiredInt(obj, 'timestamp', 0, Number.MAX_SAFE_INTEGER)
   if (
-    !eventId || !sessionKey || !agentId || !toolName ||
-    turnIndex === null || durationMs === null || timestamp === null
-  ) return null
+    !eventId ||
+    !sessionKey ||
+    !agentId ||
+    !toolName ||
+    turnIndex === null ||
+    durationMs === null ||
+    timestamp === null ||
+    !reportTimeAccepted(timestamp, nowMs)
+  )
+    return null
 
   const base = {
     eventId,
@@ -200,17 +289,181 @@ function validateBody(raw: unknown): ToolFailureAuditBody | null {
   const inputHash = optionalSha256(obj, 'inputHash')
   const outputHash = optionalSha256(obj, 'outputHash')
   const errorClass = obj.errorClass
+  if (inputHash === null || outputHash === null || !isToolFailureErrorClass(errorClass)) return null
+  if (obj.schemaVersion === 2) {
+    return {
+      schemaVersion: 2,
+      ...base,
+      ...(inputHash !== undefined ? { inputHash } : {}),
+      ...(outputHash !== undefined ? { outputHash } : {}),
+      errorClass,
+    }
+  }
+  const failureKind = obj.failureKind
+  const exitCode = optionalInt(obj, 'exitCode', 0, 255)
+  const terminationReason = obj.terminationReason
   if (
-    inputHash === null || outputHash === null ||
-    !isToolFailureErrorClass(errorClass)
-  ) return null
+    !isToolFailureKind(failureKind) ||
+    exitCode === null ||
+    (terminationReason !== undefined && !isToolTerminationReason(terminationReason))
+  )
+    return null
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     ...base,
     ...(inputHash !== undefined ? { inputHash } : {}),
     ...(outputHash !== undefined ? { outputHash } : {}),
     errorClass,
+    failureKind,
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(terminationReason !== undefined ? { terminationReason } : {}),
   }
+}
+
+const REPORT_ID_RE = /^[0-9a-f]{32}$/
+const MAX_ROLLUP_COUNTS = 256
+
+function validateRollupCount(raw: unknown): ToolCallRollupCountBody | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  const allowed = new Set(['agentId', 'toolName', 'outcome', 'errorClass', 'failureKind', 'count'])
+  if (Object.keys(obj).some((key) => !allowed.has(key))) return null
+  const agentId = requiredString(obj, 'agentId', 128)
+  const toolName = requiredString(obj, 'toolName', 128)
+  const count = requiredInt(obj, 'count', 1, 1_000_000)
+  const outcome = obj.outcome
+  const errorClass = obj.errorClass
+  const failureKind = obj.failureKind
+  if (!agentId || !toolName || count === null) return null
+  if (outcome !== 'success' && outcome !== 'failure') return null
+  if (outcome === 'success') {
+    if (errorClass !== 'none' || failureKind !== 'none') return null
+  } else if (!isToolFailureErrorClass(errorClass) || !isToolFailureKind(failureKind)) {
+    return null
+  }
+  return {
+    agentId,
+    toolName,
+    outcome,
+    errorClass: errorClass as ToolFailureErrorClass | 'none',
+    failureKind: failureKind as ToolFailureKind | 'none',
+    count,
+  }
+}
+
+function validateRollupBody(raw: unknown, nowMs: number): ToolCallRollupBody | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  const allowed = new Set([
+    'schemaVersion',
+    'reportId',
+    'reporterRunId',
+    'sequence',
+    'windowStartedAt',
+    'windowEndedAt',
+    'counts',
+  ])
+  if (Object.keys(obj).some((key) => !allowed.has(key))) return null
+  if (obj.schemaVersion !== 1) return null
+  const reportId = requiredString(obj, 'reportId', 32)
+  const reporterRunId = requiredString(obj, 'reporterRunId', 32)
+  const sequence = requiredInt(obj, 'sequence', 1, 2_147_483_647)
+  const windowStartedAt = requiredInt(obj, 'windowStartedAt', 0, Number.MAX_SAFE_INTEGER)
+  const windowEndedAt = requiredInt(obj, 'windowEndedAt', 0, Number.MAX_SAFE_INTEGER)
+  if (
+    !reportId ||
+    !REPORT_ID_RE.test(reportId) ||
+    !reporterRunId ||
+    !REPORT_ID_RE.test(reporterRunId) ||
+    sequence === null ||
+    windowStartedAt === null ||
+    windowEndedAt === null ||
+    windowEndedAt < windowStartedAt ||
+    windowEndedAt - windowStartedAt > 24 * 60 * 60 * 1000 ||
+    !reportTimeAccepted(windowEndedAt, nowMs) ||
+    !Array.isArray(obj.counts) ||
+    obj.counts.length > MAX_ROLLUP_COUNTS
+  )
+    return null
+  const counts: ToolCallRollupCountBody[] = []
+  const dimensions = new Set<string>()
+  for (const rawCount of obj.counts) {
+    const count = validateRollupCount(rawCount)
+    if (!count) return null
+    const key = JSON.stringify([
+      count.agentId,
+      count.toolName,
+      count.outcome,
+      count.errorClass,
+      count.failureKind,
+    ])
+    if (dimensions.has(key)) return null
+    dimensions.add(key)
+    counts.push(count)
+  }
+  return {
+    schemaVersion: 1,
+    reportId,
+    reporterRunId,
+    sequence,
+    windowStartedAt,
+    windowEndedAt,
+    counts,
+  }
+}
+
+export async function insertToolCallRollup(
+  runner: QueryRunner,
+  userId: number,
+  containerId: number,
+  body: ToolCallRollupBody,
+): Promise<{ duplicate: boolean }> {
+  const counts = body.counts.map((count) => ({
+    agent_id: count.agentId,
+    tool: count.toolName,
+    outcome: count.outcome,
+    error_class: count.errorClass,
+    failure_kind: count.failureKind,
+    call_count: count.count,
+  }))
+  const result = await runner.query<{ inserted: boolean }>(
+    `WITH inserted_report AS (
+       INSERT INTO agent_tool_rollup_reports(
+         report_id, user_id, container_id, reporter_run_id, sequence,
+         window_started_at, window_ended_at
+       ) VALUES (
+         $1,$2,$3,$4,$5,to_timestamp($6::double precision / 1000.0),
+         to_timestamp($7::double precision / 1000.0)
+       )
+       ON CONFLICT DO NOTHING
+       RETURNING report_id
+     ), inserted_counts AS (
+       INSERT INTO agent_tool_rollup_counts(
+         report_id, agent_id, tool, outcome, error_class, failure_kind, call_count
+       )
+       SELECT inserted_report.report_id, c.agent_id, c.tool, c.outcome,
+              c.error_class, c.failure_kind, c.call_count
+         FROM inserted_report
+         CROSS JOIN LATERAL jsonb_to_recordset($8::jsonb) AS c(
+           agent_id text, tool text, outcome text, error_class text,
+           failure_kind text, call_count integer
+         )
+       ON CONFLICT DO NOTHING
+       RETURNING 1
+     )
+     SELECT EXISTS(SELECT 1 FROM inserted_report) AS inserted`,
+    [
+      body.reportId,
+      userId,
+      containerId,
+      body.reporterRunId,
+      body.sequence,
+      body.windowStartedAt,
+      body.windowEndedAt,
+      JSON.stringify(counts),
+    ],
+  )
+  return { duplicate: result.rows[0]?.inserted !== true }
 }
 
 export async function insertToolFailureAudit(
@@ -224,15 +477,12 @@ export async function insertToolFailureAudit(
   )
   if ((existing.rowCount ?? existing.rows.length) > 0) return { duplicate: true }
 
-  const inputHash = body.schemaVersion === 2
-    ? body.inputHash ?? null
-    : sha256OrNull(body.inputPreview)
-  const outputHash = body.schemaVersion === 2
-    ? body.outputHash ?? null
-    : sha256OrNull(body.outputPreview)
-  const errorClass = body.schemaVersion === 2
-    ? body.errorClass
-    : classifyToolFailureError(body.outputPreview)
+  const inputHash =
+    body.schemaVersion === 1 ? sha256OrNull(body.inputPreview) : (body.inputHash ?? null)
+  const outputHash =
+    body.schemaVersion === 1 ? sha256OrNull(body.outputPreview) : (body.outputHash ?? null)
+  const errorClass =
+    body.schemaVersion === 1 ? classifyToolFailureError(body.outputPreview) : body.errorClass
   const inputMeta = {
     schema_version: body.schemaVersion,
     event_id: body.eventId,
@@ -240,12 +490,20 @@ export async function insertToolFailureAudit(
     turn_index: body.turnIndex,
     timestamp: body.timestamp,
     error_class: errorClass,
+    ...(body.schemaVersion === 3 ? { failure_kind: body.failureKind } : {}),
+    ...(body.schemaVersion === 3 && body.exitCode !== undefined
+      ? { exit_code: body.exitCode }
+      : {}),
+    ...(body.schemaVersion === 3 && body.terminationReason !== undefined
+      ? { termination_reason: body.terminationReason }
+      : {}),
   }
   await runner.query(
     `INSERT INTO agent_audit(
        user_id, session_id, tool, input_meta, input_hash, output_hash,
-       duration_ms, success, error_msg
-     ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,false,$8)`,
+       duration_ms, success, error_msg, occurred_at
+     ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,false,$8,
+               to_timestamp($9::double precision / 1000.0))`,
     [
       userId,
       body.sessionKey,
@@ -255,6 +513,7 @@ export async function insertToolFailureAudit(
       outputHash,
       body.durationMs,
       null,
+      body.timestamp,
     ],
   )
   return { duplicate: false }
@@ -262,6 +521,80 @@ export async function insertToolFailureAudit(
 
 export function makeToolFailureAuditHandler(deps: ToolFailureAuditDeps): ToolFailureAuditHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: 'internalToolFailureAudit' })
+  return async function handle(req, res, ctx) {
+    setSecurityHeaders(res)
+    // New runtimes use this on 400 to distinguish a current-master validation
+    // failure from an old master that only understands schema v2.
+    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '3')
+    const requestId = ensureRequestId(req)
+    res.setHeader(REQUEST_ID_HEADER, requestId)
+
+    if (req.method !== 'POST') {
+      send(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } }, requestId)
+      return
+    }
+
+    let identity: Awaited<ReturnType<typeof verifyContainerIdentity>>
+    try {
+      identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization)
+    } catch (err) {
+      if (err instanceof ContainerIdentityError) {
+        send(
+          res,
+          401,
+          { error: { code: 'UNAUTHORIZED', message: 'identity verification failed' } },
+          requestId,
+        )
+        return
+      }
+      throw err
+    }
+
+    let body: ToolFailureAuditBody
+    try {
+      const parsed = validateBody(await readJsonBody(req), deps.now?.() ?? Date.now())
+      if (!parsed) {
+        send(
+          res,
+          400,
+          { error: { code: 'INVALID_BODY', message: 'invalid tool failure body' } },
+          requestId,
+        )
+        return
+      }
+      body = parsed
+    } catch (err) {
+      const status = (err as any)?.statusCode === 413 ? 413 : 400
+      send(
+        res,
+        status,
+        { error: { code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INVALID_BODY' } },
+        requestId,
+      )
+      return
+    }
+
+    try {
+      const r = await insertToolFailureAudit(deps.queryRunner, identity.userId, body)
+      send(res, 200, { ok: true, duplicate: r.duplicate }, requestId)
+    } catch (err) {
+      log.error('failed to insert tool failure audit', {
+        userId: identity.userId,
+        eventId: body.eventId,
+        err: err instanceof Error ? err.message : String(err),
+      })
+      send(
+        res,
+        500,
+        { error: { code: 'INTERNAL', message: 'failed to record tool failure' } },
+        requestId,
+      )
+    }
+  }
+}
+
+export function makeToolCallRollupHandler(deps: ToolFailureAuditDeps): ToolCallRollupHandler {
+  const log = (deps.logger ?? rootLogger).child({ subsys: 'internalToolCallRollup' })
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res)
     const requestId = ensureRequestId(req)
@@ -277,36 +610,62 @@ export function makeToolFailureAuditHandler(deps: ToolFailureAuditDeps): ToolFai
       identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization)
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
-        send(res, 401, { error: { code: 'UNAUTHORIZED', message: 'identity verification failed' } }, requestId)
+        send(
+          res,
+          401,
+          { error: { code: 'UNAUTHORIZED', message: 'identity verification failed' } },
+          requestId,
+        )
         return
       }
       throw err
     }
 
-    let body: ToolFailureAuditBody
+    let body: ToolCallRollupBody
     try {
-      const parsed = validateBody(await readJsonBody(req))
+      const parsed = validateRollupBody(await readJsonBody(req), deps.now?.() ?? Date.now())
       if (!parsed) {
-        send(res, 400, { error: { code: 'INVALID_BODY', message: 'invalid tool failure body' } }, requestId)
+        send(
+          res,
+          400,
+          { error: { code: 'INVALID_BODY', message: 'invalid tool rollup body' } },
+          requestId,
+        )
         return
       }
       body = parsed
     } catch (err) {
       const status = (err as any)?.statusCode === 413 ? 413 : 400
-      send(res, status, { error: { code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INVALID_BODY' } }, requestId)
+      send(
+        res,
+        status,
+        { error: { code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INVALID_BODY' } },
+        requestId,
+      )
       return
     }
 
     try {
-      const r = await insertToolFailureAudit(deps.queryRunner, identity.userId, body)
-      send(res, 200, { ok: true, duplicate: r.duplicate }, requestId)
+      const result = await insertToolCallRollup(
+        deps.queryRunner,
+        identity.userId,
+        identity.containerId,
+        body,
+      )
+      send(res, 200, { ok: true, duplicate: result.duplicate }, requestId)
     } catch (err) {
-      log.error('failed to insert tool failure audit', {
+      log.error('failed to insert tool call rollup', {
         userId: identity.userId,
-        eventId: body.eventId,
+        containerId: identity.containerId,
+        reportId: body.reportId,
         err: err instanceof Error ? err.message : String(err),
       })
-      send(res, 500, { error: { code: 'INTERNAL', message: 'failed to record tool failure' } }, requestId)
+      send(
+        res,
+        500,
+        { error: { code: 'INTERNAL', message: 'failed to record tool rollup' } },
+        requestId,
+      )
     }
   }
 }

@@ -10,6 +10,7 @@
  * 政策取值:
  *   - security_events   180d  安全复盘窗口(半年足够;有告警面做实时性)
  *   - agent_audit        90d  工具失败遥测,排障价值随时间衰减
+ *   - agent_tool_rollup_reports 90d 工具成功/失败聚合;counts 由 FK 级联清理
  *   - compute_host_audit 90d  遥测已退出本表(0129),剩真实生命周期事件,量级小,
  *                             90d 覆盖"host 出事回看历史"场景
  *   - turn_traces        90d  请求ID→用户/会话反查,计费争议窗口内必须在
@@ -43,7 +44,8 @@ export interface RetentionPolicy {
 
 export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "security_events", column: "created_at", days: 180 },
-  { table: "agent_audit", column: "created_at", days: 90 },
+  { table: "agent_audit", column: "occurred_at", days: 90 },
+  { table: "agent_tool_rollup_reports", column: "created_at", days: 90 },
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
   { table: "rate_limit_events", column: "created_at", days: 30 },

@@ -16,6 +16,7 @@
 
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { AddressInfo } from "node:net";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
@@ -23,6 +24,7 @@ import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { signAccess } from "../auth/jwt.js";
 import {
+  getAgentAuditStats,
   listAgentAudit,
   AGENT_AUDIT_MAX_LIMIT,
 } from "../admin/agentAudit.js";
@@ -48,6 +50,8 @@ const COMMERCIAL_TABLES = [
   "rate_limit_events",
   "admin_audit",
   "agent_audit",
+  "agent_tool_rollup_counts",
+  "agent_tool_rollup_reports",
   "agent_containers",
   "agent_subscriptions",
   "user_preferences",
@@ -188,6 +192,7 @@ interface AgentAuditTestRow {
   duration_ms: number;
   success: boolean;
   error_msg: string | null;
+  occurred_at?: Date;
 }
 
 async function writeAgentAudit(
@@ -196,8 +201,8 @@ async function writeAgentAudit(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO agent_audit
-       (user_id, session_id, tool, input_meta, input_hash, output_hash, duration_ms, success, error_msg)
-     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9)`,
+       (user_id, session_id, tool, input_meta, input_hash, output_hash, duration_ms, success, error_msg, occurred_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, COALESCE($10, NOW()))`,
     [
       row.user_id,
       row.session_id,
@@ -208,6 +213,7 @@ async function writeAgentAudit(
       row.duration_ms,
       row.success,
       row.error_msg,
+      row.occurred_at ?? null,
     ],
   );
 }
@@ -231,6 +237,71 @@ async function insertAudit(
     success,
     error_msg: errorMsg,
   });
+}
+
+async function insertContainer(
+  uid: bigint,
+  runtimeChannel: "v3" | "v5" = "v5",
+  state: "active" | "vanished" = "active",
+): Promise<string> {
+  const result = await query<{ id: string }>(
+    `INSERT INTO agent_containers(user_id,secret_hash,state,runtime_channel)
+     VALUES ($1,$2,$3,$4) RETURNING id::text AS id`,
+    [uid.toString(), randomBytes(32), state, runtimeChannel],
+  );
+  return result.rows[0].id;
+}
+
+interface RollupCountInput {
+  agentId?: string;
+  tool: string;
+  outcome: "success" | "failure";
+  errorClass?: string;
+  failureKind?: string;
+  count: number;
+}
+
+async function insertRollup(input: {
+  userId: bigint;
+  containerId: string;
+  reporterRunId: string;
+  sequence: number;
+  counts: RollupCountInput[];
+  endedAt?: Date;
+}): Promise<void> {
+  const reportId = randomBytes(16).toString("hex");
+  const endedAt = input.endedAt ?? new Date();
+  await query(
+    `INSERT INTO agent_tool_rollup_reports(
+       report_id,user_id,container_id,reporter_run_id,sequence,
+       window_started_at,window_ended_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      reportId,
+      input.userId.toString(),
+      input.containerId,
+      input.reporterRunId,
+      input.sequence,
+      new Date(endedAt.getTime() - 5 * 60_000),
+      endedAt,
+    ],
+  );
+  for (const count of input.counts) {
+    await query(
+      `INSERT INTO agent_tool_rollup_counts(
+         report_id,agent_id,tool,outcome,error_class,failure_kind,call_count
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        reportId,
+        count.agentId ?? "main",
+        count.tool,
+        count.outcome,
+        count.errorClass ?? "none",
+        count.failureKind ?? "none",
+        count.count,
+      ],
+    );
+  }
 }
 
 // ============================================================
@@ -272,13 +343,13 @@ describe("listAgentAudit", () => {
   test("tool 过滤", async (t) => {
     if (skipIfNoPg(t)) return;
     const u1 = await createUser("t1@x.com");
-    await insertAudit(u1, "s1", "bash", true);
+    await insertAudit(u1, "s1", "codex:mcpToolCall", true);
     await insertAudit(u1, "s1", "read", true);
-    await insertAudit(u1, "s1", "bash", false, "boom");
+    await insertAudit(u1, "s1", "codex:mcpToolCall", false, "boom");
 
-    const r = await listAgentAudit({ tool: "bash" });
+    const r = await listAgentAudit({ tool: "codex:mcpToolCall" });
     assert.equal(r.rows.length, 2);
-    for (const row of r.rows) assert.equal(row.tool, "bash");
+    for (const row of r.rows) assert.equal(row.tool, "codex:mcpToolCall");
   });
 
   test("keyset 分页:limit=2 + before → 第二页", async (t) => {
@@ -336,6 +407,225 @@ describe("listAgentAudit", () => {
       () => listAgentAudit({ before: "-1" }),
       (err: unknown) => err instanceof RangeError && err.message === "invalid_before",
     );
+  });
+});
+
+// ============================================================
+//  getAgentAuditStats (aggregate rollups + failure-only rows)
+// ============================================================
+
+describe("getAgentAuditStats", () => {
+  test("computes reported-call rate and complete current-v5-fleet coverage", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u1 = await createUser("stats-1@x.com");
+    const u2 = await createUser("stats-2@x.com");
+    const c1 = await insertContainer(u1);
+    const c2 = await insertContainer(u2);
+    const run1 = "1".repeat(32);
+    const run2 = "2".repeat(32);
+    const now = new Date();
+    await insertRollup({
+      userId: u1,
+      containerId: c1,
+      reporterRunId: run1,
+      sequence: 1,
+      endedAt: new Date(now.getTime() - 4 * 60_000),
+      counts: [
+        { tool: "Bash", outcome: "success", count: 8 },
+        {
+          tool: "Bash",
+          outcome: "failure",
+          errorClass: "process_exit",
+          failureKind: "process_exit",
+          count: 2,
+        },
+      ],
+    });
+    await insertRollup({
+      userId: u1,
+      containerId: c1,
+      reporterRunId: run1,
+      sequence: 2,
+      endedAt: new Date(now.getTime() - 60_000),
+      counts: [{ tool: "Read", outcome: "success", count: 4 }],
+    });
+    await insertRollup({
+      userId: u2,
+      containerId: c2,
+      reporterRunId: run2,
+      sequence: 1,
+      endedAt: new Date(now.getTime() - 2 * 60_000),
+      counts: [{ tool: "Bash", outcome: "success", count: 2 }],
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+    await writeAgentAudit(pool, {
+      user_id: u1.toString(),
+      session_id: "stats-s1",
+      tool: "Bash",
+      input_meta: { error_class: "process_exit", failure_kind: "process_exit", exit_code: 2 },
+      input_hash: "a".repeat(64),
+      output_hash: "b".repeat(64),
+      duration_ms: 20,
+      success: false,
+      error_msg: null,
+      occurred_at: new Date(now.getTime() - 30_000),
+    });
+    await writeAgentAudit(pool, {
+      user_id: u1.toString(),
+      session_id: "stats-s2",
+      tool: "Bash",
+      input_meta: { error_class: "process_exit", failure_kind: "process_exit", exit_code: 1 },
+      input_hash: "c".repeat(64),
+      output_hash: "d".repeat(64),
+      duration_ms: 40,
+      success: false,
+      error_msg: null,
+      occurred_at: new Date(now.getTime() - 20_000),
+    });
+    await insertAudit(u1, "stats-success", "Bash", true);
+
+    const statsNow = new Date();
+    const stats = await getAgentAuditStats({ window: "24h", now: statsNow });
+    assert.deepEqual(stats.rollup, {
+      success_calls: 14,
+      failure_calls: 2,
+      total_calls: 16,
+      failure_rate: 0.125,
+    });
+    assert.deepEqual(
+      {
+        scope: stats.coverage.scope,
+        mode: stats.coverage.mode,
+        partial: stats.coverage.partial,
+        expected: stats.coverage.expected_containers,
+        covered: stats.coverage.covered_containers,
+      },
+      {
+        scope: "current_online_fleet",
+        mode: "best_effort",
+        partial: false,
+        expected: 2,
+        covered: 2,
+      },
+    );
+    assert.equal(stats.failures.events, 2);
+    assert.equal(stats.failures.affected_users, 1);
+    assert.deepEqual(stats.failures.groups[0], {
+      tool: "Bash",
+      error_class: "process_exit",
+      events: 2,
+      users: 1,
+      sessions: 2,
+      p50_ms: 30,
+      p95_ms: 39,
+    });
+
+    const bashOnly = await getAgentAuditStats({ window: "24h", tool: "Bash", now: statsNow });
+    assert.deepEqual(bashOnly.rollup, {
+      success_calls: 10,
+      failure_calls: 2,
+      total_calls: 12,
+      failure_rate: 1 / 6,
+    });
+    const userOnly = await getAgentAuditStats({ window: "24h", userId: u1, now: statsNow });
+    assert.equal(userOnly.rollup.total_calls, 14);
+    assert.equal(userOnly.coverage.expected_containers, 1);
+    assert.equal(userOnly.coverage.covered_containers, 1);
+  });
+
+  test("marks no-data and current-run sequence gaps as partial", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const empty = await getAgentAuditStats({ window: "1h" });
+    assert.equal(empty.rollup.failure_rate, null);
+    assert.equal(empty.coverage.partial, true);
+    assert.equal(empty.coverage.expected_containers, 0);
+
+    const v5User = await createUser("gap-v5@x.com");
+    const v3User = await createUser("gap-v3@x.com");
+    const vanishedUser = await createUser("gap-vanished@x.com");
+    const v5 = await insertContainer(v5User, "v5", "active");
+    await insertContainer(v3User, "v3", "active");
+    await insertContainer(vanishedUser, "v5", "vanished");
+    const run = "3".repeat(32);
+    const now = new Date();
+    await insertRollup({
+      userId: v5User,
+      containerId: v5,
+      reporterRunId: run,
+      sequence: 1,
+      endedAt: new Date(now.getTime() - 2 * 60_000),
+      counts: [],
+    });
+    await insertRollup({
+      userId: v5User,
+      containerId: v5,
+      reporterRunId: run,
+      sequence: 3,
+      endedAt: new Date(now.getTime() - 60_000),
+      counts: [],
+    });
+    const stats = await getAgentAuditStats({ window: "1h", now });
+    assert.equal(stats.coverage.expected_containers, 1);
+    assert.equal(stats.coverage.covered_containers, 0);
+    assert.equal(stats.coverage.partial, true);
+  });
+
+  test("uses bounded event-time windows for rollups, failure details, and coverage", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const user = await createUser("event-time@x.com");
+    const container = await insertContainer(user);
+    const run = "4".repeat(32);
+    const now = new Date();
+    await insertRollup({
+      userId: user,
+      containerId: container,
+      reporterRunId: run,
+      sequence: 1,
+      endedAt: new Date(now.getTime() - 60_000),
+      counts: [{ tool: "Bash", outcome: "success", count: 3 }],
+    });
+    await insertRollup({
+      userId: user,
+      containerId: container,
+      reporterRunId: run,
+      sequence: 2,
+      endedAt: new Date(now.getTime() + 5 * 60_000),
+      counts: [{ tool: "Bash", outcome: "failure", errorClass: "other", failureKind: "unknown", count: 9 }],
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+    for (const [session, occurredAt] of [
+      ["old-delayed", new Date(now.getTime() - 2 * 60 * 60_000)],
+      ["current", new Date(now.getTime() - 5 * 60_000)],
+      ["future", new Date(now.getTime() + 5 * 60_000)],
+    ] as const) {
+      await writeAgentAudit(pool, {
+        user_id: user.toString(),
+        session_id: session,
+        tool: "Bash",
+        input_meta: { error_class: "other" },
+        input_hash: null,
+        output_hash: null,
+        duration_ms: 10,
+        success: false,
+        error_msg: null,
+        occurred_at: occurredAt,
+      });
+    }
+
+    const stats = await getAgentAuditStats({ window: "1h", userId: user, now });
+    assert.deepEqual(stats.rollup, {
+      success_calls: 3,
+      failure_calls: 0,
+      total_calls: 3,
+      failure_rate: 0,
+    });
+    assert.equal(stats.failures.events, 1);
+    assert.equal(stats.failures.groups[0].sessions, 1);
+    assert.equal(stats.coverage.covered_containers, 1);
+
+    const rows = await listAgentAudit({ userId: user });
+    const current = rows.rows.find((row) => row.session_id === "current");
+    assert.equal(current?.created_at.toISOString(), new Date(now.getTime() - 5 * 60_000).toISOString());
   });
 });
 
@@ -566,5 +856,58 @@ describe("GET /api/admin/agent-audit (integ)", () => {
     const meta = rows[0].input_meta as Record<string, unknown>;
     assert.equal(meta.error_class, "command_not_found");
     assert.equal("input_preview" in meta, false);
+  });
+
+  test("stats endpoint requires admin and validates its bounded window", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const user = await createUser("stats-reader@x.com", "user");
+    const userToken = await signAccess({ sub: user.toString(), role: "user" }, JWT_SECRET);
+    const forbidden = await getJson("/api/admin/agent-audit/stats?window=24h", {
+      Authorization: `Bearer ${userToken.token}`,
+    });
+    assert.equal(forbidden.status, 403);
+
+    const admin = await createUser("stats-admin@x.com", "admin");
+    const adminToken = await signAccess({ sub: admin.toString(), role: "admin" }, JWT_SECRET);
+    const invalid = await getJson("/api/admin/agent-audit/stats?window=30d", {
+      Authorization: `Bearer ${adminToken.token}`,
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal((invalid.json.error as Record<string, unknown>).code, "VALIDATION");
+  });
+
+  test("stats endpoint returns explicit best-effort coverage semantics", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("stats-http-admin@x.com", "admin");
+    const user = await createUser("stats-http-user@x.com", "user");
+    const container = await insertContainer(user);
+    await insertRollup({
+      userId: user,
+      containerId: container,
+      reporterRunId: "4".repeat(32),
+      sequence: 1,
+      counts: [
+        { tool: "Bash", outcome: "success", count: 3 },
+        {
+          tool: "Bash",
+          outcome: "failure",
+          errorClass: "command_not_found",
+          failureKind: "process_exit",
+          count: 1,
+        },
+      ],
+    });
+    const adminToken = await signAccess({ sub: admin.toString(), role: "admin" }, JWT_SECRET);
+    const response = await getJson("/api/admin/agent-audit/stats?window=24h&tool=Bash", {
+      Authorization: `Bearer ${adminToken.token}`,
+    });
+    assert.equal(response.status, 200, JSON.stringify(response.json));
+    const rollup = response.json.rollup as Record<string, unknown>;
+    assert.equal(rollup.total_calls, 4);
+    assert.equal(rollup.failure_rate, 0.25);
+    const coverage = response.json.coverage as Record<string, unknown>;
+    assert.equal(coverage.scope, "current_online_fleet");
+    assert.equal(coverage.mode, "best_effort");
+    assert.equal(coverage.partial, false);
   });
 });

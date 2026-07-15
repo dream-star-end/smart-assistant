@@ -21,8 +21,10 @@ import { classifyToolFailureError, isToolFailureErrorClass } from "@openclaude/p
 import { HttpError, sendJson } from "./util.js";
 import { requireAdmin } from "../admin/requireAdmin.js";
 import {
+  getAgentAuditStats,
   listAgentAudit,
   AGENT_AUDIT_MAX_LIMIT,
+  type AgentAuditStatsWindow,
   type AgentAuditRowView,
 } from "../admin/agentAudit.js";
 import type { CommercialHttpDeps, RequestContext } from "./handlers.js";
@@ -103,4 +105,48 @@ export async function handleAdminAgentAudit(
     rows: result.rows.map(serializeRow),
     next_before: result.next_before,
   });
+}
+
+const STATS_WINDOWS = new Set<AgentAuditStatsWindow>(["1h", "24h", "7d"]);
+
+export async function handleAdminAgentAuditStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const sp = url.searchParams;
+  const windowRaw = sp.get("window") ?? "24h";
+  if (!STATS_WINDOWS.has(windowRaw as AgentAuditStatsWindow)) {
+    throw new HttpError(400, "VALIDATION", "window must be 1h, 24h, or 7d", {
+      issues: [{ path: "window", message: windowRaw }],
+    });
+  }
+  try {
+    const stats = await getAgentAuditStats({
+      window: windowRaw as AgentAuditStatsWindow,
+      userId: sp.get("user_id") || undefined,
+      tool: sp.get("tool") || undefined,
+    });
+    sendJson(res, 200, {
+      ...stats,
+      failures: {
+        ...stats.failures,
+        groups: stats.failures.groups.map((group) => ({
+          ...group,
+          error_class: isToolFailureErrorClass(group.error_class) ? group.error_class : "other",
+        })),
+      },
+    });
+  } catch (err) {
+    if (err instanceof RangeError) {
+      const path = err.message.replace(/^invalid_/, "");
+      throw new HttpError(400, "VALIDATION", `invalid ${path}`, {
+        issues: [{ path, message: sp.get(path) ?? "" }],
+      });
+    }
+    throw err;
+  }
 }
