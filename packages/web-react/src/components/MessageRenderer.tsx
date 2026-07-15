@@ -347,11 +347,13 @@ export function MessageList({
   /** 管理端等只读 surface；默认 false，用户端行为不变。 */
   readOnly?: boolean;
 }) {
-  // lossless tape 会把 runtime-event 原始帧一并水合进 messages,供精确留存/工具 tail 重放；
-  // 这些 messageKind=unknown 的行本来就不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
+  // 浏览器 chat 投影只会带净化后的 runtime checkpoint/tail patch；旧缓存仍可能含 raw
+  // runtime-event。两者都不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
   // reducer 会就地 mutation messages,这里故意每次 render 重算轻量投影,不以数组引用 memo。
   // 权威 messages 数组从不改写/过滤,持久化与逐字节原始记录仍完整保留。
-  const renderableMessages = messages.filter((m) => messageKind(m) !== "unknown");
+  const renderableMessages = messages.filter(
+    (m) => !m._historyProjection && messageKind(m) !== "unknown",
+  );
   // 溢出：默认只挂最近 LOAD_MORE_STEP 条**可见**消息,"加载更多历史"递增。
   const [visible, setVisible] = useState(LOAD_MORE_STEP);
   const total = renderableMessages.length;

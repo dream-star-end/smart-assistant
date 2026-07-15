@@ -38,6 +38,7 @@ import {
 } from "./model";
 import {
   applyServerIncremental,
+  applyHistoryProjectionPatches,
   mergeArchivedHistory,
   mergeFullServerWins,
   type StoredSession,
@@ -1634,6 +1635,7 @@ export class ChatSocket {
           return routing !== message._routing ? { ...message, _routing: routing } : message;
         })
       : [];
+    applyHistoryProjectionPatches(s.messages);
     s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
@@ -1710,7 +1712,7 @@ export class ChatSocket {
           archivedThroughSeq,
           archive?.completedClientMessageId,
         )
-      : applyServerIncremental(s.messages, msgs);
+      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId);
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
       s._archivedCount = archive.archivedCount;

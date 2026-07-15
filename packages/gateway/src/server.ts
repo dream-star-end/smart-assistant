@@ -3220,7 +3220,7 @@ export class Gateway {
       )
       // readArchivedMessages 直通:{ messages(升序), hasMore, oldestSeq }。storage 内部
       // 再 clamp limit;缺省/0 = 最新归档页(archived_through_seq+1 起)。
-      readArchivedMessages(sessId, userId, beforeSeq, limit)
+      readArchivedMessages(sessId, userId, beforeSeq, limit, { projection: 'chat' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
       return
@@ -3238,11 +3238,11 @@ export class Gateway {
         const sinceSeq = sinceRaw !== null ? Number(sinceRaw) : 0
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
-          getClientSessionPartial(sessId, userId, sinceSeq)
+          getClientSessionPartial(sessId, userId, sinceSeq, { projection: 'chat' })
             .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         } else {
-          getClientSession(sessId, userId)
+          getClientSession(sessId, userId, { projection: 'chat' })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
