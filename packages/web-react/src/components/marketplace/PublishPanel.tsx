@@ -6,6 +6,7 @@ import {
   type HumanMetaDraft,
   OUTCOMES_MAX,
   USE_CASES_MAX,
+  marketplaceArtifactKind,
   suggestSlug,
   validateHumanMeta,
 } from "../../lib/marketplace";
@@ -178,14 +179,14 @@ const TOOLSET_OPTIONS: { value: string; label: string; hint: string; locked?: bo
 ];
 
 /** 发布成功后的通用完成态。 */
-function DoneScreen({ onAgain, connector = false }: { onAgain: () => void; connector?: boolean }) {
+function DoneScreen({ onAgain, plugin = false }: { onAgain: () => void; plugin?: boolean }) {
   return (
     <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
       <CheckCircle2 size={32} className="text-success" />
       <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
       <p className="max-w-sm text-[12.5px] text-muted">
-        {connector
-          ? "连接器会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度可在「我的发布」查看。"
+        {plugin
+          ? "API 连接插件会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度会在市场内实时更新。"
           : "AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。审核进度可随时回到本页「我的发布」查看。"}
       </p>
       <Button variant="secondary" size="sm" onClick={onAgain}>
@@ -203,18 +204,34 @@ function DoneScreen({ onAgain, connector = false }: { onAgain: () => void; conne
 export function PublishPanel({
   auth,
   onCreateInChat,
+  publishes = null,
+  publishesLoading = false,
+  publishesError = null,
+  onRefreshPublishes = () => {},
+  onMutePublishTransition = () => {},
 }: {
   auth: AuthSession;
   /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
   onCreateInChat?: (kind: "skill" | "agent" | "connector") => void;
+  /** 市场顶层持有，确保切到发现/已安装时仍可继续追踪审核状态。 */
+  publishes?: MarketplaceMyPublish[] | null;
+  publishesLoading?: boolean;
+  publishesError?: string | null;
+  onRefreshPublishes?: () => void;
+  onMutePublishTransition?: (versionId: string, muted: boolean) => void;
 }) {
   const [kind, setKind] = useState<"skill" | "agent" | "connector">("skill");
-  const [publishReload, setPublishReload] = useState(0);
-  const bump = () => setPublishReload((n) => n + 1);
 
   return (
     <div className="flex flex-col gap-4 px-4 py-4">
-      <MyPublishes auth={auth} reload={publishReload} />
+      <MyPublishes
+        auth={auth}
+        rows={publishes}
+        loading={publishesLoading}
+        error={publishesError}
+        onRefresh={onRefreshPublishes}
+        onMuteTransition={onMutePublishTransition}
+      />
 
       <div className="flex gap-1">
         {(["skill", "agent", "connector"] as const).map((k) => (
@@ -227,7 +244,7 @@ export function PublishPanel({
               kind === k ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
-            {k === "skill" ? "发布技能" : k === "agent" ? "发布智能体" : "发布连接器"}
+            {k === "skill" ? "发布技能" : k === "agent" ? "发布智能体" : "发布插件"}
           </button>
         ))}
       </div>
@@ -244,7 +261,7 @@ export function PublishPanel({
           <span className="min-w-0 flex-1">
             <span className="block text-[13.5px] font-semibold text-fg">
               在对话中创建
-              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : "连接器"}(推荐)
+              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : " API 连接插件"}(推荐)
             </span>
             <span className="mt-0.5 block text-[12px] leading-snug text-muted">
               回答几个选择题,AI 帮你完成起草、创建
@@ -260,11 +277,11 @@ export function PublishPanel({
       )}
 
       {kind === "skill" ? (
-        <SkillPublishForm auth={auth} onPublished={bump} />
+        <SkillPublishForm auth={auth} onPublished={onRefreshPublishes} />
       ) : kind === "agent" ? (
-        <AgentPublishForm auth={auth} onPublished={bump} />
+        <AgentPublishForm auth={auth} onPublished={onRefreshPublishes} />
       ) : (
-        <ConnectorPublishForm auth={auth} onPublished={bump} />
+        <ConnectorPublishForm auth={auth} onPublished={onRefreshPublishes} />
       )}
     </div>
   );
@@ -551,7 +568,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
       <div>
         <div className="mb-1.5 flex items-center justify-between">
           <span className="text-[12px] font-medium text-muted">
-            附属文件（references/ assets/ evals/ scripts/,可选;脚本会被危险模式扫描并逐行人审）
+            附属文件（references/ assets/ evals/ scripts/,可选；脚本会先做危险模式扫描，有风险信号时转人工复核）
           </span>
           <Button
             variant="ghost"
@@ -967,7 +984,7 @@ function ConnectorPublishForm({
   onPublished,
 }: { auth: AuthSession; onPublished: () => void }) {
   const [version, setVersion] = useState("1.0.0");
-  const [tags, setTags] = useState("连接器");
+  const [tags, setTags] = useState("API 插件");
   const [specJson, setSpecJson] = useState("");
   const [decisionJson, setDecisionJson] = useState("");
   const [meta, setMeta] = useState<HumanMetaDraft>(emptyHumanMeta());
@@ -977,7 +994,7 @@ function ConnectorPublishForm({
 
   const reset = () => {
     setVersion("1.0.0");
-    setTags("连接器");
+    setTags("API 插件");
     setSpecJson("");
     setDecisionJson("");
     setMeta(emptyHumanMeta());
@@ -1024,18 +1041,18 @@ function ConnectorPublishForm({
       setOk(true);
       onPublished();
     } catch (e) {
-      setErr(apiErrorMessage(e, "发布连接器失败，请检查技术声明与安全决策。"));
+      setErr(apiErrorMessage(e, "发布 API 连接插件失败，请检查技术声明与安全决策。"));
     } finally {
       setSubmitting(false);
     }
   };
 
-  if (ok) return <DoneScreen connector onAgain={reset} />;
+  if (ok) return <DoneScreen plugin onAgain={reset} />;
   return (
     <div className="flex flex-col gap-3.5">
-      <Alert tone="info" title="技术发布 · AI 自动审核">
-        发布者填写的安全决策只是审核建议。AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
-        通过后编译并签名上架，用户绑定时再由身份探针验证真实凭据；不确定或高风险项转人工复核。OAuth2 社区连接器必须使用 BYOA。
+      <Alert tone="info" title="API 连接插件 · AI 自动审核">
+        当前支持无需运行自定义代码的声明式 API 连接插件。发布者填写的安全决策只是审核建议；AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
+        通过后编译并签名上架，用户绑定时再由身份探针验证真实凭据；不确定或高风险项转人工复核。OAuth2 社区插件必须自带 OAuth 应用（BYOA）。
       </Alert>
       {err && <Alert tone="danger">{err}</Alert>}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -1046,17 +1063,17 @@ function ConnectorPublishForm({
           <Input
             value={tags}
             onChange={(e) => setTags(e.target.value)}
-            placeholder="连接器, 文档"
+            placeholder="API 插件, 文档"
           />
         </Field>
       </div>
-      <Field label="ConnectorSpec JSON（必须含 id、identity 与 actions）">
+      <Field label="插件 ConnectorSpec JSON（必须含 id、identity 与 actions）">
         <Textarea
           value={specJson}
           onChange={(e) => setSpecJson(e.target.value)}
           rows={15}
           className="font-mono text-[12px]"
-          placeholder={'{"id":"my-connector","label":"我的连接器",…}'}
+          placeholder={'{"id":"my-plugin","label":"我的 API 插件",…}'}
         />
       </Field>
       <Field label="发布者建议的 SecurityDecision JSON">
@@ -1081,24 +1098,25 @@ function ConnectorPublishForm({
   );
 }
 
-function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
-  const [rows, setRows] = useState<MarketplaceMyPublish[] | null>(null);
+function MyPublishes({
+  auth,
+  rows,
+  loading,
+  error,
+  onRefresh,
+  onMuteTransition,
+}: {
+  auth: AuthSession;
+  rows: MarketplaceMyPublish[] | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onMuteTransition: (versionId: string, muted: boolean) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const [actionReload, setActionReload] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [confirmDialog, confirmEl] = useConfirm();
-
-  useEffect(() => {
-    let alive = true;
-    api
-      .listMarketplaceMyPublishes(auth)
-      .then((r) => alive && setRows(r))
-      .catch(() => alive && setRows([]));
-    return () => {
-      alive = false;
-    };
-  }, [auth, reload, actionReload]);
 
   const withdraw = async (r: MarketplaceMyPublish) => {
     const ok = await confirmDialog({
@@ -1110,10 +1128,13 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
     if (!ok) return;
     setBusyId(`withdraw:${r.versionId}`);
     setActionErr(null);
+    // 用户主动撤销不是审核拒绝，不应弹出“未通过审核”的自动通知。
+    onMuteTransition(r.versionId, true);
     try {
       await api.withdrawMarketplacePublish(auth, r.versionId);
-      setActionReload((n) => n + 1);
+      onRefresh();
     } catch (e) {
+      onMuteTransition(r.versionId, false);
       setActionErr(apiErrorMessage(e, "撤销发布失败"));
     } finally {
       setBusyId(null);
@@ -1132,7 +1153,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
     setActionErr(null);
     try {
       await api.unlistMarketplaceListing(auth, r.slug);
-      setActionReload((n) => n + 1);
+      onRefresh();
     } catch (e) {
       setActionErr(apiErrorMessage(e, "下架失败"));
     } finally {
@@ -1140,7 +1161,15 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
     }
   };
 
-  if (!rows || rows.length === 0) return null;
+  if (loading && !rows) {
+    return (
+      <div className="flex items-center gap-2 text-[12px] text-faint">
+        <Loader2 size={13} className="animate-spin" /> 正在同步审核状态…
+      </div>
+    );
+  }
+  if ((!rows || rows.length === 0) && !error) return null;
+  if (!rows || rows.length === 0) return <Alert tone="danger">{error}</Alert>;
   const pending = rows.filter((r) => r.status === "pending").length;
   const rejected = rows.filter((r) => r.status === "rejected").length;
 
@@ -1164,6 +1193,11 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
       </button>
       {open && (
         <ul className="flex flex-col border-t border-border">
+          {error && (
+            <li className="border-b border-border px-3.5 py-2.5">
+              <Alert tone="danger">{error}</Alert>
+            </li>
+          )}
           {actionErr && (
             <li className="border-b border-border px-3.5 py-2.5">
               <Alert tone="danger">{actionErr}</Alert>
@@ -1191,7 +1225,9 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
                   <span className="text-[13px] font-medium text-fg">{r.name}</span>
                   <Badge tone="neutral">v{r.version}</Badge>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
-                  {r.kind === "connector" && <Badge tone="info">连接器</Badge>}
+                  {marketplaceArtifactKind(r) === "plugin" && (
+                    <Badge tone="info">API 插件</Badge>
+                  )}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
                   {r.status === "approved" && !r.isCurrent && !revoked && !unlisted && (
                     <Badge tone="neutral">已被新版本取代</Badge>

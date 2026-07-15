@@ -8,6 +8,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+import { marketplaceArtifactCompatibility } from '@openclaude/protocol'
 import {
   cleanSkillQuery,
   cosineSim,
@@ -48,6 +49,8 @@ function toCard(c: ApprovedSearchRow): {
   usage30d: number
   users30d: number
   rating: { up: number; down: number } | null
+  artifactKind: 'skill' | 'agent' | 'plugin'
+  pluginType?: 'declarative-http'
   official?: boolean
   preinstalled?: boolean
 } {
@@ -72,6 +75,7 @@ function toCard(c: ApprovedSearchRow): {
     usage30d: c.usage30d,
     users30d: c.users30d,
     rating: c.rating,
+    ...marketplaceArtifactCompatibility(c.kind),
     ...(official ? { official: true, preinstalled: true } : {}),
   }
 }

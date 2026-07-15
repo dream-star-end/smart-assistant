@@ -8,6 +8,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+import { marketplaceArtifactCompatibility } from '@openclaude/protocol'
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 
@@ -578,7 +579,9 @@ export async function handleMarketplaceInstall(
       note:
         detail?.kind === 'agent'
           ? `已安装,将在你的下一次会话中可选用${installedDeps ? `（含 ${installedDeps} 个依赖技能）` : ''}。`
-          : '已安装,将在你的下一次会话中对 AI 可用。',
+          : detail?.kind === 'connector'
+            ? 'API 连接插件已安装；绑定应用账号后即可使用。'
+            : '已安装,将在你的下一次会话中对 AI 可用。',
     })
   } catch (e) {
     throw mapMarketplaceError(e)
@@ -596,7 +599,9 @@ export async function handleMarketplaceInstalled(
   // 在「已安装」里露出只会引导出没有意义的卸载/更新操作。
   const presetSet = new Set(await platformPresetAgentSlugs())
   const rows = (await listInstalled(uid(user))).filter((r) => !presetSet.has(r.slug))
-  sendJson(res, 200, { installed: rows })
+  sendJson(res, 200, {
+    installed: rows.map((row) => ({ ...row, ...marketplaceArtifactCompatibility(row.kind) })),
+  })
 }
 
 // ── PATCH /api/marketplace/installed/:slug ────────────────────────────────
@@ -630,7 +635,13 @@ export async function handleMarketplaceMyPublishes(
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
-  sendJson(res, 200, { publishes: await listMyPublishes(uid(user)) })
+  const publishes = await listMyPublishes(uid(user))
+  sendJson(res, 200, {
+    publishes: publishes.map((row) => ({
+      ...row,
+      ...marketplaceArtifactCompatibility(row.kind),
+    })),
+  })
 }
 
 // ── POST /api/marketplace/my-publishes/:id/withdraw ───────────────────────
@@ -699,7 +710,8 @@ export async function handleMarketplaceDetail(
     throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
   // 平台预设标记(加法字段):前端据此显示「开箱即用」而非安装按钮。
   const preset = detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(slug)
-  sendJson(res, 200, { detail: preset ? { ...detail, preset: true } : detail })
+  const publicDetail = { ...detail, ...marketplaceArtifactCompatibility(detail.kind) }
+  sendJson(res, 200, { detail: preset ? { ...publicDetail, preset: true } : publicDetail })
 }
 
 // ── DELETE /api/marketplace/installed/:slug ────────────────────────────────
