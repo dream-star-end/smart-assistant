@@ -8,7 +8,7 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/ccbBaselineSkills.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { readdirSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
@@ -34,5 +34,16 @@ describe('ccb-baseline skills ↔ manifest', () => {
 
   it('includes the market skill (AI marketplace ops)', () => {
     assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('market'))
+  })
+
+  it('ships the connector authoring workflow with its authority and safety gates', () => {
+    assert.ok(
+      (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('connector-authoring'),
+    )
+    const body = readFileSync(join(skillsDir, 'connector-authoring', 'SKILL.md'), 'utf8')
+    assert.match(body, /oc-market publish-connector --examples/)
+    assert.match(body, /--security-decision-file/)
+    assert.match(body, /不得[^。]*真实密码/)
+    assert.match(body, /确认/)
   })
 })
