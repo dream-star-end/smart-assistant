@@ -19,6 +19,7 @@ export function Modal({
   className,
   bodyClassName,
   hideClose,
+  onEscapeKeyDown,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -31,6 +32,8 @@ export function Modal({
   /** 内容区附加类；大尺寸对话查看器可用来接管 padding/滚动容器。 */
   bodyClassName?: string;
   hideClose?: boolean;
+  /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
+  onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
 }) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
@@ -40,6 +43,7 @@ export function Modal({
         <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
+          onEscapeKeyDown={onEscapeKeyDown}
           className={cn(
             "fixed left-1/2 top-1/2 z-50 flex max-h-[88vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-float outline-none data-[state=open]:animate-in",
             className,
