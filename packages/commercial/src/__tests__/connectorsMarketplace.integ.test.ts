@@ -563,6 +563,59 @@ describe('v5 connector marketplace', () => {
     )
   })
 
+  test('插件账号管理只聚合 connector 安装，不混入已安装 Skill', async (t) => {
+    if (skipIfNoDb(t)) return
+    const owner = await createUser()
+    const reviewer = await createUser('admin')
+    const user = await createUser()
+    const connectorSlug = `management-plugin-${Date.now() % 1_000_000}`
+    const connector = await publishApproved({
+      ownerUserId: owner,
+      reviewerUserId: reviewer,
+      slug: connectorSlug,
+    })
+    await installApprovedVersion({ userId: user, versionId: connector.versionId })
+
+    const skillSlug = `management-skill-${Date.now() % 1_000_000}`
+    const rawSkillMd = '# Management Skill\n\nThis is an installed Skill, not a Plugin.'
+    const skill = await publishSkillVersion({
+      slug: skillSlug,
+      ownerUserId: owner,
+      version: '1.0.0',
+      name: 'Management Skill',
+      description: 'Must stay out of Plugin account management',
+      tags: ['skill'],
+      rawSkillMd,
+      artifactHash: marketplaceArtifactHash(rawSkillMd),
+      embeddingHash: skillContentHash({
+        name: 'Management Skill',
+        description: 'Must stay out of Plugin account management',
+        tags: ['skill'],
+      }),
+      riskFlags: [],
+      policyVersion: 1,
+      submittedBy: owner,
+      kind: 'skill',
+      queueAiReview: false,
+    })
+    await reviewVersion({ versionId: skill.versionId, reviewerUserId: reviewer, approve: true })
+    await installApprovedVersion({ userId: user, versionId: skill.versionId })
+
+    const installedSkill = (await listInstalled(user)).find((row) => row.slug === skillSlug)
+    assert.equal(installedSkill?.kind, 'skill', 'Skill 安装本身必须保留在市场安装列表')
+
+    const management = await listDeclarativeManagement(getPool(), user)
+    assert.equal(
+      management.connectors.some((row) => row.slug === skillSlug),
+      false,
+      '非 connector 安装不能伪装成不可用 Plugin 账号卡片',
+    )
+    const installedConnector = management.connectors.find((row) => row.slug === connectorSlug)
+    assert.ok(installedConnector)
+    assert.equal(installedConnector.installation, 'marketplace')
+    assert.equal(installedConnector.canBind, true)
+  })
+
   test('连接器 AI approve：声明式验证、签名、审计与不可登录系统 reviewer 原子落地', async (t) => {
     if (skipIfNoDb(t)) return
     const owner = await createUser()
