@@ -764,7 +764,6 @@ describe("provisionV3Container", () => {
         !binds.some((b) => b.includes(":/run/oc/codex-auth:")),
         `v5 容器不得挂共享 codex auth fallback,got: ${JSON.stringify(binds)}`,
       );
-      const env = captured.containersCreated[0]?.Env ?? [];
       assert.ok(env.includes("OPENCLAUDE_USER_SKILLS_DIR=/home/agent/.openclaude/skills"));
       assert.ok(env.includes("USE_BUILTIN_RIPGREP=0"));
     } finally {
