@@ -73,8 +73,10 @@ export function useAdminAuth(): AdminAuthState {
 
   useEffect(() => {
     const controller = new AbortController();
-    const bootEpoch = adminSession.beginIdentity();
-    void cancelAuthRefresh(adminSession);
+    // 启动只消费当前身份代次，不另开身份边界，也不取消共享 refresh。React StrictMode
+    // 会 setup → cleanup → setup 重放 effect；两次消费者因此绑定同一 epoch/singleflight，
+    // 不会在首个响应已旋转 cookie 后再拿旧 cookie 发第二次 refresh。
+    const bootEpoch = adminSession.snapshot().epoch;
     onSessionExpired = () => {
       if (controller.signal.aborted) return;
       setUser(null);
