@@ -15,7 +15,7 @@ const TABS: { id: ManageTab; label: string; featureId: ProductFeatureId }[] = [
   { id: "memory", label: "记忆", featureId: PRODUCT_CAPABILITIES.memory.id },
   { id: "cron", label: "定时任务", featureId: PRODUCT_CAPABILITIES.schedules.id },
   { id: "skills", label: "技能", featureId: PRODUCT_CAPABILITIES.skills.id },
-  { id: "connectors", label: "连接器", featureId: PRODUCT_CAPABILITIES.connectors.id },
+  { id: "connectors", label: "插件账号", featureId: PRODUCT_CAPABILITIES.connectors.id },
   { id: "library", label: "文献库", featureId: PRODUCT_CAPABILITIES.research.id },
 ];
 

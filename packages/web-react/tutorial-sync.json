@@ -37,13 +37,13 @@
       "sourceHash": "59c6a51c2e750f33fab81365c7ec3d3b65e5185447e35a30d0a920db13d9f2ea"
     },
     "connectors": {
-      "contentHash": "4f3cd353aebd848f5941785facc9b2f8044906a577330ee51f524bafe37d43cc",
-      "contentVersion": 2,
+      "contentHash": "4aacc3aee18691c0d57b3896db678f6bbbdf3af64829c91c1e44ff4c07155e83",
+      "contentVersion": 3,
       "mediaHash": "21341baac82984bc62506d5c70f5a2b428aaea3a4392681430539d5f40fd21dc",
       "mediaKey": "connectors",
       "mediaVersion": 3,
-      "registryHash": "71d77d4310244f01fe3e4626d4145096bcb96dea4bf26311d0f326aebc875ccc",
-      "sourceHash": "4262605dd8e69c22609a58cf50abe5ee40e1fb49b3ec98c6a875b4e39df6ad79"
+      "registryHash": "fd49bde8c06c8e027adaa51880b2168b150e8f2aa1384b65579c431e059b5b0c",
+      "sourceHash": "3cccd0c9edcfb49494faa6267721a26cb7aeb7f187c8fdf6e7b8b346149c146d"
     },
     "container-web-preview": {
       "contentHash": "6fc7701a30aaaaf5eda9948967773aa410e9f50cdc65e36d048ed2a2113058e5",
@@ -100,22 +100,22 @@
       "sourceHash": "357a2121827c4db1b9fc12dd4fcd924d9792b96e872f77ee83f375a8b1dca26a"
     },
     "marketplace-discovery": {
-      "contentHash": "0b9c57107890ba0aac2a0d6e2e5333fed83e788f8d9a298e15f9342e92bb1aad",
-      "contentVersion": 2,
+      "contentHash": "414203beaf81ed85661ecc3ce0eede57b1ef7d4af8336d76d76c90dfbee9d7c4",
+      "contentVersion": 3,
       "mediaHash": "952b9f8d6f58d93a7604736b20b83e4482aa0e9e332235c51463c2a209e21f16",
       "mediaKey": "marketplace-discovery",
       "mediaVersion": 2,
-      "registryHash": "f0d6cab99cf8e5d4d6c0d6a31a71644f6561131a682a9d2d7f3765fe5106674b",
-      "sourceHash": "4000672be25a6932fc4d3ca631b8e1de240a2c30f3b3d4534680679a6743467d"
+      "registryHash": "3683e9974a0d66165d7669357b196eec3e0466ced48f8f4ba8c93e582803ddc8",
+      "sourceHash": "320a260d7a9eb847f1343df7deb7ab1c00709d908d16026db13ac2fb88674a46"
     },
     "marketplace-publishing": {
-      "contentHash": "441086e608ce2e218f1de2d0f3d205beb59ba7ca057fa84f51e958cb79266672",
-      "contentVersion": 2,
+      "contentHash": "061da931977e26ad137107c676fc8e3234f3f8b250b1359e63ec284227d0faec",
+      "contentVersion": 3,
       "mediaHash": "a82a0ce0066876b1e9c84fd8689105f5a71d74952ba94631231d993a272c158a",
       "mediaKey": "marketplace-publishing",
       "mediaVersion": 3,
-      "registryHash": "15579d20598d9c879cf2f42b9258ee8229fbd1bcc7993be389e27982f8346ca4",
-      "sourceHash": "95c850c052a279d4da55436b40a7b6846f6f39a494f573a91171c7b9e7de4e0f"
+      "registryHash": "320736016d2df608f90bc4d6f25325519cd203ffb8133b0e3985ea2bc2984896",
+      "sourceHash": "61c6247fc88f036e7ff86a75a8cd4b310a4f8f5ac664def5130a194e6cb12ae0"
     },
     "memory-auto-dream": {
       "contentHash": "273c90b8279e25138ccd2f58b5001015f9c0e29e189b5c46da2e67cdde9c5ccc",

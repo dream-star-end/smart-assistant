@@ -12,6 +12,17 @@ vi.mock("../../lib/api", () => ({
     listMarketplaceInstalled: (...a: unknown[]) => listMarketplaceInstalled(...a),
   },
 }));
+vi.mock("./DetailModal", () => ({
+  DetailModal: ({ slug, onClose }: { slug: string | null; onClose: () => void }) =>
+    slug ? (
+      <div data-testid="detail-slug">
+        {slug}
+        <button type="button" onClick={onClose}>
+          关闭详情
+        </button>
+      </div>
+    ) : null,
+}));
 
 import { BrowsePanel } from "./BrowsePanel";
 
@@ -197,4 +208,60 @@ test("AI 导购入口:未传 onAskAiInChat → 即便有查询词也不渲染操
   fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "翻译" } });
   await screen.findByText("翻译技能");
   expect(screen.queryByRole("button", { name: /让 AI 帮我找并装好/ })).not.toBeInTheDocument();
+});
+
+test("审核 revision 变化与窗口重新聚焦都会重新拉取目录", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  const view = render(<BrowsePanel auth={auth} revision={0} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+  expect(searchMarketplace).toHaveBeenCalledTimes(1);
+
+  view.rerender(<BrowsePanel auth={auth} revision={1} />);
+  await waitFor(() => expect(searchMarketplace).toHaveBeenCalledTimes(2));
+
+  window.dispatchEvent(new Event("focus"));
+  await waitFor(() => expect(searchMarketplace).toHaveBeenCalledTimes(3));
+});
+
+test("审核通过 CTA 的 focusRequest 可直接打开新上架条目", async () => {
+  searchMarketplace.mockResolvedValue({ results: [], method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  const onConsumed = vi.fn();
+
+  const view = render(
+    <BrowsePanel
+      auth={auth}
+      kind="connector"
+      focusRequest={{ slug: "docs-plugin", nonce: 1 }}
+      onFocusRequestConsumed={onConsumed}
+    />,
+  );
+
+  expect(await screen.findByTestId("detail-slug")).toHaveTextContent("docs-plugin");
+  expect(onConsumed).toHaveBeenCalledWith(1);
+  expect(screen.getByPlaceholderText(/搜索插件/)).toBeInTheDocument();
+
+  view.rerender(
+    <BrowsePanel
+      auth={auth}
+      kind="connector"
+      focusRequest={null}
+      onFocusRequestConsumed={onConsumed}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+  expect(screen.queryByTestId("detail-slug")).not.toBeInTheDocument();
+
+  view.unmount();
+  render(
+    <BrowsePanel
+      auth={auth}
+      kind="connector"
+      focusRequest={null}
+      onFocusRequestConsumed={onConsumed}
+    />,
+  );
+  expect(screen.queryByTestId("detail-slug")).not.toBeInTheDocument();
 });

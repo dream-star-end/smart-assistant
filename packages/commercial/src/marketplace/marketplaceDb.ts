@@ -1,3 +1,4 @@
+import { marketplaceReviewSource, type MarketplaceReviewSource } from '@openclaude/protocol'
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
 import {
@@ -959,6 +960,8 @@ export interface ListingDetail {
   /** Structured per-kind metadata (agent: model/toolsets/skillDeps); null for skills. */
   manifest: unknown
   riskFlags: RiskFlag[]
+  /** Public review vocabulary (DB `human` is projected to `manual`). */
+  reviewSource: MarketplaceReviewSource | null
   installCount: number
   /** 附属文件(references/assets/evals;null = 无)。 */
   rawBundle: Record<string, string> | null
@@ -1012,6 +1015,7 @@ export async function getListingDetail(
     raw_skill_md: string | null
     manifest: unknown
     risk_flags: unknown
+    review_source: string | null
     raw_bundle: unknown
     benchmark: unknown
     install_count: string
@@ -1030,7 +1034,7 @@ export async function getListingDetail(
     // turn 同 slug 的多次 view(与 catalog 同语义);LATERAL 聚合恒返一行,LEFT JOIN 不会放大结果。
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
-            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
+            v.manifest, v.risk_flags, v.review_source, v.raw_bundle, v.benchmark,
             v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count,
@@ -1091,6 +1095,7 @@ export async function getListingDetail(
     // 用户面只暴露下面由已签 exec_contract 生成的 connectorContract 投影。
     manifest: x.kind === 'connector' ? null : (x.manifest ?? null),
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
+    reviewSource: marketplaceReviewSource(x.review_source),
     installCount: Number.parseInt(x.install_count, 10) || 0,
     rawBundle: (x.raw_bundle as Record<string, string> | null) ?? null,
     benchmark:
@@ -1447,6 +1452,8 @@ export interface MyPublishRow {
   status: string
   /** 审核备注(拒绝理由等;管理员输入,前端须按纯文本渲染)。 */
   reviewNote: string | null
+  /** Public review vocabulary (DB `human` is projected to `manual`). */
+  reviewSource: MarketplaceReviewSource | null
   createdAt: string
   reviewedAt: string | null
   /** 该版本是否 listing 当前上架版本。 */
@@ -1472,13 +1479,14 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     name: string
     status: string
     review_note: string | null
+    review_source: string | null
     created_at: string
     reviewed_at: string | null
     is_current: boolean | null
     state: string
   }>(
     `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.status,
-            v.review_note, v.created_at::text, v.reviewed_at::text,
+            v.review_note, v.review_source, v.created_at::text, v.reviewed_at::text,
             (l.current_approved_version_id = v.id) AS is_current, l.state
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -1495,6 +1503,7 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     name: x.name,
     status: x.status,
     reviewNote: x.review_note,
+    reviewSource: marketplaceReviewSource(x.review_source),
     createdAt: x.created_at,
     reviewedAt: x.reviewed_at,
     isCurrent: x.is_current === true,

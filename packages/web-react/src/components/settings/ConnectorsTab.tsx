@@ -254,7 +254,7 @@ export function ConnectorsTab({
         await api.installMarketplace(auth, c.latestVersionId);
         reload();
       } catch (e) {
-        setErr(errText(e, "更新连接器失败"));
+        setErr(errText(e, "更新 API 插件失败"));
       }
     },
     [auth, reload],
@@ -264,7 +264,7 @@ export function ConnectorsTab({
     async (c: DeclarativeManagementConnector) => {
       if (c.installation !== "marketplace" || c.connectionCount > 0) return;
       const ok = await confirm({
-        title: `卸载连接器「${c.label}」?`,
+        title: `卸载 API 插件「${c.label}」?`,
         body: "卸载后不能再绑定或执行；以后仍可从 AI 市场重新安装。",
         confirmText: "卸载",
         danger: true,
@@ -275,7 +275,7 @@ export function ConnectorsTab({
         await api.uninstallMarketplace(auth, c.slug);
         reload();
       } catch (e) {
-        setErr(errText(e, "卸载连接器失败"));
+        setErr(errText(e, "卸载 API 插件失败"));
       }
     },
     [auth, confirm, reload],
@@ -466,7 +466,7 @@ function ProviderCard({
               className="text-danger"
               onClick={onUninstallMarket}
               disabled={management.connectionCount > 0}
-              title={management.connectionCount > 0 ? "请先解绑全部账号" : "卸载连接器"}
+              title={management.connectionCount > 0 ? "请先解绑全部账号" : "卸载 API 插件"}
             >
               <Trash2 size={13} /> 卸载
             </Button>
@@ -476,7 +476,7 @@ function ProviderCard({
 
       {management && !management.available && (
         <Alert tone="warning" className="mt-2 text-[11.5px]">
-          该连接器当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号。
+          该 API 插件当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号。
         </Alert>
       )}
 

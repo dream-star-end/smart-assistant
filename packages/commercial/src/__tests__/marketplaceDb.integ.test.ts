@@ -307,6 +307,7 @@ describe('marketplaceDb (integ)', () => {
     const detail = await getListingDetail('approve-me')
     assert.ok(detail)
     assert.equal(detail?.version, '1.0.0')
+    assert.equal(detail?.reviewSource, 'manual')
 
     const rej = await publishSkillVersion(buildPublish('reject-me', owner))
     await reviewVersion({ versionId: rej.versionId, reviewerUserId: admin, approve: false })

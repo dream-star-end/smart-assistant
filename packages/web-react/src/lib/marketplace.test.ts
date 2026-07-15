@@ -6,6 +6,7 @@ import {
   formatInstallCount,
   groupCardsByCategory,
   marketAskAiPrefill,
+  marketplaceArtifactKind,
   marketTrySkillPrefill,
   sortFeaturedListings,
   suggestSlug,
@@ -13,6 +14,14 @@ import {
   validateHumanMeta,
 } from './marketplace'
 import type { MarketplaceCard } from './types'
+
+describe('marketplaceArtifactKind', () => {
+  it('keeps old connector payloads compatible while preferring the additive projection', () => {
+    expect(marketplaceArtifactKind({ kind: 'connector' })).toBe('plugin')
+    expect(marketplaceArtifactKind({ kind: 'skill' })).toBe('skill')
+    expect(marketplaceArtifactKind({ kind: 'connector', artifactKind: 'plugin' })).toBe('plugin')
+  })
+})
 
 describe('updateAvailable', () => {
   it('true only when active listing has a different current version', () => {

@@ -2,8 +2,18 @@
 import {
   MARKETPLACE_CATEGORIES,
   isMarketplaceCategoryId,
+  marketplaceArtifactCompatibility,
+  type MarketplaceArtifactKind,
 } from '@openclaude/protocol'
 import type { MarketplaceCard, MarketplaceInstalled } from './types'
+
+/** New additive field first; old API/cache rows fall back to the legacy kind projection. */
+export function marketplaceArtifactKind(row: {
+  kind: 'skill' | 'agent' | 'connector'
+  artifactKind?: MarketplaceArtifactKind
+}): MarketplaceArtifactKind {
+  return row.artifactKind ?? marketplaceArtifactCompatibility(row.kind).artifactKind
+}
 
 /**
  * 该安装是否有新版本可更新：listing 仍在架（active）、后端带回了当前上架版本、
