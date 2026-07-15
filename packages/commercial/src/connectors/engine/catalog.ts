@@ -141,7 +141,7 @@ export interface DeclarativeManagement {
   }>
 }
 
-/** 管理中心的统一读模型：defaults ∪ active installs ∪ active declarative bindings。 */
+/** 管理中心的统一读模型：defaults ∪ active connector installs ∪ active declarative bindings。 */
 export async function listDeclarativeManagement(
   pool: Pool,
   userId: number,
@@ -163,18 +163,18 @@ export async function listDeclarativeManagement(
     latest_artifact_hash: string | null
     connection_count: string
   }>(
-    `WITH wanted AS (
+    `WITH active_install AS (
+       SELECT i.slug, i.version_id, i.artifact_hash
+         FROM marketplace_installs i
+         JOIN marketplace_skill_listings l ON l.slug = i.slug AND l.kind = 'connector'
+        WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
+     ), wanted AS (
        SELECT unnest($2::text[]) AS slug
        UNION
-       SELECT slug FROM marketplace_installs
-        WHERE user_id = $1 AND uninstalled_at IS NULL
+       SELECT slug FROM active_install
        UNION
        SELECT provider AS slug FROM connections
         WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
-     ), active_install AS (
-       SELECT i.slug, i.version_id, i.artifact_hash
-         FROM marketplace_installs i
-        WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
      ), binding_count AS (
        SELECT provider AS slug, count(*)::text AS n
          FROM connections
