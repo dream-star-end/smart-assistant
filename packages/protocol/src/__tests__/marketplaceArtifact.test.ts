@@ -3,6 +3,8 @@ import { describe, it } from 'node:test'
 
 import {
   marketplaceArtifactCompatibility,
+  marketplaceCapabilityKind,
+  marketplaceCapabilityStorageKind,
   marketplaceReviewSource,
 } from '../marketplaceArtifact.js'
 
@@ -22,5 +24,12 @@ describe('marketplace artifact compatibility', () => {
     assert.equal(marketplaceReviewSource('platform'), 'platform')
     assert.equal(marketplaceReviewSource('unknown'), null)
     assert.equal(marketplaceReviewSource(null), null)
+  })
+
+  it('maps public Plugin capability vocabulary at the storage boundary', () => {
+    assert.equal(marketplaceCapabilityStorageKind('skill'), 'skill')
+    assert.equal(marketplaceCapabilityStorageKind('plugin'), 'connector')
+    assert.equal(marketplaceCapabilityKind('skill'), 'skill')
+    assert.equal(marketplaceCapabilityKind('connector'), 'plugin')
   })
 })

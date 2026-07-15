@@ -16,6 +16,7 @@ import {
   SEED_AUTHORITY_BY_REV_ENV,
   buildAgentModelSnapshot,
   loadAgentModelResolverForUser,
+  runtimeDeniedAgentIds,
   seedAuthorityByRevEnabled,
 } from "../ws/agentModelAuthority.js";
 import { SeedDeclarationError, type SeedAgentExecution } from "../ws/seedDeclarationLoader.js";
@@ -41,6 +42,13 @@ describe("agentModelAuthority — 旧路径(flag 未开:seed = master 常量镜�
     assert.equal(snapshot.get("main"), PLATFORM_DEFAULT_MODEL, "内置 seed 最高优先");
     assert.equal(snapshot.get("mine"), "deepseek-v4-pro");
     assert.equal(snapshot.get("coder"), "glm-5.2");
+  });
+
+  test("市场未就绪同名项不能 deny 内置 seed Agent", () => {
+    assert.deepEqual(
+      [...runtimeDeniedAgentIds(new Set(["main", "codex", "hidden-reviewer", "mine"]))],
+      ["mine"],
+    );
   });
 });
 
@@ -79,6 +87,17 @@ describe("agentModelAuthority — 阶段 B(flag=1:seed = 该容器 bundle rev �
       snapshot.get("codex"),
       undefined,
       "该 rev 的声明没有 codex → resolver 返 null → bridge 对无 model 的帧 fail-closed",
+    );
+  });
+
+  test("deny 过滤跟随该 bundle rev 的 seed id 集合", () => {
+    const seedExecutions = new Map<string, SeedAgentExecution>([
+      ["main", { model: "glm-5.2", provider: "ark" }],
+      ["review-v2", { model: "glm-5.2", provider: "ark" }],
+    ]);
+    assert.deepEqual(
+      [...runtimeDeniedAgentIds(new Set(["main", "review-v2", "codex", "mine"]), seedExecutions)],
+      ["codex", "mine"],
     );
   });
 

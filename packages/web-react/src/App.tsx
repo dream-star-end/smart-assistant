@@ -973,20 +973,31 @@ export function App() {
     };
   }, [demo, auth]);
 
+  const fetchMyAgents = useCallback(async (): Promise<Agent[]> => {
+    if (demo || !auth) return [DEFAULT_AGENT];
+    const rows = await api.listMyAgents(authRef.current);
+    return rows.map(agentFromApiRow);
+  }, [demo, auth]);
+
+  const refreshMyAgents = useCallback(async (): Promise<Agent[]> => {
+    const rows = await fetchMyAgents();
+    setMyAgents(rows);
+    return rows;
+  }, [fetchMyAgents]);
+
   // 已装智能体目录:登录后拉一次(会话 agent 归属解析用;失败留默认,解析回落 stub 不阻断)。
   useEffect(() => {
     if (demo || !auth) return;
     let cancelled = false;
-    api
-      .listMyAgents(authRef.current)
+    fetchMyAgents()
       .then((rows) => {
-        if (!cancelled) setMyAgents(rows.map(agentFromApiRow));
+        if (!cancelled) setMyAgents(rows);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [demo, auth]);
+  }, [demo, auth, fetchMyAgents]);
 
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
@@ -1035,7 +1046,7 @@ export function App() {
     const resolved =
       activeSessAgentId === DEFAULT_AGENT.id
         ? DEFAULT_AGENT
-        : (myAgents.find((a) => a.id === activeSessAgentId) ?? DEFAULT_AGENT);
+        : (myAgents.find((a) => a.id === activeSessAgentId && a.ready !== false) ?? DEFAULT_AGENT);
     if (resolved.id === DEFAULT_AGENT.id && activeSessAgentId !== DEFAULT_AGENT.id && activeId) {
       chat.switchAgent(activeId, DEFAULT_AGENT.id);
     }
@@ -1785,6 +1796,13 @@ export function App() {
         onPick={(a) => {
           // 切 agent：若当前会话已在 WS service 注册，打跨-agent 污染守卫戳（§11），
           // 让旧 agent 的 late frames 被 drop、stop/hello 默认 agent 跟新选一致。
+          // Picker 自己刚拉过最新 readiness；先把这条写回 App 目录，避免旧的 ready=false
+          // 在同一轮 render 后触发会话归属 effect，把用户刚选中的 Agent 立刻切回 main。
+          setMyAgents((current) =>
+            current.some((item) => item.id === a.id)
+              ? current.map((item) => (item.id === a.id ? a : item))
+              : [...current, a],
+          );
           if (!demo && activeId && a.id !== agent.id) chat.switchAgent(activeId, a.id);
           setAgent(a);
           setPickerOpen(false);
@@ -1847,7 +1865,11 @@ export function App() {
               setManageOpen(false);
               openMarketplace("browse", "connector");
             }}
-            onClose={() => setManageOpen(false)}
+            onClose={() => {
+              setManageOpen(false);
+              // Plugin 绑定/解绑会改变 Agent readiness；关闭管理中心时立即刷新目录。
+              void refreshMyAgents().catch(() => {});
+            }}
           />
         </LazyBoundary>
       )}
@@ -1882,12 +1904,12 @@ export function App() {
               // 市场关闭后刷新已装目录(装/卸都会变);若当前选中的市场 agent 刚被卸载,
               // 回落全能助手,header/composer 不显示 stale agent。
               if (!demo && auth) {
-                const a = auth;
-                api
-                  .listMyAgents(a)
+                refreshMyAgents()
                   .then((rows) => {
-                    setMyAgents(rows.map(agentFromApiRow));
-                    if (agent.id !== "main" && !rows.some((r) => r.id === agent.id)) {
+                    if (
+                      agent.id !== "main" &&
+                      !rows.some((r) => r.id === agent.id && r.ready !== false)
+                    ) {
                       setAgent(DEFAULT_AGENT);
                     }
                   })

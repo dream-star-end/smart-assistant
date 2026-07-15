@@ -27,15 +27,20 @@ import { query } from '../db/queries.js'
 import { querySkillFeedbackRefs } from '../http/internalSkillFeedback.js'
 import {
   MarketplaceError,
+  getAgentCapabilityReadiness,
   getApprovedSkillVersions,
   getListingDetail,
   installApprovedVersion,
+  installMarketplaceBundle,
   listActiveInstalledAgents,
   listActiveInstalledArtifacts,
   listApprovedForSearch,
   listInstalled,
   listMyPublishes,
   listPendingVersions,
+  loadMarketplaceRuntimeSnapshot,
+  listRuntimeReadyAgentSets,
+  listRuntimeReadyInstalledAgents,
   ownerUnlistListing,
   publishSkillVersion,
   recordUninstall,
@@ -175,6 +180,33 @@ function buildPublishAgent(slug: string, owner: number, version = '1.0.0') {
   }
 }
 
+function buildPublishAgentWithCapabilities(
+  slug: string,
+  owner: number,
+  capabilities: Array<{ kind: 'skill' | 'plugin'; slug: string; optional: boolean }>,
+  version = '1.0.0',
+) {
+  const base = buildPublishAgent(slug, owner, version)
+  const manifest = {
+    ...(base.manifest as Record<string, unknown>),
+    capabilities,
+    skillDeps: capabilities.filter((item) => item.kind === 'skill').map((item) => item.slug),
+  }
+  const rawArtifact = JSON.stringify(manifest, null, 2)
+  return {
+    ...base,
+    manifest,
+    rawArtifact,
+    artifactHash: marketplaceArtifactHash(rawArtifact),
+  }
+}
+
+async function publishAndApproveSkill(slug: string, owner: number, reviewer: number) {
+  const result = await publishSkillVersion(buildPublish(slug, owner))
+  await reviewVersion({ versionId: result.versionId, reviewerUserId: reviewer, approve: true })
+  return result
+}
+
 async function expectMarketplaceError(fn: () => Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(fn, (e: unknown) => {
     assert.ok(e instanceof MarketplaceError, `expected MarketplaceError, got ${e}`)
@@ -292,7 +324,10 @@ describe('marketplaceDb (integ)', () => {
     const detail = await getListingDetail('admin-self-review')
     assert.ok(detail)
     assert.equal(detail.version, '1.0.0')
-    assert.equal((await listApprovedForSearch()).some((x) => x.slug === 'admin-self-review'), true)
+    assert.equal(
+      (await listApprovedForSearch()).some((x) => x.slug === 'admin-self-review'),
+      true,
+    )
   })
 
   test('approve sets current + makes searchable; reject does not', async (t) => {
@@ -440,7 +475,10 @@ describe('marketplaceDb (integ)', () => {
     )
 
     // 不存在的 slug → VERSION_NOT_FOUND。
-    await expectMarketplaceError(() => setListingFeaturedRank('no-such-slug', 1), 'VERSION_NOT_FOUND')
+    await expectMarketplaceError(
+      () => setListingFeaturedRank('no-such-slug', 1),
+      'VERSION_NOT_FOUND',
+    )
 
     // 非 active(admin revoke 后 state='revoked')→ LISTING_REVOKED,拒绝设为精选。
     await revokeListing('feat-set', 'kill-switch')
@@ -653,7 +691,9 @@ describe('marketplaceDb (integ)', () => {
 
     await updateInstalledAgentScope(installer, 'scoped-skill', ['office-assistant'])
     assert.deepEqual((await listInstalled(installer))[0].agentIds, ['office-assistant'])
-    assert.deepEqual((await listActiveInstalledArtifacts(installer))[0].agentIds, ['office-assistant'])
+    assert.deepEqual((await listActiveInstalledArtifacts(installer))[0].agentIds, [
+      'office-assistant',
+    ])
 
     await installApprovedVersion({
       userId: installer,
@@ -730,7 +770,10 @@ describe('marketplaceDb (integ)', () => {
     const affected = await ownerUnlistListing('owner-unlist', owner)
     assert.deepEqual(affected, [installer])
     assert.equal(await getListingDetail('owner-unlist'), null)
-    assert.equal((await listApprovedForSearch()).some((x) => x.slug === 'owner-unlist'), false)
+    assert.equal(
+      (await listApprovedForSearch()).some((x) => x.slug === 'owner-unlist'),
+      false,
+    )
     assert.equal((await listActiveInstalledArtifacts(installer)).length, 0)
     await expectMarketplaceError(
       () => installApprovedVersion({ userId: installer, versionId: p.versionId }),
@@ -1012,10 +1055,748 @@ describe('marketplaceDb (integ)', () => {
     // user 层:只见 su 一条。
     const user = await querySkillFeedbackRefs(getPool(), u, slug, 'user')
     assert.equal(user.total, 1)
-    assert.deepEqual(user.refs.map((r) => r.sessionKey), ['su'])
+    assert.deepEqual(
+      user.refs.map((r) => r.sessionKey),
+      ['su'],
+    )
 
     // 空:不存在的 slug → refs:[] total:0。
     const empty = await querySkillFeedbackRefs(getPool(), u, 'no-such-skill', 'hub')
     assert.deepEqual(empty, { refs: [], total: 0 })
+  })
+
+  test('Agent typed requirements publish atomically and reject missing/wrong-kind required refs', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('cap-publish-owner@x.com')
+    const reviewer = await createUser('cap-publish-reviewer@x.com')
+    await publishAndApproveSkill('cap-required', owner, reviewer)
+    await publishAndApproveSkill('cap-optional', owner, reviewer)
+    await ownerUnlistListing('cap-optional', owner, 'optional unavailable')
+
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('cap-agent', owner, [
+        { kind: 'skill', slug: 'cap-required', optional: false },
+        { kind: 'skill', slug: 'cap-optional', optional: true },
+      ]),
+    )
+    const stored = await query<{
+      capability_slug: string
+      capability_kind: string
+      required: boolean
+    }>(
+      `SELECT capability_slug, capability_kind, required
+         FROM marketplace_capability_requirements WHERE agent_version_id = $1
+         ORDER BY capability_slug`,
+      [agent.versionId],
+    )
+    assert.deepEqual(stored.rows, [
+      { capability_slug: 'cap-optional', capability_kind: 'skill', required: false },
+      { capability_slug: 'cap-required', capability_kind: 'skill', required: true },
+    ])
+    await assert.rejects(
+      publishSkillVersion(
+        buildPublishAgentWithCapabilities('cap-bad-agent', owner, [
+          { kind: 'plugin', slug: 'cap-required', optional: false },
+        ]),
+      ),
+      (error: unknown) => error instanceof MarketplaceError && error.code === 'INVALID_CAPABILITY',
+    )
+    await assert.rejects(
+      publishSkillVersion(
+        buildPublishAgentWithCapabilities('cap-missing-agent', owner, [
+          { kind: 'skill', slug: 'does-not-exist', optional: false },
+        ]),
+      ),
+      (error: unknown) => error instanceof MarketplaceError && error.code === 'INVALID_CAPABILITY',
+    )
+  })
+
+  test('Agent approval serializes with required-capability revocation', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('approval-lock-owner@x.com')
+    const reviewer = await createUser('approval-lock-reviewer@x.com')
+    const skill = await publishAndApproveSkill('approval-lock-skill', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('approval-lock-agent', owner, [
+        { kind: 'skill', slug: 'approval-lock-skill', optional: false },
+      ]),
+    )
+    const blocker = await getPool().connect()
+    try {
+      await blocker.query('BEGIN')
+      await blocker.query('SELECT id FROM marketplace_skill_versions WHERE id = $1 FOR UPDATE', [
+        skill.versionId,
+      ])
+      let settled = false
+      const approval = reviewVersion({
+        versionId: agent.versionId,
+        reviewerUserId: reviewer,
+        approve: true,
+      }).then(
+        () => {
+          settled = true
+          return { ok: true as const, error: null }
+        },
+        (error: unknown) => {
+          settled = true
+          return { ok: false as const, error }
+        },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(settled, false, 'approval must wait for the required version lock')
+      await blocker.query(
+        `UPDATE marketplace_skill_listings
+            SET state = 'revoked', revoked_reason = 'concurrent test'
+          WHERE slug = 'approval-lock-skill'`,
+      )
+      await blocker.query('COMMIT')
+      const outcome = await approval
+      assert.equal(outcome.ok, false)
+      assert.ok(outcome.error instanceof MarketplaceError)
+      assert.equal(outcome.error.code, 'INVALID_CAPABILITY')
+      const status = await query<{ status: string }>(
+        'SELECT status FROM marketplace_skill_versions WHERE id = $1',
+        [agent.versionId],
+      )
+      assert.equal(status.rows[0]!.status, 'pending')
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      blocker.release()
+    }
+  })
+
+  test('bundle install retries when a dependency approval changes the locked current version', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('install-version-race-owner@x.com')
+    const reviewer = await createUser('install-version-race-reviewer@x.com')
+    const installer = await createUser('install-version-race-user@x.com')
+    const oldSkill = await publishAndApproveSkill('install-version-race-skill', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('install-version-race-agent', owner, [
+        { kind: 'skill', slug: 'install-version-race-skill', optional: true },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    const newSkill = await publishSkillVersion(
+      buildPublish('install-version-race-skill', owner, '2.0.0', '\n新版'),
+    )
+
+    const blocker = await getPool().connect()
+    let installation: ReturnType<typeof installMarketplaceBundle> | null = null
+    try {
+      await blocker.query('BEGIN')
+      const blockerPid = await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+      await blocker.query('SELECT id FROM marketplace_skill_versions WHERE id = $1 FOR UPDATE', [
+        oldSkill.versionId,
+      ])
+      installation = installMarketplaceBundle({ userId: installer, versionId: agent.versionId })
+
+      let waitingOnOldVersion = false
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const activity = await query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> $1
+              AND wait_event_type = 'Lock'
+              AND query LIKE '%marketplace_skill_versions%FOR UPDATE%'`,
+          [blockerPid.rows[0]!.pid],
+        )
+        if (activity.rows[0]?.n !== '0') {
+          waitingOnOldVersion = true
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      assert.equal(waitingOnOldVersion, true, 'install must have captured and waited on the old pin')
+
+      await reviewVersion({
+        versionId: newSkill.versionId,
+        reviewerUserId: reviewer,
+        approve: true,
+      })
+      await blocker.query('COMMIT')
+
+      const result = await installation
+      assert.deepEqual(result.skippedOptional, [])
+      assert.deepEqual(result.installedCapabilities, [
+        { slug: 'install-version-race-skill', kind: 'skill', optional: true },
+      ])
+      const pin = await query<{ version_id: string }>(
+        `SELECT version_id::text FROM marketplace_installs
+          WHERE user_id = $1 AND slug = 'install-version-race-skill'
+            AND uninstalled_at IS NULL`,
+        [installer],
+      )
+      assert.equal(pin.rows[0]?.version_id, newSkill.versionId)
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      blocker.release()
+      await installation?.catch(() => {})
+    }
+  })
+
+  test('readiness uses the requested catalog Agent version while runtime keeps its pin', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('target-ready-owner@x.com')
+    const reviewer = await createUser('target-ready-reviewer@x.com')
+    const installer = await createUser('target-ready-installer@x.com')
+    await publishAndApproveSkill('target-ready-v1-skill', owner, reviewer)
+    await publishAndApproveSkill('target-ready-v2-skill', owner, reviewer)
+    const v1 = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('target-ready-agent', owner, [
+        { kind: 'skill', slug: 'target-ready-v1-skill', optional: false },
+      ]),
+    )
+    await reviewVersion({ versionId: v1.versionId, reviewerUserId: reviewer, approve: true })
+    await installMarketplaceBundle({ userId: installer, versionId: v1.versionId })
+    const v2 = await publishSkillVersion(
+      buildPublishAgentWithCapabilities(
+        'target-ready-agent',
+        owner,
+        [{ kind: 'skill', slug: 'target-ready-v2-skill', optional: false }],
+        '2.0.0',
+      ),
+    )
+    await reviewVersion({ versionId: v2.versionId, reviewerUserId: reviewer, approve: true })
+
+    const catalog = await getAgentCapabilityReadiness(
+      installer,
+      'target-ready-agent',
+      v2.versionId,
+    )
+    assert.equal(catalog.ready, false)
+    assert.deepEqual(catalog.requirements.map((item) => item.slug), ['target-ready-v2-skill'])
+    assert.equal(catalog.requirements[0]?.status, 'missing')
+    assert.equal(catalog.requirements[0]?.repairable, true)
+
+    const runtime = await getAgentCapabilityReadiness(installer, 'target-ready-agent', null)
+    assert.equal(runtime.ready, true)
+    assert.deepEqual(runtime.requirements.map((item) => item.slug), ['target-ready-v1-skill'])
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(installer)).map((item) => item.slug),
+      ['target-ready-agent'],
+    )
+  })
+
+  test('preset runtime readiness ignores a stale personal pin and follows the current version', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('preset-current-owner@x.com')
+    const reviewer = await createUser('preset-current-reviewer@x.com')
+    const user = await createUser('preset-current-user@x.com')
+    await publishAndApproveSkill('preset-current-v2-skill', owner, reviewer)
+    const v1 = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('preset-current-agent', owner, []),
+    )
+    await reviewVersion({ versionId: v1.versionId, reviewerUserId: reviewer, approve: true })
+    await installMarketplaceBundle({ userId: user, versionId: v1.versionId })
+    const v2 = await publishSkillVersion(
+      buildPublishAgentWithCapabilities(
+        'preset-current-agent',
+        owner,
+        [{ kind: 'skill', slug: 'preset-current-v2-skill', optional: false }],
+        '2.0.0',
+      ),
+    )
+    await reviewVersion({ versionId: v2.versionId, reviewerUserId: reviewer, approve: true })
+
+    const installedRuntime = await getAgentCapabilityReadiness(
+      user,
+      'preset-current-agent',
+      null,
+    )
+    assert.equal(installedRuntime.ready, true)
+    assert.deepEqual(installedRuntime.requirements, [])
+
+    const presetRuntime = await getAgentCapabilityReadiness(
+      user,
+      'preset-current-agent',
+      null,
+      { preset: true },
+    )
+    assert.equal(presetRuntime.ready, false)
+    assert.deepEqual(presetRuntime.requirements.map((item) => item.slug), [
+      'preset-current-v2-skill',
+    ])
+    assert.equal(presetRuntime.requirements[0]?.status, 'missing')
+    assert.equal(presetRuntime.requirements[0]?.repairable, true)
+
+    const runtimeSets = await listRuntimeReadyAgentSets(user, ['preset-current-agent'])
+    assert.deepEqual(runtimeSets.presets, [])
+    assert.deepEqual(
+      runtimeSets.installed,
+      [],
+      'an unready evergreen preset must not fall back to a stale personal pin',
+    )
+    assert.deepEqual(
+      [...runtimeSets.denied],
+      ['preset-current-agent'],
+      'bridge authority must retain an explicit deny for the selected unready preset',
+    )
+
+    await query(
+      `UPDATE marketplace_skill_listings
+          SET current_approved_version_id = NULL
+        WHERE slug = 'preset-current-agent'`,
+    )
+    const unavailablePreset = await listRuntimeReadyAgentSets(user, ['preset-current-agent'])
+    assert.deepEqual(unavailablePreset.presets, [])
+    assert.deepEqual(
+      unavailablePreset.installed,
+      [],
+      'a configured preset without a loadable current row must still reserve its slug',
+    )
+    assert.deepEqual(
+      [...unavailablePreset.denied],
+      ['preset-current-agent'],
+      'an unavailable configured preset must remain explicitly denied',
+    )
+  })
+
+  test('container runtime snapshot cannot tear Agent readiness from its required Skill feed', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('snapshot-owner@x.com')
+    const reviewer = await createUser('snapshot-reviewer@x.com')
+    const installer = await createUser('snapshot-installer@x.com')
+    await publishAndApproveSkill('snapshot-required-skill', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('snapshot-agent', owner, [
+        { kind: 'skill', slug: 'snapshot-required-skill', optional: false },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    await installMarketplaceBundle({ userId: installer, versionId: agent.versionId })
+
+    const realPool = getPool()
+    let revokedBetweenProjections = false
+    const interceptedPool = {
+      connect: async () => {
+        const client = await realPool.connect()
+        return {
+          query: async (sql: string, params?: unknown[]) => {
+            const result = await client.query(sql, params)
+            if (
+              !revokedBetweenProjections &&
+              sql.includes('SELECT DISTINCT ON (m.slug)') &&
+              sql.includes("l.kind = 'skill'")
+            ) {
+              revokedBetweenProjections = true
+              await realPool.query(
+                `UPDATE marketplace_skill_listings SET state = 'revoked'
+                  WHERE slug = 'snapshot-required-skill'`,
+              )
+            }
+            return result
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as ReturnType<typeof getPool>
+
+    const snapshot = await loadMarketplaceRuntimeSnapshot(installer, [], interceptedPool)
+    assert.equal(revokedBetweenProjections, true)
+    assert.deepEqual(snapshot.skills.map((item) => item.slug), ['snapshot-required-skill'])
+    assert.deepEqual(snapshot.agentSets.installed.map((item) => item.slug), ['snapshot-agent'])
+
+    const afterCommit = await loadMarketplaceRuntimeSnapshot(installer, [])
+    assert.deepEqual(afterCommit.skills, [])
+    assert.deepEqual(afterCommit.agentSets.installed, [])
+    assert.deepEqual([...afterCommit.agentSets.denied], ['snapshot-agent'])
+  })
+
+  test('Agent bundle install is all-or-nothing, retains provenance and reports readiness', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('bundle-owner@x.com')
+    const reviewer = await createUser('bundle-reviewer@x.com')
+    const installer = await createUser('bundle-installer@x.com')
+    const required = await publishAndApproveSkill('bundle-required', owner, reviewer)
+    await publishAndApproveSkill('bundle-optional', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('bundle-agent', owner, [
+        { kind: 'skill', slug: 'bundle-required', optional: false },
+        { kind: 'skill', slug: 'bundle-optional', optional: true },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+
+    await assert.rejects(
+      installMarketplaceBundle({
+        userId: installer,
+        versionId: agent.versionId,
+        failureInjector: () => {
+          throw new Error('injected bundle write failure')
+        },
+      }),
+      /injected bundle write failure/,
+    )
+    assert.equal((await listInstalled(installer)).length, 0, 'root and dependencies rolled back')
+
+    const result = await installMarketplaceBundle({ userId: installer, versionId: agent.versionId })
+    assert.equal(result.ready, true)
+    assert.deepEqual(
+      result.installedCapabilities.map((item) => item.slug),
+      ['bundle-optional', 'bundle-required'],
+    )
+    const installed = await listInstalled(installer)
+    assert.deepEqual(installed.map((item) => item.slug).sort(), [
+      'bundle-agent',
+      'bundle-optional',
+      'bundle-required',
+    ])
+    assert.deepEqual(installed.find((item) => item.slug === 'bundle-required')?.agentIds, [
+      'bundle-agent',
+    ])
+    const bindings = await query<{
+      capability_slug: string
+      source: string
+      source_agent_version_id: string | null
+    }>(
+      `SELECT capability_slug, source, source_agent_version_id::text
+         FROM marketplace_agent_capability_bindings
+        WHERE user_id = $1 AND agent_slug = 'bundle-agent'
+        ORDER BY capability_slug`,
+      [installer],
+    )
+    assert.ok(bindings.rows.every((row) => row.source === 'agent_dependency'))
+    assert.ok(bindings.rows.every((row) => row.source_agent_version_id === agent.versionId))
+    assert.equal(
+      (await getAgentCapabilityReadiness(installer, 'bundle-agent', agent.versionId)).ready,
+      true,
+    )
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(installer)).map((item) => item.slug),
+      ['bundle-agent'],
+    )
+
+    await query(
+      `UPDATE marketplace_installs SET artifact_hash = 'tampered-hash'
+        WHERE user_id = $1 AND slug = 'bundle-required' AND uninstalled_at IS NULL`,
+      [installer],
+    )
+    const tampered = await getAgentCapabilityReadiness(installer, 'bundle-agent', agent.versionId)
+    assert.equal(tampered.ready, false)
+    assert.equal(
+      tampered.requirements.find((item) => item.slug === 'bundle-required')?.status,
+      'revoked',
+    )
+    assert.equal(
+      tampered.requirements.find((item) => item.slug === 'bundle-required')?.repairable,
+      true,
+      'an active current dependency can repair a stale install pin',
+    )
+    assert.deepEqual(
+      await listRuntimeReadyInstalledAgents(installer),
+      [],
+      'runtime authority must exclude an Agent whose pinned dependency hash diverged',
+    )
+    const repaired = await installMarketplaceBundle({
+      userId: installer,
+      versionId: agent.versionId,
+    })
+    assert.equal(repaired.ready, true, 'same Agent version can atomically repair a stale pin')
+    assert.equal(
+      (await getAgentCapabilityReadiness(installer, 'bundle-agent', agent.versionId)).ready,
+      true,
+    )
+
+    await revokeListing('bundle-required', 'dependency kill switch')
+    const unavailable = await getAgentCapabilityReadiness(
+      installer,
+      'bundle-agent',
+      agent.versionId,
+    )
+    assert.equal(
+      unavailable.requirements.find((item) => item.slug === 'bundle-required')?.status,
+      'revoked',
+    )
+    assert.equal(
+      unavailable.requirements.find((item) => item.slug === 'bundle-required')?.repairable,
+      false,
+      'reinstall must not be offered when the dependency listing is unavailable',
+    )
+    const other = await createUser('bundle-other@x.com')
+    await assert.rejects(
+      installMarketplaceBundle({ userId: other, versionId: agent.versionId }),
+      (error: unknown) => error instanceof MarketplaceError && error.code === 'NOT_INSTALLABLE',
+    )
+    assert.equal((await listInstalled(other)).length, 0)
+    assert.equal(required.versionId.length > 0, true)
+  })
+
+  test('optional failure is explicit; uninstall cleans bindings and retires orphan dependencies', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('lifecycle-owner@x.com')
+    const reviewer = await createUser('lifecycle-reviewer@x.com')
+    const installer = await createUser('lifecycle-installer@x.com')
+    await publishAndApproveSkill('life-required', owner, reviewer)
+    await publishAndApproveSkill('life-optional', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('life-agent', owner, [
+        { kind: 'skill', slug: 'life-required', optional: false },
+        { kind: 'skill', slug: 'life-optional', optional: true },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    await revokeListing('life-optional', 'optional kill switch')
+
+    const result = await installMarketplaceBundle({ userId: installer, versionId: agent.versionId })
+    assert.deepEqual(result.skippedOptional, [
+      { slug: 'life-optional', kind: 'skill', optional: true, reason: 'unavailable' },
+    ])
+    assert.deepEqual(
+      result.installedCapabilities.map((item) => item.slug),
+      ['life-required'],
+    )
+    assert.equal(await recordUninstall(installer, 'life-agent'), true)
+    const after = await listInstalled(installer)
+    assert.deepEqual(after, [], 'dependency-only artifact is soft-deleted with the removed Agent')
+    assert.deepEqual(
+      await listActiveInstalledArtifacts(installer),
+      [],
+      'dormant dependency must not be reconciled into the runtime hub',
+    )
+    const remainingBindings = await query(
+      `SELECT 1 FROM marketplace_agent_capability_bindings
+        WHERE user_id = $1 AND source = 'agent_dependency'`,
+      [installer],
+    )
+    assert.equal(remainingBindings.rowCount, 0)
+  })
+
+  test('manual and dependency scopes union, concurrent reinstall stays single-active', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('union-owner@x.com')
+    const reviewer = await createUser('union-reviewer@x.com')
+    const installer = await createUser('union-installer@x.com')
+    const skill = await publishAndApproveSkill('union-skill', owner, reviewer)
+    await installApprovedVersion({ userId: installer, versionId: skill.versionId })
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('union-agent', owner, [
+        { kind: 'skill', slug: 'union-skill', optional: false },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    await Promise.all([
+      installMarketplaceBundle({ userId: installer, versionId: agent.versionId }),
+      installMarketplaceBundle({ userId: installer, versionId: agent.versionId }),
+    ])
+    assert.deepEqual(
+      (await listInstalled(installer)).find((item) => item.slug === 'union-skill')?.agentIds,
+      ['main', 'union-agent'],
+    )
+    assert.deepEqual(
+      (await listInstalled(installer)).find((item) => item.slug === 'union-skill')?.manualAgentIds,
+      ['main'],
+      'public compatibility scope must not erase manual/dependency provenance',
+    )
+    const active = await query<{ slug: string; n: string }>(
+      `SELECT slug, count(*)::text AS n FROM marketplace_installs
+        WHERE user_id = $1 AND uninstalled_at IS NULL GROUP BY slug ORDER BY slug`,
+      [installer],
+    )
+    assert.ok(active.rows.every((row) => row.n === '1'))
+    await recordUninstall(installer, 'union-agent')
+    assert.deepEqual(
+      (await listInstalled(installer)).find((item) => item.slug === 'union-skill')?.agentIds,
+      ['main'],
+    )
+
+    const dependencyOnly = await createUser('union-dependency-only@x.com')
+    await installMarketplaceBundle({ userId: dependencyOnly, versionId: agent.versionId })
+    assert.deepEqual(
+      (await listInstalled(dependencyOnly)).find((item) => item.slug === 'union-skill')
+        ?.manualAgentIds,
+      [],
+    )
+    // A stale frontend sends the old compatibility union. Legacy mode must remove
+    // dependency-owned IDs instead of turning them into permanent manual bindings.
+    await installMarketplaceBundle({
+      userId: dependencyOnly,
+      versionId: skill.versionId,
+      agentIds: ['union-agent'],
+      scopeMode: 'legacy_union',
+    })
+    assert.deepEqual(
+      (await listInstalled(dependencyOnly)).find((item) => item.slug === 'union-skill')
+        ?.manualAgentIds,
+      [],
+    )
+    await recordUninstall(dependencyOnly, 'union-agent')
+    const orphan = (await listInstalled(dependencyOnly)).find((item) => item.slug === 'union-skill')
+    assert.equal(orphan, undefined)
+
+    const dualSource = await createUser('union-dual-source@x.com')
+    await installMarketplaceBundle({ userId: dualSource, versionId: agent.versionId })
+    assert.equal(
+      await updateInstalledAgentScope(dualSource, 'union-skill', ['union-agent']),
+      true,
+    )
+    await installMarketplaceBundle({
+      userId: dualSource,
+      versionId: skill.versionId,
+      agentIds: ['union-agent'],
+      scopeMode: 'legacy_union',
+    })
+    assert.deepEqual(
+      (await listInstalled(dualSource)).find((item) => item.slug === 'union-skill')
+        ?.manualAgentIds,
+      ['union-agent'],
+      'legacy unions retain an already-manual scope that is also dependency-owned',
+    )
+    await recordUninstall(dualSource, 'union-agent')
+    assert.deepEqual(
+      (await listInstalled(dualSource)).find((item) => item.slug === 'union-skill')?.agentIds,
+      ['union-agent'],
+      'removing the Agent must not orphan-delete an explicitly assigned Skill',
+    )
+  })
+
+  test('personal org-private capability pins remain ready after membership exit', async (t) => {
+    if (skipIfNoPg(t)) return
+    const member = await createUser('private-pin-member@x.com')
+    const reviewer = await createUser('private-pin-reviewer@x.com')
+    const org = await query<{ id: string }>(
+      `INSERT INTO orgs(name, created_by) VALUES ('Private Pin Org', $1) RETURNING id::text`,
+      [member],
+    )
+    const orgId = org.rows[0]!.id
+    await query(
+      `INSERT INTO org_memberships(org_id, user_id, org_role)
+       VALUES ($1::bigint, $2, 'owner')`,
+      [orgId, member],
+    )
+    const skill = await publishSkillVersion({
+      ...buildPublish('private-pin-skill', member),
+      orgId,
+    })
+    await reviewVersion({ versionId: skill.versionId, reviewerUserId: reviewer, approve: true })
+    const agent = await publishSkillVersion({
+      ...buildPublishAgentWithCapabilities('private-pin-agent', member, [
+        { kind: 'skill', slug: 'private-pin-skill', optional: false },
+      ]),
+      orgId,
+    })
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    await installMarketplaceBundle({
+      userId: member,
+      versionId: agent.versionId,
+      callerOrgId: orgId,
+    })
+    assert.equal(
+      (await getAgentCapabilityReadiness(member, 'private-pin-agent', agent.versionId)).ready,
+      true,
+    )
+
+    await query(
+      `UPDATE org_memberships SET status = 'suspended'
+        WHERE org_id = $1::bigint AND user_id = $2`,
+      [orgId, member],
+    )
+    const afterExit = await getAgentCapabilityReadiness(
+      member,
+      'private-pin-agent',
+      agent.versionId,
+    )
+    assert.equal(afterExit.ready, true, 'visibility changes must not revoke an acquired pin')
+    assert.equal(afterExit.requirements[0]?.repairable, false, 'new installs remain visibility-gated')
+    assert.deepEqual(
+      (await listActiveInstalledArtifacts(member)).map((item) => item.slug),
+      ['private-pin-skill'],
+    )
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(member)).map((item) => item.slug),
+      ['private-pin-agent'],
+    )
+  })
+
+  test('organization Skill installs satisfy Agent readiness with runtime-identical scope', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('org-cap-owner@x.com')
+    const reviewer = await createUser('org-cap-reviewer@x.com')
+    const member = await createUser('org-cap-member@x.com')
+    const skill = await publishAndApproveSkill('org-cap-skill', owner, reviewer)
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('org-cap-agent', owner, [
+        { kind: 'skill', slug: 'org-cap-skill', optional: false },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+    await installMarketplaceBundle({ userId: member, versionId: agent.versionId })
+    assert.equal(await recordUninstall(member, 'org-cap-skill'), true)
+
+    const org = await query<{ id: string }>(
+      `INSERT INTO orgs(name, created_by) VALUES ('Capability Org', $1) RETURNING id::text`,
+      [member],
+    )
+    await query(
+      `INSERT INTO org_memberships(org_id, user_id, org_role)
+       VALUES ($1::bigint, $2, 'owner')`,
+      [org.rows[0]!.id, member],
+    )
+    const pinned = await query<{ artifact_hash: string }>(
+      'SELECT artifact_hash FROM marketplace_skill_versions WHERE id = $1',
+      [skill.versionId],
+    )
+    await query(
+      `INSERT INTO org_installs
+         (org_id, slug, version_id, artifact_hash, agent_ids, installed_by)
+       VALUES ($1::bigint, 'org-cap-skill', $2, $3, '["org-cap-agent"]', $4)`,
+      [org.rows[0]!.id, skill.versionId, pinned.rows[0]!.artifact_hash, member],
+    )
+
+    const ready = await getAgentCapabilityReadiness(member, 'org-cap-agent', agent.versionId)
+    assert.equal(ready.ready, true)
+    assert.equal(ready.requirements[0]?.bound, true)
+    assert.deepEqual(
+      (await listActiveInstalledArtifacts(member)).find((item) => item.slug === 'org-cap-skill')
+        ?.agentIds,
+      ['org-cap-agent'],
+    )
+    assert.deepEqual(
+      (await listRuntimeReadyInstalledAgents(member)).map((item) => item.slug),
+      ['org-cap-agent'],
+    )
+
+    await query(
+      `UPDATE org_installs SET agent_ids = '["main"]'
+        WHERE org_id = $1::bigint AND slug = 'org-cap-skill' AND uninstalled_at IS NULL`,
+      [org.rows[0]!.id],
+    )
+    const wrongScope = await getAgentCapabilityReadiness(member, 'org-cap-agent', agent.versionId)
+    assert.equal(wrongScope.ready, false)
+    assert.equal(wrongScope.requirements[0]?.bound, false)
+    assert.equal(wrongScope.requirements[0]?.status, 'missing')
+    assert.deepEqual(await listRuntimeReadyInstalledAgents(member), [])
+  })
+
+  test('preset Agent still requires each Skill to be explicitly bound to its scope', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('preset-scope-owner@x.com')
+    const reviewer = await createUser('preset-scope-reviewer@x.com')
+    const user = await createUser('preset-scope-user@x.com')
+    const skill = await publishAndApproveSkill('preset-scoped-skill', owner, reviewer)
+    await installApprovedVersion({ userId: user, versionId: skill.versionId })
+    const agent = await publishSkillVersion(
+      buildPublishAgentWithCapabilities('preset-scoped-agent', owner, [
+        { kind: 'skill', slug: 'preset-scoped-skill', optional: false },
+      ]),
+    )
+    await reviewVersion({ versionId: agent.versionId, reviewerUserId: reviewer, approve: true })
+
+    const before = await getAgentCapabilityReadiness(user, 'preset-scoped-agent', agent.versionId, {
+      preset: true,
+    })
+    assert.equal(before.ready, false)
+    assert.equal(before.requirements[0]?.status, 'missing')
+    assert.equal(before.requirements[0]?.bound, false)
+
+    assert.equal(
+      await updateInstalledAgentScope(user, 'preset-scoped-skill', ['preset-scoped-agent']),
+      true,
+    )
+    const after = await getAgentCapabilityReadiness(user, 'preset-scoped-agent', agent.versionId, {
+      preset: true,
+    })
+    assert.equal(after.ready, true)
+    assert.equal(after.requirements[0]?.status, 'ready')
+    assert.equal(after.requirements[0]?.bound, true)
   })
 })

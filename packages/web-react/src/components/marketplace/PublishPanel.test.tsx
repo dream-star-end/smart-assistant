@@ -1,18 +1,26 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { AuthSession } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
 
 const listSkills = vi.fn();
 const listMarketplaceMyPublishes = vi.fn();
 const publishMarketplace = vi.fn();
+const getPublicModels = vi.fn();
+const listMarketplaceInstalled = vi.fn();
+const getDeclarativeManagement = vi.fn();
+const publishMarketplaceAgent = vi.fn();
 vi.mock("../../lib/api", () => ({
   ApiError: class ApiError extends Error {},
   api: {
     listSkills: (...a: unknown[]) => listSkills(...a),
     listMarketplaceMyPublishes: (...a: unknown[]) => listMarketplaceMyPublishes(...a),
     publishMarketplace: (...a: unknown[]) => publishMarketplace(...a),
+    getPublicModels: (...a: unknown[]) => getPublicModels(...a),
+    listMarketplaceInstalled: (...a: unknown[]) => listMarketplaceInstalled(...a),
+    getDeclarativeManagement: (...a: unknown[]) => getDeclarativeManagement(...a),
+    publishMarketplaceAgent: (...a: unknown[]) => publishMarketplaceAgent(...a),
   },
 }));
 
@@ -21,6 +29,10 @@ import { PublishPanel } from "./PublishPanel";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+beforeEach(() => {
+  getDeclarativeManagement.mockResolvedValue({ connectors: [], connections: [] });
 });
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
@@ -102,4 +114,40 @@ test("API 插件展示 AI 创建入口，同时保持 connector kind 的旧调�
   expect(onCreateInChat).toHaveBeenCalledWith("connector");
   expect(screen.getByText("API 连接插件 · AI 自动审核")).toBeInTheDocument();
   expect(screen.getByText(/当前支持无需运行自定义代码的声明式 API 连接插件/)).toBeInTheDocument();
+});
+
+test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  listMarketplaceInstalled.mockResolvedValue([
+    { slug: "writer-skill", name: "写作 Skill", kind: "skill", listingState: "active" },
+    { slug: "paper-plugin", name: "论文 Plugin", kind: "connector", listingState: "active" },
+  ]);
+  getDeclarativeManagement.mockResolvedValue({
+    connectors: [
+      {
+        slug: "notion",
+        label: "Notion",
+        description: "官方知识库插件",
+        installation: "default",
+        official: true,
+        available: true,
+      },
+    ],
+    connections: [],
+  });
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("button", { name: "发布智能体" }));
+  const plugin = await screen.findByRole("button", { name: /Plugin · 论文 Plugin/ });
+  fireEvent.click(plugin);
+  expect(plugin).toHaveTextContent("必需 · Plugin");
+  fireEvent.click(plugin);
+  expect(plugin).toHaveTextContent("可选 · Plugin");
+  fireEvent.click(plugin);
+  expect(plugin).not.toHaveTextContent("可选 ·");
+  expect(screen.getByRole("button", { name: /Skill · 写作 Skill/ })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Plugin · Notion/ })).toBeInTheDocument();
 });

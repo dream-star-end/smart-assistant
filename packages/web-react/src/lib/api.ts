@@ -21,6 +21,7 @@ import type {
   MarketplaceAgentPublishInput,
   MarketplaceConnectorPublishInput,
   MarketplaceMyAgent,
+  MarketplaceInstallResult,
   SkillDraftDetail,
   SkillDraftSummary,
   SkillEvalGenJob,
@@ -350,7 +351,8 @@ export function refreshAuth(
     const retryAfterMs = Math.max(raw.kind === "transient" ? raw.retryAfterMs : 0, backoff);
     state.nextAllowedAt = Date.now() + retryAfterMs;
     const prior = state.friction;
-    const code = prior?.code ?? (raw.raceObserved ? "REFRESH_RACE" : "REFRESH_TRANSIENT");
+    const code = prior?.code ??
+      (raw.kind === "race" || raw.raceObserved ? "REFRESH_RACE" : "REFRESH_TRANSIENT");
     const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
     const id = reportClientFriction({
       eventId: prior?.id,
@@ -2324,17 +2326,46 @@ export const api = {
     ).then((b) => b.detail),
 
   /** 安装一个已批准版本（POST /api/marketplace/install）。 */
-  installMarketplace: (a: AuthSession, versionId: string, agentIds?: string[]) =>
-    jsonOrThrow<{ ok: boolean; slug: string; version: string; note: string }>(
+  installMarketplace: (
+    a: AuthSession,
+    versionId: string,
+    agentIds?: string[],
+    preserveManualScope = false,
+  ) => {
+    if (preserveManualScope && agentIds === undefined) {
+      throw new Error("preserveManualScope requires the current compatibility scope");
+    }
+    return jsonOrThrow<MarketplaceInstallResult>(
       callWithRefresh(a, (t) =>
         fetch("/api/marketplace/install", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ versionId, ...(agentIds ? { agentIds } : {}) }),
+          body: JSON.stringify({
+            versionId,
+            ...(agentIds !== undefined
+              ? {
+                  agentIds,
+                  // Normal edits are explicitly manual. Version updates instead send the
+                  // legacy union without this flag: old servers preserve that union, while
+                  // new servers subtract dependency-owned bindings before writing provenance.
+                  ...(!preserveManualScope ? { manualAgentScope: true } : {}),
+                }
+              : {}),
+          }),
         }),
       ),
-    ),
+    ).then((result) => ({
+      ...result,
+      // A tab may outlive a server rollback. The previous response shape omitted
+      // composition outcomes, so normalize once at the API boundary for all callers.
+      installedCapabilities: result.installedCapabilities ?? [],
+      skippedOptional: result.skippedOptional ?? [],
+      needsAuthorization: result.needsAuthorization ?? [],
+      ready: result.ready ?? true,
+      installedDeps: result.installedDeps ?? 0,
+    }));
+  },
 
   /** 修改已安装市场技能归属（PATCH /api/marketplace/installed/:slug）。 */
   updateMarketplaceInstallAgents: (a: AuthSession, slug: string, agentIds: string[]) =>

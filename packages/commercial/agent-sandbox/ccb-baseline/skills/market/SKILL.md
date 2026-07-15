@@ -1,7 +1,7 @@
 ---
 name: market
-description: 用 `oc-market` 命令行帮用户操作 AI 市场:搜索/查看/安装/卸载技能与智能体,或把用户的技能/智能体发布到市场。当用户想"找个能做 X 的技能/智能体并装上""我装了哪些""卸载某个""把我这个技能发布到市场"时使用。
-tags: [marketplace, market, skill, agent, install, publish]
+description: 用 `oc-market` 操作 AI 市场中的技能、插件与智能体,并发布可组合这些能力的智能体。当用户想找、安装、卸载或发布市场能力时使用。
+tags: [marketplace, market, skill, plugin, agent, install, publish]
 ---
 
 # AI 市场操作（oc-market CLI）
@@ -13,17 +13,18 @@ tags: [marketplace, market, skill, agent, install, publish]
 ## 命令
 
 ```bash
-# 搜索(可加 --kind skill|agent;不加=两类都搜)
+# 搜索(可加 --kind skill|agent|plugin)
 oc-market search "PPT 美化" --kind skill
 oc-market search "写作" --kind agent
+oc-market search "飞书" --kind plugin
 
-# 看详情(完整内容:技能看 SKILL.md,智能体看模型/工具集/依赖技能/人设)
+# 看详情(技能看 SKILL.md;智能体看模型、工具集、Skill/Plugin 依赖与就绪状态)
 oc-market detail <slug>
 
 # 我的已安装
 oc-market installed
 
-# 安装 / 卸载(按 slug;装智能体会自动连带装它依赖的技能)
+# 安装 / 卸载(装智能体时,智能体与全部必需能力同一事务成功或整体回滚)
 oc-market install <slug>
 oc-market uninstall <slug>
 ```
@@ -75,14 +76,20 @@ oc-market publish-skill --slug my-skill --name "学术翻译" --version 1.8.0 \
 - 安装侧会按原路径落盘,所以正文里的 `references/xxx.md` 相对引用装好后依然有效——多文件技能**不需要**为了发布压成单文件。
 - `--visibility org` 可发"仅本组织可见"(要求用户是组织成员;默认公开)。
 
-发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;skillDeps 必须是已上架技能的 slug;**category/use-cases 同样必填**):
+发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;`--skill-deps`/`--plugin-deps` 选择已上架能力;**category/use-cases 同样必填**):
 ```bash
 oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
   --description "中文写作润色专家" --model glm-5.2 --toolsets core \
   --category office-docs \
   --use-cases "把口语要点扩写成成文;给中文稿件做润色和降 AI 味" \
-  --skill-deps academic-translate --persona-file /tmp/persona.md
+  --skill-deps academic-translate --plugin-deps paper-search \
+  --optional-plugin-deps cloud-drive --persona-file /tmp/persona.md
 ```
+
+- `--skill-deps` / `--plugin-deps`:缺失时智能体不能安装的必需能力。
+- `--optional-skill-deps` / `--optional-plugin-deps`:不可用时跳过、不阻断安装的增强能力。
+- 安装返回 `installedCapabilities`、`skippedOptional`、`needsAuthorization`、`ready`;有
+  `needsAuthorization` 时引导用户去**管理中心 → 插件账号**完成授权,不要重复安装。
 
 ## 商品信息纪律(发布 / 推荐都要遵守)
 
@@ -94,11 +101,12 @@ oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
 ## 关键事实(务必告知用户)
 
 - **安装的内容只有平台审核通过的**才能装(安全)。装上后**在下一次会话/对话**才对你(AI)生效——因为是按会话同步进容器的。装好后可建议用户"新开个对话试试"。
+- Agent 的能力绑定只描述组合与就绪状态,不是逐 Agent 的插件权限边界;插件账号仍按当前用户授权。
 - `oc-market install <skill>` 是容器内代装路径,不会弹出归属选择;直接安装技能默认归到全能助手(已有安装则保留原归属)。需要装给某几个智能体时,让用户在网页市场安装/已安装里选择归属。
 - **发布是提交审核,不会立刻上架**:`publish-*` 返回 `status: pending`,要等平台管理员审核通过后才对其他用户可见。如实告诉用户"已提交,等待审核"。
 - 发布会过**静态安全扫描**:正文/人设里有密钥、内网地址、提示词注入等会被拒(返回 SCAN_BLOCKED + 原因),按提示让用户修正后重发。
 - slug 全局唯一且**归首次发布者所有**;同一 slug 不能换类型(技能↔智能体)。
-- 加 `--kind`/看返回的 JSON 里 `kind` 字段区分技能与智能体。
+- 加 `--kind`/看返回的 `artifactKind` 区分 Skill、Agent 与 Plugin。
 - 失败时命令会打印 `状态码 + 错误码 + 原因`,照着告诉用户即可。
 
 ## 工具调用纪律(重要)

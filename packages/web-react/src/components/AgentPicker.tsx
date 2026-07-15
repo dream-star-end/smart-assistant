@@ -136,17 +136,21 @@ export function AgentPicker({
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
         {others.map((a) => {
           const active = a.id === current.id
+          const unavailable = a.ready === false
           return (
             <button
               type="button"
               data-product-feature={PRODUCT_CAPABILITIES.agents.id}
               key={a.id}
               onClick={() => onPick(a)}
+              disabled={unavailable}
               className={cn(
-                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-65',
                 active
                   ? 'border-accent bg-accent-soft'
-                  : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
+                  : unavailable
+                    ? 'border-warning/35 bg-warning-soft/25'
+                    : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
               )}
             >
               <AgentAvatar agent={a} className="size-10 rounded-lg shadow-sm" iconSize={19} />
@@ -154,11 +158,21 @@ export function AgentPicker({
                 <span className="flex items-center gap-1.5">
                   <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
                   {a.preset && <Badge tone="accent">预设</Badge>}
+                  {unavailable && (
+                    <Badge tone="warning">
+                      {(a.needsAuthorization?.length ?? 0) > 0 ? 'Plugin 待授权' : '能力待修复'}
+                    </Badge>
+                  )}
                   {active && <Check size={14} className="text-accent" />}
                 </span>
                 <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
                   {a.description}
                 </span>
+                {unavailable && (
+                  <span className="mt-1 block text-[11.5px] leading-snug text-warning">
+                    完成必需能力授权或修复后可使用
+                  </span>
+                )}
               </span>
             </button>
           )

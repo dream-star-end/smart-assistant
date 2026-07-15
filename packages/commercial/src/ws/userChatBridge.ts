@@ -100,6 +100,7 @@ import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensu
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
+import type { AgentModelResolver } from "./agentModelAuthority.js";
 import {
   applyStatusFrame,
   buildAutoRebindFrames,
@@ -655,7 +656,7 @@ export interface UserChatBridgeDeps {
    *     desiredSeedAgents 的 master 侧镜像);
    *   - marketplace 平台预设 + 用户已装 agent:manifest.model
    *     (internalMarketplaceSync 同源:listPlatformPresetAgents ∪
-   *     listActiveInstalledAgents,同 slug 预设优先)。
+   *     runtime-ready Agent projections,同 slug 预设优先)。
    * 容器侧用户手改 agents.yaml 的 agent 不在权威内 → 推导失败 → 拒
    * (gateway seam 的 requestId fail-closed guard 是同问题的容器侧兜底)。
    *
@@ -677,7 +678,7 @@ export interface UserChatBridgeDeps {
       /** 容器 label 上的 platform bundle rev(见 ResolveContainerEndpoint.bundleRev)。 */
       bundleRev?: string;
     },
-  ) => Promise<(agentId: string) => string | null>;
+  ) => Promise<AgentModelResolver>;
   /**
    * Commercial v3 authority for browser chat history lives in master's
    * SQLite, not inside the per-user container. When a browser session switches
@@ -1485,6 +1486,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         let agentModelResolverHandle:
           | {
               resolve: (agentId: string) => string | null;
+              isRuntimeDenied: (agentId: string) => boolean;
               refresh: () => Promise<void>;
             }
           | null = null;
@@ -1493,7 +1495,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const resolverOpts: { bundleRev?: string } = connectionBundleRev !== undefined
             ? { bundleRev: connectionBundleRev }
             : {};
-          let innerResolve: (agentId: string) => string | null;
+          let innerResolve: AgentModelResolver;
           try {
             innerResolve = await loadResolver(uid, resolverOpts);
           } catch (err) {
@@ -1516,6 +1518,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           let refreshInflight: Promise<void> | null = null;
           agentModelResolverHandle = {
             resolve: (agentId) => innerResolve(agentId),
+            isRuntimeDenied: (agentId) => innerResolve.isRuntimeDenied?.(agentId) === true,
             refresh: async () => {
               if (refreshInflight !== null) return refreshInflight;
               refreshInflight = (async () => {
@@ -1671,6 +1674,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 推导;null = deps 未注入,桥不做推导,行为与字段加入前一致)。
      *   - `resolve(agentId)`:已绑定本连接 uid 的 sync 快照 closure;null = 权威
      *     推导不出(未知 agentId)
+     *   - `isRuntimeDenied(agentId)`:已安装/预设但能力未就绪的显式拒绝集；即使
+     *     浏览器带了 model 也不得绕过
      *   - `refresh()`:重拉快照(周期 timer 与推导 miss 时补触发,幂等去重)
      * onUserMessage 的 inbound.message 分类用它推导「帧无 model 时该 agent 的
      * 有效模型」,与容器 gateway resolveEngine 的判定保持同构。
@@ -1678,6 +1683,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     agentModelResolverHandle:
       | {
           resolve: (agentId: string) => string | null;
+          isRuntimeDenied: (agentId: string) => boolean;
           refresh: () => Promise<void>;
         }
       | null,
@@ -2630,6 +2636,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameAgentId !== null && agentModelResolverHandle !== null
                 ? agentModelResolverHandle.resolve(frameAgentId)
                 : null;
+            // Capability readiness is a server-owned execution gate, not a model
+            // selection hint. A browser normally supplies frame.model, so checking
+            // only the resolver's null model on the no-model path would let an
+            // installed-but-unready Agent execute from a stale container projection.
+            // Preserve the denied set separately and reject before team-mode/model
+            // precedence regardless of what model the client supplied.
+            if (
+              frameAgentId !== null &&
+              agentModelResolverHandle !== null &&
+              agentModelResolverHandle.isRuntimeDenied(frameAgentId)
+            ) {
+              void agentModelResolverHandle.refresh();
+              bridgeLog?.info("user-chat-bridge: agent runtime not ready, frame rejected", {
+                agentId: frameAgentId,
+              });
+              sendErrorFrame(
+                userWs,
+                "UNRESOLVED_AGENT_MODEL",
+                `agent '${frameAgentId}' is not ready — repair its required capabilities and retry`,
+              );
+              try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "agent_not_runtime_ready"); } catch { /* */ }
+              cleanup("client_close", true);
+              return;
+            }
             // Gateway 对 unknown explicit agentId 会降级为 default/main。bridge 必须用同
             // 一谓词:团队模式下 unknown agent 也按 main 队长强制 GPT,否则客户端可传
             // agentId="bogus"+model="glm-5.2" 让 master 以 GLM 放行、容器却跑 main。

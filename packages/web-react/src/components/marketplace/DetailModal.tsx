@@ -1,9 +1,25 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
-import { Activity, ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
+import {
+  Activity,
+  ArrowUpCircle,
+  Download,
+  Layers,
+  Loader2,
+  ShieldCheck,
+  Target,
+  Users,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
 import { formatInstallCount, marketTrySkillPrefill } from '../../lib/marketplace'
-import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
+import type {
+  AuthSession,
+  MarketplaceCapabilityReadiness,
+  MarketplaceDetail,
+  MarketplaceInstallResult,
+  MarketplaceInstalled,
+  MarketplaceMyAgent,
+} from '../../lib/types'
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
 import { Alert, Badge, Button, Modal } from '../ui'
@@ -27,7 +43,10 @@ function StorefrontInfo({ detail }: { detail: MarketplaceDetail }) {
           <ul className="flex flex-col gap-1">
             {useCases.map((u, i) => (
               <li key={i} className="flex gap-2 text-[13px] leading-relaxed text-fg">
-                <span className="mt-1.5 size-1 shrink-0 rounded-full bg-accent" aria-hidden="true" />
+                <span
+                  className="mt-1.5 size-1 shrink-0 rounded-full bg-accent"
+                  aria-hidden="true"
+                />
                 <span>{u}</span>
               </li>
             ))}
@@ -78,15 +97,31 @@ function scriptReviewCopy(source: MarketplaceDetail['reviewSource']): string {
 }
 
 /** Friendly render of an agent manifest (model / toolsets / 依赖技能 / 人设). */
-function AgentManifestView({ manifest }: { manifest: unknown }) {
+function AgentManifestView({
+  manifest,
+  readiness,
+}: {
+  manifest: unknown
+  readiness?: MarketplaceCapabilityReadiness
+}) {
   const m = (manifest ?? {}) as {
     model?: string
     toolsets?: string[]
+    capabilities?: Array<{ kind?: unknown; slug?: unknown; optional?: unknown }>
     skillDeps?: string[]
     persona?: string
   }
   const toolsets = Array.isArray(m.toolsets) ? m.toolsets : []
-  const deps = Array.isArray(m.skillDeps) ? m.skillDeps : []
+  const capabilities = Array.isArray(m.capabilities)
+    ? m.capabilities.filter(
+        (item): item is { kind: 'skill' | 'plugin'; slug: string; optional?: boolean } =>
+          (item.kind === 'skill' || item.kind === 'plugin') && typeof item.slug === 'string',
+      )
+    : (Array.isArray(m.skillDeps) ? m.skillDeps : []).map((slug) => ({
+        kind: 'skill' as const,
+        slug,
+        optional: false,
+      }))
   return (
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -109,18 +144,41 @@ function AgentManifestView({ manifest }: { manifest: unknown }) {
           </div>
         </div>
       </div>
-      {deps.length > 0 && (
+      {capabilities.length > 0 && (
         <div>
           <div className="mb-1 text-[12px] font-medium text-muted">
-            依赖技能（安装时将一并加入 {deps.length} 个）
+            组合能力（{capabilities.length} 项，必需能力与智能体原子安装）
           </div>
           <div className="flex flex-wrap gap-1">
-            {deps.map((d) => (
-              <Badge key={d} tone="neutral">
-                {d}
-              </Badge>
-            ))}
+            {capabilities.map((capability) => {
+              const state = readiness?.requirements.find(
+                (item) => item.kind === capability.kind && item.slug === capability.slug,
+              )
+              const stateLabel =
+                state?.status === 'ready'
+                  ? '已就绪'
+                  : state?.status === 'needs_authorization'
+                    ? '待授权'
+                    : state?.status === 'revoked'
+                      ? '已撤销'
+                      : state?.status === 'missing'
+                        ? '未安装'
+                        : null
+              return (
+                <Badge
+                  key={`${capability.kind}:${capability.slug}`}
+                  tone={state?.status === 'ready' ? 'success' : stateLabel ? 'warning' : 'neutral'}
+                >
+                  {capability.kind === 'plugin' ? 'Plugin' : 'Skill'} · {capability.slug}
+                  {capability.optional ? ' · 可选' : ' · 必需'}
+                  {stateLabel ? ` · ${stateLabel}` : ''}
+                </Badge>
+              )
+            })}
           </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-faint">
+            能力绑定用于组合与就绪检查，不是逐智能体的插件权限隔离；插件账号仍按当前用户授权。
+          </p>
         </div>
       )}
       <div>
@@ -192,26 +250,47 @@ export function DetailModal({
   const [installing, setInstalling] = useState(false)
   const [scopeSaving, setScopeSaving] = useState(false)
   const [done, setDone] = useState(false)
+  const [installResult, setInstallResult] = useState<MarketplaceInstallResult | null>(null)
   const [agents, setAgents] = useState<MarketplaceMyAgent[]>([])
   const [scopeIds, setScopeIds] = useState<string[]>(['main'])
+  const installedManualScopeKey = normalizeAgentScope(
+    installed?.manualAgentIds ?? installed?.agentIds,
+  ).join('\0')
 
   useEffect(() => {
     if (!slug) {
       setDetail(null)
       setErr(null)
       setDone(false)
+      setInstallResult(null)
       return
     }
     let alive = true
     setLoading(true)
     setErr(null)
     setDone(false)
-    Promise.all([api.getMarketplaceDetail(auth, slug), api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[])])
+    setInstallResult(null)
+    Promise.all([
+      api.getMarketplaceDetail(auth, slug),
+      api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[]),
+    ])
       .then(([d, a]) => {
         if (!alive) return
         setDetail(d)
-        setAgents(a.length ? a : [{ id: 'main', slug: 'main', name: '全能助手', description: '', installed: true, isDefault: true }])
-        setScopeIds(normalizeAgentScope(installed?.agentIds))
+        setAgents(
+          a.length
+            ? a
+            : [
+                {
+                  id: 'main',
+                  slug: 'main',
+                  name: '全能助手',
+                  description: '',
+                  installed: true,
+                  isDefault: true,
+                },
+              ],
+        )
       })
       .catch((e) => alive && setErr(apiErrorMessage(e, '加载详情失败')))
       .finally(() => alive && setLoading(false))
@@ -221,15 +300,28 @@ export function DetailModal({
   }, [slug, auth])
 
   useEffect(() => {
-    setScopeIds(normalizeAgentScope(installed?.agentIds))
-  }, [installed?.slug, installed?.agentIds?.join(',')])
+    setScopeIds(installedManualScopeKey ? installedManualScopeKey.split('\0') : [])
+  }, [installedManualScopeKey, slug])
 
   const install = async () => {
     if (!detail) return
     setInstalling(true)
     setErr(null)
     try {
-      await api.installMarketplace(auth, detail.versionId, detail.kind === 'skill' ? scopeIds : undefined)
+      const preserveManualScope = detail.kind === 'skill' && !!installed && !scopeChanged
+      const result = preserveManualScope
+        ? await api.installMarketplace(
+            auth,
+            detail.versionId,
+            normalizeAgentScope(installed.agentIds ?? installed.manualAgentIds),
+            true,
+          )
+        : await api.installMarketplace(
+            auth,
+            detail.versionId,
+            detail.kind === 'skill' ? scopeIds : undefined,
+          )
+      setInstallResult(result)
       setDone(true)
       onInstalled()
     } catch (e) {
@@ -259,18 +351,38 @@ export function DetailModal({
   const isOfficialConnector = detail?.kind === 'connector' && !!detail.official
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
   // 预设不走安装/更新语义(恒为最新上架版本,开箱即用)。
-  const canUpdate =
+  const versionUpdateAvailable =
     !isPreset &&
     !isOfficialConnector &&
     !!installed &&
     !!detail &&
     installed.versionId !== detail.versionId
+  const dormantSkill =
+    detail?.kind === 'skill' && !!installed && normalizeAgentScope(installed.agentIds).length === 0
+  const canUpdate = versionUpdateAvailable && (!dormantSkill || scopeIds.length > 0)
   const isAgent = detail?.kind === 'agent'
+  const hasRepairableRequiredCapability =
+    isAgent &&
+    detail.capabilityReadiness?.requirements.some(
+      (item) => !item.optional && item.repairable === true,
+    ) === true
+  const canRepair =
+    !!installed &&
+    isAgent &&
+    detail.capabilityReadiness?.installed === true &&
+    detail.capabilityReadiness.ready === false &&
+    hasRepairableRequiredCapability &&
+    !canUpdate
   const scopeChanged =
     !!installed &&
     !!detail &&
     detail.kind === 'skill' &&
-    normalizeAgentScope(installed.agentIds).join('\0') !== normalizeAgentScope(scopeIds).join('\0')
+    installedManualScopeKey !== normalizeAgentScope(scopeIds).join('\0')
+  const installNeedsAuthorizationCount = installResult?.needsAuthorization?.length ?? 0
+  const installedCapabilityCount = installResult?.installedCapabilities?.length ?? 0
+  const skippedOptionalCount = installResult?.skippedOptional?.length ?? 0
+  const installNeedsAuthorization = installNeedsAuthorizationCount > 0
+  const detailNeedsAuthorization = (detail?.capabilityReadiness?.needsAuthorization.length ?? 0) > 0
 
   return (
     <Modal
@@ -306,8 +418,16 @@ export function DetailModal({
                 )}
               </>
             ) : done ? (
-              <Badge tone="success" className="self-center">
-                <ShieldCheck size={13} /> {canUpdate ? '更新成功' : '安装成功'}
+              <Badge
+                tone={isAgent && installNeedsAuthorization ? 'warning' : 'success'}
+                className="self-center"
+              >
+                <ShieldCheck size={13} />{' '}
+                {isAgent && installNeedsAuthorization
+                  ? `${canUpdate ? '更新' : '安装'}完成 · Plugin 待授权`
+                  : canUpdate
+                    ? '更新成功'
+                    : '安装成功'}
               </Badge>
             ) : canUpdate ? (
               <Button variant="primary" onClick={install} disabled={installing}>
@@ -317,6 +437,11 @@ export function DetailModal({
                   <ArrowUpCircle size={15} />
                 )}
                 更新到 v{detail.version}
+              </Button>
+            ) : canRepair ? (
+              <Button variant="primary" onClick={install} disabled={installing}>
+                {installing && <Loader2 size={15} className="animate-spin" />}
+                重新安装整包修复
               </Button>
             ) : scopeChanged ? (
               <Button variant="primary" onClick={saveScope} disabled={scopeSaving}>
@@ -351,23 +476,72 @@ export function DetailModal({
         <div className="flex flex-col gap-3">
           {err && <Alert tone="danger">{err}</Alert>}
           {done && (
-            <Alert tone="success" title={canUpdate ? '已更新' : '已安装'}>
+            <Alert
+              tone={isAgent && installNeedsAuthorization ? 'warning' : 'success'}
+              title={
+                isAgent && installNeedsAuthorization
+                  ? `${canUpdate ? '更新' : '安装'}完成，仍有 Plugin 待授权`
+                  : canUpdate
+                    ? '已更新'
+                    : '已安装'
+              }
+            >
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span>
                   {detail.kind === 'connector'
                     ? 'API 连接插件已加入你的能力库，请到管理中心绑定应用账号。'
                     : isAgent
-                      ? '可在输入框上方的智能体选择器中切换使用。'
+                      ? installNeedsAuthorization
+                        ? installResult?.ready
+                          ? `智能体已经可用；另有 ${installNeedsAuthorizationCount} 项可选 Plugin 可在绑定账号后启用。`
+                          : `智能体与能力已安装；完成 ${installNeedsAuthorizationCount} 项必需 Plugin 的账号授权后即可使用。`
+                        : `智能体与 ${installedCapabilityCount} 项能力已完整安装，可在智能体选择器中切换。`
                       : '将在你的下一次会话中对 AI 可用。'}
                 </span>
-                {detail.kind === 'connector' && onOpenConnectors && (
-                  <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
-                    去管理中心绑定
-                  </Button>
-                )}
+                {(detail.kind === 'connector' || (isAgent && installNeedsAuthorization)) &&
+                  onOpenConnectors && (
+                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                      {isAgent ? '管理 Plugin 账号' : '去管理中心绑定'}
+                    </Button>
+                  )}
               </div>
+              {isAgent && skippedOptionalCount > 0 && (
+                <p className="mt-1 text-[12px]">
+                  已明确跳过 {skippedOptionalCount} 项当前不可用的可选能力。
+                </p>
+              )}
             </Alert>
           )}
+          {!done &&
+            isAgent &&
+            detail.capabilityReadiness?.installed &&
+            (!detail.capabilityReadiness.ready || detailNeedsAuthorization) && (
+              <Alert
+                tone="warning"
+                title={
+                  detail.capabilityReadiness.ready
+                    ? '该智能体可用，仍有可选 Plugin 待授权'
+                    : '该智能体尚未完全就绪'
+                }
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span>
+                    {detailNeedsAuthorization
+                      ? detail.capabilityReadiness.ready
+                        ? `有 ${detail.capabilityReadiness.needsAuthorization.length} 个可选 Plugin 等待账号授权，不影响当前智能体使用。`
+                        : `有 ${detail.capabilityReadiness.needsAuthorization.length} 个必需 Plugin 等待账号授权。`
+                      : hasRepairableRequiredCapability
+                        ? '存在未安装或版本失效的必需能力，可重新安装整包修复。'
+                        : '必需能力已被下架或撤销，需等待平台恢复或发布者更新。'}
+                  </span>
+                  {detailNeedsAuthorization && onOpenConnectors && (
+                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                      管理 Plugin 账号
+                    </Button>
+                  )}
+                </div>
+              </Alert>
+            )}
           {isPreset && (
             <Alert tone="info" title="平台预设智能体">
               无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
@@ -381,6 +555,12 @@ export function DetailModal({
           {!done && canUpdate && installed && (
             <Alert tone="info" title={`有新版本 v${detail.version}`}>
               你当前安装的是 v{installed.version}，更新后下一次会话生效。
+            </Alert>
+          )}
+          {!done && versionUpdateAvailable && dormantSkill && scopeIds.length === 0 && (
+            <Alert tone="info" title={`有新版本 v${detail.version}`}>
+              该 Skill
+              当前仅保留在能力库中、未分配给任何智能体。先选择智能体再更新，避免意外重新启用。
             </Alert>
           )}
           <p className="text-[13.5px] leading-relaxed text-fg">{detail.description}</p>
@@ -432,7 +612,8 @@ export function DetailModal({
             {detail.benchmark && (
               <Badge tone="info">
                 实测 {Math.round(detail.benchmark.withoutPassRate * 100)}%→
-                {Math.round(detail.benchmark.withPassRate * 100)}%（{detail.benchmark.cases} 用例·发布者提供）
+                {Math.round(detail.benchmark.withPassRate * 100)}%（{detail.benchmark.cases}{' '}
+                用例·发布者提供）
               </Badge>
             )}
           </div>
@@ -451,7 +632,8 @@ export function DetailModal({
           {detail.rawBundle &&
             Object.keys(detail.rawBundle).some((p) => p.startsWith('scripts/')) && (
               <Alert tone="warning" title="含可执行脚本">
-                该技能带 {Object.keys(detail.rawBundle).filter((p) => p.startsWith('scripts/')).length}{' '}
+                该技能带{' '}
+                {Object.keys(detail.rawBundle).filter((p) => p.startsWith('scripts/')).length}{' '}
                 个脚本文件，安装后可能被智能体执行。{scriptReviewCopy(detail.reviewSource)}
                 建议安装前点开逐个查看内容。
               </Alert>
@@ -473,7 +655,7 @@ export function DetailModal({
 
           {detail.kind === 'agent' ? (
             // 智能体的 manifest 是「装的到底是什么」的核心,保持展开(不折叠)。
-            <AgentManifestView manifest={detail.manifest} />
+            <AgentManifestView manifest={detail.manifest} readiness={detail.capabilityReadiness} />
           ) : detail.kind === 'connector' ? (
             <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-3 py-2.5">
               <div className="text-[12px] font-medium text-muted">API 插件 · 平台已签安全范围</div>
@@ -485,7 +667,8 @@ export function DetailModal({
                   <div className="flex flex-wrap gap-1">
                     {detail.connectorContract.actions.map((a) => (
                       <Badge key={a.id} tone={a.effect === 'read' ? 'neutral' : 'warning'}>
-                        {a.id} · {a.effect === 'read' ? '读取' : a.effect === 'send' ? '发送' : '写入'}
+                        {a.id} ·{' '}
+                        {a.effect === 'read' ? '读取' : a.effect === 'send' ? '发送' : '写入'}
                       </Badge>
                     ))}
                   </div>
@@ -495,7 +678,9 @@ export function DetailModal({
                   </div>
                 </>
               ) : (
-                <span className="text-[12px] text-warning">当前签名契约不可用，无法安装或绑定。</span>
+                <span className="text-[12px] text-warning">
+                  当前签名契约不可用，无法安装或绑定。
+                </span>
               )}
               <details>
                 <summary className="cursor-pointer text-[11.5px] text-faint">

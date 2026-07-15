@@ -1,4 +1,11 @@
-import { marketplaceReviewSource, type MarketplaceReviewSource } from '@openclaude/protocol'
+import {
+  type MarketplaceCapabilityInstallOutcome,
+  type MarketplaceCapabilityRef,
+  type MarketplaceReviewSource,
+  marketplaceCapabilityKind,
+  marketplaceCapabilityStorageKind,
+  marketplaceReviewSource,
+} from '@openclaude/protocol'
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
 import {
@@ -12,7 +19,7 @@ import { type QueryRunner, query, tx } from '../db/queries.js'
 import { getActiveMembership } from '../org/memberships.js'
 import {
   lockMarketplaceListing,
-  lockMarketplaceUserSlug,
+  lockMarketplaceMutationSet,
   lockMarketplaceVersion,
 } from './locking.js'
 /**
@@ -44,6 +51,7 @@ export class MarketplaceError extends Error {
       | 'NOT_INSTALLABLE'
       | 'KIND_MISMATCH'
       | 'ARTIFACT_MISMATCH'
+      | 'INVALID_CAPABILITY'
       | 'INSTALL_CONFLICT',
     message: string,
   ) {
@@ -52,7 +60,7 @@ export class MarketplaceError extends Error {
   }
 }
 
-export type InstallScopeMode = 'preserve' | 'replace' | 'merge'
+export type InstallScopeMode = 'preserve' | 'replace' | 'merge' | 'legacy_union'
 
 const VALID_AGENT_SCOPE_ID_RE = /^[A-Za-z0-9_-]+$/
 export const DEFAULT_INSTALL_AGENT_IDS = ['main']
@@ -81,6 +89,18 @@ export function normalizeInstallAgentIds(
 
 function mergeAgentIds(a: readonly string[], b: readonly string[]): string[] {
   return normalizeInstallAgentIds([...a, ...b], DEFAULT_INSTALL_AGENT_IDS)
+}
+
+function normalizeCapabilityScopeCache(input: unknown): string[] {
+  if (!Array.isArray(input)) return []
+  const out: string[] = []
+  for (const item of input) {
+    if (typeof item !== 'string') continue
+    const id = item.trim()
+    if (!id || !VALID_AGENT_SCOPE_ID_RE.test(id) || out.includes(id)) continue
+    out.push(id)
+  }
+  return out
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -193,9 +213,298 @@ export interface PublishInput {
   queueAiReview?: boolean
 }
 
+interface CapabilityRequirementInput {
+  slug: string
+  kind: 'skill' | 'connector'
+  required: boolean
+}
+
+function capabilityRequirementsFromManifest(
+  manifest: unknown,
+  agentSlug: string,
+): CapabilityRequirementInput[] {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest))
+    throw new MarketplaceError('INVALID_CAPABILITY', '智能体 manifest 缺失')
+  const raw = manifest as { capabilities?: unknown; skillDeps?: unknown }
+  let refs: MarketplaceCapabilityRef[]
+  if (Array.isArray(raw.capabilities)) {
+    refs = raw.capabilities as MarketplaceCapabilityRef[]
+  } else if (Array.isArray(raw.skillDeps)) {
+    refs = raw.skillDeps.map((slug) => ({
+      kind: 'skill',
+      slug,
+      optional: false,
+    })) as MarketplaceCapabilityRef[]
+  } else {
+    refs = []
+  }
+  if (refs.length > 32) throw new MarketplaceError('INVALID_CAPABILITY', '智能体能力依赖最多 32 项')
+  const out: CapabilityRequirementInput[] = []
+  const seen = new Set<string>()
+  for (const ref of refs) {
+    const storageKind =
+      ref?.kind === 'skill' || ref?.kind === 'plugin'
+        ? marketplaceCapabilityStorageKind(ref.kind)
+        : ref?.kind
+    if (
+      (storageKind !== 'skill' && storageKind !== 'connector') ||
+      typeof ref.slug !== 'string' ||
+      !/^[a-z0-9][a-z0-9-]{1,63}$/.test(ref.slug) ||
+      typeof ref.optional !== 'boolean'
+    )
+      throw new MarketplaceError('INVALID_CAPABILITY', '智能体能力依赖格式不合法')
+    if (ref.slug === agentSlug)
+      throw new MarketplaceError('INVALID_CAPABILITY', '智能体不能依赖自身')
+    const key = `${storageKind}:${ref.slug}`
+    if (seen.has(key)) throw new MarketplaceError('INVALID_CAPABILITY', `能力依赖重复：${ref.slug}`)
+    seen.add(key)
+    out.push({ slug: ref.slug, kind: storageKind, required: !ref.optional })
+  }
+  return out
+}
+
+async function validateCapabilityRequirements(
+  runner: QueryRunner,
+  requirements: readonly CapabilityRequirementInput[],
+  callerOrgId: CallerOrgId,
+): Promise<void> {
+  if (requirements.length === 0) return
+  const rows = await runner.query<{
+    slug: string
+    kind: ArtifactKind
+    state: string
+    current_approved_version_id: string | null
+    version_status: string | null
+    security_review_state: string | null
+    functional_verify_state: string | null
+    exec_revoked_at: Date | null
+  }>(
+    `SELECT l.slug, l.kind, l.state, l.current_approved_version_id::text,
+            v.status AS version_status, v.security_review_state,
+            v.functional_verify_state, v.exec_revoked_at
+       FROM marketplace_skill_listings l
+       LEFT JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = ANY($1::text[]) AND ${orgVisibleFrag('l', 2)}`,
+    [requirements.map((item) => item.slug), callerOrgId],
+  )
+  const bySlug = new Map(rows.rows.map((row) => [row.slug, row]))
+  for (const requirement of requirements) {
+    const row = bySlug.get(requirement.slug)
+    if (!row || row.kind !== requirement.kind)
+      throw new MarketplaceError(
+        'INVALID_CAPABILITY',
+        `能力不存在或类型不匹配：${requirement.slug}`,
+      )
+    if (!requirement.required) continue
+    const available =
+      row.state === 'active' &&
+      row.current_approved_version_id !== null &&
+      row.version_status === 'approved'
+    if (!available)
+      throw new MarketplaceError('INVALID_CAPABILITY', `必需能力尚未上架：${requirement.slug}`)
+    if (requirement.kind === 'connector') {
+      if (
+        row.security_review_state !== 'security_approved' ||
+        !isAcceptedFunctionalVerificationState(row.functional_verify_state ?? '') ||
+        row.exec_revoked_at !== null
+      )
+        throw new MarketplaceError(
+          'INVALID_CAPABILITY',
+          `必需插件尚未通过可信审核：${requirement.slug}`,
+        )
+      try {
+        await loadVerifiedContractWithMeta(Number(row.current_approved_version_id), runner)
+      } catch (error) {
+        if (error instanceof ConnectorSpecError)
+          throw new MarketplaceError(
+            'INVALID_CAPABILITY',
+            `必需插件签名不可验证：${requirement.slug}`,
+          )
+        throw error
+      }
+    }
+  }
+}
+
+interface CapabilityApprovalRequirement extends CapabilityRequirementInput {
+  currentVersionId: string | null
+}
+
+interface CapabilityApprovalGraph {
+  rootSlug: string
+  rootKind: ArtifactKind
+  requirements: CapabilityApprovalRequirement[]
+}
+
+type LockedMarketplaceVersionRow = NonNullable<
+  Awaited<ReturnType<typeof lockMarketplaceVersion>>
+>
+type LockedMarketplaceListingRow = NonNullable<
+  Awaited<ReturnType<typeof lockMarketplaceListing>>
+>
+
+async function loadCapabilityApprovalGraph(
+  versionId: string,
+  runner: QueryRunner = getPool(),
+): Promise<CapabilityApprovalGraph | null> {
+  const root = await runner.query<{ slug: string; kind: ArtifactKind }>(
+    `SELECT v.slug, l.kind FROM marketplace_skill_versions v
+      JOIN marketplace_skill_listings l ON l.slug = v.slug WHERE v.id = $1`,
+    [versionId],
+  )
+  const row = root.rows[0]
+  if (!row) return null
+  const requirements =
+    row.kind === 'agent'
+      ? await runner.query<{
+          slug: string
+          kind: 'skill' | 'connector'
+          required: boolean
+          current_version_id: string | null
+        }>(
+          `SELECT r.capability_slug AS slug, r.capability_kind AS kind, r.required,
+                  l.current_approved_version_id::text AS current_version_id
+             FROM marketplace_capability_requirements r
+             JOIN marketplace_skill_listings l
+               ON l.slug = r.capability_slug AND l.kind = r.capability_kind
+            WHERE r.agent_version_id = $1
+            ORDER BY r.capability_kind, r.capability_slug`,
+          [versionId],
+        )
+      : { rows: [] }
+  return {
+    rootSlug: row.slug,
+    rootKind: row.kind,
+    requirements: requirements.rows.map((requirement) => ({
+      slug: requirement.slug,
+      kind: requirement.kind,
+      required: requirement.required,
+      currentVersionId: requirement.current_version_id,
+    })),
+  }
+}
+
+function sameCapabilityApprovalGraph(
+  before: CapabilityApprovalGraph,
+  after: CapabilityApprovalGraph,
+): boolean {
+  return (
+    before.rootSlug === after.rootSlug &&
+    before.rootKind === after.rootKind &&
+    before.requirements.length === after.requirements.length &&
+    before.requirements.every((requirement, index) => {
+      const current = after.requirements[index]
+      return (
+        requirement.slug === current?.slug &&
+        requirement.kind === current.kind &&
+        requirement.required === current.required &&
+        requirement.currentVersionId === current.currentVersionId
+      )
+    })
+  )
+}
+
+async function lockCapabilityApprovalGraph(
+  runner: QueryRunner,
+  versionId: string,
+  discovered: CapabilityApprovalGraph,
+): Promise<{
+  rootVersion: LockedMarketplaceVersionRow
+  rootListing: LockedMarketplaceListingRow
+  versions: Map<string, LockedMarketplaceVersionRow>
+  listings: Map<string, LockedMarketplaceListingRow>
+  requirements: CapabilityApprovalRequirement[]
+}> {
+  const versionIds = [
+    versionId,
+    ...discovered.requirements.flatMap((requirement) =>
+      requirement.currentVersionId ? [requirement.currentVersionId] : [],
+    ),
+  ]
+    .filter((id, index, all) => all.indexOf(id) === index)
+    .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0))
+  const versions = new Map<string, LockedMarketplaceVersionRow>()
+  for (const id of versionIds) {
+    const version = await lockMarketplaceVersion(runner, id)
+    if (version) versions.set(version.id, version)
+  }
+
+  const listingSlugs = [
+    discovered.rootSlug,
+    ...discovered.requirements.map((requirement) => requirement.slug),
+  ]
+    .filter((slug, index, all) => all.indexOf(slug) === index)
+    .sort()
+  const listings = new Map<string, LockedMarketplaceListingRow>()
+  for (const slug of listingSlugs) {
+    const listing = await lockMarketplaceListing(runner, slug)
+    if (listing) listings.set(listing.slug, listing)
+  }
+
+  const current = await loadCapabilityApprovalGraph(versionId, runner)
+  if (!current || !sameCapabilityApprovalGraph(discovered, current))
+    throw new MarketplaceError('INSTALL_CONFLICT', '能力依赖在审核期间发生变化,请重试')
+  const rootVersion = versions.get(versionId)
+  const rootListing = listings.get(current.rootSlug)
+  if (!rootVersion || !rootListing || rootVersion.slug !== current.rootSlug)
+    throw new MarketplaceError('VERSION_NOT_FOUND', 'version 或 listing 不存在')
+  return {
+    rootVersion,
+    rootListing,
+    versions,
+    listings,
+    requirements: current.requirements,
+  }
+}
+
+async function validateLockedCapabilityRequirements(
+  runner: QueryRunner,
+  graph: Awaited<ReturnType<typeof lockCapabilityApprovalGraph>>,
+): Promise<void> {
+  for (const requirement of graph.requirements) {
+    const listing = graph.listings.get(requirement.slug)
+    if (
+      !listing ||
+      listing.kind !== requirement.kind ||
+      !orgCanSee(listing.orgId, graph.rootListing.orgId)
+    )
+      throw new MarketplaceError(
+        'INVALID_CAPABILITY',
+        `能力不存在或类型不匹配：${requirement.slug}`,
+      )
+    if (!requirement.required) continue
+    const version = listing.currentApprovedVersionId
+      ? graph.versions.get(listing.currentApprovedVersionId)
+      : undefined
+    if (
+      listing.state !== 'active' ||
+      !version ||
+      version.slug !== listing.slug ||
+      version.status !== 'approved'
+    )
+      throw new MarketplaceError('INVALID_CAPABILITY', `必需能力尚未上架：${requirement.slug}`)
+    if (requirement.kind !== 'connector') continue
+    if (
+      version.securityReviewState !== 'security_approved' ||
+      !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
+      version.execRevokedAt !== null
+    )
+      throw new MarketplaceError('INVALID_CAPABILITY', `必需插件尚未通过可信审核：${requirement.slug}`)
+    try {
+      await loadVerifiedContractWithMeta(Number(version.id), runner)
+    } catch (error) {
+      if (error instanceof ConnectorSpecError)
+        throw new MarketplaceError('INVALID_CAPABILITY', `必需插件签名不可验证：${requirement.slug}`)
+      throw error
+    }
+  }
+}
+
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
 export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
   const kind: ArtifactKind = input.kind ?? 'skill'
+  const requirements =
+    kind === 'agent' ? capabilityRequirementsFromManifest(input.manifest, input.slug) : []
   if (kind === 'connector' && !marketplaceConnectorsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
   const rawArtifact = input.rawArtifact ?? input.rawSkillMd
@@ -215,8 +524,14 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       [input.slug, input.ownerUserId, kind, input.orgId ?? null],
       c,
     )
-    const listing = await query<{ owner_user_id: string; state: string; kind: string }>(
-      'SELECT owner_user_id::text, state, kind FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE',
+    const listing = await query<{
+      owner_user_id: string
+      state: string
+      kind: string
+      org_id: string | null
+    }>(
+      `SELECT owner_user_id::text, state, kind, org_id::text
+         FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE`,
       [input.slug],
       c,
     )
@@ -232,6 +547,7 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
         'KIND_MISMATCH',
         `slug "${input.slug}" 已是「${row.kind}」类型，不能作为「${kind}」发布`,
       )
+    await validateCapabilityRequirements(c, requirements, row.org_id)
 
     try {
       // ai_review_state 在 INSERT 内原子写入(而非发布后再 UPDATE),消除「pending 但
@@ -274,6 +590,18 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
         ],
         c,
       )
+      if (requirements.length > 0) {
+        await query(
+          `INSERT INTO marketplace_capability_requirements
+             (agent_version_id, capability_slug, capability_kind, required)
+           SELECT $1::bigint, x.slug, x.kind, x.required
+             FROM jsonb_to_recordset($2::jsonb) AS x(slug text, kind text, required boolean)
+           ON CONFLICT (agent_version_id, capability_slug, capability_kind)
+           DO UPDATE SET required = EXCLUDED.required`,
+          [ins.rows[0].id, JSON.stringify(requirements)],
+          c,
+        )
+      }
       return { versionId: ins.rows[0].id }
     } catch (e) {
       if (e instanceof Error && /duplicate key|unique/i.test(e.message))
@@ -404,16 +732,12 @@ export async function reviewVersion(args: {
   aiNote?: string | null
 }): Promise<void> {
   const source = args.source ?? 'human'
+  const discovered = await loadCapabilityApprovalGraph(args.versionId)
+  if (!discovered) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
   await tx(async (c) => {
-    const v = await query<{ slug: string; status: string; submitted_by: string }>(
-      'SELECT slug, status, submitted_by::text FROM marketplace_skill_versions WHERE id = $1 FOR UPDATE',
-      [args.versionId],
-      c,
-    )
-    const row = v.rows[0]
-    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
-    const lockedListing = await lockMarketplaceListing(c, row.slug)
-    if (!lockedListing) throw new MarketplaceError('VERSION_NOT_FOUND', 'listing 不存在')
+    const graph = await lockCapabilityApprovalGraph(c, args.versionId, discovered)
+    const row = graph.rootVersion
+    const lockedListing = graph.rootListing
     // connector 必须走 connectorReview 的原子安全审+功能验收流程；approve/reject 都禁止旁路。
     if (lockedListing.kind === 'connector')
       throw new MarketplaceError('KIND_MISMATCH', 'connector 必须使用专用审核流程')
@@ -421,9 +745,12 @@ export async function reviewVersion(args: {
     if (
       args.reviewerUserId != null &&
       !args.allowSelfReview &&
-      BigInt(row.submitted_by) === BigInt(args.reviewerUserId)
+      BigInt(row.submittedBy) === BigInt(args.reviewerUserId)
     )
       throw new MarketplaceError('REVIEWER_IS_AUTHOR', '审核人不能是发布者本人')
+
+    if (args.approve && lockedListing.kind === 'agent')
+      await validateLockedCapabilityRequirements(c, graph)
 
     const isAi = source === 'ai'
     await query(
@@ -511,30 +838,34 @@ export async function approvePlatformVersion(
   version: string,
   expectedArtifactHash: string,
 ): Promise<void> {
+  const target = await query<{ id: string }>(
+    `SELECT id::text FROM marketplace_skill_versions WHERE slug = $1 AND version = $2`,
+    [slug, version],
+  )
+  const versionId = target.rows[0]?.id
+  if (!versionId)
+    throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
+  const discovered = await loadCapabilityApprovalGraph(versionId)
+  if (!discovered)
+    throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
   await tx(async (c) => {
-    const v = await query<{ id: string; artifact_hash: string; kind: string }>(
-      `SELECT v.id::text, v.artifact_hash, l.kind
-         FROM marketplace_skill_versions v
-         JOIN marketplace_skill_listings l ON l.slug = v.slug
-        WHERE v.slug = $1 AND v.version = $2
-        FOR UPDATE OF v`,
-      [slug, version],
-      c,
-    )
-    const row = v.rows[0]
-    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
+    const graph = await lockCapabilityApprovalGraph(c, versionId, discovered)
+    const row = graph.rootVersion
     // 只批准 agent 类(平台 seed 只产 agent)+ 内容必须与代码定义一致。否则可能把一个
     // 早已存在的同名同版本(他人/历史/被拒)版本误批成「官方」——绝不批准外来内容。
-    if (row.kind !== 'agent')
+    if (graph.rootListing.kind !== 'agent')
       throw new MarketplaceError(
         'KIND_MISMATCH',
-        `platform seed 期望 agent 类,实际 ${row.kind}(${slug}@${version})`,
+        `platform seed 期望 agent 类,实际 ${graph.rootListing.kind}(${slug}@${version})`,
       )
-    if (row.artifact_hash !== expectedArtifactHash)
+    if (row.slug !== slug || row.version !== version)
+      throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
+    if (row.artifactHash !== expectedArtifactHash)
       throw new MarketplaceError(
         'ARTIFACT_MISMATCH',
         `platform seed artifact 不匹配,拒绝批准外来内容(${slug}@${version})`,
       )
+    await validateLockedCapabilityRequirements(c, graph)
     await query(
       `UPDATE marketplace_skill_versions
           SET status = 'approved', reviewed_by = submitted_by, reviewed_at = NOW(),
@@ -1121,125 +1452,896 @@ export async function getListingDetail(
   }
 }
 
-/**
- * Install an approved version, pinning (version_id, artifact_hash).
- *
- * Validity (version approved + listing active + version is the listing's CURRENT
- * approved one) is re-checked inside the same transaction that inserts the
- * install, with `FOR UPDATE OF l` on the listing row. This closes the TOCTOU
- * window: a concurrent revoke/new-approve either blocks until we commit, or — if
- * it committed first — the locked re-read no longer matches the WHERE and we
- * raise NOT_INSTALLABLE instead of recording an install for a revoked/superseded
- * version. Re-install supersedes the prior active row (soft-delete, audit kept).
- */
+export interface MarketplaceBundleInstallResult extends MarketplaceCapabilityInstallOutcome {
+  slug: string
+  kind: ArtifactKind
+  version: string
+  name: string
+}
+
+interface BundleRequirementRow {
+  slug: string
+  kind: 'skill' | 'connector'
+  required: boolean
+}
+
+function orgCanSee(orgId: string | null, callerOrgId: CallerOrgId): boolean {
+  return orgId == null || (callerOrgId != null && BigInt(orgId) === BigInt(callerOrgId))
+}
+
+async function verifyLockedInstallTarget(
+  runner: QueryRunner,
+  version: NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>,
+  listing: NonNullable<Awaited<ReturnType<typeof lockMarketplaceListing>>>,
+  callerOrgId: CallerOrgId,
+  opts: { allowPreinstalledConnector?: boolean } = {},
+): Promise<void> {
+  if (
+    version.slug !== listing.slug ||
+    !orgCanSee(listing.orgId, callerOrgId) ||
+    version.status !== 'approved' ||
+    listing.state !== 'active' ||
+    listing.currentApprovedVersionId !== version.id
+  )
+    throw new MarketplaceError('NOT_INSTALLABLE', `工件不可安装：${version.slug}`)
+  if (listing.kind === 'agent' && !marketplaceAgentsEnabled())
+    throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
+  if (listing.kind !== 'connector') return
+  if (!marketplaceConnectorsEnabled())
+    throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
+  if (isDefaultConnectorSlug(version.slug) && opts.allowPreinstalledConnector !== true)
+    throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
+  if (
+    version.securityReviewState !== 'security_approved' ||
+    !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
+    version.execRevokedAt !== null
+  )
+    throw new MarketplaceError('NOT_INSTALLABLE', `插件尚未完成可信审核：${version.slug}`)
+  try {
+    await loadVerifiedContractWithMeta(Number(version.id), runner)
+  } catch (error) {
+    if (error instanceof ConnectorSpecError)
+      throw new MarketplaceError('NOT_INSTALLABLE', `插件执行契约不可验证：${version.slug}`)
+    throw error
+  }
+}
+
+async function replacePinnedInstall(
+  runner: QueryRunner,
+  userId: number,
+  version: NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>,
+  agentIds: readonly string[],
+): Promise<boolean> {
+  // Keep the legacy non-empty projection valid until normalized bindings are
+  // recomputed later in this transaction. Old-source rollback readers therefore
+  // never reinterpret a transient [] as the default "main" scope.
+  const compatibilityScope = agentIds.length > 0 ? agentIds : DEFAULT_INSTALL_AGENT_IDS
+  const existing = await runner.query<{ id: string }>(
+    `SELECT id::text FROM marketplace_installs
+      WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
+      FOR UPDATE`,
+    [userId, version.slug],
+  )
+  if (existing.rows[0])
+    await runner.query('UPDATE marketplace_installs SET uninstalled_at = NOW() WHERE id = $1', [
+      existing.rows[0].id,
+    ])
+  try {
+    await runner.query(
+      `INSERT INTO marketplace_installs
+         (user_id, slug, version_id, artifact_hash, installed_by, agent_ids)
+       VALUES ($1,$2,$3,$4,$1,$5::jsonb)`,
+      [userId, version.slug, version.id, version.artifactHash, JSON.stringify(compatibilityScope)],
+    )
+  } catch (error) {
+    if (isUniqueViolation(error))
+      throw new MarketplaceError('INSTALL_CONFLICT', '安装状态冲突,请重试')
+    throw error
+  }
+  return existing.rows[0] !== undefined
+}
+
+async function replaceManualBindings(
+  runner: QueryRunner,
+  args: {
+    userId: number
+    slug: string
+    kind: 'skill' | 'connector'
+    agentIds?: string[]
+    scopeMode: InstallScopeMode
+    hadExistingInstall: boolean
+  },
+): Promise<void> {
+  const existing = await runner.query<{ agent_slug: string }>(
+    `SELECT agent_slug FROM marketplace_agent_capability_bindings
+      WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+        AND source = 'manual'
+      ORDER BY agent_slug
+      FOR UPDATE`,
+    [args.userId, args.slug, args.kind],
+  )
+  const oldIds = existing.rows.map((row) => row.agent_slug)
+  const supplied = args.agentIds === undefined ? [] : normalizeInstallAgentIds(args.agentIds, [])
+  let finalIds: string[]
+  if (args.scopeMode === 'replace')
+    finalIds = supplied.length ? supplied : DEFAULT_INSTALL_AGENT_IDS
+  else if (args.scopeMode === 'merge') finalIds = mergeAgentIds(oldIds, supplied)
+  else if (args.scopeMode === 'legacy_union') {
+    // Pre-capability-graph clients send the compatibility union back as agentIds.
+    // Strip dependency-owned scopes instead of persisting them as manual provenance.
+    // With no explicit list, an existing install preserves its manual scope while a
+    // first install keeps the historical main-Agent default.
+    if (args.agentIds === undefined && args.hadExistingInstall) finalIds = oldIds
+    else {
+      const dependencyOwned = await runner.query<{ agent_slug: string }>(
+        `SELECT agent_slug FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+            AND source = 'agent_dependency'
+          ORDER BY agent_slug
+          FOR UPDATE`,
+        [args.userId, args.slug, args.kind],
+      )
+      const automatic = new Set(dependencyOwned.rows.map((row) => row.agent_slug))
+      const alreadyManual = new Set(oldIds)
+      finalIds = supplied.filter(
+        (agentId) => !automatic.has(agentId) || alreadyManual.has(agentId),
+      )
+      if (!args.hadExistingInstall && finalIds.length === 0)
+        finalIds = DEFAULT_INSTALL_AGENT_IDS
+    }
+  } else
+    finalIds = oldIds.length
+      ? oldIds
+      : supplied.length
+        ? supplied
+        : args.hadExistingInstall
+          ? []
+          : DEFAULT_INSTALL_AGENT_IDS
+
+  await runner.query(
+    `DELETE FROM marketplace_agent_capability_bindings
+      WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+        AND source = 'manual'`,
+    [args.userId, args.slug, args.kind],
+  )
+  await runner.query(
+    `INSERT INTO marketplace_agent_capability_bindings
+       (user_id, agent_slug, capability_slug, capability_kind, source, source_agent_version_id)
+     SELECT $1, x.agent_slug, $2, $3, 'manual', NULL
+       FROM unnest($4::text[]) AS x(agent_slug)`,
+    [args.userId, args.slug, args.kind, finalIds],
+  )
+}
+
+async function recomputeInstallScopeCache(
+  runner: QueryRunner,
+  userId: number,
+  slugs: readonly string[],
+): Promise<void> {
+  if (slugs.length === 0) return
+  await runner.query(
+    `UPDATE marketplace_installs i
+        SET agent_ids = (
+          SELECT jsonb_agg(x.agent_slug ORDER BY x.agent_slug)
+            FROM (
+              SELECT DISTINCT b.agent_slug
+                FROM marketplace_agent_capability_bindings b
+               WHERE b.user_id = i.user_id AND b.capability_slug = i.slug
+            ) x
+        )
+       WHERE i.user_id = $1 AND i.slug = ANY($2::text[]) AND i.uninstalled_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM marketplace_agent_capability_bindings b
+            WHERE b.user_id = i.user_id AND b.capability_slug = i.slug
+         )`,
+    [userId, slugs],
+  )
+  // Plugins are account-level capabilities: removing the Agent composition must
+  // not invalidate an authorized connection by deleting its install entitlement.
+  // Retain an orphaned Plugin with a rollback-safe legacy projection until the user
+  // explicitly uninstalls it (which already requires unbinding active accounts).
+  await runner.query(
+    `UPDATE marketplace_installs i SET agent_ids = '["main"]'::jsonb
+       FROM marketplace_skill_listings l
+      WHERE i.user_id = $1 AND i.slug = ANY($2::text[]) AND i.uninstalled_at IS NULL
+         AND l.slug = i.slug AND l.kind = 'connector'
+         AND NOT EXISTS (
+           SELECT 1 FROM marketplace_agent_capability_bindings b
+            WHERE b.user_id = i.user_id AND b.capability_slug = i.slug
+         )`,
+    [userId, slugs],
+  )
+  // An orphaned Skill has no account-level authorization to preserve. Soft
+  // deletion retains audit history and, unlike an empty active scope, is safe if
+  // the source is rolled back to the legacy non-empty reader.
+  await runner.query(
+    `UPDATE marketplace_installs i SET uninstalled_at = NOW()
+       FROM marketplace_skill_listings l
+      WHERE i.user_id = $1 AND i.slug = ANY($2::text[]) AND i.uninstalled_at IS NULL
+         AND l.slug = i.slug AND l.kind = 'skill'
+         AND NOT EXISTS (
+           SELECT 1 FROM marketplace_agent_capability_bindings b
+            WHERE b.user_id = i.user_id AND b.capability_slug = i.slug
+         )`,
+    [userId, slugs],
+  )
+}
+
+/** Install an Agent and all required Skill/Plugin capabilities as one transaction. */
+export async function installMarketplaceBundle(args: {
+  userId: number
+  versionId: string
+  agentIds?: string[]
+  scopeMode?: InstallScopeMode
+  callerOrgId?: CallerOrgId
+  /** Integration-test-only failure point; never populated by an HTTP route. */
+  failureInjector?: () => void | Promise<void>
+  /** Internal optimistic-discovery retry counter. */
+  retryAttempt?: number
+}): Promise<MarketplaceBundleInstallResult> {
+  const callerOrgId = args.callerOrgId ?? null
+  const located = await query<{ slug: string; kind: ArtifactKind }>(
+    `SELECT v.slug, l.kind FROM marketplace_skill_versions v
+      JOIN marketplace_skill_listings l ON l.slug = v.slug WHERE v.id = $1`,
+    [args.versionId],
+  )
+  const root = located.rows[0]
+  if (!root) throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
+  const discovered = await query<{ slug: string; kind: 'skill' | 'connector'; required: boolean }>(
+    `SELECT capability_slug AS slug, capability_kind AS kind, required
+       FROM marketplace_capability_requirements WHERE agent_version_id = $1
+       ORDER BY capability_kind, capability_slug`,
+    [args.versionId],
+  )
+  const requirements: BundleRequirementRow[] = root.kind === 'agent' ? discovered.rows : []
+  const existingDependencies =
+    root.kind === 'agent'
+      ? await query<{ slug: string; kind: 'skill' | 'connector' }>(
+          `SELECT capability_slug AS slug, capability_kind AS kind
+             FROM marketplace_agent_capability_bindings
+            WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'`,
+          [args.userId, root.slug],
+        )
+      : { rows: [] as Array<{ slug: string; kind: 'skill' | 'connector' }> }
+  const existingManual =
+    root.kind === 'skill' || root.kind === 'connector'
+      ? await query<{ agent_slug: string }>(
+          `SELECT agent_slug FROM marketplace_agent_capability_bindings
+            WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+              AND source = 'manual'`,
+          [args.userId, root.slug, root.kind],
+        )
+      : { rows: [] as Array<{ agent_slug: string }> }
+  const suppliedAgentIds =
+    root.kind === 'agent'
+      ? [root.slug]
+      : normalizeInstallAgentIds(args.agentIds, DEFAULT_INSTALL_AGENT_IDS)
+  try {
+    return await tx(async (c) => {
+      await c.query(
+        "SELECT set_config('openclaude.capability_writer', 'normalized', true)",
+      )
+      await lockMarketplaceMutationSet(c, {
+        userId: args.userId,
+        artifactSlugs: [
+          root.slug,
+          ...requirements.map((item) => item.slug),
+          ...existingDependencies.rows.map((item) => item.slug),
+        ],
+        agentSlugs: [...suppliedAgentIds, ...existingManual.rows.map((row) => row.agent_slug)],
+      })
+
+      if (root.kind === 'agent') {
+        const now = await c.query<{ slug: string; kind: 'skill' | 'connector' }>(
+          `SELECT capability_slug AS slug, capability_kind AS kind
+           FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'
+          ORDER BY capability_kind, capability_slug`,
+          [args.userId, root.slug],
+        )
+        const before = [...existingDependencies.rows].sort((a, b) =>
+          `${a.kind}:${a.slug}`.localeCompare(`${b.kind}:${b.slug}`),
+        )
+        if (
+          now.rows.length !== before.length ||
+          now.rows.some(
+            (item, index) => item.slug !== before[index]?.slug || item.kind !== before[index]?.kind,
+          )
+        )
+          throw new MarketplaceError('INSTALL_CONFLICT', '能力绑定在安装期间发生变化,请重试')
+      } else {
+        const now = await c.query<{ agent_slug: string }>(
+          `SELECT agent_slug FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+            AND source = 'manual'
+          ORDER BY agent_slug`,
+          [args.userId, root.slug, root.kind],
+        )
+        const before = existingManual.rows.map((row) => row.agent_slug).sort()
+        if (
+          now.rows.length !== before.length ||
+          now.rows.some((item, index) => item.agent_slug !== before[index])
+        )
+          throw new MarketplaceError('INSTALL_CONFLICT', '手动归属在安装期间发生变化,请重试')
+      }
+
+      const currentRefs = await c.query<BundleRequirementRow & { version_id: string | null }>(
+        `SELECT r.capability_slug AS slug, r.capability_kind AS kind, r.required,
+              l.current_approved_version_id::text AS version_id
+         FROM marketplace_capability_requirements r
+         JOIN marketplace_skill_listings l
+           ON l.slug = r.capability_slug AND l.kind = r.capability_kind
+        WHERE r.agent_version_id = $1
+        ORDER BY r.capability_kind, r.capability_slug`,
+        [args.versionId],
+      )
+      const refs = root.kind === 'agent' ? currentRefs.rows : []
+      if (
+        refs.length !== requirements.length ||
+        refs.some(
+          (ref, index) =>
+            ref.slug !== requirements[index]?.slug ||
+            ref.kind !== requirements[index]?.kind ||
+            ref.required !== requirements[index]?.required,
+        )
+      )
+        throw new MarketplaceError('INSTALL_CONFLICT', '能力依赖在安装期间发生变化,请重试')
+
+      const versionIds = [
+        args.versionId,
+        ...refs.flatMap((ref) => (ref.version_id ? [ref.version_id] : [])),
+      ]
+        .filter((id, index, all) => all.indexOf(id) === index)
+        .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0))
+      const versions = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>
+      >()
+      for (const versionId of versionIds) {
+        const version = await lockMarketplaceVersion(c, versionId)
+        if (version) versions.set(version.id, version)
+      }
+      const listings = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof lockMarketplaceListing>>>
+      >()
+      for (const slug of [...new Set([root.slug, ...refs.map((ref) => ref.slug)])].sort()) {
+        const listing = await lockMarketplaceListing(c, slug)
+        if (listing) listings.set(slug, listing)
+      }
+      if (
+        refs.some(
+          (ref) => listings.get(ref.slug)?.currentApprovedVersionId !== ref.version_id,
+        )
+      )
+        throw new MarketplaceError(
+          'INSTALL_CONFLICT',
+          '能力版本在安装期间发生变化,请重试',
+        )
+
+      const version = versions.get(args.versionId)
+      const rootListing = listings.get(root.slug)
+      if (!version || !rootListing || version.slug !== root.slug || rootListing.kind !== root.kind)
+        throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(版本不存在)')
+      await verifyLockedInstallTarget(c, version, rootListing, callerOrgId)
+
+      const installableRefs: Array<
+        BundleRequirementRow & { versionId: string; preinstalled: boolean }
+      > = []
+      const skippedOptional: MarketplaceCapabilityInstallOutcome['skippedOptional'] = []
+      for (const ref of refs) {
+        const depListing = listings.get(ref.slug)
+        const depVersion = ref.version_id ? versions.get(ref.version_id) : undefined
+        try {
+          if (!depListing || depListing.kind !== ref.kind || !depVersion)
+            throw new MarketplaceError('NOT_INSTALLABLE', `能力不可安装：${ref.slug}`)
+          const preinstalled =
+            ref.kind === 'connector' &&
+            isDefaultConnectorArtifact(depVersion.slug, depVersion.artifactHash)
+          await verifyLockedInstallTarget(c, depVersion, depListing, callerOrgId, {
+            allowPreinstalledConnector: preinstalled,
+          })
+          installableRefs.push({ ...ref, versionId: depVersion.id, preinstalled })
+        } catch (error) {
+          if (ref.required) throw error
+          if (!(error instanceof MarketplaceError)) throw error
+          skippedOptional.push({
+            slug: ref.slug,
+            kind: marketplaceCapabilityKind(ref.kind),
+            optional: true,
+            reason: 'unavailable',
+          })
+        }
+      }
+
+      const scopeMode: InstallScopeMode =
+        args.scopeMode ?? (args.agentIds !== undefined ? 'replace' : 'preserve')
+      const hadExistingRootInstall = await replacePinnedInstall(
+        c,
+        args.userId,
+        version,
+        rootListing.kind === 'agent' ? DEFAULT_INSTALL_AGENT_IDS : [],
+      )
+      if (rootListing.kind === 'skill' || rootListing.kind === 'connector') {
+        await replaceManualBindings(c, {
+          userId: args.userId,
+          slug: root.slug,
+          kind: rootListing.kind,
+          agentIds: args.agentIds,
+          scopeMode,
+          hadExistingInstall: hadExistingRootInstall,
+        })
+      } else {
+        await c.query(
+          `DELETE FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'`,
+          [args.userId, root.slug],
+        )
+        if (refs.length > 0)
+          await c.query(
+            `INSERT INTO marketplace_agent_capability_bindings
+             (user_id, agent_slug, capability_slug, capability_kind, source, source_agent_version_id)
+           SELECT $1, $2, x.slug, x.kind, 'agent_dependency', $3
+             FROM jsonb_to_recordset($4::jsonb) AS x(slug text, kind text)`,
+            [args.userId, root.slug, version.id, JSON.stringify(refs)],
+          )
+      }
+      for (const ref of installableRefs) {
+        if (ref.preinstalled) continue
+        const depVersion = versions.get(ref.versionId)!
+        await replacePinnedInstall(c, args.userId, depVersion, [])
+      }
+      const capabilitySlugs = [
+        ...(rootListing.kind === 'agent' ? [] : [root.slug]),
+        ...refs.map((ref) => ref.slug),
+        ...existingDependencies.rows.map((ref) => ref.slug),
+      ]
+      await recomputeInstallScopeCache(c, args.userId, capabilitySlugs)
+      if (args.failureInjector) await args.failureInjector()
+
+      const installedConnectors = [
+        ...(rootListing.kind === 'connector' ? [{ slug: root.slug, versionId: version.id }] : []),
+        ...installableRefs
+          .filter((ref) => ref.kind === 'connector')
+          .map((ref) => ({ slug: ref.slug, versionId: ref.versionId })),
+      ]
+      const activeConnections =
+        installedConnectors.length === 0
+          ? new Set<string>()
+          : new Set(
+              (
+                await c.query<{ provider: string }>(
+                  `SELECT DISTINCT c.provider
+                   FROM connections c
+                   JOIN jsonb_to_recordset($2::jsonb) AS x(provider text, version_id text)
+                     ON x.provider = c.provider
+                    AND x.version_id::bigint = c.connector_version_id
+                  WHERE c.user_id = $1 AND c.revoked_at IS NULL
+                    AND c.status = 'active'`,
+                  [
+                    args.userId,
+                    JSON.stringify(
+                      installedConnectors.map((item) => ({
+                        provider: item.slug,
+                        version_id: item.versionId,
+                      })),
+                    ),
+                  ],
+                )
+              ).rows.map((row) => row.provider),
+            )
+      const needsAuthorization = installedConnectors
+        .map((item) => item.slug)
+        .filter((slug) => !activeConnections.has(slug))
+      const requiredConnectorSlugs = [
+        ...(rootListing.kind === 'connector' ? [root.slug] : []),
+        ...installableRefs
+          .filter((ref) => ref.required && ref.kind === 'connector')
+          .map((ref) => ref.slug),
+      ]
+      return {
+        slug: version.slug,
+        kind: rootListing.kind,
+        version: version.version,
+        name: version.name,
+        installedCapabilities: installableRefs.map((ref) => ({
+          slug: ref.slug,
+          kind: marketplaceCapabilityKind(ref.kind),
+          optional: !ref.required,
+        })),
+        skippedOptional,
+        needsAuthorization,
+        ready: requiredConnectorSlugs.every((slug) => activeConnections.has(slug)),
+      }
+    })
+  } catch (error) {
+    if (
+      error instanceof MarketplaceError &&
+      error.code === 'INSTALL_CONFLICT' &&
+      error.message.includes('期间发生变化') &&
+      (args.retryAttempt ?? 0) < 2
+    )
+      return installMarketplaceBundle({ ...args, retryAttempt: (args.retryAttempt ?? 0) + 1 })
+    throw error
+  }
+}
+
+/** Backward-compatible single-result wrapper; Agent callers still receive atomic bundles. */
 export async function installApprovedVersion(args: {
   userId: number
   versionId: string
   agentIds?: string[]
   scopeMode?: InstallScopeMode
-  /** org 可见性收口:org-private 版本仅本 org 成员可装(null=仅公开)。不可见 → NOT_INSTALLABLE(404)。 */
   callerOrgId?: CallerOrgId
 }): Promise<{ slug: string; version: string; name: string }> {
-  const callerOrgId = args.callerOrgId ?? null
-  // 仅定位锁域，所有最终状态都在事务行锁后重读。
-  const located = await query<{ slug: string }>(
-    'SELECT slug FROM marketplace_skill_versions WHERE id = $1',
-    [args.versionId],
+  const result = await installMarketplaceBundle(args)
+  return { slug: result.slug, version: result.version, name: result.name }
+}
+
+export interface AgentCapabilityReadinessItem {
+  slug: string
+  kind: 'skill' | 'plugin'
+  optional: boolean
+  installed: boolean
+  bound: boolean
+  status: 'ready' | 'missing' | 'revoked' | 'needs_authorization'
+  repairable: boolean
+}
+
+export interface AgentCapabilityReadiness {
+  installed: boolean
+  ready: boolean
+  requirements: AgentCapabilityReadinessItem[]
+  needsAuthorization: string[]
+}
+
+interface AgentCapabilityReadinessTarget {
+  slug: string
+  targetVersionId: string | null
+  preset: boolean
+}
+
+interface ResolvedAgentCapabilityReadinessTarget extends AgentCapabilityReadinessTarget {
+  key: string
+  versionId: string | null
+  installed: boolean
+}
+
+interface AgentCapabilityReadinessRow {
+  target_key: string
+  target_slug: string
+  target_preset: boolean
+  target_installed: boolean
+  slug: string | null
+  kind: 'skill' | 'connector' | null
+  required: boolean | null
+  listing_state: string | null
+  listing_org_id: string | null
+  current_version_id: string | null
+  current_artifact_hash: string | null
+  current_version_status: string | null
+  current_security_state: string | null
+  current_functional_state: string | null
+  current_exec_revoked_at: Date | null
+  install_version_id: string | null
+  install_artifact_hash: string | null
+  version_artifact_hash: string | null
+  install_version_status: string | null
+  install_security_state: string | null
+  install_functional_state: string | null
+  install_exec_revoked_at: Date | null
+  bound: boolean | null
+  authorized: boolean | null
+}
+
+function agentCapabilityReadinessKey(slug: string, preset: boolean): string {
+  return `${preset ? 'preset' : 'installed'}:${slug}`
+}
+
+/**
+ * Load a user's Agent composition graph in a bounded number of queries. The turn
+ * sync path can contain many Agents, so per-Agent root/membership/requirement and
+ * per-Plugin contract reads are deliberately prohibited here.
+ */
+async function getAgentCapabilityReadinessBatch(
+  userId: number,
+  targets: readonly AgentCapabilityReadinessTarget[],
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<Map<string, AgentCapabilityReadiness>> {
+  if (targets.length === 0) return new Map()
+  const uniqueTargets = [
+    ...new Map(
+      targets.map((target) => [
+        agentCapabilityReadinessKey(target.slug, target.preset),
+        target,
+      ]),
+    ).values(),
+  ]
+  const resolvedRows = await query<{
+    target_key: string
+    slug: string
+    target_version_id: string | null
+    preset: boolean
+    version_id: string | null
+    installed: boolean
+  }>(
+    `WITH requested AS (
+       SELECT target_key, slug, target_version_id, preset
+         FROM jsonb_to_recordset($2::jsonb)
+           AS x(target_key text, slug text, target_version_id text, preset boolean)
+     )
+     SELECT r.target_key, r.slug, r.target_version_id, r.preset,
+            COALESCE(
+              NULLIF(r.target_version_id, '')::bigint,
+              CASE WHEN r.preset THEN l.current_approved_version_id ELSE i.version_id END,
+              l.current_approved_version_id
+            )::text AS version_id,
+            (r.preset OR i.version_id IS NOT NULL) AS installed
+       FROM requested r
+       LEFT JOIN LATERAL (
+         SELECT mi.version_id
+           FROM marketplace_installs mi
+          WHERE mi.user_id = $1 AND mi.slug = r.slug AND mi.uninstalled_at IS NULL
+          LIMIT 1
+       ) i ON TRUE
+       LEFT JOIN marketplace_skill_listings l ON l.slug = r.slug AND l.kind = 'agent'`,
+    [
+      userId,
+      JSON.stringify(
+        uniqueTargets.map((target) => ({
+          target_key: agentCapabilityReadinessKey(target.slug, target.preset),
+          slug: target.slug,
+          target_version_id: target.targetVersionId,
+          preset: target.preset,
+        })),
+      ),
+    ],
+    runner,
   )
-  const locatedSlug = located.rows[0]?.slug ?? null
-  if (!locatedSlug)
-    throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
+  const resolved: ResolvedAgentCapabilityReadinessTarget[] = resolvedRows.rows.map((row) => ({
+    key: row.target_key,
+    slug: row.slug,
+    targetVersionId: row.target_version_id,
+    preset: row.preset,
+    versionId: row.version_id,
+    installed: row.installed,
+  }))
+  const membership = await getActiveMembership(String(userId), runner)
+  const activeOrgId = membership?.org_id ?? null
+  const rows = await query<AgentCapabilityReadinessRow>(
+    `WITH targets AS (
+       SELECT target_key, target_slug, version_id, preset, installed
+         FROM jsonb_to_recordset($3::jsonb)
+           AS x(target_key text, target_slug text, version_id bigint,
+                preset boolean, installed boolean)
+     )
+     SELECT t.target_key, t.target_slug, t.preset AS target_preset,
+            t.installed AS target_installed,
+            r.capability_slug AS slug, r.capability_kind AS kind, r.required,
+            l.state AS listing_state, l.org_id::text AS listing_org_id,
+            l.current_approved_version_id::text AS current_version_id,
+            cv.artifact_hash AS current_artifact_hash,
+            cv.status AS current_version_status,
+            cv.security_review_state AS current_security_state,
+            cv.functional_verify_state AS current_functional_state,
+            cv.exec_revoked_at AS current_exec_revoked_at,
+            i.version_id::text AS install_version_id,
+            i.artifact_hash AS install_artifact_hash,
+            iv.artifact_hash AS version_artifact_hash,
+            iv.status AS install_version_status,
+            iv.security_review_state AS install_security_state,
+            iv.functional_verify_state AS install_functional_state,
+            iv.exec_revoked_at AS install_exec_revoked_at,
+            CASE WHEN i.install_source = 'org'
+              THEN COALESCE(i.agent_ids ? t.target_slug, FALSE)
+              ELSE EXISTS (
+                SELECT 1 FROM marketplace_agent_capability_bindings b
+                 WHERE b.user_id = $1 AND b.agent_slug = t.target_slug
+                   AND b.capability_slug = r.capability_slug
+                   AND b.capability_kind = r.capability_kind
+              ) END AS bound,
+            CASE WHEN r.capability_kind = 'connector' THEN EXISTS (
+              SELECT 1 FROM connections c
+               WHERE c.user_id = $1 AND c.provider = r.capability_slug
+                 AND c.connector_version_id = COALESCE(i.version_id, l.current_approved_version_id)
+                 AND c.revoked_at IS NULL AND c.status = 'active'
+            ) ELSE TRUE END AS authorized
+       FROM targets t
+       LEFT JOIN marketplace_capability_requirements r ON r.agent_version_id = t.version_id
+       LEFT JOIN marketplace_skill_listings l
+         ON l.slug = r.capability_slug AND l.kind = r.capability_kind
+       LEFT JOIN LATERAL (
+         SELECT candidate.version_id, candidate.artifact_hash, candidate.agent_ids,
+                candidate.install_source
+           FROM (
+             SELECT pi.version_id, pi.artifact_hash, pi.agent_ids,
+                    'personal'::text AS install_source, 0 AS priority
+               FROM marketplace_installs pi
+              WHERE pi.user_id = $1 AND pi.slug = r.capability_slug
+                AND pi.uninstalled_at IS NULL
+             UNION ALL
+             SELECT oi.version_id, oi.artifact_hash, oi.agent_ids,
+                    'org'::text AS install_source, 1 AS priority
+               FROM org_installs oi
+               JOIN orgs o ON o.id = oi.org_id AND o.status = 'active'
+              WHERE oi.org_id = $2::bigint AND oi.slug = r.capability_slug
+                AND oi.uninstalled_at IS NULL AND r.capability_kind = 'skill'
+           ) candidate
+          ORDER BY candidate.priority
+          LIMIT 1
+       ) i ON TRUE
+       LEFT JOIN marketplace_skill_versions iv ON iv.id = i.version_id
+       LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
+      ORDER BY t.target_key, r.required DESC, r.capability_kind, r.capability_slug`,
+    [
+      userId,
+      activeOrgId,
+      JSON.stringify(
+        resolved.map((target) => ({
+          target_key: target.key,
+          target_slug: target.slug,
+          version_id: target.versionId,
+          preset: target.preset,
+          installed: target.installed,
+        })),
+      ),
+    ],
+    runner,
+  )
 
-  return tx(async (c) => {
-    await lockMarketplaceUserSlug(c, args.userId, locatedSlug)
-    const version = await lockMarketplaceVersion(c, args.versionId)
-    if (!version || version.slug !== locatedSlug)
-      throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(版本不存在)')
-    const listing = await lockMarketplaceListing(c, version.slug)
-    const orgVisible =
-      listing?.orgId == null ||
-      (callerOrgId != null && BigInt(listing.orgId) === BigInt(callerOrgId))
-    if (
-      !listing ||
-      !orgVisible ||
-      version.status !== 'approved' ||
-      listing.state !== 'active' ||
-      listing.currentApprovedVersionId !== version.id
-    ) {
-      throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
+  // One DB read verifies every unique Plugin version used anywhere in this user's
+  // Agent graph. Invalid contracts are absent from the map and therefore fail closed.
+  const connectorVersionIds = [
+    ...new Set(
+      rows.rows.flatMap((row) =>
+        row.kind === 'connector'
+          ? [row.current_version_id, row.install_version_id]
+              .filter((id): id is string => id !== null)
+              .map(Number)
+          : [],
+      ),
+    ),
+  ]
+  const verifiedConnectors = await listVerifiedContractsWithMeta(connectorVersionIds, runner)
+  const result = new Map<string, AgentCapabilityReadiness>()
+  for (const target of resolved) {
+    result.set(target.key, {
+      installed: target.installed,
+      ready: target.installed,
+      requirements: [],
+      needsAuthorization: [],
+    })
+  }
+  for (const row of rows.rows) {
+    if (row.slug === null || row.kind === null || row.required === null) continue
+    const readiness = result.get(row.target_key)
+    if (!readiness) continue
+    const currentTargetVisible = row.listing_org_id === null || row.listing_org_id === activeOrgId
+    let currentTargetInstallable =
+      currentTargetVisible &&
+      row.listing_state === 'active' &&
+      row.current_version_id !== null &&
+      row.current_artifact_hash !== null &&
+      row.current_version_status === 'approved'
+    if (currentTargetInstallable && row.kind === 'connector') {
+      currentTargetInstallable =
+        row.current_security_state === 'security_approved' &&
+        isAcceptedFunctionalVerificationState(row.current_functional_state ?? '') &&
+        row.current_exec_revoked_at === null &&
+        verifiedConnectors.has(Number(row.current_version_id))
     }
-    if (listing.kind === 'agent' && !marketplaceAgentsEnabled())
-      throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
-    if (listing.kind === 'connector') {
-      if (!marketplaceConnectorsEnabled())
-        throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
-      if (isDefaultConnectorSlug(version.slug))
-        throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
-      if (
-        version.securityReviewState !== 'security_approved' ||
-        !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
-        version.execRevokedAt !== null
-      ) {
-        throw new MarketplaceError('NOT_INSTALLABLE', 'connector 尚未完成安全与功能审核')
-      }
-      try {
-        // 与 listing/version 行锁处于同一事务，验签成功到安装落库之间不存在撤销/换版窗口。
-        await loadVerifiedContractWithMeta(Number(version.id), c)
-      } catch (error) {
-        if (error instanceof ConnectorSpecError)
-          throw new MarketplaceError('NOT_INSTALLABLE', 'connector 执行契约不可验证')
-        throw error
-      }
+    const preinstalled =
+      row.kind === 'connector' &&
+      row.current_artifact_hash !== null &&
+      isDefaultConnectorArtifact(row.slug, row.current_artifact_hash)
+    const usingPreinstalled = row.install_version_id === null && preinstalled
+    const selectedVersionId =
+      row.install_version_id ?? (usingPreinstalled ? row.current_version_id : null)
+    const selectedArtifactHash =
+      row.install_version_id !== null ? row.version_artifact_hash : row.current_artifact_hash
+    const selectedStatus =
+      row.install_version_id !== null ? row.install_version_status : row.current_version_status
+    const selectedSecurityState =
+      row.install_version_id !== null ? row.install_security_state : row.current_security_state
+    const selectedFunctionalState =
+      row.install_version_id !== null ? row.install_functional_state : row.current_functional_state
+    const selectedExecRevokedAt =
+      row.install_version_id !== null ? row.install_exec_revoked_at : row.current_exec_revoked_at
+    const capabilityInstalled = selectedVersionId !== null
+    let artifactReady =
+      capabilityInstalled &&
+      (usingPreinstalled || row.install_artifact_hash === selectedArtifactHash) &&
+      selectedStatus === 'approved' &&
+      row.listing_state === 'active'
+    if (artifactReady && row.kind === 'connector') {
+      artifactReady =
+        selectedSecurityState === 'security_approved' &&
+        isAcceptedFunctionalVerificationState(selectedFunctionalState ?? '') &&
+        selectedExecRevokedAt === null &&
+        verifiedConnectors.has(Number(selectedVersionId))
     }
+    const status: AgentCapabilityReadinessItem['status'] =
+      row.target_installed &&
+      !row.bound &&
+      (!row.target_preset || row.kind === 'skill')
+        ? 'missing'
+        : !capabilityInstalled
+          ? 'missing'
+          : !artifactReady
+            ? 'revoked'
+            : row.kind === 'connector' && !row.authorized
+              ? 'needs_authorization'
+              : 'ready'
+    readiness.requirements.push({
+      slug: row.slug,
+      kind: marketplaceCapabilityKind(row.kind),
+      optional: !row.required,
+      installed: capabilityInstalled,
+      bound: row.bound === true,
+      status,
+      repairable:
+        (status === 'missing' || status === 'revoked') && currentTargetInstallable,
+    })
+  }
+  for (const readiness of result.values()) {
+    readiness.ready =
+      readiness.installed &&
+      readiness.requirements.every((item) => item.optional || item.status === 'ready')
+    readiness.needsAuthorization = readiness.requirements
+      .filter((item) => item.status === 'needs_authorization')
+      .map((item) => item.slug)
+  }
+  return result
+}
 
-    const existing = await query<{ id: string; agent_ids: unknown }>(
-      `SELECT id::text, agent_ids
-         FROM marketplace_installs
-        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
-        FOR UPDATE`,
-      [args.userId, version.slug],
-      c,
+/**
+ * User-safe composition projection. Bindings describe desired composition only;
+ * connector authorization remains account-level and is reported as readiness,
+ * never as a per-Agent access-control promise.
+ */
+export async function getAgentCapabilityReadiness(
+  userId: number,
+  agentSlug: string,
+  targetVersionId: string | null,
+  opts: { preset?: boolean } = {},
+): Promise<AgentCapabilityReadiness> {
+  const preset = opts.preset === true
+  const readiness = await getAgentCapabilityReadinessBatch(userId, [
+    { slug: agentSlug, targetVersionId, preset },
+  ])
+  return (
+    readiness.get(agentCapabilityReadinessKey(agentSlug, preset)) ?? {
+      installed: preset,
+      ready: false,
+      requirements: [],
+      needsAuthorization: [],
+    }
+  )
+}
+
+/** Bounded list projection for picker/installed surfaces. Results align with inputs. */
+export async function getAgentCapabilityReadinessMany(
+  userId: number,
+  targets: readonly { slug: string; versionId: string | null; preset?: boolean }[],
+): Promise<AgentCapabilityReadiness[]> {
+  const readiness = await getAgentCapabilityReadinessBatch(
+    userId,
+    targets.map((target) => ({
+      slug: target.slug,
+      targetVersionId: target.versionId,
+      preset: target.preset === true,
+    })),
+  )
+  return targets.map((target) => {
+    const preset = target.preset === true
+    return (
+      readiness.get(agentCapabilityReadinessKey(target.slug, preset)) ?? {
+        installed: preset,
+        ready: false,
+        requirements: [],
+        needsAuthorization: [],
+      }
     )
-    const previous = existing.rows[0]
-    const previousScope = previous
-      ? normalizeInstallAgentIds(previous.agent_ids, DEFAULT_INSTALL_AGENT_IDS)
-      : null
-    const providedScope =
-      args.agentIds !== undefined ? normalizeInstallAgentIds(args.agentIds, []) : null
-    const scopeMode: InstallScopeMode =
-      args.scopeMode ?? (args.agentIds !== undefined ? 'replace' : 'preserve')
-    let finalScope: string[]
-    if (listing.kind === 'agent' || listing.kind === 'connector') {
-      finalScope = DEFAULT_INSTALL_AGENT_IDS
-    } else if (scopeMode === 'replace') {
-      finalScope = providedScope?.length ? providedScope : DEFAULT_INSTALL_AGENT_IDS
-    } else if (scopeMode === 'merge') {
-      finalScope = mergeAgentIds(previousScope ?? [], providedScope ?? [])
-    } else {
-      finalScope =
-        previousScope ?? (providedScope?.length ? providedScope : DEFAULT_INSTALL_AGENT_IDS)
-    }
-
-    if (previous) {
-      await query(
-        'UPDATE marketplace_installs SET uninstalled_at = NOW() WHERE id = $1',
-        [previous.id],
-        c,
-      )
-    }
-    try {
-      await query(
-        `INSERT INTO marketplace_installs (user_id, slug, version_id, artifact_hash, installed_by, agent_ids)
-              VALUES ($1,$2,$3,$4,$1,$5::jsonb)`,
-        [args.userId, version.slug, version.id, version.artifactHash, JSON.stringify(finalScope)],
-        c,
-      )
-    } catch (err) {
-      if (isUniqueViolation(err))
-        throw new MarketplaceError('INSTALL_CONFLICT', '安装状态冲突,请重试')
-      throw err
-    }
-    return { slug: version.slug, version: version.version, name: version.name }
   })
 }
 export async function getInstallableVersionTarget(
@@ -1293,8 +2395,30 @@ export async function updateInstalledAgentScope(
   agentIds: string[],
 ): Promise<boolean> {
   const finalScope = normalizeInstallAgentIds(agentIds, DEFAULT_INSTALL_AGENT_IDS)
+  const before = await query<{ agent_slug: string }>(
+    `SELECT agent_slug FROM marketplace_agent_capability_bindings
+      WHERE user_id = $1 AND capability_slug = $2 AND source = 'manual'
+      ORDER BY agent_slug`,
+    [userId, slug],
+  )
   return tx(async (c) => {
-    await lockMarketplaceUserSlug(c, userId, slug)
+    await c.query("SELECT set_config('openclaude.capability_writer', 'normalized', true)")
+    await lockMarketplaceMutationSet(c, {
+      userId,
+      artifactSlugs: [slug],
+      agentSlugs: [...before.rows.map((row) => row.agent_slug), ...finalScope],
+    })
+    const current = await c.query<{ agent_slug: string }>(
+      `SELECT agent_slug FROM marketplace_agent_capability_bindings
+        WHERE user_id = $1 AND capability_slug = $2 AND source = 'manual'
+        ORDER BY agent_slug`,
+      [userId, slug],
+    )
+    if (
+      current.rows.length !== before.rows.length ||
+      current.rows.some((row, index) => row.agent_slug !== before.rows[index]?.agent_slug)
+    )
+      throw new MarketplaceError('INSTALL_CONFLICT', '手动归属在修改期间发生变化,请重试')
     const pin = await query<{ version_id: string }>(
       `SELECT version_id::text FROM marketplace_installs
         WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
@@ -1306,7 +2430,7 @@ export async function updateInstalledAgentScope(
     const version = await lockMarketplaceVersion(c, versionId)
     if (!version || version.slug !== slug) return false
     const listing = await lockMarketplaceListing(c, slug)
-    if (listing?.kind !== 'skill') return false
+    if (listing?.kind !== 'skill' && listing?.kind !== 'connector') return false
     const existing = await query<{ id: string }>(
       `SELECT id::text FROM marketplace_installs
         WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
@@ -1316,18 +2440,93 @@ export async function updateInstalledAgentScope(
     )
     const row = existing.rows[0]
     if (!row) return false
-    await query(
-      'UPDATE marketplace_installs SET agent_ids = $2::jsonb WHERE id = $1',
-      [row.id, JSON.stringify(finalScope)],
-      c,
+    await c.query(
+      `DELETE FROM marketplace_agent_capability_bindings
+        WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+          AND source = 'manual'`,
+      [userId, slug, listing.kind],
     )
+    await c.query(
+      `INSERT INTO marketplace_agent_capability_bindings
+         (user_id, agent_slug, capability_slug, capability_kind, source, source_agent_version_id)
+       SELECT $1, x.agent_slug, $2, $3, 'manual', NULL
+         FROM unnest($4::text[]) AS x(agent_slug)`,
+      [userId, slug, listing.kind, finalScope],
+    )
+    await recomputeInstallScopeCache(c, userId, [slug])
     return true
   })
 }
 
 export async function recordUninstall(userId: number, slug: string): Promise<boolean> {
+  const located = await query<{ version_id: string; kind: ArtifactKind }>(
+    `SELECT i.version_id::text, l.kind
+       FROM marketplace_installs i
+       JOIN marketplace_skill_listings l ON l.slug = i.slug
+      WHERE i.user_id = $1 AND i.slug = $2 AND i.uninstalled_at IS NULL`,
+    [userId, slug],
+  )
+  const preflight = located.rows[0]
+  if (!preflight) return false
+  const dependencyBindings =
+    preflight.kind === 'agent'
+      ? await query<{ slug: string; kind: 'skill' | 'connector' }>(
+          `SELECT capability_slug AS slug, capability_kind AS kind
+             FROM marketplace_agent_capability_bindings
+            WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'
+            ORDER BY capability_kind, capability_slug`,
+          [userId, slug],
+        )
+      : { rows: [] as Array<{ slug: string; kind: 'skill' | 'connector' }> }
+  const manualBindings =
+    preflight.kind === 'skill' || preflight.kind === 'connector'
+      ? await query<{ agent_slug: string }>(
+          `SELECT agent_slug FROM marketplace_agent_capability_bindings
+            WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+              AND source = 'manual' ORDER BY agent_slug`,
+          [userId, slug, preflight.kind],
+        )
+      : { rows: [] as Array<{ agent_slug: string }> }
   return tx(async (c) => {
-    await lockMarketplaceUserSlug(c, userId, slug)
+    await c.query("SELECT set_config('openclaude.capability_writer', 'normalized', true)")
+    await lockMarketplaceMutationSet(c, {
+      userId,
+      artifactSlugs: [slug, ...dependencyBindings.rows.map((row) => row.slug)],
+      agentSlugs: [
+        ...(preflight.kind === 'agent' ? [slug] : []),
+        ...manualBindings.rows.map((row) => row.agent_slug),
+      ],
+    })
+    if (preflight.kind === 'agent') {
+      const current = await c.query<{ slug: string; kind: 'skill' | 'connector' }>(
+        `SELECT capability_slug AS slug, capability_kind AS kind
+           FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'
+          ORDER BY capability_kind, capability_slug`,
+        [userId, slug],
+      )
+      if (
+        current.rows.length !== dependencyBindings.rows.length ||
+        current.rows.some(
+          (row, index) =>
+            row.slug !== dependencyBindings.rows[index]?.slug ||
+            row.kind !== dependencyBindings.rows[index]?.kind,
+        )
+      )
+        throw new MarketplaceError('INSTALL_CONFLICT', '能力绑定在卸载期间发生变化,请重试')
+    } else {
+      const current = await c.query<{ agent_slug: string }>(
+        `SELECT agent_slug FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+            AND source = 'manual' ORDER BY agent_slug`,
+        [userId, slug, preflight.kind],
+      )
+      if (
+        current.rows.length !== manualBindings.rows.length ||
+        current.rows.some((row, index) => row.agent_slug !== manualBindings.rows[index]?.agent_slug)
+      )
+        throw new MarketplaceError('INSTALL_CONFLICT', '手动归属在卸载期间发生变化,请重试')
+    }
     // advisory lock 后先定位 pin（不取 install 行锁），再遵循 version → listing → install/connection。
     const pin = await query<{ version_id: string }>(
       `SELECT version_id::text FROM marketplace_installs
@@ -1376,6 +2575,25 @@ export async function recordUninstall(userId: number, slug: string): Promise<boo
       [installId],
       c,
     )
+    if (listing.kind === 'agent') {
+      await c.query(
+        `DELETE FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND agent_slug = $2 AND source = 'agent_dependency'`,
+        [userId, slug],
+      )
+      await recomputeInstallScopeCache(
+        c,
+        userId,
+        dependencyBindings.rows.map((row) => row.slug),
+      )
+    } else if (listing.kind === 'skill' || listing.kind === 'connector') {
+      await c.query(
+        `DELETE FROM marketplace_agent_capability_bindings
+          WHERE user_id = $1 AND capability_slug = $2 AND capability_kind = $3
+            AND source = 'manual'`,
+        [userId, slug, listing.kind],
+      )
+    }
     return true
   })
 }
@@ -1386,6 +2604,9 @@ export interface InstalledRow {
   versionId: string
   name: string
   artifactHash: string
+  /** Explicit user-authored bindings only; excludes Agent dependency provenance. */
+  manualAgentIds: string[]
+  /** Compatibility projection: manual + Agent dependency bindings. */
   agentIds: string[]
   installedAt: string
   listingState: string
@@ -1402,6 +2623,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     version_id: string
     name: string
     artifact_hash: string
+    manual_agent_ids: unknown
     agent_ids: unknown
     installed_at: string
     state: string
@@ -1411,6 +2633,12 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     // cv = listing 当前上架版本(升级可见性:安装 pin 旧 versionId,新版获批后
     // latest_version_id ≠ version_id 即「可更新」)。LEFT JOIN:revoked/无 approved 时为 null。
     `SELECT i.slug, l.kind, v.version, i.version_id::text, v.name, i.artifact_hash,
+            COALESCE((
+              SELECT jsonb_agg(b.agent_slug ORDER BY b.agent_slug)
+                FROM marketplace_agent_capability_bindings b
+               WHERE b.user_id = i.user_id AND b.capability_slug = i.slug
+                 AND b.capability_kind = l.kind AND b.source = 'manual'
+            ), '[]'::jsonb) AS manual_agent_ids,
             i.agent_ids,
             i.installed_at::text, l.state,
             cv.version AS latest_version, cv.id::text AS latest_version_id
@@ -1434,7 +2662,8 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
       versionId: x.version_id,
       name: x.name,
       artifactHash: x.artifact_hash,
-      agentIds: normalizeInstallAgentIds(x.agent_ids, DEFAULT_INSTALL_AGENT_IDS),
+      manualAgentIds: normalizeCapabilityScopeCache(x.manual_agent_ids),
+      agentIds: normalizeCapabilityScopeCache(x.agent_ids),
       installedAt: x.installed_at,
       listingState: x.state,
       latestVersion: x.latest_version,
@@ -1624,8 +2853,11 @@ export interface InstalledArtifact {
  * 仍保留(与"个人优先"一致),不构成新增泄露(内容安装时已合法取得)。
  * org install 的 agent_ids 与个人 install 同语义,容器侧 sidecar 零改动。
  */
-export async function listActiveInstalledArtifacts(userId: number): Promise<InstalledArtifact[]> {
-  const membership = await getActiveMembership(String(userId))
+export async function listActiveInstalledArtifacts(
+  userId: number,
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<InstalledArtifact[]> {
+  const membership = await getActiveMembership(String(userId), runner)
   const orgId = membership?.org_id ?? null
   const r = await query<{
     slug: string
@@ -1647,6 +2879,9 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
           WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
                 AND l.kind = 'skill' AND v.raw_skill_md IS NOT NULL
                 AND i.artifact_hash = v.artifact_hash
+                -- Normalized writes retire orphan dependencies; this remains a
+                -- defense against malformed legacy rows during rollback/cutover.
+                AND jsonb_array_length(i.agent_ids) > 0
          UNION ALL
          -- org install(priority 1):仅当 caller 有 active org 且该 org active
          SELECT oi.slug, v.version, v.raw_skill_md, oi.artifact_hash, oi.agent_ids, v.raw_bundle,
@@ -1661,13 +2896,14 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
        ) m
       ORDER BY m.slug, m.priority`,
     [userId, orgId],
+    runner,
   )
   return r.rows.map((x) => ({
     slug: x.slug,
     version: x.version,
     rawSkillMd: x.raw_skill_md,
     artifactHash: x.artifact_hash,
-    agentIds: normalizeInstallAgentIds(x.agent_ids, DEFAULT_INSTALL_AGENT_IDS),
+    agentIds: normalizeCapabilityScopeCache(x.agent_ids),
     bundle: (x.raw_bundle as Record<string, string> | null) ?? null,
   }))
 }
@@ -1675,6 +2911,8 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
 export interface InstalledAgent {
   slug: string
   version: string
+  /** Immutable marketplace version used by the runtime readiness graph. */
+  versionId: string
   /** Canonical agent manifest JSON (raw_artifact). */
   rawManifest: string
   artifactHash: string
@@ -1685,7 +2923,10 @@ export interface InstalledAgent {
  * agents.yaml reconciliation (the agent analogue of listActiveInstalledArtifacts).
  * Excludes revoked listings (kill-switch) + requires a non-null raw_artifact.
  */
-export async function listActiveInstalledAgents(userId: number): Promise<InstalledAgent[]> {
+export async function listActiveInstalledAgents(
+  userId: number,
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<InstalledAgent[]> {
   // agent 类仅 v5。marketplace_installs 是 v3/v5 共享且非渠道隔离:同一用户在 v5 装过、
   // 或本次门控前已装的 agent,若不在此过滤,会经容器 sync(reconcileAgents → agents.yaml)
   // 在 v3 容器复活(v3 无对应能力 → 坏 agent),也会出现在 v3 my-agents。v3 渠道直接返空。
@@ -1693,21 +2934,35 @@ export async function listActiveInstalledAgents(userId: number): Promise<Install
   const r = await query<{
     slug: string
     version: string
+    version_id: string
     raw_artifact: string
     artifact_hash: string
   }>(
-    `SELECT i.slug, v.version, v.raw_artifact, i.artifact_hash
+    `SELECT i.slug, v.version, i.version_id::text, v.raw_artifact, v.artifact_hash
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
       WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
             AND l.kind = 'agent' AND v.raw_artifact IS NOT NULL
-            AND i.artifact_hash = v.artifact_hash`,
+            AND (
+              i.artifact_hash = v.artifact_hash
+              OR (
+                i.artifact_hash = marketplace_required_plugin_legacy_gate_hash(v.artifact_hash)
+                AND EXISTS (
+                  SELECT 1 FROM marketplace_capability_requirements r
+                   WHERE r.agent_version_id = i.version_id
+                     AND r.capability_kind = 'connector'
+                     AND r.required
+                )
+              )
+            )`,
     [userId],
+    runner,
   )
   return r.rows.map((x) => ({
     slug: x.slug,
     version: x.version,
+    versionId: x.version_id,
     rawManifest: x.raw_artifact,
     artifactHash: x.artifact_hash,
   }))
@@ -1720,27 +2975,167 @@ export async function listActiveInstalledAgents(userId: number): Promise<Install
  */
 export async function listPlatformPresetAgents(
   slugs: readonly string[],
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
 ): Promise<InstalledAgent[]> {
   if (slugs.length === 0 || !marketplaceAgentsEnabled()) return []
   const r = await query<{
     slug: string
     version: string
+    version_id: string
     raw_artifact: string
     artifact_hash: string
   }>(
-    `SELECT l.slug, v.version, v.raw_artifact, v.artifact_hash
+    `SELECT l.slug, v.version, v.id::text AS version_id, v.raw_artifact, v.artifact_hash
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
       WHERE l.slug = ANY($1::text[]) AND l.state = 'active' AND l.kind = 'agent'
             AND v.status = 'approved' AND v.raw_artifact IS NOT NULL`,
     [slugs],
+    runner,
   )
   return r.rows.map((x) => ({
     slug: x.slug,
     version: x.version,
+    versionId: x.version_id,
     rawManifest: x.raw_artifact,
     artifactHash: x.artifact_hash,
   }))
+}
+
+async function filterRuntimeReadyAgents(
+  userId: number,
+  agents: readonly InstalledAgent[],
+  preset: boolean,
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<InstalledAgent[]> {
+  const readiness = await getAgentCapabilityReadinessBatch(
+    userId,
+    agents.map((agent) => ({
+      slug: agent.slug,
+      targetVersionId: agent.versionId,
+      preset,
+    })),
+    runner,
+  )
+  return agents.filter(
+    (agent) => readiness.get(agentCapabilityReadinessKey(agent.slug, preset))?.ready === true,
+  )
+}
+
+/**
+ * Runtime authority for user-installed Agents. Catalog/UI callers deliberately use
+ * listActiveInstalledAgents so an unready Agent remains visible and repairable;
+ * execution/sync callers use this fail-closed projection instead.
+ */
+export async function listRuntimeReadyInstalledAgents(
+  userId: number,
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<InstalledAgent[]> {
+  return filterRuntimeReadyAgents(
+    userId,
+    await listActiveInstalledAgents(userId, runner),
+    false,
+    runner,
+  )
+}
+
+/** Runtime-ready projection of evergreen platform presets for one user. */
+export async function listRuntimeReadyPlatformPresetAgents(
+  userId: number,
+  slugs: readonly string[],
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<InstalledAgent[]> {
+  return filterRuntimeReadyAgents(
+    userId,
+    await listPlatformPresetAgents(slugs, runner),
+    true,
+    runner,
+  )
+}
+
+/**
+ * Latency-sensitive runtime authority: load installed + evergreen preset Agents,
+ * then evaluate their complete capability graph in one user-scoped batch. Preset
+ * slugs retain priority even when their current version is unready; a stale
+ * personal pin for the same slug must never become a fallback execution path.
+ */
+export async function listRuntimeReadyAgentSets(
+  userId: number,
+  presetSlugs: readonly string[],
+  runner: QueryRunner = getPool() as unknown as QueryRunner,
+): Promise<{ installed: InstalledAgent[]; presets: InstalledAgent[]; denied: Set<string> }> {
+  const installed = await listActiveInstalledAgents(userId, runner)
+  const presets = await listPlatformPresetAgents(presetSlugs, runner)
+  // Configuration reserves the slug, not the success of the catalog lookup.
+  // Otherwise a temporarily missing/invalid preset row could fail open to an
+  // older personal install with the same slug.
+  const presetSet = new Set(presetSlugs)
+  const personalCandidates = installed.filter((agent) => !presetSet.has(agent.slug))
+  const readiness = await getAgentCapabilityReadinessBatch(
+    userId,
+    [
+      ...presets.map((agent) => ({
+        slug: agent.slug,
+        targetVersionId: agent.versionId,
+        preset: true,
+      })),
+      ...personalCandidates.map((agent) => ({
+        slug: agent.slug,
+        targetVersionId: agent.versionId,
+        preset: false,
+      })),
+    ],
+    runner,
+  )
+  const readyPresets = presets.filter(
+    (agent) => readiness.get(agentCapabilityReadinessKey(agent.slug, true))?.ready === true,
+  )
+  const readyInstalled = personalCandidates.filter(
+    (agent) => readiness.get(agentCapabilityReadinessKey(agent.slug, false))?.ready === true,
+  )
+  const denied = new Set<string>(presetSlugs)
+  for (const agent of readyPresets) {
+    denied.delete(agent.slug)
+  }
+  for (const agent of personalCandidates) {
+    if (readiness.get(agentCapabilityReadinessKey(agent.slug, false))?.ready !== true) {
+      denied.add(agent.slug)
+    }
+  }
+  return { presets: readyPresets, installed: readyInstalled, denied }
+}
+
+/**
+ * Container reconciliation authority. Skills and runtime-ready Agents must come
+ * from one PostgreSQL snapshot: otherwise a concurrent uninstall/revoke can let
+ * readiness observe the old graph while the skill feed observes the new graph,
+ * briefly publishing an executable Agent without a required capability.
+ */
+export async function loadMarketplaceRuntimeSnapshot(
+  userId: number,
+  presetSlugs: readonly string[],
+  pool = getPool(),
+): Promise<{
+  skills: InstalledArtifact[]
+  agentSets: { installed: InstalledAgent[]; presets: InstalledAgent[]; denied: Set<string> }
+}> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const skills = await listActiveInstalledArtifacts(userId, client)
+    const agentSets = await listRuntimeReadyAgentSets(userId, presetSlugs, client)
+    await client.query('COMMIT')
+    return { skills, agentSets }
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // Preserve the original read failure if the connection was already lost.
+    }
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 /**
