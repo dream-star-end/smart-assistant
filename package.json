@@ -38,6 +38,7 @@
     "test:commercial:integ": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name \"*.integ.test.ts\")'",
     "test:commercial:integ:strict": "REQUIRE_TEST_DB=1 npm run test:commercial:integ",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
+    "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts",
     "check:tutorials": "tsx scripts/check-v5-tutorials.ts",
     "tutorials:accept": "tsx scripts/check-v5-tutorials.ts accept",
     "tutorials:media": "tsx scripts/generate-v5-tutorial-media.ts",
@@ -45,7 +46,7 @@
     "test": "npm run test:gateway && npm run test:web && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build",
-    "check:v5": "npm run check:tutorials && npm run typecheck && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:commercial:unit:gate",
+    "check:v5": "npm run check:tutorials && npm run typecheck && npm run test:v5:ops && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:commercial:unit:gate",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run typecheck && npm run test"

@@ -61,6 +61,69 @@ jobs:
           TUTORIAL_HISTORY_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: ${{ matrix.run }}
 
+  v5-ops:
+    name: v5-ops
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # v5ReleaseSafety includes a real-psql persistence contract. Keep this job
+    # separate from the pure suite matrix so only the ops lane pays for PG.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for test fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'Postgres did not become ready in time' >&2
+          exit 1
+
+      - name: Run v5-ops
+        # baseline hardening must prove production root:root ownership.
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            npm run test:v5:ops
+
   commercial-unit:
     name: commercial-unit (known-failures diff gate)
     runs-on: ubuntu-latest

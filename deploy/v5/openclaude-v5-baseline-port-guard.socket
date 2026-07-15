@@ -1,0 +1,15 @@
+[Unit]
+# V5 不再提供远程 CCB baseline。保留历史端口的 loopback-only 占位，确保自动回滚
+# 到旧 release 时，其 BaselineServer 对 0.0.0.0:18893 的 bind 以 EADDRINUSE 失败。
+Description=OpenClaude v5 disabled baseline port reservation
+Before=openclaude-v5.service openclaude-v5-b.service
+
+[Socket]
+ListenStream=127.0.0.1:18893
+Accept=no
+Service=openclaude-v5-baseline-port-guard.service
+NoDelay=true
+Backlog=16
+
+[Install]
+WantedBy=sockets.target

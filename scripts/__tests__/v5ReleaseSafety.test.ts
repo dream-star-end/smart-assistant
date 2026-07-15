@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -10,11 +10,19 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
+const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
 const commercialIndex = path.join(root, 'packages/commercial/src/index.ts')
+const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
+const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
+const v5UnitA = path.join(root, 'deploy/v5/openclaude-v5.service')
+const v5UnitB = path.join(root, 'deploy/v5/openclaude-v5-b.service')
+const v5BaselinePortGuardSocket = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.socket')
+const v5BaselinePortGuardService = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.service')
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -72,6 +80,361 @@ async function caddyRemoteFixture() {
 }
 
 describe('v5 release safety lanes', () => {
+  test('trusted baseline guard mirrors the runtime manifest and hardens 775/664 releases', async () => {
+    const [guardSource, supervisorSource] = await Promise.all([
+      readFile(baselineGuard, 'utf8'),
+      readFile(supervisor, 'utf8'),
+    ])
+    const shellSkills = guardSource
+      .match(/EXPECTED_SKILLS=\(\n([\s\S]*?)\n\)/)?.[1]
+      .split(/\s+/)
+      .filter(Boolean) ?? []
+    const tsSkills = [...(supervisorSource
+      .match(/V3_CCB_BASELINE_SKILL_NAMES = \[([\s\S]*?)\] as const/)?.[1] ?? '')
+      .matchAll(/"([a-z0-9-]+)"/g)]
+      .map((match) => match[1])
+    assert.deepEqual(shellSkills, tsSkills)
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-guard-')); dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    const madeWritable = spawnSync('chmod', ['-R', 'g+w', baseline], { encoding: 'utf8' })
+    assert.equal(madeWritable.status, 0, madeWritable.stderr)
+    await chmod(path.join(baseline, 'skills/system-info'), 0o700)
+    await chmod(path.join(baseline, 'skills/system-info/SKILL.md'), 0o600)
+
+    const before = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.notEqual(before.status, 0)
+    assert.match(before.stderr, /group\/other writable/)
+    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], { encoding: 'utf8' })
+    assert.equal(hardened.status, 0, hardened.stderr)
+    const after = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.equal(after.status, 0, after.stderr)
+    const dirMode = spawnSync('stat', ['-c', '%a', path.join(baseline, 'skills/system-info')], { encoding: 'utf8' })
+    const fileMode = spawnSync('stat', ['-c', '%a', path.join(baseline, 'skills/system-info/SKILL.md')], { encoding: 'utf8' })
+    assert.equal(dirMode.stdout.trim(), '755')
+    assert.equal(fileMode.stdout.trim(), '644')
+  })
+
+  test('trusted baseline guard rejects symlinks, special nodes and manifest drift before hardening', async () => {
+    const makeRelease = async (suffix: string) => {
+      const dir = await mkdtemp(path.join(tmpdir(), `v5-baseline-${suffix}-`)); dirs.push(dir)
+      const release = path.join(dir, 'release')
+      const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+      await mkdir(path.dirname(baseline), { recursive: true })
+      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+      return { release, baseline }
+    }
+
+    const linked = await makeRelease('symlink')
+    const linkedSkill = path.join(linked.baseline, 'skills/system-info/SKILL.md')
+    await rm(linkedSkill)
+    await symlink('/etc/passwd', linkedSkill)
+    const linkedResult = spawnSync('bash', [baselineGuard, 'harden-release', linked.release], { encoding: 'utf8' })
+    assert.notEqual(linkedResult.status, 0)
+    assert.match(linkedResult.stderr, /symlink\/special node/)
+
+    const special = await makeRelease('fifo')
+    const specialSkill = path.join(special.baseline, 'skills/system-info/SKILL.md')
+    await rm(specialSkill)
+    const fifo = spawnSync('mkfifo', [specialSkill], { encoding: 'utf8' })
+    assert.equal(fifo.status, 0, fifo.stderr)
+    const specialResult = spawnSync('bash', [baselineGuard, 'harden-release', special.release], { encoding: 'utf8' })
+    assert.notEqual(specialResult.status, 0)
+    assert.match(specialResult.stderr, /symlink\/special node/)
+
+    const drift = await makeRelease('drift')
+    await mkdir(path.join(drift.baseline, 'skills/undeclared'))
+    await writeFile(path.join(drift.baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
+    const driftResult = spawnSync('bash', [baselineGuard, 'harden-release', drift.release], { encoding: 'utf8' })
+    assert.notEqual(driftResult.status, 0)
+    assert.match(driftResult.stderr, /skill manifest mismatch/)
+
+    const extraFile = await makeRelease('extra-file')
+    await writeFile(path.join(extraFile.baseline, 'skills/undeclared.txt'), 'unexpected\n')
+    const extraFileResult = spawnSync('bash', [baselineGuard, 'harden-release', extraFile.release], { encoding: 'utf8' })
+    assert.notEqual(extraFileResult.status, 0)
+    assert.match(extraFileResult.stderr, /skill manifest mismatch/)
+
+    const unreadable = await makeRelease('unreadable')
+    await chmod(path.join(unreadable.baseline, 'skills/system-info/SKILL.md'), 0o600)
+    const unreadableResult = spawnSync('bash', [baselineGuard, 'check-release', unreadable.release], { encoding: 'utf8' })
+    assert.notEqual(unreadableResult.status, 0)
+    assert.match(unreadableResult.stderr, /not world-readable/)
+
+    const untraversable = await makeRelease('untraversable')
+    await chmod(path.join(untraversable.baseline, 'skills/system-info'), 0o700)
+    const untraversableResult = spawnSync('bash', [baselineGuard, 'check-release', untraversable.release], { encoding: 'utf8' })
+    assert.notEqual(untraversableResult.status, 0)
+    assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
+  })
+
+  test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
+    const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(v5Overrides, 'utf8'),
+      readFile(v5UnitA, 'utf8'),
+      readFile(v5UnitB, 'utf8'),
+      readFile(v5BaselinePortGuardSocket, 'utf8'),
+      readFile(v5BaselinePortGuardService, 'utf8'),
+      readFile(commercialIndex, 'utf8'),
+    ])
+    for (const key of [
+      'OC_V3_CCB_BASELINE_DIR',
+      'OC_V3_CCB_BASELINE_OPTIONAL',
+      'OPENCLAUDE_MASTER_BASELINE_BASE_URL',
+    ]) {
+      assert.doesNotMatch(overrides, new RegExp(`^${key}=`, 'm'))
+      assert.match(source, new RegExp(`REMOVE_KEYS=\\([\\s\\S]*?${key}`))
+      assert.match(source, new RegExp(`FORBIDDEN_IN_OVERRIDES=\\([\\s\\S]*?${key}`))
+    }
+    assert.match(unitA, /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5\/packages\/commercial\/agent-sandbox\/ccb-baseline/)
+    assert.match(unitB, /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5-b\/packages\/commercial\/agent-sandbox\/ccb-baseline/)
+    assert.match(unitA, /^Requires=openclaude-v5-baseline-port-guard\.socket$/m)
+    assert.match(unitB, /^Requires=openclaude-v5-baseline-port-guard\.socket$/m)
+    assert.doesNotMatch(unitA, /^SocketBindDeny=/m)
+    assert.doesNotMatch(unitB, /^SocketBindDeny=/m)
+    assert.match(portGuardSocket, /^ListenStream=127\.0\.0\.1:18893$/m)
+    assert.match(portGuardSocket, /^Service=openclaude-v5-baseline-port-guard\.service$/m)
+    assert.match(portGuardService, /^ExecStart=\/usr\/lib\/systemd\/systemd-socket-proxyd .*baseline-port-disabled\.sock$/m)
+
+    const transition = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_release_baseline'))
+    const bootstrap = source.match(/^bootstrap\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
+    assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('harden_release_baseline "$REMOTE_SRC"'))
+    assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
+    const migrate = source.match(/migrate_to_bluegreen\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('harden_release_baseline "$REMOTE_SRC"'))
+    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf("systemctl stop '$V5_UNIT'"))
+    const unitInstall = source.match(/install_v5_slot_units\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(unitInstall, /if ! systemctl is-active --quiet '\$V5_BASELINE_PORT_GUARD_SOCKET'; then[\s\S]*systemctl start '\$V5_BASELINE_PORT_GUARD_SOCKET'/)
+    assert.doesNotMatch(unitInstall, /systemctl restart[^\n]*V5_BASELINE_PORT_GUARD_SOCKET/)
+    assert.match(source, /assert_v5_baseline_port_guard/)
+    assert.match(source, /probe\.bind\(\("0\.0\.0\.0", port\)\)/)
+    assert.match(source, /RELEASE_GC_SCRIPT=.*v5-release-gc\.sh/)
+    assert.match(source, /gc_rc" in[\s\S]*75\)[\s\S]*首个 rm 前安全跳过整轮删除/)
+
+    const build = source.match(/build_release\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.ok(build.indexOf('harden_release_baseline "$staging"') > build.indexOf('vite build'))
+    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf("'$staging/.complete'"))
+    assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
+    assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
+    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$master"/)
+    assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
+    assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
+    assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)
+
+    assert.match(indexSource, /if \(v3Deps && selfHostUuid && runtimeChannel !== "v5"\)/)
+    assert.doesNotMatch(indexSource, /runtimeChannel === "v5" \? 18893/)
+  })
+
+  test('shared baseline env migration preserves the original on grep errors', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const envFile = path.join(dir, 'commercial-v5.env')
+    const original = [
+      'DATABASE_URL=postgres://fixture',
+      'OC_V3_CCB_BASELINE_OPTIONAL=1',
+      'PLATFORM_HMAC_SECRET=keep-me',
+      '',
+    ].join('\n')
+    await writeFile(envFile, original)
+    await writeFile(path.join(bin, 'grep'), [
+      '#!/bin/bash',
+      'if [[ "$1" == "-Ev" ]]; then',
+      '  printf "DATABASE_URL=truncated\\n"',
+      '  exit 2',
+      'fi',
+      'exec /usr/bin/grep "$@"',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'grep'), 0o755)
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `V5_ENV='${envFile}'`,
+      'KL_HOST=fake-v5',
+      'ssh() { shift; command "$@"; }',
+      'strip_shared_baseline_env_keys',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stdout + result.stderr, /failed to filter shared V5 env\(rc=2\)/)
+    assert.equal(await readFile(envFile, 'utf8'), original)
+  })
+
+  test('shared baseline env migration removes forbidden keys with leading whitespace', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-space-')); dirs.push(dir)
+    const envFile = path.join(dir, 'commercial-v5.env')
+    await writeFile(envFile, [
+      'DATABASE_URL=postgres://fixture',
+      '  OC_V3_CCB_BASELINE_DIR=/untrusted/shared/path',
+      '\tOC_V3_CCB_BASELINE_OPTIONAL=1',
+      ' OPENCLAUDE_MASTER_BASELINE_BASE_URL=https://untrusted.invalid',
+      'PLATFORM_HMAC_SECRET=keep-me',
+      '',
+    ].join('\n'))
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `V5_ENV='${envFile}'`,
+      'KL_HOST=fake-v5',
+      'ssh() { shift; command "$@"; }',
+      'strip_shared_baseline_env_keys',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.equal(
+      await readFile(envFile, 'utf8'),
+      'DATABASE_URL=postgres://fixture\nPLATFORM_HMAC_SECRET=keep-me\n',
+    )
+  })
+
+  test('18893 loopback reservation fails closed on inactive, ss/probe errors, or non-loopback listeners', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-ss-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0',
+      'KL_HOST=fake-v5',
+      'ssh() { shift; command "$@"; }',
+      'assert_v5_baseline_port_guard',
+    ].join('\n')
+    const invoke = async (ssBody: string, pythonBody = 'exit 0', systemctlBody = 'exit 0') => {
+      await writeFile(path.join(bin, 'ss'), `#!/bin/sh\n${ssBody}\n`)
+      await writeFile(path.join(bin, 'python3'), `#!/bin/sh\ncat >/dev/null\n${pythonBody}\n`)
+      await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\n${systemctlBody}\n`)
+      await chmod(path.join(bin, 'ss'), 0o755)
+      await chmod(path.join(bin, 'python3'), 0o755)
+      await chmod(path.join(bin, 'systemctl'), 0o755)
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
+      })
+    }
+    const inactive = await invoke('exit 0', 'exit 0', 'exit 3')
+    assert.notEqual(inactive.status, 0)
+    assert.match(inactive.stderr, /port guard is not active/)
+    const failed = await invoke('exit 23')
+    assert.notEqual(failed.status, 0)
+    const listening = await invoke('printf "LISTEN 0 128 0.0.0.0:18893 0.0.0.0:*\\n"')
+    assert.notEqual(listening.status, 0)
+    assert.match(listening.stderr, /expected exactly one loopback/)
+    const exact = 'printf "LISTEN 0 128 127.0.0.1:18893 0.0.0.0:*\\n"'
+    const ineffective = await invoke(exact, 'exit 17')
+    assert.notEqual(ineffective.status, 0)
+    const guarded = await invoke(exact)
+    assert.equal(guarded.status, 0, guarded.stderr || guarded.stdout)
+  })
+
+  test('release GC protects container baseline references and skips all deletion on inspect failure', async () => {
+    const makeFixture = async (suffix: string) => {
+      const dir = await mkdtemp(path.join(tmpdir(), `v5-release-gc-${suffix}-`)); dirs.push(dir)
+      const releases = path.join(dir, 'releases'); await mkdir(releases)
+      const releasePaths: string[] = []
+      for (let index = 1; index <= 8; index += 1) {
+        const release = path.join(releases, `rel-proof-${String(index).padStart(2, '0')}`)
+        const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+        await mkdir(path.join(baseline, 'skills'), { recursive: true })
+        await writeFile(path.join(baseline, 'AGENTS.md'), '# agents\n')
+        await writeFile(path.join(baseline, 'CLAUDE.md'), '# claude\n')
+        await writeFile(path.join(release, '.complete'), 'ok\n')
+        const stamp = new Date(1_700_000_000_000 + index * 1_000)
+        await utimes(release, stamp, stamp)
+        releasePaths.push(release)
+      }
+      const srcA = path.join(dir, 'slot-a')
+      const srcB = path.join(dir, 'slot-b')
+      const egress = path.join(dir, 'egress')
+      await symlink(releasePaths[7]!, srcA)
+      await symlink(releasePaths[6]!, srcB)
+      await symlink(releasePaths[7]!, egress)
+      const prev = path.join(releases, '.prev-release')
+      await writeFile(prev, `${releasePaths[5]}\n`)
+
+      const inspect = path.join(dir, 'inspect.json')
+      await writeFile(inspect, JSON.stringify([{
+        Config: { Labels: {
+          'com.openclaude.v3.managed': '1',
+          'com.openclaude.runtime_channel': 'v5',
+        } },
+        Mounts: [
+          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md'), Destination: '/opt/openclaude/AGENTS.md', RW: false },
+          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/CLAUDE.md'), Destination: '/run/oc/claude-config/CLAUDE.md', RW: false },
+          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/skills'), Destination: '/run/oc/claude-config/skills', RW: false },
+        ],
+      }]))
+      const bin = path.join(dir, 'bin'); await mkdir(bin)
+      const dockerLog = path.join(dir, 'docker.log')
+      await writeFile(path.join(bin, 'systemctl'), [
+        '#!/bin/sh',
+        'if [ "$1" = show ]; then printf "0\\n"; exit 0; fi',
+        'exit 1',
+      ].join('\n') + '\n')
+      await writeFile(path.join(bin, 'docker'), [
+        '#!/bin/sh',
+        'printf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"',
+        'if [ "$1" = ps ]; then printf "aaaaaaaaaaaa\\n"; exit 0; fi',
+        'if [ "$1" = inspect ]; then',
+        '  [ "${FAKE_INSPECT_FAIL:-0}" = 1 ] && exit 23',
+        '  cat "$FAKE_INSPECT"; exit 0',
+        'fi',
+        'exit 99',
+      ].join('\n') + '\n')
+      await chmod(path.join(bin, 'systemctl'), 0o755)
+      await chmod(path.join(bin, 'docker'), 0o755)
+      const args = [
+        releases, '2', srcA, srcB, egress, prev,
+        'openclaude-v5.service', 'openclaude-v5-b.service', 'openclaude-v5-egress.service',
+        '', '', '',
+      ]
+      const env = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        FAKE_INSPECT: inspect,
+        FAKE_DOCKER_LOG: dockerLog,
+      }
+      return { releases, releasePaths, args, env, dockerLog }
+    }
+
+    const protectedFixture = await makeFixture('protected')
+    const protectedRun = spawnSync('bash', [releaseGc, ...protectedFixture.args], {
+      cwd: root, encoding: 'utf8', env: protectedFixture.env,
+    })
+    assert.equal(protectedRun.status, 0, protectedRun.stderr || protectedRun.stdout)
+    const survivors = (await readdir(protectedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    assert.deepEqual(survivors, ['rel-proof-01', 'rel-proof-06', 'rel-proof-07', 'rel-proof-08'])
+    const dockerLog = await readFile(protectedFixture.dockerLog, 'utf8')
+    assert.match(dockerLog, /label=com\.openclaude\.v3\.managed=1/)
+    assert.match(dockerLog, /label=com\.openclaude\.runtime_channel=v5/)
+
+    const failedFixture = await makeFixture('inspect-fail')
+    const before = (await readdir(failedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    const failedRun = spawnSync('bash', [releaseGc, ...failedFixture.args], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...failedFixture.env, FAKE_INSPECT_FAIL: '1' },
+    })
+    assert.equal(failedRun.status, 75)
+    assert.match(failedRun.stderr, /SAFE-SKIP:.*cannot inspect/)
+    const after = (await readdir(failedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    assert.deepEqual(after, before)
+  })
+
   test('ordinary deploy/dist/rollback dry-runs never require a cutover nonce', () => {
     for (const [mode, args] of [
       ['deploy', ['--dry-run']],
@@ -200,6 +563,7 @@ describe('v5 release safety lanes', () => {
     const smokeDryRun = run(deploy, ['--smoke', '--dry-run'])
     assert.equal(smokeDryRun.status, 0, smokeDryRun.stderr || smokeDryRun.stdout)
     assert.match(smokeDryRun.stdout, /校验 0151 runtime 对象 owner 与应用角色逐项权限/)
+    assert.match(smokeDryRun.stdout, /\[dry-run\] \/healthz 深度健康/)
   })
 
   test('0151 privilege transport/query failure is fail-closed', () => {

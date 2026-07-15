@@ -1,6 +1,6 @@
 # v5 egress 进程 —— 容器出站面(172.31.0.1:18892):/v1/messages 本地 anthropicProxy
 # 全链 + 其余转发 master 控制口(127.0.0.1:18894,= commercial-v5.env.overrides 的
-# INTERNAL_CONTROL_PORT;18893 已被 v5 baseline server 占用)。与 openclaude-v5(master)
+# INTERNAL_CONTROL_PORT；V5 local-only 不再启动远程 baseline server)。与 openclaude-v5(master)
 # 解耦:master 部署重启不再掐断在飞 LLM 生成流。重启本服务须显式(deploy-v5.sh --egress),
 # SIGTERM 走 drain(停接新连接,在飞流最多等 30min)。
 [Unit]

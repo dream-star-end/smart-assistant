@@ -10,8 +10,9 @@
 # 才决定竞锁 / bind(RFC D4/D3)。env 里 OC_CONTROL_PLANE_LEADER=1 只表示"有资格",candidate
 # 起手 desired_* 仍指向 A → 本实例恒 standby、不抢 leader、不 bind VIP,直到 finalize 翻转 desired。
 Description=OpenClaude Gateway (v5 Aurora slot B)
-After=network.target postgresql.service redis-server.service
+After=network.target postgresql.service redis-server.service openclaude-v5-baseline-port-guard.socket
 Wants=postgresql.service redis-server.service
+Requires=openclaude-v5-baseline-port-guard.socket
 
 [Service]
 Type=simple
@@ -23,6 +24,9 @@ EnvironmentFile=/etc/openclaude/commercial-v5.env
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-b"
 Environment="NODE_ENV=production"
+# B candidate/active 必须读取 B release 自己的 baseline，不能继承共享 env 的 A 路径。
+Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5-b/packages/commercial/agent-sandbox/ccb-baseline"
+# 与 A slot 相同：回环 socket 占位使旧代码的 wildcard bind 确定失败。
 # slot 身份 + 私有控制口(RFC D3):master 据此决定本 slot 私有 dispatcher 端口 / healthz slot 标识。
 Environment="OC_SLOT=B"
 Environment="OC_PRIVATE_CONTROL_PORT=18897"
