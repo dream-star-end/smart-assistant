@@ -37,9 +37,11 @@ import {
   REQUEST_ID_HEADER,
   buildSafeUpstreamHeaders,
   isAnthropicInvalidRequestError,
+  isProviderBoundHistoryError,
   isClientAbort,
   pipeStreamWithUsageCapture,
   sendJsonError,
+  stripProviderBoundAssistantBlocks,
   errSummary,
 } from "./shared.js";
 import type { PreparedUpstreamSession } from "./upstream.js";
@@ -172,7 +174,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     } catch (err) {
       if (err instanceof HttpError) {
         incrAnthropicProxyReject("bad_headers");
-        await finalize.fail(observed, err);
+        await finalize.fail(observed, err, "INVALID_REQUEST");
         sendJsonError(res, err.status, err.code, err.message, requestId);
         return;
       }
@@ -183,16 +185,17 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 详见 proxy/upstream.ts 中两个实现的注释。
     session.applyUpstreamAuth(safeHeaders, body, userLog);
     const upstreamMessages = session.sanitizeMessages(body.messages, body.model, userLog);
-    const upstreamBodyJson = JSON.stringify({
-      ...body,
-      // 上游 model 名与平台 model id 分离(模型权威批次 §1.3):session.upstreamModel =
-      // catalog 的 upstream_model_id ?? model_id;无 catalog 时恒等于 body.model(逐字节
-      // 等于旧行为)。**计费/授权/指标一律继续用 body.model**(平台 id),只有发往上游的
-      // 这一份 JSON 用 upstreamModel —— 两个 id 面不可混用。
-      model: session.upstreamModel,
-      messages: upstreamMessages,
-      stream: true,
-    });
+    const serializeUpstreamBody = (messages: unknown[]): string => JSON.stringify({
+        ...body,
+        // 上游 model 名与平台 model id 分离(模型权威批次 §1.3):session.upstreamModel =
+        // catalog 的 upstream_model_id ?? model_id;无 catalog 时恒等于 body.model(逐字节
+        // 等于旧行为)。**计费/授权/指标一律继续用 body.model**(平台 id),只有发往上游的
+        // 这一份 JSON 用 upstreamModel —— 两个 id 面不可混用。
+        model: session.upstreamModel,
+        messages,
+        stream: true,
+      });
+    const upstreamBodyJson = serializeUpstreamBody(upstreamMessages);
 
     const fetchInit: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
@@ -208,31 +211,69 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (session.dispatcher) fetchInit.dispatcher = session.dispatcher;
 
     const fetchStartMs = Date.now();
-    const upstream = await fetchFn(session.endpoint, fetchInit);
-    if (upstream.status < 200 || upstream.status >= 300) {
-      // 上游 4xx/5xx — 读 body preview 写 log,直接转译成 502
-      let preview = "";
+    let upstream = await fetchFn(session.endpoint, fetchInit);
+    let upstreamErrorPreview: string | null = null;
+    if (upstream.status === 400) {
       try {
-        preview = (await upstream.text()).slice(0, 500);
+        upstreamErrorPreview = (await upstream.text()).slice(0, 500);
       } catch {
-        /* ignore */
+        upstreamErrorPreview = "";
       }
-      const err = new Error(
-        `upstream returned ${upstream.status}: ${preview}`,
-      );
+      if (isProviderBoundHistoryError(upstreamErrorPreview)) {
+        const stripped = stripProviderBoundAssistantBlocks(upstreamMessages);
+        if (stripped.blocksStripped > 0) {
+          userLog.info("proxy_provider_bound_history_retry", {
+            model: body.model,
+            count: stripped.blocksStripped,
+          });
+          upstream = await fetchFn(session.endpoint, {
+            ...fetchInit,
+            body: serializeUpstreamBody(stripped.messages),
+          });
+          upstreamErrorPreview = null;
+        }
+      }
+    }
+    if (upstream.status < 200 || upstream.status >= 300) {
+      // 上游 4xx/5xx — body 只在内存中做协议分类。禁止把 provider 响应正文
+      // 写进 journal/log：其中可能含请求片段或供应商内部细节。
+      let preview = upstreamErrorPreview ?? "";
+      if (upstreamErrorPreview === null) {
+        try {
+          preview = (await upstream.text()).slice(0, 500);
+        } catch {
+          /* ignore */
+        }
+      }
       // 上游 400 invalid_request_error = 客户端 body 损坏(典型:thinking
       // signature 不合法)。账号本身没问题,走 client_error 不扣健康分,
       // 防止 boss 自己客户端 bug 反复打到账号 cooldown。
       const isClientBadRequest =
         upstream.status === 400 && isAnthropicInvalidRequestError(preview);
+      const upstreamClass = isClientBadRequest
+        ? "INVALID_REQUEST"
+        : upstream.status === 429
+          ? "RATE_LIMITED"
+          : upstream.status >= 500
+            ? "UPSTREAM_UNAVAILABLE"
+            : "UPSTREAM_REJECTED";
+      const err = new Error(`upstream returned ${upstream.status} (${upstreamClass})`);
       if (isClientBadRequest) {
         userLog.warn("proxy_upstream_invalid_request", {
           status: upstream.status,
-          preview: preview.slice(0, 200),
+          errorClass: upstreamClass,
         });
-        await finalize.failClient(observed, err);
+        await finalize.failClient(observed, err, "INVALID_REQUEST");
       } else {
-        await finalize.fail(observed, err);
+        await finalize.fail(
+          observed,
+          err,
+          upstreamClass === "RATE_LIMITED"
+            ? "RATE_LIMITED"
+            : upstreamClass === "UPSTREAM_UNAVAILABLE"
+              ? "UPSTREAM_UNAVAILABLE"
+              : "UPSTREAM_REJECTED",
+        );
       }
       incrAnthropicProxySettle("aborted");
       // P3.2 健康信号:上游 5xx / 429(过载)算 provider 侧失败;4xx(含 400 客户端 body 损坏、
@@ -245,7 +286,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     }
     if (!upstream.body) {
       const err = new Error(`upstream ${upstream.status} but no body`);
-      await finalize.fail(observed, err);
+      await finalize.fail(observed, err, "UPSTREAM_UNAVAILABLE");
       incrAnthropicProxySettle("aborted");
       recordProviderHealthSample(body.model, "upstream_5xx"); // 2xx 却无 body = provider 返回畸形
       sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
@@ -294,10 +335,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     let outcome: FinalizeOutcome;
     if (result.error !== null) {
       if (isClientAbort(result.error)) {
-        outcome = await finalize.failClient(observed, result.error);
+        outcome = await finalize.failClient(observed, result.error, "CLIENT_ABORT");
         recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除,不算 provider 失败
       } else {
-        outcome = await finalize.fail(observed, result.error);
+        outcome = await finalize.fail(observed, result.error, "STREAM_FAILED");
         recordProviderHealthSample(body.model, "partial"); // 中途断流 = provider 侧失败
       }
     } else {
@@ -383,10 +424,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
     if (isClientAbort(err)) {
-      await finalize.failClient(observed, err);
+      await finalize.failClient(observed, err, "CLIENT_ABORT");
       recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除
     } else {
-      await finalize.fail(observed, err);
+      await finalize.fail(observed, err, "UPSTREAM_UNAVAILABLE");
       recordProviderHealthSample(body.model, "timeout"); // fetch 抛错:超时/DNS/socket = provider 不可达
     }
     incrAnthropicProxySettle("aborted");

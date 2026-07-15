@@ -55,6 +55,7 @@ export interface SendProactiveArgs {
 export type ProactiveDeliveryResult =
   | { kind: "delivered" }
   | { kind: "fallback"; marked: boolean }
+  | { kind: "failure"; retryable: boolean; code: string }
 
 /** master outcome → 容器决策。未知 outcome 保守按 fallback 不标注。 */
 function classifyOutcome(outcome: string): ProactiveDeliveryResult {
@@ -69,14 +70,19 @@ function classifyOutcome(outcome: string): ProactiveDeliveryResult {
     case "pref_off":
     case "no_binding":
     case "empty_render":
-    default:
       return { kind: "fallback", marked: false }
+    default:
+      // Unknown success bodies are ambiguous. Retrying with the same
+      // outboundId is safe; falling back to another channel could duplicate a
+      // master enqueue whose response shape merely changed.
+      return { kind: "failure", retryable: true, code: "WECHAT_RESPONSE_INVALID" }
   }
 }
 
 /**
- * 单次 best-effort POST。任何网络/HTTP 错误 → fallback{marked:false}(回退 web 不标注:
- * 配置/网络问题不是用户会话问题,标注会误导)。永不抛 —— 主动投递不该阻断 cron web 投递。
+ * 单次 POST。User-state outcomes may intentionally fall back to web; transport
+ * ambiguity is returned as a failure so cron retains its archived delivery and
+ * retries the same outboundId instead of duplicating across channels.
  */
 export async function sendV3WechatProactive(
   args: SendProactiveArgs,
@@ -123,7 +129,11 @@ export async function sendV3WechatProactive(
       // drain 失败 → 按网络错误回退
     }
     if (res.statusCode < 200 || res.statusCode >= 300) {
-      return { kind: "fallback", marked: false }
+      return {
+        kind: "failure",
+        retryable: res.statusCode === 408 || res.statusCode === 429 || res.statusCode >= 500,
+        code: res.statusCode >= 500 ? "WECHAT_MASTER_UNAVAILABLE" : "WECHAT_MASTER_REJECTED",
+      }
     }
     try {
       const parsed = JSON.parse(respText) as { outcome?: string }
@@ -133,10 +143,11 @@ export async function sendV3WechatProactive(
     } catch {
       // 非法 JSON → fallback
     }
-    return { kind: "fallback", marked: false }
+    return { kind: "failure", retryable: true, code: "WECHAT_RESPONSE_INVALID" }
   } catch {
-    // 网络 / DNS / TCP / TLS / abort → 回退 web 不标注
-    return { kind: "fallback", marked: false }
+    // Network ambiguity may mean master accepted the stable outboundId before
+    // the response was lost. Retry that same id; never cross-channel fallback.
+    return { kind: "failure", retryable: true, code: "WECHAT_TRANSPORT_FAILED" }
   } finally {
     clearTimeout(timer)
   }

@@ -49,6 +49,8 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
   { table: "rate_limit_events", column: "created_at", days: 30 },
+  { table: "product_friction_events", column: "updated_at", days: 30 },
+  { table: "image_generation_attempts", column: "started_at", days: 30, predicate: "outcome<>'pending'" },
   { table: "selfheal_wecom_inbound_dedupe", column: "received_at", days: 90 },
   // P1#11:连接器写账本 90 天终态 retention 统一收口到这里(connectorSweeper 只做
   // 活跃→终态转换,不再自删)。谓词保证只删终态行——活跃态(pending/approved/executing)

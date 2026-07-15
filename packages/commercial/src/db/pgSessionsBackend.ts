@@ -51,6 +51,8 @@ import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
   type ClientSession,
+  type ClientSessionLifecycle,
+  type ClientSessionLifecycleRef,
   type ClientSessionMeta,
   type ClientSessionPartial,
   type ClientSessionReadOptions,
@@ -78,6 +80,7 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
+  hasLegacyRawBillingReason,
   materializeLosslessTurn,
   type LosslessTurnRecord,
 } from "../http/losslessTurnTape.js";
@@ -973,9 +976,10 @@ export function createPgSessionsBackend(
             total_bytes: string;
             part_count: number;
             created_at: string;
+            finalized_at: string | null;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at
+                    total_bytes, part_count, created_at, finalized_at
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -993,6 +997,10 @@ export function createPgSessionsBackend(
             existingTape.part_count === request.partCount &&
             bigIntNum(existingTape.created_at, "turn_tape.created_at") === request.createdAt;
           if (!same) throw new Error("lossless turn tape immutable header conflict");
+          // Finalization already materialized sanitized records and billing.
+          // A rolling old writer may retry raw parts after we privacy-purged
+          // them; acknowledge the immutable header without re-storing bytes.
+          if (existingTape.finalized_at !== null) return { applied: "idempotent" };
         } else {
           await client.query(
             `INSERT INTO client_session_turn_tapes
@@ -1134,6 +1142,7 @@ export function createPgSessionsBackend(
         } catch (err) {
           throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
         }
+        const legacyRawBillingReason = hasLegacyRawBillingReason(rawPayload);
         const turn = materializeLosslessTurn(rawPayload);
         if (
           turn.payload.sessionId !== request.sessionId ||
@@ -1394,6 +1403,13 @@ export function createPgSessionsBackend(
             request.tapeId,
           ],
         );
+        if (legacyRawBillingReason) {
+          await client.query(
+            `DELETE FROM client_session_turn_tape_parts
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+            [request.sessionId, userId, request.tapeId],
+          );
+        }
         return {
           applied: "finalized",
           recordCount: turn.records.length,
@@ -2292,6 +2308,37 @@ export function createPgSessionsBackend(
         archivedCount: bigIntNumOr(row.archived_count, 0),
         archivedThroughSeq: bigIntNumOr(row.archived_through_seq, 0),
       };
+    },
+
+    async classifyClientSessions(
+      refs: readonly ClientSessionLifecycleRef[],
+    ): Promise<ClientSessionLifecycle[]> {
+      if (refs.length === 0) return [];
+      const rows = (
+        await pool.query<{
+          ordinal: string;
+          session_id: string;
+          user_id: string;
+          state: "active" | "deleted" | "missing";
+        }>(
+          `SELECT entry.ordinal::text AS ordinal,
+                  entry.value->>'sessionId' AS session_id,
+                  entry.value->>'userId' AS user_id,
+                  CASE WHEN cs.id IS NULL THEN 'missing'
+                       WHEN cs.deleted_at IS NULL THEN 'active'
+                       ELSE 'deleted' END AS state
+             FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS entry(value, ordinal)
+             LEFT JOIN client_sessions cs
+               ON cs.id=entry.value->>'sessionId' AND cs.user_id=entry.value->>'userId'
+            ORDER BY entry.ordinal`,
+          [JSON.stringify(refs)],
+        )
+      ).rows;
+      return rows.map((row) => ({
+        sessionId: row.session_id,
+        userId: row.user_id,
+        state: row.state,
+      }));
     },
 
     async getClientSessionPartial(

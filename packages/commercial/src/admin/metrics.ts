@@ -544,6 +544,9 @@ export type ProxyRejectReason =
   | "identity"
   | "bad_path"
   | "bad_headers"
+  // request_finalize_journal 的全局 request_id 已存在；在上游 fetch 前拒绝，
+  // 防止客户端重放或跨用户碰撞绕过计费/审计。
+  | "request_id_conflict"
   | "upstream_auth"
   | "deepseek_config"
   | "minimax_config"

@@ -1,5 +1,15 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { ApiError, api, apiErrorMessage, authErrorMessage } from './api'
+import {
+  ApiError,
+  api,
+  apiErrorMessage,
+  authErrorMessage,
+  callWithRefresh,
+  loginWithCookieSerialization,
+  logoutWithCookieSerialization,
+  refreshWithFriction,
+  resetRefreshJourney,
+} from './api'
 import type { AuthSession } from './types'
 
 afterEach(() => {
@@ -162,13 +172,13 @@ test('submitFeedback sends only the allowlisted settings payload with Bearer aut
   })
 })
 
-test('a failed refresh calls onExpired exactly once and surfaces the original error', async () => {
+test('a definitively invalid refresh calls onExpired exactly once and surfaces the original error', async () => {
   let refreshCalls = 0
   const fetchMock = vi.fn(async (url: string) => {
     const u = String(url)
     if (u.includes('/api/auth/refresh')) {
       refreshCalls += 1
-      return unauthorized()
+      return authErr(401, 'INVALID_REFRESH', 'refresh token invalid')
     }
     return unauthorized() // authed call also 401
   })
@@ -178,6 +188,348 @@ test('a failed refresh calls onExpired exactly once and surfaces the original er
   await expect(api.getMe(session)).rejects.toThrow()
   expect(refreshCalls).toBe(1)
   expect(expired()).toBe(true)
+})
+
+test('a transient refresh failure preserves the in-memory session for later recovery', async () => {
+  let refreshCalls = 0
+  const fetchMock = vi.fn(async (url: string) => {
+    const u = String(url)
+    if (u.includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      return authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary')
+    }
+    return unauthorized()
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, expired } = makeSession('tok1')
+  await expect(api.getMe(session)).rejects.toThrow()
+  expect(refreshCalls).toBe(1)
+  expect(expired()).toBe(false)
+})
+
+test('refresh friction keeps one correlation and cumulative attempt count through recovery', async () => {
+  let refreshCalls = 0
+  let meCalls = 0
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    const u = String(url)
+    if (u.includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)))
+      return ok({ ok: true })
+    }
+    if (u.includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      return refreshCalls === 1
+        ? authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary')
+        : ok({ access_token: 'tok-recovered', access_exp: 999, remember: false })
+    }
+    meCalls += 1
+    return meCalls <= 2 ? unauthorized() : ok(ME_BODY)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, expired } = makeSession('tok1')
+  await expect(api.getMe(session)).rejects.toThrow()
+  await expect(api.getMe(session)).resolves.toMatchObject({ id: 'u1' })
+
+  expect(expired()).toBe(false)
+  expect(reports).toHaveLength(2)
+  expect(reports[0]).toMatchObject({
+    code: 'REFRESH_TRANSIENT', outcome: 'failed', attempts: 1,
+  })
+  expect(reports[1]).toMatchObject({
+    event_id: reports[0]?.event_id,
+    code: 'REFRESH_TRANSIENT', outcome: 'recovered', attempts: 2,
+  })
+})
+
+test('boot/admin/WS direct refreshes share the same recovery-aware journey wrapper', async () => {
+  let refreshCalls = 0
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    const u = String(url)
+    if (u.includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)))
+      return ok({ ok: true })
+    }
+    if (u.includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      return refreshCalls === 1
+        ? authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary')
+        : ok({ access_token: 'tok-direct-recovered', access_exp: 999, remember: false })
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const stableSessionKey = {}
+  await expect(refreshWithFriction(stableSessionKey, 'admin_auth')).resolves.toMatchObject({ kind: 'transient' })
+  await expect(refreshWithFriction(stableSessionKey, 'admin_auth')).resolves.toMatchObject({
+    kind: 'success', result: { accessToken: 'tok-direct-recovered' },
+  })
+
+  expect(reports).toHaveLength(2)
+  expect(reports[0]).toMatchObject({
+    surface: 'admin_auth', code: 'REFRESH_TRANSIENT', outcome: 'failed', attempts: 1,
+  })
+  expect(reports[1]).toMatchObject({
+    event_id: reports[0]?.event_id,
+    surface: 'admin_auth', code: 'REFRESH_TRANSIENT', outcome: 'recovered', attempts: 2,
+  })
+})
+
+test('race followed by a transient preserves REFRESH_RACE classification until recovery', async () => {
+  let refreshCalls = 0
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    const u = String(url)
+    if (u.includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)))
+      return ok({ ok: true })
+    }
+    if (u.includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      if (refreshCalls === 1) return authErr(401, 'REFRESH_RACE', 'rotation race')
+      if (refreshCalls === 2) return authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary')
+      return ok({ access_token: 'tok-race-later', access_exp: 999, remember: false })
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const stableSessionKey = {}
+  await expect(refreshWithFriction(stableSessionKey, 'auth')).resolves.toMatchObject({
+    kind: 'transient', raceObserved: true, attempts: 2,
+  })
+  await expect(refreshWithFriction(stableSessionKey, 'auth')).resolves.toMatchObject({ kind: 'success' })
+  expect(reports).toHaveLength(2)
+  expect(reports[0]).toMatchObject({ code: 'REFRESH_RACE', outcome: 'failed', attempts: 2 })
+  expect(reports[1]).toMatchObject({
+    event_id: reports[0]?.event_id, code: 'REFRESH_RACE', outcome: 'recovered', attempts: 3,
+  })
+})
+
+test('identity reset prevents an old failed journey from recovering under a new account', async () => {
+  let refreshCalls = 0
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    const u = String(url)
+    if (u.includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)))
+      return ok({ ok: true })
+    }
+    refreshCalls += 1
+    return refreshCalls === 1
+      ? authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary')
+      : ok({ access_token: 'different-user-token', access_exp: 999, remember: false })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const key = {}
+  await refreshWithFriction(key, 'auth', 'old-user-token')
+  resetRefreshJourney(key)
+  await refreshWithFriction(key, 'auth', 'different-user-token')
+  expect(reports).toHaveLength(1)
+  expect(reports[0]).toMatchObject({ outcome: 'failed', code: 'REFRESH_TRANSIENT' })
+})
+
+test('identity reset serializes refresh generations and a late old response cannot expire the new login', async () => {
+  let token = 'old-access-token'
+  let expired = 0
+  let refreshCalls = 0
+  let activeRefreshes = 0
+  let maxActiveRefreshes = 0
+  let resolveOld!: (response: ReturnType<typeof authErr>) => void
+  const oldResponse = new Promise<ReturnType<typeof authErr>>((resolve) => {
+    resolveOld = resolve
+  })
+  const fetchMock = vi.fn(async (url: string) => {
+    if (!String(url).includes('/api/auth/refresh')) throw new Error(`unexpected fetch ${url}`)
+    refreshCalls += 1
+    activeRefreshes += 1
+    maxActiveRefreshes = Math.max(maxActiveRefreshes, activeRefreshes)
+    try {
+      if (refreshCalls === 1) return await oldResponse
+      return ok({ access_token: 'new-refresh-token', access_exp: 999, remember: false })
+    } finally {
+      activeRefreshes -= 1
+    }
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const session: AuthSession = {
+    getToken: () => token,
+    setToken: (next) => { token = next },
+    onExpired: () => { expired += 1 },
+  }
+
+  const oldReplay = callWithRefresh(session, async () => unauthorized() as unknown as Response)
+  await vi.waitFor(() => expect(refreshCalls).toBe(1))
+  resetRefreshJourney(session)
+  token = 'new-login-token'
+  const newRefresh = refreshWithFriction(session, 'auth', token)
+  await Promise.resolve()
+  expect(refreshCalls).toBe(1)
+
+  resolveOld(authErr(401, 'INVALID_REFRESH', 'old family invalid'))
+  await expect(oldReplay).resolves.toMatchObject({ status: 401 })
+  await expect(newRefresh).resolves.toMatchObject({
+    kind: 'success', result: { accessToken: 'new-refresh-token' },
+  })
+  expect(expired).toBe(0)
+  expect(maxActiveRefreshes).toBe(1)
+  expect(refreshCalls).toBe(2)
+})
+
+test('a delayed successful refresh applies its cookie before a replacement login', async () => {
+  const order: string[] = []
+  let resolveRefresh!: (response: ReturnType<typeof ok>) => void
+  const refreshResponse = new Promise<ReturnType<typeof ok>>((resolve) => {
+    resolveRefresh = resolve
+  })
+  let loginCalls = 0
+  const fetchMock = vi.fn(async (url: string) => {
+    const value = String(url)
+    if (value.includes('/api/auth/refresh')) {
+      const response = await refreshResponse
+      order.push('refresh-response')
+      return response
+    }
+    if (value.includes('/api/auth/login')) {
+      loginCalls += 1
+      order.push('login-response')
+      return ok({
+        user: ME_BODY.user,
+        access_token: 'new-login-token',
+        access_exp: 999,
+        refresh_exp: 1999,
+        remember: false,
+      })
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const key = {}
+
+  const oldRefresh = refreshWithFriction(key, 'auth', 'old-access-token')
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  const login = loginWithCookieSerialization(key, 'a@b.com', 'pw', 'bypass')
+  await Promise.resolve()
+  expect(loginCalls).toBe(0)
+
+  resolveRefresh(ok({ access_token: 'old-rotated-token', access_exp: 500, remember: false }))
+  await expect(oldRefresh).resolves.toMatchObject({ kind: 'stale' })
+  await expect(login).resolves.toMatchObject({ accessToken: 'new-login-token' })
+  expect(order).toEqual(['refresh-response', 'login-response'])
+})
+
+test('same-origin Web Lock serializes refresh and login across independent tab modules', async () => {
+  let lockTail = Promise.resolve()
+  const locks = {
+    request: vi.fn(<T>(_name: string, _options: LockOptions, callback: () => Promise<T>) => {
+      const result = lockTail.then(callback)
+      lockTail = result.then(() => undefined, () => undefined)
+      return result
+    }),
+  }
+  vi.stubGlobal('navigator', { userAgent: 'test', locks })
+  vi.resetModules()
+  const tabA = await import('./api')
+  vi.resetModules()
+  const tabB = await import('./api')
+
+  let resolveRefresh!: (response: ReturnType<typeof ok>) => void
+  const refreshResponse = new Promise<ReturnType<typeof ok>>((resolve) => { resolveRefresh = resolve })
+  const order: string[] = []
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes('/api/auth/refresh')) {
+      const response = await refreshResponse
+      order.push('tab-a-refresh-response')
+      return response
+    }
+    if (String(url).includes('/api/auth/login')) {
+      order.push('tab-b-login-response')
+      return ok({
+        user: ME_BODY.user, access_token: 'tab-b-token', access_exp: 999,
+        refresh_exp: 1999, remember: false,
+      })
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const oldRefresh = tabA.refreshWithFriction({}, 'auth', 'tab-a-token')
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  const newLogin = tabB.loginWithCookieSerialization({}, 'b@example.com', 'pw', 'bypass')
+  await Promise.resolve()
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+
+  resolveRefresh(ok({ access_token: 'tab-a-rotated', access_exp: 500, remember: false }))
+  await oldRefresh
+  await expect(newLogin).resolves.toMatchObject({ accessToken: 'tab-b-token' })
+  expect(order).toEqual(['tab-a-refresh-response', 'tab-b-login-response'])
+  expect(locks.request).toHaveBeenCalledTimes(2)
+})
+
+test('a replacement login waits for a previously queued logout response', async () => {
+  const order: string[] = []
+  let resolveLogout!: (response: ReturnType<typeof ok>) => void
+  const logoutResponse = new Promise<ReturnType<typeof ok>>((resolve) => {
+    resolveLogout = resolve
+  })
+  let loginCalls = 0
+  const fetchMock = vi.fn(async (url: string) => {
+    const value = String(url)
+    if (value.includes('/api/auth/logout')) {
+      const response = await logoutResponse
+      order.push('logout-response')
+      return response
+    }
+    if (value.includes('/api/auth/login')) {
+      loginCalls += 1
+      order.push('login-response')
+      return ok({
+        user: ME_BODY.user,
+        access_token: 'after-logout-token',
+        access_exp: 999,
+        refresh_exp: 1999,
+        remember: false,
+      })
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const key = {}
+
+  const logout = logoutWithCookieSerialization(key)
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  const login = loginWithCookieSerialization(key, 'a@b.com', 'pw', 'bypass')
+  await Promise.resolve()
+  expect(loginCalls).toBe(0)
+
+  resolveLogout(ok({ ok: true }))
+  await logout
+  await expect(login).resolves.toMatchObject({ accessToken: 'after-logout-token' })
+  expect(order).toEqual(['logout-response', 'login-response'])
+})
+
+test('REFRESH_RACE retries once and recovers without expiring auth', async () => {
+  let refreshCalls = 0
+  const fetchMock = vi.fn(async (url: string) => {
+    const u = String(url)
+    if (u.includes('/api/auth/refresh')) {
+      refreshCalls += 1
+      if (refreshCalls === 1) return authErr(401, 'REFRESH_RACE', 'rotation race')
+      return ok({ access_token: 'tok-race-recovered', access_exp: 999, remember: true })
+    }
+    return ok({ ok: true })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  await expect(api.refresh()).resolves.toMatchObject({
+    kind: 'success',
+    recoveredRace: true,
+    result: { accessToken: 'tok-race-recovered' },
+  })
+  expect(refreshCalls).toBe(2)
 })
 
 // ─── Bug1：auth 错误族 code→友好中文（单一权威 AUTH_ERROR_MESSAGES） ───────────────

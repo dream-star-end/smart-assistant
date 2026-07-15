@@ -46,7 +46,7 @@ function msgFrame(over: AnyFrame): OutboundMessageWire {
 function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
-    silentRefresh: async () => null,
+    silentRefresh: async () => ({ kind: "invalid" as const }),
     onAuthExpired: () => {},
     defaultAgentId: "main",
     ...overrides,

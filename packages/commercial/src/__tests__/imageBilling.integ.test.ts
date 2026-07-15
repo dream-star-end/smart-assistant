@@ -13,9 +13,13 @@ import { CODEX_RELAY_PREFIX, CODEX_UPSTREAM_AUTH_HEADER, makeCodexRelayHandler }
 import type { PreCheckRedis } from '../billing/preCheck.js'
 import {
   ImageDailyLimitError,
+  beginImageUpstreamAttempt,
+  finishImageUpstreamAttempt,
   getCompletedImageUsage,
+  markImageUsage,
   reserveImageUsage,
   settleImageCharge,
+  sweepStaleImageUsage,
 } from '../billing/imageBilling.js'
 
 const BASE_URL = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -137,6 +141,33 @@ async function outpaintInput(jobId: string, aspect = '16:9', prompt = 'expand to
 }
 
 describe('Image 2 exact billing', () => {
+  test('global stale sweep finalizes abandoned journeys and pending attempts', async (t) => {
+    if (skip(t)) return
+    const userId = await user()
+    const requestId = 'image:stale-global'
+    await reserveImageUsage(getPool(), {
+      userId, containerId: null, requestId, operation: 'generation',
+    })
+    await beginImageUpstreamAttempt(getPool(), { userId, requestId })
+    await query(
+      `UPDATE image_generation_usage_records
+          SET updated_at=NOW()-INTERVAL '16 minutes'
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), requestId],
+    )
+    assert.equal(await sweepStaleImageUsage(getPool()), 1)
+    assert.deepEqual((await query<{ status: string; error_code: string | null }>(
+      `SELECT status,error_code FROM image_generation_usage_records
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), requestId],
+    )).rows, [{ status: 'failed', error_code: 'IMAGE_STALE_TIMEOUT' }])
+    assert.deepEqual((await query<{ outcome: string; error_code: string | null }>(
+      `SELECT outcome,error_code FROM image_generation_attempts WHERE user_id=$1`,
+      [userId.toString()],
+    )).rows, [{ outcome: 'failed', error_code: 'IMAGE_STALE_TIMEOUT' }])
+    assert.equal(await sweepStaleImageUsage(getPool()), 0, 'sweep is idempotent')
+  })
+
   test('charges exactly 50 once and replays the committed response', async (t) => {
     if (skip(t)) return
     const userId = await user()
@@ -233,6 +264,103 @@ describe('Image 2 exact billing', () => {
     )).rows[0]!.credits, '450')
   })
 
+  test('0151 remains writable by the old runtime and captures only proven legacy fetches', async (t) => {
+    if (skip(t)) return
+    const userId = await user()
+    const relayRequest = 'image:legacy-relay'
+    const invalidRequest = 'image:legacy-invalid'
+    const successRequest = 'image:legacy-success'
+
+    // These are the exact lowercase writes made by the pre-0151 process while
+    // the backward-compatible migration is already live.
+    await reserveImageUsage(getPool(), {
+      userId, containerId: null, requestId: relayRequest, operation: 'generation',
+    })
+    await query(
+      `UPDATE image_generation_usage_records
+          SET status='failed',error_code='relay_failed',updated_at=NOW()
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), relayRequest],
+    )
+    await reserveImageUsage(getPool(), {
+      userId, containerId: null, requestId: invalidRequest, operation: 'generation',
+    })
+    await query(
+      `UPDATE image_generation_usage_records
+          SET status='failed',error_code='invalid_request',updated_at=NOW()
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), invalidRequest],
+    )
+    await reserveImageUsage(getPool(), {
+      userId, containerId: null, requestId: successRequest, operation: 'generation',
+    })
+    await query(
+      `UPDATE image_generation_usage_records
+          SET status='success',error_code=NULL,completed_at=NOW(),updated_at=NOW()
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), successRequest],
+    )
+
+    assert.deepEqual((await query<{ request_id: string; attempt_count: number; error_code: string | null }>(
+      `SELECT request_id,attempt_count,error_code
+         FROM image_generation_usage_records WHERE user_id=$1 ORDER BY request_id`,
+      [userId.toString()],
+    )).rows, [
+      { request_id: invalidRequest, attempt_count: 0, error_code: 'invalid_request' },
+      { request_id: relayRequest, attempt_count: 1, error_code: 'relay_failed' },
+      { request_id: successRequest, attempt_count: 1, error_code: null },
+    ])
+    assert.deepEqual((await query<{ request_id: string; outcome: string; error_code: string | null }>(
+      `SELECT u.request_id,a.outcome,a.error_code
+         FROM image_generation_attempts a
+         JOIN image_generation_usage_records u ON u.id=a.usage_id
+        WHERE a.user_id=$1 ORDER BY u.request_id`,
+      [userId.toString()],
+    )).rows, [
+      { request_id: relayRequest, outcome: 'failed', error_code: 'IMAGE_RELAY_FAILED' },
+      { request_id: successRequest, outcome: 'succeeded', error_code: null },
+    ])
+  })
+
+  test('attempt_count is cumulative across failed journey recovery and every real fetch has a row', async (t) => {
+    if (skip(t)) return
+    const userId = await user()
+    const requestId = 'image:cumulative-recovery'
+    await reserveImageUsage(getPool(), { userId, containerId: null, requestId, operation: 'generation' })
+    const first = await beginImageUpstreamAttempt(getPool(), { userId, requestId })
+    await finishImageUpstreamAttempt(getPool(), {
+      userId, requestId, attemptId: first.attemptId,
+      outcome: 'failed', errorCode: 'IMAGE_UPSTREAM_RATE_LIMITED',
+    })
+    await markImageUsage(getPool(), {
+      userId, containerId: null, requestId, operation: 'generation',
+      status: 'failed', errorCode: 'IMAGE_UPSTREAM_RATE_LIMITED',
+    })
+
+    await reserveImageUsage(getPool(), { userId, containerId: null, requestId, operation: 'generation' })
+    const second = await beginImageUpstreamAttempt(getPool(), { userId, requestId })
+    await finishImageUpstreamAttempt(getPool(), {
+      userId, requestId, attemptId: second.attemptId, outcome: 'succeeded',
+    })
+
+    assert.equal(second.attemptNo, 2, 'reopening a failed stable request must not reset journey attempts')
+    assert.deepEqual((await query<{ attempt_count: number; last_attempt_at: Date | null }>(
+      `SELECT attempt_count,last_attempt_at FROM image_generation_usage_records
+        WHERE user_id=$1 AND request_id=$2`,
+      [userId.toString(), requestId],
+    )).rows.map((row) => ({ attempt_count: row.attempt_count, hasLastAttempt: row.last_attempt_at instanceof Date })), [
+      { attempt_count: 2, hasLastAttempt: true },
+    ])
+    assert.deepEqual((await query<{ attempt_no: number; outcome: string; error_code: string | null }>(
+      `SELECT attempt_no,outcome,error_code FROM image_generation_attempts
+        WHERE user_id=$1 ORDER BY attempt_no`,
+      [userId.toString()],
+    )).rows, [
+      { attempt_no: 1, outcome: 'failed', error_code: 'IMAGE_UPSTREAM_RATE_LIMITED' },
+      { attempt_no: 2, outcome: 'succeeded', error_code: null },
+    ])
+  })
+
   test('admits only one concurrent request per user', async (t) => {
     if (skip(t)) return
     const userId = await user()
@@ -266,6 +394,207 @@ describe('Image 2 exact billing', () => {
 })
 
 describe('Image 2 relay orchestration', () => {
+  test('explicit short 429 retries once under the same reservation and charges once', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    const generated = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#33aa77' } }).png().toBuffer()
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => {
+        upstreamCalls++
+        if (upstreamCalls === 1) return new Response('', { status: 429, headers: { 'retry-after': '0' } })
+        return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
+      }) as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const jobId = '8'.repeat(32)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json', 'x-openclaude-image-job': jobId },
+        body: await annotatedInput(jobId),
+      })
+      assert.equal(response.status, 200)
+      assert.equal(upstreamCalls, 2)
+      assert.equal(tracker.releases(), 1, 'one reservation is released exactly once')
+      assert.deepEqual((await query<{ status: string; attempt_count: number }>(
+        'SELECT status,attempt_count FROM image_generation_usage_records WHERE user_id=$1 AND request_id=$2',
+        [userId.toString(), `image-job:${jobId}`],
+      )).rows, [{ status: 'success', attempt_count: 2 }])
+      assert.deepEqual((await query<{ attempt_no: number; outcome: string; error_code: string | null }>(
+        `SELECT attempt_no,outcome,error_code FROM image_generation_attempts
+          WHERE user_id=$1 ORDER BY attempt_no`,
+        [userId.toString()],
+      )).rows, [
+        { attempt_no: 1, outcome: 'failed', error_code: 'IMAGE_UPSTREAM_RATE_LIMITED' },
+        { attempt_no: 2, outcome: 'succeeded', error_code: null },
+      ])
+      assert.equal((await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'",
+        [userId.toString()],
+      )).rows[0]!.count, '1')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50')
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('client abort during Retry-After wait records only the fetch that actually started', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    let upstreamCalls = 0
+    let resolveFirst!: () => void
+    const firstCall = new Promise<void>((resolve) => { resolveFirst = resolve })
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => {
+        upstreamCalls++
+        resolveFirst()
+        return new Response('', { status: 429, headers: { 'retry-after': '2' } })
+      }) as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const jobId = '9'.repeat(32)
+    const controller = new AbortController()
+    try {
+      const request = fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+        method: 'POST', signal: controller.signal,
+        headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json', 'x-openclaude-image-job': jobId },
+        body: await annotatedInput(jobId),
+      })
+      await firstCall
+      controller.abort()
+      await assert.rejects(request)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(upstreamCalls, 1, 'abort in the delay must happen before a second upstream fetch')
+      assert.deepEqual((await query<{ attempt_count: number; status: string; error_code: string | null }>(
+        `SELECT attempt_count,status,error_code FROM image_generation_usage_records
+          WHERE user_id=$1 AND request_id=$2`,
+        [userId.toString(), `image-job:${jobId}`],
+      )).rows, [{ attempt_count: 1, status: 'failed', error_code: 'IMAGE_CLIENT_ABORT' }])
+      assert.deepEqual((await query<{ attempt_no: number; outcome: string; error_code: string | null }>(
+        `SELECT attempt_no,outcome,error_code FROM image_generation_attempts
+          WHERE user_id=$1 ORDER BY attempt_no`,
+        [userId.toString()],
+      )).rows, [{ attempt_no: 1, outcome: 'failed', error_code: 'IMAGE_UPSTREAM_RATE_LIMITED' }])
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('429 retry followed by network throw records the second attempt as relay failure', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => {
+        upstreamCalls++
+        if (upstreamCalls === 1) return new Response('', { status: 429, headers: { 'retry-after': '0' } })
+        throw new Error('simulated network reset')
+      }) as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const jobId = 'a'.repeat(32)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json', 'x-openclaude-image-job': jobId },
+        body: await annotatedInput(jobId),
+      })
+      assert.equal(response.status, 502)
+      assert.equal(upstreamCalls, 2)
+      assert.deepEqual((await query<{ attempt_no: number; error_code: string | null }>(
+        `SELECT attempt_no,error_code FROM image_generation_attempts
+          WHERE user_id=$1 ORDER BY attempt_no`,
+        [userId.toString()],
+      )).rows, [
+        { attempt_no: 1, error_code: 'IMAGE_UPSTREAM_RATE_LIMITED' },
+        { attempt_no: 2, error_code: 'IMAGE_RELAY_FAILED' },
+      ])
+      assert.deepEqual((await query<{ status: string; error_code: string | null; attempt_count: number }>(
+        `SELECT status,error_code,attempt_count FROM image_generation_usage_records
+          WHERE user_id=$1 AND request_id=$2`,
+        [userId.toString(), `image-job:${jobId}`],
+      )).rows, [{ status: 'failed', error_code: 'IMAGE_RELAY_FAILED', attempt_count: 2 }])
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('429 without Retry-After and all 5xx never auto-retry or charge', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    const statuses = [429, 503]
+    let upstreamCalls = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async () => {
+        const status = statuses[upstreamCalls++]!
+        return new Response('{"error":"provider detail must not matter"}', {
+          status,
+          headers: status === 503 ? { 'retry-after': '0' } : {},
+        })
+      }) as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      for (const [i, expectedStatus] of statuses.entries()) {
+        const jobId = String(i + 6).repeat(32)
+        const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json', 'x-openclaude-image-job': jobId },
+          body: await annotatedInput(jobId),
+        })
+        assert.equal(response.status, expectedStatus)
+      }
+      assert.equal(upstreamCalls, 2, 'each request reaches upstream exactly once')
+      assert.equal(tracker.releases(), 2)
+      assert.deepEqual((await query<{ status: string; attempt_count: number; error_code: string | null }>(
+        'SELECT status,attempt_count,error_code FROM image_generation_usage_records WHERE user_id=$1 ORDER BY request_id',
+        [userId.toString()],
+      )).rows, [
+        { status: 'failed', attempt_count: 1, error_code: 'IMAGE_UPSTREAM_RATE_LIMITED' },
+        { status: 'failed', attempt_count: 1, error_code: 'IMAGE_UPSTREAM_FAILED' },
+      ])
+      assert.equal((await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'",
+        [userId.toString()],
+      )).rows[0]!.count, '0')
+    } finally {
+      await close(server)
+    }
+  })
+
   // Regression guard for the R7 "Unsupported content type" 400: the codex backend
   // /images/edits endpoint only accepts application/json (multipart is rejected)
   // and has no separate `mask` field — the mask must ride in the image alpha
@@ -388,6 +717,11 @@ describe('Image 2 relay orchestration', () => {
       const recoveredJson = await recovered.json() as { data: Array<{ b64_json: string }> }
       assert.deepEqual(recoveredJson.data, firstJson.data)
       assert.equal(upstreamCalls, 2, 'expired paid edit regenerates once without a second charge')
+      assert.equal((await query<{ attempt_count: number }>(
+        `SELECT attempt_count FROM image_generation_usage_records
+          WHERE user_id=$1 AND request_id=$2`,
+        [userId.toString(), `image-job:${jobId}`],
+      )).rows[0]!.attempt_count, 2, 'paid cache recovery adds to the same stable journey')
       await query(
         `UPDATE image_generation_usage_records SET response_expires_at=NOW() - INTERVAL '1 minute'
          WHERE user_id=$1 AND job_id=$2`,

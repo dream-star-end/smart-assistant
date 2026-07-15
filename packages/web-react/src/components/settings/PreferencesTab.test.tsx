@@ -5,7 +5,8 @@ import { api } from "../../lib/api";
 import type { AuthSession } from "../../lib/types";
 import { PreferencesTab } from "./PreferencesTab";
 
-vi.mock("./ApiKeysSection", () => ({ ApiKeysSection: () => null }));
+const apiKeysSection = vi.hoisted(() => vi.fn(() => null));
+vi.mock("./ApiKeysSection", () => ({ ApiKeysSection: apiKeysSection }));
 
 const auth = {
   getToken: () => "tok",
@@ -16,9 +17,24 @@ const auth = {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  apiKeysSection.mockClear();
 });
 
 describe("PreferencesTab · Auto-Dream", () => {
+  test("API Key 管理只为管理员挂载", () => {
+    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    const common = {
+      auth, prefs: {}, autoDream: null, theme: "system" as const,
+      onSetTheme: () => {}, onPatch: async () => {}, onUpgrade: () => {}, onOpenMemory: () => {},
+    };
+    const first = render(<PreferencesTab {...common} canManageApiKeys={false} />);
+    expect(apiKeysSection).not.toHaveBeenCalled();
+    first.unmount();
+
+    render(<PreferencesTab {...common} canManageApiKeys />);
+    expect(apiKeysSection).toHaveBeenCalledTimes(1);
+  });
+
   test("不显示整理模型身份，并提供可感知结果入口", async () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
     const openMemory = vi.fn();

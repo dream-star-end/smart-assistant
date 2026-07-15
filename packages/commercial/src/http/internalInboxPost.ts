@@ -61,6 +61,10 @@ const BodySchema = z
     bodyMd: z.string().min(1),
     // 离线兜底通知恒为信息级;仅接受 'info'(缺省即 'info'),不开放 notice/promo/warning。
     level: z.literal("info").optional(),
+    deliveryKey: z
+      .string()
+      .regex(/^[A-Za-z0-9._:-]{8,128}$/)
+      .optional(),
   })
   .strict();
 
@@ -70,6 +74,7 @@ export interface InboxPostMessage {
   title: string;
   bodyMd: string;
   level: "info";
+  deliveryKey?: string;
 }
 
 export interface InboxPostHandlerDeps {
@@ -224,6 +229,7 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
         title,
         bodyMd,
         level: "info",
+        ...(body.deliveryKey ? { deliveryKey: body.deliveryKey } : {}),
       });
     } catch (err) {
       log.error("post_failed", {

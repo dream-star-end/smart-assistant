@@ -53,6 +53,7 @@ export function PreferencesTab({
   onPatch,
   onUpgrade,
   onOpenMemory,
+  canManageApiKeys = false,
 }: {
   auth: AuthSession;
   prefs: PrefsView;
@@ -63,6 +64,7 @@ export function PreferencesTab({
   onPatch: (patch: Record<string, unknown>) => Promise<void>;
   onUpgrade: () => void;
   onOpenMemory: () => void;
+  canManageApiKeys?: boolean;
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -275,7 +277,7 @@ export function PreferencesTab({
       <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
 
       {/* API Key 自管（admin-only rollout 命中 403 时整段隐藏） */}
-      <ApiKeysSection auth={auth} />
+      {canManageApiKeys && <ApiKeysSection auth={auth} />}
     </div>
   );
 }

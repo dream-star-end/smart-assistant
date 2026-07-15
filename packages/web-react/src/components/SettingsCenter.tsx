@@ -214,6 +214,7 @@ export function SettingsCenter({
                         onPatch={patchPref}
                         onUpgrade={() => setSubOpen(true)}
                         onOpenMemory={onOpenMemory}
+                        canManageApiKeys={user?.role === "admin" || user?.roles.includes("admin") === true}
                       />
                     )}
                   </div>

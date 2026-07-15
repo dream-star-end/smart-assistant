@@ -25,6 +25,7 @@ import { createCommercialHandler } from "../http/router.js";
 import { PricingCache } from "../billing/pricing.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import IORedis from "ioredis";
+import { setClientSessionsBackend } from "@openclaude/storage";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import {
   listPricing,
@@ -38,6 +39,12 @@ import {
   PlanNotFoundError,
 } from "../admin/plans.js";
 import { listAdminAudit } from "../admin/audit.js";
+import { listModelUsageAggregates } from "../admin/modelOps.js";
+import {
+  recordProductFrictionEvent,
+  transitionProductFrictionEventIfPresent,
+} from "../productFriction/events.js";
+import { createPgSessionsBackend } from "../db/pgSessionsBackend.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -53,6 +60,10 @@ const COMMERCIAL_TABLES = [
   "agent_subscriptions",
   "user_preferences",
   "request_finalize_journal",
+  "product_friction_events",
+  "image_generation_attempts",
+  "image_generation_usage_records",
+  "github_session_workspaces",
   "orders",
   "topup_plans",
   "usage_records",
@@ -99,6 +110,11 @@ before(async () => {
   setPoolOverride(pool);
   await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
   await runMigrations();
+  // Production injects this backend in the composition root. This handler
+  // integration test builds the router directly, so mirror that one-time
+  // injection or lifecycle classification would incorrectly hit test-host
+  // SQLite instead of the freshly migrated PG authority.
+  setClientSessionsBackend(createPgSessionsBackend(pool, { expectedGeneration: 0 }));
 
   redis = await probeRedis();
   if (redis) {
@@ -142,11 +158,12 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  // 说明:users 有 FK 反向挂 model_pricing.updated_by → TRUNCATE CASCADE 会顺带清空
-  // model_pricing(以及 credit_ledger/usage_records)。因此每次重放 0007 种子保证:
-  //   - 本次测试永远有至少 2 条 model_pricing / 4 条 topup_plans
-  //   - multiplier/enabled 回到初始值
-  await query("TRUNCATE TABLE admin_audit, usage_records, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // users 被 model_pricing.updated_by 反向引用；TRUNCATE users CASCADE 会清空
+  // 权威模型定价并触发 0144 必需运行模型保护。只清理每例断言涉及的用户态
+  // 子表，用户用唯一邮箱追加，整文件结束时统一 DROP。
+  await query(
+    "TRUNCATE TABLE admin_audit, product_friction_events, image_generation_attempts, image_generation_usage_records, github_session_workspaces, request_finalize_journal, usage_records, credit_ledger, refresh_tokens, email_verifications RESTART IDENTITY CASCADE",
+  );
   await query(
     `INSERT INTO model_pricing(
        model_id, display_name, input_per_mtok, output_per_mtok,
@@ -187,9 +204,10 @@ function skipIfNoHttp(t: { skip: (reason: string) => void }): boolean {
 async function createUser(
   email: string, role: "user" | "admin" = "user",
 ): Promise<bigint> {
+  const uniqueEmail = email.replace("@", `+${Date.now()}-${Math.random().toString(16).slice(2)}@`);
   const r = await query<{ id: string }>(
     "INSERT INTO users(email, password_hash, credits, role, status) VALUES ($1, 'argon2$stub', 0, $2, 'active') RETURNING id::text AS id",
-    [email, role],
+    [uniqueEmail, role],
   );
   return BigInt(r.rows[0].id);
 }
@@ -204,6 +222,221 @@ async function tokenFor(uid: bigint, role: "user" | "admin"): Promise<string> {
 // ============================================================
 
 describe("admin pricing — DB layer", () => {
+  test("product friction state is atomic/monotonic and never stores raw correlation", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const user = await createUser("friction-state@x.com");
+    const base = {
+      correlation: "raw-session-secret-must-not-persist",
+      userId: user,
+      surface: "auth",
+      stage: "refresh",
+      code: "REFRESH_RACE",
+    } as const;
+    await recordProductFrictionEvent({ ...base, outcome: "pending", attempts: 1 });
+    await recordProductFrictionEvent({ ...base, outcome: "failed", attempts: 2 });
+    await recordProductFrictionEvent({ ...base, outcome: "recovered", attempts: 3 });
+    await recordProductFrictionEvent({ ...base, outcome: "failed", attempts: 4 });
+    const row = await query<{ event_key: string; outcome: string; attempts: number; recovered_at: Date | null }>(
+      `SELECT event_key, outcome, attempts, recovered_at FROM product_friction_events
+        WHERE user_id=$1 AND surface='auth' AND stage='refresh'`,
+      [user.toString()],
+    );
+    assert.equal(row.rows.length, 1);
+    assert.match(row.rows[0]!.event_key, /^[0-9a-f]{64}$/);
+    assert.notEqual(row.rows[0]!.event_key, base.correlation);
+    assert.equal(row.rows[0]!.outcome, "recovered", "late failure cannot overwrite recovery");
+    assert.equal(row.rows[0]!.attempts, 4, "attempt count remains monotonic");
+    assert.ok(row.rows[0]!.recovered_at instanceof Date);
+
+    await recordProductFrictionEvent({
+      ...base,
+      correlation: "terminal-abandoned-journey",
+      outcome: "abandoned",
+    });
+    await recordProductFrictionEvent({
+      ...base,
+      correlation: "terminal-abandoned-journey",
+      outcome: "recovered",
+      attempts: 2,
+    });
+    const terminal = await query<{ outcome: string; recovered_at: Date | null }>(
+      `SELECT outcome, recovered_at FROM product_friction_events
+        WHERE user_id=$1 AND outcome='abandoned'`,
+      [user.toString()],
+    );
+    assert.equal(terminal.rows.length, 1);
+    assert.equal(terminal.rows[0]!.outcome, "abandoned");
+    assert.equal(terminal.rows[0]!.recovered_at, null, "late recovery cannot annotate a terminal abandonment");
+  });
+
+  test("durable recovery transition records failure once and terminal replay is immutable", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const user = await createUser("friction-transition@x.com");
+    const identity = {
+      correlation: "durable-recovery-transition",
+      surface: "ws",
+      stage: "billing_recovery",
+    } as const;
+    await recordProductFrictionEvent({
+      ...identity,
+      userId: user,
+      code: "USER_WS_DETACHED",
+      outcome: "pending",
+      attempts: 1,
+    });
+    assert.equal(await transitionProductFrictionEventIfPresent({
+      ...identity,
+      outcome: "failed",
+    }), true);
+    let state = await query<{
+      outcome: string;
+      attempts: number;
+      updated_at: Date;
+      recovered_at: Date | null;
+    }>(
+      `SELECT outcome,attempts,updated_at,recovered_at
+         FROM product_friction_events WHERE user_id=$1 AND stage='billing_recovery'`,
+      [user.toString()],
+    );
+    assert.equal(state.rows[0]!.outcome, "failed");
+    assert.equal(state.rows[0]!.attempts, 2);
+
+    assert.equal(await transitionProductFrictionEventIfPresent({
+      ...identity,
+      outcome: "recovered",
+    }), true);
+    state = await query(
+      `SELECT outcome,attempts,updated_at,recovered_at
+         FROM product_friction_events WHERE user_id=$1 AND stage='billing_recovery'`,
+      [user.toString()],
+    );
+    assert.equal(state.rows[0]!.outcome, "recovered");
+    assert.equal(state.rows[0]!.attempts, 3);
+    assert.ok(state.rows[0]!.recovered_at instanceof Date);
+    const terminalUpdatedAt = state.rows[0]!.updated_at;
+
+    await query("SELECT pg_sleep(0.01)");
+    assert.equal(await transitionProductFrictionEventIfPresent({
+      ...identity,
+      outcome: "recovered",
+    }), false, "already-committed replay must not mutate a terminal journey");
+    state = await query(
+      `SELECT outcome,attempts,updated_at,recovered_at
+         FROM product_friction_events WHERE user_id=$1 AND stage='billing_recovery'`,
+      [user.toString()],
+    );
+    assert.equal(state.rows[0]!.attempts, 3);
+    assert.equal(state.rows[0]!.updated_at.getTime(), terminalUpdatedAt.getTime());
+  });
+
+  test("model usage uses terminal journal attempts and joins usage by usage_id only", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const user = await createUser("usage-attempts@x.com");
+    const usage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',10,5,2,'{}'::jsonb,7,'usage-committed','success')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const codexErrorUsage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',3,1,0,'{"codex_status":"error"}'::jsonb,2,'usage-codex-error','success')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const partialUsage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',4,2,1,'{}'::jsonb,0,'usage-partial','billing_failed')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const waivedUsage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',6,0,0,'{"waived":"no_output"}'::jsonb,0,'usage-waived','success')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const usageError = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',2,0,0,'{}'::jsonb,0,'usage-error','error')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const legacyNoOutput = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',7,0,0,'{}'::jsonb,0,'usage-legacy-no-output','success')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    const codexCancelled = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, cache_read_tokens,
+          price_snapshot, cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',8,3,1,
+               '{"codex_status":"error","codex_terminal_code":"USER_CANCELLED"}'::jsonb,
+               4,'usage-codex-cancelled','success')
+       RETURNING id::text AS id`,
+      [user.toString()],
+    );
+    await query(
+      `INSERT INTO request_finalize_journal
+         (request_id,user_id,state,ctx,precheck_credits,final_credits,usage_id,failure_code)
+       VALUES
+         ('usage-committed',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,7,7,$2,NULL),
+         ('usage-codex-error',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,2,2,$3,NULL),
+         ('usage-partial',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$4,NULL),
+         ('usage-waived',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$5,NULL),
+         ('usage-error',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$6,NULL),
+         ('usage-legacy-no-output',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$7,NULL),
+         ('usage-codex-cancelled',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,4,4,$8,NULL),
+         ('usage-missing',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,NULL,NULL),
+         ('usage-failed',$1,'aborted','{"model":"qwen3.7-max"}'::jsonb,7,0,NULL,'UPSTREAM_REJECTED'),
+         ('usage-cancelled',$1,'aborted','{"model":"qwen3.7-max"}'::jsonb,7,0,NULL,'CLIENT_ABORT')`,
+      [
+        user.toString(), usage.rows[0]!.id, codexErrorUsage.rows[0]!.id,
+        partialUsage.rows[0]!.id, waivedUsage.rows[0]!.id, usageError.rows[0]!.id,
+        legacyNoOutput.rows[0]!.id, codexCancelled.rows[0]!.id,
+      ],
+    );
+    // A usage row without a journal is not an additional request truth source.
+    await query(
+      `INSERT INTO usage_records
+         (user_id, mode, model, input_tokens, output_tokens, price_snapshot,
+          cost_credits, request_id, status)
+       VALUES ($1,'chat','qwen3.7-max',999,999,'{}'::jsonb,999,'usage-orphan','success')`,
+      [user.toString()],
+    );
+
+    const qwen = (await listModelUsageAggregates())["qwen3.7-max"];
+    assert.deepEqual(qwen.d1, {
+      attempts: 10,
+      requests: 1,
+      failures: 7,
+      cancellations: 2,
+      input_tokens: "40",
+      output_tokens: "11",
+      cache_read_tokens: "4",
+      credits: "13",
+    });
+    assert.equal(
+      qwen.d1.attempts,
+      qwen.d1.requests + qwen.d1.failures + qwen.d1.cancellations,
+      "terminal partition must be mutually exclusive and exhaustive",
+    );
+  });
+
   test("normalizeMultiplier: 合法/非法边界", () => {
     assert.equal(normalizeMultiplier(1.5), "1.500");
     assert.equal(normalizeMultiplier("2.1"), "2.1");
@@ -231,9 +464,8 @@ describe("admin pricing — DB layer", () => {
   test("patchPricing: multiplier + enabled → 更新 + admin_audit 记录", async (t) => {
     if (skipIfNoPg(t)) return;
     const admin = await createUser("a@x.com", "admin");
-    // 挑第一条 seed
-    const before = await listPricing();
-    const modelId = before[0].model_id;
+    // 运行必需模型受 0144 防误停保护；此用例专门选非必需种子验证 enabled=false。
+    const modelId = "claude-sonnet-4-6";
 
     const after = await patchPricing(modelId, { multiplier: "2.500", enabled: false }, {
       adminId: admin, ip: "1.2.3.4", userAgent: "UA",
@@ -394,6 +626,130 @@ describe("admin pricing — NOTIFY 联动", () => {
 // ============================================================
 
 describe("admin pricing/plans — HTTP", () => {
+  test("GET /product-friction returns recovery-aware source-separated telemetry", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("friction-admin@x.com", "admin");
+    const affected = await createUser("friction-user@x.com");
+    await recordProductFrictionEvent({
+      correlation: "refresh-journey-1",
+      userId: affected,
+      surface: "auth",
+      stage: "refresh",
+      code: "REFRESH_RACE",
+      outcome: "recovered",
+      attempts: 2,
+    });
+    const waivedUsage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id,mode,model,input_tokens,output_tokens,price_snapshot,cost_credits,request_id,status)
+       VALUES ($1,'chat','qwen3.7-max',12,0,'{"waived":"no_output"}'::jsonb,0,'friction-model-waived','success')
+       RETURNING id::text AS id`,
+      [affected.toString()],
+    );
+    await query(
+      `INSERT INTO request_finalize_journal
+         (request_id,user_id,state,ctx,precheck_credits,final_credits,usage_id)
+       VALUES ('friction-model-waived',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$2)`,
+      [affected.toString(), waivedUsage.rows[0]!.id],
+    );
+    const legacyNoOutput = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id,mode,model,input_tokens,output_tokens,price_snapshot,cost_credits,request_id,status)
+       VALUES ($1,'chat','qwen3.7-max',5,0,'{}'::jsonb,0,'friction-model-legacy-empty','success')
+       RETURNING id::text AS id`,
+      [affected.toString()],
+    );
+    const codexCancelled = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id,mode,model,input_tokens,output_tokens,price_snapshot,cost_credits,request_id,status)
+       VALUES ($1,'chat','qwen3.7-max',9,2,
+               '{"codex_status":"error","codex_terminal_code":"USER_CANCELLED"}'::jsonb,
+               3,'friction-codex-cancelled','success')
+       RETURNING id::text AS id`,
+      [affected.toString()],
+    );
+    await query(
+      `INSERT INTO request_finalize_journal
+         (request_id,user_id,state,ctx,precheck_credits,final_credits,usage_id)
+       VALUES
+         ('friction-model-legacy-empty',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,0,0,$2),
+         ('friction-codex-cancelled',$1,'committed','{"model":"qwen3.7-max"}'::jsonb,3,3,$3)`,
+      [affected.toString(), legacyNoOutput.rows[0]!.id, codexCancelled.rows[0]!.id],
+    );
+    const imageUsage = await query<{ id: string }>(
+      `INSERT INTO image_generation_usage_records
+         (user_id,request_id,operation,status,error_code,attempt_count,last_attempt_at)
+       VALUES ($1,'image:friction','generation','failed','IMAGE_UPSTREAM_RATE_LIMITED',1,NOW())
+       RETURNING id::text AS id`,
+      [affected.toString()],
+    );
+    await query(
+      `INSERT INTO image_generation_attempts
+         (usage_id,user_id,attempt_no,outcome,error_code,completed_at)
+       VALUES ($1,$2,1,'failed','IMAGE_UPSTREAM_RATE_LIMITED',NOW())`,
+      [imageUsage.rows[0]!.id, affected.toString()],
+    );
+    await query(
+      `INSERT INTO image_generation_usage_records
+         (user_id,request_id,operation,status,error_code)
+       VALUES ($1,'image:legacy-window','generation','failed','relay_failed')`,
+      [affected.toString()],
+    );
+    await query(
+      `INSERT INTO github_session_workspaces
+         (user_id,session_id,owner,repo,branch,status,error_code)
+       VALUES
+         ($1,'missing-session','dx','openclaude','main','failed','workspace_timeout'),
+         ($1,'active-commercial-session','dx','openclaude','main','failed','workspace_timeout')`,
+      [affected.toString()],
+    );
+    const nowMs = Date.now();
+    await query(
+      `INSERT INTO client_sessions
+         (id,user_id,agent_id,title,created_at,last_at,updated_at)
+       VALUES ('active-commercial-session',$1,'main','active',$2,$2,$2)
+       ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id,deleted_at=NULL`,
+      [`c:${affected.toString()}`, nowMs],
+    );
+    const response = await fetch(`${baseUrl}/api/admin/product-friction`, {
+      headers: { Authorization: `Bearer ${await tokenFor(admin, "admin")}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      windows: { operational_days: number; funnel_days: number };
+      events: Array<{ surface: string; code: string; attempts_7d: string; recovered_7d: string }>;
+      models: Array<{ model: string; attempts_7d: string; success_7d: string; failures_7d: string; cancellations_7d: string }>;
+      model_failures: Array<{ model: string; code: string; failures_7d: string }>;
+      images: Array<{ status: string; code: string; records: string }>;
+      image_attempts: Array<{ outcome: string; code: string; attempts_7d: string }>;
+      orders: unknown[]; github: Array<{ status: string; code: string; missing_session: string }>; ratings: unknown[];
+    };
+    assert.deepEqual(body.windows, { operational_days: 7, funnel_days: 30 });
+    assert.ok(Array.isArray(body.models) && Array.isArray(body.images) && Array.isArray(body.orders));
+    assert.ok(Array.isArray(body.github) && Array.isArray(body.ratings));
+    const event = body.events.find((row) => row.surface === "auth" && row.code === "REFRESH_RACE");
+    assert.ok(event, `missing auth refresh journey: ${JSON.stringify(body.events)}`);
+    assert.equal(event.attempts_7d, "2");
+    assert.equal(event.recovered_7d, "1");
+    assert.deepEqual(body.models.find((row) => row.model === "qwen3.7-max"), {
+      model: "qwen3.7-max", attempts_1d: "3", success_1d: "0", failures_1d: "2", cancellations_1d: "1",
+      attempts_7d: "3", success_7d: "0", failures_7d: "2", cancellations_7d: "1",
+    });
+    const noOutput = body.model_failures.find((row) => row.code === "NO_OUTPUT");
+    assert.ok(noOutput, `missing NO_OUTPUT breakdown: ${JSON.stringify(body.model_failures)}`);
+    assert.equal(noOutput.failures_7d, "2");
+    assert.equal(body.model_failures.some((row) => row.code === "CODEX_ERROR"), false);
+    assert.equal(body.images.find((row) => row.code === "IMAGE_UPSTREAM_RATE_LIMITED")?.records, "1");
+    assert.equal(body.images.find((row) => row.code === "IMAGE_RELAY_FAILED")?.records, "1");
+    assert.equal(body.images.some((row) => row.code === "relay_failed"), false);
+    assert.equal(body.image_attempts.find((row) => row.code === "IMAGE_UPSTREAM_RATE_LIMITED")?.attempts_7d, "1");
+    assert.equal(
+      body.github.find((row) => row.code === "workspace_timeout")?.missing_session,
+      "1",
+      "canonical c:<uid> active session must not be reported as missing",
+    );
+  });
+
   test("非 admin → 403;admin GET /pricing → 列表", async (t) => {
     if (skipIfNoHttp(t)) return;
     const u = await createUser("u@x.com");

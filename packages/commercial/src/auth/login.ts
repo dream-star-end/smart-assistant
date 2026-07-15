@@ -33,6 +33,12 @@ import { getBalanceBreakdown } from "../billing/spend.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
 import { verifyTurnstile, TurnstileError } from "./turnstile.js";
+import {
+  lockRefreshFamily,
+  lockRefreshMutationForTokenHash,
+  lockRefreshUsers,
+  resolveRefreshTokenLockTarget,
+} from "./refreshFamilyLock.js";
 
 const emailSchema = z
   .string()
@@ -127,6 +133,11 @@ export interface LoginUser {
   credits: string; // BIGINT 用字符串
 }
 
+interface LoginDbUser extends LoginUser {
+  password_hash: string;
+  status: string;
+}
+
 export interface LoginResult {
   user: LoginUser;
   /** access JWT */
@@ -175,6 +186,9 @@ export interface LoginDeps {
    * 测试普遍 register 后立即 login 不验证邮箱)。生产 env REQUIRE_EMAIL_VERIFIED=1 打开。
    */
   requireEmailVerified?: boolean;
+  /** Current HttpOnly cookie, if any. A successful identity-replacing login
+   * revokes that entire family before issuing the new family. */
+  replaceRefreshToken?: string | null;
 }
 
 /**
@@ -228,17 +242,7 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   }
 
   // 3) 查 user(包含 banned/deleting/deleted)
-  const userRow = await query<{
-    id: string;
-    email: string;
-    email_verified: boolean;
-    password_hash: string;
-    role: "user" | "admin";
-    display_name: string | null;
-    avatar_url: string | null;
-    credits: string;
-    status: string;
-  }>(
+  const userRow = await query<LoginDbUser>(
     `SELECT id::text AS id, email, email_verified, password_hash, role,
             display_name, avatar_url, credits::text AS credits, status
        FROM users WHERE email = $1`,
@@ -269,11 +273,6 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
 
   // 5) 签发 access + refresh
   const issueNow = nowSec(deps);
-  const access = await signAccess(
-    { sub: user.id, role: user.role },
-    deps.jwtSecret,
-    { now: issueNow, ttlSeconds: deps.accessTtlSeconds },
-  );
   const refresh = issueRefresh({
     now: issueNow,
     ttlSeconds: deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
@@ -284,30 +283,96 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   const bindIp = deps.bindIp ?? deps.remoteIp ?? null;
   // "记住我":默认视为 true,保持对不带 remember 字段的旧前端完全兼容。
   const rememberMe = input.remember !== false;
-  await query(
-    `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-     VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
-    [
+  let replacedTokenHash: string | null = null;
+  if (deps.replaceRefreshToken) {
+    try { replacedTokenHash = refreshTokenHash(deps.replaceRefreshToken); } catch { /* malformed cookie is ignored */ }
+  }
+  const validatedUser = await tx(async (client): Promise<LoginDbUser> => {
+    // Identity replacement can touch cookie owner A and target account B.
+    // Resolve first, then acquire every user lock in the global numeric order
+    // before any family/row lock, so password reset/admin revoke cannot race a
+    // late issue/rotation and multi-user logins cannot deadlock each other.
+    const replacedTarget = replacedTokenHash
+      ? await resolveRefreshTokenLockTarget(client, replacedTokenHash)
+      : null;
+    await lockRefreshUsers(client, [
       user.id,
-      refresh.hash,
-      deps.userAgent ?? null,
-      bindIp,
-      refresh.expires_at,
-      rememberMe,
-    ],
+      ...(replacedTarget ? [replacedTarget.userId] : []),
+    ]);
+    if (replacedTarget) {
+      await lockRefreshFamily(client, replacedTarget.familyId);
+    }
+
+    // Password/status were checked before the lock for anti-enumeration and
+    // Argon2 timing. Re-read under the user lock and require the exact hash we
+    // verified; a concurrent reset produces a fresh salted hash and invalidates
+    // this already-verified old-password login before it can issue a token.
+    const currentRes = await client.query<LoginDbUser>(
+      `SELECT id::text AS id, email, email_verified, password_hash, role,
+              display_name, avatar_url, credits::text AS credits, status
+         FROM users WHERE id=$1::bigint
+         FOR UPDATE`,
+      [user.id],
+    );
+    const current = currentRes.rows[0];
+    if (!current || current.status !== "active" || current.password_hash !== candidateHash) {
+      throw new LoginError("INVALID_CREDENTIALS", "invalid credentials");
+    }
+    if (deps.requireEmailVerified === true && !current.email_verified) {
+      throw new LoginError("EMAIL_NOT_VERIFIED", "email not verified");
+    }
+
+    if (replacedTokenHash && replacedTarget) {
+      // Family lock makes a stale ancestor cover every descendant created by a
+      // rotation that won first; exact row is revalidated after all locks.
+      const prior = await client.query<{ family_id: string }>(
+        `SELECT family_id::text AS family_id FROM refresh_tokens
+          WHERE token_hash=$1 AND family_id=$2::uuid
+          FOR UPDATE`,
+        [replacedTokenHash, replacedTarget.familyId],
+      );
+      if (prior.rows[0]) {
+        await client.query(
+          `UPDATE refresh_tokens
+              SET revoked_at=COALESCE(revoked_at,NOW()),
+                  revoked_reason=CASE WHEN revoked_at IS NULL THEN 'logout' ELSE revoked_reason END
+            WHERE family_id=$1::uuid`,
+          [prior.rows[0].family_id],
+        );
+      }
+    }
+    await client.query(
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
+      [
+        current.id,
+        refresh.hash,
+        deps.userAgent ?? null,
+        bindIp,
+        refresh.expires_at,
+        rememberMe,
+      ],
+    );
+    return current;
+  });
+
+  const access = await signAccess(
+    { sub: validatedUser.id, role: validatedUser.role },
+    deps.jwtSecret,
+    { now: issueNow, ttlSeconds: deps.accessTtlSeconds },
   );
 
   // 双钱包（0096）：返回"总可用"= 持久钱包 + active 未过期订阅期内桶，与 /api/me 一致。
-  const totalCredits = (await getBalanceBreakdown(user.id)).total;
+  const totalCredits = (await getBalanceBreakdown(validatedUser.id)).total;
 
   return {
     user: {
-      id: user.id,
-      email: user.email,
-      email_verified: user.email_verified,
-      role: user.role,
-      display_name: user.display_name,
-      avatar_url: user.avatar_url,
+      id: validatedUser.id,
+      email: validatedUser.email,
+      email_verified: validatedUser.email_verified,
+      role: validatedUser.role,
+      display_name: validatedUser.display_name,
+      avatar_url: validatedUser.avatar_url,
       credits: totalCredits.toString(),
     },
     access_token: access.token,
@@ -371,7 +436,8 @@ export interface RefreshExtraDeps {
  * 用客户端的 refresh raw token 换 access + 轮换出新的 refresh。
  *
  * 行为(2026-04-21 LOW 重做):
- *   1. tx 开启,SELECT ... FOR UPDATE 锁定该 token_hash
+ *   1. tx 开启,先解析 immutable family_id 并拿 family advisory lock,
+ *      再 SELECT ... FOR UPDATE 重验并锁定该 token_hash
  *   2. 命中 revoked_at IS NOT NULL 但 expires_at > NOW() → 盗用!
  *      → UPDATE 整个 family 的存活行 revoked_at=NOW(),reason='theft'
  *      → 抛 INVALID_REFRESH(对外不区分原因)
@@ -405,9 +471,17 @@ export async function refresh(
   const nowIso = new Date(ts * 1000).toISOString();
   const refreshTtl = deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS;
 
-  // 全流程在 tx 中:lock 旧 row → (theft 分支?) → INSERT 新 → UPDATE 旧
+  // 全流程在 tx 中:lock family → revalidate/lock 旧 row → INSERT 新 → UPDATE 旧
   const result = await tx(async (client) => {
-    // FOR UPDATE 防并发同 token 双 rotate(经典竞态:两个 tab 同时 refresh)
+    // 同一 family 的不同代 token 也必须串行。只锁 exact row 无法阻止
+    // stale ancestor logout/login 与 descendant rotation 交错后漏掉新 token。
+    const lockTarget = await lockRefreshMutationForTokenHash(client, tokenHash);
+    if (!lockTarget) {
+      throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+    }
+
+    // 拿到 family lock 后重读并锁 exact row;READ COMMITTED 下会看到前一位
+    // family mutator 已提交的 revoked/rotation 状态。
     const lookupRes = await client.query<{
       id: string;
       user_id: string;
@@ -443,8 +517,9 @@ export async function refresh(
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
+          AND rt.family_id = $3::uuid
         FOR UPDATE OF rt`,
-      [tokenHash, nowIso],
+      [tokenHash, nowIso, lockTarget.familyId],
     );
 
     if (lookupRes.rows.length === 0) {
@@ -627,17 +702,30 @@ export async function logout(rawRefresh: string): Promise<LogoutResult> {
     return { revoked: false };
   }
 
-  // 一条 SQL 完成:子查询拿到 family_id,UPDATE 所有同 family 未撤销行
-  const result = await query(
-    `UPDATE refresh_tokens
-        SET revoked_at = NOW(), revoked_reason = 'logout'
-      WHERE family_id = (
-              SELECT family_id FROM refresh_tokens WHERE token_hash = $1
-            )
-        AND revoked_at IS NULL`,
-    [tokenHash],
-  );
-  return { revoked: (result.rowCount ?? 0) > 0 };
+  const revoked = await tx(async (client) => {
+    const lockTarget = await lockRefreshMutationForTokenHash(client, tokenHash);
+    if (!lockTarget) return false;
+
+    // Revalidate the exact cookie only after the shared family lock. This also
+    // keeps the lock order identical to refresh and identity replacement.
+    const exact = await client.query(
+      `SELECT 1 FROM refresh_tokens
+        WHERE token_hash=$1 AND family_id=$2::uuid
+        FOR UPDATE`,
+      [tokenHash, lockTarget.familyId],
+    );
+    if (!exact.rows[0]) return false;
+
+    const result = await client.query(
+      `UPDATE refresh_tokens
+          SET revoked_at = NOW(), revoked_reason = 'logout'
+        WHERE family_id = $1::uuid
+          AND revoked_at IS NULL`,
+      [lockTarget.familyId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  });
+  return { revoked };
 }
 
 // 给后续 task 复用的 helper:确认 dummy hash 已预热

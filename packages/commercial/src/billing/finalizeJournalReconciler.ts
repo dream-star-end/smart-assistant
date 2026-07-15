@@ -93,6 +93,8 @@ export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promis
             usage_id = ur.id,
             ledger_id = ur.ledger_id,
             final_credits = ur.cost_credits,
+            failure_code = NULL,
+            ctx = rfj.ctx - 'settlementClaimId',
             updated_at = NOW()
        FROM usage_records ur
       WHERE rfj.request_id = ur.request_id
@@ -107,6 +109,8 @@ export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promis
         SET state = 'aborted',
             error_msg = 'reconciler_timeout',
             final_credits = 0,
+            failure_code = 'INTERNAL_ERROR',
+            ctx = rfj.ctx - 'settlementClaimId',
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')

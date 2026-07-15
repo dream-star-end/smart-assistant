@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../lib/api";
+import {
+  api,
+  loginWithCookieSerialization,
+  logoutWithCookieSerialization,
+  refreshWithFriction,
+  resetRefreshJourney,
+} from "../lib/api";
+import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { useLaneGate } from "./useLaneGate";
 
@@ -43,6 +50,8 @@ export type UseAuth = {
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   authLoading: boolean;
   authError: string | null;
+  authRecoveryAvailable: boolean;
+  retryBoot: () => void;
   /** 启动静默续期进行中（App 渲染极简 splash）。 */
   booting: boolean;
   /**
@@ -84,6 +93,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const [user, setUser] = useState<User | null>(opts.initialUser);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
+  const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
   // demo/重置链接跳过静默续期（重置场景用户就是要走 reset 流程，不劫持进工作区）。
   const [booting, setBooting] = useState(!demo && !resetToken);
   // cohort lane 决策信号（P3 RFC D1）：undefined=决策进行中；{lane}=已拿到 auth 响应
@@ -94,10 +105,13 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 清空全部鉴权状态，回到登录/首页（静默刷新失败或主动登出都走这里）。
   // 会话/消息/面板等 chat 域收尾经 onClearAuth 注入（在 App 层完成）。
   const clearAuth = useCallback(() => {
+    resetRefreshJourney(authRef.current);
+    bootstrapMeFriction.current = null;
     tokenRef.current = null;
     setAuthed(false);
     setUser(null);
     setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
+    setAuthRecoveryAvailable(false);
     cbRef.current.onClearAuth();
   }, []);
 
@@ -124,13 +138,20 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     async (email: string, password: string, turnstileToken: string) => {
       setAuthLoading(true);
       setAuthError(null);
+      setAuthRecoveryAvailable(false);
       try {
         // 服务端 /api/auth/login schema 必填 turnstile_token。turnstileToken 由 AuthGate 给出：
         // canary（turnstile_bypass:true）发占位 'bypass'（服务端接受任意串）；生产（bypass 关闭）
         // 为真实 Cloudflare Turnstile widget 的 onSuccess token。canary 登录行为不变。
         // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
         // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
-        const res = await api.login(email, password, turnstileToken);
+        const res = await loginWithCookieSerialization(
+          authRef.current,
+          email,
+          password,
+          turnstileToken,
+        );
+        bootstrapMeFriction.current = null;
         tokenRef.current = res.accessToken;
         setAuthed(true);
         setUser(res.user);
@@ -147,31 +168,77 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   );
 
   // 启动静默续期：凭同源 HttpOnly refresh cookie 换 access token → getMe 恢复用户。
-  // api.refresh() 失败恒返 null（绝不抛），无 cookie 时开销一次 401 往返。仅挂载跑一次。
+  // api.refresh() 返回可区分的结果；无 cookie 是 invalid，临时故障不会清其它 tab 登录态。
   useEffect(() => {
     if (!booting) return;
     let cancelled = false;
     void (async () => {
-      const r = await api.refresh();
+      let r = await refreshWithFriction(authRef.current, "auth", tokenRef.current);
+      // A reload has no access token to fall back to. Give a temporary service
+      // fault one bounded recovery chance, then surface it distinctly instead
+      // of pretending the refresh credential was invalid.
+      if (r.kind === "transient" || r.kind === "race" || r.kind === "stale") {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        if (cancelled) return;
+        r = await refreshWithFriction(authRef.current, "auth", tokenRef.current);
+      }
       // accessToken 必须真实存在：200 但空 body（异常网关/mock）不算有会话，防半开登录态。
-      if (!r?.accessToken) {
-        if (!cancelled) setBooting(false);
+      if (r.kind !== "success") {
+        if (!cancelled) {
+          if (r.kind !== "invalid") {
+            setAuthError("登录状态恢复失败，请检查网络后重试");
+            setAuthRecoveryAvailable(true);
+          }
+          setBooting(false);
+        }
         return;
       }
-      tokenRef.current = r.accessToken;
-      try {
-        const me = await api.getMe(authRef.current);
-        if (cancelled) return;
-        setUser(me);
-        setAuthed(true);
-        // lane 决策达成（cookie 随 /api/me 响应下发）：解锁 WS 连接前置。
-        setLaneSignal({ lane: me.lane ?? null });
-        cbRef.current.onBootAuthed?.();
-      } catch {
-        // token 换到了但 getMe 失败（瞬时网络/服务端抖动）：不半开登录态，回首页手动登录。
-        tokenRef.current = null;
-      } finally {
-        if (!cancelled) setBooting(false);
+      tokenRef.current = r.result.accessToken;
+      for (let localAttempt = 0; localAttempt < 2; localAttempt++) {
+        try {
+          const me = await api.getMe(authRef.current);
+          if (cancelled) return;
+          const prior = bootstrapMeFriction.current;
+          if (prior) {
+            reportClientFriction({
+              eventId: prior.id, surface: "auth", stage: "bootstrap_me",
+              code: "BOOTSTRAP_ME_TRANSIENT", outcome: "recovered",
+              attempts: Math.min(32, prior.attempts + 1),
+            }, tokenRef.current);
+            bootstrapMeFriction.current = null;
+          }
+          setAuthRecoveryAvailable(false);
+          setUser(me);
+          setAuthed(true);
+          // lane 决策达成（cookie 随 /api/me 响应下发）：解锁 WS 连接前置。
+          setLaneSignal({ lane: me.lane ?? null });
+          cbRef.current.onBootAuthed?.();
+          if (!cancelled) setBooting(false);
+          return;
+        } catch {
+          if (cancelled) return;
+          // Definitive invalid refresh calls clearAuth through AuthSession;
+          // only a still-present fresh token is a recoverable /api/me fault.
+          if (!tokenRef.current) {
+            setBooting(false);
+            return;
+          }
+          const prior = bootstrapMeFriction.current;
+          const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
+          const id = reportClientFriction({
+            eventId: prior?.id, surface: "auth", stage: "bootstrap_me",
+            code: "BOOTSTRAP_ME_TRANSIENT", outcome: "failed", attempts,
+          }, tokenRef.current);
+          bootstrapMeFriction.current = { id, attempts };
+          if (localAttempt === 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, 350));
+            continue;
+          }
+          setAuthError("登录状态恢复失败，请检查网络后重试");
+          setAuthRecoveryAvailable(true);
+          setBooting(false);
+          return;
+        }
       }
     })();
     return () => {
@@ -179,6 +246,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     };
     // booting 仅由本 effect 置 false，等效"挂载跑一次"。
   }, [booting]);
+
+  const retryBoot = useCallback(() => {
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+    setBooting(true);
+  }, []);
 
   // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
   const register = useCallback(
@@ -222,7 +295,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     // 先请求后端吊销 refresh cookie（错误已在 api 层吞掉），并经 onLogout 清本 user 的
     // IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效），再清空内存态回到首页。
     if (!demo) {
-      void api.logout();
+      void logoutWithCookieSerialization(authRef.current);
       cbRef.current.onLogout?.();
     }
     clearAuth();
@@ -248,6 +321,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setUser,
     authLoading,
     authError,
+    authRecoveryAvailable,
+    retryBoot,
     booting,
     laneReady,
     lane,

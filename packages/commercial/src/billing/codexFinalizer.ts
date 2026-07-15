@@ -14,19 +14,21 @@
  *
  * 职责:接 outbound.codex_billing 帧的 token usage,按 derivedPricing(已 apply
  * agent_cost_overrides multiplier)算出 costCredits →
- *   1. settleUsageAndLedger:单 PG 事务 BEGIN/COMMIT 写 usage_records + credit_ledger
+ *   1. claimInflightJournalForSettlement:CAS journal 到 finalizing；若 reconciler
+ *      已先终态化则拒绝 late debit
+ *   2. settleUsageAndLedger:单 PG 事务 BEGIN/COMMIT 写 usage_records + credit_ledger
  *      debit(沿用 anthropic 既有 helper,(user_id, request_id) UNIQUE 防重复)
- *   2. finalizeInflightJournal:**独立** UPDATE 把 journal 由 inflight → committed
+ *   3. finalizeInflightJournal:**独立** UPDATE 把 journal 由 finalizing → committed
  *      (与 settle 不在同一 tx — 沿用 anthropic 既有架构;若 settle 已 COMMIT 而
  *      finalize 失败,journal 保持可恢复态。immutable turn tape 重放时依靠
  *      usage_records(user_id,request_id) 幂等补齐,绝不把瞬态错误固化成免单)
- *   3. release preCheck reservation
+ *   4. release preCheck reservation
  *
  * 与 anthropic 路径的 makeFinalizer 区别:
  *   - codex 没有 multi-account scheduler(用 codexBinding.acquire/release 已在
  *     userChatBridge.ts 早释放路径里搞定),不调 scheduler.release
  *   - codex 是 single-shot:gateway 在 turn 终态发一次 outbound.codex_billing,
- *     不存在 anthropic 那种 stream 中途观察 partial 的两阶段(没有 'finalizing' 中间态)
+ *     但仍先 claim `finalizing`，与 reconciler 建立结算前的 terminal CAS 边界
  *   - cost 由 caller 给的 derivedPricing(multiplier 已 apply)算 — settle 前就要
  *     拿到 multiplier,因为 preCheck 也用同一份 derivedPricing 估 maxCost
  *
@@ -64,7 +66,7 @@ import type { Pool } from "pg";
 import type { TokenUsage } from "./calculator.js";
 import { computeCost } from "./calculator.js";
 import type { ModelPricing } from "./pricing.js";
-import type { BillingAuthorityStamp } from "./proxyBilling.js";
+import type { BillingAuthorityStamp, JournalFailureCode } from "./proxyBilling.js";
 import {
   type PreCheckRedis,
   type ReservationHandle,
@@ -72,8 +74,10 @@ import {
 } from "./preCheck.js";
 import {
   abortInflightJournal,
+  claimInflightJournalForSettlement,
   finalizeInflightJournal,
   settleUsageAndLedger,
+  SettlementCommitOutcomeUnknownError,
   type SettleResult,
 } from "./proxyBilling.js";
 
@@ -160,6 +164,26 @@ export interface CodexFinalizeResult {
   clamped: boolean;
 }
 
+/** A different bridge/finalizer owns the durable journal claim. Callers must
+ * re-read journal + usage truth before deciding whether an immutable frame is
+ * safe to ACK; a no-debit result alone is not a terminal decision. */
+export class JournalSettlementClaimLostError extends Error {
+  constructor(readonly requestId: string) {
+    super(`request journal settlement claim is already owned for ${requestId}`);
+    this.name = "JournalSettlementClaimLostError";
+  }
+}
+
+export type CodexTerminalCode = "USER_CANCELLED" | "CODEX_ERROR";
+
+type CodexBillingAttribution = {
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
+  terminalCode?: CodexTerminalCode;
+};
+
 export interface CodexFinalizeHandle {
   /**
    * 用 outbound.codex_billing 帧的 usage 落账。
@@ -167,24 +191,18 @@ export interface CodexFinalizeHandle {
    * @param usage    snake_case TokenUsage(reasoning_output_tokens 已由 caller fold 进 output_tokens)
    * @param codexStatus  billing 帧报告的状态 — 仅落 snapshotJson 排障用,**不影响是否扣费**
    *                     (有正 token 就 charge — 与代理商成本模型对齐)
-   * @param errorReason  仅 codexStatus='error' 时有意义,落 snapshotJson + journal 用
+   * @param attribution  stable, bounded terminal classification and turn ownership.
    */
   commit(
     usage: TokenUsage,
     codexStatus: "success" | "error",
-    errorReason?: string,
-    attribution?: {
-      turnKey?: string | null;
-      parentTurnKey?: string | null;
-      parentSessionId?: string | null;
-      delegateAgentId?: string | null;
-    },
+    attribution?: CodexBillingAttribution,
   ): Promise<CodexFinalizeResult>;
   /**
    * 无 usage 的失败收尾(用户 ws 断开 / 容器 crash / runner spawn 失败等)。
    * journal inflight → aborted + releasePreCheck,**不**走 ledger debit。
    */
-  fail(reason: string): Promise<void>;
+  fail(reason: string, failureCode?: JournalFailureCode): Promise<void>;
 }
 
 export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHandle {
@@ -216,13 +234,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
   function commitOnce(
     usage: TokenUsage,
     codexStatus: "success" | "error",
-    errorReason?: string,
-    attribution?: {
-      turnKey?: string | null;
-      parentTurnKey?: string | null;
-      parentSessionId?: string | null;
-      delegateAgentId?: string | null;
-    },
+    attribution?: CodexBillingAttribution,
   ): Promise<CodexFinalizeResult> {
     return (async (): Promise<CodexFinalizeResult> => {
       const { cost_credits, snapshot } = computeCost(usage, ctx.derivedPricing);
@@ -249,45 +261,78 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       const effectiveCredits = waivedNoOutput ? 0n : cost_credits;
       // snapshotJson 含完整 pricing snapshot + codex 状态(reconciler / admin 排障)。
       // **不**影响落账金额 — 那个是 effectiveCredits 决定。
+      // Rolling gateways normalize any legacy raw reason at ingestion. This
+      // financial boundary accepts and persists only a bounded terminal code.
+      const codexTerminalCode: CodexTerminalCode | undefined = codexStatus === "error"
+        ? attribution?.terminalCode ?? "CODEX_ERROR"
+        : undefined;
       const snapshotJson = JSON.stringify({
         ...snapshot,
         codex_status: codexStatus,
-        ...(errorReason !== undefined ? { codex_error_reason: errorReason } : {}),
+        ...(codexTerminalCode !== undefined ? { codex_terminal_code: codexTerminalCode } : {}),
         ...(waivedNoOutput
           ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() }
           : {}),
       });
       let settled: SettleResult;
       try {
-        settled = await settleUsageAndLedger(ctx.pgPool, {
-          userId: ctx.userId,
-          // v5:codex 记账不占用账号池 FK —— usage_records.account_id 恒 NULL
-          // (0044 SET NULL 语义,同 deepseek 静态 provider 路径),不用假账号 0n。
-          accountId: null,
-          requestId: ctx.requestId,
-          model: ctx.model,
-          usage,
-          snapshotJson,
-          costCredits: effectiveCredits,
-          status: settleStatus,
-          sessionId: ctx.engineSessionId,
-          mode:
-            (attribution?.parentTurnKey ?? ctx.parentTurnKey) ||
-            (attribution?.parentSessionId ?? ctx.parentSessionId) ||
-            (attribution?.delegateAgentId ?? ctx.delegateAgentId)
-              ? "delegate"
-              : "chat",
-          parentSessionId: attribution?.parentSessionId ?? ctx.parentSessionId ?? null,
-          delegateAgentId: attribution?.delegateAgentId ?? ctx.delegateAgentId ?? null,
-          turnKey: attribution?.turnKey ?? ctx.turnKey ?? null,
-          parentTurnKey: attribution?.parentTurnKey ?? ctx.parentTurnKey ?? null,
-          authority: ctx.authority ?? null,
-        });
+        const settlementClaimId = await claimInflightJournalForSettlement(
+          ctx.pgPool,
+          ctx.requestId,
+        );
+        if (settlementClaimId === null) {
+          // The journal may be terminal, or another live/tape bridge may still
+          // own finalizing. This layer cannot tell which. The durable caller
+          // must re-read usage/journal truth before ACKing immutable evidence.
+          throw new JournalSettlementClaimLostError(ctx.requestId);
+        }
+        try {
+          settled = await settleUsageAndLedger(ctx.pgPool, {
+            userId: ctx.userId,
+            // v5:codex 记账不占用账号池 FK —— usage_records.account_id 恒 NULL
+            // (0044 SET NULL 语义,同 deepseek 静态 provider 路径),不用假账号 0n。
+            accountId: null,
+            requestId: ctx.requestId,
+            model: ctx.model,
+            usage,
+            snapshotJson,
+            costCredits: effectiveCredits,
+            status: settleStatus,
+            sessionId: ctx.engineSessionId,
+            mode:
+              (attribution?.parentTurnKey ?? ctx.parentTurnKey) ||
+              (attribution?.parentSessionId ?? ctx.parentSessionId) ||
+              (attribution?.delegateAgentId ?? ctx.delegateAgentId)
+                ? "delegate"
+                : "chat",
+            parentSessionId: attribution?.parentSessionId ?? ctx.parentSessionId ?? null,
+            delegateAgentId: attribution?.delegateAgentId ?? ctx.delegateAgentId ?? null,
+            turnKey: attribution?.turnKey ?? ctx.turnKey ?? null,
+            parentTurnKey: attribution?.parentTurnKey ?? ctx.parentTurnKey ?? null,
+            authority: ctx.authority ?? null,
+          });
+        } catch (err) {
+          if (!(err instanceof SettlementCommitOutcomeUnknownError)) {
+            // The transaction is known not to have committed. Only this claim
+            // owner may roll finalizing back to an unproven aborted state;
+            // durable replay will reopen it and retry the immutable evidence.
+            await abortInflightJournal(
+              ctx.pgPool,
+              ctx.requestId,
+              "codex_settlement_failed_before_commit",
+              "BILLING_FAILED",
+              settlementClaimId,
+            ).catch(() => false);
+          }
+          // Unknown COMMIT must retain finalizing: a debit may already exist.
+          throw err;
+        }
         await finalizeInflightJournal(ctx.pgPool, {
           requestId: ctx.requestId,
           finalCredits: effectiveCredits,
           ledgerId: settled.ledgerId,
           usageId: settled.usageId,
+          settlementClaimId,
         });
       } catch (err) {
         // A DB/network failure is not a waiver decision. Keep the journal
@@ -306,7 +351,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
     })();
   }
 
-  async function failOnce(reason: string): Promise<void> {
+  async function failOnce(reason: string, failureCode: JournalFailureCode): Promise<void> {
     try {
       // fail() is used only after a terminal no-usage decision (rejected before
       // execution, explicit abandon, or a terminal engine failure). Mark it so
@@ -316,6 +361,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
         ctx.pgPool,
         ctx.requestId,
         permanentCodexWaiverReason(reason),
+        failureCode,
       );
     } catch {
       // journal abort 失败 — 数据库瞬断,reconciler 会扫到 stuck inflight 兜底。
@@ -324,7 +370,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
   }
 
   return {
-    async commit(usage, codexStatus, errorReason, attribution) {
+    async commit(usage, codexStatus, attribution) {
       if (_done !== null) {
         if (_done.kind === "commit") {
           // commit-after-commit:duplicate billing 帧场景 — 共享首次 promise,
@@ -339,7 +385,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       }
       const promise = (async (): Promise<CodexFinalizeResult> => {
         try {
-          return await commitOnce(usage, codexStatus, errorReason, attribution);
+          return await commitOnce(usage, codexStatus, attribution);
         } finally {
           // 无论 commit 成 / 失败,都 release preCheck(否则 Redis 锁卡 300s)。
           await releasePreCheck(ctx.preCheckRedis, ctx.reservation).catch(
@@ -350,7 +396,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       _done = { kind: "commit", promise };
       return promise;
     },
-    async fail(reason) {
+    async fail(reason, failureCode = "INTERNAL_ERROR") {
       if (_done !== null) {
         // fail-after-anything:首次 promise 已起,await 让 caller 等到 settle/abort
         // 实际收尾再返(方便 cleanup 顺序确定)。错误吞掉(commit 失败的 throw 不
@@ -360,7 +406,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       }
       const promise = (async (): Promise<void> => {
         try {
-          await failOnce(reason);
+          await failOnce(reason, failureCode);
         } finally {
           await releasePreCheck(ctx.preCheckRedis, ctx.reservation).catch(
             () => {},

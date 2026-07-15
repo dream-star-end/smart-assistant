@@ -119,6 +119,15 @@ export type RefreshResult = {
   remember: boolean;
 };
 
+/** Refresh is deliberately not nullable: callers must distinguish credential
+ * expiry from a multi-tab rotation race or a temporary network/server fault. */
+export type RefreshAttempt =
+  | { kind: "success"; result: RefreshResult; recoveredRace?: boolean; raceObserved?: boolean; attempts?: number }
+  | { kind: "race"; raceObserved?: boolean; attempts?: number }
+  | { kind: "invalid"; raceObserved?: boolean; attempts?: number }
+  | { kind: "stale"; raceObserved?: boolean; attempts?: number }
+  | { kind: "transient"; status?: number; raceObserved?: boolean; attempts?: number };
+
 /** 注册（POST /api/auth/register，201）。 */
 export type RegisterResult = { userId: string; verifyEmailSent: boolean };
 

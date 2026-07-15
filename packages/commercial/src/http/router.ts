@@ -78,6 +78,7 @@ import {
   handleAdminListAudit,
   handleAdminListHostAudit,
   handleAdminListSecurityEvents,
+  handleAdminProductFriction,
   handleAdminTraceLookup,
 } from './admin/audit.js'
 import {
@@ -833,6 +834,7 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
+    { method: 'GET', path: '/api/admin/product-friction', handler: handleAdminProductFriction },
     { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
     // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
     // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。

@@ -26,6 +26,7 @@ export function AuthGate({
   onConfirmReset,
   loading,
   error,
+  onRetrySession,
   onBack,
   theme,
   onCycleTheme,
@@ -58,6 +59,8 @@ export function AuthGate({
   onConfirmReset?: (token: string, newPassword: string) => Promise<void>;
   loading?: boolean;
   error?: string | null;
+  /** Recover a valid refresh-cookie session after a transient boot fault. */
+  onRetrySession?: () => void;
   onBack?: () => void;
   theme: Theme;
   onCycleTheme: () => void;
@@ -413,6 +416,11 @@ export function AuthGate({
             </div>
 
             {errBox}
+            {shownErr && onRetrySession && (
+              <Button type="button" variant="secondary" onClick={onRetrySession} className="w-full">
+                重试恢复登录状态
+              </Button>
+            )}
             {noticeBox}
             {widget}
 

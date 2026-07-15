@@ -353,7 +353,13 @@ function buildCodexBillingPayload(
     payload.engineSessionId = out.engineSessionId
   }
   if (out.usage !== undefined) payload.usage = out.usage
-  if (typeof out.errorReason === "string") payload.errorReason = out.errorReason
+  const legacyErrorReason = (out as unknown as { errorReason?: unknown }).errorReason
+  const terminalCode = out.terminalCode === 'USER_CANCELLED' || out.terminalCode === 'CODEX_ERROR'
+    ? out.terminalCode
+    : payload.status === 'error'
+      ? legacyErrorReason === 'codex turn interrupted' ? 'USER_CANCELLED' : 'CODEX_ERROR'
+      : undefined
+  if (terminalCode) payload.terminalCode = terminalCode
   if (out.rateLimits !== undefined) payload.rateLimits = out.rateLimits
   if (typeof out.traceId === "string") payload.traceId = out.traceId
   return payload

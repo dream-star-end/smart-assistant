@@ -946,6 +946,17 @@ export interface ClientSessionMeta {
   updatedAt: number
 }
 
+export interface ClientSessionLifecycleRef {
+  sessionId: string
+  userId: string
+}
+
+export type ClientSessionLifecycleState = 'active' | 'deleted' | 'missing'
+
+export interface ClientSessionLifecycle extends ClientSessionLifecycleRef {
+  state: ClientSessionLifecycleState
+}
+
 // ── Pure merge helpers (exported for unit testing) ──
 
 /** Minimal shape this module relies on. Real messages carry more fields. */
@@ -3109,6 +3120,21 @@ async function _sqliteGetClientSession(
   }
 }
 
+async function _sqliteClassifyClientSessions(
+  refs: readonly ClientSessionLifecycleRef[],
+): Promise<ClientSessionLifecycle[]> {
+  if (refs.length === 0) return []
+  const db = await getSessionsDb()
+  const stmt = db.prepare('SELECT deleted_at FROM client_sessions WHERE id = ? AND user_id = ?')
+  return refs.map((ref) => {
+    const row = stmt.get(ref.sessionId, ref.userId) as { deleted_at: number | null } | undefined
+    return {
+      ...ref,
+      state: row === undefined ? 'missing' : row.deleted_at === null ? 'active' : 'deleted',
+    }
+  })
+}
+
 export interface ClientSessionPartial extends ClientSession {
   totalMessageCount: number
   maxSeq: number
@@ -3503,6 +3529,7 @@ const sqliteBackend = {
   sweepUsageAggregationGc: _sqliteSweepUsageAggregationGc,
   listClientSessions: _sqliteListClientSessions,
   getClientSession: _sqliteGetClientSession,
+  classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   deleteClientSession: _sqliteDeleteClientSession,
@@ -3596,6 +3623,9 @@ export const listClientSessions: ClientSessionsBackend['listClientSessions'] =
 
 export const getClientSession: ClientSessionsBackend['getClientSession'] =
   (...args) => getActiveBackend().getClientSession(...args)
+
+export const classifyClientSessions: ClientSessionsBackend['classifyClientSessions'] =
+  (...args) => getActiveBackend().classifyClientSessions(...args)
 
 export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPartial'] =
   (...args) => getActiveBackend().getClientSessionPartial(...args)

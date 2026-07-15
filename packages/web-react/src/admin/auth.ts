@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { api } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  api,
+  logoutWithCookieSerialization,
+  refreshWithFriction,
+  resetRefreshJourney,
+} from "../lib/api";
+import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 
 /**
@@ -48,6 +54,8 @@ export type AdminAuthState = {
   ready: boolean;
   /** 已认证 **且** role==='admin'。仅此时渲染 AdminShell。 */
   authed: boolean;
+  recoverable: boolean;
+  retry: () => void;
   /** 登出：吊销 refresh cookie（错误已在 api 层吞掉）后回首页。 */
   logout: () => void;
 };
@@ -60,44 +68,92 @@ export function useAdminAuth(): AdminAuthState {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [authed, setAuthed] = useState(false);
+  const [recoverable, setRecoverable] = useState(false);
+  const [retrySeq, setRetrySeq] = useState(0);
+  const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    setReady(false);
+    setRecoverable(false);
     // 刷新失败 → 清内存态回首页（绝不循环重试）。cancelled 守卫避免卸载后跳转。
     onSessionExpired = () => {
+      resetRefreshJourney(adminSession);
+      bootstrapMeFriction.current = null;
       accessToken = null;
       if (!cancelled) window.location.replace("/");
     };
     void (async () => {
-      const r = await api.refresh();
+      let r = await refreshWithFriction(adminSession, "admin_auth", accessToken);
+      if (r.kind === "transient" || r.kind === "race" || r.kind === "stale") {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        if (cancelled) return;
+        r = await refreshWithFriction(adminSession, "admin_auth", accessToken);
+      }
       // 200 但空 body 不算有会话（防半开登录态）。
-      if (!r?.accessToken) {
-        if (!cancelled) setReady(true);
+      if (r.kind !== "success") {
+        if (!cancelled) {
+          setRecoverable(r.kind !== "invalid");
+          setReady(true);
+        }
         return;
       }
-      accessToken = r.accessToken;
-      try {
-        const me = await api.getMe(adminSession);
-        if (cancelled) return;
-        setUser(me);
-        setAuthed(me.role === "admin");
-      } catch {
-        // token 换到但 getMe 失败（瞬时抖动）：不半开登录态。
-        accessToken = null;
-      } finally {
-        if (!cancelled) setReady(true);
+      accessToken = r.result.accessToken;
+      for (let localAttempt = 0; localAttempt < 2; localAttempt++) {
+        try {
+          const me = await api.getMe(adminSession);
+          if (cancelled) return;
+          const prior = bootstrapMeFriction.current;
+          if (prior) {
+            reportClientFriction({
+              eventId: prior.id, surface: "admin_auth", stage: "bootstrap_me",
+              code: "BOOTSTRAP_ME_TRANSIENT", outcome: "recovered",
+              attempts: Math.min(32, prior.attempts + 1),
+            }, accessToken);
+            bootstrapMeFriction.current = null;
+          }
+          setUser(me);
+          setAuthed(me.role === "admin");
+          setRecoverable(false);
+          if (me.role !== "admin") resetRefreshJourney(adminSession);
+          setReady(true);
+          return;
+        } catch {
+          if (cancelled) return;
+          if (accessToken === null) {
+            setReady(true);
+            return;
+          }
+          const prior = bootstrapMeFriction.current;
+          const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
+          const id = reportClientFriction({
+            eventId: prior?.id, surface: "admin_auth", stage: "bootstrap_me",
+            code: "BOOTSTRAP_ME_TRANSIENT", outcome: "failed", attempts,
+          }, accessToken);
+          bootstrapMeFriction.current = { id, attempts };
+          if (localAttempt === 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, 350));
+            continue;
+          }
+          setRecoverable(true);
+          setReady(true);
+          return;
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [retrySeq]);
+
+  const retry = useCallback(() => setRetrySeq((value) => value + 1), []);
 
   const logout = useCallback(() => {
-    void api.logout();
+    bootstrapMeFriction.current = null;
+    void logoutWithCookieSerialization(adminSession);
     accessToken = null;
     window.location.replace("/");
   }, []);
 
-  return { user, ready, authed, logout };
+  return { user, ready, authed, recoverable, retry, logout };
 }

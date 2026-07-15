@@ -41,6 +41,7 @@ const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB
 const COMMERCIAL_TABLES = [
   "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
   "agent_subscriptions", "user_preferences", "request_finalize_journal",
+  "product_friction_events",
   "orders", "topup_plans", "usage_records",
   "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
   "email_verifications", "users", "schema_migrations",
@@ -277,11 +278,21 @@ describe("POST /api/payment/hupi/create", () => {
     const r = await postJson("/api/payment/hupi/create", { plan_code: "plan-10" }, token);
     assert.equal(r.status, 502);
     assert.equal((r.json.error as Record<string, unknown>).code, "UPSTREAM_BAD_JSON");
-    // 订单依然 pending(未来 expire 扫到)
-    const cnt = await query<{ cnt: string }>(
-      "SELECT COUNT(*)::text AS cnt FROM orders WHERE status='pending'",
+    // 二维码从未交付给用户，不应伪装成“用户看到后放弃”的 pending/expired 漏斗。
+    const order = await query<{ status: string; callback_payload: { source?: string } }>(
+      "SELECT status,callback_payload FROM orders ORDER BY id DESC LIMIT 1",
     );
-    assert.equal(cnt.rows[0].cnt, "1");
+    assert.equal(order.rows[0]!.status, "canceled");
+    assert.equal(order.rows[0]!.callback_payload.source, "qr_issue_failed");
+    assert.equal((await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM orders WHERE status='pending'",
+    )).rows[0]!.cnt, "0");
+    const friction = await query<{ surface: string; stage: string; code: string; outcome: string }>(
+      "SELECT surface,stage,code,outcome FROM product_friction_events ORDER BY created_at DESC LIMIT 1",
+    );
+    assert.deepEqual(friction.rows[0], {
+      surface: "payment", stage: "qr_issue", code: "QR_ISSUE_FAILED", outcome: "failed",
+    });
   });
 });
 

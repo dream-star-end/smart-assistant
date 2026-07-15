@@ -549,6 +549,26 @@ describe("outboundReceiver — codex billing sideband", () => {
     assert.match(rec.body, /INVALID_BODY/)
     assert.equal(called, false)
   })
+
+  test("rolling raw billing reason is normalized and never reaches settlement", async () => {
+    const calls: WechatCodexBillingBody[] = []
+    const handler = makeOutboundReceiverHandler(makeDeps({
+      handleCodexBilling: async (body) => {
+        calls.push(body)
+      },
+    }))
+    const { res, rec } = makeRes()
+    await handler(authedReq({
+      ...billingBody,
+      status: "error",
+      errorReason: "DO_NOT_PERSIST provider secret",
+    }), res, CTX)
+    assert.equal(rec.status, 200)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.terminalCode, "CODEX_ERROR")
+    assert.equal(Object.prototype.hasOwnProperty.call(calls[0]!, "errorReason"), false)
+    assert.equal(JSON.stringify(calls[0]!).includes("DO_NOT_PERSIST"), false)
+  })
 })
 
 // ─── render → enqueue happy path ───────────────────────────────────────────

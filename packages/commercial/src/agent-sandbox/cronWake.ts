@@ -264,7 +264,9 @@ export async function runCronWakeRescan(deps: RescanDeps): Promise<RescanResult>
   try {
     userIds = await listV5UserIds(deps.runner);
   } catch (err) {
-    log.error("list_v5_users_failed", { err: err as Error });
+    log.error("list_v5_users_failed", {
+      errorClass: err instanceof Error ? err.name : typeof err,
+    });
     return { scanned: 0, upserted: 0, errors: 1 };
   }
 
@@ -293,7 +295,10 @@ export async function runCronWakeRescan(deps: RescanDeps): Promise<RescanResult>
       upserted++;
     } catch (err) {
       errors++;
-      log.warn("rescan_user_failed", { uid: uid.toString(), err: err as Error });
+      log.warn("rescan_user_failed", {
+        uid: uid.toString(),
+        errorClass: err instanceof Error ? err.name : typeof err,
+      });
     }
   }
 
@@ -339,6 +344,13 @@ export interface CronWakeSchedulerDeps {
   /** 启动即跑一轮 rescan(bootstrap 索引)。默认 true。 */
   runRescanOnStart?: boolean;
   horizonSec?: number;
+  /** Optional stable, body-free product recovery telemetry. */
+  recordWakeOutcome?: (input: {
+    userId: bigint;
+    correlation: string;
+    outcome: "failed" | "recovered";
+    attempts: number;
+  }) => void;
 }
 
 /**
@@ -363,6 +375,7 @@ export function startCronWakeScheduler(deps: CronWakeSchedulerDeps): CronWakeSch
   let tickCount = 0;
   /** per-uid 最近一次唤醒尝试时刻(ms);冷却窗口内不重复叫醒。 */
   const lastWakeAt = new Map<string, number>();
+  const wakeFailures = new Map<string, { correlation: string; attempts: number }>();
 
   async function tickOnce(): Promise<CronWakeTickResult> {
     if (inflight) return { due: 0, woken: 0, skippedActive: 0, skippedCooldown: 0, ran: false, skipReason: "busy" };
@@ -392,7 +405,10 @@ export function startCronWakeScheduler(deps: CronWakeSchedulerDeps): CronWakeSch
         try {
           active = await deps.isContainerActive(u.userId);
         } catch (err) {
-          log.warn("is_active_failed_skip", { uid: key, err: err as Error });
+          log.warn("is_active_failed_skip", {
+            uid: key,
+            errorClass: err instanceof Error ? err.name : typeof err,
+          });
           continue;
         }
         if (active) {
@@ -402,12 +418,41 @@ export function startCronWakeScheduler(deps: CronWakeSchedulerDeps): CronWakeSch
         // 先落冷却戳再 fire —— 即便 wake 慢/失败,下轮也不会立刻重复叫醒(spin 防护)。
         lastWakeAt.set(key, t);
         woken++;
-        void deps.wakeContainer(u.userId).catch((err) => {
-          log.warn("wake_failed", { uid: key, err: err as Error });
+        void deps.wakeContainer(u.userId).then(() => {
+          const previous = wakeFailures.get(key);
+          if (previous) {
+            deps.recordWakeOutcome?.({
+              userId: u.userId,
+              correlation: previous.correlation,
+              outcome: "recovered",
+              attempts: previous.attempts + 1,
+            });
+            wakeFailures.delete(key);
+          }
+        }).catch((err) => {
+          const previous = wakeFailures.get(key);
+          const failure = previous ?? {
+            correlation: `${key}:${u.nextFireAt.toISOString()}`,
+            attempts: 0,
+          };
+          failure.attempts++;
+          wakeFailures.set(key, failure);
+          deps.recordWakeOutcome?.({
+            userId: u.userId,
+            correlation: failure.correlation,
+            outcome: "failed",
+            attempts: failure.attempts,
+          });
+          log.warn("wake_failed", {
+            uid: key,
+            errorClass: err instanceof Error ? err.name : typeof err,
+          });
         });
       }
     } catch (err) {
-      log.error("due_tick_failed", { err: err as Error });
+      log.error("due_tick_failed", {
+        errorClass: err instanceof Error ? err.name : typeof err,
+      });
     } finally {
       inflight = false;
     }
@@ -424,7 +469,9 @@ export function startCronWakeScheduler(deps: CronWakeSchedulerDeps): CronWakeSch
       const r = await deps.runRescan();
       return (r as RescanResult) ?? { scanned: 0, upserted: 0, errors: 0 };
     } catch (err) {
-      log.error("rescan_failed", { err: err as Error });
+      log.error("rescan_failed", {
+        errorClass: err instanceof Error ? err.name : typeof err,
+      });
       return { scanned: 0, upserted: 0, errors: 1 };
     } finally {
       rescanInflight = false;

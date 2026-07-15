@@ -33,8 +33,13 @@
 import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 import { query, tx } from '../db/queries.js'
-import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, signAccess } from './jwt.js'
+import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, refreshTokenHash, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
+import {
+  lockRefreshFamily,
+  lockRefreshUsers,
+  resolveRefreshTokenLockTarget,
+} from './refreshFamilyLock.js'
 
 
 
@@ -96,6 +101,17 @@ export interface SocialLoginResult {
   remember: boolean
 }
 
+interface SocialLoginDbUser {
+  userId: string
+  isNew: boolean
+  email: string
+  emailVerified: boolean
+  displayName: string | null
+  avatarUrl: string | null
+  credits: string
+  role: 'user' | 'admin'
+}
+
 export interface SocialLoginDeps {
   jwtSecret: string | Uint8Array
   /** 写到 refresh_tokens.user_agent / ip,审计追溯用 */
@@ -106,6 +122,8 @@ export interface SocialLoginDeps {
   now?: () => number
   accessTtlSeconds?: number
   refreshTtlSeconds?: number
+  /** Current same-origin refresh cookie, revoked as an identity replacement. */
+  replaceRefreshToken?: string | null
   /**
    * 是否允许在 identity 未命中时新建本地账号。
    *
@@ -168,16 +186,7 @@ export async function socialLoginOrCreate(
   const lockKey = `${input.provider}:${input.providerUserId}`
 
   // tx 内确定 user_id + isNew + display_name + avatar_url + email + status snapshot
-  const found = await tx<{
-    userId: string
-    isNew: boolean
-    email: string
-    emailVerified: boolean
-    displayName: string | null
-    avatarUrl: string | null
-    credits: string
-    role: 'user' | 'admin'
-  }>(async (client) => {
+  const found = await tx<SocialLoginDbUser>(async (client) => {
     // 1) advisory lock —— 同 (provider, provider_user_id) 并发首登串行化
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey])
 
@@ -348,31 +357,105 @@ export async function socialLoginOrCreate(
 
   // 4) 签发 access + refresh,INSERT refresh_tokens(remember_me=TRUE,SSO 默认"记住")
   const issueNow = nowSec(deps)
-  const access = await signAccess({ sub: found.userId, role: found.role }, deps.jwtSecret, {
-    now: issueNow,
-    ttlSeconds: deps.accessTtlSeconds,
-  })
   const refresh = issueRefresh({
     now: issueNow,
     ttlSeconds: deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
   })
-  await query(
-    `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-     VALUES ($1, $2, $3, $4, to_timestamp($5), TRUE)`,
-    [found.userId, refresh.hash, deps.userAgent ?? null, deps.bindIp ?? null, refresh.expires_at],
-  )
+  let replacedTokenHash: string | null = null
+  if (deps.replaceRefreshToken) {
+    try { replacedTokenHash = refreshTokenHash(deps.replaceRefreshToken) } catch { /* ignore malformed cookie */ }
+  }
+  const validated = await tx<SocialLoginDbUser>(async (client) => {
+    const replacedTarget = replacedTokenHash
+      ? await resolveRefreshTokenLockTarget(client, replacedTokenHash)
+      : null
+    await lockRefreshUsers(client, [
+      found.userId,
+      ...(replacedTarget ? [replacedTarget.userId] : []),
+    ])
+    if (replacedTarget) {
+      await lockRefreshFamily(client, replacedTarget.familyId)
+    }
+
+    // The OAuth exchange/identity lookup happened before this token-issuing
+    // transaction. Revalidate the exact identity and account status under the
+    // same user lock used by admin revocation, so a concurrent ban either
+    // blocks this issue or revokes it after insertion.
+    const currentRes = await client.query<{
+      user_id: string
+      status: string
+      email: string
+      email_verified: boolean
+      display_name: string | null
+      avatar_url: string | null
+      credits: string
+      role: 'user' | 'admin'
+    }>(
+      `SELECT oi.user_id::text AS user_id,
+              u.status, u.email, u.email_verified,
+              u.display_name, u.avatar_url, u.credits::text AS credits, u.role
+         FROM oauth_identities oi
+         JOIN users u ON u.id = oi.user_id
+        WHERE oi.provider=$1 AND oi.provider_user_id=$2
+          AND oi.user_id=$3::bigint
+        FOR UPDATE OF oi, u`,
+      [input.provider, input.providerUserId, found.userId],
+    )
+    const current = currentRes.rows[0]
+    if (!current || current.status !== 'active') {
+      throw new SocialLoginError('USER_DISABLED', 'user disabled')
+    }
+
+    if (replacedTokenHash && replacedTarget) {
+      const prior = await client.query<{ family_id: string }>(
+        `SELECT family_id::text AS family_id FROM refresh_tokens
+          WHERE token_hash=$1 AND family_id=$2::uuid
+          FOR UPDATE`,
+        [replacedTokenHash, replacedTarget.familyId],
+      )
+      if (prior.rows[0]) {
+        await client.query(
+          `UPDATE refresh_tokens
+              SET revoked_at=COALESCE(revoked_at,NOW()),
+                  revoked_reason=CASE WHEN revoked_at IS NULL THEN 'logout' ELSE revoked_reason END
+            WHERE family_id=$1::uuid`,
+          [prior.rows[0].family_id],
+        )
+      }
+    }
+    await client.query(
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), TRUE)`,
+      [current.user_id, refresh.hash, deps.userAgent ?? null, deps.bindIp ?? null, refresh.expires_at],
+    )
+    return {
+      userId: current.user_id,
+      isNew: found.isNew,
+      email: current.email,
+      emailVerified: current.email_verified,
+      displayName: current.display_name,
+      avatarUrl: current.avatar_url,
+      credits: current.credits,
+      role: current.role,
+    }
+  })
+
+  const access = await signAccess({ sub: validated.userId, role: validated.role }, deps.jwtSecret, {
+    now: issueNow,
+    ttlSeconds: deps.accessTtlSeconds,
+  })
 
   return {
     user: {
-      id: found.userId,
-      email: found.email,
-      email_verified: found.emailVerified,
-      role: found.role,
-      display_name: found.displayName,
-      avatar_url: found.avatarUrl,
-      credits: found.credits,
+      id: validated.userId,
+      email: validated.email,
+      email_verified: validated.emailVerified,
+      role: validated.role,
+      display_name: validated.displayName,
+      avatar_url: validated.avatarUrl,
+      credits: validated.credits,
     },
-    isNew: found.isNew,
+    isNew: validated.isNew,
     access_token: access.token,
     access_exp: access.exp,
     refresh_token: refresh.token,

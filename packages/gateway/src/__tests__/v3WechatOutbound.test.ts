@@ -421,6 +421,24 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     })
   })
 
+  test("rolling raw billing reason is converted before durable staging", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({ config: CFG, retryQueue: q })
+    await adapter.init!(makeCtx())
+    await adapter.send!({
+      type: "outbound.codex_billing",
+      channel: "wechat",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "error",
+      durationMs: 9,
+      errorReason: "DO_NOT_STAGE provider secret",
+    } as unknown as OutboundMessage)
+    assert.equal(q.enqueued.length, 1)
+    assert.equal((q.enqueued[0]!.payload as { terminalCode?: string }).terminalCode, "CODEX_ERROR")
+    assert.equal(Object.prototype.hasOwnProperty.call(q.enqueued[0]!.payload, "errorReason"), false)
+    assert.equal(JSON.stringify(q.enqueued[0]!.payload).includes("DO_NOT_STAGE"), false)
+  })
+
   test("webchat codex billing frame is accepted when sent through v3 WeChat adapter", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({

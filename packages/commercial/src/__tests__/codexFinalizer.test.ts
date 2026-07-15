@@ -30,6 +30,7 @@ import assert from "node:assert/strict";
 import type { Pool, PoolClient } from "pg";
 import {
   ENGINE_SESSION_ID_RE,
+  JournalSettlementClaimLostError,
   deriveEngineSessionId,
   makeCodexFinalizer,
 } from "../billing/codexFinalizer.js";
@@ -81,11 +82,16 @@ interface FakePoolControl {
   queries: QueryRecord[];
   /** 让下一次 INSERT INTO usage_records 抛 errToThrow,触发 codexFinalizer 的 catch + abort 兜底。 */
   injectInsertUsageError(err: Error): void;
+  injectCommitError(err: Error): void;
 }
 
-function makeFakePool(opts: { userBalance?: bigint } = {}): FakePoolControl {
+function makeFakePool(opts: {
+  userBalance?: bigint;
+  finalizingClaimed?: boolean;
+} = {}): FakePoolControl {
   const queries: QueryRecord[] = [];
   let pendingUsageInsertErr: Error | null = null;
+  let pendingCommitErr: Error | null = null;
   const balance = opts.userBalance ?? 1_000_000n;
 
   function record(sql: string, params: unknown[] | undefined): void {
@@ -103,6 +109,11 @@ function makeFakePool(opts: { userBalance?: bigint } = {}): FakePoolControl {
           : (sqlOrCfg as { text: string }).text;
       record(sql, params);
       const trimmed = sql.trim();
+      if (trimmed === "COMMIT" && pendingCommitErr !== null) {
+        const e = pendingCommitErr;
+        pendingCommitErr = null;
+        throw e;
+      }
       if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") {
         return { rows: [], rowCount: 0 };
       }
@@ -166,6 +177,9 @@ function makeFakePool(opts: { userBalance?: bigint } = {}): FakePoolControl {
       const trimmed = sql.trim();
       // finalizeInflightJournal / abortInflightJournal 都走 pool.query,UPDATE noop 即可。
       if (trimmed.startsWith("UPDATE request_finalize_journal")) {
+        if (/SET state='finalizing'/.test(trimmed)) {
+          return { rows: [], rowCount: opts.finalizingClaimed === false ? 0 : 1 };
+        }
         return { rows: [], rowCount: 1 };
       }
       throw new Error(`fakePool: unhandled SQL: ${trimmed.slice(0, 80)}`);
@@ -177,6 +191,9 @@ function makeFakePool(opts: { userBalance?: bigint } = {}): FakePoolControl {
     queries,
     injectInsertUsageError(err: Error) {
       pendingUsageInsertErr = err;
+    },
+    injectCommitError(err: Error) {
+      pendingCommitErr = err;
     },
   };
 }
@@ -206,8 +223,12 @@ interface FixtureBundle {
 async function makeFixture(opts: {
   requestId?: string;
   userBalance?: bigint;
+  finalizingClaimed?: boolean;
 } = {}): Promise<FixtureBundle> {
-  const poolCtrl = makeFakePool({ userBalance: opts.userBalance });
+  const poolCtrl = makeFakePool({
+    userBalance: opts.userBalance,
+    finalizingClaimed: opts.finalizingClaimed,
+  });
   const redis = new InMemoryPreCheckRedis();
   const userId = 7n;
   const requestId = opts.requestId ?? "req-test-0001";
@@ -395,22 +416,59 @@ describe("makeCodexFinalizer / settleStatus selection", () => {
   test("cost=0 + status=error → status=error", async () => {
     const { poolCtrl, ctx } = await makeFixture();
     const fz = makeCodexFinalizer(ctx);
-    await fz.commit(usage(0, 0, 0, 0), "error", "container_crashed");
+    await fz.commit(usage(0, 0, 0, 0), "error");
 
     const ins = poolCtrl.queries.find((q) =>
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );
     assert.ok(ins);
     assert.equal(ins.params?.[14], "error");
-    // snapshotJson 应含 codex_status + codex_error_reason
+    // snapshotJson 只含稳定终态码，不持久化引擎原始错误文本。
     const snapshotJson = ins.params?.[8] as string;
     const snap = JSON.parse(snapshotJson);
     assert.equal(snap.codex_status, "error");
-    assert.equal(snap.codex_error_reason, "container_crashed");
+    assert.equal(snap.codex_terminal_code, "CODEX_ERROR");
+    assert.equal(snap.codex_error_reason, undefined);
+  });
+
+  test("interrupted partial usage persists USER_CANCELLED without raw reason", async () => {
+    const { poolCtrl, ctx } = await makeFixture({ userBalance: 1_000_000n });
+    const fz = makeCodexFinalizer(ctx);
+    await fz.commit(usage(1000, 200), "error", {
+      terminalCode: "USER_CANCELLED",
+    });
+    const ins = poolCtrl.queries.find((q) =>
+      q.sql.trim().startsWith("INSERT INTO usage_records"),
+    );
+    assert.ok(ins);
+    const snap = JSON.parse(ins.params?.[8] as string);
+    assert.equal(snap.codex_status, "error");
+    assert.equal(snap.codex_terminal_code, "USER_CANCELLED");
+    assert.equal(JSON.stringify(snap).includes("must-not-be-persisted"), false);
   });
 });
 
 describe("makeCodexFinalizer / settle failure path", () => {
+  test("reconciler 已先 abort → late billing frame 不产生 usage/ledger 或扣费", async () => {
+    const { poolCtrl, redis, ctx } = await makeFixture({ finalizingClaimed: false });
+    const fz = makeCodexFinalizer(ctx);
+
+    await assert.rejects(
+      () => fz.commit(usage(100, 100), "success"),
+      JournalSettlementClaimLostError,
+    );
+    assert.equal(
+      poolCtrl.queries.some((q) =>
+        q.sql.includes("INSERT INTO usage_records") ||
+        q.sql.includes("INSERT INTO credit_ledger") ||
+        q.sql.includes("UPDATE users SET credits"),
+      ),
+      false,
+      "lost finalizing CAS must stop before any financial settlement",
+    );
+    assert.equal(await reservationStillHeld(redis, ctx.reservation), false);
+  });
+
   test("settle throw → journal stays recoverable + rethrow + reservation released", async () => {
     const { poolCtrl, redis, ctx } = await makeFixture();
     poolCtrl.injectInsertUsageError(new Error("simulated DB outage"));
@@ -421,12 +479,34 @@ describe("makeCodexFinalizer / settle failure path", () => {
       /simulated DB outage/,
     );
 
-    // Transient/unknown commit failure must never become a permanent waiver.
+    // A known pre-COMMIT failure is rolled back only by the claim owner. The
+    // unmarked aborted row is explicitly reopenable by immutable tape replay.
     assert.ok(
-      !poolCtrl.queries.some((q) => /state='aborted'/.test(q.sql)),
-      "settle throw must leave journal recoverable for immutable replay",
+      poolCtrl.queries.some((q) =>
+        /state='aborted'/.test(q.sql) &&
+        q.sql.includes("settlementClaimId") &&
+        typeof q.params?.[3] === "string"
+      ),
+      "known transaction failure must owner-rollback for durable replay",
     );
     // reservation 仍然被释放(finally 块)
+    assert.equal(await reservationStillHeld(redis, ctx.reservation), false);
+  });
+
+  test("COMMIT outcome unknown → 保留 owner finalizing，绝不回滚成 aborted", async () => {
+    const { poolCtrl, redis, ctx } = await makeFixture();
+    poolCtrl.injectCommitError(new Error("connection lost after COMMIT"));
+    const fz = makeCodexFinalizer(ctx);
+
+    await assert.rejects(
+      () => fz.commit(usage(100, 100), "success"),
+      /COMMIT outcome is unknown/,
+    );
+    assert.equal(
+      poolCtrl.queries.some((q) => /state='aborted'/.test(q.sql)),
+      false,
+      "indeterminate commit may already have debited and must retain the claim",
+    );
     assert.equal(await reservationStillHeld(redis, ctx.reservation), false);
   });
 
@@ -568,7 +648,7 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
   test("零输出但 status=error → 走 error 语义(不免单标记,也不扣费)", async () => {
     const { poolCtrl, ctx } = await makeFixture();
     const fz = makeCodexFinalizer(ctx);
-    await fz.commit(usage(1_000_000, 0), "error", "turn_failed");
+    await fz.commit(usage(1_000_000, 0), "error");
     const ins = poolCtrl.queries.find((q) =>
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );

@@ -29,6 +29,7 @@ const {
   appendServerAuthoredMessage,
   appendServerAuthoredMessageDurable,
   appendServerAuthoredMessageForRequest,
+  classifyClientSessions,
   deleteClientSession,
   getSessionsDb,
   queueMessageToOutbox,
@@ -92,6 +93,24 @@ describe('appendServerAuthoredMessage — session_deleted vs session_not_found s
     })
     assert.equal(r.applied, false)
     assert.equal(r.reason, 'session_deleted')
+  })
+
+  it('classifies active, deleted and missing refs without conflating tenant mismatch', async () => {
+    await seedSession('sess-live', 'user-X')
+    await seedSession('sess-deleted', 'user-X')
+    await deleteClientSession('sess-deleted', 'user-X')
+
+    assert.deepEqual(await classifyClientSessions([
+      { sessionId: 'sess-live', userId: 'user-X' },
+      { sessionId: 'sess-deleted', userId: 'user-X' },
+      { sessionId: 'sess-missing', userId: 'user-X' },
+      { sessionId: 'sess-live', userId: 'other-user' },
+    ]), [
+      { sessionId: 'sess-live', userId: 'user-X', state: 'active' },
+      { sessionId: 'sess-deleted', userId: 'user-X', state: 'deleted' },
+      { sessionId: 'sess-missing', userId: 'user-X', state: 'missing' },
+      { sessionId: 'sess-live', userId: 'other-user', state: 'missing' },
+    ])
   })
 
   it('still returns session_not_found when the row never existed', async () => {

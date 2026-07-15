@@ -622,6 +622,11 @@ export const OutboundCodexBilling = Type.Object({
   engineSessionId: Type.Optional(Type.String({ pattern: '^oceng-[0-9a-f]{48}$' })),
   /** PR2 范围:codex turn 终态分类。partial 路径在 PR3 加。 */
   status: Type.Union([Type.Literal('success'), Type.Literal('error')]),
+  /** Stable content-free terminal reason. Raw engine/provider error text is
+   * deliberately excluded from every durable/wire billing contract. */
+  terminalCode: Type.Optional(
+    Type.Union([Type.Literal('USER_CANCELLED'), Type.Literal('CODEX_ERROR')]),
+  ),
   /** turn 实际墙钟时长(ms),codex app-server 报告的 durationMs。 */
   durationMs: Type.Number(),
   /** Anthropic-shape usage(codex 已映射好);可缺省(空 turn / 模型未调用)→
@@ -635,8 +640,6 @@ export const OutboundCodexBilling = Type.Object({
       reasoning_output_tokens: Type.Optional(Type.Number()),
     }),
   ),
-  /** error 状态下的简短原因(故障定位 / journal 落库),不返回给 user。 */
-  errorReason: Type.Optional(Type.String()),
   /** Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back 到本帧
    *  让 master.userChatBridge 落库到 claude_accounts.quota_5h_pct/quota_5h_resets_at/
    *  quota_7d_pct/quota_7d_resets_at,与 Anthropic 路径(M9 quota.ts)字段对齐。

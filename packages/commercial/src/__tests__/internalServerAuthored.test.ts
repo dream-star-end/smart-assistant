@@ -1146,6 +1146,30 @@ describe("internalServerAuthored handler — storage outcome mapping", () => {
     assert.equal(rec.status, 500);
   });
 
+  test("413 on oversized records one stable content-free product event", async () => {
+    const events: Array<{
+      userId: bigint;
+      requestId: string;
+      sessionId: string | null;
+      role: V3SinkPersistRole | undefined;
+    }> = [];
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: false, reason: "oversized" })),
+      recordOversized: (input) => events.push(input),
+    });
+    const { res, rec } = makeRes();
+    await h(authed(validBody), res, CTX);
+    assert.equal(rec.status, 413);
+    assert.equal(events.length, 1);
+    assert.deepEqual(
+      { userId: events[0]!.userId, sessionId: events[0]!.sessionId, role: events[0]!.role },
+      { userId: 42n, sessionId: "sess12345", role: "assistant" },
+    );
+    assert.match(events[0]!.requestId, /^[0-9a-f]{32}$/);
+    assert.deepEqual(Object.keys(events[0]!).sort(), ["requestId", "role", "sessionId", "userId"]);
+  });
+
   test("500 when storage throws", async () => {
     const h = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),

@@ -12,21 +12,34 @@ process.env.OPENCLAUDE_HOME = TEST_HOME
 
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import * as assert from 'node:assert/strict'
-import { parse as parseYaml } from 'yaml'
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
 const {
   ensureCronFile,
+  isUntouchedDefaultCronJob,
   isUserInitiatedCronJob,
   validateCronSchedule,
   resolveDueMinute,
+  resolveCronOccurrence,
   getCatchupMinutes,
   getMaxJobs,
   getMaxPerHour,
   countMinuteHitsPerHour,
   frequencyQuotaError,
   deriveCronIndexPayload,
+  catalogRejectOutcome,
+  planCronRetry,
+  deliveryFailureOutcome,
+  cronDeliveryId,
+  deliverCronViaAdapter,
+  CRON_MAX_ATTEMPTS,
   CronScheduler,
 } = await import('../cron.js')
+
+const NOOP_CRON_DURABILITY = {
+  consumeOccurrence: async () => {},
+  stageDelivery: async () => {},
+}
 const { paths } = await import('@openclaude/storage')
 const { setHostStaticProviderKeys } = await import('../hostStaticProviders.js')
 
@@ -86,6 +99,169 @@ describe('ensureCronFile — OC_SEED_DEFAULT_CRON gate', () => {
     delete process.env.OC_SEED_DEFAULT_CRON
     const file = await ensureCronFile()
     assert.equal(file.jobs.length, 0, 'existing cron.yaml must be preserved regardless of env')
+  })
+
+  it('commercial startup removes only exact untouched legacy seeds and preserves edits/user jobs', async () => {
+    delete process.env.OC_SEED_DEFAULT_CRON
+    const seeded = await ensureCronFile()
+    const edited = { ...structuredClone(seeded.jobs[0]), schedule: '18 3 * * *' }
+    const user = {
+      id: 'remind-product-review', schedule: '0 9 * * 1', agent: 'main',
+      prompt: 'Review the product metrics', enabled: true, deliver: 'webchat',
+      createdAt: Date.now(),
+    }
+    writeFileSync(paths.cronYaml, stringifyYaml({ jobs: [...seeded.jobs, edited, user] }))
+
+    process.env.OC_SEED_DEFAULT_CRON = '0'
+    const file = await ensureCronFile()
+    assert.deepEqual(file.jobs.map((j) => j.id), [edited.id, user.id])
+    assert.equal(file.jobs[0].schedule, '18 3 * * *', 'a one-field user edit must never be scrubbed')
+    const onDisk = parseYaml(readFileSync(paths.cronYaml, 'utf8')) as { jobs: Array<{ id: string }> }
+    assert.deepEqual(onDisk.jobs.map((j) => j.id), [edited.id, user.id])
+  })
+
+  it('recognizes shipped 80697968/pre-806 seeds but preserves every field edit or addition', () => {
+    const cliSeed = {
+      id: 'daily-reflection', schedule: '17 3 * * *', agent: 'main', enabled: true, deliver: 'local' as const,
+      prompt: `You are doing a DAILY REFLECTION pass. It is currently early morning.
+
+1. Run \`oc-memory session-search "<query>"\` in the shell with query terms that cover yesterday's activity (e.g. the current date, common topics).
+2. Review the last 5-10 turns you find.
+3. Extract durable facts, user preferences, and patterns that should persist across sessions.
+4. Run \`oc-memory memory --action add --target <memory|user> --content "..."\` to add new entries — "memory" (your observations) or "user" (what you know about the user). Be selective — only things that will actually help next time.
+5. If you notice a pattern of tasks that could be reused, use \`skill_save\` to distill it into a reusable skill.
+6. IMPORTANT: 重点检查今天是否有超过 3 次工具调用的复杂任务。如果有且没有对应 skill,立即用 skill_save 创建。
+7. 如果 MEMORY.md 中有冗长条目,考虑用 \`oc-memory archival-add "..."\` 迁移到归档记忆,然后 \`oc-memory memory --action remove --target memory --needle "..."\` 从 Core 删除。
+8. Write a SHORT summary of what you learned today (max 200 words).
+9. If you learned nothing significant, reply with exactly "[SILENT]" and nothing else.`,
+    }
+    const mcpSeed = {
+      id: 'daily-reflection', schedule: '17 3 * * *', agent: 'main', enabled: true, deliver: 'local' as const,
+      prompt: `You are doing a DAILY REFLECTION pass. It is currently early morning.
+
+1. Call \`session_search\` with query terms that cover yesterday's activity (e.g. the current date, common topics).
+2. Review the last 5-10 turns you find.
+3. Extract durable facts, user preferences, and patterns that should persist across sessions.
+4. Use the \`memory\` tool to \`add\` new entries to either "memory" (your observations) or "user" (what you know about the user). Be selective — only things that will actually help next time.
+5. If you notice a pattern of tasks that could be reused, use \`skill_save\` to distill it into a reusable skill.
+6. IMPORTANT: 重点检查今天是否有超过 3 次工具调用的复杂任务。如果有且没有对应 skill,立即用 skill_save 创建。
+7. 如果 MEMORY.md 中有冗长条目,考虑用 archival_add 迁移到归档记忆,然后从 Core 中 remove。
+8. Write a SHORT summary of what you learned today (max 200 words).
+9. If you learned nothing significant, reply with exactly "[SILENT]" and nothing else.`,
+    }
+    assert.equal(isUntouchedDefaultCronJob(cliSeed), true, '80697968 CLI seed must be scrubbed')
+    assert.equal(isUntouchedDefaultCronJob(mcpSeed), true, 'pre-806 production seed must be scrubbed')
+
+    const variants = [
+      { ...cliSeed, id: 'daily-reflection-user' },
+      { ...cliSeed, schedule: '18 3 * * *' },
+      { ...cliSeed, agent: 'researcher' },
+      { ...cliSeed, prompt: `${cliSeed.prompt}\nuser note` },
+      { ...cliSeed, deliver: 'webchat' },
+      { ...cliSeed, enabled: false },
+      { ...cliSeed, heartbeat: true },
+      { ...cliSeed, createdAt: 1 },
+      { ...cliSeed, label: '我的复盘' },
+      { ...cliSeed, oneshot: true },
+      { ...cliSeed, deliverTarget: { channel: 'webchat', peerId: 'mine' } },
+      { ...cliSeed, userExtension: 'preserve-me' },
+    ]
+    for (const variant of variants) {
+      assert.equal(isUntouchedDefaultCronJob(variant as any), false)
+    }
+  })
+})
+
+describe('catalogRejectOutcome — retry contract', () => {
+  it('only catalog unavailability is retryable; policy/model rejects consume the run', () => {
+    assert.deepEqual(catalogRejectOutcome('MODEL_CATALOG_UNAVAILABLE'), {
+      kind: 'retryable_failure', code: 'MODEL_CATALOG_UNAVAILABLE',
+    })
+    assert.deepEqual(catalogRejectOutcome('MODEL_NOT_AVAILABLE'), {
+      kind: 'terminal_failure', code: 'MODEL_NOT_AVAILABLE',
+    })
+  })
+})
+
+describe('cron retry occurrence + delivery contract', () => {
+  it('binds execution retries to the original due minute and treats consumed execution as stale', () => {
+    const now = at(9, 30)
+    const retry = {
+      dueMinuteKey: mk(at(9, 0)), schedule: '*/5 * * * *', failures: 2,
+      nextAttemptAt: now.getTime() - 1, code: 'DELIVERY_TRANSIENT', phase: 'execution' as const,
+    }
+    assert.equal(
+      resolveCronOccurrence(
+        { id: 'r', schedule: '*/5 * * * *' }, {}, retry,
+        now.getTime(), now, 15,
+      ),
+      mk(at(9, 0)),
+      'the 09:30 occurrence must not replace the still-pending 09:00 delivery',
+    )
+    assert.equal(
+      resolveCronOccurrence(
+        { id: 'r', schedule: '*/5 * * * *' }, { r: mk(at(9, 0)) }, retry,
+        now.getTime(), now, 15,
+      ),
+      null,
+      'a retry left after last-run persistence is stale and cannot replay',
+    )
+  })
+
+  it('drains a delivery outbox even though model/tool execution was already consumed', () => {
+    const now = at(9, 30)
+    const dueMinuteKey = mk(at(9, 0))
+    const outbox = {
+      dueMinuteKey, schedule: '*/5 * * * *', failures: 0,
+      nextAttemptAt: now.getTime() - 1, code: 'DELIVERY_PENDING',
+      phase: 'delivery' as const, outputFile: 'reminder.md',
+    }
+    assert.equal(resolveCronOccurrence(
+      { id: 'r', schedule: '*/5 * * * *' }, { r: dueMinuteKey }, outbox,
+      now.getTime(), now, 15,
+    ), dueMinuteKey)
+  })
+
+  it('uses bounded delays and turns the fourth failed attempt into explicit exhaustion', () => {
+    const args = { dueMinuteKey: 100, schedule: '0 9 * * *', nowEpoch: 1_000, code: 'EXECUTION_ERROR' }
+    const first = planCronRetry(undefined, args)
+    assert.equal(first.kind, 'retry')
+    if (first.kind !== 'retry') return
+    assert.equal(first.entry.failures, 1)
+    const second = planCronRetry(first.entry, { ...args, nowEpoch: 61_000 })
+    assert.equal(second.kind, 'retry')
+    if (second.kind !== 'retry') return
+    const third = planCronRetry(second.entry, { ...args, nowEpoch: 181_000 })
+    assert.equal(third.kind, 'retry')
+    if (third.kind !== 'retry') return
+    const exhausted = planCronRetry(third.entry, { ...args, nowEpoch: 481_000 })
+    assert.deepEqual(exhausted, { kind: 'exhausted', attempts: CRON_MAX_ATTEMPTS })
+    const newer = planCronRetry(third.entry, { ...args, dueMinuteKey: 101 })
+    assert.equal(newer.kind, 'retry')
+    if (newer.kind === 'retry') assert.equal(newer.entry.failures, 1, 'new occurrence never inherits old failures')
+  })
+
+  it('treats unknown delivery exceptions as transient; only explicit stable tags are permanent', () => {
+    assert.deepEqual(deliveryFailureOutcome(new Error('socket detail must stay private')), {
+      kind: 'retryable_failure', code: 'DELIVERY_TRANSIENT',
+    })
+    assert.deepEqual(deliveryFailureOutcome({ code: 'TARGET_REJECTED', retryable: false }), {
+      kind: 'terminal_failure', code: 'TARGET_REJECTED',
+    })
+  })
+
+  it('production adapter boundary awaits and propagates sink rejection', async () => {
+    let completed = false
+    await assert.rejects(
+      () => deliverCronViaAdapter({
+        send: async () => {
+          await Promise.resolve()
+          throw new Error('adapter rejected')
+        },
+      }, { text: 'archived output' }),
+      /adapter rejected/,
+    )
+    assert.equal(completed, false)
   })
 })
 
@@ -393,7 +569,8 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
 
   it('codex 默认(agent 无 model + defaults=gpt-5.6-sol)→ getOrCreate+submit 均带非 codex 兜底模型', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
-    await (sched as any).runJob(job, { id: 'main' })
+    const outcome = await (sched as any).runJob(job, { id: 'main' }, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' })
     assert.equal(getOrCreateOpts.length, 1)
     assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
     assert.equal(submitCalls.length, 1)
@@ -402,14 +579,14 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
 
   it('agent 显式 gpt-5.6-sol(codex)→ 同样替换为非 codex 兜底', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
-    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.6-sol' })
+    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.6-sol' }, NOOP_CRON_DURABILITY)
     assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro')
     assert.equal(submitCalls[0].model, 'deepseek-v4-pro')
   })
 
   it('非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model=undefined)', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
-    await (sched as any).runJob(job, { id: 'x', model: 'glm-5.2' })
+    await (sched as any).runJob(job, { id: 'x', model: 'glm-5.2' }, NOOP_CRON_DURABILITY)
     // 尊重原配置:getOrCreate 不注入 model 键(沿用 agent 默认),submit model 为 undefined。
     assert.equal('model' in getOrCreateOpts[0], false, '非 codex 不应注入 model override')
     assert.equal(submitCalls[0].model, undefined)
@@ -468,12 +645,12 @@ describe('CronScheduler.runJob — 引擎 API 错误熔断(402 站内信轰炸�
     const { sched, setOutput, delivered } = makeSchedulerWithOutput()
     setOutput(ERR_402)
 
-    await (sched as any).runJob(job, AGENT)
-    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
     assert.equal(delivered.length, 0, '裸 API 错误绝不能作为任务产出送达')
     assert.equal(job.enabled, true, '未到阈值不停用')
 
-    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
     assert.equal(job.enabled, false, '第 3 次连续 402 必须停用任务')
     assert.equal(delivered.length, 1, '暂停通知恰好一条')
     assert.ok(delivered[0].includes('已自动暂停'), `通知需说明暂停:${delivered[0]}`)
@@ -489,14 +666,14 @@ describe('CronScheduler.runJob — 引擎 API 错误熔断(402 站内信轰炸�
     const { sched, setOutput, delivered } = makeSchedulerWithOutput()
 
     setOutput(ERR_402)
-    await (sched as any).runJob(job, AGENT)
-    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
     setOutput('今日一切正常。')
-    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
     assert.deepEqual(delivered, ['今日一切正常。'], '正常产出照常送达')
     setOutput(ERR_402)
-    await (sched as any).runJob(job, AGENT)
-    await (sched as any).runJob(job, AGENT)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
+    await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY)
     assert.equal(job.enabled, true, '成功已清零连击,两次新失败不该停用')
   })
 
@@ -505,8 +682,208 @@ describe('CronScheduler.runJob — 引擎 API 错误熔断(402 站内信轰炸�
     seedJob(job)
     const { sched, setOutput, delivered } = makeSchedulerWithOutput()
     setOutput(ERR_429)
-    for (let i = 0; i < 5; i++) await (sched as any).runJob(job, AGENT)
+    for (let i = 0; i < 5; i++) {
+      assert.deepEqual(await (sched as any).runJob(job, AGENT, NOOP_CRON_DURABILITY), {
+        kind: 'terminal_failure', code: 'RATE_LIMITED',
+      })
+    }
     assert.equal(delivered.length, 0, '瞬时错误不送达')
     assert.equal(job.enabled, true, '瞬时错误永不替用户关任务')
+  })
+})
+
+describe('CronScheduler execution retry boundary', () => {
+  const job = {
+    id: 'remind-side-effect-boundary', schedule: '0 9 * * *', agent: 'x',
+    prompt: 'perform a side effect', deliver: 'webchat', enabled: true,
+  } as any
+  const agent = { id: 'x', model: 'glm-5.2' } as any
+
+  it('retries a session-creation failure because submit never started', async () => {
+    let submits = 0
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async () => { throw new Error('spawn unavailable') },
+        submit: async () => { submits++ },
+        destroySession: async () => {},
+      } as any,
+      async () => {},
+    )
+    assert.deepEqual(await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY), {
+      kind: 'retryable_failure', code: 'SESSION_CREATE_FAILED',
+    })
+    assert.equal(submits, 0)
+  })
+
+  it('disabled one-shot survives a last-run write failure and submits exactly once after restart retry', async () => {
+    process.env.OC_SEED_DEFAULT_CRON = '0'
+    const retryPath = join(TEST_HOME, 'cron', 'retry-state.json')
+    const lastRunPath = join(TEST_HOME, 'cron', 'last-run.json')
+    for (const path of [paths.cronYaml, paths.agentsYaml, retryPath, lastRunPath]) {
+      if (existsSync(path)) unlinkSync(path)
+    }
+    const job = {
+      id: 'oneshot-last-run-retry', schedule: '* * * * *', agent: 'x',
+      prompt: 'do once', deliver: 'local', enabled: true, oneshot: true,
+    }
+    writeFileSync(paths.cronYaml, stringifyYaml({ jobs: [job] }))
+    writeFileSync(paths.agentsYaml, stringifyYaml({
+      agents: [{ id: 'x', model: 'glm-5.2' }], routes: [], default: 'x',
+    }))
+    let submits = 0
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }),
+        submit: async (_session: any, _prompt: any, cb: any) => {
+          submits++
+          cb({ kind: 'block', block: { kind: 'text', text: '[SILENT]' } })
+        },
+        destroySession: async () => {},
+      } as any,
+      async () => {},
+    )
+    const persistLastRun = (sched as any).persistLastRun.bind(sched)
+    let failOnce = true
+    ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
+      if (failOnce) {
+        failOnce = false
+        throw new Error('simulated last-run disk failure')
+      }
+      await persistLastRun(value)
+    }
+
+    await (sched as any).tick()
+    assert.equal(submits, 0, 'submit cannot start before the owned occurrence is durable')
+    const disabled = parseYaml(readFileSync(paths.cronYaml, 'utf8')) as any
+    assert.equal(disabled.jobs[0].enabled, false)
+    const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as Record<string, any>
+    assert.equal(retryState[job.id].phase, 'execution')
+    retryState[job.id].nextAttemptAt = 0
+    writeFileSync(retryPath, JSON.stringify(retryState))
+
+    await (sched as any).tick()
+    assert.equal(submits, 1)
+    await (sched as any).tick()
+    assert.equal(submits, 1, 'completed one-shot cannot fire again after retry cleanup')
+  })
+
+  it('never retries after submit began, even when partial output/tool side effects preceded the throw', async () => {
+    let destroys = 0
+    let deliveries = 0
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }),
+        submit: async (_session: any, _prompt: any, cb: any) => {
+          cb({ kind: 'block', block: { kind: 'text', text: 'partial after tool write' } })
+          throw new Error('upstream failed after side effect')
+        },
+        destroySession: async () => { destroys++ },
+      } as any,
+      async () => { deliveries++ },
+    )
+    assert.deepEqual(await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY), {
+      kind: 'terminal_failure', code: 'EXECUTION_ERROR',
+    })
+    assert.equal(destroys, 1)
+    assert.equal(deliveries, 0, 'partial output after an execution failure must not be delivered')
+  })
+})
+
+describe('CronScheduler delivery outbox retry', () => {
+  it('consumes before submit and suppresses send/re-execution when outbox persistence fails', async () => {
+    const events: string[] = []
+    let submits = 0
+    let deliveries = 0
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }),
+        submit: async (_s: any, _t: any, cb: any) => {
+          events.push('submit')
+          submits++
+          cb({ kind: 'block', block: { kind: 'text', text: 'side effect already happened' } })
+        },
+        destroySession: async () => {},
+      } as any,
+      async () => { deliveries++ },
+    )
+    ;(sched as any).persistRetryState = async () => {
+      throw new Error('disk unavailable')
+    }
+    const job = {
+      id: 'remind-outbox-write-failure', schedule: '0 9 * * *', agent: 'x',
+      prompt: 'p', deliver: 'webchat', enabled: true,
+    } as any
+    const outcome = await (sched as any).runJob(
+      job,
+      { id: 'x', model: 'glm-5.2' },
+      {
+        consumeOccurrence: async () => { events.push('consume') },
+        stageDelivery: async (outputFile: string) => {
+          events.push('stage')
+          await (sched as any).stageDeliveryOutbox(job, 100, Date.now(), outputFile)
+        },
+      },
+    )
+    assert.deepEqual(outcome, {
+      kind: 'terminal_failure', code: 'DELIVERY_OUTBOX_WRITE_FAILED',
+    })
+    assert.deepEqual(events, ['consume', 'submit', 'stage'])
+    assert.equal(submits, 1)
+    assert.equal(deliveries, 0)
+    assert.equal((sched as any).retryState.has(job.id), false)
+  })
+
+  it('retries archived delivery without executing the agent a second time', async () => {
+    let submits = 0
+    let deliveries = 0
+    const sessions = {
+      getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }) as any,
+      submit: async (_s: any, _t: any, cb: any) => {
+        submits++
+        cb({ kind: 'block', block: { kind: 'text', text: 'durable reminder output' } })
+      },
+      destroySession: async () => {},
+    }
+    const deliveryIds: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      sessions as any,
+      async (_text, _job, delivery) => {
+        deliveries++
+        deliveryIds.push(delivery!.deliveryId)
+        if (deliveries === 1) throw new Error('transient channel detail')
+      },
+    )
+    const job = {
+      id: 'remind-delivery-outbox', schedule: '0 9 * * *', agent: 'x',
+      prompt: 'p', deliver: 'webchat', enabled: true,
+    } as any
+    const first = await (sched as any).runJob(
+      job,
+      { id: 'x', model: 'glm-5.2' },
+      NOOP_CRON_DURABILITY,
+      { dueMinuteKey: 100, deliveryId: cronDeliveryId(job.id, 100) },
+    )
+    assert.equal(first.kind, 'retryable_failure')
+    assert.equal(first.retry?.phase, 'delivery')
+    assert.equal(typeof first.retry?.outputFile, 'string')
+    const retried = await (sched as any).retryArchivedDelivery(job, {
+      dueMinuteKey: 100,
+      schedule: job.schedule,
+      failures: 1,
+      nextAttemptAt: 0,
+      code: first.code,
+      phase: 'delivery',
+      outputFile: first.retry.outputFile,
+      deliveryId: cronDeliveryId(job.id, 100),
+    })
+    assert.deepEqual(retried, { kind: 'completed' })
+    assert.equal(submits, 1, 'delivery retry must not re-run model/tool side effects')
+    assert.equal(deliveries, 2)
+    assert.deepEqual(deliveryIds, [cronDeliveryId(job.id, 100), cronDeliveryId(job.id, 100)])
   })
 })

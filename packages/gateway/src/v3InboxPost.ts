@@ -41,6 +41,8 @@ export interface InboxMessageArgs {
   title: string
   /** 站内信正文 Markdown(截断 MAX_BODY_CHARS)。 */
   bodyMd: string
+  /** Stable occurrence id for durable cron delivery. */
+  deliveryKey?: string
 }
 
 export interface PostInboxOpts {
@@ -54,6 +56,28 @@ export interface PostInboxOpts {
 
 function cap(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}…`
+}
+
+export class InboxPostDeliveryError extends Error {
+  override readonly name = 'InboxPostDeliveryError'
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly retryable: boolean,
+  ) {
+    super(message)
+  }
+}
+
+async function readResponseBody(body: AsyncIterable<unknown>): Promise<string> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of body) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as ArrayBuffer)
+    if (total < 16 * 1024) chunks.push(bytes.subarray(0, 16 * 1024 - total))
+    total += bytes.length
+  }
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 /**
@@ -74,6 +98,7 @@ export async function postInboxMessage(
   const body = JSON.stringify({
     title: cap(args.title, MAX_TITLE_CHARS),
     bodyMd: cap(args.bodyMd, MAX_BODY_CHARS),
+    ...(args.deliveryKey ? { deliveryKey: args.deliveryKey } : {}),
   })
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -99,6 +124,63 @@ export async function postInboxMessage(
     }
   } catch {
     // 网络 / DNS / TCP / TLS / abort → 静默
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Durable cron variant: await master persistence and surface transport/HTTP
+ * failures so CronScheduler retains the archived delivery outbox. A missing
+ * commercial config remains a personal-edition no-op and returns false. */
+export async function postInboxMessageDurable(
+  args: InboxMessageArgs & { deliveryKey: string },
+  opts: PostInboxOpts = {},
+): Promise<boolean> {
+  const config = opts.config !== undefined ? opts.config : readV3InboxPostConfig()
+  if (!config) return false
+  const fetcher = opts.fetcher ?? undiciRequest
+  const timeoutMs = opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS
+  const body = JSON.stringify({
+    title: cap(args.title, MAX_TITLE_CHARS),
+    bodyMd: cap(args.bodyMd, MAX_BODY_CHARS),
+    deliveryKey: args.deliveryKey,
+  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetcher(`${config.baseUrl}${INBOX_POST_PATH}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${config.bearer}`,
+      },
+      body,
+      signal: controller.signal,
+    })
+    const responseText = await readResponseBody(res.body as AsyncIterable<unknown>).catch(() => '')
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw new InboxPostDeliveryError(
+        `inbox master status ${res.statusCode}`,
+        res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429
+          ? 'INBOX_MASTER_UNAVAILABLE'
+          : 'INBOX_MASTER_REJECTED',
+        res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429,
+      )
+    }
+    try {
+      const parsed = JSON.parse(responseText) as { ok?: unknown; reason?: unknown }
+      if (parsed.ok === true || parsed.reason === 'duplicate') return true
+      if (parsed.reason === 'rate_limited') {
+        throw new InboxPostDeliveryError('inbox master rate limited', 'INBOX_RATE_LIMITED', true)
+      }
+    } catch (err) {
+      if (err instanceof InboxPostDeliveryError) throw err
+      throw new InboxPostDeliveryError('inbox master response invalid', 'INBOX_RESPONSE_INVALID', true)
+    }
+    throw new InboxPostDeliveryError('inbox master rejected delivery', 'INBOX_MASTER_REJECTED', false)
+  } catch (err) {
+    if (err instanceof InboxPostDeliveryError) throw err
+    throw new InboxPostDeliveryError('inbox master transport failed', 'INBOX_TRANSPORT_FAILED', true)
   } finally {
     clearTimeout(timer)
   }

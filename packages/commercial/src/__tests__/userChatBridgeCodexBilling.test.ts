@@ -46,6 +46,7 @@ import { signAccess } from "../auth/jwt.js";
 import {
   createUserChatBridge,
   BRIDGE_WS_PATH,
+  codexAbandonFailureCode,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
   type UserChatBridgeDeps,
@@ -72,6 +73,14 @@ import {
 } from "../billing/modelCatalog.js";
 
 const JWT_SECRET = "x".repeat(32);
+
+test("Codex abandon reasons map to stable failure-code families", () => {
+  assert.equal(codexAbandonFailureCode("bridge_disconnect_before_finalize"), "CLIENT_ABORT");
+  assert.equal(codexAbandonFailureCode("rewritten_frame_too_big"), "INVALID_REQUEST");
+  assert.equal(codexAbandonFailureCode("codex_billing_engine_session_id_invalid"), "INVALID_REQUEST");
+  assert.equal(codexAbandonFailureCode("container_forward_rejected"), "UPSTREAM_UNAVAILABLE");
+  assert.equal(codexAbandonFailureCode("sign_boundary_missing"), "INTERNAL_ERROR");
+});
 
 // M2 — billing 帧上的 engineSessionId(gateway engineSessionId(sessionKey) 的
 // 等价物;这里用 commercial 侧同算法 helper 派生,形状恒 oceng-<48hex>)。

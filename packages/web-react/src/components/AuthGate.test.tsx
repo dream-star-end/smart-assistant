@@ -24,6 +24,16 @@ function fill() {
 }
 
 describe("AuthGate — Turnstile gating", () => {
+  test("transient bootstrap failure exposes an explicit session recovery action", () => {
+    const retry = vi.fn();
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true}
+        error="登录状态恢复失败，请检查网络后重试" onRetrySession={retry} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "重试恢复登录状态" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
   test("bypass=true：无 widget，登录发占位 'bypass'（canary 行为不变）", () => {
     const onLogin = vi.fn();
     render(<AuthGate {...base} onLogin={onLogin} turnstileBypass={true} />);

@@ -146,9 +146,14 @@ import {
 } from './skillTrain.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
-import { CronScheduler, isUserInitiatedCronJob } from './cron.js'
+import {
+  CronScheduler,
+  cronDeliveryId,
+  deliverCronViaAdapter,
+  isUserInitiatedCronJob,
+} from './cron.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
-import { postInboxMessage } from './v3InboxPost.js'
+import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
@@ -1953,8 +1958,12 @@ export class Gateway {
     // Start cron scheduler for reflection jobs (L3)
     // Smart delivery: push to last active channel, fallback to all webchat clients
     const wechatProactiveCfg = readV3WechatProactiveConfig()
-    this.cron = new CronScheduler(config, this.sessions, async (text, job) => {
+    this.cron = new CronScheduler(config, this.sessions, async (text, job, delivery) => {
       const agentId = job.agent
+      const stableDeliveryId = delivery?.deliveryId ?? cronDeliveryId(
+        `${job.id}:${text}`,
+        Math.floor(Date.now() / 60_000),
+      )
       // ── 根治:主动微信投递(定时任务/提醒推送到微信)──
       // 对所有用户发起的提醒/定时任务(remind-/ccb-/未来入口),排除系统 heartbeat/reflection
       // (见 isUserInitiatedCronJob —— 反向排除系统,避免白名单漏掉 remind- 这类入口)。
@@ -1966,12 +1975,22 @@ export class Gateway {
         const result = await sendV3WechatProactive({
           config: wechatProactiveCfg,
           text,
-          // 分钟粒度稳定幂等键:同一 fire(同分钟)被重跑→同 outboundId→outbox UNIQUE 去重,
-          // 避免崩溃/重试窗口重复发微信(cron 调度本身也是分钟粒度去重)。
-          outboundId: `${job.id}.wxproactive.${Math.floor(Date.now() / 60000)}`,
-        }).catch(() => ({ kind: 'fallback', marked: false }) as const)
+          // Scheduler-owned occurrence key survives delayed outbox retries;
+          // master outbox UNIQUE makes an ACK-lost POST idempotent.
+          outboundId: stableDeliveryId,
+        })
         if (result.kind === 'delivered') return
-        if (result.marked) {
+        if (result.kind === 'failure' && result.retryable) {
+          throw Object.assign(new Error(result.code), {
+            code: result.code,
+            retryable: true,
+          })
+        }
+        // A permanent 4xx rejection proves master did not accept this
+        // occurrence, so continuing to web/inbox cannot duplicate a WeChat
+        // delivery. Ambiguous transport/5xx/invalid-response failures above
+        // must instead retain the cron outbox and retry the same delivery id.
+        if (result.kind === 'fallback' && result.marked) {
           deliverText = `⚠️ 微信因会话过期/未激活未送达(发条微信即可恢复推送)\n\n${text}`
         }
       }
@@ -2023,7 +2042,7 @@ export class Gateway {
         if (!delivered) {
           const adapter = this.channels.get(lastActive.channel)
           if (adapter) {
-            adapter.send(buildOut(lastActive.peerId, lastActive.sessionKey)).catch(() => {})
+            await deliverCronViaAdapter(adapter, buildOut(lastActive.peerId, lastActive.sessionKey))
             delivered = true
           }
         }
@@ -2033,7 +2052,7 @@ export class Gateway {
       if (!delivered && job.deliver && job.deliver !== 'local') {
         const adapter = this.channels.get(job.deliver)
         if (adapter) {
-          adapter.send(buildOut(job.deliverTarget?.peerId || '__cron__')).catch(() => {})
+          await deliverCronViaAdapter(adapter, buildOut(job.deliverTarget?.peerId || '__cron__'))
           delivered = true
         }
       }
@@ -2068,10 +2087,11 @@ export class Gateway {
       // delivered (delivered===true) to honor the "don't double-notify" UX rule;
       // bodyMd is the raw output, not the wechat-fallback-prefixed text.
       if (!delivered && broadcastSent === 0) {
-        void postInboxMessage({
+        await postInboxMessageDurable({
           title: job.label || 'AI定时任务结果',
           bodyMd: text,
-        }).catch(() => {})
+          deliveryKey: stableDeliveryId,
+        })
       }
     })
     this.cron.lastActiveChannel = this.lastActiveChannel
@@ -12112,9 +12132,9 @@ export class Gateway {
           ...(e.delegateAgentId ? { delegateAgentId: e.delegateAgentId } : {}),
           engineSessionId: e.engineSessionId,
           status: e.status,
+          ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
-          ...(e.errorReason ? { errorReason: e.errorReason } : {}),
           // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到
           // claude_accounts.quota_*。optional 字段缺省时自然不带。
           ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),

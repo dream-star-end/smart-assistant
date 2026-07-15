@@ -68,6 +68,7 @@ import {
 import {
   startInflightJournal,
   abortInflightJournal,
+  type JournalFailureCode,
 } from "../billing/proxyBilling.js";
 import {
   DURABLE_CODEX_RECOVERY_VERSION,
@@ -78,6 +79,7 @@ import {
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
@@ -967,7 +969,18 @@ interface CodexTurnSnapshot {
    * reservation;若 finalizer 已构造则直接委托其 fail(fail-after-commit 由
    * _done 守门 no-op)。幂等。
    */
-  abandon(reason: string): Promise<void>;
+  abandon(reason: string, failureCode?: JournalFailureCode): Promise<void>;
+}
+
+export function codexAbandonFailureCode(reason: string): JournalFailureCode {
+  if (reason.startsWith("bridge_disconnect_")) return "CLIENT_ABORT";
+  if (
+    reason === "rewritten_frame_too_big" ||
+    reason === "codex_billing_engine_session_id_invalid"
+  ) return "INVALID_REQUEST";
+  if (reason === "container_forward_rejected") return "UPSTREAM_UNAVAILABLE";
+  if (reason.startsWith("sign_boundary_")) return "INTERNAL_ERROR";
+  return "INTERNAL_ERROR";
 }
 
 export interface UserChatBridgeHandler {
@@ -2206,6 +2219,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
 
+    const recordBillingRecovery = (
+      requestId: string,
+      outcome: "pending" | "failed" | "recovered" | "abandoned",
+      snap?: Pick<CodexTurnSnapshot, "model" | "traceId">,
+      attempts = 1,
+    ): void => {
+      if (!deps.pgPool) return;
+      void recordProductFrictionEvent({
+        correlation: requestId,
+        userId: uid,
+        surface: "ws",
+        stage: "billing_recovery",
+        code: "USER_WS_DETACHED",
+        outcome,
+        attempts,
+        model: snap?.model ?? null,
+        traceId: snap?.traceId ?? null,
+      }, deps.pgPool).catch(() => {});
+    };
+
     // 注册到 registry,超额会踢老的。连接态信号只走 close code,**不发 turn 级 error 帧**
     // (曾经 kick/shutdown 共用"error 帧 + 4505",部署一次=全线会话钉红卡+误报连接数超限;
     // close code 语义拆分后前端按码分流:4505=提示关多余标签页,4509=静默重连+resume 续传)。
@@ -3203,7 +3236,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const accountIdForQuota = acquired !== null ? acquired.account_id : 0n;
 
               try {
-                await startInflightJournal(pgPool, {
+                const admitted = await startInflightJournal(pgPool, {
                   requestId,
                   userId: uid,
                   containerId: BigInt(cid),
@@ -3237,6 +3270,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         }),
                   },
                 });
+                if (!admitted) {
+                  turnLogCapture?.error("user-chat-bridge: request journal conflict", {
+                    requestId,
+                  });
+                  if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                    sendErrorFrame(userWs, "CODEX_BILLING", "journal unavailable");
+                    try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
+                  }
+                  await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                  releaseAcquiredSlotForFailure();
+                  return;
+                }
               } catch (err) {
                 turnLogCapture?.error("user-chat-bridge: startInflightJournal failed", {
                   requestId, err,
@@ -3255,6 +3300,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   pgPool,
                   requestId,
                   permanentCodexWaiverReason("bridge_disconnect_before_finalize"),
+                  "CLIENT_ABORT",
                 ).catch(() => {});
                 await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
                 releaseAcquiredSlotForFailure();
@@ -3307,12 +3353,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   snapState = { kind: "handle", handle };
                   return handle;
                 },
-                async abandon(reason: string): Promise<void> {
+                async abandon(
+                  reason: string,
+                  failureCode = codexAbandonFailureCode(reason),
+                ): Promise<void> {
                   if (snapState !== null) {
                     if (snapState.kind === "handle") {
                       // finalizer 已构造:委托其 fail(fail-after-commit 由 _done 守门,
                       // 已扣过费不会再 abort journal)。
-                      await snapState.handle.fail(reason);
+                      await snapState.handle.fail(reason, failureCode);
                       return;
                     }
                     await snapState.promise.catch(() => {});
@@ -3324,6 +3373,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         pgPool,
                         requestId,
                         permanentCodexWaiverReason(reason),
+                        failureCode,
                       );
                     } catch {
                       // journal abort 失败 — reconciler 会扫到 stuck inflight 兜底。
@@ -3742,7 +3792,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
       }
       // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,
-      // **绝不**透传给用户浏览器(用户不可见 billing,且帧含 errorReason 等内部串)。
+      // **绝不**透传给用户浏览器(用户不可见 billing,且帧含内部计费字段)。
       //
       // **必须在 userWs.readyState 检查之前**:
       //   - drain 期 userWs 已关(detachUserSide → unregister),但 inflightCodexTurns
@@ -3772,6 +3822,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               delegateAgentId?: unknown;
               engineSessionId?: unknown;
               status?: unknown;
+              terminalCode?: unknown;
               errorReason?: unknown;
               usage?: {
                 input_tokens?: number;
@@ -3817,9 +3868,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 : null;
             const codexStatus: "success" | "error" =
               billing.status === "error" ? "error" : "success";
-            const errorReason = typeof billing.errorReason === "string"
+            const legacyErrorReason = typeof billing.errorReason === "string"
               ? billing.errorReason
               : undefined;
+            const terminalCode = billing.terminalCode === "USER_CANCELLED" || billing.terminalCode === "CODEX_ERROR"
+              ? billing.terminalCode
+              : codexStatus === "error"
+                ? legacyErrorReason === "codex turn interrupted" ? "USER_CANCELLED" : "CODEX_ERROR"
+                : undefined;
             const u = billing.usage ?? {};
             // 防御性 number → 非负整数 BigInt:容器侧理论 emit 合法 number,但坏帧
             // (NaN / Infinity / 字符串 / 对象)若进来,raw `BigInt(Math.trunc(...))`
@@ -3863,7 +3919,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 engineSid,
                 engineSidRaw,
                 codexStatus,
-                errorReason,
+                terminalCode,
                 usage,
                 billingRl,
                 turnKey: billingTurnKey,
@@ -3933,13 +3989,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     err: (err as Error)?.message,
                   });
                 } finally {
+                  if (drainCause !== null) {
+                    recordBillingRecovery(reqId, "abandoned", snap, 2);
+                  }
                   expireCodexRouteToken(snap.codexRouteToken, "billing_engine_session_id_invalid");
                   checkDrainComplete();
                 }
               })();
               return;
             }
-            // codexStatus / errorReason / usage 解析已上移(主路径与跨桥 fallback 共用)。
+            // codexStatus / stable terminalCode / usage 解析已上移(主路径与跨桥 fallback 共用)。
             // fire-and-forget settle:Map 已 delete,duplicate 帧不会再触发;commit
             // 内部 _done 守门兜底防 finalCleanup 同时调 fail 时重复 debit。
             // M2:settle 收口 = codexFinalizer → settleUsageAndLedger → spendTwoBucket
@@ -3954,14 +4013,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   return;
                 }
                 const result = await finalizer.commit(
-                  usage, codexStatus, errorReason,
-                  {
+                  usage, codexStatus, {
                     turnKey: billingTurnKey,
                     parentTurnKey: billingParentTurnKey,
                     parentSessionId: billingParentSessionId,
                     delegateAgentId: billingDelegateAgentId,
+                    terminalCode,
                   },
                 );
+                if (drainCause !== null) {
+                  recordBillingRecovery(reqId, "recovered", snap, 2);
+                }
                 // 仅 debit > 0 才广播 cost_charged;0 token / 零输出免单 / 重入 /
                 // settle 失败 / commit-after-fail 合成 skipped(debitedCredits=null)
                 // 都不广播,避免前端误显示 ¥0 扣费条目。
@@ -4008,6 +4070,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   });
                 }
               } catch (err) {
+                if (drainCause !== null) {
+                  recordBillingRecovery(reqId, "failed", snap, 2);
+                }
                 billingLog?.error("user-chat-bridge: codex finalizer commit threw", {
                   err: (err as Error)?.message,
                 });
@@ -4455,10 +4520,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
       });
+      for (const [requestId, snap] of inflightCodexTurns) {
+        recordBillingRecovery(requestId, "pending", snap);
+      }
       drainTimer = setTimeout(() => {
         bridgeLog?.warn("user-chat-bridge: drain timeout", {
           leftover: inflightCodexTurns.size,
         });
+        for (const [requestId, snap] of inflightCodexTurns) {
+          recordBillingRecovery(requestId, "failed", snap);
+        }
         finalCleanup(drainCause ?? "client_close");
       }, readDrainBillingMs());
       drainTimer.unref?.();
@@ -4517,7 +4588,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       engineSid: string | null;
       engineSidRaw: unknown;
       codexStatus: "success" | "error";
-      errorReason: string | undefined;
+      terminalCode: "USER_CANCELLED" | "CODEX_ERROR" | undefined;
       usage: TokenUsage;
       billingRl: unknown;
       turnKey: string | null;
@@ -4610,7 +4681,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             const reopened = await pgPool.query(
               `UPDATE request_finalize_journal
-                  SET state='inflight', error_msg=NULL, final_credits=NULL, updated_at=NOW()
+                  SET state='inflight', error_msg=NULL, failure_code=NULL,
+                      final_credits=NULL, updated_at=NOW()
                 WHERE request_id=$1 AND user_id=$2 AND state='aborted'
                   AND NOT EXISTS (
                     SELECT 1 FROM usage_records ur
@@ -4650,6 +4722,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               pgPool,
               requestId,
               permanentCodexWaiverReason(reason),
+              codexAbandonFailureCode(reason),
             ).catch(() => {});
             await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
           };
@@ -4698,6 +4771,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 pgPool,
                 requestId,
                 permanentCodexWaiverReason("cross_bridge_authority_binding_invalid"),
+                "INTERNAL_ERROR",
               ).catch(() => {});
               await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
               return;
@@ -4807,16 +4881,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             authority: recoveredAuthority,
           });
           const result = await finalizer.commit(
-            frame.usage, frame.codexStatus, frame.errorReason,
-            {
+            frame.usage, frame.codexStatus, {
               turnKey: frame.turnKey,
               parentTurnKey: frame.parentTurnKey,
               parentSessionId: frame.parentSessionId,
               delegateAgentId: frame.delegateAgentId,
+              terminalCode: frame.terminalCode,
             },
           );
           // settle 已收口 → 后续同桥 duplicate 帧同步丢弃(与主路径簿记同构)。
           locallySettledCodexTurns.add(requestId);
+          recordBillingRecovery(requestId, "recovered", {
+            model,
+            traceId: ctxTraceId ?? requestId,
+          }, 2);
           billingLog?.info("user-chat-bridge: codex cross-bridge settle done (recovered turn billing)", {
             model,
             debitedCredits: result.debitedCredits?.toString() ?? null,
@@ -4862,6 +4940,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             requestId,
             err: (err as Error)?.message,
           });
+          recordBillingRecovery(requestId, "failed", undefined, 2);
         } finally {
           pendingJournalSettles.delete(requestId);
         }

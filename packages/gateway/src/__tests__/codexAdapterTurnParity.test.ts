@@ -481,8 +481,9 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     // 中断计费部分工作量(codex 已扣的 token 要上报)
     assert.equal(h.billing.length, 1);
     assert.equal(h.billing[0].status, "error");
+    assert.equal(h.billing[0].terminalCode, "USER_CANCELLED");
     assert.equal(h.billing[0].usage?.output_tokens, 4);
-    assert.ok(h.billing[0].errorReason?.includes("interrupted"));
+    assert.equal(Object.prototype.hasOwnProperty.call(h.billing[0], "errorReason"), false);
   });
 
   test("无活跃 turn / 无进程 → interrupt() = false", () => {
@@ -600,7 +601,7 @@ describe("CodexAdapter — billing 侧信道边界", () => {
     assert.equal(h.billing[0].turnKey, turnKey);
   });
 
-  test("buildCodexBillingEvent 纯函数:usage typeof 防御 + errorReason", () => {
+  test("buildCodexBillingEvent 纯函数:usage typeof 防御 + stable terminalCode", () => {
     const ev = buildCodexBillingEvent(
       {
         type: "result",
@@ -621,7 +622,8 @@ describe("CodexAdapter — billing 侧信道边界", () => {
       },
     );
     assert.equal(ev.status, "error");
-    assert.equal(ev.errorReason, "codex turn failed");
+    assert.equal(ev.terminalCode, "CODEX_ERROR");
+    assert.equal(Object.prototype.hasOwnProperty.call(ev, "errorReason"), false);
     assert.deepEqual(ev.usage, { input_tokens: 3, reasoning_output_tokens: 2 });
     assert.deepEqual(ev.rateLimits, { reset5h: "2026-01-01T00:00:00Z" }, "NaN util 必须拒收");
     assert.equal(ev.engineSessionId, "oceng-abc");

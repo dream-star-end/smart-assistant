@@ -51,7 +51,7 @@ const PUBLIC_CONFIG = okJson({
 
 // 启动静默续期(App boot):无 refresh cookie → 401。mock 必须显式处理本路径,否则
 // catch-all 的 200 空体/LOGIN_OK 会让 boot 自动进工作区,登录流用例找不到 Landing。
-const REFRESH_401 = errJson(401, { error: { code: 'UNAUTHENTICATED', message: '未登录' } })
+const REFRESH_401 = errJson(401, { error: { code: 'INVALID_REFRESH', message: '未登录' } })
 // 静默续期成功(自动登录用例):v5 refresh 仅回 access token,user 由 GET /api/me 拿。
 const REFRESH_OK = okJson({ access_token: 'tok-r', access_exp: 1234, remember: true })
 

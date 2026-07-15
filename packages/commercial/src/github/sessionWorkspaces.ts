@@ -14,6 +14,11 @@
  * 只在**行语义实际变化**时 bump(per Codex amendment),避免重复 PUT 同值刷版本号。
  */
 
+import {
+  classifyClientSessions,
+  type ClientSessionLifecycle,
+  type ClientSessionLifecycleRef,
+} from '@openclaude/storage'
 import type { Pool } from 'pg'
 
 export type GithubSelectionStatus = 'pending' | 'cloning' | 'ready' | 'failed' | 'cleared'
@@ -336,4 +341,86 @@ export async function clearAllSessionSelections(
     [userId, errorCode],
   )
   return res.rowCount ?? 0
+}
+
+export interface GithubWorkspaceSweeperHandle {
+  stop(): void
+  runNow(): Promise<{ timedOut: number; orphaned: number }>
+}
+
+/** Fail bounded clone attempts and clear selections whose master session was
+ * explicitly deleted. A selection may legitimately be created before the
+ * session row is materialized, so a merely missing row is not deletion proof.
+ * error_message is always erased; only stable error_code stays. */
+export function startGithubWorkspaceSweeper(
+  pool: Pool,
+  intervalMs = 5 * 60_000,
+  classify: (
+    refs: readonly ClientSessionLifecycleRef[],
+  ) => Promise<ClientSessionLifecycle[]> = classifyClientSessions,
+): GithubWorkspaceSweeperHandle {
+  let stopped = false
+  let cursor: { updatedAt: Date; userId: string; sessionId: string } | null = null
+  const runNow = async () => {
+    const timedOut = await pool.query(
+      `UPDATE github_session_workspaces
+          SET status='failed', error_code='workspace_timeout', error_message=NULL, updated_at=NOW()
+        WHERE status IN ('pending','cloning') AND updated_at < NOW()-interval '30 minutes'`,
+    )
+    const candidates = await pool.query<{ session_id: string; user_id: string; updated_at: Date }>(
+      `SELECT session_id,user_id::text AS user_id,updated_at
+         FROM github_session_workspaces
+        WHERE status<>'cleared'
+          AND ($1::timestamptz IS NULL
+               OR (updated_at,user_id,session_id) > ($1::timestamptz,$2::bigint,$3::text))
+        ORDER BY updated_at ASC,user_id ASC,session_id ASC
+        LIMIT 500`,
+      [cursor?.updatedAt.toISOString() ?? null, cursor?.userId ?? '0', cursor?.sessionId ?? ''],
+    )
+    if (candidates.rows.length === 500) {
+      const last = candidates.rows[candidates.rows.length - 1]!
+      cursor = { updatedAt: last.updated_at, userId: last.user_id, sessionId: last.session_id }
+    } else {
+      // End of keyspace: the next tick starts a fresh bounded cycle so rows
+      // created/updated behind the prior cursor are not skipped forever.
+      cursor = null
+    }
+    const lifecycleRefs = candidates.rows.map((row) => ({
+      sessionId: row.session_id,
+      // client_sessions is a shared storage namespace. Commercial users are
+      // stored as c:<uid>; github_session_workspaces intentionally keeps the
+      // numeric uid, so translate only at the lifecycle boundary.
+      userId: `c:${row.user_id}`,
+    }))
+    const lifecycles = await classify(lifecycleRefs)
+    const deletedKeys = new Set(
+      lifecycles
+        .filter((row) => row.state === 'deleted')
+        .map((row) => `${row.userId}\0${row.sessionId}`),
+    )
+    const deleted = candidates.rows.filter((row) =>
+      deletedKeys.has(`c:${row.user_id}\0${row.session_id}`))
+    let orphaned = 0
+    if (deleted.length > 0) {
+      const cleared = await pool.query(
+        `UPDATE github_session_workspaces g
+            SET status='cleared', error_code='session_deleted', error_message=NULL,
+                selection_version=selection_version+1, updated_at=NOW()
+           FROM unnest($1::text[], $2::bigint[]) AS dead(session_id,user_id)
+          WHERE g.session_id=dead.session_id AND g.user_id=dead.user_id
+            AND g.status<>'cleared'`,
+        [deleted.map((row) => row.session_id), deleted.map((row) => row.user_id)],
+      )
+      orphaned = cleared.rowCount ?? 0
+    }
+    return { timedOut: timedOut.rowCount ?? 0, orphaned }
+  }
+  const timer = setInterval(() => {
+    if (!stopped) void runNow().catch(() => {})
+  }, Math.max(60_000, intervalMs))
+  timer.unref?.()
+  return {
+    stop() { stopped = true; clearInterval(timer) },
+    runNow,
+  }
 }

@@ -18,7 +18,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { HttpError } from './util.js'
-import { setRefreshCookie } from './cookies.js'
+import { readRefreshCookie, setRefreshCookie } from './cookies.js'
 import {
   startLinuxdoOAuth,
   exchangeLinuxdoOAuth,
@@ -257,6 +257,7 @@ export async function handleLinuxdoCallback(
         userAgent: ctx.userAgent ?? undefined,
         bindIp: ctx.authBoundIp,
         allowCreate: allowRegSetting.value === true,
+        replaceRefreshToken: readRefreshCookie(req),
       },
     )
   } catch (err) {

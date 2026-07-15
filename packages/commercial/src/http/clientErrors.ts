@@ -1,24 +1,11 @@
 /**
- * POST /api/client-errors — 前端问题自动上报端点。
+ * POST /api/client-errors — bounded browser product-friction signals.
  *
- * 设计目标(2026-06-18):前台出现任何问题(全局 JS 异常 / unhandledrejection /
- * 接口失败 / 流式中断)时,浏览器 fire-and-forget 把上下文打到这里。后端**不入库**,
- * 而是用结构化 logger 落 journald —— 与上游 turn 日志同一条流,且把前端看到的
- * `traceId`(响应底部那串"请求ID")作为 top-level 字段打出来。这样运维 grep 一个
- * traceId 就能把"用户截图里的报错"与"master 这一轮的全链路日志"串起来,提升定位效率。
- *
- * 为什么不入库:
- *   - 错误上报天然高频/可突发,DB 表会被噪声淹没且需要 GC / admin 页面;
- *   - 真正的定位价值在"与现有 turn 日志同流、可按 traceId 关联",日志流已满足;
- *   - 若将来要做错误趋势统计,再单独加一张表 + admin tab(本期不做,见需求决策)。
- *
- * 安全:
- *   - 限流 clientErrors(30/min/IP):比 feedback(5/min)宽,因为一个坏页面会连发几条,
- *     但仍挡住脚本刷日志。前端侧另有签名节流(见 web/api.js reportClientError)。
- *   - 仅 Bearer 关联 uid(与 feedback 一致,cookie 关联会被 CSRF 误绑);匿名也接收。
- *   - 所有字段硬上限截断,绝不把超大 stack/meta 灌进日志。
+ * The legacy endpoint accepted message/stack/path/URL/UA and copied them to
+ * journald.  It now accepts stable classifications only and persists them in
+ * the recovery-aware table. Unknown/raw fields are ignored, so telemetry can
+ * never become a second copy of conversation or browser data.
  */
-
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readJsonBody, sendJson } from "./util.js";
 import {
@@ -28,25 +15,64 @@ import {
   type RequestContext,
 } from "./handlers.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
+import { recordProductFrictionEvent, type FrictionOutcome } from "../productFriction/events.js";
 
-/** 截断而不抛错:上报字段长度可能超限但语义无损,截断后照常落日志。 */
-function clampStr(v: unknown, max: number): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  if (!t) return null;
-  return t.length <= max ? t : t.slice(0, max);
+const SAFE_LOWER = /^[a-z0-9_]{1,48}$/;
+const SAFE_CODE = /^[A-Z0-9_]{1,64}$/;
+const OUTCOMES = new Set<FrictionOutcome>([
+  "pending", "failed", "recovered", "succeeded", "abandoned", "cancelled",
+]);
+
+function safeToken(value: unknown, max: number, pattern: RegExp): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > max) return null;
+  return pattern.test(value) ? value : null;
 }
 
-function clampInt(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : null;
+function safeId(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,96}$/.test(value) ? value : null;
 }
 
-/** traceId / requestId 形态守卫:只接受 alnum + - _,长度 ≤ 64,
- *  与 protocol/traceId.ts TRACE_ID_REGEX 及 commercial requestId 形态对齐。
- *  非法值丢弃(返回 null)而非截断,避免把垃圾当成关联键打进日志误导排查。 */
-function safeCorrelationId(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  return /^[A-Za-z0-9_-]{1,64}$/.test(v) ? v : null;
+export type NormalizedClientFrictionReport = Omit<
+  Parameters<typeof recordProductFrictionEvent>[0],
+  "userId"
+>;
+
+/** Reduce an untrusted browser body to the exact bounded telemetry schema.
+ * Raw message/stack/path/URL/UA and every unknown field are deliberately
+ * absent from the returned value. */
+export function normalizeClientFrictionReport(
+  body: Record<string, unknown>,
+  fallbackEventId: string,
+): NormalizedClientFrictionReport {
+  const surface = typeof body.surface === "string" && SAFE_LOWER.test(body.surface)
+    ? body.surface : "client";
+  const stageRaw = typeof body.stage === "string" ? body.stage : body.type;
+  const stage = typeof stageRaw === "string" && SAFE_LOWER.test(stageRaw)
+    ? stageRaw : "runtime";
+  const code = typeof body.code === "string" && SAFE_CODE.test(body.code)
+    ? body.code : "CLIENT_UNKNOWN";
+  const outcome = typeof body.outcome === "string" && OUTCOMES.has(body.outcome as FrictionOutcome)
+    ? body.outcome as FrictionOutcome : "failed";
+  const traceId = safeId(body.trace_id);
+  const sessionId = safeId(body.session_id);
+  return {
+    correlation: safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId,
+    surface,
+    stage,
+    code,
+    outcome,
+    attempts: typeof body.attempts === "number" ? body.attempts : 1,
+    latencyMs: typeof body.latency_ms === "number" ? body.latency_ms : null,
+    model: safeToken(body.model, 128, /^[A-Za-z0-9_.:+/-]+$/),
+    provider: safeToken(body.provider, 32, /^[a-z0-9_-]+$/),
+    clientBuild: safeToken(body.client_build, 64, /^[A-Za-z0-9._-]+$/),
+    browserFamily: safeToken(body.browser_family, 24, /^[a-z0-9_]+$/),
+    deviceClass: ["desktop", "mobile", "tablet", "unknown"].includes(String(body.device_class))
+      ? body.device_class as "desktop" | "mobile" | "tablet" | "unknown"
+      : "unknown",
+    traceId,
+    sessionId,
+  };
 }
 
 export async function handleClientErrorReport(
@@ -58,59 +84,35 @@ export async function handleClientErrorReport(
   const cfg = deps.rateLimits?.clientErrors ?? DEFAULT_RATE_LIMITS.clientErrors;
   await enforceRateLimit(deps, cfg, ctx.clientIp);
 
-  // 仅 Bearer 关联 user_id;匿名上报也接收(报错时可能 token 已失效)。
   const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
-  let uid: string | null = null;
-  if (authHeader) {
-    const claims = verifyCommercialJwtSync(authHeader, deps.jwtSecret);
-    if (claims) uid = claims.sub;
-  }
+  const claims = authHeader ? verifyCommercialJwtSync(authHeader, deps.jwtSecret) : null;
+  let userId: bigint | null = null;
+  if (claims && /^\d+$/.test(claims.sub)) userId = BigInt(claims.sub);
 
   const body = (await readJsonBody(req)) as Record<string, unknown> | undefined;
   if (!body || typeof body !== "object") {
-    // 上报端点对脏 body 宽容:不抛 400(否则前端上报失败又触发新一轮上报),
-    // 直接 200 吞掉。
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  // 前端看到的"请求ID" = master per-turn traceId;turn 无关的纯 JS 异常没有它。
-  const traceId = safeCorrelationId(body.trace_id);
-  // 接口失败时携带的 commercial proxy x-request-id(与 traceId 不同层,1:N)。
-  const reqId = safeCorrelationId(body.request_id);
-  const errType = clampStr(body.type, 48) ?? "unknown";
-  const name = clampStr(body.name, 128);
-  const message = clampStr(body.message, 2048) ?? "(no message)";
-  const stackHead = clampStr(body.stack, 4096);
-  const route = clampStr(body.route, 512);
-  const filename = clampStr(body.filename, 512);
-  const version = clampStr(body.version, 32);
-  const sessionId = clampStr(body.session_id, 64);
-  const userAgent =
-    clampStr(body.user_agent, 512) ?? clampStr(req.headers["user-agent"], 512);
-  const lineno = clampInt(body.lineno);
-  const colno = clampInt(body.colno);
+  const report = normalizeClientFrictionReport(body, ctx.requestId);
 
-  // 结构化日志:traceId / requestId 作为 top-level 关联键。ctx.log 已 child-bind 了
-  // 本次上报 HTTP 调用自己的 requestId(ensureRequestId),与用户侧 traceId 区分开。
-  // 用 warn 级:是真实信号(前端确实出问题了)但不是服务端 error,不污染 error 率告警;
-  // 运维按 msg tag "client_error_report" + traceId 过滤即可。
-  ctx.log.warn("client_error_report", {
-    uid,
-    ...(traceId ? { traceId } : {}),
-    ...(reqId ? { clientRequestId: reqId } : {}),
-    errType,
-    ...(name ? { errName: name } : {}),
-    message,
-    ...(route ? { route } : {}),
-    ...(filename ? { filename } : {}),
-    ...(lineno !== null ? { lineno } : {}),
-    ...(colno !== null ? { colno } : {}),
-    ...(version ? { clientVersion: version } : {}),
-    ...(sessionId ? { sessionId } : {}),
-    ...(userAgent ? { userAgent } : {}),
-    ...(stackHead ? { stackHead } : {}),
+  await recordProductFrictionEvent({
+    ...report,
+    userId,
+  }).catch(() => {
+    // Telemetry must never affect the user path; emit only the stable class.
+    ctx.log.warn("client_friction_persist_failed", {
+      surface: report.surface, stage: report.stage, code: report.code,
+    });
   });
 
+  ctx.log.warn("client_friction_report", {
+    uid: claims?.sub ?? null,
+    surface: report.surface,
+    stage: report.stage,
+    code: report.code,
+    outcome: report.outcome,
+  });
   sendJson(res, 200, { ok: true });
 }

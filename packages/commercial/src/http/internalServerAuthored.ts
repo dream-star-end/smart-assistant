@@ -518,6 +518,14 @@ export interface ServerAuthoredHandlerDeps {
    *  `reject_bad_body` / `reject_method`) where the body hasn't been parsed
    *  yet, and either 'thinking' or 'assistant' for per-row outcomes. */
   metric?: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
+  /** Stable, content-free product telemetry for the theoretically unreachable
+   * post-spill hard limit. Optional so personal/test callers remain unchanged. */
+  recordOversized?: (input: {
+    userId: bigint;
+    requestId: string;
+    sessionId: string | null;
+    role: V3SinkPersistRole | undefined;
+  }) => void;
 }
 
 /** Same ctx shape as `AnthropicProxyHandler` — derived by listener wiring. */
@@ -592,6 +600,12 @@ export function makeServerAuthoredHandler(
             },
             occurrenceDelta: 1,
           }).catch(() => {});
+          deps.recordOversized?.({
+            userId: BigInt(oversizedCtx.uid),
+            requestId,
+            sessionId: oversizedCtx.sessionId ?? null,
+            role: kind,
+          });
         }
       }
       baseMetric(outcome, kind);

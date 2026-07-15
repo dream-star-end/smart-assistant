@@ -277,6 +277,8 @@ export function App() {
     user,
     authLoading,
     authError,
+    authRecoveryAvailable,
+    retryBoot,
     booting,
     laneReady,
     login,
@@ -1509,6 +1511,7 @@ export function App() {
         onConfirmReset={confirmReset}
         loading={authLoading}
         error={authError}
+        onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
         onBack={() => {
           setAuthMode("login");
           setView("home");

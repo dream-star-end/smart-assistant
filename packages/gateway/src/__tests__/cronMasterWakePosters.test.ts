@@ -14,7 +14,11 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 
 import { postCronIndex, CRON_INDEX_PATH } from '../v3CronIndexPush.js'
-import { postInboxMessage, INBOX_POST_PATH } from '../v3InboxPost.js'
+import {
+  postInboxMessage,
+  postInboxMessageDurable,
+  INBOX_POST_PATH,
+} from '../v3InboxPost.js'
 
 const CONFIG = { baseUrl: 'http://master:18791', bearer: 'oc-v3.7.secret', agentId: 'main' }
 
@@ -125,6 +129,38 @@ describe('postInboxMessage — 离线兜底站内信', () => {
     }) as unknown as typeof import('undici').request
     await assert.doesNotReject(() =>
       postInboxMessage({ title: 't', bodyMd: 'b' }, { config: CONFIG, fetcher: throwing }),
+    )
+  })
+
+  test('durable inbox POST carries stable key and rejects transport failure', async () => {
+    const captured: Captured[] = []
+    const deliveryKey = `cron.${'a'.repeat(64)}`
+    const successFetcher = (async (url: string, init: any) => {
+      captured.push({ url, init })
+      return {
+        statusCode: 200,
+        headers: {},
+        body: Readable.from([Buffer.from('{"ok":true}', 'utf8')]),
+      }
+    }) as unknown as typeof import('undici').request
+    await assert.doesNotReject(() => postInboxMessageDurable(
+      { title: '定时任务结果', bodyMd: '正文内容', deliveryKey },
+      { config: CONFIG, fetcher: successFetcher },
+    ))
+    const body = JSON.parse(captured[0]!.init.body as string)
+    assert.equal(body.deliveryKey, deliveryKey)
+
+    const throwing = (async () => { throw new Error('master down') }) as unknown as typeof import('undici').request
+    await assert.rejects(
+      () => postInboxMessageDurable(
+        { title: '定时任务结果', bodyMd: '正文内容', deliveryKey },
+        { config: CONFIG, fetcher: throwing },
+      ),
+      (err: unknown) => (
+        err instanceof Error &&
+        (err as Error & { code?: string; retryable?: boolean }).code === 'INBOX_TRANSPORT_FAILED' &&
+        (err as Error & { retryable?: boolean }).retryable === true
+      ),
     )
   })
 })

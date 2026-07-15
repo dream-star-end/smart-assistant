@@ -3,7 +3,10 @@
 // packages/commercial/src/http/admin/modelOps.ts、admin/modelOps.ts)。
 
 export type UsageWindow = {
+  attempts: number;
   requests: number;
+  failures: number;
+  cancellations: number;
   input_tokens: string;
   output_tokens: string;
   cache_read_tokens: string;
@@ -63,7 +66,14 @@ export type ProviderData = {
   } | null;
   samples: Array<{ probed_at: string; latency_ms: number; ok: boolean }>;
   inflight_current: number;
-  usage_d1: { requests: number; tokens: string; credits: string };
+  usage_d1: {
+    attempts: number;
+    requests: number;
+    failures: number;
+    cancellations: number;
+    tokens: string;
+    credits: string;
+  };
 };
 
 export type ModelOpsResp = {

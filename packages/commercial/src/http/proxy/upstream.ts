@@ -561,7 +561,8 @@ function makeStaticKeyUpstream(
     sanitizeMessages(messages, _model, _log) {
       // 静态 key 文本 provider 的 text-only 非文本块 strip 在 handler(http/proxy/index.ts)
       // estimateInputTokens **之前**完成(否则历史里残留的大 base64 图会被静态 input cap
-      // 误判 413 + 高估 preCheck cost);到这里 messages 已 sanitized,故 noop 原样返回。
+      // 误判 413 + 高估 preCheck cost)。合法 thinking 可能是同 provider 上一轮
+      // 的签名证据，必须原样保留；只有上游明确返回签名错误时 core 才会用副本重试。
       return messages;
     },
     zeroizeSecrets() {
@@ -674,6 +675,9 @@ function makeOAuthPoolUpstream(
       }
     },
     sanitizeMessages(messages, model, log) {
+      // 长度/形状合法的 signed thinking 可能属于当前 OAuth provider/account，
+      // 首发必须保留。跨 provider/credential 的签名只在上游明确拒绝后由 core
+      // copy-on-write 剥离并重试一次，避免正常续聊无声丢掉推理上下文。
       const r = stripMalformedThinkingBlocks(messages);
       if (r.thinkingStripped + r.redactedThinkingStripped > 0) {
         log.warn("proxy_malformed_thinking_blocks_stripped", {
@@ -1084,7 +1088,9 @@ export async function pickUpstream(
 export async function releaseUpstreamSession(
   scheduler: Pick<AccountScheduler, "release">,
   session: PreparedUpstreamSession,
-  reason: { kind: "failure"; error: string },
+  reason:
+    | { kind: "failure"; error?: string | null }
+    | { kind: "client_error"; error?: string | null },
   log: Logger,
 ): Promise<void> {
   // accountId 与 slotId 同生死(OAuth 两者非 null;DeepSeek/MiniMax 两者 null)。

@@ -183,6 +183,8 @@ interface FakePoolOverride {
   failJournalInsert?: Error;
   /** 让 settleUsageAndLedger 的 BEGIN 抛错。 */
   failSettleBegin?: Error;
+  /** 跨请求共享的 journal request_id → owner uid；用于模拟真实 UNIQUE 冲突。 */
+  journalOwners?: Map<string, string>;
   /** 用户余额(分,默认 99_999_999 = 充足)。 */
   userCredits?: bigint;
   /** 注入 claude_accounts row;不注入则 SELECT a.id ... 返空(refreshAccountToken → account_not_found)。 */
@@ -212,6 +214,14 @@ function buildFakePool(override: FakePoolOverride = {}) {
 
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) {
       if (override.failJournalInsert) throw override.failJournalInsert;
+      if (override.journalOwners) {
+        const requestId = String(params[0]);
+        const userId = String(params[1]);
+        if (override.journalOwners.has(requestId)) {
+          return { rows: [], rowCount: 0 };
+        }
+        override.journalOwners.set(requestId, userId);
+      }
       return { rows: [], rowCount: 1 };
     }
     if (head.startsWith("UPDATE REQUEST_FINALIZE_JOURNAL")) {
@@ -219,6 +229,23 @@ function buildFakePool(override: FakePoolOverride = {}) {
     }
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) {
       return { rows: [{ id: "1" }], rowCount: 1 };
+    }
+    // preCheckWithCost → 个人钱包 + 当期套餐桶。
+    if (head.startsWith("SELECT U.CREDITS::TEXT AS WALLET")) {
+      const c = override.userCredits ?? 99_999_999n;
+      return { rows: [{ wallet: c.toString(), period: "0" }], rowCount: 1 };
+    }
+    // preCheckWithCost → 企业钱包；本基线默认用户不属于企业。
+    if (head.startsWith("SELECT (O.CREDITS + COALESCE(OS.PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
+    // settleUsageAndLedger → 解析企业归属；本基线默认无企业 membership。
+    if (head.startsWith("SELECT M.ORG_ID::TEXT AS ORG_ID")) {
+      return { rows: [], rowCount: 0 };
+    }
+    // spendTwoBucket → 个人期内桶；本基线默认无 active subscription。
+    if (head.startsWith("SELECT ID::TEXT AS ID, PERIOD_CREDITS::TEXT AS PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
     }
     // 兼容 getBalance 与 settleUsageAndLedger 的 select(SELECT credits::text AS credits)
     if (head.startsWith("SELECT CREDITS")) {
@@ -491,6 +518,13 @@ class MockRes {
     this.listeners.get(ev)!.push(cb);
     return this;
   }
+  once(ev: string, cb: (...a: unknown[]) => void): this {
+    const onceCb = (...args: unknown[]) => {
+      this.off(ev, onceCb);
+      cb(...args);
+    };
+    return this.on(ev, onceCb);
+  }
   off(ev: string, cb: (...a: unknown[]) => void): this {
     const arr = this.listeners.get(ev);
     if (arr) {
@@ -534,6 +568,9 @@ interface HarnessOpts {
   ) => Promise<{ status: number; body: string }>;
   /** appendCostCredits 自定义实现(覆盖默认 push events.persist)。 */
   appendCostCreditsImpl?: AnthropicProxyDeps["appendCostCredits"];
+  /** request-id 跨租户碰撞测试覆写；其它基线继续使用固定 uid/cid。 */
+  userId?: number;
+  containerId?: number;
 }
 
 const FIXED_USER_ID = 7;
@@ -546,10 +583,12 @@ const FIXED_PINNED_USER_ID = createHash("sha256")
   .digest("hex");
 
 function buildHarness(opts: HarnessOpts = {}) {
+  const userId = opts.userId ?? FIXED_USER_ID;
+  const containerId = opts.containerId ?? FIXED_CONTAINER_ID;
   const secretHex = makeSecretHex();
   const identityRepo = buildFakeIdentityRepo({
-    containerId: FIXED_CONTAINER_ID,
-    userId: FIXED_USER_ID,
+    containerId,
+    userId,
     secretHex,
     hostUuid: FIXED_HOST_UUID,
     boundIp: FIXED_BOUND_IP,
@@ -658,7 +697,7 @@ function buildHarness(opts: HarnessOpts = {}) {
   const handler = makeAnthropicProxyHandler(deps);
 
   const ctx: AnthropicProxyIdentityCtx = { hostUuid: FIXED_HOST_UUID, boundIp: FIXED_BOUND_IP };
-  const token = `oc-v3.${FIXED_CONTAINER_ID}.${secretHex}`;
+  const token = `oc-v3.${containerId}.${secretHex}`;
 
   async function run(
     body: Record<string, unknown>,
@@ -894,6 +933,55 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
       ["scheduler", "preCheck"],
       "stage (c) 顺序铁律:scheduler.release 必须先,preCheck release 后",
     );
+  });
+
+  test("(c admission) 同 UID 重放与跨 UID request-id 碰撞均在 fetch 前统一 409", async () => {
+    const requestId = "stable-replay-id";
+    const journalOwners = new Map<string, string>();
+    let ownerFetchCalls = 0;
+    const owner = buildHarness({
+      poolOverride: { journalOwners },
+      fetchImpl: async () => {
+        ownerFetchCalls++;
+        return sseResponse(200, makeFullSseChunks());
+      },
+    });
+
+    const first = await owner.run(minBody(), { "x-request-id": requestId });
+    assert.equal(first.statusCode, 200);
+    assert.equal(ownerFetchCalls, 1);
+    assert.equal(journalOwners.get(requestId), String(FIXED_USER_ID));
+
+    const sameUserReplay = await owner.run(minBody(), { "x-request-id": requestId });
+    assert.equal(sameUserReplay.statusCode, 409);
+    assert.equal(readErrCode(sameUserReplay), "REQUEST_ID_CONFLICT");
+    assert.equal(ownerFetchCalls, 1, "同用户重放不得再次调用上游 fetch");
+    assert.equal(owner.schedulerSpy.releaseCalls.at(-1)?.result.kind, "client_error");
+    assert.equal(owner.preCheckSpy.releaseCalls.length, 2, "原请求和重放的预扣都必须释放");
+
+    await resetPool();
+    let crossUserFetchCalls = 0;
+    const otherUser = buildHarness({
+      userId: 8,
+      containerId: 43,
+      poolOverride: { journalOwners },
+      fetchImpl: async () => {
+        crossUserFetchCalls++;
+        return sseResponse(200, makeFullSseChunks());
+      },
+    });
+    const crossUserCollision = await otherUser.run(minBody(), { "x-request-id": requestId });
+    assert.equal(crossUserCollision.statusCode, 409);
+    assert.equal(readErrCode(crossUserCollision), "REQUEST_ID_CONFLICT");
+    assert.equal(crossUserFetchCalls, 0, "跨用户碰撞不得调用上游 fetch");
+    assert.deepEqual(
+      crossUserCollision.bodyJson(),
+      sameUserReplay.bodyJson(),
+      "同用户重放与跨用户碰撞必须返回完全相同的非披露响应",
+    );
+    assert.equal(journalOwners.get(requestId), String(FIXED_USER_ID), "原 owner 不得被覆盖");
+    assert.equal(otherUser.schedulerSpy.releaseCalls.at(-1)?.result.kind, "client_error");
+    assert.equal(otherUser.preCheckSpy.releaseCalls.length, 1);
   });
 
   // (d) 正常 commit → finalize 接管,scheduler.release 一次,kind=success

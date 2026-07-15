@@ -2751,6 +2751,7 @@ describe('shutdown — token state cleared (PR1 v1.0.65 A.2)', () => {
       cache_creation_input_tokens: 0,
       reasoning_output_tokens: 0,
     })
+    assert.equal(result.billing_terminal_code, 'CODEX_ERROR')
     await h.runner.shutdown()
     assert.deepEqual(
       runner.priorTurnTotal,

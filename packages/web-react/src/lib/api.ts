@@ -54,6 +54,7 @@ import type {
   PutSessionInput,
   PutSessionResult,
   RefreshResult,
+  RefreshAttempt,
   RegisterResult,
   SessionArchivePage,
   SessionDetail,
@@ -97,6 +98,7 @@ import type {
   DeclarativeOauthStartResult,
 } from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
+import { reportClientFriction } from "./clientFriction";
 
 /**
  * v5 商业版前端网络层。
@@ -116,17 +118,157 @@ import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 // 否则多个请求会用同一个 refresh cookie 并发刷新，第二个携带已轮换的旧 cookie
 // 到后端会被判 reuse → 撤销整个 token family → 正常用户被踢下线。
 const refreshInFlight = new WeakMap<AuthSession, Promise<string | null>>();
+type RefreshSurface = "auth" | "admin_auth";
+type RefreshFrictionState = { id: string; code: string; attempts: number; surface: RefreshSurface };
+type RefreshFlight = { generation: number; promise: Promise<RefreshAttempt> };
+const refreshAttemptInFlight = new WeakMap<object, RefreshFlight>();
+const refreshFriction = new WeakMap<object, RefreshFrictionState>();
+const refreshGeneration = new WeakMap<object, number>();
+// The refresh token is one browser cookie, so every request that can rotate or
+// replace it must share one process-local mutex.  A generation guard can stop a
+// late response from mutating JavaScript state, but it cannot undo that
+// response's Set-Cookie header.  Serializing refresh/login/logout is therefore
+// required to prevent an old successful refresh from overwriting a new login
+// cookie (and to prevent a delayed logout from clearing it).
+let authCookieMutationTail: Promise<void> = Promise.resolve();
+
+function runLocalAuthCookieMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = authCookieMutationTail.catch(() => undefined).then(mutation);
+  authCookieMutationTail = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+function runAuthCookieMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  // Web Locks coordinates every same-origin tab/document. The local tail is
+  // the explicit compatibility fallback for engines without navigator.locks;
+  // the server additionally revokes the replaced cookie family on login, so a
+  // late legacy-tab Set-Cookie can never resume the prior identity.
+  const locks = typeof navigator !== "undefined"
+    ? (navigator as Navigator & { locks?: LockManager }).locks
+    : undefined;
+  if (locks?.request) {
+    return locks.request("openclaude-auth-cookie-v1", { mode: "exclusive" }, mutation);
+  }
+  return runLocalAuthCookieMutation(mutation);
+}
+
+/** End a refresh identity epoch (logout, clear-auth or a successful login as
+ * another account). A late old request is ignored and cannot recover an event
+ * under the next user's bearer token. */
+export function resetRefreshJourney(key: object): void {
+  refreshGeneration.set(key, (refreshGeneration.get(key) ?? 0) + 1);
+  refreshFriction.delete(key);
+}
+
+/**
+ * Every refresh entry point (REST 401 replay, page boot, admin boot and WS
+ * reconnect) shares one bounded journey per stable session object.  Keeping
+ * reporting outside the React hooks prevents a new call site from silently
+ * bypassing recovery telemetry again.
+ */
+export function refreshWithFriction(
+  key: object,
+  surface: RefreshSurface,
+  token?: string | null,
+): Promise<RefreshAttempt> {
+  const generation = refreshGeneration.get(key) ?? 0;
+  const existing = refreshAttemptInFlight.get(key);
+  if (existing?.generation === generation) return existing.promise;
+
+  let pending!: Promise<RefreshAttempt>;
+  const run = async (): Promise<RefreshAttempt> => {
+    const refreshed = await runAuthCookieMutation(() => api.refresh());
+    if ((refreshGeneration.get(key) ?? 0) !== generation) {
+      // Identity epoch changed while the cookie request was in flight. This is
+      // neither invalid credentials nor a recoverable event for the new user.
+      return {
+        kind: "stale",
+        attempts: refreshed.attempts ?? 1,
+        ...(refreshed.raceObserved ? { raceObserved: true } : {}),
+      };
+    }
+    const prior = refreshFriction.get(key);
+    if (refreshed.kind === "success") {
+      if (prior || refreshed.recoveredRace || refreshed.raceObserved) {
+        reportClientFriction({
+          eventId: prior?.id,
+          surface: prior?.surface ?? surface,
+          stage: "refresh",
+          code: prior?.code ?? "REFRESH_RACE",
+          outcome: "recovered",
+          attempts: (prior?.attempts ?? 0) + (refreshed.attempts ?? 1),
+        }, refreshed.result.accessToken);
+      }
+      refreshFriction.delete(key);
+      return refreshed;
+    }
+    if (refreshed.kind === "invalid") {
+      refreshFriction.delete(key);
+      return refreshed;
+    }
+    const code = prior?.code ??
+      (refreshed.kind === "race" || refreshed.raceObserved ? "REFRESH_RACE" : "REFRESH_TRANSIENT");
+    const attempts = (prior?.attempts ?? 0) + (refreshed.attempts ?? 1);
+    const eventId = reportClientFriction({
+      eventId: prior?.id,
+      surface: prior?.surface ?? surface,
+      stage: "refresh",
+      code,
+      outcome: "failed",
+      attempts,
+    }, token);
+    refreshFriction.set(key, { id: eventId, code, attempts, surface: prior?.surface ?? surface });
+    return refreshed;
+  };
+  // A reset never drops an outstanding cookie rotation request. The next
+  // identity epoch queues behind it, preventing old/new refresh requests from
+  // overlapping and tripping refresh-token reuse detection.
+  pending = (existing
+    ? existing.promise.catch(() => ({ kind: "stale" as const })).then(run)
+    : run()
+  ).finally(() => {
+    if (refreshAttemptInFlight.get(key)?.promise === pending) {
+      refreshAttemptInFlight.delete(key);
+    }
+  });
+  refreshAttemptInFlight.set(key, { generation, promise: pending });
+  return pending;
+}
+
+/** Replace the refresh-cookie identity only after every earlier rotation has
+ * finished applying its response headers. */
+export function loginWithCookieSerialization(
+  key: object,
+  email: string,
+  password: string,
+  turnstileToken?: string,
+): Promise<LoginResult> {
+  resetRefreshJourney(key);
+  return runAuthCookieMutation(() => api.login(email, password, turnstileToken));
+}
+
+/** Revoke the refresh cookie in request order.  Callers may clear local UI
+ * state immediately; a later login in this page still waits for this request. */
+export function logoutWithCookieSerialization(key: object): Promise<void> {
+  resetRefreshJourney(key);
+  return runAuthCookieMutation(() => api.logout());
+}
 
 function refreshOnce(a: AuthSession): Promise<string | null> {
   let pending = refreshInFlight.get(a);
   if (!pending) {
     pending = (async () => {
-      const refreshed = await api.refresh();
-      if (refreshed) {
-        a.setToken(refreshed.accessToken);
-        return refreshed.accessToken;
+      const refreshed = await refreshWithFriction(a, "auth", a.getToken());
+      if (refreshed.kind === "success") {
+        a.setToken(refreshed.result.accessToken);
+        return refreshed.result.accessToken;
       }
-      a.onExpired();
+      // Only a definitive invalid/missing refresh credential tears down auth.
+      // A second tab race, network failure or 5xx keeps the in-memory session so
+      // the next request/reconnect can recover naturally.
+      if (refreshed.kind === "invalid") {
+        a.onExpired();
+      }
       return null;
     })().finally(() => refreshInFlight.delete(a));
     refreshInFlight.set(a, pending);
@@ -589,22 +731,55 @@ export const api = {
   /**
    * 静默刷新（POST /api/auth/refresh）：无 body、无 Authorization，仅凭同源 HttpOnly refresh
    * cookie 换新 access token。浏览器在同源 fetch 上自动带 Origin（满足后端 CSRF 校验）。
-   * v5 仅回 access token（不回 user）。200 返回解析体，否则 null。
+   * v5 仅回 access token（不回 user）。多 tab 轮换竞态短延迟重试一次；
+   * 确定失效与临时故障使用不同结果，调用方不得把后者误当登出。
    * 该调用绝不经 callWithRefresh 包装，避免 401 时自我递归。
    */
-  async refresh(): Promise<RefreshResult | null> {
-    try {
-      const res = await fetch("/api/auth/refresh", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json" },
-      });
-      if (!res.ok) return null;
-      const b = (await res.json()) as { access_token: string; access_exp: number; remember: boolean };
-      return { accessToken: b.access_token, accessExp: b.access_exp, remember: b.remember };
-    } catch {
-      return null;
-    }
+  async refresh(): Promise<RefreshAttempt> {
+    const attempt = async (): Promise<RefreshAttempt> => {
+      let res: Response;
+      try {
+        res = await fetch("/api/auth/refresh", {
+          method: "POST",
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+      } catch {
+        return { kind: "transient" };
+      }
+      if (res.ok) {
+        try {
+          const b = (await res.json()) as { access_token: string; access_exp: number; remember: boolean };
+          if (typeof b.access_token !== "string" || b.access_token.length === 0) {
+            return { kind: "transient", status: res.status };
+          }
+          return {
+            kind: "success",
+            result: { accessToken: b.access_token, accessExp: b.access_exp, remember: b.remember },
+          };
+        } catch {
+          return { kind: "transient", status: res.status };
+        }
+      }
+      let code = "";
+      try {
+        const body = (await res.json()) as { error?: { code?: unknown } };
+        if (typeof body?.error?.code === "string") code = body.error.code;
+      } catch {
+        // A non-JSON gateway failure is temporary, not proof of logout.
+      }
+      if (code === "REFRESH_RACE") return { kind: "race" };
+      if (code === "INVALID_REFRESH" || code === "VALIDATION") return { kind: "invalid" };
+      return { kind: "transient", status: res.status };
+    };
+
+    const first = await attempt();
+    if (first.kind !== "race") return { ...first, attempts: 1 };
+    await sleep(180);
+    const second = await attempt();
+    return second.kind === "success"
+      ? { ...second, recoveredRace: true, raceObserved: true, attempts: 2 }
+      : { ...second, raceObserved: true, attempts: 2 };
   },
 
   /** 主动登出（POST /api/auth/logout）：吊销 refresh cookie。错误一律吞掉（前端清状态即视为已登出）。 */

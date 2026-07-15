@@ -9,6 +9,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { classifyClientSessions } from "@openclaude/storage";
 import { sendJson } from "../util.js";
 import { HttpError } from "../util.js";
 import { requireAdmin } from "../../admin/requireAdmin.js";
@@ -198,5 +199,209 @@ export async function handleAdminTraceLookup(
       model: row.model,
       created_at: row.created_at.toISOString(),
     },
+  });
+}
+
+// ─── GET /api/admin/product-friction — recovery-aware product signals ─────
+
+type GithubFrictionRow = {
+  status: string;
+  code: string;
+  selections: string;
+  affected_users: string;
+  stale: string;
+  deleted_session: string;
+  missing_session: string;
+};
+
+async function listGithubFriction(): Promise<GithubFrictionRow[]> {
+  const [base, refs] = await Promise.all([
+    query<Omit<GithubFrictionRow, "deleted_session" | "missing_session">>(
+      `SELECT status, COALESCE(error_code,'NONE') AS code,
+              COUNT(*)::text selections, COUNT(DISTINCT user_id)::text affected_users,
+              COUNT(*) FILTER (WHERE status IN ('pending','cloning')
+                                AND updated_at < NOW()-interval '30 minutes')::text stale
+         FROM github_session_workspaces
+        GROUP BY status,COALESCE(error_code,'NONE') ORDER BY status,code`,
+    ),
+    query<{ status: string; code: string; session_id: string; user_id: string }>(
+      `SELECT status,COALESCE(error_code,'NONE') AS code,session_id,user_id::text AS user_id
+         FROM github_session_workspaces`,
+    ),
+  ]);
+  const lifecycle = await classifyClientSessions(refs.rows.map((row) => ({
+    sessionId: row.session_id,
+    userId: `c:${row.user_id}`,
+  })));
+  const deleted = new Map<string, number>();
+  const missing = new Map<string, number>();
+  for (let i = 0; i < refs.rows.length; i++) {
+    const key = `${refs.rows[i]!.status}:${refs.rows[i]!.code}`;
+    const state = lifecycle[i]?.state;
+    if (state === "deleted") deleted.set(key, (deleted.get(key) ?? 0) + 1);
+    if (state === "missing") missing.set(key, (missing.get(key) ?? 0) + 1);
+  }
+  return base.rows.map((row) => ({
+    ...row,
+    deleted_session: String(deleted.get(`${row.status}:${row.code}`) ?? 0),
+    missing_session: String(missing.get(`${row.status}:${row.code}`) ?? 0),
+  }));
+}
+
+export async function handleAdminProductFriction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const [events, models, modelFailures, images, imageAttempts, orders, github, ratings] = await Promise.all([
+    query<{
+      surface: string; stage: string; code: string; journeys_1d: string; journeys_7d: string;
+      attempts_1d: string; attempts_7d: string; failed_7d: string; recovered_7d: string;
+      pending_7d: string; affected_users_7d: string;
+    }>(
+      `SELECT surface, stage, code,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours')::text journeys_1d,
+              COUNT(*)::text journeys_7d,
+              COALESCE(SUM(attempts) FILTER (WHERE created_at > NOW()-interval '24 hours'),0)::text attempts_1d,
+              COALESCE(SUM(attempts),0)::text attempts_7d,
+              COUNT(*) FILTER (WHERE outcome IN ('failed','abandoned'))::text failed_7d,
+              COUNT(*) FILTER (WHERE outcome IN ('recovered','succeeded'))::text recovered_7d,
+              COUNT(*) FILTER (WHERE outcome='pending')::text pending_7d,
+              COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL)::text affected_users_7d
+         FROM product_friction_events
+        WHERE created_at > NOW()-interval '7 days'
+        GROUP BY surface, stage, code
+        ORDER BY COUNT(*) FILTER (WHERE outcome IN ('failed','abandoned')) DESC, COUNT(*) DESC
+        LIMIT 100`,
+    ),
+    query<{
+      model: string; attempts_1d: string; success_1d: string; failures_1d: string; cancellations_1d: string;
+      attempts_7d: string; success_7d: string; failures_7d: string; cancellations_7d: string;
+    }>(
+      `WITH classified AS (
+         SELECT rfj.created_at,
+                COALESCE(rfj.ctx->>'model',ur.model,'unknown') AS model,
+                CASE
+                  WHEN (rfj.state='aborted'
+                         AND rfj.failure_code IN ('CLIENT_ABORT','USER_CANCELLED'))
+                    OR (rfj.state='committed'
+                         AND ur.price_snapshot->>'codex_terminal_code'='USER_CANCELLED')
+                    THEN 'cancelled'
+                  WHEN rfj.state='committed'
+                    AND ur.id IS NOT NULL
+                    AND ur.status='success'
+                    AND COALESCE(ur.output_tokens,0)>0
+                    AND COALESCE(ur.price_snapshot->>'codex_status','success')<>'error'
+                    AND COALESCE(ur.price_snapshot->>'waived','')<>'no_output' THEN 'success'
+                  ELSE 'failure'
+                END AS terminal_outcome
+           FROM request_finalize_journal rfj
+           LEFT JOIN usage_records ur ON ur.id=rfj.usage_id
+          WHERE rfj.created_at > NOW()-interval '7 days'
+            AND rfj.state IN ('committed','aborted')
+       )
+       SELECT model,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours')::text attempts_1d,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours' AND terminal_outcome='success')::text success_1d,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours' AND terminal_outcome='failure')::text failures_1d,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours' AND terminal_outcome='cancelled')::text cancellations_1d,
+              COUNT(*)::text attempts_7d,
+              COUNT(*) FILTER (WHERE terminal_outcome='success')::text success_7d,
+              COUNT(*) FILTER (WHERE terminal_outcome='failure')::text failures_7d,
+              COUNT(*) FILTER (WHERE terminal_outcome='cancelled')::text cancellations_7d
+         FROM classified
+        GROUP BY model
+        ORDER BY COUNT(*) FILTER (WHERE terminal_outcome='failure') DESC, COUNT(*) DESC`,
+    ),
+    query<{
+      model: string; code: string; failures_1d: string; failures_7d: string; affected_users_7d: string;
+    }>(
+      `WITH failures AS (
+         SELECT rfj.created_at,rfj.user_id,
+                COALESCE(rfj.ctx->>'model',ur.model,'unknown') AS model,
+                CASE
+                  WHEN rfj.state='aborted' THEN COALESCE(rfj.failure_code,'UNKNOWN')
+                  WHEN ur.price_snapshot->>'codex_status'='error' THEN 'CODEX_ERROR'
+                  WHEN ur.price_snapshot->>'waived'='no_output'
+                    OR (ur.status='success' AND COALESCE(ur.output_tokens,0)=0) THEN 'NO_OUTPUT'
+                  WHEN ur.id IS NULL THEN 'MISSING_USAGE'
+                  WHEN ur.status='billing_failed' THEN 'BILLING_PARTIAL'
+                  WHEN ur.status='error' THEN 'USAGE_ERROR'
+                  ELSE 'UNKNOWN'
+                END AS code
+           FROM request_finalize_journal rfj
+           LEFT JOIN usage_records ur ON ur.id=rfj.usage_id
+          WHERE rfj.created_at > NOW()-interval '7 days'
+            AND rfj.state IN ('committed','aborted')
+            AND (rfj.state='aborted'
+                 AND COALESCE(rfj.failure_code,'UNKNOWN') IN ('CLIENT_ABORT','USER_CANCELLED')) IS NOT TRUE
+            AND (rfj.state='committed'
+                 AND COALESCE(ur.price_snapshot->>'codex_terminal_code','')='USER_CANCELLED') IS NOT TRUE
+            AND (
+              rfj.state='committed' AND ur.id IS NOT NULL AND ur.status='success'
+              AND COALESCE(ur.output_tokens,0)>0
+              AND COALESCE(ur.price_snapshot->>'codex_status','success')<>'error'
+              AND COALESCE(ur.price_snapshot->>'waived','')<>'no_output'
+            ) IS NOT TRUE
+       )
+       SELECT model,code,
+              COUNT(*) FILTER (WHERE created_at > NOW()-interval '24 hours')::text failures_1d,
+              COUNT(*)::text failures_7d,
+              COUNT(DISTINCT user_id)::text affected_users_7d
+         FROM failures GROUP BY model,code
+        ORDER BY COUNT(*) DESC,model,code`,
+    ),
+    query<{ status: string; code: string; records: string; affected_users: string }>(
+      `SELECT status,code,COUNT(*)::text records,
+              COUNT(DISTINCT user_id)::text affected_users
+         FROM (
+           SELECT status,user_id,
+                  CASE WHEN error_code IS NULL THEN 'NONE'
+                       WHEN UPPER(error_code) ~ '^IMAGE_' THEN UPPER(error_code)
+                       ELSE 'IMAGE_' || UPPER(error_code) END AS code
+             FROM image_generation_usage_records
+            WHERE updated_at > NOW()-interval '7 days'
+         ) image_journeys
+        GROUP BY status,code ORDER BY status,code`,
+    ),
+    query<{ outcome: string; code: string; attempts_1d: string; attempts_7d: string; affected_users_7d: string }>(
+      `SELECT outcome,COALESCE(error_code,'NONE') AS code,
+              COUNT(*) FILTER (WHERE started_at > NOW()-interval '24 hours')::text attempts_1d,
+              COUNT(*)::text attempts_7d,
+              COUNT(DISTINCT user_id)::text affected_users_7d
+         FROM image_generation_attempts
+        WHERE started_at > NOW()-interval '7 days'
+        GROUP BY outcome,COALESCE(error_code,'NONE') ORDER BY outcome,code`,
+    ),
+    query<{ status: string; orders: string; affected_users: string; amount_cents: string }>(
+      `SELECT status, COUNT(*)::text orders, COUNT(DISTINCT user_id)::text affected_users,
+              COALESCE(SUM(amount_cents),0)::text amount_cents
+         FROM orders WHERE created_at > NOW()-interval '30 days'
+        GROUP BY status ORDER BY status`,
+    ),
+    listGithubFriction(),
+    query<{ rating: string; ratings: string; affected_users: string; missing_reason: string; missing_trace: string }>(
+      `SELECT rating, COUNT(*)::text ratings, COUNT(DISTINCT user_id)::text affected_users,
+              COUNT(*) FILTER (WHERE rating='down' AND (cardinality(tags)=0 OR tags=ARRAY['未说明原因']::text[])
+                                AND COALESCE(BTRIM(comment),'')='')::text missing_reason,
+              COUNT(*) FILTER (WHERE trace_id IS NULL)::text missing_trace
+         FROM response_rating WHERE created_at > NOW()-interval '30 days'
+        GROUP BY rating ORDER BY rating`,
+    ),
+  ]);
+
+  sendJson(res, 200, {
+    generated_at: new Date().toISOString(),
+    windows: { operational_days: 7, funnel_days: 30 },
+    events: events.rows,
+    models: models.rows,
+    model_failures: modelFailures.rows,
+    images: images.rows,
+    image_attempts: imageAttempts.rows,
+    orders: orders.rows,
+    github,
+    ratings: ratings.rows,
   });
 }
