@@ -100,4 +100,38 @@ describe('browser chat history projection', () => {
     assert.equal((first[0]!._historyProjection as HistoryProjection).kind, 'checkpoint')
     assert.equal((first[1]!._historyProjection as HistoryProjection).kind, 'bash-tail')
   })
+
+  test('tail ids stay collision-free and invalid routing ids become checkpoints', () => {
+    const exact = [
+      runtime('plain-surrogate-token', 1, 'tape-a', {
+        type: 'system', subtype: 'bash_output_tail', tool_use_id: 'tool-uD800',
+        tail: 'a', total_bytes: 1,
+      }),
+      runtime('plain-replacement-token', 2, 'tape-b', {
+        type: 'system', subtype: 'bash_output_tail', tool_use_id: 'tool-uFFFD',
+        tail: 'b', total_bytes: 2,
+      }),
+      runtime('numeric-id', 3, 'tape-c', {
+        type: 'system', subtype: 'bash_output_tail', tool_use_id: 123,
+        tail: 'ignored', total_bytes: 3,
+      }),
+      runtime('invalid-parent', 4, 'tape-d', {
+        type: 'system', subtype: 'bash_output_tail', tool_use_id: 'tool-valid',
+        parent_tool_use_id: { nested: true }, tail: 'ignored', total_bytes: 4,
+      }),
+      runtime('backslash-id', 5, 'tape-e', {
+        type: 'system', subtype: 'bash_output_tail', tool_use_id: String.raw`tool-\u0000`,
+        tail: 'ignored', total_bytes: 5,
+      }),
+    ]
+
+    const chat = projectClientSessionMessagesForChat(exact)
+    const patches = chat.flatMap((message) => {
+      const projection = message._historyProjection as HistoryProjection | undefined
+      return projection?.kind === 'bash-tail' ? [projection] : []
+    })
+    assert.deepEqual(patches.map((patch) => patch.toolUseId).sort(), ['tool-uD800', 'tool-uFFFD'])
+    assert.equal(chat.filter((message) =>
+      (message._historyProjection as HistoryProjection | undefined)?.kind === 'checkpoint').length, 3)
+  })
 })

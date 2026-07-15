@@ -752,28 +752,61 @@ async function hydrateTurnTapeMessages(
   const chatTailRows = !exact
     ? (
         await pool.query<HydratedTapeRow>(
-          `WITH parsed AS (
-             SELECT r.*, t.tape_sha256, t.created_at AS tape_created_at,
-                    convert_from(r.payload, 'UTF8')::jsonb AS body
+          `WITH candidates AS MATERIALIZED (
+             SELECT r.*, t.tape_sha256, t.created_at AS tape_created_at
                FROM client_session_turn_tape_records r
                JOIN client_session_turn_tapes t
                  ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
               WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
                 AND r.role='runtime-event'
-           ), ranked AS (
+                AND position(convert_to('"subtype":"bash_output_tail"', 'UTF8') in r.payload)>0
+           ), parsed AS (
+             SELECT candidates.*,
+                    regexp_replace(
+                      regexp_replace(
+                        convert_from(payload, 'UTF8'),
+                        '(?<=\\\\)u0000', 'uFFFD', 'g'
+                      ),
+                      '(?<=\\\\)u[dD][89a-fA-F][0-9a-fA-F]{2}', 'uFFFD', 'g'
+                    )::jsonb AS body
+               FROM candidates
+           ), eligible AS (
              SELECT parsed.*,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY body #>> '{_runtimeEvent,parent_tool_use_id}',
-                                   body #>> '{_runtimeEvent,tool_use_id}'
-                      ORDER BY
-                        CASE WHEN jsonb_typeof(body #> '{_runtimeEvent,total_bytes}')='number'
-                             THEN (body #>> '{_runtimeEvent,total_bytes}')::numeric ELSE 0 END DESC,
-                        ts DESC, tape_created_at DESC, ordinal DESC, tape_id DESC, msg_id DESC
-                    ) AS winner
+                    COALESCE(body #>> '{_runtimeEvent,parent_tool_use_id}', '') AS parent_tool_use_id,
+                    body #>> '{_runtimeEvent,tool_use_id}' AS tool_use_id,
+                    GREATEST(
+                      CASE WHEN jsonb_typeof(body #> '{_runtimeEvent,total_bytes}')='number'
+                           THEN (body #>> '{_runtimeEvent,total_bytes}')::numeric ELSE 0 END,
+                      0
+                    ) AS projected_total_bytes
                FROM parsed
-              WHERE body #>> '{_runtimeEvent,type}'='system'
+              WHERE jsonb_typeof(body #> '{_runtimeEvent,type}')='string'
+                AND body #>> '{_runtimeEvent,type}'='system'
+                AND jsonb_typeof(body #> '{_runtimeEvent,subtype}')='string'
                 AND body #>> '{_runtimeEvent,subtype}'='bash_output_tail'
-                AND COALESCE(body #>> '{_runtimeEvent,tool_use_id}', '') <> ''
+                AND jsonb_typeof(body #> '{_runtimeEvent,tool_use_id}')='string'
+                AND body #>> '{_runtimeEvent,tool_use_id}' ~ '^[A-Za-z0-9_-]+$'
+                AND (
+                  body #> '{_runtimeEvent,parent_tool_use_id}' IS NULL
+                  OR body #> '{_runtimeEvent,parent_tool_use_id}'='null'::jsonb
+                  OR (
+                    jsonb_typeof(body #> '{_runtimeEvent,parent_tool_use_id}')='string'
+                    AND (
+                      body #>> '{_runtimeEvent,parent_tool_use_id}'=''
+                      OR body #>> '{_runtimeEvent,parent_tool_use_id}' ~ '^[A-Za-z0-9_-]+$'
+                    )
+                  )
+                )
+           ), ranked AS (
+             SELECT eligible.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY parent_tool_use_id, tool_use_id
+                      ORDER BY
+                        projected_total_bytes DESC,
+                        ts DESC NULLS LAST, tape_created_at DESC NULLS LAST,
+                        ordinal DESC, tape_id DESC, msg_id DESC
+                    ) AS winner
+               FROM eligible
            )
            SELECT tape_id, tape_sha256, msg_id, ordinal, role,
                   content_sha256, payload, '0'::text AS cost_credits,
