@@ -50,18 +50,24 @@ export function utilTone(current: number, limit: number): { pct: number; tone: T
 
 /** 模型 24h 用量一行:"N 请求 · X tok · Y 积分"(tokens = in+out 自加)。 */
 export function usageLine(
-  u: { requests: number; input_tokens: string; output_tokens: string; credits: string } | null | undefined,
+  u: {
+    attempts?: number; requests: number; failures?: number; cancellations?: number;
+    input_tokens: string; output_tokens: string; credits: string;
+  } | null | undefined,
 ): string {
   if (!u) return "—";
   const tokens = Number(u.input_tokens ?? 0) + Number(u.output_tokens ?? 0);
-  return `${fmtCompactNum(u.requests)} 请求 · ${fmtCompactNum(tokens)} tok · ${fmtCompactNum(u.credits)} 积分`;
+  return `${fmtCompactNum(u.requests)}/${fmtCompactNum(u.attempts ?? u.requests)} 成功/尝试 · ${fmtCompactNum(u.failures ?? 0)} 失败 · ${fmtCompactNum(u.cancellations ?? 0)} 取消 · ${fmtCompactNum(tokens)} tok · ${fmtCompactNum(u.credits)} 积分`;
 }
 
 /** 服务商 24h 用量一行(tokens 后端已合计为字符串)。 */
 export function providerUsageLine(u: {
+  attempts?: number;
   requests: number;
+  failures?: number;
+  cancellations?: number;
   tokens: string;
   credits: string;
 }): string {
-  return `24h: ${fmtCompactNum(u.requests)} 请求 · ${fmtCompactNum(u.tokens)} tokens · ${fmtCompactNum(u.credits)} 积分`;
+  return `24h: ${fmtCompactNum(u.requests)}/${fmtCompactNum(u.attempts ?? u.requests)} 成功/尝试 · ${fmtCompactNum(u.failures ?? 0)} 失败 · ${fmtCompactNum(u.cancellations ?? 0)} 取消 · ${fmtCompactNum(u.tokens)} tokens · ${fmtCompactNum(u.credits)} 积分`;
 }

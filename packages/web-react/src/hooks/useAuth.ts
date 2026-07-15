@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { useLaneGate } from "./useLaneGate";
 
@@ -66,6 +67,8 @@ export type UseAuth = {
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   authLoading: boolean;
   authError: string | null;
+  authRecoveryAvailable: boolean;
+  retryBoot: () => void;
   /** 启动静默续期进行中（App 渲染极简 splash）。 */
   booting: boolean;
   /**
@@ -107,6 +110,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const [user, setUser] = useState<User | null>(opts.initialUser);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
+  const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
   // demo/重置链接跳过静默续期（重置场景用户就是要走 reset 流程，不劫持进工作区）。
   const [booting, setBooting] = useState(!demo && !resetToken);
   // cohort lane 决策信号（P3 RFC D1）：undefined=决策进行中；{lane}=已拿到 auth 响应
@@ -121,10 +126,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
+    bootstrapMeFriction.current = null;
     setAuthed(false);
     setUser(null);
     setAuthLoading(false);
     setAuthError(null);
+    setAuthRecoveryAvailable(false);
     setBooting(false);
     setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
     cbRef.current.onClearAuth();
@@ -148,10 +155,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     async (email: string, password: string, turnstileToken: string) => {
       const session = authRef.current;
       const loginEpoch = session.beginIdentity();
+      bootstrapMeFriction.current = null;
       // abort 同步发生；api.login 随后进入同 tab cookie-mutation FIFO，必在旧 refresh settle 后发出。
       void cancelAuthRefresh(session);
       setAuthLoading(true);
       setAuthError(null);
+      setAuthRecoveryAvailable(false);
       try {
         // 服务端 /api/auth/login schema 必填 turnstile_token。turnstileToken 由 AuthGate 给出：
         // canary（turnstile_bypass:true）发占位 'bypass'（服务端接受任意串）；生产（bypass 关闭）
@@ -196,6 +205,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         if (outcome.kind === "transient") {
           const localBackoff = AUTH_RECOVERY_BACKOFF_MS[Math.min(refreshAttempt, AUTH_RECOVERY_BACKOFF_MS.length - 1)];
           refreshAttempt += 1;
+          if (refreshAttempt >= 2) {
+            setAuthError("登录状态恢复失败，请检查网络后重试");
+            setAuthRecoveryAvailable(true);
+            setBooting(false);
+            return;
+          }
           try {
             await waitForRecovery(Math.max(localBackoff, outcome.retryAfterMs), controller.signal);
           } catch {
@@ -209,6 +224,19 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
           try {
             const me = await api.getMe(session);
             if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
+            const prior = bootstrapMeFriction.current;
+            if (prior) {
+              reportClientFriction({
+                eventId: prior.id,
+                surface: "auth",
+                stage: "bootstrap_me",
+                code: "BOOTSTRAP_ME_TRANSIENT",
+                outcome: "recovered",
+                attempts: Math.min(32, prior.attempts + 1),
+              }, session.snapshot().token);
+              bootstrapMeFriction.current = null;
+            }
+            setAuthRecoveryAvailable(false);
             setUser(me);
             setAuthed(true);
             setLaneSignal({ lane: me.lane ?? null });
@@ -222,8 +250,25 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
               clearAuthState();
               return;
             }
+            const prior = bootstrapMeFriction.current;
+            const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
+            const id = reportClientFriction({
+              eventId: prior?.id,
+              surface: "auth",
+              stage: "bootstrap_me",
+              code: "BOOTSTRAP_ME_TRANSIENT",
+              outcome: "failed",
+              attempts,
+            }, session.snapshot().token);
+            bootstrapMeFriction.current = { id, attempts };
             const delayMs = AUTH_RECOVERY_BACKOFF_MS[Math.min(meAttempt, AUTH_RECOVERY_BACKOFF_MS.length - 1)];
             meAttempt += 1;
+            if (meAttempt >= 2) {
+              setAuthError("登录状态恢复失败，请检查网络后重试");
+              setAuthRecoveryAvailable(true);
+              setBooting(false);
+              return;
+            }
             try {
               await waitForRecovery(delayMs, controller.signal);
             } catch {
@@ -237,6 +282,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
       controller.abort();
     };
   }, [booting, clearAuthState]);
+
+  const retryBoot = useCallback(() => {
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+    setBooting(true);
+  }, []);
 
   // 其它同源 tab 主动登出：立即作废本 tab 的 epoch/token 和在飞 refresh，不等旧 access JWT
   // 自然过期；信号不携带任何 token。
@@ -322,6 +373,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setUser,
     authLoading,
     authError,
+    authRecoveryAvailable,
+    retryBoot,
     booting,
     laneReady,
     lane,

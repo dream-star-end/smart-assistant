@@ -14,6 +14,8 @@ import {
 } from "../auth/login.js";
 import { verifyAccess, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "../auth/jwt.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
+import { confirmPasswordReset, requestPasswordReset } from "../auth/verify.js";
+import { patchUser } from "../admin/users.js";
 
 /**
  * T-14 集成:登录 + Refresh + Logout 端到端打通真 Postgres。
@@ -120,6 +122,113 @@ async function setupUser(email: string, password: string): Promise<{ userId: str
   return { userId: r.user_id };
 }
 
+async function requestResetToken(email: string): Promise<string> {
+  const mailer = new CapturingMailer();
+  await requestPasswordReset(email, {
+    mailer,
+    resetUrlBase: "https://claudeai.chat",
+  });
+  const raw = mailer.sent[0]?.text.match(/token=([^\s]+)/)?.[1];
+  if (!raw) throw new Error("test setup:reset URL not captured");
+  return raw;
+}
+
+async function waitForAdvisoryWait(queryPattern: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const waiting = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM pg_stat_activity
+        WHERE pid <> pg_backend_pid()
+          AND datname = current_database()
+          AND wait_event_type = 'Lock'
+          AND wait_event = 'advisory'
+          AND query ILIKE $1`,
+      [queryPattern],
+    );
+    if (Number(waiting.rows[0].count) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for PostgreSQL advisory lock:${queryPattern}`);
+}
+
+async function installRefreshInsertBarrier(
+  target: { familyId?: string; userId?: string },
+  lockKey: string,
+): Promise<{
+  waitUntilRefreshInsertBlocked: () => Promise<void>;
+  waitUntilFamilyMutationBlocked: () => Promise<void>;
+  release: () => Promise<void>;
+  cleanup: () => Promise<void>;
+}> {
+  await query("DROP TRIGGER IF EXISTS auth_refresh_insert_barrier_trigger ON refresh_tokens");
+  await query("DROP FUNCTION IF EXISTS auth_refresh_insert_barrier_fn()");
+  await query("DROP TABLE IF EXISTS auth_refresh_insert_barrier");
+  await query(
+    `CREATE TABLE auth_refresh_insert_barrier (
+       family_id uuid,
+       user_id bigint,
+       lock_key bigint NOT NULL
+     )`,
+  );
+  await query(
+    `INSERT INTO auth_refresh_insert_barrier(family_id, user_id, lock_key)
+     VALUES ($1::uuid, $2::bigint, $3::bigint)`,
+    [target.familyId ?? null, target.userId ?? null, lockKey],
+  );
+  await query(
+    `CREATE FUNCTION auth_refresh_insert_barrier_fn() RETURNS trigger
+       LANGUAGE plpgsql AS $fn$
+     DECLARE barrier_key bigint;
+     BEGIN
+       SELECT lock_key INTO barrier_key
+         FROM auth_refresh_insert_barrier
+        WHERE (family_id IS NULL OR family_id = NEW.family_id)
+          AND (user_id IS NULL OR user_id = NEW.user_id);
+       IF barrier_key IS NOT NULL THEN
+         PERFORM pg_advisory_xact_lock(barrier_key);
+       END IF;
+       RETURN NEW;
+     END
+     $fn$`,
+  );
+  await query(
+    `CREATE TRIGGER auth_refresh_insert_barrier_trigger
+       BEFORE INSERT ON refresh_tokens
+       FOR EACH ROW EXECUTE FUNCTION auth_refresh_insert_barrier_fn()`,
+  );
+
+  const blockerPool = createPool({
+    connectionString: TEST_DB_URL,
+    max: 1,
+    statementTimeoutMs: 30_000,
+  });
+  const blocker = await blockerPool.connect();
+  await blocker.query("SELECT pg_advisory_lock($1::bigint)", [lockKey]);
+  let released = false;
+
+  return {
+    waitUntilRefreshInsertBlocked: () => waitForAdvisoryWait("%INSERT INTO refresh_tokens%"),
+    waitUntilFamilyMutationBlocked: () =>
+      waitForAdvisoryWait("SELECT pg_advisory_xact_lock(hashtextextended%"),
+    release: async () => {
+      if (released) return;
+      released = true;
+      try {
+        await blocker.query("SELECT pg_advisory_unlock($1::bigint)", [lockKey]);
+      } finally {
+        blocker.release();
+        await blockerPool.end();
+      }
+    },
+    cleanup: async () => {
+      await query("DROP TRIGGER IF EXISTS auth_refresh_insert_barrier_trigger ON refresh_tokens");
+      await query("DROP FUNCTION IF EXISTS auth_refresh_insert_barrier_fn()");
+      await query("DROP TABLE IF EXISTS auth_refresh_insert_barrier");
+    },
+  };
+}
+
 describe("auth.login (integ)", () => {
   test("happy path: returns access+refresh, refresh row inserted with sha256 hash", async (t) => {
     if (skipIfNoPg(t)) return;
@@ -167,6 +276,198 @@ describe("auth.login (integ)", () => {
     assert.equal(rt.rows[0].ua, "node-test");
     assert.equal(rt.rows[0].ip, "10.0.0.5");
     assert.equal(rt.rows[0].revoked_at, null);
+  });
+
+  test("replacement login revokes a stale cookie's whole rotated family", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("old-tab@example.com", "old tab password");
+    await setupUser("new-tab@example.com", "new tab password");
+    const oldLogin = await login(
+      { email: "old-tab@example.com", password: "old tab password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.5", userAgent: "browser" },
+    );
+    // Model a refresh response whose Set-Cookie is still in flight while the
+    // other tab starts a replacement login carrying the original cookie.
+    const lateRefresh = await refresh(oldLogin.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.5",
+      userAgent: "browser",
+    });
+    const newLogin = await login(
+      { email: "new-tab@example.com", password: "new tab password", turnstile_token: "tok" },
+      {
+        jwtSecret: JWT_SECRET,
+        turnstileBypass: true,
+        remoteIp: "10.0.0.5",
+        userAgent: "browser",
+        replaceRefreshToken: oldLogin.refresh_token,
+      },
+    );
+
+    await assert.rejects(
+      refresh(lateRefresh.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.5",
+        userAgent: "browser",
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    const validNewIdentity = await refresh(newLogin.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.5",
+      userAgent: "browser",
+    });
+    const claims = await verifyAccess(validNewIdentity.access_token, JWT_SECRET);
+    assert.equal(claims.sub, newLogin.user.id);
+  });
+
+  test("replacement login waits for descendant rotation and revokes the late token", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("concurrent-old@example.com", "concurrent old password");
+    await setupUser("concurrent-new@example.com", "concurrent new password");
+    const oldLogin = await login(
+      { email: "concurrent-old@example.com", password: "concurrent old password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.8", userAgent: "browser" },
+    );
+    const firstDescendant = await refresh(oldLogin.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.8",
+      userAgent: "browser",
+    });
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash=$1",
+      [refreshTokenHash(oldLogin.refresh_token)],
+    );
+    const barrier = await installRefreshInsertBarrier(
+      { familyId: family.rows[0].family_id },
+      "9151001",
+    );
+    let descendantPromise: ReturnType<typeof refresh> | null = null;
+    let replacementPromise: ReturnType<typeof login> | null = null;
+    try {
+      descendantPromise = refresh(firstDescendant.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.8",
+        userAgent: "browser",
+      });
+      await barrier.waitUntilRefreshInsertBlocked();
+
+      replacementPromise = login(
+        { email: "concurrent-new@example.com", password: "concurrent new password", turnstile_token: "tok" },
+        {
+          jwtSecret: JWT_SECRET,
+          turnstileBypass: true,
+          remoteIp: "10.0.0.8",
+          userAgent: "browser",
+          replaceRefreshToken: oldLogin.refresh_token,
+        },
+      );
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateDescendant, newLogin] = await Promise.all([descendantPromise, replacementPromise]);
+      await assert.rejects(
+        refresh(lateDescendant.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.8",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      const validNewIdentity = await refresh(newLogin.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.8",
+        userAgent: "browser",
+      });
+      assert.equal((await verifyAccess(validNewIdentity.access_token, JWT_SECRET)).sub, newLogin.user.id);
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([descendantPromise, replacementPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
+  });
+
+  test("verified old-password login cannot escape a concurrent password reset", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const email = "login-reset-race@example.com";
+    const oldPassword = "login reset old password";
+    const { userId } = await setupUser(email, oldPassword);
+    const resetToken = await requestResetToken(email);
+    const barrier = await installRefreshInsertBarrier({ userId }, "9151003");
+    let loginPromise: ReturnType<typeof login> | null = null;
+    let resetPromise: ReturnType<typeof confirmPasswordReset> | null = null;
+    try {
+      loginPromise = login(
+        { email, password: oldPassword, turnstile_token: "tok" },
+        { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.10", userAgent: "browser" },
+      );
+      // The INSERT trigger fires only after the old password has been verified
+      // and the login transaction owns the user mutation lock.
+      await barrier.waitUntilRefreshInsertBlocked();
+      resetPromise = confirmPasswordReset(resetToken, "login reset new password");
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateLogin] = await Promise.all([loginPromise, resetPromise]);
+      await assert.rejects(
+        refresh(lateLogin.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.10",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      const active = await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL",
+        [userId],
+      );
+      assert.equal(active.rows[0].count, "0");
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([loginPromise, resetPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
+  });
+
+  test("verified old-password login cannot escape a concurrent admin ban", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const email = "login-ban-race@example.com";
+    const oldPassword = "login ban old password";
+    const { userId } = await setupUser(email, oldPassword);
+    const { userId: adminId } = await setupUser("login-ban-admin@example.com", "admin password");
+    const barrier = await installRefreshInsertBarrier({ userId }, "9151004");
+    let loginPromise: ReturnType<typeof login> | null = null;
+    let banPromise: ReturnType<typeof patchUser> | null = null;
+    try {
+      loginPromise = login(
+        { email, password: oldPassword, turnstile_token: "tok" },
+        { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.11", userAgent: "browser" },
+      );
+      await barrier.waitUntilRefreshInsertBlocked();
+      banPromise = patchUser(userId, { status: "banned" }, { adminId });
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateLogin, banned] = await Promise.all([loginPromise, banPromise]);
+      assert.equal(banned.status, "banned");
+      await assert.rejects(
+        refresh(lateLogin.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.11",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      const active = await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL",
+        [userId],
+      );
+      assert.equal(active.rows[0].count, "0");
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([loginPromise, banPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
   });
 
   test("email_verified flag is reflected in user object", async (t) => {
@@ -651,6 +952,170 @@ describe("auth.refresh rotation (integ, LOW)", () => {
       refresh(r2.refresh_token, { jwtSecret: JWT_SECRET }),
       (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
     );
+  });
+
+  test("logout waits for descendant rotation and revokes the late token", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("concurrent-logout@example.com", "concurrent logout password");
+    const original = await login(
+      { email: "concurrent-logout@example.com", password: "concurrent logout password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.9", userAgent: "browser" },
+    );
+    const firstDescendant = await refresh(original.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.9",
+      userAgent: "browser",
+    });
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash=$1",
+      [refreshTokenHash(original.refresh_token)],
+    );
+    const barrier = await installRefreshInsertBarrier(
+      { familyId: family.rows[0].family_id },
+      "9151002",
+    );
+    let descendantPromise: ReturnType<typeof refresh> | null = null;
+    let logoutPromise: ReturnType<typeof logout> | null = null;
+    try {
+      descendantPromise = refresh(firstDescendant.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.9",
+        userAgent: "browser",
+      });
+      await barrier.waitUntilRefreshInsertBlocked();
+
+      logoutPromise = logout(original.refresh_token);
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateDescendant, logoutResult] = await Promise.all([descendantPromise, logoutPromise]);
+      assert.equal(logoutResult.revoked, true);
+      await assert.rejects(
+        refresh(lateDescendant.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.9",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([descendantPromise, logoutPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
+  });
+
+  test("password reset waits for descendant rotation and revokes the late token", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const email = "rotation-reset-race@example.com";
+    const { userId } = await setupUser(email, "rotation reset old password");
+    const resetToken = await requestResetToken(email);
+    const original = await login(
+      { email, password: "rotation reset old password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.12", userAgent: "browser" },
+    );
+    const firstDescendant = await refresh(original.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.12",
+      userAgent: "browser",
+    });
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash=$1",
+      [refreshTokenHash(original.refresh_token)],
+    );
+    const barrier = await installRefreshInsertBarrier(
+      { familyId: family.rows[0].family_id },
+      "9151005",
+    );
+    let descendantPromise: ReturnType<typeof refresh> | null = null;
+    let resetPromise: ReturnType<typeof confirmPasswordReset> | null = null;
+    try {
+      descendantPromise = refresh(firstDescendant.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.12",
+        userAgent: "browser",
+      });
+      await barrier.waitUntilRefreshInsertBlocked();
+      resetPromise = confirmPasswordReset(resetToken, "rotation reset new password");
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateDescendant] = await Promise.all([descendantPromise, resetPromise]);
+      await assert.rejects(
+        refresh(lateDescendant.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.12",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      const active = await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL",
+        [userId],
+      );
+      assert.equal(active.rows[0].count, "0");
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([descendantPromise, resetPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
+  });
+
+  test("admin ban waits for descendant rotation and revokes the late token", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const email = "rotation-ban-race@example.com";
+    const { userId } = await setupUser(email, "rotation ban password");
+    const { userId: adminId } = await setupUser("rotation-ban-admin@example.com", "admin password");
+    const original = await login(
+      { email, password: "rotation ban password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.0.0.13", userAgent: "browser" },
+    );
+    const firstDescendant = await refresh(original.refresh_token, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.0.0.13",
+      userAgent: "browser",
+    });
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash=$1",
+      [refreshTokenHash(original.refresh_token)],
+    );
+    const barrier = await installRefreshInsertBarrier(
+      { familyId: family.rows[0].family_id },
+      "9151006",
+    );
+    let descendantPromise: ReturnType<typeof refresh> | null = null;
+    let banPromise: ReturnType<typeof patchUser> | null = null;
+    try {
+      descendantPromise = refresh(firstDescendant.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.0.0.13",
+        userAgent: "browser",
+      });
+      await barrier.waitUntilRefreshInsertBlocked();
+      banPromise = patchUser(userId, { status: "banned" }, { adminId });
+      await barrier.waitUntilFamilyMutationBlocked();
+      await barrier.release();
+
+      const [lateDescendant, banned] = await Promise.all([descendantPromise, banPromise]);
+      assert.equal(banned.status, "banned");
+      await assert.rejects(
+        refresh(lateDescendant.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.0.0.13",
+          userAgent: "browser",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      const active = await query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL",
+        [userId],
+      );
+      assert.equal(active.rows[0].count, "0");
+    } finally {
+      await barrier.release();
+      await Promise.allSettled([descendantPromise, banPromise].filter(Boolean));
+      await barrier.cleanup();
+    }
   });
 });
 

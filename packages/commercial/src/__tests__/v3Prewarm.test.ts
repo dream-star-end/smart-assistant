@@ -49,8 +49,9 @@ describe("makePrewarmContainer", () => {
     const spy = makeWarnSpy();
     const boom = new Error("docker daemon unreachable");
     const ensureRunning = async (_uid: bigint): Promise<never> => { throw boom; };
+    const failures: Array<{ userId: bigint; correlation: string; latencyMs: number }> = [];
 
-    const prewarm = makePrewarmContainer(ensureRunning, spy.log);
+    const prewarm = makePrewarmContainer(ensureRunning, spy.log, (input) => failures.push(input));
 
     // 关键不变量:同步调用不抛(即使 ensureRunning 内会 reject)
     assert.doesNotThrow(() => prewarm(456n));
@@ -61,7 +62,12 @@ describe("makePrewarmContainer", () => {
     assert.equal(spy.calls.length, 1, "reject 应触发恰好 1 行 warn");
     assert.equal(spy.calls[0]!.msg, "prewarm failed");
     assert.equal(spy.calls[0]!.fields?.uid, "456");
-    assert.equal(spy.calls[0]!.fields?.error, "docker daemon unreachable");
+    assert.equal(spy.calls[0]!.fields?.errorClass, "Error");
+    assert.equal(spy.calls[0]!.fields?.error, undefined, "原始异常文本不得进入日志");
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!.userId, 456n);
+    assert.match(failures[0]!.correlation, /^456:\d+$/);
+    assert.ok(failures[0]!.latencyMs >= 0);
   });
 
   test("reject: 非 Error 抛出值也能转 string,不二次抛", async () => {
@@ -74,7 +80,8 @@ describe("makePrewarmContainer", () => {
 
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(spy.calls.length, 1);
-    assert.equal(spy.calls[0]!.fields?.error, "string error");
+    assert.equal(spy.calls[0]!.fields?.errorClass, "string");
+    assert.equal(spy.calls[0]!.fields?.error, undefined);
   });
 
   test("多次调用独立 reject,各自 log,前后互不污染", async () => {

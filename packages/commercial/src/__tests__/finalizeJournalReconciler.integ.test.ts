@@ -17,6 +17,11 @@ import {
   reconcileStuckFinalizeJournal,
 } from '../billing/finalizeJournalReconciler.js'
 import { DURABLE_CODEX_RECOVERY_VERSION } from '../billing/codexFinalizer.js'
+import {
+  abortInflightJournal,
+  claimInflightJournalForSettlement,
+  finalizeInflightJournal,
+} from '../billing/proxyBilling.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
@@ -182,6 +187,78 @@ async function getJournal(
 }
 
 describe('reconcileStuckFinalizeJournal (integ)', () => {
+  test('settlement claim 是单持有者 fence，loser 不能 abort/finalize winner', async (t) => {
+    if (skipIfNoPg(t)) return
+    const userId = await createUser('settlement-fence@t.co')
+    await insertJournal('settlement-fence', userId)
+
+    const pool = createPool({ connectionString: TEST_DB_URL, max: 8 })
+    try {
+      const claims = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          claimInflightJournalForSettlement(pool, 'settlement-fence'),
+        ),
+      )
+      const winner = claims.find((claim): claim is string => claim !== null)
+      assert.ok(winner)
+      assert.equal(claims.filter((claim) => claim !== null).length, 1)
+
+      assert.equal(
+        await abortInflightJournal(pool, 'settlement-fence', 'loser abort', 'BILLING_FAILED'),
+        false,
+        'unclaimed abort must not cross a finalizing owner fence',
+      )
+      await assert.rejects(
+        finalizeInflightJournal(pool, {
+          requestId: 'settlement-fence',
+          finalCredits: 10n,
+          ledgerId: null,
+          usageId: 999n,
+          settlementClaimId: '00000000-0000-4000-8000-000000000000',
+        }),
+        /settlement fence lost/,
+      )
+      assert.equal((await getJournal('settlement-fence'))?.state, 'finalizing')
+
+      assert.equal(
+        await abortInflightJournal(
+          pool,
+          'settlement-fence',
+          'owner rollback',
+          'BILLING_FAILED',
+          winner,
+        ),
+        true,
+      )
+      assert.equal((await getJournal('settlement-fence'))?.state, 'aborted')
+
+      const usageId = await insertUsage(userId, 'settlement-fence-commit', { cost: 10n })
+      await insertJournal('settlement-fence-commit', userId)
+      const commitOwner = await claimInflightJournalForSettlement(pool, 'settlement-fence-commit')
+      assert.ok(commitOwner)
+      await finalizeInflightJournal(pool, {
+        requestId: 'settlement-fence-commit',
+        finalCredits: 10n,
+        ledgerId: null,
+        usageId,
+        settlementClaimId: commitOwner,
+      })
+      assert.equal((await getJournal('settlement-fence-commit'))?.state, 'committed')
+      assert.equal(
+        await abortInflightJournal(
+          pool,
+          'settlement-fence-commit',
+          'late owner abort',
+          'BILLING_FAILED',
+          commitOwner,
+        ),
+        false,
+      )
+    } finally {
+      await pool.end()
+    }
+  })
+
   test('stuck inflight + usage_records(success) → committed,回填 usage_id/ledger_id/final_credits', async (t) => {
     if (skipIfNoPg(t)) return
     const u = await createUser('a@t.co')

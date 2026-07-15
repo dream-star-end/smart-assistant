@@ -4,6 +4,7 @@ import { App, prefetchLazyCentersOnIdle } from './App'
 import { LegalPage } from './components/LegalPage'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { registerServiceWorker } from './registerSW'
+import { installGlobalClientFrictionHandlers } from './lib/clientFriction'
 import './styles.css'
 
 // 法律文本静态页(/terms /privacy):纯静态、无任何 App 状态,在入口层短路,
@@ -11,6 +12,8 @@ import './styles.css'
 // 依赖 gateway SPA fallback 对无扩展名路径回退 index.html。
 const legalKind =
   location.pathname === '/terms' ? 'terms' : location.pathname === '/privacy' ? 'privacy' : null
+
+installGlobalClientFrictionHandlers()
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

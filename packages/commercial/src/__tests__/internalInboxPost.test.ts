@@ -90,6 +90,25 @@ describe("inbox-post handler", () => {
     assert.equal(p.posts[0].msg.level, "info");
   });
 
+  test("stable cron delivery key is validated and forwarded to durable storage", async () => {
+    const p = capturePost();
+    const h = makeInboxPostHandler({ identityRepo: repoFor(99), postMessage: p.postMessage });
+    let res = makeRes();
+    await h(makeReq({
+      auth: `Bearer ${TOKEN}`,
+      body: { title: "任务完成", bodyMd: "结果如下", deliveryKey: `cron.${"a".repeat(64)}` },
+    }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    assert.equal(p.posts[0]!.msg.deliveryKey, `cron.${"a".repeat(64)}`);
+
+    res = makeRes();
+    await h(makeReq({
+      auth: `Bearer ${TOKEN}`,
+      body: { title: "任务完成", bodyMd: "结果如下", deliveryKey: "bad key" },
+    }), res, CTX);
+    assert.equal(res.statusCode, 400);
+  });
+
   test("title/body truncated to caps", async () => {
     const p = capturePost();
     const h = makeInboxPostHandler({ identityRepo: repoFor(), postMessage: p.postMessage });

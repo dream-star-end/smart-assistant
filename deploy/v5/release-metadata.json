@@ -16,7 +16,8 @@
     "0147_lossless_turn_tapes",
     "0148_inbox_rich_assets",
     "0149_audit_hardening",
-    "0150_agent_tool_rollups"
+    "0150_agent_tool_rollups",
+    "0151_product_friction_events"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

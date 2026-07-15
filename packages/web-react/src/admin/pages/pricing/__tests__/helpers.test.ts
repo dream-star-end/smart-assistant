@@ -38,7 +38,10 @@ describe("usageLine", () => {
   test("tokens = in + out 自加", () => {
     expect(
       usageLine({ requests: 12, input_tokens: "1000", output_tokens: "500", credits: "30" }),
-    ).toBe("12 请求 · 1.5K tok · 30 积分");
+    ).toBe("12/12 成功/尝试 · 0 失败 · 0 取消 · 1.5K tok · 30 积分");
+    expect(
+      usageLine({ attempts: 20, requests: 12, failures: 6, cancellations: 2, input_tokens: "1000", output_tokens: "500", credits: "30" }),
+    ).toBe("12/20 成功/尝试 · 6 失败 · 2 取消 · 1.5K tok · 30 积分");
     expect(usageLine(null)).toBe("—");
   });
 });

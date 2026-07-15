@@ -270,6 +270,28 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
   })
 
+  test('boot repeated transient failures surface a manual recovery action instead of false logout', async () => {
+    let refreshCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        return errJson(503, { error: { code: 'UPSTREAM_UNAVAILABLE', message: 'temporary outage' } })
+      }
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () => expect(screen.getByRole('button', { name: '重试恢复登录状态' })).toBeInTheDocument(),
+      { timeout: 4_000 },
+    )
+    expect(refreshCalls).toBe(2)
+    expect(screen.getByText('登录状态恢复失败，请检查网络后重试')).toBeInTheDocument()
+  })
+
   test('StrictMode effect replay shares the same boot refresh flight', async () => {
     let refreshCalls = 0
     fetchMock = vi.fn(async (url: string) => {

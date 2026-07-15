@@ -99,6 +99,7 @@ import {
   deleteRemoteCodexContainerAuth,
 } from "./codex-auth/remoteCodexAuth.js";
 import { tx } from "./db/queries.js";
+import { recordProductFrictionEvent } from "./productFriction/events.js";
 import {
   startLifecycleScheduler,
   type LifecycleScheduler,
@@ -114,6 +115,8 @@ import {
   startAuditRetentionSweeper,
   type AuditRetentionSweeperHandle,
 } from "./admin/auditRetention.js";
+import { startGithubWorkspaceSweeper } from "./github/sessionWorkspaces.js";
+import { startImageUsageSweeper } from "./billing/imageBilling.js";
 import {
   startCodexRefreshActor,
   type CodexRefreshActorHandle,
@@ -422,7 +425,10 @@ import {
   composeMultiplier,
   getAgentCostMultiplier,
 } from "./billing/agentMultiplier.js";
-import { startInflightJournal } from "./billing/proxyBilling.js";
+import {
+  startInflightJournal,
+  type JournalFailureCode,
+} from "./billing/proxyBilling.js";
 import {
   DURABLE_CODEX_RECOVERY_VERSION,
   deriveEngineSessionId,
@@ -1615,6 +1621,17 @@ export async function registerCommercial(
           appendServerAuthoredMessageDrainByUser,
           drainDelegateCostForClientSession,
         },
+        recordOversized: ({ userId, requestId, sessionId }) => {
+          void recordProductFrictionEvent({
+            correlation: requestId,
+            userId,
+            surface: "session",
+            stage: "persist",
+            code: "SESSION_OVERSIZED",
+            outcome: "failed",
+            sessionId,
+          }, getPool()).catch(() => {});
+        },
       });
       // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.
       // Container's gateway forwards 401-recovery refresh asks here; we read
@@ -1846,6 +1863,38 @@ export async function registerCommercial(
           );
           const senderId = adminRow.rows[0]?.id;
           if (!senderId) throw new Error("inbox-post: no active admin sender");
+          if (msg.deliveryKey) {
+            const existing = await getPool().query<{ title: string; body_md: string }>(
+              `SELECT title,body_md FROM inbox_messages
+                WHERE source_type='cron_delivery' AND source_id=$1 AND source_phase=$2`,
+              [uid, msg.deliveryKey],
+            );
+            if (existing.rows[0]) {
+              if (existing.rows[0].title !== msg.title || existing.rows[0].body_md !== msg.bodyMd) {
+                throw new Error("inbox-post: delivery key content collision");
+              }
+              return;
+            }
+            const inserted = await getPool().query(
+              `INSERT INTO inbox_messages
+                 (audience,user_id,title,body_md,level,created_by,source_type,source_id,source_phase)
+               SELECT 'user',$1,$2,$3,$4,$5,'cron_delivery',$1,$6
+                WHERE EXISTS (
+                  SELECT 1 FROM users WHERE id=$1 AND status='active'
+                )
+               ON CONFLICT (source_type,source_id,source_phase)
+                 WHERE source_type IS NOT NULL DO NOTHING`,
+              [uid, msg.title, msg.bodyMd, msg.level, senderId, msg.deliveryKey],
+            );
+            if ((inserted.rowCount ?? 0) === 1) return;
+            const raced = await getPool().query<{ title: string; body_md: string }>(
+              `SELECT title,body_md FROM inbox_messages
+                WHERE source_type='cron_delivery' AND source_id=$1 AND source_phase=$2`,
+              [uid, msg.deliveryKey],
+            );
+            if (raced.rows[0]?.title === msg.title && raced.rows[0]?.body_md === msg.bodyMd) return;
+            throw new Error("inbox-post: recipient missing or delivery key collision");
+          }
           await createInboxMessage(senderId, {
             audience: "user",
             user_id: uid,
@@ -2890,7 +2939,21 @@ export async function registerCommercial(
   // 语义仍由 makePrewarmContainer 外层 .catch 吞掉保留(它只把返回 promise 吞掉,同步 return void)。
   // v3Deps 未配 → sharedEnsureRunning undefined → prewarmContainer undefined → handler 端 no-op。
   const prewarmContainer: ((uid: bigint) => void) | undefined = sharedEnsureRunning
-    ? makePrewarmContainer(sharedEnsureRunning, rootLogger.child({ subsys: "v3/prewarm" }))
+    ? makePrewarmContainer(
+        sharedEnsureRunning,
+        rootLogger.child({ subsys: "v3/prewarm" }),
+        ({ userId, correlation, latencyMs }) => {
+          void recordProductFrictionEvent({
+            correlation,
+            userId,
+            surface: "container",
+            stage: "prewarm",
+            code: "PREWARM_FAILED",
+            outcome: "failed",
+            latencyMs,
+          }, getPool()).catch(() => {});
+        },
+      )
     : undefined;
 
   // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
@@ -3291,8 +3354,14 @@ export async function registerCommercial(
     if (!snap) return;
     wechatCodexTurns.delete(requestId);
     clearTimeout(snap.timeout);
+    const failureCode: JournalFailureCode = reason === "wechat_container_cold_start"
+      ? "UPSTREAM_UNAVAILABLE"
+      : reason.startsWith("wechat_container_rejected_")
+          || reason === "wechat_container_terminal_before_start"
+        ? "UPSTREAM_REJECTED"
+        : "INTERNAL_ERROR";
     try {
-      await snap.finalizer.fail(reason);
+      await snap.finalizer.fail(reason, failureCode);
     } finally {
       expireCodexRouteToken(snap.routeToken, reason);
     }
@@ -3359,6 +3428,7 @@ export async function registerCommercial(
       ...(body.delegateAgentId ? { delegateAgentId: body.delegateAgentId } : {}),
       engineSessionId: journalEngineSessionId,
       status: body.status,
+      ...(body.terminalCode !== undefined ? { terminalCode: body.terminalCode } : {}),
       durationMs: body.durationMs,
       usage: {
         input_tokens: safeBillingNum(u.input_tokens),
@@ -3367,7 +3437,6 @@ export async function registerCommercial(
         cache_read_input_tokens: safeBillingNum(u.cache_read_input_tokens),
         cache_creation_input_tokens: safeBillingNum(u.cache_creation_input_tokens),
       },
-      ...(body.errorReason !== undefined ? { errorReason: body.errorReason } : {}),
       ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits } : {}),
     };
     try {
@@ -3471,7 +3540,7 @@ export async function registerCommercial(
       `wechat:${args.bindingUserId}:${args.containerId}:${agentForCharge}`,
     );
     try {
-      await startInflightJournal(getPool(), {
+      const admitted = await startInflightJournal(getPool(), {
         requestId,
         userId: args.userId,
         containerId: BigInt(args.containerId),
@@ -3486,6 +3555,12 @@ export async function registerCommercial(
           engineSessionId,
         },
       });
+      if (!admitted) {
+        await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+        expireCodexRouteToken(route.token, "wechat_codex_journal_conflict");
+        codexRouteLog.error("wechat_codex_journal_conflict", { requestId });
+        return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
+      }
     } catch (err) {
       await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
       expireCodexRouteToken(route.token, "wechat_codex_journal_failed");
@@ -4137,6 +4212,28 @@ export async function registerCommercial(
     });
   }
 
+  // Image journey recovery is operational state, not request-triggered
+  // cleanup: one-shot users may never make another image call. The V5 leader
+  // finalizes stale journeys/attempts globally in bounded batches.
+  if (
+    runtimeChannel === "v5" &&
+    process.env.COMMERCIAL_IMAGE_USAGE_SWEEP_DISABLED !== "1"
+  ) {
+    leaderBundle.add({
+      name: "imageUsageSweep",
+      domain: "v5-owned",
+      start: () => {
+        const h = trackScheduler("imageUsageSweep", "v5-owned", startImageUsageSweeper({
+          pool: getPool(),
+          onError: (error) => rootLogger.warn("image usage sweep failed", {
+            errorClass: error instanceof Error ? error.name : typeof error,
+          }),
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   // plan G2/G4 — codex token refresh actor(单进程独占,60s tick,unref)。
   // 扫 codex 账号 → 提前 15min refresh → 持锁逐容器写 per-container auth.json。
   // 永不写 master 文件 / legacy 共享 dir。详见 codexAccountActor.ts 头注。
@@ -4350,6 +4447,17 @@ export async function registerCommercial(
       // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
       isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
       wakeContainer: (uid) => wakeFn(uid),
+      recordWakeOutcome: ({ userId, correlation, outcome, attempts }) => {
+        void recordProductFrictionEvent({
+          correlation,
+          userId,
+          surface: "cron",
+          stage: "container_wake",
+          code: "WAKE_FAILED",
+          outcome,
+          attempts,
+        }, getPool()).catch(() => {});
+      },
       runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
       logger: rootLogger,
       maxPerTick,
@@ -4456,6 +4564,17 @@ export async function registerCommercial(
         const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
         const h = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (runtimeChannel === "v5" && process.env.OC_GITHUB_WORKSPACE_SWEEPER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "githubWorkspaceSweeper",
+      domain: "v5-owned",
+      start: () => {
+        const h = trackScheduler("githubWorkspaceSweeper", "v5-owned", startGithubWorkspaceSweeper(getPool()));
         return { stop: () => h.stop() };
       },
     });

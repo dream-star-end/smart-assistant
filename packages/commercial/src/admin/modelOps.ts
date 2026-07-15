@@ -201,7 +201,12 @@ export async function listProvidersOverview(
 // ─── 用量聚合(0106 容量面) ───────────────────────────────────────────
 
 export interface ModelUsageWindow {
+  /** Journal terminal attempts (single authority; includes failures/cancels). */
+  attempts: number;
+  /** Successful terminal attempts. Kept as `requests` for API compatibility. */
   requests: number;
+  failures: number;
+  cancellations: number;
   input_tokens: string;
   output_tokens: string;
   cache_read_tokens: string;
@@ -215,43 +220,85 @@ export interface ModelUsageAgg {
 
 type UsageAggRow = {
   model: string;
-  req_1d: string; in_1d: string; out_1d: string; cache_1d: string; credits_1d: string;
-  req_7d: string; in_7d: string; out_7d: string; cache_7d: string; credits_7d: string;
+  attempts_1d: string; req_1d: string; failures_1d: string; cancellations_1d: string;
+  in_1d: string; out_1d: string; cache_1d: string; credits_1d: string;
+  attempts_7d: string; req_7d: string; failures_7d: string; cancellations_7d: string;
+  in_7d: string; out_7d: string; cache_7d: string; credits_7d: string;
 };
 
 /**
- * per-model 24h/7d 用量聚合(usage_records 单次 7 天窗扫描 + FILTER 拆 24h;
- * 走 0106 的 (model, created_at) 索引)。BIGINT 一律 ::text 防 JS 精度丢失。
+ * per-model 24h/7d attempt 聚合。request_finalize_journal 终态是唯一请求
+ * 事实源；usage_records 只按 journal.usage_id 补 token/积分，绝不 UNION 后
+ * 重复计算 committed 请求。BIGINT 一律 ::text 防 JS 精度丢失。
  */
 export async function listModelUsageAggregates(): Promise<Record<string, ModelUsageAgg>> {
   const r = await query<UsageAggRow>(
-    `SELECT model,
-       COUNT(*)                    FILTER (WHERE created_at > NOW() - interval '24 hours')::text AS req_1d,
+    `WITH classified AS (
+       SELECT rfj.*,
+              ur.id AS joined_usage_id,
+              ur.model AS usage_model,
+              ur.status AS usage_status,
+              ur.input_tokens,
+              ur.output_tokens,
+              ur.cache_read_tokens,
+              ur.cost_credits,
+              CASE
+                WHEN (rfj.state='aborted'
+                       AND rfj.failure_code IN ('CLIENT_ABORT','USER_CANCELLED'))
+                  OR (rfj.state='committed'
+                       AND ur.price_snapshot->>'codex_terminal_code'='USER_CANCELLED')
+                  THEN 'cancelled'
+                WHEN rfj.state='committed'
+                  AND ur.id IS NOT NULL
+                  AND ur.status='success'
+                  AND COALESCE(ur.output_tokens,0)>0
+                  AND COALESCE(ur.price_snapshot->>'codex_status','success')<>'error'
+                  AND COALESCE(ur.price_snapshot->>'waived','')<>'no_output' THEN 'success'
+                ELSE 'failure'
+              END AS terminal_outcome
+         FROM request_finalize_journal rfj
+         LEFT JOIN usage_records ur ON ur.id=rfj.usage_id
+        WHERE rfj.created_at > NOW() - interval '7 days'
+          AND rfj.state IN ('committed','aborted')
+     )
+     SELECT COALESCE(ctx->>'model', usage_model, 'unknown') AS model,
+       COUNT(*) FILTER (WHERE rfj.created_at > NOW() - interval '24 hours')::text AS attempts_1d,
+       COUNT(*) FILTER (WHERE created_at > NOW() - interval '24 hours' AND terminal_outcome='success')::text AS req_1d,
+       COUNT(*) FILTER (WHERE created_at > NOW() - interval '24 hours' AND terminal_outcome='failure')::text AS failures_1d,
+       COUNT(*) FILTER (WHERE created_at > NOW() - interval '24 hours' AND terminal_outcome='cancelled')::text AS cancellations_1d,
        COALESCE(SUM(input_tokens)      FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS in_1d,
        COALESCE(SUM(output_tokens)     FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS out_1d,
        COALESCE(SUM(cache_read_tokens) FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS cache_1d,
        COALESCE(SUM(cost_credits)      FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS credits_1d,
-       COUNT(*)::text AS req_7d,
+       COUNT(*)::text AS attempts_7d,
+       COUNT(*) FILTER (WHERE terminal_outcome='success')::text AS req_7d,
+       COUNT(*) FILTER (WHERE terminal_outcome='failure')::text AS failures_7d,
+       COUNT(*) FILTER (WHERE terminal_outcome='cancelled')::text AS cancellations_7d,
        COALESCE(SUM(input_tokens), 0)::text AS in_7d,
        COALESCE(SUM(output_tokens), 0)::text AS out_7d,
        COALESCE(SUM(cache_read_tokens), 0)::text AS cache_7d,
        COALESCE(SUM(cost_credits), 0)::text AS credits_7d
-     FROM usage_records
-     WHERE created_at > NOW() - interval '7 days'
-     GROUP BY model`,
+     FROM classified rfj
+     GROUP BY COALESCE(ctx->>'model', usage_model, 'unknown')`,
   );
   const out: Record<string, ModelUsageAgg> = {};
   for (const row of r.rows) {
     out[row.model] = {
       d1: {
+        attempts: Number(row.attempts_1d),
         requests: Number(row.req_1d),
+        failures: Number(row.failures_1d),
+        cancellations: Number(row.cancellations_1d),
         input_tokens: row.in_1d,
         output_tokens: row.out_1d,
         cache_read_tokens: row.cache_1d,
         credits: row.credits_1d,
       },
       d7: {
+        attempts: Number(row.attempts_7d),
         requests: Number(row.req_7d),
+        failures: Number(row.failures_7d),
+        cancellations: Number(row.cancellations_7d),
         input_tokens: row.in_7d,
         output_tokens: row.out_7d,
         cache_read_tokens: row.cache_7d,

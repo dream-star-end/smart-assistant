@@ -48,6 +48,7 @@ import {
 import { verifyHupijiao } from "../payment/hupijiao/sign.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
+import { recordQrIssueFailure } from "../payment/qrIssueFailure.js";
 import { safeEnqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 
@@ -211,7 +212,8 @@ export async function handleCreateHupi(
   }
   const { order, plan } = created;
 
-  // 调虎皮椒拿 qrcode_url。失败时订单留 pending —— 15min 后 expire 扫掉
+  // 调虎皮椒拿 qrcode_url。若二维码未能交付，立即把本地 pending 单终态化为
+  // canceled；否则会被 15min expirer 误算成“用户看了二维码但放弃支付”。
   let qr: { qrcodeUrl: string; mobileUrl: string | null; providerOrder?: string | null };
   try {
     qr = await deps.hupijiao.createQr({
@@ -221,6 +223,7 @@ export async function handleCreateHupi(
       attach: `user:${user.id}`,
     });
   } catch (err) {
+    await recordQrIssueFailure(order);
     if (err instanceof HupijiaoError) {
       throw new HttpError(502, err.code, err.message);
     }

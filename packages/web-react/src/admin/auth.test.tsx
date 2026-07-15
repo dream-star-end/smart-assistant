@@ -42,6 +42,25 @@ test("admin boot recovers from a transient refresh failure without becoming unau
   expect(refreshCalls).toBe(2);
 });
 
+test("admin boot surfaces an explicit recovery action after bounded transient retries", async () => {
+  let refreshCalls = 0;
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes("/api/auth/refresh")) {
+      refreshCalls += 1;
+      return response({ error: { code: "UPSTREAM_UNAVAILABLE", message: "temporary outage" } }, 503);
+    }
+    return response({});
+  });
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  const { result } = renderHook(() => useAdminAuth());
+  await waitFor(() => expect(result.current.recoverable).toBe(true), { timeout: 4_000 });
+  expect(result.current.ready).toBe(true);
+  expect(result.current.authed).toBe(false);
+  expect(typeof result.current.retry).toBe("function");
+  expect(refreshCalls).toBe(2);
+});
+
 test("admin StrictMode effect replay shares one boot refresh flight", async () => {
   let refreshCalls = 0;
   const fetchMock = vi.fn(async (url: string) => {

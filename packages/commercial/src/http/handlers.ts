@@ -639,6 +639,7 @@ export async function handleLogin(
       bindIp: ctx.authBoundIp,
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
+      replaceRefreshToken: readRefreshCookie(req),
     });
     // HIGH#4:refresh token 走 HttpOnly cookie 下发,不再放 body。
     // Max-Age 用 (refresh_exp - now) 而不是固定 30d,确保前端能精确算到截止时间;

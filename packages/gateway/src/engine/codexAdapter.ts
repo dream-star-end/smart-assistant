@@ -151,8 +151,9 @@ export function buildCodexBillingEvent(
   usageAttribution?: UsageAttributionTag,
 ): EngineBillingEvent {
   const isOk = msg.is_error !== true
-  const errReason =
-    !isOk && typeof msg.result === 'string' && msg.result.length > 0 ? msg.result : undefined
+  const terminalCode = !isOk
+    ? msg.billing_terminal_code === 'USER_CANCELLED' ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const
+    : undefined
   const u = msg.usage as
     | {
         input_tokens?: unknown
@@ -206,9 +207,9 @@ export function buildCodexBillingEvent(
       : {}),
     engineSessionId: sessionEngineId,
     status: isOk ? 'success' : 'error',
+    ...(terminalCode ? { terminalCode } : {}),
     durationMs: typeof msg.duration_ms === 'number' ? msg.duration_ms : 0,
     ...(usagePayload && Object.keys(usagePayload).length > 0 ? { usage: usagePayload } : {}),
-    ...(errReason ? { errorReason: errReason } : {}),
     ...(rateLimitsPayload ? { rateLimits: rateLimitsPayload } : {}),
   }
 }

@@ -33,6 +33,7 @@ import {
 import { SYNTHETIC_EMAIL_DOMAIN } from './socialLogin.js'
 import { verifyTurnstile, TurnstileError } from './turnstile.js'
 import type { Mailer } from './mail.js'
+import { lockRefreshUsers } from './refreshFamilyLock.js'
 
 /** 密码重置 token TTL:1 小时(短于 verify_email)05-SEC §15 */
 export const RESET_PASSWORD_TTL_SECONDS = 60 * 60
@@ -496,10 +497,11 @@ export interface ConfirmResetResult {
  * 用 raw token + 新密码完成重置。
  *
  * 单事务:
- *   1) hash → 查 reset_password 未用未过期 token
- *   2) UPDATE users.password_hash + updated_at
- *   3) UPDATE email_verifications.used_at(消费 token)
- *   4) UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id=$ AND revoked_at IS NULL
+ *   1) hash → 无锁解析 reset token 的 user_id
+ *   2) 获取 account-wide refresh mutation lock,再 FOR UPDATE 重验 token
+ *   3) UPDATE users.password_hash + updated_at
+ *   4) UPDATE email_verifications.used_at(消费 token)
+ *   5) UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id=$ AND revoked_at IS NULL
  *
  * 故意不复用 verifyEmail —— purpose 不同,逻辑(改密 + revoke)也不同。
  */
@@ -523,6 +525,23 @@ export async function confirmPasswordReset(
   const nowIso = new Date(ts * 1000).toISOString()
 
   return await tx<ConfirmResetResult>(async (client) => {
+    const preliminary = await client.query<{ user_id: string }>(
+      `SELECT user_id::text AS user_id
+         FROM email_verifications
+        WHERE token_hash = $1
+          AND purpose = 'reset_password'
+          AND used_at IS NULL
+          AND expires_at > $2::timestamptz`,
+      [tokenHash, nowIso],
+    )
+    if (preliminary.rows.length === 0) {
+      throw new VerifyError('INVALID_TOKEN', 'reset token invalid or expired')
+    }
+    await lockRefreshUsers(client, [preliminary.rows[0].user_id])
+
+    // Revalidate only after the user lock. Every token issuer/rotator takes the
+    // same lock first, so whichever side wins either sees the new password or
+    // has its newly inserted descendant revoked by this transaction.
     const found = await client.query<{ id: string; user_id: string }>(
       `SELECT id::text AS id, user_id::text AS user_id
          FROM email_verifications
@@ -537,6 +556,9 @@ export async function confirmPasswordReset(
       throw new VerifyError('INVALID_TOKEN', 'reset token invalid or expired')
     }
     const { id: evId, user_id: userId } = found.rows[0]
+    if (userId !== preliminary.rows[0].user_id) {
+      throw new VerifyError('INVALID_TOKEN', 'reset token invalid or expired')
+    }
 
     await client.query(
       'UPDATE users SET password_hash = $1, updated_at = $2::timestamptz WHERE id = $3',

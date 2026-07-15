@@ -96,7 +96,10 @@ async function fetchInflightStats(): Promise<StatsResult> {
 }
 
 const ZERO_WINDOW: ModelUsageWindow = {
+  attempts: 0,
   requests: 0,
+  failures: 0,
+  cancellations: 0,
   input_tokens: "0",
   output_tokens: "0",
   cache_read_tokens: "0",
@@ -139,11 +142,19 @@ export async function handleAdminModelOpsOverview(
     const pid = providerIdForModel(model);
     inflightByProvider.set(pid, (inflightByProvider.get(pid) ?? 0) + v.current);
   }
-  const usageByProvider = new Map<string, { requests: number; tokens: bigint; credits: bigint }>();
+  const usageByProvider = new Map<string, {
+    attempts: number; requests: number; failures: number; cancellations: number;
+    tokens: bigint; credits: bigint;
+  }>();
   for (const [model, agg] of Object.entries(usageAgg)) {
     const pid = providerIdForModel(model);
-    const cur = usageByProvider.get(pid) ?? { requests: 0, tokens: 0n, credits: 0n };
+    const cur = usageByProvider.get(pid) ?? {
+      attempts: 0, requests: 0, failures: 0, cancellations: 0, tokens: 0n, credits: 0n,
+    };
+    cur.attempts += agg.d1.attempts;
     cur.requests += agg.d1.requests;
+    cur.failures += agg.d1.failures;
+    cur.cancellations += agg.d1.cancellations;
     cur.tokens += BigInt(agg.d1.input_tokens) + BigInt(agg.d1.output_tokens);
     cur.credits += BigInt(agg.d1.credits);
     usageByProvider.set(pid, cur);
@@ -154,7 +165,10 @@ export async function handleAdminModelOpsOverview(
       ...p,
       inflight_current: inflightByProvider.get(p.id) ?? 0,
       usage_d1: {
+        attempts: u?.attempts ?? 0,
         requests: u?.requests ?? 0,
+        failures: u?.failures ?? 0,
+        cancellations: u?.cancellations ?? 0,
         tokens: (u?.tokens ?? 0n).toString(),
         credits: (u?.credits ?? 0n).toString(),
       },

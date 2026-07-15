@@ -223,6 +223,7 @@ const CodexBillingBodySchema = z
     delegateAgentId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional(),
     engineSessionId: z.string().regex(/^oceng-[0-9a-f]{48}$/).optional(),
     status: z.union([z.literal("success"), z.literal("error")]),
+    terminalCode: z.union([z.literal("USER_CANCELLED"), z.literal("CODEX_ERROR")]).optional(),
     durationMs: z.number().finite().nonnegative(),
     usage: z
       .object({
@@ -234,6 +235,8 @@ const CodexBillingBodySchema = z
       })
       .strict()
       .optional(),
+    // Accepted only during rolling deploy. The transform below immediately
+    // converts it to a bounded terminalCode and removes the raw string.
     errorReason: z.string().optional(),
     rateLimits: z
       .object({
@@ -250,6 +253,16 @@ const CodexBillingBodySchema = z
       .optional(),
   })
   .strict()
+  .transform(({ errorReason, ...body }) => ({
+    ...body,
+    ...(body.status === "error" && body.terminalCode === undefined
+      ? {
+          terminalCode: errorReason === "codex turn interrupted"
+            ? "USER_CANCELLED" as const
+            : "CODEX_ERROR" as const,
+        }
+      : {}),
+  }))
 
 export type WechatCodexBillingBody = z.infer<typeof CodexBillingBodySchema>
 

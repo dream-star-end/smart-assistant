@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -36,9 +37,18 @@ const AUTO_DISMISS_MS = 3500;
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const seq = useRef(0);
+  const dismissTimers = useRef(new Map<number, number>());
 
   const dismiss = useCallback((id: number) => {
+    const timer = dismissTimers.current.get(id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    dismissTimers.current.delete(id);
     setItems((cur) => cur.filter((t) => t.id !== id));
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of dismissTimers.current.values()) window.clearTimeout(timer);
+    dismissTimers.current.clear();
   }, []);
 
   const toast = useCallback(
@@ -48,7 +58,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       setItems((cur) => [...cur, { id, message, tone }]);
       // 错误提示不自动消失(可达性:屏幕阅读器/慢读用户不会因 3.5s 自隐而错过失败原因;
       // 用户可点 X 关闭)。成功/信息类保持短暂自隐。
-      if (tone !== "error") window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+      if (tone !== "error") {
+        const timer = window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+        dismissTimers.current.set(id, timer);
+      }
     },
     [dismiss],
   );

@@ -123,7 +123,15 @@ describe("cronWake due tick", () => {
   });
 
   test("isContainerActive error → skip this tick (no mass wake, no crash)", async () => {
+    const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      child() { return this; },
+      info() {},
+      error() {},
+      warn(msg: string, fields?: Record<string, unknown>) { warnings.push({ msg, fields }); },
+    };
     const h = baseDeps({
+      logger,
       isContainerActive: async () => {
         throw new Error("db blip");
       },
@@ -133,6 +141,54 @@ describe("cronWake due tick", () => {
     try {
       const r = await sched.runNow();
       assert.equal(r.woken, 0);
+      assert.deepEqual(warnings, [
+        { msg: "is_active_failed_skip", fields: { uid: "1", errorClass: "Error" } },
+        { msg: "is_active_failed_skip", fields: { uid: "2", errorClass: "Error" } },
+      ]);
+      assert.equal(JSON.stringify(warnings).includes("db blip"), false);
+    } finally {
+      sched.stop();
+    }
+  });
+
+  test("failed wake later recovers under one stable correlation without raw error", async () => {
+    let wakeCalls = 0;
+    const outcomes: Array<{
+      userId: bigint;
+      correlation: string;
+      outcome: "failed" | "recovered";
+      attempts: number;
+    }> = [];
+    const h = baseDeps({
+      cooldownMs: 0,
+      wakeContainer: async () => {
+        wakeCalls++;
+        if (wakeCalls === 1) throw new Error("docker socket secret detail");
+      },
+      recordWakeOutcome: (input: (typeof outcomes)[number]) => outcomes.push(input),
+    });
+    h.setDue([U(9)]);
+    const sched = startCronWakeScheduler(h.deps as any);
+    try {
+      await sched.runNow();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      h.advance(1);
+      await sched.runNow();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(wakeCalls, 2);
+      assert.deepEqual(outcomes.map(({ outcome, attempts }) => ({ outcome, attempts })), [
+        { outcome: "failed", attempts: 1 },
+        { outcome: "recovered", attempts: 2 },
+      ]);
+      assert.equal(outcomes[0]!.userId, 9n);
+      assert.equal(outcomes[1]!.correlation, outcomes[0]!.correlation);
+      assert.match(outcomes[0]!.correlation, /^9:/);
+      assert.equal(
+        JSON.stringify(outcomes, (_key, value) => typeof value === "bigint" ? value.toString() : value)
+          .includes("docker socket secret detail"),
+        false,
+      );
     } finally {
       sched.stop();
     }

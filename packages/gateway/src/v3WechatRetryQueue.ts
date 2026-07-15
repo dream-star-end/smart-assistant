@@ -92,6 +92,7 @@ export interface V3WechatCodexBillingWirePayload {
   delegateAgentId?: string
   engineSessionId?: string
   status: 'success' | 'error'
+  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
   durationMs: number
   usage?: {
     input_tokens?: number
@@ -100,7 +101,6 @@ export interface V3WechatCodexBillingWirePayload {
     cache_creation_input_tokens?: number
     reasoning_output_tokens?: number
   }
-  errorReason?: string
   rateLimits?: {
     util5h?: number
     reset5h?: string
@@ -138,6 +138,36 @@ export interface V3WechatRetryEntry {
   lastErrorAt?: number
   /** 完整错误文本;never the bearer / payload body。 */
   lastErrorMessage?: string
+}
+
+/** Rolling compatibility: old runtime images may leave raw `errorReason` in
+ * an on-disk billing payload. Map the one historical user-cancel literal to a
+ * stable code and drop all raw text before any new fsync or network attempt. */
+export function sanitizeV3WechatRetryEntry(entry: V3WechatRetryEntry): {
+  entry: V3WechatRetryEntry
+  changed: boolean
+} {
+  const payload = entry.payload as unknown as Record<string, unknown>
+  if (payload.type !== 'outbound.codex_billing') return { entry, changed: false }
+  const hadReason = Object.prototype.hasOwnProperty.call(payload, 'errorReason')
+  const validTerminal = payload.terminalCode === 'USER_CANCELLED' || payload.terminalCode === 'CODEX_ERROR'
+  const needsTerminal = payload.status === 'error' && !validTerminal
+  if (!hadReason && !needsTerminal) return { entry, changed: false }
+  const legacyReason = payload.errorReason
+  const withoutRaw = { ...payload }
+  delete withoutRaw.errorReason
+  if (needsTerminal) {
+    withoutRaw.terminalCode = legacyReason === 'codex turn interrupted'
+      ? 'USER_CANCELLED'
+      : 'CODEX_ERROR'
+  }
+  return {
+    entry: {
+      ...entry,
+      payload: withoutRaw as unknown as V3WechatOutboundPostPayload,
+    },
+    changed: true,
+  }
 }
 
 export interface DrainStats {
@@ -205,7 +235,7 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
   async function enqueueDurable(entry: V3WechatRetryEntry): Promise<void> {
     await ensureDir()
     const filepath = join(dir, entryFilename())
-    await atomicWriteJson(filepath, entry)
+    await atomicWriteJson(filepath, sanitizeV3WechatRetryEntry(entry).entry)
     kick()
   }
 
@@ -268,7 +298,9 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         if (!isV3WechatRetryEntry(parsed)) {
           throw new Error('schema mismatch')
         }
-        entry = parsed
+        const sanitized = sanitizeV3WechatRetryEntry(parsed)
+        entry = sanitized.entry
+        if (sanitized.changed) await atomicWriteJson(filepath, entry)
       } catch (err) {
         stats.errors++
         const quarantine = `${filepath}.quarantine-${randomBytes(4).toString('hex')}`
@@ -392,6 +424,8 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
     if (p.engineSessionId !== undefined &&
         (typeof p.engineSessionId !== 'string' || !/^oceng-[0-9a-f]{48}$/.test(p.engineSessionId))) return false
     if (p.status !== 'success' && p.status !== 'error') return false
+    if (p.terminalCode !== undefined &&
+        p.terminalCode !== 'USER_CANCELLED' && p.terminalCode !== 'CODEX_ERROR') return false
     if (typeof p.durationMs !== 'number' || !Number.isFinite(p.durationMs) || p.durationMs < 0) return false
     return true
   }

@@ -354,6 +354,74 @@ describe("runUpstreamRoundTrip — buildSafeUpstreamHeaders HttpError", () => {
 });
 
 describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
+  test("同 provider 的合法 signed thinking 首发原样保留且不重试", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const { ctx, finalize } = buildCtx({
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return sseFullResponse();
+      },
+    });
+    const messages = [{
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "same provider", signature: "s".repeat(64) },
+        { type: "redacted_thinking", data: "r".repeat(64) },
+        { type: "connector_text", text: "signed connector" },
+        { type: "text", text: "answer" },
+      ],
+    }];
+    ctx.body.messages = messages as ProxyBody["messages"];
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(sentBodies.length, 1);
+    assert.deepEqual(sentBodies[0]!.messages, messages);
+    assert.equal(finalize.commitCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.equal(finalize.failClientCalls.length, 0);
+  });
+
+  test("明确的签名 400 后只用清洗副本重试一次并正常结算", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const signatureError = JSON.stringify({
+      type: "error",
+      error: { type: "invalid_request_error", message: "thinking signature invalid" },
+    });
+    const { ctx, finalize } = buildCtx({
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return sentBodies.length === 1
+          ? new Response(signatureError, { status: 400 })
+          : sseFullResponse();
+      },
+    });
+    const messages = [{
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "foreign", signature: "q".repeat(64) },
+        { type: "redacted_thinking", data: "r".repeat(64) },
+        { type: "connector_text", text: "foreign connector" },
+        { type: "text", text: "portable answer" },
+      ],
+    }];
+    const before = structuredClone(messages);
+    ctx.body.messages = messages as ProxyBody["messages"];
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(sentBodies.length, 2);
+    assert.deepEqual(sentBodies[0]!.messages, before, "first attempt must retain valid same-provider history");
+    assert.deepEqual(sentBodies[1]!.messages, [{
+      role: "assistant",
+      content: [{ type: "text", text: "portable answer" }],
+    }]);
+    assert.deepEqual(messages, before, "retry sanitizer must not mutate persisted/request history");
+    assert.equal(finalize.commitCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.equal(finalize.failClientCalls.length, 0);
+  });
+
   test("上游 500 → finalize.fail(非 failClient)+ 502 UPSTREAM_ERROR", async () => {
     const { ctx, res, session, finalize } = buildCtx({
       fetchImpl: async () => new Response("internal error", { status: 500 }),

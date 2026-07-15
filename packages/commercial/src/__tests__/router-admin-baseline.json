@@ -127,6 +127,12 @@
   },
   {
     "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/product-friction",
+    "handler": "handleAdminProductFriction"
+  },
+  {
+    "method": "GET",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/trace/",
     "handler": "handleAdminTraceLookup"

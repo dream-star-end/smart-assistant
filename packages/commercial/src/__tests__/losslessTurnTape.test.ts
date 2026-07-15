@@ -420,9 +420,23 @@ describe("materializeLosslessTurn", () => {
         engineBillings: [delegateBilling],
       }],
     });
-    assert.deepEqual(turn.engineBillings, [rootBilling, delegateBilling]);
+    const sanitizedDelegateBilling = {
+      requestId: delegateBilling.requestId,
+      turnKey: delegateBilling.turnKey,
+      parentTurnKey: delegateBilling.parentTurnKey,
+      parentSessionId: delegateBilling.parentSessionId,
+      delegateAgentId: delegateBilling.delegateAgentId,
+      engineSessionId: delegateBilling.engineSessionId,
+      status: delegateBilling.status,
+      durationMs: delegateBilling.durationMs,
+      usage: delegateBilling.usage,
+      terminalCode: "CODEX_ERROR",
+    };
+    assert.deepEqual(turn.engineBillings, [rootBilling, sanitizedDelegateBilling]);
     const group = turn.records.find((record) => record.role === "agent-group")!;
-    assert.deepEqual(group.payload.engineBillings, [delegateBilling]);
+    assert.deepEqual(group.payload.engineBillings, [sanitizedDelegateBilling]);
+    assert.equal(JSON.stringify(turn).includes("exact delegate failure"), false);
+    assert.equal(JSON.stringify(turn).includes("errorReason"), false);
     assert.throws(() => materializeLosslessTurn({
       sessionId,
       agentId: "codex",

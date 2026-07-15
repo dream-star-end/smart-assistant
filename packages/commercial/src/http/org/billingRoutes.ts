@@ -32,6 +32,7 @@ import {
   createOrgTopupOrder,
   type OrderRow,
 } from "../../payment/orders.js";
+import { recordQrIssueFailure } from "../../payment/qrIssueFailure.js";
 import { HupijiaoError } from "../../payment/hupijiao/client.js";
 import { listOrgLedger, listOrgOrders, getOrgBalance } from "../../org/orgBilling.js";
 import {
@@ -123,6 +124,7 @@ async function issueOrderQr(
       attach: opts.attach,
     });
   } catch (err) {
+    await recordQrIssueFailure(order);
     if (err instanceof HupijiaoError) throw new HttpError(502, err.code, err.message);
     throw err;
   }

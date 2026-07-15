@@ -110,7 +110,7 @@ export type ChatSocketDeps = {
   /** 商业版余额刷新（cost_charged / 4506 / insufficient_credits）。*/
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
-  reportClientError?: (p: { type: string; message: string; traceId?: string; sessionId?: string }) => void;
+  reportClientError?: (p: { type: string; code: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (
     sessId: string,
@@ -797,7 +797,7 @@ export class ChatSocket {
       },
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
-        this.deps.reportClientError?.({ type: "turn_error", message: p.message, traceId: p.traceId, sessionId: p.sessionId }),
+        this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
       forceSync: (sessId, context) => {
         void this.deps.syncSession?.(sessId, context);
       },

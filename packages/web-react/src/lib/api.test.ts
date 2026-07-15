@@ -106,7 +106,12 @@ test('concurrent 401s trigger only ONE /api/auth/refresh (singleflight) and both
 test('REFRESH_RACE retries inside grace and commits the sibling-rotated cookie result', async () => {
   vi.useFakeTimers()
   let refreshCalls = 0
-  const fetchMock = vi.fn(async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return ok({})
+    }
     refreshCalls += 1
     if (refreshCalls === 1) return authErr(401, 'REFRESH_RACE', 'refresh token rotation race')
     return ok({ access_token: 'tok-race-winner', access_exp: 999, remember: true })
@@ -119,12 +124,20 @@ test('REFRESH_RACE retries inside grace and commits the sibling-rotated cookie r
   await expect(pending).resolves.toMatchObject({ kind: 'success', epoch: 0 })
   expect(refreshCalls).toBe(2)
   expect(token()).toBe('tok-race-winner')
+  expect(reports).toEqual([expect.objectContaining({
+    surface: 'auth', stage: 'refresh', code: 'REFRESH_RACE', outcome: 'recovered',
+  })])
 })
 
 test('repeated REFRESH_RACE is bounded and degrades to transient, never expiry', async () => {
   vi.useFakeTimers()
   let refreshCalls = 0
-  const fetchMock = vi.fn(async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return ok({})
+    }
     refreshCalls += 1
     return authErr(401, 'REFRESH_RACE', 'refresh token rotation race')
   })
@@ -136,12 +149,20 @@ test('repeated REFRESH_RACE is bounded and degrades to transient, never expiry',
   await expect(pending).resolves.toMatchObject({ kind: 'transient', epoch: 0 })
   expect(refreshCalls).toBe(6)
   expect(expireCount()).toBe(0)
+  expect(reports).toEqual([expect.objectContaining({
+    code: 'REFRESH_RACE', outcome: 'failed', attempts: 1,
+  })])
 })
 
 test('transient refresh preserves the original 401 response and applies a shared cooldown', async () => {
   let refreshCalls = 0
   const original = unauthorized()
-  const fetchMock = vi.fn(async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return ok({})
+    }
     refreshCalls += 1
     return authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary outage')
   })
@@ -154,6 +175,40 @@ test('transient refresh preserves the original 401 response and applies a shared
   expect(second).toBe(original)
   expect(refreshCalls).toBe(1)
   expect(expireCount()).toBe(0)
+  expect(reports).toEqual([expect.objectContaining({
+    code: 'REFRESH_TRANSIENT', outcome: 'failed', attempts: 1,
+  })])
+})
+
+test('refresh friction keeps one correlation through admin/WS recovery', async () => {
+  vi.useFakeTimers()
+  let refreshCalls = 0
+  const reports: Array<Record<string, unknown>> = []
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/client-errors')) {
+      reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return ok({})
+    }
+    refreshCalls += 1
+    return refreshCalls === 1
+      ? authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary outage')
+      : ok({ access_token: 'tok-recovered', access_exp: 999, remember: false })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session } = makeSession('tok-old')
+  await expect(api.refresh(session, 0, 'admin_auth')).resolves.toMatchObject({ kind: 'transient' })
+  await vi.advanceTimersByTimeAsync(500)
+  await expect(api.refresh(session, 0, 'ws_auth')).resolves.toMatchObject({ kind: 'success' })
+
+  expect(reports).toHaveLength(2)
+  expect(reports[0]).toEqual(expect.objectContaining({
+    surface: 'admin_auth', code: 'REFRESH_TRANSIENT', outcome: 'failed', attempts: 1,
+  }))
+  expect(reports[1]).toEqual(expect.objectContaining({
+    event_id: reports[0]?.event_id,
+    surface: 'admin_auth', code: 'REFRESH_TRANSIENT', outcome: 'recovered', attempts: 2,
+  }))
 })
 
 test('malformed 200 refresh body is transient and never commits or expires auth', async () => {

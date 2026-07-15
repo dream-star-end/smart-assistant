@@ -33,6 +33,7 @@ import { listOrgSubscriptionPlans } from "../org/orgSubscriptions.js";
 import { getBalanceBreakdown } from "../billing/spend.js";
 import { createPackOrder, createSubscriptionOrder } from "../payment/orders.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
+import { recordQrIssueFailure } from "../payment/qrIssueFailure.js";
 
 // ─── GET /api/subscription/plans ─────────────────────────────────────────
 // 公开档位数据(定价本就是公开信息)。?scope=user(默认,向后兼容)| org。
@@ -159,6 +160,7 @@ async function createOrderAndQr(
       attach: `user:${args.userId}`,
     });
   } catch (err) {
+    await recordQrIssueFailure(order);
     if (err instanceof HupijiaoError) throw new HttpError(502, err.code, err.message);
     throw err;
   }
@@ -250,6 +252,7 @@ export async function handleBuyPack(
       attach: `user:${user.id}`,
     });
   } catch (e) {
+    await recordQrIssueFailure(order);
     if (e instanceof HupijiaoError) throw new HttpError(502, e.code, e.message);
     throw e;
   }

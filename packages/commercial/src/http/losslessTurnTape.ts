@@ -65,6 +65,20 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Detect only the legacy raw billing field at its two sanctioned locations;
+ * user/tool text that happens to contain the word `errorReason` is unrelated. */
+export function hasLegacyRawBillingReason(raw: unknown): boolean {
+  if (!isObject(raw)) return false;
+  if (isObject(raw.engineBilling) && Object.prototype.hasOwnProperty.call(raw.engineBilling, "errorReason")) {
+    return true;
+  }
+  if (!Array.isArray(raw.agentGroups)) return false;
+  return raw.agentGroups.some((group) =>
+    isObject(group) && Array.isArray(group.engineBillings) &&
+    group.engineBillings.some((billing) =>
+      isObject(billing) && Object.prototype.hasOwnProperty.call(billing, "errorReason")));
+}
+
 function requiredString(obj: Record<string, unknown>, key: string): string {
   const value = obj[key];
   if (typeof value !== "string") throw new Error(`turn tape payload.${key} must be a string`);
@@ -168,6 +182,10 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
   if (value.status !== "success" && value.status !== "error") {
     throw new Error(`${prefix}.status is invalid`);
   }
+  if (value.terminalCode !== undefined &&
+      value.terminalCode !== "USER_CANCELLED" && value.terminalCode !== "CODEX_ERROR") {
+    throw new Error(`${prefix}.terminalCode is invalid`);
+  }
   for (const key of ["turnKey", "parentTurnKey"] as const) {
     if (value[key] !== undefined && (typeof value[key] !== "string" || !SAFE_TURN_KEY.test(value[key] as string))) {
       throw new Error(`${prefix}.${key} is invalid`);
@@ -210,7 +228,19 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
       }
     }
   }
-  return structuredClone(value) as unknown as DurableCodexBilling;
+  const exact = structuredClone(value);
+  const legacyReason = exact.errorReason;
+  delete exact.errorReason;
+  if (
+    exact.status === "error" &&
+    exact.terminalCode !== "USER_CANCELLED" &&
+    exact.terminalCode !== "CODEX_ERROR"
+  ) {
+    exact.terminalCode = legacyReason === "codex turn interrupted"
+      ? "USER_CANCELLED"
+      : "CODEX_ERROR";
+  }
+  return exact as unknown as DurableCodexBilling;
 }
 
 function parseEngineBilling(obj: Record<string, unknown>): DurableCodexBilling | undefined {

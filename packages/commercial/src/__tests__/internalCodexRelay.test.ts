@@ -16,6 +16,7 @@ import {
   CODEX_UPSTREAM_AUTH_HEADER,
   buildCodexRelayLocalBaseUrl,
   codexRelayBasePathForUpstream,
+  image429RetryDelayMs,
   isRelayCredentialFailureStatus,
   makeCodexRelayHandler,
   mapCodexRelayUrl,
@@ -113,6 +114,17 @@ describe('internalCodexRelay path mapping', () => {
     }
     for (const status of [200, 201, 400, 404]) {
       assert.equal(isRelayCredentialFailureStatus(status), false, `${status} should not count as credential failure`)
+    }
+  })
+
+  test('retries images only for explicit integer Retry-After up to two seconds', () => {
+    const delay = (value?: string) => image429RetryDelayMs(new Headers(value === undefined ? {} : { 'retry-after': value }))
+    assert.equal(delay(), null)
+    assert.equal(delay('0'), 100)
+    assert.equal(delay('1'), 1_000)
+    assert.equal(delay('2'), 2_000)
+    for (const invalid of ['3', '-1', '0.5', 'Wed, 21 Oct 2026 07:28:00 GMT', 'x']) {
+      assert.equal(delay(invalid), null, invalid)
     }
   })
 

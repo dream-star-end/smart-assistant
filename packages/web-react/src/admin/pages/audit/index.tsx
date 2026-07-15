@@ -7,12 +7,14 @@ import { AgentAuditTab } from "./AgentAuditTab";
 import { HostAuditTab } from "./HostAuditTab";
 import { SecurityEventsTab } from "./SecurityEventsTab";
 import { TraceLookup } from "./TraceLookup";
+import { ProductFrictionTab } from "./ProductFrictionTab";
 
-type AuditView = "admin" | "security" | "agent" | "host";
+type AuditView = "admin" | "security" | "agent" | "friction" | "host";
 const TABS: TabItem[] = [
   { value: "admin", label: "管理审计" },
   { value: "security", label: "安全事件" },
   { value: "agent", label: "Agent 工具失败" },
+  { value: "friction", label: "产品摩擦" },
   { value: "host", label: "主机审计" },
 ];
 
@@ -41,6 +43,7 @@ export default function AuditPage() {
       {tab === "admin" && <AdminAuditTab />}
       {tab === "security" && <SecurityEventsTab />}
       {tab === "agent" && <AgentAuditTab />}
+      {tab === "friction" && <ProductFrictionTab />}
       {tab === "host" && <HostAuditTab />}
     </div>
   );

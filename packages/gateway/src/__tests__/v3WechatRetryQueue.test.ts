@@ -151,6 +151,27 @@ describe("drainOnce", () => {
     assert.deepEqual(sent[0], billingPayload())
   })
 
+  test("old on-disk raw billing reason is scrubbed before rewrite and send", async () => {
+    const old = entry({
+      ...billingPayload({ status: "error" }),
+      errorReason: "DO_NOT_SEND queued provider detail",
+    } as unknown as V3WechatCodexBillingWirePayload)
+    const filepath = join(dir, "legacy-billing.json")
+    await writeFile(filepath, JSON.stringify(old))
+    const sent: unknown[] = []
+    const q = makeV3WechatRetryQueue({
+      dir,
+      attemptSend: async (payload) => { sent.push(payload) },
+    })
+    const stats = await q.drainOnce()
+    assert.equal(stats.drained, 1)
+    assert.equal(sent.length, 1)
+    assert.equal((sent[0] as { terminalCode?: string }).terminalCode, "CODEX_ERROR")
+    assert.equal(Object.prototype.hasOwnProperty.call(sent[0]!, "errorReason"), false)
+    assert.equal(JSON.stringify(sent[0]).includes("DO_NOT_SEND"), false)
+    assert.equal(await q.pendingCount(), 0)
+  })
+
   test("transient → bump attempts + rewrite", async () => {
     const q = makeV3WechatRetryQueue({
       dir,

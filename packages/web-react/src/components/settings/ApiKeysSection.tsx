@@ -8,8 +8,7 @@ import { shortTime } from "./labels";
 /**
  * API Key 自管：list / create（一次性明文展示）/ delete。
  *
- * commercial-only：后端当前是 admin-only rollout，普通用户调用返 403 —— 命中即整段
- * 隐藏（不暴露"有这功能但你没权限"的噪音）。明文仅创建时返回一次，强制引导即时复制。
+ * commercial-only：admin 角色由父组件先验控制挂载；403 隐藏仍作为角色变更竞态兜底。
  */
 export function ApiKeysSection({ auth }: { auth: AuthSession }) {
   const [hidden, setHidden] = useState(false);

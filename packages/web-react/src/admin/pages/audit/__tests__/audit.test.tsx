@@ -114,6 +114,25 @@ const TRACE = {
   model: "glm-5.2",
   created_at: new Date().toISOString(),
 };
+const PRODUCT_FRICTION = {
+  generated_at: new Date().toISOString(),
+  windows: { operational_days: 7, funnel_days: 30 },
+  events: [{
+    surface: "auth", stage: "refresh", code: "REFRESH_RACE",
+    journeys_1d: "2", journeys_7d: "3", attempts_1d: "3", attempts_7d: "5",
+    failed_7d: "0", recovered_7d: "3", pending_7d: "0", affected_users_7d: "2",
+  }],
+  models: [{
+    model: "qwen3.7-max", attempts_1d: "10", success_1d: "7", failures_1d: "2", cancellations_1d: "1",
+    attempts_7d: "40", success_7d: "35", failures_7d: "3", cancellations_7d: "2",
+  }],
+  model_failures: [{ model: "qwen3.7-max", code: "NO_OUTPUT", failures_1d: "1", failures_7d: "2", affected_users_7d: "2" }],
+  images: [{ status: "failed", code: "IMAGE_UPSTREAM_RATE_LIMITED", records: "1", affected_users: "1" }],
+  image_attempts: [{ outcome: "failed", code: "IMAGE_UPSTREAM_RATE_LIMITED", attempts_1d: "1", attempts_7d: "1", affected_users_7d: "1" }],
+  orders: [{ status: "canceled", orders: "2", affected_users: "2", amount_cents: "2000" }],
+  github: [{ status: "failed", code: "workspace_timeout", selections: "1", affected_users: "1", stale: "0", deleted_session: "0", missing_session: "1" }],
+  ratings: [{ rating: "down", ratings: "2", affected_users: "2", missing_reason: "1", missing_trace: "0" }],
+};
 
 beforeEach(() => {
   adminGet.mockReset();
@@ -126,6 +145,7 @@ beforeEach(() => {
       return Promise.resolve({ rows: [SECURITY_ROW], next_before: null });
     if (path === "/host-audit")
       return Promise.resolve({ rows: [HOST_ROW], next_before: null });
+    if (path === "/product-friction") return Promise.resolve(PRODUCT_FRICTION);
     return Promise.resolve({ rows: [], next_before: null });
   });
 });
@@ -230,6 +250,27 @@ describe("AuditPage", () => {
     // 首拉带 limit=100
     const call = adminGet.mock.calls.find((c) => c[0] === "/security-events");
     expect(call?.[1]).toMatchObject({ limit: 100 });
+  });
+
+  test("产品摩擦按来源展示尝试、终局与恢复，不把重试当事故相加", async () => {
+    renderPage(<AuditPage />);
+    await screen.findByText("user.patch");
+    fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
+
+    expect((await screen.findAllByText("qwen3.7-max")).length).toBeGreaterThanOrEqual(2);
+    expect(adminGet.mock.calls.some((c) => c[0] === "/product-friction")).toBe(true);
+    expect(screen.getByText(/重试是过程，不等于终局失败/)).toBeTruthy();
+    expect(screen.getByText(/不跨来源相加/)).toBeTruthy();
+    expect(screen.getByText("REFRESH_RACE")).toBeTruthy();
+    expect(screen.getByText("24 小时模型尝试").parentElement?.textContent).toContain("10");
+    expect(screen.getByText("24 小时终局失败").parentElement?.textContent).toContain("2");
+    expect(screen.getByText("7 天自动恢复").parentElement?.textContent).toContain("3");
+    expect(screen.getByText("7 天进行中旅程").parentElement?.textContent).toContain("0");
+    expect(screen.getByText("终局未成功")).toBeTruthy();
+    expect(screen.getByText("待物化会话")).toBeTruthy();
+    expect(screen.getByText("NO_OUTPUT")).toBeTruthy();
+    expect(screen.getAllByText("IMAGE_UPSTREAM_RATE_LIMITED").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("workspace_timeout")).toBeTruthy();
   });
 
   test("请求ID反查成功 → 弹卡片展示归属信息", async () => {

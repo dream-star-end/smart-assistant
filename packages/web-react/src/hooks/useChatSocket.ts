@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
+import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
@@ -173,17 +174,18 @@ export function useChatSocket(opts: {
       silentRefresh: async (expectedEpoch) => {
         const session = authRef.current;
         if (!session) return { kind: "stale", epoch: expectedEpoch };
-        return api.refresh(session, expectedEpoch);
+        return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
       refreshBalance: () => refreshBalanceRef.current?.(),
       reportClientError: (p) => {
-        // 真 turn 失败自动上报（best-effort，端点 P6 接；这里静默兜底）。
-        void fetch("/api/client-errors", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(p),
-        }).catch(() => {});
+        reportClientFriction({
+          surface: "chat",
+          stage: p.type,
+          code: p.code,
+          traceId: p.traceId,
+          sessionId: p.sessionId,
+        }, authRef.current?.snapshot().token);
       },
       // resume_failed / 重连 reconcile：有游标走 REST 增量、无游标才全量；两者都以 server
       // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。

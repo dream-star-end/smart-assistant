@@ -48,7 +48,17 @@ import { getCodexTokenSnapshot } from '../account-pool/store.js'
 import { zeroBuffer } from '../crypto/keys.js'
 import type { PreCheckRedis, ReservationHandle } from '../billing/preCheck.js'
 import { preCheckExactCost, releasePreCheck, InsufficientCreditsError as PreCheckInsufficientCreditsError } from '../billing/preCheck.js'
-import { IMAGE2_UNIT_COST, ImageDailyLimitError, bindImageInputHash, getCompletedImageUsage, markImageUsage, reserveImageUsage, settleImageCharge } from '../billing/imageBilling.js'
+import {
+  IMAGE2_UNIT_COST,
+  ImageDailyLimitError,
+  beginImageUpstreamAttempt,
+  bindImageInputHash,
+  finishImageUpstreamAttempt,
+  getCompletedImageUsage,
+  markImageUsage,
+  reserveImageUsage,
+  settleImageCharge,
+} from '../billing/imageBilling.js'
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
@@ -415,22 +425,29 @@ function imageUpstreamClientStatus(code: ImageUpstreamFailureCode, upstreamStatu
   return 400
 }
 
-/** 上游图片端点非 2xx 时,把响应体前 N 字符投进结构化日志(此前 err 空对象、排查无从下手)。
- * 响应体是上游返回的 error JSON,本不含我方请求的 Authorization;仍防御性脱敏任何形似
- * bearer / sk- 密钥的串,并折叠空白、截断到 500 字符(避免把整个 body 灌进日志)。 */
-function sanitizeUpstreamErrorBody(bytes: Buffer, max = 500): string {
-  let text: string
-  try {
-    text = bytes.toString('utf8')
-  } catch {
-    return '<non-utf8 body>'
-  }
-  const redacted = text
-    .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, 'Bearer <redacted>')
-    .replace(/\bsk-[A-Za-z0-9._-]{6,}/g, 'sk-<redacted>')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return redacted.length > max ? `${redacted.slice(0, max)}…(+${redacted.length - max})` : redacted
+/** Retry only an explicit, short 429 Retry-After. 5xx is deliberately excluded:
+ * the provider may have generated/billed an image before returning it and does
+ * not offer an idempotency-key contract on this endpoint. */
+export function image429RetryDelayMs(headers: Headers): number | null {
+  const raw = headers.get('retry-after')?.trim()
+  if (!raw || !/^\d+$/.test(raw)) return null
+  const ms = Number(raw) * 1000
+  return Number.isFinite(ms) && ms >= 0 && ms <= 2_000 ? Math.max(100, ms) : null
+}
+
+async function waitForImageRetry(ms: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new DOMException('image request aborted', 'AbortError'))
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('image request aborted', 'AbortError'))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 async function readBoundedBody(req: IncomingMessage, maxBytes = 40 * 1024 * 1024): Promise<Buffer> {
@@ -992,6 +1009,10 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     // 上游图片失败归类(task 3):非 2xx 分支据 body 前缀判类,catch 里据此选 client
     // 状态码 + code,gateway 再本地化成人话文案。
     let imageUpstreamFailureCode: ImageUpstreamFailureCode | null = null
+    let imageFailureCode: string | null = null
+    let activeImageAttemptId: bigint | null = null
+    let activeImageAttemptNo = 0
+    let imageUpstreamSucceeded = false
 
     if (isImageRequest) {
       if (activeImageHeavyWork >= 4) {
@@ -1172,7 +1193,45 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         ? init.headers
         : new Headers(init.headers as HeadersInit)
       init.headers = outgoingHeaders
-      const upstream = await fetchImpl(mappedUrl.url, init)
+      const fetchUpstream = async (): Promise<Response> => {
+        if (isImageRequest) {
+          if (!imageRequestId || !deps.pgPool) throw new Error('image attempt reservation missing')
+          // Failure classification is per fetch attempt. A prior 429 must not
+          // leak into a second attempt that fails before receiving a Response.
+          imageUpstreamFailureCode = null
+          imageFailureCode = null
+          const attempt = await beginImageUpstreamAttempt(deps.pgPool, {
+            userId: BigInt(identity.userId),
+            requestId: imageRequestId,
+          })
+          activeImageAttemptId = attempt.attemptId
+          activeImageAttemptNo = attempt.attemptNo
+          relayLog.info('image_upstream_attempt_started', { attempt: attempt.attemptNo })
+        }
+        return fetchImpl(mappedUrl.url, init)
+      }
+      let upstream = await fetchUpstream()
+      if (isImageRequest && upstream.status === 429) {
+        imageUpstreamFailureCode = 'IMAGE_UPSTREAM_RATE_LIMITED'
+        if (activeImageAttemptId && imageRequestId && deps.pgPool) {
+          await finishImageUpstreamAttempt(deps.pgPool, {
+            userId: BigInt(identity.userId), requestId: imageRequestId,
+            attemptId: activeImageAttemptId, outcome: 'failed',
+            errorCode: imageUpstreamFailureCode,
+          })
+        }
+        const retryDelayMs = image429RetryDelayMs(upstream.headers)
+        if (retryDelayMs !== null && imageRequestId && deps.pgPool) {
+          await upstream.body?.cancel().catch(() => {})
+          relayLog.info('image_upstream_retry', {
+            failureCode: 'IMAGE_UPSTREAM_RATE_LIMITED',
+            nextAttempt: activeImageAttemptNo + 1,
+            retryDelayMs,
+          })
+          await waitForImageRetry(retryDelayMs, controller.signal)
+          upstream = await fetchUpstream()
+        }
+      }
       relayLog.info('relay_upstream_response', {
         status: upstream.status,
         forwardedCodexTurnState: outgoingHeaders.has('x-codex-turn-state'),
@@ -1213,10 +1272,16 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             }
           } catch {}
         } else {
-          // 诊断盲区根治(Task 2):上游非 2xx 把响应体前缀 + 我方送出的关键几何(size)
-          // 落结构化日志。requestedSize 命中 annotated/outpaint 的 API 画布串——若 400
-          // 由 size/几何触发,这里一眼可见。
+          // 只记录稳定分类和安全几何，不把供应商响应正文写入日志。
           imageUpstreamFailureCode = classifyImageUpstreamFailure(upstream.status, bytes)
+          imageFailureCode = imageUpstreamFailureCode
+          if (activeImageAttemptId && imageRequestId && deps.pgPool) {
+            await finishImageUpstreamAttempt(deps.pgPool, {
+              userId: BigInt(identity.userId), requestId: imageRequestId,
+              attemptId: activeImageAttemptId, outcome: 'failed',
+              errorCode: imageUpstreamFailureCode,
+            })
+          }
           relayLog.warn('image_upstream_non_2xx', {
             status: upstream.status,
             operation: imageOperation,
@@ -1225,14 +1290,29 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             requestedSize: annotatedPrepared?.target.api ?? outpaintPrepared?.target.api ?? null,
             imageJobId: annotatedJob?.jobId ?? null,
             failureCode: imageUpstreamFailureCode,
-            bodyPrefix: sanitizeUpstreamErrorBody(bytes),
           })
         }
         const producedValid = isAnnotatedImageRequest ? generated !== null : nativeValid
         if (!producedValid) {
           if (!upstream.ok) throw new ImageUpstreamError(upstream.status)
+          imageFailureCode = 'IMAGE_INVALID_RESPONSE'
+          if (activeImageAttemptId && imageRequestId && deps.pgPool) {
+            await finishImageUpstreamAttempt(deps.pgPool, {
+              userId: BigInt(identity.userId), requestId: imageRequestId,
+              attemptId: activeImageAttemptId, outcome: 'failed',
+              errorCode: imageFailureCode,
+            })
+          }
           throw new Error('Image 2 returned an invalid image')
         }
+
+        if (activeImageAttemptId && imageRequestId && deps.pgPool) {
+          await finishImageUpstreamAttempt(deps.pgPool, {
+            userId: BigInt(identity.userId), requestId: imageRequestId,
+            attemptId: activeImageAttemptId, outcome: 'succeeded',
+          })
+        }
+        imageUpstreamSucceeded = true
 
         let responseBody = bytes
         if (isAnnotatedImageRequest) {
@@ -1270,7 +1350,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
               balanceAfter: settled.balanceAfter?.toString() ?? null,
             })
           } catch (err) {
-            relayLog.warn('image_charge_callback_failed', { err: err as Error })
+            relayLog.warn('image_charge_callback_failed', {
+              errorClass: err instanceof Error ? 'Error' : typeof err,
+            })
           }
         }
         res.statusCode = 200
@@ -1301,24 +1383,54 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       })
     } catch (err) {
       if (deps.preCheckRedis && imageReservation) await releasePreCheck(deps.preCheckRedis, imageReservation).catch(() => {})
+      const aborted = controller.signal.aborted
+      const stableFailureCode = aborted
+        ? 'IMAGE_CLIENT_ABORT'
+        : imageFailureCode
+          ?? (err instanceof LedgerInsufficientCreditsError
+            ? 'IMAGE_BILLING_INSUFFICIENT'
+            : imageUpstreamSucceeded
+              ? 'IMAGE_PROCESSING_FAILED'
+              : imageUpstreamFailureCode
+                ?? (err instanceof ImageUpstreamError
+                  ? (err.status === 429 ? 'IMAGE_UPSTREAM_RATE_LIMITED' : err.status >= 500 ? 'IMAGE_UPSTREAM_FAILED' : 'IMAGE_UPSTREAM_REJECTED')
+                  : 'IMAGE_RELAY_FAILED'))
+      if (deps.pgPool && imageRequestId && activeImageAttemptId) {
+        await finishImageUpstreamAttempt(deps.pgPool, {
+          userId: BigInt(identity.userId), requestId: imageRequestId,
+          attemptId: activeImageAttemptId,
+          outcome: aborted ? 'cancelled' : 'failed',
+          errorCode: stableFailureCode,
+        }).catch(() => {})
+      }
       if (deps.pgPool && imageRequestId && imageOperation) {
         await markImageUsage(deps.pgPool, {
           userId: BigInt(identity.userId), containerId: identity.containerId,
           requestId: imageRequestId, jobId: annotatedJob?.jobId ?? null, operation: imageOperation,
-          status: 'failed', errorCode: 'relay_failed',
+          status: 'failed', errorCode: stableFailureCode,
         }).catch(() => {})
       }
-      if (controller.signal.aborted) return
-      relayLog.warn('relay_fetch_failed', { err: err as Error })
+      if (aborted) return
+      const failureClass = err instanceof ImageUpstreamError
+        ? 'ImageUpstreamError'
+        : err instanceof LedgerInsufficientCreditsError
+          ? 'LedgerInsufficientCreditsError'
+          : err instanceof Error
+            ? 'Error'
+            : typeof err
+      relayLog.warn('relay_fetch_failed', {
+        errorClass: failureClass,
+        failureCode: isImageRequest ? stableFailureCode : 'RELAY_FAILED',
+      })
       if (routeContext) {
-        void markCredentialFailure(routeContext.credential.id, err instanceof Error ? err.message : String(err)).catch(() => {})
+        void markCredentialFailure(routeContext.credential.id, `relay_${failureClass}`).catch(() => {})
       }
       if (closeIfHeadersAlreadySent(res, err)) return
       if (err instanceof LedgerInsufficientCreditsError) {
         sendJsonError(res, 402, 'ERR_INSUFFICIENT_CREDITS', err.message, requestId)
       } else if (err instanceof ImageUpstreamError) {
         // 失败原因透传(task 3):把上游失败的粗粒度归类 code 带回,gateway 本地化文案。
-        // 原始 upstream body 不透传(仅入结构化日志),这里只给稳定 code + 安全兜底文案。
+        // 原始 upstream body 只在内存中归类，不透传也不记日志；这里只给稳定 code + 安全兜底文案。
         const code = imageUpstreamFailureCode
           ?? (err.status === 429 ? 'IMAGE_UPSTREAM_RATE_LIMITED' : err.status >= 500 ? 'IMAGE_UPSTREAM_FAILED' : 'IMAGE_UPSTREAM_REJECTED')
         const status = imageUpstreamClientStatus(code, err.status)

@@ -39,6 +39,7 @@ import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 const DEEPSEEK_ROUTE = { kind: "static" as const, provider: getStaticProvider("deepseek") };
 const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("minimax") };
 const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
+const OPENCODEGO_ROUTE = { kind: "static" as const, provider: getStaticProvider("opencodego") };
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
@@ -137,6 +138,13 @@ describe("selectUpstreamRoute", () => {
       const r = selectUpstreamRoute(m);
       assert.equal(r.kind, "static");
       if (r.kind === "static") assert.equal(r.provider.id, "ark");
+    }
+  });
+  test("qwen3.7-max / plus → static/opencodego", () => {
+    for (const m of ["qwen3.7-max", "qwen3.7-plus"]) {
+      const r = selectUpstreamRoute(m);
+      assert.equal(r.kind, "static");
+      if (r.kind === "static") assert.equal(r.provider.id, "opencodego");
     }
   });
   test("其它 model → kind=oauth", () => {
@@ -442,6 +450,58 @@ describe("pickUpstream — Ark output_config effort 白名单清洗", () => {
     assert.equal(cleanse(s, ["max"]), undefined); // array(typeof==object)被 Array.isArray 排除
     assert.equal(cleanse(s, null), undefined);
     assert.equal(cleanse(s, undefined), undefined);
+  });
+});
+
+// ─── OpenCode Go signature-bound history retention ─────────────────────
+
+describe("pickUpstream — OpenCode Go 同 provider 历史", () => {
+  test("合法签名块首发原样保留，且不改持久历史", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "QWEN-KEY" } },
+      bodyFor("qwen3.7-max"),
+      OPENCODEGO_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const messages = [
+      { role: "user", content: [{ type: "thinking", thinking: "user literal" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "private", signature: "provider-A" },
+          { type: "redacted_thinking", data: "opaque" },
+          { type: "connector_text", text: "signed connector" },
+          { type: "text", text: "answer" },
+          { type: "tool_use", id: "t1", name: "Bash", input: { command: "pwd" } },
+        ],
+      },
+    ];
+    const before = structuredClone(messages);
+    const sanitized = res.session.sanitizeMessages(messages, "qwen3.7-max", log);
+
+    assert.deepEqual(messages, before, "清洗只能作用于 outbound copy，禁止改写持久历史");
+    assert.equal(sanitized, messages);
+    assert.deepEqual(sanitized, before);
+  });
+
+  test("签名块与普通文本都保留原引用", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "QWEN-KEY" } },
+      bodyFor("qwen3.7-plus"),
+      OPENCODEGO_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const onlyBound = [{ role: "assistant", content: [{ type: "thinking", thinking: "x" }] }];
+    const cleaned = res.session.sanitizeMessages(onlyBound, "qwen3.7-plus", log);
+    assert.equal(cleaned, onlyBound);
+    const plain = [{ role: "assistant", content: "plain" }];
+    assert.equal(res.session.sanitizeMessages(plain, "qwen3.7-plus", log), plain);
   });
 });
 
@@ -868,6 +928,36 @@ describe("PreparedUpstreamSession (OAuth) — sanitizeMessages", () => {
     const types = out[0].content.map((c) => c.type);
     assert.ok(!types.includes("thinking"));
     assert.ok(types.includes("text"));
+  });
+
+  test("形状合法的长签名块首发保留，由明确签名错误后的 core 重试负责跨 provider 恢复", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const messages = [{
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "foreign", signature: "q".repeat(256) },
+        { type: "redacted_thinking", data: "r".repeat(256) },
+        { type: "connector_text", text: "foreign connector" },
+        { type: "text", text: "portable answer" },
+      ],
+    }];
+    const before = structuredClone(messages);
+    const out = res.session.sanitizeMessages(messages, "claude-sonnet-4-6", log) as Array<{
+      content: Array<{ type: string }>;
+    }>;
+    assert.deepEqual(messages, before);
+    assert.equal(out, messages);
   });
 });
 

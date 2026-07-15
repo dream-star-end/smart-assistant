@@ -194,6 +194,23 @@ describe("pgSessionsBackend contract", () => {
     assert.equal((got.messages as MessageLike[])[0].id, "m-1");
   });
 
+  maybe("classifyClientSessions 批量区分 active/deleted/missing 并保序", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-live", userId: "u-1" }));
+    await backend.upsertClientSession(mkSession({ id: "s-deleted", userId: "u-1" }));
+    await backend.deleteClientSession("s-deleted", "u-1");
+    assert.deepEqual(await backend.classifyClientSessions([
+      { sessionId: "s-live", userId: "u-1" },
+      { sessionId: "s-deleted", userId: "u-1" },
+      { sessionId: "s-missing", userId: "u-1" },
+      { sessionId: "s-live", userId: "other-user" },
+    ]), [
+      { sessionId: "s-live", userId: "u-1", state: "active" },
+      { sessionId: "s-deleted", userId: "u-1", state: "deleted" },
+      { sessionId: "s-missing", userId: "u-1", state: "missing" },
+      { sessionId: "s-live", userId: "other-user", state: "missing" },
+    ]);
+  });
+
   maybe("upsert stale(baseSyncedAt 落后)→ rejected_stale", async () => {
     await backend.upsertClientSession(mkSession({ updatedAt: 5000 }));
     // baseSyncedAt=1000 < 现有 updated_at(5000) → 拒。

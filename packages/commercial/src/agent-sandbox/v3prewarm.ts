@@ -28,12 +28,20 @@ import type { Logger } from "../logging/logger.js";
 export function makePrewarmContainer(
   ensureRunning: (uid: bigint) => Promise<unknown>,
   log: Pick<Logger, "warn">,
+  recordFailure?: (input: { userId: bigint; correlation: string; latencyMs: number }) => void,
 ): (uid: bigint) => void {
   return function prewarm(uid: bigint): void {
+    const startedAt = Date.now();
+    const correlation = `${uid.toString()}:${startedAt}`;
     void ensureRunning(uid).catch((err: unknown) => {
+      recordFailure?.({
+        userId: uid,
+        correlation,
+        latencyMs: Date.now() - startedAt,
+      });
       log.warn("prewarm failed", {
         uid: uid.toString(),
-        error: err instanceof Error ? err.message : String(err),
+        errorClass: err instanceof Error ? err.name : typeof err,
       });
     });
   };

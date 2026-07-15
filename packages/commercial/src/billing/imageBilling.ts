@@ -5,6 +5,72 @@ import { InsufficientCreditsError } from './ledger.js'
 
 export const IMAGE2_UNIT_COST = 50n
 export const IMAGE_RESPONSE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+export const IMAGE_STALE_SWEEP_INTERVAL_MS = 60_000
+
+export async function sweepStaleImageUsage(pool: Pool, batchSize = 500): Promise<number> {
+  const boundedBatch = Math.max(1, Math.min(5000, Math.trunc(batchSize)))
+  const result = await pool.query<{ finalized: string }>(
+    `WITH stale AS (
+       SELECT id FROM image_generation_usage_records
+        WHERE status='reserved' AND updated_at < NOW()-INTERVAL '15 minutes'
+        ORDER BY updated_at,id
+        LIMIT $1 FOR UPDATE SKIP LOCKED
+     ), attempts AS (
+       UPDATE image_generation_attempts a
+          SET outcome='failed',error_code='IMAGE_STALE_TIMEOUT',completed_at=NOW()
+         FROM stale
+        WHERE a.usage_id=stale.id AND a.outcome='pending'
+       RETURNING a.id
+     ), journeys AS (
+       UPDATE image_generation_usage_records u
+          SET status='failed',error_code='IMAGE_STALE_TIMEOUT',updated_at=NOW()
+         FROM stale
+        WHERE u.id=stale.id AND u.status='reserved'
+       RETURNING u.id
+     )
+     SELECT COUNT(*)::text AS finalized FROM journeys`,
+    [boundedBatch],
+  )
+  return Number(result.rows[0]?.finalized ?? 0)
+}
+
+export interface ImageUsageSweeperHandle {
+  stop(): void
+  runNow(): Promise<number>
+}
+
+export function startImageUsageSweeper(opts: {
+  pool: Pool
+  intervalMs?: number
+  runOnStart?: boolean
+  onError?: (error: unknown) => void
+}): ImageUsageSweeperHandle {
+  const intervalMs = Math.max(10_000, opts.intervalMs ?? IMAGE_STALE_SWEEP_INTERVAL_MS)
+  let stopped = false
+  const runNow = async (): Promise<number> => {
+    if (stopped) return 0
+    try {
+      return await sweepStaleImageUsage(opts.pool)
+    } catch (error) {
+      opts.onError?.(error)
+      return -1
+    }
+  }
+  const timer = setInterval(() => { void runNow() }, intervalMs)
+  timer.unref?.()
+  if (opts.runOnStart) void runNow()
+  return {
+    stop() { stopped = true; clearInterval(timer) },
+    runNow,
+  }
+}
+
+function stableImageErrorCode(code: string | undefined): string | null {
+  if (!code) return null
+  const upper = code.trim().toUpperCase()
+  const prefixed = upper.startsWith('IMAGE_') ? upper : `IMAGE_${upper}`
+  return /^[A-Z0-9_]{1,64}$/.test(prefixed) ? prefixed : 'IMAGE_UNKNOWN'
+}
 
 export class ImageDailyLimitError extends Error {
   constructor() {
@@ -91,8 +157,16 @@ export async function reserveImageUsage(pool: Pool, args: {
       [args.userId.toString()],
     )
     await client.query(
-      `UPDATE image_generation_usage_records SET status='failed', error_code='stale_timeout', updated_at=NOW()
-       WHERE user_id=$1 AND status='reserved' AND updated_at < NOW() - INTERVAL '15 minutes'`,
+      `WITH stale AS (
+         UPDATE image_generation_usage_records
+            SET status='failed', error_code='IMAGE_STALE_TIMEOUT', updated_at=NOW()
+          WHERE user_id=$1 AND status='reserved' AND updated_at < NOW() - INTERVAL '15 minutes'
+         RETURNING id
+       )
+       UPDATE image_generation_attempts a
+          SET outcome='failed', error_code='IMAGE_STALE_TIMEOUT', completed_at=NOW()
+         FROM stale
+        WHERE a.usage_id=stale.id AND a.outcome='pending'`,
       [args.userId.toString()],
     )
     const daily = await client.query<{ count: string }>(
@@ -138,6 +212,54 @@ export async function reserveImageUsage(pool: Pool, args: {
   } finally {
     client.release()
   }
+}
+
+/** Atomically records one real upstream fetch immediately before it begins.
+ * attempt_count is cumulative for the stable request journey (including paid
+ * cache recovery) and is never reset when a failed/expired row is reopened. */
+export async function beginImageUpstreamAttempt(
+  pool: Pool,
+  args: { userId: bigint; requestId: string },
+): Promise<{ attemptId: bigint; attemptNo: number }> {
+  const result = await pool.query<{ id: string; attempt_no: number }>(
+    `WITH bumped AS (
+       UPDATE image_generation_usage_records
+          SET attempt_count=attempt_count+1, last_attempt_at=NOW(), updated_at=NOW()
+        WHERE user_id=$1 AND request_id=$2 AND status='reserved'
+       RETURNING id,user_id,attempt_count
+     )
+     INSERT INTO image_generation_attempts(usage_id,user_id,attempt_no,outcome)
+     SELECT id,user_id,attempt_count,'pending' FROM bumped
+     RETURNING id::text AS id,attempt_no`,
+    [args.userId.toString(), args.requestId],
+  )
+  if (result.rowCount !== 1) throw new Error('image retry reservation is not active')
+  return { attemptId: BigInt(result.rows[0]!.id), attemptNo: result.rows[0]!.attempt_no }
+}
+
+export async function finishImageUpstreamAttempt(
+  pool: Pool,
+  args: {
+    userId: bigint
+    requestId: string
+    attemptId: bigint
+    outcome: 'succeeded' | 'failed' | 'cancelled'
+    errorCode?: string
+  },
+): Promise<boolean> {
+  const errorCode = args.outcome === 'succeeded'
+    ? null
+    : stableImageErrorCode(args.errorCode) ?? 'IMAGE_UNKNOWN'
+  const result = await pool.query(
+    `UPDATE image_generation_attempts a
+        SET outcome=$4,error_code=$5,completed_at=NOW()
+       FROM image_generation_usage_records u
+      WHERE a.id=$1 AND a.usage_id=u.id
+        AND u.user_id=$2 AND u.request_id=$3
+        AND a.outcome='pending'`,
+    [args.attemptId.toString(), args.userId.toString(), args.requestId, args.outcome, errorCode],
+  )
+  return result.rowCount === 1
 }
 
 export async function settleImageCharge(
@@ -247,6 +369,7 @@ export async function markImageUsage(
     errorCode?: string
   },
 ): Promise<void> {
+  const errorCode = stableImageErrorCode(args.errorCode)
   await pool.query(
     `INSERT INTO image_generation_usage_records
        (user_id,container_id,request_id,job_id,operation,status,error_code)
@@ -262,7 +385,7 @@ export async function markImageUsage(
       args.jobId ?? null,
       args.operation,
       args.status,
-      args.errorCode ?? null,
+      errorCode,
     ],
   )
 }

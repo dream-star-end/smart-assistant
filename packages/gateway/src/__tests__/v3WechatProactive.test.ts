@@ -2,7 +2,7 @@
  * 容器 → master 主动微信投递 client 单测。
  *
  * 覆盖 master outcome → 容器决策(ProactiveDeliveryResult)的分类,以及
- * 网络/HTTP/非法 JSON 错误一律回退 web 不标注(配置/网络问题非用户会话问题)。
+ * 网络/HTTP/非法 JSON 错误保留为可重试/永久失败,避免跨通道重复。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/v3WechatProactive.test.ts
  */
@@ -52,16 +52,22 @@ describe('v3WechatProactive client', () => {
     assert.deepEqual(await send(mockFetcher(200, { outcome: 'no_binding' })), { kind: 'fallback', marked: false })
   })
 
-  test('non-2xx → fallback unmarked', async () => {
-    assert.deepEqual(await send(mockFetcher(500, { outcome: 'queued' })), { kind: 'fallback', marked: false })
-    assert.deepEqual(await send(mockFetcher(404, {})), { kind: 'fallback', marked: false })
+  test('non-2xx → classified failure', async () => {
+    assert.deepEqual(await send(mockFetcher(500, { outcome: 'queued' })), {
+      kind: 'failure', retryable: true, code: 'WECHAT_MASTER_UNAVAILABLE',
+    })
+    assert.deepEqual(await send(mockFetcher(404, {})), {
+      kind: 'failure', retryable: false, code: 'WECHAT_MASTER_REJECTED',
+    })
   })
 
-  test('network error never throws → fallback unmarked', async () => {
+  test('network ambiguity is retryable with the same outbound id', async () => {
     const throwing = (async () => {
       throw new Error('ECONNREFUSED')
     }) as unknown as typeof import('undici').request
-    assert.deepEqual(await send(throwing), { kind: 'fallback', marked: false })
+    assert.deepEqual(await send(throwing), {
+      kind: 'failure', retryable: true, code: 'WECHAT_TRANSPORT_FAILED',
+    })
   })
 
   test('invalid JSON body → fallback unmarked', async () => {
@@ -70,11 +76,15 @@ describe('v3WechatProactive client', () => {
       headers: {},
       body: Readable.from([Buffer.from('not json', 'utf8')]),
     })) as unknown as typeof import('undici').request
-    assert.deepEqual(await send(badJson), { kind: 'fallback', marked: false })
+    assert.deepEqual(await send(badJson), {
+      kind: 'failure', retryable: true, code: 'WECHAT_RESPONSE_INVALID',
+    })
   })
 
-  test('unknown outcome → fallback unmarked (conservative)', async () => {
-    assert.deepEqual(await send(mockFetcher(200, { outcome: 'something_new' })), { kind: 'fallback', marked: false })
+  test('unknown outcome → retryable rather than cross-channel duplicate', async () => {
+    assert.deepEqual(await send(mockFetcher(200, { outcome: 'something_new' })), {
+      kind: 'failure', retryable: true, code: 'WECHAT_RESPONSE_INVALID',
+    })
   })
 
   test('readV3WechatProactiveConfig: both env missing → null', () => {

@@ -923,7 +923,7 @@ export function makeAnthropicProxyHandler(
       // 由 handler 调 releaseUpstreamSession(session) + session.zeroizeSecrets() 补偿。
       // DeepSeek session 的 release 是 noop(accountId=null),zeroize 也是 noop。
       try {
-        await startInflightJournal(deps.pgPool, {
+        const admitted = await startInflightJournal(deps.pgPool, {
           requestId,
           userId: uid,
           containerId: containerIdBig,
@@ -947,6 +947,28 @@ export function makeAnthropicProxyHandler(
               }
             : undefined,
         });
+        if (!admitted) {
+          await releaseUpstreamSession(
+            deps.scheduler,
+            session,
+            { kind: "client_error" },
+            userLog,
+          );
+          session.zeroizeSecrets();
+          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
+            userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
+          });
+          userLog.warn("proxy_request_id_conflict");
+          incrAnthropicProxyReject("request_id_conflict");
+          sendJsonError(
+            res,
+            409,
+            "REQUEST_ID_CONFLICT",
+            "request could not be admitted",
+            requestId,
+          );
+          return;
+        }
       } catch (err) {
         await releaseUpstreamSession(
           deps.scheduler,

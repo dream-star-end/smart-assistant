@@ -30,8 +30,9 @@
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
 
 import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
@@ -52,7 +53,7 @@ import {
   resolveSyntheticTurnModel,
   type LocalExecutionDecision,
 } from './server.js'
-import { localExecutionRejectCode } from './modelCatalogClient.js'
+import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -63,6 +64,7 @@ import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 const logger = createLogger({ module: 'cron' })
 
 const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
+const RETRY_STATE_FILE = join(paths.home, 'cron', 'retry-state.json')
 
 // 连续「余额不足」失败自动暂停阈值。余额不足是**持续性**失败(用户不充值不会自愈),
 // 放任任务按 schedule 空转 = 每次产出同一段 "API Error: 402…"(线上事故:每 5 分钟
@@ -71,6 +73,126 @@ const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
 // 等瞬时错误**不**计入 —— 平台侧故障不该替用户关任务。
 // (行注释而非 docblock:注释里出现 crontab 星号斜杠写法会截断 docblock,历史炸过套件。)
 const CREDIT_FAIL_PAUSE_THRESHOLD = 3
+
+export type CronRunOutcome =
+  | { kind: 'completed' }
+  | { kind: 'silent' }
+  | { kind: 'terminal_failure'; code: string }
+  | {
+      kind: 'retryable_failure'
+      code: string
+      retry?: { phase: 'execution' } | { phase: 'delivery'; outputFile: string }
+    }
+
+export interface CronRetryEntry {
+  dueMinuteKey: number
+  schedule: string
+  failures: number
+  nextAttemptAt: number
+  code: string
+  phase: 'execution' | 'delivery'
+  outputFile?: string
+  /** Stable sink idempotency key for this exact owned occurrence. */
+  deliveryId?: string
+}
+
+export interface CronDeliveryContext {
+  dueMinuteKey: number
+  deliveryId: string
+}
+
+export function cronDeliveryId(jobId: string, dueMinuteKey: number): string {
+  return `cron.${createHash('sha256').update(`${jobId}\0${dueMinuteKey}`).digest('hex')}`
+}
+
+/** Production adapter boundary: completion means the adapter promise resolved;
+ * rejection must propagate to the durable cron delivery outbox. */
+export async function deliverCronViaAdapter<T>(
+  adapter: { send(value: T): Promise<void> },
+  value: T,
+): Promise<void> {
+  await adapter.send(value)
+}
+
+interface CronRunDurabilityHooks {
+  /** Persist the owned due occurrence before submit can execute tools. */
+  consumeOccurrence(): Promise<void>
+  /** Persist the archived delivery payload before the first channel send. */
+  stageDelivery(outputFile: string): Promise<void>
+}
+
+export const CRON_MAX_ATTEMPTS = 4
+const CRON_RETRY_DELAYS_MS = [60_000, 120_000, 300_000] as const
+
+export function planCronRetry(
+  previous: CronRetryEntry | undefined,
+  args: {
+    dueMinuteKey: number
+    schedule: string
+    nowEpoch: number
+    code: string
+    phase?: 'execution' | 'delivery'
+    outputFile?: string
+    deliveryId?: string
+  },
+): { kind: 'retry'; entry: CronRetryEntry; delayMs: number } | { kind: 'exhausted'; attempts: number } {
+  const phase = args.phase ?? 'execution'
+  const samePhase = previous?.phase === phase && (
+    phase !== 'delivery' || previous.outputFile === args.outputFile
+  )
+  const failures = previous?.dueMinuteKey === args.dueMinuteKey && previous.schedule === args.schedule && samePhase
+    ? previous.failures + 1
+    : 1
+  if (failures >= CRON_MAX_ATTEMPTS) return { kind: 'exhausted', attempts: failures }
+  const delayMs = CRON_RETRY_DELAYS_MS[Math.min(failures - 1, CRON_RETRY_DELAYS_MS.length - 1)]
+  return {
+    kind: 'retry',
+    delayMs,
+    entry: {
+      dueMinuteKey: args.dueMinuteKey,
+      schedule: args.schedule,
+      failures,
+      nextAttemptAt: args.nowEpoch + delayMs,
+      code: args.code,
+      phase,
+      ...(phase === 'delivery' && args.outputFile ? { outputFile: args.outputFile } : {}),
+      ...(args.deliveryId ? { deliveryId: args.deliveryId } : {}),
+    },
+  }
+}
+
+function stableCronErrorClass(err: unknown): string {
+  if (typeof err === 'object' && err !== null) {
+    const code = (err as { code?: unknown }).code
+    if (typeof code === 'string' && /^[A-Z0-9_]{1,48}$/.test(code)) return code
+    if (err instanceof Error && err.name === 'AbortError') return 'AbortError'
+    if (err instanceof Error) return 'Error'
+  }
+  return typeof err
+}
+
+/** Unknown delivery exceptions are transient by default. A delivery adapter
+ * may explicitly tag a stable code with retryable=false for a permanent target
+ * rejection; bounded cron retries still terminate after CRON_MAX_ATTEMPTS. */
+export function deliveryFailureOutcome(err: unknown):
+  | { kind: 'terminal_failure'; code: string }
+  | { kind: 'retryable_failure'; code: string } {
+  const tagged = typeof err === 'object' && err !== null
+    ? err as { code?: unknown; retryable?: unknown }
+    : null
+  const code = typeof tagged?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(tagged.code)
+    ? tagged.code
+    : 'DELIVERY_TRANSIENT'
+  return tagged?.retryable === false
+    ? { kind: 'terminal_failure', code }
+    : { kind: 'retryable_failure', code }
+}
+
+export function catalogRejectOutcome(code: LocalExecutionRejectCode): CronRunOutcome {
+  return code === 'MODEL_CATALOG_UNAVAILABLE'
+    ? { kind: 'retryable_failure', code }
+    : { kind: 'terminal_failure', code }
+}
 
 export interface CronJob {
   id: string
@@ -194,12 +316,63 @@ const DEFAULT_JOBS: CronJob[] = [
   },
 ]
 
+function canonicalCronSeedValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalCronSeedValue)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalCronSeedValue(child)]),
+    )
+  }
+  return value
+}
+
+function cronSeedFingerprint(job: CronJob): string {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalCronSeedValue(job)))
+    .digest('hex')
+}
+
+/** Every exact personal DEFAULT_JOBS semantic fingerprint that existed in
+ * repository history and could have reached a persistent commercial volume.
+ * Generated from the full git history of this file; groups are current/memdir
+ * (147a14e8), oc-memory CLI (80697968), original MCP defaults (948f69ab and
+ * earlier), plus the two older heartbeat prompt revisions. Do not replace this
+ * allowlist with fuzzy id/name matching. */
+const KNOWN_DEFAULT_CRON_SEED_FINGERPRINTS = new Set([
+  // 147a14e8+
+  '1080714f0958de174435357d007ecc2bff95cad6272f8415ff677b37f2b7e81c',
+  '4290bc62d5dac58463c532212843042224d97f91dda84f54d563b3018e3711f7',
+  'ada7d700379a8de7813cd7f1e94ac4087741f7da85da509696e204e1b00fb0b3',
+  '367fb7b20f1a6e56555f52e49ddeb89bef295fd00c633c5c4f1396fcb26dd624',
+  // 80697968
+  'bc694c21d0d73bc7f5eb3e529ebd8582ad8c3f8f0c93cdf8a7efc0dace5ba0ea',
+  '86a297d04726ef85ad3628e84a03eab60ed6f662e1326491df3d190bc1bc76cf',
+  'b9f396f9279c17a57a42fe79bf35602cf94bcef24ad963477a6e0c156e2c8e6d',
+  'f8d1b45da9c29e8c9fa0d8b07917d32200fba468dbf2bc48573e7573ab3c7332',
+  // 948f69ab and earlier production defaults
+  '10645f9c4032d6bd43d54463b51ff5f0cef515fb3aa2c989607130fdb9c2c66f',
+  '33dd9c4010e3ce17e8ea8f4ffe74e4de1e5c980a1a05e1a05c669a9d88914741',
+  '3e732d9b8413b60f618288545674c54fe1678a6f5024a1e7953318c7759099c4',
+  'faffde435d553e2b6b637e4c7c87afb1f8a3263c6eedfd718619ffcd59efd88e',
+  '98192ae8724857e481c1e961d2082fedeac9ef6bb4155c5d97ab8bcd5d5bc311',
+  'f50a77b27538aa330348cf2e88489447abf5249e9a438e4195a3ec342f5bba34',
+])
+
+/** Exact legacy seed fingerprint. Commercial containers may remove only an
+ * untouched known personal default. Any top-level/nested field addition or
+ * edit changes the canonical fingerprint and preserves the user's job. */
+export function isUntouchedDefaultCronJob(job: CronJob): boolean {
+  return KNOWN_DEFAULT_CRON_SEED_FINGERPRINTS.has(cronSeedFingerprint(job))
+}
+
 export async function ensureCronFile(): Promise<CronFile> {
   const path = paths.cronYaml
   if (!existsSync(path)) {
     await mkdir(dirname(path), { recursive: true })
-    // Controls only the first-time bootstrap when cron.yaml is missing.
-    // Existing cron.yaml files and user-created jobs are left untouched.
+    // Controls first-time bootstrap. Existing commercial files are also
+    // scrubbed below, but only for exact untouched legacy seed fingerprints.
     // Set OC_SEED_DEFAULT_CRON=0 in v3 commercial containers to skip seeding
     // the personal-version self-reflection jobs (they would burn user credits).
     const seedDefaults = process.env.OC_SEED_DEFAULT_CRON !== '0'
@@ -209,7 +382,18 @@ export async function ensureCronFile(): Promise<CronFile> {
   }
   try {
     const raw = await readFile(path, 'utf-8')
-    return parseYaml(raw) as CronFile
+    const file = parseYaml(raw) as CronFile
+    // Commercial images historically inherited the personal seed before
+    // OC_SEED_DEFAULT_CRON=0 was introduced. Remove only byte-for-byte semantic
+    // defaults; modified or user-created jobs remain untouched.
+    if (process.env.OC_SEED_DEFAULT_CRON === '0' && Array.isArray(file.jobs)) {
+      const kept = file.jobs.filter((job) => !isUntouchedDefaultCronJob(job))
+      if (kept.length !== file.jobs.length) {
+        file.jobs = kept
+        await atomicWriteYaml(path, file)
+      }
+    }
+    return file
   } catch {
     return { jobs: [] }
   }
@@ -229,6 +413,55 @@ async function saveLastRun(map: Record<string, number>): Promise<void> {
   const tmp = LAST_RUN_FILE + `.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(map, null, 2))
   await rename(tmp, LAST_RUN_FILE)
+}
+
+async function loadRetryState(): Promise<Map<string, CronRetryEntry>> {
+  if (!existsSync(RETRY_STATE_FILE)) return new Map()
+  try {
+    const parsed = JSON.parse(await readFile(RETRY_STATE_FILE, 'utf8')) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return new Map()
+    const out = new Map<string, CronRetryEntry>()
+    for (const [jobId, value] of Object.entries(parsed)) {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+      const row = value as Partial<CronRetryEntry>
+      const phase = row.phase === 'delivery' ? 'delivery' : 'execution'
+      const validOutput = phase === 'execution' || (
+        typeof row.outputFile === 'string' &&
+        row.outputFile === basename(row.outputFile) &&
+        row.outputFile.length >= 1 && row.outputFile.length <= 240
+      )
+      const deliveryId = typeof row.deliveryId === 'string' && /^[A-Za-z0-9._:-]{8,128}$/.test(row.deliveryId)
+        ? row.deliveryId
+        : cronDeliveryId(jobId, Number(row.dueMinuteKey))
+      if (
+        Number.isSafeInteger(row.dueMinuteKey) &&
+        typeof row.schedule === 'string' && row.schedule.length <= 128 &&
+        Number.isSafeInteger(row.failures) &&
+        Number(row.failures) >= (phase === 'delivery' ? 0 : 1) &&
+        Number(row.failures) < CRON_MAX_ATTEMPTS &&
+        Number.isSafeInteger(row.nextAttemptAt) && Number(row.nextAttemptAt) >= 0 &&
+        typeof row.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(row.code) &&
+        validOutput
+      ) {
+        out.set(jobId, {
+          dueMinuteKey: row.dueMinuteKey!, schedule: row.schedule!, failures: row.failures!,
+          nextAttemptAt: row.nextAttemptAt!, code: row.code!, phase,
+          ...(phase === 'delivery' ? { outputFile: row.outputFile! } : {}),
+          deliveryId,
+        })
+      }
+    }
+    return out
+  } catch {
+    return new Map()
+  }
+}
+
+async function saveRetryState(map: Map<string, CronRetryEntry>): Promise<void> {
+  await mkdir(dirname(RETRY_STATE_FILE), { recursive: true })
+  const tmp = RETRY_STATE_FILE + `.${process.pid}.${++_writeCounter}.tmp`
+  await writeFile(tmp, JSON.stringify(Object.fromEntries(map), null, 2))
+  await rename(tmp, RETRY_STATE_FILE)
 }
 
 /** Atomically write a YAML file by writing to a unique .tmp then renaming. */
@@ -430,7 +663,7 @@ export function resolveDueMinute(
   const nowMinuteKey = Math.floor(nowEpoch / 60_000)
   const last = lastRun[job.id]
   // Current minute: exact same rule as the pre-catch-up scheduler.
-  if (cronMatches(job.schedule, localNow) && last !== nowMinuteKey) {
+  if (cronMatches(job.schedule, localNow) && (last === undefined || last < nowMinuteKey)) {
     return nowMinuteKey
   }
   if (catchupMin <= 0) return null
@@ -454,6 +687,31 @@ export function resolveDueMinute(
     return null
   }
   return null
+}
+
+/** Selects the exact occurrence owned by a job. A valid persisted retry takes
+ * precedence over current/catch-up matches, so high-frequency schedules cannot
+ * merge a newer occurrence into an older failed delivery. */
+export function resolveCronOccurrence(
+  job: Pick<CronJob, 'id' | 'schedule' | 'createdAt'>,
+  lastRun: Record<string, number>,
+  retry: CronRetryEntry | undefined,
+  nowEpoch: number,
+  localNow: Date,
+  catchupMin: number,
+): number | null {
+  if (retry && retry.schedule === job.schedule) {
+    // Execution retries are stale once the occurrence is consumed. Delivery
+    // outbox entries are different: submit/tool execution was intentionally
+    // consumed before the send, and the archived payload must still drain.
+    if (
+      retry.phase !== 'delivery' &&
+      lastRun[job.id] !== undefined && lastRun[job.id]! >= retry.dueMinuteKey
+    ) return null
+    if (retry.nextAttemptAt > nowEpoch) return null
+    return retry.dueMinuteKey
+  }
+  return resolveDueMinute(job, lastRun, nowEpoch, localNow, catchupMin)
 }
 
 // ── Runtime quotas (container API create/update paths only) ──────────────────
@@ -549,11 +807,51 @@ export class CronScheduler {
   /** job.id → 连续「余额不足」失败次数(内存态,容器重启清零 —— 失败仍在就会重新累积,
    *  最多多试 CREDIT_FAIL_PAUSE_THRESHOLD 轮,可接受)。成功产出即清零。 */
   private creditFailStreak = new Map<string, number>()
+  /** Retry state is persisted and bound to the exact due minute + schedule.
+   * It survives catch-up expiry/restarts and cannot be mixed with a newer fire. */
+  private retryState = new Map<string, CronRetryEntry>()
+
+  private async persistRetryState(): Promise<void> {
+    await saveRetryState(this.retryState)
+  }
+
+  private async persistLastRun(map: Record<string, number>): Promise<void> {
+    await saveLastRun(map)
+  }
+
+  private async stageDeliveryOutbox(
+    job: CronJob,
+    dueMinuteKey: number,
+    nowEpoch: number,
+    outputFile: string,
+  ): Promise<void> {
+    const entry: CronRetryEntry = {
+      dueMinuteKey,
+      schedule: job.schedule,
+      failures: 0,
+      nextAttemptAt: nowEpoch,
+      code: 'DELIVERY_PENDING',
+      phase: 'delivery',
+      outputFile,
+      deliveryId: cronDeliveryId(job.id, dueMinuteKey),
+    }
+    this.retryState.set(job.id, entry)
+    try {
+      await this.persistRetryState()
+    } catch (err) {
+      this.retryState.delete(job.id)
+      throw err
+    }
+  }
 
   constructor(
     private config: OpenClaudeConfig,
     private sessions: SessionManager,
-    private onDeliver: (text: string, job: CronJob) => void | Promise<void>,
+    private onDeliver: (
+      text: string,
+      job: CronJob,
+      delivery?: CronDeliveryContext,
+    ) => void | Promise<void>,
   ) {}
 
   /**
@@ -584,7 +882,9 @@ export class CronScheduler {
     // Tick once per minute
     this.timer = setInterval(() => {
       if (this.stopped) return
-      if (!this.running) this.tick().catch((err) => logger.error('tick failed', {}, err))
+      if (!this.running) this.tick().catch((err) => logger.error('tick failed', {
+        errorClass: stableCronErrorClass(err),
+      }))
     }, 60_000)
     // Fire an initial tick 10s after boot (not immediate, to avoid startup race).
     // Track the handle so stop() can cancel it during shutdown.
@@ -612,13 +912,16 @@ export class CronScheduler {
       // memory and are flushed in a single write at the end, eliminating the
       // concurrent read-modify-write race condition.
       const lastRun = await loadLastRun()
+      this.retryState = await loadRetryState()
       const now = new Date()
       const localNow = getLocalDate()
       const agentsConfig = await readAgentsConfig()
 
       // Cleanup: remove completed oneshot jobs from yaml
       const before = file.jobs.length
-      file.jobs = file.jobs.filter((j) => !(j.oneshot && j.enabled === false))
+      file.jobs = file.jobs.filter((j) => !(
+        j.oneshot && j.enabled === false && !this.retryState.has(j.id)
+      ))
       if (file.jobs.length < before) {
         await atomicWriteYaml(paths.cronYaml, file)
       }
@@ -628,40 +931,153 @@ export class CronScheduler {
 
       const catchupMin = getCatchupMinutes()
       let lastRunDirty = false
+      let retryStateDirty = false
+      const completedRetryIds = new Set<string>()
+      const liveJobs = new Map(file.jobs.map((job) => [job.id, job]))
+      // A replaced/disabled job must not inherit an old occurrence. A retry
+      // whose due minute was already durably consumed is stale after a crash
+      // between last-run save and retry-file cleanup, so prune it without run.
+      for (const [jobId, retry] of this.retryState) {
+        const job = liveJobs.get(jobId)
+        const consumed = lastRun[jobId] !== undefined && lastRun[jobId]! >= retry.dueMinuteKey
+        const predatesCreation = job?.createdAt !== undefined && retry.dueMinuteKey * 60_000 < job.createdAt
+        if (
+          !job ||
+          (job.enabled === false && !job.oneshot) ||
+          job.schedule !== retry.schedule ||
+          (consumed && retry.phase !== 'delivery') ||
+          predatesCreation
+        ) {
+          this.retryState.delete(jobId)
+          retryStateDirty = true
+        }
+      }
       try {
         for (const job of file.jobs ?? []) {
-          if (job.enabled === false) continue
-          // Current-minute match OR most-recent bounded catch-up (see header).
-          // Returns the minuteKey to record; null = nothing due for this job.
-          const dueMinuteKey = resolveDueMinute(job, lastRun, now.getTime(), localNow, catchupMin)
+          const existingRetry = this.retryState.get(job.id)
+          if (job.enabled === false && !(job.oneshot && existingRetry)) continue
+          // A persisted retry owns its original occurrence even after the
+          // catch-up window expires. New high-frequency occurrences wait until
+          // this one reaches success/permanent failure/exhaustion.
+          const dueMinuteKey = resolveCronOccurrence(
+            job, lastRun, existingRetry, now.getTime(), localNow, catchupMin,
+          )
           if (dueMinuteKey === null) continue
-          if (isHiddenSystemAgentId(job.agent)) {
+          const deliveryContext: CronDeliveryContext = {
+            dueMinuteKey,
+            deliveryId: existingRetry?.deliveryId ?? cronDeliveryId(job.id, dueMinuteKey),
+          }
+          let outcome: CronRunOutcome
+          if (existingRetry?.phase === 'delivery') {
+            outcome = await this.retryArchivedDelivery(job, existingRetry)
+          } else if (isHiddenSystemAgentId(job.agent)) {
             logger.warn(`job ${job.id}: hidden system agent rejected`, {
               jobId: job.id,
               agent: job.agent,
             })
-            continue
+            outcome = { kind: 'terminal_failure', code: 'HIDDEN_SYSTEM_AGENT' }
+          } else {
+            const agent = agentsConfig.agents.find((a) => a.id === job.agent)
+            if (!agent) {
+              logger.warn(`job ${job.id}: agent ${job.agent} not found`, {
+                jobId: job.id,
+                agent: job.agent,
+              })
+              outcome = { kind: 'terminal_failure', code: 'AGENT_NOT_FOUND' }
+            } else {
+              try {
+                outcome = await this.runJob(job, agent, {
+                  consumeOccurrence: async () => {
+                    // At-most-once execution boundary: once submit may run
+                    // tools, a crash must never replay the occurrence. A
+                    // one-shot is disabled first so it cannot fire on a later
+                    // schedule after restart.
+                    if (job.oneshot && job.enabled !== false) {
+                      job.enabled = false
+                      await saveCronFile(await ensureCronFile(), job)
+                    }
+                    lastRun[job.id] = dueMinuteKey
+                    await this.persistLastRun(lastRun)
+                    lastRunDirty = false
+                  },
+                  stageDelivery: async (outputFile) => {
+                    await this.stageDeliveryOutbox(
+                      job, dueMinuteKey, now.getTime(), outputFile,
+                    )
+                    retryStateDirty = false
+                  },
+                }, deliveryContext)
+              } catch (err) {
+                logger.error(`job ${job.id} execution failed`, {
+                  jobId: job.id,
+                  errorClass: stableCronErrorClass(err),
+                })
+                // Unknown exceptions are conservative terminal failures. Once
+                // submit may have started, replaying a fresh isolated session
+                // can duplicate non-idempotent tool side effects.
+                outcome = { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
+              }
+            }
           }
-          const agent = agentsConfig.agents.find((a) => a.id === job.agent)
-          if (!agent) {
-            logger.warn(`job ${job.id}: agent ${job.agent} not found`, {
-              jobId: job.id,
-              agent: job.agent,
+          if (outcome.kind === 'retryable_failure') {
+            const planned = planCronRetry(this.retryState.get(job.id) ?? existingRetry, {
+              dueMinuteKey,
+              schedule: job.schedule,
+              nowEpoch: now.getTime(),
+              code: outcome.code,
+              phase: outcome.retry?.phase,
+              outputFile: outcome.retry?.phase === 'delivery' ? outcome.retry.outputFile : undefined,
+              deliveryId: deliveryContext.deliveryId,
             })
-            continue
+            if (planned.kind === 'retry') {
+              this.retryState.set(job.id, planned.entry)
+              // Persist immediately. Execution retries exist only before
+              // submit, so replay is safe. Delivery retries already have both
+              // a consumed occurrence and a persisted pending outbox; if this
+              // update fails, the older outbox still prevents agent replay.
+              await this.persistRetryState()
+              retryStateDirty = false
+              logger.warn(`job ${job.id} will retry after transient failure`, {
+                jobId: job.id,
+                code: outcome.code,
+                attempt: planned.entry.failures,
+                retryInMs: planned.delayMs,
+                dueMinuteKey,
+              })
+              continue
+            }
+            logger.warn(`job ${job.id} exhausted transient retries`, {
+              jobId: job.id,
+              code: outcome.code,
+              attempts: planned.attempts,
+              dueMinuteKey,
+            })
+            outcome = { kind: 'terminal_failure', code: 'RETRY_EXHAUSTED' }
           }
-          await this.runJob(job, agent)
+          // A one-shot remains enabled across retryable failures. Completed,
+          // silent, permanent and explicitly exhausted outcomes consume it.
+          if (job.oneshot) {
+            job.enabled = false
+            await saveCronFile(await ensureCronFile(), job)
+          }
           // Record the minute that actually fired (catch-up records the missed
           // minute M, not "now") so it stays idempotent across restarts.
           lastRun[job.id] = dueMinuteKey
           lastRunDirty = true
+          if (this.retryState.has(job.id)) completedRetryIds.add(job.id)
         }
       } finally {
-        // Always flush completed job timestamps so a later failure doesn't replay
-        // already-run jobs on the next tick.
+        // Ordering is intentional:durably consume the due minute before deleting
+        // its retry entry. A crash in between leaves a delivery outbox to drain
+        // (never a reason to execute the agent again).
         if (lastRunDirty) {
-          await saveLastRun(lastRun)
+          await this.persistLastRun(lastRun)
         }
+        for (const jobId of completedRetryIds) {
+          this.retryState.delete(jobId)
+          retryStateDirty = true
+        }
+        if (retryStateDirty) await this.persistRetryState()
       }
       // Refresh master's wake index if the derived (nextFireAt, enabledCount)
       // changed this tick (jobs may have been disabled by oneshot cleanup/run).
@@ -672,7 +1088,59 @@ export class CronScheduler {
     }
   }
 
-  private async runJob(job: CronJob, agent: AgentDef): Promise<void> {
+  private async retryArchivedDelivery(job: CronJob, retry: CronRetryEntry): Promise<CronRunOutcome> {
+    if (
+      retry.phase !== 'delivery' || !retry.outputFile ||
+      retry.outputFile !== basename(retry.outputFile)
+    ) {
+      return { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_INVALID' }
+    }
+    let text: string
+    try {
+      text = await readFile(join(paths.cronOutputsDir, retry.outputFile), 'utf8')
+    } catch (err) {
+      const missing = typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT'
+      logger.warn(`delivery payload read failed for ${job.id}`, {
+        jobId: job.id,
+        code: missing ? 'DELIVERY_PAYLOAD_MISSING' : 'DELIVERY_PAYLOAD_READ_FAILED',
+        errorClass: stableCronErrorClass(err),
+      })
+      return missing
+        ? { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_MISSING' }
+        : {
+            kind: 'retryable_failure', code: 'DELIVERY_PAYLOAD_READ_FAILED',
+            retry: { phase: 'delivery', outputFile: retry.outputFile },
+          }
+    }
+    try {
+      await this.onDeliver(text.trim(), job, {
+        dueMinuteKey: retry.dueMinuteKey,
+        deliveryId: retry.deliveryId ?? cronDeliveryId(job.id, retry.dueMinuteKey),
+      })
+      return { kind: 'completed' }
+    } catch (err) {
+      const failure = deliveryFailureOutcome(err)
+      logger.warn(`archived delivery failed for ${job.id}`, {
+        jobId: job.id,
+        code: failure.code,
+        errorClass: stableCronErrorClass(err),
+        retryable: failure.kind === 'retryable_failure',
+      })
+      return failure.kind === 'retryable_failure'
+        ? { ...failure, retry: { phase: 'delivery', outputFile: retry.outputFile } }
+        : failure
+    }
+  }
+
+  private async runJob(
+    job: CronJob,
+    agent: AgentDef,
+    durability: CronRunDurabilityHooks,
+    deliveryContext: CronDeliveryContext = {
+      dueMinuteKey: Math.floor(Date.now() / 60_000),
+      deliveryId: cronDeliveryId(job.id, Math.floor(Date.now() / 60_000)),
+    },
+  ): Promise<CronRunOutcome> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
     // Isolated session per execution for ALL jobs (heartbeat included).
@@ -696,9 +1164,8 @@ export class CronScheduler {
     // codex 意图仍按真值表**降级为非 codex**(既有语义,cron 无 server-owned requestId)。
     // 投影拉不到 → 抛 → 本 job 本次不执行(**无 baked 回落**,R1-B1)。
     // flag 未开(个人版/过渡期)→ undefined → 完全沿用上面的 baked 合成降级,零变化。
-    // 判定失败(投影不可用 / 模型不可用 / codex pin)→ **本 job 跳过本次执行**,不上抛:
-    // runJob 的异常会中断整个 tick 的 for 循环,一个 pin 到 disabled 模型的 job 会永久
-    // 饿死排在它后面的所有 job。这里就地记日志 + return(lastRun 照记,不产生重试风暴)。
+    // 判定失败用结构化 outcome 返回:catalog 临时不可用不消费本次 schedule,
+    // 永久不支持则消费；tick 对每个 job 独立处理，单项失败不会饿死后续任务。
     let cronExec: LocalExecutionDecision | undefined
     try {
       cronExec = await resolveLocalExecutionIfEnforced({
@@ -715,7 +1182,7 @@ export class CronScheduler {
         agent: agent.id,
         code,
       })
-      return
+      return catalogRejectOutcome(code)
     }
     const cronModel = cronExec?.canonicalModel ?? cronRoute?.model
     // MAJOR-2 透明化:cron 是 host 平台维护 turn(无用户面),降级记 runLog/日志即可,不需用户可见。
@@ -728,23 +1195,40 @@ export class CronScheduler {
       })
     }
 
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      ...(cronModel ? { model: cronModel } : {}),
-      ...localExecutionOverride(cronExec),
-      channel: 'cron',
-      peerId: job.id,
-      title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
-      // Tag this run as a cron workload so CCB stamps
-      // `cc_workload=cron;` into the attribution billing-header.
-      // Lets Anthropic serve scheduled jobs at lower QoS and keeps
-      // automation traffic from competing with interactive turns for
-      // the user's rate-limit headroom — directly mitigates the
-      // "automation abuse" ban trigger documented in the Feishu doc.
-      workload: 'cron',
-    })
+    let session: Awaited<ReturnType<SessionManager['getOrCreate']>>
+    try {
+      session = await this.sessions.getOrCreate({
+        sessionKey,
+        agent,
+        ...(cronModel ? { model: cronModel } : {}),
+        ...localExecutionOverride(cronExec),
+        channel: 'cron',
+        peerId: job.id,
+        title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
+        // Tag this run as a cron workload so CCB stamps
+        // `cc_workload=cron;` into the attribution billing-header.
+        workload: 'cron',
+      })
+    } catch (err) {
+      // No submit/tool execution has started, so a bounded retry is safe.
+      logger.warn(`job ${job.id} session creation failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'SESSION_CREATE_FAILED' }
+    }
+    try {
+      await durability.consumeOccurrence()
+    } catch (err) {
+      await this.sessions.destroySession(sessionKey).catch(() => {})
+      logger.warn(`job ${job.id} occurrence persistence failed before submit`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
+    }
     let output = ''
+    let submitError: unknown = null
     try {
       await this.sessions.submit(
         session,
@@ -757,6 +1241,8 @@ export class CronScheduler {
         // model: 与 getOrCreate 同源;非 codex agent 为 undefined(不覆盖)。
         cronModel,
       )
+    } catch (err) {
+      submitError = err
     } finally {
       // All jobs use isolated sessions — always destroy, even if submit()
       // threw, otherwise the subprocess + resume-map entry would leak until
@@ -764,33 +1250,47 @@ export class CronScheduler {
       await this.sessions
         .destroySession(sessionKey)
         .catch((err) =>
-          logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
+          logger.warn(`destroySession failed for ${job.id}`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          }),
         )
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
+    let archivedOutputFile: string | null = null
     try {
       await mkdir(dirname(outPath), { recursive: true })
       await writeFile(outPath, output)
-    } catch {}
-    // One-shot jobs: disable after first run, regardless of delivery outcome
-    if (job.oneshot) {
-      logger.info(`job ${job.id} is one-shot, disabling`, { jobId: job.id })
-      job.enabled = false
-      await saveCronFile(await ensureCronFile(), job)
+      archivedOutputFile = basename(outPath)
+    } catch (err) {
+      logger.warn(`job ${job.id} output archive failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
     }
-
+    if (submitError !== null) {
+      logger.warn(`job ${job.id} submit failed after execution began`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(submitError),
+      })
+      return { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
+    }
     // Skip delivery for silence markers AND genuinely empty output. The empty
     // case covers subprocess crashes / API failures mid-turn: without this
     // guard, the user sees an orphan "💓 heartbeat" card with no content.
     const trimmed = output.trim()
-    if (!trimmed || trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
+    if (!trimmed) {
+      logger.warn(`job ${job.id} produced empty output`, { jobId: job.id })
+      return { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' }
+    }
+    if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
       logger.info(`job ${job.id} silent/empty, not delivering`, {
         jobId: job.id,
-        reason: !trimmed ? 'empty' : trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
+        reason: trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
       })
-      return
+      return { kind: 'silent' }
     }
 
     // 引擎 API 错误产出 = 失败,不是结果。CCB 把上游失败以 "API Error: …" 文本块
@@ -805,7 +1305,6 @@ export class CronScheduler {
       logger.warn(`job ${job.id} produced engine API error, suppressing delivery`, {
         jobId: job.id,
         code: apiErr.code,
-        detail: apiErr.detail.slice(0, 200),
       })
       if (apiErr.code === 'insufficient_credits') {
         const fails = (this.creditFailStreak.get(job.id) ?? 0) + 1
@@ -824,13 +1323,20 @@ export class CronScheduler {
               `⏸️ 定时任务「${label}」已自动暂停:连续 ${fails} 次因积分余额不足执行失败。` +
                 `充值后在管理中心重新启用该任务,或直接在对话里让我帮你重新开启。`,
               job,
+              deliveryContext,
             )
           } catch (err) {
-            logger.warn(`pause notice delivery failed for ${job.id}`, { jobId: job.id }, err as Error)
+            logger.warn(`pause notice delivery failed for ${job.id}`, {
+              jobId: job.id,
+              errorClass: stableCronErrorClass(err),
+            })
           }
         }
       }
-      return
+      // The engine error is observed only after submit completed and may follow
+      // successful tool calls. Consume this occurrence; a fresh session replay
+      // would be an unsafe at-least-once execution of those side effects.
+      return { kind: 'terminal_failure', code: apiErr.code.toUpperCase() }
     }
     // 正常产出 → 清失败计数(偶发失败不累积成误杀)。
     this.creditFailStreak.delete(job.id)
@@ -842,12 +1348,43 @@ export class CronScheduler {
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
     } else {
+      if (!archivedOutputFile) {
+        return { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_UNAVAILABLE' }
+      }
+      try {
+        await durability.stageDelivery(archivedOutputFile)
+      } catch (err) {
+        logger.warn(`delivery outbox persistence failed for ${job.id}`, {
+          jobId: job.id,
+          errorClass: stableCronErrorClass(err),
+        })
+        // The occurrence was already consumed before submit. Do not send
+        // without an outbox and, crucially, never re-run model/tool effects.
+        return { kind: 'terminal_failure', code: 'DELIVERY_OUTBOX_WRITE_FAILED' }
+      }
       logger.info(`delivering job ${job.id} to ${job.deliver}`, {
         jobId: job.id,
         deliver: job.deliver,
       })
-      await this.onDeliver(trimmed, job)
+      try {
+        await this.onDeliver(trimmed, job, deliveryContext)
+      } catch (err) {
+        const failure = deliveryFailureOutcome(err)
+        logger.warn(`delivery failed for ${job.id}`, {
+          jobId: job.id,
+          code: failure.code,
+          errorClass: stableCronErrorClass(err),
+          retryable: failure.kind === 'retryable_failure',
+        })
+        if (failure.kind === 'retryable_failure') {
+          return archivedOutputFile
+            ? { ...failure, retry: { phase: 'delivery', outputFile: archivedOutputFile } }
+            : { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_UNAVAILABLE' }
+        }
+        return failure
+      }
     }
+    return { kind: 'completed' }
   }
 
   /**

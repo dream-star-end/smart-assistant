@@ -33,6 +33,7 @@ import {
   rewriteMetadataAccountUuid,
   rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
+  stripProviderBoundAssistantBlocks,
   stripNonTextContentBlocks,
   isUuidLike,
   DEEPSEEK_UPSTREAM_ENDPOINT,
@@ -1348,7 +1349,6 @@ describe("stripNonTextContentBlocks", () => {
     const estimateIdx = src.indexOf("const inputTokens = estimateInputTokens(body)");
     assert.ok(estimateIdx >= 0, "必须存在 const inputTokens = estimateInputTokens(body) 调用");
     assert.ok(stripIdx < estimateIdx, "strip 必须在 estimateInputTokens(body) 之前");
-
     // strip 必须 gated 在 `if (route.kind === "static" && !modelSupportsVision)` 内:
     // 只对静态**纯文本**模型 strip;MiniMax-M3 等原生识图的模型不 strip。
     //
@@ -1382,6 +1382,23 @@ describe("stripNonTextContentBlocks", () => {
       /const modelSupportsVision = gate[\s\S]{0,200}capabilityProfile\.supportsVision/,
       "modelSupportsVision 必须优先取 catalog descriptor 的 per-model capability",
     );
+  });
+
+  test("provider-bound retry sanitizer lowers the retry body without mutating persistent history", () => {
+    const messages = [{
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "x".repeat(400_000), signature: "s".repeat(256) },
+        { type: "connector_text", text: "c".repeat(400_000) },
+        { type: "text", text: "visible" },
+      ],
+    }];
+    const before = structuredClone(messages);
+    const cleaned = stripProviderBoundAssistantBlocks(messages);
+    const rawEstimate = estimateInputTokens({ model: "qwen3.7-max", max_tokens: 1, messages } as ProxyBody);
+    const cleanEstimate = estimateInputTokens({ model: "qwen3.7-max", max_tokens: 1, messages: cleaned.messages } as ProxyBody);
+    assert.ok(cleanEstimate < rawEstimate / 100, "removed opaque blocks must not inflate cap/preCheck");
+    assert.deepEqual(messages, before, "copy-on-write sanitizer must not rewrite persisted history");
   });
 });
 
@@ -1564,12 +1581,21 @@ describe("isUuidLike", () => {
 // ─── makeFinalizer.commit — 零输出免单(模型无响应/超时不扣费) ─────────────
 
 describe("makeFinalizer.commit → 零输出免单", () => {
-  function makeStubs() {
+  function makeStubs(opts: {
+    failJournalFinalize?: boolean;
+    commitThrowsButUsageVisible?: boolean;
+    finalizingClaimed?: boolean;
+  } = {}) {
     const queriedSql: string[] = [];
+    const usageSnapshots: string[] = [];
     const stubClient = {
-      query: async (sql: string, _params?: unknown[]) => {
+      query: async (sql: string, params?: unknown[]) => {
         queriedSql.push(sql);
+        if (sql === "COMMIT" && opts.commitThrowsButUsageVisible) {
+          throw new Error("connection lost after COMMIT");
+        }
         if (sql.includes("INSERT INTO usage_records")) {
+          usageSnapshots.push(String(params?.[8] ?? ""));
           return { rows: [{ id: "9001" }], rowCount: 1 } as never;
         }
         // spendTwoBucket 依赖:钱包行锁 / 期内桶行锁 / ledger 插入
@@ -1589,13 +1615,25 @@ describe("makeFinalizer.commit → 零输出免单", () => {
     const stubPool = {
       query: async (sql: string, _params?: unknown[]) => {
         queriedSql.push(sql);
+        if (sql.includes("SET state='finalizing'")) {
+          return { rows: [], rowCount: opts.finalizingClaimed === false ? 0 : 1 } as never;
+        }
+        if (opts.commitThrowsButUsageVisible && sql.includes("FROM usage_records WHERE user_id")) {
+          return { rows: [{ id: "9001", ledger_id: "7001" }], rowCount: 1 } as never;
+        }
+        if (opts.failJournalFinalize && sql.includes("SET state='committed'")) {
+          throw new Error("journal finalize unavailable");
+        }
+        if (sql.includes("UPDATE request_finalize_journal")) {
+          return { rows: [], rowCount: 1 } as never;
+        }
         return { rows: [], rowCount: 0 } as never;
       },
       connect: async () => stubClient,
     };
     const stubScheduler = { release: async () => {} };
     const stubRedis = { releaseReservation: async () => true };
-    return { queriedSql, stubPool, stubScheduler, stubRedis };
+    return { queriedSql, usageSnapshots, stubPool, stubScheduler, stubRedis };
   }
 
   const baseCtx = {
@@ -1611,7 +1649,7 @@ describe("makeFinalizer.commit → 零输出免单", () => {
   };
 
   test("kind=final 但 output_tokens=0 → finalCredits=0,不走双钱包扣费", async () => {
-    const { queriedSql, stubPool, stubScheduler, stubRedis } = makeStubs();
+    const { queriedSql, usageSnapshots, stubPool, stubScheduler, stubRedis } = makeStubs();
     const f = makeFinalizer(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
@@ -1633,6 +1671,7 @@ describe("makeFinalizer.commit → 零输出免单", () => {
       !queriedSql.some((s) => s.includes("period_credits") || s.includes("credit_ledger")),
       "免单路径不得写 ledger/扣桶",
     );
+    assert.equal(JSON.parse(usageSnapshots[0]!).waived, "no_output", "免单原因必须进入持久 pricing snapshot");
   });
 
   test("对照:同 input 但 output_tokens>0 → 正常计费(finalCredits>0)", async () => {
@@ -1652,5 +1691,86 @@ describe("makeFinalizer.commit → 零输出免单", () => {
     });
     assert.equal(out.state, "committed");
     assert.ok(out.finalCredits > 0n, "有输出必须照常计费");
+  });
+
+  test("usage/ledger 已提交但 journal CAS 失败 → 保持可恢复 committed，绝不回退 aborted", async () => {
+    const { queriedSql, stubPool, stubScheduler, stubRedis } = makeStubs({ failJournalFinalize: true });
+    const f = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      {
+        ...baseCtx,
+        requestId: "req-journal-finalize-pending",
+        preCheckReservation: { userId: "u1", requestId: "req-journal-finalize-pending" },
+      },
+    );
+    const out = await f.commit({
+      kind: "final",
+      usage: { input_tokens: 2_000, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0 },
+    });
+    assert.equal(out.state, "committed", "financial settlement is authoritative after COMMIT");
+    assert.equal(
+      queriedSql.filter((sql) => sql.includes("SET state='aborted'")).length,
+      0,
+      "journal finalize failure must remain finalizing for reconciler",
+    );
+  });
+
+  test("reconciler 已先 abort → late commit 不产生 usage/ledger 或扣费", async () => {
+    const { queriedSql, stubPool, stubScheduler, stubRedis } = makeStubs({
+      finalizingClaimed: false,
+    });
+    const f = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      {
+        ...baseCtx,
+        requestId: "req-late-after-reconciler-abort",
+        preCheckReservation: { userId: "u1", requestId: "req-late-after-reconciler-abort" },
+      },
+    );
+    const out = await f.commit({
+      kind: "final",
+      usage: { input_tokens: 2_000, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0 },
+    });
+    assert.equal(out.state, "aborted");
+    assert.equal(out.finalCredits, 0n);
+    assert.equal(
+      queriedSql.some((sql) => sql.includes("SET state='aborted'")),
+      false,
+      "claim loser must not abort the current settlement owner",
+    );
+    assert.equal(
+      queriedSql.some((sql) =>
+        sql.includes("INSERT INTO usage_records") ||
+        sql.includes("INSERT INTO credit_ledger") ||
+        sql.includes("UPDATE users SET credits"),
+      ),
+      false,
+      "lost finalizing CAS must stop before any financial settlement",
+    );
+  });
+
+  test("COMMIT response lost but independent usage proof exists → finalize, never abort", async () => {
+    const { queriedSql, stubPool, stubScheduler, stubRedis } = makeStubs({
+      commitThrowsButUsageVisible: true,
+    });
+    const f = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      {
+        ...baseCtx,
+        requestId: "req-commit-ambiguous-visible",
+        preCheckReservation: { userId: "u1", requestId: "req-commit-ambiguous-visible" },
+      },
+    );
+    const out = await f.commit({
+      kind: "final",
+      usage: { input_tokens: 2_000, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0 },
+    });
+    assert.equal(out.state, "committed");
+    assert.equal(out.debitedCredits, null, "ambiguous replay must not rebroadcast an unverifiable debit");
+    assert.ok(queriedSql.some((sql) => sql.includes("FROM usage_records WHERE user_id")));
+    assert.equal(queriedSql.some((sql) => sql.includes("SET state='aborted'")), false);
   });
 });

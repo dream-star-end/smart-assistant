@@ -28,13 +28,13 @@ interface QueryCall {
   values: unknown[];
 }
 
-function makeMockPool(): { pool: Pool; calls: QueryCall[] } {
+function makeMockPool(rowCount = 1): { pool: Pool; calls: QueryCall[] } {
   const calls: QueryCall[] = [];
   // 只 stub `query`,其它字段不被本测试触达;以 unknown 双 cast 满足 TS。
   const pool = {
     query: async (text: string, values: unknown[]): Promise<QueryResult> => {
       calls.push({ text, values });
-      return { rows: [], rowCount: 0, command: "INSERT", oid: 0, fields: [] };
+      return { rows: [], rowCount, command: "INSERT", oid: 0, fields: [] };
     },
   } as unknown as Pool;
   return { pool, calls };
@@ -43,13 +43,14 @@ function makeMockPool(): { pool: Pool; calls: QueryCall[] } {
 describe("startInflightJournal — containerId nullable bind (CC 外接 plan Phase 0)", () => {
   test("containerId = bigint 时 SQL bind[2] = id.toString()(容器路径保留既有行为)", async () => {
     const { pool, calls } = makeMockPool();
-    await startInflightJournal(pool, {
+    const admitted = await startInflightJournal(pool, {
       requestId: "req-container-1",
       userId: 100n,
       containerId: 42n,
       model: "claude-sonnet-4-5",
       precheckCredits: 50n,
     });
+    assert.equal(admitted, true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].values[0], "req-container-1");
     assert.equal(calls[0].values[1], "100");
@@ -117,5 +118,18 @@ describe("startInflightJournal — containerId nullable bind (CC 外接 plan Pha
     }
     assert.equal(callsA[0].values[2], "7");
     assert.strictEqual(callsB[0].values[2], null);
+  });
+
+  test("request_id 已存在时返回 false，调用方可在 fetch 前拒绝重放", async () => {
+    const { pool, calls } = makeMockPool(0);
+    const admitted = await startInflightJournal(pool, {
+      requestId: "req-replayed",
+      userId: 100n,
+      containerId: 42n,
+      model: "claude-sonnet-4-5",
+      precheckCredits: 50n,
+    });
+    assert.equal(admitted, false);
+    assert.equal(calls.length, 1);
   });
 });

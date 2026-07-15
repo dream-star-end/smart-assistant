@@ -226,9 +226,21 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       "compute_host_audit",
       "turn_traces",
       "rate_limit_events",
+      "product_friction_events",
+      "image_generation_attempts",
     ]) {
       assert.ok(tables.includes(t), `缺 retention 政策: ${t}`);
     }
+    assert.equal(
+      AUDIT_RETENTION_POLICIES.find((p) => p.table === "product_friction_events")?.column,
+      "updated_at",
+      "recovered journey must retain from its latest transition",
+    );
+    assert.equal(
+      AUDIT_RETENTION_POLICIES.find((p) => p.table === "image_generation_attempts")?.predicate,
+      "outcome<>'pending'",
+      "retention must not delete pending evidence before the stale sweeper finalizes it",
+    );
   });
 
   test("env 覆盖:注册表内的表可改天数;未注册表忽略(防任意表删除)", () => {

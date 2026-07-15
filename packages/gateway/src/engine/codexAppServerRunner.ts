@@ -419,6 +419,9 @@ interface RunnerMessage {
    *    turn status 'interrupted' → 'interrupted'(用户主动 stop;无 Anthropic 等价枚举)
    *    failed / unexpected / catch 路径 → 不带(保持 is_error 语义,不伪造终态)。 */
   stop_reason?: string
+  /** Billing-only stable terminal classification. Unlike stop_reason this
+   * distinguishes an explicit user interrupt from process/deploy shutdown. */
+  billing_terminal_code?: 'USER_CANCELLED' | 'CODEX_ERROR'
   event?: unknown
 }
 
@@ -2814,6 +2817,7 @@ export class CodexAppServerRunner extends EventEmitter {
           // LOW-2:用户主动 stop —— 无 Anthropic 等价枚举,用自描述 'interrupted'
           // (下游只对 'max_tokens' 有分支语义,其余值透传展示)。
           stopReason: 'interrupted',
+          terminalCode: 'USER_CANCELLED',
         })
       } else {
         this.emitResult({
@@ -2963,6 +2967,7 @@ export class CodexAppServerRunner extends EventEmitter {
     /** LOW-2(2026-07-03)— caller 按 turn status 映射(见 RunnerMessage.stop_reason
      *  注释);不传 → result 行不带 stop_reason(failed / 异常路径)。 */
     stopReason?: string
+    terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
   }): void {
     const msg: RunnerMessage = {
       type: 'result',
@@ -2976,6 +2981,9 @@ export class CodexAppServerRunner extends EventEmitter {
       requestId: opts.requestId,
       ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
       ...(opts.stopReason ? { stop_reason: opts.stopReason } : {}),
+      ...(!opts.ok
+        ? { billing_terminal_code: opts.terminalCode ?? 'CODEX_ERROR' as const }
+        : {}),
     }
     this.emit('message', msg)
   }

@@ -62,6 +62,17 @@ function normalizeTags(v: unknown): string[] {
   return out;
 }
 
+export function normalizeResponseRatingReason(
+  rating: "up" | "down",
+  rawTags: unknown,
+  rawComment: unknown,
+): { tags: string[]; comment: string | null } {
+  const tags = normalizeTags(rawTags);
+  const comment = clampStr(rawComment, MAX_COMMENT);
+  if (rating === "down" && tags.length === 0 && comment === null) tags.push("未说明原因");
+  return { tags, comment };
+}
+
 // ─── POST /api/response-rating ──────────────────────────────────────
 
 export async function handlePostResponseRating(
@@ -96,6 +107,10 @@ export async function handlePostResponseRating(
   }
   const messageId = messageIdRaw.slice(0, MAX_MESSAGE_ID);
 
+  const { tags, comment } = normalizeResponseRatingReason(
+    rating as "up" | "down", body.tags, body.comment,
+  );
+
   await upsertResponseRating({
     userId: user.id,
     sessionId: clampStr(body.sessionId, MAX_SESSION_ID),
@@ -103,8 +118,8 @@ export async function handlePostResponseRating(
     traceId: clampStr(body.traceId, MAX_TRACE_ID),
     model: clampStr(body.model, MAX_MODEL),
     rating: rating as "up" | "down",
-    tags: normalizeTags(body.tags),
-    comment: clampStr(body.comment, MAX_COMMENT),
+    tags,
+    comment,
   });
 
   // 不记 comment(可能含敏感上下文);仅关联 user + rating + model + 标签数量。

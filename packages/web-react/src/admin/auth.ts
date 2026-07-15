@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 
 const ADMIN_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
@@ -59,6 +60,8 @@ export type AdminAuthState = {
   ready: boolean;
   /** 已认证 **且** role==='admin'。仅此时渲染 AdminShell。 */
   authed: boolean;
+  recoverable: boolean;
+  retry: () => void;
   /** 登出：先隐藏管理面，等待 refresh family 吊销/清 cookie 后再回首页。 */
   logout: () => Promise<void>;
 };
@@ -70,30 +73,39 @@ export function useAdminAuth(): AdminAuthState {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [authed, setAuthed] = useState(false);
+  const [recoverable, setRecoverable] = useState(false);
+  const [retrySeq, setRetrySeq] = useState(0);
+  const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
+    setReady(false);
+    setRecoverable(false);
     // 启动只消费当前身份代次，不另开身份边界，也不取消共享 refresh。React StrictMode
     // 会 setup → cleanup → setup 重放 effect；两次消费者因此绑定同一 epoch/singleflight，
     // 不会在首个响应已旋转 cookie 后再拿旧 cookie 发第二次 refresh。
     const bootEpoch = adminSession.snapshot().epoch;
     onSessionExpired = () => {
       if (controller.signal.aborted) return;
+      bootstrapMeFriction.current = null;
       setUser(null);
       setAuthed(false);
+      setRecoverable(false);
       setReady(true);
     };
     const unsubscribe = subscribeAuthLogout(() => {
+      bootstrapMeFriction.current = null;
       adminSession.beginIdentity();
       void cancelAuthRefresh(adminSession);
       setUser(null);
       setAuthed(false);
+      setRecoverable(false);
       setReady(true);
     });
     void (async () => {
       let refreshAttempt = 0;
       while (!controller.signal.aborted && adminSession.snapshot().epoch === bootEpoch) {
-        const outcome = await api.refresh(adminSession, bootEpoch);
+        const outcome = await api.refresh(adminSession, bootEpoch, "admin_auth");
         if (controller.signal.aborted) return;
         if (outcome.kind === "stale") return;
         if (outcome.kind === "invalid") {
@@ -103,6 +115,11 @@ export function useAdminAuth(): AdminAuthState {
         if (outcome.kind === "transient") {
           const local = ADMIN_RECOVERY_BACKOFF_MS[Math.min(refreshAttempt, ADMIN_RECOVERY_BACKOFF_MS.length - 1)];
           refreshAttempt += 1;
+          if (refreshAttempt >= 2) {
+            setRecoverable(true);
+            setReady(true);
+            return;
+          }
           try {
             await waitForRecovery(Math.max(local, outcome.retryAfterMs), controller.signal);
           } catch {
@@ -116,8 +133,21 @@ export function useAdminAuth(): AdminAuthState {
           try {
             const me = await api.getMe(adminSession);
             if (controller.signal.aborted || adminSession.snapshot().epoch !== bootEpoch) return;
+            const prior = bootstrapMeFriction.current;
+            if (prior) {
+              reportClientFriction({
+                eventId: prior.id,
+                surface: "admin_auth",
+                stage: "bootstrap_me",
+                code: "BOOTSTRAP_ME_TRANSIENT",
+                outcome: "recovered",
+                attempts: Math.min(32, prior.attempts + 1),
+              }, adminSession.snapshot().token);
+              bootstrapMeFriction.current = null;
+            }
             setUser(me);
             setAuthed(me.role === "admin");
+            setRecoverable(false);
             setReady(true);
             return;
           } catch (error) {
@@ -127,8 +157,24 @@ export function useAdminAuth(): AdminAuthState {
               setReady(true);
               return;
             }
+            const prior = bootstrapMeFriction.current;
+            const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
+            const id = reportClientFriction({
+              eventId: prior?.id,
+              surface: "admin_auth",
+              stage: "bootstrap_me",
+              code: "BOOTSTRAP_ME_TRANSIENT",
+              outcome: "failed",
+              attempts,
+            }, adminSession.snapshot().token);
+            bootstrapMeFriction.current = { id, attempts };
             const delayMs = ADMIN_RECOVERY_BACKOFF_MS[Math.min(meAttempt, ADMIN_RECOVERY_BACKOFF_MS.length - 1)];
             meAttempt += 1;
+            if (meAttempt >= 2) {
+              setRecoverable(true);
+              setReady(true);
+              return;
+            }
             try {
               await waitForRecovery(delayMs, controller.signal);
             } catch {
@@ -143,9 +189,12 @@ export function useAdminAuth(): AdminAuthState {
       unsubscribe();
       onSessionExpired = () => {};
     };
-  }, []);
+  }, [retrySeq]);
+
+  const retry = useCallback(() => setRetrySeq((value) => value + 1), []);
 
   const logout = useCallback(async () => {
+    bootstrapMeFriction.current = null;
     adminSession.beginIdentity();
     void cancelAuthRefresh(adminSession);
     publishAuthLogout();
@@ -157,5 +206,5 @@ export function useAdminAuth(): AdminAuthState {
     window.location.replace("/");
   }, []);
 
-  return { user, ready, authed, logout };
+  return { user, ready, authed, recoverable, retry, logout };
 }

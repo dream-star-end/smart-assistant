@@ -29,6 +29,9 @@ export interface DurableCodexBilling {
   delegateAgentId?: string
   engineSessionId: string
   status: 'success' | 'error'
+  /** Stable, content-free terminal classification. Optional only for rolling
+   * compatibility with runtime images predating product-friction telemetry. */
+  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
   durationMs: number
   usage?: {
     input_tokens?: number
@@ -37,7 +40,6 @@ export interface DurableCodexBilling {
     cache_creation_input_tokens?: number
     reasoning_output_tokens?: number
   }
-  errorReason?: string
   rateLimits?: {
     util5h?: number
     reset5h?: string

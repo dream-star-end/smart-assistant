@@ -22,8 +22,8 @@
  * 不变量(R3 + PR2 v1.0.66 + 2I-2 + Codex 审计结论):
  *   - single-shot finalize:once-flag + inflight promise 兜底,commit/fail/
  *     failClient 三入口加起来最多跑一次 release(scheduler + redis preCheck)
- *   - journal CAS:WHERE state IN ('inflight','finalizing') 防 reconciler 已
- *     abort 的行被覆盖回 committed,反向同理
+ *   - journal settle fence:仅 inflight→finalizing 可认领；随机 owner token
+ *     同时约束 finalize/rollback，跨 bridge loser 不能扣费或 abort winner
  *   - DeepSeek 路径(`accountId === null`):跳过 scheduler.release,但 settle
  *     仍写 usage_records / credit_ledger(只是 account_id 写 NULL)
  *   - clamp 语义:余额 < cost,debit 夹到 balance、状态仍 success、ledger memo
@@ -32,6 +32,7 @@
  *     debitedCredits/balanceAfter 退化为 null(无法重算)
  */
 
+import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
@@ -161,6 +162,18 @@ export interface FinalizeOutcome {
   balanceAfter: bigint | null;
 }
 
+export type JournalFailureCode =
+  | "UNKNOWN"
+  | "INVALID_REQUEST"
+  | "RATE_LIMITED"
+  | "UPSTREAM_UNAVAILABLE"
+  | "UPSTREAM_REJECTED"
+  | "CLIENT_ABORT"
+  | "STREAM_FAILED"
+  | "BILLING_FAILED"
+  | "INTERNAL_ERROR"
+  | "USER_CANCELLED";
+
 interface FinalizeDeps {
   pgPool: Pool;
   preCheckRedis: PreCheckRedis;
@@ -168,10 +181,14 @@ interface FinalizeDeps {
 }
 
 /**
- * 在 stream 开始前写一行 `inflight` journal。**幂等**:同 requestId 二次调用 noop。
+ * 在 stream 开始前原子申请一行 `inflight` journal。
  *
- * 设计理由:journal INSERT 必须先于上游 fetch,这样进程哪怕在 fetch 时 crash,
- * journal 里就有这条 inflight 记录,reconciler 后续可以扫到并兜底退预扣(P1)。
+ * 返回 true 才代表本请求取得执行权；同 requestId 已存在时返回 false，调用方
+ * 必须在上游 fetch 前停止。这里不能把冲突当“幂等 noop”继续执行：系统没有
+ * 缓存可重放的模型响应，继续执行会产生第二份响应却没有第二条计费/审计记录。
+ *
+ * journal INSERT 必须先于上游 fetch,这样进程哪怕在 fetch 时 crash,journal 里
+ * 也有这条 inflight 记录,reconciler 后续可以扫到并兜底退预扣(P1)。
  */
 export async function startInflightJournal(
   pool: Pool,
@@ -182,9 +199,9 @@ export async function startInflightJournal(
      *  settle 仍以本地 inflight Map 中的 pricing 为准。anthropic 路径默认只含 model。 */
     ctxJson?: Record<string, unknown>;
   },
-): Promise<void> {
+): Promise<boolean> {
   const journalCtx = { model: ctx.model, ...(ctx.ctxJson ?? {}) };
-  await pool.query(
+  const inserted = await pool.query(
     `INSERT INTO request_finalize_journal
        (request_id, user_id, container_id, state, ctx, precheck_credits)
      VALUES ($1, $2, $3, 'inflight', $4::jsonb, $5)
@@ -199,16 +216,43 @@ export async function startInflightJournal(
       ctx.precheckCredits.toString(),
     ],
   );
+  return inserted.rowCount === 1;
 }
 
 /**
- * journal CAS:inflight/finalizing → committed,落 final_credits + ledger/usage 关联。
+ * Acquire the durable right to create financial settlement rows for a request.
+ * A stale-stream reconciler may have already terminally aborted the journal;
+ * in that case callers must not debit, even if a late upstream/Codex terminal
+ * event contains valid usage.
+ *
+ * The UPDATE is also the concurrency fence:only `inflight` may become
+ * `finalizing`, and the winner stores a random owner token in journal ctx.
+ * PostgreSQL rechecks the WHERE after waiting on a concurrent row update, so
+ * exactly one bridge can win. The token then fences both finalize and rollback;
+ * a loser can neither debit nor abort the winner's settlement.
+ */
+export async function claimInflightJournalForSettlement(
+  pool: Pool,
+  requestId: string,
+): Promise<string | null> {
+  const settlementClaimId = randomUUID();
+  const result = await pool.query(
+    `UPDATE request_finalize_journal
+        SET state='finalizing',
+            ctx=jsonb_set(COALESCE(ctx, '{}'::jsonb), '{settlementClaimId}', to_jsonb($2::text), true),
+            updated_at=NOW()
+      WHERE request_id=$1 AND state='inflight'`,
+    [requestId, settlementClaimId],
+  );
+  return result.rowCount === 1 ? settlementClaimId : null;
+}
+
+/**
+ * journal owner CAS:finalizing → committed,落 final_credits + ledger/usage 关联。
  *
  * **PR2 v1.0.66 抽出**:从 makeFinalizer.runCommit 内联 SQL 抽出,
- * codex finalizer 单 phase(无 finalizing 中间态)直接调用此 helper。
- *
- * CAS WHERE state IN (...) 防止 reconciler 已 abort 的行被覆盖回 committed
- * (虽然 once-flag + reconciler 间隔保证一般不会发生,helper 自防御稳)。
+ * 只有持有 settlementClaimId 的 finalizer 能提交；0-row 必须抛错，已提交的
+ * usage/ledger 留给 reconciler 按 request_id 补齐 journal，不得伪装成功。
  */
 export async function finalizeInflightJournal(
   pool: Pool,
@@ -217,47 +261,65 @@ export async function finalizeInflightJournal(
     finalCredits: bigint;
     ledgerId: bigint | null;
     usageId: bigint;
+    settlementClaimId: string;
   },
 ): Promise<void> {
-  await pool.query(
+  const finalized = await pool.query(
     `UPDATE request_finalize_journal
         SET state='committed',
             final_credits=$2,
             ledger_id=$3,
             usage_id=$4,
+            failure_code=NULL,
+            ctx=ctx - 'settlementClaimId',
             updated_at=NOW()
       WHERE request_id=$1
-        AND state IN ('inflight','finalizing')`,
+        AND state='finalizing'
+        AND ctx->>'settlementClaimId'=$5`,
     [
       ctx.requestId,
       ctx.finalCredits.toString(),
       ctx.ledgerId === null ? null : ctx.ledgerId.toString(),
       ctx.usageId.toString(),
+      ctx.settlementClaimId,
     ],
   );
+  if (finalized.rowCount !== 1) {
+    throw new Error(`request journal settlement fence lost for ${ctx.requestId}`);
+  }
 }
 
 /**
- * journal CAS:inflight/finalizing → aborted,落 error_msg + final_credits=0。
+ * journal CAS → aborted,落 error_msg + final_credits=0。
  *
  * **PR2 v1.0.66 抽出**:从 makeFinalizer.runAbort 内联 SQL 抽出。
- * 加 CAS state IN (...) guard:already committed 行不被回退到 aborted。
+ * 默认只允许未认领的 inflight abort；结算失败时必须同时提供 owner token，
+ * 才能回滚自己持有的 finalizing。already committed 或别人的 claim 永不回退。
  */
 export async function abortInflightJournal(
   pool: Pool,
   requestId: string,
   errorMsg: string,
-): Promise<void> {
-  await pool.query(
+  failureCode: JournalFailureCode = "UNKNOWN",
+  settlementClaimId?: string,
+): Promise<boolean> {
+  const aborted = await pool.query(
     `UPDATE request_finalize_journal
         SET state='aborted',
             error_msg=$2,
+            failure_code=$3,
             final_credits=0,
+            ctx=ctx - 'settlementClaimId',
             updated_at=NOW()
       WHERE request_id=$1
-        AND state IN ('inflight','finalizing')`,
-    [requestId, errorMsg],
+        AND (${settlementClaimId === undefined
+          ? "state='inflight'"
+          : "state='finalizing' AND ctx->>'settlementClaimId'=$4"})`,
+    settlementClaimId === undefined
+      ? [requestId, errorMsg, failureCode]
+      : [requestId, errorMsg, failureCode, settlementClaimId],
   );
+  return aborted.rowCount === 1;
 }
 
 /**
@@ -280,13 +342,13 @@ export async function abortInflightJournal(
  */
 export type FinalizerHandle = {
   commit: (obs: UsageObservation) => Promise<FinalizeOutcome>;
-  fail: (obs: UsageObservation, err: unknown) => Promise<FinalizeOutcome>;
+  fail: (obs: UsageObservation, err: unknown, failureCode?: JournalFailureCode) => Promise<FinalizeOutcome>;
   /**
    * 与 fail 同写库 + 写 abort journal,但 scheduler.release 走 client_error,
    * 不调 health.onFailure → 不扣账号健康分。用于上游 400 invalid_request_error
    * (用户参数损坏)与 ac.abort 客户端主动断流场景。
    */
-  failClient: (obs: UsageObservation, err: unknown) => Promise<FinalizeOutcome>;
+  failClient: (obs: UsageObservation, err: unknown, failureCode?: JournalFailureCode) => Promise<FinalizeOutcome>;
 };
 
 export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): FinalizerHandle {
@@ -297,7 +359,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     if (obs.kind === "none") {
       // 看不到任何 usage 但 stream 正常结束 — 罕见(上游协议异常)。
       // 视为 abort,不扣费。
-      return runAbort(obs, new Error("no usage observed in successful stream"));
+      return runAbort(obs, new Error("no usage observed in successful stream"), "BILLING_FAILED");
     }
     const usage = obs.usage;
     const { cost_credits, snapshot } = computeCost(usage, ctx.pricing);
@@ -309,22 +371,48 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     // 前端不出 cost_charged。上游直接失败/中断的请求走 fail/abort 路径,本就不扣。
     const waivedNoOutput = status === "success" && BigInt(usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
     const effectiveCredits = waivedNoOutput ? 0n : cost_credits;
-    // 二阶段:UPDATE → INSERT × 2 + UPDATE。失败任何一步都 catch 掉走 abort 路径。
+    // 二阶段:journal→finalizing,再原子写 usage/ledger。只有结算事务尚未提交时
+    // 才允许走 abort；结算一旦成功，journal 最终 CAS 失败必须留在 finalizing
+    // 交给 reconciler，绝不能把已扣费请求回退成 aborted。
+    let settled: SettleResult;
+    let settlementClaimId: string | null = null;
     try {
-      await deps.pgPool.query(
-        `UPDATE request_finalize_journal
-            SET state='finalizing', updated_at=NOW()
-          WHERE request_id=$1 AND state IN ('inflight','finalizing')`,
-        [ctx.requestId],
+      settlementClaimId = await claimInflightJournalForSettlement(
+        deps.pgPool,
+        ctx.requestId,
       );
+      if (settlementClaimId === null) {
+        // A stale-stream reconciler may already have terminally aborted this
+        // journal. Settling after that CAS loss would debit the user while the
+        // durable request truth remains "aborted" (and later GC loses the
+        // association entirely). Never create usage/ledger rows without first
+        // owning a settleable journal state.
+        ctx.log.warn("proxy_finalize_claim_lost", {
+          requestId: ctx.requestId,
+        });
+        // Another bridge/finalizer owns `finalizing`, or the journal is already
+        // terminal. Never let the loser abort the winner's claim.
+        return {
+          finalCredits: 0n,
+          debitedCredits: null,
+          state: "aborted",
+          requestId: ctx.requestId,
+          balanceAfter: null,
+        };
+      }
       // 写 usage_records + credit_ledger + 更新 users.credits 一个事务里
-      const settled = await settleUsageAndLedger(deps.pgPool, {
+      settled = await settleUsageAndLedger(deps.pgPool, {
         userId: ctx.userId,
         accountId: ctx.accountId,
         requestId: ctx.requestId,
         model: ctx.model,
         usage,
-        snapshotJson: JSON.stringify(snapshot),
+        snapshotJson: JSON.stringify({
+          ...snapshot,
+          ...(waivedNoOutput
+            ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() }
+            : {}),
+        }),
         costCredits: effectiveCredits,
         status,
         sessionId: ctx.sessionId ?? null,
@@ -335,50 +423,84 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         parentTurnKey: ctx.parentTurnKey,
         authority: ctx.authority ?? null,
       });
-      await finalizeInflightJournal(deps.pgPool, {
-        requestId: ctx.requestId,
-        finalCredits: effectiveCredits,
-        ledgerId: settled.ledgerId,
-        usageId: settled.usageId,
-      });
-      ctx.log.info("proxy_finalize_committed", {
-        finalCredits: effectiveCredits.toString(),
-        kind: obs.kind,
-        usage: usageToLog(usage),
-        clamped: settled.clamped,
-        ...(waivedNoOutput ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() } : {}),
-      });
-      // 2I-2: billing_debit 三态语义重新对齐(Codex 审核结论):
-      //   * success      = obs.kind='final' + cost>0 + 余额 >= cost (足额扣款)
-      //   * insufficient = obs.kind='final' + cost>0 + 余额 < cost (debit 被夹到 0,欠费)
-      //   * (不计数)    = obs.kind='partial' (status='billing_failed' 路径不走 ledger debit,settle 计 partial)
-      //   * error        = settle 写库失败 (catch 块)
-      if (status === "success" && effectiveCredits > 0n) {
-        incrBillingDebit(settled.clamped ? "insufficient" : "success");
-      }
-      return {
-        finalCredits: effectiveCredits,
-        debitedCredits: settled.debitedCredits,
-        state: "committed",
-        requestId: ctx.requestId,
-        balanceAfter: settled.balanceAfter,
-      };
     } catch (err) {
-      ctx.log.error("proxy_finalize_commit_db_failed", {
+      ctx.log.error("proxy_finalize_settle_db_failed", {
         err: errSummary(err),
         precheckCredits: ctx.precheckCredits.toString(),
       });
       // settle 写库失败 = billing_debit_failures_total{result="error"}
       incrBillingDebit("error");
-      // 走 abort 路径,确保 journal/redis/scheduler 状态一致
-      return runAbort(obs, err);
+      if (err instanceof SettlementCommitOutcomeUnknownError) {
+        // Never turn an indeterminate COMMIT into an aborted waiver: a debit
+        // may already exist and the reconciler will join durable usage truth.
+        ctx.log.warn("proxy_finalize_commit_outcome_unknown", {
+          requestId: ctx.requestId,
+        });
+        return {
+          finalCredits: effectiveCredits,
+          debitedCredits: null,
+          state: "committed",
+          requestId: ctx.requestId,
+          balanceAfter: null,
+        };
+      }
+      return runAbort(obs, err, "BILLING_FAILED", settlementClaimId ?? undefined);
     }
+
+    try {
+      await finalizeInflightJournal(deps.pgPool, {
+        requestId: ctx.requestId,
+        finalCredits: effectiveCredits,
+        ledgerId: settled.ledgerId,
+        usageId: settled.usageId,
+        settlementClaimId,
+      });
+    } catch (err) {
+      ctx.log.warn("proxy_finalize_journal_pending", {
+        errorClass: err instanceof Error ? "Error" : typeof err,
+      });
+      // Financial truth is already committed. The reconciler joins the durable
+      // usage row by request_id and completes this journal CAS later.
+    }
+    ctx.log.info("proxy_finalize_committed", {
+      finalCredits: effectiveCredits.toString(),
+      kind: obs.kind,
+      usage: usageToLog(usage),
+      clamped: settled.clamped,
+      ...(waivedNoOutput ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() } : {}),
+    });
+    // 2I-2: billing_debit 三态语义重新对齐(Codex 审核结论):
+    //   * success      = obs.kind='final' + cost>0 + 余额 >= cost (足额扣款)
+    //   * insufficient = obs.kind='final' + cost>0 + 余额 < cost (debit 被夹到 0,欠费)
+    //   * (不计数)    = obs.kind='partial' (status='billing_failed' 路径不走 ledger debit,settle 计 partial)
+    //   * error        = settle 写库失败 (catch 块)
+    if (status === "success" && effectiveCredits > 0n) {
+      incrBillingDebit(settled.clamped ? "insufficient" : "success");
+    }
+    return {
+      finalCredits: effectiveCredits,
+      debitedCredits: settled.debitedCredits,
+      state: "committed",
+      requestId: ctx.requestId,
+      balanceAfter: settled.balanceAfter,
+    };
   }
 
-  async function runAbort(_obs: UsageObservation, err: unknown): Promise<FinalizeOutcome> {
+  async function runAbort(
+    _obs: UsageObservation,
+    err: unknown,
+    failureCode: JournalFailureCode = "UNKNOWN",
+    settlementClaimId?: string,
+  ): Promise<FinalizeOutcome> {
     const msg = errMessageShort(err);
     try {
-      await abortInflightJournal(deps.pgPool, ctx.requestId, msg);
+      await abortInflightJournal(
+        deps.pgPool,
+        ctx.requestId,
+        msg,
+        failureCode,
+        settlementClaimId,
+      );
     } catch (dbErr) {
       ctx.log.error("proxy_finalize_abort_db_failed", { err: errSummary(dbErr) });
     }
@@ -439,10 +561,10 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
 
   return {
     commit: (obs) => runFinalizeAndRelease(() => runCommit(obs), "success", null),
-    fail: (obs, err) =>
-      runFinalizeAndRelease(() => runAbort(obs, err), "failure", errMessageShort(err)),
-    failClient: (obs, err) =>
-      runFinalizeAndRelease(() => runAbort(obs, err), "client_error", errMessageShort(err)),
+    fail: (obs, err, failureCode) =>
+      runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "failure", errMessageShort(err)),
+    failClient: (obs, err, failureCode) =>
+      runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "client_error", errMessageShort(err)),
   };
 }
 
@@ -475,6 +597,16 @@ export interface SettleResult {
    * caller 想展示"当前余额"且这里拿到 null 时,请另查 users 表。
    */
   balanceAfter: bigint | null;
+}
+
+/** COMMIT returned an error and independent reads could not yet prove whether
+ * it committed. Callers must leave the journal recoverable; aborting could
+ * contradict a debit that became visible after the connection was lost. */
+export class SettlementCommitOutcomeUnknownError extends Error {
+  constructor(readonly requestId: string, options?: { cause?: unknown }) {
+    super(`settlement COMMIT outcome is unknown for ${requestId}`, options);
+    this.name = "SettlementCommitOutcomeUnknownError";
+  }
 }
 
 /**
@@ -533,6 +665,7 @@ export async function settleUsageAndLedger(
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
+  let commitAttempted = false;
   try {
     await client.query("BEGIN");
     // org 归属解析(0112 企业版):tx 内、锁前一次索引点查。成员在某 active org 语境 →
@@ -655,6 +788,7 @@ export async function settleUsageAndLedger(
         costCredits: debitedCredits,
       });
     }
+    commitAttempted = true;
     await client.query("COMMIT");
     return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };
   } catch (err) {
@@ -662,6 +796,34 @@ export async function settleUsageAndLedger(
       await client.query("ROLLBACK");
     } catch {
       /* ignore */
+    }
+    if (commitAttempted) {
+      // Use a new pool checkout: the transaction connection may be dead or in
+      // an indeterminate protocol state. A committed usage row is permanent
+      // financial truth and lets the journal finalize idempotently.
+      for (const delayMs of [0, 50, 150]) {
+        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        try {
+          const settled = await pool.query<{ id: string; ledger_id: string | null }>(
+            `SELECT id::text AS id,ledger_id::text AS ledger_id
+               FROM usage_records WHERE user_id=$1 AND request_id=$2`,
+            [args.userId.toString(), args.requestId],
+          );
+          const row = settled.rows[0];
+          if (row) {
+            return {
+              usageId: BigInt(row.id),
+              ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
+              clamped: false,
+              debitedCredits: null,
+              balanceAfter: null,
+            };
+          }
+        } catch {
+          // A failed proof query is also indeterminate; retry, never abort.
+        }
+      }
+      throw new SettlementCommitOutcomeUnknownError(args.requestId, { cause: err });
     }
     throw err;
   } finally {

@@ -46,6 +46,7 @@ import { signAccess } from "../auth/jwt.js";
 import {
   createUserChatBridge,
   BRIDGE_WS_PATH,
+  codexAbandonFailureCode,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
   type UserChatBridgeDeps,
@@ -72,6 +73,14 @@ import {
 } from "../billing/modelCatalog.js";
 
 const JWT_SECRET = "x".repeat(32);
+
+test("Codex abandon reasons map to stable failure-code families", () => {
+  assert.equal(codexAbandonFailureCode("bridge_disconnect_before_finalize"), "CLIENT_ABORT");
+  assert.equal(codexAbandonFailureCode("rewritten_frame_too_big"), "INVALID_REQUEST");
+  assert.equal(codexAbandonFailureCode("codex_billing_engine_session_id_invalid"), "INVALID_REQUEST");
+  assert.equal(codexAbandonFailureCode("container_forward_rejected"), "UPSTREAM_UNAVAILABLE");
+  assert.equal(codexAbandonFailureCode("sign_boundary_missing"), "INTERNAL_ERROR");
+});
 
 // M2 — billing 帧上的 engineSessionId(gateway engineSessionId(sessionKey) 的
 // 等价物;这里用 commercial 侧同算法 helper 派生,形状恒 oceng-<48hex>)。
@@ -210,7 +219,8 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       // 都作用于 journalRows,测试能断言权威终态(而不只是 SQL 形状)。
       if (trimmed.startsWith("INSERT INTO request_finalize_journal")) {
         const [reqId, userId, , ctxJson, precheck] = params as [string, string, unknown, string, string];
-        if (!journalRows.has(reqId)) { // ON CONFLICT DO NOTHING
+        const inserted = !journalRows.has(reqId);
+        if (inserted) { // ON CONFLICT DO NOTHING
           journalRows.set(reqId, {
             state: "inflight",
             user_id: userId,
@@ -219,27 +229,49 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
             error_msg: null,
           });
         }
-        return { rows: [], rowCount: 1 };
+        return { rows: [], rowCount: inserted ? 1 : 0 };
       }
       if (trimmed.startsWith("UPDATE request_finalize_journal")) {
-        const reqId = (params as unknown[])[0] as string;
+        const values = params as unknown[];
+        const reqId = values[0] as string;
         const row = journalRows.get(reqId);
-        const reopening = /state='inflight'/.test(trimmed);
-        const casOk = row !== undefined && (
-          reopening
-            ? row.state === "aborted"
-            : row.state === "inflight" || row.state === "finalizing"
-        );
-        if (casOk) {
-          if (reopening) {
-            row!.state = "inflight";
-            row!.error_msg = null;
-          } else if (/state='finalizing'/.test(trimmed)) row!.state = "finalizing";
-          else if (/state='committed'/.test(trimmed)) row!.state = "committed";
-          else if (/state='aborted'/.test(trimmed)) {
-            row!.state = "aborted";
-            row!.error_msg = String((params as unknown[])[1] ?? "");
+        const setState = trimmed.match(/SET\s+state='(inflight|finalizing|committed|aborted)'/)?.[1];
+        let casOk = false;
+
+        if (row !== undefined && setState === "finalizing") {
+          casOk = row.state === "inflight";
+          if (casOk) {
+            row.state = "finalizing";
+            row.ctx = { ...row.ctx, settlementClaimId: String(values[1]) };
           }
+        } else if (row !== undefined && setState === "committed") {
+          casOk = row.state === "finalizing" &&
+            row.ctx.settlementClaimId === values[4];
+          if (casOk) {
+            row.state = "committed";
+            delete row.ctx.settlementClaimId;
+          }
+        } else if (row !== undefined && setState === "aborted") {
+          const ownerClaim = values.length === 4 ? values[3] : undefined;
+          casOk = ownerClaim === undefined
+            ? row.state === "inflight"
+            : row.state === "finalizing" && row.ctx.settlementClaimId === ownerClaim;
+          if (casOk) {
+            row.state = "aborted";
+            row.error_msg = String(values[1] ?? "");
+            delete row.ctx.settlementClaimId;
+          }
+        } else if (row !== undefined && setState === "inflight") {
+          const expectedState = /state='finalizing'/.test(trimmed) ? "finalizing" : "aborted";
+          const expectedUser = /user_id=\$2/.test(trimmed) ? String(values[1]) : row.user_id;
+          casOk = row.state === expectedState && row.user_id === expectedUser;
+          if (casOk) {
+            row.state = "inflight";
+            row.error_msg = null;
+            delete row.ctx.settlementClaimId;
+          }
+        } else if (setState === undefined) {
+          throw new Error(`fakePool: unrecognized journal UPDATE: ${trimmed.slice(0, 120)}`);
         }
         return { rows: [], rowCount: casOk ? 1 : 0 };
       }

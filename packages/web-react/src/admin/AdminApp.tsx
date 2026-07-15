@@ -1,6 +1,6 @@
 import { useCallback, useEffect } from "react";
 import { MediaSignProvider } from "../components/chat/media";
-import { Spinner } from "../components/ui";
+import { Button, Spinner } from "../components/ui";
 import { api } from "../lib/api";
 import { AdminShell } from "./AdminShell";
 import { adminSession, useAdminAuth } from "./auth";
@@ -13,7 +13,7 @@ import { adminSession, useAdminAuth } from "./auth";
  *  - admin → 渲染 AdminShell。
  */
 export function AdminApp() {
-  const { user, ready, authed, logout } = useAdminAuth();
+  const { user, ready, authed, recoverable, retry, logout } = useAdminAuth();
   const signMedia = useCallback(
     (paths: string[]) => api.mediaSign(adminSession, paths).then((result) => result.urls),
     [],
@@ -21,8 +21,17 @@ export function AdminApp() {
 
   // 引导完成且无权限时跳首页。放 effect 里避免在 render 阶段做副作用（StrictMode 双调用安全）。
   useEffect(() => {
-    if (ready && !authed) window.location.replace("/");
-  }, [ready, authed]);
+    if (ready && !authed && !recoverable) window.location.replace("/");
+  }, [ready, authed, recoverable]);
+
+  if (ready && recoverable) {
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-3 bg-bg px-6 text-center">
+        <p className="text-sm text-muted">管理后台登录状态暂时无法恢复，请检查网络后重试。</p>
+        <Button variant="primary" onClick={retry}>重试恢复</Button>
+      </div>
+    );
+  }
 
   if (!ready || !authed) {
     return (

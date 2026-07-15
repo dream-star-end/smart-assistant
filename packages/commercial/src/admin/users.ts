@@ -26,6 +26,7 @@ import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
 import { csvEscapeCell } from "./csvHelper.js";
 import { listClientSessions } from "@openclaude/storage";
+import { lockRefreshUsers } from "../auth/refreshFamilyLock.js";
 
 export const USER_STATUSES = ["active", "banned", "deleting", "deleted"] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
@@ -639,6 +640,10 @@ export async function patchUser(
   }
 
   return tx(async (client: PoolClient) => {
+    // Account-wide auth mutation lock must precede the users row lock. Every
+    // refresh issue/rotation takes the same lock, so ban/delete cannot miss a
+    // descendant inserted after this transaction's UPDATE snapshot.
+    await lockRefreshUsers(client, [idStr]);
     const before = await client.query<AdminUserRowView>(
       `SELECT ${USER_COLUMNS} FROM users WHERE id = $1 FOR UPDATE`,
       [idStr],

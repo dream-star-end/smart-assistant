@@ -277,6 +277,9 @@ export function App() {
     user,
     authLoading,
     authError,
+    authRecoveryAvailable,
+    retryBoot,
+    clearAuth,
     booting,
     laneReady,
     login,
@@ -1470,7 +1473,9 @@ export function App() {
       </div>
     );
   }
-  if (!demo && view === "home") {
+  // A transient boot failure is not a logout. Surface the dedicated recovery
+  // action immediately instead of hiding it behind the ordinary landing page.
+  if (!demo && view === "home" && !authRecoveryAvailable) {
     return (
       <LazyBoundary fallback={<SplashFallback />}>
         <Landing
@@ -1509,7 +1514,9 @@ export function App() {
         onConfirmReset={confirmReset}
         loading={authLoading}
         error={authError}
+        onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
         onBack={() => {
+          if (authRecoveryAvailable) clearAuth();
           setAuthMode("login");
           setView("home");
         }}

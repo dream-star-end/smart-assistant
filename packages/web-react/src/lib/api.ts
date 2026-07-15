@@ -98,6 +98,7 @@ import type {
   DeclarativeOauthStartResult,
 } from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
+import { reportClientFriction } from "./clientFriction";
 
 /**
  * v5 商业版前端网络层。
@@ -123,10 +124,18 @@ const REFRESH_RACE_RETRY_DELAYS_MS = [250, 500, 1_000, 1_500, 1_750] as const;
 const REFRESH_TRANSIENT_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 
 type RawRefreshOutcome =
-  | { kind: "success"; result: RefreshResult }
-  | { kind: "invalid" }
+  | { kind: "success"; result: RefreshResult; raceObserved?: boolean }
+  | { kind: "invalid"; raceObserved?: boolean }
   | { kind: "race" }
-  | { kind: "transient"; retryAfterMs: number };
+  | { kind: "transient"; retryAfterMs: number; raceObserved?: boolean };
+
+type RefreshSurface = "auth" | "admin_auth" | "ws_auth";
+type RefreshFrictionState = {
+  id: string;
+  code: "REFRESH_RACE" | "REFRESH_TRANSIENT";
+  attempts: number;
+  surface: RefreshSurface;
+};
 
 type RefreshState = {
   epoch: number;
@@ -134,6 +143,7 @@ type RefreshState = {
   controller: AbortController | null;
   transientFailures: number;
   nextAllowedAt: number;
+  friction: RefreshFrictionState | null;
 };
 
 const refreshStates = new WeakMap<AuthSession, RefreshState>();
@@ -174,6 +184,7 @@ function refreshStateFor(a: AuthSession, epoch: number): RefreshState {
     controller: null,
     transientFailures: 0,
     nextAllowedAt: 0,
+    friction: null,
   };
   refreshStates.set(a, next);
   return next;
@@ -234,8 +245,12 @@ async function refreshAttempt(signal: AbortSignal): Promise<RawRefreshOutcome> {
 
 async function refreshWithRaceRetry(signal: AbortSignal): Promise<RawRefreshOutcome> {
   let outcome = await refreshAttempt(signal);
+  let raceObserved = false;
   for (const delayMs of REFRESH_RACE_RETRY_DELAYS_MS) {
-    if (outcome.kind !== "race") return outcome;
+    if (outcome.kind !== "race") {
+      return raceObserved ? { ...outcome, raceObserved: true } : outcome;
+    }
+    raceObserved = true;
     try {
       await sleep(delayMs, signal);
     } catch {
@@ -243,7 +258,9 @@ async function refreshWithRaceRetry(signal: AbortSignal): Promise<RawRefreshOutc
     }
     outcome = await refreshAttempt(signal);
   }
-  return outcome.kind === "race" ? { kind: "transient", retryAfterMs: 0 } : outcome;
+  return outcome.kind === "race"
+    ? { kind: "transient", retryAfterMs: 0, raceObserved: true }
+    : raceObserved ? { ...outcome, raceObserved: true } : outcome;
 }
 
 /** 中止当前 session 的旧身份 refresh；返回值可用于需要等待其真正 settle 的调用点。 */
@@ -262,7 +279,11 @@ export function cancelAuthRefresh(a: AuthSession): Promise<void> {
 }
 
 /** REST、boot、admin、WS 共用的唯一静默续期入口。 */
-export function refreshAuth(a: AuthSession, expectedEpoch = a.snapshot().epoch): Promise<RefreshOutcome> {
+export function refreshAuth(
+  a: AuthSession,
+  expectedEpoch = a.snapshot().epoch,
+  surface: RefreshSurface = "auth",
+): Promise<RefreshOutcome> {
   const snapshot = a.snapshot();
   if (snapshot.epoch !== expectedEpoch) {
     return Promise.resolve({ kind: "stale", epoch: expectedEpoch });
@@ -301,6 +322,18 @@ export function refreshAuth(a: AuthSession, expectedEpoch = a.snapshot().epoch):
     if (raw.kind === "success") {
       state.transientFailures = 0;
       state.nextAllowedAt = 0;
+      const prior = state.friction;
+      if (prior || raw.raceObserved) {
+        reportClientFriction({
+          eventId: prior?.id,
+          surface: prior?.surface ?? surface,
+          stage: "refresh",
+          code: prior?.code ?? "REFRESH_RACE",
+          outcome: "recovered",
+          attempts: Math.min(32, (prior?.attempts ?? 0) + 1),
+        }, raw.result.accessToken);
+      }
+      state.friction = null;
       return a.commitToken(expectedEpoch, raw.result.accessToken)
         ? { kind: "success", epoch: expectedEpoch, result: raw.result }
         : { kind: "stale", epoch: expectedEpoch };
@@ -308,6 +341,7 @@ export function refreshAuth(a: AuthSession, expectedEpoch = a.snapshot().epoch):
     if (raw.kind === "invalid") {
       state.transientFailures = 0;
       state.nextAllowedAt = 0;
+      state.friction = null;
       return { kind: "invalid", epoch: expectedEpoch };
     }
 
@@ -315,6 +349,18 @@ export function refreshAuth(a: AuthSession, expectedEpoch = a.snapshot().epoch):
     const backoff = REFRESH_TRANSIENT_BACKOFF_MS[state.transientFailures - 1] ?? 10_000;
     const retryAfterMs = Math.max(raw.kind === "transient" ? raw.retryAfterMs : 0, backoff);
     state.nextAllowedAt = Date.now() + retryAfterMs;
+    const prior = state.friction;
+    const code = prior?.code ?? (raw.raceObserved ? "REFRESH_RACE" : "REFRESH_TRANSIENT");
+    const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
+    const id = reportClientFriction({
+      eventId: prior?.id,
+      surface: prior?.surface ?? surface,
+      stage: "refresh",
+      code,
+      outcome: "failed",
+      attempts,
+    }, a.snapshot().token);
+    state.friction = { id, code, attempts, surface: prior?.surface ?? surface };
     return { kind: "transient", epoch: expectedEpoch, retryAfterMs };
   }).finally(() => {
     if (timeout) clearTimeout(timeout);
@@ -836,8 +882,8 @@ export const api = {
    * 按 outcome.kind 区分真正失效与瞬时故障。
    * 该调用绝不经 callWithRefresh 包装，避免 401 时自我递归。
    */
-  refresh(a: AuthSession, expectedEpoch?: number): Promise<RefreshOutcome> {
-    return refreshAuth(a, expectedEpoch);
+  refresh(a: AuthSession, expectedEpoch?: number, surface?: RefreshSurface): Promise<RefreshOutcome> {
+    return refreshAuth(a, expectedEpoch, surface);
   },
 
   /** 主动登出（POST /api/auth/logout）：吊销 refresh cookie。错误一律吞掉（前端清状态即视为已登出）。 */

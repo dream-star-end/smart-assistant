@@ -1028,6 +1028,28 @@ export function isAnthropicInvalidRequestError(bodyPreview: string): boolean {
   }
 }
 
+/** True only for an explicit provider-bound history rejection. This narrow
+ * predicate gates the one safe retry that removes signed assistant blocks;
+ * generic 400s must never trigger a semantically different second request. */
+export function isProviderBoundHistoryError(bodyPreview: string): boolean {
+  if (!bodyPreview) return false;
+  try {
+    const obj = JSON.parse(bodyPreview);
+    if (obj?.error?.type !== "invalid_request_error") return false;
+    const message = obj?.error?.message;
+    if (typeof message !== "string") return false;
+    const normalized = message.toLowerCase();
+    if (normalized.includes("signature")) return true;
+    return (
+      normalized.includes("thinking") ||
+      normalized.includes("redacted_thinking") ||
+      normalized.includes("connector_text")
+    ) && /invalid|mismatch|not valid/.test(normalized);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 客户端断流识别 —— 仅看 err 形状,**不看** ac.signal.aborted。
  *
@@ -1157,6 +1179,61 @@ export function stripMalformedThinkingBlocks(messages: unknown[]): {
     thinkingStripped,
     redactedThinkingStripped,
   };
+}
+
+/**
+ * Provider-bound history sanitizer used only for a bounded recovery retry.
+ *
+ * Anthropic-style thinking, redacted-thinking and connector-text blocks carry
+ * provider/credential-bound opaque signatures. Replaying a block produced by
+ * another model or API key is invalid even when the visible history is sound.
+ * The same blocks are valid and necessary on ordinary same-provider turns, so
+ * callers must not apply this helper pre-emptively: core invokes it only after
+ * an explicit upstream signature-invalid response, then retries once.
+ * persisted conversation history is never modified.  Text and tool blocks are
+ * retained byte-for-byte, and an otherwise empty assistant message receives a
+ * plain-text placeholder so the Anthropic-compatible message alternation stays
+ * valid.
+ */
+export function stripProviderBoundAssistantBlocks(messages: unknown[]): {
+  messages: unknown[];
+  blocksStripped: number;
+} {
+  let blocksStripped = 0;
+  let outer: unknown[] | null = null;
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) {
+      continue;
+    }
+    const content = message.content;
+    let kept: unknown[] | null = null;
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      const drop =
+        isRecord(block) &&
+        (block.type === "thinking" ||
+          block.type === "redacted_thinking" ||
+          block.type === "connector_text");
+      if (drop) {
+        blocksStripped++;
+        if (kept === null) kept = content.slice(0, j);
+      } else if (kept !== null) {
+        kept.push(block);
+      }
+    }
+    if (kept === null) continue;
+    if (kept.length === 0) {
+      kept = [{ type: "text", text: "[signed reasoning block omitted]" }];
+    }
+    if (outer === null) outer = messages.slice();
+    outer[i] = { ...message, content: kept };
+  }
+
+  return { messages: outer ?? messages, blocksStripped };
 }
 
 /**
