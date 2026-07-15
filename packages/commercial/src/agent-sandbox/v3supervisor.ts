@@ -2419,6 +2419,11 @@ export async function provisionV3Container(
       // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
       "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
+    // Dedicated container capability: OC_RUNTIME_CHANNEL is a master-process
+    // signal and would also change the in-container CLI web-root semantics.
+    if (getRuntimeChannel() === "v5") {
+      env.push("OC_CONTAINER_PREVIEW_ENABLED=1");
+    }
     appendCodexRelayEnv(env);
 
     // 工具失败遥测显式开关透传:仅当 master 进程 env 显式设 OC_TOOL_FAILURE_AUDIT=1

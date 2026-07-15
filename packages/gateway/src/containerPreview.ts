@@ -284,7 +284,7 @@ export class ContainerPreviewHandler {
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
     const pathname = safePathname(req.url)
     if (pathname !== CONTAINER_PREVIEW_INTERNAL_WS_PATH) return false
-    if (this.shuttingDown || this.env.OC_RUNTIME_CHANNEL?.trim() !== 'v5') {
+    if (this.shuttingDown || this.env.OC_CONTAINER_PREVIEW_ENABLED?.trim() !== '1') {
       rejectUpgrade(socket, 503, 'preview unavailable')
       return true
     }

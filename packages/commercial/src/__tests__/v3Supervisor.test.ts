@@ -756,6 +756,8 @@ describe("provisionV3Container", () => {
         },
         779,
       );
+      const env = captured.containersCreated[0]?.Env ?? [];
+      assert.ok(env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
       const binds = (captured.containersCreated[0]?.HostConfig?.Binds ?? []) as string[];
       assert.ok(binds.length > 0, "v5 容器仍需其它 bind(data/proj/codex volume 等)");
       assert.ok(
@@ -3260,6 +3262,7 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
     // 行为不变 — self host 注入 V3_GATEWAY_IP / V3_INTERNAL_PROXY_URL
     assert.ok(env.includes(`OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`));
     assert.ok(env.includes(`ANTHROPIC_BASE_URL=${V3_INTERNAL_PROXY_URL}`));
+    assert.ok(!env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
   });
 
   test("remote host + bridgeCidr=172.30.2.0/24(tk1)→ env 注入 172.30.2.1", async () => {
