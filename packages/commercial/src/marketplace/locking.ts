@@ -12,13 +12,45 @@ export async function lockMarketplaceUserSlug(
   userId: number,
   slug: string,
 ): Promise<void> {
-  await runner.query(
-    `SELECT pg_advisory_xact_lock(
-       hashtext('marketplace_install_scope'),
-       hashtext($1::text || ':' || $2::text)
-     )`,
-    [userId, slug],
-  )
+  await lockMarketplaceMutationSet(runner, {
+    userId,
+    artifactSlugs: [slug],
+    agentSlugs: [],
+  })
+}
+
+export interface MarketplaceMutationLockSet {
+  userId: number
+  /** Marketplace install/listing slugs whose install or cache row will change. */
+  artifactSlugs: readonly string[]
+  /** Agent scopes whose capability bindings will change. Includes "main". */
+  agentSlugs: readonly string[]
+}
+
+/**
+ * Capability graph writes share one transaction-scoped advisory-lock namespace.
+ * Callers must collect the complete touched set before their first write. Sorting
+ * the typed keys here gives bundle install, manual scope edit and uninstall the
+ * same global order, preventing ABBA deadlocks and stale agent_ids projections.
+ */
+export async function lockMarketplaceMutationSet(
+  runner: QueryRunner,
+  set: MarketplaceMutationLockSet,
+): Promise<void> {
+  const keys = [
+    ...set.agentSlugs.map((slug) => `agent:${set.userId}:${slug}`),
+    ...set.artifactSlugs.map((slug) => `artifact:${set.userId}:${slug}`),
+  ]
+  const ordered = [...new Set(keys)].sort()
+  for (const key of ordered) {
+    await runner.query(
+      `SELECT pg_advisory_xact_lock(
+         hashtext('marketplace_capability_mutation'),
+         hashtext($1::text)
+       )`,
+      [key],
+    )
+  }
 }
 
 /** 只用于定位后续锁域；不得据此做最终授权决定。 */

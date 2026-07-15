@@ -444,8 +444,14 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     mockedInstallMarketplace.mockResolvedValue({
       ok: true,
       slug: "linear",
+      kind: "connector",
       version: "2.0.0",
       note: "updated",
+      installedDeps: 0,
+      installedCapabilities: [],
+      skippedOptional: [],
+      needsAuthorization: ["linear"],
+      ready: false,
     });
     render(<ConnectorsTab auth={auth} />);
 

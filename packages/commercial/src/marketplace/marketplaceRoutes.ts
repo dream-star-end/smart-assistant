@@ -29,11 +29,13 @@ import {
 import {
   FEATURED_RANK_MAX,
   FEATURED_RANK_MIN,
+  type AgentCapabilityReadiness,
   MarketplaceError,
-  getApprovedSkillVersions,
+  getAgentCapabilityReadiness,
+  getAgentCapabilityReadinessMany,
   getInstallableVersionTarget,
   getListingDetail,
-  installApprovedVersion,
+  installMarketplaceBundle,
   listActiveInstalledAgents,
   listInstalled,
   listMyPublishes,
@@ -162,9 +164,11 @@ function mapMarketplaceError(e: unknown): HttpError {
             e.code === 'KIND_MISMATCH' ||
             e.code === 'INSTALL_CONFLICT'
           ? 409
-          : e.code === 'VERSION_NOT_FOUND' || e.code === 'NOT_INSTALLABLE'
-            ? 404
-            : 400
+          : e.code === 'INVALID_CAPABILITY'
+            ? 422
+            : e.code === 'VERSION_NOT_FOUND' || e.code === 'NOT_INSTALLABLE'
+              ? 404
+              : 400
     return new HttpError(status, e.code, e.message)
   }
   return e instanceof HttpError ? e : new HttpError(500, 'INTERNAL', 'marketplace error')
@@ -298,6 +302,7 @@ export async function handleMarketplaceAgentPublish(
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,
     allowedModels,
+    artifactSlug: slug,
   })
   if (!result.ok) {
     sendJson(res, 422, {
@@ -326,22 +331,6 @@ export async function handleMarketplaceAgentPublish(
   if (humanMetaScanBlocked(res, manifest.name, humanMeta)) return
 
   const orgId = await resolvePublishOrgId(uid(user), body.visibility)
-
-  // every skillDep must resolve to an approved, active marketplace skill visible to the
-  // publisher(公开 ∪ 本 org 私有);org-private 依赖对非本 org 发布者不解析 → 判未上架。
-  if (manifest.skillDeps.length > 0) {
-    const found = await getApprovedSkillVersions(manifest.skillDeps, orgId)
-    const missing = manifest.skillDeps.filter((s) => !found.has(s))
-    if (missing.length > 0) {
-      sendJson(res, 422, {
-        error: {
-          code: 'UNAPPROVED_SKILLDEP',
-          message: `依赖技能未上架或未批准：${missing.join(', ')}`,
-        },
-      })
-      return
-    }
-  }
 
   const rawArtifact = canonicalizeAgentManifest(manifest)
   try {
@@ -465,7 +454,25 @@ export async function handleMarketplaceMyAgents(
     listActiveInstalledAgents(uid(user)),
   ])
   const presetSet = new Set(presets.map((p) => p.slug))
-  const toRow = (a: { slug: string; version: string; rawManifest: string }, preset: boolean) => {
+  const candidates = [
+    ...presets.map((agent) => ({ agent, preset: true })),
+    ...installed
+      .filter((agent) => !presetSet.has(agent.slug))
+      .map((agent) => ({ agent, preset: false })),
+  ]
+  const readiness = await getAgentCapabilityReadinessMany(
+    uid(user),
+    candidates.map(({ agent, preset }) => ({
+      slug: agent.slug,
+      versionId: agent.versionId,
+      preset,
+    })),
+  )
+  const toRow = (
+    a: { slug: string; version: string; rawManifest: string },
+    preset: boolean,
+    capabilityReadiness: AgentCapabilityReadiness,
+  ) => {
     let m: Record<string, unknown> = {}
     try {
       m = JSON.parse(a.rawManifest) as Record<string, unknown>
@@ -481,13 +488,13 @@ export async function handleMarketplaceMyAgents(
       model: (m.model as string) ?? null,
       version: a.version,
       installed: true,
+      capabilityReadiness,
       ...(preset ? { preset: true } : {}),
     }
   }
-  const agents = [
-    ...presets.map((p) => toRow(p, true)),
-    ...installed.filter((a) => !presetSet.has(a.slug)).map((a) => toRow(a, false)),
-  ]
+  const agents = candidates.map(({ agent, preset }, index) =>
+    toRow(agent, preset, readiness[index]!),
+  )
   sendJson(res, 200, {
     agents: [
       {
@@ -500,6 +507,12 @@ export async function handleMarketplaceMyAgents(
         version: null,
         installed: true,
         isDefault: true,
+        capabilityReadiness: {
+          installed: true,
+          ready: true,
+          requirements: [],
+          needsAuthorization: [],
+        },
       },
       ...agents,
     ],
@@ -529,58 +542,69 @@ export async function handleMarketplaceInstall(
     const target = await getInstallableVersionTarget(versionId, callerOrgId)
     if (!target)
       throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
+    if (body.preserveManualScope !== undefined && typeof body.preserveManualScope !== 'boolean')
+      throw new HttpError(400, 'BAD_AGENT_SCOPE', 'preserveManualScope must be boolean')
+    if (body.manualAgentScope !== undefined && typeof body.manualAgentScope !== 'boolean')
+      throw new HttpError(400, 'BAD_AGENT_SCOPE', 'manualAgentScope must be boolean')
+    const preserveManualScope = body.preserveManualScope === true
+    const manualAgentScope = body.manualAgentScope === true
+    if (
+      preserveManualScope &&
+      (target.kind !== 'skill' || body.agentIds !== undefined || manualAgentScope)
+    )
+      throw new HttpError(
+        400,
+        'BAD_AGENT_SCOPE',
+        'preserveManualScope is only valid for a Skill update without agentIds',
+      )
+    if (manualAgentScope && (target.kind !== 'skill' || body.agentIds === undefined))
+      throw new HttpError(
+        400,
+        'BAD_AGENT_SCOPE',
+        'manualAgentScope requires explicit Skill agentIds',
+      )
     const selectedAgentIds =
-      target.kind === 'skill'
+      target.kind === 'skill' && body.agentIds !== undefined
         ? await validateAssignableAgentScope(userId, body.agentIds)
         : undefined
-    const v = await installApprovedVersion({
+    const v = await installMarketplaceBundle({
       userId,
       versionId,
       callerOrgId,
-      ...(selectedAgentIds ? { agentIds: selectedAgentIds, scopeMode: 'replace' as const } : {}),
+      ...(target.kind === 'skill'
+        ? preserveManualScope
+          ? { scopeMode: 'preserve' as const }
+          : manualAgentScope
+            ? { agentIds: selectedAgentIds, scopeMode: 'replace' as const }
+            : {
+                ...(selectedAgentIds ? { agentIds: selectedAgentIds } : {}),
+                // A stale frontend may send the old manual+dependency union. The
+                // data layer removes dependency-owned IDs before writing provenance.
+                scopeMode: 'legacy_union' as const,
+              }
+        : {}),
     })
-
-    // Installing an agent pulls in its (already-approved) skill dependencies so the
-    // agent works out of the box. Best-effort + idempotent: a dep already installed
-    // is re-pinned to its current approved version; a failure on one dep never fails
-    // the agent install.
-    let installedDeps = 0
-    const detail = await getListingDetail(v.slug, callerOrgId)
-    if (detail?.kind === 'agent') {
-      const deps2 = Array.isArray((detail.manifest as { skillDeps?: unknown })?.skillDeps)
-        ? ((detail.manifest as { skillDeps: unknown[] }).skillDeps.filter(
-            (s) => typeof s === 'string',
-          ) as string[])
-        : []
-      if (deps2.length > 0) {
-        const versions = await getApprovedSkillVersions(deps2, callerOrgId)
-        for (const depVid of versions.values()) {
-          try {
-            await installApprovedVersion({
-              userId,
-              versionId: depVid,
-              callerOrgId,
-              agentIds: [v.slug],
-              scopeMode: 'merge',
-            })
-            installedDeps++
-          } catch {
-            /* skip a single failing dep; agent install already recorded */
-          }
-        }
-      }
-    }
 
     sendJson(res, 200, {
       ok: true,
       slug: v.slug,
       version: v.version,
-      installedDeps,
+      kind: v.kind,
+      ...marketplaceArtifactCompatibility(v.kind),
+      installedDeps: v.installedCapabilities.length,
+      installedCapabilities: v.installedCapabilities,
+      skippedOptional: v.skippedOptional,
+      needsAuthorization: v.needsAuthorization,
+      ready: v.ready,
       note:
-        detail?.kind === 'agent'
-          ? `已安装,将在你的下一次会话中可选用${installedDeps ? `（含 ${installedDeps} 个依赖技能）` : ''}。`
-          : detail?.kind === 'connector'
-            ? 'API 连接插件已安装；绑定应用账号后即可使用。'
+        v.kind === 'agent'
+          ? v.ready
+            ? `智能体与 ${v.installedCapabilities.length} 项能力已原子安装。`
+            : '智能体与能力已安装；完成必需插件的账号授权后即可使用。'
+          : v.kind === 'connector'
+            ? v.ready
+              ? 'API 连接插件已安装并可使用。'
+              : 'API 连接插件已安装；绑定应用账号后即可使用。'
             : '已安装,将在你的下一次会话中对 AI 可用。',
     })
   } catch (e) {
@@ -599,8 +623,20 @@ export async function handleMarketplaceInstalled(
   // 在「已安装」里露出只会引导出没有意义的卸载/更新操作。
   const presetSet = new Set(await platformPresetAgentSlugs())
   const rows = (await listInstalled(uid(user))).filter((r) => !presetSet.has(r.slug))
+  const agentRows = rows.filter((row) => row.kind === 'agent')
+  const readinessRows = await getAgentCapabilityReadinessMany(
+    uid(user),
+    agentRows.map((row) => ({ slug: row.slug, versionId: row.versionId })),
+  )
+  const readiness = new Map(
+    agentRows.map((row, index) => [row.slug, readinessRows[index]!] as const),
+  )
   sendJson(res, 200, {
-    installed: rows.map((row) => ({ ...row, ...marketplaceArtifactCompatibility(row.kind) })),
+    installed: rows.map((row) => ({
+      ...row,
+      ...marketplaceArtifactCompatibility(row.kind),
+      ...(row.kind === 'agent' ? { capabilityReadiness: readiness.get(row.slug) } : {}),
+    })),
   })
 }
 
@@ -711,7 +747,17 @@ export async function handleMarketplaceDetail(
   // 平台预设标记(加法字段):前端据此显示「开箱即用」而非安装按钮。
   const preset = detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(slug)
   const publicDetail = { ...detail, ...marketplaceArtifactCompatibility(detail.kind) }
-  sendJson(res, 200, { detail: preset ? { ...publicDetail, preset: true } : publicDetail })
+  const capabilityReadiness =
+    detail.kind === 'agent'
+      ? await getAgentCapabilityReadiness(uid(user), slug, detail.versionId, { preset })
+      : null
+  sendJson(res, 200, {
+    detail: {
+      ...publicDetail,
+      ...(preset ? { preset: true } : {}),
+      ...(capabilityReadiness ? { capabilityReadiness } : {}),
+    },
+  })
 }
 
 // ── DELETE /api/marketplace/installed/:slug ────────────────────────────────

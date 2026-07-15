@@ -76,7 +76,9 @@ export function InstalledPanel({
     async (slug: string, name: string, isAgent: boolean) => {
       const ok = await confirmDialog({
         title: `卸载${isAgent ? "智能体" : "技能"}「${name}」?`,
-        body: "卸载后将不再可用,可随时从市场重新安装。",
+        body: isAgent
+          ? "智能体会被移除；仅由它自动带来的 Skill 会退出。Plugin 是用户级能力，会保留到你在插件管理中主动卸载。"
+          : "卸载后将不再可用；其他智能体对它的依赖会明确显示为未就绪。",
         confirmText: "卸载",
         danger: true,
       });
@@ -106,7 +108,10 @@ export function InstalledPanel({
         await api.installMarketplace(
           auth,
           row.latestVersionId,
-          row.kind === "skill" ? normalizeAgentScope(row.agentIds) : undefined,
+          row.kind === "skill"
+            ? normalizeAgentScope(row.agentIds ?? row.manualAgentIds)
+            : undefined,
+          row.kind === "skill",
         );
         setReload((n) => n + 1);
       } catch (e) {
@@ -121,7 +126,7 @@ export function InstalledPanel({
 
   const openScopeEditor = (row: MarketplaceInstalled) => {
     setEditing(row);
-    setEditScope(normalizeAgentScope(row.agentIds));
+    setEditScope(normalizeAgentScope(row.manualAgentIds ?? row.agentIds));
   };
 
   const saveScope = async () => {
@@ -155,7 +160,7 @@ export function InstalledPanel({
             <Button
               variant="primary"
               onClick={saveScope}
-              disabled={!editing || busy === editing.slug}
+              disabled={!editing || editScope.length === 0 || busy === editing.slug}
             >
               {editing && busy === editing.slug && <Loader2 size={14} className="animate-spin" />}
               保存
@@ -202,6 +207,7 @@ export function InstalledPanel({
           {visibleRows.map((r) => {
             const revoked = r.listingState === "revoked";
             const canUpdate = updateAvailable(r);
+            const dormant = r.kind === "skill" && (r.agentIds?.length ?? 0) === 0;
             return (
               <li
                 key={r.slug}
@@ -218,6 +224,21 @@ export function InstalledPanel({
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
                     {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                    {r.kind === "agent" && r.capabilityReadiness?.ready === true && (
+                      <Badge tone="success">能力已就绪</Badge>
+                    )}
+                    {r.kind === "agent" &&
+                      r.capabilityReadiness?.ready === true &&
+                      r.capabilityReadiness.needsAuthorization.length > 0 && (
+                        <Badge tone="warning">可选 Plugin 待授权</Badge>
+                      )}
+                    {r.kind === "agent" && r.capabilityReadiness?.ready === false && (
+                      <Badge tone="warning">
+                        {r.capabilityReadiness.needsAuthorization.length > 0
+                          ? "Plugin 待授权"
+                          : "能力未就绪"}
+                      </Badge>
+                    )}
                     <Badge tone="neutral">v{r.version}</Badge>
                     {canUpdate && r.latestVersion && (
                       <Badge tone="accent">
@@ -231,6 +252,13 @@ export function InstalledPanel({
                       ? `平台已下架该${r.kind === "agent" ? "智能体" : "技能"}，将自动从你的会话移除。`
                       : r.slug}
                   </p>
+                  {r.kind === "agent" && r.capabilityReadiness && (
+                    <p className="mt-1 text-[11.5px] text-faint">
+                      {r.capabilityReadiness.requirements.length === 0
+                        ? "不依赖额外 Skill / Plugin"
+                        : `${r.capabilityReadiness.requirements.filter((item) => item.status === "ready").length}/${r.capabilityReadiness.requirements.length} 项组合能力就绪`}
+                    </p>
+                  )}
                   {r.kind === "skill" && !revoked && (
                     <div className="mt-1 flex items-center gap-1.5 text-[12px] text-muted">
                       <span>适用：</span>
@@ -238,7 +266,7 @@ export function InstalledPanel({
                     </div>
                   )}
                 </div>
-                {canUpdate && (
+                {canUpdate && !dormant && (
                   <Button
                     variant="primary"
                     size="sm"
@@ -253,6 +281,13 @@ export function InstalledPanel({
                     更新
                   </Button>
                 )}
+                {r.kind === "agent" &&
+                  (r.capabilityReadiness?.needsAuthorization.length ?? 0) > 0 &&
+                  onOpenConnectors && (
+                    <Button variant="secondary" size="sm" onClick={onOpenConnectors}>
+                      授权 Plugin
+                    </Button>
+                  )}
                 {r.kind === "skill" && !revoked && (
                   <Button
                     variant="secondary"

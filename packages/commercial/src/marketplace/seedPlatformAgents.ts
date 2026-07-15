@@ -87,6 +87,7 @@ const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
       // 由 research-writing-style / scientific-writing skill 兜底。如需更长写作上下文可换 MiniMax-M3。
       model: 'deepseek-v4-pro',
       toolsets: ['core', 'research'],
+      capabilities: [],
       skillDeps: [],
       avatarEmoji: '🔬',
       greeting:
@@ -145,6 +146,7 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       version: '1.0.1',
       model: 'MiniMax-M3',
       toolsets: ['core'],
+      capabilities: [],
       skillDeps: [],
       avatarEmoji: '📊',
       greeting:
@@ -185,6 +187,7 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       version: '1.0.1',
       model: 'kimi-k2.7-code',
       toolsets: ['core'],
+      capabilities: [],
       skillDeps: [],
       avatarEmoji: '💻',
       greeting:
@@ -287,6 +290,18 @@ async function seedAgentDefs(
       }
       const manifest: AgentManifest = result.manifest
 
+      // Platform presets have no per-user install row, so the 0151 legacy hash
+      // gate cannot hide one during a source rollback. Keep required Plugins out
+      // of evergreen presets while that rollback contract exists; installable
+      // marketplace Agents remain free to declare them.
+      if (manifest.capabilities.some((ref) => ref.kind === 'plugin' && !ref.optional)) {
+        out.errors.push({
+          slug: def.slug,
+          error: 'required Plugin is not rollback-safe for a platform preset',
+        })
+        continue
+      }
+
       // persona 过与发布路由相同的静态安全扫描(注入/泄密/…)。
       const scan = scanSkillArtifact({
         name: manifest.name,
@@ -360,7 +375,10 @@ async function seedAgentDefs(
       await revokeListing(slug, 'deprecated platform agent')
       out.deprecated.push(slug)
     } catch (e) {
-      out.errors.push({ slug, error: `revoke failed: ${e instanceof Error ? e.message : String(e)}` })
+      out.errors.push({
+        slug,
+        error: `revoke failed: ${e instanceof Error ? e.message : String(e)}`,
+      })
     }
   }
 

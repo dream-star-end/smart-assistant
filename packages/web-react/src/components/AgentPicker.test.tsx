@@ -22,8 +22,11 @@ afterEach(() => {
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
-function renderPicker(extra: Partial<Parameters<typeof AgentPicker>[0]> = {}) {
-  listMyAgents.mockResolvedValue([]);
+function renderPicker(
+  extra: Partial<Parameters<typeof AgentPicker>[0]> = {},
+  rows: unknown[] = [],
+) {
+  listMyAgents.mockResolvedValue(rows);
   return render(
     <AgentPicker
       open
@@ -59,5 +62,47 @@ describe("AgentPicker 团队模式开关文案（知情同意）", () => {
     renderPicker({ teamMode: true });
     const sw = await screen.findByRole("switch", { name: "启用团队模式" });
     expect(sw).toHaveAttribute("data-state", "checked");
+  });
+});
+
+describe("AgentPicker capability readiness", () => {
+  it("保留未就绪 Agent 供用户理解状态，但禁止选择执行", async () => {
+    const onPick = vi.fn();
+    const rows = [
+      {
+        id: "main",
+        slug: "main",
+        name: "全能助手",
+        description: "",
+        installed: true,
+        isDefault: true,
+        capabilityReadiness: {
+          installed: true,
+          ready: true,
+          requirements: [],
+          needsAuthorization: [],
+        },
+      },
+      {
+        id: "research-agent",
+        slug: "research-agent",
+        name: "科研助手",
+        description: "需要检索插件",
+        installed: true,
+        capabilityReadiness: {
+          installed: true,
+          ready: false,
+          requirements: [],
+          needsAuthorization: ["paper-search"],
+        },
+      },
+    ];
+    renderPicker({ onPick }, rows);
+
+    const agent = await screen.findByRole("button", { name: /科研助手/ });
+    expect(agent).toBeDisabled();
+    expect(screen.getByText("Plugin 待授权")).toBeInTheDocument();
+    fireEvent.click(agent);
+    expect(onPick).not.toHaveBeenCalled();
   });
 });

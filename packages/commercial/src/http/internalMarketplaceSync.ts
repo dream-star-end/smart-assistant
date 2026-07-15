@@ -17,11 +17,7 @@ import {
   verifyContainerIdentity,
 } from '../auth/containerIdentity.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
-import {
-  listActiveInstalledAgents,
-  listActiveInstalledArtifacts,
-  listPlatformPresetAgents,
-} from '../marketplace/marketplaceDb.js'
+import { loadMarketplaceRuntimeSnapshot } from '../marketplace/marketplaceDb.js'
 import { marketplaceArtifactHash } from '@openclaude/storage'
 import { canonicalBundleJson } from '../marketplace/bundle.js'
 import { platformPresetAgentSlugs } from '../marketplace/platformPresets.js'
@@ -79,21 +75,18 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
       // agents = 平台预设(current approved,evergreen)∪ 用户已装;同 slug 预设优先。
       // 与 my-agents 的合并规则一致 —— 预设对所有用户容器恒下发,无需安装。
       const presetSlugs = await platformPresetAgentSlugs()
-      const [skills, installedAgents, presetAgents] = await Promise.all([
-        listActiveInstalledArtifacts(identity.userId),
-        listActiveInstalledAgents(identity.userId),
-        listPlatformPresetAgents(presetSlugs),
-      ])
+      // Skill feed + Agent readiness 必须来自同一个 PG 快照；否则并发卸载/撤销会
+      // 短暂下发“Agent 仍可执行、必需 Skill 已消失”的撕裂组合。
+      const { skills, agentSets } = await loadMarketplaceRuntimeSnapshot(
+        identity.userId,
+        presetSlugs,
+      )
       // bundle 完整性:master 侧对 canonical JSON 计算 hash,容器侧独立复算比对。
       const skillsOut = skills.map((sk) => {
         if (!sk.bundle) return sk
         return { ...sk, bundleHash: marketplaceArtifactHash(canonicalBundleJson(sk.bundle)) }
       })
-      const presetSet = new Set(presetAgents.map((p) => p.slug))
-      const agents = [
-        ...presetAgents,
-        ...installedAgents.filter((a) => !presetSet.has(a.slug)),
-      ]
+      const agents = [...agentSets.presets, ...agentSets.installed]
       sendJson(res, 200, { skills: skillsOut, agents }, requestId)
     } catch (err) {
       log

@@ -2605,6 +2605,49 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
+  test("Agent 能力未就绪 + 帧显式带 model → 仍 fail-closed,不得执行容器陈旧投影", async () => {
+    let loaderCalls = 0;
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAgentModelResolver: async () => {
+        loaderCalls += 1;
+        const resolver = (agentId: string) =>
+          agentId === "main" ? "glm-5.2" : null;
+        resolver.isRuntimeDenied = (agentId: string) => agentId === "blocked-agent";
+        return resolver;
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("230"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      const loadsBeforeFrame = loaderCalls;
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+
+      const errP = waitJsonFrameOfType(ws, "error");
+      const closedP = new Promise<number>((r) => ws.once("close", (code) => r(code)));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "blocked-agent",
+        model: "glm-5.2",
+        content: "hi",
+      }));
+
+      const err = await errP;
+      assert.equal(err.code, "UNRESOLVED_AGENT_MODEL");
+      assert.match(String(err.message), /not ready/);
+      assert.equal(await closedP, 4507);
+      await waitUntil(() => loaderCalls > loadsBeforeFrame, 1000);
+      assert.equal(containerGotFrame, false, "explicit model must not bypass runtime readiness");
+      assert.equal(rig.binding.acquireCalls, 0);
+      assert.equal(rig.poolCtrl.journalRows.size, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
   test("帧显式带 model 时 frame.model 优先于权威(gpt-5.6-sol 帧在非 gpt agent 上仍走 codex 计费)", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,

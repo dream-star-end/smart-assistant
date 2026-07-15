@@ -17,7 +17,8 @@
     "0148_inbox_rich_assets",
     "0149_audit_hardening",
     "0150_agent_tool_rollups",
-    "0151_product_friction_events"
+    "0151_product_friction_events",
+    "0152_marketplace_capability_bindings"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

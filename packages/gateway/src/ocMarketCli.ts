@@ -6,7 +6,7 @@
  * publish goes to the review queue (never live without admin approval).
  *
  * Usage (the `market` baseline skill documents this for the agent):
- *   oc-market search <query> [--kind skill|agent]
+ *   oc-market search <query> [--kind skill|agent|plugin]
  *   oc-market detail <slug>
  *   oc-market installed
  *   oc-market install <slug>
@@ -16,7 +16,8 @@
  *     [--bundle-dir <dir>] [--benchmark-file <f>] [--visibility org]
  *   oc-market publish-agent --slug <s> --name <n> --version <v> --description <d> --model <m>
  *     --toolsets a,b --persona-file <f> --category <id> --use-cases "a;b"
- *     [--outcomes "a;b"] [--intro-file <f>] [--skill-deps a,b] [--tags a,b] [--visibility org]
+ *     [--outcomes "a;b"] [--intro-file <f>] [--skill-deps a,b] [--plugin-deps a,b]
+ *     [--optional-skill-deps a,b] [--optional-plugin-deps a,b] [--tags a,b] [--visibility org]
  *
  * Storefront ("人向商品层") metadata carried on publish (validated server-side):
  *   --category <id>       one of the marketplace taxonomy ids (required)
@@ -41,8 +42,8 @@ import { pathToFileURL } from 'node:url'
 
 import {
   BUNDLE_ALLOWED_PREFIXES,
-  BUNDLE_MAX_FILE_BYTES,
   BUNDLE_MAX_FILES,
+  BUNDLE_MAX_FILE_BYTES,
   BUNDLE_MAX_TOTAL_BYTES,
   validateBundlePath,
 } from '@openclaude/protocol'
@@ -82,8 +83,11 @@ export function resolveLocalGatewayBase(
 ): string | null {
   const home = env.OPENCLAUDE_HOME?.trim() || join(env.HOME?.trim() || homedir(), '.openclaude')
   try {
-    const cfg = JSON.parse(readFile(join(home, 'openclaude.json'), 'utf8')) as { gateway?: { port?: unknown } }
-    const port = typeof cfg.gateway?.port === 'number' ? cfg.gateway.port : Number(cfg.gateway?.port)
+    const cfg = JSON.parse(readFile(join(home, 'openclaude.json'), 'utf8')) as {
+      gateway?: { port?: unknown }
+    }
+    const port =
+      typeof cfg.gateway?.port === 'number' ? cfg.gateway.port : Number(cfg.gateway?.port)
     if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
     return `http://127.0.0.1:${port}/internal/v3/marketplace/agent-local`
   } catch {
@@ -106,7 +110,10 @@ export function resolveMarketplaceEndpoint(
   }
   const localBase = resolveLocalGatewayBase(env, readFile)
   if (localBase) return { baseUrl: localBase, mode: 'local' }
-  if (masterBase) throw new Error('not in a commercial container (no container token and no local gateway config)')
+  if (masterBase)
+    throw new Error(
+      'not in a commercial container (no container token and no local gateway config)',
+    )
   throw new Error('not in a commercial container (no master base url or local gateway config)')
 }
 
@@ -149,8 +156,9 @@ export interface BundleFileEntry {
  */
 export function collectBundleDir(
   dir: string,
-  readDir: (p: string) => Array<{ name: string; isDirectory(): boolean; isFile(): boolean }> = (p) =>
-    readdirSync(p, { withFileTypes: true }),
+  readDir: (p: string) => Array<{ name: string; isDirectory(): boolean; isFile(): boolean }> = (
+    p,
+  ) => readdirSync(p, { withFileTypes: true }),
   readFile: FileReader = readFileSync,
 ): { files: BundleFileEntry[]; errors: string[] } {
   const relPaths: string[] = []
@@ -172,12 +180,15 @@ export function collectBundleDir(
       else if (e.isFile()) relPaths.push(`${rel}${e.name}`) // symlink 等特殊类型一律忽略
     }
   }
-  for (const prefix of BUNDLE_ALLOWED_PREFIXES) walk(join(dir, prefix.replace(/\/$/, '')), prefix, true)
+  for (const prefix of BUNDLE_ALLOWED_PREFIXES)
+    walk(join(dir, prefix.replace(/\/$/, '')), prefix, true)
   relPaths.sort()
   const files: BundleFileEntry[] = []
   let total = 0
-  if (relPaths.length === 0) errors.push(`目录下没有可发布的附属文件(只认 ${BUNDLE_ALLOWED_PREFIXES.join(' ')} 子目录)`)
-  if (relPaths.length > BUNDLE_MAX_FILES) errors.push(`附属文件最多 ${BUNDLE_MAX_FILES} 个(实际 ${relPaths.length} 个)`)
+  if (relPaths.length === 0)
+    errors.push(`目录下没有可发布的附属文件(只认 ${BUNDLE_ALLOWED_PREFIXES.join(' ')} 子目录)`)
+  if (relPaths.length > BUNDLE_MAX_FILES)
+    errors.push(`附属文件最多 ${BUNDLE_MAX_FILES} 个(实际 ${relPaths.length} 个)`)
   for (const rel of relPaths) {
     const pathErr = validateBundlePath(rel)
     if (pathErr) {
@@ -230,6 +241,8 @@ export interface PublishAgentRequest {
   category?: string
   model?: string
   toolsets: string[]
+  capabilities: Array<{ kind: 'skill' | 'plugin'; slug: string; optional: boolean }>
+  /** Compatibility projection consumed by older V5 runtimes. */
   skillDeps: string[]
   tags: string[]
   useCases: string[]
@@ -276,6 +289,21 @@ export function buildPublishAgentRequest(
   humanMd?: string,
   extras?: { visibility?: 'org' },
 ): PublishAgentRequest {
+  const uniqueList = (value: string | undefined) => [...new Set(splitList(value, ','))]
+  const requiredSkills = uniqueList(flags['skill-deps'])
+  const requiredPlugins = uniqueList(flags['plugin-deps'])
+  const optionalSkills = uniqueList(flags['optional-skill-deps']).filter(
+    (slug) => !requiredSkills.includes(slug),
+  )
+  const optionalPlugins = uniqueList(flags['optional-plugin-deps']).filter(
+    (slug) => !requiredPlugins.includes(slug),
+  )
+  const capabilities = [
+    ...requiredSkills.map((slug) => ({ kind: 'skill' as const, slug, optional: false })),
+    ...requiredPlugins.map((slug) => ({ kind: 'plugin' as const, slug, optional: false })),
+    ...optionalSkills.map((slug) => ({ kind: 'skill' as const, slug, optional: true })),
+    ...optionalPlugins.map((slug) => ({ kind: 'plugin' as const, slug, optional: true })),
+  ]
   return {
     kind: 'agent',
     slug: flags.slug,
@@ -285,7 +313,8 @@ export function buildPublishAgentRequest(
     category: flags.category,
     model: flags.model,
     toolsets: splitList(flags.toolsets, ','),
-    skillDeps: splitList(flags['skill-deps'], ','),
+    capabilities,
+    skillDeps: [...requiredSkills, ...optionalSkills],
     tags: splitList(flags.tags, ','),
     useCases: splitList(flags['use-cases'], ';'),
     outcomeExamples: splitList(flags.outcomes, ';'),
@@ -361,7 +390,7 @@ async function main(): Promise<void> {
     case 'search': {
       const q = positional.join(' ')
       const query: Record<string, string> = { q }
-      if (flags.kind) query.kind = flags.kind
+      if (flags.kind) query.kind = flags.kind === 'plugin' ? 'connector' : flags.kind
       const r = await call('GET', 'search', query)
       out(r.results ?? [])
       return

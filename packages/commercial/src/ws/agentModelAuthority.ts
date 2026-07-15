@@ -10,8 +10,8 @@
  * 信 frame / lastSeen 这类客户端可控信号。
  *
  * 快照组成(与容器 agents.yaml 的 master 侧来源一一对应):
- *   1. marketplace 用户已装 agent(listActiveInstalledAgents)→ manifest.model
- *   2. marketplace 平台预设 agent(listPlatformPresetAgents)→ manifest.model,
+ *   1. marketplace 用户已装且能力就绪的 agent(listRuntimeReadyAgentSets)→ manifest.model
+ *   2. 同一批次内能力就绪的平台预设 agent → manifest.model,
  *      同 slug 覆盖已装(与 internalMarketplaceSync 的「预设优先」合并规则一致)
  *   3. 内置 seed agents → 见下「seed 权威的两种形态」;内置 id 最后写入 = 最高优先
  *      (容器 reconcileAgents 对 reserved id 同样跳过 marketplace 同名项,语义对齐)
@@ -38,8 +38,7 @@
 import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 import {
-  listActiveInstalledAgents,
-  listPlatformPresetAgents,
+  listRuntimeReadyAgentSets,
   type InstalledAgent,
 } from "../marketplace/marketplaceDb.js";
 import { platformPresetAgentSlugs } from "../marketplace/platformPresets.js";
@@ -48,6 +47,12 @@ import { seedAgentModels, type SeedAgentExecution } from "./seedDeclarationLoade
 
 /** 阶段 B 开关:=1 时 seed 权威按容器 bundle_rev 推导(见文件头);未设 = 旧常量路径。 */
 export const SEED_AUTHORITY_BY_REV_ENV = "OC_SEED_AUTHORITY_BY_REV";
+
+const LEGACY_SEED_AGENT_MODELS = new Map<string, string>([
+  ["main", PLATFORM_DEFAULT_MODEL],
+  ["codex", DEFAULT_CODEX_ENGINE_MODEL],
+  ["hidden-reviewer", PLATFORM_HIDDEN_REVIEWER_MODEL],
+]);
 
 export function seedAuthorityByRevEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[SEED_AUTHORITY_BY_REV_ENV] === "1";
@@ -91,11 +96,25 @@ export function buildAgentModelSnapshot(
       map.set(agentId, exec.model);
     }
   } else {
-    map.set("main", PLATFORM_DEFAULT_MODEL);
-    map.set("codex", DEFAULT_CODEX_ENGINE_MODEL);
-    map.set("hidden-reviewer", PLATFORM_HIDDEN_REVIEWER_MODEL);
+    for (const [agentId, model] of LEGACY_SEED_AGENT_MODELS) map.set(agentId, model);
   }
   return map;
+}
+
+/**
+ * Marketplace readiness can contain a colliding unready slug, but seed Agents
+ * retain execution precedence over marketplace content. Filter those IDs from
+ * the deny projection using the same per-bundle seed authority as the model map.
+ */
+export function runtimeDeniedAgentIds(
+  denied: ReadonlySet<string>,
+  seedExecutions?: ReadonlyMap<string, SeedAgentExecution>,
+): Set<string> {
+  const seedIds =
+    seedExecutions === undefined
+      ? new Set(LEGACY_SEED_AGENT_MODELS.keys())
+      : new Set(seedExecutions.keys());
+  return new Set([...denied].filter((agentId) => !seedIds.has(agentId)));
 }
 
 /** loadAgentModelResolverForUser 的阶段 B 入参(bridge 在 ensureRunning 之后拿到 label 传入)。 */
@@ -109,6 +128,16 @@ export interface AgentModelResolverOptions {
 }
 
 /**
+ * Callable for the hot-path model lookup, with an attached fail-closed readiness
+ * predicate. The predicate is optional only so older test/assembly injections that
+ * predate capability readiness remain source-compatible; the production loader
+ * always provides it.
+ */
+export type AgentModelResolver = ((agentId: string) => string | null) & {
+  isRuntimeDenied?: (agentId: string) => boolean;
+};
+
+/**
  * bridge dep `loadAgentModelResolver` 的生产实现:拉一次 DB 快照(+ 阶段 B 的 seed 声明),
  * 返回 sync resolver closure。刷新语义由 bridge 侧 handle 承载(周期 + miss 补触发)。
  *
@@ -119,17 +148,17 @@ export interface AgentModelResolverOptions {
 export async function loadAgentModelResolverForUser(
   uid: bigint,
   opts?: AgentModelResolverOptions,
-): Promise<(agentId: string) => string | null> {
+): Promise<AgentModelResolver> {
   // seed 声明**先于** DB 加载:rev 缺失/非法/bundle 坏 = 这条连接注定 fail-closed,不必再打 DB。
   // (rev 不可变 ⇒ LRU 命中时这里是纯内存查表,无额外延迟。)
   const seedExecutions = seedAuthorityByRevEnabled(opts?.env)
     ? await seedAgentModels(opts?.bundleRev, opts?.platformRoot)
     : undefined;
   const presetSlugs = await platformPresetAgentSlugs();
-  const [installed, presets] = await Promise.all([
-    listActiveInstalledAgents(Number(uid)),
-    listPlatformPresetAgents(presetSlugs),
-  ]);
-  const snapshot = buildAgentModelSnapshot(installed, presets, seedExecutions);
-  return (agentId: string) => snapshot.get(agentId) ?? null;
+  const agentSets = await listRuntimeReadyAgentSets(Number(uid), presetSlugs);
+  const snapshot = buildAgentModelSnapshot(agentSets.installed, agentSets.presets, seedExecutions);
+  const denied = runtimeDeniedAgentIds(agentSets.denied, seedExecutions);
+  const resolver = ((agentId: string) => snapshot.get(agentId) ?? null) as AgentModelResolver;
+  resolver.isRuntimeDenied = (agentId: string) => denied.has(agentId);
+  return resolver;
 }

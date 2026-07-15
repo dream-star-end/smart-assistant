@@ -4,7 +4,10 @@ import type { MarketplaceMyAgent } from "../lib/types";
 const DEFAULT_SCOPE = ["main"];
 
 export function normalizeAgentScope(ids: readonly string[] | undefined): string[] {
-  const raw = ids && ids.length > 0 ? ids : DEFAULT_SCOPE;
+  // undefined means a new/legacy install and keeps the main-Agent default. An
+  // explicit [] is authoritative: dependency artifacts may remain dormant after
+  // their last Agent is removed and must not be visually/reactively reactivated.
+  const raw = ids === undefined ? DEFAULT_SCOPE : ids;
   const out: string[] = [];
   const seen = new Set<string>();
   for (const id of raw) {
@@ -13,7 +16,7 @@ export function normalizeAgentScope(ids: readonly string[] | undefined): string[
     seen.add(trimmed);
     out.push(trimmed);
   }
-  return out.length > 0 ? out : [...DEFAULT_SCOPE];
+  return out;
 }
 
 export function agentScopeLabels(
@@ -32,6 +35,9 @@ export function AgentScopeSummary({
   agents: MarketplaceMyAgent[];
 }) {
   const labels = agentScopeLabels(agentIds, agents);
+  if (labels.length === 0) {
+    return <Badge tone="neutral">能力库中 · 暂未启用</Badge>;
+  }
   return (
     <span className="inline-flex flex-wrap items-center gap-1">
       {labels.map((label) => (

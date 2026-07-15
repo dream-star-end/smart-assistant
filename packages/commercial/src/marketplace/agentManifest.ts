@@ -10,12 +10,16 @@
  *     (never "default = all"),
  *   - requires model ∈ the v5 public model set,
  *   - takes persona as INLINE text (scanned by the caller via the skill scanner),
- *   - takes skillDeps as marketplace slugs (their "approved" status is checked
- *     against the DB by the publish route, not here).
+ *   - takes Skills + Plugins as typed capability references. Legacy skillDeps is
+ *     still accepted and emitted so an older runtime can read a new manifest.
  *
  * permissionMode is intentionally absent: the platform fixes it at runtime; a
  * marketplace agent can never request bypassPermissions.
  */
+
+import type { MarketplaceCapabilityRef } from '@openclaude/protocol'
+
+export type { MarketplaceCapabilityKind, MarketplaceCapabilityRef } from '@openclaude/protocol'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 
@@ -33,6 +37,7 @@ const ALLOWED_FIELDS = new Set([
   'version',
   'model',
   'toolsets',
+  'capabilities',
   'skillDeps',
   'persona',
   'displayName',
@@ -61,6 +66,8 @@ export interface AgentManifest {
   version: string
   model: string
   toolsets: string[]
+  capabilities: MarketplaceCapabilityRef[]
+  /** Legacy compatibility projection of all skill capabilities. */
   skillDeps: string[]
   persona: string
   displayName?: string
@@ -75,6 +82,71 @@ export interface ValidateOpts {
   vettedToolsets?: ReadonlySet<string> | readonly string[]
   /** v5 public model ids the manifest.model must belong to. */
   allowedModels: ReadonlySet<string>
+  /** Marketplace listing slug, used to reject a direct self-dependency. */
+  artifactSlug?: string
+}
+
+const MAX_CAPABILITIES = 32
+
+function parseLegacySkillDeps(value: unknown, errors: string[]): string[] {
+  const skillDeps: string[] = []
+  if (value === undefined) return skillDeps
+  if (!Array.isArray(value)) {
+    errors.push('skillDeps 须为数组')
+    return skillDeps
+  }
+  for (const s of value) {
+    if (typeof s !== 'string' || !SLUG_RE.test(s)) errors.push(`skillDep "${String(s)}" 非法 slug`)
+    else if (!skillDeps.includes(s)) skillDeps.push(s)
+  }
+  return skillDeps
+}
+
+function parseCapabilities(value: unknown, artifactSlug: string | undefined, errors: string[]) {
+  const capabilities: MarketplaceCapabilityRef[] = []
+  if (value === undefined) return capabilities
+  if (!Array.isArray(value)) {
+    errors.push('capabilities 须为数组')
+    return capabilities
+  }
+  if (value.length > MAX_CAPABILITIES) errors.push(`capabilities 最多 ${MAX_CAPABILITIES} 项`)
+  const seen = new Set<string>()
+  for (const [index, raw] of value.entries()) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      errors.push(`capabilities[${index}] 须为对象`)
+      continue
+    }
+    const item = raw as Record<string, unknown>
+    const unknown = Object.keys(item).find((key) => !['kind', 'slug', 'optional'].includes(key))
+    if (unknown) errors.push(`capabilities[${index}] 未知字段：${unknown}`)
+    const kind = item.kind
+    const slug = item.slug
+    const optional = item.optional ?? false
+    if (kind !== 'skill' && kind !== 'plugin') {
+      errors.push(`capabilities[${index}].kind 须为 skill 或 plugin`)
+      continue
+    }
+    if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
+      errors.push(`capabilities[${index}].slug 非法`)
+      continue
+    }
+    if (typeof optional !== 'boolean') {
+      errors.push(`capabilities[${index}].optional 须为布尔值`)
+      continue
+    }
+    if (artifactSlug && slug === artifactSlug) {
+      errors.push(`capability "${slug}" 不得依赖自身`)
+      continue
+    }
+    const key = `${kind}:${slug}`
+    if (seen.has(key)) {
+      errors.push(`capability 重复：${key}`)
+      continue
+    }
+    seen.add(key)
+    capabilities.push({ kind, slug, optional })
+  }
+  return capabilities
 }
 
 const MAX = {
@@ -141,19 +213,29 @@ export function validateAgentManifest(raw: unknown, opts: ValidateOpts): Validat
     }
   }
 
-  // skillDeps: optional list of marketplace slugs (approval checked by the route)
-  const skillDeps: string[] = []
-  if (o.skillDeps !== undefined) {
-    if (!Array.isArray(o.skillDeps)) {
-      errors.push('skillDeps 须为数组')
-    } else {
-      for (const s of o.skillDeps) {
-        if (typeof s !== 'string' || !SLUG_RE.test(s))
-          errors.push(`skillDep "${String(s)}" 非法 slug`)
-        else if (!skillDeps.includes(s)) skillDeps.push(s)
-      }
-    }
+  // capabilities supersedes skillDeps. If both are present their skill projection
+  // must match exactly, otherwise old and new runtimes would install different bundles.
+  const legacySkillDeps = parseLegacySkillDeps(o.skillDeps, errors)
+  let capabilities = parseCapabilities(o.capabilities, opts.artifactSlug, errors)
+  if (o.capabilities === undefined) {
+    capabilities = legacySkillDeps.map((slug) => ({ kind: 'skill', slug, optional: false }))
   }
+  if (capabilities.length > MAX_CAPABILITIES && o.capabilities === undefined)
+    errors.push(`capabilities 最多 ${MAX_CAPABILITIES} 项`)
+  const capabilitySkillDeps = capabilities
+    .filter((item) => item.kind === 'skill')
+    .map((item) => item.slug)
+  // Plugin refs cannot be projected into the legacy Skill-only vocabulary. The
+  // 0151 install trigger therefore gives Agents with a required Plugin an
+  // old-reader-visible hash mismatch: rollback source hides them fail-closed,
+  // while current source recognizes that exact marker and evaluates readiness.
+  if (o.capabilities !== undefined && o.skillDeps !== undefined) {
+    const a = [...capabilitySkillDeps].sort()
+    const b = [...legacySkillDeps].sort()
+    if (a.length !== b.length || a.some((slug, index) => slug !== b[index]))
+      errors.push('capabilities 与 skillDeps 的技能集合不一致')
+  }
+  const skillDeps = capabilitySkillDeps
 
   // tags: optional
   const tags: string[] = []
@@ -190,6 +272,7 @@ export function validateAgentManifest(raw: unknown, opts: ValidateOpts): Validat
       version: version as string,
       model: model as string,
       toolsets,
+      capabilities,
       skillDeps,
       persona: persona as string,
       ...(displayName ? { displayName } : {}),
@@ -208,6 +291,10 @@ export function canonicalizeAgentManifest(m: AgentManifest): string {
     version: m.version,
     model: m.model,
     toolsets: m.toolsets,
+    // Preserve the canonical bytes of legacy/no-capability Agents. Platform seeds
+    // pin artifact hashes by version, so emitting a new empty key would break their
+    // idempotent convergence without adding any semantics.
+    ...(m.capabilities.length > 0 ? { capabilities: m.capabilities } : {}),
     skillDeps: m.skillDeps,
     tags: m.tags,
     persona: m.persona,

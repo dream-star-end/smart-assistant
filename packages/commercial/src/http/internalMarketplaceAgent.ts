@@ -21,6 +21,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+import { marketplaceArtifactCompatibility } from '@openclaude/protocol'
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 
 import {
@@ -36,9 +37,10 @@ import {
 } from '../marketplace/agentManifest.js'
 import {
   MarketplaceError,
-  getApprovedSkillVersions,
+  getAgentCapabilityReadiness,
+  getAgentCapabilityReadinessMany,
   getListingDetail,
-  installApprovedVersion,
+  installMarketplaceBundle,
   listInstalled,
   marketplaceAgentsEnabled,
   marketplaceConnectorsEnabled,
@@ -51,7 +53,10 @@ import {
   humanMetaScanBody,
   parseHumanMeta,
 } from '../marketplace/marketplaceMeta.js'
-import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
+import {
+  listMarketBrowseCatalog,
+  platformPresetAgentSlugs,
+} from '../marketplace/platformPresets.js'
 import { prepareConnectorPublish } from '../marketplace/publishConnectorPipeline.js'
 import {
   PUBLISH_MAX_REQUEST_BYTES,
@@ -140,6 +145,7 @@ function statusForMarketplaceError(code: string): number {
     code === 'INSTALL_CONFLICT'
   )
     return 409
+  if (code === 'INVALID_CAPABILITY') return 422
   if (code === 'NOT_INSTALLABLE' || code === 'VERSION_NOT_FOUND') return 404
   return 400
 }
@@ -218,6 +224,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             results: filtered.slice(0, limit).map((c) => ({
               slug: c.slug,
               kind: c.kind,
+              ...marketplaceArtifactCompatibility(c.kind),
               name: c.name,
               description: c.description,
               tags: c.tags,
@@ -252,18 +259,48 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             { error: { code: 'NOT_FOUND', message: '未上架或不存在' } },
             requestId,
           )
-        send(res, 200, { detail }, requestId)
-        return
-      }
-      if (req.method === 'GET' && op === 'installed') {
-        const installed = await listInstalled(userId)
+        const preset =
+          detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(detail.slug)
+        const capabilityReadiness =
+          detail.kind === 'agent'
+            ? await getAgentCapabilityReadiness(userId, detail.slug, detail.versionId, { preset })
+            : null
         send(
           res,
           200,
           {
-            installed: marketplaceConnectorsEnabled()
+            detail: {
+              ...detail,
+              ...marketplaceArtifactCompatibility(detail.kind),
+              ...(capabilityReadiness ? { capabilityReadiness } : {}),
+            },
+          },
+          requestId,
+        )
+        return
+      }
+      if (req.method === 'GET' && op === 'installed') {
+        const installed = await listInstalled(userId)
+        const agentRows = installed.filter((item) => item.kind === 'agent')
+        const readinessRows = await getAgentCapabilityReadinessMany(
+          userId,
+          agentRows.map((item) => ({ slug: item.slug, versionId: item.versionId })),
+        )
+        const readiness = new Map(
+          agentRows.map((item, index) => [item.slug, readinessRows[index]!] as const),
+        )
+        send(
+          res,
+          200,
+          {
+            installed: (marketplaceConnectorsEnabled()
               ? installed
-              : installed.filter((item) => item.kind !== 'connector'),
+              : installed.filter((item) => item.kind !== 'connector')
+            ).map((item) => ({
+              ...item,
+              ...marketplaceArtifactCompatibility(item.kind),
+              ...(item.kind === 'agent' ? { capabilityReadiness: readiness.get(item.slug) } : {}),
+            })),
           },
           requestId,
         )
@@ -289,41 +326,27 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             { error: { code: 'NOT_INSTALLABLE', message: '未上架或不存在' } },
             requestId,
           )
-        const v = await installApprovedVersion({
+        const v = await installMarketplaceBundle({
           userId,
           versionId: detail.versionId,
           callerOrgId,
           scopeMode: 'preserve',
         })
-        let installedDeps = 0
-        if (detail.kind === 'agent') {
-          const depSlugs = Array.isArray((detail.manifest as { skillDeps?: unknown })?.skillDeps)
-            ? ((detail.manifest as { skillDeps: unknown[] }).skillDeps.filter(
-                (s) => typeof s === 'string',
-              ) as string[])
-            : []
-          if (depSlugs.length > 0) {
-            const versions = await getApprovedSkillVersions(depSlugs, callerOrgId)
-            for (const depVid of versions.values()) {
-              try {
-                await installApprovedVersion({
-                  userId,
-                  versionId: depVid,
-                  callerOrgId,
-                  agentIds: [v.slug],
-                  scopeMode: 'merge',
-                })
-                installedDeps++
-              } catch {
-                /* skip a single failing dep */
-              }
-            }
-          }
-        }
         send(
           res,
           200,
-          { ok: true, slug: v.slug, kind: detail.kind, version: v.version, installedDeps },
+          {
+            ok: true,
+            slug: v.slug,
+            kind: detail.kind,
+            ...marketplaceArtifactCompatibility(detail.kind),
+            version: v.version,
+            installedDeps: v.installedCapabilities.length,
+            installedCapabilities: v.installedCapabilities,
+            skippedOptional: v.skippedOptional,
+            needsAuthorization: v.needsAuthorization,
+            ready: v.ready,
+          },
           requestId,
         )
         return
@@ -456,6 +479,8 @@ async function handlePublish(
       200,
       {
         ok: true,
+        kind: 'connector',
+        ...marketplaceArtifactCompatibility('connector'),
         versionId,
         status: 'pending',
         riskFlags: prepared.riskFlags,
@@ -513,6 +538,8 @@ async function handlePublish(
       200,
       {
         ok: true,
+        kind: 'skill',
+        ...marketplaceArtifactCompatibility('skill'),
         versionId,
         status: 'pending',
         // 含 scripts 危险模式 warning flag —— 发布者(容器内 AI)与审核者看同一份。
@@ -586,6 +613,7 @@ async function handlePublish(
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,
     allowedModels,
+    artifactSlug: slug,
   })
   if (!result.ok)
     return send(
@@ -608,17 +636,6 @@ async function handlePublish(
       { error: { code: 'SCAN_BLOCKED', message: '被静态扫描拦截' }, riskFlags: scan.flags },
       requestId,
     )
-  if (manifest.skillDeps.length > 0) {
-    const found = await getApprovedSkillVersions(manifest.skillDeps, orgId)
-    const missing = manifest.skillDeps.filter((s) => !found.has(s))
-    if (missing.length > 0)
-      return send(
-        res,
-        422,
-        { error: { code: 'UNAPPROVED_SKILLDEP', message: `依赖技能未上架:${missing.join(', ')}` } },
-        requestId,
-      )
-  }
   const rawArtifact = canonicalizeAgentManifest(manifest)
   const { versionId } = await publishSkillVersion({
     slug,
@@ -650,7 +667,14 @@ async function handlePublish(
   send(
     res,
     200,
-    { ok: true, versionId, status: 'pending', note: '已提交,平台审核通过后才会上架。' },
+    {
+      ok: true,
+      kind: 'agent',
+      ...marketplaceArtifactCompatibility('agent'),
+      versionId,
+      status: 'pending',
+      note: '已提交,平台审核通过后才会上架。',
+    },
     requestId,
   )
 }
