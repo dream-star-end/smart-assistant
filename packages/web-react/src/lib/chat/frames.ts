@@ -23,6 +23,7 @@ import type {
   InboundPermissionResponse,
   MediaRef,
   OutboundContentBlock,
+  OutboundActiveTurnReplayStart,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
@@ -78,6 +79,7 @@ export type OutboundErrorWire = OutboundError & WireRuntimeFields;
 export type OutboundPermissionRequestWire = OutboundPermissionRequest & WireRuntimeFields;
 export type OutboundPermissionSettledWire = OutboundPermissionSettled & WireRuntimeFields;
 export type OutboundResumeFailedWire = OutboundResumeFailed & WireRuntimeFields;
+export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
 export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 
 /** legacy bridge error 帧（`type:'error'`，protocol 未建模）。*/
@@ -199,6 +201,7 @@ export type OutboundWire =
   | OutboundPermissionRequestWire
   | OutboundPermissionSettledWire
   | OutboundResumeFailedWire
+  | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
   | LegacyBridgeErrorWire
   | CostChargedWire
@@ -225,6 +228,7 @@ export type InboundHelloWire = {
     agentId: string;
     inFlight: boolean;
     lastFrameSeq: number;
+    resumeActiveTurnCandidateMessageIds?: string[];
   }>;
 };
 

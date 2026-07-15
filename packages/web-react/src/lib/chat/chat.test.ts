@@ -1842,8 +1842,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const inbound = ws.sent.find((d) => d.includes('"inbound.message"'));
     expect(inbound).toBeTruthy();
     const s = sock.sessions.get("s1")!;
+    const user = s.messages.find((m) => m.role === "user")!;
+    expect(JSON.parse(inbound!).clientMessageId).toBe(user.id);
+    expect(s._activeClientMessageId).toBe(user.id);
     expect(s._sendingInFlight).toBe(true);
-    expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
+    expect(user.status).toBe("sent");
   });
 
   test("annotated image sends hidden source/mask to gateway but only shows the guide in the user bubble", () => {
@@ -1916,6 +1919,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const stored = sock.toStored("s1")!;
     expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
     expect(stored._sendingInFlight).toBe(true);
+    expect(stored._activeClientMessageId).toBe(stored.messages.find((m) => m.role === "user")?.id);
     expect(typeof stored._turnStartedAt).toBe("number");
   });
 
@@ -2072,6 +2076,224 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(helloRaw).toBeTruthy();
     const hello = JSON.parse(helloRaw!);
     expect(hello.peers[0]).toMatchObject({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 7 });
+    sock.stop();
+  });
+
+  test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [
+        { id: "srv-old", role: "assistant", text: "old", ts: now - 4 },
+        { id: "m-user-1", role: "user", text: "running", ts: now - 3, status: "sent" },
+        { id: "m-placeholder", role: "system", text: "", ts: now - 2, _genPlaceholder: {
+          jobId: "a".repeat(32), aspect: 1, status: "running", startedAt: now - 2,
+        } },
+        { id: "m-user-2", role: "user", text: "queued", ts: now - 1, status: "queued" },
+      ],
+      createdAt: now - 4,
+      lastAt: now - 1,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
+    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-1", "m-user-2"]);
+    sock.stop();
+  });
+
+  test("hello keeps the oldest lock-owner candidate when a queued user block exceeds 32 rows", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [
+        { id: "srv-old", role: "assistant", text: "old", ts: now - 100 },
+        ...Array.from({ length: 35 }, (_, i) => ({
+          id: `m-user-${i}`,
+          role: "user" as const,
+          text: `queued ${i}`,
+          ts: now - 35 + i,
+          status: i === 0 ? "sent" as const : "queued" as const,
+        })),
+      ],
+      createdAt: now - 100,
+      lastAt: now,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
+    const candidates = hello.peers[0].resumeActiveTurnCandidateMessageIds as string[];
+    expect(candidates).toHaveLength(32);
+    expect(candidates[0]).toBe("m-user-0");
+    expect(candidates.slice(1)).toEqual(Array.from({ length: 31 }, (_, i) => `m-user-${i + 4}`));
+    sock.stop();
+  });
+
+  test("shell miss → REST user row → verified active replay resets only then restores the full prefix", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const persistSession = vi.fn();
+    const sock = makeSocket({ syncSession, persistSession });
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const initialHello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
+    expect(initialHello.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.resume_failed",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      from: 0,
+      to: 42,
+      reason: "no_buffer",
+    }) });
+    expect(sock.sessions.get("s1")!._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+
+    const user = { id: "m-user-running", role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage;
+    sock.applyServerMessages("s1", "main", [user], true, 1);
+    const targeted = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.hello")
+      .at(-1);
+    expect(targeted.peers[0]).toMatchObject({
+      peerId: "s1",
+      inFlight: false,
+      lastFrameSeq: 42,
+      resumeActiveTurnCandidateMessageIds: ["m-user-running"],
+    });
+    const helloCount = ws.sent.filter((raw) => raw.includes('"inbound.hello"')).length;
+    sock.applyServerMessages("s1", "main", [user], true, 1);
+    expect(ws.sent.filter((raw) => raw.includes('"inbound.hello"'))).toHaveLength(helloCount);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: "m-user-running",
+    }) });
+    const active = sock.sessions.get("s1")!;
+    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+    expect(active._activeClientMessageId).toBe("m-user-running");
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 10,
+      ts: 10,
+      blocks: [{ kind: "text", text: "prefix restored" }],
+    })) });
+    expect(active.messages.some((m) => m.role === "assistant" && m.text === "prefix restored")).toBe(true);
+    expect(active.messages.find((m) => m.role === "assistant")?._clientMessageId).toBe("m-user-running");
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    sock.stop();
+  });
+
+  test("a real final triggers one exact sync; duplicate final frames cannot trigger a second", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "question" });
+    const s = sock.sessions.get("s1")!;
+    const clientMessageId = s.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: 1,
+      blocks: [{ kind: "text", text: "answer" }],
+    })) });
+    const final = JSON.stringify(msgFrame({ frameSeq: 2, ts: 2, blocks: [], isFinal: true }));
+    ws.onmessage?.({ data: final });
+    ws.onmessage?.({ data: final });
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId });
+    expect(s._activeClientMessageId).toBeUndefined();
+    expect(s.messages.find((m) => m.role === "assistant")?._clientMessageId).toBe(clientMessageId);
+    sock.stop();
+  });
+
+  test("an error terminal syncs once, while interrupted and cron terminals never sync", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "will fail" });
+    const failedId = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      code: "upstream_failed",
+      message: "upstream failed",
+      isFinal: false,
+      frameSeq: 1,
+      ts: 1,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2,
+      ts: 2,
+      blocks: [{ kind: "text", text: "[error] upstream failed" }],
+      isFinal: true,
+    })) });
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    expect(syncSession).toHaveBeenLastCalledWith("s1", { clientMessageId: failedId });
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "will be interrupted" });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 3,
+      ts: 3,
+      isFinal: true,
+      meta: { interrupted: "service_restart" },
+    })) });
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    expect(sock.sessions.get("s1")!._activeClientMessageId).toBeUndefined();
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 4,
+      ts: 4,
+      blocks: [{ kind: "text", text: "scheduled update" }],
+      isFinal: true,
+      cronJob: { label: "daily" },
+    })) });
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("reconcile final performs its existing sync exactly once with exact turn identity", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "question" });
+    const clientMessageId = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: 1,
+      blocks: [],
+      isFinal: true,
+      meta: { reconcile: "turn_completed" },
+    })) });
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId });
     sock.stop();
   });
 

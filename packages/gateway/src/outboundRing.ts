@@ -58,6 +58,13 @@ interface SessionRing {
   contentLossSeq: number
 }
 
+interface ActiveTurnMarker {
+  /** Persisted browser user-row id bound to the actual session-lock owner. */
+  clientMessageId: string
+  /** Last frame assigned before this turn acquired the lock. */
+  baseSeq: number
+}
+
 export type ReplayMissReason = 'no_buffer' | 'buffer_miss' | 'sequence_mismatch'
 
 /**
@@ -83,6 +90,10 @@ export type ReplayResult =
 export class OutboundRingBuffer {
   private rings = new Map<string, SessionRing>()
   private lastSeq = new Map<string, number>()
+  /** Separate from SessionRing so an active turn with no output allocates no
+   * empty frame namespace. The marker exists only between the lock-owner
+   * lifecycle callbacks and is cleared by end()/clear(). */
+  private activeTurns = new Map<string, ActiveTurnMarker>()
 
   constructor(private readonly config: RingConfig = DEFAULT_RING_CONFIG) {}
 
@@ -122,7 +133,7 @@ export class OutboundRingBuffer {
     const bytes = Buffer.byteLength(data, 'utf8')
     ring.frames.push({ seq, ts: now, data, bytes, cls })
     ring.totalBytes += bytes
-    return this.prune(ring, now)
+    return this.prune(sessionKey, ring, now)
   }
 
   /**
@@ -167,7 +178,74 @@ export class OutboundRingBuffer {
     const bytes = Buffer.byteLength(data, 'utf8')
     ring.frames.push({ seq, ts: now, data, bytes, cls })
     ring.totalBytes += bytes
-    return this.prune(ring, now)
+    return this.prune(sessionKey, ring, now)
+  }
+
+  /** Mark the turn that currently owns the per-session execution lock. */
+  beginActiveTurn(sessionKey: string, clientMessageId: string): void {
+    this.activeTurns.set(sessionKey, {
+      clientMessageId,
+      baseSeq: this.lastSeq.get(sessionKey) ?? 0,
+    })
+  }
+
+  /** End exactly the marked turn, then immediately restore ordinary age
+   * pruning now that the immutable terminal tape is authoritative. */
+  endActiveTurn(
+    sessionKey: string,
+    clientMessageId: string,
+    now: number = Date.now(),
+  ): EvictionStats {
+    const marker = this.activeTurns.get(sessionKey)
+    if (!marker || marker.clientMessageId !== clientMessageId) {
+      return { entries: 0, age: 0, bytes: 0 }
+    }
+    this.activeTurns.delete(sessionKey)
+    const ring = this.rings.get(sessionKey)
+    if (!ring) return { entries: 0, age: 0, bytes: 0 }
+    const evicted = this.prune(sessionKey, ring, now)
+    if (ring.frames.length === 0) this.rings.delete(sessionKey)
+    return evicted
+  }
+
+  /** Server-owned identity currently bound to the actual lock owner. */
+  activeTurnClientMessageId(sessionKey: string): string | undefined {
+    return this.activeTurns.get(sessionKey)?.clientMessageId
+  }
+
+  /** Replay the complete buffered slice of one exact active turn. Unlike
+   * peekReplay(), this is the only safe cold-cursor path: it never includes
+   * completed-turn frames before baseSeq, and any hard-cap content loss after
+   * baseSeq converts the whole attempt to a miss. */
+  peekActiveTurnReplay(
+    sessionKey: string,
+    clientMessageId: string,
+    now: number = Date.now(),
+  ): ReplayResult {
+    const currentLast = this.lastSeq.get(sessionKey) ?? 0
+    const marker = this.activeTurns.get(sessionKey)
+    const ring = this.rings.get(sessionKey)
+    const evicted: EvictionStats = ring
+      ? this.prune(sessionKey, ring, now)
+      : { entries: 0, age: 0, bytes: 0 }
+    if (!marker || marker.clientMessageId !== clientMessageId) {
+      return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
+    }
+    if (currentLast === marker.baseSeq) {
+      return { ok: true, sent: [], to: currentLast, evicted }
+    }
+    if (!ring) {
+      return { ok: false, sent: [], to: currentLast, reason: 'no_buffer', evicted }
+    }
+    if (ring.contentLossSeq > marker.baseSeq) {
+      return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss', evicted }
+    }
+    return {
+      ok: true,
+      sent: ring.frames.filter((frame) => frame.seq > marker.baseSeq),
+      to: currentLast,
+      evicted,
+    }
   }
 
   /**
@@ -189,7 +267,9 @@ export class OutboundRingBuffer {
   peekReplay(sessionKey: string, fromSeq: number, now: number = Date.now()): ReplayResult {
     const currentLast = this.lastSeq.get(sessionKey) ?? 0
     const ring = this.rings.get(sessionKey)
-    const evicted: EvictionStats = ring ? this.prune(ring, now) : { entries: 0, age: 0, bytes: 0 }
+    const evicted: EvictionStats = ring
+      ? this.prune(sessionKey, ring, now)
+      : { entries: 0, age: 0, bytes: 0 }
     if (fromSeq > currentLast) {
       // Client claims to have seen frames we don't know about. If we have
       // no ring for this sessionKey at all, assume the server restarted and
@@ -276,6 +356,7 @@ export class OutboundRingBuffer {
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
     this.lastSeq.delete(sessionKey)
+    this.activeTurns.delete(sessionKey)
   }
 
   /**
@@ -297,13 +378,16 @@ export class OutboundRingBuffer {
   pruneAll(now: number): EvictionStats {
     const total: EvictionStats = { entries: 0, age: 0, bytes: 0 }
     for (const [key, ring] of this.rings) {
-      const ev = this.prune(ring, now)
+      const ev = this.prune(key, ring, now)
       total.entries += ev.entries
       total.age += ev.age
       total.bytes += ev.bytes
-      if (ring.frames.length === 0) {
-        // Empty ring: drop the SessionRing struct so the rings Map doesn't
-        // grow without bound across container lifecycles. lastSeq survives.
+      if (ring.frames.length === 0 && !this.activeTurns.has(key)) {
+        // Empty inactive ring: drop the SessionRing struct so the rings Map
+        // doesn't grow without bound across container lifecycles. Keep an
+        // active empty ring because contentLossSeq distinguishes safe loss of
+        // progress-only frames from current-turn content lost to a hard cap.
+        // lastSeq survives either way.
         this.rings.delete(key)
       }
     }
@@ -319,32 +403,52 @@ export class OutboundRingBuffer {
    *
    *  帧分级淘汰:entries/bytes 压力下先淘最老的 progress 帧(mid-array splice,
    *  frames 保持 seq 有序;n≤maxEntries,线性扫描代价可忽略),无 progress 才淘
-   *  frames[0]。age 淘汰始终从头部走(ts 随 seq 单调,头部即最老)。任何 content
+   *  frames[0]。hard-cap 淘汰仍 progress-first；age 在 active turn 期间会跳过
+   *  当前轮 content 并扫描全数组，以便回收其后的过期 progress。任何 content
    *  帧被淘汰都推进 contentLossSeq 水位线。
    */
-  private prune(ring: SessionRing, now: number): EvictionStats {
+  private prune(sessionKey: string, ring: SessionRing, now: number): EvictionStats {
     const stats: EvictionStats = { entries: 0, age: 0, bytes: 0 }
     const cutoff = now - this.config.maxAgeMs
-    while (ring.frames.length > 0) {
-      let cause: keyof EvictionStats | null = null
-      if (ring.frames.length > this.config.maxEntries) cause = 'entries'
-      else if (ring.totalBytes > this.config.maxBytes) cause = 'bytes'
-      else if (ring.frames[0].ts < cutoff) cause = 'age'
-      if (!cause) break
-      let dropped: RingEntry | undefined
-      if (cause === 'age') {
-        dropped = ring.frames.shift()
-      } else {
-        const pi = ring.frames.findIndex((f) => f.cls === 'progress')
-        dropped = pi >= 0 ? ring.frames.splice(pi, 1)[0] : ring.frames.shift()
-      }
+    const dropAt = (index: number): RingEntry | undefined => {
+      const dropped = ring.frames.splice(index, 1)[0]
       if (dropped) {
         ring.totalBytes -= dropped.bytes
         if (dropped.cls === 'content' && dropped.seq > ring.contentLossSeq) {
           ring.contentLossSeq = dropped.seq
         }
       }
+      return dropped
+    }
+
+    // Hard bounds remain absolute even for an active turn. Preserve the
+    // existing progress-first policy, then drop oldest content only when no
+    // progress frame remains.
+    while (
+      ring.frames.length > this.config.maxEntries ||
+      ring.totalBytes > this.config.maxBytes
+    ) {
+      const cause: 'entries' | 'bytes' =
+        ring.frames.length > this.config.maxEntries ? 'entries' : 'bytes'
+      const progressIndex = ring.frames.findIndex((frame) => frame.cls === 'progress')
+      dropAt(progressIndex >= 0 ? progressIndex : 0)
       stats[cause]++
+    }
+
+    // Age is selective while a turn is active: protect only current-turn
+    // content. Scan the full array so an expired progress frame behind an
+    // older protected content frame is still reclaimed.
+    const active = this.activeTurns.get(sessionKey)
+    for (let i = 0; i < ring.frames.length;) {
+      const frame = ring.frames[i]!
+      const protectedCurrentContent =
+        active !== undefined && frame.cls === 'content' && frame.seq > active.baseSeq
+      if (frame.ts < cutoff && !protectedCurrentContent) {
+        dropAt(i)
+        stats.age++
+        continue
+      }
+      i++
     }
     return stats
   }

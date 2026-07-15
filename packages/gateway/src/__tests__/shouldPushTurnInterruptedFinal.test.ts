@@ -24,7 +24,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { _shouldPushTurnInterruptedFinal } from '../server.js'
+import {
+  ACTIVE_TURN_REPLAY_CANDIDATE_MAX,
+  _matchActiveTurnReplayCandidate,
+  _shouldPushTurnInterruptedFinal,
+} from '../server.js'
 
 // ── core matrix from the helper jsdoc decision table ──
 
@@ -97,4 +101,22 @@ test('negative counters → treated as 0 (defense against double-finally)', () =
   // rather than "turn alive" (which would silently suppress legitimate
   // reconcile pushes).
   assert.equal(_shouldPushTurnInterruptedFinal(true, -1, -1), true)
+})
+
+test('active-turn replay candidates authorize only an exact bounded server-owned id', () => {
+  assert.equal(
+    _matchActiveTurnReplayCandidate('m-user-1', ['m-queued-2', 'm-user-1']),
+    'm-user-1',
+  )
+  assert.equal(_matchActiveTurnReplayCandidate('m-user-1', ['m-user-2']), undefined)
+  assert.equal(_matchActiveTurnReplayCandidate(undefined, ['m-user-1']), undefined)
+  assert.equal(_matchActiveTurnReplayCandidate('bad id', ['bad id']), undefined)
+  assert.equal(
+    _matchActiveTurnReplayCandidate(
+      'm-user-1',
+      Array.from({ length: ACTIVE_TURN_REPLAY_CANDIDATE_MAX + 1 }, () => 'm-user-1'),
+    ),
+    undefined,
+    'oversized client hints degrade to ordinary cursor replay',
+  )
 })

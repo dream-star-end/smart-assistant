@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
+  isClientMessageId,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
@@ -10,6 +11,7 @@ export type LosslessTurnPayload = {
   sessionId: string;
   agentId: string;
   turnIndex: number;
+  clientMessageId?: string;
   status: "completed" | "interrupted" | "crashed";
   turnKey: string;
   continuationOfTurnKey?: string;
@@ -244,6 +246,10 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   const sessionId = requiredString(raw, "sessionId");
   const agentId = requiredString(raw, "agentId");
   const turnIndex = requiredInt(raw, "turnIndex");
+  const clientMessageId = optionalString(raw, "clientMessageId");
+  if (clientMessageId !== undefined && !isClientMessageId(clientMessageId)) {
+    throw new Error("turn tape payload.clientMessageId is invalid");
+  }
   const status = raw.status;
   const turnKey = requiredString(raw, "turnKey");
   if (sessionId.length < 8 || sessionId.length > 50) throw new Error("turn tape payload.sessionId is invalid");
@@ -316,6 +322,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       status !== "completed" ||
       requiredString(raw, "text") !== "" ||
       parentTurnKey !== undefined ||
+      clientMessageId !== undefined ||
       requestId !== undefined ||
       agentSessionId !== undefined ||
       usage !== undefined ||
@@ -340,6 +347,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     turnIndex,
     status,
     turnKey,
+    ...(clientMessageId !== undefined ? { clientMessageId } : {}),
     ...(continuationOfTurnKey !== undefined ? { continuationOfTurnKey } : {}),
     ...(parentTurnKey !== undefined ? { parentTurnKey } : {}),
     text: requiredString(raw, "text"),
@@ -598,6 +606,17 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
     }, event.ordinal));
   }
   if (records.length === 0) throw new Error("turn tape contains no persistable records");
+
+  // Exact origin attribution is part of each immutable message payload (not
+  // a database column). Recompute bytes/hash after stamping so tape hashes,
+  // hot history and archived history all expose the same evidence.
+  if (body.clientMessageId) {
+    for (const item of records) {
+      item.payload = { ...item.payload, _clientMessageId: body.clientMessageId };
+      item.payloadBytes = Buffer.from(JSON.stringify(item.payload), "utf8");
+      item.payloadSha256 = sha256(item.payloadBytes);
+    }
+  }
 
   const seen = new Set<string>();
   for (const item of records) {

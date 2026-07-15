@@ -560,6 +560,9 @@ export interface AgentSession {
   _currentTurnTraceId?: string
   /** Stable logical turn key used by lossless persistence and cost joins. */
   _currentTurnKey?: string
+  /** Browser user-row id bound to the submit that currently owns session.lock.
+   * Unlike _activeTurnCount, this never describes queued submits. */
+  _runningClientMessageId?: string
 }
 
 function takeDurableEventOrdinal(session: AgentSession): number {
@@ -657,6 +660,10 @@ function persistServerAuthoredTurn(args: {
    *  Ignored on the v3 sink path (master derives it from identity). */
   userId: string | undefined
   turnIndex: number
+  /** Exact browser user row that originated this webchat turn. Optional for
+   * cron/legacy/retry-queue compatibility; materialized server rows carry it
+   * as `_clientMessageId` for exact client reconciliation. */
+  clientMessageId?: string
   turnKey?: string
   continuationOfTurnKey?: string
   createdAt?: number
@@ -732,6 +739,7 @@ function persistServerAuthoredTurn(args: {
       sessionId: args.peerId,
       agentId: args.agentId,
       turnIndex: args.turnIndex,
+      ...(args.clientMessageId ? { clientMessageId: args.clientMessageId } : {}),
       ...(args.turnKey ? { turnKey: args.turnKey } : {}),
       ...(args.continuationOfTurnKey
         ? { continuationOfTurnKey: args.continuationOfTurnKey }
@@ -2059,6 +2067,15 @@ export class SessionManager {
        *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
        *  submit 不传 → 无用户可见提示。gateway-authored 决策,不进 engine event 流。 */
       emitContextRebuilt?: (info: { messageCount: number }) => void
+      /** Active-turn reconnect lifecycle for one validated webchat user row.
+       * Hooks are isolated from turn correctness: SessionManager logs and
+       * ignores hook failures and always releases session.lock. */
+      replayLifecycle?: {
+        clientMessageId: string
+        onStart: () => void
+        onBeforeRelease: (unhandledError: unknown | undefined) => void
+        onEnd: () => void
+      }
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -2120,6 +2137,8 @@ export class SessionManager {
     const prev = session.lock
     let release!: () => void
     let memoryTurnBarrier: KernelFileLock | undefined
+    let replayLifecycleStarted = false
+    let unhandledTurnError: unknown | undefined
     session.lock = new Promise<void>((r) => (release = r))
     // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
     // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
@@ -2133,6 +2152,15 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      if (opts?.replayLifecycle) {
+        replayLifecycleStarted = true
+        session._runningClientMessageId = opts.replayLifecycle.clientMessageId
+        try {
+          opts.replayLifecycle.onStart()
+        } catch (err) {
+          log.warn('active-turn replay start hook failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
       // V5 native Write/Edit bypasses MemoryDir's userspace CAS lock. Hold a
       // shared kernel barrier for the complete foreground turn so Auto-Dream's
       // exclusive batch/recovery can neither overwrite nor roll back a live
@@ -2377,6 +2405,7 @@ export class SessionManager {
             traceId,
             opts?.collabAgentPolicy,
             opts?.modelAuthority,
+            opts?.replayLifecycle?.clientMessageId,
           ),
           livenessPromise,
         ])
@@ -2415,6 +2444,7 @@ export class SessionManager {
           err,
         )
       } else {
+        unhandledTurnError = err
         throw err
       }
     } finally {
@@ -2426,9 +2456,35 @@ export class SessionManager {
       // (`_shouldPushTurnInterruptedFinal`)也把负数当 0,生产侧顺势对齐,
       // 让真值源不依赖外部不变量。release() 之前归零,保证下一个 await prev
       // 的 submit 看到的是干净状态。
-      session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
-      session._currentTurnKey = undefined
-      release()
+      try {
+        if (replayLifecycleStarted) {
+          try {
+            opts?.replayLifecycle?.onBeforeRelease(unhandledTurnError)
+          } catch (err) {
+            log.warn('active-turn replay before-release hook failed', { sessionKey: session.sessionKey }, err)
+          }
+        }
+      } finally {
+        try {
+          if (replayLifecycleStarted) {
+            try {
+              opts?.replayLifecycle?.onEnd()
+            } catch (err) {
+              log.warn('active-turn replay end hook failed', { sessionKey: session.sessionKey }, err)
+            }
+          }
+        } finally {
+          if (
+            opts?.replayLifecycle &&
+            session._runningClientMessageId === opts.replayLifecycle.clientMessageId
+          ) {
+            session._runningClientMessageId = undefined
+          }
+          session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
+          session._currentTurnKey = undefined
+          release()
+        }
+      }
     }
   }
 
@@ -2449,6 +2505,8 @@ export class SessionManager {
      *  续跑认 lease(TTL = 最大 turn 窗口 + grace);安全撤销由 egress 每请求 epoch
      *  fence 兜住,不靠票据过期。 */
     modelAuthority?: TurnModelAuthority,
+    /** Validated browser user-row id for exact durable attribution. */
+    clientMessageId?: string,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -2551,6 +2609,7 @@ export class SessionManager {
           thinkingMessageId,
           toolMessageIdFactory,
           turnKey,
+          clientMessageId,
           modelAuthority,
           retryRuntimeEvents,
           retryAssistantSegments,
@@ -2674,6 +2733,8 @@ export class SessionManager {
     toolMessageIdFactory?: (blockId: string) => string,
     /** Stable logical key shared by tape persistence and proxy billing. */
     turnKey?: string,
+    /** Validated browser user-row id carried into every terminal tape path. */
+    clientMessageId?: string,
     /** 模型权威批次 §4:本 turn 的上游凭据(见 runOneTurnWithRetry 注释)。 */
     modelAuthority?: TurnModelAuthority,
     /** Exact events from earlier attempts of this same logical turn. */
@@ -3006,6 +3067,7 @@ export class SessionManager {
                 agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
+                ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
                 text: partialAssistant.text,
                 ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
@@ -3412,6 +3474,7 @@ export class SessionManager {
                 agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
+                ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
                 text: assistantText,
                 ...(completedHasThinking ? { thinkingText } : {}),

@@ -190,7 +190,7 @@ export function useChatSocket(opts: {
       // resume_failed / 重连 reconcile：REST 全量 sync 作最终权威源（server-wins **合并**,
       // 不是整段替换——替换会抹掉 server 端根本没有的 client-owned 内容:乐观尾/用户行/
       // 团队卡,走与 loadHistory 同一条 applyServerMessages 收口,含 normalizeDelegateCards）。
-      syncSession: async (sessId) => {
+      syncSession: async (sessId, context) => {
         const a = authRef.current;
         if (!a) return;
         const socket = socketRef.current;
@@ -205,6 +205,7 @@ export function useChatSocket(opts: {
             socket?.applyServerMessages(sessId, detail.agentId || sess.agentId, serverMsgs, true, detail.maxSeq, {
               archivedThroughSeq: detail.archivedThroughSeq,
               archivedCount: detail.archivedCount,
+              completedClientMessageId: context?.clientMessageId,
             });
           }
           sess._liveStreamBroken = false;

@@ -59,8 +59,14 @@ const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
 
 /** reducer 上交给 ChatSocket 的跨切面副作用。全部可选——纯模型测试可不传。*/
 export type FrameEffects = {
-  /** isFinal 到达（turn 收尾后）：socket 清 thinking-safety / 推进 drain / promote status。*/
-  onFinal?: (sess: ChatSession, frame: OutboundMessageWire, isCronOrHeartbeat: boolean) => void;
+  /** isFinal 到达（turn 收尾后）：socket 清 thinking-safety / 推进 drain / promote status。
+   * `clientMessageId` 在 reducer 清 active turn 前捕获，异步 REST 对账必须按它精确合并。*/
+  onFinal?: (
+    sess: ChatSession,
+    frame: OutboundMessageWire,
+    isCronOrHeartbeat: boolean,
+    clientMessageId?: string,
+  ) => void;
   /** service_restart 中断 final:调度自动续写(socket 决定是否真续,见其守卫)。 */
   scheduleRestartContinue?: (sessId: string) => void;
   /** 非 final 且 in-flight：socket 重置 thinking-safety（证明后端活着）。*/
@@ -72,7 +78,7 @@ export type FrameEffects = {
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportTurnError?: (p: { code: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
-  forceSync?: (sessId: string) => void;
+  forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
    * 立即把会话快照落 IndexedDB（断点续传游标 durable）。resume_failed 推进游标后必须
    * 同步落地：否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环。
@@ -902,12 +908,14 @@ export function applyOutboundMessage(
       (!!sess._streamingAssistant && (sess._streamingAssistant.text ?? "").trim().length > 0) ||
       !!sess._streamingThinking;
     if (!(hasLiveStream && !hasQueuedUser)) {
+      const clientMessageId = sess._activeClientMessageId;
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
       sess._sendingInFlight = false;
+      sess._activeClientMessageId = undefined;
       clearTurnTiming(sess);
       resetReplyTracker(sess);
-      effects.onFinal?.(sess, frame, true);
+      effects.onFinal?.(sess, frame, true, clientMessageId);
       return;
     }
   }
@@ -916,15 +924,18 @@ export function applyOutboundMessage(
   //    发送态(missed 真 final)。清发送态收口本轮 UI,但**不走空轮分类**(空 blocks 不合成空气泡——
   //    内容其实已在服务端生成),并强制 REST 全量对账拉回客户端丢失的内容(参考 applyResumeFailed)。──
   if (frame.isFinal && frame.meta?.reconcile === "turn_completed") {
+    const clientMessageId = sess._activeClientMessageId;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
     resetReplyTracker(sess);
     // 该轮已在服务端正常收尾（含 imageEdit 结果图）：消解运行中占位，结果随 forceSync 回带。
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
-    effects.onFinal?.(sess, frame, false);
-    effects.forceSync?.(sess.id);
+    effects.onFinal?.(sess, frame, false, clientMessageId);
+    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
+    else effects.forceSync?.(sess.id);
     return;
   }
 
@@ -944,7 +955,16 @@ export function applyOutboundMessage(
   // _sendingInFlight 永不清 → 本轮永久卡「回复中」。统一到 server 域后消除这一整类跨钟域误吞
   // (frame.ts 与 _trackerResetServerTs 同为 server 钟;仅在从未见过 server ts 的首轮回退客户端钟,
   //  此时无「上一轮遗留 late final」风险)。
-  if (typeof frame.ts === "number" && staleVsTrackerReset(frame.ts)) {
+  // The compatibility terminator immediately following an accepted
+  // outbound.error is authorized by its exact adjacent frameSeq. Both
+  // gateway deliver() calls can share one millisecond timestamp, and the
+  // error handler intentionally resets the tracker before this final arrives;
+  // do not let that reset suppress the terminal lifecycle/sync callback.
+  if (
+    typeof frame.ts === "number" &&
+    staleVsTrackerReset(frame.ts) &&
+    !suppressLegacyErrorText
+  ) {
     return; // final:不误 teardown;非 final:不恢复 in-flight
   }
   // 本地 stop/timeout/switch/error 后，禁止旧 turn 非 final 复活发送态；cron/proactive 推送
@@ -1445,14 +1465,16 @@ export function applyOutboundMessage(
     }
     sess._pendingCostCredits = "0";
     // 清流式指针 + in-flight。
+    const clientMessageId = sess._activeClientMessageId;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
     // 生成占位卡（需求 C）消解：本 turn 收尾 → imageEdit 结果图已作为 assistant 消息原位落地，
     // 删占位行。直投终帧回带顶层 imageEditJobId 时精确匹配；缺省按串行语义消解运行中占位（见函数注释）。
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
-    effects.onFinal?.(sess, frame, isCronOrHeartbeat);
+    effects.onFinal?.(sess, frame, isCronOrHeartbeat, clientMessageId);
     // 服务重启掐断上游生成流的合成 final:有截断内容则自动续写(守卫在 socket 侧)。
     if (frame.meta?.interrupted === "service_restart") effects.scheduleRestartContinue?.(sess.id);
   }
@@ -1526,6 +1548,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   });
   // legacy error 无后续 final，前端自己收尾本轮 UI。
   sess._sendingInFlight = false;
+  sess._activeClientMessageId = undefined;
   clearTurnTiming(sess);
   resetReplyTracker(sess);
   sess._localTeardownAt = sess._trackerResetAt;

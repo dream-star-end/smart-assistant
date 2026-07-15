@@ -116,6 +116,9 @@ export interface V3MasterSinkWirePayload {
   agentId?: string
   sessionId: string
   turnIndex: number
+  /** Browser-authored persisted user-row id for this webchat turn. Optional
+   * for legacy retry-queue entries and non-webchat producers. */
+  clientMessageId?: string
   status: 'completed' | 'interrupted' | 'crashed'
   /** Stable logical turn identity used by lossless persistence and exact billing. */
   turnKey?: string
