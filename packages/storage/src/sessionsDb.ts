@@ -1037,9 +1037,16 @@ export function projectClientSessionMessagesForChat(messages: readonly MessageLi
     const event = raw as Record<string, unknown>
     if (event.type !== 'system' || event.subtype !== 'bash_output_tail') continue
     const toolUseId = event.tool_use_id
-    if (typeof toolUseId !== 'string' || toolUseId.length === 0) continue
-    const parentToolUseId = typeof event.parent_tool_use_id === 'string' && event.parent_tool_use_id.length > 0
-      ? event.parent_tool_use_id
+    if (typeof toolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(toolUseId)) continue
+    const rawParentToolUseId = event.parent_tool_use_id
+    if (
+      rawParentToolUseId !== undefined &&
+      rawParentToolUseId !== null &&
+      rawParentToolUseId !== '' &&
+      (typeof rawParentToolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawParentToolUseId))
+    ) continue
+    const parentToolUseId = typeof rawParentToolUseId === 'string' && rawParentToolUseId.length > 0
+      ? rawParentToolUseId
       : undefined
     const totalBytes = typeof event.total_bytes === 'number' && Number.isFinite(event.total_bytes)
       ? Math.max(0, event.total_bytes)

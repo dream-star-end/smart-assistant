@@ -810,7 +810,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       type: "system",
       subtype: "bash_output_tail",
       tool_use_id: "tool-bg",
-      tail: "后台命令迟到的完整 stdout\n第二行😀",
+      tail: "后台命令迟到的完整 stdout\u0000\n第二行😀\\u0000\ud800",
       total_bytes: 45,
       truncated_head: false,
       future_exact_field: { nested: ["逐字", "保留"] },
@@ -861,19 +861,37 @@ describe("pgSessionsBackend lossless turn tape", () => {
       continuationOfTurnKey: originalTurnKey,
       text: "",
       createdAt: 1_783_944_000_100,
-      runtimeEvents: [{
-        ordinal: 99,
-        observedAt: 1_783_944_000_100,
-        source: "ccb",
-        payload: rawTail,
-      }],
+      runtimeEvents: [
+        {
+          ordinal: 99,
+          observedAt: 1_783_944_000_100,
+          source: "ccb",
+          payload: rawTail,
+        },
+        {
+          ordinal: 100,
+          observedAt: 1_783_944_000_101,
+          source: "codex-jsonrpc",
+          payload: {
+            method: "item/completed",
+            params: {
+              type: "system",
+              subtype: "bash_output_tail",
+              tool_use_id: "tool-bg",
+              tail: "nested marker must not win",
+              total_bytes: 999_999,
+            },
+            unicodeNoise: "nul=\u0000 surrogate=\ud800 literal=\\u0000",
+          },
+        },
+      ],
     });
     for (const part of continuation.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
     assert.deepEqual(
       await backend.finalizeLosslessTurnTape(userId, continuation.finalize),
-      { applied: "finalized", recordCount: 1, engineBillings: [] },
+      { applied: "finalized", recordCount: 2, engineBillings: [] },
     );
 
     const hydrated = await backend.getClientSession(sessionId, userId);
