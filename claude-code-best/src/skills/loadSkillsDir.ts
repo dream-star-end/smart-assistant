@@ -638,11 +638,17 @@ async function loadSkillsFromCommandsDir(
 export const getSkillDirCommands = memoize(
   async (cwd: string): Promise<Command[]> => {
     const userSkillsDir = join(getClaudeConfigHomeDir(), 'skills')
+    const openClaudeUserSkillsDirRaw =
+      process.env.OPENCLAUDE_USER_SKILLS_DIR?.trim() ?? ''
+    const openClaudeUserSkillsDir =
+      openClaudeUserSkillsDirRaw && isAbsolute(openClaudeUserSkillsDirRaw)
+        ? openClaudeUserSkillsDirRaw
+        : null
     const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
     const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
 
     logForDebugging(
-      `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, project=[${projectSkillsDirs.join(', ')}]`,
+      `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, openclaude-user=${openClaudeUserSkillsDir ?? 'disabled'}, project=[${projectSkillsDirs.join(', ')}]`,
     )
 
     // Load from additional directories (--add-dir)
@@ -679,6 +685,7 @@ export const getSkillDirCommands = memoize(
     const [
       managedSkills,
       userSkills,
+      openClaudeUserSkills,
       projectSkillsNested,
       additionalSkillsNested,
       legacyCommands,
@@ -688,6 +695,11 @@ export const getSkillDirCommands = memoize(
         : loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
       isSettingSourceEnabled('userSettings') && !skillsLocked
         ? loadSkillsFromSkillsDir(userSkillsDir, 'userSettings')
+        : Promise.resolve([]),
+      isSettingSourceEnabled('userSettings') &&
+      !skillsLocked &&
+      openClaudeUserSkillsDir
+        ? loadSkillsFromSkillsDir(openClaudeUserSkillsDir, 'userSettings')
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
@@ -717,6 +729,7 @@ export const getSkillDirCommands = memoize(
     const allSkillsWithPaths = [
       ...managedSkills,
       ...userSkills,
+      ...openClaudeUserSkills,
       ...projectSkillsNested.flat(),
       ...additionalSkillsNested.flat(),
       ...legacyCommands,
@@ -796,7 +809,7 @@ export const getSkillDirCommands = memoize(
     }
 
     logForDebugging(
-      `Loaded ${deduplicatedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length})`,
+      `Loaded ${deduplicatedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, openclaude-user: ${openClaudeUserSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length})`,
     )
 
     return unconditionalSkills

@@ -13,7 +13,11 @@ import { mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import type { ToolCalledEvent } from '@openclaude/protocol'
+import {
+  classifyToolFailureError,
+  type ToolCalledEvent,
+  type ToolFailureErrorClass,
+} from '@openclaude/protocol'
 
 import { eventBus, type GatewayEventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
@@ -22,7 +26,6 @@ const log = createLogger({ module: 'v3ToolFailureReporter' })
 
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
 
-const MAX_PREVIEW_CHARS = 4_096
 const MAX_FIELD_CHARS = 512
 const ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 const DRAIN_INTERVAL_MS = 30_000
@@ -54,7 +57,8 @@ export interface ToolFailureReportConfig {
   containerToken: string
 }
 
-export interface ToolFailureReportPayload {
+/** Legacy on-disk queue / rolling-upgrade payload. New reports never create v1. */
+export interface ToolFailureReportPayloadV1 {
   schemaVersion: 1
   eventId: string
   sessionKey: string
@@ -66,6 +70,22 @@ export interface ToolFailureReportPayload {
   outputPreview?: string
   timestamp: number
 }
+
+export interface ToolFailureReportPayloadV2 {
+  schemaVersion: 2
+  eventId: string
+  sessionKey: string
+  agentId: string
+  turnIndex: number
+  toolName: string
+  durationMs: number
+  inputHash?: string
+  outputHash?: string
+  errorClass: ToolFailureErrorClass
+  timestamp: number
+}
+
+export type ToolFailureReportPayload = ToolFailureReportPayloadV1 | ToolFailureReportPayloadV2
 
 interface ToolFailureQueueEntry {
   schemaVersion: 1
@@ -114,14 +134,6 @@ function cap(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 12))}…[truncated]`
 }
 
-function scrubPreview(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined
-  return cap(value, MAX_PREVIEW_CHARS)
-    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-    .replace(/oc-v3\.\d+\.[0-9a-f]{32,128}/gi, '[redacted-container-token]')
-    .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-[redacted]')
-}
-
 function safeString(value: unknown, fallback: string, max = MAX_FIELD_CHARS): string {
   return typeof value === 'string' && value.trim().length > 0
     ? cap(value.trim(), max)
@@ -133,18 +145,23 @@ function retryBackoffMs(attempts: number): number {
   return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** Math.min(attempts - 1, 20), RETRY_BACKOFF_MAX_MS)
 }
 
-export function buildToolFailureReportPayload(ev: ToolCalledEvent): ToolFailureReportPayload | null {
+function sha256Preview(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : createHash('sha256').update(value).digest('hex')
+}
+
+export function buildToolFailureReportPayload(ev: ToolCalledEvent): ToolFailureReportPayloadV2 | null {
   if (!ev.isError) return null
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: safeString(ev.id, createHash('sha256').update(JSON.stringify(ev)).digest('hex'), 128),
     sessionKey: safeString(ev.sessionKey, 'unknown', 512),
     agentId: safeString(ev.agentId, 'unknown', 128),
     turnIndex: Number.isFinite(ev.turnIndex) ? Math.max(0, Math.trunc(ev.turnIndex)) : 0,
     toolName: safeString(ev.toolName, 'unknown', 128),
     durationMs: Number.isFinite(ev.durationMs) ? Math.max(0, Math.trunc(ev.durationMs)) : 0,
-    inputPreview: scrubPreview(ev.inputPreview),
-    outputPreview: scrubPreview(ev.outputPreview),
+    inputHash: sha256Preview(ev.inputPreview),
+    outputHash: sha256Preview(ev.outputPreview),
+    errorClass: classifyToolFailureError(ev.outputPreview),
     timestamp: Number.isFinite(ev.timestamp) ? Math.max(0, Math.trunc(ev.timestamp)) : Date.now(),
   }
 }

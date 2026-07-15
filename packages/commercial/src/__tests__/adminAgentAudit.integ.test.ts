@@ -537,7 +537,7 @@ describe("GET /api/admin/agent-audit (integ)", () => {
     assert.equal(rows[0].success, true);
   });
 
-  test("Acceptance 2: 错误命令 → success=false + error_msg", async (t) => {
+  test("Acceptance 2: 错误命令 → 仅返回安全分类，不暴露历史原始预览", async (t) => {
     if (skipIfNoHttp(t)) return;
     const admin = await createUser("admin-acc2@x.com", "admin");
     const u = await createUser("u-bad@x.com", "user");
@@ -546,7 +546,7 @@ describe("GET /api/admin/agent-audit (integ)", () => {
       user_id: u.toString(),
       session_id: "sess-bad-1",
       tool: "bash",
-      input_meta: { cmd: "notacmd" },
+      input_meta: { cmd: "notacmd", input_preview: "email=user@example.com" },
       input_hash: null,
       output_hash: null,
       duration_ms: 5,
@@ -562,6 +562,9 @@ describe("GET /api/admin/agent-audit (integ)", () => {
     const rows = r.json.rows as Array<Record<string, unknown>>;
     assert.equal(rows.length, 1);
     assert.equal(rows[0].success, false);
-    assert.equal(rows[0].error_msg, "command not found");
+    assert.equal(rows[0].error_msg, null);
+    const meta = rows[0].input_meta as Record<string, unknown>;
+    assert.equal(meta.error_class, "command_not_found");
+    assert.equal("input_preview" in meta, false);
   });
 });

@@ -136,6 +136,8 @@ describe("auditActions — 注册表", () => {
   });
 
   test("isAdminAuditAction:注册的 true,野字符串/原型链 false", () => {
+    assert.ok(isAdminAuditAction("user.create"));
+    assert.ok(isAdminAuditAction("account.migrate_to_pool"));
     assert.ok(isAdminAuditAction("user.patch"));
     assert.ok(isAdminAuditAction("user.credits.adjust"));
     assert.ok(!isAdminAuditAction("credits.adjust"));
@@ -154,7 +156,7 @@ describe("auditActions — 注册表", () => {
   });
 
   test("资金/权限/封禁类必须 mode='tx'(政策不变量)", () => {
-    for (const a of ["user.credits.adjust", "org.credits.adjust", "user.patch", "pricing.patch", "plan.patch", "model_grant.add"] as const) {
+    for (const a of ["user.create", "user.credits.adjust", "org.credits.adjust", "user.patch", "pricing.patch", "plan.patch", "model_grant.add"] as const) {
       assert.equal(ADMIN_AUDIT_ACTIONS[a].mode, "tx", `${a} 必须 fail-closed`);
     }
   });

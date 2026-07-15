@@ -17,6 +17,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { classifyToolFailureError, isToolFailureErrorClass } from "@openclaude/protocol";
 import { HttpError, sendJson } from "./util.js";
 import { requireAdmin } from "../admin/requireAdmin.js";
 import {
@@ -38,17 +39,28 @@ function parseLimit(raw: string | null): number | undefined {
 }
 
 function serializeRow(r: AgentAuditRowView): Record<string, unknown> {
+  const sourceMeta = r.input_meta && typeof r.input_meta === "object" && !Array.isArray(r.input_meta)
+    ? r.input_meta as Record<string, unknown>
+    : {};
+  const safeMeta = Object.fromEntries(
+    Object.entries(sourceMeta).filter(([key]) => key !== "input_preview"),
+  );
+  if (!isToolFailureErrorClass(safeMeta.error_class)) {
+    safeMeta.error_class = classifyToolFailureError(r.error_msg ?? undefined);
+  }
   return {
     id: r.id,
     user_id: r.user_id,
     session_id: r.session_id,
     tool: r.tool,
-    input_meta: r.input_meta,
+    input_meta: safeMeta,
     input_hash: r.input_hash,
     output_hash: r.output_hash,
     duration_ms: r.duration_ms,
     success: r.success,
-    error_msg: r.error_msg,
+    // Historical rows may still contain raw output previews until 0149 is applied.
+    // Never expose them through the admin API; error_class above is the diagnostic surface.
+    error_msg: null,
     created_at: r.created_at.toISOString(),
   };
 }
@@ -68,7 +80,7 @@ export async function handleAdminAgentAudit(
   const beforeRaw = sp.get("before");
   const limit = parseLimit(sp.get("limit"));
 
-  let result;
+  let result: Awaited<ReturnType<typeof listAgentAudit>>;
   try {
     result = await listAgentAudit({
       userId: userIdRaw === null || userIdRaw === "" ? undefined : userIdRaw,

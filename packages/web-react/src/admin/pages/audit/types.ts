@@ -2,8 +2,8 @@
 // 第一层（管理操作 admin_audit）行结构仍在 AdminAuditTab.tsx；此处只承载整改批新增的三面。
 
 // ─── 安全事件（GET /api/admin/security-events） ─────────────────────
-/** 目前唯一类型：route_bypass（管理员在被拦路由上的放行记录，detail={path}）。 */
-export type SecurityEventType = "route_bypass";
+/** 已知类型：管理员绕过与普通用户被防火墙阻断。 */
+export type SecurityEventType = "route_bypass" | "route_blocked";
 
 export interface SecurityEventRow {
   id: string;
@@ -24,6 +24,7 @@ export interface SecurityEventsResp {
 /** 已知事件类型 → 中文标签；未知类型回落原样显示。 */
 export const SECURITY_EVENT_TYPE_LABELS: Record<string, string> = {
   route_bypass: "路由放行",
+  route_blocked: "路由拦截",
 };
 
 // ─── 主机审计（GET /api/admin/host-audit） ──────────────────────────

@@ -177,7 +177,7 @@ export async function ackFeedback(id: string, ctx: AckFeedbackCtx): Promise<Feed
     await writeAdminAudit(client, {
       adminId: ctx.adminId,
       action: "feedback.ack",
-      target: id,
+      target: `feedback:${id}`,
       before: { status: row.status },
       after: { status: "acked" },
       ip: ctx.ip,

@@ -7,6 +7,11 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import {
+  classifyToolFailureError,
+  isToolFailureErrorClass,
+  type ToolFailureErrorClass,
+} from '@openclaude/protocol'
 
 import { rootLogger, type Logger } from '../logging/logger.js'
 import {
@@ -31,20 +36,31 @@ export function isToolFailureAuditEnabled(env: NodeJS.ProcessEnv = process.env):
 }
 
 const MAX_BODY_BYTES = 32 * 1024
-const MAX_ERROR_MSG_CHARS = 2_000
 
-export interface ToolFailureAuditBody {
-  schemaVersion: 1
+interface ToolFailureAuditBase {
   eventId: string
   sessionKey: string
   agentId: string
   turnIndex: number
   toolName: string
   durationMs: number
-  inputPreview?: string
-  outputPreview?: string
   timestamp: number
 }
+
+export interface ToolFailureAuditBodyV1 extends ToolFailureAuditBase {
+  schemaVersion: 1
+  inputPreview?: string
+  outputPreview?: string
+}
+
+export interface ToolFailureAuditBodyV2 extends ToolFailureAuditBase {
+  schemaVersion: 2
+  inputHash?: string
+  outputHash?: string
+  errorClass: ToolFailureErrorClass
+}
+
+export type ToolFailureAuditBody = ToolFailureAuditBodyV1 | ToolFailureAuditBodyV2
 
 export interface ToolFailureAuditCtx {
   hostUuid: string
@@ -102,11 +118,6 @@ function sha256OrNull(value: string | undefined): string | null {
   return value === undefined ? null : createHash('sha256').update(value).digest('hex')
 }
 
-function cap(value: string | undefined, max: number): string | null {
-  if (value === undefined) return null
-  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 12))}…[truncated]`
-}
-
 function requiredString(obj: Record<string, unknown>, key: string, max: number): string | null {
   const v = obj[key]
   return typeof v === 'string' && v.length > 0 && v.length <= max ? v : null
@@ -123,10 +134,18 @@ function requiredInt(obj: Record<string, unknown>, key: string, min: number, max
   return Number.isInteger(v) && (v as number) >= min && (v as number) <= max ? v as number : null
 }
 
+const SHA256_RE = /^[0-9a-f]{64}$/
+
+function optionalSha256(obj: Record<string, unknown>, key: string): string | undefined | null {
+  const value = obj[key]
+  if (value === undefined) return undefined
+  return typeof value === 'string' && SHA256_RE.test(value) ? value : null
+}
+
 function validateBody(raw: unknown): ToolFailureAuditBody | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const obj = raw as Record<string, unknown>
-  const allowed = new Set([
+  const commonAllowed = [
     'schemaVersion',
     'eventId',
     'sessionKey',
@@ -134,12 +153,17 @@ function validateBody(raw: unknown): ToolFailureAuditBody | null {
     'turnIndex',
     'toolName',
     'durationMs',
-    'inputPreview',
-    'outputPreview',
     'timestamp',
-  ])
+  ]
+  const allowed = new Set(
+    obj.schemaVersion === 1
+      ? [...commonAllowed, 'inputPreview', 'outputPreview']
+      : obj.schemaVersion === 2
+        ? [...commonAllowed, 'inputHash', 'outputHash', 'errorClass']
+        : commonAllowed,
+  )
   if (Object.keys(obj).some((k) => !allowed.has(k))) return null
-  if (obj.schemaVersion !== 1) return null
+  if (obj.schemaVersion !== 1 && obj.schemaVersion !== 2) return null
   const eventId = requiredString(obj, 'eventId', 128)
   const sessionKey = requiredString(obj, 'sessionKey', 512)
   const agentId = requiredString(obj, 'agentId', 128)
@@ -147,24 +171,45 @@ function validateBody(raw: unknown): ToolFailureAuditBody | null {
   const turnIndex = requiredInt(obj, 'turnIndex', 0, 1_000_000)
   const durationMs = requiredInt(obj, 'durationMs', 0, 24 * 60 * 60 * 1000)
   const timestamp = requiredInt(obj, 'timestamp', 0, Number.MAX_SAFE_INTEGER)
-  const inputPreview = optionalString(obj, 'inputPreview', 4_096)
-  const outputPreview = optionalString(obj, 'outputPreview', 4_096)
   if (
     !eventId || !sessionKey || !agentId || !toolName ||
-    turnIndex === null || durationMs === null || timestamp === null ||
-    inputPreview === null || outputPreview === null
+    turnIndex === null || durationMs === null || timestamp === null
   ) return null
-  return {
-    schemaVersion: 1,
+
+  const base = {
     eventId,
     sessionKey,
     agentId,
     turnIndex,
     toolName,
     durationMs,
-    ...(inputPreview !== undefined ? { inputPreview } : {}),
-    ...(outputPreview !== undefined ? { outputPreview } : {}),
     timestamp,
+  }
+  if (obj.schemaVersion === 1) {
+    const inputPreview = optionalString(obj, 'inputPreview', 4_096)
+    const outputPreview = optionalString(obj, 'outputPreview', 4_096)
+    if (inputPreview === null || outputPreview === null) return null
+    return {
+      schemaVersion: 1,
+      ...base,
+      ...(inputPreview !== undefined ? { inputPreview } : {}),
+      ...(outputPreview !== undefined ? { outputPreview } : {}),
+    }
+  }
+
+  const inputHash = optionalSha256(obj, 'inputHash')
+  const outputHash = optionalSha256(obj, 'outputHash')
+  const errorClass = obj.errorClass
+  if (
+    inputHash === null || outputHash === null ||
+    !isToolFailureErrorClass(errorClass)
+  ) return null
+  return {
+    schemaVersion: 2,
+    ...base,
+    ...(inputHash !== undefined ? { inputHash } : {}),
+    ...(outputHash !== undefined ? { outputHash } : {}),
+    errorClass,
   }
 }
 
@@ -179,13 +224,22 @@ export async function insertToolFailureAudit(
   )
   if ((existing.rowCount ?? existing.rows.length) > 0) return { duplicate: true }
 
+  const inputHash = body.schemaVersion === 2
+    ? body.inputHash ?? null
+    : sha256OrNull(body.inputPreview)
+  const outputHash = body.schemaVersion === 2
+    ? body.outputHash ?? null
+    : sha256OrNull(body.outputPreview)
+  const errorClass = body.schemaVersion === 2
+    ? body.errorClass
+    : classifyToolFailureError(body.outputPreview)
   const inputMeta = {
     schema_version: body.schemaVersion,
     event_id: body.eventId,
     agent_id: body.agentId,
     turn_index: body.turnIndex,
     timestamp: body.timestamp,
-    input_preview: body.inputPreview ?? null,
+    error_class: errorClass,
   }
   await runner.query(
     `INSERT INTO agent_audit(
@@ -197,10 +251,10 @@ export async function insertToolFailureAudit(
       body.sessionKey,
       body.toolName,
       JSON.stringify(inputMeta),
-      sha256OrNull(body.inputPreview),
-      sha256OrNull(body.outputPreview),
+      inputHash,
+      outputHash,
       body.durationMs,
-      cap(body.outputPreview, MAX_ERROR_MSG_CHARS),
+      null,
     ],
   )
   return { duplicate: false }

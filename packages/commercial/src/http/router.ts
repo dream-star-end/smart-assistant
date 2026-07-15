@@ -1721,6 +1721,15 @@ export function createCommercialHandler(
         }
         // 普通付费用户:直接 403
         blockLog.warn('blocked_for_user', { sub: claims.sub })
+        // 只持久化已解析 pathname + 静态 rule label；绝不把 query/token/body 带入审计。
+        void writeSecurityEvent({
+          type: 'route_blocked',
+          actorUserId: claims.sub,
+          target: `${method} ${blockedRule.label}`,
+          detail: { path },
+          ip: clientIpOf(req),
+          userAgent: userAgentOf(req),
+        })
         sendError(
           res,
           403,

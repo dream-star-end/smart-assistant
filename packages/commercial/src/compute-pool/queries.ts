@@ -1368,18 +1368,23 @@ export async function setLoadedImage(
   imageId: string,
   imageTag: string,
   audit: { actor: string; operationId: string; source: string },
-): Promise<void> {
+): Promise<boolean> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
-    await client.query(
+    const updated = await client.query(
       `UPDATE compute_hosts
           SET loaded_image_id = $2,
               loaded_image_at = NOW(),
               updated_at = NOW()
-        WHERE id = $1`,
+        WHERE id = $1
+          AND loaded_image_id IS DISTINCT FROM $2`,
       [id, imageId],
     );
+    if ((updated.rowCount ?? 0) === 0) {
+      await client.query("COMMIT");
+      return false;
+    }
     await writeAuditInTx(client, {
       hostId: id,
       operation: "image.loaded",
@@ -1393,6 +1398,7 @@ export async function setLoadedImage(
       actor: audit.actor,
     });
     await client.query("COMMIT");
+    return true;
   } catch (e) {
     try {
       await client.query("ROLLBACK");
@@ -1403,29 +1409,82 @@ export async function setLoadedImage(
   }
 }
 
-/** admin 删除 — 仅 draining 且 active container = 0 */
-export async function deleteHost(id: string): Promise<boolean> {
-  // self host 不可删
-  const head = await getPool().query<{ name: string; status: ComputeHostStatus; n: string }>(
-    `SELECT name, status,
-            (SELECT COUNT(*)::text FROM agent_containers
-              WHERE host_uuid = compute_hosts.id AND state='active') AS n
-       FROM compute_hosts WHERE id = $1`,
-    [id],
-  );
-  if (head.rowCount === 0) return false;
-  const { name, status, n } = head.rows[0]!;
-  if (name === "self") {
-    throw new Error("cannot delete self host");
+export interface DeletedHostAuditSnapshot {
+  id: string;
+  name: string;
+  host: string;
+  ssh_port: number;
+  ssh_user: string;
+  agent_port: number;
+  status: ComputeHostStatus;
+  max_containers: number;
+  bridge_cidr: string;
+  expires_at: string | null;
+}
+
+/** admin 删除 — 锁行校验后 DELETE RETURNING，给操作审计提供同事务权威快照。 */
+export async function deleteHost(id: string): Promise<DeletedHostAuditSnapshot | null> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const head = await client.query<ComputeHostRow>(
+      `SELECT ${COMPUTE_HOST_COLS}
+         FROM compute_hosts
+        WHERE id = $1
+        FOR UPDATE`,
+      [id],
+    );
+    if (head.rowCount === 0) {
+      await client.query("COMMIT");
+      return null;
+    }
+    const row = head.rows[0]!;
+    if (row.name === "self") throw new Error("cannot delete self host");
+    if (row.status !== "draining") {
+      throw new Error(`host must be in draining status to delete, got ${row.status}`);
+    }
+    const active = await client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM agent_containers
+        WHERE host_uuid = $1 AND state='active'`,
+      [id],
+    );
+    const n = active.rows[0]?.n ?? "0";
+    if (Number.parseInt(n, 10) > 0) {
+      throw new Error(`host still has ${n} active containers; drain first`);
+    }
+    const deleted = await client.query<{
+      id: string;
+      name: string;
+      host: string;
+      ssh_port: number;
+      ssh_user: string;
+      agent_port: number;
+      status: ComputeHostStatus;
+      max_containers: number;
+      bridge_cidr: string;
+      expires_at: Date | null;
+    }>(
+      `DELETE FROM compute_hosts
+        WHERE id = $1
+        RETURNING id::text AS id, name, host, ssh_port, ssh_user, agent_port,
+                  status, max_containers, bridge_cidr, expires_at`,
+      [id],
+    );
+    await client.query("COMMIT");
+    const value = deleted.rows[0]!;
+    return {
+      ...value,
+      expires_at: value.expires_at?.toISOString() ?? null,
+    };
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch { /* swallow */ }
+    throw e;
+  } finally {
+    client.release();
   }
-  if (status !== "draining") {
-    throw new Error(`host must be in draining status to delete, got ${status}`);
-  }
-  if (Number.parseInt(n, 10) > 0) {
-    throw new Error(`host still has ${n} active containers; drain first`);
-  }
-  const r = await getPool().query(`DELETE FROM compute_hosts WHERE id = $1`, [id]);
-  return (r.rowCount ?? 0) > 0;
 }
 
 /**

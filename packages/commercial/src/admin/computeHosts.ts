@@ -441,11 +441,13 @@ export async function revokeComputeHost(id: string, ctx: AdminAuditCtx): Promise
 export async function removeComputeHost(id: string, ctx: AdminAuditCtx): Promise<void> {
   // queries.deleteHost 已包含:self 拒、draining 检查、active=0 检查、ID 存在性
   // throw message 我们按文案 map 成 HttpError code/status
+  let removed: queries.DeletedHostAuditSnapshot;
   try {
-    const ok = await queries.deleteHost(id);
-    if (!ok) {
+    const result = await queries.deleteHost(id);
+    if (!result) {
       throw new HttpError(404, "NOT_FOUND", `compute host ${id} not found`);
     }
+    removed = result;
   } catch (err) {
     if (err instanceof HttpError) throw err;
     const msg = err instanceof Error ? err.message : String(err);
@@ -460,7 +462,13 @@ export async function removeComputeHost(id: string, ctx: AdminAuditCtx): Promise
     }
     throw err;
   }
-  await bestEffortAudit(ctx, "compute_host.remove", `compute_host:${id}`, null, null);
+  await bestEffortAudit(
+    ctx,
+    "compute_host.remove",
+    `compute_host:${id}`,
+    removed,
+    { removed: true },
+  );
 }
 
 export async function clearQuarantineForHost(id: string, ctx: AdminAuditCtx): Promise<void> {

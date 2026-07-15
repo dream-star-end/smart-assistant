@@ -291,6 +291,33 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     assert.ok(!rDecoded.text.includes(FALLTHROUGH_MARKER));
   });
 
+  test("已认证 user 被拦 → route_blocked 仅持久化 pathname，不含敏感 query", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const uid = await createUser(`blocked-audit${Date.now()}@x.com`, "user");
+    const tok = await tokenFor(uid, "user");
+    const secret = "query-secret-must-not-persist";
+    const r = await fetchWith(`/api/cron?email=user%40example.com&token=${secret}`, "GET", tok);
+    assert.equal(r.status, 403);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    const ev = await query<{
+      type: string;
+      target: string;
+      detail: { path: string };
+    }>(
+      `SELECT type, target, detail
+         FROM security_events
+        WHERE actor_user_id=$1 AND type='route_blocked'
+        ORDER BY id DESC LIMIT 1`,
+      [uid.toString()],
+    );
+    assert.equal(ev.rows.length, 1);
+    assert.equal(ev.rows[0].target, "GET /api/cron");
+    assert.deepEqual(ev.rows[0].detail, { path: "/api/cron" });
+    assert.equal(JSON.stringify(ev.rows[0]).includes(secret), false);
+    assert.equal(JSON.stringify(ev.rows[0]).includes("user@example.com"), false);
+  });
+
   test("trailing-slash 不能绕过(gateway 自己用 exact match,命中规则一致)", async (t) => {
     if (skipIfNoHttp(t)) return;
     const uid = await createUser(`trail${Date.now()}@x.com`, "user");

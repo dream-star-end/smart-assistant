@@ -7,7 +7,6 @@ import {
   DataTable,
   FilterBar,
   KeyValue,
-  LevelBadge,
   Pagination,
   TimeAgo,
 } from "../../components";
@@ -39,6 +38,33 @@ interface Filter {
   tool: string;
 }
 
+const ERROR_CLASS_LABELS: Record<string, string> = {
+  unknown_skill: "未知技能",
+  command_not_found: "命令缺失",
+  file_not_found: "文件缺失",
+  permission_denied: "权限拒绝",
+  timeout: "超时",
+  cancelled: "已取消",
+  validation_error: "参数校验",
+  rate_limited: "限流",
+  service_unavailable: "服务不可用",
+  network_error: "网络错误",
+  other: "其他",
+};
+
+function errorClassOf(row: AgentAuditRow): string {
+  if (row.input_meta && typeof row.input_meta === "object" && !Array.isArray(row.input_meta)) {
+    const value = (row.input_meta as Record<string, unknown>).error_class;
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return "other";
+}
+
+function errorClassLabel(row: AgentAuditRow): string {
+  const value = errorClassOf(row);
+  return ERROR_CLASS_LABELS[value] ?? value;
+}
+
 /** 单次工具调用详情:元信息 + input_meta / hash。 */
 function DetailBody({ row }: { row: AgentAuditRow }) {
   return (
@@ -61,18 +87,7 @@ function DetailBody({ row }: { row: AgentAuditRow }) {
             </span>
           }
         />
-        <KeyValue
-          label="结果"
-          value={
-            <LevelBadge
-              level={row.success ? "ok" : "error"}
-              label={row.success ? "成功" : "失败"}
-            />
-          }
-        />
-        {row.error_msg && (
-          <KeyValue label="错误" value={<span className="text-danger break-words">{row.error_msg}</span>} />
-        )}
+        <KeyValue label="错误分类" value={<Badge tone="danger">{errorClassLabel(row)}</Badge>} />
         <KeyValue
           label="input_hash"
           value={<span className="font-mono text-[12px] break-all">{row.input_hash ?? "—"}</span>}
@@ -192,26 +207,9 @@ export function AgentAuditTab() {
       render: (r) => (r.duration_ms == null ? "—" : `${r.duration_ms}ms`),
     },
     {
-      key: "success",
-      title: "结果",
-      render: (r) => (
-        <LevelBadge level={r.success ? "ok" : "error"} label={r.success ? "成功" : "失败"} />
-      ),
-    },
-    {
-      key: "error_msg",
-      title: "错误",
-      render: (r) =>
-        r.error_msg ? (
-          <span
-            className="block max-w-[16rem] truncate text-danger"
-            title={r.error_msg}
-          >
-            {r.error_msg}
-          </span>
-        ) : (
-          <span className="text-faint">—</span>
-        ),
+      key: "error_class",
+      title: "错误分类",
+      render: (r) => <Badge tone="danger">{errorClassLabel(r)}</Badge>,
     },
     {
       key: "created_at",
@@ -262,7 +260,7 @@ export function AgentAuditTab() {
         rowKey={(r) => r.id}
         loading={loading}
         onRowClick={(r) => setDetail(r)}
-        emptyTitle="暂无工具调用记录"
+        emptyTitle="暂无工具失败记录"
         emptyHint="调整过滤条件或稍后再试。"
       />
 

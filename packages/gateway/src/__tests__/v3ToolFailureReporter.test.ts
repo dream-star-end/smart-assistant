@@ -4,6 +4,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -41,7 +42,7 @@ function toolEvent(overrides: Partial<ToolCalledEvent> = {}): ToolCalledEvent {
     durationMs: 17,
     isError: true,
     inputPreview: 'Authorization: Bearer secret-token',
-    outputPreview: 'failed with oc-v3.7.' + 'a'.repeat(64),
+    outputPreview: `failed with oc-v3.7.${'a'.repeat(64)}`,
     ...overrides,
   } as ToolCalledEvent
 }
@@ -108,28 +109,38 @@ describe('v3ToolFailureReporter', () => {
     }
   })
 
-  test('builds only failed events and scrubs obvious secrets', () => {
+  test('builds only failed events and emits hashes/categories without raw previews', () => {
     assert.equal(buildToolFailureReportPayload(toolEvent({ isError: false })), null)
     const payload = buildToolFailureReportPayload(toolEvent())!
+    const rawInput = 'Authorization: Bearer secret-token'
+    const rawOutput = `failed with oc-v3.7.${'a'.repeat(64)}`
     assert.equal(payload.eventId, 'evt-1')
     assert.equal(payload.toolName, 'Bash')
-    assert.equal(payload.inputPreview, 'Authorization: Bearer [redacted]')
-    assert.equal(payload.outputPreview, 'failed with [redacted-container-token]')
+    assert.equal(payload.schemaVersion, 2)
+    assert.equal(payload.inputHash, createHash('sha256').update(rawInput).digest('hex'))
+    assert.equal(payload.outputHash, createHash('sha256').update(rawOutput).digest('hex'))
+    assert.equal(payload.errorClass, 'other')
+    assert.equal('inputPreview' in payload, false)
+    assert.equal('outputPreview' in payload, false)
   })
 
   test('sender posts to master endpoint with container bearer and classifies failures', async () => {
     const payload = buildToolFailureReportPayload(toolEvent())!
     let seenUrl = ''
     let seenAuth = ''
+    let seenBody = ''
     await sendToolFailureReport(payload, { masterBaseUrl: 'http://master', containerToken: 'tok' }, {
       fetchImpl: async (input, init) => {
         seenUrl = String(input)
         seenAuth = new Headers(init.headers).get('authorization') ?? ''
+        seenBody = String(init.body ?? '')
         return new Response('{}', { status: 200 })
       },
     })
     assert.equal(seenUrl, `http://master${TOOL_FAILURE_AUDIT_PATH}`)
     assert.equal(seenAuth, 'Bearer tok')
+    assert.equal(seenBody.includes('secret-token'), false)
+    assert.equal(seenBody.includes('oc-v3.7.'), false)
 
     await assert.rejects(
       () => sendToolFailureReport(payload, { masterBaseUrl: 'http://master', containerToken: 'tok' }, {
