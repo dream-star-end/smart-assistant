@@ -3,6 +3,7 @@ import { Check, GitBranch, Lock, Search, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { githubErrorText } from "../../lib/github";
+import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import type {
   AuthSession,
   GithubBranch,
@@ -129,7 +130,11 @@ export function GithubRepoModal({
         .then((bs) => {
           // default 分支顶置。
           const sorted = [...bs].sort((a, b) =>
-            a.name === repo.default_branch ? -1 : b.name === repo.default_branch ? 1 : 0,
+            a.name === repo.default_branch
+              ? -1
+              : b.name === repo.default_branch
+                ? 1
+                : 0,
           );
           setBranches(sorted);
           setSelBranch(repo.default_branch);
@@ -148,7 +153,10 @@ export function GithubRepoModal({
       window.location.href = authorizeUrl; // 跳 GitHub 授权页，回调后 302 回 /?github_linked=1
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : apiErrorMessage(e, "连接失败"), "error");
+      toast(
+        code ? githubErrorText(code) : apiErrorMessage(e, "连接失败"),
+        "error",
+      );
       setLinking(false);
     }
   }, [auth, linking, toast]);
@@ -170,7 +178,10 @@ export function GithubRepoModal({
       toast(`已解绑 GitHub · ${r.sessionsCleared} 个会话已清空`, "success");
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : apiErrorMessage(e, "解绑失败"), "error");
+      toast(
+        code ? githubErrorText(code) : apiErrorMessage(e, "解绑失败"),
+        "error",
+      );
     } finally {
       setUnlinking(false);
     }
@@ -184,7 +195,10 @@ export function GithubRepoModal({
       onClose();
     } catch (e) {
       const code = (e as { code?: string }).code;
-      toast(code ? githubErrorText(code) : apiErrorMessage(e, "绑定失败"), "error");
+      toast(
+        code ? githubErrorText(code) : apiErrorMessage(e, "绑定失败"),
+        "error",
+      );
     } finally {
       setConfirming(false);
     }
@@ -215,6 +229,7 @@ export function GithubRepoModal({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
+          data-product-feature={PRODUCT_CAPABILITIES.github.id}
           className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between px-5 py-4">
@@ -239,8 +254,15 @@ export function GithubRepoModal({
               </div>
             ) : !linked ? (
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[13px] text-muted">连接 GitHub 账号后即可把仓库绑定到当前会话</span>
-                <Button variant="primary" size="sm" onClick={startLink} disabled={linking}>
+                <span className="text-[13px] text-muted">
+                  连接 GitHub 账号后即可把仓库绑定到当前会话
+                </span>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={startLink}
+                  disabled={linking}
+                >
                   <GitBranch size={14} /> {linking ? "跳转中…" : "连接 GitHub"}
                 </Button>
               </div>
@@ -249,7 +271,9 @@ export function GithubRepoModal({
                 <Avatar
                   size="sm"
                   src={(link.linked && link.avatar_url) || undefined}
-                  fallback={(link.linked && link.login?.[0]?.toUpperCase()) || "G"}
+                  fallback={
+                    (link.linked && link.login?.[0]?.toUpperCase()) || "G"
+                  }
                 />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[13.5px] font-medium text-fg">
@@ -261,15 +285,28 @@ export function GithubRepoModal({
                 </div>
                 {confirmUnlink ? (
                   <div className="flex items-center gap-1.5">
-                    <Button variant="danger" size="sm" onClick={doUnlink} disabled={unlinking}>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={doUnlink}
+                      disabled={unlinking}
+                    >
                       {unlinking ? "解绑中…" : "确认解绑"}
                     </Button>
-                    <Button variant="ghost" size="sm" onClick={() => setConfirmUnlink(false)}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setConfirmUnlink(false)}
+                    >
                       取消
                     </Button>
                   </div>
                 ) : (
-                  <Button variant="subtle" size="sm" onClick={() => setConfirmUnlink(true)}>
+                  <Button
+                    variant="subtle"
+                    size="sm"
+                    onClick={() => setConfirmUnlink(true)}
+                  >
                     解绑
                   </Button>
                 )}
@@ -284,7 +321,10 @@ export function GithubRepoModal({
               <div className="flex min-h-0 flex-col border-border sm:border-r">
                 <div className="px-3 pt-3">
                   <div className="relative">
-                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
+                    <Search
+                      size={14}
+                      className="absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+                    />
                     <Input
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
@@ -299,9 +339,13 @@ export function GithubRepoModal({
                       <Spinner /> 加载仓库…
                     </div>
                   ) : reposErr ? (
-                    <p className="px-2 py-8 text-center text-[13px] text-danger">{reposErr}</p>
+                    <p className="px-2 py-8 text-center text-[13px] text-danger">
+                      {reposErr}
+                    </p>
                   ) : filteredRepos.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-[13px] text-faint">无匹配仓库</p>
+                    <p className="px-2 py-8 text-center text-[13px] text-faint">
+                      无匹配仓库
+                    </p>
                   ) : (
                     <ul className="flex flex-col gap-0.5">
                       {filteredRepos.map((r) => {
@@ -312,17 +356,29 @@ export function GithubRepoModal({
                               onClick={() => onPickRepo(r)}
                               className={cn(
                                 "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-                                active ? "bg-accent-soft text-accent" : "hover:bg-hover",
+                                active
+                                  ? "bg-accent-soft text-accent"
+                                  : "hover:bg-hover",
                               )}
                             >
                               <span className="min-w-0 flex-1 truncate text-[13px]">
-                                <span className="text-faint">{r.owner.login}/</span>
-                                <span className="font-medium text-fg">{r.name}</span>
+                                <span className="text-faint">
+                                  {r.owner.login}/
+                                </span>
+                                <span className="font-medium text-fg">
+                                  {r.name}
+                                </span>
                               </span>
                               {r.private && (
-                                <Lock size={12} className="shrink-0 text-faint" aria-label="私有" />
+                                <Lock
+                                  size={12}
+                                  className="shrink-0 text-faint"
+                                  aria-label="私有"
+                                />
                               )}
-                              {active && <Check size={14} className="shrink-0" />}
+                              {active && (
+                                <Check size={14} className="shrink-0" />
+                              )}
                             </button>
                           </li>
                         );
@@ -339,13 +395,17 @@ export function GithubRepoModal({
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-2">
                   {!selRepo ? (
-                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">先选择左侧仓库</p>
+                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">
+                      先选择左侧仓库
+                    </p>
                   ) : branchesLoading ? (
                     <div className="flex items-center justify-center gap-2 py-10 text-[13px] text-faint">
                       <Spinner /> 加载分支…
                     </div>
                   ) : branches.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">无分支</p>
+                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">
+                      无分支
+                    </p>
                   ) : (
                     <ul className="flex flex-col gap-0.5">
                       {branches.map((b) => {
@@ -356,14 +416,20 @@ export function GithubRepoModal({
                               onClick={() => setSelBranch(b.name)}
                               className={cn(
                                 "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-                                active ? "bg-accent-soft text-accent" : "hover:bg-hover",
+                                active
+                                  ? "bg-accent-soft text-accent"
+                                  : "hover:bg-hover",
                               )}
                             >
                               <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg">
                                 {b.name}
                               </span>
-                              {b.name === selRepo.default_branch && <Badge tone="neutral">default</Badge>}
-                              {active && <Check size={14} className="shrink-0" />}
+                              {b.name === selRepo.default_branch && (
+                                <Badge tone="neutral">default</Badge>
+                              )}
+                              {active && (
+                                <Check size={14} className="shrink-0" />
+                              )}
                             </button>
                           </li>
                         );
@@ -379,7 +445,12 @@ export function GithubRepoModal({
           <div className="flex items-center justify-between gap-2 border-t border-border px-5 py-3">
             <div>
               {hasBinding && (
-                <Button variant="subtle" size="sm" onClick={doUnbind} disabled={unbinding}>
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  onClick={doUnbind}
+                  disabled={unbinding}
+                >
                   {unbinding ? "解除中…" : "解除当前绑定"}
                 </Button>
               )}
@@ -394,7 +465,9 @@ export function GithubRepoModal({
                 variant="primary"
                 size="sm"
                 onClick={doConfirm}
-                disabled={!linked || !selRepo || !selBranch || confirming || !sessionId}
+                disabled={
+                  !linked || !selRepo || !selBranch || confirming || !sessionId
+                }
               >
                 {confirming ? "绑定中…" : "确认绑定"}
               </Button>

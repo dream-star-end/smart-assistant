@@ -1,4 +1,4 @@
-import * as Dialog from '@radix-ui/react-dialog'
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   ArrowRight,
   Bell,
@@ -30,8 +30,8 @@ import {
   Users,
   Wallet,
   X,
-} from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   PRODUCT_CAPABILITIES,
   PRODUCT_CAPABILITY_LIST,
@@ -40,17 +40,21 @@ import {
   type ProductFeatureCategory,
   type ProductFeatureId,
   capabilityById,
-} from '../lib/productCapabilities'
-import type { TutorialActionState } from '../lib/tutorialActions'
+} from "../lib/productCapabilities";
+import type { TutorialActionState } from "../lib/tutorialActions";
 import {
   TUTORIAL_MEDIA,
   TUTORIAL_TOPICS,
   TUTORIAL_TOPIC_LIST,
   tutorialById,
-} from '../lib/tutorialCatalog'
-import { markTutorialRead, readTutorialProgress, tutorialIsRead } from '../lib/tutorialProgress'
-import { cn } from '../lib/utils'
-import { Badge, Button, IconButton } from './ui'
+} from "../lib/tutorialCatalog";
+import {
+  markTutorialRead,
+  readTutorialProgress,
+  tutorialIsRead,
+} from "../lib/tutorialProgress";
+import { cn } from "../lib/utils";
+import { Badge, Button, IconButton } from "./ui";
 
 const ICONS: Record<string, LucideIcon> = {
   message: MessageCircle,
@@ -74,18 +78,21 @@ const ICONS: Record<string, LucideIcon> = {
   settings: Settings,
   wallet: Wallet,
   building: Building2,
-  'message-square': MessageSquare,
+  "message-square": MessageSquare,
   monitor: Monitor,
-}
+};
 
 function normalizeSearch(value: string): string {
-  return value.trim().toLocaleLowerCase('zh-CN').replace(/\s+/g, ' ')
+  return value.trim().toLocaleLowerCase("zh-CN").replace(/\s+/g, " ");
 }
 
-export function tutorialMatches(feature: ProductCapability, query: string): boolean {
-  const q = normalizeSearch(query)
-  if (!q) return true
-  const topic = tutorialById(feature.id as ProductFeatureId)
+export function tutorialMatches(
+  feature: ProductCapability,
+  query: string,
+): boolean {
+  const q = normalizeSearch(query);
+  if (!q) return true;
+  const topic = tutorialById(feature.id as ProductFeatureId);
   const haystack = normalizeSearch(
     [
       feature.title,
@@ -95,9 +102,9 @@ export function tutorialMatches(feature: ProductCapability, query: string): bool
       topic.outcome,
       ...topic.scenarios,
       ...topic.steps.flatMap((step) => [step.title, step.body]),
-    ].join(' '),
-  )
-  return q.split(' ').every((term) => haystack.includes(term))
+    ].join(" "),
+  );
+  return q.split(" ").every((term) => haystack.includes(term));
 }
 
 export function TutorialCenter({
@@ -108,69 +115,75 @@ export function TutorialCenter({
   actionState,
   onRunAction,
 }: {
-  open: boolean
-  topicId: ProductFeatureId
-  onTopicChange: (id: ProductFeatureId) => void
-  onClose: () => void
-  actionState: (feature: ProductCapability) => TutorialActionState
-  onRunAction: (feature: ProductCapability) => void
+  open: boolean;
+  topicId: ProductFeatureId;
+  onTopicChange: (id: ProductFeatureId) => void;
+  onClose: () => void;
+  actionState: (feature: ProductCapability) => TutorialActionState;
+  onRunAction: (feature: ProductCapability) => void;
 }) {
-  const [query, setQuery] = useState('')
-  const [category, setCategory] = useState<ProductFeatureCategory | 'all'>('all')
-  const [progress, setProgress] = useState(() => readTutorialProgress())
-  const [videoFailed, setVideoFailed] = useState<Record<string, boolean>>({})
-  const [copied, setCopied] = useState(false)
-  const copyTimer = useRef<number | null>(null)
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState<ProductFeatureCategory | "all">(
+    "all",
+  );
+  const [progress, setProgress] = useState(() => readTutorialProgress());
+  const [videoFailed, setVideoFailed] = useState<Record<string, boolean>>({});
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
 
-  const feature = capabilityById(topicId)
-  const topic = tutorialById(topicId)
-  const media = TUTORIAL_MEDIA[topic.media]
-  const cta = actionState(feature)
+  const feature = capabilityById(topicId);
+  const topic = tutorialById(topicId);
+  const media = TUTORIAL_MEDIA[topic.media];
+  const cta = actionState(feature);
 
   const filtered = useMemo(
     () =>
       PRODUCT_CAPABILITY_LIST.filter(
         (item) =>
-          (category === 'all' || item.category === category) && tutorialMatches(item, query),
+          (category === "all" || item.category === category) &&
+          tutorialMatches(item, query),
       ),
     [category, query],
-  )
+  );
   const mobileOptions = filtered.some((item) => item.id === topicId)
     ? filtered
-    : [feature, ...filtered]
+    : [feature, ...filtered];
 
   const readCount = TUTORIAL_TOPIC_LIST.filter((item) =>
     tutorialIsRead(progress, item.featureId),
-  ).length
+  ).length;
 
   useEffect(() => {
     if (!open) {
-      setQuery('')
-      setCategory('all')
-      return
+      setQuery("");
+      setCategory("all");
+      return;
     }
-    const timer = window.setTimeout(() => setProgress(markTutorialRead(topicId)), 900)
-    return () => window.clearTimeout(timer)
-  }, [open, topicId])
+    const timer = window.setTimeout(
+      () => setProgress(markTutorialRead(topicId)),
+      900,
+    );
+    return () => window.clearTimeout(timer);
+  }, [open, topicId]);
 
   useEffect(
     () => () => {
-      if (copyTimer.current != null) window.clearTimeout(copyTimer.current)
+      if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
     },
     [],
-  )
+  );
 
   const copyExample = () => {
-    if (!topic.example) return
+    if (!topic.example) return;
     void navigator.clipboard
       ?.writeText(topic.example)
       .then(() => {
-        setCopied(true)
-        if (copyTimer.current != null) window.clearTimeout(copyTimer.current)
-        copyTimer.current = window.setTimeout(() => setCopied(false), 1600)
+        setCopied(true);
+        if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
+        copyTimer.current = window.setTimeout(() => setCopied(false), 1600);
       })
-      .catch(() => {})
-  }
+      .catch(() => {});
+  };
 
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !next && onClose()}>
@@ -211,10 +224,15 @@ export function TutorialCenter({
               <span>
                 {readCount}/{TUTORIAL_TOPIC_LIST.length} 已读
               </span>
-              <span className="h-1.5 w-16 overflow-hidden rounded-full bg-hover" aria-hidden>
+              <span
+                className="h-1.5 w-16 overflow-hidden rounded-full bg-hover"
+                aria-hidden
+              >
                 <span
                   className="block h-full rounded-full bg-accent transition-[width]"
-                  style={{ width: `${(readCount / TUTORIAL_TOPIC_LIST.length) * 100}%` }}
+                  style={{
+                    width: `${(readCount / TUTORIAL_TOPIC_LIST.length) * 100}%`,
+                  }}
                 />
               </span>
             </div>
@@ -226,7 +244,10 @@ export function TutorialCenter({
           </header>
 
           <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-3 py-2 lg:hidden">
-            <CategoryChip active={category === 'all'} onClick={() => setCategory('all')}>
+            <CategoryChip
+              active={category === "all"}
+              onClick={() => setCategory("all")}
+            >
               全部
             </CategoryChip>
             {PRODUCT_FEATURE_CATEGORIES.map((item) => (
@@ -245,16 +266,18 @@ export function TutorialCenter({
               <div className="flex flex-col gap-1 p-3">
                 <button
                   type="button"
-                  onClick={() => setCategory('all')}
+                  onClick={() => setCategory("all")}
                   className={cn(
-                    'rounded-lg px-3 py-2 text-left text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                    category === 'all'
-                      ? 'bg-active text-fg'
-                      : 'text-muted hover:bg-hover hover:text-fg',
+                    "rounded-lg px-3 py-2 text-left text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                    category === "all"
+                      ? "bg-active text-fg"
+                      : "text-muted hover:bg-hover hover:text-fg",
                   )}
                 >
-                  全部功能{' '}
-                  <span className="float-right text-faint">{PRODUCT_CAPABILITY_LIST.length}</span>
+                  全部功能{" "}
+                  <span className="float-right text-faint">
+                    {PRODUCT_CAPABILITY_LIST.length}
+                  </span>
                 </button>
                 {PRODUCT_FEATURE_CATEGORIES.map((item) => (
                   <button
@@ -263,10 +286,10 @@ export function TutorialCenter({
                     onClick={() => setCategory(item.id)}
                     title={item.description}
                     className={cn(
-                      'rounded-lg px-3 py-2 text-left text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      "rounded-lg px-3 py-2 text-left text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
                       category === item.id
-                        ? 'bg-active text-fg'
-                        : 'text-muted hover:bg-hover hover:text-fg',
+                        ? "bg-active text-fg"
+                        : "text-muted hover:bg-hover hover:text-fg",
                     )}
                   >
                     {item.label}
@@ -299,13 +322,16 @@ export function TutorialCenter({
                 <select
                   aria-label="选择教程"
                   value={topicId}
-                  onChange={(event) => onTopicChange(event.target.value as ProductFeatureId)}
+                  onChange={(event) =>
+                    onTopicChange(event.target.value as ProductFeatureId)
+                  }
                   className="h-9 w-full rounded-lg border border-border bg-bg px-3 text-[13px] text-fg outline-none focus:ring-2 focus:ring-ring"
                 >
                   {mobileOptions.length > 0 ? (
                     mobileOptions.map((item) => (
                       <option key={item.id} value={item.id}>
-                        {item.id === topicId && !filtered.some((match) => match.id === topicId)
+                        {item.id === topicId &&
+                        !filtered.some((match) => match.id === topicId)
                           ? `当前 · ${item.shortTitle}`
                           : item.shortTitle}
                       </option>
@@ -325,7 +351,9 @@ export function TutorialCenter({
                     <FeatureIcon feature={feature} className="hidden sm:flex" />
                     <div className="min-w-0 flex-1">
                       <div className="mb-2 flex flex-wrap items-center gap-2">
-                        <Badge tone="accent">{categoryLabel(feature.category)}</Badge>
+                        <Badge tone="accent">
+                          {categoryLabel(feature.category)}
+                        </Badge>
                         <span className="text-[11px] text-faint">
                           内容版本 {topic.contentVersion}
                         </span>
@@ -338,7 +366,9 @@ export function TutorialCenter({
                       <h1 className="text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">
                         {feature.title}
                       </h1>
-                      <p className="mt-3 text-[14.5px] leading-7 text-muted">{topic.intro}</p>
+                      <p className="mt-3 text-[14.5px] leading-7 text-muted">
+                        {topic.intro}
+                      </p>
                     </div>
                   </div>
 
@@ -365,17 +395,26 @@ export function TutorialCenter({
                           poster={media.poster}
                           aria-label={`${feature.shortTitle}演示视频`}
                           onError={() =>
-                            setVideoFailed((current) => ({ ...current, [topic.media]: true }))
+                            setVideoFailed((current) => ({
+                              ...current,
+                              [topic.media]: true,
+                            }))
                           }
                           className="h-full w-full object-cover"
                         >
-                          <source src={media.video} type="video/webm; codecs=vp8" />
+                          <source
+                            src={media.video}
+                            type="video/webm; codecs=vp8"
+                          />
                         </video>
                       )}
                     </div>
-                    <p className="border-t border-border px-4 py-2.5 text-[11.5px] text-faint">
-                      {media.caption}
-                    </p>
+                    <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border px-4 py-2.5 text-[11.5px] text-faint">
+                      <p>{media.caption}</p>
+                      <span className="shrink-0 rounded-full bg-success-soft px-2 py-0.5 font-medium text-success">
+                        真实界面录制 · 脱敏示例
+                      </span>
+                    </div>
                   </section>
 
                   <section className="mt-7 rounded-2xl bg-accent-soft p-5">
@@ -398,7 +437,9 @@ export function TutorialCenter({
                   </section>
 
                   <section className="mt-9">
-                    <h2 className="text-[19px] font-semibold tracking-tight text-fg">跟着做</h2>
+                    <h2 className="text-[19px] font-semibold tracking-tight text-fg">
+                      跟着做
+                    </h2>
                     <ol className="mt-4 flex flex-col gap-5">
                       {topic.steps.map((step, index) => (
                         <li key={step.title} className="flex gap-3.5">
@@ -406,8 +447,12 @@ export function TutorialCenter({
                             {index + 1}
                           </span>
                           <div>
-                            <h3 className="text-[14px] font-semibold text-fg">{step.title}</h3>
-                            <p className="mt-1 text-[13.5px] leading-6 text-muted">{step.body}</p>
+                            <h3 className="text-[14px] font-semibold text-fg">
+                              {step.title}
+                            </h3>
+                            <p className="mt-1 text-[13.5px] leading-6 text-muted">
+                              {step.body}
+                            </p>
                           </div>
                         </li>
                       ))}
@@ -417,10 +462,12 @@ export function TutorialCenter({
                   {topic.example && (
                     <section className="mt-9 rounded-2xl border border-border bg-surface p-4 sm:p-5">
                       <div className="flex items-center justify-between gap-3">
-                        <h2 className="text-[14px] font-semibold text-fg">可以直接参考的说法</h2>
+                        <h2 className="text-[14px] font-semibold text-fg">
+                          可以直接参考的说法
+                        </h2>
                         <Button variant="ghost" size="sm" onClick={copyExample}>
                           {copied ? <Check size={14} /> : <Copy size={14} />}
-                          {copied ? '已复制' : '复制示例'}
+                          {copied ? "已复制" : "复制示例"}
                         </Button>
                       </div>
                       <blockquote className="mt-3 border-l-2 border-accent pl-3 text-[13.5px] leading-6 text-muted">
@@ -430,7 +477,12 @@ export function TutorialCenter({
                   )}
 
                   <div className="mt-9 grid gap-4 sm:grid-cols-2">
-                    <InfoBox icon={Lightbulb} title="实用建议" tone="accent" items={topic.tips} />
+                    <InfoBox
+                      icon={Lightbulb}
+                      title="实用建议"
+                      tone="accent"
+                      items={topic.tips}
+                    />
                     <InfoBox
                       icon={TriangleAlert}
                       title="使用前留意"
@@ -449,7 +501,9 @@ export function TutorialCenter({
                           教程不会替你发送消息、修改设置或执行付费操作。
                         </p>
                         {!cta.enabled && cta.disabledReason && (
-                          <p className="mt-1.5 text-[12px] text-warning">{cta.disabledReason}</p>
+                          <p className="mt-1.5 text-[12px] text-warning">
+                            {cta.disabledReason}
+                          </p>
                         )}
                       </div>
                       <Button
@@ -464,11 +518,13 @@ export function TutorialCenter({
                   </section>
 
                   <section className="mt-9">
-                    <h2 className="text-[14px] font-semibold text-fg">接着了解</h2>
+                    <h2 className="text-[14px] font-semibold text-fg">
+                      接着了解
+                    </h2>
                     <div className="mt-3 grid gap-2 sm:grid-cols-3">
                       {topic.related.map((relatedId) => {
-                        const related = capabilityById(relatedId)
-                        const RelatedIcon = ICONS[related.icon] ?? Sparkles
+                        const related = capabilityById(relatedId);
+                        const RelatedIcon = ICONS[related.icon] ?? Sparkles;
                         return (
                           <button
                             key={relatedId}
@@ -476,11 +532,16 @@ export function TutorialCenter({
                             onClick={() => onTopicChange(relatedId)}
                             className="flex items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2.5 text-left text-[12px] text-muted outline-none transition-colors hover:border-accent/40 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
                           >
-                            <RelatedIcon size={14} className="shrink-0 text-accent" />
-                            <span className="min-w-0 flex-1 truncate">{related.shortTitle}</span>
+                            <RelatedIcon
+                              size={14}
+                              className="shrink-0 text-accent"
+                            />
+                            <span className="min-w-0 flex-1 truncate">
+                              {related.shortTitle}
+                            </span>
                             <ArrowRight size={12} className="text-faint" />
                           </button>
-                        )
+                        );
                       })}
                     </div>
                   </section>
@@ -491,7 +552,7 @@ export function TutorialCenter({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
-  )
+  );
 }
 
 function CategoryChip({
@@ -499,22 +560,24 @@ function CategoryChip({
   onClick,
   children,
 }: {
-  active: boolean
-  onClick: () => void
-  children: React.ReactNode
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={cn(
-        'shrink-0 rounded-full px-3 py-1.5 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-        active ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-hover hover:text-fg',
+        "shrink-0 rounded-full px-3 py-1.5 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        active
+          ? "bg-accent-soft text-accent"
+          : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
       {children}
     </button>
-  )
+  );
 }
 
 function TopicList({
@@ -523,32 +586,34 @@ function TopicList({
   isRead,
   onSelect,
 }: {
-  items: ProductCapability[]
-  activeId: ProductFeatureId
-  isRead: (id: ProductFeatureId) => boolean
-  onSelect: (id: ProductFeatureId) => void
+  items: ProductCapability[];
+  activeId: ProductFeatureId;
+  isRead: (id: ProductFeatureId) => boolean;
+  onSelect: (id: ProductFeatureId) => void;
 }) {
   if (items.length === 0) {
     return (
       <p className="px-4 py-8 text-center text-[12.5px] text-faint">
         没有匹配的教程，换个关键词试试。
       </p>
-    )
+    );
   }
   return (
     <div className="flex flex-col gap-0.5">
       {items.map((item) => {
-        const id = item.id as ProductFeatureId
-        const Icon = ICONS[item.icon] ?? Sparkles
+        const id = item.id as ProductFeatureId;
+        const Icon = ICONS[item.icon] ?? Sparkles;
         return (
           <button
             key={id}
             type="button"
-            aria-current={id === activeId ? 'page' : undefined}
+            aria-current={id === activeId ? "page" : undefined}
             onClick={() => onSelect(id)}
             className={cn(
-              'group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-              id === activeId ? 'bg-active text-fg' : 'text-muted hover:bg-hover hover:text-fg',
+              "group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+              id === activeId
+                ? "bg-active text-fg"
+                : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
             <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-surface text-faint shadow-sm group-hover:text-accent">
@@ -557,26 +622,38 @@ function TopicList({
             <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">
               {item.shortTitle}
             </span>
-            {isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}
+            {isRead(id) && (
+              <Check
+                size={13}
+                className="shrink-0 text-success"
+                aria-label="已读"
+              />
+            )}
           </button>
-        )
+        );
       })}
     </div>
-  )
+  );
 }
 
-function FeatureIcon({ feature, className }: { feature: ProductCapability; className?: string }) {
-  const Icon = ICONS[feature.icon] ?? Sparkles
+function FeatureIcon({
+  feature,
+  className,
+}: {
+  feature: ProductCapability;
+  className?: string;
+}) {
+  const Icon = ICONS[feature.icon] ?? Sparkles;
   return (
     <span
       className={cn(
-        'size-12 shrink-0 items-center justify-center rounded-2xl bg-grad-cta text-white shadow-sm',
+        "size-12 shrink-0 items-center justify-center rounded-2xl bg-grad-cta text-white shadow-sm",
         className,
       )}
     >
       <Icon size={22} />
     </span>
-  )
+  );
 }
 
 function InfoBox({
@@ -585,22 +662,24 @@ function InfoBox({
   tone,
   items,
 }: {
-  icon: LucideIcon
-  title: string
-  tone: 'accent' | 'warning'
-  items: readonly string[]
+  icon: LucideIcon;
+  title: string;
+  tone: "accent" | "warning";
+  items: readonly string[];
 }) {
   return (
     <section
       className={cn(
-        'rounded-2xl border p-4',
-        tone === 'accent' ? 'border-accent/20 bg-accent-soft' : 'border-warning/20 bg-warning-soft',
+        "rounded-2xl border p-4",
+        tone === "accent"
+          ? "border-accent/20 bg-accent-soft"
+          : "border-warning/20 bg-warning-soft",
       )}
     >
       <h2
         className={cn(
-          'flex items-center gap-1.5 text-[13px] font-semibold',
-          tone === 'accent' ? 'text-accent' : 'text-warning',
+          "flex items-center gap-1.5 text-[13px] font-semibold",
+          tone === "accent" ? "text-accent" : "text-warning",
         )}
       >
         <Icon size={15} /> {title}
@@ -611,11 +690,11 @@ function InfoBox({
         ))}
       </ul>
     </section>
-  )
+  );
 }
 
 function categoryLabel(id: ProductFeatureCategory): string {
-  return PRODUCT_FEATURE_CATEGORIES.find((item) => item.id === id)?.label ?? id
+  return PRODUCT_FEATURE_CATEGORIES.find((item) => item.id === id)?.label ?? id;
 }
 
-export const DEFAULT_TUTORIAL_TOPIC = PRODUCT_CAPABILITIES.chatBasics.id
+export const DEFAULT_TUTORIAL_TOPIC = PRODUCT_CAPABILITIES.chatBasics.id;

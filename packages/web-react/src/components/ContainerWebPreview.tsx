@@ -40,6 +40,7 @@ import {
 import { type ContainerPreviewFrame, useContainerPreview } from '../hooks/useContainerPreview'
 import { apiErrorMessage } from '../lib/api'
 import { type ContainerWebAnnotation, buildContainerWebReviewPrompt } from '../lib/containerPreview'
+import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { Modal } from './ui'
@@ -605,7 +606,10 @@ export function ContainerWebPreview({
       className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-black"
       bodyClassName="overflow-hidden p-0"
     >
-      <div className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden bg-[#08090b] text-white">
+      <div
+        className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden bg-[#08090b] text-white"
+        data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
+      >
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(57,76,112,0.19),transparent_48%)]" />
 
         {mode === 'interact' ? (

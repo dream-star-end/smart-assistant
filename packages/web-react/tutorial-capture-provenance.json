@@ -1,0 +1,1622 @@
+{
+  "schema": 1,
+  "pipelineVersion": 2,
+  "generatedAt": "2026-07-15T08:00:00.000Z",
+  "sourceCommit": "db1cfb66234254ecb0e8bc95e4b7b656245c6510",
+  "sourceTreeHash": "889a065a3e2bbafe48e300b16b3fa2cac8217694386b1d10436b84de019f1684",
+  "productionEntry": "index.html -> src/main.tsx -> App",
+  "fixtureBoundary": "HTTP / WebSocket / browser capabilities only",
+  "networkPolicy": "local static + explicit fixtures; unknown local and all external requests fail",
+  "toolchain": {
+    "node": "v20.20.2",
+    "chrome": "Google Chrome for Testing 149.0.7827.55",
+    "playwrightCore": "1.61.0-alpha-1781023400000",
+    "ffmpeg": "ffmpeg version n7.0.1-playwright-build-1011 Copyright (c) 2000-2024 the FFmpeg developers",
+    "sharp": "0.34.5",
+    "fonts": {
+      "inter": {
+        "file": "node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2",
+        "sha256": "3100e775e8616cd2611beecfa23a4263d7037586789b43f035236a2e6fbd4c62"
+      },
+      "cjk": {
+        "family": "Noto Sans CJK SC",
+        "file": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "sha256": "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+      }
+    },
+    "viewport": {
+      "product": "960x500",
+      "final": "960x540",
+      "deviceScaleFactor": 1
+    },
+    "locale": "zh-CN",
+    "timezone": "Asia/Shanghai",
+    "colorScheme": "light",
+    "reducedMotion": "reduce",
+    "serviceWorkers": "block",
+    "chromeFlags": [
+      "--no-sandbox",
+      "--disable-gpu",
+      "--hide-scrollbars",
+      "--font-render-hinting=none",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync"
+    ]
+  },
+  "scenarios": {
+    "chat-basics": {
+      "mediaVersion": 3,
+      "caption": "输入目标并发送，随后核对助手返回的完整交付。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "新建会话，准备描述任务",
+          "dHash": "392c190a92b1a148a148a14822c8a1c0a5a0246800102020040386021c820c80"
+        },
+        {
+          "label": "写清目标、字段和交付格式",
+          "dHash": "392c190a92b1a148a148a14822c8a1c0a5a0246800902080064386431c830c80"
+        },
+        {
+          "label": "发送后核对助手的完整交付",
+          "dHash": "390c196c92e4a40bba20a9482548a608a608260024208400840386021c820c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "新建独立会话",
+          "selector": "aside button[data-product-feature=\"chat-basics\"]:has-text(\"新建会话\")",
+          "expectedFeatureId": "chat-basics",
+          "assertions": [
+            "visible:aside button[data-product-feature=\"chat-basics\"]:has-text(\"新建会话\")",
+            "feature:chat-basics"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "新建会话",
+          "matchedFeatureId": "chat-basics",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "输入清晰的交付目标",
+          "selector": "textarea[data-product-feature=\"chat-basics\"]",
+          "expectedFeatureId": "chat-basics",
+          "assertions": [
+            "visible:textarea[data-product-feature=\"chat-basics\"]",
+            "feature:chat-basics"
+          ],
+          "tag": "textarea",
+          "role": null,
+          "label": "和「科研助手」对话…",
+          "matchedFeatureId": "chat-basics",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "发送任务",
+          "selector": "button[aria-label=\"发送\"]",
+          "expectedFeatureId": "chat-basics",
+          "assertions": [
+            "visible:button[aria-label=\"发送\"]",
+            "feature:chat-basics"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "发送",
+          "matchedFeatureId": "chat-basics",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["助手已返回完整交付"],
+      "poster": {
+        "sha256": "5f7fb3b0d8d836015c1fc7b83b1097817366f3ac757bc722b7a03189256cade2",
+        "bytes": 23954
+      },
+      "video": {
+        "sha256": "e47fd6b09fa4382668a74117f9945ec7f56b8a90979faa9255268f9262e330c5",
+        "bytes": 97814
+      }
+    },
+    "sessions-history": {
+      "mediaVersion": 2,
+      "caption": "搜索会话并切换到“客户研究”，继续已有工作。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "在侧栏搜索已有项目",
+          "dHash": "390c192a9b418748a500a5482548a747a7ac27a824038420840366021c820c80"
+        },
+        {
+          "label": "打开会话并恢复历史上下文",
+          "dHash": "390c192a9b41a748a500a5482548a747a7ac27a824038420840366021c820c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "搜索已有项目会话",
+          "selector": "input[data-product-feature=\"sessions-history\"][placeholder=\"搜索会话\"]",
+          "expectedFeatureId": "sessions-history",
+          "assertions": [
+            "visible:input[data-product-feature=\"sessions-history\"][placeholder=\"搜索会话\"]",
+            "feature:sessions-history"
+          ],
+          "tag": "input",
+          "role": null,
+          "label": "搜索会话",
+          "matchedFeatureId": "sessions-history",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "切换到客户研究会话",
+          "selector": "aside [data-product-feature=\"sessions-history\"] button:has-text(\"客户研究与竞品分析\")",
+          "expectedFeatureId": "sessions-history",
+          "assertions": [
+            "visible:aside [data-product-feature=\"sessions-history\"] button:has-text(\"客户研究与竞品分析\")",
+            "feature:sessions-history"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "客户研究与竞品分析",
+          "matchedFeatureId": "sessions-history",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["历史消息已恢复"],
+      "poster": {
+        "sha256": "2529a26b5610100bcedc4a23fb412517a6a50dd92aa3e02f0005fb0f018e005a",
+        "bytes": 25266
+      },
+      "video": {
+        "sha256": "7f50cf8fcfb737574beac987591ad402619d144769232f33980a2140cea23e44",
+        "bytes": 83388
+      }
+    },
+    "models-reasoning": {
+      "mediaVersion": 2,
+      "caption": "打开模型选择器，比较并切换后续消息使用的模型。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看当前可用模型与思考档位",
+          "dHash": "392c192a9835a530a420a5302640a747a72c27a8240384208403a6021c820c80"
+        },
+        {
+          "label": "确认后续消息使用所选模型",
+          "dHash": "390c193a9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+        },
+        {
+          "label": "在模型列表中核对当前选择与可用范围",
+          "dHash": "390c190a9835a530a430a5202640a747a72c27a8240384208403a6021c820c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开模型选择器",
+          "selector": "button[data-product-feature=\"models-reasoning\"][aria-label=\"选择对话模型\"]",
+          "expectedFeatureId": "models-reasoning",
+          "assertions": [
+            "visible:button[data-product-feature=\"models-reasoning\"][aria-label=\"选择对话模型\"]",
+            "feature:models-reasoning"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "选择对话模型",
+          "matchedFeatureId": "models-reasoning",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "选择 GPT-5.6-Terra",
+          "selector": "[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"]:has-text(\"GPT-5.6-Terra\")",
+          "expectedFeatureId": "models-reasoning",
+          "assertions": [
+            "visible:[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"]:has-text(\"GPT-5.6-Terra\")",
+            "feature:models-reasoning"
+          ],
+          "tag": "div",
+          "role": "menuitem",
+          "label": "GPT-5.6-Terra",
+          "matchedFeatureId": "models-reasoning",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "重新打开选择器核对当前模型",
+          "selector": "button[data-product-feature=\"models-reasoning\"][aria-label=\"选择对话模型\"]",
+          "expectedFeatureId": "models-reasoning",
+          "assertions": [
+            "visible:button[data-product-feature=\"models-reasoning\"][aria-label=\"选择对话模型\"]",
+            "feature:models-reasoning"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "选择对话模型",
+          "matchedFeatureId": "models-reasoning",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["顶栏已显示新模型"],
+      "poster": {
+        "sha256": "803ac951015ce15438e034537536ff8ebf9ba2bd9acf4c47a19e8ba48ba7abf3",
+        "bytes": 25074
+      },
+      "video": {
+        "sha256": "21c2c1ee81481e7e0fdd8057619724db062ad750cef7b4977b76922d39666e5c",
+        "bytes": 98330
+      }
+    },
+    "files-media": {
+      "mediaVersion": 3,
+      "caption": "选择“季度数据.xlsx”，等待上传完成并看到附件卡片。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "等待附件上传并确认文件卡片",
+          "dHash": "392c194a9741a540a548a7462748a728a402240023028c018403a60b1c830c80"
+        },
+        {
+          "label": "在同一条消息里说明分析目标",
+          "dHash": "392c194a9741a540a548a7462748a728a402242823808c2184cba6cb1c830c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "选择季度数据附件",
+          "selector": "input[type=\"file\"][data-product-feature=\"files-media\"] + button",
+          "expectedFeatureId": "files-media",
+          "assertions": [
+            "visible:input[type=\"file\"][data-product-feature=\"files-media\"] + button",
+            "feature:files-media"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "添加附件",
+          "matchedFeatureId": "files-media",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["附件卡片已出现"],
+      "poster": {
+        "sha256": "ec7aceac77066529bd25dbe72c7156164503f9a6f0387a437620c9aadf81d2d7",
+        "bytes": 26708
+      },
+      "video": {
+        "sha256": "4d3789957764148f964c6fbdd2cff03476592da06c68d37fa76f4b226c9c3193",
+        "bytes": 90740
+      }
+    },
+    "voice-input": {
+      "mediaVersion": 2,
+      "caption": "开始录音、停止转写，再校对进入输入框的文字。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "开始录音并观察录音状态",
+          "dHash": "390c192a9b41a748a500a5482548a747a7ac27a8240384008402a6021c8e0c8c"
+        },
+        {
+          "label": "停止后校对进入输入框的转写文字",
+          "dHash": "390c192a9b41a748a500a5482548a747a7ac2728211384698691a69b1c8b0c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "开始语音输入",
+          "selector": "button[data-product-feature=\"voice-input\"][aria-label=\"语音输入\"]",
+          "expectedFeatureId": "voice-input",
+          "assertions": [
+            "visible:button[data-product-feature=\"voice-input\"][aria-label=\"语音输入\"]",
+            "feature:voice-input"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "语音输入",
+          "matchedFeatureId": "voice-input",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "停止录音并转写",
+          "selector": "button[data-product-feature=\"voice-input\"][aria-label=\"停止录音\"]",
+          "expectedFeatureId": "voice-input",
+          "assertions": [
+            "visible:button[data-product-feature=\"voice-input\"][aria-label=\"停止录音\"]",
+            "feature:voice-input"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "停止录音",
+          "matchedFeatureId": "voice-input",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["录音状态已启动", "语音转写文字已进入输入框"],
+      "poster": {
+        "sha256": "b12aebe7f491213ed8693bddc5a5493b9ebce0d4f37599f93c635bb109444238",
+        "bytes": 34182
+      },
+      "video": {
+        "sha256": "3f15306603da30e60d0cd8c9a8d362f6969e02601b3ff68edb8404cb3674c547",
+        "bytes": 88908
+      }
+    },
+    "web-research": {
+      "mediaVersion": 2,
+      "caption": "进入真实文献库，上传并查看已解析的研究资料。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "进入文献库查看已解析资料",
+          "dHash": "190c89168016921693169036845694469956981690169816921690161c162c08"
+        },
+        {
+          "label": "上传资料并确认解析入库",
+          "dHash": "190c89168016921693169036841690469436949699169816901690161c162c08"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到文献库",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"文献库\")",
+          "expectedFeatureId": "web-research",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"文献库\")",
+            "feature:web-research"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "文献库",
+          "matchedFeatureId": "web-research",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["记忆"]
+        },
+        {
+          "step": "上传新的研究资料",
+          "selector": "[role=\"dialog\"] input[type=\"file\"] + button",
+          "expectedFeatureId": "web-research",
+          "assertions": [
+            "visible:[role=\"dialog\"] input[type=\"file\"] + button",
+            "feature:web-research"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "上传入库",
+          "matchedFeatureId": "web-research",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["文献库"]
+        }
+      ],
+      "assertions": [
+        "管理中心已打开",
+        "已加载真实文献库列表",
+        "上传资料已入库"
+      ],
+      "poster": {
+        "sha256": "92b38e4108300f798f691864653a89216ef99cce15395f205ee4f8783f40380c",
+        "bytes": 15330
+      },
+      "video": {
+        "sha256": "f91b617202d49d3beffc251dc4002cf29d7b4fda5711969ed60e6db3753d26be",
+        "bytes": 53037
+      }
+    },
+    "artifacts-download": {
+      "mediaVersion": 3,
+      "caption": "在消息中找到真实成果卡片并触发签名下载。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "在历史消息中找到成果文件卡片",
+          "dHash": "392c19189318a363a4acb8ac2c4ba588a411247c2798869886daa4031c920c80"
+        },
+        {
+          "label": "触发签名下载并保留成果卡片入口",
+          "dHash": "392c19189318a363a4acb8ac2c4ba588a411247c2798869886daa6031c920c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "下载成果文件",
+          "selector": "a[data-product-feature=\"artifacts-download\"]",
+          "expectedFeatureId": "artifacts-download",
+          "assertions": [
+            "visible:a[data-product-feature=\"artifacts-download\"]",
+            "feature:artifacts-download"
+          ],
+          "tag": "a",
+          "role": null,
+          "label": "tutorial-quarterly-report.docx",
+          "matchedFeatureId": "artifacts-download",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["季度经营复盘会话已打开", "成果文件卡片已渲染"],
+      "poster": {
+        "sha256": "9adfed2401f73a769d0f14dcb6a7e31b19b5654dd7366e852360fdcea90b73b9",
+        "bytes": 28572
+      },
+      "video": {
+        "sha256": "88ced6730a4baec5adb62674f8c7c1bf585ed01d05dde077d06a9c34c1472399",
+        "bytes": 90176
+      }
+    },
+    "container-web-preview": {
+      "mediaVersion": 5,
+      "caption": "打开真实容器网页预览，选中页面元素并留下修改评论。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "在真实会话中找到容器网页预览入口",
+          "dHash": "392c190a92c0a194a583ba413a22a718a65824028410a300a40346021c820c80"
+        },
+        {
+          "label": "在桌面视口验收容器内真实网页",
+          "dHash": "266936e1431c432d4aed496d486d486d486d489d49dd494d469da96859604968"
+        },
+        {
+          "label": "选中具体按钮并填写可执行修改意见",
+          "dHash": "c1b9f081431c432d4aed496d486d486d886ebe1e898e898e821e90a690268026"
+        },
+        {
+          "label": "保存后核对页面锚点与评论数量",
+          "dHash": "c0a9f081431c432d4aed496d486d486d4c6d489d49cd494d449da89865d86598"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开容器内网页预览",
+          "selector": "a[data-product-feature=\"container-web-preview\"][data-container-local-preview=\"true\"]",
+          "expectedFeatureId": "container-web-preview",
+          "assertions": [
+            "visible:a[data-product-feature=\"container-web-preview\"][data-container-local-preview=\"true\"]",
+            "feature:container-web-preview"
+          ],
+          "tag": "a",
+          "role": null,
+          "label": "在容器内安全预览",
+          "matchedFeatureId": "container-web-preview",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "切换到元素评论模式",
+          "selector": "[data-product-feature=\"container-web-preview\"] button:has-text(\"评论\")",
+          "expectedFeatureId": "container-web-preview",
+          "assertions": [
+            "visible:[data-product-feature=\"container-web-preview\"] button:has-text(\"评论\")",
+            "feature:container-web-preview"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "评论",
+          "matchedFeatureId": "container-web-preview",
+          "matchedControl": true,
+          "dialogTitle": "容器网页预览与元素评论",
+          "activeTabs": []
+        },
+        {
+          "step": "填写针对所选元素的修改意见",
+          "selector": "[data-product-feature=\"container-web-preview\"] textarea[aria-label=\"描述网页修改\"]",
+          "expectedFeatureId": "container-web-preview",
+          "assertions": [
+            "visible:[data-product-feature=\"container-web-preview\"] textarea[aria-label=\"描述网页修改\"]",
+            "feature:container-web-preview"
+          ],
+          "tag": "textarea",
+          "role": null,
+          "label": "描述网页修改",
+          "matchedFeatureId": "container-web-preview",
+          "matchedControl": true,
+          "dialogTitle": "容器网页预览与元素评论",
+          "activeTabs": []
+        },
+        {
+          "step": "保存元素评论",
+          "selector": "[data-product-feature=\"container-web-preview\"] button:has-text(\"添加评论\")",
+          "expectedFeatureId": "container-web-preview",
+          "assertions": [
+            "visible:[data-product-feature=\"container-web-preview\"] button:has-text(\"添加评论\")",
+            "feature:container-web-preview"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "添加评论",
+          "matchedFeatureId": "container-web-preview",
+          "matchedControl": true,
+          "dialogTitle": "容器网页预览与元素评论",
+          "activeTabs": []
+        },
+        {
+          "step": "打开网页修改评论清单",
+          "selector": "[data-product-feature=\"container-web-preview\"] button:has-text(\"1 条评论\")",
+          "expectedFeatureId": "container-web-preview",
+          "assertions": [
+            "visible:[data-product-feature=\"container-web-preview\"] button:has-text(\"1 条评论\")",
+            "feature:container-web-preview"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "1 条评论",
+          "matchedFeatureId": "container-web-preview",
+          "matchedControl": true,
+          "dialogTitle": "容器网页预览与元素评论",
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "会话已渲染可验证的容器本地网页链接",
+        "隔离浏览器预览已打开",
+        "真实预览控件已绘制容器网页画面",
+        "已选中页面主按钮并打开评论输入",
+        "评论数量已更新，页面锚点仍然可见",
+        "元素选择器与评论已加入修改清单",
+        "修改意见已保留在评论清单"
+      ],
+      "poster": {
+        "sha256": "84659628c76f0a805111026d492bc5c9e6292dbc3ba20bb19860ac781823ccaf",
+        "bytes": 15854
+      },
+      "video": {
+        "sha256": "68204907853f1735be7633b0f53adeb44214d425aa8f9ecf6894d768d87891c9",
+        "bytes": 104743
+      }
+    },
+    "image-create-edit": {
+      "mediaVersion": 3,
+      "caption": "打开生成图片，进入圈选修改并查看下载操作。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "在图片查看器核对下载与编辑操作",
+          "dHash": "c001cb6d08ed0ccd0ecc0acc09ed08cd08cd98ad0b24088c084c08a40a280160"
+        },
+        {
+          "label": "进入真实图片查看与圈选编辑界面",
+          "dHash": "c4d4c4cc4eed4cedcacdcaedcdedcccdcccdc8ad492d482d088e99c602b402b0"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开图片编辑器",
+          "selector": "button[data-product-feature=\"image-create-edit\"][aria-label=\"编辑图片\"]",
+          "expectedFeatureId": "image-create-edit",
+          "assertions": [
+            "visible:button[data-product-feature=\"image-create-edit\"][aria-label=\"编辑图片\"]",
+            "feature:image-create-edit"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "编辑图片",
+          "matchedFeatureId": "image-create-edit",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "进入圈选编辑模式",
+          "selector": "[role=\"dialog\"] button[data-product-feature=\"image-create-edit\"]:has-text(\"编辑\")",
+          "expectedFeatureId": "image-create-edit",
+          "assertions": [
+            "visible:[role=\"dialog\"] button[data-product-feature=\"image-create-edit\"]:has-text(\"编辑\")",
+            "feature:image-create-edit"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "编辑",
+          "matchedFeatureId": "image-create-edit",
+          "matchedControl": true,
+          "dialogTitle": "图片预览",
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "季度经营复盘会话已打开",
+        "图片编辑入口已渲染",
+        "图片查看器已打开并显示编辑入口",
+        "圈选图片编辑器已打开"
+      ],
+      "poster": {
+        "sha256": "9b406130f056269962917181fcde058be4db906b9c6a2a3cd43c407198c6fd20",
+        "bytes": 13890
+      },
+      "video": {
+        "sha256": "da8f42670ca35a4c854a55cca80bdef272552dc74b349e2af500430887f0d714",
+        "bytes": 66363
+      }
+    },
+    "github-repository": {
+      "mediaVersion": 2,
+      "caption": "关联 GitHub，选择仓库与分支并确认绑定。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "确认 GitHub 已关联并查看仓库列表",
+          "dHash": "390c39089b0692169216801e801e9696943698b69896901e903e860e3c001c04"
+        },
+        {
+          "label": "选择仓库与目标分支",
+          "dHash": "390c39089b0692169216801e801e9296949e98c698c6909e905a860e3c001c08"
+        },
+        {
+          "label": "确认仓库已绑定到当前会话",
+          "dHash": "392c190a9ec0a440a548a5482548a747a72c27a8240384208403a4021d220d00"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开仓库关联面板",
+          "selector": "[data-product-feature=\"github-repository\"][aria-label=\"关联 GitHub 仓库\"]",
+          "expectedFeatureId": "github-repository",
+          "assertions": [
+            "visible:[data-product-feature=\"github-repository\"][aria-label=\"关联 GitHub 仓库\"]",
+            "feature:github-repository"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "关联 GitHub 仓库",
+          "matchedFeatureId": "github-repository",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "选择仓库",
+          "selector": "[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"aurora-workspace\")",
+          "expectedFeatureId": "github-repository",
+          "assertions": [
+            "visible:[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"aurora-workspace\")",
+            "feature:github-repository"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "openclaude-demo/aurora-workspace",
+          "matchedFeatureId": "github-repository",
+          "matchedControl": true,
+          "dialogTitle": "绑定 GitHub 仓库",
+          "activeTabs": []
+        },
+        {
+          "step": "选择目标分支",
+          "selector": "[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"feature/tutorial\")",
+          "expectedFeatureId": "github-repository",
+          "assertions": [
+            "visible:[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"feature/tutorial\")",
+            "feature:github-repository"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "feature/tutorial",
+          "matchedFeatureId": "github-repository",
+          "matchedControl": true,
+          "dialogTitle": "绑定 GitHub 仓库",
+          "activeTabs": []
+        },
+        {
+          "step": "确认绑定仓库与分支",
+          "selector": "[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"确认绑定\")",
+          "expectedFeatureId": "github-repository",
+          "assertions": [
+            "visible:[role=\"dialog\"][data-product-feature=\"github-repository\"] button:has-text(\"确认绑定\")",
+            "feature:github-repository"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "确认绑定",
+          "matchedFeatureId": "github-repository",
+          "matchedControl": true,
+          "dialogTitle": "绑定 GitHub 仓库",
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "仓库关联面板已打开",
+        "分支列表已加载",
+        "输入框下方已显示绑定仓库"
+      ],
+      "poster": {
+        "sha256": "a5ccb675e7fdac870b4d88aa2fb0004f6ba1aa9e9c533376cb5db7121c78a7f4",
+        "bytes": 26662
+      },
+      "video": {
+        "sha256": "f679aba61fd9e4b163267c7fd436fe033ee1be2dec30cdc0ff2267aee1e3af28",
+        "bytes": 71121
+      }
+    },
+    "agents": {
+      "mediaVersion": 3,
+      "caption": "打开智能体选择器，查看并切换已安装的专业助手。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看已安装的专业智能体",
+          "dHash": "390c190e8416821692369116951692a692c69096a18684a6989698160c063c00"
+        },
+        {
+          "label": "确认当前会话使用编程助手",
+          "dHash": "390c192a9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+        },
+        {
+          "label": "在智能体目录中核对当前角色与专业说明",
+          "dHash": "390c190e8416821692369116951692a692c69196a18685a6989698160c063c00"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开智能体选择器",
+          "selector": "header button[data-product-feature=\"agents\"]",
+          "expectedFeatureId": "agents",
+          "assertions": [
+            "visible:header button[data-product-feature=\"agents\"]",
+            "feature:agents"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "🔬科研助手",
+          "matchedFeatureId": "agents",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "切换到编程助手",
+          "selector": "[role=\"dialog\"] button[data-product-feature=\"agents\"]:has-text(\"编程助手\")",
+          "expectedFeatureId": "agents",
+          "assertions": [
+            "visible:[role=\"dialog\"] button[data-product-feature=\"agents\"]:has-text(\"编程助手\")",
+            "feature:agents"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "💻编程助手预设阅读仓库、实现功能并运行测试",
+          "matchedFeatureId": "agents",
+          "matchedControl": true,
+          "dialogTitle": "选择智能体",
+          "activeTabs": []
+        },
+        {
+          "step": "重新打开选择器核对当前智能体",
+          "selector": "header button[data-product-feature=\"agents\"]",
+          "expectedFeatureId": "agents",
+          "assertions": [
+            "visible:header button[data-product-feature=\"agents\"]",
+            "feature:agents"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "💻编程助手",
+          "matchedFeatureId": "agents",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": ["智能体选择器已打开", "顶栏已切换智能体"],
+      "poster": {
+        "sha256": "1e1fb498aeafc19c05d14d26487077f8c7e808acba41c0cba22f3e65354f2b5e",
+        "bytes": 22922
+      },
+      "video": {
+        "sha256": "f2443aa63e7a9005fab5ae3d0404712c77e19d80428072fc5a0afe1ec3f219ef",
+        "bytes": 107178
+      }
+    },
+    "team-mode": {
+      "mediaVersion": 3,
+      "caption": "在智能体选择器中开启团队模式并确认队长说明。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "启用团队模式并核对队长计费说明",
+          "dHash": "390c190e8416821692369116950692de92d69096a18684a6989698160c063c00"
+        },
+        {
+          "label": "在工作区顶栏确认团队模式与队长引擎已生效",
+          "dHash": "3d4c192e9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+        },
+        {
+          "label": "在工作区顶栏核对团队模式状态与关闭入口",
+          "dHash": "3d4c194a9b45a490a4d0a7402740a747a72c27a8240384208403a6021c820c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "启用团队模式",
+          "selector": "[role=\"dialog\"] [role=\"switch\"][data-product-feature=\"team-mode\"]",
+          "expectedFeatureId": "team-mode",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"switch\"][data-product-feature=\"team-mode\"]",
+            "feature:team-mode"
+          ],
+          "tag": "button",
+          "role": "switch",
+          "label": "启用团队模式",
+          "matchedFeatureId": "team-mode",
+          "matchedControl": true,
+          "dialogTitle": "选择智能体",
+          "activeTabs": []
+        },
+        {
+          "step": "打开团队模式状态说明",
+          "selector": "header button[data-product-feature=\"team-mode\"][aria-label=\"团队模式已开启\"]",
+          "expectedFeatureId": "team-mode",
+          "assertions": [
+            "visible:header button[data-product-feature=\"team-mode\"][aria-label=\"团队模式已开启\"]",
+            "feature:team-mode"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "团队模式已开启",
+          "matchedFeatureId": "team-mode",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "智能体选择器已打开",
+        "团队模式开关已启用",
+        "顶栏已常驻显示团队模式状态",
+        "团队模式状态与关闭入口已显示"
+      ],
+      "poster": {
+        "sha256": "c8003a6f919cd378fb7a19d289f7e8dbe1dd7e3bad02c87744924dd4e9f5b660",
+        "bytes": 28848
+      },
+      "video": {
+        "sha256": "d80644cc1b193837c917c7ccf71715ccb4c35833121a86bc6bb67f9ee07627f6",
+        "bytes": 109760
+      }
+    },
+    "memory-auto-dream": {
+      "mediaVersion": 3,
+      "caption": "进入记忆中心，查看长期记忆与 Auto-Dream 报告。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看长期记忆与项目背景",
+          "dHash": "190c89168016921696168a969216835683568896941692169896901610162c00"
+        },
+        {
+          "label": "展开查看本次自动复盘报告",
+          "dHash": "090e901690169416901698169616901696169616901692169016905e905e0806"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开 Auto-Dream 更新的记忆",
+          "selector": "[data-product-feature=\"memory-auto-dream\"] [aria-label=\"Auto-Dream 梦境报告\"] button",
+          "expectedFeatureId": "memory-auto-dream",
+          "assertions": [
+            "visible:[data-product-feature=\"memory-auto-dream\"] [aria-label=\"Auto-Dream 梦境报告\"] button",
+            "feature:memory-auto-dream"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "更新aurora-launchaurora-launch.md",
+          "matchedFeatureId": "memory-auto-dream",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["记忆"]
+        }
+      ],
+      "assertions": [
+        "管理中心已打开",
+        "长期记忆列表已加载",
+        "Auto-Dream 报告已加载"
+      ],
+      "poster": {
+        "sha256": "c8287c29dee5cf6c93f6c053172ea1fc3ad6f23a0ff98ef6ad1fb1f9fe1378f4",
+        "bytes": 12744
+      },
+      "video": {
+        "sha256": "33ed5b9687b03fea84f7eb3909607769bffc7bbff9872a044ad740d1668d890a",
+        "bytes": 69587
+      }
+    },
+    "schedules-reminders": {
+      "mediaVersion": 3,
+      "caption": "进入定时任务，查看下一次执行时间并打开新建表单。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看任务状态与下一次执行时间",
+          "dHash": "190c8916801696169216809e8c1e913690369c1693b690b6949690161c162c08"
+        },
+        {
+          "label": "打开新建表单配置计划与交付方式",
+          "dHash": "190c8916801696169216809e841693168c169816901694169096921616162c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到定时任务",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"定时任务\")",
+          "expectedFeatureId": "schedules-reminders",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"定时任务\")",
+            "feature:schedules-reminders"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "定时任务",
+          "matchedFeatureId": "schedules-reminders",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["记忆"]
+        },
+        {
+          "step": "打开新建定时任务表单",
+          "selector": "[data-product-feature=\"schedules-reminders\"] button:has-text(\"新建\")",
+          "expectedFeatureId": "schedules-reminders",
+          "assertions": [
+            "visible:[data-product-feature=\"schedules-reminders\"] button:has-text(\"新建\")",
+            "feature:schedules-reminders"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "新建",
+          "matchedFeatureId": "schedules-reminders",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["定时任务"]
+        }
+      ],
+      "assertions": ["管理中心已打开", "定时任务列表已加载"],
+      "poster": {
+        "sha256": "9e1698a3d67d87558a1b3e239636b868c74e707f2a239c6afbc11b5f570fac69",
+        "bytes": 13604
+      },
+      "video": {
+        "sha256": "bed5b04607ed8f1cfc247656c598cd01c3c56dfc4be6a440cff0d43fe0dc9d46",
+        "bytes": 61708
+      }
+    },
+    "skills-training": {
+      "mediaVersion": 3,
+      "caption": "打开技能详情，查看评测与训练优化入口。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看技能正文与版本信息",
+          "dHash": "190c89168016921696168016951690169816945698169016901690161c960c08"
+        },
+        {
+          "label": "查看评测结果和训练优化入口",
+          "dHash": "190c891680169216961680169516901698169456981690129412901610162c08"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到技能",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"技能\")",
+          "expectedFeatureId": "skills-training",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"技能\")",
+            "feature:skills-training"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "技能",
+          "matchedFeatureId": "skills-training",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["记忆"]
+        },
+        {
+          "step": "打开技能详情",
+          "selector": "[data-product-feature=\"skills-training\"] button:has-text(\"evidence-research\")",
+          "expectedFeatureId": "skills-training",
+          "assertions": [
+            "visible:[data-product-feature=\"skills-training\"] button:has-text(\"evidence-research\")",
+            "feature:skills-training"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "evidence-research检索一手资料并生成可回查引用。",
+          "matchedFeatureId": "skills-training",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["技能"]
+        },
+        {
+          "step": "打开评测与训练区",
+          "selector": "[data-product-feature=\"skills-training\"] button:has-text(\"评测\")",
+          "expectedFeatureId": "skills-training",
+          "assertions": [
+            "visible:[data-product-feature=\"skills-training\"] button:has-text(\"评测\")",
+            "feature:skills-training"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "评测",
+          "matchedFeatureId": "skills-training",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["技能"]
+        }
+      ],
+      "assertions": ["管理中心已打开", "技能列表已加载"],
+      "poster": {
+        "sha256": "178dd57b07372a24ca653bc67311d511f3d339c2169acefac3b4dfe4e12a7c98",
+        "bytes": 14658
+      },
+      "video": {
+        "sha256": "af1e986c8ce8ac110b9a74e3e7559c70601f497ab27a2f82b2e8479e054d6cb2",
+        "bytes": 54708
+      }
+    },
+    "connectors": {
+      "mediaVersion": 3,
+      "caption": "进入连接器管理，查看已绑定账号与账号绑定入口。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看已绑定的 Notion 产品知识库",
+          "dHash": "190c891680169116921694569856901690169056901690169016901610162c08"
+        },
+        {
+          "label": "查看可绑定账号与连接器状态",
+          "dHash": "19048d1e805e811e811e805e845e805e845e805e885e801e807e847e001e1c20"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到连接器",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"连接器\")",
+          "expectedFeatureId": "connectors",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"连接器\")",
+            "feature:connectors"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "连接器",
+          "matchedFeatureId": "connectors",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["记忆"]
+        },
+        {
+          "step": "查看连接器绑定入口",
+          "selector": "[data-product-feature=\"connectors\"] button:has-text(\"Notion\"), [data-product-feature=\"connectors\"] button:has-text(\"绑定\")",
+          "expectedFeatureId": "connectors",
+          "assertions": [
+            "visible:[data-product-feature=\"connectors\"] button:has-text(\"Notion\"), [data-product-feature=\"connectors\"] button:has-text(\"绑定\")",
+            "feature:connectors"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "绑定",
+          "matchedFeatureId": "connectors",
+          "matchedControl": true,
+          "dialogTitle": "管理中心",
+          "activeTabs": ["连接器"]
+        }
+      ],
+      "assertions": ["管理中心已打开", "已绑定连接器已加载"],
+      "poster": {
+        "sha256": "45d4dd879fdcfb433b61be7d5c78ff46e8b7622fcb29cdcdef47be3bbaeeab9a",
+        "bytes": 10416
+      },
+      "video": {
+        "sha256": "c11c3e211a37f9c54adcb61cfeff6ea20989b74ca555a7475bca253002f59a92",
+        "bytes": 69279
+      }
+    },
+    "marketplace-discovery": {
+      "mediaVersion": 2,
+      "caption": "在 AI 市场搜索“研究”，打开条目详情核对适用场景。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "搜索并比较匹配的市场能力",
+          "dHash": "390c090b060b320b210b200b300b080b210b640b210b240b2c0b280b24031c04"
+        },
+        {
+          "label": "核对详情、适用场景与版本",
+          "dHash": "2d1c015f085f041f031f085f091f085f0b1f601f0a1f2a8f06df03e705af0418"
+        }
+      ],
+      "actions": [
+        {
+          "step": "搜索研究类能力",
+          "selector": "[data-product-feature=\"marketplace-discovery\"] input[placeholder*=\"搜索\"]",
+          "expectedFeatureId": "marketplace-discovery",
+          "assertions": [
+            "visible:[data-product-feature=\"marketplace-discovery\"] input[placeholder*=\"搜索\"]",
+            "feature:marketplace-discovery"
+          ],
+          "tag": "input",
+          "role": null,
+          "label": "搜索技能（试试「翻译」「论文」「写作」）…",
+          "matchedFeatureId": "marketplace-discovery",
+          "matchedControl": true,
+          "dialogTitle": "AI 市场",
+          "activeTabs": ["发现"]
+        },
+        {
+          "step": "打开市场条目详情",
+          "selector": "[data-product-feature=\"marketplace-discovery\"] button:has-text(\"证据研究助手\"), [data-product-feature=\"marketplace-discovery\"] article:has-text(\"证据研究助手\")",
+          "expectedFeatureId": "marketplace-discovery",
+          "assertions": [
+            "visible:[data-product-feature=\"marketplace-discovery\"] button:has-text(\"证据研究助手\"), [data-product-feature=\"marketplace-discovery\"] article:has-text(\"证据研究助手\")",
+            "feature:marketplace-discovery"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "证据研究助手检索一手资料、交叉核对并生成带引用的研究结论。研究引用👍 42/44 30天 96 人在用实测 61%→92%",
+          "matchedFeatureId": "marketplace-discovery",
+          "matchedControl": true,
+          "dialogTitle": "AI 市场",
+          "activeTabs": ["发现"]
+        }
+      ],
+      "assertions": ["AI 市场已打开", "搜索结果已加载", "条目详情已打开"],
+      "poster": {
+        "sha256": "1eb3aa09f46471583ea2ba41c5008372b1a742a6561ce91c4fb9560bb61fba7c",
+        "bytes": 20558
+      },
+      "video": {
+        "sha256": "147d8c1790f4b68da74b58ba36bccb1ee280f5bc38b1d9f76d25a42066f2b1eb",
+        "bytes": 71229
+      }
+    },
+    "marketplace-publishing": {
+      "mediaVersion": 3,
+      "caption": "进入创作发布，填写技能定义并查看发布记录。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "进入公开市场的创作发布页",
+          "dHash": "390c090b060b200b200b200b200b200b090b328b309b094b200b010b0d830c40"
+        },
+        {
+          "label": "填写技能定义并核对发布记录",
+          "dHash": "390c090b060b200b300b200b200b080b324b309b2c8b000b210b090b0d830c84"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到发布",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"发布\")",
+          "expectedFeatureId": "marketplace-publishing",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"发布\")",
+            "feature:marketplace-publishing"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "发布",
+          "matchedFeatureId": "marketplace-publishing",
+          "matchedControl": true,
+          "dialogTitle": "AI 市场",
+          "activeTabs": ["发现"]
+        },
+        {
+          "step": "填写技能名称",
+          "selector": "[data-product-feature=\"marketplace-publishing\"] input",
+          "expectedFeatureId": "marketplace-publishing",
+          "assertions": [
+            "visible:[data-product-feature=\"marketplace-publishing\"] input",
+            "feature:marketplace-publishing"
+          ],
+          "tag": "input",
+          "role": null,
+          "label": "例：学术翻译",
+          "matchedFeatureId": "marketplace-publishing",
+          "matchedControl": true,
+          "dialogTitle": "AI 市场",
+          "activeTabs": ["发布"]
+        }
+      ],
+      "assertions": ["发布面板已打开"],
+      "poster": {
+        "sha256": "decbfc47ad1d142abec8c8e8e290d83210c0ed52e4a9e12dd6574d20fac2d7e5",
+        "bytes": 16690
+      },
+      "video": {
+        "sha256": "ae8bfefe3044429f48229303a6bbf8b2aa2c456d33c6d20b582d2b4694c91402",
+        "bytes": 59004
+      }
+    },
+    "inbox": {
+      "mediaVersion": 2,
+      "caption": "打开站内信，筛选未读并展开一条服务通知。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看全部服务通知",
+          "dHash": "20062006a400a400a622a64225c1a510a48626862501a440a400a40024002400"
+        },
+        {
+          "label": "筛选未读并展开通知详情",
+          "dHash": "20062006a400a402a402a4822511a4c1a54024562686a501a440a40024002400"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开站内信",
+          "selector": "header button[data-product-feature=\"inbox\"][aria-label=\"站内信\"]",
+          "expectedFeatureId": "inbox",
+          "assertions": [
+            "visible:header button[data-product-feature=\"inbox\"][aria-label=\"站内信\"]",
+            "feature:inbox"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "站内信",
+          "matchedFeatureId": "inbox",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "筛选未读消息",
+          "selector": "[role=\"dialog\"] [role=\"tab\"][data-product-feature=\"inbox\"]:has-text(\"未读\")",
+          "expectedFeatureId": "inbox",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"][data-product-feature=\"inbox\"]:has-text(\"未读\")",
+            "feature:inbox"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "未读",
+          "matchedFeatureId": "inbox",
+          "matchedControl": true,
+          "dialogTitle": "站内信",
+          "activeTabs": ["全部"]
+        },
+        {
+          "step": "展开一条未读通知",
+          "selector": "[role=\"dialog\"] [data-product-feature=\"inbox\"] button:has-text(\"定时任务已完成\")",
+          "expectedFeatureId": "inbox",
+          "assertions": [
+            "visible:[role=\"dialog\"] [data-product-feature=\"inbox\"] button:has-text(\"定时任务已完成\")",
+            "feature:inbox"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "定时任务已完成刚刚“每日行业摘要”已运行完成，研究结论已送达到对应会话。公告",
+          "matchedFeatureId": "inbox",
+          "matchedControl": true,
+          "dialogTitle": "站内信",
+          "activeTabs": ["未读"]
+        }
+      ],
+      "assertions": ["站内信已打开"],
+      "poster": {
+        "sha256": "2ebd5f4eb13fdfc0fae1db39a83bd63b59e86966e4c104185a424d17ebaaacee",
+        "bytes": 12954
+      },
+      "video": {
+        "sha256": "f5ab574b6274ba87cc14063e1024431cf97cfbdb9350cb81375c984d25a484b6",
+        "bytes": 53460
+      }
+    },
+    "preferences": {
+      "mediaVersion": 3,
+      "caption": "进入偏好设置，查看默认模型与 Auto-Dream，并切换主题。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看外观、默认模型与 Auto-Dream",
+          "dHash": "190c89168816925690169116917693769176901680368036803690161c062c08"
+        },
+        {
+          "label": "切换主题并确认界面即时生效",
+          "dHash": "c6c3d6c714060d861d86101698ee08ce48cf9417900e180e58165815c3a6e300"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到偏好",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"偏好\")",
+          "expectedFeatureId": "preferences",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"偏好\")",
+            "feature:preferences"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "偏好",
+          "matchedFeatureId": "preferences",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["账户与计费", "30 天"]
+        },
+        {
+          "step": "切换深色主题",
+          "selector": "[data-product-feature=\"preferences\"] button:has-text(\"深色\")",
+          "expectedFeatureId": "preferences",
+          "assertions": [
+            "visible:[data-product-feature=\"preferences\"] button:has-text(\"深色\")",
+            "feature:preferences"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "深色",
+          "matchedFeatureId": "preferences",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["偏好"]
+        }
+      ],
+      "assertions": ["偏好页已加载", "深色主题已生效"],
+      "poster": {
+        "sha256": "e6c656843854d8b12c293e51dfc4d7a3b8f7d9fbf3beb4a449dd275303f4a36b",
+        "bytes": 10582
+      },
+      "video": {
+        "sha256": "3dd34cc02475a91e19bae20f78236a03a42f5ad4dd2a070e2817cd428baa5ced",
+        "bytes": 58563
+      }
+    },
+    "billing-usage": {
+      "mediaVersion": 2,
+      "caption": "打开账户与用量，查看余额、趋势和模型消耗。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看当前套餐与可用积分",
+          "dHash": "190c89168816925692169116801690169416801e901690169216841610162c08"
+        },
+        {
+          "label": "查看趋势、模型消耗与缓存命中",
+          "dHash": "190c891688169256921691669066919681969196819691b6959691961c562c80"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开账户与计费",
+          "selector": "aside button[data-product-feature=\"billing-usage\"][aria-label=\"设置\"]",
+          "expectedFeatureId": "billing-usage",
+          "assertions": [
+            "visible:aside button[data-product-feature=\"billing-usage\"][aria-label=\"设置\"]",
+            "feature:billing-usage"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "设置",
+          "matchedFeatureId": "billing-usage",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "切换到用量",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"用量\")",
+          "expectedFeatureId": "billing-usage",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"用量\")",
+            "feature:billing-usage"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "用量",
+          "matchedFeatureId": "billing-usage",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["账户与计费", "30 天"]
+        }
+      ],
+      "assertions": ["套餐与余额已加载", "用量趋势图已加载"],
+      "poster": {
+        "sha256": "c991db1ef6b36684c3ea2ff07192befb6130ca09f87b31fb510203c90d5fec90",
+        "bytes": 12414
+      },
+      "video": {
+        "sha256": "8c038dc5a37321fdef75cac7506f5b9d7bafef133877722eaf656f282dd65751",
+        "bytes": 62145
+      }
+    },
+    "organization": {
+      "mediaVersion": 3,
+      "caption": "进入组织中心，查看成员、共享额度与用量报表。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "查看组织成员数与共享额度",
+          "dHash": "190c89168416985694569116841694169016801694b684d69706901618860c08"
+        },
+        {
+          "label": "查看组织用量趋势与模型分布",
+          "dHash": "190c891684169856945699169816931681969196859691b6901693160b2e2c88"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到报表",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"报表\")",
+          "expectedFeatureId": "organization",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"报表\")",
+            "feature:organization"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "报表",
+          "matchedFeatureId": "organization",
+          "matchedControl": true,
+          "dialogTitle": "示例研发组",
+          "activeTabs": ["概览"]
+        }
+      ],
+      "assertions": ["组织中心已打开", "组织概览已加载", "组织用量图表已加载"],
+      "poster": {
+        "sha256": "9241534ee560eea92ccaf51632ef71b2af262a0d1b5af7568bb417e07ebc141b",
+        "bytes": 11516
+      },
+      "video": {
+        "sha256": "68e5f32d10be34535d886ded6a8367b207fd7a73c25e2793260b96e9d69d3ac9",
+        "bytes": 58506
+      }
+    },
+    "feedback-support": {
+      "mediaVersion": 2,
+      "caption": "选择反馈类型，填写复现步骤并看到提交准备状态。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+        },
+        {
+          "label": "选择反馈类型并阅读隐私说明",
+          "dHash": "190c89168816925696169956999686968056841680169516951698161c162c08"
+        },
+        {
+          "label": "填写可复现描述并准备提交",
+          "dHash": "190c89168816925696169956999686968056841682969476942690161c062c08"
+        }
+      ],
+      "actions": [
+        {
+          "step": "切换到反馈",
+          "selector": "[role=\"dialog\"] [role=\"tab\"]:has-text(\"反馈\")",
+          "expectedFeatureId": "feedback-support",
+          "assertions": [
+            "visible:[role=\"dialog\"] [role=\"tab\"]:has-text(\"反馈\")",
+            "feature:feedback-support"
+          ],
+          "tag": "button",
+          "role": "tab",
+          "label": "反馈",
+          "matchedFeatureId": "feedback-support",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["账户与计费", "30 天"]
+        },
+        {
+          "step": "选择体验问题",
+          "selector": "[data-product-feature=\"feedback-support\"] select",
+          "expectedFeatureId": "feedback-support",
+          "assertions": [
+            "visible:[data-product-feature=\"feedback-support\"] select",
+            "feature:feedback-support"
+          ],
+          "tag": "select",
+          "role": null,
+          "label": "反馈类型",
+          "matchedFeatureId": "feedback-support",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["反馈"]
+        },
+        {
+          "step": "填写复现步骤与期望结果",
+          "selector": "[data-product-feature=\"feedback-support\"] textarea",
+          "expectedFeatureId": "feedback-support",
+          "assertions": [
+            "visible:[data-product-feature=\"feedback-support\"] textarea",
+            "feature:feedback-support"
+          ],
+          "tag": "textarea",
+          "role": null,
+          "label": "请描述发生了什么、你原本期待怎样，以及必要的复现步骤。\n\n请勿填写密码、密钥等敏感信息。",
+          "matchedFeatureId": "feedback-support",
+          "matchedControl": true,
+          "dialogTitle": "设置",
+          "activeTabs": ["反馈"]
+        }
+      ],
+      "assertions": ["反馈表单已打开"],
+      "poster": {
+        "sha256": "9dcc13731b53554948ac5eea31474f99b1602781302acb92eee93e0302e259b6",
+        "bytes": 16526
+      },
+      "video": {
+        "sha256": "178bc912265a874917a38e11146c6a8ab0eeb4c325d31625b046a293e2b1bd82",
+        "bytes": 57981
+      }
+    }
+  }
+}

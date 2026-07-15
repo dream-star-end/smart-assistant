@@ -51,18 +51,36 @@ npm run tutorials:accept -- --retire <稳定-id> --note "说明下线原因与�
 
 ## 媒体更新
 
-`npm run tutorials:media` 从 `tutorial-capture.html` 的确定性舞台生成 9 组本地媒体。舞台复用
-生产 Sidebar、ChatHeader、Composer、AgentPicker、RepoPill、Tabs 等组件，不读取生产账号或网络数据，
-也不进入线上构建入口。生成后：
+`npm run tutorials:media` 会先构建正常的 production `index.html → main.tsx → App`，再由无痕
+Chromium 自动操作真实 v5 界面，为 23 个稳定能力 ID 各生成一组独立 WebP + VP8 WebM。禁止
+`page.setContent`、替换 React root、隐藏产品 DOM，仓库也不保留教程专用伪 UI/构建入口。
+
+录制使用全新的浏览器上下文，不读取真实账号、Cookie、浏览器 profile、环境密钥或生产数据。
+只有 HTTP、WebSocket、麦克风等浏览器能力边界可使用显式脱敏 fixture；静态文件之外的未知本地
+请求失败，所有外网请求均被阻断并执行自检。产品区先按 `960×500` 截取，独立合成 `40 px`
+说明栏为 `960×540` 成片，感知哈希只计算产品区，避免说明文字掩盖重复画面。
+共享的“工作区已就绪”只保留在来源证明中，成片从每章自己的首个操作画面开始，不占用视频时长。
+
+生成器同时写入 `tutorial-capture-provenance.json`，记录受控 Chromium / Playwright / ffmpeg /
+字体版本及哈希、每章阶段感知哈希、真实 selector 动作轨迹、命中的能力祖先、结果断言与媒体哈希。
+首次建立或工具链变化时，人工核对后显式运行：
+
+```bash
+npm run tutorials:media -- --accept-toolchain
+```
+
+生成后：
 
 1. 人工播放并核对相关截图/视频；
 2. 提高 `TUTORIAL_MEDIA.<key>.version`；
 3. 运行 `npm run check:tutorials`；
 4. 用普通 `tutorials:accept` 接受。
 
-门禁会核验本地路径、WebP/WebM 文件头、VP8、`960×540`、`2–12 s` 时长、单组和总大小预算、
-能力注册表（标题、分类、别名、CTA、权限）、正文、真实入口与媒体哈希及版本同步。线上教程视频
-不自动播放，失败时回退到同一组 WebP 海报，并尊重浏览器的减少动态效果设置。
+门禁会核验 23 个能力与 23 组媒体严格一一对应、本地路径、WebP/WebM 文件头、VP8、
+`960×540`、`2–12 s` 时长、单组和总大小预算、媒体字节不重复、产品区感知哈希不过近、阶段/
+动作轨迹不重复、provenance 与文件哈希一致、真实 App 入口和网络边界声明，以及能力注册表
+（标题、分类、别名、CTA、权限）、正文、真实入口与媒体哈希及版本同步。线上教程视频不自动播放，
+失败时回退到同章 WebP 海报，并尊重浏览器的减少动态效果设置。
 
 ## CI
 
