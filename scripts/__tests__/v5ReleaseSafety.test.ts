@@ -14,6 +14,7 @@ const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
+const commercialIndex = path.join(root, 'packages/commercial/src/index.ts')
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -92,6 +93,26 @@ describe('v5 release safety lanes', () => {
     assert.equal(egress.status, 0, egress.stderr || egress.stdout)
     assert.doesNotMatch(normal.stdout, /checks=.*svc_egress/)
     assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,svc_egress,http_egress/)
+  })
+
+  test('production smoke allowlist covers every explicitly v5-owned leader scheduler', async () => {
+    const [deploySource, indexSource] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(commercialIndex, 'utf8'),
+    ])
+    const smokeBody = deploySource.match(/smoke\(\) \{([\s\S]*?)\n\}\n\n# ─+ bootstrap/)?.[1] ?? ''
+    const allowed = new Set(
+      [...smokeBody.matchAll(/allowed="([^"]*)"/g)]
+        .flatMap((match) => match[1].split(/\s+/))
+        .filter((name) => name !== '' && name !== '$allowed'),
+    )
+    const v5Owned = [...indexSource.matchAll(
+      /name:\s*"([^"]+)",\s*\n\s*domain:\s*"v5-owned"/g,
+    )].map((match) => match[1])
+
+    assert.ok(v5Owned.includes('imageUsageSweep'))
+    assert.ok(v5Owned.includes('githubWorkspaceSweeper'))
+    assert.deepEqual(v5Owned.filter((name) => !allowed.has(name)), [])
   })
 
   test('maintenance lifecycle uses one cleanup trap and locked schema+nonce clear', async () => {
