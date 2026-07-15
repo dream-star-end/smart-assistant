@@ -285,6 +285,49 @@ describe('PUT 防复活', () => {
   })
 })
 
+describe('browser chat projection (SQLite compatibility)', () => {
+  it('exact keeps raw runtime payload while chat returns only sanitized patch/checkpoint', async () => {
+    await upsertClientSession({
+      id: 'web-chat-projection', userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: [], updatedAt: 1,
+    }, 0)
+    const raw = [
+      {
+        id: 'raw-hidden', role: 'runtime-event', text: 'large raw', ts: 1, _seq: 1,
+        _source: 'server',
+        _runtimeEvent: { type: 'stream_event', private: 'x'.repeat(4096) },
+      },
+      {
+        id: 'raw-tail', role: 'runtime-event', text: 'tail raw', ts: 2, _seq: 2,
+        _source: 'server',
+        _runtimeEvent: {
+          type: 'system', subtype: 'bash_output_tail', tool_use_id: 'tool-1',
+          tail: 'done', total_bytes: 4, truncated_head: false,
+        },
+      },
+    ]
+    const db = await getSessionsDb()
+    db.prepare(
+      'UPDATE client_sessions SET messages=?, message_count=?, next_seq=? WHERE id=? AND user_id=?',
+    ).run(JSON.stringify(raw), raw.length, 3, 'web-chat-projection', USER)
+
+    const exact = await getClientSession('web-chat-projection', USER)
+    assert.equal((exact!.messages[0] as Msg)._runtimeEvent !== undefined, true)
+    const chat = await getClientSession('web-chat-projection', USER, { projection: 'chat' })
+    const chatMessages = chat!.messages as Msg[]
+    assert.equal(chatMessages.some((message) => message._runtimeEvent !== undefined), false)
+    assert.deepEqual(chatMessages.map((message) =>
+      (message._historyProjection as { kind: string }).kind), ['checkpoint', 'bash-tail'])
+
+    const partial = await getClientSessionPartial(
+      'web-chat-projection', USER, 1, { projection: 'chat' },
+    )
+    assert.equal(partial!.isPartial, true)
+    assert.equal(partial!.maxSeq, 2)
+    assert.equal((partial!.messages[0] as Msg)._historyProjection !== undefined, true)
+  })
+})
+
 describe('appendServerAuthoredMessage — 归档幂等 + spill', () => {
   it('append 已归档 id → already_exists', async () => {
     const session = {

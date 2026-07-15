@@ -118,6 +118,7 @@ export type ChatMessage = {
     | "goal"
     | "permission"
     | "delegate-progress"
+    | "runtime-event"
     | "system";
   /** 文本内容（user 输入 / assistant 文本 / thinking 文本 / tool 名 / goal objective / plan 摘要…）。*/
   text: string;
@@ -143,6 +144,19 @@ export type ChatMessage = {
    * this from the immutable lossless tape; local fallback m-* output rows are
    * tagged while streaming so final sync can replace only the right turn. */
   _clientMessageId?: string;
+  /** Sanitized server history control row. Raw runtime events never enter the
+   * browser chat projection; these rows are hidden and persist only cursor or
+   * bounded Bash-tail update semantics. */
+  _historyProjection?:
+    | { kind: "checkpoint" }
+    | {
+        kind: "bash-tail";
+        toolUseId: string;
+        parentToolUseId?: string;
+        tail: string;
+        totalBytes: number;
+        truncatedHead: boolean;
+      };
 
   // ── user ──
   status?: UserMsgStatus;

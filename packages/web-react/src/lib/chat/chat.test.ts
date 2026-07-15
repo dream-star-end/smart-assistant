@@ -2079,6 +2079,46 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("stored sanitized history tail patch reapplies during IndexedDB hydration", () => {
+    const sock = makeSocket();
+    sock.loadStored({
+      id: "s-history-patch",
+      agentId: "main",
+      title: "history",
+      messages: [
+        {
+          id: "srv-tool",
+          role: "tool",
+          text: "Bash",
+          ts: 1,
+          blockId: "tool-bg",
+        },
+        {
+          id: "projection-tail:runtime",
+          role: "runtime-event",
+          text: "",
+          ts: 2,
+          _seq: 9,
+          _historyProjection: {
+            kind: "bash-tail",
+            toolUseId: "tool-bg",
+            tail: "restored tail",
+            totalBytes: 42,
+            truncatedHead: false,
+          },
+        },
+      ],
+      createdAt: 1,
+      lastAt: 2,
+      _maxSeq: 9,
+    });
+    expect(sock.sessions.get("s-history-patch")!.messages[0]!.bashTail).toEqual({
+      tail: "restored tail",
+      totalBytes: 42,
+      truncatedHead: false,
+    });
+  });
+
   test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();

@@ -53,6 +53,7 @@ import {
   type ClientSession,
   type ClientSessionMeta,
   type ClientSessionPartial,
+  type ClientSessionReadOptions,
   type ClientSessionsBackend,
   type DelegatePendingRow,
   type DrainDelegateCostResult,
@@ -65,6 +66,7 @@ import {
   planCostPatch,
   planDelegateCostMerge,
   planSpillOverflow,
+  projectClientSessionMessagesForChat,
   type ReadArchivedMessagesResult,
   type ServerAuthoredAppendResult,
   type SpillChunkPlan,
@@ -531,6 +533,7 @@ type HydratedTapeRow = {
   tape_sha256: string;
   msg_id: string;
   ordinal: number;
+  role: string;
   content_sha256: string;
   payload: Buffer;
   cost_credits: string;
@@ -606,6 +609,7 @@ async function hydrateTurnTapeMessages(
   sessionId: string,
   userId: string,
   messages: MessageLike[],
+  options: ClientSessionReadOptions = {},
 ): Promise<MessageLike[]> {
   const refs = messages.filter(
     (m) =>
@@ -615,10 +619,30 @@ async function hydrateTurnTapeMessages(
   );
   if (refs.length === 0) return messages;
   const tapeIds = [...new Set(refs.map((m) => m._turnTapeId as string))];
-  const rows = (
-    await pool.query<HydratedTapeRow>(
+  const exact = options.projection !== "chat";
+  const counts = exact
+    ? new Map<string, { count: number; tapeSha256: string }>()
+    : new Map(
+        (
+          await pool.query<{ tape_id: string; tape_sha256: string; record_count: string }>(
+            `SELECT r.tape_id, t.tape_sha256, COUNT(*)::text AS record_count
+               FROM client_session_turn_tape_records r
+               JOIN client_session_turn_tapes t
+                 ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+              WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+              GROUP BY r.tape_id, t.tape_sha256`,
+            [sessionId, userId, tapeIds],
+          )
+        ).rows.map((row) => [
+          row.tape_id,
+          { count: Number(row.record_count), tapeSha256: row.tape_sha256 },
+        ]),
+      );
+  const exactRows = exact
+    ? (
+        await pool.query<HydratedTapeRow>(
       `SELECT r.tape_id, t.tape_sha256, r.msg_id, r.ordinal,
-              r.content_sha256, r.payload,
+              r.role, r.content_sha256, r.payload,
               COALESCE((
                 SELECT SUM(exact_cost.cost_credits)::text
                   FROM (
@@ -666,8 +690,101 @@ async function hydrateTurnTapeMessages(
         WHERE r.session_id = $1 AND r.user_id = $2 AND r.tape_id = ANY($3::text[])
         ORDER BY r.tape_id, r.ordinal`,
       [sessionId, userId, tapeIds],
-    )
-  ).rows;
+        )
+      ).rows
+    : [];
+  const chatVisibleRows = !exact
+    ? (
+        await pool.query<HydratedTapeRow>(
+          `SELECT r.tape_id, t.tape_sha256, r.msg_id, r.ordinal,
+                  r.role, r.content_sha256, r.payload,
+                  COALESCE((
+                    SELECT SUM(exact_cost.cost_credits)::text
+                      FROM (
+                        SELECT c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                        UNION ALL
+                        SELECT p.cost_credits::numeric AS cost_credits
+                          FROM pending_usage_patches p
+                         WHERE p.user_id=r.user_id
+                           AND r.msg_id=t.billing_anchor_id
+                           AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                      ) exact_cost
+                  ), '0') AS cost_credits,
+                  COALESCE((
+                    SELECT jsonb_agg(
+                             jsonb_build_object(
+                               'agentId', grouped.delegate_agent_id,
+                               'costCredits', grouped.cost_credits
+                             ) ORDER BY grouped.delegate_agent_id
+                           )
+                      FROM (
+                        SELECT exact_delegate.delegate_agent_id,
+                               SUM(exact_delegate.cost_credits)::text AS cost_credits
+                          FROM (
+                            SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                              FROM turn_tape_cost_components c
+                             WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                            UNION ALL
+                            SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                              FROM pending_usage_patches p
+                             WHERE p.user_id=r.user_id
+                               AND r.msg_id=t.billing_anchor_id
+                               AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                          ) exact_delegate
+                         WHERE exact_delegate.delegate_agent_id IS NOT NULL
+                         GROUP BY exact_delegate.delegate_agent_id
+                      ) grouped
+                  ), '[]'::jsonb) AS delegate_costs
+             FROM client_session_turn_tape_records r
+             JOIN client_session_turn_tapes t
+               ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+            WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+              AND r.role <> 'runtime-event'
+            ORDER BY r.tape_id, r.ordinal`,
+          [sessionId, userId, tapeIds],
+        )
+      ).rows
+    : [];
+  const chatTailRows = !exact
+    ? (
+        await pool.query<HydratedTapeRow>(
+          `WITH parsed AS (
+             SELECT r.*, t.tape_sha256, t.created_at AS tape_created_at,
+                    convert_from(r.payload, 'UTF8')::jsonb AS body
+               FROM client_session_turn_tape_records r
+               JOIN client_session_turn_tapes t
+                 ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+              WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+                AND r.role='runtime-event'
+           ), ranked AS (
+             SELECT parsed.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY body #>> '{_runtimeEvent,parent_tool_use_id}',
+                                   body #>> '{_runtimeEvent,tool_use_id}'
+                      ORDER BY
+                        CASE WHEN jsonb_typeof(body #> '{_runtimeEvent,total_bytes}')='number'
+                             THEN (body #>> '{_runtimeEvent,total_bytes}')::numeric ELSE 0 END DESC,
+                        ts DESC, tape_created_at DESC, ordinal DESC, tape_id DESC, msg_id DESC
+                    ) AS winner
+               FROM parsed
+              WHERE body #>> '{_runtimeEvent,type}'='system'
+                AND body #>> '{_runtimeEvent,subtype}'='bash_output_tail'
+                AND COALESCE(body #>> '{_runtimeEvent,tool_use_id}', '') <> ''
+           )
+           SELECT tape_id, tape_sha256, msg_id, ordinal, role,
+                  content_sha256, payload, '0'::text AS cost_credits,
+                  '[]'::jsonb AS delegate_costs
+             FROM ranked WHERE winner=1
+            ORDER BY tape_created_at, ordinal, tape_id, msg_id`,
+          [sessionId, userId, tapeIds],
+        )
+      ).rows
+    : [];
+  const rows = exact ? exactRows : [...chatVisibleRows, ...chatTailRows];
   const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
   const byTape = new Map<string, HydratedTapeRow[]>();
   for (const row of rows) {
@@ -685,20 +802,34 @@ async function hydrateTurnTapeMessages(
     }
     if (anchor._turnTapeComplete === true) {
       const tapeRows = byTape.get(anchor._turnTapeId);
-      if (!tapeRows || tapeRows.length === 0) {
+      if (exact && (!tapeRows || tapeRows.length === 0)) {
         throw new Error(`[pgSessions] lossless turn tape records missing: ${anchor._turnTapeId}`);
       }
       const expectedCount = anchor._turnTapeRecordCount;
+      const projectedMeta = counts.get(anchor._turnTapeId);
+      const actualCount = exact ? tapeRows?.length : projectedMeta?.count;
       if (
         typeof expectedCount !== "number" ||
         !Number.isSafeInteger(expectedCount) ||
         expectedCount <= 0 ||
-        tapeRows.length !== expectedCount
+        actualCount !== expectedCount
       ) {
         throw new Error(`[pgSessions] lossless turn tape record count mismatch: ${anchor._turnTapeId}`);
       }
-      if (tapeRows.some((row) => row.tape_sha256 !== anchor._turnTapeSha256)) {
+      if (tapeRows?.some((row) => row.tape_sha256 !== anchor._turnTapeSha256)) {
         throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
+      }
+      if (!exact && projectedMeta?.tapeSha256 !== anchor._turnTapeSha256) {
+        throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
+      }
+      if (!tapeRows || tapeRows.length === 0) {
+        return [{
+          ...anchor,
+          id: `projection-source:${anchor._turnTapeId}`,
+          role: "runtime-event",
+          text: "",
+          _turnTapeExpanded: true,
+        }];
       }
       return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false));
     }
@@ -710,6 +841,9 @@ async function hydrateTurnTapeMessages(
     }
     const key = `${anchor._turnTapeId}\0${anchor._turnTapeMsgId}`;
     const row = byKey.get(key);
+    if (!row && !exact) {
+      return [{ ...anchor, role: "runtime-event", text: "", _turnTapeExpanded: true }];
+    }
     if (!row) throw new Error(`[pgSessions] lossless turn tape record missing: ${key}`);
     return [hydrateTapeRecord(row, anchor, true)];
   });
@@ -738,34 +872,36 @@ async function hydrateTurnTapeMessages(
     }
     indexChildTools(message.childBlocks);
   }
-  for (const message of hydrated) {
-    if (message.role !== "runtime-event") continue;
-    const runtime = message._runtimeEvent;
-    if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) continue;
-    const raw = runtime as Record<string, unknown>;
-    if (raw.type !== "system" || raw.subtype !== "bash_output_tail") continue;
-    const toolUseId = raw.tool_use_id;
-    if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
-    const target = typeof raw.parent_tool_use_id === "string" && raw.parent_tool_use_id.length > 0
-      ? childTools.get(toolUseId)
-      : topLevelTools.get(toolUseId) ?? childTools.get(toolUseId);
-    if (!target) continue;
-    const totalBytes = typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
-      ? raw.total_bytes
-      : 0;
-    const previous = target.bashTail;
-    const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
-      typeof (previous as Record<string, unknown>).totalBytes === "number"
-      ? (previous as Record<string, unknown>).totalBytes as number
-      : 0;
-    if (totalBytes < previousBytes) continue;
-    target.bashTail = {
-      tail: typeof raw.tail === "string" ? raw.tail : "",
-      totalBytes,
-      truncatedHead: raw.truncated_head === true,
-    };
+  if (exact) {
+    for (const message of hydrated) {
+      if (message.role !== "runtime-event") continue;
+      const runtime = message._runtimeEvent;
+      if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) continue;
+      const raw = runtime as Record<string, unknown>;
+      if (raw.type !== "system" || raw.subtype !== "bash_output_tail") continue;
+      const toolUseId = raw.tool_use_id;
+      if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
+      const target = typeof raw.parent_tool_use_id === "string" && raw.parent_tool_use_id.length > 0
+        ? childTools.get(toolUseId)
+        : topLevelTools.get(toolUseId) ?? childTools.get(toolUseId);
+      if (!target) continue;
+      const totalBytes = typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
+        ? raw.total_bytes
+        : 0;
+      const previous = target.bashTail;
+      const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
+        typeof (previous as Record<string, unknown>).totalBytes === "number"
+        ? (previous as Record<string, unknown>).totalBytes as number
+        : 0;
+      if (totalBytes < previousBytes) continue;
+      target.bashTail = {
+        tail: typeof raw.tail === "string" ? raw.tail : "",
+        totalBytes,
+        truncatedHead: raw.truncated_head === true,
+      };
+    }
   }
-  return hydrated;
+  return exact ? hydrated : projectClientSessionMessagesForChat(hydrated);
 }
 
 /**
@@ -2084,7 +2220,11 @@ export function createPgSessionsBackend(
       }));
     },
 
-    async getClientSession(id: string, userId?: string): Promise<ClientSession | null> {
+    async getClientSession(
+      id: string,
+      userId?: string,
+      options: ClientSessionReadOptions = {},
+    ): Promise<ClientSession | null> {
       const sql = userId
         ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
         : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
@@ -2105,7 +2245,7 @@ export function createPgSessionsBackend(
       ).rows[0];
       if (!row) return null;
       const parsedMessages = JSON.parse(row.messages) as MessageLike[];
-      const messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages);
+      const messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
       return {
         id: row.id,
         userId: row.user_id,
@@ -2121,7 +2261,12 @@ export function createPgSessionsBackend(
       };
     },
 
-    async getClientSessionPartial(id: string, userId: string, sinceSeq: number): Promise<ClientSessionPartial | null> {
+    async getClientSessionPartial(
+      id: string,
+      userId: string,
+      sinceSeq: number,
+      options: ClientSessionReadOptions = {},
+    ): Promise<ClientSessionPartial | null> {
       const row = (
         await pool.query<{
           id: string;
@@ -2167,7 +2312,7 @@ export function createPgSessionsBackend(
         messages = allMsgs;
         isPartial = false;
       }
-      messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages);
+      messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages, options);
       return {
         id: row.id,
         userId: row.user_id,
@@ -2186,7 +2331,13 @@ export function createPgSessionsBackend(
       };
     },
 
-    async readArchivedMessages(sessId: string, userId: string, beforeSeq = 0, limit = 100): Promise<ReadArchivedMessagesResult> {
+    async readArchivedMessages(
+      sessId: string,
+      userId: string,
+      beforeSeq = 0,
+      limit = 100,
+      options: ClientSessionReadOptions = {},
+    ): Promise<ReadArchivedMessagesResult> {
       const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) ? limit : 100)));
       const row = (
         await pool.query<{ archived_through_seq: number | null }>(
@@ -2227,7 +2378,7 @@ export function createPgSessionsBackend(
       const hasMore = messagePool.length > cappedLimit;
       const page = messagePool.slice(Math.max(0, messagePool.length - cappedLimit));
       const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null;
-      const hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page);
+      const hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page, options);
       return { messages: hydrated, hasMore, oldestSeq };
     },
 

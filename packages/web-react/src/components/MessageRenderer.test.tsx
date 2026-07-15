@@ -691,6 +691,17 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.queryByRole("button", { name: /加载更多历史/ })).toBeNull();
   });
 
+  test("sanitized history projection rows are hidden even if a future role becomes renderable", () => {
+    const projection = mk("system", {
+      id: "projection-checkpoint:tape-1",
+      text: "绝不能展示的 checkpoint",
+      _historyProjection: { kind: "checkpoint" },
+    });
+    renderList([mk("assistant", { id: "answer", text: "正常答复" }), projection]);
+    expect(screen.getByText("正常答复")).toBeInTheDocument();
+    expect(screen.queryByText("绝不能展示的 checkpoint")).toBeNull();
+  });
+
   test("本地翻尽 + 有归档未拉 → 云端加载按钮,还有 M 条(§5 文案)", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(

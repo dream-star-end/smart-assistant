@@ -837,13 +837,19 @@ describe("pgSessionsBackend lossless turn tape", () => {
         ts: 1_783_944_000_001,
         arrivedAt: 1_783_944_000_001,
       }],
+      runtimeEvents: [{
+        ordinal: 1,
+        observedAt: 1_783_944_000_002,
+        source: "ccb",
+        payload: { type: "stream_event", hidden_blob: "x".repeat(64 * 1024) },
+      }],
     });
     for (const part of original.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
     assert.deepEqual(
       await backend.finalizeLosslessTurnTape(userId, original.finalize),
-      { applied: "finalized", recordCount: 2, engineBillings: [] },
+      { applied: "finalized", recordCount: 3, engineBillings: [] },
     );
 
     const continuation = buildTape({
@@ -880,12 +886,48 @@ describe("pgSessionsBackend lossless turn tape", () => {
       totalBytes: rawTail.total_bytes,
       truncatedHead: false,
     });
-    const runtime = messages.find((message) => message.role === "runtime-event");
+    const runtime = messages.find((message) =>
+      message.role === "runtime-event" &&
+      (message._runtimeEvent as { subtype?: string } | undefined)?.subtype === "bash_output_tail");
     assert.ok(runtime, "continuation raw event remains reload-visible, not only reduced into bashTail");
     assert.deepEqual(runtime._runtimeEvent, rawTail);
     assert.equal(runtime._continuationOfTurnKey, originalTurnKey);
     assert.equal(messages.filter((message) => message.role === "assistant").length, 1,
       "runtime continuation must not invent or duplicate a visible assistant reply");
+
+    const chat = await backend.getClientSession(sessionId, userId, { projection: "chat" });
+    assert.ok(chat);
+    const chatMessages = chat.messages as MessageLike[];
+    assert.equal(chatMessages.some((message) => message._runtimeEvent !== undefined), false,
+      "browser projection must not expose exact raw runtime payloads");
+    assert.equal(chatMessages.filter((message) => message.role === "assistant").length, 1);
+    assert.equal(chatMessages.filter((message) => message.role === "tool").length, 1);
+    const patch = chatMessages.find(
+      (message) => (message._historyProjection as { kind?: string } | undefined)?.kind === "bash-tail",
+    );
+    assert.ok(patch);
+    assert.deepEqual(patch._historyProjection, {
+      kind: "bash-tail",
+      toolUseId: "tool-bg",
+      tail: rawTail.tail,
+      totalBytes: rawTail.total_bytes,
+      truncatedHead: false,
+    });
+
+    const originalSeq = Math.min(...chatMessages.flatMap((message) =>
+      typeof message._seq === "number" ? [message._seq] : []));
+    const incremental = await backend.getClientSessionPartial(
+      sessionId,
+      userId,
+      originalSeq,
+      { projection: "chat" },
+    );
+    assert.ok(incremental?.isPartial);
+    assert.equal((incremental.messages as MessageLike[]).some((message) => message.role === "tool"), false,
+      "tail-only incremental does not refetch the owning tape");
+    assert.equal((incremental.messages as MessageLike[]).some(
+      (message) => (message._historyProjection as { kind?: string } | undefined)?.kind === "bash-tail",
+    ), true);
   });
 });
 

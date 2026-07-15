@@ -217,6 +217,94 @@ describe("persist — 历史合并纯函数", () => {
     expect(applyServerIncremental(local, [])).toBe(local);
   });
 
+  test("tail-only incremental projection updates an older local tool and stays idempotent", () => {
+    const local: ChatMessage[] = [{
+      id: "srv-tool",
+      role: "tool",
+      text: "Bash",
+      ts: 1,
+      blockId: "tool-bg",
+      bashTail: { tail: "old", totalBytes: 10, truncatedHead: false },
+    }];
+    const patch: ChatMessage = {
+      id: "projection-tail:srv-runtime",
+      role: "runtime-event",
+      text: "",
+      ts: 2,
+      _seq: 8,
+      _source: "server",
+      _historyProjection: {
+        kind: "bash-tail",
+        toolUseId: "tool-bg",
+        tail: "new tail",
+        totalBytes: 20,
+        truncatedHead: true,
+      },
+    };
+    const once = applyServerIncremental(local, [patch]);
+    expect(once.find((m) => m.id === "srv-tool")?.bashTail).toEqual({
+      tail: "new tail", totalBytes: 20, truncatedHead: true,
+    });
+    const twice = applyServerIncremental(once, [patch]);
+    expect(twice.filter((m) => m.id === patch.id)).toHaveLength(1);
+    expect(twice.find((m) => m.id === "srv-tool")?.bashTail?.totalBytes).toBe(20);
+  });
+
+  test("history projection updates a recursively nested child tool; lower byte snapshots cannot regress it", () => {
+    const group = {
+      id: "group",
+      role: "agent-group",
+      text: "team",
+      ts: 1,
+      childBlocks: [{
+        kind: "tool_use",
+        blockId: "outer",
+        childBlocks: [{
+          kind: "tool_use",
+          blockId: "child-bg",
+          bashTail: { tail: "newer", totalBytes: 30, truncatedHead: false },
+        }],
+      }],
+    } as unknown as ChatMessage;
+    const patch: ChatMessage = {
+      id: "projection-tail:child",
+      role: "runtime-event",
+      text: "",
+      ts: 2,
+      _historyProjection: {
+        kind: "bash-tail",
+        toolUseId: "child-bg",
+        parentToolUseId: "outer",
+        tail: "stale",
+        totalBytes: 20,
+        truncatedHead: false,
+      },
+    };
+    const merged = mergeFullServerWins([group, patch], []);
+    const nested = (merged[0]!.childBlocks![0] as unknown as { childBlocks: Array<{ bashTail: unknown }> })
+      .childBlocks[0]!;
+    expect(nested.bashTail).toEqual({ tail: "newer", totalBytes: 30, truncatedHead: false });
+  });
+
+  test("incremental exact completion evidence removes only that turn's local fallback", () => {
+    const local: ChatMessage[] = [
+      { id: "m-a1", role: "assistant", text: "fallback", ts: 1, _clientMessageId: "m-user-1" },
+      { id: "m-a2", role: "assistant", text: "queued", ts: 2, _clientMessageId: "m-user-2" },
+    ];
+    const incoming: ChatMessage[] = [{
+      id: "srv-a1",
+      role: "assistant",
+      text: "canonical",
+      ts: 1,
+      _source: "server",
+      _clientMessageId: "m-user-1",
+    }];
+    const merged = applyServerIncremental(local, incoming, "m-user-1");
+    expect(merged.some((m) => m.id === "m-a1")).toBe(false);
+    expect(merged.some((m) => m.id === "srv-a1")).toBe(true);
+    expect(merged.some((m) => m.id === "m-a2")).toBe(true);
+  });
+
   test("mergeFullServerWins: stripped server team rows do not wipe rich local agent cards", () => {
     const localGroup: ChatMessage = {
       id: "g1",

@@ -171,6 +171,58 @@ export function dbNameForUser(userId: string | null | undefined): string {
   return `ocv5_sessions__${safe}`;
 }
 
+function historyProjectionChildTool(
+  blocks: unknown,
+  toolUseId: string,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(blocks)) return undefined;
+  for (const raw of blocks) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const block = raw as Record<string, unknown>;
+    if (block.kind === "tool_use" && block.blockId === toolUseId) return block;
+    const nested = historyProjectionChildTool(block.childBlocks, toolUseId);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+/** Apply sanitized history patches while retaining the hidden patch rows as
+ * durable sequence checkpoints. Mutates the owning tool exactly like the live
+ * reducer and returns the original array reference. */
+export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMessage[] {
+  const topLevelTools = new Map<string, ChatMessage>();
+  for (const message of messages) {
+    if (message.role === "tool" && message.blockId) topLevelTools.set(message.blockId, message);
+  }
+  for (const message of messages) {
+    const patch = message._historyProjection;
+    if (patch?.kind !== "bash-tail" || !patch.toolUseId) continue;
+    const child = (() => {
+      for (const candidate of messages) {
+        const found = historyProjectionChildTool(candidate.childBlocks, patch.toolUseId);
+        if (found) return found;
+      }
+      return undefined;
+    })();
+    const target: Record<string, unknown> | undefined = patch.parentToolUseId
+      ? child
+      : topLevelTools.get(patch.toolUseId) ?? child;
+    if (!target) continue;
+    const previous = target.bashTail;
+    const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
+      typeof (previous as Record<string, unknown>).totalBytes === "number"
+      ? (previous as Record<string, unknown>).totalBytes as number
+      : 0;
+    if (patch.totalBytes < previousBytes) continue;
+    target.bashTail = {
+      tail: patch.tail,
+      totalBytes: patch.totalBytes,
+      truncatedHead: patch.truncatedHead,
+    };
+  }
+  return messages;
+}
+
 /**
  * full（server canonical 整带）合并：server 为权威在前，保留两类 local-only 消息：
  *  ① **末尾连续的乐观尾消息**（用户刚发出、server 尚未持久化的那一截：从尾部回溯到第一条
@@ -261,9 +313,11 @@ export function mergeFullServerWins(
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m))),
     );
-  if (!tail.length && !preservedMid.length) return serverChanged ? serverMerged : server;
+  if (!tail.length && !preservedMid.length) {
+    return applyHistoryProjectionPatches(serverChanged ? serverMerged : server);
+  }
   // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
-  return stableSortByTs([...serverMerged, ...preservedMid, ...tail]);
+  return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...preservedMid, ...tail]));
 }
 
 /**
@@ -275,8 +329,27 @@ export function mergeFullServerWins(
 export function applyServerIncremental(
   local: ChatMessage[],
   incoming: ChatMessage[],
+  completedClientMessageId?: string,
 ): ChatMessage[] {
   if (!incoming.length) return local;
+  if (
+    completedClientMessageId &&
+    incoming.some(
+      (m) =>
+        isServerAuthoredRow(m) &&
+        m._clientMessageId === completedClientMessageId &&
+        (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
+    )
+  ) {
+    local = local.filter(
+      (m) =>
+        !(
+          m.id?.startsWith("m-") &&
+          m._clientMessageId === completedClientMessageId &&
+          (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
+        ),
+    );
+  }
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
   if (!incoming.length) return local;
@@ -286,7 +359,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return stableSortByTs(merged);
+  return applyHistoryProjectionPatches(stableSortByTs(merged));
 }
 
 /**
@@ -301,7 +374,7 @@ export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage
   for (const m of local) if (m?.id) existing.add(m.id);
   const add = archived.filter((m) => m?.id && !existing.has(m.id));
   if (!add.length) return local;
-  return stableSortByTs([...add, ...local]);
+  return applyHistoryProjectionPatches(stableSortByTs([...add, ...local]));
 }
 
 /** `_seq ≤ 归档水位` = server 已把该行搬进归档 chunk,full 同步只回热尾巴时不再带回它。 */
