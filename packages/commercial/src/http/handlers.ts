@@ -99,6 +99,7 @@ import {
   readInboxAssetForViewer,
 } from "../inbox/assets.js";
 import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
+import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -106,6 +107,8 @@ export interface CommercialHttpDeps {
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */
   containerPreviewAvailable?: () => boolean;
+  /** Optional native iframe transport; legacy screencast remains the fallback. */
+  directContainerPreview?: DirectContainerPreviewService;
   mailer: Mailer;
   redis: RateLimitRedis;
   turnstileSecret?: string;

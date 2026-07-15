@@ -446,6 +446,10 @@ import {
 } from "./ws/containerPreviewBridge.js";
 import { ContainerPreviewTicketStore } from "./ws/containerPreviewTickets.js";
 import {
+  createDirectContainerPreviewService,
+  type DirectContainerPreviewService,
+} from "./ws/directContainerPreview.js";
+import {
   DEFAULT_V3_CCB_BASELINE_DIR,
   resolveCcbBaselineMounts,
   makePrewarmContainer,
@@ -979,6 +983,8 @@ export async function registerCommercial(
      * (见 ws/frontendBuild.ts)。v3 / 测试不传 → 功能整体 inert。
      */
     webDistDir?: string;
+    /** 当前 gateway 实际监听端口;Quick Tunnel 必须回源到本 slot,不能固定指向 A。 */
+    gatewayPort?: number;
   } = {},
 ): Promise<RegisterCommercialResult> {
   void app;
@@ -2923,14 +2929,49 @@ export async function registerCommercial(
   // "孤儿检测"用途(不需魔法 120s),provisioning 态是孤儿的**有界自愈等待**(≤15s 后转
   // missing → stopAndRemove + 重建自愈,不引入慢愈退化)。见 v3supervisor
   // getV3ContainerStatus / v3ensureRunning 2a-bis 的语义注释。
-  const sharedEnsureRunning: ResolveContainerEndpoint | undefined =
-    v3Deps ? makeUidSingleflight(makeV3EnsureRunning(v3Deps)) : undefined;
-
-  const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined = sharedEnsureRunning
-    ? async (uid) => {
-        await sharedEnsureRunning(uid);
-      }
+  const clearResolvedEndpointSecret = (
+    endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
+  ): void => {
+    try { endpoint.tunnel?.nodeAgent.psk?.fill(0); } catch { /* best-effort secret cleanup */ }
+  };
+  const cloneResolvedEndpoint = (
+    endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
+  ): Awaited<ReturnType<ResolveContainerEndpoint>> => ({
+    ...endpoint,
+    ...(endpoint.tunnel
+      ? {
+          tunnel: {
+            ...endpoint.tunnel,
+            nodeAgent: {
+              ...endpoint.tunnel.nodeAgent,
+              psk: endpoint.tunnel.nodeAgent.psk
+                ? Buffer.from(endpoint.tunnel.nodeAgent.psk)
+                : null,
+            },
+          },
+        }
+      : {}),
+  });
+  const sharedEnsureRunning: ResolveContainerEndpoint | undefined = v3Deps
+    ? makeUidSingleflight(makeV3EnsureRunning(v3Deps), {
+        // A provision singleflight may fan out to chat, legacy preview and
+        // native preview at once. Give every consumer its own mutable PSK
+        // buffer so one transport's mandatory fill(0) cannot break another.
+        cloneResult: cloneResolvedEndpoint,
+        disposeSharedResult: clearResolvedEndpointSecret,
+      })
     : undefined;
+
+  const ensureContainerEndpointReady: ((uid: bigint) => Promise<void>) | undefined =
+    sharedEnsureRunning
+      ? async (uid) => {
+          const endpoint = await sharedEnsureRunning(uid);
+          clearResolvedEndpointSecret(endpoint);
+        }
+      : undefined;
+
+  const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
+    ensureContainerEndpointReady;
 
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
   // 覆盖 docker run 冷启,首条消息命中 running)。
@@ -3005,6 +3046,16 @@ export async function registerCommercial(
     }
   };
 
+  // One endpoint resolver is shared by chat, legacy screencast and direct
+  // iframe transports. Keep it above HTTP handler assembly so the optional
+  // direct service can own public preview-host requests from the first byte.
+  const resolveContainerEndpoint: ResolveContainerEndpoint =
+    options.resolveContainerEndpoint
+    ?? sharedEnsureRunning
+    ?? (async (_uid: bigint) => {
+      throw new ContainerUnreadyError(5, "supervisor_not_wired");
+    });
+
   // V5 container-local web preview is intentionally atomic: the HTTP ticket
   // endpoint stays unavailable until the authenticated public WS bridge has
   // been assembled below. Model authority provides the existing Ed25519 trust
@@ -3019,11 +3070,38 @@ export async function registerCommercial(
       ? new ContainerPreviewTicketStore()
       : undefined;
   let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined;
+  let directContainerPreview: DirectContainerPreviewService | undefined;
+  if (
+    process.env.OC_CONTAINER_DIRECT_PREVIEW_ENABLED === "1"
+    && containerPreviewTickets
+    && modelAuthoritySigner
+    && containerPreviewBaseUrl
+  ) {
+    try {
+      directContainerPreview = createDirectContainerPreviewService({
+        signer: modelAuthoritySigner,
+        resolveContainerEndpoint,
+        parentOrigin: containerPreviewBaseUrl,
+        tunnelOrigin: `http://127.0.0.1:${options.gatewayPort}`,
+        cloudflaredBinary: process.env.OC_CONTAINER_PREVIEW_CLOUDFLARED_BIN,
+        maxSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
+        warmTunnels: Number(process.env.OC_CONTAINER_PREVIEW_WARM_TUNNELS || 2),
+        logger: rootLogger.child({ subsys: "commercial", module: "directContainerPreview" }),
+      });
+      // eslint-disable-next-line no-console
+      console.log("[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)");
+    } catch (err) {
+      rootLogger.error("[commercial] native iframe preview disabled", {
+        error: (err as Error)?.message ?? String(err),
+      });
+    }
+  }
 
   const handler = createCommercialHandler({
     jwtSecret,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
+    directContainerPreview,
     mailer,
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
@@ -3192,15 +3270,6 @@ export async function registerCommercial(
       },
     });
   }
-
-  // v1.0.191:复用 sharedEnsureRunning(与 /api/media-signed ensureContainerReady
-  // 共享同一 per-uid singleflight,避免 reload 同瞬间 WS+HTTP 各自 DB INSERT race)。
-  const resolveContainerEndpoint: ResolveContainerEndpoint =
-    options.resolveContainerEndpoint
-    ?? sharedEnsureRunning
-    ?? (async (_uid: bigint) => {
-      throw new ContainerUnreadyError(5, "supervisor_not_wired");
-    });
 
   if (
     containerPreviewTickets
@@ -4725,9 +4794,18 @@ export async function registerCommercial(
   }
 
   return {
-    handle: handler,
+    handle: async (req, res) => {
+      // A Quick Tunnel reaches the same listener with a trycloudflare Host.
+      // Claim those requests before the ordinary commercial router so an
+      // invalid/expired preview can never fall through to the main SPA/API.
+      if (directContainerPreview && (await directContainerPreview.handleHttp(req, res))) {
+        return true;
+      }
+      return await handler(req, res);
+    },
     runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
+      if (directContainerPreview?.handleUpgrade(req, socket, head)) return true;
       // Preview uses its own short-lived one-time ticket and must never fall
       // through to the ordinary cookie/JWT bridges.
       if (containerPreviewBridge?.handleUpgrade(req, socket, head)) return true;
@@ -4755,6 +4833,9 @@ export async function registerCommercial(
       }
       const previewBridge = containerPreviewBridge;
       containerPreviewBridge = undefined;
+      const directPreview = directContainerPreview;
+      directContainerPreview = undefined;
+      try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
@@ -4859,10 +4940,10 @@ export async function registerCommercial(
     // **结构化返回**:不把 ContainerUnreadyError 穿过 gateway 边界(后者零编译期
     // 依赖 commercial,见 server.ts 头部注释),把已知冷启动 "未就绪" 拍平成
     // 普通对象;其他 error(DB / docker daemon 抖)继续 throw 让 gateway 兜底 500。
-    ensureContainerReady: sharedEnsureRunning
+    ensureContainerReady: ensureContainerEndpointReady
       ? async (uid) => {
           try {
-            await sharedEnsureRunning(uid);
+            await ensureContainerEndpointReady(uid);
             return { ok: true as const };
           } catch (err) {
             if (err instanceof ContainerUnreadyError) {

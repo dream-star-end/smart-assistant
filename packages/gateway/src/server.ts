@@ -2564,6 +2564,24 @@ export class Gateway {
       return
     }
 
+    // V5 direct webpage preview: only the commercial master can reach this
+    // signed internal path. It must run before commercial/gateway routing so
+    // the user app can never collide with a platform API path.
+    try {
+      if (this._containerPreview.handleHttp(req, res)) return
+    } catch (err) {
+      this.log.error('containerPreview.handleHttp threw', undefined, err)
+      if (!res.headersSent) {
+        res.statusCode = 500
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-store')
+        res.end('preview proxy error')
+      } else if (!res.writableEnded) {
+        try { res.destroy() } catch {}
+      }
+      return
+    }
+
     // V3 2H: 商业化模块优先 — 其 router 自管 auth + 输入校验 + status code,
     // 返 true 即"已处理",gateway 不再走自家 /api/auth/login 等路径。
     // 必须在 security headers 之前,否则 commercial 自己设置的 CSP/headers 会被覆盖。

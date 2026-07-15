@@ -23,20 +23,56 @@
  */
 export function makeUidSingleflight<R>(
   underlying: (uid: bigint) => Promise<R>,
+  options: {
+    cloneResult?: (value: R) => R
+    disposeSharedResult?: (value: R) => void
+  } = {},
 ): (uid: bigint) => Promise<R> {
-  const inflight = new Map<string, Promise<R>>()
+  interface Entry {
+    readonly promise: Promise<R>
+    waiters: number
+    settled: boolean
+    hasValue: boolean
+    value?: R
+  }
+
+  const inflight = new Map<string, Entry>()
   return (uid: bigint): Promise<R> => {
     const key = String(uid)
-    const existing = inflight.get(key)
-    if (existing) return existing
-    const p = underlying(uid)
-    inflight.set(key, p)
-    // settle 后清除(成功或失败),让下次重试重新触发。
-    // identity check(`inflight.get(key) === p`):理论上 settle 与 set 都是单线程串行
-    // microtask,新 Promise 不会在 settle 前就 set 进同 key,但保险起见只删自己。
-    p.finally(() => {
-      if (inflight.get(key) === p) inflight.delete(key)
-    }).catch(() => {})
-    return p
+    let entry = inflight.get(key)
+    if (!entry) {
+      entry = {
+        promise: underlying(uid),
+        waiters: 0,
+        settled: false,
+        hasValue: false,
+      }
+      inflight.set(key, entry)
+      void entry.promise.then(
+        (value) => {
+          entry!.value = value
+          entry!.hasValue = true
+          entry!.settled = true
+          disposeIfUnused(key, entry!)
+        },
+        () => {
+          entry!.settled = true
+          disposeIfUnused(key, entry!)
+        },
+      )
+    }
+    entry.waiters++
+    return entry.promise
+      .then((value) => (options.cloneResult ? options.cloneResult(value) : value))
+      .finally(() => {
+        entry!.waiters--
+        disposeIfUnused(key, entry!)
+      })
+  }
+
+  function disposeIfUnused(key: string, entry: Entry): void {
+    if (!entry.settled || entry.waiters !== 0 || inflight.get(key) !== entry) return
+    inflight.delete(key)
+    if (entry.hasValue) options.disposeSharedResult?.(entry.value as R)
   }
 }

@@ -212,7 +212,11 @@ import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.j
 import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import { handleClientErrorReport } from './clientErrors.js'
-import { handleCreateContainerPreviewTicket } from './containerPreview.js'
+import {
+  handleCreateContainerPreviewTicket,
+  handleHeartbeatContainerPreview,
+  handleRevokeContainerPreview,
+} from './containerPreview.js'
 import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
 import { containerFileProxy } from './containerFileProxy.js'
 import {
@@ -695,6 +699,8 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
     { method: 'POST', path: '/api/agent/cancel', handler: handleAgentCancel },
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
+    { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
+    { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
     // ── Skill marketplace (B2) — browser-only user/admin routes ──
     // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
     // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that

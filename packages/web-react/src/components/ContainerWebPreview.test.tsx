@@ -3,8 +3,8 @@ import type { ContainerPreviewClientMessage } from '@openclaude/protocol/contain
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
-import type { AuthSession } from '../lib/types'
 import { createMemoryAuthSession } from '../lib/authSession'
+import type { AuthSession } from '../lib/types'
 
 type Target = {
   selector: string
@@ -17,6 +17,8 @@ type Target = {
 
 const previewMock = vi.hoisted(() => ({
   phase: 'ready',
+  transport: 'legacy' as 'legacy' | 'direct',
+  directUrl: null as string | null,
   error: null as null | { message: string; retryable: boolean },
   ready: {
     url: 'http://localhost:3000/',
@@ -36,6 +38,7 @@ const previewMock = vi.hoisted(() => ({
     pageRevision: number
   },
   send: vi.fn<(message: ContainerPreviewClientMessage) => boolean>(() => true),
+  useLegacyFallback: vi.fn(),
   calls: [] as Array<{
     viewport: { isMobile: boolean; width: number; height: number }
     reconnectKey: number
@@ -50,12 +53,15 @@ vi.mock('../hooks/useContainerPreview', () => ({
     previewMock.calls.push(input)
     return {
       phase: previewMock.phase,
+      transport: previewMock.transport,
+      directUrl: previewMock.directUrl,
       error: previewMock.error,
       ready: previewMock.ready ? { ...previewMock.ready, viewport: input.viewport } : null,
       selection: previewMock.selection,
       resolved: previewMock.resolved,
       navigation: previewMock.navigation,
       send: previewMock.send,
+      useLegacyFallback: previewMock.useLegacyFallback,
     }
   },
 }))
@@ -118,6 +124,8 @@ afterEach(cleanup)
 
 beforeEach(() => {
   previewMock.phase = 'ready'
+  previewMock.transport = 'legacy'
+  previewMock.directUrl = null
   previewMock.error = null
   previewMock.ready = { url: 'http://localhost:3000/', title: 'Demo app' }
   previewMock.selection = null
@@ -129,10 +137,39 @@ beforeEach(() => {
     pageRevision: 1,
   }
   previewMock.send.mockClear()
+  previewMock.useLegacyFallback.mockClear()
   previewMock.calls.length = 0
 })
 
 describe('ContainerWebPreview immersive UI', () => {
+  test('renders the isolated native iframe and exposes an explicit compatibility fallback', () => {
+    previewMock.transport = 'direct'
+    previewMock.directUrl =
+      'https://alpha-preview.trycloudflare.com/__oc_preview_bootstrap?ticket=secret'
+    const OriginalResizeObserver = globalThis.ResizeObserver
+    globalThis.ResizeObserver = class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    }
+    try {
+      render(<PreviewHarness />)
+      const frame = screen.getByTitle('容器内网页原生预览')
+      expect(frame).toHaveAttribute('src', previewMock.directUrl)
+      expect(frame).toHaveAttribute(
+        'sandbox',
+        'allow-scripts allow-forms allow-same-origin allow-modals allow-popups',
+      )
+      expect(screen.queryByLabelText('可交互网页画面')).not.toBeInTheDocument()
+      expect(screen.getByText('原生清晰预览')).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '切换兼容预览' }))
+      expect(previewMock.useLegacyFallback).toHaveBeenCalledTimes(1)
+    } finally {
+      globalThis.ResizeObserver = OriginalResizeObserver
+    }
+  })
+
   test('starts with compact remote controls and switches to the real mobile viewport', () => {
     render(<PreviewHarness />)
 

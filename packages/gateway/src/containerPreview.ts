@@ -7,9 +7,9 @@
  */
 
 import { existsSync } from 'node:fs'
-import type { IncomingMessage } from 'node:http'
-import { get as httpGet } from 'node:http'
-import { get as httpsGet } from 'node:https'
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
+import { get as httpGet, request as httpRequest } from 'node:http'
+import { get as httpsGet, request as httpsRequest } from 'node:https'
 import { createRequire } from 'node:module'
 import { isIPv4 } from 'node:net'
 import type { Duplex } from 'node:stream'
@@ -17,9 +17,14 @@ import type { Duplex } from 'node:stream'
 import {
   CONTAINER_PREVIEW_ASSERTION_HEADER,
   CONTAINER_PREVIEW_BINARY_HEADER_BYTES,
+  CONTAINER_PREVIEW_DIRECT_BRIDGE_PATH,
+  CONTAINER_PREVIEW_DIRECT_COOKIE,
+  CONTAINER_PREVIEW_DIRECT_PROXY_PATH,
   CONTAINER_PREVIEW_INTERNAL_WS_PATH,
   CONTAINER_PREVIEW_MAX_BINARY_FRAME_BYTES,
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
+  CONTAINER_PREVIEW_TARGET_HEADER,
+  CONTAINER_PREVIEW_VIEWPORT_HEADER,
   type ContainerPreviewClientMessage,
   type ContainerPreviewElementTarget,
   type ContainerPreviewOpenMessage,
@@ -51,6 +56,11 @@ const PROBE_SNIFF_BYTES = 64 * 1024
 const MOTION_FRAME_INTERVAL_MS = 84
 const SETTLED_SCREENSHOT_MS = 190
 const CLEANUP_TIMEOUT_MS = 2_000
+const DIRECT_MAX_HTML_BYTES = 4 * 1024 * 1024
+const DIRECT_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+const DIRECT_CONNECT_TIMEOUT_MS = 5_000
+const DIRECT_IDLE_TIMEOUT_MS = 60_000
+const DIRECT_ASSERTION_CACHE_CAP = 4_096
 
 export interface ContainerPreviewLog {
   info(message: string, fields?: Record<string, unknown>): void
@@ -281,8 +291,57 @@ export class ContainerPreviewHandler {
     this.cleanupTimeoutMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS
   }
 
+  /** Authenticated master-only direct HTTP proxy into the signed loopback target. */
+  handleHttp(req: IncomingMessage, res: ServerResponse): boolean {
+    if (safePathname(req.url) !== CONTAINER_PREVIEW_DIRECT_PROXY_PATH) return false
+    if (this.shuttingDown || this.env.OC_CONTAINER_PREVIEW_ENABLED?.trim() !== '1') {
+      sendDirectText(res, 503, 'preview unavailable')
+      return true
+    }
+    let target: AcceptedDirectPreviewTarget
+    try {
+      target = this.authorizeDirect(req)
+    } catch (err) {
+      this.log.warn('container_preview.direct_auth_rejected', {
+        reason: err instanceof Error ? err.message : String(err),
+      })
+      sendDirectText(res, 401, 'unauthorized')
+      return true
+    }
+    void proxyDirectHttp(req, res, target.url, this.log).catch((err) => {
+      this.log.warn('container_preview.direct_http_failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      })
+      if (!res.headersSent) sendDirectText(res, 502, 'preview upstream unavailable')
+      else if (!res.writableEnded) {
+        try {
+          res.destroy()
+        } catch {}
+      }
+    })
+    return true
+  }
+
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
     const pathname = safePathname(req.url)
+    if (pathname === CONTAINER_PREVIEW_DIRECT_PROXY_PATH) {
+      if (this.shuttingDown || this.env.OC_CONTAINER_PREVIEW_ENABLED?.trim() !== '1') {
+        rejectUpgrade(socket, 503, 'preview unavailable')
+        return true
+      }
+      let target: AcceptedDirectPreviewTarget
+      try {
+        target = this.authorizeDirect(req)
+      } catch (err) {
+        this.log.warn('container_preview.direct_ws_auth_rejected', {
+          reason: err instanceof Error ? err.message : String(err),
+        })
+        rejectUpgrade(socket, 401, 'unauthorized')
+        return true
+      }
+      proxyDirectUpgrade(req, socket, head, target.url, this.log)
+      return true
+    }
     if (pathname !== CONTAINER_PREVIEW_INTERNAL_WS_PATH) return false
     if (this.shuttingDown || this.env.OC_CONTAINER_PREVIEW_ENABLED?.trim() !== '1') {
       rejectUpgrade(socket, 503, 'preview unavailable')
@@ -362,12 +421,36 @@ export class ContainerPreviewHandler {
     const assertion = verifyContainerPreviewUpgrade(req, this.env, this.now())
     this.pruneConsumed(this.now())
     if (this.consumedAssertions.has(assertion.sessionId)) throw new Error('assertion replayed')
-    if (this.consumedAssertions.size >= 256) {
+    if (this.consumedAssertions.size >= DIRECT_ASSERTION_CACHE_CAP) {
       throw new Error('assertion replay cache at capacity')
     }
     // JS event-loop check+set is atomic; insert before any asynchronous work.
     this.consumedAssertions.set(assertion.sessionId, assertion.expiresAt)
     return assertion
+  }
+
+  private authorizeDirect(req: IncomingMessage): AcceptedDirectPreviewTarget {
+    const assertion = this.authorize(req)
+    const rawTarget = singleHeader(req.headers[CONTAINER_PREVIEW_TARGET_HEADER])
+    const rawViewport = singleHeader(req.headers[CONTAINER_PREVIEW_VIEWPORT_HEADER])
+    if (!rawTarget || rawTarget.length > 2_048 || !rawViewport || rawViewport.length > 256) {
+      throw new Error('direct preview target missing')
+    }
+    let viewportValue: unknown
+    try {
+      viewportValue = JSON.parse(rawViewport)
+    } catch {
+      throw new Error('direct preview viewport invalid')
+    }
+    if (!isRecord(viewportValue)) throw new Error('direct preview viewport invalid')
+    const target = normalizeContainerPreviewUrl(rawTarget)
+    const viewport = normalizeContainerPreviewViewport(
+      viewportValue as Partial<ContainerPreviewViewport>,
+    )
+    if (containerPreviewTargetHash(target.url, viewport) !== assertion.targetHash) {
+      throw new Error('direct preview target hash mismatch')
+    }
+    return { url: target.url, viewport, assertion }
   }
 
   private pruneConsumed(now: number): void {
@@ -377,6 +460,349 @@ export class ContainerPreviewHandler {
     // Never evict a still-valid ID: doing so would turn the memory bound into
     // a replay window. authorize() rejects new assertions at the hard cap.
   }
+}
+
+interface AcceptedDirectPreviewTarget {
+  url: string
+  viewport: ContainerPreviewViewport
+  assertion: AcceptedContainerPreviewAssertion
+}
+
+const DIRECT_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+const DIRECT_INTERNAL_HEADERS = new Set([
+  CONTAINER_PREVIEW_ASSERTION_HEADER,
+  CONTAINER_PREVIEW_TARGET_HEADER,
+  CONTAINER_PREVIEW_VIEWPORT_HEADER,
+  'authorization',
+  'proxy-authorization',
+  'x-oc-v5-secret',
+])
+
+function directTargetHeaders(
+  incoming: IncomingHttpHeaders,
+  target: URL,
+  websocket: boolean,
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {}
+  for (const [name, value] of Object.entries(incoming)) {
+    const lower = name.toLowerCase()
+    if (value === undefined || DIRECT_INTERNAL_HEADERS.has(lower)) continue
+    if (lower.startsWith('x-openclaude-') || lower.startsWith('x-oc-')) continue
+    if (DIRECT_HOP_BY_HOP_HEADERS.has(lower) && !websocket) continue
+    if (lower === 'host' || lower === 'origin' || lower === 'referer') continue
+    if (lower === 'cookie') {
+      const sanitized = stripReservedPreviewCookie(Array.isArray(value) ? value.join('; ') : value)
+      if (sanitized) out.cookie = sanitized
+      continue
+    }
+    if (Array.isArray(value)) {
+      const safe = value.filter((entry) => !/[\r\n]/.test(entry))
+      if (safe.length > 0) out[name] = safe
+    } else if (!/[\r\n]/.test(value)) {
+      out[name] = value
+    }
+  }
+  out.host = target.host
+  out['accept-encoding'] = 'identity'
+  if (incoming.origin) out.origin = target.origin
+  if (incoming.referer) out.referer = `${target.origin}/`
+  if (websocket) {
+    out.connection = 'Upgrade'
+    out.upgrade = 'websocket'
+  }
+  return out
+}
+
+function stripReservedPreviewCookie(raw: string): string {
+  return raw
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part && part.split('=', 1)[0] !== CONTAINER_PREVIEW_DIRECT_COOKIE)
+    .join('; ')
+}
+
+function directResponseHeaders(
+  incoming: IncomingHttpHeaders,
+  injectedLength?: number,
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {}
+  for (const [name, value] of Object.entries(incoming)) {
+    if (value === undefined) continue
+    const lower = name.toLowerCase()
+    if (DIRECT_HOP_BY_HOP_HEADERS.has(lower)) continue
+    if (lower.startsWith('x-openclaude-') || lower.startsWith('x-oc-')) continue
+    if (
+      injectedLength !== undefined &&
+      ['content-length', 'content-encoding', 'etag', 'content-md5', 'digest'].includes(lower)
+    ) {
+      continue
+    }
+    out[name] = value
+  }
+  if (injectedLength !== undefined) out['content-length'] = String(injectedLength)
+  return out
+}
+
+async function proxyDirectHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  canonicalTarget: string,
+  log: ContainerPreviewLog,
+): Promise<void> {
+  const target = new URL(canonicalTarget)
+  const contentLength = Number.parseInt(singleHeader(req.headers['content-length']) ?? '0', 10)
+  if (Number.isFinite(contentLength) && contentLength > DIRECT_MAX_REQUEST_BYTES) {
+    sendDirectText(res, 413, 'request too large')
+    return
+  }
+  const requestImpl = target.protocol === 'https:' ? httpsRequest : httpRequest
+  await new Promise<void>((resolve) => {
+    let settled = false
+    let requestBytes = 0
+    let requestTooLarge = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    const upstream = requestImpl({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || undefined,
+      method: req.method ?? 'GET',
+      path: target.pathname + target.search,
+      headers: directTargetHeaders(req.headers, target, false),
+      family: target.hostname === '::1' ? 6 : 4,
+      rejectUnauthorized: false,
+      timeout: DIRECT_CONNECT_TIMEOUT_MS,
+    })
+    let responseStream: IncomingMessage | null = null
+    res.once('close', () => {
+      upstream.destroy()
+      responseStream?.destroy()
+      finish()
+    })
+    upstream.on('timeout', () => upstream.destroy(new Error('direct preview connect timeout')))
+    upstream.on('error', (err) => {
+      if (requestTooLarge) {
+        finish()
+        return
+      }
+      log.warn('container_preview.direct_target_error', { reason: err.message })
+      if (!res.headersSent) sendDirectText(res, 502, 'preview target unavailable')
+      else if (!res.writableEnded) {
+        try {
+          res.destroy()
+        } catch {}
+      }
+      finish()
+    })
+    upstream.on('response', (response) => {
+      responseStream = response
+      response.setTimeout(DIRECT_IDLE_TIMEOUT_MS, () => response.destroy())
+      const contentType = String(response.headers['content-type'] ?? '').toLowerCase()
+      const contentEncoding = String(
+        response.headers['content-encoding'] ?? 'identity',
+      ).toLowerCase()
+      const html =
+        contentType.includes('text/html') &&
+        (contentEncoding === '' || contentEncoding === 'identity')
+      if (!html || (req.method ?? 'GET') === 'HEAD') {
+        res.writeHead(response.statusCode ?? 502, directResponseHeaders(response.headers))
+        response.pipe(res)
+        response.once('end', finish)
+        response.once('close', () => {
+          if (!response.complete && !res.writableEnded) {
+            try {
+              res.destroy()
+            } catch {}
+          }
+          finish()
+        })
+        response.once('error', () => {
+          if (!res.writableEnded) {
+            try {
+              res.destroy()
+            } catch {}
+          }
+          finish()
+        })
+        return
+      }
+      const chunks: Buffer[] = []
+      let total = 0
+      let overflow = false
+      response.on('data', (chunk: Buffer) => {
+        total += chunk.length
+        if (total > DIRECT_MAX_HTML_BYTES) {
+          overflow = true
+          response.destroy()
+          return
+        }
+        chunks.push(chunk)
+      })
+      response.on('end', () => {
+        if (overflow) return
+        const body = injectDirectPreviewBridge(Buffer.concat(chunks, total))
+        res.writeHead(
+          response.statusCode ?? 502,
+          directResponseHeaders(response.headers, body.length),
+        )
+        res.end(body)
+        finish()
+      })
+      response.on('close', () => {
+        if (overflow) {
+          if (!res.headersSent) sendDirectText(res, 502, 'preview HTML is too large')
+        } else if (!response.complete) {
+          if (!res.headersSent) sendDirectText(res, 502, 'preview target response failed')
+          else if (!res.writableEnded) {
+            try {
+              res.destroy()
+            } catch {}
+          }
+        }
+        finish()
+      })
+      response.on('error', () => {
+        if (!res.headersSent) sendDirectText(res, 502, 'preview target response failed')
+        finish()
+      })
+    })
+    req.on('data', (chunk: Buffer) => {
+      if (requestTooLarge) return
+      requestBytes += chunk.length
+      if (requestBytes > DIRECT_MAX_REQUEST_BYTES) {
+        requestTooLarge = true
+        upstream.destroy(new Error('direct preview request too large'))
+        if (!res.headersSent) sendDirectText(res, 413, 'request too large')
+        finish()
+        return
+      }
+      if (!upstream.destroyed) upstream.write(chunk)
+    })
+    req.once('end', () => {
+      if (!upstream.destroyed) upstream.end()
+    })
+    req.once('aborted', () => upstream.destroy())
+    req.once('error', () => upstream.destroy())
+  })
+}
+
+function injectDirectPreviewBridge(body: Buffer): Buffer {
+  const html = body.toString('utf8')
+  const tag = `<script src="${CONTAINER_PREVIEW_DIRECT_BRIDGE_PATH}" defer></script>`
+  const headEnd = html.toLowerCase().indexOf('</head>')
+  const injected =
+    headEnd >= 0 ? `${html.slice(0, headEnd)}${tag}${html.slice(headEnd)}` : `${tag}${html}`
+  return Buffer.from(injected, 'utf8')
+}
+
+function proxyDirectUpgrade(
+  req: IncomingMessage,
+  browserSocket: Duplex,
+  browserHead: Buffer,
+  canonicalTarget: string,
+  log: ContainerPreviewLog,
+): void {
+  if ((req.method ?? 'GET') !== 'GET') {
+    rejectUpgrade(browserSocket, 405, 'method not allowed')
+    return
+  }
+  const target = new URL(canonicalTarget)
+  const requestImpl = target.protocol === 'https:' ? httpsRequest : httpRequest
+  let upgraded = false
+  const upstream = requestImpl({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || undefined,
+    method: 'GET',
+    path: target.pathname + target.search,
+    headers: directTargetHeaders(req.headers, target, true),
+    family: target.hostname === '::1' ? 6 : 4,
+    rejectUnauthorized: false,
+    timeout: DIRECT_CONNECT_TIMEOUT_MS,
+  })
+  const fail = (reason: string): void => {
+    if (upgraded) return
+    log.warn('container_preview.direct_target_ws_failed', { reason })
+    rejectUpgrade(browserSocket, 502, 'preview websocket unavailable')
+    try {
+      upstream.destroy()
+    } catch {}
+  }
+  upstream.on('timeout', () => fail('timeout'))
+  upstream.on('error', (err) => fail(err.message))
+  upstream.on('response', (response) => {
+    response.resume()
+    fail(`unexpected status ${response.statusCode ?? 0}`)
+  })
+  upstream.on('upgrade', (response, targetSocket, targetHead) => {
+    if (response.statusCode !== 101) {
+      try {
+        targetSocket.destroy()
+      } catch {}
+      fail(`unexpected upgrade status ${response.statusCode ?? 0}`)
+      return
+    }
+    upgraded = true
+    const lines = ['HTTP/1.1 101 Switching Protocols']
+    for (let index = 0; index + 1 < response.rawHeaders.length; index += 2) {
+      const name = response.rawHeaders[index]!
+      const value = response.rawHeaders[index + 1]!
+      if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) continue
+      const lower = name.toLowerCase()
+      if (lower.startsWith('x-openclaude-') || lower.startsWith('x-oc-')) continue
+      lines.push(`${name}: ${value}`)
+    }
+    lines.push('', '')
+    try {
+      browserSocket.write(lines.join('\r\n'))
+      if (targetHead.length > 0) browserSocket.write(targetHead)
+      if (browserHead.length > 0) targetSocket.write(browserHead)
+      browserSocket.pipe(targetSocket)
+      targetSocket.pipe(browserSocket)
+    } catch {
+      try {
+        browserSocket.destroy()
+      } catch {}
+      try {
+        targetSocket.destroy()
+      } catch {}
+    }
+    browserSocket.once('close', () => targetSocket.destroy())
+    browserSocket.once('error', () => targetSocket.destroy())
+    targetSocket.once('close', () => browserSocket.destroy())
+    targetSocket.once('error', () => browserSocket.destroy())
+  })
+  browserSocket.once('close', () => upstream.destroy())
+  browserSocket.once('error', () => upstream.destroy())
+  upstream.end()
+}
+
+function sendDirectText(res: ServerResponse, status: number, message: string): void {
+  if (res.headersSent || res.writableEnded) return
+  const body = Buffer.from(message, 'utf8')
+  res.writeHead(status, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Length': String(body.length),
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
+
+function singleHeader(value: string | string[] | undefined): string | null {
+  return typeof value === 'string' ? value : null
 }
 
 interface PreviewSessionOptions {
