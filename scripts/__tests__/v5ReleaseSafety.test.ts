@@ -563,6 +563,7 @@ describe('v5 release safety lanes', () => {
     const smokeDryRun = run(deploy, ['--smoke', '--dry-run'])
     assert.equal(smokeDryRun.status, 0, smokeDryRun.stderr || smokeDryRun.stdout)
     assert.match(smokeDryRun.stdout, /校验 0151 runtime 对象 owner 与应用角色逐项权限/)
+    assert.match(smokeDryRun.stdout, /\[dry-run\] \/healthz 深度健康/)
   })
 
   test('0151 privilege transport/query failure is fail-closed', () => {

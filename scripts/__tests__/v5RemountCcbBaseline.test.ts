@@ -87,7 +87,7 @@ describe("V5 CCB baseline remount classification", () => {
     assert.match(deploySource, /MODE" != "baseline-census"/);
     assert.match(packageSource, /"test:v5:ops"/);
     assert.match(packageSource, /"check:v5"[^\n]*test:v5:ops/);
-    assert.match(workflow, /name: v5-ops[\s\S]*run: .*npm run test:v5:ops/);
+    assert.match(workflow, /name: v5-ops[\s\S]*?run: \|[\s\S]*?npm run test:v5:ops/);
   });
 
   test("census requires exact local host ownership and rejects null legacy rows", () => {

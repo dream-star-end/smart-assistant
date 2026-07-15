@@ -3414,6 +3414,10 @@ smoke() {
   # 用其端口跑本 smoke 即验证"新 active 完整健康+leader 形态"。
   local sport="${1:-$V5_PORT}"
   echo "── v5 smoke(健康 + 隔离断言;port=$sport)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] /healthz 深度健康、leadership、调度器/环境/端口/隔离断言"
+    return 0
+  fi
   local hz=""; local i
   for i in $(seq 1 10); do
     hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/healthz" 2>/dev/null || true)"
