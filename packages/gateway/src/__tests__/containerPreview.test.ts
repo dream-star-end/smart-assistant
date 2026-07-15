@@ -37,7 +37,7 @@ const keyId = 'mak1_0123456789abcdef'
 const keyringEnv = encodeAuthorityKeyring(new Map([[keyId, publicRaw]]))
 const viewport = { width: 1280, height: 800, deviceScaleFactor: 1, isMobile: false } as const
 const previewEnv = {
-  OC_RUNTIME_CHANNEL: 'v5',
+  OC_CONTAINER_PREVIEW_ENABLED: '1',
   OPENCLAUDE_TRUST_BRIDGE_IP: '127.0.0.1',
   OC_USER_ID: '42',
   OC_CONTAINER_ID: '7',
@@ -106,6 +106,40 @@ describe('container preview upgrade authorization', () => {
     )
     assert.throws(() => verifyContainerPreviewUpgrade(request('172.31.0.1'), env, now + 30_000))
   })
+})
+
+test('container preview capability is explicit and fail-closed', async () => {
+  const disabledEnvs = [
+    { ...previewEnv, OC_CONTAINER_PREVIEW_ENABLED: undefined },
+    { ...previewEnv, OC_CONTAINER_PREVIEW_ENABLED: '0' },
+    {
+      ...previewEnv,
+      OC_CONTAINER_PREVIEW_ENABLED: undefined,
+      OC_RUNTIME_CHANNEL: 'v5',
+    },
+  ]
+  for (const env of disabledEnvs) {
+    const handler = new ContainerPreviewHandler({ env })
+    const server = createServer()
+    server.on('upgrade', (req, socket, head) => {
+      if (!handler.handleUpgrade(req, socket, head)) socket.destroy()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not bind')
+    const status = await new Promise<number>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${address.port}/ws/container-preview`)
+      ws.once('unexpected-response', (_req, response) => {
+        response.resume()
+        resolve(response.statusCode ?? 0)
+      })
+      ws.once('open', () => reject(new Error('preview opened without its capability flag')))
+      ws.once('error', reject)
+    })
+    assert.equal(status, 503)
+    await handler.shutdown()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })
 
 test('a fresh signed upgrade replaces the active in-container session', async () => {
