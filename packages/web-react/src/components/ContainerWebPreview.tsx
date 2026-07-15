@@ -9,12 +9,14 @@ import {
   ArrowLeft,
   ArrowRight,
   Check,
+  CircleAlert,
+  Globe2,
   Hand,
   Keyboard,
+  ListChecks,
   Loader2,
   MessageSquarePlus,
   Monitor,
-  MousePointer2,
   RefreshCw,
   RotateCw,
   Send,
@@ -27,6 +29,7 @@ import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
+  type RefObject,
   useCallback,
   useEffect,
   useMemo,
@@ -41,7 +44,15 @@ import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { Modal } from './ui'
 
-type ToolMode = 'interact' | 'select'
+type ToolMode = 'interact' | 'comment'
+type PreviewSurface = 'none' | 'textComposer' | 'commentsDrawer' | 'draftEditor'
+
+type CommentDraft = {
+  target: ContainerPreviewElementTarget
+  comment: string
+  editingId: string | null
+  targetMissing: boolean
+}
 
 type FrameStats = {
   width: number
@@ -56,7 +67,7 @@ type PendingFrame = ContainerPreviewFrame
 const PHASE_LABEL: Record<string, string> = {
   idle: '等待连接',
   ticket: '正在授权',
-  connecting: '正在连接容器',
+  connecting: '正在连接运行环境',
   probing: '正在检查网页',
   launching: '正在启动独立浏览器',
   loading: '正在加载网页',
@@ -80,16 +91,21 @@ export function ContainerWebPreview({
 }) {
   const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop')
   const [mode, setMode] = useState<ToolMode>('interact')
+  const [surface, setSurface] = useState<PreviewSurface>('none')
   const [reconnectKey, setReconnectKey] = useState(0)
   const [annotations, setAnnotations] = useState<ContainerWebAnnotation[]>([])
-  const [draftTarget, setDraftTarget] = useState<ContainerPreviewElementTarget | null>(null)
-  const [draftComment, setDraftComment] = useState('')
-  const [editingId, setEditingId] = useState<string | null>(null)
+  const [draft, setDraft] = useState<CommentDraft | null>(null)
   const [selectionHint, setSelectionHint] = useState<string | null>(null)
-  const [textInputOpen, setTextInputOpen] = useState(false)
+  const [announcement, setAnnouncement] = useState('')
   const [textInput, setTextInput] = useState('')
   const [frameStats, setFrameStats] = useState<FrameStats | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const textInputRef = useRef<HTMLInputElement>(null)
+  const commentActionRef = useRef<HTMLButtonElement>(null)
+  const commentCountRef = useRef<HTMLButtonElement>(null)
+  const drawerCloseRef = useRef<HTMLButtonElement>(null)
+  const pinRefs = useRef(new Map<string, HTMLButtonElement>())
+  const drawerItemRefs = useRef(new Map<string, HTMLButtonElement>())
   const pendingFrameRef = useRef<PendingFrame | null>(null)
   const decodingRef = useRef(false)
   const frameTimesRef = useRef<number[]>([])
@@ -97,8 +113,17 @@ export function ContainerWebPreview({
   const lastInteractionAtRef = useRef<number | null>(null)
   const pointerStartRef = useRef<{ id: number; x: number; y: number; type: string } | null>(null)
   const lastPointerMoveAtRef = useRef(0)
+  const textComposingRef = useRef(false)
   const annotationsRef = useRef(annotations)
+  const draftRef = useRef(draft)
+  const modeRef = useRef(mode)
+  const surfaceRef = useRef(surface)
   const sourceUrlRef = useRef(sourceUrl)
+
+  annotationsRef.current = annotations
+  draftRef.current = draft
+  modeRef.current = mode
+  surfaceRef.current = surface
 
   const viewport = useMemo<ContainerPreviewViewport>(
     () => ({
@@ -121,8 +146,6 @@ export function ContainerWebPreview({
           const bytes = next.jpeg.slice()
           const blob = new Blob([bytes], { type: 'image/jpeg' })
           const drawable = await decodeJpeg(blob)
-          // A newer packet completed while this JPEG decoded. Skip the stale
-          // paint rather than building a client-side latency queue.
           if (pendingFrameRef.current) {
             closeDrawable(drawable)
             continue
@@ -162,8 +185,7 @@ export function ContainerWebPreview({
           }
         }
       } catch {
-        // Keep the last successfully painted frame if a corrupt JPEG slips
-        // through; the next valid latest-only packet can recover the view.
+        // Keep the last successfully painted frame. The latest-only stream can recover.
       } finally {
         decodingRef.current = false
         if (pendingFrameRef.current) drawFrame(pendingFrameRef.current)
@@ -179,19 +201,19 @@ export function ContainerWebPreview({
     reconnectKey,
     onFrame: drawFrame,
   })
-
-  annotationsRef.current = annotations
+  const ready = session.phase === 'ready'
 
   useEffect(() => {
     if (sourceUrlRef.current === sourceUrl) return
     sourceUrlRef.current = sourceUrl
     setDevice('desktop')
     setMode('interact')
+    setSurface('none')
     setAnnotations([])
-    setDraftTarget(null)
-    setDraftComment('')
-    setEditingId(null)
+    setDraft(null)
     setSelectionHint(null)
+    setAnnouncement('')
+    setTextInput('')
     setFrameStats(null)
     setReconnectKey((value) => value + 1)
   }, [sourceUrl])
@@ -199,23 +221,42 @@ export function ContainerWebPreview({
   useEffect(() => {
     const event = session.selection
     if (!event) return
+    if (modeRef.current !== 'comment' || surfaceRef.current === 'commentsDrawer') return
     if (!event.target) {
-      setSelectionHint('这里没有可标注的网页元素，请换个位置再点一次')
+      const message = '这里没有可评论的网页元素，请换个位置再点一次'
+      setSelectionHint(message)
+      setAnnouncement(message)
       return
     }
-    if (annotationsRef.current.length >= MAX_ANNOTATIONS) {
-      setSelectionHint(`最多添加 ${MAX_ANNOTATIONS} 条评论，请先编辑或删除已有评论`)
+    const currentDraft = draftRef.current
+    if (!currentDraft && annotationsRef.current.length >= MAX_ANNOTATIONS) {
+      const message = `已达到 ${MAX_ANNOTATIONS} 条评论上限，请先编辑或删除已有评论`
+      setSelectionHint(message)
+      setAnnouncement(message)
       return
     }
     setSelectionHint(null)
-    setDraftTarget(event.target)
-    setDraftComment('')
-    setEditingId(null)
+    setDraft(
+      currentDraft
+        ? { ...currentDraft, target: event.target, targetMissing: false }
+        : {
+            target: event.target,
+            comment: '',
+            editingId: null,
+            targetMissing: false,
+          },
+    )
+    setSurface('draftEditor')
+    setAnnouncement(currentDraft ? '已重新选择评论元素' : '已选择元素，请描述希望怎样修改')
   }, [session.selection])
 
   useEffect(() => {
     const event = session.resolved
     if (!event) return
+    const stillRegistered =
+      annotationsRef.current.some((annotation) => annotation.target.selector === event.selector) ||
+      draftRef.current?.target.selector === event.selector
+    if (!stillRegistered) return
     setAnnotations((current) =>
       current.map((annotation) => {
         if (annotation.target.selector !== event.selector) return annotation
@@ -224,24 +265,41 @@ export function ContainerWebPreview({
           : { ...annotation, missing: true }
       }),
     )
+    setDraft((current) => {
+      if (!current || current.target.selector !== event.selector) return current
+      return event.target
+        ? { ...current, target: event.target, targetMissing: false }
+        : { ...current, targetMissing: true }
+    })
   }, [session.resolved])
 
   useEffect(() => {
     if (!session.navigation) return
-    for (const annotation of annotationsRef.current) {
-      session.send({ type: 'preview.resolve', selector: annotation.target.selector })
+    const selectors = new Set(
+      annotationsRef.current.map((annotation) => annotation.target.selector),
+    )
+    if (draftRef.current) selectors.add(draftRef.current.target.selector)
+    for (const selector of selectors) {
+      session.send({ type: 'preview.resolve', selector })
     }
   }, [session.navigation, session.send])
 
+  useEffect(() => {
+    if (surface !== 'textComposer') return
+    const frame = requestAnimationFrame(() => textInputRef.current?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [surface])
+
   const sendControl = useCallback(
     (message: ContainerPreviewClientMessage): boolean => {
+      if (session.phase !== 'ready') return false
       const sent = session.send(message)
       if (sent && message.type !== 'preview.resolve' && message.type !== 'preview.select') {
         lastInteractionAtRef.current = performance.now()
       }
       return sent
     },
-    [session.send],
+    [session.phase, session.send],
   )
 
   const reconnect = (nextDevice = device) => {
@@ -249,7 +307,9 @@ export function ContainerWebPreview({
     setFrameStats(null)
     frameTimesRef.current = []
     pendingFrameRef.current = null
+    setSelectionHint(null)
     setReconnectKey((value) => value + 1)
+    setAnnouncement('正在重新连接网页预览')
   }
 
   const pointFromPointer = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -267,8 +327,11 @@ export function ContainerWebPreview({
   }
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!ready) return
     event.currentTarget.focus()
-    event.currentTarget.setPointerCapture(event.pointerId)
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    } catch {}
     const point = pointFromPointer(event)
     pointerStartRef.current = { id: event.pointerId, ...point, type: event.pointerType }
     if (mode === 'interact' && event.pointerType !== 'touch') {
@@ -282,7 +345,7 @@ export function ContainerWebPreview({
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (mode !== 'interact' || event.pointerType === 'touch') return
+    if (!ready || mode !== 'interact' || event.pointerType === 'touch') return
     const now = performance.now()
     if (now - lastPointerMoveAtRef.current < 50) return
     lastPointerMoveAtRef.current = now
@@ -290,12 +353,26 @@ export function ContainerWebPreview({
   }
 
   const onPointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!ready) return
     const point = pointFromPointer(event)
     const start = pointerStartRef.current
     pointerStartRef.current = null
-    if (mode === 'select') {
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    } catch {}
+    if (mode === 'comment') {
+      if (event.pointerType === 'touch' && start) {
+        const dx = point.x - start.x
+        const dy = point.y - start.y
+        if (Math.hypot(dx, dy) > 8) {
+          sendControl({ type: 'preview.wheel', deltaX: -dx * 2, deltaY: -dy * 2 })
+          return
+        }
+      }
       session.send({ type: 'preview.select', ...point })
-      setSelectionHint('正在识别元素…')
+      const message = '正在识别网页元素…'
+      setSelectionHint(message)
+      setAnnouncement(message)
       return
     }
     if (event.pointerType === 'touch' && start) {
@@ -317,46 +394,131 @@ export function ContainerWebPreview({
   }
 
   const onWheel = (event: ReactWheelEvent<HTMLCanvasElement>) => {
+    if (!ready) return
     event.preventDefault()
     sendControl({ type: 'preview.wheel', deltaX: event.deltaX, deltaY: event.deltaY })
   }
 
+  const focusSoon = (target: () => HTMLElement | null | undefined) => {
+    requestAnimationFrame(() => target()?.focus())
+  }
+
+  const focusDraftOrigin = (value = draftRef.current) => {
+    if (value?.editingId) {
+      focusSoon(() => pinRefs.current.get(value.editingId!))
+      return
+    }
+    focusSoon(() => canvasRef.current)
+  }
+
+  const enterCommentMode = () => {
+    if (!ready) return
+    const currentDraft = draftRef.current
+    setMode('comment')
+    setSurface(currentDraft ? 'draftEditor' : 'none')
+    setAnnouncement(currentDraft ? '已恢复未保存的元素评论' : '评论模式：点按页面元素添加修改意见')
+    if (!currentDraft) focusSoon(() => canvasRef.current)
+  }
+
+  const leaveCommentMode = () => {
+    setSurface('none')
+    setMode('interact')
+    setSelectionHint(null)
+    setAnnouncement('已返回网页操作模式')
+    focusSoon(() => commentActionRef.current)
+  }
+
+  const editAnnotation = (annotation: ContainerWebAnnotation) => {
+    const currentDraft = draftRef.current
+    if (currentDraft) {
+      if (currentDraft.editingId === annotation.id) {
+        setSurface('draftEditor')
+        return
+      }
+      setSurface('draftEditor')
+      setAnnouncement('请先保存或取消当前未完成的评论')
+      return
+    }
+    setMode('comment')
+    setDraft({
+      target: annotation.target,
+      comment: annotation.comment,
+      editingId: annotation.id,
+      targetMissing: Boolean(annotation.missing),
+    })
+    setSurface('draftEditor')
+  }
+
+  const cancelDraft = () => {
+    const previous = draftRef.current
+    setDraft(null)
+    setSurface('none')
+    setAnnouncement(previous?.editingId ? '已取消修改，原评论保持不变' : '已取消未保存的评论')
+    focusDraftOrigin(previous)
+  }
+
+  const hideDraftEditor = () => {
+    setSurface('none')
+    setAnnouncement('评论草稿已保留')
+    focusDraftOrigin()
+  }
+
   const saveDraft = () => {
-    const comment = draftComment.trim()
-    if (!draftTarget || !comment) return
-    if (!editingId && annotations.length >= MAX_ANNOTATIONS) return
+    const current = draftRef.current
+    const comment = current?.comment.trim() ?? ''
+    if (!current || !comment || current.targetMissing) return
     const pageUrl = session.navigation?.url ?? session.ready?.url ?? sourceUrl
     const pageTitle = session.navigation?.title ?? session.ready?.title ?? ''
-    if (editingId) {
-      setAnnotations((current) =>
-        current.map((annotation) =>
-          annotation.id === editingId
-            ? { ...annotation, target: draftTarget, comment, pageUrl, pageTitle, missing: false }
+    const savedId = current.editingId ?? crypto.randomUUID()
+    if (current.editingId) {
+      setAnnotations((items) =>
+        items.map((annotation) =>
+          annotation.id === current.editingId
+            ? {
+                ...annotation,
+                target: current.target,
+                comment,
+                pageUrl,
+                pageTitle,
+                missing: false,
+              }
             : annotation,
         ),
       )
     } else {
-      setAnnotations((current) => [
-        ...current,
+      setAnnotations((items) => [
+        ...items,
         {
-          id: crypto.randomUUID(),
-          target: draftTarget,
+          id: savedId,
+          target: current.target,
           comment,
           pageUrl,
           pageTitle,
         },
       ])
     }
-    setDraftTarget(null)
-    setDraftComment('')
-    setEditingId(null)
+    setDraft(null)
+    setSurface('none')
+    setAnnouncement(current.editingId ? '评论已保存' : '评论已添加')
+    focusSoon(() => pinRefs.current.get(savedId) ?? canvasRef.current)
   }
 
-  const editAnnotation = (annotation: ContainerWebAnnotation) => {
-    setDraftTarget(annotation.target)
-    setDraftComment(annotation.comment)
-    setEditingId(annotation.id)
-    setMode('select')
+  const deleteAnnotation = (id: string, index: number, focus: 'drawer' | 'canvas' = 'canvas') => {
+    const remaining = annotationsRef.current.filter((annotation) => annotation.id !== id)
+    setAnnotations(remaining)
+    if (draftRef.current?.editingId === id) {
+      setDraft(null)
+      setSurface(focus === 'drawer' ? 'commentsDrawer' : 'none')
+    }
+    setAnnouncement(`已删除评论 ${index + 1}`)
+    focusSoon(() => {
+      if (focus === 'drawer') {
+        const neighbor = remaining[index] ?? remaining[index - 1]
+        return neighbor ? drawerItemRefs.current.get(neighbor.id) : drawerCloseRef.current
+      }
+      const neighbor = remaining[index] ?? remaining[index - 1]
+      return neighbor ? pinRefs.current.get(neighbor.id) : canvasRef.current
+    })
   }
 
   const submitReview = () => {
@@ -373,390 +535,563 @@ export function ContainerWebPreview({
     onClose()
   }
 
-  const ready = session.phase === 'ready'
-  const visibleTargets = [
-    ...annotations.map((annotation, index) => ({
-      key: annotation.id,
-      target: annotation.target,
-      label: index + 1,
-      active: annotation.id === editingId,
-      missing: annotation.missing,
-    })),
-    ...(draftTarget && !editingId
-      ? [
-          {
-            key: 'draft',
-            target: draftTarget,
-            label: annotations.length + 1,
-            active: true,
-            missing: false,
-          },
-        ]
-      : []),
-  ]
+  const closeCommentsDrawer = () => {
+    setSurface('none')
+    focusSoon(() => commentCountRef.current)
+  }
+
+  const visibleTargets = useMemo(() => {
+    if (mode !== 'comment') return []
+    const items: Array<{
+      key: string
+      target: ContainerPreviewElementTarget
+      label: number
+      active: boolean
+      missing: boolean
+      annotation: ContainerWebAnnotation | null
+    }> = annotations.map((annotation, index) => {
+      const activeDraft = draft?.editingId === annotation.id ? draft : null
+      return {
+        key: annotation.id,
+        target: activeDraft?.target ?? annotation.target,
+        label: index + 1,
+        active: Boolean(activeDraft),
+        missing: activeDraft ? activeDraft.targetMissing : Boolean(annotation.missing),
+        annotation,
+      }
+    })
+    if (draft && !draft.editingId) {
+      items.push({
+        key: 'draft',
+        target: draft.target,
+        label: annotations.length + 1,
+        active: true,
+        missing: draft.targetMissing,
+        annotation: null,
+      })
+    }
+    return items
+  }, [annotations, draft, mode])
+
+  const aspect = viewport.width / viewport.height
+  const previewWidth = `min(${device === 'mobile' ? '430px' : '1280px'}, 100%, calc((100dvh - 168px) * ${aspect}))`
+  const displayTitle = session.navigation?.title || session.ready?.title || '容器内网页'
+  const displayUrl = session.navigation?.url || sourceUrl
+  const hasError = Boolean(session.error || (session.phase === 'closed' && !session.error))
 
   return (
     <Modal
       open={open}
       onOpenChange={(next) => !next && onClose()}
+      onEscapeKeyDown={(event) => {
+        const activeSurface = surfaceRef.current
+        if (activeSurface !== 'none') {
+          event.preventDefault()
+          if (activeSurface === 'commentsDrawer') closeCommentsDrawer()
+          else if (activeSurface === 'draftEditor') hideDraftEditor()
+          else {
+            setSurface('none')
+            focusSoon(() => canvasRef.current)
+          }
+          return
+        }
+        if (modeRef.current === 'comment') {
+          event.preventDefault()
+          leaveCommentMode()
+        }
+      }}
       srTitle="容器网页预览与元素评论"
       hideClose
-      className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-[#111318] sm:h-[calc(100dvh-24px)] sm:max-h-[calc(100dvh-24px)] sm:w-[calc(100vw-24px)] sm:rounded-2xl sm:border sm:border-white/10"
+      className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-black"
       bodyClassName="overflow-hidden p-0"
     >
-      <div className="flex h-full min-h-0 flex-col bg-[#111318] text-white">
-        <header className="flex shrink-0 items-center gap-2 border-b border-white/10 px-2 py-2 pt-[max(8px,env(safe-area-inset-top))] sm:px-3">
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="关闭网页预览"
-            className="preview-icon-button"
-          >
-            <X size={18} />
-          </button>
-          <div className="hidden items-center gap-1 sm:flex">
-            <button
-              type="button"
-              disabled={!ready}
-              onClick={() => sendControl({ type: 'preview.navigate', action: 'back' })}
-              aria-label="后退"
-              className="preview-icon-button"
-            >
-              <ArrowLeft size={17} />
-            </button>
-            <button
-              type="button"
-              disabled={!ready}
-              onClick={() => sendControl({ type: 'preview.navigate', action: 'forward' })}
-              aria-label="前进"
-              className="preview-icon-button"
-            >
-              <ArrowRight size={17} />
-            </button>
-            <button
-              type="button"
-              disabled={!ready}
-              onClick={() => sendControl({ type: 'preview.navigate', action: 'reload' })}
-              aria-label="刷新"
-              className="preview-icon-button"
-            >
-              <RotateCw size={16} />
-            </button>
-          </div>
-          <div className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 px-3 py-2">
-            <div className="truncate text-[12px] font-medium text-white/90">
-              {session.navigation?.title || session.ready?.title || '容器内网页'}
-            </div>
-            <div className="truncate text-[10px] text-white/45">
-              {session.navigation?.url || sourceUrl}
-            </div>
-          </div>
-          <div className="flex shrink-0 rounded-lg bg-white/5 p-0.5" aria-label="预览设备">
-            <DeviceButton
-              active={device === 'desktop'}
-              label="桌面"
-              onClick={() => device !== 'desktop' && reconnect('desktop')}
-            >
-              <Monitor size={15} />
-            </DeviceButton>
-            <DeviceButton
-              active={device === 'mobile'}
-              label="移动"
-              onClick={() => device !== 'mobile' && reconnect('mobile')}
-            >
-              <Smartphone size={15} />
-            </DeviceButton>
-          </div>
-        </header>
+      <div className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden bg-[#08090b] text-white">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(57,76,112,0.19),transparent_48%)]" />
 
-        <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-          <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-            <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-white/10 px-2 py-2 sm:px-3">
-              <ModeButton
-                active={mode === 'interact'}
-                onClick={() => setMode('interact')}
-                icon={<Hand size={15} />}
-                label="操作网页"
-              />
-              <ModeButton
-                active={mode === 'select'}
-                onClick={() => setMode('select')}
-                icon={<MousePointer2 size={15} />}
-                label="选元素评论"
-              />
+        {mode === 'interact' ? (
+          <header className="preview-floating-header">
+            <div className="mx-auto flex w-full max-w-[1600px] items-center gap-2 px-2 sm:px-4">
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="关闭网页预览"
+                title="关闭 (Esc)"
+                className="preview-icon-button"
+              >
+                <X size={19} />
+              </button>
+              <div className="hidden items-center gap-1 sm:flex">
+                <button
+                  type="button"
+                  disabled={!ready}
+                  onClick={() => sendControl({ type: 'preview.navigate', action: 'back' })}
+                  aria-label="后退"
+                  className="preview-icon-button"
+                >
+                  <ArrowLeft size={18} />
+                </button>
+                <button
+                  type="button"
+                  disabled={!ready}
+                  onClick={() => sendControl({ type: 'preview.navigate', action: 'forward' })}
+                  aria-label="前进"
+                  className="preview-icon-button"
+                >
+                  <ArrowRight size={18} />
+                </button>
+                <button
+                  type="button"
+                  disabled={!ready}
+                  onClick={() => sendControl({ type: 'preview.navigate', action: 'reload' })}
+                  aria-label="刷新网页"
+                  className="preview-icon-button"
+                >
+                  <RotateCw size={17} />
+                </button>
+              </div>
+              <div
+                className="preview-address-pill min-w-0 flex-1"
+                title={`${displayTitle}\n${displayUrl}`}
+              >
+                <Globe2 className="hidden shrink-0 text-white/45 min-[430px]:block" size={16} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12px] font-semibold text-white/90">
+                    {displayTitle}
+                  </span>
+                  <span className="block truncate text-[10px] text-white/45">{displayUrl}</span>
+                </span>
+              </div>
               <button
                 type="button"
                 disabled={!ready}
-                onClick={() => setTextInputOpen((value) => !value)}
-                className="preview-tool-button"
+                onClick={() => sendControl({ type: 'preview.navigate', action: 'reload' })}
+                aria-label="刷新网页"
+                className="preview-icon-button preview-mobile-reload"
               >
-                <Keyboard size={15} /> 输入文字
+                <RotateCw size={17} />
               </button>
-              <div className="ml-auto flex shrink-0 items-center gap-2 text-[10px] tabular-nums text-white/50">
-                <span
-                  className={cn('size-1.5 rounded-full', ready ? 'bg-emerald-400' : 'bg-amber-400')}
-                />
-                <span>{PHASE_LABEL[session.phase] ?? session.phase}</span>
-                {frameStats && (
-                  <span className="hidden lg:inline">
-                    {frameStats.width}×{frameStats.height} · {frameStats.fps} fps ·{' '}
-                    {frameStats.highQuality ? '高清' : '实时'}
-                    {frameStats.responseMs !== null ? ` · 响应≈${frameStats.responseMs} ms` : ''}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {textInputOpen && (
-              <form
-                className="flex shrink-0 gap-2 border-b border-white/10 bg-black/15 p-2"
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  const text = textInput
-                  if (!text) return
-                  sendControl({ type: 'preview.text', text })
-                  setTextInput('')
-                }}
-              >
-                <input
-                  value={textInput}
-                  onChange={(event) => setTextInput(event.target.value.slice(0, 2_000))}
-                  placeholder="向网页当前焦点输入文字（支持中文）"
-                  className="min-h-10 min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-white outline-none placeholder:text-white/35 focus:border-blue-400/70"
-                />
-                <button
-                  type="submit"
-                  disabled={!ready || !textInput}
-                  className="rounded-lg bg-blue-500 px-4 text-sm font-medium disabled:opacity-40"
+              <div className="preview-device-switch" aria-label="预览设备">
+                <DeviceButton
+                  active={device === 'desktop'}
+                  label="桌面"
+                  onClick={() => device !== 'desktop' && reconnect('desktop')}
                 >
-                  输入
-                </button>
-              </form>
-            )}
-
-            <div className="relative flex min-h-[260px] flex-1 items-center justify-center overflow-hidden bg-[#090a0d] p-2 sm:p-4">
-              <div
-                className={cn(
-                  'relative max-h-full max-w-full overflow-hidden rounded-md bg-white shadow-2xl',
-                  device === 'mobile' && 'rounded-[18px] ring-4 ring-white/10',
-                )}
-                style={{
-                  aspectRatio: `${viewport.width} / ${viewport.height}`,
-                  width: '100%',
-                  maxWidth: device === 'mobile' ? '430px' : undefined,
-                }}
-              >
-                <canvas
-                  ref={canvasRef}
-                  tabIndex={0}
-                  aria-label={mode === 'select' ? '网页画面，点按选择元素' : '可交互网页画面'}
-                  className={cn(
-                    'block size-full touch-none select-none object-fill outline-none',
-                    mode === 'select' ? 'cursor-crosshair' : 'cursor-default',
-                  )}
-                  onPointerDown={onPointerDown}
-                  onPointerMove={onPointerMove}
-                  onPointerUp={onPointerUp}
-                  onPointerCancel={() => {
-                    pointerStartRef.current = null
-                  }}
-                  onWheel={onWheel}
-                  onKeyDown={(event) => {
-                    if (!ready || mode !== 'interact' || event.nativeEvent.isComposing) return
-                    const key = keyboardShortcut(event)
-                    if (!key) return
-                    event.preventDefault()
-                    sendControl({ type: 'preview.key', key })
-                  }}
-                />
-                {visibleTargets.map(({ key, target, label, active, missing }) => (
-                  <div
-                    key={key}
-                    style={targetOverlayStyle(target, viewport)}
-                    className={cn(
-                      'pointer-events-none absolute z-10 border-2 bg-blue-500/10 text-left',
-                      active ? 'border-blue-300' : 'border-blue-500',
-                      missing && 'border-dashed border-amber-400',
-                    )}
-                  >
-                    {annotations.some((item) => item.id === key) ? (
-                      <button
-                        type="button"
-                        aria-label={`编辑网页评论 ${label}`}
-                        onClick={() => {
-                          const annotation = annotations.find((item) => item.id === key)
-                          if (annotation) editAnnotation(annotation)
-                        }}
-                        className="pointer-events-auto absolute -left-3 -top-3 flex size-6 items-center justify-center rounded-full border-2 border-white bg-blue-500 text-[11px] font-bold text-white shadow-lg"
-                      >
-                        {label}
-                      </button>
-                    ) : (
-                      <span className="absolute -left-3 -top-3 flex size-6 items-center justify-center rounded-full border-2 border-white bg-blue-500 text-[11px] font-bold text-white shadow-lg">
-                        {label}
-                      </span>
-                    )}
-                  </div>
-                ))}
-
-                {!frameStats && !session.error && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#15171c] text-center text-white/65">
-                    <Loader2 className="animate-spin" size={24} />
-                    <span className="text-xs">{PHASE_LABEL[session.phase] ?? '正在准备预览'}</span>
-                  </div>
-                )}
-                {(session.error || (session.phase === 'closed' && !session.error)) && (
-                  <div
-                    role="alert"
-                    className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#15171c]/95 px-6 text-center"
-                  >
-                    <p className="max-w-sm text-sm text-white/80">
-                      {session.error?.message ?? '网页预览连接已断开'}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => reconnect()}
-                      className="flex min-h-10 items-center gap-2 rounded-lg bg-white px-4 text-sm font-semibold text-black"
-                    >
-                      <RefreshCw size={15} />
-                      重试
-                    </button>
-                  </div>
-                )}
-              </div>
-              {selectionHint && (
-                <output className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-black/75 px-3 py-1.5 text-xs text-white shadow-lg backdrop-blur">
-                  {selectionHint}
-                </output>
-              )}
-            </div>
-          </section>
-
-          <aside
-            className={cn(
-              'flex h-[28dvh] min-h-[210px] shrink-0 flex-col border-t border-white/10 bg-[#15171c] md:h-full md:min-h-0 md:w-[340px] md:border-l md:border-t-0',
-              draftTarget && 'h-[42dvh] min-h-[290px] md:h-full md:min-h-0',
-            )}
-          >
-            <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-3">
-              <div>
-                <h2 className="text-sm font-semibold">修改评论</h2>
-                <p className="mt-0.5 text-[11px] text-white/45">
-                  选择页面元素，说明希望 AI 怎样修改
-                </p>
-              </div>
-              <span className="rounded-full bg-white/8 px-2 py-1 text-[11px] text-white/65">
-                {annotations.length}/{MAX_ANNOTATIONS} 条
-              </span>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
-              {draftTarget ? (
-                <div className="rounded-xl border border-blue-400/30 bg-blue-400/5 p-3">
-                  <ElementSummary target={draftTarget} />
-                  <textarea
-                    value={draftComment}
-                    maxLength={2_000}
-                    onChange={(event) => setDraftComment(event.target.value)}
-                    placeholder="例如：按钮改成品牌蓝色，文案改为“立即开始”，移动端占满一行。"
-                    className="mt-3 min-h-24 w-full resize-none rounded-lg border border-white/10 bg-black/20 p-3 text-sm text-white outline-none placeholder:text-white/30 focus:border-blue-400/70"
-                  />
-                  <div className="mt-2 flex justify-between gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDraftTarget(null)
-                        setDraftComment('')
-                        setEditingId(null)
-                      }}
-                      className="min-h-9 rounded-lg px-3 text-xs text-white/55 hover:bg-white/5"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!draftComment.trim()}
-                      onClick={saveDraft}
-                      className="flex min-h-9 items-center gap-1.5 rounded-lg bg-blue-500 px-3 text-xs font-semibold text-white disabled:opacity-40"
-                    >
-                      <Check size={14} />
-                      {editingId ? '保存' : '添加评论'}
-                    </button>
-                  </div>
-                </div>
-              ) : annotations.length === 0 ? (
-                <button
-                  type="button"
-                  onClick={() => setMode('select')}
-                  className="flex min-h-32 w-full flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 px-6 text-center text-white/45 hover:border-blue-400/50 hover:text-white/70"
+                  <Monitor size={17} />
+                </DeviceButton>
+                <DeviceButton
+                  active={device === 'mobile'}
+                  label="移动"
+                  onClick={() => device !== 'mobile' && reconnect('mobile')}
                 >
-                  <MessageSquarePlus size={22} />
-                  <span className="text-xs">切换“选元素评论”，然后点网页上的任意元素</span>
-                </button>
-              ) : null}
-
-              <div className="mt-3 space-y-2">
-                {annotations.map((annotation, index) => (
-                  <div
-                    key={annotation.id}
-                    className="group flex w-full gap-2 rounded-xl border border-white/10 bg-white/[0.03] p-2 text-left hover:border-blue-400/40"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => editAnnotation(annotation)}
-                      className="flex min-w-0 flex-1 gap-2 p-1 text-left"
-                    >
-                      <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-blue-500 text-[11px] font-bold">
-                        {index + 1}
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[11px] font-medium text-blue-200">
-                          {annotation.target.selector}
-                        </span>
-                        <span className="mt-1 block text-xs leading-5 text-white/75">
-                          {annotation.comment}
-                        </span>
-                        {annotation.missing && (
-                          <span className="mt-1 block text-[10px] text-amber-300">
-                            刷新后未重新匹配
-                          </span>
-                        )}
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`删除评论 ${index + 1}`}
-                      onClick={() => {
-                        setAnnotations((current) =>
-                          current.filter((item) => item.id !== annotation.id),
-                        )
-                      }}
-                      className="flex size-7 shrink-0 items-center justify-center rounded-md text-white/30 hover:bg-red-500/10 hover:text-red-300"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                ))}
+                  <Smartphone size={17} />
+                </DeviceButton>
               </div>
             </div>
-
-            <div className="shrink-0 border-t border-white/10 p-3 pb-[max(12px,env(safe-area-inset-bottom))]">
+          </header>
+        ) : (
+          <header className="preview-floating-header">
+            <div className="mx-auto grid w-full max-w-[1100px] grid-cols-[auto_1fr_auto] items-center gap-2 px-2 sm:px-4">
+              <button
+                type="button"
+                onClick={leaveCommentMode}
+                aria-label="返回操作网页"
+                className="preview-icon-button"
+              >
+                <ArrowLeft size={19} />
+              </button>
+              <button
+                ref={commentCountRef}
+                type="button"
+                onClick={() => setSurface('commentsDrawer')}
+                aria-haspopup="dialog"
+                aria-expanded={surface === 'commentsDrawer'}
+                className="preview-comment-count"
+              >
+                <ListChecks size={16} />
+                <span>{annotations.length} 条评论</span>
+              </button>
               <button
                 type="button"
                 disabled={annotations.length === 0}
                 onClick={submitReview}
-                className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-white text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-35"
+                title="只加入输入框，不会自动发送或附截图"
+                className="preview-primary-button"
               >
-                <Send size={15} /> 添加到对话输入框
+                <span className="hidden min-[430px]:inline">加入输入框</span>
+                <span className="min-[430px]:hidden">完成</span>
+                <Send size={15} />
               </button>
-              <p className="mt-2 text-center text-[10px] text-white/35">
-                加入对话时不附截图；仅写入地址、所选元素元数据和你的评论
-              </p>
             </div>
-          </aside>
-        </div>
+          </header>
+        )}
+
+        <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2 pb-[calc(88px+env(safe-area-inset-bottom))] pt-[calc(76px+env(safe-area-inset-top))] sm:px-6 sm:pb-24 sm:pt-20">
+          {!hasError && (
+            <PreviewStatus phase={session.phase} ready={ready} frameStats={frameStats} />
+          )}
+          <div
+            className={cn(
+              'preview-viewport relative max-h-full max-w-full overflow-hidden bg-[#181a20]',
+              device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl',
+              mode === 'comment' && ready && 'preview-viewport-selecting',
+            )}
+            style={{ aspectRatio: `${viewport.width} / ${viewport.height}`, width: previewWidth }}
+          >
+            <canvas
+              ref={canvasRef}
+              tabIndex={ready ? 0 : -1}
+              aria-label={mode === 'comment' ? '网页画面，点按选择评论元素' : '可交互网页画面'}
+              aria-disabled={!ready}
+              className={cn(
+                'block size-full touch-none select-none object-fill outline-none',
+                mode === 'comment' && ready ? 'cursor-crosshair' : 'cursor-default',
+              )}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={() => {
+                pointerStartRef.current = null
+              }}
+              onContextMenu={(event) => event.preventDefault()}
+              onWheel={onWheel}
+              onKeyDown={(event) => {
+                if (!ready || mode !== 'interact' || event.nativeEvent.isComposing) return
+                const key = keyboardShortcut(event)
+                if (!key) return
+                event.preventDefault()
+                sendControl({ type: 'preview.key', key })
+              }}
+            />
+
+            {visibleTargets.map(({ key, target, label, active, missing, annotation }) => (
+              <div
+                key={key}
+                style={targetOverlayStyle(target, viewport)}
+                className={cn(
+                  'preview-target-box pointer-events-none absolute z-10',
+                  active && 'preview-target-box-active',
+                  missing && 'preview-target-box-missing',
+                )}
+              >
+                <button
+                  ref={(node) => {
+                    if (node) pinRefs.current.set(key, node)
+                    else pinRefs.current.delete(key)
+                  }}
+                  type="button"
+                  aria-label={
+                    annotation
+                      ? `编辑网页评论 ${label}：${annotation.comment.slice(0, 80)}${missing ? '，元素未重新匹配' : ''}`
+                      : '继续编辑未保存的网页评论'
+                  }
+                  onClick={() => {
+                    if (annotation) editAnnotation(annotation)
+                    else setSurface('draftEditor')
+                  }}
+                  className="preview-anchor-hit pointer-events-auto"
+                >
+                  <span
+                    className={cn('preview-anchor-dot', missing && 'preview-anchor-dot-missing')}
+                  >
+                    {label}
+                  </span>
+                </button>
+              </div>
+            ))}
+
+            {!frameStats && !hasError && (
+              <output
+                aria-live="polite"
+                className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#15171c] text-center"
+              >
+                <span className="flex size-12 items-center justify-center rounded-full bg-white/[0.06]">
+                  <Loader2 className="animate-spin text-white/75" size={22} />
+                </span>
+                <span className="text-sm font-medium text-white/75">
+                  {PHASE_LABEL[session.phase] ?? '正在准备预览'}
+                </span>
+                <span className="text-xs text-white/35">首次启动独立浏览器可能需要几秒</span>
+              </output>
+            )}
+
+            {hasError && (
+              <PreviewError
+                detail={session.error?.message ?? '网页预览连接已断开'}
+                retryable={session.error?.retryable ?? true}
+                onRetry={() => reconnect()}
+              />
+            )}
+          </div>
+
+          {selectionHint && (
+            <output
+              aria-live="polite"
+              className="preview-toast pointer-events-none absolute bottom-[calc(92px+env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2"
+            >
+              {selectionHint}
+            </output>
+          )}
+        </main>
+
+        {mode === 'interact' && surface === 'none' && (
+          <div className="preview-bottom-layer">
+            <div className="preview-action-dock" aria-label="网页预览工具">
+              <PreviewActionButton
+                active
+                label="操作"
+                icon={<Hand size={20} />}
+                onClick={() => focusSoon(() => canvasRef.current)}
+              />
+              <PreviewActionButton
+                buttonRef={commentActionRef}
+                disabled={!ready}
+                label="评论"
+                icon={<MessageSquarePlus size={20} />}
+                onClick={enterCommentMode}
+              />
+              <PreviewActionButton
+                disabled={!ready}
+                label="输入"
+                icon={<Keyboard size={20} />}
+                onClick={() => setSurface('textComposer')}
+              />
+            </div>
+          </div>
+        )}
+
+        {mode === 'interact' && surface === 'textComposer' && (
+          <form
+            className="preview-bottom-layer"
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (textComposingRef.current || !textInput) return
+              if (!sendControl({ type: 'preview.text', text: textInput })) return
+              setTextInput('')
+              setSurface('none')
+              setAnnouncement('文字已输入到网页当前焦点')
+              focusSoon(() => canvasRef.current)
+            }}
+          >
+            <div className="preview-composer">
+              <button
+                type="button"
+                aria-label="关闭文字输入"
+                onClick={() => {
+                  setSurface('none')
+                  focusSoon(() => canvasRef.current)
+                }}
+                className="preview-icon-button"
+              >
+                <X size={18} />
+              </button>
+              <input
+                ref={textInputRef}
+                value={textInput}
+                onChange={(event) => setTextInput(event.target.value.slice(0, 2_000))}
+                onCompositionStart={() => {
+                  textComposingRef.current = true
+                }}
+                onCompositionEnd={() => {
+                  textComposingRef.current = false
+                }}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === 'Enter' &&
+                    (event.nativeEvent.isComposing || textComposingRef.current)
+                  ) {
+                    event.preventDefault()
+                  }
+                }}
+                aria-label="输入网页文字"
+                placeholder="输入到网页当前焦点…"
+                className="min-w-0 flex-1 bg-transparent px-1 text-base text-white outline-none placeholder:text-white/35"
+              />
+              <button
+                type="submit"
+                disabled={!ready || !textInput}
+                aria-label="确认输入网页文字"
+                className="preview-composer-submit"
+              >
+                <Send size={17} />
+              </button>
+            </div>
+          </form>
+        )}
+
+        {mode === 'comment' && surface === 'draftEditor' && draft && (
+          <CommentEditor
+            key={`${draft.editingId ?? 'new'}:${draft.target.selector}`}
+            draft={draft}
+            annotationIndex={
+              draft.editingId
+                ? annotations.findIndex((annotation) => annotation.id === draft.editingId)
+                : annotations.length
+            }
+            onChange={(comment) =>
+              setDraft((current) => (current ? { ...current, comment } : null))
+            }
+            onHide={hideDraftEditor}
+            onCancel={cancelDraft}
+            onSave={saveDraft}
+            onDelete={
+              draft.editingId
+                ? () => {
+                    const index = annotations.findIndex(
+                      (annotation) => annotation.id === draft.editingId,
+                    )
+                    if (index >= 0) deleteAnnotation(draft.editingId!, index)
+                  }
+                : undefined
+            }
+          />
+        )}
+
+        {mode === 'comment' && surface === 'none' && (
+          <div className="preview-bottom-layer pointer-events-none">
+            <div className="preview-comment-hint pointer-events-auto">
+              {draft ? (
+                <>
+                  <span>有一条未保存的评论</span>
+                  <button type="button" onClick={() => setSurface('draftEditor')}>
+                    继续编辑
+                  </button>
+                </>
+              ) : (
+                <>
+                  <MessageSquarePlus size={16} />
+                  <span>点按元素添加评论，滑动或滚轮可浏览页面</span>
+                </>
+              )}
+              <span className="hidden border-l border-white/10 pl-3 text-white/35 sm:inline">
+                只预填修改要求，不会自动发送或附截图
+              </span>
+            </div>
+          </div>
+        )}
+
+        {mode === 'comment' && surface === 'commentsDrawer' && (
+          <Modal
+            open
+            onOpenChange={(next) => !next && closeCommentsDrawer()}
+            srTitle="网页评论列表"
+            hideClose
+            className="preview-comments-modal"
+            bodyClassName="overflow-hidden p-0"
+          >
+            <CommentsDrawer
+              annotations={annotations}
+              closeButtonRef={drawerCloseRef}
+              setItemRef={(id, node) => {
+                if (node) drawerItemRefs.current.set(id, node)
+                else drawerItemRefs.current.delete(id)
+              }}
+              onClose={closeCommentsDrawer}
+              onEdit={(annotation) => {
+                editAnnotation(annotation)
+              }}
+              onDelete={(id, index) => deleteAnnotation(id, index, 'drawer')}
+            />
+          </Modal>
+        )}
+
+        <output aria-live="polite" className="sr-only">
+          {announcement}
+        </output>
       </div>
     </Modal>
+  )
+}
+
+function PreviewStatus({
+  phase,
+  ready,
+  frameStats,
+}: {
+  phase: string
+  ready: boolean
+  frameStats: FrameStats | null
+}) {
+  return (
+    <output className="preview-status-pill" aria-live="polite">
+      <span className={cn('size-1.5 rounded-full', ready ? 'bg-emerald-400' : 'bg-amber-300')} />
+      <span>{PHASE_LABEL[phase] ?? phase}</span>
+      {frameStats && (
+        <span className="hidden border-l border-white/10 pl-2 text-white/40 lg:inline">
+          {frameStats.width}×{frameStats.height} · {frameStats.fps} fps ·{' '}
+          {frameStats.highQuality ? '高清' : '实时'}
+          {frameStats.responseMs !== null ? ` · ${frameStats.responseMs} ms` : ''}
+        </span>
+      )}
+    </output>
+  )
+}
+
+function PreviewError({
+  detail,
+  retryable,
+  onRetry,
+}: {
+  detail: string
+  retryable: boolean
+  onRetry: () => void
+}) {
+  return (
+    <div
+      role="alert"
+      className="absolute inset-0 flex items-center justify-center bg-[#111318]/97 p-5 text-center"
+    >
+      <div className="w-full max-w-sm">
+        <span className="mx-auto flex size-12 items-center justify-center rounded-full bg-amber-300/10 text-amber-200">
+          <CircleAlert size={23} />
+        </span>
+        <h2 className="mt-4 text-base font-semibold">无法连接网页预览</h2>
+        <p className="mt-2 text-sm leading-6 text-white/55">
+          运行环境可能仍在启动，或网页服务暂时不可用。请确认网页已运行后重试。
+        </p>
+        {retryable && (
+          <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-5">
+            <RefreshCw size={16} />
+            重新连接
+          </button>
+        )}
+        <details className="group mx-auto mt-4 max-w-xs text-left text-[11px] text-white/35">
+          <summary className="cursor-pointer text-center hover:text-white/55">诊断详情</summary>
+          <p className="mt-2 max-h-24 overflow-auto break-all rounded-xl bg-black/30 p-3 leading-5">
+            {detail}
+          </p>
+        </details>
+      </div>
+    </div>
+  )
+}
+
+function PreviewActionButton({
+  buttonRef,
+  active = false,
+  disabled = false,
+  label,
+  icon,
+  onClick,
+}: {
+  buttonRef?: RefObject<HTMLButtonElement | null>
+  active?: boolean
+  disabled?: boolean
+  label: string
+  icon: ReactNode
+  onClick: () => void
+}) {
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      disabled={disabled}
+      aria-pressed={label === '操作' || label === '评论' ? active : undefined}
+      onClick={onClick}
+      className={cn('preview-action-button', active && 'preview-action-button-active')}
+    >
+      <span className="preview-action-icon">{icon}</span>
+      <span>{label}</span>
+    </button>
   )
 }
 
@@ -765,7 +1100,12 @@ function DeviceButton({
   label,
   onClick,
   children,
-}: { active: boolean; label: string; onClick: () => void; children: ReactNode }) {
+}: {
+  active: boolean
+  label: string
+  onClick: () => void
+  children: ReactNode
+}) {
   return (
     <button
       type="button"
@@ -773,36 +1113,197 @@ function DeviceButton({
       aria-label={`${label}预览`}
       aria-pressed={active}
       onClick={onClick}
-      className={cn(
-        'flex min-h-9 items-center gap-1.5 rounded-md px-2 text-xs',
-        active ? 'bg-white text-black' : 'text-white/55 hover:text-white',
-      )}
+      className={cn('preview-device-button', active && 'preview-device-button-active')}
     >
-      <span>{children}</span>
+      {children}
       <span className="hidden lg:inline">{label}</span>
     </button>
   )
 }
 
-function ModeButton({
-  active,
-  onClick,
-  icon,
-  label,
-}: { active: boolean; onClick: () => void; icon: ReactNode; label: string }) {
+function CommentEditor({
+  draft,
+  annotationIndex,
+  onChange,
+  onHide,
+  onCancel,
+  onSave,
+  onDelete,
+}: {
+  draft: CommentDraft
+  annotationIndex: number
+  onChange: (value: string) => void
+  onHide: () => void
+  onCancel: () => void
+  onSave: () => void
+  onDelete?: () => void
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => textareaRef.current?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [])
+
   return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      className={cn(
-        'preview-tool-button',
-        active && 'border-blue-400/50 bg-blue-500/20 text-blue-100',
-      )}
-    >
-      <span>{icon}</span>
-      {label}
-    </button>
+    <div className="preview-bottom-layer">
+      <section className="preview-comment-editor" aria-label="编辑网页评论">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="preview-anchor-dot static mt-0.5 shrink-0 translate-x-0 translate-y-0">
+            {annotationIndex + 1}
+          </span>
+          <div className="min-w-0 flex-1">
+            <ElementSummary target={draft.target} />
+            {draft.targetMissing && (
+              <p className="mt-2 text-xs leading-5 text-amber-200">
+                页面变化后未找到这个元素，请在画面中重新选择后再保存。
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            aria-label="收起评论编辑器"
+            title="收起并保留草稿 (Esc)"
+            onClick={onHide}
+            className="preview-icon-button -mr-1 -mt-1"
+          >
+            <X size={17} />
+          </button>
+        </div>
+        <textarea
+          ref={textareaRef}
+          value={draft.comment}
+          maxLength={2_000}
+          onChange={(event) => onChange(event.target.value)}
+          aria-label="描述网页修改"
+          placeholder="例如：按钮改成品牌蓝色，文案改为“立即开始”，移动端占满一行。"
+          className="mt-3 min-h-20 w-full resize-none bg-transparent text-sm leading-6 text-white outline-none placeholder:text-white/30"
+        />
+        <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
+          <div className="flex items-center gap-1">
+            {onDelete && (
+              <button
+                type="button"
+                aria-label="删除该评论"
+                onClick={onDelete}
+                className="preview-secondary-button preview-destructive-button"
+              >
+                <Trash2 size={15} />
+                删除
+              </button>
+            )}
+            <button type="button" onClick={onCancel} className="preview-secondary-button">
+              {draft.editingId ? '取消修改' : '取消草稿'}
+            </button>
+          </div>
+          <button
+            type="button"
+            disabled={!draft.comment.trim() || draft.targetMissing}
+            onClick={onSave}
+            aria-label={draft.editingId ? '保存评论' : '添加评论'}
+            className="preview-primary-button"
+          >
+            <Check size={15} />
+            {draft.editingId ? '保存' : '添加评论'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function CommentsDrawer({
+  annotations,
+  closeButtonRef,
+  setItemRef,
+  onClose,
+  onEdit,
+  onDelete,
+}: {
+  annotations: ContainerWebAnnotation[]
+  closeButtonRef: RefObject<HTMLButtonElement | null>
+  setItemRef: (id: string, node: HTMLButtonElement | null) => void
+  onClose: () => void
+  onEdit: (annotation: ContainerWebAnnotation) => void
+  onDelete: (id: string, index: number) => void
+}) {
+  return (
+    <section className="preview-comments-drawer">
+      <header className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+        <div>
+          <h2 className="text-sm font-semibold">网页修改评论</h2>
+          <p className="mt-0.5 text-xs text-white/40">
+            {annotations.length}/{MAX_ANNOTATIONS} 条
+          </p>
+        </div>
+        <button
+          ref={closeButtonRef}
+          type="button"
+          aria-label="关闭评论列表"
+          onClick={onClose}
+          className="preview-icon-button"
+        >
+          <X size={18} />
+        </button>
+      </header>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {annotations.length === 0 ? (
+          <div className="flex min-h-48 flex-col items-center justify-center gap-3 px-6 text-center text-white/45">
+            <MessageSquarePlus size={24} />
+            <p className="text-sm leading-6">还没有评论，关闭列表后点按网页元素即可添加。</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {annotations.map((annotation, index) => (
+              <div
+                key={annotation.id}
+                className="flex items-start gap-1 rounded-2xl border border-white/10 bg-white/[0.035] p-2"
+              >
+                <button
+                  ref={(node) => setItemRef(annotation.id, node)}
+                  type="button"
+                  onClick={() => onEdit(annotation)}
+                  className="flex min-h-11 min-w-0 flex-1 items-start gap-3 rounded-xl p-2 text-left outline-none hover:bg-white/[0.05] focus-visible:ring-2 focus-visible:ring-blue-300"
+                >
+                  <span
+                    className={cn(
+                      'preview-anchor-dot static shrink-0 translate-x-0 translate-y-0',
+                      annotation.missing && 'preview-anchor-dot-missing',
+                    )}
+                  >
+                    {index + 1}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium text-blue-100">
+                      {annotation.target.selector}
+                    </span>
+                    <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/70">
+                      {annotation.comment}
+                    </span>
+                    {annotation.missing && (
+                      <span className="mt-1 block text-xs text-amber-200">
+                        页面变化后未重新匹配
+                      </span>
+                    )}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  aria-label={`删除评论 ${index + 1}`}
+                  onClick={() => onDelete(annotation.id, index)}
+                  className="preview-icon-button preview-delete-button"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      <p className="border-t border-white/10 px-4 py-3 text-xs leading-5 text-white/35">
+        点击评论可重新编辑。加入输入框时不会附截图，也不会自动发送。
+      </p>
+    </section>
   )
 }
 
@@ -810,11 +1311,11 @@ function ElementSummary({ target }: { target: ContainerPreviewElementTarget }) {
   const label = target.ariaLabel || target.text
   return (
     <div className="min-w-0">
-      <div className="truncate text-xs font-semibold text-blue-200">{target.selector}</div>
+      <div className="truncate text-xs font-semibold text-blue-100">{target.selector}</div>
       <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-white/45">
-        <span className="rounded bg-white/5 px-1.5 py-0.5">&lt;{target.tag}&gt;</span>
+        <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">&lt;{target.tag}&gt;</span>
         {target.role && (
-          <span className="rounded bg-white/5 px-1.5 py-0.5">role={target.role}</span>
+          <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">role={target.role}</span>
         )}
         {label && <span className="line-clamp-1">{label}</span>}
       </div>
