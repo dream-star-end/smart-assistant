@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { ApiError, api, apiErrorMessage, authErrorMessage, callWithRefresh } from './api'
+import { ApiError, AuthEpochStaleError, api, apiErrorMessage, authErrorMessage, callWithRefresh } from './api'
 import { createMemoryAuthSession } from './authSession'
 import type { AuthSession } from './types'
 
@@ -234,8 +234,92 @@ test('an old 401 is never replayed with a newly logged-in account token', async 
   const nextEpoch = session.beginIdentity()
   session.commitToken(nextEpoch, 'account-b')
   release()
-  await expect(pending).resolves.toMatchObject({ status: 401 })
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
   expect(seen).toEqual(['account-a'])
+})
+
+test('a replay response arriving after an identity switch is discarded before callers can parse it', async () => {
+  let releaseReplay!: () => void
+  let markReplayStarted!: () => void
+  const replayGate = new Promise<void>((resolve) => {
+    releaseReplay = resolve
+  })
+  const replayStarted = new Promise<void>((resolve) => {
+    markReplayStarted = resolve
+  })
+  const seen: string[] = []
+  const { session } = makeSession('account-a-expired')
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ok({ access_token: 'account-a-fresh', access_exp: 999, remember: true })) as unknown as typeof fetch,
+  )
+  const pending = callWithRefresh(session, async (token) => {
+    seen.push(token)
+    if (token === 'account-a-expired') return unauthorized() as unknown as Response
+    markReplayStarted()
+    await replayGate
+    return ok({ user: { id: 'account-a-private' } }) as unknown as Response
+  })
+
+  await replayStarted
+  const nextEpoch = session.beginIdentity()
+  session.commitToken(nextEpoch, 'account-b')
+  releaseReplay()
+
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+  expect(seen).toEqual(['account-a-expired', 'account-a-fresh'])
+})
+
+test('an ordinary successful response arriving after an identity switch is also discarded', async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const { session } = makeSession('account-a')
+  const pending = callWithRefresh(session, async () => {
+    await gate
+    return ok({ user: { id: 'account-a-private' } }) as unknown as Response
+  })
+
+  await Promise.resolve()
+  const nextEpoch = session.beginIdentity()
+  session.commitToken(nextEpoch, 'account-b')
+  release()
+
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+})
+
+test('a response body that finishes parsing after an identity switch is discarded', async () => {
+  let releaseBody!: () => void
+  let markBodyStarted!: () => void
+  const bodyGate = new Promise<void>((resolve) => {
+    releaseBody = resolve
+  })
+  const bodyStarted = new Promise<void>((resolve) => {
+    markBodyStarted = resolve
+  })
+  const { session } = makeSession('account-a')
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => {
+        markBodyStarted()
+        await bodyGate
+        return ME_BODY
+      },
+    })) as unknown as typeof fetch,
+  )
+  const pending = api.getMe(session)
+
+  await bodyStarted
+  const nextEpoch = session.beginIdentity()
+  session.commitToken(nextEpoch, 'account-b')
+  releaseBody()
+
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
 })
 
 test('shared invalid refresh expires the matching epoch exactly once', async () => {
@@ -314,6 +398,39 @@ test('rapid logout then login is FIFO-ordered in the same tab', async () => {
   releaseLogout()
   await Promise.all([logout, login])
   expect(order).toEqual(['logout:start', 'logout:end', 'login'])
+})
+
+test('a hung logout times out so the cookie-mutation FIFO cannot starve a later login forever', async () => {
+  vi.useFakeTimers()
+  const order: string[] = []
+  const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    if (String(url).includes('/api/auth/logout')) {
+      order.push('logout:start')
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          order.push('logout:abort')
+          reject(new DOMException('timeout', 'AbortError'))
+        })
+      })
+    }
+    order.push('login')
+    return Promise.resolve(ok({
+      user: ME_BODY.user,
+      access_token: 'tok-login',
+      access_exp: 1234,
+      refresh_exp: 5678,
+      remember: true,
+    }))
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const logout = api.logout()
+  await Promise.resolve()
+  const login = api.login('a@b.com', 'pw')
+  expect(order).toEqual(['logout:start'])
+  await vi.advanceTimersByTimeAsync(30_000)
+  await Promise.all([logout, login])
+  expect(order).toEqual(['logout:start', 'logout:abort', 'login'])
 })
 
 test('orgTopup preserves mutually exclusive desktop/mobile payment URLs from the unified response envelope', async () => {

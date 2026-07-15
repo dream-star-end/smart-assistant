@@ -1,4 +1,4 @@
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { useAdminAuth } from "./auth";
 
@@ -51,4 +51,47 @@ test("admin boot ends unauthenticated only for an explicit invalid refresh", asy
   await waitFor(() => expect(result.current.ready).toBe(true));
   expect(result.current.authed).toBe(false);
   expect(result.current.user).toBeNull();
+});
+
+test("admin logout hides privileged UI and waits for server revoke before navigation completes", async () => {
+  let releaseLogout!: () => void;
+  const logoutGate = new Promise<void>((resolve) => {
+    releaseLogout = resolve;
+  });
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes("/api/auth/refresh")) {
+      return response({ access_token: "admin-token", access_exp: 999, remember: true });
+    }
+    if (String(url).includes("/api/me")) {
+      return response({ user: { id: "admin-1", email: "admin@example.com", role: "admin", credits: "0" } });
+    }
+    if (String(url).includes("/api/auth/logout")) {
+      await logoutGate;
+      return response({});
+    }
+    return response({});
+  });
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  const { result } = renderHook(() => useAdminAuth());
+  await waitFor(() => expect(result.current.authed).toBe(true));
+
+  let settled = false;
+  let loggingOut!: Promise<void>;
+  act(() => {
+    loggingOut = result.current.logout();
+    void loggingOut.then(() => {
+      settled = true;
+    });
+  });
+  expect(result.current.ready).toBe(false);
+  expect(result.current.authed).toBe(false);
+  await Promise.resolve();
+  expect(settled).toBe(false);
+
+  releaseLogout();
+  await act(async () => {
+    await loggingOut;
+  });
+  expect(settled).toBe(true);
 });

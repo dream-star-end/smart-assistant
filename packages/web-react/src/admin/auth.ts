@@ -59,8 +59,8 @@ export type AdminAuthState = {
   ready: boolean;
   /** 已认证 **且** role==='admin'。仅此时渲染 AdminShell。 */
   authed: boolean;
-  /** 登出：吊销 refresh cookie（错误已在 api 层吞掉）后回首页。 */
-  logout: () => void;
+  /** 登出：先隐藏管理面，等待 refresh family 吊销/清 cookie 后再回首页。 */
+  logout: () => Promise<void>;
 };
 
 /**
@@ -143,11 +143,15 @@ export function useAdminAuth(): AdminAuthState {
     };
   }, []);
 
-  const logout = useCallback(() => {
+  const logout = useCallback(async () => {
     adminSession.beginIdentity();
     void cancelAuthRefresh(adminSession);
     publishAuthLogout();
-    void api.logout(adminSession);
+    // ready=false 先隐藏管理数据，同时避免 AdminApp 的 ready&&!authed effect 抢先导航。
+    setUser(null);
+    setAuthed(false);
+    setReady(false);
+    await api.logout(adminSession);
     window.location.replace("/");
   }, []);
 

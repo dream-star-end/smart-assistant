@@ -1,5 +1,6 @@
 import {
   ApiError,
+  assertAuthResponseCurrent,
   bearerHeaders,
   callWithRefresh,
   jsonOrThrow,
@@ -78,6 +79,7 @@ export async function adminSend<T>(
   if (!res.ok) await throwApi(res);
   if (res.status === 204) return undefined as T;
   const text = await res.text();
+  assertAuthResponseCurrent(res);
   if (text.trim() === "") return undefined as T;
   try {
     return JSON.parse(text) as T;
@@ -100,5 +102,7 @@ export async function adminText(path: string, params?: AdminParams): Promise<str
     }),
   );
   if (!res.ok) await throwApi(res);
-  return res.text();
+  const text = await res.text();
+  assertAuthResponseCurrent(res);
+  return text;
 }
