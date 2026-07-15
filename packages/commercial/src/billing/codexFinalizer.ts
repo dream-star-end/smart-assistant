@@ -82,8 +82,10 @@ import {
 } from "./proxyBilling.js";
 
 /** Journal marker written for Codex turns whose exact final billing evidence
- * is carried by the immutable v2 turn tape. Reconciler/GC must never convert
- * these rows into a time-based waiver or delete their recovery decision. */
+ * is carried by the immutable v2 turn tape. The reconciler excludes these
+ * rows from the legacy timeout, then may permanently waive only an `inflight`
+ * row that still has no usage evidence after the separate 24h+ recovery SLA.
+ * GC never deletes the resulting durable recovery decision. */
 export const DURABLE_CODEX_RECOVERY_VERSION = "lossless_turn_tape_v2";
 
 /** `aborted` is ACK-safe only when the reason carries this explicit marker.
@@ -364,7 +366,8 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
         failureCode,
       );
     } catch {
-      // journal abort 失败 — 数据库瞬断,reconciler 会扫到 stuck inflight 兜底。
+      // journal abort 失败 — 数据库瞬断；durable tape 会继续重试，若始终没有
+      // billing/usage evidence，reconciler 最早在独立 24h SLA 后兜底免单。
       // 这里不 rethrow,让 cleanup 路径继续走完(Map 必须清空)。
     }
   }

@@ -297,6 +297,70 @@ REMOTE
 assert_repo_required_migrations() { assert_required_migrations "$RELEASE_METADATA" local; }
 assert_release_required_migrations() { assert_required_migrations "$1/deploy/v5/release-metadata.json" remote; }
 
+# 0151 once got applied as postgres instead of `SET LOCAL ROLE openclaude`, so
+# schema_migrations was green while the runtime role could not write either new
+# telemetry table. Keep this an explicit application-role capability gate: a
+# recorded migration without its effective grants is not deploy/smoke-ready.
+assert_0151_runtime_privileges() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 0151 runtime 对象 owner 与应用角色逐项权限"
+    return 0
+  fi
+  if ssh "$KL_HOST" bash -s -- "$V5_ENV" <<'REMOTE'
+set -Eeuo pipefail
+env_file="$1"
+[[ -r "$env_file" ]] || { echo "FATAL: env 不可读:$env_file" >&2; exit 1; }
+dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+[[ -n "$dburl" ]] || { echo "FATAL: DATABASE_URL missing:$env_file" >&2; exit 1; }
+ready="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT (
+  has_table_privilege(current_user,'public.product_friction_events','SELECT')
+  AND has_table_privilege(current_user,'public.product_friction_events','INSERT')
+  AND has_table_privilege(current_user,'public.product_friction_events','UPDATE')
+  AND has_table_privilege(current_user,'public.product_friction_events','DELETE')
+  AND has_table_privilege(current_user,'public.image_generation_attempts','SELECT')
+  AND has_table_privilege(current_user,'public.image_generation_attempts','INSERT')
+  AND has_table_privilege(current_user,'public.image_generation_attempts','UPDATE')
+  AND has_table_privilege(current_user,'public.image_generation_attempts','DELETE')
+  AND has_sequence_privilege(current_user,'public.image_generation_attempts_id_seq','SELECT')
+  AND has_sequence_privilege(current_user,'public.image_generation_attempts_id_seq','USAGE')
+  AND has_function_privilege(current_user,'public.canonicalize_legacy_codex_terminal_snapshot()','EXECUTE')
+  AND has_function_privilege(current_user,'public.oc_0151_canonicalize_billing_array(jsonb)','EXECUTE')
+  AND has_function_privilege(current_user,'public.canonicalize_legacy_lossless_tape_header()','EXECUTE')
+  AND has_function_privilege(current_user,'public.canonicalize_legacy_lossless_agent_group()','EXECUTE')
+  AND has_function_privilege(current_user,'public.reject_finalized_lossless_tape_part()','EXECUTE')
+  AND has_function_privilege(current_user,'public.capture_legacy_image_attempt_on_terminal()','EXECUTE')
+  AND has_function_privilege(current_user,'public.clear_github_workspace_on_session_delete()','EXECUTE')
+  AND (SELECT pg_get_userbyid(c.relowner)='openclaude' FROM pg_class c
+        WHERE c.oid='public.product_friction_events'::regclass)
+  AND (SELECT pg_get_userbyid(c.relowner)='openclaude' FROM pg_class c
+        WHERE c.oid='public.image_generation_attempts'::regclass)
+  AND (SELECT pg_get_userbyid(c.relowner)='openclaude' FROM pg_class c
+        WHERE c.oid='public.image_generation_attempts_id_seq'::regclass)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.canonicalize_legacy_codex_terminal_snapshot()'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.oc_0151_canonicalize_billing_array(jsonb)'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.canonicalize_legacy_lossless_tape_header()'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.canonicalize_legacy_lossless_agent_group()'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.reject_finalized_lossless_tape_part()'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.capture_legacy_image_attempt_on_terminal()'::regprocedure)
+  AND (SELECT pg_get_userbyid(p.proowner)='openclaude' FROM pg_proc p
+        WHERE p.oid='public.clear_github_workspace_on_session_delete()'::regprocedure)
+)::text" | tr -d '[:space:]')"
+[[ "$ready" == true ]] || { echo "FATAL: 0151 runtime privileges incomplete for DATABASE_URL role" >&2; exit 1; }
+REMOTE
+  then
+    echo "  ✓ 0151 runtime ownership/privileges 完整"
+  else
+    echo "✗ 0151 runtime ownership/privileges 校验失败（迁移可能由错误 owner apply）" >&2
+    return 1
+  fi
+}
+
 # 普通 deploy/dist/rollback 的短维护窗。只把 restart 前“即时确认健康”的检查写进
 # marker，部署前已坏/无法确认的项继续正常告警。schema=2 与 offline cutover 的
 # schema=1 共用一把远端锁，但互不覆盖、互不清理。
@@ -3192,6 +3256,7 @@ bootstrap() {
   sshk "set -e; if [ -f '$V5_ENV' ]; then echo '  ⚠ $V5_ENV 已存在 → 保留现网 env(权威=现网文件,含热修密钥),跳过派生;如确要重建请先手动移走该文件'; exit 0; fi; preserved_secret=''; pid=\$(systemctl show -p MainPID --value openclaude-v5-egress 2>/dev/null || true); if [ -n \"\$pid\" ] && [ \"\$pid\" != 0 ] && [ -r /proc/\$pid/environ ]; then preserved_secret=\$(tr '\\0' '\\n' < /proc/\$pid/environ | sed -n 's/^OC_EGRESS_SECRET=//p' | tail -n 1 || true); fi; if [ -z \"\$preserved_secret\" ]; then preserved_secret=\$(openssl rand -hex 32); fi; grep -Ev '^[[:space:]]*(${rmpat})=' '$V3_ENV' > '$V5_ENV.tmp' && { echo ''; echo '# ===== v5 overrides (deploy-v5.sh) ====='; cat /tmp/commercial-v5.env.overrides; printf '\nOC_EGRESS_SECRET=%s\n' \"\$preserved_secret\"; } >> '$V5_ENV.tmp' && mv '$V5_ENV.tmp' '$V5_ENV' && chmod 600 '$V5_ENV'"
   echo "── 4.5) release metadata 数据库前置硬门 ──"
   assert_repo_required_migrations
+  assert_0151_runtime_privileges
   # 5) systemd unit(master + egress 一并装:见 V5_EGRESS_UNIT 定义处的踩雷说明)
   echo "── 5) 安装 $V5_UNIT + $V5_EGRESS_UNIT ──"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_UNIT' '$KL_HOST:/etc/systemd/system/$V5_UNIT'"
@@ -4757,6 +4822,11 @@ fi
 # 在任何 release/symlink/unit/Caddy/状态机副作用前统一 fail-closed。
 if [[ "$MODE" != "smoke" && "$MODE" != "bootstrap" ]]; then
   assert_repo_required_migrations || exit 1
+fi
+# Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后
+# 于 4.5 步单独执行。其余模式在任何远端状态副作用前统一 fail-closed。
+if [[ "$MODE" != "bootstrap" ]]; then
+  assert_0151_runtime_privileges || exit 1
 fi
 
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新

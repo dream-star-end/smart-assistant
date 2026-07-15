@@ -334,11 +334,33 @@ SessionManager submit 双闸均确认无在途 turn 才回收,握手失败/繁�
 **只有 bootstrap 会重新生成**;平时改 overrides 必须手动把差异同步到线上 env(先 `cp env env.bak-<date>`)。改完核对:线上 env 键集 = 继承∪overrides∪secret(双向差集为空)。
 
 ### 4.5 迁移人工 apply(0096+ 惯例)
+
+生产 `DATABASE_URL` 是运行期 `openclaude_app` 角色，**不得**拿它执行 DDL；反过来，直接
+以 `postgres` 跑 migration 又会让新对象归属 postgres、绕过 `openclaude` 的 default ACL，
+出现“`schema_migrations` 已记账但应用角色无权读写”的假就绪。人工 apply 必须复刻 runner
+的同一把 session advisory lock，并在事务内 `SET LOCAL ROLE openclaude`：
+
 ```bash
-ssh kl-mirror 'DBURL=$(grep ^DATABASE_URL= /etc/openclaude/commercial-v5.env | cut -d= -f2-); psql "$DBURL" -v ON_ERROR_STOP=1'
-BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES ('<文件名不带.sql>', now()) ON CONFLICT DO NOTHING; COMMIT;
+MIG=packages/commercial/src/db/migrations/<NNNN_name.sql>
+VERSION=$(basename "$MIG" .sql)
+DBNAME=$(ssh kl-mirror 'DBURL=$(grep ^DATABASE_URL= /etc/openclaude/commercial-v5.env | cut -d= -f2-); python3 -c '\''import sys,urllib.parse; print(urllib.parse.urlparse(sys.argv[1]).path.lstrip("/"))'\'' "$DBURL"')
+
+{
+  echo 'SELECT pg_advisory_lock(54729267713);'
+  echo 'BEGIN;'
+  echo 'SET LOCAL ROLE openclaude;'
+  cat "$MIG"
+  printf "\nINSERT INTO schema_migrations(version, applied_at) VALUES ('%s', now()) ON CONFLICT DO NOTHING;\n" "$VERSION"
+  echo 'COMMIT;'
+  echo 'SELECT pg_advisory_unlock(54729267713);'
+} | ssh kl-mirror "sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d '$DBNAME'"
 ```
-版本记账格式=文件名去 `.sql`(必须与既有行一致,否则 runner 对账守卫会炸);psql 造数/迁移**必须显式 COMMIT**。
+
+版本记账格式=文件名去 `.sql`(必须与既有行一致,否则 runner 对账守卫会炸)；psql 造数/迁移
+**必须显式 COMMIT**。执行后必须核对新表/序列/函数 owner=`openclaude`，并以
+`SET ROLE openclaude_app` 做 `BEGIN → 最小 INSERT/UPDATE/SELECT → ROLLBACK` 权限冒烟，确保
+零测试残留。`deploy-v5.sh`/`--smoke` 另有 0151 runtime 对象 owner + 逐项权限硬门；仅有
+migration 记账行而 owner/grants 不完整会 fail-closed。
 
 `deploy/v5/release-metadata.json.requiredMigrations` 是所有 deploy/dist/rollback/canary/
 finalize/abort/recover 等写 lane 的统一硬门；目标 rollback/canary release 还会按自己的 metadata

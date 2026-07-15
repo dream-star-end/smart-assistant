@@ -169,6 +169,94 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(combined, /SIDE_EFFECT/)
   })
 
+  test('0151 application-role privilege gate covers every runtime object before dispatch and smoke', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const body = source.match(/assert_0151_runtime_privileges\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    for (const object of [
+      'product_friction_events',
+      'image_generation_attempts',
+      'image_generation_attempts_id_seq',
+      'canonicalize_legacy_codex_terminal_snapshot()',
+      'oc_0151_canonicalize_billing_array(jsonb)',
+      'canonicalize_legacy_lossless_tape_header()',
+      'canonicalize_legacy_lossless_agent_group()',
+      'reject_finalized_lossless_tape_part()',
+      'capture_legacy_image_attempt_on_terminal()',
+      'clear_github_workspace_on_session_delete()',
+    ]) {
+      assert.match(body, new RegExp(object.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    }
+    assert.equal((body.match(/has_table_privilege\(/g) ?? []).length, 8)
+    assert.equal((body.match(/has_sequence_privilege\(/g) ?? []).length, 2)
+    assert.doesNotMatch(body, /'SELECT,INSERT|SELECT,USAGE'/)
+    assert.equal((body.match(/pg_get_userbyid\(/g) ?? []).length, 10)
+    assert.match(body, /='openclaude'/)
+    const sourceOnlyAt = source.indexOf('V5_DEPLOY_SOURCE_ONLY')
+    const gateAt = source.indexOf('assert_0151_runtime_privileges || exit 1', sourceOnlyAt)
+    const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
+    assert.ok(gateAt > sourceOnlyAt && dispatchAt > gateAt)
+    assert.match(source, /bootstrap\(\) \{[\s\S]*assert_repo_required_migrations\n\s*assert_0151_runtime_privileges/)
+
+    const smokeDryRun = run(deploy, ['--smoke', '--dry-run'])
+    assert.equal(smokeDryRun.status, 0, smokeDryRun.stderr || smokeDryRun.stdout)
+    assert.match(smokeDryRun.stdout, /校验 0151 runtime 对象 owner 与应用角色逐项权限/)
+  })
+
+  test('0151 privilege transport/query failure is fail-closed', () => {
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ssh() { cat >/dev/null; return 23; }',
+      'assert_0151_runtime_privileges || exit 1',
+      'printf "%s\\n" SIDE_EFFECT',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    const combined = result.stdout + result.stderr
+    assert.notEqual(result.status, 0)
+    assert.match(combined, /0151 runtime ownership\/privileges 校验失败/)
+    assert.doesNotMatch(combined, /SIDE_EFFECT/)
+  })
+
+  test('0151 privilege gate rejects a false capability result and accepts only complete true', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-0151-privileges-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const envFile = path.join(dir, 'commercial-v5.env')
+    await writeFile(envFile, 'DATABASE_URL=postgres://unused/runtime\n')
+    await writeFile(path.join(bin, 'psql'), '#!/bin/sh\nprintf "%s\\n" "$FAKE_PSQL_READY"\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `V5_ENV='${envFile}'`,
+      'KL_HOST=fake-v5',
+      'ssh() { shift; command "$@"; }',
+      'assert_0151_runtime_privileges || exit 1',
+      'printf "%s\\n" SIDE_EFFECT',
+    ].join('\n')
+    const runReady = (ready: 'true' | 'false') => spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        FAKE_PSQL_READY: ready,
+        PATH: `${bin}:${process.env.PATH}`,
+      },
+    })
+    const incomplete = runReady('false')
+    assert.notEqual(incomplete.status, 0)
+    assert.doesNotMatch(incomplete.stdout + incomplete.stderr, /SIDE_EFFECT/)
+    const complete = runReady('true')
+    assert.equal(complete.status, 0, complete.stderr || complete.stdout)
+    assert.match(complete.stdout, /SIDE_EFFECT/)
+  })
+
   test('finalize/abort verify the target before irreversible state changes', async () => {
     const source = await readFile(deploy, 'utf8')
     const finalizeBody = source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''

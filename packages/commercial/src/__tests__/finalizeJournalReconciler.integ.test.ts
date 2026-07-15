@@ -2,7 +2,7 @@
  * B1 真 PG 集成测试:reconcileStuckFinalizeJournal / gcFinalizeJournal 的 SQL 行为。
  *
  * 单元测试(finalizeJournalReconciler.test.ts)只覆盖 sweeper 包装层 + 阈值钳制;
- * 这里锁真 PG:两条 CAS UPDATE 的分类(有/无 usage_records)、状态守卫(只动
+ * 这里锁真 PG:三条 CAS UPDATE 的分类(usage/legacy/durable)、状态守卫(只动
  * inflight/finalizing、不碰终态)、aborted 字段、committed 回填 usage_id/ledger_id/
  * final_credits、GC 只删老终态行且尊重 LIMIT。
  *
@@ -13,10 +13,14 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import {
+  DEFAULT_DURABLE_WAIVER_AGE_MS,
   gcFinalizeJournal,
   reconcileStuckFinalizeJournal,
 } from '../billing/finalizeJournalReconciler.js'
-import { DURABLE_CODEX_RECOVERY_VERSION } from '../billing/codexFinalizer.js'
+import {
+  DURABLE_CODEX_RECOVERY_VERSION,
+  permanentCodexWaiverReason,
+} from '../billing/codexFinalizer.js'
 import {
   abortInflightJournal,
   claimInflightJournalForSettlement,
@@ -32,6 +36,7 @@ const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB
 const THRESHOLD_MS = 1_800_000 // 30min
 const STUCK_MS = 2_400_000 // 40min(> 阈值 → stuck)
 const FRESH_MS = 60_000 // 1min(< 阈值 → 不动)
+const DURABLE_EXPIRED_MS = 25 * 3_600_000 // 25h(> durable recovery SLA)
 const GC_AGE_MS = 7 * 24 * 3_600_000 // 7d
 const OLD_TERMINAL_MS = 8 * 24 * 3_600_000 // 8d(> GC age)
 
@@ -140,7 +145,13 @@ async function insertUsage(
 async function insertJournal(
   requestId: string,
   userId: bigint,
-  opts: { state?: string; ageMs?: number; precheck?: bigint; durable?: boolean } = {},
+  opts: {
+    state?: string
+    ageMs?: number
+    precheck?: bigint
+    durable?: boolean
+    settlementClaimId?: string
+  } = {},
 ): Promise<void> {
   const state = opts.state ?? 'inflight'
   const ageMs = opts.ageMs ?? 0
@@ -154,6 +165,7 @@ async function insertJournal(
       JSON.stringify({
         model: 'claude-x',
         ...(opts.durable ? { durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION } : {}),
+        ...(opts.settlementClaimId ? { settlementClaimId: opts.settlementClaimId } : {}),
       }),
       precheck.toString(),
       state,
@@ -170,6 +182,8 @@ async function getJournal(
   usage_id: string | null
   ledger_id: string | null
   error_msg: string | null
+  failure_code: string | null
+  settlement_claim_id: string | null
 } | null> {
   const r = await query<{
     state: string
@@ -177,9 +191,12 @@ async function getJournal(
     usage_id: string | null
     ledger_id: string | null
     error_msg: string | null
+    failure_code: string | null
+    settlement_claim_id: string | null
   }>(
     `SELECT state, final_credits::text AS final_credits, usage_id::text AS usage_id,
-            ledger_id::text AS ledger_id, error_msg
+            ledger_id::text AS ledger_id, error_msg, failure_code,
+            ctx->>'settlementClaimId' AS settlement_claim_id
        FROM request_finalize_journal WHERE request_id=$1`,
     [requestId],
   )
@@ -268,6 +285,7 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.committed, 1)
     assert.equal(res.aborted, 0)
+    assert.equal(res.durableWaived, 0)
     const j = await getJournal('r1')
     assert.equal(j?.state, 'committed')
     assert.equal(j?.final_credits, '137')
@@ -285,6 +303,7 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.committed, 2)
     assert.equal(res.aborted, 0)
+    assert.equal(res.durableWaived, 0)
     assert.equal((await getJournal('r-bf'))?.state, 'committed')
     assert.equal((await getJournal('r-err'))?.state, 'committed')
   })
@@ -297,6 +316,7 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.committed, 0)
     assert.equal(res.aborted, 2)
+    assert.equal(res.durableWaived, 0)
     const j = await getJournal('r2')
     assert.equal(j?.state, 'aborted')
     assert.equal(j?.error_msg, 'reconciler_timeout')
@@ -310,10 +330,11 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.committed, 0)
     assert.equal(res.aborted, 0)
+    assert.equal(res.durableWaived, 0)
     assert.equal((await getJournal('r4'))?.state, 'inflight')
   })
 
-  test('durable Codex journal 无 usage 时不按年龄 abort', async (t) => {
+  test('durable Codex journal 在 24h evidence SLA 内不按 legacy 年龄 abort', async (t) => {
     if (skipIfNoPg(t)) return
     const u = await createUser('durable@t.co')
     await insertJournal('r-durable', u, {
@@ -323,7 +344,66 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     })
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.aborted, 0)
+    assert.equal(res.durableWaived, 0)
     assert.equal((await getJournal('r-durable'))?.state, 'inflight')
+  })
+
+  test('durable inflight 超过 24h 且无 usage → 永久免单并清 settlement claim', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('durable-expired@t.co')
+    await insertJournal('r-durable-expired', u, {
+      state: 'inflight',
+      ageMs: DURABLE_EXPIRED_MS,
+      durable: true,
+      settlementClaimId: '00000000-0000-4000-8000-000000000001',
+    })
+    const res = await reconcileStuckFinalizeJournal(
+      THRESHOLD_MS,
+      DEFAULT_DURABLE_WAIVER_AGE_MS,
+    )
+    assert.deepEqual(res, { committed: 0, aborted: 0, durableWaived: 1 })
+    const journal = await getJournal('r-durable-expired')
+    assert.equal(journal?.state, 'aborted')
+    assert.equal(
+      journal?.error_msg,
+      permanentCodexWaiverReason('durable_evidence_timeout'),
+    )
+    assert.equal(journal?.failure_code, 'INTERNAL_ERROR')
+    assert.equal(journal?.final_credits, '0')
+    assert.equal(journal?.settlement_claim_id, null)
+  })
+
+  test('durable finalizing 超过 24h 且无 usage → 不抢可能仍存活的 owner', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('durable-finalizing@t.co')
+    await insertJournal('r-durable-finalizing', u, {
+      state: 'finalizing',
+      ageMs: DURABLE_EXPIRED_MS,
+      durable: true,
+      settlementClaimId: '00000000-0000-4000-8000-000000000002',
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.deepEqual(res, { committed: 0, aborted: 0, durableWaived: 0 })
+    const journal = await getJournal('r-durable-finalizing')
+    assert.equal(journal?.state, 'finalizing')
+    assert.equal(journal?.settlement_claim_id, '00000000-0000-4000-8000-000000000002')
+  })
+
+  test('durable 超过 24h 但已有 usage → usage 真相优先修复 committed', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('durable-usage@t.co')
+    const usageId = await insertUsage(u, 'r-durable-usage', { cost: 71n })
+    await insertJournal('r-durable-usage', u, {
+      state: 'inflight',
+      ageMs: DURABLE_EXPIRED_MS,
+      durable: true,
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.deepEqual(res, { committed: 1, aborted: 0, durableWaived: 0 })
+    const journal = await getJournal('r-durable-usage')
+    assert.equal(journal?.state, 'committed')
+    assert.equal(journal?.usage_id, usageId.toString())
+    assert.equal(journal?.final_credits, '71')
   })
 
   test('已终态行(committed/aborted)不被重复处理', async (t) => {
@@ -334,6 +414,7 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
     assert.equal(res.committed, 0)
     assert.equal(res.aborted, 0)
+    assert.equal(res.durableWaived, 0)
     assert.equal((await getJournal('r5'))?.state, 'committed')
     assert.equal((await getJournal('r6'))?.state, 'aborted')
   })

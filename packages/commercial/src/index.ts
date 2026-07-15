@@ -151,6 +151,7 @@ import {
 import {
   startFinalizeJournalReconciler,
   resolveStuckThresholdMs,
+  resolveDurableWaiverAgeMs,
   DEFAULT_RECONCILE_INTERVAL_MS,
   MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
   type ReconcilerHandle as FinalizeJournalReconcilerHandle,
@@ -4331,9 +4332,9 @@ export async function registerCommercial(
   }
 
   // B1 — request_finalize_journal reconciler + GC(migration 0015 承诺、之前漏接)。
-  // 把崩溃后卡 inflight/finalizing 的 journal 行终态化(有结算记录→committed,无→aborted),
-  // 并 GC 老终态行。stuck 阈值对 env 向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min),
-  // 因为 journal 不心跳、不能把存活长流误判成 stuck。
+  // 把崩溃后卡 inflight/finalizing 的 journal 行终态化并 GC 老终态行。legacy stuck
+  // 阈值向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min)；durable Codex 另用 ≥24h
+  // evidence SLA，且只豁免无 usage 的 inflight，绝不抢 finalizing owner。
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     leaderBundle.add({
       name: "finalizeReconciler",
@@ -4349,7 +4350,15 @@ export async function registerCommercial(
           process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
           Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
         );
-        const h = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({ intervalMs, thresholdMs }));
+        const durableWaiverAgeMs = resolveDurableWaiverAgeMs(
+          process.env.COMMERCIAL_FINALIZE_DURABLE_WAIVER_AGE_MS,
+          thresholdMs,
+        );
+        const h = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({
+          intervalMs,
+          thresholdMs,
+          durableWaiverAgeMs,
+        }));
         return { stop: () => h.stop() };
       },
     });
