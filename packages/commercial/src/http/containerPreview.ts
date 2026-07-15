@@ -4,7 +4,7 @@ import type { ContainerPreviewViewport } from '@openclaude/protocol'
 
 import { requireAuth } from './auth.js'
 import type { CommercialHttpDeps, RequestContext } from './handlers.js'
-import { requireUserVerifyDb } from './requireUser.js'
+import { requireActiveAccountVerifyDb } from './requireUser.js'
 import { HttpError, readJsonBody, sendJson } from './util.js'
 
 export async function handleCreateContainerPreviewTicket(
@@ -21,7 +21,7 @@ export async function handleCreateContainerPreviewTicket(
     throw new HttpError(503, 'PREVIEW_UNAVAILABLE', '网页预览暂不可用')
   }
   const user = await requireAuth(req, deps.jwtSecret)
-  if (user.role !== 'user' || !(await requireUserVerifyDb(user.id, deps.v3Supervisor.pool))) {
+  if (!(await requireActiveAccountVerifyDb(user.id, ['user', 'admin'], deps.v3Supervisor.pool))) {
     throw new HttpError(403, 'FORBIDDEN', 'account is not allowed to open a container preview')
   }
   const body = await readJsonBody(req)
