@@ -1907,7 +1907,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      *
      * 拒帧时调用方**必须**跑补偿(`compensate`):这一步之前 codex 路径可能已经开了
      * inflight journal + 占了 preCheck 预扣 + 占了并发槽。留着不管 = 悬空 journal
-     * (reconciler 30min 后才终态化)+ 预扣卡 5min + 槽泄漏。补偿路径复用既有的
+     * (durable reconciler 最早在 24h evidence SLA 后永久免单)+ 预扣卡 5min + 槽泄漏。
+     * 补偿路径复用既有的
      * `snap.abandon()`(abort journal + release reservation)与 `releaseAcquiredSlotForFailure()`
      * —— 不新造第二套回滚语义。
      *
@@ -3376,7 +3377,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         failureCode,
                       );
                     } catch {
-                      // journal abort 失败 — reconciler 会扫到 stuck inflight 兜底。
+                      // journal abort 失败 — durable replay 继续重试；始终无 evidence 时
+                      // reconciler 最早在 24h SLA 后兜底免单。
                     } finally {
                       await releasePreCheck(preCheckRedis, reservationForTurn).catch(() => {});
                     }
@@ -3406,7 +3408,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 这里是 turn 里**最后一个还能无痛掉头**的点:票还没签、帧还没进容器。
               // 从起手 fence 到这一行之间已经跑完 route/acquire/preCheck/journal/历史装配
               // 全部 await —— 安全写完全可能落在中间。重读 epoch,不一致就**整单放弃**:
-              // abort journal(否则悬空 = 漏账/错账,要等 reconciler 30min 兜底)+ 释放
+              // abort journal(否则悬空 = 漏账/错账,最早等 durable reconciler 24h
+              // evidence SLA 兜底免单)+ 释放
               // preCheck 预扣 + 还 codex 槽,一步都不能少。
               let authorityFields: Record<string, unknown> = {};
               if (authorityExec !== null) {
@@ -4834,8 +4837,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             try {
               agentMul = await getAgentCostMultiplier(pgPool, agentId);
             } catch (err) {
-              // 瞬态 DB 错误:**不** abort —— journal 保持 inflight,reconciler 兜底
-              // 终态化(与"桥断不 abort 存活 turn"同一裁决权归属),不把临时故障
+              // 瞬态 DB 错误:**不** abort —— journal 保持 inflight，durable tape 继续重试；
+              // 始终无 evidence 才在 ≥24h SLA 后由 reconciler 免单终态化，不把临时故障
               // 固化成免单。
               billingLog?.error("user-chat-bridge: cross-bridge getAgentCostMultiplier failed — journal left inflight for reconciler", {
                 agentId,
@@ -5027,10 +5030,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // billing 帧随后到达**新桥**时撞上 aborted journal → 整 turn 免费(收入漏洞,
       // e2e 实测复现)。桥对"容器侧 turn 是否存活"不可知,裁决权交给权威源:
       //   - billing 帧到达任意桥(旧桥 drain 窗口 / 新桥 journal 回查)→ settle;
-      //   - turn 真死(容器崩 / billing 帧永失)→ finalizeJournalReconciler 在
-      //     stuck 阈值(≥30min,COMMERCIAL_FINALIZE_RECONCILER_*)后终态化:有
-      //     usage_records 补 committed,无则 aborted('reconciler_timeout',不扣费)
-      //     —— 不产生永久 inflight 泄漏;
+      //   - turn 真死(容器崩 / billing 帧永失)→ finalizeJournalReconciler 先让
+      //     immutable tape 持久重试；有 usage_records 就补 committed。若 durable
+      //     inflight 到独立 evidence SLA(默认 ≥24h,
+      //     COMMERCIAL_FINALIZE_DURABLE_WAIVER_AGE_MS)仍无 usage，才写显式永久免单；
+      //     finalizing owner 绝不按时间 abort。legacy 行仍走 ≥30min timeout；
       //   - preCheck 软预扣不在此处提前释放:settle 时由 finalizer release,否则
       //     Redis TTL(300s)自然回收。代价 = 低余额用户断线后至多 5min 内新 turn
       //     可能被软预扣挡住 —— 但该 turn 确实仍在消耗,语义正确且有界。

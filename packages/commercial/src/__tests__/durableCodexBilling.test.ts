@@ -118,7 +118,7 @@ describe("settleDurableCodexBilling", () => {
     assert.equal(calls, 2, "the non-blocking telemetry transition was still attempted");
   });
 
-  test("committed / explicitly permanent-waived journals are terminal", async () => {
+  test("committed / durable evidence-timeout journals are terminal for late tape replay", async () => {
     for (const [state, expected] of [
       ["committed", "already_committed"],
       ["aborted", "waived"],
@@ -132,7 +132,9 @@ describe("settleDurableCodexBilling", () => {
                 state,
                 user_id: USER_ID.toString(),
                 ctx: {},
-                error_msg: state === "aborted" ? permanentCodexWaiverReason("terminal_no_usage") : null,
+                error_msg: state === "aborted"
+                  ? permanentCodexWaiverReason("durable_evidence_timeout")
+                  : null,
               }],
               rowCount: 1,
             };

@@ -14,8 +14,10 @@
  *   旧 journal 只持久化了 model / codex 元信息,**没有**持久化最终 usage/pricing(结算用的是
  *   内存 snapshot)。因此旧请求崩溃后**无法**重算真实用量、无法"replay 成 committed"。
  *   新 Codex paid-turn 用 immutable turn tape 保存精确 billing evidence,ctx 带
- *   durableBillingRecovery 标记；这类行必须由 tape 无限重试,本 reconciler 不得按时间
- *   abort,GC 也不得删除其恢复裁决。对其余 legacy/Anthropic journal 能安全做的是:
+ *   durableBillingRecovery 标记；这类行先由 tape 持久重试,不得套 legacy 30min 超时。
+ *   但若 24h 后仍没有 tape/usage 证据,继续永久 inflight 只会制造假在途状态；此时仅对
+ *   `inflight` 行写入显式永久免单裁决。`finalizing` 可能仍有 owner/结算事务,绝不按时间
+ *   abort。GC 不删除 durable recovery 的任何终态裁决。对其余 legacy/Anthropic journal:
  *     - 已结算但 journal 没翻终态的(崩在 settle 提交与 journal 更新之间)→ 按 usage_records
  *       这个**持久财务真相**把 journal 补到 committed,并回填 usage_id/ledger_id/final_credits;
  *     - 非 durable 且从未结算的(崩在 observe/settle 之前,无 usage_records)→ 记为 aborted(error_msg=
@@ -33,13 +35,21 @@
  */
 
 import { query } from '../db/queries.js'
-import { DURABLE_CODEX_RECOVERY_VERSION } from './codexFinalizer.js'
+import {
+  DURABLE_CODEX_RECOVERY_VERSION,
+  permanentCodexWaiverReason,
+} from './codexFinalizer.js'
+import { transitionProductFrictionEventIfPresent } from '../productFriction/events.js'
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 60_000
 export const MIN_INTERVAL_MS = 5_000
 /** stuck 判定:行 updated_at 早于 now-threshold 才动。默认 30min。 */
 export const DEFAULT_STUCK_THRESHOLD_MS = 1_800_000
 export const DEFAULT_CODEX_SESSION_MAX_MS = 600_000
+/** Durable Codex evidence can retry for one full day before a no-evidence inflight row is waived. */
+export const DEFAULT_DURABLE_WAIVER_AGE_MS = 24 * 3_600_000
+/** Avoid unsafe/accidental multi-year interval values while keeping a generous operator ceiling. */
+export const MAX_DURABLE_WAIVER_AGE_MS = 365 * 24 * 3_600_000
 /** GC:非 durable Codex 的 committed/aborted 老于该时长才删。 */
 export const DEFAULT_GC_AGE_MS = 7 * 24 * 3_600_000
 export const MIN_GC_AGE_MS = 3_600_000 // 永不删 1h 内的终态行(防误删)
@@ -51,6 +61,7 @@ export const MAX_STUCK_THRESHOLD_MS = 86_400_000
 export interface ReconcileCounts {
   committed: number
   aborted: number
+  durableWaived: number
 }
 
 /**
@@ -77,15 +88,41 @@ export function resolveStuckThresholdMs(
 }
 
 /**
- * 扫 stuck journal 行并终态化。两条 CAS UPDATE:
+ * Durable recovery has a distinct, much longer SLA than legacy stuck rows.
+ * It can only be raised by configuration; its floor is max(24h, stuck threshold).
+ */
+export function resolveDurableWaiverAgeMs(
+  envValue: string | number | undefined,
+  stuckThresholdMs?: number,
+): number {
+  const safeStuck =
+    typeof stuckThresholdMs === 'number' &&
+    Number.isSafeInteger(stuckThresholdMs) &&
+    stuckThresholdMs >= 0
+      ? stuckThresholdMs
+      : DEFAULT_STUCK_THRESHOLD_MS
+  const floor = Math.max(DEFAULT_DURABLE_WAIVER_AGE_MS, safeStuck)
+  const cap = Math.max(floor, MAX_DURABLE_WAIVER_AGE_MS)
+  const raw = Number(envValue)
+  const fromEnv = Number.isSafeInteger(raw) && raw > floor ? raw : floor
+  return Math.min(fromEnv, cap)
+}
+
+/**
+ * 扫 stuck journal 行并终态化。三条 CAS UPDATE:
  *   1) committed:有对应 usage_records(结算记录已落,只是 journal 没翻终态)→ 回填 ids；
  *      不按 status 过滤——journal 'committed' 语义就是"存在结算记录"(success/billing_failed/
  *      codex 0-cost error 都算),与现有 finalizer 一致。
  *   2) aborted:非 durable Codex 且无 usage_records(从未结算的真泄漏)→
  *      记 'reconciler_timeout',不退不扣。带 durable recovery 标记的行保持可重放。
+ *   3) durableWaived:durable `inflight` 超过独立 24h+ SLA 且仍无 usage_records →
+ *      写显式永久免单裁决；晚到 tape 只 ACK waiver。`finalizing` 永不走此时间裁决。
  * 返回各自受影响行数。
  */
-export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promise<ReconcileCounts> {
+export async function reconcileStuckFinalizeJournal(
+  thresholdMs: number,
+  durableWaiverAgeMs: number = DEFAULT_DURABLE_WAIVER_AGE_MS,
+): Promise<ReconcileCounts> {
   const ms = String(Math.max(0, Math.floor(thresholdMs)))
   const committedRes = await query<{ request_id: string }>(
     `UPDATE request_finalize_journal rfj
@@ -122,7 +159,42 @@ export async function reconcileStuckFinalizeJournal(thresholdMs: number): Promis
       RETURNING rfj.request_id`,
     [ms, DURABLE_CODEX_RECOVERY_VERSION],
   )
-  return { committed: committedRes.rowCount ?? 0, aborted: abortedRes.rowCount ?? 0 }
+  const durableMs = String(
+    resolveDurableWaiverAgeMs(durableWaiverAgeMs, Math.max(0, Math.floor(thresholdMs))),
+  )
+  const waiverReason = permanentCodexWaiverReason('durable_evidence_timeout')
+  const durableWaivedRes = await query<{ request_id: string }>(
+    `UPDATE request_finalize_journal rfj
+        SET state = 'aborted',
+            error_msg = $3,
+            final_credits = 0,
+            failure_code = 'INTERNAL_ERROR',
+            ctx = rfj.ctx - 'settlementClaimId',
+            updated_at = NOW()
+      WHERE rfj.state = 'inflight'
+        AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+        AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_records ur
+           WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
+        )
+      RETURNING rfj.request_id`,
+    [durableMs, DURABLE_CODEX_RECOVERY_VERSION, waiverReason],
+  )
+  // Analytics must never roll back or delay a completed billing decision.
+  for (const row of durableWaivedRes.rows) {
+    void transitionProductFrictionEventIfPresent({
+      correlation: row.request_id,
+      surface: 'ws',
+      stage: 'billing_recovery',
+      outcome: 'abandoned',
+    }).catch(() => false)
+  }
+  return {
+    committed: committedRes.rowCount ?? 0,
+    aborted: abortedRes.rowCount ?? 0,
+    durableWaived: durableWaivedRes.rowCount ?? 0,
+  }
 }
 
 /** GC:删非 durable Codex 的终态老行,单批 ≤ limit(最旧优先,确定性)。 */
@@ -148,13 +220,15 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
 export interface ReconcilerHandle {
   stop(): void
   /** 测试/运维:立即跑一轮(reconcile + 视 cadence 决定是否 GC)。与 interval tick 共用 running 守卫。 */
-  runNow(): Promise<{ committed: number; aborted: number; gc: number }>
+  runNow(): Promise<{ committed: number; aborted: number; durableWaived: number; gc: number }>
 }
 
 export interface ReconcilerOptions {
   intervalMs?: number
   /** 调用方应已用 resolveStuckThresholdMs 夹好;这里不再夹(但兜底取默认)。 */
   thresholdMs?: number
+  /** 调用方应已用 resolveDurableWaiverAgeMs 夹好；默认 24h。 */
+  durableWaiverAgeMs?: number
   gcAgeMs?: number
   gcIntervalMs?: number
   gcLimit?: number
@@ -175,10 +249,16 @@ function defaultOnError(err: unknown): void {
 export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): ReconcilerHandle {
   const interval = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS)
   const thresholdMs = opts.thresholdMs ?? DEFAULT_STUCK_THRESHOLD_MS
+  const durableWaiverAgeMs = resolveDurableWaiverAgeMs(
+    opts.durableWaiverAgeMs,
+    thresholdMs,
+  )
   const gcAgeMs = Math.max(MIN_GC_AGE_MS, opts.gcAgeMs ?? DEFAULT_GC_AGE_MS)
   const gcIntervalMs = Math.max(interval, opts.gcIntervalMs ?? DEFAULT_GC_INTERVAL_MS)
   const gcLimit = Math.max(1, opts.gcLimit ?? DEFAULT_GC_LIMIT)
-  const reconcileFn = opts.reconcileFn ?? (() => reconcileStuckFinalizeJournal(thresholdMs))
+  const reconcileFn = opts.reconcileFn ?? (
+    () => reconcileStuckFinalizeJournal(thresholdMs, durableWaiverAgeMs)
+  )
   const gcFn = opts.gcFn ?? (() => gcFinalizeJournal(gcAgeMs, gcLimit))
   const onError = opts.onError ?? defaultOnError
   const runOnStart = opts.runOnStart ?? true
@@ -188,17 +268,24 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
   let running = false
   let lastGcAt = 0 // 0 → 首轮即 GC(部署后立即清历史终态行)
 
-  async function runOneTick(): Promise<{ committed: number; aborted: number; gc: number }> {
-    if (running) return { committed: 0, aborted: 0, gc: 0 } // DB 卡时跳过重叠 tick
+  async function runOneTick(): Promise<{
+    committed: number
+    aborted: number
+    durableWaived: number
+    gc: number
+  }> {
+    if (running) return { committed: 0, aborted: 0, durableWaived: 0, gc: 0 } // DB 卡时跳过重叠 tick
     running = true
     try {
       let committed = 0
       let aborted = 0
+      let durableWaived = 0
       let gc = 0
       try {
         const r = await reconcileFn()
         committed = r.committed
         aborted = r.aborted
+        durableWaived = r.durableWaived
       } catch (err) {
         onError(err)
       }
@@ -211,7 +298,7 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
           onError(err)
         }
       }
-      return { committed, aborted, gc }
+      return { committed, aborted, durableWaived, gc }
     } finally {
       running = false
     }
