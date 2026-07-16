@@ -31,10 +31,13 @@ auth=(-H "Authorization: Bearer $TOK")
 
 detail=$(curl -sf "${auth[@]}" "$V5_BASE/api/marketplace/$SLUG") || { echo "detail 404:$SLUG 不存在或未上架(pending 版本不支持,见脚本头注释)"; exit 2; }
 versionId=$(echo "$detail" | jqpy 'print(json.load(sys.stdin)["detail"]["versionId"])')
-skillName=$(echo "$detail" | jqpy 'print(json.load(sys.stdin)["detail"]["name"])')
+displayName=$(echo "$detail" | jqpy 'print(json.load(sys.stdin)["detail"]["name"])')
 kind=$(echo "$detail" | jqpy 'print(json.load(sys.stdin)["detail"].get("kind","skill"))')
 [ "$kind" = "skill" ] || { echo "仅支持 kind=skill(当前:$kind)"; exit 2; }
-echo "== $SLUG(skill=$skillName, version=$versionId)"
+# 技能技术名 = slug(发布管线钉死 frontmatter name===slug===hub 目录名);
+# detail.name 是人向展示名(可为中文),不能用于 /api/skills/<name> 路径。
+skillName="$SLUG"
+echo "== $SLUG(《$displayName》, version=$versionId)"
 
 was_installed=$(curl -sf "${auth[@]}" "$V5_BASE/api/marketplace/installed" |
   jqpy "print('yes' if any(i.get('slug')=='$SLUG' for i in json.load(sys.stdin).get('installed',[])) else 'no')" 2>/dev/null || echo unknown)
