@@ -36,6 +36,9 @@ export type RatingSubmitInput = {
 export type ResponseRatingCtx = {
   ratings: Map<string, RatingEntry>;
   submit: (input: RatingSubmitInput) => void;
+  /** 方案 a：需一次性脉冲高亮引导的评分行 messageId（高成本 turn 完成后 App 下发，4s 自熄）。
+   *  可选字段，向后兼容既有消费方；仅命中且未评的卡加脉冲类，绝不表示"已选态"。*/
+  nudgeId?: string | null;
 };
 
 const Ctx = createContext<ResponseRatingCtx | null>(null);
@@ -135,6 +138,8 @@ export function ResponseRatingCard({
 
   const committed = ctx.ratings.get(messageId);
   const rating = committed?.rating; // undefined=未评
+  // 脉冲高亮门控:仅当本卡是被引导的那条(nudgeId 命中)且**尚未评过**时点亮 —— 已评用户不再打扰。
+  const nudged = ctx.nudgeId === messageId && !rating;
 
   // 点 thumb：立即静默提交（只带 rating），乐观置已评；同时就地展开细节区。
   // 改评（thumb 切换）时用被点 thumb 已有的标签回填，同 thumb 则沿用其标签。
@@ -160,7 +165,9 @@ export function ResponseRatingCard({
   const tagOptions = rating === "down" ? DOWN_TAGS : UP_TAGS;
 
   return (
-    <div className="mt-1 flex flex-col gap-2">
+    // oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
+    // respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。
+    <div className={cn("mt-1 flex flex-col gap-2", nudged && "oc-rating-nudge")}>
       <div className="flex items-center gap-1.5 text-[12px] text-faint">
         <span>{rating ? "谢谢反馈" : "这条回复怎么样?"}</span>
         <div className="flex items-center gap-0.5">
