@@ -29,6 +29,7 @@ import {
   releaseJobLeasesForOwner,
   renewJobLease,
   setJobCapability,
+  setJobConditionKey,
   setJobSessionKey,
   setJobStatus,
 } from '@openclaude/storage'
@@ -298,6 +299,21 @@ export class SelfhealJobWorker {
     }
     await setJobCapability(repairId, capability)
 
+    // 1.5 Freeze the authoritative condition key BEFORE any turn starts. The
+    //     broker's drill authorization (context/report only for drill repairs)
+    //     reads this frozen value — proceeding without it would let a drill
+    //     repair verify/cutover, so this is fail-closed like the capability:
+    //     leave 'starting', retry next tick after the lease expires.
+    if (job.conditionKey === null) {
+      try {
+        const conditionKey = await this.fetchConditionKey(repairId, capability)
+        await setJobConditionKey(repairId, conditionKey)
+      } catch (err) {
+        log.warn('condition key freeze failed — will retry after lease expiry', { repairId }, err)
+        return
+      }
+    }
+
     // 2. Resolve the repair agent (block C provisions `codex-v5ops`).
     const agent = await this.deps.resolveAgent(SELFHEAL_AGENT_ID)
     if (!agent) {
@@ -511,5 +527,40 @@ export class SelfhealJobWorker {
       fetchImpl: this.deps.fetchImpl,
       timeoutMs: CAPABILITY_FETCH_TIMEOUT_MS,
     })
+  }
+
+  /**
+   * Fetch the AUTHORITATIVE condition key from the v5 master context (capability
+   * auth). This is the value the broker's drill authorization reads — it must be
+   * frozen onto the job row BEFORE any repair turn starts (fail-closed: a repair
+   * whose key cannot be frozen does not run this tick). Only the condition key
+   * is extracted; the full context stays a model-side pull via `oc-selfheal
+   * context` so no free-text detour opens here.
+   */
+  private async fetchConditionKey(repairId: string, capability: string): Promise<string> {
+    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/context`
+    const ctrl = new AbortController()
+    const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
+    try {
+      const f = this.deps.fetchImpl ?? fetch
+      const res = await f(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${capability}` },
+        redirect: 'manual',
+        signal: ctrl.signal,
+      })
+      if (!res.ok) throw new Error(`context HTTP ${res.status}`)
+      // The master returns the RepairContext object directly (see v5
+      // http/internal/selfhealRepairs.ts `context` route) — conditionKey is a
+      // top-level field.
+      const body = (await res.json()) as { conditionKey?: unknown }
+      const key = body?.conditionKey
+      if (typeof key !== 'string' || key.length === 0 || key.length > 256) {
+        throw new Error('context response carries no usable conditionKey')
+      }
+      return key
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 }

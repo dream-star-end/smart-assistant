@@ -62,13 +62,21 @@ function fakeSessionManager() {
   return mgr
 }
 
-/** fetch stub: answers claim-capability with a token and records every call. */
-function fakeFetch() {
+/** fetch stub: answers claim-capability with a token, context with the
+ *  authoritative condition key (frozen before any submit), records calls. */
+function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5') {
   const calls: { url: string; init?: RequestInit }[] = []
   const impl = (async (url: string | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init })
     if (String(url).includes('/claim-capability')) {
       return { ok: true, status: 200, json: async () => ({ token: 'cap-test' }) }
+    }
+    if (String(url).endsWith('/context')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => (conditionKey === null ? {} : { conditionKey }),
+      }
     }
     return { ok: true, status: 200, json: async () => ({}) }
   }) as unknown as typeof fetch
@@ -324,5 +332,35 @@ describe('terminal worker failures are reported exactly when the failed CAS wins
 
     assert.equal((await getJob('w-final-error'))?.status, 'failed')
     assert.equal(calls.filter((c) => c.url.includes('/repairs/w-final-error/failed')).length, 1)
+  })
+})
+
+describe('condition key freeze — before any submit, fail-closed (batch0)', () => {
+  it('freezes the authoritative condition key onto the job before the turn starts', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch('selfheal.drill:transport_v1')
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-freeze')
+    await worker.processJob(job)
+
+    const after = await getJob('w-freeze')
+    assert.equal(after?.conditionKey, 'selfheal.drill:transport_v1')
+    assert.equal(sessions.state.submits.length, 1)
+    const contextCall = calls.findIndex((c) => c.url.endsWith('/context'))
+    const capabilityCall = calls.findIndex((c) => c.url.includes('/claim-capability'))
+    assert.ok(contextCall > capabilityCall, 'context is fetched with the claimed capability')
+  })
+
+  it('fail-closed: no usable conditionKey ⇒ zero submit, job stays starting for retry', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch(null) // context answers {} — nothing to freeze
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-freeze-fail')
+    await worker.processJob(job)
+
+    assert.equal(sessions.state.submits.length, 0, 'a turn must never start unfrozen')
+    const after = await getJob('w-freeze-fail')
+    assert.equal(after?.status, 'starting', 'job is left for a later tick (lease retry)')
+    assert.equal(after?.conditionKey, null)
   })
 })

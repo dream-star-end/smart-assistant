@@ -82,6 +82,7 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
       lease_until  INTEGER NOT NULL DEFAULT 0,
       session_key  TEXT,
       release_revoked INTEGER NOT NULL DEFAULT 0,
+      condition_key TEXT,
       created_at   INTEGER NOT NULL,
       updated_at   INTEGER NOT NULL
 `
@@ -129,6 +130,19 @@ function ensureReleaseRevokedColumn(db: Database.Database): void {
   const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
   if (cols.some((c) => c.name === 'release_revoked')) return
   db.exec('ALTER TABLE selfheal_jobs ADD COLUMN release_revoked INTEGER NOT NULL DEFAULT 0')
+}
+
+/**
+ * Idempotent schema guard: `condition_key` freezes the AUTHORITATIVE condition
+ * key of the dispatched incident onto the job row (fetched from the v5 master
+ * via the root-held capability at job start — never from the model). The
+ * broker authorizes drill repairs against this frozen value; NULL means the
+ * key was never frozen (legacy row) and is treated as non-drill.
+ */
+function ensureConditionKeyColumn(db: Database.Database): void {
+  const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
+  if (cols.some((c) => c.name === 'condition_key')) return
+  db.exec('ALTER TABLE selfheal_jobs ADD COLUMN condition_key TEXT')
 }
 
 export async function getSelfhealDb(): Promise<Database.Database> {
@@ -215,6 +229,7 @@ export async function getSelfhealDb(): Promise<Database.Database> {
   // the release_revoked fuse column when a newer-but-pre-fuse DB lacks it.
   ensureCancellingStatusSchema(db)
   ensureReleaseRevokedColumn(db)
+  ensureConditionKeyColumn(db)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
@@ -277,6 +292,9 @@ export interface SelfhealJob {
   /** Cancel-side release fuse: a cancel of a terminal job durably revokes any
    *  held (pending_release) cutover — the broker refuses to release it. */
   releaseRevoked: boolean
+  /** Authoritative condition key frozen from the v5 master context at job
+   *  start (NULL = never frozen; treated as non-drill by the broker). */
+  conditionKey: string | null
   createdAt: number
   updatedAt: number
 }
@@ -302,6 +320,7 @@ interface JobRow {
   lease_until: number
   session_key: string | null
   release_revoked: number
+  condition_key: string | null
   created_at: number
   updated_at: number
 }
@@ -318,6 +337,7 @@ function rowToJob(r: JobRow): SelfhealJob {
     leaseUntil: r.lease_until,
     sessionKey: r.session_key,
     releaseRevoked: r.release_revoked === 1,
+    conditionKey: r.condition_key,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -587,6 +607,17 @@ export async function setJobReleaseRevoked(repairId: string, now = Date.now()): 
     .prepare('UPDATE selfheal_jobs SET release_revoked = 1, updated_at = ? WHERE repair_id = ?')
     .run(now, repairId)
   return res.changes > 0
+}
+
+/** Freeze the authoritative condition key (from the v5 master context) onto
+ *  the job row. Set-once: a frozen value is never overwritten — the first
+ *  root-fetched context wins, so a later (potentially replayed) fetch cannot
+ *  reclassify a drill repair as non-drill or vice versa. */
+export async function setJobConditionKey(repairId: string, conditionKey: string): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    'UPDATE selfheal_jobs SET condition_key = ?, updated_at = ? WHERE repair_id = ? AND condition_key IS NULL',
+  ).run(conditionKey, Date.now(), repairId)
 }
 
 /** Persist the deterministic session key onto the job row. */
