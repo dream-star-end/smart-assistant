@@ -314,6 +314,20 @@ export class SelfhealJobWorker {
       }
     }
 
+    // 1.6 Machine-authored ack: "the execution side accepted this job" is a
+    //     TRANSPORT fact, so the worker signs it — never the model (the retired
+    //     contract expected `oc-selfheal ack` from the agent; the CLI never had
+    //     it, so repairs sat in 'dispatched' forever and every later `done`
+    //     409'd against the master CAS while the ack-budget watchdog counted
+    //     down to cancel). Fail-closed like the freeze: without a confirmed
+    //     acked state the turn's terminal report cannot land, so don't start it.
+    try {
+      await this.postAck(repairId, capability)
+    } catch (err) {
+      log.warn('ack callback failed — will retry after lease expiry', { repairId }, err)
+      return
+    }
+
     // 2. Resolve the repair agent (block C provisions `codex-v5ops`).
     const agent = await this.deps.resolveAgent(SELFHEAL_AGENT_ID)
     if (!agent) {
@@ -527,6 +541,32 @@ export class SelfhealJobWorker {
       fetchImpl: this.deps.fetchImpl,
       timeoutMs: CAPABILITY_FETCH_TIMEOUT_MS,
     })
+  }
+
+  /**
+   * Machine-authored ack callback (capability auth): flips the master-side
+   * repair dispatched→acked. Idempotent on the master (an already-acked/active
+   * repair re-acks as an event append). Must succeed before the turn starts —
+   * the master's progress/done CAS and the ack-budget watchdog both key off
+   * the acked state.
+   */
+  private async postAck(repairId: string, capability: string): Promise<void> {
+    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/ack`
+    const ctrl = new AbortController()
+    const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
+    try {
+      const f = this.deps.fetchImpl ?? fetch
+      const res = await f(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${capability}` },
+        body: JSON.stringify({ message: '执行侧已接单(jobWorker 机器签发)' }),
+        redirect: 'manual',
+        signal: ctrl.signal,
+      })
+      if (!res.ok) throw new Error(`ack HTTP ${res.status}`)
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
   /**
