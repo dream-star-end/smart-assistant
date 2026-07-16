@@ -40,7 +40,19 @@ fi
 
 fail=0
 for name in "${skills[@]}"; do
-  evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$name/evals" || echo '{}')
+  # 取 evals 必须区分"确认无 evals"与"取数失败"(容器冷启动的代理瞬态 5xx 曾把
+  # web-context 静默跳过):失败重试,重试耗尽计 fail 而不是当作无用例跳过。
+  evals=""
+  for attempt in 1 2 3; do
+    evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$name/evals") && break
+    evals=""
+    [ "$attempt" -lt 3 ] && sleep 15
+  done
+  if [ -z "$evals" ]; then
+    echo "== eval $name: FETCH FAILED (evals GET 3 次均失败,非'无 evals')"
+    fail=1
+    continue
+  fi
   cases=$(echo "$evals" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len((d.get("evals") or {}).get("cases",[])))' 2>/dev/null || echo 0)
   [ "$cases" -eq 0 ] && continue
   echo "== eval $name ($cases cases) =="
