@@ -83,6 +83,10 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
       session_key  TEXT,
       release_revoked INTEGER NOT NULL DEFAULT 0,
       condition_key TEXT,
+      execution_class TEXT,
+      action_opcode TEXT,
+      tier1_claimed_at INTEGER,
+      tier1_receipt TEXT,
       created_at   INTEGER NOT NULL,
       updated_at   INTEGER NOT NULL
 `
@@ -143,6 +147,59 @@ function ensureConditionKeyColumn(db: Database.Database): void {
   const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
   if (cols.some((c) => c.name === 'condition_key')) return
   db.exec('ALTER TABLE selfheal_jobs ADD COLUMN condition_key TEXT')
+}
+
+/**
+ * Idempotent schema guard (batch1a): Tier1 routing frozen from the master
+ * context (execution_class + action_opcode, set-once with condition_key) plus
+ * tier1_receipt (set-once record of the executed opcode = at-most-once replay
+ * guard). Plain defaulted columns are ALTER-addable.
+ */
+/**
+ * Idempotent schema guard: an outbox created before batch1a has a phase CHECK
+ * lacking 'failed'. SQLite cannot ALTER a CHECK — rebuild (new table → copy →
+ * drop → rename) in one transaction, preserving in-flight rows.
+ */
+function ensureCallbackFailedPhase(db: Database.Database): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='selfheal_callback_outbox'")
+    .get() as { sql: string } | undefined
+  if (!row || row.sql.includes("'failed'")) return
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE selfheal_callback_outbox_rebuild (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        repair_id       TEXT NOT NULL,
+        phase           TEXT NOT NULL CHECK (phase IN ('pending_release','done','failed')),
+        message         TEXT NOT NULL,
+        detail_json     TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'queued'
+                          CHECK (status IN ('queued','sent','abandoned')),
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        UNIQUE(repair_id, phase)
+      );
+      INSERT INTO selfheal_callback_outbox_rebuild
+        SELECT id, repair_id, phase, message, detail_json, status, attempts,
+               next_attempt_at, created_at, updated_at FROM selfheal_callback_outbox;
+      DROP TABLE selfheal_callback_outbox;
+      ALTER TABLE selfheal_callback_outbox_rebuild RENAME TO selfheal_callback_outbox;
+      CREATE INDEX IF NOT EXISTS idx_selfheal_cb_outbox_due
+        ON selfheal_callback_outbox(status, next_attempt_at);
+    `)
+  })()
+}
+
+function ensureTier1Columns(db: Database.Database): void {
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]).map((c) => c.name),
+  )
+  if (!cols.has('execution_class')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN execution_class TEXT')
+  if (!cols.has('action_opcode')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN action_opcode TEXT')
+  if (!cols.has('tier1_claimed_at')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN tier1_claimed_at INTEGER')
+  if (!cols.has('tier1_receipt')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN tier1_receipt TEXT')
 }
 
 export async function getSelfhealDb(): Promise<Database.Database> {
@@ -209,7 +266,7 @@ export async function getSelfhealDb(): Promise<Database.Database> {
     CREATE TABLE IF NOT EXISTS selfheal_callback_outbox (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       repair_id       TEXT NOT NULL,
-      phase           TEXT NOT NULL CHECK (phase IN ('pending_release','done')),
+      phase           TEXT NOT NULL CHECK (phase IN ('pending_release','done','failed')),
       message         TEXT NOT NULL,
       detail_json     TEXT NOT NULL,
       status          TEXT NOT NULL DEFAULT 'queued'
@@ -230,6 +287,8 @@ export async function getSelfhealDb(): Promise<Database.Database> {
   ensureCancellingStatusSchema(db)
   ensureReleaseRevokedColumn(db)
   ensureConditionKeyColumn(db)
+  ensureTier1Columns(db)
+  ensureCallbackFailedPhase(db)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
@@ -295,6 +354,17 @@ export interface SelfhealJob {
   /** Authoritative condition key frozen from the v5 master context at job
    *  start (NULL = never frozen; treated as non-drill by the broker). */
   conditionKey: string | null
+  /** Tier1 routing frozen from the master context (set-once with conditionKey):
+   *  executionClass = 'tier1' | 'tier2' | null(unfrozen); actionOpcode present
+   *  only for tier1. */
+  executionClass: 'tier1' | 'tier2' | null
+  actionOpcode: string | null
+  /** Tier1 PRE-CLAIM timestamp (set-once BEFORE the SSH): the at-most-once
+   *  gate. Only the claim winner transmits; a crash leaving claimed-without-
+   *  receipt is settled as 'unknown' (never re-transmitted). */
+  tier1ClaimedAt: number | null
+  /** Set-once record of the executed Tier1 opcode receipt (JSON). */
+  tier1Receipt: string | null
   createdAt: number
   updatedAt: number
 }
@@ -321,6 +391,10 @@ interface JobRow {
   session_key: string | null
   release_revoked: number
   condition_key: string | null
+  execution_class: string | null
+  action_opcode: string | null
+  tier1_claimed_at: number | null
+  tier1_receipt: string | null
   created_at: number
   updated_at: number
 }
@@ -338,6 +412,11 @@ function rowToJob(r: JobRow): SelfhealJob {
     sessionKey: r.session_key,
     releaseRevoked: r.release_revoked === 1,
     conditionKey: r.condition_key,
+    executionClass:
+      r.execution_class === 'tier1' || r.execution_class === 'tier2' ? r.execution_class : null,
+    actionOpcode: r.action_opcode,
+    tier1ClaimedAt: r.tier1_claimed_at,
+    tier1Receipt: r.tier1_receipt,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -618,6 +697,49 @@ export async function setJobConditionKey(repairId: string, conditionKey: string)
   db.prepare(
     'UPDATE selfheal_jobs SET condition_key = ?, updated_at = ? WHERE repair_id = ? AND condition_key IS NULL',
   ).run(conditionKey, Date.now(), repairId)
+}
+
+/** Atomically freeze the full authoritative routing (condition_key +
+ *  execution_class + action_opcode) in ONE write (BLOCKER1: two separate
+ *  set-once writes could interleave a crash and mix two context versions).
+ *  Anchored set-once on condition_key: the first root-fetched routing wins. */
+export async function setJobFrozenRouting(
+  repairId: string,
+  conditionKey: string,
+  executionClass: 'tier1' | 'tier2',
+  actionOpcode: string | null,
+): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    'UPDATE selfheal_jobs SET condition_key = ?, execution_class = ?, action_opcode = ?, updated_at = ? WHERE repair_id = ? AND condition_key IS NULL',
+  ).run(conditionKey, executionClass, actionOpcode, Date.now(), repairId)
+}
+
+/** Atomic Tier1 PRE-CLAIM (BLOCKER2): a single conditional UPDATE that sets
+ *  tier1_claimed_at only when it is still NULL. Returns true for the ONE caller
+ *  that won the claim — only the winner may transmit the SSH opcode. A crash
+ *  after this (claimed) but before the receipt is settled as 'unknown' on
+ *  re-claim, never a re-transmit. */
+export async function claimJobTier1(repairId: string, now = Date.now()): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      'UPDATE selfheal_jobs SET tier1_claimed_at = ?, updated_at = ? WHERE repair_id = ? AND tier1_claimed_at IS NULL',
+    )
+    .run(now, now, repairId)
+  return res.changes > 0
+}
+
+/** Record the Tier1 opcode receipt. Set-once — the committed record after a
+ *  won pre-claim + SSH. */
+export async function setJobTier1Receipt(repairId: string, receiptJson: string): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      'UPDATE selfheal_jobs SET tier1_receipt = ?, updated_at = ? WHERE repair_id = ? AND tier1_receipt IS NULL',
+    )
+    .run(receiptJson, Date.now(), repairId)
+  return res.changes > 0
 }
 
 /** Persist the deterministic session key onto the job row. */
@@ -990,7 +1112,7 @@ export async function overwriteBrokerActionResponse(
 
 // ── broker→master callback outbox (durable delivery — BLOCKER2) ──────────────
 
-export type SelfhealCallbackPhase = 'pending_release' | 'done'
+export type SelfhealCallbackPhase = 'pending_release' | 'done' | 'failed'
 export type SelfhealCallbackStatus = 'queued' | 'sent' | 'abandoned'
 
 export interface SelfhealCallbackRow {
@@ -1047,6 +1169,47 @@ function rowToCallback(r: CallbackOutboxDbRow): SelfhealCallbackRow {
  * 事务失败时 claim 保持 'claimed'(replay=in_progress,fail-closed 绝不重跑副作用),
  * 由调用方如实上报 commit_failed。
  */
+/**
+ * ATOMICALLY terminalize a Tier1 job AND enqueue its terminal callback in ONE
+ * SQLite transaction (BLOCKER: enqueue + terminal status must not be two
+ * commits — a crash between them leaves a delivered callback + a local running
+ * orphan; and a cancel that terminalized first must make this CAS lose so no
+ * stale callback is enqueued). The CAS gates the enqueue: if the job is no
+ * longer in `fromStatuses` (a cancel won), NOTHING is enqueued and this returns
+ * false. Idempotent enqueue per (repairId, phase). EVERY Tier1 terminal path
+ * (completed/action_failed/unknown → done; rejected/drift/unprovisioned →
+ * failed) goes through here — no best-effort fire-and-forget callback remains.
+ */
+export async function terminalizeTier1WithCallback(input: {
+  repairId: string
+  fromStatuses: SelfhealJobStatus[]
+  toStatus: 'succeeded' | 'failed'
+  phase: 'done' | 'failed'
+  message: string
+  detail: Record<string, unknown>
+  now?: number
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const now = input.now ?? Date.now()
+  const placeholders = input.fromStatuses.map(() => '?').join(',')
+  const txn = db.transaction(() => {
+    const cas = db
+      .prepare(
+        `UPDATE selfheal_jobs SET status = ?, updated_at = ? WHERE repair_id = ? AND status IN (${placeholders})`,
+      )
+      .run(input.toStatus, now, input.repairId, ...input.fromStatuses)
+    if (cas.changes === 0) return false // a cancel (or prior terminal) won — no callback
+    db.prepare(`
+      INSERT INTO selfheal_callback_outbox
+        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      ON CONFLICT(repair_id, phase) DO NOTHING
+    `).run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
+    return true
+  })
+  return txn()
+}
+
 export async function commitBrokerOutcomeWithCallback(input: {
   finalize: { claimKey: string; response: string }[]
   overwriteCommitted?: { claimKey: string; response: string }

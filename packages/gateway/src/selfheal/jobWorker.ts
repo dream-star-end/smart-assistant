@@ -28,13 +28,23 @@ import {
   reclaimOrphanedLeases,
   releaseJobLeasesForOwner,
   renewJobLease,
+  claimJobTier1,
   setJobCapability,
-  setJobConditionKey,
+  setJobFrozenRouting,
   setJobSessionKey,
   setJobStatus,
+  setJobTier1Receipt,
+  terminalizeTier1WithCallback,
 } from '@openclaude/storage'
 import { createLogger } from '../logger.js'
 import type { SessionManager } from '../sessionManager.js'
+import {
+  CONDITION_OPCODE_MAP,
+  type HostActionConfig,
+  type HostActionReceipt,
+  executeHostOpcode,
+  hostActionConfigFromEnv,
+} from './hostAction.js'
 import {
   SELFHEAL_AGENT_ID,
   buildRepairPrompt,
@@ -77,6 +87,11 @@ export interface SelfhealJobWorkerDeps {
   prepareClone?: (opts: PrepareCloneOpts) => Promise<PrepareCloneResult>
   /** Injectable fetch (tests). Defaults to global fetch. */
   fetchImpl?: typeof fetch
+  /** Injectable Tier1 host-action config resolver (tests). `undefined` ⇒ read
+   *  from env; an explicit `null` ⇒ not provisioned (fail-closed). */
+  hostActionConfig?: HostActionConfig | null
+  /** Injectable Tier1 opcode transport (tests). Defaults to the real SSH. */
+  executeHostOpcode?: typeof executeHostOpcode
 }
 
 /** Build worker deps from env, or null when the feature is not fully configured. */
@@ -299,19 +314,39 @@ export class SelfhealJobWorker {
     }
     await setJobCapability(repairId, capability)
 
-    // 1.5 Freeze the authoritative condition key BEFORE any turn starts. The
-    //     broker's drill authorization (context/report only for drill repairs)
-    //     reads this frozen value — proceeding without it would let a drill
-    //     repair verify/cutover, so this is fail-closed like the capability:
-    //     leave 'starting', retry next tick after the lease expires.
-    if (job.conditionKey === null) {
+    // 1.5 Freeze the authoritative ROUTING (condition key + executionClass +
+    //     actionOpcode) from the master context BEFORE any action or turn. The
+    //     master is the single authority on how a class is repaired — the
+    //     execution side never guesses tier. Fail-closed like the capability:
+    //     leave 'starting', retry next tick after the lease expires. Set-once,
+    //     so a replayed/late context cannot reclassify tier or swap the opcode.
+    if (job.conditionKey === null || job.executionClass === null) {
       try {
-        const conditionKey = await this.fetchConditionKey(repairId, capability)
-        await setJobConditionKey(repairId, conditionKey)
+        const fetched = await this.fetchRouting(repairId, capability)
+        // ONE atomic set-once write (BLOCKER1): condition + class + opcode
+        // together, so a crash can never mix two context versions.
+        await setJobFrozenRouting(
+          repairId,
+          fetched.conditionKey,
+          fetched.executionClass,
+          fetched.actionOpcode,
+        )
       } catch (err) {
-        log.warn('condition key freeze failed — will retry after lease expiry', { repairId }, err)
+        log.warn('routing freeze failed — will retry after lease expiry', { repairId }, err)
         return
       }
+    }
+    // Read the AUTHORITATIVE frozen values back from the row (never the
+    // in-memory fetch result) — everything downstream uses the durable freeze.
+    const frozen = await getJob(repairId)
+    if (!frozen || frozen.conditionKey === null || frozen.executionClass === null) {
+      log.warn('routing not frozen after write — will retry', { repairId })
+      return
+    }
+    const routing = {
+      conditionKey: frozen.conditionKey,
+      executionClass: frozen.executionClass,
+      actionOpcode: frozen.actionOpcode,
     }
 
     // 1.6 Machine-authored ack: "the execution side accepted this job" is a
@@ -320,11 +355,23 @@ export class SelfhealJobWorker {
     //     it, so repairs sat in 'dispatched' forever and every later `done`
     //     409'd against the master CAS while the ack-budget watchdog counted
     //     down to cancel). Fail-closed like the freeze: without a confirmed
-    //     acked state the turn's terminal report cannot land, so don't start it.
+    //     acked state the terminal report cannot land, so don't start work.
     try {
       await this.postAck(repairId, capability)
     } catch (err) {
       log.warn('ack callback failed — will retry after lease expiry', { repairId }, err)
+      return
+    }
+
+    // 1.7 Tier1 = deterministic ops action, PURE MACHINE PATH: no clone, no
+    //     ocheal turn, no codex session (the model has zero decision value for a
+    //     fixed restart/prune, and adds latency + an injection/mis-edit surface).
+    //     The done callback is signed by the root executor bound to the real SSH
+    //     exit, which is exactly the trusted-attestation shape "model-authored
+    //     done ≠ evidence" demands. Everything below (agent/clone/turn) is Tier2
+    //     only and stays lazy.
+    if (routing.executionClass === 'tier1') {
+      await this.executeTier1(repairId, capability, routing.conditionKey, routing.actionOpcode)
       return
     }
 
@@ -551,7 +598,20 @@ export class SelfhealJobWorker {
    * the acked state.
    */
   private async postAck(repairId: string, capability: string): Promise<void> {
-    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/ack`
+    await this.postCallback(repairId, capability, 'ack', '执行侧已接单(jobWorker 机器签发)', true)
+  }
+
+  /** Machine-authored capability callback (ack/progress/done/failed). Throws on
+   *  non-2xx only when `strict` (ack must land before work; done/failed callers
+   *  handle their own retry via lease). */
+  private async postCallback(
+    repairId: string,
+    capability: string,
+    outcome: 'ack' | 'progress' | 'done' | 'failed',
+    message: string,
+    strict: boolean,
+  ): Promise<void> {
+    const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/${outcome}`
     const ctrl = new AbortController()
     const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
     try {
@@ -559,14 +619,165 @@ export class SelfhealJobWorker {
       const res = await f(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${capability}` },
-        body: JSON.stringify({ message: '执行侧已接单(jobWorker 机器签发)' }),
+        body: JSON.stringify({ message }),
         redirect: 'manual',
         signal: ctrl.signal,
       })
-      if (!res.ok) throw new Error(`ack HTTP ${res.status}`)
+      if (!res.ok && strict) throw new Error(`${outcome} HTTP ${res.status}`)
     } finally {
       clearTimeout(timeout)
     }
+  }
+
+  /**
+   * Tier1 PURE MACHINE PATH (no clone / no ocheal / no codex). Three-layer
+   * intersection: master-frozen opcode == local exact map == remote wrapper's
+   * accepted set; any drift fails closed. The SSH is at-most-once via the
+   * set-once tier1_receipt (and the opcodes are idempotent, so a crash-replay is
+   * harmless). Outcome routing: completed/unknown → machine done (master →
+   * verifying, the probe fence adjudicates real recovery); failed → machine
+   * failed (action explicitly failed → fuse counts up → human).
+   */
+  private async executeTier1(
+    repairId: string,
+    capability: string,
+    conditionKey: string,
+    actionOpcode: string | null,
+  ): Promise<void> {
+    // Preflight refusals (never authorized to run) — atomic terminal+outbox,
+    // still cancel-safe (the CAS loses if a cancel already terminalized).
+    const expected = CONDITION_OPCODE_MAP[conditionKey]
+    if (!expected || expected !== actionOpcode) {
+      log.error('tier1 opcode drift — refusing', { repairId, conditionKey, actionOpcode, expected })
+      await this.tier1Terminal(repairId, ['starting', 'running'], 'failed', {
+        opcode: actionOpcode,
+        reason: `opcode drift (local map=${expected ?? 'none'} frozen=${actionOpcode ?? 'none'})`,
+      })
+      return
+    }
+    const cfg =
+      this.deps.hostActionConfig !== undefined ? this.deps.hostActionConfig : hostActionConfigFromEnv()
+    if (!cfg) {
+      log.error('tier1 host action not provisioned (OC_SELFHEAL_ACTION_HOST/KEY)', { repairId })
+      await this.tier1Terminal(repairId, ['starting', 'running'], 'failed', {
+        opcode: actionOpcode,
+        reason: 'host action host/key not configured',
+      })
+      return
+    }
+
+    // The SSH path runs INSIDE the per-repair lock — the SAME lock a cancel
+    // holds (BLOCKER: a cancel must not terminalize between the running CAS and
+    // the SSH and still let the action fire). Host actions cannot be remotely
+    // cancelled, so we hold the lock through the SSH return and the atomic
+    // local settle; a concurrent cancel waits (bounded by the action timeout).
+    await withRepairLock(repairId, async () => {
+      const cas = await setJobStatus(repairId, 'running', ['starting', 'running'])
+      if (!cas) {
+        log.info('tier1 CAS lost to cancel — zero action', { repairId })
+        return
+      }
+      // AT-MOST-ONCE (BLOCKER): durable pre-claim gates a single SSH; a crash
+      // after claim but before receipt settles as 'unknown' (never re-sent).
+      const receipt = await this.resolveTier1Receipt(repairId, actionOpcode as string, cfg)
+      // 'rejected' = never authorized to run ⇒ FAILED. Everything the host
+      // actually attempted (completed/action_failed/unknown) ⇒ DONE → verifying;
+      // only a fresh master probe decides real recovery.
+      const phase: 'done' | 'failed' = receipt.outcome === 'rejected' ? 'failed' : 'done'
+      await this.tier1Terminal(repairId, ['running'], phase === 'done' ? 'succeeded' : 'failed', {
+        opcode: actionOpcode,
+        host: receipt.host,
+        outcome: receipt.outcome,
+        exit: receipt.exit,
+        durationMs: receipt.durationMs,
+        receipt: receipt.detail,
+      })
+      log.info('tier1 settled', { repairId, opcode: actionOpcode, outcome: receipt.outcome, phase })
+    })
+  }
+
+  /** Atomic Tier1 terminal: CAS job → terminal AND enqueue the outbox callback
+   *  in ONE transaction. The CAS gates the enqueue (a cancel that terminalized
+   *  first makes it lose → no stale callback). Every Tier1 terminal path goes
+   *  through here — no best-effort fire-and-forget remains. */
+  private async tier1Terminal(
+    repairId: string,
+    fromStatuses: ('starting' | 'running')[],
+    toStatus: 'succeeded' | 'failed',
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    const phase: 'done' | 'failed' = toStatus === 'succeeded' ? 'done' : 'failed'
+    const message = `[tier1 ${String(detail.opcode ?? '?')}] ${String(detail.outcome ?? detail.reason ?? phase)}`
+    const won = await terminalizeTier1WithCallback({
+      repairId,
+      fromStatuses,
+      toStatus,
+      phase,
+      message,
+      detail,
+    })
+    if (!won) log.info('tier1 terminal CAS lost (cancel won) — no callback enqueued', { repairId })
+  }
+
+  /**
+   * Durable at-most-once resolution of the Tier1 receipt:
+   *  - a receipt already on the row  → committed earlier; reuse (idempotent).
+   *  - won the pre-claim             → transmit ONCE, persist the receipt.
+   *  - lost the pre-claim, no receipt → a prior claim crashed before settling;
+   *    treat as 'unknown' (the action MAY have run — never re-transmit).
+   */
+  private async resolveTier1Receipt(
+    repairId: string,
+    opcode: string,
+    cfg: HostActionConfig,
+  ): Promise<HostActionReceipt> {
+    const existing = await getJob(repairId)
+    if (existing?.tier1Receipt) {
+      return JSON.parse(existing.tier1Receipt) as HostActionReceipt
+    }
+    const won = await claimJobTier1(repairId)
+    if (!won) {
+      const j = await getJob(repairId)
+      if (j?.tier1Receipt) return JSON.parse(j.tier1Receipt) as HostActionReceipt
+      // Pre-claim held by a prior (crashed) attempt, no receipt → ambiguous.
+      // Persist an 'unknown' receipt (set-once) so re-claims are idempotent; a
+      // concurrent real receipt, if any, wins the set-once and is reused.
+      log.warn('tier1 pre-claim held without receipt — settling unknown (no replay)', { repairId })
+      const unknownReceipt: HostActionReceipt = {
+        opcode,
+        outcome: 'unknown',
+        exit: -1,
+        host: cfg.host,
+        startedAt: 0,
+        finishedAt: 0,
+        durationMs: 0,
+        detail: { reason: 'crashed after pre-claim before receipt — not re-transmitted' },
+      }
+      await setJobTier1Receipt(repairId, JSON.stringify(unknownReceipt))
+      const j2 = await getJob(repairId)
+      return j2?.tier1Receipt ? (JSON.parse(j2.tier1Receipt) as HostActionReceipt) : unknownReceipt
+    }
+    const exec = this.deps.executeHostOpcode ?? executeHostOpcode
+    const receipt = await exec(opcode, cfg)
+    await setJobTier1Receipt(repairId, JSON.stringify(receipt))
+    // Read the PERSISTED receipt back and use it (MAJOR): under a graceful
+    // shutdown a re-claim may have written a synthetic 'unknown' while this
+    // (old-owner) SSH was in flight; set-once picks ONE evidence, and every
+    // competitor must settle from that single SQLite winner — never its own
+    // in-memory copy — so the receipt, the terminal status and the outbox
+    // detail can never diverge into two authorities.
+    const persisted = await getJob(repairId)
+    const winner = persisted?.tier1Receipt
+      ? (JSON.parse(persisted.tier1Receipt) as HostActionReceipt)
+      : receipt
+    log.info('tier1 opcode executed', {
+      repairId,
+      opcode,
+      outcome: winner.outcome,
+      exit: winner.exit,
+      durationMs: winner.durationMs,
+    })
+    return winner
   }
 
   /**
@@ -577,7 +788,10 @@ export class SelfhealJobWorker {
    * is extracted; the full context stays a model-side pull via `oc-selfheal
    * context` so no free-text detour opens here.
    */
-  private async fetchConditionKey(repairId: string, capability: string): Promise<string> {
+  private async fetchRouting(
+    repairId: string,
+    capability: string,
+  ): Promise<{ conditionKey: string; executionClass: 'tier1' | 'tier2'; actionOpcode: string | null }> {
     const url = `${this.deps.callbackBaseUrl.replace(/\/$/, '')}/internal/v5/repairs/${encodeURIComponent(repairId)}/context`
     const ctrl = new AbortController()
     const timeout = setTimeout(() => ctrl.abort(), CAPABILITY_FETCH_TIMEOUT_MS)
@@ -590,15 +804,39 @@ export class SelfhealJobWorker {
         signal: ctrl.signal,
       })
       if (!res.ok) throw new Error(`context HTTP ${res.status}`)
-      // The master returns the RepairContext object directly (see v5
-      // http/internal/selfhealRepairs.ts `context` route) — conditionKey is a
-      // top-level field.
-      const body = (await res.json()) as { conditionKey?: unknown }
+      // Master returns the RepairContext object directly (v5
+      // http/internal/selfhealRepairs.ts `context` route): conditionKey +
+      // executionClass + actionOpcode are top-level fields.
+      const body = (await res.json()) as {
+        conditionKey?: unknown
+        executionClass?: unknown
+        actionOpcode?: unknown
+        tier?: unknown
+      }
       const key = body?.conditionKey
       if (typeof key !== 'string' || key.length === 0 || key.length > 256) {
         throw new Error('context response carries no usable conditionKey')
       }
-      return key
+      // STRICT (BLOCKER1): unknown/absent executionClass is REJECTED, never
+      // silently defaulted to tier2. tier and executionClass must agree (both
+      // derive from the frozen r.tier on the master); tier1⇔opcode consistency
+      // is enforced. Any inconsistency fails closed → lease retry.
+      const executionClass = body?.executionClass
+      if (executionClass !== 'tier1' && executionClass !== 'tier2') {
+        throw new Error(`context executionClass invalid: ${String(executionClass)}`)
+      }
+      // tier is REQUIRED and must agree (master contract always returns it).
+      if (body?.tier !== executionClass) {
+        throw new Error(`context tier/executionClass mismatch: ${String(body?.tier)} vs ${executionClass}`)
+      }
+      const actionOpcode = typeof body?.actionOpcode === 'string' ? body.actionOpcode : null
+      if (executionClass === 'tier1' && !actionOpcode) {
+        throw new Error('tier1 routing missing actionOpcode')
+      }
+      if (executionClass === 'tier2' && actionOpcode) {
+        throw new Error('tier2 routing must not carry an actionOpcode')
+      }
+      return { conditionKey: key, executionClass, actionOpcode }
     } finally {
       clearTimeout(timeout)
     }

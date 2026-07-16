@@ -54,7 +54,7 @@ export async function postMasterCallback(input: {
   callbackBaseUrl: string
   capability: string
   repairId: string
-  action: 'progress' | 'done'
+  action: 'progress' | 'done' | 'failed'
   message: string
   /** JSON OBJECT — the master's callback schema requires an object detail. */
   detail: Record<string, unknown>
@@ -196,7 +196,8 @@ export class SelfhealCallbackPump {
   }
 
   private async deliver(row: SelfhealCallbackRow): Promise<void> {
-    const action: 'progress' | 'done' = row.phase === 'pending_release' ? 'progress' : 'done'
+    const action: 'progress' | 'done' | 'failed' =
+      row.phase === 'pending_release' ? 'progress' : row.phase === 'failed' ? 'failed' : 'done'
     const ctx = { id: row.id, repairId: row.repairId, phase: row.phase, attempts: row.attempts }
 
     // Fresh capability per send (the 90min TTL would otherwise 401 a late
@@ -273,7 +274,7 @@ export class SelfhealCallbackPump {
 
   private send(
     row: SelfhealCallbackRow,
-    action: 'progress' | 'done',
+    action: 'progress' | 'done' | 'failed',
     capability: string,
     detail: Record<string, unknown>,
   ): Promise<number> {
