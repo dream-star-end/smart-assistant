@@ -32,6 +32,7 @@ async function fixture(port: number): Promise<{
   home: string
   spec: string
   decision: string
+  draft: string
 }> {
   const root = await mkdtemp(join(tmpdir(), 'oc-market-connector-'))
   const home = join(root, 'home')
@@ -41,7 +42,22 @@ async function fixture(port: number): Promise<{
   const decision = join(root, 'decision.json')
   await writeFile(spec, JSON.stringify({ id: 'cli-connector', identity: {}, actions: [] }))
   await writeFile(decision, JSON.stringify({ audience: {}, actions: {} }))
-  return { home, spec, decision }
+  const draft = join(root, 'plugin.json')
+  await writeFile(
+    draft,
+    JSON.stringify({
+      kind: 'plugin',
+      version: '1.2.3',
+      spec: { id: 'cli-plugin', identity: {}, actions: [] },
+      securityDecision: { audience: {}, actions: {} },
+      category: 'daily-tools',
+      useCases: ['查询当前账号身份'],
+      outcomeExamples: ['授权账号后返回身份'],
+      tags: ['API插件', '测试'],
+      visibility: 'public',
+    }),
+  )
+  return { home, spec, decision, draft }
 }
 
 test('oc-market publish-connector --help 自描述全部必需参数', async () => {
@@ -68,6 +84,113 @@ test('oc-market publish-connector --examples 提供容器内可编译的三种�
   for (const [name, example] of Object.entries(examples)) {
     assert.doesNotThrow(() => compileSpec(example.spec, example.securityDecision), name)
   }
+})
+
+test('oc-market plugin examples 提供完整单文件草稿、合法分类和可编译声明', async () => {
+  const r = await run(['plugin', 'examples'])
+  assert.equal(r.code, 0, r.stderr)
+  const output = JSON.parse(r.stdout) as {
+    categoryIds: string[]
+    examples: Record<
+      string,
+      {
+        kind: string
+        spec: Record<string, unknown>
+        securityDecision: Record<string, unknown>
+      }
+    >
+  }
+  assert.ok(output.categoryIds.includes('daily-tools'))
+  assert.deepEqual(Object.keys(output.examples).sort(), [
+    'oauth2-auth-code-byoa',
+    'static-token',
+    'token-exchange',
+  ])
+  for (const [name, example] of Object.entries(output.examples)) {
+    assert.equal(example.kind, 'plugin')
+    assert.doesNotThrow(() => compileSpec(example.spec, example.securityDecision), name)
+  }
+})
+
+test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑定确认', async () => {
+  const validationHash = 'a'.repeat(64)
+  const received: Array<{ url: string; body: Record<string, unknown> }> = []
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      received.push({
+        url: req.url ?? '',
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      })
+      res.setHeader('content-type', 'application/json')
+      if (req.url?.endsWith('/validate-plugin')) {
+        res.end(
+          JSON.stringify({
+            ok: true,
+            validationHash,
+            plugin: { slug: 'cli-plugin' },
+            permissionSummary: { authMode: 'static-token' },
+          }),
+        )
+      } else {
+        res.end(JSON.stringify({ ok: true, versionId: 'v-plugin', status: 'pending' }))
+      }
+    })
+  })
+  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  const f = await fixture(address.port)
+  const env = { OPENCLAUDE_HOME: f.home, HTTP_PROXY: 'http://127.0.0.1:1' }
+  try {
+    let r = await run(['plugin', 'validate', '--file', f.draft], env)
+    assert.equal(r.code, 0, r.stderr)
+    const validated = JSON.parse(r.stdout) as {
+      validationHash: string
+      publishCommand: string
+    }
+    assert.equal(validated.validationHash, validationHash)
+    assert.match(validated.publishCommand, new RegExp(`--confirm ${validationHash}$`))
+    assert.equal(received[0]?.url, '/internal/v3/marketplace/agent-local/validate-plugin')
+    assert.deepEqual(received[0]?.body, {
+      kind: 'connector',
+      version: '1.2.3',
+      spec: { id: 'cli-plugin', identity: {}, actions: [] },
+      securityDecision: { audience: {}, actions: {} },
+      category: 'daily-tools',
+      useCases: ['查询当前账号身份'],
+      outcomeExamples: ['授权账号后返回身份'],
+      tags: ['API插件', '测试'],
+    })
+
+    received.length = 0
+    r = await run(['plugin', 'publish', '--file', f.draft, '--confirm', 'b'.repeat(64)], env)
+    assert.equal(r.code, 1)
+    assert.match(r.stderr, /hash is stale/)
+    assert.deepEqual(received.map((x) => x.url), [
+      '/internal/v3/marketplace/agent-local/validate-plugin',
+    ])
+
+    received.length = 0
+    r = await run(['plugin', 'publish', '--file', f.draft, '--confirm', validationHash], env)
+    assert.equal(r.code, 0, r.stderr)
+    assert.match(r.stdout, /"versionId": "v-plugin"/)
+    assert.deepEqual(received.map((x) => x.url), [
+      '/internal/v3/marketplace/agent-local/validate-plugin',
+      '/internal/v3/marketplace/agent-local/publish',
+    ])
+    assert.deepEqual(received[0]?.body, received[1]?.body)
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+  }
+})
+
+test('oc-market plugin publish 缺少确认 hash 时不接触 relay', async () => {
+  const f = await fixture(1)
+  const r = await run(['plugin', 'publish', '--file', f.draft], { OPENCLAUDE_HOME: f.home })
+  assert.equal(r.code, 2)
+  assert.match(r.stderr, /--confirm/)
 })
 
 test('oc-market publish-connector 只经 loopback relay 发送正确 payload', async () => {

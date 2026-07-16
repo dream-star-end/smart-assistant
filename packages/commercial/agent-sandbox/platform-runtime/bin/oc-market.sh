@@ -7,15 +7,18 @@ set -e
 # 本薄壳无 sibling 引用,SELF_ROOT 仅立"工具单文件独立、禁相对 sibling 裸调用"不变量(测试固化)。
 SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
-# Connector publishing lives here rather than packages/gateway so the command can
-# ship through the true-hot platform bundle without a runtime image rebuild.
-if [ "${1:-}" = "publish-connector" ]; then
+# Plugin authoring lives here rather than packages/gateway so the command can ship
+# through the true-hot platform bundle without a runtime image rebuild. The old
+# publish-connector surface remains as a compatibility alias.
+if [ "${1:-}" = "plugin" ] || [ "${1:-}" = "publish-connector" ]; then
+  MARKET_COMMAND="$1"
   shift
-  exec python3 - "$@" <<'PY'
+  exec python3 - "$MARKET_COMMAND" "$@" <<'PY'
 import argparse
 import json
 import os
 import pathlib
+import shlex
 import sys
 import urllib.error
 import urllib.request
@@ -180,10 +183,139 @@ CONNECTOR_EXAMPLES = {
 }
 
 
-if sys.argv[1:] == ["--examples"]:
-    print(json.dumps(CONNECTOR_EXAMPLES, ensure_ascii=False, indent=2))
+MARKETPLACE_CATEGORIES = [
+    "office-docs", "data-analysis", "coding-dev", "research-academic",
+    "design-creative", "finance-business", "daily-tools", "skill-pack",
+]
+PLUGIN_DRAFT_KEYS = {
+    "kind", "version", "spec", "securityDecision", "category", "useCases",
+    "outcomeExamples", "humanMd", "tags", "visibility",
+}
+
+
+def plugin_examples():
+    examples = {}
+    for name, connector in CONNECTOR_EXAMPLES.items():
+        examples[name] = {
+            "kind": "plugin",
+            "version": "1.0.0",
+            "category": "daily-tools",
+            "useCases": ["连接外部服务并读取当前账号信息"],
+            "outcomeExamples": ["完成账号授权后，返回当前账号身份"],
+            "tags": ["API插件"],
+            "visibility": "public",
+            "spec": connector["spec"],
+            "securityDecision": connector["securityDecision"],
+        }
+    return {"categoryIds": MARKETPLACE_CATEGORIES, "examples": examples}
+
+
+def plugin_payload(path):
+    draft = json_object(path, "--file")
+    unknown = sorted(set(draft) - PLUGIN_DRAFT_KEYS)
+    if unknown:
+        die(f"--file has unknown top-level fields: {', '.join(unknown)}")
+    if draft.get("kind") != "plugin":
+        die("--file kind must be 'plugin'")
+    visibility = draft.get("visibility", "public")
+    if visibility not in ("public", "org"):
+        die("--file visibility must be 'public' or 'org'")
+    payload = dict(draft)
+    payload["kind"] = "connector"
+    if visibility == "public":
+        payload.pop("visibility", None)
+    return payload
+
+
+def local_gateway_port():
+    home = os.environ.get("OPENCLAUDE_HOME", "").strip()
+    if not home:
+        home = str(pathlib.Path(os.environ.get("HOME", str(pathlib.Path.home()))) / ".openclaude")
+    config_path = pathlib.Path(home) / "openclaude.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        port = int(config["gateway"]["port"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        die(f"cannot resolve local gateway from {config_path}: {exc}")
+    if port < 1 or port > 65535:
+        die(f"invalid local gateway port: {port}")
+    return port
+
+
+def relay(payload, operation, action):
+    url = (
+        f"http://127.0.0.1:{local_gateway_port()}"
+        f"/internal/v3/marketplace/agent-local/{operation}"
+    )
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        # Never inherit HTTP(S)_PROXY for the identity-bearing loopback relay.
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            request, timeout=30
+        )
+        raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        die(f"{action} failed: HTTP {exc.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        die(f"{action} relay failed: {exc}")
+    try:
+        result = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        die(f"{action} relay returned invalid JSON: {raw[:400]}")
+    if not isinstance(result, dict):
+        die(f"{action} relay returned a non-object response")
+    return result
+
+
+command = sys.argv[1]
+argv = sys.argv[2:]
+
+if command == "plugin":
+    parser = argparse.ArgumentParser(
+        prog="oc-market plugin",
+        description="Create, validate and publish one-file declarative HTTP Plugin drafts.",
+    )
+    sub = parser.add_subparsers(dest="operation", required=True)
+    sub.add_parser("examples", help="print complete one-file Plugin drafts and category ids")
+    validate_parser = sub.add_parser("validate", help="validate a draft without publishing")
+    validate_parser.add_argument("--file", required=True, help="one-file Plugin draft JSON")
+    publish_parser = sub.add_parser("publish", help="publish the exact validated draft")
+    publish_parser.add_argument("--file", required=True, help="one-file Plugin draft JSON")
+    publish_parser.add_argument(
+        "--confirm", required=True, help="validationHash returned by plugin validate"
+    )
+    args = parser.parse_args(argv)
+    if args.operation == "examples":
+        print(json.dumps(plugin_examples(), ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+
+    payload = plugin_payload(args.file)
+    validated = relay(payload, "validate-plugin", "validation")
+    validation_hash = validated.get("validationHash")
+    if not isinstance(validation_hash, str) or len(validation_hash) != 64:
+        die("validation relay omitted a valid validationHash")
+    if args.operation == "validate":
+        validated["publishCommand"] = (
+            f"oc-market plugin publish --file {shlex.quote(args.file)} "
+            f"--confirm {validation_hash}"
+        )
+        print(json.dumps(validated, ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+    if args.confirm != validation_hash:
+        die("draft changed or confirmation hash is stale; validate again and ask the user to reconfirm")
+    print(json.dumps(relay(payload, "publish", "publish"), ensure_ascii=False, indent=2))
     raise SystemExit(0)
 
+if argv == ["--examples"]:
+    print(json.dumps(CONNECTOR_EXAMPLES, ensure_ascii=False, indent=2))
+    raise SystemExit(0)
 
 parser = argparse.ArgumentParser(
     prog="oc-market publish-connector",
@@ -203,11 +335,10 @@ parser.add_argument("--outcomes", default="", help="effect examples separated by
 parser.add_argument("--tags", default="连接器", help="comma-separated tags")
 parser.add_argument("--intro-file", help="optional Markdown storefront introduction")
 parser.add_argument("--visibility", choices=("public", "org"), default="public")
-args = parser.parse_args()
+args = parser.parse_args(argv)
 
 spec = json_object(args.spec_file, "--spec-file")
 decision = json_object(args.security_decision_file, "--security-decision-file")
-
 payload = {
     "kind": "connector",
     "version": args.version,
@@ -225,41 +356,7 @@ if args.intro_file:
         payload["humanMd"] = pathlib.Path(args.intro_file).read_text(encoding="utf-8")
     except OSError as exc:
         die(f"cannot read --intro-file: {exc}")
-
-home = os.environ.get("OPENCLAUDE_HOME", "").strip()
-if not home:
-    home = str(pathlib.Path(os.environ.get("HOME", str(pathlib.Path.home()))) / ".openclaude")
-config_path = pathlib.Path(home) / "openclaude.json"
-try:
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    port = int(config["gateway"]["port"])
-except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-    die(f"cannot resolve local gateway from {config_path}: {exc}")
-if port < 1 or port > 65535:
-    die(f"invalid local gateway port: {port}")
-
-url = f"http://127.0.0.1:{port}/internal/v3/marketplace/agent-local/publish"
-body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-request = urllib.request.Request(
-    url,
-    data=body,
-    method="POST",
-    headers={"Content-Type": "application/json", "Accept": "application/json"},
-)
-try:
-    # Never inherit HTTP(S)_PROXY for the identity-bearing loopback relay.
-    response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=30)
-    raw = response.read().decode("utf-8")
-except urllib.error.HTTPError as exc:
-    detail = exc.read().decode("utf-8", errors="replace")
-    die(f"publish failed: HTTP {exc.code}: {detail}")
-except (urllib.error.URLError, TimeoutError, OSError) as exc:
-    die(f"publish relay failed: {exc}")
-try:
-    result = json.loads(raw) if raw else {}
-except json.JSONDecodeError:
-    die(f"publish relay returned invalid JSON: {raw[:400]}")
-print(json.dumps(result, ensure_ascii=False, indent=2))
+print(json.dumps(relay(payload, "publish", "publish"), ensure_ascii=False, indent=2))
 PY
 fi
 
