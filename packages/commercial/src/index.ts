@@ -1116,7 +1116,25 @@ export async function registerCommercial(
       losslessTurnTapeStorage = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
-      sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({ pool: getPool() }));
+      sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({
+        pool: getPool(),
+        onStats: (s) => {
+          if (s.pendingFolded || s.pendingUnreachableExpired || s.tapePartsPurged) {
+            rootLogger.info("[sessionsGcSweep] lossless 收尾 GC", {
+              pendingFolded: s.pendingFolded,
+              pendingUnreachableExpired: s.pendingUnreachableExpired,
+              tapePartsPurged: s.tapePartsPurged,
+            });
+          }
+          // 折叠异常 = (request_id,user_id) 已有坐标/金额不符的 cost component。行被
+          // 保留待人工核对;持续非零应查 appendCostCredits/finalize 两路径的归因分歧。
+          if (s.pendingFoldAnomaly) {
+            rootLogger.warn("[sessionsGcSweep] pending 折叠异常(component 坐标不符,行已保留)", {
+              pendingFoldAnomaly: s.pendingFoldAnomaly,
+            });
+          }
+        },
+      }));
       // eslint-disable-next-line no-console
       console.log(`[commercial] sessions store authority = PG (generation=${decision.generation})`);
     } else {

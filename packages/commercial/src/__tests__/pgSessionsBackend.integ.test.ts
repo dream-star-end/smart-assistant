@@ -463,8 +463,9 @@ describe("pgSessionsBackend lossless turn tape", () => {
     const child = "child-detail".repeat(50_000);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
 
-    // Billing may arrive before the tape. The exact key must park without a
-    // TTL that can delete it, then finalize must consume it atomically.
+    // Billing may arrive before the tape. The exact key parks well clear of any
+    // GC window (24h keyless hard-delete / 7d unreachable expiry both杜绝误删
+    // in-flight turns), then finalize must consume it atomically.
     assert.deepEqual(
       await backend.appendCostCredits("cost-before", userId, "7", "ccb-1", null, null, turnKey),
       { applied: "pending" },
@@ -552,12 +553,14 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal(hotAnchors.length, 1, "one constant-size hot anchor represents the whole turn");
     assert.equal(hotAnchors[0]!._turnTapeComplete, true);
     assert.equal(hotAnchors[0]!._turnTapeRecordCount, 4);
-    const rawParts = await pool.query<{ payload: Buffer }>(
-      `SELECT payload FROM client_session_turn_tape_parts
-        WHERE session_id=$1 AND user_id=$2 ORDER BY part_index`,
+    // 2026-07-16 起:原始分片(脱敏前 payload)随 finalize 一律清除——records 才是
+    // 脱敏后的持久权威,上文水合断言已证明细节完整;parts 留存即隐私偏差+双份存储。
+    const rawParts = await pool.query(
+      `SELECT 1 FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2`,
       [sessionId, userId],
     );
-    assert.deepEqual(Buffer.concat(rawParts.rows.map((row) => Buffer.from(row.payload))), tape.canonical);
+    assert.equal(rawParts.rowCount, 0, "finalize 后原始分片必须被清除");
 
     // A browser may immediately PUT the fully hydrated GET projection back.
     // Expanded rows are read-only projections and must not be copied into the
@@ -693,16 +696,21 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal(components.rowCount, 3);
   });
 
-  maybe("GC never hard-deletes exact turn-key pending cost", async () => {
+  maybe("GC 对带 key pending:24h 硬删不碰;tape 迟到窗口(7d)内保留", async () => {
+    // 2026-07-16 起语义从"永不删"改为**有界**:tape 经 fsync 重试队列分钟-小时级必达,
+    // 7d 后仍无任何 finalized tape 可达的行是死重(生产曾滞留 300 行),由
+    // pendingUnreachableExpired 分支清除(见 lossless 收尾闭合套件)。本用例守住
+    // 窗口内不误删:2d 龄 + 无 tape → 24h 硬删(keyless 专属)与不可达清除都不得碰它。
     const userId = "u-retain";
     const turnKey = "c".repeat(64);
     await backend.appendCostCredits("retain-cost", userId, "9", null, null, null, turnKey);
     await pool.query(
       "UPDATE pending_usage_patches SET created_at=$1 WHERE request_id=$2 AND user_id=$3",
-      [1, "retain-cost", userId],
+      [Date.now() - 2 * 24 * 60 * 60_000, "retain-cost", userId],
     );
     const stats = await backend.sweepUsageAggregationGc(Date.now());
     assert.equal(stats.pendingExpired, 0);
+    assert.equal(stats.pendingUnreachableExpired, 0, "7d 窗口内的不可达行不得清除");
     const retained = await pool.query(
       "SELECT cost_credits FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
       ["retain-cost", userId],
@@ -1111,5 +1119,209 @@ describe("startSessionsGcSweeper advisory lease", () => {
     assert.equal(probe2.rows[0].ok, true, "stop 后锁应释放");
     await pool.query("SELECT pg_advisory_unlock(hashtextextended('oc_sessions_sweep_gc',0))");
     assert.ok(statsCount >= 1, "持锁者应至少跑过一轮 sweep");
+  });
+});
+
+// ── 2026-07-16 巡检批:lossless 收尾 GC 语义闭合 ────────────────────────────────
+// 生产事实:345 行带 key 的 pending 全部对应已结算请求(45 行可折叠 / 300 行读路径
+// 永不可达);215/233 盘 finalized tape 的原始分片(72MB)从未回收。本组断言三条新
+// 语义:晚到折叠(收敛单一权威)、不可达超期清除、finalize 后 parts 兜底清扫。
+describe("sweepUsageAggregationGc lossless 收尾闭合", () => {
+  const HOUR = 60 * 60_000;
+  const DAY = 24 * HOUR;
+
+  /** 造一盘最小 finalized tape,返回其坐标(不走 stage/finalize 全流程,直插表)。 */
+  async function seedFinalizedTape(args: {
+    sessionId: string;
+    userId: string;
+    turnKey: string;
+    finalizedAt?: number;
+  }): Promise<{ tapeId: string; billingAnchorId: string }> {
+    const tapeId = sha256(`gc-tape\0${args.turnKey}`);
+    const billingAnchorId = `anchor-${args.turnKey.slice(0, 8)}`;
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id, user_id, tape_id, agent_id, turn_index, status, turn_key,
+          tape_sha256, total_bytes, part_count, created_at, billing_anchor_id, finalized_at)
+       VALUES ($1,$2,$3,'main',1,'completed',$4,$5,1,1,$6,$7,$8)`,
+      [
+        args.sessionId,
+        args.userId,
+        tapeId,
+        args.turnKey,
+        sha256(tapeId),
+        Date.now() - 3 * HOUR,
+        billingAnchorId,
+        args.finalizedAt ?? Date.now() - 3 * HOUR,
+      ],
+    );
+    return { tapeId, billingAnchorId };
+  }
+
+  async function seedKeyedPending(args: {
+    requestId: string;
+    userId: string;
+    turnKey?: string | null;
+    parentTurnKey?: string | null;
+    cost: string;
+    ageMs: number;
+    delegateAgentId?: string | null;
+  }): Promise<void> {
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id, user_id, session_id, delegate_agent_id, turn_key, parent_turn_key, cost_credits, created_at)
+       VALUES ($1,$2,NULL,$3,$4,$5,$6,$7)`,
+      [
+        args.requestId,
+        args.userId,
+        args.delegateAgentId ?? null,
+        args.turnKey ?? null,
+        args.parentTurnKey ?? null,
+        args.cost,
+        Date.now() - args.ageMs,
+      ],
+    );
+  }
+
+  maybe("晚到折叠:aged 带 key 行折进 cost components 后删,坐标取 finalized tape anchor", async () => {
+    const userId = "u-gc-fold";
+    const sessionId = "s-gc-fold";
+    const turnKey = "b".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = await seedFinalizedTape({ sessionId, userId, turnKey });
+    // 晚到成本(2h 前 stage;错过 finalize 内折叠时机)——一条 turn_key 直挂,一条
+    // parent_turn_key 挂(delegate 归因形态)。
+    await seedKeyedPending({ requestId: "gc-fold-1", userId, turnKey, cost: "42", ageMs: 2 * HOUR });
+    await seedKeyedPending({
+      requestId: "gc-fold-2", userId, parentTurnKey: turnKey, cost: "8",
+      ageMs: 2 * HOUR, delegateAgentId: "reviewer",
+    });
+
+    const stats = await backend.sweepUsageAggregationGc();
+    assert.equal(stats.pendingFolded, 2, "两条晚到成本都应折叠");
+    assert.equal(stats.pendingFoldAnomaly, 0);
+
+    const comps = await pool.query<{ request_id: string; cost_credits: string; tape_id: string; billing_anchor_id: string; delegate_agent_id: string | null }>(
+      `SELECT request_id, cost_credits::text, tape_id, billing_anchor_id, delegate_agent_id
+         FROM turn_tape_cost_components WHERE user_id=$1 ORDER BY request_id`,
+      [userId],
+    );
+    assert.equal(comps.rowCount, 2);
+    assert.equal(comps.rows[0]!.tape_id, tape.tapeId);
+    assert.equal(comps.rows[0]!.billing_anchor_id, tape.billingAnchorId);
+    assert.equal(comps.rows[0]!.cost_credits, "42");
+    assert.equal(comps.rows[1]!.cost_credits, "8");
+    assert.equal(comps.rows[1]!.delegate_agent_id, "reviewer");
+    const left = await pool.query("SELECT 1 FROM pending_usage_patches WHERE user_id=$1", [userId]);
+    assert.equal(left.rowCount, 0, "折叠完成后 pending 应清空");
+  });
+
+  maybe("折叠原子换源:sweep 后水合积分徽章不变(单一权威收敛,无双计)", async () => {
+    const userId = "u-gc-hydrate";
+    const sessionId = "s-gc-hydrate";
+    const turnKey = "c".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    // 真实全流程:先 park 晚到成本用的 key,再 stage+finalize 一盘真 tape。
+    const tape = buildTape({
+      sessionId, agentId: "main", turnIndex: 1, status: "completed", turnKey,
+      text: "答案", createdAt: Date.now() - 2 * HOUR, requestId: "gc-hyd-top",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    // finalize 后才落的成本 locator(生产形态:settle 路径 stageUsageCostLocator 在
+    // tape finalize 之后写入,错过 finalize 内折叠;appendCostCredits 主路径此时会直折,
+    // 不经 pending)。直插 pending 复现该形态,读路径此刻靠 UNION 兜底显示。
+    await seedKeyedPending({ requestId: "gc-hyd-late", userId, turnKey, cost: "13", ageMs: 2 * HOUR });
+    const costOf = async (): Promise<string> => {
+      const s = await backend.getClientSession(sessionId, userId);
+      const anchor = (s!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
+      return String((anchor.usage as Record<string, unknown>).costCredits);
+    };
+    assert.equal(await costOf(), "13", "折叠前:pending UNION 兜底显示");
+    const stats = await backend.sweepUsageAggregationGc();
+    assert.equal(stats.pendingFolded, 1);
+    assert.equal(await costOf(), "13", "折叠后:component 显示,徽章金额不变");
+  });
+
+  maybe("折叠异常:同 (request_id,user_id) 已有坐标不符的 component → 保留并计数", async () => {
+    const userId = "u-gc-anomaly";
+    const sessionId = "s-gc-anomaly";
+    const turnKey = "d".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = await seedFinalizedTape({ sessionId, userId, turnKey });
+    // 同 request 已有指向"另一盘 tape"的 component(坐标不符)。
+    const otherKey = "e".repeat(64);
+    const other = await seedFinalizedTape({ sessionId, userId, turnKey: otherKey });
+    await pool.query(
+      `INSERT INTO turn_tape_cost_components
+         (request_id, user_id, session_id, tape_id, billing_anchor_id, cost_credits, delegate_agent_id, updated_at)
+       VALUES ('gc-anomaly-1',$1,$2,$3,$4,99,NULL,$5)`,
+      [userId, sessionId, other.tapeId, other.billingAnchorId, Date.now()],
+    );
+    await seedKeyedPending({ requestId: "gc-anomaly-1", userId, turnKey, cost: "42", ageMs: 2 * HOUR });
+
+    const stats = await backend.sweepUsageAggregationGc();
+    assert.equal(stats.pendingFoldAnomaly, 1, "坐标不符必须计入异常");
+    const pending = await pool.query("SELECT 1 FROM pending_usage_patches WHERE request_id='gc-anomaly-1'");
+    assert.equal(pending.rowCount, 1, "异常行必须保留待人工核对");
+    const comp = await pool.query<{ cost_credits: string }>(
+      "SELECT cost_credits::text FROM turn_tape_cost_components WHERE request_id='gc-anomaly-1' AND user_id=$1",
+      [userId],
+    );
+    assert.equal(comp.rows[0]!.cost_credits, "99", "既有 component 不可被覆盖");
+    void tape;
+  });
+
+  maybe("不可达清除:无任何 finalized tape 匹配的带 key 行,7d 后删、7d 内留", async () => {
+    const userId = "u-gc-orphan";
+    await seedKeyedPending({ requestId: "gc-orphan-old", userId, turnKey: "f".repeat(64), cost: "1", ageMs: 8 * DAY });
+    await seedKeyedPending({ requestId: "gc-orphan-new", userId, turnKey: "0".repeat(64), cost: "2", ageMs: 2 * DAY });
+    const stats = await backend.sweepUsageAggregationGc();
+    assert.equal(stats.pendingUnreachableExpired, 1, "只清 7d 以上的不可达行");
+    const rows = await pool.query<{ request_id: string }>(
+      "SELECT request_id FROM pending_usage_patches WHERE user_id=$1",
+      [userId],
+    );
+    assert.deepEqual(rows.rows.map((r) => r.request_id), ["gc-orphan-new"]);
+  });
+
+  maybe("parts 兜底清扫:finalized tape 的 48h+ 分片删,新分片与未 finalize 的留", async () => {
+    const userId = "u-gc-parts";
+    const sessionId = "s-gc-parts";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const done = await seedFinalizedTape({ sessionId, userId, turnKey: "1".repeat(64) });
+    // 未 finalize 的 tape(上传中断形态)。
+    const stagingTapeId = sha256("gc-tape-staging");
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id, user_id, tape_id, agent_id, turn_index, status, turn_key,
+          tape_sha256, total_bytes, part_count, created_at)
+       VALUES ($1,$2,$3,'main',2,'completed',$4,$5,1,1,$6)`,
+      [sessionId, userId, stagingTapeId, "2".repeat(64), sha256(stagingTapeId), Date.now() - 3 * DAY],
+    );
+    const seedPart = (tapeId: string, idx: number, ageMs: number) =>
+      pool.query(
+        `INSERT INTO client_session_turn_tape_parts
+           (session_id, user_id, tape_id, part_index, part_sha256, payload, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [sessionId, userId, tapeId, idx, sha256(`p${idx}`), Buffer.from("x"), Date.now() - ageMs],
+      );
+    await seedPart(done.tapeId, 0, 3 * DAY); // finalized + 老 → 删
+    await seedPart(done.tapeId, 1, 1 * HOUR); // finalized + 新(理论重放窗口)→ 留
+    await seedPart(stagingTapeId, 0, 3 * DAY); // 未 finalize → 留(等 finalize 消费)
+    const stats = await backend.sweepUsageAggregationGc();
+    assert.equal(stats.tapePartsPurged, 1);
+    const left = await pool.query<{ tape_id: string; part_index: number }>(
+      "SELECT tape_id, part_index FROM client_session_turn_tape_parts WHERE user_id=$1 ORDER BY tape_id, part_index",
+      [userId],
+    );
+    assert.equal(left.rowCount, 2);
+    assert.ok(
+      left.rows.every((r) => (r.tape_id === done.tapeId ? r.part_index === 1 : r.part_index === 0)),
+      "只删 finalized+超期分片",
+    );
   });
 });

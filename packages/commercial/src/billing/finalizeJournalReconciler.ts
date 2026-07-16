@@ -52,6 +52,17 @@ export const DEFAULT_DURABLE_WAIVER_AGE_MS = 24 * 3_600_000
 export const MAX_DURABLE_WAIVER_AGE_MS = 365 * 24 * 3_600_000
 /** GC:非 durable Codex 的 committed/aborted 老于该时长才删。 */
 export const DEFAULT_GC_AGE_MS = 7 * 24 * 3_600_000
+/**
+ * durable Codex 终态行的有界 GC(2026-07-16 巡检批;此前 durable 行永不删 → 每个
+ * codex turn 永久留一行,无界增长)。settleDurableCodexBilling 对"journal 缺行"本就有
+ * GC 竞态兜底:usage_records 是永久财务真相,缺行 + usage 在 → ACK already_committed。
+ *   - committed:30d(且必须仍有 usage_records 证据才删——兜底路径依赖它证幂等);
+ *   - aborted(含永久免单 waiver):90d。waiver 行无 usage 证据,删后若有 >90d 迟到
+ *     tape 重放会在重试队列里响亮报错(journal missing)而非静默双扣——可见、可运维,
+ *     且 90d 远超容器 fsync 重试队列的实际生存期。
+ */
+export const DURABLE_COMMITTED_GC_AGE_MS = 30 * 24 * 3_600_000
+export const DURABLE_ABORTED_GC_AGE_MS = 90 * 24 * 3_600_000
 export const MIN_GC_AGE_MS = 3_600_000 // 永不删 1h 内的终态行(防误删)
 export const DEFAULT_GC_INTERVAL_MS = 3_600_000 // GC 比 reconcile 稀疏
 export const DEFAULT_GC_LIMIT = 5_000 // 单次 GC 批量上限,避免一刀大删
@@ -197,7 +208,8 @@ export async function reconcileStuckFinalizeJournal(
   }
 }
 
-/** GC:删非 durable Codex 的终态老行,单批 ≤ limit(最旧优先,确定性)。 */
+/** GC:删终态老行,单批每分区 ≤ limit(最旧优先,确定性)。三分区:非 durable(入参
+ * 窗口)、durable committed(30d + usage 证据仍在)、durable aborted(90d)。 */
 export async function gcFinalizeJournal(olderThanMs: number, limit: number): Promise<number> {
   const ms = String(Math.max(0, Math.floor(olderThanMs)))
   const lim = Math.max(1, Math.floor(limit))
@@ -214,7 +226,42 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
       RETURNING request_id`,
     [ms, lim, DURABLE_CODEX_RECOVERY_VERSION],
   )
-  return res.rowCount ?? 0
+  let total = res.rowCount ?? 0
+  // durable committed:settle 兜底路径靠 usage_records 证幂等,故只删证据仍在的行;
+  // 无 usage 的 committed 行(理论不存在)保留 → 可见异常而非静默消失。
+  const durableCommitted = await query<{ request_id: string }>(
+    `DELETE FROM request_finalize_journal
+      WHERE ctid IN (
+        SELECT rfj.ctid FROM request_finalize_journal rfj
+         WHERE rfj.state = 'committed'
+           AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+           AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $3
+           AND EXISTS (
+             SELECT 1 FROM usage_records ur
+              WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
+           )
+         ORDER BY rfj.updated_at ASC
+         LIMIT $2
+      )
+      RETURNING request_id`,
+    [String(DURABLE_COMMITTED_GC_AGE_MS), lim, DURABLE_CODEX_RECOVERY_VERSION],
+  )
+  total += durableCommitted.rowCount ?? 0
+  const durableAborted = await query<{ request_id: string }>(
+    `DELETE FROM request_finalize_journal
+      WHERE ctid IN (
+        SELECT ctid FROM request_finalize_journal
+         WHERE state = 'aborted'
+           AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+           AND COALESCE(ctx->>'durableBillingRecovery', '') = $3
+         ORDER BY updated_at ASC
+         LIMIT $2
+      )
+      RETURNING request_id`,
+    [String(DURABLE_ABORTED_GC_AGE_MS), lim, DURABLE_CODEX_RECOVERY_VERSION],
+  )
+  total += durableAborted.rowCount ?? 0
+  return total
 }
 
 export interface ReconcilerHandle {

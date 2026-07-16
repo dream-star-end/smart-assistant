@@ -16,6 +16,9 @@
  *   - turn_traces        90d  请求ID→用户/会话反查,计费争议窗口内必须在
  *   - rate_limit_events  30d  限流命中信号,只喂告警聚合
  *   - connector_write_ledger 90d  写确认账本**终态**行(带 status 谓词;活跃态不删)
+ *   - refresh_tokens     过期后 30d  auth 死行回收(列=expires_at;revoked 未过期行
+ *                             保留给重用检测,见注册表内注释)
+ *   - admin_alert_outbox 90d  告警投递队列 sent/failed 终态行(带 status 谓词)
  *   - admin_audit        永久  合规审计,显式登记在 PERMANENT_AUDIT_TABLES,
  *                             不允许出现在删除政策里(sweeper 有 fail-fast 断言)
  *   - account_refresh_events / provider_health / wechat_audit 已有各自 sweeper,
@@ -60,6 +63,22 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     column: "created_at",
     days: 90,
     predicate: "status IN ('succeeded','failed','unknown','expired','denied')",
+  },
+  // 2026-07-16 巡检批:本注册表是仓内 retention 的单一权威,收口范围从"审计/事件表"
+  // 扩到"无自有 sweeper 的有界状态表"——与其为下面两张表各造一个清理调度器(第二机制),
+  // 不如沿用同一注册表 + 同一 sweeper。
+  //
+  // refresh_tokens:巡检发现全库 3.9 万行中 97% 是过期/吊销死行(最老 04-20),全仓无
+  // 任何删除路径。谓词按 expires_at 过期 30d 才删:revoked 未过期的行**故意保留**——
+  // 旋转家族的"吊销 token 被重用 → 撤全家族"防盗检测依赖能查到该行,等自然过期再入围。
+  { table: "refresh_tokens", column: "expires_at", days: 30 },
+  // admin_alert_outbox:投递队列的 sent/failed 终态行此前无任何回收。pending/带
+  // next_attempt_at 的活跃行绝不在此删除(谓词钉死终态)。
+  {
+    table: "admin_alert_outbox",
+    column: "created_at",
+    days: 90,
+    predicate: "status IN ('sent','failed')",
   },
 ] as const;
 
