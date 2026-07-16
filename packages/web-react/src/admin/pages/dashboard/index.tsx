@@ -701,7 +701,7 @@ function AlertsCard({
       ) : (
         <div className="border-t border-border px-5 py-4">
           {/* 概览 3 指标 */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <MiniStat
               label="触发中规则"
               value={fmtInt(summary.rules.firing)}

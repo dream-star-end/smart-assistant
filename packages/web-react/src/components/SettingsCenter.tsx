@@ -152,7 +152,7 @@ export function SettingsCenter({
               <button
                 type="button"
                 aria-label="关闭"
-                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
               >
                 <X size={17} />
               </button>

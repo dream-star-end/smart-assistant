@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, OrgUsageReport, OrgUsageTrendPoint } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
@@ -13,6 +13,7 @@ vi.mock("chart.js/auto", () => ({
 
 vi.mock("../../lib/api", () => ({
   api: { getOrgUsage: vi.fn() },
+  apiErrorMessage: (_e: unknown, fallback: string) => fallback,
 }));
 
 import { api } from "../../lib/api";
@@ -128,5 +129,24 @@ describe("ReportsTab 趋势图（共享 charts，替代手写 CSS 竖条）", ()
     expect(await screen.findByText("趋势 · 按扣费")).toBeInTheDocument();
     // 图表以 canvas 渲染（旧手写竖条无 canvas）
     expect(container.querySelector("canvas")).not.toBeNull();
+    const trendTable = screen.getByRole("table", { name: "组织扣费趋势，近 24 小时" });
+    expect(within(trendTable).getByRole("cell", { name: "300 积分" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "按成员用量表，可横向滚动" })).toHaveAttribute(
+      "tabindex",
+      "0",
+    );
+    expect(screen.getAllByText("表格可左右滑动查看更多").length).toBeGreaterThan(0);
+  });
+
+  test("首屏失败可原地重试并恢复完整报表", async () => {
+    mockedGetOrgUsage
+      .mockRejectedValueOnce(new Error("backend unavailable"))
+      .mockResolvedValueOnce(report);
+    render(<ReportsTab auth={auth} />);
+
+    expect(await screen.findByText("加载组织报表失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("总请求数")).toBeInTheDocument();
+    await waitFor(() => expect(mockedGetOrgUsage).toHaveBeenCalledTimes(2));
   });
 });

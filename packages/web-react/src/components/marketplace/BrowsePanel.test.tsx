@@ -71,6 +71,8 @@ test("分类筛选片只渲染有条目的分类(+全部/未分类)", async () =
   expect(screen.getByRole("button", { name: "办公文档" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "数据分析" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "未分类" })).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "市场分类，可横向滚动" })).toHaveAttribute("tabindex", "0");
+  expect(screen.getByText("左右滑动查看更多分类")).toHaveClass("sm:hidden");
   // 没有条目的分类不出 chip
   expect(screen.queryByRole("button", { name: "编程开发" })).not.toBeInTheDocument();
 });

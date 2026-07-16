@@ -88,7 +88,7 @@ import {
   type ProductFeatureId,
 } from "./lib/productCapabilities";
 import { resolveTutorialAction } from "./lib/tutorialActions";
-import { api } from "./lib/api";
+import { api, apiErrorMessage } from "./lib/api";
 import {
   effectiveEffortModelId,
   effortForModel,
@@ -951,7 +951,7 @@ export function App() {
         await refreshMe();
         toast("已加入组织", "success");
       } catch (e) {
-        toast(`接受邀请失败：${(e as Error).message}`, "error");
+        toast(apiErrorMessage(e, "接受组织邀请失败"), "error");
       }
     })();
   }, [demo, inWorkspace, auth, user, confirmDialog, refreshMe, toast]);

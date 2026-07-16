@@ -1,6 +1,15 @@
-import { describe, expect, test } from "vitest";
+import "@testing-library/jest-dom/vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, test } from "vitest";
 import { ApiError } from "../lib/api";
-import { orgErrText, orgRoleLabel } from "./OrgCenter";
+import { OrgCenter, orgErrText, orgRoleLabel } from "./OrgCenter";
+
+afterEach(cleanup);
+
+test("组织中心关闭按钮仅在粗指针扩大到 44px", () => {
+  render(<OrgCenter open auth={null} user={null} onClose={() => {}} />);
+  expect(screen.getByRole("button", { name: "关闭" })).toHaveClass("[@media(hover:none)]:size-11");
+});
 
 describe("orgRoleLabel", () => {
   test("三档角色中文", () => {

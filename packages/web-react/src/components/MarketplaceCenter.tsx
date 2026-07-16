@@ -132,7 +132,7 @@ export function MarketplaceCenter({
           className="fixed left-1/2 top-1/2 z-50 flex h-[min(85vh,46rem)] w-[calc(100vw-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between px-5 py-4">
-            <div>
+            <div className="min-w-0">
               <Dialog.Title className="text-[15px] font-semibold text-fg">AI 市场</Dialog.Title>
               <p className="mt-0.5 text-[12px] text-faint">
                 发现并安装技能、智能体与插件，也可以把自己的作品分享给大家。
@@ -142,7 +142,7 @@ export function MarketplaceCenter({
               <button
                 type="button"
                 aria-label="关闭"
-                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
               >
                 <X size={17} />
               </button>
@@ -214,7 +214,7 @@ export function MarketplaceCenter({
                           key={k}
                           onClick={() => setBrowseKind(k)}
                           className={cn(
-                            'rounded-full px-3 py-1 text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                            'rounded-full px-3 py-1 text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5',
                             browseKind === k
                               ? 'bg-accent-soft text-accent'
                               : 'text-muted hover:bg-hover hover:text-fg',

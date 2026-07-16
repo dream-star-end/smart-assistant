@@ -460,7 +460,9 @@ export const ThinkingCard = memo(
           className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
         >
           <Brain size={14} className="shrink-0 text-faint" />
-          <span className="min-w-0 truncate font-medium">{headline}</span>
+          <span className="min-w-0 truncate font-medium" title={headline}>
+            {headline}
+          </span>
           <ChevronRight
             size={14}
             className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
@@ -510,7 +512,12 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           <ListTodo size={14} />
         </span>
-        <span className="text-[13px] font-medium text-fg">{msg.text || "执行计划"}</span>
+        <span
+          className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg"
+          title={msg.text || "执行计划"}
+        >
+          {msg.text || "执行计划"}
+        </span>
         {msg._partial && <Badge tone="accent">编制中</Badge>}
       </div>
       <div className="px-3.5 py-2.5">
@@ -575,7 +582,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
       {!collapsed && entries.length > 0 && (
         <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           {entries.slice(-6).map((e, i) => (
-            <li key={i} className="truncate">
+            <li key={i} className="line-clamp-2 break-words" title={`[${e.phase}] ${e.text}`}>
               <span className="text-faint">[{e.phase}]</span> {e.text}
             </li>
           ))}

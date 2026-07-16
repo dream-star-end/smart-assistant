@@ -117,6 +117,9 @@ describe('ImageViewer 全屏查看器', () => {
     for (const label of ['编辑', '评论', '调整大小']) {
       expect(screen.getByRole('button', { name: label })).toBeInTheDocument()
     }
+    for (const label of ['关闭预览', '下载', '分享', '更多']) {
+      expect(screen.getByRole('button', { name: label })).toHaveClass('[@media(hover:none)]:size-11')
+    }
     // 「移除」已删除,不再出现。
     expect(screen.queryByRole('button', { name: '移除' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '关闭预览' }))
