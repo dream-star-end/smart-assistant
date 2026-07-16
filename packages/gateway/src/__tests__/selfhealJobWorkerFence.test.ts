@@ -64,7 +64,7 @@ function fakeSessionManager() {
 
 /** fetch stub: answers claim-capability with a token, context with the
  *  authoritative condition key (frozen before any submit), records calls. */
-function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5') {
+function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5', opts: { ackStatus?: number } = {}) {
   const calls: { url: string; init?: RequestInit }[] = []
   const impl = (async (url: string | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init })
@@ -77,6 +77,10 @@ function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5') {
         status: 200,
         json: async () => (conditionKey === null ? {} : { conditionKey }),
       }
+    }
+    if (String(url).endsWith('/ack')) {
+      const status = opts.ackStatus ?? 200
+      return { ok: status >= 200 && status < 300, status, json: async () => ({}) }
     }
     return { ok: true, status: 200, json: async () => ({}) }
   }) as unknown as typeof fetch
@@ -362,5 +366,34 @@ describe('condition key freeze — before any submit, fail-closed (batch0)', () 
     const after = await getJob('w-freeze-fail')
     assert.equal(after?.status, 'starting', 'job is left for a later tick (lease retry)')
     assert.equal(after?.conditionKey, null)
+  })
+})
+
+describe('machine-authored ack — before any submit, fail-closed (drill#1 409 root cause)', () => {
+  it('acks the master (capability auth) after freeze and before the turn', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch()
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-ack')
+    await worker.processJob(job)
+
+    assert.equal(sessions.state.submits.length, 1)
+    const ackCall = calls.find((c) => c.url.endsWith('/ack'))
+    assert.ok(ackCall, 'worker must send the ack callback')
+    assert.match(String(ackCall?.init?.headers && (ackCall.init.headers as Record<string, string>).Authorization), /^Bearer cap-test$/)
+    const ackIdx = calls.findIndex((c) => c.url.endsWith('/ack'))
+    const ctxIdx = calls.findIndex((c) => c.url.endsWith('/context'))
+    assert.ok(ackIdx > ctxIdx, 'ack follows the condition freeze')
+  })
+
+  it('fail-closed: ack rejected ⇒ zero submit, job stays starting for retry', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:svc_v5', { ackStatus: 503 })
+    const worker = makeWorker({ sessions, fetchImpl: impl }) as unknown as ProcessJobRunner
+    const job = await stageStartingJob('w-ack-fail')
+    await worker.processJob(job)
+
+    assert.equal(sessions.state.submits.length, 0, 'no turn may start unacked')
+    assert.equal((await getJob('w-ack-fail'))?.status, 'starting')
   })
 })
