@@ -364,6 +364,61 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         send(res, 200, { ok: await recordUninstall(userId, slug) }, requestId)
         return
       }
+      if (req.method === 'POST' && op === 'validate-plugin') {
+        if (!marketplaceConnectorsEnabled())
+          return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
+        const body = await readBody(req, PUBLISH_MAX_REQUEST_BYTES)
+        if (body.kind !== 'connector')
+          return send(
+            res,
+            400,
+            { error: { code: 'BAD_KIND', message: 'plugin draft kind is invalid' } },
+            requestId,
+          )
+        if (body.visibility === 'org' && !callerOrgId)
+          return send(
+            res,
+            403,
+            { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的插件' } },
+            requestId,
+          )
+        const prepared = prepareConnectorPublish(body)
+        if (!prepared.ok)
+          return send(
+            res,
+            prepared.status,
+            {
+              error: { code: prepared.code, message: prepared.message },
+              ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+            },
+            requestId,
+          )
+        send(
+          res,
+          200,
+          {
+            ok: true,
+            ...marketplaceArtifactCompatibility('connector'),
+            validationHash: prepared.validationHash,
+            plugin: {
+              slug: prepared.slug,
+              version: prepared.version,
+              name: prepared.name,
+              description: prepared.description,
+              category: prepared.humanMeta.category,
+              useCases: prepared.humanMeta.useCases,
+              outcomeExamples: prepared.humanMeta.outcomeExamples,
+              tags: prepared.tags,
+              visibility: body.visibility === 'org' ? 'org' : 'public',
+            },
+            permissionSummary: prepared.permissionSummary,
+            riskFlags: prepared.riskFlags,
+            note: '校验通过；发布前请向用户展示以上摘要并取得明确确认。',
+          },
+          requestId,
+        )
+        return
+      }
       if (req.method === 'POST' && op === 'publish') {
         await handlePublish(req, res, requestId, userId, callerOrgId, deps)
         return

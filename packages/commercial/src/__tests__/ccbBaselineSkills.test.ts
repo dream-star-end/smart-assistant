@@ -41,8 +41,11 @@ describe('ccb-baseline skills ↔ manifest', () => {
       (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('connector-authoring'),
     )
     const body = readFileSync(join(skillsDir, 'connector-authoring', 'SKILL.md'), 'utf8')
-    assert.match(body, /oc-market publish-connector --examples/)
-    assert.match(body, /--security-decision-file/)
+    assert.match(body, /oc-market plugin examples/)
+    assert.match(body, /oc-market plugin validate --file/)
+    assert.match(body, /validationHash/)
+    assert.match(body, /publishCommand/)
+    assert.doesNotMatch(body, /--security-decision-file/)
     assert.match(body, /不得[^。]*真实密码/)
     assert.match(body, /确认/)
   })

@@ -40,12 +40,10 @@ export const CHAT_CREATE_TEMPLATES: Record<ChatCreateKind, string> = {
 \`\`\`options
 {"question":"问题?","multi":false,"options":[{"label":"选项A","desc":"说明"},{"label":"选项B"}]}
 \`\`\`
-2. 信息足够后,先运行 oc-market publish-connector --examples 读取容器内置、经过编译器验证的三种完整模板,选择最接近的一种改写；不要猜测私有 schema，也不要读取容器中不存在的平台源码。然后起草一份「发布确认单」:名称/slug/认证方式/固定 origins/identity probe/每个 action 的 HTTP 方法与 read|write effect/凭据放置位置/BYOA 要求,等我回复「确认」。不得向我索要或把真实密钥写进文件。
-3. 确认后把完整 ConnectorSpec JSON 写到 /tmp/connector-spec.json,把与全部 origin、audience 和 action 一一对应的 publisher-proposed SecurityDecision JSON 写到 /tmp/connector-security-decision.json。社区 OAuth2 必须 clientProvisioning=byoa；凭据只能通过声明式 credential slot 注入,不得写入 path、日志或示例值。
-4. 用以下命令发布(按我的内容替换分类、场景、效果和标签；场景/效果用分号分隔):
-oc-market publish-connector --spec-file /tmp/connector-spec.json --security-decision-file /tmp/connector-security-decision.json --version 1.0.0 --category <分类id> --use-cases "场景1;场景2" --outcomes "效果1;效果2" --tags "API插件,服务名"
-如需仅组织可见再加 --visibility org；有富介绍时写入文件并加 --intro-file <文件>。
-5. 最后告诉我发布结果:提交后由 AI 自动审核；不确定、内容过大或高风险会转人工复核。之后可在「市场 → 发布 → 我的发布」实时跟踪,安装后到「管理中心 → 插件账号」统一绑定和管理账号。
+2. 信息足够后,运行 oc-market plugin examples 读取容器内置、经过编译器验证的三种完整单文件模板和合法分类；选择最接近的一种,把全部发布信息写入 /tmp/openclaude-plugin.json。不要猜私有 schema,也不要读取容器中不存在的平台源码。不得向我索要或把真实密码、token、client secret、授权码写进文件；社区 OAuth2 必须 BYOA,凭据只能在安装后通过账号授权注入。
+3. 运行 oc-market plugin validate --file /tmp/openclaude-plugin.json。必须用返回的 plugin 与 permissionSummary 起草「发布确认单」,逐项展示:名称/slug/版本/可见范围/认证方式/BYOA/所需授权字段/全部固定 origins/identity probe/每个 action 的 HTTP 方法与 read|write|send effect/凭据放置位置/风险提示。校验失败先按结构化错误修正并重新校验；校验成功后等我明确回复「确认」。
+4. 只有我确认后,才原样执行校验结果里的 publishCommand。确认后不得再修改草稿；如需修改,必须重新 validate、展示新摘要并让我重新确认。不得自己拼 curl/wget 或直连内部接口。
+5. 最后告诉我发布结果:提交后由 AI 自动审核；不确定、内容过大或高风险会转人工复核。可在「市场 → 发布 → 我的发布」实时跟踪；审核通过后「市场 → 发现」会自动刷新展示,安装后到「管理中心 → 插件账号」统一授权和管理账号。
 
 我的想法:【用一句话描述要连接的服务和希望 AI 能做什么,例如:连接公司内部工单 API,让 AI 查询工单并追加处理备注】`,
 }

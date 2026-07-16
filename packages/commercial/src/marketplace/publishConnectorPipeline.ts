@@ -8,7 +8,8 @@
 import { skillContentHash } from '@openclaude/storage'
 
 import { requiredBindSources } from '../connectors/engine/credentialBag.js'
-import { canonicalBytes } from '../connectors/spec/canonical.js'
+import { ConnectorError } from '../connectors/errors.js'
+import { canonicalBytes, canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 import {
@@ -44,6 +45,28 @@ export interface ConnectorPublishPrepared {
   riskFlags: RiskFlag[]
   policyVersion: number
   proposedSecurityDecision: unknown
+  /** Hash of the normalized effective draft shown to the user before publish. */
+  validationHash: string
+  /** Non-secret, compiler-derived facts used for the user's publish confirmation. */
+  permissionSummary: {
+    authMode: string
+    originMode: string
+    clientProvisioning: string | null
+    requiredCredentialSources: string[]
+    origins: {
+      authorizationOrigins: string[]
+      tokenOrigins: string[]
+      apiOrigins: string[]
+      unauthenticatedUploadOrigins: string[]
+    }
+    credentialPlacements: unknown[]
+    actions: Array<{ id: string; method: string; effect: string }>
+    identity: {
+      probeActionId: string
+      accountKeyPointer: string
+      accountHintPointer?: string
+    } | null
+  }
 }
 
 const reject = (
@@ -77,11 +100,18 @@ export function prepareConnectorPublish(
 
   const proposedSecurityDecision = body.securityDecision
   let compiled: ReturnType<typeof compileSpec>
+  let requiredCredentialSources: string[]
   try {
     compiled = compileSpec(specInput, proposedSecurityDecision)
-    requiredBindSources(compiled.execContract)
+    requiredCredentialSources = requiredBindSources(compiled.execContract)
   } catch (e) {
-    if (e instanceof ConnectorSpecError) return reject(422, e.code, e.code)
+    if (e instanceof ConnectorSpecError) return reject(422, e.code, e.message)
+    if (e instanceof ConnectorError && e.code === 'BAD_REQUEST')
+      return reject(
+        422,
+        'AUTH_MODE_UNSUPPORTED',
+        '当前市场自助发布仅支持 static-token、token-exchange 与 oauth2-auth-code',
+      )
     throw e
   }
   if (
@@ -126,6 +156,22 @@ export function prepareConnectorPublish(
   if (metaScan.blocked)
     return reject(422, 'SCAN_BLOCKED', '商品页文案被静态安全扫描拦截,请修正后重试', metaScan.flags)
 
+  const visibility = body.visibility === 'org' ? 'org' : 'public'
+  const validationHash = canonicalSha256Hex({
+    kind: 'connector',
+    version,
+    spec: specInput,
+    securityDecision: proposedSecurityDecision,
+    category: humanMeta.category,
+    useCases: humanMeta.useCases,
+    outcomeExamples: humanMeta.outcomeExamples,
+    humanMd: humanMeta.humanMd,
+    tags,
+    visibility,
+  })
+  const contract = compiled.execContract
+  const credentialPlacements = contract.actions[0]?.apiCredentialPlacements ?? []
+
   return {
     ok: true,
     slug,
@@ -146,5 +192,20 @@ export function prepareConnectorPublish(
     riskFlags: [...scan.flags, ...metaScan.flags],
     policyVersion: scan.policyVersion,
     proposedSecurityDecision,
+    validationHash,
+    permissionSummary: {
+      authMode: contract.authMode,
+      originMode: contract.originMode,
+      clientProvisioning: contract.oauth2?.clientProvisioning ?? null,
+      requiredCredentialSources,
+      origins: contract.credentialAudiencePolicy,
+      credentialPlacements,
+      actions: contract.actions.map((action) => ({
+        id: action.id,
+        method: action.request.method,
+        effect: action.effect,
+      })),
+      identity: contract.identity ?? null,
+    },
   }
 }
