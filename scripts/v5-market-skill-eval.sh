@@ -55,10 +55,12 @@ curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
   || { echo "install 失败"; exit 2; }
 echo "· 已安装到 canary,等待 hub 同步…"
 
-# 触发并等待容器 hub 同步(管理面读会触发 syncMarketplaceHub,5s TTL);
+# 触发并等待容器 hub 同步:**同步触发点在技能列表读**(handleUserSkillsList →
+# syncMarketplaceHubForManagement),evals GET 本身不触发 —— 每轮先打一次列表。
 # evals GET 200 且非空 = 同步就位。容器冷启动最长等 ~2min。
 evals=""
 for _ in $(seq 1 8); do
+  curl -sf "${auth[@]}" "$V5_BASE/api/skills" >/dev/null 2>&1 || true
   sleep 15
   evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$skillName/evals") && {
     n=$(echo "$evals" | jqpy 'd=json.load(sys.stdin);print(len((d.get("evals") or {}).get("cases",[])))' 2>/dev/null || echo 0)
