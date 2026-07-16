@@ -48,7 +48,12 @@ import type { AccountScheduler, ReleaseResult } from "../account-pool/scheduler.
 import { incrBillingDebit } from "../admin/metrics.js";
 import { errSummary, errMessageShort, isObj } from "../http/util.js";
 import type { UsageObservation } from "../http/proxy/shared.js";
-import { stageUsageCostLocatorInBillingTransaction } from "../db/pgSessionsBackend.js";
+import {
+  loadSettledUsageAttribution,
+  stageUsageCostLocatorInBillingTransaction,
+} from "../db/pgSessionsBackend.js";
+
+export { loadUsageAttributionCredits } from "../db/pgSessionsBackend.js";
 
 // ─── finalizer(single-shot + journal) ────────────────────────────────────
 
@@ -148,6 +153,11 @@ export interface FinalizeOutcome {
    * 广播/UI 应该用这个,不要用 finalCredits,否则 billing_failed/clamp 时会误报。
    */
   debitedCredits: bigint | null;
+  /** Exact actual-debit amount persisted with the turn locator for GoalState
+   * attribution. Unlike debitedCredits, zero is meaningful. Idempotent and
+   * commit-proven recovery paths return the existing immutable locator amount
+   * when available so callers can repair a missed fold/live refresh. */
+  attributionCredits?: bigint | null;
   /** 'committed' | 'aborted' */
   state: "committed" | "aborted";
   /** journal 行的 PG 主键(== requestId) */
@@ -439,6 +449,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         return {
           finalCredits: effectiveCredits,
           debitedCredits: null,
+          attributionCredits: null,
           state: "committed",
           requestId: ctx.requestId,
           balanceAfter: null,
@@ -480,6 +491,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     return {
       finalCredits: effectiveCredits,
       debitedCredits: settled.debitedCredits,
+      attributionCredits: settled.attributionCredits,
       state: "committed",
       requestId: ctx.requestId,
       balanceAfter: settled.balanceAfter,
@@ -586,6 +598,9 @@ export interface SettleResult {
    * 调用方用这个值决定是否向前端广播"已扣费"事件,以及广播多少。
    */
   debitedCredits: bigint | null;
+  /** Actual debit persisted beside the lossless turn locator. Zero preserves
+   * usage-only/error/waived attribution without inventing a charge. */
+  attributionCredits: bigint | null;
   /**
    * debit 完成后的 users.credits(即 ledger balance_after)。
    *
@@ -723,23 +738,22 @@ export async function settleUsageAndLedger(
         // 幂等路径只需读出另一并发 tx 已提交的行,不再走本事务内 ledger 写入,
         // 因此先 ROLLBACK 结束 aborted tx,SELECT 走 autocommit 读已提交行即可。
         await client.query("ROLLBACK");
-        const sel = await client.query<{ id: string; ledger_id: string | null }>(
-          `SELECT id::text AS id, ledger_id::text AS ledger_id
-             FROM usage_records WHERE user_id=$1 AND request_id=$2`,
-          [args.userId.toString(), args.requestId],
-        );
-        if (sel.rowCount === 0) throw err;
-        const r = sel.rows[0]!;
+        const settled = await loadSettledUsageAttribution(client, args.userId, args.requestId);
+        if (settled === null) throw err;
         // 重试时无法重新算 clamp(原始 balance 已变),保守标 false。
         // metric 只对首次 settle 路径完整反映 — 重复 settle 是边界场景,
         // 由 inflight 兜底,clamp 状态以原 ledger memo 为准(非 metric 来源)。
         return {
-          usageId: BigInt(r.id),
-          ledgerId: r.ledger_id === null ? null : BigInt(r.ledger_id),
+          usageId: settled.usageId,
+          ledgerId: settled.ledgerId,
           clamped: false,
           // 重入路径 DB 已是提交态,原始 debit 金额无法安全重算,标 null
           // (caller 用 null 决定不对外广播 cost_charged,只靠 refreshBalance 更新气泡)。
           debitedCredits: null,
+          // A crash may have happened after usage+ledger+pending committed but
+          // before the post-commit fold/broadcast. Returning the existing exact
+          // locator lets the retry drive that live refresh without re-debiting.
+          attributionCredits: settled.attributionCredits,
           // 同上:余额可能被别的并发请求改过,无法还原当时的 balance_after。
           balanceAfter: null,
         };
@@ -776,7 +790,8 @@ export async function settleUsageAndLedger(
       }
     }
     const targetTurnKey = args.parentTurnKey ?? args.turnKey ?? null;
-    if (debitedCredits !== null && debitedCredits > 0n && targetTurnKey !== null) {
+    const attributionCredits = targetTurnKey === null ? null : (debitedCredits ?? 0n);
+    if (attributionCredits !== null) {
       await stageUsageCostLocatorInBillingTransaction(client, {
         requestId: args.requestId,
         userId: `c:${args.userId.toString()}`,
@@ -785,12 +800,16 @@ export async function settleUsageAndLedger(
         delegateAgentId: args.delegateAgentId ?? null,
         turnKey: args.turnKey ?? null,
         parentTurnKey: args.parentTurnKey ?? null,
-        costCredits: debitedCredits,
+        // The locator is also the durable join from usage_records to this
+        // tape. A zero actual debit must therefore still be staged; the goal
+        // token aggregate reads the usage row while the credit aggregate adds
+        // exactly zero. This commits atomically with usage/ledger truth.
+        costCredits: attributionCredits,
       });
     }
     commitAttempted = true;
     await client.query("COMMIT");
-    return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };
+    return { usageId, ledgerId, clamped, debitedCredits, attributionCredits, balanceAfter };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -804,18 +823,14 @@ export async function settleUsageAndLedger(
       for (const delayMs of [0, 50, 150]) {
         if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
         try {
-          const settled = await pool.query<{ id: string; ledger_id: string | null }>(
-            `SELECT id::text AS id,ledger_id::text AS ledger_id
-               FROM usage_records WHERE user_id=$1 AND request_id=$2`,
-            [args.userId.toString(), args.requestId],
-          );
-          const row = settled.rows[0];
-          if (row) {
+          const settled = await loadSettledUsageAttribution(pool, args.userId, args.requestId);
+          if (settled) {
             return {
-              usageId: BigInt(row.id),
-              ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
+              usageId: settled.usageId,
+              ledgerId: settled.ledgerId,
               clamped: false,
               debitedCredits: null,
+              attributionCredits: settled.attributionCredits,
               balanceAfter: null,
             };
           }

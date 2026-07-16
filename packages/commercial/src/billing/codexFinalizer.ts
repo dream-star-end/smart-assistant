@@ -157,6 +157,9 @@ export interface CodexFinalizeResult {
    *  - status='success' + cost>0:debit 实际值(clamp 时 = balance < cost)
    *  - status='error' / cost=0 / 零输出免单 / 23505 重入:null */
   debitedCredits: bigint | null;
+  /** Actual debit persisted with the usage→turn locator. Zero still means a
+   * valid usage-only attribution and must be folded into the tape. */
+  attributionCredits?: bigint | null;
   /** debit 后**双钱包总可用**(period_credits 期内桶 + users.credits 持久钱包,
    *  0096 spendTwoBucket.totalAfter 口径,对齐前端余额气泡);cost=0 / 重入路径为 null。 */
   balanceAfter: bigint | null;
@@ -228,6 +231,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
   // commit-after-fail 的合成"skipped" result:caller 看 debitedCredits===null 不广播。
   const SKIPPED_RESULT: CodexFinalizeResult = {
     debitedCredits: null,
+    attributionCredits: null,
     balanceAfter: null,
     costCredits: 0n,
     clamped: false,
@@ -345,6 +349,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
       }
       return {
         debitedCredits: settled.debitedCredits,
+        attributionCredits: settled.attributionCredits,
         // 双钱包总可用(settleUsageAndLedger → spendTwoBucket.totalAfter),非单桶。
         balanceAfter: settled.balanceAfter,
         costCredits: effectiveCredits,

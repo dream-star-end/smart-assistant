@@ -165,9 +165,17 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(notice).toHaveClass("max-w-full", "break-words", "rounded-xl");
   });
 
-  test("goal（v5 不实现）→ 不渲染任何内容", () => {
-    const { container } = renderMsg(mk("goal", { text: "目标" }));
-    expect(container.textContent).toBe("");
+  test("goal → 渲染原生目标更新卡", () => {
+    renderMsg(mk("goal", {
+      text: "目标",
+      goalStatus: "active",
+      tokensUsed: 120,
+      tokenBudget: 1_000,
+      timeUsedSeconds: 8,
+    }));
+    expect(screen.getByText("目标")).toBeInTheDocument();
+    expect(screen.getByText("active")).toBeInTheDocument();
+    expect(screen.getByText("Token 120 / 1,000 · 8s")).toBeInTheDocument();
   });
 });
 
@@ -834,16 +842,15 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     expect(screen.queryByText(/已思考/)).toBeNull();
   });
 
-  test("中间夹被跳过的 unknown(goal)行 → 不打断连续性,仍合并成 1 张卡", () => {
+  test("中间夹可见 goal 行 → 打断 thinking 连续性并渲染目标卡", () => {
     renderList([
       mk("user", { id: "u1", text: "q", status: "sent" }),
       think("th1", "**Alpha**"),
-      mk("goal", { id: "g1", text: "目标(v5 不渲染)" }), // messageKind unknown → 渲染 null,透明跳过
+      mk("goal", { id: "g1", text: "目标", goalStatus: "active" }),
       think("th2", "**Beta**"),
     ]);
-    expect(screen.getAllByText(/已思考/)).toHaveLength(1);
-    // goal 行仍不产出可见内容(消息数量/顺序语义不变,只是被并入连续性判定)。
-    expect(screen.queryByText("目标(v5 不渲染)")).toBeNull();
+    expect(screen.getAllByText(/已思考/)).toHaveLength(2);
+    expect(screen.getByText("目标")).toBeInTheDocument();
   });
 
   test("被会渲染的 assistant 叙事行打断 → 分成两张思考卡", () => {

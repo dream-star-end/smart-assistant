@@ -5,7 +5,7 @@ import { describe, test } from "node:test";
 
 import { LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID } from "@openclaude/protocol";
 
-import { materializeLosslessTurn } from "../http/losslessTurnTape.js";
+import { computeGoalTokensUsed, materializeLosslessTurn } from "../http/losslessTurnTape.js";
 
 const TURN_KEY = "a".repeat(64);
 
@@ -150,6 +150,7 @@ describe("materializeLosslessTurn", () => {
       {
         kind: "goal",
         blockId: "goal-live",
+        platformGoalId: "11111111-1111-4111-8111-111111111111",
         objective: "first objective",
         status: "in_progress",
         tokenBudget: null,
@@ -160,6 +161,7 @@ describe("materializeLosslessTurn", () => {
       {
         kind: "goal",
         blockId: "goal-live",
+        platformGoalId: "11111111-1111-4111-8111-111111111111",
         objective: hugeDetail,
         status: "complete",
         tokenBudget: null,
@@ -204,11 +206,13 @@ describe("materializeLosslessTurn", () => {
       hugeDetail,
     );
     assert.equal(goalRecord.payload.text, hugeDetail);
+    assert.equal(goalRecord.payload.blockId, "platform-goal-11111111-1111-4111-8111-111111111111");
     assert.equal(goalRecord.payload.goalStatus, "complete");
     assert.equal((goalRecord.payload._eventHistory as unknown[]).length, 2);
     assert.deepEqual((goalRecord.payload._eventHistory as unknown[])[1], {
       kind: "goal",
       blockId: "goal-live",
+      platformGoalId: "11111111-1111-4111-8111-111111111111",
       objective: hugeDetail,
       status: "complete",
       tokenBudget: null,
@@ -569,5 +573,37 @@ describe("materializeLosslessTurn", () => {
       createdAt: 1_783_944_000_000,
       engineBilling: rootBilling,
     }), /does not match requestId/);
+  });
+
+  test("sums root plus mixed nested delegate goal usage exactly once", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-123",
+      agentId: "main",
+      turnIndex: 16,
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "done",
+      createdAt: 1_783_944_000_000,
+      goalId: "11111111-1111-4111-8111-111111111111",
+      goalStateRevision: 4,
+      usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreationTokens: 1 },
+      agentGroups: [{
+        runId: "dlg-root",
+        agentId: "worker",
+        goal: "work",
+        status: "ok",
+        completedAt: 1_783_944_000_001,
+        goalUsageRecords: [
+          { runId: "dlg-root", agentId: "worker", engine: "ccb", inputTokens: 7, outputTokens: 3, cacheReadTokens: 1, cacheCreationTokens: 0 },
+          { runId: "dlg-child", agentId: "reviewer", engine: "codex", inputTokens: 4, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 1 },
+        ],
+      }],
+    });
+    assert.equal(computeGoalTokensUsed(turn.payload), 36);
+    const duplicate = structuredClone(turn.payload);
+    (duplicate.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>).push(
+      structuredClone((duplicate.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>)[0]!),
+    );
+    assert.throws(() => computeGoalTokensUsed(duplicate), /duplicate goal usage runId/);
   });
 });

@@ -22,6 +22,8 @@ export type LosslessTurnPayload = {
   createdAt: number;
   requestId?: string;
   agentSessionId?: string;
+  goalId?: string;
+  goalStateRevision?: number;
   usage?: Record<string, unknown>;
   truncated?: boolean;
   errorCode?: string;
@@ -68,6 +70,7 @@ export type MaterializedLosslessTurn = {
 
 const SAFE_AGENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_TURN_KEY = /^[0-9a-f]{64}$/;
+const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -262,6 +265,34 @@ function parseAgentGroups(obj: Record<string, unknown>): Array<Record<string, un
   if (groups === undefined) return undefined;
   return groups.map((group, groupIndex) => {
     const exact = structuredClone(group);
+    const rawUsage = group.goalUsageRecords;
+    if (rawUsage !== undefined) {
+      if (!Array.isArray(rawUsage)) {
+        throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords must be an array`);
+      }
+      exact.goalUsageRecords = rawUsage.map((record, recordIndex) => {
+        if (!isObject(record)) {
+          throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}] must be an object`);
+        }
+        const runId = requiredString(record, "runId");
+        const agentId = requiredString(record, "agentId");
+        if (!runId || runId.length > 128 || !SAFE_AGENT_ID.test(agentId)) {
+          throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}] identity is invalid`);
+        }
+        if (record.engine !== "ccb" && record.engine !== "codex") {
+          throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}].engine is invalid`);
+        }
+        return {
+          runId,
+          agentId,
+          engine: record.engine,
+          inputTokens: requiredInt(record, "inputTokens"),
+          outputTokens: requiredInt(record, "outputTokens"),
+          cacheReadTokens: requiredInt(record, "cacheReadTokens"),
+          cacheCreationTokens: requiredInt(record, "cacheCreationTokens"),
+        };
+      });
+    }
     const rawBillings = group.engineBillings;
     if (rawBillings === undefined) return exact;
     if (!Array.isArray(rawBillings)) {
@@ -313,6 +344,14 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (createdAt === undefined) throw new Error("turn tape payload.createdAt is required");
   const requestId = optionalString(raw, "requestId");
   const agentSessionId = optionalString(raw, "agentSessionId");
+  const goalId = optionalString(raw, "goalId");
+  const goalStateRevision = optionalPositiveInt(raw, "goalStateRevision");
+  if ((goalId === undefined) !== (goalStateRevision === undefined)) {
+    throw new Error("turn tape payload goalId and goalStateRevision must be present together");
+  }
+  if (goalId !== undefined && !SAFE_UUID.test(goalId)) {
+    throw new Error("turn tape payload.goalId is invalid");
+  }
   const usage = optionalObject(raw, "usage");
   const errorCode = optionalString(raw, "errorCode");
   const errorDetail = optionalString(raw, "errorDetail");
@@ -363,6 +402,8 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       clientMessageId !== undefined ||
       requestId !== undefined ||
       agentSessionId !== undefined ||
+      goalId !== undefined ||
+      goalStateRevision !== undefined ||
       usage !== undefined ||
       thinkingText !== undefined ||
       truncated !== undefined ||
@@ -393,6 +434,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     createdAt,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(agentSessionId !== undefined ? { agentSessionId } : {}),
+    ...(goalId !== undefined ? { goalId, goalStateRevision: goalStateRevision! } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(truncated === true ? { truncated: true } : {}),
     ...(errorCode !== undefined ? { errorCode } : {}),
@@ -405,6 +447,45 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     ...(runtimeEvents !== undefined ? { runtimeEvents } : {}),
     ...(engineBilling !== undefined ? { engineBilling } : {}),
   };
+}
+
+/** Sum the root execution and every delegate execution exactly once. The
+ * normalized per-run records remain unaggregated on the tape so nested mixed
+ * engine trees can be audited without re-reading billing ledgers. */
+export function computeGoalTokensUsed(payload: LosslessTurnPayload): number {
+  const seenRunIds = new Set<string>();
+  let total = 0;
+  const add = (value: unknown, field: string): void => {
+    if (value === undefined) return;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`turn tape payload ${field} must be a non-negative safe integer`);
+    }
+    total += value;
+    if (!Number.isSafeInteger(total)) throw new Error("turn tape payload goal token total exceeds safe integer range");
+  };
+  for (const field of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] as const) {
+    add(payload.usage?.[field], `usage.${field}`);
+  }
+  let delegateRecordCount = 0;
+  for (let groupIndex = 0; groupIndex < (payload.agentGroups ?? []).length; groupIndex++) {
+    const records = payload.agentGroups![groupIndex]!.goalUsageRecords;
+    if (records === undefined) continue;
+    if (!Array.isArray(records)) throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords must be an array`);
+    for (let recordIndex = 0; recordIndex < records.length; recordIndex++) {
+      const record = records[recordIndex] as Record<string, unknown>;
+      const runId = requiredString(record, "runId");
+      if (seenRunIds.has(runId)) throw new Error("turn tape payload contains duplicate goal usage runId");
+      seenRunIds.add(runId);
+      delegateRecordCount += 1;
+      for (const field of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] as const) {
+        add(record[field], `agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}].${field}`);
+      }
+    }
+  }
+  if (!payload.goalId && delegateRecordCount > 0) {
+    throw new Error("turn tape payload without goal attribution cannot contain goal usage records");
+  }
+  return payload.goalId ? total : 0;
 }
 
 function sha256(bytes: Buffer): string {
@@ -684,9 +765,14 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
     if (kind !== "plan" && kind !== "goal") {
       throw new Error("turn tape structuredBlocks[].kind is invalid");
     }
-    const blockId = typeof block.blockId === "string" && block.blockId.length > 0
-      ? block.blockId
-      : `${kind}-${ordinal}`;
+    const platformGoalId = kind === "goal" && typeof block.platformGoalId === "string" && block.platformGoalId.length > 0
+      ? block.platformGoalId
+      : null;
+    const blockId = platformGoalId
+      ? `platform-goal-${platformGoalId}`
+      : typeof block.blockId === "string" && block.blockId.length > 0
+        ? block.blockId
+        : `${kind}-${ordinal}`;
     const key = `${kind}\0${blockId}`;
     const current = structuredGroups.get(key) ?? { kind, blockId, events: [] };
     current.events.push(block);

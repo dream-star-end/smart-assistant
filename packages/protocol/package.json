@@ -12,6 +12,7 @@
     "./traceId": "./src/traceId.ts",
     "./research": "./src/research.ts",
     "./modelAuthority": "./src/modelAuthority.ts",
+    "./goalState": "./src/goalState.ts",
     "./containerPreview": "./src/containerPreview.ts",
     "./containerPreviewAuth": "./src/containerPreviewAuth.ts"
   },

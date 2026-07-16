@@ -18,6 +18,7 @@ import {
   Sparkles,
   MessageSquare,
   Square,
+  Target,
   Type,
   Volume2,
   Wallet,
@@ -535,6 +536,28 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
           ))}
         </ol>
       </div>
+    </div>
+  );
+}
+
+// Engine diagnostic projection. Platform controls and authoritative budgets
+// live in the header GoalControl; this row simply makes native goal updates
+// visible and updates in place through its stable block id.
+export function GoalCard({ msg }: { msg: ChatMessage }) {
+  const status = msg.cleared ? "已清除" : msg.goalStatus || "已同步";
+  return (
+    <div className="rounded-lg border border-border bg-surface px-3.5 py-3 animate-in">
+      <div className="flex items-center gap-2">
+        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent"><Target size={14} /></span>
+        <span className="text-[13px] font-medium text-fg">{msg.text || "会话目标"}</span>
+        <Badge tone={msg.cleared ? "neutral" : "accent"}>{status}</Badge>
+      </div>
+      {!msg.cleared && (
+        <p className="mt-2 text-[11.5px] text-muted tabular-nums">
+          Token {groupDigits(String(msg.tokensUsed ?? 0))}{msg.tokenBudget == null ? "" : ` / ${groupDigits(String(msg.tokenBudget))}`}
+          {typeof msg.timeUsedSeconds === "number" ? ` · ${msg.timeUsedSeconds}s` : ""}
+        </p>
+      )}
     </div>
   );
 }

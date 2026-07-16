@@ -129,7 +129,7 @@ export interface RoundTripCtx {
  *   - 上游非 2xx / no-body 错误:finalize.fail or failClient(取决于 isClientBadRequest)
  *   - SSE byte-pipe + usage capture
  *   - finalize.commit / fail / failClient(取决于 result.error & isClientAbort)
- *   - 成功 commit & debited>0 → appendCostCredits → broadcastToUser
+ *   - 成功 commit → 持久折叠 usage locator；debited>0 才 broadcastToUser
  *   - settle metric
  *   - finally: req.off / res.off / session.zeroizeSecrets()
  *
@@ -354,21 +354,23 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     //   - clamp(余额不足)路径 finalCredits=标称,debitedCredits=实际扣款(<标称),
     //     必须发实际扣款值,否则用户面板看到的 meta 和左上角余额对不上
     //   - 23505 重入路径 debitedCredits=null → 跳过广播,前端靠 refreshBalance 兜底
-    if (
-      outcome.state === "committed"
-      && outcome.debitedCredits !== null
-      && outcome.debitedCredits > 0n
-    ) {
-      // 1) Durable persist FIRST — refresh-after-reply must show the
-      //    same number the broadcast carries. Failure here is logged but
-      //    does NOT block the broadcast: in-page UX still updates, and
-      //    `pending_usage_patches` GC sweep will surface the straggler.
-      if (appendCostCredits) {
-        try {
-          await appendCostCredits(
+    // Every newly committed usage row with a turn locator carries an exact
+    // attribution amount. Zero is not "nothing": it joins waived/error usage
+    // to the tape while contributing no credits. The pending locator was
+    // already committed atomically with usage_records/ledger; this call folds
+    // it immediately and bumps the live GoalState snapshot.
+    const persistedUsageCredits =
+      outcome.attributionCredits !== null && outcome.attributionCredits !== undefined
+        ? outcome.attributionCredits
+        : outcome.debitedCredits !== null && outcome.debitedCredits > 0n
+          ? outcome.debitedCredits
+          : null;
+    if (outcome.state === "committed" && persistedUsageCredits !== null && appendCostCredits) {
+      try {
+        await appendCostCredits(
             requestId,
             uid.toString(),
-            outcome.debitedCredits.toString(),
+            persistedUsageCredits.toString(),
             // agent session id(ccb getSessionId,= cost 帧 sessionId)→ park 进 pending.session_id,
             // 供 ccb 助手落库按 session 精确 drain(per-turn 精确,消除 by-user 跨会话归并)。
             sessionId,
@@ -381,15 +383,20 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             delegateAgentId,
             turnKey,
             parentTurnKey,
-          );
-        } catch (err) {
-          userLog.warn("proxy_persist_costcredits_failed", {
-            err: errSummary(err),
-            requestId,
-          });
-        }
+        );
+      } catch (err) {
+        userLog.warn("proxy_persist_costcredits_failed", {
+          err: errSummary(err),
+          requestId,
+        });
       }
-      // 2) Broadcast — in-page fast-path. Stays fire-and-broadcast even
+    }
+    if (
+      outcome.state === "committed"
+      && outcome.debitedCredits !== null
+      && outcome.debitedCredits > 0n
+    ) {
+      // Broadcast — in-page fast-path. Stays fire-and-broadcast even
       //    when persistence fails (see comment above).
       if (broadcastToUser) {
         try {

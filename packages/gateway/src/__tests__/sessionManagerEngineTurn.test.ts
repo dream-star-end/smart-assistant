@@ -554,6 +554,7 @@ describe("crash/interrupt partial persistence", () => {
     try {
       const sm = new SessionManager(makeConfigStub());
       const events: SessionStreamEvent[] = [];
+      let session!: AgentSession;
       const runner = new FakeCcbRunner((r) => {
         setImmediate(() => {
           r.thinking("half thought");
@@ -578,10 +579,23 @@ describe("crash/interrupt partial persistence", () => {
           });
           r.toolPair("tu1", "Bash", "tool output before crash");
           r.text("wer");
+          session.runner.emit("billing", {
+            requestId: "crash-usage-request",
+            turnKey: session._currentTurnKey,
+            engineSessionId: `oceng-${"c".repeat(48)}`,
+            status: "error",
+            durationMs: 123,
+            usage: {
+              input_tokens: 7,
+              output_tokens: 3,
+              cache_read_input_tokens: 2,
+              cache_creation_input_tokens: 1,
+            },
+          });
           r.emitExit({ code: 1, signal: null, crashed: true });
         });
       });
-      const session = makeSession(runner, {
+      session = makeSession(runner, {
         channel: "webchat",
         userId: "user-1",
       } as Partial<AgentSession>);
@@ -599,6 +613,13 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(p.thinkingText, "half thought");
       assert.equal(p.requestId, "req-unit");
       assert.equal(p.agentSessionId, "ccb-sess-1");
+      assert.deepEqual(p.usage, {
+        inputTokens: 7,
+        outputTokens: 3,
+        cacheReadTokens: 2,
+        cacheCreationTokens: 1,
+        turn: 1,
+      });
       assert.equal(p.tools?.length, 1);
       assert.equal(p.tools?.[0].toolName, "Bash");
       assert.equal(p.tools?.[0].output, "tool output before crash");

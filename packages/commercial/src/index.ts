@@ -99,6 +99,7 @@ import {
   deleteRemoteCodexContainerAuth,
 } from "./codex-auth/remoteCodexAuth.js";
 import { tx } from "./db/queries.js";
+import { GoalStateService } from './goal/goalStateService.js'
 import { recordProductFrictionEvent } from "./productFriction/events.js";
 import {
   startLifecycleScheduler,
@@ -1120,16 +1121,23 @@ export async function registerCommercial(
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
+  const goalUsageRefreshRef: {
+    current: (userId: string, sessionId: string) => void | Promise<void>;
+  } = { current: () => { /* GoalState service is assembled below. */ } };
   if (runtimeChannel === "v5") {
     const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
     if (decision.store === "pg") {
-      const pgSessionsBackend = createPgSessionsBackend(getPool(), { expectedGeneration: decision.generation });
+      const pgSessionsBackend = createPgSessionsBackend(getPool(), {
+        expectedGeneration: decision.generation,
+        onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
+      });
       setClientSessionsBackend(pgSessionsBackend);
       losslessTurnTapeStorage = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
       sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({
         pool: getPool(),
+        onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onStats: (s) => {
           if (s.pendingFolded || s.pendingUnreachableExpired || s.tapePartsPurged) {
             rootLogger.info("[sessionsGcSweep] lossless 收尾 GC", {
@@ -1465,6 +1473,24 @@ export async function registerCommercial(
   // 看不到积分显示,但扣费本身仍生效;生产上 proxy 处理请求前 bridge 必已初始化)。
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
+  };
+  const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
+  const goalSyncRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
+  const goalStateService = new GoalStateService({
+    pool: getPool(),
+    broadcast: (uid, snapshot) => goalBroadcastRef.current(uid, {
+      type: 'sys.goal_snapshot',
+      goal: snapshot,
+    }),
+    syncEngine: (uid, snapshot) => goalSyncRef.current(uid, snapshot),
+  });
+  goalUsageRefreshRef.current = async (userId, sessionId) => {
+    if (!/^c:\d+$/.test(userId)) return;
+    await goalStateService.refreshUsage(BigInt(userId.slice(2)), sessionId);
   };
   // 双槽私有 relay 的本槽 bridge forward-ref。控制口先起、bridge 后装配，窗口内安全返空。
   const slotRelayLocalRef: { current: SlotRelayLocal } = {
@@ -3174,6 +3200,7 @@ export async function registerCommercial(
 
   const handler = createCommercialHandler({
     jwtSecret,
+    goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
@@ -4271,6 +4298,8 @@ export async function registerCommercial(
       const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
       return session?.messages ?? null;
     },
+    loadGoalState: (uid, sessionId) => goalStateService.get(uid, sessionId),
+    updateGoalEngineMetrics: (args) => goalStateService.updateEngineMetrics(args),
     persistMasterUserMessage: async (uid, sessionId, message) =>
       appendServerAuthoredMessage(
         sessionId,
@@ -4301,6 +4330,12 @@ export async function registerCommercial(
   // 扣费事件会实时推到用户前端。
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
+  };
+  goalBroadcastRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
+  goalSyncRef.current = (uid, payload) => {
+    userChatBridge.syncGoalToContainers(uid, payload);
   };
   slotRelayLocalRef.current = {
     onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),

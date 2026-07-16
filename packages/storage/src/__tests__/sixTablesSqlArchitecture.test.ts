@@ -14,6 +14,9 @@
  *     clientSessionsPlan.ts(纯决策层,无 SQL,防御性列入)
  *   - commercial backend:db/pgSessionsBackend.ts(PG 六表)、db/sessionsStoreAuthority.ts
  *     (只触状态机表,防御性列入)
+ *   - commercial GoalState PG 权威:goal/goalStateService.ts。mutation 必须在同一事务内先锁
+ *     client_sessions 归属行,再跨 session_goals/tape/pending 聚合并 CAS;拆到普通 backend
+ *     调用会丢失同事务 ownership fence,因此只对白名单中的该权威服务保留直读
  *   - 迁移/割接工具:scripts/v5-sessions-backfill-pg.ts
  *   - RFC §5b 已裁决 deprecated 的 SQLite-only 运维/迁移工具(master 割接后不用于生产,仅
  *     个人版/留档库):storage/sessionsMigrate.ts、scripts/v5-sessions-spill-archive.ts、
@@ -60,6 +63,7 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
   "packages/commercial/src/db/sessionsStoreAuthority.ts",
+  "packages/commercial/src/goal/goalStateService.ts",
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",

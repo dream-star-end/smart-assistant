@@ -221,6 +221,80 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
     h.adapter.clearSessionId();
     assert.equal(h.adapter.nativeSessionId, null);
   });
+
+  test("thread/goal/set 的同步通知在下一 turn parser 安装后保留平台 generation", async () => {
+    const h = makeHarness();
+    const first = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    p.notify("turn/completed", {
+      threadId: "thr-new-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+    await first.summary;
+    h.events.length = 0;
+
+    const fallback = p.onRequest;
+    p.onRequest = (req) => {
+      if (req.method !== "thread/goal/set") {
+        fallback?.(req);
+        return;
+      }
+      // Reproduce app-server stdout ordering:the notification is parsed in
+      // the same chunk before the request Promise continuation resumes.
+      p.notify("thread/goal/updated", {
+        threadId: "thr-new-1",
+        goal: {
+          objective: "ship adapter goal",
+          status: "paused",
+          tokenBudget: 2_000,
+          tokensUsed: 21,
+          timeUsedSeconds: 8,
+        },
+      });
+      p.respondTo(req.id, {});
+    };
+    await h.adapter.setGoalState({
+      sessionId: "web-goal-adapter",
+      goalId: "11111111-1111-4111-8111-111111111111",
+      objective: "ship adapter goal",
+      status: "paused",
+      tokenBudget: 2_000,
+      creditBudget: null,
+      tokensUsed: 21,
+      creditsUsed: "0",
+      timeUsedSeconds: 8,
+      stateRevision: 7,
+      snapshotRevision: 9,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:00:01.000Z",
+      statusChangedAt: "2026-07-16T00:00:01.000Z",
+    });
+    assert.equal(h.events.length, 0, "between-turn notification waits for a live parser");
+
+    const second = beginTurn(h);
+    const goalEvent = h.events.find(
+      (event) => event.kind === "block" && (event.block as { kind?: string }).kind === "goal",
+    );
+    assert.ok(goalEvent && goalEvent.kind === "block");
+    assert.deepEqual(goalEvent.block, {
+      kind: "goal",
+      blockId: "codex-goal-pending",
+      objective: "ship adapter goal",
+      status: "paused",
+      tokenBudget: 2_000,
+      tokensUsed: 21,
+      timeUsedSeconds: 8,
+      platformGoalId: "11111111-1111-4111-8111-111111111111",
+      platformStateRevision: 7,
+    });
+    await waitFor(() => p.written.filter((request) => request.method === "turn/start").length === 2);
+    p.notify("turn/completed", {
+      threadId: "thr-new-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+    await second.summary;
+  });
 });
 
 describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {

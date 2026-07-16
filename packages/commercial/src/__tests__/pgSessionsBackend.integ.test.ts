@@ -2,6 +2,7 @@
 //
 // 需 PG fixture(openclaude_test，与其它 integ 同库)。为不污染共享 public schema，本套件在
 // 专用 schema `oc_p2_sessions_test` 里 apply 0066/0078 WeChat outbox + 0134 六表 + 状态机表
+// + 0147 lossless tape + GoalState placeholder migration
 // (pool 走 search_path 隔离)，
 // 收尾 DROP SCHEMA CASCADE。无 PG → skip（与既有 integ 模式一致）。
 //
@@ -37,6 +38,7 @@ const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_
 const MIGRATION_0078 = path.resolve(here, "../db/migrations/0078_wechat_outbox_backoff_hol.sql");
 const MIGRATION_0134 = path.resolve(here, "../db/migrations/0134_sessions_master_pg.sql");
 const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_tapes.sql");
+const MIGRATION_GOAL_STATE = path.resolve(here, "../db/migrations/0159_goal_state.sql");
 const MIGRATION_0157 = path.resolve(here, "../db/migrations/0157_lossless_runtime_batches.sql");
 
 let pool: Pool;
@@ -77,6 +79,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0078, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0134, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_GOAL_STATE, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0157, { encoding: "utf8" }));
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
@@ -454,6 +457,92 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("publishes goal usage only after finalize and late-cost commits", async () => {
+    const sessionId = "s-goal-live-usage";
+    const userId = "c:42";
+    const goalId = "11111111-1111-4111-8111-111111111111";
+    const turnKey = "9".repeat(64);
+    const observations: Array<{ revision: string; tapeFinalized: boolean; components: number }> = [];
+    const observedBackend = createPgSessionsBackend(pool, {
+      expectedGeneration: GENERATION,
+      onGoalUsageChanged: async (changedUserId, changedSessionId) => {
+        assert.equal(changedUserId, userId);
+        assert.equal(changedSessionId, sessionId);
+        const row = (await pool.query<{
+          revision: string;
+          tape_finalized: boolean;
+          components: number;
+        }>(
+          `SELECT g.snapshot_revision::text AS revision,
+                  EXISTS (
+                    SELECT 1 FROM client_session_turn_tapes t
+                     WHERE t.session_id=g.session_id AND t.user_id=$2
+                       AND t.goal_id=g.goal_id AND t.finalized_at IS NOT NULL
+                  ) AS tape_finalized,
+                  (SELECT COUNT(*)::int FROM turn_tape_cost_components c
+                    WHERE c.session_id=g.session_id AND c.user_id=$2) AS components
+             FROM session_goals g WHERE g.session_id=$1`,
+          [sessionId, userId],
+        )).rows[0]!;
+        observations.push({
+          revision: row.revision,
+          tapeFinalized: row.tape_finalized,
+          components: row.components,
+        });
+      },
+    });
+
+    await observedBackend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO session_goals
+         (session_id,goal_id,objective,status,active_started_at)
+       VALUES ($1,$2,'验证实时 usage 快照','active',clock_timestamp())`,
+      [sessionId, goalId],
+    );
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      text: "goal usage",
+      createdAt: 1_783_944_000_000,
+      goalId,
+      goalStateRevision: 1,
+      usage: { inputTokens: 5, outputTokens: 7 },
+    });
+    for (const part of tape.parts) {
+      await observedBackend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    assert.equal((await observedBackend.finalizeLosslessTurnTape(userId, tape.finalize)).applied, "finalized");
+    assert.deepEqual(observations, [{ revision: "2", tapeFinalized: true, components: 0 }]);
+
+    assert.deepEqual(
+      await observedBackend.appendCostCredits(
+        "goal-live-cost", userId, "4", "ccb-live", null, null, turnKey,
+      ),
+      { applied: "patched" },
+    );
+    assert.deepEqual(observations, [
+      { revision: "2", tapeFinalized: true, components: 0 },
+      { revision: "3", tapeFinalized: true, components: 1 },
+    ]);
+    assert.deepEqual(
+      await observedBackend.appendCostCredits(
+        "goal-live-cost", userId, "4", "ccb-live", null, null, turnKey,
+      ),
+      { applied: "noop" },
+    );
+    assert.deepEqual(observations, [
+      { revision: "2", tapeFinalized: true, components: 0 },
+      { revision: "3", tapeFinalized: true, components: 1 },
+      // Recovery replay repairs the window where the component committed but
+      // the process died before its post-commit live notification, without
+      // manufacturing another database revision.
+      { revision: "3", tapeFinalized: true, components: 1 },
+    ]);
+  });
+
   maybe("multipart finalize hydrates every full detail and exact turn billing", async () => {
     const sessionId = "s-lossless1";
     const userId = "u-lossless";

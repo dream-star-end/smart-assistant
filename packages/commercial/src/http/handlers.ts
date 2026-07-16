@@ -102,9 +102,12 @@ import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
+import type { GoalStateService } from '../goal/goalStateService.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
+  /** Platform-authoritative session GoalState service. */
+  goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */

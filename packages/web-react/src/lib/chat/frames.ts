@@ -39,6 +39,7 @@ import type {
   PromptQueueMutationFrame,
   PromptQueueSnapshot,
 } from "@openclaude/protocol/frames";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 
 export type {
   InboundPromptQueueDelete,
@@ -157,6 +158,11 @@ export type ContextRebuiltWire = {
   messageCount?: number;
 } & WireRuntimeFields;
 
+export type GoalSnapshotWire = {
+  type: "sys.goal_snapshot";
+  goal: GoalStateSnapshot;
+};
+
 /**
  * 审批后的用户恢复通知（master→user）。内部 incident 生命周期不再对用户可见；只有
  * userNoticeApproval 在可信全自动修复、精确影响证据、企微审批和在线收件人门禁全部通过后，
@@ -231,6 +237,7 @@ export type OutboundWire =
   | RelayReadyWire
   | FrontendBuildWire
   | ContextRebuiltWire
+  | GoalSnapshotWire
   | IncidentWire
   | AckWire
   | PongWire

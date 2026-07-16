@@ -22,6 +22,7 @@ import {
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
+  normalizeGoalCards,
   resetAgentFrameSeqCursorsForSession,
   resetFrameSeqCursor,
   type FrameEffects,
@@ -35,6 +36,7 @@ import {
   createSession,
   rebuildIndexes,
   resetReplyTracker,
+  shouldApplyGoalSnapshot,
 } from "./model";
 import {
   applyServerIncremental,
@@ -93,6 +95,7 @@ import type {
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundWire,
+  GoalSnapshotWire,
   RepoBindErrorWire,
   RepoStatusWire,
 } from "./frames";
@@ -120,6 +123,10 @@ export type ChatSocketDeps = {
     sessId: string,
     context?: { clientMessageId?: string },
   ) => Promise<void> | void;
+  /** Every successful WS open (initial or reconnect) refreshes the selected
+   * and in-flight sessions from the PG GoalState REST authority. Live goal
+   * broadcasts are intentionally not trusted to be a replay log. */
+  syncGoalState?: (sessId: string) => Promise<void> | void;
   /**
    * 首次发消息前在主控创建 client_sessions 行（PUT /api/sessions/:id，messages:[]）。
    * v3 commercial 持久化契约：**前端 PUT 建行 + 元数据，容器 server-authored 往该行 append
@@ -202,8 +209,9 @@ export class ChatSocket {
   readonly sessions = new Map<string, ChatSession>();
   /** 已确认在主控建过行的会话 id(PUT 200 或 409-stale 才进;每会话只成功建一次)。登出清。*/
   private serverSessionEnsured = new Set<string>();
-  /** 建行 PUT 在途的会话 id(防并发重复 PUT)。PUT 失败时从此移除以便下次重试(不进 ensured)。*/
-  private serverSessionInflight = new Set<string>();
+  /** 建行 PUT 在途的会话 id→共享 Promise。发送与“先设目标”并发时必须等待同一
+   * 结果，不能让后到调用者把“已有请求在途”误判成建行失败。 */
+  private serverSessionInflight = new Map<string, Promise<boolean>>();
 
   // ── 订阅 / 批量 notify ──
   private listeners = new Set<() => void>();
@@ -703,6 +711,14 @@ export class ChatSocket {
     this.activeSessionId = sessId;
   }
 
+  setGoalState(sessId: string, goal: ChatSession["goalState"]): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    if (!shouldApplyGoalSnapshot(sess.goalState, goal ?? null)) return;
+    sess.goalState = goal ? structuredClone(goal) : null;
+    this.scheduleNotify();
+  }
+
   /** 对单会话触发 syncSession（去抖：同会话 SYNC_DEBOUNCE_MS 内至多一次）。*/
   private reconcileSession(sessId: string): void {
     if (!this.deps.syncSession) return;
@@ -900,6 +916,24 @@ export class ChatSocket {
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
+
+      // sys.goal_snapshot is a low-latency live path, not a durable replay
+      // ring. Close the disconnect window on every successful socket open by
+      // re-reading PG for the selected and any in-flight sessions. The hook's
+      // monotonic merge rejects a slower REST response if a newer WS snapshot
+      // wins the race.
+      const goalRefreshSessions = new Set<string>();
+      if (this.activeSessionId) goalRefreshSessions.add(this.activeSessionId);
+      for (const sessId of this.reconnectInFlightSet ?? []) goalRefreshSessions.add(sessId);
+      for (const sessId of goalRefreshSessions) {
+        try {
+          void Promise.resolve(this.deps.syncGoalState?.(sessId)).catch(() => {
+            /* retain the last monotonic snapshot; next open/selection retries */
+          });
+        } catch {
+          /* synchronous test/adapter failure follows the same retry policy */
+        }
+      }
 
       // 4s grace 主动 reconcile（§4 + S1 无条件对账）：等 replay 先赢，再 REST 补静默丢失。
       // 恒 arm（不再仅在有 in-flight 时）——即使本次重连没有 in-flight，也要对账当前选中会话，
@@ -1222,6 +1256,11 @@ export class ChatSocket {
         const frame = f as ContextRebuiltWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
         if (sess) this.applyContextRebuilt(sess, frame);
+        return;
+      }
+      case "sys.goal_snapshot": {
+        const frame = f as GoalSnapshotWire;
+        this.setGoalState(frame.goal.sessionId, frame.goal);
         return;
       }
       case "sys.relay_ready": {
@@ -1603,6 +1642,14 @@ export class ChatSocket {
     return s;
   }
 
+  /** Ensure the platform-owned client_sessions row exists before operations
+   * such as GoalState set that require ownership but may precede the first
+   * chat turn. Shares the same idempotent PUT flight as sendMessage. */
+  ensureServerSession(sessId: string, agentId: string, title?: string): Promise<boolean> {
+    const sess = this.ensureSession(sessId, agentId, title);
+    return this.ensureServerSessionOnce(sess, agentId);
+  }
+
   /** 重命名会话(纯元数据):改内存 title + notify → persist sig 变化,IndexedDB 随之落地。
    *  服务端 canonical 由调用方经 PATCH /api/sessions/:id 同步(三持有方一次收口)。*/
   renameSession(sessId: string, title: string): void {
@@ -1760,6 +1807,7 @@ export class ChatSocket {
     s._lastRouting = restoredRouting ? { ...restoredRouting } : undefined;
     rebuildIndexes(s);
     normalizeDelegateCards(s);
+    normalizeGoalCards(s);
     this.sessions.set(stored.id, s);
     if (inFlightFresh) this.resetThinkingSafety(stored.id);
     this.scheduleNotify();
@@ -1814,6 +1862,7 @@ export class ChatSocket {
     s._agentGroups = new Map();
     rebuildIndexes(s);
     normalizeDelegateCards(s);
+    normalizeGoalCards(s);
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -1844,6 +1893,7 @@ export class ChatSocket {
     s._agentGroups = new Map();
     rebuildIndexes(s);
     normalizeDelegateCards(s);
+    normalizeGoalCards(s);
     this.scheduleNotify();
   }
 
@@ -2054,14 +2104,15 @@ export class ChatSocket {
   /**
    * 主控建行（每会话一次，幂等）。**只在 PUT 确认成功(返回 true)后才标 ensured**;失败则清
    * inflight、下次发送/重试重建(Codex 审 MAJOR:旧实现发送即标 ensured,PUT 失败被吞 → 永不重建)。
-   * 已 ensured → resolve(true);inflight 中 → resolve(false)。sendMessage / retryMessage 共用。
+   * 已 ensured → resolve(true);inflight 中 → 共享同一 Promise。发送/目标设置共用。
    */
   private ensureServerSessionOnce(sess: ChatSession, agentId: string): Promise<boolean> {
     if (this.serverSessionEnsured.has(sess.id)) return Promise.resolve(true);
-    if (this.serverSessionInflight.has(sess.id)) return Promise.resolve(false);
-    this.serverSessionInflight.add(sess.id);
+    const existing = this.serverSessionInflight.get(sess.id);
+    if (existing) return existing;
     const sid = sess.id;
-    return Promise.resolve(this.deps.ensureServerSession?.(sid, agentId, sess.title))
+    const pending = Promise.resolve()
+      .then(() => this.deps.ensureServerSession?.(sid, agentId, sess.title))
       .then((ok) => {
         this.serverSessionInflight.delete(sid);
         // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
@@ -2072,6 +2123,8 @@ export class ChatSocket {
         this.serverSessionInflight.delete(sid);
         return false;
       });
+    this.serverSessionInflight.set(sid, pending);
+    return pending;
   }
 
   /**

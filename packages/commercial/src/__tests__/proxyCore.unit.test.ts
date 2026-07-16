@@ -204,6 +204,11 @@ function makeFinalize(outcome: Partial<FinalizeOutcome> = {}): FinalizerSpy {
   const fullOutcome: FinalizeOutcome = {
     finalCredits: "finalCredits" in outcome ? outcome.finalCredits! : 100n,
     debitedCredits: "debitedCredits" in outcome ? outcome.debitedCredits! : 100n,
+    attributionCredits: "attributionCredits" in outcome
+      ? outcome.attributionCredits!
+      : "debitedCredits" in outcome
+        ? outcome.debitedCredits!
+        : 100n,
     state: outcome.state ?? "committed",
     requestId: outcome.requestId ?? "req-1",
     balanceAfter: "balanceAfter" in outcome ? outcome.balanceAfter! : 9900n,
@@ -599,7 +604,7 @@ describe("runUpstreamRoundTrip — happy path commit + post-commit", () => {
     assert.equal(broadcastCalls, 0, "debitedCredits=null 不该 broadcast");
   });
 
-  test("debited=0n → 跳过 persist + broadcast", async () => {
+  test("debited=0n → persist usage attribution but skip charge broadcast", async () => {
     let persistCalls = 0;
     let broadcastCalls = 0;
     const { ctx } = buildCtx({
@@ -614,7 +619,7 @@ describe("runUpstreamRoundTrip — happy path commit + post-commit", () => {
     });
     await runUpstreamRoundTrip(ctx);
 
-    assert.equal(persistCalls, 0);
+    assert.equal(persistCalls, 1);
     assert.equal(broadcastCalls, 0);
   });
 

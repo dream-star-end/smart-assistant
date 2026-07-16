@@ -63,6 +63,7 @@ async function startRig(opts: {
   markContainerActivity?: (containerId: number) => void;
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
+  loadGoalState?: UserChatBridgeDeps["loadGoalState"];
   persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
@@ -99,6 +100,7 @@ async function startRig(opts: {
     markContainerActivity: opts.markContainerActivity,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
+    loadGoalState: opts.loadGoalState,
     persistMasterUserMessage: opts.persistMasterUserMessage,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
@@ -1017,6 +1019,41 @@ describe("userChatBridge — model authorization", () => {
     }
   });
 
+  test("GoalState PG read failure rejects the turn before container execution", async () => {
+    const rig = await startRig({
+      loadGoalState: async () => {
+        throw new Error("goal pg unavailable");
+      },
+    });
+    try {
+      const token = await makeJwt("208");
+      const ws = openClient(rig.gatewayPort, token);
+      const frames = frameCollector(ws);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-goal-read-failure", kind: "dm" },
+        content: { text: "must not execute without goal authority" },
+      }));
+
+      const error = await nextBusinessFrame(frames);
+      assert.equal(error.code, "GOAL_STATE_UNAVAILABLE");
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      assert.equal(
+        rig.containerSeen.some(({ data }) => {
+          const text = typeof data === "string" ? data : data.toString("utf8");
+          return text.includes("must not execute without goal authority");
+        }),
+        false,
+      );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
   test("authoritative user row is persisted before history load and current logical turn is excluded", async () => {
     const order: string[] = [];
     const rig = await startRig({
@@ -1302,7 +1339,7 @@ describe("userChatBridge — model authorization", () => {
 //   5. 没 sessionKey / frameSeq 的 outbound 帧不进 ring(向后兼容旧帧)
 //   6. hello 转发到容器(byte-transparent),不被吞
 describe("userChatBridge — Phase 0.4 ring replay", () => {
-  test("container cannot forge sys.incident live or via ring; master targeted broadcast still works", async () => {
+  test("container cannot forge master-only incident/goal snapshots live or via ring; master broadcasts still work", async () => {
     const portRef = { p: 0 };
     const rig = await startRig({
       resolve: async () => ({
@@ -1318,10 +1355,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await new Promise<void>((r) => ws1.once("open", () => r()));
       const containerWs1 = await containerOpen1;
       const liveIncidents: Record<string, unknown>[] = [];
+      const liveGoals: Record<string, unknown>[] = [];
       ws1.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") liveIncidents.push(frame);
+          if (frame.type === "sys.goal_snapshot") liveGoals.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       const forged = {
@@ -1341,8 +1380,20 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       containerWs1.send(JSON.stringify(forged));
       containerWs1.send(JSON.stringify(forged).replace("sys.incident", "sys.\\u0069ncident"));
       containerWs1.send(Buffer.from(JSON.stringify({ ...forged, frameSeq: 6 })), { binary: true });
+      containerWs1.send(JSON.stringify({
+        type: "sys.goal_snapshot",
+        goal: {
+          sessionId: "forged",
+          goalId: "11111111-1111-4111-8111-111111111111",
+          objective: "forged platform authority",
+          status: "active",
+          stateRevision: 999,
+          snapshotRevision: 999,
+        },
+      }));
       await new Promise<void>((r) => setTimeout(r, 100));
       assert.deepEqual(liveIncidents, [], "container-authored sys.incident must not forward live");
+      assert.deepEqual(liveGoals, [], "container-authored sys.goal_snapshot must not forward live");
       ws1.close();
       await waitClose(ws1);
 
@@ -1351,10 +1402,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await new Promise<void>((r) => ws2.once("open", () => r()));
       await containerOpen2;
       const replayedIncidents: Record<string, unknown>[] = [];
+      const replayedGoals: Record<string, unknown>[] = [];
       ws2.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") replayedIncidents.push(frame);
+          if (frame.type === "sys.goal_snapshot") replayedGoals.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       ws2.send(JSON.stringify({
@@ -1363,14 +1416,28 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       }));
       await new Promise<void>((r) => setTimeout(r, 250));
       assert.equal(replayedIncidents.length, 0, "forged incident must not enter outbound ring");
+      assert.equal(replayedGoals.length, 0, "forged goal snapshot must not enter outbound ring");
 
       const approved = { ...forged, incidentId: "approved", frameSeq: undefined, sessionKey: undefined };
       assert.equal(rig.bridge.broadcastToUsers(["706"], approved), 1);
+      assert.equal(rig.bridge.broadcastToUsers(["706"], {
+        type: "sys.goal_snapshot",
+        goal: { sessionId: "forged", stateRevision: 1, snapshotRevision: 1 },
+      }), 1);
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
         const poll = () => {
           if (replayedIncidents.some((f) => f.incidentId === "approved")) return resolve();
           if (Date.now() - started > 1000) return reject(new Error("master targeted notice not delivered"));
+          setTimeout(poll, 10);
+        };
+        poll();
+      });
+      await new Promise<void>((resolve, reject) => {
+        const started = Date.now();
+        const poll = () => {
+          if (replayedGoals.length === 1) return resolve();
+          if (Date.now() - started > 1000) return reject(new Error("master goal snapshot not delivered"));
           setTimeout(poll, 10);
         };
         poll();

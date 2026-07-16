@@ -38,6 +38,8 @@ import {
   type AgentGroupStatus,
   type DurableAgentGroup,
   type DurableCodexBilling,
+  type DurableGoalUsageRecord,
+  type GoalStateSnapshot,
   type DurableRuntimeEvent,
   type ReviewVerdict,
   REVIEW_VERDICT_PASS,
@@ -7792,7 +7794,12 @@ export class Gateway {
   private _resolveDelegateParent(args: {
     parentSessionKey?: unknown
     sourceAgent?: unknown
-  }): { sessionKey: string; repoSessionId?: string; billingParentTurnKey?: string } | null {
+  }): {
+    sessionKey: string
+    repoSessionId?: string
+    billingParentTurnKey?: string
+    platformGoal?: GoalStateSnapshot | null
+  } | null {
     if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
     const parent = this.sessions.getByKey(args.parentSessionKey)
     if (!parent) return null
@@ -7807,6 +7814,7 @@ export class Gateway {
       // direct parent turn is an ephemeral delegate session and has no master
       // tape/anchor of its own.
       billingParentTurnKey: parent._billingParentTurnKey ?? parent._currentTurnKey,
+      platformGoal: parent._platformGoal,
     }
   }
 
@@ -8233,6 +8241,7 @@ export class Gateway {
     const durableTranscript: unknown[] = []
     const durableRuntimeEvents: DurableRuntimeEvent[] = []
     const durableEngineBillings: DurableCodexBilling[] = []
+    const durableGoalUsageRecords: DurableGoalUsageRecord[] = []
     let session
     try {
       session = await this.sessions.getOrCreate({
@@ -8259,6 +8268,10 @@ export class Gateway {
       session._durableDelegateTranscript = durableTranscript
       session._durableDelegateRuntimeEvents = durableRuntimeEvents
       session._durableDelegateEngineBillings = durableEngineBillings
+      session._durableDelegateGoalUsageRecords = durableGoalUsageRecords
+      session._platformGoal = delegateParent?.platformGoal
+        ? structuredClone(delegateParent.platformGoal)
+        : null
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
       if (streamProgress) {
@@ -8317,6 +8330,7 @@ export class Gateway {
     // P2 债C — review 委派结束时从审查输出解析出的结构化裁决(PASS/NEEDS_FIX);
     // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
     let verdict: ReviewVerdict | undefined
+    let ownGoalUsageRecord: DurableGoalUsageRecord | undefined
     const timeoutConfig = resolveDelegateTimeoutConfig()
     const startedAt = Date.now()
     let lastChildActivityAt = startedAt
@@ -8349,7 +8363,36 @@ export class Gateway {
       (e) => {
         if (e.kind === 'block') durableTranscript.push(e.block)
         else if (e.kind === 'error') durableTranscript.push({ kind: 'error', error: e.error })
-        else if (e.kind === 'final') durableTranscript.push({ kind: 'final', meta: e.meta })
+        else if (e.kind === 'final') {
+          durableTranscript.push({ kind: 'final', meta: e.meta })
+          if (session._platformGoal?.status === 'active') {
+            ownGoalUsageRecord = {
+              runId: progressRunId,
+              agentId: targetAgentId,
+              engine: session.runner.engineId === 'codex' ? 'codex' : 'ccb',
+              inputTokens: e.meta?.inputTokens ?? ownGoalUsageRecord?.inputTokens ?? 0,
+              outputTokens: e.meta?.outputTokens ?? ownGoalUsageRecord?.outputTokens ?? 0,
+              cacheReadTokens: e.meta?.cacheReadTokens ?? ownGoalUsageRecord?.cacheReadTokens ?? 0,
+              cacheCreationTokens:
+                e.meta?.cacheCreationTokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
+            }
+          }
+        } else if (e.kind === 'codex_billing' && session._platformGoal?.status === 'active') {
+          // Billing is emitted before the parser's final event. Preserve it as
+          // a crash/exit fallback; a later final event overwrites only fields
+          // it actually observed.
+          ownGoalUsageRecord = {
+            runId: progressRunId,
+            agentId: targetAgentId,
+            engine: 'codex',
+            inputTokens: e.usage?.input_tokens ?? ownGoalUsageRecord?.inputTokens ?? 0,
+            outputTokens: e.usage?.output_tokens ?? ownGoalUsageRecord?.outputTokens ?? 0,
+            cacheReadTokens:
+              e.usage?.cache_read_input_tokens ?? ownGoalUsageRecord?.cacheReadTokens ?? 0,
+            cacheCreationTokens:
+              e.usage?.cache_creation_input_tokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
+          }
+        }
         const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
         if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
         if (!timedOut) {
@@ -8361,6 +8404,11 @@ export class Gateway {
       // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
       // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
       input.effort,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { platformGoal: session._platformGoal ?? null },
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])
@@ -8478,6 +8526,9 @@ export class Gateway {
       if (session._durableDelegateEngineBillings === durableEngineBillings) {
         session._durableDelegateEngineBillings = undefined
       }
+      if (session._durableDelegateGoalUsageRecords === durableGoalUsageRecords) {
+        session._durableDelegateGoalUsageRecords = undefined
+      }
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
@@ -8516,6 +8567,10 @@ export class Gateway {
     // instead of silently losing the nested reply.
     const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
     const resultSummary = error ? error : output.trim()
+    const goalUsageRecords = [
+      ...(ownGoalUsageRecord ? [ownGoalUsageRecord] : []),
+      ...durableGoalUsageRecords,
+    ]
     const durableGroup: DurableAgentGroup = {
       runId: progressRunId,
       agentId: targetAgentId,
@@ -8525,6 +8580,7 @@ export class Gateway {
       ...(durableTranscript.length > 0 ? { transcript: durableTranscript } : {}),
       ...(durableRuntimeEvents.length > 0 ? { runtimeEvents: durableRuntimeEvents } : {}),
       ...(durableEngineBillings.length > 0 ? { engineBillings: durableEngineBillings } : {}),
+      ...(goalUsageRecords.length > 0 ? { goalUsageRecords } : {}),
       completedAt: Date.now(),
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
       ...(verdict ? { verdict } : {}),
@@ -8536,6 +8592,11 @@ export class Gateway {
       if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
         directParent._durableDelegateEngineBillings.push(
           ...durableGroup.engineBillings.map((billing) => structuredClone(billing)),
+        )
+      }
+      if (durableGroup.goalUsageRecords && directParent?._durableDelegateGoalUsageRecords) {
+        directParent._durableDelegateGoalUsageRecords.push(
+          ...durableGroup.goalUsageRecords.map((record) => structuredClone(record)),
         )
       }
       const parentTranscript = directParent?._durableDelegateTranscript
@@ -9338,6 +9399,9 @@ export class Gateway {
   }
 
   private wsClients = new Set<WebSocket>()
+  /** Wire-private goal snapshots are trusted only on the authenticated master
+   * bridge connection. Programmatic/direct dispatch callers cannot forge it. */
+  private trustedGoalFrames = new WeakSet<object>()
 
   /**
    * 消费一条 bridge inbound.message 上的模型执行权威(方案 §2)。
@@ -9578,6 +9642,8 @@ export class Gateway {
         // 入口统一兜底(一切入口无条件 strip),descriptor 经 WeakMap 旁路挂载 ——
         // 客户端在 wire 上伪造不出 WeakMap key,故没有「伪造 descriptor」这个面。
         if (!this._consumeFrameAuthority(ws, frame as any, isFromBridge)) return
+        if (isFromBridge) (this.trustedGoalFrames ??= new WeakSet()).add(frame as object)
+        else delete (frame as any)._goalState
 
         // Stash userId on the frame so downstream dispatchInbound/deliver
         // paths that don't have the WS in scope can still build the correct
@@ -9603,6 +9669,9 @@ export class Gateway {
           })
         }
         await this.dispatchInbound(frame)
+      } else if (frame.type === 'inbound.goal_sync') {
+        if (!isFromBridge) return
+        await this.sessions.syncGoalState(frame.goal.sessionId, frame.goal)
       } else if (frame.type === 'inbound.control.stop') {
         await this.handleStop(frame)
       } else if ((frame as any).type === 'inbound.permission_response') {
@@ -10698,6 +10767,7 @@ export class Gateway {
     // descriptor 走 WeakMap 而不是 frame 上的私有属性,正是为了让「strip 干净」与
     // 「descriptor 可用」两件事互不冲突(见 modelAuthority.ts 的 authorityByFrame)。
     stripModelAuthorityField(frame as unknown as Record<string, unknown>)
+    if (!this.trustedGoalFrames?.has(frame as object)) delete (frame as any)._goalState
 
     // Ingress guard: drop new messages once shutdown begins so we don't spin
     // up work that `shutdownAll()` then has to tear back down.
@@ -12254,6 +12324,9 @@ export class Gateway {
     const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')
+        ? { platformGoal: frame._goalState ?? null }
+        : {}),
       // 模型权威批次 §4 —— bridge turn 的上游请求凭据。
       //
       // descriptor 是**验签产物**(_consumeAuthority → attachTurnAuthority),它原样保留了

@@ -1,4 +1,5 @@
 export * from './frames.js'
+export * from './goalState.js'
 export * from './events.js'
 export * from './teamCards.js'
 export * from './engineModels.js'

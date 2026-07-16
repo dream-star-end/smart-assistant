@@ -145,6 +145,10 @@ export interface DurableAgentGroup {
    * one-shot delegate sessions, so these frames must travel with the card
    * rather than depend on the bounded live bridge ring. */
   engineBillings?: import('./losslessTurnTape.js').DurableCodexBilling[]
+  /** Canonical token usage for this delegate execution and every nested child.
+   * runId is globally unique inside the owning root turn; master rejects
+   * duplicates before computing the tape total. */
+  goalUsageRecords?: import('./goalState.js').DurableGoalUsageRecord[]
   /** 委派实际完成时刻(epoch ms)。落库同时作行 `ts`(turn 内插序)与
    *  `completedAt`(展示)。 */
   completedAt: number

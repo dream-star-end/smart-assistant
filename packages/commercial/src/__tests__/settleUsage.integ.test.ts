@@ -33,7 +33,10 @@ import {
 } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
-import { settleUsageAndLedger } from "../billing/proxyBilling.js";
+import {
+  loadUsageAttributionCredits,
+  settleUsageAndLedger,
+} from "../billing/proxyBilling.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { getPool } from "../db/index.js";
 import { generatePersona } from "../account-pool/persona.js";
@@ -122,7 +125,7 @@ beforeEach(async () => {
   // egress_proxies 一并 TRUNCATE — 0055 CHECK 强制 claude_accounts.egress_proxy_id
   // NOT NULL,FK 指向 egress_proxies(id),所以 fixture 必须一起重建。
   await query(
-    "TRUNCATE TABLE pending_usage_patches, admin_audit, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
+    "TRUNCATE TABLE client_sessions, pending_usage_patches, admin_audit, usage_records, credit_ledger, claude_accounts, egress_proxies, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
   );
 });
 
@@ -294,6 +297,133 @@ describe("settleUsageAndLedger (integ)", () => {
       turn_key: turnKey,
       cost_credits: "300",
     }]);
+
+    // Simulate process loss after COMMIT but before appendCostCredits folds the
+    // pending locator. The idempotent retry must recover the exact attribution
+    // amount so its caller can fold and broadcast without another debit.
+    const replay = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-lossless-cost-1",
+      model: "test-model",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId: "ccb-lossless-1",
+      turnKey,
+    });
+    assert.equal(replay.debitedCredits, null);
+    assert.equal(replay.attributionCredits, 300n);
+    assert.equal(
+      await loadUsageAttributionCredits(getPool(), uid, "req-lossless-cost-1"),
+      300n,
+    );
+
+    // Simulate the normal sessions-backend fold. The shared proof reader must
+    // preserve the same amount after pending_usage_patches becomes a durable
+    // turn_tape_cost_components row.
+    await query(
+      `INSERT INTO client_sessions(id,user_id,created_at,last_at,updated_at)
+       VALUES ($1,$2,1,1,1)`,
+      ["ccb-lossless-1", `c:${uid.toString()}`],
+    );
+    await query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,
+          tape_sha256,total_bytes,part_count,billing_anchor_id,created_at,finalized_at)
+       VALUES ($1,$2,$3,'main',0,'completed',$4,$5,0,1,$6,1,1)`,
+      [
+        "ccb-lossless-1",
+        `c:${uid.toString()}`,
+        "tape-lossless-1",
+        turnKey,
+        "d".repeat(64),
+        "billing-anchor-1",
+      ],
+    );
+    await query(
+      `INSERT INTO turn_tape_cost_components
+         (request_id,user_id,session_id,tape_id,billing_anchor_id,cost_credits,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,1)`,
+      [
+        "req-lossless-cost-1",
+        `c:${uid.toString()}`,
+        "ccb-lossless-1",
+        "tape-lossless-1",
+        "billing-anchor-1",
+        "300",
+      ],
+    );
+    await query(
+      "DELETE FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+      ["req-lossless-cost-1", `c:${uid.toString()}`],
+    );
+    assert.equal(
+      await loadUsageAttributionCredits(getPool(), uid, "req-lossless-cost-1"),
+      300n,
+    );
+    const foldedReplay = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-lossless-cost-1",
+      model: "test-model",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId: "ccb-lossless-1",
+      turnKey,
+    });
+    assert.equal(foldedReplay.usageId, result.usageId);
+    assert.equal(foldedReplay.debitedCredits, null);
+    assert.equal(foldedReplay.attributionCredits, 300n);
+    const ledgerCount = await query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM credit_ledger WHERE user_id=$1",
+      [uid.toString()],
+    );
+    assert.equal(ledgerCount.rows[0].count, "1");
+  });
+
+  test("zero-debit usage commits a zero locator atomically for GoalState attribution", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("lossless-zero@example.com", 1000n);
+    const turnKey = "c".repeat(64);
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-lossless-zero-1",
+      model: "test-model",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "billing_failed",
+      sessionId: "ccb-lossless-zero",
+      turnKey,
+    });
+    assert.equal(result.debitedCredits, null);
+    assert.equal(result.attributionCredits, 0n);
+    const pending = await query<{
+      user_id: string;
+      turn_key: string | null;
+      cost_credits: string;
+    }>(
+      `SELECT user_id,turn_key,cost_credits
+         FROM pending_usage_patches WHERE request_id=$1`,
+      ["req-lossless-zero-1"],
+    );
+    assert.deepEqual(pending.rows, [{
+      user_id: `c:${uid.toString()}`,
+      turn_key: turnKey,
+      cost_credits: "0",
+    }]);
+    const truth = await query<{ input_tokens: string; ledger_id: string | null }>(
+      `SELECT input_tokens::text,ledger_id::text
+         FROM usage_records WHERE id=$1`,
+      [result.usageId.toString()],
+    );
+    assert.equal(truth.rows[0].input_tokens, String(makeUsage().input_tokens));
+    assert.equal(truth.rows[0].ledger_id, null);
   });
 
   test("immutable lossless locator conflict rolls back usage and debit together", async (t) => {

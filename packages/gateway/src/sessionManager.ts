@@ -30,6 +30,7 @@ import type {
   DurableRuntimeEvent,
   EngineBillingEvent,
   EngineEvent,
+  EngineFinalMeta,
   SegmentRecord,
   SessionStreamEvent,
   TurnSummary,
@@ -47,7 +48,12 @@ import {
   getV3MasterSinkOrNull,
   type V3MasterSinkPayload,
 } from './v3MasterSink.js'
-import type { DurableAgentGroup, OutboundContentBlock } from '@openclaude/protocol'
+import type {
+  DurableAgentGroup,
+  DurableGoalUsageRecord,
+  GoalStateSnapshot,
+  OutboundContentBlock,
+} from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import {
   type ExecutionTarget,
@@ -420,6 +426,11 @@ export interface AgentSession {
   /** Complete engine-reported billing frames for this delegate subtree.
    * handleDelegateTask moves them into the parent DurableAgentGroup. */
   _durableDelegateEngineBillings?: EngineBillingEvent[]
+  /** Platform-authoritative goal captured under this session's lock. It is
+   * immutable for the complete logical turn, including retries. */
+  _platformGoal?: GoalStateSnapshot | null
+  /** Delegate-subtree usage records rolled up without aggregation. */
+  _durableDelegateGoalUsageRecords?: DurableGoalUsageRecord[]
   lock: Promise<void>
   lastUsedAt: number
   // 跨 turn 累积
@@ -686,6 +697,8 @@ function persistServerAuthoredTurn(args: {
    *  session 精确排空 pending costCredits(per-turn 精确,消除 by-user 跨会话归并)。
    *  Legacy/personal path 忽略。 */
   agentSessionId?: string
+  goalId?: string
+  goalStateRevision?: number
   /** Plan §4.4 改动 7 — token usage gathered at message_stop. Wire-only on
    *  the v3 sink path; legacy persists usage via the
    *  `outputs/usage_log` table separately. */
@@ -757,6 +770,10 @@ function persistServerAuthoredTurn(args: {
       // the assistant path; we don't synthesize one here.
       ...(args.requestId !== undefined ? { requestId: args.requestId } : {}),
       ...(args.agentSessionId !== undefined ? { agentSessionId: args.agentSessionId } : {}),
+      ...(args.goalId !== undefined ? { goalId: args.goalId } : {}),
+      ...(args.goalStateRevision !== undefined
+        ? { goalStateRevision: args.goalStateRevision }
+        : {}),
       ...(args.usage !== undefined ? { usage: args.usage } : {}),
       ...(args.truncated ? { truncated: true } : {}),
       ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
@@ -932,6 +949,52 @@ function persistServerAuthoredTurn(args: {
     })
 }
 
+function activeGoalAttribution(session: AgentSession): {
+  goalId: string
+  goalStateRevision: number
+} | undefined {
+  const goal = session._platformGoal
+  return goal?.status === 'active'
+    ? { goalId: goal.goalId, goalStateRevision: goal.stateRevision }
+    : undefined
+}
+
+function safeUsageCounter(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined
+}
+
+/** Partial/crash persistence must retain every token counter already observed.
+ * Codex billing arrives before its final parser event, so it is also a valid
+ * fallback if an exit races terminal materialization. */
+function terminalUsageForPersistence(args: {
+  finalMeta?: EngineFinalMeta
+  billing?: EngineBillingEvent
+  traceId?: string
+  turnIndex: number
+  model?: string
+}): NonNullable<V3MasterSinkPayload['usage']> {
+  const billingUsage = args.billing?.usage
+  return {
+    inputTokens:
+      safeUsageCounter(args.finalMeta?.inputTokens) ?? safeUsageCounter(billingUsage?.input_tokens) ?? 0,
+    outputTokens:
+      safeUsageCounter(args.finalMeta?.outputTokens) ?? safeUsageCounter(billingUsage?.output_tokens) ?? 0,
+    cacheReadTokens:
+      safeUsageCounter(args.finalMeta?.cacheReadTokens) ??
+      safeUsageCounter(billingUsage?.cache_read_input_tokens) ??
+      0,
+    cacheCreationTokens:
+      safeUsageCounter(args.finalMeta?.cacheCreationTokens) ??
+      safeUsageCounter(billingUsage?.cache_creation_input_tokens) ??
+      0,
+    ...(args.model ? { model: args.model } : {}),
+    turn: args.turnIndex,
+    ...(args.traceId ? { traceId: args.traceId } : {}),
+  }
+}
+
 function persistPostTerminalRuntimeEvent(args: {
   sessionKey: string
   sessionId: string
@@ -1048,6 +1111,26 @@ export class SessionManager {
    */
   setRepoSnapshotProvider(fn: (sessionId: string) => RepoSnapshot | null): void {
     this._getRepoSnapshot = fn
+  }
+
+  /** Apply a master-authored goal update at the next session lock boundary.
+   * Busy turns finish with their captured revision; no queue or interruption
+   * behavior is changed. */
+  async syncGoalState(sessionId: string, goal: GoalStateSnapshot): Promise<void> {
+    const sessionKey = this._sessionIdToKey.get(sessionId)
+    if (!sessionKey) return
+    const session = this.sessions.get(sessionKey)
+    if (!session) return
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((resolve) => { release = resolve })
+    try {
+      await prev
+      session._platformGoal = structuredClone(goal)
+      await session.runner.setGoalState(goal)
+    } finally {
+      release()
+    }
   }
 
   /**
@@ -1318,6 +1401,7 @@ export class SessionManager {
         agentId: session.agentId,
         userId: session.userId,
         turnIndex,
+        ...activeGoalAttribution(session),
         turnKey,
         text: args.assistantText,
         status: 'completed',
@@ -2055,6 +2139,9 @@ export class SessionManager {
        *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine
        *  runner 实现 setCodexRoute,其余 runner duck-type 缺方法 → noop。 */
       codexRoute?: CodexProviderConfigOverride | null
+      /** Master-authored platform goal snapshot for this exact turn. null
+       * explicitly clears stale engine state; omission is for legacy callers. */
+      platformGoal?: GoalStateSnapshot | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
       /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
@@ -2239,6 +2326,11 @@ export class SessionManager {
             err,
           )
         }
+      }
+      if (Object.prototype.hasOwnProperty.call(opts ?? {}, 'platformGoal')) {
+        const goal = opts?.platformGoal ? structuredClone(opts.platformGoal) : null
+        session._platformGoal = goal
+        await session.runner.setGoalState(goal)
       }
       session.lastUsedAt = Date.now()
       // Clear tool use mappings from previous turn to prevent unbounded growth
@@ -2845,6 +2937,7 @@ export class SessionManager {
 
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
+      let observedFinalMeta: EngineFinalMeta | undefined
       const handleEngineEvent = (e: EngineEvent) => {
         // CCB 私有 detected 事件(原 parser onToolUse/onToolResult 回调的升格形态):
         // cron 桥接 + tool.called 指标属 engine 中立编排,在此就地消费,**不进**
@@ -2925,7 +3018,11 @@ export class SessionManager {
         // so it must NOT be flagged as phantom even if usage is 0.
         if (e.kind === 'block') turnBlockCount++
         else if (e.kind === 'permission_request') turnPermissionCount++
-        if (e.kind === 'final') { pendingFinal = e; return }
+        if (e.kind === 'final') {
+          observedFinalMeta = e.meta ? { ...e.meta } : undefined
+          pendingFinal = e
+          return
+        }
         onEvent(e)
       }
 
@@ -3071,6 +3168,7 @@ export class SessionManager {
                 agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
+                ...activeGoalAttribution(session),
                 ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
                 text: partialAssistant.text,
@@ -3078,7 +3176,13 @@ export class SessionManager {
                 status,
                 errorCode,
                 errorDetail: reason,
-                ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
+                usage: terminalUsageForPersistence({
+                  finalMeta: observedFinalMeta,
+                  billing: terminalEngineBilling,
+                  traceId,
+                  turnIndex,
+                  model: session.model,
+                }),
                 ...(requestId ? { requestId } : {}),
                 ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
                 ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
@@ -3478,6 +3582,7 @@ export class SessionManager {
                 agentId: session.agentId,
                 userId: session.userId,
                 turnIndex,
+                ...activeGoalAttribution(session),
                 ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
                 text: assistantText,

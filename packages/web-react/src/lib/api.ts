@@ -86,6 +86,7 @@ import type {
   OrgPayResult,
 } from "./types";
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type {
   ConnectorBindResult,
   ConnectorConfirmationDetail,
@@ -1411,6 +1412,54 @@ export const api = {
       ),
     );
   },
+
+  getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/session-goals/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((body) => body.goal),
+
+  setSessionGoal: (
+    a: AuthSession,
+    id: string,
+    input: {
+      objective: string;
+      tokenBudget: number | null;
+      creditBudget: string | null;
+      expectedStateRevision: number;
+    },
+  ): Promise<GoalStateSnapshot> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/session-goals/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((body) => body.goal),
+
+  transitionSessionGoal: (
+    a: AuthSession,
+    id: string,
+    action: "pause" | "resume" | "complete" | "clear",
+    expectedStateRevision: number,
+  ): Promise<GoalStateSnapshot | null> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/session-goals/${encodeURIComponent(id)}/${action}`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ expectedStateRevision }),
+        }),
+      ),
+    ).then((body) => body.goal),
 
   /**
    * 取归档分页（GET /api/sessions/:id/archive，Bearer）——滚动加载被搬进归档 chunk 的更早历史。
