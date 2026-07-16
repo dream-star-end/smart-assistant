@@ -28,6 +28,7 @@
 
 import {
   LOSSLESS_TURN_TAPE_CAPABILITY,
+  LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_EGRESS_CAPABILITY,
 } from "@openclaude/protocol";
@@ -38,6 +39,7 @@ import { isModelAuthorityEnforced } from "./billing/modelCatalogRuntime.js";
 export const MASTER_CAPABILITIES: readonly string[] = [
   MODEL_AUTHORITY_CAPABILITY,
   LOSSLESS_TURN_TAPE_CAPABILITY,
+  LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY,
 ];
 
 /** egress 进程广播的 capability(→ /internal/v5/egress-health.capabilities)。 */

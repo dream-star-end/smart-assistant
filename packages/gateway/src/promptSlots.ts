@@ -108,7 +108,15 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 ## 网页/文档提取 · 论文下载 (CLI)
 
 读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 \`oc-web extract <url>\` / \`oc-web parse <绝对路径>\`;学术论文检索与下载 → \`scansci-pdf <子命令>\`(search/download/citation 等)。细节见 \`skill_view("web-context")\` 与 \`skill_view("scansci-pdf")\`。
-安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。`
+安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。
+
+## 工具效率与失败自愈
+
+在**不减少验证、不省略用户要求、不降低结果质量**的前提下:
+- 多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行;有先后依赖的步骤仍按顺序执行,不要为省调用而并错流程。
+- 同一个工具以完全相同输入连续失败 2 次后,不要原样无限重试,也不要因此停止任务。先读错误信息,再改变参数、工具或路径继续完成;只有确实需要用户输入时才提问。
+- 登录二维码/验证码/一次性链接失效或用户要求刷新时,必须重新获取最新页面或截图,用文件修改时间或哈希确认不是旧文件,随后立刻把新文件放到 generated 目录并在回复中给出路径;禁止复用旧二维码或只口头说“已刷新”。
+`
 
 /** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{MEMORY_INDEX}} 由
  *  renderMemoryInstructions 注入运行时值。对应 prompts/memory-instructions.md。 */

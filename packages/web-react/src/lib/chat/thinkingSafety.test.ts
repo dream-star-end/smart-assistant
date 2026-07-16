@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { ChatSocket, type ChatSocketDeps } from "./socket";
+import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
 import { THINKING_SAFETY_MS } from "./pure";
 
 /**
@@ -196,11 +196,12 @@ describe("retryMessage：发送失败原地重发", () => {
     expect(s.messages.filter((m) => m.role === "user").length).toBe(userCountBefore);
     expect(userMsg.status).toBe("sent");
     expect(s._sendingInFlight).toBe(true);
-    // 重发帧走既有发送入口：含 web-retry 幂等键 + 保真文本（_modelText）+ 附件引用。
+    // 重发帧复用 clientMessageId，只把持久化 attempt 从 0 精确推进到 1。
     const inbound = ws.sent.find((d) => d.includes('"inbound.message"'))!;
     expect(inbound).toBeTruthy();
     const frame = JSON.parse(inbound);
-    expect(frame.idempotencyKey).toContain("web-retry-");
+    expect(frame.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMsg.id, 1));
+    expect(userMsg._sendAttempt).toBe(1);
     expect(frame.content.text).toBe("带图问题"); // _modelText（含附件的完整模型可见文本）
     expect(Array.isArray(frame.content.media)).toBe(true);
   });
