@@ -534,7 +534,11 @@ describe('v5 connector marketplace', () => {
     })
     await tx(async (client) => {
       await client.query(
-        "SELECT set_config('openclaude.plugin_signature_writer', 'plugin-v2', true)",
+        `SELECT set_config(
+           'openclaude.plugin_signature_writer',
+           'plugin-v2:' || pg_current_xact_id()::text,
+           true
+         )`,
       )
       await client.query(
         `UPDATE marketplace_skill_versions

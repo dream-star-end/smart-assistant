@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, before, describe, test } from 'node:test'
-import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query, tx } from '../db/queries.js'
 
@@ -129,7 +129,11 @@ describe('marketplace Plugin kernel migration', () => {
     )
     await tx(async (client) => {
       await client.query(
-        "SELECT set_config('openclaude.plugin_signature_writer', 'plugin-v2', true)",
+        `SELECT set_config(
+           'openclaude.plugin_signature_writer',
+           'plugin-v2:' || pg_current_xact_id()::text,
+           true
+         )`,
       )
       await client.query(
         `UPDATE marketplace_skill_versions
@@ -148,6 +152,40 @@ describe('marketplace Plugin kernel migration', () => {
       ),
       /explicit transaction writer gate/,
     )
+
+    // Even a mistakenly session-scoped marker is valid for at most its bound
+    // transaction; it cannot authorize the next checkout/transaction.
+    const pooledClient = await getPool().connect()
+    try {
+      await pooledClient.query('BEGIN')
+      await pooledClient.query(
+        `SELECT set_config(
+           'openclaude.plugin_signature_writer',
+           'plugin-v2:' || pg_current_xact_id()::text,
+           false
+         )`,
+      )
+      await pooledClient.query(
+        `UPDATE marketplace_skill_versions
+            SET signature=decode(repeat('12', 32), 'hex')
+          WHERE id=$1`,
+        [browserVersion.rows[0]!.id],
+      )
+      await pooledClient.query('COMMIT')
+      await pooledClient.query('BEGIN')
+      await assert.rejects(
+        pooledClient.query(
+          `UPDATE marketplace_skill_versions
+              SET signature=decode(repeat('34', 32), 'hex')
+            WHERE id=$1`,
+          [browserVersion.rows[0]!.id],
+        ),
+        /explicit transaction writer gate/,
+      )
+      await pooledClient.query('ROLLBACK')
+    } finally {
+      pooledClient.release()
+    }
     await assert.rejects(
       query(
         "UPDATE marketplace_skill_listings SET plugin_type='sandboxed-local' WHERE slug='browser-plugin'",

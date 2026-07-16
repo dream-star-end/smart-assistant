@@ -117,7 +117,9 @@ ALTER TABLE marketplace_skill_versions
 
 -- Cross-table shape cannot be expressed as a normal CHECK. This trigger also
 -- prevents an old binary from rewriting plugin-v2 trust columns: the future v2
--- writer must opt into the explicit transaction-local GUC before its atomic write.
+-- writer must opt into a marker bound to the current transaction id before its
+-- atomic write. Binding the xid prevents a session-level SET from leaking
+-- authorization through a pooled connection into a later transaction.
 CREATE OR REPLACE FUNCTION marketplace_validate_signature_scheme()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
@@ -165,7 +167,8 @@ BEGIN
   END IF;
 
   IF NEW.signature_scheme = 'plugin-v2' AND trust_changed
-     AND COALESCE(current_setting('openclaude.plugin_signature_writer', TRUE), '') <> 'plugin-v2' THEN
+     AND COALESCE(current_setting('openclaude.plugin_signature_writer', TRUE), '')
+       <> ('plugin-v2:' || pg_current_xact_id()::text) THEN
     RAISE EXCEPTION 'plugin-v2 trust write requires explicit transaction writer gate'
       USING ERRCODE = '23514';
   END IF;
