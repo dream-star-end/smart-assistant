@@ -498,6 +498,7 @@ describe('v5 release safety lanes', () => {
       requiredMigrations: string[]
     }
     assert.ok(metadata.requiredMigrations.includes('0135_deploy_state'))
+    assert.ok(metadata.requiredMigrations.includes('0153_marketplace_plugin_kernel'))
     const source = await readFile(deploy, 'utf8')
     const gateAt = source.indexOf('assert_repo_required_migrations || exit 1')
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
