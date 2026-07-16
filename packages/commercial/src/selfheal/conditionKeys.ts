@@ -53,7 +53,7 @@ export function sessionOversizedKey(uid: string | number): string {
 export const SYSTEM_MAINTENANCE_ON = "system.maintenance_on";
 
 /**
- * 合成 transport 演练 condition(exact;0154 seed;写点=演练脚本
+ * 合成 transport 演练 condition(exact;0155 seed;写点=演练脚本
  * scripts/v5-selfheal-drill.ts 经 write_alert_condition)。
  *
  * ── 跨仓契约(改动必须两侧同步)──

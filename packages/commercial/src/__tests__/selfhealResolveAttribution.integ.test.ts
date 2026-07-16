@@ -7,7 +7,7 @@
  *   - P3:repair 离开 verifying(失败终态)后,probe resolve 正常收口(无死锁);
  *   - P3:suppression(admin)收口不受 verifying 守卫阻塞;
  *   - P4:policy enabled=FALSE 时即使 auto_repair=TRUE 也不派单;
- *   - P5:0154 drill policy seed 姿态(exact/enabled/auto_repair=F/notice=F)。
+ *   - P5:0155 drill policy seed 姿态(exact/enabled/auto_repair=F/notice=F)。
  *
  * pg 不可用时 skip(与 selfhealReconciler.integ.test.ts 同款门)。
  */
@@ -196,7 +196,7 @@ describe("P4 派单过滤 — policy.enabled", () => {
   });
 });
 
-describe("P5 drill policy seed(0154)", () => {
+describe("P5 drill policy seed(0155)", () => {
   test("常驻姿态:exact + enabled + auto_repair=F + user_notice=F", async (t) => {
     if (skipIfNoPg(t)) return;
     const r = await query<{
@@ -206,7 +206,7 @@ describe("P5 drill policy seed(0154)", () => {
          FROM incident_policies WHERE match_key = $1`,
       [SELFHEAL_DRILL_TRANSPORT],
     );
-    assert.equal(r.rows.length, 1, "0154 seed 恰一行");
+    assert.equal(r.rows.length, 1, "0155 seed 恰一行");
     assert.equal(r.rows[0].match_kind, "exact");
     assert.equal(r.rows[0].enabled, true);
     assert.equal(r.rows[0].auto_repair, false, "常态不派单——只有演练脚本持锁期间临时翻开");

@@ -84,7 +84,7 @@ async function setDrillAutoRepair(c: Client, on: boolean): Promise<void> {
       WHERE match_kind = 'exact' AND match_key = $1`,
     [SELFHEAL_DRILL_TRANSPORT, on],
   );
-  if (r.rowCount !== 1) fail(`drill policy 不存在或不唯一(0154 未 apply?)rowCount=${r.rowCount}`);
+  if (r.rowCount !== 1) fail(`drill policy 不存在或不唯一(0155 未 apply?)rowCount=${r.rowCount}`);
 }
 
 /** 异常清场:auto_repair 先关(防再派),再翻 condition false。 */
