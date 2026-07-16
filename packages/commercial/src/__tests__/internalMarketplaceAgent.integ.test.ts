@@ -579,19 +579,68 @@ describe('internalMarketplaceAgent (integ)', () => {
       const slug = 'internal-ai-connector'
       const spec = connectorSpec(slug)
       const ownerHandler = await handlerFor(owner, 201)
+      const pluginDraft = {
+        kind: 'connector',
+        version: '1.0.0',
+        spec,
+        securityDecision: connectorDecision,
+        tags: ['连接器'],
+        category: 'daily-tools',
+        useCases: ['连接外部服务并查询当前身份'],
+      }
       let res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'validate-plugin', {
+          token: tokenFor(201),
+          body: pluginDraft,
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+      assert.equal(res.body.artifactKind, 'plugin')
+      assert.match(String(res.body.validationHash), /^[0-9a-f]{64}$/)
+      assert.equal(res.body.plugin.slug, slug)
+      assert.equal(res.body.permissionSummary.authMode, 'static-token')
+      assert.deepEqual(res.body.permissionSummary.requiredCredentialSources, ['access_token'])
+      assert.deepEqual(res.body.permissionSummary.origins.apiOrigins, [CONNECTOR_API_ORIGIN])
+      assert.deepEqual(res.body.permissionSummary.actions, [
+        { id: 'whoami', method: 'GET', effect: 'read' },
+      ])
+      let untouched = await query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug=$1',
+        [slug],
+      )
+      assert.equal(untouched.rows[0]?.count, '0', 'validate must not create a listing')
+
+      res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'validate-plugin', {
+          token: tokenFor(201),
+          body: {
+            ...pluginDraft,
+            securityDecision: {
+              ...connectorDecision,
+              audience: { ...connectorDecision.audience, apiOrigins: [] },
+            },
+          },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 422)
+      assert.equal(res.body.error.code, 'AUDIENCE_MISSING')
+      untouched = await query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug=$1',
+        [slug],
+      )
+      assert.equal(untouched.rows[0]?.count, '0', 'failed validate must remain side-effect-free')
+
+      res = makeRes()
       await ownerHandler(
         makeReq('POST', 'publish', {
           token: tokenFor(201),
-          body: {
-            kind: 'connector',
-            version: '1.0.0',
-            spec,
-            securityDecision: connectorDecision,
-            tags: ['连接器'],
-            category: 'daily-tools',
-            useCases: ['连接外部服务并查询当前身份'],
-          },
+          body: pluginDraft,
         }),
         res,
         CTX,
