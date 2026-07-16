@@ -1,6 +1,7 @@
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
+export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 15_000
 export const KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES = 1024 * 1024
 export const KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES = 256 * 1024
 export const KNOWLEDGE_PLANET_TOPIC_PAGE_MAX = 10
@@ -587,18 +588,34 @@ async function authenticatedProbe(context) {
   }
 }
 
-async function captureQr(page) {
-  for (const frame of page.frames().slice(1)) {
-    const images = frame.locator('img.qrcode, img[src*="/connect/qrcode/"]');
-    for (let i = 0, count = await images.count().catch(() => 0); i < count; i += 1) {
-      const image = images.nth(i);
-      if (!await image.isVisible().catch(() => false)) continue;
-      const loaded = await image.evaluate((element) => element.complete && element.naturalWidth >= 180 && element.naturalHeight >= 180).catch(() => false);
-      if (loaded) return image.screenshot({ type: 'png' });
+function remainingCaptureTimeout(deadlineMs) {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) throw new Error('qr');
+  return remaining;
+}
+
+async function captureQr(page, captureDeadline) {
+  while (Date.now() < captureDeadline) {
+    for (const frame of page.frames().slice(1)) {
+      const images = frame.locator('img.qrcode, img[src*="/connect/qrcode/"]');
+      for (let i = 0, count = await images.count().catch(() => 0); i < count; i += 1) {
+        const image = images.nth(i);
+        if (!await image.isVisible({ timeout: remainingCaptureTimeout(captureDeadline) }).catch(() => false)) continue;
+        const loaded = await image.evaluate(
+          (element) => element.complete && element.naturalWidth >= 180 && element.naturalHeight >= 180,
+          undefined,
+          { timeout: remainingCaptureTimeout(captureDeadline) },
+        ).catch(() => false);
+        if (!loaded) continue;
+        const png = await image.screenshot({
+          type: 'png',
+          timeout: remainingCaptureTimeout(captureDeadline),
+        }).catch(() => null);
+        if (png) return png;
+      }
     }
+    await page.waitForTimeout(Math.min(250, remainingCaptureTimeout(captureDeadline)));
   }
-  const frame = page.locator('iframe[src*="open.weixin.qq.com"]').first();
-  if (await frame.isVisible().catch(() => false)) return frame.screenshot({ type: 'png' });
   throw new Error('qr');
 }
 
@@ -641,9 +658,12 @@ async function runLogin(input, relay) {
     const agree = page.locator('.agreement-overlay .agree-btn, button.agree-btn').first();
     if (await agree.isVisible().catch(() => false)) await agree.click();
     if (await qrButton.isVisible().catch(() => false)) await qrButton.click();
-    await page.locator('iframe[src*="open.weixin.qq.com"]').first().waitFor({ state: 'visible', timeout: 12_000 }).catch(() => {});
-    await page.waitForTimeout(800);
-    const qr = await captureQr(page);
+    const qrCaptureDeadline = Math.min(input.deadlineMs, Date.now() + ${KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS});
+    await page.locator('iframe[src*="open.weixin.qq.com"]').first().waitFor({
+      state: 'visible',
+      timeout: remainingCaptureTimeout(qrCaptureDeadline),
+    }).catch(() => {});
+    const qr = await captureQr(page, qrCaptureDeadline);
     if (qr.length > 512 * 1024) throw new Error('qr');
     writeFrame({ event: 'qr', png: qr.toString('base64') });
     let nextProbeAt = Date.now() + ${KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS};
