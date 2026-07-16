@@ -2,7 +2,7 @@
  * P5 渲染层**纯逻辑核心** —— 与 React 无关、可独立单测。
  *
  * 这里集中三类「会引发 UI bug 的隐性规则」，从组件里抽出来用 vitest 钉死：
- *  1. role → 渲染分派 kind（goal/codex v5 不产生 → 'unknown' 不出卡）。
+ *  1. role → 渲染分派 kind（含平台同步的 goal 更新卡）。
  *  2. 单条消息 / 子块 **渲染签名**：reducer 对 message 做**就地 mutation**（同一对象
  *     引用、改字段），React.memo 默认浅比较会把"同引用"当"没变"而漏渲。这里产出一个
  *     仅捕获「影响渲染的字段」的字符串签名，作为 memo 比较键 —— 内容变才变、不变则
@@ -28,6 +28,7 @@ export type MessageKind =
   | "tool"
   | "agent-group"
   | "plan"
+  | "goal"
   | "permission"
   | "delegate-progress"
   | "system"
@@ -35,8 +36,7 @@ export type MessageKind =
 
 /**
  * role → 渲染分派 kind。
- * v5 已删 codex：`goal` 永不产生 → 落 'unknown'（渲染层静默跳过，不出空卡）。
- * 未知/将来新增 role 同样落 'unknown'，保证渲染层 fail-safe（不崩、不出占位）。
+ * Unknown/future roles land in `unknown`, keeping rendering fail-safe.
  */
 export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
   switch (m.role) {
@@ -46,12 +46,12 @@ export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
     case "tool":
     case "agent-group":
     case "plan":
+    case "goal":
     case "permission":
     case "delegate-progress":
     case "system":
       return m.role;
     default:
-      // goal（codex 专属，v5 不实现）及任何未知 role。
       return "unknown";
   }
 }
@@ -133,6 +133,19 @@ export function messageSignature(
         m.explanation ? m.explanation.length : 0,
         (m.steps ?? []).map((s) => `${s.status}:${s.step.length}`).join(","),
         m._partial ? 1 : 0,
+      ].join("|");
+    case "goal":
+      return [
+        head,
+        textSig(m.text),
+        m.goalStatus ?? "",
+        m.tokenBudget ?? "",
+        m.tokensUsed ?? 0,
+        m.timeUsedSeconds ?? 0,
+        m.updatedAt ?? 0,
+        m.cleared ? 1 : 0,
+        m.platformGoalId ?? "",
+        m.platformStateRevision ?? 0,
       ].join("|");
     case "permission":
       return [

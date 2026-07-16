@@ -19,7 +19,7 @@
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import type { OutboundContentBlock } from '@openclaude/protocol'
+import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
@@ -169,6 +169,9 @@ export interface EngineAdapter extends EventEmitter {
   setEffortLevel(level: string | undefined): void
   readonly effortLevel: string | undefined
   setTraceId(traceId: string | undefined): void
+  /** Synchronize the platform-authoritative session goal. Called only at a
+   * SessionManager lock boundary, never as a turn interruption mechanism. */
+  setGoalState(goal: GoalStateSnapshot | null): Promise<void>
   updateConfig(config: OpenClaudeConfig): void
   setToolsets(toolsets: string[] | undefined): void
   readonly toolsets: string[] | undefined

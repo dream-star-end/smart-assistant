@@ -28,6 +28,7 @@
  *     这里收口保证 codex 路径永远命中 scrub,与 buildCodexEnv 的 env scrub 成对。
  */
 import { EventEmitter } from 'node:events'
+import type { GoalStateSnapshot } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { createLogger } from '../logger.js'
@@ -239,6 +240,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
    *  经 identity guard 清空。 */
   private _routeTurn: CodexTurnContext | null = null
   private _activeTurn: CodexTurnContext | null = null
+  /** Goal sync happens at the session lock boundary before submitTurn installs
+   * its parser. Codex may synchronously notify from thread/goal/set, so retain
+   * the latest such notification and replay it into the next turn boundary. */
+  private _pendingGoalMessage: Record<string, unknown> | null = null
 
   // toolsets / executionTarget:codex 内核不支持,adapter 侧 stash 满足契约。
   private _toolsets: string[] | undefined
@@ -274,6 +279,15 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     this.kernel.on('message', (msg: Record<string, unknown>) => {
       this.emit('activity')
       const turn = this._routeTurn
+      if (
+        msg &&
+        typeof msg === 'object' &&
+        msg.type === 'openclaude_goal' &&
+        (!turn || turn.parser.finalized || this._activeTurn !== turn)
+      ) {
+        this._pendingGoalMessage = structuredClone(msg)
+        return
+      }
       if (turn && msg && typeof msg === 'object' && msg.type === 'result') {
         if (msg.is_error === true && typeof msg.result === 'string') {
           turn.lastErrorText = msg.result
@@ -359,6 +373,11 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     ctx.parser = parser
     this._routeTurn = ctx
     this._activeTurn = ctx
+    if (this._pendingGoalMessage) {
+      const pendingGoal = this._pendingGoalMessage
+      this._pendingGoalMessage = null
+      parser.parse(pendingGoal as unknown as SdkMessage)
+    }
     const submitted = this.kernel.submit(
       params.input as string | Array<{ type: string; text?: string }>,
       params.requestId,
@@ -424,6 +443,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   setTraceId(traceId: string | undefined): void {
     this.kernel.setTraceId(traceId)
+  }
+
+  setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    return this.kernel.setGoalState(goal)
   }
 
   updateConfig(config: OpenClaudeConfig): void {

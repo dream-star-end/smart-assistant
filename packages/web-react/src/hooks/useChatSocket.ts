@@ -51,6 +51,9 @@ export type UseChatSocket = {
   getSession: (sessId: string | undefined) => ChatSession | undefined;
   isSending: (sessId: string | undefined) => boolean;
   ensureSession: (sessId: string, agentId: string, title?: string) => void;
+  /** Confirm the server session row before an ownership-gated operation that
+   * can occur before the first message (notably GoalState set). */
+  ensureServerSession: (sessId: string, agentId: string, title?: string) => Promise<boolean>;
   removeSession: (sessId: string) => void;
   /** 重命名会话(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步)。*/
   renameSession: (sessId: string, title: string) => void;
@@ -76,6 +79,8 @@ export type UseChatSocket = {
   }) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
+  /** Apply REST/WS platform goal snapshots to the live session model. */
+  setGoalState: (sessId: string, goal: ChatSession["goalState"]) => void;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非持久，随 version 快照读回）。*/
   getTransientNotice: (sessId: string | undefined) => { text: string; ts: number } | null;
   respondPermission: (p: {
@@ -220,6 +225,12 @@ export function useChatSocket(opts: {
         } catch {
           /* sync 失败：保留现状，下次重连/前台再试 */
         }
+      },
+      syncGoalState: async (sessId) => {
+        const a = authRef.current;
+        if (!a) return;
+        const goal = await api.getSessionGoal(a, sessId);
+        socketRef.current?.setGoalState(sessId, goal);
       },
       // 首次发消息前在主控建 client_sessions 行（见 socket.ts deps.ensureServerSession 注释）。
       // fire-and-forget：建行是快 REST，远早于容器跑完 turn 后的 authored POST；失败不阻塞发送
@@ -416,6 +427,10 @@ export function useChatSocket(opts: {
   const ensureSession = useCallback((sessId: string, agentId: string, title?: string) => {
     socket.ensureSession(sessId, agentId, title);
   }, [socket]);
+  const ensureServerSession = useCallback<UseChatSocket["ensureServerSession"]>(
+    (sessId, agentId, title) => socket.ensureServerSession(sessId, agentId, title),
+    [socket],
+  );
   const removeSession = useCallback((sessId: string) => socket.removeSession(sessId), [socket]);
   const renameSession = useCallback(
     (sessId: string, title: string) => socket.renameSession(sessId, title),
@@ -426,6 +441,10 @@ export function useChatSocket(opts: {
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
   const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
   const setActiveSession = useCallback((sessId: string | undefined) => socket.setActiveSession(sessId), [socket]);
+  const setGoalState = useCallback<UseChatSocket["setGoalState"]>(
+    (sessId, goal) => socket.setGoalState(sessId, goal),
+    [socket],
+  );
   const getTransientNotice = useCallback(
     (sessId: string | undefined) => {
       void snap.version; // 随快照版本触发重算（transient 提示 set/clear 都 scheduleNotify）
@@ -509,6 +528,7 @@ export function useChatSocket(opts: {
       getSession,
       isSending,
       ensureSession,
+      ensureServerSession,
       removeSession,
       renameSession,
       switchAgent,
@@ -516,6 +536,7 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       setActiveSession,
+      setGoalState,
       getTransientNotice,
       respondPermission,
       mergeServerHistory,
@@ -532,6 +553,7 @@ export function useChatSocket(opts: {
       getSession,
       isSending,
       ensureSession,
+      ensureServerSession,
       removeSession,
       renameSession,
       switchAgent,
@@ -539,6 +561,7 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       setActiveSession,
+      setGoalState,
       getTransientNotice,
       respondPermission,
       mergeServerHistory,

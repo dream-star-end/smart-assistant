@@ -388,6 +388,59 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(chatLike.length).toBe(0)
   })
 
+  test('fresh conversation can create its server row and set GoalState before the first turn', async () => {
+    const base = routedFetch()
+    const mutations: string[] = []
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      const method = init?.method ?? 'GET'
+      if (/\/api\/session-goals\/[^/]+$/.test(u) && method === 'GET') {
+        return okJson({ goal: null })
+      }
+      if (/\/api\/sessions\/[^/]+$/.test(u) && method === 'PUT') {
+        mutations.push('session')
+        return okJson({ ok: true })
+      }
+      if (/\/api\/session-goals\/[^/]+$/.test(u) && method === 'PUT') {
+        mutations.push('goal')
+        const sessionId = decodeURIComponent(u.slice(u.lastIndexOf('/') + 1))
+        return okJson({
+          goal: {
+            sessionId,
+            goalId: '11111111-1111-4111-8111-111111111111',
+            objective: '先设目标再执行',
+            status: 'active',
+            tokenBudget: null,
+            creditBudget: null,
+            tokensUsed: 0,
+            creditsUsed: '0',
+            timeUsedSeconds: 0,
+            stateRevision: 1,
+            snapshotRevision: 1,
+            createdAt: '2026-07-16T00:00:00.000Z',
+            updatedAt: '2026-07-16T00:00:00.000Z',
+            statusChangedAt: '2026-07-16T00:00:00.000Z',
+          },
+        })
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '会话目标' }))
+    fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
+      target: { value: '先设目标再执行' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '开始目标' }))
+
+    await waitFor(() => expect(mutations).toEqual(['session', 'goal']))
+    expect(screen.getAllByText('先设目标再执行').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/会话尚未创建成功/)).toBeNull()
+  })
+
   test('team mode switch persists while reopening the agent picker', async () => {
     fetchMock = routedFetch()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)

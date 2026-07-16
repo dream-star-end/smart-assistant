@@ -2203,6 +2203,102 @@ describe('LOW-2 — turn 终态 stop_reason 映射', () => {
 })
 
 describe('handleNotification — goals', () => {
+  const goal = (overrides: Record<string, unknown> = {}) => ({
+    sessionId: 'web-goal-1',
+    goalId: '11111111-1111-4111-8111-111111111111',
+    objective: 'ship commercial goals',
+    status: 'active' as const,
+    tokenBudget: 1200,
+    creditBudget: '500',
+    tokensUsed: 99,
+    creditsUsed: '12',
+    timeUsedSeconds: 12,
+    stateRevision: 1,
+    snapshotRevision: 1,
+    createdAt: '2026-07-16T00:00:00.000Z',
+    updatedAt: '2026-07-16T00:00:00.000Z',
+    statusChangedAt: '2026-07-16T00:00:00.000Z',
+    ...overrides,
+  })
+
+  it('syncs platform set/pause/complete/clear through exact thread/goal/set params', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const runner = h.runner as any
+    runner.attached = true
+    runner.threadId = 'thread-goal-sync'
+    const calls: Array<{ method: string; params: unknown }> = []
+    runner.sendRequest = async (method: string, params: unknown) => {
+      calls.push({ method, params })
+      return {}
+    }
+    await h.runner.setGoalState(goal())
+    await h.runner.setGoalState(goal({ status: 'paused', stateRevision: 2 }))
+    await h.runner.setGoalState(goal({ status: 'completed', stateRevision: 3 }))
+    await h.runner.setGoalState(goal({ status: 'cleared', stateRevision: 4 }))
+    assert.deepEqual(calls, [
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'active', tokenBudget: 1200 } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'paused', tokenBudget: 1200 } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'complete', tokenBudget: 1200 } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: null, status: null, tokenBudget: null } },
+    ])
+    await h.cleanup()
+  })
+
+  it('stamps native notifications with the last successfully synced platform generation', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const runner = h.runner as any
+    runner.attached = true
+    runner.threadId = 'thread-goal-stamp'
+    runner.sendRequest = async () => ({})
+    await h.runner.setGoalState(goal())
+    runner.activeTurnId = 't-goal-stamp'
+    runner.handleNotification('thread/goal/updated', {
+      turnId: 't-goal-stamp',
+      goal: { objective: 'engine echo', status: 'active', tokensUsed: 101 },
+    })
+    assert.equal(h.messages[0].goal.platformGoalId, '11111111-1111-4111-8111-111111111111')
+    assert.equal(h.messages[0].goal.platformStateRevision, 1)
+    runner.activeTurnId = null
+    await h.runner.setGoalState(goal({ status: 'cleared', stateRevision: 4 }))
+    runner.activeTurnId = 't-goal-stamp'
+    runner.handleNotification('thread/goal/cleared', { turnId: 't-goal-stamp' })
+    assert.equal(h.messages[1].goal.platformGoalId, '11111111-1111-4111-8111-111111111111')
+    assert.equal(h.messages[1].goal.platformStateRevision, 4)
+    await h.cleanup()
+  })
+
+  it('stages the new platform generation before a same-chunk goal notification and rolls back on failure', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const runner = h.runner as any
+    runner.attached = true
+    runner.threadId = 'thread-goal-race'
+    runner.sendRequest = async () => ({})
+    await h.runner.setGoalState(goal())
+
+    runner.sendRequest = async () => {
+      // app-server stdout can dispatch this notification synchronously before
+      // the request Promise continuation runs.
+      runner.handleNotification('thread/goal/updated', {
+        goal: { objective: 'new engine echo', status: 'paused', tokensUsed: 110 },
+      })
+      return {}
+    }
+    await h.runner.setGoalState(goal({ status: 'paused', stateRevision: 2 }))
+    assert.equal(h.messages[0].goal.platformGoalId, '11111111-1111-4111-8111-111111111111')
+    assert.equal(h.messages[0].goal.platformStateRevision, 2)
+
+    runner.sendRequest = async () => { throw new Error('goal sync rejected') }
+    await assert.rejects(
+      h.runner.setGoalState(goal({ status: 'completed', stateRevision: 3 })),
+      /goal sync rejected/,
+    )
+    runner.handleNotification('thread/goal/updated', {
+      goal: { objective: 'last confirmed echo', status: 'paused', tokensUsed: 111 },
+    })
+    assert.equal(h.messages[1].goal.platformStateRevision, 2)
+    await h.cleanup()
+  })
+
   it('thread/goal/updated emits an OpenClaude-native goal message', async () => {
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-goal'

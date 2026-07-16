@@ -80,9 +80,11 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
+  computeGoalTokensUsed,
   materializeLosslessTurn,
   type LosslessTurnRecord,
 } from "../http/losslessTurnTape.js";
+import { bumpGoalUsageSnapshotForTape } from "../goal/goalStateService.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -472,10 +474,17 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "tape_id", "text"],
   ["client_session_turn_tapes", "turn_key", "text"],
   ["client_session_turn_tapes", "engine_billings", "jsonb"],
+  ["client_session_turn_tapes", "goal_id", "uuid"],
+  ["client_session_turn_tapes", "goal_state_revision", "bigint"],
+  ["client_session_turn_tapes", "goal_tokens_used", "bigint"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
   ["turn_tape_cost_components", "request_id", "text"],
+  ["session_goals", "session_id", "text"],
+  ["session_goals", "goal_id", "uuid"],
+  ["session_goals", "state_revision", "bigint"],
+  ["session_goals", "snapshot_revision", "bigint"],
   ["wechat_bindings", "user_id", "text"],
   ["wechat_bindings", "account_id", "text"],
   ["wechat_bindings", "bot_token", "text"],
@@ -484,6 +493,22 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
 export interface PgSessionsBackendOptions {
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
   expectedGeneration: number;
+  /** Runs only after the owning tape/cost transaction commits. Failures are
+   * projection-only and must never turn a committed billing write into retry. */
+  onGoalUsageChanged?: (userId: string, sessionId: string) => void | Promise<void>;
+}
+
+type GoalUsageChange = { userId: string; sessionId: string };
+
+async function notifyGoalUsageChanges(
+  callback: PgSessionsBackendOptions["onGoalUsageChanged"],
+  changes: readonly GoalUsageChange[],
+): Promise<void> {
+  if (!callback || changes.length === 0) return;
+  const unique = new Map(changes.map((change) => [`${change.userId}\0${change.sessionId}`, change]));
+  await Promise.allSettled(
+    [...unique.values()].map((change) => Promise.resolve(callback(change.userId, change.sessionId))),
+  );
 }
 
 export type LosslessTurnTapeStageResult =
@@ -1060,7 +1085,8 @@ export function createPgSessionsBackend(
       userId: string,
       request: LosslessTurnTapeFinalizeRequest,
     ): Promise<LosslessTurnTapeFinalizeResult> {
-      return withTx(pool, async (client) => {
+      let goalUsageChanged = false;
+      const result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
         // Serializes "cost parks while tape finalizes" on the logical turn.
         await requestAdvisoryXactLock(client, userId, `turn:${request.turnKey}`);
         const session = (
@@ -1159,6 +1185,7 @@ export function createPgSessionsBackend(
         ) {
           throw new Error("lossless turn tape envelope/payload identity mismatch");
         }
+        const goalTokensUsed = computeGoalTokensUsed(turn.payload);
 
         for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
           const item = turn.records[ordinal]!;
@@ -1396,19 +1423,24 @@ export function createPgSessionsBackend(
         await client.query(
           `UPDATE client_session_turn_tapes
               SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
-                  engine_billings=$4, finalized_at=$5
-            WHERE session_id=$6 AND user_id=$7 AND tape_id=$8`,
+                  engine_billings=$4, finalized_at=$5,goal_id=$6::uuid,
+                  goal_state_revision=$7,goal_tokens_used=$8
+            WHERE session_id=$9 AND user_id=$10 AND tape_id=$11`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
             turn.payload.parentTurnKey ?? null,
             JSON.stringify(turn.engineBillings),
             Date.now(),
+            turn.payload.goalId ?? null,
+            turn.payload.goalStateRevision ?? null,
+            goalTokensUsed,
             request.sessionId,
             userId,
             request.tapeId,
           ],
         );
+        goalUsageChanged = await bumpGoalUsageSnapshotForTape(client, request.sessionId, userId, request.tapeId);
         // 原始分片(parts)一律随 finalize 清除:records 才是脱敏后的持久权威,parts 保存
         // 的是脱敏前 payload,留下即隐私面偏差 + 双份存储(2026-07-16 巡检批;此前只在
         // legacyRawBillingReason 时删)。上传路径对已 finalize tape 已有短路(见
@@ -1424,6 +1456,10 @@ export function createPgSessionsBackend(
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
         };
       });
+      if (goalUsageChanged && result.applied === "finalized") {
+        await notifyGoalUsageChanges(options.onGoalUsageChanged, [{ userId, sessionId: request.sessionId }]);
+      }
+      return result;
     },
     // ── probe(D5)──────────────────────────────────────────────────────────
     async probeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -1447,6 +1483,7 @@ export function createPgSessionsBackend(
               "client_session_turn_tape_records",
               "server_authored_turn_anchor_map",
               "turn_tape_cost_components",
+              "session_goals",
               "wechat_bindings",
             ],
           ],
@@ -1757,7 +1794,8 @@ export function createPgSessionsBackend(
       if (parentTurnKey && !LOSSLESS_TURN_TAPE_SHA256_RE.test(parentTurnKey)) {
         throw new Error("parentTurnKey must be a lowercase SHA-256 hex digest");
       }
-      return withTx(pool, async (client): Promise<AppendCostCreditsResult> => {
+      let goalUsageChange: GoalUsageChange | null = null;
+      const result = await withTx(pool, async (client): Promise<AppendCostCreditsResult> => {
         // ① request advisory(串行点)。
         await requestAdvisoryXactLock(client, userId, requestId);
 
@@ -1871,6 +1909,12 @@ export function createPgSessionsBackend(
                     [requestId, userId],
                   );
                 }
+                // A billing retry can arrive after the immutable component and
+                // its snapshot_revision bump committed, but before the
+                // post-commit notification reached the browser. Re-publish the
+                // already-advanced snapshot without writing another revision:
+                // duplicate/reconnect replays must not create revision churn.
+                goalUsageChange = { userId, sessionId: map.session_id };
                 return { applied: "noop" };
               }
               await client.query(
@@ -1894,6 +1938,9 @@ export function createPgSessionsBackend(
                   "DELETE FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
                   [requestId, userId],
                 );
+              }
+              if (await bumpGoalUsageSnapshotForTape(client, map.session_id, userId, map.tape_id)) {
+                goalUsageChange = { userId, sessionId: map.session_id };
               }
               let messages: MessageLike[] = [];
               try {
@@ -2144,6 +2191,8 @@ export function createPgSessionsBackend(
         );
         return { applied: "pending" };
       });
+      await notifyGoalUsageChanges(options.onGoalUsageChanged, goalUsageChange ? [goalUsageChange] : []);
+      return result;
     },
 
     // ── drainDelegateCostForClientSession(委派成本按父客户端会话归并)──────────────
@@ -2244,7 +2293,10 @@ export function createPgSessionsBackend(
 
     // ── sweepUsageAggregationGc(pending/map 老化 GC;只由 advisory lease 持有者调度)──
     async sweepUsageAggregationGc(now: number = Date.now()): Promise<UsageAggregationGcStats> {
-      return withTx(pool, (client) => sweepOnce(client, now));
+      const changes: GoalUsageChange[] = [];
+      const stats = await withTx(pool, (client) => sweepOnce(client, now, changes));
+      await notifyGoalUsageChanges(options.onGoalUsageChanged, changes);
+      return stats;
     },
 
     // ── 读路径(无事务;单/多语句纯读,与 SQLite 一致不开显式事务)────────────────
@@ -2739,6 +2791,7 @@ export interface SessionsGcSweeperOptions {
   recompeteMs?: number;
   now?: () => number;
   onStats?: (stats: UsageAggregationGcStats) => void;
+  onGoalUsageChanged?: (userId: string, sessionId: string) => void | Promise<void>;
   onError?: (err: unknown) => void;
 }
 
@@ -2764,7 +2817,9 @@ export function startSessionsGcSweeper(opts: SessionsGcSweeperOptions): { stop: 
     sweeping = true;
     try {
       // sweep 事务走 pool(普通短事务);lease 连接只负责持锁,不跑业务(避免持锁连接被业务占用)。
-      const stats = await withTx(opts.pool, (client) => sweepOnce(client, now()));
+      const changes: GoalUsageChange[] = [];
+      const stats = await withTx(opts.pool, (client) => sweepOnce(client, now(), changes));
+      await notifyGoalUsageChanges(opts.onGoalUsageChanged, changes);
       opts.onStats?.(stats);
     } catch (err) {
       opts.onError?.(err);
@@ -2875,7 +2930,11 @@ export function startSessionsGcSweeper(opts: SessionsGcSweeperOptions): { stop: 
 }
 
 /** 单次 sweep(map→pending 锁序;供 sweeper 与测试共用)。 */
-async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggregationGcStats> {
+async function sweepOnce(
+  client: PoolClient,
+  nowMs: number,
+  goalUsageChanges: GoalUsageChange[] = [],
+): Promise<UsageAggregationGcStats> {
   const agingThreshold = nowMs - PENDING_AGING_MS;
   const expiredThreshold = nowMs - PENDING_HARD_DELETE_MS;
   const mapThreshold = nowMs - MAP_HARD_DELETE_MS;
@@ -2901,7 +2960,7 @@ async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggreg
   // 删除在同一事务内,外部读者要么看到 pending 要么看到 component,不会双计。
   // 可达性判据与 hydrateTurnTapeMessages 同源:finalized tape 按 turn_key 或
   // parent_turn_key 匹配。FOR UPDATE SKIP LOCKED 避让在途 append/finalize 路径。
-  await client.query(
+  const changedGoals = await client.query<{ user_id: string; session_id: string }>(
     `WITH locked AS (
        SELECT p.request_id, p.user_id, p.cost_credits, p.delegate_agent_id,
               p.turn_key, p.parent_turn_key
@@ -2921,15 +2980,34 @@ async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggreg
           AND t.finalized_at IS NOT NULL
           AND t.billing_anchor_id IS NOT NULL
         ORDER BY l.request_id, l.user_id, t.finalized_at ASC, t.tape_id ASC
+     ), inserted AS (
+       INSERT INTO turn_tape_cost_components
+         (request_id, user_id, session_id, tape_id, billing_anchor_id,
+          cost_credits, delegate_agent_id, updated_at)
+       SELECT request_id, user_id, session_id, tape_id, billing_anchor_id,
+              cost_credits::numeric, delegate_agent_id, $2
+         FROM foldable
+       ON CONFLICT (request_id, user_id) DO NOTHING
+       RETURNING session_id,user_id,tape_id
+     ), updated AS (
+       UPDATE session_goals g
+          SET snapshot_revision=snapshot_revision+1,updated_at=clock_timestamp()
+        WHERE EXISTS (
+          SELECT 1
+            FROM inserted i
+            JOIN client_session_turn_tapes t
+              ON t.session_id=i.session_id AND t.user_id=i.user_id AND t.tape_id=i.tape_id
+           WHERE t.goal_id=g.goal_id AND t.session_id=g.session_id
+        )
+       RETURNING g.session_id
      )
-     INSERT INTO turn_tape_cost_components
-       (request_id, user_id, session_id, tape_id, billing_anchor_id,
-        cost_credits, delegate_agent_id, updated_at)
-     SELECT request_id, user_id, session_id, tape_id, billing_anchor_id,
-            cost_credits::numeric, delegate_agent_id, $2
-       FROM foldable
-     ON CONFLICT (request_id, user_id) DO NOTHING`,
+     SELECT DISTINCT i.user_id,i.session_id
+       FROM inserted i
+       JOIN updated u ON u.session_id=i.session_id`,
     [agingThreshold, nowMs],
+  );
+  goalUsageChanges.push(
+    ...changedGoals.rows.map((row) => ({ userId: row.user_id, sessionId: row.session_id })),
   );
   // 只删"component 坐标与金额与本行完全一致"的 pending(镜像 finalize 内折叠的不可变
   // 校验;冲突不符的行保留待人工核对,由 pendingFoldAnomaly 暴露)。

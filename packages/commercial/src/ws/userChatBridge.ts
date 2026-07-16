@@ -68,6 +68,7 @@ import {
 import {
   startInflightJournal,
   abortInflightJournal,
+  loadUsageAttributionCredits,
   type JournalFailureCode,
 } from "../billing/proxyBilling.js";
 import {
@@ -94,6 +95,7 @@ import {
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
   type TraceIdIssue,
+  type GoalStateSnapshot,
 } from "@openclaude/protocol";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
@@ -691,6 +693,19 @@ export interface UserChatBridgeDeps {
     uid: bigint,
     sessionId: string,
   ) => Promise<unknown[] | null>;
+  /** Platform GoalState injected into every accepted browser turn. */
+  loadGoalState?: (uid: bigint, sessionId: string) => Promise<GoalStateSnapshot | null>;
+  /** Engine notifications may update only diagnostic engine-owned fields. */
+  updateGoalEngineMetrics?: (args: {
+    uid: bigint;
+    sessionId: string;
+    goalId: string;
+    stateRevision: number;
+    engineStatus?: string;
+    tokensUsed?: number;
+    timeUsedSeconds?: number;
+    engineUpdatedAt?: string;
+  }) => Promise<unknown>;
   /**
    * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
@@ -1002,6 +1017,8 @@ export interface UserChatBridgeHandler {
    * 非 JSON-serializable 输入会吞 JSON.stringify 异常,不抛。
    */
   broadcastToUser(uid: bigint, payload: unknown): number;
+  /** Master-only control path into this user's live runtime container(s). */
+  syncGoalToContainers(uid: bigint, goal: unknown): number;
   /** 给所有在线用户的每个 OPEN user WS 广播 JSON payload。不得用于用户事故通知。 */
   broadcastAll(payload: unknown): number;
   /**
@@ -1219,6 +1236,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    * 期间的 ws 不在这里,因为没有跑到 startBridge 里 registry.register。
    */
   const uidToUserWs = new Map<string, Set<WebSocket>>();
+  const uidToContainerWs = new Map<string, Set<WebSocket>>();
 
   function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
     const url = parseWsUrl(req);
@@ -2291,36 +2309,57 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const attachMasterHistoricalMessages = async (
       frameObj: Record<string, unknown>,
       turnLog: Logger | null,
-    ): Promise<Record<string, unknown>> => {
-      if (!deps.loadMasterSessionMessages) return frameObj;
+    ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
         peer && typeof peer === "object"
           ? (peer as { id?: unknown }).id
           : undefined;
       if (typeof peerId !== "string" || peerId.length === 0) return frameObj;
-      try {
+      let enriched = frameObj;
+      if (deps.loadMasterSessionMessages) try {
         const raw = await deps.loadMasterSessionMessages(uid, peerId);
         const historical = Array.isArray(raw)
           ? _sanitizeMasterHistoricalMessagesForFrame(raw)
           : [];
-        if (historical.length === 0) return frameObj;
-        turnLog?.info("user-chat-bridge: attached master history", {
-          sessionId: peerId,
-          messageCount: historical.length,
-        });
-        return {
-          ...frameObj,
-          _masterHistoricalMessages: historical,
-        };
+        if (historical.length > 0) {
+          turnLog?.info("user-chat-bridge: attached master history", {
+            sessionId: peerId,
+            messageCount: historical.length,
+          });
+          enriched = { ...enriched, _masterHistoricalMessages: historical };
+        }
       } catch (err) {
         // Fail-open: history bridging is UX context, not authz/billing.
         turnLog?.warn("user-chat-bridge: load master history failed", {
           sessionId: peerId,
           err,
         });
-        return frameObj;
       }
+      if (deps.loadGoalState) try {
+        const goal = await deps.loadGoalState(uid, peerId);
+        enriched = { ...enriched, _goalState: goal };
+      } catch (err) {
+        // Goal attribution is part of the paid turn's durable authority. A
+        // transient PG read failure must not be converted to `null`: doing so
+        // would run the turn without goal_id and make later repair impossible.
+        // Reject this turn before it reaches the container; Codex callers that
+        // already reserved billing/slots unwind through their existing
+        // pre-forward compensation path.
+        turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
+          sessionId: peerId,
+          err,
+        });
+        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+          sendErrorFrame(
+            userWs,
+            "GOAL_STATE_UNAVAILABLE",
+            "goal state unavailable, retry this turn shortly",
+          );
+        }
+        return null;
+      }
+      return enriched;
     };
 
     const onUserMessage = (data: RawData, isBinary: boolean): void => {
@@ -2423,6 +2462,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // inbound.message 上消费 authority,但"入口无条件 strip"是一条不留缺口的铁律。
           if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
             const parsedObj = parsed as Record<string, unknown>;
+            // Browser never authors platform GoalState or the master-only sync
+            // control frame. Strip the former and drop the latter before any
+            // async enrichment/forwarding.
+            if (Object.prototype.hasOwnProperty.call(parsedObj, "_goalState")) {
+              delete parsedObj._goalState;
+              const strippedStr = JSON.stringify(parsedObj);
+              passthroughData = Buffer.from(strippedStr, "utf8");
+              passthroughLen = Buffer.byteLength(strippedStr);
+            }
+            if (parsedObj.type === "inbound.goal_sync") {
+              bridgeLog?.warn("user-chat-bridge: browser goal sync frame dropped");
+              return;
+            }
             if (Object.prototype.hasOwnProperty.call(parsedObj, MODEL_AUTHORITY_FIELD)) {
               stripModelAuthorityField(parsedObj);
               bridgeLog?.warn("user-chat-bridge: client-supplied model authority field stripped");
@@ -2921,6 +2973,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             inboundParsedCapture,
             turnLogCapture,
           );
+          if (enrichedParsed === null) return;
           if (cleaned) return;
           // Image 2 owns its exact 50-credit reservation inside the trusted
           // relay. Do not acquire a chat slot, open a Codex journal, or create
@@ -3434,6 +3487,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 inboundParsedCapture,
                 turnLogCapture,
               );
+              if (enrichedParsed === null) {
+                abandonReason = "goal_state_unavailable";
+                return;
+              }
               // ── 签发边界(MAJOR-2)────────────────────────────────────────────
               // 这里是 turn 里**最后一个还能无痛掉头**的点:票还没签、帧还没进容器。
               // 从起手 fence 到这一行之间已经跑完 route/acquire/preCheck/journal/历史装配
@@ -3518,6 +3575,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 inboundParsedCapture,
                 turnLogCapture,
               );
+              if (enrichedParsed === null) {
+                releaseAcquiredSlotForFailure();
+                return;
+              }
               // 签发边界(MAJOR-2):本分支没开 journal / 没预扣,但**占了 codex 槽** ——
               // 拒帧必须还槽,否则该用户后续 codex turn 全被 G7 单飞门挡住。
               let authorityFields: Record<string, unknown> = {};
@@ -3653,6 +3714,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             inboundParsedCapture,
             turnLogCapture,
           );
+          if (enrichedParsed === null) return;
           // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
           // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
           // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
@@ -3796,8 +3858,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // `sys.incident` is a master-authored, approval-gated user-notice namespace.
-      // Containers are tenant-controlled execution surfaces and must never forge it.
+      // `sys.incident` and `sys.goal_snapshot` are master-authored namespaces.
+      // Containers are tenant-controlled execution surfaces and must never forge
+      // either an approval notice or the platform-authoritative PG GoalState.
       // Reject before TTFT accounting, outboundRing.storeStamped and live forwarding,
       // so a forged approved_recovery cannot reach the user now or on reconnect replay.
       const incidentCandidate = Buffer.isBuffer(data)
@@ -3805,15 +3868,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         : data instanceof ArrayBuffer
           ? Buffer.from(data).toString("utf8")
           : Buffer.concat(data).toString("utf8");
-      let parsedIncident: unknown = null;
-      try { parsedIncident = JSON.parse(incidentCandidate); } catch { /* non-JSON remains normal traffic */ }
+      let parsedMasterFrameCandidate: unknown = null;
+      try { parsedMasterFrameCandidate = JSON.parse(incidentCandidate); } catch { /* non-JSON remains normal traffic */ }
+      const masterOnlyFrameType =
+        parsedMasterFrameCandidate !== null && typeof parsedMasterFrameCandidate === "object"
+          ? (parsedMasterFrameCandidate as { type?: unknown }).type
+          : null;
       if (
-        parsedIncident !== null && typeof parsedIncident === "object" &&
-        (parsedIncident as { type?: unknown }).type === "sys.incident"
+        masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;
-          bridgeLog?.warn("user-chat-bridge: rejected container-authored sys.incident");
+          bridgeLog?.warn("user-chat-bridge: rejected container-authored master-only frame", {
+            type: masterOnlyFrameType,
+          });
         }
         return;
       }
@@ -3940,7 +4008,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               //     inflight),用户断 WS 重连后容器把 billing 帧发到了新桥。旧实现
               //     只打日志丢帧 = 整 turn 免费(收入漏洞)。现在按 request_id 回查
               //     request_finalize_journal 裁决:inflight 行用 journal ctx 恢复
-              //     settle,committed/finalizing 幂等忽略,aborted 免单 + 告警。
+              //     settle；committed/finalizing 从 immutable attribution 恢复，
+              //     finalizing 尚无可见证据时保持可重试；aborted 免单 + 告警。
               if (locallySettledCodexTurns.has(reqId)) {
                 bridgeLog?.info("user-chat-bridge: codex_billing duplicate for locally settled turn — dropped", {
                   requestId: reqId,
@@ -4057,22 +4126,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 if (drainCause !== null) {
                   recordBillingRecovery(reqId, "recovered", snap, 2);
                 }
-                // 仅 debit > 0 才广播 cost_charged;0 token / 零输出免单 / 重入 /
-                // settle 失败 / commit-after-fail 合成 skipped(debitedCredits=null)
-                // 都不广播,避免前端误显示 ¥0 扣费条目。
-                if (
-                  result.debitedCredits !== null &&
-                  result.debitedCredits > 0n
-                ) {
-                  // Plan §4.2 改动 4a: persist FIRST so refresh-after-reply
-                  // shows the same value the broadcast carries. Failure is
-                  // metric-only — broadcast still fires.
+                // Persist/fold the usage locator even when the actual debit is
+                // zero. The settlement transaction already staged this exact
+                // amount atomically with usage_records/ledger; folding here
+                // makes the live GoalState snapshot advance immediately.
+                const persistedUsageCredits =
+                  result.attributionCredits !== null && result.attributionCredits !== undefined
+                    ? result.attributionCredits
+                    : result.debitedCredits !== null && result.debitedCredits > 0n
+                      ? result.debitedCredits
+                      : null;
+                if (persistedUsageCredits !== null) {
                   if (deps.appendCostCredits) {
                     try {
                       await deps.appendCostCredits(
                         reqId,
                         uid.toString(),
-                        result.debitedCredits.toString(),
+                        persistedUsageCredits.toString(),
                         engineSid,
                         billingParentSessionId,
                         billingDelegateAgentId,
@@ -4085,6 +4155,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       });
                     }
                   }
+                }
+                // Only a real positive debit produces cost_charged. Zero-token,
+                // waived/error, idempotent, and skipped paths stay invisible as
+                // charges even though their usage attribution is durable.
+                if (
+                  result.debitedCredits !== null &&
+                  result.debitedCredits > 0n
+                ) {
                   // CG2c — broadcast 帧带 traceId 让 outboundRing audit / 前端 trace
                   // 关联到 inbound canonical。snap.traceId 是 server-owned 唯一可信源。
                   // M2:balanceAfter = **双钱包总可用**(spendTwoBucket.totalAfter,
@@ -4219,6 +4297,52 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
+      // Codex-native goal notifications are advisory. The runner stamps the
+      // platform generation it last synchronized; master rejects stale
+      // generations and writes only engine-owned diagnostics.
+      if (!isBinary && deps.updateGoalEngineMetrics) {
+        let text: string | null = null;
+        if (typeof data === "string") text = data;
+        else if (Buffer.isBuffer(data)) text = data.toString("utf8");
+        if (text?.includes('"kind":"goal"')) {
+          try {
+            const frame = JSON.parse(text) as {
+              type?: unknown;
+              peer?: { id?: unknown };
+              blocks?: Array<Record<string, unknown>>;
+            };
+            const sessionId = frame.peer?.id;
+            if (frame.type === "outbound.message" && typeof sessionId === "string") {
+              for (const block of frame.blocks ?? []) {
+                if (
+                  block.kind !== "goal" ||
+                  typeof block.platformGoalId !== "string" ||
+                  typeof block.platformStateRevision !== "number"
+                ) continue;
+                void deps.updateGoalEngineMetrics({
+                  uid,
+                  sessionId,
+                  goalId: block.platformGoalId,
+                  stateRevision: block.platformStateRevision,
+                  ...(typeof block.status === "string" ? { engineStatus: block.status } : {}),
+                  ...(typeof block.tokensUsed === "number" ? { tokensUsed: block.tokensUsed } : {}),
+                  ...(typeof block.timeUsedSeconds === "number"
+                    ? { timeUsedSeconds: block.timeUsedSeconds }
+                    : {}),
+                  ...(typeof block.updatedAt === "number"
+                    ? { engineUpdatedAt: new Date(block.updatedAt * 1000).toISOString() }
+                    : {}),
+                }).catch((err) => {
+                  bridgeLog?.warn("user-chat-bridge: goal engine metrics update failed", { err });
+                });
+              }
+            }
+          } catch { /* ordinary non-JSON or malformed goal frame */ }
+        }
+      }
+      // Goal usage broadcasts are commit-driven by the PG tape/cost backend.
+      // Do not guess durability with a one-shot terminal-frame timer: CCB cost
+      // settlement and the GC late-fold can legitimately happen much later.
       if (userWs.readyState !== WebSocket.OPEN) {
         // user 已经走了 — billing 帧已在上面分支处理,这里是非 billing 容器帧,丢
         // Note: ring write above ALREADY captured the frame for late-reconnect
@@ -4321,6 +4445,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     containerWs.on("open", () => {
       clearTimeout(connectTimer);
+      {
+        const key = uid.toString();
+        let set = uidToContainerWs.get(key);
+        if (!set) { set = new Set(); uidToContainerWs.set(key, set); }
+        set.add(containerWs);
+      }
       bridgeLog?.debug("user-chat-bridge: container connected", {
         host: endpoint.host, port: endpoint.port,
       });
@@ -4591,8 +4721,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      *   - 'inflight'   → 用 journal ctx(model/agentId/codexAccountId/traceId,
      *     startInflightJournal 落笔)重构 finalizer 完成 settle —— 双钱包扣费、
      *     零输出免单、cost_charged 持久化+广播口径与主路径完全一致;
-     *   - 'committed' / 'finalizing' → 幂等忽略(duplicate 帧 / 旧桥 drain 窗口已
-     *     settle / 并发 settle 在途);
+     *   - 'committed' / 'finalizing' → 从 immutable attribution 恢复 Goal usage；
+     *     只有证据可见且 append/fold 成功后才本地抑制重复帧。finalizing 尚无
+     *     可见证据时保持可重试，避免 commit-before-fold 崩溃窗漏归属;
      *   - 'aborted'    → **免单 + error 告警,不补收**。钱安全红线"宁少收不乱扣":
      *     aborted 行的 preCheck reservation 已释放、免单决策(engineSessionId
      *     fail-closed / reconciler_timeout / commit 失败等)已对外生效,此处补收
@@ -4685,10 +4816,48 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
           if (row.state === "committed" || row.state === "finalizing") {
-            bridgeLog?.info("user-chat-bridge: codex_billing for already-settled journal — idempotent ignore", {
+            // Settlement may have committed immediately before the old process
+            // died, leaving its exact pending locator unfurled and its live goal
+            // snapshot unbroadcast. Recovering the immutable amount never
+            // re-debits; appendCostCredits either folds it or republishes the
+            // already-advanced GoalState snapshot without revision churn.
+            let attributionRepaired = false;
+            try {
+              const recoveredCredits = await loadUsageAttributionCredits(
+                pgPool,
+                uid,
+                requestId,
+              );
+              if (recoveredCredits !== null && deps.appendCostCredits) {
+                await deps.appendCostCredits(
+                  requestId,
+                  uid.toString(),
+                  recoveredCredits.toString(),
+                  frame.engineSid,
+                  frame.parentSessionId,
+                  frame.delegateAgentId,
+                  frame.turnKey,
+                  frame.parentTurnKey,
+                );
+                attributionRepaired = true;
+              }
+            } catch (err) {
+              bridgeLog?.warn("user-chat-bridge: settled journal goal attribution recovery failed", {
+                requestId,
+                state: row.state,
+                err: (err as Error)?.message,
+              });
+            }
+            bridgeLog?.info(attributionRepaired
+              ? "user-chat-bridge: codex_billing for already-settled journal — attribution refreshed"
+              : "user-chat-bridge: settled journal attribution not yet visible — replay remains eligible", {
               requestId,
               state: row.state,
             });
+            // `finalizing` can be observed before the settlement transaction is
+            // visible. Only suppress later frames after immutable attribution
+            // was read and its fold/rebroadcast completed successfully.
+            if (attributionRepaired) locallySettledCodexTurns.add(requestId);
             return;
           }
           if (row.state === "aborted") {
@@ -4933,14 +5102,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             debitedCredits: result.debitedCredits?.toString() ?? null,
             costCredits: result.costCredits.toString(),
           });
-          // 广播口径与主路径一致:仅 debit>0 才 persist + 广播。
-          if (result.debitedCredits !== null && result.debitedCredits > 0n) {
+          // Usage attribution fold is independent from whether a charge was
+          // debited. pending_usage_patches remains the crash-safe fallback.
+          const persistedUsageCredits =
+            result.attributionCredits !== null && result.attributionCredits !== undefined
+              ? result.attributionCredits
+              : result.debitedCredits !== null && result.debitedCredits > 0n
+                ? result.debitedCredits
+                : null;
+          if (persistedUsageCredits !== null) {
             if (deps.appendCostCredits) {
               try {
                 await deps.appendCostCredits(
                   requestId,
                   uid.toString(),
-                  result.debitedCredits.toString(),
+                  persistedUsageCredits.toString(),
                   frame.engineSid,
                   frame.parentSessionId,
                   frame.delegateAgentId,
@@ -4953,6 +5129,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 });
               }
             }
+          }
+          // 广播口径与主路径一致:仅 debit>0 才广播。
+          if (result.debitedCredits !== null && result.debitedCredits > 0n) {
             broadcastToUser(uid, {
               type: "outbound.cost_charged",
               requestId,
@@ -5024,6 +5203,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (set) {
           set.delete(userWs);
           if (set.size === 0) uidToUserWs.delete(key);
+        }
+      }
+      {
+        const key = uid.toString();
+        const set = uidToContainerWs.get(key);
+        if (set) {
+          set.delete(containerWs);
+          if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
     }
@@ -5181,6 +5368,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return sent;
   }
 
+  function syncGoalToContainers(uid: bigint, goal: unknown): number {
+    const set = uidToContainerWs.get(uid.toString());
+    if (!set || set.size === 0) return 0;
+    let text: string;
+    try { text = JSON.stringify({ type: "inbound.goal_sync", goal }); }
+    catch { return 0; }
+    let sent = 0;
+    for (const ws of set) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try { ws.send(text); sent += 1; } catch { /* next connection */ }
+    }
+    return sent;
+  }
+
   /**
    * V5 自愈体系(§5)— 全站广播。把 payload 以 JSON text 帧发给**所有**在线 uid 名下所有
    * OPEN user WS。非 OPEN 跳过;单 ws send 异常单独 catch,不连累其他连接。返回成功连接数。
@@ -5250,7 +5451,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return out;
   }
 
-  return { handleUpgrade, shutdown, registry, broadcastToUser, broadcastAll, broadcastToUsers, onlineUserSubset };
+  return {
+    handleUpgrade,
+    shutdown,
+    registry,
+    broadcastToUser,
+    syncGoalToContainers,
+    broadcastAll,
+    broadcastToUsers,
+    onlineUserSubset,
+  };
 }
 
 // ---------- 测试 re-exports ------------------------------------------------

@@ -16,6 +16,7 @@ import {
   AssistantCard,
   type CardCallbacks,
   DelegateProgressCard,
+  GoalCard,
   PlanCard,
   SystemCard,
   ThinkingCard,
@@ -119,6 +120,8 @@ export const MessageRenderer = memo(
         // 只读卡(含步骤与状态)。text-only plan(无 steps)恒走 inline 兜底。
         if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
         return <PlanCard msg={message} />;
+      case "goal":
+        return <GoalCard msg={message} />;
       case "permission":
         return <PermissionCard msg={message} onRespond={onRespondPermission} readOnly={readOnly} />;
       case "agent-group":
@@ -128,7 +131,7 @@ export const MessageRenderer = memo(
       case "system":
         return <SystemCard msg={message} />;
       default:
-        // 'unknown'（含 v5 不实现的 goal/codex）——静默跳过，不出空卡。
+        // Unknown/future roles fail safe without an empty card.
         return null;
     }
   },

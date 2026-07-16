@@ -125,6 +125,8 @@ describe('CcbMessageParser: text streaming', () => {
         timeUsedSeconds: 7,
         updatedAt: 1780000000,
         cleared: false,
+        platformGoalId: '11111111-1111-4111-8111-111111111111',
+        platformStateRevision: 9,
       },
     } as any)
 
@@ -141,6 +143,8 @@ describe('CcbMessageParser: text streaming', () => {
       assert.equal(b.timeUsedSeconds, 7)
       assert.equal(b.updatedAt, 1780000000)
       assert.equal(b.cleared, false)
+      assert.equal(b.platformGoalId, '11111111-1111-4111-8111-111111111111')
+      assert.equal(b.platformStateRevision, 9)
     }
     assert.equal(parser.assistantBuf, '')
   })

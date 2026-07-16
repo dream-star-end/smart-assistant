@@ -10,6 +10,7 @@
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
 import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type { InboundMessage, MediaRef } from "./frames";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
@@ -261,6 +262,8 @@ export type ChatMessage = {
   timeUsedSeconds?: number;
   updatedAt?: number;
   cleared?: boolean;
+  platformGoalId?: string;
+  platformStateRevision?: number;
 
   // ── permission ──
   requestId?: string;
@@ -282,6 +285,9 @@ export type ChatSession = {
   createdAt: number;
   lastAt: number;
   updatedAt?: number;
+  /** Server-authoritative session goal. Kept out of IndexedDB; active-session
+   * REST/WS snapshots repopulate it after every load. */
+  goalState?: GoalStateSnapshot | null;
 
   /** 最近一次用户发送的路由字段快照(model/teamMode/effortLevel)。合成续写
    *  (服务重启自动续写/空轮续写)必须复用——否则桥按默认模型分类,不做 codex
@@ -481,4 +487,36 @@ export function agentGroupRunId(m: ChatMessage): string | undefined {
   if (m.role !== "agent-group") return undefined;
   const rid = m._delegateRunId || m.runId;
   return typeof rid === "string" && rid.length > 0 ? rid : undefined;
+}
+
+/** Monotonic merge for REST/WS goal snapshots. State changes are ordered by
+ * stateRevision; usage/engine refreshes by snapshotRevision. Equal revisions
+ * may still carry a later active-runtime sample, but no usage counter may
+ * move backwards. A stale `null` GET never erases an observed goal. */
+export function shouldApplyGoalSnapshot(
+  current: GoalStateSnapshot | null | undefined,
+  incoming: GoalStateSnapshot | null,
+): boolean {
+  if (!incoming) return !current;
+  if (!current) return true;
+  if (incoming.goalId !== current.goalId) {
+    return incoming.stateRevision > current.stateRevision;
+  }
+  if (incoming.stateRevision !== current.stateRevision) {
+    return incoming.stateRevision > current.stateRevision;
+  }
+  if (incoming.snapshotRevision !== current.snapshotRevision) {
+    return incoming.snapshotRevision > current.snapshotRevision;
+  }
+  let creditsMonotonic = false;
+  try {
+    creditsMonotonic = BigInt(incoming.creditsUsed) >= BigInt(current.creditsUsed);
+  } catch {
+    return false;
+  }
+  return (
+    incoming.tokensUsed >= current.tokensUsed &&
+    incoming.timeUsedSeconds >= current.timeUsedSeconds &&
+    creditsMonotonic
+  );
 }

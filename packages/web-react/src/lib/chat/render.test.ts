@@ -17,7 +17,7 @@ function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMe
 const CTX = { isLast: true, sending: false };
 
 describe("messageKind 角色分派", () => {
-  test("八类 role 各自映射", () => {
+  test("支持的 role 各自映射", () => {
     for (const r of [
       "user",
       "assistant",
@@ -25,6 +25,7 @@ describe("messageKind 角色分派", () => {
       "tool",
       "agent-group",
       "plan",
+      "goal",
       "permission",
       "delegate-progress",
       "system",
@@ -32,8 +33,7 @@ describe("messageKind 角色分派", () => {
       expect(messageKind({ role: r })).toBe(r);
     }
   });
-  test("goal（codex 专属，v5 不实现）与未知 role → unknown（不出卡）", () => {
-    expect(messageKind({ role: "goal" })).toBe("unknown");
+  test("未知 role → unknown（不出卡）", () => {
     // @ts-expect-error 故意传未知 role 验证 fail-safe
     expect(messageKind({ role: "whatever" })).toBe("unknown");
   });

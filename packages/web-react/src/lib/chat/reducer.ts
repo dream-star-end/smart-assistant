@@ -625,6 +625,62 @@ export function normalizeDelegateCards(sess: ChatSession): void {
   }
 }
 
+function goalCardIdentity(msg: ChatMessage): string | null {
+  if (msg.role !== "goal") return null;
+  if (typeof msg.platformGoalId === "string" && msg.platformGoalId) {
+    return `platform-goal-${msg.platformGoalId}`;
+  }
+  if (msg.blockId === "engine-goal" || msg.blockId?.startsWith("codex-goal-")) {
+    return "engine-goal";
+  }
+  return msg.blockId || null;
+}
+
+function isLaterGoalCard(candidate: ChatMessage, current: ChatMessage): boolean {
+  const candidateRevision = candidate.platformStateRevision ?? -1;
+  const currentRevision = current.platformStateRevision ?? -1;
+  if (candidateRevision !== currentRevision) return candidateRevision > currentRevision;
+  const candidateUpdated = candidate.updatedAt ?? candidate.ts ?? 0;
+  const currentUpdated = current.updatedAt ?? current.ts ?? 0;
+  return candidateUpdated >= currentUpdated;
+}
+
+/** Hydration can return one server-authored goal projection per historical
+ * turn. Collapse them to the same stable identity used by the live reducer so
+ * refresh/reconnect never recreates a row per Codex notification. */
+export function normalizeGoalCards(sess: ChatSession): void {
+  const latest = new Map<string, ChatMessage>();
+  const remove = new Set<ChatMessage>();
+  let changed = false;
+  for (const msg of sess.messages) {
+    const identity = goalCardIdentity(msg);
+    if (!identity) continue;
+    if (msg.blockId !== identity) {
+      msg.blockId = identity;
+      changed = true;
+    }
+    const current = latest.get(identity);
+    if (!current) {
+      latest.set(identity, msg);
+      continue;
+    }
+    if (isLaterGoalCard(msg, current)) {
+      remove.add(current);
+      latest.set(identity, msg);
+    } else {
+      remove.add(msg);
+    }
+  }
+  if (remove.size > 0) {
+    sess.messages = sess.messages.filter((msg) => !remove.has(msg));
+    changed = true;
+  }
+  if (!changed) return;
+  sess._blockIdToMsgId = new Map();
+  sess._agentGroups = new Map();
+  rebuildIndexes(sess);
+}
+
 type DelegateProgressBlock = {
   kind: "delegate_progress";
   runId: string;
@@ -1116,12 +1172,6 @@ export function applyOutboundMessage(
         planMsg.completedAt = Date.now();
       }
     } else if (b.kind === "goal") {
-      const goalId = b.blockId || "goal";
-      let goalMsg: ChatMessage | null = null;
-      if (goalId && sess._blockIdToMsgId?.has(goalId)) {
-        const mid = sess._blockIdToMsgId.get(goalId);
-        goalMsg = sess.messages.find((m) => m.id === mid && m.role === "goal") || null;
-      }
       const gb = b as {
         objective?: string;
         status?: string;
@@ -1130,7 +1180,17 @@ export function applyOutboundMessage(
         timeUsedSeconds?: number;
         updatedAt?: number;
         cleared?: boolean;
+        platformGoalId?: string;
+        platformStateRevision?: number;
       };
+      // One stable row per platform goal. Codex's native block id is turn-
+      // scoped, so using it directly would append a duplicate card every turn.
+      const goalId = gb.platformGoalId ? `platform-goal-${gb.platformGoalId}` : "engine-goal";
+      let goalMsg: ChatMessage | null = null;
+      if (goalId && sess._blockIdToMsgId?.has(goalId)) {
+        const mid = sess._blockIdToMsgId.get(goalId);
+        goalMsg = sess.messages.find((m) => m.id === mid && m.role === "goal") || null;
+      }
       const objective = typeof gb.objective === "string" ? gb.objective : "";
       const goalFields: Partial<ChatMessage> = {
         blockId: goalId,
@@ -1140,6 +1200,8 @@ export function applyOutboundMessage(
         timeUsedSeconds: typeof gb.timeUsedSeconds === "number" ? gb.timeUsedSeconds : undefined,
         updatedAt: typeof gb.updatedAt === "number" ? gb.updatedAt : undefined,
         cleared: !!gb.cleared,
+        platformGoalId: gb.platformGoalId,
+        platformStateRevision: gb.platformStateRevision,
         completedAt: Date.now(),
       };
       if (!goalMsg) {

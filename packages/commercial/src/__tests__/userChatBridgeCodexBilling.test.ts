@@ -129,6 +129,8 @@ interface FakePoolControl {
   /** P0 跨桥修复 — 有状态 journal 表(INSERT/UPDATE CAS/SELECT 都作用于此),
    *  测试可直接读断言终态,或预置 synthetic 行(aborted 撞帧 / 串桥用例)。 */
   journalRows: Map<string, FakeJournalRow>;
+  /** Existing pending/component attribution visible after a committed settle. */
+  attributionCredits: Map<string, string>;
 }
 
 function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | null } = {}): FakePoolControl {
@@ -136,6 +138,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
   const balance = opts.userBalance ?? 1_000_000n;
   const periodCredits = opts.periodCredits ?? null; // null = 无 active 订阅(默认)
   const journalRows = new Map<string, FakeJournalRow>();
+  const attributionCredits = new Map<string, string>();
 
   function record(sql: string, params: unknown[] | undefined): void {
     queries.push({ sql, params });
@@ -189,6 +192,8 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       // backend integration suite; this bridge fake only needs to acknowledge
       // the atomic insert.
       if (trimmed.startsWith("INSERT INTO pending_usage_patches")) {
+        const values = params as unknown[];
+        attributionCredits.set(String(values[0]), String(values[7]));
         return { rows: [], rowCount: 1 };
       }
       // settle 23505 重入读(不该在本套件触发,兜住防 unhandled)
@@ -294,6 +299,13 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("SELECT EXISTS(") && trimmed.includes("FROM usage_records")) {
         return { rows: [{ present: false }], rowCount: 1 };
       }
+      if (trimmed.startsWith("SELECT COALESCE(") && trimmed.includes("AS attribution_credits")) {
+        const requestId = String((params as unknown[])[1]);
+        return {
+          rows: [{ attribution_credits: attributionCredits.get(requestId) ?? null }],
+          rowCount: 1,
+        };
+      }
       // preCheck 的 getSpendableBalance(0096 双钱包总可用)走 rootQuery 落
       // commercial/db getPool() —— 测试用 setPoolOverride 把 fakePool 装上。
       if (trimmed.startsWith("SELECT u.credits::text AS wallet")) {
@@ -312,7 +324,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
     async end(): Promise<void> { /* noop for tests */ },
   };
 
-  return { pool: fakePool as Pool, queries, journalRows };
+  return { pool: fakePool as Pool, queries, journalRows, attributionCredits };
 }
 
 // ---------- 模型执行权威夹具(签发边界 epoch 重读 / journal 补偿用) ----------
@@ -1550,16 +1562,22 @@ describe("userChatBridge / codex billing — P0 displacement(新连接顶掉旧�
 describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞帧 / 幂等 / 串桥)", () => {
   let rig: BillingRig;
   let logs: CapturedLog[];
+  const recoveredAppends: unknown[][] = [];
   before(async () => {
     const cap = makeCaptureLogger();
     logs = cap.logs;
-    rig = await startRig({ userBalance: 1_000_000n, logger: cap.log });
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      logger: cap.log,
+      appendCostCredits: async (...args) => { recoveredAppends.push(args); },
+    });
   });
   after(async () => { await stopRig(rig); });
   beforeEach(() => {
     _resetAgentMultiplierCacheForTests();
     logs.length = 0;
     rig.poolCtrl.queries.length = 0;
+    recoveredAppends.length = 0;
   });
 
   async function openPair(uidStr: string): Promise<{ ws: WebSocket; containerWs: WebSocket }> {
@@ -1630,7 +1648,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
     ws.close();
   });
 
-  test("billing 帧撞 committed journal → 幂等忽略(无二次 settle / 广播)", async () => {
+  test("billing 帧撞 committed journal → 不二次 settle/扣费，但修复 crash-window goal attribution", async () => {
     const { ws, containerWs } = await openPair("44");
     const reqId = "b".repeat(32);
     rig.poolCtrl.journalRows.set(reqId, {
@@ -1640,14 +1658,69 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
       precheck_credits: "100",
       error_msg: null,
     });
-    sendBilling(containerWs, reqId);
+    const turnKey = "f".repeat(64);
+    rig.poolCtrl.attributionCredits.set(reqId, "17");
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: reqId,
+      turnKey,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
 
     await waitUntil(() =>
       logs.some((l) => l.msg.includes("already-settled journal")), 1500);
     assert.equal(usageInserts(rig).length, 0);
+    assert.equal(recoveredAppends.length, 1);
+    assert.equal(recoveredAppends[0]![0], reqId);
+    assert.equal(recoveredAppends[0]![2], "17");
+    assert.equal(recoveredAppends[0]![6], turnKey);
     let cost: Record<string, unknown> | null = null;
     try { cost = await waitJsonFrameOfType(ws, "outbound.cost_charged", 200); } catch { /* */ }
     assert.equal(cost, null);
+    ws.close();
+  });
+
+  test("billing 帧先撞 finalizing 未提交窗口 → 不永久去重，提交证据可见后同帧完成修复", async () => {
+    const { ws, containerWs } = await openPair("441");
+    const reqId = "f".repeat(32);
+    const turnKey = "e".repeat(64);
+    rig.poolCtrl.journalRows.set(reqId, {
+      state: "finalizing",
+      user_id: "441",
+      ctx: {
+        model: "gpt-5.6-sol",
+        agentId: "codex",
+        source: "codex_bridge",
+        settlementClaimId: "claim-in-progress",
+      },
+      precheck_credits: "100",
+      error_msg: null,
+    });
+
+    const frame = {
+      type: "outbound.codex_billing",
+      requestId: reqId,
+      turnKey,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    };
+    containerWs.send(JSON.stringify(frame));
+    await waitUntil(() =>
+      logs.some((l) => l.msg.includes("attribution not yet visible")), 1500);
+    assert.equal(recoveredAppends.length, 0);
+
+    rig.poolCtrl.journalRows.get(reqId)!.state = "committed";
+    rig.poolCtrl.attributionCredits.set(reqId, "19");
+    containerWs.send(JSON.stringify(frame));
+    await waitUntil(() => recoveredAppends.length === 1, 1500);
+    assert.equal(recoveredAppends[0]![0], reqId);
+    assert.equal(recoveredAppends[0]![2], "19");
+    assert.equal(recoveredAppends[0]![6], turnKey);
+    assert.equal(usageInserts(rig).length, 0);
+    assert.equal(ledgerInserts(rig).length, 0);
     ws.close();
   });
 

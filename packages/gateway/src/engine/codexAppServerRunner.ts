@@ -10,7 +10,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { isToolExitCode, type ToolTerminationReason } from '@openclaude/protocol'
+import {
+  isToolExitCode,
+  type GoalStateSnapshot,
+  type ToolTerminationReason,
+} from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
 import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
@@ -195,6 +199,8 @@ type CodexGoalBlock = {
   timeUsedSeconds?: number
   updatedAt?: number
   cleared?: boolean
+  platformGoalId?: string
+  platformStateRevision?: number
 }
 
 type CollabAgentStateSummary = { status: string; message?: string }
@@ -799,6 +805,12 @@ export class CodexAppServerRunner extends EventEmitter {
    *  the proc requires re-attaching even when threadId is known. */
   private attached = false
   private activeTurnId: string | null = null
+  private platformGoal: GoalStateSnapshot | null = null
+  /** Distinguishes "the platform has never supplied goal state" from an
+   *  explicit null snapshot, which means clear Codex's native goal. */
+  private platformGoalInitialized = false
+  private syncedPlatformGoalSignature: string | null = null
+  private syncedPlatformGoal: GoalStateSnapshot | null = null
   /** Promise wired into `turn/completed` notification handling. Set by runTurn
    *  before sending `turn/start`, resolved by handleNotification on
    *  `turn/completed` for the matching turnId. */
@@ -992,6 +1004,62 @@ export class CodexAppServerRunner extends EventEmitter {
     this.opts.traceId = traceId
   }
 
+  async setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    this.platformGoalInitialized = true
+    this.platformGoal = goal ? structuredClone(goal) : null
+    if (this.proc && this.attached && this.threadId && this.activeTurnId === null) {
+      await this.syncPlatformGoal()
+    }
+  }
+
+  private platformGoalSignature(): string {
+    const goal = this.platformGoal
+    if (!goal || goal.status === 'cleared') return 'cleared'
+    return JSON.stringify({
+      goalId: goal.goalId,
+      stateRevision: goal.stateRevision,
+      objective: goal.objective,
+      status: goal.status,
+      tokenBudget: goal.tokenBudget,
+    })
+  }
+
+  private async syncPlatformGoal(): Promise<void> {
+    if (!this.platformGoalInitialized || !this.threadId || !this.attached) return
+    const signature = this.platformGoalSignature()
+    if (signature === this.syncedPlatformGoalSignature) return
+    const goal = this.platformGoal
+    const cleared = !goal || goal.status === 'cleared'
+    // app-server can deliver the matching notification synchronously from the
+    // same stdout chunk before this request Promise resumes. Stage the platform
+    // generation first so that notification is correlated to the mutation that
+    // caused it; restore the last successful stamp if the request itself fails.
+    const previousSignature = this.syncedPlatformGoalSignature
+    const previousGoal = this.syncedPlatformGoal
+    this.syncedPlatformGoalSignature = signature
+    // Keep a cleared platform snapshot for correlation so Codex's native
+    // thread/goal/cleared notification updates the existing card in place.
+    this.syncedPlatformGoal = goal ? structuredClone(goal) : null
+    try {
+      await this.sendRequest('thread/goal/set', {
+        threadId: this.threadId,
+        objective: cleared ? null : goal.objective,
+        status: cleared
+          ? null
+          : goal.status === 'completed'
+            ? 'complete'
+            : goal.status,
+        tokenBudget: cleared ? null : goal.tokenBudget,
+      })
+    } catch (err) {
+      // SessionManager serializes setGoalState under the session lock, so no
+      // newer sync can legitimately supersede this staged value here.
+      this.syncedPlatformGoalSignature = previousSignature
+      this.syncedPlatformGoal = previousGoal
+      throw err
+    }
+  }
+
   // ── Phase 5 GitHub session repo binding (parity with SubprocessRunner) ──
 
   /** Public getter consumed by sessionManager.recyclePeerForRepoChange:
@@ -1022,6 +1090,8 @@ export class CodexAppServerRunner extends EventEmitter {
     this.priorTurnTotal = null
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.syncedPlatformGoalSignature = null
+    this.syncedPlatformGoal = null
     this.cleanupLaunchOverrides()
   }
 
@@ -1269,6 +1339,8 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentCollabAgentPolicy = undefined
     this.initialized = false
     this.attached = false
+    this.syncedPlatformGoalSignature = null
+    this.syncedPlatformGoal = null
     // The proc close event (awaited above) is the stdout-drained boundary.
     // Only now may we clear the identity pointer; clearing it earlier made the
     // stdout identity guard discard bytes already emitted by Codex.
@@ -1513,6 +1585,8 @@ export class CodexAppServerRunner extends EventEmitter {
       this.spawnedProviderSignature = null
       this.initialized = false
       this.attached = false
+      this.syncedPlatformGoalSignature = null
+      this.syncedPlatformGoal = null
       this.activeTurnId = null
       // Clear stdoutBuf so the next proc's first response isn't prepended
       // with a partial line residue from this dying proc.
@@ -1859,10 +1933,19 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitGoalBlock(goal: CodexGoalBlock): void {
+    const platformGoal = this.syncedPlatformGoal
     this.emit('message', {
       type: 'openclaude_goal',
       session_id: this.threadId,
-      goal,
+      goal: {
+        ...goal,
+        ...(platformGoal
+          ? {
+              platformGoalId: platformGoal.goalId,
+              platformStateRevision: platformGoal.stateRevision,
+            }
+          : {}),
+      },
     } as unknown as RunnerMessage)
   }
 
@@ -2580,6 +2663,8 @@ export class CodexAppServerRunner extends EventEmitter {
     this.priorTurnTotal = null
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.syncedPlatformGoalSignature = null
+    this.syncedPlatformGoal = null
     // sessionManager listens for this and writes the new id (+ provider tag)
     // to resume-map.json, so the *next* turn against this sessionKey resumes
     // against the fresh thread instead of looping back into -32600.
@@ -2703,6 +2788,8 @@ export class CodexAppServerRunner extends EventEmitter {
         }
         this.attached = true
       }
+
+      await this.syncPlatformGoal()
 
       // Set up the completion box BEFORE turn/start so a fast turn/completed
       // notification (rare but possible) doesn't slip past us.

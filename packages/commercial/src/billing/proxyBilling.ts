@@ -148,6 +148,11 @@ export interface FinalizeOutcome {
    * 广播/UI 应该用这个,不要用 finalCredits,否则 billing_failed/clamp 时会误报。
    */
   debitedCredits: bigint | null;
+  /** Exact actual-debit amount persisted with the turn locator for GoalState
+   * attribution. Unlike debitedCredits, zero is meaningful. Idempotent and
+   * commit-proven recovery paths return the existing immutable locator amount
+   * when available so callers can repair a missed fold/live refresh. */
+  attributionCredits?: bigint | null;
   /** 'committed' | 'aborted' */
   state: "committed" | "aborted";
   /** journal 行的 PG 主键(== requestId) */
@@ -439,6 +444,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         return {
           finalCredits: effectiveCredits,
           debitedCredits: null,
+          attributionCredits: null,
           state: "committed",
           requestId: ctx.requestId,
           balanceAfter: null,
@@ -480,6 +486,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     return {
       finalCredits: effectiveCredits,
       debitedCredits: settled.debitedCredits,
+      attributionCredits: settled.attributionCredits,
       state: "committed",
       requestId: ctx.requestId,
       balanceAfter: settled.balanceAfter,
@@ -586,6 +593,9 @@ export interface SettleResult {
    * 调用方用这个值决定是否向前端广播"已扣费"事件,以及广播多少。
    */
   debitedCredits: bigint | null;
+  /** Actual debit persisted beside the lossless turn locator. Zero preserves
+   * usage-only/error/waived attribution without inventing a charge. */
+  attributionCredits: bigint | null;
   /**
    * debit 完成后的 users.credits(即 ledger balance_after)。
    *
@@ -597,6 +607,29 @@ export interface SettleResult {
    * caller 想展示"当前余额"且这里拿到 null 时,请另查 users 表。
    */
   balanceAfter: bigint | null;
+}
+
+/** Read the immutable usage→turn attribution already committed by settlement.
+ * Used by durable/cross-bridge replays to repair the narrow window where the
+ * financial transaction committed but the post-commit fold/live refresh did
+ * not run. It never derives or reprices a charge. */
+export async function loadUsageAttributionCredits(
+  pool: Pool,
+  userId: bigint,
+  requestId: string,
+): Promise<bigint | null> {
+  const storageUserId = `c:${userId.toString()}`;
+  const row = (await pool.query<{ attribution_credits: string | null }>(
+    `SELECT COALESCE(
+              (SELECT p.cost_credits FROM pending_usage_patches p
+                WHERE p.user_id=$3 AND p.request_id=u.request_id),
+              (SELECT c.cost_credits::text FROM turn_tape_cost_components c
+                WHERE c.user_id=$3 AND c.request_id=u.request_id)
+            ) AS attribution_credits
+       FROM usage_records u WHERE u.user_id=$1 AND u.request_id=$2`,
+    [userId.toString(), requestId, storageUserId],
+  )).rows[0];
+  return row?.attribution_credits == null ? null : BigInt(row.attribution_credits);
 }
 
 /** COMMIT returned an error and independent reads could not yet prove whether
@@ -723,10 +756,20 @@ export async function settleUsageAndLedger(
         // 幂等路径只需读出另一并发 tx 已提交的行,不再走本事务内 ledger 写入,
         // 因此先 ROLLBACK 结束 aborted tx,SELECT 走 autocommit 读已提交行即可。
         await client.query("ROLLBACK");
-        const sel = await client.query<{ id: string; ledger_id: string | null }>(
-          `SELECT id::text AS id, ledger_id::text AS ledger_id
-             FROM usage_records WHERE user_id=$1 AND request_id=$2`,
-          [args.userId.toString(), args.requestId],
+        const sel = await client.query<{
+          id: string;
+          ledger_id: string | null;
+          attribution_credits: string | null;
+        }>(
+          `SELECT u.id::text AS id,u.ledger_id::text AS ledger_id,
+                  COALESCE(
+                    (SELECT p.cost_credits FROM pending_usage_patches p
+                      WHERE p.user_id=$3 AND p.request_id=u.request_id),
+                    (SELECT c.cost_credits::text FROM turn_tape_cost_components c
+                      WHERE c.user_id=$3 AND c.request_id=u.request_id)
+                  ) AS attribution_credits
+             FROM usage_records u WHERE u.user_id=$1 AND u.request_id=$2`,
+          [args.userId.toString(), args.requestId, `c:${args.userId.toString()}`],
         );
         if (sel.rowCount === 0) throw err;
         const r = sel.rows[0]!;
@@ -740,6 +783,11 @@ export async function settleUsageAndLedger(
           // 重入路径 DB 已是提交态,原始 debit 金额无法安全重算,标 null
           // (caller 用 null 决定不对外广播 cost_charged,只靠 refreshBalance 更新气泡)。
           debitedCredits: null,
+          // A crash may have happened after usage+ledger+pending committed but
+          // before the post-commit fold/broadcast. Returning the existing exact
+          // locator lets the retry drive that live refresh without re-debiting.
+          attributionCredits:
+            r.attribution_credits === null ? null : BigInt(r.attribution_credits),
           // 同上:余额可能被别的并发请求改过,无法还原当时的 balance_after。
           balanceAfter: null,
         };
@@ -776,7 +824,8 @@ export async function settleUsageAndLedger(
       }
     }
     const targetTurnKey = args.parentTurnKey ?? args.turnKey ?? null;
-    if (debitedCredits !== null && debitedCredits > 0n && targetTurnKey !== null) {
+    const attributionCredits = targetTurnKey === null ? null : (debitedCredits ?? 0n);
+    if (attributionCredits !== null) {
       await stageUsageCostLocatorInBillingTransaction(client, {
         requestId: args.requestId,
         userId: `c:${args.userId.toString()}`,
@@ -785,12 +834,16 @@ export async function settleUsageAndLedger(
         delegateAgentId: args.delegateAgentId ?? null,
         turnKey: args.turnKey ?? null,
         parentTurnKey: args.parentTurnKey ?? null,
-        costCredits: debitedCredits,
+        // The locator is also the durable join from usage_records to this
+        // tape. A zero actual debit must therefore still be staged; the goal
+        // token aggregate reads the usage row while the credit aggregate adds
+        // exactly zero. This commits atomically with usage/ledger truth.
+        costCredits: attributionCredits,
       });
     }
     commitAttempted = true;
     await client.query("COMMIT");
-    return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };
+    return { usageId, ledgerId, clamped, debitedCredits, attributionCredits, balanceAfter };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -804,10 +857,20 @@ export async function settleUsageAndLedger(
       for (const delayMs of [0, 50, 150]) {
         if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
         try {
-          const settled = await pool.query<{ id: string; ledger_id: string | null }>(
-            `SELECT id::text AS id,ledger_id::text AS ledger_id
-               FROM usage_records WHERE user_id=$1 AND request_id=$2`,
-            [args.userId.toString(), args.requestId],
+          const settled = await pool.query<{
+            id: string;
+            ledger_id: string | null;
+            attribution_credits: string | null;
+          }>(
+            `SELECT u.id::text AS id,u.ledger_id::text AS ledger_id,
+                    COALESCE(
+                      (SELECT p.cost_credits FROM pending_usage_patches p
+                        WHERE p.user_id=$3 AND p.request_id=u.request_id),
+                      (SELECT c.cost_credits::text FROM turn_tape_cost_components c
+                        WHERE c.user_id=$3 AND c.request_id=u.request_id)
+                    ) AS attribution_credits
+               FROM usage_records u WHERE u.user_id=$1 AND u.request_id=$2`,
+            [args.userId.toString(), args.requestId, `c:${args.userId.toString()}`],
           );
           const row = settled.rows[0];
           if (row) {
@@ -816,6 +879,8 @@ export async function settleUsageAndLedger(
               ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
               clamped: false,
               debitedCredits: null,
+              attributionCredits:
+                row.attribution_credits === null ? null : BigInt(row.attribution_credits),
               balanceAfter: null,
             };
           }

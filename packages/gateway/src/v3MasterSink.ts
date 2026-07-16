@@ -152,6 +152,10 @@ export interface V3MasterSinkWirePayload {
    *  使 ccb 助手落库时按 session 精确排空 pending costCredits(anthropicProxy 异步算费
    *  park 时以 LLM metadata.session_id 为 key,与此一致)。缺省 → master 退回 by-user。 */
   agentSessionId?: string
+  /** Platform goal captured before this turn started. Both fields must be
+   * present together; master validates ownership against sessionId. */
+  goalId?: string
+  goalStateRevision?: number
   /** Plan §4.4 改动 7 — token usage gathered by the gateway-side stream
    *  finalizer at `message_stop`. Persisted into `messages[i].usage`;
    *  costCredits joins later via `appendCostCredits`. Snake-case JSON

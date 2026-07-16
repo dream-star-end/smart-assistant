@@ -1,5 +1,6 @@
 import { type Static, Type } from '@sinclair/typebox'
 import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
+import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 
 // ───────────────────────────────────────────────
 // V3 S12e — trace id schema fragment
@@ -19,6 +20,27 @@ export const CLIENT_MESSAGE_ID_RE = new RegExp(CLIENT_MESSAGE_ID_PATTERN)
 export const isClientMessageId = (value: unknown): value is string =>
   typeof value === 'string' && CLIENT_MESSAGE_ID_RE.test(value)
 const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
+
+export const GoalStateSnapshotSchema = Type.Object({
+  sessionId: Type.String(),
+  goalId: Type.String({ format: 'uuid' }),
+  objective: Type.String(),
+  status: Type.Union(GOAL_STATUSES.map((status) => Type.Literal(status))),
+  tokenBudget: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  creditBudget: Type.Union([Type.String({ pattern: '^[0-9]+$' }), Type.Null()]),
+  tokensUsed: Type.Integer({ minimum: 0 }),
+  creditsUsed: Type.String({ pattern: '^[0-9]+$' }),
+  timeUsedSeconds: Type.Integer({ minimum: 0 }),
+  stateRevision: Type.Integer({ minimum: 1 }),
+  snapshotRevision: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String(),
+  updatedAt: Type.String(),
+  statusChangedAt: Type.String(),
+  engineStatus: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  engineTokensUsed: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()])),
+  engineTimeUsedSeconds: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()])),
+  engineUpdatedAt: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+})
 
 // ───────────────────────────────────────────────
 // Common
@@ -170,6 +192,9 @@ export const InboundMessage = Type.Object({
   // 只以 schema 外附加属性存在、gateway 无视它自铸,导致底部请求ID与 turn_traces
   // 永远对不上(双权威源),这里显式入约。个人版直连不带此字段,走自铸分支。
   traceId: Type.Optional(TraceIdString),
+  /** Master-only turn attribution. Browser input is stripped before this field
+   * is populated; the container treats it as immutable for the whole turn. */
+  _goalState: Type.Optional(Type.Union([GoalStateSnapshotSchema, Type.Null()])),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
@@ -203,7 +228,20 @@ export const InboundPermissionResponse = Type.Object({
 })
 export type InboundPermissionResponse = Static<typeof InboundPermissionResponse>
 
-export const InboundFrame = Type.Union([InboundMessage, InboundControlStop, InboundPermissionResponse])
+/** Master-to-container control sideband. The commercial bridge rejects this
+ * shape when browser-authored; only its server-side sync method emits it. */
+export const InboundGoalSync = Type.Object({
+  type: Type.Literal('inbound.goal_sync'),
+  goal: GoalStateSnapshotSchema,
+})
+export type InboundGoalSync = Static<typeof InboundGoalSync>
+
+export const InboundFrame = Type.Union([
+  InboundMessage,
+  InboundControlStop,
+  InboundPermissionResponse,
+  InboundGoalSync,
+])
 export type InboundFrame = Static<typeof InboundFrame>
 
 // ───────────────────────────────────────────────
@@ -354,6 +392,10 @@ export const OutboundContentBlock = Type.Union([
     timeUsedSeconds: Type.Optional(Type.Number()),
     updatedAt: Type.Optional(Type.Number()),
     cleared: Type.Optional(Type.Boolean()),
+    /** Platform generation last successfully synchronized into this engine.
+     * Present only on server-authored engine notifications. */
+    platformGoalId: Type.Optional(Type.String({ format: 'uuid' })),
+    platformStateRevision: Type.Optional(Type.Integer({ minimum: 1 })),
     parentToolUseId: Type.Optional(Type.String()),
   }),
   // Live progress from the synchronous delegate_task bridge. These blocks are
@@ -782,6 +824,12 @@ export const SysIncident = Type.Object({
 })
 export type SysIncident = Static<typeof SysIncident>
 
+export const SysGoalSnapshot = Type.Object({
+  type: Type.Literal('sys.goal_snapshot'),
+  goal: GoalStateSnapshotSchema,
+})
+export type SysGoalSnapshot = Static<typeof SysGoalSnapshot>
+
 // ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
@@ -812,6 +860,9 @@ export const AnyFrame = Type.Union([
   OutboundTurnStatus,
   SysContextRebuilt,
   SysIncident,
+  SysGoalSnapshot,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>
+
+export type { GoalStateSnapshot }

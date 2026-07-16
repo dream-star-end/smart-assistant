@@ -17,6 +17,7 @@
  * 硬约束:CCB stream-json SdkMessage 形状不跨出本模块。
  */
 import { EventEmitter } from 'node:events'
+import type { GoalStateSnapshot } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -329,6 +330,11 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   setTraceId(traceId: string | undefined): void {
     this.runner.setTraceId(traceId)
+  }
+
+  async setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    const changed = this.runner.setGoalState(goal)
+    if (changed && this.runner.isRunning) await this.runner.shutdown()
   }
 
   updateConfig(config: OpenClaudeConfig): void {

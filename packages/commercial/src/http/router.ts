@@ -299,6 +299,7 @@ import {
   userAgentOf,
 } from './util.js'
 import { handleWechatLivePage, handleWechatLiveSnapshot } from './wechatLive.js'
+import { dispatchGoalRoute } from './goalRoutes.js'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -633,6 +634,13 @@ export function createCommercialHandler(
     { method: 'GET', path: '/wx/live', handler: handleWechatLivePage },
     { method: 'GET', path: '/api/wechat/live', handler: handleWechatLiveSnapshot },
     { method: 'GET', path: '/api/me', handler: handleMe },
+    // Session GoalState. Method/action semantics are centralized in the
+    // dispatcher; ownership is rechecked against client_sessions in PG.
+    {
+      method: ANY_METHOD,
+      pathPrefix: '/api/session-goals/',
+      handler: (req, res) => dispatchGoalRoute(req, res, deps),
+    },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },

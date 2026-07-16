@@ -1076,6 +1076,49 @@ export function App() {
     sockRef.current?.setActiveSession(activeId);
   }, [demo, activeId]);
 
+  // Goal state is platform-owned (PG), not part of the browser session blob.
+  // Fetch on session selection; live updates arrive through sys.goal_snapshot.
+  useEffect(() => {
+    if (demo || !activeId || !user) return;
+    let cancelled = false;
+    void api.getSessionGoal(authRef.current, activeId).then((goal) => {
+      if (!cancelled) sockRef.current?.setGoalState(activeId, goal);
+    }).catch(() => {
+      // A just-created session can briefly race its first server upsert. The
+      // next selection or goal action retries; do not poison chat readiness.
+    });
+    return () => { cancelled = true; };
+  }, [demo, activeId, user?.id]);
+
+  const setSessionGoal = useCallback(async (input: {
+    objective: string;
+    tokenBudget: number | null;
+    creditBudget: string | null;
+    expectedStateRevision: number;
+  }) => {
+    const auth = authRef.current;
+    if (!auth || !activeId) return;
+    const sessionTitle =
+      activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? "新对话";
+    const ensured = await sockRef.current?.ensureServerSession(activeId, agent.id, sessionTitle);
+    if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
+    const goal = await api.setSessionGoal(auth, activeId, input);
+    sockRef.current?.setGoalState(activeId, goal);
+  }, [activeId, activeSess?.title, agent.id, sessions]);
+
+  const transitionSessionGoal = useCallback(async (
+    action: "pause" | "resume" | "complete" | "clear",
+  ) => {
+    const auth = authRef.current;
+    if (!auth || !activeId) return;
+    const revision = sockRef.current?.getSession(activeId)?.goalState?.stateRevision;
+    if (typeof revision !== "number" || !Number.isSafeInteger(revision)) {
+      throw new Error("目标状态尚未加载，请稍后重试");
+    }
+    const goal = await api.transitionSessionGoal(auth, activeId, action, revision);
+    sockRef.current?.setGoalState(activeId, goal);
+  }, [activeId]);
+
   // 本轮活动快照（喂给 MessageList → TurnActivity）：模型慢时把阶段反馈显性化，取代裸三个点。
   // 团队模式额外带队长当前 plan step（消息区常长时间纯空白时用它填充等待文案）。
   const teamLeaderActive = !demo && teamMode && agent.id === "main";
@@ -1654,6 +1697,9 @@ export function App() {
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
+          goal={activeSess?.goalState}
+          onSetGoal={demo || !activeId ? undefined : setSessionGoal}
+          onGoalAction={demo || !activeId ? undefined : transitionSessionGoal}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}

@@ -471,6 +471,13 @@ export class CcbMessageParser {
       if (typeof goal.timeUsedSeconds === 'number') block.timeUsedSeconds = goal.timeUsedSeconds
       if (typeof goal.updatedAt === 'number') block.updatedAt = goal.updatedAt
       if (typeof goal.cleared === 'boolean') block.cleared = goal.cleared
+      // These two fields bind an advisory Codex notification to the exact
+      // platform-owned GoalState generation. Dropping them here would make
+      // the master unable to reject stale engine diagnostics.
+      if (typeof goal.platformGoalId === 'string') block.platformGoalId = goal.platformGoalId
+      if (typeof goal.platformStateRevision === 'number') {
+        block.platformStateRevision = goal.platformStateRevision
+      }
       if (parentToolUseId) block.parentToolUseId = parentToolUseId
       this.onEvent({ kind: 'block', block: block as OutboundContentBlock })
       return

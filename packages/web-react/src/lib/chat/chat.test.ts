@@ -18,7 +18,14 @@ import {
   parsePartialJson,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
-import { addMessage, type ChatMessage, createSession, isServerAuthoredRow, resetReplyTracker } from "./model";
+import {
+  addMessage,
+  type ChatMessage,
+  createSession,
+  isServerAuthoredRow,
+  resetReplyTracker,
+  shouldApplyGoalSnapshot,
+} from "./model";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -27,6 +34,7 @@ import {
   applyOutboundMessage,
   applyResumeFailed,
   normalizeDelegateCards,
+  normalizeGoalCards,
   type FrameEffects,
 } from "./reducer";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
@@ -384,6 +392,100 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const asst = s.messages.filter((m) => m.role === "assistant" && m.id === "srv-1");
     expect(asst).toHaveLength(1);
     expect(asst[0].text).toBe("part1 part2");
+  });
+
+  test("native goal notifications update one stable platform card instead of spamming turns", () => {
+    const s = sess();
+    const platformGoalId = "11111111-1111-4111-8111-111111111111";
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      blocks: [{
+        kind: "goal",
+        blockId: "codex-turn-1",
+        objective: "完成迁移",
+        status: "active",
+        tokensUsed: 10,
+        platformGoalId,
+        platformStateRevision: 1,
+      }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      blocks: [{
+        kind: "goal",
+        blockId: "codex-turn-2",
+        objective: "完成迁移并验证",
+        status: "paused",
+        tokensUsed: 25,
+        platformGoalId,
+        platformStateRevision: 2,
+      }],
+    }));
+    const goals = s.messages.filter((m) => m.role === "goal");
+    expect(goals).toHaveLength(1);
+    expect(goals[0]).toMatchObject({
+      text: "完成迁移并验证",
+      blockId: `platform-goal-${platformGoalId}`,
+      goalStatus: "paused",
+      tokensUsed: 25,
+      platformStateRevision: 2,
+    });
+  });
+
+  test("hydrated per-turn goal rows collapse to the latest stable platform card", () => {
+    const s = sess();
+    const platformGoalId = "11111111-1111-4111-8111-111111111111";
+    addMessage(s, "goal", "old", {
+      blockId: "codex-goal-turn-1",
+      platformGoalId,
+      platformStateRevision: 1,
+      goalStatus: "active",
+      updatedAt: 10,
+    });
+    addMessage(s, "goal", "latest", {
+      blockId: "codex-goal-turn-2",
+      platformGoalId,
+      platformStateRevision: 2,
+      goalStatus: "paused",
+      updatedAt: 20,
+    });
+    normalizeGoalCards(s);
+    expect(s.messages.filter((message) => message.role === "goal")).toHaveLength(1);
+    expect(s.messages.find((message) => message.role === "goal")).toMatchObject({
+      text: "latest",
+      blockId: `platform-goal-${platformGoalId}`,
+      platformStateRevision: 2,
+      goalStatus: "paused",
+    });
+  });
+
+  test("goal snapshot merge rejects REST/WS regression and accepts monotonic usage", () => {
+    const current = {
+      sessionId: "s1",
+      goalId: "11111111-1111-4111-8111-111111111111",
+      objective: "ship",
+      status: "active" as const,
+      tokenBudget: 100,
+      creditBudget: "100",
+      tokensUsed: 20,
+      creditsUsed: "30",
+      timeUsedSeconds: 10,
+      stateRevision: 2,
+      snapshotRevision: 5,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      statusChangedAt: "2026-07-16T00:00:00.000Z",
+    };
+    expect(shouldApplyGoalSnapshot(current, { ...current, stateRevision: 1, snapshotRevision: 99 })).toBe(false);
+    expect(shouldApplyGoalSnapshot(current, { ...current, snapshotRevision: 4, tokensUsed: 999 })).toBe(false);
+    expect(shouldApplyGoalSnapshot(current, { ...current, timeUsedSeconds: 9 })).toBe(false);
+    expect(shouldApplyGoalSnapshot(current, { ...current, timeUsedSeconds: 11 })).toBe(true);
+    expect(shouldApplyGoalSnapshot(current, null)).toBe(false);
+    expect(shouldApplyGoalSnapshot(current, {
+      ...current,
+      goalId: "22222222-2222-4222-8222-222222222222",
+      stateRevision: 3,
+    })).toBe(true);
   });
 
   test("tool partial→final: partialJson seeded then cleared on final", () => {
@@ -1902,6 +2004,27 @@ describe("ChatSocket 1008 auth recovery", () => {
     sock.stop();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(silentRefresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ChatSocket GoalState reconnect recovery", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("every successful socket open refreshes the selected PG goal authority", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncGoalState = vi.fn<NonNullable<ChatSocketDeps["syncGoalState"]>>();
+    const sock = makeSocket({ syncGoalState });
+    sock.ensureSession("s-goal-reconnect", "main");
+    sock.setActiveSession("s-goal-reconnect");
+    sock.setGateReady(true);
+    FakeWS.instances.at(-1)!.open();
+    await Promise.resolve();
+    expect(syncGoalState).toHaveBeenCalledTimes(1);
+    expect(syncGoalState).toHaveBeenCalledWith("s-goal-reconnect");
+    sock.stop();
   });
 });
 
