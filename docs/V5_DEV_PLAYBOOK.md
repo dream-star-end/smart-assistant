@@ -471,6 +471,11 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | 蓝绿:bootstrap 未收口 | 新机 `--bootstrap` 仍建实目录,首次 deploy 会被 assert_bluegreen_layout 挡(fail-closed 无声破坏已防);须手动再跑一次 --migrate-bluegreen | bootstrap 直接建首个 release+symlink(下次碰 bootstrap 顺手) |
 | ~~deploy 重启窗口监控告警噪音~~ **已偿还**(07-13) | deploy/dist/rollback 在 restart 前写 schema=2 marker(TTL≤180s),scope=即时健康快照;`--egress`才纳入 egress 两项。monitor 锁内单 snapshot 严验 schema/权限/host/commit/TTL/scope,部署前 bad 不压,smoke 后 schema+nonce+flock 清理,cutover recovery 同锁只清自己；超时仍坏 planned→bad 立即告警，stale schema=1 可信+全健康才自动清,否则保留但部署/告警 fail-open；schema=1 offline-cutover 向后兼容 | — |
 | 蓝绿:offline cutover lane 未适配 | stage/activate-staged/offline-recycle/prepare-offline-cutover 仍按实目录 in-place+mv 语义操作 REMOTE_SRC,symlink 布局下会破坏不变量 → 已 assert_not_bluegreen_for_cutover **fail-closed 拒绝**(不静默破坏);但也就用不了该 lane 做 GPT56 类离线大切换 | 做下一次离线大切换(image codex 版本切换等)前,把 stage/activate_staged 也改为 build_release+原子 symlink |
+| selfheal:Tier1 动作无 host-routed 执行器(批0 已 fail-closed) | Tier1(restart_service/clean_disk/switch_node)实现于个人版 broker **本机执行**,而 v5 修复目标在 kl-mirror=错宿主;且动作授权未绑定 policy/condition(任意活跃 repair 可 raw socket 请求任意 allowlist 动作)。批0 处置=broker 默认零注册+`OC_SELFHEAL_TIER1_ENABLED` 正向闸(默认关);现阶段自愈修复面=取证上报+Tier2 代码修复(宿主正确) | 放开任何 `ops.monitor:*` 真实类 auto_repair 前:落 host-routed 限权执行器(方向=经既有 kl-mirror ssh 通道或宿主常驻执行器)+policy-scoped `allowed_actions/target`(master 上下文冻结,broker 强制) |
+| selfheal:writer-guard trigger 有意 deferred | schema_migrations 有 0136 记账行但 **trigger 不存在**(0137 显式 DROP 并把 SQL 移驻 db/deferred/selfheal_writer_guard.sql;当时回滚池仍含旧 writer)。**验收只认 pg_trigger,禁看 migration ledger** | 回滚池候选全部 ≥ selfheal 合并点后,以**新迁移版本**入仓启用(勿复用 0136 号) |
+| selfheal:派单候选无优先级 | sweeper autoRepair 派单按 opened_at ASC 取最老,不看 severity;多类真实 policy 放开后低级事故可占 singleflight 槽 90min 饿死 critical | 放开 >1 个真实类前:severity 优先级+aging 一并设计(只加 severity 会饿死长期 warning,勿单做) |
+| selfheal:Tier2 release 演练未做 | transport drill(scripts/v5-selfheal-drill.ts)覆盖派单→执行→归因闭环,但真 commit→verify→pending_release→一键放行→deployDriver 全链从未在生产走通 | 首个真实类放开前,低峰窗口做一次 Tier2 release 专项演练(真部署一个 no-op 修复) |
+| selfheal:0137 用户通知全关 | incident_policies.user_notice_enabled 全 f;0137 attestation 只认 svc_v5/http_v5 fully_automatic deploy_v5,AUTO_DEPLOY_TIER2=0 下人工放行不产 attestation → 即使修复成功也不会形成用户通知 proposal(设计使然) | 独立批3:审批人绑定+真实影响证据链演练后,先只开一个 policy 试点 |
 
 ### 审计体系速记(2026-07-11 整改批)
 - **语义三分层**:`admin_audit`=人类管理员操作留痕(**永久保留**,append-only RULE)/`security_events`(0129)=系统安全事件(route_bypass 等,180d)/运维遥测**不进审计表**(health 快照态=compute_hosts 列,审计只记 health.transition、image.promote.apply 等真实迁移;整改前 84% 是心跳,存量 14 万行已清)。
@@ -494,7 +499,11 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 
 每次踩到新坑/建立新机制,**当场更新本文对应小节**(部署类进 §4,定位类进 §3,债进 §5),并同步 bump 相关 skill(`~/.claude/skills/v5-*`)。文档腐烂比没有文档更危险。
 
-### 2026-07-10 管理后台同框架重构 + 告警统一送达速记
+### 2026-07-16 自愈批0(契约收口+drill 一等公民)速记
+- **执行契约三方钉死**:oc-selfheal CLI 四命令(context/report/verify/cutover)= 唯一权威;修复代理 SKILL 权威源在个人版仓 `ops/selfheal/skills/v5-incident-repair/SKILL.md`(provision step_skill 原子安装+装后逐字节校验),prompt(executionLedger.buildRepairPrompt)与 SKILL 教同一契约,三方由 selfhealSkillContract.test.ts 行为测试锁定(SKILL 示例真实 spawn CLI)。**改任何一方必须三方同改**。事故背景:07-11 手放 SKILL 教了 ack/broker 等不存在的子命令,修复代理首条命令即失败。
+- **drill 机制**:0154 seed exact policy `selfheal.drill:transport_v1`(常驻 enabled=t/auto_repair=f/user_notice=f);演练=kl-mirror release 树跑 `npx tsx scripts/v5-selfheal-drill.ts`(单 PG 连接 advisory lock+九检查点断言+异常安全清场:auto_repair 先关再翻 condition)。**drill key 是跨仓契约常量**(v5 conditionKeys.SELFHEAL_DRILL_TRANSPORT ⇄ 个人版 broker SELFHEAL_DRILL_TRANSPORT_KEY):dispatcher cooldown 豁免、broker context/report 白名单都只认精确常量,新增 drill 类型必须两侧显式扩表,禁前缀化。
+- **归因让位(P3)**:reconciler probe 收口一律走 `resolveIncidentByProbe`(单条 CAS 内嵌 NOT EXISTS verifying 守卫,防 TOCTOU);verifying 窗口归 sweeper 的 succeeded+resolve(source='codex') 同事务。admin/suppression 收口必须能压过 verifying(走无守卫 resolveIncident)。**新增 resolve 调用点先想清归因语义再选函数**。
+- **条件键冻结**:个人版 jobWorker 起 turn 前用 root 持有的 capability 从 master context 冻结 conditionKey 到 job 行(set-once,fail-closed);broker 一切 drill 判定只读冻结值。给 repair 加任何"按事件类型区别对待"的能力都必须走这条冻结链,禁信 payload/模型自述。
 - **admin = web-react 第二 Vite 入口**(`admin.html` + `src/admin/**`,21 页,hash 路由 `#tab=NAME&k=v` 兼容旧深链);URL 仍 `/admin.html`(+`/admin` 302);鉴权 refresh→me→role gate。地基组件权威在 `src/admin/components`(StatCard/ChartCard/DataTable/FilterBar/useAdminPoll/adminApi),页面禁手写内联样式原语。
 - **告警送达不变量**:enqueueAlert 零订阅通道→inbox(uid=1)兜底;critical 恒 inbox 镜像(每 enqueue 至多一次)。shell 侧(monitor/daily/alert-fail)psql 直插 outbox,**判定单一 SQL 权威 = scripts/v5-alert-fanout.sql——改订阅/静默判定必须 TS(alertOutbox.ts)与该 SQL 同改**。注意:企微通道 severity_min=warning 时 info 级(恢复通知/日报)不进企微是订阅语义,非 bug。
 - **坑:undici NO_PROXY 不支持 CIDR**。master 全局 EnvHttpProxyAgent 下,fetch 内网桥接 IP(172.31.0.1)必须 per-request `directEgressDispatcher()` 直连(modelOps 容量面曾因此静默降级 local_fallback);任何新的 master→内网 fetch 同此纪律。
