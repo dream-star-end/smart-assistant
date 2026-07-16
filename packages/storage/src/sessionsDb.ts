@@ -2766,6 +2766,16 @@ export interface UsageAggregationGcStats {
   pendingAging: number
   pendingExpired: number
   mapExpired: number
+  /** 带 turn_key 的滞留行晚到折叠进 turn_tape_cost_components 的条数(lossless tape 是
+   * PG/commercial 专属,SQLite 引擎恒 0)。 */
+  pendingFolded: number
+  /** 折叠时发现 (request_id,user_id) 已有坐标/金额不符的 cost component——不删、只计数,
+   * 留给人工核对(不可变冲突,与 finalize 内折叠同语义)。SQLite 恒 0。 */
+  pendingFoldAnomaly: number
+  /** 带 key 但任何 finalized tape 都匹配不到(读路径永不可达)、超期后清除的条数。SQLite 恒 0。 */
+  pendingUnreachableExpired: number
+  /** 已 finalize tape 的原始分片(parts,含未脱敏 payload)超期清除条数。SQLite 恒 0。 */
+  tapePartsPurged: number
 }
 
 const PENDING_AGING_MS = 60 * 60_000           // 1h alarm
@@ -2801,6 +2811,11 @@ async function _sqliteSweepUsageAggregationGc(
       pendingAging: aging.n,
       pendingExpired: delPending.changes,
       mapExpired: delMap.changes,
+      // lossless turn tape 四表只存在于 PG/commercial 引擎,SQLite 侧无对应清扫面。
+      pendingFolded: 0,
+      pendingFoldAnomaly: 0,
+      pendingUnreachableExpired: 0,
+      tapePartsPurged: 0,
     }
   })
   return txn()

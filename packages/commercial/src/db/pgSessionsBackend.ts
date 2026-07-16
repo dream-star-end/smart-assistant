@@ -80,7 +80,6 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
-  hasLegacyRawBillingReason,
   materializeLosslessTurn,
   type LosslessTurnRecord,
 } from "../http/losslessTurnTape.js";
@@ -238,6 +237,14 @@ async function requestAdvisoryXactLock(
 const PENDING_AGING_MS = 60 * 60_000; // 1h alarm
 const PENDING_HARD_DELETE_MS = 24 * 60 * 60_000; // 24h GC
 const MAP_HARD_DELETE_MS = 7 * 24 * 60 * 60_000; // 7d GC
+// 带 key 且读路径永不可达(无任何 finalized tape 匹配 turn_key/parent_turn_key)的滞留行:
+// 7d 后清除。窗口远大于 tape fsync 重试与 durable 计费 24h SLA——7d 后不再有 finalize
+// 会来消费它;若 tape 在删除后才 finalize(理论窗口),该 turn 仅损失积分徽章展示,
+// 结算真相在 usage_records/ledger 不受影响。
+const PENDING_UNREACHABLE_DELETE_MS = 7 * 24 * 60 * 60_000;
+// 已 finalize tape 的原始分片(parts 存的是脱敏前 payload;records 才是脱敏后权威):
+// finalize 事务内即删,本常量只兜历史存量与删除失败残留。48h 覆盖任何滚动升级重放窗口。
+const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 
 // updated_at 逻辑版本 SQL 片段(RFC D3b)。$Ncol = 列名前缀(冲突更新时用 client_sessions,
 // 普通 UPDATE 时用裸列)。第三个 GREATEST 参数(客户端 requested)只 upsert 用,append/patch
@@ -1142,7 +1149,6 @@ export function createPgSessionsBackend(
         } catch (err) {
           throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
         }
-        const legacyRawBillingReason = hasLegacyRawBillingReason(rawPayload);
         const turn = materializeLosslessTurn(rawPayload);
         if (
           turn.payload.sessionId !== request.sessionId ||
@@ -1403,13 +1409,15 @@ export function createPgSessionsBackend(
             request.tapeId,
           ],
         );
-        if (legacyRawBillingReason) {
-          await client.query(
-            `DELETE FROM client_session_turn_tape_parts
-              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-            [request.sessionId, userId, request.tapeId],
-          );
-        }
+        // 原始分片(parts)一律随 finalize 清除:records 才是脱敏后的持久权威,parts 保存
+        // 的是脱敏前 payload,留下即隐私面偏差 + 双份存储(2026-07-16 巡检批;此前只在
+        // legacyRawBillingReason 时删)。上传路径对已 finalize tape 已有短路(见
+        // stageLosslessTurnTapePart finalized_at 分支),重放不会把 parts 写回来。
+        await client.query(
+          `DELETE FROM client_session_turn_tape_parts
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [request.sessionId, userId, request.tapeId],
+        );
         return {
           applied: "finalized",
           recordCount: turn.records.length,
@@ -2871,6 +2879,8 @@ async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggreg
   const agingThreshold = nowMs - PENDING_AGING_MS;
   const expiredThreshold = nowMs - PENDING_HARD_DELETE_MS;
   const mapThreshold = nowMs - MAP_HARD_DELETE_MS;
+  const unreachableThreshold = nowMs - PENDING_UNREACHABLE_DELETE_MS;
+  const partsThreshold = nowMs - FINALIZED_TAPE_PARTS_DELETE_MS;
   const aging = (
     await client.query<{ n: number }>(
       "SELECT COUNT(*)::int AS n FROM pending_usage_patches WHERE created_at <= $1 AND created_at > $2",
@@ -2883,5 +2893,114 @@ async function sweepOnce(client: PoolClient, nowMs: number): Promise<UsageAggreg
       WHERE created_at <= $1 AND turn_key IS NULL AND parent_turn_key IS NULL`,
     [expiredThreshold],
   );
-  return { pendingAging: aging?.n ?? 0, pendingExpired: delPending.rowCount ?? 0, mapExpired: delMap.rowCount ?? 0 };
+
+  // ── 带 key 滞留行的终态语义(2026-07-16 巡检批)────────────────────────────────
+  // 成本晚于 tape finalize 才 stage 的行会错过 finalizeLosslessTurnTape 内折叠的唯一
+  // 时机,此后只能靠 hydration 的 UNION 读时兜底、永久滞留。这里补"晚到折叠":与
+  // finalize 内折叠同语义(finalized tape 的 anchor 坐标 + 不可变冲突校验),折叠与
+  // 删除在同一事务内,外部读者要么看到 pending 要么看到 component,不会双计。
+  // 可达性判据与 hydrateTurnTapeMessages 同源:finalized tape 按 turn_key 或
+  // parent_turn_key 匹配。FOR UPDATE SKIP LOCKED 避让在途 append/finalize 路径。
+  await client.query(
+    `WITH locked AS (
+       SELECT p.request_id, p.user_id, p.cost_credits, p.delegate_agent_id,
+              p.turn_key, p.parent_turn_key
+         FROM pending_usage_patches p
+        WHERE p.created_at <= $1
+          AND (p.turn_key IS NOT NULL OR p.parent_turn_key IS NOT NULL)
+        ORDER BY p.request_id
+        FOR UPDATE SKIP LOCKED
+     ), foldable AS (
+       SELECT DISTINCT ON (l.request_id, l.user_id)
+              l.request_id, l.user_id, l.cost_credits, l.delegate_agent_id,
+              t.session_id, t.tape_id, t.billing_anchor_id
+         FROM locked l
+         JOIN client_session_turn_tapes t
+           ON t.user_id = l.user_id
+          AND (t.turn_key = l.turn_key OR t.turn_key = l.parent_turn_key)
+          AND t.finalized_at IS NOT NULL
+          AND t.billing_anchor_id IS NOT NULL
+        ORDER BY l.request_id, l.user_id, t.finalized_at ASC, t.tape_id ASC
+     )
+     INSERT INTO turn_tape_cost_components
+       (request_id, user_id, session_id, tape_id, billing_anchor_id,
+        cost_credits, delegate_agent_id, updated_at)
+     SELECT request_id, user_id, session_id, tape_id, billing_anchor_id,
+            cost_credits::numeric, delegate_agent_id, $2
+       FROM foldable
+     ON CONFLICT (request_id, user_id) DO NOTHING`,
+    [agingThreshold, nowMs],
+  );
+  // 只删"component 坐标与金额与本行完全一致"的 pending(镜像 finalize 内折叠的不可变
+  // 校验;冲突不符的行保留待人工核对,由 pendingFoldAnomaly 暴露)。
+  const delFolded = await client.query(
+    `DELETE FROM pending_usage_patches p
+      USING client_session_turn_tapes t, turn_tape_cost_components c
+      WHERE p.created_at <= $1
+        AND (p.turn_key IS NOT NULL OR p.parent_turn_key IS NOT NULL)
+        AND t.user_id = p.user_id
+        AND (t.turn_key = p.turn_key OR t.turn_key = p.parent_turn_key)
+        AND t.finalized_at IS NOT NULL
+        AND t.billing_anchor_id IS NOT NULL
+        AND c.request_id = p.request_id
+        AND c.user_id = p.user_id
+        AND c.session_id = t.session_id
+        AND c.tape_id = t.tape_id
+        AND c.billing_anchor_id = t.billing_anchor_id
+        AND c.cost_credits::numeric = p.cost_credits::numeric
+        AND c.delegate_agent_id IS NOT DISTINCT FROM p.delegate_agent_id`,
+    [agingThreshold],
+  );
+  const foldAnomaly = (
+    await client.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n
+         FROM pending_usage_patches p
+        WHERE p.created_at <= $1
+          AND (p.turn_key IS NOT NULL OR p.parent_turn_key IS NOT NULL)
+          AND EXISTS (
+            SELECT 1 FROM client_session_turn_tapes t
+             WHERE t.user_id = p.user_id
+               AND (t.turn_key = p.turn_key OR t.turn_key = p.parent_turn_key)
+               AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM turn_tape_cost_components c
+             WHERE c.request_id = p.request_id AND c.user_id = p.user_id
+          )`,
+      [agingThreshold],
+    )
+  ).rows[0];
+  // 不可达行:任何 finalized tape 都匹配不到 → hydration 永远读不到,纯死重。超期清除。
+  const delUnreachable = await client.query(
+    `DELETE FROM pending_usage_patches p
+      WHERE p.created_at <= $1
+        AND (p.turn_key IS NOT NULL OR p.parent_turn_key IS NOT NULL)
+        AND NOT EXISTS (
+          SELECT 1 FROM client_session_turn_tapes t
+           WHERE t.user_id = p.user_id
+             AND (t.turn_key = p.turn_key OR t.turn_key = p.parent_turn_key)
+             AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
+        )`,
+    [unreachableThreshold],
+  );
+  // finalize 后残留的原始分片(存量 + 删除失败兜底;新 finalize 已在事务内清)。
+  const delParts = await client.query(
+    `DELETE FROM client_session_turn_tape_parts pp
+      USING client_session_turn_tapes t
+      WHERE t.session_id = pp.session_id
+        AND t.user_id = pp.user_id
+        AND t.tape_id = pp.tape_id
+        AND t.finalized_at IS NOT NULL
+        AND pp.created_at <= $1`,
+    [partsThreshold],
+  );
+  return {
+    pendingAging: aging?.n ?? 0,
+    pendingExpired: delPending.rowCount ?? 0,
+    mapExpired: delMap.rowCount ?? 0,
+    pendingFolded: delFolded.rowCount ?? 0,
+    pendingFoldAnomaly: foldAnomaly?.n ?? 0,
+    pendingUnreachableExpired: delUnreachable.rowCount ?? 0,
+    tapePartsPurged: delParts.rowCount ?? 0,
+  };
 }
