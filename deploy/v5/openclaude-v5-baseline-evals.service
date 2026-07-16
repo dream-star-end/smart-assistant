@@ -1,0 +1,18 @@
+# baseline 技能评测周期回归(agent 能力批债①)—— 由 openclaude-v5-baseline-evals.timer
+# 每周触发 scripts/v5-baseline-evals-weekly.sh:canary 账号全量跑带 evals 的平台技能,
+# 结果 JSONL 落 /var/lib/openclaude-v5/baseline-evals/,回归/失败经 admin_alert_outbox
+# 告警(warning 进企微),正常一条 info 周报进站内信。
+# 自监:脚本崩/超时/非 0 退出时 OnFailure 拉起 alert-fail 模板做 outbox+inbox 双写。
+[Unit]
+Description=OpenClaude v5 baseline skill evals weekly regression
+After=network.target postgresql.service openclaude-v5.service
+Wants=postgresql.service
+OnFailure=openclaude-v5-alert-fail@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-baseline-evals-weekly.sh
+TimeoutStartSec=14400
