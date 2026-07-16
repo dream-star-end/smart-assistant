@@ -100,14 +100,14 @@ async function openIncident(key = KEY): Promise<string> {
 async function insertRepair(
   incidentId: string,
   status: string,
-  opts: { verifyAfterOffsetMs?: number } = {},
+  opts: { verifyAfterOffsetMs?: number; tier?: string } = {},
 ): Promise<string> {
   const off = opts.verifyAfterOffsetMs ?? -2_000; // 默认 verify_after 在过去 → 观测天然新鲜
   const r = await query<{ id: string }>(
     `INSERT INTO codex_repairs (incident_id, status, attempt, tier, verify_after, verify_deadline, created_at, updated_at)
-     VALUES ($1::bigint, $2, 1, 'tier2', NOW() + ($3 || ' milliseconds')::interval, NOW() + interval '10 minutes', NOW(), NOW())
+     VALUES ($1::bigint, $2, 1, $4, NOW() + ($3 || ' milliseconds')::interval, NOW() + interval '10 minutes', NOW(), NOW())
      RETURNING id::text AS id`,
-    [incidentId, status, String(off)],
+    [incidentId, status, String(off), opts.tier ?? "tier2"],
   );
   return r.rows[0].id;
 }
@@ -211,5 +211,63 @@ describe("P5 drill policy seed(0155)", () => {
     assert.equal(r.rows[0].enabled, true);
     assert.equal(r.rows[0].auto_repair, false, "常态不派单——只有演练脚本持锁期间临时翻开");
     assert.equal(r.rows[0].user_notice_enabled, false, "演练绝不触达用户");
+  });
+});
+
+describe("批1a Tier1 执行路由", () => {
+  const EGRESS = "ops.monitor:svc_egress"; // 0156: tier1 + restart-v5-egress-v1
+
+  test("0156 seed:egress/disk policy = tier1 + opcode;其余 tier2 无 opcode", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const r = await query<{ match_key: string; execution_class: string; action_opcode: string | null }>(
+      `SELECT match_key, execution_class, action_opcode FROM incident_policies
+        WHERE match_key IN ('ops.monitor:svc_egress','ops.monitor:http_egress','ops.monitor:disk','ops.monitor:mail')
+        ORDER BY match_key`,
+    );
+    const by = Object.fromEntries(r.rows.map((x) => [x.match_key, x]));
+    assert.equal(by["ops.monitor:svc_egress"].execution_class, "tier1");
+    assert.equal(by["ops.monitor:svc_egress"].action_opcode, "restart-v5-egress-v1");
+    assert.equal(by["ops.monitor:http_egress"].action_opcode, "restart-v5-egress-v1");
+    assert.equal(by["ops.monitor:disk"].action_opcode, "clean-v5-disk-v1");
+    assert.equal(by["ops.monitor:mail"].execution_class, "tier2");
+    assert.equal(by["ops.monitor:mail"].action_opcode, null);
+  });
+
+  test("context 携带 executionClass+actionOpcode(执行侧冻结源)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const incidentId = await openIncident(EGRESS);
+    const repairId = await insertRepair(incidentId, "running", { tier: "tier1" });
+    const { getRepairContext } = await import("../selfheal/repairContext.js");
+    const ctx = await getRepairContext(repairId, { query });
+    assert.equal(ctx?.executionClass, "tier1");
+    assert.equal(ctx?.actionOpcode, "restart-v5-egress-v1");
+  });
+
+  test("probe 让位:tier1 repair 活跃(running)时不抢关 incident", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const incidentId = await openIncident(EGRESS);
+    await insertRepair(incidentId, "running", { tier: "tier1" }); // 动作执行中
+    // 动作重启服务后 monitor 抢先写 false:
+    await writeCondition(EGRESS, { mode: "probe", firing: false, level: "critical", snapshot: {} });
+    const r = await reconcileOnce(NOOP_DEPS);
+    assert.ok(!r.resolved.includes(EGRESS), "tier1 running 窗口内 probe 不能关(否则 machine done 409)");
+    const st = await query<{ status: string }>(`SELECT status FROM incidents WHERE id=$1::bigint`, [incidentId]);
+    assert.notEqual(st.rows[0].status, "resolved");
+  });
+
+  test("tier1 归因 source='auto'(区别 tier2 的 codex)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const incidentId = await openIncident(EGRESS);
+    const repairId = await insertRepair(incidentId, "verifying", { tier: "tier1" });
+    await writeCondition(EGRESS, { mode: "probe", firing: false, level: "critical", snapshot: {} });
+    await sweepRepairsOnce({ enqueueAlert: () => {} });
+    const fin = await query<{ istatus: string; source: string; rstatus: string }>(
+      `SELECT i.status AS istatus, i.resolve_source AS source, r.status AS rstatus
+         FROM incidents i JOIN codex_repairs r ON r.id=$2::bigint WHERE i.id=$1::bigint`,
+      [incidentId, repairId],
+    );
+    assert.equal(fin.rows[0].rstatus, "succeeded");
+    assert.equal(fin.rows[0].istatus, "resolved");
+    assert.equal(fin.rows[0].source, "auto", "tier1 确定性动作归因 auto");
   });
 });
