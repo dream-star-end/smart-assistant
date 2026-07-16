@@ -176,20 +176,21 @@ async function migrateLegacySkillInstalls(versionId: string): Promise<{
   migrated: number
   skippedExisting: number
 }> {
+  // 任意历史 Plugin 安装记录都代表迁移已发生；soft-uninstall 是用户意图，后续 deploy seed
+  // 不得因旧 Skill 仍 active 而静默恢复。用户仍可从市场显式重装同一版本。
   const rows = await query<{
     user_id: string
     agent_ids: unknown
     install_source: string
     installed_by: string
-    already_installed: boolean
+    already_migrated: boolean
   }>(
     `SELECT old.user_id::text, old.agent_ids, old.install_source,
             old.installed_by::text,
             EXISTS (
               SELECT 1 FROM marketplace_installs current
                WHERE current.user_id = old.user_id AND current.slug = $2
-                 AND current.uninstalled_at IS NULL
-            ) AS already_installed
+            ) AS already_migrated
        FROM marketplace_installs old
        JOIN marketplace_skill_listings legacy
          ON legacy.slug = old.slug AND legacy.kind = 'skill'
@@ -200,7 +201,7 @@ async function migrateLegacySkillInstalls(versionId: string): Promise<{
   let migrated = 0
   let skippedExisting = 0
   for (const row of rows.rows) {
-    if (row.already_installed) {
+    if (row.already_migrated) {
       skippedExisting++
       continue
     }

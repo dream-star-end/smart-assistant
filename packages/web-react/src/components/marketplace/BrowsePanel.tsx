@@ -83,6 +83,7 @@ function CardTile({
         <div className="flex flex-wrap items-center gap-1">
           {card.preset && <Badge tone="success">预设 · 开箱即用</Badge>}
           {card.preinstalled && <Badge tone="success">官方 · 已预装</Badge>}
+          {card.official && !card.preinstalled && <Badge tone="success">官方</Badge>}
           {canUpdate && <Badge tone="accent">可更新</Badge>}
           {catLabel && (
             <Badge tone="info">

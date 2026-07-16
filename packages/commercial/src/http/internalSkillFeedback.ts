@@ -97,6 +97,8 @@ export async function querySkillFeedbackRefs(
           AND e.layer = $3
           AND e.trace_id IS NOT NULL
           AND e.session_key IS NOT NULL
+          -- 有意不排除 tags 含 'implicit' 的隐式弱差评(中途打断/改写重发):它们正是
+          -- 差评驱动训练的燃料来源(方案 b);公开评分/满意度统计的排除口径见 responseRatings.ts。
           AND r.rating = 'down'
           AND r.created_at >= NOW() - make_interval(days => $4)
         ORDER BY e.session_key, r.created_at DESC

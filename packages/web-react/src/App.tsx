@@ -33,6 +33,7 @@ import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
 import { correctedScrollTop } from "./components/chat/archivePaging";
+import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks } from "./components/chat/cards";
 import {
   type RatingEntry,
@@ -65,6 +66,12 @@ import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
+import {
+  findRewriteTarget,
+  findStopTarget,
+  type ImplicitTarget,
+  isExpensiveTurn,
+} from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveConnBanner } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
@@ -154,6 +161,9 @@ function DialogFallback() {
 }
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
+
+/** 隐式负反馈的成因标签（随 implicit down 一并上报，仅供后端归因，用户不可见）。 */
+type ImplicitReason = "中途打断" | "改写重发";
 
 // 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
 //  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
@@ -261,6 +271,14 @@ export function App() {
   // 透传（与 sockRef 同样的 TDZ 规避；handler 本身是 useRepoBinding 的稳定 useCallback）。
   const repoStatusHandlerRef = useRef<(f: RepoStatusWire) => void>(() => {});
   const repoBindErrorHandlerRef = useRef<(f: RepoBindErrorWire) => void>(() => {});
+  // 隐式负反馈上报入口的稳定间接（与 sockRef 同款 TDZ 规避）：send/stopTurn 在
+  // sendImplicitRating 声明之前就要引用它，故经 ref 回填；回调本体在下方 useCallback 定义。
+  // 走 ref 而非直接入 deps → send/stopTurn 引用保持稳定（不被评价态/模型切换牵动重建）。
+  const sendImplicitRatingRef = useRef<
+    ((target: ImplicitTarget, opts: { reason: ImplicitReason }) => void) | null
+  >(null);
+  // 用户主动 Stop 的轮不做完成脉冲高亮：stopTurn 置位，sending 沿的 nudge effect 消费后清。
+  const stoppedTurnRef = useRef(false);
 
   // 本地会话消息存储（脚手架，仅 demo 路径用）：activeId → 消息数组。非 demo 走 WS + IndexedDB。
   const localStore = useRef<Map<string, Message[]>>(new Map());
@@ -454,6 +472,17 @@ export function App() {
       }
 
       if (!user) return;
+      // 隐式负反馈（改写重发）：发送前用**当前会话**的现有消息判定「5min 内高相似改写」——
+      // 命中即对被改写轮的末条 assistant 静默记 implicit down（空会话无历史 → 命中不了）。
+      // 现场取消息（sockRef.current === chat，稳定句柄）而非捕获每帧刷新的 wsMessages。
+      {
+        const rewriteTarget = findRewriteTarget(
+          sockRef.current?.getMessages(activeId) ?? [],
+          text,
+          Date.now(),
+        );
+        if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
+      }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
       let sessionId = activeId;
       let createdSession: Session | null = null;
@@ -1131,6 +1160,12 @@ export function App() {
       setBusy(false);
       setStreamText("");
     } else if (activeId) {
+      // 隐式负反馈（中途打断）：过秒停窗后 Stop → 对本轮末条 assistant 静默记 implicit down。
+      // 现场取消息（chat 已在依赖内），不捕获每帧刷新的 wsMessages。
+      const stopTarget = findStopTarget(chat.getMessages(activeId), Date.now());
+      if (stopTarget) sendImplicitRatingRef.current?.(stopTarget, { reason: "中途打断" });
+      // 本轮由用户主动打断 → 不做完成脉冲高亮（nudge effect 消费该标记后清）。
+      stoppedTurnRef.current = true;
       chat.stop(activeId);
     }
     setChatError(null);
@@ -1157,6 +1192,14 @@ export function App() {
   // 每条 AssistantCard 底部的 ResponseRatingCard。切会话/加载后由 GET 回读已评态填充（见下方
   // effect）；提交时乐观同步更新 + 静默 POST（维护期 503 / 限流 / 网络失败一律吞，不打断）。
   const [sessionRatings, setSessionRatings] = useState<Map<string, RatingEntry>>(() => new Map());
+  // 隐式负反馈上报去重：本会话运行内已隐式上报过的 messageId（切会话时清），防同一条重复 POST。
+  const implicitReportedRef = useRef<Set<string>>(new Set());
+  // 方案 a：高成本 turn 完成后对评分行做一次性脉冲高亮（4s）。nudgeId 经 ratingCtx 下发；
+  // 定时器走 ref 自管（不绑 effect cleanup，避免 sending/activeId 变更中途误清 → 高亮永驻）。
+  const [ratingNudgeId, setRatingNudgeId] = useState<string | null>(null);
+  const nudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // sending 沿检测：true→false（turn 完成）才评估是否高亮。
+  const prevSendingRef = useRef(sending);
   const onRateResponse = useCallback(
     (input: {
       messageId: string;
@@ -1190,6 +1233,34 @@ export function App() {
     },
     [demo, activeId, user, modelId],
   );
+  // 隐式负反馈静默上报（方案 b）：仅记 implicit down，**绝不碰 sessionRatings**（不渲染成
+  // 用户已选态）。两道跳过闸：① 用户已显式评过该条 → 尊重其表态不覆盖；② 本会话运行已隐式
+  // 上报过该 id → 幂等。tags=['implicit', reason] 供后端归因；503/限流/网络失败一律静默吞。
+  const sendImplicitRating = useCallback(
+    (target: ImplicitTarget, { reason }: { reason: ImplicitReason }) => {
+      if (demo || !user || !activeId) return;
+      const { messageId, traceId } = target;
+      if (sessionRatings.has(messageId)) return;
+      if (implicitReportedRef.current.has(messageId)) return;
+      implicitReportedRef.current.add(messageId);
+      void api
+        .submitResponseRating(authRef.current, {
+          messageId,
+          rating: "down",
+          sessionId: activeId,
+          traceId: traceId ?? undefined,
+          model: modelId,
+          tags: ["implicit", reason],
+        })
+        .catch(() => {
+          /* 静默：不弹错、不打断对话；隐式信号丢失可接受。*/
+        });
+    },
+    [demo, user, activeId, modelId, sessionRatings],
+  );
+  // 回填稳定间接（render 期赋值幂等，与 sockRef / repoStatusHandlerRef 同模式）——
+  // send/stopTurn 只经 ref 调用，故它们的引用不被本回调的重建牵动。
+  sendImplicitRatingRef.current = sendImplicitRating;
 
   // 逐条反馈（P6 反馈弹窗的占位接线）：暂以复制诊断串兜底（请求ID + 关联键），
   // 让用户/运维能立即把可追溯上下文交出去；P6 落地后替换为带上下文的反馈弹窗。
@@ -1265,6 +1336,13 @@ export function App() {
   const ratingsEnabled = !demo && !!user;
   useEffect(() => {
     setSessionRatings(new Map());
+    // 切会话：清隐式上报去重集 + 收起任何未散的评分脉冲高亮（旧 nudgeId 属上个会话）。
+    implicitReportedRef.current = new Set();
+    setRatingNudgeId(null);
+    if (nudgeTimerRef.current) {
+      clearTimeout(nudgeTimerRef.current);
+      nudgeTimerRef.current = null;
+    }
     if (!ratingsEnabled || !activeId) return;
     let cancelled = false;
     api
@@ -1288,9 +1366,56 @@ export function App() {
   }, [ratingsEnabled, activeId]);
 
   // 评价 Context 载荷:demo/未登录 → null（ResponseRatingCard 自渲 null，天然隐藏）。
+  // nudgeId 随载荷下发：nudge 卡作为 Context 消费者穿透 MessageRenderer sig-memo 重渲（同 ratings
+  // 机制，不改渲染签名）→ 命中的评分行加/去脉冲类，其余卡 nudgeId!==自身 id 不受影响。
   const ratingCtx: ResponseRatingCtx | null = useMemo(
-    () => (ratingsEnabled ? { ratings: sessionRatings, submit: onRateResponse } : null),
-    [ratingsEnabled, sessionRatings, onRateResponse],
+    () =>
+      ratingsEnabled
+        ? { ratings: sessionRatings, submit: onRateResponse, nudgeId: ratingNudgeId }
+        : null,
+    [ratingsEnabled, sessionRatings, onRateResponse, ratingNudgeId],
+  );
+
+  // 方案 a：sending true→false（本轮完成）沿检测 → 若为高成本 turn 且轮末条 assistant 未被评过，
+  // 点亮该条评分行做一次性脉冲高亮引导（4s 自动熄灭）。用户主动 Stop 的轮不高亮（stoppedTurnRef）。
+  // 走 sockRef.current（稳定句柄，同 chat）现场取消息，deps 不含每帧翻新的 chat 引用。
+  useEffect(() => {
+    const wasSending = prevSendingRef.current;
+    prevSendingRef.current = sending;
+    if (!wasSending || sending) return; // 仅 true→false 沿动作
+    if (stoppedTurnRef.current) {
+      stoppedTurnRef.current = false; // 消费"本轮被主动打断"标记 → 不高亮
+      return;
+    }
+    if (demo || !activeId) return;
+    const msgs = sockRef.current?.getMessages(activeId) ?? [];
+    if (!isExpensiveTurn(msgs)) return;
+    // 轮末条 assistant 正文 = 评价行唯一落点（turnFinalAssistantFlags 最后一个 true）。
+    const flags = turnFinalAssistantFlags(msgs);
+    let idx = -1;
+    for (let i = flags.length - 1; i >= 0; i--) {
+      if (flags[i]) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) return;
+    const id = msgs[idx]?.id;
+    if (!id || sessionRatings.has(id)) return; // 已显式评过 → 不打扰
+    if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
+    setRatingNudgeId(id);
+    nudgeTimerRef.current = setTimeout(() => {
+      setRatingNudgeId(null);
+      nudgeTimerRef.current = null;
+    }, 4000);
+  }, [sending, demo, activeId, sessionRatings]);
+
+  // 卸载兜底：清未散的脉冲定时器，防泄漏。
+  useEffect(
+    () => () => {
+      if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
+    },
+    [],
   );
 
   // autoscroll 根治(两个对称 bug 一次收口):
