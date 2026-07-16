@@ -37,7 +37,7 @@ const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_
 const MIGRATION_0078 = path.resolve(here, "../db/migrations/0078_wechat_outbox_backoff_hol.sql");
 const MIGRATION_0134 = path.resolve(here, "../db/migrations/0134_sessions_master_pg.sql");
 const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_tapes.sql");
-const MIGRATION_0156 = path.resolve(here, "../db/migrations/0156_lossless_runtime_batches.sql");
+const MIGRATION_0157 = path.resolve(here, "../db/migrations/0157_lossless_runtime_batches.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -77,7 +77,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0078, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0134, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
-  await pool.query(await readFile(MIGRATION_0156, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0157, { encoding: "utf8" }));
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
     `INSERT INTO sessions_store_migration_state (singleton, authority, generation, cutover_id, source_digest, completed_at)

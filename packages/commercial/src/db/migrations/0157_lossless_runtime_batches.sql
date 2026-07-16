@@ -1,4 +1,4 @@
--- 0156_lossless_runtime_batches — distinguish compressed physical tape rows.
+-- 0157_lossless_runtime_batches — distinguish compressed physical tape rows.
 --
 -- Existing and rolling writers remain format 2. A new master sets format 3
 -- only when it materialises `_runtimeEventBatch` records. Deploy/rollback

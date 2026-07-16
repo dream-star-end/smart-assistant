@@ -1465,7 +1465,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
-    assert.ok(meta.requiredMigrations.includes('0156_lossless_runtime_batches'))
+    assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)

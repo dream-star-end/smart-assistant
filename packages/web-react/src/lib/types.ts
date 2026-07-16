@@ -909,8 +909,9 @@ export type MarketplaceCard = {
   installCount?: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
-  /** 官方默认连接器：平台预装，无 install/uninstall。 */
+  /** 平台验证的官方身份；不等于预装，官方 Plugin 仍可能需要用户安装。 */
   official?: boolean;
+  /** 官方默认连接器：平台预装，无 install/uninstall。 */
   preinstalled?: boolean;
   /** 发布者自报评测摘要(仅有数据时渲染徽记;展示须标注"发布者提供·未经平台验证")。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
@@ -978,7 +979,10 @@ export type MarketplaceDetail = {
   installCount: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
+  /** 平台验证的官方身份；不等于预装。 */
   official?: boolean;
+  /** 精确平台默认 Plugin：开箱即用，无 install/uninstall。 */
+  preinstalled?: boolean;
   connectorContract?: {
     authMode: string;
     approvedOrigins: string[];

@@ -289,7 +289,7 @@ describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
       LOSSLESS_TURN_TAPE_CAPABILITY,
     ]);
     assert.ok(meta.requiredMigrations.includes("0143_model_catalog"));
-    assert.ok(meta.requiredMigrations.includes("0156_lossless_runtime_batches"));
+    assert.ok(meta.requiredMigrations.includes("0157_lossless_runtime_batches"));
   });
 
   test("cutover marker 置位 + flag 关 → 拒启(不可逆地板);其余组合放行", () => {

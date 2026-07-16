@@ -540,6 +540,85 @@ test("信号徽章:旧后端缺字段 → 不渲染 usage/rating,仅保留安装
   expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
 });
 
+test("官方但非预装的 Plugin 仍显示安装按钮并可恢复安装", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({
+      slug: "knowledge-planet",
+      kind: "connector",
+      artifactKind: "plugin",
+      pluginType: "managed-browser",
+      name: "知识星球",
+      versionId: "1606",
+      official: true,
+      preinstalled: false,
+    }),
+  );
+  listMyAgents.mockResolvedValue([]);
+  installMarketplace.mockResolvedValue({
+    ok: true,
+    slug: "knowledge-planet",
+    kind: "connector",
+    artifactKind: "plugin",
+    pluginType: "managed-browser",
+    version: "1.0.0",
+    installedDeps: 0,
+    installedCapabilities: [],
+    skippedOptional: [],
+    needsAuthorization: [],
+    ready: false,
+    note: "installed",
+  });
+  const onInstalled = vi.fn();
+
+  render(
+    <DetailModal
+      slug="knowledge-planet"
+      auth={auth}
+      onClose={() => {}}
+      onInstalled={onInstalled}
+    />,
+  );
+
+  const install = await screen.findByRole("button", { name: "安装" });
+  expect(screen.queryByText(/已预装/)).not.toBeInTheDocument();
+  fireEvent.click(install);
+  expect(await screen.findByText("安装成功")).toBeInTheDocument();
+  expect(installMarketplace).toHaveBeenCalledWith(auth, "1606", undefined);
+  expect(onInstalled).toHaveBeenCalledTimes(1);
+});
+
+test("精确预装 Plugin 不提供市场安装，只引导到管理中心", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({
+      slug: "notion",
+      kind: "connector",
+      artifactKind: "plugin",
+      pluginType: "declarative-http",
+      name: "Notion",
+      official: true,
+      preinstalled: true,
+    }),
+  );
+  listMyAgents.mockResolvedValue([]);
+  const openConnectors = vi.fn();
+
+  render(
+    <DetailModal
+      slug="notion"
+      auth={auth}
+      onClose={() => {}}
+      onInstalled={() => {}}
+      onOpenConnectors={openConnectors}
+    />,
+  );
+
+  expect(await screen.findByText("官方 API 插件 · 已预装")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "安装" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "去绑定账号" }));
+  expect(openConnectors).toHaveBeenCalledTimes(1);
+  expect(installMarketplace).not.toHaveBeenCalled();
+});
+
 test.each([
   ["ai", /AI 自动审核/, /管理员人工审核/],
   ["manual", /管理员人工审核/, /AI 自动审核/],

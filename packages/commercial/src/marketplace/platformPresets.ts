@@ -12,6 +12,7 @@
  * slug 权威 = seedPlatformAgents 的定义(同源导出),不在此重复列举。
  */
 import { getResearchConfigPublic } from '../admin/researchConfig.js'
+import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
 import {
   type ApprovedSearchRow,
   type ArtifactKind,
@@ -43,16 +44,18 @@ export function isPresetCandidateSlug(slug: string): boolean {
 }
 
 /**
- * 市场浏览/搜索目录的**单一权威**:approved catalog 去掉平台预设 agent。
+ * 市场浏览/搜索目录的**单一权威**:approved catalog 去掉无需安装的平台预置能力。
  *
- * 预设(编程/办公/科研)是"免安装、开箱即用"的,不该出现在市场发现里(与"发现→安装"
- * 语义冲突 + 冗余)。市场有两个搜索面——浏览器 `/api/marketplace/search`(BrowsePanel)
- * 与容器 AI `/internal/v3/marketplace/agent/search`(oc-market skill)——**都走此函数**,
- * 保证一处收口;以后再加市场搜索端点复用它即可,不会漏过滤。
+ * 平台预设 agent(编程/办公/科研)与默认 Plugin 都是"免安装、开箱即用"的,不该出现在
+ * 市场发现里(与"发现→安装"语义冲突 + 冗余)。默认 Plugin 必须按 slug + artifactHash
+ * 精确判断；`official` 还包括知识星球等需要用户安装的官方 Plugin，不能拿来过滤。
+ * 市场有两个搜索面——浏览器 `/api/marketplace/search`(BrowsePanel)与容器 AI
+ * `/internal/v3/marketplace/agent/search`(oc-market skill)——**都走此函数**,保证一处收口；
+ * 以后再加市场搜索端点复用它即可,不会漏过滤。
  *
  * 注意与 `listApprovedForSearch`(=全部 approved,含预设)语义区分:后者是"上架事实"
  * (seed/install/detail 依赖它,预设本就在架),此函数是"市场对外可见目录"。
- * presetSet 仅 agent 类非空(平台预设都是 agent);skill / v3 渠道原样透传。
+ * skill 原样透传；connector 只剔除精确默认工件，官方但非预装的 Plugin 仍可发现/安装。
  *
  * callerOrgId(企业版 P3.1):透传给 listApprovedForSearch 做 org 可见性收口——org-private
  * listing 只对本 org 成员出现在浏览/搜索目录。null = 仅公开(v3 及无 org 归属者)。
@@ -62,6 +65,8 @@ export async function listMarketBrowseCatalog(
   callerOrgId: CallerOrgId = null,
 ): Promise<ApprovedSearchRow[]> {
   const rows = await listApprovedForSearch(kind, callerOrgId)
+  if (kind === 'connector')
+    return rows.filter((row) => !isDefaultConnectorArtifact(row.slug, row.artifactHash))
   if (kind !== 'agent') return rows
   const presetSet = new Set(await platformPresetAgentSlugs())
   return presetSet.size > 0 ? rows.filter((r) => !presetSet.has(r.slug)) : rows

@@ -113,6 +113,7 @@ export interface RepairSweepResult {
 interface VerifyingRow {
   id: string;
   incident_id: string;
+  tier: string;
   verify_after: Date | null;
   verify_deadline: Date | null;
   firing: boolean | null;
@@ -156,7 +157,7 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
   // ② verify freshness fence:verifying 修复只有 observed_at>verify_after 的新观测有裁决资格。
   try {
     const vr = await query<VerifyingRow>(
-      `SELECT r.id::text AS id, r.incident_id::text AS incident_id,
+      `SELECT r.id::text AS id, r.incident_id::text AS incident_id, r.tier,
               r.verify_after, r.verify_deadline, c.firing, c.observed_at
          FROM codex_repairs r
          JOIN incidents i ON i.id = r.incident_id
@@ -171,7 +172,9 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
         const fresh = verifyAfter !== null && observedAt !== null && observedAt > verifyAfter;
         const deadlinePassed = row.verify_deadline !== null && nowMs > row.verify_deadline.getTime();
         if (fresh && row.firing === false) {
-          // 新观测探测已过 → 修复成功 + resolve incident(source='codex')。
+          // 新观测探测已过 → 修复成功 + resolve incident。归因按 tier:
+          // tier1 确定性运维动作=source='auto';tier2 代码修复=source='codex'。
+          const resolveSource = row.tier === "tier1" ? "auto" : "codex";
           const done = await tx(async (client: PoolClient) => {
             const cas = await client.query(
               `UPDATE codex_repairs SET status='succeeded', finished_at=NOW(), updated_at=NOW()
@@ -180,7 +183,7 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
             );
             if ((cas.rowCount ?? 0) === 0) return false;
             await appendRepairEvent(client, row.id, "note", "探测确认已恢复,修复成功");
-            await resolveIncident(row.incident_id, "codex", client);
+            await resolveIncident(row.incident_id, resolveSource, client);
             return true;
           });
           if (done) out.succeeded++;
@@ -304,12 +307,21 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
       [ACTIVE_REPAIR_STATUSES as unknown as string[]],
     );
     if (active.rows.length === 0) {
+      // 派单优先级(P4):critical(及等待>2h 的 warning 提级)先派,同级按最老。
+      // 保留"顺序尝试所有候选"不 LIMIT——熔断/冷却挡住的候选不能挡住后续事故。
       const cand = await query<{ id: string }>(
         `SELECT i.id::text AS id
            FROM incidents i JOIN incident_policies p ON p.id = i.policy_id
           WHERE i.status IN ('open','repairing')
             AND p.auto_repair = TRUE AND p.enabled = TRUE
-          ORDER BY i.opened_at ASC`,
+          ORDER BY
+            CASE
+              WHEN i.severity = 'critical'
+                OR (i.severity = 'warning' AND i.opened_at < NOW() - INTERVAL '2 hours') THEN 0
+              WHEN i.severity = 'warning' THEN 1
+              ELSE 2
+            END,
+            i.opened_at ASC, i.id ASC`,
       );
       for (const c of cand.rows) {
         const r = await dispatchRepair(c.id, { query, tx, now, logger: log });
