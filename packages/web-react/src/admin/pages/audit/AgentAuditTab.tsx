@@ -46,6 +46,13 @@ interface AgentAuditFailureGroup {
   p50_ms: number | null;
   p95_ms: number | null;
 }
+interface AgentAuditToolRate {
+  tool: string;
+  success_calls: number;
+  failure_calls: number;
+  total_calls: number;
+  failure_rate: number | null;
+}
 interface AgentAuditStats {
   window: StatsWindow;
   rollup: {
@@ -53,6 +60,7 @@ interface AgentAuditStats {
     failure_calls: number;
     total_calls: number;
     failure_rate: number | null;
+    tools: AgentAuditToolRate[];
   };
   coverage: {
     scope: "current_online_fleet";
@@ -324,6 +332,39 @@ export function AgentAuditTab() {
     },
   ];
 
+  const toolRateColumns: Column<AgentAuditToolRate>[] = [
+    {
+      key: "tool",
+      title: "工具",
+      render: (row) => <Badge tone="accent">{row.tool}</Badge>,
+    },
+    {
+      key: "success_calls",
+      title: "成功",
+      align: "right",
+      cellClassName: "tabular-nums",
+      render: (row) => formatCount(row.success_calls),
+    },
+    {
+      key: "failure_calls",
+      title: "失败",
+      align: "right",
+      cellClassName: "tabular-nums",
+      render: (row) => formatCount(row.failure_calls),
+    },
+    {
+      key: "failure_rate",
+      title: "失败率",
+      align: "right",
+      cellClassName: "tabular-nums",
+      render: (row) => (
+        <span className={row.failure_rate && row.failure_rate > 0.05 ? "text-warning" : "text-muted"}>
+          {formatRate(row.failure_rate)}
+        </span>
+      ),
+    },
+  ];
+
   const groupColumns: Column<AgentAuditFailureGroup>[] = [
     {
       key: "tool",
@@ -467,6 +508,22 @@ export function AgentAuditTab() {
           统计加载失败：{apiErrorMessage(statsError, "加载失败")}
         </p>
       )}
+
+      <div>
+        <h3 className="text-[13px] font-semibold text-fg">按工具成败率</h3>
+        <p className="mt-0.5 text-[12px] text-faint">
+          成功/失败均来自容器侧聚合上报；失败明细流只含失败,不能直接当失败率看。
+        </p>
+      </div>
+
+      <DataTable
+        columns={toolRateColumns}
+        rows={stats?.rollup.tools ?? []}
+        rowKey={(row) => row.tool}
+        loading={statsLoading && !stats}
+        emptyTitle="当前窗口暂无聚合上报"
+        emptyHint="容器侧聚合按窗口批量上报,稍后再试。"
+      />
 
       <div className="flex items-end justify-between gap-3">
         <div>
