@@ -402,7 +402,18 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     }
   }
   if (skillList.length === 0) return null
-  const top = skillList.slice(0, 15)
+  // 注入菜单排序:用户自建技能永远靠前(通常少而高相关),平台技能按 frontmatter
+  // priority 降序补位 —— 取代纯字母序截断(曾把 office 套件/web-context 等高频
+  // 技能全部截出前 15,模型只能靠 skill_search 盲找)。同优先级内保持字母序稳定。
+  const rank = (s: (typeof skillList)[number]) => s.priority ?? 0
+  const sorted = [...skillList].sort((a, b) => {
+    const userA = a.source !== 'platform' ? 1 : 0
+    const userB = b.source !== 'platform' ? 1 : 0
+    if (userA !== userB) return userB - userA
+    if (rank(a) !== rank(b)) return rank(b) - rank(a)
+    return a.name.localeCompare(b.name)
+  })
+  const top = sorted.slice(0, 15)
   const lines = [
     `# Skills (${skillList.length})`,
     '',
