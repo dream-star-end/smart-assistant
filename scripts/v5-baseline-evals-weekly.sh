@@ -26,6 +26,9 @@ DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
 
 # 告警管道:与 v5-monitor.sh 的 fanout_alert 同构(psql 直插共享 SQL 模板)。
 # 失败只记日志绝不阻断 —— 回归结果本身还有 JSONL + journal 留痕。
+# ⚠️ shell fanout 路径没有 TS enqueueAlert 的"零通道→inbox 兜底":info 级匹配不到
+# 任何通道(企微 severity_min=warning)会静默零投递,所以站内信必须由 inbox_notice
+# 直插(对齐 v5-daily-check.sh 日报惯例,uid=1)。
 fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
   if [ -z "$DBURL" ]; then log "FANOUT-SKIP no DATABASE_URL event=$1"; return 0; fi
   if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP no $FANOUT_SQL event=$1"; return 0; fi
@@ -39,6 +42,17 @@ fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_
   fi
 }
 
+BOSS_UID="${OC_EVAL_BOSS_UID:-1}"
+inbox_notice() { # <level info|warning> <title> <body>
+  if [ -z "$DBURL" ]; then log "INBOX-SKIP no DATABASE_URL"; return 0; fi
+  if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+       -v lvl="$1" -v title="$2" -v body="$3" -v uid="$BOSS_UID" <<'SQL' >/dev/null 2>&1
+INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
+VALUES ('user', :'uid'::bigint, :'title', :'body', :'lvl', :'uid'::bigint);
+SQL
+  then log "INBOX-OK $2"; else log "INBOX-FAIL $2"; fi
+}
+
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   log "另一轮 baseline 评测仍在运行(锁被占),本轮跳过"
@@ -49,6 +63,8 @@ if [ ! -r "$CANARY_PW_FILE" ]; then
   fanout_alert baseline_evals warning "baseline-evals:cred" \
     "baseline 评测:canary 凭据缺失" \
     "读不到 $CANARY_PW_FILE,周期回归无法运行。重置 canary(uid=247)密码并写入该文件。" '{}'
+  inbox_notice warning "baseline 评测:canary 凭据缺失" \
+    "读不到 $CANARY_PW_FILE,周期回归无法运行。重置 canary(uid=247)密码并写入该文件。"
   exit 1
 fi
 
@@ -122,24 +138,22 @@ report="$(echo "$summary" | python3 -c 'import sys,json;print(json.load(sys.stdi
 problems_txt="$(echo "$summary" | python3 -c 'import sys,json;print("\n".join(json.load(sys.stdin)["problems"]))')"
 
 if [ "$run_rc" -ne 0 ] || [ "$problems_n" -gt 0 ]; then
-  fanout_alert baseline_evals warning "baseline-evals:$STAMP" \
-    "baseline 技能评测回归异常($problems_n 项)" \
-    "$problems_txt
+  body="$problems_txt
 
 完整结果:kl-mirror $RESULTS_FILE
-$report" \
+$report"
+  fanout_alert baseline_evals warning "baseline-evals:$STAMP" \
+    "baseline 技能评测回归异常($problems_n 项)" "$body" \
     "{\"rc\":$run_rc,\"problems\":$problems_n}"
+  inbox_notice warning "baseline 技能评测回归异常($problems_n 项)" "$body"
   log "回归异常 rc=$run_rc problems=$problems_n"
   # 告警已自行送达 → 单元按"完成职责"退 0;非零留给"没能自行报告"的崩溃/超时,
   # 那才轮到 OnFailure=alert-fail 兜底,避免同一事件双告警。
   exit 0
 fi
 
-fanout_alert baseline_evals info "baseline-evals:$STAMP" \
-  "baseline 技能评测周报:全部正常" \
-  "$report
+inbox_notice info "baseline 技能评测周报:全部正常" "$report
 
-结果:kl-mirror $RESULTS_FILE" \
-  "{\"rc\":0,\"problems\":0}"
+结果:kl-mirror $RESULTS_FILE"
 log "回归完成,全部正常"
 exit 0
