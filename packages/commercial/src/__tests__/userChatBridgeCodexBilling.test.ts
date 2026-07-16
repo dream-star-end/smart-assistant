@@ -299,10 +299,17 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("SELECT EXISTS(") && trimmed.includes("FROM usage_records")) {
         return { rows: [{ present: false }], rowCount: 1 };
       }
-      if (trimmed.startsWith("SELECT COALESCE(") && trimmed.includes("AS attribution_credits")) {
+      if (
+        trimmed.startsWith("SELECT usage_records.id::text AS id") &&
+        trimmed.includes("AS attribution_credits")
+      ) {
         const requestId = String((params as unknown[])[1]);
         return {
-          rows: [{ attribution_credits: attributionCredits.get(requestId) ?? null }],
+          rows: [{
+            id: "100",
+            ledger_id: "200",
+            attribution_credits: attributionCredits.get(requestId) ?? null,
+          }],
           rowCount: 1,
         };
       }

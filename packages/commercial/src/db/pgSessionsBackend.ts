@@ -219,6 +219,63 @@ export async function stageUsageCostLocatorInBillingTransaction(
   }
 }
 
+export interface SettledUsageAttribution {
+  usageId: bigint;
+  ledgerId: bigint | null;
+  attributionCredits: bigint | null;
+}
+
+/**
+ * Read the immutable settlement proof together with its lossless-turn cost
+ * locator. This query belongs to the PG sessions backend because the locator
+ * can be in either pending_usage_patches or its folded tape component.
+ *
+ * The runner may be the caller's PoolClient after a 23505 rollback, or a fresh
+ * Pool checkout used to prove an indeterminate COMMIT. The outer usage_records
+ * table intentionally stays unaliased: besides keeping the query simple, this
+ * preserves the long-standing fault-injection matcher used by finalizer tests.
+ */
+export async function loadSettledUsageAttribution(
+  runner: Pool | PoolClient,
+  userId: bigint,
+  requestId: string,
+): Promise<SettledUsageAttribution | null> {
+  const storageUserId = `c:${userId.toString()}`;
+  const row = (await runner.query<{
+    id: string;
+    ledger_id: string | null;
+    attribution_credits: string | null;
+  }>(
+    `SELECT usage_records.id::text AS id,
+            usage_records.ledger_id::text AS ledger_id,
+            COALESCE(
+              (SELECT p.cost_credits FROM pending_usage_patches p
+                WHERE p.user_id=$3 AND p.request_id=usage_records.request_id),
+              (SELECT c.cost_credits::text FROM turn_tape_cost_components c
+                WHERE c.user_id=$3 AND c.request_id=usage_records.request_id)
+            ) AS attribution_credits
+       FROM usage_records WHERE user_id=$1 AND request_id=$2`,
+    [userId.toString(), requestId, storageUserId],
+  )).rows[0];
+  if (!row) return null;
+  return {
+    usageId: BigInt(row.id),
+    ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
+    attributionCredits:
+      row.attribution_credits == null ? null : BigInt(row.attribution_credits),
+  };
+}
+
+/** Read only the exact debit attribution used by durable bridge repair. */
+export async function loadUsageAttributionCredits(
+  runner: Pool | PoolClient,
+  userId: bigint,
+  requestId: string,
+): Promise<bigint | null> {
+  return (await loadSettledUsageAttribution(runner, userId, requestId))
+    ?.attributionCredits ?? null;
+}
+
 // 竞态回滚哨兵:upsert 在事务内发现 ON CONFLICT WHERE 被并发写拒(rowCount===0,新建同名
 // 会话的竞态,FOR UPDATE 锁不住尚不存在的行)时,抛此哨兵 → withTx ROLLBACK(撤销已做的
 // spill 归档 INSERT)→ 外层 catch 映射为 'rejected_stale'。复用同一实例(重复抛无副作用),
