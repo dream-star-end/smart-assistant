@@ -202,13 +202,44 @@ export async function resolveIncident(
   source: ResolveSource,
   client: PoolClient,
 ): Promise<ResolveIncidentResult> {
+  return resolveIncidentGuarded(incidentId, source, client, false);
+}
+
+/**
+ * probe 专用 resolve:condition 翻 false 且**无 verifying repair** 时才收口。
+ * verifying 是 codex 归因的裁决窗口——sweeper 在同一事务里做
+ * `repair=succeeded + resolveIncident(source='codex')`;probe 在窗口内抢先
+ * resolve 会把自愈成功永久记成 probe 恢复(incident.resolve_source 是归因与
+ * 0137 用户通知门的读取源)。守卫必须钉在同一条 UPDATE 里:先 SELECT 判
+ * verifying 再 UPDATE 是 TOCTOU——判定与 resolve 之间 repair 可能刚进
+ * verifying。CAS 落空不是错误:repair 离开 verifying(succeeded 路径 sweeper
+ * 已同事务 resolve;failed/inconclusive 终态后行不再 verifying)后,下一轮
+ * reconciler 的 probe resolve 自然收口,无死锁。
+ * admin/suppression/codex 路径不走本函数(admin 收口必须能压过 verifying)。
+ */
+export async function resolveIncidentByProbe(
+  incidentId: string,
+  client: PoolClient,
+): Promise<ResolveIncidentResult> {
+  return resolveIncidentGuarded(incidentId, "probe", client, true);
+}
+
+async function resolveIncidentGuarded(
+  incidentId: string,
+  source: ResolveSource,
+  client: PoolClient,
+  skipWhileVerifying: boolean,
+): Promise<ResolveIncidentResult> {
   const r = await client.query<{ rev: string }>(
     `UPDATE incidents
         SET status = 'resolved', resolved_at = NOW(), resolve_source = $2,
             rev = rev + 1, updated_at = NOW()
       WHERE id = $1::bigint AND status <> 'resolved'
+        AND ($3::boolean = FALSE OR NOT EXISTS (
+              SELECT 1 FROM codex_repairs r
+               WHERE r.incident_id = incidents.id AND r.status = 'verifying'))
       RETURNING rev::text AS rev`,
-    [incidentId, source],
+    [incidentId, source, skipWhileVerifying],
   );
   if (r.rows.length === 0) return { resolved: false, rev: 0 };
   const rev = Number(r.rows[0].rev);
