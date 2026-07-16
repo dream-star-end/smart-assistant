@@ -3675,6 +3675,33 @@ wait_for_egress_release_ready() { # <expected-release> <require-authority-cap:0|
   return 1
 }
 
+# Official managed-browser Plugin publication is a deploy-time operation, never a
+# gateway-startup side effect. The pre-activation gate exercises the exact pinned
+# runtime image and real QR flow without touching the DB; only after the new master
+# passes its normal smoke do we atomically publish/approve and additively migrate
+# legacy Knowledge Planet Skill users.
+knowledge_planet_plugin_smoke_gate() { # <pinned master release>
+  local release="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] exact-image Knowledge Planet QR smoke @ $release (DB zero-write)"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
+}
+
+knowledge_planet_plugin_seed() { # <active master release>
+  local release="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] verify smoke evidence → official Plugin seed + additive legacy Skill migration @ $release"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --seed-only"
+}
+
 activate_egress_release() {
   local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps require_cap=0
   if [[ "$DRY" == 1 ]]; then
@@ -3752,6 +3779,9 @@ deploy() {
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
+  echo "── Knowledge Planet Plugin:exact-image QR 预激活门(DB 零写入)──"
+  knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
+    || { echo "✗ Knowledge Planet Plugin QR smoke 失败,未激活新 release" >&2; exit 1; }
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
@@ -3781,6 +3811,9 @@ deploy() {
   if [[ "$WITH_DIST" == 1 ]]; then
     dist_handshake_smoke "$ACTIVE_PORT"
   fi
+  echo "── Knowledge Planet Plugin:官方发布 + 旧 Skill 加法迁移──"
+  knowledge_planet_plugin_seed "$BUILT_RELEASE" \
+    || { echo "✗ Knowledge Planet Plugin 发布/迁移失败" >&2; exit 1; }
   end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)

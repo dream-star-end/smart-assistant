@@ -1,6 +1,6 @@
-import { ArrowUpCircle, Check, ExternalLink, Pencil, Store, Trash2, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ApiError, api, apiErrorMessage } from "../../lib/api";
+import { ArrowUpCircle, Check, ExternalLink, Pencil, QrCode, Store, Trash2, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ApiError, api, apiErrorMessage } from '../../lib/api'
 import {
   type ConnectorConnection,
   type ConnectorFormField,
@@ -10,6 +10,10 @@ import {
   type DeclarativeConnection,
   type DeclarativeManagementConnector,
   type DeclarativeManagementResponse,
+  type KnowledgePlanetSetupView,
+  type PluginManagementResponse,
+  type RuntimePluginAccount,
+  type RuntimePluginCatalogEntry,
   bindFieldMeta,
   connectorCapabilityLabel,
   connectorErrorText,
@@ -69,16 +73,19 @@ export function ConnectorsTab({
   auth: AuthSession;
   onOpenMarketplace?: () => void;
 }) {
-  const [data, setData] = useState<ConnectorsResponse | null>(null);
-  const [declConnections, setDeclConnections] = useState<DeclarativeConnection[]>([]);
-  const [management, setManagement] = useState<DeclarativeManagementConnector[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
+  const [data, setData] = useState<ConnectorsResponse | null>(null)
+  const [declConnections, setDeclConnections] = useState<DeclarativeConnection[]>([])
+  const [management, setManagement] = useState<DeclarativeManagementConnector[]>([])
+  const [runtimeCatalog, setRuntimeCatalog] = useState<RuntimePluginCatalogEntry[]>([])
+  const [runtimeAccounts, setRuntimeAccounts] = useState<RuntimePluginAccount[]>([])
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState<string | null>(null)
   /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
   const [bindFor, setBindFor] = useState<ConnectorProvider | null>(null);
   /** 打开声明式绑定弹层的 catalog 条目。 */
-  const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null);
-  const [confirm, confirmEl] = useConfirm();
+  const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null)
+  const [setupRuntimeFor, setSetupRuntimeFor] = useState<RuntimePluginCatalogEntry | null>(null)
+  const [confirm, confirmEl] = useConfirm()
 
   const reload = useCallback(() => {
     let alive = true;
@@ -87,15 +94,21 @@ export function ConnectorsTab({
     const managementP: Promise<DeclarativeManagementResponse> = api
       .getDeclarativeManagement(auth)
       .catch((e) => {
-        console.warn("[connectors] 管理聚合加载失败，降级仅显示 v1 连接器", e);
-        return { connectors: [], connections: [] };
-      });
-    Promise.all([api.getConnectors(auth), managementP])
-      .then(([d, managed]) => {
-        if (!alive) return;
-        setData(d);
-        setManagement(managed.connectors);
-        setDeclConnections(managed.connections);
+        console.warn('[connectors] 管理聚合加载失败，降级仅显示 v1 连接器', e)
+        return { connectors: [], connections: [] }
+      })
+    const runtimeP: Promise<PluginManagementResponse> = api.getPluginManagement(auth).catch((e) => {
+      console.warn('[plugins] 运行时 Plugin 管理加载失败，降级显示现有连接器', e)
+      return { catalog: [], accounts: [] }
+    })
+    Promise.all([api.getConnectors(auth), managementP, runtimeP])
+      .then(([d, managed, runtime]) => {
+        if (!alive) return
+        setData(d)
+        setManagement(managed.connectors)
+        setDeclConnections(managed.connections)
+        setRuntimeCatalog(runtime.catalog)
+        setRuntimeAccounts(runtime.accounts)
       })
       .catch((e) => {
         // 仅 v1 会 reject 到此（声明式已各自 catch 降级）。
@@ -281,6 +294,61 @@ export function ConnectorsTab({
     [auth, confirm, reload],
   );
 
+  const revokeRuntimeAccount = useCallback(
+    async (account: RuntimePluginAccount) => {
+      const name = account.displayName || account.accountHint || account.provider
+      const ok = await confirm({
+        title: `解绑「${name}」?`,
+        body: '解绑后 Plugin 将立即无法访问该账号，加密保存的登录状态会被销毁。此操作不可撤销。',
+        confirmText: '解绑',
+        danger: true,
+      })
+      if (!ok) return
+      try {
+        await api.revokePluginAccount(auth, account.id)
+        reload()
+      } catch (e) {
+        setErr(errText(e, '解绑 Plugin 账号失败'))
+      }
+    },
+    [auth, confirm, reload],
+  )
+
+  const updateRuntimePlugin = useCallback(
+    async (plugin: RuntimePluginCatalogEntry, accountCount: number) => {
+      if (!plugin.latestVersionId || !plugin.updateAvailable || accountCount > 0) return
+      setErr(null)
+      try {
+        await api.installMarketplace(auth, plugin.latestVersionId)
+        reload()
+      } catch (e) {
+        setErr(errText(e, plugin.installed ? '更新 Plugin 失败' : '重新安装 Plugin 失败'))
+      }
+    },
+    [auth, reload],
+  )
+
+  const uninstallRuntimePlugin = useCallback(
+    async (plugin: RuntimePluginCatalogEntry, accountCount: number) => {
+      if (!plugin.installed || accountCount > 0) return
+      const ok = await confirm({
+        title: `卸载 Plugin「${plugin.label}」?`,
+        body: '卸载后不能再执行该 Plugin；以后仍可从 AI 市场重新安装。',
+        confirmText: '卸载',
+        danger: true,
+      })
+      if (!ok) return
+      setErr(null)
+      try {
+        await api.uninstallMarketplace(auth, plugin.slug)
+        reload()
+      } catch (e) {
+        setErr(errText(e, '卸载 Plugin 失败'))
+      }
+    },
+    [auth, confirm, reload],
+  )
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
@@ -314,6 +382,20 @@ export function ConnectorsTab({
       </div>
 
       <div className="flex flex-col gap-3 px-5 py-4">
+        {runtimeCatalog.map((plugin) => {
+          const accounts = runtimeAccounts.filter((account) => account.provider === plugin.slug)
+          return (
+            <RuntimePluginCard
+              key={plugin.slug}
+              plugin={plugin}
+              accounts={accounts}
+              onAuthorize={() => setSetupRuntimeFor(plugin)}
+              onUpdate={() => void updateRuntimePlugin(plugin, accounts.length)}
+              onUninstall={() => void uninstallRuntimePlugin(plugin, accounts.length)}
+              onRevoke={(account) => void revokeRuntimeAccount(account)}
+            />
+          )
+        })}
         {unified.map((u) => (
           <ProviderCard
             key={u.slug}
@@ -350,7 +432,7 @@ export function ConnectorsTab({
             onRelink={(c) => relink(u, c)}
           />
         ))}
-        {data && unified.length === 0 && (
+        {data && unified.length === 0 && runtimeCatalog.length === 0 && (
           <p className="py-6 text-center text-[13px] text-faint">暂无可绑定的应用。</p>
         )}
       </div>
@@ -373,9 +455,373 @@ export function ConnectorsTab({
           reload();
         }}
       />
+      <KnowledgePlanetSetupDialog
+        key={setupRuntimeFor?.versionId ?? 'closed'}
+        auth={auth}
+        plugin={setupRuntimeFor}
+        onClose={() => setSetupRuntimeFor(null)}
+        onBound={() => {
+          reload()
+        }}
+      />
       {confirmEl}
     </div>
   );
+}
+
+function RuntimePluginCard({
+  plugin,
+  accounts,
+  onAuthorize,
+  onUpdate,
+  onUninstall,
+  onRevoke,
+}: {
+  plugin: RuntimePluginCatalogEntry
+  accounts: RuntimePluginAccount[]
+  onAuthorize: () => void
+  onUpdate: () => void
+  onUninstall: () => void
+  onRevoke: (account: RuntimePluginAccount) => void
+}) {
+  const Icon = connectorIcon(plugin.slug)
+  const canSelfAuthorize = plugin.slug === 'knowledge-planet' && plugin.installedCurrent
+  return (
+    <div className="rounded-xl border border-border bg-surface p-3.5">
+      <div className="flex items-start gap-3">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+          <Icon size={18} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[14px] font-medium text-fg">{plugin.label}</span>
+            <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">只读</span>
+            {plugin.installed ? (
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+                市场已安装 · v{plugin.installedVersion}
+              </span>
+            ) : (
+              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-[10.5px] text-warning">
+                历史账号 · 当前未安装
+              </span>
+            )}
+            {plugin.updateAvailable && plugin.latestVersion && (
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+                {plugin.installed ? `可更新 v${plugin.latestVersion}` : '可重新安装'}
+              </span>
+            )}
+            {plugin.pluginType === 'managed-browser' && (
+              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
+                隔离运行
+              </span>
+            )}
+            {accounts.length > 0 && (
+              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
+                已授权
+              </span>
+            )}
+          </div>
+          <p className="mt-0.5 text-[12px] leading-snug text-faint">{plugin.description}</p>
+          <p className="mt-1 text-[11px] text-faint">
+            {plugin.actions.length} 项只读能力
+            {plugin.accountMode === 'none' ? ' · 无需账号' : ' · 账号登录状态加密保存'}
+          </p>
+        </div>
+        <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+          {plugin.updateAvailable && (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={onUpdate}
+              disabled={accounts.length > 0}
+              title={accounts.length > 0 ? '请先解绑 Plugin 账号再更新' : undefined}
+            >
+              <ArrowUpCircle size={13} /> {plugin.installed ? '更新' : '重新安装'}
+            </Button>
+          )}
+          {plugin.accountMode === 'required' && accounts.length === 0 && plugin.installedCurrent && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={onAuthorize}
+              disabled={!canSelfAuthorize}
+              title={canSelfAuthorize ? '使用微信扫码授权' : '该 Plugin 暂未提供自助授权流程'}
+            >
+              <QrCode size={13} /> {canSelfAuthorize ? '微信扫码授权' : '暂不可授权'}
+            </Button>
+          )}
+          {plugin.installed && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-danger"
+              onClick={onUninstall}
+              disabled={accounts.length > 0}
+              title={accounts.length > 0 ? '请先解绑 Plugin 账号' : '卸载 Plugin'}
+            >
+              <Trash2 size={13} /> 卸载
+            </Button>
+          )}
+        </div>
+      </div>
+      {!plugin.available && (
+        <Alert tone="warning" className="mt-2 text-[11.5px]">
+          该 Plugin 当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号或卸载。
+        </Alert>
+      )}
+      {accounts.length > 0 && (
+        <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
+          {accounts.map((account) => (
+            <li key={account.id} className="flex items-center gap-2 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[13px] text-fg">
+                  {account.displayName || plugin.label}
+                </div>
+                {account.accountHint && (
+                  <div className="truncate text-[11px] text-faint">{account.accountHint}</div>
+                )}
+              </div>
+              <span className={account.executable ? 'text-[11px] text-success' : 'text-[11px] text-warning'}>
+                {account.status === 'error'
+                  ? '需重新授权'
+                  : account.executable
+                    ? '可用'
+                    : plugin.updateAvailable
+                      ? '需先更新'
+                      : plugin.installedCurrent && account.versionId !== plugin.versionId
+                        ? '需重新授权'
+                        : '当前不可用'}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-danger"
+                onClick={() => onRevoke(account)}
+              >
+                <Trash2 size={13} /> 解绑
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function KnowledgePlanetSetupDialog({
+  auth,
+  plugin,
+  onClose,
+  onBound,
+}: {
+  auth: AuthSession
+  plugin: RuntimePluginCatalogEntry | null
+  onClose: () => void
+  onBound: () => void
+}) {
+  const [accepted, setAccepted] = useState(false)
+  const [starting, setStarting] = useState(false)
+  const [setup, setSetup] = useState<KnowledgePlanetSetupView | null>(null)
+  const [qrUrl, setQrUrl] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [reportedActive, setReportedActive] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const setupSessionId = setup?.sessionId ?? null
+  const setupStatus = setup?.status ?? null
+  const setupQrReady = setup?.qrReady === true
+
+  useEffect(
+    () => () => {
+      if (qrUrl) URL.revokeObjectURL(qrUrl)
+    },
+    [qrUrl],
+  )
+
+  useEffect(() => {
+    if (
+      !setupSessionId ||
+      !setupStatus ||
+      !['waiting_for_scan', 'finalizing'].includes(setupStatus)
+    )
+      return
+    let cancelled = false
+    let timer: number | undefined
+    const poll = () => {
+      void api
+        .getKnowledgePlanetSetup(auth, setupSessionId)
+        .then((next) => {
+          if (!cancelled) {
+            setSetup(next)
+            setError(null)
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) setError(errText(e, '读取扫码状态失败，请重试'))
+        })
+        .finally(() => {
+          if (!cancelled) timer = window.setTimeout(poll, 900)
+        })
+    }
+    timer = window.setTimeout(poll, 900)
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [auth, setupSessionId, setupStatus])
+
+  useEffect(() => {
+    if (!setupQrReady || !setupSessionId || qrUrl) return
+    let cancelled = false
+    let timer: number | undefined
+    const load = () => {
+      void api
+        .getKnowledgePlanetSetupQr(auth, setupSessionId)
+        .then((blob) => {
+          if (cancelled) return
+          setQrUrl(URL.createObjectURL(blob))
+          setError(null)
+        })
+        .catch((e) => {
+          if (!cancelled) {
+            setError(errText(e, '二维码加载失败，请重试'))
+            timer = window.setTimeout(load, 900)
+          }
+        })
+    }
+    load()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [auth, qrUrl, setupQrReady, setupSessionId])
+
+  useEffect(() => {
+    if (setupStatus !== 'active' || reportedActive) return
+    setReportedActive(true)
+    onBound()
+  }, [onBound, reportedActive, setupStatus])
+
+  const start = async () => {
+    if (!accepted || starting) return
+    setStarting(true)
+    setError(null)
+    try {
+      setSetup(await api.startKnowledgePlanetSetup(auth))
+    } catch (e) {
+      setError(errText(e, '发起知识星球授权失败'))
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const close = async () => {
+    if (cancelling) return
+    if (setup?.status === 'waiting_for_scan') {
+      setCancelling(true)
+      setError(null)
+      try {
+        await api.cancelKnowledgePlanetSetup(auth, setup.sessionId)
+      } catch (e) {
+        setError(errText(e, '取消授权失败，请重试'))
+        setCancelling(false)
+        return
+      }
+      setCancelling(false)
+    }
+    onClose()
+  }
+
+  const retry = () => {
+    if (qrUrl) URL.revokeObjectURL(qrUrl)
+    setQrUrl(null)
+    setSetup(null)
+    setError(null)
+    setAccepted(false)
+    setReportedActive(false)
+  }
+
+  const terminalFailure = setup && ['cancelled', 'expired', 'failed'].includes(setup.status)
+  return (
+    <Modal
+      open={plugin != null}
+      onOpenChange={(open) => !open && void close()}
+      title="授权知识星球"
+      description="微信扫码一次即可；Plugin 只读取你已加入星球的内容，不执行发布、评论或删除。"
+      footer={
+        <>
+          <Button variant="ghost" size="sm" disabled={cancelling} onClick={() => void close()}>
+            {cancelling
+              ? '正在取消…'
+              : setup?.status === 'active'
+                ? '完成'
+                : setup?.status === 'finalizing'
+                  ? '后台完成'
+                  : '取消'}
+          </Button>
+          {!setup && (
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!accepted || starting}
+              onClick={() => void start()}
+            >
+              <QrCode size={13} /> {starting ? '正在生成二维码…' : '生成二维码'}
+            </Button>
+          )}
+          {terminalFailure && (
+            <Button variant="secondary" size="sm" onClick={retry}>
+              重新授权
+            </Button>
+          )}
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        {error && <Alert tone="danger">{error}</Alert>}
+        {!setup && (
+          <>
+            <div className="rounded-lg bg-hover px-3 py-2.5 text-[12px] leading-relaxed text-muted">
+              登录状态仅保存在服务端加密账号库中；每次调用都在无网络容器内运行，并只通过固定域名白名单读取数据。
+            </div>
+            <label className="flex cursor-pointer items-start gap-2 text-[12.5px] leading-relaxed text-muted">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={accepted}
+                onChange={(event) => setAccepted(event.target.checked)}
+              />
+              <span>我确认使用微信扫码授权知识星球账号，并同意上述只读访问范围。</span>
+            </label>
+          </>
+        )}
+        {setup?.status === 'waiting_for_scan' && (
+          <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-border bg-white p-4">
+            {qrUrl ? (
+              <img src={qrUrl} alt="知识星球微信登录二维码" className="size-56 object-contain" />
+            ) : (
+              <div className="flex items-center gap-2 text-[12.5px] text-muted">
+                <Spinner /> 正在加载二维码…
+              </div>
+            )}
+            <p className="text-center text-[12px] text-muted">请使用微信扫码，并在手机上确认登录</p>
+          </div>
+        )}
+        {setup?.status === 'finalizing' && (
+          <div className="flex items-center justify-center gap-2 py-12 text-[13px] text-muted">
+            <Spinner /> 已确认登录，正在安全保存账号…
+          </div>
+        )}
+        {setup?.status === 'active' && (
+          <Alert tone="success">知识星球账号已授权，可以在对话中使用只读能力。</Alert>
+        )}
+        {terminalFailure && (
+          <Alert tone="warning">
+            {setup.status === 'expired' ? '二维码已过期，请重新授权。' : '本次授权未完成，请重试。'}
+          </Alert>
+        )}
+      </div>
+    </Modal>
+  )
 }
 
 // ── provider 目录卡（含该 provider 的已绑多账号列表） ────────────────────────

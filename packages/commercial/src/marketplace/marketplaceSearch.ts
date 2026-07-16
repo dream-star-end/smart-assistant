@@ -60,7 +60,8 @@ function toCard(c: ApprovedSearchRow): {
   // 前端徽记须标注"发布者提供·未经平台验证"(v3 vanilla UI 忽略该加法字段)。
   // 人向导购字段(category/useCases/featuredRank)卡片透出;outcomeExamples/humanMd 仅 detail(卡片保持轻)。
   // 真实使用信号(usage30d/users30d/rating)卡片透出;rating 样本 <RATING_MIN_SAMPLE 时服务端已置 null。
-  const official = c.kind === 'connector' && isDefaultConnectorArtifact(c.slug, c.artifactHash)
+  const preinstalled = c.kind === 'connector' && isDefaultConnectorArtifact(c.slug, c.artifactHash)
+  const official = preinstalled || c.official === true
   return {
     slug: c.slug,
     kind: c.kind,
@@ -76,7 +77,8 @@ function toCard(c: ApprovedSearchRow): {
     users30d: c.users30d,
     rating: c.rating,
     ...marketplaceArtifactCompatibility(c.kind, c.pluginType),
-    ...(official ? { official: true, preinstalled: true } : {}),
+    ...(official ? { official: true } : {}),
+    ...(preinstalled ? { preinstalled: true } : {}),
   }
 }
 

@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { runOcConnectCli, type OcConnectDeps } from '../ocConnectCli.js'
+import { type OcConnectDeps, runOcConnectCli } from '../ocConnectCli.js'
 import {
   CONNECTOR_BAD_RESPONSE,
   CONNECTOR_NO_MASTER_BASE,
@@ -149,7 +149,10 @@ describe('oc-connect list', () => {
     const { deps } = mkDeps({ responses: { list: { connections: [] } } })
     const r = await runOcConnectCli(['list'], deps)
     assert.equal(r.exitCode, 0)
-    assert.equal(r.stdout, '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n')
+    assert.equal(
+      r.stdout,
+      '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n',
+    )
   })
 })
 
@@ -246,12 +249,14 @@ describe('oc-connect call — account resolution', () => {
     assert.match(r.stderr, /--account 11/)
     assert.match(r.stderr, /--account 12/)
     assert.match(r.stderr, /坚果云/)
+    assert.match(r.stderr, /有多个已绑定连接/)
   })
 
   test('no connection for provider → guidance, exit 1', async () => {
     const { deps } = mkDeps({ responses: { list: { connections: [CONN_A] } } })
     const r = await runOcConnectCli(['call', 'notion', 'search'], deps)
     assert.equal(r.exitCode, 1)
+    assert.match(r.stderr, /未找到 provider=notion 的已绑定连接/)
     assert.match(r.stderr, /设置 → 应用连接器/)
   })
 

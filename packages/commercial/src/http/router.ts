@@ -209,6 +209,7 @@ import {
   handleAdminStatsSignupsByDay,
 } from './adminStats.js'
 import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.js'
+import { dispatchPluginsRoute } from './plugins.js'
 // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
 import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
@@ -675,6 +676,9 @@ export function createCommercialHandler(
     // (handler 内自调 requireAuth;oauth/callback 是浏览器导航例外,身份由 state 行推导)。
     { method: ANY_METHOD, path: '/api/connectors', handler: dispatchConnectorsRoute },
     { method: ANY_METHOD, pathPrefix: '/api/connectors/', handler: dispatchConnectorsRoute },
+    // Plugin management + official managed login; method/subroute authority lives in dispatcher.
+    { method: ANY_METHOD, path: '/api/plugins', handler: dispatchPluginsRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/plugins/', handler: dispatchPluginsRoute },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
@@ -1288,6 +1292,7 @@ export function createCommercialHandler(
     // + 本 prefixes 所有权清单;漏本处 → commercialHandler 不认领 → fall through gateway → 浏览器
     // 401/404("not found")。2026-07-11 连接器目录 not found 事故根因即漏登本处。
     '/api/connectors',
+    '/api/plugins',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     '/api/remote-hosts',
     // P0/P1:commercial user 的 memory/skills/tasks/agent 管理 API 由 master
