@@ -36,7 +36,19 @@ export const CONDITION_OPCODE_MAP: Record<string, string> = {
   'ops.monitor:disk_var': 'clean-v5-disk-v1',
 }
 
-export type HostActionOutcome = 'completed' | 'failed' | 'unknown'
+/**
+ * - 'completed'     wrapper exit 0 + bound receipt outcome=completed
+ * - 'action_failed' the action ran on the host but did not succeed (wrapper
+ *                   ran the command, non-zero, receipt bound) — still went to
+ *                   the host, so recovery is decided by the master probe.
+ * - 'rejected'      the action was NEVER authorized to run (local whitelist
+ *                   miss, or the remote forced-command rejected the opcode:
+ *                   exit 64/65) — a definite non-execution.
+ * - 'unknown'       transport ambiguity (timeout, ssh exit 255/signal, missing/
+ *                   malformed receipt, opcode-mismatch): the action MAY have
+ *                   run — never auto-replay; the probe fence adjudicates.
+ */
+export type HostActionOutcome = 'completed' | 'action_failed' | 'rejected' | 'unknown'
 
 export interface HostActionReceipt {
   opcode: string
@@ -119,9 +131,10 @@ export async function executeHostOpcode(
 ): Promise<HostActionReceipt> {
   const startedAt = now()
   if (!TIER1_OPCODES.has(opcode)) {
+    // Local whitelist miss = never transmitted = a definite non-execution.
     return {
       opcode,
-      outcome: 'failed',
+      outcome: 'rejected',
       exit: -1,
       host: cfg.host,
       startedAt,
@@ -157,18 +170,38 @@ export async function executeHostOpcode(
     finishedAt,
     durationMs: finishedAt - startedAt,
   }
-  // Timeout / transport failure with no clean remote line ⇒ unknown.
-  if (r.timedOut || (r.code === -1 && !r.stdout.trim())) {
-    return { ...base, outcome: 'unknown', detail: { reason: 'ssh transport timeout/disconnect', stderr: r.stderr.slice(0, 400) } }
-  }
-  let detail: unknown
+  const unknown = (reason: string): HostActionReceipt => ({
+    ...base,
+    outcome: 'unknown',
+    detail: { reason, stderr: r.stderr.slice(0, 400) },
+  })
+
+  // Transport ambiguity — the action MAY have run. ssh exit 255 = transport
+  // error/disconnect (NOT a remote non-zero). timeout/signal likewise.
+  if (r.timedOut) return unknown('ssh timeout')
+  if (r.code === 255 || r.code === -1) return unknown('ssh transport error (255/disconnect)')
+
+  // Parse + BIND the receipt: it must be valid JSON, name THIS opcode, and its
+  // exit must agree with the process exit — else we cannot trust the outcome.
+  type RemoteReceipt = { opcode?: unknown; outcome?: unknown; exit?: unknown }
+  let receipt: RemoteReceipt | null = null
   try {
-    detail = JSON.parse(r.stdout.trim().split('\n').pop() ?? '{}')
+    receipt = JSON.parse(r.stdout.trim().split('\n').pop() ?? '') as RemoteReceipt
   } catch {
-    detail = { raw: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
+    return unknown('receipt not valid JSON')
   }
-  // Remote exit 0 = completed; anything else = failed (the action was attempted;
-  // never retried automatically — the master probe decides recovery).
-  const outcome: HostActionOutcome = r.code === 0 ? 'completed' : 'failed'
-  return { ...base, outcome, detail }
+  if (!receipt || receipt.opcode !== opcode) return unknown('receipt opcode mismatch / missing')
+  if (typeof receipt.exit === 'number' && receipt.exit !== r.code) {
+    return unknown('receipt exit disagrees with process exit')
+  }
+
+  // Bound receipt. Classify by remote wrapper exit:
+  //  64/65 = the forced-command rejected the opcode (never executed) = rejected
+  //  0     = completed;  else = action ran but failed.
+  let outcome: HostActionOutcome
+  if (r.code === 64 || r.code === 65) outcome = 'rejected'
+  else if (r.code === 0 && receipt.outcome === 'completed') outcome = 'completed'
+  else if (r.code === 0) return unknown('exit 0 but receipt outcome not completed')
+  else outcome = 'action_failed'
+  return { ...base, outcome, detail: receipt }
 }

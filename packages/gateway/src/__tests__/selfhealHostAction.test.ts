@@ -37,48 +37,64 @@ describe('hostActionConfigFromEnv — fail-closed', () => {
   })
 })
 
-describe('executeHostOpcode — outcome classification', () => {
-  it('completed on remote exit 0', async () => {
+describe('executeHostOpcode — strict outcome classification', () => {
+  const recv = (op: string, outcome: string, exit: number) =>
+    JSON.stringify({ opcode: op, outcome, exit })
+
+  it('completed on exit 0 with a bound receipt', async () => {
     let sentArgs: string[] = []
     const r = await executeHostOpcode(
       'restart-v5-egress-v1',
-      { ...CFG, runner: async (args) => { sentArgs = args; return { code: 0, stdout: '{"outcome":"completed","exit":0}', stderr: '', timedOut: false } } },
+      { ...CFG, runner: async (args) => { sentArgs = args; return { code: 0, stdout: recv('restart-v5-egress-v1', 'completed', 0), stderr: '', timedOut: false } } },
       clock,
     )
     assert.equal(r.outcome, 'completed')
-    assert.equal(r.exit, 0)
     // opcode is a single trailing argv token (no shell), host is pinned.
     assert.equal(sentArgs[sentArgs.length - 1], 'restart-v5-egress-v1')
-    assert.ok(sentArgs.includes('kl-mirror'))
-    assert.ok(sentArgs.includes('BatchMode=yes'))
-    assert.ok(sentArgs.includes('IdentitiesOnly=yes'))
+    assert.ok(sentArgs.includes('kl-mirror') && sentArgs.includes('BatchMode=yes') && sentArgs.includes('IdentitiesOnly=yes'))
   })
-  it('failed on remote exit > 0 (action ran, did not succeed)', async () => {
+  it('action_failed on remote exit > 0 (action ran, did not succeed)', async () => {
     const r = await executeHostOpcode(
       'restart-v5-egress-v1',
-      { ...CFG, runner: async () => ({ code: 3, stdout: '{"outcome":"failed","exit":3}', stderr: 'boom', timedOut: false }) },
+      { ...CFG, runner: async () => ({ code: 3, stdout: recv('restart-v5-egress-v1', 'failed', 3), stderr: 'boom', timedOut: false }) },
       clock,
     )
-    assert.equal(r.outcome, 'failed')
-    assert.equal(r.exit, 3)
+    assert.equal(r.outcome, 'action_failed')
   })
-  it('unknown on transport timeout (ambiguous — never auto-replayed)', async () => {
+  it('rejected on remote forced-command refusal (exit 64/65)', async () => {
     const r = await executeHostOpcode(
-      'clean-v5-disk-v1',
-      { ...CFG, runner: async () => ({ code: -1, stdout: '', stderr: 'timeout', timedOut: true }) },
+      'restart-v5-egress-v1',
+      { ...CFG, runner: async () => ({ code: 65, stdout: recv('restart-v5-egress-v1', 'rejected', 65), stderr: '', timedOut: false }) },
       clock,
     )
-    assert.equal(r.outcome, 'unknown')
+    assert.equal(r.outcome, 'rejected')
   })
-  it('rejects (failed, no transmit) an opcode outside the local whitelist', async () => {
+  it('unknown on timeout, ssh exit 255, malformed receipt, exit0-not-completed, and opcode mismatch', async () => {
+    const cases: Array<{ code: number; stdout: string; timedOut?: boolean }> = [
+      { code: -1, stdout: '', timedOut: true }, // timeout
+      { code: 255, stdout: '' }, // ssh transport error
+      { code: 0, stdout: 'not json' }, // malformed
+      { code: 0, stdout: '' }, // exit0 empty
+      { code: 0, stdout: recv('restart-v5-egress-v1', 'failed', 0) }, // exit0 but not completed
+      { code: 0, stdout: recv('WRONG-OPCODE', 'completed', 0) }, // opcode mismatch
+    ]
+    for (const c of cases) {
+      const r = await executeHostOpcode(
+        'restart-v5-egress-v1',
+        { ...CFG, runner: async () => ({ code: c.code, stdout: c.stdout, stderr: '', timedOut: c.timedOut ?? false }) },
+        clock,
+      )
+      assert.equal(r.outcome, 'unknown', `case ${JSON.stringify(c)} must be unknown`)
+    }
+  })
+  it('rejected (no transmit) for an opcode outside the local whitelist', async () => {
     let called = false
     const r = await executeHostOpcode(
       'rm-rf-slash',
       { ...CFG, runner: async () => { called = true; return { code: 0, stdout: '{}', stderr: '', timedOut: false } } },
       clock,
     )
-    assert.equal(r.outcome, 'failed')
-    assert.equal(r.exit, -1)
+    assert.equal(r.outcome, 'rejected')
     assert.equal(called, false, 'a non-whitelisted opcode is never transmitted')
   })
 })

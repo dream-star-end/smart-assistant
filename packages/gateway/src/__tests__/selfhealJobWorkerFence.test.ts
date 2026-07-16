@@ -459,7 +459,8 @@ describe('Tier1 pure machine path (batch1a) — no clone, no codex, machine done
     assert.deepEqual(opcodes, ['restart-v5-egress-v1'], 'the frozen opcode was transmitted')
     assert.equal(sessions.state.submits.length, 0, 'Tier1 never starts a codex turn')
     assert.equal(cloned, false, 'Tier1 never prepares a clone')
-    assert.ok(calls.some((c) => c.url.endsWith('/done')), 'machine done callback sent')
+    // Terminal callback goes via the durable outbox (pump not run here), so the
+    // job reaching 'succeeded' proves the enqueue landed before terminalization.
     assert.equal((await getJob('t1-ok'))?.status, 'succeeded')
     assert.ok((await getJob('t1-ok'))?.tier1Receipt, 'receipt is durable')
   })
@@ -490,22 +491,35 @@ describe('Tier1 pure machine path (batch1a) — no clone, no codex, machine done
     assert.equal((await getJob('t1-noprov'))?.status, 'failed')
   })
 
-  it('remote failed (exit>0) ⇒ machine failed', async () => {
+  it('action_failed (remote ran, exit>0) ⇒ done → verifying (NOT machine failed; probe decides)', async () => {
     const sessions = fakeSessionManager()
     const { impl } = fakeFetch('ops.monitor:http_egress', {
       executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
     })
     const worker = tier1Worker({
       sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
-      executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'failed', exit: 3, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
+      executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'action_failed', exit: 3, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
     })
-    await worker.processJob(await stageStartingJob('t1-remotefail'))
-    assert.equal((await getJob('t1-remotefail'))?.status, 'failed')
+    await worker.processJob(await stageStartingJob('t1-actionfail'))
+    assert.equal((await getJob('t1-actionfail'))?.status, 'succeeded', 'attempted action → done, probe adjudicates')
   })
 
-  it('unknown transport outcome ⇒ optimistic machine done (probe fence adjudicates)', async () => {
+  it('rejected (never authorized to run) ⇒ machine failed', async () => {
     const sessions = fakeSessionManager()
-    const { impl, calls } = fakeFetch('ops.monitor:svc_egress', {
+    const { impl } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
+    })
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'rejected', exit: 65, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
+    })
+    await worker.processJob(await stageStartingJob('t1-rejected'))
+    assert.equal((await getJob('t1-rejected'))?.status, 'failed')
+  })
+
+  it('unknown transport outcome ⇒ optimistic done → verifying (probe fence adjudicates)', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:svc_egress', {
       executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
     })
     const worker = tier1Worker({
@@ -513,7 +527,23 @@ describe('Tier1 pure machine path (batch1a) — no clone, no codex, machine done
       executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'unknown', exit: -1, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
     })
     await worker.processJob(await stageStartingJob('t1-unknown'))
-    assert.ok(calls.some((c) => c.url.endsWith('/done')), 'unknown goes to done → verifying')
     assert.equal((await getJob('t1-unknown'))?.status, 'succeeded')
+  })
+
+  it('pre-claim replay guard: a second processJob with a receipt does NOT re-transmit', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
+    })
+    let transmits = 0
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => { transmits++; return { opcode: op, outcome: 'completed', exit: 0, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} } },
+    })
+    const job = await stageStartingJob('t1-replay')
+    await worker.processJob(job)
+    // Re-run the same job object (simulates a re-claim after crash).
+    await worker.processJob(job)
+    assert.equal(transmits, 1, 'the opcode is transmitted at most once')
   })
 })

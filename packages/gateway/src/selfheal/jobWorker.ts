@@ -28,9 +28,10 @@ import {
   reclaimOrphanedLeases,
   releaseJobLeasesForOwner,
   renewJobLease,
+  claimJobTier1,
+  enqueueTier1Callback,
   setJobCapability,
-  setJobConditionKey,
-  setJobRouting,
+  setJobFrozenRouting,
   setJobSessionKey,
   setJobStatus,
   setJobTier1Receipt,
@@ -319,22 +320,33 @@ export class SelfhealJobWorker {
     //     execution side never guesses tier. Fail-closed like the capability:
     //     leave 'starting', retry next tick after the lease expires. Set-once,
     //     so a replayed/late context cannot reclassify tier or swap the opcode.
-    let routing: { conditionKey: string; executionClass: 'tier1' | 'tier2'; actionOpcode: string | null }
     if (job.conditionKey === null || job.executionClass === null) {
       try {
-        routing = await this.fetchRouting(repairId, capability)
-        await setJobConditionKey(repairId, routing.conditionKey)
-        await setJobRouting(repairId, routing.executionClass, routing.actionOpcode)
+        const fetched = await this.fetchRouting(repairId, capability)
+        // ONE atomic set-once write (BLOCKER1): condition + class + opcode
+        // together, so a crash can never mix two context versions.
+        await setJobFrozenRouting(
+          repairId,
+          fetched.conditionKey,
+          fetched.executionClass,
+          fetched.actionOpcode,
+        )
       } catch (err) {
         log.warn('routing freeze failed — will retry after lease expiry', { repairId }, err)
         return
       }
-    } else {
-      routing = {
-        conditionKey: job.conditionKey,
-        executionClass: job.executionClass,
-        actionOpcode: job.actionOpcode,
-      }
+    }
+    // Read the AUTHORITATIVE frozen values back from the row (never the
+    // in-memory fetch result) — everything downstream uses the durable freeze.
+    const frozen = await getJob(repairId)
+    if (!frozen || frozen.conditionKey === null || frozen.executionClass === null) {
+      log.warn('routing not frozen after write — will retry', { repairId })
+      return
+    }
+    const routing = {
+      conditionKey: frozen.conditionKey,
+      executionClass: frozen.executionClass,
+      actionOpcode: frozen.actionOpcode,
     }
 
     // 1.6 Machine-authored ack: "the execution side accepted this job" is a
@@ -656,45 +668,77 @@ export class SelfhealJobWorker {
       return
     }
 
-    // Replay guard: a receipt already on the row ⇒ the SSH was already sent
-    // (re-claim after crash) → never re-transmit; settle from the stored receipt.
-    let receipt: HostActionReceipt
+    // AT-MOST-ONCE (BLOCKER2): resolve the receipt through a durable pre-claim,
+    // so the SSH is transmitted by exactly one winner; a crash after claim but
+    // before receipt settles as 'unknown' (never re-sent).
+    const receipt = await this.resolveTier1Receipt(repairId, actionOpcode as string, cfg)
+
+    // Terminal routing (MAJOR2): 'rejected' = the action was never authorized to
+    // run (local/forced-command refusal) ⇒ machine FAILED. Everything the host
+    // actually attempted (completed / action_failed / unknown) ⇒ machine DONE →
+    // master verifying; only a fresh probe decides real recovery.
+    const detail: Record<string, unknown> = {
+      opcode: actionOpcode,
+      host: receipt.host,
+      outcome: receipt.outcome,
+      exit: receipt.exit,
+      durationMs: receipt.durationMs,
+      receipt: receipt.detail,
+    }
+    const summary = `[tier1 ${actionOpcode}] ${receipt.outcome} exit=${receipt.exit}`
+    // Enqueue the terminal callback into the DURABLE outbox (BLOCKER3): the pump
+    // delivers with a fresh capability and abandons on an explicit master
+    // refusal — no fire-and-forget, no orphan. Local terminalization only AFTER
+    // the enqueue is durable.
+    const phase: 'done' | 'failed' = receipt.outcome === 'rejected' ? 'failed' : 'done'
+    await enqueueTier1Callback({ repairId, phase, message: summary, detail })
+    await setJobStatus(repairId, phase === 'done' ? 'succeeded' : 'failed', ['running'])
+    log.info('tier1 settled', { repairId, opcode: actionOpcode, outcome: receipt.outcome, phase })
+  }
+
+  /**
+   * Durable at-most-once resolution of the Tier1 receipt:
+   *  - a receipt already on the row  → committed earlier; reuse (idempotent).
+   *  - won the pre-claim             → transmit ONCE, persist the receipt.
+   *  - lost the pre-claim, no receipt → a prior claim crashed before settling;
+   *    treat as 'unknown' (the action MAY have run — never re-transmit).
+   */
+  private async resolveTier1Receipt(
+    repairId: string,
+    opcode: string,
+    cfg: HostActionConfig,
+  ): Promise<HostActionReceipt> {
     const existing = await getJob(repairId)
     if (existing?.tier1Receipt) {
-      receipt = JSON.parse(existing.tier1Receipt) as HostActionReceipt
-      log.info('tier1 receipt already present — not re-transmitting', { repairId })
-    } else {
-      const exec = this.deps.executeHostOpcode ?? executeHostOpcode
-      receipt = await exec(actionOpcode as string, cfg)
-      const won = await setJobTier1Receipt(repairId, JSON.stringify(receipt))
-      if (!won) {
-        const j = await getJob(repairId)
-        if (j?.tier1Receipt) receipt = JSON.parse(j.tier1Receipt) as HostActionReceipt
-      }
-      log.info('tier1 opcode executed', {
-        repairId,
-        opcode: actionOpcode,
-        outcome: receipt.outcome,
-        exit: receipt.exit,
-        durationMs: receipt.durationMs,
-      })
+      return JSON.parse(existing.tier1Receipt) as HostActionReceipt
     }
-
-    const summary = `[tier1 ${actionOpcode}] ${receipt.outcome} exit=${receipt.exit}`
-    try {
-      if (receipt.outcome === 'completed' || receipt.outcome === 'unknown') {
-        // done → master verifying; the probe fence confirms real recovery.
-        await this.postCallback(repairId, capability, 'done', summary, false)
-        await setJobStatus(repairId, 'succeeded', ['running'])
-      } else {
-        await this.postCallback(repairId, capability, 'failed', summary, false)
-        await setJobStatus(repairId, 'failed', ['running'])
+    const won = await claimJobTier1(repairId)
+    if (!won) {
+      const j = await getJob(repairId)
+      if (j?.tier1Receipt) return JSON.parse(j.tier1Receipt) as HostActionReceipt
+      log.warn('tier1 pre-claim held without receipt — settling unknown (no replay)', { repairId })
+      return {
+        opcode,
+        outcome: 'unknown',
+        exit: -1,
+        host: cfg.host,
+        startedAt: 0,
+        finishedAt: 0,
+        durationMs: 0,
+        detail: { reason: 'crashed after pre-claim before receipt — not re-transmitted' },
       }
-    } catch (err) {
-      // Callback failed: leave the job 'running' for a lease-retry. The receipt
-      // is durable, so the retry re-sends only the callback, never the SSH.
-      log.warn('tier1 terminal callback failed — lease retry (no SSH replay)', { repairId }, err)
     }
+    const exec = this.deps.executeHostOpcode ?? executeHostOpcode
+    const receipt = await exec(opcode, cfg)
+    await setJobTier1Receipt(repairId, JSON.stringify(receipt))
+    log.info('tier1 opcode executed', {
+      repairId,
+      opcode,
+      outcome: receipt.outcome,
+      exit: receipt.exit,
+      durationMs: receipt.durationMs,
+    })
+    return receipt
   }
 
   /**
@@ -728,20 +772,29 @@ export class SelfhealJobWorker {
         conditionKey?: unknown
         executionClass?: unknown
         actionOpcode?: unknown
+        tier?: unknown
       }
       const key = body?.conditionKey
       if (typeof key !== 'string' || key.length === 0 || key.length > 256) {
         throw new Error('context response carries no usable conditionKey')
       }
-      // Conservative: anything not explicitly 'tier1' is tier2 (never let an
-      // unknown/absent class fall into an automatic ops action).
-      const executionClass = body?.executionClass === 'tier1' ? 'tier1' : 'tier2'
-      const actionOpcode =
-        executionClass === 'tier1' && typeof body?.actionOpcode === 'string'
-          ? body.actionOpcode
-          : null
+      // STRICT (BLOCKER1): unknown/absent executionClass is REJECTED, never
+      // silently defaulted to tier2. tier and executionClass must agree (both
+      // derive from the frozen r.tier on the master); tier1⇔opcode consistency
+      // is enforced. Any inconsistency fails closed → lease retry.
+      const executionClass = body?.executionClass
+      if (executionClass !== 'tier1' && executionClass !== 'tier2') {
+        throw new Error(`context executionClass invalid: ${String(executionClass)}`)
+      }
+      if (body?.tier !== undefined && body.tier !== executionClass) {
+        throw new Error(`context tier/executionClass mismatch: ${String(body.tier)} vs ${executionClass}`)
+      }
+      const actionOpcode = typeof body?.actionOpcode === 'string' ? body.actionOpcode : null
       if (executionClass === 'tier1' && !actionOpcode) {
         throw new Error('tier1 routing missing actionOpcode')
+      }
+      if (executionClass === 'tier2' && actionOpcode) {
+        throw new Error('tier2 routing must not carry an actionOpcode')
       }
       return { conditionKey: key, executionClass, actionOpcode }
     } finally {

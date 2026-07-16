@@ -70,8 +70,8 @@ describe('selfheal_jobs release_revoked ALTER guard', () => {
     // trail the table here, unlike the canonical DDL order (…, created_at,
     // updated_at) — proof the cheap ALTER path ran, not a rebuild.
     assert.deepEqual(
-      cols.slice(-5).map((c) => c.name),
-      ['release_revoked', 'condition_key', 'execution_class', 'action_opcode', 'tier1_receipt'],
+      cols.slice(-6).map((c) => c.name),
+      ['release_revoked', 'condition_key', 'execution_class', 'action_opcode', 'tier1_claimed_at', 'tier1_receipt'],
     )
   })
 
