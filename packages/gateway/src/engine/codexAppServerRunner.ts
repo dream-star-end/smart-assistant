@@ -651,6 +651,26 @@ type JsonRpcLine =
   | { kind: 'notification'; method: string; params?: unknown }
   | { kind: 'unknown' }
 
+interface PendingCodexUserInput {
+  /** Exact app-server reverse-RPC id. Must be echoed without string coercion. */
+  rpcId: number | string
+  /** Canonical key used only for duplicate detection while the RPC is pending. */
+  rpcKey: string
+  turnId: string
+  itemId: string
+  /** Existing AskUserQuestion answers are keyed by question text; Codex's
+   * response is keyed by this stable question id. */
+  questions: Array<{ id: string; question: string }>
+}
+
+interface NormalizedCodexUserInput {
+  threadId: string
+  turnId: string
+  itemId: string
+  questions: Array<{ id: string; question: string }>
+  input: Record<string, unknown>
+}
+
 /**
  * Classify a JSON-RPC line. Codex app-server uses bidirectional JSON-RPC 2.0:
  *   - Response: { id, result } or { id, error } — reply to one of our requests.
@@ -708,8 +728,89 @@ function jsonRpcMethodNotFound(id: number | string, method: string): string {
   })
 }
 
+function jsonRpcInvalidParams(id: number | string, method: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id,
+    error: {
+      code: -32602,
+      message: `invalid params for '${method}'`,
+    },
+  })
+}
+
 function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+function codexReverseRpcKey(id: number | string): string {
+  return JSON.stringify([typeof id, id])
+}
+
+/** Project Codex 0.144.0 ToolRequestUserInputParams onto the already-shipped
+ * CCB AskUserQuestion input shape. Codex has no multiSelect request field;
+ * every model-facing option list is mutually exclusive, so the projection is
+ * explicitly single-select. Protocol-only fields are retained as harmless
+ * metadata inside the existing question objects (no second wire model). */
+function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput | null {
+  const params = asRecord(paramsUnk)
+  const threadId = typeof params.threadId === 'string' ? params.threadId : ''
+  const turnId = typeof params.turnId === 'string' ? params.turnId : ''
+  const itemId = typeof params.itemId === 'string' ? params.itemId : ''
+  if (!threadId || !turnId || !itemId || !Array.isArray(params.questions)) return null
+
+  const inputQuestions: Array<Record<string, unknown>> = []
+  const questions: Array<{ id: string; question: string }> = []
+  for (const questionUnk of params.questions) {
+    const question = asRecord(questionUnk)
+    const id = typeof question.id === 'string' ? question.id : ''
+    const header = typeof question.header === 'string' ? question.header : ''
+    const text = typeof question.question === 'string' ? question.question : ''
+    if (!id || !text || typeof question.header !== 'string') return null
+
+    const rawOptions = question.options
+    if (rawOptions !== null && rawOptions !== undefined && !Array.isArray(rawOptions)) return null
+    const options: Array<{ label: string; description: string }> = []
+    for (const optionUnk of Array.isArray(rawOptions) ? rawOptions : []) {
+      const option = asRecord(optionUnk)
+      if (typeof option.label !== 'string' || typeof option.description !== 'string') return null
+      options.push({ label: option.label, description: option.description })
+    }
+
+    questions.push({ id, question: text })
+    inputQuestions.push({
+      id,
+      header,
+      question: text,
+      multiSelect: false,
+      isOther: question.isOther === true,
+      isSecret: question.isSecret === true,
+      options,
+    })
+  }
+  if (questions.length === 0) return null
+
+  const autoResolutionMs = params.autoResolutionMs
+  if (
+    autoResolutionMs !== undefined &&
+    autoResolutionMs !== null &&
+    (typeof autoResolutionMs !== 'number' ||
+      !Number.isSafeInteger(autoResolutionMs) ||
+      autoResolutionMs < 0)
+  ) {
+    return null
+  }
+
+  return {
+    threadId,
+    turnId,
+    itemId,
+    questions,
+    input: {
+      questions: inputQuestions,
+      ...(typeof autoResolutionMs === 'number' ? { autoResolutionMs } : {}),
+    },
+  }
 }
 
 function chooseApprovalString(options: unknown[]): string {
@@ -788,6 +889,12 @@ export class CodexAppServerRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
   private nextRequestId = 0
   private pending = new Map<number, PendingRequest>()
+  private nextUserInputRequestId = 0
+  /** Browser-facing permission request id → exact Codex reverse-RPC context. */
+  private pendingUserInputs = new Map<string, PendingCodexUserInput>()
+  /** Exact reverse-RPC id → browser-facing id. Prevents duplicate cards if a
+   * transport replays the same still-pending request. */
+  private pendingUserInputIdsByRpc = new Map<string, string>()
   private queue: QueuedTurn[] = []
   private processing = false
   private shuttingDown = false
@@ -1018,6 +1125,7 @@ export class CodexAppServerRunner extends EventEmitter {
    *
    *  接口名 / 语义与 SubprocessRunner.clearSessionId 对齐(symmetric polymorphism)。 */
   clearSessionId(): void {
+    this.settleAllPendingUserInputs('session id cleared')
     this.threadId = null
     this.priorTurnTotal = null
     this.activeTurnTotal = null
@@ -1056,13 +1164,71 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.opts.cwd
   }
 
-  sendPermissionResponse(_requestId: string, _response: unknown): boolean {
-    // Same rationale as CodexRunner: app-server is launched with
-    // approvalPolicy=never + sandbox=danger-full-access, so the browser
-    // permission callback is not used. If newer codex emits reverse-RPC
-    // approval requests anyway, the server-request branch in handleLine
-    // answers the recognized ones directly.
-    return false
+  sendPermissionResponse(requestId: string, responseUnk: unknown): boolean {
+    const pending = this.takePendingUserInput(requestId)
+    if (!pending) return false
+
+    const response = asRecord(responseUnk)
+    const codexAnswers: Record<string, { answers: string[] }> = {}
+    if (response.behavior === 'allow') {
+      // server.ts already ran sanitizeAskUserQuestionUpdatedInput. Keep a
+      // defensive type/nonblank check here because EngineAdapter is a public
+      // seam and tests/other channels may call it directly.
+      const updatedInput = asRecord(response.updatedInput)
+      const answersByQuestionText = asRecord(updatedInput.answers)
+      for (const question of pending.questions) {
+        const answer = answersByQuestionText[question.question]
+        if (typeof answer !== 'string' || answer.trim().length === 0) continue
+        // Codex 0.144.0 has no multiSelect input field. Its response still
+        // uses an array so future/internal callers can express more than one
+        // value; the existing AskUserQuestion card supplies one string.
+        codexAnswers[question.id] = { answers: [answer] }
+      }
+    }
+
+    // A browser deny (or an allow whose already-sanitized answers somehow
+    // vanished) is represented by the schema-valid empty answers map. Codex
+    // app-server uses the same empty response after a client-side RPC error,
+    // so the model receives an explicit no-answer result instead of hanging.
+    return this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
+  }
+
+  private takePendingUserInput(requestId: string): PendingCodexUserInput | null {
+    const pending = this.pendingUserInputs.get(requestId)
+    if (!pending) return null
+    this.pendingUserInputs.delete(requestId)
+    this.pendingUserInputIdsByRpc.delete(pending.rpcKey)
+    return pending
+  }
+
+  private settlePendingUserInputsForTurn(turnId: string, reason: string): number {
+    const requestIds = [...this.pendingUserInputs.entries()]
+      .filter(([, pending]) => pending.turnId === turnId)
+      .map(([requestId]) => requestId)
+    for (const requestId of requestIds) {
+      const pending = this.takePendingUserInput(requestId)
+      if (!pending) continue
+      this.writeRaw(jsonRpcResult(pending.rpcId, { answers: {} }))
+    }
+    if (requestIds.length > 0) {
+      log.info('codex requestUserInput settled without browser answer', {
+        sessionKey: this.opts.sessionKey,
+        turnId,
+        count: requestIds.length,
+        reason,
+      })
+    }
+    return requestIds.length
+  }
+
+  private settleAllPendingUserInputs(reason: string): void {
+    const turnIds = new Set([...this.pendingUserInputs.values()].map((pending) => pending.turnId))
+    for (const turnId of turnIds) this.settlePendingUserInputsForTurn(turnId, reason)
+  }
+
+  private clearPendingUserInputs(): void {
+    this.pendingUserInputs.clear()
+    this.pendingUserInputIdsByRpc.clear()
   }
 
   interrupt(): boolean {
@@ -1212,6 +1378,10 @@ export class CodexAppServerRunner extends EventEmitter {
     const pendingQueue = this.queue
     this.queue = []
     for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    // Resolve app-server reverse requests while stdin is still writable. This
+    // mirrors a browser deny and prevents requestUserInput from surviving a
+    // transient runner recycle in either pending map.
+    this.settleAllPendingUserInputs('runner shutdown')
     const proc = this.proc
     if (proc) {
       let resolveClose!: () => void
@@ -1548,6 +1718,10 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter.reject(new Error(reason))
       this.currentTurnCompleter = null
     }
+    // The process is already gone at this boundary, so a JSON-RPC response is
+    // impossible. Still clear both indexes to prevent stale ids from leaking
+    // into a later app-server generation.
+    this.clearPendingUserInputs()
   }
 
   /** Emit one synthetic terminal result after a forced process shutdown. This
@@ -1700,16 +1874,18 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private writeRaw(line: string): void {
-    if (!this.proc || this.proc.killed) return
+  private writeRaw(line: string): boolean {
+    if (!this.proc || this.proc.killed) return false
     try {
       this.proc.stdin.write(`${line}\n`)
+      return true
     } catch (err) {
       // EPIPE if proc died between our check and write — fail pending so
       // callers settle.
       log.warn('codex app-server stdin write failed', {
         err: (err as Error).message,
       })
+      return false
     }
   }
 
@@ -1750,6 +1926,75 @@ export class CodexAppServerRunner extends EventEmitter {
       default:
         return null
     }
+  }
+
+  private handleRequestUserInput(id: number | string, paramsUnk: unknown): void {
+    const params = normalizeCodexUserInput(paramsUnk)
+    if (!params) {
+      this.writeRaw(jsonRpcInvalidParams(id, 'item/tool/requestUserInput'))
+      return
+    }
+    if (
+      !this.currentTurnCompleter ||
+      params.threadId !== this.threadId ||
+      (this.activeTurnId !== null && params.turnId !== this.activeTurnId)
+    ) {
+      log.warn('codex requestUserInput does not match active thread/turn', {
+        sessionKey: this.opts.sessionKey,
+        requestThreadId: params.threadId,
+        activeThreadId: this.threadId,
+        requestTurnId: params.turnId,
+        activeTurnId: this.activeTurnId,
+      })
+      this.writeRaw(jsonRpcInvalidParams(id, 'item/tool/requestUserInput'))
+      return
+    }
+
+    // A reverse request can share the stdout chunk with the turn/start
+    // response. Mirror notification handling's early-turn adoption so the
+    // subsequent turn/completed cleanup is scoped correctly.
+    if (this.activeTurnId === null && this.currentTurnCompleter) {
+      this.activeTurnId = params.turnId
+    }
+
+    const rpcKey = codexReverseRpcKey(id)
+    const duplicateRequestId = this.pendingUserInputIdsByRpc.get(rpcKey)
+    if (duplicateRequestId) {
+      log.warn('duplicate pending codex requestUserInput ignored', {
+        sessionKey: this.opts.sessionKey,
+        requestId: duplicateRequestId,
+        rpcId: id,
+      })
+      return
+    }
+
+    // turnId + itemId are app-server generated and make this opaque id stable
+    // and collision-resistant across runner respawns; the serial disambiguates
+    // a protocol-violating duplicate item id without parsing the id later.
+    const requestId =
+      `codex-user-input:${params.turnId}:${params.itemId}:${++this.nextUserInputRequestId}`
+    this.pendingUserInputs.set(requestId, {
+      rpcId: id,
+      rpcKey,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      questions: params.questions,
+    })
+    this.pendingUserInputIdsByRpc.set(rpcKey, requestId)
+
+    // Reuse the exact CCB parser ingress. CcbMessageParser converts this
+    // synthetic control_request into the canonical permission_request event,
+    // so no Codex-specific frame or frontend card is introduced.
+    this.emit('message', {
+      type: 'control_request',
+      request_id: requestId,
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: params.itemId,
+        input: params.input,
+      },
+    } as unknown as RunnerMessage)
   }
 
   private handleLine(line: string): void {
@@ -1815,6 +2060,10 @@ export class CodexAppServerRunner extends EventEmitter {
         // Async fire-and-forget; we reply to codex in the callback. Errors
         // here become a JSON-RPC error frame back to codex.
         void this._handleChatgptAuthTokensRefresh(msg.id, msg.params)
+        return
+      }
+      if (msg.method === 'item/tool/requestUserInput') {
+        this.handleRequestUserInput(msg.id, msg.params)
         return
       }
       const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
@@ -2103,6 +2352,14 @@ export class CodexAppServerRunner extends EventEmitter {
       // re-check.
       const tid = typeof turn.id === 'string' ? turn.id : undefined
       if (tid && this.activeTurnId && tid !== this.activeTurnId) return
+      // A normal requestUserInput keeps the turn open until the browser
+      // answers. This fallback covers app-server auto-resolution, interrupt,
+      // and protocol races: echo the schema-valid no-answer result once and
+      // remove both pending indexes before the next turn can start.
+      const completedTurnId = tid ?? this.activeTurnId
+      if (completedTurnId) {
+        this.settlePendingUserInputsForTurn(completedTurnId, 'turn completed')
+      }
       if (this.currentTurnCompleter) {
         this.currentTurnCompleter.resolve(
           turn as Parameters<typeof this.currentTurnCompleter.resolve>[0],
@@ -2594,6 +2851,10 @@ export class CodexAppServerRunner extends EventEmitter {
     const startedAt = Date.now()
     this.activeRequestId = requestId
     this.forcedShutdownResultEmitted = false
+    // Serial runner invariant: no reverse request from the previous turn may
+    // be carried into this one. Normally turn/completed already performed the
+    // same cleanup; this is a defensive boundary for unusual protocol order.
+    this.settleAllPendingUserInputs('next turn started')
     // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
     // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
     // 都会出现撕裂窗口(spawn cwd 用了 ready,attach cwd 拿到 cloning 之类)。
@@ -2841,6 +3102,7 @@ export class CodexAppServerRunner extends EventEmitter {
         await Promise.allSettled([...this.inflightItemHandlers])
       }
       const failedTurnUsage = this.consumeActiveTurnUsage()
+      this.settleAllPendingUserInputs('turn failed')
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
