@@ -37,7 +37,11 @@ import {
   useState,
 } from 'react'
 
-import { type ContainerPreviewFrame, useContainerPreview } from '../hooks/useContainerPreview'
+import {
+  type ContainerPreviewFrame,
+  type ContainerPreviewTransport,
+  useContainerPreview,
+} from '../hooks/useContainerPreview'
 import { apiErrorMessage } from '../lib/api'
 import { type ContainerWebAnnotation, buildContainerWebReviewPrompt } from '../lib/containerPreview'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
@@ -101,6 +105,9 @@ export function ContainerWebPreview({
   const [textInput, setTextInput] = useState('')
   const [frameStats, setFrameStats] = useState<FrameStats | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
+  const [directScale, setDirectScale] = useState(1)
   const textInputRef = useRef<HTMLInputElement>(null)
   const commentActionRef = useRef<HTMLButtonElement>(null)
   const commentCountRef = useRef<HTMLButtonElement>(null)
@@ -200,9 +207,27 @@ export function ContainerWebPreview({
     viewport,
     enabled: open,
     reconnectKey,
+    iframeRef,
     onFrame: drawFrame,
   })
   const ready = session.phase === 'ready'
+
+  useEffect(() => {
+    if (session.transport !== 'direct') {
+      setDirectScale(1)
+      return
+    }
+    const node = viewportRef.current
+    if (!node) return
+    const update = () => {
+      const width = node.getBoundingClientRect().width
+      if (width > 0) setDirectScale(width / viewport.width)
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [session.transport, viewport.width])
 
   useEffect(() => {
     if (sourceUrlRef.current === sourceUrl) return
@@ -313,7 +338,7 @@ export function ContainerWebPreview({
     setAnnouncement('正在重新连接网页预览')
   }
 
-  const pointFromPointer = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+  const pointFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
     return {
       x: Math.max(
@@ -327,7 +352,7 @@ export function ContainerWebPreview({
     }
   }
 
-  const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+  const onPointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     if (!ready) return
     event.currentTarget.focus()
     try {
@@ -345,7 +370,7 @@ export function ContainerWebPreview({
     }
   }
 
-  const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+  const onPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
     if (!ready || mode !== 'interact' || event.pointerType === 'touch') return
     const now = performance.now()
     if (now - lastPointerMoveAtRef.current < 50) return
@@ -353,7 +378,7 @@ export function ContainerWebPreview({
     session.send({ type: 'preview.pointer', action: 'move', ...pointFromPointer(event) })
   }
 
-  const onPointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+  const onPointerUp = (event: ReactPointerEvent<HTMLElement>) => {
     if (!ready) return
     const point = pointFromPointer(event)
     const start = pointerStartRef.current
@@ -394,7 +419,7 @@ export function ContainerWebPreview({
     })
   }
 
-  const onWheel = (event: ReactWheelEvent<HTMLCanvasElement>) => {
+  const onWheel = (event: ReactWheelEvent<HTMLElement>) => {
     if (!ready) return
     event.preventDefault()
     sendControl({ type: 'preview.wheel', deltaX: event.deltaX, deltaY: event.deltaY })
@@ -404,12 +429,15 @@ export function ContainerWebPreview({
     requestAnimationFrame(() => target()?.focus())
   }
 
+  const previewFocusTarget = () =>
+    session.transport === 'direct' ? iframeRef.current : canvasRef.current
+
   const focusDraftOrigin = (value = draftRef.current) => {
     if (value?.editingId) {
       focusSoon(() => pinRefs.current.get(value.editingId!))
       return
     }
-    focusSoon(() => canvasRef.current)
+    focusSoon(previewFocusTarget)
   }
 
   const enterCommentMode = () => {
@@ -418,7 +446,7 @@ export function ContainerWebPreview({
     setMode('comment')
     setSurface(currentDraft ? 'draftEditor' : 'none')
     setAnnouncement(currentDraft ? '已恢复未保存的元素评论' : '评论模式：点按页面元素添加修改意见')
-    if (!currentDraft) focusSoon(() => canvasRef.current)
+    if (!currentDraft) focusSoon(previewFocusTarget)
   }
 
   const leaveCommentMode = () => {
@@ -501,7 +529,7 @@ export function ContainerWebPreview({
     setDraft(null)
     setSurface('none')
     setAnnouncement(current.editingId ? '评论已保存' : '评论已添加')
-    focusSoon(() => pinRefs.current.get(savedId) ?? canvasRef.current)
+    focusSoon(() => pinRefs.current.get(savedId) ?? previewFocusTarget())
   }
 
   const deleteAnnotation = (id: string, index: number, focus: 'drawer' | 'canvas' = 'canvas') => {
@@ -518,7 +546,7 @@ export function ContainerWebPreview({
         return neighbor ? drawerItemRefs.current.get(neighbor.id) : drawerCloseRef.current
       }
       const neighbor = remaining[index] ?? remaining[index - 1]
-      return neighbor ? pinRefs.current.get(neighbor.id) : canvasRef.current
+      return neighbor ? pinRefs.current.get(neighbor.id) : previewFocusTarget()
     })
   }
 
@@ -592,7 +620,7 @@ export function ContainerWebPreview({
           else if (activeSurface === 'draftEditor') hideDraftEditor()
           else {
             setSurface('none')
-            focusSoon(() => canvasRef.current)
+            focusSoon(previewFocusTarget)
           }
           return
         }
@@ -690,6 +718,17 @@ export function ContainerWebPreview({
                   <Smartphone size={17} />
                 </DeviceButton>
               </div>
+              {session.transport === 'direct' && (
+                <button
+                  type="button"
+                  onClick={session.useLegacyFallback}
+                  aria-label="切换兼容预览"
+                  title="兼容模式（远程浏览器）"
+                  className="preview-icon-button"
+                >
+                  <RefreshCw size={16} />
+                </button>
+              )}
             </div>
           </header>
         ) : (
@@ -731,9 +770,15 @@ export function ContainerWebPreview({
 
         <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2 pb-[calc(88px+env(safe-area-inset-bottom))] pt-[calc(76px+env(safe-area-inset-top))] sm:px-6 sm:pb-24 sm:pt-20">
           {!hasError && (
-            <PreviewStatus phase={session.phase} ready={ready} frameStats={frameStats} />
+            <PreviewStatus
+              phase={session.phase}
+              ready={ready}
+              frameStats={frameStats}
+              transport={session.transport}
+            />
           )}
           <div
+            ref={viewportRef}
             className={cn(
               'preview-viewport relative max-h-full max-w-full overflow-hidden bg-[#181a20]',
               device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl',
@@ -741,31 +786,71 @@ export function ContainerWebPreview({
             )}
             style={{ aspectRatio: `${viewport.width} / ${viewport.height}`, width: previewWidth }}
           >
-            <canvas
-              ref={canvasRef}
-              tabIndex={ready ? 0 : -1}
-              aria-label={mode === 'comment' ? '网页画面，点按选择评论元素' : '可交互网页画面'}
-              aria-disabled={!ready}
-              className={cn(
-                'block size-full touch-none select-none object-fill outline-none',
-                mode === 'comment' && ready ? 'cursor-crosshair' : 'cursor-default',
-              )}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={() => {
-                pointerStartRef.current = null
-              }}
-              onContextMenu={(event) => event.preventDefault()}
-              onWheel={onWheel}
-              onKeyDown={(event) => {
-                if (!ready || mode !== 'interact' || event.nativeEvent.isComposing) return
-                const key = keyboardShortcut(event)
-                if (!key) return
-                event.preventDefault()
-                sendControl({ type: 'preview.key', key })
-              }}
-            />
+            {session.transport === 'direct' && session.directUrl ? (
+              <>
+                <iframe
+                  ref={iframeRef}
+                  src={session.directUrl}
+                  title="容器内网页原生预览"
+                  sandbox="allow-scripts allow-forms allow-same-origin allow-modals allow-popups"
+                  referrerPolicy="no-referrer"
+                  className={cn(
+                    'absolute left-0 top-0 border-0 bg-white outline-none',
+                    mode === 'comment' && 'pointer-events-none',
+                  )}
+                  style={{
+                    width: `${viewport.width}px`,
+                    height: `${viewport.height}px`,
+                    transform: `scale(${directScale})`,
+                    transformOrigin: 'top left',
+                  }}
+                  onError={session.useLegacyFallback}
+                />
+                {mode === 'comment' && ready && (
+                  <div
+                    // biome-ignore lint/a11y/noNoninteractiveTabindex: the overlay is the keyboard focus surface for coordinate-based DOM selection
+                    tabIndex={0}
+                    role="application"
+                    aria-label="网页画面，点按选择评论元素"
+                    className="absolute inset-0 z-[5] touch-none cursor-crosshair outline-none"
+                    onPointerDown={onPointerDown}
+                    onPointerMove={onPointerMove}
+                    onPointerUp={onPointerUp}
+                    onPointerCancel={() => {
+                      pointerStartRef.current = null
+                    }}
+                    onContextMenu={(event) => event.preventDefault()}
+                    onWheel={onWheel}
+                  />
+                )}
+              </>
+            ) : (
+              <canvas
+                ref={canvasRef}
+                tabIndex={ready ? 0 : -1}
+                aria-label={mode === 'comment' ? '网页画面，点按选择评论元素' : '可交互网页画面'}
+                aria-disabled={!ready}
+                className={cn(
+                  'block size-full touch-none select-none object-fill outline-none',
+                  mode === 'comment' && ready ? 'cursor-crosshair' : 'cursor-default',
+                )}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={() => {
+                  pointerStartRef.current = null
+                }}
+                onContextMenu={(event) => event.preventDefault()}
+                onWheel={onWheel}
+                onKeyDown={(event) => {
+                  if (!ready || mode !== 'interact' || event.nativeEvent.isComposing) return
+                  const key = keyboardShortcut(event)
+                  if (!key) return
+                  event.preventDefault()
+                  sendControl({ type: 'preview.key', key })
+                }}
+              />
+            )}
 
             {visibleTargets.map(({ key, target, label, active, missing, annotation }) => (
               <div
@@ -803,7 +888,7 @@ export function ContainerWebPreview({
               </div>
             ))}
 
-            {!frameStats && !hasError && (
+            {!ready && !hasError && (
               <output
                 aria-live="polite"
                 className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#15171c] text-center"
@@ -814,7 +899,11 @@ export function ContainerWebPreview({
                 <span className="text-sm font-medium text-white/75">
                   {PHASE_LABEL[session.phase] ?? '正在准备预览'}
                 </span>
-                <span className="text-xs text-white/35">首次启动独立浏览器可能需要几秒</span>
+                <span className="text-xs text-white/35">
+                  {session.transport === 'direct'
+                    ? '正在建立原生网页通道，失败会自动切换兼容模式'
+                    : '首次启动独立浏览器可能需要几秒'}
+                </span>
               </output>
             )}
 
@@ -822,7 +911,9 @@ export function ContainerWebPreview({
               <PreviewError
                 detail={session.error?.message ?? '网页预览连接已断开'}
                 retryable={session.error?.retryable ?? true}
-                onRetry={() => reconnect()}
+                onRetry={() =>
+                  session.transport === 'direct' ? session.useLegacyFallback() : reconnect()
+                }
               />
             )}
           </div>
@@ -844,7 +935,7 @@ export function ContainerWebPreview({
                 active
                 label="操作"
                 icon={<Hand size={20} />}
-                onClick={() => focusSoon(() => canvasRef.current)}
+                onClick={() => focusSoon(previewFocusTarget)}
               />
               <PreviewActionButton
                 buttonRef={commentActionRef}
@@ -873,7 +964,7 @@ export function ContainerWebPreview({
               setTextInput('')
               setSurface('none')
               setAnnouncement('文字已输入到网页当前焦点')
-              focusSoon(() => canvasRef.current)
+              focusSoon(previewFocusTarget)
             }}
           >
             <div className="preview-composer">
@@ -882,7 +973,7 @@ export function ContainerWebPreview({
                 aria-label="关闭文字输入"
                 onClick={() => {
                   setSurface('none')
-                  focusSoon(() => canvasRef.current)
+                  focusSoon(previewFocusTarget)
                 }}
                 className="preview-icon-button"
               >
@@ -1010,15 +1101,22 @@ function PreviewStatus({
   phase,
   ready,
   frameStats,
+  transport,
 }: {
   phase: string
   ready: boolean
   frameStats: FrameStats | null
+  transport: ContainerPreviewTransport
 }) {
   return (
     <output className="preview-status-pill" aria-live="polite">
       <span className={cn('size-1.5 rounded-full', ready ? 'bg-emerald-400' : 'bg-amber-300')} />
       <span>{PHASE_LABEL[phase] ?? phase}</span>
+      {ready && transport === 'direct' && (
+        <span className="hidden border-l border-white/10 pl-2 text-emerald-200/65 sm:inline">
+          原生清晰预览
+        </span>
+      )}
       {frameStats && (
         <span className="hidden border-l border-white/10 pl-2 text-white/40 lg:inline">
           {frameStats.width}×{frameStats.height} · {frameStats.fps} fps ·{' '}

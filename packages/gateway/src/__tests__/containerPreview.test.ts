@@ -1,11 +1,20 @@
 import assert from 'node:assert/strict'
 import { sign as cryptoSign, generateKeyPairSync } from 'node:crypto'
-import { type IncomingMessage, createServer } from 'node:http'
+import {
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  createServer,
+  request as httpRequest,
+} from 'node:http'
 import { after, before, describe, test } from 'node:test'
 
 import {
   CONTAINER_PREVIEW_ASSERTION_HEADER,
+  CONTAINER_PREVIEW_DIRECT_BRIDGE_PATH,
+  CONTAINER_PREVIEW_DIRECT_PROXY_PATH,
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
+  CONTAINER_PREVIEW_TARGET_HEADER,
+  CONTAINER_PREVIEW_VIEWPORT_HEADER,
   encodeAuthorityKeyring,
 } from '@openclaude/protocol'
 import {
@@ -15,7 +24,7 @@ import {
   encodeContainerPreviewAssertion,
 } from '@openclaude/protocol/containerPreviewAuth'
 
-import { WebSocket } from 'ws'
+import { WebSocket, WebSocketServer } from 'ws'
 import {
   ContainerPreviewHandler,
   probeHtmlApplication,
@@ -107,6 +116,217 @@ describe('container preview upgrade authorization', () => {
     assert.throws(() => verifyContainerPreviewUpgrade(request('172.31.0.1'), env, now + 30_000))
   })
 })
+
+test('signed direct HTTP proxy injects the platform bridge and consumes assertions once', async () => {
+  let seenHost = ''
+  let seenCookie = ''
+  const app = createServer((req, res) => {
+    seenHost = req.headers.host ?? ''
+    seenCookie = req.headers.cookie ?? ''
+    const html = '<!doctype html><html><head><title>native</title></head><body>ok</body></html>'
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Length': String(Buffer.byteLength(html)),
+      ETag: 'stale-after-injection',
+    })
+    res.end(html)
+  })
+  await new Promise<void>((resolve) => app.listen(0, '127.0.0.1', resolve))
+  const appAddress = app.address()
+  if (!appAddress || typeof appAddress === 'string') throw new Error('app did not bind')
+  const targetUrl = `http://127.0.0.1:${appAddress.port}/page?q=1`
+  const handler = new ContainerPreviewHandler({ env: previewEnv, now: () => now + 1 })
+  const gateway = createServer((req, res) => {
+    if (!handler.handleHttp(req, res)) {
+      res.statusCode = 404
+      res.end()
+    }
+  })
+  await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+  const gatewayAddress = gateway.address()
+  if (!gatewayAddress || typeof gatewayAddress === 'string') throw new Error('gateway did not bind')
+
+  const assertion = signedAssertion({
+    sessionId: 'd'.repeat(32),
+    targetHash: containerPreviewTargetHash(targetUrl, viewport),
+  })
+  const headers = {
+    [CONTAINER_PREVIEW_ASSERTION_HEADER]: assertion,
+    [CONTAINER_PREVIEW_TARGET_HEADER]: targetUrl,
+    [CONTAINER_PREVIEW_VIEWPORT_HEADER]: JSON.stringify(viewport),
+    Cookie: '__Host-oc_preview=platform-secret; app_cookie=kept',
+  }
+  try {
+    const response = await httpCall(
+      gatewayAddress.port,
+      CONTAINER_PREVIEW_DIRECT_PROXY_PATH,
+      headers,
+    )
+    assert.equal(response.status, 200)
+    assert.match(
+      response.body,
+      new RegExp(CONTAINER_PREVIEW_DIRECT_BRIDGE_PATH.replaceAll('/', '\\/')),
+    )
+    assert.equal(response.headers.etag, undefined)
+    assert.equal(Number(response.headers['content-length']), Buffer.byteLength(response.body))
+    assert.equal(seenHost, `127.0.0.1:${appAddress.port}`)
+    assert.equal(seenCookie, 'app_cookie=kept')
+
+    const replay = await httpCall(gatewayAddress.port, CONTAINER_PREVIEW_DIRECT_PROXY_PATH, headers)
+    assert.equal(replay.status, 401)
+  } finally {
+    await handler.shutdown()
+    await new Promise<void>((resolve) => gateway.close(() => resolve()))
+    await new Promise<void>((resolve) => app.close(() => resolve()))
+  }
+})
+
+test('signed direct HTTP proxy tears down a streaming target when its downstream closes', async () => {
+  let closeTarget!: () => void
+  const targetClosed = new Promise<void>((resolve) => {
+    closeTarget = resolve
+  })
+  const app = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+    const timer = setInterval(() => res.write('stream-chunk\n'), 5)
+    res.once('close', () => {
+      clearInterval(timer)
+      closeTarget()
+    })
+  })
+  await new Promise<void>((resolve) => app.listen(0, '127.0.0.1', resolve))
+  const appAddress = app.address()
+  if (!appAddress || typeof appAddress === 'string') throw new Error('app did not bind')
+  const targetUrl = `http://127.0.0.1:${appAddress.port}/stream`
+  const handler = new ContainerPreviewHandler({ env: previewEnv, now: () => now + 1 })
+  const gateway = createServer((req, res) => {
+    if (!handler.handleHttp(req, res)) res.writeHead(404).end()
+  })
+  await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+  const gatewayAddress = gateway.address()
+  if (!gatewayAddress || typeof gatewayAddress === 'string') throw new Error('gateway did not bind')
+  const headers = {
+    [CONTAINER_PREVIEW_ASSERTION_HEADER]: signedAssertion({
+      sessionId: 'f'.repeat(32),
+      targetHash: containerPreviewTargetHash(targetUrl, viewport),
+    }),
+    [CONTAINER_PREVIEW_TARGET_HEADER]: targetUrl,
+    [CONTAINER_PREVIEW_VIEWPORT_HEADER]: JSON.stringify(viewport),
+  }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gatewayAddress.port,
+          path: CONTAINER_PREVIEW_DIRECT_PROXY_PATH,
+          headers,
+        },
+        (res) => {
+          res.once('data', () => {
+            res.destroy()
+            resolve()
+          })
+        },
+      )
+      req.once('error', reject)
+      req.end()
+    })
+    await Promise.race([
+      targetClosed,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('stream target was not closed')), 500),
+      ),
+    ])
+  } finally {
+    await handler.shutdown()
+    await new Promise<void>((resolve) => gateway.close(() => resolve()))
+    await new Promise<void>((resolve) => app.close(() => resolve()))
+  }
+})
+
+test('signed direct WebSocket proxy preserves HMR-style upgrades without leaking platform state', async () => {
+  let seenOrigin = ''
+  let seenCookie = ''
+  const app = createServer()
+  const appWss = new WebSocketServer({ server: app })
+  appWss.on('connection', (socket, req) => {
+    seenOrigin = req.headers.origin ?? ''
+    seenCookie = req.headers.cookie ?? ''
+    socket.on('message', (data) => socket.send(`echo:${data.toString()}`))
+  })
+  await new Promise<void>((resolve) => app.listen(0, '127.0.0.1', resolve))
+  const appAddress = app.address()
+  if (!appAddress || typeof appAddress === 'string') throw new Error('app did not bind')
+  const targetUrl = `http://127.0.0.1:${appAddress.port}/hmr`
+
+  const handler = new ContainerPreviewHandler({ env: previewEnv, now: () => now + 1 })
+  const gateway = createServer()
+  gateway.on('upgrade', (req, socket, head) => {
+    if (!handler.handleUpgrade(req, socket, head)) socket.destroy()
+  })
+  await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+  const gatewayAddress = gateway.address()
+  if (!gatewayAddress || typeof gatewayAddress === 'string') throw new Error('gateway did not bind')
+  const assertion = signedAssertion({
+    sessionId: 'e'.repeat(32),
+    targetHash: containerPreviewTargetHash(targetUrl, viewport),
+  })
+  const client = new WebSocket(
+    `ws://127.0.0.1:${gatewayAddress.port}${CONTAINER_PREVIEW_DIRECT_PROXY_PATH}`,
+    {
+      headers: {
+        [CONTAINER_PREVIEW_ASSERTION_HEADER]: assertion,
+        [CONTAINER_PREVIEW_TARGET_HEADER]: targetUrl,
+        [CONTAINER_PREVIEW_VIEWPORT_HEADER]: JSON.stringify(viewport),
+        Cookie: '__Host-oc_preview=platform-secret; hmr_cookie=kept',
+        Origin: 'https://alpha-preview.trycloudflare.com',
+      },
+    },
+  )
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.once('open', resolve)
+      client.once('error', reject)
+    })
+    const echoed = await new Promise<string>((resolve, reject) => {
+      client.once('message', (data) => resolve(data.toString()))
+      client.once('error', reject)
+      client.send('hot-update')
+    })
+    assert.equal(echoed, 'echo:hot-update')
+    assert.equal(seenOrigin, `http://127.0.0.1:${appAddress.port}`)
+    assert.equal(seenCookie, 'hmr_cookie=kept')
+  } finally {
+    client.terminate()
+    await handler.shutdown()
+    await new Promise<void>((resolve) => gateway.close(() => resolve()))
+    await new Promise<void>((resolve) => appWss.close(() => resolve()))
+    await new Promise<void>((resolve) => app.close(() => resolve()))
+  }
+})
+
+async function httpCall(
+  port: number,
+  path: string,
+  headers: Record<string, string>,
+): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
+  return await new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port, path, headers }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode ?? 0,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+      })
+    })
+    req.on('error', reject)
+    req.end()
+  })
+}
 
 test('container preview capability is explicit and fail-closed', async () => {
   const disabledEnvs = [

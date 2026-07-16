@@ -823,6 +823,11 @@ export type ContainerPreviewTicketResponse = {
   url: string;
   viewport: ContainerPreviewViewport;
   protocol: "preview-v1";
+  direct?: {
+    sessionId: string;
+    url: string;
+    expiresAt: number;
+  };
 };
 
 export const api = {
@@ -3223,6 +3228,7 @@ export const api = {
     a: AuthSession,
     url: string,
     viewport: ContainerPreviewViewport,
+    options?: { direct?: boolean },
   ): Promise<ContainerPreviewTicketResponse> =>
     jsonOrThrow<ContainerPreviewTicketResponse>(
       callWithRefresh(a, (token) =>
@@ -3230,10 +3236,35 @@ export const api = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(token, true),
-          body: JSON.stringify({ url, viewport }),
+          body: JSON.stringify({ url, viewport, ...options }),
         }),
       ),
     ),
+
+  heartbeatContainerPreview: (a: AuthSession, sessionId: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/container-preview/heartbeat", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({ sessionId }),
+        }),
+      ),
+    ).then(() => undefined),
+
+  revokeContainerPreview: (a: AuthSession, sessionId: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/container-preview/revoke", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({ sessionId }),
+          keepalive: true,
+        }),
+      ),
+    ).then(() => undefined),
 
   // ── 逐条响应评价反馈（commercial REST，需登录 401，限流 60/60s） ──────────────
   //

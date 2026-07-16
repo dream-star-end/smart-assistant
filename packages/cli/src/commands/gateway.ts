@@ -132,6 +132,9 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
       // (spa=web-react/dist);透传避免 commercial 侧二次推导。vanilla(v3)不传 → 功能 inert。
       commercial = await mod.registerCommercial(null, {
         webDistDir: staticMode === 'spa' ? webRoot : undefined,
+        // 双 slot 的 gateway.port 不同(A=18790/B=18795)。Quick Tunnel 必须
+        // 回源到当前进程的实际监听端口,不能由 commercial 侧猜 slot。
+        gatewayPort: config.gateway.port,
       })
       console.log('[cli] commercial module registered (v3 mode)')
     } catch (err) {

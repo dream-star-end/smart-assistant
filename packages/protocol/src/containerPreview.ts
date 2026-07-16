@@ -9,8 +9,16 @@
 export const CONTAINER_PREVIEW_PROTOCOL_VERSION = 1 as const
 export const CONTAINER_PREVIEW_PUBLIC_WS_PATH = '/ws/container-preview'
 export const CONTAINER_PREVIEW_INTERNAL_WS_PATH = '/ws/container-preview'
+/** Master-authenticated direct HTTP/WS proxy entry on the container gateway. */
+export const CONTAINER_PREVIEW_DIRECT_PROXY_PATH = '/__oc_preview_proxy'
+/** Platform-owned resources served by the public preview host, never by the user app. */
+export const CONTAINER_PREVIEW_DIRECT_BOOTSTRAP_PATH = '/__oc_preview_bootstrap'
+export const CONTAINER_PREVIEW_DIRECT_BRIDGE_PATH = '/__oc_preview_bridge.js'
+export const CONTAINER_PREVIEW_DIRECT_COOKIE = '__Host-oc_preview'
 export const CONTAINER_PREVIEW_TICKET_PROTOCOL = 'preview-v1'
 export const CONTAINER_PREVIEW_ASSERTION_HEADER = 'x-openclaude-preview-assertion'
+export const CONTAINER_PREVIEW_TARGET_HEADER = 'x-openclaude-preview-target'
+export const CONTAINER_PREVIEW_VIEWPORT_HEADER = 'x-openclaude-preview-viewport'
 export const OPENCLAUDE_CONTAINER_GATEWAY_PORT = 18_789
 
 export const CONTAINER_PREVIEW_BINARY_MAGIC = 'OCPF'

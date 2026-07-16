@@ -149,4 +149,34 @@ describe('makeUidSingleflight', () => {
     await sf(50n)
     assert.equal(calls, 101)
   })
+
+  test('cloneResult 给并发 caller 独立 secret,共享结果在 fan-out 后清零', async () => {
+    const d = defer<{ secret: Buffer }>()
+    const shared = { secret: Buffer.from('shared-secret') }
+    const sf = makeUidSingleflight(async () => d.promise, {
+      cloneResult: (value) => ({ secret: Buffer.from(value.secret) }),
+      disposeSharedResult: (value) => value.secret.fill(0),
+    })
+
+    const p1 = sf(88n)
+    const p2 = sf(88n)
+    d.resolve(shared)
+    const [one, two] = await Promise.all([p1, p2])
+
+    assert.notEqual(one, two)
+    assert.notEqual(one.secret, two.secret)
+    assert.equal(one.secret.toString(), 'shared-secret')
+    assert.equal(two.secret.toString(), 'shared-secret')
+    assert.equal(
+      shared.secret.every((byte) => byte === 0),
+      true,
+    )
+
+    one.secret.fill(0)
+    assert.equal(
+      two.secret.toString(),
+      'shared-secret',
+      'one transport cleanup must not break another',
+    )
+  })
 })
