@@ -25,7 +25,11 @@ import {
   type CommercialHttpDeps,
   type RequestContext,
 } from "./handlers.js";
-import { listSessionRatings, upsertResponseRating } from "../responseRatings.js";
+import {
+  isImplicitRating,
+  listSessionRatings,
+  upsertResponseRating,
+} from "../responseRatings.js";
 
 const RATING_VALUES = new Set(["up", "down"]);
 const MAX_MESSAGE_ID = 256;
@@ -110,6 +114,13 @@ export async function handlePostResponseRating(
   const { tags, comment } = normalizeResponseRatingReason(
     rating as "up" | "down", body.tags, body.comment,
   );
+
+  // 隐式弱信号(方案 b)只有"弱差评"一种语义:implicit + up 无意义,硬拒防误用。
+  if (isImplicitRating(tags) && rating !== "down") {
+    throw new HttpError(400, "VALIDATION", "implicit rating must be 'down'", {
+      issues: [{ path: "tags", message: "implicit tag requires rating=down" }],
+    });
+  }
 
   await upsertResponseRating({
     userId: user.id,

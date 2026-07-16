@@ -1328,7 +1328,9 @@ export async function listApprovedForSearch(
                     FROM (SELECT DISTINCT e.slug, r.user_id, r.message_id, r.rating
                             FROM marketplace_skill_usage_events e
                             JOIN response_rating r ON r.trace_id = e.trace_id
-                           WHERE e.trace_id IS NOT NULL AND e.layer = 'hub') d
+                           WHERE e.trace_id IS NOT NULL AND e.layer = 'hub'
+                             -- 公开评分口径只认显式评分:隐式弱信号(implicit)不进上架分
+                             AND NOT ('implicit' = ANY(r.tags))) d
                    GROUP BY slug) rt ON rt.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (
@@ -1454,8 +1456,10 @@ export interface ListingDetail {
   users30d: number
   /** 评分归因(样本 <RATING_MIN_SAMPLE → null)。 */
   rating: { up: number; down: number } | null
-  /** connector-only：官方身份与已签执行契约的人向投影。 */
+  /** connector-only：官方身份比预装更宽；官方 Plugin 仍可能需要用户安装。 */
   official?: boolean
+  /** connector-only：精确命中平台默认工件，无需也不允许走市场安装。 */
+  preinstalled?: boolean
   connectorContract?: {
     authMode: string
     approvedOrigins: string[]
@@ -1530,7 +1534,9 @@ export async function getListingDetail(
                         FROM marketplace_skill_usage_events e
                         JOIN response_rating r ON r.trace_id = e.trace_id
                        WHERE e.trace_id IS NOT NULL AND e.slug = l.slug
-                         AND e.layer = 'hub') d
+                         AND e.layer = 'hub'
+                         -- 公开评分口径只认显式评分(与 catalog 聚合同步改)
+                         AND NOT ('implicit' = ANY(r.tags))) d
             ) rt ON true
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (
@@ -1577,6 +1583,7 @@ export async function getListingDetail(
       throw error
     }
   }
+  const preinstalled = x.kind === 'connector' && isDefaultConnectorArtifact(x.slug, x.artifact_hash)
   return {
     slug: x.slug,
     kind: x.kind as ArtifactKind,
@@ -1615,7 +1622,7 @@ export async function getListingDetail(
     ...(x.kind === 'connector'
       ? {
           official:
-            isDefaultConnectorArtifact(x.slug, x.artifact_hash) ||
+            preinstalled ||
             isOfficialKnowledgePlanetPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
@@ -1623,6 +1630,7 @@ export async function getListingDetail(
               execContractHash: verifiedRuntimeExecContractHash,
               reviewSource: x.review_source,
             }),
+          preinstalled,
           connectorContract,
         }
       : {}),
