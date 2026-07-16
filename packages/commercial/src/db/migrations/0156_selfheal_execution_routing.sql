@@ -36,3 +36,18 @@ UPDATE incident_policies
 UPDATE incident_policies
    SET execution_class = 'tier1', action_opcode = 'clean-v5-disk-v1', updated_at = NOW()
  WHERE match_kind = 'prefix' AND match_key = 'ops.monitor:disk';
+
+-- 授权路由必须在**派单时**快照到 repair 行(Codex R? BLOCKER1):context 若从
+-- 可变的当前 policy 读 execution_class/opcode,派单后有人改 policy 就会让一个已
+-- 冻结为 tier1 的 repair 误启 tier2 codex。codex_repairs.action_opcode 与既有
+-- tier 列一起,在 dispatchRepair 的 INSERT 同事务从 policy 快照;context 之后只
+-- 读 repair 行,不再 join policy 的路由字段。CHECK 与 policy 侧同构。
+ALTER TABLE codex_repairs
+  ADD COLUMN IF NOT EXISTS action_opcode TEXT;
+ALTER TABLE codex_repairs
+  DROP CONSTRAINT IF EXISTS codex_repairs_tier1_opcode_ck;
+ALTER TABLE codex_repairs
+  ADD CONSTRAINT codex_repairs_tier1_opcode_ck CHECK (
+    (tier = 'tier1' AND action_opcode IS NOT NULL) OR
+    (tier = 'tier2' AND action_opcode IS NULL)
+  );

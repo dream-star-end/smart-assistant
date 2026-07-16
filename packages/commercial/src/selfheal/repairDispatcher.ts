@@ -313,12 +313,14 @@ export async function dispatchRepair(
       // condition 仍 firing **且未被压制**(H1b:operator 压制中不派修)。若在步1读到
       // open 之后 condition 已恢复 / incident 被 resolve / 被压制,SELECT 返 0 行 →
       // 不插入 → 不派单(绝不对已恢复/已压制系统派 codex 改动)。
-      // tier 从 policy.execution_class 派生(批1a:tier1 运维动作走纯机器路径,
-      // tier 列成为执行侧分流权威;policy 无命中/未声明 → 保守 tier2)。
+      // 授权路由在派单时快照到 repair(BLOCKER1):tier + action_opcode 同事务
+      // 从 policy 冻结,此后 context 只读 repair 行——派单后改 policy 不影响已
+      // 派 repair 的 tier/opcode。policy 无命中/未声明 → 保守 tier2(opcode NULL)。
       const ins = await client.query<{ id: string; attempt: number }>(
-        `INSERT INTO codex_repairs (incident_id, status, attempt, tier, created_at, updated_at)
+        `INSERT INTO codex_repairs (incident_id, status, attempt, tier, action_opcode, created_at, updated_at)
          SELECT i.id, 'pending', COALESCE(MAX(cr.attempt), 0) + 1,
                 CASE WHEN p.execution_class = 'tier1' THEN 'tier1' ELSE 'tier2' END,
+                CASE WHEN p.execution_class = 'tier1' THEN p.action_opcode ELSE NULL END,
                 NOW(), NOW()
            FROM incidents i
            LEFT JOIN codex_repairs cr ON cr.incident_id = i.id
@@ -328,7 +330,7 @@ export async function dispatchRepair(
             AND i.status <> 'resolved'
             AND COALESCE(c.firing, FALSE) = TRUE
             AND NOT COALESCE(c.suppressed_until_clear, FALSE)
-          GROUP BY i.id, p.execution_class
+          GROUP BY i.id, p.execution_class, p.action_opcode
          RETURNING id::text AS id, attempt`,
         [incidentId],
       );

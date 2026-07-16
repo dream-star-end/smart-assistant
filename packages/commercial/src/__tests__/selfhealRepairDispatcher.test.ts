@@ -41,6 +41,7 @@ function makeFake(opts: FakeOpts = {}) {
     casCalls: [] as string[],
     insertedId: "10",
     insertedAttempt: 1,
+    insertSql: "",
   };
   const fakeQuery = (async (sql: string, params?: unknown[]) => {
     state.queries.push(sql);
@@ -74,6 +75,7 @@ function makeFake(opts: FakeOpts = {}) {
           // insertNoRow: the guarded INSERT…SELECT matched 0 rows (incident
           // resolved / condition recovered between read and insert) — H2 TOCTOU.
           if (opts.insertNoRow) return qr([]);
+          state.insertSql = sql; // BLOCKER1: assert tier+opcode frozen in this INSERT
           return qr([{ id: state.insertedId, attempt: state.insertedAttempt }]);
         }
         if (/UPDATE codex_repairs/.test(sql)) {
@@ -191,6 +193,9 @@ describe("repairDispatcher.dispatchRepair", () => {
     const r = await dispatchRepair("7", { query: fakeQuery, tx: fakeTx, fetch: fetchFn, now: () => NOW });
     assert.equal(r.status, "dispatched");
     assert.equal((r as { repairId: string }).repairId, "10");
+    // BLOCKER1:INSERT 同事务从 policy 快照 tier + action_opcode 到 repair 行。
+    assert.match(state.insertSql, /action_opcode/);
+    assert.match(state.insertSql, /p\.execution_class = 'tier1'/);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal");
     const h = calls[0].init.headers;

@@ -52,7 +52,6 @@ interface ContextRow {
   match_key: string | null;
   repair_hint: string | null;
   snapshot: unknown;
-  execution_class: string | null;
   action_opcode: string | null;
 }
 
@@ -83,8 +82,7 @@ export async function getRepairContext(
             i.ops_detail         AS ops_detail,
             p.match_key          AS match_key,
             p.repair_hint        AS repair_hint,
-            p.execution_class    AS execution_class,
-            p.action_opcode      AS action_opcode,
+            r.action_opcode      AS action_opcode,
             c.snapshot           AS snapshot
        FROM codex_repairs r
        JOIN incidents i           ON i.id = r.incident_id
@@ -110,9 +108,10 @@ export async function getRepairContext(
     // M4:repair_hint 虽是 admin 配的策略文本,仍可能被贴进凭据 → 同口径出口清洗。
     repairHint: row.repair_hint === null ? null : scrubSecretsInString(row.repair_hint),
     tier: row.tier,
-    // 路由权威:policy 无命中(match_key=null)时保守判 tier2(绝不让未知
-    // condition 落入自动运维动作);tier1 必带 opcode(0156 CHECK 保证)。
-    executionClass: row.execution_class === "tier1" ? "tier1" : "tier2",
-    actionOpcode: row.execution_class === "tier1" ? row.action_opcode : null,
+    // 路由权威 = **派单时冻结在 repair 行**的 tier + action_opcode(BLOCKER1),
+    // 不读可变的当前 policy。executionClass 直接由 r.tier 派生(DB CHECK 保证
+    // tier1⇔opcode 非空),二者天然一致——执行侧再校验 tier===executionClass。
+    executionClass: row.tier === "tier1" ? "tier1" : "tier2",
+    actionOpcode: row.tier === "tier1" ? row.action_opcode : null,
   };
 }

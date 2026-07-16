@@ -72,6 +72,15 @@ beforeEach(async () => {
      RESTART IDENTITY CASCADE`,
   );
   await query(`UPDATE incident_policies SET enabled = TRUE WHERE match_key = 'ops.monitor:svc_v5'`);
+  // 恢复 0156 Tier1 路由姿态(某些用例会临时改 egress policy 验证冻结独立性)。
+  await query(
+    `UPDATE incident_policies SET execution_class='tier1', action_opcode='restart-v5-egress-v1'
+      WHERE match_key IN ('ops.monitor:svc_egress','ops.monitor:http_egress')`,
+  );
+  await query(
+    `UPDATE incident_policies SET execution_class='tier1', action_opcode='clean-v5-disk-v1'
+      WHERE match_key='ops.monitor:disk'`,
+  );
   _resetPolicyCacheForTest();
 });
 
@@ -100,14 +109,17 @@ async function openIncident(key = KEY): Promise<string> {
 async function insertRepair(
   incidentId: string,
   status: string,
-  opts: { verifyAfterOffsetMs?: number; tier?: string } = {},
+  opts: { verifyAfterOffsetMs?: number; tier?: string; actionOpcode?: string } = {},
 ): Promise<string> {
   const off = opts.verifyAfterOffsetMs ?? -2_000; // 默认 verify_after 在过去 → 观测天然新鲜
+  const tier = opts.tier ?? "tier2";
+  // codex_repairs_tier1_opcode_ck:tier1 必带 opcode,tier2 必空。
+  const opcode = tier === "tier1" ? (opts.actionOpcode ?? "restart-v5-egress-v1") : null;
   const r = await query<{ id: string }>(
-    `INSERT INTO codex_repairs (incident_id, status, attempt, tier, verify_after, verify_deadline, created_at, updated_at)
-     VALUES ($1::bigint, $2, 1, $4, NOW() + ($3 || ' milliseconds')::interval, NOW() + interval '10 minutes', NOW(), NOW())
+    `INSERT INTO codex_repairs (incident_id, status, attempt, tier, action_opcode, verify_after, verify_deadline, created_at, updated_at)
+     VALUES ($1::bigint, $2, 1, $4, $5, NOW() + ($3 || ' milliseconds')::interval, NOW() + interval '10 minutes', NOW(), NOW())
      RETURNING id::text AS id`,
-    [incidentId, status, String(off), opts.tier ?? "tier2"],
+    [incidentId, status, String(off), tier, opcode],
   );
   return r.rows[0].id;
 }
@@ -242,6 +254,23 @@ describe("批1a Tier1 执行路由", () => {
     assert.equal(ctx?.executionClass, "tier1");
     assert.equal(ctx?.actionOpcode, "restart-v5-egress-v1");
   });
+
+  test("BLOCKER1:派单后改 policy,repair 路由不变(context 从 repair 冻结读)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const incidentId = await openIncident(EGRESS);
+    // 已派单 repair 快照 tier1+opcode(生产由 dispatchRepair INSERT 冻结):
+    const repairId = await insertRepair(incidentId, "running", { tier: "tier1" });
+    // 派单之后有人把 policy 改成 tier2:
+    await query(
+      `UPDATE incident_policies SET execution_class='tier2', action_opcode=NULL WHERE match_key=$1`,
+      [EGRESS],
+    );
+    const { getRepairContext } = await import("../selfheal/repairContext.js");
+    const ctx = await getRepairContext(repairId, { query });
+    assert.equal(ctx?.executionClass, "tier1", "路由冻结在 repair 行,不受 policy 后改影响");
+    assert.equal(ctx?.actionOpcode, "restart-v5-egress-v1");
+  });
+
 
   test("probe 让位:tier1 repair 活跃(running)时不抢关 incident", async (t) => {
     if (skipIfNoPg(t)) return;
