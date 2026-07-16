@@ -5278,21 +5278,22 @@ export class Gateway {
    * POST /api/uploads — streaming single-file upload (Plan B 2026-05-09).
    *
    * Body is the raw file bytes. Required headers:
-   *   - Content-Type: file MIME type (validated against UPLOAD_MIME_PREFIXES)
+   *   - Content-Type: claimed file MIME type (metadata only; all formats accepted)
    * Optional:
    *   - Content-Length: when present, used for early reject (saves bandwidth);
    *     when absent, streaming guard rejects mid-stream if bytes > MAX_UPLOAD_SINGLE.
-   *   - X-Filename: URL-encoded original filename (display only; doesn't affect storage).
+   *   - X-Filename: URL-encoded original filename. Only its safe final extension may
+   *     be used as a storage suffix when MIME has no canonical mapping.
    *
    * Response: 200 { url, digest, size, mimeType }
-   * Errors: 400 / 413 (too large) / 415 (mime) / 500 (write failed)
+   * Errors: 400 / 413 (too large) / 500 (write failed)
    *
    * Storage: streams to `<uploadsDir>/.tmp-<random>` while computing sha256;
    * on success atomically renames to `<digest>.<ext>`. If a file with the
    * same digest already exists, dedups (tmp removed, existing path returned).
    */
   private async handleUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // ── 1. MIME validation ──
+    // ── 1. MIME metadata ──
     const ctype = (req.headers['content-type'] || '').toString().split(';')[0].trim().toLowerCase()
     if (!ctype) {
       this.sendError(res, 400, 'missing content-type')
@@ -5586,7 +5587,10 @@ export class Gateway {
 
       // ── 5. Compute final name + per-user prep + atomic publish ──
       const digest = hash.digest('hex')
-      const ext = uploadExtForMime(ctype)
+      const filenameHint = typeof req.headers['x-filename'] === 'string'
+        ? req.headers['x-filename']
+        : undefined
+      const ext = uploadExtForMime(ctype, filenameHint)
       const finalName = `${digest}.${ext}`
       const finalPath = join(baseReal, finalName)
 
@@ -11206,9 +11210,8 @@ export class Gateway {
     let externalTurnCompleted = false
     try {
 
-    // Server-side upload validation. Constants live at module level
-    // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
-    // stay in sync with handleUpload (POST /api/uploads).
+    // Server-side upload validation. MIME is untrusted metadata and all formats
+    // are admitted; size limits remain shared with handleUpload (POST /api/uploads).
     // 件数上限走 protocol 单一权威源 MAX_ATTACHMENTS_PER_MESSAGE(=前端 Composer
     // 同源),消除历史"前端 8 / 后端 5"漂移导致的"上传成功却被拒"。
     const MAX_FILES_PER_FRAME = MAX_ATTACHMENTS_PER_MESSAGE
@@ -11372,7 +11375,7 @@ export class Gateway {
       const prefixMatch = base64.match(/^data:([^;]+);base64,(.*)$/)
       const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
       if (prefixMatch) base64 = prefixMatch[2]
-      const ext = uploadExtForMime(mimeType)
+      const ext = uploadExtForMime(mimeType, m.filename)
       const defaultName =
         m.kind === 'image'
           ? 'image'
@@ -13347,28 +13350,21 @@ export function validateWechatInboundCompensateBody(
 }
 
 // ── Upload constants — single source of truth ──
-// Plan B (2026-05-09): both POST /api/uploads (handleUpload) and dispatchInbound's
-// legacy base64 path import these. Used to live in two places (one trimmed list
-// here for tests, a richer list inlined in dispatchInbound) — fixed now.
-export const UPLOAD_MIME_PREFIXES = [
-  'image/', 'audio/', 'video/', 'application/pdf', 'text/',
-  'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
-  'application/vnd.ms-',                            // doc, xls, ppt
-  'application/msword',                             // .doc
-  'application/zip', 'application/x-zip',           // zip archives
-  'application/json',                               // json files
-  'application/xml',                                // xml files
-]
 // 2026-05-18:从 200MB → 100MB。前端 attachments.js 同步;Cloudflare Free/Pro
 // request body cap = 100MB,后端写 200MB 是个永远摸不到的虚上限。前后端对齐到
 // CF 现实让 413 在前端直接拦,而不是被 CF 边缘 HTML 错误页吞掉。
 export const MAX_UPLOAD_SINGLE = 100 * 1024 * 1024
 export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
 
-/** Returns true if the MIME type is allowed for upload. */
-export function isUploadMimeAllowed(mime: string): boolean {
-  if (!mime) return true
-  return UPLOAD_MIME_PREFIXES.some((p) => mime.startsWith(p)) || mime === 'application/octet-stream'
+/**
+ * Upload admission is intentionally format-agnostic. Browser MIME values are
+ * client-controlled metadata (and `application/octet-stream` already made the
+ * old allowlist bypassable), so they are not a security boundary. Safety comes
+ * from byte limits, tenant-scoped storage, parser-specific gates, and forcing
+ * executable web content to download rather than render inline.
+ */
+export function isUploadMimeAllowed(_mime: string): boolean {
+  return true
 }
 
 /** MIME → file extension. Used by dispatchInbound (legacy base64 path) and
@@ -13397,15 +13393,44 @@ export const UPLOAD_MIME_TO_EXT: Record<string, string> = {
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
 }
 
-/** Resolve a MIME type to a safe extension. Falls back to the second
- *  segment of the MIME (sanitized) and finally `bin`. Same logic the
- *  legacy dispatchInbound used inline. */
-export function uploadExtForMime(mime: string): string {
-  return (
-    UPLOAD_MIME_TO_EXT[mime] ??
-    mime.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ??
-    'bin'
-  )
+const SAFE_UPLOAD_EXTENSION_RE = /^[a-z0-9]{1,32}$/
+
+function safeUploadExtension(candidate: string | undefined): string | null {
+  if (!candidate) return null
+  const normalized = candidate.toLowerCase()
+  return SAFE_UPLOAD_EXTENSION_RE.test(normalized) ? normalized : null
+}
+
+/**
+ * Resolve claimed MIME + optional original filename to a safe storage suffix.
+ * Canonical MIME mappings win. Unknown formats retain a bounded final filename
+ * extension when possible, then fall back to a bounded MIME subtype or `bin`.
+ * `filenameHint` accepts either raw URL-encoded X-Filename or a plain legacy
+ * filename; malformed encoding never rejects the upload.
+ */
+export function uploadExtForMime(mime: string, filenameHint?: string): string {
+  const normalizedMime = mime.split(';')[0].trim().toLowerCase()
+  const mapped = safeUploadExtension(UPLOAD_MIME_TO_EXT[normalizedMime])
+  if (mapped) return mapped
+
+  if (filenameHint) {
+    let decoded = filenameHint
+    try {
+      decoded = decodeURIComponent(filenameHint)
+    } catch {
+      // A literal '%' or malformed escape is still safe to inspect because we
+      // retain only a bounded alphanumeric suffix, never any path component.
+    }
+    const finalComponent = decoded.replace(/\\/g, '/').split('/').pop() ?? ''
+    const suffix = finalComponent.match(/\.([^.]+)$/)?.[1]
+    const fromFilename = safeUploadExtension(suffix)
+    if (fromFilename) return fromFilename
+  }
+
+  const subtype = normalizedMime.includes('/')
+    ? normalizedMime.slice(normalizedMime.indexOf('/') + 1).replace(/[^a-z0-9]/g, '')
+    : ''
+  return safeUploadExtension(subtype) ?? 'bin'
 }
 
 const MIME_MAP: Record<string, string> = {
