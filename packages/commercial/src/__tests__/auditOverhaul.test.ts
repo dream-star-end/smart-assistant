@@ -226,6 +226,7 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       "compute_host_audit",
       "turn_traces",
       "rate_limit_events",
+      "skill_retrieval_shadow_events",
       "product_friction_events",
       "image_generation_attempts",
     ]) {
