@@ -353,6 +353,7 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   CONNECTION_NOT_FOUND: '连接不存在或已解绑',
   NOT_INSTALLED: '请先从 AI 市场安装该 Plugin',
   SETUP_ACTIVE: '已有一个扫码授权正在进行，请先完成或取消',
+  SETUP_NOT_FOUND: '扫码会话已失效，请重新生成二维码',
   ACCOUNT_ALREADY_EXISTS: '该 Plugin 已授权账号，无需重复绑定',
   QR_NOT_READY: '二维码尚未就绪，请稍后重试',
   PLUGIN_RUNTIME_UNAVAILABLE: 'Plugin 授权服务暂不可用，请稍后重试',

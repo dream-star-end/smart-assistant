@@ -983,10 +983,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     expect(within(providerCard('知识星球')).getByText('隔离运行')).toBeInTheDocument()
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     const dialog = await screen.findByRole('dialog')
-    const start = within(dialog).getByRole('button', { name: '生成二维码' })
-    expect(start).toBeDisabled()
-    fireEvent.click(within(dialog).getByRole('checkbox'))
+    const start = within(dialog).getByRole('button', { name: '同意并生成二维码' })
     expect(start).toBeEnabled()
+    expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
     fireEvent.click(start)
 
     expect(await within(dialog).findByAltText('知识星球微信登录二维码')).toHaveAttribute(
@@ -1002,6 +1001,105 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
         '11111111-1111-4111-8111-111111111111',
       ),
     )
+  })
+
+  test('市场安装后一次性自动打开知识星球授权弹层', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    const consumed = vi.fn()
+
+    render(
+      <ConnectorsTab
+        auth={auth}
+        autoAuthorizePluginSlug="knowledge-planet"
+        onAutoAuthorizeConsumed={consumed}
+      />,
+    )
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('授权知识星球')).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '同意并生成二维码' })).toBeEnabled()
+    expect(consumed).toHaveBeenCalledTimes(1)
+  })
+
+  test('扫码成功后刷新账号卡、显示成功反馈并自动关闭弹层', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    mockedKnowledgeStart.mockResolvedValue({
+      sessionId: '22222222-2222-4222-8222-222222222222',
+      status: 'waiting_for_scan',
+      qrReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+    })
+    mockedKnowledgeStatus.mockResolvedValue({
+      sessionId: '22222222-2222-4222-8222-222222222222',
+      status: 'active',
+      qrReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+      accountId: '902',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', {
+        name: '同意并生成二维码',
+      }),
+    )
+
+    expect(await screen.findByText(/授权成功，知识星球已自动启用/)).toBeInTheDocument()
+    expect(await screen.findByText(/Agent 现在可以直接读取相关内容/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), {
+      timeout: 4_000,
+    })
+    expect(mockedPluginManagement.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  test('扫码状态因服务重启丢失时从账号权威恢复成功而不让用户空转', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+      .mockResolvedValue({
+        catalog: [knowledgePlanetPlugin()],
+        accounts: [
+          {
+            id: '903',
+            provider: 'knowledge-planet',
+            pluginType: 'managed-browser',
+            displayName: '知识星球',
+            accountHint: '微信扫码账号',
+            status: 'active',
+            actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
+            versionId: '101',
+            executable: true,
+          },
+        ],
+      })
+    mockedKnowledgeStart.mockResolvedValue({
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      status: 'waiting_for_scan',
+      qrReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+    })
+    mockedKnowledgeStatus.mockRejectedValue(
+      new ApiError({ status: 404, code: 'SETUP_NOT_FOUND', message: 'missing' }),
+    )
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', {
+        name: '同意并生成二维码',
+      }),
+    )
+
+    expect(await screen.findByText(/授权成功，知识星球已自动启用/)).toBeInTheDocument()
+    expect(screen.queryByText(/扫码会话已失效/)).not.toBeInTheDocument()
   })
 
   test('已授权的受管 Plugin 展示账号并在二次确认后走安全解绑端点', async () => {
@@ -1036,5 +1134,70 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     await waitFor(() => expect(mockedPluginRevoke).toHaveBeenCalledWith(auth, '901'))
     await waitFor(() => expect(mockedPluginManagement).toHaveBeenCalledTimes(2))
+  })
+
+  test('授权成功提示在解绑时立即清除，解绑后无需刷新即可重新发起扫码', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account = {
+      id: '904',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser' as const,
+      displayName: '我的知识星球',
+      accountHint: '微信扫码账号',
+      status: 'active' as const,
+      actions: [{ id: 'list_groups', description: '列出星球', readOnly: true as const }],
+      versionId: '101',
+      executable: true,
+    }
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+      .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [account] })
+      .mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    mockedKnowledgeStart.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'waiting_for_scan',
+      qrReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+    })
+    mockedKnowledgeStatus.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'active',
+      qrReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+      accountId: account.id,
+    })
+    mockedPluginRevoke.mockResolvedValue(undefined)
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', {
+        name: '同意并生成二维码',
+      }),
+    )
+    expect(await screen.findByText(/Agent 现在可以直接读取相关内容/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), {
+      timeout: 4_000,
+    })
+    const boundCard = providerCard('知识星球')
+    fireEvent.click(within(boundCard).getByRole('button', { name: '解绑' }))
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: '解绑' }),
+    )
+    await waitFor(() =>
+      expect(screen.queryByText(/Agent 现在可以直接读取相关内容/)).not.toBeInTheDocument(),
+    )
+    await waitFor(() =>
+      expect(
+        within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }),
+      ).toBeEnabled(),
+    )
+    fireEvent.click(
+      within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }),
+    )
+    expect(await screen.findByRole('dialog')).toHaveTextContent('授权知识星球')
   })
 })

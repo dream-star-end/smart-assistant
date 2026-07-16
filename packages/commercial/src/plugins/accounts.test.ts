@@ -10,6 +10,7 @@ import {
   commitPluginAccountState,
   decryptPluginAccountEnvelope,
   markPluginAccountRelinkRequiredFenced,
+  migrateManagedBrowserPluginAccountVersionFenced,
   validateBrowserStorageState,
 } from './accounts.js'
 import type { ManagedBrowserPluginContractV1 } from './contracts.js'
@@ -236,6 +237,138 @@ describe('managed-browser Plugin accounts', () => {
     await assert.rejects(
       markPluginAccountRelinkRequiredFenced({ row, verified, runner: staleRunner }),
       (error: unknown) => error instanceof PluginAccountError && error.code === 'ACCOUNT_STALE',
+    )
+  })
+
+  test('version transition preserves account identity and storageState while rotating every fence', async () => {
+    const accountInstanceId = randomUUID()
+    const envelope: PluginAccountEnvelopeV1 = {
+      schemaVersion: 1,
+      pluginType: 'managed-browser',
+      driverId: contract.runtime.driverId,
+      driverVersion: contract.runtime.driverVersion,
+      accountInstanceId,
+      storageState: validateBrowserStorageState(state('migration-cookie'), contract),
+    }
+    const row: PluginAccountRow = {
+      id: '71',
+      user_id: 9,
+      provider: 'browser-reader',
+      display_name: 'Reader',
+      account_key: 'a'.repeat(64),
+      aad_seed: randomUUID(),
+      secret_enc: Buffer.from('x'),
+      secret_nonce: Buffer.alloc(12),
+      revision: 4,
+      secret_generation: '8',
+      connector_version_id: '51',
+      spec_hash: Buffer.from('a'.repeat(64), 'hex'),
+      exec_contract_hash: Buffer.from('b'.repeat(64), 'hex'),
+      auth_contract_version: 1,
+      status: 'error',
+      meta: { account_hint: 'kept' },
+      revoked_at: null,
+    }
+    const from = {
+      slug: row.provider,
+      versionId: 51,
+      pluginType: 'managed-browser' as const,
+      artifactHash: 'a'.repeat(64),
+      execContractHash: 'b'.repeat(64),
+      contract,
+      compiled: {
+        pluginType: 'managed-browser' as const,
+        artifactHash: 'a'.repeat(64),
+        execContractHash: 'b'.repeat(64),
+        execContract: contract,
+      },
+    }
+    let encryptionParams: readonly unknown[] = []
+    const committedGeneration = await commitPluginAccountState({
+      row,
+      verified: from,
+      envelope,
+      env,
+      runner: {
+        async query<Row extends QueryResultRow>(
+          _sql: string,
+          params?: readonly unknown[],
+        ): Promise<QueryResult<Row>> {
+          encryptionParams = params ?? []
+          return queryResult([{ secret_generation: '9' } as unknown as Row])
+        },
+      },
+    })
+    const encryptedOld: PluginAccountRow = {
+      ...row,
+      aad_seed: String(encryptionParams[10]),
+      secret_enc: encryptionParams[8] as Buffer,
+      secret_nonce: encryptionParams[9] as Buffer,
+      secret_generation: committedGeneration,
+    }
+    const nextContract: ManagedBrowserPluginContractV1 = {
+      ...contract,
+      artifactHash: 'c'.repeat(64),
+      version: '2.0.0',
+      runtime: { ...contract.runtime, driverId: 'browser-reader-next', driverVersion: '2.0.0' },
+    }
+    const to = {
+      slug: row.provider,
+      versionId: 52,
+      pluginType: 'managed-browser' as const,
+      artifactHash: 'c'.repeat(64),
+      execContractHash: 'd'.repeat(64),
+      contract: nextContract,
+      compiled: {
+        pluginType: 'managed-browser' as const,
+        artifactHash: 'c'.repeat(64),
+        execContractHash: 'd'.repeat(64),
+        execContract: nextContract,
+      },
+    }
+    let statement = ''
+    const migrated = await migrateManagedBrowserPluginAccountVersionFenced({
+      row: encryptedOld,
+      from,
+      to,
+      env,
+      runner: {
+        async query<Row extends QueryResultRow>(
+          sql: string,
+          params?: readonly unknown[],
+        ): Promise<QueryResult<Row>> {
+          statement = sql
+          const p = params ?? []
+          return queryResult([
+            {
+              ...encryptedOld,
+              connector_version_id: String(p[9]),
+              spec_hash: p[10],
+              exec_contract_hash: p[11],
+              auth_contract_version: p[12],
+              secret_enc: p[13],
+              secret_nonce: p[14],
+              aad_seed: String(p[15]),
+              revision: encryptedOld.revision + 1,
+              secret_generation: '10',
+            } as unknown as Row,
+          ])
+        },
+      },
+    })
+    assert.match(statement, /revision = revision \+ 1/)
+    assert.match(statement, /secret_generation = secret_generation \+ 1/)
+    assert.equal(migrated.status, 'error')
+    assert.equal(migrated.revision, 5)
+    assert.equal(migrated.secret_generation, '10')
+    assert.equal(migrated.connector_version_id, '52')
+    const opened = decryptPluginAccountEnvelope(migrated, nextContract, env)
+    assert.equal(opened.accountInstanceId, accountInstanceId)
+    assert.deepEqual(opened.storageState, envelope.storageState)
+    assert.throws(
+      () => decryptPluginAccountEnvelope(migrated, contract, env),
+      (error: unknown) =>
+        error instanceof PluginAccountError && error.code === 'SECRET_INVALID',
     )
   })
 })

@@ -96,13 +96,32 @@ describe('v5 release safety lanes', () => {
     const built = body.indexOf('build_release ||')
     const qrGate = body.indexOf('knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE"')
     const maintenance = body.indexOf('begin_planned_maintenance deploy')
+    const closeGate = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
+    const previousPluginPin = body.indexOf(
+      'kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"',
+    )
+    const previousPluginClassifier = body.indexOf(
+      'knowledge_planet_plugin_classify_previous_release',
+      previousPluginPin,
+    )
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
-    const maintenanceEnd = body.indexOf('end_planned_maintenance')
+    const maintenanceEnd = body.indexOf('end_planned_maintenance', seed)
     assert.ok(built >= 0 && qrGate > built && maintenance > qrGate)
-    assert.ok(activation > maintenance && fullSmoke > activation)
+    assert.ok(
+      closeGate > maintenance &&
+        previousPluginPin > closeGate &&
+        previousPluginClassifier > previousPluginPin &&
+        activation > previousPluginClassifier &&
+        fullSmoke > activation,
+    )
     assert.ok(seed > fullSmoke && maintenanceEnd > seed)
+    assert.equal(
+      body.match(/"\$egress_prev_release" "\$kp_had_previous_plugin"/g)?.length,
+      2,
+      'pre-seed validation and mid-seed failures must both carry the pinned first-publication flag',
+    )
     assert.match(
       source,
       /seed-knowledge-planet-plugin\.ts --smoke-only[\s\S]*seed-knowledge-planet-plugin\.ts --seed-only/,
@@ -110,6 +129,84 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(seedSource, /smoke skipped/)
     assert.match(seedSource, /await readEvidence\(imageId\)[\s\S]*seedKnowledgePlanetPlugin/)
     assert.match(seedSource, /workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST/)
+    assert.match(seedSource, /runKnowledgePlanetActionSmoke/)
+    assert.match(seedSource, /findApprovedKnowledgePlanetPluginForDeploy/)
+    assert.match(seedSource, /evidence\.verification !== 'authenticated-action-smoke'/)
+    assert.match(seedSource, /passedActionIds/)
+    assert.match(seedSource, /--classify-current-for-release=/)
+    assert.match(
+      source,
+      /deploy_dist\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*activate_runtime_tuple/,
+    )
+    assert.match(
+      source,
+      /canary\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*start_candidate_unit_and_wait/,
+    )
+    assert.match(
+      source,
+      /finalize\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*finalize_run_steps/,
+    )
+    assert.match(
+      source,
+      /rollback_runtime_tuple "\$ROLLBACK_N" 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release/,
+    )
+    assert.match(
+      source,
+      /rollback_runtime_tuple 1 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release[\s\S]*"\$kp_rollback_helper" "\$kp_rollback_helper"/,
+    )
+  })
+
+  test('Knowledge Planet first-publication and hotcfg compensation stay fail-closed', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=()',
+      'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
+      'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
+      'knowledge_planet_plugin_open_gate_to_release() { calls+=("open:$1:$2"); }',
+      'activate_release() { calls+=("activate:$1"); }',
+      'activate_egress_release() { calls+=("UNEXPECTED-egress:$*"); return 92; }',
+      'rollback_runtime_tuple() { calls+=("rollback:$1:$2:$3:$4"); }',
+      'smoke() { calls+=("smoke:$1"); }',
+      'ACTIVE_PORT=18790',
+      '# A prior partial first publication left current=candidate, but old source still has no approved exact version.',
+      'ssh() { printf \'%s\\n\' \'{"available":false,"versionId":null,"currentVersionId":"77"}\'; }',
+      'knowledge_planet_plugin_classify_previous_release new-release old-release 77',
+      'test "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE" = 0',
+      '# Models the first mid-seed failure followed by a second pre-seed smoke failure.',
+      'knowledge_planet_compensate_deploy new-release old-release 0 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'knowledge_planet_compensate_deploy new-release old-release 0 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'printf "classic:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'ssh() { printf \'%s\\n\' \'{"available":true,"versionId":"55","currentVersionId":"77"}\'; }',
+      'knowledge_planet_plugin_classify_previous_release new-release old-release 77',
+      'test "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE" = 1',
+      'knowledge_planet_compensate_deploy new-release old-release 1 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'printf "hotcfg-existing:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'knowledge_planet_compensate_deploy new-release old-release 1 0 "" 0',
+      'printf "hotcfg-first:%s\\n" "${calls[*]}"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(
+      result.stdout,
+      /classic:close:new-release activate:old-release smoke:18790 close:new-release activate:old-release smoke:18790/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg-existing:rollback:1:1:new-release:1 smoke:18790 open:new-release:old-release/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg-first:rollback:1:1:new-release:0 smoke:18790(?:\n|$)/,
+    )
+    assert.doesNotMatch(result.stdout, /UNEXPECTED/)
   })
 
   test('trusted baseline guard mirrors the runtime manifest and hardens 775/664 releases', async () => {

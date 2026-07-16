@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.0.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.1.0'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +18,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.0.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.1.0'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.0.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.1.0'
 
 const authorSchema = {
   type: 'object',
@@ -31,18 +31,126 @@ const authorSchema = {
   additionalProperties: false,
 }
 
+const imageSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', maxLength: 32 },
+    type: { type: 'string', maxLength: 64 },
+    width: { type: 'integer', minimum: 0 },
+    height: { type: 'integer', minimum: 0 },
+    size: { type: 'integer', minimum: 0 },
+  },
+  additionalProperties: false,
+}
+
+const fileSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', maxLength: 32 },
+    name: { type: 'string', maxLength: 512 },
+    type: { type: 'string', maxLength: 128 },
+    size: { type: 'integer', minimum: 0 },
+    duration: { type: 'integer', minimum: 0 },
+  },
+  additionalProperties: false,
+}
+
+const articleSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', maxLength: 32 },
+    title: { type: 'string', maxLength: 512 },
+    summary: { type: 'string', maxLength: 4_000 },
+  },
+  additionalProperties: false,
+}
+
 const topicSchema = {
   type: 'object',
   properties: {
     id: { type: 'string', maxLength: 32 },
     type: { type: 'string', maxLength: 32 },
     createdAt: { type: 'string', maxLength: 64 },
+    groupId: { type: 'string', maxLength: 32 },
+    title: { type: 'string', maxLength: 512 },
     text: { type: 'string', maxLength: 12_000 },
+    question: { type: 'string', maxLength: 8_000 },
+    answer: { type: 'string', maxLength: 8_000 },
     author: authorSchema,
     commentCount: { type: 'integer', minimum: 0 },
     likeCount: { type: 'integer', minimum: 0 },
+    readCount: { type: 'integer', minimum: 0 },
+    rewardCount: { type: 'integer', minimum: 0 },
+    digested: { type: 'boolean' },
+    sticky: { type: 'boolean' },
+    images: { type: 'array', maxItems: 10, items: imageSchema },
+    files: { type: 'array', maxItems: 10, items: fileSchema },
+    article: articleSchema,
+  },
+  required: ['id'],
+  additionalProperties: false,
+}
+
+const groupSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', maxLength: 32 },
+    name: { type: 'string', maxLength: 256 },
+    description: { type: 'string', maxLength: 4_000 },
+    type: { type: 'string', maxLength: 32 },
+    memberCount: { type: 'integer', minimum: 0 },
+    topicCount: { type: 'integer', minimum: 0 },
+    createdAt: { type: 'string', maxLength: 64 },
+    joinedAt: { type: 'string', maxLength: 64 },
+    validUntil: { type: 'string', maxLength: 64 },
+    owner: authorSchema,
+  },
+  required: ['id', 'name'],
+  additionalProperties: false,
+}
+
+const commentSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', maxLength: 32 },
+    createdAt: { type: 'string', maxLength: 64 },
+    text: { type: 'string', maxLength: 5_000 },
+    author: authorSchema,
+    replyTo: authorSchema,
+    likeCount: { type: 'integer', minimum: 0 },
+    sticky: { type: 'boolean' },
+  },
+  required: ['id'],
+  additionalProperties: false,
+}
+
+const topicListResultSchema = {
+  type: 'object',
+  properties: {
+    topics: { type: 'array', maxItems: 10, items: topicSchema },
+    nextEndTime: { type: 'string', maxLength: 80 },
+  },
+  required: ['topics'],
+  additionalProperties: false,
+}
+
+const topicListParamsSchema = {
+  type: 'object',
+  properties: {
+    count: { type: 'integer', minimum: 1, maximum: 50 },
+    scope: { type: 'string', enum: ['all', 'digests', 'by_owner'] },
+    direction: { type: 'string', enum: ['forward', 'backward'] },
+    beginTime: { type: 'string', maxLength: 80 },
+    endTime: { type: 'string', maxLength: 80 },
   },
   additionalProperties: false,
+}
+
+const numericIdParamSchema = {
+  type: 'string',
+  minLength: 6,
+  maxLength: 32,
+  pattern: '^[0-9]{6,32}$',
 }
 
 export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
@@ -67,46 +175,61 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
       result: {
         type: 'object',
         properties: {
-          groups: {
-            type: 'array',
-            maxItems: 50,
-            items: {
-              type: 'object',
-              properties: {
-                id: { type: 'string', maxLength: 32 },
-                name: { type: 'string', maxLength: 256 },
-                description: { type: 'string', maxLength: 4_000 },
-                memberCount: { type: 'integer', minimum: 0 },
-              },
-              additionalProperties: false,
-            },
-          },
+          groups: { type: 'array', maxItems: 50, items: groupSchema },
         },
         required: ['groups'],
         additionalProperties: false,
       },
     },
     {
-      id: 'list_topics',
-      description: '读取指定知识星球的主题列表',
+      id: 'get_group',
+      description: '读取指定知识星球的基本资料',
       effect: 'read',
       timeoutSeconds: 30,
       params: {
         type: 'object',
-        properties: {
-          groupId: { type: 'string', minLength: 6, maxLength: 32 },
-          count: { type: 'integer', minimum: 1, maximum: 50 },
-          endTime: { type: 'string', maxLength: 80 },
-        },
+        properties: { groupId: numericIdParamSchema },
         required: ['groupId'],
         additionalProperties: false,
       },
       result: {
         type: 'object',
+        properties: { group: groupSchema },
+        required: ['group'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_topics',
+      description: '按范围、方向和时间读取指定知识星球的主题列表',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
         properties: {
-          topics: { type: 'array', maxItems: 50, items: topicSchema },
+          groupId: numericIdParamSchema,
+          ...topicListParamsSchema.properties,
         },
-        required: ['topics'],
+        required: ['groupId'],
+        additionalProperties: false,
+      },
+      result: topicListResultSchema,
+    },
+    {
+      id: 'get_topic',
+      description: '读取指定主题的结构化正文、问答与附件元数据',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: { topicId: numericIdParamSchema },
+        required: ['topicId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { topic: topicSchema },
+        required: ['topic'],
         additionalProperties: false,
       },
     },
@@ -118,8 +241,9 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
       params: {
         type: 'object',
         properties: {
-          topicId: { type: 'string', minLength: 6, maxLength: 32 },
+          topicId: numericIdParamSchema,
           count: { type: 'integer', minimum: 1, maximum: 50 },
+          sort: { type: 'string', enum: ['asc', 'desc'] },
         },
         required: ['topicId'],
         additionalProperties: false,
@@ -130,16 +254,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
           comments: {
             type: 'array',
             maxItems: 50,
-            items: {
-              type: 'object',
-              properties: {
-                id: { type: 'string', maxLength: 32 },
-                createdAt: { type: 'string', maxLength: 64 },
-                text: { type: 'string', maxLength: 5_000 },
-                author: authorSchema,
-              },
-              additionalProperties: false,
-            },
+            items: commentSchema,
           },
         },
         required: ['comments'],
@@ -154,21 +269,276 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
       params: {
         type: 'object',
         properties: {
-          groupId: { type: 'string', minLength: 6, maxLength: 32 },
+          groupId: numericIdParamSchema,
           keyword: { type: 'string', minLength: 1, maxLength: 100 },
           count: { type: 'integer', minimum: 1, maximum: 50 },
+          index: { type: 'integer', minimum: 0, maximum: 1_000 },
         },
         required: ['groupId', 'keyword'],
+        additionalProperties: false,
+      },
+      result: topicListResultSchema,
+    },
+    {
+      id: 'list_dynamics',
+      description: '读取所有已加入星球的最近动态',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+          endTime: { type: 'string', maxLength: 80 },
+        },
         additionalProperties: false,
       },
       result: {
         type: 'object',
         properties: {
-          topics: { type: 'array', maxItems: 50, items: topicSchema },
+          dynamics: {
+            type: 'array',
+            maxItems: 10,
+            items: {
+              type: 'object',
+              properties: {
+                createdAt: { type: 'string', maxLength: 64 },
+                action: { type: 'string', maxLength: 64 },
+                topic: topicSchema,
+              },
+              additionalProperties: false,
+            },
+          },
+          nextEndTime: { type: 'string', maxLength: 80 },
         },
-        required: ['topics'],
+        required: ['dynamics'],
         additionalProperties: false,
       },
+    },
+    {
+      id: 'get_unread_counts',
+      description: '读取各知识星球的未读主题数量',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: { type: 'object', properties: {}, additionalProperties: false },
+      result: {
+        type: 'object',
+        properties: {
+          counts: {
+            type: 'array',
+            maxItems: 50,
+            items: {
+              type: 'object',
+              properties: {
+                groupId: { type: 'string', maxLength: 32 },
+                unreadCount: { type: 'integer', minimum: 0 },
+              },
+              required: ['groupId', 'unreadCount'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['counts'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_hashtags',
+      description: '列出指定知识星球的标签',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: { groupId: numericIdParamSchema },
+        required: ['groupId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          hashtags: {
+            type: 'array',
+            maxItems: 50,
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', maxLength: 32 },
+                name: { type: 'string', maxLength: 256 },
+                topicCount: { type: 'integer', minimum: 0 },
+              },
+              required: ['id', 'name'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['hashtags'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_hashtag_topics',
+      description: '读取指定标签下的主题',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          hashtagId: numericIdParamSchema,
+          ...topicListParamsSchema.properties,
+        },
+        required: ['hashtagId'],
+        additionalProperties: false,
+      },
+      result: topicListResultSchema,
+    },
+    {
+      id: 'list_columns',
+      description: '列出指定知识星球的专栏',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: { groupId: numericIdParamSchema },
+        required: ['groupId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          columns: {
+            type: 'array',
+            maxItems: 50,
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', maxLength: 32 },
+                name: { type: 'string', maxLength: 256 },
+                description: { type: 'string', maxLength: 4_000 },
+                topicCount: { type: 'integer', minimum: 0 },
+                createdAt: { type: 'string', maxLength: 64 },
+              },
+              required: ['id', 'name'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['columns'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_column_topics',
+      description: '读取指定专栏下的主题',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          columnId: numericIdParamSchema,
+          ...topicListParamsSchema.properties,
+        },
+        required: ['groupId', 'columnId'],
+        additionalProperties: false,
+      },
+      result: topicListResultSchema,
+    },
+    {
+      id: 'list_checkins',
+      description: '列出指定知识星球的打卡项目',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          scope: { type: 'string', enum: ['ongoing', 'closed', 'over'] },
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+        required: ['groupId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          checkins: {
+            type: 'array',
+            maxItems: 50,
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', maxLength: 32 },
+                groupId: { type: 'string', maxLength: 32 },
+                name: { type: 'string', maxLength: 256 },
+                description: { type: 'string', maxLength: 4_000 },
+                status: { type: 'string', maxLength: 32 },
+                createdAt: { type: 'string', maxLength: 64 },
+                beginAt: { type: 'string', maxLength: 64 },
+                endAt: { type: 'string', maxLength: 64 },
+                owner: authorSchema,
+              },
+              required: ['id', 'name'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['checkins'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'get_checkin',
+      description: '读取指定打卡项目的详情',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          checkinId: numericIdParamSchema,
+        },
+        required: ['groupId', 'checkinId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          checkin: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', maxLength: 32 },
+              groupId: { type: 'string', maxLength: 32 },
+              name: { type: 'string', maxLength: 256 },
+              description: { type: 'string', maxLength: 4_000 },
+              status: { type: 'string', maxLength: 32 },
+              createdAt: { type: 'string', maxLength: 64 },
+              beginAt: { type: 'string', maxLength: 64 },
+              endAt: { type: 'string', maxLength: 64 },
+              owner: authorSchema,
+            },
+            required: ['id', 'name'],
+            additionalProperties: false,
+          },
+        },
+        required: ['checkin'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_checkin_topics',
+      description: '读取指定打卡项目下的打卡主题',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          checkinId: numericIdParamSchema,
+          ...topicListParamsSchema.properties,
+        },
+        required: ['groupId', 'checkinId'],
+        additionalProperties: false,
+      },
+      result: topicListResultSchema,
     },
   ],
 } as const)

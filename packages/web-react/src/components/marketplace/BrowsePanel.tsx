@@ -189,7 +189,7 @@ export function BrowsePanel({
   onFocusRequestConsumed?: (nonce: number) => void;
   /** AI 导购入口(批3):有查询词时结果区顶部「让 AI 帮我找并装好」;缺省则不渲染入口。 */
   onAskAiInChat?: (text: string) => void;
-  onOpenConnectors?: () => void;
+  onOpenConnectors?: (pluginSlug?: string) => void;
 }) {
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);

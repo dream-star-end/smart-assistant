@@ -62,7 +62,7 @@ export function MarketplaceCenter({
   /** AI 导购入口(批3):关闭市场 → 新会话 → 输入框预填(text 已拼好);不 autoSend。 */
   onAskAiInChat?: (text: string) => void
   /** 安装连接器后跳到管理中心完成账号绑定。 */
-  onOpenConnectors?: () => void
+  onOpenConnectors?: (pluginSlug?: string) => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {

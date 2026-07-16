@@ -30,6 +30,8 @@ export function ManageCenter({
   auth,
   agentId,
   agents,
+  autoAuthorizePluginSlug,
+  onAutoAuthorizeConsumed,
   onTabChange,
   onClose,
   onOpenMarketplace,
@@ -41,6 +43,9 @@ export function ManageCenter({
   agentId: string;
   /** 可切换的智能体（全能助手 + 已安装市场智能体），记忆面板内切换。 */
   agents: { id: string; name: string }[];
+  /** 市场安装后一次性自动打开对应 Plugin 的授权弹层。 */
+  autoAuthorizePluginSlug?: string | null;
+  onAutoAuthorizeConsumed?: () => void;
   onTabChange: (t: ManageTab) => void;
   onClose: () => void;
   onOpenMarketplace?: () => void;
@@ -97,7 +102,12 @@ export function ManageCenter({
                 )}
                 {tab === "connectors" && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
-                    <ConnectorsTab auth={auth} onOpenMarketplace={onOpenMarketplace} />
+                    <ConnectorsTab
+                      auth={auth}
+                      onOpenMarketplace={onOpenMarketplace}
+                      autoAuthorizePluginSlug={autoAuthorizePluginSlug}
+                      onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
+                    />
                   </div>
                 )}
                 {tab === "library" && (

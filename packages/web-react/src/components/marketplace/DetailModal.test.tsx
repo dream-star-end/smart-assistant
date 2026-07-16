@@ -564,11 +564,12 @@ test("官方但非预装的 Plugin 仍显示安装按钮并可恢复安装", asy
     installedDeps: 0,
     installedCapabilities: [],
     skippedOptional: [],
-    needsAuthorization: [],
+    needsAuthorization: ["knowledge-planet"],
     ready: false,
     note: "installed",
   });
   const onInstalled = vi.fn();
+  const onOpenConnectors = vi.fn();
 
   render(
     <DetailModal
@@ -576,6 +577,7 @@ test("官方但非预装的 Plugin 仍显示安装按钮并可恢复安装", asy
       auth={auth}
       onClose={() => {}}
       onInstalled={onInstalled}
+      onOpenConnectors={onOpenConnectors}
     />,
   );
 
@@ -585,6 +587,7 @@ test("官方但非预装的 Plugin 仍显示安装按钮并可恢复安装", asy
   expect(await screen.findByText("安装成功")).toBeInTheDocument();
   expect(installMarketplace).toHaveBeenCalledWith(auth, "1606", undefined);
   expect(onInstalled).toHaveBeenCalledTimes(1);
+  expect(onOpenConnectors).toHaveBeenCalledWith("knowledge-planet");
 });
 
 test("精确预装 Plugin 不提供市场安装，只引导到管理中心", async () => {

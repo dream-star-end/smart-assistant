@@ -676,13 +676,14 @@ export const TUTORIAL_TOPICS = {
   },
   connectors: {
     featureId: "connectors",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
-      "API 连接插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装插件；管理中心只负责账号、凭据与授权。当前支持 Notion、飞书、GitHub 及通过审核的声明式 HTTP 插件。",
+      "插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装；管理中心只负责账号与授权。除 Notion、飞书、GitHub 和声明式 HTTP 插件外，知识星球支持微信扫码登录及只读内容检索。",
     outcome: "让 AI 在真实业务系统里查数据和执行动作，而不靠手工搬运。",
     scenarios: [
       "读取 Notion 或飞书文档",
       "在 GitHub 上协作开发",
+      "检索知识星球的主题、评论、动态、标签、专栏与打卡内容",
       "调用已审核的业务 API 插件",
     ],
     steps: [
@@ -692,7 +693,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "绑定账号",
-        body: "进入管理中心 → 插件账号，按提示 OAuth 授权或填写凭据；可为多个账号设置备注名。",
+        body: "安装知识星球后会自动打开授权弹层；点击同意并用微信扫码，手机确认后页面会自动显示成功并启用。其他插件按提示 OAuth 授权或填写凭据。",
       },
       {
         title: "在任务里明确账号与动作",
@@ -705,6 +706,7 @@ export const TUTORIAL_TOPICS = {
     ],
     tips: [
       "读写账号分开绑定、备注清楚，可减少选错账号。",
+      "知识星球授权后可直接向 AI 描述目标；AI 会自动发现账号并组合只读 action，无需手工提供内部 ID。",
       "首次先做只读查询，确认范围后再允许写入。",
     ],
     cautions: [

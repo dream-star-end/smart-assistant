@@ -30,11 +30,16 @@ const SCHEMA_KEYS = new Set([
   'enum',
   'minLength',
   'maxLength',
+  'pattern',
   'minimum',
   'maximum',
   'minItems',
   'maxItems',
 ])
+// Contract patterns are deliberately limited to anchored ASCII character
+// classes with a bounded repetition. This covers opaque IDs without admitting
+// publisher-controlled regular expressions with catastrophic backtracking.
+const SAFE_SCHEMA_PATTERN_RE = /^\^\[[A-Za-z0-9-]{1,64}\]\{([0-9]{1,4}),([0-9]{1,4})\}\$$/
 const SAFE_BROWSER_METHODS = new Set(['GET', 'HEAD', 'POST'])
 const INTERPRETER_BY_EXTENSION: Readonly<Record<string, string>> = {
   '.py': '/usr/bin/python3',
@@ -312,6 +317,21 @@ function safeSchema(value: unknown, label: string, depth = 0): Record<string, un
     if (item !== undefined && (typeof item !== 'number' || !Number.isFinite(item)))
       invalid(`${label}.${key} must be finite`)
   }
+  if (schema.pattern !== undefined) {
+    if (type !== 'string' || typeof schema.pattern !== 'string')
+      invalid(`${label}.pattern requires type=string`)
+    const match = SAFE_SCHEMA_PATTERN_RE.exec(schema.pattern)
+    if (!match) invalid(`${label}.pattern is not an allowed bounded ASCII pattern`)
+    const minimum = Number(match[1])
+    const maximum = Number(match[2])
+    if (minimum > maximum || maximum > 4096)
+      invalid(`${label}.pattern repetition is invalid`)
+    try {
+      new RegExp(schema.pattern)
+    } catch {
+      invalid(`${label}.pattern is invalid`)
+    }
+  }
   if (
     typeof schema.minLength === 'number' &&
     typeof schema.maxLength === 'number' &&
@@ -349,7 +369,8 @@ function matchesSchema(schema: Record<string, unknown>, value: unknown): boolean
       return (
         typeof value === 'string' &&
         (typeof schema.minLength !== 'number' || value.length >= schema.minLength) &&
-        (typeof schema.maxLength !== 'number' || value.length <= schema.maxLength)
+        (typeof schema.maxLength !== 'number' || value.length <= schema.maxLength) &&
+        (typeof schema.pattern !== 'string' || new RegExp(schema.pattern).test(value))
       )
     case 'integer':
     case 'number':
