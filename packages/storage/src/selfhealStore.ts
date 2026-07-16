@@ -83,6 +83,9 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
       session_key  TEXT,
       release_revoked INTEGER NOT NULL DEFAULT 0,
       condition_key TEXT,
+      execution_class TEXT,
+      action_opcode TEXT,
+      tier1_receipt TEXT,
       created_at   INTEGER NOT NULL,
       updated_at   INTEGER NOT NULL
 `
@@ -143,6 +146,21 @@ function ensureConditionKeyColumn(db: Database.Database): void {
   const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
   if (cols.some((c) => c.name === 'condition_key')) return
   db.exec('ALTER TABLE selfheal_jobs ADD COLUMN condition_key TEXT')
+}
+
+/**
+ * Idempotent schema guard (batch1a): Tier1 routing frozen from the master
+ * context (execution_class + action_opcode, set-once with condition_key) plus
+ * tier1_receipt (set-once record of the executed opcode = at-most-once replay
+ * guard). Plain defaulted columns are ALTER-addable.
+ */
+function ensureTier1Columns(db: Database.Database): void {
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]).map((c) => c.name),
+  )
+  if (!cols.has('execution_class')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN execution_class TEXT')
+  if (!cols.has('action_opcode')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN action_opcode TEXT')
+  if (!cols.has('tier1_receipt')) db.exec('ALTER TABLE selfheal_jobs ADD COLUMN tier1_receipt TEXT')
 }
 
 export async function getSelfhealDb(): Promise<Database.Database> {
@@ -230,6 +248,7 @@ export async function getSelfhealDb(): Promise<Database.Database> {
   ensureCancellingStatusSchema(db)
   ensureReleaseRevokedColumn(db)
   ensureConditionKeyColumn(db)
+  ensureTier1Columns(db)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
@@ -295,6 +314,14 @@ export interface SelfhealJob {
   /** Authoritative condition key frozen from the v5 master context at job
    *  start (NULL = never frozen; treated as non-drill by the broker). */
   conditionKey: string | null
+  /** Tier1 routing frozen from the master context (set-once with conditionKey):
+   *  executionClass = 'tier1' | 'tier2' | null(unfrozen); actionOpcode present
+   *  only for tier1. */
+  executionClass: 'tier1' | 'tier2' | null
+  actionOpcode: string | null
+  /** Set-once record of the executed Tier1 opcode receipt (JSON) — the
+   *  at-most-once replay guard: a job with a receipt never re-transmits. */
+  tier1Receipt: string | null
   createdAt: number
   updatedAt: number
 }
@@ -321,6 +348,9 @@ interface JobRow {
   session_key: string | null
   release_revoked: number
   condition_key: string | null
+  execution_class: string | null
+  action_opcode: string | null
+  tier1_receipt: string | null
   created_at: number
   updated_at: number
 }
@@ -338,6 +368,10 @@ function rowToJob(r: JobRow): SelfhealJob {
     sessionKey: r.session_key,
     releaseRevoked: r.release_revoked === 1,
     conditionKey: r.condition_key,
+    executionClass:
+      r.execution_class === 'tier1' || r.execution_class === 'tier2' ? r.execution_class : null,
+    actionOpcode: r.action_opcode,
+    tier1Receipt: r.tier1_receipt,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }
@@ -618,6 +652,34 @@ export async function setJobConditionKey(repairId: string, conditionKey: string)
   db.prepare(
     'UPDATE selfheal_jobs SET condition_key = ?, updated_at = ? WHERE repair_id = ? AND condition_key IS NULL',
   ).run(conditionKey, Date.now(), repairId)
+}
+
+/** Freeze the Tier1 routing (executionClass + actionOpcode) from the master
+ *  context. Set-once alongside condition_key (same fail-closed freeze): the
+ *  first root-fetched routing wins, so a replayed/late context cannot
+ *  reclassify tier or swap the opcode. */
+export async function setJobRouting(
+  repairId: string,
+  executionClass: 'tier1' | 'tier2',
+  actionOpcode: string | null,
+): Promise<void> {
+  const db = await getSelfhealDb()
+  db.prepare(
+    'UPDATE selfheal_jobs SET execution_class = ?, action_opcode = ?, updated_at = ? WHERE repair_id = ? AND execution_class IS NULL',
+  ).run(executionClass, actionOpcode, Date.now(), repairId)
+}
+
+/** Record the Tier1 opcode receipt. Set-once = at-most-once replay guard:
+ *  returns false when a receipt already exists (job re-claimed after the SSH
+ *  was already transmitted — must NOT re-transmit). */
+export async function setJobTier1Receipt(repairId: string, receiptJson: string): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const res = db
+    .prepare(
+      'UPDATE selfheal_jobs SET tier1_receipt = ?, updated_at = ? WHERE repair_id = ? AND tier1_receipt IS NULL',
+    )
+    .run(receiptJson, Date.now(), repairId)
+  return res.changes > 0
 }
 
 /** Persist the deterministic session key onto the job row. */

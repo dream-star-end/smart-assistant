@@ -64,7 +64,10 @@ function fakeSessionManager() {
 
 /** fetch stub: answers claim-capability with a token, context with the
  *  authoritative condition key (frozen before any submit), records calls. */
-function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5', opts: { ackStatus?: number } = {}) {
+function fakeFetch(
+  conditionKey: string | null = 'ops.monitor:svc_v5',
+  opts: { ackStatus?: number; executionClass?: 'tier1' | 'tier2'; actionOpcode?: string } = {},
+) {
   const calls: { url: string; init?: RequestInit }[] = []
   const impl = (async (url: string | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init })
@@ -75,11 +78,18 @@ function fakeFetch(conditionKey: string | null = 'ops.monitor:svc_v5', opts: { a
       return {
         ok: true,
         status: 200,
-        json: async () => (conditionKey === null ? {} : { conditionKey }),
+        json: async () =>
+          conditionKey === null
+            ? {}
+            : {
+                conditionKey,
+                executionClass: opts.executionClass ?? 'tier2',
+                actionOpcode: opts.actionOpcode ?? null,
+              },
       }
     }
-    if (String(url).endsWith('/ack')) {
-      const status = opts.ackStatus ?? 200
+    if (/\/(ack|done|failed|progress)$/.test(String(url))) {
+      const status = String(url).endsWith('/ack') ? (opts.ackStatus ?? 200) : 200
       return { ok: status >= 200 && status < 300, status, json: async () => ({}) }
     }
     return { ok: true, status: 200, json: async () => ({}) }
@@ -395,5 +405,115 @@ describe('machine-authored ack — before any submit, fail-closed (drill#1 409 r
 
     assert.equal(sessions.state.submits.length, 0, 'no turn may start unacked')
     assert.equal((await getJob('w-ack-fail'))?.status, 'starting')
+  })
+})
+
+describe('Tier1 pure machine path (batch1a) — no clone, no codex, machine done', () => {
+  const HOST_CFG = { host: 'kl-mirror', keyPath: '/k' }
+
+  function tier1Worker(opts: {
+    sessions: ReturnType<typeof fakeSessionManager>
+    fetchImpl: typeof fetch
+    hostActionConfig?: unknown
+    executeHostOpcode?: unknown
+    prepareClone?: (input: { repairId: string }) => Promise<{ clonePath: string }>
+  }) {
+    return new SelfhealJobWorker({
+      sessions: opts.sessions as never,
+      resolveAgent: async () => AGENT,
+      callbackBaseUrl: 'http://127.0.0.1:1',
+      hmacSecret: 'test-secret-of-decent-length-123456',
+      canonicalRepo: '/canon',
+      canonicalBranch: 'main',
+      ochealUid: 1000,
+      ochealGid: 1000,
+      prepareClone:
+        (opts.prepareClone as never) ??
+        (async ({ repairId }: { repairId: string }) => ({ clonePath: `/clones/${repairId}` })),
+      fetchImpl: opts.fetchImpl,
+      hostActionConfig: opts.hostActionConfig as never,
+      executeHostOpcode: opts.executeHostOpcode as never,
+    }) as unknown as ProcessJobRunner
+  }
+
+  it('svc_egress: executes opcode, machine done, job succeeded, ZERO codex submit / clone', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1',
+      actionOpcode: 'restart-v5-egress-v1',
+    })
+    const opcodes: string[] = []
+    let cloned = false
+    const worker = tier1Worker({
+      sessions,
+      fetchImpl: impl,
+      hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => {
+        opcodes.push(op)
+        return { opcode: op, outcome: 'completed', exit: 0, host: 'kl-mirror', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }
+      },
+      prepareClone: async () => { cloned = true; return { clonePath: '/x' } },
+    })
+    await worker.processJob(await stageStartingJob('t1-ok'))
+
+    assert.deepEqual(opcodes, ['restart-v5-egress-v1'], 'the frozen opcode was transmitted')
+    assert.equal(sessions.state.submits.length, 0, 'Tier1 never starts a codex turn')
+    assert.equal(cloned, false, 'Tier1 never prepares a clone')
+    assert.ok(calls.some((c) => c.url.endsWith('/done')), 'machine done callback sent')
+    assert.equal((await getJob('t1-ok'))?.status, 'succeeded')
+    assert.ok((await getJob('t1-ok'))?.tier1Receipt, 'receipt is durable')
+  })
+
+  it('opcode drift (frozen ≠ local map) ⇒ machine failed, opcode NOT transmitted', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1',
+      actionOpcode: 'clean-v5-disk-v1', // wrong opcode for svc_egress
+    })
+    let transmitted = false
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async () => { transmitted = true; return { opcode: 'x', outcome: 'completed', exit: 0, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} } },
+    })
+    await worker.processJob(await stageStartingJob('t1-drift'))
+    assert.equal(transmitted, false, 'drift must never transmit')
+    assert.equal((await getJob('t1-drift'))?.status, 'failed')
+  })
+
+  it('host action not provisioned (null config) ⇒ machine failed, no transmit', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:disk_root', {
+      executionClass: 'tier1', actionOpcode: 'clean-v5-disk-v1',
+    })
+    const worker = tier1Worker({ sessions, fetchImpl: impl, hostActionConfig: null })
+    await worker.processJob(await stageStartingJob('t1-noprov'))
+    assert.equal((await getJob('t1-noprov'))?.status, 'failed')
+  })
+
+  it('remote failed (exit>0) ⇒ machine failed', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:http_egress', {
+      executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
+    })
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'failed', exit: 3, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
+    })
+    await worker.processJob(await stageStartingJob('t1-remotefail'))
+    assert.equal((await getJob('t1-remotefail'))?.status, 'failed')
+  })
+
+  it('unknown transport outcome ⇒ optimistic machine done (probe fence adjudicates)', async () => {
+    const sessions = fakeSessionManager()
+    const { impl, calls } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
+    })
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => ({ opcode: op, outcome: 'unknown', exit: -1, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }),
+    })
+    await worker.processJob(await stageStartingJob('t1-unknown'))
+    assert.ok(calls.some((c) => c.url.endsWith('/done')), 'unknown goes to done → verifying')
+    assert.equal((await getJob('t1-unknown'))?.status, 'succeeded')
   })
 })

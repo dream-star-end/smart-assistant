@@ -621,6 +621,49 @@ step_tunnel_key() {
 }
 
 # ---------------------------------------------------------------------------
+# 8. Tier1 host-action:专用限权 key + kl-mirror forced-command wrapper(批1a)
+# ---------------------------------------------------------------------------
+# Tier1 运维动作(重启 egress / 清盘)在 kl-mirror 执行,经**独立于隧道 key 的
+# 专用限权 key**:authorized_keys 用 command="…/oc-selfheal-host-action" 锁死,
+# 客户端请求的 opcode 落 $SSH_ORIGINAL_COMMAND,wrapper 只认版本化无参 opcode。
+# 绝不复用 root 通用 key —— broker 被攻陷也只能触发这三个固定 opcode,而非任意
+# root。key 缺失 = Tier1 host action fail-closed(hostActionConfigFromEnv 返 null)。
+step_host_action() {
+  log "--- step 8: Tier1 host-action key + wrapper ---"
+  local key="$SECRETS_DIR/action_key" pub="$SECRETS_DIR/action_key.pub"
+  if [ ! -f "$key" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      todo "action key $key (would ssh-keygen ed25519, dedicated to Tier1 host action)"
+    else
+      run ssh-keygen -t ed25519 -N '' -C 'oc-selfheal-host-action' -f "$key"
+      ok "action key generated $key (ed25519, dedicated)"
+    fi
+  else
+    local mode; mode="$(stat -c '%a' "$key")"
+    [ "$mode" = "600" ] || run chmod 0600 "$key"
+    ok "action key $key present (0600)"
+  fi
+
+  local wrapper_src="$REPO_ROOT/ops/oc-selfheal-host-action.sh"
+  if [ -f "$wrapper_src" ]; then
+    ok "host-action wrapper source present: $wrapper_src"
+  else
+    warn "host-action wrapper source missing: $wrapper_src"
+  fi
+
+  if [ -f "$pub" ]; then
+    local publine; publine="$(head -n1 "$pub")"
+    log "kl-mirror 侧手工安装(见 runbook 步骤 8):"
+    log "  ① cp $wrapper_src → kl-mirror:/usr/local/sbin/oc-selfheal-host-action (root:root 0755)"
+    log "  ② kl-mirror ~/.ssh/authorized_keys 追加限权行:"
+    printf '     restrict,command="/usr/local/sbin/oc-selfheal-host-action" %s\n' "$publine"
+    log "  ③ 个人版 selfheal.env 追加:OC_SELFHEAL_ACTION_HOST=kl-mirror  OC_SELFHEAL_ACTION_KEY=$key"
+    log "  ④ 首用握手核对:ssh -i $key kl-mirror capabilities-v1 → {\"capabilities\":[...]}"
+  fi
+  todo "kl-mirror host-action wrapper + forced-command line + selfheal.env ACTION_HOST/KEY (manual, printed above)"
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 step_user
@@ -632,6 +675,7 @@ step_agents
 step_env
 step_autossh
 step_tunnel_key
+step_host_action
 
 log ""
 log "================= provision checklist ================="
