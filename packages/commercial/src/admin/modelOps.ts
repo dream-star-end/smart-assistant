@@ -18,6 +18,9 @@ import {
 } from "@openclaude/protocol";
 import { STATIC_PROVIDER_META } from "../http/proxy/staticProviderMeta.js";
 import { query, tx } from "../db/queries.js";
+import { providerDegradedKey } from "../selfheal/conditionKeys.js";
+import { rootLogger } from "../logging/logger.js";
+import { transitionRuleState } from "./alertOutbox.js";
 import { writeAdminAudit } from "./audit.js";
 import { effectiveHealth, type HealthMode } from "./providerHealth.js";
 
@@ -381,7 +384,7 @@ export async function putProviderOps(
   const concurrencyLimit = normalizeConcurrencyLimit(input.concurrency_limit);
   const healthMode = normalizeHealthMode(input.health_mode);
 
-  await tx(async (client: PoolClient) => {
+  const prevHealthMode = await tx(async (client: PoolClient) => {
     const before = await client.query<OpsRow>(
       `SELECT provider_id, display_name, subscription_expires_at, notes, concurrency_limit, updated_at, health_mode
          FROM provider_ops WHERE provider_id = $1 FOR UPDATE`,
@@ -432,5 +435,35 @@ export async function putProviderOps(
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
+    return (b?.health_mode as HealthMode) ?? "auto";
   });
+
+  // 健康裁定必须传导到 condition 层(admin_alert_rule_state):scheduler 在 forced_* 模式下
+  // 不再评估/转移,firing 会冻结在裁定前的旧值;而 incident 投影(reconciler)是 level-triggered
+  // 只看 condition —— 不传导则 forced_healthy 后降级 incident 悬挂、用户端"服务降级"横幅永不撤。
+  // condition 写失败不回滚运维写(告警面故障不应阻塞 admin 操作),warn 留证即可;
+  // 切回 auto 不在此强写 condition,交还 scheduler 按观测重新判定。
+  if (healthMode !== undefined && healthMode !== prevHealthMode) {
+    try {
+      if (healthMode === "forced_healthy") {
+        await transitionRuleState(providerDegradedKey(id), false, null, {
+          provider_id: id,
+          reason: "管理员强制恢复(forced_healthy)",
+          forced_by_admin: String(ctx.adminId),
+        });
+      } else if (healthMode === "forced_degraded") {
+        await transitionRuleState(providerDegradedKey(id), true, providerDegradedKey(id), {
+          provider_id: id,
+          reason: "管理员强制降级(forced_degraded)",
+          forced_by_admin: String(ctx.adminId),
+        });
+      }
+    } catch (err) {
+      rootLogger.warn("provider_ops health_mode condition propagation failed", {
+        provider: id,
+        health_mode: healthMode,
+        err: String((err as Error)?.message ?? err),
+      });
+    }
+  }
 }

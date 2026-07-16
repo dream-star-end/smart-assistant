@@ -281,7 +281,11 @@ export function startIlinkAlertWorker(opts: IlinkWorkerOptions = {}): IlinkWorke
     let sent = 0
     let ready: Awaited<ReturnType<typeof claimReadyAlerts>>
     try {
-      ready = await claimReadyAlerts(20)
+      // claim 必须按类型分区(与 wecomAlertDispatcher 对称):类型无关的 catch-all claim
+      // 会抢走 wecom_* 行并 markFailed 'unsupported channel_type' —— 谁先 claim 谁赢的竞态,
+      // 输的一侧把本该由对方发出的告警(如 ops.egress_node_down)永久标 failed(不再重试)。
+      // channel 已删的行由外键 ON DELETE CASCADE 直接消失,不需要 catch-all 兜 NULL。
+      ready = await claimReadyAlerts(20, ['ilink_wechat', 'telegram'])
     } catch (err) {
       onError('claimReady', err)
       return 0
