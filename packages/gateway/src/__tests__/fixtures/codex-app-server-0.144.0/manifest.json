@@ -1,0 +1,15 @@
+{
+  "codexVersion": "0.144.0",
+  "binaryPath": "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "binarySha256": "901923c1808a151f6926d41d703c17ad48815662cefb1c8d832a052c44271429",
+  "command": "<binaryPath> app-server generate-json-schema --experimental --out <outputDir>",
+  "method": "turn/steer",
+  "generatedFiles": {
+    "TurnSteerParams.json": "2c5a7ff12f952bab1b829bcae1afd2f79217b87f48ba296581ea3b3888eedabb",
+    "TurnSteerResponse.json": "a669b85e3b75b86468e39e6a2f760966bffe83f378b514c6898fb04b838cd78d"
+  },
+  "repositoryFiles": {
+    "TurnSteerParams.json": "3f64eb389e90defdaaad697463739d8ca07c36bce01abedf8ae4c53819af6caf",
+    "TurnSteerResponse.json": "c5a1351d81126924af3f616677a41dc5f1019e07e85d2d75f3377e32cfac2cb8"
+  }
+}
