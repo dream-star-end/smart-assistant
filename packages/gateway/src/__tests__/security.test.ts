@@ -13,13 +13,14 @@ import {
   FILE_BLOCKED_PATTERNS,
   MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL,
-  UPLOAD_MIME_PREFIXES,
   isFileAllowed,
   isFileBlocked,
   isTrustedContainerFileServeEnabled,
   isUploadMimeAllowed,
   makeUserScopedMediaPredicate,
+  shouldServeInline,
   staticCacheControl,
+  uploadExtForMime,
 } from '../server.js'
 
 // ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
@@ -300,35 +301,86 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   })
 })
 
-// ── T02: Upload MIME validation — tests the REAL isUploadMimeAllowed function ──
-describe('T02: isUploadMimeAllowed — upload type filtering', () => {
-  // Should ALLOW
-  it('allows image/png', () => assert.ok(isUploadMimeAllowed('image/png')))
-  it('allows image/jpeg', () => assert.ok(isUploadMimeAllowed('image/jpeg')))
-  it('allows image/gif', () => assert.ok(isUploadMimeAllowed('image/gif')))
-  it('allows image/webp', () => assert.ok(isUploadMimeAllowed('image/webp')))
-  it('allows audio/mpeg', () => assert.ok(isUploadMimeAllowed('audio/mpeg')))
-  it('allows audio/wav', () => assert.ok(isUploadMimeAllowed('audio/wav')))
-  it('allows video/mp4', () => assert.ok(isUploadMimeAllowed('video/mp4')))
-  it('allows video/webm', () => assert.ok(isUploadMimeAllowed('video/webm')))
-  it('allows application/pdf', () => assert.ok(isUploadMimeAllowed('application/pdf')))
-  it('allows text/plain', () => assert.ok(isUploadMimeAllowed('text/plain')))
-  it('allows text/csv', () => assert.ok(isUploadMimeAllowed('text/csv')))
-  it('allows application/octet-stream (generic)', () =>
-    assert.ok(isUploadMimeAllowed('application/octet-stream')))
-  it('allows empty mime (no header)', () => assert.ok(isUploadMimeAllowed('')))
+// ── T02: Format-agnostic uploads — MIME is metadata, not an execution gate ──
+describe('T02: isUploadMimeAllowed — all claimed formats are admitted', () => {
+  for (const mime of [
+    'image/png',
+    'audio/mpeg',
+    'video/mp4',
+    'application/pdf',
+    'text/plain',
+    'application/octet-stream',
+    'application/x-pak',
+    'application/x-executable',
+    'application/x-sh',
+    'application/x-msdownload',
+    'application/java-archive',
+    'application/x-httpd-php',
+    'application/vnd.unregistered-custom-format',
+    '', // legacy base64 messages may omit MIME; streaming POST requires it separately
+  ]) {
+    it(`allows ${mime || '(empty legacy MIME)'}`, () => {
+      assert.ok(isUploadMimeAllowed(mime))
+    })
+  }
+})
 
-  // Should BLOCK
-  it('blocks application/x-executable', () =>
-    assert.ok(!isUploadMimeAllowed('application/x-executable')))
-  it('blocks application/x-sh (shell scripts)', () =>
-    assert.ok(!isUploadMimeAllowed('application/x-sh')))
-  it('blocks application/x-msdownload (EXE)', () =>
-    assert.ok(!isUploadMimeAllowed('application/x-msdownload')))
-  it('blocks application/java-archive (JAR)', () =>
-    assert.ok(!isUploadMimeAllowed('application/java-archive')))
-  it('blocks application/x-httpd-php', () =>
-    assert.ok(!isUploadMimeAllowed('application/x-httpd-php')))
+describe('T02b: uploadExtForMime — safe suffix preservation for unknown formats', () => {
+  it('uses canonical MIME mapping before a conflicting filename suffix', () => {
+    assert.equal(uploadExtForMime('IMAGE/PNG; charset=binary', 'payload.pak'), 'png')
+  })
+  it('preserves .pak from a raw URL-encoded X-Filename basename', () => {
+    assert.equal(uploadExtForMime('application/x-pak', 'folder%2F..%2FAsset.PAK'), 'pak')
+  })
+  it('preserves .pak from a plain legacy m.filename', () => {
+    assert.equal(uploadExtForMime('application/x-pak', 'plugin.PAK'), 'pak')
+  })
+  it('malformed percent encoding never throws and still keeps a safe suffix', () => {
+    assert.doesNotThrow(() => uploadExtForMime('application/x-pak', 'broken%ZZ.PAK'))
+    assert.equal(uploadExtForMime('application/x-pak', 'broken%ZZ.PAK'), 'pak')
+  })
+  it('normalizes backslash paths and keeps only the final component suffix', () => {
+    assert.equal(uploadExtForMime('application/octet-stream', 'C%3A%5Ctmp%5Cplugin.PAK'), 'pak')
+  })
+  it('uses only the final suffix of a multi-dot filename', () => {
+    assert.equal(uploadExtForMime('application/octet-stream', 'archive.tar.GZ'), 'gz')
+  })
+  it('accepts exactly 32 alphanumeric suffix characters', () => {
+    const suffix = 'a'.repeat(32)
+    assert.equal(uploadExtForMime('application/octet-stream', `file.${suffix}`), suffix)
+  })
+  it('rejects 33-character, punctuation, and non-ASCII filename suffixes', () => {
+    assert.equal(uploadExtForMime('application/x-pak', `file.${'a'.repeat(33)}`), 'xpak')
+    assert.equal(uploadExtForMime('application/x-pak', 'file.p@k'), 'xpak')
+    assert.equal(uploadExtForMime('application/x-pak', 'file.数据'), 'xpak')
+  })
+  it('bounds the sanitized MIME subtype with the same 32-character rule', () => {
+    const suffix = 'b'.repeat(32)
+    assert.equal(uploadExtForMime(`application/${suffix}`), suffix)
+    assert.equal(uploadExtForMime(`application/${suffix}b`), 'bin')
+    assert.equal(uploadExtForMime('application/---'), 'bin')
+    assert.equal(uploadExtForMime('not-a-mime'), 'bin')
+  })
+})
+
+describe('T02c: shouldServeInline — admitted files are not automatically executable', () => {
+  it('renders only image/audio/video media inline', () => {
+    assert.ok(shouldServeInline('image/png'))
+    assert.ok(shouldServeInline('audio/mpeg'))
+    assert.ok(shouldServeInline('video/mp4'))
+  })
+  it('forces active web content and arbitrary binaries to download', () => {
+    for (const mime of [
+      'text/html; charset=utf-8',
+      'image/svg+xml',
+      'application/xml',
+      'application/javascript',
+      'application/x-executable',
+      'application/x-pak',
+    ]) {
+      assert.ok(!shouldServeInline(mime), mime)
+    }
+  })
 })
 
 // ── T03: Upload size limits ──
