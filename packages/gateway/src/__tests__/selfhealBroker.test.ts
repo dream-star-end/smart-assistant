@@ -12,7 +12,7 @@ import {
   SelfhealBroker,
   releaseHttpStatusFor,
 } from '../selfheal/broker.js'
-import type { CommandRunner, RunResult } from '../selfheal/brokerActions.js'
+import { type CommandRunner, type RunResult, TIER1_ACTIONS } from '../selfheal/brokerActions.js'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
@@ -56,6 +56,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -76,6 +77,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -94,6 +96,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
     })
     const resp = await broker.handleRequest({
@@ -110,6 +113,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -128,6 +132,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
     })
     const resp = await broker.handleRequest({
@@ -145,6 +150,7 @@ describe('SelfhealBroker Tier1', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -169,6 +175,7 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: async () => null, // no such repair
       run,
     })
@@ -189,6 +196,7 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -213,6 +221,7 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: activeAuthority,
       run,
     })
@@ -229,6 +238,7 @@ describe('SelfhealBroker authorization (capability + repair record)', () => {
     const broker = new SelfhealBroker({
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
+      actions: TIER1_ACTIONS,
       repairAuthority: async () => ({ status: 'succeeded', capability: CAP }),
       run,
     })
@@ -1166,5 +1176,117 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     assert.equal(replay.detail?.replayed, true)
     assert.equal(fx.enqueued.length, 1, 'idempotent replay leaves the outbox untouched')
     fx.cleanup()
+  })
+})
+
+// ── batch0: Tier1 positive enablement + server-side drill authorization ─────
+
+describe('Tier1 positive enablement (default = no actions)', () => {
+  it('default construction rejects Tier1 kinds as unknown actions (fail-closed)', async () => {
+    process.env.OC_SELFHEAL_RESTART_UNITS = 'openclaude-v5'
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: activeAuthority,
+      run,
+    })
+    for (const actionKind of ['restart_service', 'clean_disk', 'switch_node']) {
+      const resp = await broker.handleRequest({
+        repairId: `r-default-${actionKind}`,
+        capability: CAP,
+        actionKind,
+        params: actionKind === 'restart_service' ? { unit: 'openclaude-v5' } : { target: 'docker' },
+      })
+      assert.equal(resp.status, 'rejected', `${actionKind} must be rejected without enablement`)
+      assert.match(String(resp.detail?.reason), /unknown action/)
+    }
+    assert.equal(calls.length, 0, 'no command may ever run without positive enablement')
+    setOrUnset('OC_SELFHEAL_RESTART_UNITS', undefined)
+  })
+})
+
+describe('drill authorization — frozen condition key, server-side allowlist', () => {
+  const drillAuthority: RepairAuthority = async () => ({
+    status: 'running',
+    capability: CAP,
+    conditionKey: 'selfheal.drill:transport_v1',
+  })
+
+  function drillBroker(run?: CommandRunner) {
+    return new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: drillAuthority,
+      actions: TIER1_ACTIONS,
+      ...(run ? { run } : {}),
+    })
+  }
+
+  it('rejects verify / cutover / Tier1 for a drill repair BEFORE any side effect', async () => {
+    process.env.OC_SELFHEAL_RESTART_UNITS = 'openclaude-v5'
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const broker = drillBroker(run)
+    const attempts: Array<{ actionKind: string; params: Record<string, unknown> }> = [
+      { actionKind: 'verify', params: { sha: 'a'.repeat(40) } },
+      { actionKind: 'cutover', params: { sha: 'a'.repeat(40), verificationRef: 'r-drill' } },
+      { actionKind: 'restart_service', params: { unit: 'openclaude-v5' } },
+      { actionKind: 'clean_disk', params: { target: 'docker' } },
+    ]
+    for (const a of attempts) {
+      const resp = await broker.handleRequest({
+        repairId: 'r-drill',
+        capability: CAP,
+        actionKind: a.actionKind,
+        params: a.params,
+      })
+      assert.equal(resp.status, 'rejected', `${a.actionKind} must be drill-rejected`)
+      assert.match(String(resp.detail?.reason), /drill repair may only context\/report/)
+    }
+    assert.equal(calls.length, 0, 'a drill repair must never reach a command runner')
+    setOrUnset('OC_SELFHEAL_RESTART_UNITS', undefined)
+  })
+
+  it('context and report pass the drill gate (they fail later only for unrelated reasons)', async () => {
+    const broker = drillBroker()
+    const ctx = await broker.handleRequest({
+      repairId: 'r-drill-ctx',
+      capability: CAP,
+      actionKind: 'context',
+      params: {},
+    })
+    // No callbackBaseUrl in this fixture — the rejection reason proves the
+    // request got PAST the drill gate into the real handler.
+    assert.doesNotMatch(String(ctx.detail?.reason ?? ''), /drill repair/)
+    const rep = await broker.handleRequest({
+      repairId: 'r-drill-rep',
+      capability: CAP,
+      actionKind: 'report',
+      params: { outcome: 'progress', message: 'drill 已接单' },
+    })
+    assert.doesNotMatch(String(rep.detail?.reason ?? ''), /drill repair/)
+  })
+
+  it('a NON-drill (or unfrozen) condition key is not drill-gated', async () => {
+    const realAuthority: RepairAuthority = async () => ({
+      status: 'running',
+      capability: CAP,
+      conditionKey: 'ops.monitor:svc_v5',
+    })
+    const legacyAuthority: RepairAuthority = async () => ({ status: 'running', capability: CAP })
+    for (const repairAuthority of [realAuthority, legacyAuthority]) {
+      const broker = new SelfhealBroker({
+        socketPath: '/unused',
+        store: new InMemoryBrokerClaimStore(),
+        repairAuthority,
+      })
+      const resp = await broker.handleRequest({
+        repairId: 'r-real',
+        capability: CAP,
+        actionKind: 'verify',
+        params: { sha: 'a'.repeat(40) },
+      })
+      assert.doesNotMatch(String(resp.detail?.reason ?? ''), /drill repair/)
+    }
   })
 })
