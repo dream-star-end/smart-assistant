@@ -78,7 +78,8 @@ export function buildRepairPrompt(repairId: string, clonePath: string): string {
     `  oc-selfheal report ${repairId} progress|done|failed <message>   回报进度/终态`,
     `  oc-selfheal verify ${repairId} <sha>                对 clone 内 commit 跑降权四层验证`,
     `  oc-selfheal cutover ${repairId} <sha>               验证通过后申请上线(默认停在待人工放行)`,
-    '严格按 skill v5-incident-repair 执行:先 report progress 确认接单,再 context 拉上下文,按等级修复;红线禁区以该 skill 为准。',
+    '命令语法以上述四条为唯一权威;安全边界与事件路由按 skill v5-incident-repair 执行。两者冲突时不要猜:`oc-selfheal report <repairId> failed "<冲突描述>"` 上报并停止。',
+    '流程:先 `report progress` 确认接单 → `context` 拉上下文 → 按 skill 的事件路由处理。',
   ].join('\n')
 }
 
