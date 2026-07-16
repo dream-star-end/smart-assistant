@@ -2,6 +2,7 @@
 name: market
 description: 用 `oc-market` 操作 AI 市场中的技能、插件与智能体,并发布可组合这些能力的智能体。当用户想找、安装、卸载或发布市场能力时使用。
 tags: [marketplace, market, skill, plugin, agent, install, publish]
+priority: 4
 ---
 
 # AI 市场操作（oc-market CLI）

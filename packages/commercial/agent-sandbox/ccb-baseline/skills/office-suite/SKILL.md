@@ -2,6 +2,7 @@
 name: office-suite
 description: 中文办公高频任务总纲:周报/月报/工作总结、汇报PPT、会议纪要(含待办与责任人)、公文/通知/请示、简历、邮件与日程。把"读资料→分析→出交付物"串成端到端闭环。用户提这些办公场景时,按本 skill 选对工具链并交付可下载文件。
 tags: [office, report, ppt, meeting, gongwen, resume, email]
+priority: 9
 ---
 
 # 中文办公工作流总纲

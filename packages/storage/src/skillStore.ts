@@ -47,6 +47,16 @@ import { paths } from './paths.js'
 export const MAX_SKILL_NAME_LENGTH = 64
 export const MAX_SKILL_DESCRIPTION_LENGTH = 1024
 
+export const SKILL_PRIORITY_MIN = -100
+export const SKILL_PRIORITY_MAX = 100
+
+/** frontmatter priority 归一化:非法/缺失 → undefined;数值钳制到 [-100,100] 整数。 */
+export function normalizeSkillPriority(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v.trim()) : Number.NaN
+  if (!Number.isFinite(n)) return undefined
+  return Math.max(SKILL_PRIORITY_MIN, Math.min(SKILL_PRIORITY_MAX, Math.trunc(n)))
+}
+
 const VALID_SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]*$/
 const VALID_VERSION_RE = /^\d+\.\d+\.\d+$/
 const VALID_AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/
@@ -60,6 +70,11 @@ export interface SkillFrontmatter {
   related_skills?: string[]
   created_at?: string
   updated_at?: string
+  /**
+   * 注入菜单排序提示(越大越靠前),仅影响系统提示 SKILLS slot 的展示顺序,
+   * 不影响 skill_search/管理面板。范围钳制 [-100,100],缺省视为 0。
+   */
+  priority?: number
 }
 
 export type SkillSource = 'user' | 'platform'
@@ -628,6 +643,7 @@ export class SkillStore {
           related_skills: Array.isArray(meta.related_skills) ? meta.related_skills : undefined,
           created_at: meta.created_at,
           updated_at: meta.updated_at,
+          priority: normalizeSkillPriority(meta.priority),
           path: join(rootDir, entry.name),
           source,
           layer,
@@ -818,6 +834,7 @@ export class SkillStore {
       related_skills: Array.isArray(meta.related_skills) ? meta.related_skills : undefined,
       created_at: meta.created_at,
       updated_at: meta.updated_at,
+      priority: normalizeSkillPriority(meta.priority),
       path: join(rootDir, name),
       body,
       rawContent: raw,

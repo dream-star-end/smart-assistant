@@ -2,6 +2,7 @@
 name: office-pdf
 description: 生成与处理 PDF:把报告/方案/合同/通知排版成 PDF、程序化生成票据/表单、合并拆分加水印、解析已有 PDF 并按页码溯源总结。用户要"导出 PDF""做个 PDF 合同/发票""合并这几个 PDF""这份 PDF 讲了什么/帮我总结"时调用。
 tags: [office, pdf, report, parse, ocr]
+priority: 7
 ---
 
 # PDF 生成与处理

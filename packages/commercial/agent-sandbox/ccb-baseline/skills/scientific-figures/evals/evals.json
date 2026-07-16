@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "data-plot-closed-loop-figcheck",
+      "prompt": "给我画一张论文用的折线图:三个 epoch 的准确率,方法A=[0.72,0.85,0.91],方法B=[0.68,0.80,0.88],横轴 Epoch(1,2,3),纵轴 Accuracy(%)。要专业、可印刷。图注用中文『准确率对比』。请在最终回复里给出绘图工具与关键参数、oc-figcheck 的结论与是否自纠,以及产物绝对路径。",
+      "assertions": [
+        "使用 matplotlib + SciencePlots 绘制,样式列表包含 'no-latex'(容器无 LaTeX),而非默认粗糙样式",
+        "savefig 使用 dpi=300、bbox_inches='tight',坐标轴含标签与单位、含图例",
+        "出图后运行 oc-figcheck 回看并在回复中给出 VERDICT/审图结论(如需则说明自纠),完成闭环",
+        "中文图注设置 Noto Serif CJK SC 字体以避免豆腐块",
+        "给出产物绝对路径(/home/agent/.openclaude/ 下)与所用关键参数"
+      ]
+    },
+    {
+      "id": "network-graphviz-not-manual",
+      "prompt": "帮我画一张有向的模块依赖关系图(网络图):节点有『数据采集』『特征工程』『模型训练』『评估』『部署』;依赖边为 数据采集→特征工程→模型训练→评估→部署,且额外有一条 特征工程→评估。要中文标签、布局整齐不打结。请在最终回复里给出所用库、布局算法、oc-figcheck 结论与产物绝对路径。",
+      "assertions": [
+        "使用 networkx + graphviz 布局(如 graphviz_layout(prog='dot'/'neato'/'sfdp')),而非用 matplotlib 手工摆放节点坐标",
+        "networkx 绘制中文标签时显式传 font_family='Noto Serif CJK SC',避免默认 sans-serif 导致豆腐块",
+        "五个节点与依赖边完整正确(含额外的 特征工程→评估 边),布局整齐",
+        "运行 oc-figcheck --kind network 回看并在回复中给出结论,完成闭环",
+        "给出所用库/布局算法与产物绝对路径"
+      ]
+    },
+    {
+      "id": "schematic-cetz-no-genai",
+      "prompt": "给我画一张信号收发的机制示意图(矢量、可投稿):左边一个方框『发射机』,中间一个圆表示『目标』,右边一个方框『中心处理』;发射机→目标画箭头并标注 s(t),目标→中心处理画箭头。要求精密对齐、无草图感、中文标注。请在最终回复里说明所用工具、为什么不用生成式 AI、oc-figcheck 结论与产物绝对路径。",
+      "assertions": [
+        "使用 Typst + CeTZ(经 oc-diagram 渲染)绘制矢量示意图,而非 matplotlib 硬画框线或生成式 AI 出图",
+        "明确不使用生成式 AI(DALL·E/Stable Diffusion/Midjourney/吐 base64 图)画示意图,符合 skill 铁律",
+        "Typst 设置了裁紧页面(如 set page(width: auto, height: auto, margin: ...))与中文字体,标注/箭头齐全且对齐",
+        "运行 oc-figcheck --kind schematic 回看并在回复中给出结论,完成闭环",
+        "产物为矢量(PDF/SVG)并给出绝对路径,回复含所用命令要点"
+      ]
+    },
+    {
+      "id": "boundary-3d-device-info-first",
+      "prompt": "画一张实验装置的三维示意图(3D 工程装置图):一个方形工作台上,左右各竖一根天线杆(标注『天线1』『天线2』),中间放一个控制箱(标注『控制箱』),并用坐标轴给出比例参照。重点是信息清楚、每个部件有文字标注,不要照片级渲染,但主体不能飘在角落。请在最终回复里给出所用工具、如何保证标注与取景、oc-figcheck 结论与产物绝对路径。",
+      "assertions": [
+        "使用 matplotlib-3D(Axes3D)绘制,信息优先:各部件有清晰 marker + 文字标注、含坐标轴/比例参照与图例",
+        "收紧 set_xlim/ylim/zlim 让主体充满画面,主体不飘在角落、不留大片空白",
+        "未使用生成式 AI 或纯渲染引擎(pyvista/vtk)追求照片级而牺牲标注",
+        "运行 oc-figcheck --kind 3d 回看,针对取景空/悬空/背景异常/标注缺失自纠并在回复中说明结论",
+        "三个部件(天线1、天线2、控制箱)标注齐全,并给出产物绝对路径"
+      ]
+    }
+  ]
+}

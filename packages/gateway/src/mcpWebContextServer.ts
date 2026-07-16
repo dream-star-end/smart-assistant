@@ -181,7 +181,12 @@ function runChild(payload: Record<string, unknown>, timeoutMs: number): Promise<
     let stderr = Buffer.alloc(0)
     const timer = setTimeout(() => {
       proc.kill('SIGKILL')
-      reject(new Error('web-context parser timed out'))
+      reject(
+        new Error(
+          'web-context parser timed out(页面可能重 JS/反爬。正文页可加大 --timeout-ms 重试;' +
+            '要做搜索请改用内置 WebSearch,不要抓搜索引擎结果页)',
+        ),
+      )
     }, timeoutMs)
     proc.stdout.on('data', (chunk: Buffer) => {
       stdout = Buffer.concat([stdout, chunk])

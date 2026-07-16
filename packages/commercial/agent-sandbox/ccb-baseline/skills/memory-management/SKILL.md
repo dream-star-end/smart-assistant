@@ -4,6 +4,7 @@ description: "如何用 memdir 范式管理长期记忆:一条记忆一个文件
 version: "2.0.0"
 tags: [system, meta, learning]
 related_skills: [skill-management]
+priority: 6
 ---
 
 # 记忆管理指南

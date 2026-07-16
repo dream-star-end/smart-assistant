@@ -19,7 +19,9 @@
     "0150_agent_tool_rollups",
     "0151_product_friction_events",
     "0152_marketplace_capability_bindings",
-    "0153_marketplace_plugin_kernel"
+    "0153_marketplace_plugin_kernel",
+    "0154_model_admin_audit_returning_grant",
+    "0155_selfheal_drill_policy"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

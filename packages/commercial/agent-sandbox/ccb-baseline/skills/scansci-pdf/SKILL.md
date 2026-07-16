@@ -2,6 +2,7 @@
 name: scansci-pdf
 description: （已退役为重定向）文献检索/下载/引用请用 oc-lit / oc-cite / oc-ingest。当前镜像里的 `scansci-pdf` 仅 server 模式(只有 run/check)，没有 search/download/citation 等 CLI 子命令，别用它做这些。
 tags: [research, papers, redirect, deprecated]
+priority: -10
 ---
 
 # scansci-pdf（已退役 → 用 oc-* 研究命令行）

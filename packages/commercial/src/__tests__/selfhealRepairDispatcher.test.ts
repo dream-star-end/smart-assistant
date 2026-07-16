@@ -27,6 +27,8 @@ interface FakeOpts {
   failedCount?: number;
   fuseAlertExists?: boolean;
   cooldownHit?: boolean;
+  /** incident 的 event_type/condition_key(默认 ops.monitor:svc_v5)。 */
+  eventType?: string;
   insertError?: { code?: string };
   /** Guarded INSERT…SELECT matched 0 rows (incident recovered mid-dispatch). */
   insertNoRow?: boolean;
@@ -46,9 +48,9 @@ function makeFake(opts: FakeOpts = {}) {
       return qr([
         {
           id: String((params as unknown[])?.[0] ?? "1"),
-          condition_key: "ops.monitor:svc_v5",
+          condition_key: opts.eventType ?? "ops.monitor:svc_v5",
           status: opts.incidentStatus ?? "open",
-          event_type: "ops.monitor:svc_v5",
+          event_type: opts.eventType ?? "ops.monitor:svc_v5",
         },
       ]);
     }
@@ -151,6 +153,17 @@ describe("repairDispatcher.dispatchRepair", () => {
     assert.equal(r.status, "skipped");
     assert.equal((r as { reason: string }).reason, "cooldown");
     assert.equal(calls.length, 0);
+  });
+
+  test("冷却豁免:transport drill(精确常量)不受 cooldown 拦截,可连续重跑", async () => {
+    const { fakeQuery, fakeTx } = makeFake({
+      cooldownHit: true, // 即便冷却窗口内有既往派单记录……
+      eventType: "selfheal.drill:transport_v1",
+    });
+    const { fetchFn, calls } = makeFetch(202);
+    const r = await dispatchRepair("1", { query: fakeQuery, tx: fakeTx, fetch: fetchFn, now: () => NOW });
+    assert.equal(r.status, "dispatched", "drill 派单不因 cooldown 跳过");
+    assert.equal(calls.length, 1, "隧道 POST 照常发出");
   });
 
   test("singleflight:INSERT 23505 冲突 → skipped:singleflight_conflict", async () => {

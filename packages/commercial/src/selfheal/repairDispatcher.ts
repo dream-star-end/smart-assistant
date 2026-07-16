@@ -40,6 +40,7 @@ import { rootLogger, type Logger } from "../logging/logger.js";
 import { safeEnqueueAlert as _safeEnqueueAlert, type AlertEventInput } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 import { repairCooldownMs } from "./config.js";
+import { SELFHEAL_DRILL_TRANSPORT } from "./conditionKeys.js";
 
 /**
  * ops 升级告警 event_type —— 单一真理源在 alertEvents.ts EVENTS(已登记 EVENT_META 'ops' 组,
@@ -284,7 +285,11 @@ export async function dispatchRepair(
   }
 
   // 3) 冷却:同 event_type 30min 内已有派单记录 → 跳过(防轰炸)。
-  const cd = repairCooldownMs();
+  //    transport drill 豁免:演练要求连续可重跑(验收=连跑两次全过),其
+  //    incident/repair 生命周期由演练脚本持 advisory lock 串行编排,无轰炸面。
+  //    豁免只认精确常量,绝不放宽到 `selfheal.drill:` 前缀——新增 drill 类型
+  //    必须来这里显式扩(与个人版 broker 白名单同纪律)。
+  const cd = eventType === SELFHEAL_DRILL_TRANSPORT ? 0 : repairCooldownMs();
   if (cd > 0) {
     const since = new Date(d.now() - cd);
     const coolR = await d.query<{ one: number }>(

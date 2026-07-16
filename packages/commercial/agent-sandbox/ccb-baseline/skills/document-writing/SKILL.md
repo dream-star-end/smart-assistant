@@ -1,6 +1,7 @@
 ---
 name: document-writing
 description: 用 Pandoc/Quarto 生成排版美观、公式为 Word 原生可编辑格式的 DOCX/Word 文档。用户要求写报告、论文、方案、含公式 Word、导出 docx 时调用。
+priority: 8
 ---
 
 # 高质量 Word/DOCX 写作流程

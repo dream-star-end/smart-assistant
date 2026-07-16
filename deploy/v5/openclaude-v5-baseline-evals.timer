@@ -1,0 +1,12 @@
+# baseline 技能评测周期回归 —— 每周一 04:30 北京时间(低峰,单轮全量 8 技能约 1-2h)。
+# Persistent=true:恰逢停机/重启时起来后补跑,回归不缺周。
+[Unit]
+Description=Run OpenClaude v5 baseline skill evals regression weekly (Mon 04:30 Beijing)
+
+[Timer]
+OnCalendar=Mon *-*-* 04:30:00 Asia/Shanghai
+AccuracySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

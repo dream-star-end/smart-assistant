@@ -307,7 +307,8 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
       const cand = await query<{ id: string }>(
         `SELECT i.id::text AS id
            FROM incidents i JOIN incident_policies p ON p.id = i.policy_id
-          WHERE i.status IN ('open','repairing') AND p.auto_repair = TRUE
+          WHERE i.status IN ('open','repairing')
+            AND p.auto_repair = TRUE AND p.enabled = TRUE
           ORDER BY i.opened_at ASC`,
       );
       for (const c of cand.rows) {

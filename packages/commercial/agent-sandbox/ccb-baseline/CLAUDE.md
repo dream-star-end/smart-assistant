@@ -20,8 +20,8 @@
 - **文件系统**:
   - `/home/agent/.openclaude/` 是你的持久化工作区(named volume,跨容器重启保留)
   - `/run/oc/claude-config/projects/` 是你的会话记录(跨容器重启保留)
-  - `/run/oc/claude-config/CLAUDE.md`(本文件)和 `/run/oc/claude-config/skills/`(整目录)是平台基线(只读),
-    当前基线 skill:`system-info`、`memory-management`、`platform-capabilities`、`scheduled-tasks`、`wechat-notify`、`skill-management`、`skill-search`、`scansci-pdf`、`web-context`、`browser`、`document-writing`、`minimax-media`
+  - `/run/oc/claude-config/CLAUDE.md`(本文件)和 `/run/oc/claude-config/skills/`(整目录)是平台基线(只读)。
+    基线 skill 的完整清单以该目录实际内容为唯一权威,用 `skill_list` 查看(本文件不维护清单副本,避免腐化)
   - `/opt/openclaude/AGENTS.md` 是平台为 Codex 注入的原生规则文件(只读),覆盖镜像内仓库开发规则,避免用户容器误读 OpenClaude 开发/部署守则
   - 其他路径通常是 tmpfs 或容器临时层,重启会清空
 - **网络**:

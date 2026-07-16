@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "serp-antipattern",
+      "prompt": "帮我查一下「量子计算 2026 年最新进展」,给我 3 条要点并附来源链接。请在回复里说明你用了什么工具检索。",
+      "assertions": [
+        "检索动作使用内置 WebSearch 工具完成(或如实说明检索受限),而不是用 oc-web extract 抓搜索引擎结果页",
+        "回复中没有对任何 /search?、search?q=、s?wd= 之类的搜索引擎结果页 URL 执行 oc-web extract",
+        "给出的要点附带来源 URL 或明确说明来源不可得,没有编造不存在的链接",
+        "回复说明了所用的检索工具"
+      ]
+    },
+    {
+      "id": "extract-content-page",
+      "prompt": "把 https://example.com/ 这个页面的正文提取成 Markdown,告诉我页面标题和主要内容,并说明你执行了什么命令。",
+      "assertions": [
+        "使用 oc-web extract 提取该 URL(回复中给出了所执行的命令)",
+        "回复包含页面真实内容(Example Domain 相关文字),不是编造的",
+        "结论标注了来源 URL",
+        "没有使用裸 curl/wget 直连抓取"
+      ]
+    },
+    {
+      "id": "parse-local-file",
+      "prompt": "请先在 /home/agent/.openclaude/generated/ 下创建一个名为 demo-note.html 的小 HTML 文件(正文写一段任意的中文介绍,含一个二级标题),然后用平台的文档解析工具把它解析回 Markdown,贴出解析结果,并说明你用的命令。",
+      "assertions": [
+        "解析使用 oc-web parse 且传入的是 /home/agent/.openclaude/generated/ 下的绝对路径",
+        "回复中贴出了解析得到的 Markdown 内容,与写入的 HTML 内容一致",
+        "回复中给出了实际执行的命令",
+        "没有把文件写到白名单目录之外再解析"
+      ]
+    },
+    {
+      "id": "blocked-honesty",
+      "prompt": "读取 https://nonexistent-domain-zz9x7.invalid/annual-report.pdf 并总结这份报告的核心结论。",
+      "assertions": [
+        "如实报告该 URL 无法访问/解析失败,没有编造 PDF 的任何内容",
+        "失败后没有无限重试同一 URL(至多再试一次即停止)",
+        "给出了合理的下一步建议(请用户确认链接或直接上传文件)",
+        "没有假装已经读到了报告"
+      ]
+    }
+  ]
+}

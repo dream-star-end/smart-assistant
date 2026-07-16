@@ -62,6 +62,14 @@ export interface AgentAuditFailureGroup {
   p95_ms: number | null;
 }
 
+export interface AgentAuditToolRate {
+  tool: string;
+  success_calls: number;
+  failure_calls: number;
+  total_calls: number;
+  failure_rate: number | null;
+}
+
 export interface AgentAuditStatsResult {
   window: AgentAuditStatsWindow;
   rollup: {
@@ -69,6 +77,9 @@ export interface AgentAuditStatsResult {
     failure_calls: number;
     total_calls: number;
     failure_rate: number | null;
+    /** 按工具分解的成败率(rollup 同源,调用量降序 top 12)。失败列表流只显示失败,
+     * 观感必然"满屏红";这张分解表让"哪个工具在失败、失败占比多少"一眼可见。 */
+    tools: AgentAuditToolRate[];
   };
   coverage: {
     scope: "current_online_fleet";
@@ -227,6 +238,35 @@ export async function getAgentAuditStats(input: {
   const failureCalls = Number(rollupResult.rows[0]?.failure_calls ?? 0);
   const totalCalls = successCalls + failureCalls;
 
+  const toolRateResult = await query<{
+    tool: string;
+    success_calls: string;
+    failure_calls: string;
+  }>(
+    `SELECT c.tool,
+            COALESCE(SUM(c.call_count) FILTER (WHERE c.outcome='success'),0)::text AS success_calls,
+            COALESCE(SUM(c.call_count) FILTER (WHERE c.outcome='failure'),0)::text AS failure_calls
+       FROM agent_tool_rollup_reports r
+       JOIN agent_tool_rollup_counts c ON c.report_id=r.report_id
+      WHERE ${rollupWhere.join(" AND ")}
+      GROUP BY c.tool
+      ORDER BY SUM(c.call_count) DESC, c.tool
+      LIMIT 12`,
+    rollupParams,
+  );
+  const toolRates: AgentAuditToolRate[] = toolRateResult.rows.map((row) => {
+    const ok = Number(row.success_calls);
+    const fail = Number(row.failure_calls);
+    const total = ok + fail;
+    return {
+      tool: row.tool,
+      success_calls: ok,
+      failure_calls: fail,
+      total_calls: total,
+      failure_rate: total > 0 ? fail / total : null,
+    };
+  });
+
   // Coverage deliberately describes only the current v5 online fleet. The
   // container table has no authoritative lifecycle-end timestamp, so this
   // must never be presented as historical window completeness or an SLA.
@@ -327,6 +367,7 @@ export async function getAgentAuditStats(input: {
       failure_calls: failureCalls,
       total_calls: totalCalls,
       failure_rate: totalCalls > 0 ? failureCalls / totalCalls : null,
+      tools: toolRates,
     },
     coverage: {
       scope: "current_online_fleet",

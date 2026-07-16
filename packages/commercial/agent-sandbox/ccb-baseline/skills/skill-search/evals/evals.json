@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "discover-before-doing",
+      "prompt": "有没有现成的技能可以帮我生成 Excel 报表?有的话告诉我叫什么、怎么用。",
+      "assertions": [
+        "调用了 skill_search 检索(回复中体现了搜索动作与查询词)",
+        "报告了找到的相关技能名称(如 office-spreadsheet 或同类)",
+        "区分/标注了技能来源(platform 平台内置或 user 自建)",
+        "说明实际使用前会用 skill_view 加载完整步骤(或已经加载)"
+      ]
+    },
+    {
+      "id": "dedup-before-save",
+      "prompt": "我刚摸索出一套用 ffmpeg 把视频转高质量 GIF 的稳定流程:先 palettegen 生成调色板,再 paletteuse 合成,scale=480:-1,fps=10。帮我把这套流程沉淀成一个技能,以后直接复用。",
+      "assertions": [
+        "创建前先用 skill_search 做了查重(回复中体现)",
+        "用 skill_save 创建了技能,名称为小写英文加连字符(kebab-case)",
+        "技能内容包含触发场景、步骤(含 palettegen/paletteuse 两步法与参数)和验证方式",
+        "没有把一次性隐私、密钥或临时路径写进技能"
+      ]
+    },
+    {
+      "id": "not-found-fallback",
+      "prompt": "找一个能直接操作 Adobe Photoshop 的技能,我要批量修图。",
+      "assertions": [
+        "执行了 skill_search,无果后换关键词重搜或用 skill_list 浏览兜底(流程在回复中体现)",
+        "如实说明没有现成的 Photoshop 操作技能,没有编造技能名称",
+        "给出了能力边界内的替代方案(如容器内 ImageMagick/Python 批处理或平台生图编辑能力)",
+        "没有假装已经完成批量修图"
+      ]
+    }
+  ]
+}

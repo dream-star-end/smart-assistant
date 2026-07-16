@@ -25,6 +25,7 @@ import {
   openIncident,
   updateIncident,
   resolveIncident,
+  resolveIncidentByProbe,
   maxSeverity,
   type IncidentSeverity,
 } from "./incidents.js";
@@ -165,8 +166,13 @@ export async function reconcileOnce(deps: ReconcileDeps = {}): Promise<Reconcile
     if (cond.firing === true && !suppressed) continue;
     const bySuppression = cond.firing === true && suppressed;
     try {
+      // probe 收口走 verifying 守卫版:codex 归因窗口内不抢 resolve(归因
+      // 让位给 sweeper 的 succeeded+codex 同事务收口);suppression 收口保持
+      // 无守卫(admin 裁定必须能压过 verifying)。
       const r = await tx((client: PoolClient) =>
-        resolveIncident(inc.id, bySuppression ? "admin" : "probe", client),
+        bySuppression
+          ? resolveIncident(inc.id, "admin", client)
+          : resolveIncidentByProbe(inc.id, client),
       );
       if (r.resolved) {
         result.resolved.push(inc.condition_key);
