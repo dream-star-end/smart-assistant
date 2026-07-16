@@ -87,6 +87,7 @@ import {
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
   isCodexEngineModel,
+  isClientMessageId,
   newTraceId,
   parseTraceIdCandidate,
   stripModelAuthorityField,
@@ -691,6 +692,23 @@ export interface UserChatBridgeDeps {
     uid: bigint,
     sessionId: string,
   ) => Promise<unknown[] | null>;
+  /** Persist the browser-authored user row before any paid/runtime work starts.
+   * V5 wires this to the authoritative PG session backend; tests/legacy
+   * deployments may omit it and retain the old forwarding path. */
+  persistMasterUserMessage?: (
+    uid: bigint,
+    sessionId: string,
+    message: {
+      id: string;
+      role: "user";
+      text: string;
+      ts: number;
+      _media?: unknown[];
+    },
+  ) => Promise<{
+    applied: boolean;
+    reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized";
+  }>;
   /**
    * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
@@ -953,6 +971,9 @@ interface CodexTurnSnapshot {
   traceId: string;
   /** Opaque Codex API relay route token for this turn, if the turn used an API relay group. */
   codexRouteToken: string | null;
+  /** Exact local admission-state release keyed by this snapshot's requestId.
+   * Cross-bridge recovered snapshots omit it and rely on bridge cleanup/timer. */
+  releaseBridgeTurnState?: (reason: string) => boolean;
   /** 计费留证；flag 未开的 legacy/shadow turn 为 null。 */
   authority: import("../billing/proxyBilling.js").BillingAuthorityStamp | null;
   authorityTurnId: string | null;
@@ -1067,7 +1088,7 @@ function extractMasterHistoryText(msg: Record<string, unknown>): string {
 
 export function _sanitizeMasterHistoricalMessagesForFrame(
   rawMessages: unknown[],
-  opts: { maxMessages?: number; maxChars?: number } = {},
+  opts: { maxMessages?: number; maxChars?: number; excludeClientMessageId?: string } = {},
 ): Array<Record<string, unknown>> {
   const maxMessages = opts.maxMessages ?? MASTER_HISTORY_MAX_MESSAGES;
   const maxChars = opts.maxChars ?? MASTER_HISTORY_MAX_CHARS;
@@ -1075,6 +1096,10 @@ export function _sanitizeMasterHistoricalMessagesForFrame(
   for (const raw of rawMessages) {
     if (!raw || typeof raw !== "object") continue;
     const msg = raw as Record<string, unknown>;
+    if (
+      opts.excludeClientMessageId &&
+      (msg.id === opts.excludeClientMessageId || msg._clientMessageId === opts.excludeClientMessageId)
+    ) continue;
     const role = msg.role === "user" || msg.role === "assistant" ? msg.role : null;
     if (!role) continue;
     if (msg.system === true) continue;
@@ -1096,9 +1121,22 @@ export function _sanitizeMasterHistoricalMessagesForFrame(
   return selected;
 }
 
-function sendErrorFrame(ws: WebSocket, code: string, message: string): void {
+function sendErrorFrame(
+  ws: WebSocket,
+  code: string,
+  message: string,
+  turn?: { peerId?: string | null; clientMessageId?: string | null },
+): void {
   if (ws.readyState !== WebSocket.OPEN) return;
-  try { ws.send(JSON.stringify({ type: "error", code, message })); }
+  try {
+    ws.send(JSON.stringify({
+      type: "error",
+      code,
+      message,
+      ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
+      ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
+    }));
+  }
   catch { /* client gone */ }
 }
 
@@ -2077,31 +2115,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return exec;
     };
 
-    // plan v3 G5/G7 — codex per-account 并发槽:per-bridge 状态。
-    //   acquiredCodexAccountId !== null → 已持槽,新 codex inbound 应被严格单飞拒绝
-    //   codexAcquireInflight = true → acquire promise 在飞,新 codex inbound 拒
-    //   legacy 容器(codex_account_id IS NULL,决策 N3):acquire() 返回 null,IIFE 内
-    //     不占槽但 PR2 v1.0.66 起每轮仍跑 billing → 不再用 sticky 状态跳过 IIFE。
-    //   codexReleaseTimer → CODEX_SESSION_MAX_MS 兜底释放(决策 G6),防 outbound 丢/
-    //     ws 异常断后槽永久泄漏
-    let acquiredCodexAccountId: bigint | null = null;
-    // B7 per-slot 租约 id,与 acquiredCodexAccountId 同生死(成对 set/reset)。
-    // release 必须传它精确还槽;reaper 兜底"timer 也没跑到"的极端泄漏。
-    let acquiredCodexSlotId: string | null = null;
-    let codexAcquireInflight = false;
-    let codexApiRelayTurnInFlight = false;
-    let codexApiRelayRouteToken: string | null = null;
-    let codexReleaseTimer: ReturnType<typeof setTimeout> | null = null;
-    // plan v3 G6 — outbound 终态早释放(Codex review v2 BLOCKER 1):
-    //   只靠 600s timer + cleanup 释放,正常完成的 turn 会持槽 ≤ 10min,
-    //   单账号 maxConcurrent=10 → 10 个正常 turn 后误判 busy。
-    //   方案:acquire 时记 inbound.peer.id;outbound.message + isFinal:true 或
-    //   outbound.error 且 peer.id 命中 → 立即 release,timer 退化为兜底。
-    //   匹配 peer.id 的原因:同桥可 claude+codex 交错,只看"任意 isFinal"会误释。
-    let codexInboundPeerId: string | null = null;
+    // Codex turn ownership is session-scoped, not bridge-scoped. A browser WS can
+    // multiplex several sessions; serializing the whole bridge made one long task
+    // block unrelated sessions. Each peer retains strict single-flight while
+    // different peers may use the account scheduler's configured concurrency.
+    type ActiveCodexTurnState = {
+      readonly stateId: string;
+      readonly peerKey: string;
+      readonly peerId: string | null;
+      readonly clientMessageId: string | null;
+      acquireInflight: boolean;
+      acquiredAccountId: bigint | null;
+      acquiredSlotId: string | null;
+      apiRelayRouteToken: string | null;
+      releaseTimer: ReturnType<typeof setTimeout> | null;
+    };
+    const activeCodexTurnsByPeer = new Map<string, ActiveCodexTurnState>();
+    const codexPeerKey = (peerId: string | null): string =>
+      peerId === null ? "__missing_peer__" : `peer:${peerId}`;
+    const isCurrentCodexTurnState = (state: ActiveCodexTurnState): boolean =>
+      !cleaned && activeCodexTurnsByPeer.get(state.peerKey) === state;
     const expireCodexRouteToken = (token: string | null, reason: string): void => {
       if (token === null) return;
-      if (codexApiRelayRouteToken === token) codexApiRelayRouteToken = null;
       const expire = deps.expireCodexRoute;
       if (expire === undefined) return;
       void expire(token).catch((err) => {
@@ -2111,8 +2146,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       });
     };
-    const expireActiveCodexRoute = (reason: string): void => {
-      expireCodexRouteToken(codexApiRelayRouteToken, reason);
+    const releaseCodexTurnState = (
+      state: ActiveCodexTurnState,
+      reason: string,
+    ): void => {
+      if (state.releaseTimer !== null) {
+        clearTimeout(state.releaseTimer);
+        state.releaseTimer = null;
+      }
+      const accountId = state.acquiredAccountId;
+      const slotId = state.acquiredSlotId;
+      state.acquiredAccountId = null;
+      state.acquiredSlotId = null;
+      const routeToken = state.apiRelayRouteToken;
+      state.apiRelayRouteToken = null;
+      state.acquireInflight = false;
+      // Identity compare is the stateId fence: a late completion can never delete
+      // a newer turn that reused the same peer key.
+      const current = activeCodexTurnsByPeer.get(state.peerKey);
+      if (current === state && current.stateId === state.stateId) {
+        activeCodexTurnsByPeer.delete(state.peerKey);
+      }
+      if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
+        try { deps.codexBinding.release(accountId, slotId); } catch { /* best effort */ }
+      }
+      expireCodexRouteToken(routeToken, reason);
     };
 
     // Phase 4 — GitHub session-repo auto-rebind:bridge 实例级 cache。
@@ -2291,18 +2349,114 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const attachMasterHistoricalMessages = async (
       frameObj: Record<string, unknown>,
       turnLog: Logger | null,
-    ): Promise<Record<string, unknown>> => {
-      if (!deps.loadMasterSessionMessages) return frameObj;
+    ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
         peer && typeof peer === "object"
           ? (peer as { id?: unknown }).id
           : undefined;
       if (typeof peerId !== "string" || peerId.length === 0) return frameObj;
+      const clientMessageId = isClientMessageId(frameObj.clientMessageId)
+        ? frameObj.clientMessageId
+        : null;
+
+      // The browser's optimistic POST is intentionally not a dispatch gate.
+      // Make the server-side ordering invariant explicit here instead: the
+      // authoritative user row must exist before route/acquire/precheck/
+      // journal/history injection or any physical forward can happen.
+      if (clientMessageId !== null && deps.persistMasterUserMessage) {
+        const content = frameObj.content && typeof frameObj.content === "object"
+          ? frameObj.content as { text?: unknown; media?: unknown }
+          : {};
+        const rawMedia = Array.isArray(content.media) ? content.media : [];
+        const persistedMedia = rawMedia.filter((item) =>
+          !item || typeof item !== "object" || (item as { hidden?: unknown }).hidden !== true);
+        const message = {
+          id: clientMessageId,
+          role: "user" as const,
+          text: typeof frameObj.content === "string"
+            ? frameObj.content
+            : typeof content.text === "string"
+              ? content.text
+              : "",
+          ts: typeof frameObj.ts === "number" && Number.isFinite(frameObj.ts)
+            ? frameObj.ts
+            : Date.now(),
+          ...(persistedMedia.length > 0 ? { _media: persistedMedia } : {}),
+        };
+        let persisted = false;
+        let lastReason: string | undefined;
+        const retryDelays = [0, 50, 150];
+        for (const delayMs of retryDelays) {
+          if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+          if (cleaned) return null;
+          try {
+            const result = await deps.persistMasterUserMessage(uid, peerId, message);
+            if (result.applied || result.reason === "already_exists") {
+              persisted = true;
+              break;
+            }
+            lastReason = result.reason;
+            // Only the known PUT-vs-WS creation race is retryable here.
+            if (result.reason !== "session_not_found") break;
+          } catch (err) {
+            lastReason = (err as Error)?.message ?? String(err);
+            break;
+          }
+        }
+        if (!persisted) {
+          turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
+            sessionId: peerId,
+            clientMessageId,
+            reason: lastReason,
+          });
+          sendErrorFrame(
+            userWs,
+            "SESSION_PERSIST_UNAVAILABLE",
+            "user message could not be durably admitted; retry safely",
+            { peerId, clientMessageId },
+          );
+          return null;
+        }
+      }
+
+      if (!deps.loadMasterSessionMessages) return frameObj;
       try {
         const raw = await deps.loadMasterSessionMessages(uid, peerId);
+        if (clientMessageId !== null && Array.isArray(raw)) {
+          const alreadyCompleted = raw.some((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const row = value as Record<string, unknown>;
+            return row.role === "assistant" &&
+              row._clientMessageId === clientMessageId &&
+              row.status === "completed" &&
+              row._errorCode === undefined &&
+              row._isError !== true;
+          });
+          if (alreadyCompleted) {
+            const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+              ? frameObj.idempotencyKey
+              : undefined;
+            try {
+              userWs.send(JSON.stringify({
+                type: "outbound.ack",
+                deduplicated: true,
+                ...(idempotencyKey ? { idempotencyKey } : {}),
+                peer: { id: peerId, kind: "dm" },
+                clientMessageId,
+              }));
+            } catch { /* client left; durable response remains syncable */ }
+            turnLog?.info("user-chat-bridge: completed client turn deduplicated", {
+              sessionId: peerId,
+              clientMessageId,
+            });
+            return null;
+          }
+        }
         const historical = Array.isArray(raw)
-          ? _sanitizeMasterHistoricalMessagesForFrame(raw)
+          ? _sanitizeMasterHistoricalMessagesForFrame(raw, {
+              ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
+            })
           : [];
         if (historical.length === 0) return frameObj;
         turnLog?.info("user-chat-bridge: attached master history", {
@@ -2389,8 +2543,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
-      // plan v3 G6 早释放(BLOCKER 1):codex inbound 帧的 peer.id,acquire 路径捕获后存
-      // codexInboundPeerId,匹配 outbound 终态时用。无 peer.id 即保持 null,降级为 timer 兜底。
+      // Session-scoped Codex admission key. Outbound terminal frames match this
+      // peer plus clientMessageId; missing peer falls back to a bridge-local
+      // sentinel and therefore only has timeout/cleanup release safety.
       let inboundPeerIdForFrame: string | null = null;
       // PR2 v1.0.66 — 把 codex 计费需要用到的 frame 字段提到外层(下面 IIFE 用):
       //   inboundParsedFrame:rewrite 帧塞 server requestId 时复用,免再次 JSON.parse
@@ -2783,8 +2938,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? (authorityDeps?.catalog.peek()?.isCodexModel(authorityModelForFrame) ??
                    isCodexEngineModel(effectiveModel))
                 : isCodexEngineModel(effectiveModel);
-            // 提取 peer.id(用于 outbound 终态早释放匹配)。codex 帧才需要;非 codex
-            // 帧不影响 acquiredCodexAccountId,捕不捕没用。
+            // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
             if (isCodexInboundFrame) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
@@ -2907,6 +3061,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             return;
           }
+          const enrichedParsed = await attachMasterHistoricalMessages(
+            inboundParsedCapture,
+            turnLogCapture,
+          );
+          if (enrichedParsed === null || cleaned) return;
           // 模型执行权威:epoch fence + descriptor(拒帧 → 直接 return,本路径尚无预扣)。
           let authorityExec: ResolvedTurnExecution | null = null;
           if (authorityOn) {
@@ -2917,11 +3076,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
             if (authorityExec === null) return;
           }
-          const enrichedParsed = await attachMasterHistoricalMessages(
-            inboundParsedCapture,
-            turnLogCapture,
-          );
-          if (cleaned) return;
           // Image 2 owns its exact 50-credit reservation inside the trusted
           // relay. Do not acquire a chat slot, open a Codex journal, or create
           // a chat Redis reservation for a turn the gateway intentionally
@@ -2970,39 +3124,54 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         containerId !== undefined &&
         (deps.codexBinding !== undefined || deps.createCodexRoute !== undefined)
       ) {
-        if (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight || codexAcquireInflight) {
-          // G7 严格单飞:不 close bridge,让前端等当前 turn 完成后重发
+        const peerIdForAcquire = inboundPeerIdForFrame;
+        const clientMessageIdForAcquire = inboundParsedFrame !== null &&
+          isClientMessageId(inboundParsedFrame.clientMessageId)
+          ? inboundParsedFrame.clientMessageId
+          : null;
+        const peerKeyForAcquire = codexPeerKey(peerIdForAcquire);
+        if (activeCodexTurnsByPeer.has(peerKeyForAcquire)) {
+          // Same-session strict single-flight. Do not close the bridge: other
+          // sessions on this connection remain usable and the exact failed turn
+          // can be retried without disturbing their lifecycle state.
           turnLogForFrame?.info("user-chat-bridge: codex turn busy, rejecting frame");
           sendErrorFrame(
             userWs,
             "CODEX_TURN_BUSY",
             "previous codex turn still in progress, wait for completion",
+            { peerId: peerIdForAcquire, clientMessageId: clientMessageIdForAcquire },
           );
           return;
         }
-        codexAcquireInflight = true;
+        // Reserve the peer synchronously before the first await. This is both the
+        // same-session admission lock and the ABA fence for late async continuations.
+        const codexTurnState: ActiveCodexTurnState = {
+          stateId: randomUUID(),
+          peerKey: peerKeyForAcquire,
+          peerId: peerIdForAcquire,
+          clientMessageId: clientMessageIdForAcquire,
+          acquireInflight: true,
+          acquiredAccountId: null,
+          acquiredSlotId: null,
+          apiRelayRouteToken: null,
+          releaseTimer: null,
+        };
+        activeCodexTurnsByPeer.set(peerKeyForAcquire, codexTurnState);
+        const turnIdentity = {
+          peerId: peerIdForAcquire,
+          clientMessageId: clientMessageIdForAcquire,
+        };
+        const sendTurnErrorFrame = (code: string, message: string): void => {
+          sendErrorFrame(userWs, code, message, turnIdentity);
+        };
         const codexBinding = deps.codexBinding;
         const createCodexRoute = deps.createCodexRoute;
         const cid = containerId;
         const sessionMaxMs = readCodexSessionMaxMs();
-        // 进 acquire 路径才记 peer.id;G7 拒绝路径(busy)不该覆盖在飞 turn 的 peer.id。
-        const peerIdForAcquire = inboundPeerIdForFrame;
-        // PR2 v1.0.66 — billing 路径的回滚 helper:任意 await 阶段失败 / cleaned
-        // 检测命中时调,把已 set 的 acquiredCodexAccountId / timer / peerId 清理。
-        // legacy 路径 acquiredCodexAccountId 始终 null,是 no-op,安全。
+        // Billing rollback owns journal/reservation separately; this helper owns
+        // only the session admission state, account slot, timer and relay route.
         const releaseAcquiredSlotForFailure = (): void => {
-          if (codexReleaseTimer !== null) {
-            clearTimeout(codexReleaseTimer);
-            codexReleaseTimer = null;
-          }
-          if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
-            try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
-            acquiredCodexAccountId = null;
-            acquiredCodexSlotId = null;
-          }
-          expireActiveCodexRoute("failure");
-          codexApiRelayTurnInFlight = false;
-          codexInboundPeerId = null;
+          releaseCodexTurnState(codexTurnState, "failure");
         };
         // PR2 v1.0.66 — 把外层 onUserMessage 抓的 effectiveModel / parsed / agentId
         // 快照进 IIFE 局部,IIFE 跑期间 onUserMessage 不会再修改这几个 let(下一帧
@@ -3017,6 +3186,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // CG2b — capture turn-scoped logger;同步 set 一并 capture。
         const turnLogCapture = turnLogForFrame;
         void (async () => {
+          let turnForwarded = false;
           try {
             // CG2a invariant — codex inbound 必经 inbound.message 分支 ⇒ trace + parsed 必非 null。
             // 这里前置校验(acquire 之前),invariant 破坏 → close 1011,无需 release。
@@ -3025,11 +3195,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // invariant 命中时 turnLogCapture 也必为 null(同步生成),用 bridgeLog 兜底
               bridgeLog?.error("user-chat-bridge: codex frame missing trace invariant");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+                sendTurnErrorFrame("ERR_INTERNAL", "trace invariant violated");
                 try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
               }
               return;
             }
+            const preparedInbound = await attachMasterHistoricalMessages(
+              inboundParsedCapture,
+              turnLogCapture,
+            );
+            if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
             // ── 模型执行权威:epoch fence + descriptor(方案 §1.2 R3-B2)─────────
             // **必须在 acquire / preCheck / journal 之前**:此刻拒帧的代价是零(没占槽、
             // 没预扣、没开 journal)。放到后面拒 = 要写一堆补偿回滚,而补偿路径正是漏账
@@ -3042,6 +3217,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 log: turnLogCapture,
               });
               if (authorityExec === null) return;
+              if (!isCurrentCodexTurnState(codexTurnState)) return;
             }
             let codexRoute: CodexApiRelayRoute | null = null;
             let officialOAuthGroupId: string | null = null;
@@ -3054,6 +3230,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userId: uid,
                 modelId: effectiveModelCapture,
               });
+              if (!isCurrentCodexTurnState(codexTurnState)) {
+                if (
+                  decision !== null &&
+                  decision.kind !== "official_oauth" &&
+                  decision.kind !== "unavailable"
+                ) {
+                  expireCodexRouteToken(decision.token, "stale_route_creation");
+                }
+                return;
+              }
               if (decision !== null) {
                 if (decision.kind === "official_oauth") {
                   officialOAuthGroupId = decision.groupId;
@@ -3061,7 +3247,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   throw Object.assign(new Error(decision.reason), { name: "CodexRouteUnavailable" });
                 } else {
                   codexRoute = decision;
-                  codexApiRelayRouteToken = decision.token;
+                  codexTurnState.apiRelayRouteToken = decision.token;
                 }
               }
             }
@@ -3072,11 +3258,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
               }
               acquired = await codexBinding.acquire(cid, officialOAuthGroupId);
+              if (!isCurrentCodexTurnState(codexTurnState)) {
+                if (acquired !== null) {
+                  try { codexBinding.release(acquired.account_id, acquired.slotId); } catch { /* */ }
+                }
+                return;
+              }
               if (officialOAuthGroupId !== null && acquired === null) {
                 throw Object.assign(new Error("selected Codex OAuth group unavailable"), { name: "CodexRouteUnavailable" });
               }
             }
-            if (cleaned) {
+            if (!isCurrentCodexTurnState(codexTurnState)) {
               // bridge 在 acquire/route 创建期间被关 — 立即 release 不留泄漏
               if (codexRoute !== null) {
                 expireCodexRouteToken(codexRoute.token, "cleanup_during_route_creation");
@@ -3086,37 +3278,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            if (codexRoute !== null) {
-              codexApiRelayTurnInFlight = true;
-              codexInboundPeerId = peerIdForAcquire;
-              codexReleaseTimer = setTimeout(() => {
-                expireActiveCodexRoute("timeout");
-                codexApiRelayTurnInFlight = false;
-                codexInboundPeerId = null;
-                codexReleaseTimer = null;
-              }, sessionMaxMs);
-              codexReleaseTimer.unref?.();
-            } else if (acquired === null) {
+            if (acquired === null) {
               // legacy NULL 容器(决策 N3):不占 per-account 槽,billing 路径下面
-              // 仍跑(accountIdForQuota=0n 占位)。每轮 turn 都会再走一次 IIFE
-              // (acquire() 内部 row 查很轻),持续保持每轮扣费。
+              // 仍跑(accountIdForQuota=0n 占位)。The session state still remains
+              // active so a legacy turn gets the same single-flight semantics.
             } else {
-              acquiredCodexAccountId = acquired.account_id;
-              acquiredCodexSlotId = acquired.slotId;
-              codexInboundPeerId = peerIdForAcquire;
-              codexReleaseTimer = setTimeout(() => {
-                // 兜底释放:防 outbound 完成信号丢 / ws 异常断 → 槽永久泄漏
-                if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
-                  try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
-                  acquiredCodexAccountId = null;
-                  acquiredCodexSlotId = null;
-                }
-                codexApiRelayTurnInFlight = false;
-                codexInboundPeerId = null;
-                codexReleaseTimer = null;
-              }, sessionMaxMs);
-              codexReleaseTimer.unref?.();
+              codexTurnState.acquiredAccountId = acquired.account_id;
+              codexTurnState.acquiredSlotId = acquired.slotId;
             }
+            codexTurnState.acquireInflight = false;
+            codexTurnState.releaseTimer = setTimeout(() => {
+              releaseCodexTurnState(codexTurnState, "timeout");
+            }, sessionMaxMs);
+            codexTurnState.releaseTimer.unref?.();
 
             // PR2 v1.0.66 → M2 — codex 真扣费 path:preCheck → journal → snapshot
             //   (finalizer 延迟到 billing 帧构造)→ inflightCodexTurns Map 注册 →
@@ -3148,7 +3322,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // 不该发生(isCodexInboundFrame=true 蕴含 effectiveModel 非空)
                 turnLogCapture?.error("user-chat-bridge: codex billing without effective model");
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(userWs, "CODEX_BILLING", "codex billing internal");
+                  sendTurnErrorFrame("CODEX_BILLING", "codex billing internal");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "codex billing"); } catch { /* */ }
                 }
                 releaseAcquiredSlotForFailure();
@@ -3168,7 +3342,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   model: effectiveModel,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(userWs, "CODEX_BILLING", `pricing missing for ${effectiveModel}`);
+                  sendTurnErrorFrame("CODEX_BILLING", `pricing missing for ${effectiveModel}`);
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "pricing missing"); } catch { /* */ }
                 }
                 releaseAcquiredSlotForFailure();
@@ -3186,13 +3360,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   agentId: agentForCharge, err,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(userWs, "CODEX_BILLING", "billing config unavailable");
+                  sendTurnErrorFrame("CODEX_BILLING", "billing config unavailable");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "billing config"); } catch { /* */ }
                 }
                 releaseAcquiredSlotForFailure();
                 return;
               }
-              if (cleaned) {
+              if (!isCurrentCodexTurnState(codexTurnState)) {
                 releaseAcquiredSlotForFailure();
                 return;
               }
@@ -3215,7 +3389,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               } catch (err) {
                 turnLogCapture?.error("user-chat-bridge: estimateMaxCost failed", { err });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(userWs, "CODEX_BILLING", "billing internal");
+                  sendTurnErrorFrame("CODEX_BILLING", "billing internal");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "billing internal"); } catch { /* */ }
                 }
                 releaseAcquiredSlotForFailure();
@@ -3236,8 +3410,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     required: err.required.toString(),
                   });
                   if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                    sendErrorFrame(
-                      userWs,
+                    sendTurnErrorFrame(
                       "ERR_INSUFFICIENT_CREDITS",
                       `insufficient credits: balance=${err.balance} required=${err.required}`,
                     );
@@ -3246,14 +3419,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 } else {
                   turnLogCapture?.error("user-chat-bridge: preCheckWithCost failed", { err });
                   if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                    sendErrorFrame(userWs, "CODEX_BILLING", "preCheck unavailable");
+                    sendTurnErrorFrame("CODEX_BILLING", "preCheck unavailable");
                     try { userWs.close(CLOSE_BRIDGE.INTERNAL, "preCheck unavailable"); } catch { /* */ }
                   }
                 }
                 releaseAcquiredSlotForFailure();
                 return;
               }
-              if (cleaned) {
+              if (!isCurrentCodexTurnState(codexTurnState)) {
                 // 已 preCheck;主动 release 不让 lock 在 Redis 卡 5 分钟
                 await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
                 releaseAcquiredSlotForFailure();
@@ -3306,7 +3479,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     requestId,
                   });
                   if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                    sendErrorFrame(userWs, "CODEX_BILLING", "journal unavailable");
+                    sendTurnErrorFrame("CODEX_BILLING", "journal unavailable");
                     try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
                   }
                   await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
@@ -3318,14 +3491,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   requestId, err,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(userWs, "CODEX_BILLING", "journal unavailable");
+                  sendTurnErrorFrame("CODEX_BILLING", "journal unavailable");
                   try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
                 }
                 await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
                 releaseAcquiredSlotForFailure();
                 return;
               }
-              if (cleaned) {
+              if (!isCurrentCodexTurnState(codexTurnState)) {
                 // journal 已落 inflight — 主动 abort + release reservation,免 reconciler 等 timeout
                 await abortInflightJournal(
                   pgPool,
@@ -3357,6 +3530,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // 这里读出来 TS 推断为 string。本 turn 整个生命周期内固定不可变。
                 traceId: turnTraceIdCapture,
                 codexRouteToken: codexRoute?.token ?? null,
+                releaseBridgeTurnState(reason: string): boolean {
+                  if (!isCurrentCodexTurnState(codexTurnState)) return false;
+                  releaseCodexTurnState(codexTurnState, reason);
+                  return true;
+                },
                 authority: authorityExec === null
                   ? null
                   : {
@@ -3430,10 +3608,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 把这个 requestId 透传到 outbound.codex_billing,master 用它从
               // inflightCodexTurns Map 找回 snapshot 落账。
               // CG2a — 同时注入 master canonical traceId(IIFE 起手 invariant 保证非 null)
-              const enrichedParsed = await attachMasterHistoricalMessages(
-                inboundParsedCapture,
-                turnLogCapture,
-              );
+              const enrichedParsed = preparedInbound;
               // ── 签发边界(MAJOR-2)────────────────────────────────────────────
               // 这里是 turn 里**最后一个还能无痛掉头**的点:票还没签、帧还没进容器。
               // 从起手 fence 到这一行之间已经跑完 route/acquire/preCheck/journal/历史装配
@@ -3456,7 +3631,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
                 authorityFields = sealed;
               }
-              if (cleaned) {
+              if (!isCurrentCodexTurnState(codexTurnState)) {
                 abandonReason = "bridge_disconnect_before_forward";
                 return;
               }
@@ -3479,8 +3654,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 });
                 abandonReason = "rewritten_frame_too_big";
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(
-                    userWs,
+                  sendTurnErrorFrame(
                     "ERR_FRAME_TOO_BIG",
                     `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
                   );
@@ -3497,6 +3671,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 frameForwardIsBinary,
                 frameForwardLen,
               );
+              turnForwarded = forwardCommitted;
               if (!forwardCommitted) abandonReason = "container_forward_rejected";
               } finally {
                 if (!forwardCommitted) {
@@ -3514,10 +3689,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else {
               // CG2a — billing 未启用(legacy NULL 容器无三件套 / 测试)路径仍要 rewrite
               // 注入 traceId(合同硬门);不动 requestId(client 提供的 requestId 保留 raw)。
-              const enrichedParsed = await attachMasterHistoricalMessages(
-                inboundParsedCapture,
-                turnLogCapture,
-              );
+              const enrichedParsed = preparedInbound;
               // 签发边界(MAJOR-2):本分支没开 journal / 没预扣,但**占了 codex 槽** ——
               // 拒帧必须还槽,否则该用户后续 codex turn 全被 G7 单飞门挡住。
               let authorityFields: Record<string, unknown> = {};
@@ -3530,7 +3702,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 if (sealed === null) return;
                 authorityFields = sealed;
               }
-              if (cleaned) {
+              if (!isCurrentCodexTurnState(codexTurnState)) {
                 releaseAcquiredSlotForFailure();
                 return;
               }
@@ -3549,8 +3721,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   rewrittenLen, max: maxFrameBytes,
                 });
                 if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(
-                    userWs,
+                  sendTurnErrorFrame(
                     "ERR_FRAME_TOO_BIG",
                     `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
                   );
@@ -3565,7 +3736,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
             // 已 acquire(+ billing 注册若启用)完毕,继续同步 forward 路径
             // (等价于"放行 frame")。两条分支都已 rewrite 注入 traceId(CG2a 合同)。
-            forwardInboundFrame(frameForwardData, frameForwardIsBinary, frameForwardLen);
+            turnForwarded = forwardInboundFrame(
+              frameForwardData,
+              frameForwardIsBinary,
+              frameForwardLen,
+            );
           } catch (err) {
             const errName = (err as { name?: string } | null | undefined)?.name ?? "";
             if (errName === "ContainerStaleBindingError") {
@@ -3579,8 +3754,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 err: (err as Error)?.message,
               });
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(
-                  userWs,
+                sendTurnErrorFrame(
                   "CODEX_CONTAINER_RECYCLED",
                   "GPT 账号配置已变更,容器已自动重建,请刷新页面后重发",
                 );
@@ -3589,33 +3763,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else if (errName === "CodexRouteUnavailable") {
               turnLogCapture?.info("user-chat-bridge: codex api relay route unavailable");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(
-                  userWs,
+                sendTurnErrorFrame(
                   "CODEX_ROUTE_UNAVAILABLE",
-                  "no enabled Codex API relay group for this model",
+                  "GPT 服务暂时不可用，请稍后重试。",
                 );
               }
             } else if (errName === "AccountPoolBusyError") {
               turnLogCapture?.info("user-chat-bridge: codex pool busy, fast-fail");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(
-                  userWs,
+                sendTurnErrorFrame(
                   "CODEX_POOL_BUSY",
-                  "codex pool busy, retry shortly",
+                  "当前请求较多，请稍后重试。",
                 );
               }
             } else {
               turnLogCapture?.warn("user-chat-bridge: codex acquire failed", { err });
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(
-                  userWs,
+                sendTurnErrorFrame(
                   "CODEX_UNAVAILABLE",
-                  "GPT temporarily unavailable, retry shortly",
+                  "GPT 服务暂时不可用，请稍后重试。",
                 );
               }
             }
           } finally {
-            codexAcquireInflight = false;
+            codexTurnState.acquireInflight = false;
+            if (!turnForwarded) releaseCodexTurnState(codexTurnState, "not_forwarded");
           }
         })();
         return; // 同步路径不再 forward,等 async 完成后由 forwardInboundFrame 走
@@ -3653,6 +3825,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             inboundParsedCapture,
             turnLogCapture,
           );
+          if (enrichedParsed === null) return;
           // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
           // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
           // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
@@ -3969,6 +4142,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 各广播一次 — 用 Map.delete + 本地簿记早断。
             inflightCodexTurns.delete(reqId);
             locallySettledCodexTurns.add(reqId);
+            // requestId resolves to this exact turn snapshot, so the internal
+            // terminal billing frame can release even if a legacy gateway does
+            // not echo peer/clientMessageId on its later user-facing final frame.
+            snap.releaseBridgeTurnState?.("turn_billing_terminal");
             // CG2c — billing settle 路径的 log 钉到 turn 的 server-owned trace。
             // child 一次,后续 quota / commit / persist 三个分支都用 billingLog;
             // requestId 经 binding 提供,call-site 不再手写。**只读 snap.traceId,
@@ -4226,19 +4403,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // (was previously a silent-drop bug because there was no ring layer).
         return;
       }
-      // plan v3 G6 early release(BLOCKER 1):outbound.message + isFinal:true 或
-      //   outbound.error,且 peer.id 命中本桥在飞 codex turn 的 inbound peer.id →
-      //   立即 release codex slot,timer 退化为兜底。
-      //   - 必须 acquiredCodexAccountId !== null && codexInboundPeerId !== null:
-      //     未持槽 / 没记 peer.id 走纯透传(timer 兜底)
-      //   - 仅文本帧 + cheap pre-filter 减少 JSON.parse 开销(claude 流是高频)
-      //   - peer.id 严格匹配:claude 流 peer.id 不同 → 不误释
-      //   - 释放在 userWs.send 之前完成,失败回滚靠 cleanup 兜底
-      if (
-        (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight) &&
-        codexInboundPeerId !== null &&
-        !isBinary
-      ) {
+      // Terminal release is exact by peer + clientMessageId. Peer-only fallback
+      // is restricted to genuinely legacy inbound turns that never had a client
+      // id; otherwise a late id-less final from turn A could ABA-release a newer
+      // turn B after A's requestId-scoped billing frame already released it.
+      if (activeCodexTurnsByPeer.size > 0 && !isBinary) {
         let outText: string | null = null;
         if (typeof data === "string") outText = data;
         else if (Buffer.isBuffer(data)) {
@@ -4255,27 +4424,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               type?: unknown;
               isFinal?: unknown;
               peer?: { id?: unknown };
+              clientMessageId?: unknown;
             };
             const peerId = obj.peer && typeof obj.peer === "object"
               ? (typeof obj.peer.id === "string" ? obj.peer.id : null)
               : null;
             const isFinalMsg = obj.type === "outbound.message" && obj.isFinal === true;
             const isErr = obj.type === "outbound.error";
-            if ((isFinalMsg || isErr) && peerId !== null && peerId === codexInboundPeerId) {
-              const accountId = acquiredCodexAccountId;
-              const slotId = acquiredCodexSlotId;
-              acquiredCodexAccountId = null;
-              acquiredCodexSlotId = null;
-              codexApiRelayTurnInFlight = false;
-              codexInboundPeerId = null;
-              if (codexReleaseTimer !== null) {
-                clearTimeout(codexReleaseTimer);
-                codexReleaseTimer = null;
+            if ((isFinalMsg || isErr) && peerId !== null) {
+              const state = activeCodexTurnsByPeer.get(codexPeerKey(peerId));
+              const terminalClientMessageId = isClientMessageId(obj.clientMessageId)
+                ? obj.clientMessageId
+                : null;
+              const exactClientMatch = state !== undefined &&
+                terminalClientMessageId !== null &&
+                state.clientMessageId === terminalClientMessageId;
+              const legacyPeerFallback = state !== undefined &&
+                terminalClientMessageId === null &&
+                state.clientMessageId === null;
+              if (state !== undefined && (exactClientMatch || legacyPeerFallback)) {
+                releaseCodexTurnState(state, isFinalMsg ? "turn_final" : "turn_error");
               }
-              if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
-                try { deps.codexBinding.release(accountId, slotId); } catch { /* swallow */ }
-              }
-              expireActiveCodexRoute(isFinalMsg ? "turn_final" : "turn_error");
             }
           }
         }
@@ -5079,22 +5248,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       inflightCodexTurns.clear();
 
-      // plan v3 G6 — codex 槽兜底释放:bridge 关 = 当前 turn 必然终止(用户 ws / 容器
-      //   ws 任一断都进 cleanup)。清掉 timeout timer 后显式 release。即便 acquire 还在
-      //   飞(codexAcquireInflight=true),acquire 内部已检查 cleaned 标志,acquire 成功
-      //   后会立刻 release 自己,不会泄漏。
-      if (codexReleaseTimer !== null) {
-        clearTimeout(codexReleaseTimer);
-        codexReleaseTimer = null;
+      // Release every session-scoped admission state. Awaiting acquire/route
+      // continuations carry the state identity fence and release any resource
+      // they receive after this map has been cleared.
+      for (const state of [...activeCodexTurnsByPeer.values()]) {
+        releaseCodexTurnState(state, "bridge_cleanup");
       }
-      if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && deps.codexBinding) {
-        try { deps.codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
-        acquiredCodexAccountId = null;
-        acquiredCodexSlotId = null;
-      }
-      expireActiveCodexRoute("bridge_cleanup");
-      codexApiRelayTurnInFlight = false;
-      codexInboundPeerId = null;
       try { connectAbort.abort(); } catch { /* */ }
       try {
         // 注意:CLOSING 状态也强 terminate(),不依赖对端 echo,

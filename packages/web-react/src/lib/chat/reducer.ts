@@ -23,6 +23,8 @@ import {
   getFrameSeqCursor,
   isBridgeAuthControlError,
   normalizeBridgeErrorCode,
+  safeBridgeErrorDetail,
+  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -73,6 +75,8 @@ export type FrameEffects = {
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
   scheduleAutoContinue?: (sessId: string, targetMsgId: string, cls: EmptyTurnDecision) => void;
+  /** 仅行动承诺式短开场后 end_turn → 单次继续执行。 */
+  schedulePreambleContinue?: (sessId: string, targetMsgId: string) => void;
   /** 商业版余额刷新（cost_charged / insufficient_credits）。*/
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
@@ -868,6 +872,19 @@ export function applyOutboundMessage(
   // server ts 跟踪(max 单调):供 resetReplyTracker 定格 server 域 stale 截止(§11)。
   trackServerTs(sess, frame.ts);
 
+  // A delayed frame from an older turn on the same peer must never mutate
+  // the streaming pointers/lifecycle of a newer active turn. The durable
+  // tape owns the old content, so an exact sync is safer than cross-turn
+  // client-side merging here.
+  if (
+    frame.clientMessageId &&
+    sess._activeClientMessageId &&
+    frame.clientMessageId !== sess._activeClientMessageId
+  ) {
+    if (frame.isFinal) effects.forceSync?.(sess.id, { clientMessageId: frame.clientMessageId });
+    return;
+  }
+
   // ── §11 双帧 error 抑制：紧随 outbound.error 的 [error] text isFinal 不渲染气泡 ──
   let suppressLegacyErrorText = false;
   if (
@@ -908,7 +925,7 @@ export function applyOutboundMessage(
       (!!sess._streamingAssistant && (sess._streamingAssistant.text ?? "").trim().length > 0) ||
       !!sess._streamingThinking;
     if (!(hasLiveStream && !hasQueuedUser)) {
-      const clientMessageId = sess._activeClientMessageId;
+      const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
       sess._sendingInFlight = false;
@@ -924,7 +941,7 @@ export function applyOutboundMessage(
   //    发送态(missed 真 final)。清发送态收口本轮 UI,但**不走空轮分类**(空 blocks 不合成空气泡——
   //    内容其实已在服务端生成),并强制 REST 全量对账拉回客户端丢失的内容(参考 applyResumeFailed)。──
   if (frame.isFinal && frame.meta?.reconcile === "turn_completed") {
-    const clientMessageId = sess._activeClientMessageId;
+    const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
@@ -1354,6 +1371,16 @@ export function applyOutboundMessage(
   if (frame.isFinal) {
     // 空轮分类（block 渲染后；deferred 到这里）。
     if (deferredEmptyNotice) {
+      if (
+        effects.schedulePreambleContinue &&
+        shouldAutoContinueActionPreamble({
+          messages: sess.messages,
+          targetMsgId: deferredEmptyNotice.targetMsgId,
+          stopReason: deferredEmptyNotice.stopReason,
+        })
+      ) {
+        effects.schedulePreambleContinue(sess.id, deferredEmptyNotice.targetMsgId);
+      }
       const cls = classifyEmptyTurn({
         messages: sess.messages,
         targetMsgId: deferredEmptyNotice.targetMsgId,
@@ -1465,7 +1492,7 @@ export function applyOutboundMessage(
     }
     sess._pendingCostCredits = "0";
     // 清流式指针 + in-flight。
-    const clientMessageId = sess._activeClientMessageId;
+    const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
@@ -1494,31 +1521,39 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
-  // 友好主文案;原始技术信息(detail 优先,无则 message)落 _errorDetail→「查看详情」,未知码也不丢
-  // (friendlyBridgeErrorMessage 未知码返通用文案、不再带 message,故这里必须兜住 message)。Codex 审。
-  const rawDetail =
-    (typeof frame.detail === "string" && frame.detail) ||
-    (typeof frame.message === "string" && frame.message) ||
-    "";
   addMessage(sess, "assistant", friendlyBridgeErrorMessage(frame.code, frame.message || "出错了"), {
     _errorCode: normalized,
-    _errorDetail: rawDetail,
+    _errorDetail: safeBridgeErrorDetail(frame.code, frame.traceId),
+    ...(frame.clientMessageId ? { _clientMessageId: frame.clientMessageId } : {}),
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   });
   // outbound.error is the structured error card; the following [error] text final is only a
   // compatibility terminator. Clear/persist locally now so a refresh in that tiny gap does not
   // resurrect the stop button or let late non-final frames revive the failed turn.
-  sess._sendingInFlight = false;
-  clearTurnTiming(sess);
-  resetReplyTracker(sess);
-  sess._localTeardownAt = sess._trackerResetAt;
-  // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态（danger 边 + 原因）。
-  failGenPlaceholders(sess, errorLabel(normalized));
-  for (let i = sess.messages.length - 1; i >= 0; i--) {
-    const m = sess.messages[i];
-    if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
-      m.status = "error";
-      break;
+  const ownsActiveTurn = frame.clientMessageId
+    ? sess._activeClientMessageId === frame.clientMessageId
+    : true; // rolling compatibility for old gateways
+  if (ownsActiveTurn) {
+    sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
+    clearTurnTiming(sess);
+    resetReplyTracker(sess);
+    sess._localTeardownAt = sess._trackerResetAt;
+    // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态（danger 边 + 原因）。
+    failGenPlaceholders(sess, errorLabel(normalized));
+  }
+  const exactUser = frame.clientMessageId
+    ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
+    : undefined;
+  if (exactUser) {
+    exactUser.status = "error";
+  } else if (!frame.clientMessageId) {
+    for (let i = sess.messages.length - 1; i >= 0; i--) {
+      const m = sess.messages[i];
+      if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
+        m.status = "error";
+        break;
+      }
     }
   }
   effects.persistSession?.(sess.id);
@@ -1543,22 +1578,35 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   const text = friendlyBridgeErrorMessage(frame.code, frame.message);
   addMessage(sess, "assistant", text, {
     _errorCode: normalized,
-    _errorDetail: typeof frame.message === "string" ? frame.message : "",
+    _errorDetail: safeBridgeErrorDetail(frame.code, frame.traceId),
+    ...(frame.clientMessageId ? { _clientMessageId: frame.clientMessageId } : {}),
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   });
   // legacy error 无后续 final，前端自己收尾本轮 UI。
-  sess._sendingInFlight = false;
-  sess._activeClientMessageId = undefined;
-  clearTurnTiming(sess);
-  resetReplyTracker(sess);
-  sess._localTeardownAt = sess._trackerResetAt;
-  // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态。
-  failGenPlaceholders(sess, errorLabel(normalized));
-  for (let i = sess.messages.length - 1; i >= 0; i--) {
-    const m = sess.messages[i];
-    if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
-      m.status = "error";
-      break;
+  const ownsActiveTurn = frame.clientMessageId
+    ? sess._activeClientMessageId === frame.clientMessageId
+    : true;
+  if (ownsActiveTurn) {
+    sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
+    clearTurnTiming(sess);
+    resetReplyTracker(sess);
+    sess._localTeardownAt = sess._trackerResetAt;
+    // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态。
+    failGenPlaceholders(sess, errorLabel(normalized));
+  }
+  const exactUser = frame.clientMessageId
+    ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
+    : undefined;
+  if (exactUser) {
+    exactUser.status = "error";
+  } else if (!frame.clientMessageId) {
+    for (let i = sess.messages.length - 1; i >= 0; i--) {
+      const m = sess.messages[i];
+      if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
+        m.status = "error";
+        break;
+      }
     }
   }
   effects.persistSession?.(sess.id);

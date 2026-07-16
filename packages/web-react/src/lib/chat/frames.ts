@@ -86,6 +86,7 @@ export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 export type LegacyBridgeErrorWire = {
   type: "error";
   peer?: Peer;
+  clientMessageId?: string;
   code?: string;
   message?: string;
   traceId?: string;
@@ -163,6 +164,8 @@ export type AckWire = {
   type: "outbound.ack";
   deduplicated?: boolean;
   idempotencyKey?: string;
+  peer?: Peer;
+  clientMessageId?: string;
 };
 
 /** keepalive pong（按 id 匹配，先于一切 session handler 处理）。*/

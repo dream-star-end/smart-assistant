@@ -44,6 +44,7 @@ OC_HOTCFG_MODEL_AUTHORITY_CAP="model_authority_v1"
 OC_HOTCFG_MODEL_AUTHORITY_CUTOVER_KEY="OC_MODEL_AUTHORITY_CUTOVER"
 OC_HOTCFG_IMAGE_FEATURES_LABEL="oc.runtime.features"
 OC_HOTCFG_LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
+OC_HOTCFG_LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
 
 # bundle 顶层目录白名单(§1.2:与 TS 侧 platformBundle.ts 校验语义一致的 bash 版)。
 OC_HOTCFG_BUNDLE_TOPDIRS="bin entrypoint etc-codex codex-skills seed prompts"
@@ -941,6 +942,59 @@ oc_hotcfg_assert_master_lossless_capability() {
   return 1
 }
 
+oc_hotcfg_probe_master_runtime_batch_capability() {
+  local master_release="$1" metadata caps
+  [ -n "$master_release" ] || return 2
+  metadata="$master_release/deploy/v5/release-metadata.json"
+  [ -r "$metadata" ] || return 2
+  caps="$(jq -r '(.capabilities // []) | if type == "array" then join(" ") else error("not array") end' "$metadata" 2>/dev/null)" || return 2
+  case " $caps " in
+    *" $OC_HOTCFG_LOSSLESS_RUNTIME_BATCH_CAP "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+oc_hotcfg_assert_master_runtime_batch_capability() {
+  local master_release="$1" rc=0
+  oc_hotcfg_probe_master_runtime_batch_capability "$master_release" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) oc_hotcfg__die "runtime-batch rollback: master release 未声明 '$OC_HOTCFG_LOSSLESS_RUNTIME_BATCH_CAP':${master_release:-<empty>}" ;;
+    *) oc_hotcfg__die "runtime-batch rollback: master release capability 不可核验:${master_release:-<empty>}" ;;
+  esac
+  return 1
+}
+
+# 0=armed, 1=definitively inactive, 2=unknown. The env opt-in closes the
+# first-write race; persisted format-3 rows keep the reader floor irreversible.
+oc_hotcfg_probe_runtime_batch_floor() {
+  local env_file="$1" state="" rc=0
+  [ -r "$env_file" ] || return 2
+  state="$(
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file" 2>/dev/null || exit 21
+    set +a
+    case "${LOSSLESS_TURN_TAPE_RUNTIME_BATCHING:-}" in 1|true|TRUE|on|ON) printf true; exit 0 ;; esac
+    [ -n "${DATABASE_URL:-}" ] || exit 22
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc \
+      "SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL AND record_storage_format >= 3)::text" 2>/dev/null
+  )" || rc=$?
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  [ "$rc" -eq 0 ] && [ "$state" = true ] && return 0
+  [ "$rc" -eq 0 ] && [ "$state" = false ] && return 1
+  return 2
+}
+
+oc_hotcfg_assert_master_runtime_batch_pair() {
+  local env_file="$1" target_master="$2" previous_master="$3" rc=0
+  oc_hotcfg_probe_runtime_batch_floor "$env_file" || rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 2 ] && oc_hotcfg__log "runtime-event batch 地板状态不可核验 → master pair fail-closed"
+  oc_hotcfg_assert_master_runtime_batch_capability "$target_master" \
+    && oc_hotcfg_assert_master_runtime_batch_capability "$previous_master"
+}
+
 # DB 中首个 finalized v2 tape 是不可逆地板。无 DATABASE_URL 仅用于本地 fixture/
 # bootstrap，放行；生产 env 有 URL 但查询失败则按地板已生效处理。
 oc_hotcfg_assert_tuple_lossless_floor() {
@@ -1029,6 +1083,10 @@ oc_hotcfg_activate_saga() {
   #    R3-B2:守卫与 canary 都必须在 pre-state 记账**之前**:canary 失败若已留 history 条目,
   #    hotcfg_history_present 会把 --rollback 导向 tuple 路径而倒数第 2 条不存在 = rollback 报废。
   oc_hotcfg_assert_tuple_viable "$image" "$image_id" "$release" || return 1
+  # Master-only format 3:when opt-in is armed or any format-3 tape exists,
+  # prove both sides before the candidate can serve. This preserves automatic
+  # compensation without a check-then-first-write race.
+  oc_hotcfg_assert_master_runtime_batch_pair "$env_file" "$master_release" "$prev_master_release" || return 1
 
   # 0.3) R2-M2③:canary boot 冒烟(仅两轴任一启用;rev-pinned,不依赖 current/env → 现场未动,
   #      失败直接拒绝激活,无需回滚、history 零污染)。

@@ -168,6 +168,9 @@ export type ChatMessage = {
   _modelText?: string;
   /** 首发时的路由快照；重试旧消息时不能被后续 turn 的选择覆盖。*/
   _routing?: ChatRoutingSnapshot;
+  /** Stable logical-send attempt. Reconnect/offline replay keeps the current
+   * value; only an explicit user click on Retry increments it. */
+  _sendAttempt?: number;
   _isAutoRetry?: boolean;
   /** auto-continue 的确定性 idempotencyKey（dedup ack 对账）。*/
   _idem?: string;

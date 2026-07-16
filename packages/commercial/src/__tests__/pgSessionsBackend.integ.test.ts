@@ -37,6 +37,7 @@ const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_
 const MIGRATION_0078 = path.resolve(here, "../db/migrations/0078_wechat_outbox_backoff_hol.sql");
 const MIGRATION_0134 = path.resolve(here, "../db/migrations/0134_sessions_master_pg.sql");
 const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_tapes.sql");
+const MIGRATION_0156 = path.resolve(here, "../db/migrations/0156_lossless_runtime_batches.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -76,6 +77,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0078, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0134, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0156, { encoding: "utf8" }));
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
     `INSERT INTO sessions_store_migration_state (singleton, authority, generation, cutover_id, source_digest, completed_at)
@@ -971,6 +973,73 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal((incremental.messages as MessageLike[]).some(
       (message) => (message._historyProjection as { kind?: string } | undefined)?.kind === "bash-tail",
     ), true);
+  });
+
+  maybe("runtime-event batches reduce physical rows but exact hydration restores every logical payload", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      const sessionId = "s-lossless-runtime-batch";
+      const userId = "u-lossless-runtime-batch";
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      const runtimeEvents = Array.from({ length: 8 }, (_, ordinal) => ({
+        ordinal,
+        observedAt: 1_783_944_100_000 + ordinal,
+        source: "gateway",
+        payload: { type: "raw-progress", ordinal, exact: `value-${ordinal}` },
+      }));
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: "completed",
+        turnKey: "8".repeat(64),
+        text: "visible answer",
+        createdAt: 1_783_944_100_000,
+        runtimeEvents,
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+      }
+      assert.deepEqual(
+        await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        { applied: "finalized", recordCount: 2, engineBillings: [] },
+        "one physical runtime batch plus one assistant row",
+      );
+      const physical = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      );
+      assert.equal(Number(physical.rows[0]!.count), 2);
+
+      const exact = await backend.getClientSession(sessionId, userId);
+      assert.ok(exact);
+      const exactMessages = exact.messages as MessageLike[];
+      const runtime = exactMessages.filter((message) => message.role === "runtime-event");
+      assert.equal(runtime.length, 8);
+      assert.deepEqual(
+        runtime.map((message) => message._runtimeEvent),
+        runtimeEvents.map((event) => event.payload),
+      );
+      assert.ok(runtime.every((message) => message._turnTapePhysicalMsgId !== undefined));
+      assert.equal(exactMessages.find((message) => message.role === "assistant")?.text, "visible answer");
+
+      const chat = await backend.getClientSession(sessionId, userId, { projection: "chat" });
+      assert.ok(chat);
+      const chatMessages = chat.messages as MessageLike[];
+      assert.equal(chatMessages.some((message) => message.role === "runtime-event"), false);
+      assert.equal(chatMessages.find((message) => message.role === "assistant")?.text, "visible answer");
+      const storage = await pool.query<{ record_storage_format: number }>(
+        `SELECT record_storage_format FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      );
+      assert.equal(storage.rows[0]!.record_storage_format, 3);
+    } finally {
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+    }
   });
 });
 

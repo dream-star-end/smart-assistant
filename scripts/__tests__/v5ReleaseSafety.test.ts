@@ -815,6 +815,7 @@ describe('v5 release safety lanes', () => {
         'DRY=0',
         'ssh() {',
         '  case "$*" in',
+        '    *"record_storage_format"*) printf "%s\\n" false ;;',
         '    *"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes"*)',
         dbResult === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${dbResult}' ;;`,
         '    *".runtimeCapabilities"*) [[ "$FLOOR_RUNTIME" == 1 ]] && printf "capable\\n" || printf "incapable\\n" ;;',
@@ -868,6 +869,7 @@ describe('v5 release safety lanes', () => {
       'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$1"; }',
       'ssh() {',
       '  case "$*" in',
+      '    *"record_storage_format"*) printf "%s\\n" false; return 0 ;;',
       '    *candidate*) return 23 ;;',
       '    *old*) printf "%s\\n" incapable; return 0 ;;',
       '    *) printf "MUTATION:%s\\n" "$*" >>"$MUTATION_LOG"; return 0 ;;',
@@ -926,6 +928,7 @@ describe('v5 release safety lanes', () => {
       '}',
       'ssh() {',
       '  case "$*" in',
+      '    *"record_storage_format"*) printf "%s\\n" false; return 0 ;;',
       '    *"test -f"*"/release/candidate/.complete"*) return 0 ;;',
       '    *"ln -s"*"/release/candidate"*)',
       '      printf "%s\\n" candidate >"$ACTIVE_TARGET"',
@@ -1000,6 +1003,130 @@ describe('v5 release safety lanes', () => {
     assert.match(invoke().stdout, /RC:2/)
   })
 
+  test('runtime-event batch format has a distinct master capability and durable rollback floor', async () => {
+    const invoke = (floor: 'true' | 'false' | 'error', capability: 'capable' | 'incapable') => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"record_storage_format"*)',
+        floor === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${floor}' ;;`,
+        `    *"lossless-turn-runtime-batch-v1"*) printf '%s\\n' '${capability}' ;;`,
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'assert_lossless_runtime_batch_floor /release/target',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+      })
+    }
+
+    assert.equal(invoke('false', 'incapable').status, 0, 'default-off rollout must retain old-reader rollback')
+    assert.equal(invoke('true', 'capable').status, 0)
+    assert.notEqual(invoke('true', 'incapable').status, 0)
+    assert.notEqual(invoke('error', 'incapable').status, 0, 'unknown DB state must fail closed')
+
+    const source = await readFile(deploy, 'utf8')
+    const start = source.indexOf('enable_runtime_tape_batching()')
+    const end = source.indexOf('\n# 自动回切', start)
+    const enableBody = source.slice(start, end)
+    const activeProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$active"')
+    const rollbackProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$previous"')
+    const flagWrite = enableBody.indexOf('remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 1')
+    assert.ok(activeProof >= 0 && rollbackProof > activeProof && flagWrite > rollbackProof,
+      'explicit opt-in must prove live and rollback readers before arming the writer')
+  })
+
+  test('runtime-event batch floor treats every unprovable database state as unknown', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-batch-floor-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const envOff = path.join(dir, 'off.env')
+    const envSourceFailure = path.join(dir, 'source-failure.env')
+    const envMissingDatabase = path.join(dir, 'missing-database.env')
+    const envDatabase = path.join(dir, 'database.env')
+    const missingEnv = path.join(dir, 'missing.env')
+    await writeFile(envOff, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
+    await writeFile(envSourceFailure, 'return 1\n')
+    await writeFile(envMissingDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING DATABASE_URL\n')
+    await writeFile(envDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
+    await writeFile(path.join(bin, 'psql'), [
+      '#!/bin/sh',
+      'case "$FAKE_PSQL_MODE" in',
+      '  false) printf "%s\\n" false ;;',
+      '  missing-column) exit 3 ;;',
+      '  failure) exit 9 ;;',
+      '  *) exit 10 ;;',
+      'esac',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+
+    const invokeDeployProbe = (envFile: string, psqlMode: string) => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'KL_HOST=fake',
+        `V5_ENV='${envFile}'`,
+        'unset DATABASE_URL LOSSLESS_TURN_TAPE_RUNTIME_BATCHING',
+        'ssh() { shift; bash -c "$1"; }',
+        'rc=0; probe_lossless_runtime_batch_floor || rc=$?',
+        'printf "RC:%s\\n" "$rc"',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          FAKE_PSQL_MODE: psqlMode,
+        },
+      })
+    }
+
+    const runtimeLib = path.join(root, 'scripts/v5-runtime-release-lib.sh')
+    const invokeHotcfgProbe = (envFile: string, psqlMode: string) => {
+      const harness = [
+        'set -u',
+        `source '${runtimeLib}'`,
+        'unset DATABASE_URL LOSSLESS_TURN_TAPE_RUNTIME_BATCHING',
+        `rc=0; oc_hotcfg_probe_runtime_batch_floor '${envFile}' || rc=$?`,
+        'printf "RC:%s\\n" "$rc"',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          FAKE_PSQL_MODE: psqlMode,
+        },
+      })
+    }
+
+    const scenarios = [
+      ['env file missing', missingEnv, 'false'],
+      ['env source failed', envSourceFailure, 'false'],
+      ['DATABASE_URL missing', envMissingDatabase, 'false'],
+      ['migration/column missing', envDatabase, 'missing-column'],
+      ['psql failed', envDatabase, 'failure'],
+    ] as const
+    for (const [label, envFile, psqlMode] of scenarios) {
+      assert.match(invokeDeployProbe(envFile, psqlMode).stdout, /RC:2/, `deploy probe: ${label}`)
+      assert.match(invokeHotcfgProbe(envFile, psqlMode).stdout, /RC:2/, `hotcfg probe: ${label}`)
+    }
+    assert.match(invokeDeployProbe(envOff, 'false').stdout, /RC:1/,
+      'only a successful false query proves the floor inactive')
+    assert.match(invokeHotcfgProbe(envOff, 'false').stdout, /RC:1/,
+      'only a successful false query proves the hotcfg floor inactive')
+  })
+
   test('explicit rollback uses the live capability, not a racy no-tape DB observation', () => {
     const invoke = (live: 'capable' | 'incapable' | 'probe-error', target: 'capable' | 'incapable') => {
       const harness = [
@@ -1010,6 +1137,7 @@ describe('v5 release safety lanes', () => {
         'KL_HOST=fake',
         'ssh() {',
         '  case "$*" in',
+        '    *"record_storage_format"*) printf "%s\\n" false ;;',
         '    *"/release/live"*)',
         live === 'probe-error' ? '      return 23 ;;' : `      printf '%s\\n' '${live}';;`,
         '    *"/release/target"*) printf "%s\\n" "$TARGET_CAP" ;;',
@@ -1064,6 +1192,7 @@ describe('v5 release safety lanes', () => {
     )
     assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
     assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
+    assert.match(runtimeLib, /oc_hotcfg_assert_master_runtime_batch_pair "\$env_file" "\$master_release" "\$prev_master_release"/)
 
     const compensationGuardStart = source.indexOf('assert_release_activation_compensation_compatible()')
     const compensationGuardBody = source.slice(
@@ -1335,6 +1464,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
+    assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
+    assert.ok(meta.requiredMigrations.includes('0156_lossless_runtime_batches'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
