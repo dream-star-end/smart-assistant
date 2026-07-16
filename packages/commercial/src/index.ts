@@ -4297,6 +4297,7 @@ export async function registerCommercial(
           pool: getPool(),
           onError: (error) => rootLogger.warn("image usage sweep failed", {
             errorClass: error instanceof Error ? error.name : typeof error,
+            message: error instanceof Error ? error.message : String(error),
           }),
         }));
         return { stop: () => h.stop() };
