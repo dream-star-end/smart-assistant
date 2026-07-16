@@ -311,6 +311,8 @@ export function assertSmtpPort(port: number): void {
 export interface DnsResolver {
   resolve4(hostname: string): Promise<string[]>
   resolve6(hostname: string): Promise<string[]>
+  /** Optional per-request resolver cancellation (used by the local Plugin broker). */
+  cancel?(): void
 }
 
 const defaultResolver: DnsResolver = {
@@ -415,13 +417,16 @@ export function makePinnedDispatcher(pin: PinnedAddress): Dispatcher {
 
 /**
  * 自由域 https fetch 收口:解析→全记录校验→钉死建连→禁 redirect→总超时 60s。
- * 只用于 webdav(imap/smtp 走 imapflow/nodemailer 的 host=IP+servername 路径)。
+ * 用于 webdav 与只读 Plugin HTTPS broker
+ * (imap/smtp 走 imapflow/nodemailer 的 host=IP+servername 路径)。
  *
  * fetchImpl 必须是 undici fetch(支持 RequestInit.dispatcher);测试注入 mock。
  */
 export interface PinnedFetchDeps {
   resolver?: DnsResolver
   fetchImpl?: (input: string, init: Record<string, unknown>) => Promise<Response>
+  /** Optional caller lifecycle signal. When present it also cancels a cancelable resolver. */
+  signal?: AbortSignal
 }
 
 export async function pinnedHttpsFetch(
@@ -432,23 +437,37 @@ export async function pinnedHttpsFetch(
   if (url.protocol !== 'https:') {
     throw new ConnectorError('OUTBOUND_BLOCKED', 'pinned fetch requires https')
   }
-  const pin = await resolvePinnedAddress(url.hostname, deps.resolver)
-  const dispatcher = makePinnedDispatcher(pin)
-  const doFetch =
-    deps.fetchImpl ??
-    ((input: string, i: Record<string, unknown>) =>
-      undiciFetch(input, i as never) as unknown as Promise<Response>)
+  const totalSignal = AbortSignal.timeout(TOTAL_TIMEOUT_MS)
+  const signal = deps.signal ? AbortSignal.any([deps.signal, totalSignal]) : totalSignal
+  const cancelResolver = () => {
+    try {
+      deps.resolver?.cancel?.()
+    } catch {
+      // An abort listener must never surface a resolver implementation error.
+    }
+  }
+  signal.addEventListener('abort', cancelResolver)
+  let dispatcher: Dispatcher | null = null
   try {
+    if (signal.aborted) throw signal.reason
+    const pin = await resolvePinnedAddress(url.hostname, deps.resolver)
+    if (signal.aborted) throw signal.reason
+    dispatcher = makePinnedDispatcher(pin)
+    const doFetch =
+      deps.fetchImpl ??
+      ((input: string, i: Record<string, unknown>) =>
+        undiciFetch(input, i as never) as unknown as Promise<Response>)
     return await doFetch(url.toString(), {
       method: init.method,
       headers: init.headers,
       body: init.body,
       redirect: 'error', // 禁 redirect(3xx=失败)
       dispatcher,
-      signal: AbortSignal.timeout(TOTAL_TIMEOUT_MS),
+      signal,
     })
   } finally {
+    signal.removeEventListener('abort', cancelResolver)
     // fire-and-forget close:等 in-flight body 读完由 undici 引用计数处理
-    void (dispatcher as Agent).close().catch(() => {})
+    if (dispatcher) void (dispatcher as Agent).close().catch(() => {})
   }
 }

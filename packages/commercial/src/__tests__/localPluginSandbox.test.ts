@@ -1,11 +1,23 @@
 import assert from 'node:assert/strict'
-import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Duplex } from 'node:stream'
 import { afterEach, describe, test } from 'node:test'
 
 import type Docker from 'dockerode'
+
+import { LOCAL_PLUGIN_BROKER_SOCKET } from '../plugins/localBroker.js'
 
 import {
   BoundedOutput,
@@ -386,6 +398,61 @@ describe('Docker isolation contract', () => {
     ])
       assert.equal(names.includes(forbidden), false, `${forbidden} leaked into Plugin env`)
   })
+
+  test('adds only the verified invocation socket directory for a brokered action', () => {
+    const compiled = compilePlatformLocalPluginPackage(fixturePackage())
+    const invocationId = '12345678-1234-4234-9234-123456789abc'
+    const path = `/var/lib/openclaude-v5/plugin-artifacts/${compiled.digest}`
+    const brokerRoot = '/run/openclaude-v5/plugin-brokers'
+    const hostDirectory = `${brokerRoot}/${invocationId}`
+    const opts = buildLocalPluginContainerOptions({
+      imageId: IMAGE_ID,
+      materializedPath: path,
+      digest: compiled.digest,
+      manifest: compiled.manifest,
+      action: compiled.manifest.actions[0]!,
+      invocationId,
+      broker: {
+        invocationId,
+        brokerRoot,
+        hostDirectory,
+        hostSocketPath: `${hostDirectory}/broker.sock`,
+        containerSocketPath: LOCAL_PLUGIN_BROKER_SOCKET,
+        token: 'a'.repeat(43),
+      },
+    })
+    assert.deepEqual(opts.HostConfig?.Mounts?.slice(1), [
+      {
+        Type: 'bind',
+        Source: hostDirectory,
+        Target: '/run/oc-plugin-broker',
+        ReadOnly: true,
+        BindOptions: { Propagation: 'rprivate' },
+      },
+    ])
+    assert.ok(opts.Env?.includes(`OC_PLUGIN_BROKER_SOCKET=${LOCAL_PLUGIN_BROKER_SOCKET}`))
+    assert.ok(opts.Env?.includes(`OC_PLUGIN_BROKER_TOKEN=${'a'.repeat(43)}`))
+    assert.throws(
+      () =>
+        buildLocalPluginContainerOptions({
+          imageId: IMAGE_ID,
+          materializedPath: path,
+          digest: compiled.digest,
+          manifest: compiled.manifest,
+          action: compiled.manifest.actions[0]!,
+          invocationId,
+          broker: {
+            invocationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            brokerRoot,
+            hostDirectory,
+            hostSocketPath: `${hostDirectory}/broker.sock`,
+            containerSocketPath: LOCAL_PLUGIN_BROKER_SOCKET,
+            token: 'a'.repeat(43),
+          },
+        }),
+      expectCode('INVALID_CONFIG'),
+    )
+  })
 })
 
 describe('bounded execution helpers', () => {
@@ -534,6 +601,59 @@ describe('inert orchestration service boundary', () => {
     assert.equal(fake.created.length, 1)
     assert.equal(fake.streams[0]?.input, '{"text":"hello"}\n')
     assert.equal(fake.removed, 1)
+  })
+
+  test('creates an action-scoped broker mount and removes it after the container', async () => {
+    const root = await tempRoot()
+    const brokerRoot = await tempRoot()
+    const fake = fakeDocker()
+    const service = new LocalPluginSandboxService(fake.docker, {
+      artifactRoot: root,
+      image: {
+        imageId: IMAGE_ID,
+        requiredLabels: { 'oc.runtime.embed_source': '0' },
+      },
+      packages: new Map([['fixture-local-plugin', fixturePackage()]]),
+      expectedArtifactOwnerUid: OWNER_UID,
+      brokerPolicies: new Map([
+        [
+          'fixture-local-plugin',
+          {
+            schemaVersion: 1,
+            actions: {
+              echo: {
+                httpRead: {
+                  origins: ['https://example.com'],
+                  maxRequests: 1,
+                  maxConcurrent: 1,
+                  maxResponseBytes: 1024,
+                  requestTimeoutMs: 1000,
+                },
+              },
+            },
+          },
+        ],
+      ]),
+      brokerRoot,
+      expectedBrokerOwnerUid: OWNER_UID,
+      brokerSocketUid: OWNER_UID,
+      brokerSocketGid: process.getgid?.() ?? 0,
+    })
+    const result = await service.runReadAction({
+      userId: 7,
+      pluginId: 'fixture-local-plugin',
+      actionId: 'echo',
+      params: { text: 'brokered' },
+    })
+    assert.deepEqual(result.result, { echo: 'brokered' })
+    const options = fake.created[0]
+    assert.equal(options?.NetworkDisabled, true)
+    assert.equal(options?.HostConfig?.NetworkMode, 'none')
+    assert.equal(options?.HostConfig?.Mounts?.length, 2)
+    assert.equal(options?.HostConfig?.Mounts?.[1]?.Target, '/run/oc-plugin-broker')
+    assert.equal(options?.HostConfig?.Mounts?.[1]?.ReadOnly, true)
+    assert.ok(options?.Env?.some((item) => item.startsWith('OC_PLUGIN_BROKER_TOKEN=')))
+    assert.deepEqual(await readdir(brokerRoot), [])
   })
 
   test('rejects non-allowlisted packages and bad params before creating a container', async () => {

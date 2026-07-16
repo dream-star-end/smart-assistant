@@ -1,5 +1,5 @@
 /**
- * Local Plugin sandbox substrate (phase 3.1).
+ * Local Plugin sandbox substrate (phase 3.2a).
  *
  * This module deliberately has no HTTP/RPC registration and ships with no
  * production package allowlist. It only provides the hard isolation primitives
@@ -13,8 +13,9 @@
  *  - exact Docker image ID (sha256) pinning;
  *  - one-shot, network-none, read-only-rootfs containers with no user-volume or
  *    credential mounts;
- *  - read-only, network-free JSON actions only. Browser/network/persistence and
- *    write/send effects are rejected until their enforceable brokers exist.
+ *  - read-only JSON actions only. The default remains fully network-free; an
+ *    offline-reviewed action may receive the invocation-scoped read-only HTTPS
+ *    broker socket. Browser/persistence and write/send effects remain rejected.
  */
 
 import { createHash, randomUUID } from 'node:crypto'
@@ -37,6 +38,15 @@ import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node
 import type { Duplex } from 'node:stream'
 
 import type Docker from 'dockerode'
+
+import {
+  LOCAL_PLUGIN_BROKER_SOCKET,
+  type LocalPluginBrokerDeps,
+  type LocalPluginBrokerHandle,
+  type LocalPluginBrokerMount,
+  compileLocalPluginBrokerPolicy,
+  createLocalPluginBroker,
+} from './localBroker.js'
 
 const SLUG_RE = /^[a-z][a-z0-9-]{1,63}$/
 const ACTION_RE = /^[a-z][a-z0-9_-]{0,63}$/
@@ -618,6 +628,7 @@ export function buildLocalPluginContainerOptions(args: {
   action: LocalPluginActionV1
   invocationId: string
   limits?: LocalPluginSandboxLimits
+  broker?: LocalPluginBrokerMount
 }): Docker.ContainerCreateOptions {
   if (!IMAGE_ID_RE.test(args.imageId))
     throw new LocalPluginSandboxError('IMAGE_MISMATCH', 'Plugin image must be an exact sha256 ID')
@@ -631,6 +642,35 @@ export function buildLocalPluginContainerOptions(args: {
     throw new LocalPluginSandboxError('INVALID_PACKAGE', 'invalid invocation id')
   const limits = args.limits ?? DEFAULT_LOCAL_PLUGIN_LIMITS
   assertLocalPluginSandboxLimits(limits)
+  let brokerMount: Docker.MountSettings | null = null
+  const brokerEnv: string[] = []
+  if (args.broker) {
+    const brokerRoot = resolve(args.broker.brokerRoot)
+    const hostDirectory = resolve(args.broker.hostDirectory)
+    if (
+      args.broker.invocationId !== args.invocationId ||
+      !isAbsolute(args.broker.brokerRoot) ||
+      !isAbsolute(args.broker.hostDirectory) ||
+      !isAbsolute(args.broker.hostSocketPath) ||
+      dirname(hostDirectory) !== brokerRoot ||
+      relative(brokerRoot, hostDirectory) !== args.invocationId ||
+      args.broker.hostSocketPath !== join(hostDirectory, 'broker.sock') ||
+      args.broker.containerSocketPath !== LOCAL_PLUGIN_BROKER_SOCKET ||
+      !/^[A-Za-z0-9_-]{43}$/.test(args.broker.token)
+    )
+      throw new LocalPluginSandboxError('INVALID_CONFIG', 'invalid Plugin broker mount')
+    brokerMount = {
+      Type: 'bind',
+      Source: hostDirectory,
+      Target: dirname(LOCAL_PLUGIN_BROKER_SOCKET),
+      ReadOnly: true,
+      BindOptions: { Propagation: 'rprivate' },
+    }
+    brokerEnv.push(
+      `OC_PLUGIN_BROKER_SOCKET=${LOCAL_PLUGIN_BROKER_SOCKET}`,
+      `OC_PLUGIN_BROKER_TOKEN=${args.broker.token}`,
+    )
+  }
   return {
     name: `oc-v5-plugin-${invocation.toLowerCase()}`,
     Image: args.imageId,
@@ -644,6 +684,7 @@ export function buildLocalPluginContainerOptions(args: {
       `OC_PLUGIN_ID=${args.manifest.id}`,
       `OC_PLUGIN_VERSION=${args.manifest.version}`,
       `OC_PLUGIN_ACTION=${args.action.id}`,
+      ...brokerEnv,
     ],
     Entrypoint: [],
     Cmd: [interpreterFor(args.action.entrypoint), `/plugin/${args.action.entrypoint}`],
@@ -683,6 +724,7 @@ export function buildLocalPluginContainerOptions(args: {
           ReadOnly: true,
           BindOptions: { Propagation: 'rprivate' },
         },
+        ...(brokerMount ? [brokerMount] : []),
       ],
       RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
       LogConfig: { Type: 'none', Config: {} },
@@ -845,10 +887,16 @@ export class LocalPluginSandboxService {
       packages: ReadonlyMap<string, PlatformLocalPluginPackage>
       limits?: LocalPluginSandboxLimits
       expectedArtifactOwnerUid?: number
+      brokerPolicies?: ReadonlyMap<string, unknown>
+      brokerRoot?: string
+      brokerDeps?: LocalPluginBrokerDeps
+      expectedBrokerOwnerUid?: number
+      brokerSocketUid?: number
+      brokerSocketGid?: number
     },
   ) {}
 
-  /** No caller is wired in phase 3.1; this method is the future internal boundary. */
+  /** No production caller is wired in phase 3.2a; this remains an internal boundary. */
   async runReadAction(args: {
     userId: number
     pluginId: string
@@ -869,6 +917,10 @@ export class LocalPluginSandboxService {
     this.activeByUser.set(args.userId, current + 1)
     let container: Docker.Container | null = null
     let attachStream: Duplex | null = null
+    let broker: LocalPluginBrokerHandle | null = null
+    let completed: LocalPluginRunResult | null = null
+    let failure: { error: unknown } | null = null
+    let brokerCleanupError: unknown
     try {
       await assertPinnedLocalPluginImage(this.docker, this.opts.image)
       const materialized = await materializePlatformLocalPluginPackage(source, {
@@ -890,6 +942,33 @@ export class LocalPluginSandboxService {
         throw new LocalPluginSandboxError('INVALID_PARAMS', 'params exceed byte limit')
 
       const invocationId = randomUUID()
+      const rawBrokerPolicy = this.opts.brokerPolicies?.get(args.pluginId)
+      if (rawBrokerPolicy !== undefined) {
+        const allowedActionIds = new Set(
+          materialized.compiled.manifest.actions.map((item) => item.id),
+        )
+        const compiledBrokerPolicy = compileLocalPluginBrokerPolicy(
+          rawBrokerPolicy,
+          allowedActionIds,
+        )
+        const actionPolicy = compiledBrokerPolicy.actions[action.id]
+        if (actionPolicy) {
+          if (!this.opts.brokerRoot)
+            throw new LocalPluginSandboxError(
+              'INVALID_CONFIG',
+              'Plugin broker root is required by the action policy',
+            )
+          broker = await createLocalPluginBroker({
+            root: this.opts.brokerRoot,
+            invocationId,
+            policy: actionPolicy,
+            expectedOwnerUid: this.opts.expectedBrokerOwnerUid ?? 0,
+            socketUid: this.opts.brokerSocketUid ?? 1000,
+            socketGid: this.opts.brokerSocketGid ?? 1000,
+            deps: this.opts.brokerDeps,
+          })
+        }
+      }
       container = await this.docker.createContainer(
         buildLocalPluginContainerOptions({
           imageId: this.opts.image.imageId,
@@ -899,6 +978,7 @@ export class LocalPluginSandboxService {
           action,
           invocationId,
           limits,
+          ...(broker ? { broker: broker.mount } : {}),
         }),
       )
       const stream = (await container.attach({
@@ -951,13 +1031,27 @@ export class LocalPluginSandboxService {
         throw new LocalPluginSandboxError('INVALID_RESULT', 'Plugin stdout is not one JSON value')
       }
       validateJsonAgainstSchema(action.result, result, 'INVALID_RESULT')
-      return { result, stderr: stderr.text(), digest: materialized.digest }
+      completed = { result, stderr: stderr.text(), digest: materialized.digest }
+    } catch (error) {
+      failure = { error }
     } finally {
       attachStream?.destroy()
       if (container) await container.remove({ force: true }).catch(() => {})
+      if (broker) {
+        try {
+          await broker.close()
+        } catch (error) {
+          brokerCleanupError = error
+        }
+      }
       const next = (this.activeByUser.get(args.userId) ?? 1) - 1
       if (next <= 0) this.activeByUser.delete(args.userId)
       else this.activeByUser.set(args.userId, next)
     }
+    if (brokerCleanupError) throw brokerCleanupError
+    if (failure) throw failure.error
+    if (!completed)
+      throw new LocalPluginSandboxError('EXECUTION_FAILED', 'Plugin action did not complete')
+    return completed
   }
 }
