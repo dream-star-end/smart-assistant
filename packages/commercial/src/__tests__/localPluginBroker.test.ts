@@ -184,11 +184,11 @@ describe('local Plugin broker policy compiler', () => {
 describe('local Plugin broker wire and outbound policy', () => {
   test('serves one authenticated GET and returns only bounded safe response fields', async () => {
     let seenInput = ''
-    let seenInit: Record<string, unknown> | null = null
+    const seenInits: Record<string, unknown>[] = []
     const handle = await makeBroker({
       fetchImpl: async (input, init) => {
         seenInput = input
-        seenInit = init
+        seenInits.push(init)
         return new Response('public body', {
           status: 200,
           headers: {
@@ -219,11 +219,13 @@ describe('local Plugin broker wire and outbound policy', () => {
       'last-modified': 'Wed, 16 Jul 2026 00:00:00 GMT',
     })
     assert.equal(seenInput, 'https://example.com/public?q=1')
+    const seenInit = seenInits[0]
+    assert.ok(seenInit)
     const headers = seenInit?.headers as Record<string, string>
     assert.equal(headers.accept, 'application/json')
     assert.equal(headers['user-agent'], 'OpenClaude-Plugin-Broker/1')
     assert.equal('authorization' in headers, false)
-    assert.equal(seenInit?.redirect, 'error')
+    assert.equal(seenInit.redirect, 'error')
   })
 
   test('rejects bad token, methods, headers, credentials, fragments and other origins', async () => {
