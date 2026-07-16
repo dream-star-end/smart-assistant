@@ -52,6 +52,8 @@
 #   --model-authority-cutover     # 步骤 5:置位不可逆兼容地板 marker(DB 单行 + env 键)
 #                                 # 置位后:deploy/rollback 拒绝激活缺 capability 的 release/tuple;
 #                                 #        master/egress 在 flag 关闭态拒启;admin catalog 状态机开放。
+#   --enable-runtime-tape-batching # 显式开启 format-3 runtime-event 物理批存储；要求当前及
+#                                  # previous rollback release 都具备 reader capability。
 set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
@@ -224,6 +226,7 @@ for arg in "$@"; do
     --enable-seed-authority-by-rev) MODE="enable-seed-authority-by-rev" ;;
     --record-model-authority-emergency-drill) MODE="record-model-authority-emergency-drill" ;;
     --model-authority-cutover) MODE="model-authority-cutover" ;;
+    --enable-runtime-tape-batching) MODE="enable-runtime-tape-batching" ;;
     # ── P3 双 master cohort lane(全部经 deploy_state CAS + journal;§D5 逐步)──
     --canary) MODE="canary" ;;
     --canary=*) MODE="canary"; CANARY_RELEASE="${arg#*=}" ;;
@@ -1504,6 +1507,8 @@ assert_release_capability_for_sessions_pg() {
 # login. Likewise, an older runtime would resume lossy v1 writes. Therefore the
 # first finalized tape makes reader+writer capability irreversible.
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
+LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
+LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
 
 # Tri-state artifact probe. Return codes are part of the safety contract:
 #   0 = capability is explicitly present
@@ -1543,6 +1548,85 @@ probe_release_lossless_master_capability() {
 
 probe_release_lossless_runtime_capability() {
   probe_release_lossless_capability_field "$1" runtimeCapabilities
+}
+
+# Compressed runtime-event rows are a master-only storage format. Keep their
+# declaration separate from the container v2 wire capability so an older
+# master cannot pass the floor merely because it understands tape uploads.
+probe_release_lossless_runtime_batch_capability() {
+  local reldir="$1" result="" rc=0
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$LOSSLESS_RUNTIME_BATCH_CAP' '(.capabilities // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capability field must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_lossless_runtime_batch_capability() {
+  local reldir="$1" rc=0
+  probe_release_lossless_runtime_batch_capability "$reldir" || rc=$?
+  if [[ $rc -eq 0 ]]; then return 0; fi
+  if [[ $rc -eq 2 ]]; then
+    echo "✗ 目标 master release 的 runtime-batch capability 状态不可核验(探测失败):" >&2
+  else
+    echo "✗ 目标 master release 未声明 reader capability '$LOSSLESS_RUNTIME_BATCH_CAP':" >&2
+  fi
+  echo "    $reldir/deploy/v5/release-metadata.json" >&2
+  return 1
+}
+
+# Tri-state storage floor. The explicit opt-in closes the first-write race;
+# record_storage_format=3 keeps the floor irreversible after the flag is ever
+# removed or an env file is restored. 0=armed, 1=definitively inactive,
+# 2=unknown (production callers fail closed).
+probe_lossless_runtime_batch_floor() {
+  local state="" rc=0
+  if state="$(ssh "$KL_HOST" "test -r '$V5_ENV' || exit 20
+      set -a; . '$V5_ENV' 2>/dev/null || exit 21
+      case \"\${$LOSSLESS_RUNTIME_BATCH_ENV:-}\" in 1|true|TRUE|on|ON) printf true; exit 0 ;; esac
+      test -n \"\${DATABASE_URL:-}\" || exit 22
+      psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (
+        SELECT 1 FROM client_session_turn_tapes
+         WHERE finalized_at IS NOT NULL AND record_storage_format >= 3
+      )::text\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  if [[ $rc -eq 0 && "$state" == true ]]; then return 0; fi
+  if [[ $rc -eq 0 && "$state" == false ]]; then return 1; fi
+  return 2
+}
+
+assert_lossless_runtime_batch_floor() {
+  local reldir="$1" rc=0
+  probe_lossless_runtime_batch_floor || rc=$?
+  if [[ $rc -eq 1 ]]; then
+    echo "  · runtime-event batch 地板尚未启用且无 format-3 tape。"
+    return 0
+  fi
+  if [[ $rc -eq 2 ]]; then
+    echo "  · runtime-event batch 地板状态不可核验 → 对旧 master fail-closed。" >&2
+  else
+    echo "  · runtime-event batch 地板生效(opt-in 已开或已有 format-3 tape)。"
+  fi
+  assert_lossless_runtime_batch_capability "$reldir" || return 1
+  echo "  ✓ runtime-event batch 地板:目标 master 声明 $LOSSLESS_RUNTIME_BATCH_CAP。"
 }
 
 # True when a candidate may have accepted v2 writes. Only a successfully read
@@ -1591,6 +1675,7 @@ assert_lossless_release_capability() {
 # can use the DB floor alone: it cannot finalize v2 concurrently.
 assert_lossless_explicit_rollback_target() {  # $1=live master $2=target master $3=image id $4=runtime release
   local live_master="$1" target_master="$2" image_id="$3" runtime_release="$4" live_rc=0
+  assert_lossless_runtime_batch_floor "$target_master" || return 1
   probe_release_lossless_master_capability "$live_master" || live_rc=$?
   if [[ $live_rc -eq 1 ]]; then
     echo "  · 当前 master 明确不具备 $LOSSLESS_TURN_TAPE_CAP；显式回滚继续由 finalized tape 地板裁决。"
@@ -1609,6 +1694,7 @@ assert_lossless_explicit_rollback_target() {  # $1=live master $2=target master 
 assert_lossless_turn_tape_floor() {
   local reldir="$1" finalized rc
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过 lossless turn-tape 兼容地板"; return 0; }
+  assert_lossless_runtime_batch_floor "$reldir" || exit 1
   if finalized="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
       test -n \"\${DATABASE_URL:-}\"
       psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL)::text\"" 2>/dev/null)"; then
@@ -1658,6 +1744,8 @@ assert_lossless_runtime_tuple_floor() {
 assert_lossless_canary_pair() {
   local active_rel="$1" candidate_rel="$2" rel kind has image_id runtime_release
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 核验 active+candidate master/runtime 与实际 tuple 的 lossless capability"; return 0; }
+  assert_lossless_runtime_batch_floor "$active_rel" || return 1
+  assert_lossless_runtime_batch_floor "$candidate_rel" || return 1
   for rel in "$active_rel" "$candidate_rel"; do
     for kind in capabilities runtimeCapabilities; do
       has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.${kind} // []) | index(\$c) // empty' '$rel/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
@@ -2713,12 +2801,60 @@ SQL
   echo "   · admin catalog 状态机(/api/admin/model-catalog)即为开放状态。"
 }
 
+# Runtime-event physical batching is deliberately dark by default. Enabling is
+# a separate locked rollout only after both the live and immediate rollback
+# masters can hydrate format 3. A failed restart/smoke reverts only the flag and
+# restarts the same capable release; it never falls through to an old reader.
+enable_runtime_tape_batching() {
+  echo "══ 开启 lossless runtime-event batching(format 3)══"
+  assert_no_rollout_in_progress
+  resolve_active_lane
+  local active previous current
+  active="$(bg_current_release "$ACTIVE_SRC")"
+  previous="$ACTIVE_STATE_PREVIOUS_RELEASE"
+  [[ -n "$active" && -n "$previous" ]] || {
+    echo "✗ 缺当前/previous release 权威，无法证明安全回滚。先完成两代含新 reader 的正常部署。" >&2
+    return 1
+  }
+  assert_release_required_migrations "$active" || return 1
+  assert_lossless_runtime_batch_capability "$active" || return 1
+  assert_lossless_runtime_batch_capability "$previous" || {
+    echo "✗ previous release 不支持 format 3；保持 batching 关闭。再完成一轮正常部署后重试。" >&2
+    return 1
+  }
+  current="$(remote_env_get "$LOSSLESS_RUNTIME_BATCH_ENV")"
+  if [[ "$current" =~ ^(1|true|TRUE|on|ON)$ ]]; then
+    assert_lossless_runtime_batch_floor "$active" || return 1
+    smoke "$ACTIVE_PORT"
+    echo "✓ runtime-event batching 已开启且健康。"
+    return 0
+  fi
+  begin_planned_maintenance deploy 0
+  if ! remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 1 \
+      || ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
+      || ! smoke "$ACTIVE_PORT" \
+      || ! assert_lossless_runtime_batch_floor "$active"; then
+    echo "✗ batching 开启未通过健康门；恢复 flag=0 并重启同一 capable release。" >&2
+    remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
+    smoke "$ACTIVE_PORT" || true
+    end_planned_maintenance
+    return 1
+  fi
+  end_planned_maintenance
+  echo "✓ runtime-event batching 已安全开启(active+previous reader 均兼容 format 3)。"
+}
+
 # 自动回切的 lossless 能力门。candidate 一旦可能服务过 v2 写入，必须在任何
 # deploy_state/symlink/unit 补偿之前证明旧 master 和**当前实际** runtime tuple 都兼容。
 # 调用方持有 deploy lock，release metadata 不可变；同一次补偿只检查一次，避免状态已
 # 回退后第二次瞬态探测失败而留下 state=old/runtime=new 的分裂现场。
 assert_release_activation_compensation_compatible() {  # $1=old_release $2=candidate_release
   local old_release="$1" candidate_release="$2" image_id runtime_release
+  if ! assert_lossless_runtime_batch_floor "$old_release"; then
+    mark_deploy_recovery_required "lossless writer 已可能对外服务,runtime-event batch 地板拒绝旧 master:$old_release"
+    return 1
+  fi
   # The candidate may have accepted traffic as soon as restart was attempted.
   # If it is a v2 writer OR its capability probe failed, require the
   # compensation target unconditionally. Unknown must be armed: treating a
@@ -3679,11 +3815,13 @@ wait_for_egress_release_ready() { # <expected-release> <require-authority-cap:0|
 # gateway-startup side effect. The pre-activation gate exercises the exact pinned
 # runtime image and real QR flow without touching the DB; only after the new master
 # passes its normal smoke do we atomically publish/approve and additively migrate
-# legacy Knowledge Planet Skill users.
+# legacy Knowledge Planet Skill users. A new artifact also requires one user-assisted
+# login plus schema-validated execution of every declared action; an already-approved
+# exact artifact keeps the lightweight QR/runtime regression gate on later deploys.
 knowledge_planet_plugin_smoke_gate() { # <pinned master release>
   local release="$1"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] exact-image Knowledge Planet QR smoke @ $release (DB zero-write)"
+    echo "  [dry-run] exact-image Knowledge Planet QR/action smoke @ $release (DB zero-write)"
     return 0
   fi
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
@@ -3700,6 +3838,160 @@ knowledge_planet_plugin_seed() { # <active master release>
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
     cd '$release'
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --seed-only"
+}
+
+# Close only the Knowledge Planet execution/install/setup surface while source
+# and encrypted account pins are on different versions. Unlike the monitor's
+# maintenance marker, listing.state=unlisted is enforced by every runtime trust
+# load and is therefore a real cross-process fail-closed gate.
+knowledge_planet_plugin_close_gate() { # <release containing transition helper>
+  local runner="$1"
+  KNOWLEDGE_PLANET_GATE_VERSION_ID=""
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] close Knowledge Planet listing execution gate @ $runner"
+    return 0
+  fi
+  local output result
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --close-listing-gate")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e '(.changed | type == "boolean") and
+         (.currentVersionId == null or
+          (.currentVersionId | type == "string" and test("^[0-9]+$")))' \
+    >/dev/null <<<"$result" || {
+    echo "✗ Knowledge Planet gate close 返回非法结果" >&2
+    return 1
+  }
+  KNOWLEDGE_PLANET_GATE_VERSION_ID="$(jq -r '.currentVersionId // ""' <<<"$result")"
+}
+
+# Decide whether the previous source has an exact approved platform Plugin
+# version that compensation can actually transition back to. The current DB
+# pointer alone is insufficient after a partial first publication: it may point
+# at the new candidate while the previous source never had a published version.
+knowledge_planet_plugin_classify_previous_release() { # <helper> <previous-release> <expected-current-version-or-empty>
+  local runner="$1" previous="$2" expected_current="$3"
+  KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE=0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] classify exact approved Knowledge Planet version for previous release @ $previous"
+    return 0
+  fi
+  local output result actual_current available
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--classify-current-for-release=$previous'")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e '(.available | type == "boolean") and
+         (.versionId == null or (.versionId | type == "string" and test("^[0-9]+$"))) and
+         (.currentVersionId == null or
+          (.currentVersionId | type == "string" and test("^[0-9]+$")))' \
+    >/dev/null <<<"$result" || {
+    echo "✗ Knowledge Planet previous-release classifier 返回非法结果" >&2
+    return 1
+  }
+  actual_current="$(jq -r '.currentVersionId // ""' <<<"$result")"
+  [[ "$actual_current" == "$expected_current" ]] || {
+    echo "✗ Knowledge Planet current version 在 close/classify 间变化(expected=${expected_current:-<none>} actual=${actual_current:-<none>})" >&2
+    return 1
+  }
+  available="$(jq -r '.available' <<<"$result")"
+  if [[ "$available" == true ]]; then
+    KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE=1
+  fi
+}
+
+knowledge_planet_plugin_transition_to_release() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] transition Knowledge Planet installs/accounts → $target (gate stays closed) @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--transition-to-release=$target'"
+}
+
+knowledge_planet_plugin_open_gate_to_release() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] verify $target exact official contract → open Knowledge Planet listing gate @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--open-listing-gate-to-release=$target'"
+}
+
+# Non-normal activation lanes are not allowed to change the global managed
+# browser account contract: two masters cannot safely execute different driver
+# pins against one shared account table. A mismatch must go through deploy(),
+# which performs QR/action verification and an atomic account/install cutover.
+knowledge_planet_plugin_assert_release_compatible() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert Knowledge Planet target contract == DB current @ $target"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--assert-current-release-compatible=$target'"
+}
+
+# Unified compensation after a new master has been activated while the
+# Knowledge Planet listing gate is closed. It restores an explicitly switched
+# egress first, then restores the master source + encrypted account/install pins
+# + listing gate as one fail-closed sequence. Callers mark recovery-required if
+# this returns non-zero. First publication has no old Plugin pins to restore, so
+# a partially created new listing deliberately remains globally unlisted.
+knowledge_planet_compensate_deploy() { # <helper/new> <previous> <hotcfg:0|1> <egress-switched:0|1> <previous-egress> [had-previous-plugin:0|1]
+  local helper="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
+  local had_previous_plugin="${6:-1}"
+  local failed=0
+  [[ "$had_previous_plugin" =~ ^[01]$ ]] || {
+    echo "✗ Knowledge Planet compensation previous-plugin flag 非法:$had_previous_plugin" >&2
+    return 2
+  }
+  if [[ "$egress_switched" == 1 ]]; then
+    activate_egress_release "$previous_egress" "$helper" || failed=1
+  fi
+  if [[ "$hotcfg" == 1 ]]; then
+    if ! rollback_runtime_tuple 1 1 "$helper" "$had_previous_plugin"; then
+      failed=1
+    elif ! smoke "$ACTIVE_PORT"; then
+      failed=1
+    elif [[ "$had_previous_plugin" == 1 ]] \
+      && ! knowledge_planet_plugin_open_gate_to_release "$helper" "$previous"; then
+      failed=1
+    fi
+  elif [[ "$had_previous_plugin" == 0 ]]; then
+    # Fresh-install compensation has no approved previous Plugin version to
+    # transition to. Close a listing if the failed seed created one, leave it
+    # globally inert, and restore only the source. The legacy Skill is retired
+    # last, so partial per-user migration remains usable through that old entry.
+    if ! knowledge_planet_plugin_close_gate "$helper" \
+      || ! activate_release "$previous" \
+      || ! smoke "$ACTIVE_PORT"; then
+      failed=1
+    fi
+  else
+    if ! knowledge_planet_plugin_close_gate "$helper" \
+      || ! knowledge_planet_plugin_transition_to_release "$helper" "$previous" \
+      || ! activate_release "$previous" \
+      || ! smoke "$ACTIVE_PORT" \
+      || ! knowledge_planet_plugin_open_gate_to_release "$helper" "$previous"; then
+      failed=1
+    fi
+  fi
+  return "$failed"
 }
 
 activate_egress_release() {
@@ -3759,7 +4051,12 @@ deploy() {
   # BLOCKER 4:解析 active slot(A/B;蓝绿 finalize 后可能是 B)→ 后续 build/activate/smoke 全 slot-aware。
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
-  local egress_prev_release=""
+  local egress_prev_release="" kp_previous_release=""
+  local kp_previous_plugin_version_id="" kp_had_previous_plugin=0
+  kp_previous_release="$(bg_current_release "$ACTIVE_SRC")"
+  [[ "$DRY" == 1 || -n "$kp_previous_release" ]] || {
+    echo "✗ 无法钉住 Knowledge Planet Plugin source 回退点" >&2; exit 1;
+  }
   if [[ "$RESTART_EGRESS" == 1 && "$DRY" != 1 ]]; then
     # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
     egress_prev_release="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
@@ -3779,7 +4076,7 @@ deploy() {
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
-  echo "── Knowledge Planet Plugin:exact-image QR 预激活门(DB 零写入)──"
+  echo "── Knowledge Planet Plugin:exact-image QR/action 预激活门(DB 零写入)──"
   knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
     || { echo "✗ Knowledge Planet Plugin QR smoke 失败,未激活新 release" >&2; exit 1; }
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
@@ -3798,22 +4095,82 @@ deploy() {
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
   begin_planned_maintenance deploy "$RESTART_EGRESS"
-  if [[ "$hc_any" == 1 ]]; then
-    activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
-  else
-    activate_release "$BUILT_RELEASE"   # 原子 symlink 翻转 + restart(master 只从完整不可变 release 启动)
+  echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
+  if ! knowledge_planet_plugin_close_gate "$BUILT_RELEASE"; then
+    knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+      || mark_deploy_recovery_required "Knowledge Planet gate close commit unknown and restore failed"
+    end_planned_maintenance || true
+    echo "✗ Knowledge Planet Plugin 执行门关闭失败(live 未改)" >&2
+    exit 1
   fi
+  kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
+  if ! knowledge_planet_plugin_classify_previous_release \
+    "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
+    knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+      || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
+    end_planned_maintenance || true
+    echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
+    exit 1
+  fi
+  kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
+  echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
+  if [[ "$hc_any" == 1 ]]; then
+    if ! activate_runtime_tuple; then
+      if [[ "$kp_had_previous_plugin" == 1 ]]; then
+        knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+          || mark_deploy_recovery_required "tuple 激活回滚后 Knowledge Planet 执行门未恢复"
+      fi
+      end_planned_maintenance || true
+      echo "✗ tuple 激活失败(saga 已自动回滚)" >&2
+      exit 1
+    fi
+  else
+    if ! activate_release "$BUILT_RELEASE"; then
+      if [[ "$kp_had_previous_plugin" == 1 ]]; then
+        knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+          || mark_deploy_recovery_required "release 激活回滚后 Knowledge Planet 执行门未恢复"
+      fi
+      end_planned_maintenance || true
+      exit 1
+    fi
+  fi
+  local egress_switched=0 validation_failure=""
   if [[ "$RESTART_EGRESS" == 1 ]]; then
     echo "── 激活 openclaude-v5-egress 独立 release(显式 --egress;SIGTERM drain 在飞流)──"
-    activate_egress_release "$BUILT_RELEASE" "$egress_prev_release" || exit 1
+    if activate_egress_release "$BUILT_RELEASE" "$egress_prev_release"; then
+      egress_switched=1
+    else
+      validation_failure="egress activation failed"
+    fi
   fi
-  [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
-  if [[ "$WITH_DIST" == 1 ]]; then
-    dist_handshake_smoke "$ACTIVE_PORT"
+  if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
+    validation_failure="full master smoke failed"
   fi
-  echo "── Knowledge Planet Plugin:官方发布 + 旧 Skill 加法迁移──"
-  knowledge_planet_plugin_seed "$BUILT_RELEASE" \
-    || { echo "✗ Knowledge Planet Plugin 发布/迁移失败" >&2; exit 1; }
+  if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
+    && ! dist_handshake_smoke "$ACTIVE_PORT"; then
+    validation_failure="frontend build handshake failed"
+  fi
+  if [[ -n "$validation_failure" ]]; then
+    echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
+    knowledge_planet_compensate_deploy \
+      "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+      "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
+      || { mark_deploy_recovery_required "pre-seed validation failed and Plugin/source compensation failed: $validation_failure"; exit 1; }
+    end_planned_maintenance || true
+    echo "✗ 部署强校验失败；已确认回到旧 source/账号版本，部署未生效" >&2
+    exit 1
+  fi
+  echo "── Knowledge Planet Plugin:官方发布 + 账号/install 原子升级 + 旧 Skill 加法迁移──"
+  if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then
+    echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
+    knowledge_planet_compensate_deploy \
+      "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+      "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
+      || { mark_deploy_recovery_required "Plugin seed failed and source/DB/egress compensation failed"; exit 1; }
+    end_planned_maintenance || true
+    echo "✗ Knowledge Planet Plugin seed 失败；已确认回到旧 source/账号版本，部署未生效" >&2
+    exit 1
+  fi
   end_planned_maintenance
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
@@ -3907,6 +4264,8 @@ activate_staged_inner() {
   assert_v3_inactive_for_gpt_cutover
   assert_runtime_channel_column
   assert_gpt56_migration_ready
+  knowledge_planet_plugin_assert_release_compatible "$REMOTE_SRC" "$REMOTE_SRC" \
+    || { echo "✗ staged source 改变 Knowledge Planet Plugin；请改用 normal deploy" >&2; exit 1; }
   install_cutover_target_image_env
   local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
   local image_commit image_codex_version actual_codex_version
@@ -3989,6 +4348,8 @@ deploy_dist() {
   assert_bluegreen_layout "$ACTIVE_SRC"
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
+  knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
+    || { echo "✗ --dist 目标改变 Knowledge Planet Plugin；请改用 normal deploy" >&2; exit 1; }
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
   # hotcfg 启用时同样走 tuple saga(master 源码翻转=extra_apply,单次重启)。纯前端变更下
   # bundle/release digest 不变 → 幂等复用零 churn;tuple env 不变 → 只是随本次重启一并生效。
@@ -4034,9 +4395,32 @@ rollback() {
       echo "  [dry-run] hotcfg rollback(slot=$ACTIVE_SLOT):N=1 以 state.previous 为 master 权威(P3 master-only 则保留当前 tuple)→slot-aware saga+三态 state commit/reconcile"
       return 0
     fi
+    local kp_rollback_helper kp_rollback_target
+    kp_rollback_helper="$(bg_current_release "$ACTIVE_SRC")"
     begin_planned_maintenance rollback 0
-    rollback_runtime_tuple "$ROLLBACK_N" || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
-    smoke "$ACTIVE_PORT"
+    rollback_runtime_tuple "$ROLLBACK_N" 1 "$kp_rollback_helper" \
+      || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
+    kp_rollback_target="$(bg_current_release "$ACTIVE_SRC")"
+    if [[ -z "$kp_rollback_target" ]] || ! smoke "$ACTIVE_PORT"; then
+      rollback_runtime_tuple 1 1 "$kp_rollback_helper" \
+        && smoke "$ACTIVE_PORT" \
+        && knowledge_planet_plugin_open_gate_to_release \
+          "$kp_rollback_helper" "$kp_rollback_helper" \
+        || { mark_deploy_recovery_required "tuple rollback full smoke failed and reverse compensation failed"; exit 1; }
+      end_planned_maintenance || true
+      echo "✗ tuple rollback target full smoke 失败；已恢复原 source/账号版本" >&2
+      exit 1
+    fi
+    if ! knowledge_planet_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_target"; then
+      rollback_runtime_tuple 1 1 "$kp_rollback_helper" \
+        && smoke "$ACTIVE_PORT" \
+        && knowledge_planet_plugin_open_gate_to_release \
+          "$kp_rollback_helper" "$kp_rollback_helper" \
+        || { mark_deploy_recovery_required "tuple rollback Plugin gate open failed and reverse compensation failed"; exit 1; }
+      end_planned_maintenance || true
+      echo "✗ tuple rollback target Plugin 门开启失败；已恢复原 source/账号版本" >&2
+      exit 1
+    fi
     end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
     return 0
@@ -4085,11 +4469,45 @@ rollback() {
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
   assert_lossless_explicit_rollback_target \
     "$live_master" "$target" "$image_id" "$runtime_release" || exit 1
+  begin_planned_maintenance rollback 0
+  echo "── Knowledge Planet Plugin:回滚前关闭执行门并反向迁移账号/install──"
+  if ! knowledge_planet_plugin_close_gate "$live_master"; then
+    knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
+      || mark_deploy_recovery_required "rollback Plugin gate close commit unknown and restore failed"
+    end_planned_maintenance || true
+    exit 1
+  fi
+  if ! knowledge_planet_plugin_transition_to_release "$live_master" "$target"; then
+    knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
+      || mark_deploy_recovery_required "Knowledge Planet rollback transition failed and gate restore failed"
+    end_planned_maintenance || true
+    exit 1
+  fi
   # activate_release 内 ds_commit_active_release 会把 previous_active_release←旧 active(=回滚前的 release)、
   # active_release←target 原子对调(BLOCKER 4:rollback 成功后 CAS 更新 active_release+previous 对调)。
-  begin_planned_maintenance rollback 0
-  activate_release "$target"
-  smoke "$ACTIVE_PORT"
+  if ! activate_release "$target"; then
+    # activate_release 已把 source 补偿回 live_master；执行门仍关闭，因此可
+    # 在无错版调用窗口下把密文/install pins 原子迁回 live 版本。
+    knowledge_planet_plugin_transition_to_release "$live_master" "$live_master" \
+      && knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
+      || mark_deploy_recovery_required "rollback source compensation succeeded but Knowledge Planet DB compensation failed"
+    end_planned_maintenance || true
+    exit 1
+  fi
+  if ! smoke "$ACTIVE_PORT"; then
+    knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" \
+      || { mark_deploy_recovery_required "rollback target smoke failed and source/Plugin compensation failed"; exit 1; }
+    end_planned_maintenance || true
+    echo "✗ rollback target full smoke 失败；已恢复原 source/账号版本" >&2
+    exit 1
+  fi
+  if ! knowledge_planet_plugin_open_gate_to_release "$live_master" "$target"; then
+    knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" \
+      || { mark_deploy_recovery_required "rollback target gate open failed and source/Plugin compensation failed"; exit 1; }
+    end_planned_maintenance || true
+    echo "✗ rollback target Plugin 门开启失败；已恢复原 source/账号版本" >&2
+    exit 1
+  fi
   end_planned_maintenance
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
 }
@@ -4099,10 +4517,17 @@ rollback() {
 # current tuple 对称反向；joint 恢复上一条同源 master+tuple。P3 finalize 未写 history 时由
 # history.last.master!=active 识别为未记账 master-only。N>1 仅允许纯 joint 起点。
 rollback_runtime_tuple() {
-  local n="$1" nth prev last last_master last_kind last_previous last_schema image image_id release bundle master source_desc transition_kind state_commit=1
+  local n="$1" defer_plugin_open="${2:-0}" helper_override="${3:-}"
+  local plugin_previous_exists="${4:-1}"
+  [[ "$plugin_previous_exists" =~ ^[01]$ ]] || {
+    echo "✗ tuple rollback previous-plugin flag 非法:$plugin_previous_exists" >&2
+    return 2
+  }
+  local nth prev last last_master last_kind last_previous last_schema image image_id release bundle master source_desc transition_kind state_commit=1
   nth=$((n+1))
-  local flip_rev prev_src old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
+  local flip_rev prev_src plugin_helper old_prev="" restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
+  plugin_helper="${helper_override:-$prev_src}"
   [[ -n "$prev_src" ]] || { echo "✗ tuple 回滚前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
   [[ "$prev_src" == "$ACTIVE_STATE_RELEASE" ]] || {
     echo "✗ deploy_state.active_release=$ACTIVE_STATE_RELEASE 与 slot=$ACTIVE_SLOT symlink=$prev_src 不一致，拒绝回滚。" >&2
@@ -4255,13 +4680,36 @@ rollback_runtime_tuple() {
   HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
   [[ "$state_commit" == 1 ]] && build_hotcfg_state_hooks "$master"
   echo "  回滚计划($source_desc): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
+  echo "── Knowledge Planet Plugin:tuple 回滚前关闭执行门并反向迁移账号/install──"
+  knowledge_planet_plugin_close_gate "$plugin_helper" || return 1
+  if [[ "$plugin_previous_exists" == 1 ]]; then
+    if ! knowledge_planet_plugin_transition_to_release "$plugin_helper" "$master"; then
+      knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || mark_deploy_recovery_required "tuple rollback Plugin transition failed and gate restore failed"
+      return 1
+    fi
+  fi
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
   # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
-  hotcfg_rmt oc_hotcfg_activate_saga \
+  if ! hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind" || return 1
+    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind"; then
+    if [[ "$plugin_previous_exists" == 1 ]]; then
+      knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
+        && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || mark_deploy_recovery_required "tuple rollback saga compensated source but Plugin DB compensation failed"
+    else
+      knowledge_planet_plugin_close_gate "$plugin_helper" \
+        || mark_deploy_recovery_required "tuple rollback saga failed and first-publication Plugin gate state is unknown"
+    fi
+    return 1
+  fi
+  if [[ "$defer_plugin_open" != 1 && "$plugin_previous_exists" == 1 ]]; then
+    knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$master" \
+      || { mark_deploy_recovery_required "tuple rollback target active but Plugin gate failed to open"; return 1; }
+  fi
   if [[ "$state_commit" == 1 ]]; then
     ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
     ACTIVE_STATE_RELEASE="$master"
@@ -4746,6 +5194,11 @@ canary() {
     recover_canary_prep "$cand"
     exit 1
   }
+  if ! knowledge_planet_plugin_assert_release_compatible "$reldir" "$reldir"; then
+    echo "✗ candidate 改变全局 Knowledge Planet Plugin contract；双 master 不允许混跑，请改用 normal deploy" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  fi
   ds_cas_or_die "candidate_release='$(ds_lit "$reldir")', transition_step=1" 1 "built candidate_release=$reldir"
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
@@ -4861,7 +5314,15 @@ SQL
 finalize() {
   echo "══ v5 --finalize(cohort 收敛 + master 交接;RFC D5 七步;可 resume)══"
   ds_snapshot
-  local cand old
+  local cand old kp_candidate_release
+  kp_candidate_release="$DS_candidate_release"
+  [[ "$DRY" == 1 || -n "$kp_candidate_release" ]] \
+    || { echo "✗ finalize 缺 candidate_release，无法校验 Knowledge Planet contract" >&2; exit 1; }
+  [[ -z "$kp_candidate_release" || "$kp_candidate_release" == /* ]] \
+    || kp_candidate_release="$RELEASES_ROOT/$kp_candidate_release"
+  knowledge_planet_plugin_assert_release_compatible \
+    "$kp_candidate_release" "$kp_candidate_release" \
+    || { echo "✗ candidate Knowledge Planet contract 与 DB current 不同；拒绝 finalize" >&2; exit 1; }
   if [[ "$DRY" == 1 ]]; then
     ds_assert_phase canary
     cand="${DS_candidate_slot:-B}"; old="$DS_active_slot"
@@ -5220,6 +5681,7 @@ case "$MODE" in
   enable-seed-authority-by-rev) enable_seed_authority_by_rev ;;
   record-model-authority-emergency-drill) record_model_authority_emergency_drill ;;
   model-authority-cutover)   model_authority_cutover ;;
+  enable-runtime-tape-batching) enable_runtime_tape_batching ;;
   emergency-tuple) emergency_tuple ;;
   activate-emergency-tuple) activate_emergency_tuple ;;
   prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;

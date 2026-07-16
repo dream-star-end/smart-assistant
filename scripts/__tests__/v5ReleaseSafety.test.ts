@@ -96,13 +96,32 @@ describe('v5 release safety lanes', () => {
     const built = body.indexOf('build_release ||')
     const qrGate = body.indexOf('knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE"')
     const maintenance = body.indexOf('begin_planned_maintenance deploy')
+    const closeGate = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
+    const previousPluginPin = body.indexOf(
+      'kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"',
+    )
+    const previousPluginClassifier = body.indexOf(
+      'knowledge_planet_plugin_classify_previous_release',
+      previousPluginPin,
+    )
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
-    const maintenanceEnd = body.indexOf('end_planned_maintenance')
+    const maintenanceEnd = body.indexOf('end_planned_maintenance', seed)
     assert.ok(built >= 0 && qrGate > built && maintenance > qrGate)
-    assert.ok(activation > maintenance && fullSmoke > activation)
+    assert.ok(
+      closeGate > maintenance &&
+        previousPluginPin > closeGate &&
+        previousPluginClassifier > previousPluginPin &&
+        activation > previousPluginClassifier &&
+        fullSmoke > activation,
+    )
     assert.ok(seed > fullSmoke && maintenanceEnd > seed)
+    assert.equal(
+      body.match(/"\$egress_prev_release" "\$kp_had_previous_plugin"/g)?.length,
+      2,
+      'pre-seed validation and mid-seed failures must both carry the pinned first-publication flag',
+    )
     assert.match(
       source,
       /seed-knowledge-planet-plugin\.ts --smoke-only[\s\S]*seed-knowledge-planet-plugin\.ts --seed-only/,
@@ -110,6 +129,84 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(seedSource, /smoke skipped/)
     assert.match(seedSource, /await readEvidence\(imageId\)[\s\S]*seedKnowledgePlanetPlugin/)
     assert.match(seedSource, /workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST/)
+    assert.match(seedSource, /runKnowledgePlanetActionSmoke/)
+    assert.match(seedSource, /findApprovedKnowledgePlanetPluginForDeploy/)
+    assert.match(seedSource, /evidence\.verification !== 'authenticated-action-smoke'/)
+    assert.match(seedSource, /passedActionIds/)
+    assert.match(seedSource, /--classify-current-for-release=/)
+    assert.match(
+      source,
+      /deploy_dist\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*activate_runtime_tuple/,
+    )
+    assert.match(
+      source,
+      /canary\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*start_candidate_unit_and_wait/,
+    )
+    assert.match(
+      source,
+      /finalize\(\)[\s\S]*knowledge_planet_plugin_assert_release_compatible[\s\S]*finalize_run_steps/,
+    )
+    assert.match(
+      source,
+      /rollback_runtime_tuple "\$ROLLBACK_N" 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release/,
+    )
+    assert.match(
+      source,
+      /rollback_runtime_tuple 1 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release[\s\S]*"\$kp_rollback_helper" "\$kp_rollback_helper"/,
+    )
+  })
+
+  test('Knowledge Planet first-publication and hotcfg compensation stay fail-closed', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=()',
+      'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
+      'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
+      'knowledge_planet_plugin_open_gate_to_release() { calls+=("open:$1:$2"); }',
+      'activate_release() { calls+=("activate:$1"); }',
+      'activate_egress_release() { calls+=("UNEXPECTED-egress:$*"); return 92; }',
+      'rollback_runtime_tuple() { calls+=("rollback:$1:$2:$3:$4"); }',
+      'smoke() { calls+=("smoke:$1"); }',
+      'ACTIVE_PORT=18790',
+      '# A prior partial first publication left current=candidate, but old source still has no approved exact version.',
+      'ssh() { printf \'%s\\n\' \'{"available":false,"versionId":null,"currentVersionId":"77"}\'; }',
+      'knowledge_planet_plugin_classify_previous_release new-release old-release 77',
+      'test "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE" = 0',
+      '# Models the first mid-seed failure followed by a second pre-seed smoke failure.',
+      'knowledge_planet_compensate_deploy new-release old-release 0 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'knowledge_planet_compensate_deploy new-release old-release 0 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'printf "classic:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'ssh() { printf \'%s\\n\' \'{"available":true,"versionId":"55","currentVersionId":"77"}\'; }',
+      'knowledge_planet_plugin_classify_previous_release new-release old-release 77',
+      'test "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE" = 1',
+      'knowledge_planet_compensate_deploy new-release old-release 1 0 "" "$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"',
+      'printf "hotcfg-existing:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'knowledge_planet_compensate_deploy new-release old-release 1 0 "" 0',
+      'printf "hotcfg-first:%s\\n" "${calls[*]}"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(
+      result.stdout,
+      /classic:close:new-release activate:old-release smoke:18790 close:new-release activate:old-release smoke:18790/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg-existing:rollback:1:1:new-release:1 smoke:18790 open:new-release:old-release/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg-first:rollback:1:1:new-release:0 smoke:18790(?:\n|$)/,
+    )
+    assert.doesNotMatch(result.stdout, /UNEXPECTED/)
   })
 
   test('trusted baseline guard mirrors the runtime manifest and hardens 775/664 releases', async () => {
@@ -815,6 +912,7 @@ describe('v5 release safety lanes', () => {
         'DRY=0',
         'ssh() {',
         '  case "$*" in',
+        '    *"record_storage_format"*) printf "%s\\n" false ;;',
         '    *"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes"*)',
         dbResult === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${dbResult}' ;;`,
         '    *".runtimeCapabilities"*) [[ "$FLOOR_RUNTIME" == 1 ]] && printf "capable\\n" || printf "incapable\\n" ;;',
@@ -868,6 +966,7 @@ describe('v5 release safety lanes', () => {
       'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$1"; }',
       'ssh() {',
       '  case "$*" in',
+      '    *"record_storage_format"*) printf "%s\\n" false; return 0 ;;',
       '    *candidate*) return 23 ;;',
       '    *old*) printf "%s\\n" incapable; return 0 ;;',
       '    *) printf "MUTATION:%s\\n" "$*" >>"$MUTATION_LOG"; return 0 ;;',
@@ -926,6 +1025,7 @@ describe('v5 release safety lanes', () => {
       '}',
       'ssh() {',
       '  case "$*" in',
+      '    *"record_storage_format"*) printf "%s\\n" false; return 0 ;;',
       '    *"test -f"*"/release/candidate/.complete"*) return 0 ;;',
       '    *"ln -s"*"/release/candidate"*)',
       '      printf "%s\\n" candidate >"$ACTIVE_TARGET"',
@@ -1000,6 +1100,130 @@ describe('v5 release safety lanes', () => {
     assert.match(invoke().stdout, /RC:2/)
   })
 
+  test('runtime-event batch format has a distinct master capability and durable rollback floor', async () => {
+    const invoke = (floor: 'true' | 'false' | 'error', capability: 'capable' | 'incapable') => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0',
+        'ssh() {',
+        '  case "$*" in',
+        '    *"record_storage_format"*)',
+        floor === 'error' ? '      return 23 ;;' : `      printf '%s\\n' '${floor}' ;;`,
+        `    *"lossless-turn-runtime-batch-v1"*) printf '%s\\n' '${capability}' ;;`,
+        '    *) return 97 ;;',
+        '  esac',
+        '}',
+        'assert_lossless_runtime_batch_floor /release/target',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+      })
+    }
+
+    assert.equal(invoke('false', 'incapable').status, 0, 'default-off rollout must retain old-reader rollback')
+    assert.equal(invoke('true', 'capable').status, 0)
+    assert.notEqual(invoke('true', 'incapable').status, 0)
+    assert.notEqual(invoke('error', 'incapable').status, 0, 'unknown DB state must fail closed')
+
+    const source = await readFile(deploy, 'utf8')
+    const start = source.indexOf('enable_runtime_tape_batching()')
+    const end = source.indexOf('\n# 自动回切', start)
+    const enableBody = source.slice(start, end)
+    const activeProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$active"')
+    const rollbackProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$previous"')
+    const flagWrite = enableBody.indexOf('remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 1')
+    assert.ok(activeProof >= 0 && rollbackProof > activeProof && flagWrite > rollbackProof,
+      'explicit opt-in must prove live and rollback readers before arming the writer')
+  })
+
+  test('runtime-event batch floor treats every unprovable database state as unknown', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-batch-floor-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const envOff = path.join(dir, 'off.env')
+    const envSourceFailure = path.join(dir, 'source-failure.env')
+    const envMissingDatabase = path.join(dir, 'missing-database.env')
+    const envDatabase = path.join(dir, 'database.env')
+    const missingEnv = path.join(dir, 'missing.env')
+    await writeFile(envOff, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
+    await writeFile(envSourceFailure, 'return 1\n')
+    await writeFile(envMissingDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING DATABASE_URL\n')
+    await writeFile(envDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
+    await writeFile(path.join(bin, 'psql'), [
+      '#!/bin/sh',
+      'case "$FAKE_PSQL_MODE" in',
+      '  false) printf "%s\\n" false ;;',
+      '  missing-column) exit 3 ;;',
+      '  failure) exit 9 ;;',
+      '  *) exit 10 ;;',
+      'esac',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+
+    const invokeDeployProbe = (envFile: string, psqlMode: string) => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'KL_HOST=fake',
+        `V5_ENV='${envFile}'`,
+        'unset DATABASE_URL LOSSLESS_TURN_TAPE_RUNTIME_BATCHING',
+        'ssh() { shift; bash -c "$1"; }',
+        'rc=0; probe_lossless_runtime_batch_floor || rc=$?',
+        'printf "RC:%s\\n" "$rc"',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          FAKE_PSQL_MODE: psqlMode,
+        },
+      })
+    }
+
+    const runtimeLib = path.join(root, 'scripts/v5-runtime-release-lib.sh')
+    const invokeHotcfgProbe = (envFile: string, psqlMode: string) => {
+      const harness = [
+        'set -u',
+        `source '${runtimeLib}'`,
+        'unset DATABASE_URL LOSSLESS_TURN_TAPE_RUNTIME_BATCHING',
+        `rc=0; oc_hotcfg_probe_runtime_batch_floor '${envFile}' || rc=$?`,
+        'printf "RC:%s\\n" "$rc"',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          FAKE_PSQL_MODE: psqlMode,
+        },
+      })
+    }
+
+    const scenarios = [
+      ['env file missing', missingEnv, 'false'],
+      ['env source failed', envSourceFailure, 'false'],
+      ['DATABASE_URL missing', envMissingDatabase, 'false'],
+      ['migration/column missing', envDatabase, 'missing-column'],
+      ['psql failed', envDatabase, 'failure'],
+    ] as const
+    for (const [label, envFile, psqlMode] of scenarios) {
+      assert.match(invokeDeployProbe(envFile, psqlMode).stdout, /RC:2/, `deploy probe: ${label}`)
+      assert.match(invokeHotcfgProbe(envFile, psqlMode).stdout, /RC:2/, `hotcfg probe: ${label}`)
+    }
+    assert.match(invokeDeployProbe(envOff, 'false').stdout, /RC:1/,
+      'only a successful false query proves the floor inactive')
+    assert.match(invokeHotcfgProbe(envOff, 'false').stdout, /RC:1/,
+      'only a successful false query proves the hotcfg floor inactive')
+  })
+
   test('explicit rollback uses the live capability, not a racy no-tape DB observation', () => {
     const invoke = (live: 'capable' | 'incapable' | 'probe-error', target: 'capable' | 'incapable') => {
       const harness = [
@@ -1010,6 +1234,7 @@ describe('v5 release safety lanes', () => {
         'KL_HOST=fake',
         'ssh() {',
         '  case "$*" in',
+        '    *"record_storage_format"*) printf "%s\\n" false ;;',
         '    *"/release/live"*)',
         live === 'probe-error' ? '      return 23 ;;' : `      printf '%s\\n' '${live}';;`,
         '    *"/release/target"*) printf "%s\\n" "$TARGET_CAP" ;;',
@@ -1064,6 +1289,7 @@ describe('v5 release safety lanes', () => {
     )
     assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
     assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
+    assert.match(runtimeLib, /oc_hotcfg_assert_master_runtime_batch_pair "\$env_file" "\$master_release" "\$prev_master_release"/)
 
     const compensationGuardStart = source.indexOf('assert_release_activation_compensation_compatible()')
     const compensationGuardBody = source.slice(
@@ -1335,6 +1561,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('model_authority_v1'))
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
+    assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
+    assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)

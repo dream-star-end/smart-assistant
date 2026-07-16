@@ -230,6 +230,10 @@ import {
   startSkillUsageReporter,
   type SkillFeedbackRef,
 } from './skillUsageReporter.js'
+import {
+  startSkillShadowReporter,
+  type SkillShadowReporter,
+} from './skillShadowReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import {
   AuthorityRejected,
@@ -1371,6 +1375,7 @@ export class Gateway {
   /** Commercial tool telemetry stays subscribed through session drain, then
    *  fsyncs its final aggregate batch before the process may exit. */
   private _toolFailureReporter: ToolFailureReporter | null = null
+  private _skillShadowReporter: SkillShadowReporter | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
   /** Host-controlled stale-image barrier: covers dispatch preprocessing. */
@@ -2115,6 +2120,13 @@ export class Gateway {
       resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
     })
 
+    // Retrieval quality shadow: strict opt-in via OC_SKILL_SHADOW_SAMPLE_RATE.
+    // The observer never mutates prompt/tool state and never blocks dispatchInbound;
+    // it only reads the same agent-visible metadata used by the SKILLS slot.
+    this._skillShadowReporter = startSkillShadowReporter({
+      resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
+    })
+
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
 
@@ -2424,6 +2436,8 @@ export class Gateway {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
+    this._skillShadowReporter?.stop()
+    this._skillShadowReporter = null
     if (this._wsKeepaliveTimer !== null) {
       clearInterval(this._wsKeepaliveTimer)
       this._wsKeepaliveTimer = null
@@ -10787,6 +10801,10 @@ export class Gateway {
           type: 'outbound.ack',
           idempotencyKey: frame.idempotencyKey,
           deduplicated: true,
+          peer: frame.peer,
+          ...(isClientMessageId((frame as any).clientMessageId)
+            ? { clientMessageId: (frame as any).clientMessageId }
+            : {}),
         })
         for (const ws of clients) {
           try { ws.send(ack) } catch {}
@@ -11204,6 +11222,7 @@ export class Gateway {
       sessionKey,
       channel: frame.channel,
       peer: frame.peer,
+      ...(safeClientMessageId ? { clientMessageId: safeClientMessageId } : {}),
       blocks: [],
       isFinal: false,
       // V3 S12e CG7 — turn-level trace id. Stamped on the main `out` so every
@@ -11685,21 +11704,17 @@ export class Gateway {
                 ?? 'Image 2 服务暂时不可用，请稍后重试。'
           const errorFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
-            sessionKey,
-            channel: frame.channel,
-            peer: frame.peer,
+            ..._inheritOutboundRouting(out),
             code: insufficient ? 'insufficient_credits' : rateLimited ? 'rate_limited' : 'upstream_failed',
             message,
             detail: err instanceof Error ? err.message : String(err),
             isFinal: false,
-            traceId: turnTraceId,
-            _userId: activeUserId,
           }
           this.deliver(errorFrame, adapter)
           this.deliver({
-            type: 'outbound.message', sessionKey, channel: frame.channel, peer: frame.peer,
+            ...out,
             blocks: [{ kind: 'text', text: `[error] ${message}` }],
-            isFinal: true, traceId: turnTraceId, _userId: activeUserId,
+            isFinal: true,
           } as OutboundMessage, adapter)
         } else {
           rejectEdit(err instanceof Error ? err.message : '图片校验失败')
@@ -11928,6 +11943,15 @@ export class Gateway {
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
     session._currentTurnUserText = (text ?? '').slice(0, 8000)
+    // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
+    // canonical trace id and raw text only long enough to hash/rank them; no result
+    // is fed back into prompt assembly or execution.
+    this._skillShadowReporter?.observeTurn({
+      traceId: turnTraceId,
+      sessionKey,
+      agentId: effectiveAgent.id,
+      userMessage: text ?? '',
+    })
     const currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     let turnErrored = false
     let leaderFinalCount = 0
@@ -11990,22 +12014,23 @@ export class Gateway {
           // unknown 4xx variants that intentionally keep the legacy UX.
           autoDreamHasCanonicalApiError = true
           const _cls = classifyRunError(_b0.text)
-          if (_cls.code !== 'unknown') {
-            _apiErrorIntercepted = true
-            _apiErrorText = _b0.text
-            // CG7 — derived frame copies routing + traceId from main `out` via
-            // `_inheritOutboundRouting`, type-specific fields stay explicit.
-            const errFrame: OutboundError & { _userId?: string } = {
-              type: 'outbound.error',
-              ..._inheritOutboundRouting(out),
-              code: _cls.code,
-              message: _cls.message,
-              detail: _b0.text,
-              isFinal: false,
-            }
-            this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
-            return
+          _apiErrorIntercepted = true
+          _apiErrorText = _b0.text
+          // Every canonical API error gets the structured UX. Unknown
+          // provider text is deliberately mapped to the generic retryable
+          // category; the exact string remains available only in `detail`.
+          const errFrame: OutboundError & { _userId?: string } = {
+            type: 'outbound.error',
+            ..._inheritOutboundRouting(out),
+            code: _cls.code === 'unknown' ? 'upstream_failed' : _cls.code,
+            message: _cls.code === 'unknown'
+              ? '任务执行暂时中断，请直接重试本条消息'
+              : _cls.message,
+            detail: _b0.text,
+            isFinal: false,
           }
+          this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
+          return
         }
 
         if (b.kind === 'text' && typeof b.text === 'string') {
@@ -12255,20 +12280,20 @@ export class Gateway {
         // 老的 [error] text bubble (turn 终止器,frameSeq 单调,新客户端按 seq
         // 抑制重复气泡,旧客户端无视 outbound.error,只看到 [error] 文本降级 UX)。
         const cls = classifyRunError(e.error)
-        if (cls.code !== 'unknown') {
-          // CG7 — derived frame copies routing + traceId from main `out` via
-          // `_inheritOutboundRouting`(replaces the prior hand-spread of
-          // sessionKey/channel/peer + conditional _userId).
-          const errFrame: OutboundError & { _userId?: string } = {
-            type: 'outbound.error',
-            ..._inheritOutboundRouting(out),
-            code: cls.code,
-            message: cls.message,
-            detail: e.error,
-            isFinal: false,
-          }
-          this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
+        // Always emit the structured error card.  Older clients still get
+        // the compatibility `[error]` final below; modern clients suppress
+        // that raw bubble and keep the technical string folded in `detail`.
+        const errFrame: OutboundError & { _userId?: string } = {
+          type: 'outbound.error',
+          ..._inheritOutboundRouting(out),
+          code: cls.code === 'unknown' ? 'upstream_failed' : cls.code,
+          message: cls.code === 'unknown'
+            ? '任务执行暂时中断，请直接重试本条消息'
+            : cls.message,
+          detail: e.error,
+          isFinal: false,
         }
+        this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
         if (liveWechatAdapter) {
           const errBlocks = [{ kind: 'text', text: `[error] ${e.error}` } as any]
           this.deliver(
@@ -12761,6 +12786,7 @@ export function _buildTurnTraceContext(
  *
  *   - `sessionKey` / `channel` / `peer` — public schema fields used by
  *     `deliver()` to compute peerKey + ring slot.
+ *   - `clientMessageId`                — exact browser turn identity.
  *   - `traceId`                        — CG7 public schema field.
  *   - `_userId`                        — private routing stamp consumed by
  *     `_stripPrivateRoutingFields` inside `deliver()`.
@@ -12775,6 +12801,7 @@ export function _inheritOutboundRouting(
   sessionKey: string
   channel: string
   peer: Peer
+  clientMessageId?: string
   _userId?: string
   traceId?: string
 } {
@@ -12782,6 +12809,7 @@ export function _inheritOutboundRouting(
     sessionKey: out.sessionKey,
     channel: out.channel,
     peer: out.peer,
+    ...(out.clientMessageId ? { clientMessageId: out.clientMessageId } : {}),
     ...(out._userId ? { _userId: out._userId } : {}),
     ...(out.traceId ? { traceId: out.traceId } : {}),
   }

@@ -49,6 +49,8 @@ import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
   contextRebuiltNotice,
+  PREAMBLE_CONTINUE_DISPLAY,
+  PREAMBLE_CONTINUE_PROMPT,
   RESTART_CONTINUE_DISPLAY,
   RESTART_CONTINUE_PROMPT,
   backoffDelay,
@@ -69,6 +71,7 @@ import {
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
+  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
@@ -76,6 +79,7 @@ import {
   WS_CLOSE_CODE_STALLED,
 } from "./pure";
 import type {
+  AckWire,
   ColdStartWire,
   ContextRebuiltWire,
   CostChargedWire,
@@ -155,6 +159,21 @@ type OfflineItem = {
   msgId: string;
   _retryCount?: number;
 };
+
+/** Stable key for one logical browser send attempt.  The normal minted
+ * client id keeps the readable form; the deterministic 64-bit fallback only
+ * exists for protocol-valid custom ids near the 128-byte wire limit. */
+export function messageAttemptIdempotencyKey(clientMessageId: string, attempt: number): string {
+  const safeAttempt = Number.isSafeInteger(attempt) && attempt >= 0 ? attempt : 0;
+  const readable = `web:${clientMessageId}:${safeAttempt}`;
+  if (readable.length <= 128) return readable;
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < clientMessageId.length; i++) {
+    hash ^= BigInt(clientMessageId.charCodeAt(i));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `webh:${hash.toString(36)}:${safeAttempt}`;
+}
 
 export type ChatSnapshot = {
   version: number;
@@ -808,6 +827,9 @@ export class ChatSocket {
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
       },
+      schedulePreambleContinue: (sessId, targetMsgId) => {
+        setTimeout(() => this.autoContinueActionPreamble(sessId, targetMsgId), 0);
+      },
       scheduleRestartContinue: (sessId) => {
         setTimeout(() => this.autoContinueAfterRestart(sessId), 0);
       },
@@ -1123,8 +1145,10 @@ export class ChatSocket {
         const frame = f as OutboundErrorWire;
         const sess = this.sessions.get(frame.peer?.id);
         if (sess) {
+          const ownsActiveTurn = !frame.clientMessageId ||
+            sess._activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
-          this.clearThinkingSafety(sess.id);
+          if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
         }
         return;
       }
@@ -1132,8 +1156,10 @@ export class ChatSocket {
         const frame = f as LegacyBridgeErrorWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : this.firstSession();
         if (sess) {
+          const ownsActiveTurn = !frame.clientMessageId ||
+            sess._activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
-          this.clearThinkingSafety(sess.id);
+          if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
           this.deps.persistSession?.(sess.id);
         }
         return;
@@ -1250,13 +1276,12 @@ export class ChatSocket {
         return;
       }
       case "outbound.ack": {
-        const frame = f as { deduplicated?: boolean; idempotencyKey?: string };
+        const frame = f as AckWire;
         if (frame.deduplicated) {
-          if (this.offlineDrainingCurrent) {
-            this.offlineDrainingCurrent = null;
-            this.nudgeDrain();
-          }
-          if (typeof frame.idempotencyKey === "string" && frame.idempotencyKey.startsWith("autocont-")) {
+          const reconciled = this.reconcileDeduplicatedTurn(frame);
+          if (!reconciled && typeof frame.idempotencyKey === "string" && frame.idempotencyKey.startsWith("autocont-")) {
+            // Rolling compatibility with an old gateway ACK that did not yet
+            // carry peer/clientMessageId.
             this.clearAutoContinueInFlight(frame.idempotencyKey);
           }
         }
@@ -1279,6 +1304,40 @@ export class ChatSocket {
         // pong 已先处理；其余 v5 webchat 不消费。
         return;
     }
+  }
+
+  /** Reconcile a server-confirmed duplicate without touching another queued
+   * or newer turn on the same peer. Returns false for legacy/unscoped ACKs. */
+  private reconcileDeduplicatedTurn(frame: AckWire): boolean {
+    const sessId = frame.peer?.id;
+    const clientMessageId = frame.clientMessageId;
+    if (!sessId || !clientMessageId) return false;
+    const sess = this.sessions.get(sessId);
+    if (!sess || sess._activeClientMessageId !== clientMessageId) return false;
+
+    const direct = this.inFlightSends.get(sessId);
+    if (direct?.msgId === clientMessageId) this.inFlightSends.delete(sessId);
+
+    let advancedDrain = false;
+    if (
+      this.offlineDrainingCurrent?.sessId === sessId &&
+      this.offlineDrainingCurrent.msgId === clientMessageId
+    ) {
+      if (this.drainTimeoutTimer) {
+        clearTimeout(this.drainTimeoutTimer);
+        this.drainTimeoutTimer = null;
+      }
+      this.offlineDrainingCurrent = null;
+      advancedDrain = true;
+    }
+
+    this.clearSendingState(sess, { clearThinking: true });
+    const user = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId);
+    if (user) user.status = "sent";
+    void this.deps.syncSession?.(sessId, { clientMessageId });
+    if (advancedDrain) this.nudgeDrain();
+    this.scheduleNotify();
+    return true;
   }
 
   /** outbound.message 的 peer 解析：未知 peer 直接忽略（v5 每会话即 peer）。*/
@@ -1969,7 +2028,9 @@ export class ChatSocket {
     });
     const payload: InboundMessage = {
       type: "inbound.message",
-      idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      // Filled from the minted client message id below.  A fixed placeholder
+      // keeps construction type-safe; it is never dispatched as-is.
+      idempotencyKey: "web:pending:0",
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId: p.agentId,
@@ -1988,8 +2049,10 @@ export class ChatSocket {
       _imageEdit: p.imageEdit,
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
+      _sendAttempt: 0,
     });
     payload.clientMessageId = userMsg.id;
+    payload.idempotencyKey = messageAttemptIdempotencyKey(userMsg.id, 0);
     // 生成占位卡（需求 C）：imageEdit 提交紧随乐观 user 行注入一条**本地专属**占位行
     // （role 'system' 客户端域，空文本），jobId = clientJobId。生成期间 MessageList 拦截
     // 渲染 GeneratingPlaceholderCard；本会话 turn final 由 reducer 按 jobId 消解（结果图作为
@@ -2182,7 +2245,7 @@ export class ChatSocket {
     }
     const payload: InboundMessage = {
       type: "inbound.message",
-      idempotencyKey: `web-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      idempotencyKey: "web:pending:retry",
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId,
@@ -2195,6 +2258,12 @@ export class ChatSocket {
       ts: Date.now(),
     };
     payload.clientMessageId = userMsg.id;
+    const previousAttempt = Number.isSafeInteger(userMsg._sendAttempt) && (userMsg._sendAttempt ?? 0) >= 0
+      ? userMsg._sendAttempt!
+      : 0;
+    const nextAttempt = previousAttempt + 1;
+    userMsg._sendAttempt = nextAttempt;
+    payload.idempotencyKey = messageAttemptIdempotencyKey(userMsg.id, nextAttempt);
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
     // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
     this.ensureGenPlaceholder(sess, userMsg._imageEdit, true, userMsg.id);
@@ -2309,6 +2378,44 @@ export class ChatSocket {
     sess._activeClientMessageId = userMsg.id;
     sess._localTeardownAt = undefined;
     this.scheduleNotify();
+  }
+
+  // ═══════════════ 行动开场后误结束 → 极保守单次继续执行 ════════════════
+  private autoContinueActionPreamble(sessId: string, targetMsgId: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess || sess._sendingInFlight) return;
+    if (!shouldAutoContinueActionPreamble({
+      messages: sess.messages,
+      targetMsgId,
+      stopReason: "end_turn",
+    })) return;
+    const idem = `autocont-preamble-${sessId}-${targetMsgId}`;
+
+    const routing = sess._lastRouting;
+    const payload: InboundMessage = {
+      type: "inbound.message",
+      idempotencyKey: idem,
+      channel: "webchat",
+      peer: { id: sess.id, kind: "dm" },
+      agentId: sess.agentId || this.deps.defaultAgentId || "main",
+      content: { text: PREAMBLE_CONTINUE_PROMPT },
+      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
+        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
+        : {}),
+      ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.teamMode ? { teamMode: true } : {}),
+      ts: Date.now(),
+    };
+    const userMsg = addMessage(sess, "user", PREAMBLE_CONTINUE_DISPLAY, {
+      status: "sending",
+      _isAutoRetry: true,
+      _modelText: PREAMBLE_CONTINUE_PROMPT,
+      _idem: idem,
+      ...(routing ? { _routing: { ...routing } } : {}),
+      _sendAttempt: 0,
+    });
+    payload.clientMessageId = userMsg.id;
+    this.dispatchPayload(sess, userMsg, payload);
   }
 
   // ═══════════════ 单次 auto-continue（确定性 idempotencyKey，§7）═══════════════

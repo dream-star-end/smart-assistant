@@ -17,7 +17,7 @@ import { FeedbackTab } from "./settings/FeedbackTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
-import { Avatar, Spinner, Tabs } from "./ui";
+import { Avatar, Button, Spinner, Tabs } from "./ui";
 
 export type SettingsSection = "account" | "usage" | "preferences" | "feedback" | "about";
 
@@ -77,6 +77,7 @@ export function SettingsCenter({
   const [autoDream, setAutoDream] = useState<AutoDreamFeatureView | null>(null);
   const [prefsLoading, setPrefsLoading] = useState(false);
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
+  const [prefsReloadTick, setPrefsReloadTick] = useState(0);
 
   // 关闭面板：复位分区与瞬态（避免重开残留）。
   useEffect(() => {
@@ -92,6 +93,7 @@ export function SettingsCenter({
   // 注意：依赖数组**绝不能含 prefsLoading**——effect 自身 setPrefsLoading(true) 会改它，
   // 触发 cleanup(alive=false) 再重跑，使 fetch 回来时 alive 已 false、setPrefs/finally 被跳过
   // → 永久"加载偏好…"转圈（后端其实 200）。prefs!=null 守卫挡住成功后的回跑。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器，不在请求体内消费。
   useEffect(() => {
     if (!open || demo || !auth || section !== "preferences" || prefs != null) {
       return;
@@ -117,7 +119,7 @@ export function SettingsCenter({
     return () => {
       alive = false;
     };
-  }, [open, demo, auth, section, prefs, onPreferencesChange]);
+  }, [open, demo, auth, section, prefs, onPreferencesChange, prefsReloadTick]);
 
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {
@@ -150,7 +152,7 @@ export function SettingsCenter({
               <button
                 type="button"
                 aria-label="关闭"
-                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
               >
                 <X size={17} />
               </button>
@@ -197,7 +199,16 @@ export function SettingsCenter({
                     {prefsLoading || !prefs ? (
                       <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
                         {prefsErr ? (
-                          <span className="text-danger">{prefsErr}</span>
+                          <div className="flex flex-col items-center gap-3 text-center">
+                            <span className="text-danger">{prefsErr}</span>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => setPrefsReloadTick((tick) => tick + 1)}
+                            >
+                              重试
+                            </Button>
+                          </div>
                         ) : (
                           <>
                             <Spinner /> 加载偏好…

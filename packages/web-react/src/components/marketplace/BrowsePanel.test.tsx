@@ -12,6 +12,7 @@ vi.mock("../../lib/api", () => ({
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
     listMarketplaceInstalled: (...a: unknown[]) => listMarketplaceInstalled(...a),
   },
+  apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }));
 vi.mock("./DetailModal", () => ({
   DetailModal: ({ slug, onClose }: { slug: string | null; onClose: () => void }) =>
@@ -70,6 +71,8 @@ test("分类筛选片只渲染有条目的分类(+全部/未分类)", async () =
   expect(screen.getByRole("button", { name: "办公文档" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "数据分析" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "未分类" })).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "市场分类，可横向滚动" })).toHaveAttribute("tabindex", "0");
+  expect(screen.getByText("左右滑动查看更多分类")).toHaveClass("sm:hidden");
   // 没有条目的分类不出 chip
   expect(screen.queryByRole("button", { name: "编程开发" })).not.toBeInTheDocument();
 });
@@ -100,6 +103,19 @@ test("空目录时给空态,不渲染分区/筛选片", async () => {
   render(<BrowsePanel auth={auth} />);
   expect(await screen.findByText("市场还没有上架的技能")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "全部" })).not.toBeInTheDocument();
+});
+
+test("市场首次加载失败可原地重试并恢复目录", async () => {
+  searchMarketplace
+    .mockRejectedValueOnce(new Error("backend unavailable"))
+    .mockResolvedValueOnce({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  expect(await screen.findByText("加载市场失败")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
+  expect(searchMarketplace).toHaveBeenCalledTimes(2);
 });
 
 test("卡片:users30d>0 → 以「30天 N 人在用」替代安装数徽章位", async () => {

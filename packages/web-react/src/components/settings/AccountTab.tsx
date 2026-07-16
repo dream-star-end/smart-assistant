@@ -65,6 +65,7 @@ export function AccountTab({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [ledgerReloadTick, setLedgerReloadTick] = useState(0);
   const [sub, setSub] = useState<MySubscription | null>(null);
 
   // 积分收支卡（窗口口径，独立于用量 Tab）。
@@ -138,7 +139,7 @@ export function AccountTab({
     return () => {
       alive = false;
     };
-  }, [auth, reloadKey]);
+  }, [auth, reloadKey, ledgerReloadTick]);
 
   const loadMore = useCallback(async () => {
     if (!nextBefore || loadingMore) return;
@@ -366,7 +367,21 @@ export function AccountTab({
           </>
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <ChartCard title="收支趋势" hint="收入 / 支出" height={200}>
+            <ChartCard
+              title="收支趋势"
+              hint="收入 / 支出"
+              height={200}
+              ariaLabel={`收支趋势，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
+              dataTable={{
+                columns: ["时间", "收入积分", "支出积分"],
+                rows: ledgerTrend.map((point, index) => [
+                  trendLabels[index],
+                  formatCredits(point.credited),
+                  formatCredits(point.debited),
+                ]),
+                emptyText: "该时段暂无收支记录。",
+              }}
+            >
               {trendHasData ? (
                 <canvas ref={flowRef} />
               ) : (
@@ -375,7 +390,20 @@ export function AccountTab({
                 </div>
               )}
             </ChartCard>
-            <ChartCard title="支出构成" hint="按类型" height={200}>
+            <ChartCard
+              title="支出构成"
+              hint="按类型"
+              height={200}
+              ariaLabel={`支出构成，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
+              dataTable={{
+                columns: ["类型", "支出积分"],
+                rows: byReason.map((reason) => [
+                  ledgerReasonLabel(reason.reason),
+                  formatCredits(reason.debited),
+                ]),
+                emptyText: "该时段暂无支出。",
+              }}
+            >
               {reasonHasData ? (
                 <canvas ref={reasonRef} />
               ) : (
@@ -393,15 +421,26 @@ export function AccountTab({
           账单流水
         </div>
         {err && (
-          <Alert tone="danger" className="mb-2 text-[12.5px]">
-            {err}
-          </Alert>
+          <div className="mb-2">
+            <Alert tone="danger" className="text-[12.5px]">
+              {err}
+            </Alert>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              aria-label="重试账单流水"
+              onClick={() => setLedgerReloadTick((tick) => tick + 1)}
+            >
+              重试
+            </Button>
+          </div>
         )}
         {loading ? (
           <div className="flex items-center justify-center gap-2 py-8 text-[13px] text-faint">
             <Spinner /> 加载中…
           </div>
-        ) : rows.length === 0 ? (
+        ) : err && rows.length === 0 ? null : rows.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-faint">暂无账单记录</p>
         ) : (
           <>

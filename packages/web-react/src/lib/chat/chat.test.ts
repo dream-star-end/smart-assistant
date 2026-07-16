@@ -14,8 +14,10 @@ import {
   loadOlderHistoryLabel,
   nonAuthPolicyCloseInfo,
   normalizeBridgeErrorCode,
+  OFFLINE_DRAIN_START_DELAY_MS,
   onopenSetInitialStatus,
   parsePartialJson,
+  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -37,7 +39,7 @@ import {
   normalizeGoalCards,
   type FrameEffects,
 } from "./reducer";
-import { ChatSocket, type ChatSocketDeps } from "./socket";
+import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -148,6 +150,58 @@ describe("classifyEmptyTurn / shouldAutoContinueEmptyTurn", () => {
       { id: "u2", role: "user", _isAutoRetry: true },
     ];
     expect(shouldAutoContinueEmptyTurn({ messages: withAuto, targetMsgId: "u1", stopReason: "end_turn" })).toBe(false);
+  });
+  test("action-preamble recovery is deliberately strict", () => {
+    expect(shouldAutoContinueActionPreamble({
+      messages: [
+        { id: "u1", role: "user", text: "修一下" },
+        { id: "a1", role: "assistant", text: "好的，我现在检查并修复这个问题。" },
+      ],
+      targetMsgId: "u1",
+      stopReason: "end_turn",
+    })).toBe(true);
+    expect(shouldAutoContinueActionPreamble({
+      messages: [
+        { id: "u1", role: "user" },
+        { id: "a1", role: "assistant", text: "I'll inspect the logs and fix it now." },
+      ],
+      targetMsgId: "u1",
+      stopReason: "end_turn",
+    })).toBe(true);
+    for (const messages of [
+      [
+        { id: "u1", role: "user" },
+        { id: "a1", role: "assistant", text: "我现在检查，可以吗？" },
+      ],
+      [
+        { id: "u1", role: "user" },
+        { id: "a1", role: "assistant", text: "已经检查完成，结果正常。" },
+      ],
+      [
+        { id: "u1", role: "user" },
+        { id: "a1", role: "assistant", text: "我来检查。" },
+        { id: "tool", role: "tool", text: "real work already happened" },
+      ],
+      [
+        { id: "u1", role: "user" },
+        { id: "thinking", role: "thinking", text: "reasoning" },
+        { id: "a1", role: "assistant", text: "我来检查。" },
+      ],
+    ]) {
+      expect(shouldAutoContinueActionPreamble({
+        messages,
+        targetMsgId: "u1",
+        stopReason: "end_turn",
+      })).toBe(false);
+    }
+    expect(shouldAutoContinueActionPreamble({
+      messages: [
+        { id: "u1", role: "user" },
+        { id: "a1", role: "assistant", text: "我来检查。" },
+      ],
+      targetMsgId: "u1",
+      stopReason: "max_tokens",
+    })).toBe(false);
   });
 });
 
@@ -1584,12 +1638,41 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s._sendingInFlight).toBe(false);
   });
 
-  test("未知错误码 + 无 detail:主文案友好通用,原始 message 仍落 _errorDetail(不丢)", () => {
+  test("未知错误码不把内部 message 暴露到查看详情", () => {
     const s = sess();
     applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "some_new_code", message: "server shutting down", isFinal: true } as never);
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
-    expect(err._errorDetail).toBe("server shutting down"); // 原始信息进查看详情,Codex 审防丢失
+    expect(err._errorDetail).toBe("系统暂时不可用，请稍后重试。");
+    expect(err._errorDetail).not.toMatch(/server shutting down/);
+  });
+
+  test("scoped stale error marks only its client row and cannot tear down a newer turn", () => {
+    const s = sess();
+    const older = addMessage(s, "user", "older", { status: "sent", ts: 1 });
+    const newer = addMessage(s, "user", "newer", { status: "sent", ts: 2 });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = newer.id;
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: older.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，请直接重试本条消息",
+      detail: "raw provider detail",
+      isFinal: false,
+    } as never);
+    expect(older.status).toBe("error");
+    expect(newer.status).toBe("sent");
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe(newer.id);
+    expect(s.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      _clientMessageId: older.id,
+      _errorDetail: "任务执行暂时中断，你的消息已保留，可直接重试。",
+    });
   });
 
   test("legacy bridge error 无 final：本地收尾后立即 persist false", () => {
@@ -2032,6 +2115,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
   afterEach(() => {
     FakeWS.instances = [];
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   test("send while ws OPEN → ws.send called, msg sent, in-flight", () => {
@@ -2045,7 +2129,10 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(inbound).toBeTruthy();
     const s = sock.sessions.get("s1")!;
     const user = s.messages.find((m) => m.role === "user")!;
-    expect(JSON.parse(inbound!).clientMessageId).toBe(user.id);
+    const payload = JSON.parse(inbound!);
+    expect(payload.clientMessageId).toBe(user.id);
+    expect(payload.idempotencyKey).toBe(messageAttemptIdempotencyKey(user.id, 0));
+    expect(user._sendAttempt).toBe(0);
     expect(s._activeClientMessageId).toBe(user.id);
     expect(s._sendingInFlight).toBe(true);
     expect(user.status).toBe("sent");
@@ -2119,7 +2206,10 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
     expect(persistSession).toHaveBeenCalledWith("s1");
     const stored = sock.toStored("s1")!;
-    expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
+    expect(stored.messages.find((m) => m.role === "user")).toMatchObject({
+      text: "hi",
+      _sendAttempt: 0,
+    });
     expect(stored._sendingInFlight).toBe(true);
     expect(stored._activeClientMessageId).toBe(stored.messages.find((m) => m.role === "user")?.id);
     expect(typeof stored._turnStartedAt).toBe("number");
@@ -2160,7 +2250,8 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     const retry = ws.sent
       .map((raw) => JSON.parse(raw))
-      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+      .find((payload) => payload.clientMessageId === userMessage.id && typeof payload.idempotencyKey === "string" && payload.idempotencyKey.endsWith(":1"));
+    expect(retry.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMessage.id, 1));
     expect(retry).toMatchObject({
       model: "gpt-5.6-terra",
       effortLevel: "max",
@@ -2191,7 +2282,8 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     const retry = ws.sent
       .map((raw) => JSON.parse(raw))
-      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+      .find((payload) => payload.clientMessageId === userMessage.id && typeof payload.idempotencyKey === "string" && payload.idempotencyKey.endsWith(":1"));
+    expect(retry.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMessage.id, 1));
     expect(retry).toMatchObject({
       model: "gpt-5.6-sol",
       effortLevel: "high",
@@ -2224,7 +2316,8 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     const retry = ws.sent
       .map((raw) => JSON.parse(raw))
-      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+      .find((payload) => payload.clientMessageId === userMessage.id && typeof payload.idempotencyKey === "string" && payload.idempotencyKey.endsWith(":1"));
+    expect(retry.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMessage.id, 1));
     expect(retry).toMatchObject({ model: "gpt-5.6-sol", effortLevel: null });
   });
 
@@ -2482,6 +2575,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       sessionKey: "agent:main:webchat:dm:s1",
       channel: "webchat",
       peer: { id: "s1", kind: "dm" },
+      clientMessageId: failedId,
       code: "upstream_failed",
       message: "upstream failed",
       isFinal: false,
@@ -2491,6 +2585,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
       frameSeq: 2,
       ts: 2,
+      clientMessageId: failedId,
       blocks: [{ kind: "text", text: "[error] upstream failed" }],
       isFinal: true,
     })) });
@@ -2603,6 +2698,36 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(persistSession).toHaveBeenCalledWith("s1");
   });
 
+  test("scoped dedup ACK reconciles only its exact peer and client row", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "one" });
+    sock.sendMessage({ sessId: "s2", agentId: "main", text: "two" });
+    const first = sock.sessions.get("s1")!;
+    const second = sock.sessions.get("s2")!;
+    const firstId = first._activeClientMessageId!;
+    const secondId = second._activeClientMessageId!;
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      deduplicated: true,
+      idempotencyKey: messageAttemptIdempotencyKey(firstId, 0),
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: firstId,
+    }) });
+
+    expect(first._sendingInFlight).toBe(false);
+    expect(first._activeClientMessageId).toBeUndefined();
+    expect(second._sendingInFlight).toBe(true);
+    expect(second._activeClientMessageId).toBe(secondId);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: firstId });
+    expect(syncSession).not.toHaveBeenCalledWith("s2", expect.anything());
+  });
+
   test("Fix B — cost_charged 带 parentSessionId → 精确路由到父会话(多会话并发下不丢)", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -2649,6 +2774,26 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
     expect(sock.offlineQueue.length).toBe(1);
     expect(sock.sessions.get("s1")!.messages.find((m) => m.role === "user")?.status).toBe("queued");
+  });
+
+  test("offline replay keeps attempt 0 and the exact original idempotency key", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true); // connecting: initial dispatch enters offline queue
+    const ws = FakeWS.instances.at(-1)!;
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    const userMessage = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!;
+    const originalKey = messageAttemptIdempotencyKey(userMessage.id, 0);
+    expect(sock.offlineQueue[0]!.payload.idempotencyKey).toBe(originalKey);
+    expect(userMessage._sendAttempt).toBe(0);
+
+    ws.open();
+    vi.advanceTimersByTime(OFFLINE_DRAIN_START_DELAY_MS + 100);
+    const replay = ws.sent.map((raw) => JSON.parse(raw)).find((payload) =>
+      payload.type === "inbound.message" && payload.clientMessageId === userMessage.id);
+    expect(replay.idempotencyKey).toBe(originalKey);
+    expect(userMessage._sendAttempt).toBe(0);
   });
 
   test("onclose requeues in-flight drain items at head, preserving order (§10)", () => {
@@ -2789,6 +2934,65 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     expect(autocont.idempotencyKey).toBe(`autocont-s1-${userMsg.id}`);
     // 确定性：同 (sessId,targetMsgId) 再算一次必得同 key（跨 tab/replay 可被 server dedup）。
     expect(autocont.idempotencyKey).toBe(`autocont-s1-${userMsg.id}`);
+  });
+
+  test("short action promise end_turn continues once without blocking user flow", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "检查问题",
+      model: "gpt-5.6-sol",
+      effortLevel: "high",
+    });
+    const original = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        frameSeq: 1,
+        isFinal: true,
+        ts: 9e12,
+        blocks: [{ kind: "text", text: "好的，我现在检查并修复这个问题。" }],
+        meta: { stopReason: "end_turn" },
+      }),
+    });
+    vi.advanceTimersByTime(10);
+    const sent = ws.sent.map((data) => JSON.parse(data));
+    const continuation = sent.find((payload) =>
+      payload.idempotencyKey === `autocont-preamble-s1-${original.id}`);
+    expect(continuation).toBeTruthy();
+    expect(continuation.model).toBe("gpt-5.6-sol");
+    expect(continuation.effortLevel).toBe("high");
+    expect(continuation.content.text).toContain("直接继续完成");
+    expect(sock.sessions.get("s1")!.messages.some((message) =>
+      message.role === "user" && message.text === "↻ 自动继续执行")).toBe(true);
+
+    // Replayed duplicate final is rejected by frameSeq and cannot create a
+    // second paid continuation.
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        frameSeq: 1,
+        isFinal: true,
+        ts: 9e12,
+        blocks: [{ kind: "text", text: "好的，我现在检查并修复这个问题。" }],
+        meta: { stopReason: "end_turn" },
+      }),
+    });
+    vi.advanceTimersByTime(10);
+    expect(ws.sent.map((data) => JSON.parse(data)).filter((payload) =>
+      String(payload.idempotencyKey ?? "").startsWith("autocont-preamble-")).length).toBe(1);
   });
 
   test("合成续写复用被中断 turn 的路由字段(model/teamMode)——缺失会被 codex 计费闸拒", () => {

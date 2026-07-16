@@ -586,6 +586,188 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     await turn.summary;
   });
 
+  test("requestUserInput → 复用 AskUserQuestion permission 事件并回写精确 answers schema", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    const reverseRequest = {
+      jsonrpc: "2.0",
+      id: "srv-user-input-1",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thr-new-1",
+        turnId: "turn-1",
+        itemId: "ask-1",
+        questions: [
+          {
+            id: "color",
+            header: "Color",
+            question: "Which color?",
+            isOther: true,
+            isSecret: false,
+            options: [
+              { label: "Red", description: "Warm." },
+              { label: "Blue", description: "Cool." },
+            ],
+          },
+        ],
+        autoResolutionMs: 60_000,
+      },
+    };
+
+    p.reply(reverseRequest);
+    await waitFor(() => h.events.some((e) => e.kind === "permission_request"));
+    const permissionEvents = h.events.filter((e) => e.kind === "permission_request");
+    assert.equal(permissionEvents.length, 1);
+    const permission = permissionEvents[0];
+    assert.equal(permission.kind, "permission_request");
+    assert.equal(permission.request.toolName, "AskUserQuestion");
+    assert.equal(permission.request.toolUseId, "ask-1");
+    assert.match(permission.request.requestId, /^codex-user-input:turn-1:ask-1:\d+$/);
+    assert.deepEqual(permission.request.input, {
+      questions: [
+        {
+          id: "color",
+          header: "Color",
+          question: "Which color?",
+          multiSelect: false,
+          isOther: true,
+          isSecret: false,
+          options: [
+            { label: "Red", description: "Warm." },
+            { label: "Blue", description: "Cool." },
+          ],
+        },
+      ],
+      autoResolutionMs: 60_000,
+    });
+
+    // A transport replay while the reverse RPC is pending must not open a
+    // second permission card.
+    p.reply(reverseRequest);
+    assert.equal(h.events.filter((e) => e.kind === "permission_request").length, 1);
+
+    const beforeResponse = p.written.length;
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, {
+        behavior: "allow",
+        updatedInput: {
+          answers: { "Which color?": "Blue" },
+          annotations: { "Which color?": { notes: "not in Codex 0.144 response schema" } },
+        },
+      }),
+      true,
+    );
+    await waitFor(() => p.written.length === beforeResponse + 1);
+    assert.deepEqual(p.written[beforeResponse] as unknown, {
+      jsonrpc: "2.0",
+      id: "srv-user-input-1",
+      result: { answers: { color: { answers: ["Blue"] } } },
+    });
+
+    // Consumed atomically: a late/double browser response cannot write a
+    // second JSON-RPC result for the same server request id.
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, {
+        behavior: "deny",
+      }),
+      false,
+    );
+    assert.equal(p.written.length, beforeResponse + 1);
+
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("requestUserInput 浏览器拒绝 → schema-valid 空 answers", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    p.reply({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thr-new-1",
+        turnId: "turn-1",
+        itemId: "ask-deny",
+        questions: [
+          {
+            id: "confirm",
+            header: "Confirm",
+            question: "Continue?",
+            isOther: true,
+            isSecret: false,
+            options: [{ label: "Yes", description: "Continue." }],
+          },
+        ],
+        autoResolutionMs: null,
+      },
+    });
+    await waitFor(() => h.events.some((e) => e.kind === "permission_request"));
+    const permission = h.events.find((e) => e.kind === "permission_request");
+    assert.ok(permission && permission.kind === "permission_request");
+    const beforeResponse = p.written.length;
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, { behavior: "deny" }),
+      true,
+    );
+    await waitFor(() => p.written.length === beforeResponse + 1);
+    assert.deepEqual(p.written[beforeResponse] as unknown, {
+      jsonrpc: "2.0",
+      id: 41,
+      result: { answers: {} },
+    });
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("requestUserInput 未回答而 turn 结束 → 自动空 answers 且 pending 清零", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    p.reply({
+      jsonrpc: "2.0",
+      id: "srv-user-input-terminal",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thr-new-1",
+        turnId: "turn-1",
+        itemId: "ask-terminal",
+        questions: [
+          {
+            id: "path",
+            header: "Path",
+            question: "Use this path?",
+            isOther: true,
+            isSecret: false,
+            options: [{ label: "Yes", description: "Use it." }],
+          },
+        ],
+        autoResolutionMs: 60_000,
+      },
+    });
+    await waitFor(() => h.events.some((e) => e.kind === "permission_request"));
+    const permission = h.events.find((e) => e.kind === "permission_request");
+    assert.ok(permission && permission.kind === "permission_request");
+    const beforeTerminal = p.written.length;
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    assert.deepEqual(p.written[beforeTerminal] as unknown, {
+      jsonrpc: "2.0",
+      id: "srv-user-input-terminal",
+      result: { answers: {} },
+    });
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, { behavior: "allow" }),
+      false,
+    );
+    assert.equal(p.written.length, beforeTerminal + 1);
+  });
+
   test("app-server 崩溃:partial snapshot 保留 + 'exit' crashed + summary isError", async () => {
     const h = makeHarness();
     const turn = beginTurn(h, { requestId: "req-crash" });

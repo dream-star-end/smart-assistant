@@ -351,6 +351,85 @@ export function decryptPluginAccountEnvelope(
   }
 }
 
+/**
+ * Rebind one encrypted browser account to another already-verified version.
+ * The caller must hold the same Redis account lease used by invoke/revoke and
+ * execute this inside the version-transition transaction. No credential bytes
+ * leave memory; account identity and canonical storageState stay unchanged.
+ */
+export async function migrateManagedBrowserPluginAccountVersionFenced(input: {
+  row: PluginAccountRow
+  from: VerifiedRuntimePluginContract
+  to: VerifiedRuntimePluginContract
+  runner: QueryRunner
+  env?: NodeJS.ProcessEnv
+}): Promise<PluginAccountRow> {
+  if (
+    input.from.pluginType !== 'managed-browser' ||
+    input.to.pluginType !== 'managed-browser' ||
+    input.from.slug !== input.to.slug ||
+    input.row.provider !== input.from.slug ||
+    input.row.connector_version_id !== String(input.from.versionId)
+  )
+    throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account transition target mismatch')
+  const previous = decryptPluginAccountEnvelope(input.row, input.from.contract, input.env)
+  const storageState = validateBrowserStorageState(previous.storageState, input.to.contract)
+  if (JSON.stringify(storageState) !== JSON.stringify(previous.storageState))
+    throw new PluginAccountError(
+      'INVALID_STATE',
+      'Plugin account transition would change canonical storage state',
+    )
+  const envelope: PluginAccountEnvelopeV1 = {
+    schemaVersion: 1,
+    pluginType: 'managed-browser',
+    driverId: input.to.contract.runtime.driverId,
+    driverVersion: input.to.contract.runtime.driverVersion,
+    accountInstanceId: previous.accountInstanceId,
+    storageState,
+  }
+  const aadSeed = randomUUID()
+  const encrypted = encryptEnvelope(
+    envelope,
+    input.row.user_id,
+    input.row.provider,
+    aadSeed,
+    input.env,
+  )
+  const updated = await input.runner.query<PluginAccountRow>(
+    `UPDATE connections
+        SET connector_version_id = $10, spec_hash = $11, exec_contract_hash = $12,
+            auth_contract_version = $13, secret_enc = $14, secret_nonce = $15,
+            aad_seed = $16::uuid, revision = revision + 1,
+            secret_generation = secret_generation + 1, updated_at = NOW()
+      WHERE id = $1::bigint AND user_id = $2 AND provider = $3
+        AND connector_version_id = $4 AND revision = $5 AND secret_generation = $6
+        AND spec_hash = $7 AND exec_contract_hash = $8 AND auth_contract_version = $9
+        AND status IN ('active','error') AND revoked_at IS NULL
+      RETURNING ${ACCOUNT_COLS}`,
+    [
+      input.row.id,
+      input.row.user_id,
+      input.row.provider,
+      input.from.versionId,
+      input.row.revision,
+      input.row.secret_generation,
+      Buffer.from(input.from.artifactHash, 'hex'),
+      Buffer.from(input.from.execContractHash, 'hex'),
+      input.from.contract.account.contractVersion,
+      input.to.versionId,
+      Buffer.from(input.to.artifactHash, 'hex'),
+      Buffer.from(input.to.execContractHash, 'hex'),
+      input.to.contract.account.contractVersion,
+      encrypted.ciphertext,
+      encrypted.nonce,
+      aadSeed,
+    ],
+  )
+  if (updated.rowCount !== 1)
+    throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account version transition CAS failed')
+  return updated.rows[0]!
+}
+
 export async function assertRuntimePluginInstallEntitlement(
   userId: number,
   verified: VerifiedRuntimePluginContract,

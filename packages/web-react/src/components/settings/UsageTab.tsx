@@ -11,7 +11,7 @@ import type {
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
-import { Alert, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 
 const SESSIONS_PAGE = 20;
@@ -75,6 +75,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [usageReloadTick, setUsageReloadTick] = useState(0);
   /** 展开了组队明细的会话行(session_id 集合)。 */
   const [expandedDelegates, setExpandedDelegates] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
@@ -120,7 +121,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth]);
+  }, [auth, usageReloadTick]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
@@ -237,6 +238,14 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         <Alert tone="danger" className="text-[12.5px]">
           {err}
         </Alert>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="mt-2"
+          onClick={() => setUsageReloadTick((tick) => tick + 1)}
+        >
+          重试
+        </Button>
       </div>
     );
   }
@@ -307,13 +316,52 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 
             {/* 图表区 grid（桌面 2 列，移动堆叠） */}
             <div className="grid grid-cols-1 gap-3 px-5 pb-4 sm:grid-cols-2">
-              <ChartCard title="积分消耗趋势" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={200}>
+              <ChartCard
+                title="积分消耗趋势"
+                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
+                height={200}
+                ariaLabel={`积分消耗趋势，近 ${REPORT_WINDOW_NOUN[window]}`}
+                dataTable={{
+                  columns: ["时间", "消耗积分"],
+                  rows: report.trend.map((point, index) => [
+                    trendLabels[index],
+                    `${formatCredits(point.credits)} 积分`,
+                  ]),
+                  emptyText: "该时段暂无积分消耗数据。",
+                }}
+              >
                 <canvas ref={creditRef} />
               </ChartCard>
-              <ChartCard title="请求次数" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={200}>
+              <ChartCard
+                title="请求次数"
+                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
+                height={200}
+                ariaLabel={`请求次数趋势，近 ${REPORT_WINDOW_NOUN[window]}`}
+                dataTable={{
+                  columns: ["时间", "请求次数"],
+                  rows: report.trend.map((point, index) => [
+                    trendLabels[index],
+                    groupDigits(point.requests),
+                  ]),
+                  emptyText: "该时段暂无请求数据。",
+                }}
+              >
                 <canvas ref={requestRef} />
               </ChartCard>
-              <ChartCard title="按模型积分构成" hint="扣费前 5 · 余并「其他」" height={220}>
+              <ChartCard
+                title="按模型积分构成"
+                hint="扣费前 5 · 余并「其他」"
+                height={220}
+                ariaLabel={`按模型积分构成，近 ${REPORT_WINDOW_NOUN[window]}`}
+                dataTable={{
+                  columns: ["模型", "消耗积分"],
+                  rows: report.models.map((model) => [
+                    model.model,
+                    `${formatCredits(model.credits)} 积分`,
+                  ]),
+                  emptyText: "该时段暂无模型用量。",
+                }}
+              >
                 {modelHasData ? (
                   <canvas ref={modelRef} />
                 ) : (
@@ -322,7 +370,22 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                   </div>
                 )}
               </ChartCard>
-              <ChartCard title="Token 构成" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={220}>
+              <ChartCard
+                title="Token 构成"
+                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
+                height={220}
+                ariaLabel={`Token 构成，近 ${REPORT_WINDOW_NOUN[window]}`}
+                dataTable={{
+                  columns: ["类型", "Token 数"],
+                  rows: [
+                    ["输入", groupDigits(rs.input_tokens)],
+                    ["输出", groupDigits(rs.output_tokens)],
+                    ["缓存命中", groupDigits(rs.cache_read_tokens)],
+                    ["缓存写入", groupDigits(rs.cache_write_tokens)],
+                  ],
+                  emptyText: "该时段暂无用量数据。",
+                }}
+              >
                 {tokenHasData ? (
                   <canvas ref={tokenRef} />
                 ) : (

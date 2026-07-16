@@ -405,7 +405,7 @@ export function MessageList({
         <button
           type="button"
           onClick={() => setVisible((v) => v + LOAD_MORE_STEP)}
-          className="mx-auto rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+          className="mx-auto rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
         >
           加载更多历史（还有 {loadMore.count} 条）
         </button>
@@ -416,7 +416,7 @@ export function MessageList({
           onClick={archive.onLoadOlder}
           disabled={archive.loading}
           aria-busy={archive.loading}
-          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60"
+          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
         >
           {archive.loading ? (
             <>

@@ -64,6 +64,7 @@ async function startRig(opts: {
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
+  persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
 } = {}): Promise<TestRig> {
@@ -100,6 +101,7 @@ async function startRig(opts: {
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
     loadGoalState: opts.loadGoalState,
+    persistMasterUserMessage: opts.persistMasterUserMessage,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
   });
@@ -1045,6 +1047,138 @@ describe("userChatBridge — model authorization", () => {
         }),
         false,
       );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("authoritative user row is persisted before history load and current logical turn is excluded", async () => {
+    const order: string[] = [];
+    const rig = await startRig({
+      persistMasterUserMessage: async (uid, sessionId, message) => {
+        assert.equal(uid, 205n);
+        assert.equal(sessionId, "sess-persist-order");
+        assert.equal(message.id, "m-current-turn");
+        assert.equal(message.text, "continue safely");
+        order.push("persist");
+        return { applied: true };
+      },
+      loadMasterSessionMessages: async () => {
+        assert.deepEqual(order, ["persist"]);
+        order.push("history");
+        return [
+          { id: "u-old", role: "user", text: "older question", ts: 1 },
+          { id: "a-old", role: "assistant", text: "older answer", status: "completed", ts: 2 },
+          { id: "m-current-turn", role: "user", text: "continue safely", ts: 3 },
+          { id: "a-failed", role: "assistant", text: "old failed projection", _clientMessageId: "m-current-turn", status: "crashed", ts: 4 },
+        ];
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("205"));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      const containerWs = await containerOpenP;
+      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
+        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
+      });
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-persist-order", kind: "dm" },
+        clientMessageId: "m-current-turn",
+        model: "gpt-5.6-sol",
+        content: { text: "continue safely" },
+      }));
+      const forwarded = await forwardedP;
+      assert.deepEqual(order, ["persist", "history"]);
+      assert.deepEqual(forwarded._masterHistoricalMessages, [
+        { id: "u-old", role: "user", text: "older question", ts: 1 },
+        { id: "a-old", role: "assistant", text: "older answer", status: "completed", ts: 2 },
+      ]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("completed clientMessageId deduplicates with exact ACK and no container execution", async () => {
+    const rig = await startRig({
+      persistMasterUserMessage: async () => ({ applied: false, reason: "already_exists" }),
+      loadMasterSessionMessages: async () => [
+        { id: "m-done", role: "user", text: "do once", ts: 1 },
+        { id: "srv-done", role: "assistant", text: "already complete", status: "completed", _clientMessageId: "m-done", ts: 2 },
+      ],
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("206"));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      await containerOpenP;
+      const fc = frameCollector(ws);
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-done", kind: "dm" },
+        clientMessageId: "m-done",
+        idempotencyKey: "web:m-done:0",
+        model: "gpt-5.6-sol",
+        content: { text: "do once" },
+      }));
+      const ack = await nextBusinessFrame(fc);
+      assert.deepEqual(ack, {
+        type: "outbound.ack",
+        deduplicated: true,
+        idempotencyKey: "web:m-done:0",
+        peer: { id: "sess-done", kind: "dm" },
+        clientMessageId: "m-done",
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(rig.containerSeen.some((entry) => {
+        try { return JSON.parse(entry.data.toString()).type === "inbound.message"; }
+        catch { return false; }
+      }), false);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("persistence admission failure is scoped and never starts container work", async () => {
+    let attempts = 0;
+    const rig = await startRig({
+      persistMasterUserMessage: async () => {
+        attempts += 1;
+        return { applied: false, reason: "session_not_found" };
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("207"));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      await containerOpenP;
+      const fc = frameCollector(ws);
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-missing", kind: "dm" },
+        clientMessageId: "m-not-admitted",
+        model: "gpt-5.6-sol",
+        content: { text: "must not execute" },
+      }));
+      const error = await nextBusinessFrame(fc);
+      assert.equal(error.code, "SESSION_PERSIST_UNAVAILABLE");
+      assert.deepEqual(error.peer, { id: "sess-missing", kind: "dm" });
+      assert.equal(error.clientMessageId, "m-not-admitted");
+      assert.equal(attempts, 3);
+      assert.equal(rig.containerSeen.some((entry) => {
+        try { return JSON.parse(entry.data.toString()).type === "inbound.message"; }
+        catch { return false; }
+      }), false);
       ws.close();
       await waitClose(ws);
     } finally {

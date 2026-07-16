@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 
 import {
   isClientMessageId,
@@ -53,7 +54,14 @@ export type LosslessTurnRecord = {
 
 export type MaterializedLosslessTurn = {
   payload: LosslessTurnPayload;
+  /** Physical PostgreSQL rows after optional runtime-event batching. */
   records: LosslessTurnRecord[];
+  /** Exact pre-batch record cardinality exposed on the hot anchor. */
+  logicalRecordCount: number;
+  /** Deterministic digest of every runtime batch manifest, if batching occurred. */
+  runtimeBatchManifestSha256?: string;
+  /** Logical ids are retained for v1/v2 collision checks even when physically batched. */
+  logicalRecordIds: string[];
   billingAnchorId: string;
   /** Root + delegate final billing frames, each validated against the owning
    * tape locator. Master must settle all of them before ACKing finalize. */
@@ -500,6 +508,146 @@ function record(
   };
 }
 
+const RUNTIME_EVENT_BATCH_MIN_RECORDS = 4;
+const RUNTIME_EVENT_BATCH_MAX_RECORDS = 128;
+const RUNTIME_EVENT_BATCH_MAX_UNCOMPRESSED_BYTES = 512 * 1024;
+
+type RuntimeBatchManifestEntry = {
+  id: string;
+  eventOrdinal: number;
+  ts: number;
+  source: "ccb" | "codex-jsonrpc" | "gateway";
+  offset: number;
+  length: number;
+  payloadSha256: string;
+};
+
+function isBashTailRuntimeRecord(item: LosslessTurnRecord): boolean {
+  if (item.role !== "runtime-event") return false;
+  const event = item.payload._runtimeEvent;
+  return !!event && typeof event === "object" && !Array.isArray(event) &&
+    (event as Record<string, unknown>).type === "system" &&
+    (event as Record<string, unknown>).subtype === "bash_output_tail";
+}
+
+function runtimeBatchingEnabled(): boolean {
+  const raw = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "on";
+}
+
+function batchRuntimeEventRecords(
+  records: LosslessTurnRecord[],
+  prefix: string,
+): {
+  records: LosslessTurnRecord[];
+  runtimeBatchManifestSha256?: string;
+} {
+  if (!runtimeBatchingEnabled()) return { records };
+  const physical: LosslessTurnRecord[] = [];
+  const batchDescriptors: Array<{
+    batchId: string;
+    logicalCount: number;
+    manifestSha256: string;
+  }> = [];
+  let pending: LosslessTurnRecord[] = [];
+  let pendingBytes = 0;
+
+  const flush = (): void => {
+    if (pending.length < RUNTIME_EVENT_BATCH_MIN_RECORDS) {
+      physical.push(...pending);
+      pending = [];
+      pendingBytes = 0;
+      return;
+    }
+    let offset = 0;
+    const manifest: RuntimeBatchManifestEntry[] = pending.map((item) => {
+      const source = item.payload._runtimeSource;
+      if (source !== "ccb" && source !== "codex-jsonrpc" && source !== "gateway") {
+        throw new Error("turn tape runtime event source missing during batching");
+      }
+      if (item.eventOrdinal === undefined) {
+        throw new Error("turn tape runtime event ordinal missing during batching");
+      }
+      const entry: RuntimeBatchManifestEntry = {
+        id: item.id,
+        eventOrdinal: item.eventOrdinal,
+        ts: item.ts,
+        source,
+        offset,
+        length: item.payloadBytes.length,
+        payloadSha256: item.payloadSha256,
+      };
+      offset += item.payloadBytes.length;
+      return entry;
+    });
+    const manifestSha256 = sha256(Buffer.from(JSON.stringify(manifest), "utf8"));
+    const raw = Buffer.concat(pending.map((item) => item.payloadBytes), offset);
+    const compressed = gzipSync(raw, { level: 6 });
+    const first = pending[0]!;
+    const last = pending.at(-1)!;
+    const batchId = `${prefix}-runtime-batch-${first.eventOrdinal}-${last.eventOrdinal}-${manifestSha256.slice(0, 12)}`;
+    const batch = record({
+      id: batchId,
+      role: "runtime-event",
+      text: "",
+      ts: first.ts,
+      status: first.payload.status,
+      _runtimeEventBatch: {
+        version: 1,
+        encoding: "gzip+base64",
+        logicalCount: manifest.length,
+        uncompressedBytes: raw.length,
+        compressedBytes: compressed.length,
+        manifestSha256,
+        manifest,
+        data: compressed.toString("base64"),
+      },
+      _ocEventOrdinal: first.eventOrdinal,
+      _hiddenRuntimeEvent: true,
+      ...(typeof first.payload._clientMessageId === "string"
+        ? { _clientMessageId: first.payload._clientMessageId }
+        : {}),
+      ...(typeof first.payload._continuationOfTurnKey === "string"
+        ? { _continuationOfTurnKey: first.payload._continuationOfTurnKey }
+        : {}),
+    }, first.eventOrdinal);
+    physical.push(batch);
+    batchDescriptors.push({ batchId, logicalCount: manifest.length, manifestSha256 });
+    pending = [];
+    pendingBytes = 0;
+  };
+
+  for (const item of records) {
+    const eligible = item.role === "runtime-event" && !isBashTailRuntimeRecord(item);
+    if (!eligible) {
+      flush();
+      physical.push(item);
+      continue;
+    }
+    if (
+      pending.length >= RUNTIME_EVENT_BATCH_MAX_RECORDS ||
+      (pending.length > 0 && pendingBytes + item.payloadBytes.length > RUNTIME_EVENT_BATCH_MAX_UNCOMPRESSED_BYTES)
+    ) flush();
+    if (item.payloadBytes.length > RUNTIME_EVENT_BATCH_MAX_UNCOMPRESSED_BYTES) {
+      physical.push(item);
+      continue;
+    }
+    pending.push(item);
+    pendingBytes += item.payloadBytes.length;
+  }
+  flush();
+  return {
+    records: physical,
+    ...(batchDescriptors.length > 0
+      ? {
+          runtimeBatchManifestSha256: sha256(
+            Buffer.from(JSON.stringify(batchDescriptors), "utf8"),
+          ),
+        }
+      : {}),
+  };
+}
+
 /** Converts one complete canonical payload into immutable UI message records. */
 export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn {
   const body = parseLosslessTurnPayload(raw);
@@ -746,7 +894,10 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
     if (a.ts !== b.ts) return a.ts - b.ts;
     return a.id.localeCompare(b.id);
   });
-  const billingAnchorId = assistantRecords.at(-1)?.id ?? records.at(-1)!.id;
+  const logicalRecordIds = records.map((item) => item.id);
+  const logicalRecordCount = records.length;
+  const batched = batchRuntimeEventRecords(records, prefix);
+  const billingAnchorId = assistantRecords.at(-1)?.id ?? batched.records.at(-1)!.id;
   const engineBillings = [
     ...(body.engineBilling ? [structuredClone(body.engineBilling)] : []),
     ...(body.agentGroups ?? []).flatMap((group) =>
@@ -754,5 +905,15 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
         ? (group.engineBillings as DurableCodexBilling[]).map((billing) => structuredClone(billing))
         : []),
   ];
-  return { payload: body, records, billingAnchorId, engineBillings };
+  return {
+    payload: body,
+    records: batched.records,
+    logicalRecordCount,
+    logicalRecordIds,
+    ...(batched.runtimeBatchManifestSha256
+      ? { runtimeBatchManifestSha256: batched.runtimeBatchManifestSha256 }
+      : {}),
+    billingAnchorId,
+    engineBillings,
+  };
 }

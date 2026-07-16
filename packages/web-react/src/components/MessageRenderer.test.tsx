@@ -82,6 +82,19 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText(/没有产生新内容/)).toBeInTheDocument();
   });
 
+  test("assistant：触屏动作按钮保留 44px 命中区，复制与重新生成能力不减少", () => {
+    const onRegenerate = vi.fn();
+    renderMsg(mk("assistant", { text: "可复制的回答" }), { cb: { onRegenerate } });
+    const copy = screen.getByRole("button", { name: "复制" });
+    const plain = screen.getByRole("button", { name: "复制纯文本" });
+    const regenerate = screen.getByRole("button", { name: "重新生成" });
+    for (const button of [copy, plain, regenerate]) {
+      expect(button).toHaveClass("[@media(hover:none)]:size-11");
+    }
+    fireEvent.click(regenerate);
+    expect(onRegenerate).toHaveBeenCalledTimes(1);
+  });
+
   test("user：气泡 + 状态角标", () => {
     renderMsg(mk("user", { text: "提问", status: "sent" }));
     expect(screen.getByText("提问")).toBeInTheDocument();
@@ -92,6 +105,11 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     renderMsg(mk("thinking", { text: "推理中..." }), { isLast: true, sending: true });
     expect(screen.getByText("思考中…")).toBeInTheDocument();
     expect(screen.getByText("推理中...")).toBeInTheDocument();
+  });
+
+  test("thinking：完成态截断标题保留完整悬浮文本", () => {
+    renderMsg(mk("thinking", { text: "**这是一个很长的完整思考摘要标题**\n正文" }));
+    expect(screen.getByTitle("已思考 · 这是一个很长的完整思考摘要标题")).toBeInTheDocument();
   });
 
   test("plan：活跃段 + 本轮进行中 → structured steps 交给 PinnedTaskTracker，inline 不重复渲染", () => {
@@ -123,6 +141,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     );
     expect(screen.getByText("第一步")).toBeInTheDocument();
     expect(screen.getByText("第二步")).toBeInTheDocument();
+    expect(screen.getByTitle("计划")).toHaveClass("min-w-0", "flex-1", "truncate");
   });
 
   test("plan：活跃段但本轮已结束(sending=false,HUD 已隐藏)→ 渲染只读卡兜底", () => {
@@ -141,7 +160,9 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
 
   test("system：居中提示", () => {
     renderMsg(mk("system", { text: "会话已恢复" }));
-    expect(screen.getByText("会话已恢复")).toBeInTheDocument();
+    const notice = screen.getByText("会话已恢复");
+    expect(notice).toBeInTheDocument();
+    expect(notice).toHaveClass("max-w-full", "break-words", "rounded-xl");
   });
 
   test("goal → 渲染原生目标更新卡", () => {
@@ -271,7 +292,8 @@ describe("tool / agent-group 集成", () => {
         ],
       }),
     );
-    expect(screen.getByText("legacy output")).toBeInTheDocument();
+    expect(screen.getByText("legacy output")).toHaveClass("line-clamp-2", "break-words");
+    expect(screen.getByTitle("[text] legacy output")).toBeInTheDocument();
     expect(screen.getByText("终端")).toBeInTheDocument();
   });
 });
@@ -489,6 +511,23 @@ describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
     expect(screen.getByText("超时")).toBeInTheDocument();
     expect(screen.queryByText("运行中")).not.toBeInTheDocument(); // server 行永不"运行中"
   });
+
+  test("多枚终态徽记与成本在窄屏可换行，信息仍完整", () => {
+    renderMsg(
+      mk("agent-group", {
+        id: "srv-review",
+        _source: "server",
+        _delegate: true,
+        _delegateAgentId: "hidden-reviewer",
+        text: "质量审查",
+        _completed: true,
+        _reviewVerdict: "PASS",
+      }),
+    );
+    const verdict = screen.getByText("PASS");
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(verdict.parentElement).toHaveClass("flex-wrap", "max-w-[55%]");
+  });
 });
 
 describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
@@ -659,7 +698,9 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
   test("本地未翻尽(>100 条)→ 本地翻页按钮;count 含归档未拉数(§4)", () => {
     // 130 条尾巴,visible=100 → 30 本地未挂;归档 500 未拉 → 还有 530 条。
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
-    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toHaveClass(
+      "[@media(hover:none)]:min-h-11",
+    );
     expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
   });
 
@@ -714,7 +755,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(
       screen.getByRole("button", { name: /从云端加载更早的历史（还有 500 条）/ }),
-    ).toBeInTheDocument();
+    ).toHaveClass("[@media(hover:none)]:min-h-11");
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });
 

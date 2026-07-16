@@ -57,6 +57,23 @@ async function expandRow(name: string) {
 }
 
 describe("SkillsPanel 未配评测提示点", () => {
+  test("首次加载失败不显示假空态，可原地重试后显示真实空态", async () => {
+    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    const listSkills = vi
+      .spyOn(api, "listSkills")
+      .mockRejectedValueOnce(new Error("backend unavailable"))
+      .mockResolvedValueOnce([]);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+
+    render(<SkillsPanel auth={auth} />);
+
+    expect(await screen.findByText("加载技能失败")).toBeInTheDocument();
+    expect(screen.queryByText("还没有技能")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("还没有技能")).toBeInTheDocument();
+    await waitFor(() => expect(listSkills).toHaveBeenCalledTimes(2));
+  });
+
   test("自建可写技能且无评测用例:展开后页签栏出现「未配评测」提示点", async () => {
     mountPanel();
     await expandRow("写作助手");

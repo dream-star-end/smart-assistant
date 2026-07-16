@@ -46,6 +46,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
   expect(screen.getByRole('form', { name: '反馈表单' })).toBeInTheDocument()
   expect(screen.getByLabelText('反馈类型')).toBeInTheDocument()
   expect(screen.getByLabelText('反馈内容')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
 })
 
 test('设置中心只把 API Key 管理权限授予 admin', async () => {
@@ -78,4 +79,27 @@ test('设置中心只把 API Key 管理权限授予 admin', async () => {
   await screen.findByText('偏好页')
   await waitFor(() => expect(preferencesProps).toHaveBeenCalled())
   expect((preferencesProps.mock.calls.at(-1)?.[0] as { canManageApiKeys?: boolean }).canManageApiKeys).toBe(true)
+})
+
+test('偏好首次加载失败可原地重试，成功后恢复完整偏好页', async () => {
+  vi.spyOn(api, 'getPreferences')
+    .mockRejectedValueOnce(new Error('backend unavailable'))
+    .mockResolvedValueOnce({ prefs: {} } as never)
+  render(
+    <SettingsCenter
+      open
+      auth={auth}
+      user={null}
+      theme="light"
+      onClose={() => {}}
+      onSetTheme={() => {}}
+      onOpenMemory={() => {}}
+    />,
+  )
+
+  fireEvent.click(screen.getByRole('tab', { name: '偏好' }))
+  expect(await screen.findByText('加载偏好失败')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '重试' }))
+  expect(await screen.findByText('偏好页')).toBeInTheDocument()
+  expect(api.getPreferences).toHaveBeenCalledTimes(2)
 })

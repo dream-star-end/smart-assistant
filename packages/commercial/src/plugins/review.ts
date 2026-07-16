@@ -42,6 +42,12 @@ export interface ApproveOfficialRuntimePluginVersionInput {
   expectedArtifactHash: string
   /** Set only after the deploy gate exercised this exact official worker flow. */
   functionalVerified: true
+  /**
+   * False approves/signs the immutable target but leaves current selection to a
+   * later atomic install/account transition. Official managed-browser upgrades
+   * use this to avoid exposing a version before encrypted accounts are ready.
+   */
+  activateListing?: boolean
   env?: NodeJS.ProcessEnv
   pool?: Pool
 }
@@ -366,12 +372,15 @@ export async function approveOfficialRuntimePluginVersion(
 
     const listingUpdate = await client.query(
       `UPDATE marketplace_skill_listings
-          SET current_approved_version_id = $2,
-              state = CASE WHEN state = 'unlisted' THEN 'active' ELSE state END,
-              revoked_reason = CASE WHEN state = 'unlisted' THEN NULL ELSE revoked_reason END,
+          SET current_approved_version_id = CASE WHEN $3::boolean THEN $2
+                                                 ELSE current_approved_version_id END,
+              state = CASE WHEN $3::boolean AND state = 'unlisted'
+                           THEN 'active' ELSE state END,
+              revoked_reason = CASE WHEN $3::boolean AND state = 'unlisted'
+                                    THEN NULL ELSE revoked_reason END,
               updated_at = NOW()
         WHERE slug = $1 AND state <> 'revoked'`,
-      [listing.slug, version.id],
+      [listing.slug, version.id, input.activateListing !== false],
     )
     if (listingUpdate.rowCount !== 1)
       throw new ConnectorSpecError('EXEC_REVOKED', 'official Plugin listing is revoked')
@@ -445,6 +454,7 @@ function verifyStoredRuntimeRow(
   row: StoredRuntimePluginRow,
   policyFloor: number,
   env: NodeJS.ProcessEnv,
+  allowUnlisted = false,
 ): VerifiedRuntimePluginContract {
   const pluginType = row.plugin_type
   if (
@@ -453,7 +463,7 @@ function verifyStoredRuntimeRow(
   )
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'version is not a runtime Plugin')
   if (
-    row.listing_state !== 'active' ||
+    (row.listing_state !== 'active' && !(allowUnlisted && row.listing_state === 'unlisted')) ||
     row.version_status !== 'approved' ||
     row.security_review_state !== 'security_approved'
   )
@@ -538,7 +548,7 @@ function verifyStoredRuntimeRow(
 export async function loadVerifiedRuntimePluginContract(
   versionId: number,
   runner: QueryRunner,
-  opts: { minPolicyVersion?: number; env?: NodeJS.ProcessEnv } = {},
+  opts: { minPolicyVersion?: number; env?: NodeJS.ProcessEnv; allowUnlisted?: boolean } = {},
 ): Promise<VerifiedRuntimePluginContract> {
   safeVersionId(versionId)
   if (
@@ -552,6 +562,7 @@ export async function loadVerifiedRuntimePluginContract(
     row,
     Math.max(CURRENT_RUNTIME_PLUGIN_SECURITY_POLICY_VERSION, opts.minPolicyVersion ?? 0),
     opts.env ?? process.env,
+    opts.allowUnlisted === true,
   )
 }
 

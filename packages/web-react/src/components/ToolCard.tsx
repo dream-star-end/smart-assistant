@@ -88,7 +88,11 @@ export function ToolCard({ message }: { message: ToolLike }) {
           <Icon size={13} />
         </span>
         <span className="shrink-0 text-[13px] font-medium text-fg">{meta.label}</span>
-        {summary && <span className="min-w-0 truncate font-mono text-xs text-muted">{summary}</span>}
+        {summary && (
+          <span className="min-w-0 truncate font-mono text-xs text-muted" title={summary}>
+            {summary}
+          </span>
+        )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
           {/* running/done 的 spinner/✓ 是 aria-hidden，需 sr-only 播报状态；error/cancelled 的 Badge 自带可见文案，无需重复。 */}
           {!isError && !isCancelled && <span className="sr-only">{statusLabel}</span>}

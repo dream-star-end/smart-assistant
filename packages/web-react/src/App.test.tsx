@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
+import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 
 // ---------------------------------------------------------------------------
@@ -182,6 +183,37 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
 })
 
 describe('Aurora v5 skeleton — auth → workspace', () => {
+  test('接受组织邀请失败走统一中文错误收口，不外露后端英文', async () => {
+    window.history.replaceState({}, '', '/?orgInvite=invite-token')
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/org/invitations/accept')) {
+        return {
+          ok: false,
+          status: 500,
+          headers: { get: (h: string) => (h === 'x-request-id' ? 'req-org-invite' : null) },
+          json: async () => ({ error: { code: 'INTERNAL', message: 'database unavailable' } }),
+        }
+      }
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<ToastProvider><App /></ToastProvider>)
+    fireEvent.click(await screen.findByRole('button', { name: '接受邀请' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('接受组织邀请失败（追踪号 req-org-invite）')
+    expect(alert).not.toHaveTextContent('database unavailable')
+  })
+
   test('登录与退出清空图片 Blob 缓存，跨账号相同容器路径不得复用', async () => {
     const key = byteCacheKey('/home/agent/same-path.png', null)
     imageByteCache.set(key, new Blob(['account-a']))

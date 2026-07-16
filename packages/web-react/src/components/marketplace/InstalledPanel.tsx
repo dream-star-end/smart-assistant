@@ -25,7 +25,7 @@ export function InstalledPanel({
 }: {
   auth: AuthSession;
   onGoBrowse: () => void;
-  onOpenConnectors?: () => void;
+  onOpenConnectors?: (pluginSlug?: string) => void;
 }) {
   const [rows, setRows] = useState<MarketplaceInstalled[] | null>(null);
   const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
@@ -181,7 +181,7 @@ export function InstalledPanel({
             {connectorCount} 个 API 连接插件在管理中心统一绑定账号、更新与卸载。
           </span>
           {onOpenConnectors && (
-            <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+            <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
               管理插件账号
             </Button>
           )}
@@ -284,7 +284,7 @@ export function InstalledPanel({
                 {r.kind === "agent" &&
                   (r.capabilityReadiness?.needsAuthorization.length ?? 0) > 0 &&
                   onOpenConnectors && (
-                    <Button variant="secondary" size="sm" onClick={onOpenConnectors}>
+                    <Button variant="secondary" size="sm" onClick={() => onOpenConnectors()}>
                       授权 Plugin
                     </Button>
                   )}

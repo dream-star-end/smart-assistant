@@ -10,7 +10,7 @@
  */
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
   AuthSession,
@@ -159,6 +159,19 @@ describe("AccountTab 本期套餐积分进度", () => {
 });
 
 describe("AccountTab 积分收支卡", () => {
+  test("账单流水失败不显示假空态，可重试后恢复真实空态", async () => {
+    mockedGetSub.mockResolvedValue(makeSub("4000", "3000"));
+    mockedGetUsage
+      .mockRejectedValueOnce(new Error("backend unavailable"))
+      .mockResolvedValueOnce(makeUsage());
+    renderTab();
+    expect(await screen.findByText("加载账单流水失败")).toBeInTheDocument();
+    expect(screen.queryByText("暂无账单记录")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试账单流水" }));
+    expect(await screen.findByText("暂无账单记录")).toBeInTheDocument();
+    expect(mockedGetUsage).toHaveBeenCalledTimes(2);
+  });
+
   test("默认窗口 30d 拉 getMyUsageReport，收支/支出图渲染 canvas", async () => {
     mockedGetSub.mockResolvedValue(makeSub("4000", "3000"));
     const { container } = renderTab();
@@ -167,5 +180,7 @@ describe("AccountTab 积分收支卡", () => {
     expect(screen.getByText("支出构成")).toBeInTheDocument();
     // 两张图均以 canvas 渲染
     expect(container.querySelectorAll("canvas").length).toBeGreaterThanOrEqual(2);
+    const flowTable = screen.getByRole("table", { name: "收支趋势，近 30 天" });
+    expect(within(flowTable).getByRole("cell", { name: "1,000" })).toBeInTheDocument();
   });
 });

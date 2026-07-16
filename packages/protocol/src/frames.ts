@@ -236,11 +236,251 @@ export const InboundGoalSync = Type.Object({
 })
 export type InboundGoalSync = Static<typeof InboundGoalSync>
 
+// ───────────────────────────────────────────────
+// V5 prompt queue P0 — wire contract only (RFC §3.2 / §4)
+// ───────────────────────────────────────────────
+// This block intentionally contains no coordinator/runner behavior. It freezes
+// the durable queue projection and mutation envelopes so later P1+ slices can
+// share one schema across master, runtime and web without inventing local DTOs.
+// These names freeze RFC §11.1 only; P0 does not read flags or advertise a
+// capability. All three flags remain off until their owning rollout slices.
+export const PROMPT_QUEUE_V1_ENV = 'OC_PROMPT_QUEUE_V1'
+export const PROMPT_STEER_CODEX_NATIVE_ENV = 'OC_PROMPT_STEER_CODEX_NATIVE'
+export const PROMPT_STEER_CCB_FORK_ENV = 'OC_PROMPT_STEER_CCB_FORK'
+export const PROMPT_QUEUE_V1_CAPABILITY = 'promptQueueV1'
+
+export const PROMPT_QUEUE_VERSION_PATTERN = '^(0|[1-9][0-9]*)$'
+const PROMPT_QUEUE_VERSION_RE = new RegExp(PROMPT_QUEUE_VERSION_PATTERN)
+export const PromptQueueVersion = Type.String({ pattern: PROMPT_QUEUE_VERSION_PATTERN })
+export type PromptQueueVersion = Static<typeof PromptQueueVersion>
+
+export const isPromptQueueVersion = (value: unknown): value is PromptQueueVersion =>
+  typeof value === 'string' && PROMPT_QUEUE_VERSION_RE.test(value)
+
+/** Parse the canonical decimal wire version without crossing JS's safe-integer boundary. */
+export function parsePromptQueueVersion(value: PromptQueueVersion): bigint {
+  if (!isPromptQueueVersion(value)) throw new TypeError('invalid prompt queue version')
+  return BigInt(value)
+}
+
+/** Return the next canonical wire version. The result is strictly greater than the input. */
+export function nextPromptQueueVersion(value: PromptQueueVersion): PromptQueueVersion {
+  return (parsePromptQueueVersion(value) + 1n).toString()
+}
+
+/** Compare canonical queue versions while preserving the full BIGINT range. */
+export function comparePromptQueueVersions(
+  left: PromptQueueVersion,
+  right: PromptQueueVersion,
+): -1 | 0 | 1 {
+  const leftValue = parsePromptQueueVersion(left)
+  const rightValue = parsePromptQueueVersion(right)
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0
+}
+
+// Queue item ids deliberately use the existing browser-authored message-id
+// contract: one client-precast id remains stable from optimistic row → queue →
+// materialized user message and is also suitable for Codex clientUserMessageId.
+export const PromptQueueItemId = ClientMessageId
+export type PromptQueueItemId = Static<typeof PromptQueueItemId>
+export const isPromptQueueItemId = isClientMessageId
+
+export function promptQueueItemIdFromClientMessageId(clientMessageId: string): PromptQueueItemId {
+  if (!isPromptQueueItemId(clientMessageId)) {
+    throw new TypeError('invalid prompt queue item id')
+  }
+  return clientMessageId
+}
+
+export const PromptQueueSteerDelivery = Type.Union([
+  Type.Literal('native'),
+  Type.Literal('fork-native'),
+  Type.Literal('turn-boundary'),
+])
+export type PromptQueueSteerDelivery = Static<typeof PromptQueueSteerDelivery>
+
+export const PromptQueueAttachmentRef = Type.Object(
+  {
+    ordinal: Type.Integer({ minimum: 0, maximum: MAX_ATTACHMENTS_PER_MESSAGE - 1 }),
+    kind: Type.String({ minLength: 1 }),
+    // Queue snapshots only expose durable content-addressed media refs. Browser-
+    // local blob/data URLs and inline base64 belong to the pre-enqueue upload path.
+    url: Type.String({ pattern: '^/api/media/[0-9a-f]{64}\\.[A-Za-z0-9]{1,32}$' }),
+    mimeType: Type.Optional(Type.String()),
+    filename: Type.Optional(Type.String()),
+    hidden: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+)
+export type PromptQueueAttachmentRef = Static<typeof PromptQueueAttachmentRef>
+
+export const PromptQueueItem = Type.Object({
+  id: PromptQueueItemId,
+  clientMessageId: PromptQueueItemId,
+  position: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  displayText: Type.String(),
+  contentHash: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  contentBytes: PromptQueueVersion,
+  attachmentRefs: Type.Array(PromptQueueAttachmentRef, {
+    maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
+  }),
+  state: Type.Union([
+    Type.Literal('queued'),
+    Type.Literal('steer_pending'),
+    Type.Literal('delivery_unknown'),
+    Type.Literal('blocked'),
+  ]),
+  requestedExecution: Type.Object({
+    agentId: Type.String({ minLength: 1 }),
+    model: Type.Optional(Type.String()),
+    effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    teamMode: Type.Optional(Type.Boolean()),
+  }),
+  createdAt: Type.Number(),
+  updatedAt: Type.Number(),
+})
+export type PromptQueueItem = Static<typeof PromptQueueItem>
+
+export const PromptQueueMutationOperation = Type.Union([
+  Type.Literal('enqueue'),
+  Type.Literal('edit'),
+  Type.Literal('delete'),
+  Type.Literal('reorder'),
+  Type.Literal('interject'),
+])
+export type PromptQueueMutationOperation = Static<typeof PromptQueueMutationOperation>
+
+export const PromptQueueMutationOutcome = Type.Union([
+  Type.Literal('applied'),
+  Type.Literal('duplicate'),
+  Type.Literal('version_conflict'),
+  Type.Literal('turn_changed'),
+  Type.Literal('delivery_pending'),
+  Type.Literal('delivery_unknown'),
+  Type.Literal('rejected'),
+])
+export type PromptQueueMutationOutcome = Static<typeof PromptQueueMutationOutcome>
+
+const PromptQueuePlatformTurnId = Type.String({ pattern: '^[0-9a-f]{64}$' })
+const PromptQueueIdempotencyKey = Type.String({ minLength: 1 })
+const PromptQueueAgentId = Type.String({ minLength: 1 })
+const PromptQueueMessageContent = Type.Intersect([
+  InboundMessage.properties.content,
+  Type.Object({
+    media: Type.Optional(Type.Array(MediaRef, { maxItems: MAX_ATTACHMENTS_PER_MESSAGE })),
+  }),
+])
+
+export const PromptQueueSnapshot = Type.Object({
+  type: Type.Literal('outbound.prompt_queue.snapshot'),
+  owner: Type.Object({
+    userId: Type.String({ minLength: 1 }),
+    sessionKey: Type.String({ minLength: 1 }),
+    clientSessionId: Type.String({ minLength: 1 }),
+    agentId: PromptQueueAgentId,
+  }),
+  version: PromptQueueVersion,
+  activeTurn: Type.Union([
+    Type.Null(),
+    Type.Object({
+      id: PromptQueuePlatformTurnId,
+      sourceItemId: PromptQueueItemId,
+      traceId: Type.Optional(TraceIdString),
+      startedAt: Type.Number(),
+      steerDelivery: PromptQueueSteerDelivery,
+    }),
+  ]),
+  items: Type.Array(PromptQueueItem),
+  mutation: Type.Optional(
+    Type.Object({
+      idempotencyKey: PromptQueueIdempotencyKey,
+      operation: PromptQueueMutationOperation,
+      outcome: PromptQueueMutationOutcome,
+      appliedVersion: Type.Optional(PromptQueueVersion),
+      code: Type.Optional(Type.String()),
+    }),
+  ),
+  serverTs: Type.Number(),
+  frameSeq: Type.Optional(Type.Number()),
+})
+export type PromptQueueSnapshot = Static<typeof PromptQueueSnapshot>
+
+export const InboundPromptQueueEnqueue = Type.Object({
+  type: Type.Literal('inbound.prompt_queue.enqueue'),
+  peer: Peer,
+  channel: Type.Literal('webchat'),
+  agentId: PromptQueueAgentId,
+  itemId: PromptQueueItemId,
+  clientMessageId: PromptQueueItemId,
+  observedVersion: Type.Optional(PromptQueueVersion),
+  idempotencyKey: PromptQueueIdempotencyKey,
+  content: PromptQueueMessageContent,
+  requestedExecution: Type.Object({
+    model: Type.Optional(Type.String()),
+    effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    teamMode: Type.Optional(Type.Boolean()),
+  }),
+})
+export type InboundPromptQueueEnqueue = Static<typeof InboundPromptQueueEnqueue>
+
+export const InboundPromptQueueEdit = Type.Object({
+  type: Type.Literal('inbound.prompt_queue.edit'),
+  peer: Peer,
+  agentId: PromptQueueAgentId,
+  itemId: PromptQueueItemId,
+  expectedVersion: PromptQueueVersion,
+  idempotencyKey: PromptQueueIdempotencyKey,
+  content: PromptQueueMessageContent,
+})
+export type InboundPromptQueueEdit = Static<typeof InboundPromptQueueEdit>
+
+export const InboundPromptQueueDelete = Type.Object({
+  type: Type.Literal('inbound.prompt_queue.delete'),
+  peer: Peer,
+  agentId: PromptQueueAgentId,
+  itemId: PromptQueueItemId,
+  expectedVersion: PromptQueueVersion,
+  idempotencyKey: PromptQueueIdempotencyKey,
+})
+export type InboundPromptQueueDelete = Static<typeof InboundPromptQueueDelete>
+
+export const InboundPromptQueueReorder = Type.Object({
+  type: Type.Literal('inbound.prompt_queue.reorder'),
+  peer: Peer,
+  agentId: PromptQueueAgentId,
+  orderedItemIds: Type.Array(PromptQueueItemId, { uniqueItems: true }),
+  expectedVersion: PromptQueueVersion,
+  idempotencyKey: PromptQueueIdempotencyKey,
+})
+export type InboundPromptQueueReorder = Static<typeof InboundPromptQueueReorder>
+
+export const InboundPromptQueueInterject = Type.Object({
+  type: Type.Literal('inbound.prompt_queue.interject'),
+  peer: Peer,
+  agentId: PromptQueueAgentId,
+  itemId: PromptQueueItemId,
+  mode: Type.Union([Type.Literal('insert_current'), Type.Literal('interrupt_then_head')]),
+  expectedVersion: PromptQueueVersion,
+  expectedTurnId: PromptQueuePlatformTurnId,
+  idempotencyKey: PromptQueueIdempotencyKey,
+})
+export type InboundPromptQueueInterject = Static<typeof InboundPromptQueueInterject>
+
+export const PromptQueueMutationFrame = Type.Union([
+  InboundPromptQueueEnqueue,
+  InboundPromptQueueEdit,
+  InboundPromptQueueDelete,
+  InboundPromptQueueReorder,
+  InboundPromptQueueInterject,
+])
+export type PromptQueueMutationFrame = Static<typeof PromptQueueMutationFrame>
+
 export const InboundFrame = Type.Union([
   InboundMessage,
   InboundControlStop,
   InboundPermissionResponse,
   InboundGoalSync,
+  PromptQueueMutationFrame,
 ])
 export type InboundFrame = Static<typeof InboundFrame>
 
@@ -452,6 +692,10 @@ export const OutboundMessage = Type.Object({
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
+  /** Exact browser-authored user row that owns this turn.  Every streamed
+   * frame carries it so reconnects, delayed finals and errors cannot tear
+   * down a newer turn that happens to reuse the same peer/session. */
+  clientMessageId: Type.Optional(ClientMessageId),
   blocks: Type.Array(OutboundContentBlock),
   isFinal: Type.Boolean(),
   // v5 图片体验 — gateway「免模型直投」的图片编辑 / outpaint 交付终帧回带触发它的
@@ -597,6 +841,8 @@ export const OutboundError = Type.Object({
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
+  /** Same turn identity as the companion outbound.message final. */
+  clientMessageId: Type.Optional(ClientMessageId),
   /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。 */
   code: Type.Union([
     Type.Literal('insufficient_credits'),
@@ -850,6 +1096,7 @@ export type ControlFrame = Static<typeof ControlFrame>
 export const AnyFrame = Type.Union([
   InboundMessage,
   InboundPermissionResponse,
+  PromptQueueMutationFrame,
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundPermissionSettled,
@@ -858,6 +1105,7 @@ export const AnyFrame = Type.Union([
   OutboundError,
   OutboundCodexBilling,
   OutboundTurnStatus,
+  PromptQueueSnapshot,
   SysContextRebuilt,
   SysIncident,
   SysGoalSnapshot,

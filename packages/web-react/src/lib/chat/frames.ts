@@ -21,9 +21,14 @@ import type {
   InboundControlStop,
   InboundMessage,
   InboundPermissionResponse,
+  InboundPromptQueueDelete,
+  InboundPromptQueueEdit,
+  InboundPromptQueueEnqueue,
+  InboundPromptQueueInterject,
+  InboundPromptQueueReorder,
   MediaRef,
-  OutboundContentBlock,
   OutboundActiveTurnReplayStart,
+  OutboundContentBlock,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
@@ -31,10 +36,22 @@ import type {
   OutboundResumeFailed,
   OutboundTurnStatus,
   Peer,
+  PromptQueueMutationFrame,
+  PromptQueueSnapshot,
 } from "@openclaude/protocol/frames";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 
-export type { MediaRef, OutboundContentBlock, Peer };
+export type {
+  InboundPromptQueueDelete,
+  InboundPromptQueueEdit,
+  InboundPromptQueueEnqueue,
+  InboundPromptQueueInterject,
+  InboundPromptQueueReorder,
+  MediaRef,
+  OutboundContentBlock,
+  Peer,
+  PromptQueueSnapshot,
+};
 
 // ─── runtime-augmented 公共片段 ──────────────────────────────────────
 /**
@@ -87,6 +104,7 @@ export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 export type LegacyBridgeErrorWire = {
   type: "error";
   peer?: Peer;
+  clientMessageId?: string;
   code?: string;
   message?: string;
   traceId?: string;
@@ -169,6 +187,8 @@ export type AckWire = {
   type: "outbound.ack";
   deduplicated?: boolean;
   idempotencyKey?: string;
+  peer?: Peer;
+  clientMessageId?: string;
 };
 
 /** keepalive pong（按 id 匹配，先于一切 session handler 处理）。*/
@@ -209,6 +229,7 @@ export type OutboundWire =
   | OutboundResumeFailedWire
   | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
+  | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire
   | CostWaivedWire
@@ -267,6 +288,7 @@ export type InboundWire =
   | InboundMessage
   | InboundControlStop
   | InboundPermissionResponse
+  | PromptQueueMutationFrame
   | InboundHelloWire
   | InboundPingWire
   | InboundRepoBindWire

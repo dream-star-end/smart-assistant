@@ -10,7 +10,8 @@ import { skillContentHash } from '@openclaude/storage'
 
 import { canonicalBytes } from '../connectors/spec/canonical.js'
 import { getPool } from '../db/index.js'
-import { query } from '../db/queries.js'
+import { query, tx } from '../db/queries.js'
+import { lockMarketplaceListing, lockMarketplaceVersion } from './locking.js'
 import {
   COMPILED_KNOWLEDGE_PLANET_PLUGIN,
   KNOWLEDGE_PLANET_PLUGIN_ARTIFACT,
@@ -21,6 +22,11 @@ import {
   approveOfficialRuntimePluginVersion,
   loadVerifiedRuntimePluginContract,
 } from '../plugins/review.js'
+import type { PluginLeaseRedis } from '../plugins/accountLease.js'
+import {
+  OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+  transitionOfficialManagedBrowserPluginVersion,
+} from '../plugins/officialManagedBrowserTransition.js'
 import {
   MarketplaceError,
   installApprovedVersion,
@@ -32,9 +38,14 @@ import { scanSkillArtifact } from './skillScanner.js'
 const LEGACY_KNOWLEDGE_PLANET_SKILL = 'zsxq-persistent-connector'
 const OFFICIAL_NAME = '知识星球'
 const OFFICIAL_DESCRIPTION =
-  '安全读取已授权知识星球的星球、主题与评论；账号凭据加密保存，执行时使用隔离的只读受管浏览器。'
-const OFFICIAL_TAGS = ['知识星球', '社群内容', '只读插件']
-const OFFICIAL_USE_CASES = ['查看已加入的知识星球', '读取星球主题与评论', '在指定星球内搜索内容']
+  '安全读取已授权知识星球的星球、主题、评论、动态、标签、专栏与打卡内容；扫码后自动启用，账号状态加密保存，执行时使用隔离的只读受管浏览器。'
+const OFFICIAL_TAGS = ['知识星球', '社群内容', '知识检索', '只读插件']
+const OFFICIAL_USE_CASES = [
+  '查看已加入的知识星球与未读数量',
+  '读取、筛选或搜索主题与评论',
+  '汇总跨星球动态、标签和专栏内容',
+  '读取打卡项目及其主题',
+]
 
 export interface SeedKnowledgePlanetPluginResult {
   ownerUserId: number
@@ -42,6 +53,9 @@ export interface SeedKnowledgePlanetPluginResult {
   published: boolean
   migratedUsers: number
   skippedExistingUsers: number
+  migratedPluginInstalls: number
+  migratedPluginAccounts: number
+  retiredLegacyListing: boolean
 }
 
 async function resolveInitialOfficialOwner(): Promise<number> {
@@ -64,13 +78,16 @@ interface LocatedOfficialVersion {
   kind: string
   plugin_type: string | null
   listing_state: string
+  revoked_reason: string | null
+  current_approved_version_id: string | null
 }
 
 async function locateVersion(): Promise<LocatedOfficialVersion | null> {
   const row = await query<LocatedOfficialVersion>(
     `SELECT v.id::text, l.owner_user_id::text, v.submitted_by::text,
             v.status, v.ai_review_state, v.review_source,
-            l.kind, l.plugin_type, l.state AS listing_state
+            l.kind, l.plugin_type, l.state AS listing_state, l.revoked_reason,
+            l.current_approved_version_id::text
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.slug = $1 AND v.version = $2
@@ -123,7 +140,7 @@ async function resolveRecordedListingOwner(env: NodeJS.ProcessEnv): Promise<numb
     ownerUserId <= 0 ||
     listing.kind !== 'connector' ||
     listing.plugin_type !== 'managed-browser' ||
-    listing.listing_state === 'revoked' ||
+    !['active', 'unlisted'].includes(listing.listing_state) ||
     !listing.version_id ||
     listing.version_status !== 'approved' ||
     listing.review_source !== 'platform'
@@ -131,6 +148,9 @@ async function resolveRecordedListingOwner(env: NodeJS.ProcessEnv): Promise<numb
     throw new Error('Knowledge Planet Plugin slug is not a trusted platform listing')
   const verified = await loadVerifiedRuntimePluginContract(Number(listing.version_id), getPool(), {
     env,
+    // Deploy closes the current version before publishing its replacement. This
+    // is an internal exact-version trust read, not a public catalog/runtime read.
+    allowUnlisted: true,
   }).catch(() => null)
   if (
     !verified ||
@@ -157,6 +177,7 @@ export async function findApprovedKnowledgePlanetPlugin(
   const row = await locateVersion()
   if (!row) return null
   if (row.status !== 'approved' || row.review_source !== 'platform') return null
+  if (row.current_approved_version_id !== row.id) return null
   const verified = await loadVerifiedRuntimePluginContract(Number(row.id), getPool(), {
     env,
   }).catch(() => null)
@@ -172,24 +193,60 @@ export async function findApprovedKnowledgePlanetPlugin(
   return { versionId: row.id, ownerUserId }
 }
 
+/**
+ * Deploy-only exact approval lookup used while the global listing gate is
+ * intentionally closed. Public catalog/runtime callers must keep using the
+ * active-only lookup above.
+ */
+export async function findApprovedKnowledgePlanetPluginForDeploy(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ versionId: string; ownerUserId: number } | null> {
+  const row = await locateVersion()
+  if (!row) return null
+  if (
+    row.status !== 'approved' ||
+    row.review_source !== 'platform' ||
+    row.current_approved_version_id !== row.id ||
+    !(
+      row.listing_state === 'active' ||
+      (row.listing_state === 'unlisted' &&
+        row.revoked_reason === OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON)
+    )
+  )
+    return null
+  const verified = await loadVerifiedRuntimePluginContract(Number(row.id), getPool(), {
+    env,
+    allowUnlisted: true,
+  })
+  if (
+    verified.pluginType !== 'managed-browser' ||
+    verified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG ||
+    verified.artifactHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash ||
+    verified.execContractHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash
+  )
+    throw new Error('Knowledge Planet Plugin deploy approval trust mismatch')
+  return { versionId: row.id, ownerUserId: ownerFromLocatedVersion(row) }
+}
+
 async function migrateLegacySkillInstalls(versionId: string): Promise<{
   migrated: number
   skippedExisting: number
 }> {
+  // 任意历史 Plugin 安装记录都代表迁移已发生；soft-uninstall 是用户意图，后续 deploy seed
+  // 不得因旧 Skill 仍 active 而静默恢复。用户仍可从市场显式重装同一版本。
   const rows = await query<{
     user_id: string
     agent_ids: unknown
     install_source: string
     installed_by: string
-    already_installed: boolean
+    already_migrated: boolean
   }>(
     `SELECT old.user_id::text, old.agent_ids, old.install_source,
             old.installed_by::text,
             EXISTS (
               SELECT 1 FROM marketplace_installs current
                WHERE current.user_id = old.user_id AND current.slug = $2
-                 AND current.uninstalled_at IS NULL
-            ) AS already_installed
+            ) AS already_migrated
        FROM marketplace_installs old
        JOIN marketplace_skill_listings legacy
          ON legacy.slug = old.slug AND legacy.kind = 'skill'
@@ -200,7 +257,7 @@ async function migrateLegacySkillInstalls(versionId: string): Promise<{
   let migrated = 0
   let skippedExisting = 0
   for (const row of rows.rows) {
-    if (row.already_installed) {
+    if (row.already_migrated) {
       skippedExisting++
       continue
     }
@@ -226,11 +283,88 @@ async function migrateLegacySkillInstalls(versionId: string): Promise<{
   return { migrated, skippedExisting }
 }
 
+/**
+ * Retire the legacy self-hosted Skill as the last migration step. Historical
+ * installs and audit rows are retained, but the duplicate market entry and its
+ * self-host/write-capable instructions can no longer be newly installed or fed
+ * to Agents. The final listing lock closes the install race: if a personal
+ * install appeared after the migration census, retirement fails and the next
+ * idempotent seed migrates it before retrying. Org Skill installs cannot be
+ * represented by the per-user managed-browser Plugin and therefore fail closed
+ * instead of silently removing an org capability.
+ */
+async function retireLegacyKnowledgePlanetSkillListing(): Promise<boolean> {
+  const pool = getPool()
+  return tx(async (client) => {
+    const located = await client.query<{ version_id: string | null }>(
+      `SELECT current_approved_version_id::text AS version_id
+         FROM marketplace_skill_listings WHERE slug = $1`,
+      [LEGACY_KNOWLEDGE_PLANET_SKILL],
+    )
+    const versionId = located.rows[0]?.version_id ?? null
+    if (!versionId) return false
+    const version = await lockMarketplaceVersion(client, versionId)
+    const listing = await lockMarketplaceListing(client, LEGACY_KNOWLEDGE_PLANET_SKILL)
+    if (
+      !version ||
+      !listing ||
+      version.slug !== LEGACY_KNOWLEDGE_PLANET_SKILL ||
+      listing.currentApprovedVersionId !== version.id ||
+      listing.kind !== 'skill' ||
+      listing.pluginType !== null ||
+      version.status !== 'approved' ||
+      version.submittedBy !== listing.ownerUserId
+    )
+      throw new Error('legacy Knowledge Planet Skill retirement trust mismatch')
+    if (listing.state === 'unlisted' || listing.state === 'revoked') return false
+    if (listing.state !== 'active')
+      throw new Error('legacy Knowledge Planet Skill is in an unexpected listing state')
+
+    const blockers = await client.query<{
+      personal_without_plugin: string
+      active_org_installs: string
+    }>(
+      `SELECT
+         (SELECT count(*)::text
+            FROM marketplace_installs legacy
+           WHERE legacy.slug = $1 AND legacy.uninstalled_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM marketplace_installs plugin
+                WHERE plugin.user_id = legacy.user_id AND plugin.slug = $2
+             )) AS personal_without_plugin,
+         (SELECT count(*)::text
+            FROM org_installs legacy_org
+           WHERE legacy_org.slug = $1 AND legacy_org.uninstalled_at IS NULL
+         ) AS active_org_installs`,
+      [LEGACY_KNOWLEDGE_PLANET_SKILL, KNOWLEDGE_PLANET_PLUGIN_SLUG],
+    )
+    const blocker = blockers.rows[0]
+    if (blocker?.personal_without_plugin !== '0')
+      throw new Error('legacy Knowledge Planet Skill still has unmigrated personal installs')
+    if (blocker?.active_org_installs !== '0')
+      throw new Error('legacy Knowledge Planet Skill still has active org installs')
+
+    const retired = await client.query(
+      `UPDATE marketplace_skill_listings
+          SET state = 'unlisted',
+              revoked_reason = 'migrated to official knowledge-planet Plugin',
+              updated_at = NOW()
+        WHERE slug = $1 AND state = 'active'
+          AND current_approved_version_id = $2::bigint`,
+      [LEGACY_KNOWLEDGE_PLANET_SKILL, versionId],
+    )
+    if (retired.rowCount !== 1)
+      throw new Error('legacy Knowledge Planet Skill retirement CAS failed')
+    return true
+  }, pool)
+}
+
 export async function seedKnowledgePlanetPlugin(input: {
-  /** The deploy gate sets this only after exercising the exact image and QR flow. */
+  /** The deploy gate sets this only after exact-image QR and authenticated action verification. */
   functionalVerified: true
   ownerUserId?: number
   env?: NodeJS.ProcessEnv
+  leaseRedis?: PluginLeaseRedis | null
   migrateLegacyInstalls?: boolean
 }): Promise<SeedKnowledgePlanetPluginResult> {
   if (input.functionalVerified !== true)
@@ -282,11 +416,12 @@ export async function seedKnowledgePlanetPlugin(input: {
         category: 'daily-tools',
         useCases: OFFICIAL_USE_CASES,
         outcomeExamples: [
-          '列出账号已加入的星球，并以结构化结果供 Agent 继续处理',
-          '按星球读取或搜索主题，再读取指定主题的评论',
+          '列出账号已加入的星球和未读数，并以结构化结果供 Agent 继续处理',
+          '按星球、标签、专栏或打卡项目读取主题，再读取指定主题的正文与评论',
+          '汇总所有星球的最近动态并继续做检索、归纳或内容分析',
         ],
         humanMd:
-          '平台官方只读 Plugin。授权时使用微信扫码；账号状态加密保存，调用仅允许访问签名契约内的知识星球读取接口。',
+          '平台官方只读 Plugin。安装后会自动进入微信扫码授权；扫码成功后自动启用。账号状态加密保存，调用仅允许访问签名契约内的知识星球读取接口，不支持发布、评论、点赞或删除。',
         queueAiReview: false,
       })
       located = await locateVersion()
@@ -310,8 +445,19 @@ export async function seedKnowledgePlanetPlugin(input: {
     ownerUserId,
     expectedArtifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
     functionalVerified: true,
+    activateListing: false,
     env,
     pool: getPool(),
+  })
+  const versionTransition = await transitionOfficialManagedBrowserPluginVersion({
+    slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+    targetVersionId: located.id,
+    expectedArtifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+    expectedExecContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
+    ownerUserId,
+    env,
+    pool: getPool(),
+    redis: input.leaseRedis,
   })
   const trusted = await findApprovedKnowledgePlanetPlugin(env)
   if (!trusted || trusted.versionId !== located.id || trusted.ownerUserId !== ownerUserId)
@@ -321,11 +467,18 @@ export async function seedKnowledgePlanetPlugin(input: {
     input.migrateLegacyInstalls === false
       ? { migrated: 0, skippedExisting: 0 }
       : await migrateLegacySkillInstalls(located.id)
+  const retiredLegacyListing =
+    input.migrateLegacyInstalls === false
+      ? false
+      : await retireLegacyKnowledgePlanetSkillListing()
   return {
     ownerUserId,
     versionId: located.id,
     published,
     migratedUsers: migration.migrated,
     skippedExistingUsers: migration.skippedExisting,
+    migratedPluginInstalls: versionTransition.migratedInstalls,
+    migratedPluginAccounts: versionTransition.migratedAccounts,
+    retiredLegacyListing,
   }
 }

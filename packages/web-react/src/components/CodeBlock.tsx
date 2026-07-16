@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { useRef, useState, type ReactNode } from "react";
+import { type ReactNode, useRef, useState } from "react";
 
 export function CodeBlock({ language, children }: { language?: string; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
@@ -21,8 +21,9 @@ export function CodeBlock({ language, children }: { language?: string; children:
       <div className="flex items-center justify-between border-b border-border px-3.5 py-1.5">
         <span className="font-mono text-xs text-faint">{language || "code"}</span>
         <button
+          type="button"
           onClick={copy}
-          className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-hover hover:text-fg"
+          className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
         >
           {copied ? <Check size={13} /> : <Copy size={13} />}
           {copied ? "已复制" : "复制"}

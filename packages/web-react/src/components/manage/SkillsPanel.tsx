@@ -4,7 +4,7 @@ import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, MarketplaceMyAgent, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { AgentScopeSummary } from "../AgentScopePicker";
-import { Alert, Badge, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
+import { Alert, Badge, Button, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
 import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
 import { SKILL_RUN_MODEL, SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
 import { SkillEditor } from "./SkillEditor";
@@ -92,7 +92,14 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
       {err && (
         <div className="px-5 pb-2">
           <Alert tone="danger" className="text-[12.5px]">
-            {err}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="min-w-0 flex-1">{err}</span>
+              {skills === null && (
+                <Button size="sm" variant="secondary" onClick={() => setReload((n) => n + 1)}>
+                  重试
+                </Button>
+              )}
+            </div>
           </Alert>
         </div>
       )}
@@ -100,7 +107,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
         <div className="flex items-center justify-center gap-2 py-12 text-[13px] text-faint">
           <Spinner /> 加载技能…
         </div>
-      ) : !skills || skills.length === 0 ? (
+      ) : err && skills === null ? null : !skills || skills.length === 0 ? (
         <EmptyState
           icon={Sparkles}
           title="还没有技能"

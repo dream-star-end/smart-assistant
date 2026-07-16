@@ -41,6 +41,7 @@
 
 import type { Pool, PoolClient } from "pg";
 import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import {
   LOSSLESS_TURN_TAPE_SHA256_RE,
   type DurableCodexBilling,
@@ -477,6 +478,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "goal_id", "uuid"],
   ["client_session_turn_tapes", "goal_state_revision", "bigint"],
   ["client_session_turn_tapes", "goal_tokens_used", "bigint"],
+  ["client_session_turn_tapes", "record_storage_format", "smallint"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
@@ -545,7 +547,9 @@ function tapeAnchor(
   billingRecord: LosslessTurnRecord,
   tapeId: string,
   tapeSha256: string,
-  recordCount: number,
+  physicalRecordCount: number,
+  logicalRecordCount: number,
+  runtimeBatchManifestSha256: string | undefined,
   structuredRoles: string[],
 ): MessageLike & { id: string } {
   return {
@@ -558,7 +562,13 @@ function tapeAnchor(
     _turnTapeId: tapeId,
     _turnTapeSha256: tapeSha256,
     _turnTapeComplete: true,
-    _turnTapeRecordCount: recordCount,
+    // _turnTapeRecordCount remains the rolling-compatible physical DB count.
+    _turnTapeRecordCount: physicalRecordCount,
+    _turnTapePhysicalRecordCount: physicalRecordCount,
+    _turnTapeLogicalRecordCount: logicalRecordCount,
+    ...(runtimeBatchManifestSha256
+      ? { _turnTapeRuntimeManifestSha256: runtimeBatchManifestSha256 }
+      : {}),
     ...(structuredRoles.length > 0 ? { _turnTapeStructuredRoles: structuredRoles } : {}),
   };
 }
@@ -636,6 +646,133 @@ function hydrateTapeRecord(
         Object.keys(exactDelegateUsage).length > 0
       ? { usage: { ...recordUsage, ...anchorUsage, ...exactCostUsage, ...exactDelegateUsage } }
       : {}),
+  };
+}
+
+type HydratedRuntimeBatchDescriptor = {
+  batchId: string;
+  logicalCount: number;
+  manifestSha256: string;
+};
+
+function expandHydratedRuntimeBatch(
+  hydrated: MessageLike,
+  row: HydratedTapeRow,
+  anchor: MessageLike,
+): { messages: MessageLike[]; descriptor?: HydratedRuntimeBatchDescriptor } {
+  const rawBatch = hydrated._runtimeEventBatch;
+  if (rawBatch === undefined) return { messages: [hydrated] };
+  if (!rawBatch || typeof rawBatch !== "object" || Array.isArray(rawBatch)) {
+    throw new Error(`[pgSessions] lossless runtime batch malformed: ${row.tape_id}\0${row.msg_id}`);
+  }
+  const batch = rawBatch as Record<string, unknown>;
+  const manifest = batch.manifest;
+  const logicalCount = batch.logicalCount;
+  const uncompressedBytes = batch.uncompressedBytes;
+  const compressedBytes = batch.compressedBytes;
+  const manifestSha256 = batch.manifestSha256;
+  const data = batch.data;
+  if (
+    batch.version !== 1 ||
+    batch.encoding !== "gzip+base64" ||
+    !Array.isArray(manifest) ||
+    typeof logicalCount !== "number" || !Number.isSafeInteger(logicalCount) || logicalCount < 1 ||
+    manifest.length !== logicalCount ||
+    typeof uncompressedBytes !== "number" || !Number.isSafeInteger(uncompressedBytes) || uncompressedBytes < 0 ||
+    typeof compressedBytes !== "number" || !Number.isSafeInteger(compressedBytes) || compressedBytes < 0 ||
+    typeof manifestSha256 !== "string" || !LOSSLESS_TURN_TAPE_SHA256_RE.test(manifestSha256) ||
+    typeof data !== "string" || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)
+  ) {
+    throw new Error(`[pgSessions] lossless runtime batch header invalid: ${row.tape_id}\0${row.msg_id}`);
+  }
+  if (sha256Bytes(Buffer.from(JSON.stringify(manifest), "utf8")) !== manifestSha256) {
+    throw new Error(`[pgSessions] lossless runtime batch manifest hash mismatch: ${row.tape_id}\0${row.msg_id}`);
+  }
+  const compressed = Buffer.from(data, "base64");
+  if (compressed.length !== compressedBytes) {
+    throw new Error(`[pgSessions] lossless runtime batch compressed length mismatch: ${row.tape_id}\0${row.msg_id}`);
+  }
+  let raw: Buffer;
+  try {
+    raw = gunzipSync(compressed);
+  } catch (err) {
+    throw new Error(
+      `[pgSessions] lossless runtime batch gzip invalid: ${row.tape_id}\0${row.msg_id}: ${(err as Error).message}`,
+    );
+  }
+  if (raw.length !== uncompressedBytes) {
+    throw new Error(`[pgSessions] lossless runtime batch raw length mismatch: ${row.tape_id}\0${row.msg_id}`);
+  }
+
+  const messages: MessageLike[] = [];
+  let expectedOffset = 0;
+  for (let index = 0; index < manifest.length; index++) {
+    const value = manifest[index];
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`[pgSessions] lossless runtime batch manifest entry invalid: ${row.tape_id}\0${row.msg_id}\0${index}`);
+    }
+    const entry = value as Record<string, unknown>;
+    const id = entry.id;
+    const eventOrdinal = entry.eventOrdinal;
+    const ts = entry.ts;
+    const source = entry.source;
+    const offset = entry.offset;
+    const length = entry.length;
+    const payloadSha256 = entry.payloadSha256;
+    if (
+      typeof id !== "string" || id.length === 0 ||
+      typeof eventOrdinal !== "number" || !Number.isSafeInteger(eventOrdinal) || eventOrdinal < 0 ||
+      typeof ts !== "number" || !Number.isSafeInteger(ts) || ts < 0 ||
+      (source !== "ccb" && source !== "codex-jsonrpc" && source !== "gateway") ||
+      typeof offset !== "number" || !Number.isSafeInteger(offset) || offset !== expectedOffset ||
+      typeof length !== "number" || !Number.isSafeInteger(length) || length < 0 ||
+      typeof payloadSha256 !== "string" || !LOSSLESS_TURN_TAPE_SHA256_RE.test(payloadSha256) ||
+      offset + length > raw.length
+    ) {
+      throw new Error(`[pgSessions] lossless runtime batch manifest entry invalid: ${row.tape_id}\0${row.msg_id}\0${index}`);
+    }
+    const payloadBytes = raw.subarray(offset, offset + length);
+    expectedOffset += length;
+    if (sha256Bytes(payloadBytes) !== payloadSha256) {
+      throw new Error(`[pgSessions] lossless runtime batch record hash mismatch: ${row.tape_id}\0${id}`);
+    }
+    let payload: MessageLike;
+    try {
+      const parsed = JSON.parse(payloadBytes.toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      payload = parsed as MessageLike;
+    } catch (err) {
+      throw new Error(
+        `[pgSessions] lossless runtime batch record malformed: ${row.tape_id}\0${id}: ${(err as Error).message}`,
+      );
+    }
+    if (
+      payload.id !== id || payload.role !== "runtime-event" || payload.ts !== ts ||
+      payload._ocEventOrdinal !== eventOrdinal || payload._runtimeSource !== source
+    ) {
+      throw new Error(`[pgSessions] lossless runtime batch record identity mismatch: ${row.tape_id}\0${id}`);
+    }
+    messages.push({
+      ...payload,
+      _source: "server",
+      _turnTapeId: row.tape_id,
+      _turnTapeMsgId: id,
+      _turnTapePhysicalMsgId: row.msg_id,
+      _turnTapeSha256: row.tape_sha256,
+      _turnTapeExpanded: true,
+      ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+    });
+  }
+  if (expectedOffset !== raw.length) {
+    throw new Error(`[pgSessions] lossless runtime batch manifest coverage mismatch: ${row.tape_id}\0${row.msg_id}`);
+  }
+  const batchUsage = hydrated.usage && typeof hydrated.usage === "object"
+    ? hydrated.usage
+    : undefined;
+  if (batchUsage && messages.length > 0) messages.at(-1)!.usage = batchUsage;
+  return {
+    messages,
+    descriptor: { batchId: row.msg_id, logicalCount, manifestSha256 },
   };
 }
 
@@ -874,6 +1011,7 @@ async function hydrateTurnTapeMessages(
         throw new Error(`[pgSessions] lossless turn tape records missing: ${anchor._turnTapeId}`);
       }
       const expectedCount = anchor._turnTapeRecordCount;
+      const expectedPhysicalCount = anchor._turnTapePhysicalRecordCount;
       const projectedMeta = counts.get(anchor._turnTapeId);
       const actualCount = exact ? tapeRows?.length : projectedMeta?.count;
       if (
@@ -883,6 +1021,14 @@ async function hydrateTurnTapeMessages(
         actualCount !== expectedCount
       ) {
         throw new Error(`[pgSessions] lossless turn tape record count mismatch: ${anchor._turnTapeId}`);
+      }
+      if (
+        expectedPhysicalCount !== undefined &&
+        (typeof expectedPhysicalCount !== "number" ||
+          !Number.isSafeInteger(expectedPhysicalCount) ||
+          expectedPhysicalCount !== expectedCount)
+      ) {
+        throw new Error(`[pgSessions] lossless turn tape physical count mismatch: ${anchor._turnTapeId}`);
       }
       if (tapeRows?.some((row) => row.tape_sha256 !== anchor._turnTapeSha256)) {
         throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
@@ -899,7 +1045,42 @@ async function hydrateTurnTapeMessages(
           _turnTapeExpanded: true,
         }];
       }
-      return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false));
+      if (!exact) return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false));
+      const expanded: MessageLike[] = [];
+      const batchDescriptors: HydratedRuntimeBatchDescriptor[] = [];
+      for (const row of tapeRows) {
+        const result = expandHydratedRuntimeBatch(
+          hydrateTapeRecord(row, anchor, false),
+          row,
+          anchor,
+        );
+        expanded.push(...result.messages);
+        if (result.descriptor) batchDescriptors.push(result.descriptor);
+      }
+      const expectedLogicalCount = anchor._turnTapeLogicalRecordCount;
+      if (
+        expectedLogicalCount !== undefined &&
+        (typeof expectedLogicalCount !== "number" ||
+          !Number.isSafeInteger(expectedLogicalCount) ||
+          expectedLogicalCount <= 0 ||
+          expanded.length !== expectedLogicalCount)
+      ) {
+        throw new Error(`[pgSessions] lossless turn tape logical count mismatch: ${anchor._turnTapeId}`);
+      }
+      const expectedManifestSha = anchor._turnTapeRuntimeManifestSha256;
+      if (expectedManifestSha !== undefined) {
+        if (
+          typeof expectedManifestSha !== "string" ||
+          !LOSSLESS_TURN_TAPE_SHA256_RE.test(expectedManifestSha) ||
+          batchDescriptors.length === 0 ||
+          sha256Bytes(Buffer.from(JSON.stringify(batchDescriptors), "utf8")) !== expectedManifestSha
+        ) {
+          throw new Error(`[pgSessions] lossless turn tape runtime manifest mismatch: ${anchor._turnTapeId}`);
+        }
+      } else if (batchDescriptors.length > 0) {
+        throw new Error(`[pgSessions] lossless turn tape runtime manifest missing: ${anchor._turnTapeId}`);
+      }
+      return expanded;
     }
 
     // Rolling compatibility with any per-record refs staged by an earlier
@@ -1302,6 +1483,8 @@ export function createPgSessionsBackend(
             request.tapeId,
             request.tapeSha256,
             turn.records.length,
+            turn.logicalRecordCount,
+            turn.runtimeBatchManifestSha256,
             [...new Set(turn.records
               .map((item) => item.role)
               .filter((role) => role === "plan" || role === "goal"))],
@@ -1320,10 +1503,14 @@ export function createPgSessionsBackend(
         } catch {
           throw new Error("lossless turn tape target session row malformed");
         }
+        const allRecordIds = [...new Set([
+          ...turn.logicalRecordIds,
+          ...turn.records.map((item) => item.id),
+        ])];
         const archived = await client.query<{ msg_id: string }>(
           `SELECT msg_id FROM client_session_archived_ids
             WHERE session_id=$1 AND msg_id = ANY($2::text[])`,
-          [request.sessionId, turn.records.map((item) => item.id)],
+          [request.sessionId, allRecordIds],
         );
         if (archived.rows.length > 0) throw new Error("lossless turn tape record id collides with archived row");
         // Rolling v1→v2 replay: an old runtime may have committed the same
@@ -1333,7 +1520,7 @@ export function createPgSessionsBackend(
         // would make hydration return duplicate paid records. Archived
         // collisions stay fail-closed above because rewriting archive chunks
         // is not part of this atomic finalize operation.
-        const recordIds = new Set(turn.records.map((item) => item.id));
+        const recordIds = new Set(allRecordIds);
         existingMessages = existingMessages.filter(
           (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
         );
@@ -1423,15 +1610,16 @@ export function createPgSessionsBackend(
         await client.query(
           `UPDATE client_session_turn_tapes
               SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
-                  engine_billings=$4, finalized_at=$5,goal_id=$6::uuid,
-                  goal_state_revision=$7,goal_tokens_used=$8
-            WHERE session_id=$9 AND user_id=$10 AND tape_id=$11`,
+                  engine_billings=$4, finalized_at=$5, record_storage_format=$6,
+                  goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9
+            WHERE session_id=$10 AND user_id=$11 AND tape_id=$12`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
             turn.payload.parentTurnKey ?? null,
             JSON.stringify(turn.engineBillings),
             Date.now(),
+            turn.runtimeBatchManifestSha256 ? 3 : 2,
             turn.payload.goalId ?? null,
             turn.payload.goalStateRevision ?? null,
             goalTokensUsed,

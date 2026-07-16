@@ -242,7 +242,7 @@ export function DetailModal({
   onInstalled: () => void
   /** AI 导购(批3):「在对话中试用」——关市场 → 新会话 → 预填安装+上手示例;缺省不渲染。 */
   onAskAiInChat?: (text: string) => void
-  onOpenConnectors?: () => void
+  onOpenConnectors?: (pluginSlug?: string) => void
 }) {
   const [detail, setDetail] = useState<MarketplaceDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -324,6 +324,8 @@ export function DetailModal({
       setInstallResult(result)
       setDone(true)
       onInstalled()
+      if (result.needsAuthorization.includes('knowledge-planet'))
+        onOpenConnectors?.('knowledge-planet')
     } catch (e) {
       setErr(apiErrorMessage(e, '安装失败'))
     } finally {
@@ -348,12 +350,13 @@ export function DetailModal({
 
   const warns = friendlyRiskFlags(detail?.riskFlags)
   const isPreset = !!detail?.preset
-  const isOfficialConnector = detail?.kind === 'connector' && !!detail.official
+  const isPreinstalledConnector = detail?.kind === 'connector' && !!detail.preinstalled
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
-  // 预设不走安装/更新语义(恒为最新上架版本,开箱即用)。
+  // 预设/预装不走安装/更新语义(恒为最新上架版本,开箱即用)。官方身份本身不阻断安装：
+  // 知识星球等官方 Plugin 仍需要用户显式安装。
   const versionUpdateAvailable =
     !isPreset &&
-    !isOfficialConnector &&
+    !isPreinstalledConnector &&
     !!installed &&
     !!detail &&
     installed.versionId !== detail.versionId
@@ -405,14 +408,14 @@ export function DetailModal({
                 在对话中试用
               </Button>
             )}
-            {isPreset || isOfficialConnector ? (
+            {isPreset || isPreinstalledConnector ? (
               <>
                 <Badge tone="success" className="self-center">
                   <ShieldCheck size={13} />
-                  {isOfficialConnector ? '官方 API 插件 · 已预装' : '平台预设 · 开箱即用'}
+                  {isPreinstalledConnector ? '官方 API 插件 · 已预装' : '平台预设 · 开箱即用'}
                 </Badge>
-                {isOfficialConnector && onOpenConnectors && (
-                  <Button variant="primary" onClick={onOpenConnectors}>
+                {isPreinstalledConnector && onOpenConnectors && (
+                  <Button variant="primary" onClick={() => onOpenConnectors()}>
                     去绑定账号
                   </Button>
                 )}
@@ -500,7 +503,7 @@ export function DetailModal({
                 </span>
                 {(detail.kind === 'connector' || (isAgent && installNeedsAuthorization)) &&
                   onOpenConnectors && (
-                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                    <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
                       {isAgent ? '管理 Plugin 账号' : '去管理中心绑定'}
                     </Button>
                   )}
@@ -535,7 +538,7 @@ export function DetailModal({
                         : '必需能力已被下架或撤销，需等待平台恢复或发布者更新。'}
                   </span>
                   {detailNeedsAuthorization && onOpenConnectors && (
-                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                    <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
                       管理 Plugin 账号
                     </Button>
                   )}
@@ -547,7 +550,7 @@ export function DetailModal({
               无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
             </Alert>
           )}
-          {isOfficialConnector && (
+          {isPreinstalledConnector && (
             <Alert tone="info" title="官方预装 API 插件">
               无需安装；可直接到管理中心绑定你的应用账号。
             </Alert>
