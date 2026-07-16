@@ -42,8 +42,14 @@ const STEP_TIMEOUTS_MS = {
 function log(msg: string): void {
   process.stdout.write(`[drill ${new Date().toISOString()}] ${msg}\n`);
 }
+/** 演练期断言失败:必须 throw(进 catch 走 emergencyCleanup),绝不 process.exit
+ *  —— exit 会跳过清理,把 auto_repair=true/firing=true 留在生产(审计 R4 BLOCKER)。 */
 function fail(msg: string): never {
-  process.stderr.write(`[drill][FAIL] ${msg}\n`);
+  throw new Error(`[drill-assert] ${msg}`);
+}
+/** 进入演练临界区(翻 policy)之前的硬退出:此时无任何生产副作用需要清理。 */
+function abort(msg: string): never {
+  process.stderr.write(`[drill][ABORT] ${msg}\n`);
   process.exit(1);
 }
 
@@ -112,9 +118,24 @@ async function emergencyCleanup(c: Client): Promise<void> {
   );
 }
 
+/** 清场后终态校验:auto_repair 与 firing 都必须已放平,否则非零退出。 */
+async function assertCleanPosture(c: Client): Promise<boolean> {
+  const r = await c.query<{ auto_repair: boolean; firing: boolean | null }>(
+    `SELECT p.auto_repair, s.firing
+       FROM incident_policies p
+       LEFT JOIN admin_alert_rule_state s ON s.rule_id = p.match_key
+      WHERE p.match_kind = 'exact' AND p.match_key = $1`,
+    [SELFHEAL_DRILL_TRANSPORT],
+  );
+  const row = r.rows[0];
+  const clean = !!row && row.auto_repair === false && row.firing !== true;
+  if (!clean) process.stderr.write(`[drill][cleanup] 终态未放平:${JSON.stringify(r.rows)}\n`);
+  return clean;
+}
+
 async function main(): Promise<void> {
   const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl) fail("DATABASE_URL 未设置(先 source /etc/openclaude/commercial-v5.env)");
+  if (!dbUrl) abort("DATABASE_URL 未设置(先 source /etc/openclaude/commercial-v5.env)");
   const c = new Client({ connectionString: dbUrl });
   await c.connect();
 
@@ -123,13 +144,27 @@ async function main(): Promise<void> {
     `SELECT pg_try_advisory_lock(hashtext($1)) AS ok`,
     [LOCK_NS],
   );
-  if (!lock.rows[0]?.ok) fail("另一个 drill 会话持锁中 —— 同一时刻只允许一场演练");
+  if (!lock.rows[0]?.ok) abort("另一个 drill 会话持锁中 —— 同一时刻只允许一场演练");
+
+  // SIGINT/SIGTERM → 清场后退出(kill -9 无法拦截,由 --cleanup 兜)。
+  let signalled = false;
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.on(sig, () => {
+      if (signalled) return;
+      signalled = true;
+      process.stderr.write(`[drill] ${sig} — 执行安全清场后退出\n`);
+      void emergencyCleanup(c)
+        .catch(() => {})
+        .finally(() => process.exit(1));
+    });
+  }
 
   if (CLEANUP) {
     log("--cleanup:执行安全清场(auto_repair=false 先行 → condition=false)");
     await emergencyCleanup(c);
+    const clean = await assertCleanPosture(c);
     await c.end();
-    return;
+    process.exit(clean ? 0 : 1);
   }
 
   try {
@@ -227,15 +262,18 @@ async function main(): Promise<void> {
     log("✓ 6/9 repair=verifying,verify_after 已冻结(模型自述 done ≠ 完成证据)");
 
     // ── 检查点 7:无用户侧副作用 ──────────────────────────────────
-    const sideEffects = await c.query<{ deliveries: string; proposals: string }>(
+    const sideEffects = await c.query<{ deliveries: string; proposals: string; inbox: string }>(
       `SELECT
          (SELECT COUNT(*) FROM incident_deliveries WHERE incident_id = $1::bigint)::text AS deliveries,
-         (SELECT COUNT(*) FROM selfheal_user_notice_proposals WHERE incident_id = $1::bigint)::text AS proposals`,
+         (SELECT COUNT(*) FROM selfheal_user_notice_proposals WHERE incident_id = $1::bigint)::text AS proposals,
+         (SELECT COUNT(*) FROM inbox_messages
+           WHERE source_type = 'incident' AND source_id = $1::bigint)::text AS inbox`,
       [incidentId],
     );
-    if (sideEffects.rows[0]?.deliveries !== "0" || sideEffects.rows[0]?.proposals !== "0")
-      fail(`出现用户侧副作用:${JSON.stringify(sideEffects.rows[0])}(drill 必须零触达)`);
-    log("✓ 7/9 零用户侧副作用(无 delivery、无 user-notice proposal)");
+    const se = sideEffects.rows[0];
+    if (se?.deliveries !== "0" || se?.proposals !== "0" || se?.inbox !== "0")
+      fail(`出现用户侧副作用:${JSON.stringify(se)}(drill 必须零触达)`);
+    log("✓ 7/9 零用户侧副作用(无 delivery、无 inbox 落信、无 user-notice proposal)");
 
     // ── 检查点 8:新鲜恢复观测(observed_at > verify_after)────────
     await pollUntil(30_000, 1_000, async () => {
