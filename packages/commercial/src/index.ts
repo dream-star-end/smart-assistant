@@ -282,6 +282,12 @@ import {
   type SkillFeedbackHandler,
 } from "./http/internalSkillFeedback.js";
 import {
+  SKILL_SHADOW_PATH,
+  isSkillShadowEnabled,
+  makeSkillShadowHandler,
+  type SkillShadowHandler,
+} from "./http/internalSkillShadow.js";
+import {
   AUTO_DREAM_POLICY_PATH,
   makeAutoDreamPolicyHandler,
   type AutoDreamPolicyHandler,
@@ -1840,6 +1846,14 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      // /internal/v3/skill-shadow — 四路 cost-free 检索旁路 + 同 turn skill_view 金标。
+      // 严格 opt-in:env 缺省时不注册路由，与容器侧 listener 的门控同源。
+      const skillShadowHandler: SkillShadowHandler | null = isSkillShadowEnabled()
+        ? makeSkillShadowHandler({
+            identityRepo,
+            queryRunner: getPool(),
+          })
+        : null;
       // /internal/v3/marketplace/skill-feedback — 容器 gateway 起技能训练前拉「该用户对该技能
       // 差评过的真实场景引用」(只回 sessionKey/traceId/at,内容主权不出容器)。user_id 由
       // verifyContainerIdentity 推导。**无条件注册**:纯只读端点,无数据时返 {refs:[],total:0};
@@ -2053,6 +2067,9 @@ export async function registerCommercial(
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);
+        }
+        if (skillShadowHandler && path === SKILL_SHADOW_PATH) {
+          return skillShadowHandler(req, res, ctx);
         }
         if (path === SKILL_FEEDBACK_PATH) {
           return skillFeedbackHandler(req, res, ctx);

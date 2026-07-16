@@ -72,6 +72,7 @@ import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
+import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
 import {
   removeCodexContainerAuthDir,
@@ -2463,6 +2464,11 @@ export async function provisionV3Container(
         ? "OC_MARKET_SKILL_USAGE=0"
         : "OC_MARKET_SKILL_USAGE=1",
     );
+
+    // 技能检索 shadow 严格 opt-in:master env 缺省/非法/0 时不向容器注入任何键，
+    // gateway 因而连 tool.called listener 都不注册。只透传已校验的 (0,1] 数字，
+    // 避免任意 env 文本进入 docker Env；`default`/`true` 在 master 侧归一为 0.1。
+    env.push(...skillShadowContainerEnv(process.env));
 
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。

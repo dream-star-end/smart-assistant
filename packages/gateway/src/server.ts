@@ -228,6 +228,10 @@ import {
   startSkillUsageReporter,
   type SkillFeedbackRef,
 } from './skillUsageReporter.js'
+import {
+  startSkillShadowReporter,
+  type SkillShadowReporter,
+} from './skillShadowReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import {
   AuthorityRejected,
@@ -1369,6 +1373,7 @@ export class Gateway {
   /** Commercial tool telemetry stays subscribed through session drain, then
    *  fsyncs its final aggregate batch before the process may exit. */
   private _toolFailureReporter: ToolFailureReporter | null = null
+  private _skillShadowReporter: SkillShadowReporter | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
   /** Host-controlled stale-image barrier: covers dispatch preprocessing. */
@@ -2113,6 +2118,13 @@ export class Gateway {
       resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
     })
 
+    // Retrieval quality shadow: strict opt-in via OC_SKILL_SHADOW_SAMPLE_RATE.
+    // The observer never mutates prompt/tool state and never blocks dispatchInbound;
+    // it only reads the same agent-visible metadata used by the SKILLS slot.
+    this._skillShadowReporter = startSkillShadowReporter({
+      resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
+    })
+
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
 
@@ -2422,6 +2434,8 @@ export class Gateway {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
+    this._skillShadowReporter?.stop()
+    this._skillShadowReporter = null
     if (this._wsKeepaliveTimer !== null) {
       clearInterval(this._wsKeepaliveTimer)
       this._wsKeepaliveTimer = null
@@ -11859,6 +11873,15 @@ export class Gateway {
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
     session._currentTurnUserText = (text ?? '').slice(0, 8000)
+    // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
+    // canonical trace id and raw text only long enough to hash/rank them; no result
+    // is fed back into prompt assembly or execution.
+    this._skillShadowReporter?.observeTurn({
+      traceId: turnTraceId,
+      sessionKey,
+      agentId: effectiveAgent.id,
+      userMessage: text ?? '',
+    })
     const currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     let turnErrored = false
     let leaderFinalCount = 0

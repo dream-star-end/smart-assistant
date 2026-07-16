@@ -15,6 +15,7 @@
  *                             90d 覆盖"host 出事回看历史"场景
  *   - turn_traces        90d  请求ID→用户/会话反查,计费争议窗口内必须在
  *   - rate_limit_events  30d  限流命中信号,只喂告警聚合
+ *   - skill_retrieval_shadow_events 30d 技能检索 shadow 排名/使用弱信号
  *   - connector_write_ledger 90d  写确认账本**终态**行(带 status 谓词;活跃态不删)
  *   - refresh_tokens     过期后 30d  auth 死行回收(列=expires_at;revoked 未过期行
  *                             保留给重用检测,见注册表内注释)
@@ -52,6 +53,7 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
   { table: "rate_limit_events", column: "created_at", days: 30 },
+  { table: "skill_retrieval_shadow_events", column: "created_at", days: 30 },
   { table: "product_friction_events", column: "updated_at", days: 30 },
   { table: "image_generation_attempts", column: "started_at", days: 30, predicate: "outcome<>'pending'" },
   { table: "selfheal_wecom_inbound_dedupe", column: "received_at", days: 90 },
