@@ -237,7 +237,16 @@ async function resolveIncidentGuarded(
       WHERE id = $1::bigint AND status <> 'resolved'
         AND ($3::boolean = FALSE OR NOT EXISTS (
               SELECT 1 FROM codex_repairs r
-               WHERE r.incident_id = incidents.id AND r.status = 'verifying'))
+               WHERE r.incident_id = incidents.id
+                 AND (
+                   -- tier2 归因窗口:done→verifying 期间让位给 codex 收口。
+                   r.status = 'verifying'
+                   -- tier1 全活跃窗口:动作执行期(pending..running)也让位——
+                   -- 动作刚重启服务、monitor 抢先写 false 时,probe 不能在
+                   -- machine done 之前把 incident 关掉(否则 done 必 409)。
+                   OR (r.tier = 'tier1'
+                       AND r.status IN ('pending','dispatched','acked','running'))
+                 )))
       RETURNING rev::text AS rev`,
     [incidentId, source, skipWhileVerifying],
   );

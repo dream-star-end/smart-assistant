@@ -21,7 +21,8 @@
     "0152_marketplace_capability_bindings",
     "0153_marketplace_plugin_kernel",
     "0154_model_admin_audit_returning_grant",
-    "0155_selfheal_drill_policy"
+    "0155_selfheal_drill_policy",
+    "0156_selfheal_execution_routing"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
