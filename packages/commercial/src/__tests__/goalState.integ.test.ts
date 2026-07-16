@@ -101,9 +101,9 @@ function maybe(name: string, fn: () => Promise<void>): void {
   })
 }
 
-describe('0156 platform GoalState', () => {
+describe('0159 platform GoalState', () => {
   maybe('opens a populated schema and is idempotent', async () => {
-    assert.equal(migrationSql.split('\n', 1)[0], '-- 编号待集成者对生产 ledger 校准')
+    assert.match(migrationSql.split('\n', 1)[0], /^-- 0159_goal_state /)
     await pool.query(migrationSql)
     await pool.query(migrationSql)
 
