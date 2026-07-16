@@ -157,6 +157,17 @@ beforeEach(() => {
 });
 
 describe("UsageTab 图表化窗口口径", () => {
+  test("首屏用量失败可原地重试并恢复，失败态不伪装成空数据", async () => {
+    mockedGetUsage
+      .mockRejectedValueOnce(new Error("backend unavailable"))
+      .mockResolvedValueOnce(makeResponse([chatRow()]));
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("加载用量统计失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("累计请求")).toBeInTheDocument();
+    expect(mockedGetUsage).toHaveBeenCalledTimes(2);
+  });
+
   test("报表先于用量摘要返回时，摘要完成后仍会首次绘制四张图", async () => {
     const usage = deferred<UsageResponse>();
     const report = deferred<UsageReport>();

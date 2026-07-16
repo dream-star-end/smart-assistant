@@ -120,7 +120,14 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       {err && (
         <div className="px-5 pb-2">
           <Alert tone="danger" className="text-[12.5px]">
-            {err}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="min-w-0 flex-1">{err}</span>
+              {jobs === null && (
+                <Button size="sm" variant="secondary" onClick={refresh}>
+                  重试
+                </Button>
+              )}
+            </div>
           </Alert>
         </div>
       )}
@@ -129,7 +136,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         <div className="flex items-center justify-center gap-2 py-12 text-[13px] text-faint">
           <Spinner /> 加载定时任务…
         </div>
-      ) : !jobs || jobs.length === 0 ? (
+      ) : err && jobs === null ? null : !jobs || jobs.length === 0 ? (
         <EmptyState
           icon={Clock}
           title="还没有定时任务"

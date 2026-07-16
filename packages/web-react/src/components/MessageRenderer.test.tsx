@@ -82,6 +82,19 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText(/没有产生新内容/)).toBeInTheDocument();
   });
 
+  test("assistant：触屏动作按钮保留 44px 命中区，复制与重新生成能力不减少", () => {
+    const onRegenerate = vi.fn();
+    renderMsg(mk("assistant", { text: "可复制的回答" }), { cb: { onRegenerate } });
+    const copy = screen.getByRole("button", { name: "复制" });
+    const plain = screen.getByRole("button", { name: "复制纯文本" });
+    const regenerate = screen.getByRole("button", { name: "重新生成" });
+    for (const button of [copy, plain, regenerate]) {
+      expect(button).toHaveClass("[@media(hover:none)]:size-11");
+    }
+    fireEvent.click(regenerate);
+    expect(onRegenerate).toHaveBeenCalledTimes(1);
+  });
+
   test("user：气泡 + 状态角标", () => {
     renderMsg(mk("user", { text: "提问", status: "sent" }));
     expect(screen.getByText("提问")).toBeInTheDocument();
@@ -141,7 +154,9 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
 
   test("system：居中提示", () => {
     renderMsg(mk("system", { text: "会话已恢复" }));
-    expect(screen.getByText("会话已恢复")).toBeInTheDocument();
+    const notice = screen.getByText("会话已恢复");
+    expect(notice).toBeInTheDocument();
+    expect(notice).toHaveClass("max-w-full", "break-words", "rounded-xl");
   });
 
   test("goal（v5 不实现）→ 不渲染任何内容", () => {
@@ -480,6 +495,23 @@ describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
     );
     expect(screen.getByText("超时")).toBeInTheDocument();
     expect(screen.queryByText("运行中")).not.toBeInTheDocument(); // server 行永不"运行中"
+  });
+
+  test("多枚终态徽记与成本在窄屏可换行，信息仍完整", () => {
+    renderMsg(
+      mk("agent-group", {
+        id: "srv-review",
+        _source: "server",
+        _delegate: true,
+        _delegateAgentId: "hidden-reviewer",
+        text: "质量审查",
+        _completed: true,
+        _reviewVerdict: "PASS",
+      }),
+    );
+    const verdict = screen.getByText("PASS");
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(verdict.parentElement).toHaveClass("flex-wrap", "max-w-[55%]");
   });
 });
 

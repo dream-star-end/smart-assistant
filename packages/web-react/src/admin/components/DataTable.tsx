@@ -87,9 +87,21 @@ export function DataTable<T>({
               <tr
                 key={rowKey(row, i)}
                 onClick={onRowClick ? () => onRowClick(row, i) : undefined}
+                tabIndex={onRowClick ? 0 : undefined}
+                onKeyDown={
+                  onRowClick
+                    ? (event) => {
+                        if (event.currentTarget !== event.target) return;
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        onRowClick(row, i);
+                      }
+                    : undefined
+                }
                 className={cn(
                   "border-b border-border/60 last:border-0",
-                  onRowClick && "cursor-pointer transition-colors hover:bg-hover",
+                  onRowClick &&
+                    "cursor-pointer outline-none transition-colors hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                 )}
               >
                 {columns.map((c) => (

@@ -65,6 +65,7 @@ export function AccountTab({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [ledgerReloadTick, setLedgerReloadTick] = useState(0);
   const [sub, setSub] = useState<MySubscription | null>(null);
 
   // 积分收支卡（窗口口径，独立于用量 Tab）。
@@ -138,7 +139,7 @@ export function AccountTab({
     return () => {
       alive = false;
     };
-  }, [auth, reloadKey]);
+  }, [auth, reloadKey, ledgerReloadTick]);
 
   const loadMore = useCallback(async () => {
     if (!nextBefore || loadingMore) return;
@@ -393,15 +394,26 @@ export function AccountTab({
           账单流水
         </div>
         {err && (
-          <Alert tone="danger" className="mb-2 text-[12.5px]">
-            {err}
-          </Alert>
+          <div className="mb-2">
+            <Alert tone="danger" className="text-[12.5px]">
+              {err}
+            </Alert>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              aria-label="重试账单流水"
+              onClick={() => setLedgerReloadTick((tick) => tick + 1)}
+            >
+              重试
+            </Button>
+          </div>
         )}
         {loading ? (
           <div className="flex items-center justify-center gap-2 py-8 text-[13px] text-faint">
             <Spinner /> 加载中…
           </div>
-        ) : rows.length === 0 ? (
+        ) : err && rows.length === 0 ? null : rows.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-faint">暂无账单记录</p>
         ) : (
           <>
