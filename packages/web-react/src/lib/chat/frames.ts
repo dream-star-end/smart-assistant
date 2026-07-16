@@ -21,9 +21,14 @@ import type {
   InboundControlStop,
   InboundMessage,
   InboundPermissionResponse,
+  InboundPromptQueueDelete,
+  InboundPromptQueueEdit,
+  InboundPromptQueueEnqueue,
+  InboundPromptQueueInterject,
+  InboundPromptQueueReorder,
   MediaRef,
-  OutboundContentBlock,
   OutboundActiveTurnReplayStart,
+  OutboundContentBlock,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
@@ -31,9 +36,21 @@ import type {
   OutboundResumeFailed,
   OutboundTurnStatus,
   Peer,
+  PromptQueueMutationFrame,
+  PromptQueueSnapshot,
 } from "@openclaude/protocol/frames";
 
-export type { MediaRef, OutboundContentBlock, Peer };
+export type {
+  InboundPromptQueueDelete,
+  InboundPromptQueueEdit,
+  InboundPromptQueueEnqueue,
+  InboundPromptQueueInterject,
+  InboundPromptQueueReorder,
+  MediaRef,
+  OutboundContentBlock,
+  Peer,
+  PromptQueueSnapshot,
+};
 
 // ─── runtime-augmented 公共片段 ──────────────────────────────────────
 /**
@@ -206,6 +223,7 @@ export type OutboundWire =
   | OutboundResumeFailedWire
   | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
+  | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire
   | CostWaivedWire
@@ -263,6 +281,7 @@ export type InboundWire =
   | InboundMessage
   | InboundControlStop
   | InboundPermissionResponse
+  | PromptQueueMutationFrame
   | InboundHelloWire
   | InboundPingWire
   | InboundRepoBindWire
