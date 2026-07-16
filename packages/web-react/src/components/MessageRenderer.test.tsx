@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
@@ -13,6 +13,13 @@ import {
 } from "./tool/__fixtures__/sessionToolTexts";
 
 afterEach(cleanup);
+
+beforeAll(async () => {
+  // MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
+  // RTL 统一的 5s 查询窗口；测试先显式等模块就绪，再让 findBy* 只等待 React 提交 DOM。
+  // 冷态 Suspense fallback 由 Markdown.test.tsx 的永久 suspend 替身独立覆盖。
+  await import("./MarkdownImpl");
+});
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: "m1", role, text: "", ts: 1000, ...extra };
@@ -51,8 +58,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     // Markdown 经 React.lazy 异步加载：占位期渲染纯文本整段「你好**世界**」。
     // 用精确匹配「世界」跳过占位（占位无独立「世界」节点），等到真正的富文本解析完成，
     // 届时 **世界** 被渲染为 <strong>世界</strong> —— 既验证内容到位，又验证懒加载边界确实落地。
-    // 懒加载 chunk 在全量套件并发下解析可能 >1s，给足超时余量(隔离稳过,仅满负载偶发)。
-    const strong = await screen.findByText("世界", {}, { timeout: 5000 });
+    const strong = await screen.findByText("世界");
     expect(strong.tagName).toBe("STRONG");
   });
 
@@ -871,7 +877,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     // 完成态默认折叠 → 点开表头展开正文。
     fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
     // Markdown 经 React.lazy 异步加载:占位期是含 `**` 的纯文本,富文本解析完成后 `**标题**`→<strong>。
-    const strong = await screen.findByText("Planning tool usage strategy", {}, { timeout: 5000 });
+    const strong = await screen.findByText("Planning tool usage strategy");
     expect(strong.tagName).toBe("STRONG");
     // 富化后整卡 DOM 不得残留裸 `**`(现网星号裸露 bug 的回归钉)。
     expect(container.textContent).not.toContain("**");
@@ -885,9 +891,9 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     ]);
     fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
     // 首条消息(th1)末标题 + 末条消息(th2)末标题都被富化为粗体 → 证明两段都进了同一张卡。
-    const s1 = await screen.findByText("Planning explicit collaboration spawn", {}, { timeout: 5000 });
+    const s1 = await screen.findByText("Planning explicit collaboration spawn");
     expect(s1.tagName).toBe("STRONG");
-    const s2 = await screen.findByText("Debugging template literal parsing", {}, { timeout: 5000 });
+    const s2 = await screen.findByText("Debugging template literal parsing");
     expect(s2.tagName).toBe("STRONG");
   });
 
