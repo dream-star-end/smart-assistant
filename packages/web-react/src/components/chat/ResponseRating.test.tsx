@@ -18,9 +18,11 @@ afterEach(cleanup);
 function Harness({
   initial,
   onSubmit,
+  nudgeId,
 }: {
   initial?: Map<string, RatingEntry>;
   onSubmit?: (i: RatingSubmitInput) => void;
+  nudgeId?: string | null;
 }) {
   const [ratings, setRatings] = useState<Map<string, RatingEntry>>(initial ?? new Map());
   const submit = (input: RatingSubmitInput) => {
@@ -34,7 +36,7 @@ function Harness({
     });
   };
   return (
-    <ResponseRatingProvider value={{ ratings, submit }}>
+    <ResponseRatingProvider value={{ ratings, submit, nudgeId }}>
       <ResponseRatingCard messageId="m1" traceId="t1" />
     </ResponseRatingProvider>
   );
@@ -99,6 +101,25 @@ describe("ResponseRatingCard", () => {
     render(<Harness initial={initial} />);
     expect(screen.getByText("谢谢反馈")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "点赞" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("nudgeId 命中未评消息 → 外层带 oc-rating-nudge 脉冲类（方案 a 引导）", () => {
+    const { container } = render(<Harness nudgeId="m1" />);
+    expect(container.querySelector(".oc-rating-nudge")).not.toBeNull();
+    // 高亮只是视觉引导，不得渲染成已选态：thumb 仍未按下、文案仍是未评。
+    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "点赞" })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  test("nudgeId 命中已评消息 → 不加脉冲类（不打扰已表态用户）", () => {
+    const initial = new Map<string, RatingEntry>([["m1", { rating: "up", tags: [] }]]);
+    const { container } = render(<Harness initial={initial} nudgeId="m1" />);
+    expect(container.querySelector(".oc-rating-nudge")).toBeNull();
+  });
+
+  test("nudgeId 未命中本卡 → 不加脉冲类", () => {
+    const { container } = render(<Harness nudgeId="other-id" />);
+    expect(container.querySelector(".oc-rating-nudge")).toBeNull();
   });
 
   test("Context 为 null(demo/未登录) → 整卡不渲染", () => {
