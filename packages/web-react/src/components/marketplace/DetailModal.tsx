@@ -242,7 +242,7 @@ export function DetailModal({
   onInstalled: () => void
   /** AI 导购(批3):「在对话中试用」——关市场 → 新会话 → 预填安装+上手示例;缺省不渲染。 */
   onAskAiInChat?: (text: string) => void
-  onOpenConnectors?: () => void
+  onOpenConnectors?: (pluginSlug?: string) => void
 }) {
   const [detail, setDetail] = useState<MarketplaceDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -324,6 +324,8 @@ export function DetailModal({
       setInstallResult(result)
       setDone(true)
       onInstalled()
+      if (result.needsAuthorization.includes('knowledge-planet'))
+        onOpenConnectors?.('knowledge-planet')
     } catch (e) {
       setErr(apiErrorMessage(e, '安装失败'))
     } finally {
@@ -413,7 +415,7 @@ export function DetailModal({
                   {isPreinstalledConnector ? '官方 API 插件 · 已预装' : '平台预设 · 开箱即用'}
                 </Badge>
                 {isPreinstalledConnector && onOpenConnectors && (
-                  <Button variant="primary" onClick={onOpenConnectors}>
+                  <Button variant="primary" onClick={() => onOpenConnectors()}>
                     去绑定账号
                   </Button>
                 )}
@@ -501,7 +503,7 @@ export function DetailModal({
                 </span>
                 {(detail.kind === 'connector' || (isAgent && installNeedsAuthorization)) &&
                   onOpenConnectors && (
-                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                    <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
                       {isAgent ? '管理 Plugin 账号' : '去管理中心绑定'}
                     </Button>
                   )}
@@ -536,7 +538,7 @@ export function DetailModal({
                         : '必需能力已被下架或撤销，需等待平台恢复或发布者更新。'}
                   </span>
                   {detailNeedsAuthorization && onOpenConnectors && (
-                    <Button size="sm" variant="secondary" onClick={onOpenConnectors}>
+                    <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
                       管理 Plugin 账号
                     </Button>
                   )}

@@ -133,6 +133,65 @@ describe('Knowledge Planet managed setup', () => {
     assert.equal(active.accountId, '91')
   })
 
+  test('uses the account row as authority after unlink and allows immediate re-authorization', async () => {
+    const workers = [deferred(), deferred()]
+    let starts = 0
+    let callbacks:
+      | {
+          onAuthenticated: (state: unknown) => void
+        }
+      | undefined
+    let accountExists = false
+    const service = {
+      async startLogin(args: { sessionId: string; onAuthenticated: (state: unknown) => void }) {
+        callbacks = args
+        const worker = workers[starts++]!
+        return {
+          sessionId: args.sessionId,
+          done: worker.promise,
+          stop: async () => worker.reject(),
+        }
+      },
+      async closeAndDrain() {},
+    } as unknown as KnowledgePlanetDockerService
+    const pool = {
+      async query<Row extends QueryResultRow>(): Promise<QueryResult<Row>> {
+        return result<Row>(accountExists ? ([{ exists: 1 }] as unknown as Row[]) : [])
+      },
+    } as unknown as Pool
+    const manager = new KnowledgePlanetSetupManager(service, {
+      pool,
+      loadEntitledVersion: async () => 41,
+      resolvePins: async () => [],
+      createAccount: async () => {
+        accountExists = true
+        return { id: '91' }
+      },
+    })
+
+    const first = await manager.start(7, true)
+    callbacks!.onAuthenticated({ cookies: [], origins: [] })
+    workers[0]!.resolve()
+    for (let i = 0; i < 20; i++) {
+      if ((await manager.status(7, first.sessionId)).status === 'active') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1))
+    }
+    assert.equal((await manager.status(7, first.sessionId)).status, 'active')
+    await assert.rejects(
+      manager.start(7, true),
+      (error: unknown) =>
+        error instanceof KnowledgePlanetSetupError && error.code === 'ACCOUNT_ALREADY_EXISTS',
+    )
+
+    // Simulate the authoritative revoke path. The cached terminal setup remains,
+    // but must no longer block a fresh QR session.
+    accountExists = false
+    const second = await manager.start(7, true)
+    assert.equal(second.status, 'waiting_for_scan')
+    assert.notEqual(second.sessionId, first.sessionId)
+    assert.equal(starts, 2)
+  })
+
   test('cancel wins the terminal CAS and authenticated state is discarded', async () => {
     const workerDone = deferred()
     let onAuthenticated: ((state: unknown) => void) | undefined

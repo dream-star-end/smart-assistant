@@ -37,13 +37,13 @@
       "sourceHash": "59c6a51c2e750f33fab81365c7ec3d3b65e5185447e35a30d0a920db13d9f2ea"
     },
     "connectors": {
-      "contentHash": "4aacc3aee18691c0d57b3896db678f6bbbdf3af64829c91c1e44ff4c07155e83",
-      "contentVersion": 3,
+      "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
+      "contentVersion": 4,
       "mediaHash": "21341baac82984bc62506d5c70f5a2b428aaea3a4392681430539d5f40fd21dc",
       "mediaKey": "connectors",
       "mediaVersion": 3,
       "registryHash": "fd49bde8c06c8e027adaa51880b2168b150e8f2aa1384b65579c431e059b5b0c",
-      "sourceHash": "3cccd0c9edcfb49494faa6267721a26cb7aeb7f187c8fdf6e7b8b346149c146d"
+      "sourceHash": "d0479ccf63a965458cef9d8dfaabf444b98df173b29d0c3ba9fee500d5cab736"
     },
     "container-web-preview": {
       "contentHash": "5d562e29a55d5209936a3fb4410c4bcec70a6ce8f710836b3ba5e757b4db3bb3",

@@ -234,6 +234,9 @@ export function App() {
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
+  const [manageAutoAuthorizePluginSlug, setManageAutoAuthorizePluginSlug] = useState<
+    string | null
+  >(null);
   const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
   const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
   const [orgSection, setOrgSection] = useState<OrgSection>("overview");
@@ -323,6 +326,7 @@ export function App() {
       setChatError(null);
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
+      setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       setTutorialOpen(false);
       setView("home");
@@ -1985,6 +1989,8 @@ export function App() {
             auth={auth}
             agentId={agent.id}
             agents={myAgents}
+            autoAuthorizePluginSlug={manageAutoAuthorizePluginSlug}
+            onAutoAuthorizeConsumed={() => setManageAutoAuthorizePluginSlug(null)}
             onTabChange={setManageTab}
             onOpenMarketplace={() => {
               setManageOpen(false);
@@ -1992,6 +1998,7 @@ export function App() {
             }}
             onClose={() => {
               setManageOpen(false);
+              setManageAutoAuthorizePluginSlug(null);
               // Plugin 绑定/解绑会改变 Agent readiness；关闭管理中心时立即刷新目录。
               void refreshMyAgents().catch(() => {});
             }}
@@ -2019,8 +2026,9 @@ export function App() {
               newSession();
               setComposerPrefill({ text, nonce: Date.now() });
             }}
-            onOpenConnectors={() => {
+            onOpenConnectors={(pluginSlug) => {
               setMarketplaceOpen(false);
+              setManageAutoAuthorizePluginSlug(pluginSlug ?? null);
               openManage("connectors");
             }}
             onTabChange={setMarketplaceTab}

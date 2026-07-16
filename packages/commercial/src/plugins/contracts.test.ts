@@ -203,6 +203,52 @@ describe('runtime Plugin contracts', () => {
     )
   })
 
+  test('supports only bounded anchored ASCII patterns and enforces them at runtime', () => {
+    const patternedParams = {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          minLength: 6,
+          maxLength: 32,
+          pattern: '^[0-9]{6,32}$',
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    }
+    const compiled = compileRuntimePluginArtifact({
+      ...managedArtifact(),
+      actions: [{ ...managedArtifact().actions[0]!, params: patternedParams }],
+    })
+    const params = compiled.execContract.actions[0]!.params
+    validateRuntimePluginJson(params, { query: '123456' }, 'params')
+    assert.throws(
+      () => validateRuntimePluginJson(params, { query: 'abcdef' }, 'params'),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+    )
+
+    assert.throws(
+      () =>
+        compileRuntimePluginArtifact({
+          ...managedArtifact(),
+          actions: [
+            {
+              ...managedArtifact().actions[0]!,
+              params: {
+                type: 'object',
+                properties: { query: { type: 'string', pattern: '^(a+)+$' } },
+                required: ['query'],
+                additionalProperties: false,
+              },
+            },
+          ],
+        }),
+      /not an allowed bounded ASCII pattern/,
+    )
+  })
+
   test('requires closed object schemas and bounded array item schemas', () => {
     assert.throws(
       () =>

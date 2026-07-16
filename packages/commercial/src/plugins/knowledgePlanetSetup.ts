@@ -246,6 +246,7 @@ export class KnowledgePlanetSetupManager {
     if (this.closing) throw new KnowledgePlanetSetupError('CLOSING')
     this.prune()
     const currentId = this.currentByUser.get(userId)
+    let staleActive: SetupSession | null = null
     if (currentId) {
       const current = this.sessions.get(currentId)
       if (current) await this.expireIfNeeded(current)
@@ -253,8 +254,11 @@ export class KnowledgePlanetSetupManager {
       // recover the private session id instead of being locked out until TTL.
       if (current && ['waiting_for_scan', 'finalizing'].includes(current.status))
         return this.view(current)
-      if (current?.status === 'active')
-        throw new KnowledgePlanetSetupError('ACCOUNT_ALREADY_EXISTS')
+      // A terminal setup is only a UI/history cache. The encrypted account row
+      // remains authoritative: unlink may happen immediately after success, so
+      // retaining an `active` session must never block re-authorization for the
+      // remainder of the 15-minute setup TTL.
+      if (current?.status === 'active') staleActive = current
     }
     const existing = await this.pool.query(
       `SELECT 1 FROM connections
@@ -264,6 +268,14 @@ export class KnowledgePlanetSetupManager {
     )
     if ((existing.rowCount ?? 0) !== 0)
       throw new KnowledgePlanetSetupError('ACCOUNT_ALREADY_EXISTS')
+    if (staleActive) {
+      wipe(staleActive.qr)
+      staleActive.qr = null
+      wipe(staleActive.stateBuffer)
+      staleActive.stateBuffer = null
+      this.sessions.delete(staleActive.id)
+      if (this.currentByUser.get(userId) === staleActive.id) this.currentByUser.delete(userId)
+    }
     const versionId = await this.loadEntitledVersion(userId)
     const pins = this.opts.resolvePins
       ? await this.opts.resolvePins()
