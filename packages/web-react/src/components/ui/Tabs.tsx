@@ -47,7 +47,10 @@ export function Tabs({
     <div
       role="tablist"
       aria-label={ariaLabel}
-      className={cn("inline-flex gap-1 rounded-full bg-hover p-1", className)}
+      className={cn(
+        "no-scrollbar inline-flex max-w-full gap-1 overflow-x-auto overscroll-x-contain rounded-full bg-hover p-1",
+        className,
+      )}
     >
       {items.map((it, i) => {
         const active = it.value === value;
@@ -65,7 +68,7 @@ export function Tabs({
             onClick={() => onValueChange(it.value)}
             onKeyDown={(e) => onKeyDown(e, i)}
             className={cn(
-              "whitespace-nowrap rounded-full px-4 py-1.5 text-[13px] font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring",
+              "shrink-0 whitespace-nowrap rounded-full px-4 py-1.5 text-[13px] font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring",
               active ? "bg-surface text-fg shadow-soft" : "text-muted hover:text-fg",
             )}
           >

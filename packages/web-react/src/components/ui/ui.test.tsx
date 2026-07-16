@@ -92,6 +92,8 @@ describe("ui primitives", () => {
       />,
     );
     const overview = screen.getByRole("tab", { name: "概览" });
+    expect(screen.getByRole("tablist").className).toContain("overflow-x-auto");
+    expect(overview.className).toContain("shrink-0");
     expect(overview.getAttribute("aria-selected")).toBe("true");
     expect(overview.getAttribute("tabindex")).toBe("0");
     const ledger = screen.getByRole("tab", { name: "账单" });
