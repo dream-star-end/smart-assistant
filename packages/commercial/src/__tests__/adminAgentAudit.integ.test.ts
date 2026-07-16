@@ -491,6 +491,11 @@ describe("getAgentAuditStats", () => {
       failure_calls: 2,
       total_calls: 16,
       failure_rate: 0.125,
+      // 按工具分解(调用量降序):Bash=10ok/2fail,Read=4ok/0fail。
+      tools: [
+        { tool: "Bash", success_calls: 10, failure_calls: 2, total_calls: 12, failure_rate: 2 / 12 },
+        { tool: "Read", success_calls: 4, failure_calls: 0, total_calls: 4, failure_rate: 0 },
+      ],
     });
     assert.deepEqual(
       {
@@ -526,6 +531,9 @@ describe("getAgentAuditStats", () => {
       failure_calls: 2,
       total_calls: 12,
       failure_rate: 1 / 6,
+      tools: [
+        { tool: "Bash", success_calls: 10, failure_calls: 2, total_calls: 12, failure_rate: 1 / 6 },
+      ],
     });
     const userOnly = await getAgentAuditStats({ window: "24h", userId: u1, now: statsNow });
     assert.equal(userOnly.rollup.total_calls, 14);
@@ -618,6 +626,9 @@ describe("getAgentAuditStats", () => {
       failure_calls: 0,
       total_calls: 3,
       failure_rate: 0,
+      tools: [
+        { tool: "Bash", success_calls: 3, failure_calls: 0, total_calls: 3, failure_rate: 0 },
+      ],
     });
     assert.equal(stats.failures.events, 1);
     assert.equal(stats.failures.groups[0].sessions, 1);

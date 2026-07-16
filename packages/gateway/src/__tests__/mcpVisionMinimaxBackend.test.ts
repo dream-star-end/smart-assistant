@@ -2,8 +2,14 @@ import * as assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, it } from 'node:test'
+import { after, before, describe, it } from 'node:test'
 import { STATIC_KEY_PROVIDERS } from '@openclaude/protocol'
+import {
+  LOCAL_CATALOG_HEADER,
+  ModelCatalogUnavailableError,
+  _setModelCatalogClientForTests,
+  type ModelCatalogClient,
+} from '../modelCatalogClient.js'
 
 const home = mkdtempSync(join(tmpdir(), 'oc-vision-mm-'))
 process.env.OPENCLAUDE_HOME = home
@@ -121,6 +127,21 @@ describe('vision backend cap/timeout(默认 minimax)', () => {
 })
 
 describe('runMinimaxVision', () => {
+  // 模型权威批次后 vision 走本地路径凭据:注入假 catalog client(真 client 会去打
+  // master 的 /internal/v3/model-catalog,测试环境不可达)。
+  before(() => {
+    _setModelCatalogClientForTests({
+      configured: true,
+      getToken: async () => 'cat-tok',
+      getView: async () => {
+        throw new Error('view not used in vision tests')
+      },
+    } as unknown as ModelCatalogClient)
+  })
+  after(() => {
+    _setModelCatalogClientForTests(null)
+  })
+
   it('经 anthropic proxy 发 MiniMax-M3 + image,解析 SSE text_delta', async () => {
     const p = join(uploads, 'c.png')
     writeFileSync(p, PNG)
@@ -159,6 +180,9 @@ describe('runMinimaxVision', () => {
     )
     assert.equal(captured.url, 'http://172.30.0.1:18791/v1/messages')
     assert.equal(captured.init?.headers.authorization, 'Bearer oc-v3.bearer')
+    // 模型权威凭据:vision 属本地路径,必须带 local catalog token,否则 enforce 后
+    // 被 anthropic proxy 以 MODEL_AUTHORITY_INVALID 拒(2026-07-16 巡检根因)。
+    assert.equal(captured.init?.headers[LOCAL_CATALOG_HEADER], 'cat-tok')
     const body = JSON.parse(captured.init?.body as string)
     assert.equal(body.model, 'MiniMax-M3')
     assert.ok(typeof body.max_tokens === 'number' && body.max_tokens > 0)
@@ -220,6 +244,52 @@ describe('runMinimaxVision', () => {
         }
       },
     )
+  })
+
+  it('catalog token 拿不到 → fail-closed 报错(不发无凭据请求)', async () => {
+    const p = join(uploads, 'g.png')
+    writeFileSync(p, PNG)
+    _setModelCatalogClientForTests({
+      configured: true,
+      getToken: async () => {
+        throw new ModelCatalogUnavailableError('master unreachable')
+      },
+      getView: async () => {
+        throw new Error('unused')
+      },
+    } as unknown as ModelCatalogClient)
+    try {
+      await withEnv(
+        {
+          ANTHROPIC_BASE_URL: 'http://x',
+          OPENCLAUDE_V3_CONTAINER_TOKEN: 'b',
+          OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: undefined,
+        },
+        async () => {
+          const orig = globalThis.fetch
+          globalThis.fetch = (async () => {
+            throw new Error('must not reach fetch without catalog token')
+          }) as typeof fetch
+          try {
+            await assert.rejects(
+              () => vision.runMinimaxVisionForTest(vision.resolveVisionInput({ image_file: p })),
+              /model catalog token unavailable/,
+            )
+          } finally {
+            globalThis.fetch = orig
+          }
+        },
+      )
+    } finally {
+      // 恢复本套件默认的可用假 client(before 里那只)。
+      _setModelCatalogClientForTests({
+        configured: true,
+        getToken: async () => 'cat-tok',
+        getView: async () => {
+          throw new Error('view not used in vision tests')
+        },
+      } as unknown as ModelCatalogClient)
+    }
   })
 
   it('bearer 优先 token file(不用 raw env)', async () => {
