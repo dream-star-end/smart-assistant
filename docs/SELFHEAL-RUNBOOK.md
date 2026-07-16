@@ -226,7 +226,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18796/healthz   # v5 m
 
 ```bash
 ssh kl-mirror
-# ① 迁移 0154(drill policy seed;同 2.1 记账 SOP)
+# ① 迁移 0155(drill policy seed;同 2.1 记账 SOP)
 # ② 真实 policy 全关派单:
 #    UPDATE incident_policies SET auto_repair=FALSE, updated_at=NOW() WHERE match_key <> 'selfheal.drill:transport_v1';
 # ③ 开闸:
