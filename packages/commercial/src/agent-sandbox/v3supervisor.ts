@@ -586,16 +586,34 @@ export function resolveCcbBaselineMounts(
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const skillDir = pathJoin(skillsDirPath, name);
       assertBaselineLeaf(skillDir, "dir", abs);
-      // R3 codex HIGH#1:skill 目录下**必须只有** SKILL.md。未来如果需要支持
-      // scripts/ references/ 等,要显式扩这条白名单,并把新条目加入 lstat 校验闭环。
-      const skillEntries = readdirSync(skillDir);
-      if (skillEntries.length !== 1 || skillEntries[0] !== "SKILL.md") {
+      // R3 codex HIGH#1 白名单(2026-07-16 显式扩展):skill 目录允许恰好
+      // {SKILL.md} 或 {SKILL.md, evals/};evals/ 目录内必须恰好只有 evals.json。
+      // 每个放行条目都走 assertBaselineLeaf 的 lstat 校验闭环(owner=root/非可写/
+      // 非 symlink/realpath 不逃逸);再支持 scripts/ references/ 时同样在此扩展。
+      const skillEntries = readdirSync(skillDir).sort();
+      const shapeOk =
+        (skillEntries.length === 1 && skillEntries[0] === "SKILL.md") ||
+        (skillEntries.length === 2 &&
+          skillEntries[0] === "SKILL.md" &&
+          skillEntries[1] === "evals");
+      if (!shapeOk) {
         throw new Error(
-          `skill dir ${name} must contain exactly one entry (SKILL.md), got: ${JSON.stringify(skillEntries)}`,
+          `skill dir ${name} must contain exactly SKILL.md (optionally plus evals/), got: ${JSON.stringify(skillEntries)}`,
         );
       }
       const skillMd = pathJoin(skillDir, "SKILL.md");
       assertBaselineLeaf(skillMd, "file", abs);
+      if (skillEntries.includes("evals")) {
+        const evalsDir = pathJoin(skillDir, "evals");
+        assertBaselineLeaf(evalsDir, "dir", abs);
+        const evalEntries = readdirSync(evalsDir);
+        if (evalEntries.length !== 1 || evalEntries[0] !== "evals.json") {
+          throw new Error(
+            `skill dir ${name}/evals must contain exactly one entry (evals.json), got: ${JSON.stringify(evalEntries)}`,
+          );
+        }
+        assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
+      }
     }
     return {
       agentsMdHostPath: agentsReal,
