@@ -1,10 +1,11 @@
 /**
- * Native browser iframe preview through a one-session Cloudflare Quick Tunnel.
+ * Native browser iframe preview through one isolated public hostname.
  *
- * The random trycloudflare.com host is only transport/isolation. Authorization
- * remains a one-use bootstrap plus a host-only Partitioned HttpOnly cookie.
- * Every browser request is re-authorized and re-signed before it can reach the
- * user's fixed in-container gateway port.
+ * Production uses a random same-site hostname below claudeai.chat. A temporary
+ * Cloudflare Quick Tunnel remains available when no hostname suffix is
+ * configured. The public host is only transport/isolation: authorization stays
+ * a one-use bootstrap plus a host-only Partitioned HttpOnly cookie, and every
+ * browser request is re-authorized before it can reach the container gateway.
  */
 
 import { type ChildProcessByStdio, spawn } from 'node:child_process'
@@ -26,6 +27,7 @@ import type {
 } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
+import { isIP } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Duplex, Readable } from 'node:stream'
@@ -52,6 +54,8 @@ import type { AuthoritySigner } from './authoritySigner.js'
 import type { ResolveContainerEndpoint } from './userChatBridge.js'
 
 const TRY_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/
+const SAME_SITE_HOST_LABEL_RE = /^ocp-[0-9a-f]{32}$/
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 const SESSION_ID_RE = /^[0-9a-f]{32}$/
 const BOOTSTRAP_TICKET_RE = /^[A-Za-z0-9_-]{32}$/
 const COOKIE_VALUE_RE = /^[A-Za-z0-9_-]{43}$/
@@ -113,6 +117,8 @@ export interface DirectContainerPreviewDeps {
   tunnelOrigin: string
   logger?: Logger
   cloudflaredBinary?: string
+  /** Optional same-site suffix. When set, no cloudflared process is launched. */
+  previewHostnameSuffix?: string
   launchTunnel?: (originUrl: string) => Promise<QuickTunnelLease>
   now?: () => number
   maxSessions?: number
@@ -146,12 +152,19 @@ interface DirectSession {
 
 type ResolvedEndpoint = Awaited<ReturnType<ResolveContainerEndpoint>>
 
+interface PreviewAuthorityPolicy {
+  readonly kind: 'quick-tunnel' | 'same-site'
+  readonly suffix: string
+  readonly validHostname: RegExp
+}
+
 export function createDirectContainerPreviewService(
   deps: DirectContainerPreviewDeps,
 ): DirectContainerPreviewService {
   const now = deps.now ?? Date.now
   const parentOrigin = normalizeParentOrigin(deps.parentOrigin)
   const tunnelOrigin = normalizeLoopbackOrigin(deps.tunnelOrigin)
+  const authorityPolicy = createPreviewAuthorityPolicy(parentOrigin, deps.previewHostnameSuffix)
   const logger = deps.logger
   const derivationKey = randomBytes(32)
   const maxSessions = clampInt(finiteOr(deps.maxSessions, DEFAULT_GLOBAL_CAP), 1, 16)
@@ -171,10 +184,14 @@ export function createDirectContainerPreviewService(
     1,
     256,
   )
-  const launchTunnel = (): Promise<QuickTunnelLease> =>
-    deps.launchTunnel
+  const launchTunnel = (): Promise<QuickTunnelLease> => {
+    if (authorityPolicy.kind === 'same-site') {
+      return Promise.resolve(createSameSitePreviewHostLease(authorityPolicy.suffix))
+    }
+    return deps.launchTunnel
       ? deps.launchTunnel(tunnelOrigin)
       : launchCloudflaredQuickTunnel(deps.cloudflaredBinary, tunnelOrigin)
+  }
   const pool = new QuickTunnelPool(launchTunnel, maxSessions, warmTunnels, logger)
   const byHost = new Map<string, DirectSession>()
   const byId = new Map<string, DirectSession>()
@@ -297,7 +314,7 @@ export function createDirectContainerPreviewService(
   }
 
   async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-    const authority = readQuickTunnelAuthority(req.headers.host)
+    const authority = readPreviewAuthority(req.headers.host, authorityPolicy)
     if (!authority.claimed) return false
     if (!authority.hostname) {
       sendPreviewText(res, 400, 'invalid preview authority', parentOrigin)
@@ -351,7 +368,7 @@ export function createDirectContainerPreviewService(
   }
 
   function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
-    const authority = readQuickTunnelAuthority(req.headers.host)
+    const authority = readPreviewAuthority(req.headers.host, authorityPolicy)
     if (!authority.claimed) return false
     if (!authority.hostname) {
       rejectUpgrade(socket, 400, 'invalid preview authority')
@@ -931,6 +948,24 @@ export async function launchCloudflaredQuickTunnel(
   return await waitForQuickTunnel(child, isolatedHome)
 }
 
+export function createSameSitePreviewHostLease(suffix: string): QuickTunnelLease {
+  const normalizedSuffix = normalizePreviewHostnameSuffix(suffix)
+  let closed = false
+  let resolveExit: () => void = () => {}
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve
+  })
+  return {
+    hostname: `ocp-${randomBytes(16).toString('hex')}.${normalizedSuffix}`,
+    exited,
+    async close(): Promise<void> {
+      if (closed) return
+      closed = true
+      resolveExit()
+    },
+  }
+}
+
 function waitForQuickTunnel(
   child: ChildProcessByStdio<null, Readable, Readable>,
   isolatedHome: string,
@@ -1034,6 +1069,58 @@ function normalizeParentOrigin(raw: string): string {
   return parsed.origin
 }
 
+function createPreviewAuthorityPolicy(
+  parentOrigin: string,
+  rawSuffix: string | undefined,
+): PreviewAuthorityPolicy {
+  if (rawSuffix === undefined) {
+    return {
+      kind: 'quick-tunnel',
+      suffix: 'trycloudflare.com',
+      validHostname: TRY_HOST_RE,
+    }
+  }
+  const suffix = normalizePreviewHostnameSuffix(rawSuffix)
+  const parent = new URL(parentOrigin)
+  if (parent.protocol !== 'https:') {
+    throw new Error('same-site preview parent origin must use HTTPS')
+  }
+  const parentHostname = parent.hostname.toLowerCase()
+  if (parentHostname !== suffix && !parentHostname.endsWith(`.${suffix}`)) {
+    throw new Error('preview hostname suffix must contain the parent hostname')
+  }
+  return {
+    kind: 'same-site',
+    suffix,
+    validHostname: new RegExp(
+      `^${SAME_SITE_HOST_LABEL_RE.source.slice(1, -1)}\\.${escapeRegExp(suffix)}$`,
+    ),
+  }
+}
+
+function normalizePreviewHostnameSuffix(raw: string): string {
+  if (
+    raw.length === 0 ||
+    raw !== raw.trim() ||
+    raw !== raw.toLowerCase() ||
+    raw.endsWith('.') ||
+    raw.includes('*') ||
+    isIP(raw) !== 0
+  ) {
+    throw new Error('preview hostname suffix must be a lowercase DNS suffix')
+  }
+  const labels = raw.split('.')
+  if (
+    labels.length < 2 ||
+    labels.some((label) => !DNS_LABEL_RE.test(label)) ||
+    !/[a-z]/.test(labels.at(-1) ?? '') ||
+    `ocp-${'0'.repeat(32)}.${raw}`.length > 253
+  ) {
+    throw new Error('preview hostname suffix must be a valid public DNS suffix')
+  }
+  return raw
+}
+
 function normalizeLoopbackOrigin(raw: string): string {
   const parsed = new URL(raw)
   const port = Number(parsed.port)
@@ -1054,17 +1141,21 @@ function normalizeLoopbackOrigin(raw: string): string {
   return parsed.origin
 }
 
-function readQuickTunnelAuthority(raw: string | undefined): {
+function readPreviewAuthority(
+  raw: string | undefined,
+  policy: PreviewAuthorityPolicy,
+): {
   claimed: boolean
   hostname: string | null
 } {
   if (typeof raw !== 'string') return { claimed: false, hostname: null }
   const trimmed = raw.trim()
   const firstColon = trimmed.indexOf(':')
-  const rawHostname = (firstColon >= 0 ? trimmed.slice(0, firstColon) : trimmed).replace(/\.+$/, '')
+  const rawHostname = (firstColon >= 0 ? trimmed.slice(0, firstColon) : trimmed)
+    .trim()
+    .replace(/\.+$/, '')
   const lowerCandidate = rawHostname.toLowerCase()
-  const claimed =
-    lowerCandidate === 'trycloudflare.com' || lowerCandidate.endsWith('.trycloudflare.com')
+  const claimed = isPreviewAuthorityClaimed(lowerCandidate, policy)
   if (!claimed) return { claimed: false, hostname: null }
   if (trimmed !== raw || raw.length > 320) return { claimed: true, hostname: null }
 
@@ -1080,8 +1171,21 @@ function readQuickTunnelAuthority(raw: string | undefined): {
   }
   return {
     claimed: true,
-    hostname: TRY_HOST_RE.test(hostname) ? hostname : null,
+    hostname: policy.validHostname.test(hostname) ? hostname : null,
   }
+}
+
+function isPreviewAuthorityClaimed(hostname: string, policy: PreviewAuthorityPolicy): boolean {
+  if (policy.kind === 'quick-tunnel') {
+    return hostname === policy.suffix || hostname.endsWith(`.${policy.suffix}`)
+  }
+  if (!hostname.endsWith(`.${policy.suffix}`)) return false
+  const label = hostname.slice(0, -(policy.suffix.length + 1))
+  return !label.includes('.') && label.startsWith('ocp-')
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function safePreviewPath(raw: string | undefined, hostname: string): string | null {

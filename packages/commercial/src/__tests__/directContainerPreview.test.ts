@@ -14,6 +14,7 @@ import {
   type DirectContainerPreviewService,
   type QuickTunnelLease,
   createDirectContainerPreviewService,
+  createSameSitePreviewHostLease,
 } from '../ws/directContainerPreview.js'
 
 const services: DirectContainerPreviewService[] = []
@@ -23,6 +24,86 @@ afterEach(async () => {
 })
 
 describe('native direct container preview authorization', () => {
+  it('uses a random same-site host without launching cloudflared and claims only its reserved namespace', async () => {
+    let tunnelLaunches = 0
+    const service = makeService(
+      async () => {
+        tunnelLaunches++
+        throw new Error('same-site mode must not launch cloudflared')
+      },
+      { previewHostnameSuffix: 'claudeai.chat' },
+    )
+    const issued = await service.issue(6n, 'http://127.0.0.1:5173/app?q=1', undefined)
+    assert.ok(issued)
+    const publicUrl = new URL(issued.url)
+    assert.match(publicUrl.hostname, /^ocp-[0-9a-f]{32}\.claudeai\.chat$/)
+    assert.equal(tunnelLaunches, 0)
+
+    const server = createServer((req, res) => {
+      void service.handleHttp(req, res).then((handled) => {
+        if (!handled && !res.writableEnded) {
+          res.statusCode = 418
+          res.end()
+        }
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    try {
+      const bootstrap = await request(port, publicUrl.pathname + publicUrl.search, {
+        Host: `${publicUrl.hostname.toUpperCase()}.:443`,
+      })
+      assert.equal(bootstrap.status, 302)
+      assert.match(String(bootstrap.headers['set-cookie']?.[0]), /SameSite=None; Partitioned/)
+
+      const malformed = await request(port, '/', { Host: 'ocp-short.claudeai.chat' })
+      assert.equal(malformed.status, 400)
+      const unknown = await request(port, '/', {
+        Host: `ocp-${'f'.repeat(32)}.claudeai.chat:443`,
+      })
+      assert.equal(unknown.status, 404)
+      const root = await request(port, '/', { Host: 'claudeai.chat' })
+      assert.equal(root.status, 418)
+      const ordinary = await request(port, '/', { Host: 'status.claudeai.chat' })
+      assert.equal(ordinary.status, 418)
+      const deeper = await request(port, '/', {
+        Host: `ocp-${'e'.repeat(32)}.nested.claudeai.chat`,
+      })
+      assert.equal(deeper.status, 418)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('strictly validates the same-site suffix and its relationship to the HTTPS parent', () => {
+    const invalid: Array<
+      Pick<DirectContainerPreviewDeps, 'parentOrigin' | 'previewHostnameSuffix'>
+    > = [
+      { parentOrigin: 'http://claudeai.chat', previewHostnameSuffix: 'claudeai.chat' },
+      { parentOrigin: 'https://claudeai.chat', previewHostnameSuffix: 'CLAUDEAI.CHAT' },
+      { parentOrigin: 'https://claudeai.chat', previewHostnameSuffix: '*.claudeai.chat' },
+      { parentOrigin: 'https://claudeai.chat', previewHostnameSuffix: 'claudeai.chat.' },
+      { parentOrigin: 'https://claudeai.chat', previewHostnameSuffix: '127.0.0.1' },
+      { parentOrigin: 'https://claudeai.chat', previewHostnameSuffix: 'example.com' },
+    ]
+    for (const options of invalid) {
+      assert.throws(() =>
+        makeService(async () => fakeTunnel('unused.trycloudflare.com').lease, options),
+      )
+    }
+  })
+
+  it('same-site leases close idempotently and resolve their exit exactly once', async () => {
+    const lease = createSameSitePreviewHostLease('claudeai.chat')
+    assert.match(lease.hostname, /^ocp-[0-9a-f]{32}\.claudeai\.chat$/)
+    let exits = 0
+    void lease.exited.then(() => exits++)
+    await Promise.all([lease.close(), lease.close(), lease.close()])
+    await lease.exited
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(exits, 1)
+  })
+
   it('consumes bootstrap once, requires one reserved cookie, and serves platform bridge first', async () => {
     const tunnel = fakeTunnel('alpha-preview.trycloudflare.com')
     const service = makeService(async () => tunnel.lease)
@@ -254,6 +335,26 @@ describe('native direct container preview authorization', () => {
     await service.revoke(22n, two.sessionId)
   })
 
+  it('closes a tunnel that finishes starting after shutdown', async () => {
+    const late = fakeTunnel('shutdown-late-preview.trycloudflare.com')
+    let resolveLaunch!: (lease: QuickTunnelLease) => void
+    const service = makeService(
+      () =>
+        new Promise((resolve) => {
+          resolveLaunch = resolve
+        }),
+      { tunnelAcquireTimeoutMs: 1_000 },
+    )
+    const pendingIssue = service.issue(28n, 'http://localhost:3000/', undefined)
+    await waitUntil(() => resolveLaunch !== undefined)
+    const shutdown = service.shutdown()
+    resolveLaunch(late.lease)
+    assert.equal(await pendingIssue, null)
+    await shutdown
+    await waitUntil(late.closed)
+    assert.equal(service.activeCount(), 0)
+  })
+
   it('expires an abandoned bootstrap at its 30-second ticket deadline', async () => {
     let at = 10_000
     const tunnel = fakeTunnel('expired-preview.trycloudflare.com')
@@ -292,11 +393,15 @@ function makeService(
       | 'maxWebSocketsPerSession'
       | 'maxWebSocketsGlobal'
       | 'resolveContainerEndpoint'
+      | 'parentOrigin'
+      | 'previewHostnameSuffix'
+      | 'warmTunnels'
     >
   > = {},
 ): DirectContainerPreviewService {
   const {
     tunnelOrigin = 'http://127.0.0.1:18790',
+    parentOrigin = 'https://claudeai.chat',
     resolveContainerEndpoint = async () => {
       throw new Error('not used')
     },
@@ -305,7 +410,7 @@ function makeService(
   const service = createDirectContainerPreviewService({
     signer: {} as never,
     resolveContainerEndpoint,
-    parentOrigin: 'https://claudeai.chat',
+    parentOrigin,
     tunnelOrigin,
     launchTunnel,
     maxSessions: 4,
