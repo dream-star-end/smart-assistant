@@ -51,3 +51,16 @@ export function sessionOversizedKey(uid: string | number): string {
 
 /** 维护模式 condition(exact;systemSettings maintenance_mode 写点)。 */
 export const SYSTEM_MAINTENANCE_ON = "system.maintenance_on";
+
+/**
+ * 合成 transport 演练 condition(exact;0154 seed;写点=演练脚本
+ * scripts/v5-selfheal-drill.ts 经 write_alert_condition)。
+ *
+ * ── 跨仓契约(改动必须两侧同步)──
+ * 个人版 broker 以同一字面量(packages/gateway/src/selfheal/broker.ts
+ * SELFHEAL_DRILL_TRANSPORT_KEY)对冻结 conditionKey === 本值的 repair 做
+ * context/report 白名单强制(verify/cutover/Tier1 服务端拒绝)。
+ * dispatcher 的冷却豁免同样只认本精确常量。未来新增 drill 类型 = 新常量 +
+ * 两侧显式扩表,严禁改成前缀匹配。
+ */
+export const SELFHEAL_DRILL_TRANSPORT = "selfheal.drill:transport_v1";
