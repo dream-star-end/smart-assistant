@@ -331,6 +331,10 @@ export function classifyEmptyTurn(p: {
 
 export const AUTO_CONTINUE_PROMPT = "请基于刚才的思考,继续输出完整的正文回答。";
 export const AUTO_CONTINUE_DISPLAY = "↻ 自动续写";
+/** 模型只说“我来处理”却在执行前 end_turn 时的单次恢复。 */
+export const PREAMBLE_CONTINUE_PROMPT =
+  "你刚才只说明了将要执行的动作,但本轮尚未实际执行。请现在直接继续完成该动作,不要重复开场说明,完成后给出结果。";
+export const PREAMBLE_CONTINUE_DISPLAY = "↻ 自动继续执行";
 /** 服务重启把上游生成流掐断(容器模型调用经 master 内部代理)时的自动续写。 */
 export const RESTART_CONTINUE_PROMPT =
   "你上一条回复因服务重启被中断。请从中断处继续输出剩余内容,不要重复已经输出的部分,直接接着写。";
@@ -368,6 +372,41 @@ export function shouldAutoContinueEmptyTurn(p: {
     if (messages[i]?.role === "user" && isAutoContinueMsg(messages[i])) return false;
   }
   return true;
+}
+
+/**
+ * 极保守识别“行动承诺式开场白后直接 end_turn”。只接受当前轮恰好一条短 assistant、
+ * 没有 thinking/tool/plan 等任何其他产物、没有向用户提问，且文本同时命中明确的
+ * 将来行动主语和动作动词。误判会擅自多跑一轮，因此宁可漏判也不放宽。
+ */
+export function shouldAutoContinueActionPreamble(p: {
+  messages: Array<{
+    id?: string;
+    role?: string;
+    text?: string;
+    _isAutoRetry?: boolean;
+    _modelText?: string;
+  }>;
+  targetMsgId: string;
+  stopReason?: string | null;
+}): boolean {
+  const { messages, targetMsgId, stopReason } = p;
+  if (stopReason !== "end_turn" || !Array.isArray(messages)) return false;
+  const idx = messages.findIndex((m) => m && m.id === targetMsgId);
+  if (idx < 0 || isAutoContinueMsg(messages[idx])) return false;
+  const turnRows = messages.slice(idx + 1).filter((m) => !!m?.role);
+  if (turnRows.length !== 1 || turnRows[0].role !== "assistant") return false;
+  const text = String(turnRows[0].text ?? "")
+    .replace(/^[\s>*#`_-]+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length < 4 || text.length > 180) return false;
+  if (/[?？]/.test(text) || /(?:是否|能否|要不要|需不需要|可以吗|好吗|行吗|请问)/.test(text)) {
+    return false;
+  }
+  const zhPromise = /^(?:(?:好的|可以|明白)[，,。.! ]*)?(?:(?:我(?:现在|马上|立即|先|来|会|将|这就|接下来))|(?:让我(?:先|来)?)|(?:接下来(?:我)?)).{0,64}(?:检查|排查|查看|核实|调查|分析|处理|修复|修改|实现|执行|测试|验证|查找|搜索|读取|打开|整理|生成|创建|更新|部署|继续)/;
+  const enPromise = /^(?:okay[,!. ]*)?(?:(?:i(?:['’]ll| will| am going to))|(?:let me)|(?:next,? i(?:['’]ll| will))).{0,96}\b(?:check|inspect|investigate|analy[sz]e|fix|update|implement|run|test|verify|search|read|open|create|generate|deploy|continue)\b/i;
+  return zhPromise.test(text) || enPromise.test(text);
 }
 
 // ═══════════════ 归档 / 上下文重建文案（SESSION_ARCHIVE_DESIGN §5,统一权威）═══════════════
@@ -583,6 +622,7 @@ export function normalizeBridgeErrorCode(code: unknown): string {
   if (upper === "CODEX_POOL_BUSY") return "codex_pool_busy";
   if (upper === "CODEX_ROUTE_UNAVAILABLE") return "codex_route_unavailable";
   if (upper === "CODEX_CONTAINER_RECYCLED") return "codex_container_recycled";
+  if (upper === "SESSION_PERSIST_UNAVAILABLE") return "session_persist_unavailable";
   return raw ? raw.toLowerCase() : "unknown";
 }
 
@@ -612,9 +652,25 @@ export function friendlyBridgeErrorMessage(code: unknown, message?: string): str
   if (n === "conn_kicked") return "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。";
   if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";
   if (n === "codex_pool_busy") return "账号池繁忙，请稍后重试。";
-  // 未知码:回友好通用文案,不把裸技术消息(如 "server shutting down")抛给用户;
-  // 原始 message 由 reducer 落进 _errorDetail,「查看详情」里仍可见,便于反馈/排查。
+  if (n === "codex_route_unavailable" || n === "codex_unavailable")
+    return "GPT 服务暂时不可用，你的消息已保留，请稍后重试。";
+  if (n === "codex_billing") return "计费服务暂时不可用，本轮未开始，请稍后重试。";
+  if (n === "rate_limited") return "请求暂时较多，请稍后直接重试本条消息。";
+  if (n === "upstream_failed") return "任务执行暂时中断，你的消息已保留，可直接重试。";
+  if (n === "session_persist_unavailable")
+    return "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。";
+  // 未知码:回友好通用文案,不把裸技术消息(如 "server shutting down")抛给用户。
   return "系统暂时不可用，请稍后重试。";
+}
+
+/**
+ * 「查看详情」只保留可公开的说明与 trace id。上游/路由/账号池原文仍进入错误遥测，
+ * 但不能持久化进会话后直接展示给用户。
+ */
+export function safeBridgeErrorDetail(code: unknown, traceId?: unknown): string {
+  const summary = friendlyBridgeErrorMessage(code);
+  const trace = typeof traceId === "string" ? traceId.trim() : "";
+  return trace ? `${summary}\n请求编号：${trace}` : summary;
 }
 
 /** 预期业务态错误码：不自动上报（websocket.js:4038）。*/

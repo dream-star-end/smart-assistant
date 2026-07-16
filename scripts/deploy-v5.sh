@@ -52,6 +52,8 @@
 #   --model-authority-cutover     # 步骤 5:置位不可逆兼容地板 marker(DB 单行 + env 键)
 #                                 # 置位后:deploy/rollback 拒绝激活缺 capability 的 release/tuple;
 #                                 #        master/egress 在 flag 关闭态拒启;admin catalog 状态机开放。
+#   --enable-runtime-tape-batching # 显式开启 format-3 runtime-event 物理批存储；要求当前及
+#                                  # previous rollback release 都具备 reader capability。
 set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
@@ -224,6 +226,7 @@ for arg in "$@"; do
     --enable-seed-authority-by-rev) MODE="enable-seed-authority-by-rev" ;;
     --record-model-authority-emergency-drill) MODE="record-model-authority-emergency-drill" ;;
     --model-authority-cutover) MODE="model-authority-cutover" ;;
+    --enable-runtime-tape-batching) MODE="enable-runtime-tape-batching" ;;
     # ── P3 双 master cohort lane(全部经 deploy_state CAS + journal;§D5 逐步)──
     --canary) MODE="canary" ;;
     --canary=*) MODE="canary"; CANARY_RELEASE="${arg#*=}" ;;
@@ -1504,6 +1507,8 @@ assert_release_capability_for_sessions_pg() {
 # login. Likewise, an older runtime would resume lossy v1 writes. Therefore the
 # first finalized tape makes reader+writer capability irreversible.
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
+LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
+LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
 
 # Tri-state artifact probe. Return codes are part of the safety contract:
 #   0 = capability is explicitly present
@@ -1543,6 +1548,85 @@ probe_release_lossless_master_capability() {
 
 probe_release_lossless_runtime_capability() {
   probe_release_lossless_capability_field "$1" runtimeCapabilities
+}
+
+# Compressed runtime-event rows are a master-only storage format. Keep their
+# declaration separate from the container v2 wire capability so an older
+# master cannot pass the floor merely because it understands tape uploads.
+probe_release_lossless_runtime_batch_capability() {
+  local reldir="$1" result="" rc=0
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$LOSSLESS_RUNTIME_BATCH_CAP' '(.capabilities // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capability field must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_lossless_runtime_batch_capability() {
+  local reldir="$1" rc=0
+  probe_release_lossless_runtime_batch_capability "$reldir" || rc=$?
+  if [[ $rc -eq 0 ]]; then return 0; fi
+  if [[ $rc -eq 2 ]]; then
+    echo "✗ 目标 master release 的 runtime-batch capability 状态不可核验(探测失败):" >&2
+  else
+    echo "✗ 目标 master release 未声明 reader capability '$LOSSLESS_RUNTIME_BATCH_CAP':" >&2
+  fi
+  echo "    $reldir/deploy/v5/release-metadata.json" >&2
+  return 1
+}
+
+# Tri-state storage floor. The explicit opt-in closes the first-write race;
+# record_storage_format=3 keeps the floor irreversible after the flag is ever
+# removed or an env file is restored. 0=armed, 1=definitively inactive,
+# 2=unknown (production callers fail closed).
+probe_lossless_runtime_batch_floor() {
+  local state="" rc=0
+  if state="$(ssh "$KL_HOST" "test -r '$V5_ENV' || exit 20
+      set -a; . '$V5_ENV' 2>/dev/null || exit 21
+      case \"\${$LOSSLESS_RUNTIME_BATCH_ENV:-}\" in 1|true|TRUE|on|ON) printf true; exit 0 ;; esac
+      test -n \"\${DATABASE_URL:-}\" || exit 22
+      psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (
+        SELECT 1 FROM client_session_turn_tapes
+         WHERE finalized_at IS NOT NULL AND record_storage_format >= 3
+      )::text\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  if [[ $rc -eq 0 && "$state" == true ]]; then return 0; fi
+  if [[ $rc -eq 0 && "$state" == false ]]; then return 1; fi
+  return 2
+}
+
+assert_lossless_runtime_batch_floor() {
+  local reldir="$1" rc=0
+  probe_lossless_runtime_batch_floor || rc=$?
+  if [[ $rc -eq 1 ]]; then
+    echo "  · runtime-event batch 地板尚未启用且无 format-3 tape。"
+    return 0
+  fi
+  if [[ $rc -eq 2 ]]; then
+    echo "  · runtime-event batch 地板状态不可核验 → 对旧 master fail-closed。" >&2
+  else
+    echo "  · runtime-event batch 地板生效(opt-in 已开或已有 format-3 tape)。"
+  fi
+  assert_lossless_runtime_batch_capability "$reldir" || return 1
+  echo "  ✓ runtime-event batch 地板:目标 master 声明 $LOSSLESS_RUNTIME_BATCH_CAP。"
 }
 
 # True when a candidate may have accepted v2 writes. Only a successfully read
@@ -1591,6 +1675,7 @@ assert_lossless_release_capability() {
 # can use the DB floor alone: it cannot finalize v2 concurrently.
 assert_lossless_explicit_rollback_target() {  # $1=live master $2=target master $3=image id $4=runtime release
   local live_master="$1" target_master="$2" image_id="$3" runtime_release="$4" live_rc=0
+  assert_lossless_runtime_batch_floor "$target_master" || return 1
   probe_release_lossless_master_capability "$live_master" || live_rc=$?
   if [[ $live_rc -eq 1 ]]; then
     echo "  · 当前 master 明确不具备 $LOSSLESS_TURN_TAPE_CAP；显式回滚继续由 finalized tape 地板裁决。"
@@ -1609,6 +1694,7 @@ assert_lossless_explicit_rollback_target() {  # $1=live master $2=target master 
 assert_lossless_turn_tape_floor() {
   local reldir="$1" finalized rc
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 跳过 lossless turn-tape 兼容地板"; return 0; }
+  assert_lossless_runtime_batch_floor "$reldir" || exit 1
   if finalized="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null
       test -n \"\${DATABASE_URL:-}\"
       psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL)::text\"" 2>/dev/null)"; then
@@ -1658,6 +1744,8 @@ assert_lossless_runtime_tuple_floor() {
 assert_lossless_canary_pair() {
   local active_rel="$1" candidate_rel="$2" rel kind has image_id runtime_release
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] 核验 active+candidate master/runtime 与实际 tuple 的 lossless capability"; return 0; }
+  assert_lossless_runtime_batch_floor "$active_rel" || return 1
+  assert_lossless_runtime_batch_floor "$candidate_rel" || return 1
   for rel in "$active_rel" "$candidate_rel"; do
     for kind in capabilities runtimeCapabilities; do
       has="$(ssh "$KL_HOST" "jq -r --arg c '$LOSSLESS_TURN_TAPE_CAP' '(.${kind} // []) | index(\$c) // empty' '$rel/deploy/v5/release-metadata.json' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
@@ -2713,12 +2801,60 @@ SQL
   echo "   · admin catalog 状态机(/api/admin/model-catalog)即为开放状态。"
 }
 
+# Runtime-event physical batching is deliberately dark by default. Enabling is
+# a separate locked rollout only after both the live and immediate rollback
+# masters can hydrate format 3. A failed restart/smoke reverts only the flag and
+# restarts the same capable release; it never falls through to an old reader.
+enable_runtime_tape_batching() {
+  echo "══ 开启 lossless runtime-event batching(format 3)══"
+  assert_no_rollout_in_progress
+  resolve_active_lane
+  local active previous current
+  active="$(bg_current_release "$ACTIVE_SRC")"
+  previous="$ACTIVE_STATE_PREVIOUS_RELEASE"
+  [[ -n "$active" && -n "$previous" ]] || {
+    echo "✗ 缺当前/previous release 权威，无法证明安全回滚。先完成两代含新 reader 的正常部署。" >&2
+    return 1
+  }
+  assert_release_required_migrations "$active" || return 1
+  assert_lossless_runtime_batch_capability "$active" || return 1
+  assert_lossless_runtime_batch_capability "$previous" || {
+    echo "✗ previous release 不支持 format 3；保持 batching 关闭。再完成一轮正常部署后重试。" >&2
+    return 1
+  }
+  current="$(remote_env_get "$LOSSLESS_RUNTIME_BATCH_ENV")"
+  if [[ "$current" =~ ^(1|true|TRUE|on|ON)$ ]]; then
+    assert_lossless_runtime_batch_floor "$active" || return 1
+    smoke "$ACTIVE_PORT"
+    echo "✓ runtime-event batching 已开启且健康。"
+    return 0
+  fi
+  begin_planned_maintenance deploy 0
+  if ! remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 1 \
+      || ! ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
+      || ! smoke "$ACTIVE_PORT" \
+      || ! assert_lossless_runtime_batch_floor "$active"; then
+    echo "✗ batching 开启未通过健康门；恢复 flag=0 并重启同一 capable release。" >&2
+    remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 0 || true
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
+    smoke "$ACTIVE_PORT" || true
+    end_planned_maintenance
+    return 1
+  fi
+  end_planned_maintenance
+  echo "✓ runtime-event batching 已安全开启(active+previous reader 均兼容 format 3)。"
+}
+
 # 自动回切的 lossless 能力门。candidate 一旦可能服务过 v2 写入，必须在任何
 # deploy_state/symlink/unit 补偿之前证明旧 master 和**当前实际** runtime tuple 都兼容。
 # 调用方持有 deploy lock，release metadata 不可变；同一次补偿只检查一次，避免状态已
 # 回退后第二次瞬态探测失败而留下 state=old/runtime=new 的分裂现场。
 assert_release_activation_compensation_compatible() {  # $1=old_release $2=candidate_release
   local old_release="$1" candidate_release="$2" image_id runtime_release
+  if ! assert_lossless_runtime_batch_floor "$old_release"; then
+    mark_deploy_recovery_required "lossless writer 已可能对外服务,runtime-event batch 地板拒绝旧 master:$old_release"
+    return 1
+  fi
   # The candidate may have accepted traffic as soon as restart was attempted.
   # If it is a v2 writer OR its capability probe failed, require the
   # compensation target unconditionally. Unknown must be armed: treating a
@@ -5220,6 +5356,7 @@ case "$MODE" in
   enable-seed-authority-by-rev) enable_seed_authority_by_rev ;;
   record-model-authority-emergency-drill) record_model_authority_emergency_drill ;;
   model-authority-cutover)   model_authority_cutover ;;
+  enable-runtime-tape-batching) enable_runtime_tape_batching ;;
   emergency-tuple) emergency_tuple ;;
   activate-emergency-tuple) activate_emergency_tuple ;;
   prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;

@@ -1681,6 +1681,145 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
   });
 });
 
+describe("userChatBridge / Codex admission is session-scoped", () => {
+  test("different peers run concurrently while the same peer stays single-flight", async () => {
+    const rig = await startRig({ userBalance: 1_000_000n });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("160"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-a", kind: "dm" },
+        clientMessageId: "m-peer-a-1",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "long task A" },
+      }));
+      const first = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+
+      // peer-a is still active. peer-b must not be blocked by bridge-global state.
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-b", kind: "dm" },
+        clientMessageId: "m-peer-b-1",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "independent task B" },
+      }));
+      const second = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal((first.peer as { id: string }).id, "peer-a");
+      assert.equal((second.peer as { id: string }).id, "peer-b");
+      assert.equal(rig.binding.acquireCalls, 2);
+
+      // A second logical turn in peer-a is rejected without touching peer-b,
+      // and the error identifies only the rejected client row.
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-a", kind: "dm" },
+        clientMessageId: "m-peer-a-busy",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "must queue" },
+      }));
+      const busy = await waitJsonFrameOfType(ws, "error", 3000);
+      assert.equal(busy.code, "CODEX_TURN_BUSY");
+      assert.deepEqual(busy.peer, { id: "peer-a", kind: "dm" });
+      assert.equal(busy.clientMessageId, "m-peer-a-busy");
+      assert.equal(rig.binding.acquireCalls, 2);
+
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        channel: "webchat",
+        peer: { id: "peer-a", kind: "dm" },
+        clientMessageId: "m-peer-a-1",
+        blocks: [{ kind: "text", text: "A complete" }],
+        isFinal: true,
+      }));
+      await waitJsonFrameOfType(ws, "outbound.message", 3000);
+      await waitUntil(() => rig.binding.releaseCalls >= 1, 1500);
+
+      // Exact terminal release makes the same peer immediately reusable while
+      // peer-b remains active.
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-a", kind: "dm" },
+        clientMessageId: "m-peer-a-2",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "follow-up A" },
+      }));
+      const third = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal((third.peer as { id: string }).id, "peer-a");
+      assert.equal(rig.binding.acquireCalls, 3);
+
+      for (const frame of [first, second, third]) {
+        containerWs.send(JSON.stringify({
+          type: "outbound.codex_billing",
+          requestId: frame.requestId,
+          engineSessionId: ENGINE_SID,
+          status: "success",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }));
+      }
+      await waitUntil(() => rig.binding.releaseCalls >= 3, 1500);
+
+      // Billing is an exact requestId-scoped terminal and can release before a
+      // user-facing final arrives. A late id-less final from the old turn must
+      // not ABA-release the newer modern turn on the same peer.
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-b", kind: "dm" },
+        clientMessageId: "m-peer-b-2",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "new B after billing" },
+      }));
+      const fourth = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal(rig.binding.acquireCalls, 4);
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        channel: "webchat",
+        peer: { id: "peer-b", kind: "dm" },
+        blocks: [{ kind: "text", text: "late legacy final for old B" }],
+        isFinal: true,
+      }));
+      await waitJsonFrameOfType(ws, "outbound.message", 3000);
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "peer-b", kind: "dm" },
+        clientMessageId: "m-peer-b-still-busy",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "must still be rejected" },
+      }));
+      const stillBusy = await waitJsonFrameOfType(ws, "error", 3000);
+      assert.equal(stillBusy.code, "CODEX_TURN_BUSY");
+      assert.equal(stillBusy.clientMessageId, "m-peer-b-still-busy");
+      assert.equal(rig.binding.acquireCalls, 4);
+      containerWs.send(JSON.stringify({
+        type: "outbound.codex_billing",
+        requestId: fourth.requestId,
+        engineSessionId: ENGINE_SID,
+        status: "success",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+      await waitUntil(() => rig.binding.releaseCalls >= 4, 1500);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
 describe("userChatBridge / codex billing — legacy NULL container per-turn billing", () => {
   let rig: BillingRig;
   before(async () => { rig = await startRig({ userBalance: 1_000_000n, acquireResult: "legacy" }); });

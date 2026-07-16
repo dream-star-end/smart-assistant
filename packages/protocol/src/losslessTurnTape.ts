@@ -10,6 +10,10 @@ export const LOSSLESS_TURN_TAPE_VERSION = 2 as const
 /** Release/runtime capability token. Once any finalized v2 tape exists,
  * deploy tooling must never activate a reader or writer that lacks it. */
 export const LOSSLESS_TURN_TAPE_CAPABILITY = 'lossless-turn-tape-v2' as const
+/** Master-only reader/writer capability for compressed physical runtime-event
+ * records. It is intentionally separate from the v2 container wire capability:
+ * an older master can parse v2 tapes but cannot hydrate this storage format. */
+export const LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY = 'lossless-turn-runtime-batch-v1' as const
 export const LOSSLESS_TURN_TAPE_PART_BYTES = 192 * 1024
 export const LOSSLESS_TURN_TAPE_SHA256_RE = /^[0-9a-f]{64}$/
 /** Reserved envelope identity used only when upgrading a pre-agentId v1

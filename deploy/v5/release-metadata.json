@@ -23,6 +23,7 @@
     "0154_model_admin_audit_returning_grant",
     "0155_selfheal_drill_policy",
     "0156_selfheal_execution_routing",
+    "0157_lossless_runtime_batches",
     "0158_skill_retrieval_shadow"
   ],
   "capabilities": [
@@ -30,7 +31,8 @@
     "dual-master-v1",
     "model_authority_v1",
     "model_authority_v1-egress",
-    "lossless-turn-tape-v2"
+    "lossless-turn-tape-v2",
+    "lossless-turn-runtime-batch-v1"
   ],
   "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2"],
   "bridgeFrameSchema": "1",

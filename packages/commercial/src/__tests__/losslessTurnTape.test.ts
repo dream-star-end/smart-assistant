@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { describe, test } from "node:test";
 
 import { LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID } from "@openclaude/protocol";
@@ -286,6 +287,126 @@ describe("materializeLosslessTurn", () => {
     assert.deepEqual(runtime[0]!.payload._runtimeEvent, rawOne);
     assert.deepEqual(runtime[1]!.payload._runtimeEvent, rawFive);
     assert.equal(runtime[1]!.payload.text, JSON.stringify(rawFive));
+  });
+
+  test("batches ordinary runtime events losslessly while leaving Bash tails directly queryable", () => {
+    const previous = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      const runtimeEvents = Array.from({ length: 9 }, (_, ordinal) => ({
+        ordinal,
+        observedAt: 1_783_944_000_000 + ordinal,
+        source: "ccb" as const,
+        payload: ordinal === 4
+          ? {
+              type: "system",
+              subtype: "bash_output_tail",
+              tool_use_id: "tool-bg",
+              tail: "still directly queryable",
+              total_bytes: 24,
+            }
+          : { type: "progress", ordinal, exact: `payload-${ordinal}` },
+      }));
+      const turn = materializeLosslessTurn({
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 101,
+        status: "completed",
+        turnKey: TURN_KEY,
+        text: "",
+        createdAt: 1_783_944_000_000,
+        runtimeEvents,
+      });
+
+      assert.equal(turn.logicalRecordCount, 9);
+      assert.equal(turn.records.length, 3, "two batches plus one unbatched Bash tail");
+      assert.match(turn.runtimeBatchManifestSha256!, /^[0-9a-f]{64}$/);
+      const tail = turn.records.find((record) => record.payload._runtimeEvent);
+      assert.equal(
+        (tail!.payload._runtimeEvent as Record<string, unknown>).subtype,
+        "bash_output_tail",
+      );
+      const reconstructed: Array<Record<string, unknown>> = [];
+      for (const record of turn.records) {
+        const rawBatch = record.payload._runtimeEventBatch;
+        if (!rawBatch || typeof rawBatch !== "object" || Array.isArray(rawBatch)) continue;
+        const batch = rawBatch as Record<string, unknown>;
+        const manifest = batch.manifest as Array<Record<string, unknown>>;
+        const raw = gunzipSync(Buffer.from(String(batch.data), "base64"));
+        for (const entry of manifest) {
+          const offset = Number(entry.offset);
+          const length = Number(entry.length);
+          const bytes = raw.subarray(offset, offset + length);
+          assert.equal(
+            createHash("sha256").update(bytes).digest("hex"),
+            entry.payloadSha256,
+          );
+          reconstructed.push(JSON.parse(bytes.toString("utf8")) as Record<string, unknown>);
+        }
+      }
+      assert.deepEqual(
+        reconstructed.map((payload) => payload._ocEventOrdinal),
+        [0, 1, 2, 3, 5, 6, 7, 8],
+      );
+      assert.deepEqual(
+        reconstructed.map((payload) => payload._runtimeEvent),
+        runtimeEvents.filter((event) => event.ordinal !== 4).map((event) => event.payload),
+      );
+      const replay = materializeLosslessTurn({
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 101,
+        status: "completed",
+        turnKey: TURN_KEY,
+        text: "",
+        createdAt: 1_783_944_000_000,
+        runtimeEvents,
+      });
+      assert.deepEqual(
+        replay.records.map((record) => ({
+          id: record.id,
+          payloadSha256: record.payloadSha256,
+          payloadBytes: record.payloadBytes,
+        })),
+        turn.records.map((record) => ({
+          id: record.id,
+          payloadSha256: record.payloadSha256,
+          payloadBytes: record.payloadBytes,
+        })),
+        "ACK-loss replay must reproduce byte-identical physical batch records",
+      );
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previous;
+    }
+  });
+
+  test("runtime batching is default-off and requires an explicit safe-rollout opt-in", () => {
+    const previous = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+    try {
+      const turn = materializeLosslessTurn({
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 102,
+        status: "completed",
+        turnKey: TURN_KEY,
+        text: "",
+        createdAt: 1_783_944_000_000,
+        runtimeEvents: Array.from({ length: 4 }, (_, ordinal) => ({
+          ordinal,
+          observedAt: 1_783_944_000_000 + ordinal,
+          source: "gateway" as const,
+          payload: { ordinal },
+        })),
+      });
+      assert.equal(turn.records.length, 4);
+      assert.equal(turn.logicalRecordCount, 4);
+      assert.equal(turn.runtimeBatchManifestSha256, undefined);
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previous;
+    }
   });
 
   test("materializes an uncapped visible assistant row for an error-only paid turn", () => {

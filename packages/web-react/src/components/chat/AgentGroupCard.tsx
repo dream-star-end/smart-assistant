@@ -78,7 +78,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
         </span>
         <span className="min-w-0 truncate text-[13px] font-medium text-fg">{msg.text || "子任务"}</span>
-        <span className="ml-auto flex items-center gap-2">
+        <span className="ml-auto flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (
             <Badge tone="accent">运行中</Badge>
           ) : (

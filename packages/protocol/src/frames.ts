@@ -410,6 +410,10 @@ export const OutboundMessage = Type.Object({
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
+  /** Exact browser-authored user row that owns this turn.  Every streamed
+   * frame carries it so reconnects, delayed finals and errors cannot tear
+   * down a newer turn that happens to reuse the same peer/session. */
+  clientMessageId: Type.Optional(ClientMessageId),
   blocks: Type.Array(OutboundContentBlock),
   isFinal: Type.Boolean(),
   // v5 图片体验 — gateway「免模型直投」的图片编辑 / outpaint 交付终帧回带触发它的
@@ -555,6 +559,8 @@ export const OutboundError = Type.Object({
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
+  /** Same turn identity as the companion outbound.message final. */
+  clientMessageId: Type.Optional(ClientMessageId),
   /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。 */
   code: Type.Union([
     Type.Literal('insufficient_credits'),
