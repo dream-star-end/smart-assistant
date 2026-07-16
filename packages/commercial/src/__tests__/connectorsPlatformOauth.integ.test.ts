@@ -199,6 +199,7 @@ async function publishPlatformConnector(slug: string): Promise<{
     policyVersion: 1,
     submittedBy: owner,
     kind: 'connector',
+    pluginType: 'declarative-http',
     queueAiReview: false,
   })
   return { versionId: published.versionId, owner, reviewer, specHash }

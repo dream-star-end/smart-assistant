@@ -1,3 +1,4 @@
+import type { MarketplacePluginType } from '@openclaude/protocol'
 import type { QueryRunner } from '../db/queries.js'
 
 /**
@@ -83,6 +84,7 @@ export interface LockedMarketplaceVersion {
   securityPolicyVersion: number | null
   signature: Buffer | null
   keyId: string | null
+  signatureScheme: 'connector-v1' | 'plugin-v2' | null
 }
 
 /** 固定锁序的第一步：只锁 version 行。 */
@@ -108,12 +110,13 @@ export async function lockMarketplaceVersion(
     security_policy_version: number | null
     signature: Buffer | null
     key_id: string | null
+    signature_scheme: 'connector-v1' | 'plugin-v2' | null
   }>(
     `SELECT id::text, slug, version, name, artifact_hash, status,
             submitted_by::text, raw_artifact, security_review_state,
             functional_verify_state, exec_revoked_at, exec_contract,
             exec_contract_hash, compiler_version, security_policy_version,
-            signature, key_id
+            signature, key_id, signature_scheme
        FROM marketplace_skill_versions
       WHERE id = $1
       FOR UPDATE`,
@@ -139,12 +142,14 @@ export async function lockMarketplaceVersion(
     securityPolicyVersion: row.security_policy_version,
     signature: row.signature,
     keyId: row.key_id,
+    signatureScheme: row.signature_scheme,
   }
 }
 
 export interface LockedMarketplaceListing {
   slug: string
   kind: 'skill' | 'agent' | 'connector'
+  pluginType: MarketplacePluginType | null
   state: string
   ownerUserId: string
   orgId: string | null
@@ -159,12 +164,13 @@ export async function lockMarketplaceListing(
   const r = await runner.query<{
     slug: string
     kind: 'skill' | 'agent' | 'connector'
+    plugin_type: MarketplacePluginType | null
     state: string
     owner_user_id: string
     org_id: string | null
     current_approved_version_id: string | null
   }>(
-    `SELECT slug, kind, state, owner_user_id::text,
+    `SELECT slug, kind, plugin_type, state, owner_user_id::text,
             org_id::text, current_approved_version_id::text
        FROM marketplace_skill_listings
       WHERE slug = $1
@@ -176,6 +182,7 @@ export async function lockMarketplaceListing(
   return {
     slug: row.slug,
     kind: row.kind,
+    pluginType: row.plugin_type,
     state: row.state,
     ownerUserId: row.owner_user_id,
     orgId: row.org_id,

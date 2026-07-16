@@ -20,7 +20,13 @@ process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
 
 import { canonicalBytes, canonicalSha256Hex, sha256Hex } from '../connectors/spec/canonical.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
-import { type ContractSignMeta, signContract, verifyContract } from '../connectors/spec/signer.js'
+import {
+  type LegacyConnectorContractSignMeta,
+  signLegacyConnectorContract,
+  signPluginContractV2,
+  verifyLegacyConnectorContract,
+  verifyPluginContractV2,
+} from '../connectors/spec/signer.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 
 function isCode(code: string) {
@@ -109,7 +115,7 @@ describe('canonical', () => {
 // ─── sign / verify(篡改即失败) ─────────────────────────────────────────────
 
 describe('signer', () => {
-  const meta: ContractSignMeta = {
+  const meta: LegacyConnectorContractSignMeta = {
     listingSlug: 'notion',
     versionId: 42,
     kind: 'connector',
@@ -120,15 +126,23 @@ describe('signer', () => {
   }
 
   test('roundtrip 通过', () => {
-    const { signature, keyId } = signContract(meta)
+    const { signature, keyId } = signLegacyConnectorContract(meta)
     assert.equal(keyId, 'v1')
     assert.match(signature, /^[0-9a-f]{64}$/)
-    assert.equal(verifyContract(meta, signature, keyId), true)
+    assert.equal(verifyLegacyConnectorContract(meta, signature, keyId), true)
+  })
+
+  test('connector-v1 legacy bytes stay frozen across the Plugin migration', () => {
+    const fixedEnv = { OPENCLAUDE_KMS_KEY: Buffer.alloc(32).toString('base64') }
+    assert.equal(
+      signLegacyConnectorContract(meta, { env: fixedEnv }).signature,
+      'cf96495e46413e0140cb283d1ab93509e88aec78e925e649ac48cc873fe73508',
+    )
   })
 
   test('覆盖字段任一被篡改 → verify 失败', () => {
-    const { signature, keyId } = signContract(meta)
-    const tampers: ContractSignMeta[] = [
+    const { signature, keyId } = signLegacyConnectorContract(meta)
+    const tampers: LegacyConnectorContractSignMeta[] = [
       { ...meta, specHash: 'c'.repeat(64) },
       { ...meta, execContractHash: 'd'.repeat(64) },
       { ...meta, policyVersion: 2 },
@@ -137,22 +151,35 @@ describe('signer', () => {
       { ...meta, compilerVersion: 2 },
     ]
     for (const t of tampers) {
-      assert.equal(verifyContract(t, signature, keyId), false)
+      assert.equal(verifyLegacyConnectorContract(t, signature, keyId), false)
     }
   })
 
   test('签名字节被篡改 → verify 失败', () => {
-    const { signature, keyId } = signContract(meta)
+    const { signature, keyId } = signLegacyConnectorContract(meta)
     const flipped = (signature[0] === '0' ? '1' : '0') + signature.slice(1)
-    assert.equal(verifyContract(meta, flipped, keyId), false)
+    assert.equal(verifyLegacyConnectorContract(meta, flipped, keyId), false)
     // 非法形状签名一律 false
-    assert.equal(verifyContract(meta, 'not-hex', keyId), false)
-    assert.equal(verifyContract(meta, `${signature}ff`, keyId), false)
+    assert.equal(verifyLegacyConnectorContract(meta, 'not-hex', keyId), false)
+    assert.equal(verifyLegacyConnectorContract(meta, `${signature}ff`, keyId), false)
   })
 
   test('未知 keyId → verify 失败', () => {
-    const { signature } = signContract(meta)
-    assert.equal(verifyContract(meta, signature, 'v99'), false)
+    const { signature } = signLegacyConnectorContract(meta)
+    assert.equal(verifyLegacyConnectorContract(meta, signature, 'v99'), false)
+  })
+
+  test('plugin-v2 binds subtype and is cryptographically separated from connector-v1', () => {
+    const legacy = signLegacyConnectorContract(meta)
+    const v2Meta = { ...meta, pluginType: 'declarative-http' as const }
+    const v2 = signPluginContractV2(v2Meta)
+    assert.equal(verifyPluginContractV2(v2Meta, v2.signature, v2.keyId), true)
+    assert.equal(
+      verifyPluginContractV2({ ...v2Meta, pluginType: 'managed-browser' }, v2.signature, v2.keyId),
+      false,
+    )
+    assert.notEqual(v2.signature, legacy.signature)
+    assert.equal(verifyLegacyConnectorContract(meta, v2.signature, v2.keyId), false)
   })
 })
 

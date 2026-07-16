@@ -8,6 +8,7 @@ const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),
   refresh: vi.fn(),
   mute: vi.fn(),
+  catalogChange: null as null | (() => void),
 }));
 
 vi.mock("./marketplace/useMarketplacePublishes", () => ({
@@ -24,6 +25,12 @@ vi.mock("./marketplace/useMarketplacePublishes", () => ({
       refresh: monitor.refresh,
       muteTransition: monitor.mute,
     };
+  },
+}));
+
+vi.mock("./marketplace/useMarketplaceRevision", () => ({
+  useMarketplaceRevision: ({ onChange }: { onChange: () => void }) => {
+    monitor.catalogChange = onChange;
   },
 }));
 
@@ -79,6 +86,24 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   monitor.emit = null;
+  monitor.catalogChange = null;
+});
+
+test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
+  render(
+    <MarketplaceCenter
+      open
+      tab="browse"
+      auth={auth}
+      isAdmin={false}
+      onTabChange={() => {}}
+      onClose={() => {}}
+    />,
+  );
+  expect(screen.getByTestId("browse-props")).toHaveTextContent("skill|0|none");
+  act(() => monitor.catalogChange?.());
+  expect(screen.getByTestId("browse-props")).toHaveTextContent("skill|1|none");
+  expect(monitor.refresh).toHaveBeenCalledTimes(1);
 });
 
 test("连接器旧 kind 在产品层显示为插件；通过通知 CTA 实时刷新并一次性打开条目", () => {

@@ -15,13 +15,18 @@
  * 任一不满足 **抛 fail-closed 错误**,绝不返回可执行 contract。
  */
 
+import { isMarketplacePluginType } from '@openclaude/protocol'
 import { Value } from '@sinclair/typebox/value'
 import type { Pool } from 'pg'
 import { type QueryRunner, tx } from '../../db/queries.js'
 import { isDefaultConnectorArtifact } from '../defaults/index.js'
 import { canonicalSha256Hex } from './canonical.js'
 import { COMPILER_VERSION, compileSpec } from './compiler.js'
-import { signContract, verifyContract } from './signer.js'
+import {
+  signLegacyConnectorContract,
+  verifyLegacyConnectorContract,
+  verifyPluginContractV2,
+} from './signer.js'
 import { ConnectorSpecError, ExecContract, type ExecContractT } from './types.js'
 
 /**
@@ -84,9 +89,10 @@ export async function securityApproveWithRunner(
     raw_artifact: string
     artifact_hash: string
     kind: string
+    plugin_type: string | null
   }>(
     `SELECT v.slug, v.submitted_by, v.security_review_state, v.raw_artifact, v.artifact_hash,
-              l.kind
+              l.kind, l.plugin_type
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1
@@ -98,6 +104,11 @@ export async function securityApproveWithRunner(
   // P0-2:kind 是 DB 事实,skill/agent version 调本函数必败。
   if (row.kind !== 'connector')
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
+  if (row.plugin_type !== 'declarative-http')
+    throw new ConnectorSpecError(
+      'WRONG_ARTIFACT_KIND',
+      `pluginType=${String(row.plugin_type)} is not declarative-http`,
+    )
   if (row.security_review_state !== 'draft')
     throw new ConnectorSpecError('NOT_DRAFT', `state=${row.security_review_state}`)
 
@@ -135,7 +146,7 @@ export async function securityApproveWithRunner(
   if ((rawSpec as { id?: unknown }).id !== row.slug)
     throw new ConnectorSpecError('SPEC_ID_MISMATCH', 'spec.id != listing slug')
 
-  const sig = signContract(
+  const sig = signLegacyConnectorContract(
     {
       listingSlug: row.slug,
       versionId: input.versionId,
@@ -156,6 +167,7 @@ export async function securityApproveWithRunner(
               security_policy_version = $5,
               signature = $6,
               key_id = $7,
+              signature_scheme = 'connector-v1',
               security_reviewed_by = $8,
               security_reviewed_at = now(),
               security_review_state = 'security_approved'
@@ -312,12 +324,14 @@ export interface VerifiedContract {
   /** exec_contract_hash 的 hex(= canonicalSha256Hex(contract),已与存列比对自洽)。 */
   execContractHash: string
   authContractVersion: number
+  pluginType: 'declarative-http'
 }
 
 interface StoredContractRow {
   id: string
   slug: string
   kind: string
+  plugin_type: string | null
   artifact_hash: string
   raw_artifact: string
   security_review_state: string
@@ -329,6 +343,7 @@ interface StoredContractRow {
   security_policy_version: number | null
   signature: Buffer | null
   key_id: string | null
+  signature_scheme: string | null
 }
 
 async function readStoredContractRows(
@@ -337,10 +352,11 @@ async function readStoredContractRows(
 ): Promise<StoredContractRow[]> {
   if (versionIds.length === 0) return []
   const r = await runner.query<StoredContractRow>(
-    `SELECT v.id::text, v.slug, l.kind, v.artifact_hash, v.raw_artifact,
+    `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.artifact_hash, v.raw_artifact,
             v.security_review_state, v.functional_verify_state,
             v.exec_revoked_at, v.exec_contract,
-            v.exec_contract_hash, v.compiler_version, v.security_policy_version, v.signature, v.key_id
+            v.exec_contract_hash, v.compiler_version, v.security_policy_version, v.signature,
+            v.key_id, v.signature_scheme
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.id = ANY($1::bigint[])`,
@@ -357,6 +373,13 @@ function verifyStoredContractRow(
   const versionId = Number(row.id)
   if (row.kind !== 'connector')
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', `kind=${row.kind} is not connector`)
+  if (!isMarketplacePluginType(row.plugin_type))
+    throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'connector plugin_type is invalid')
+  if (row.plugin_type !== 'declarative-http')
+    throw new ConnectorSpecError(
+      'WRONG_ARTIFACT_KIND',
+      `pluginType=${row.plugin_type} is not executable by the declarative loader`,
+    )
   if (row.security_review_state !== 'security_approved')
     throw new ConnectorSpecError('NOT_SECURITY_APPROVED', `state=${row.security_review_state}`)
   if (!isAcceptedFunctionalVerificationState(row.functional_verify_state))
@@ -371,6 +394,7 @@ function verifyStoredContractRow(
     row.exec_contract_hash == null ||
     row.signature == null ||
     row.key_id == null ||
+    row.signature_scheme == null ||
     row.compiler_version == null ||
     row.security_policy_version == null
   )
@@ -412,20 +436,27 @@ function verifyStoredContractRow(
   if (recomputedHash !== storedHashHex)
     throw new ConnectorSpecError('HASH_MISMATCH', 'exec_contract_hash mismatch')
 
-  const ok = verifyContract(
-    {
-      listingSlug: row.slug,
-      versionId,
-      kind: row.kind,
-      specHash: (execContract as ExecContractT).spec_hash,
-      execContractHash: recomputedHash,
-      compilerVersion: Number(row.compiler_version),
-      policyVersion: Number(row.security_policy_version),
-    },
-    Buffer.from(row.signature).toString('hex'),
-    row.key_id,
-    env,
-  )
+  const signMeta = {
+    listingSlug: row.slug,
+    versionId,
+    kind: row.kind,
+    specHash: (execContract as ExecContractT).spec_hash,
+    execContractHash: recomputedHash,
+    compilerVersion: Number(row.compiler_version),
+    policyVersion: Number(row.security_policy_version),
+  }
+  const signature = Buffer.from(row.signature).toString('hex')
+  const ok =
+    row.signature_scheme === 'connector-v1'
+      ? verifyLegacyConnectorContract(signMeta, signature, row.key_id, env)
+      : row.signature_scheme === 'plugin-v2'
+        ? verifyPluginContractV2(
+            { ...signMeta, pluginType: row.plugin_type },
+            signature,
+            row.key_id,
+            env,
+          )
+        : false
   if (!ok)
     throw new ConnectorSpecError('SIGNATURE_INVALID', 'contract signature verification failed')
 
@@ -435,6 +466,7 @@ function verifyStoredContractRow(
     versionId,
     execContractHash: recomputedHash,
     authContractVersion: (execContract as ExecContractT).auth_contract_version,
+    pluginType: row.plugin_type,
   }
 }
 

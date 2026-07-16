@@ -6,7 +6,11 @@ export type MarketplaceStorageKind = 'skill' | 'agent' | 'connector'
 
 export type MarketplaceArtifactKind = 'skill' | 'agent' | 'plugin'
 
-export type MarketplacePluginType = 'declarative-http'
+export type MarketplacePluginType = 'declarative-http' | 'sandboxed-local' | 'managed-browser'
+
+export function isMarketplacePluginType(value: unknown): value is MarketplacePluginType {
+  return value === 'declarative-http' || value === 'sandboxed-local' || value === 'managed-browser'
+}
 
 /**
  * Public Agent composition vocabulary. A Skill contributes reusable guidance;
@@ -68,10 +72,15 @@ export type MarketplaceArtifactCompatibility =
 /** Additive public projection; never changes the legacy `kind` field. */
 export function marketplaceArtifactCompatibility(
   kind: MarketplaceStorageKind,
+  pluginType: MarketplacePluginType | null,
 ): MarketplaceArtifactCompatibility {
   if (kind === 'connector') {
-    return { artifactKind: 'plugin', pluginType: 'declarative-http' }
+    if (!isMarketplacePluginType(pluginType)) {
+      throw new TypeError('connector marketplace artifact requires a valid pluginType')
+    }
+    return { artifactKind: 'plugin', pluginType }
   }
+  if (pluginType !== null) throw new TypeError(`${kind} marketplace artifact cannot be a Plugin`)
   return { artifactKind: kind }
 }
 

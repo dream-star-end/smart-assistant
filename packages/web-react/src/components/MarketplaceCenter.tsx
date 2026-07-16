@@ -13,6 +13,7 @@ import {
   type MarketplacePublishTransition,
   useMarketplacePublishes,
 } from './marketplace/useMarketplacePublishes'
+import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
 import { Alert, Button, Tabs } from './ui'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
@@ -91,6 +92,15 @@ export function MarketplaceCenter({
     enabled: open && !!auth,
     onTransition: onPublishTransition,
   })
+  const onCatalogRevision = useCallback(() => {
+    setBrowseRevision((revision) => revision + 1)
+    publishes.refresh()
+  }, [publishes.refresh])
+  useMarketplaceRevision({
+    auth,
+    enabled: open && !!auth,
+    onChange: onCatalogRevision,
+  })
 
   // when (re)opened, honor the requested category (e.g. opened to 智能体)
   useEffect(() => {
@@ -154,7 +164,7 @@ export function MarketplaceCenter({
             ) : (
               <>
                 {publishNotice && (
-                  <div className="px-4 pt-3" role="status">
+                  <output className="block px-4 pt-3">
                     <Alert
                       tone={publishNotice.publish.status === 'approved' ? 'success' : 'danger'}
                       title={
@@ -193,7 +203,7 @@ export function MarketplaceCenter({
                         </div>
                       </div>
                     </Alert>
-                  </div>
+                  </output>
                 )}
                 {safeTab === 'browse' && (
                   <div className="flex flex-col" data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}>

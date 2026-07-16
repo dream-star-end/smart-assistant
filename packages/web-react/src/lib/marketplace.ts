@@ -1,9 +1,10 @@
 // 市场纯函数助手 —— 升级可见性、分区导航与发布校验的唯一权威（面板间共享，可测）。
 import {
   MARKETPLACE_CATEGORIES,
+  type MarketplaceArtifactKind,
+  type MarketplacePluginType,
   isMarketplaceCategoryId,
   marketplaceArtifactCompatibility,
-  type MarketplaceArtifactKind,
 } from '@openclaude/protocol'
 import type { MarketplaceCard, MarketplaceInstalled } from './types'
 
@@ -11,8 +12,12 @@ import type { MarketplaceCard, MarketplaceInstalled } from './types'
 export function marketplaceArtifactKind(row: {
   kind: 'skill' | 'agent' | 'connector'
   artifactKind?: MarketplaceArtifactKind
+  pluginType?: MarketplacePluginType | null
 }): MarketplaceArtifactKind {
-  return row.artifactKind ?? marketplaceArtifactCompatibility(row.kind).artifactKind
+  // Rolling-deploy compatibility only: an old API omitted pluginType because
+  // every historical connector was declarative HTTP. New API rows are DB-driven.
+  const pluginType = row.kind === 'connector' ? (row.pluginType ?? 'declarative-http') : null
+  return row.artifactKind ?? marketplaceArtifactCompatibility(row.kind, pluginType).artifactKind
 }
 
 /**

@@ -30,11 +30,12 @@ import {
 import { ConnectorError } from '../connectors/errors.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import { loadVerifiedContractWithMeta } from '../connectors/spec/review.js'
+import { signPluginContractV2 } from '../connectors/spec/signer.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
-import { query } from '../db/queries.js'
+import { query, tx } from '../db/queries.js'
 import { handleAdminPutPlatformOauthApp } from '../http/admin/connectorPlatformOauth.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
@@ -458,6 +459,7 @@ describe('v5 connector marketplace', () => {
     const pending = (await listPendingVersions()).find((row) => row.versionId === versionId)
     assert.ok(pending)
     assert.equal(pending.kind, 'connector')
+    assert.equal(pending.pluginType, 'declarative-http')
     assert.deepEqual(pending.manifest, {
       connector: true,
       proposedSecurityDecision: securityDecision,
@@ -483,10 +485,13 @@ describe('v5 connector marketplace', () => {
       has_signature: boolean
       listing_state: string
       current_id: string | null
+      plugin_type: string | null
+      signature_scheme: string | null
     }>(
       `SELECT v.status, v.security_review_state, v.functional_verify_state, v.exec_revoked_at,
               (v.signature IS NOT NULL) AS has_signature, l.state AS listing_state,
-              l.current_approved_version_id::text AS current_id
+              l.current_approved_version_id::text AS current_id,
+              l.plugin_type, v.signature_scheme
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1`,
@@ -500,7 +505,48 @@ describe('v5 connector marketplace', () => {
       has_signature: true,
       listing_state: 'active',
       current_id: versionId,
+      plugin_type: 'declarative-http',
+      signature_scheme: 'connector-v1',
     })
+
+    // Slice A keeps writing legacy bytes, but can already read a future v2
+    // signature once the explicit DB writer gate is used.
+    const trust = await query<{
+      artifact_hash: string
+      exec_contract_hash: Buffer
+      compiler_version: number
+      security_policy_version: number
+    }>(
+      `SELECT artifact_hash, exec_contract_hash, compiler_version, security_policy_version
+         FROM marketplace_skill_versions WHERE id=$1`,
+      [versionId],
+    )
+    const trustRow = trust.rows[0]!
+    const v2Signature = signPluginContractV2({
+      listingSlug: slug,
+      versionId: Number(versionId),
+      kind: 'connector',
+      pluginType: 'declarative-http',
+      specHash: trustRow.artifact_hash,
+      execContractHash: Buffer.from(trustRow.exec_contract_hash).toString('hex'),
+      compilerVersion: trustRow.compiler_version,
+      policyVersion: trustRow.security_policy_version,
+    })
+    await tx(async (client) => {
+      await client.query(
+        "SELECT set_config('openclaude.plugin_signature_writer', 'plugin-v2', true)",
+      )
+      await client.query(
+        `UPDATE marketplace_skill_versions
+            SET signature=$2, key_id=$3, signature_scheme='plugin-v2'
+          WHERE id=$1`,
+        [versionId, Buffer.from(v2Signature.signature, 'hex'), v2Signature.keyId],
+      )
+    })
+    assert.equal(
+      (await loadVerifiedContractWithMeta(Number(versionId), getPool())).pluginType,
+      'declarative-http',
+    )
 
     assert.equal(
       (await listApprovedForSearch('connector')).some((row) => row.slug === slug),
@@ -509,6 +555,7 @@ describe('v5 connector marketplace', () => {
     const detail = await getListingDetail(slug)
     assert.ok(detail)
     assert.equal(detail.kind, 'connector')
+    assert.equal(detail.pluginType, 'declarative-http')
     assert.equal(detail.official, false)
     assert.equal(detail.manifest, null, '公开详情不得暴露发布者提议的安全决定')
     assert.deepEqual(detail.connectorContract, {
@@ -525,10 +572,8 @@ describe('v5 connector marketplace', () => {
       false,
     )
     await installApprovedVersion({ userId: user, versionId })
-    assert.equal(
-      (await listInstalled(user)).some((row) => row.slug === slug),
-      true,
-    )
+    const installed = (await listInstalled(user)).find((row) => row.slug === slug)
+    assert.equal(installed?.pluginType, 'declarative-http')
     assert.equal(
       (await listDeclarativeCatalog(getPool(), user)).some((row) => row.slug === slug),
       true,
@@ -924,6 +969,7 @@ describe('v5 connector marketplace', () => {
       policyVersion: 1,
       submittedBy: owner,
       kind: 'connector',
+      pluginType: 'declarative-http',
       queueAiReview: false,
     })
 
@@ -1247,7 +1293,11 @@ describe('v5 connector marketplace', () => {
       userId: installer,
       versionId: agent.versionId,
     })
-    assert.equal(reinstalled.ready, true, 'existing account authorization is reused after reinstall')
+    assert.equal(
+      reinstalled.ready,
+      true,
+      'existing account authorization is reused after reinstall',
+    )
 
     await revokeListing('agent-required-plugin', 'plugin kill switch')
     assert.equal(

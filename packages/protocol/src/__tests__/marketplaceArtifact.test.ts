@@ -10,12 +10,28 @@ import {
 
 describe('marketplace artifact compatibility', () => {
   it('projects legacy connector rows as declarative HTTP plugins', () => {
-    assert.deepEqual(marketplaceArtifactCompatibility('connector'), {
+    assert.deepEqual(marketplaceArtifactCompatibility('connector', 'declarative-http'), {
       artifactKind: 'plugin',
       pluginType: 'declarative-http',
     })
-    assert.deepEqual(marketplaceArtifactCompatibility('skill'), { artifactKind: 'skill' })
-    assert.deepEqual(marketplaceArtifactCompatibility('agent'), { artifactKind: 'agent' })
+    assert.deepEqual(marketplaceArtifactCompatibility('connector', 'sandboxed-local'), {
+      artifactKind: 'plugin',
+      pluginType: 'sandboxed-local',
+    })
+    assert.deepEqual(marketplaceArtifactCompatibility('connector', 'managed-browser'), {
+      artifactKind: 'plugin',
+      pluginType: 'managed-browser',
+    })
+    assert.deepEqual(marketplaceArtifactCompatibility('skill', null), { artifactKind: 'skill' })
+    assert.deepEqual(marketplaceArtifactCompatibility('agent', null), { artifactKind: 'agent' })
+  })
+
+  it('rejects missing or cross-kind Plugin subtype projections', () => {
+    assert.throws(() => marketplaceArtifactCompatibility('connector', null), /pluginType/)
+    assert.throws(
+      () => marketplaceArtifactCompatibility('skill', 'managed-browser'),
+      /cannot be a Plugin/,
+    )
   })
 
   it('maps stored human reviews to the public manual vocabulary', () => {
