@@ -101,6 +101,7 @@ function CopyIconButton({
       title={label}
       size="sm"
       shape="square"
+      className="[@media(hover:none)]:size-11"
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(getText());
@@ -199,6 +200,7 @@ function SpeakButton({ getText }: { getText: () => string }) {
       title={speaking ? "停止朗读" : "朗读"}
       size="sm"
       shape="square"
+      className="[@media(hover:none)]:size-11"
       onClick={toggle}
     >
       {speaking ? <Square size={14} className="fill-current" /> : <Volume2 size={15} />}
@@ -226,7 +228,14 @@ function MessageActions({
       />
       <SpeakButton getText={() => stripMarkdown(msg.text || "")} />
       {showRegen && cb.onRegenerate && (
-        <IconButton aria-label="重新生成" title="重新生成" size="sm" shape="square" onClick={cb.onRegenerate}>
+        <IconButton
+          aria-label="重新生成"
+          title="重新生成"
+          size="sm"
+          shape="square"
+          className="[@media(hover:none)]:size-11"
+          onClick={cb.onRegenerate}
+        >
           <RotateCcw size={15} />
         </IconButton>
       )}
@@ -236,6 +245,7 @@ function MessageActions({
           title="反馈"
           size="sm"
           shape="square"
+          className="[@media(hover:none)]:size-11"
           onClick={() => cb.onFeedback?.(buildFeedbackCtx(msg))}
         >
           <MessageSquare size={15} />
@@ -590,7 +600,7 @@ export function SystemCard({ msg }: { msg: ChatMessage }) {
   if (!msg.text) return null;
   return (
     <div className="flex justify-center animate-in">
-      <div className="max-w-[80%] rounded-full bg-hover px-3 py-1 text-center text-[12px] text-faint">
+      <div className="max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-1.5 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] sm:text-center">
         {msg.text}
       </div>
     </div>

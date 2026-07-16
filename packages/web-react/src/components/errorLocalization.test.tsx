@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
@@ -31,12 +31,19 @@ function englishApiError() {
 
 describe("展示层错误收口：后端英文 message 不外露，渲染中文 fallback", () => {
   test("manage/CronPanel · 渲染「加载定时任务失败」而非英文原文", async () => {
-    vi.spyOn(api, "listCron").mockRejectedValue(englishApiError());
+    const listCron = vi
+      .spyOn(api, "listCron")
+      .mockRejectedValueOnce(englishApiError())
+      .mockResolvedValueOnce([]);
     render(<CronPanel auth={auth} />);
     expect(
       await screen.findByText("加载定时任务失败（追踪号 req-behav）"),
     ).toBeInTheDocument();
     expect(screen.queryByText(/sync failed/)).not.toBeInTheDocument();
+    expect(screen.queryByText("还没有定时任务")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("还没有定时任务")).toBeInTheDocument();
+    await waitFor(() => expect(listCron).toHaveBeenCalledTimes(2));
   });
 
   test("settings/UsageTab · 渲染「加载用量统计失败」而非英文原文", async () => {

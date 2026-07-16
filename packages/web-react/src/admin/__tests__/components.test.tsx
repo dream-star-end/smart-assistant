@@ -1,3 +1,4 @@
+import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { DataTable, type Column } from "../components/DataTable";
@@ -69,5 +70,16 @@ describe("DataTable", () => {
     render(<DataTable columns={columns} rows={rows} rowKey={(r) => r.id} onRowClick={onRowClick} />);
     fireEvent.click(screen.getByText("Alpha"));
     expect(onRowClick).toHaveBeenCalledWith(rows[0], 0);
+  });
+
+  test("可点击行可聚焦，并支持 Enter / Space 键盘激活", () => {
+    const onRowClick = vi.fn();
+    const rows: Row[] = [{ id: "a", name: "Alpha", n: 3 }];
+    render(<DataTable columns={columns} rows={rows} rowKey={(r) => r.id} onRowClick={onRowClick} />);
+    const row = screen.getByText("Alpha").closest("tr");
+    expect(row).toHaveAttribute("tabindex", "0");
+    fireEvent.keyDown(row!, { key: "Enter" });
+    fireEvent.keyDown(row!, { key: " " });
+    expect(onRowClick).toHaveBeenCalledTimes(2);
   });
 });

@@ -26,6 +26,8 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.getByText("前端工程师")).toBeInTheDocument();
     expect(screen.getByText("做登录页")).toBeInTheDocument();
     expect(screen.getByText("后端工程师")).toBeInTheDocument();
+    const headerStatus = screen.getByText(/1 运行中/).parentElement;
+    expect(headerStatus).toHaveClass("flex-wrap", "max-w-[55%]");
   });
 
   test("全完成默认收起;点头部展开队员", () => {
@@ -159,6 +161,8 @@ describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => 
       { delegateCosts: { "hidden-reviewer": "3", "coding-assistant": "12345" } },
     );
     expect(screen.getByText("3 积分")).toBeInTheDocument();
-    expect(screen.getByText("12,345 积分")).toBeInTheDocument();
+    const cost = screen.getByText("12,345 积分");
+    expect(cost).toBeInTheDocument();
+    expect(cost.parentElement).toHaveClass("flex-wrap", "max-w-[55%]");
   });
 });

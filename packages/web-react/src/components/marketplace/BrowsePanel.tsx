@@ -341,7 +341,14 @@ export function BrowsePanel({
 
       {err && (
         <div className="px-4 pb-2">
-          <Alert tone="danger">{err}</Alert>
+          <Alert tone="danger">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="min-w-0 flex-1">{err}</span>
+              <Button size="sm" variant="secondary" onClick={() => void loadCards(true)}>
+                重试
+              </Button>
+            </div>
+          </Alert>
         </div>
       )}
 

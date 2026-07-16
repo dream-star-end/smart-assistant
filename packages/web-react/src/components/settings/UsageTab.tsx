@@ -11,7 +11,7 @@ import type {
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
-import { Alert, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 
 const SESSIONS_PAGE = 20;
@@ -75,6 +75,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [usageReloadTick, setUsageReloadTick] = useState(0);
   /** 展开了组队明细的会话行(session_id 集合)。 */
   const [expandedDelegates, setExpandedDelegates] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
@@ -120,7 +121,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth]);
+  }, [auth, usageReloadTick]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
@@ -237,6 +238,14 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         <Alert tone="danger" className="text-[12.5px]">
           {err}
         </Alert>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="mt-2"
+          onClick={() => setUsageReloadTick((tick) => tick + 1)}
+        >
+          重试
+        </Button>
       </div>
     );
   }

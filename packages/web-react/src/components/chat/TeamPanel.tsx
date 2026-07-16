@@ -87,7 +87,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
           <span className="block truncate text-[12.5px] font-medium text-fg">{name}</span>
           {goal && <span className="block truncate text-[11.5px] text-faint">{goal}</span>}
         </span>
-        <span className="flex shrink-0 items-center gap-2">
+        <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (
             <Badge tone="accent">运行中</Badge>
           ) : (
@@ -183,7 +183,7 @@ export const TeamPanel = memo(
           <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg">
             团队协作 · {total} 个智能体
           </span>
-          <span className="flex shrink-0 items-center gap-2 text-[11.5px]">
+          <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-[11.5px]">
             {running > 0 && (
               <span className="flex items-center gap-1 text-accent">
                 <Spinner size={10} /> {running} 运行中
