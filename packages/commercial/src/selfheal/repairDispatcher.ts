@@ -313,17 +313,22 @@ export async function dispatchRepair(
       // condition 仍 firing **且未被压制**(H1b:operator 压制中不派修)。若在步1读到
       // open 之后 condition 已恢复 / incident 被 resolve / 被压制,SELECT 返 0 行 →
       // 不插入 → 不派单(绝不对已恢复/已压制系统派 codex 改动)。
+      // tier 从 policy.execution_class 派生(批1a:tier1 运维动作走纯机器路径,
+      // tier 列成为执行侧分流权威;policy 无命中/未声明 → 保守 tier2)。
       const ins = await client.query<{ id: string; attempt: number }>(
         `INSERT INTO codex_repairs (incident_id, status, attempt, tier, created_at, updated_at)
-         SELECT i.id, 'pending', COALESCE(MAX(cr.attempt), 0) + 1, 'tier2', NOW(), NOW()
+         SELECT i.id, 'pending', COALESCE(MAX(cr.attempt), 0) + 1,
+                CASE WHEN p.execution_class = 'tier1' THEN 'tier1' ELSE 'tier2' END,
+                NOW(), NOW()
            FROM incidents i
            LEFT JOIN codex_repairs cr ON cr.incident_id = i.id
+           LEFT JOIN incident_policies p ON p.id = i.policy_id
            LEFT JOIN admin_alert_rule_state c ON c.rule_id = i.condition_key
           WHERE i.id = $1::bigint
             AND i.status <> 'resolved'
             AND COALESCE(c.firing, FALSE) = TRUE
             AND NOT COALESCE(c.suppressed_until_clear, FALSE)
-          GROUP BY i.id
+          GROUP BY i.id, p.execution_class
          RETURNING id::text AS id, attempt`,
         [incidentId],
       );
