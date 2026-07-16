@@ -31,6 +31,7 @@ import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
+  KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_TOPIC_PAGE_MAX,
   KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
   KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES,
@@ -170,6 +171,33 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(isKnowledgePlanetLoginProbeDue(2_999, 3_000, 0), false)
     assert.equal(isKnowledgePlanetLoginProbeDue(3_000, 3_000, 0), true)
     assert.equal(isKnowledgePlanetLoginProbeDue(999_999, 3_000, 48), false)
+  })
+
+  test('waits for the real QR image and never publishes the iframe loading mask', () => {
+    assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 15_000)
+    const captureStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function captureQr')
+    const captureEnd = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
+    assert.ok(captureStart >= 0 && captureEnd > captureStart)
+    const captureSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(captureStart, captureEnd)
+    assert.match(captureSource, /while \(Date\.now\(\) < captureDeadline\)/)
+    assert.match(captureSource, /element\.complete && element\.naturalWidth >= 180/)
+    assert.match(
+      captureSource,
+      /image\.isVisible\(\{ timeout: remainingCaptureTimeout\(captureDeadline\) \}\)/,
+    )
+    assert.match(
+      captureSource,
+      /image\.evaluate\([\s\S]*undefined,[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)/,
+    )
+    assert.match(
+      captureSource,
+      /image\.screenshot\(\{[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)/,
+    )
+    assert.doesNotMatch(captureSource, /frame\.screenshot|iframe/)
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /const qrCaptureDeadline = Math\.min\(input\.deadlineMs,[\s\S]*waitFor\(\{[\s\S]*timeout: remainingCaptureTimeout\(qrCaptureDeadline\)[\s\S]*const qr = await captureQr\(page, qrCaptureDeadline\)/,
+    )
   })
 
   test('materialized worker source is valid JavaScript', async () => {
