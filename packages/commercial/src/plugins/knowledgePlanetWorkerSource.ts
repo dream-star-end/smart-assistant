@@ -2,9 +2,24 @@ export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
 export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 15_000
+export const KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION = 0.15
+export const KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION = 0.2
+export const KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION = 70
 export const KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES = 1024 * 1024
 export const KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES = 256 * 1024
 export const KNOWLEDGE_PLANET_TOPIC_PAGE_MAX = 10
+
+export function isKnowledgePlanetQrPixelSampleReady(input: {
+  darkFraction: number
+  lightFraction: number
+  luminanceDeviation: number
+}): boolean {
+  return (
+    input.darkFraction >= KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION &&
+    input.lightFraction >= KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION &&
+    input.luminanceDeviation >= KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION
+  )
+}
 
 export function isKnowledgePlanetLoginProbeDue(
   now: number,
@@ -594,27 +609,136 @@ function remainingCaptureTimeout(deadlineMs) {
   return remaining;
 }
 
-async function captureQr(page, captureDeadline) {
+async function beforeCaptureDeadline(operation, deadlineMs) {
+  const remaining = remainingCaptureTimeout(deadlineMs);
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('qr')), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function captureQr(page, qrButton, switchButton, captureDeadline) {
+  let requested = false;
+  let consentHandled = false;
+  let loginModeHandled = false;
+  const agree = page.locator('.agreement-overlay .agree-btn, button.agree-btn').first();
   while (Date.now() < captureDeadline) {
-    for (const frame of page.frames().slice(1)) {
-      const images = frame.locator('img.qrcode, img[src*="/connect/qrcode/"]');
-      for (let i = 0, count = await images.count().catch(() => 0); i < count; i += 1) {
-        const image = images.nth(i);
-        if (!await image.isVisible({ timeout: remainingCaptureTimeout(captureDeadline) }).catch(() => false)) continue;
-        const loaded = await image.evaluate(
-          (element) => element.complete && element.naturalWidth >= 180 && element.naturalHeight >= 180,
-          undefined,
-          { timeout: remainingCaptureTimeout(captureDeadline) },
-        ).catch(() => false);
-        if (!loaded) continue;
-        const png = await image.screenshot({
-          type: 'png',
-          timeout: remainingCaptureTimeout(captureDeadline),
-        }).catch(() => null);
-        if (png) return png;
+    if (!consentHandled && await beforeCaptureDeadline(() => agree.isVisible(), captureDeadline).catch(() => false)) {
+      const clicked = await beforeCaptureDeadline(
+        () => agree.click({ timeout: remainingCaptureTimeout(captureDeadline) }),
+        captureDeadline,
+      ).then(() => true).catch(() => false);
+      if (clicked) {
+        consentHandled = true;
+        requested = false;
       }
     }
-    await page.waitForTimeout(Math.min(250, remainingCaptureTimeout(captureDeadline)));
+    let qrButtonVisible = await beforeCaptureDeadline(() => qrButton.isVisible(), captureDeadline).catch(() => false);
+    if (!qrButtonVisible && !loginModeHandled) {
+      const switchVisible = await beforeCaptureDeadline(() => switchButton.isVisible(), captureDeadline).catch(() => false);
+      if (switchVisible) {
+        const switched = await beforeCaptureDeadline(
+          () => switchButton.click({ timeout: remainingCaptureTimeout(captureDeadline) }),
+          captureDeadline,
+        ).then(() => true).catch(() => false);
+        if (switched) {
+          loginModeHandled = true;
+          requested = false;
+        }
+      }
+      qrButtonVisible = await beforeCaptureDeadline(() => qrButton.isVisible(), captureDeadline).catch(() => false);
+    } else if (qrButtonVisible) {
+      loginModeHandled = true;
+    }
+    if (!requested && qrButtonVisible) {
+      requested = await beforeCaptureDeadline(
+        () => qrButton.click({ timeout: remainingCaptureTimeout(captureDeadline) }),
+        captureDeadline,
+      ).then(() => true).catch(() => false);
+    }
+    for (const frame of page.frames().slice(1)) {
+      const images = frame.locator('img.qrcode, img[src*="/connect/qrcode/"]');
+      const count = await beforeCaptureDeadline(() => images.count(), captureDeadline).catch(() => 0);
+      for (let i = 0; i < count; i += 1) {
+        const image = images.nth(i);
+        if (!await beforeCaptureDeadline(() => image.isVisible(), captureDeadline).catch(() => false)) continue;
+        const encodedQr = await beforeCaptureDeadline(
+          () => image.evaluate(
+            (element) => {
+              if (!element.complete || element.naturalWidth < 180 || element.naturalHeight < 180) return null;
+              if (element.naturalWidth > 1024 || element.naturalHeight > 1024) return null;
+              if (Math.abs(element.naturalWidth - element.naturalHeight) > Math.max(element.naturalWidth, element.naturalHeight) * 0.05) return null;
+              for (let current = element; current; current = current.parentElement) {
+                const style = getComputedStyle(current);
+                if (style.filter !== 'none' || Number(style.opacity) < 0.99 || style.visibility !== 'visible') return null;
+              }
+              const bounds = element.getBoundingClientRect();
+              if (bounds.width < 180 || bounds.height < 180) return null;
+              if (Math.abs(bounds.width - bounds.height) > Math.max(bounds.width, bounds.height) * 0.05) return null;
+              if (document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2) !== element) return null;
+              const sample = document.createElement('canvas');
+              sample.width = 128;
+              sample.height = 128;
+              const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+              if (!sampleContext) return null;
+              sampleContext.fillStyle = '#fff';
+              sampleContext.fillRect(0, 0, sample.width, sample.height);
+              sampleContext.imageSmoothingEnabled = false;
+              sampleContext.drawImage(element, 0, 0, sample.width, sample.height);
+              const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
+              let dark = 0;
+              let light = 0;
+              let luminanceSum = 0;
+              let luminanceSquareSum = 0;
+              const pixelCount = pixels.length / 4;
+              for (let index = 0; index < pixels.length; index += 4) {
+                const luminance = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
+                if (luminance < 96) dark += 1;
+                if (luminance > 224) light += 1;
+                luminanceSum += luminance;
+                luminanceSquareSum += luminance * luminance;
+              }
+              const mean = luminanceSum / pixelCount;
+              const deviation = Math.sqrt(Math.max(0, luminanceSquareSum / pixelCount - mean * mean));
+              if (dark / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION} || light / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION} || deviation < ${KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION}) return null;
+              const output = document.createElement('canvas');
+              output.width = element.naturalWidth;
+              output.height = element.naturalHeight;
+              const outputContext = output.getContext('2d');
+              if (!outputContext) return null;
+              outputContext.fillStyle = '#fff';
+              outputContext.fillRect(0, 0, output.width, output.height);
+              outputContext.imageSmoothingEnabled = false;
+              outputContext.drawImage(element, 0, 0, output.width, output.height);
+              const dataUrl = output.toDataURL('image/png');
+              const prefix = 'data:image/png;base64,';
+              const encoded = dataUrl.startsWith(prefix) ? dataUrl.slice(prefix.length) : '';
+              return encoded.length > 0 && encoded.length <= Math.ceil(512 * 1024 / 3) * 4 ? encoded : null;
+            },
+            undefined,
+            { timeout: remainingCaptureTimeout(captureDeadline) },
+          ),
+          captureDeadline,
+        ).catch(() => null);
+        if (!encodedQr || !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedQr) || encodedQr.length % 4 !== 0) continue;
+        const png = Buffer.from(encodedQr, 'base64');
+        if (png.toString('base64') !== encodedQr || png.length > 512 * 1024) continue;
+        if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) continue;
+        remainingCaptureTimeout(captureDeadline);
+        return png;
+      }
+    }
+    await beforeCaptureDeadline(
+      () => page.waitForTimeout(Math.min(250, remainingCaptureTimeout(captureDeadline))),
+      captureDeadline,
+    );
   }
   throw new Error('qr');
 }
@@ -648,23 +772,15 @@ async function runLogin(input, relay) {
     });
     if (typeof page.routeWebSocket === 'function') await page.routeWebSocket('**/*', (socket) => socket.close());
     await page.goto('https://wx.zsxq.com/login', { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    let qrButton = page.getByRole('button', { name: /获取登录二维码/ }).first();
-    if (!await qrButton.isVisible().catch(() => false)) {
-      const switchButton = page.getByText('切换至微信登录', { exact: true }).first();
-      if (await switchButton.isVisible().catch(() => false)) await switchButton.click();
-      qrButton = page.getByRole('button', { name: /获取登录二维码/ }).first();
-    }
-    if (await qrButton.isVisible().catch(() => false)) await qrButton.click();
-    const agree = page.locator('.agreement-overlay .agree-btn, button.agree-btn').first();
-    if (await agree.isVisible().catch(() => false)) await agree.click();
-    if (await qrButton.isVisible().catch(() => false)) await qrButton.click();
     const qrCaptureDeadline = Math.min(input.deadlineMs, Date.now() + ${KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS});
-    await page.locator('iframe[src*="open.weixin.qq.com"]').first().waitFor({
-      state: 'visible',
-      timeout: remainingCaptureTimeout(qrCaptureDeadline),
-    }).catch(() => {});
-    const qr = await captureQr(page, qrCaptureDeadline);
+    const qrButton = page.getByRole('button', { name: /获取登录二维码/ }).first();
+    const switchButton = page.getByText('切换至微信登录', { exact: true }).first();
+    const qr = await beforeCaptureDeadline(
+      () => captureQr(page, qrButton, switchButton, qrCaptureDeadline),
+      qrCaptureDeadline,
+    );
     if (qr.length > 512 * 1024) throw new Error('qr');
+    remainingCaptureTimeout(qrCaptureDeadline);
     writeFrame({ event: 'qr', png: qr.toString('base64') });
     let nextProbeAt = Date.now() + ${KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS};
     let probeAttempts = 0;
