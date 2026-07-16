@@ -898,7 +898,7 @@ export type MarketplaceCard = {
   slug: string;
   /** 加法兼容投影；存量 `kind=connector` 在产品层展示为 plugin。 */
   artifactKind?: MarketplaceArtifactKind;
-  pluginType?: MarketplacePluginType;
+  pluginType?: MarketplacePluginType | null;
   kind: MarketplaceKind;
   name: string;
   description: string;
@@ -945,7 +945,7 @@ export type MarketplaceInstallResult = MarketplaceCapabilityInstallOutcome & {
   slug: string;
   kind: MarketplaceKind;
   artifactKind?: MarketplaceArtifactKind;
-  pluginType?: MarketplacePluginType;
+  pluginType?: MarketplacePluginType | null;
   version: string;
   note: string;
   installedDeps: number;
@@ -955,7 +955,7 @@ export type MarketplaceInstallResult = MarketplaceCapabilityInstallOutcome & {
 export type MarketplaceDetail = {
   slug: string;
   artifactKind?: MarketplaceArtifactKind;
-  pluginType?: MarketplacePluginType;
+  pluginType?: MarketplacePluginType | null;
   kind: MarketplaceKind;
   state: string;
   ownerUserId: string;
@@ -1012,7 +1012,7 @@ export type MarketplaceDetail = {
 export type MarketplaceInstalled = {
   slug: string;
   artifactKind?: MarketplaceArtifactKind;
-  pluginType?: MarketplacePluginType;
+  pluginType?: MarketplacePluginType | null;
   kind: MarketplaceKind;
   version: string;
   versionId: string;
@@ -1035,7 +1035,7 @@ export type MarketplaceMyPublish = {
   versionId: string;
   slug: string;
   artifactKind?: MarketplaceArtifactKind;
-  pluginType?: MarketplacePluginType;
+  pluginType?: MarketplacePluginType | null;
   kind: MarketplaceKind;
   version: string;
   name: string;

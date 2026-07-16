@@ -18,7 +18,8 @@
     "0149_audit_hardening",
     "0150_agent_tool_rollups",
     "0151_product_friction_events",
-    "0152_marketplace_capability_bindings"
+    "0152_marketplace_capability_bindings",
+    "0153_marketplace_plugin_kernel"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

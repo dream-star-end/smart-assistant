@@ -305,8 +305,7 @@ export function refreshAuth(
   state.controller = controller;
   let timeout: ReturnType<typeof setTimeout> | null = null;
 
-  let flight!: Promise<RefreshOutcome>;
-  flight = withAuthCookieMutation(async (): Promise<RefreshOutcome> => {
+  const flight = withAuthCookieMutation(async (): Promise<RefreshOutcome> => {
     // 排队不计入 refresh 自身网络期限；login/logout 队首也各自有同样的 30s 上限。
     timeout = setTimeout(
       () => controller.abort(new DOMException("refresh timeout", "TimeoutError")),
@@ -2316,6 +2315,18 @@ export const api = {
           `/api/marketplace/search?q=${encodeURIComponent(q)}&limit=${limit}${kind ? `&kind=${kind}` : ""}`,
           { credentials: "include", headers: bearerHeaders(t) },
         ),
+      ),
+    ),
+
+  /** Opaque market invalidation token; compare equality only. */
+  getMarketplaceRevision: (a: AuthSession) =>
+    jsonOrThrow<{ revision: string }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/revision", {
+          credentials: "include",
+          cache: "no-store",
+          headers: bearerHeaders(t),
+        }),
       ),
     ),
 

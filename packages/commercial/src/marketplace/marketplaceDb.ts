@@ -1,7 +1,9 @@
 import {
   type MarketplaceCapabilityInstallOutcome,
   type MarketplaceCapabilityRef,
+  type MarketplacePluginType,
   type MarketplaceReviewSource,
+  isMarketplacePluginType,
   marketplaceCapabilityKind,
   marketplaceCapabilityStorageKind,
   marketplaceReviewSource,
@@ -38,6 +40,20 @@ import type { RiskFlag } from './skillScanner.js'
  *  lifecycle (publish→scan→review→approve→install→sync→revoke) is shared, only
  *  the scanner / install-applier / detail-renderer vary by kind. */
 export type ArtifactKind = 'skill' | 'agent' | 'connector'
+
+function marketplacePluginType(
+  kind: ArtifactKind,
+  value: unknown,
+): MarketplacePluginType | null {
+  if (kind === 'connector') {
+    if (!isMarketplacePluginType(value))
+      throw new MarketplaceError('KIND_MISMATCH', 'connector listing 缺少合法 Plugin 子类型')
+    return value
+  }
+  if (value != null)
+    throw new MarketplaceError('KIND_MISMATCH', `${kind} listing 不能声明 Plugin 子类型`)
+  return null
+}
 
 export class MarketplaceError extends Error {
   constructor(
@@ -164,6 +180,18 @@ export async function resolveCallerOrgId(userId: string | number): Promise<Calle
   return m?.org_id ?? null
 }
 
+/** Opaque catalog invalidation token. Clients compare equality only. */
+export async function getMarketplaceCatalogRevision(): Promise<string> {
+  const r = await query<{ revision: string }>(
+    `SELECT revision::text
+       FROM marketplace_catalog_revision
+      WHERE singleton = TRUE`,
+  )
+  const revision = r.rows[0]?.revision
+  if (!revision) throw new Error('marketplace catalog revision row missing')
+  return revision
+}
+
 export interface PublishInput {
   slug: string
   ownerUserId: number
@@ -184,6 +212,8 @@ export interface PublishInput {
   submittedBy: number
   /** Artifact kind; the listing is owner- AND kind-locked. Defaults to 'skill'. */
   kind?: ArtifactKind
+  /** Required for kind='connector'; null/omitted for Skill and Agent. */
+  pluginType?: MarketplacePluginType | null
   /**
    * 可见范围(企业版 P3.1):null/缺省 = 公开;非空 = 仅该 org 成员可见/可装(listing.org_id)。
    * 仅在**首次创建 listing** 时落库(org_id 与 owner/kind 同为 listing 级不可变属性,
@@ -503,6 +533,7 @@ async function validateLockedCapabilityRequirements(
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
 export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
   const kind: ArtifactKind = input.kind ?? 'skill'
+  const pluginType = marketplacePluginType(kind, input.pluginType)
   const requirements =
     kind === 'agent' ? capabilityRequirementsFromManifest(input.manifest, input.slug) : []
   if (kind === 'connector' && !marketplaceConnectorsEnabled())
@@ -519,18 +550,19 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
     await query(
       // org_id 仅在首次创建 listing 时落(ON CONFLICT DO NOTHING → 已存在的 listing 保留
       // 其原 org_id,可见性不因新版本发布而变;与 owner/kind 同为 listing 级不可变属性)。
-      `INSERT INTO marketplace_skill_listings (slug, owner_user_id, kind, org_id)
-            VALUES ($1, $2, $3, $4::bigint) ON CONFLICT (slug) DO NOTHING`,
-      [input.slug, input.ownerUserId, kind, input.orgId ?? null],
+      `INSERT INTO marketplace_skill_listings (slug, owner_user_id, kind, plugin_type, org_id)
+            VALUES ($1, $2, $3, $4, $5::bigint) ON CONFLICT (slug) DO NOTHING`,
+      [input.slug, input.ownerUserId, kind, pluginType, input.orgId ?? null],
       c,
     )
     const listing = await query<{
       owner_user_id: string
       state: string
       kind: string
+      plugin_type: string | null
       org_id: string | null
     }>(
-      `SELECT owner_user_id::text, state, kind, org_id::text
+      `SELECT owner_user_id::text, state, kind, plugin_type, org_id::text
          FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE`,
       [input.slug],
       c,
@@ -546,6 +578,11 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       throw new MarketplaceError(
         'KIND_MISMATCH',
         `slug "${input.slug}" 已是「${row.kind}」类型，不能作为「${kind}」发布`,
+      )
+    if (marketplacePluginType(row.kind as ArtifactKind, row.plugin_type) !== pluginType)
+      throw new MarketplaceError(
+        'KIND_MISMATCH',
+        `slug "${input.slug}" 已是其它 Plugin 子类型，不能改写`,
       )
     await validateCapabilityRequirements(c, requirements, row.org_id)
 
@@ -615,6 +652,7 @@ export interface PendingVersionRow {
   versionId: string
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   version: string
   name: string
   description: string
@@ -650,6 +688,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     id: string
     slug: string
     kind: string
+    plugin_type: string | null
     version: string
     name: string
     description: string
@@ -670,7 +709,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     human_md: string | null
     ai_note: string | null
   }>(
-    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
+    `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.version, v.name, v.description, v.tags,
             v.raw_artifact, v.artifact_hash, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
             v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note
@@ -685,6 +724,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     versionId: x.id,
     slug: x.slug,
     kind: x.kind as ArtifactKind,
+    pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
     version: x.version,
     name: x.name,
     description: x.description,
@@ -839,7 +879,7 @@ export async function approvePlatformVersion(
   expectedArtifactHash: string,
 ): Promise<void> {
   const target = await query<{ id: string }>(
-    `SELECT id::text FROM marketplace_skill_versions WHERE slug = $1 AND version = $2`,
+    'SELECT id::text FROM marketplace_skill_versions WHERE slug = $1 AND version = $2',
     [slug, version],
   )
   const versionId = target.rows[0]?.id
@@ -901,6 +941,7 @@ function mapAiCandidateRow(x: {
   id: string
   slug: string
   kind: string
+  plugin_type: string | null
   version: string
   name: string
   description: string
@@ -926,6 +967,7 @@ function mapAiCandidateRow(x: {
     versionId: x.id,
     slug: x.slug,
     kind: x.kind as ArtifactKind,
+    pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
     version: x.version,
     name: x.name,
     description: x.description,
@@ -979,7 +1021,7 @@ export async function claimNextAiReview(): Promise<AiReviewCandidate | null> {
       c,
     )
     const full = await query<Parameters<typeof mapAiCandidateRow>[0]>(
-      `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
+      `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.version, v.name, v.description, v.tags,
               v.raw_artifact, v.artifact_hash, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
               v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
               v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note, v.ai_attempts
@@ -1070,6 +1112,7 @@ export interface AiReviewRecord {
   versionId: string
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   version: string
   name: string
   /** AI 的最终裁决落到 status:'approved' | 'rejected'。 */
@@ -1083,13 +1126,14 @@ export async function listRecentAiReviews(limit = 50): Promise<AiReviewRecord[]>
     id: string
     slug: string
     kind: string
+    plugin_type: string | null
     version: string
     name: string
     status: string
     ai_note: string | null
     reviewed_at: string | null
   }>(
-    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.status, v.ai_note,
+    `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.version, v.name, v.status, v.ai_note,
             v.reviewed_at::text
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -1102,6 +1146,7 @@ export async function listRecentAiReviews(limit = 50): Promise<AiReviewRecord[]>
     versionId: x.id,
     slug: x.slug,
     kind: x.kind as ArtifactKind,
+    pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
     version: x.version,
     name: x.name,
     status: x.status,
@@ -1129,6 +1174,7 @@ export interface ApprovedSearchRow {
   versionId: string
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   name: string
   description: string
   tags: string[]
@@ -1168,6 +1214,7 @@ export async function listApprovedForSearch(
     id: string
     slug: string
     kind: string
+    plugin_type: string | null
     name: string
     description: string
     tags: unknown
@@ -1194,7 +1241,7 @@ export async function listApprovedForSearch(
     // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
     // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 30 天使用人数(users30d
     // DESC)→ 安装数(DESC)→ 新版本(v.id DESC)。前端不再自行排序,信任此序。
-    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.artifact_hash, v.embedding_hash,
+    `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.name, v.description, v.tags, v.artifact_hash, v.embedding_hash,
             v.benchmark, ic.n::text AS install_count,
             v.category, v.use_cases, l.featured_rank,
             us.usage_n::text AS usage30d, us.users_n::text AS users30d,
@@ -1250,6 +1297,7 @@ export async function listApprovedForSearch(
       versionId: x.id,
       slug: x.slug,
       kind: x.kind as ArtifactKind,
+      pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
       name: x.name,
       description: x.description,
       tags: (x.tags as string[]) ?? [],
@@ -1276,6 +1324,7 @@ export async function listApprovedForSearch(
 export interface ListingDetail {
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   state: string
   ownerUserId: string
   version: string
@@ -1334,6 +1383,7 @@ export async function getListingDetail(
   const r = await query<{
     slug: string
     kind: string
+    plugin_type: string | null
     state: string
     owner_user_id: string
     version: string
@@ -1363,7 +1413,7 @@ export async function getListingDetail(
     // detail 是单行读:usage/rating 用 LEFT JOIN LATERAL 按 l.slug 直取(命中 idx_mkt_usage_slug_time,
     // 不做全表 GROUP BY),与 install_count 的单 slug 相关子查询同量级。rt 内先 DISTINCT 去重同
     // turn 同 slug 的多次 view(与 catalog 同语义);LATERAL 聚合恒返一行,LEFT JOIN 不会放大结果。
-    `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
+    `SELECT l.slug, l.kind, l.plugin_type, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
             v.manifest, v.risk_flags, v.review_source, v.raw_bundle, v.benchmark,
             v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
@@ -1412,6 +1462,7 @@ export async function getListingDetail(
   return {
     slug: x.slug,
     kind: x.kind as ArtifactKind,
+    pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
     state: x.state,
     ownerUserId: x.owner_user_id,
     version: x.version,
@@ -1455,6 +1506,7 @@ export async function getListingDetail(
 export interface MarketplaceBundleInstallResult extends MarketplaceCapabilityInstallOutcome {
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   version: string
   name: string
 }
@@ -1942,6 +1994,7 @@ export async function installMarketplaceBundle(args: {
       return {
         slug: version.slug,
         kind: rootListing.kind,
+        pluginType: rootListing.pluginType,
         version: version.version,
         name: version.name,
         installedCapabilities: installableRefs.map((ref) => ({
@@ -2600,6 +2653,7 @@ export async function recordUninstall(userId: number, slug: string): Promise<boo
 export interface InstalledRow {
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   version: string
   versionId: string
   name: string
@@ -2619,6 +2673,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   const r = await query<{
     slug: string
     kind: string
+    plugin_type: string | null
     version: string
     version_id: string
     name: string
@@ -2632,7 +2687,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   }>(
     // cv = listing 当前上架版本(升级可见性:安装 pin 旧 versionId,新版获批后
     // latest_version_id ≠ version_id 即「可更新」)。LEFT JOIN:revoked/无 approved 时为 null。
-    `SELECT i.slug, l.kind, v.version, i.version_id::text, v.name, i.artifact_hash,
+    `SELECT i.slug, l.kind, l.plugin_type, v.version, i.version_id::text, v.name, i.artifact_hash,
             COALESCE((
               SELECT jsonb_agg(b.agent_slug ORDER BY b.agent_slug)
                 FROM marketplace_agent_capability_bindings b
@@ -2658,6 +2713,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     .map((x) => ({
       slug: x.slug,
       kind: x.kind as ArtifactKind,
+      pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
       version: x.version,
       versionId: x.version_id,
       name: x.name,
@@ -2675,6 +2731,7 @@ export interface MyPublishRow {
   versionId: string
   slug: string
   kind: ArtifactKind
+  pluginType: MarketplacePluginType | null
   version: string
   name: string
   /** pending | approved | rejected */
@@ -2704,6 +2761,7 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     id: string
     slug: string
     kind: string
+    plugin_type: string | null
     version: string
     name: string
     status: string
@@ -2714,7 +2772,7 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     is_current: boolean | null
     state: string
   }>(
-    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.status,
+    `SELECT v.id::text, v.slug, l.kind, l.plugin_type, v.version, v.name, v.status,
             v.review_note, v.review_source, v.created_at::text, v.reviewed_at::text,
             (l.current_approved_version_id = v.id) AS is_current, l.state
        FROM marketplace_skill_versions v
@@ -2728,6 +2786,7 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     versionId: x.id,
     slug: x.slug,
     kind: x.kind as ArtifactKind,
+    pluginType: marketplacePluginType(x.kind as ArtifactKind, x.plugin_type),
     version: x.version,
     name: x.name,
     status: x.status,

@@ -48,6 +48,10 @@ function candidate(over: Partial<AiReviewCandidate> = {}): AiReviewCandidate {
     aiNote: null,
     aiAttempts: 1,
     ...over,
+    pluginType:
+      (over.kind ?? 'skill') === 'connector'
+        ? (over.pluginType ?? 'declarative-http')
+        : null,
   }
 }
 

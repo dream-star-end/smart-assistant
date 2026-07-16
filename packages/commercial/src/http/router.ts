@@ -44,6 +44,7 @@ import {
   handleMarketplaceMyAgents,
   handleMarketplaceMyPublishes,
   handleMarketplacePublish,
+  handleMarketplaceRevision,
   handleMarketplaceUninstall,
   handleMarketplaceUnlist,
   handleMarketplaceWithdrawPublish,
@@ -716,6 +717,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/marketplace/search',
       handler: (req, res) => handleMarketplaceSearch(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/marketplace/revision',
+      handler: (req, res) => handleMarketplaceRevision(req, res, deps),
     },
     {
       method: 'POST',

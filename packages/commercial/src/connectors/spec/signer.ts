@@ -1,10 +1,11 @@
 /**
  * 连接器 Contract 内核 · 签名唯一信任根(RFC §6.1 / §10.1)。
  *
- * 信任根 = 签名(删 DB-only 备选):`exec_contract` 附 `signature/key_id`,签名覆盖
- * `listingSlug + versionId + kind + specHash + execContractHash + compilerVersion +
- * policyVersion`。execute/载入必须**验签名 + 覆盖字段与连接/账本一致**,不是信 JSON
- * 里有个字段叫 signed。任一覆盖字段被篡改 → verify 必失败。
+ * 信任根 = 签名(删 DB-only 备选):`exec_contract` 附 `signature/key_id`。历史
+ * connector-v1 覆盖 `listingSlug + versionId + kind + specHash + execContractHash +
+ * compilerVersion + policyVersion`；plugin-v2 另覆盖固定 scheme marker 与 pluginType。
+ * execute/载入必须**验签名 + 覆盖字段与连接/账本一致**,不是信 JSON 里有个字段叫
+ * signed。任一覆盖字段被篡改 → verify 必失败。
  *
  * 密钥派生:`HKDF(loadKmsKey(), info='connector-exec-contract-sign-v1')`,派生 key
  * 用后 zeroBuffer。`keyId` 供轮换 —— **仅 contract bytes 不变时可换 keyId 重签**
@@ -12,6 +13,7 @@
  */
 
 import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto'
+import type { MarketplacePluginType } from '@openclaude/protocol'
 import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { canonicalBytes } from './canonical.js'
 import { ConnectorSpecError } from './types.js'
@@ -27,7 +29,7 @@ export const CURRENT_SIGNING_KEY_ID = 'v1'
  * `kind` 是 **DB 事实**(join listing 读到,不是硬编码常量,P0-2):签名/验签都用
  * DB 读到的真实 kind,listing.kind 被篡改则验签必失败。
  */
-export interface ContractSignMeta {
+export interface LegacyConnectorContractSignMeta {
   listingSlug: string
   versionId: number
   kind: string
@@ -35,6 +37,10 @@ export interface ContractSignMeta {
   execContractHash: string
   compilerVersion: number
   policyVersion: number
+}
+
+export interface PluginContractSignMetaV2 extends LegacyConnectorContractSignMeta {
+  pluginType: MarketplacePluginType
 }
 
 function deriveSignKey(keyId: string, env: NodeJS.ProcessEnv): Buffer {
@@ -51,7 +57,7 @@ function deriveSignKey(keyId: string, env: NodeJS.ProcessEnv): Buffer {
 }
 
 /** 覆盖字段的 canonical bytes(签名的输入)。keyId **不**在其中(允许重签换 keyId)。 */
-function signBytes(meta: ContractSignMeta): Buffer {
+function legacyConnectorSignBytes(meta: LegacyConnectorContractSignMeta): Buffer {
   return canonicalBytes({
     listingSlug: meta.listingSlug,
     versionId: meta.versionId,
@@ -63,10 +69,24 @@ function signBytes(meta: ContractSignMeta): Buffer {
   })
 }
 
-function hmacHex(meta: ContractSignMeta, keyId: string, env: NodeJS.ProcessEnv): string {
+function pluginV2SignBytes(meta: PluginContractSignMetaV2): Buffer {
+  return canonicalBytes({
+    signatureScheme: 'plugin-v2',
+    pluginType: meta.pluginType,
+    listingSlug: meta.listingSlug,
+    versionId: meta.versionId,
+    kind: meta.kind,
+    specHash: meta.specHash,
+    execContractHash: meta.execContractHash,
+    compilerVersion: meta.compilerVersion,
+    policyVersion: meta.policyVersion,
+  })
+}
+
+function hmacHex(bytes: Buffer, keyId: string, env: NodeJS.ProcessEnv): string {
   const key = deriveSignKey(keyId, env)
   try {
-    return createHmac('sha256', key).update(signBytes(meta)).digest('hex')
+    return createHmac('sha256', key).update(bytes).digest('hex')
   } finally {
     zeroBuffer(key)
   }
@@ -77,22 +97,22 @@ export interface ContractSignature {
   keyId: string
 }
 
-/** 用当前(或指定)signing key 对覆盖字段签名。 */
-export function signContract(
-  meta: ContractSignMeta,
+/** 用当前(或指定)signing key 写历史 connector-v1 签名。 */
+export function signLegacyConnectorContract(
+  meta: LegacyConnectorContractSignMeta,
   opts: { keyId?: string; env?: NodeJS.ProcessEnv } = {},
 ): ContractSignature {
   const keyId = opts.keyId ?? CURRENT_SIGNING_KEY_ID
   const env = opts.env ?? process.env
-  return { signature: hmacHex(meta, keyId, env), keyId }
+  return { signature: hmacHex(legacyConnectorSignBytes(meta), keyId, env), keyId }
 }
 
 /**
  * 恒定时间验签。任一覆盖字段(specHash/execContractHash/policyVersion/versionId/
  * listingSlug/compilerVersion/kind)或 signature 被篡改 → false。未知 keyId → false。
  */
-export function verifyContract(
-  meta: ContractSignMeta,
+export function verifyLegacyConnectorContract(
+  meta: LegacyConnectorContractSignMeta,
   signature: string,
   keyId: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -101,7 +121,41 @@ export function verifyContract(
   if (typeof signature !== 'string' || !/^[0-9a-f]{64}$/.test(signature)) return false
   let expected: string
   try {
-    expected = hmacHex(meta, keyId, env)
+    expected = hmacHex(legacyConnectorSignBytes(meta), keyId, env)
+  } catch {
+    return false
+  }
+  const a = Buffer.from(signature, 'hex')
+  const b = Buffer.from(expected, 'hex')
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * Plugin v2 binds the public Plugin subtype and an explicit scheme marker into
+ * the signed bytes. It is read-compatible in this release, but its production
+ * writer remains gated until this release becomes the rollback floor.
+ */
+export function signPluginContractV2(
+  meta: PluginContractSignMetaV2,
+  opts: { keyId?: string; env?: NodeJS.ProcessEnv } = {},
+): ContractSignature {
+  const keyId = opts.keyId ?? CURRENT_SIGNING_KEY_ID
+  const env = opts.env ?? process.env
+  return { signature: hmacHex(pluginV2SignBytes(meta), keyId, env), keyId }
+}
+
+export function verifyPluginContractV2(
+  meta: PluginContractSignMetaV2,
+  signature: string,
+  keyId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!KEY_INFOS[keyId]) return false
+  if (typeof signature !== 'string' || !/^[0-9a-f]{64}$/.test(signature)) return false
+  let expected: string
+  try {
+    expected = hmacHex(pluginV2SignBytes(meta), keyId, env)
   } catch {
     return false
   }

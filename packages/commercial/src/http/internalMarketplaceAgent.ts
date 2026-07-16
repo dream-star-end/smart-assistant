@@ -224,7 +224,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             results: filtered.slice(0, limit).map((c) => ({
               slug: c.slug,
               kind: c.kind,
-              ...marketplaceArtifactCompatibility(c.kind),
+              ...marketplaceArtifactCompatibility(c.kind, c.pluginType),
               name: c.name,
               description: c.description,
               tags: c.tags,
@@ -271,7 +271,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           {
             detail: {
               ...detail,
-              ...marketplaceArtifactCompatibility(detail.kind),
+              ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
               ...(capabilityReadiness ? { capabilityReadiness } : {}),
             },
           },
@@ -298,7 +298,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
               : installed.filter((item) => item.kind !== 'connector')
             ).map((item) => ({
               ...item,
-              ...marketplaceArtifactCompatibility(item.kind),
+              ...marketplaceArtifactCompatibility(item.kind, item.pluginType),
               ...(item.kind === 'agent' ? { capabilityReadiness: readiness.get(item.slug) } : {}),
             })),
           },
@@ -339,7 +339,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             ok: true,
             slug: v.slug,
             kind: detail.kind,
-            ...marketplaceArtifactCompatibility(detail.kind),
+            ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
             version: v.version,
             installedDeps: v.installedCapabilities.length,
             installedCapabilities: v.installedCapabilities,
@@ -379,7 +379,9 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           return send(
             res,
             403,
-            { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的插件' } },
+            {
+              error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的插件' },
+            },
             requestId,
           )
         const prepared = prepareConnectorPublish(body)
@@ -398,7 +400,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           200,
           {
             ok: true,
-            ...marketplaceArtifactCompatibility('connector'),
+            ...marketplaceArtifactCompatibility('connector', 'declarative-http'),
             validationHash: prepared.validationHash,
             plugin: {
               slug: prepared.slug,
@@ -518,6 +520,7 @@ async function handlePublish(
         proposedSecurityDecision: prepared.proposedSecurityDecision,
       },
       kind: 'connector',
+      pluginType: 'declarative-http',
       artifactHash: prepared.artifactHash,
       embeddingHash: prepared.embeddingHash,
       riskFlags: prepared.riskFlags,
@@ -535,7 +538,7 @@ async function handlePublish(
       {
         ok: true,
         kind: 'connector',
-        ...marketplaceArtifactCompatibility('connector'),
+        ...marketplaceArtifactCompatibility('connector', 'declarative-http'),
         versionId,
         status: 'pending',
         riskFlags: prepared.riskFlags,
@@ -594,7 +597,7 @@ async function handlePublish(
       {
         ok: true,
         kind: 'skill',
-        ...marketplaceArtifactCompatibility('skill'),
+        ...marketplaceArtifactCompatibility('skill', null),
         versionId,
         status: 'pending',
         // 含 scripts 危险模式 warning flag —— 发布者(容器内 AI)与审核者看同一份。
@@ -725,7 +728,7 @@ async function handlePublish(
     {
       ok: true,
       kind: 'agent',
-      ...marketplaceArtifactCompatibility('agent'),
+      ...marketplaceArtifactCompatibility('agent', null),
       versionId,
       status: 'pending',
       note: '已提交,平台审核通过后才会上架。',

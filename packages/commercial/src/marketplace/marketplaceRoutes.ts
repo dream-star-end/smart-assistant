@@ -27,14 +27,15 @@ import {
   rejectMarketplaceConnectorVersion,
 } from './connectorReview.js'
 import {
+  type AgentCapabilityReadiness,
   FEATURED_RANK_MAX,
   FEATURED_RANK_MIN,
-  type AgentCapabilityReadiness,
   MarketplaceError,
   getAgentCapabilityReadiness,
   getAgentCapabilityReadinessMany,
   getInstallableVersionTarget,
   getListingDetail,
+  getMarketplaceCatalogRevision,
   installMarketplaceBundle,
   listActiveInstalledAgents,
   listInstalled,
@@ -172,6 +173,19 @@ function mapMarketplaceError(e: unknown): HttpError {
     return new HttpError(status, e.code, e.message)
   }
   return e instanceof HttpError ? e : new HttpError(500, 'INTERNAL', 'marketplace error')
+}
+
+// ── GET /api/marketplace/revision ─────────────────────────────────────────
+// Opaque invalidation token for cross-client publication visibility. The
+// caller must compare equality only; one transaction may advance it >1.
+export async function handleMarketplaceRevision(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  await requireAuth(req, deps.jwtSecret)
+  res.setHeader('Cache-Control', 'private, no-store')
+  sendJson(res, 200, { revision: await getMarketplaceCatalogRevision() })
 }
 
 /** 人向元数据校验(单一权威 parseHumanMeta),HumanMetaError → 400(带 code)。 */
@@ -411,6 +425,7 @@ export async function handleMarketplaceConnectorPublish(
         proposedSecurityDecision: prepared.proposedSecurityDecision,
       },
       kind: 'connector',
+      pluginType: 'declarative-http',
       artifactHash: prepared.artifactHash,
       embeddingHash: prepared.embeddingHash,
       riskFlags: prepared.riskFlags,
@@ -590,7 +605,7 @@ export async function handleMarketplaceInstall(
       slug: v.slug,
       version: v.version,
       kind: v.kind,
-      ...marketplaceArtifactCompatibility(v.kind),
+      ...marketplaceArtifactCompatibility(v.kind, v.pluginType),
       installedDeps: v.installedCapabilities.length,
       installedCapabilities: v.installedCapabilities,
       skippedOptional: v.skippedOptional,
@@ -634,7 +649,7 @@ export async function handleMarketplaceInstalled(
   sendJson(res, 200, {
     installed: rows.map((row) => ({
       ...row,
-      ...marketplaceArtifactCompatibility(row.kind),
+      ...marketplaceArtifactCompatibility(row.kind, row.pluginType),
       ...(row.kind === 'agent' ? { capabilityReadiness: readiness.get(row.slug) } : {}),
     })),
   })
@@ -675,7 +690,7 @@ export async function handleMarketplaceMyPublishes(
   sendJson(res, 200, {
     publishes: publishes.map((row) => ({
       ...row,
-      ...marketplaceArtifactCompatibility(row.kind),
+      ...marketplaceArtifactCompatibility(row.kind, row.pluginType),
     })),
   })
 }
@@ -746,7 +761,10 @@ export async function handleMarketplaceDetail(
     throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
   // 平台预设标记(加法字段):前端据此显示「开箱即用」而非安装按钮。
   const preset = detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(slug)
-  const publicDetail = { ...detail, ...marketplaceArtifactCompatibility(detail.kind) }
+  const publicDetail = {
+    ...detail,
+    ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
+  }
   const capabilityReadiness =
     detail.kind === 'agent'
       ? await getAgentCapabilityReadiness(uid(user), slug, detail.versionId, { preset })
