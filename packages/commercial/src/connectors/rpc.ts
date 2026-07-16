@@ -29,6 +29,11 @@ import {
 } from '../auth/containerIdentity.js'
 import { getPool } from '../db/index.js'
 import { getGithubLinkPublic } from '../github/tokenStore.js'
+import type {
+  PluginRuntimeFacade,
+  RuntimePluginCatalogEntry,
+  RuntimePluginTargetEntry,
+} from '../plugins/runtime.js'
 import { canonicalDigestHex } from './canonicalJson.js'
 import {
   type DeclarativeConnectionRow,
@@ -60,9 +65,13 @@ import {
 } from './store.js'
 
 export const CONNECTORS_RPC_PREFIX = '/v3/connectors/'
+export const PLUGINS_RPC_PREFIX = '/v3/plugins/'
 const LIST_PATH = '/v3/connectors/list'
 const CALL_PATH = '/v3/connectors/call'
 const CATALOG_PATH = '/v3/connectors/catalog'
+const PLUGIN_LIST_PATH = '/v3/plugins/list'
+const PLUGIN_CALL_PATH = '/v3/plugins/call'
+const PLUGIN_CATALOG_PATH = '/v3/plugins/catalog'
 
 /** call body 上限:put_file contentBase64 ≤6MB + JSON 包装余量。 */
 const MAX_CALL_BODY_BYTES = 8 * 1024 * 1024
@@ -237,6 +246,8 @@ export interface ConnectorsRpcDeps {
   limiter?: PerContainerLimiter
   now?: () => number
   log?: RpcLog
+  /** Non-declarative Plugin facade. Omitted in old tests/dev assembly = declarative aliases only. */
+  pluginFacade?: Pick<PluginRuntimeFacade, 'catalog' | 'list' | 'classifyTarget' | 'call'>
 }
 
 export interface ConnectorsRpcCtx {
@@ -321,21 +332,22 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
     const userId = identity.userId
 
     try {
-      if (path === LIST_PATH) {
+      if (path === LIST_PATH || path === PLUGIN_LIST_PATH) {
         await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES) // drain(CLI 发空 {})
-        await handleList(res, userId, pool)
+        await handleList(res, userId, pool, path === PLUGIN_LIST_PATH, deps.pluginFacade)
         return
       }
-      if (path === CALL_PATH) {
+      if (path === CALL_PATH || path === PLUGIN_CALL_PATH) {
         await handleCall(req, res, { userId, containerId: identity.containerId }, pool, {
           deps,
           limiter,
           now,
           log,
+          pluginSurface: path === PLUGIN_CALL_PATH,
         })
         return
       }
-      if (path === CATALOG_PATH) {
+      if (path === CATALOG_PATH || path === PLUGIN_CATALOG_PATH) {
         const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
         const query =
           body !== null &&
@@ -343,7 +355,14 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
           typeof (body as { query?: unknown }).query === 'string'
             ? (body as { query: string }).query
             : undefined
-        await handleCatalog(res, userId, pool, query)
+        await handleCatalog(
+          res,
+          userId,
+          pool,
+          query,
+          path === PLUGIN_CATALOG_PATH,
+          deps.pluginFacade,
+        )
         return
       }
       sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' })
@@ -365,7 +384,13 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
 
 // ─── list ────────────────────────────────────────────────────────────────
 
-async function handleList(res: ServerResponse, userId: number, pool: Pool): Promise<void> {
+async function handleList(
+  res: ServerResponse,
+  userId: number,
+  pool: Pool,
+  pluginSurface = false,
+  pluginFacade?: Pick<PluginRuntimeFacade, 'list'>,
+): Promise<void> {
   // 声明式连接:动作由 pin 的 contract 派生(readOnly = effect==='read')。
   const declConns = await listDeclarativeConnections(userId, pool)
   const declIds = new Set(declConns.map((c) => c.id))
@@ -431,7 +456,22 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
       })),
     })
   }
-  sendEnvelope(res, { connections })
+  if (!pluginSurface) {
+    sendEnvelope(res, { connections })
+    return
+  }
+  const runtimePlugins: RuntimePluginTargetEntry[] = pluginFacade
+    ? await pluginFacade.list(userId)
+    : []
+  sendEnvelope(res, {
+    plugins: [
+      ...connections.map((connection) => ({
+        ...connection,
+        pluginType: 'declarative-http' as const,
+      })),
+      ...runtimePlugins,
+    ],
+  })
 }
 
 // ─── catalog(agent 发现/搜索可装连接器;只读,不含凭据) ─────────────────────
@@ -446,17 +486,34 @@ async function handleCatalog(
   userId: number,
   pool: Pool,
   query?: string,
+  pluginSurface = false,
+  pluginFacade?: Pick<PluginRuntimeFacade, 'catalog'>,
 ): Promise<void> {
   const connectors = await listDeclarativeCatalog(pool, userId, query ? { query } : {})
+  const declarative = connectors.map((c) => ({
+    slug: c.slug,
+    label: c.label,
+    description: c.description,
+    authMode: c.authMode,
+    requiredBindSources: c.requiredBindSources,
+    actions: c.actions.map((a) => ({ id: a.id, readOnly: a.effect === 'read' })),
+  }))
+  if (!pluginSurface) {
+    sendEnvelope(res, { connectors: declarative })
+    return
+  }
+  const runtimePlugins: RuntimePluginCatalogEntry[] = pluginFacade
+    ? await pluginFacade.catalog(userId, query)
+    : []
   sendEnvelope(res, {
-    connectors: connectors.map((c) => ({
-      slug: c.slug,
-      label: c.label,
-      description: c.description,
-      authMode: c.authMode,
-      requiredBindSources: c.requiredBindSources,
-      actions: c.actions.map((a) => ({ id: a.id, readOnly: a.effect === 'read' })),
-    })),
+    plugins: [
+      ...declarative.map((plugin) => ({
+        ...plugin,
+        pluginType: 'declarative-http' as const,
+        accountMode: 'required' as const,
+      })),
+      ...runtimePlugins,
+    ],
   })
 }
 
@@ -623,6 +680,7 @@ async function handleCall(
     limiter: PerContainerLimiter
     now: () => number
     log: RpcLog
+    pluginSurface: boolean
   },
 ): Promise<void> {
   const body = parseCallBody(await readBoundedJsonBody(req, MAX_CALL_BODY_BYTES))
@@ -631,6 +689,46 @@ async function handleCall(
     redis: rt.deps.redis ?? null,
     resolver: rt.deps.resolver,
     fetchImpl: rt.deps.fetchImpl,
+  }
+
+  // Canonical Plugin surface: non-declarative targets are dispatched by the runtime facade.
+  // Declarative/v1 targets fall through byte-for-byte to the historical connector path below.
+  if (rt.pluginSurface && rt.deps.pluginFacade) {
+    const pluginType = await rt.deps.pluginFacade.classifyTarget(who.userId, body.connectionId)
+    if (pluginType !== null) {
+      if (body.confirmId)
+        throw new ConnectorError('BAD_REQUEST', 'runtime Plugin actions are read-only')
+      if (!rt.limiter.check(who.containerId, rt.now()))
+        throw new ConnectorError('RATE_LIMITED', 'per-container window exceeded')
+      await checkRedisWindow(rt.deps.redis, 'read', who.userId, rt.now(), rt.log)
+      try {
+        const result = await rt.deps.pluginFacade.call({
+          userId: who.userId,
+          targetId: body.connectionId,
+          actionId: requireBodyAction(body.action),
+          params: body.params ?? {},
+        })
+        sendEnvelope(res, { kind: 'result', result, pluginType })
+        return
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code
+        if (code === 'LEASE_BUSY')
+          throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
+        if (code === 'TARGET_NOT_FOUND' || code === 'ACCOUNT_NOT_FOUND')
+          throw new ConnectorError('CONNECTION_NOT_FOUND', 'Plugin target not found')
+        if (
+          code === 'TARGET_STALE' ||
+          code === 'ACCOUNT_STALE' ||
+          code === 'NOT_INSTALLED' ||
+          code === 'EXEC_REVOKED' ||
+          code === 'POLICY_STALE'
+        )
+          throw new ConnectorError('RELINK_REQUIRED', 'Plugin target is no longer executable')
+        if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'ACTION_NOT_FOUND')
+          throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
+        throw new ConnectorError('CONNECTION_ERROR', 'Plugin runtime unavailable')
+      }
+    }
   }
 
   // ── github 虚拟连接(只读) ──

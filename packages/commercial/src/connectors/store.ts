@@ -339,7 +339,7 @@ export async function listConnections(
 ): Promise<ConnectionRow[]> {
   const r = await pool.query<ConnectionRow>(
     `SELECT ${ROW_COLS} FROM connections
-      WHERE user_id = $1 AND revoked_at IS NULL
+      WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NULL
       ORDER BY created_at ASC`,
     [userId],
   )

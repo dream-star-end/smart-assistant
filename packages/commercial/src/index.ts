@@ -359,9 +359,11 @@ import {
 } from "./literatureProxy.js";
 import {
   CONNECTORS_RPC_PREFIX,
+  PLUGINS_RPC_PREFIX,
   makeConnectorsRpcHandler,
   type ConnectorsRpcHandler,
 } from "./connectors/rpc.js";
+import { PluginRuntimeFacade } from "./plugins/runtime.js";
 import { seedDefaultConnectors } from "./connectors/declarativeSeed.js";
 import {
   startConnectorSweeper,
@@ -1674,6 +1676,7 @@ export async function registerCommercial(
       const connectorsRpcHandler: ConnectorsRpcHandler = makeConnectorsRpcHandler({
         identityRepo,
         redis,
+        pluginFacade: new PluginRuntimeFacade({ redis }),
       });
       // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
       // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;
@@ -1957,7 +1960,10 @@ export async function registerCommercial(
         if (path === LITERATURE_SEARCH_PATH) {
           return literatureProxyHandler(req, res, ctx);
         }
-        if (path.startsWith(CONNECTORS_RPC_PREFIX)) {
+        if (
+          path.startsWith(CONNECTORS_RPC_PREFIX) ||
+          path.startsWith(PLUGINS_RPC_PREFIX)
+        ) {
           return connectorsRpcHandler(req, res, ctx);
         }
         if (path.startsWith(RESEARCH_PREFIX)) {

@@ -91,6 +91,7 @@ export interface LockedMarketplaceVersion {
 export async function lockMarketplaceVersion(
   runner: QueryRunner,
   versionId: string | number,
+  opts: { maxRawArtifactBytes?: number } = {},
 ): Promise<LockedMarketplaceVersion | null> {
   const r = await runner.query<{
     id: string
@@ -119,8 +120,9 @@ export async function lockMarketplaceVersion(
             signature, key_id, signature_scheme
        FROM marketplace_skill_versions
       WHERE id = $1
+        AND ($2::integer IS NULL OR octet_length(raw_artifact) <= $2)
       FOR UPDATE`,
-    [versionId],
+    [versionId, opts.maxRawArtifactBytes ?? null],
   )
   const row = r.rows[0]
   if (!row) return null

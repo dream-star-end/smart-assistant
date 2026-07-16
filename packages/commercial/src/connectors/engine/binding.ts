@@ -212,11 +212,14 @@ export async function listDeclarativeConnections(
     meta: Record<string, unknown>
     created_at: Date
   }>(
-    `SELECT id::text AS id, provider, display_name,
-            connector_version_id::text AS connector_version_id, meta, created_at
-       FROM connections
-      WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
-      ORDER BY created_at DESC`,
+    `SELECT c.id::text AS id, c.provider, c.display_name,
+            c.connector_version_id::text AS connector_version_id, c.meta, c.created_at
+       FROM connections c
+       JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
+       JOIN marketplace_skill_listings l ON l.slug = v.slug
+      WHERE c.user_id = $1 AND c.revoked_at IS NULL
+        AND l.kind = 'connector' AND l.plugin_type = 'declarative-http'
+      ORDER BY c.created_at DESC`,
     [userId],
   )
   return r.rows.map((row) => ({
