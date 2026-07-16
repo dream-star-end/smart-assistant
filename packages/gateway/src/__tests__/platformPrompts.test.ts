@@ -276,6 +276,52 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       ),
     )
   })
+  it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
+    const sources = {
+      prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+      codex: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8'),
+      skill: readFileSync(
+        'packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md',
+        'utf8',
+      ),
+    }
+    const required = [
+      '单文件、自包含',
+      '真实项目',
+      'curl -fsSL --max-time 5',
+      '[打开网站预览](http://localhost:3000/dashboard)',
+    ]
+    for (const [name, source] of Object.entries(sources)) {
+      for (const fragment of required) {
+        assert.ok(source.includes(fragment), `${name} 缺原生预览契约: ${fragment}`)
+      }
+    }
+
+    const semanticContracts = [
+      ['回复后保持服务', /回复后[^\n]*(?:不要结束服务|服务必须继续运行)/],
+      ['禁止自建临时域名或隧道', /不要[^\n]*trycloudflare[^\n]*(?:域名|隧道)/],
+      [
+        '元素评论必须修改、测试、再次校验并返回同一预览',
+        /(?:选择器[^\n]*视口|视口[^\n]*选择器)[^\n]*(?:修改|定位源码)[^\n]*测试[^\n]*再次校验[^\n]*预览链接/,
+      ],
+    ] as const
+    for (const [name, source] of Object.entries(sources)) {
+      for (const [contract, pattern] of semanticContracts) {
+        assert.match(source, pattern, `${name} 缺原生预览语义契约: ${contract}`)
+      }
+    }
+
+    const retiredBroadRules = [
+      '用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原或可视化原型时,优先直接输出',
+      '当用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原、可视化原型时,优先直接回复',
+      '当用户要求可视化、界面预览、交互 demo、HTML Canvas、小游戏、设计稿还原时,**优先直接输出内联代码块**',
+    ]
+    for (const [name, source] of Object.entries(sources)) {
+      for (const retired of retiredBroadRules) {
+        assert.ok(!source.includes(retired), `${name} 仍含与原生预览冲突的 htmlpreview 广义规则`)
+      }
+    }
+  })
   it('memory-instructions.md === MEMORY_INSTRUCTIONS_FALLBACK', () => {
     const fb = _platformPromptFallbacks.MEMORY_INSTRUCTIONS_FALLBACK
     assert.equal(readFileSync(join(dir, 'memory-instructions.md'), 'utf8'), fb)
