@@ -44,6 +44,7 @@ import {
 import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
 import { buildWriteDetail, buildWriteSummary, requireAction } from '../connectors/service.js'
 import { HttpError } from '../http/util.js'
+import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 
 // ─── registry ────────────────────────────────────────────────────────────
 
@@ -418,10 +419,7 @@ describe('checkFeishuScopes / normalizeScopes(P2#12)', () => {
   test('部分授权(缺 calendar create + im send)→ missing 非空 → 调用方拒绑', () => {
     const r = checkFeishuScopes('docx:document:readonly calendar:calendar.event:read')
     assert.equal(r.verified, false)
-    assert.deepEqual(r.missing.sort(), [
-      'calendar:calendar.event:create',
-      'im:message:send_as_bot',
-    ])
+    assert.deepEqual(r.missing.sort(), ['calendar:calendar.event:create', 'im:message:send_as_bot'])
   })
   test('多余 scope 不影响 verified', () => {
     const r = checkFeishuScopes(`${REQUIRED.join(' ')} extra:scope another:one`)
@@ -675,6 +673,182 @@ describe('RPC 信封契约', () => {
     assert.deepEqual(Object.keys(parsed).sort(), ['code', 'kind'])
     assert.equal(parsed.kind, 'error')
     assert.equal(parsed.code, 'BAD_REQUEST')
+  })
+
+  test('/v3/plugins/call 复用身份与信封，并把非声明式 target 交给 Plugin facade', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    let callInput: unknown
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        call: async (input) => {
+          callInput = input
+          return { posts: 2 }
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({ connectionId: '41', action: 'search', params: { q: 'hello' } }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.equal(state.statusCode, 200)
+    assert.deepEqual(JSON.parse(state.body), {
+      kind: 'result',
+      result: { posts: 2 },
+      pluginType: 'managed-browser',
+    })
+    assert.deepEqual(callInput, {
+      userId: 7,
+      targetId: '41',
+      actionId: 'search',
+      params: { q: 'hello' },
+    })
+  })
+
+  test('/v3/plugins/call 稳定映射容量饱和与账号登录过期', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    for (const [runtimeCode, expected] of [
+      ['RUNTIME_BUSY', 'RATE_LIMITED'],
+      ['RELINK_REQUIRED', 'RELINK_REQUIRED'],
+    ] as const) {
+      const handler = makeConnectorsRpcHandler({
+        identityRepo: okRepo,
+        pool: {} as never,
+        pluginFacade: {
+          catalog: async () => [],
+          list: async () => [],
+          classifyTarget: async () => 'managed-browser',
+          call: async () => {
+            throw new PluginRuntimeFacadeError(runtimeCode)
+          },
+        },
+        log: () => {},
+      })
+      const { res, state } = makeFakeRes()
+      await handler(
+        makeFakeReq({
+          method: 'POST',
+          url: '/v3/plugins/call',
+          headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+          body: JSON.stringify({ connectionId: '41', action: 'search', params: {} }),
+        }),
+        res,
+        { hostUuid: 'h', boundIp: '1.2.3.4' },
+      )
+      assert.deepEqual(JSON.parse(state.body), { kind: 'error', code: expected })
+    }
+  })
+
+  test('连接器列表不混入 runtime target，Plugin 列表只聚合一次', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    const emptyPool = {
+      async query() {
+        return { rows: [], rowCount: 0 }
+      },
+    } as never
+    let facadeListCalls = 0
+    const runtimeTarget = {
+      id: '41',
+      provider: 'browser-reader',
+      displayName: 'Browser Reader',
+      accountHint: '',
+      status: 'active' as const,
+      pluginType: 'managed-browser' as const,
+      actions: [{ id: 'search', description: 'Search', readOnly: true as const }],
+    }
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: emptyPool,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => {
+          facadeListCalls += 1
+          return [runtimeTarget]
+        },
+        classifyTarget: async () => null,
+        call: async () => ({}),
+      },
+      log: () => {},
+    })
+
+    const connectorResponse = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/connectors/list',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: '{}',
+      }),
+      connectorResponse.res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(JSON.parse(connectorResponse.state.body), { connections: [] })
+    assert.equal(facadeListCalls, 0)
+
+    const pluginResponse = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/list',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: '{}',
+      }),
+      pluginResponse.res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(JSON.parse(pluginResponse.state.body), { plugins: [runtimeTarget] })
+    assert.equal(facadeListCalls, 1)
   })
 })
 

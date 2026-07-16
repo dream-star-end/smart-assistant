@@ -85,12 +85,15 @@ export interface LockedMarketplaceVersion {
   signature: Buffer | null
   keyId: string | null
   signatureScheme: 'connector-v1' | 'plugin-v2' | null
+  aiReviewState: string | null
+  reviewSource: string | null
 }
 
 /** 固定锁序的第一步：只锁 version 行。 */
 export async function lockMarketplaceVersion(
   runner: QueryRunner,
   versionId: string | number,
+  opts: { maxRawArtifactBytes?: number } = {},
 ): Promise<LockedMarketplaceVersion | null> {
   const r = await runner.query<{
     id: string
@@ -111,16 +114,19 @@ export async function lockMarketplaceVersion(
     signature: Buffer | null
     key_id: string | null
     signature_scheme: 'connector-v1' | 'plugin-v2' | null
+    ai_review_state: string | null
+    review_source: string | null
   }>(
     `SELECT id::text, slug, version, name, artifact_hash, status,
             submitted_by::text, raw_artifact, security_review_state,
             functional_verify_state, exec_revoked_at, exec_contract,
             exec_contract_hash, compiler_version, security_policy_version,
-            signature, key_id, signature_scheme
+            signature, key_id, signature_scheme, ai_review_state, review_source
        FROM marketplace_skill_versions
       WHERE id = $1
+        AND ($2::integer IS NULL OR octet_length(raw_artifact) <= $2)
       FOR UPDATE`,
-    [versionId],
+    [versionId, opts.maxRawArtifactBytes ?? null],
   )
   const row = r.rows[0]
   if (!row) return null
@@ -143,6 +149,8 @@ export async function lockMarketplaceVersion(
     signature: row.signature,
     keyId: row.key_id,
     signatureScheme: row.signature_scheme,
+    aiReviewState: row.ai_review_state,
+    reviewSource: row.review_source,
   }
 }
 

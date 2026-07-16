@@ -20,6 +20,16 @@ import { getPool } from '../db/index.js'
 import { type QueryRunner, query, tx } from '../db/queries.js'
 import { getActiveMembership } from '../org/memberships.js'
 import {
+  COMPILED_KNOWLEDGE_PLANET_PLUGIN,
+  KNOWLEDGE_PLANET_PLUGIN_SLUG,
+  KNOWLEDGE_PLANET_PLUGIN_VERSION,
+  isOfficialKnowledgePlanetPluginIdentity,
+} from '../plugins/knowledgePlanetContract.js'
+import {
+  listVerifiedRuntimePluginContracts,
+  loadVerifiedRuntimePluginContract,
+} from '../plugins/review.js'
+import {
   lockMarketplaceListing,
   lockMarketplaceMutationSet,
   lockMarketplaceVersion,
@@ -41,10 +51,21 @@ import type { RiskFlag } from './skillScanner.js'
  *  the scanner / install-applier / detail-renderer vary by kind. */
 export type ArtifactKind = 'skill' | 'agent' | 'connector'
 
-function marketplacePluginType(
-  kind: ArtifactKind,
-  value: unknown,
-): MarketplacePluginType | null {
+async function loadVerifiedMarketplacePlugin(
+  versionId: number,
+  pluginType: MarketplacePluginType | null,
+  runner: QueryRunner,
+): Promise<
+  | Awaited<ReturnType<typeof loadVerifiedContractWithMeta>>
+  | Awaited<ReturnType<typeof loadVerifiedRuntimePluginContract>>
+> {
+  if (pluginType === 'declarative-http') return loadVerifiedContractWithMeta(versionId, runner)
+  if (pluginType === 'sandboxed-local' || pluginType === 'managed-browser')
+    return loadVerifiedRuntimePluginContract(versionId, runner)
+  throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'unknown Plugin subtype')
+}
+
+function marketplacePluginType(kind: ArtifactKind, value: unknown): MarketplacePluginType | null {
   if (kind === 'connector') {
     if (!isMarketplacePluginType(value))
       throw new MarketplaceError('KIND_MISMATCH', 'connector listing 缺少合法 Plugin 子类型')
@@ -302,6 +323,7 @@ async function validateCapabilityRequirements(
   const rows = await runner.query<{
     slug: string
     kind: ArtifactKind
+    plugin_type: MarketplacePluginType | null
     state: string
     current_approved_version_id: string | null
     version_status: string | null
@@ -309,7 +331,7 @@ async function validateCapabilityRequirements(
     functional_verify_state: string | null
     exec_revoked_at: Date | null
   }>(
-    `SELECT l.slug, l.kind, l.state, l.current_approved_version_id::text,
+    `SELECT l.slug, l.kind, l.plugin_type, l.state, l.current_approved_version_id::text,
             v.status AS version_status, v.security_review_state,
             v.functional_verify_state, v.exec_revoked_at
        FROM marketplace_skill_listings l
@@ -343,7 +365,11 @@ async function validateCapabilityRequirements(
           `必需插件尚未通过可信审核：${requirement.slug}`,
         )
       try {
-        await loadVerifiedContractWithMeta(Number(row.current_approved_version_id), runner)
+        await loadVerifiedMarketplacePlugin(
+          Number(row.current_approved_version_id),
+          row.plugin_type,
+          runner,
+        )
       } catch (error) {
         if (error instanceof ConnectorSpecError)
           throw new MarketplaceError(
@@ -366,12 +392,8 @@ interface CapabilityApprovalGraph {
   requirements: CapabilityApprovalRequirement[]
 }
 
-type LockedMarketplaceVersionRow = NonNullable<
-  Awaited<ReturnType<typeof lockMarketplaceVersion>>
->
-type LockedMarketplaceListingRow = NonNullable<
-  Awaited<ReturnType<typeof lockMarketplaceListing>>
->
+type LockedMarketplaceVersionRow = NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>
+type LockedMarketplaceListingRow = NonNullable<Awaited<ReturnType<typeof lockMarketplaceListing>>>
 
 async function loadCapabilityApprovalGraph(
   versionId: string,
@@ -519,19 +541,28 @@ async function validateLockedCapabilityRequirements(
       !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
       version.execRevokedAt !== null
     )
-      throw new MarketplaceError('INVALID_CAPABILITY', `必需插件尚未通过可信审核：${requirement.slug}`)
+      throw new MarketplaceError(
+        'INVALID_CAPABILITY',
+        `必需插件尚未通过可信审核：${requirement.slug}`,
+      )
     try {
-      await loadVerifiedContractWithMeta(Number(version.id), runner)
+      await loadVerifiedMarketplacePlugin(Number(version.id), listing.pluginType, runner)
     } catch (error) {
       if (error instanceof ConnectorSpecError)
-        throw new MarketplaceError('INVALID_CAPABILITY', `必需插件签名不可验证：${requirement.slug}`)
+        throw new MarketplaceError(
+          'INVALID_CAPABILITY',
+          `必需插件签名不可验证：${requirement.slug}`,
+        )
       throw error
     }
   }
 }
 
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
-export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
+async function publishSkillVersionInternal(
+  input: PublishInput,
+  allowOfficialKnowledgePlanetSeed: boolean,
+): Promise<{ versionId: string }> {
   const kind: ArtifactKind = input.kind ?? 'skill'
   const pluginType = marketplacePluginType(kind, input.pluginType)
   const requirements =
@@ -541,10 +572,13 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
   const rawArtifact = input.rawArtifact ?? input.rawSkillMd
   if (rawArtifact == null)
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
-  if (isDefaultConnectorSlug(input.slug))
+  if (
+    isDefaultConnectorSlug(input.slug) ||
+    (input.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG && !allowOfficialKnowledgePlanetSeed)
+  )
     throw new MarketplaceError(
       'SLUG_OWNED_BY_OTHER',
-      `slug "${input.slug}" 为平台默认连接器保留，不能发布`,
+      `slug "${input.slug}" 为平台官方 Plugin 保留，不能发布`,
     )
   return tx(async (c) => {
     await query(
@@ -646,6 +680,35 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       throw e
     }
   })
+}
+
+/** User/admin/Agent publication path. Platform-reserved slugs always fail closed. */
+export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
+  return publishSkillVersionInternal(input, false)
+}
+
+/**
+ * Narrow deploy-seed bypass for the one version-controlled Knowledge Planet
+ * artifact. It is intentionally not parameterized by slug/hash/type, so ordinary
+ * publication callers cannot turn a user artifact into a platform-reserved one.
+ */
+export async function publishOfficialKnowledgePlanetVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG ||
+    input.version !== KNOWLEDGE_PLANET_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Knowledge Planet platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
 }
 
 export interface PendingVersionRow {
@@ -1196,6 +1259,8 @@ export interface ApprovedSearchRow {
   users30d: number
   /** 评分归因(好评率原始计数;样本 <RATING_MIN_SAMPLE → null,前端不渲染)。 */
   rating: { up: number; down: number } | null
+  /** True only after exact platform provenance + signed contract verification. */
+  official?: boolean
 }
 
 /** Current approved version of every active listing — the searchable catalog.
@@ -1229,6 +1294,7 @@ export async function listApprovedForSearch(
     users30d: string | null
     rating_up: string | null
     rating_down: string | null
+    review_source: string | null
   }>(
     // install_count / usage / rating 全部走一次性聚合 JOIN(而非逐行 correlated 子查询):
     // 目录上限 500 行,逐行子查询会对共享 search 端点放大 500 次扫描。三个信号子查询各按 slug
@@ -1245,7 +1311,8 @@ export async function listApprovedForSearch(
             v.benchmark, ic.n::text AS install_count,
             v.category, v.use_cases, l.featured_rank,
             us.usage_n::text AS usage30d, us.users_n::text AS users30d,
-            rt.up_n::text AS rating_up, rt.down_n::text AS rating_down
+            rt.up_n::text AS rating_up, rt.down_n::text AS rating_down,
+            v.review_source
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
        LEFT JOIN (SELECT slug, count(*) AS n FROM marketplace_installs
@@ -1285,14 +1352,40 @@ export async function listApprovedForSearch(
   }
   const out: ApprovedSearchRow[] = []
   const pool = getPool()
-  const connectorVersionIds = r.rows
-    .filter((row) => row.kind === 'connector')
+  const declarativeVersionIds = r.rows
+    .filter((row) => row.kind === 'connector' && row.plugin_type === 'declarative-http')
     .map((row) => Number(row.id))
-  const verifiedConnectors = await listVerifiedContractsWithMeta(connectorVersionIds, pool)
+  const runtimeVersionIds = r.rows
+    .filter(
+      (row) =>
+        row.kind === 'connector' &&
+        (row.plugin_type === 'sandboxed-local' || row.plugin_type === 'managed-browser'),
+    )
+    .map((row) => Number(row.id))
+  const [verifiedDeclarative, verifiedRuntimeContracts] = await Promise.all([
+    listVerifiedContractsWithMeta(declarativeVersionIds, pool),
+    listVerifiedRuntimePluginContracts(runtimeVersionIds, pool),
+  ])
   for (const x of r.rows) {
     // lifecycle 列只是快筛；公开目录必须经过与 bind/execute 相同的工件 hash、策略、
     // key 与签名权威校验。批量读取避免目录上限 500 条时产生 N+1。
-    if (x.kind === 'connector' && !verifiedConnectors.has(Number(x.id))) continue
+    if (
+      x.kind === 'connector' &&
+      !(x.plugin_type === 'declarative-http'
+        ? verifiedDeclarative.has(Number(x.id))
+        : verifiedRuntimeContracts.has(Number(x.id)))
+    )
+      continue
+    const verifiedRuntime = verifiedRuntimeContracts.get(Number(x.id))
+    const officialKnowledgePlanet =
+      x.kind === 'connector' &&
+      isOfficialKnowledgePlanetPluginIdentity({
+        slug: x.slug,
+        pluginType: x.plugin_type,
+        artifactHash: x.artifact_hash,
+        execContractHash: verifiedRuntime?.execContractHash ?? null,
+        reviewSource: x.review_source,
+      })
     out.push({
       versionId: x.id,
       slug: x.slug,
@@ -1316,6 +1409,7 @@ export async function listApprovedForSearch(
         Number.parseInt(x.rating_up ?? '0', 10) || 0,
         Number.parseInt(x.rating_down ?? '0', 10) || 0,
       ),
+      ...(officialKnowledgePlanet ? { official: true } : {}),
     })
   }
   return out
@@ -1449,11 +1543,35 @@ export async function getListingDetail(
   )
   const x = r.rows[0]
   if (!x) return null
-  let verifiedConnectorContract: Awaited<ReturnType<typeof loadVerifiedContractWithMeta>> | null =
-    null
+  let connectorContract: ListingDetail['connectorContract'] = null
+  let verifiedRuntimeExecContractHash: string | null = null
   if (x.kind === 'connector') {
     try {
-      verifiedConnectorContract = await loadVerifiedContractWithMeta(Number(x.vid), getPool())
+      if (x.plugin_type === 'declarative-http') {
+        const verified = await loadVerifiedContractWithMeta(Number(x.vid), getPool())
+        connectorContract = projectSignedConnectorContract(verified.contract)
+      } else if (x.plugin_type === 'sandboxed-local' || x.plugin_type === 'managed-browser') {
+        const verified = await loadVerifiedRuntimePluginContract(Number(x.vid), getPool())
+        verifiedRuntimeExecContractHash = verified.execContractHash
+        const approvedOrigins =
+          verified.pluginType === 'managed-browser'
+            ? [...verified.contract.runtime.network.origins]
+            : [
+                ...new Set(
+                  Object.values(verified.contract.runtime.brokerPolicy?.actions ?? {}).flatMap(
+                    (action) => [...action.httpRead.origins],
+                  ),
+                ),
+              ].sort()
+        connectorContract = {
+          authMode: verified.pluginType === 'managed-browser' ? 'managed_browser' : 'none',
+          approvedOrigins,
+          actions: verified.contract.actions.map((action) => ({
+            id: action.id,
+            effect: action.effect,
+          })),
+        }
+      } else return null
     } catch (error) {
       if (error instanceof ConnectorSpecError) return null
       throw error
@@ -1496,8 +1614,16 @@ export async function getListingDetail(
     ),
     ...(x.kind === 'connector'
       ? {
-          official: isDefaultConnectorArtifact(x.slug, x.artifact_hash),
-          connectorContract: projectSignedConnectorContract(verifiedConnectorContract!.contract),
+          official:
+            isDefaultConnectorArtifact(x.slug, x.artifact_hash) ||
+            isOfficialKnowledgePlanetPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }),
+          connectorContract,
         }
       : {}),
   }
@@ -1550,7 +1676,7 @@ async function verifyLockedInstallTarget(
   )
     throw new MarketplaceError('NOT_INSTALLABLE', `插件尚未完成可信审核：${version.slug}`)
   try {
-    await loadVerifiedContractWithMeta(Number(version.id), runner)
+    await loadVerifiedMarketplacePlugin(Number(version.id), listing.pluginType, runner)
   } catch (error) {
     if (error instanceof ConnectorSpecError)
       throw new MarketplaceError('NOT_INSTALLABLE', `插件执行契约不可验证：${version.slug}`)
@@ -1563,6 +1689,7 @@ async function replacePinnedInstall(
   userId: number,
   version: NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>,
   agentIds: readonly string[],
+  audit?: { source: string; installedBy: number },
 ): Promise<boolean> {
   // Keep the legacy non-empty projection valid until normalized bindings are
   // recomputed later in this transaction. Old-source rollback readers therefore
@@ -1581,9 +1708,17 @@ async function replacePinnedInstall(
   try {
     await runner.query(
       `INSERT INTO marketplace_installs
-         (user_id, slug, version_id, artifact_hash, installed_by, agent_ids)
-       VALUES ($1,$2,$3,$4,$1,$5::jsonb)`,
-      [userId, version.slug, version.id, version.artifactHash, JSON.stringify(compatibilityScope)],
+         (user_id, slug, version_id, artifact_hash, installed_by, install_source, agent_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [
+        userId,
+        version.slug,
+        version.id,
+        version.artifactHash,
+        audit?.installedBy ?? userId,
+        audit?.source ?? 'web',
+        JSON.stringify(compatibilityScope),
+      ],
     )
   } catch (error) {
     if (isUniqueViolation(error))
@@ -1635,11 +1770,8 @@ async function replaceManualBindings(
       )
       const automatic = new Set(dependencyOwned.rows.map((row) => row.agent_slug))
       const alreadyManual = new Set(oldIds)
-      finalIds = supplied.filter(
-        (agentId) => !automatic.has(agentId) || alreadyManual.has(agentId),
-      )
-      if (!args.hadExistingInstall && finalIds.length === 0)
-        finalIds = DEFAULT_INSTALL_AGENT_IDS
+      finalIds = supplied.filter((agentId) => !automatic.has(agentId) || alreadyManual.has(agentId))
+      if (!args.hadExistingInstall && finalIds.length === 0) finalIds = DEFAULT_INSTALL_AGENT_IDS
     }
   } else
     finalIds = oldIds.length
@@ -1726,11 +1858,22 @@ export async function installMarketplaceBundle(args: {
   agentIds?: string[]
   scopeMode?: InstallScopeMode
   callerOrgId?: CallerOrgId
+  /** Internal seed/migration audit metadata, written atomically with the root install. */
+  installAudit?: { source: string; installedBy: number }
   /** Integration-test-only failure point; never populated by an HTTP route. */
   failureInjector?: () => void | Promise<void>
   /** Internal optimistic-discovery retry counter. */
   retryAttempt?: number
 }): Promise<MarketplaceBundleInstallResult> {
+  if (
+    args.installAudit &&
+    (typeof args.installAudit.source !== 'string' ||
+      args.installAudit.source.length < 1 ||
+      args.installAudit.source.length > 128 ||
+      !Number.isSafeInteger(args.installAudit.installedBy) ||
+      args.installAudit.installedBy <= 0)
+  )
+    throw new MarketplaceError('INSTALL_CONFLICT', '安装审计元数据无效')
   const callerOrgId = args.callerOrgId ?? null
   const located = await query<{ slug: string; kind: ArtifactKind }>(
     `SELECT v.slug, l.kind FROM marketplace_skill_versions v
@@ -1770,9 +1913,7 @@ export async function installMarketplaceBundle(args: {
       : normalizeInstallAgentIds(args.agentIds, DEFAULT_INSTALL_AGENT_IDS)
   try {
     return await tx(async (c) => {
-      await c.query(
-        "SELECT set_config('openclaude.capability_writer', 'normalized', true)",
-      )
+      await c.query("SELECT set_config('openclaude.capability_writer', 'normalized', true)")
       await lockMarketplaceMutationSet(c, {
         userId: args.userId,
         artifactSlugs: [
@@ -1861,15 +2002,8 @@ export async function installMarketplaceBundle(args: {
         const listing = await lockMarketplaceListing(c, slug)
         if (listing) listings.set(slug, listing)
       }
-      if (
-        refs.some(
-          (ref) => listings.get(ref.slug)?.currentApprovedVersionId !== ref.version_id,
-        )
-      )
-        throw new MarketplaceError(
-          'INSTALL_CONFLICT',
-          '能力版本在安装期间发生变化,请重试',
-        )
+      if (refs.some((ref) => listings.get(ref.slug)?.currentApprovedVersionId !== ref.version_id))
+        throw new MarketplaceError('INSTALL_CONFLICT', '能力版本在安装期间发生变化,请重试')
 
       const version = versions.get(args.versionId)
       const rootListing = listings.get(root.slug)
@@ -1913,6 +2047,7 @@ export async function installMarketplaceBundle(args: {
         args.userId,
         version,
         rootListing.kind === 'agent' ? DEFAULT_INSTALL_AGENT_IDS : [],
+        args.installAudit,
       )
       if (rootListing.kind === 'skill' || rootListing.kind === 'connector') {
         await replaceManualBindings(c, {
@@ -2026,6 +2161,7 @@ export async function installApprovedVersion(args: {
   agentIds?: string[]
   scopeMode?: InstallScopeMode
   callerOrgId?: CallerOrgId
+  installAudit?: { source: string; installedBy: number }
 }): Promise<{ slug: string; version: string; name: string }> {
   const result = await installMarketplaceBundle(args)
   return { slug: result.slug, version: result.version, name: result.name }
@@ -2104,10 +2240,7 @@ async function getAgentCapabilityReadinessBatch(
   if (targets.length === 0) return new Map()
   const uniqueTargets = [
     ...new Map(
-      targets.map((target) => [
-        agentCapabilityReadinessKey(target.slug, target.preset),
-        target,
-      ]),
+      targets.map((target) => [agentCapabilityReadinessKey(target.slug, target.preset), target]),
     ).values(),
   ]
   const resolvedRows = await query<{
@@ -2314,9 +2447,7 @@ async function getAgentCapabilityReadinessBatch(
         verifiedConnectors.has(Number(selectedVersionId))
     }
     const status: AgentCapabilityReadinessItem['status'] =
-      row.target_installed &&
-      !row.bound &&
-      (!row.target_preset || row.kind === 'skill')
+      row.target_installed && !row.bound && (!row.target_preset || row.kind === 'skill')
         ? 'missing'
         : !capabilityInstalled
           ? 'missing'
@@ -2332,8 +2463,7 @@ async function getAgentCapabilityReadinessBatch(
       installed: capabilityInstalled,
       bound: row.bound === true,
       status,
-      repairable:
-        (status === 'missing' || status === 'revoked') && currentTargetInstallable,
+      repairable: (status === 'missing' || status === 'revoked') && currentTargetInstallable,
     })
   }
   for (const readiness of result.values()) {

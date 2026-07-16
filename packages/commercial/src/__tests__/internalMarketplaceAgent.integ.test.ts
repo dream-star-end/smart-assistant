@@ -588,6 +588,32 @@ describe('internalMarketplaceAgent (integ)', () => {
         category: 'daily-tools',
         useCases: ['连接外部服务并查询当前身份'],
       }
+      const pluginBlueprint = {
+        format: 'plugin-blueprint-v1',
+        slug,
+        name: `Connector ${slug}`,
+        description: 'connector published by the in-container AI',
+        category: 'daily-tools',
+        useCases: ['连接外部服务并查询当前身份'],
+        tags: ['连接器'],
+        apiOrigin: 'https://api.internal-market.test',
+        auth: { mode: 'static-token' },
+        identity: { actionId: 'whoami', accountKeyPointer: '/id' },
+        actions: [
+          {
+            id: 'whoami',
+            description: 'identity probe',
+            method: 'GET',
+            path: '/v1/me',
+            params: { type: 'object', properties: {}, additionalProperties: false },
+            result: {
+              type: 'object',
+              properties: { id: { type: 'string' } },
+              additionalProperties: false,
+            },
+          },
+        ],
+      }
       let res = makeRes()
       await ownerHandler(
         makeReq('POST', 'validate-plugin', {
@@ -638,9 +664,41 @@ describe('internalMarketplaceAgent (integ)', () => {
 
       res = makeRes()
       await ownerHandler(
-        makeReq('POST', 'publish', {
+        makeReq('POST', 'prepare-plugin', {
           token: tokenFor(201),
-          body: pluginDraft,
+          body: pluginBlueprint,
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+      const confirmationHash = String(res.body.validationHash)
+      assert.match(confirmationHash, /^[0-9a-f]{64}$/)
+      assert.equal(res.body.plugin.slug, slug)
+      assert.deepEqual(res.body.permissionSummary.origins.apiOrigins, [CONNECTOR_API_ORIGIN])
+
+      res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'publish-plugin', {
+          token: tokenFor(201),
+          body: { draft: pluginBlueprint, confirmationHash: '0'.repeat(64) },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error.code, 'CONFIRMATION_STALE')
+      untouched = await query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug=$1',
+        [slug],
+      )
+      assert.equal(untouched.rows[0]?.count, '0', 'stale confirmation must not create a listing')
+
+      res = makeRes()
+      await ownerHandler(
+        makeReq('POST', 'publish-plugin', {
+          token: tokenFor(201),
+          body: { draft: pluginBlueprint, confirmationHash },
         }),
         res,
         CTX,
@@ -665,7 +723,10 @@ describe('internalMarketplaceAgent (integ)', () => {
       assert.equal(stored.rows[0]!.owner_user_id, String(owner))
       assert.equal(stored.rows[0]!.submitted_by, String(owner))
       assert.equal(stored.rows[0]!.ai_review_state, 'queued')
-      assert.deepEqual(stored.rows[0]!.proposed, connectorDecision)
+      assert.deepEqual(stored.rows[0]!.proposed, {
+        ...connectorDecision,
+        actions: { whoami: { effect: 'read' } },
+      })
 
       await approveMarketplaceConnectorVersion({
         versionId,

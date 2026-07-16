@@ -57,7 +57,11 @@ import {
   listMarketBrowseCatalog,
   platformPresetAgentSlugs,
 } from '../marketplace/platformPresets.js'
-import { prepareConnectorPublish } from '../marketplace/publishConnectorPipeline.js'
+import { PluginBlueprintError, compilePluginBlueprint } from '../marketplace/pluginBlueprint.js'
+import {
+  type ConnectorPublishPrepared,
+  prepareConnectorPublish,
+} from '../marketplace/publishConnectorPipeline.js'
 import {
   PUBLISH_MAX_REQUEST_BYTES,
   prepareSkillPublish,
@@ -421,6 +425,99 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         )
         return
       }
+      if (req.method === 'POST' && op === 'prepare-plugin') {
+        if (!marketplaceConnectorsEnabled())
+          return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
+        const body = await readBody(req, PUBLISH_MAX_REQUEST_BYTES)
+        const draft = agentPluginPublishBody(body)
+        if (draft.visibility === 'org' && !callerOrgId)
+          return send(
+            res,
+            403,
+            {
+              error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的插件' },
+            },
+            requestId,
+          )
+        const prepared = prepareConnectorPublish(draft)
+        if (!prepared.ok)
+          return send(
+            res,
+            prepared.status,
+            {
+              error: { code: prepared.code, message: prepared.message },
+              ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+            },
+            requestId,
+          )
+        sendPluginPreparation(
+          res,
+          requestId,
+          prepared,
+          draft.visibility === 'org' ? 'org' : 'public',
+        )
+        return
+      }
+      if (req.method === 'POST' && op === 'publish-plugin') {
+        if (!marketplaceConnectorsEnabled())
+          return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
+        const envelope = await readBody(req, PUBLISH_MAX_REQUEST_BYTES)
+        if (
+          envelope === null ||
+          typeof envelope !== 'object' ||
+          Array.isArray(envelope) ||
+          Object.keys(envelope).sort().join('\0') !== 'confirmationHash\0draft' ||
+          typeof envelope.confirmationHash !== 'string' ||
+          envelope.confirmationHash.length !== 64
+        )
+          return send(
+            res,
+            400,
+            { error: { code: 'CONFIRMATION_REQUIRED', message: '发布前必须确认当前校验摘要' } },
+            requestId,
+          )
+        const draft = agentPluginPublishBody(envelope.draft)
+        if (draft.visibility === 'org' && !callerOrgId)
+          return send(
+            res,
+            403,
+            {
+              error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的插件' },
+            },
+            requestId,
+          )
+        const prepared = prepareConnectorPublish(draft)
+        if (!prepared.ok)
+          return send(
+            res,
+            prepared.status,
+            {
+              error: { code: prepared.code, message: prepared.message },
+              ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
+            },
+            requestId,
+          )
+        if (envelope.confirmationHash !== prepared.validationHash)
+          return send(
+            res,
+            409,
+            {
+              error: {
+                code: 'CONFIRMATION_STALE',
+                message: 'Plugin 草稿已变化；请重新准备并取得用户确认',
+              },
+            },
+            requestId,
+          )
+        await publishPreparedPlugin(
+          res,
+          requestId,
+          prepared,
+          userId,
+          draft.visibility === 'org' ? callerOrgId : null,
+        )
+        return
+      }
       if (req.method === 'POST' && op === 'publish') {
         await handlePublish(req, res, requestId, userId, callerOrgId, deps)
         return
@@ -447,6 +544,10 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         send(res, 400, { error: { code: err.code, message: err.message } }, requestId)
         return
       }
+      if (err instanceof PluginBlueprintError) {
+        send(res, 400, { error: { code: err.code, message: err.message } }, requestId)
+        return
+      }
       const msg = err instanceof Error ? err.message : 'error'
       if (msg === 'invalid JSON' || msg === 'body too large') {
         send(res, 400, { error: { code: 'BAD_REQUEST', message: msg } }, requestId)
@@ -460,6 +561,94 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
       send(res, 500, { error: { code: 'INTERNAL', message: 'marketplace op failed' } }, requestId)
     }
   }
+}
+
+function agentPluginPublishBody(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new PluginBlueprintError('Plugin draft must be a JSON object')
+  const draft = value as Record<string, unknown>
+  return draft.format === 'plugin-blueprint-v1' ? compilePluginBlueprint(draft) : draft
+}
+
+function sendPluginPreparation(
+  res: ServerResponse,
+  requestId: string,
+  prepared: ConnectorPublishPrepared,
+  visibility: 'public' | 'org',
+): void {
+  send(
+    res,
+    200,
+    {
+      ok: true,
+      ...marketplaceArtifactCompatibility('connector', 'declarative-http'),
+      validationHash: prepared.validationHash,
+      plugin: {
+        slug: prepared.slug,
+        version: prepared.version,
+        name: prepared.name,
+        description: prepared.description,
+        category: prepared.humanMeta.category,
+        useCases: prepared.humanMeta.useCases,
+        outcomeExamples: prepared.humanMeta.outcomeExamples,
+        tags: prepared.tags,
+        visibility,
+      },
+      permissionSummary: prepared.permissionSummary,
+      riskFlags: prepared.riskFlags,
+      note: '准备完成；发布前请向用户展示以上摘要并取得一次明确确认。',
+    },
+    requestId,
+  )
+}
+
+async function publishPreparedPlugin(
+  res: ServerResponse,
+  requestId: string,
+  prepared: ConnectorPublishPrepared,
+  userId: number,
+  orgId: string | null,
+): Promise<void> {
+  const { versionId } = await publishSkillVersion({
+    slug: prepared.slug,
+    ownerUserId: userId,
+    version: prepared.version,
+    name: prepared.name,
+    description: prepared.description,
+    tags: prepared.tags,
+    rawSkillMd: null,
+    rawArtifact: prepared.rawArtifact,
+    manifest: {
+      connector: true,
+      proposedSecurityDecision: prepared.proposedSecurityDecision,
+    },
+    kind: 'connector',
+    pluginType: 'declarative-http',
+    artifactHash: prepared.artifactHash,
+    embeddingHash: prepared.embeddingHash,
+    riskFlags: prepared.riskFlags,
+    policyVersion: prepared.policyVersion,
+    submittedBy: userId,
+    orgId,
+    category: prepared.humanMeta.category,
+    useCases: prepared.humanMeta.useCases,
+    outcomeExamples: prepared.humanMeta.outcomeExamples,
+    humanMd: prepared.humanMeta.humanMd,
+  })
+  send(
+    res,
+    200,
+    {
+      ok: true,
+      kind: 'connector',
+      ...marketplaceArtifactCompatibility('connector', 'declarative-http'),
+      versionId,
+      status: 'pending',
+      riskFlags: prepared.riskFlags,
+      note: '已提交 AI 自动审核；不确定或高风险项会转人工复核。',
+    },
+    requestId,
+  )
 }
 
 /** Publish a skill, agent or connector on the user's behalf → PENDING + static scan. */
@@ -506,46 +695,7 @@ async function handlePublish(
         },
         requestId,
       )
-    const { versionId } = await publishSkillVersion({
-      slug: prepared.slug,
-      ownerUserId: userId,
-      version: prepared.version,
-      name: prepared.name,
-      description: prepared.description,
-      tags: prepared.tags,
-      rawSkillMd: null,
-      rawArtifact: prepared.rawArtifact,
-      manifest: {
-        connector: true,
-        proposedSecurityDecision: prepared.proposedSecurityDecision,
-      },
-      kind: 'connector',
-      pluginType: 'declarative-http',
-      artifactHash: prepared.artifactHash,
-      embeddingHash: prepared.embeddingHash,
-      riskFlags: prepared.riskFlags,
-      policyVersion: prepared.policyVersion,
-      submittedBy: userId,
-      orgId,
-      category: prepared.humanMeta.category,
-      useCases: prepared.humanMeta.useCases,
-      outcomeExamples: prepared.humanMeta.outcomeExamples,
-      humanMd: prepared.humanMeta.humanMd,
-    })
-    send(
-      res,
-      200,
-      {
-        ok: true,
-        kind: 'connector',
-        ...marketplaceArtifactCompatibility('connector', 'declarative-http'),
-        versionId,
-        status: 'pending',
-        riskFlags: prepared.riskFlags,
-        note: '已提交 AI 自动审核；不确定或高风险项会转人工复核。',
-      },
-      requestId,
-    )
+    await publishPreparedPlugin(res, requestId, prepared, userId, orgId)
     return
   }
 

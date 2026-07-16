@@ -1,8 +1,8 @@
 ---
 name: platform-capabilities
-description: "OpenClaude (claudeai.chat) 平台核心能力: 多媒体收发规则、内联富内容、htmlpreview、HTML Canvas、界面预览、设计稿还原、交互 demo、小游戏"
-version: "2.1.0"
-tags: [system, platform, media, rich-content, htmlpreview, canvas, ui-preview]
+description: "OpenClaude (claudeai.chat) 平台核心能力: 多媒体收发、内联富内容、htmlpreview、容器网站原生预览、HTML Canvas、界面与交互 demo"
+version: "2.2.0"
+tags: [system, platform, media, rich-content, htmlpreview, container-preview, canvas, ui-preview]
 priority: 9
 ---
 
@@ -44,7 +44,39 @@ priority: 9
 - **```mermaid** — 流程图/时序图/甘特图
 - **```htmlpreview** — 完整 HTML+CSS+JS 沙盒(Canvas/动画/小游戏/界面 demo)
 
-当用户要求可视化、界面预览、交互 demo、HTML Canvas、小游戏、设计稿还原时,**优先直接输出内联代码块**,不要先生成 `.html` 文件。只有用户明确要求“保存成文件/给我下载链接”时才写文件。
+单文件、自包含且不依赖真实项目构建、路由或 API 的界面 mock、HTML Canvas、动画、小游戏和独立交互 demo,**优先直接输出内联 `htmlpreview` 代码块**。真实项目、多文件或框架站点、开发服务器、真实路由/API/静态资源联调使用下方的容器网站原生预览。只有用户明确要求“保存成文件/给我下载链接”时才把预览另写成文件。
+
+## 容器网站原生预览
+
+### 什么时候使用
+
+以下情况不要把项目硬塞进 `htmlpreview`,而应启动真实服务:
+
+- 正在编写或修改真实项目、多文件页面、React/Vue/Vite/Next 等框架站点
+- 需要验证路由、API、构建产物、静态资源或响应式行为
+- 项目已经有开发服务器,或用户明确要求“打开网站看看”“给我网站预览”
+
+### 操作闭环
+
+1. **复用或启动服务**:优先复用当前项目已运行的服务;否则检查空闲的普通应用端口并启动长驻进程。按框架需要监听 `127.0.0.1` 或 `0.0.0.0`,不要使用平台保留端口、系统管理端口或数据库端口。日志可暂存到 `/tmp`,但回复后服务必须继续运行。
+2. **校验最终路径**:对准备返回给用户的完整路径执行失败即报错的检查,例如:
+   ```bash
+   curl -fsSL --max-time 5 'http://127.0.0.1:3000/dashboard' >/dev/null
+   ```
+   根路径成功不代表 `/dashboard` 成功;检查不通过时先看服务日志、修复并重试,不得提前声称预览可用。
+3. **给显式 Markdown 链接**:校验通过后在回复中输出:
+   ```markdown
+   [打开网站预览](http://localhost:3000/dashboard)
+   ```
+   前端会把该 loopback 链接识别为“容器预览”并打开原生页面。不能只说“服务已启动”、只给绝对文件路径,也不要让用户在自己的电脑或手机浏览器里直接输入 localhost。
+4. **域名由平台处理**:不要让用户提供额外域名,不要运行 cloudflared/ngrok,不要自行创建公网或 `trycloudflare` 临时域名/隧道。平台会为每次预览自动提供隔离临时域名与兼容回退。
+5. **落实元素评论**:用户从预览界面把评论加入对话后,消息会包含页面、视口、CSS 选择器和评论。把它当作直接实现任务:定位源码、完成修改、运行相关测试,确认服务仍在同一 URL(必要时重启),再次校验完整路径并返回同一预览链接。不要只复述标注意见。
+
+### 失败处理
+
+- 端口被占用:先确认是否是可复用的项目服务;否则换一个普通空闲端口并同步更新链接。
+- 服务未就绪或 HTTP 非成功:读取启动日志,修复依赖、构建或路由错误后再回复。
+- 用户只要一个独立视觉草图而没有真实项目:退回 `htmlpreview`,不要无意义启动服务器。
 
 ### `htmlpreview` / HTML Canvas 用法
 

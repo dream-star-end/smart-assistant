@@ -9,6 +9,9 @@
 #   V5_BASE=http://127.0.0.1:18790 EMAIL=v5-canary@claudeai.chat PASSWORD=... \
 #     scripts/run-baseline-skill-evals.sh [skill1 skill2 ...]
 #   不传技能名 = 遍历该账号可见技能里所有带 evals 的。
+#   OC_EVAL_RESULTS_FILE=<path> 时,每个技能完成后追加一行机器可读 JSONL
+#   {skill,runId,status,benchmark} —— 周期回归管道(v5-baseline-evals-weekly.sh)
+#   靠它做历史对比,别改字段名。
 set -euo pipefail
 
 V5_BASE="${V5_BASE:-http://127.0.0.1:18790}"
@@ -40,22 +43,42 @@ fi
 
 fail=0
 for name in "${skills[@]}"; do
-  evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$name/evals" || echo '{}')
+  # 取 evals 必须区分"确认无 evals"与"取数失败"(容器冷启动的代理瞬态 5xx 曾把
+  # web-context 静默跳过):失败重试,重试耗尽计 fail 而不是当作无用例跳过。
+  evals=""
+  for attempt in 1 2 3; do
+    evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$name/evals") && break
+    evals=""
+    [ "$attempt" -lt 3 ] && sleep 15
+  done
+  if [ -z "$evals" ]; then
+    echo "== eval $name: FETCH FAILED (evals GET 3 次均失败,非'无 evals')"
+    fail=1
+    continue
+  fi
   cases=$(echo "$evals" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len((d.get("evals") or {}).get("cases",[])))' 2>/dev/null || echo 0)
   [ "$cases" -eq 0 ] && continue
   echo "== eval $name ($cases cases) =="
   runId=$(curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
     "$V5_BASE/api/skills/$name/eval-run" -d '{"mode":"baseline"}' |
     python3 -c 'import sys,json;print(json.load(sys.stdin)["runId"])') || { echo "  start failed"; fail=1; continue; }
+  final_status=""
   for _ in $(seq 1 120); do
     sleep 10
     st=$(curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId" |
       python3 -c 'import sys,json;r=json.load(sys.stdin)["run"];print(r["status"], "|", (r.get("benchmark") or {}).get("verdict",""))')
     status="${st%% |*}"
     case "$status" in
-      done) echo "  $st"; echo "$st" | grep -q "反而更差" && { echo "  REGRESSION"; fail=1; }; break ;;
-      failed) echo "  FAILED: $st"; fail=1; break ;;
+      done) echo "  $st"; echo "$st" | grep -q "反而更差" && { echo "  REGRESSION"; fail=1; }; final_status=done; break ;;
+      failed) echo "  FAILED: $st"; fail=1; final_status=failed; break ;;
     esac
   done
+  [ -n "$final_status" ] || { echo "  TIMEOUT (20min 未终态)"; fail=1; final_status=timeout; }
+  if [ -n "${OC_EVAL_RESULTS_FILE:-}" ]; then
+    curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId" |
+      python3 -c 'import sys,json;r=json.load(sys.stdin)["run"];print(json.dumps({"skill":sys.argv[1],"runId":r.get("runId"),"status":r.get("status"),"benchmark":r.get("benchmark")},ensure_ascii=False))' "$name" \
+      >> "$OC_EVAL_RESULTS_FILE" ||
+      printf '{"skill":"%s","runId":"%s","status":"%s","benchmark":null}\n' "$name" "$runId" "$final_status" >> "$OC_EVAL_RESULTS_FILE"
+  fi
 done
 exit $fail

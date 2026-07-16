@@ -176,6 +176,52 @@ export type DeclarativeBindResult = {
 /** POST /api/connectors/declarative/oauth/start 回包（整页跳转授权页）。 */
 export type DeclarativeOauthStartResult = { authorizeUrl: string };
 
+// ── 通用 Plugin 运行时（sandboxed-local / managed-browser）────────────────
+
+export type RuntimePluginCatalogEntry = {
+  versionId: string
+  slug: string
+  pluginType: 'sandboxed-local' | 'managed-browser'
+  label: string
+  description: string
+  accountMode: 'none' | 'required'
+  actions: Array<{ id: string; description: string; readOnly: true }>
+  installed: boolean
+  installedVersion: string
+  latestVersionId: string | null
+  latestVersion: string | null
+  installedCurrent: boolean
+  updateAvailable: boolean
+  available: boolean
+}
+
+export type RuntimePluginAccount = {
+  id: string
+  provider: string
+  pluginType: 'sandboxed-local' | 'managed-browser'
+  displayName: string
+  accountHint: string
+  status: 'active' | 'error'
+  actions: Array<{ id: string; description: string; readOnly: true }>
+  versionId: string
+  executable: boolean
+}
+
+export type PluginManagementResponse = {
+  catalog: RuntimePluginCatalogEntry[]
+  accounts: RuntimePluginAccount[]
+}
+
+export type KnowledgePlanetSetupView = {
+  sessionId: string
+  status: 'waiting_for_scan' | 'finalizing' | 'active' | 'cancelled' | 'expired' | 'failed'
+  qrReady: boolean
+  createdAt: string
+  expiresAt: string
+  accountId?: string
+  errorCode?: string
+}
+
 /**
  * 该 authMode 是否走 OAuth 授权码重定向流（用户 BYOA 自建应用：填 client 凭据 → 跳授权页）。
  * 单一权威：UI 一律用本函数判断，禁止各组件散写 authMode 字符串比较。
@@ -301,13 +347,23 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   UNSUPPORTED_PROVIDER: "暂不支持该应用",
   NOT_FOUND: "连接不存在或已解绑",
   // 声明式引擎（/api/connectors/declarative/* 经 HttpError 抛的 code）
-  UPSTREAM_AUTH_FAILED: "应用凭据校验失败，请检查后重试",
-  IDENTITY_INVALID: "账号身份校验失败，请稍后重试",
-  BAD_REQUEST: "请求参数有误，请检查后重试",
-  CONNECTION_NOT_FOUND: "连接不存在或已解绑",
-  INTERNAL: "服务暂时不可用，请稍后重试",
-  UPSTREAM_ERROR: "应用服务暂时不可用，请稍后重试",
-};
+  UPSTREAM_AUTH_FAILED: '应用凭据校验失败，请检查后重试',
+  IDENTITY_INVALID: '账号身份校验失败，请稍后重试',
+  BAD_REQUEST: '请求参数有误，请检查后重试',
+  CONNECTION_NOT_FOUND: '连接不存在或已解绑',
+  NOT_INSTALLED: '请先从 AI 市场安装该 Plugin',
+  SETUP_ACTIVE: '已有一个扫码授权正在进行，请先完成或取消',
+  ACCOUNT_ALREADY_EXISTS: '该 Plugin 已授权账号，无需重复绑定',
+  QR_NOT_READY: '二维码尚未就绪，请稍后重试',
+  PLUGIN_RUNTIME_UNAVAILABLE: 'Plugin 授权服务暂不可用，请稍后重试',
+  PLUGIN_SETUP_FAILED: 'Plugin 授权未完成，请重新扫码',
+  LEASE_BUSY: '账号正在执行任务，请稍后再解绑',
+  LEASE_UNAVAILABLE: '账号安全锁暂不可用，请稍后重试',
+  TARGET_NOT_FOUND: 'Plugin 账号不存在或已解绑',
+  TARGET_STALE: 'Plugin 账号状态已变化，请刷新后重试',
+  INTERNAL: '服务暂时不可用，请稍后重试',
+  UPSTREAM_ERROR: '应用服务暂时不可用，请稍后重试',
+}
 
 /** 错误码 → 友好中文（未知码回退通用文案，绝不暴露裸码/上游细节）。 */
 export function connectorErrorText(code: string | null | undefined): string {
