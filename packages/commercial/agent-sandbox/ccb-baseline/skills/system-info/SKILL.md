@@ -1,6 +1,7 @@
 ---
 name: system-info
 description: 展示当前 AI 助手的身份、所处容器环境、能力边界与平台守则。用户问"你是谁 / 你在哪 / 你能做什么 / 有什么限制 / 当前是什么环境"时调用
+priority: 3
 ---
 
 # 系统自述 — claudeai.chat 商业版容器

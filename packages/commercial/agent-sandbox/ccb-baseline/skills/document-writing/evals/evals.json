@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "md-formula-to-docx-omml",
+      "prompt": "帮我写一份简短的技术说明 Word 文档(.docx),标题『均方误差说明』,正文解释 MSE。需要包含行内公式和一个块级公式:行内用 $\\bar{x}$ 表示均值;块级公式为 $$\\mathrm{MSE}=\\frac{1}{n}\\sum_{i=1}^{n}(y_i-\\hat{y}_i)^2$$。公式必须是 Word 里能继续编辑的原生公式,不要用图片。请在最终回复里给出所用工具/命令、如何验证公式为原生 OMML,以及产物绝对路径。",
+      "assertions": [
+        "使用 Pandoc/Quarto(如 oc-docx)从 Markdown/qmd 生成 .docx,而非手写 HTML 改扩展名或把公式截图塞入",
+        "保留 LaTeX 公式源(行内 $...$、块级 $$...$$)交给管线转换,而非把公式当普通文本或图片",
+        "通过检查 word/document.xml 含 m:oMath 确认公式为 Word 原生可编辑公式(OMML),并在回复中说明该验证",
+        "产物为合法 .docx(unzip 校验通过)并给出绝对路径",
+        "最终回复给出所用命令与关键参数"
+      ]
+    },
+    {
+      "id": "quarto-long-report-toc-sections",
+      "prompt": "帮我用 Quarto 写一份较长的结构化调研报告(导出 .docx):标题『城市公共交通满意度调研报告』,需要目录和章节自动编号。至少包含四章:一、研究背景 二、方法 三、结果(含一个小结论) 四、建议。标题层级要清楚、不跳级。请在最终回复里说明你写的是 .qmd、启用了哪些选项(toc/number-sections)、渲染命令与产物绝对路径。",
+      "assertions": [
+        "采用 Quarto 路线:编写 .qmd 源文件并用 quarto render / oc-docx --quarto 生成 .docx",
+        "在 YAML 头启用了目录(toc: true)与章节自动编号(number-sections: true)",
+        "标题层级清晰不跳级(# / ## 规范),四个章节齐备",
+        "产物为合法 .docx 并给出绝对路径(/home/agent/.openclaude/ 下)",
+        "最终回复说明了所用选项与渲染命令"
+      ]
+    },
+    {
+      "id": "no-html-rename-discipline",
+      "prompt": "我不太在乎用什么工具,随便给我弄个能用 Word 打开的文件就行。内容是一段项目周报:本周完成了接口联调,下周计划做压测。要 .docx。请在最终回复里说明你实际是用什么生成的,并验证它确实是真正的 docx。",
+      "assertions": [
+        "用 Pandoc/Quarto(oc-docx)生成真正的 .docx,而非手写 HTML 或纯文本改扩展名冒充 Word",
+        "通过 unzip -tq 或等价方式验证产物是结构完好的 docx(OOXML zip 包),并在回复中体现该验证",
+        "未使用 curl/wget 直连或硬编码任何 URL/端口/token,只用 skill 封装的命令传参",
+        "给出产物绝对路径与所用命令",
+        "周报正文内容完整落入文档"
+      ]
+    },
+    {
+      "id": "boundary-cn-mixed-table-formula",
+      "prompt": "写一份 Word(.docx)实验小结:中文为主、混排英文术语。需要包含:一个 3 行的数据表(列:样本 Sample、测量值 Value(mm)、误差 Error,数据自拟合理即可);以及二次方程求根公式的块级公式 $$x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}$$(必须是可编辑公式,不能是截图)。中文不能乱码。请在最终回复里给出所用命令、验证公式为原生 OMML 的方式与产物绝对路径。",
+      "assertions": [
+        "表格用 Markdown pipe table(或等价结构化方式)而非空格对齐,并含指定的三列",
+        "求根公式保留 LaTeX 源并生成为 Word 原生可编辑公式(word/document.xml 含 m:oMath),非图片截图",
+        "中英文混排、中文无乱码,且通过 Pandoc/Quarto 管线生成 .docx",
+        "产物为合法 .docx 并给出绝对路径",
+        "最终回复说明了验证 OMML 的方式与所用命令"
+      ]
+    }
+  ]
+}

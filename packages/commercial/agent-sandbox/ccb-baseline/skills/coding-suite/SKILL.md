@@ -2,6 +2,7 @@
 name: coding-suite
 description: 编程高频任务总纲:读懂现有代码库、规划改动、精确编辑、跑测试/构建/lint 自我验证、code review、根因调试、写测试。把「需求/报错 → 验证通过的代码」串成端到端闭环。用户提编程、改代码、修 bug、写测试、评审代码、重构时,按本 skill 选路,并在完成前给出可运行的验证证据。
 tags: [coding, software, debug, test, review, refactor, git]
+priority: 5
 ---
 
 # 编程工作流总纲

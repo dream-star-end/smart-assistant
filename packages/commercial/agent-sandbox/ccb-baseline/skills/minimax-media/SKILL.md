@@ -1,6 +1,7 @@
 ---
 name: minimax-media
 description: Use MiniMax Token Plan media capabilities from OpenClaude commercial containers through the safe `mmx` wrapper for image, video, speech, music, and lyrics generation. Use when the user asks to generate MiniMax images, videos, speech/audio, music, lyrics, or asks to use MiniMax CLI/MMX.
+priority: 4
 ---
 
 # MiniMax media in OpenClaude commercial

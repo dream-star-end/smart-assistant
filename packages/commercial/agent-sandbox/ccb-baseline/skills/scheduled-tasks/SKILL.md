@@ -3,6 +3,7 @@ name: scheduled-tasks
 description: "定时任务的创建方法: cron 表达式计算、工具调用、常见场景速查"
 version: "1.1.0"
 tags: [system, scheduling, cron, task]
+priority: 7
 ---
 
 # 定时任务
