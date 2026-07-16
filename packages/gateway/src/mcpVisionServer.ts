@@ -33,6 +33,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { DEFAULT_CODEX_ENGINE_MODEL, findRouteProviderForModel } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
+import { LOCAL_CATALOG_HEADER, getLocalCatalogToken } from './modelCatalogClient.js'
 
 const TOOL_NAME = 'understand_image'
 const DEFAULT_MODEL = DEFAULT_CODEX_ENGINE_MODEL
@@ -811,6 +812,22 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
     if (!baseUrl) throw new Error('minimax vision backend unavailable: ANTHROPIC_BASE_URL unset')
     const bearer = readContainerBearer()
     if (!bearer) throw new Error('minimax vision backend unavailable: container token unset')
+    // 模型权威批次(0143/0144)enforce 后,anthropic proxy 的 /v1/messages 要求
+    // bridge authority 或 `x-oc-local-catalog` 二选一。vision 调用不属于任何 bridge
+    // turn(容器内工具自发起),与 cron/synthetic/delegate 同为**本地路径** —— 走同一
+    // 权威机制:现取 local catalog token(内存 TTL/LKG+epoch 验证,拿不到即 fail-closed
+    // 报错,与"无 baked 回落"纪律一致)。缺这行是 07-13 enforce 后识图 100% 被
+    // MODEL_AUTHORITY_INVALID 拒的根因(2026-07-16 巡检)。
+    let catalogToken: string
+    try {
+      catalogToken = await getLocalCatalogToken()
+    } catch (err) {
+      throw new Error(
+        `minimax vision backend unavailable: model catalog token unavailable (${
+          err instanceof Error ? err.message : String(err)
+        })`,
+      )
+    }
 
     const buf = readFileSync(input.imagePath)
     if (buf.length > input.maxImageBytes) {
@@ -853,6 +870,7 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
           'content-type': 'application/json',
           authorization: `Bearer ${bearer}`,
           'anthropic-version': '2023-06-01',
+          [LOCAL_CATALOG_HEADER]: catalogToken,
         },
         body: JSON.stringify(body),
         signal: controller.signal,

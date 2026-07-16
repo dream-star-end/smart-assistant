@@ -402,9 +402,18 @@ export const SkillTool: Tool<InputSchema, Output, Progress> = buildTool({
     // Check if command exists
     const foundCommand = findCommand(normalizedCommandName, commands)
     if (!foundCommand) {
+      // Actionable guidance (2026-07-16): skills are agent-scoped — a marketplace
+      // skill bound to another agent is invisible here. Production showed agents
+      // blind-retrying the same unknown name 49 times instead of surfacing the
+      // binding problem to the user. Tell the model what to do instead.
       return {
         result: false,
-        message: `Unknown skill: ${normalizedCommandName}`,
+        message:
+          `Unknown skill: ${normalizedCommandName}. ` +
+          `This skill is not in the current agent's skill set — do NOT retry the same name. ` +
+          `Skills are agent-scoped: if the user expects this skill to exist, it may be installed ` +
+          `but not bound to this agent; ask the user to install/bind it to this agent. ` +
+          `Otherwise pick an available skill (see your skill list, or search the marketplace).`,
         errorCode: 2,
       }
     }
