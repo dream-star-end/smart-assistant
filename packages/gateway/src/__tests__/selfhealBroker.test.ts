@@ -17,9 +17,15 @@ import { type VerificationResult, signVerification } from '../selfheal/verifier.
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
 
-// Capability authorization test fixtures: an active repair holding CAP.
+// Capability authorization test fixtures: an active repair holding CAP with a
+// frozen (non-drill) condition key — the batch0 posture every real repair has
+// by the time a socket action arrives.
 const CAP = 'test-capability-token-xyz'
-const activeAuthority: RepairAuthority = async () => ({ status: 'running', capability: CAP })
+const activeAuthority: RepairAuthority = async () => ({
+  status: 'running',
+  capability: CAP,
+  conditionKey: 'ops.monitor:svc_v5',
+})
 
 function stubRunner(handler: (cmd: string, args: string[]) => Partial<RunResult> | undefined): {
   run: CommandRunner
@@ -763,6 +769,7 @@ describe('releaseApproved — re-verifies pending record + ancestry + denylist',
         status: 'running',
         capability: CAP,
         releaseRevoked: revoked.v,
+        conditionKey: 'ops.monitor:svc_v5',
       }),
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
@@ -1129,7 +1136,12 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       reads += 1
       // 1st read: handleRequest authorize; 2nd: release entry check; 3rd+ (locked
       // re-check): revoked.
-      return { status: 'running', capability: CAP, releaseRevoked: reads >= 3 }
+      return {
+        status: 'running',
+        capability: CAP,
+        releaseRevoked: reads >= 3,
+        conditionKey: 'ops.monitor:svc_v5',
+      }
     }
     const deployed: string[] = []
     const store = new InMemoryBrokerClaimStore()
@@ -1267,26 +1279,60 @@ describe('drill authorization — frozen condition key, server-side allowlist', 
     assert.doesNotMatch(String(rep.detail?.reason ?? ''), /drill repair/)
   })
 
-  it('a NON-drill (or unfrozen) condition key is not drill-gated', async () => {
+  it('a NON-drill frozen condition key is not drill-gated', async () => {
     const realAuthority: RepairAuthority = async () => ({
       status: 'running',
       capability: CAP,
       conditionKey: 'ops.monitor:svc_v5',
     })
-    const legacyAuthority: RepairAuthority = async () => ({ status: 'running', capability: CAP })
-    for (const repairAuthority of [realAuthority, legacyAuthority]) {
-      const broker = new SelfhealBroker({
-        socketPath: '/unused',
-        store: new InMemoryBrokerClaimStore(),
-        repairAuthority,
-      })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: realAuthority,
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'r-real',
+      capability: CAP,
+      actionKind: 'verify',
+      params: { sha: 'a'.repeat(40) },
+    })
+    assert.doesNotMatch(String(resp.detail?.reason ?? ''), /drill repair|not frozen/)
+  })
+
+  it('an UNFROZEN condition key rejects EVERY action (pre-freeze window is closed)', async () => {
+    process.env.OC_SELFHEAL_RESTART_UNITS = 'openclaude-v5'
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    // A job stuck in 'starting' whose context fetch keeps failing — its key was
+    // never frozen. A guessed repairId must get NOTHING, not non-drill powers.
+    const unfrozenAuthority: RepairAuthority = async () => ({
+      status: 'starting',
+      capability: CAP,
+    })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: unfrozenAuthority,
+      actions: TIER1_ACTIONS,
+      run,
+    })
+    const attempts: Array<{ actionKind: string; params: Record<string, unknown> }> = [
+      { actionKind: 'context', params: {} },
+      { actionKind: 'report', params: { outcome: 'progress', message: 'hi' } },
+      { actionKind: 'verify', params: { sha: 'a'.repeat(40) } },
+      { actionKind: 'cutover', params: { sha: 'a'.repeat(40), verificationRef: 'r-x' } },
+      { actionKind: 'restart_service', params: { unit: 'openclaude-v5' } },
+    ]
+    for (const a of attempts) {
       const resp = await broker.handleRequest({
-        repairId: 'r-real',
+        repairId: 'r-unfrozen',
         capability: CAP,
-        actionKind: 'verify',
-        params: { sha: 'a'.repeat(40) },
+        actionKind: a.actionKind,
+        params: a.params,
       })
-      assert.doesNotMatch(String(resp.detail?.reason ?? ''), /drill repair/)
+      assert.equal(resp.status, 'rejected', `${a.actionKind} must be rejected while unfrozen`)
+      assert.match(String(resp.detail?.reason), /not frozen/)
     }
+    assert.equal(calls.length, 0)
+    setOrUnset('OC_SELFHEAL_RESTART_UNITS', undefined)
   })
 })

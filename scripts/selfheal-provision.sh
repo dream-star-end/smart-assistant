@@ -381,26 +381,35 @@ step_skill() {
   local src="$REPO_ROOT/$SKILL_SRC_REL"
   local dst="$SKILL_DST"
   if [ ! -f "$src" ]; then
-    warn "$src not found — skipping skill install"
-    todo "skill $dst (source missing, re-run provision after $SKILL_SRC_REL lands)"
-    return 0
+    # skill 是修复代理的行为契约:源缺失继续跑会把旧漂移版留在线上(该漂移
+    # 曾是 BLOCKER),宁可 fail-closed。
+    if [ "$DRY_RUN" -eq 1 ]; then
+      todo "skill $dst (source $SKILL_SRC_REL MISSING — non-dry run would die)"
+      return 0
+    fi
+    die "$src not found — refusing to leave a stale/drifted skill installed"
   fi
   if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
     ok "skill $dst (up to date, sha256=$(sha256sum "$src" | cut -c1-12))"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    todo "skill $dst (would install/update atomically)"
+    return 0
+  fi
+  # 原子安装:同目录临时文件 + mv(运行中的 agent 绝不能读到半份契约)。
+  mkdir -p "$(dirname "$dst")"
+  local tmp
+  tmp="$(dirname "$dst")/.SKILL.md.tmp.$$"
+  cp "$src" "$tmp"
+  chmod 0644 "$tmp"
+  cmp -s "$src" "$tmp" || { rm -f "$tmp"; die "skill temp copy differs from repo source"; }
+  mv -f "$tmp" "$dst"
+  # 终校验:落点逐字节一致
+  if cmp -s "$src" "$dst"; then
+    ok "skill $dst (installed atomically, sha256=$(sha256sum "$src" | cut -c1-12))"
   else
-    run mkdir -p "$(dirname "$dst")"
-    run cp "$src" "$dst"
-    run chmod 0644 "$dst"
-    if [ "$DRY_RUN" -eq 1 ]; then
-      todo "skill $dst (would install/update)"
-    else
-      # 装完必须逐字节一致 —— skill 是修复代理的行为契约,半份=漂移
-      if cmp -s "$src" "$dst"; then
-        ok "skill $dst (installed, sha256=$(sha256sum "$src" | cut -c1-12))"
-      else
-        die "skill $dst differs from repo source after install"
-      fi
-    fi
+    die "skill $dst differs from repo source after install"
   fi
 }
 

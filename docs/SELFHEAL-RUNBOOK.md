@@ -220,7 +220,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18796/healthz   # v5 m
 ### 4.4 kl-mirror 开派单闸(drill-only 姿态)
 
 > **前置(批0 裁定,2026-07-16)**:开闸前先把 **9 类真实 policy 全部
-> `auto_repair=FALSE`**(闸一直关着,该变更零行为差异),只留 0154 的 drill
+> `auto_repair=FALSE`**(闸一直关着,该变更零行为差异),只留 0155 的 drill
 > policy 可被演练脚本临时翻开。真实类逐个放开的前置条件在 playbook §5 债表
 > (host-routed Tier1 / 外部 watchdog)。
 
@@ -248,7 +248,7 @@ grep -i 'selfheal' /var/log/openclaude-v5.log | tail -5   # 不再出现 selfhea
 
 ```bash
 ssh kl-mirror
-cd <v5 release 树>    # readlink -f /srv/openclaude-v5/current(以 deploy 布局为准)
+cd "$(readlink -f /opt/openclaude/openclaude-v5)"   # 蓝绿 release 树权威入口
 set -a && . /etc/openclaude/commercial-v5.env && set +a
 npx tsx scripts/v5-selfheal-drill.ts              # 完整演练(九点全绿才算过)
 npx tsx scripts/v5-selfheal-drill.ts              # 连跑第二次:验证 cooldown 豁免 + 可重复回归

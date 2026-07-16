@@ -586,13 +586,30 @@ export class SelfhealBroker {
       return { ok: false, status: 'unauthorized', detail: { reason: authz.reason } }
     }
 
-    // Drill authorization (server-side, allowlist): a transport-drill repair
-    // may ONLY pull context and report progress/terminal state. The decision
-    // reads the condition key FROZEN from the v5 master context — the model's
-    // own claims and SKILL text carry no authority here. Checked before the
-    // claim so a forbidden attempt never touches the idempotency ledger.
+    // Condition-key authorization (server-side; checked before the claim so a
+    // forbidden attempt never touches the idempotency ledger). The decision
+    // reads the key FROZEN from the v5 master context — the model's own claims
+    // and SKILL text carry no authority here.
+    //
+    // Unfrozen (null) ⇒ reject EVERYTHING: the jobWorker freezes the key via
+    // its own HTTP fetch before any turn starts, so no legitimate socket
+    // caller exists in that window — while a guessed repairId of a job stuck
+    // in 'starting' would otherwise get full non-drill powers (audit R4
+    // BLOCKER: "unfrozen = non-drill" was a bypass, not a default).
+    const frozenKey = authz.rec.conditionKey
+    if (typeof frozenKey !== 'string' || frozenKey.length === 0) {
+      this.audit(req, 'rejected', { reason: 'condition_key_not_frozen' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: {
+          reason: 'repair condition key not frozen yet — no broker actions until job start',
+        },
+      }
+    }
+    // Transport-drill repairs may ONLY pull context and report.
     if (
-      authz.rec.conditionKey === SELFHEAL_DRILL_TRANSPORT_KEY &&
+      frozenKey === SELFHEAL_DRILL_TRANSPORT_KEY &&
       req.actionKind !== CONTEXT_KIND &&
       req.actionKind !== REPORT_KIND
     ) {
