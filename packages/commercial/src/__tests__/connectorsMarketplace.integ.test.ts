@@ -63,6 +63,7 @@ import {
   revokeListing,
 } from '../marketplace/marketplaceDb.js'
 import { handleMarketplaceConnectorPublish } from '../marketplace/marketplaceRoutes.js'
+import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -561,6 +562,7 @@ describe('v5 connector marketplace', () => {
     assert.equal(detail.kind, 'connector')
     assert.equal(detail.pluginType, 'declarative-http')
     assert.equal(detail.official, false)
+    assert.equal(detail.preinstalled, false)
     assert.equal(detail.manifest, null, '公开详情不得暴露发布者提议的安全决定')
     assert.deepEqual(detail.connectorContract, {
       authMode: 'static-token',
@@ -584,6 +586,13 @@ describe('v5 connector marketplace', () => {
     )
 
     await seedDefaultConnectors(getPool())
+    const approvedConnectorSlugs = (await listApprovedForSearch('connector')).map((row) => row.slug)
+    assert.ok(approvedConnectorSlugs.includes('notion'), '预装工件仍是内部上架事实')
+    const marketConnectorSlugs = (await listMarketBrowseCatalog('connector')).map((row) => row.slug)
+    assert.ok(marketConnectorSlugs.includes(slug), '需安装的社区 Plugin 仍须出现在市场')
+    assert.equal(marketConnectorSlugs.includes('notion'), false)
+    assert.equal(marketConnectorSlugs.includes('feishu'), false)
+    assert.equal(marketConnectorSlugs.includes('github'), false)
     const management = await listDeclarativeManagement(getPool(), user)
     const community = management.connectors.find((row) => row.slug === slug)
     assert.ok(community)
@@ -593,6 +602,9 @@ describe('v5 connector marketplace', () => {
     assert.ok(notion)
     assert.equal(notion.installation, 'default')
     assert.equal(notion.official, true)
+    const notionDetail = await getListingDetail('notion')
+    assert.equal(notionDetail?.official, true)
+    assert.equal(notionDetail?.preinstalled, true)
     const notionVersion = await query<{ id: string }>(
       `SELECT current_approved_version_id::text AS id
          FROM marketplace_skill_listings WHERE slug = 'notion'`,
