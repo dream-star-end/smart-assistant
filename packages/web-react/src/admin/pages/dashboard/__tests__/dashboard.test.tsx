@@ -1,3 +1,4 @@
+import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
@@ -147,6 +148,7 @@ describe('DashboardPage', () => {
     expect(screen.getByText('告警摘要')).toBeTruthy()
     expect(await screen.findByText('触发中规则')).toBeTruthy()
     expect(screen.getByText('pg_idle_in_tx')).toBeTruthy()
+    expect(screen.getByText('待发 / 失败').closest('.grid')).toHaveClass('grid-cols-1', 'sm:grid-cols-3')
   })
 
   test('点击「账号池可用」KPI → 深链 #tab=accounts', async () => {

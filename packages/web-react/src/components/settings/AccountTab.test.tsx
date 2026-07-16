@@ -10,7 +10,7 @@
  */
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
   AuthSession,
@@ -180,5 +180,7 @@ describe("AccountTab 积分收支卡", () => {
     expect(screen.getByText("支出构成")).toBeInTheDocument();
     // 两张图均以 canvas 渲染
     expect(container.querySelectorAll("canvas").length).toBeGreaterThanOrEqual(2);
+    const flowTable = screen.getByRole("table", { name: "收支趋势，近 30 天" });
+    expect(within(flowTable).getByRole("cell", { name: "1,000" })).toBeInTheDocument();
   });
 });

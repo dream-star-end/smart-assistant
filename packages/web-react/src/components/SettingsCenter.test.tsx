@@ -46,6 +46,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
   expect(screen.getByRole('form', { name: '反馈表单' })).toBeInTheDocument()
   expect(screen.getByLabelText('反馈类型')).toBeInTheDocument()
   expect(screen.getByLabelText('反馈内容')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
 })
 
 test('设置中心只把 API Key 管理权限授予 admin', async () => {

@@ -163,6 +163,30 @@ describe("InboxDialog", () => {
     expect(screen.getByRole("button", { name: /全部已读/ })).toBeDisabled();
   });
 
+  test("全部已读失败显式反馈且不清红点，可用同一按钮原地重试", async () => {
+    listInboxMessages.mockResolvedValue({
+      messages: [mk("1", { read: false })],
+      unread_count: 1,
+    });
+    markAllInboxRead
+      .mockRejectedValueOnce(new Error("backend unavailable"))
+      .mockResolvedValueOnce({ ok: true, inserted: 1 });
+
+    render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
+    const title = await screen.findByText("标题1");
+    const allBtn = screen.getByRole("button", { name: /全部已读/ });
+
+    fireEvent.click(allBtn);
+    expect(await screen.findByText("全部已读失败，请重试")).toBeInTheDocument();
+    expect(title).toHaveClass("font-semibold");
+    expect(allBtn).toBeEnabled();
+
+    fireEvent.click(allBtn);
+    await waitFor(() => expect(markAllInboxRead).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(allBtn).toBeDisabled());
+    expect(screen.queryByText("全部已读失败，请重试")).not.toBeInTheDocument();
+  });
+
   test("切到「未读」Tab：重新拉取且带 unreadOnly", async () => {
     listInboxMessages.mockResolvedValue({ messages: [mk("1", { read: false })], unread_count: 1 });
     render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);

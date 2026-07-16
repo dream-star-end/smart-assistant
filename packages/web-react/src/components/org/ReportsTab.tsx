@@ -9,7 +9,7 @@ import type {
   OrgUsageWindow,
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
-import { Alert, Spinner, Tabs } from "../ui";
+import { Alert, Button, Spinner, Tabs } from "../ui";
 import { orgErrText } from "./orgShared";
 
 const WINDOWS: { value: OrgUsageWindow; label: string }[] = [
@@ -101,9 +101,11 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
   const [data, setData] = useState<OrgUsageReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
 
-  // 窗口切换即重拉。依赖数组含 window，**绝不含 loading**（防转圈）。切窗口先清 data 显 spinner。
+  // 窗口切换/显式重试即重拉。依赖数组绝不含 loading（防转圈）；请求前清 data 显 spinner。
   useEffect(() => {
+    void reloadTick;
     let alive = true;
     setLoading(true);
     setErr(null);
@@ -122,7 +124,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, window]);
+  }, [auth, window, reloadTick]);
 
   const s = data?.summary;
   const tokenTotal = s
@@ -135,6 +137,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
     trendMax(trend, "credits") !== "0" ? "credits" : "requests";
   const trendPeak = trendMax(trend, trendMetric);
   const trendHasData = trend.length > 0 && trendPeak !== "0";
+  const windowLabel = WINDOWS.find((w) => w.value === window)?.label ?? window;
 
   // 趋势面积图（与个人版「积分消耗趋势」同视觉：单 series 折线填充）。
   const trendRef = useRef<HTMLCanvasElement>(null);
@@ -178,6 +181,14 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           <Alert tone="danger" className="text-[12.5px]">
             {err}
           </Alert>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="mt-2"
+            onClick={() => setReloadTick((tick) => tick + 1)}
+          >
+            重试
+          </Button>
         </div>
       ) : !s ? null : (
         <>
@@ -231,8 +242,19 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           <div className="border-t border-border px-5 py-4">
             <ChartCard
               title={`趋势 · 按${trendMetric === "credits" ? "扣费" : "请求"}`}
-              hint={`近 ${WINDOWS.find((w) => w.value === window)?.label ?? window}`}
+              hint={`近 ${windowLabel}`}
               height={200}
+              ariaLabel={`组织${trendMetric === "credits" ? "扣费" : "请求"}趋势，近 ${windowLabel}`}
+              dataTable={{
+                columns: ["时间", trendMetric === "credits" ? "扣费积分" : "请求次数"],
+                rows: trend.map((point) => [
+                  fmtBucket(point.bucket, window),
+                  trendMetric === "credits"
+                    ? `${formatCredits(point.credits)} 积分`
+                    : groupDigits(point.requests),
+                ]),
+                emptyText: "该时段暂无趋势数据。",
+              }}
             >
               {trendHasData ? (
                 <canvas ref={trendRef} />
@@ -316,37 +338,45 @@ function UsageTable({
       {rows.length === 0 ? (
         <p className="py-2 text-[12.5px] text-faint">{emptyText}</p>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[26rem] text-[12.5px]">
-            <thead>
-              <tr className="text-left text-[11px] text-faint">
-                <th className="pb-1.5 font-medium">名称</th>
-                <th className="pb-1.5 text-right font-medium">请求</th>
-                <th className="pb-1.5 text-right font-medium">Token</th>
-                <th className="pb-1.5 text-right font-medium">扣费</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.key} className="border-t border-border/60">
-                  <td className="max-w-[12rem] py-1.5 pr-2">
-                    <span className="block truncate text-fg">{r.name}</span>
-                    {r.sub && <span className="block truncate text-[11px] text-faint">{r.sub}</span>}
-                  </td>
-                  <td className="py-1.5 text-right tabular-nums text-muted">
-                    {groupDigits(r.requests)}
-                  </td>
-                  <td className="py-1.5 text-right tabular-nums text-muted">
-                    {formatCompactCount(r.tokens)}
-                  </td>
-                  <td className="py-1.5 text-right font-medium tabular-nums text-fg">
-                    {formatCredits(r.credits)}
-                  </td>
+        <>
+          <p className="pb-1.5 text-[11px] text-faint sm:hidden">表格可左右滑动查看更多</p>
+          <section
+            aria-label={`${title}用量表，可横向滚动`}
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
+            tabIndex={0}
+            className="overflow-x-auto rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <table className="w-full min-w-[26rem] text-[12.5px]">
+              <thead>
+                <tr className="text-left text-[11px] text-faint">
+                  <th className="pb-1.5 font-medium">名称</th>
+                  <th className="pb-1.5 text-right font-medium">请求</th>
+                  <th className="pb-1.5 text-right font-medium">Token</th>
+                  <th className="pb-1.5 text-right font-medium">扣费</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.key} className="border-t border-border/60">
+                    <td className="max-w-[12rem] py-1.5 pr-2">
+                      <span className="block truncate text-fg">{r.name}</span>
+                      {r.sub && <span className="block truncate text-[11px] text-faint">{r.sub}</span>}
+                    </td>
+                    <td className="py-1.5 text-right tabular-nums text-muted">
+                      {groupDigits(r.requests)}
+                    </td>
+                    <td className="py-1.5 text-right tabular-nums text-muted">
+                      {formatCompactCount(r.tokens)}
+                    </td>
+                    <td className="py-1.5 text-right font-medium tabular-nums text-fg">
+                      {formatCredits(r.credits)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+        </>
       )}
     </div>
   );

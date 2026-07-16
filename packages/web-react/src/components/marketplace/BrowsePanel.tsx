@@ -322,21 +322,29 @@ export function BrowsePanel({
 
       {/* 分类筛选片:仅浏览态且有分区时渲染,一行可横向滚动(移动端不换行) */}
       {grouped && (grouped.categories.length > 0 || grouped.uncategorized.length > 0) && (
-        <div className="flex gap-1.5 overflow-x-auto px-4 pb-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
-            全部
-          </Chip>
-          {grouped.categories.map((c) => (
-            <Chip key={c.id} active={selectedCat === c.id} onClick={() => setSelectedCat(c.id)}>
-              {c.label}
+        <>
+          <section
+            aria-label="市场分类，可横向滚动"
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动分类必须可由键盘聚焦和滚动。
+            tabIndex={0}
+            className="flex gap-1.5 overflow-x-auto px-4 pb-2.5 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden"
+          >
+            <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
+              全部
             </Chip>
-          ))}
-          {grouped.uncategorized.length > 0 && (
-            <Chip active={selectedCat === UNCAT} onClick={() => setSelectedCat(UNCAT)}>
-              未分类
-            </Chip>
-          )}
-        </div>
+            {grouped.categories.map((c) => (
+              <Chip key={c.id} active={selectedCat === c.id} onClick={() => setSelectedCat(c.id)}>
+                {c.label}
+              </Chip>
+            ))}
+            {grouped.uncategorized.length > 0 && (
+              <Chip active={selectedCat === UNCAT} onClick={() => setSelectedCat(UNCAT)}>
+                未分类
+              </Chip>
+            )}
+          </section>
+          <p className="px-4 pb-2 text-[11px] text-faint sm:hidden">左右滑动查看更多分类</p>
+        </>
       )}
 
       {err && (
