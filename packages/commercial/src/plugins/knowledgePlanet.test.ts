@@ -32,11 +32,15 @@ import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
   KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
+  KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
+  KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
+  KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION,
   KNOWLEDGE_PLANET_TOPIC_PAGE_MAX,
   KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
   KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES,
   KNOWLEDGE_PLANET_WORKER_SOURCE,
   isKnowledgePlanetLoginProbeDue,
+  isKnowledgePlanetQrPixelSampleReady,
 } from './knowledgePlanetWorkerSource.js'
 
 const roots: string[] = []
@@ -175,28 +179,77 @@ describe('official Knowledge Planet Plugin', () => {
 
   test('waits for the real QR image and never publishes the iframe loading mask', () => {
     assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 15_000)
+    assert.equal(KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION, 0.15)
+    assert.equal(KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION, 0.2)
+    assert.equal(KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION, 70)
+    assert.equal(
+      isKnowledgePlanetQrPixelSampleReady({
+        darkFraction: 0.378,
+        lightFraction: 0.547,
+        luminanceDeviation: 117.9,
+      }),
+      true,
+    )
+    assert.equal(
+      isKnowledgePlanetQrPixelSampleReady({
+        darkFraction: 0.0011,
+        lightFraction: 0.7,
+        luminanceDeviation: 19.25,
+      }),
+      false,
+    )
     const captureStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function captureQr')
     const captureEnd = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
     assert.ok(captureStart >= 0 && captureEnd > captureStart)
     const captureSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(captureStart, captureEnd)
-    assert.match(captureSource, /while \(Date\.now\(\) < captureDeadline\)/)
-    assert.match(captureSource, /element\.complete && element\.naturalWidth >= 180/)
-    assert.match(
-      captureSource,
-      /image\.isVisible\(\{ timeout: remainingCaptureTimeout\(captureDeadline\) \}\)/,
-    )
-    assert.match(
-      captureSource,
-      /image\.evaluate\([\s\S]*undefined,[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)/,
-    )
-    assert.match(
-      captureSource,
-      /image\.screenshot\(\{[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)/,
-    )
-    assert.doesNotMatch(captureSource, /frame\.screenshot|iframe/)
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
-      /const qrCaptureDeadline = Math\.min\(input\.deadlineMs,[\s\S]*waitFor\(\{[\s\S]*timeout: remainingCaptureTimeout\(qrCaptureDeadline\)[\s\S]*const qr = await captureQr\(page, qrCaptureDeadline\)/,
+      /async function beforeCaptureDeadline\(operation,[\s\S]*Promise\.race\([\s\S]*Promise\.resolve\(\)\.then\(operation\)[\s\S]*setTimeout\(\(\) => reject\(new Error\('qr'\)\), remaining\)/,
+    )
+    assert.match(captureSource, /while \(Date\.now\(\) < captureDeadline\)/)
+    assert.match(captureSource, /let requested = false/)
+    assert.match(captureSource, /let consentHandled = false/)
+    assert.match(captureSource, /consentHandled = true;[\s\S]*requested = false/)
+    assert.match(
+      captureSource,
+      /requested = await beforeCaptureDeadline\([\s\S]*\(\) => qrButton\.click\(\{ timeout:/,
+    )
+    assert.match(captureSource, /!element\.complete \|\| element\.naturalWidth < 180/)
+    assert.match(captureSource, /style\.filter !== 'none'/)
+    assert.match(captureSource, /Number\(style\.opacity\) < 0\.99/)
+    assert.match(captureSource, /document\.elementFromPoint\([\s\S]*\) !== element/)
+    assert.match(captureSource, /sampleContext\.fillStyle = '#fff'/)
+    assert.match(captureSource, /sampleContext\.imageSmoothingEnabled = false/)
+    assert.match(captureSource, /sampleContext\.getImageData/)
+    assert.match(captureSource, /output\.toDataURL\('image\/png'\)/)
+    assert.match(captureSource, /png\.toString\('base64'\) !== encodedQr/)
+    assert.match(captureSource, /Buffer\.from\(\[137, 80, 78, 71, 13, 10, 26, 10\]\)/)
+    assert.match(
+      captureSource,
+      /beforeCaptureDeadline\(\(\) => image\.isVisible\(\), captureDeadline\)/,
+    )
+    assert.match(
+      captureSource,
+      /beforeCaptureDeadline\(\(\) => images\.count\(\), captureDeadline\)/,
+    )
+    assert.match(
+      captureSource,
+      /beforeCaptureDeadline\([\s\S]*\(\) => image\.evaluate\([\s\S]*undefined,[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)[\s\S]*captureDeadline/,
+    )
+    assert.match(captureSource, /remainingCaptureTimeout\(captureDeadline\);\s*return png/)
+    assert.doesNotMatch(captureSource, /\.screenshot\(|iframe/)
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /const qrCaptureDeadline = Math\.min\(input\.deadlineMs,[\s\S]*const qrButton =[\s\S]*const switchButton =[\s\S]*const qr = await beforeCaptureDeadline\([\s\S]*captureQr\(page, qrButton, switchButton, qrCaptureDeadline\)[\s\S]*remainingCaptureTimeout\(qrCaptureDeadline\);\s*writeFrame/,
+    )
+    const deadlineStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('const qrCaptureDeadline')
+    const captureCall = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      'const qr = await beforeCaptureDeadline(',
+    )
+    assert.ok(deadlineStart >= 0 && captureCall > deadlineStart)
+    assert.doesNotMatch(
+      KNOWLEDGE_PLANET_WORKER_SOURCE.slice(deadlineStart, captureCall),
+      /\.click\(\)/,
     )
   })
 
