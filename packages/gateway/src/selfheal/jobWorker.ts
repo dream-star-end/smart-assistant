@@ -29,12 +29,12 @@ import {
   releaseJobLeasesForOwner,
   renewJobLease,
   claimJobTier1,
-  enqueueTier1Callback,
   setJobCapability,
   setJobFrozenRouting,
   setJobSessionKey,
   setJobStatus,
   setJobTier1Receipt,
+  terminalizeTier1WithCallback,
 } from '@openclaude/storage'
 import { createLogger } from '../logger.js'
 import type { SessionManager } from '../sessionManager.js'
@@ -644,56 +644,79 @@ export class SelfhealJobWorker {
     conditionKey: string,
     actionOpcode: string | null,
   ): Promise<void> {
+    // Preflight refusals (never authorized to run) — atomic terminal+outbox,
+    // still cancel-safe (the CAS loses if a cancel already terminalized).
     const expected = CONDITION_OPCODE_MAP[conditionKey]
     if (!expected || expected !== actionOpcode) {
       log.error('tier1 opcode drift — refusing', { repairId, conditionKey, actionOpcode, expected })
-      await this.markFailedAndReport(
-        repairId,
-        capability,
-        `tier1 opcode drift (local map=${expected ?? 'none'} frozen=${actionOpcode ?? 'none'})`,
-      )
+      await this.tier1Terminal(repairId, ['starting', 'running'], 'failed', {
+        opcode: actionOpcode,
+        reason: `opcode drift (local map=${expected ?? 'none'} frozen=${actionOpcode ?? 'none'})`,
+      })
       return
     }
     const cfg =
       this.deps.hostActionConfig !== undefined ? this.deps.hostActionConfig : hostActionConfigFromEnv()
     if (!cfg) {
       log.error('tier1 host action not provisioned (OC_SELFHEAL_ACTION_HOST/KEY)', { repairId })
-      await this.markFailedAndReport(repairId, capability, 'tier1 host action host/key not configured')
-      return
-    }
-    // Enter execution (cancel-first makes this CAS lose → the cancel owns status).
-    const cas = await setJobStatus(repairId, 'running', ['starting', 'running'])
-    if (!cas) {
-      log.info('tier1 CAS lost to cancel — zero action', { repairId })
+      await this.tier1Terminal(repairId, ['starting', 'running'], 'failed', {
+        opcode: actionOpcode,
+        reason: 'host action host/key not configured',
+      })
       return
     }
 
-    // AT-MOST-ONCE (BLOCKER2): resolve the receipt through a durable pre-claim,
-    // so the SSH is transmitted by exactly one winner; a crash after claim but
-    // before receipt settles as 'unknown' (never re-sent).
-    const receipt = await this.resolveTier1Receipt(repairId, actionOpcode as string, cfg)
+    // The SSH path runs INSIDE the per-repair lock — the SAME lock a cancel
+    // holds (BLOCKER: a cancel must not terminalize between the running CAS and
+    // the SSH and still let the action fire). Host actions cannot be remotely
+    // cancelled, so we hold the lock through the SSH return and the atomic
+    // local settle; a concurrent cancel waits (bounded by the action timeout).
+    await withRepairLock(repairId, async () => {
+      const cas = await setJobStatus(repairId, 'running', ['starting', 'running'])
+      if (!cas) {
+        log.info('tier1 CAS lost to cancel — zero action', { repairId })
+        return
+      }
+      // AT-MOST-ONCE (BLOCKER): durable pre-claim gates a single SSH; a crash
+      // after claim but before receipt settles as 'unknown' (never re-sent).
+      const receipt = await this.resolveTier1Receipt(repairId, actionOpcode as string, cfg)
+      // 'rejected' = never authorized to run ⇒ FAILED. Everything the host
+      // actually attempted (completed/action_failed/unknown) ⇒ DONE → verifying;
+      // only a fresh master probe decides real recovery.
+      const phase: 'done' | 'failed' = receipt.outcome === 'rejected' ? 'failed' : 'done'
+      await this.tier1Terminal(repairId, ['running'], phase === 'done' ? 'succeeded' : 'failed', {
+        opcode: actionOpcode,
+        host: receipt.host,
+        outcome: receipt.outcome,
+        exit: receipt.exit,
+        durationMs: receipt.durationMs,
+        receipt: receipt.detail,
+      })
+      log.info('tier1 settled', { repairId, opcode: actionOpcode, outcome: receipt.outcome, phase })
+    })
+  }
 
-    // Terminal routing (MAJOR2): 'rejected' = the action was never authorized to
-    // run (local/forced-command refusal) ⇒ machine FAILED. Everything the host
-    // actually attempted (completed / action_failed / unknown) ⇒ machine DONE →
-    // master verifying; only a fresh probe decides real recovery.
-    const detail: Record<string, unknown> = {
-      opcode: actionOpcode,
-      host: receipt.host,
-      outcome: receipt.outcome,
-      exit: receipt.exit,
-      durationMs: receipt.durationMs,
-      receipt: receipt.detail,
-    }
-    const summary = `[tier1 ${actionOpcode}] ${receipt.outcome} exit=${receipt.exit}`
-    // Enqueue the terminal callback into the DURABLE outbox (BLOCKER3): the pump
-    // delivers with a fresh capability and abandons on an explicit master
-    // refusal — no fire-and-forget, no orphan. Local terminalization only AFTER
-    // the enqueue is durable.
-    const phase: 'done' | 'failed' = receipt.outcome === 'rejected' ? 'failed' : 'done'
-    await enqueueTier1Callback({ repairId, phase, message: summary, detail })
-    await setJobStatus(repairId, phase === 'done' ? 'succeeded' : 'failed', ['running'])
-    log.info('tier1 settled', { repairId, opcode: actionOpcode, outcome: receipt.outcome, phase })
+  /** Atomic Tier1 terminal: CAS job → terminal AND enqueue the outbox callback
+   *  in ONE transaction. The CAS gates the enqueue (a cancel that terminalized
+   *  first makes it lose → no stale callback). Every Tier1 terminal path goes
+   *  through here — no best-effort fire-and-forget remains. */
+  private async tier1Terminal(
+    repairId: string,
+    fromStatuses: ('starting' | 'running')[],
+    toStatus: 'succeeded' | 'failed',
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    const phase: 'done' | 'failed' = toStatus === 'succeeded' ? 'done' : 'failed'
+    const message = `[tier1 ${String(detail.opcode ?? '?')}] ${String(detail.outcome ?? detail.reason ?? phase)}`
+    const won = await terminalizeTier1WithCallback({
+      repairId,
+      fromStatuses,
+      toStatus,
+      phase,
+      message,
+      detail,
+    })
+    if (!won) log.info('tier1 terminal CAS lost (cancel won) — no callback enqueued', { repairId })
   }
 
   /**
@@ -716,8 +739,11 @@ export class SelfhealJobWorker {
     if (!won) {
       const j = await getJob(repairId)
       if (j?.tier1Receipt) return JSON.parse(j.tier1Receipt) as HostActionReceipt
+      // Pre-claim held by a prior (crashed) attempt, no receipt → ambiguous.
+      // Persist an 'unknown' receipt (set-once) so re-claims are idempotent; a
+      // concurrent real receipt, if any, wins the set-once and is reused.
       log.warn('tier1 pre-claim held without receipt — settling unknown (no replay)', { repairId })
-      return {
+      const unknownReceipt: HostActionReceipt = {
         opcode,
         outcome: 'unknown',
         exit: -1,
@@ -727,6 +753,9 @@ export class SelfhealJobWorker {
         durationMs: 0,
         detail: { reason: 'crashed after pre-claim before receipt — not re-transmitted' },
       }
+      await setJobTier1Receipt(repairId, JSON.stringify(unknownReceipt))
+      const j2 = await getJob(repairId)
+      return j2?.tier1Receipt ? (JSON.parse(j2.tier1Receipt) as HostActionReceipt) : unknownReceipt
     }
     const exec = this.deps.executeHostOpcode ?? executeHostOpcode
     const receipt = await exec(opcode, cfg)
@@ -786,8 +815,9 @@ export class SelfhealJobWorker {
       if (executionClass !== 'tier1' && executionClass !== 'tier2') {
         throw new Error(`context executionClass invalid: ${String(executionClass)}`)
       }
-      if (body?.tier !== undefined && body.tier !== executionClass) {
-        throw new Error(`context tier/executionClass mismatch: ${String(body.tier)} vs ${executionClass}`)
+      // tier is REQUIRED and must agree (master contract always returns it).
+      if (body?.tier !== executionClass) {
+        throw new Error(`context tier/executionClass mismatch: ${String(body?.tier)} vs ${executionClass}`)
       }
       const actionOpcode = typeof body?.actionOpcode === 'string' ? body.actionOpcode : null
       if (executionClass === 'tier1' && !actionOpcode) {

@@ -77,6 +77,10 @@ describe('executeHostOpcode — strict outcome classification', () => {
       { code: 0, stdout: '' }, // exit0 empty
       { code: 0, stdout: recv('restart-v5-egress-v1', 'failed', 0) }, // exit0 but not completed
       { code: 0, stdout: recv('WRONG-OPCODE', 'completed', 0) }, // opcode mismatch
+      { code: 0, stdout: JSON.stringify({ opcode: 'restart-v5-egress-v1', outcome: 'completed' }) }, // exit missing
+      { code: 0, stdout: JSON.stringify({ opcode: 'restart-v5-egress-v1', outcome: 'completed', exit: '0' }) }, // exit string
+      { code: 5, stdout: recv('restart-v5-egress-v1', 'completed', 5) }, // exit disagrees with outcome
+      { code: 3, stdout: recv('restart-v5-egress-v1', 'failed', 9) }, // receipt exit ≠ process exit
     ]
     for (const c of cases) {
       const r = await executeHostOpcode(

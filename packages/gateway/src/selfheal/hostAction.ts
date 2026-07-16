@@ -190,18 +190,25 @@ export async function executeHostOpcode(
   } catch {
     return unknown('receipt not valid JSON')
   }
+  // Full binding (MAJOR): the receipt must name THIS opcode, carry an INTEGER
+  // exit equal to the process exit, and its outcome must agree with that exit.
   if (!receipt || receipt.opcode !== opcode) return unknown('receipt opcode mismatch / missing')
-  if (typeof receipt.exit === 'number' && receipt.exit !== r.code) {
-    return unknown('receipt exit disagrees with process exit')
-  }
+  if (!Number.isInteger(receipt.exit)) return unknown('receipt exit missing / not an integer')
+  if (receipt.exit !== r.code) return unknown('receipt exit disagrees with process exit')
 
-  // Bound receipt. Classify by remote wrapper exit:
-  //  64/65 = the forced-command rejected the opcode (never executed) = rejected
+  // Classify by the (now trusted) exit, requiring the receipt outcome to match:
+  //  64/65 = forced-command rejected the opcode (never executed) = rejected
   //  0     = completed;  else = action ran but failed.
   let outcome: HostActionOutcome
-  if (r.code === 64 || r.code === 65) outcome = 'rejected'
-  else if (r.code === 0 && receipt.outcome === 'completed') outcome = 'completed'
-  else if (r.code === 0) return unknown('exit 0 but receipt outcome not completed')
-  else outcome = 'action_failed'
+  if (r.code === 64 || r.code === 65) {
+    if (receipt.outcome !== 'rejected') return unknown('exit 64/65 but outcome not rejected')
+    outcome = 'rejected'
+  } else if (r.code === 0) {
+    if (receipt.outcome !== 'completed') return unknown('exit 0 but outcome not completed')
+    outcome = 'completed'
+  } else {
+    if (receipt.outcome !== 'failed') return unknown('non-zero exit but outcome not failed')
+    outcome = 'action_failed'
+  }
   return { ...base, outcome, detail: receipt }
 }

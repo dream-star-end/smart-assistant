@@ -1170,28 +1170,44 @@ function rowToCallback(r: CallbackOutboxDbRow): SelfhealCallbackRow {
  * 由调用方如实上报 commit_failed。
  */
 /**
- * Enqueue a Tier1 machine-path terminal callback (done | failed) into the SAME
- * durable outbox the broker uses (BLOCKER3): the callbackPump delivers with a
- * fresh capability per send and marks 'abandoned' on an explicit master refusal
- * (so a master that already terminalized never leaves a local running orphan).
- * Idempotent per (repairId, phase). Returns true when a row was enqueued (or
- * already present) — the caller only terminalizes the local job after this.
+ * ATOMICALLY terminalize a Tier1 job AND enqueue its terminal callback in ONE
+ * SQLite transaction (BLOCKER: enqueue + terminal status must not be two
+ * commits — a crash between them leaves a delivered callback + a local running
+ * orphan; and a cancel that terminalized first must make this CAS lose so no
+ * stale callback is enqueued). The CAS gates the enqueue: if the job is no
+ * longer in `fromStatuses` (a cancel won), NOTHING is enqueued and this returns
+ * false. Idempotent enqueue per (repairId, phase). EVERY Tier1 terminal path
+ * (completed/action_failed/unknown → done; rejected/drift/unprovisioned →
+ * failed) goes through here — no best-effort fire-and-forget callback remains.
  */
-export async function enqueueTier1Callback(input: {
+export async function terminalizeTier1WithCallback(input: {
   repairId: string
+  fromStatuses: SelfhealJobStatus[]
+  toStatus: 'succeeded' | 'failed'
   phase: 'done' | 'failed'
   message: string
   detail: Record<string, unknown>
   now?: number
-}): Promise<void> {
+}): Promise<boolean> {
   const db = await getSelfhealDb()
   const now = input.now ?? Date.now()
-  db.prepare(`
-    INSERT INTO selfheal_callback_outbox
-      (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-    ON CONFLICT(repair_id, phase) DO NOTHING
-  `).run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
+  const placeholders = input.fromStatuses.map(() => '?').join(',')
+  const txn = db.transaction(() => {
+    const cas = db
+      .prepare(
+        `UPDATE selfheal_jobs SET status = ?, updated_at = ? WHERE repair_id = ? AND status IN (${placeholders})`,
+      )
+      .run(input.toStatus, now, input.repairId, ...input.fromStatuses)
+    if (cas.changes === 0) return false // a cancel (or prior terminal) won — no callback
+    db.prepare(`
+      INSERT INTO selfheal_callback_outbox
+        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      ON CONFLICT(repair_id, phase) DO NOTHING
+    `).run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
+    return true
+  })
+  return txn()
 }
 
 export async function commitBrokerOutcomeWithCallback(input: {
