@@ -631,18 +631,18 @@ export function ContainerWebPreview({
       }}
       srTitle="容器网页预览与元素评论"
       hideClose
-      className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-black"
+      className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-[#0c0c11]"
       bodyClassName="overflow-hidden p-0"
     >
       <div
-        className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden bg-[#08090b] text-white"
+        className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden"
         data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
       >
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(57,76,112,0.19),transparent_48%)]" />
+        <div className="preview-ambient pointer-events-none absolute inset-0" />
 
         {mode === 'interact' ? (
           <header className="preview-floating-header">
-            <div className="mx-auto flex w-full max-w-[1600px] items-center gap-2 px-2 sm:px-4">
+            <div className="preview-header-row mx-auto flex w-full max-w-[1600px] items-center gap-2 px-2 sm:px-4">
               <button
                 type="button"
                 onClick={onClose}
@@ -685,7 +685,10 @@ export function ContainerWebPreview({
                 className="preview-address-pill min-w-0 flex-1"
                 title={`${displayTitle}\n${displayUrl}`}
               >
-                <Globe2 className="hidden shrink-0 text-white/45 min-[430px]:block" size={16} />
+                <Globe2
+                  className="preview-accent-text hidden shrink-0 min-[430px]:block"
+                  size={16}
+                />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[12px] font-semibold text-white/90">
                     {displayTitle}
@@ -733,7 +736,7 @@ export function ContainerWebPreview({
           </header>
         ) : (
           <header className="preview-floating-header">
-            <div className="mx-auto grid w-full max-w-[1100px] grid-cols-[auto_1fr_auto] items-center gap-2 px-2 sm:px-4">
+            <div className="preview-header-row mx-auto grid w-full max-w-[1100px] grid-cols-[auto_1fr_auto] items-center gap-2 px-2 sm:px-4">
               <button
                 type="button"
                 onClick={leaveCommentMode}
@@ -780,9 +783,10 @@ export function ContainerWebPreview({
           <div
             ref={viewportRef}
             className={cn(
-              'preview-viewport relative max-h-full max-w-full overflow-hidden bg-[#181a20]',
+              'preview-viewport relative max-h-full max-w-full overflow-hidden',
               device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl',
               mode === 'comment' && ready && 'preview-viewport-selecting',
+              hasError && 'preview-viewport-error',
             )}
             style={{ aspectRatio: `${viewport.width} / ${viewport.height}`, width: previewWidth }}
           >
@@ -891,15 +895,15 @@ export function ContainerWebPreview({
             {!ready && !hasError && (
               <output
                 aria-live="polite"
-                className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#15171c] text-center"
+                className="preview-loading-state absolute inset-0 flex flex-col items-center justify-center text-center"
               >
-                <span className="flex size-12 items-center justify-center rounded-full bg-white/[0.06]">
-                  <Loader2 className="animate-spin text-white/75" size={22} />
+                <span className="preview-state-icon">
+                  <Loader2 className="animate-spin" size={21} />
                 </span>
-                <span className="text-sm font-medium text-white/75">
+                <span className="preview-state-title">
                   {PHASE_LABEL[session.phase] ?? '正在准备预览'}
                 </span>
-                <span className="text-xs text-white/35">
+                <span className="preview-state-copy">
                   {session.transport === 'direct'
                     ? '正在建立原生网页通道，失败会自动切换兼容模式'
                     : '首次启动独立浏览器可能需要几秒'}
@@ -1138,29 +1142,24 @@ function PreviewError({
   onRetry: () => void
 }) {
   return (
-    <div
-      role="alert"
-      className="absolute inset-0 flex items-center justify-center bg-[#111318]/97 p-5 text-center"
-    >
-      <div className="w-full max-w-sm">
-        <span className="mx-auto flex size-12 items-center justify-center rounded-full bg-amber-300/10 text-amber-200">
-          <CircleAlert size={23} />
+    <div role="alert" className="preview-error-state absolute inset-0">
+      <div className="preview-error-content">
+        <span className="preview-error-icon">
+          <CircleAlert size={21} />
         </span>
-        <h2 className="mt-4 text-base font-semibold">无法连接网页预览</h2>
-        <p className="mt-2 text-sm leading-6 text-white/55">
+        <h2 className="preview-error-title">无法连接网页预览</h2>
+        <p className="preview-error-copy">
           运行环境可能仍在启动，或网页服务暂时不可用。请确认网页已运行后重试。
         </p>
         {retryable && (
-          <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-5">
+          <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-3.5">
             <RefreshCw size={16} />
             重新连接
           </button>
         )}
-        <details className="group mx-auto mt-4 max-w-xs text-left text-[11px] text-white/35">
-          <summary className="cursor-pointer text-center hover:text-white/55">诊断详情</summary>
-          <p className="mt-2 max-h-24 overflow-auto break-all rounded-xl bg-black/30 p-3 leading-5">
-            {detail}
-          </p>
+        <details className="preview-error-details group">
+          <summary>诊断详情</summary>
+          <p className="preview-error-detail-body">{detail}</p>
         </details>
       </div>
     </div>
@@ -1278,7 +1277,7 @@ function CommentEditor({
           maxLength={2_000}
           onChange={(event) => onChange(event.target.value)}
           aria-label="描述网页修改"
-          placeholder="例如：按钮改成品牌蓝色，文案改为“立即开始”，移动端占满一行。"
+          placeholder="例如：按钮改成品牌色，文案改为“立即开始”，移动端占满一行。"
           className="mt-3 min-h-20 w-full resize-none bg-transparent text-sm leading-6 text-white outline-none placeholder:text-white/30"
         />
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
@@ -1365,7 +1364,7 @@ function CommentsDrawer({
                   ref={(node) => setItemRef(annotation.id, node)}
                   type="button"
                   onClick={() => onEdit(annotation)}
-                  className="flex min-h-11 min-w-0 flex-1 items-start gap-3 rounded-xl p-2 text-left outline-none hover:bg-white/[0.05] focus-visible:ring-2 focus-visible:ring-blue-300"
+                  className="preview-comment-item flex min-h-11 min-w-0 flex-1 items-start gap-3 rounded-xl p-2 text-left hover:bg-white/[0.05]"
                 >
                   <span
                     className={cn(
@@ -1376,7 +1375,7 @@ function CommentsDrawer({
                     {index + 1}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xs font-medium text-blue-100">
+                    <span className="preview-accent-text block truncate text-xs font-medium">
                       {annotation.target.selector}
                     </span>
                     <span className="mt-1 line-clamp-3 block text-sm leading-5 text-white/70">
@@ -1413,7 +1412,7 @@ function ElementSummary({ target }: { target: ContainerPreviewElementTarget }) {
   const label = target.ariaLabel || target.text
   return (
     <div className="min-w-0">
-      <div className="truncate text-xs font-semibold text-blue-100">{target.selector}</div>
+      <div className="preview-accent-text truncate text-xs font-semibold">{target.selector}</div>
       <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-white/45">
         <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">&lt;{target.tag}&gt;</span>
         {target.role && (
