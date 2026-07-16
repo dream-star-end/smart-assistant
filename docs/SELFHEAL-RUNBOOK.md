@@ -152,7 +152,9 @@ ssh kl-mirror "journalctl -u openclaude-v5 --since '-3min' | grep -iE 'selfheal.
 # 等 monitor 下一轮(≤2min)后:
 # psql: SELECT rule_id, firing, observed_at FROM admin_alert_rule_state WHERE rule_id LIKE 'ops.monitor:%' ORDER BY observed_at DESC LIMIT 15;
 #   => 11 项 check 有新 observed_at(firing 视实况)
-# 若有属实 firing:admin selfheal 页出现 incident + WS banner/inbox 推送;dispatch 日志确认被 DISPATCH_DISABLED=1 挡住
+# 若有属实 firing:admin selfheal 页出现 incident(107c5967 后 incident 是纯内部账本,
+# **不再**推 WS banner/inbox;用户通知只走 userNoticeApproval 审批出口);
+# dispatch 日志确认被 DISPATCH_DISABLED=1 挡住
 ```
 
 **回滚**:env 还原(`V5MON_CONDITIONS` 删 / `OC_SELFHEAL_DISABLED=1` 加回)→ `systemctl restart openclaude-v5`。
@@ -215,77 +217,89 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18796/healthz   # v5 m
 
 **回滚**:`systemctl disable --now openclaude-selfheal-tunnel`;kl-mirror 删 authorized_keys 该行。
 
-### 4.4 kl-mirror 开派单闸
+### 4.4 kl-mirror 开派单闸(drill-only 姿态)
+
+> **前置(批0 裁定,2026-07-16)**:开闸前先把 **9 类真实 policy 全部
+> `auto_repair=FALSE`**(闸一直关着,该变更零行为差异),只留 0155 的 drill
+> policy 可被演练脚本临时翻开。真实类逐个放开的前置条件在 playbook §5 债表
+> (host-routed Tier1 / 外部 watchdog)。
 
 ```bash
 ssh kl-mirror
+# ① 迁移 0155(drill policy seed;同 2.1 记账 SOP)
+# ② 真实 policy 全关派单:
+#    UPDATE incident_policies SET auto_repair=FALSE, updated_at=NOW() WHERE match_key <> 'selfheal.drill:transport_v1';
+# ③ 开闸:
+cp /etc/openclaude/commercial-v5.env /etc/openclaude/commercial-v5.env.bak-$(date +%F)-step4
 sed -i 's/^OC_SELFHEAL_DISPATCH_DISABLED=1/OC_SELFHEAL_DISPATCH_DISABLED=0/' /etc/openclaude/commercial-v5.env
 systemctl restart openclaude-v5
-journalctl -u openclaude-v5 --since '-2min' | grep -i 'selfheal.*dispatch'   # => dispatch enabled(B3 fail-fast 校验通过)
+grep -i 'selfheal' /var/log/openclaude-v5.log | tail -5   # 不再出现 selfheal_dispatch_disabled 警告
 ```
 
+**核对**:`SELECT match_key, auto_repair, enabled FROM incident_policies ORDER BY id;`
+—— 仅 drill 行允许被脚本翻 auto_repair;其余全 FALSE。
 **回滚**:`DISPATCH_DISABLED=1` 改回 + restart。
 
-### 4.5 合成 incident E2E(全链演练)
+### 4.5 transport 演练(全链 E2E,固化为一等公民)
 
-```sql
--- kl-mirror psql:造 firing(参数序以 0134/0135 函数定义为准)
-SELECT write_alert_condition(
-  'ops.monitor:synthetic_e2e', 'probe', TRUE, 'critical',
-  '{"kind":"synthetic","note":"E2E drill, safe to resolve"}'::jsonb, now());
+> 手写 synthetic SQL 的旧法已废弃(`ops.monitor:synthetic_e2e` 不命中任何
+> policy,不会派单;且 107c5967 后 incident 不推 WS banner)。演练一律走
+> 编排脚本 —— 它持 advisory lock、断言九个检查点、异常自动安全清场。
+
+```bash
+ssh kl-mirror
+cd "$(readlink -f /opt/openclaude/openclaude-v5)"   # 蓝绿 release 树权威入口
+set -a && . /etc/openclaude/commercial-v5.env && set +a
+npx tsx scripts/v5-selfheal-drill.ts              # 完整演练(九点全绿才算过)
+npx tsx scripts/v5-selfheal-drill.ts              # 连跑第二次:验证 cooldown 豁免 + 可重复回归
 ```
 
-**观察全链(按序核对)**:
-1. ≤10s reconciler 开 incident(admin selfheal 页 + WS banner + inbox);
-2. repairDispatcher 派单 → 隧道 18795 → 本机 receiver ack(`codex_repairs` 进 dispatched→acked);
-3. 本机 job:prepareClone(`/home/ocheal/selfheal/<repairId>` 出现,owner=ocheal)→ codex-v5ops 会话跑起 → `oc-selfheal context/progress` 经 broker 回传;
-4. 修复产出 → `oc-selfheal verify`(降权四层测试)→ 签名落盘 `/var/lib/openclaude-selfheal/verifications/`;
-5. **pending_release** → 企微通知到达(OC_SELFHEAL_WECOM_WEBHOOK 已填时);
-6. v5 admin repair 详情"待放行"→ **一键放行** → 隧道 → 本机 releaseApproved → deployDriver(演练可选:合成修复无实际 diff 时此段按实现语义走 done/failed 收尾);
-7. done 回调 → master verify fence 窗口 → 探测确认;
-8. 造恢复:
+**九个检查点(脚本自动断言,人工只看输出)**:
+1. 预检:无活跃 repair、无其它可派单 incident、drill policy 姿态正确;
+2. `write_alert_condition` 落 firing=true(单写权威);
+3. reconciler 开 incident(纯内部账本,**无**用户广播);
+4. sweeper/dispatcher 派单 → 隧道 18795 → `codex_repairs` 离开 pending;
+5. 执行侧 ack/progress 回调(隧道 18796 + broker 通路);
+6. `report done` 后 repair=**verifying**(绝不直达 succeeded;verify_after 冻结);
+7. 零用户侧副作用(无 delivery、无 user-notice proposal);
+8. 恢复观测晚于 verify_after(freshness fence);
+9. sweeper 同事务 `repair=succeeded + incident=resolved + resolve_source='codex'`
+   (probe 抢跑=P3 守卫回归,脚本会 FAIL)。
 
-```sql
-SELECT write_alert_condition(
-  'ops.monitor:synthetic_e2e', 'probe', FALSE, 'critical',
-  '{"kind":"synthetic"}'::jsonb, now());
-```
-
-9. ≤10s incident resolved + 恢复推送;active repair(若仍在跑)进 cancel_requested→cancelled(A2 语义)。
-
-**预期输出**:上述 9 点全过;`repair_events` 链完整;audit 有 admin release 记录。
-**回滚/清理**:E2E 卡在中间 → kl-mirror `DISPATCH_DISABLED=1`+restart 止血,再按 `repair_events` 定位;synthetic condition 已 firing=false 自动收敛,无残留。
+**执行侧语义**:drill repair 被个人版 broker 服务端白名单限制为 context/report
+(verify/cutover/Tier1 一律拒绝,audit 记 `drill_forbidden_action`);codex 会话按
+skill drill 分支两步收尾,不改代码。
+**卡住/中断**:`npx tsx scripts/v5-selfheal-drill.ts --cleanup`(先关 auto_repair
+再翻 condition false,防再派);止血兜底 = kl `DISPATCH_DISABLED=1` + restart。
+**注意**:Tier2 release 演练(真 commit→verify→pending_release→一键放行→deploy)
+是单独的低峰专项,**不在**日常 drill 内 —— 见 playbook §5 债表登记。
 
 ---
 
-## 步骤 5:0136 writer-guard(单写权威 trigger)
+## 步骤 5:writer-guard trigger(单写权威,当前=有意 deferred)
 
-**双重门(R2 HIGH1),两门全过才 apply:**
+> **口径更正(2026-07-16 批0)**:`schema_migrations` 里有 `0136_selfheal_writer_guard`
+> 记账行,但 **trigger 并未生效** —— 0137 迁移显式 `DROP TRIGGER/FUNCTION` 并把
+> 真实 SQL 移驻 `packages/commercial/src/db/deferred/selfheal_writer_guard.sql`
+> (0137 文件头有说明:当时回滚池仍含旧 writer,统一收敛回"暂缓 guard")。
+> **验收 guard 是否生效只能查 pg_trigger,绝不能看 schema_migrations。**
 
-1. **门①**:新 master(function 写路径)已上线 —— 步骤 2-4 完成即满足。
-2. **门②**:回滚池内不再有直写检测列的旧 release —— 核对 `deploy-v5.sh --rollback` 候选列表,**全部 ≥ selfheal 合并点**(须等 selfheal 之后的 release 把直写版全部挤出回滚窗口)。
+**双重门(R2 HIGH1),两门全过才启用:**
 
-**未过门②之前**:0136 只进仓不 apply,**登记 playbook §5 债表**(条目:`0136 writer-guard 待 apply;触发条件=回滚池候选全部 ≥ selfheal 合并点`)。
+1. **门①**:新 master(function 写路径)已上线 —— 已满足。
+2. **门②**:回滚池内不再有直写检测列的旧 release —— 核对 `deploy-v5.sh --rollback` 候选列表,**全部 ≥ selfheal 合并点**。
 
-**apply(过双重门后)**:
+**启用方式(过双重门后)**:把 `db/deferred/selfheal_writer_guard.sql` 以**新的迁移版本号**
+(如 `01XX_selfheal_writer_guard_enable.sql`)入仓 → apply + 记账 → 下一版才登记
+release-metadata requiredMigrations。**不要**复用 0136 版本号(已被 0137 消费为"暂缓"语义)。
 
 ```sql
--- 同 2.1 记账 SOP
-BEGIN;
-\i /tmp/0136_<name>.sql
-INSERT INTO schema_migrations(version, applied_at)
-  VALUES ('0136_<name>', now()) ON CONFLICT DO NOTHING;
-COMMIT;
--- 核对 trigger:
-SELECT tgname FROM pg_trigger WHERE tgname='guard_alert_condition_write';   -- 1 行
--- 负例验证:直写检测列应被拒
-UPDATE admin_alert_rule_state SET firing=false WHERE rule_id='ops.monitor:synthetic_e2e';
--- => ERROR(RAISE EXCEPTION)= trigger 生效;operator 列(ack_*/suppressed_*)直写仍放行
+-- 启用后核对:
+SELECT tgname FROM pg_trigger WHERE tgname LIKE '%alert_condition%';   -- 1 行=生效
+-- 负例:直写检测列应被拒(operator 列 ack_*/suppressed_* 仍放行)
 ```
 
-**记账铁律**:release-metadata.json requiredMigrations **在 apply 之后的下一版才登记 0136**(先登记会挡部署)。
-
-**回滚**:`DROP TRIGGER guard_alert_condition_write ON admin_alert_rule_state;`(function 写路径不受影响);重新 apply 时重跑 0136。
+**回滚**:`DROP TRIGGER ... ON admin_alert_rule_state;`(function 写路径不受影响)。
 
 ---
 
@@ -330,7 +344,8 @@ UPDATE admin_alert_rule_state SET firing=false WHERE rule_id='ops.monitor:synthe
 | 本机 | 同上 | `OC_SELFHEAL_CANONICAL_DIR` | `/opt/openclaude/openclaude-v5-aurora` |
 | 本机 | 同上 | `OC_SELFHEAL_RESTART_UNITS` | `openclaude-v5.service` |
 | 本机 | 同上 | `OC_SELFHEAL_AUTO_DEPLOY_TIER2` | `0`(boss 拍板后才可置 1) |
-| 本机 | 同上 | `OC_SELFHEAL_WECOM_WEBHOOK` | 留空占位;填 qyapi robot URL(国内直连禁代理) |
+| 本机 | 同上 | `OC_SELFHEAL_WECOM_WEBHOOK` | qyapi robot URL(2026-07 已配;国内直连禁代理) |
+| 本机 | 同上 | `OC_SELFHEAL_TIER1_ENABLED` | **不设=关**(批0 正向闸:Tier1 实现在本机执行、目标在 kl-mirror=错宿主;host-routed 执行器落地前禁止置 1) |
 
 改 kl-mirror env 遵守 V5_DEV_PLAYBOOK §4.4:先 `cp env env.bak-<date>`,bootstrap 才会重新生成,平时手工同步。
 
@@ -343,7 +358,7 @@ SELECT rule_id, firing, level, mode, observed_at FROM admin_alert_rule_state WHE
 SELECT rule_id, suppressed_at, suppressed_by FROM admin_alert_rule_state WHERE suppressed_until_clear;
 -- repair 生命周期
 SELECT id, incident_id, status, attempt, updated_at FROM codex_repairs ORDER BY updated_at DESC LIMIT 20;
-SELECT repair_id, kind, message, created_at FROM repair_events WHERE repair_id=<id> ORDER BY created_at;
+SELECT repair_id, kind, message, created_at FROM codex_repair_events WHERE repair_id=<id> ORDER BY created_at;
 ```
 
 本机侧 ground truth:`selfheal_jobs`(个人版 selfheal.db)、`/home/ocheal/selfheal/<repairId>` clone、`/var/lib/openclaude-selfheal/verifications/` 签名、broker_actions 幂等记录。

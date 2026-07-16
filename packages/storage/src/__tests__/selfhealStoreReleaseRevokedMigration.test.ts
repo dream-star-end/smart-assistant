@@ -66,9 +66,13 @@ describe('selfheal_jobs release_revoked ALTER guard', () => {
   it("the cancelling rebuild guard did NOT run (table wasn't rebuilt needlessly)", async () => {
     const db = await getSelfhealDb()
     const cols = db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]
-    // ALTER appends: release_revoked is the LAST column here, unlike the
-    // canonical DDL order — proof the cheap ALTER path ran, not a rebuild.
-    assert.equal(cols[cols.length - 1]?.name, 'release_revoked')
+    // ALTER appends: release_revoked then condition_key trail the table here,
+    // unlike the canonical DDL order (…, condition_key, created_at,
+    // updated_at) — proof the cheap ALTER path ran twice, not a rebuild.
+    assert.deepEqual(
+      cols.slice(-2).map((c) => c.name),
+      ['release_revoked', 'condition_key'],
+    )
   })
 
   it('the fuse is writable after the ALTER', async () => {

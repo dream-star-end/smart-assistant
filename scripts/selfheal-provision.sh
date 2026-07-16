@@ -42,6 +42,8 @@ ROOT_CODEX_AUTH=/root/.codex/auth.json
 VERIFY_DIR=/var/lib/openclaude-selfheal/verifications
 CLI_SRC_REL="ops/oc-selfheal.mjs"
 CLI_DST=/usr/local/bin/oc-selfheal
+SKILL_SRC_REL="ops/selfheal/skills/v5-incident-repair/SKILL.md"
+SKILL_DST=/root/.openclaude/agents/codex-v5ops/skills/v5-incident-repair/SKILL.md
 DROPIN_DIR=/etc/systemd/system/openclaude.service.d
 DROPIN_FILE="$DROPIN_DIR/selfheal.conf"
 TUNNEL_UNIT_SRC_REL="deploy/openclaude-selfheal-tunnel.service"
@@ -372,6 +374,46 @@ step_cli() {
 }
 
 # ---------------------------------------------------------------------------
+# 3b. 安装 v5-incident-repair skill(权威源=仓内;曾因手放漂移出 BLOCKER)
+# ---------------------------------------------------------------------------
+step_skill() {
+  log "--- step 3b: v5-incident-repair skill ---"
+  local src="$REPO_ROOT/$SKILL_SRC_REL"
+  local dst="$SKILL_DST"
+  if [ ! -f "$src" ]; then
+    # skill 是修复代理的行为契约:源缺失继续跑会把旧漂移版留在线上(该漂移
+    # 曾是 BLOCKER),宁可 fail-closed。
+    if [ "$DRY_RUN" -eq 1 ]; then
+      todo "skill $dst (source $SKILL_SRC_REL MISSING — non-dry run would die)"
+      return 0
+    fi
+    die "$src not found — refusing to leave a stale/drifted skill installed"
+  fi
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    ok "skill $dst (up to date, sha256=$(sha256sum "$src" | cut -c1-12))"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    todo "skill $dst (would install/update atomically)"
+    return 0
+  fi
+  # 原子安装:同目录临时文件 + mv(运行中的 agent 绝不能读到半份契约)。
+  mkdir -p "$(dirname "$dst")"
+  local tmp
+  tmp="$(dirname "$dst")/.SKILL.md.tmp.$$"
+  cp "$src" "$tmp"
+  chmod 0644 "$tmp"
+  cmp -s "$src" "$tmp" || { rm -f "$tmp"; die "skill temp copy differs from repo source"; }
+  mv -f "$tmp" "$dst"
+  # 终校验:落点逐字节一致
+  if cmp -s "$src" "$dst"; then
+    ok "skill $dst (installed atomically, sha256=$(sha256sum "$src" | cut -c1-12))"
+  else
+    die "skill $dst differs from repo source after install"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # 4. agents.yaml — codex-v5ops 注册
 # ---------------------------------------------------------------------------
 AGENT_SNIPPET='  - id: codex-v5ops
@@ -585,6 +627,7 @@ step_user
 step_dirs
 step_codex_auth
 step_cli
+step_skill
 step_agents
 step_env
 step_autossh

@@ -52,7 +52,6 @@ import {
   BrokerActionError,
   type CommandRunner,
   type RunOpts,
-  TIER1_ACTIONS,
 } from './brokerActions.js'
 import { listToolchainTouches } from './deployDriver.js'
 import { withRepairLock } from './executionLedger.js'
@@ -119,7 +118,21 @@ export interface RepairAuthorityRecord {
   /** Durable release fuse (HIGH3): set by a cancel of a terminal job — a held
    *  pending_release cutover for this repair must never be released. */
   releaseRevoked?: boolean
+  /** Authoritative condition key frozen from the v5 master context at job
+   *  start. Drill authorization reads ONLY this value — never the model's
+   *  self-description. null/absent = not frozen = treated as non-drill. */
+  conditionKey?: string | null
 }
+
+/**
+ * Transport-drill condition key — cross-repo contract with the v5 side
+ * (packages/commercial/src/selfheal/conditionKeys.ts SELFHEAL_DRILL_TRANSPORT).
+ * A repair whose FROZEN condition key equals this constant is a transport
+ * drill: it may only pull context and report — verify/cutover/Tier1 are
+ * rejected server-side (a SKILL instruction is guidance, not a permission
+ * boundary). Exact-match only; future drill kinds extend this set explicitly.
+ */
+export const SELFHEAL_DRILL_TRANSPORT_KEY = 'selfheal.drill:transport_v1'
 
 /** Resolves the durable repair record for a repairId (or null if none). */
 export type RepairAuthority = (repairId: string) => Promise<RepairAuthorityRecord | null>
@@ -132,7 +145,12 @@ const ACTIVE_REPAIR_STATES = new Set(['starting', 'running'])
 const defaultRepairAuthority: RepairAuthority = async (repairId) => {
   const job = await getSelfhealJob(repairId)
   return job
-    ? { status: job.status, capability: job.capability, releaseRevoked: job.releaseRevoked }
+    ? {
+        status: job.status,
+        capability: job.capability,
+        releaseRevoked: job.releaseRevoked,
+        conditionKey: job.conditionKey,
+      }
     : null
 }
 
@@ -413,7 +431,14 @@ export class SelfhealBroker {
     // replay protection across a restart (Codex HIGH #4), so it must be opted in.
     this.store = opts.store ?? durableBrokerClaimStore
     this.repairAuthority = opts.repairAuthority ?? defaultRepairAuthority
-    this.actions = opts.actions ?? TIER1_ACTIONS
+    // Tier1 actions are OFF unless explicitly injected (positive enablement):
+    // the current Tier1 implementations execute on THIS host, while v5 repair
+    // targets live on the v5 master host — auto-registering them would hand
+    // any active repair a wrong-host systemctl/docker lever via the raw
+    // socket. The server layer injects TIER1_ACTIONS only behind
+    // OC_SELFHEAL_TIER1_ENABLED=1 (see server.ts); host-routed execution is
+    // the condition for ever turning that on.
+    this.actions = opts.actions ?? {}
     this.run = opts.run ?? defaultCommandRunner
     this.canonicalRepo = opts.canonicalRepo ?? '/opt/openclaude/openclaude-v5-aurora'
     this.canonicalBranch = opts.canonicalBranch ?? 'feat/v5-aurora-rewrite'
@@ -559,6 +584,43 @@ export class SelfhealBroker {
     if (!authz.ok) {
       this.log.warn('broker request unauthorized', { repairId: req.repairId, reason: authz.reason })
       return { ok: false, status: 'unauthorized', detail: { reason: authz.reason } }
+    }
+
+    // Condition-key authorization (server-side; checked before the claim so a
+    // forbidden attempt never touches the idempotency ledger). The decision
+    // reads the key FROZEN from the v5 master context — the model's own claims
+    // and SKILL text carry no authority here.
+    //
+    // Unfrozen (null) ⇒ reject EVERYTHING: the jobWorker freezes the key via
+    // its own HTTP fetch before any turn starts, so no legitimate socket
+    // caller exists in that window — while a guessed repairId of a job stuck
+    // in 'starting' would otherwise get full non-drill powers (audit R4
+    // BLOCKER: "unfrozen = non-drill" was a bypass, not a default).
+    const frozenKey = authz.rec.conditionKey
+    if (typeof frozenKey !== 'string' || frozenKey.length === 0) {
+      this.audit(req, 'rejected', { reason: 'condition_key_not_frozen' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: {
+          reason: 'repair condition key not frozen yet — no broker actions until job start',
+        },
+      }
+    }
+    // Transport-drill repairs may ONLY pull context and report.
+    if (
+      frozenKey === SELFHEAL_DRILL_TRANSPORT_KEY &&
+      req.actionKind !== CONTEXT_KIND &&
+      req.actionKind !== REPORT_KIND
+    ) {
+      this.audit(req, 'rejected', { reason: 'drill_forbidden_action' })
+      return {
+        ok: false,
+        status: 'rejected',
+        detail: {
+          reason: `drill repair may only context/report — "${req.actionKind}" is forbidden`,
+        },
+      }
     }
 
     // Hash the params so a same-key request with DIFFERENT params is a conflict,

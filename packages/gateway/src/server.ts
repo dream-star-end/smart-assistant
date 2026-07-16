@@ -110,6 +110,7 @@ import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { selectRunLogResponse } from './runLogApi.js'
 import { type BrokerResponse, SelfhealBroker, releaseHttpStatusFor } from './selfheal/broker.js'
+import { TIER1_ACTIONS } from './selfheal/brokerActions.js'
 import { SelfhealCallbackPump } from './selfheal/callbackPump.js'
 import { executeSelfhealCancel } from './selfheal/cancel.js'
 import { createDeployDriver } from './selfheal/deployDriver.js'
@@ -979,8 +980,20 @@ export class Gateway {
         const canonicalBranch =
           process.env.OC_SELFHEAL_CANONICAL_BRANCH?.trim() || 'feat/v5-aurora-rewrite'
         const notify = createWecomNotifier()
+        // Tier1 actions require POSITIVE enablement: the current implementations
+        // execute on THIS host while v5 repair targets live on the v5 master —
+        // enabling them without host-routed execution hands wrong-host
+        // systemctl/docker levers to any active repair. Absent/other values ⇒
+        // OFF (fail-closed); the broker itself also defaults to no actions.
+        const tier1Enabled = process.env.OC_SELFHEAL_TIER1_ENABLED === '1'
+        if (tier1Enabled) {
+          this.log.warn(
+            'selfheal Tier1 actions ENABLED — verify host-routing before relying on restart/clean_disk',
+          )
+        }
         this._selfhealBroker = new SelfhealBroker({
           socketPath: brokerSock,
+          actions: tier1Enabled ? TIER1_ACTIONS : {},
           ochealUid: Number.isInteger(uidRaw) ? uidRaw : undefined,
           ochealGid: Number.isInteger(gidRaw) ? gidRaw : undefined,
           canonicalRepo,
