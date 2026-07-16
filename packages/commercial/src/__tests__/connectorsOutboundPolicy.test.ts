@@ -20,6 +20,7 @@ import {
   isGlobalUnicastIpv4,
   isGlobalUnicastIpv6,
   makePinnedLookup,
+  pinnedHttpsFetch,
   resolvePinnedAddress,
   validateWebdavBaseUrl,
 } from '../connectors/outboundPolicy.js'
@@ -314,6 +315,47 @@ describe('makePinnedLookup(net/tls lookup 覆盖)', () => {
       assert.equal(err, null)
       assert.deepEqual(addrs, [{ address: '8.8.8.8', family: 4 }])
     })
+  })
+})
+
+describe('pinnedHttpsFetch caller lifecycle', () => {
+  test('caller abort cancels an in-flight per-request resolver before fetch', async () => {
+    let rejectDns!: (error: Error) => void
+    let markStarted!: () => void
+    let cancellations = 0
+    let fetches = 0
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const controller = new AbortController()
+    const pending = pinnedHttpsFetch(
+      new URL('https://example.com/public'),
+      { method: 'GET' },
+      {
+        resolver: {
+          resolve4: async () =>
+            new Promise<string[]>((_resolve, reject) => {
+              rejectDns = reject
+              markStarted()
+            }),
+          resolve6: async () => [],
+          cancel: () => {
+            cancellations += 1
+            rejectDns(Object.assign(new Error('cancelled'), { code: 'ECANCELLED' }))
+          },
+        },
+        fetchImpl: async () => {
+          fetches += 1
+          return new Response('unexpected')
+        },
+        signal: controller.signal,
+      },
+    )
+    await started
+    controller.abort()
+    await assert.rejects(pending)
+    assert.equal(cancellations, 1)
+    assert.equal(fetches, 0)
   })
 })
 
