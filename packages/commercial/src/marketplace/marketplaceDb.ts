@@ -1328,7 +1328,9 @@ export async function listApprovedForSearch(
                     FROM (SELECT DISTINCT e.slug, r.user_id, r.message_id, r.rating
                             FROM marketplace_skill_usage_events e
                             JOIN response_rating r ON r.trace_id = e.trace_id
-                           WHERE e.trace_id IS NOT NULL AND e.layer = 'hub') d
+                           WHERE e.trace_id IS NOT NULL AND e.layer = 'hub'
+                             -- 公开评分口径只认显式评分:隐式弱信号(implicit)不进上架分
+                             AND NOT ('implicit' = ANY(r.tags))) d
                    GROUP BY slug) rt ON rt.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (
@@ -1532,7 +1534,9 @@ export async function getListingDetail(
                         FROM marketplace_skill_usage_events e
                         JOIN response_rating r ON r.trace_id = e.trace_id
                        WHERE e.trace_id IS NOT NULL AND e.slug = l.slug
-                         AND e.layer = 'hub') d
+                         AND e.layer = 'hub'
+                         -- 公开评分口径只认显式评分(与 catalog 聚合同步改)
+                         AND NOT ('implicit' = ANY(r.tags))) d
             ) rt ON true
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
             AND (l.kind <> 'connector' OR (

@@ -236,6 +236,21 @@ body {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
+/* ── 高成本 turn 完成后的一次性「评分引导」脉冲(方案 a)：极轻光环,**无布局位移**
+   (只动 box-shadow / border-radius),仅在用户未表达减少动效偏好时播放,播 2 次即止。
+   --accent 随明暗主题自适应(见 :root / .dark 的 accent token);color-mix 保证光环柔和不刺眼。
+   放进 prefers-reduced-motion:no-preference → reduce 偏好下整块不生效(评分行恒静止)。 ── */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes oc-rating-nudge {
+    0%, 100% { box-shadow: none; }
+    50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent, #6366f1) 18%, transparent); }
+  }
+  .oc-rating-nudge {
+    border-radius: 9999px;
+    animation: oc-rating-nudge 1.4s ease-in-out 2;
+  }
+}
+
 /* ── Container-local web preview ──
    An immersive dark workspace built from the same Aurora primitives as the
    rest of V5. Controls remain legible over arbitrary page content and all

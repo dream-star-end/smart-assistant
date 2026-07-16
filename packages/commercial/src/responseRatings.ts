@@ -23,11 +23,29 @@ export interface UpsertResponseRatingInput {
 }
 
 /**
+ * 隐式评分的机器标记 tag(方案 b,2026-07-16):前端把"turn 中途被用户打断/同一问题
+ * 5 分钟内改写重发"作为弱差评静默上报,tags 含本标记。语义地位:
+ *   - **显式永远压过隐式**:upsert 冲突时,隐式来件不得覆盖已有显式评分;
+ *     显式来件照常覆盖一切(含隐式)。
+ *   - 展示/统计面(前端已评回读、admin 满意度统计、市场公开评分聚合)一律排除隐式;
+ *     **差评驱动训练燃料查询(marketplaceDb skill-feedback)有意纳入** —— 那是本机制的
+ *     目的。新增消费面时先决定它属于哪一侧。
+ */
+export const IMPLICIT_RATING_TAG = "implicit";
+
+export function isImplicitRating(tags: string[]): boolean {
+  return tags.includes(IMPLICIT_RATING_TAG);
+}
+
+/**
  * INSERT ... ON CONFLICT (user_id, message_id) DO UPDATE。
  * 用户可改 👍↔👎、改标签、补/改评论 —— 命中唯一键即更新可变字段 + updated_at。
  * created_at 不动(首评时间保留)。
+ * 隐式来件(tags 含 IMPLICIT_RATING_TAG)只允许覆盖同为隐式的既有行:
+ * DO UPDATE 带 WHERE,显式行命中冲突时隐式来件静默不生效(0 行更新,非错误)。
  */
 export async function upsertResponseRating(input: UpsertResponseRatingInput): Promise<void> {
+  const incomingImplicit = isImplicitRating(input.tags);
   await query(
     `INSERT INTO response_rating
        (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
@@ -39,7 +57,8 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
            model      = EXCLUDED.model,
            trace_id   = EXCLUDED.trace_id,
            session_id = EXCLUDED.session_id,
-           updated_at = NOW()`,
+           updated_at = NOW()
+     WHERE NOT $9::boolean OR $10 = ANY(response_rating.tags)`,
     [
       input.userId,
       input.sessionId,
@@ -49,6 +68,8 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
       input.rating,
       input.tags, // node-pg 把 JS string[] 序列化为 PG text[] 字面量
       input.comment,
+      incomingImplicit,
+      IMPLICIT_RATING_TAG,
     ],
   );
 }
@@ -60,7 +81,9 @@ export interface SessionRatingEntry {
   tags: string[];
 }
 
-/** 返回 { [messageId]: { rating, tags } };前端重开会话据此标出已评响应、避免重复采集。 */
+/** 返回 { [messageId]: { rating, tags } };前端重开会话据此标出已评响应、避免重复采集。
+ *  排除隐式行:UI 绝不把用户没点过的 👎 渲染成已选态(隐式行存在时用户仍可正常显式评,
+ *  显式 upsert 会覆盖隐式)。 */
 export async function listSessionRatings(
   userId: string,
   sessionId: string,
@@ -68,8 +91,9 @@ export async function listSessionRatings(
   const r = await query<{ message_id: string; rating: "up" | "down"; tags: string[] | null }>(
     `SELECT message_id, rating, tags
        FROM response_rating
-      WHERE user_id = $1::bigint AND session_id = $2`,
-    [userId, sessionId],
+      WHERE user_id = $1::bigint AND session_id = $2
+        AND NOT ($3 = ANY(tags))`,
+    [userId, sessionId, IMPLICIT_RATING_TAG],
   );
   const out: Record<string, SessionRatingEntry> = {};
   for (const row of r.rows) {
@@ -111,6 +135,8 @@ function toBucket(up: number, down: number): RatingBucket {
 
 export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
   // 一次扫表算出 overall + 7d + 30d 三个窗口的 up/down(条件聚合,走 created_at / model_rating 索引)。
+  // 满意度口径只统计显式评分:隐式弱信号(中途打断/改写重发)不进 up_rate,防止把
+  // "用户拿到所需后主动停止"这类中性行为计成不满意。
   const windows = await query<{
     up_all: number;
     down_all: number;
@@ -126,7 +152,9 @@ export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
        COUNT(*) FILTER (WHERE rating = 'down' AND created_at >= NOW() - INTERVAL '7 days')::int  AS down_7d,
        COUNT(*) FILTER (WHERE rating = 'up'   AND created_at >= NOW() - INTERVAL '30 days')::int AS up_30d,
        COUNT(*) FILTER (WHERE rating = 'down' AND created_at >= NOW() - INTERVAL '30 days')::int AS down_30d
-     FROM response_rating`,
+     FROM response_rating
+     WHERE NOT ($1 = ANY(tags))`,
+    [IMPLICIT_RATING_TAG],
   );
   const w = windows.rows[0] ?? {
     up_all: 0,
@@ -142,8 +170,10 @@ export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
        COUNT(*) FILTER (WHERE rating = 'up')::int   AS up,
        COUNT(*) FILTER (WHERE rating = 'down')::int AS down
      FROM response_rating
+     WHERE NOT ($1 = ANY(tags))
      GROUP BY model
      ORDER BY (COUNT(*)) DESC, model ASC NULLS LAST`,
+    [IMPLICIT_RATING_TAG],
   );
 
   return {
