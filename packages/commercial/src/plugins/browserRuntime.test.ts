@@ -59,6 +59,10 @@ const contract: ManagedBrowserPluginContractV1 = {
       redirects: 'revalidate-every-hop',
       ipv4PinsRequired: true,
     },
+    accountState: {
+      cookieDomains: ['example.com'],
+      origins: ['https://example.com:443'],
+    },
   },
 }
 const storageState: BrowserStorageStateV1 = { cookies: [], origins: [] }
@@ -127,7 +131,9 @@ async function fixture(
     profileRoot: root,
     expectedOwnerUid: process.getuid?.() ?? 0,
     resolver,
-    cleanupTimeoutMs: 25,
+    // Keep the barrier far below the 1 s assertion while avoiding filesystem
+    // scheduler flakes when this suite runs beside the broader Plugin matrix.
+    cleanupTimeoutMs: 250,
     ...(opts.removeProfile ? { removeProfile: opts.removeProfile } : {}),
     ...(opts.removeFails
       ? {

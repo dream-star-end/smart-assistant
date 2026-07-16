@@ -9,6 +9,7 @@ import {
   type PluginAccountRow,
   commitPluginAccountState,
   decryptPluginAccountEnvelope,
+  markPluginAccountRelinkRequiredFenced,
   validateBrowserStorageState,
 } from './accounts.js'
 import type { ManagedBrowserPluginContractV1 } from './contracts.js'
@@ -39,6 +40,10 @@ const contract: ManagedBrowserPluginContractV1 = {
       ],
       redirects: 'revalidate-every-hop',
       ipv4PinsRequired: true,
+    },
+    accountState: {
+      cookieDomains: ['example.com'],
+      origins: ['https://example.com:443'],
     },
   },
 }
@@ -89,6 +94,17 @@ describe('managed-browser Plugin accounts', () => {
         ),
       /must be secure/,
     )
+  })
+
+  test('account state domains are independent from the narrower action network', () => {
+    const splitContract: ManagedBrowserPluginContractV1 = {
+      ...contract,
+      runtime: {
+        ...contract.runtime,
+        network: { ...contract.runtime.network, origins: ['https://api.example.com:443'] },
+      },
+    }
+    assert.doesNotThrow(() => validateBrowserStorageState(state(), splitContract))
   })
 
   test('rejects unknown/prototype fields and bounded-state overflow', () => {
@@ -207,6 +223,18 @@ describe('managed-browser Plugin accounts', () => {
     }
     await assert.rejects(
       commitPluginAccountState({ row, verified, envelope, runner: staleRunner, env }),
+      (error: unknown) => error instanceof PluginAccountError && error.code === 'ACCOUNT_STALE',
+    )
+
+    await markPluginAccountRelinkRequiredFenced({ row, verified, runner })
+    assert.match(statement, /status = 'error'/)
+    assert.match(statement, /last_error_code = 'RELINK_REQUIRED'/)
+    assert.match(statement, /secret_generation = \$6/)
+    assert.match(statement, /exec_contract_hash = \$8/)
+    assert.equal(params[5], row.secret_generation)
+    assert.equal(params[8], verified.contract.account.contractVersion)
+    await assert.rejects(
+      markPluginAccountRelinkRequiredFenced({ row, verified, runner: staleRunner }),
       (error: unknown) => error instanceof PluginAccountError && error.code === 'ACCOUNT_STALE',
     )
   })

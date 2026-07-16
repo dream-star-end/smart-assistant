@@ -362,12 +362,16 @@ import {
   PLUGINS_RPC_PREFIX,
   makeConnectorsRpcHandler,
   type ConnectorsRpcHandler,
-} from "./connectors/rpc.js";
-import { PluginRuntimeFacade } from "./plugins/runtime.js";
-import { seedDefaultConnectors } from "./connectors/declarativeSeed.js";
+} from './connectors/rpc.js'
+import { PluginRuntimeFacade } from './plugins/runtime.js'
+import { ManagedBrowserRuntime } from './plugins/browserRuntime.js'
 import {
-  startConnectorSweeper,
-} from "./connectors/sweeper.js";
+  KnowledgePlanetDockerService,
+  createKnowledgePlanetRuntimeRegistries,
+} from './plugins/knowledgePlanet.js'
+import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
+import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
+import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
   RESEARCH_PREFIX,
   makeResearchProxyHandler,
@@ -1280,6 +1284,36 @@ export async function registerCommercial(
 
   const preCheckRedis = wrapIoredisForPreCheck(redis);
 
+  // Generic Plugin facade is process-scoped and shared by container RPC + browser HTTP.
+  // The official Knowledge Planet driver is enabled only on V5 with the immutable image ID;
+  // a mutable tag is never accepted as the worker trust root.
+  let knowledgePlanetService: KnowledgePlanetDockerService | undefined
+  let knowledgePlanetSetup: KnowledgePlanetSetupManager | undefined
+  let pluginFacade: PluginRuntimeFacade
+  if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
+    const pluginDocker = cfg.AGENT_DOCKER_SOCKET
+      ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
+      : new Docker()
+    knowledgePlanetService = new KnowledgePlanetDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: '/var/lib/openclaude-v5/plugin-workers',
+      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
+    const registries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
+    const browserRuntime = new ManagedBrowserRuntime({
+      ...registries,
+      profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
+      expectedOwnerUid: 0,
+    })
+    pluginFacade = new PluginRuntimeFacade({ redis, browserRuntime })
+    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService)
+  } else {
+    pluginFacade = new PluginRuntimeFacade({ redis })
+  }
+
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
   // 任一必要字段缺失 → agentRuntime 置 undefined;/api/agent/open 返 503,/status 仍然可读。
   let agentRuntime: AgentHttpDeps | undefined;
@@ -1676,8 +1710,8 @@ export async function registerCommercial(
       const connectorsRpcHandler: ConnectorsRpcHandler = makeConnectorsRpcHandler({
         identityRepo,
         redis,
-        pluginFacade: new PluginRuntimeFacade({ redis }),
-      });
+        pluginFacade,
+      })
       // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
       // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;
       // enabled 由 research_config 控制(off → 503)。免费源(OpenAlex/Crossref/arXiv)无 key。
@@ -3108,6 +3142,8 @@ export async function registerCommercial(
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
+    pluginRuntime: pluginFacade,
+    knowledgePlanetSetup,
     mailer,
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
@@ -4846,6 +4882,12 @@ export async function registerCommercial(
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
+      // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
+      try {
+        await knowledgePlanetSetup?.closeAndDrain()
+      } catch {
+        /* ignore */
+      }
       // ── P3:LeaderBundle + lease + 控制口 teardown(RFC D4)──────────────────────
       // v5:leaderLease.shutdown() graceful=(若持 lease)drain bundle(有界 30s)+写本 epoch ACK
       //    +unlock advisory —— 新 holder 拿锁即见 ACK,零等待零重叠;非 leader 则只清连接/timer。

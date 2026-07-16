@@ -100,6 +100,8 @@ import {
 } from "../inbox/assets.js";
 import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
+import type { PluginRuntimeFacade } from '../plugins/runtime.js'
+import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
@@ -108,11 +110,15 @@ export interface CommercialHttpDeps {
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */
   containerPreviewAvailable?: () => boolean;
   /** Optional native iframe transport; legacy screencast remains the fallback. */
-  directContainerPreview?: DirectContainerPreviewService;
-  mailer: Mailer;
-  redis: RateLimitRedis;
-  turnstileSecret?: string;
-  turnstileBypass?: boolean;
+  directContainerPreview?: DirectContainerPreviewService
+  /** Signed Plugin catalog/accounts runtime for the browser management surface. */
+  pluginRuntime?: PluginRuntimeFacade
+  /** Short-lived managed login coordinator for the official Knowledge Planet Plugin. */
+  knowledgePlanetSetup?: KnowledgePlanetSetupManager
+  mailer: Mailer
+  redis: RateLimitRedis
+  turnstileSecret?: string
+  turnstileBypass?: boolean
   /**
    * Turnstile 公钥(client-side site key)。
    * 经 `GET /api/public/config` 暴露给前端 auth 模态加载 widget 用。

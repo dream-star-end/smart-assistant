@@ -36,6 +36,16 @@ export interface ApproveRuntimePluginVersionInput {
   pool?: Pool
 }
 
+export interface ApproveOfficialRuntimePluginVersionInput {
+  versionId: string | number
+  ownerUserId: number
+  expectedArtifactHash: string
+  /** Set only after the deploy gate exercised this exact official worker flow. */
+  functionalVerified: true
+  env?: NodeJS.ProcessEnv
+  pool?: Pool
+}
+
 async function assertActiveAdminNotAuthor(
   reviewerUserId: number,
   authorUserId: string,
@@ -227,6 +237,146 @@ export async function approveRuntimePluginVersion(
       ),
     pool,
   )
+}
+
+/**
+ * Idempotent approval for a version-control-owned official runtime Plugin.
+ * Unlike user submissions, the version-controlled platform seed is the reviewer;
+ * the recorded owner is provenance only and may later be disabled without making
+ * an already trusted official artifact undeployable.
+ */
+export async function approveOfficialRuntimePluginVersion(
+  input: ApproveOfficialRuntimePluginVersionInput,
+): Promise<CompiledRuntimePluginArtifact> {
+  if (input.functionalVerified !== true)
+    throw new ConnectorSpecError('INVALID_STATE', 'live functional verification is required')
+  const pool = input.pool ?? getPool()
+  return tx(async (client) => {
+    const version = await lockMarketplaceVersion(client, input.versionId, {
+      maxRawArtifactBytes: RUNTIME_PLUGIN_ARTIFACT_MAX_BYTES,
+    })
+    if (!version) throw new ConnectorSpecError('VERSION_NOT_FOUND', 'Plugin version not found')
+    const listing = await lockMarketplaceListing(client, version.slug)
+    if (!listing) throw new ConnectorSpecError('VERSION_NOT_FOUND', 'Plugin listing not found')
+    if (
+      listing.kind !== 'connector' ||
+      (listing.pluginType !== 'sandboxed-local' && listing.pluginType !== 'managed-browser')
+    )
+      throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'version is not a runtime Plugin')
+    if (
+      listing.state === 'revoked' ||
+      version.execRevokedAt !== null ||
+      listing.ownerUserId !== String(input.ownerUserId) ||
+      version.submittedBy !== String(input.ownerUserId)
+    )
+      throw new ConnectorSpecError('EXEC_REVOKED', 'official Plugin ownership or state mismatch')
+    const compiled = parseAndCompileRuntimeArtifact(
+      version.rawArtifact,
+      input.expectedArtifactHash,
+      version.artifactHash,
+      version.slug,
+      version.version,
+    )
+    if (compiled.pluginType !== listing.pluginType)
+      throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'artifact subtype does not match listing')
+    const versionId = safeVersionId(version.id)
+    const signedInput = {
+      listingSlug: listing.slug,
+      versionId,
+      kind: listing.kind,
+      pluginType: listing.pluginType,
+      specHash: compiled.artifactHash,
+      execContractHash: compiled.execContractHash,
+      compilerVersion: RUNTIME_PLUGIN_COMPILER_VERSION,
+      policyVersion: CURRENT_RUNTIME_PLUGIN_SECURITY_POLICY_VERSION,
+    } as const
+
+    if (version.status === 'approved') {
+      if (
+        version.reviewSource !== 'platform' ||
+        version.securityReviewState !== 'security_approved' ||
+        version.functionalVerifyState !== 'verified' ||
+        version.execContractHash === null ||
+        version.signature === null ||
+        version.keyId === null ||
+        version.signatureScheme !== 'plugin-v2' ||
+        version.compilerVersion !== RUNTIME_PLUGIN_COMPILER_VERSION ||
+        version.securityPolicyVersion !== CURRENT_RUNTIME_PLUGIN_SECURITY_POLICY_VERSION ||
+        Buffer.from(version.execContractHash).toString('hex') !== compiled.execContractHash ||
+        canonicalSha256Hex(version.execContract) !== compiled.execContractHash ||
+        !verifyPluginContractV2(
+          signedInput,
+          Buffer.from(version.signature).toString('hex'),
+          version.keyId,
+          input.env ?? process.env,
+        )
+      )
+        throw new ConnectorSpecError('SIGNATURE_INVALID', 'approved official Plugin trust mismatch')
+    } else {
+      if (
+        version.status !== 'pending' ||
+        version.securityReviewState !== 'draft' ||
+        version.aiReviewState !== null
+      )
+        throw new ConnectorSpecError('NOT_DRAFT', 'official Plugin version is not reviewable')
+      const signature = signPluginContractV2(signedInput, { env: input.env ?? process.env })
+      await client.query(
+        `SELECT set_config(
+           'openclaude.plugin_signature_writer',
+           'plugin-v2:' || pg_current_xact_id()::text,
+           true
+         )`,
+      )
+      const updated = await client.query(
+        `UPDATE marketplace_skill_versions
+            SET exec_contract = $2::jsonb,
+                exec_contract_hash = $3,
+                compiler_version = $4,
+                security_policy_version = $5,
+                signature = $6,
+                key_id = $7,
+                signature_scheme = 'plugin-v2',
+                security_reviewed_by = submitted_by,
+                security_reviewed_at = NOW(),
+                security_review_state = 'security_approved',
+                functional_verify_state = 'verified',
+                functional_verified_by = submitted_by,
+                functional_verified_at = NOW(),
+                status = 'approved',
+                reviewed_by = submitted_by,
+                reviewed_at = NOW(),
+                review_note = 'platform-official Plugin seed',
+                review_source = 'platform'
+          WHERE id = $1 AND status = 'pending' AND security_review_state = 'draft'
+            AND artifact_hash = $8`,
+        [
+          version.id,
+          JSON.stringify(compiled.execContract),
+          Buffer.from(compiled.execContractHash, 'hex'),
+          RUNTIME_PLUGIN_COMPILER_VERSION,
+          CURRENT_RUNTIME_PLUGIN_SECURITY_POLICY_VERSION,
+          Buffer.from(signature.signature, 'hex'),
+          signature.keyId,
+          version.artifactHash,
+        ],
+      )
+      if (updated.rowCount !== 1)
+        throw new ConnectorSpecError('CAS_CONFLICT', 'official Plugin changed during approval')
+    }
+
+    const listingUpdate = await client.query(
+      `UPDATE marketplace_skill_listings
+          SET current_approved_version_id = $2,
+              state = CASE WHEN state = 'unlisted' THEN 'active' ELSE state END,
+              revoked_reason = CASE WHEN state = 'unlisted' THEN NULL ELSE revoked_reason END,
+              updated_at = NOW()
+        WHERE slug = $1 AND state <> 'revoked'`,
+      [listing.slug, version.id],
+    )
+    if (listingUpdate.rowCount !== 1)
+      throw new ConnectorSpecError('EXEC_REVOKED', 'official Plugin listing is revoked')
+    return compiled
+  }, pool)
 }
 
 interface StoredRuntimePluginRow {

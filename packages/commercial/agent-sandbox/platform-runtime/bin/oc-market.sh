@@ -207,11 +207,44 @@ def plugin_examples():
             "spec": connector["spec"],
             "securityDecision": connector["securityDecision"],
         }
-    return {"categoryIds": MARKETPLACE_CATEGORIES, "examples": examples}
+    blueprint = {
+        "format": "plugin-blueprint-v1",
+        "slug": "example-api",
+        "name": "Example API",
+        "description": "Read the current account and items from Example API.",
+        "category": "daily-tools",
+        "useCases": ["连接外部服务并读取当前账号信息"],
+        "outcomeExamples": ["完成账号授权后，返回当前账号身份"],
+        "tags": ["API插件"],
+        "visibility": "public",
+        "apiOrigin": "https://api.example.com",
+        "auth": {"mode": "static-token"},
+        "identity": {
+            "actionId": "whoami", "accountKeyPointer": "/id",
+            "accountHintPointer": "/name"
+        },
+        "actions": [{
+            "id": "whoami", "description": "Return the authenticated account.",
+            "method": "GET", "path": "/v1/me",
+            "params": {"type": "object", "properties": {}, "additionalProperties": False},
+            "result": {
+                "type": "object", "properties": {
+                    "id": {"type": "string"}, "name": {"type": "string"}
+                }, "additionalProperties": False
+            }
+        }]
+    }
+    return {
+        "categoryIds": MARKETPLACE_CATEGORIES,
+        "recommendedBlueprint": blueprint,
+        "advancedRawDrafts": examples,
+    }
 
 
-def plugin_payload(path):
+def plugin_draft(path):
     draft = json_object(path, "--file")
+    if draft.get("format") == "plugin-blueprint-v1":
+        return draft
     unknown = sorted(set(draft) - PLUGIN_DRAFT_KEYS)
     if unknown:
         die(f"--file has unknown top-level fields: {', '.join(unknown)}")
@@ -280,28 +313,30 @@ argv = sys.argv[2:]
 if command == "plugin":
     parser = argparse.ArgumentParser(
         prog="oc-market plugin",
-        description="Create, validate and publish one-file declarative HTTP Plugin drafts.",
+        description="Prepare and publish compact one-file declarative HTTP Plugin blueprints.",
     )
     sub = parser.add_subparsers(dest="operation", required=True)
-    sub.add_parser("examples", help="print complete one-file Plugin drafts and category ids")
-    validate_parser = sub.add_parser("validate", help="validate a draft without publishing")
-    validate_parser.add_argument("--file", required=True, help="one-file Plugin draft JSON")
+    sub.add_parser("examples", help="print the compact blueprint, advanced drafts and category ids")
+    prepare_parser = sub.add_parser("prepare", help="compile and validate without publishing")
+    prepare_parser.add_argument("--file", required=True, help="compact blueprint or advanced draft JSON")
+    validate_parser = sub.add_parser("validate", help="compatibility alias for prepare")
+    validate_parser.add_argument("--file", required=True, help="compact blueprint or advanced draft JSON")
     publish_parser = sub.add_parser("publish", help="publish the exact validated draft")
-    publish_parser.add_argument("--file", required=True, help="one-file Plugin draft JSON")
+    publish_parser.add_argument("--file", required=True, help="compact blueprint or advanced draft JSON")
     publish_parser.add_argument(
-        "--confirm", required=True, help="validationHash returned by plugin validate"
+        "--confirm", required=True, help="validationHash returned by plugin prepare"
     )
     args = parser.parse_args(argv)
     if args.operation == "examples":
         print(json.dumps(plugin_examples(), ensure_ascii=False, indent=2))
         raise SystemExit(0)
 
-    payload = plugin_payload(args.file)
-    validated = relay(payload, "validate-plugin", "validation")
+    draft = plugin_draft(args.file)
+    validated = relay(draft, "prepare-plugin", "preparation")
     validation_hash = validated.get("validationHash")
     if not isinstance(validation_hash, str) or len(validation_hash) != 64:
         die("validation relay omitted a valid validationHash")
-    if args.operation == "validate":
+    if args.operation in ("prepare", "validate"):
         validated["publishCommand"] = (
             f"oc-market plugin publish --file {shlex.quote(args.file)} "
             f"--confirm {validation_hash}"
@@ -310,7 +345,9 @@ if command == "plugin":
         raise SystemExit(0)
     if args.confirm != validation_hash:
         die("draft changed or confirmation hash is stale; validate again and ask the user to reconfirm")
-    print(json.dumps(relay(payload, "publish", "publish"), ensure_ascii=False, indent=2))
+    print(json.dumps(relay({
+        "draft": draft, "confirmationHash": args.confirm
+    }, "publish-plugin", "publish"), ensure_ascii=False, indent=2))
     raise SystemExit(0)
 
 if argv == ["--examples"]:

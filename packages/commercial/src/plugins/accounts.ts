@@ -27,6 +27,7 @@ export class PluginAccountError extends Error {
   readonly code:
     | 'INVALID_STATE'
     | 'NOT_INSTALLED'
+    | 'ACCOUNT_ALREADY_EXISTS'
     | 'ACCOUNT_NOT_FOUND'
     | 'ACCOUNT_STALE'
     | 'ACCOUNT_REVOKED'
@@ -113,8 +114,8 @@ function allowedOriginFacts(contract: ManagedBrowserPluginContractV1): {
   origins: Set<string>
   hostnames: Set<string>
 } {
-  const origins = new Set(contract.runtime.network.origins)
-  const hostnames = new Set([...origins].map((origin) => new URL(origin).hostname))
+  const origins = new Set(contract.runtime.accountState.origins)
+  const hostnames = new Set(contract.runtime.accountState.cookieDomains)
   return { origins, hostnames }
 }
 
@@ -386,68 +387,91 @@ export async function createManagedBrowserPluginAccount(input: {
   pool?: Pool
 }): Promise<{ id: string; accountInstanceId: string }> {
   const pool = input.pool ?? getPool()
-  return tx(async (client: PoolClient) => {
-    const initial = await loadVerifiedRuntimePluginContract(input.versionId, client, {
-      env: input.env,
-    })
-    if (initial.pluginType !== 'managed-browser')
-      throw new PluginAccountError('INVALID_STATE', 'Plugin does not use a browser account')
-    await lockMarketplaceUserSlug(client, input.userId, initial.slug)
-    const version = await lockMarketplaceVersion(client, input.versionId)
-    if (!version || version.slug !== initial.slug)
-      throw new PluginAccountError('ACCOUNT_STALE', 'Plugin version changed before account bind')
-    const listing = await lockMarketplaceListing(client, initial.slug)
-    if (!listing || listing.pluginType !== 'managed-browser')
-      throw new PluginAccountError('ACCOUNT_STALE', 'Plugin listing changed before account bind')
-    const verified = await loadVerifiedRuntimePluginContract(input.versionId, client, {
-      env: input.env,
-    })
-    if (verified.pluginType !== 'managed-browser')
-      throw new PluginAccountError('ACCOUNT_STALE', 'Plugin subtype changed before account bind')
-    await assertRuntimePluginInstallEntitlement(input.userId, verified, client, {
-      requireCurrent: true,
-    })
-    const accountInstanceId = randomUUID()
-    const accountKey = computeAccountKey(
-      `plugin-account-v1:${verified.slug}:${accountInstanceId}`,
-      input.env ?? process.env,
-    )
-    const aadSeed = randomUUID()
-    const envelope: PluginAccountEnvelopeV1 = {
-      schemaVersion: 1,
-      pluginType: 'managed-browser',
-      driverId: verified.contract.runtime.driverId,
-      driverVersion: verified.contract.runtime.driverVersion,
-      accountInstanceId,
-      storageState: validateBrowserStorageState(input.storageState, verified.contract),
-    }
-    const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
-    const inserted = await client.query<{ id: string }>(
-      `INSERT INTO connections
+  try {
+    return await tx(async (client: PoolClient) => {
+      const initial = await loadVerifiedRuntimePluginContract(input.versionId, client, {
+        env: input.env,
+      })
+      if (initial.pluginType !== 'managed-browser')
+        throw new PluginAccountError('INVALID_STATE', 'Plugin does not use a browser account')
+      await lockMarketplaceUserSlug(client, input.userId, initial.slug)
+      const version = await lockMarketplaceVersion(client, input.versionId)
+      if (!version || version.slug !== initial.slug)
+        throw new PluginAccountError('ACCOUNT_STALE', 'Plugin version changed before account bind')
+      const listing = await lockMarketplaceListing(client, initial.slug)
+      if (!listing || listing.pluginType !== 'managed-browser')
+        throw new PluginAccountError('ACCOUNT_STALE', 'Plugin listing changed before account bind')
+      const verified = await loadVerifiedRuntimePluginContract(input.versionId, client, {
+        env: input.env,
+      })
+      if (verified.pluginType !== 'managed-browser')
+        throw new PluginAccountError('ACCOUNT_STALE', 'Plugin subtype changed before account bind')
+      await assertRuntimePluginInstallEntitlement(input.userId, verified, client, {
+        requireCurrent: true,
+      })
+      const existing = await client.query(
+        `SELECT 1 FROM connections
+          WHERE user_id = $1 AND provider = $2 AND revoked_at IS NULL
+          LIMIT 1 FOR UPDATE`,
+        [input.userId, verified.slug],
+      )
+      if ((existing.rowCount ?? 0) !== 0)
+        throw new PluginAccountError(
+          'ACCOUNT_ALREADY_EXISTS',
+          'managed-browser Plugin already has an active account',
+        )
+      const accountInstanceId = randomUUID()
+      const accountKey = computeAccountKey(
+        `plugin-account-v1:${verified.slug}:single`,
+        input.env ?? process.env,
+      )
+      const aadSeed = randomUUID()
+      const envelope: PluginAccountEnvelopeV1 = {
+        schemaVersion: 1,
+        pluginType: 'managed-browser',
+        driverId: verified.contract.runtime.driverId,
+        driverVersion: verified.contract.runtime.driverVersion,
+        accountInstanceId,
+        storageState: validateBrowserStorageState(input.storageState, verified.contract),
+      }
+      const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO connections
          (user_id, provider, display_name, account_key, aad_seed, secret_enc, secret_nonce,
           meta, connector_version_id, spec_hash, exec_contract_hash, auth_contract_version)
        VALUES ($1,$2,$3,$4,$5::uuid,$6,$7,$8::jsonb,$9,$10,$11,$12)
        RETURNING id::text AS id`,
-      [
-        input.userId,
-        verified.slug,
-        (input.displayName ?? '').slice(0, 64),
-        accountKey,
-        aadSeed,
-        encrypted.ciphertext,
-        encrypted.nonce,
-        JSON.stringify({
-          plugin_type: 'managed-browser',
-          account_hint: (input.accountHint ?? '').slice(0, 128),
-        }),
-        verified.versionId,
-        Buffer.from(verified.artifactHash, 'hex'),
-        Buffer.from(verified.execContractHash, 'hex'),
-        verified.contract.account.contractVersion,
-      ],
+        [
+          input.userId,
+          verified.slug,
+          (input.displayName ?? '').slice(0, 64),
+          accountKey,
+          aadSeed,
+          encrypted.ciphertext,
+          encrypted.nonce,
+          JSON.stringify({
+            plugin_type: 'managed-browser',
+            account_hint: (input.accountHint ?? '').slice(0, 128),
+          }),
+          verified.versionId,
+          Buffer.from(verified.artifactHash, 'hex'),
+          Buffer.from(verified.execContractHash, 'hex'),
+          verified.contract.account.contractVersion,
+        ],
+      )
+      return { id: inserted.rows[0]!.id, accountInstanceId }
+    }, pool)
+  } catch (error) {
+    if (
+      error instanceof PluginAccountError ||
+      !(error && typeof error === 'object' && 'code' in error && error.code === '23505')
     )
-    return { id: inserted.rows[0]!.id, accountInstanceId }
-  }, pool)
+      throw error
+    throw new PluginAccountError(
+      'ACCOUNT_ALREADY_EXISTS',
+      'managed-browser Plugin already has an active account',
+    )
+  }
 }
 
 /** Call-time entitlement + persistent generation fence. Invoke only while holding Redis lease. */
@@ -552,10 +576,43 @@ export async function commitPluginAccountState(input: {
   return updated.rows[0]!.secret_generation
 }
 
+/** Mark an expired managed-browser login unusable without overwriting a concurrent rotation. */
+export async function markPluginAccountRelinkRequiredFenced(input: {
+  row: PluginAccountRow
+  verified: VerifiedRuntimePluginContract
+  runner: QueryRunner
+}): Promise<void> {
+  if (input.verified.pluginType !== 'managed-browser')
+    throw new PluginAccountError('INVALID_STATE', 'runtime Plugin is not accountful')
+  const updated = await input.runner.query(
+    `UPDATE connections
+        SET status = 'error', last_error_code = 'RELINK_REQUIRED',
+            secret_generation = secret_generation + 1, updated_at = NOW()
+      WHERE id = $1::bigint AND user_id = $2 AND provider = $3
+        AND connector_version_id = $4 AND revision = $5 AND secret_generation = $6
+        AND spec_hash = $7 AND exec_contract_hash = $8
+        AND auth_contract_version = $9 AND status = 'active' AND revoked_at IS NULL`,
+    [
+      input.row.id,
+      input.row.user_id,
+      input.verified.slug,
+      input.verified.versionId,
+      input.row.revision,
+      input.row.secret_generation,
+      Buffer.from(input.verified.artifactHash, 'hex'),
+      Buffer.from(input.verified.execContractHash, 'hex'),
+      input.verified.contract.account.contractVersion,
+    ],
+  )
+  if (updated.rowCount !== 1)
+    throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account error fence failed')
+}
+
 export async function getPluginAccount(
   connectionId: string,
   userId: number,
   runner: QueryRunner,
+  opts: { includeError?: boolean } = {},
 ): Promise<PluginAccountRow | null> {
   const row = await runner.query<PluginAccountRow>(
     `SELECT c.id::text AS id, c.user_id::int AS user_id, c.provider, c.display_name,
@@ -567,9 +624,9 @@ export async function getPluginAccount(
       JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
       JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE c.id = $1::bigint AND c.user_id = $2 AND c.revoked_at IS NULL
-        AND c.status = 'active' AND l.kind = 'connector'
+        AND ($3::boolean OR c.status = 'active') AND l.kind = 'connector'
         AND l.plugin_type = 'managed-browser'`,
-    [connectionId, userId],
+    [connectionId, userId, opts.includeError === true],
   )
   return row.rows[0] ?? null
 }
@@ -584,8 +641,14 @@ export async function revokePluginAccountFenced(input: {
         SET secret_enc = NULL, secret_nonce = NULL, revoked_at = NOW(),
             secret_generation = secret_generation + 1, updated_at = NOW()
       WHERE id = $1::bigint AND user_id = $2 AND revision = $3
-        AND secret_generation = $4 AND status = 'active' AND revoked_at IS NULL`,
-    [input.row.id, input.row.user_id, input.row.revision, input.row.secret_generation],
+        AND secret_generation = $4 AND status = $5 AND revoked_at IS NULL`,
+    [
+      input.row.id,
+      input.row.user_id,
+      input.row.revision,
+      input.row.secret_generation,
+      input.row.status,
+    ],
   )
   if (revoked.rowCount !== 1)
     throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account revoke fence failed')

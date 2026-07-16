@@ -10,13 +10,21 @@ import {
   decryptPluginAccountEnvelope,
   fencePluginAccountInvocation,
   getPluginAccount,
+  markPluginAccountRelinkRequiredFenced,
+  revokePluginAccountFenced,
 } from './accounts.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
 import type { VerifiedLocalPluginRuntime } from './localRuntime.js'
 import { listVerifiedRuntimePluginContracts, loadVerifiedRuntimePluginContract } from './review.js'
 
 export class PluginRuntimeFacadeError extends Error {
-  readonly code: 'TARGET_NOT_FOUND' | 'RUNTIME_UNAVAILABLE' | 'BAD_REQUEST' | 'TARGET_STALE'
+  readonly code:
+    | 'TARGET_NOT_FOUND'
+    | 'RUNTIME_UNAVAILABLE'
+    | 'RUNTIME_BUSY'
+    | 'RELINK_REQUIRED'
+    | 'BAD_REQUEST'
+    | 'TARGET_STALE'
 
   constructor(code: PluginRuntimeFacadeError['code'], message: string = code) {
     super(message)
@@ -35,6 +43,23 @@ export interface RuntimePluginCatalogEntry {
   actions: Array<{ id: string; description: string; readOnly: true }>
 }
 
+export interface RuntimePluginManagementEntry extends RuntimePluginCatalogEntry {
+  installed: boolean
+  installedVersion: string
+  latestVersionId: string | null
+  latestVersion: string | null
+  installedCurrent: boolean
+  updateAvailable: boolean
+  available: boolean
+}
+
+export interface RuntimePluginManagementAccount
+  extends Omit<RuntimePluginTargetEntry, 'status'> {
+  status: 'active' | 'error'
+  versionId: string
+  executable: boolean
+}
+
 export interface RuntimePluginTargetEntry {
   id: string
   provider: string
@@ -51,6 +76,23 @@ interface CatalogRow {
   name: string
   description: string
   plugin_type: 'sandboxed-local' | 'managed-browser'
+}
+
+interface ManagementRow {
+  installed: boolean
+  installed_id: string
+  installed_version: string
+  installed_name: string
+  installed_description: string
+  installed_artifact_hash: string
+  install_artifact_hash: string
+  slug: string
+  plugin_type: 'sandboxed-local' | 'managed-browser'
+  listing_state: string
+  latest_id: string | null
+  latest_version: string | null
+  latest_name: string | null
+  latest_description: string | null
 }
 
 function isSafeDbId(value: string): boolean {
@@ -228,6 +270,146 @@ export class PluginRuntimeFacade {
     return out
   }
 
+  /**
+   * Browser management view. Unlike the executable Agent catalog, this keeps
+   * stale/revoked installs and accounts visible so users can update, revoke or
+   * uninstall them instead of losing the only recovery controls.
+   */
+  async management(userId: number): Promise<{
+    catalog: RuntimePluginManagementEntry[]
+    accounts: RuntimePluginManagementAccount[]
+  }> {
+    const rows = await this.pool.query<ManagementRow>(
+      `WITH orphan_targets AS (
+         SELECT DISTINCT ON (c.provider)
+                c.provider AS slug, c.connector_version_id AS version_id,
+                v.artifact_hash
+           FROM connections c
+           JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
+          WHERE c.user_id = $1 AND c.revoked_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM marketplace_installs i
+               WHERE i.user_id = c.user_id AND i.slug = c.provider
+                 AND i.uninstalled_at IS NULL
+            )
+          ORDER BY c.provider, c.created_at DESC, c.id DESC
+       ), targets AS (
+         SELECT i.slug, i.version_id, i.artifact_hash, TRUE AS installed
+           FROM marketplace_installs i
+          WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
+         UNION ALL
+         SELECT slug, version_id, artifact_hash, FALSE AS installed
+           FROM orphan_targets
+       )
+       SELECT t.installed, iv.id::text AS installed_id, iv.version AS installed_version,
+              iv.name AS installed_name, iv.description AS installed_description,
+              iv.artifact_hash AS installed_artifact_hash,
+              t.artifact_hash AS install_artifact_hash,
+              t.slug, l.plugin_type, l.state AS listing_state,
+              cv.id::text AS latest_id, cv.version AS latest_version,
+              cv.name AS latest_name, cv.description AS latest_description
+         FROM targets t
+         JOIN marketplace_skill_versions iv ON iv.id = t.version_id AND iv.slug = t.slug
+         JOIN marketplace_skill_listings l ON l.slug = t.slug
+         LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
+        WHERE l.kind = 'connector'
+          AND l.plugin_type IN ('sandboxed-local','managed-browser')
+        ORDER BY COALESCE(cv.name, iv.name) ASC, t.slug ASC
+        LIMIT 100`,
+      [userId],
+    )
+    const versionIds = [
+      ...new Set(
+        rows.rows
+          .flatMap((row) => [row.installed_id, row.latest_id])
+          .filter((id): id is string => id !== null && isSafeDbId(id))
+          .map(Number),
+      ),
+    ]
+    const verified = await listVerifiedRuntimePluginContracts(versionIds, this.pool, {
+      env: this.opts.env,
+    })
+    const catalog: RuntimePluginManagementEntry[] = rows.rows.map((row) => {
+      const installed = verified.get(Number(row.installed_id))
+      const latest = row.latest_id ? verified.get(Number(row.latest_id)) : undefined
+      const installedTrusted =
+        row.install_artifact_hash === row.installed_artifact_hash &&
+        installed?.pluginType === row.plugin_type
+      const latestTrusted = latest?.pluginType === row.plugin_type
+      const available = row.listing_state === 'active' && latestTrusted
+      const installedCurrent =
+        available &&
+        row.installed &&
+        installedTrusted &&
+        row.latest_id === row.installed_id &&
+        latest?.artifactHash === installed?.artifactHash
+      const contract = latestTrusted ? latest : installedTrusted ? installed : null
+      return {
+        versionId: row.installed_id,
+        slug: row.slug,
+        pluginType: row.plugin_type,
+        label: (latestTrusted ? row.latest_name : row.installed_name) ?? row.installed_name,
+        description:
+          (latestTrusted ? row.latest_description : row.installed_description) ??
+          row.installed_description,
+        accountMode:
+          contract?.pluginType === 'managed-browser' ? contract.contract.account.mode : 'none',
+        actions:
+          contract?.contract.actions.map((action) => ({
+            id: action.id,
+            description: action.description,
+            readOnly: true as const,
+          })) ?? [],
+        installed: row.installed,
+        installedVersion: row.installed_version,
+        latestVersionId: available ? row.latest_id : null,
+        latestVersion: available ? row.latest_version : null,
+        installedCurrent,
+        updateAvailable:
+          available &&
+          (!row.installed || !installedTrusted || row.latest_id !== row.installed_id),
+        available,
+      }
+    })
+    const bySlug = new Map(catalog.map((item) => [item.slug, item]))
+    const accountRows = await this.pool.query<{
+      id: string
+      provider: string
+      display_name: string
+      connector_version_id: string
+      status: 'active' | 'error'
+      meta: Record<string, unknown>
+    }>(
+      `SELECT c.id::text, c.provider, c.display_name,
+              c.connector_version_id::text, c.status, c.meta
+         FROM connections c
+         JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
+         JOIN marketplace_skill_listings l ON l.slug = v.slug AND l.slug = c.provider
+        WHERE c.user_id = $1 AND c.revoked_at IS NULL
+          AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
+        ORDER BY c.created_at DESC`,
+      [userId],
+    )
+    const accounts: RuntimePluginManagementAccount[] = accountRows.rows.map((row) => {
+      const plugin = bySlug.get(row.provider)
+      return {
+        id: row.id,
+        provider: row.provider,
+        pluginType: 'managed-browser',
+        displayName: row.display_name || row.provider,
+        accountHint: typeof row.meta?.account_hint === 'string' ? row.meta.account_hint : '',
+        status: row.status,
+        actions: plugin?.actions ?? [],
+        versionId: row.connector_version_id,
+        executable:
+          row.status === 'active' &&
+          plugin?.installedCurrent === true &&
+          plugin.versionId === row.connector_version_id,
+      }
+    })
+    return { catalog, accounts }
+  }
+
   async list(userId: number): Promise<RuntimePluginTargetEntry[]> {
     const catalog = await this.catalog(userId)
     const localTargets: RuntimePluginTargetEntry[] = catalog
@@ -287,6 +469,25 @@ export class PluginRuntimeFacade {
       })
     }
     return [...managedTargets, ...localTargets]
+  }
+
+  async revokeManagedAccount(userId: number, targetId: string): Promise<{ id: string }> {
+    if (!isSafeDbId(targetId))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin account id is malformed')
+    if (!(await getPluginAccount(targetId, userId, this.pool, { includeError: true })))
+      throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account not found')
+    const lease = await acquirePluginAccountLease(this.opts.redis, targetId, {
+      hardTimeoutMs: 15_000,
+    })
+    try {
+      const row = await getPluginAccount(targetId, userId, this.pool, { includeError: true })
+      if (!row) throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account not found')
+      await lease.assertHeld()
+      await revokePluginAccountFenced({ row, runner: this.pool })
+      return { id: targetId }
+    } finally {
+      await lease.release()
+    }
   }
 
   async call(input: {
@@ -371,13 +572,33 @@ export class PluginRuntimeFacade {
         runner: this.pool,
       })
       const envelope = decryptPluginAccountEnvelope(fencedRow, verified.contract, this.opts.env)
-      const executed = await this.browser.runReadAction({
-        contract: verified.contract,
-        storageState: envelope.storageState,
-        actionId: input.actionId,
-        params: input.params,
-        signal: lease.signal,
-      })
+      let executed: Awaited<ReturnType<ManagedBrowserRuntime['runReadAction']>>
+      try {
+        executed = await this.browser.runReadAction({
+          contract: verified.contract,
+          storageState: envelope.storageState,
+          actionId: input.actionId,
+          params: input.params,
+          signal: lease.signal,
+        })
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code
+        if (code === 'LOGIN_EXPIRED_ACCOUNT') {
+          await lease.assertHeld()
+          await markPluginAccountRelinkRequiredFenced({
+            row: fencedRow,
+            verified,
+            runner: this.pool,
+          })
+          throw new PluginRuntimeFacadeError(
+            'RELINK_REQUIRED',
+            'Plugin account login has expired',
+          )
+        }
+        if (code === 'CAPACITY_EXCEEDED')
+          throw new PluginRuntimeFacadeError('RUNTIME_BUSY', 'Plugin worker capacity is full')
+        throw error
+      }
 
       // Browser/context/profile cleanup has completed at this point. Recheck kill switch and
       // exact install before the one final irreversible DB CAS.

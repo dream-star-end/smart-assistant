@@ -22,8 +22,10 @@ describe('Plugin runtime facade', () => {
     const facade = new PluginRuntimeFacade({ pool: pool as never, redis: null })
     assert.deepEqual(await facade.catalog(7), [])
     assert.deepEqual(await facade.list(7), [])
+    assert.deepEqual(await facade.management(7), { catalog: [], accounts: [] })
     assert.ok(calls.some((sql) => sql.includes('marketplace_installs')))
     assert.ok(calls.some((sql) => sql.includes("l.plugin_type = 'managed-browser'")))
+    assert.ok(calls.some((sql) => sql.includes('NOT EXISTS')))
   })
 
   test('classifyTarget starts from a user-scoped current install and rejects absent targets', async () => {

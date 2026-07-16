@@ -712,12 +712,13 @@ async function handleCall(
         return
       } catch (error) {
         const code = (error as { code?: unknown })?.code
-        if (code === 'LEASE_BUSY')
+        if (code === 'LEASE_BUSY' || code === 'RUNTIME_BUSY')
           throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
         if (code === 'TARGET_NOT_FOUND' || code === 'ACCOUNT_NOT_FOUND')
           throw new ConnectorError('CONNECTION_NOT_FOUND', 'Plugin target not found')
         if (
           code === 'TARGET_STALE' ||
+          code === 'RELINK_REQUIRED' ||
           code === 'ACCOUNT_STALE' ||
           code === 'NOT_INSTALLED' ||
           code === 'EXEC_REVOKED' ||

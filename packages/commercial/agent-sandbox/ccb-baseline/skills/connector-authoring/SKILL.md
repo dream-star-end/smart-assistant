@@ -6,38 +6,43 @@ tags: [plugin, connectors, authoring, api, marketplace, publish, oauth]
 
 # 创建和发布 API Plugin
 
-API Plugin 是经过平台编译、安全审核后上架的声明式集成。你负责把用户的自然语言需求整理
-成一个草稿文件，再通过平台 CLI 做权威校验和发布；不要让用户理解底层声明格式，不要猜
-平台私有 schema，也不要直连市场内部接口。
+API Plugin 是经过平台编译、安全审核后上架的声明式集成。默认使用紧凑的
+`plugin-blueprint-v1`：你只描述服务、认证、身份探针和动作，平台会确定性补齐 origin 受众、
+凭据管线、slot 与安全决定，再走同一权威编译器。不要让用户填写底层声明，也不要把平台
+schema 问题转嫁给用户。
 
 ## 权威入口
 
-开始设计前读取容器内置的完整单文件模板和合法分类：
+开始设计前读取容器内置的**紧凑 blueprint**、合法分类和高级兼容模板：
 
 ```bash
 oc-market plugin examples
 ```
 
-模板覆盖 `static-token`、`token-exchange` 和 `oauth2-auth-code`（BYOA）。以最接近的模板
-为骨架，只修改已理解的字段；模板、validate 返回值和 CLI 错误是当前平台契约的权威来源。
+优先复制返回的 `recommendedBlueprint`。`advancedRawDrafts` 仅在 blueprint 无法表达需求时使用；
+它覆盖 `static-token`、`token-exchange` 和 `oauth2-auth-code`（BYOA）。模板、prepare 返回值
+和 CLI 错误是当前平台契约的权威来源。
 
 ## 引导与确认流程
 
-1. 最多分两轮确认：目标服务/API 文档、认证方式、固定 API origin、读取/写入动作、
-   identity 身份探针、市场分类与适用场景。尽量让用户做编号选择；信息不足就问，不要猜。
-2. 把完整草稿写到一个文件（建议 `/tmp/openclaude-plugin.json`），然后在**发布前**运行：
+1. 先从用户描述和 API 文档自行推导名称、slug、分类、用途、固定 API origin、动作、参数与
+   结果白名单。只对真正阻塞的信息提问，最多一轮：认证方式/端点不明确、缺 identity 身份探针、
+   或写入/发送语义无法判断。不要逐字段盘问用户。
+2. 把紧凑 blueprint 写到一个文件（建议 `/tmp/openclaude-plugin.json`）。其中请求体可直接写
+   普通 JSON，值 `"$field"` 会安全引用同名 params；路径 `{field}` 与 query 的字段名也由平台
+   转为受限参数引用。然后在**发布前**运行：
 
 ```bash
-oc-market plugin validate --file /tmp/openclaude-plugin.json
+oc-market plugin prepare --file /tmp/openclaude-plugin.json
 ```
 
-3. validate 不发布、不上架。校验失败时按结构化错误修正并重新校验；成功后，必须依据返回的
+3. prepare 只编译、校验，不发布、不上架。失败时按结构化错误修正并重试；成功后，必须依据返回的
    `plugin` 和 `permissionSummary` 给用户展示发布确认单：名称/slug/版本/可见范围、认证方式、
    BYOA、所需授权字段、全部固定 origins、identity probe、每个 action 的 HTTP method 与
    `read|write|send` effect、凭据放置位置、风险提示。
-4. **只有用户明确确认后**，才原样执行 validate 返回的 `publishCommand`。该命令用
-   `validationHash` 绑定确认时的有效草稿；确认后不得修改文件。任何修改都必须重新 validate、
-   展示新摘要并让用户重新确认。更新已有 Plugin 也按新版本完整走一遍。
+4. **只向用户确认一次；只有用户明确确认后**，才原样执行 prepare 返回的 `publishCommand`。
+   CLI 和服务端都会用 `validationHash` 绑定确认时的有效草稿；确认后不得修改文件。任何修改
+   都必须重新 prepare、展示新摘要并重新确认。更新已有 Plugin 也按新版本走同一流程。
 5. 发布返回 `pending` 表示已提交 AI 审核，不代表已经上架。告诉用户可在
    **市场 → 发布 → 我的发布**实时跟踪；审核通过后**市场 → 发现**会自动刷新展示；安装后在
    **管理中心 → 插件账号**完成授权。

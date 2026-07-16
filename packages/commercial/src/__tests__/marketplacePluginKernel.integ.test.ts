@@ -7,6 +7,17 @@ import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../d
 import { runMigrations } from '../db/migrate.js'
 import { query, tx } from '../db/queries.js'
 import {
+  MarketplaceError,
+  getListingDetail,
+  installApprovedVersion,
+  listApprovedForSearch,
+  publishSkillVersion,
+} from '../marketplace/marketplaceDb.js'
+import {
+  findApprovedKnowledgePlanetPlugin,
+  seedKnowledgePlanetPlugin,
+} from '../marketplace/seedKnowledgePlanetPlugin.js'
+import {
   commitPluginAccountState,
   createManagedBrowserPluginAccount,
   decryptPluginAccountEnvelope,
@@ -14,16 +25,43 @@ import {
   getPluginAccount,
 } from '../plugins/accounts.js'
 import { compileRuntimePluginArtifact } from '../plugins/contracts.js'
+import { KnowledgePlanetRuntimeError } from '../plugins/knowledgePlanet.js'
+import {
+  COMPILED_KNOWLEDGE_PLANET_PLUGIN,
+  KNOWLEDGE_PLANET_PLUGIN_ARTIFACT,
+  KNOWLEDGE_PLANET_PLUGIN_SLUG,
+  KNOWLEDGE_PLANET_PLUGIN_VERSION,
+} from '../plugins/knowledgePlanetContract.js'
 import {
   approveRuntimePluginVersion,
   loadVerifiedRuntimePluginContract,
 } from '../plugins/review.js'
-import { PluginRuntimeFacade } from '../plugins/runtime.js'
+import { PluginRuntimeFacade, PluginRuntimeFacadeError } from '../plugins/runtime.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 let pgAvailable = false
+
+function leaseRedis() {
+  let value: string | null = null
+  return {
+    async eval(script: string, _numKeys: number, ...args: Array<string | number>) {
+      if (script.includes("redis.call('SET'")) {
+        if (value !== null) return 0
+        value = String(args[1])
+        return 1
+      }
+      if (script.includes("redis.call('PEXPIRE'")) return value === String(args[1]) ? 1 : 0
+      if (script.includes("redis.call('DEL'")) {
+        if (value !== String(args[1])) return 0
+        value = null
+        return 1
+      }
+      return value === String(args[1]) ? 1 : 0
+    },
+  }
+}
 
 async function probePg(): Promise<boolean> {
   const pool = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
@@ -247,6 +285,7 @@ describe('marketplace Plugin kernel migration', () => {
       version: '1.0.0',
       driver: { id: 'approved-browser-plugin', version: '1.0.0' },
       account: { mode: 'required', contractVersion: 1 },
+      accountState: { cookieDomains: ['example.com'], origins: ['https://example.com'] },
       network: { origins: ['https://example.com'], methods: ['GET'] },
       actions: [
         {
@@ -310,6 +349,48 @@ describe('marketplace Plugin kernel migration', () => {
       pool: getPool(),
     })
 
+    const previousKmsKey = process.env.OPENCLAUDE_KMS_KEY
+    const previousChannel = process.env.OC_RUNTIME_CHANNEL
+    process.env.OPENCLAUDE_KMS_KEY = env.OPENCLAUDE_KMS_KEY
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    try {
+      const catalog = await listApprovedForSearch('connector')
+      assert.equal(
+        catalog.some(
+          (item) =>
+            item.slug === raw.id &&
+            item.pluginType === 'managed-browser' &&
+            item.versionId === version.rows[0]!.id,
+        ),
+        true,
+      )
+      const detail = await getListingDetail(raw.id)
+      assert.equal(detail?.pluginType, 'managed-browser')
+      assert.deepEqual(detail?.connectorContract, {
+        authMode: 'managed_browser',
+        approvedOrigins: ['https://example.com:443'],
+        actions: [{ id: 'read', effect: 'read' }],
+      })
+      assert.deepEqual(
+        await installApprovedVersion({
+          userId: Number(author.rows[0]!.id),
+          versionId: version.rows[0]!.id,
+          agentIds: ['main'],
+          scopeMode: 'replace',
+        }),
+        {
+          slug: raw.id,
+          version: raw.version,
+          name: 'Approved Browser Plugin',
+        },
+      )
+    } finally {
+      if (previousKmsKey === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_KMS_KEY')
+      else process.env.OPENCLAUDE_KMS_KEY = previousKmsKey
+      if (previousChannel === undefined) Reflect.deleteProperty(process.env, 'OC_RUNTIME_CHANNEL')
+      else process.env.OC_RUNTIME_CHANNEL = previousChannel
+    }
+
     const trusted = await loadVerifiedRuntimePluginContract(
       Number(version.rows[0]!.id),
       getPool(),
@@ -338,12 +419,6 @@ describe('marketplace Plugin kernel migration', () => {
       functional_verify_state: 'verified',
     })
 
-    await query(
-      `INSERT INTO marketplace_installs
-         (user_id, slug, version_id, artifact_hash, installed_by)
-       VALUES ($1, $2, $3, $4, $1)`,
-      [author.rows[0]!.id, raw.id, version.rows[0]!.id, compiled.artifactHash],
-    )
     const account = await createManagedBrowserPluginAccount({
       userId: Number(author.rows[0]!.id),
       versionId: Number(version.rows[0]!.id),
@@ -358,6 +433,26 @@ describe('marketplace Plugin kernel migration', () => {
     assert.equal(
       await facade.classifyTarget(Number(author.rows[0]!.id), account.id),
       'managed-browser',
+    )
+    const currentManagement = await facade.management(Number(author.rows[0]!.id))
+    assert.equal(currentManagement.catalog.length, 1)
+    assert.deepEqual(
+      {
+        slug: currentManagement.catalog[0]!.slug,
+        installed: currentManagement.catalog[0]!.installed,
+        installedCurrent: currentManagement.catalog[0]!.installedCurrent,
+        updateAvailable: currentManagement.catalog[0]!.updateAvailable,
+      },
+      {
+        slug: raw.id,
+        installed: true,
+        installedCurrent: true,
+        updateAvailable: false,
+      },
+    )
+    assert.deepEqual(
+      currentManagement.accounts.map((item) => ({ id: item.id, executable: item.executable })),
+      [{ id: account.id, executable: true }],
     )
     assert.equal(
       (await listDeclarativeConnections(Number(author.rows[0]!.id), getPool())).some(
@@ -386,6 +481,26 @@ describe('marketplace Plugin kernel migration', () => {
       [author.rows[0]!.id, raw.id],
     )
     assert.equal(await facade.classifyTarget(Number(author.rows[0]!.id), account.id), null)
+    const orphanManagement = await facade.management(Number(author.rows[0]!.id))
+    assert.equal(orphanManagement.catalog.length, 1)
+    assert.deepEqual(
+      {
+        slug: orphanManagement.catalog[0]!.slug,
+        installed: orphanManagement.catalog[0]!.installed,
+        installedCurrent: orphanManagement.catalog[0]!.installedCurrent,
+        updateAvailable: orphanManagement.catalog[0]!.updateAvailable,
+      },
+      {
+        slug: raw.id,
+        installed: false,
+        installedCurrent: false,
+        updateAvailable: true,
+      },
+    )
+    assert.deepEqual(
+      orphanManagement.accounts.map((item) => ({ id: item.id, executable: item.executable })),
+      [{ id: account.id, executable: false }],
+    )
     await assert.rejects(
       commitPluginAccountState({
         row: fenced,
@@ -411,5 +526,209 @@ describe('marketplace Plugin kernel migration', () => {
       }),
       '3',
     )
+    const expiringFacade = new PluginRuntimeFacade({
+      pool: getPool(),
+      redis: leaseRedis(),
+      env,
+      browserRuntime: {
+        async runReadAction() {
+          throw new KnowledgePlanetRuntimeError('LOGIN_EXPIRED_ACCOUNT')
+        },
+      } as never,
+    })
+    await assert.rejects(
+      expiringFacade.call({
+        userId: Number(author.rows[0]!.id),
+        targetId: account.id,
+        actionId: 'read',
+        params: {},
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError && error.code === 'RELINK_REQUIRED',
+    )
+    const expired = await query<{ status: string; last_error_code: string | null }>(
+      'SELECT status, last_error_code FROM connections WHERE id = $1',
+      [account.id],
+    )
+    assert.deepEqual(expired.rows[0], {
+      status: 'error',
+      last_error_code: 'RELINK_REQUIRED',
+    })
+    const errorManagement = await facade.management(Number(author.rows[0]!.id))
+    assert.deepEqual(
+      errorManagement.accounts.map((item) => ({
+        id: item.id,
+        status: item.status,
+        executable: item.executable,
+      })),
+      [{ id: account.id, status: 'error', executable: false }],
+    )
+    const revoker = new PluginRuntimeFacade({
+      pool: getPool(),
+      redis: leaseRedis(),
+      env,
+    })
+    assert.deepEqual(await revoker.revokeManagedAccount(Number(author.rows[0]!.id), account.id), {
+      id: account.id,
+    })
+    assert.equal(await getPluginAccount(account.id, Number(author.rows[0]!.id), getPool()), null)
+    const scrubbed = await query<{
+      secret_enc: Buffer | null
+      secret_nonce: Buffer | null
+      revoked_at: Date | null
+    }>('SELECT secret_enc, secret_nonce, revoked_at FROM connections WHERE id = $1', [account.id])
+    assert.equal(scrubbed.rows[0]!.secret_enc, null)
+    assert.equal(scrubbed.rows[0]!.secret_nonce, null)
+    assert.ok(scrubbed.rows[0]!.revoked_at)
+  })
+
+  test('seeds the official Knowledge Planet Plugin and additively migrates legacy Skill users', async (t) => {
+    if (!pgAvailable) return t.skip('pg not available')
+    const admin = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, email_verified, role)
+       VALUES ('knowledge-planet-owner@test.local', 'x', TRUE, 'admin') RETURNING id::text`,
+    )
+    const user = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, email_verified)
+       VALUES ('knowledge-planet-user@test.local', 'x', TRUE) RETURNING id::text`,
+    )
+    await query(
+      `INSERT INTO marketplace_skill_listings(slug, owner_user_id, kind, state)
+       VALUES ('zsxq-persistent-connector', $1, 'skill', 'active')`,
+      [admin.rows[0]!.id],
+    )
+    const legacyVersion = await query<{ id: string }>(
+      `INSERT INTO marketplace_skill_versions
+         (slug, version, name, description, raw_skill_md, raw_artifact, artifact_hash,
+          embedding_hash, submitted_by, status)
+       VALUES ('zsxq-persistent-connector', '0.2.0', '知识星球旧版', 'legacy', '# legacy',
+               '# legacy', 'legacy-zsxq-hash', 'legacy-zsxq-embedding', $1, 'approved')
+       RETURNING id::text`,
+      [admin.rows[0]!.id],
+    )
+    await query(
+      `UPDATE marketplace_skill_listings SET current_approved_version_id = $2
+        WHERE slug = 'zsxq-persistent-connector' AND owner_user_id = $1`,
+      [admin.rows[0]!.id, legacyVersion.rows[0]!.id],
+    )
+    await query(
+      `INSERT INTO marketplace_installs
+         (user_id, slug, version_id, artifact_hash, install_source, installed_by, agent_ids)
+       VALUES ($1, 'zsxq-persistent-connector', $2, 'legacy-zsxq-hash', 'web', $3,
+               '["legacy-agent"]'::jsonb)`,
+      [user.rows[0]!.id, legacyVersion.rows[0]!.id, admin.rows[0]!.id],
+    )
+
+    const previousKmsKey = process.env.OPENCLAUDE_KMS_KEY
+    const previousChannel = process.env.OC_RUNTIME_CHANNEL
+    const kms = randomBytes(32).toString('base64')
+    process.env.OPENCLAUDE_KMS_KEY = kms
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    try {
+      await assert.rejects(
+        publishSkillVersion({
+          slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+          ownerUserId: Number(user.rows[0]!.id),
+          version: KNOWLEDGE_PLANET_PLUGIN_VERSION,
+          name: 'foreign exact copy',
+          description: 'must not preclaim a platform slug',
+          tags: [],
+          rawSkillMd: null,
+          rawArtifact: JSON.stringify(KNOWLEDGE_PLANET_PLUGIN_ARTIFACT),
+          artifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+          embeddingHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+          riskFlags: [],
+          policyVersion: 1,
+          submittedBy: Number(user.rows[0]!.id),
+          kind: 'connector',
+          pluginType: 'managed-browser',
+          queueAiReview: false,
+        }),
+        (error: unknown) =>
+          error instanceof MarketplaceError && error.code === 'SLUG_OWNED_BY_OTHER',
+      )
+      assert.equal(
+        (
+          await query<{ count: string }>(
+            'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug = $1',
+            [KNOWLEDGE_PLANET_PLUGIN_SLUG],
+          )
+        ).rows[0]!.count,
+        '0',
+      )
+
+      const seeded = await seedKnowledgePlanetPlugin({
+        functionalVerified: true,
+        ownerUserId: Number(admin.rows[0]!.id),
+        env: process.env,
+      })
+      assert.equal(seeded.published, true)
+      assert.equal(seeded.migratedUsers, 1)
+      const trusted = await findApprovedKnowledgePlanetPlugin(process.env)
+      assert.equal(trusted?.versionId, seeded.versionId)
+      const detail = await getListingDetail(KNOWLEDGE_PLANET_PLUGIN_SLUG)
+      assert.equal(detail?.official, true)
+      const searchRow = (await listApprovedForSearch('connector')).find(
+        (row) => row.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      )
+      assert.equal(searchRow?.official, true)
+
+      const installs = await query<{
+        slug: string
+        install_source: string
+        installed_by: string
+        agent_ids: unknown
+        uninstalled_at: Date | null
+      }>(
+        `SELECT slug, install_source, installed_by::text, agent_ids, uninstalled_at
+           FROM marketplace_installs
+          WHERE user_id = $1 AND slug IN ('zsxq-persistent-connector', 'knowledge-planet')
+          ORDER BY slug`,
+        [user.rows[0]!.id],
+      )
+      assert.deepEqual(
+        installs.rows.map((row) => ({
+          slug: row.slug,
+          source: row.install_source,
+          installedBy: row.installed_by,
+          agentIds: row.agent_ids,
+          active: row.uninstalled_at === null,
+        })),
+        [
+          {
+            slug: 'knowledge-planet',
+            source: 'migration:zsxq-persistent-connector:web',
+            installedBy: admin.rows[0]!.id,
+            agentIds: ['legacy-agent'],
+            active: true,
+          },
+          {
+            slug: 'zsxq-persistent-connector',
+            source: 'web',
+            installedBy: admin.rows[0]!.id,
+            agentIds: ['legacy-agent'],
+            active: true,
+          },
+        ],
+      )
+      await query("UPDATE users SET status = 'banned' WHERE id = $1", [admin.rows[0]!.id])
+      await query(
+        `INSERT INTO users(email, password_hash, email_verified, role)
+         VALUES ('knowledge-planet-next-admin@test.local', 'x', TRUE, 'admin')`,
+      )
+      const repeated = await seedKnowledgePlanetPlugin({
+        functionalVerified: true,
+        env: process.env,
+      })
+      assert.equal(repeated.published, false)
+      assert.equal(repeated.ownerUserId, Number(admin.rows[0]!.id))
+      assert.equal(repeated.migratedUsers, 0)
+      assert.equal(repeated.skippedExistingUsers, 1)
+    } finally {
+      if (previousKmsKey === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_KMS_KEY')
+      else process.env.OPENCLAUDE_KMS_KEY = previousKmsKey
+      if (previousChannel === undefined) Reflect.deleteProperty(process.env, 'OC_RUNTIME_CHANNEL')
+      else process.env.OC_RUNTIME_CHANNEL = previousChannel
+    }
   })
 })

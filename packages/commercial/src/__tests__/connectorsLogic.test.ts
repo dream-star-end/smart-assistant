@@ -44,6 +44,7 @@ import {
 import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
 import { buildWriteDetail, buildWriteSummary, requireAction } from '../connectors/service.js'
 import { HttpError } from '../http/util.js'
+import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 
 // ─── registry ────────────────────────────────────────────────────────────
 
@@ -727,6 +728,53 @@ describe('RPC 信封契约', () => {
       actionId: 'search',
       params: { q: 'hello' },
     })
+  })
+
+  test('/v3/plugins/call 稳定映射容量饱和与账号登录过期', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    for (const [runtimeCode, expected] of [
+      ['RUNTIME_BUSY', 'RATE_LIMITED'],
+      ['RELINK_REQUIRED', 'RELINK_REQUIRED'],
+    ] as const) {
+      const handler = makeConnectorsRpcHandler({
+        identityRepo: okRepo,
+        pool: {} as never,
+        pluginFacade: {
+          catalog: async () => [],
+          list: async () => [],
+          classifyTarget: async () => 'managed-browser',
+          call: async () => {
+            throw new PluginRuntimeFacadeError(runtimeCode)
+          },
+        },
+        log: () => {},
+      })
+      const { res, state } = makeFakeRes()
+      await handler(
+        makeFakeReq({
+          method: 'POST',
+          url: '/v3/plugins/call',
+          headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+          body: JSON.stringify({ connectionId: '41', action: 'search', params: {} }),
+        }),
+        res,
+        { hostUuid: 'h', boundIp: '1.2.3.4' },
+      )
+      assert.deepEqual(JSON.parse(state.body), { kind: 'error', code: expected })
+    }
   })
 
   test('连接器列表不混入 runtime target，Plugin 列表只聚合一次', async () => {

@@ -93,10 +93,16 @@ export interface ManagedBrowserNetworkContractV1 {
   ipv4PinsRequired: true
 }
 
+export interface ManagedBrowserAccountStateContractV1 {
+  cookieDomains: readonly string[]
+  origins: readonly string[]
+}
+
 export interface ManagedBrowserRuntimeContractV1 {
   driverId: string
   driverVersion: string
   network: ManagedBrowserNetworkContractV1
+  accountState: ManagedBrowserAccountStateContractV1
 }
 
 interface RuntimePluginContractBaseV1 {
@@ -559,7 +565,17 @@ function compileManaged(
 ): CompiledRuntimePluginArtifact {
   exactKeys(
     root,
-    ['schemaVersion', 'pluginType', 'id', 'version', 'driver', 'account', 'network', 'actions'],
+    [
+      'schemaVersion',
+      'pluginType',
+      'id',
+      'version',
+      'driver',
+      'account',
+      'accountState',
+      'network',
+      'actions',
+    ],
     'artifact',
   )
   const id = boundedString(root.id, 2, 64, 'artifact.id')
@@ -576,6 +592,53 @@ function compileManaged(
   exactKeys(account, ['mode', 'contractVersion'], 'artifact.account')
   if (account.mode !== 'required' || account.contractVersion !== 1)
     invalid('managed-browser account must be required contractVersion=1')
+
+  const accountState = plainObject(root.accountState, 'artifact.accountState')
+  exactKeys(accountState, ['cookieDomains', 'origins'], 'artifact.accountState')
+  if (
+    !Array.isArray(accountState.cookieDomains) ||
+    accountState.cookieDomains.length === 0 ||
+    accountState.cookieDomains.length > 16
+  )
+    invalid('artifact.accountState.cookieDomains must contain 1-16 domains')
+  const cookieDomains = [
+    ...new Set(
+      accountState.cookieDomains.map((raw) => {
+        if (typeof raw !== 'string' || raw.startsWith('.') || raw !== raw.toLowerCase())
+          invalid('artifact.accountState cookie domain must be a canonical hostname')
+        try {
+          const hostname = new URL(normalizeHttpsOrigin(`https://${raw}`)).hostname
+          if (hostname !== raw)
+            invalid('artifact.accountState cookie domain must be a canonical hostname')
+          return hostname
+        } catch {
+          invalid('artifact.accountState cookie domain must be a safe public hostname')
+        }
+      }),
+    ),
+  ].sort()
+  if (cookieDomains.length !== accountState.cookieDomains.length)
+    invalid('artifact.accountState cookie domains contain duplicates')
+  if (
+    !Array.isArray(accountState.origins) ||
+    accountState.origins.length === 0 ||
+    accountState.origins.length > 16
+  )
+    invalid('artifact.accountState.origins must contain 1-16 origins')
+  const stateOrigins = [
+    ...new Set(
+      accountState.origins.map((origin) => {
+        if (typeof origin !== 'string') invalid('artifact.accountState origin must be a string')
+        try {
+          return normalizeHttpsOrigin(origin)
+        } catch {
+          invalid('artifact.accountState origin must be a safe HTTPS origin')
+        }
+      }),
+    ),
+  ].sort()
+  if (stateOrigins.length !== accountState.origins.length)
+    invalid('artifact.accountState origins contain duplicates')
 
   const network = plainObject(root.network, 'artifact.network')
   exactKeys(network, ['origins', 'methods'], 'artifact.network')
@@ -630,6 +693,10 @@ function compileManaged(
         forbiddenChannels: REQUIRED_BROWSER_FORBIDDEN_CHANNELS,
         redirects: 'revalidate-every-hop',
         ipv4PinsRequired: true,
+      },
+      accountState: {
+        cookieDomains,
+        origins: stateOrigins,
       },
     },
   }

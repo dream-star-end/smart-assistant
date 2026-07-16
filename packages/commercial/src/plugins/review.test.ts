@@ -24,6 +24,7 @@ function artifact() {
     version: '1.0.0',
     driver: { id: 'browser-reader', version: '1.0.0' },
     account: { mode: 'required', contractVersion: 1 },
+    accountState: { cookieDomains: ['example.com'], origins: ['https://example.com'] },
     network: { origins: ['https://example.com'], methods: ['GET'] },
     actions: [
       {

@@ -24,6 +24,10 @@ function managedArtifact() {
     version: '1.0.0',
     driver: { id: 'knowledge-planet', version: '1.0.0' },
     account: { mode: 'required', contractVersion: 1 },
+    accountState: {
+      cookieDomains: ['zsxq.com', 'wx.zsxq.com'],
+      origins: ['https://wx.zsxq.com'],
+    },
     network: {
       origins: ['https://wx.zsxq.com', 'https://api.zsxq.com:443'],
       methods: ['GET', 'POST'],
@@ -60,6 +64,10 @@ describe('runtime Plugin contracts', () => {
       a.execContract.runtime.network.forbiddenChannels,
       REQUIRED_BROWSER_FORBIDDEN_CHANNELS,
     )
+    assert.deepEqual(a.execContract.runtime.accountState, {
+      cookieDomains: ['wx.zsxq.com', 'zsxq.com'],
+      origins: ['https://wx.zsxq.com:443'],
+    })
   })
 
   test('rejects writable actions and browser network escape declarations', () => {
@@ -94,6 +102,25 @@ describe('runtime Plugin contracts', () => {
           network: { origins: ['https://wx.zsxq.com'], methods: ['GET', 'DELETE'] },
         }),
       /network method/,
+    )
+    assert.throws(
+      () =>
+        compileRuntimePluginArtifact({
+          ...managedArtifact(),
+          accountState: { cookieDomains: ['127.0.0.1'], origins: ['https://wx.zsxq.com'] },
+        }),
+      /safe public hostname/,
+    )
+    assert.throws(
+      () =>
+        compileRuntimePluginArtifact({
+          ...managedArtifact(),
+          accountState: {
+            cookieDomains: ['wx.zsxq.com:443'],
+            origins: ['https://wx.zsxq.com'],
+          },
+        }),
+      /canonical hostname|safe public hostname/,
     )
   })
 
