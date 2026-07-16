@@ -49,33 +49,46 @@ vi.mock("../../lib/api", async (importOriginal) => {
       bindDeclarativeConnector: vi.fn(),
       startDeclarativeOauth: vi.fn(),
       unbindDeclarativeConnector: vi.fn(),
+      getPluginManagement: vi.fn(),
+      startKnowledgePlanetSetup: vi.fn(),
+      getKnowledgePlanetSetup: vi.fn(),
+      getKnowledgePlanetSetupQr: vi.fn(),
+      cancelKnowledgePlanetSetup: vi.fn(),
+      revokePluginAccount: vi.fn(),
     },
   };
 });
 
 import { api, ApiError } from "../../lib/api";
 
-const mockedGetConnectors = vi.mocked(api.getConnectors);
-const mockedBind = vi.mocked(api.bindConnector);
-const mockedOAuthStart = vi.mocked(api.startConnectorOAuth);
-const mockedGithubStart = vi.mocked(api.startGithubOAuth);
-const mockedRename = vi.mocked(api.renameConnector);
-const mockedDelete = vi.mocked(api.deleteConnector);
-const mockedDeclCatalog = vi.mocked(api.getDeclarativeCatalog);
-const mockedDeclConnections = vi.mocked(api.getDeclarativeConnections);
-const mockedDeclManagement = vi.mocked(api.getDeclarativeManagement);
-const mockedInstallMarketplace = vi.mocked(api.installMarketplace);
-const mockedUninstallMarketplace = vi.mocked(api.uninstallMarketplace);
-const mockedDeclBind = vi.mocked(api.bindDeclarativeConnector);
-const mockedDeclOauthStart = vi.mocked(api.startDeclarativeOauth);
-const mockedDeclUnbind = vi.mocked(api.unbindDeclarativeConnector);
+const mockedGetConnectors = vi.mocked(api.getConnectors)
+const mockedBind = vi.mocked(api.bindConnector)
+const mockedOAuthStart = vi.mocked(api.startConnectorOAuth)
+const mockedGithubStart = vi.mocked(api.startGithubOAuth)
+const mockedRename = vi.mocked(api.renameConnector)
+const mockedDelete = vi.mocked(api.deleteConnector)
+const mockedDeclCatalog = vi.mocked(api.getDeclarativeCatalog)
+const mockedDeclConnections = vi.mocked(api.getDeclarativeConnections)
+const mockedDeclManagement = vi.mocked(api.getDeclarativeManagement)
+const mockedInstallMarketplace = vi.mocked(api.installMarketplace)
+const mockedUninstallMarketplace = vi.mocked(api.uninstallMarketplace)
+const mockedDeclBind = vi.mocked(api.bindDeclarativeConnector)
+const mockedDeclOauthStart = vi.mocked(api.startDeclarativeOauth)
+const mockedDeclUnbind = vi.mocked(api.unbindDeclarativeConnector)
+const mockedPluginManagement = vi.mocked(api.getPluginManagement)
+const mockedKnowledgeStart = vi.mocked(api.startKnowledgePlanetSetup)
+const mockedKnowledgeStatus = vi.mocked(api.getKnowledgePlanetSetup)
+const mockedKnowledgeQr = vi.mocked(api.getKnowledgePlanetSetupQr)
+const mockedKnowledgeCancel = vi.mocked(api.cancelKnowledgePlanetSetup)
+const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
   // 声明式默认降级为空（现有 v1 用例不受第二套后端影响）；声明式用例各自 override。
-  mockedDeclCatalog.mockResolvedValue({ connectors: [] });
-  mockedDeclConnections.mockResolvedValue({ connections: [] });
+  mockedDeclCatalog.mockResolvedValue({ connectors: [] })
+  mockedDeclConnections.mockResolvedValue({ connections: [] })
+  mockedPluginManagement.mockResolvedValue({ catalog: [], accounts: [] })
   // 旧目录 fixture 转成管理中心聚合契约，既保留既有交互覆盖，也钉住新读模型。
   mockedDeclManagement.mockImplementation(async (session) => {
     const [catalogResponse, connectionsResponse] = await Promise.all([
@@ -222,6 +235,25 @@ function managementEntry(
     contract,
     ...overrides,
   };
+}
+
+function knowledgePlanetPlugin() {
+  return {
+    versionId: '101',
+    slug: 'knowledge-planet',
+    pluginType: 'managed-browser' as const,
+    label: '知识星球',
+    description: '安全读取已授权知识星球的主题与评论',
+    accountMode: 'required' as const,
+    actions: [{ id: 'list_groups', description: '列出星球', readOnly: true as const }],
+    installed: true,
+    installedVersion: '1.0.0',
+    latestVersionId: '101',
+    latestVersion: '1.0.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  }
 }
 
 /** 定位某 provider 目录卡的容器（label 文本 → 最近的卡片 div）。 */
@@ -799,9 +831,210 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     mockedDeclConnections.mockRejectedValue(new Error("boom"));
     render(<ConnectorsTab auth={auth} />);
 
-    expect(await screen.findByText("WebDAV 网盘")).toBeInTheDocument();
-    for (const p of PROVIDERS) expect(screen.getByText(p.label)).toBeInTheDocument();
-    expect(screen.queryByText("加载应用连接失败")).not.toBeInTheDocument();
-    warn.mockRestore();
-  });
-});
+    expect(await screen.findByText('WebDAV 网盘')).toBeInTheDocument()
+    for (const p of PROVIDERS) expect(screen.getByText(p.label)).toBeInTheDocument()
+    expect(screen.queryByText('加载应用连接失败')).not.toBeInTheDocument()
+    warn.mockRestore()
+  })
+})
+
+describe('ConnectorsTab 通用 Plugin 账号', () => {
+  test('旧版 Plugin 无账号时可直接更新到市场当前版本', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [
+        {
+          ...knowledgePlanetPlugin(),
+          installedVersion: '1.0.0',
+          latestVersionId: '202',
+          latestVersion: '1.1.0',
+          installedCurrent: false,
+          updateAvailable: true,
+        },
+      ],
+      accounts: [],
+    })
+    mockedInstallMarketplace.mockResolvedValue({
+      ok: true,
+      slug: 'knowledge-planet',
+      kind: 'connector',
+      version: '1.1.0',
+      note: 'updated',
+      installedDeps: 0,
+      installedCapabilities: [],
+      skippedOptional: [],
+      needsAuthorization: ['knowledge-planet'],
+      ready: false,
+    })
+    render(<ConnectorsTab auth={auth} />)
+
+    await screen.findByText('知识星球')
+    const card = providerCard('知识星球')
+    expect(within(card).getByText('可更新 v1.1.0')).toBeInTheDocument()
+    fireEvent.click(within(card).getByRole('button', { name: '更新' }))
+
+    await waitFor(() => expect(mockedInstallMarketplace).toHaveBeenCalledWith(auth, '202'))
+  })
+
+  test('旧版 Plugin 有账号时保留恢复入口并要求先解绑再更新', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [
+        {
+          ...knowledgePlanetPlugin(),
+          latestVersionId: '202',
+          latestVersion: '1.1.0',
+          installedCurrent: false,
+          updateAvailable: true,
+        },
+      ],
+      accounts: [
+        {
+          id: '901',
+          provider: 'knowledge-planet',
+          pluginType: 'managed-browser',
+          displayName: '旧版知识星球',
+          accountHint: '微信扫码账号',
+          status: 'active',
+          actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
+          versionId: '101',
+          executable: false,
+        },
+      ],
+    })
+    render(<ConnectorsTab auth={auth} />)
+
+    await screen.findByText('旧版知识星球')
+    const card = providerCard('知识星球')
+    expect(within(card).getByText('需先更新')).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: '更新' })).toBeDisabled()
+    expect(within(card).getByRole('button', { name: '解绑' })).toBeEnabled()
+  })
+
+  test('受管 Plugin 登录过期后明确提示重新授权并保留解绑入口', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [
+        {
+          id: '901',
+          provider: 'knowledge-planet',
+          pluginType: 'managed-browser',
+          displayName: '过期的知识星球账号',
+          accountHint: '微信扫码账号',
+          status: 'error',
+          actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
+          versionId: '101',
+          executable: false,
+        },
+      ],
+    })
+    render(<ConnectorsTab auth={auth} />)
+
+    await screen.findByText('过期的知识星球账号')
+    const card = providerCard('知识星球')
+    expect(within(card).getByText('需重新授权')).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: '解绑' })).toBeEnabled()
+  })
+
+  test('无账号的运行时 Plugin 可二次确认卸载', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    mockedUninstallMarketplace.mockResolvedValue({ ok: true })
+    render(<ConnectorsTab auth={auth} />)
+
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '卸载' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/卸载 Plugin「知识星球」/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '卸载' }))
+
+    await waitFor(() =>
+      expect(mockedUninstallMarketplace).toHaveBeenCalledWith(auth, 'knowledge-planet'),
+    )
+  })
+
+  test('知识星球已安装但未授权时提供微信扫码流程，关闭会取消并销毁会话', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    mockedKnowledgeStart.mockResolvedValue({
+      sessionId: '11111111-1111-4111-8111-111111111111',
+      status: 'waiting_for_scan',
+      qrReady: true,
+      createdAt: '2026-07-16T00:00:00.000Z',
+      expiresAt: '2026-07-16T00:04:00.000Z',
+    })
+    mockedKnowledgeStatus.mockImplementation(() => new Promise(() => {}))
+    mockedKnowledgeQr.mockResolvedValue(new Blob(['png'], { type: 'image/png' }))
+    mockedKnowledgeCancel.mockResolvedValue({
+      sessionId: '11111111-1111-4111-8111-111111111111',
+      status: 'cancelled',
+      qrReady: false,
+      createdAt: '2026-07-16T00:00:00.000Z',
+      expiresAt: '2026-07-16T00:04:00.000Z',
+    })
+    const createObjectUrl = vi.fn(() => 'blob:knowledge-planet-qr')
+    const revokeObjectUrl = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    expect(within(providerCard('知识星球')).getByText('隔离运行')).toBeInTheDocument()
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    const start = within(dialog).getByRole('button', { name: '生成二维码' })
+    expect(start).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    expect(start).toBeEnabled()
+    fireEvent.click(start)
+
+    expect(await within(dialog).findByAltText('知识星球微信登录二维码')).toHaveAttribute(
+      'src',
+      'blob:knowledge-planet-qr',
+    )
+    expect(mockedKnowledgeStart).toHaveBeenCalledWith(auth)
+    expect(mockedKnowledgeQr).toHaveBeenCalledWith(auth, '11111111-1111-4111-8111-111111111111')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(mockedKnowledgeCancel).toHaveBeenCalledWith(
+        auth,
+        '11111111-1111-4111-8111-111111111111',
+      ),
+    )
+  })
+
+  test('已授权的受管 Plugin 展示账号并在二次确认后走安全解绑端点', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [
+        {
+          id: '901',
+          provider: 'knowledge-planet',
+          pluginType: 'managed-browser',
+          displayName: '我的知识星球',
+          accountHint: '微信扫码账号',
+          status: 'active',
+          actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
+          versionId: '101',
+          executable: true,
+        },
+      ],
+    })
+    mockedPluginRevoke.mockResolvedValue(undefined)
+    render(<ConnectorsTab auth={auth} />)
+
+    await screen.findByText('微信扫码账号')
+    const card = providerCard('知识星球')
+    expect(within(card).getByText('已授权')).toBeInTheDocument()
+    expect(within(card).queryByRole('button', { name: '微信扫码授权' })).not.toBeInTheDocument()
+    fireEvent.click(within(card).getByRole('button', { name: '解绑' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/加密保存的登录状态会被销毁/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '解绑' }))
+
+    await waitFor(() => expect(mockedPluginRevoke).toHaveBeenCalledWith(auth, '901'))
+    await waitFor(() => expect(mockedPluginManagement).toHaveBeenCalledTimes(2))
+  })
+})

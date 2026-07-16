@@ -17,6 +17,10 @@ const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
 const commercialIndex = path.join(root, 'packages/commercial/src/index.ts')
+const knowledgePlanetSeed = path.join(
+  root,
+  'packages/commercial/scripts/seed-knowledge-planet-plugin.ts',
+)
 const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
 const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
 const v5UnitA = path.join(root, 'deploy/v5/openclaude-v5.service')
@@ -80,6 +84,34 @@ async function caddyRemoteFixture() {
 }
 
 describe('v5 release safety lanes', () => {
+  test('Knowledge Planet Plugin is gated before activation and seeded only after full smoke', async () => {
+    const [source, seedSource] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(knowledgePlanetSeed, 'utf8'),
+    ])
+    const start = source.indexOf('\ndeploy() {')
+    const end = source.indexOf('\n# ───────────────────────── offline recycle', start)
+    assert.ok(start >= 0 && end > start)
+    const body = source.slice(start, end)
+    const built = body.indexOf('build_release ||')
+    const qrGate = body.indexOf('knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE"')
+    const maintenance = body.indexOf('begin_planned_maintenance deploy')
+    const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
+    const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
+    const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
+    const maintenanceEnd = body.indexOf('end_planned_maintenance')
+    assert.ok(built >= 0 && qrGate > built && maintenance > qrGate)
+    assert.ok(activation > maintenance && fullSmoke > activation)
+    assert.ok(seed > fullSmoke && maintenanceEnd > seed)
+    assert.match(
+      source,
+      /seed-knowledge-planet-plugin\.ts --smoke-only[\s\S]*seed-knowledge-planet-plugin\.ts --seed-only/,
+    )
+    assert.doesNotMatch(seedSource, /smoke skipped/)
+    assert.match(seedSource, /await readEvidence\(imageId\)[\s\S]*seedKnowledgePlanetPlugin/)
+    assert.match(seedSource, /workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST/)
+  })
+
   test('trusted baseline guard mirrors the runtime manifest and hardens 775/664 releases', async () => {
     const [guardSource, supervisorSource] = await Promise.all([
       readFile(baselineGuard, 'utf8'),

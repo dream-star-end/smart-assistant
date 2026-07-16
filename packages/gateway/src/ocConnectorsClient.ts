@@ -21,6 +21,7 @@ export const CONNECTOR_NO_MASTER_BASE = 'CONNECTOR_NO_MASTER_BASE'
 export const CONNECTOR_NO_CONTAINER_TOKEN = 'CONNECTOR_NO_CONTAINER_TOKEN'
 
 export type ConnectorOp = 'list' | 'call' | 'catalog'
+export type ConnectorRpcSurface = 'connectors' | 'plugins'
 
 /** 传输层错误:message 只承载稳定码 + 可安全展示的非敏感细节(如 HTTP 状态数)。 */
 export class ConnectorError extends Error {
@@ -38,6 +39,8 @@ export interface ConnectorCallOptions {
   fetchImpl?: typeof fetch
   /** 请求总超时(含 body 读取)。默认 75s——略高于后端 60s 总时限,让后端自身错误优先返回。 */
   timeoutMs?: number
+  /** Historical default is connectors; oc-plugin selects the canonical plugins alias. */
+  surface?: ConnectorRpcSurface
 }
 
 /** 读容器身份 bearer;缺失 → ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)。 */
@@ -76,7 +79,7 @@ export async function callConnectors(
   const doFetch = opts.fetchImpl ?? fetch
   const base = resolveMasterBase(env)
   const token = readContainerToken(env)
-  const url = `${base}/v3/connectors/${op}`
+  const url = `${base}/v3/${opts.surface ?? 'connectors'}/${op}`
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? 75_000)
   try {

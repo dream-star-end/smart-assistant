@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { compileSpec } from '../connectors/spec/compiler.js'
+import { compilePluginBlueprint } from '../marketplace/pluginBlueprint.js'
 
 const SCRIPT = resolve('packages/commercial/agent-sandbox/platform-runtime/bin/oc-market.sh')
 
@@ -86,12 +87,13 @@ test('oc-market publish-connector --examples 提供容器内可编译的三种�
   }
 })
 
-test('oc-market plugin examples 提供完整单文件草稿、合法分类和可编译声明', async () => {
+test('oc-market plugin examples 优先提供紧凑 blueprint，并保留三种高级完整草稿', async () => {
   const r = await run(['plugin', 'examples'])
   assert.equal(r.code, 0, r.stderr)
   const output = JSON.parse(r.stdout) as {
     categoryIds: string[]
-    examples: Record<
+    recommendedBlueprint: Record<string, unknown>
+    advancedRawDrafts: Record<
       string,
       {
         kind: string
@@ -101,18 +103,25 @@ test('oc-market plugin examples 提供完整单文件草稿、合法分类和可
     >
   }
   assert.ok(output.categoryIds.includes('daily-tools'))
-  assert.deepEqual(Object.keys(output.examples).sort(), [
+  const compact = compilePluginBlueprint(output.recommendedBlueprint)
+  assert.doesNotThrow(() =>
+    compileSpec(
+      compact.spec as Record<string, unknown>,
+      compact.securityDecision as Record<string, unknown>,
+    ),
+  )
+  assert.deepEqual(Object.keys(output.advancedRawDrafts).sort(), [
     'oauth2-auth-code-byoa',
     'static-token',
     'token-exchange',
   ])
-  for (const [name, example] of Object.entries(output.examples)) {
+  for (const [name, example] of Object.entries(output.advancedRawDrafts)) {
     assert.equal(example.kind, 'plugin')
     assert.doesNotThrow(() => compileSpec(example.spec, example.securityDecision), name)
   }
 })
 
-test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑定确认', async () => {
+test('oc-market plugin prepare/publish 使用单文件、loopback 与服务端 hash 双重绑定确认', async () => {
   const validationHash = 'a'.repeat(64)
   const received: Array<{ url: string; body: Record<string, unknown> }> = []
   const server = createServer((req, res) => {
@@ -124,7 +133,7 @@ test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑�
         body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
       })
       res.setHeader('content-type', 'application/json')
-      if (req.url?.endsWith('/validate-plugin')) {
+      if (req.url?.endsWith('/prepare-plugin')) {
         res.end(
           JSON.stringify({
             ok: true,
@@ -144,7 +153,7 @@ test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑�
   const f = await fixture(address.port)
   const env = { OPENCLAUDE_HOME: f.home, HTTP_PROXY: 'http://127.0.0.1:1' }
   try {
-    let r = await run(['plugin', 'validate', '--file', f.draft], env)
+    let r = await run(['plugin', 'prepare', '--file', f.draft], env)
     assert.equal(r.code, 0, r.stderr)
     const validated = JSON.parse(r.stdout) as {
       validationHash: string
@@ -152,7 +161,7 @@ test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑�
     }
     assert.equal(validated.validationHash, validationHash)
     assert.match(validated.publishCommand, new RegExp(`--confirm ${validationHash}$`))
-    assert.equal(received[0]?.url, '/internal/v3/marketplace/agent-local/validate-plugin')
+    assert.equal(received[0]?.url, '/internal/v3/marketplace/agent-local/prepare-plugin')
     assert.deepEqual(received[0]?.body, {
       kind: 'connector',
       version: '1.2.3',
@@ -168,19 +177,82 @@ test('oc-market plugin validate/publish 使用单文件、loopback 与 hash 绑�
     r = await run(['plugin', 'publish', '--file', f.draft, '--confirm', 'b'.repeat(64)], env)
     assert.equal(r.code, 1)
     assert.match(r.stderr, /hash is stale/)
-    assert.deepEqual(received.map((x) => x.url), [
-      '/internal/v3/marketplace/agent-local/validate-plugin',
-    ])
+    assert.deepEqual(
+      received.map((x) => x.url),
+      ['/internal/v3/marketplace/agent-local/prepare-plugin'],
+    )
 
     received.length = 0
     r = await run(['plugin', 'publish', '--file', f.draft, '--confirm', validationHash], env)
     assert.equal(r.code, 0, r.stderr)
     assert.match(r.stdout, /"versionId": "v-plugin"/)
-    assert.deepEqual(received.map((x) => x.url), [
-      '/internal/v3/marketplace/agent-local/validate-plugin',
-      '/internal/v3/marketplace/agent-local/publish',
-    ])
-    assert.deepEqual(received[0]?.body, received[1]?.body)
+    assert.deepEqual(
+      received.map((x) => x.url),
+      [
+        '/internal/v3/marketplace/agent-local/prepare-plugin',
+        '/internal/v3/marketplace/agent-local/publish-plugin',
+      ],
+    )
+    assert.deepEqual(received[1]?.body, {
+      draft: received[0]?.body,
+      confirmationHash: validationHash,
+    })
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+  }
+})
+
+test('oc-market plugin 紧凑 blueprint 原样交给服务端权威编译，不在薄 CLI 复制 schema', async () => {
+  const validationHash = 'c'.repeat(64)
+  const received: Array<{ url: string; body: Record<string, unknown> }> = []
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      received.push({
+        url: req.url ?? '',
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      })
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ok: true, validationHash, permissionSummary: {} }))
+    })
+  })
+  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  const f = await fixture(address.port)
+  const compactPath = join(f.draft, '..', 'blueprint.json')
+  const compact = {
+    format: 'plugin-blueprint-v1',
+    slug: 'thin-cli',
+    name: 'Thin CLI',
+    description: 'server compiled',
+    category: 'daily-tools',
+    useCases: ['读取账号'],
+    apiOrigin: 'https://api.example.com',
+    auth: { mode: 'static-token' },
+    identity: { actionId: 'whoami', accountKeyPointer: '/id' },
+    actions: [
+      {
+        id: 'whoami',
+        description: '读取账号',
+        method: 'GET',
+        path: '/v1/me',
+        params: { type: 'object', properties: {}, additionalProperties: false },
+        result: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          additionalProperties: false,
+        },
+      },
+    ],
+  }
+  await writeFile(compactPath, JSON.stringify(compact))
+  try {
+    const r = await run(['plugin', 'prepare', '--file', compactPath], { OPENCLAUDE_HOME: f.home })
+    assert.equal(r.code, 0, r.stderr)
+    assert.equal(received[0]?.url, '/internal/v3/marketplace/agent-local/prepare-plugin')
+    assert.deepEqual(received[0]?.body, compact)
   } finally {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
   }

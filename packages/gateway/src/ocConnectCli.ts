@@ -50,8 +50,45 @@ export interface OcConnectDeps {
   env?: NodeJS.ProcessEnv
 }
 
-const EMPTY_LIST_TEXT = '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。'
-const EMPTY_CATALOG_TEXT = '暂无可用的应用连接器。'
+interface CliSurface {
+  program: 'oc-connect' | 'oc-plugin'
+  rpcSurface: 'connectors' | 'plugins'
+  listKey: 'connections' | 'plugins'
+  catalogKey: 'connectors' | 'plugins'
+  emptyListText: string
+  emptyCatalogText: string
+  listTitle: string
+  catalogTitle: string
+  catalogBindHint: string
+  missingAccountHint: string
+}
+
+const CONNECTOR_SURFACE: CliSurface = {
+  program: 'oc-connect',
+  rpcSurface: 'connectors',
+  listKey: 'connections',
+  catalogKey: 'connectors',
+  emptyListText: '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。',
+  emptyCatalogText: '暂无可用的应用连接器。',
+  listTitle: '已绑定的应用连接:',
+  catalogTitle: '可绑定的应用连接器:',
+  catalogBindHint:
+    '（绑定需用户在 设置 → 应用连接器 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
+  missingAccountHint: '请告知用户前往 设置 → 应用连接器 绑定后重试。',
+}
+
+const PLUGIN_SURFACE: CliSurface = {
+  program: 'oc-plugin',
+  rpcSurface: 'plugins',
+  listKey: 'plugins',
+  catalogKey: 'plugins',
+  emptyListText: '当前没有可调用的插件。请先在 AI 市场安装，并在需要时完成账户授权。',
+  emptyCatalogText: '暂无已安装且可用的插件。',
+  listTitle: '可调用的插件:',
+  catalogTitle: '已安装且可用的插件:',
+  catalogBindHint: '（插件凭据与浏览器状态始终留在平台受控环境；Agent 不会获得明文。）',
+  missingAccountHint: '请先安装插件，并在需要时由用户完成账户授权。',
+}
 /** 绑定凭据字段名(source)→ 面向用户的中文提示(catalog 展示"用户需提供什么")。 */
 const BIND_SOURCE_HINT: Record<string, string> = {
   access_token: '访问令牌 / API Token',
@@ -63,19 +100,32 @@ const BIND_SOURCE_HINT: Record<string, string> = {
 // 仅 call 子命令带取值 flag;无布尔 flag(--help 单列处理)。
 const VALUE_FLAGS = new Set(['account', 'confirm', 'out'])
 
-const USAGE = [
-  'Usage: oc-connect <command> [options]',
-  '',
-  'Commands:',
-  '  list                                    列出已绑定的应用连接与可用操作',
-  '  catalog [query]                         列出可绑定的应用连接器(可选关键词搜索)',
-  '  call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)',
-  '',
-  'Options (call):',
-  '  --account <connectionId>   指定连接(同一 provider 有多个连接时必填)',
-  '  --confirm <id>             执行已被用户确认的写操作(凭确认卡返回的 id)',
-  '  --out <file>               结果含文件时,解码 base64 落盘到 <file>(只打印路径与大小)',
-].join('\n')
+function usage(surface: CliSurface): string {
+  const plugin = surface.rpcSurface === 'plugins'
+  return [
+    `Usage: ${surface.program} <command> [options]`,
+    '',
+    'Commands:',
+    plugin
+      ? '  list                                    列出当前可调用的 Plugin 目标与操作'
+      : '  list                                    列出已绑定的应用连接与可用操作',
+    plugin
+      ? '  catalog [query]                         列出已安装的可用 Plugin(可选关键词搜索)'
+      : '  catalog [query]                         列出可绑定的应用连接器(可选关键词搜索)',
+    plugin
+      ? '  call <plugin> <action> [options]        调用 Plugin 操作(params 从 stdin 读 JSON)'
+      : '  call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)',
+    '',
+    'Options (call):',
+    plugin
+      ? '  --account <targetId>       指定目标(同一 Plugin 有多个账户时必填)'
+      : '  --account <connectionId>   指定连接(同一 provider 有多个连接时必填)',
+    plugin
+      ? '  --confirm <id>             执行已被用户确认的 declarative-http 写操作'
+      : '  --confirm <id>             执行已被用户确认的写操作(凭确认卡返回的 id)',
+    '  --out <file>               结果含文件时,解码 base64 落盘到 <file>(只打印路径与大小)',
+  ].join('\n')
+}
 
 type ParsedFlags =
   | { ok: true; flags: Record<string, string>; positional: string[] }
@@ -114,8 +164,8 @@ function ok(stdout: string): OcConnectResult {
   return { exitCode: 0, stdout, stderr: '' }
 }
 
-function usageError(message: string): OcConnectResult {
-  return { exitCode: 2, stdout: '', stderr: `oc-connect: ${message}\n` }
+function usageError(message: string, surface: CliSurface): OcConnectResult {
+  return { exitCode: 2, stdout: '', stderr: `${surface.program}: ${message}\n` }
 }
 
 /** 外部内容(来自第三方,不可信)打印包裹。辅助标记,非安全边界。 */
@@ -181,9 +231,9 @@ function findBase64File(result: unknown): FoundFile | null {
   return null
 }
 
-function formatConnections(connections: any[]): string {
-  if (!connections.length) return EMPTY_LIST_TEXT
-  const lines: string[] = ['已绑定的应用连接:', '']
+function formatConnections(connections: any[], surface: CliSurface): string {
+  if (!connections.length) return surface.emptyListText
+  const lines: string[] = [surface.listTitle, '']
   for (const c of connections) {
     const name = strOrUndef(c?.displayName)?.trim() || '(未命名)'
     const hint = c?.accountHint ? ` (${c.accountHint})` : ''
@@ -209,15 +259,17 @@ function formatConnections(connections: any[]): string {
  * catalog 输出:可**绑定**的连接器目录(≠已绑 list)。供 AI 感知"有哪些应用可用"并**引导用户
  * 去绑定**——凭据永不进容器,agent 不能代绑,只能告知用户去 设置 → 应用连接器 填凭据。
  */
-function formatCatalog(connectors: any[], query?: string): string {
+function formatCatalog(connectors: any[], surface: CliSurface, query?: string): string {
   if (!connectors.length) {
     return query
-      ? `未找到匹配「${query}」的应用连接器。可不带关键词再列全部。`
-      : EMPTY_CATALOG_TEXT
+      ? `未找到匹配「${query}」的${surface.rpcSurface === 'plugins' ? '插件' : '应用连接器'}。可不带关键词再列全部。`
+      : surface.emptyCatalogText
   }
   const lines: string[] = [
-    query ? `匹配「${query}」的应用连接器:` : '可绑定的应用连接器:',
-    '（绑定需用户在 设置 → 应用连接器 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
+    query
+      ? `匹配「${query}」的${surface.rpcSurface === 'plugins' ? '插件' : '应用连接器'}:`
+      : surface.catalogTitle,
+    surface.catalogBindHint,
     '',
   ]
   for (const c of connectors) {
@@ -243,6 +295,7 @@ interface CallCtx {
   transport: (op: ConnectorOp, body: unknown) => Promise<any>
   readStdin: () => Promise<string>
   writeOut: (path: string, data: Buffer) => void
+  surface: CliSurface
 }
 
 async function cmdCall(
@@ -251,8 +304,9 @@ async function cmdCall(
   ctx: CallCtx,
 ): Promise<OcConnectResult> {
   const [provider, action, ...extra] = positional
-  if (!provider || !action) return usageError('call requires <provider> <action>')
-  if (extra.length) return usageError('call takes exactly <provider> <action> positionals')
+  if (!provider || !action) return usageError('call requires <provider> <action>', ctx.surface)
+  if (extra.length)
+    return usageError('call takes exactly <provider> <action> positionals', ctx.surface)
 
   const confirmId = flags.confirm ? String(flags.confirm) : undefined
 
@@ -262,13 +316,18 @@ async function cmdCall(
     connectionId = String(flags.account)
   } else {
     const listResp = await ctx.transport('list', {})
-    const connections: any[] = Array.isArray(listResp?.connections) ? listResp.connections : []
+    const rawList = listResp?.[ctx.surface.listKey]
+    const connections: any[] = Array.isArray(rawList) ? rawList : []
     const matches = connections.filter((c) => c && c.provider === provider)
     if (matches.length === 0) {
+      const message =
+        ctx.surface.rpcSurface === 'connectors'
+          ? `oc-connect: 未找到 provider=${provider} 的已绑定连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n`
+          : `oc-plugin: 未找到 provider=${provider} 的可用目标。${ctx.surface.missingAccountHint}\n`
       return {
         exitCode: 1,
         stdout: '',
-        stderr: `oc-connect: 未找到 provider=${provider} 的已绑定连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n`,
+        stderr: message,
       }
     }
     if (matches.length > 1) {
@@ -278,10 +337,14 @@ async function cmdCall(
             `  --account ${c.id}  ${strOrUndef(c.displayName) || '(未命名)'}${c.accountHint ? ` (${c.accountHint})` : ''}`,
         )
         .join('\n')
+      const message =
+        ctx.surface.rpcSurface === 'connectors'
+          ? `oc-connect: provider=${provider} 有多个已绑定连接，请用 --account <connectionId> 指定其一:\n${cand}\n`
+          : `oc-plugin: provider=${provider} 有多个可用目标，请用 --account <connectionId> 指定其一:\n${cand}\n`
       return {
         exitCode: 2,
         stdout: '',
-        stderr: `oc-connect: provider=${provider} 有多个已绑定连接，请用 --account <connectionId> 指定其一:\n${cand}\n`,
+        stderr: message,
       }
     }
     connectionId = matches[0].id
@@ -298,17 +361,17 @@ async function cmdCall(
       try {
         params = JSON.parse(raw)
       } catch {
-        return usageError('stdin 不是合法 JSON(params 必须是 JSON 对象)')
+        return usageError('stdin 不是合法 JSON(params 必须是 JSON 对象)', ctx.surface)
       }
       if (params === null || typeof params !== 'object' || Array.isArray(params)) {
-        return usageError('params 必须是 JSON 对象')
+        return usageError('params 必须是 JSON 对象', ctx.surface)
       }
     }
     callBody.params = params
   }
 
   const resp = await ctx.transport('call', callBody)
-  return formatCallResponse(resp, provider, flags, ctx.writeOut)
+  return formatCallResponse(resp, provider, flags, ctx.writeOut, ctx.surface)
 }
 
 function formatCallResponse(
@@ -316,6 +379,7 @@ function formatCallResponse(
   provider: string,
   flags: Record<string, string>,
   writeOut: (path: string, data: Buffer) => void,
+  surface: CliSurface,
 ): OcConnectResult {
   switch (resp?.kind) {
     case 'result': {
@@ -332,15 +396,14 @@ function formatCallResponse(
         return {
           exitCode: 0,
           stdout: `${wrapExternal(provider, JSON.stringify(result, null, 2))}\n`,
-          stderr: 'oc-connect: --out 指定但结果中无文件字段，已按 JSON 输出。\n',
+          stderr: `${surface.program}: --out 指定但结果中无文件字段，已按 JSON 输出。\n`,
         }
       }
       return ok(`${wrapExternal(provider, JSON.stringify(result, null, 2))}\n`)
     }
     case 'confirmation_required': {
       const line1 = JSON.stringify(confirmationObject(resp))
-      const line2 =
-        '已生成写操作确认请求，请等待用户在界面上确认后，使用 --confirm <id> 重新调用。'
+      const line2 = '已生成写操作确认请求，请等待用户在界面上确认后，使用 --confirm <id> 重新调用。'
       return ok(`${line1}\n${line2}\n`)
     }
     case 'in_progress': {
@@ -355,14 +418,22 @@ function formatCallResponse(
       if (resp.errorCode) parts.push(`错误码=${String(resp.errorCode)}`)
       if (resp.resultDigest) parts.push(`结果摘要=${String(resp.resultDigest)}`)
       // 不承诺原结果;仅 succeeded 视为成功退出。
-      return { exitCode: status === 'succeeded' ? 0 : 1, stdout: `${parts.join('，')}\n`, stderr: '' }
+      return {
+        exitCode: status === 'succeeded' ? 0 : 1,
+        stdout: `${parts.join('，')}\n`,
+        stderr: '',
+      }
     }
     case 'error': {
       const code = strOrUndef(resp.code) || 'CONNECTOR_ERROR'
-      return { exitCode: 1, stdout: '', stderr: `oc-connect: ${code}\n` }
+      return { exitCode: 1, stdout: '', stderr: `${surface.program}: ${code}\n` }
     }
     default:
-      return { exitCode: 1, stdout: '', stderr: 'oc-connect: CONNECTOR_UNEXPECTED_RESPONSE\n' }
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `${surface.program}: CONNECTOR_UNEXPECTED_RESPONSE\n`,
+      }
   }
 }
 
@@ -373,7 +444,7 @@ function redactSecrets(text: string, env: NodeJS.ProcessEnv): string {
   return text
 }
 
-function errorResult(err: unknown, env: NodeJS.ProcessEnv): OcConnectResult {
+function errorResult(err: unknown, env: NodeJS.ProcessEnv, surface: CliSurface): OcConnectResult {
   let msg: string
   if (err instanceof ConnectorError) {
     if (err.code === CONNECTOR_RPC_TIMEOUT || err.code === CONNECTOR_RPC_NETWORK) {
@@ -387,46 +458,68 @@ function errorResult(err: unknown, env: NodeJS.ProcessEnv): OcConnectResult {
   } else {
     msg = `CONNECTOR_UNEXPECTED: ${err instanceof Error ? err.message : String(err)}`
   }
-  return { exitCode: 1, stdout: '', stderr: `oc-connect: ${redactSecrets(msg, env)}\n` }
+  return { exitCode: 1, stdout: '', stderr: `${surface.program}: ${redactSecrets(msg, env)}\n` }
 }
 
-export async function runOcConnectCli(argv: string[], deps: OcConnectDeps = {}): Promise<OcConnectResult> {
+async function runOcCapabilityCli(
+  argv: string[],
+  deps: OcConnectDeps,
+  surface: CliSurface,
+): Promise<OcConnectResult> {
   const env = deps.env ?? process.env
-  const transport = deps.transport ?? ((op, body) => callConnectors(op, body, { env }))
+  const transport =
+    deps.transport ?? ((op, body) => callConnectors(op, body, { env, surface: surface.rpcSurface }))
   const readStdin = deps.readStdin ?? readStdinReal
   const writeOut = deps.writeOut ?? ((p, d) => writeFileSync(p, d))
 
   const [command, ...rest] = argv
-  if (!command) return { exitCode: 2, stdout: '', stderr: `${USAGE}\n` }
+  const help = usage(surface)
+  if (!command) return { exitCode: 2, stdout: '', stderr: `${help}\n` }
   if (command === 'help' || command === '--help' || command === '-h') {
-    return { exitCode: 0, stdout: `${USAGE}\n`, stderr: '' }
+    return { exitCode: 0, stdout: `${help}\n`, stderr: '' }
   }
 
   const parsed = parseFlags(rest)
-  if (!parsed.ok) return usageError(parsed.error)
+  if (!parsed.ok) return usageError(parsed.error, surface)
   const { flags, positional } = parsed
 
   try {
     if (command === 'list') {
-      if (positional.length) return usageError('list takes no arguments')
+      if (positional.length) return usageError('list takes no arguments', surface)
       const resp = await transport('list', {})
-      const connections: any[] = Array.isArray(resp?.connections) ? resp.connections : []
-      return ok(`${formatConnections(connections)}\n`)
+      const rawList = resp?.[surface.listKey]
+      const connections: any[] = Array.isArray(rawList) ? rawList : []
+      return ok(`${formatConnections(connections, surface)}\n`)
     }
     if (command === 'catalog') {
-      if (positional.length > 1) return usageError('catalog takes at most one <query>')
+      if (positional.length > 1) return usageError('catalog takes at most one <query>', surface)
       const query = positional[0]?.trim() || undefined
       const resp = await transport('catalog', query ? { query } : {})
-      const connectors: any[] = Array.isArray(resp?.connectors) ? resp.connectors : []
-      return ok(`${formatCatalog(connectors, query)}\n`)
+      const rawCatalog = resp?.[surface.catalogKey]
+      const connectors: any[] = Array.isArray(rawCatalog) ? rawCatalog : []
+      return ok(`${formatCatalog(connectors, surface, query)}\n`)
     }
     if (command === 'call') {
-      return await cmdCall(positional, flags, { transport, readStdin, writeOut })
+      return await cmdCall(positional, flags, { transport, readStdin, writeOut, surface })
     }
-    return usageError(`unknown command '${command}'\n${USAGE}`)
+    return usageError(`unknown command '${command}'\n${help}`, surface)
   } catch (err) {
-    return errorResult(err, env)
+    return errorResult(err, env, surface)
   }
+}
+
+export async function runOcConnectCli(
+  argv: string[],
+  deps: OcConnectDeps = {},
+): Promise<OcConnectResult> {
+  return runOcCapabilityCli(argv, deps, CONNECTOR_SURFACE)
+}
+
+export async function runOcPluginCli(
+  argv: string[],
+  deps: OcConnectDeps = {},
+): Promise<OcConnectResult> {
+  return runOcCapabilityCli(argv, deps, PLUGIN_SURFACE)
 }
 
 async function readStdinReal(): Promise<string> {

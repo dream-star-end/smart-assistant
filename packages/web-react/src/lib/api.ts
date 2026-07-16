@@ -97,9 +97,11 @@ import type {
   DeclarativeConnectionsResponse,
   DeclarativeManagementResponse,
   DeclarativeOauthStartResult,
-} from "./connectors";
-import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
-import { reportClientFriction } from "./clientFriction";
+  KnowledgePlanetSetupView,
+  PluginManagementResponse,
+} from './connectors'
+import { normalizeOrgPlan, normalizeOrgSubscription } from './orgBilling'
+import { reportClientFriction } from './clientFriction'
 
 /**
  * v5 商业版前端网络层。
@@ -2957,6 +2959,79 @@ export const api = {
         fetch(`/api/connectors/declarative/connections/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── 通用 Plugin 运行时（账号授权与隔离执行）────────────────────────────
+
+  getPluginManagement: (a: AuthSession): Promise<PluginManagementResponse> =>
+    jsonOrThrow<PluginManagementResponse>(
+      callWithRefresh(a, (t) =>
+        fetch('/api/plugins/management', {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  startKnowledgePlanetSetup: (a: AuthSession): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch('/api/plugins/knowledge-planet/setup', {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ acceptTerms: true }),
+        }),
+      ),
+    ),
+
+  getKnowledgePlanetSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  async getKnowledgePlanetSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}/qr`, {
+        credentials: 'include',
+        headers: { ...bearerHeaders(t), Accept: 'image/png' },
+      }),
+    )
+    assertAuthResponseCurrent(res)
+    if (!res.ok) await throwApi(res)
+    const blob = await res.blob()
+    assertAuthResponseCurrent(res)
+    return blob
+  },
+
+  cancelKnowledgePlanetSetup: (
+    a: AuthSession,
+    sessionId: string,
+  ): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}`, {
+          method: 'DELETE',
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  revokePluginAccount: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          credentials: 'include',
           headers: bearerHeaders(t),
         }),
       ),
