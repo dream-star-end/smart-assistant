@@ -1454,8 +1454,10 @@ export interface ListingDetail {
   users30d: number
   /** 评分归因(样本 <RATING_MIN_SAMPLE → null)。 */
   rating: { up: number; down: number } | null
-  /** connector-only：官方身份与已签执行契约的人向投影。 */
+  /** connector-only：官方身份比预装更宽；官方 Plugin 仍可能需要用户安装。 */
   official?: boolean
+  /** connector-only：精确命中平台默认工件，无需也不允许走市场安装。 */
+  preinstalled?: boolean
   connectorContract?: {
     authMode: string
     approvedOrigins: string[]
@@ -1577,6 +1579,7 @@ export async function getListingDetail(
       throw error
     }
   }
+  const preinstalled = x.kind === 'connector' && isDefaultConnectorArtifact(x.slug, x.artifact_hash)
   return {
     slug: x.slug,
     kind: x.kind as ArtifactKind,
@@ -1615,7 +1618,7 @@ export async function getListingDetail(
     ...(x.kind === 'connector'
       ? {
           official:
-            isDefaultConnectorArtifact(x.slug, x.artifact_hash) ||
+            preinstalled ||
             isOfficialKnowledgePlanetPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
@@ -1623,6 +1626,7 @@ export async function getListingDetail(
               execContractHash: verifiedRuntimeExecContractHash,
               reviewSource: x.review_source,
             }),
+          preinstalled,
           connectorContract,
         }
       : {}),

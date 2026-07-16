@@ -12,7 +12,9 @@ import {
   installApprovedVersion,
   listApprovedForSearch,
   publishSkillVersion,
+  recordUninstall,
 } from '../marketplace/marketplaceDb.js'
+import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
 import {
   findApprovedKnowledgePlanetPlugin,
   seedKnowledgePlanetPlugin,
@@ -668,10 +670,18 @@ describe('marketplace Plugin kernel migration', () => {
       assert.equal(trusted?.versionId, seeded.versionId)
       const detail = await getListingDetail(KNOWLEDGE_PLANET_PLUGIN_SLUG)
       assert.equal(detail?.official, true)
+      assert.equal(detail?.preinstalled, false)
       const searchRow = (await listApprovedForSearch('connector')).find(
         (row) => row.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG,
       )
       assert.equal(searchRow?.official, true)
+      assert.equal(
+        (await listMarketBrowseCatalog('connector')).some(
+          (row) => row.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG,
+        ),
+        true,
+        '官方但非预装的知识星球必须保留在市场供恢复安装',
+      )
 
       const installs = await query<{
         slug: string
@@ -724,6 +734,39 @@ describe('marketplace Plugin kernel migration', () => {
       assert.equal(repeated.ownerUserId, Number(admin.rows[0]!.id))
       assert.equal(repeated.migratedUsers, 0)
       assert.equal(repeated.skippedExistingUsers, 1)
+
+      assert.equal(
+        await recordUninstall(Number(user.rows[0]!.id), KNOWLEDGE_PLANET_PLUGIN_SLUG),
+        true,
+      )
+      const afterUninstallSeed = await seedKnowledgePlanetPlugin({
+        functionalVerified: true,
+        env: process.env,
+      })
+      assert.equal(afterUninstallSeed.migratedUsers, 0)
+      assert.equal(afterUninstallSeed.skippedExistingUsers, 1)
+      const afterUninstall = await query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM marketplace_installs
+          WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+        [user.rows[0]!.id, KNOWLEDGE_PLANET_PLUGIN_SLUG],
+      )
+      assert.equal(
+        afterUninstall.rows[0]!.count,
+        '0',
+        '重复部署 seed 不得覆盖用户的 soft-uninstall 意图',
+      )
+      await installApprovedVersion({
+        userId: Number(user.rows[0]!.id),
+        versionId: seeded.versionId,
+      })
+      const recovered = await query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM marketplace_installs
+          WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+        [user.rows[0]!.id, KNOWLEDGE_PLANET_PLUGIN_SLUG],
+      )
+      assert.equal(recovered.rows[0]!.count, '1', 'soft-uninstall 后必须可从市场恢复安装')
     } finally {
       if (previousKmsKey === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_KMS_KEY')
       else process.env.OPENCLAUDE_KMS_KEY = previousKmsKey
