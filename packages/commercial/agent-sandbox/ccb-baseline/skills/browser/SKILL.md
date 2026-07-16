@@ -2,6 +2,7 @@
 name: browser
 description: 用 `oc-browser` 命令行操作真实浏览器(有状态,跨调用共享同一会话):导航、抓 accessibility 快照拿元素 ref、按 ref 点击/输入、截图、等待。用户要打开网页、点按钮、填表单、登录、抓动态页面数据时使用。
 tags: [browser, playwright, automation, web]
+priority: 5
 ---
 
 # 浏览器操作（oc-browser CLI）

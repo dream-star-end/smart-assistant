@@ -207,7 +207,18 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.TimeoutExpired:
-        print(json.dumps({"ok": False, "error": "parser timed out"}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "parser timed out(页面可能重 JS/反爬。正文页可加大 --timeout-ms 重试;"
+                        "要做搜索请改用内置 WebSearch,不要抓搜索引擎结果页)"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
         raise SystemExit(1)
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))

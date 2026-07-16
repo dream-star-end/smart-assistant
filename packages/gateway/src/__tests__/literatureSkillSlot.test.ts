@@ -261,6 +261,39 @@ describe('buildSkillsSlot baseline overlay', () => {
     })
   })
 
+  it('orders the injected menu by frontmatter priority (desc) instead of pure alphabetical truncation', async () => {
+    const baselineRoot = mkdtempSync(join(tmpdir(), 'prompt-baseline-prio-'))
+    const writeSkill = (name: string, priority?: number) => {
+      mkdirSync(join(baselineRoot, name), { recursive: true })
+      writeFileSync(
+        join(baselineRoot, name, 'SKILL.md'),
+        [
+          '---',
+          `name: ${name}`,
+          `description: "${name} desc"`,
+          ...(priority !== undefined ? [`priority: ${priority}`] : []),
+          '---',
+          '',
+          `# ${name}`,
+        ].join('\n'),
+        'utf-8',
+      )
+    }
+    // 16 个技能:字母序最末的 zz-core 带高优先级,字母序靠前的一批不带优先级。
+    for (let i = 1; i <= 15; i++) writeSkill(`aa-filler-${String(i).padStart(2, '0')}`)
+    writeSkill('zz-core', 9)
+
+    await withEnv({ OPENCLAUDE_BASELINE_SKILLS_DIR: baselineRoot }, async () => {
+      const slot = await buildSkillsSlot({ agentId: 'prio-slot-test-agent' })
+      assert.ok(slot)
+      // 纯字母序截断会把 zz-core 挤出前 15;priority 排序必须让它上榜且排第一。
+      assert.match(slot!.content, /\*\*zz-core\*\*/)
+      const firstEntry = slot!.content.split('\n').find((l) => l.startsWith('- **'))
+      assert.match(firstEntry ?? '', /zz-core/)
+      assert.match(slot!.content, /还有 1 个/)
+    })
+  })
+
   it('falls back to user-only skills when OPENCLAUDE_BASELINE_SKILLS_DIR is invalid', async () => {
     await withEnv(
       { OPENCLAUDE_BASELINE_SKILLS_DIR: '/definitely/not/a/real/baseline' },

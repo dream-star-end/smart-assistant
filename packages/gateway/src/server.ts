@@ -6354,10 +6354,13 @@ export class Gateway {
     skillName: string,
   ): Promise<void> {
     const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    // 评测读取面对平台 baseline 技能开放(includePlatform:true):平台技能的 evals 以
+    // 源码形式随 ccb-baseline 分发,容器内本就整目录只读可 cat,这里不构成枚举泄露
+    // ("用户向列表面禁平台技能"红线针对管理面板枚举);写入(PUT)仍被 writable 门挡住。
+    const skill = await store.view(skillName, undefined, { includePlatform: true })
     if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
     if (req.method === 'GET') {
-      const raw = await store.view(skillName, 'evals/evals.json', { includePlatform: false })
+      const raw = await store.view(skillName, 'evals/evals.json', { includePlatform: true })
       let evals: SkillEvalsFile | null = null
       let parseErrors: string[] | undefined
       if (typeof raw === 'string') {
@@ -6367,7 +6370,7 @@ export class Gateway {
       }
       let lastRun: unknown = null
       const lastRaw = await store.view(skillName, 'evals/last-run.json', {
-        includePlatform: false,
+        includePlatform: true,
       })
       if (typeof lastRaw === 'string') {
         try {
@@ -6413,7 +6416,9 @@ export class Gateway {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const userId = this.getUserId(req)
     const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    // 平台 baseline 技能允许跑 baseline 评测(canary 回归脚本/用户自查都走这里);
+    // draft 模式天然被 train-run 属主校验挡住(训练本就拒平台技能)。
+    const skill = await store.view(skillName, undefined, { includePlatform: true })
     if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
 
     const body = await this.readJsonBody<{ mode?: string; trainRunId?: string }>(req).catch(
@@ -6440,7 +6445,7 @@ export class Gateway {
     // 用例来源:草稿附带 > 技能自带。没有用例 → 明确 400(而不是空跑烧积分)。
     let evalsRaw =
       draftEvalsJson ??
-      ((await store.view(skillName, 'evals/evals.json', { includePlatform: false })) as
+      ((await store.view(skillName, 'evals/evals.json', { includePlatform: true })) as
         | string
         | null)
     if (typeof evalsRaw !== 'string') evalsRaw = null

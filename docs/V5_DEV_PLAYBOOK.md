@@ -510,6 +510,14 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 - **坑:新增 npm 依赖不随 deploy 上线(07-11 实际停机 ~4 分钟)**。deploy-v5.sh rsync 排除 node_modules 且不跑 npm install;批次若加了新依赖(package.json/lock 变更),master 重启即 ERR_MODULE_NOT_FOUND 崩溃循环(实例:连接器批的 imapflow,由后续无关部署首次带上线引爆)。**纪律:合并含 package-lock 变更的批次后、restart 之前,必须 `ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && npm install --no-audit --no-fund'`**;止血=同命令补装后 restart(lockfile 已同步,秒级)。根治债:deploy-v5.sh 检测 package-lock 哈希变化自动补装(见 §5)。
 - **坑:CI commercial-unit 门曾挂死 3 天(07-07~07-10)**。根因=握手测试对"背靠背同步双帧"用逐次 once('message') 取帧,第二帧在无 listener 窗口被 EventEmitter 丢弃→await 永挂→30min 超时 cancelled。**WS 测试等多帧一律用 userChatBridge.test.ts 的 frameCollector 模式**(持久 listener+队列)。诊断法:TAP 停哪个套件之后+零改动探针 PR 定责基线。
 
+### 2026-07-16 agent 能力批:baseline 评测体系 + SKILLS 菜单排序速记
+- **baseline 技能可带评测集**:`ccb-baseline/skills/<name>/evals/evals.json`(源码维护,schema=storage/skillEvals.ts,≤5 case)。形态白名单三处同源:运行时挂载校验(v3supervisor.ts resolveCcbBaselineMounts:skill 目录恰好 {SKILL.md} 或 {SKILL.md,evals/},evals/ 内恰好 evals.json,每条走 assertBaselineLeaf lstat 闭环)+ 部署 guard(scripts/v5-baseline-security.sh)+ 测试(ccbBaselineSkills.test.ts,含 evals.json 可解析门)。**再扩 scripts/ references/ 时必须三处同改**。
+- **eval API 平台感知**:GET evals / POST eval-run 对平台技能 includePlatform:true(只读+跑),PUT 仍被 writable 403;"用户向 skill API 禁平台技能"红线只针对**管理面板枚举**(/api/skills 列表),按名评测读取不在此列。draft 评测/训练/AI 生成用例对平台技能仍 404。
+- **回归复跑**:`scripts/run-baseline-skill-evals.sh`(canary 账号)无参=仓库树枚举带 evals 的 baseline + 该账号用户技能;verdict"反而更差"或 failed → 非零退出。首批 8 技能 28 case(web-context/office-spreadsheet/office-pdf/document-writing/scientific-figures/scheduled-tasks/memory-management/skill-search)。
+- **SKILLS slot 排序**:SKILL.md frontmatter 可选 `priority`(-100..100,storage normalizeSkillPriority 钳制);注入菜单=用户技能恒先→平台按 priority 降序→字母序,cap 仍 15(根治字母序截断把 office 套件/web-context 挤出菜单)。管理面/搜索不受影响。
+- **生产失败模式修复**:oc-web 抓 SERP 反模式写入 web-context skill(SERP=反爬垃圾/超时,搜索走内置 WebSearch);oc-browser 子命令 --help 改打印用法 exit 0;web-context parser 超时报错带可操作提示(py+mcp 两侧);ccb-baseline/CLAUDE.md 不再手抄技能清单(指向 skill_list,根治腐化)。
+- **债(触发条件)**:①baseline eval 回归未接 deploy 门 —— 模型/镜像升级批次或技能大改时人工跑上面脚本;接 CI/deploy 待 eval 时长与成本实测后评估。②市场技能 evals 平台复跑(审核者一键跑)仍未实现(bundleHasEvals 仅展示)。③评分卡样本极少(累计 3 条),差评驱动训练无燃料 —— 下次 UX 批次考虑轻量引导。
+
 ### 2026-07-11 管理后台全面审计修复批速记
 - **cron 引擎错误熔断(容器侧 gateway/cron.ts)**:API 错误产出(CCB "API Error: …" 文本块)一律不作为任务结果送达;`insufficient_credits` 连续 3 次 → 持久化停用任务(cron.yaml enabled=false)+ 恰好一条暂停通知(凌驾 deliver=local);瞬时错误(429/上游)只抑制送达绝不替用户关任务。**错误识别单一权威 = errorClassify.classifyDelegateOutputError,禁再造第二套字符串匹配**。背景事故:402 × 每 5 分钟 schedule,35h 刷 424 条同文站内信(user 66)。
 - **inbox-post 同内容去重(master 侧)**:同 uid+同 (title,bodyMd) 6h 窗口只落一条(`{ok:false,reason:'duplicate'}`)。内存窗口重启清零,是信任边界兜底闸,根治在容器侧熔断;逐分钟限频拦不住"低频×长时间"重复轰炸这一类。

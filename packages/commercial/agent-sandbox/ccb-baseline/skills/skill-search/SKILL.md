@@ -4,6 +4,7 @@ description: "搜索和发现当前可用 skills 的流程: 先用 skill_search 
 version: "1.0.0"
 tags: [system, meta, learning, discovery]
 related_skills: [skill-management, memory-management]
+priority: 6
 ---
 
 # Skill 搜索与发现指南

@@ -102,6 +102,11 @@ export function parseOcBrowserCommand(argv: string[]): ParsedCommand {
   const spec = SUBCOMMANDS[command]
   if (!spec)
     return { ok: false, exitCode: 2, message: `oc-browser: unknown command '${command}'\n` }
+  // `oc-browser <cmd> --help` 是 agent 高频探索动作(生产遥测实证):按惯例打印
+  // 总用法并以 0 退出,而不是 "unknown flag" 报错浪费一轮工具调用。
+  if (rest.includes('--help') || rest.includes('-h')) {
+    return { ok: false, exitCode: 0, message: `${USAGE}\n` }
+  }
 
   const known = spec.flags
   const args: Record<string, unknown> = {}

@@ -2,6 +2,7 @@
 name: scientific-figures
 description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
 tags: [research, figures, matplotlib, scienceplots, seaborn, networkx, typst, cetz, figcheck]
+priority: 5
 ---
 
 # scientific-figures 科研图表规范(闭环出图)

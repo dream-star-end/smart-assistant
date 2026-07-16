@@ -23,9 +23,20 @@ auth=(-H "Authorization: Bearer $TOK")
 
 skills=("$@")
 if [ ${#skills[@]} -eq 0 ]; then
-  mapfile -t skills < <(curl -sf "${auth[@]}" "$V5_BASE/api/skills" |
+  # 默认清单 = 平台 baseline 里带 evals 的技能(从仓库树枚举 —— /api/skills 是
+  # 用户管理面,有意不枚举平台技能) + 该账号自建的用户技能。
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  BASELINE_SKILLS_DIR="$SCRIPT_DIR/../packages/commercial/agent-sandbox/ccb-baseline/skills"
+  if [ -d "$BASELINE_SKILLS_DIR" ]; then
+    while IFS= read -r f; do
+      skills+=("$(basename "$(dirname "$(dirname "$f")")")")
+    done < <(find "$BASELINE_SKILLS_DIR" -mindepth 3 -maxdepth 3 -name evals.json -path '*/evals/*' | sort)
+  fi
+  mapfile -t user_skills < <(curl -sf "${auth[@]}" "$V5_BASE/api/skills" |
     python3 -c 'import sys,json;[print(s["name"]) for s in json.load(sys.stdin).get("skills",[])]')
+  skills+=("${user_skills[@]}")
 fi
+[ ${#skills[@]} -gt 0 ] || { echo "no skills to evaluate"; exit 0; }
 
 fail=0
 for name in "${skills[@]}"; do

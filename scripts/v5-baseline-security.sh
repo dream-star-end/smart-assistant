@@ -91,11 +91,23 @@ assert_structure() { # <baseline-dir>
   skills_actual="$(find -P "$root/skills" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
   assert_exact_lines "skill manifest" "$skills_expected" "$skills_actual"
 
+  # 与 runtime resolveCcbBaselineMounts() 同一白名单(2026-07-16 扩展):
+  # skill 目录允许恰好 {SKILL.md} 或 {SKILL.md, evals/};evals/ 内恰好一个 evals.json。
   for skill in "${EXPECTED_SKILLS[@]}"; do
     [[ -d "$root/skills/$skill" ]] || die "missing skill directory: $skill"
     entries="$(find -P "$root/skills/$skill" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
-    [[ "$entries" == "SKILL.md" && -f "$root/skills/$skill/SKILL.md" ]] \
-      || die "skill $skill must contain exactly one regular SKILL.md"
+    if [[ "$entries" == "SKILL.md" ]]; then
+      [[ -f "$root/skills/$skill/SKILL.md" ]] \
+        || die "skill $skill must contain a regular SKILL.md"
+    elif [[ "$entries" == "$(printf 'SKILL.md\nevals')" ]]; then
+      [[ -f "$root/skills/$skill/SKILL.md" && -d "$root/skills/$skill/evals" ]] \
+        || die "skill $skill entries must be regular SKILL.md + evals dir"
+      eval_entries="$(find -P "$root/skills/$skill/evals" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
+      [[ "$eval_entries" == "evals.json" && -f "$root/skills/$skill/evals/evals.json" ]] \
+        || die "skill $skill/evals must contain exactly one regular evals.json"
+    else
+      die "skill $skill must contain exactly SKILL.md (optionally plus evals/), got: $entries"
+    fi
   done
 }
 

@@ -1,7 +1,7 @@
 ---
 name: skill-authoring
 description: "写好一个 skill 的平台规范: 目录结构(references/scripts/assets/evals)、SKILL.md 写法、评测用例(evals.json)格式与评测驱动迭代方法。创建/更新/训练 skill 前先读本文。"
-version: "1.1.0"
+version: "1.2.0"
 tags: [system, skill, authoring, evals]
 ---
 
@@ -22,6 +22,7 @@ skill-name/
 ## SKILL.md 写法
 
 - frontmatter `description` 是**触发的唯一依据**:第三人称,同时写"做什么 + 何时用",含触发关键词。
+- frontmatter 可选 `priority: N`(-100~100,缺省 0):只影响系统提示 SKILLS 菜单的排序(越大越靠前),不影响搜索与面板;用户自建技能永远排在平台技能之前,一般无需设置。
 - 正文 <500 行,定位是导航页:触发条件、前提、checklist 式步骤、决策分支、常见坑、验证方式。
 - 细节外链到 references/(引用只允许一层深);> 100 行的 reference 文件顶部加目录。
 - 指令里区分 "Run scripts/x.py"(执行)与 "See references/y.md"(阅读)。
@@ -47,6 +48,8 @@ skill-name/
 ```
 
 - 2-3 个用例起步(措辞多样化 + 至少一个边界 case),每用例 3-5 条**可判定**断言;上限 5 用例。
+- 评分员**只看模型的最终回复文本**判断断言:prompt 里要求模型给出所用命令/参数/结果摘要,让证据出现在文本里;断言避免依赖"看不见的文件内容"。
+- 平台 baseline 技能的 evals 以源码形式随平台分发(容器内只读),由平台在发版前用回归脚本统一复跑;用户技能的 evals 在管理中心技能面板编辑与运行。
 - 断言在看到第一轮真实输出后再补齐;恒过的断言删掉(模型本来就会),恒败的断言先怀疑断言本身。
 - 平台评测跑法:with/without 双跑(有/无本技能),断言通过率 delta = 技能买到了什么;
   训练草稿自动跑 draft vs 现版(评测门),更差的草稿不要合并。

@@ -16,9 +16,14 @@ import { before, describe, it } from 'node:test'
 const testHome = await mkdtemp(join(tmpdir(), 'oc-skillstore-'))
 process.env.OPENCLAUDE_HOME = testHome
 
-const { SkillStore, searchSkillMetadata, buildAgentSkillStore, buildUserSkillStore } = await import(
-  '../skillStore.js'
-)
+const {
+  SkillStore,
+  searchSkillMetadata,
+  buildAgentSkillStore,
+  buildUserSkillStore,
+  normalizeSkillPriority,
+  parseFrontmatter,
+} = await import('../skillStore.js')
 const { paths } = await import('../paths.js')
 
 const AGENT = 'test-agent'
@@ -592,5 +597,37 @@ describe('buildAgentSkillStore — agent-scoped visibility (shared/hub ownership
       !existsSync(join(paths.agentSkillsDir(RESEARCH), 'evil-x', 'SKILL.md')),
       'peer dir must not be written through the symlink',
     )
+  })
+})
+
+describe('skill priority — frontmatter 注入菜单排序提示', () => {
+  it('normalizeSkillPriority: 数值/字符串/钳制/非法', () => {
+    assert.equal(normalizeSkillPriority(8), 8)
+    assert.equal(normalizeSkillPriority('8'), 8)
+    assert.equal(normalizeSkillPriority('-10'), -10)
+    assert.equal(normalizeSkillPriority(3.9), 3)
+    assert.equal(normalizeSkillPriority(1000), 100)
+    assert.equal(normalizeSkillPriority(-1000), -100)
+    assert.equal(normalizeSkillPriority('abc'), undefined)
+    assert.equal(normalizeSkillPriority(undefined), undefined)
+    assert.equal(normalizeSkillPriority(null), undefined)
+  })
+
+  it('parseFrontmatter 透传 priority 原始值,list() 元数据归一为数字', async () => {
+    const { meta } = parseFrontmatter('---\nname: p-skill\ndescription: "d"\npriority: 7\n---\nbody')
+    assert.equal(normalizeSkillPriority((meta as Record<string, unknown>).priority), 7)
+
+    await writeSkillMd(
+      userRoot,
+      'prio-skill',
+      '---\nname: prio-skill\ndescription: "带优先级"\npriority: 7\n---\n\nbody\n',
+    )
+    const store = new SkillStore(AGENT)
+    const listed = (await store.list()).find((s) => s.name === 'prio-skill')
+    assert.ok(listed)
+    assert.equal(listed!.priority, 7)
+    const viewed = await store.view('prio-skill')
+    assert.ok(viewed && typeof viewed !== 'string')
+    assert.equal((viewed as { priority?: number }).priority, 7)
   })
 })

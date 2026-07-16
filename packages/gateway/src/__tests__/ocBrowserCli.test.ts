@@ -21,6 +21,10 @@ describe('parseOcBrowserCommand — dispatch & usage', () => {
   it('help → exit 0', () => assert.equal(parseOcBrowserCommand(['help']).ok, false))
   it('unknown command → usage error (2)', () =>
     assert.match(err(['frob'], 2).message, /unknown command 'frob'/))
+  it('subcommand --help → usage, exit 0 (agent 高频探索动作,不算用法错误)', () =>
+    assert.match(err(['click', '--help'], 0).message, /Usage: oc-browser/))
+  it('subcommand -h → usage, exit 0', () =>
+    assert.match(err(['type', '-h'], 0).message, /Usage: oc-browser/))
 })
 
 describe('parseOcBrowserCommand — tool/arg mapping', () => {

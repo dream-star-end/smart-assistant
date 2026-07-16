@@ -3,6 +3,7 @@ name: platform-capabilities
 description: "OpenClaude (claudeai.chat) 平台核心能力: 多媒体收发规则、内联富内容、htmlpreview、HTML Canvas、界面预览、设计稿还原、交互 demo、小游戏"
 version: "2.1.0"
 tags: [system, platform, media, rich-content, htmlpreview, canvas, ui-preview]
+priority: 9
 ---
 
 # claudeai.chat 平台能力

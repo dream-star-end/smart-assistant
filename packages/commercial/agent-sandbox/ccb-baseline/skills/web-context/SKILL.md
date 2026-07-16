@@ -1,7 +1,8 @@
 ---
 name: web-context
-description: 用 `oc-web` 命令行把公开网页/URL 或已上传/已生成的本地文档(HTML/PDF/Office/文本)转成干净 Markdown 上下文喂给模型。用户要读公开链接、网页、公告、PDF、Office 文档或解析本地文件时使用。
+description: 用 `oc-web` 命令行把公开网页/URL 或已上传/已生成的本地文档(HTML/PDF/Office/文本)转成干净 Markdown 上下文喂给模型。用户要读公开链接、网页、公告、PDF、Office 文档或解析本地文件时使用。搜索请用内置 WebSearch,不要用 oc-web 抓搜索引擎结果页。
 tags: [web, extract, pdf, document, markdown]
+priority: 8
 ---
 
 # 网页/文档上下文提取（oc-web CLI）
@@ -24,6 +25,13 @@ oc-web health                 # 检查解析器依赖是否可用
 - `--max-file-bytes <n>`：`parse` 的输入文件大小上限。
 
 退出码：`0` 成功；`1` 提取失败/被拦（blocked）/运行错误；`2` 用法错误。
+
+## 搜索 vs 提取的分工(反模式,生产实证)
+
+- **搜索一律用内置 WebSearch 工具**,拿到目标 URL 后再对**内容页**用 `oc-web extract`。
+- **绝不用 `oc-web extract` 抓搜索引擎结果页**(baidu/bing/sogou/google/brave/yahoo 的 `/search?...` URL):SERP 是重 JS+反爬页面,实测要么超时、要么返回与查询无关的垃圾内容(比拿不到更糟——会污染你的结论)。`site:xxx` 这类站内检索同样交给 WebSearch。
+- WebSearch 结果不足时的正确姿势:换关键词再搜、直接猜权威站点的内容页 URL、或如实告诉用户找不到;而不是去抓 SERP。
+- `extract` 返回 `blocked`/`parser timed out`:内容页可加 `--timeout-ms 60000` 重试一次;仍失败就换 WebSearch 或如实说明受阻,不要反复重试同一 URL。
 
 ## 路径与安全边界
 

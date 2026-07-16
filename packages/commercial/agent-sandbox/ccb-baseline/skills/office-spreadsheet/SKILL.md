@@ -2,6 +2,7 @@
 name: office-spreadsheet
 description: 生成与处理 Excel(.xlsx):把结构化数据做成规范表格、写公式、做数据清洗/透视/统计分析、出图表。用户要"做个 Excel/表格""整理成表""算一下这批数据""数据透视""导出 xlsx"时调用。
 tags: [office, excel, xlsx, data, spreadsheet]
+priority: 8
 ---
 
 # Excel / 表格与数据处理

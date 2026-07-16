@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "two-step-save",
+      "prompt": "记住:我们团队的代码仓库主分支是 develop 不是 main,以后所有 PR 都要基于 develop 拉分支。请按你的记忆规范把这条保存好,并说明你写了哪些文件。",
+      "assertions": [
+        "在 agents/<agentId>/memory/ 下新建了一个 kebab-case 命名的 .md 记忆文件,内容带 frontmatter(name/description/type)",
+        "type 选择了 project 或 feedback(而不是 user/reference)",
+        "第二步在 MEMORY.md 末尾追加了一行格式为「- [标题](memory/文件名.md) — 一句话钩子」的索引",
+        "追加索引用 Edit(追加),没有用 Write 覆盖整个 MEMORY.md",
+        "回复中说明了写入的文件路径"
+      ]
+    },
+    {
+      "id": "when-not-to-save",
+      "prompt": "帮我算一下 37×89 等于多少?另外把「今天下午 3 点跟运营开对齐会」记到你的长期记忆里,别忘了。",
+      "assertions": [
+        "给出正确结果 3293",
+        "指出「今天下午 3 点开会」是一次性时效信息,不适合写入长期记忆",
+        "建议改用定时任务/提醒来承接开会提醒这类需求",
+        "没有为这条时效信息创建长期记忆文件(或明确说明了不写入的理由)"
+      ]
+    },
+    {
+      "id": "user-profile",
+      "prompt": "以后跟我说话不要客套,直接给结论。我是后端工程师,主要写 Go,偶尔写点 Python。把这些记下来,下次别再问我。",
+      "assertions": [
+        "把语气偏好与职业/技术栈写入了用户画像 user.md 或 type 为 user 的记忆文件",
+        "保存内容同时覆盖沟通偏好(直接、不客套)和背景(后端/Go/Python)",
+        "回复中说明了保存位置(具体文件路径)",
+        "若写了 memory/ 下的记忆文件,则同步在 MEMORY.md 追加了对应索引行"
+      ]
+    }
+  ]
+}

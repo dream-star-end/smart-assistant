@@ -4,6 +4,7 @@ description: "如何创建、查看、更新和删除 skills — 自我进化的
 version: "1.0.0"
 tags: [system, meta, learning]
 related_skills: [memory-management, platform-capabilities]
+priority: 4
 ---
 
 # Skill 管理指南
