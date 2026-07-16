@@ -490,7 +490,7 @@ export function ImageViewer({
                       data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
                       aria-label="关闭预览"
                       title="关闭 (Esc)"
-                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
                     >
                       <X size={20} />
                     </button>
@@ -501,7 +501,7 @@ export function ImageViewer({
                       aria-label="下载"
                       title="下载"
                       onClick={() => void handleDownload()}
-                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                      className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
                     >
                       <Download size={18} />
                     </button>
@@ -511,7 +511,7 @@ export function ImageViewer({
                         aria-label="分享"
                         title="分享"
                         onClick={() => void handleShare()}
-                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
                       >
                         <Share2 size={18} />
                       </button>
@@ -523,7 +523,7 @@ export function ImageViewer({
                         title="更多"
                         aria-expanded={moreOpen}
                         onClick={() => setMoreOpen((v) => !v)}
-                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
                       >
                         <MoreHorizontal size={18} />
                       </button>

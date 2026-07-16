@@ -124,14 +124,25 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
         }
       />
 
-      {err && <Alert tone="danger">{err}</Alert>}
+      {err && (
+        <Alert tone="danger">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="min-w-0 flex-1">{err}</span>
+            {docs === null && (
+              <Button size="sm" variant="secondary" onClick={refresh}>
+                重试
+              </Button>
+            )}
+          </div>
+        </Alert>
+      )}
       {notice && <Alert tone="info">{notice}</Alert>}
 
       {loading ? (
         <div className="flex justify-center py-10">
           <Spinner />
         </div>
-      ) : !docs || docs.length === 0 ? (
+      ) : err && docs === null ? null : !docs || docs.length === 0 ? (
         <EmptyState
           icon={BookOpen}
           title="文献库为空"

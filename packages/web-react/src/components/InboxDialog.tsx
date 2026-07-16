@@ -20,6 +20,7 @@ import type { AuthSession, InboxLevel, InboxMessage } from "../lib/types";
 import { cn } from "../lib/utils";
 import { Markdown } from "./Markdown";
 import {
+  Alert,
   Badge,
   Button,
   EmptyState,
@@ -151,6 +152,7 @@ export function InboxDialog({
   const [moreErr, setMoreErr] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [markingAll, setMarkingAll] = useState(false);
+  const [markAllErr, setMarkAllErr] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // 重试计数：递增以强制首屏拉取 effect 重跑。
   const [reloadTick, setReloadTick] = useState(0);
@@ -169,6 +171,7 @@ export function InboxDialog({
     let alive = true;
     setLoading(true);
     setErr(null);
+    setMarkAllErr(null);
     setMoreErr(false);
     setExpandedId(null);
     api
@@ -240,13 +243,15 @@ export function InboxDialog({
   const markAll = useCallback(async () => {
     if (!auth || markingAll || unreadCount === 0) return;
     setMarkingAll(true);
+    setMarkAllErr(null);
     try {
       await api.markAllInboxRead(auth);
       setMessages((cur) => cur.map((m) => (m.read ? m : { ...m, read: true })));
       setUnreadCount(0);
       onUnreadChange();
-    } catch {
+    } catch (e) {
       // 全部已读失败：保持列表，红点不变，用户可再次点击重试。
+      setMarkAllErr(apiErrorMessage(e, "全部已读失败，请重试"));
     } finally {
       setMarkingAll(false);
     }
@@ -283,6 +288,14 @@ export function InboxDialog({
           </IconButton>
         </div>
       </div>
+
+      {markAllErr && (
+        <div className="px-4 pt-3">
+          <Alert tone="danger" className="text-[12.5px]">
+            {markAllErr}
+          </Alert>
+        </div>
+      )}
 
       {/* Tabs：全部 / 未读（切换重拉，unread_only 跟随） */}
       <div className="border-b border-border px-4 py-2.5">

@@ -134,8 +134,9 @@ export function OrgCenter({
             </Dialog.Title>
             <Dialog.Close asChild>
               <button
+                type="button"
                 aria-label="关闭"
-                className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
               >
                 <X size={17} />
               </button>

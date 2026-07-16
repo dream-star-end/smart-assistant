@@ -16,6 +16,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(container.querySelector(".animate-spin")).toBeInTheDocument();
     // 运行中默认展开 → 命令出现两处：header 摘要 + 展开体终端行
     expect(screen.getAllByText("ls -la")).toHaveLength(2);
+    expect(screen.getByTitle("ls -la")).toHaveClass("truncate");
   });
 
   test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {

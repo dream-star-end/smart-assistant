@@ -145,6 +145,8 @@ export function ChartCard({
   height = 260,
   children,
   className,
+  ariaLabel,
+  dataTable,
 }: {
   title: string;
   hint?: string;
@@ -152,14 +154,56 @@ export function ChartCard({
   height?: number;
   children: ReactNode;
   className?: string;
+  /** 图表的屏幕阅读器名称；未提供时沿用可见标题。 */
+  ariaLabel?: string;
+  /** 与画布同源的文本数据。视觉保持 canvas，读屏改读精确字符串表格。 */
+  dataTable?: {
+    columns: readonly string[];
+    rows: readonly (readonly string[])[];
+    emptyText?: string;
+  };
 }) {
+  const accessibleLabel = ariaLabel ?? title;
   return (
-    <Card className={className}>
+    // biome-ignore lint/a11y/useSemanticElements: 图表是有名称的内容组，不是表单控件组，fieldset 语义不适用。
+    <Card className={className} role="group" aria-label={accessibleLabel}>
       <PanelHeader title={title} hint={hint} action={action} />
       <div className="px-4 pb-4">
-        <div className="relative w-full" style={{ height }}>
+        <div className="relative w-full" style={{ height }} aria-hidden={dataTable ? true : undefined}>
           {children}
         </div>
+        {dataTable &&
+          (dataTable.rows.length > 0 ? (
+            <table className="sr-only">
+              <caption>{accessibleLabel}</caption>
+              <thead>
+                <tr>
+                  {dataTable.columns.map((column) => (
+                    <th key={column} scope="col">
+                      {column}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {dataTable.rows.map((row) => (
+                  <tr key={row[0]}>
+                    {dataTable.columns.map((column, cellIndex) =>
+                      cellIndex === 0 ? (
+                        <th key={column} scope="row">
+                          {row[cellIndex]}
+                        </th>
+                      ) : (
+                        <td key={column}>{row[cellIndex]}</td>
+                      ),
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="sr-only">{dataTable.emptyText ?? "暂无数据"}</p>
+          ))}
       </div>
     </Card>
   );

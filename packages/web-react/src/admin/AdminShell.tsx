@@ -1,4 +1,4 @@
-import { LogOut, Menu, MessageSquare } from "lucide-react";
+import { LogOut, Menu, MessageSquare, X } from "lucide-react";
 import { useState } from "react";
 import { LazyBoundary } from "../components/ChunkErrorBoundary";
 import { ThemeToggle } from "../components/ThemeToggle";
@@ -153,6 +153,15 @@ export function AdminShell({ user, onLogout }: { user: User | null; onLogout: ()
             OC
           </span>
           <span className="text-[13px] font-semibold text-fg">管理后台</span>
+          <IconButton
+            onClick={() => setNavOpen(false)}
+            title="关闭导航"
+            aria-label="关闭导航"
+            shape="square"
+            className="ml-auto size-11"
+          >
+            <X size={18} />
+          </IconButton>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
           <NavList activeTab={tab} onNavigate={go} />

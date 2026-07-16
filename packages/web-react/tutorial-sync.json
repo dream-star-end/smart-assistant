@@ -16,7 +16,7 @@
       "mediaKey": "artifacts-download",
       "mediaVersion": 3,
       "registryHash": "60f71929b1b4a3a38611c575b5b906becb708bfe3578987be8873ec427ab245b",
-      "sourceHash": "e80216bcfbc10e2b5deac623c899de044d56f02c1a1fe7dbf918769e8f389c4f"
+      "sourceHash": "5506a250805463f08f71d099efe43039cd777677ee4c902639ec850317038a6d"
     },
     "billing-usage": {
       "contentHash": "56f33a84f3970b14004a48e7fc2c8996a39c473bbbb3d9a406facad9c6539d5e",
@@ -106,7 +106,7 @@
       "mediaKey": "marketplace-discovery",
       "mediaVersion": 2,
       "registryHash": "3683e9974a0d66165d7669357b196eec3e0466ced48f8f4ba8c93e582803ddc8",
-      "sourceHash": "320a260d7a9eb847f1343df7deb7ab1c00709d908d16026db13ac2fb88674a46"
+      "sourceHash": "ab021ca077fa794392de596ff4aba7fe4810d9e01cf04b7ca6e91741fbd8b3d5"
     },
     "marketplace-publishing": {
       "contentHash": "061da931977e26ad137107c676fc8e3234f3f8b250b1359e63ec284227d0faec",

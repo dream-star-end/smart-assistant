@@ -12,7 +12,7 @@
  */
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { DependencyList, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
@@ -201,9 +201,11 @@ describe("UsageTab 图表化窗口口径", () => {
     await waitFor(() => expect(mockedGetReport).toHaveBeenCalledWith(auth, "7d"));
     // 窗口口径 stat 卡（请求 42 / 输入 123456→12.3万 / 输出 7890→7,890 / 积分 888）
     expect(await screen.findByText("42")).toBeInTheDocument();
-    expect(screen.getByText("12.3万")).toBeInTheDocument();
-    expect(screen.getByText("7,890")).toBeInTheDocument();
+    expect(screen.getAllByText("12.3万").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("7,890").length).toBeGreaterThan(0);
     expect(screen.getByText("888 积分")).toBeInTheDocument();
+    const trendTable = screen.getByRole("table", { name: "积分消耗趋势，近 7 天" });
+    expect(within(trendTable).getByRole("cell", { name: "688 积分" })).toBeInTheDocument();
   });
 
   test("切换窗口 pill → 以新窗口重拉 getMyUsageReport", async () => {

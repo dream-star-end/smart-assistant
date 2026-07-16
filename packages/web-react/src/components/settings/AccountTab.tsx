@@ -367,7 +367,21 @@ export function AccountTab({
           </>
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <ChartCard title="收支趋势" hint="收入 / 支出" height={200}>
+            <ChartCard
+              title="收支趋势"
+              hint="收入 / 支出"
+              height={200}
+              ariaLabel={`收支趋势，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
+              dataTable={{
+                columns: ["时间", "收入积分", "支出积分"],
+                rows: ledgerTrend.map((point, index) => [
+                  trendLabels[index],
+                  formatCredits(point.credited),
+                  formatCredits(point.debited),
+                ]),
+                emptyText: "该时段暂无收支记录。",
+              }}
+            >
               {trendHasData ? (
                 <canvas ref={flowRef} />
               ) : (
@@ -376,7 +390,20 @@ export function AccountTab({
                 </div>
               )}
             </ChartCard>
-            <ChartCard title="支出构成" hint="按类型" height={200}>
+            <ChartCard
+              title="支出构成"
+              hint="按类型"
+              height={200}
+              ariaLabel={`支出构成，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
+              dataTable={{
+                columns: ["类型", "支出积分"],
+                rows: byReason.map((reason) => [
+                  ledgerReasonLabel(reason.reason),
+                  formatCredits(reason.debited),
+                ]),
+                emptyText: "该时段暂无支出。",
+              }}
+            >
               {reasonHasData ? (
                 <canvas ref={reasonRef} />
               ) : (

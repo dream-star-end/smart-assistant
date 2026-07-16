@@ -107,6 +107,11 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText("推理中...")).toBeInTheDocument();
   });
 
+  test("thinking：完成态截断标题保留完整悬浮文本", () => {
+    renderMsg(mk("thinking", { text: "**这是一个很长的完整思考摘要标题**\n正文" }));
+    expect(screen.getByTitle("已思考 · 这是一个很长的完整思考摘要标题")).toBeInTheDocument();
+  });
+
   test("plan：活跃段 + 本轮进行中 → structured steps 交给 PinnedTaskTracker，inline 不重复渲染", () => {
     const { container } = renderMsg(
       mk("plan", {
@@ -136,6 +141,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     );
     expect(screen.getByText("第一步")).toBeInTheDocument();
     expect(screen.getByText("第二步")).toBeInTheDocument();
+    expect(screen.getByTitle("计划")).toHaveClass("min-w-0", "flex-1", "truncate");
   });
 
   test("plan：活跃段但本轮已结束(sending=false,HUD 已隐藏)→ 渲染只读卡兜底", () => {
@@ -278,7 +284,8 @@ describe("tool / agent-group 集成", () => {
         ],
       }),
     );
-    expect(screen.getByText("legacy output")).toBeInTheDocument();
+    expect(screen.getByText("legacy output")).toHaveClass("line-clamp-2", "break-words");
+    expect(screen.getByTitle("[text] legacy output")).toBeInTheDocument();
     expect(screen.getByText("终端")).toBeInTheDocument();
   });
 });
@@ -683,7 +690,9 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
   test("本地未翻尽(>100 条)→ 本地翻页按钮;count 含归档未拉数(§4)", () => {
     // 130 条尾巴,visible=100 → 30 本地未挂;归档 500 未拉 → 还有 530 条。
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
-    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toHaveClass(
+      "[@media(hover:none)]:min-h-11",
+    );
     expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
   });
 
@@ -738,7 +747,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(
       screen.getByRole("button", { name: /从云端加载更早的历史（还有 500 条）/ }),
-    ).toBeInTheDocument();
+    ).toHaveClass("[@media(hover:none)]:min-h-11");
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });
 
