@@ -760,14 +760,24 @@ export class SelfhealJobWorker {
     const exec = this.deps.executeHostOpcode ?? executeHostOpcode
     const receipt = await exec(opcode, cfg)
     await setJobTier1Receipt(repairId, JSON.stringify(receipt))
+    // Read the PERSISTED receipt back and use it (MAJOR): under a graceful
+    // shutdown a re-claim may have written a synthetic 'unknown' while this
+    // (old-owner) SSH was in flight; set-once picks ONE evidence, and every
+    // competitor must settle from that single SQLite winner — never its own
+    // in-memory copy — so the receipt, the terminal status and the outbox
+    // detail can never diverge into two authorities.
+    const persisted = await getJob(repairId)
+    const winner = persisted?.tier1Receipt
+      ? (JSON.parse(persisted.tier1Receipt) as HostActionReceipt)
+      : receipt
     log.info('tier1 opcode executed', {
       repairId,
       opcode,
-      outcome: receipt.outcome,
-      exit: receipt.exit,
-      durationMs: receipt.durationMs,
+      outcome: winner.outcome,
+      exit: winner.exit,
+      durationMs: winner.durationMs,
     })
-    return receipt
+    return winner
   }
 
   /**

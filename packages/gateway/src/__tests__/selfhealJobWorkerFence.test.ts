@@ -565,6 +565,40 @@ describe('Tier1 pure machine path (batch1a) — no clone, no codex, machine done
     assert.equal((await getJob('t1-cancelfirst'))?.status, 'cancelled', 'cancel owns the terminal status')
   })
 
+  it('worker-first ⇒ cancel WAITS for the SSH lock; one terminal, no stale callback', async () => {
+    const sessions = fakeSessionManager()
+    const { impl } = fakeFetch('ops.monitor:svc_egress', {
+      executionClass: 'tier1', actionOpcode: 'restart-v5-egress-v1',
+    })
+    let releaseSsh: () => void = () => {}
+    const sshGate = new Promise<void>((r) => { releaseSsh = r })
+    let inSsh = false
+    const worker = tier1Worker({
+      sessions, fetchImpl: impl, hostActionConfig: HOST_CFG,
+      executeHostOpcode: async (op: string) => {
+        inSsh = true
+        await sshGate // hold the lock while the SSH is "in flight"
+        return { opcode: op, outcome: 'completed', exit: 0, host: 'h', startedAt: 0, finishedAt: 1, durationMs: 1, detail: {} }
+      },
+    })
+    const job = await stageStartingJob('t1-workerfirst')
+    const p = (worker as unknown as { processJob(j: unknown): Promise<void> }).processJob(job)
+    // Wait until the worker is inside the SSH (holding withRepairLock).
+    while (!inSsh) await new Promise((r) => setTimeout(r, 5))
+
+    let cancelDone = false
+    const cancelP = executeSelfhealCancel({ repairId: 't1-workerfirst', incidentId: 'i' }, sessions).then((r) => { cancelDone = true; return r })
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(cancelDone, false, 'cancel must block on the repair lock while the SSH is in flight')
+
+    releaseSsh()
+    await p
+    await cancelP
+    // The worker won the lock: job is a worker terminal (succeeded), and the
+    // cancel serialized behind it (no stale callback, no double terminal).
+    assert.equal((await getJob('t1-workerfirst'))?.status, 'succeeded')
+  })
+
   it('pre-claim crash window: claimed-without-receipt settles unknown, ZERO transmit', async () => {
     const sessions = fakeSessionManager()
     const { impl } = fakeFetch('ops.monitor:svc_egress', {
