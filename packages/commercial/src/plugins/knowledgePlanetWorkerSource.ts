@@ -50,12 +50,24 @@ function fail() {
   writeFrame({ event: 'failed', code: 'WORKER_FAILED' });
 }
 
-function writeFrame(value) {
+function encodeFrame(value) {
   const body = Buffer.from(JSON.stringify(value));
   if (body.length > MAX_OUTPUT) throw new Error('output');
   const header = Buffer.alloc(4);
   header.writeUInt32BE(body.length);
-  process.stdout.write(Buffer.concat([header, body]));
+  return Buffer.concat([header, body]);
+}
+
+function writeFrame(value) {
+  process.stdout.write(encodeFrame(value));
+}
+
+async function writeAuthenticatedAndExit(storageState) {
+  const output = encodeFrame({ event: 'authenticated', storageState });
+  await new Promise((resolve, reject) => {
+    process.stdout.write(output, (error) => error ? reject(error) : resolve());
+  });
+  process.exit(0);
 }
 
 async function readFrame() {
@@ -798,9 +810,7 @@ async function runLogin(input, relay) {
         : false;
       if (pageAuthenticated || probeAuthenticated) {
         const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
-        writeFrame({ event: 'authenticated', storageState: state });
-        terminal = true;
-        return;
+        await writeAuthenticatedAndExit(state);
       }
       await page.waitForTimeout(1000);
     }
