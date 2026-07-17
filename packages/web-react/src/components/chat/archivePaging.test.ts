@@ -35,6 +35,13 @@ describe("loadedArchivedMetrics", () => {
       anchors: 2,
     });
   });
+
+  test("新行以 _orderSeq 判水位，内容 patch 后的高 _seq 不会伪装成热尾巴", () => {
+    expect(loadedArchivedMetrics([
+      { _seq: 99, _orderSeq: 3 },
+      { _seq: 4, _orderSeq: 10 },
+    ], 5)).toEqual({ rows: 1, anchors: 1 });
+  });
 });
 
 describe("correctedScrollTop", () => {

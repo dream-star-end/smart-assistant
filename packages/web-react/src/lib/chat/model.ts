@@ -135,12 +135,13 @@ export type ChatMessage = {
    */
   _source?: "server" | "local";
   /**
-   * server 权威单调序号(getSession 按 `_seq > since` 增量下发,随每行带回)。**跨会话历史
-   * 排序的权威源**:server-authored 行携带,本地乐观行(user 气泡 / 团队卡在被 server echo 回
-   * 之前)缺省。排序优先用它(纯 server 域,免受客户端时钟偏移影响);缺省行回退到 ts。
-   * 见 persist.stableSortByTs。
+   * server 权威内容版本游标。内容 patch 会换号；仅用于 getSession `_seq > since` 增量同步，
+   * 不参与展示顺序。
    */
   _seq?: number;
+  /** 首次持久化即冻结的历史顺序轴。展示、turn 分组、spill/归档分页均以它为权威；
+   * 本地乐观行在 server echo 前缺省，由排序器锚到最近的耐久行。 */
+  _orderSeq?: number;
   /** Exact persisted user row that owns this turn. Server-authored rows get
    * this from the immutable lossless tape; local fallback m-* output rows are
    * tagged while streaming so final sync can replace only the right turn. */
@@ -302,8 +303,7 @@ export type ChatSession = {
   _lastFrameSeq?: number;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
-  /** 归档水位(server 已把 `_seq ≤ 此值`的行搬进归档 chunk)。full 合并时本地 ≤ 此值的行无条件
-   *  保留(热尾巴不丢旧历史);归档分页 loadOlderHistory 的 before 游标兜底也用它。*/
+  /** 归档 `_orderSeq` 水位(字段名保留兼容);full 合并与归档分页共用。*/
   _archivedThroughSeq?: number;
   /** 已归档消息条数(会话总数 = tail + 此值)。UI"还有 N 条"与"从云端加载更早历史"按钮据此。*/
   _archivedCount?: number;

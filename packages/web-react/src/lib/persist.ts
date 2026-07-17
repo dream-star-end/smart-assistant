@@ -48,7 +48,7 @@ export type StoredSession = {
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
-  /** 归档水位(server 已把 `_seq ≤ 此值`的行搬进归档 chunk);full 合并时本地 ≤ 此值的行无条件保留。*/
+  /** 归档 `_orderSeq` 水位(字段名为滚动兼容保留)。*/
   _archivedThroughSeq?: number;
   /** 已归档消息条数(会话总数 = tail + 此值;UI"还有 N 条"与"从云端加载"按钮据此)。*/
   _archivedCount?: number;
@@ -241,8 +241,8 @@ export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMess
  *
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
- * 合并后按 ts 稳定排序：user 气泡 ts < 其轮 server 助手 ts → 正确落到该轮助手之前；server
- * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。
+ * 合并后按 `(anchorOrderSeq, ts, index)` 真全序：耐久行位置冻结，本地乐观窗只在锚点内
+ * 用 ts/index 排列，server echo 后自然收敛到 `_orderSeq`。
  *
  * **债A 偿还(server-authored 团队卡)**：server 现会带回 agent-group 骨架行(id `srv-*`、
  * `_source:'server'`、无 childBlocks),用于跨设备/清缓存场景保住团队结构+终态。去重按 runId:
@@ -253,8 +253,8 @@ export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMess
  * 碰不到它们;唯一的去重维度是 runId,收口在这里 + normalizeDelegateCards(reducer)。
  *
  * **热尾巴适配(archivedThroughSeq)**:行体积到顶前 server 会把最老的一截消息搬进归档 chunk,
- * full 同步返回的 `server` 可能**只含热尾巴**(`_seq > archivedThroughSeq` 的那截)。此时本地缓存
- * 里 `_seq ≤ archivedThroughSeq` 的行是"已归档的 server 行"——server 不再带回不代表它们被取代,
+ * full 同步返回的 `server` 可能**只含热尾巴**(`_orderSeq > archivedThroughSeq`)。此时本地缓存
+ * 里 `_orderSeq ≤ archivedThroughSeq` 的行是"已归档的 server 行"——server 不再带回不代表它们被取代,
  * 只是被搬走了。故第三参 `archivedThroughSeq` 传入后,这些行**无条件保留**(④),绝不当"中段
  * server 不认识的陈旧数据"丢弃(否则 reopen 长会话整段旧历史蒸发,本次改造的主雷)。默认 0 =
  * 未归档,行为与旧版完全一致。
@@ -322,7 +322,7 @@ export function mergeFullServerWins(
       (m) =>
         m?.id &&
         !serverIds.has(m.id) &&
-        // ④ 已归档的 server 行(server 只回热尾巴时 _seq ≤ 水位的行不再带回):无条件保留。
+        // ④ 已归档的 server 行(server 只回热尾巴时 _orderSeq ≤ 水位):无条件保留。
         (isArchivedServerRow(m, archivedThroughSeq) ||
           // ① user 行=客户端权威;② 团队卡=client-owned(见 docstring ③),被 adopt 吸收的
           // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
@@ -332,7 +332,7 @@ export function mergeFullServerWins(
           (m.role === "system" && !isServerAuthoredRow(m))),
     );
   if (!tail.length && !preservedMid.length) {
-    return applyHistoryProjectionPatches(serverChanged ? serverMerged : server);
+    return applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server));
   }
   // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
   return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...preservedMid, ...tail]));
@@ -375,9 +375,9 @@ export function applyServerIncremental(
 
 /**
  * 归档分页并入:把云端 getSessionArchive 拉回的更早归档消息(server-authored、srv-* id、
- * `_seq` 升序)前插进本地 messages。**只前插 + 按 id 去重,绝不触发 server-wins 覆盖本地富卡**
+ * `_orderSeq` 升序)前插进本地 messages。**只前插 + 按 id 去重,绝不触发 server-wins 覆盖本地富卡**
  * (归档行 id 与本地 m-* 天然不撞;已在本地的归档 id 直接跳过,不重复插入)。合并后 stableSortByTs
- * 按 `_seq` 归位(归档行 `_seq` 低 → 落到最前)。无新增时**返回原引用**(零拷贝,免无谓重渲)。
+ * 按 `_orderSeq` 归位。无新增时**返回原引用**(零拷贝,免无谓重渲)。
  */
 export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage[]): ChatMessage[] {
   if (!archived.length) return local;
@@ -388,13 +388,16 @@ export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage
   return applyHistoryProjectionPatches(stableSortByTs([...add, ...local]));
 }
 
-/** `_seq ≤ 归档水位` = server 已把该行搬进归档 chunk,full 同步只回热尾巴时不再带回它。 */
+/** `_orderSeq ≤ 归档水位` = server 已把该行搬进归档 chunk。 */
 function isArchivedServerRow(m: ChatMessage, archivedThroughSeq: number): boolean {
+  const orderSeq = typeof m._orderSeq === "number" && Number.isFinite(m._orderSeq)
+    ? m._orderSeq
+    : m._seq; // rolling compatibility with pre-_orderSeq IndexedDB rows
   return (
     archivedThroughSeq > 0 &&
-    typeof m._seq === "number" &&
-    Number.isFinite(m._seq) &&
-    m._seq <= archivedThroughSeq
+    typeof orderSeq === "number" &&
+    Number.isFinite(orderSeq) &&
+    orderSeq <= archivedThroughSeq
   );
 }
 
@@ -532,25 +535,30 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
 
 function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
   if (messages.length <= 1) return messages;
-  if (!messages.every((m) => typeof m?.ts === "number" && Number.isFinite(m.ts))) {
-    return messages;
-  }
-  const seqOf = (m: ChatMessage): number | null =>
-    typeof m._seq === "number" && Number.isFinite(m._seq) ? m._seq : null;
-  return messages
-    .map((m, idx) => ({ m, idx }))
-    .sort((a, b) => {
-      // 排序权威源 = server 单调序号 `_seq`(两行都携带时才用):纯 server 时钟域,免受客户端
-      // 时钟偏移影响。修正「设备钟快于 server → user 气泡(客户端 ts,且 server 侧也按客户端
-      // ts 存档)被排到本轮 server 助手行之后」的错序 —— 凡被 server echo 回、带 _seq 的行都
-      // 恒按 server 顺序落位。任一行缺 _seq(本地乐观行在 echo 回来之前)→ 回退 ts(既有行为;
-      // 同一域内的行仍正确,仅乐观窗内的短暂错序不可避免,echo 回后自愈)。
-      const sa = seqOf(a.m);
-      const sb = seqOf(b.m);
-      if (sa !== null && sb !== null) return sa - sb || a.idx - b.idx;
-      return a.m.ts - b.m.ts || a.idx - b.idx;
+  const orderOf = (m: ChatMessage): number | null =>
+    typeof m._orderSeq === "number" &&
+    Number.isSafeInteger(m._orderSeq) &&
+    m._orderSeq > 0
+      ? m._orderSeq
+      : null;
+  let anchorOrderSeq = 0;
+  const sorted = messages
+    .map((m, idx) => {
+      const ownOrderSeq = orderOf(m);
+      if (ownOrderSeq !== null) anchorOrderSeq = ownOrderSeq;
+      return {
+        m,
+        idx,
+        anchorOrderSeq: ownOrderSeq ?? anchorOrderSeq,
+        ts: typeof m?.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
+      };
     })
+    // One lexicographic tuple for every pair makes the comparator transitive.
+    // Missing ts is a local tie-breaker value, never a whole-sort bailout.
+    .sort((a, b) =>
+      a.anchorOrderSeq - b.anchorOrderSeq || a.ts - b.ts || a.idx - b.idx)
     .map((x) => x.m);
+  return sorted.every((message, index) => message === messages[index]) ? messages : sorted;
 }
 
 /**
