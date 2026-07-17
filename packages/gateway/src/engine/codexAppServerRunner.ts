@@ -373,6 +373,28 @@ export function isMissingRolloutError(err: unknown): err is JsonRpcCallError {
   )
 }
 
+/** Detect codex's "clear a goal on a thread that has none" failure mode.
+ *  syncPlatformGoal sends a clearing `thread/goal/set` (objective: null) for
+ *  every session whose platform goal state is absent/cleared; codex 0.125
+ *  rejects that with -32600 "no goal exists" when the thread never had a
+ *  goal. The desired end state (no goal upstream) already holds, so the
+ *  clear is idempotent success — treating it as fatal killed every turn on
+ *  goalless sessions (2026-07-17 outage).
+ *
+ *  Same three guards as isMissingRolloutError: method + code + text, so a
+ *  future codex release repurposing -32600 for schema drift on this method
+ *  still surfaces as a hard error. */
+export function isGoalAlreadyClearedError(err: unknown): err is JsonRpcCallError {
+  if (!(err instanceof Error)) return false
+  const e = err as Partial<JsonRpcCallError>
+  return (
+    e.rpcMethod === 'thread/goal/set' &&
+    e.rpcCode === -32600 &&
+    typeof e.rpcMessage === 'string' &&
+    /no goal exists/i.test(e.rpcMessage)
+  )
+}
+
 /** Runner message shape used by sessionManager.ts (subset of SdkMessage). */
 interface RunnerMessage {
   type: string
@@ -1159,6 +1181,16 @@ export class CodexAppServerRunner extends EventEmitter {
         tokenBudget: cleared ? null : goal.tokenBudget,
       })
     } catch (err) {
+      // Clearing a goal the app-server never had = the desired state already
+      // holds; keep the staged 'cleared' stamp so the next turn short-circuits
+      // on signature instead of re-issuing the doomed RPC.
+      if (cleared && isGoalAlreadyClearedError(err)) {
+        log.info('codex thread/goal/set: no goal upstream — treating clear as no-op', {
+          sessionKey: this.opts.sessionKey,
+          threadId: this.threadId,
+        })
+        return
+      }
       // SessionManager serializes setGoalState under the session lock, so no
       // newer sync can legitimately supersede this staged value here.
       this.syncedPlatformGoalSignature = previousSignature
