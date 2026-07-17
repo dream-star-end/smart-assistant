@@ -19,7 +19,9 @@ TARGET_SHA="${1:?usage: selfheal-closeout-restart.sh <target-sha>}"
 MARKER_DIR=/var/lib/openclaude-selfheal
 MARKER="$MARKER_DIR/closeout-${TARGET_SHA:0:12}.json"
 UNIT=openclaude.service
-HEALTH_URL=http://127.0.0.1:18789/api/doctor
+# /healthz 是无鉴权健康端点;/api/doctor 需要鉴权(401),用它做 smoke 会把
+# 一次成功的重启误判成 failed(2026-07-16 首次收口重启实际踩到)。
+HEALTH_URL=http://127.0.0.1:18789/healthz
 BROKER_SOCK=/run/openclaude-selfheal/broker.sock
 
 mkdir -p "$MARKER_DIR"
