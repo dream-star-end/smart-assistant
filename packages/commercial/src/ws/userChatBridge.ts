@@ -46,6 +46,7 @@ import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { recordTurnTrace } from "./turnTraces.js";
+import { GoalStateError } from "../goal/goalStateService.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import {
@@ -2520,24 +2521,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const goal = await deps.loadGoalState(uid, peerId);
         enriched = { ...enriched, _goalState: goal };
       } catch (err) {
-        // Goal attribution is part of the paid turn's durable authority. A
-        // transient PG read failure must not be converted to `null`: doing so
-        // would run the turn without goal_id and make later repair impossible.
-        // Reject this turn before it reaches the container; Codex callers that
-        // already reserved billing/slots unwind through their existing
-        // pre-forward compensation path.
-        turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
-          sessionId: peerId,
-          err,
-        });
-        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-          sendErrorFrame(
-            userWs,
-            "GOAL_STATE_UNAVAILABLE",
-            "goal state unavailable, retry this turn shortly",
-          );
+        if (err instanceof GoalStateError && err.code === "NOT_FOUND") {
+          // NOT_FOUND is a definitive answer, not a transient failure: the
+          // client_sessions row does not exist yet (first turn of a fresh
+          // WS-only session, before any PUT /api/sessions), so no goal can
+          // exist either. Attribution stays repairable — a goal cannot be
+          // set on a session that has no row.
+          enriched = { ...enriched, _goalState: null };
+        } else {
+          // Goal attribution is part of the paid turn's durable authority. A
+          // transient PG read failure must not be converted to `null`: doing so
+          // would run the turn without goal_id and make later repair impossible.
+          // Reject this turn before it reaches the container; Codex callers that
+          // already reserved billing/slots unwind through their existing
+          // pre-forward compensation path.
+          turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
+            sessionId: peerId,
+            err,
+          });
+          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+            sendErrorFrame(
+              userWs,
+              "GOAL_STATE_UNAVAILABLE",
+              "goal state unavailable, retry this turn shortly",
+            );
+          }
+          return null;
         }
-        return null;
       }
       return enriched;
     };

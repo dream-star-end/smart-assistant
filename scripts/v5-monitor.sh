@@ -85,6 +85,10 @@ CURL_TIMEOUT=5
 DS_STEP_CANARY_READY="${DS_STEP_CANARY_READY:-10}"
 MAIL_ERR_WINDOW_SECS="${V5MON_MAIL_ERR_WINDOW:-1800}"  # 邮件发送失败回看窗口(30min)
 MAIL_LOG="${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}"
+TURN_ERR_WINDOW_SECS="${V5MON_TURN_ERR_WINDOW:-600}"   # turn 失败回看窗口(10min)
+TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个用户同窗失败
+TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
+TURN_ERR_SOLO_EVENTS="${V5MON_TURN_ERR_SOLO:-8}"       # 单源阈:单窗总失败 ≥N 次
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -195,6 +199,34 @@ EOF
   fi
 }
 
+check_turn_failures() {
+  # turn 失败率:product_friction_events 短窗内 stage=turn_error/outcome=failed
+  # 聚合超阈值 → 告警。背景:2026-07-17 goal 功能致 codex 引擎无目标会话每轮必挂,
+  # 健康端点全绿、无任何 turn 级监控,boss 比平台先发现 → 本检查补盲区。
+  # outcome=failed 不含 recovered(用户重试成功即自愈,不算持续故障);
+  # 阈值语义:多用户同窗失败 = 平台性故障;单用户刷高量 = 也值得看一眼。
+  # 部署重启窗口的瞬时 turn 中断由 planned-maintenance marker 静默(deploy 侧
+  # begin_planned_maintenance checks 列表含 turn_failures,两侧同步)。
+  local row events users
+  if [ -z "$DBURL" ]; then record turn_failures ok "turn 失败率:无 DATABASE_URL(跳过)"; return; fi
+  if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
+      "SELECT count(*), count(DISTINCT user_id)
+         FROM product_friction_events
+        WHERE stage = 'turn_error' AND outcome = 'failed'
+          AND updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})" 2>&1)"; then
+    record turn_failures bad "turn 失败率:psql 查询失败:$(echo "$row" | head -c 120)"; return
+  fi
+  IFS='|' read -r events users <<<"$row"
+  [[ "$events" =~ ^[0-9]+$ && "$users" =~ ^[0-9]+$ ]] || {
+    record turn_failures bad "turn 失败率:查询返回非法行:$(echo "$row" | head -c 120)"; return; }
+  if { [ "$users" -ge "$TURN_ERR_MIN_USERS" ] && [ "$events" -ge "$TURN_ERR_MIN_EVENTS" ]; } \
+     || [ "$events" -ge "$TURN_ERR_SOLO_EVENTS" ]; then
+    record turn_failures bad "turn 失败 ${events} 次/${users} 个用户(${TURN_ERR_WINDOW_SECS}s 窗,阈值 ${TURN_ERR_MIN_USERS}用户×${TURN_ERR_MIN_EVENTS}次 或单源${TURN_ERR_SOLO_EVENTS}次)——聊天主链路可能故障"
+  else
+    record turn_failures ok "turn 失败率:${events} 次/${users} 用户(窗口内,未超阈)"
+  fi
+}
+
 slot_unit() { case "$1" in A) echo openclaude-v5 ;; B) echo openclaude-v5-b ;; *) return 1 ;; esac; }
 slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEALTH_URL" ;; *) return 1 ;; esac; }
 
@@ -269,7 +301,7 @@ check_serving_masters() {
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail) echo critical ;;
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
     disk_root|disk_var|mem) echo warning ;;
     *) echo warning ;;
   esac
@@ -304,6 +336,7 @@ check_mem
 check_pool
 check_image
 check_mail
+check_turn_failures
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

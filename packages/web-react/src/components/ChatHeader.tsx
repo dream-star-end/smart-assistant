@@ -5,11 +5,9 @@ import type { Agent } from "../lib/agents";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
-import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { ThemeToggle } from "./ThemeToggle";
-import { GoalControl, type GoalSetInput } from "./GoalControl";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
 export function ChatHeader({
@@ -21,9 +19,6 @@ export function ChatHeader({
   modelsLoading,
   teamModeActive,
   onDisableTeamMode,
-  goal,
-  onSetGoal,
-  onGoalAction,
   credits,
   onOpenBilling,
   sidebarCollapsed,
@@ -51,9 +46,6 @@ export function ChatHeader({
   teamModeActive?: boolean;
   /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
   onDisableTeamMode?: () => void;
-  goal?: GoalStateSnapshot | null;
-  onSetGoal?: (input: GoalSetInput) => Promise<void>;
-  onGoalAction?: (action: "pause" | "resume" | "complete" | "clear") => Promise<void>;
   /** 账户余额（积分字符串大数，来自 /api/me）。省略 / null 不渲染 pill。 */
   credits?: string | null;
   /** 点击 balance-pill 打开计费面板（省略则 pill 不可点）。 */
@@ -156,9 +148,6 @@ export function ChatHeader({
           loading={modelsLoading}
           teamEngineActive={teamModeActive}
         />
-      )}
-      {onSetGoal && onGoalAction && (
-        <GoalControl goal={goal} onSet={onSetGoal} onAction={onGoalAction} />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
         {onOpenTutorial && (

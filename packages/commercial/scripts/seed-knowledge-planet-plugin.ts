@@ -437,8 +437,18 @@ async function seedOnly(): Promise<void> {
   await inspectExactImage(docker, imageId)
   const handoff = await readHandoffIfPresent(expected)
   const alreadyApproved = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
-  if (!alreadyApproved && !handoff)
-    throw new Error('new Knowledge Planet Plugin versions require an encrypted action handoff')
+  if (!alreadyApproved && !handoff) {
+    // 2026-07-17 架构纠偏:未审批候选不再阻断平台部署。零接触收尾:把执行门
+    // 幂等重开到 listing 当前已审批版本(deploy 前置 close-gate 的对称收口),
+    // 不做任何版本迁移/账号绑定。候选晋升走 --verify-knowledge-planet-user
+    // 显式 lane,与平台部署解耦;运行时按内容 pin fail-closed,未审批制品
+    // 没有执行入口。
+    process.stderr.write(
+      'Knowledge Planet candidate is not approved and no handoff is present; zero-touch seed: reopening gate to current approved version.\n',
+    )
+    await openListingGateToCurrent()
+    return
+  }
   const redis = await leaseRedis()
   try {
     let accountBind: Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>> | null = null
@@ -657,6 +667,43 @@ async function openListingGateToRelease(targetRelease: string): Promise<void> {
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 
+/** 重开执行门到 listing 当前已审批版本(按 DB 行身份,与 release/source-commit 无关)。
+ *  2026-07-17 架构纠偏:release 身份钉死的 open-to-release 在"目标 release 早于
+ *  插件审批"(紧急回滚)或"候选未审批"(纯平台部署)时无版本可解,曾把整个
+ *  回滚打进 manual-recovery。运行时按内容 pin 强制信任,这里只需幂等恢复
+ *  "已审批版本可执行"的门状态。无已审批版本时无门可开,如实上报不报错。 */
+async function openListingGateToCurrent(): Promise<void> {
+  const current = await query<{
+    version_id: string
+    artifact_hash: string
+    exec_contract_hash: string
+  }>(
+    `SELECT v.id::text AS version_id, v.artifact_hash,
+            encode(v.exec_contract_hash, 'hex') AS exec_contract_hash
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = $1 AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
+        AND v.status = 'approved' AND v.exec_revoked_at IS NULL`,
+    [KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id],
+  )
+  const row = current.rows[0]
+  if (!row) {
+    process.stdout.write(
+      `${JSON.stringify({ changed: false, currentVersionId: null, note: 'no-approved-version' })}\n`,
+    )
+    return
+  }
+  const result = await openOfficialManagedBrowserPluginListingGate({
+    slug: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id,
+    expectedVersionId: row.version_id,
+    expectedArtifactHash: row.artifact_hash,
+    expectedExecContractHash: row.exec_contract_hash,
+    env: process.env,
+    pool: getPool(),
+  })
+  process.stdout.write(`${JSON.stringify(result)}\n`)
+}
+
 async function openSetupFirstListingGateToVersion(versionIdRaw: string): Promise<void> {
   if (!/^\d{1,16}$/.test(versionIdRaw))
     throw new Error('setup-first Plugin version ID must be a positive integer')
@@ -727,6 +774,42 @@ async function assertCurrentReleaseCompatible(targetRelease: string): Promise<vo
     )
   process.stdout.write(
     `${JSON.stringify({ compatible: true, versionId, artifactHash: target.artifactHash })}\n`,
+  )
+}
+
+/** 部署侧非阻断咨询门(2026-07-17 架构纠偏):平台部署不再被插件审批状态阻断。
+ *  运行时才是插件信任的强制点(三表 pin + plugin-v2 验签 + 摘要派生 driver 匹配,
+ *  均 fail-closed)——未审批制品在运行时没有任何执行入口,部署门只需回答
+ *  "本次部署是否会做插件版本迁移"与"插件会不会因此休眠",供 deploy 决定是否
+ *  执行 close-gate/seed 迁移段并打印告知。stdout 输出单行 JSON 契约(deploy 侧
+ *  jq 校验,不依赖进程退出码);基础设施故障(镜像缺失/DB 不可达)仍然 throw =
+ *  fail-closed("连状态都读不到"不许放行部署)。 */
+async function advisoryStatus(): Promise<void> {
+  const docker = dockerClient()
+  const imageId = imageIdFromEnv()
+  await inspectExactImage(docker, imageId)
+  const expected = verificationExpected(imageId)
+  const approvedForDeploy =
+    (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  const handoff = await readHandoffIfPresent(expected)
+  const current = await query<{ artifact_hash: string }>(
+    `SELECT v.artifact_hash
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = $1 AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
+        AND v.status = 'approved' AND v.exec_revoked_at IS NULL`,
+    [KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id],
+  )
+  const currentApprovedArtifactHash = current.rows[0]?.artifact_hash ?? null
+  process.stdout.write(
+    `${JSON.stringify({
+      advisory: 'knowledge-planet',
+      approvedForDeploy,
+      handoffPresent: handoff !== null,
+      artifactMatchesCurrentApproved:
+        currentApprovedArtifactHash !== null &&
+        currentApprovedArtifactHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+    })}\n`,
   )
 }
 
@@ -850,6 +933,7 @@ async function main(): Promise<void> {
   const openGateTarget = mode?.startsWith('--open-listing-gate-to-release=')
     ? mode.slice('--open-listing-gate-to-release='.length)
     : null
+  const openGateCurrent = mode === '--open-listing-gate-current'
   const openSetupFirstGateVersion = mode?.startsWith('--open-setup-first-gate-to-version=')
     ? mode.slice('--open-setup-first-gate-to-version='.length)
     : null
@@ -865,11 +949,13 @@ async function main(): Promise<void> {
   if (
     process.argv.length !== 3 ||
     (mode !== '--smoke-only' &&
+      mode !== '--advisory-status' &&
       mode !== '--seed-only' &&
       mode !== '--close-listing-gate' &&
       !(verifyUserId && Number.isSafeInteger(verifyUserId) && verifyUserId > 0) &&
       !transitionTarget &&
       !openGateTarget &&
+      !openGateCurrent &&
       !openSetupFirstGateVersion &&
       !compatibilityTarget &&
       !classifyTarget &&
@@ -877,15 +963,17 @@ async function main(): Promise<void> {
       setupFirstPhase !== 'post')
   )
     throw new Error(
-      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--open-setup-first-gate-to-version=ID|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH|--assert-setup-first-safe=pre|post',
+      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--advisory-status|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--open-listing-gate-current|--open-setup-first-gate-to-version=ID|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH|--assert-setup-first-safe=pre|post',
     )
   try {
     if (verifyUserId) await verifyUser(verifyUserId)
     else if (mode === '--smoke-only') await smokeOnly()
+    else if (mode === '--advisory-status') await advisoryStatus()
     else if (mode === '--seed-only') await seedOnly()
     else if (mode === '--close-listing-gate') await closeListingGate()
     else if (transitionTarget) await transitionToRelease(transitionTarget)
     else if (openGateTarget) await openListingGateToRelease(openGateTarget)
+    else if (openGateCurrent) await openListingGateToCurrent()
     else if (openSetupFirstGateVersion)
       await openSetupFirstListingGateToVersion(openSetupFirstGateVersion)
     else if (compatibilityTarget) await assertCurrentReleaseCompatible(compatibilityTarget)
@@ -901,5 +989,8 @@ main().catch((error) => {
   process.stderr.write(
     `Knowledge Planet Plugin deploy gate failed: ${error instanceof Error ? error.message : String(error)}\n`,
   )
-  process.exitCode = 1
+  // 必须硬退出:process.exitCode 软退出码经 `npx --no-install tsx` 转发时可能
+  // 丢失(2026-07-17 实测:门 throw 后 ssh 拿到 0 → deploy fail-open)。stderr
+  // 上一行是同步写,exit 不会截断。
+  process.exit(1)
 })
