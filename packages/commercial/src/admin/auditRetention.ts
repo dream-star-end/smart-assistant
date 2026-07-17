@@ -23,8 +23,12 @@
  *   - admin_alert_outbox 90d  告警投递队列 sent/failed 终态行(带 status 谓词)
  *   - admin_audit        永久  合规审计,显式登记在 PERMANENT_AUDIT_TABLES,
  *                             不允许出现在删除政策里(sweeper 有 fail-fast 断言)
- *   - account_refresh_events / provider_health / wechat_audit 已有各自 sweeper,
- *     不重复纳管(避免双清理权威;登记债:后续可迁入本表统一)
+ *   - account_refresh_events / provider_health 已有各自 sweeper,不重复纳管(避免双清理权威)
+ *   - wechat_audit **例外**:0066 迁移与旧注释都声称"daemon 定期 DELETE WHERE received_at
+ *     < NOW-7d",但全仓无任何 DELETE FROM wechat_audit —— 声明的 sweeper 从未实现(无界增长)。
+ *     且 received_at 是 BIGINT epoch-ms(非 timestamptz),用不了本表的通用 TTL 策略。故在
+ *     retentionRegistry.ts 登记为 `deferred`(带 owner+到期日),由 D3 反向对账门盯住,
+ *     待 wechat 子系统补真实 bespoke sweeper 后转正。
  *
  * 运维:COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED=1 一键关停(UX 铁律:限流/清理类
  * 默认宽松 + env 可回滚)。天数可经 COMMERCIAL_AUDIT_RETENTION_OVERRIDES 覆盖,
@@ -108,6 +112,9 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   "selfheal_user_impact_evidence",
   "selfheal_user_notice_proposals",
   "selfheal_user_notice_recipients",
+  // 批D D3:自愈放行请求账本。量小、账本性质(与 codex_repairs 同档),永久可回溯放行
+  // 决策链,不删。
+  "selfheal_release_requests",
 ] as const;
 
 // 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。
@@ -137,6 +144,8 @@ export interface AuditRetentionSweeperOptions {
   overrides?: string;
   /** 测试用注入:覆盖默认的 DELETE 执行(便于无 DB 单元测试;同 refreshEventsSweeper 惯例)。 */
   purgeFn?: (p: RetentionPolicy) => Promise<number>;
+  /** 测试用注入:覆盖 session_goals 终态清理(默认 = sweepTerminalSessionGoals)。 */
+  sessionGoalsPurgeFn?: () => Promise<number>;
 }
 
 function defaultOnError(table: string, err: unknown): void {
@@ -184,12 +193,53 @@ async function purgeTable(p: RetentionPolicy): Promise<number> {
   return r.rowCount ?? 0;
 }
 
+/** session_goals 终态离场窗口(天)与单 tick 批量上限。 */
+export const SESSION_GOALS_SWEEP_DAYS = 90;
+export const SESSION_GOALS_SWEEP_BATCH = 5000;
+
+/**
+ * 批D D3:session_goals **终态行离场**(bespoke sweep,由 auditRetentionSweeper tick 驱动)。
+ *
+ * session_goals.session_id FK 到 client_sessions ON DELETE CASCADE,但 client_sessions 仅
+ * **软删**(deleted_at),从不硬删 → 终态目标行会随软删会话无限滞留。清理规则:status 为终态
+ * (completed/cleared)且(会话已软删 **或** 该目标 90d 未再变更)。幂等 + 单 tick 批量上限
+ * (CTE LIMIT,避免长事务)。90d 覆盖计费/归因回看窗口,终态目标无长期保留价值。
+ *
+ * 为何不进 AUDIT_RETENTION_POLICIES:那是"单列时间 TTL",本清理需 JOIN client_sessions 读
+ * deleted_at,属 bespoke 形态;为不新增独立调度器(会触发 scheduler 隔离门,需改部署白名单),
+ * 挂在已在册的 auditRetentionSweeper tick 内执行。在 retentionRegistry.ts 登记为 bespoke-sweeper。
+ */
+export async function sweepTerminalSessionGoals(
+  runQuery: (sql: string, params: unknown[]) => Promise<{ rowCount: number | null }>,
+  days = SESSION_GOALS_SWEEP_DAYS,
+  batch = SESSION_GOALS_SWEEP_BATCH,
+): Promise<number> {
+  const sql = `
+    WITH victims AS (
+      SELECT sg.session_id
+        FROM session_goals sg
+        JOIN client_sessions cs ON cs.id = sg.session_id
+       WHERE sg.status IN ('completed','cleared')
+         AND (cs.deleted_at IS NOT NULL
+              OR sg.updated_at < NOW() - ($1 || ' days')::interval)
+       LIMIT $2
+    )
+    DELETE FROM session_goals sg
+     USING victims v
+     WHERE sg.session_id = v.session_id`;
+  const r = await runQuery(sql, [String(days), batch]);
+  return r.rowCount ?? 0;
+}
+
 export function startAuditRetentionSweeper(
   opts: AuditRetentionSweeperOptions = {},
 ): AuditRetentionSweeperHandle {
   const interval = Math.max(60_000, opts.intervalMs ?? AUDIT_RETENTION_INTERVAL_MS);
   const onError = opts.onError ?? defaultOnError;
   const purgeFn = opts.purgeFn ?? purgeTable;
+  const sessionGoalsPurgeFn =
+    opts.sessionGoalsPurgeFn ??
+    (() => sweepTerminalSessionGoals((sql, params) => query(sql, params)));
   const policies = resolveRetentionPolicies(opts.overrides);
   let stopped = false;
 
@@ -202,6 +252,15 @@ export function startAuditRetentionSweeper(
       } catch (err) {
         onError(p.table, err);
         deleted[p.table] = -1;
+      }
+    }
+    // bespoke:session_goals 终态离场(JOIN client_sessions,非单列 TTL,故不在 policies 里)。
+    if (!stopped) {
+      try {
+        deleted["session_goals"] = await sessionGoalsPurgeFn();
+      } catch (err) {
+        onError("session_goals", err);
+        deleted["session_goals"] = -1;
       }
     }
     const summary = Object.entries(deleted)
