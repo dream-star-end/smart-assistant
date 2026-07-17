@@ -210,14 +210,13 @@ export class KnowledgePlanetSetupManager {
         'Knowledge Planet Plugin is not installed',
       )
     const verified = await loadVerifiedRuntimePluginContract(id, this.pool, { env: this.opts.env })
-    const setupPin =
-      verified.pluginType === 'managed-browser' && verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
-        ? classifyKnowledgePlanetSetupPin({
-            version: verified.contract.version,
-            artifactHash: verified.artifactHash,
-            execContractHash: verified.execContractHash,
-          })
-        : null
+    if (verified.pluginType !== 'managed-browser' || verified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG)
+      throw new KnowledgePlanetSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
+    const setupPin = classifyKnowledgePlanetSetupPin({
+      version: verified.contract.version,
+      artifactHash: verified.artifactHash,
+      execContractHash: verified.execContractHash,
+    })
     if (!setupPin)
       throw new KnowledgePlanetSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
     await assertRuntimePluginInstallEntitlement(userId, verified, this.pool, {
