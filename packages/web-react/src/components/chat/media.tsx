@@ -258,14 +258,19 @@ function useFreshSignedUrl(src: string | null | undefined): {
 export function ZoomableImage({
   src,
   alt,
+  title,
   imgClassName,
   onError,
   signPath,
   thumbWidth,
   readOnly = false,
+  referrerPolicy,
+  loading,
 }: {
   src: string;
   alt: string;
+  /** Markdown 图片可选标题；从原生 img 路径迁移时必须保留。 */
+  title?: string;
   /** 缩略态 <img> 的样式(灯箱内恒全尺寸 object-contain)。 */
   imgClassName?: string;
   onError?: React.ReactEventHandler<HTMLImageElement>;
@@ -275,6 +280,10 @@ export function ZoomableImage({
   thumbWidth?: number | null;
   /** 站内信等只读上下文：保留灯箱/下载，不暴露聊天图片编辑入口。 */
   readOnly?: boolean;
+  /** 外链只读图片必须贯穿缩略态与查看器，避免向第三方泄漏站内信页面地址。 */
+  referrerPolicy?: React.HTMLAttributeReferrerPolicy;
+  /** 仅缩略态使用；外链站内信图片保留原生 lazy loading。 */
+  loading?: React.ImgHTMLAttributes<HTMLImageElement>["loading"];
 }) {
   const [open, setOpen] = useState(false);
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
@@ -329,7 +338,10 @@ export function ZoomableImage({
             <img
               src={objectUrl}
               alt={alt}
+              title={title}
               decoding="async"
+              referrerPolicy={referrerPolicy}
+              loading={loading}
               onError={(e) => onError?.(e)}
               className={cn(imgClassName, status !== "loaded" && "absolute inset-0 h-full w-full opacity-0")}
             />
@@ -385,6 +397,7 @@ export function ZoomableImage({
         peek={peek}
         initialMode="view"
         readOnly={readOnly}
+        referrerPolicy={referrerPolicy}
       />
     </>
   );

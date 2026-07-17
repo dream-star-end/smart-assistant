@@ -18,4 +18,6 @@ test('管理中心关闭按钮仅在粗指针扩大到 44px', () => {
     />,
   )
   expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
+  expect(screen.getByRole('dialog')).toHaveClass('oc-center-dialog', 'h-[min(85vh,44rem)]', 'h-[min(85dvh,44rem)]')
+  expect(screen.getByRole('dialog')).not.toHaveClass('top-1/2')
 })
