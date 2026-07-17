@@ -884,11 +884,12 @@ describe('v5 release safety lanes', () => {
         .filter((name) => name !== '' && name !== '$allowed'),
     )
     const v5Owned = [...indexSource.matchAll(
-      /name:\s*"([^"]+)",\s*\n\s*domain:\s*"v5-owned"/g,
+      /leaderBundle\.add\(\{\s*\n\s*name:\s*["']([^"']+)["'],\s*\n\s*domain:\s*["']v5-owned["']/g,
     )].map((match) => match[1])
 
     assert.ok(v5Owned.includes('imageUsageSweep'))
     assert.ok(v5Owned.includes('githubWorkspaceSweeper'))
+    assert.ok(v5Owned.includes('knowledgePlanetAutomation'))
     assert.deepEqual(v5Owned.filter((name) => !allowed.has(name)), [])
   })
 
@@ -913,6 +914,7 @@ describe('v5 release safety lanes', () => {
     }
     assert.ok(metadata.requiredMigrations.includes('0135_deploy_state'))
     assert.ok(metadata.requiredMigrations.includes('0153_marketplace_plugin_kernel'))
+    assert.ok(metadata.requiredMigrations.includes('0168_knowledge_planet_automation'))
     const source = await readFile(deploy, 'utf8')
     const gateAt = source.indexOf('assert_repo_required_migrations || exit 1')
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
