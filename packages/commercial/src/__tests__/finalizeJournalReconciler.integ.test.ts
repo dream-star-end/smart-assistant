@@ -16,6 +16,7 @@ import {
   DEFAULT_DURABLE_WAIVER_AGE_MS,
   gcFinalizeJournal,
   reconcileStuckFinalizeJournal,
+  scanStuckDurableFinalizing,
 } from '../billing/finalizeJournalReconciler.js'
 import {
   DURABLE_CODEX_RECOVERY_VERSION,
@@ -455,5 +456,52 @@ describe('gcFinalizeJournal (integ)', () => {
     })
     assert.equal(await gcFinalizeJournal(GC_AGE_MS, 10), 0)
     assert.equal((await getJournal('g-durable'))?.state, 'committed')
+  })
+})
+
+// G2:三条 CAS 都不覆盖的死角 —— durable finalizing 无 usage 老化行,只读扫描检出、
+// **绝不改状态**(告警交人工裁定,状态原样)。这里锁真 SQL 谓词与"行状态不变"。
+describe('scanStuckDurableFinalizing (integ)', () => {
+  const ALERT_AGE_MS = 48 * 3_600_000 // 48h 告警龄
+  const AGED_MS = 60 * 3_600_000 // 60h(> 告警龄)
+  const YOUNG_MS = 30 * 3_600_000 // 30h(< 告警龄)
+
+  test('durable finalizing 老化且无 usage → 检出且行状态原样 finalizing', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('scan-hit@t.co')
+    await insertJournal('scan-hit', u, { state: 'finalizing', ageMs: AGED_MS, durable: true })
+    const rows = await scanStuckDurableFinalizing(ALERT_AGE_MS, 100)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0]!.requestId, 'scan-hit')
+    assert.equal(rows[0]!.userId, u.toString())
+    assert.ok(rows[0]!.ageMs >= AGED_MS - 60_000, 'ageMs 约等于注入龄')
+    // 扫描是只读的 —— 行状态必须原样(不自动终态)
+    assert.equal((await getJournal('scan-hit'))?.state, 'finalizing')
+  })
+
+  test('未达告警龄 / 有 usage / 非 durable / inflight 四类均不检出', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('scan-miss@t.co')
+    // 1) 未达 48h
+    await insertJournal('young', u, { state: 'finalizing', ageMs: YOUNG_MS, durable: true })
+    // 2) 已有 usage 证据(有真相 → 归 committed CAS,不该告警)
+    await insertUsage(u, 'has-usage', { cost: 1n })
+    await insertJournal('has-usage', u, { state: 'finalizing', ageMs: AGED_MS, durable: true })
+    // 3) 非 durable(老化 non-durable finalizing 由 aborted CAS 处置,不归本扫描)
+    await insertJournal('legacy', u, { state: 'finalizing', ageMs: AGED_MS, durable: false })
+    // 4) durable inflight(归 durableWaived CAS,不是 finalizing)
+    await insertJournal('inflight', u, { state: 'inflight', ageMs: AGED_MS, durable: true })
+    const rows = await scanStuckDurableFinalizing(ALERT_AGE_MS, 100)
+    assert.equal(rows.length, 0)
+  })
+
+  test('LIMIT 生效:多行只取前 N', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('scan-limit@t.co')
+    await insertJournal('s1', u, { state: 'finalizing', ageMs: AGED_MS, durable: true })
+    await insertJournal('s2', u, { state: 'finalizing', ageMs: AGED_MS + 1000, durable: true })
+    await insertJournal('s3', u, { state: 'finalizing', ageMs: AGED_MS + 2000, durable: true })
+    const rows = await scanStuckDurableFinalizing(ALERT_AGE_MS, 2)
+    assert.equal(rows.length, 2)
   })
 })

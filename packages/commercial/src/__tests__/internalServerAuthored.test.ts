@@ -263,6 +263,119 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
   });
 });
 
+// 止血批 A · A3:turn tape 落库错误的瞬态 vs 永久分类。瞬态(statement timeout / 死锁 /
+// 连接类)→ 503 TURN_TAPE_RETRYABLE(容器 fsync 队列幂等重试);真正的 immutable 冲突 →
+// 仍 409 TURN_TAPE_CONFLICT。回归:生产曾把 statement_timeout 误报 409 → part 永久丢失。
+describe("internalServerAuthored handler — lossless turn tape error classification", () => {
+  const turnKey = "a".repeat(64);
+  const tapeId = "b".repeat(64);
+  const bytes = Buffer.from("hi", "utf8");
+  const sha = createHash("sha256").update(bytes).digest("hex");
+
+  const partBody: LosslessTurnTapePartRequest = {
+    protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+    action: "part",
+    sessionId: "web-test1",
+    agentId: "main",
+    turnIndex: 1,
+    status: "completed",
+    turnKey,
+    tapeId,
+    tapeSha256: sha,
+    totalBytes: bytes.length,
+    partCount: 1,
+    partIndex: 0,
+    partSha256: sha,
+    data: bytes.toString("base64"),
+    createdAt: 1_783_944_000_000,
+  };
+  const finalizeBody: LosslessTurnTapeFinalizeRequest = {
+    protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+    action: "finalize",
+    sessionId: "web-test1",
+    agentId: "main",
+    turnIndex: 1,
+    status: "completed",
+    turnKey,
+    tapeId,
+    tapeSha256: sha,
+    totalBytes: bytes.length,
+    partCount: 1,
+    createdAt: 1_783_944_000_000,
+  };
+
+  function handlerThrowing(
+    on: "part" | "finalize",
+    err: () => never,
+  ): ReturnType<typeof makeServerAuthoredHandler> {
+    return makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          if (on === "part") return err();
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          if (on === "finalize") return err();
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
+        },
+      },
+    });
+  }
+
+  async function run(
+    handler: ReturnType<typeof makeServerAuthoredHandler>,
+    body: unknown,
+  ): Promise<{ status?: number; code?: string }> {
+    const { res, rec } = makeRes();
+    await handler(makeReq({ body: JSON.stringify(body), auth: `Bearer ${VALID_TOKEN}` }), res, CTX);
+    let code: string | undefined;
+    try {
+      code = (JSON.parse(rec.body) as { error?: { code?: string } }).error?.code;
+    } catch {
+      /* */
+    }
+    return { status: rec.status, code };
+  }
+
+  test("part: statement_timeout(57014)形态 → 503 TURN_TAPE_RETRYABLE", async () => {
+    const handler = handlerThrowing("part", () => {
+      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    });
+    const r = await run(handler, partBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("part: immutable 冲突形态 → 仍 409 TURN_TAPE_CONFLICT", async () => {
+    const handler = handlerThrowing("part", () => {
+      throw new Error("lossless turn tape immutable part conflict");
+    });
+    const r = await run(handler, partBody);
+    assert.equal(r.status, 409);
+    assert.equal(r.code, "TURN_TAPE_CONFLICT");
+  });
+
+  test("finalize: 死锁(40P01)形态 → 503 TURN_TAPE_RETRYABLE", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("finalize: 校验冲突形态 → 仍 409 TURN_TAPE_CONFLICT", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw new Error("lossless turn tape finalize header conflict");
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 409);
+    assert.equal(r.code, "TURN_TAPE_CONFLICT");
+  });
+});
+
 // ─── tests ───────────────────────────────────────────────────────────────
 
 describe("internalServerAuthored handler — method gate", () => {
