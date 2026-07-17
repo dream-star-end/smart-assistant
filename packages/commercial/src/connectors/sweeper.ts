@@ -5,8 +5,8 @@
  * 与其它 leader 门控调度器同挂;本模块只管**活跃态转换**三职责,全部 DB CAS +
  * SKIP LOCKED 幂等:
  *
- *   1. stale executing → unknown(超 action 总时限 + 缓冲;**绝不回 approved** ——
- *      "可能已发出"的写不允许二次执行)+ 销毁 params
+ *   1. stale executing → Plugin 的 DB dispatch fence 尚未 armed 则 failed；其余
+ *      unknown(超 action 总时限 + 缓冲；"可能已发出"的写不允许二次执行)+ 销毁 params
  *   2. pending|approved 过期 → expired + 销毁 params
  *   3. connector_oauth_pending 过期行 **DELETE 整行**(未消费行密文随行销毁)
  *
@@ -54,11 +54,21 @@ async function sweepOnce(
     oauthDeleted: 0,
   }
 
-  // ① stale executing → unknown(SKIP LOCKED:与在飞 finalize 的行锁互让)
+  // ① stale executing:Plugin pre-arm 是确定未发出 → failed；legacy/armed → unknown。
+  // dispatch_fence_required 默认 FALSE，既有连接器保持原保守语义。
   try {
     const r = await pool.query(
       `UPDATE connector_write_ledger
-          SET status = 'unknown', error_code = 'STALE_EXECUTING', finished_at = now(),
+          SET status = CASE
+                WHEN dispatch_fence_required AND dispatch_armed_at IS NULL THEN 'failed'
+                ELSE 'unknown'
+              END,
+              error_code = CASE
+                WHEN dispatch_fence_required AND dispatch_armed_at IS NULL
+                  THEN 'PRE_DISPATCH_STALE'
+                ELSE 'STALE_EXECUTING'
+              END,
+              finished_at = now(),
               params_enc = NULL, params_nonce = NULL
         WHERE id IN (
           SELECT id FROM connector_write_ledger

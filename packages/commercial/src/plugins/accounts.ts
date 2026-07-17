@@ -297,6 +297,9 @@ export interface PluginAccountRow {
   spec_hash: Buffer
   exec_contract_hash: Buffer
   auth_contract_version: number
+  plugin_write_enabled: boolean
+  plugin_write_disclaimer_version: number | null
+  plugin_write_disclaimer_accepted_at: Date | null
   status: 'active' | 'error'
   meta: Record<string, unknown>
   revoked_at: Date | null
@@ -306,7 +309,8 @@ const ACCOUNT_COLS = `id::text AS id, user_id::int AS user_id, provider, display
   account_key, aad_seed::text AS aad_seed, secret_enc, secret_nonce, revision,
   secret_generation::text AS secret_generation,
   connector_version_id::text AS connector_version_id, spec_hash, exec_contract_hash,
-  auth_contract_version, status, meta, revoked_at`
+  auth_contract_version, plugin_write_enabled, plugin_write_disclaimer_version,
+  plugin_write_disclaimer_accepted_at, status, meta, revoked_at`
 
 function encryptEnvelope(
   envelope: PluginAccountEnvelopeV1,
@@ -932,7 +936,9 @@ export async function getPluginAccount(
             c.account_key, c.aad_seed::text AS aad_seed, c.secret_enc, c.secret_nonce,
             c.revision, c.secret_generation::text AS secret_generation,
             c.connector_version_id::text AS connector_version_id, c.spec_hash,
-            c.exec_contract_hash, c.auth_contract_version, c.status, c.meta, c.revoked_at
+            c.exec_contract_hash, c.auth_contract_version,
+            c.plugin_write_enabled, c.plugin_write_disclaimer_version,
+            c.plugin_write_disclaimer_accepted_at, c.status, c.meta, c.revoked_at
        FROM connections c
       JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
       JOIN marketplace_skill_listings l ON l.slug = v.slug

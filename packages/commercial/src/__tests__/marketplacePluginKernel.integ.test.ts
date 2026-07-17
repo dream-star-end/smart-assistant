@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { after, before, describe, test } from 'node:test'
 import { listDeclarativeConnections } from '../connectors/engine/binding.js'
+import { ConnectorError } from '../connectors/errors.js'
+import { approveConfirmation, getLedgerRow } from '../connectors/ledger.js'
 import { listConnections } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
@@ -1268,7 +1270,161 @@ describe('marketplace Plugin kernel migration', () => {
         env: process.env,
         browserRuntime: { supportsContract: () => true } as never,
       })
-      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 15)
+      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 17)
+      const offTarget = (await facade.list(activeUserId)).find(
+        (target) => target.id === activeAccount.id,
+      )
+      assert.ok(offTarget)
+      assert.equal(offTarget.actions.length, 15)
+      assert.equal(
+        offTarget.actions.some((action) => !action.readOnly),
+        false,
+      )
+      const offManagement = await facade.management(activeUserId)
+      const offControl = offManagement.accounts.find(
+        (account) => account.id === activeAccount.id,
+      )?.writeControl
+      assert.ok(offControl)
+      assert.deepEqual(
+        {
+          available: offControl.available,
+          enabled: offControl.enabled,
+          acceptedVersion: offControl.acceptedVersion,
+          acceptedAt: offControl.acceptedAt,
+        },
+        { available: true, enabled: false, acceptedVersion: null, acceptedAt: null },
+      )
+      assert.match(offControl.disclaimerText, /真实知识星球身份/)
+      assert.match(offControl.disclaimerText, /每一次发布或评论仍须由你在对话确认卡中单独确认/)
+      assert.match(offControl.disclaimerText, /不会自动重试/)
+      await assert.rejects(
+        facade.proposeWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          actionId: 'create_topic',
+          params: { groupId: '123456', text: 'default-off probe' },
+        }),
+        (error: unknown) =>
+          error instanceof PluginRuntimeFacadeError && error.code === 'WRITE_DISABLED',
+      )
+      await assert.rejects(
+        facade.call({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          actionId: 'create_topic',
+          params: { groupId: '123456', text: 'must confirm' },
+        }),
+        (error: unknown) =>
+          error instanceof PluginRuntimeFacadeError && error.code === 'WRITE_REQUIRES_CONFIRMATION',
+      )
+
+      const enabledControl = await facade.setManagedAccountWriteAccess({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: offControl.disclaimerVersion,
+      })
+      assert.equal(enabledControl.enabled, true)
+      assert.equal(enabledControl.acceptedVersion, offControl.disclaimerVersion)
+      assert.ok(enabledControl.acceptedAt)
+      const onTarget = (await facade.list(activeUserId)).find(
+        (target) => target.id === activeAccount.id,
+      )
+      assert.ok(onTarget)
+      assert.equal(onTarget.actions.length, 17)
+      assert.deepEqual(
+        onTarget.actions.filter((action) => !action.readOnly).map((action) => action.id),
+        ['create_topic', 'create_comment'],
+      )
+
+      const staleProposal = await facade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'create_topic',
+        params: { groupId: '123456', text: 'disable-before-arm probe' },
+      })
+      await approveConfirmation(staleProposal.confirmId, activeUserId, getPool())
+      await facade.setManagedAccountWriteAccess({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: false,
+      })
+      await assert.rejects(
+        facade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: staleProposal.confirmId,
+        }),
+        (error: unknown) => error instanceof ConnectorError && error.code === 'REVISION_MISMATCH',
+      )
+      const staleLedger = await getLedgerRow(staleProposal.confirmId, activeUserId, getPool())
+      assert.equal(staleLedger?.dispatch_fence_required, true)
+      assert.equal(staleLedger?.status, 'failed')
+      assert.equal(staleLedger?.dispatch_armed_at, null)
+
+      await facade.setManagedAccountWriteAccess({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: offControl.disclaimerVersion,
+      })
+      const uncertainProposal = await facade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'create_comment',
+        params: { topicId: '987654', text: 'post-arm uncertainty probe' },
+      })
+      await approveConfirmation(uncertainProposal.confirmId, activeUserId, getPool())
+      let dispatches = 0
+      const failingFacade = new PluginRuntimeFacade({
+        pool: getPool(),
+        redis: transitionRedis,
+        env: process.env,
+        browserRuntime: {
+          supportsContract: () => true,
+          async runAction() {
+            dispatches += 1
+            throw new Error('ambiguous worker exit')
+          },
+        } as never,
+      })
+      const uncertain = await failingFacade.executeConfirmedWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        confirmId: uncertainProposal.confirmId,
+      })
+      assert.deepEqual(uncertain, {
+        kind: 'replay',
+        status: 'unknown',
+        errorCode: 'INTERNAL',
+        resultDigest: null,
+      })
+      const uncertainLedger = await getLedgerRow(
+        uncertainProposal.confirmId,
+        activeUserId,
+        getPool(),
+      )
+      assert.equal(uncertainLedger?.status, 'unknown')
+      assert.equal(uncertainLedger?.dispatch_fence_required, true)
+      assert.ok(uncertainLedger?.dispatch_armed_at)
+      assert.equal(uncertainLedger?.params_enc, null)
+      assert.equal(uncertainLedger?.params_nonce, null)
+      assert.deepEqual(
+        await failingFacade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: uncertainProposal.confirmId,
+        }),
+        uncertain,
+      )
+      assert.equal(dispatches, 1, 'unknown replay must never dispatch or retry again')
+      await facade.setManagedAccountWriteAccess({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: false,
+      })
       const orphanManagement = await facade.management(orphanUserId)
       assert.deepEqual(
         orphanManagement.accounts.map((account) => ({
@@ -1475,7 +1631,7 @@ describe('marketplace Plugin kernel migration', () => {
         expectedExecContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
         env: process.env,
       })
-      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 15)
+      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 17)
       const twiceMigratedActive = await getPluginAccount(
         activeAccount.id,
         activeUserId,

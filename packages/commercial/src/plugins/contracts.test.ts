@@ -70,11 +70,16 @@ describe('runtime Plugin contracts', () => {
     })
   })
 
-  test('rejects writable actions and browser network escape declarations', () => {
+  test('accepts managed writes but rejects unsupported effects and browser network escapes', () => {
     const writable = managedArtifact()
     writable.actions[0]!.effect = 'write'
+    const compiled = compileRuntimePluginArtifact(writable)
+    assert.equal(compiled.execContract.actions[0]?.effect, 'write')
+
+    const unsupported = managedArtifact()
+    unsupported.actions[0]!.effect = 'send'
     assert.throws(
-      () => compileRuntimePluginArtifact(writable),
+      () => compileRuntimePluginArtifact(unsupported),
       (error: unknown) =>
         error instanceof RuntimePluginContractError && error.code === 'INVALID_ARTIFACT',
     )
@@ -121,6 +126,27 @@ describe('runtime Plugin contracts', () => {
           },
         }),
       /canonical hostname|safe public hostname/,
+    )
+  })
+
+  test('managed-browser action count is bounded at 32', () => {
+    const action = managedArtifact().actions[0]!
+    const thirtyTwo = {
+      ...managedArtifact(),
+      actions: Array.from({ length: 32 }, (_, index) => ({
+        ...action,
+        id: `read_${index}`,
+      })),
+    }
+    assert.equal(compileRuntimePluginArtifact(thirtyTwo).execContract.actions.length, 32)
+    assert.throws(
+      () =>
+        compileRuntimePluginArtifact({
+          ...thirtyTwo,
+          actions: [...thirtyTwo.actions, { ...action, id: 'read_32' }],
+        }),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_ARTIFACT',
     )
   })
 

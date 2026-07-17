@@ -44,7 +44,9 @@ const expected: KnowledgePlanetVerificationExpected = {
   workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST,
   imageId: `sha256:${'1'.repeat(64)}`,
   sourceCommit: '2'.repeat(40),
-  actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+  actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'read')
+    .map((action) => action.id),
   resourceDependentActionIds: KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS,
   contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
 }
@@ -199,10 +201,7 @@ describe('Knowledge Planet encrypted verification handoff', () => {
     const passedActionIds = expected.actionIds.filter(
       (actionId) => !resourceUnavailableActionIds.includes(actionId),
     )
-    const writeCoverage = (
-      passed: readonly string[],
-      unavailable: readonly string[],
-    ) =>
+    const writeCoverage = (passed: readonly string[], unavailable: readonly string[]) =>
       writeKnowledgePlanetVerificationHandoff({
         expected,
         userId: 1,
@@ -221,10 +220,7 @@ describe('Knowledge Planet encrypted verification handoff', () => {
     await writeCoverage(passedActionIds, resourceUnavailableActionIds)
     const opened = await readKnowledgePlanetVerificationHandoff({ expected, env, now, file })
     assert.deepEqual(opened.metadata.passedActionIds, passedActionIds)
-    assert.deepEqual(
-      opened.metadata.resourceUnavailableActionIds,
-      resourceUnavailableActionIds,
-    )
+    assert.deepEqual(opened.metadata.resourceUnavailableActionIds, resourceUnavailableActionIds)
 
     for (const [passed, unavailable] of [
       [passedActionIds.slice(1), resourceUnavailableActionIds],

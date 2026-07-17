@@ -357,7 +357,7 @@ export class ManagedBrowserRuntime {
     }
   }
 
-  async runReadAction(args: {
+  async runAction(args: {
     contract: ManagedBrowserPluginContractV1
     storageState: BrowserStorageStateV1
     actionId: string
@@ -476,5 +476,22 @@ export class ManagedBrowserRuntime {
         'managed-browser action did not complete',
       )
     return completed
+  }
+
+  /** Compatibility guard for callers that intentionally expose a read-only surface. */
+  async runReadAction(args: {
+    contract: ManagedBrowserPluginContractV1
+    storageState: BrowserStorageStateV1
+    actionId: string
+    params: Record<string, unknown>
+    signal: AbortSignal
+  }): Promise<{ result: unknown; storageState: BrowserStorageStateV1 }> {
+    const action = args.contract.actions.find((candidate) => candidate.id === args.actionId)
+    if (!action || action.effect !== 'read')
+      throw new ManagedBrowserRuntimeError(
+        'ACTION_NOT_FOUND',
+        'managed-browser read action not found',
+      )
+    return this.runAction(args)
   }
 }

@@ -84,7 +84,9 @@ function verificationExpected(imageId: string): KnowledgePlanetVerificationExpec
     workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST,
     imageId,
     sourceCommit: sourceCommitFromEnv(),
-    actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+    actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+      .filter((action) => action.effect === 'read')
+      .map((action) => action.id),
     resourceDependentActionIds: KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS,
     contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   }
@@ -180,6 +182,7 @@ async function runActionSmoke(
 ): Promise<{
   passedActionIds: string[]
   resourceUnavailableActionIds: string[]
+  writeActionIdsSkipped: string[]
   storageState: BrowserStorageStateV1
 }> {
   const registries = createKnowledgePlanetRuntimeRegistries(service)
@@ -374,7 +377,7 @@ async function verifyUser(userId: number): Promise<void> {
           validateKnowledgePlanetAccountState(reusable.storageState),
         )
         process.stdout.write(
-          `Knowledge Planet user ${userId} existing encrypted login executed ${completed.passedActionIds.length} actions; ${completed.resourceUnavailableActionIds.length} resource-dependent actions lacked account data; no scan needed.\n`,
+          `Knowledge Planet user ${userId} existing encrypted login executed ${completed.passedActionIds.length} read actions; ${completed.resourceUnavailableActionIds.length} resource-dependent actions lacked account data; ${completed.writeActionIdsSkipped.length} write actions were contract-verified and intentionally skipped; no scan needed.\n`,
         )
       } catch (error) {
         if (!canRelinkAfter(error)) throw error
@@ -410,7 +413,7 @@ async function verifyUser(userId: number): Promise<void> {
     `KNOWLEDGE_PLANET_VERIFICATION_READY=${KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH}\n`,
   )
   process.stdout.write(
-    `Knowledge Planet exact-image action smoke passed (${metadata.verification}; ${metadata.passedActionIds.length} actions executed, ${metadata.resourceUnavailableActionIds.length} resource-dependent actions lacked account data); encrypted handoff expires at ${metadata.expiresAt}.\n`,
+    `Knowledge Planet exact-image action smoke passed (${metadata.verification}; ${metadata.passedActionIds.length} read actions executed, ${metadata.resourceUnavailableActionIds.length} resource-dependent actions lacked account data; ${completed.writeActionIdsSkipped.length} write actions contract-verified and intentionally skipped); encrypted handoff expires at ${metadata.expiresAt}.\n`,
   )
 }
 
@@ -789,8 +792,7 @@ async function advisoryStatus(): Promise<void> {
   const imageId = imageIdFromEnv()
   await inspectExactImage(docker, imageId)
   const expected = verificationExpected(imageId)
-  const approvedForDeploy =
-    (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  const approvedForDeploy = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
   const handoff = await readHandoffIfPresent(expected)
   const current = await query<{ artifact_hash: string }>(
     `SELECT v.artifact_hash
