@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.2.1'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.3.0'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +18,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.2.1'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.3.0'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.2.1'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.3.0'
 
 const authorSchema = {
   type: 'object',
@@ -40,6 +40,31 @@ const imageSchema = {
     height: { type: 'integer', minimum: 0 },
     size: { type: 'integer', minimum: 0 },
   },
+  additionalProperties: false,
+}
+
+const sha256Schema = {
+  type: 'string',
+  minLength: 64,
+  maxLength: 64,
+  pattern: '^[0-9a-f]{64,64}$',
+}
+
+const mediaPathSchema = { type: 'string', minLength: 1, maxLength: 512 }
+
+/** Server-sealed metadata. Agent input may omit it and may never author it. */
+const sealedMediaSchema = {
+  type: 'object',
+  properties: {
+    path: mediaPathSchema,
+    inputId: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9-]{1,64}$' },
+    filename: { type: 'string', minLength: 1, maxLength: 512 },
+    sizeBytes: { type: 'integer', minimum: 1, maximum: 50 * 1024 * 1024 },
+    sha256: sha256Schema,
+    mimeType: { type: 'string', minLength: 1, maxLength: 128 },
+    kind: { type: 'string', enum: ['image', 'file'] },
+  },
+  required: ['path', 'inputId', 'filename', 'sizeBytes', 'sha256', 'mimeType', 'kind'],
   additionalProperties: false,
 }
 
@@ -83,6 +108,8 @@ const topicSchema = {
     rewardCount: { type: 'integer', minimum: 0 },
     digested: { type: 'boolean' },
     sticky: { type: 'boolean' },
+    liked: { type: 'boolean' },
+    contentDigest: sha256Schema,
     images: { type: 'array', maxItems: 10, items: imageSchema },
     files: { type: 'array', maxItems: 10, items: fileSchema },
     article: articleSchema,
@@ -114,11 +141,14 @@ const commentSchema = {
   properties: {
     id: { type: 'string', maxLength: 32 },
     createdAt: { type: 'string', maxLength: 64 },
-    text: { type: 'string', maxLength: 5_000 },
+    text: { type: 'string', maxLength: 1_200 },
     author: authorSchema,
     replyTo: authorSchema,
     likeCount: { type: 'integer', minimum: 0 },
     sticky: { type: 'boolean' },
+    liked: { type: 'boolean' },
+    images: { type: 'array', maxItems: 1, items: imageSchema },
+    contentDigest: sha256Schema,
   },
   required: ['id'],
   additionalProperties: false,
@@ -153,6 +183,42 @@ const numericIdParamSchema = {
   pattern: '^[0-9]{6,32}$',
 }
 
+const editSnapshotSchema = {
+  type: 'object',
+  properties: {
+    expectedDigest: sha256Schema,
+    previousText: { type: 'string', maxLength: 12_000 },
+    imageIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
+    fileIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
+  },
+  required: ['expectedDigest', 'previousText', 'imageIds', 'fileIds'],
+  additionalProperties: false,
+}
+
+const deleteSnapshotSchema = {
+  type: 'object',
+  properties: {
+    expectedDigest: sha256Schema,
+    preview: { type: 'string', maxLength: 1_000 },
+  },
+  required: ['expectedDigest', 'preview'],
+  additionalProperties: false,
+}
+
+const automationSourceSnapshotSchema = {
+  type: 'object',
+  properties: { expectedDigest: sha256Schema },
+  required: ['expectedDigest'],
+  additionalProperties: false,
+}
+
+const mutationResultSchema = {
+  type: 'object',
+  properties: { ok: { type: 'boolean' } },
+  required: ['ok'],
+  additionalProperties: false,
+}
+
 export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
   schemaVersion: 1,
   pluginType: 'managed-browser',
@@ -164,8 +230,24 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     cookieDomains: ['api.zsxq.com', 'wx.zsxq.com', 'zsxq.com'],
     origins: ['https://api.zsxq.com', 'https://wx.zsxq.com'],
   },
-  network: { origins: ['https://api.zsxq.com'], methods: ['GET', 'POST'] },
+  network: {
+    origins: ['https://api.zsxq.com', 'https://upload-z1.qiniup.com'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  },
   actions: [
+    {
+      id: 'get_self',
+      description: '读取当前授权的知识星球账号身份',
+      effect: 'read',
+      timeoutSeconds: 30,
+      params: { type: 'object', properties: {}, additionalProperties: false },
+      result: {
+        type: 'object',
+        properties: { user: authorSchema },
+        required: ['user'],
+        additionalProperties: false,
+      },
+    },
     {
       id: 'list_groups',
       description: '列出当前账号已加入的知识星球',
@@ -542,16 +624,19 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_topic',
-      description: '在指定知识星球发布纯文本主题（每次执行都需用户单独确认）',
+      description: '在指定知识星球发布文本、图片和附件主题（每次执行都需用户单独确认）',
       effect: 'write',
-      timeoutSeconds: 30,
+      timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
           groupId: numericIdParamSchema,
-          text: { type: 'string', minLength: 1, maxLength: 10_000 },
+          text: { type: 'string', maxLength: 10_000 },
+          images: { type: 'array', maxItems: 9, items: mediaPathSchema },
+          files: { type: 'array', maxItems: 9, items: mediaPathSchema },
+          mediaManifest: { type: 'array', maxItems: 18, items: sealedMediaSchema },
         },
-        required: ['groupId', 'text'],
+        required: ['groupId'],
         additionalProperties: false,
       },
       result: {
@@ -563,16 +648,20 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_comment',
-      description: '在指定主题发布纯文本评论（每次执行都需用户单独确认）',
+      description: '在指定主题发布文字或单图评论/回复（每次执行都需用户单独确认）',
       effect: 'write',
-      timeoutSeconds: 30,
+      timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
           topicId: numericIdParamSchema,
-          text: { type: 'string', minLength: 1, maxLength: 5_000 },
+          text: { type: 'string', maxLength: 1_200 },
+          repliedCommentId: numericIdParamSchema,
+          images: { type: 'array', maxItems: 1, items: mediaPathSchema },
+          mediaManifest: { type: 'array', maxItems: 1, items: sealedMediaSchema },
+          automationSourceSnapshot: automationSourceSnapshotSchema,
         },
-        required: ['topicId', 'text'],
+        required: ['topicId'],
         additionalProperties: false,
       },
       result: {
@@ -581,6 +670,89 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
         required: ['comment'],
         additionalProperties: false,
       },
+    },
+    {
+      id: 'edit_topic',
+      description: '完整编辑普通主题正文并可追加图片或附件（保留现有媒体，逐次确认）',
+      effect: 'write',
+      timeoutSeconds: 600,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          topicId: numericIdParamSchema,
+          text: { type: 'string', maxLength: 10_000 },
+          preserveExistingMedia: { type: 'boolean' },
+          images: { type: 'array', maxItems: 9, items: mediaPathSchema },
+          files: { type: 'array', maxItems: 9, items: mediaPathSchema },
+          mediaManifest: { type: 'array', maxItems: 18, items: sealedMediaSchema },
+          editSnapshot: editSnapshotSchema,
+        },
+        required: ['groupId', 'topicId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { topic: topicSchema },
+        required: ['topic'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'delete_topic',
+      description: '永久删除主题（不可撤销，逐次确认）',
+      effect: 'write',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { topicId: numericIdParamSchema, deleteSnapshot: deleteSnapshotSchema },
+        required: ['topicId'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
+    },
+    {
+      id: 'delete_comment',
+      description: '永久删除评论或回复（不可撤销，逐次确认）',
+      effect: 'write',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          topicId: numericIdParamSchema,
+          commentId: numericIdParamSchema,
+          deleteSnapshot: deleteSnapshotSchema,
+        },
+        required: ['topicId', 'commentId'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
+    },
+    {
+      id: 'set_topic_like',
+      description: '把主题点赞状态设置为已赞或未赞（逐次确认）',
+      effect: 'write',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { topicId: numericIdParamSchema, liked: { type: 'boolean' } },
+        required: ['topicId', 'liked'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
+    },
+    {
+      id: 'set_comment_like',
+      description: '把评论点赞状态设置为已赞或未赞（逐次确认）',
+      effect: 'write',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { commentId: numericIdParamSchema, liked: { type: 'boolean' } },
+        required: ['commentId', 'liked'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
     },
   ],
 } as const)

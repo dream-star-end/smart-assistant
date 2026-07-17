@@ -118,8 +118,8 @@ describe('official Knowledge Planet Plugin', () => {
   test('has a signed read/write action network separated from login/account state', () => {
     assert.equal(COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType, 'managed-browser')
     assert.deepEqual(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network, {
-      origins: ['https://api.zsxq.com:443'],
-      methods: ['GET', 'POST'],
+      origins: ['https://api.zsxq.com:443', 'https://upload-z1.qiniup.com:443'],
+      methods: ['DELETE', 'GET', 'POST', 'PUT'],
       forbiddenChannels: [
         'background-network',
         'doh',
@@ -136,21 +136,22 @@ describe('official Knowledge Planet Plugin', () => {
     assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://open.weixin.qq.com:443'))
     assert.equal(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
-      15,
+      16,
     )
     assert.equal(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'write').length,
-      2,
+      7,
     )
   })
 
-  test('v1.2 exposes bounded reads plus confirmed text writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.2.1')
+  test('v1.3 exposes bounded reads plus confirmed rich writes without credential-bearing results', () => {
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.3.0')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
       [
+        'get_self',
         'list_groups',
         'get_group',
         'list_topics',
@@ -168,6 +169,11 @@ describe('official Knowledge Planet Plugin', () => {
         'list_checkin_topics',
         'create_topic',
         'create_comment',
+        'edit_topic',
+        'delete_topic',
+        'delete_comment',
+        'set_topic_like',
+        'set_comment_like',
       ],
     )
     const forbidden = /(?:url|uri|href|token|cookie|header|signature|secret)/i
@@ -196,7 +202,17 @@ describe('official Knowledge Planet Plugin', () => {
       const idNames = Object.keys(schema.properties ?? {}).filter((name) => name.endsWith('Id'))
       if (idNames.length === 0) continue
       const valid: Record<string, unknown> = {}
-      for (const name of schema.required ?? []) valid[name] = name === 'keyword' ? 'x' : '123456'
+      for (const name of schema.required ?? []) {
+        const property = schema.properties?.[name]
+        valid[name] =
+          property?.type === 'boolean'
+            ? true
+            : property?.type === 'integer'
+              ? 1
+              : name === 'keyword'
+                ? 'x'
+                : '123456'
+      }
       validateRuntimePluginJson(action.params, valid, 'params')
       for (const name of idNames) {
         assert.deepEqual(schema.properties?.[name], {
@@ -214,22 +230,23 @@ describe('official Knowledge Planet Plugin', () => {
         checked++
       }
     }
-    assert.equal(checked, 17)
+    assert.ok(checked >= 20)
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /const NUMERIC_ID = \/\^\\d\{6,32\}\$\//)
   })
 
-  test('builds exact one-shot POST bytes and signatures for topic and comment writes', () => {
+  test('builds exact one-shot mutation bytes and the current URL/request signature', () => {
     const helpers = Function(
       'createHash',
       'Buffer',
       'NUMERIC_ID',
-      `'use strict'; ${KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE}; return { buildKnowledgePlanetWriteRequest, knowledgePlanetPostSignature };`,
+      `'use strict'; ${KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE}; return { buildKnowledgePlanetWriteRequest, knowledgePlanetSignature };`,
     )(createHash, Buffer, /^\d{6,32}$/) as {
       buildKnowledgePlanetWriteRequest: (
         action: string,
         params: Record<string, unknown>,
+        uploaded?: { imageIds?: string[]; fileIds?: string[] },
       ) => { path: string; body: string; method: string } | null
-      knowledgePlanetPostSignature: (timestamp: string, body: string) => string
+      knowledgePlanetSignature: (url: string, timestamp: string, requestId: string) => string
     }
     const topic = helpers.buildKnowledgePlanetWriteRequest('create_topic', {
       groupId: '123456789',
@@ -241,7 +258,7 @@ describe('official Knowledge Planet Plugin', () => {
       topic.body,
       JSON.stringify({
         req_data: {
-          type: 'topic',
+          type: 'talk',
           text: '含中文与 "引号"',
           image_ids: [],
           file_ids: [],
@@ -250,10 +267,12 @@ describe('official Knowledge Planet Plugin', () => {
       }),
     )
     const timestamp = '1774404109'
+    const requestId = '12345678-1234-4234-8234-123456789abc'
+    const url = "https://api.zsxq.com/v2/groups/123456789/topics?q='x'"
     const expected = createHash('sha1')
-      .update(timestamp + createHash('md5').update(Buffer.from(topic.body, 'utf8')).digest('hex'))
+      .update(`https://api.zsxq.com/v2/groups/123456789/topics?q=%27x%27 1774404109 ${requestId}`)
       .digest('hex')
-    assert.equal(helpers.knowledgePlanetPostSignature(timestamp, topic.body), expected)
+    assert.equal(helpers.knowledgePlanetSignature(url, timestamp, requestId), expected)
 
     const comment = helpers.buildKnowledgePlanetWriteRequest('create_comment', {
       topicId: '223456789',
@@ -264,6 +283,58 @@ describe('official Knowledge Planet Plugin', () => {
       comment.body,
       JSON.stringify({ req_data: { text: '评论', image_ids: [], mentioned_user_ids: [] } }),
     )
+    assert.deepEqual(
+      helpers.buildKnowledgePlanetWriteRequest(
+        'create_topic',
+        { groupId: '123456789', text: '' },
+        { imageIds: ['323456789'], fileIds: ['423456789'] },
+      ),
+      {
+        method: 'POST',
+        path: '/v2/groups/123456789/topics',
+        query: {},
+        resultKind: 'topic',
+        body: JSON.stringify({
+          req_data: {
+            type: 'talk',
+            text: '',
+            image_ids: ['323456789'],
+            file_ids: ['423456789'],
+            mentioned_user_ids: [],
+          },
+        }),
+      },
+    )
+    assert.equal(
+      helpers.buildKnowledgePlanetWriteRequest('delete_topic', { topicId: '223456789' })?.method,
+      'DELETE',
+    )
+    assert.equal(
+      helpers.buildKnowledgePlanetWriteRequest('set_comment_like', {
+        commentId: '523456789',
+        liked: false,
+      })?.method,
+      'DELETE',
+    )
+    assert.equal(
+      helpers.buildKnowledgePlanetWriteRequest('set_comment_like', {
+        commentId: '523456789',
+        liked: true,
+      })?.body,
+      undefined,
+    )
+    assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /uploadData\.upload_zone\?\.domains/)
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /JSON\.stringify\(\{ req_data: item\.kind === 'image'/,
+    )
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /type: 'image', size: item\.sizeBytes, name: '', hash: ''/,
+    )
+    assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /data\?\.succeeded !== true/)
+    assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /dataAt\(data\)\.image_id/)
+    assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /dataAt\(data\)\.file_id/)
     assert.equal([...KNOWLEDGE_PLANET_WORKER_SOURCE.matchAll(/api\.fetch\(/g)].length, 1)
     assert.doesNotMatch(KNOWLEDGE_PLANET_WORKER_SOURCE, /retry|retries/i)
   })
@@ -426,7 +497,7 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('flushes action terminal frames before exiting instead of waiting on proxy cleanup', () => {
-    const actionStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runAction')
+    const actionStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function fetchApi')
     const probeStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
       '\nasync function authenticatedProbe',
       actionStart,
@@ -577,7 +648,7 @@ describe('official Knowledge Planet Plugin', () => {
     }
     const ready = workerFrame({
       event: 'ready',
-      runtime: 'knowledge-planet-worker-v1.2',
+      runtime: 'knowledge-planet-worker-v1.3',
       playwrightMcpVersion: '0.0.76',
     })
     const completedBase = {

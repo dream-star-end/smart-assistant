@@ -43,7 +43,15 @@ describe('Knowledge Planet authenticated action smoke', () => {
         .map((action) => action.id),
     )
     assert.deepEqual(completed.resourceUnavailableActionIds, [])
-    assert.deepEqual(completed.writeActionIdsSkipped, ['create_topic', 'create_comment'])
+    assert.deepEqual(completed.writeActionIdsSkipped, [
+      'create_topic',
+      'create_comment',
+      'edit_topic',
+      'delete_topic',
+      'delete_comment',
+      'set_topic_like',
+      'set_comment_like',
+    ])
     assert.deepEqual(calls.find((call) => call.actionId === 'get_topic')?.params, {
       topicId: '223456789',
     })

@@ -29,6 +29,13 @@ import {
 } from './accounts.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
+import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
+import {
+  type KnowledgePlanetMediaDeps,
+  type KnowledgePlanetSealedMedia,
+  sealKnowledgePlanetMedia,
+  stageKnowledgePlanetMedia,
+} from './knowledgePlanetMedia.js'
 import type { VerifiedLocalPluginRuntime } from './localRuntime.js'
 import {
   type VerifiedRuntimePluginContract,
@@ -110,6 +117,13 @@ export type RuntimePluginWriteExecution =
       errorCode: string | null
       resultDigest: string | null
     }
+
+export type KnowledgePlanetAutomationExecution =
+  | { kind: 'result'; result: unknown }
+  | { kind: 'deferred'; errorCode: 'AUTOMATION_DISPATCH_BUSY' }
+  | { kind: 'not_dispatched'; errorCode: string }
+  | { kind: 'failed'; errorCode: string }
+  | { kind: 'unknown'; errorCode: string }
 
 interface CatalogRow {
   id: string
@@ -203,6 +217,7 @@ export class PluginRuntimeFacade {
       profileRoot?: string
       resolver?: DnsResolver
       env?: NodeJS.ProcessEnv
+      knowledgePlanetMedia?: KnowledgePlanetMediaDeps
     } = {},
   ) {
     this.pool = opts.pool ?? getPool()
@@ -723,6 +738,33 @@ export class PluginRuntimeFacade {
         )
         if ((result.rowCount ?? 0) !== 1)
           throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin write toggle CAS failed')
+        if (!input.enabled) {
+          await client.query(
+            `UPDATE plugin_automation_controls
+                SET enabled = FALSE, paused_reason = 'MANUAL_WRITE_DISABLED',
+                    revision = revision + 1, updated_at = now()
+              WHERE connection_id = $1::bigint AND user_id = $2`,
+            [input.targetId, input.userId],
+          )
+          await client.query(
+            `UPDATE plugin_automation_rules
+                SET enabled = FALSE, paused_reason = 'MANUAL_WRITE_DISABLED',
+                    lease_token = NULL, lease_until = NULL,
+                    revision = revision + 1, updated_at = now()
+              WHERE connection_id = $1::bigint AND user_id = $2 AND deleted_at IS NULL`,
+            [input.targetId, input.userId],
+          )
+          await client.query(
+            `UPDATE plugin_automation_runs
+                SET status = 'skipped', reason_code = 'MANUAL_WRITE_DISABLED',
+                    reply_enc = NULL, reply_nonce = NULL, reply_hash = NULL,
+                    dispatch_claim_token = NULL, dispatch_claim_until = NULL,
+                    finished_at = now()
+              WHERE connection_id = $1::bigint AND user_id = $2
+                AND status IN ('reserved','generating','ready')`,
+            [input.targetId, input.userId],
+          )
+        }
         return result.rows[0]!
       }, this.pool)
       const control = writeControlFor(
@@ -735,6 +777,145 @@ export class PluginRuntimeFacade {
     } finally {
       await lease.release()
     }
+  }
+
+  private async prepareKnowledgePlanetWriteParams(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<Record<string, unknown>> {
+    if (
+      Object.hasOwn(input.params, 'mediaManifest') ||
+      Object.hasOwn(input.params, 'editSnapshot') ||
+      Object.hasOwn(input.params, 'deleteSnapshot') ||
+      Object.hasOwn(input.params, 'automationSourceSnapshot')
+    )
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
+
+    const prepared: Record<string, unknown> = { ...input.params }
+    const imagePaths = Array.isArray(input.params.images)
+      ? (input.params.images as unknown[]).filter(
+          (value): value is string => typeof value === 'string',
+        )
+      : []
+    const filePaths = Array.isArray(input.params.files)
+      ? (input.params.files as unknown[]).filter(
+          (value): value is string => typeof value === 'string',
+        )
+      : []
+    if (imagePaths.length + filePaths.length > 0) {
+      if (!this.opts.knowledgePlanetMedia)
+        throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+      prepared.mediaManifest = await sealKnowledgePlanetMedia({
+        userId: input.userId,
+        items: [
+          ...imagePaths.map((path) => ({ path, kind: 'image' as const })),
+          ...filePaths.map((path) => ({ path, kind: 'file' as const })),
+        ],
+        deps: this.opts.knowledgePlanetMedia,
+      })
+    } else if (['create_topic', 'create_comment', 'edit_topic'].includes(input.actionId)) {
+      prepared.mediaManifest = []
+    }
+    if (['create_topic', 'create_comment', 'edit_topic'].includes(input.actionId))
+      prepared.text = typeof input.params.text === 'string' ? input.params.text : ''
+
+    if (input.actionId === 'edit_topic' || input.actionId === 'delete_topic') {
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'get_topic',
+        params: { topicId: String(input.params.topicId ?? '') },
+      })) as { topic?: Record<string, unknown> }
+      const topic = read?.topic
+      const digest = topic?.contentDigest
+      if (!topic || typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest))
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic snapshot is unavailable')
+      const imageIds = Array.isArray(topic.images)
+        ? topic.images.flatMap((item) => {
+            const id = (item as Record<string, unknown>)?.id
+            return typeof id === 'string' ? [id] : []
+          })
+        : []
+      const fileIds = Array.isArray(topic.files)
+        ? topic.files.flatMap((item) => {
+            const id = (item as Record<string, unknown>)?.id
+            return typeof id === 'string' ? [id] : []
+          })
+        : []
+      if (input.actionId === 'edit_topic') {
+        if (topic.type !== 'talk')
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin can edit ordinary Knowledge Planet topics only',
+          )
+        const preserve = input.params.preserveExistingMedia !== false
+        const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
+        const newImages = manifest.filter((item) => item.kind === 'image').length
+        const newFiles = manifest.filter((item) => item.kind === 'file').length
+        if (
+          (preserve ? imageIds.length : 0) + newImages > 9 ||
+          (preserve ? fileIds.length : 0) + newFiles > 9
+        )
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic media limit exceeded')
+        prepared.preserveExistingMedia = preserve
+        prepared.editSnapshot = {
+          expectedDigest: digest,
+          previousText: typeof topic.text === 'string' ? topic.text : '',
+          imageIds,
+          fileIds,
+        }
+        if (
+          String(prepared.text ?? '').length === 0 &&
+          (preserve ? imageIds.length + fileIds.length : 0) + newImages + newFiles === 0
+        )
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic cannot be empty')
+      } else {
+        prepared.deleteSnapshot = {
+          expectedDigest: digest,
+          preview: String(topic.text ?? topic.title ?? '').slice(0, 1000),
+        }
+      }
+    }
+
+    if (input.actionId === 'delete_comment') {
+      const topicId = String(input.params.topicId ?? '')
+      const commentId = String(input.params.commentId ?? '')
+      let comment: Record<string, unknown> | undefined
+      for (const sort of ['desc', 'asc'] as const) {
+        const read = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'list_comments',
+          params: { topicId, count: 50, sort },
+        })) as { comments?: Record<string, unknown>[] }
+        comment = read.comments?.find((candidate) => candidate.id === commentId)
+        if (comment) break
+      }
+      const digest = comment?.contentDigest
+      if (!comment || typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest))
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment snapshot is unavailable')
+      prepared.deleteSnapshot = {
+        expectedDigest: digest,
+        preview: String(comment.text ?? '').slice(0, 1000),
+      }
+    }
+
+    if (input.actionId === 'create_topic') {
+      const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
+      if (String(prepared.text ?? '').length === 0 && manifest.length === 0)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic cannot be empty')
+    }
+    if (input.actionId === 'create_comment') {
+      const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
+      if (
+        manifest.some((item) => item.kind !== 'image') ||
+        (String(prepared.text ?? '').length === 0 && manifest.length === 0)
+      )
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment cannot be empty')
+    }
+    return prepared
   }
 
   async proposeWrite(input: {
@@ -760,6 +941,11 @@ export class PluginRuntimeFacade {
       throw error
     }
 
+    const sealedParams =
+      initial.verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
+        ? await this.prepareKnowledgePlanetWriteParams(input)
+        : input.params
+
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,
     })
@@ -782,7 +968,7 @@ export class PluginRuntimeFacade {
       )
       if (!control?.enabled)
         throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin writes are disabled')
-      validateRuntimePluginJson(action.params, input.params, 'params')
+      validateRuntimePluginJson(action.params, sealedParams, 'params')
       await lease.assertHeld()
       const proposed = await proposeLedgerWrite(
         {
@@ -791,11 +977,11 @@ export class PluginRuntimeFacade {
           connectionRevision: current.row.revision,
           provider: current.verified.slug,
           action: action.id,
-          params: input.params,
+          params: sealedParams,
           summary: buildWriteSummary(
             current.verified.slug,
             action.id,
-            input.params,
+            sealedParams,
             typeof current.row.meta?.account_hint === 'string' ? current.row.meta.account_hint : '',
           ),
           contractPins: {
@@ -851,7 +1037,7 @@ export class PluginRuntimeFacade {
     if (classification.kind === 'replay') return ledgerReplay(snapshot)
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
-      hardTimeoutMs: 120_000,
+      hardTimeoutMs: 700_000,
     })
     let begun: Extract<Awaited<ReturnType<typeof beginExecute>>, { kind: 'ok' }> | null = null
     let fencedRow: PluginAccountRow | null = null
@@ -893,20 +1079,6 @@ export class PluginRuntimeFacade {
         if (!policy)
           throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin write policy is unavailable')
         await lease.assertHeld()
-        armAttempted = true
-        await armPluginWriteDispatch(
-          {
-            id: input.confirmId,
-            userId: input.userId,
-            connectionId: input.targetId,
-            currentDisclaimerVersion: policy.version,
-          },
-          this.pool,
-        )
-        // From this commit forward the parent is uncertainty-armed before any
-        // worker input is sent. Only a complete validated success may escape unknown.
-        armed = true
-
         fencedRow = await fencePluginAccountInvocation({
           connectionId: input.targetId,
           userId: input.userId,
@@ -915,13 +1087,47 @@ export class PluginRuntimeFacade {
           runner: this.pool,
         })
         const envelope = decryptPluginAccountEnvelope(fencedRow, verified.contract, this.opts.env)
-        const executed = await this.browser.runAction({
-          contract: verified.contract,
-          storageState: envelope.storageState,
-          actionId: begun.row.action,
-          params: begun.params,
-          signal: lease.signal,
-        })
+        const manifest = Array.isArray(begun.params.mediaManifest)
+          ? (begun.params.mediaManifest as KnowledgePlanetSealedMedia[])
+          : []
+        let staged: Awaited<ReturnType<typeof stageKnowledgePlanetMedia>> | null = null
+        if (verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG && manifest.length > 0) {
+          const mediaDeps = this.opts.knowledgePlanetMedia
+          if (!mediaDeps)
+            throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+          staged = await stageKnowledgePlanetMedia({
+            userId: input.userId,
+            manifest,
+            deps: mediaDeps,
+          })
+        }
+        let executed: Awaited<ReturnType<ManagedBrowserRuntime['runAction']>>
+        try {
+          executed = await this.browser.runAction({
+            contract: verified.contract,
+            storageState: envelope.storageState,
+            actionId: begun.row.action,
+            params: begun.params,
+            signal: lease.signal,
+            ...(staged ? { inputDirectory: staged.directory } : {}),
+            beforeDispatch: async () => {
+              await lease.assertHeld()
+              armAttempted = true
+              await armPluginWriteDispatch(
+                {
+                  id: input.confirmId,
+                  userId: input.userId,
+                  connectionId: input.targetId,
+                  currentDisclaimerVersion: policy.version,
+                },
+                this.pool,
+              )
+              armed = true
+            },
+          })
+        } finally {
+          await staged?.cleanup()
+        }
         const currentVerified = await loadVerifiedRuntimePluginContract(
           verified.versionId,
           this.pool,
@@ -960,8 +1166,11 @@ export class PluginRuntimeFacade {
         return { kind: 'result', result: executed.result }
       } catch (error) {
         const code = stablePluginErrorCode(error)
-        let dispatchMayHaveStarted = armed
-        if (!dispatchMayHaveStarted && armAttempted) {
+        const dispatchProvenNotStarted =
+          (error as { dispatchProvenNotStarted?: unknown } | null)?.dispatchProvenNotStarted ===
+          true
+        let dispatchMayHaveStarted = armed && !dispatchProvenNotStarted
+        if (!dispatchProvenNotStarted && !dispatchMayHaveStarted && armAttempted) {
           // The COMMIT response itself can be lost. Never trust a local flag
           // across that ambiguity; reread the durable dispatch boundary.
           const authoritative = await getLedgerRow(input.confirmId, input.userId, this.pool)
@@ -991,6 +1200,128 @@ export class PluginRuntimeFacade {
           this.pool,
         ).catch(() => false)
         return this.authoritativeWriteOutcome(input.userId, input.targetId, input.confirmId)
+      }
+    } finally {
+      await lease.release()
+    }
+  }
+
+  /**
+   * Platform-only unattended path. This is deliberately not exposed by the Plugin RPC or HTTP
+   * write-confirmation surface: it can perform exactly one text-only Knowledge Planet comment,
+   * and only while both the signed current Plugin and the manual-write consent remain valid.
+   * The caller owns the separate automation consent/run ledger and must durably arm it in
+   * `beforeDispatch`; an ambiguous post-arm outcome is never retried.
+   */
+  async executeKnowledgePlanetAutomationComment(input: {
+    userId: number
+    targetId: string
+    topicId: string
+    text: string
+    sourceDigest: string
+    beforeDispatch: () => Promise<void>
+  }): Promise<KnowledgePlanetAutomationExecution> {
+    if (!isSafeDbId(input.targetId))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin account id is malformed')
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: 620_000,
+    })
+    let fencedRow: PluginAccountRow | null = null
+    let verified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }> | null =
+      null
+    let armAttempted = false
+    let armed = false
+    try {
+      try {
+        const current = await this.loadManagedTarget(input.userId, input.targetId)
+        verified = current.verified
+        if (verified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG)
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Automation target is unsupported')
+        const action = verified.contract.actions.find(
+          (candidate) => candidate.id === 'create_comment',
+        )
+        if (!action || action.effect !== 'write')
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Automation action changed')
+        const params = {
+          topicId: input.topicId,
+          text: input.text,
+          images: [],
+          mediaManifest: [],
+          automationSourceSnapshot: { expectedDigest: input.sourceDigest },
+        }
+        validateRuntimePluginJson(action.params, params, 'params')
+        const policy = managedPluginWritePolicy(verified.slug)
+        const control = writeControlFor(verified.slug, verified.contract.actions, current.row)
+        if (!policy || !control?.enabled)
+          throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin writes are disabled')
+        await lease.assertHeld()
+        fencedRow = await fencePluginAccountInvocation({
+          connectionId: input.targetId,
+          userId: input.userId,
+          expectedRevision: current.row.revision,
+          verified,
+          runner: this.pool,
+        })
+        const envelope = decryptPluginAccountEnvelope(fencedRow, verified.contract, this.opts.env)
+        const executed = await this.browser.runAction({
+          contract: verified.contract,
+          storageState: envelope.storageState,
+          actionId: action.id,
+          params,
+          signal: lease.signal,
+          beforeDispatch: async () => {
+            await lease.assertHeld()
+            armAttempted = true
+            await input.beforeDispatch()
+            armed = true
+          },
+        })
+        const currentVerified = await loadVerifiedRuntimePluginContract(
+          verified.versionId,
+          this.pool,
+          { env: this.opts.env },
+        )
+        if (
+          currentVerified.pluginType !== 'managed-browser' ||
+          currentVerified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG ||
+          currentVerified.artifactHash !== verified.artifactHash ||
+          currentVerified.execContractHash !== verified.execContractHash ||
+          !this.browser.supportsContract(currentVerified.contract)
+        )
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed during write')
+        await assertRuntimePluginInstallEntitlement(input.userId, currentVerified, this.pool, {
+          requireCurrent: true,
+        })
+        await lease.assertHeld()
+        await commitPluginAccountState({
+          row: fencedRow,
+          verified: currentVerified,
+          envelope: { ...envelope, storageState: executed.storageState },
+          runner: this.pool,
+          env: this.opts.env,
+        })
+        return { kind: 'result', result: executed.result }
+      } catch (error) {
+        const code = stablePluginErrorCode(error)
+        if (code === 'AUTOMATION_DISPATCH_BUSY') {
+          return { kind: 'deferred', errorCode: 'AUTOMATION_DISPATCH_BUSY' }
+        }
+        if (
+          (error as { dispatchProvenNotStarted?: unknown } | null)?.dispatchProvenNotStarted ===
+          true
+        )
+          return { kind: 'not_dispatched', errorCode: code }
+        if (code === 'LOGIN_EXPIRED_ACCOUNT' && fencedRow && verified) {
+          await markPluginAccountRelinkRequiredFenced({
+            row: fencedRow,
+            verified,
+            runner: this.pool,
+          }).catch(() => {})
+        }
+        // Once the automation arm transaction may have committed, a lost callback/stream/result
+        // is conservatively unknown. The scheduler disables automation globally for this account.
+        if (armed || armAttempted) return { kind: 'unknown', errorCode: code }
+        return { kind: 'failed', errorCode: code }
       }
     } finally {
       await lease.release()

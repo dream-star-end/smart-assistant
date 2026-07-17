@@ -24,6 +24,7 @@ import {
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button, IconButton, Input, Modal, Spinner, Switch, useConfirm } from "../ui";
+import { KnowledgePlanetAutomationPanel } from './KnowledgePlanetAutomationPanel'
 
 /** 把 ApiError 的机器码映射为中文（无码/未知码走 apiErrorMessage 收口：后端中文直显、
  *  英文/技术串回退 fallback + 追踪号，绝不裸露码或英文原文）。 */
@@ -449,7 +450,7 @@ export function ConnectorsTab({
                 setErr(null)
                 setSuccess(
                   enabled
-                    ? '知识星球写入能力已开启；每次发布主题或评论仍需在对话中单独确认。'
+                    ? '知识星球写入能力已开启；发布媒体、点赞、编辑和删除仍需在对话中逐次确认。无人值守自动回复需另行同意。'
                     : '知识星球写入能力已关闭。',
                 )
                 reload()
@@ -738,6 +739,11 @@ function RuntimePluginCard({
               >
                 <Trash2 size={13} /> 解绑
               </Button>
+              {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
+                <div className="basis-full">
+                  <KnowledgePlanetAutomationPanel auth={auth} account={account} />
+                </div>
+              )}
             </li>
           ))}
         </ul>
@@ -752,7 +758,7 @@ function RuntimePluginCard({
           }
         }}
         title="开启知识星球写入能力"
-        description="开启后仍不会自动发布；每一次主题或评论都必须由你在对话确认卡中单独批准。"
+        description="开启后仍不会自动发布；主题、评论、媒体、点赞、编辑和删除都必须由你在对话确认卡中单独批准。无人值守回复使用另一份独立授权。"
         footer={
           <>
             <Button
@@ -998,7 +1004,7 @@ function KnowledgePlanetSetupDialog({
       open={plugin != null}
       onOpenChange={(open) => !open && void close()}
       title="授权知识星球"
-      description="微信扫码一次即可复用登录。读取能力授权后可用；发布主题和评论默认关闭，需另行阅读免责声明并手动开启。"
+      description="微信扫码一次即可复用登录。读取能力授权后可用；发布媒体、互动、编辑和删除默认关闭，需另行阅读免责声明并手动开启。"
       footer={
         <>
           {setup?.status !== 'active' && (
