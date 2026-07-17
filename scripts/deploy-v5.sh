@@ -697,7 +697,7 @@ begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
   target_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   nonce="$(openssl rand -hex 16)"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] begin planned-maintenance schema=2 mode=$maintenance_mode ttl<=180s checks=svc_v5,http_v5,public_route$([[ "$include_egress" == 1 ]] && printf ',svc_egress,http_egress')"
+    echo "  [dry-run] begin planned-maintenance schema=2 mode=$maintenance_mode ttl<=180s checks=svc_v5,http_v5,public_route,turn_failures$([[ "$include_egress" == 1 ]] && printf ',svc_egress,http_egress')"
     PLANNED_MAINTENANCE_NONCE="$nonce"
     PLANNED_MAINTENANCE_ACTIVE=1
     return 0
@@ -723,6 +723,8 @@ body="$(curl -fsS --max-time 5 "http://127.0.0.1:${v5_port}/healthz" 2>/dev/null
 jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_v5)
 body="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' "http://127.0.0.1:${caddy_http_port}/healthz" 2>/dev/null || true)"
 jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=(public_route)
+# turn_failures 是窗口聚合检查(v5-monitor.sh):部署窗内 turn 瞬断是预期行为,无条件静默。
+healthy+=(turn_failures)
 if [[ "$include_egress" == 1 ]]; then
   systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
   body="$(curl -fsS --max-time 5 'http://172.31.0.1:18892/internal/v5/egress-health' 2>/dev/null || true)"
@@ -882,9 +884,13 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   # 关键:后台 ssh 必须关掉继承的本地部署锁 fd(fd 8 / OC_V5_DEPLOY_LOCK_FD)。否则本进程
   # 被 SIGKILL 绕过 trap 时,残活的 sleep-infinity ssh 会同时焊死本地部署锁与远端 lease,
   # 后续一切部署 900s 超时。fd 号已通过整数校验,eval 仅拼接受控数字,无注入面。
+  # pidfile:远端持锁进程自记 pid。无 PTY 的后台 ssh 通道关闭**不保证**给远端发
+  # SIGHUP(2026-07-17 实测:KP 门 abort 后 sleep infinity 孤儿焊死 lease,手动 kill
+  # 才解),release 必须能按 pid 显式回收远端进程,不能只依赖通道断开。
   remote_script="mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
 exec 9>'$PRODUCTION_MUTATION_LOCK'
 flock -w ${lease_wait} 9 || exit 75
+echo \$\$ > '${PRODUCTION_MUTATION_LOCK}.pid'
 echo LEASED
 exec sleep infinity"
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
@@ -892,6 +898,9 @@ exec sleep infinity"
   fi
   eval 'ssh "$KL_HOST" "$remote_script" >"$out" 2>/dev/null 8>&- '"$inherited_close"' &'
   MUTATION_LEASE_PID=$!
+  # 立即置 ACTIVE:轮询窗口内(spawn 后~LEASED 前)被 trap 打断时,release 才会
+  # 回收本地 ssh + 远端 pidfile(2026-07-17 复盘:迟至轮询成功才置位=竞态窗孤儿)。
+  MUTATION_LEASE_ACTIVE=1
   # 轮询 LEASED(截止 poll_ceiling=wait+30s);ssh 提前退出(flock 竞争失败/连接失败)→ kill -0 断链即止。
   while (( waited < poll_ceiling )); do
     if grep -q LEASED "$out" 2>/dev/null; then got=1; break; fi
@@ -900,17 +909,18 @@ exec sleep infinity"
   done
   rm -f "$out"
   if [[ "$got" != 1 ]]; then
+    MUTATION_LEASE_ACTIVE=0
     if [[ -n "$MUTATION_LEASE_PID" ]]; then
       kill "$MUTATION_LEASE_PID" 2>/dev/null || true
       wait "$MUTATION_LEASE_PID" 2>/dev/null || true
     fi
     MUTATION_LEASE_PID=""
+    ssh "$KL_HOST" "rm -f '${PRODUCTION_MUTATION_LOCK}.pid'" 2>/dev/null || true
     echo "✗ 未取得 kl-mirror production-mutation lease(远端 flock -w ${lease_wait} 竞争超时 / ssh 失败 / ${poll_ceiling}s 无 LEASED)。" >&2
     echo "  可能有另一生产变更(部署 / 自愈 host-action / 人工 runbook wrapper)正持锁;" >&2
     echo "  稍后重试或核查 $KL_HOST:$PRODUCTION_MUTATION_LOCK。紧急旁路(仅 runbook 记载):OC_V5_SKIP_MUTATION_LEASE=1。" >&2
     return 1
   fi
-  MUTATION_LEASE_ACTIVE=1
   echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,持有至本次收尾)"
   return 0
 }
@@ -924,6 +934,12 @@ release_production_mutation_lease() {
     wait "$MUTATION_LEASE_PID" 2>/dev/null || true
     MUTATION_LEASE_PID=""
   fi
+  # 远端持锁进程显式回收(2026-07-17 孤儿实测:无 PTY 通道关闭常不送达信号)。
+  # 按 pidfile 定点 kill,且只杀 comm=sleep 的进程(pid 复用防误杀);best-effort,
+  # ssh 不通也不阻断收尾(远端进程无通道最终会由下次 acquire 的 flock 竞争暴露)。
+  ssh "$KL_HOST" "pid=\$(cat '${PRODUCTION_MUTATION_LOCK}.pid' 2>/dev/null || true)
+if [ -n \"\$pid\" ] && [ \"\$(cat /proc/\$pid/comm 2>/dev/null)\" = sleep ]; then kill \"\$pid\" 2>/dev/null || true; fi
+rm -f '${PRODUCTION_MUTATION_LOCK}.pid'" 2>/dev/null || true
 }
 
 # 翻转/激活类关键点前活体断言:后台 ssh 死 → 远端 flock 已随通道关闭释放,自愈 host-action
@@ -4003,6 +4019,71 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
 }
 
+# 2026-07-17 goal 事故门禁补强:激活后真跑一个 codex 引擎聊天 turn(canary 账号,
+# WS 全链路,PUT 建会话→inbound.message→text 判成)。背景:goal bug 致 codex 引擎
+# 100% turn 必挂时,健康端点/调度器 smoke 全绿——没有任何门跑过真 turn。
+# 失败 = 与 full smoke 同级的强校验失败(走对称补偿回滚)。V5_SMOKE_TURN=0 可跳过
+# (紧急场景明示豁免;默认必跑)。
+smoke_turn_canary() { # <pinned master release>
+  local release="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] real-turn canary(codex 引擎全链路)@ $release"
+    return 0
+  fi
+  echo "── smoke:canary 真 turn(codex 引擎全链路,port=$ACTIVE_PORT)──"
+  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${ACTIVE_PORT}' timeout 300 node scripts/v5-smoke-turn-canary.mjs"
+}
+
+# 2026-07-17 架构纠偏(goal 事故复盘产物):插件审批状态不再阻断平台部署。
+# 插件信任的强制点在**运行时**(三表 pin + plugin-v2 验签 + 摘要派生 driver 匹配,
+# 全部 fail-closed)——未审批制品在任何 release 下都没有执行入口,部署门的旧职责
+# (挡住未验证候选)是纵深防御的冗余层,却把整个平台的部署/回滚锁在单个插件的
+# 扫码审批后面(07-17 故障期间紧急 hotfix 与回滚双双被拦)。
+# 本咨询门只判定:本次部署是否会做插件版本迁移(KP_PLUGIN_PROMOTE),以及不迁移
+# 时插件是继续服务还是休眠,打印告知后放行。stdout 单行 JSON 契约 + jq 校验,
+# 不依赖 tsx 退出码(fail-open 历史教训);基础设施故障(读不到状态)仍 fail-closed。
+KP_PLUGIN_PROMOTE=0
+knowledge_planet_plugin_advisory_gate() { # <pinned master release>
+  local release="$1"
+  KP_PLUGIN_PROMOTE=0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] Knowledge Planet advisory status(非阻断;判定是否做插件迁移)@ $release"
+    return 0
+  fi
+  local source_commit output
+  source_commit="$(knowledge_planet_candidate_commit)" || return 1
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    export OC_KNOWLEDGE_PLANET_SOURCE_COMMIT='$source_commit'
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --advisory-status")" || {
+    echo "✗ Knowledge Planet advisory status 执行失败(基础设施:镜像/DB/ssh)" >&2
+    return 1
+  }
+  local line
+  line="$(printf '%s\n' "$output" | grep -a '"advisory":"knowledge-planet"' | tail -1)"
+  if [[ -z "$line" ]] || ! jq -e '
+      .advisory == "knowledge-planet"
+      and (.approvedForDeploy | type == "boolean")
+      and (.handoffPresent | type == "boolean")
+      and (.artifactMatchesCurrentApproved | type == "boolean")' >/dev/null 2>&1 <<<"$line"; then
+    echo "✗ Knowledge Planet advisory status 输出不符合 JSON 契约:$(printf '%s' "$output" | head -c 200)" >&2
+    return 1
+  fi
+  local approved handoff matches
+  approved="$(jq -r '.approvedForDeploy' <<<"$line")"
+  handoff="$(jq -r '.handoffPresent' <<<"$line")"
+  matches="$(jq -r '.artifactMatchesCurrentApproved' <<<"$line")"
+  if [[ "$approved" == true || "$handoff" == true ]]; then
+    KP_PLUGIN_PROMOTE=1
+    echo "  · Knowledge Planet:候选已审批/持有 handoff → 本次部署执行插件版本迁移段"
+  elif [[ "$matches" == true ]]; then
+    echo "  · Knowledge Planet:插件制品与线上已审批版本一致 → 零接触(插件不受影响继续服务;运行时按已审批版本 pin 执行)"
+  else
+    echo "⚠ Knowledge Planet:插件制品有改动且未验证 → 零接触部署;新 release 下该插件将 RUNTIME_UNAVAILABLE(运行时 fail-closed 拒未审批制品),直至 --verify-knowledge-planet-user=<id> 验证晋升。平台部署不因此阻断。" >&2
+  fi
+  return 0
+}
+
 # One-shot setup-first deploy guard. It permits exactly the currently signed
 # platform v1.0 predecessor, identical encrypted browser-account semantics,
 # exact active installs, and zero persisted accounts. The post phase repeats
@@ -4146,6 +4227,21 @@ knowledge_planet_plugin_open_gate_to_release() { # <helper release> <target rele
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
     cd '$runner'
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--open-listing-gate-to-release=$target'"
+}
+
+# 兜底重开:把执行门恢复到 listing 当前已审批版本(DB 行身份,与 release 无关)。
+# release 身份钉死的 open-to-release 在"目标 release 早于插件审批"(紧急回滚)时
+# 无版本可解(2026-07-17 rollback 实测被它打进 manual-recovery);本兜底恒可执行,
+# 无已审批版本时 TS 侧如实上报 no-approved-version 且退出 0(无门可开≠失败)。
+knowledge_planet_plugin_open_gate_current() { # <helper release>
+  local runner="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] open Knowledge Planet listing gate to current approved version @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --open-listing-gate-current"
 }
 
 knowledge_planet_plugin_open_setup_first_gate_to_version() { # <helper release> <exact predecessor version ID>
@@ -4360,9 +4456,9 @@ deploy() {
       || { echo "✗ Knowledge Planet setup-first 前置守卫失败,未激活新 release" >&2; exit 1; }
     kp_setup_plugin_version_id="$KNOWLEDGE_PLANET_SETUP_VERSION_ID"
   else
-    echo "── Knowledge Planet Plugin:noninteractive exact-image approval/handoff 预激活门(DB 零写入)──"
-    knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
-      || { echo "✗ Knowledge Planet Plugin 非交互预验证门失败,未激活新 release" >&2; exit 1; }
+    echo "── Knowledge Planet Plugin:advisory status(非阻断;DB 零写入)──"
+    knowledge_planet_plugin_advisory_gate "$BUILT_RELEASE" \
+      || { echo "✗ Knowledge Planet advisory status 基础设施故障(读不到状态,fail-closed),未激活新 release" >&2; exit 1; }
   fi
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
@@ -4388,18 +4484,23 @@ deploy() {
     exit 1
   fi
   echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
+  local kp_deploy_bracket=1
   if ! knowledge_planet_plugin_close_gate "$BUILT_RELEASE"; then
     if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+      # setup-first 是显式插件升级 lane,门关不上=前提不成立,保持阻断语义。
       knowledge_planet_plugin_open_setup_first_gate_to_version \
         "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
         || mark_deploy_recovery_required "Knowledge Planet setup-first gate close commit unknown and exact restore failed"
-    else
-      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-        || mark_deploy_recovery_required "Knowledge Planet gate close commit unknown and restore failed"
+      end_planned_maintenance || true
+      echo "✗ Knowledge Planet setup-first 执行门关闭失败(live 未改)" >&2
+      exit 1
     fi
-    end_planned_maintenance || true
-    echo "✗ Knowledge Planet Plugin 执行门关闭失败(live 未改)" >&2
-    exit 1
+    # 2026-07-17 架构纠偏:普通 deploy 的插件括号 best-effort——门关不上则插件
+    # 零接触(不迁移不 seed,handoff 保留待下次),平台部署继续。
+    echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续部署(版本 pin 不动,promotion 顺延)" >&2
+    knowledge_planet_plugin_open_gate_current "$BUILT_RELEASE" || true
+    kp_deploy_bracket=0
+    KP_PLUGIN_PROMOTE=0
   fi
   kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
@@ -4414,16 +4515,24 @@ deploy() {
     # pre guard has already proven the exact compatible predecessor. setup-first
     # never transitions its DB pin; compensation reopens this captured ID.
     kp_had_previous_plugin=1
+  elif [[ "$kp_deploy_bracket" == 0 ]]; then
+    # 零接触:门未关,不做 classify,补偿路径也不得碰插件。
+    kp_had_previous_plugin=0
   else
     if ! knowledge_planet_plugin_classify_previous_release \
       "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
+      # 2026-07-17 纠偏:classify 只服务于"插件迁移的补偿目标可用性"判定;
+      # 失败=降级为零接触(重开门后继续部署),不再阻断平台部署。
+      echo "⚠ Knowledge Planet previous-release classify 失败:插件零接触继续部署" >&2
       knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || knowledge_planet_plugin_open_gate_current "$BUILT_RELEASE" \
         || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
-      end_planned_maintenance || true
-      echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
-      exit 1
+      kp_deploy_bracket=0
+      KP_PLUGIN_PROMOTE=0
+      kp_had_previous_plugin=0
+    else
+      kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
     fi
-    kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
   fi
   echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
   if [[ "$hc_any" == 1 ]]; then
@@ -4483,6 +4592,10 @@ deploy() {
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
     validation_failure="full master smoke failed"
   fi
+  if [[ -z "$validation_failure" && "$DRY" != 1 && "${V5_SMOKE_TURN:-1}" == 1 ]] \
+    && ! smoke_turn_canary "$BUILT_RELEASE"; then
+    validation_failure="real-turn canary failed(codex 引擎真 turn 未出正文)"
+  fi
   if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
@@ -4519,6 +4632,14 @@ deploy() {
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
+    return 0
+  fi
+  if [[ "$kp_deploy_bracket" == 0 ]]; then
+    echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
+    end_planned_maintenance
+    gc_releases
+    [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
+    echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
     return 0
   fi
   echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
@@ -4628,7 +4749,7 @@ activate_staged_inner() {
   assert_runtime_channel_column
   assert_gpt56_migration_ready
   knowledge_planet_plugin_assert_release_compatible "$REMOTE_SRC" "$REMOTE_SRC" \
-    || { echo "✗ staged source 改变 Knowledge Planet Plugin；请改用 normal deploy" >&2; exit 1; }
+    || echo "⚠ staged source 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升(运行时按内容 pin fail-closed);staged cutover 不因此阻断(2026-07-17 纠偏)" >&2
   install_cutover_target_image_env
   local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
   local image_commit image_codex_version actual_codex_version
@@ -4715,7 +4836,7 @@ deploy_dist() {
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
-    || { echo "✗ --dist 目标改变 Knowledge Planet Plugin；请改用 normal deploy" >&2; exit 1; }
+    || echo "⚠ --dist 目标的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升;--dist 不因此阻断(2026-07-17 纠偏)" >&2
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
   # hotcfg 启用时同样走 tuple saga(master 源码翻转=extra_apply,单次重启)。纯前端变更下
   # bundle/release digest 不变 → 幂等复用零 churn;tuple env 不变 → 只是随本次重启一并生效。
@@ -4781,26 +4902,27 @@ rollback() {
     if [[ -z "$kp_rollback_target" ]] || ! smoke "$ACTIVE_PORT"; then
       # F7:反向补偿(恢复回滚前 tuple)前 best-effort 重取 lease;失败也照补(恢复稳态优先)。
       reacquire_mutation_lease_best_effort "rollback-compensation"
-      rollback_runtime_tuple 1 1 "$kp_rollback_helper" \
-        && smoke "$ACTIVE_PORT" \
-        && knowledge_planet_plugin_open_gate_to_release \
-          "$kp_rollback_helper" "$kp_rollback_helper" \
-        || { mark_deploy_recovery_required "tuple rollback full smoke failed and reverse compensation failed"; exit 1; }
+      if rollback_runtime_tuple 1 1 "$kp_rollback_helper" && smoke "$ACTIVE_PORT"; then
+        # 2026-07-17 纠偏:插件门恢复 best-effort(release 身份 → current 兜底),
+        # 门恢复失败不推翻已成功的 source 反向补偿。
+        knowledge_planet_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_helper" \
+          || knowledge_planet_plugin_open_gate_current "$kp_rollback_helper" \
+          || mark_deploy_recovery_required "tuple rollback reverse compensation succeeded but Plugin gate restore failed"
+      else
+        mark_deploy_recovery_required "tuple rollback full smoke failed and reverse compensation failed"
+        exit 1
+      fi
       end_planned_maintenance || true
       echo "✗ tuple rollback target full smoke 失败；已恢复原 source/账号版本" >&2
       exit 1
     fi
     if ! knowledge_planet_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_target"; then
-      # F7:同上,反向补偿前 best-effort 重取 lease(helper 幂等)。
-      reacquire_mutation_lease_best_effort "rollback-compensation"
-      rollback_runtime_tuple 1 1 "$kp_rollback_helper" \
-        && smoke "$ACTIVE_PORT" \
-        && knowledge_planet_plugin_open_gate_to_release \
-          "$kp_rollback_helper" "$kp_rollback_helper" \
-        || { mark_deploy_recovery_required "tuple rollback Plugin gate open failed and reverse compensation failed"; exit 1; }
-      end_planned_maintenance || true
-      echo "✗ tuple rollback target Plugin 门开启失败；已恢复原 source/账号版本" >&2
-      exit 1
+      # 2026-07-17 纠偏:回滚本体已成功,插件门开启失败不再反向推翻整个回滚
+      # (昨日实测该反向补偿链条二次失败直接打进 manual-recovery)。兜底重开
+      # 当前已审批版本;兜底也失败才标记人工恢复,回滚仍算成功。
+      echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+      knowledge_planet_plugin_open_gate_current "$kp_rollback_helper" \
+        || mark_deploy_recovery_required "tuple rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
     fi
     end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
@@ -4856,48 +4978,49 @@ rollback() {
     echo "✗ production-mutation lease 失活;未回滚(live 未改)" >&2
     exit 1
   fi
-  echo "── Knowledge Planet Plugin:回滚前关闭执行门并反向迁移账号/install──"
+  # 2026-07-17 架构纠偏:插件括号 best-effort——回滚是紧急通道,插件侧失败只降级
+  # (零接触/兜底重开当前已审批版本),永不阻断回滚本体。
+  echo "── Knowledge Planet Plugin:回滚前关闭执行门并反向迁移账号/install(best-effort)──"
+  local kp_rb_bracket=1
   if ! knowledge_planet_plugin_close_gate "$live_master"; then
-    # F7:非 hotcfg rollback 补偿入口(与 hotcfg reverse-compensation 同类),补偿前 best-effort 重取 lease。
-    reacquire_mutation_lease_best_effort "rollback-compensation"
-    knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
-      || mark_deploy_recovery_required "rollback Plugin gate close commit unknown and restore failed"
-    end_planned_maintenance || true
-    exit 1
+    echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
+    kp_rb_bracket=0
   fi
-  if ! knowledge_planet_plugin_transition_to_release "$live_master" "$target"; then
-    reacquire_mutation_lease_best_effort "rollback-compensation"
-    knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
-      || mark_deploy_recovery_required "Knowledge Planet rollback transition failed and gate restore failed"
-    end_planned_maintenance || true
-    exit 1
+  if [[ "$kp_rb_bracket" == 1 ]] && ! knowledge_planet_plugin_transition_to_release "$live_master" "$target"; then
+    echo "⚠ Knowledge Planet 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+    knowledge_planet_plugin_open_gate_current "$live_master" \
+      || mark_deploy_recovery_required "rollback Plugin transition failed and current-version gate restore also failed"
+    kp_rb_bracket=0
   fi
   # activate_release 内 ds_commit_active_release 会把 previous_active_release←旧 active(=回滚前的 release)、
   # active_release←target 原子对调(BLOCKER 4:rollback 成功后 CAS 更新 active_release+previous 对调)。
   if ! activate_release "$target"; then
-    # activate_release 已把 source 补偿回 live_master；执行门仍关闭，因此可
-    # 在无错版调用窗口下把密文/install pins 原子迁回 live 版本。
+    # activate_release 已把 source 补偿回 live_master。插件补偿 best-effort:
+    # 迁移过才迁回;兜底 current;只有兜底也失败才标记人工恢复。
     # F7:补偿前 best-effort 重取 lease(非 hotcfg rollback 补偿入口,与其它补偿同类)。
     reacquire_mutation_lease_best_effort "rollback-compensation"
-    knowledge_planet_plugin_transition_to_release "$live_master" "$live_master" \
-      && knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
-      || mark_deploy_recovery_required "rollback source compensation succeeded but Knowledge Planet DB compensation failed"
+    if [[ "$kp_rb_bracket" == 1 ]]; then
+      knowledge_planet_plugin_transition_to_release "$live_master" "$live_master" \
+        && knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
+        || knowledge_planet_plugin_open_gate_current "$live_master" \
+        || mark_deploy_recovery_required "rollback source compensation succeeded but Knowledge Planet DB compensation failed"
+    fi
     end_planned_maintenance || true
     exit 1
   fi
   if ! smoke "$ACTIVE_PORT"; then
-    knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" \
+    knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" "$kp_rb_bracket" \
       || { mark_deploy_recovery_required "rollback target smoke failed and source/Plugin compensation failed"; exit 1; }
     end_planned_maintenance || true
     echo "✗ rollback target full smoke 失败；已恢复原 source/账号版本" >&2
     exit 1
   fi
-  if ! knowledge_planet_plugin_open_gate_to_release "$live_master" "$target"; then
-    knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" \
-      || { mark_deploy_recovery_required "rollback target gate open failed and source/Plugin compensation failed"; exit 1; }
-    end_planned_maintenance || true
-    echo "✗ rollback target Plugin 门开启失败；已恢复原 source/账号版本" >&2
-    exit 1
+  if [[ "$kp_rb_bracket" == 1 ]] && ! knowledge_planet_plugin_open_gate_to_release "$live_master" "$target"; then
+    # 2026-07-17 纠偏:回滚本体已成功,门开启失败不再反向推翻;兜底 current,
+    # 兜底也失败才标记人工恢复,回滚仍算成功。
+    echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+    knowledge_planet_plugin_open_gate_current "$live_master" \
+      || mark_deploy_recovery_required "rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
   fi
   end_planned_maintenance
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
@@ -5071,13 +5194,21 @@ rollback_runtime_tuple() {
   HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
   [[ "$state_commit" == 1 ]] && build_hotcfg_state_hooks "$master"
   echo "  回滚计划($source_desc): image_id=$image_id release=${release:-<none>} bundle=${flip_rev:-<none>} master源码=$master"
-  echo "── Knowledge Planet Plugin:tuple 回滚前关闭执行门并反向迁移账号/install──"
-  knowledge_planet_plugin_close_gate "$plugin_helper" || return 1
-  if [[ "$plugin_previous_exists" == 1 ]]; then
+  # 2026-07-17 架构纠偏:插件括号 best-effort 化——回滚是平台紧急通道,任何
+  # 插件侧失败都不得阻断(运行时按内容 pin fail-closed,插件门状态不影响平台
+  # 完整性;最坏情形=插件休眠,用 open_gate_current 兜底恢复已审批版本)。
+  echo "── Knowledge Planet Plugin:tuple 回滚前关闭执行门并反向迁移账号/install(best-effort)──"
+  local kp_plugin_bracket=1
+  if ! knowledge_planet_plugin_close_gate "$plugin_helper"; then
+    echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
+    kp_plugin_bracket=0
+  fi
+  if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
     if ! knowledge_planet_plugin_transition_to_release "$plugin_helper" "$master"; then
-      knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
-        || mark_deploy_recovery_required "tuple rollback Plugin transition failed and gate restore failed"
-      return 1
+      echo "⚠ Knowledge Planet 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+      knowledge_planet_plugin_open_gate_current "$plugin_helper" \
+        || mark_deploy_recovery_required "tuple rollback Plugin transition failed and current-version gate restore also failed"
+      kp_plugin_bracket=0
     fi
   fi
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
@@ -5087,19 +5218,29 @@ rollback_runtime_tuple() {
     "$image" "$image_id" "$release" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src" \
     "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind"; then
-    if [[ "$plugin_previous_exists" == 1 ]]; then
+    if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
       knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
         && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
-        || mark_deploy_recovery_required "tuple rollback saga compensated source but Plugin DB compensation failed"
-    else
+        || {
+          # 2026-07-17 实测:release 身份的 open 在此处失败曾直接打 manual-recovery。
+          # 兜底恢复当前已审批版本;兜底也失败才升级为人工恢复态。
+          echo "⚠ Knowledge Planet release 身份门恢复失败,走 current-version 兜底" >&2
+          knowledge_planet_plugin_open_gate_current "$plugin_helper" \
+            || mark_deploy_recovery_required "tuple rollback saga compensated source but Plugin DB compensation failed"
+        }
+    elif [[ "$kp_plugin_bracket" == 1 ]]; then
       knowledge_planet_plugin_close_gate "$plugin_helper" \
         || mark_deploy_recovery_required "tuple rollback saga failed and first-publication Plugin gate state is unknown"
     fi
     return 1
   fi
-  if [[ "$defer_plugin_open" != 1 && "$plugin_previous_exists" == 1 ]]; then
+  if [[ "$defer_plugin_open" != 1 && "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
     knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$master" \
-      || { mark_deploy_recovery_required "tuple rollback target active but Plugin gate failed to open"; return 1; }
+      || {
+        echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不阻断回滚" >&2
+        knowledge_planet_plugin_open_gate_current "$plugin_helper" \
+          || mark_deploy_recovery_required "tuple rollback target active but Plugin gate failed to open (current-version fallback also failed)"
+      }
   fi
   if [[ "$state_commit" == 1 ]]; then
     ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
@@ -5585,11 +5726,8 @@ canary() {
     recover_canary_prep "$cand"
     exit 1
   }
-  if ! knowledge_planet_plugin_assert_release_compatible "$reldir" "$reldir"; then
-    echo "✗ candidate 改变全局 Knowledge Planet Plugin contract；双 master 不允许混跑，请改用 normal deploy" >&2
-    recover_canary_prep "$cand"
-    exit 1
-  fi
+  knowledge_planet_plugin_assert_release_compatible "$reldir" "$reldir" \
+    || echo "⚠ canary candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:candidate lane 上该插件将 RUNTIME_UNAVAILABLE(active lane 不受影响,运行时按内容 pin);canary 不因此阻断(2026-07-17 纠偏)" >&2
   ds_cas_or_die "candidate_release='$(ds_lit "$reldir")', transition_step=1" 1 "built candidate_release=$reldir"
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
@@ -5718,7 +5856,7 @@ finalize() {
     || kp_candidate_release="$RELEASES_ROOT/$kp_candidate_release"
   knowledge_planet_plugin_assert_release_compatible \
     "$kp_candidate_release" "$kp_candidate_release" \
-    || { echo "✗ candidate Knowledge Planet contract 与 DB current 不同；拒绝 finalize" >&2; exit 1; }
+    || echo "⚠ candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:finalize 后该插件将 RUNTIME_UNAVAILABLE 直至验证晋升;finalize 不因此阻断(2026-07-17 纠偏)" >&2
   if [[ "$DRY" == 1 ]]; then
     ds_assert_phase canary
     cand="${DS_candidate_slot:-B}"; old="$DS_active_slot"

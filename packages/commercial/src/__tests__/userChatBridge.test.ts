@@ -39,10 +39,19 @@ import {
   detectScanSciPaperIntent,
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
+import { GoalStateError } from "../goal/goalStateService.js";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
 const JWT_SECRET = "x".repeat(32);
+
+async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("waitFor timeout");
+    await new Promise<void>((r) => setTimeout(r, 25));
+  }
+}
 
 interface TestRig {
   gateway: http.Server;
@@ -1047,6 +1056,46 @@ describe("userChatBridge — model authorization", () => {
         }),
         false,
       );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("GoalState NOT_FOUND (fresh session without row) proceeds with null goal instead of rejecting", async () => {
+    // 2026-07-17 生产实证:纯 WS 新会话(无 client_sessions 行)被 goal 加载的
+    // NOT_FOUND 当作瞬态失败整轮拒掉。NOT_FOUND 是确定性答案(行不存在 →
+    // 必然无 goal),必须放行并以 _goalState=null 进容器。
+    const rig = await startRig({
+      loadGoalState: async () => {
+        throw new GoalStateError("NOT_FOUND", "session not found");
+      },
+    });
+    try {
+      const token = await makeJwt("209");
+      const ws = openClient(rig.gatewayPort, token);
+      const frames = frameCollector(ws);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-goal-not-found", kind: "dm" },
+        content: { text: "fresh session must reach container" },
+      }));
+
+      await waitFor(() =>
+        rig.containerSeen.some(({ data }) => {
+          const text = typeof data === "string" ? data : data.toString("utf8");
+          return text.includes("fresh session must reach container");
+        }),
+      );
+      const forwardedRaw = rig.containerSeen
+        .map(({ data }) => (typeof data === "string" ? data : data.toString("utf8")))
+        .find((text) => text.includes("fresh session must reach container"));
+      assert.ok(forwardedRaw, "inbound must be forwarded to container");
+      const forwarded = JSON.parse(forwardedRaw);
+      assert.equal(forwarded._goalState, null);
       ws.close();
       await waitClose(ws);
     } finally {
