@@ -33,6 +33,7 @@ v1 以为缺的只是 release drill。实际有两个结构性根因:
 - host-action wrapper **不是查询它**,而是 `flock -n` **取得同一把锁并持有整个 opcode 执行期**;拿不到 → exit 66 让路(消灭 TOCTOU)。
 - 本地 `/var/lock/oc-v5-deploy.lock` 与远端 host-mutation lease **固定锁序**(先本地后远端),防死锁。
 - **marker 回归本职**:只做告警隔离,不承担互斥正确性。
+- **显式例外(补偿优先于互斥,实现审 R3/R4 收口)**:lease 在翻转后失活时,补偿/回滚路径**先阻塞重取**(`flock -w 180`);重取仍失败则**降级继续补偿**并打 CRITICAL 告警——恢复生产稳态优先于严格互斥。残余并发窗口按对方持有者**分别陈述**:与自愈 host-action opcode 并发时以其 90s 动作超时为上限;与人工 `with-production-mutation-lease.sh` 持锁操作并发时**无时长上限**(180s 等不到锁的最可能原因正是人工长操作在持锁)——此时 CRITICAL 告警已发出,运维纪律=**先停下人工持锁操作、确认补偿现场,再继续**。已知且接受。除该补偿降级分支外,写 lane 的任何前向翻转在 lease 失活时一律中止。
 - **非 deploy-v5 lane 也必须入列**(Codex MAJOR4):人工 migration / env 同步 / systemd unit 安装 / runtime image build+tag 切换等,要么走持同一 lease 的受控 wrapper/runbook,要么在 durable maintenance inhibit 下执行 —— 否则"绝不冲突"不成立。
 
 ### 1.3 批1b Tier2 部署面
