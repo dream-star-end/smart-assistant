@@ -2172,12 +2172,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // ── 角色分档窗口投影(modelRolePolicy)────────────────────────────────
+      // ── 角色分档窗口投影(modelRolePolicy · 执行轴)──────────────────────────
       // descriptor.contextWindow 是 CCB auto-compact 的实际执行窗口 —— 在签发前按本连接
       // 角色收窄(如 kimi-k3:admin 1M / 其他 500k)。签名 envelope 只对 descriptor 整体签名,
-      // egress gate 校验的是快照级 executionRevision(catalog 行未动,不受影响)。
-      // role 取连接 claims(JWT):与 listForUser/egress 的 DB role 相比,晋升迟一个 token
-      // 生命周期生效(收窄方向保守);降级窗口 ≤ token TTL,与 grants 30s 刷新同级别容忍。
+      // egress gate 校验的是快照级 executionRevision(catalog 机制行未动,不受影响)。
+      //
+      // ⚠ 一致性边界(审计纠偏):这是**执行轴**,role 取连接 claims(JWT),**从不进
+      //   projectionRevision 对账**。只有列表轴(listForUser 的 DB role)才有 master↔egress
+      //   的 409 对账网;本处窗口收窄不会被任何 409 兜住。JWT/DB 角色在 15min TTL 内的漂移
+      //   是被设计容忍的(晋升迟一个 token 生命周期、收窄方向保守;降级窗口 ≤ token TTL,与
+      //   grants 30s 刷新同级别容忍)。⇒ 执行轴一致性的**唯一防线** = 与 listForUser 共用
+      //   同一纯函数 projectContextWindowForRole + 两处落点单测(modelRolePolicy.test.ts 纯
+      //   函数契约 / modelAuthorityBridge.test.ts:431 bridge 签发)。别删这两个测试,也别新增
+      //   旁路投影而不加对应落点单测。
       const projectedWindow = projectContextWindowForRole(
         exec.canonicalModel,
         exec.descriptor.contextWindow,

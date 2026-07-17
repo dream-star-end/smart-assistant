@@ -37,6 +37,7 @@
     "test:web-react": "npm run test --workspace packages/web-react",
     "test:commercial:integ": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name \"*.integ.test.ts\")'",
     "test:commercial:integ:strict": "REQUIRE_TEST_DB=1 npm run test:commercial:integ",
+    "test:commercial:prompt-queue": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 packages/commercial/src/__tests__/internalPromptQueue.test.ts packages/commercial/src/__tests__/promptQueueStore.integ.test.ts'",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
     "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts",
     "check:tutorials": "tsx scripts/check-v5-tutorials.ts",

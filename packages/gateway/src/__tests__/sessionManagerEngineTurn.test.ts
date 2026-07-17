@@ -1510,6 +1510,176 @@ describe("post-terminal tail folding (A1)", () => {
       setV3MasterSinkSingleton(null);
     }
   });
+
+  // ── B5/B6 post-terminal 归属 fail-closure + 非 tail dropped 门控 ───────────────
+  type DispatchCtx = {
+    ownerTurnKey: string | undefined | null;
+    ownerSessionId: string | undefined | null;
+    turnIndex: number;
+    onEvent: (e: SessionStreamEvent) => void;
+  };
+  const dispatch = (
+    sm: SessionManager,
+    session: AgentSession,
+    event: DurableRuntimeEvent,
+    block: unknown,
+    ctx: DispatchCtx,
+  ): void =>
+    (sm as unknown as {
+      _dispatchPostTerminalRuntimeEvent: (
+        s: AgentSession,
+        e: DurableRuntimeEvent,
+        b: unknown,
+        c: DispatchCtx,
+      ) => void;
+    })._dispatchPostTerminalRuntimeEvent(session, event, block, ctx);
+  const missingOwnerMetrics = (sm: SessionManager): { tailDropped: number; nonTailForwarded: number } =>
+    (sm as unknown as { _missingOwnerMetrics: { tailDropped: number; nonTailForwarded: number } })
+      ._missingOwnerMetrics;
+  const nonTailEvent = (): DurableRuntimeEvent =>
+    ({
+      ordinal: 1,
+      observedAt: Date.now(),
+      source: "gateway",
+      payload: { type: "system", subtype: "runtime_note" },
+    }) as unknown as DurableRuntimeEvent;
+  const tailEvent = (): DurableRuntimeEvent =>
+    ({
+      ordinal: 1,
+      observedAt: Date.now(),
+      source: "ccb",
+      payload: mkTail(),
+    }) as unknown as DurableRuntimeEvent;
+  const anyBlock = { kind: "tool_output_tail", tail: "x" } as unknown;
+
+  test("B5 delegate 缺 parentTurnKey:post-terminal tail fail-closed 丢弃(不裸转发)+ 计数", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      // delegate 会话只有 parentSessionId、**缺 _billingParentTurnKey** → ownerTurnKey 归属缺失。
+      const { session, runner, events } = await runFoldTurn(sm, "m".repeat(32), {
+        sessionOver: {
+          channel: "delegate",
+          _usageAttribution: { mode: "delegate", parentSessionId: "parent-peer" },
+        } as unknown as Partial<AgentSession>,
+      });
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail()); // 归属不明的 tail
+      await sm.awaitPendingPersistence();
+
+      assert.equal(tailBlockCount(events), 0, "归属不明的 tail 绝不裸转发(fail-closed)");
+      assert.equal(captured.payloads.length, baseline, "未持久化任何 continuation");
+      assert.ok(missingOwnerMetrics(sm).tailDropped >= 1, "tailDropped 计数活体");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("B5 归属缺失 + 非 tail:保持兜底转发(丢弃即真丢内容)+ 计数", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner, { channel: "webchat" });
+    const events: SessionStreamEvent[] = [];
+    dispatch(sm, session, nonTailEvent(), anyBlock, {
+      ownerTurnKey: undefined, // 归属缺失
+      ownerSessionId: "peer",
+      turnIndex: 1,
+      onEvent: (e) => events.push(e),
+    });
+    assert.equal(events.length, 1, "非 tail 归属缺失仍兜底转发");
+    assert.equal(missingOwnerMetrics(sm).nonTailForwarded, 1, "nonTailForwarded 计数活体");
+    assert.equal(missingOwnerMetrics(sm).tailDropped, 0, "非 tail 不计 tailDropped");
+  });
+
+  test("B6 非 tail persist=dropped:fail-closed 不转发 + 不进 durable 收集器", async () => {
+    const captured = makeCapturingSink({ ok: false, queued: false, droppedReason: "gone" });
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const collector: DurableRuntimeEvent[] = [];
+      const runner = new FakeCcbRunner(() => {});
+      const session = makeSession(runner, {
+        channel: "webchat",
+        _durableDelegateRuntimeEvents: collector,
+      } as unknown as Partial<AgentSession>);
+      const events: SessionStreamEvent[] = [];
+      const baseline = captured.payloads.length;
+
+      dispatch(sm, session, nonTailEvent(), anyBlock, {
+        ownerTurnKey: "owner-1",
+        ownerSessionId: "peer",
+        turnIndex: 1,
+        onEvent: (e) => events.push(e),
+      });
+      await sm.awaitPendingPersistence();
+
+      assert.equal(events.length, 0, "dropped 的非 tail 事件绝不抢先展示(fail-closed)");
+      assert.equal(collector.length, 0, "dropped 不进 durable 收集器");
+      assert.equal(captured.payloads.length - baseline, 1, "持久化确有尝试(结果 dropped)");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("B6 非 tail persist=acked:先落盘后转发 + 进 durable 收集器", async () => {
+    const captured = makeCapturingSink(); // ok:true → acked
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const collector: DurableRuntimeEvent[] = [];
+      const runner = new FakeCcbRunner(() => {});
+      const session = makeSession(runner, {
+        channel: "webchat",
+        _durableDelegateRuntimeEvents: collector,
+      } as unknown as Partial<AgentSession>);
+      const events: SessionStreamEvent[] = [];
+      const baseline = captured.payloads.length;
+
+      dispatch(sm, session, nonTailEvent(), anyBlock, {
+        ownerTurnKey: "owner-1",
+        ownerSessionId: "peer",
+        turnIndex: 1,
+        onEvent: (e) => events.push(e),
+      });
+      await sm.awaitPendingPersistence();
+
+      assert.equal(events.length, 1, "acked 后转发");
+      assert.equal(collector.length, 1, "acked 进 durable 收集器");
+      assert.equal(captured.payloads.length - baseline, 1, "落盘一条");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("B5 归属缺失 + tail(直调接缝):fail-closed 丢弃,不转发不持久化", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner(() => {});
+      const session = makeSession(runner, { channel: "webchat" });
+      const events: SessionStreamEvent[] = [];
+      const baseline = captured.payloads.length;
+
+      dispatch(sm, session, tailEvent(), anyBlock, {
+        ownerTurnKey: "owner-1",
+        ownerSessionId: undefined, // 归属缺失(缺 sessionId)
+        turnIndex: 1,
+        onEvent: (e) => events.push(e),
+      });
+      await sm.awaitPendingPersistence();
+
+      assert.equal(events.length, 0, "归属不明的 tail 直调也 fail-closed 丢弃");
+      assert.equal(captured.payloads.length, baseline, "未持久化");
+      assert.ok(missingOwnerMetrics(sm).tailDropped >= 1, "tailDropped 计数活体");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
 });
 
 describe("active-turn replay lock-owner lifecycle", () => {

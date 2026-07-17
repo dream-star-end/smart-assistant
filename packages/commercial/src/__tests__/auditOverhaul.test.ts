@@ -229,6 +229,7 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       "skill_retrieval_shadow_events",
       "product_friction_events",
       "image_generation_attempts",
+      "prompt_queue_mutations",
     ]) {
       assert.ok(tables.includes(t), `缺 retention 政策: ${t}`);
     }
