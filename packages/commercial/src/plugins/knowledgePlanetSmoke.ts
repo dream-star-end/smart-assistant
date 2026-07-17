@@ -59,6 +59,7 @@ export async function runKnowledgePlanetActionSmoke(input: {
 }): Promise<{
   passedActionIds: string[]
   resourceUnavailableActionIds: string[]
+  writeActionIdsSkipped: string[]
   storageState: BrowserStorageStateV1
 }> {
   let storageState = input.storageState
@@ -169,7 +170,12 @@ export async function runKnowledgePlanetActionSmoke(input: {
     resourceUnavailable.add('list_checkin_topics')
   }
 
-  const expectedActionIds = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id)
+  const expectedActionIds = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'read')
+    .map((action) => action.id)
+  const writeActionIdsSkipped = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'write')
+    .map((action) => action.id)
   const allowedUnavailable = new Set(KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS)
   const invalidUnavailable = [...resourceUnavailable].filter(
     (actionId) => !allowedUnavailable.has(actionId),
@@ -187,6 +193,7 @@ export async function runKnowledgePlanetActionSmoke(input: {
     resourceUnavailableActionIds: expectedActionIds.filter((actionId) =>
       resourceUnavailable.has(actionId),
     ),
+    writeActionIdsSkipped,
     storageState,
   }
 }

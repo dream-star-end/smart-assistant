@@ -100,6 +100,7 @@ import type {
   DeclarativeOauthStartResult,
   KnowledgePlanetSetupView,
   PluginManagementResponse,
+  RuntimePluginAccount,
 } from './connectors'
 import { normalizeOrgPlan, normalizeOrgSubscription } from './orgBilling'
 import { reportClientFriction } from './clientFriction'
@@ -3085,6 +3086,24 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
+
+  setPluginWriteAccess: (
+    a: AuthSession,
+    id: string,
+    input:
+      | { enabled: false }
+      | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount['writeControl']> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-access`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.writeControl),
 
   // ── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────
   // org 由服务端从 caller membership 推导,前端**不带** org_id。批次 D 端点(usage/

@@ -180,6 +180,9 @@ describe('managed-browser Plugin accounts', () => {
       spec_hash: Buffer.from('a'.repeat(64), 'hex'),
       exec_contract_hash: Buffer.from('b'.repeat(64), 'hex'),
       auth_contract_version: 1,
+      plugin_write_enabled: false,
+      plugin_write_disclaimer_version: null,
+      plugin_write_disclaimer_accepted_at: null,
       status: 'active',
       meta: {},
       revoked_at: null,
@@ -265,6 +268,9 @@ describe('managed-browser Plugin accounts', () => {
       spec_hash: Buffer.from('a'.repeat(64), 'hex'),
       exec_contract_hash: Buffer.from('b'.repeat(64), 'hex'),
       auth_contract_version: 1,
+      plugin_write_enabled: false,
+      plugin_write_disclaimer_version: null,
+      plugin_write_disclaimer_accepted_at: null,
       status: 'error',
       meta: { account_hint: 'kept' },
       revoked_at: null,
@@ -367,8 +373,7 @@ describe('managed-browser Plugin accounts', () => {
     assert.deepEqual(opened.storageState, envelope.storageState)
     assert.throws(
       () => decryptPluginAccountEnvelope(migrated, contract, env),
-      (error: unknown) =>
-        error instanceof PluginAccountError && error.code === 'SECRET_INVALID',
+      (error: unknown) => error instanceof PluginAccountError && error.code === 'SECRET_INVALID',
     )
   })
 })

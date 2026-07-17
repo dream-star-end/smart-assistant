@@ -91,6 +91,8 @@ export interface LedgerRow {
   started_at: Date | null
   finished_at: Date | null
   expires_at: Date
+  dispatch_fence_required: boolean
+  dispatch_armed_at: Date | null
 }
 
 const ROW_COLS = `id::text AS id, user_id::int AS user_id, connection_id::text AS connection_id,
@@ -98,7 +100,7 @@ const ROW_COLS = `id::text AS id, user_id::int AS user_id, connection_id::text A
   spec_hash, exec_contract_hash, auth_contract_version, params_enc, params_nonce, params_key_version,
   params_aad_seed::text AS params_aad_seed, params_hash, canonicalization_version, summary,
   idempotency_key, status, error_code, result_digest, created_at, approved_at, started_at,
-  finished_at, expires_at`
+  finished_at, expires_at, dispatch_fence_required, dispatch_armed_at`
 
 // ─── 纯逻辑:执行入口分类(单测友好,beginExecute 复用) ─────────────────────
 
@@ -145,6 +147,8 @@ export interface ProposeWriteInput {
     execContractHashHex: string
     authContractVersion: number
   }
+  /** Plugin-only: stale executing before dispatch_armed_at is a proven pre-dispatch failure. */
+  dispatchFenceRequired?: boolean
 }
 
 export interface ProposedWrite {
@@ -197,9 +201,10 @@ export async function proposeWrite(
        (id, user_id, connection_id, connection_revision, provider, action,
           params_enc, params_nonce, params_aad_seed, params_hash, canonicalization_version,
           summary, idempotency_key, status, expires_at,
-          connector_version_id, spec_hash, exec_contract_hash, auth_contract_version)
+          connector_version_id, spec_hash, exec_contract_hash, auth_contract_version,
+          dispatch_fence_required)
        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13, 'pending',
-               now() + interval '10 minutes', $14, $15, $16, $17)
+               now() + interval '10 minutes', $14, $15, $16, $17, $18)
        RETURNING expires_at`,
       [
         id,
@@ -219,6 +224,7 @@ export async function proposeWrite(
         input.contractPins ? Buffer.from(input.contractPins.specHashHex, 'hex') : null,
         input.contractPins ? Buffer.from(input.contractPins.execContractHashHex, 'hex') : null,
         input.contractPins?.authContractVersion ?? null,
+        input.dispatchFenceRequired === true,
       ],
     )
     return r.rows[0]!.expires_at
@@ -364,6 +370,12 @@ interface ConnCheckRow {
   auth_contract_version: number | null
 }
 
+interface PluginArmConnectionRow extends ConnCheckRow {
+  provider: string
+  plugin_write_enabled: boolean
+  plugin_write_disclaimer_version: number | null
+}
+
 /**
  * CAS approved→executing(单事务 FOR UPDATE):
  *   - **绑定校验(P0#2 越权面)**:账本行必须属于本 connection,且 provider/action 与
@@ -504,6 +516,91 @@ export async function beginExecute(
     throw new ConnectorError(out.code, 'confirmation not executable (terminalized)')
   }
   return out
+}
+
+/**
+ * Plugin-only external write fence. The database commit order is the authority,
+ * not the Redis lease TTL: write access toggles lock the same connection row.
+ * Once this transaction commits, every non-proven-success outcome must be
+ * treated as maybe delivered and must never be retried automatically.
+ */
+export async function armPluginWriteDispatch(
+  opts: {
+    id: string
+    userId: number
+    connectionId: string
+    currentDisclaimerVersion: number
+  },
+  pool: Pool = getPool(),
+): Promise<LedgerRow> {
+  return tx<LedgerRow>(async (client) => {
+    // Lock order is deliberately connection -> ledger. The write-access PATCH
+    // takes only the connection lock; beginExecute has already committed before
+    // this function is called, so there is no inverse lock-order overlap.
+    const connectionResult = await client.query<PluginArmConnectionRow>(
+      `SELECT revision, status, revoked_at, provider,
+              connector_version_id::text AS connector_version_id, spec_hash,
+              exec_contract_hash, auth_contract_version,
+              plugin_write_enabled, plugin_write_disclaimer_version
+         FROM connections
+        WHERE id = $1::bigint AND user_id = $2
+        FOR UPDATE`,
+      [opts.connectionId, opts.userId],
+    )
+    const connection = connectionResult.rows[0]
+    if (!connection || connection.revoked_at !== null)
+      throw new ConnectorError('CONNECTION_REVOKED', 'Plugin account is revoked')
+
+    const ledgerResult = await client.query<LedgerRow>(
+      `SELECT ${ROW_COLS} FROM connector_write_ledger
+        WHERE id = $1::uuid AND user_id = $2 AND connection_id = $3::bigint
+        FOR UPDATE`,
+      [opts.id, opts.userId, opts.connectionId],
+    )
+    const row = ledgerResult.rows[0]
+    if (!row) throw new ConnectorError('CONFIRMATION_NOT_FOUND', 'Plugin confirmation not found')
+    if (
+      row.status !== 'executing' ||
+      row.dispatch_fence_required !== true ||
+      row.dispatch_armed_at !== null
+    )
+      throw new ConnectorError('CONFIRMATION_IN_PROGRESS', 'Plugin confirmation is not armable')
+
+    const pinsMatch =
+      row.connector_version_id === connection.connector_version_id &&
+      row.spec_hash !== null &&
+      connection.spec_hash !== null &&
+      row.spec_hash.equals(connection.spec_hash) &&
+      row.exec_contract_hash !== null &&
+      connection.exec_contract_hash !== null &&
+      row.exec_contract_hash.equals(connection.exec_contract_hash) &&
+      row.auth_contract_version !== null &&
+      row.auth_contract_version === connection.auth_contract_version
+    if (
+      connection.status !== 'active' ||
+      row.provider !== connection.provider ||
+      row.connection_revision !== connection.revision ||
+      !pinsMatch
+    )
+      throw new ConnectorError('REVISION_MISMATCH', 'Plugin account changed before dispatch')
+    if (
+      connection.plugin_write_enabled !== true ||
+      connection.plugin_write_disclaimer_version !== opts.currentDisclaimerVersion
+    )
+      throw new ConnectorError('CONNECTION_ERROR', 'Plugin writes are disabled')
+
+    const armed = await client.query<LedgerRow>(
+      `UPDATE connector_write_ledger
+          SET dispatch_armed_at = now()
+        WHERE id = $1::uuid AND user_id = $2 AND connection_id = $3::bigint
+          AND status = 'executing' AND dispatch_armed_at IS NULL
+        RETURNING ${ROW_COLS}`,
+      [opts.id, opts.userId, opts.connectionId],
+    )
+    if ((armed.rowCount ?? 0) !== 1)
+      throw new ConnectorError('INTERNAL', 'Plugin dispatch arm CAS failed')
+    return armed.rows[0]!
+  }, pool)
 }
 
 /** beginExecute 就地终态化后抛出的错误码集合。 */

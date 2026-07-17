@@ -1,10 +1,24 @@
 import type { Pool } from 'pg'
+import { canonicalDigestHex } from '../connectors/canonicalJson.js'
+import {
+  type LedgerRow,
+  type LedgerStatus,
+  armPluginWriteDispatch,
+  beginExecute,
+  classifyForExecute,
+  finalizeExecute,
+  getLedgerRow,
+  proposeWrite as proposeLedgerWrite,
+} from '../connectors/ledger.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
+import { buildWriteSummary } from '../connectors/service.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { getPool } from '../db/index.js'
+import { tx } from '../db/queries.js'
 import { type PluginLeaseRedis, acquirePluginAccountLease } from './accountLease.js'
 import {
   PluginAccountError,
+  type PluginAccountRow,
   assertRuntimePluginInstallEntitlement,
   commitPluginAccountState,
   decryptPluginAccountEnvelope,
@@ -14,8 +28,14 @@ import {
   revokePluginAccountFenced,
 } from './accounts.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
+import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 import type { VerifiedLocalPluginRuntime } from './localRuntime.js'
-import { listVerifiedRuntimePluginContracts, loadVerifiedRuntimePluginContract } from './review.js'
+import {
+  type VerifiedRuntimePluginContract,
+  listVerifiedRuntimePluginContracts,
+  loadVerifiedRuntimePluginContract,
+} from './review.js'
+import { managedPluginWritePolicy } from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
   readonly code:
@@ -25,6 +45,8 @@ export class PluginRuntimeFacadeError extends Error {
     | 'RELINK_REQUIRED'
     | 'BAD_REQUEST'
     | 'TARGET_STALE'
+    | 'WRITE_DISABLED'
+    | 'WRITE_REQUIRES_CONFIRMATION'
 
   constructor(code: PluginRuntimeFacadeError['code'], message: string = code) {
     super(message)
@@ -40,7 +62,16 @@ export interface RuntimePluginCatalogEntry {
   label: string
   description: string
   accountMode: 'none' | 'required'
-  actions: Array<{ id: string; description: string; readOnly: true }>
+  actions: Array<{ id: string; description: string; readOnly: boolean }>
+}
+
+export interface RuntimePluginWriteControl {
+  available: boolean
+  enabled: boolean
+  disclaimerVersion: number
+  acceptedVersion: number | null
+  acceptedAt: string | null
+  disclaimerText: string
 }
 
 export interface RuntimePluginManagementEntry extends RuntimePluginCatalogEntry {
@@ -53,11 +84,11 @@ export interface RuntimePluginManagementEntry extends RuntimePluginCatalogEntry 
   available: boolean
 }
 
-export interface RuntimePluginManagementAccount
-  extends Omit<RuntimePluginTargetEntry, 'status'> {
+export interface RuntimePluginManagementAccount extends Omit<RuntimePluginTargetEntry, 'status'> {
   status: 'active' | 'error'
   versionId: string
   executable: boolean
+  writeControl: RuntimePluginWriteControl | null
 }
 
 export interface RuntimePluginTargetEntry {
@@ -67,8 +98,18 @@ export interface RuntimePluginTargetEntry {
   displayName: string
   accountHint: string
   status: 'active'
-  actions: Array<{ id: string; description: string; readOnly: true }>
+  actions: Array<{ id: string; description: string; readOnly: boolean }>
 }
+
+export type RuntimePluginWriteExecution =
+  | { kind: 'result'; result: unknown }
+  | { kind: 'in_progress' }
+  | {
+      kind: 'replay'
+      status: LedgerStatus
+      errorCode: string | null
+      resultDigest: string | null
+    }
 
 interface CatalogRow {
   id: string
@@ -101,6 +142,54 @@ function isSafeDbId(value: string): boolean {
   return Number.isSafeInteger(numeric) && numeric > 0
 }
 
+function actionProjection(action: { id: string; description: string; effect: 'read' | 'write' }) {
+  return {
+    id: action.id,
+    description: action.description,
+    readOnly: action.effect === 'read',
+  }
+}
+
+function writeControlFor(
+  slug: string,
+  actions: readonly { effect: 'read' | 'write' }[],
+  row: {
+    plugin_write_enabled: boolean
+    plugin_write_disclaimer_version: number | null
+    plugin_write_disclaimer_accepted_at: Date | null
+  },
+): RuntimePluginWriteControl | null {
+  if (!actions.some((action) => action.effect === 'write')) return null
+  const policy = managedPluginWritePolicy(slug)
+  if (!policy) return null
+  const enabled =
+    row.plugin_write_enabled === true &&
+    row.plugin_write_disclaimer_version === policy.version &&
+    row.plugin_write_disclaimer_accepted_at instanceof Date
+  return {
+    available: true,
+    enabled,
+    disclaimerVersion: policy.version,
+    acceptedVersion: row.plugin_write_disclaimer_version,
+    acceptedAt: row.plugin_write_disclaimer_accepted_at?.toISOString() ?? null,
+    disclaimerText: policy.disclaimerText,
+  }
+}
+
+function ledgerReplay(row: LedgerRow): RuntimePluginWriteExecution {
+  return {
+    kind: 'replay',
+    status: row.status,
+    errorCode: row.error_code,
+    resultDigest: row.result_digest,
+  }
+}
+
+function stablePluginErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code
+  return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'INTERNAL'
+}
+
 export class PluginRuntimeFacade {
   private readonly pool: Pool
   private readonly browser: ManagedBrowserRuntime
@@ -124,6 +213,36 @@ export class PluginRuntimeFacade {
         expectedOwnerUid: 0,
         ...(opts.resolver ? { resolver: opts.resolver } : {}),
       })
+  }
+
+  private async loadManagedTarget(
+    userId: number,
+    targetId: string,
+    opts: { includeError?: boolean } = {},
+  ): Promise<{
+    row: PluginAccountRow
+    verified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>
+  }> {
+    if (!isSafeDbId(targetId))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin account id is malformed')
+    const row = await getPluginAccount(targetId, userId, this.pool, opts)
+    if (!row) throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account not found')
+    const verified = await loadVerifiedRuntimePluginContract(
+      Number(row.connector_version_id),
+      this.pool,
+      { env: this.opts.env },
+    )
+    if (verified.pluginType !== 'managed-browser' || verified.slug !== row.provider)
+      throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
+    if (!this.browser.supportsContract(verified.contract))
+      throw new PluginRuntimeFacadeError(
+        'RUNTIME_UNAVAILABLE',
+        'managed-browser Plugin runtime unavailable',
+      )
+    await assertRuntimePluginInstallEntitlement(userId, verified, this.pool, {
+      requireCurrent: true,
+    })
+    return { row, verified }
   }
 
   async classifyTarget(
@@ -263,11 +382,7 @@ export class PluginRuntimeFacade {
         label: row.name,
         description: row.description,
         accountMode: item.contract.account.mode,
-        actions: item.contract.actions.map((action) => ({
-          id: action.id,
-          description: action.description,
-          readOnly: true,
-        })),
+        actions: item.contract.actions.map(actionProjection),
       })
     }
     return out
@@ -365,20 +480,14 @@ export class PluginRuntimeFacade {
           row.installed_description,
         accountMode:
           contract?.pluginType === 'managed-browser' ? contract.contract.account.mode : 'none',
-        actions:
-          contract?.contract.actions.map((action) => ({
-            id: action.id,
-            description: action.description,
-            readOnly: true as const,
-          })) ?? [],
+        actions: contract?.contract.actions.map(actionProjection) ?? [],
         installed: row.installed,
         installedVersion: row.installed_version,
         latestVersionId: available ? row.latest_id : null,
         latestVersion: available ? row.latest_version : null,
         installedCurrent,
         updateAvailable:
-          available &&
-          (!row.installed || !installedTrusted || row.latest_id !== row.installed_id),
+          available && (!row.installed || !installedTrusted || row.latest_id !== row.installed_id),
         available,
       }
     })
@@ -390,9 +499,14 @@ export class PluginRuntimeFacade {
       connector_version_id: string
       status: 'active' | 'error'
       meta: Record<string, unknown>
+      plugin_write_enabled: boolean
+      plugin_write_disclaimer_version: number | null
+      plugin_write_disclaimer_accepted_at: Date | null
     }>(
       `SELECT c.id::text, c.provider, c.display_name,
-              c.connector_version_id::text, c.status, c.meta
+              c.connector_version_id::text, c.status, c.meta,
+              c.plugin_write_enabled, c.plugin_write_disclaimer_version,
+              c.plugin_write_disclaimer_accepted_at
          FROM connections c
          JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
          JOIN marketplace_skill_listings l ON l.slug = v.slug AND l.slug = c.provider
@@ -403,6 +517,15 @@ export class PluginRuntimeFacade {
     )
     const accounts: RuntimePluginManagementAccount[] = accountRows.rows.map((row) => {
       const plugin = bySlug.get(row.provider)
+      const writeControl = plugin
+        ? writeControlFor(
+            row.provider,
+            plugin.actions.map((action) => ({
+              effect: action.readOnly ? ('read' as const) : ('write' as const),
+            })),
+            row,
+          )
+        : null
       return {
         id: row.id,
         provider: row.provider,
@@ -417,6 +540,7 @@ export class PluginRuntimeFacade {
           plugin?.installedCurrent === true &&
           plugin.versionId === row.connector_version_id &&
           runtimeSupportedVersionIds.has(row.connector_version_id),
+        writeControl,
       }
     })
     return { catalog, accounts }
@@ -441,9 +565,14 @@ export class PluginRuntimeFacade {
       display_name: string
       connector_version_id: string
       meta: Record<string, unknown>
+      plugin_write_enabled: boolean
+      plugin_write_disclaimer_version: number | null
+      plugin_write_disclaimer_accepted_at: Date | null
     }>(
       `SELECT c.id::text, c.provider, c.display_name,
-              c.connector_version_id::text, c.meta
+              c.connector_version_id::text, c.meta,
+              c.plugin_write_enabled, c.plugin_write_disclaimer_version,
+              c.plugin_write_disclaimer_accepted_at
          FROM connections c
          JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
          JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -478,14 +607,394 @@ export class PluginRuntimeFacade {
         displayName: row.display_name || row.provider,
         accountHint: typeof row.meta?.account_hint === 'string' ? row.meta.account_hint : '',
         status: 'active',
-        actions: item.contract.actions.map((action) => ({
-          id: action.id,
-          description: action.description,
-          readOnly: true,
-        })),
+        actions: item.contract.actions
+          .filter(
+            (action) =>
+              action.effect === 'read' ||
+              writeControlFor(row.provider, item.contract.actions, row)?.enabled === true,
+          )
+          .map(actionProjection),
       })
     }
     return [...managedTargets, ...localTargets]
+  }
+
+  async actionEffect(input: {
+    userId: number
+    targetId: string
+    actionId: string
+  }): Promise<'read' | 'write'> {
+    const local = /^plugin:(\d{1,16})$/.exec(input.targetId)
+    if (local) {
+      if (!isSafeDbId(local[1]!))
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin target id is malformed')
+      const verified = await loadVerifiedRuntimePluginContract(Number(local[1]), this.pool, {
+        env: this.opts.env,
+      })
+      if (verified.pluginType !== 'sandboxed-local')
+        throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin target subtype mismatch')
+      await assertRuntimePluginInstallEntitlement(input.userId, verified, this.pool, {
+        requireCurrent: true,
+      })
+      if (!verified.contract.actions.some((action) => action.id === input.actionId))
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
+      return 'read'
+    }
+    const { verified } = await this.loadManagedTarget(input.userId, input.targetId)
+    const action = verified.contract.actions.find((candidate) => candidate.id === input.actionId)
+    if (!action) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
+    return action.effect
+  }
+
+  async setManagedAccountWriteAccess(input: {
+    userId: number
+    targetId: string
+    enabled: boolean
+    accepted?: true
+    disclaimerVersion?: number
+  }): Promise<RuntimePluginWriteControl> {
+    const initial = await this.loadManagedTarget(input.userId, input.targetId)
+    const policy = managedPluginWritePolicy(initial.verified.slug)
+    if (!policy || !initial.verified.contract.actions.some((action) => action.effect === 'write'))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin does not expose managed writes')
+    if (input.enabled && (input.accepted !== true || input.disclaimerVersion !== policy.version))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'current write disclaimer is required')
+
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: 15_000,
+    })
+    try {
+      const current = await this.loadManagedTarget(input.userId, input.targetId)
+      if (
+        current.verified.artifactHash !== initial.verified.artifactHash ||
+        current.verified.execContractHash !== initial.verified.execContractHash
+      )
+        throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin changed before write toggle')
+      await lease.assertHeld()
+      const updated = await tx<{
+        plugin_write_enabled: boolean
+        plugin_write_disclaimer_version: number | null
+        plugin_write_disclaimer_accepted_at: Date | null
+      }>(async (client) => {
+        const locked = await client.query<PluginAccountRow>(
+          `SELECT id::text AS id, user_id::int AS user_id, provider, display_name,
+                  account_key, aad_seed::text AS aad_seed, secret_enc, secret_nonce,
+                  revision, secret_generation::text AS secret_generation,
+                  connector_version_id::text AS connector_version_id, spec_hash,
+                  exec_contract_hash, auth_contract_version,
+                  plugin_write_enabled, plugin_write_disclaimer_version,
+                  plugin_write_disclaimer_accepted_at, status, meta, revoked_at
+             FROM connections
+            WHERE id = $1::bigint AND user_id = $2
+            FOR UPDATE`,
+          [input.targetId, input.userId],
+        )
+        const row = locked.rows[0]
+        if (
+          !row ||
+          row.status !== 'active' ||
+          row.revoked_at !== null ||
+          row.provider !== current.verified.slug ||
+          row.revision !== current.row.revision ||
+          row.connector_version_id !== String(current.verified.versionId) ||
+          row.spec_hash.toString('hex') !== current.verified.artifactHash ||
+          row.exec_contract_hash.toString('hex') !== current.verified.execContractHash ||
+          row.auth_contract_version !== current.verified.contract.account.contractVersion
+        )
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin account changed')
+        await assertRuntimePluginInstallEntitlement(input.userId, current.verified, client, {
+          requireCurrent: true,
+        })
+        const result = await client.query<{
+          plugin_write_enabled: boolean
+          plugin_write_disclaimer_version: number | null
+          plugin_write_disclaimer_accepted_at: Date | null
+        }>(
+          `UPDATE connections
+              SET plugin_write_enabled = $3,
+                  plugin_write_disclaimer_version = CASE WHEN $3 THEN $4 ELSE plugin_write_disclaimer_version END,
+                  plugin_write_disclaimer_accepted_at = CASE WHEN $3 THEN now() ELSE plugin_write_disclaimer_accepted_at END,
+                  revision = revision + 1, updated_at = now()
+            WHERE id = $1::bigint AND user_id = $2 AND revision = $5
+              AND status = 'active' AND revoked_at IS NULL
+            RETURNING plugin_write_enabled, plugin_write_disclaimer_version,
+                      plugin_write_disclaimer_accepted_at`,
+          [input.targetId, input.userId, input.enabled, policy.version, row.revision],
+        )
+        if ((result.rowCount ?? 0) !== 1)
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin write toggle CAS failed')
+        return result.rows[0]!
+      }, this.pool)
+      const control = writeControlFor(
+        current.verified.slug,
+        current.verified.contract.actions,
+        updated,
+      )
+      if (!control) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin write policy missing')
+      return control
+    } finally {
+      await lease.release()
+    }
+  }
+
+  async proposeWrite(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<{ confirmId: string; provider: string; summary: string; expiresAt: Date }> {
+    const initial = await this.loadManagedTarget(input.userId, input.targetId)
+    const initialAction = initial.verified.contract.actions.find(
+      (candidate) => candidate.id === input.actionId,
+    )
+    if (!initialAction || initialAction.effect !== 'write')
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin write action not found')
+    const policy = managedPluginWritePolicy(initial.verified.slug)
+    if (!policy)
+      throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin write policy is unavailable')
+    try {
+      validateRuntimePluginJson(initialAction.params, input.params, 'params')
+    } catch (error) {
+      if (error instanceof RuntimePluginContractError)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin write params are invalid')
+      throw error
+    }
+
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: 15_000,
+    })
+    try {
+      const current = await this.loadManagedTarget(input.userId, input.targetId)
+      const action = current.verified.contract.actions.find(
+        (candidate) => candidate.id === input.actionId,
+      )
+      if (
+        !action ||
+        action.effect !== 'write' ||
+        current.verified.artifactHash !== initial.verified.artifactHash ||
+        current.verified.execContractHash !== initial.verified.execContractHash
+      )
+        throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin write action changed')
+      const control = writeControlFor(
+        current.verified.slug,
+        current.verified.contract.actions,
+        current.row,
+      )
+      if (!control?.enabled)
+        throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin writes are disabled')
+      validateRuntimePluginJson(action.params, input.params, 'params')
+      await lease.assertHeld()
+      const proposed = await proposeLedgerWrite(
+        {
+          userId: input.userId,
+          connectionId: current.row.id,
+          connectionRevision: current.row.revision,
+          provider: current.verified.slug,
+          action: action.id,
+          params: input.params,
+          summary: buildWriteSummary(
+            current.verified.slug,
+            action.id,
+            input.params,
+            typeof current.row.meta?.account_hint === 'string' ? current.row.meta.account_hint : '',
+          ),
+          contractPins: {
+            connectorVersionId: current.verified.versionId,
+            specHashHex: current.verified.artifactHash,
+            execContractHashHex: current.verified.execContractHash,
+            authContractVersion: current.verified.contract.account.contractVersion,
+          },
+          dispatchFenceRequired: true,
+        },
+        this.pool,
+      )
+      return {
+        confirmId: proposed.id,
+        provider: current.verified.slug,
+        summary: proposed.summary,
+        expiresAt: proposed.expiresAt,
+      }
+    } finally {
+      await lease.release()
+    }
+  }
+
+  private async authoritativeWriteOutcome(
+    userId: number,
+    targetId: string,
+    confirmId: string,
+  ): Promise<RuntimePluginWriteExecution> {
+    const row = await getLedgerRow(confirmId, userId, this.pool)
+    if (!row || row.connection_id !== targetId)
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin confirmation binding changed')
+    if (row.status === 'executing') return { kind: 'in_progress' }
+    if (['succeeded', 'failed', 'unknown', 'expired', 'denied'].includes(row.status))
+      return ledgerReplay(row)
+    throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin ledger state is invalid')
+  }
+
+  async executeConfirmedWrite(input: {
+    userId: number
+    targetId: string
+    confirmId: string
+  }): Promise<RuntimePluginWriteExecution> {
+    if (!isSafeDbId(input.targetId))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin account id is malformed')
+    const snapshot = await getLedgerRow(input.confirmId, input.userId, this.pool)
+    if (!snapshot || snapshot.connection_id !== input.targetId)
+      throw new PluginRuntimeFacadeError(
+        'BAD_REQUEST',
+        'Plugin confirmation does not match account',
+      )
+    const classification = classifyForExecute(snapshot)
+    if (classification.kind === 'in_progress') return { kind: 'in_progress' }
+    if (classification.kind === 'replay') return ledgerReplay(snapshot)
+
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: 120_000,
+    })
+    let begun: Extract<Awaited<ReturnType<typeof beginExecute>>, { kind: 'ok' }> | null = null
+    let fencedRow: PluginAccountRow | null = null
+    let verified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }> | null =
+      null
+    let armed = false
+    let armAttempted = false
+    try {
+      const started = await beginExecute(
+        {
+          id: input.confirmId,
+          userId: input.userId,
+          connectionId: input.targetId,
+          expectedProvider: snapshot.provider,
+        },
+        this.pool,
+      )
+      if (started.kind === 'in_progress') return { kind: 'in_progress' }
+      if (started.kind === 'replay') {
+        return {
+          kind: 'replay',
+          status: started.status,
+          errorCode: started.errorCode,
+          resultDigest: started.resultDigest,
+        }
+      }
+      begun = started
+
+      try {
+        const current = await this.loadManagedTarget(input.userId, input.targetId)
+        verified = current.verified
+        const action = verified.contract.actions.find(
+          (candidate) => candidate.id === begun!.row.action,
+        )
+        if (!action || action.effect !== 'write')
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin write action changed')
+        validateRuntimePluginJson(action.params, begun.params, 'params')
+        const policy = managedPluginWritePolicy(verified.slug)
+        if (!policy)
+          throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin write policy is unavailable')
+        await lease.assertHeld()
+        armAttempted = true
+        await armPluginWriteDispatch(
+          {
+            id: input.confirmId,
+            userId: input.userId,
+            connectionId: input.targetId,
+            currentDisclaimerVersion: policy.version,
+          },
+          this.pool,
+        )
+        // From this commit forward the parent is uncertainty-armed before any
+        // worker input is sent. Only a complete validated success may escape unknown.
+        armed = true
+
+        fencedRow = await fencePluginAccountInvocation({
+          connectionId: input.targetId,
+          userId: input.userId,
+          expectedRevision: begun.row.connection_revision,
+          verified,
+          runner: this.pool,
+        })
+        const envelope = decryptPluginAccountEnvelope(fencedRow, verified.contract, this.opts.env)
+        const executed = await this.browser.runAction({
+          contract: verified.contract,
+          storageState: envelope.storageState,
+          actionId: begun.row.action,
+          params: begun.params,
+          signal: lease.signal,
+        })
+        const currentVerified = await loadVerifiedRuntimePluginContract(
+          verified.versionId,
+          this.pool,
+          {
+            env: this.opts.env,
+          },
+        )
+        if (
+          currentVerified.pluginType !== 'managed-browser' ||
+          currentVerified.artifactHash !== verified.artifactHash ||
+          currentVerified.execContractHash !== verified.execContractHash ||
+          !this.browser.supportsContract(currentVerified.contract)
+        )
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed during write')
+        await assertRuntimePluginInstallEntitlement(input.userId, currentVerified, this.pool, {
+          requireCurrent: true,
+        })
+        await lease.assertHeld()
+        await commitPluginAccountState({
+          row: fencedRow,
+          verified: currentVerified,
+          envelope: { ...envelope, storageState: executed.storageState },
+          runner: this.pool,
+          env: this.opts.env,
+        })
+        const finalized = await finalizeExecute(
+          {
+            id: input.confirmId,
+            status: 'succeeded',
+            resultDigest: canonicalDigestHex(executed.result),
+          },
+          this.pool,
+        )
+        if (!finalized)
+          return this.authoritativeWriteOutcome(input.userId, input.targetId, input.confirmId)
+        return { kind: 'result', result: executed.result }
+      } catch (error) {
+        const code = stablePluginErrorCode(error)
+        let dispatchMayHaveStarted = armed
+        if (!dispatchMayHaveStarted && armAttempted) {
+          // The COMMIT response itself can be lost. Never trust a local flag
+          // across that ambiguity; reread the durable dispatch boundary.
+          const authoritative = await getLedgerRow(input.confirmId, input.userId, this.pool)
+          if (!authoritative || authoritative.connection_id !== input.targetId)
+            throw new PluginRuntimeFacadeError(
+              'RUNTIME_UNAVAILABLE',
+              'Plugin dispatch state is unavailable',
+            )
+          dispatchMayHaveStarted = authoritative.dispatch_armed_at !== null
+        }
+        if (dispatchMayHaveStarted) {
+          if (code === 'LOGIN_EXPIRED_ACCOUNT' && fencedRow && verified) {
+            await markPluginAccountRelinkRequiredFenced({
+              row: fencedRow,
+              verified,
+              runner: this.pool,
+            }).catch(() => {})
+          }
+          await finalizeExecute(
+            { id: input.confirmId, status: 'unknown', errorCode: code },
+            this.pool,
+          ).catch(() => false)
+          return this.authoritativeWriteOutcome(input.userId, input.targetId, input.confirmId)
+        }
+        await finalizeExecute(
+          { id: input.confirmId, status: 'failed', errorCode: code },
+          this.pool,
+        ).catch(() => false)
+        return this.authoritativeWriteOutcome(input.userId, input.targetId, input.confirmId)
+      }
+    } finally {
+      await lease.release()
+    }
   }
 
   async revokeManagedAccount(userId: number, targetId: string): Promise<{ id: string }> {
@@ -569,6 +1078,11 @@ export class PluginRuntimeFacade {
       )
     const action = initialVerified.contract.actions.find((item) => item.id === input.actionId)
     if (!action) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
+    if (action.effect !== 'read')
+      throw new PluginRuntimeFacadeError(
+        'WRITE_REQUIRES_CONFIRMATION',
+        'Plugin writes require an approved confirmation',
+      )
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: action.timeoutSeconds * 1000,
@@ -613,10 +1127,7 @@ export class PluginRuntimeFacade {
             verified,
             runner: this.pool,
           })
-          throw new PluginRuntimeFacadeError(
-            'RELINK_REQUIRED',
-            'Plugin account login has expired',
-          )
+          throw new PluginRuntimeFacadeError('RELINK_REQUIRED', 'Plugin account login has expired')
         }
         if (code === 'CAPACITY_EXCEEDED')
           throw new PluginRuntimeFacadeError('RUNTIME_BUSY', 'Plugin worker capacity is full')

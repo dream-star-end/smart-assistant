@@ -65,6 +65,14 @@ function deps(overrides: Record<string, unknown> = {}): any {
         accounts: [{ id: '7', provider: 'p-42' }],
       }),
       revokeManagedAccount: async (userId: number, id: string) => ({ id: `${userId}:${id}` }),
+      setManagedAccountWriteAccess: async (input: Record<string, unknown>) => ({
+        available: true,
+        enabled: input.enabled === true,
+        disclaimerVersion: 1,
+        acceptedVersion: input.enabled === true ? 1 : null,
+        acceptedAt: input.enabled === true ? '2026-07-17T00:00:00.000Z' : null,
+        disclaimerText: 'test disclaimer',
+      }),
     },
     knowledgePlanetSetup: {
       start: async (userId: number, accepted: boolean) => ({
@@ -138,6 +146,72 @@ describe('Plugin management HTTP dispatcher', () => {
       ),
       (error: unknown) => error instanceof HttpError && error.status === 400,
     )
+  })
+
+  test('write access requires the exact current consent body and authenticated owner', async () => {
+    const calls: unknown[] = []
+    const custom = deps({
+      pluginRuntime: {
+        setManagedAccountWriteAccess: async (input: unknown) => {
+          calls.push(input)
+          return {
+            available: true,
+            enabled: true,
+            disclaimerVersion: 3,
+            acceptedVersion: 3,
+            acceptedAt: '2026-07-17T00:00:00.000Z',
+            disclaimerText: 'notice',
+          }
+        },
+      },
+    })
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('PATCH', '/api/plugins/accounts/901/write-access', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 3,
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(calls, [
+      {
+        userId: 42,
+        targetId: '901',
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 3,
+      },
+    ])
+
+    for (const invalid of [
+      { enabled: true, accepted: false, disclaimerVersion: 3 },
+      { enabled: true, accepted: true },
+      { enabled: false, accepted: true },
+      { enabled: false, extra: true },
+    ]) {
+      await assert.rejects(
+        dispatchPluginsRoute(
+          await request('PATCH', '/api/plugins/accounts/901/write-access', invalid),
+          response(),
+          ctx,
+          custom,
+        ),
+        (error: unknown) => error instanceof HttpError && error.status === 400,
+      )
+    }
+
+    const disabled = response()
+    await dispatchPluginsRoute(
+      await request('PATCH', '/api/plugins/accounts/901/write-access', { enabled: false }),
+      disabled,
+      ctx,
+      custom,
+    )
+    assert.deepEqual(calls.at(-1), { userId: 42, targetId: '901', enabled: false })
   })
 
   test('runtime ownership failures map to stable HTTP errors; unknown methods stay dispatcher-owned', async () => {

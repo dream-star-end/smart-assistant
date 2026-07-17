@@ -698,6 +698,13 @@ describe('RPC 信封契约', () => {
         catalog: async () => [],
         list: async () => [],
         classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => 'read',
+        proposeWrite: async () => {
+          throw new Error('unexpected write')
+        },
+        executeConfirmedWrite: async () => {
+          throw new Error('unexpected confirmation')
+        },
         call: async (input) => {
           callInput = input
           return { posts: 2 }
@@ -730,6 +737,199 @@ describe('RPC 信封契约', () => {
     })
   })
 
+  test('/v3/plugins/call 的写动作只创建服务端确认，不会直调运行时', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    let proposedInput: unknown
+    let directCalls = 0
+    const confirmId = '11111111-1111-4111-8111-111111111111'
+    const expiresAt = new Date('2026-07-17T01:02:03.000Z')
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      redis: { eval: async () => 1 } as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => 'write',
+        proposeWrite: async (input) => {
+          proposedInput = input
+          return {
+            confirmId,
+            provider: 'knowledge-planet',
+            summary: '发布知识星球主题',
+            expiresAt,
+          }
+        },
+        executeConfirmedWrite: async () => {
+          throw new Error('unexpected confirmation')
+        },
+        call: async () => {
+          directCalls += 1
+          return {}
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({
+          connectionId: '41',
+          action: 'create_topic',
+          params: { groupId: '123', text: 'hello' },
+        }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(JSON.parse(state.body), {
+      kind: 'confirmation_required',
+      id: confirmId,
+      provider: 'knowledge-planet',
+      action: 'create_topic',
+      summary: '发布知识星球主题',
+      expiresAt: expiresAt.toISOString(),
+    })
+    assert.deepEqual(proposedInput, {
+      userId: 7,
+      targetId: '41',
+      actionId: 'create_topic',
+      params: { groupId: '123', text: 'hello' },
+    })
+    assert.equal(directCalls, 0)
+  })
+
+  test('/v3/plugins/call 的 confirmId 完全委托账本执行并保留 unknown replay', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    let executionInput: unknown
+    const confirmId = '22222222-2222-4222-8222-222222222222'
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => {
+          throw new Error('body action must not be authoritative')
+        },
+        proposeWrite: async () => {
+          throw new Error('unexpected propose')
+        },
+        executeConfirmedWrite: async (input) => {
+          executionInput = input
+          return {
+            kind: 'replay',
+            status: 'unknown',
+            errorCode: 'CONNECTION_ERROR',
+            resultDigest: null,
+          }
+        },
+        call: async () => {
+          throw new Error('unexpected direct call')
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({ connectionId: '41', confirmId }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(executionInput, { userId: 7, targetId: '41', confirmId })
+    assert.deepEqual(JSON.parse(state.body), {
+      kind: 'replay',
+      status: 'unknown',
+      errorCode: 'CONNECTION_ERROR',
+    })
+  })
+
+  test('/v3/plugins/call 稳定映射默认关闭的写开关', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      redis: { eval: async () => 1 } as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => 'write',
+        proposeWrite: async () => {
+          throw new PluginRuntimeFacadeError('WRITE_DISABLED')
+        },
+        executeConfirmedWrite: async () => {
+          throw new Error('unexpected confirmation')
+        },
+        call: async () => {
+          throw new Error('unexpected direct call')
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({ connectionId: '41', action: 'create_topic', params: {} }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(JSON.parse(state.body), { kind: 'error', code: 'WRITE_DISABLED' })
+  })
+
   test('/v3/plugins/call 稳定映射容量饱和与账号登录过期', async () => {
     const okRepo = {
       async findActiveByHostAndBoundIp() {
@@ -756,6 +956,13 @@ describe('RPC 信封契约', () => {
           catalog: async () => [],
           list: async () => [],
           classifyTarget: async () => 'managed-browser',
+          actionEffect: async () => 'read',
+          proposeWrite: async () => {
+            throw new Error('unexpected write')
+          },
+          executeConfirmedWrite: async () => {
+            throw new Error('unexpected confirmation')
+          },
           call: async () => {
             throw new PluginRuntimeFacadeError(runtimeCode)
           },
@@ -817,6 +1024,13 @@ describe('RPC 信封契约', () => {
           return [runtimeTarget]
         },
         classifyTarget: async () => null,
+        actionEffect: async () => 'read',
+        proposeWrite: async () => {
+          throw new Error('unexpected write')
+        },
+        executeConfirmedWrite: async () => {
+          throw new Error('unexpected confirmation')
+        },
         call: async () => ({}),
       },
       log: () => {},

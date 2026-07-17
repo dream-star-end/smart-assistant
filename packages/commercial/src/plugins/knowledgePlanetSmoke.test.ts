@@ -38,9 +38,12 @@ describe('Knowledge Planet authenticated action smoke', () => {
 
     assert.deepEqual(
       completed.passedActionIds,
-      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+        .filter((action) => action.effect === 'read')
+        .map((action) => action.id),
     )
     assert.deepEqual(completed.resourceUnavailableActionIds, [])
+    assert.deepEqual(completed.writeActionIdsSkipped, ['create_topic', 'create_comment'])
     assert.deepEqual(calls.find((call) => call.actionId === 'get_topic')?.params, {
       topicId: '223456789',
     })
@@ -89,11 +92,15 @@ describe('Knowledge Planet authenticated action smoke', () => {
     assert.deepEqual(
       completed.passedActionIds,
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+        .filter((action) => action.effect === 'read')
         .map((action) => action.id)
         .filter((actionId) => !completed.resourceUnavailableActionIds.includes(actionId)),
     )
     for (const actionId of completed.resourceUnavailableActionIds)
-      assert.equal(calls.some((call) => call.actionId === actionId), false)
+      assert.equal(
+        calls.some((call) => call.actionId === actionId),
+        false,
+      )
     assert.equal(calls.filter((call) => call.actionId === 'list_checkins').length, 3)
   })
 
