@@ -43,6 +43,7 @@ type Msg = {
   text: string
   ts: number
   _seq?: number
+  _orderSeq?: number
   _source?: string
   [k: string]: unknown
 }
@@ -286,6 +287,39 @@ describe('PUT 防复活', () => {
 })
 
 describe('browser chat projection (SQLite compatibility)', () => {
+  it('legacy hot rows derive order from durable array once and freeze it on the next write', async () => {
+    const sessId = 'web-legacy-order'
+    await upsertClientSession({
+      id: sessId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: [], updatedAt: 1,
+    }, 0)
+    const legacy: Msg[] = [
+      { id: 'u1', role: 'user', text: 'one', ts: 100, _seq: 5 },
+      { id: 'a1', role: 'assistant', text: 'answer', ts: 400, _seq: 13, _source: 'server' },
+      { id: 'u2', role: 'user', text: 'two', ts: 300, _seq: 6 },
+    ]
+    const db = await getSessionsDb()
+    db.prepare('UPDATE client_sessions SET messages=?,message_count=?,next_seq=? WHERE id=? AND user_id=?')
+      .run(JSON.stringify(legacy), legacy.length, 14, sessId, USER)
+
+    const lazy = (await getClientSession(sessId, USER))!.messages as Msg[]
+    assert.deepEqual(lazy.map((m) => m.id), ['u1', 'a1', 'u2'])
+    assert.deepEqual(lazy.map((m) => m._orderSeq), [1, 2, 3])
+
+    const stored = db.prepare('SELECT updated_at FROM client_sessions WHERE id=? AND user_id=?')
+      .get(sessId, USER) as { updated_at: number }
+    const result = await upsertClientSession({
+      id: sessId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 3,
+      messages: [legacy[2], legacy[0], legacy[1]],
+      updatedAt: stored.updated_at + 1,
+    }, stored.updated_at)
+    assert.equal(result, 'applied')
+    const frozen = await rowMessages(sessId)
+    assert.deepEqual(frozen.map((m) => m.id), ['u1', 'a1', 'u2'])
+    assert.deepEqual(frozen.map((m) => m._orderSeq), [1, 2, 3])
+  })
+
   it('exact keeps raw runtime payload while chat returns only sanitized patch/checkpoint', async () => {
     await upsertClientSession({
       id: 'web-chat-projection', userId: USER, agentId: 'main', title: 't', pinned: false,
@@ -451,6 +485,52 @@ describe('readArchivedMessages — 分页', () => {
     const page = await readArchivedMessages('web-pg2', 'someone-else', 0, 50)
     assert.equal(page.messages.length, 0)
     assert.equal(page.hasMore, false)
+  })
+
+  it('旧行内容 patch 换 _seq 后仍按冻结 _orderSeq spill，并可与热尾巴无损拼回', async () => {
+    const sessId = 'web-order-roundtrip'
+    const initial = makeMsgs(220, 11 * 1024, 'ord')
+    await upsertClientSession({
+      id: sessId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: initial, updatedAt: 1000,
+    }, 0)
+
+    // Make one early row a real server billing target, then exercise the
+    // production cost patch path: its content-version _seq advances while
+    // its presentation _orderSeq must remain at the original position.
+    const db = await getSessionsDb()
+    const hot = await rowMessages(sessId)
+    hot[5] = { ...hot[5], _source: 'server' }
+    db.prepare('UPDATE client_sessions SET messages=? WHERE id=? AND user_id=?')
+      .run(JSON.stringify(hot), sessId, USER)
+    db.prepare(
+      'INSERT INTO server_authored_request_map (request_id,user_id,session_id,msg_id) VALUES (?,?,?,?)',
+    ).run('req-order-roundtrip', USER, sessId, 'ord-5')
+    assert.equal((await appendCostCredits('req-order-roundtrip', USER, '42')).applied, 'patched')
+
+    const patched = (await rowMessages(sessId)).find((m) => m.id === 'ord-5')!
+    assert.equal(patched._orderSeq, 6)
+    assert.ok((patched._seq ?? 0) > 220, 'patch only advances the version cursor')
+
+    const appended = await appendServerAuthoredMessage(sessId, USER, {
+      id: 'srv-order-tail', role: 'assistant', text: 'z'.repeat(300 * 1024), ts: 999999,
+    })
+    assert.equal(appended.applied, true)
+
+    const archived = await readArchivedMessages(sessId, USER, 0, 200)
+    const tail = (await getClientSession(sessId, USER))!.messages as Msg[]
+    const roundTrip = [...archived.messages as Msg[], ...tail]
+      .sort((a, b) => (a._orderSeq ?? 0) - (b._orderSeq ?? 0))
+    assert.deepEqual(
+      roundTrip.map((m) => m.id),
+      [...initial.map((m) => m.id), 'srv-order-tail'],
+      'archive page + hot tail reconstruct first-persist order exactly',
+    )
+    assert.equal(
+      roundTrip.findIndex((m) => m.id === 'ord-5'),
+      5,
+      'patched old row does not move to the archive/tail end',
+    )
   })
 })
 

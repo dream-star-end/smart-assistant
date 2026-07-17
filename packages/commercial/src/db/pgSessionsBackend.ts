@@ -59,10 +59,14 @@ import {
   type ClientSessionReadOptions,
   type ClientSessionsBackend,
   type DelegatePendingRow,
+  compareMessagesByOrder,
+  deriveArchivedOrderSeqsForRead,
+  deriveOrderSeqsForRead,
   type DrainDelegateCostResult,
   MAX_SESSION_BYTES,
   type MessageLike,
   mergePreservingServerAuthored,
+  normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
   _warnSeqAnomaly,
   planAppendServerAuthored,
@@ -698,6 +702,7 @@ function hydrateTapeRecord(
     // A tape is one atomic sync unit. Expanded records intentionally share
     // its anchor sequence: partial sync either returns every record or none.
     ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+    ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
     ...(Object.keys(recordUsage).length > 0 ||
         Object.keys(anchorUsage).length > 0 ||
         Object.keys(exactCostUsage).length > 0 ||
@@ -819,6 +824,7 @@ function expandHydratedRuntimeBatch(
       _turnTapeSha256: row.tape_sha256,
       _turnTapeExpanded: true,
       ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+      ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
     });
   }
   if (expectedOffset !== raw.length) {
@@ -1798,7 +1804,13 @@ export function createPgSessionsBackend(
           const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[];
           const currentNextSeq =
             existing && typeof existing.next_seq === "number" && existing.next_seq > 0 ? existing.next_seq : 1;
-          const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq, _warnSeqAnomaly);
+          const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(
+            oldMsgs,
+            merged,
+            currentNextSeq,
+            _warnSeqAnomaly,
+            bigIntNumOr(existing?.archived_through_seq, 0),
+          );
 
           const now = Date.now();
           const plan = planSpillOverflow(finalMessages, bigIntNumOr(existing?.archived_through_seq, 0));
@@ -2195,6 +2207,11 @@ export function createPgSessionsBackend(
               } catch {
                 throw new Error("lossless turn billing target session row malformed");
               }
+              messages = normalizeAndAssignOrderSeqs(
+                messages,
+                messages,
+                bigIntNumOr(sess.archived_through_seq, 0),
+              ).messages;
               const anchorIndex = messages.findIndex(
                 (message) =>
                   message?.id === map.billing_anchor_id &&
@@ -2599,7 +2616,11 @@ export function createPgSessionsBackend(
         }>(sql, userId ? [id, userId] : [id])
       ).rows[0];
       if (!row) return null;
-      const parsedMessages = JSON.parse(row.messages) as MessageLike[];
+      const archivedThroughOrderSeq = bigIntNumOr(row.archived_through_seq, 0);
+      const parsedMessages = deriveOrderSeqsForRead(
+        JSON.parse(row.messages) as MessageLike[],
+        archivedThroughOrderSeq,
+      );
       const messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
       return {
         id: row.id,
@@ -2612,7 +2633,7 @@ export function createPgSessionsBackend(
         messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
         archivedCount: bigIntNumOr(row.archived_count, 0),
-        archivedThroughSeq: bigIntNumOr(row.archived_through_seq, 0),
+        archivedThroughSeq: archivedThroughOrderSeq,
       };
     },
 
@@ -2682,6 +2703,7 @@ export function createPgSessionsBackend(
       } catch {
         /* malformed → 空 */
       }
+      allMsgs = deriveOrderSeqsForRead(allMsgs, archivedThroughSeq);
       const anyMissingSeq = allMsgs.some((m) => !m || typeof m._seq !== "number" || !Number.isFinite(m._seq as number));
       let maxSeq = 0;
       for (const m of allMsgs) {
@@ -2754,16 +2776,18 @@ export function createPgSessionsBackend(
         } catch {
           arr = [];
         }
-        for (const m of arr) {
-          const s = typeof m?._seq === "number" ? m._seq : -1;
+        for (const m of deriveArchivedOrderSeqsForRead(arr)) {
+          const s = typeof m?._orderSeq === "number" ? m._orderSeq : -1;
           if (s >= 0 && s < effectiveBefore) messagePool.push(m);
         }
         if (messagePool.length > cappedLimit) break;
       }
-      messagePool.sort((a, b) => (a._seq as number) - (b._seq as number));
+      messagePool.sort(compareMessagesByOrder);
       const hasMore = messagePool.length > cappedLimit;
       const page = messagePool.slice(Math.max(0, messagePool.length - cappedLimit));
-      const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null;
+      const oldestSeq = page.length > 0 && typeof page[0]._orderSeq === "number"
+        ? page[0]._orderSeq
+        : null;
       const hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page, options);
       return { messages: hydrated, hasMore, oldestSeq };
     },

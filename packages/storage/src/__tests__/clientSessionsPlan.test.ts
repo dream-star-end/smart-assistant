@@ -68,6 +68,19 @@ describe('planSpillOverflow — no-op 分支', () => {
 })
 
 describe('planSpillOverflow — spill 决策', () => {
+  it('spills the oldest _orderSeq rows when mutable _seq/array order is polluted', () => {
+    const msgs = makeMsgs(90, 40_000)
+    for (let i = 0; i < msgs.length; i++) msgs[i]!._orderSeq = i + 1
+    const polluted = [msgs.at(-1)!, ...msgs.slice(0, -1)]
+
+    const plan = planSpillOverflow(polluted, 0)
+    const spilled = plan.chunksToInsert.flatMap((chunk) => chunk.messages)
+    assert.ok(spilled.length > 0)
+    assert.equal(spilled[0]?._orderSeq, 1)
+    assert.ok((spilled.at(-1)?._orderSeq as number) < (plan.tail[0]?._orderSeq as number))
+    assert.equal(plan.archivedThroughSeq, spilled.at(-1)?._orderSeq)
+  })
+
   it('超阈值:spilled+tail=原集、尾巴≥MIN、水位=max(spilled._seq)、_seq 冻结', () => {
     const N = 300
     const msgs = makeMsgs(N, 11 * 1024) // ~3.3MB

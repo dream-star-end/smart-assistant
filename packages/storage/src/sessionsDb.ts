@@ -275,12 +275,11 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // 单行 messages JSON 有 4MB 硬上限(MAX_SESSION_BYTES,防 2026-05-08 大行卡死
   // 事件循环)。行到顶后所有追加被静默丢弃 = "扣费但看不到回答"(2026-07-10 uid4)。
   // 解法:行体积超软阈值(SESSION_SOFT_TRIM_BYTES)时把最老的消息从行里"搬"进归档
-  // chunk 表,行只留最近的热尾巴,写路径永不再拒。归档消息 _seq 冻结不变(增量协议
-  // 依赖单调 _seq),用户回看走 readArchivedMessages 分页从 chunk 表拉。
+  // chunk 表,行只留最近的热尾巴,写路径永不再拒。归档顺序由首次持久化冻结的
+  // _orderSeq 决定;_seq 继续作为内容版本/增量游标,用户回看走分页从 chunk 表拉。
   //
   //   client_session_archive_chunks — 归档 chunk(分页权威;messages 为冻结 JSON 数组)。
-  //     first_seq/last_seq = chunk 内 _seq 的 min/max(chunk 之间 _seq 池 disjoint,故
-  //     first_seq 唯一,可做 PK 的一半)。message_count = chunk 内消息条数。
+  //     first_seq/last_seq = chunk 内 _orderSeq 的 min/max(物理列名为滚动兼容保留)。
   //   client_session_archived_ids — 已归档消息 id 集。三用途:
   //     ① PUT 防复活(客户端全量 PUT 带回已归档 id → 过滤掉,行不回涨);
   //     ② append 幂等(server-authored 重放已归档 id → already_exists);
@@ -303,7 +302,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
     );
   `)
   // 归档水位列(存量库靠 ALTER 补;CREATE TABLE IF NOT EXISTS 对存量 client_sessions
-  // no-op,不会补新列)。archived_through_seq = max(已归档 _seq),归档页游标锚点;
+  // no-op,不会补新列)。archived_through_seq = max(已归档 _orderSeq),归档页游标锚点;
   // archived_count = 已归档消息累计条数(message_count = tail 数 + archived_count)。
   try {
     const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
@@ -929,8 +928,8 @@ export interface ClientSession {
   messages: unknown[]
   updatedAt: number
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
-  // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 是客户端 mergeFullServerWins
-  // 判定"本地 _seq ≤ 水位的行是已归档 server 行,无条件保留"的边界。旧行/无归档 → 0。
+  // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 名称为滚动兼容保留,
+  // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
   archivedCount?: number
   archivedThroughSeq?: number
 }
@@ -964,7 +963,129 @@ export type MessageLike = {
   id?: string
   ts?: number
   _source?: string
+  /** Immutable presentation/archive position assigned on first persistence.
+   * `_seq` remains the mutable content-version cursor. */
+  _orderSeq?: number
   [k: string]: unknown
+}
+
+const isValidOrderSeq = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+
+/** Stable total order for persisted history. Missing `_orderSeq` is only a
+ * rolling/legacy compatibility case; callers should derive it first. */
+export function compareMessagesByOrder(a: MessageLike, b: MessageLike): number {
+  const ao = isValidOrderSeq(a?._orderSeq) ? a._orderSeq : Number.MAX_SAFE_INTEGER
+  const bo = isValidOrderSeq(b?._orderSeq) ? b._orderSeq : Number.MAX_SAFE_INTEGER
+  if (ao !== bo) return ao - bo
+  const at = typeof a?.ts === 'number' && Number.isFinite(a.ts) ? a.ts : 0
+  const bt = typeof b?.ts === 'number' && Number.isFinite(b.ts) ? b.ts : 0
+  return at - bt
+}
+
+/**
+ * Freeze the independent history-order axis.
+ *
+ * Existing ids always inherit the server's `_orderSeq`, even when a client
+ * PUT omits or forges it. Legacy hot rows derive once from their durable array
+ * order, starting above the already-archived order watermark. New ids append
+ * after the greatest frozen value. The returned array is canonical order.
+ */
+export function normalizeAndAssignOrderSeqs<T extends MessageLike>(
+  oldMsgs: readonly T[],
+  finalMsgs: readonly T[],
+  currentArchivedThroughOrderSeq = 0,
+  onWarn?: (message: string) => void,
+): { messages: T[]; maxOrderSeq: number } {
+  const floor = isValidOrderSeq(currentArchivedThroughOrderSeq)
+    ? currentArchivedThroughOrderSeq
+    : 0
+  let maxExisting = floor
+  for (const message of oldMsgs) {
+    if (isValidOrderSeq(message?._orderSeq) && message._orderSeq > maxExisting) {
+      maxExisting = message._orderSeq
+    }
+  }
+
+  let alloc = maxExisting + 1
+  const seenOld = new Set<number>()
+  const duplicateOrderSeqs: number[] = []
+  const normalizedOld = oldMsgs.map((message) => {
+    const orderSeq = message?._orderSeq
+    if (isValidOrderSeq(orderSeq) && !seenOld.has(orderSeq)) {
+      seenOld.add(orderSeq)
+      return message as T & { _orderSeq: number }
+    }
+    if (isValidOrderSeq(orderSeq)) duplicateOrderSeqs.push(orderSeq)
+    const assigned = alloc++
+    seenOld.add(assigned)
+    return { ...message, _orderSeq: assigned } as T & { _orderSeq: number }
+  })
+  if (duplicateOrderSeqs.length > 0 && onWarn) {
+    const unique = [...new Set(duplicateOrderSeqs)].sort((a, b) => a - b)
+    onWarn(
+      `${duplicateOrderSeqs.length} row(s) carried duplicate _orderSeq in oldMsgs ` +
+        `(order ${unique.join(', ')}); kept first occurrence and reassigned duplicates`,
+    )
+  }
+
+  const oldById = new Map<string, T & { _orderSeq: number }>()
+  for (const message of normalizedOld) {
+    if (typeof message?.id === 'string' && !oldById.has(message.id)) {
+      oldById.set(message.id, message)
+    }
+  }
+
+  const used = new Set<number>()
+  const stamped = finalMsgs.map((message, index) => {
+    const old = typeof message?.id === 'string' ? oldById.get(message.id) : undefined
+    let orderSeq = old?._orderSeq
+    if (!isValidOrderSeq(orderSeq) || used.has(orderSeq)) orderSeq = alloc++
+    used.add(orderSeq)
+    const value = message._orderSeq === orderSeq
+      ? message
+      : ({ ...message, _orderSeq: orderSeq } as T)
+    return { value, index }
+  })
+  stamped.sort((a, b) => compareMessagesByOrder(a.value, b.value) || a.index - b.index)
+  let maxOrderSeq = floor
+  const messages = stamped.map(({ value }) => {
+    if (isValidOrderSeq(value._orderSeq) && value._orderSeq > maxOrderSeq) {
+      maxOrderSeq = value._orderSeq
+    }
+    return value
+  })
+  return { messages, maxOrderSeq }
+}
+
+/** Side-effect-free lazy compatibility projection for hot rows. A later write
+ * runs the same derivation and persists the exact same frozen values. */
+export function deriveOrderSeqsForRead<T extends MessageLike>(
+  messages: readonly T[],
+  currentArchivedThroughOrderSeq = 0,
+): T[] {
+  return normalizeAndAssignOrderSeqs(
+    messages,
+    messages,
+    currentArchivedThroughOrderSeq,
+  ).messages
+}
+
+/** Archived legacy rows are immutable and their physical first_seq/last_seq
+ * metadata was written from `_seq`; use that value as their one-time frozen
+ * compatibility order. New chunks already carry `_orderSeq`. */
+export function deriveArchivedOrderSeqsForRead<T extends MessageLike>(messages: readonly T[]): T[] {
+  return messages
+    .map((message) => {
+      if (isValidOrderSeq(message?._orderSeq)) return message
+      const legacy = message?._seq
+      return isValidOrderSeq(legacy)
+        ? ({ ...message, _orderSeq: legacy } as T)
+        : message
+    })
+    .map((value, index) => ({ value, index }))
+    .sort((a, b) => compareMessagesByOrder(a.value, b.value) || a.index - b.index)
+    .map(({ value }) => value)
 }
 
 /** Read projection for client-session history. Exact is the durable/admin
@@ -998,6 +1119,7 @@ function utf8Tail(value: string, maxBytes: number): { value: string; truncated: 
 
 function projectionAnchorKey(message: MessageLike): string {
   if (typeof message._turnTapeId === 'string') return `tape:${message._turnTapeId}`
+  if (isValidOrderSeq(message._orderSeq)) return `order:${message._orderSeq}`
   if (typeof message._seq === 'number' && Number.isFinite(message._seq)) return `seq:${message._seq}`
   return `id:${String(message.id ?? '')}`
 }
@@ -1005,6 +1127,7 @@ function projectionAnchorKey(message: MessageLike): string {
 function projectionCheckpoint(message: MessageLike): MessageLike {
   const tapeId = typeof message._turnTapeId === 'string' ? message._turnTapeId : undefined
   const seq = typeof message._seq === 'number' && Number.isFinite(message._seq) ? message._seq : undefined
+  const orderSeq = isValidOrderSeq(message._orderSeq) ? message._orderSeq : undefined
   const suffix = tapeId ?? (seq !== undefined ? `seq-${seq}` : String(message.id ?? 'legacy'))
   return {
     id: `projection-checkpoint:${suffix}`,
@@ -1013,6 +1136,7 @@ function projectionCheckpoint(message: MessageLike): MessageLike {
     ts: typeof message.ts === 'number' ? message.ts : 0,
     _source: 'server',
     ...(seq !== undefined ? { _seq: seq } : {}),
+    ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
     ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
     ...(typeof message._turnTapeSha256 === 'string'
       ? { _turnTapeSha256: message._turnTapeSha256 }
@@ -1091,6 +1215,7 @@ export function projectClientSessionMessagesForChat(messages: readonly MessageLi
       ts: typeof message.ts === 'number' ? message.ts : 0,
       _source: 'server',
       ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
+      ...(isValidOrderSeq(message._orderSeq) ? { _orderSeq: message._orderSeq } : {}),
       ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
       ...(typeof message._turnTapeSha256 === 'string'
         ? { _turnTapeSha256: message._turnTapeSha256 }
@@ -1103,14 +1228,10 @@ export function projectClientSessionMessagesForChat(messages: readonly MessageLi
   for (const [key, anchor] of anchors) {
     if (!represented.has(key)) visible.push(projectionCheckpoint(anchor))
   }
-  return visible.sort((a, b) => {
-    const seqA = typeof a._seq === 'number' ? a._seq : Number.MAX_SAFE_INTEGER
-    const seqB = typeof b._seq === 'number' ? b._seq : Number.MAX_SAFE_INTEGER
-    if (seqA !== seqB) return seqA - seqB
-    const tsA = typeof a.ts === 'number' ? a.ts : 0
-    const tsB = typeof b.ts === 'number' ? b.ts : 0
-    return tsA - tsB
-  })
+  return visible
+    .map((value, index) => ({ value, index }))
+    .sort((a, b) => compareMessagesByOrder(a.value, b.value) || a.index - b.index)
+    .map(({ value }) => value)
 }
 
 /**
@@ -1225,7 +1346,7 @@ const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>(
 )
 
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
-  '_source', '_seq', 'usage',
+  '_source', '_seq', '_orderSeq', 'usage',
   '_truncated', '_errorCode', '_errorDetail',
 ])
 
@@ -1394,15 +1515,29 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       serverAuthored.set(m.id, m)
     }
   }
-  const planDedupedClientMsgs = dedupeClientPlanRowsWithinTurns(clientMsgs)
-  if (serverAuthored.size === 0) return planDedupedClientMsgs
+  const orderedClientInput = serverSideMsgs.length > 0
+    ? sortForMergeByOrderAnchor(serverSideMsgs, clientMsgs)
+    : clientMsgs
+  const planDedupedClientMsgs = dedupeClientPlanRowsWithinTurns(orderedClientInput)
+  if (serverAuthored.size === 0) {
+    // Preserve the historical zero-copy fast path when dedupe made no change;
+    // ordering is frozen later by normalizeAndAssignOrderSeqs on every write.
+    return planDedupedClientMsgs === orderedClientInput ? clientMsgs : planDedupedClientMsgs
+  }
+
+  // The client may have ts-sorted or otherwise reordered its PUT. Restore the
+  // server-frozen axis before any turn-boundary/phantom grouping. Rows not yet
+  // persisted have no frozen value: anchor them to the nearest preceding
+  // ordered row, then use ts/index as a total tie-breaker. This keeps the
+  // optimistic window coherent without allowing it to rewrite frozen rows.
+  const orderedClientMsgs = sortForMergeByOrderAnchor(serverSideMsgs, planDedupedClientMsgs)
 
   const clientIds = new Set<string>()
-  for (const m of planDedupedClientMsgs) {
+  for (const m of orderedClientMsgs) {
     if (m && typeof m.id === 'string') clientIds.add(m.id)
   }
 
-  const merged: T[] = planDedupedClientMsgs.map((m) => {
+  const merged: T[] = orderedClientMsgs.map((m) => {
     if (m && typeof m.id === 'string' && serverAuthored.has(m.id)) {
       return serverAuthored.get(m.id) as T
     }
@@ -1411,7 +1546,8 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   for (const [, msg] of serverAuthored) {
     if (typeof msg.id === 'string' && !clientIds.has(msg.id)) merged.push(msg)
   }
-  merged.sort((a, b) => ((a?.ts ?? 0) - (b?.ts ?? 0)))
+  const orderedMerged = sortForMergeByOrderAnchor(serverSideMsgs, merged)
+  merged.splice(0, merged.length, ...orderedMerged)
 
   // Phantom dedupe (rule 3): partition merged[] into turns on user/system
   // messages (turn boundaries — the model never produces those client-side
@@ -1622,6 +1758,71 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   return dedupeClientPlanRowsWithinTurns(deduped) as T[]
 }
 
+function sortForMergeByOrderAnchor<T extends MessageLike>(
+  existing: readonly T[],
+  messages: readonly T[],
+): T[] {
+  const existingOrderById = new Map<string, number>()
+  const existingByTs: Array<{ order: number; ts: number }> = []
+  let legacyOrder = 0
+  let maxExistingOrder = 0
+  for (const message of existing) {
+    legacyOrder++
+    const order = isValidOrderSeq(message?._orderSeq) ? message._orderSeq : legacyOrder
+    if (order > maxExistingOrder) maxExistingOrder = order
+    if (typeof message?.id === 'string' && !existingOrderById.has(message.id)) {
+      existingOrderById.set(message.id, order)
+    }
+    if (typeof message?.ts === 'number' && Number.isFinite(message.ts)) {
+      existingByTs.push({ order, ts: message.ts })
+    }
+  }
+  existingByTs.sort((a, b) => a.ts - b.ts || a.order - b.order)
+  let prefixMaxOrder = 0
+  for (const persisted of existingByTs) {
+    prefixMaxOrder = Math.max(prefixMaxOrder, persisted.order)
+    persisted.order = prefixMaxOrder
+  }
+  const orderAtOrBeforeTs = (ts: number): number => {
+    let lo = 0
+    let hi = existingByTs.length
+    while (lo < hi) {
+      const mid = lo + Math.floor((hi - lo) / 2)
+      if (existingByTs[mid]!.ts <= ts) lo = mid + 1
+      else hi = mid
+    }
+    return lo > 0 ? existingByTs[lo - 1]!.order : 0
+  }
+  let anchor = 0
+  return messages
+    .map((message, index) => {
+      const own = isValidOrderSeq(message?._orderSeq)
+        ? message._orderSeq
+        : typeof message?.id === 'string'
+          ? existingOrderById.get(message.id)
+          : undefined
+      if (own !== undefined) anchor = own
+      const ts = typeof message?.ts === 'number' && Number.isFinite(message.ts) ? message.ts : 0
+      let inferredAnchor = Math.max(anchor, orderAtOrBeforeTs(ts))
+      const role = (message as { role?: unknown })?.role
+      if (own === undefined && (role === 'user' || role === 'system')) {
+        // A new turn starts after the complete durable history even when its
+        // client clock is behind the server clock. Subsequent optimistic rows
+        // share this anchor and retain their ts/index order inside the window.
+        inferredAnchor = Math.max(inferredAnchor, maxExistingOrder)
+        anchor = inferredAnchor
+      }
+      return {
+        message,
+        index,
+        anchor: own ?? inferredAnchor,
+        ts,
+      }
+    })
+    .sort((a, b) => a.anchor - b.anchor || a.ts - b.ts || a.index - b.index)
+    .map(({ message }) => message)
+}
+
 function isPlanTurnBoundary(m: MessageLike): boolean {
   const role = (m as { role?: unknown }).role
   return role === 'user' || role === 'system'
@@ -1795,7 +1996,7 @@ export function appendServerAuthoredPure<T extends MessageLike>(
  * - text / role / childBlocks / agentName / streaming flags (when persisted
  *   they reflect what the server holds; if any change, client should resync)
  */
-const _SEQ_CONTENT_IGNORE_FIELDS = new Set(['_seq', 'status'])
+const _SEQ_CONTENT_IGNORE_FIELDS = new Set(['_seq', '_orderSeq', 'status'])
 
 function _stableStringifyForSeq(v: unknown): string | null {
   try {
@@ -1879,6 +2080,7 @@ export function normalizeAndAssignSeqs<T extends MessageLike>(
   finalMsgs: readonly T[],
   currentNextSeq: number,
   onWarn?: (message: string) => void,
+  currentArchivedThroughOrderSeq = 0,
 ): { messages: T[]; nextSeq: number; maxSeq: number } {
   // 合法 _seq:正安全整数(正、整、在 Number 安全范围内)。
   // 比旧判据(`typeof === 'number' && isFinite`)更严:0 / 负数 / 小数 / 超安全范围
@@ -1991,7 +2193,13 @@ export function normalizeAndAssignSeqs<T extends MessageLike>(
     const s = (m as MessageLike)._seq
     if (typeof s === 'number' && s > maxSeq) maxSeq = s
   }
-  return { messages: out, nextSeq, maxSeq }
+  const ordered = normalizeAndAssignOrderSeqs(
+    oldNormalized,
+    out,
+    currentArchivedThroughOrderSeq,
+    onWarn,
+  )
+  return { messages: ordered.messages, nextSeq, maxSeq }
 }
 
 // ── 长会话热尾巴 + 归档:spill 核心(唯一写侧收口)──
@@ -2156,7 +2364,13 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     const currentNextSeq = existing && typeof existing.next_seq === 'number' && existing.next_seq > 0
       ? existing.next_seq
       : 1
-    const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq, _warnSeqAnomaly)
+    const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(
+      oldMsgs,
+      merged,
+      currentNextSeq,
+      _warnSeqAnomaly,
+      existing?.archived_through_seq ?? 0,
+    )
 
     // 热尾巴 + 归档:normalize 后、写行前把最老的消息搬进归档,行只留热尾巴。归档表 INSERT
     // 在本事务内;若下面的 ON CONFLICT WHERE 因并发写被拒(racing stale),抛哨兵一并回滚。
@@ -3193,7 +3407,11 @@ async function _sqliteGetClientSession(
     archived_through_seq: number | null; archived_count: number | null
   } | undefined
   if (!row) return null
-  const exactMessages = JSON.parse(row.messages) as MessageLike[]
+  const archivedThroughOrderSeq = row.archived_through_seq ?? 0
+  const exactMessages = deriveOrderSeqsForRead(
+    JSON.parse(row.messages) as MessageLike[],
+    archivedThroughOrderSeq,
+  )
   return {
     id: row.id,
     userId: row.user_id,
@@ -3209,7 +3427,7 @@ async function _sqliteGetClientSession(
     // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
     // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
     archivedCount: row.archived_count ?? 0,
-    archivedThroughSeq: row.archived_through_seq ?? 0,
+    archivedThroughSeq: archivedThroughOrderSeq,
   }
 }
 
@@ -3271,6 +3489,7 @@ async function _sqliteGetClientSessionPartial(
     const parsed = JSON.parse(row.messages)
     if (Array.isArray(parsed)) allMsgs = parsed as MessageLike[]
   } catch { /* malformed — fall through with empty allMsgs */ }
+  allMsgs = deriveOrderSeqsForRead(allMsgs, archivedThroughSeq)
 
   // Detect legacy: any message missing a numeric `_seq`. Returning a partial
   // tail in this state is unsafe (the client's `sinceSeq=0` would slice
@@ -3319,26 +3538,26 @@ async function _sqliteGetClientSessionPartial(
 
 /** {@link readArchivedMessages} 的返回。 */
 export interface ReadArchivedMessagesResult {
-  /** 本页归档消息,**升序**(_seq 从小到大)返回。 */
+  /** 本页归档消息,**升序**(_orderSeq 从小到大)返回。 */
   messages: MessageLike[]
-  /** 是否还有更早(_seq 更小)的归档消息 —— 前端"从云端加载更早历史"是否继续可点。 */
+  /** 是否还有更早(_orderSeq 更小)的归档消息。 */
   hasMore: boolean
-  /** 本页最老一条的 _seq(= 下一页 beforeSeq 游标);空页 → null。 */
+  /** 本页最老一条的 _orderSeq(字段名保留兼容);空页 → null。 */
   oldestSeq: number | null
 }
 
 /**
  * **归档回看分页**(用户上滑加载更早历史;读侧,零写)。
  *
- * 语义:返回 `_seq < beforeSeq` 的**最近** `limit` 条(升序返回);hasMore = 更早还有。
+ * 语义:返回 `_orderSeq < beforeSeq` 的**最近** `limit` 条(升序返回);hasMore = 更早还有。
  *   - beforeSeq 传 0/缺省 = 从 archived_through_seq+1 开始(即最新归档页)。
  *   - 分页游标单向后退:下一页传本页 oldestSeq,严格取更早,不重不漏。
  *   - limit 默认 100、上限 200(下限 1)。
  *
- * 实现:按 chunk 从新到旧读(idx_csa_chunks_last:last_seq DESC),展开、过滤 `_seq < beforeSeq`,
+ * 实现:按 chunk 从新到旧读(idx_csa_chunks_last:last_seq DESC),展开、过滤 `_orderSeq < beforeSeq`,
  * 攒够一页(>limit)即停 —— chunk 小(≤200 条/≤768KB),即便超长历史这段有界读也很轻。
- * 归档 _seq 随 spill 冻结、且 spill 恒搬"当前尾巴里最老的一段"(其 _seq 恒 > 上次水位)→
- * 归档区 _seq 与时间序单调,故"从新 chunk 起攒 limit 条"即全局最新 limit 条。
+ * 归档 _orderSeq 随 spill 冻结且与 chunk 物理范围同轴,故从新 chunk 起攒 limit 条
+ * 即全局最新 limit 条。
  *
  * 分租:先按 (id, user_id) 验会话归属(拿不到 → 空结果),chunk 查询再带 user_id 双保险。
  */
@@ -3359,7 +3578,7 @@ async function _sqliteReadArchivedMessages(
   if (!row) return { messages: [], hasMore: false, oldestSeq: null }
   const watermark = typeof row.archived_through_seq === 'number' ? row.archived_through_seq : 0
   const effectiveBefore = Number.isFinite(beforeSeq) && beforeSeq > 0 ? beforeSeq : watermark + 1
-  // effectiveBefore ≤ 1:没有 _seq < 1 的归档消息可返回(_seq 从 1 起)。
+  // effectiveBefore ≤ 1:没有 _orderSeq < 1 的归档消息可返回。
   if (effectiveBefore <= 1) return { messages: [], hasMore: false, oldestSeq: null }
 
   // 候选 chunk:first_seq(= chunk 内 _seq 最小值)< effectiveBefore 者才可能含合格消息。
@@ -3377,19 +3596,21 @@ async function _sqliteReadArchivedMessages(
       const parsed = JSON.parse(cr.messages)
       arr = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
     } catch { arr = [] }
-    for (const m of arr) {
-      const s = typeof m?._seq === 'number' ? m._seq : -1
+    for (const m of deriveArchivedOrderSeqsForRead(arr)) {
+      const s = isValidOrderSeq(m?._orderSeq) ? m._orderSeq : -1
       if (s >= 0 && s < effectiveBefore) pool.push(m)
     }
     // 攒够一页 + 1(多出的那条用于判定 hasMore)即停:更老的 chunk _seq 更小,不影响本页。
     if (pool.length > cappedLimit) break
   }
 
-  // 取 _seq 最大的 limit 条(= 最新的一页),升序返回。
-  pool.sort((a, b) => ((a._seq as number) - (b._seq as number)))
+  // 取 _orderSeq 最大的 limit 条(= 最新的一页),升序返回。
+  pool.sort(compareMessagesByOrder)
   const hasMore = pool.length > cappedLimit
   const page = pool.slice(Math.max(0, pool.length - cappedLimit))
-  const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null
+  const oldestSeq = page.length > 0 && isValidOrderSeq(page[0]._orderSeq)
+    ? page[0]._orderSeq
+    : null
   return {
     messages: options.projection === 'chat' ? projectClientSessionMessagesForChat(page) : page,
     hasMore,
