@@ -260,6 +260,12 @@ export class CcbMessageParser {
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
+  /** F5 — 每观测到一个 **Bash** tool_use(**含子 agent**,parentToolUseId 与否都触发)
+   *  就回调一次,仅供归属登记(tool_use_id → 发起 turn),不触发任何 host bridge。
+   *  与 onToolUse(主 agent-only、驱动 CronCreate/委派等桥接)分离,避免子 agent 工具
+   *  重复触发桥接;又保证子 agent bg bash 的 tail 能被路由层正确归位(否则 fail-closed
+   *  会把活跃 turn 内的子 agent bash tail 也误丢)。 */
+  private onBashToolObserved?: (toolUseId: string) => void
   private onPostFinalRuntimeEvent?: (
     event: DurableRuntimeEvent,
     block: OutboundContentBlock,
@@ -298,6 +304,8 @@ export class CcbMessageParser {
     onEvent: (e: SessionStreamEvent) => void
     onToolUse?: (tool: DetectedToolUse) => void
     onToolResult?: (result: DetectedToolResult) => void
+    /** F5 — 见字段级注释:所有 Bash tool_use(含子 agent)的归属登记回调。 */
+    onBashToolObserved?: (toolUseId: string) => void
     onPostFinalRuntimeEvent?: (
       event: DurableRuntimeEvent,
       block: OutboundContentBlock,
@@ -327,6 +335,7 @@ export class CcbMessageParser {
     this.onEvent = opts.onEvent
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
+    this.onBashToolObserved = opts.onBashToolObserved
     this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
@@ -627,6 +636,9 @@ export class CcbMessageParser {
         this.toolUseIdToName.set(cb.id, cb.name)
         this.streamingToolUses.set(cb.id, { name: cb.name, partialJson: '', done: false })
         if (typeof ev.index === 'number') this.indexToToolId.set(ev.index, cb.id)
+        // F5:Bash tool_use 归属登记(含子 agent,parentToolUseId 不论);幂等,
+        // _handleAssistant 快照点会再登记一次(非流式路径的兜底),Set/map 去重无害。
+        if (cb.name === 'Bash') this.onBashToolObserved?.(cb.id)
         // Fix B: tool boundary triggers segment bump IFF the corresponding
         // text/thinking kind already has at least one segment. Skipping the
         // bump on empty segments keeps tool-first turns (tool → text₁ → text₂)
@@ -796,6 +808,11 @@ export class CcbMessageParser {
         const inputRaw = c.input ?? {}
         const inputStr = typeof c.input === 'string' ? c.input : JSON.stringify(inputRaw)
         const inputPreview = inputStr.slice(0, 400)
+
+        // F5:Bash tool_use 归属登记(含子 agent,parentToolUseId 不论)。与下方
+        // 主 agent-only 的 onToolUse 桥接分离,子 agent bg bash 的 tail 才能被路由层
+        // 正确归位(活跃 turn → 进 Agent 卡;post-terminal → 归 origin turn)。
+        if (c.name === 'Bash') this.onBashToolObserved?.(c.id)
 
         // Notify about detected tool_use for bridging. Only main-agent
         // tool_use events should trigger host-side bridging (CronCreate,

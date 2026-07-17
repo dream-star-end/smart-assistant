@@ -33,6 +33,8 @@ function makeGateway(opts: {
   onInterrupt?: () => void
   onShutdown?: () => void | Promise<void>
   onWaitForOutputDrain?: () => void | Promise<void>
+  /** F4 — 供测试注入"drain 期落进收集器的晚到 tail",验证摘取顺序。 */
+  onFlushTailFolding?: (session: any) => void | Promise<void>
 }): {
   gw: any
   buffered: Array<{ sessionKey: string; group: DurableAgentGroup }>
@@ -92,6 +94,10 @@ function makeGateway(opts: {
   })
   gw._runLog = { start: () => ({}), complete: () => {} }
   gw.sessions = {
+    // F4 — 生产在此 flush 折叠链(drain 期把 acked|queued 的 tail 落进收集器);fake
+    // 转调 opts.onFlushTailFolding(默认 no-op)。补上此方法后 server 的 F4 调用不再
+    // 抛 TypeError 被 catch 吞掉,顺序才真正被下方用例断言。
+    flushSessionTailFolding: async (session: any) => { await opts.onFlushTailFolding?.(session) },
     // team-durability — 一次性委派子会话收尾即销毁(fake 为 no-op,防泄漏语义在生产实现)
     destroySession: async () => {},
     getByKey: (key: string) => {
@@ -177,6 +183,37 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     ])
     assert.match(group.runId, /^dlg-/, 'runId = delegate progress runId')
     assert.ok(group.completedAt >= before && group.completedAt <= Date.now())
+  })
+
+  it('F4 — flushSessionTailFolding 在摘取收集器构造 group 之前调用(drain 期落进的 tail 入 group)', async () => {
+    let flushedBeforeBuffer = false
+    const { gw, buffered } = makeGateway({
+      submit: async (_s, _p, onEvent) => {
+        onEvent({ kind: 'block', block: { kind: 'text', text: '结果' } })
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+      },
+      onFlushTailFolding: (session) => {
+        // 模拟:drain 期把一条 acked|queued 的晚到 tail 落进 delegate 收集器。
+        // 只有当本回调在"摘取 durableRuntimeEvents 构造 group"之前发生,该 tail 才会
+        // 进入 buffered group.runtimeEvents —— 以此断言 F4 顺序真的生效。
+        flushedBeforeBuffer = buffered.length === 0
+        session._durableDelegateRuntimeEvents?.push({
+          ordinal: 999,
+          observedAt: 1,
+          source: 'ccb',
+          payload: { type: 'system', subtype: 'bash_output_tail', tool_use_id: 'late', tail: 'late-drain' },
+        })
+      },
+    })
+    const r = await delegate(gw, 'coding-assistant', taskBody())
+    assert.equal(r.status, 200)
+    assert.equal(flushedBeforeBuffer, true, 'flush 发生在 bufferPendingAgentGroup 之前')
+    assert.equal(buffered.length, 1)
+    const rtEvents = buffered[0].group.runtimeEvents ?? []
+    assert.ok(
+      rtEvents.some((e) => (e.payload as { tail?: string })?.tail === 'late-drain'),
+      'drain 期落进收集器的晚到 tail 必须进入 group(证明摘取前已 await 折叠链)',
+    )
   })
 
   it('失败委派(子 agent 报 error)→ 收尾 buffer status "failed" + resultSummary=错误', async () => {

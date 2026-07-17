@@ -509,6 +509,77 @@ describe("CcbAdapter turn parity", () => {
     assert.equal(postTerminal[0].block.tail, "drain-tail");
   });
 
+  test("F5 活跃态:子 agent bg bash tail 正常路由进当前 turn(不被 fail-closed 误丢)", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    // 子 agent(parent_tool_use_id 置位)发起 Bash 工具 → onBashToolObserved 登记归属
+    // (onToolUse 主 agent-only 不会触发,故不能靠它登记)。
+    runner.msg({
+      type: "assistant",
+      parent_tool_use_id: "agent-1",
+      message: { content: [{ type: "tool_use", id: "sub-bash", name: "Bash", input: { command: "x &" } }] },
+    });
+    // 活跃 turn 内子 agent 的 bash tail(带 parent)→ 路由进当前 turn,发 tool_output_tail。
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "sub-bash",
+      parent_tool_use_id: "agent-1",
+      tail: "sub output",
+      total_bytes: 10,
+    });
+    const tail = events.find(
+      (e): e is Extract<EngineEvent, { kind: "block" }> =>
+        e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+    );
+    assert.ok(tail, "活跃态子 agent bash tail 必须路由进当前 turn(非丢弃)");
+    assert.equal(
+      (tail!.block as { parentToolUseId?: string }).parentToolUseId,
+      "agent-1",
+      "带 parent → 前端归入 Agent 卡",
+    );
+    assert.equal((tail!.block as { tail?: string }).tail, "sub output");
+    runner.msg(resultRow());
+    await turn.summary;
+  });
+
+  test("F5 post-terminal:子 agent bg bash tail 在后续 turn 期间归位 origin turn", async () => {
+    const { adapter, runner } = makeAdapter();
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { tail?: string; parentToolUseId?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminalA.push({ block: block as { tail?: string; parentToolUseId?: string } }),
+    });
+    runner.msg({
+      type: "assistant",
+      parent_tool_use_id: "agent-1",
+      message: { content: [{ type: "tool_use", id: "sub-bash", name: "Bash", input: {} }] },
+    });
+    runner.msg(resultRow());
+    await turnA.summary;
+
+    const eventsB: EngineEvent[] = [];
+    const turnB = beginTurn(adapter, eventsB);
+    runner.msg(textDelta("B"));
+
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "sub-bash",
+      parent_tool_use_id: "agent-1",
+      tail: "late sub",
+      total_bytes: 8,
+    });
+    assert.equal(postTerminalA.length, 1, "子 agent post-terminal tail 归位 turn1");
+    assert.equal(postTerminalA[0].block.tail, "late sub");
+    assert.equal(postTerminalA[0].block.parentToolUseId, "agent-1");
+
+    runner.msg(resultRow({ total_cost_usd: 0.01 }));
+    await turnB.summary;
+  });
+
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {
     const { adapter, runner } = makeAdapter();
     let activity = 0;

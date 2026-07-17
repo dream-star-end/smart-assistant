@@ -633,14 +633,18 @@ export interface CronBridgeEvent {
   id?: string
 }
 
-/** post-terminal / server-authored turn 持久化三态:
+/** post-terminal / server-authored turn 持久化四态:
  *  - 'acked'   = master 已确认落库(主 turn final 唯一认可的成功)。
  *  - 'queued'  = 已 durable 暂存到重试队列(stageDurable 已 fsync 在网络请求之前,
  *                master 暂不可达),重试循环保证送达 —— 对 tail 折叠**等同成功**:
- *                可更新 hash/count、可转发(帧已可靠落盘,不会因 master 抖动重复 stage)。
+ *                可更新 hash/**计入预算**、可转发(帧已可靠落盘,不因 master 抖动重复 stage)。
  *  - 'dropped' = 永久丢弃(410 会话已删 / 4xx 契约冲突 / stage 都失败)—— 不算成功,
- *                fold 不更新 hash/count、不转发、不进 durable 收集器。 */
-type TapePersistResult = 'acked' | 'queued' | 'dropped'
+ *                fold 不更新 hash、不转发、不进 durable 收集器。
+ *  - 'skipped' = **未持久化但非失败**(legacy 本地路径:无 userId / 空 text /
+ *                runtimeEvents-only 不落本地 SQLite)。改前该分支返回 undefined→布尔 true;
+ *                四态下 fold 对 skipped **转发 + 更新 hash(保去重)但不计预算**(没写东西
+ *                不占 cap),与"没落盘不消耗预算"语义一致。仅 legacy 分支产生。 */
+type TapePersistResult = 'acked' | 'queued' | 'dropped' | 'skipped'
 
 /**
  * Persist the authoritative server-authored assistant text for a turn.
@@ -675,15 +679,17 @@ type TapePersistResult = 'acked' | 'queued' | 'dropped'
  * don't `await` it — they continue in parallel; the pending-set is
  * what makes shutdown wait, not the call sites.
  *
- * 本函数是 `persistServerAuthoredTurnOutcome` 的**布尔适配层**:只把三态里的
- * `'acked'` 折成 true,`'queued'|'dropped'` 折成 false —— 与三态化前的既有语义
- * 逐值一致(主 turn final 只认 acked 的判定完全不受影响)。需要区分"已可靠排队"
- * 与"永久丢弃"的调用方(如 post-terminal tail 折叠)改调 Outcome 版本。
+ * 本函数是 `persistServerAuthoredTurnOutcome` 的**布尔适配层**:`'acked'|'skipped'` 折成
+ * true,`'queued'|'dropped'` 折成 false —— 与四态化前的既有语义**逐值一致**(sink 路径
+ * ok→acked→true / queued|dropped→false;legacy 路径 undefined→skipped→true /
+ * applied|already_exists→acked→true / queued_to_outbox→queued→false / 其余→dropped→false)。
+ * 主 turn final 只认 acked 的判定完全不受影响。需要区分"已可靠排队 / 未持久化 / 永久丢弃"
+ * 的调用方(如 post-terminal tail 折叠)改调 Outcome 版本。
  */
 function persistServerAuthoredTurn(
   args: Parameters<typeof persistServerAuthoredTurnOutcome>[0],
 ): Promise<boolean> {
-  return persistServerAuthoredTurnOutcome(args).then((r) => r === 'acked')
+  return persistServerAuthoredTurnOutcome(args).then((r) => r === 'acked' || r === 'skipped')
 }
 
 /** server-authored turn 持久化三态(见 TapePersistResult):把 V3MasterSink /
@@ -940,7 +946,9 @@ function persistServerAuthoredTurnOutcome(args: {
   }
   return directWrite()
     .then((r): TapePersistResult => {
-      if (!r) return 'acked'
+      // undefined = 没写任何东西(无 userId / thinking-only 空 text / runtimeEvents-only):
+      // 未持久化但非失败 → 'skipped'(布尔层仍折 true,与改前 undefined→true 逐值一致)。
+      if (!r) return 'skipped'
       if (r.applied) return 'acked'
       if (r.reason === 'already_exists') return 'acked'
       if (r.reason === 'queued_to_outbox') {
@@ -1107,7 +1115,7 @@ interface TailFoldStreamState {
   markerEvent: DurableRuntimeEvent | null
 }
 
-/** F2 — 单个 ownerTurnKey 的跨会话 tail 预算(SessionManager 级,有界 LRU)。多个
+/** F2/F6 — 单个 ownerTurnKey 的跨会话 tail 预算(SessionManager 级,有界 LRU)。多个
  *  delegate 子会话共享同一 parent ownerTurnKey 时**共用**本预算(不再各领 64)。 */
 interface TailOwnerBudget {
   /** 本 owner 跨所有流已成功持久化的真实 tail 总数(owner cap 判定)。 */
@@ -1116,6 +1124,13 @@ interface TailOwnerBudget {
   capped: boolean
   /** F1b/F2 — owner capped marker 事件,首次构造后冻结(同上,identity 稳定去重)。 */
   markerEvent: DurableRuntimeEvent | null
+  /**
+   * F6 — owner 级串行链(**跨 session** 预算临界区)。cap 判定 / 真实 tail 落定 /
+   * marker 落定都在本链任务内执行,消灭"两个共享 ownerTurnKey 的 session 各经自己
+   * 的 per-session 链、同时读 persistedCount 过 cap → 超发"的竞态。
+   * 死锁面:owner 链任务内**绝不 await session 链**(嵌套方向恒为 session→owner)。
+   */
+  chain: Promise<void>
 }
 
 /** tail 内容指纹 = tail + total_bytes + truncated_head + tool_use_id +
@@ -1501,7 +1516,10 @@ export class SessionManager {
     this._trackPersistence(chain)
   }
 
-  /** F2 — 取/建 ownerTurnKey 的跨会话预算(LRU:命中刷新位置,超限逐出最旧一条)。 */
+  /** F2 — 取/建 ownerTurnKey 的跨会话预算(LRU:命中刷新位置,超限逐出最旧一条)。
+   *  逐出 = 预算重置(被逐 owner 重新获得额度)。为何**不**改成 fail-closed 拒绝新 owner:
+   *  ownerTurnKey 是 turn 作用域,512 个并发 post-terminal 活跃 turn 非现实场景;拒绝新
+   *  owner 会伤 UX(合法 bg bash tail 被无端丢)。逐出时 warn 一次以便观测异常规模。 */
   private _getOwnerBudget(ownerTurnKey: string): TailOwnerBudget {
     const map = this._tailOwnerBudgets
     const existing = map.get(ownerTurnKey)
@@ -1510,14 +1528,41 @@ export class SessionManager {
       map.set(ownerTurnKey, existing)
       return existing
     }
-    const budget: TailOwnerBudget = { persistedCount: 0, capped: false, markerEvent: null }
+    const budget: TailOwnerBudget = {
+      persistedCount: 0,
+      capped: false,
+      markerEvent: null,
+      chain: Promise.resolve(),
+    }
     map.set(ownerTurnKey, budget)
     while (map.size > SessionManager.TAIL_OWNER_BUDGET_MAX) {
       const oldest = map.keys().next().value as string | undefined
       if (oldest === undefined) break
       map.delete(oldest)
+      log.warn('post-terminal tail owner budget evicted (budget reset)', {
+        evictedOwnerTurnKey: oldest,
+        budgetCap: SessionManager.TAIL_OWNER_BUDGET_MAX,
+      })
     }
     return budget
+  }
+
+  /** F6 — 在 owner 级串行链上跑一个任务(跨 session 预算临界区串行化)。返回本任务
+   *  完成时 resolve 的 promise,供 session 链任务 `await`(方向恒为 session→owner,
+   *  owner 任务内绝不 await session 链 → 无环、无死锁)。 */
+  private _runOnOwnerChain(ownerTurnKey: string, task: () => Promise<void>): Promise<void> {
+    const budget = this._getOwnerBudget(ownerTurnKey)
+    const next = budget.chain
+      .then(task)
+      .catch((err) =>
+        log.error(
+          'post-terminal tail owner-chain task failed',
+          { ownerTurnKey },
+          err as Error,
+        ),
+      )
+    budget.chain = next
+    return next
   }
 
   /** F1b — 冻结的 capped marker 事件(ordinal/observedAt/payload 首次构造后不再变),
@@ -1540,37 +1585,39 @@ export class SessionManager {
     }
   }
 
-  /** A1/F1/F1b/F2/F4 — 实际持久化一条 tail;达 owner/stream cap 时改持久化一条**冻结**
-   *  的 capped marker。所有 cap 判定 + 计数增量都在**串行链任务内**完成(读最新值)。
-   *  三态:仅 acked|queued 算成功(更新 hash/count、push 收集器、转发);dropped 不更新
-   *  (marker/变化 tail 下次用同一冻结事件重试),从而维持"转发的必已持久化"。exemptCap
-   *  只给 session 销毁时每流一次豁免 cap 的 terminal flush。 */
+  /** A1/F1/F1b/F2/F4/F6/F7 — 实际持久化一条 tail;达 owner/stream cap 时改持久化一条
+   *  **冻结**的 capped marker。嵌套两级串行链:**session 链**保证本流内保序、**owner 链**
+   *  把 cap 判定 + 计数增量 + 落定收进跨 session 临界区(F6:消灭共享 ownerTurnKey 的
+   *  两 session 同读 count 超发)。四态:acked|queued → 转发 + 更新 hash + 计入预算 +
+   *  进收集器;skipped(legacy 未落盘)→ 转发 + 更新 hash 但**不计预算/不进收集器**;
+   *  dropped → 全不更新(marker/变化 tail 下次用同一冻结事件重试)。cap 恒被尊重
+   *  (F7:terminal flush 不再豁免 cap,capped 后不写任何东西)。 */
   private _enqueueTailPersist(
     session: AgentSession,
     st: TailFoldStreamState,
     item: TailFoldItem,
-    opts: { exemptCap: boolean },
   ): void {
     // 限频锚点:尝试时刻同步置位(而非落定时刻),给后续事件稳定的间隔判定。
     st.lastPersistAt = Date.now()
-    this._chainTailPersist(session, async () => {
-      const metrics = (session._tailFoldMetrics ??= {
-        unchangedSuppressed: 0,
-        rateCoalesced: 0,
-        capped: 0,
-      })
-      // 迟到同内容:rapid-fire 的重复 tail 在首条落定前已排进 pending,落定后其 hash
-      // 已等于 lastPersistedHash → 不重复落。
-      if (item.hash === st.lastPersistedHash) {
-        metrics.unchangedSuppressed++
-        return
-      }
-      const owner = this._getOwnerBudget(item.ownerTurnKey)
-      if (!opts.exemptCap) {
-        // 已封顶(stream 或 owner)→ 该流彻底停(不落不转)。
+    // session 链:本流内保序;把预算临界区 + 持久化委托给 owner 链(session→owner)。
+    this._chainTailPersist(session, () =>
+      this._runOnOwnerChain(item.ownerTurnKey, async () => {
+        const metrics = (session._tailFoldMetrics ??= {
+          unchangedSuppressed: 0,
+          rateCoalesced: 0,
+          capped: 0,
+        })
+        // 迟到同内容:rapid-fire 的重复 tail 在首条落定前已排进 pending,落定后其 hash
+        // 已等于 lastPersistedHash → 不重复落。
+        if (item.hash === st.lastPersistedHash) {
+          metrics.unchangedSuppressed++
+          return
+        }
+        const owner = this._getOwnerBudget(item.ownerTurnKey)
+        // 已封顶(stream 或 owner)→ 该流彻底停(不落不转);cap 恒尊重,无豁免。
         if (st.capped || owner.capped) return
-        // owner cap:整 owner 只落一条冻结 marker,成功(acked|queued)后封停该 owner
-        // 全部流;dropped 则不封停,下次用同一冻结 marker 重试。
+        // owner cap:整 owner 只落一条冻结 marker,成功(acked|queued|skipped)后封停该
+        // owner 全部流;dropped 则不封停,下次用同一冻结 marker 重试。
         if (owner.persistedCount >= this._tailFoldOwnerCap) {
           owner.markerEvent ??= this._buildTailCapMarker(item, 'owner_cap')
           const outcome = await persistPostTerminalRuntimeEvent({
@@ -1613,25 +1660,28 @@ export class SessionManager {
           }
           return
         }
-      }
-      // 真实 tail 持久化。
-      const outcome = await persistPostTerminalRuntimeEvent({
-        sessionKey: session.sessionKey,
-        sessionId: item.ownerSessionId,
-        turnIndex: item.turnIndex,
-        continuationOfTurnKey: item.ownerTurnKey,
-        event: item.event,
-      })
-      // 仅 acked|queued 算成功:更新 hash/count、F4 落定后才进 delegate durable 收集器
-      //(dropped 不进,否则 delegate transcript 跟着洪泛/丢失),再转发。
-      if (outcome !== 'dropped') {
+        // 真实 tail 持久化。
+        const outcome = await persistPostTerminalRuntimeEvent({
+          sessionKey: session.sessionKey,
+          sessionId: item.ownerSessionId,
+          turnIndex: item.turnIndex,
+          continuationOfTurnKey: item.ownerTurnKey,
+          event: item.event,
+        })
+        // dropped:全不更新(维持"转发的必已持久化",变化 tail 下次重试)。
+        if (outcome === 'dropped') return
+        // acked|queued|skipped 都更新 hash + 转发(去重前进)。
         st.lastPersistedHash = item.hash
-        st.persistedCount++
-        owner.persistedCount++
-        session._durableDelegateRuntimeEvents?.push(structuredClone(item.event))
+        // acked|queued 才计入预算 + 进 delegate durable 收集器(skipped=未落盘,不占
+        // 预算、不进收集器)。
+        if (outcome === 'acked' || outcome === 'queued') {
+          st.persistedCount++
+          owner.persistedCount++
+          session._durableDelegateRuntimeEvents?.push(structuredClone(item.event))
+        }
         item.onEvent({ kind: 'block', block: item.block })
-      }
-    })
+      }),
+    )
   }
 
   /** A1 — bash_output_tail 折叠入口(在发起 turn 的 onPostTerminalRuntimeEvent 内
@@ -1681,7 +1731,7 @@ export class SessionManager {
           st!.timer = null
           const pending = st!.pending
           st!.pending = null
-          if (pending) this._enqueueTailPersist(session, st!, pending, { exemptCap: false })
+          if (pending) this._enqueueTailPersist(session, st!, pending)
         }, delay)
         // 折叠定时器不该拖住进程退出:销毁路径会主动 flush pending 并 clear。
         const t = st.timer as { unref?: () => void }
@@ -1689,14 +1739,23 @@ export class SessionManager {
       }
       return
     }
-    this._enqueueTailPersist(session, st, item, { exemptCap: false })
+    this._enqueueTailPersist(session, st, item)
   }
 
-  /** A1 — session 销毁收尾(destroySession / LRU 驱逐 / shutdownAll 三处)。调用前
-   *  caller 必须已 await runner.shutdown()(确保底座停产出)。flush 各流 pending
-   *  (最终态豁免限频 + 每流一个豁免 cap 的 terminal 槽位),await 串行链排空,
-   *  汇总 log 抑制指标一次,再清状态与定时器。 */
-  private async _flushTailFolding(session: AgentSession): Promise<void> {
+  /**
+   * A1/F7 — 排空 tail 折叠:flush 各流 pending(**只绕过 5s 限频窗口,仍受 stream/owner
+   * cap 约束** —— pending 走既有 cap 判定,cap 已满则落 marker 或丢弃,owner.capped 后
+   * 不写任何东西),await 串行链排空。
+   *
+   * `destroy`(仅 runner 已停的三处销毁路径:destroySession / LRU 驱逐 / shutdownAll)
+   * 时额外汇总 log + 清 stream 状态/metrics/session 链 —— **破坏性**。
+   * `destroy=false`(F4:handleDelegateTask 摘取点,runner 仍活)为**非破坏 snapshot
+   * drain**:只 flush + await,不清态,后续 tail 仍受既有去重/cap 状态约束。
+   */
+  private async _drainTailFolding(
+    session: AgentSession,
+    opts: { destroy: boolean },
+  ): Promise<void> {
     const streams = session._tailFoldStreams
     if (streams) {
       for (const st of streams.values()) {
@@ -1706,14 +1765,13 @@ export class SessionManager {
         }
         const pending = st.pending
         st.pending = null
-        if (pending && !st.capped) {
-          this._enqueueTailPersist(session, st, pending, { exemptCap: true })
-        }
+        if (pending) this._enqueueTailPersist(session, st, pending)
       }
     }
     if (session._postTerminalRuntimeChain) {
       await session._postTerminalRuntimeChain.catch(() => {})
     }
+    if (!opts.destroy) return
     const m = session._tailFoldMetrics
     if (m && (m.unchangedSuppressed || m.rateCoalesced || m.capped)) {
       log.info('post-terminal tail folding summary', {
@@ -1730,12 +1788,17 @@ export class SessionManager {
     // 会话共享,自身受 LRU(512)有界;随会话清会破坏跨会话聚合封顶。
   }
 
-  /** F4 — 供 handleDelegateTask 摘取 delegate 收集器(_durableDelegateRuntimeEvents →
-   *  DurableAgentGroup)前调用:委派子会话的 bg bash 后终态 tail 经 per-session 串行链
-   *  异步持久化,其入收集器发生在持久化 acked|queued **之后**;摘取前若不 await 该链,
-   *  晚到的 queued tail 会丢出 group。语义 = flush pending + await 链排空 + 清状态。 */
+  /** A1 — session 销毁收尾(destroySession / LRU 驱逐 / shutdownAll 三处,runner 已停)。 */
+  private async _flushTailFolding(session: AgentSession): Promise<void> {
+    await this._drainTailFolding(session, { destroy: true })
+  }
+
+  /** F4/F7② — 供 handleDelegateTask 摘取 delegate 收集器(_durableDelegateRuntimeEvents →
+   *  DurableAgentGroup)前调用。**此时 runner 仍活**,故走**非破坏** drain:flush pending +
+   *  await 折叠链排空(使 acked|queued 的 tail 入收集器),但**不清 stream 状态/metrics**,
+   *  后续 tail 仍受既有去重/cap 约束。若用破坏性清态,drain 后新 tail 会重置去重/cap 面。 */
   async flushSessionTailFolding(session: AgentSession): Promise<void> {
-    await this._flushTailFolding(session)
+    await this._drainTailFolding(session, { destroy: false })
   }
 
   /** Record a platform-executed turn (for example a trusted Image 2 edit)

@@ -268,14 +268,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // 旧 parser 回调升格为一等事件,与内容事件同一条同步顺序流:
       // tool_use_detected 先于 finalized tool_use block,tool_result block 先于
       // tool_result_detected —— 与旧回调触发点逐一对位。
-      onToolUse: (tool) => {
-        // A0/F3:仅 Bash 工具产 bash_output_tail —— 只登记它的 tool_use_id → 本 turn ctx
-        // (fail-closed:非 Bash id 绝不进 origin map),供 turn 终态后其 tail 归位。
-        if (tool.name === 'Bash') {
-          ctx.ownedBashToolUseIds.add(tool.id)
-          this._registerToolOrigin(tool.id, ctx)
-        }
-        params.onEvent({ kind: 'tool_use_detected', tool })
+      // 主 agent-only 桥接事件(与登记解耦,见下方 onBashToolObserved)。
+      onToolUse: (tool) => params.onEvent({ kind: 'tool_use_detected', tool }),
+      // F5:所有 Bash tool_use(含子 agent)的归属登记入口 —— 只登记 tool_use_id → 本
+      // turn ctx(fail-closed:非 Bash id 绝不进 origin map),供 tail 归位(活跃 turn /
+      // post-terminal 皆然)。不触发 host bridge(那是 onToolUse 的职责)。
+      onBashToolObserved: (toolUseId) => {
+        ctx.ownedBashToolUseIds.add(toolUseId)
+        this._registerToolOrigin(toolUseId, ctx)
       },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
