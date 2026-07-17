@@ -127,6 +127,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "org_memberships",
   "org_subscriptions",
   "orgs",
+  // prompt_queue 家族:队列活体状态,靠消费出队 + 用户删除 FK 级联清理,无定期时间 sweep
+  // (prompt_queue_mutations 是审计流水,单独走 ttl,见 AUDIT_RETENTION_POLICIES)。
+  "prompt_queue_heads",
+  "prompt_queue_item_attachments",
+  "prompt_queue_items",
   "provider_ops",
   "research_config",
   "research_documents",
