@@ -21,7 +21,7 @@ const TEST_DB_URL = process.env.TEST_DATABASE_URL
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 const SCHEMA = 'oc_prompt_queue_p1_test'
 const here = path.dirname(fileURLToPath(import.meta.url))
-const MIGRATION = path.resolve(here, '../db/migrations/0163_prompt_queue.sql')
+const MIGRATION = path.resolve(here, '../db/migrations/0165_prompt_queue.sql')
 
 const owner1: PromptQueueOwner = {
   userId: 1n,
@@ -112,10 +112,10 @@ function enqueue(
   }
 }
 
-describe('0163_prompt_queue migration', () => {
-  test('0163 is the production-ledger-calibrated first unapplied migration', () => {
-    assert.equal(path.basename(MIGRATION), '0163_prompt_queue.sql')
-    assert.match(migrationSql.split('\n')[0] ?? '', /^-- 0163_prompt_queue/)
+describe('0165_prompt_queue migration', () => {
+  test('0165 is the production-ledger-calibrated first unapplied migration', () => {
+    assert.equal(path.basename(MIGRATION), '0165_prompt_queue.sql')
+    assert.match(migrationSql.split('\n')[0] ?? '', /^-- 0165_prompt_queue/)
   })
 
   test('exact replay leaves all tables, constraints, indexes and intended FKs', async (t) => {

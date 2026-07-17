@@ -1,4 +1,4 @@
--- 0163_prompt_queue — V5 durable prompt queue repository (P1, flag off)
+-- 0165_prompt_queue — V5 durable prompt queue repository (P1, flag off)
 --
 -- PG is the durable authority. Runtime coordinators can only mutate through
 -- the container-authenticated internal API; every write locks one head row.
