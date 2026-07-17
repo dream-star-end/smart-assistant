@@ -351,6 +351,29 @@ ssh kl-mirror "systemctl stop openclaude-v5-egress.service"
 **回滚**:出问题即 `UPDATE incident_policies SET auto_repair=FALSE WHERE match_key='<类>'`
 (秒级止血,不需重启);整体止血 = `OC_SELFHEAL_DISPATCH_DISABLED=1` + restart。
 
+### 5.6 自愈 × 正常部署的协调(**现状两闸 + 已知不完备**)
+
+**现有两闸**:
+1. **monitor 侧(第一道,主场景有效)**:`deploy-v5.sh` 在 restart 前写 planned-maintenance
+   marker(`--egress` 时 `include_egress=1` → marker 含 svc_egress/http_egress);
+   monitor 的 condition bridge **跳过被 marker 压制的 check** → 不写 firing →
+   不开 incident → **自愈不会被派单**。
+2. **wrapper 侧(最后一道)**:`oc-selfheal-host-action` 在动作 opcode 执行前查 marker,
+   活跃(`schema=2` ∧ `deadline>now`)则**任何 opcode 让路**(exit 66 → `rejected`,
+   receipt 带部署 mode/target)。不按 check 细分——部署期间清盘会删掉部署正在用的
+   build cache,同样是冲突。
+
+**⚠️ 已知不完备(不得宣称已根治)**:marker **不能充当互斥锁** —— TTL 仅 180s、
+在部署后期才创建(不覆盖 release build 段)、无健康检查时可 `SKIPPED`、wrapper 是
+"先检查再执行"= TOCTOU。**残留风险低但非零**(disk 类未开;主场景 marker 覆盖 restart 段)。
+根治方案(kl-mirror 独立 production-mutation lease + wrapper `flock -n` 持整个 opcode)
+见 playbook §5 债表与 `RFC-v5-selfheal-batch1b.md` §1。
+
+**人工排障口径**:若怀疑"自愈和我的部署打架" → 查
+`codex_repair_events` 里该 repair 的 done receipt:`detail.outcome='rejected'` +
+`reason` 含 `planned maintenance` 即闸生效(自愈让路);若 receipt 是 `completed`
+且时间落在你的部署窗口内 → 命中上述边缘窗口,按债表根治。
+
 ---
 
 ## 步骤 6:watchdog + selector 迁移(独立小窗口)
