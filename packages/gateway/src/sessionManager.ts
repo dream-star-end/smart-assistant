@@ -1204,6 +1204,16 @@ export class SessionManager {
    */
   private _tailOwnerBudgets = new Map<string, TailOwnerBudget>()
   private static readonly TAIL_OWNER_BUDGET_MAX = 512
+  /**
+   * B5 — post-terminal 事件归属缺失(缺 ownerTurnKey/ownerSessionId)的观测计数(单一
+   * SessionManager 级,非 per-session:归属失败与具体会话无关,是路由/委派链的健康信号)。
+   * `tailDropped` = 无法归属的 tail 被 fail-closed 丢弃的次数(对齐 ccbAdapter 的
+   * dropped-tail 惯例);`nonTailForwarded` = 无法归属的非 tail 事件仍兜底转发的次数
+   * (非 tail 无 cap/去重保护,丢弃会真丢内容,故只观测不拦)。测试经此断言告警活体。
+   */
+  private _missingOwnerMetrics = { tailDropped: 0, nonTailForwarded: 0 }
+  /** B5 — 归属缺失告警的限频锚点(每 30s 至多一次,对齐 ccbAdapter._warnDroppedTail,防洪泛)。*/
+  private _lastMissingOwnerWarnAt = 0
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
@@ -1742,6 +1752,108 @@ export class SessionManager {
       return
     }
     this._enqueueTailPersist(session, st, item)
+  }
+
+  /** B5 — 归属缺失计数 + 限频 warn(30s)。丢弃/兜底转发两类共用一个限频锚点,
+   *  日志带累计计数便于观测该缺陷是个例还是持续。 */
+  private _warnMissingPostTerminalOwner(kind: 'tail_dropped' | 'non_tail_forwarded'): void {
+    if (kind === 'tail_dropped') this._missingOwnerMetrics.tailDropped++
+    else this._missingOwnerMetrics.nonTailForwarded++
+    const now = Date.now()
+    if (now - this._lastMissingOwnerWarnAt < 30_000) return
+    this._lastMissingOwnerWarnAt = now
+    log.warn('post-terminal runtime event missing owner attribution', {
+      kind,
+      tail_dropped: this._missingOwnerMetrics.tailDropped,
+      non_tail_forwarded: this._missingOwnerMetrics.nonTailForwarded,
+    })
+  }
+
+  /**
+   * B5/B6 — post-terminal runtime 事件分发的**单一权威**(从 runEngineTurn 的
+   * onPostTerminalRuntimeEvent 闭包抽出,给归属 fail-closure 与非 tail dropped 门控一个
+   * 可直接单测的接缝)。三条不变量:
+   *   - **归属缺失(B5)**:缺 ownerTurnKey/ownerSessionId 时,tail 类 **fail-closed 丢弃**
+   *     (对齐 ccbAdapter._routeMessage:归属不明的 tail 绝不裸转发 —— 那正是 owner
+   *     attribution bug 成因;tail 有 cap/去重/归档兜底,丢一帧无损);非 tail 类因无
+   *     cap/去重保护且丢弃即真丢内容,**保持兜底转发**,但两类都记计数 + 限频 warn。
+   *   - **非 tail dropped 门控(B6)**:非 tail 事件先持久化后转发,persist 结果 `dropped`
+   *     时**不转发**(与 tail 路径 _enqueueTailPersist 的 dropped→不更新/不转发对称),
+   *     绝不把未落盘的 post-terminal 快照抢先展示;durable 收集器 push 同步收敛到
+   *     acked|queued(dropped/skipped 不进,消除"未落盘事件仍被当耐久重放"的类一致性缺陷)。
+   *   - **tail 折叠**:归属齐备的 tail 交 _foldPostTerminalTail(去重/限频/cap)。
+   */
+  private _dispatchPostTerminalRuntimeEvent(
+    session: AgentSession,
+    event: DurableRuntimeEvent,
+    block: OutboundContentBlock,
+    ctx: {
+      ownerTurnKey: string | undefined | null
+      ownerSessionId: string | undefined | null
+      turnIndex: number
+      onEvent: (e: SessionStreamEvent) => void
+    },
+  ): void {
+    const { ownerTurnKey, ownerSessionId, turnIndex, onEvent } = ctx
+    const payload =
+      event.payload && typeof event.payload === 'object'
+        ? (event.payload as Record<string, unknown>)
+        : null
+    const isTail = payload?.subtype === 'bash_output_tail'
+
+    if (!ownerTurnKey || !ownerSessionId) {
+      if (isTail) {
+        // B5 fail-closed:归属不明的 tail 绝不裸转发(丢弃 + 计数 + 限频 warn)。
+        this._warnMissingPostTerminalOwner('tail_dropped')
+        return
+      }
+      // B5:非 tail 无 cap/去重保护,丢弃会真丢内容 → 保持兜底转发,但计数 + 限频 warn。
+      this._warnMissingPostTerminalOwner('non_tail_forwarded')
+      onEvent({ kind: 'block', block })
+      return
+    }
+
+    if (!isTail) {
+      // B6 非 tail:先持久化后转发,dropped 时 fail-closed 不转发(与 tail 路径对称)。
+      this._chainTailPersist(session, async () => {
+        const outcome = await persistPostTerminalRuntimeEvent({
+          sessionKey: session.sessionKey,
+          sessionId: ownerSessionId,
+          turnIndex,
+          continuationOfTurnKey: ownerTurnKey,
+          event,
+        })
+        // dropped:帧未落盘 → 绝不抢先展示未持久化的 post-terminal 快照。
+        if (outcome === 'dropped') return
+        // acked|queued 才进 durable 收集器(skipped=legacy 未落盘,转发但不计耐久;
+        // 与 tail 路径 _enqueueTailPersist 完全对称)。
+        if (outcome === 'acked' || outcome === 'queued') {
+          session._durableDelegateRuntimeEvents?.push(structuredClone(event))
+        }
+        onEvent({ kind: 'block', block })
+      })
+      return
+    }
+
+    // tail → 折叠(去重 / 5s 限频 / 每流 24 + 每 turn 64 封顶)。
+    const toolUseId = typeof payload!.tool_use_id === 'string' ? payload!.tool_use_id : ''
+    const parentToolUseId =
+      typeof payload!.parent_tool_use_id === 'string' ? payload!.parent_tool_use_id : ''
+    this._foldPostTerminalTail(
+      session,
+      {
+        event,
+        block,
+        hash: tailContentHash(payload!),
+        ownerTurnKey,
+        ownerSessionId,
+        turnIndex,
+        toolUseId,
+        parentToolUseId,
+        onEvent,
+      },
+      [ownerTurnKey, parentToolUseId, toolUseId].join('\u0000'),
+    )
   }
 
   /**
@@ -3296,53 +3408,12 @@ export class SessionManager {
       const ownerSessionId = session.channel === 'delegate'
         ? session._usageAttribution?.parentSessionId
         : session.peerId
-      if (!ownerTurnKey || !ownerSessionId) {
-        // 无法归属(缺 turnKey / sessionId)→ 保持旧的直接转发(不持久化)兜底语义。
-        onEvent({ kind: 'block', block })
-        return
-      }
-      const payload =
-        event.payload && typeof event.payload === 'object'
-          ? (event.payload as Record<string, unknown>)
-          : null
-      // 非 bash_output_tail 的 post-terminal 事件:保持既有逐条持久化路径不变
-      // (仅把原 per-turn 链提升为 per-session 串行链,先持久化后转发,行为等价)。
-      if (!payload || payload.subtype !== 'bash_output_tail') {
-        session._durableDelegateRuntimeEvents?.push(structuredClone(event))
-        this._chainTailPersist(session, async () => {
-          await persistPostTerminalRuntimeEvent({
-            sessionKey: session.sessionKey,
-            sessionId: ownerSessionId,
-            turnIndex: prevTurns + 1,
-            continuationOfTurnKey: ownerTurnKey,
-            event,
-          })
-          // Never show a post-terminal snapshot before its exact raw event is
-          // fsynced in the sink queue (and normally ACKed by master).
-          onEvent({ kind: 'block', block })
-        })
-        return
-      }
-      // bash_output_tail → 折叠(去重 / 5s 限频 / 每流 24 + 每 turn 64 封顶),把
-      // CCB bg bash 在 turn 终态后每秒不变的 tail 洪泛压掉。
-      const toolUseId = typeof payload.tool_use_id === 'string' ? payload.tool_use_id : ''
-      const parentToolUseId =
-        typeof payload.parent_tool_use_id === 'string' ? payload.parent_tool_use_id : ''
-      this._foldPostTerminalTail(
-        session,
-        {
-          event,
-          block,
-          hash: tailContentHash(payload),
-          ownerTurnKey,
-          ownerSessionId,
-          turnIndex: prevTurns + 1,
-          toolUseId,
-          parentToolUseId,
-          onEvent,
-        },
-        [ownerTurnKey, parentToolUseId, toolUseId].join('\u0000'),
-      )
+      this._dispatchPostTerminalRuntimeEvent(session, event, block, {
+        ownerTurnKey,
+        ownerSessionId,
+        turnIndex: prevTurns + 1,
+        onEvent,
+      })
     }
 
     // Snapshot session totals so we can roll back on auth error / phantom turn
