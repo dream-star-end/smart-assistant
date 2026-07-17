@@ -374,6 +374,34 @@ ssh kl-mirror "systemctl stop openclaude-v5-egress.service"
 `reason` 含 `planned maintenance` 即闸生效(自愈让路);若 receipt 是 `completed`
 且时间落在你的部署窗口内 → 命中上述边缘窗口,按债表根治。
 
+### 5.7 Tier2 代码自愈激活(批1b,代码已合并 dormant,**未激活**)
+
+代码面(两侧已合 canonical,Codex 实现审四轮 PASS):个人版 master a99a177d(release
+worker/lane/按面证明/分类器/wrapper lease);v5 分支 feat/v5-selfheal-batch1b(PR #87:
+迁移 0161/0162、放行 202 异步、回调分流、deploy-v5.sh lease+继承 FD、manifest、drill)。
+**dormant 保证**:0161/0162 未 apply 前 v5 侧零行为;个人版 release worker 无 job 零行为。
+
+激活序(单独低峰窗口,按 RFC §7;每步可独立回滚):
+1. **v5 迁移 apply**:低峰人工 psql apply `0161_selfheal_release_requests` +
+   `0162_selfheal_release_drill_policy`(记账进 schema_migrations),**apply 之后**才把
+   两号登记进 `deploy/v5/release-metadata.json.requiredMigrations`(先 apply 后登记铁律)。
+2. **v5 部署**:普通 `deploy-v5.sh --with-dist`(master+admin 前端两面)。部署后 smoke +
+   `GET /api/admin/selfheal/release-fuse` 应 200 `{engaged:false}`。
+3. **个人版部署**:按 openclaude-release-checklist 发版(gateway/storage 面);
+   provision 推新版 `oc-selfheal-host-action` 到 kl-mirror `/usr/local/sbin/`
+   (`scripts/selfheal-provision.sh` 或手动 scp+chmod,校验字节一致)。
+4. **release drill 真跑一次**(RFC §5,低峰人工监督):kl-mirror release 树
+   `npx tsx scripts/v5-selfheal-drill.ts --release` → 等 pending_release → boss/运维
+   `--approve <repairId>`(admin bearer 从 stdin)→ 断言三条件+清场。这是 Tier2 可用的
+   **验收门**;drill 会真部署一个 docs-only commit 并推进 canonical。
+5. `OC_SELFHEAL_AUTO_DEPLOY_TIER2` **保持 0**(人工放行);真实 policy `auto_repair`
+   仍全表 FALSE,放开前必读 playbook §5 债表前置。
+
+回滚:①drill 失败按脚本清场断言处置(policy 复位/无活跃请求/fuse 检查);②任何
+deploy_unknown → 全局熔断自动拉起,人工按 `/version`+deploy_state+candidate ref 裁决后
+双侧 clear(v5 admin POST release-fuse/clear + 个人版 fuse-clear webhook 收敛);
+③彻底停用=个人版 env `OC_SELFHEAL_RELEASE_DISABLED=1`(worker 不 claim,v5 交付退避)。
+
 ---
 
 ## 步骤 6:watchdog + selector 迁移(独立小窗口)
