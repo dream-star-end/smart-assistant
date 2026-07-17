@@ -398,10 +398,16 @@ export function addMessage(
   ) as ChatMessage;
   if (
     sess._activeClientMessageId &&
-    msg.id.startsWith("m-") &&
     (role === "assistant" || role === "thinking" || role === "tool") &&
     msg._source !== "server"
   ) {
+    // 本地新建的**生成内容行**一律盖当前活跃轮的 clientMessageId——无论 id 是 m-* fallback
+    // 还是直接采用引擎 messageId(v7 起主 agent live text/thinking/tool 带 srv-* messageId,
+    // 见 reducer.findOrCreateStreamingRow)。旧代码只盖 m-* 行,导致采用引擎 messageId 的本地
+    // 行拿不到 _clientMessageId → turn finalize 后 server 展开成 srv-*-s{idx} 分段行(id 不同,
+    // server-wins 按 id 漏)、完成证据去重又只认 m-*(漏)→ 与 server 副本并存重复渲染。
+    // 权威守卫仍是 _source:'server'(server-authored 行绝不在此被本地 clientMessageId 污染);
+    // 不给 user/system/agent-group/goal/delegate-progress 等 client-owned 行盖。
     msg._clientMessageId ??= sess._activeClientMessageId;
   }
   sess.messages.push(msg);

@@ -1064,8 +1064,17 @@ export function applyOutboundMessage(
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return;
 
   const hasBlocks = Array.isArray(frame.blocks) && frame.blocks.length > 0;
+  // tool_output_tail-only 帧(bg bash 每秒一条 tail 快照)不复活已结束轮的发送态:turn 终态后
+  // 晚到的纯 tail 帧只是长命令的尾巴刷新,不是模型新内容,若据此把 _sendingInFlight 点回 true
+  // 会把已收尾的轮持续显示成"回复中"(生产事故:一条 bg bash tail 让终态轮亮了 13 分钟)。
+  // 混合帧(tail + text/tool)仍复活——那代表模型确有新生成内容。帧计活(markFrameReceived)不受
+  // 影响,tail 帧照常推进 _lastFrameAt。
+  const tailOnlyFrame =
+    hasBlocks &&
+    (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "tool_output_tail");
   // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
-  if (!frame.isFinal && !frame.cronJob && hasBlocks && !sess._sendingInFlight) sess._sendingInFlight = true;
+  if (!frame.isFinal && !frame.cronJob && hasBlocks && !tailOnlyFrame && !sess._sendingInFlight)
+    sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。
   if (sess._sendingInFlight && !frame.isFinal) effects.onLiveFrame?.(sess);

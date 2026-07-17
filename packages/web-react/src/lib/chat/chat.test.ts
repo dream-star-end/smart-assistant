@@ -575,6 +575,44 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(tool?.bashTail?.totalBytes).toBe(100);
   });
 
+  // C3:turn 终态后晚到的纯 tool_output_tail 帧(bg bash 每秒一条尾巴刷新)不得复活发送态。
+  test("tail-only 帧不复活已结束轮的发送态(bg bash tail 不点亮回复中)", () => {
+    const s = sess();
+    // 先建一张 Bash 工具卡,tail 帧才能按 blockId 找到它。
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Bash", blockId: "t1", partial: false, inputJson: {} }] }));
+    // 模拟本轮已收尾:发送态已清(onFinal 会清 _sendingInFlight)。
+    s._sendingInFlight = false;
+    // 纯 tool_output_tail 帧 —— 不得复活发送态。
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false }] }));
+    expect(s._sendingInFlight).toBe(false);
+    // 但 tail 内容照常落到工具卡(帧计活/渲染不受影响)。
+    expect(s.messages.find((m) => m.blockId === "t1")?.bashTail?.tail).toBe("chunk");
+  });
+
+  test("混合帧(tail + text)仍复活发送态", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Bash", blockId: "t1", partial: false, inputJson: {} }] }));
+    s._sendingInFlight = false;
+    // tail + text 混合:text 代表模型确有新生成 → 仍复活。
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [
+      { kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false },
+      { kind: "text", text: "继续", messageId: "srv-x" },
+    ] }));
+    expect(s._sendingInFlight).toBe(true);
+  });
+
+  // C2:采用引擎 messageId(srv- 前缀)的 live 生成行也应被盖上当前活跃轮的 _clientMessageId,
+  // 否则 finalize 后无法按 _clientMessageId 精确去重(与 server 分段副本并存重复渲染)。
+  test("采用引擎 messageId(srv-*)的 live assistant 行也盖 _clientMessageId", () => {
+    const s = sess();
+    const u = addMessage(s, "user", "hi", { status: "sent" });
+    s._activeClientMessageId = u.id;
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "答", messageId: "srv-peer-main-t1" }] }));
+    const asst = s.messages.find((m) => m.id === "srv-peer-main-t1");
+    expect(asst?.role).toBe("assistant");
+    expect(asst?._clientMessageId).toBe(u.id);
+  });
+
   test("§11 stale-final 早于最近 turn 边界的 server 截止 → 丢弃(不误 teardown)", () => {
     const s = sess();
     const u = addMessage(s, "user", "hi", { status: "sent", ts: 1000 });
