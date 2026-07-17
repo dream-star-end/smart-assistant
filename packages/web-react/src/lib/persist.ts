@@ -288,11 +288,108 @@ function isSupersededLocalTurnRow(m: ChatMessage, completedClientMessageId: stri
   );
 }
 
+function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
+  return role === "assistant" || role === "thinking" || role === "tool";
+}
+
+/**
+ * **同步权威传播**(07-17 tail 洪水事故收尾根治):从 server 载荷自身推导"已被权威 tape 覆盖的
+ * turn 集",据此删除本地残留的过期副本。此前完成证据只认调用方传入的 completedClientMessageId
+ * (仅"刚完成的那一轮"),事故期间落进 IndexedDB 的历史脏行(旧代码铸的 live 行:无
+ * _clientMessageId、id 为裸引擎 messageId)在老会话重开时**永远删不掉**——合并的尾段整段保留 +
+ * 无序轴行锚到末尾 = "响应结束标记之后重现 turn 开头内容"。
+ *
+ * 证据构造是**证据为正**(presence-based):只有载荷里出现某 turn 的 server 生成行才认定该 turn
+ * 被权威 tape 覆盖 —— 旧 full 快照缺某 turn 只会"不清理",绝不会误删(与 P1 的缺席判定不同,
+ * 不需要版本护栏)。server 落库失败的降级场景(某 turn 服务端零行)自然无证据 → 本地行保留,
+ * "已计费内容不得整条丢弃"红线不破。
+ *
+ * 双通道(命中其一即为过期副本):
+ *  a. `_clientMessageId` ∈ 证据集(限定携带 `_turnTapeId` 的 v2 tape 展开行:单行即证明整 turn
+ *     已原子落库;v1 逐行 writer 不具备该性质,不入证据集);
+ *  b. id 落在证据 turn 前缀命名空间内。前缀**只从 assistant/thinking 展开行的受控后缀文法反推**
+ *     (`<prefix>-s<idx>` / `<prefix>-thinking-s<idx>`,后缀完全受平台控制,无歧义);tool 展开行
+ *     的 blockId 内容任意、不可靠反解析,**不参与前缀推导**。本地行匹配用"id === 前缀 或
+ *     id.startsWith(前缀 + '-')"的成员判定 —— 不解析本地 id,turn 号数字边界(t1- vs t12)
+ *     天然防跨 turn 误伤。
+ * 活跃轮守卫:行的 `_clientMessageId` 等于当前活跃轮 → 双通道都不删(REST 已回终态、WS delta
+ * 仍在途的竞态窗口);新代码给所有本地生成行盖 clientMessageId,活跃轮不存在无章行。
+ * 角色守卫:user/system/agent-group/plan/goal 等 client-owned 行绝不触碰。
+ */
+interface ServerTurnEvidence {
+  clientMessageIds: Set<string>;
+  turnPrefixes: Set<string>;
+}
+const ASSISTANT_EXPANSION_ID_RE = /^(srv-.+-t\d+)-s\d+$/;
+const THINKING_EXPANSION_ID_RE = /^(srv-.+-t\d+)-thinking-s\d+$/;
+
+function buildServerTurnEvidence(serverRows: readonly ChatMessage[]): ServerTurnEvidence {
+  const clientMessageIds = new Set<string>();
+  const turnPrefixes = new Set<string>();
+  for (const m of serverRows) {
+    if (!m || m._source !== "server" || !isGeneratedRole(m.role)) continue;
+    // 只有 **complete tape** 的展开行才有资格作证:_turnTapeId 在 rolling per-record 兼容路径
+    // (pre-release 逐行 refs)上也会被盖,单独存在不构成"整 turn 已原子落库"证明(Codex R2
+    // MAJOR);_turnTapeComplete 仅由 hydration 的 complete-anchor 分支盖章。
+    if (typeof m._turnTapeId !== "string" || m._turnTapeId.length === 0) continue;
+    if (m._turnTapeComplete !== true) continue;
+    if (typeof m._clientMessageId === "string" && m._clientMessageId.length > 0) {
+      clientMessageIds.add(m._clientMessageId);
+    }
+    if (typeof m.id === "string") {
+      const hit =
+        (m.role === "assistant" && ASSISTANT_EXPANSION_ID_RE.exec(m.id)) ||
+        (m.role === "thinking" && THINKING_EXPANSION_ID_RE.exec(m.id));
+      if (hit) turnPrefixes.add(hit[1]);
+    }
+  }
+  return { clientMessageIds, turnPrefixes };
+}
+
+function matchesEvidenceTurnPrefix(id: unknown, turnPrefixes: Set<string>): boolean {
+  if (typeof id !== "string" || !id.startsWith("srv-")) return false;
+  for (const prefix of turnPrefixes) {
+    if (id === prefix || id.startsWith(prefix + "-")) return true;
+  }
+  return false;
+}
+
+function isCoveredStaleLocalRow(
+  m: ChatMessage,
+  evidence: ServerTurnEvidence,
+  activeClientMessageId: string | undefined,
+): boolean {
+  if (m._source === "server" || !isGeneratedRole(m.role)) return false;
+  if (
+    activeClientMessageId !== undefined &&
+    m._clientMessageId === activeClientMessageId
+  ) {
+    return false;
+  }
+  if (
+    typeof m._clientMessageId === "string" &&
+    evidence.clientMessageIds.has(m._clientMessageId)
+  ) {
+    return true;
+  }
+  return matchesEvidenceTurnPrefix(m.id, evidence.turnPrefixes);
+}
+
+
 export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
   archivedThroughSeq = 0,
   completedClientMessageId?: string,
+  opts?: {
+    /** P1 缺席删除授权:仅当调用方已过版本护栏(载荷带 updatedAt 且 ≥ 已应用水位;被证明过期
+     *  的载荷在 applyServerMessages 已整体丢弃,不会走到这里)时为 true。fresh full 的缺席权威
+     *  = 版本护栏 + id 缺席 + 归档水位保护,不做行级 seq 豁免(maxSeq 非单调且与 _orderSeq
+     *  跨轴,Codex R2 BLOCKER;"增量先到旧 full 晚到"竞态由整体丢弃闭合)。 */
+    deletionAuthority?: boolean;
+    /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,活跃轮的行绝不被载荷自证清除)。 */
+    activeClientMessageId?: string;
+  },
 ): ChatMessage[] {
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
@@ -305,6 +402,30 @@ export function mergeFullServerWins(
   if (hasExactCompletionEvidence) {
     local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
   }
+  const serverIdsForAuthority = new Set<string>();
+  for (const m of server) if (m?.id) serverIdsForAuthority.add(m.id);
+  const evidence = buildServerTurnEvidence(server);
+  // 同步权威传播(见 buildServerTurnEvidence docstring):
+  //  P1(缺席判定,需 deletionAuthority=调用方已过版本护栏)—— `_source:'server'` 的本地行,
+  //    full 载荷不带且高于归档水位 → server 已删除(事故清理/终态行离场),本地跟删,否则
+  //    服务端清理永远传播不到端上。无行级 seq 豁免(maxSeq 非单调且与 _orderSeq 跨轴;
+  //    "增量先到旧 full 晚到"由 applyServerMessages 整体丢弃过期载荷闭合)。无授权时跳过:
+  //    旧 full 快照的缺席不是删除证明(BLOCKER:晚到旧快照会把新行永久删丢——_maxSeq 游标
+  //    单调,删了就再也增量不回来)。
+  //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。
+  local = local.filter((m) => {
+    if (!m) return false;
+    if (
+      opts?.deletionAuthority === true &&
+      m._source === "server" &&
+      m.id &&
+      !serverIdsForAuthority.has(m.id) &&
+      !isArchivedServerRow(m, archivedThroughSeq)
+    ) {
+      return false;
+    }
+    return !isCoveredStaleLocalRow(m, evidence, opts?.activeClientMessageId);
+  });
   // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();
@@ -348,6 +469,10 @@ export function applyServerIncremental(
   local: ChatMessage[],
   incoming: ChatMessage[],
   completedClientMessageId?: string,
+  opts?: {
+    /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,同 mergeFullServerWins)。 */
+    activeClientMessageId?: string;
+  },
 ): ChatMessage[] {
   if (!incoming.length) return local;
   if (
@@ -361,6 +486,13 @@ export function applyServerIncremental(
   ) {
     local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
   }
+  // 同步权威传播 P2(增量版,证据为正):增量带回某 turn 的 v2 tape 展开行 = 该 turn 已原子
+  // 落权威库,同 turn 的本地过期副本一并清除——不依赖调用方恰好传 completedClientMessageId。
+  // P1(缺席判定)不适用增量:增量载荷缺席不代表不存在。
+  const incomingEvidence = buildServerTurnEvidence(incoming);
+  local = local.filter(
+    (m) => m && !isCoveredStaleLocalRow(m, incomingEvidence, opts?.activeClientMessageId),
+  );
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
   if (!incoming.length) return local;

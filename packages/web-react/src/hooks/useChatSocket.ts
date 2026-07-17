@@ -100,6 +100,8 @@ export type UseChatSocket = {
     maxSeq?: number;
     archivedThroughSeq?: number;
     archivedCount?: number;
+    /** SessionDetail.updatedAt:full 缺席删除(同步权威传播 P1)的版本护栏证据。*/
+    serverUpdatedAt?: number;
   }) => void;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
@@ -217,6 +219,7 @@ export function useChatSocket(opts: {
               archivedThroughSeq: detail.archivedThroughSeq,
               archivedCount: detail.archivedCount,
               completedClientMessageId: context?.clientMessageId,
+              serverUpdatedAt: detail.updatedAt,
               },
             );
           }
@@ -462,6 +465,7 @@ export function useChatSocket(opts: {
       socket.applyServerMessages(p.sessId, p.agentId, p.messages, p.full, p.maxSeq, {
         archivedThroughSeq: p.archivedThroughSeq,
         archivedCount: p.archivedCount,
+        serverUpdatedAt: p.serverUpdatedAt,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },

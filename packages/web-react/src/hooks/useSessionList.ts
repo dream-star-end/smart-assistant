@@ -185,6 +185,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           // full 合并才不丢本地已归档旧行,并记录归档计数供 UI 展示。
           archivedThroughSeq: detail.archivedThroughSeq,
           archivedCount: detail.archivedCount,
+          serverUpdatedAt: detail.updatedAt,
         });
         historyFetchedAtRef.current.set(id, Date.now());
       } catch (e) {
