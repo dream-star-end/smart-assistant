@@ -62,6 +62,7 @@ interface Captured {
     sourcePhase: string;
   }>;
   sqlSeen: string[];
+  sessionVersionBumps: number;
   commits: number;
   rollbacks: number;
 }
@@ -72,6 +73,7 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
     ledgerInserts: [],
     inboxInserts: [],
     sqlSeen: [],
+    sessionVersionBumps: 0,
     commits: 0,
     rollbacks: 0,
   };
@@ -226,6 +228,10 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
         state.waiver.inboxMessageId = String(params[3]);
         return { rowCount: 1, rows: [] };
       }
+      if (/^UPDATE client_sessions s SET updated_at=GREATEST/.test(t)) {
+        cap.sessionVersionBumps++;
+        return { rowCount: 1, rows: [] };
+      }
       if (/SELECT \(u\.credits \+ COALESCE/.test(t)) {
         const total = state.wallet + (state.userSub?.period ?? 0n);
         return { rowCount: 1, rows: [{ total: total.toString() }] };
@@ -261,6 +267,7 @@ describe("applyTurnWaiver — exact owner/bucket reversal + inbox receipt", () =
     assert.equal(result.newlyApplied, true);
     assert.equal(result.refundedCredits, 100n);
     assert.equal(result.recordCount, 1);
+    assert.equal(cap.sessionVersionBumps, 1);
     assert.equal(state.wallet, 70n);
     assert.equal(state.userSub?.period, 60n);
     assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.delta]), [
@@ -430,6 +437,7 @@ describe("applyTurnWaiver — exact owner/bucket reversal + inbox receipt", () =
     assert.equal(second.inboxMessageId, first.inboxMessageId);
     assert.equal(cap.ledgerInserts.length, 0);
     assert.equal(cap.inboxInserts.length, 1);
+    assert.equal(cap.sessionVersionBumps, 1);
     assert.match(cap.inboxInserts[0]!.body, /没有实际扣除积分/);
   });
 

@@ -1867,6 +1867,8 @@ export class ChatSocket {
       archivedThroughSeq?: number;
       archivedCount?: number;
       completedClientMessageId?: string;
+      /** 载荷的 SessionDetail.updatedAt:P1 缺席删除的版本护栏证据(见下)。 */
+      serverUpdatedAt?: number;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1874,14 +1876,33 @@ export class ChatSocket {
       typeof archive?.archivedThroughSeq === "number" && Number.isFinite(archive.archivedThroughSeq)
         ? archive.archivedThroughSeq
         : 0;
+    // 同步权威传播的版本护栏:loadHistory 与 syncSession 是两条独立 REST,旧载荷可能晚于更新的
+    // 合并抵达。被证明过期的载荷(updatedAt < 已应用水位)**整体丢弃**——不只是撤销 P1 授权:
+    // 旧 full 的同 id server-wins 会把新行覆盖回旧版、preservedMid 规则会丢中段新 server 行、
+    // 归档计数/水位会回退、流式索引会被重建,全都是破坏面(Codex R2 BLOCKER)。水位随任何
+    // 成功应用的带版本载荷推进(full+增量),只在本进程内存(会话重开从 0 起,首个载荷天然可用)。
+    const serverUpdatedAt = archive?.serverUpdatedAt;
+    const hasVersion = typeof serverUpdatedAt === "number" && Number.isFinite(serverUpdatedAt);
+    const watermark = s._lastServerSyncUpdatedAt ?? 0;
+    if (hasVersion && serverUpdatedAt < watermark) return;
+    // P1 缺席删除只在「载荷携带版本且 ≥ 水位」的 full 上授权;无版本信息的载荷照常合并但不授权
+    // (缺席不可证)。活跃轮守卫:发送中的轮绝不被载荷自证清除。
+    const activeClientMessageId = s._sendingInFlight ? s._activeClientMessageId : undefined;
     s.messages = full
       ? mergeFullServerWins(
           msgs,
           s.messages,
           archivedThroughSeq,
           archive?.completedClientMessageId,
+          {
+            deletionAuthority: hasVersion,
+            activeClientMessageId,
+          },
         )
-      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId);
+      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
+          activeClientMessageId,
+        });
+    if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
       s._archivedCount = archive.archivedCount;

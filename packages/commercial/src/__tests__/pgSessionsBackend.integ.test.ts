@@ -81,7 +81,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_GOAL_STATE, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0157, { encoding: "utf8" }));
-  // 0165 also alters billing/inbox tables that are intentionally absent from
+  // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.
   await pool.query(`
@@ -764,6 +764,12 @@ describe("pgSessionsBackend lossless turn tape", () => {
     ]);
     const assistant = messages.find((m) => m.role === "assistant")!;
     assert.equal(assistant.text, answer);
+    // 跨层契约(前端同步权威传播 P2 的作证前提):complete anchor 的水合行必须带
+    // `_turnTapeComplete:true` —— 前端只认此标记的行作"整 turn 已原子落库"证据。
+    for (const role of ["assistant", "thinking", "tool"] as const) {
+      assert.equal(messages.find((m) => m.role === role)?._turnTapeComplete, true,
+        `complete-anchor 水合的 ${role} 行必须携带 _turnTapeComplete:true`);
+    }
     assert.equal((assistant.usage as Record<string, unknown>).costCredits, "7");
 
     // The hot session only stores small refs; canonical bytes remain intact

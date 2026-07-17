@@ -377,6 +377,25 @@ export async function applyTurnWaiver(
         WHERE id=$1::bigint AND status='pending'`,
       [waiver.id, refunded.toString(), usageIds.size, inboxMessageId],
     )
+    // SessionDetail.updatedAt is the client sync version. Advance every
+    // session that contains this exact root turn in the same transaction as
+    // pending→applied, so a post-waiver history response is strictly newer
+    // than any response captured before the refund. The client also preserves
+    // waived=true monotonically to tolerate an older multi-query snapshot.
+    await client.query(
+      `UPDATE client_sessions s
+          SET updated_at=GREATEST(
+                s.updated_at + 1,
+                (floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT
+              )
+        WHERE s.user_id=$1
+          AND EXISTS (
+            SELECT 1
+              FROM client_session_turn_tapes t
+             WHERE t.session_id=s.id AND t.user_id=s.user_id AND t.turn_key=$2
+          )`,
+      [`c:${uid}`, input.turnKey],
+    )
     await client.query('COMMIT')
 
     const totalAfter = wallet + period
