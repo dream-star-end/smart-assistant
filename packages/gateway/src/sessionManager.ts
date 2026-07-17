@@ -668,9 +668,11 @@ type TapePersistResult = 'acked' | 'queued' | 'dropped' | 'skipped'
  *      `getClientSession` lookup when the AgentSession didn't carry
  *      userId (cron pre-warm, legacy webchat callers).
  *
- * Returns Promise<boolean> that always resolves: true means the authoritative
- * store acknowledged the write; false means it is only durably queued or the
- * write failed. Errors are logged internally. Callers MUST track it so shutdown can
+ * Returns Promise<boolean> that always resolves: true means 'acked'(权威库确认
+ * 落库)或 legacy 'skipped'(该模式下无可落之物,非失败——逐值保持三态化前的既有
+ * 布尔语义);false means 'queued'(仅可靠排队)或 'dropped'(写失败)。需要区分
+ * 四态的调用方(tail 折叠)直接用 persistServerAuthoredTurnOutcome。
+ * Errors are logged internally. Callers MUST track it so shutdown can
  * await pending writes via SessionManager.awaitPendingPersistence();
  * a process exit before the durable enqueue lands on disk would
  * silently lose the turn (Codex R2 BLOCK-1, the original bug we're
