@@ -462,7 +462,13 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
     fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
-    fireEvent.click(await screen.findByRole('button', { name: '会话目标' }))
+    // 目标入口已迁入输入框「+」选项菜单(07-17 boss 产品决策):先开菜单再点设定目标。
+    // Radix DropdownMenu trigger 在 jsdom 下需要 pointerdown 序列才会开菜单。
+    const plusTrigger = await screen.findByRole('button', { name: '更多选项' })
+    fireEvent.pointerDown(plusTrigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(plusTrigger)
+    const goalItem = await screen.findByText('设定目标')
+    fireEvent.click(goalItem)
     fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })

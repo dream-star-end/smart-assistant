@@ -1,17 +1,26 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
-import { ArrowUp, FileText, Loader2, Mic, Pencil, Plus, RotateCcw, Square, X } from "lucide-react";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
+import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
+import { GoalDialog, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
-import { IconButton, useToast } from "./ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  IconButton,
+  useToast,
+} from "./ui";
 
 type Attach = {
   id: string;
@@ -49,6 +58,9 @@ export function Composer({
   prefill,
   repoSelection,
   onOpenRepo,
+  goal,
+  onSetGoal,
+  onGoalAction,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
@@ -56,7 +68,7 @@ export function Composer({
   onStop?: () => void;
   disabled?: boolean;
   placeholder?: string;
-  /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件按钮禁用）。 */
+  /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件入口禁用）。 */
   onUpload?: (file: File) => Promise<MediaRef>;
   /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
   getVoiceToken?: () => string | null;
@@ -66,6 +78,12 @@ export function Composer({
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
   onOpenRepo?: () => void;
+  /** 当前会话目标快照（驱动「+」菜单里目标项的状态点；省略 onSetGoal/onGoalAction 则不渲染目标入口，如 demo）。 */
+  goal?: GoalStateSnapshot | null;
+  /** 设定/更新会话目标（入口从会话头部迁至「+」菜单）。 */
+  onSetGoal?: (input: GoalSetInput) => Promise<void>;
+  /** 目标状态流转（暂停/继续/完成/清除）。 */
+  onGoalAction?: (action: "pause" | "resume" | "complete" | "clear") => Promise<void>;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -82,6 +100,8 @@ export function Composer({
   );
   const [attachments, setAttachments] = useState<Attach[]>([]);
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
+  // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
+  const [goalOpen, setGoalOpen] = useState(false);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -150,6 +170,13 @@ export function Composer({
     .filter((a) => a.status === "done" && a.media)
     .map((a) => a.media as MediaRef);
   const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading;
+
+  // 「+」菜单可用项:附件(有 onUpload)与目标(有 onSetGoal+onGoalAction)。两者皆无时(如 demo)
+  // 退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
+  const canAttach = !!onUpload;
+  const canGoal = !!onSetGoal && !!onGoalAction;
+  const hasPlusMenu = canAttach || canGoal;
+  const visibleGoal = visibleGoalOf(goal);
 
   const removeAttach = useCallback(
     (id: string) => {
@@ -282,16 +309,60 @@ export function Composer({
             className="hidden"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
-          <IconButton
-            data-product-feature={PRODUCT_CAPABILITIES.files.id}
-            aria-label="添加附件"
-            title={onUpload ? "添加附件" : "附件暂不可用"}
-            disabled={!onUpload || disabled}
-            onClick={() => fileRef.current?.click()}
-            className="mb-0.5"
-          >
-            <Plus size={20} />
-          </IconButton>
+          {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。
+              菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
+              无任何可用项时(demo)退化为禁用按钮,不弹空菜单。 */}
+          {hasPlusMenu ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton
+                  data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                  aria-label="更多选项"
+                  title="更多选项"
+                  disabled={disabled}
+                  className="mb-0.5"
+                >
+                  <Plus size={20} />
+                </IconButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="top">
+                {canAttach && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                    onSelect={() => fileRef.current?.click()}
+                  >
+                    <Paperclip size={16} className="shrink-0 text-muted" />
+                    添加附件
+                  </DropdownMenuItem>
+                )}
+                {canGoal && (
+                  <DropdownMenuItem onSelect={() => setGoalOpen(true)}>
+                    <Target size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
+                    {visibleGoal && (
+                      <span
+                        aria-hidden
+                        className={cn(
+                          "size-1.5 shrink-0 rounded-full",
+                          goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                        )}
+                      />
+                    )}
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <IconButton
+              data-product-feature={PRODUCT_CAPABILITIES.files.id}
+              aria-label="更多选项"
+              title="附件暂不可用"
+              disabled
+              className="mb-0.5"
+            >
+              <Plus size={20} />
+            </IconButton>
+          )}
           <textarea
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
             ref={ref}
@@ -383,6 +454,17 @@ export function Composer({
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
+      {canGoal && onSetGoal && onGoalAction && (
+        <GoalDialog
+          open={goalOpen}
+          onOpenChange={setGoalOpen}
+          goal={goal}
+          onSet={onSetGoal}
+          onAction={onGoalAction}
+        />
+      )}
     </div>
   );
 }

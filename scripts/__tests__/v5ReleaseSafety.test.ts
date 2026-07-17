@@ -94,7 +94,9 @@ describe('v5 release safety lanes', () => {
     assert.ok(start >= 0 && end > start)
     const body = source.slice(start, end)
     const built = body.indexOf('build_release ||')
-    const qrGate = body.indexOf('knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE"')
+    // 2026-07-17 架构纠偏:阻断式 smoke_gate → 非阻断 advisory gate(stdout JSON 契约,
+    // 基础设施故障 fail-closed;审批状态只决定是否走插件迁移段,不阻断平台部署)。
+    const advisoryGate = body.indexOf('knowledge_planet_plugin_advisory_gate "$BUILT_RELEASE"')
     const maintenance = body.indexOf('begin_planned_maintenance deploy')
     const closeGate = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
     const previousPluginPin = body.indexOf(
@@ -106,9 +108,11 @@ describe('v5 release safety lanes', () => {
     )
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
+    const turnCanary = body.indexOf('smoke_turn_canary "$BUILT_RELEASE"')
+    const zeroTouch = body.indexOf('knowledge-planet=zero-touch')
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
     const maintenanceEnd = body.indexOf('end_planned_maintenance', seed)
-    assert.ok(built >= 0 && qrGate > built && maintenance > qrGate)
+    assert.ok(built >= 0 && advisoryGate > built && maintenance > advisoryGate)
     assert.ok(
       closeGate > maintenance &&
         previousPluginPin > closeGate &&
@@ -116,7 +120,12 @@ describe('v5 release safety lanes', () => {
         activation > previousPluginClassifier &&
         fullSmoke > activation,
     )
-    assert.ok(seed > fullSmoke && maintenanceEnd > seed)
+    // 真 turn canary 强校验紧随 full smoke(2026-07-17 goal 事故门禁补强);
+    // 零接触收尾分支必须在 seed 之前(门未关/未审批 → 不 seed 直接完成)。
+    assert.ok(turnCanary > fullSmoke && zeroTouch > turnCanary && seed > zeroTouch && maintenanceEnd > seed)
+    // advisory gate 必须校验 stdout JSON 契约,不依赖 tsx 退出码(fail-open 历史教训)。
+    assert.match(source, /advisory == "knowledge-planet"/)
+    assert.match(source, /--advisory-status/)
     assert.equal(
       body.match(/"\$egress_prev_release" "\$kp_had_previous_plugin"/g)?.length,
       2,
@@ -170,9 +179,21 @@ describe('v5 release safety lanes', () => {
       source,
       /rollback_runtime_tuple "\$ROLLBACK_N" 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release/,
     )
+    // 2026-07-17 纠偏:rollback 的插件门恢复 best-effort——release 身份失败必须有
+    // current-version 兜底,且不再以反向补偿推翻已成功的回滚。
     assert.match(
       source,
-      /rollback_runtime_tuple 1 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release[\s\S]*"\$kp_rollback_helper" "\$kp_rollback_helper"/,
+      /knowledge_planet_plugin_open_gate_to_release "\$kp_rollback_helper" "\$kp_rollback_target"[\s\S]*knowledge_planet_plugin_open_gate_current "\$kp_rollback_helper"/,
+    )
+    assert.match(seedSource, /--open-listing-gate-current/)
+    assert.match(seedSource, /zero-touch seed: reopening gate to current approved version/)
+    assert.match(seedSource, /async function openListingGateToCurrent/)
+    // seed 脚本必须硬退出(process.exit),软 exitCode 经 npx tsx 会 fail-open(2026-07-17 实测)。
+    assert.match(seedSource, /process\.exit\(1\)/)
+    // 未审批候选不再 throw 阻断(旧断言反转)。
+    assert.doesNotMatch(
+      seedSource,
+      /throw new Error\('new Knowledge Planet Plugin versions require an encrypted action handoff'\)/,
     )
   })
 
@@ -733,7 +754,7 @@ describe('v5 release safety lanes', () => {
     assert.equal(normal.status, 0, normal.stderr || normal.stdout)
     assert.equal(egress.status, 0, egress.stderr || egress.stdout)
     assert.doesNotMatch(normal.stdout, /checks=.*svc_egress/)
-    assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,svc_egress,http_egress/)
+    assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,turn_failures,svc_egress,http_egress/)
   })
 
   test('production smoke allowlist covers every explicitly v5-owned leader scheduler', async () => {
@@ -3173,33 +3194,42 @@ wait $!
         deployBody.indexOf('knowledge_planet_compensate_deploy'),
       'deploy 补偿 reacquire 未先于 compensate',
     )
-    // rollback 补偿全覆盖:hotcfg 两条 reverse compensation + 非 hotcfg 三条补偿入口,共 5 次。
+    // rollback 补偿覆盖(2026-07-17 KP 门摘除后):真正做反向补偿的只剩 hotcfg smoke-failure
+    // reverse compensation + 非 hotcfg activate-failure 两条;其余插件侧失败已降级为
+    // warn+open_gate_current 兜底继续(不做补偿,lease 仍在持有中),不需要 reacquire。
     assert.equal(
       source.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
-      5,
-      'rollback 补偿路径(hotcfg 2 + 非 hotcfg 3)未全挂 reacquire',
+      2,
+      'rollback 反向补偿路径(hotcfg smoke-failure + 非 hotcfg activate-failure)未挂 reacquire',
     )
-    // hotcfg 两条紧邻先于 rollback_runtime_tuple 1 1(反向补偿)。
+    // hotcfg smoke-failure 反向补偿紧邻先于 rollback_runtime_tuple 1 1。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
+      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*if rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
     )
     // 非 hotcfg 三条:reacquire 紧邻先于 Knowledge Planet 补偿(open_gate / transition)。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
+      /reacquire_mutation_lease_best_effort "rollback-compensation"\n(\s*if \[\[ "\$kp_rb_bracket" == 1 \]\]; then\n)?\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
     )
-    // 全部 5 次 reacquire 都落在 rollback() 函数体内(不外溢别的 lane)。
+    // 全部 2 次 reacquire(2026-07-17 KP 门摘除后仅剩真反向补偿两条)都落在
+    // rollback() 函数体内(不外溢别的 lane)。
     {
       const rbStart = source.indexOf('\nrollback() {')
       const rbEnd = source.indexOf('\nrollback_runtime_tuple() {', rbStart)
       const rbBody = source.slice(rbStart, rbEnd)
       assert.equal(
         rbBody.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
-        5,
+        2,
         'rollback-compensation reacquire 未全部落在 rollback() 内',
       )
     }
+    // 2026-07-17 lease 孤儿修复:ACTIVE 在 spawn 后立即置位(轮询窗被 trap 打断
+    // 也能回收本地 ssh;远端 holder 由 base 侧自释放设计负责,见 PPid 自检循环)。
+    assert.match(
+      source,
+      /MUTATION_LEASE_PID=\$!\n[\s\S]{0,400}?MUTATION_LEASE_ACTIVE=1/,
+    )
     // abort_continue 恢复动作(caddy_render_reload)前调用
     const abortStart = source.indexOf('\nabort_continue() {')
     const abortEnd = source.indexOf('\n# ═════════ --recover', abortStart)
