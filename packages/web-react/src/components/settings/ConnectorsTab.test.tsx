@@ -1050,9 +1050,13 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
 
-    expect(await screen.findByText(/授权成功，知识星球已自动启用/)).toBeInTheDocument()
-    expect(await screen.findByText(/Agent 现在可以直接读取相关内容/)).toBeInTheDocument()
     const successDialog = screen.getByRole('dialog')
+    expect(
+      await within(successDialog).findByText(/授权成功，知识星球已自动启用/),
+    ).toBeInTheDocument()
+    expect(
+      await within(successDialog).findByText(/Agent 现在可以直接读取相关内容/),
+    ).toBeInTheDocument()
     await new Promise((resolve) => setTimeout(resolve, 1_300))
     expect(successDialog).toBeInTheDocument()
     fireEvent.click(within(successDialog).getByRole('button', { name: '完成' }))
@@ -1099,7 +1103,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     expect(await within(dialog).findByText(/正在加密保存账号/)).toBeInTheDocument()
     expect(await within(dialog).findByText(/无需再次扫码/)).toBeInTheDocument()
     expect(screen.queryByText(/Agent 现在可以直接读取相关内容/)).not.toBeInTheDocument()
-    expect(await screen.findByText(/系统完成 Plugin 升级后会自动启用/)).toBeInTheDocument()
+    expect(
+      await within(dialog).findByText(/系统完成 Plugin 升级后会自动启用/),
+    ).toBeInTheDocument()
     expect(dialog).toBeInTheDocument()
   })
 
