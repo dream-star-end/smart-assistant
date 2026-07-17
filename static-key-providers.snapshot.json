@@ -45,6 +45,15 @@
       "capabilityZero": true,
       "contextWindow": 256000,
       "supportsVision": false
+    },
+    {
+      "id": "moonshot",
+      "inboundModelIds": ["kimi-k3"],
+      "maxInputTokens": 1048576,
+      "upstreamEndpoint": "https://api.kimi.com/coding/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1048576,
+      "supportsVision": true
     }
   ]
 }

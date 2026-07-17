@@ -516,6 +516,18 @@ export const commercialConfigSchema = z
      */
     OPENCODE_GO_API_KEY: z.string().trim().min(1).max(256).optional(),
     /**
+     * Moonshot 官方「Kimi For Coding」订阅 key(2026-07-17 接入,kimi-k3,boss 的 Allegretto 档)。
+     * - 配置时 anthropicProxy 收到 model 命中 moonshot(kimi-k3)的请求 → forward 到
+     *   https://api.kimi.com/coding/v1/messages,鉴权 `x-api-key: <MOONSHOT_CODING_PLAN_KEY>`;
+     *   不占 claude_accounts 池。**与火山转售的 'kimi'(ARK_AGENT_PLAN_KEY)是两家上游两把 key**。
+     * - 未配置 → 503 MOONSHOT_NOT_CONFIGURED + reject 'moonshot_config'
+     * - **配额是个人订阅规格**(Allegretto 档,全 v5 用户共享),打穿后上游 429,turn 零输出走
+     *   免单兜底;不适合作平台默认模型上游。
+     * - key 只在 master/egress 进程 env 存在,**绝不注入用户容器**;不入 git,由 systemd
+     *   EnvironmentFile 注入(commercial-v5.env)。
+     */
+    MOONSHOT_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。

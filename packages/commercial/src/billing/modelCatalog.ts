@@ -37,6 +37,7 @@ import {
 import { loadConfig } from "../config.js";
 import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
+import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -547,7 +548,10 @@ export class ModelCatalogSnapshot {
         displayName: p.displayName,
         engine: e.engine,
         providerId: e.providerId,
-        contextWindow: e.contextWindow,
+        // 角色分档投影(modelRolePolicy):同一模型 admin 与普通用户可见/可用不同窗口。
+        // 本方法同时是 projectionRevisionFor 的底稿 —— master 下发与 egress 每请求重算
+        // 都经这里,策略进哈希,双端天然一致。
+        contextWindow: projectContextWindowForRole(e.modelId, e.contextWindow, scope.role),
         supportedEfforts: e.capabilityProfile.reasoning.supported,
         supportsVision: e.capabilityProfile.supportsVision,
         capabilityZero: e.capabilityProfile.ccb.capabilityZero,
