@@ -81,7 +81,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_GOAL_STATE, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0157, { encoding: "utf8" }));
-  // 0165 also alters billing/inbox tables that are intentionally absent from
+  // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.
   await pool.query(`
