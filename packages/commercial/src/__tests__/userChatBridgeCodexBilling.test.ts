@@ -12,7 +12,7 @@
  *     UPDATE user_subscriptions SET period_credits / 每桶一条 credit_ledger;
  *   - usage_records.account_id 恒 NULL(v3 legacy 0n 假账号已废弃);
  *   - usage_records.session_id = billing 帧的 engineSessionId(oceng-<48hex>,
- *     gateway 唯一 helper 产物;settle=waive 同值红线);缺失/形状非法 →
+ *     gateway 唯一 helper 产物);缺失/形状非法 →
  *     fail-closed 免单(abort journal,不扣费);
  *   - 零输出免单:success + output=0 + 本有成本 → cost=0 落 audit,不 debit 不广播;
  *   - cost_charged.balanceAfter = 双钱包总可用(period + wallet)。
@@ -155,6 +155,12 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       record(sql, params);
       const trimmed = sql.trim();
       if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+      if (trimmed.startsWith("SELECT pg_advisory_xact_lock")) {
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (trimmed.startsWith("SELECT 1 FROM turn_waivers")) {
         return { rows: [], rowCount: 0 };
       }
       // 0112 企业版:settle 收口 tx 内的 org 归属解析(resolveOrgBillingContext)。
@@ -856,8 +862,8 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     // 红线 3:account_id 恒 SQL NULL(params[2],0104 后 mode 占 $2;不再是 v3 的 '0' 假账号)
     assert.equal(inserts[0]!.params?.[2], null, "usage_records.account_id must be NULL");
     // 红线 2:session_id(params[10],0104 参数位)= billing 帧携带的 engineSessionId ——
-    // 与 gateway idle-timeout waive 上报(engineSessionId(sessionKey))同一 helper
-    // 同一入参 ⇒ settle=waive 同值,refund.refundSessionWindow 才能圈到本记录。
+    // 与 gateway engineSessionId(sessionKey) 同一 helper，保证会话维度稳定。
+    // 免单归因已独立转为 turnKey / parentTurnKey，不依赖此字段。
     assert.equal(inserts[0]!.params?.[10], ENGINE_SID, "usage_records.session_id must equal wire engineSessionId");
     assert.equal(inserts[0]!.params?.[13], serverReqId);
     assert.deepEqual(

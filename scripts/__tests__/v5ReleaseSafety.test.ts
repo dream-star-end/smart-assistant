@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const manualMutationLease = path.join(root, 'scripts/with-production-mutation-lease.sh')
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
@@ -43,6 +44,109 @@ function run(script: string, args: string[], env: NodeJS.ProcessEnv = {}) {
     encoding: 'utf8',
     env: childEnv,
   })
+}
+
+async function waitUntilManualLease(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return false
+}
+
+function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+}
+
+async function manualLeaseFixture() {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-manual-lease-'))
+  dirs.push(dir)
+  const bin = path.join(dir, 'bin')
+  await mkdir(bin)
+  const lock = path.join(dir, 'mutation.lock')
+  const commandStarted = path.join(dir, 'command-started')
+  const commandRelease = path.join(dir, 'command-release')
+  const blockerStarted = path.join(dir, 'blocker-started')
+  const blockerRelease = path.join(dir, 'blocker-release')
+  const sshPids = path.join(dir, 'ssh-pids')
+  const remotePids = path.join(dir, 'remote-pids')
+  const wrapper = path.join(dir, 'with-production-mutation-lease.sh')
+  const command = path.join(dir, 'wrapped-command.sh')
+  const source = await readFile(manualMutationLease, 'utf8')
+  const lockNeedle = 'PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"'
+  assert.equal(source.split(lockNeedle).length - 1, 1, 'manual wrapper lock path replacement drifted')
+  const fixtureSource = source.replace(lockNeedle, `PRODUCTION_MUTATION_LOCK="${lock}"`)
+  await writeFile(wrapper, fixtureSource)
+  await chmod(wrapper, 0o755)
+  await writeFile(
+    path.join(bin, 'ssh'),
+    [
+      '#!/bin/bash',
+      'printf "%s\\n" "$$" >>"$FAKE_SSH_PIDS"',
+      'shift',
+      'bash -c "$1" &',
+      'remote_pid=$!',
+      'printf "%s\\n" "$remote_pid" >>"$FAKE_REMOTE_PIDS"',
+      "trap 'exit 0' HUP INT TERM",
+      'wait "$remote_pid"',
+    ].join('\n') + '\n',
+  )
+  await chmod(path.join(bin, 'ssh'), 0o755)
+  await writeFile(
+    command,
+    [
+      '#!/bin/bash',
+      'set -e',
+      ': >"$COMMAND_STARTED"',
+      'while [ ! -e "$COMMAND_RELEASE" ]; do sleep 0.05; done',
+    ].join('\n') + '\n',
+  )
+  await chmod(command, 0o755)
+  return {
+    dir,
+    lock,
+    commandStarted,
+    commandRelease,
+    blockerStarted,
+    blockerRelease,
+    sshPids,
+    remotePids,
+    wrapper,
+    command,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      KL_HOST: 'fake-manual-lease',
+      FAKE_SSH_PIDS: sshPids,
+      FAKE_REMOTE_PIDS: remotePids,
+      COMMAND_STARTED: commandStarted,
+      COMMAND_RELEASE: commandRelease,
+      BLOCKER_STARTED: blockerStarted,
+      BLOCKER_RELEASE: blockerRelease,
+    } as NodeJS.ProcessEnv,
+  }
+}
+
+async function killManualLeaseFixtureProcesses(...pidFiles: string[]): Promise<void> {
+  for (const pidFile of pidFiles) {
+    const raw = await readFile(pidFile, 'utf8').catch(() => '')
+    for (const value of raw.split(/\s+/)) {
+      const pid = Number(value)
+      if (!Number.isSafeInteger(pid) || pid <= 1) continue
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+  }
 }
 
 async function caddyRemoteFixture() {
@@ -126,6 +230,17 @@ describe('v5 release safety lanes', () => {
     // advisory gate 必须校验 stdout JSON 契约,不依赖 tsx 退出码(fail-open 历史教训)。
     assert.match(source, /advisory == "knowledge-planet"/)
     assert.match(source, /--advisory-status/)
+    const advisoryStatus = seedSource.slice(
+      seedSource.indexOf('async function advisoryStatus()'),
+      seedSource.indexOf('async function assertSetupFirstSafe'),
+    )
+    const artifactMatch = advisoryStatus.indexOf('const artifactMatchesCurrentApproved')
+    const strictLookup = advisoryStatus.indexOf('findApprovedKnowledgePlanetPluginForDeploy')
+    assert.ok(artifactMatch >= 0 && strictLookup > artifactMatch)
+    assert.match(
+      advisoryStatus,
+      /const approvedForDeploy =\s*artifactMatchesCurrentApproved &&\s*\(await findApprovedKnowledgePlanetPluginForDeploy/,
+    )
     assert.equal(
       body.match(/"\$egress_prev_release" "\$kp_had_previous_plugin"/g)?.length,
       2,
@@ -1733,6 +1848,9 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
     assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
+    assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
+    assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
+    assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
@@ -3043,6 +3161,102 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       'parent-watch 循环缺到点自释放的硬 TTL 检查',
     )
     assert.ok(holder.indexOf('drop_meta', loop) > loop, 'holder 退出路径必须清 fencing meta')
+  })
+
+  test('manual mutation wrapper holder watches its live sshd parent and isolates stdin', async () => {
+    const source = await readFile(manualMutationLease, 'utf8')
+    const start = source.indexOf('REMOTE_HOLDER="')
+    const end = source.indexOf('\nssh "$KL_HOST" "$REMOTE_HOLDER"', start)
+    assert.ok(start >= 0 && end > start, '未找到 manual production-mutation remote holder')
+    const holder = source.slice(start, end)
+    const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
+    const parentCapture = holder.indexOf('lease_parent=\\"\\$PPID\\"')
+    const flock = holder.indexOf('flock -w 60 9')
+    const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
+    const leased = holder.indexOf('echo LEASED')
+    const loop = holder.indexOf('while :; do', leased)
+    assert.ok(signalTrap >= 0 && signalTrap < parentCapture, 'manual holder 须在等待 flock 前安装退出 trap')
+    assert.ok(parentCapture > signalTrap && parentCapture < flock, '必须在可能阻塞的 flock 前快照 sshd parent')
+    assert.ok(firstKernelParent > flock && firstKernelParent < leased, '取锁后、LEASED 前须读取内核实时 PPid')
+    assert.ok(holder.indexOf('[ \\"\\$current_parent\\" = \\"\\$lease_parent\\" ]', firstKernelParent) < leased,
+      'LEASED 前未校验取锁后的 PPid 仍是原 sshd parent')
+    assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', firstKernelParent) < leased, 'LEASED 前未校验 parent 活性')
+    assert.ok(loop > leased, 'manual holder 缺 parent-watch 循环')
+    assert.ok(holder.indexOf('/proc/\\$\\$/status', loop) > loop, '循环未重读实时 PPid')
+    assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop, '循环未复核 parent 活性')
+    assert.doesNotMatch(holder, /exec sleep infinity/, 'manual holder 禁止 orphanable infinite sleep')
+    assert.match(source, /ssh "\$KL_HOST" "\$REMOTE_HOLDER" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
+  })
+
+  test('manual mutation wrapper normal cleanup releases a reparented remote holder', async () => {
+    const fx = await manualLeaseFixture()
+    const child = spawn('bash', [fx.wrapper, fx.command], { env: fx.env, stdio: 'ignore' })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'wrapped command never started after LEASED',
+      )
+      assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual holder never held flock')
+      await writeFile(fx.commandRelease, '')
+      assert.equal(await waitForChildExit(child, 5_000), true, 'manual wrapper did not exit after command')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 3_000),
+        true,
+        'normal cleanup left an orphaned manual holder',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper disconnect while waiting for flock cannot leak after acquisition', async () => {
+    const fx = await manualLeaseFixture()
+    const blocker = spawn(
+      'flock',
+      [fx.lock, 'bash', '-c', ': >"$BLOCKER_STARTED"; while [ ! -e "$BLOCKER_RELEASE" ]; do sleep 0.05; done'],
+      { env: fx.env, stdio: 'ignore' },
+    )
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.blockerStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'test blocker never acquired the mutation flock',
+      )
+      child = spawn('bash', [fx.wrapper, fx.command], { env: fx.env, stdio: 'ignore' })
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.remotePids, 'utf8').then((raw) => raw.trim().length > 0).catch(() => false), 5_000),
+        true,
+        'remote holder never started waiting for flock',
+      )
+      child.kill('SIGTERM')
+      assert.equal(await waitForChildExit(child, 5_000), true, 'interrupted manual wrapper did not exit')
+      const remotePid = Number((await readFile(fx.remotePids, 'utf8')).trim().split(/\s+/).at(-1))
+      const sshPid = Number((await readFile(fx.sshPids, 'utf8')).trim().split(/\s+/).at(-1))
+      assert.equal(
+        await waitUntilManualLease(async () => {
+          const status = await readFile(`/proc/${remotePid}/status`, 'utf8').catch(() => '')
+          const parent = Number(status.match(/^PPid:\s+(\d+)$/m)?.[1])
+          return parent > 0 && parent !== sshPid
+        }, 3_000),
+        true,
+        'fake remote holder was not reparented after ssh disconnect',
+      )
+      await writeFile(fx.blockerRelease, '')
+      assert.equal(await waitForChildExit(blocker, 5_000), true, 'test blocker did not release flock')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 3_000),
+        true,
+        'reparented pre-LEASED holder leaked flock after the blocker released it',
+      )
+    } finally {
+      await writeFile(fx.blockerRelease, '').catch(() => undefined)
+      blocker.kill('SIGKILL')
+      child?.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.sshPids, fx.remotePids)
+    }
   })
 
   test('reclaim-mutation-lease is read-only rescue: skips every write-fence and the global lease', async () => {

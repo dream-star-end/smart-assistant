@@ -12255,9 +12255,8 @@ export class Gateway {
         //
         // M2 — engineSessionId 进 wire 帧:EngineBillingEvent.engineSessionId
         // (adapter 构造时经唯一 helper engineSessionId(sessionKey) 派生)是 master
-        // settle 落 usage_records.session_id 的权威值;与 _reportTurnWaive 的
-        // idle-timeout 免单上报同源同值(方案红线:settle=waive 同一
-        // engineSessionId,否则 refund.refundSessionWindow 圈不到 codex 记录)。
+        // settle 落 usage_records.session_id 的权威值。逻辑 turn 的免单归因单独使用
+        // turnKey / parentTurnKey，不再依赖会话时间窗口。
         const billingFrame: OutboundCodexBilling & { _userId?: string } = {
           type: 'outbound.codex_billing',
           ..._inheritOutboundRouting(out),

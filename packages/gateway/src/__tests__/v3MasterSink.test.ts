@@ -185,6 +185,18 @@ describe("lossless v2 turn tape", () => {
     assert.deepEqual(first.parts, second.parts);
     assert.deepEqual(first.finalize, second.finalize);
   });
+
+  test("auto-waive reason is fsynced on every envelope and canonical tape", () => {
+    const tape = buildLosslessTurnTapeRequests({
+      ...PAYLOAD,
+      turnKey: "b".repeat(64),
+      waiveReason: "platform_authority_expired",
+    });
+    assert.equal(tape.finalize.waiveReason, "platform_authority_expired");
+    assert.ok(tape.parts.every((part) => part.waiveReason === "platform_authority_expired"));
+    const canonical = JSON.parse(tape.canonical.toString("utf8"));
+    assert.equal(canonical.waiveReason, "platform_authority_expired");
+  });
 });
 
 describe("readV3MasterSinkConfig", () => {

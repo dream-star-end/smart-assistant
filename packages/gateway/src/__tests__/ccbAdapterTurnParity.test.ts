@@ -282,6 +282,31 @@ describe("CcbAdapter turn parity", () => {
     assert.equal(summary?.errorKind, "auth");
   });
 
+  test("MODEL_AUTHORITY_INVALID 先于泛 403/auth 分类，且不泄露原始 JSON", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"}}';
+    runner.msg({ type: "assistant_error", error: raw });
+    runner.msg(resultRow({
+      is_error: true,
+      subtype: "error_during_execution",
+      result: raw,
+      errors: [raw],
+      total_cost_usd: 0,
+      usage: {},
+    }));
+
+    const summary = await turn.summary;
+    assert.equal(summary?.errorKind, "model_authority");
+    assert.equal(summary?.assistantText, "");
+    assert.deepEqual(summary?.assistantSegments, []);
+    assert.equal(summary?.errorDetail, "MODEL_AUTHORITY_EXPIRED");
+    assert.equal(events.some((event) => event.kind === "error"), false);
+    assert.doesNotMatch(JSON.stringify(summary?.runtimeEvents), /MODEL_AUTHORITY_INVALID|forbidden/);
+    assert.match(JSON.stringify(summary?.runtimeEvents), /MODEL_AUTHORITY_EXPIRED/);
+  });
+
   test("非 auth 的 isError → errorKind='other'", async () => {
     const { adapter, runner } = makeAdapter();
     const events: EngineEvent[] = [];

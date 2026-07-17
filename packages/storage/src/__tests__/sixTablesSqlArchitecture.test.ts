@@ -64,6 +64,10 @@ const WHITELIST = new Set<string>([
   "packages/commercial/src/db/pgSessionsBackend.ts",
   "packages/commercial/src/db/sessionsStoreAuthority.ts",
   "packages/commercial/src/goal/goalStateService.ts",
+  // Exact-turn waiver 必须在同一 PG 事务内完成退款、定向站内信、pending→applied，
+  // 并推进包含该 turn 的会话 sync version。普通 sessions backend 会另开事务，无法保持
+  // 这组写入的原子可见性；因此只为该事务权威服务保留这一个精确文件例外。
+  "packages/commercial/src/billing/refund.ts",
   // 批D D3:session_goals 终态离场 sweeper(retention 单一权威模块)。对 client_sessions 仅
   // **只读 JOIN deleted_at**(判定"会话已软删")——不写六表、不绕 ownership fence;放 backend
   // 反而把 goal 域的离场语义搬进 sessions backend,内聚更差。写入面仍只经白名单 backend。

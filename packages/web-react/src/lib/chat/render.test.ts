@@ -4,6 +4,7 @@ import {
   childSignature,
   defaultCollapsed,
   errorLabel,
+  errorPresentation,
   isLive,
   messageKind,
   messageSignature,
@@ -212,6 +213,33 @@ describe("errorLabel / stripMarkdown", () => {
     expect(errorLabel("unresolved_agent_model")).toBe("未能确定模型");
     expect(errorLabel("model_authority_unavailable")).toBe("模型服务暂时不可用");
     expect(errorLabel("model_catalog_unavailable")).toBe("模型服务暂时不可用");
+  });
+  test("存量 MODEL_AUTHORITY_INVALID 会脱敏，但无账务证据时不谎报免单/站内信", () => {
+    const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
+    const presented = errorPresentation("ENGINE_ERROR", raw, raw);
+    expect(presented).toEqual({
+      title: "任务未正常完成",
+      message: "长任务的执行凭证未能继续。你的消息已保留，可以重新尝试。",
+      detail: "请求 ID：9cad8ad4bf74b7050694873e6ab16b01",
+      waived: false,
+    });
+    expect(JSON.stringify(presented)).not.toMatch(/MODEL_AUTHORITY_INVALID|forbidden|403/);
+    expect(JSON.stringify(presented)).not.toMatch(/免单|退回|站内信/);
+  });
+  test("仅 applied waiver + receipt 的持久证据显示免单完成态", () => {
+    const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"}}';
+    const presented = errorPresentation("ENGINE_ERROR", raw, raw, true);
+    expect(presented.title).toBe("本轮已自动免单");
+    expect(presented.message).toContain("已发送站内信说明");
+    expect(presented.waived).toBe(true);
+  });
+  test("ENGINE_ERROR 不把 JSON/英文堆栈作为正文或详情展示", () => {
+    const raw = '{"error":"API Error","code":"UPSTREAM"}\n at run (/srv/app.js:1:2)';
+    const presented = errorPresentation("ENGINE_ERROR", raw, raw);
+    expect(presented.title).toBe("任务执行失败");
+    expect(presented.message).toContain("内部错误");
+    expect(presented.detail).toBeUndefined();
+    expect(JSON.stringify(presented)).not.toContain("API Error");
   });
   test("stripMarkdown 去标记取纯文本", () => {
     expect(stripMarkdown("# 标题")).toBe("标题");

@@ -15,6 +15,7 @@ import {
   Info,
   ListTodo,
   RotateCcw,
+  ShieldCheck,
   Sparkles,
   MessageSquare,
   Square,
@@ -29,7 +30,7 @@ import {
   CONTINUE_PROMPT,
   childSignature,
   defaultCollapsed,
-  errorLabel,
+  errorPresentation,
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
@@ -315,6 +316,9 @@ export function AssistantCard({
 }) {
   const live = isLive(msg, ctx);
   const hasError = !!msg._errorCode;
+  const presentedError = hasError
+    ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
+    : null;
 
   return (
     <div className="group flex gap-4 animate-in">
@@ -373,34 +377,46 @@ export function AssistantCard({
           </Alert>
         )}
 
-        {/* 错误红卡 */}
-        {hasError && (
-          <Alert tone="danger" className="mt-2.5" icon={<AlertTriangle size={16} />}>
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">{errorLabel(msg._errorCode)}</div>
-              {/* 友好可读消息(friendlyBridgeErrorMessage 产出);与标题互补:标题=类别,这里=怎么办 */}
-              {msg.text && (
-                <div className="mt-0.5 text-[13px] text-fg/90">{msg.text}</div>
-              )}
-              {msg._errorDetail && (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-xs text-muted">查看详情</summary>
-                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-2 py-1.5 text-[11px] text-muted">
-                    {msg._errorDetail}
+        {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
+        {presentedError && (
+          <Alert
+            tone={presentedError.waived ? "warning" : "danger"}
+            className="mt-2.5 max-w-full overflow-hidden px-3.5 py-3 sm:px-4"
+            icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
+            title={presentedError.title}
+          >
+            <div className="min-w-0">
+              <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
+                {presentedError.message}
+              </p>
+              {presentedError.detail && (
+                <details className="mt-1.5 max-w-full">
+                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg">
+                    查看请求信息
+                  </summary>
+                  <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-[11px] text-muted [overflow-wrap:anywhere]">
+                    {presentedError.detail}
                   </pre>
                 </details>
               )}
-              {msg._errorCode === "insufficient_credits" && cb.onTopUp && (
-                <Button size="sm" variant="accent" shape="pill" className="mt-2" onClick={cb.onTopUp}>
-                  <Wallet size={14} /> 去充值
-                </Button>
-              )}
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                {msg._errorCode?.toLowerCase() === "insufficient_credits" && cb.onTopUp && (
+                  <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
+                    <Wallet size={14} /> 去充值
+                  </Button>
+                )}
+                {msg._errorCode?.toLowerCase() !== "insufficient_credits" && cb.onRegenerate && (
+                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+                    <RotateCcw size={14} /> 重新尝试
+                  </Button>
+                )}
+              </div>
             </div>
           </Alert>
         )}
 
         {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
-        {!live && (msg.text || hasError) && (
+        {!live && !hasError && msg.text && (
           <MessageActions msg={msg} cb={cb} showRegen={ctx.isLast && !hasError} />
         )}
         {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}

@@ -583,6 +583,16 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
  */
 function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // A turn waiver is irreversible (pending→applied only). A live waiver frame
+  // may beat an older REST full response with the same message id/version, so
+  // keep the applied marker monotonic while every other usage field remains
+  // server-wins. This affects presentation only; billing never trusts IndexedDB.
+  if (localMsg.usage?.waived === true && serverMsg.usage?.waived !== true) {
+    serverMsg = {
+      ...serverMsg,
+      usage: { ...(serverMsg.usage ?? {}), waived: true },
+    };
+  }
   // server echo owns the durable user row, but these client-only fields are required to
   // faithfully retry that exact turn after a later turn changes the session routing.
   if (serverMsg.role === "user" && localMsg.role === "user") {

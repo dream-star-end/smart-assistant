@@ -1804,48 +1804,31 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
   refresh();
 }
 
-/** turn 免单退款帧：idle-timeout 无响应轮,master 已冲正扣费。
- *  处理三件事：
- *   1. 刷余额气泡（balanceAfter 在则触发 refreshBalance）。
- *   2. 从 _pendingCostCredits 未落账队列里先行抵扣（cost 常在 turn 结束前入队未 drain）。
- *   3. 找最近一条有 costCredits 的助手消息，把展示扣费额度减回去并标 waived
- *      （UI 显示「已免单」而不是积分数）。*/
+/** turn 免单退款帧：master 已精确冲正扣费并创建站内信。
+ *  余额始终刷新；消息投影只允许按 master 持久化的 root turnKey 精确命中。
+ *  `_pendingCostCredits` 没有 turn 归属，绝不能用它猜测，否则迟到的 A 轮免单会
+ *  篡改正在展示的 B 轮成本。未命中时等待下一次 server history 对账。*/
 export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire, effects: FrameEffects = {}): void {
   if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) effects.refreshBalance?.();
   if (!sess) return;
-  let refund: bigint;
-  try {
-    refund = BigInt(frame.refundedCredits ?? "0");
-  } catch {
-    refund = 0n;
-  }
-  if (refund <= 0n) return;
-  // 先抵扣未落账队列。
-  try {
-    const pending = BigInt(sess._pendingCostCredits || "0");
-    if (pending > 0n) {
-      const used = pending < refund ? pending : refund;
-      sess._pendingCostCredits = (pending - used).toString();
-      refund -= used;
+  if (typeof frame.turnKey !== "string" || !/^[0-9a-f]{64}$/.test(frame.turnKey)) return;
+  let target: ChatMessage | undefined;
+  for (let index = sess.messages.length - 1; index >= 0; index--) {
+    const message = sess.messages[index];
+    if (message.role === "assistant" && message._turnKey === frame.turnKey) {
+      target = message;
+      break;
     }
-  } catch {
-    /* 非法 pending — 忽略 */
   }
-  // 再从最近一条已展示扣费的助手消息上减（从尾部找，超时轮必然是最近的）。
-  for (let i = sess.messages.length - 1; i >= 0 && i >= sess.messages.length - 20; i--) {
-    const m = sess.messages[i];
-    if (m.role !== "assistant" || !m.usage?.costCredits) continue;
-    let cur = 0n;
-    try {
-      cur = BigInt(m.usage.costCredits);
-    } catch {
-      cur = 0n;
-    }
-    const used = cur < refund ? cur : refund;
-    m.usage = { ...m.usage, costCredits: (cur - used).toString(), waived: true };
-    refund -= used;
-    break;
+  if (!target) {
+    // The live fallback row does not know the master turn key. Pull the
+    // applied waiver+receipt projection instead of guessing a nearby row.
+    effects.forceSync?.(sess.id);
+    return;
   }
+  // Keep gross costCredits as audit evidence. The waived marker controls the
+  // presentation, matching the durable history projection exactly.
+  target.usage = { ...target.usage, waived: true };
 }
 
 // ═══════════════ permission_request / settled（§3 去重）═══════════════

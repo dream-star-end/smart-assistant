@@ -16,8 +16,8 @@
  *     内核 result 帧携带 server-owned requestId 时,adapter 在 parser.parse **之前**
  *     经独立 'billing' 事件通道 emit EngineBillingEvent(billing 先于 'final',
  *     与 P1f 前 sessionManager 的发射顺序一致)。engineSessionId 由
- *     engine/engineSessionId.ts 唯一 helper 派生(M2 双钱包 settle / turn-waive
- *     的记账键,禁止各处自行 hash)。
+ *     engine/engineSessionId.ts 唯一 helper 派生，作为 usage_records 的
+ *     稳定会话维度；turn 账务归因另用 turnKey。
  *   - errorKind 分类按 codex 错误形状(401 / token 失效 / 认证失败),分类语料 =
  *     assistantText(内核 failed 路径会先 emit "[turn failed: ...]" delta)+
  *     result 帧的原始 error 字符串(catch 路径不产 delta,只有 result.result)。

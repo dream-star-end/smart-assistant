@@ -1046,6 +1046,7 @@ export function App() {
     enabled: inWorkspace && !demo,
     defaultAgentId: "main",
     refreshBalance: refreshMe,
+    refreshInbox: inbox.refreshUnread,
     // 持久按 user 命名空间（隐私隔离）；onHydrated 把 IndexedDB 本地会话填进侧栏。
     userId: demo ? null : (user?.id ?? null),
     onHydrated,

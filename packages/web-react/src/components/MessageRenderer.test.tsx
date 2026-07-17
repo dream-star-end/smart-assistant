@@ -72,6 +72,22 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(onTopUp).toHaveBeenCalledTimes(1);
   });
 
+  test("assistant：权威过期用温和免单卡，隐藏原始 JSON 并可重试", () => {
+    const onRegenerate = vi.fn();
+    const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"}}';
+    const { container } = renderMsg(mk("assistant", {
+      text: raw,
+      _errorCode: "ENGINE_ERROR",
+      _errorDetail: raw,
+      usage: { waived: true },
+    }), { cb: { onRegenerate } });
+    expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
+    expect(screen.getByText(/已发送站内信说明/)).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/MODEL_AUTHORITY_INVALID|forbidden|403/);
+    fireEvent.click(screen.getByRole("button", { name: "重新尝试" }));
+    expect(onRegenerate).toHaveBeenCalledTimes(1);
+  });
+
   test("assistant：截断 banner 含「继续」，点击触发 onContinue", () => {
     const onContinue = vi.fn();
     renderMsg(mk("assistant", { text: "半句话", _truncated: "max_tokens" }), {

@@ -138,6 +138,8 @@ export function useChatSocket(opts: {
   defaultAgentId?: string;
   /** 商业版余额刷新（cost_charged / 4506 / insufficient_credits）。*/
   refreshBalance?: () => void;
+  /** 自动免单站内信提交后的未读角标刷新。 */
+  refreshInbox?: () => void;
   /** 当前登录用户 id：IndexedDB 持久按它命名空间（隐私隔离）。null=不持久。*/
   userId?: string | null;
   /** boot/登录从 IndexedDB 读回会话后回调（供侧栏装载本地会话）。*/
@@ -147,13 +149,15 @@ export function useChatSocket(opts: {
   /** GitHub 绑定校验失败帧回调。*/
   onRepoBindError?: (frame: RepoBindErrorWire) => void;
 }): UseChatSocket {
-  const { auth, ready, laneReady, enabled, defaultAgentId, refreshBalance, userId, onHydrated } = opts;
+  const { auth, ready, laneReady, enabled, defaultAgentId, refreshBalance, refreshInbox, userId, onHydrated } = opts;
 
   // authRef / refreshBalanceRef：让 service deps 永远读到最新闭包，无 stale。
   const authRef = useRef(auth);
   authRef.current = auth;
   const refreshBalanceRef = useRef(refreshBalance);
   refreshBalanceRef.current = refreshBalance;
+  const refreshInboxRef = useRef(refreshInbox);
+  refreshInboxRef.current = refreshInbox;
   const defaultAgentRef = useRef(defaultAgentId);
   defaultAgentRef.current = defaultAgentId;
   const onHydratedRef = useRef(onHydrated);
@@ -185,6 +189,7 @@ export function useChatSocket(opts: {
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
       refreshBalance: () => refreshBalanceRef.current?.(),
+      refreshInbox: () => refreshInboxRef.current?.(),
       reportClientError: (p) => {
         reportClientFriction({
           surface: "chat",

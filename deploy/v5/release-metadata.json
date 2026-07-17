@@ -26,7 +26,10 @@
     "0157_lossless_runtime_batches",
     "0158_skill_retrieval_shadow",
     "0159_goal_state",
-    "0163_plugin_write_control"
+    "0163_plugin_write_control",
+    "0164_admin_audit_model_admin_grant",
+    "0166_prompt_queue",
+    "0167_turn_waiver_receipts"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
