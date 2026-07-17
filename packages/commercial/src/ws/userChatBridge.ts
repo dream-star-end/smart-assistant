@@ -57,6 +57,7 @@ import {
   InsufficientCreditsError,
 } from "../billing/preCheck.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
+import { projectContextWindowForRole } from "../billing/modelRolePolicy.js";
 import {
   parseBillingPricing,
   serializeBillingPricing,
@@ -1684,6 +1685,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           modelCheckerHandle,
           agentModelResolverHandle,
           connId,
+          claims.role === "admin" ? "admin" : "user",
         );
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
@@ -1750,6 +1752,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 36 char UUID(`randomUUID()`),过 TRACE_ID_REGEX。
      */
     connId: string,
+    /**
+     * 连接用户的角色(来自 handleUpgrade 的 JWT claims.role,缺省 'user')。
+     * 当前唯一消费点 = executionDescriptor 的角色分档窗口投影(modelRolePolicy,
+     * 如 kimi-k3:admin 1M / 其他 500k)。语义与 claims.role 的其它读取点一致:
+     * 非破坏性产品分档,token 生命周期内的角色漂移可容忍(收窄方向保守)。
+     */
+    userRole: "user" | "admin" = "user",
   ): void {
     // CG2b/CG4 — connection-scoped logger:把 uid + connection-level trace 钉进 bindings,
     // 后续 startBridge 内所有 log call 不必手写这两个字段。turn-scoped(traceId)再从
@@ -2129,6 +2138,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
           }
         }
+      }
+      // ── 角色分档窗口投影(modelRolePolicy)────────────────────────────────
+      // descriptor.contextWindow 是 CCB auto-compact 的实际执行窗口 —— 在签发前按本连接
+      // 角色收窄(如 kimi-k3:admin 1M / 其他 500k)。签名 envelope 只对 descriptor 整体签名,
+      // egress gate 校验的是快照级 executionRevision(catalog 行未动,不受影响)。
+      // role 取连接 claims(JWT):与 listForUser/egress 的 DB role 相比,晋升迟一个 token
+      // 生命周期生效(收窄方向保守);降级窗口 ≤ token TTL,与 grants 30s 刷新同级别容忍。
+      const projectedWindow = projectContextWindowForRole(
+        exec.canonicalModel,
+        exec.descriptor.contextWindow,
+        userRole,
+      );
+      if (projectedWindow !== exec.descriptor.contextWindow) {
+        exec = {
+          ...exec,
+          descriptor: { ...exec.descriptor, contextWindow: projectedWindow },
+        };
       }
       return exec;
     };

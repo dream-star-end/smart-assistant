@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
+import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isMoonshotKimiK3Model, isOpencodeQwenModel } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -119,6 +119,14 @@ export function modelSupportsThinking(model: string): boolean {
   // 接受 thinking:{type:enabled,budget_tokens}(同走 enabled+budget 分支)。注意它不支持
   // disabled(火山 400),master 侧 spec.stripDisabledThinking 删参兜底。
   if (isArkPlanKimiModel(model)) {
+    return true
+  }
+  // kimi-k3(Moonshot 官方 Kimi For Coding)是思考模型 —— 同在 isCapabilityZeroStaticModel
+  // 集合(betas/effort/adaptive-thinking 全关),thinking 例外放行:2026-07-17 直连验证
+  // https://api.kimi.com/coding/v1/messages 接受 thinking:{type:enabled,budget_tokens}
+  // (默认即返回带 signature 的 thinking block),且 {type:disabled} 真关思考(纯直答,
+  // 同 qwen 语义,与 k2.7 的火山 400 不同)。同走 enabled+budget 分支。
+  if (isMoonshotKimiK3Model(model)) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {
