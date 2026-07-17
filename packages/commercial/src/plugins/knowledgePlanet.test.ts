@@ -91,9 +91,21 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 2)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 3)
+    assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
+      version: '1.2.0',
+      artifactHash: 'ee306d2ede7fe277084e842687ff798317ada778aeda942e31bb5770c83f0824',
+      execContractHash: '240e3cfe91898d8cb13ba983a05f0cf1082ccee57a22d27674ebd409f894f949',
+    })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
+    assert.equal(
+      classifyKnowledgePlanetSetupPin({
+        ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
+        artifactHash: '0'.repeat(64),
+      }),
+      null,
+    )
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
@@ -133,7 +145,9 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('v1.2 exposes bounded reads plus confirmed text writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.2.0')
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.2.1')
+    assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
+    assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
       [
