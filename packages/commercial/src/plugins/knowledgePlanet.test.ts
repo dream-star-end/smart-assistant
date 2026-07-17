@@ -205,7 +205,11 @@ describe('official Knowledge Planet Plugin', () => {
   test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
-      /async function writeAuthenticatedAndExit\(storageState\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+      /async function writeTerminalAndExit\(value\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+    )
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /async function writeAuthenticatedAndExit\(storageState\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'authenticated', storageState \}\)/,
     )
     const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
     const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
@@ -216,6 +220,23 @@ describe('official Knowledge Planet Plugin', () => {
       /const state = filteredState\([\s\S]*await writeAuthenticatedAndExit\(state\)/,
     )
     assert.doesNotMatch(loginSource, /writeFrame\(\{ event: 'authenticated'/)
+  })
+
+  test('flushes action terminal frames before exiting instead of waiting on proxy cleanup', () => {
+    const actionStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runAction')
+    const probeStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nasync function authenticatedProbe',
+      actionStart,
+    )
+    assert.ok(actionStart >= 0 && probeStart > actionStart)
+    const actionSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(actionStart, probeStart)
+    assert.match(
+      actionSource,
+      /if \(!response\.ok\(\) \|\| data\?\.succeeded !== true\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'failed'/,
+    )
+    assert.match(actionSource, /await writeTerminalAndExit\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
   })
 
   test('waits for the real QR image and never publishes the iframe loading mask', () => {
