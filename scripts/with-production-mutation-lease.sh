@@ -43,12 +43,34 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 LEASE_OUT="$(mktemp "${TMPDIR:-/tmp}/oc-v5-manual-lease.XXXXXX")"
-# 后台 ssh:远端取 flock -w 60,成功打印 LEASED 后 sleep infinity 长持(通道断即释放)。
-ssh "$KL_HOST" "mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
+# 后台 ssh:远端 shell 自身持 flock。不能 exec sleep infinity:OpenSSH
+# 断链时 sleep 可能被 PID 1 收养并永久保留 fd9。holder 每秒从 /proc
+# 读取实时 PPid；sshd session parent 消失/reparent 后立即退出释放锁。
+# 本 wrapper 没有 deploy lane 的 fencing meta/TTL；若前台被 SIGKILL、后台
+# 本地 ssh 本身仍存活，lease 会继续持有到该 ssh 退出，这是既有运维边界。
+REMOTE_HOLDER="mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
 exec 9>'$PRODUCTION_MUTATION_LOCK'
+trap 'exit 0' HUP INT TERM
+# 必须在可能阻塞的 flock 前快照 sshd session parent。若通道在等待锁时
+# 断开，holder 随后被 PID 1 收养，取锁后会因 /proc PPid 不匹配而退出。
+lease_parent=\"\$PPID\"
+case \"\$lease_parent\" in ''|*[!0-9]*) exit 76 ;; esac
+[ \"\$lease_parent\" -gt 1 ] || exit 76
+kill -0 \"\$lease_parent\" 2>/dev/null || exit 76
 flock -w 60 9 || exit 75
+current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 76
+case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
+[ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
+kill -0 \"\$lease_parent\" 2>/dev/null || exit 76
 echo LEASED
-exec sleep infinity" >"$LEASE_OUT" 2>/dev/null &
+while :; do
+  current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 0
+  case \"\$current_parent\" in ''|*[!0-9]*) exit 0 ;; esac
+  [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 0
+  kill -0 \"\$lease_parent\" 2>/dev/null || exit 0
+  sleep 1
+done"
+ssh "$KL_HOST" "$REMOTE_HOLDER" </dev/null >"$LEASE_OUT" 2>/dev/null &
 LEASE_PID=$!
 
 got=0 waited=0
