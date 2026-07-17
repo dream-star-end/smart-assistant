@@ -40,10 +40,14 @@ import {
 } from '../src/plugins/knowledgePlanetSmoke.js'
 import {
   KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH,
+  type KnowledgePlanetVerificationCheckpoint,
   type KnowledgePlanetVerificationExpected,
   type KnowledgePlanetVerificationHandoff,
+  deleteKnowledgePlanetVerificationCheckpoint,
   deleteKnowledgePlanetVerificationHandoff,
+  readKnowledgePlanetVerificationCheckpoint,
   readKnowledgePlanetVerificationHandoff,
+  writeKnowledgePlanetVerificationCheckpoint,
   writeKnowledgePlanetVerificationHandoff,
 } from '../src/plugins/knowledgePlanetVerificationHandoff.js'
 import {
@@ -321,6 +325,37 @@ function canRelinkAfter(error: unknown): boolean {
   )
 }
 
+function knowledgePlanetService(docker: Docker, imageId: string): KnowledgePlanetDockerService {
+  return new KnowledgePlanetDockerService(docker, {
+    imageId,
+    workerRoot: '/var/lib/openclaude-v5/plugin-workers',
+    brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
+    expectedOwnerUid: 0,
+    socketUid: 1000,
+    socketGid: 1000,
+  })
+}
+
+// C2:读一个仍对当前制品/用户有效的 post-scan checkpoint;无 / 失效 / 过期 / 制品或用户不匹配
+// 一律视作"没有",顺手清掉陈旧文件后返回 null(调用方走正常扫码)。
+async function readReusableCheckpoint(
+  expected: KnowledgePlanetVerificationExpected,
+  userId: number,
+): Promise<KnowledgePlanetVerificationCheckpoint | null> {
+  let checkpoint: KnowledgePlanetVerificationCheckpoint
+  try {
+    checkpoint = await readKnowledgePlanetVerificationCheckpoint({ expected, env: process.env })
+  } catch {
+    await deleteKnowledgePlanetVerificationCheckpoint()
+    return null
+  }
+  if (checkpoint.metadata.userId !== userId) {
+    await deleteKnowledgePlanetVerificationCheckpoint()
+    return null
+  }
+  return checkpoint
+}
+
 async function verifyUser(userId: number): Promise<void> {
   const imageId = imageIdFromEnv()
   const expected = verificationExpected(imageId)
@@ -346,6 +381,44 @@ async function verifyUser(userId: number): Promise<void> {
       await deleteKnowledgePlanetVerificationHandoff()
     }
   }
+  // C2:post-scan checkpoint 恢复 —— 上一次运行已扫码成功、但在 action smoke/handoff 落盘前中断
+  // (smoke 抖动 / 进程重跑)。此时直接复用已认证的 storageState 重跑 smoke → 写 handoff,免用户重扫。
+  const checkpoint = await readReusableCheckpoint(expected, userId)
+  if (checkpoint) {
+    await rm(LEGACY_EVIDENCE_PATH, { force: true })
+    await rm(QR_PATH, { force: true })
+    const service = knowledgePlanetService(docker, imageId)
+    let recovered: Awaited<ReturnType<typeof runActionSmoke>>
+    try {
+      recovered = await runActionSmoke(
+        service,
+        validateKnowledgePlanetAccountState(checkpoint.storageState),
+      )
+    } finally {
+      await service.closeAndDrain()
+      await rm(QR_PATH, { force: true })
+    }
+    const metadata = await writeKnowledgePlanetVerificationHandoff({
+      expected,
+      userId,
+      verification: checkpoint.metadata.verification,
+      replaceExistingAccount: checkpoint.metadata.replaceExistingAccount,
+      expectedExistingAccountInstanceId: checkpoint.metadata.expectedExistingAccountInstanceId,
+      replacementAccountInstanceId: checkpoint.metadata.replacementAccountInstanceId,
+      passedActionIds: recovered.passedActionIds,
+      resourceUnavailableActionIds: recovered.resourceUnavailableActionIds,
+      storageState: recovered.storageState,
+      env: process.env,
+    })
+    await deleteKnowledgePlanetVerificationCheckpoint()
+    process.stdout.write(
+      `KNOWLEDGE_PLANET_VERIFICATION_READY=${KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH}\n`,
+    )
+    process.stdout.write(
+      `Knowledge Planet post-scan checkpoint recovered for user ${userId} without a re-scan (${metadata.verification}; ${metadata.passedActionIds.length} read actions executed, ${metadata.resourceUnavailableActionIds.length} resource-dependent actions lacked account data; ${recovered.writeActionIdsSkipped.length} write actions contract-verified and intentionally skipped); encrypted handoff expires at ${metadata.expiresAt}.\n`,
+    )
+    return
+  }
   const reusable = await loadReusableAccountState(userId)
   if (alreadyApproved && reusable) {
     process.stdout.write(
@@ -355,14 +428,7 @@ async function verifyUser(userId: number): Promise<void> {
   }
   await rm(LEGACY_EVIDENCE_PATH, { force: true })
   await rm(QR_PATH, { force: true })
-  const service = new KnowledgePlanetDockerService(docker, {
-    imageId,
-    workerRoot: '/var/lib/openclaude-v5/plugin-workers',
-    brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
-    expectedOwnerUid: 0,
-    socketUid: 1000,
-    socketGid: 1000,
-  })
+  const service = knowledgePlanetService(docker, imageId)
   let verification: 'existing-account' | 'qr-login' = 'existing-account'
   let replaceExistingAccount = false
   let expectedExistingAccountInstanceId: string | null = null
@@ -390,6 +456,17 @@ async function verifyUser(userId: number): Promise<void> {
     }
     if (!completed) {
       const authenticated = await waitForQrLogin(service)
+      // C2:扫码一成功立刻落加密 checkpoint(intent 与最终 handoff 同源)。此后 runActionSmoke
+      // 抖动 / 进程重跑都能从 checkpoint 恢复,不再逼用户重扫。成功写 handoff 后于下方删除。
+      await writeKnowledgePlanetVerificationCheckpoint({
+        expected,
+        userId,
+        replaceExistingAccount,
+        expectedExistingAccountInstanceId,
+        replacementAccountInstanceId,
+        storageState: authenticated,
+        env: process.env,
+      })
       completed = await runActionSmoke(service, authenticated)
     }
   } finally {
@@ -409,6 +486,8 @@ async function verifyUser(userId: number): Promise<void> {
     storageState: completed.storageState,
     env: process.env,
   })
+  // handoff 已是最终持久化态,checkpoint 使命完成 → 删除(qr-login 路径才可能存在)。
+  await deleteKnowledgePlanetVerificationCheckpoint()
   process.stdout.write(
     `KNOWLEDGE_PLANET_VERIFICATION_READY=${KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH}\n`,
   )

@@ -32,8 +32,12 @@
 #   scripts/deploy-v5.sh --offline-recycle --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --stage --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --activate-staged --cutover-nonce=NONCE
-#   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart
+#   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart(收尾追加一次非阻断 real-turn canary)
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
+#   scripts/deploy-v5.sh --reclaim-mutation-lease
+#                                  # 回收陈旧的 kl-mirror production-mutation lease:读远端 fencing meta →
+#                                  # kill -0 校验 holder → 仅当陈旧(holder 不存在 / 超 TTL)才清锁,否则拒绝并打印持有者。
+#                                  # 明知部署已死时可 OC_V5_RECLAIM_FORCE=1 强制(runbook 记载的紧急旁路)。
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
 #
 # runtime hotcfg(§5,两轴独立开关):
@@ -100,7 +104,16 @@ MAINTENANCE_LOCK="/run/openclaude-v5/planned-maintenance.lock"
 # marker 的一把远端 flock:每个写 lane 在进入任何 lane 逻辑前统一取得,持有到收尾。自愈
 # host-action wrapper 用 flock -n 竞同一把锁,拿不到即让路(exit 66)——消除 marker 的
 # TTL(180s)/SKIPPED/check→action TOCTOU 三缺陷,把互斥正确性从 marker 移交给真锁。
-PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"
+# OC_V5_PRODUCTION_MUTATION_LOCK 仅供本地 hermetic 测试注入独立锁文件(与 OC_V5_DEPLOY_LOCK_FILE
+# 同款"自测可覆盖"约定),线上恒用默认路径。
+PRODUCTION_MUTATION_LOCK="${OC_V5_PRODUCTION_MUTATION_LOCK:-/run/openclaude-v5/production-mutation.lock}"
+# 远端 holder 硬 TTL(秒):即便本地部署进程被 SIGKILL 绕过 trap、残活的后台 ssh 被 init 收养
+# 使远端 sshd 父进程不变(PPid 检测因此不触发),holder 也会在 TTL 到点后自 exit 释放 flock,
+# 消除"生产变更被永久焊死、无自动过期"的死锁(C1)。非法/0 → 回退 7200(2h)。
+MUTATION_LEASE_TTL_SECONDS="${OC_V5_MUTATION_LEASE_TTL_SECONDS:-7200}"
+[[ "$MUTATION_LEASE_TTL_SECONDS" =~ ^[1-9][0-9]*$ ]] || MUTATION_LEASE_TTL_SECONDS=7200
+# holder fencing 元数据(reclaim 读它裁决陈旧):{remote_pid,started_at,ttl,deploy_id,holder_host,mode}。
+PRODUCTION_MUTATION_LEASE_META="${PRODUCTION_MUTATION_LOCK}.meta"
 BASELINE_REMOUNT_TIMEOUT_SECONDS="${OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS:-2700}"
 
 # ── 定位 worktree 根 ──
@@ -234,6 +247,8 @@ for arg in "$@"; do
     --activate-staged) MODE="activate-staged" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
+    # 陈旧 production-mutation lease 回收(C1):只读探测 + 条件清理,不抢任何本地/全局锁。
+    --reclaim-mutation-lease) MODE="reclaim-mutation-lease" ;;
     # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
     --model-authority-preflight) MODE="model-authority-preflight" ;;
     --enable-model-authority) MODE="enable-model-authority" ;;
@@ -879,6 +894,12 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
     return 0
   fi
   local out got=0 waited=0 remote_script inherited_close=""
+  local lease_ttl="$MUTATION_LEASE_TTL_SECONDS"
+  # deploy_id/holder_host = fencing 证据(reclaim 打印持有者身份;deploy_id 也用作 holder 自清 meta 的归属校验)。
+  local deploy_id holder_host meta_path
+  deploy_id="$(openssl rand -hex 12)"
+  holder_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+  meta_path="$PRODUCTION_MUTATION_LEASE_META"
   out="$(mktemp "${TMPDIR:-/tmp}/oc-v5-lease.XXXXXX")" || { echo "✗ 无法创建 lease 临时文件" >&2; return 1; }
   # 后台 ssh:远端取 flock,成功打印 LEASED 后由 shell 自身持锁。不能 exec sleep infinity:
   # OpenSSH 断链时 sleep 可能被 PID 1 收养并永久保留 fd9。holder 每秒从 /proc 读取内核
@@ -886,20 +907,36 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   # 关键:后台 ssh 必须关掉继承的本地部署锁 fd(fd 8 / OC_V5_DEPLOY_LOCK_FD)。否则本进程
   # 被 SIGKILL 绕过 trap 时,残活的 holder ssh 会同时焊死本地部署锁与远端 lease,
   # 后续一切部署 900s 超时。fd 号已通过整数校验,eval 仅拼接受控数字,无注入面。
+  # C1 硬 TTL + fencing:PPid 检测只覆盖"ssh 通道断"这一路;若本地部署进程被 SIGKILL、残活
+  # 后台 ssh 被 init 收养仍维持通道,则远端 holder 的 sshd 父进程不变、PPid 检测不触发,flock
+  # 会被永久焊死。holder 因此额外(a)到 TTL 自 exit 释放;(b)LEASED 时原子写 fencing meta,
+  # 供 --reclaim-mutation-lease 裁决陈旧;(c)自身任一退出路径清掉自己的 meta(持锁期间 meta 必属己)。
   remote_script="mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
 exec 9>'$PRODUCTION_MUTATION_LOCK'
 flock -w ${lease_wait} 9 || exit 75
 lease_parent=\"\$PPID\"
-trap 'exit 0' HUP INT TERM
+lease_ttl=${lease_ttl}
+lease_start=\"\$(date +%s)\"
+meta='$meta_path'
+drop_meta() { rm -f \"\$meta\" 2>/dev/null || true; }
+write_meta() {
+  printf '{\"schema\":1,\"remote_pid\":%s,\"started_at\":%s,\"ttl\":%s,\"deploy_id\":\"%s\",\"holder_host\":\"%s\",\"mode\":\"%s\"}\n' \\
+    \"\$\$\" \"\$lease_start\" \"\$lease_ttl\" '$deploy_id' '$holder_host' '$MODE' > \"\${meta}.tmp.\$\$\" 2>/dev/null \\
+    && mv -f \"\${meta}.tmp.\$\$\" \"\$meta\" 2>/dev/null || rm -f \"\${meta}.tmp.\$\$\" 2>/dev/null || true
+}
+trap 'drop_meta; exit 0' HUP INT TERM
 current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 76
 case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
+write_meta
 echo LEASED
 while :; do
-  current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 0
-  case \"\$current_parent\" in ''|*[!0-9]*) exit 0 ;; esac
-  [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 0
-  kill -0 \"\$lease_parent\" 2>/dev/null || exit 0
+  current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || { drop_meta; exit 0; }
+  case \"\$current_parent\" in ''|*[!0-9]*) drop_meta; exit 0 ;; esac
+  [ \"\$current_parent\" = \"\$lease_parent\" ] || { drop_meta; exit 0; }
+  kill -0 \"\$lease_parent\" 2>/dev/null || { drop_meta; exit 0; }
+  now=\"\$(date +%s)\"
+  if [ \"\$lease_ttl\" -gt 0 ] && [ \$(( now - lease_start )) -ge \"\$lease_ttl\" ]; then drop_meta; exit 0; fi
   sleep 1
 done"
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
@@ -930,8 +967,83 @@ done"
     echo "  稍后重试或核查 $KL_HOST:$PRODUCTION_MUTATION_LOCK。紧急旁路(仅 runbook 记载):OC_V5_SKIP_MUTATION_LEASE=1。" >&2
     return 1
   fi
-  echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,持有至本次收尾)"
+  echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,持有至本次收尾;远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
+}
+
+# 陈旧 lease 回收(C1)。读远端 fencing meta → kill -0 校验 holder 死活 → 仅当陈旧
+# (holder 进程不存在 或 超 TTL)才 kill 残留 holder 并清 meta(flock 随 holder 进程退出由内核释放);
+# 否则拒绝并打印持有者身份。OC_V5_RECLAIM_FORCE=1 = 明知部署已死时的显式强制旁路(与
+# OC_V5_SKIP_MUTATION_LEASE 同哲学:仅 runbook 记载、大写告警),仍要求 meta 存在、大声打印。
+# 只读+条件清理,不抢本地 deploy lock、不取全局 lease(见 MODE 门跳过),避免被同一残留焊死时自我阻塞。
+reclaim_production_mutation_lease() {
+  echo "══ kl-mirror production-mutation lease 陈旧回收(reclaim)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 读 $KL_HOST:$PRODUCTION_MUTATION_LEASE_META → kill -0 校验 holder → 陈旧(不存在/超TTL)才清锁,否则拒绝(force=${OC_V5_RECLAIM_FORCE:-0})"
+    return 0
+  fi
+  local result
+  # 远端 heredoc:每条判定路径都 exit 0 + 结构化结论行;仅 ssh/脚本异常才非零 → 外层按"探测失败"fail-closed(不清)。
+  if ! result="$(ssh "$KL_HOST" bash -s -- \
+      "$PRODUCTION_MUTATION_LOCK" "$PRODUCTION_MUTATION_LEASE_META" "${OC_V5_RECLAIM_FORCE:-0}" <<'REMOTE'
+set -Eeuo pipefail
+lock="$1"; meta="$2"; force="$3"
+[ "$force" = 1 ] || force=0
+now="$(date +%s)"
+# 锁空闲判定:独立 fd flock -n 拿到 = 无任何 OFD 持锁(holder 已死,内核已释放 flock)。
+lock_free=0
+if [ -e "$lock" ]; then
+  if exec 8>"$lock" 2>/dev/null && flock -n 8 2>/dev/null; then lock_free=1; flock -u 8 2>/dev/null || true; fi
+  exec 8>&- 2>/dev/null || true
+else
+  lock_free=1
+fi
+if [ ! -f "$meta" ]; then
+  if [ "$lock_free" = 1 ]; then echo "CLEAN:no-meta-lock-free"; exit 0; fi
+  echo "REFUSE:lock-held-without-meta(有 OFD 持锁但无 fencing meta;拒绝盲清)"; exit 0
+fi
+command -v jq >/dev/null 2>&1 || { echo "ERROR:jq-missing"; exit 0; }
+rpid="$(jq -r '.remote_pid // empty' "$meta" 2>/dev/null || true)"
+started="$(jq -r '.started_at // empty' "$meta" 2>/dev/null || true)"
+ttl="$(jq -r '.ttl // empty' "$meta" 2>/dev/null || true)"
+did="$(jq -r '.deploy_id // empty' "$meta" 2>/dev/null || true)"
+hhost="$(jq -r '.holder_host // empty' "$meta" 2>/dev/null || true)"
+hmode="$(jq -r '.mode // empty' "$meta" 2>/dev/null || true)"
+case "$rpid" in ''|*[!0-9]*) echo "REFUSE:meta-unparseable"; exit 0 ;; esac
+case "$started" in ''|*[!0-9]*) started=0 ;; esac
+case "$ttl" in ''|*[!0-9]*) ttl=0 ;; esac
+holder_alive=0; kill -0 "$rpid" 2>/dev/null && holder_alive=1
+age=$(( now - started ))
+stale=0
+[ "$holder_alive" = 0 ] && stale=1
+[ "$ttl" -gt 0 ] && [ "$age" -ge "$ttl" ] && stale=1
+if [ "$stale" = 0 ] && [ "$force" != 1 ]; then
+  printf 'REFUSE:holder-live pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
+  exit 0
+fi
+reason=stale; [ "$stale" = 0 ] && reason=forced
+if [ "$holder_alive" = 1 ]; then
+  kill -TERM "$rpid" 2>/dev/null || true
+  i=0; while [ "$i" -lt 5 ]; do kill -0 "$rpid" 2>/dev/null || break; sleep 1; i=$((i+1)); done
+  kill -0 "$rpid" 2>/dev/null && kill -KILL "$rpid" 2>/dev/null || true
+fi
+rm -f "$meta" 2>/dev/null || true
+printf 'CLEAN:%s pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$reason" "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
+exit 0
+REMOTE
+  )"; then
+    echo "✗ reclaim:远端探测失败(ssh 不通 / 脚本异常);未做任何清理(fail-closed)。" >&2
+    return 1
+  fi
+  echo "  远端结论:$result"
+  case "$result" in
+    CLEAN:*)  echo "  ✓ 已回收陈旧 production-mutation lease(下一次部署可正常取锁)。"; return 0 ;;
+    REFUSE:*) echo "  ⚠ 拒绝回收:lease 仍由活跃 holder 持有 / 无法确认归属。" >&2
+              echo "    若确信该部署已死:等待远端 holder TTL(${MUTATION_LEASE_TTL_SECONDS}s)自动过期,或复核持有者后带 OC_V5_RECLAIM_FORCE=1 强制回收。" >&2
+              return 4 ;;
+    ERROR:*)  echo "  ✗ reclaim 远端错误:$result" >&2; return 1 ;;
+    *)        echo "  ✗ reclaim 未知结论:$result" >&2; return 1 ;;
+  esac
 }
 
 release_production_mutation_lease() {
@@ -3999,9 +4111,19 @@ knowledge_planet_plugin_verify_user() {
   assert_no_rollout_in_progress
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
-  build_release || { echo "✗ Knowledge Planet verification release build failed" >&2; return 1; }
+  # C7:全局 production-mutation lease 只围绕 build_release(唯一写共享不可变 release 命名空间的段)窄取窄放;
+  # 下方 ssh --verify-user 的**人工扫码轮询窗(≤4min)**只是浏览器登录 + 写 /run 加密 handoff 文件,
+  # 不动任何生产共享状态,故**不持全局 lease**——避免像旧实现那样跨扫码窗焊住 lease、饿死紧急自愈 host-action。
+  # "同一时刻至多一个 verifier / 不与部署对撞"仍由入口的 KP-verify 专用锁(fd 9)+ 全局 deploy lock(fd 8)保证。
+  # 锁序:deploy lock(fd 8)→ KP-verify lock(fd 9)→ 全局 lease(此处,先本地后远端,与既有约定一致)。
+  acquire_production_mutation_lease || { echo "✗ 未取得 production-mutation lease;拒绝构建 Knowledge Planet 验证 release" >&2; return 3; }
+  local build_rc=0
+  build_release || build_rc=1
+  release_production_mutation_lease
+  [[ "$build_rc" == 0 ]] || { echo "✗ Knowledge Planet verification release build failed" >&2; return 1; }
   local source_commit
   source_commit="$(knowledge_planet_candidate_commit)" || return 1
+  echo "── 人工扫码验证窗(不持全局 lease;紧急自愈 host-action 此窗内可正常抢锁)──"
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
     export OC_KNOWLEDGE_PLANET_SOURCE_COMMIT='$source_commit'
     cd '$BUILT_RELEASE'
@@ -4035,6 +4157,26 @@ smoke_turn_canary() { # <pinned master release>
   fi
   echo "── smoke:canary 真 turn(codex 引擎全链路,port=$ACTIVE_PORT)──"
   ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${ACTIVE_PORT}' timeout 300 node scripts/v5-smoke-turn-canary.mjs"
+}
+
+# C5:rollback 收尾后的 real-turn canary —— **非阻断**。回滚本体必须能落地,故这里
+# 的真 turn 只做"回滚后引擎是否真能出正文"的健康观测:失败只大声告警,**绝不**反向翻回
+# 已成功的回滚(回滚往往正是在引擎已坏时执行,再拿 turn 结果当门会把救援自我否决)。
+# V5_SMOKE_TURN=0 显式豁免(与 deploy 侧同一开关)。
+smoke_turn_canary_advisory() { # <pinned master release>
+  local release="$1"
+  [[ "${V5_SMOKE_TURN:-1}" == 1 ]] || { echo "  · real-turn canary 已显式豁免(V5_SMOKE_TURN=0)"; return 0; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] real-turn canary(rollback 后·非阻断)@ $release"
+    return 0
+  fi
+  echo "── rollback 后 real-turn canary(非阻断观测,port=$ACTIVE_PORT)──"
+  if smoke_turn_canary "$release"; then
+    echo "  ✓ rollback 后 real-turn canary 通过(引擎可出正文且计费到账)。"
+  else
+    echo "⚠⚠ rollback 后 real-turn canary 未通过(非阻断:回滚已落地,不翻回)。引擎可能仍不健康,请人工核查 turn 主链路。" >&2
+  fi
+  return 0
 }
 
 # 2026-07-17 架构纠偏(goal 事故复盘产物):插件审批状态不再阻断平台部署。
@@ -4501,7 +4643,10 @@ deploy() {
     # 2026-07-17 架构纠偏:普通 deploy 的插件括号 best-effort——门关不上则插件
     # 零接触(不迁移不 seed,handoff 保留待下次),平台部署继续。
     echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续部署(版本 pin 不动,promotion 顺延)" >&2
-    knowledge_planet_plugin_open_gate_current "$BUILT_RELEASE" || true
+    # C6:关门失败后重开 current-version 门若**也**失败,则门处于无法裁决态,须标记人工恢复
+    # (与 4649/4994/5026 的兄弟路径对称,不再 `|| true` 静默吞掉门恢复失败)。
+    knowledge_planet_plugin_open_gate_current "$BUILT_RELEASE" \
+      || mark_deploy_recovery_required "Knowledge Planet gate close failed and current-version gate restore also failed"
     kp_deploy_bracket=0
     KP_PLUGIN_PROMOTE=0
   fi
@@ -4929,6 +5074,7 @@ rollback() {
     fi
     end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
+    smoke_turn_canary_advisory "$kp_rollback_target"   # C5:非阻断,失败不翻回
     return 0
   fi
   # 非 hotcfg:N=1 → deploy_state.previous_active_release(state 权威;蓝绿 slot-aware);
@@ -5027,6 +5173,7 @@ rollback() {
   fi
   end_planned_maintenance
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
+  smoke_turn_canary_advisory "$target"   # C5:非阻断,失败不翻回
 }
 
 # tuple 感知回滚：history v3 用 transitionKind+previousMasterRelease 区分 joint/master-only/
@@ -6201,7 +6348,8 @@ if [[ "$DRY" != 1 && "$MODE" == "knowledge-planet-verify" ]]; then
     > "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
   KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=1
 fi
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" && "$MODE" != "reclaim-mutation-lease" ]]; then
+  # reclaim 是"陈旧锁被同一残留焊死"时的救援入口:必须**不**抢本地 deploy lock(否则会被残留 fd 8 阻塞 900s)。
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then
     # ── 继承锁 FD(RFC-v5-selfheal-batch1b §4.1 锁交接协议 · probe-then-relock)──
     # 自愈 release lane 在任何 canonical mutation 前先 `exec 200>$DEPLOY_LOCK; flock 200` 抢全局锁,
@@ -6270,18 +6418,21 @@ fi
 
 # bootstrap 必须先生成/保留 V5_ENV，故在 bootstrap() 的 4.5 步单独执行；其余所有写 lane
 # 在任何 release/symlink/unit/Caddy/状态机副作用前统一 fail-closed。
-if [[ "$MODE" != "smoke" && "$MODE" != "bootstrap" ]]; then
+# reclaim 是纯远端 lease 救援(不建 release、不写 DB),且必须能在有 recovery marker / 迁移未就绪时照跑,
+# 故一并跳过下面三道写前门。
+if [[ "$MODE" != "smoke" && "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" ]]; then
   assert_repo_required_migrations || exit 1
 fi
 # Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后
 # 于 4.5 步单独执行。其余模式在任何远端状态副作用前统一 fail-closed。
-if [[ "$MODE" != "bootstrap" ]]; then
+if [[ "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" ]]; then
   assert_0151_runtime_privileges || exit 1
 fi
 
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新
 # 发布覆盖现场证据。只读 smoke 仍允许，供人工诊断；dry-run 不访问远端。
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" ]]; then
+# reclaim 必须在 marker 存在时照样能跑(它正是清理陈旧锁的救援手段)。
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "reclaim-mutation-lease" ]]; then
   assert_no_deploy_recovery_marker || exit 1
 fi
 
@@ -6292,6 +6443,11 @@ fi
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in
   smoke|baseline-census|model-authority-preflight|model-authority-observation-status) ;;
+  # reclaim = 陈旧 lease 救援,自身绝不能去取全局 lease(否则被残留焊死时自我阻塞)。
+  reclaim-mutation-lease) ;;
+  # knowledge-planet-verify:人工扫码轮询窗(~4min)不持全局 lease,避免饿死紧急自愈 host-action(C7);
+  # 全局 lease 仅在函数内围绕 build_release(唯一共享命名空间写)窄取窄放。
+  knowledge-planet-verify) ;;
   *) acquire_production_mutation_lease || exit 3 ;;
 esac
 
@@ -6319,6 +6475,7 @@ case "$MODE" in
   stage)     assert_not_bluegreen_for_cutover; stage ;;
   activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
   rollback)  rollback ;;
+  reclaim-mutation-lease) reclaim_production_mutation_lease ;;
   # ── P3 双 master cohort lane ──
   canary)    canary ;;
   promote)   promote ;;

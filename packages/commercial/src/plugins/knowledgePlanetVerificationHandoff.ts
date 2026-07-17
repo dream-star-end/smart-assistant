@@ -133,14 +133,16 @@ function validateUserId(userId: number): void {
     throw new Error('Knowledge Planet verification user is invalid')
 }
 
-function metadataAad(metadata: KnowledgePlanetVerificationMetadata): Buffer {
+function metadataAad(metadata: object): Buffer {
   return Buffer.from(JSON.stringify(metadata), 'utf8')
 }
 
-function deriveKey(env: NodeJS.ProcessEnv): Buffer {
+// info 域分隔:handoff 与 checkpoint 从同一 KMS 根派生互不相同的子密钥,任一密文
+// 不可能被对方的解密路径接受(即便同 AAD 结构),防止两类短命凭据交叉误用。
+function deriveKey(env: NodeJS.ProcessEnv, info: string = HKDF_INFO): Buffer {
   const kms = loadKmsKey(env)
   try {
-    return Buffer.from(hkdfSync('sha256', kms, Buffer.alloc(0), HKDF_INFO, 32))
+    return Buffer.from(hkdfSync('sha256', kms, Buffer.alloc(0), info, 32))
   } finally {
     zeroBuffer(kms)
   }
@@ -466,5 +468,281 @@ export async function deleteKnowledgePlanetVerificationHandoff(
   file: FileOptions = {},
 ): Promise<void> {
   const { path } = safePath(file)
+  await rm(path, { force: true })
+}
+
+// ─────────────────────────── post-scan checkpoint (C2) ───────────────────────────
+// 扫码成功后、正式 handoff 写盘前的短命加密快照。背景:旧实现里已认证 storageState 只在内存,
+// 要等 runActionSmoke(~15-20 次真实 API)全过 + handoff 落盘才持久化;其间任一抖动/进程重跑
+// 都逼用户重扫。checkpoint 复用本模块的 AEAD + 原子私有写基建(独立路径 + 域分隔密钥 + 短 TTL),
+// probeAuthenticated 命中即写;post-scan 任一失败优先从有效 checkpoint 恢复继续,成功写 handoff 后删。
+
+const CHECKPOINT_HKDF_INFO = 'openclaude:knowledge-planet-verification-checkpoint:v1'
+const CHECKPOINT_TTL_MS = 30 * 60_000
+
+export const KNOWLEDGE_PLANET_VERIFICATION_CHECKPOINT_PATH =
+  '/run/openclaude-v5/knowledge-planet-plugin-verification-checkpoint.json'
+
+export interface KnowledgePlanetVerificationCheckpointMetadata {
+  schemaVersion: 1
+  artifactHash: string
+  execContractHash: string
+  workerDigest: string
+  imageId: string
+  sourceCommit: string
+  userId: number
+  // checkpoint 只存在于 qr-login 路径(existing-account 复用不扫码,无需 checkpoint)。
+  verification: 'qr-login'
+  replaceExistingAccount: boolean
+  expectedExistingAccountInstanceId: string | null
+  replacementAccountInstanceId: string | null
+  createdAt: string
+  expiresAt: string
+}
+
+interface CheckpointFile extends KnowledgePlanetVerificationCheckpointMetadata {
+  nonce: string
+  ciphertext: string
+}
+
+export interface KnowledgePlanetVerificationCheckpoint {
+  metadata: KnowledgePlanetVerificationCheckpointMetadata
+  storageState: BrowserStorageStateV1
+}
+
+// handoff 与 checkpoint 都携带 replace-account 意图,校验规则一致,收口一处避免两套并行判定。
+function assertReplacementIntent(input: {
+  verification: 'qr-login' | 'existing-account'
+  replaceExistingAccount: boolean
+  expectedExistingAccountInstanceId: string | null
+  replacementAccountInstanceId: string | null
+}): void {
+  if (
+    (input.verification === 'existing-account' && input.replaceExistingAccount) ||
+    !(
+      input.expectedExistingAccountInstanceId === null ||
+      UUID_RE.test(input.expectedExistingAccountInstanceId)
+    ) ||
+    !(
+      input.replacementAccountInstanceId === null ||
+      UUID_RE.test(input.replacementAccountInstanceId)
+    ) ||
+    (input.replaceExistingAccount &&
+      (input.expectedExistingAccountInstanceId === null ||
+        input.replacementAccountInstanceId === null ||
+        input.replacementAccountInstanceId === input.expectedExistingAccountInstanceId)) ||
+    (!input.replaceExistingAccount && input.replacementAccountInstanceId !== null)
+  )
+    throw new Error('Knowledge Planet verification checkpoint intent is invalid')
+}
+
+function checkpointSafePath(file: FileOptions): {
+  path: string
+  root: string
+  expectedOwnerUid: number
+} {
+  const path = file.path ?? KNOWLEDGE_PLANET_VERIFICATION_CHECKPOINT_PATH
+  if (!isAbsolute(path)) throw new Error('Knowledge Planet verification checkpoint path is unsafe')
+  return { path, root: dirname(path), expectedOwnerUid: file.expectedOwnerUid ?? 0 }
+}
+
+export async function writeKnowledgePlanetVerificationCheckpoint(input: {
+  expected: KnowledgePlanetVerificationExpected
+  userId: number
+  replaceExistingAccount: boolean
+  expectedExistingAccountInstanceId: string | null
+  replacementAccountInstanceId: string | null
+  storageState: unknown
+  env?: NodeJS.ProcessEnv
+  now?: number
+  file?: FileOptions
+}): Promise<KnowledgePlanetVerificationCheckpointMetadata> {
+  validateExpected(input.expected)
+  validateUserId(input.userId)
+  assertReplacementIntent({
+    verification: 'qr-login',
+    replaceExistingAccount: input.replaceExistingAccount,
+    expectedExistingAccountInstanceId: input.expectedExistingAccountInstanceId,
+    replacementAccountInstanceId: input.replacementAccountInstanceId,
+  })
+  const now = input.now ?? Date.now()
+  if (!Number.isFinite(now)) throw new Error('Knowledge Planet verification time is invalid')
+  const metadata: KnowledgePlanetVerificationCheckpointMetadata = {
+    schemaVersion: 1,
+    artifactHash: input.expected.artifactHash,
+    execContractHash: input.expected.execContractHash,
+    workerDigest: input.expected.workerDigest,
+    imageId: input.expected.imageId,
+    sourceCommit: input.expected.sourceCommit,
+    userId: input.userId,
+    verification: 'qr-login',
+    replaceExistingAccount: input.replaceExistingAccount,
+    expectedExistingAccountInstanceId: input.expectedExistingAccountInstanceId,
+    replacementAccountInstanceId: input.replacementAccountInstanceId,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + CHECKPOINT_TTL_MS).toISOString(),
+  }
+  const state = validateBrowserStorageState(input.storageState, input.expected.contract)
+  const plaintext = Buffer.from(JSON.stringify(state), 'utf8')
+  const aad = metadataAad(metadata)
+  const key = deriveKey(input.env ?? process.env, CHECKPOINT_HKDF_INFO)
+  try {
+    const encrypted = encrypt(plaintext, key, aad)
+    try {
+      const file: CheckpointFile = {
+        ...metadata,
+        nonce: encrypted.nonce.toString('base64'),
+        ciphertext: encrypted.ciphertext.toString('base64'),
+      }
+      await writePrivateFile(
+        checkpointSafePath(input.file ?? {}),
+        Buffer.from(`${JSON.stringify(file)}\n`, 'utf8'),
+      )
+    } finally {
+      zeroBuffer(encrypted.nonce)
+      zeroBuffer(encrypted.ciphertext)
+    }
+  } finally {
+    zeroBuffer(plaintext)
+    zeroBuffer(aad)
+    zeroBuffer(key)
+  }
+  return metadata
+}
+
+function parseCheckpointMetadata(
+  raw: Record<string, unknown>,
+  expected: KnowledgePlanetVerificationExpected,
+  now: number,
+): KnowledgePlanetVerificationCheckpointMetadata {
+  if (
+    raw.schemaVersion !== 1 ||
+    raw.artifactHash !== expected.artifactHash ||
+    raw.execContractHash !== expected.execContractHash ||
+    raw.workerDigest !== expected.workerDigest ||
+    raw.imageId !== expected.imageId ||
+    raw.sourceCommit !== expected.sourceCommit ||
+    !Number.isSafeInteger(raw.userId) ||
+    Number(raw.userId) <= 0 ||
+    raw.verification !== 'qr-login' ||
+    typeof raw.replaceExistingAccount !== 'boolean' ||
+    !(
+      raw.expectedExistingAccountInstanceId === null ||
+      (typeof raw.expectedExistingAccountInstanceId === 'string' &&
+        UUID_RE.test(raw.expectedExistingAccountInstanceId))
+    ) ||
+    !(
+      raw.replacementAccountInstanceId === null ||
+      (typeof raw.replacementAccountInstanceId === 'string' &&
+        UUID_RE.test(raw.replacementAccountInstanceId))
+    ) ||
+    (raw.replaceExistingAccount === true &&
+      (raw.expectedExistingAccountInstanceId === null ||
+        raw.replacementAccountInstanceId === null ||
+        raw.replacementAccountInstanceId === raw.expectedExistingAccountInstanceId)) ||
+    (raw.replaceExistingAccount === false && raw.replacementAccountInstanceId !== null) ||
+    typeof raw.createdAt !== 'string' ||
+    typeof raw.expiresAt !== 'string'
+  )
+    throw new Error('Knowledge Planet verification checkpoint does not match this artifact/image')
+  const createdAt = Date.parse(raw.createdAt)
+  const expiresAt = Date.parse(raw.expiresAt)
+  if (
+    !Number.isFinite(createdAt) ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt - createdAt !== CHECKPOINT_TTL_MS ||
+    createdAt > now + FUTURE_SKEW_MS ||
+    now > expiresAt
+  )
+    throw new Error('Knowledge Planet verification checkpoint expired')
+  return {
+    schemaVersion: 1,
+    artifactHash: expected.artifactHash,
+    execContractHash: expected.execContractHash,
+    workerDigest: expected.workerDigest,
+    imageId: expected.imageId,
+    sourceCommit: expected.sourceCommit,
+    userId: Number(raw.userId),
+    verification: 'qr-login',
+    replaceExistingAccount: raw.replaceExistingAccount,
+    expectedExistingAccountInstanceId: raw.expectedExistingAccountInstanceId as string | null,
+    replacementAccountInstanceId: raw.replacementAccountInstanceId as string | null,
+    createdAt: raw.createdAt,
+    expiresAt: raw.expiresAt,
+  }
+}
+
+export async function readKnowledgePlanetVerificationCheckpoint(input: {
+  expected: KnowledgePlanetVerificationExpected
+  env?: NodeJS.ProcessEnv
+  now?: number
+  file?: FileOptions
+}): Promise<KnowledgePlanetVerificationCheckpoint> {
+  validateExpected(input.expected)
+  const body = await readPrivateFile(checkpointSafePath(input.file ?? {}))
+  let raw: unknown
+  try {
+    raw = JSON.parse(body.toString('utf8'))
+  } catch {
+    throw new Error('Knowledge Planet verification checkpoint is invalid')
+  } finally {
+    zeroBuffer(body)
+  }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+    throw new Error('Knowledge Planet verification checkpoint is invalid')
+  const record = raw as Record<string, unknown>
+  if (
+    !exactKeys(record, [
+      'schemaVersion',
+      'artifactHash',
+      'execContractHash',
+      'workerDigest',
+      'imageId',
+      'sourceCommit',
+      'userId',
+      'verification',
+      'replaceExistingAccount',
+      'expectedExistingAccountInstanceId',
+      'replacementAccountInstanceId',
+      'createdAt',
+      'expiresAt',
+      'nonce',
+      'ciphertext',
+    ])
+  )
+    throw new Error('Knowledge Planet verification checkpoint is invalid')
+  const metadata = parseCheckpointMetadata(record, input.expected, input.now ?? Date.now())
+  const nonce = decodeBase64(record.nonce, 'nonce', NONCE_BYTES)
+  const ciphertext = decodeBase64(record.ciphertext, 'ciphertext', MAX_CIPHERTEXT_BYTES)
+  if (nonce.length !== NONCE_BYTES || ciphertext.length < TAG_BYTES) {
+    zeroBuffer(nonce)
+    zeroBuffer(ciphertext)
+    throw new Error('Knowledge Planet verification checkpoint ciphertext is invalid')
+  }
+  const aad = metadataAad(metadata)
+  const key = deriveKey(input.env ?? process.env, CHECKPOINT_HKDF_INFO)
+  let plaintext: Buffer | null = null
+  try {
+    plaintext = decryptToBuffer(ciphertext, nonce, key, aad)
+    const parsed = JSON.parse(plaintext.toString('utf8'))
+    return {
+      metadata,
+      storageState: validateBrowserStorageState(parsed, input.expected.contract),
+    }
+  } catch {
+    throw new Error('Knowledge Planet verification checkpoint authentication failed')
+  } finally {
+    if (plaintext) zeroBuffer(plaintext)
+    zeroBuffer(nonce)
+    zeroBuffer(ciphertext)
+    zeroBuffer(aad)
+    zeroBuffer(key)
+  }
+}
+
+export async function deleteKnowledgePlanetVerificationCheckpoint(
+  file: FileOptions = {},
+): Promise<void> {
+  const { path } = checkpointSafePath(file)
   await rm(path, { force: true })
 }
