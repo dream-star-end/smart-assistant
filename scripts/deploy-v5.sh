@@ -856,7 +856,7 @@ cleanup_deploy_process() {
 }
 
 # ───────────────────────── production-mutation lease(RFC §1.2)────────────────
-# 取得远端一把 flock 并由后台 ssh 长持(sleep infinity),直到 release/cleanup kill 它。
+# 取得远端一把 flock 并由后台 ssh 的父进程感知 holder 长持,直到 release/cleanup 断开它。
 # 与本地 deploy lock 固定锁序:先本地(fd 8)后远端(本函数),防死锁。
 # 超时/失败一律 return 非零,调用方 exit 3。紧急旁路 OC_V5_SKIP_MUTATION_LEASE=1(大写 WARNING)。
 acquire_production_mutation_lease() {  # [<wait_secs>=60]
@@ -878,15 +878,28 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   fi
   local out got=0 waited=0 remote_script inherited_close=""
   out="$(mktemp "${TMPDIR:-/tmp}/oc-v5-lease.XXXXXX")" || { echo "✗ 无法创建 lease 临时文件" >&2; return 1; }
-  # 后台 ssh:远端取 flock -w 60,成功打印 LEASED 后 sleep infinity 持锁(通道断则锁随之释放)。
+  # 后台 ssh:远端取 flock,成功打印 LEASED 后由 shell 自身持锁。不能 exec sleep infinity:
+  # OpenSSH 断链时 sleep 可能被 PID 1 收养并永久保留 fd9。holder 每秒从 /proc 读取内核
+  # 实时 PPid(不能用 bash 缓存的 $PPID)；sshd session parent 消失/reparent 后立即退出释放锁。
   # 关键:后台 ssh 必须关掉继承的本地部署锁 fd(fd 8 / OC_V5_DEPLOY_LOCK_FD)。否则本进程
-  # 被 SIGKILL 绕过 trap 时,残活的 sleep-infinity ssh 会同时焊死本地部署锁与远端 lease,
+  # 被 SIGKILL 绕过 trap 时,残活的 holder ssh 会同时焊死本地部署锁与远端 lease,
   # 后续一切部署 900s 超时。fd 号已通过整数校验,eval 仅拼接受控数字,无注入面。
   remote_script="mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
 exec 9>'$PRODUCTION_MUTATION_LOCK'
 flock -w ${lease_wait} 9 || exit 75
+lease_parent=\"\$PPID\"
+trap 'exit 0' HUP INT TERM
+current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 76
+case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
+[ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
 echo LEASED
-exec sleep infinity"
+while :; do
+  current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 0
+  case \"\$current_parent\" in ''|*[!0-9]*) exit 0 ;; esac
+  [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 0
+  kill -0 \"\$lease_parent\" 2>/dev/null || exit 0
+  sleep 1
+done"
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
     inherited_close="${OC_V5_DEPLOY_LOCK_FD}>&-"
   fi
