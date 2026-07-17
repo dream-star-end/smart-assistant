@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -3009,6 +3009,114 @@ describe('v5 monitor deploy_state serving lanes', () => {
 })
 
 describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
+  test('remote mutation holder watches the kernel parent instead of orphaning sleep', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const start = source.indexOf('remote_script="mkdir -p -m 700')
+    const end = source.indexOf('\n  if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}"', start)
+    assert.ok(start >= 0 && end > start, '未找到 production-mutation remote holder')
+    const holder = source.slice(start, end)
+    const parentCapture = holder.indexOf('lease_parent=\\"\\$PPID\\"')
+    const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
+    const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
+    const leased = holder.indexOf('echo LEASED')
+    const loop = holder.indexOf('while :; do', leased)
+    assert.ok(parentCapture >= 0, 'remote holder 未快照 sshd session parent')
+    assert.ok(signalTrap > parentCapture && signalTrap < leased, '退出 trap 必须在 LEASED 握手前安装')
+    assert.ok(
+      firstKernelParent > signalTrap && firstKernelParent < leased,
+      'LEASED 前缺 /proc 实时 PPid 身份校验',
+    )
+    assert.ok(loop > leased, 'remote holder 缺握手后的 parent-watch 循环')
+    assert.ok(
+      holder.indexOf('/proc/\\$\\$/status', loop) > loop &&
+        holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop,
+      'parent-watch 必须同时复核内核实时 PPid 与 parent 活性',
+    )
+    assert.doesNotMatch(holder, /exec sleep infinity/, '禁止 PID 1 收养的无限 sleep 继续持锁')
+  })
+
+  test('mutation holder releases its flock after its session parent is SIGKILLed', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-mutation-holder-'))
+    dirs.push(dir)
+    const lock = path.join(dir, 'mutation.lock')
+    const ready = path.join(dir, 'ready')
+    const holderScript = path.join(dir, 'holder.sh')
+    const parentScript = path.join(dir, 'parent.sh')
+    await writeFile(
+      holderScript,
+      `#!/bin/bash
+set -e
+lock="$1"; ready="$2"
+exec 9>"$lock"
+flock -w 2 9 || exit 75
+lease_parent="$PPID"
+trap 'exit 0' HUP INT TERM
+current_parent="$(awk '/^PPid:/{print $2; exit}' "/proc/$$/status" 2>/dev/null)" || exit 76
+case "$current_parent" in ''|*[!0-9]*) exit 76 ;; esac
+[ "$current_parent" = "$lease_parent" ] || exit 76
+printf '%s\n' "$$" >"$ready"
+while :; do
+  current_parent="$(awk '/^PPid:/{print $2; exit}' "/proc/$$/status" 2>/dev/null)" || exit 0
+  case "$current_parent" in ''|*[!0-9]*) exit 0 ;; esac
+  [ "$current_parent" = "$lease_parent" ] || exit 0
+  kill -0 "$lease_parent" 2>/dev/null || exit 0
+  sleep 1
+done
+`,
+    )
+    await writeFile(
+      parentScript,
+      `#!/bin/bash
+set -e
+bash "$1" "$2" "$3" &
+wait $!
+`,
+    )
+    await chmod(holderScript, 0o755)
+    await chmod(parentScript, 0o755)
+
+    const waitUntil = async (predicate: () => boolean | Promise<boolean>, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        if (await predicate()) return true
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return false
+    }
+    let parent: ReturnType<typeof spawn> | undefined
+    let holderPid = 0
+    let holderExited = false
+    try {
+      parent = spawn('bash', [parentScript, holderScript, lock, ready], {
+        stdio: 'ignore',
+      })
+      assert.equal(
+        await waitUntil(async () => {
+          const raw = await readFile(ready, 'utf8').catch(() => '')
+          holderPid = Number(raw.trim())
+          return Number.isSafeInteger(holderPid) && holderPid > 0
+        }, 2_000),
+        true,
+        'holder 未进入已持锁 parent-watch 状态',
+      )
+      assert.notEqual(spawnSync('flock', ['-n', lock, 'true']).status, 0, 'holder 未持有 flock')
+      assert.equal(parent.kill('SIGKILL'), true, '未能 SIGKILL session parent')
+      assert.equal(
+        await waitUntil(() => spawnSync('flock', ['-n', lock, 'true']).status === 0, 5_000),
+        true,
+        'session parent 死亡后 holder 未在时限内释放 flock',
+      )
+      holderExited = await waitUntil(
+        () => spawnSync('kill', ['-0', String(holderPid)]).status !== 0,
+        5_000,
+      )
+      assert.equal(holderExited, true, 'orphan holder 未自行退出')
+    } finally {
+      parent?.kill('SIGKILL')
+      if (holderPid > 0 && !holderExited) spawnSync('kill', ['-KILL', String(holderPid)])
+    }
+  })
+
   test('F6: inherited deploy-lock fd uses probe-then-relock (rejects unlocked liar)', async () => {
     const source = await readFile(deploy, 'utf8')
     // 继承锁 FD 分支:从 `if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then` 到 else 分支起点 `exec 8>"$DEPLOY_LOCK"`。
@@ -3116,10 +3224,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         'rollback-compensation reacquire 未全部落在 rollback() 内',
       )
     }
-    // 2026-07-17 lease 孤儿修复:远端持锁进程自记 pidfile,release 显式远端回收
-    // (comm=sleep 防 pid 复用误杀),ACTIVE 在 spawn 后立即置位(轮询窗竞态)。
-    assert.match(source, /echo \\\$\\\$ > '\$\{PRODUCTION_MUTATION_LOCK\}\.pid'/)
-    assert.match(source, /comm 2>\/dev\/null\)\\" = sleep/)
+    // 2026-07-17 lease 孤儿修复:ACTIVE 在 spawn 后立即置位(轮询窗被 trap 打断
+    // 也能回收本地 ssh;远端 holder 由 base 侧自释放设计负责,见 PPid 自检循环)。
     assert.match(
       source,
       /MUTATION_LEASE_PID=\$!\n[\s\S]{0,400}?MUTATION_LEASE_ACTIVE=1/,
