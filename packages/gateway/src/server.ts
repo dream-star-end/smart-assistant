@@ -41,6 +41,7 @@ import {
   deleteClientSession,
   effortsForModel,
   getClientSession,
+  getJob as getSelfhealJob,
   getUsageSummary,
   listClientSessions,
   listUnclaimedSessions,
@@ -109,16 +110,24 @@ import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { selectRunLogResponse } from './runLogApi.js'
-import { type BrokerResponse, SelfhealBroker, releaseHttpStatusFor } from './selfheal/broker.js'
+import { SelfhealBroker } from './selfheal/broker.js'
 import { TIER1_ACTIONS } from './selfheal/brokerActions.js'
 import { SelfhealCallbackPump } from './selfheal/callbackPump.js'
 import { executeSelfhealCancel } from './selfheal/cancel.js'
-import { createDeployDriver } from './selfheal/deployDriver.js'
 import { refreshEgressPreferSelector } from './selfheal/egressRefresh.js'
 import { SelfhealJobWorker, getSelfhealJobWorkerDeps } from './selfheal/jobWorker.js'
 import { createWecomNotifier } from './selfheal/notify.js'
 import {
+  enqueueReleaseJob,
+  readCommittedCutoverPlan,
+} from './selfheal/releaseIntake.js'
+import {
+  SelfhealReleaseWorker,
+  getSelfhealReleaseWorkerDeps,
+} from './selfheal/releaseWorker.js'
+import {
   SELFHEAL_CANCEL_WEBHOOK_PATH,
+  SELFHEAL_FUSE_CLEAR_WEBHOOK_PATH,
   SELFHEAL_RELEASE_WEBHOOK_PATH,
   SELFHEAL_WEBHOOK_PATH,
   type SelfhealReceiverConfig,
@@ -126,6 +135,10 @@ import {
   isLoopbackAddress,
   parseSelfhealIdBody,
   receiveSelfhealDispatch,
+  receiveSelfhealFuseClear,
+  receiveSelfhealRelease,
+  resolveDualCancel,
+  resolveReleaseJobCancel,
   verifySelfhealSignedRequest,
 } from './selfheal/receiver.js'
 import { SessionManager } from './sessionManager.js'
@@ -247,6 +260,8 @@ export class Gateway {
   private _selfhealCallbackPump: SelfhealCallbackPump | null = null
   // Self-heal (block C): root-side privilege broker (Unix socket) + release path.
   private _selfhealBroker: SelfhealBroker | null = null
+  // Self-heal (batch1b): durable Tier2 release worker (deploy lane driver).
+  private _selfhealReleaseWorker: SelfhealReleaseWorker | null = null
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
   private channels = new Map<string, ChannelAdapter>()
@@ -961,7 +976,13 @@ export class Gateway {
           hmacSecret: workerDeps.hmacSecret,
         })
         this._selfhealCallbackPump.start()
-        this.log.info('selfheal receiver + jobWorker + callback pump active')
+        // Durable Tier2 release worker (batch1b §8): drains selfheal_release_jobs
+        // and deploys approved code repairs via the release lane. Gated with the
+        // jobWorker (only started when release deps exist) + the per-tick
+        // OC_SELFHEAL_RELEASE_DISABLED kill switch.
+        this._selfhealReleaseWorker = new SelfhealReleaseWorker(getSelfhealReleaseWorkerDeps())
+        this._selfhealReleaseWorker.start()
+        this.log.info('selfheal receiver + jobWorker + callback pump + release worker active')
       } else {
         this.log.warn(
           'selfheal receiver active but OC_SELFHEAL_CALLBACK_URL unset — jobs will accept but not execute',
@@ -1000,7 +1021,6 @@ export class Gateway {
           canonicalBranch,
           callbackBaseUrl: process.env.OC_SELFHEAL_CALLBACK_URL?.trim() || undefined,
           autoDeployTier2: process.env.OC_SELFHEAL_AUTO_DEPLOY_TIER2 === '1',
-          deployDriver: createDeployDriver({ canonicalRepo, canonicalBranch, notify }),
           notifyPendingRelease: (info) =>
             notify(
               info.toolchain?.length
@@ -1319,6 +1339,11 @@ export class Gateway {
       this.log.warn('selfheal callback pump stop error', undefined, err)
     }
     try {
+      this._selfhealReleaseWorker?.stop()
+    } catch (err) {
+      this.log.warn('selfheal release worker stop error', undefined, err)
+    }
+    try {
       await this._selfhealBroker?.stop()
     } catch (err) {
       this.log.warn('selfheal broker stop error', undefined, err)
@@ -1559,6 +1584,10 @@ export class Gateway {
     }
     if (url.pathname === SELFHEAL_RELEASE_WEBHOOK_PATH) {
       this._handleSelfhealRelease(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    if (url.pathname === SELFHEAL_FUSE_CLEAR_WEBHOOK_PATH) {
+      this._handleSelfhealFuseClear(req, res).catch((err) => this.sendError(res, 500, String(err)))
       return
     }
     // Root break-glass release: loopback + the personal-edition global token
@@ -3438,7 +3467,7 @@ export class Gateway {
     res: ServerResponse,
     path: string,
     opts: { requireIncidentId: boolean },
-  ): Promise<{ repairId: string; incidentId?: string } | null> {
+  ): Promise<{ repairId: string; incidentId?: string; releaseRequestId?: string } | null> {
     if (req.method !== 'POST') {
       this.sendError(res, 405, 'method not allowed')
       return null
@@ -3485,10 +3514,12 @@ export class Gateway {
   }
 
   /**
-   * POST /api/webhooks/v5-selfheal-cancel { repairId, incidentId } — the
-   * canonical v5-initiated cancel (design §A2/§C4; same trust chain as
-   * dispatch). Runs the four-case terminated contract under the per-repair
-   * mutex; `terminated=true` IFF the durable job status is now 'cancelled'.
+   * POST /api/webhooks/v5-selfheal-cancel { repairId, incidentId, releaseRequestId? }
+   * — the canonical v5-initiated cancel (design §A2/§C4; same trust chain as
+   * dispatch). With a `releaseRequestId` (batch1b §3.2 + §F11) the cancel targets
+   * that release JOB via the receiver's rrid↔repair-bound resolver (200/409);
+   * without it, the repair four-case terminated contract runs under the per-repair
+   * mutex.
    */
   private async _handleSelfhealCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const parsed = await this._readVerifiedSelfhealCommand(req, res, SELFHEAL_CANCEL_WEBHOOK_PATH, {
@@ -3500,6 +3531,25 @@ export class Gateway {
       // Unreachable — requireIncidentId already enforced it — but keep the
       // narrow explicit rather than asserting.
       this.sendJson(res, 400, { error: 'invalid body' })
+      return
+    }
+    // §3.2 + §F11 — a release-job-scoped cancel (rrid present). R2-1: run BOTH
+    // the release-job resolver (three-state) AND the repair-level four-case cancel
+    // and merge, so v5's postCancel can settle a repair stuck `cancelling` (the
+    // old handler returned ONLY the release-job fields). `repair_mismatch` is the
+    // one exception — a suspicious (rrid, repairId) pair stays 409 and runs no
+    // cancel. resolveDualCancel encodes both the skip decision and the merge.
+    if (parsed.releaseRequestId) {
+      const releaseOutcome = await resolveReleaseJobCancel(parsed.releaseRequestId, parsed.repairId)
+      const dual = await resolveDualCancel(releaseOutcome, () =>
+        executeSelfhealCancel({ repairId: parsed.repairId, incidentId }, this.sessions),
+      )
+      this.log.info('selfheal release+repair cancel', {
+        releaseRequestId: parsed.releaseRequestId,
+        releaseCancel: releaseOutcome.body.releaseCancel,
+        status: dual.status,
+      })
+      this.sendJson(res, dual.status, dual.body)
       return
     }
     const outcome = await executeSelfhealCancel(
@@ -3522,56 +3572,99 @@ export class Gateway {
   }
 
   /**
-   * POST /api/webhooks/v5-selfheal-release { repairId } — the v5 admin
-   * one-click release (design §C3; same trust chain as dispatch). Terminates on
-   * the broker's IN-PROCESS releaseApproved (release is never a socket action),
-   * which re-verifies the durable pending_release record + ancestry + denylist.
-   *
-   * HTTP mapping (BLOCKER1): the v5 side judges success by "2xx && body.ok &&
-   * body.status==='deployed'", so the broker outcome drives the status code
-   * (releaseHttpStatusFor: deployed→200, pending_release/rejected→409,
-   * in_progress→423, deploy_failed→500); store/internal exceptions → 503.
-   * The body is always JSON { ok, status, detail }.
+   * POST /api/webhooks/v5-selfheal-release (batch1b §3.1; same trust chain as
+   * dispatch) — DURABLE intake: verify → local fuse → LOCAL authority re-check →
+   * idempotent insert of a release job. A 202 means the job is on disk; the
+   * release worker deploys it asynchronously (release is no longer synchronous).
+   * 423 fuse / 409 authority_mismatch|conflict / 202 accepted; the body is JSON.
    */
   private async _handleSelfhealRelease(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const parsed = await this._readVerifiedSelfhealCommand(
-      req,
-      res,
-      SELFHEAL_RELEASE_WEBHOOK_PATH,
-      { requireIncidentId: false },
-    )
-    if (!parsed) return
-    const broker = this._selfhealBroker
-    if (!broker) {
-      this.sendJson(res, 503, {
-        ok: false,
-        status: 'error',
-        detail: { reason: 'selfheal broker not active' },
-      })
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
       return
     }
-    let resp: BrokerResponse
+    const cfg = this._selfhealReceiverCfg
+    if (!cfg) {
+      this.sendError(res, 503, 'selfheal receiver not configured')
+      return
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      this.sendError(res, 403, 'forbidden')
+      return
+    }
+    let rawBody: Buffer
     try {
-      resp = await broker.releaseApproved(parsed.repairId)
-    } catch (err) {
-      this.log.error('selfheal release crashed', { repairId: parsed.repairId }, err as Error)
-      this.sendJson(res, 503, { ok: false, status: 'error', detail: { reason: 'internal error' } })
+      rawBody = await this.readBinaryBody(req, cfg.maxBodyBytes)
+    } catch {
+      this.sendJson(res, 413, { error: 'payload too large' })
       return
     }
-    this.log.info('selfheal release (webhook)', { repairId: parsed.repairId, status: resp.status })
-    this.sendJson(res, releaseHttpStatusFor(resp), {
-      ok: resp.ok,
-      repairId: parsed.repairId,
-      status: resp.status,
-      detail: resp.detail ?? {},
-    })
+    const result = await receiveSelfhealRelease(
+      {
+        remoteAddress: req.socket.remoteAddress,
+        method: req.method,
+        path: SELFHEAL_RELEASE_WEBHOOK_PATH,
+        ts: firstHeader(req.headers['x-selfheal-ts']),
+        nonce: firstHeader(req.headers['x-selfheal-nonce']),
+        sig: firstHeader(req.headers['x-selfheal-sig']),
+        rawBody,
+      },
+      cfg,
+    )
+    this.sendJson(res, result.status, result.body)
+    // A 202 means the release job is durable — wake the release worker.
+    if (result.status === 202) this._selfhealReleaseWorker?.kick()
+  }
+
+  /**
+   * POST /api/webhooks/v5-selfheal-fuse-clear { repairId:"fuse", reason, clearedBy }
+   * (batch1b §3.3) — clear the LOCAL Tier2 release fuse (same HMAC trust chain).
+   */
+  private async _handleSelfhealFuseClear(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const cfg = this._selfhealReceiverCfg
+    if (!cfg) {
+      this.sendError(res, 503, 'selfheal receiver not configured')
+      return
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      this.sendError(res, 403, 'forbidden')
+      return
+    }
+    let rawBody: Buffer
+    try {
+      rawBody = await this.readBinaryBody(req, cfg.maxBodyBytes)
+    } catch {
+      this.sendJson(res, 413, { error: 'payload too large' })
+      return
+    }
+    const result = await receiveSelfhealFuseClear(
+      {
+        remoteAddress: req.socket.remoteAddress,
+        method: req.method,
+        path: SELFHEAL_FUSE_CLEAR_WEBHOOK_PATH,
+        ts: firstHeader(req.headers['x-selfheal-ts']),
+        nonce: firstHeader(req.headers['x-selfheal-nonce']),
+        sig: firstHeader(req.headers['x-selfheal-sig']),
+        rawBody,
+      },
+      cfg,
+    )
+    this.sendJson(res, result.status, result.body)
   }
 
   /**
    * POST /internal/selfheal/release { repairId } — root break-glass release:
-   * loopback + the personal-edition global token (checkHttpAuth). Same
-   * in-process releaseApproved terminal AND the same broker-outcome→HTTP
-   * mapping (BLOCKER1) as the signed webhook.
+   * loopback + the personal-edition global token (checkHttpAuth). Enqueues a
+   * durable local release job (origin='breakglass') from the committed cutover
+   * record — the release worker deploys it via the same lane as every other
+   * origin (batch1b §11). No synchronous deploy path remains.
    */
   private async _handleSelfhealBreakGlassRelease(
     req: IncomingMessage,
@@ -3605,30 +3698,42 @@ export class Gateway {
       this.sendJson(res, 400, { error: 'invalid body' })
       return
     }
-    const broker = this._selfhealBroker
-    if (!broker) {
-      this.sendJson(res, 503, {
+    // Freeze the deploy plan from the committed cutover record (400 if absent).
+    const plan = await readCommittedCutoverPlan(repairId)
+    if (!plan) {
+      this.sendJson(res, 400, {
         ok: false,
-        status: 'error',
-        detail: { reason: 'selfheal broker not active' },
+        error: 'no_committed_cutover',
+        detail: { reason: 'no committed cutover record for this repair' },
       })
       return
     }
-    let resp: BrokerResponse
-    try {
-      resp = await broker.releaseApproved(repairId)
-    } catch (err) {
-      this.log.error('selfheal release (break-glass) crashed', { repairId }, err as Error)
-      this.sendJson(res, 503, { ok: false, status: 'error', detail: { reason: 'internal error' } })
+    const repairJob = await getSelfhealJob(repairId)
+    const incidentId = repairJob?.incidentId ?? ''
+    if (!incidentId) {
+      this.sendJson(res, 400, { ok: false, error: 'no_incident_id' })
       return
     }
-    this.log.warn('selfheal release (break-glass)', { repairId, status: resp.status })
-    this.sendJson(res, releaseHttpStatusFor(resp), {
-      ok: resp.ok,
-      repairId,
-      status: resp.status,
-      detail: resp.detail ?? {},
-    })
+    const releaseRequestId = `breakglass-${repairId}-${Date.now()}`
+    try {
+      const enq = await enqueueReleaseJob({
+        repairId,
+        incidentId,
+        releaseRequestId,
+        origin: 'breakglass',
+        plan,
+      })
+      this.log.warn('selfheal release (break-glass) enqueued', {
+        repairId,
+        releaseRequestId,
+        outcome: enq.outcome,
+      })
+      this._selfhealReleaseWorker?.kick()
+      this.sendJson(res, 202, { ok: true, status: 'accepted', releaseRequestId })
+    } catch (err) {
+      this.log.error('selfheal release (break-glass) enqueue failed', { repairId }, err as Error)
+      this.sendJson(res, 503, { ok: false, status: 'error', detail: { reason: 'internal error' } })
+    }
   }
 
   private async _handleWechat(
