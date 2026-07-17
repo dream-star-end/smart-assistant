@@ -328,8 +328,11 @@ function buildServerTurnEvidence(serverRows: readonly ChatMessage[]): ServerTurn
   const turnPrefixes = new Set<string>();
   for (const m of serverRows) {
     if (!m || m._source !== "server" || !isGeneratedRole(m.role)) continue;
-    // v2 tape 展开行才有资格作证(原子落库证明);_turnTapeId 由 hydration 逐行盖章。
+    // 只有 **complete tape** 的展开行才有资格作证:_turnTapeId 在 rolling per-record 兼容路径
+    // (pre-release 逐行 refs)上也会被盖,单独存在不构成"整 turn 已原子落库"证明(Codex R2
+    // MAJOR);_turnTapeComplete 仅由 hydration 的 complete-anchor 分支盖章。
     if (typeof m._turnTapeId !== "string" || m._turnTapeId.length === 0) continue;
+    if (m._turnTapeComplete !== true) continue;
     if (typeof m._clientMessageId === "string" && m._clientMessageId.length > 0) {
       clientMessageIds.add(m._clientMessageId);
     }
@@ -372,18 +375,6 @@ function isCoveredStaleLocalRow(
   return matchesEvidenceTurnPrefix(m.id, evidence.turnPrefixes);
 }
 
-/** full 快照的删除授权(P1 缺席判定专用):调用方**必须**先过版本护栏(载荷 updatedAt ≥ 已应用
- *  水位)才可给出;maxSeq 用于豁免"晚于快照抵达"的行(增量先到、旧 full 后到的竞态窗口,
- *  orderSeq > 快照 maxSeq 的本地 server 行不是缺席,是快照没看到)。 */
-export interface FullSyncDeletionAuthority {
-  maxSeq: number;
-}
-
-function isBeyondSnapshot(m: ChatMessage, maxSeq: number): boolean {
-  const orderSeq =
-    typeof m._orderSeq === "number" && Number.isFinite(m._orderSeq) ? m._orderSeq : m._seq;
-  return typeof orderSeq === "number" && Number.isFinite(orderSeq) && orderSeq > maxSeq;
-}
 
 export function mergeFullServerWins(
   server: ChatMessage[],
@@ -391,8 +382,11 @@ export function mergeFullServerWins(
   archivedThroughSeq = 0,
   completedClientMessageId?: string,
   opts?: {
-    /** 见 FullSyncDeletionAuthority:仅在调用方已验证载荷版本(updatedAt ≥ 已应用水位)时给出。 */
-    deletionAuthority?: FullSyncDeletionAuthority;
+    /** P1 缺席删除授权:仅当调用方已过版本护栏(载荷带 updatedAt 且 ≥ 已应用水位;被证明过期
+     *  的载荷在 applyServerMessages 已整体丢弃,不会走到这里)时为 true。fresh full 的缺席权威
+     *  = 版本护栏 + id 缺席 + 归档水位保护,不做行级 seq 豁免(maxSeq 非单调且与 _orderSeq
+     *  跨轴,Codex R2 BLOCKER;"增量先到旧 full 晚到"竞态由整体丢弃闭合)。 */
+    deletionAuthority?: boolean;
     /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,活跃轮的行绝不被载荷自证清除)。 */
     activeClientMessageId?: string;
   },
@@ -421,12 +415,11 @@ export function mergeFullServerWins(
   local = local.filter((m) => {
     if (!m) return false;
     if (
-      opts?.deletionAuthority &&
+      opts?.deletionAuthority === true &&
       m._source === "server" &&
       m.id &&
       !serverIdsForAuthority.has(m.id) &&
-      !isArchivedServerRow(m, archivedThroughSeq) &&
-      !isBeyondSnapshot(m, opts.deletionAuthority.maxSeq)
+      !isArchivedServerRow(m, archivedThroughSeq)
     ) {
       return false;
     }

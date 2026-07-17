@@ -651,6 +651,10 @@ function hydrateTapeRecord(
   row: HydratedTapeRow,
   anchor: MessageLike,
   requireRecordHash: boolean,
+  /** true = 来自 complete anchor 的展开(整 turn 已原子落库)。前端同步权威传播(P2 载荷自证)
+   *  只认携带 `_turnTapeComplete:true` 的行作证——rolling per-record 兼容路径(pre-release
+   *  逐行 refs)同样有 _turnTapeId,但单行不构成整 turn 覆盖证明,不得盖此标记。 */
+  fromCompleteAnchor = false,
 ): MessageLike {
   const payloadBytes = Buffer.from(row.payload);
   const actualSha = sha256Bytes(payloadBytes);
@@ -699,6 +703,7 @@ function hydrateTapeRecord(
     _turnTapeMsgId: row.msg_id,
     _turnTapeSha256: row.tape_sha256,
     _turnTapeExpanded: true,
+    ...(fromCompleteAnchor ? { _turnTapeComplete: true } : {}),
     // A tape is one atomic sync unit. Expanded records intentionally share
     // its anchor sequence: partial sync either returns every record or none.
     ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
@@ -1109,12 +1114,12 @@ async function hydrateTurnTapeMessages(
           _turnTapeExpanded: true,
         }];
       }
-      if (!exact) return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false));
+      if (!exact) return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false, true));
       const expanded: MessageLike[] = [];
       const batchDescriptors: HydratedRuntimeBatchDescriptor[] = [];
       for (const row of tapeRows) {
         const result = expandHydratedRuntimeBatch(
-          hydrateTapeRecord(row, anchor, false),
+          hydrateTapeRecord(row, anchor, false, true),
           row,
           anchor,
         );

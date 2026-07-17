@@ -955,7 +955,7 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
 // _clientMessageId/排序轴)+ 已被服务端清理的高 orderSeq tail 行。
 // ---------------------------------------------------------------------------
 describe("sync authority propagation", () => {
-  const TAPE = { _source: "server" as const, _turnTapeId: "tape-1", _clientMessageId: "cm-1" };
+  const TAPE = { _source: "server" as const, _turnTapeId: "tape-1", _turnTapeComplete: true, _clientMessageId: "cm-1" };
   const cleanServer: ChatMessage[] = [
     { id: "u-1", role: "user", text: "复刻这个游戏", ts: 100, _seq: 1, _orderSeq: 1 },
     { id: "srv-peer-main-t1-thinking-s0", role: "thinking", text: "分析截图", ts: 200, _seq: 5, _orderSeq: 5, ...TAPE },
@@ -963,22 +963,24 @@ describe("sync authority propagation", () => {
     { id: "srv-peer-main-t1-tool-tb1", role: "tool", text: "创建游戏目录", ts: 220, _seq: 5, _orderSeq: 5, ...TAPE },
     { id: "srv-peer-main-t1-s1", role: "assistant", text: "已复刻完成,规则如下…", ts: 400, _seq: 5, _orderSeq: 5, ...TAPE },
   ];
-  const AUTH = { deletionAuthority: { maxSeq: 5 } };
+  const AUTH = { deletionAuthority: true };
   // 事故期缓存:旧代码铸的 live 行(无 _clientMessageId、无排序轴;含 bare 前缀 id 与 tool 后缀 id)
   const staleLiveRows: ChatMessage[] = [
     { id: "srv-peer-main-t1", role: "thinking", text: "分析截图", ts: 200 },
     { id: "srv-peer-main-t1", role: "assistant", text: "我来复刻这个游戏。", ts: 210 },
     { id: "srv-peer-main-t1-tool-oldtb", role: "tool", text: "创建游戏目录", ts: 220 },
   ];
-  // 已被服务端事故清理删掉的 tail 折叠行(_source server,高 orderSeq 但 ≤ 快照 maxSeq 才可删,
-  // 这里 orderSeq=2 ≤ maxSeq=5 → 属快照可见范围内的缺席)
-  const deletedTailRow: ChatMessage = {
-    id: "srv-peer-tail_abc-t1-runtime-10528", role: "runtime-event" as ChatMessage["role"],
-    text: "", ts: 300, _seq: 2, _orderSeq: 2, _source: "server",
-  };
+  // 已被服务端事故清理删掉的 tail 折叠行(_source server)。事故真实形态:_seq 乱序且**高于**
+  // 主 anchor(13,6,7…),部分行无 _orderSeq —— 版本护栏语义下缺席即删,无行级 seq 豁免。
+  const deletedTailRows: ChatMessage[] = [
+    { id: "srv-peer-tail_abc-t1-runtime-10528", role: "runtime-event" as ChatMessage["role"], text: "", ts: 300, _seq: 2, _orderSeq: 2, _source: "server" },
+    { id: "srv-peer-tail_def-t1-runtime-10531", role: "runtime-event" as ChatMessage["role"], text: "", ts: 301, _seq: 13, _source: "server" },
+    { id: "srv-peer-tail_ghi-t1-runtime-10532", role: "runtime-event" as ChatMessage["role"], text: "", ts: 302, _seq: 6, _source: "server" },
+  ];
+  const deletedTailRow = deletedTailRows[0];
 
   test("事故缓存全愈:P2 前缀证据清 legacy live 行(bare/thinking/tool 后缀),P1 授权下清 server 已删行,最终=server 序", () => {
-    const local = [cleanServer[0], ...staleLiveRows, deletedTailRow];
+    const local = [cleanServer[0], ...staleLiveRows, ...deletedTailRows];
     const merged = mergeFullServerWins(cleanServer, local, 0, undefined, AUTH);
     expect(merged.map((m) => m.id)).toEqual(cleanServer.map((m) => m.id));
   });
@@ -996,12 +998,6 @@ describe("sync authority propagation", () => {
   test("P1 无版本授权不删(BLOCKER 竞态):旧 full 快照晚到时 server 行缺席≠删除", () => {
     const merged = mergeFullServerWins(cleanServer, [cleanServer[0], deletedTailRow]);
     expect(merged.some((m) => m.id === deletedTailRow.id)).toBe(true);
-  });
-
-  test("P1 maxSeq 豁免:orderSeq 晚于快照的本地 server 行(增量先到)不被旧快照缺席误删", () => {
-    const lateRow: ChatMessage = { id: "srv-peer-main-t2-s0", role: "assistant", text: "新回复", ts: 500, _seq: 9, _orderSeq: 9, _source: "server" };
-    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], lateRow], 0, undefined, AUTH);
-    expect(merged.some((m) => m.id === "srv-peer-main-t2-s0")).toBe(true);
   });
 
   test("活跃轮守卫:REST 已回终态、WS 仍在途——活跃 clientMessageId 的行双通道都不清", () => {
