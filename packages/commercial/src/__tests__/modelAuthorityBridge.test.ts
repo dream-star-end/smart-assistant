@@ -113,9 +113,25 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   ];
+  // kimi-k3:角色分档窗口投影(modelRolePolicy)的靶模型 —— 机制窗口 1M,
+  // 签发时 admin 原样 / user 收窄 500k(见「角色分档窗口投影」describe)。
+  entries.push(
+    entry({
+      entryId: 9,
+      modelId: "kimi-k3",
+      providerId: "moonshot",
+      contextWindow: 1_048_576,
+      capabilityProfile: {
+        supportsVision: true,
+        reasoning: { supported: [], codexModelDefault: null },
+        ccb: { capabilityZero: true, supportsThinking: true },
+      },
+    }),
+  );
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
+    ["kimi-k3", price("kimi-k3")],
   ]);
   if (auxState !== "absent") {
     entries.push(
@@ -282,8 +298,8 @@ async function stopRig(rig: Rig): Promise<void> {
   await new Promise<void>((r) => rig.gateway.close(() => r()));
 }
 
-async function openClient(port: number): Promise<WebSocket> {
-  const { token } = await signAccess({ sub: String(UID), role: "user" }, JWT_SECRET);
+async function openClient(port: number, role: "user" | "admin" = "user"): Promise<WebSocket> {
+  const { token } = await signAccess({ sub: String(UID), role }, JWT_SECRET);
   const ws = new WebSocket(`ws://127.0.0.1:${port}${BRIDGE_WS_PATH}`, ["bearer", token]);
   await new Promise<void>((r, j) => {
     ws.once("open", () => r());
@@ -413,6 +429,26 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     // frame.model 必须已归一 —— 容器会断言 canonicalModel === frame.model。
     assert.equal(f.model, payload.canonicalModel);
     ws.close();
+  });
+
+  test("角色分档窗口投影:kimi-k3 user 签 512000,admin 签 1048576;glm-5.2 不受影响", async () => {
+    // modelRolePolicy 的签发边界落点:descriptor.contextWindow 按连接角色收窄,
+    // 驱动 CCB auto-compact —— 这是"admin 1M / 其他 500k"的实际执行面。
+    const grab = async (role: "user" | "admin", model: string): Promise<number | null> => {
+      rig.containerSeen.length = 0;
+      const ws = await openClient(rig.port, role);
+      ws.send(inboundFrame({ model }));
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      const f = firstInbound(rig.containerSeen);
+      const bundle = f[MODEL_AUTHORITY_FIELD] as { authority: string };
+      const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+      ws.close();
+      return payload.executionDescriptor.contextWindow;
+    };
+    assert.equal(await grab("user", "kimi-k3"), 512_000);
+    assert.equal(await grab("admin", "kimi-k3"), 1_048_576);
+    // 未登记模型不受策略影响(哪个角色都拿机制窗口)
+    assert.equal(await grab("user", "glm-5.2"), 200_000);
   });
 
   test("ccb turn:auxModels = 平台次级模型集合(WebFetch/WebSearch 的隐藏调用能过 egress)", async () => {
