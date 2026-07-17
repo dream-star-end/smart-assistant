@@ -166,20 +166,28 @@ export async function listDeclarativeManagement(
     `WITH active_install AS (
        SELECT i.slug, i.version_id, i.artifact_hash
          FROM marketplace_installs i
-         JOIN marketplace_skill_listings l ON l.slug = i.slug AND l.kind = 'connector'
+         JOIN marketplace_skill_listings l ON l.slug = i.slug
+          AND l.kind = 'connector' AND l.plugin_type = 'declarative-http'
         WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
      ), wanted AS (
        SELECT unnest($2::text[]) AS slug
        UNION
        SELECT slug FROM active_install
        UNION
-       SELECT provider AS slug FROM connections
-        WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
+       SELECT c.provider AS slug
+         FROM connections c
+         JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
+         JOIN marketplace_skill_listings l ON l.slug = v.slug
+          AND l.kind = 'connector' AND l.plugin_type = 'declarative-http'
+        WHERE c.user_id = $1 AND c.revoked_at IS NULL
      ), binding_count AS (
-       SELECT provider AS slug, count(*)::text AS n
-         FROM connections
-        WHERE user_id = $1 AND revoked_at IS NULL AND connector_version_id IS NOT NULL
-        GROUP BY provider
+       SELECT c.provider AS slug, count(*)::text AS n
+         FROM connections c
+         JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
+         JOIN marketplace_skill_listings l ON l.slug = v.slug
+          AND l.kind = 'connector' AND l.plugin_type = 'declarative-http'
+        WHERE c.user_id = $1 AND c.revoked_at IS NULL
+        GROUP BY c.provider
      )
      SELECT w.slug, l.state,
             cv.id::text AS latest_version_id, cv.version AS latest_version,
@@ -191,7 +199,8 @@ export async function listDeclarativeManagement(
             ai.artifact_hash AS installed_artifact_hash, cv.artifact_hash AS latest_artifact_hash,
             COALESCE(bc.n, '0') AS connection_count
        FROM wanted w
-       LEFT JOIN marketplace_skill_listings l ON l.slug = w.slug AND l.kind = 'connector'
+       LEFT JOIN marketplace_skill_listings l ON l.slug = w.slug
+        AND l.kind = 'connector' AND l.plugin_type = 'declarative-http'
        LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
        LEFT JOIN active_install ai ON ai.slug = w.slug
        LEFT JOIN marketplace_skill_versions iv ON iv.id = ai.version_id
