@@ -719,6 +719,7 @@ export class AuthoritySigner {
       auxModels,
       securityEpoch: input.securityEpoch,
       connectionChallenge: input.connectionChallenge,
+      originalIssuedAt: now,
       issuedAt: now,
       expiresAt: now + (opts.leaseTtlMs ?? TURN_LEASE_TTL_MS),
     }

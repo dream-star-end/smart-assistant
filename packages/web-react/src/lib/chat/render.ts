@@ -289,11 +289,121 @@ const ERROR_LABELS: Record<string, string> = {
   model_catalog_unavailable: "模型服务暂时不可用",
   stopped: "已停止本轮生成",
   internal_error: "服务内部错误",
+  auth_error: "认证状态异常",
+  engine_error: "任务执行失败",
+  model_authority_expired: "本轮已自动免单",
+  liveness_timeout: "本轮已自动免单",
+  idle_timeout: "本轮已自动免单",
+  no_response: "本轮已自动免单",
+  phantom_turn: "本轮已自动免单",
+  turn_limit: "本轮已自动免单",
 };
 export function errorLabel(code: string | undefined): string {
   if (!code) return "出错了";
   // 未知码回退友好"出错了"(不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
-  return ERROR_LABELS[code] ?? "出错了";
+  return ERROR_LABELS[code.trim().toLowerCase()] ?? "出错了";
+}
+
+const WAIVED_ERROR_CODES = new Set([
+  "model_authority_expired",
+  "liveness_timeout",
+  "idle_timeout",
+  "no_response",
+  "phantom_turn",
+  "turn_limit",
+]);
+
+function requestReference(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (!value) continue;
+    const labelled = /(?:请求|request|trace)[ _-]?(?:id)?[：:=\s]+([A-Za-z0-9_-]{8,64})/i.exec(value)?.[1];
+    if (labelled) return labelled;
+    const trace = /\b[0-9a-f]{32}\b/i.exec(value)?.[0];
+    if (trace) return trace;
+  }
+  return undefined;
+}
+
+function looksLikeInternalError(value: string | undefined): boolean {
+  if (!value) return false;
+  return (
+    /^\s*[\[{]/.test(value) ||
+    /MODEL_AUTHORITY_INVALID|API Error|"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(/i.test(value)
+  );
+}
+
+export type ErrorPresentation = {
+  title: string;
+  message: string;
+  detail?: string;
+  waived: boolean;
+};
+
+/** Render-time privacy/UX boundary for both new and already-persisted errors. */
+export function errorPresentation(
+  code: string | undefined,
+  text: string | undefined,
+  detail: string | undefined,
+  waiverApplied = false,
+): ErrorPresentation {
+  let normalized = code?.trim().toLowerCase() ?? "";
+  if (/MODEL_AUTHORITY_INVALID|MODEL_AUTHORITY_EXPIRED/i.test(`${code ?? ""}\n${text ?? ""}\n${detail ?? ""}`)) {
+    normalized = "model_authority_expired";
+  }
+  const waiverEligible = WAIVED_ERROR_CODES.has(normalized);
+  const ref = requestReference(detail, text);
+  if (waiverEligible && waiverApplied) {
+    const message = normalized === "turn_limit"
+      ? "任务达到 12 小时运行上限，系统已中断。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。"
+      : normalized === "liveness_timeout" || normalized === "idle_timeout"
+        ? "任务长时间没有新输出，系统已中断。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。"
+        : normalized === "no_response" || normalized === "phantom_turn"
+          ? "任务未能产生有效回复。本轮未扣费，并已发送站内信说明。"
+          : "长任务的执行凭证未能继续。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。你可以重新尝试。";
+    return {
+      title: "本轮已自动免单",
+      message,
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: true,
+    };
+  }
+  if (waiverEligible) {
+    const message = normalized === "turn_limit"
+      ? "任务达到 12 小时运行上限，系统已中断。你可以重新尝试。"
+      : normalized === "liveness_timeout" || normalized === "idle_timeout"
+        ? "任务长时间没有新输出，系统已中断。你可以重新尝试。"
+        : normalized === "no_response" || normalized === "phantom_turn"
+          ? "任务未能产生有效回复。你可以重新尝试。"
+          : "长任务的执行凭证未能继续。你的消息已保留，可以重新尝试。";
+    return {
+      title: "任务未正常完成",
+      message,
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: false,
+    };
+  }
+  if (normalized === "auth_error") {
+    return {
+      title: ERROR_LABELS.auth_error,
+      message: "认证状态异常，本轮未正常完成。请重新尝试。",
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: false,
+    };
+  }
+  if (normalized === "engine_error" && (looksLikeInternalError(text) || looksLikeInternalError(detail))) {
+    return {
+      title: ERROR_LABELS.engine_error,
+      message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: false,
+    };
+  }
+  return {
+    title: errorLabel(code),
+    message: text?.trim() || "本轮未正常完成，请重试。",
+    ...(detail?.trim() ? { detail: detail.trim() } : {}),
+    waived: false,
+  };
 }
 
 /**

@@ -1,15 +1,16 @@
-import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { describe, test } from "node:test";
 import type { Pool, PoolClient } from "pg";
-import { refundSessionWindow } from "../billing/refund.js";
+
+import { applyTurnWaiver } from "../billing/refund.js";
 
 /**
- * 退款按原桶冲正的核心不变量(P0 资损/套现回归门):
- *   - org_wallet/org_period 的扣费**只能退回 org**(ledger bucket=org_*、org_id 保留),
- *     绝不写成个人 wallet 桶 —— 否则等于把企业池的钱铸造成成员个人积分。
- *   - org 已停用(orgs FOR UPDATE 空)且无可退目标 → 跳过 + skippedOrgCredits 计数,绝不落个人钱包。
- *   - 个人 wallet/period 桶行为不变。
- *   - user_subscriptions 选择谓词含 period_end > NOW()(P1-1:防退款打进过期未轮转桶被清零)。
+ * Exact-turn auto-waiver money invariants:
+ *   - only turn_key / parent_turn_key locate debits (never a session/time window);
+ *   - every debit returns to the original owner and bucket, with an inactive
+ *     org still receiving its own money;
+ *   - refund, one targeted inbox receipt and pending→applied commit together;
+ *   - retries are idempotent, including zero-debit waived turns.
  */
 
 interface DebitInput {
@@ -19,149 +20,323 @@ interface DebitInput {
   org_id: string | null;
 }
 
+interface WaiverState {
+  id: string;
+  reason: "idle_timeout";
+  status: "pending" | "applied";
+  refundedCredits: bigint;
+  recordCount: number;
+  inboxMessageId: string | null;
+}
+
 interface FakeState {
   debits: DebitInput[];
   wallet: bigint;
-  userSub: { id: string; period_credits: string } | null;
-  orgs: Map<string, bigint | null>; // null = org 非 active(FOR UPDATE 空)
-  orgSubs: Map<string, { id: string; period_credits: string } | null>;
+  userSub: { id: string; period: bigint } | null;
+  /** Missing key means an impossible dangling historical org reference. */
+  orgs: Map<string, bigint>;
+  orgSubs: Map<string, { id: string; period: bigint } | null>;
+  waiver?: WaiverState;
 }
 
 interface Captured {
-  ledgerInserts: Array<{ bucket: string; org_id: string | null; delta: string; memo: string }>;
-  updates: Array<{ sql: string; params: readonly unknown[] }>;
+  ledgerInserts: Array<{
+    bucket: string;
+    orgId: string | null;
+    delta: bigint;
+    usageId: string;
+    memo: string;
+  }>;
+  inboxInserts: Array<{
+    audience: string;
+    userId: string;
+    title: string;
+    body: string;
+    notifyEmail: boolean;
+    sourceType: string;
+    sourceId: string;
+    sourcePhase: string;
+  }>;
   sqlSeen: string[];
+  commits: number;
+  rollbacks: number;
 }
 
-function makeFakePool(state: FakeState): { pool: Pool; cap: Captured } {
-  const cap: Captured = { ledgerInserts: [], updates: [], sqlSeen: [] };
+function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: Captured } {
+  const state = initial;
+  const cap: Captured = {
+    ledgerInserts: [],
+    inboxInserts: [],
+    sqlSeen: [],
+    commits: 0,
+    rollbacks: 0,
+  };
+  let nextInboxId = 900n;
+
   const client: PoolClient = {
-    async query(sql: any, params?: any): Promise<any> {
+    async query(sql: any, params: readonly unknown[] = []): Promise<any> {
       const text = typeof sql === "string" ? sql : sql.text;
-      cap.sqlSeen.push(text);
       const t = text.replace(/\s+/g, " ").trim();
-      if (/^BEGIN|^COMMIT|^ROLLBACK/.test(t)) return { rowCount: 0, rows: [] };
+      cap.sqlSeen.push(t);
+      if (t === "BEGIN") return { rowCount: 0, rows: [] };
+      if (t === "COMMIT") {
+        cap.commits++;
+        return { rowCount: 0, rows: [] };
+      }
+      if (t === "ROLLBACK") {
+        cap.rollbacks++;
+        return { rowCount: 0, rows: [] };
+      }
       if (/pg_advisory_xact_lock/.test(t)) return { rowCount: 1, rows: [{}] };
-      if (/FROM usage_records ur JOIN credit_ledger/.test(t)) {
+
+      if (/FROM turn_waivers WHERE user_id = \$1 AND turn_key = \$2 FOR UPDATE/.test(t)) {
+        const w = state.waiver;
+        return w
+          ? {
+              rowCount: 1,
+              rows: [{
+                id: w.id,
+                reason: w.reason,
+                status: w.status,
+                refunded_credits: w.refundedCredits.toString(),
+                record_count: w.recordCount,
+                inbox_message_id: w.inboxMessageId,
+              }],
+            }
+          : { rowCount: 0, rows: [] };
+      }
+      if (/^INSERT INTO turn_waivers /.test(t)) {
+        state.waiver = {
+          id: "71",
+          reason: "idle_timeout",
+          status: "pending",
+          refundedCredits: 0n,
+          recordCount: 0,
+          inboxMessageId: null,
+        };
+        return {
+          rowCount: 1,
+          rows: [{
+            id: "71",
+            reason: "idle_timeout",
+            status: "pending",
+            refunded_credits: "0",
+            record_count: 0,
+            inbox_message_id: null,
+          }],
+        };
+      }
+      if (/FROM usage_records ur JOIN credit_ledger cl/.test(t)) {
         return { rowCount: state.debits.length, rows: state.debits };
       }
-      if (/FROM orgs WHERE id = \$1::bigint AND status = 'active' FOR UPDATE/.test(t)) {
-        const c = state.orgs.get(String(params[0]));
-        return c === null || c === undefined ? { rowCount: 0, rows: [] } : { rowCount: 1, rows: [{ credits: c.toString() }] };
+      if (/FROM orgs WHERE id=\$1::bigint FOR UPDATE/.test(t)) {
+        const credits = state.orgs.get(String(params[0]));
+        return credits === undefined
+          ? { rowCount: 0, rows: [] }
+          : { rowCount: 1, rows: [{ credits: credits.toString() }] };
       }
-      if (/FROM org_subscriptions WHERE org_id/.test(t)) {
-        const s = state.orgSubs.get(String(params[0]));
-        return s ? { rowCount: 1, rows: [s] } : { rowCount: 0, rows: [] };
+      if (/FROM org_subscriptions WHERE org_id=\$1::bigint/.test(t)) {
+        const sub = state.orgSubs.get(String(params[0]));
+        return sub
+          ? { rowCount: 1, rows: [{ id: sub.id, period_credits: sub.period.toString() }] }
+          : { rowCount: 0, rows: [] };
       }
-      if (/FROM users WHERE id = \$1 FOR UPDATE/.test(t)) {
+      if (/SELECT credits::text AS credits FROM users WHERE id=\$1 FOR UPDATE/.test(t)) {
         return { rowCount: 1, rows: [{ credits: state.wallet.toString() }] };
       }
-      if (/FROM user_subscriptions WHERE user_id/.test(t)) {
-        return state.userSub ? { rowCount: 1, rows: [state.userSub] } : { rowCount: 0, rows: [] };
+      if (/FROM user_subscriptions WHERE user_id=\$1/.test(t)) {
+        return state.userSub
+          ? {
+              rowCount: 1,
+              rows: [{ id: state.userSub.id, period_credits: state.userSub.period.toString() }],
+            }
+          : { rowCount: 0, rows: [] };
       }
       if (/^INSERT INTO credit_ledger/.test(t)) {
-        // 参数序:user_id, delta, balance_after, bucket, usageId, memo, org_id
         cap.ledgerInserts.push({
-          delta: String(params[1]),
+          delta: BigInt(String(params[1])),
           bucket: String(params[3]),
+          usageId: String(params[4]),
           memo: String(params[5]),
-          org_id: params[6] == null ? null : String(params[6]),
+          orgId: params[6] == null ? null : String(params[6]),
         });
         return { rowCount: 1, rows: [] };
       }
-      if (/^UPDATE /.test(t)) {
-        cap.updates.push({ sql: t, params });
+      if (/^UPDATE users SET credits=\$1 WHERE id=\$2/.test(t)) {
+        state.wallet = BigInt(String(params[0]));
         return { rowCount: 1, rows: [] };
       }
-      throw new Error(`fake: unhandled SQL: ${t.slice(0, 90)}`);
+      if (/^UPDATE user_subscriptions SET period_credits=\$1/.test(t)) {
+        assert.ok(state.userSub);
+        state.userSub.period = BigInt(String(params[0]));
+        return { rowCount: 1, rows: [] };
+      }
+      if (/^UPDATE orgs SET credits=\$1/.test(t)) {
+        state.orgs.set(String(params[1]), BigInt(String(params[0])));
+        return { rowCount: 1, rows: [] };
+      }
+      if (/^UPDATE org_subscriptions SET period_credits=\$1/.test(t)) {
+        const entry = [...state.orgSubs.entries()].find(([, sub]) => sub?.id === String(params[1]));
+        assert.ok(entry?.[1]);
+        entry[1].period = BigInt(String(params[0]));
+        return { rowCount: 1, rows: [] };
+      }
+      if (/^INSERT INTO inbox_messages/.test(t)) {
+        const id = (nextInboxId++).toString();
+        cap.inboxInserts.push({
+          audience: "user",
+          userId: String(params[0]),
+          title: "本轮已自动免单",
+          body: String(params[1]),
+          notifyEmail: false,
+          sourceType: "turn_waive",
+          sourceId: String(params[2]),
+          sourcePhase: "receipt",
+        });
+        return { rowCount: 1, rows: [{ id }] };
+      }
+      if (/^UPDATE turn_waivers SET status='applied'/.test(t)) {
+        assert.ok(state.waiver);
+        state.waiver.status = "applied";
+        state.waiver.refundedCredits = BigInt(String(params[1]));
+        state.waiver.recordCount = Number(params[2]);
+        state.waiver.inboxMessageId = String(params[3]);
+        return { rowCount: 1, rows: [] };
+      }
+      if (/SELECT \(u\.credits \+ COALESCE/.test(t)) {
+        const total = state.wallet + (state.userSub?.period ?? 0n);
+        return { rowCount: 1, rows: [{ total: total.toString() }] };
+      }
+      throw new Error(`fake: unhandled SQL: ${t}`);
     },
     release() {},
   } as unknown as PoolClient;
-  const pool = { async connect() { return client; } } as unknown as Pool;
-  return { pool, cap };
+  return {
+    state,
+    cap,
+    pool: { async connect() { return client; } } as unknown as Pool,
+  };
 }
 
-const baseInput = { userId: 7n, sessionId: "sess-1", sinceMs: 1000, memo: "waive:idle_timeout" };
+const TURN_KEY = "a".repeat(64);
+const input = { userId: 7n, turnKey: TURN_KEY, reason: "idle_timeout" as const };
 
-describe("refundSessionWindow — 按原桶冲正", () => {
-  test("P0:org_wallet 扣费退回 org,不写个人 wallet 桶 ledger", async () => {
-    const { pool, cap } = makeFakePool({
-      debits: [{ usage_id: "u1", bucket: "org_wallet", delta: "-500", org_id: "5" }],
-      wallet: 200n,
-      userSub: null,
-      orgs: new Map([["5", 1000n]]),
-      orgSubs: new Map([["5", null]]),
+describe("applyTurnWaiver — exact owner/bucket reversal + inbox receipt", () => {
+  test("personal period+wallet debits reverse exactly and create one targeted no-email receipt", async () => {
+    const { pool, state, cap } = makeFakePool({
+      debits: [
+        { usage_id: "u1", bucket: "period", delta: "-40", org_id: null },
+        { usage_id: "u1", bucket: "wallet", delta: "-60", org_id: null },
+      ],
+      wallet: 10n,
+      userSub: { id: "51", period: 20n },
+      orgs: new Map(),
+      orgSubs: new Map(),
     });
-    const r = await refundSessionWindow(pool, baseInput);
-    assert.equal(r.refundedCredits, 500n);
-    assert.equal(r.skippedOrgCredits, 0n);
-    // 唯一 ledger 行必须是 org_wallet + org_id=5,绝不是个人 wallet
-    assert.equal(cap.ledgerInserts.length, 1);
-    assert.equal(cap.ledgerInserts[0]!.bucket, "org_wallet");
-    assert.equal(cap.ledgerInserts[0]!.org_id, "5");
-    // orgs 被 +500;个人 wallet 写回原值(未被 org 钱膨胀)
-    const orgUpd = cap.updates.find((u) => /UPDATE orgs SET credits/.test(u.sql));
-    assert.ok(orgUpd, "org.credits 应被更新");
-    assert.equal(String(orgUpd!.params[0]), "1500");
-    const userUpd = cap.updates.find((u) => /UPDATE users SET credits/.test(u.sql));
-    assert.equal(String(userUpd!.params[0]), "200", "个人钱包必须保持原值 200,不得被 org 退款膨胀");
+
+    const result = await applyTurnWaiver(pool, input);
+    assert.equal(result.newlyApplied, true);
+    assert.equal(result.refundedCredits, 100n);
+    assert.equal(result.recordCount, 1);
+    assert.equal(state.wallet, 70n);
+    assert.equal(state.userSub?.period, 60n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.delta]), [
+      ["period", 40n],
+      ["wallet", 60n],
+    ]);
+    assert.equal(cap.inboxInserts.length, 1);
+    assert.deepEqual(cap.inboxInserts[0], {
+      audience: "user",
+      userId: "7",
+      title: "本轮已自动免单",
+      body: "由于任务长时间没有新输出，本轮已自动免单，并退还 **100 积分**。积分已按原扣费来源退回个人或组织额度。你可以回到原会话重新尝试。",
+      notifyEmail: false,
+      sourceType: "turn_waive",
+      sourceId: "71",
+      sourcePhase: "receipt",
+    });
+    assert.equal(state.waiver?.status, "applied");
+    assert.equal(cap.commits, 1);
   });
 
-  test("P0:org_period 有 active org 订阅 → 退回 org 期内桶,不落个人", async () => {
-    const { pool, cap } = makeFakePool({
+  test("suspended/inactive org still receives org money; period falls back only within same org", async () => {
+    const { pool, state, cap } = makeFakePool({
+      debits: [
+        { usage_id: "u1", bucket: "org_period", delta: "-300", org_id: "5" },
+        { usage_id: "u2", bucket: "org_wallet", delta: "-200", org_id: "5" },
+      ],
+      wallet: 9n,
+      userSub: null,
+      // Refund deliberately has no status predicate; 5 may be suspended.
+      orgs: new Map([["5", 1_000n]]),
+      orgSubs: new Map([["5", null]]),
+    });
+
+    const result = await applyTurnWaiver(pool, input);
+    assert.equal(result.refundedCredits, 500n);
+    assert.equal(state.orgs.get("5"), 1_500n);
+    assert.equal(state.wallet, 9n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.orgId, r.delta]), [
+      ["org_wallet", "5", 300n],
+      ["org_wallet", "5", 200n],
+    ]);
+    assert.match(cap.ledgerInserts[0]!.memo, /org_period→org_wallet/);
+    const orgSelect = cap.sqlSeen.find((sql) => /FROM orgs WHERE id=\$1::bigint FOR UPDATE/.test(sql));
+    assert.ok(orgSelect);
+    assert.doesNotMatch(orgSelect, /status='active'/);
+  });
+
+  test("active org period debit returns to the original org period bucket", async () => {
+    const { pool, state, cap } = makeFakePool({
       debits: [{ usage_id: "u1", bucket: "org_period", delta: "-300", org_id: "5" }],
       wallet: 0n,
       userSub: null,
-      orgs: new Map([["5", 1000n]]),
-      orgSubs: new Map([["5", { id: "88", period_credits: "700" }]]),
+      orgs: new Map([["5", 1_000n]]),
+      orgSubs: new Map([["5", { id: "88", period: 700n }]]),
     });
-    const r = await refundSessionWindow(pool, baseInput);
-    assert.equal(r.refundedCredits, 300n);
-    assert.equal(cap.ledgerInserts[0]!.bucket, "org_period");
-    assert.equal(cap.ledgerInserts[0]!.org_id, "5");
-    const subUpd = cap.updates.find((u) => /UPDATE org_subscriptions SET period_credits/.test(u.sql));
-    assert.ok(subUpd);
-    assert.equal(String(subUpd!.params[0]), "1000", "org 期内桶 700+300");
+
+    await applyTurnWaiver(pool, input);
+    assert.equal(state.orgSubs.get("5")?.period, 1_000n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.orgId]), [["org_period", "5"]]);
   });
 
-  test("P0:org 已停用(orgs 空)→ 跳过,skippedOrgCredits 计数,绝不落个人钱包", async () => {
+  test("zero-debit waiver still commits one receipt; retry creates neither ledger nor inbox duplicates", async () => {
     const { pool, cap } = makeFakePool({
-      debits: [{ usage_id: "u1", bucket: "org_wallet", delta: "-400", org_id: "9" }],
-      wallet: 100n,
-      userSub: null,
-      orgs: new Map([["9", null]]), // 非 active
-      orgSubs: new Map([["9", null]]),
-    });
-    const r = await refundSessionWindow(pool, baseInput);
-    assert.equal(r.refundedCredits, 0n, "无可退 → 不退");
-    assert.equal(r.skippedOrgCredits, 400n);
-    assert.equal(cap.ledgerInserts.length, 0, "不得写任何退款 ledger");
-    // refunded=0 → 整体 ROLLBACK,个人钱包绝不被 org 退款触碰
-    assert.ok(!cap.updates.some((u) => /UPDATE users SET credits/.test(u.sql)), "不得写个人钱包");
-  });
-
-  test("个人 wallet 桶行为不变(回归)", async () => {
-    const { pool, cap } = makeFakePool({
-      debits: [{ usage_id: "u1", bucket: "wallet", delta: "-150", org_id: null }],
-      wallet: 100n,
+      debits: [],
+      wallet: 25n,
       userSub: null,
       orgs: new Map(),
       orgSubs: new Map(),
     });
-    const r = await refundSessionWindow(pool, baseInput);
-    assert.equal(r.refundedCredits, 150n);
-    assert.equal(cap.ledgerInserts[0]!.bucket, "wallet");
-    const userUpd = cap.updates.find((u) => /UPDATE users SET credits/.test(u.sql));
-    assert.equal(String(userUpd!.params[0]), "250", "个人钱包 100+150");
+
+    const first = await applyTurnWaiver(pool, input);
+    const second = await applyTurnWaiver(pool, input);
+    assert.equal(first.newlyApplied, true);
+    assert.equal(first.refundedCredits, 0n);
+    assert.equal(second.newlyApplied, false);
+    assert.equal(second.inboxMessageId, first.inboxMessageId);
+    assert.equal(cap.ledgerInserts.length, 0);
+    assert.equal(cap.inboxInserts.length, 1);
+    assert.match(cap.inboxInserts[0]!.body, /没有实际扣除积分/);
   });
 
-  test("P1-1:user_subscriptions 选择谓词含 period_end > NOW()", async () => {
+  test("locator is exact turn/parent-turn only, and a missing referenced org rolls back fail-closed", async () => {
     const { pool, cap } = makeFakePool({
-      debits: [{ usage_id: "u1", bucket: "wallet", delta: "-10", org_id: null }],
-      wallet: 0n, userSub: null, orgs: new Map(), orgSubs: new Map(),
+      debits: [{ usage_id: "u1", bucket: "org_wallet", delta: "-10", org_id: "999" }],
+      wallet: 50n,
+      userSub: null,
+      orgs: new Map(),
+      orgSubs: new Map(),
     });
-    await refundSessionWindow(pool, baseInput);
-    const usSql = cap.sqlSeen.find((s) => /FROM user_subscriptions WHERE user_id/.test(s.replace(/\s+/g, " ")));
-    assert.ok(usSql && /period_end > NOW\(\)/.test(usSql.replace(/\s+/g, " ")), "退款须与 spend 谓词对齐");
+
+    await assert.rejects(() => applyTurnWaiver(pool, input), /referenced org 999 is missing/);
+    const debitQuery = cap.sqlSeen.find((sql) => /FROM usage_records ur JOIN credit_ledger cl/.test(sql));
+    assert.ok(debitQuery);
+    assert.match(debitQuery, /ur\.turn_key = \$2 OR ur\.parent_turn_key = \$2/);
+    assert.doesNotMatch(debitQuery, /session_id|created_at/);
+    assert.equal(cap.ledgerInserts.length, 0);
+    assert.equal(cap.inboxInserts.length, 0);
+    assert.equal(cap.commits, 0);
+    assert.equal(cap.rollbacks, 1);
   });
 });

@@ -606,7 +606,7 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
     assert.equal(ins.params?.[2], null, "codex 记账 account_id 必须是 NULL");
   });
 
-  test("usage_records.session_id = engineSessionId(退款窗口口径)", async () => {
+  test("usage_records.session_id = engineSessionId(稳定会话口径)", async () => {
     const { poolCtrl, ctx } = await makeFixture();
     const fz = makeCodexFinalizer(ctx);
     await fz.commit(usage(100, 100), "success");

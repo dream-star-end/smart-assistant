@@ -329,6 +329,12 @@ describe("settleDurableCodexBilling", () => {
         if (["BEGIN", "COMMIT", "ROLLBACK"].includes(trimmed)) {
           return { rows: [], rowCount: 0 };
         }
+        if (trimmed.startsWith("SELECT pg_advisory_xact_lock")) {
+          return { rows: [{}], rowCount: 1 };
+        }
+        if (trimmed.startsWith("SELECT 1 FROM turn_waivers")) {
+          return { rows: [], rowCount: 0 };
+        }
         if (trimmed.startsWith("SELECT m.org_id")) return { rows: [], rowCount: 0 };
         if (trimmed.startsWith("INSERT INTO usage_records")) {
           return { rows: [{ id: "100" }], rowCount: 1 };

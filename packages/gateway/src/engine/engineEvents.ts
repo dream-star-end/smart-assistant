@@ -179,11 +179,10 @@ export interface EngineBillingEvent extends DurableCodexBilling {
   parentTurnKey?: string
   parentSessionId?: string
   delegateAgentId?: string
-  /** engine-reported 计费的稳定记账键 = engine/engineSessionId.ts 的
+  /** engine-reported 计费的稳定会话维度 = engine/engineSessionId.ts 的
    *  `engineSessionId(sessionKey)`(唯一 helper,禁止各处自行 hash)。M2 双钱包
-   *  settle 落 usage_records.session_id 与 idle-timeout turn-waive 上报都用它 ——
-   *  不用 containerId/threadId 占位(refund.ts 按 session_id 圈退款窗口)。
-   *  master 侧用它圈定退款窗口。 */
+   *  settle 用它落 usage_records.session_id；免单则独立按 turnKey /
+   *  parentTurnKey 精确归因。 */
   // Issue A v1.0.108 — codex account/rateLimits/updated 快照,piggy-back 到 billing
   // 终态帧让 master.userChatBridge 落库到 claude_accounts。utilization 0..100,
   // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
@@ -240,7 +239,7 @@ export interface TurnSummary {
   /** 错误分类。'auth' 触发 sessionManager 的 token-refresh + 回滚重试路径。
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */
-  errorKind?: 'auth' | 'other'
+  errorKind?: 'auth' | 'model_authority' | 'other'
   /** Complete engine-reported error object/string, never truncated. */
   errorDetail?: string
   /** 底座报告 --resume/thread id 已失效(CCB: "No conversation found with

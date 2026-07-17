@@ -1581,6 +1581,19 @@ export class SubprocessRunner extends EventEmitter {
     await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message')
   }
 
+  /**
+   * Replace only the current turn's rolling lease while CCB is running.
+   * StructuredIO applies update_environment_variables concurrently with a
+   * live query and every subsequent `/v1/messages` call reads the new header.
+   */
+  async updateTurnLease(leaseEnvelope: string): Promise<void> {
+    const envUpdateLine = _buildUpdateEnvStdinLine(
+      _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope }),
+    )
+    if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
+    await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+  }
+
   private async writeTurnLineOrDestroy(
     line: string,
     phase: 'authority_env' | 'user_message',

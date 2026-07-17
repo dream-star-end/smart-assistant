@@ -91,6 +91,8 @@ import {
   type LosslessTurnRecord,
 } from "../http/losslessTurnTape.js";
 import { bumpGoalUsageSnapshotForTape } from "../goal/goalStateService.js";
+import { ensurePendingTurnWaiverInTransaction } from "../billing/refund.js";
+import { lockTurnBillingKeys, numericCommercialUserId } from "../billing/turnLock.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -638,6 +640,8 @@ function tapeAnchor(
 type HydratedTapeRow = {
   tape_id: string;
   tape_sha256: string;
+  waive_reason: string | null;
+  waiver_applied: boolean;
   msg_id: string;
   ordinal: number;
   role: string;
@@ -677,6 +681,14 @@ function hydrateTapeRecord(
     ? anchor.usage as Record<string, unknown>
     : {};
   const exactCostUsage = BigInt(row.cost_credits) > 0n ? { costCredits: row.cost_credits } : {};
+  // The live cost_waived frame updates the current browser immediately, but
+  // history hydration must carry the same truth for refreshes, offline users
+  // and other devices. Only an applied waiver (whose CHECK requires a receipt)
+  // may project completion; the tape's pending decision alone is not a refund.
+  // Keep the original cost for audit while the UI hides it behind that marker.
+  const exactWaiverUsage = row.waiver_applied && full.id === anchor.id
+    ? { waived: true }
+    : {};
   const exactDelegates = Array.isArray(row.delegate_costs)
     ? row.delegate_costs.flatMap((value) => {
         if (!value || typeof value !== "object" || Array.isArray(value)) return [];
@@ -706,8 +718,9 @@ function hydrateTapeRecord(
     ...(Object.keys(recordUsage).length > 0 ||
         Object.keys(anchorUsage).length > 0 ||
         Object.keys(exactCostUsage).length > 0 ||
+        Object.keys(exactWaiverUsage).length > 0 ||
         Object.keys(exactDelegateUsage).length > 0
-      ? { usage: { ...recordUsage, ...anchorUsage, ...exactCostUsage, ...exactDelegateUsage } }
+      ? { usage: { ...recordUsage, ...anchorUsage, ...exactCostUsage, ...exactWaiverUsage, ...exactDelegateUsage } }
       : {}),
   };
 }
@@ -877,7 +890,13 @@ async function hydrateTurnTapeMessages(
   const exactRows = exact
     ? (
         await pool.query<HydratedTapeRow>(
-      `SELECT r.tape_id, t.tape_sha256, r.msg_id, r.ordinal,
+      `SELECT r.tape_id, t.tape_sha256, t.waive_reason,
+              EXISTS (
+                SELECT 1 FROM turn_waivers w
+                 WHERE ('c:' || w.user_id::text)=t.user_id
+                   AND w.turn_key=t.turn_key AND w.status='applied'
+              ) AS waiver_applied,
+              r.msg_id, r.ordinal,
               r.role, r.content_sha256, r.payload,
               COALESCE((
                 SELECT SUM(exact_cost.cost_credits)::text
@@ -932,7 +951,13 @@ async function hydrateTurnTapeMessages(
   const chatVisibleRows = !exact
     ? (
         await pool.query<HydratedTapeRow>(
-          `SELECT r.tape_id, t.tape_sha256, r.msg_id, r.ordinal,
+          `SELECT r.tape_id, t.tape_sha256, t.waive_reason,
+                  EXISTS (
+                    SELECT 1 FROM turn_waivers w
+                     WHERE ('c:' || w.user_id::text)=t.user_id
+                       AND w.turn_key=t.turn_key AND w.status='applied'
+                  ) AS waiver_applied,
+                  r.msg_id, r.ordinal,
                   r.role, r.content_sha256, r.payload,
                   COALESCE((
                     SELECT SUM(exact_cost.cost_credits)::text
@@ -989,7 +1014,8 @@ async function hydrateTurnTapeMessages(
     ? (
         await pool.query<HydratedTapeRow>(
           `WITH candidates AS MATERIALIZED (
-             SELECT r.*, t.tape_sha256, t.created_at AS tape_created_at
+             SELECT r.*, t.tape_sha256, t.waive_reason,
+                    t.created_at AS tape_created_at
                FROM client_session_turn_tape_records r
                JOIN client_session_turn_tapes t
                  ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
@@ -1044,7 +1070,8 @@ async function hydrateTurnTapeMessages(
                     ) AS winner
                FROM eligible
            )
-           SELECT tape_id, tape_sha256, msg_id, ordinal, role,
+           SELECT tape_id, tape_sha256, waive_reason, false AS waiver_applied,
+                  msg_id, ordinal, role,
                   content_sha256, payload, '0'::text AS cost_credits,
                   '[]'::jsonb AS delegate_costs
              FROM ranked WHERE winner=1
@@ -1253,10 +1280,11 @@ export function createPgSessionsBackend(
             total_bytes: string;
             part_count: number;
             created_at: string;
+            waive_reason: string | null;
             finalized_at: string | null;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at, finalized_at
+                    total_bytes, part_count, created_at, waive_reason, finalized_at
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -1272,7 +1300,8 @@ export function createPgSessionsBackend(
             existingTape.tape_sha256 === request.tapeSha256 &&
             bigIntNum(existingTape.total_bytes, "turn_tape.total_bytes") === request.totalBytes &&
             existingTape.part_count === request.partCount &&
-            bigIntNum(existingTape.created_at, "turn_tape.created_at") === request.createdAt;
+            bigIntNum(existingTape.created_at, "turn_tape.created_at") === request.createdAt &&
+            existingTape.waive_reason === (request.waiveReason ?? null);
           if (!same) throw new Error("lossless turn tape immutable header conflict");
           // Finalization already materialized sanitized records and billing.
           // A rolling old writer may retry raw parts after we privacy-purged
@@ -1282,8 +1311,8 @@ export function createPgSessionsBackend(
           await client.query(
             `INSERT INTO client_session_turn_tapes
                (session_id, user_id, tape_id, agent_id, turn_index, status,
-                turn_key, tape_sha256, total_bytes, part_count, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                turn_key, tape_sha256, total_bytes, part_count, created_at, waive_reason)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
             [
               request.sessionId,
               userId,
@@ -1296,6 +1325,7 @@ export function createPgSessionsBackend(
               request.totalBytes,
               request.partCount,
               request.createdAt,
+              request.waiveReason ?? null,
             ],
           );
         }
@@ -1331,9 +1361,22 @@ export function createPgSessionsBackend(
       request: LosslessTurnTapeFinalizeRequest,
     ): Promise<LosslessTurnTapeFinalizeResult> {
       let goalUsageChanged = false;
+      // Personal/test namespaces also use this backend in some deployments,
+      // but only `c:<uid>` sessions participate in commercial settlement.
+      const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
+        ? numericCommercialUserId(userId)
+        : null;
+      if (request.waiveReason !== undefined && billingUserId === null) {
+        throw new Error("turn waiver requires a commercial c:<uid> session owner");
+      }
       const result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
         // Serializes "cost parks while tape finalizes" on the logical turn.
         await requestAdvisoryXactLock(client, userId, `turn:${request.turnKey}`);
+        // Shared with rolling lease renewal and every settlement/refund path:
+        // once a terminal anchor commits, no renewal can race past its check.
+        if (billingUserId !== null) {
+          await lockTurnBillingKeys(client, billingUserId, [request.turnKey]);
+        }
         const session = (
           await client.query<SessionWriteRow>(
             `SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count
@@ -1354,11 +1397,12 @@ export function createPgSessionsBackend(
             total_bytes: string;
             part_count: number;
             created_at: string;
+            waive_reason: string | null;
             finalized_at: string | null;
             engine_billings: unknown;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at, finalized_at, engine_billings
+                    total_bytes, part_count, created_at, waive_reason, finalized_at, engine_billings
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -1374,9 +1418,20 @@ export function createPgSessionsBackend(
           tape.tape_sha256 === request.tapeSha256 &&
           bigIntNum(tape.total_bytes, "turn_tape.total_bytes") === request.totalBytes &&
           tape.part_count === request.partCount &&
-          bigIntNum(tape.created_at, "turn_tape.created_at") === request.createdAt;
+          bigIntNum(tape.created_at, "turn_tape.created_at") === request.createdAt &&
+          tape.waive_reason === (request.waiveReason ?? null);
         if (!sameHeader) throw new Error("lossless turn tape finalize header conflict");
         if (tape.finalized_at !== null) {
+          // Rolling-upgrade/ACK-loss replay: the terminal anchor may already
+          // exist, but the exact-turn waiver fence still must be present
+          // before the master can ACK this finalizer.
+          if (request.waiveReason !== undefined) {
+            await ensurePendingTurnWaiverInTransaction(client, {
+              userId: billingUserId!,
+              turnKey: request.turnKey,
+              reason: request.waiveReason,
+            });
+          }
           const count = await client.query<{ count: string }>(
             `SELECT COUNT(*)::text AS count FROM client_session_turn_tape_records
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3`,
@@ -1426,9 +1481,20 @@ export function createPgSessionsBackend(
           turn.payload.agentId !== request.agentId ||
           turn.payload.turnIndex !== request.turnIndex ||
           turn.payload.status !== request.status ||
-          turn.payload.turnKey !== request.turnKey
+          turn.payload.turnKey !== request.turnKey ||
+          turn.payload.waiveReason !== request.waiveReason
         ) {
           throw new Error("lossless turn tape envelope/payload identity mismatch");
+        }
+        // The marker and terminal materialization commit (or roll back)
+        // together. Settlement uses the same advisory key, so after this
+        // transaction becomes visible it cannot create a new debit.
+        if (request.waiveReason !== undefined) {
+          await ensurePendingTurnWaiverInTransaction(client, {
+            userId: billingUserId!,
+            turnKey: request.turnKey,
+            reason: request.waiveReason,
+          });
         }
         const goalTokensUsed = computeGoalTokensUsed(turn.payload);
 

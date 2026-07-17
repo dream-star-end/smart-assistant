@@ -340,8 +340,9 @@ export const OC_ATTR_PARENT_TURN_KEY = "oc_parent_turn_key";
 /**
  * 计费归因(usage_records 落库维度)。
  *
- * - `sessionId`:既有语义不变 —— 引擎原生会话 id(CCB UUID),refund/turn-waive
- *   的圈定窗口靠它,**禁止**改成客户端会话 id。
+ * - `sessionId`:既有语义不变 —— 引擎原生会话 id(CCB UUID),
+ *   用于会话聚合与 pending cost 折叠，**禁止**改成客户端会话 id。
+ *   逻辑 turn 免单独立按 turnKey / parentTurnKey 归因。
  * - `mode`:'delegate' 当且仅当 user_id JSON 带 `oc_mode:"delegate"`(gateway 只对
  *   delegate 子会话注入);其余(普通 chat/cron/webhook/未打标旧容器)一律 'chat',
  *   与既有行为逐字节一致。

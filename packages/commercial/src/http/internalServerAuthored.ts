@@ -68,8 +68,10 @@ import {
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type TurnWaiveReason,
 } from "@openclaude/protocol";
 import type { LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
+import type { TurnWaiverInput, TurnWaiverResult } from "../billing/refund.js";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { enqueueAlert } from "../admin/alertOutbox.js";
@@ -507,6 +509,11 @@ export interface ServerAuthoredHandlerDeps {
   /** Durable billing fallback. Finalize is ACKed only after every billing
    * frame co-located with the immutable tape is settled or proven terminal. */
   settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
+  /** Exact refund + one targeted inbox receipt. A waived finalize is never
+   * ACKed until this durable transaction succeeds. */
+  applyTurnWaiver?: (input: TurnWaiverInput) => Promise<TurnWaiverResult>;
+  /** Best-effort live projection after the durable receipt commits. */
+  broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
@@ -671,6 +678,8 @@ export function makeServerAuthoredHandler(
           res,
           storage: deps.losslessTurnTapeStorage,
           settleCodexBilling: deps.settleCodexBilling,
+          applyTurnWaiver: deps.applyTurnWaiver,
+          broadcastToUser: deps.broadcastToUser,
           userLog,
           metric,
         });
@@ -1689,6 +1698,12 @@ const LosslessTapeBaseSchema = z.object({
   agentId: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
   turnIndex: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   status: z.enum(["completed", "interrupted", "crashed"]),
+  waiveReason: z.enum([
+    "idle_timeout",
+    "no_response",
+    "platform_authority_expired",
+    "turn_limit",
+  ] satisfies readonly TurnWaiveReason[]).optional(),
   turnKey: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
   tapeId: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
   tapeSha256: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
@@ -1753,6 +1768,8 @@ async function handleLosslessTurnTapeRequest(args: {
   res: ServerResponse;
   storage?: LosslessTurnTapeStorage;
   settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
+  applyTurnWaiver?: (input: TurnWaiverInput) => Promise<TurnWaiverResult>;
+  broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
   userLog: Logger;
   metric: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
 }): Promise<void> {
@@ -1882,11 +1899,65 @@ async function handleLosslessTurnTapeRequest(args: {
           return;
         }
       }
+      let waiverResult: TurnWaiverResult | undefined;
+      if (body.waiveReason !== undefined) {
+        if (!args.applyTurnWaiver) {
+          sendJsonError(args.res, 503, "TURN_WAIVER_UNAVAILABLE", "exact turn waiver unavailable", args.requestId);
+          return;
+        }
+        try {
+          waiverResult = await args.applyTurnWaiver({
+            userId: args.numericUserId,
+            turnKey: body.turnKey,
+            reason: body.waiveReason,
+            logger: args.userLog,
+          });
+        } catch (err) {
+          args.userLog.error("lossless_turn_waiver_apply_failed", {
+            tapeId: body.tapeId,
+            turnKey: body.turnKey,
+            reason: body.waiveReason,
+            err: err as Error,
+          });
+          // Keep the container's fsynced finalizer queued. The pending marker
+          // already fences new debits; retry completes refund + receipt.
+          sendJsonError(args.res, 503, "TURN_WAIVER_PENDING", "exact refund and receipt pending", args.requestId);
+          return;
+        }
+        // ACK-loss retries re-enter this block after refund+receipt committed;
+        // only the applying transaction emits the best-effort live projection.
+        // The durable targeted inbox receipt remains the source of truth.
+        if (waiverResult.newlyApplied) {
+          try {
+            args.broadcastToUser?.(args.numericUserId, {
+              type: "outbound.cost_waived",
+              sessionId: body.sessionId,
+              turnKey: body.turnKey,
+              refundedCredits: waiverResult.refundedCredits.toString(),
+              balanceAfter: waiverResult.totalAfter === null ? null : waiverResult.totalAfter.toString(),
+              reason: body.waiveReason,
+              inboxMessageId: waiverResult.inboxMessageId,
+            });
+          } catch (err) {
+            args.userLog.warn("lossless_turn_waiver_broadcast_failed", {
+              turnKey: body.turnKey,
+              err: err as Error,
+            });
+          }
+        }
+      }
       args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
       sendJsonOk(args.res, 200, {
         ok: true,
         idempotent: result.applied === "idempotent",
         recordCount: result.recordCount,
+        ...(waiverResult
+          ? {
+              waived: true,
+              refundedCredits: waiverResult.refundedCredits.toString(),
+              inboxMessageId: waiverResult.inboxMessageId,
+            }
+          : {}),
       }, args.requestId);
       return;
     } catch (err) {

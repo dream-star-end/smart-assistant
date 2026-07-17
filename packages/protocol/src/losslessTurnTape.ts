@@ -22,6 +22,13 @@ export const LOSSLESS_TURN_TAPE_SHA256_RE = /^[0-9a-f]{64}$/
  * is replaced idempotently rather than duplicated. */
 export const LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID = "__legacy_v1__" as const
 
+/** 平台自动免单的稳定原因码。只进签名/持久化控制面，不携带上游原文。 */
+export type TurnWaiveReason =
+  | 'idle_timeout'
+  | 'no_response'
+  | 'platform_authority_expired'
+  | 'turn_limit'
+
 /** Engine-reported Codex billing evidence stored inside the same immutable
  * tape as the paid reply. Master-owned journal context supplies pricing and
  * identity; this payload supplies the final usage and exact turn locators. */
@@ -59,6 +66,8 @@ export interface LosslessTurnTapePartRequest {
   agentId: string
   turnIndex: number
   status: 'completed' | 'interrupted' | 'crashed'
+  /** 终态携带即要求 master 原子封账并异步完成退款+定向站内信。 */
+  waiveReason?: TurnWaiveReason
   turnKey: string
   tapeId: string
   tapeSha256: string
@@ -78,6 +87,8 @@ export interface LosslessTurnTapeFinalizeRequest {
   agentId: string
   turnIndex: number
   status: 'completed' | 'interrupted' | 'crashed'
+  /** 与每个 part 同值；finalize 事务以它创建 pending 免单封账标记。 */
+  waiveReason?: TurnWaiveReason
   turnKey: string
   tapeId: string
   tapeSha256: string

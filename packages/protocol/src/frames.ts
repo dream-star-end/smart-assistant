@@ -900,14 +900,13 @@ export const OutboundCodexBilling = Type.Object({
   parentTurnKey: Type.Optional(Type.String({ pattern: '^[0-9a-f]{64}$' })),
   parentSessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
   delegateAgentId: Type.Optional(Type.String({ pattern: '^[A-Za-z0-9_-]{1,64}$' })),
-  /** M2(v5 codex 复活)— engine-reported 计费的稳定记账键。
+  /** M2(v5 codex 复活)— engine-reported 计费的稳定会话标识。
    *
    *  值 = gateway engine/engineSessionId.ts 的 `engineSessionId(sessionKey)`
    *  (`'oceng-' + sha256(sessionKey).hex.slice(0,48)`,共 54 字符,唯一权威
-   *  helper,禁止各处自行 hash)。master settle 落 usage_records.session_id 与
-   *  容器 idle-timeout turn-waive 上报(masterTurnWaive)**必须同一值**,否则
-   *  退款窗口(refund.refundSessionWindow 按 session_id 圈定)永远圈不到 codex
-   *  记录 —— 钱安全红线。
+   *  helper,禁止各处自行 hash)。master settle 落 usage_records.session_id;
+   *  免单则只依赖独立的 turnKey / parentTurnKey 精确归因，不再使用
+   *  会话时间窗口。
    *
    *  Optional 仅为渐进部署兼容(旧容器镜像不带此字段);master 侧对缺失/形状
    *  非法的帧 fail-closed:不 settle 扣费,abort journal 免单 + 告警(宁可少收

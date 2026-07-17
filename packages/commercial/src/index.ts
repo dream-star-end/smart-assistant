@@ -59,6 +59,7 @@ import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider, type ModelPricing } from "./billing/pricing.js";
+import { applyTurnWaiver } from "./billing/refund.js";
 import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
@@ -252,6 +253,11 @@ import {
   makeTurnWaiveHandler,
   type TurnWaiveHandler,
 } from "./http/internalTurnWaive.js";
+import {
+  TURN_LEASE_RENEW_PATH,
+  makeTurnLeaseRenewHandler,
+  type TurnLeaseRenewHandler,
+} from "./http/internalTurnLeaseRenew.js";
 import {
   PROMPT_QUEUE_CLAIM_PATH,
   PROMPT_QUEUE_DETAIL_PATH,
@@ -1479,6 +1485,10 @@ export async function registerCommercial(
   // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
   // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
   let dispatchInternal: AnthropicProxyHandler | undefined;
+  // Internal listeners are assembled before model-authority startup. Renewal
+  // reads this forward ref at request time; startup windows fail closed 503.
+  let modelAuthoritySigner: AuthoritySigner | undefined;
+  let modelCatalogCache: ModelCatalogCache | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
@@ -1722,6 +1732,8 @@ export async function registerCommercial(
             billing,
           );
         },
+        applyTurnWaiver: (input) => applyTurnWaiver(getPool(), input),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
@@ -1841,13 +1853,18 @@ export async function registerCommercial(
       const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
         identityRepo,
       });
-      // /internal/v3/turn-waive — 容器 gateway 上报"turn idle-timeout 被杀"(用户视角
-      // 无响应/超时),master 按 (user, ccb session, turn 窗口) 冲正该轮已扣费用并广播
-      // outbound.cost_waived。boss 红线:本轮模型无响应或超时不得扣费。
+      // /internal/v3/turn-waive — 滚动升级/审计修复的兼容入口。master 只按
+      // (user, turnKey) 精确冲正，并在同一事务写一封定向站内信。主路径
+      // 由 lossless turn tape 携 waiveReason，不再使用会话时间窗口。
       const turnWaiveHandler: TurnWaiveHandler = makeTurnWaiveHandler({
         identityRepo,
         pgPool: getPool(),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+      });
+      const turnLeaseRenewHandler: TurnLeaseRenewHandler = makeTurnLeaseRenewHandler({
+        identityRepo,
+        pgPool: getPool(),
+        getSigner: () => modelAuthoritySigner,
       });
       // V5 queue P1 compatibility layer:strict opt-in. Flag off means no store
       // instance and no route registration, so legacy internal dispatch remains exact.
@@ -2106,6 +2123,9 @@ export async function registerCommercial(
         }
         if (path === TURN_WAIVE_PATH) {
           return turnWaiveHandler(req, res, ctx);
+        }
+        if (path === TURN_LEASE_RENEW_PATH) {
+          return turnLeaseRenewHandler(req, res, ctx);
         }
         if (
           promptQueueHandler &&
@@ -2613,8 +2633,6 @@ export async function registerCommercial(
   // 经 authenticated drain 全量退出后才真正关总 flag，消除回滚 census 的尾巴竞态。
   const modelAuthorityProvisionRequired =
     modelAuthorityFlag && process.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
-  let modelAuthoritySigner: AuthoritySigner | undefined;
-  let modelCatalogCache: ModelCatalogCache | undefined;
   if (modelAuthorityFlag) {
     // catalog HTTP mutation 必须走独立低权 admin role；缺失/串用 app role 时拒绝启动。
     await assertModelCatalogAdminPoolConfigured();
