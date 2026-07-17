@@ -40,6 +40,8 @@ import {
   permanentCodexWaiverReason,
 } from './codexFinalizer.js'
 import { transitionProductFrictionEventIfPresent } from '../productFriction/events.js'
+import { safeEnqueueAlert } from '../admin/alertOutbox.js'
+import { EVENTS } from '../admin/alertEvents.js'
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 60_000
 export const MIN_INTERVAL_MS = 5_000
@@ -68,6 +70,28 @@ export const DEFAULT_GC_INTERVAL_MS = 3_600_000 // GC 比 reconcile 稀疏
 export const DEFAULT_GC_LIMIT = 5_000 // 单次 GC 批量上限,避免一刀大删
 /** stuck 阈值上限 24h:防 env 写 1e100 之类(指数记法 / 丢精度会把 $1::bigint 打挂)。 */
 export const MAX_STUCK_THRESHOLD_MS = 86_400_000
+
+/**
+ * durable `finalizing` 老化告警阈值(二级检测,2026-07-17 batch G)。
+ *
+ * 审计缺口:reconcileStuckFinalizeJournal 的三条 CAS 都**不覆盖** durable `finalizing`
+ * 无 evidence 行 —— committed CAS 要有 usage_records;aborted CAS 显式排除 durable 行
+ * (`durableBillingRecovery <> version`);durableWaived CAS 只认 `state='inflight'`。因此
+ * 一个 durable finalizing 行若既拿不到 settle owner、又永远等不到 usage_records,会**永久
+ * 卡"假在途"**,任何自动路径都不会动它(故意保守:finalizing 可能仍有存活 owner/结算事务,
+ * 绝不按时间 abort)。
+ *
+ * 本阈值触发的是**告警而非终态**:超龄(默认 48h)+ 无 usage 证据的 durable finalizing 行
+ * → 发 admin 告警交人工裁定,**行状态一律不动**。48h 远超任何存活 settle 事务时长,命中
+ * 基本可判定为真卡死。可经 startFinalizeJournalReconciler 的 durableFinalizingAlertAgeMs
+ * option 覆盖(env 接线待 index.ts 归入所有权批次时补 COMMERCIAL_FINALIZE_DURABLE_
+ * FINALIZING_ALERT_AGE_MS;当前 index.ts 不在本批所有权内,故只走 option + 常量)。
+ */
+export const DEFAULT_DURABLE_FINALIZING_ALERT_AGE_MS = 48 * 3_600_000
+/** durable finalizing 告警龄上限(复用 waiver 的一年硬顶,拒 1e100/非安全整数)。 */
+export const MAX_DURABLE_FINALIZING_ALERT_AGE_MS = MAX_DURABLE_WAIVER_AGE_MS
+/** 单轮告警扫描行数上限(dedupe 已按行 id+天收敛,这里再加一道硬顶防一次性刷屏)。 */
+export const DEFAULT_FINALIZING_ALERT_LIMIT = 100
 
 export interface ReconcileCounts {
   committed: number
@@ -117,6 +141,105 @@ export function resolveDurableWaiverAgeMs(
   const raw = Number(envValue)
   const fromEnv = Number.isSafeInteger(raw) && raw > floor ? raw : floor
   return Math.min(fromEnv, cap)
+}
+
+/**
+ * 夹 durable finalizing 告警龄:floor=48h(默认),cap=一年硬顶;非安全整数/过小 → 默认。
+ * 仅用于 option 覆盖场景(index.ts 当前不传 → 恒取 DEFAULT)。
+ */
+export function resolveDurableFinalizingAlertAgeMs(
+  value: number | string | undefined,
+): number {
+  const raw = Number(value)
+  const floor = DEFAULT_DURABLE_FINALIZING_ALERT_AGE_MS
+  if (!Number.isSafeInteger(raw) || raw < floor) return floor
+  return Math.min(raw, MAX_DURABLE_FINALIZING_ALERT_AGE_MS)
+}
+
+export interface StuckDurableFinalizingRow {
+  requestId: string
+  userId: string
+  ageMs: number
+}
+
+/**
+ * 只读扫描:durable(`durableBillingRecovery=version`)且 `state='finalizing'` 超过告警龄、
+ * 又无 usage_records evidence 的行。**不发任何 UPDATE**,不碰行状态。谓词与三条 CAS 的
+ * durable/finalizing/no-usage 判定同源,专挑三条 CAS 都不覆盖的"假在途"死角。
+ */
+export async function scanStuckDurableFinalizing(
+  alertAgeMs: number,
+  limit: number,
+): Promise<StuckDurableFinalizingRow[]> {
+  const ms = String(Math.max(0, Math.floor(alertAgeMs)))
+  const lim = Math.max(1, Math.floor(limit))
+  const res = await query<{ request_id: string; user_id: string; age_ms: string }>(
+    `SELECT rfj.request_id,
+            rfj.user_id::text AS user_id,
+            (EXTRACT(EPOCH FROM (NOW() - rfj.updated_at)) * 1000)::bigint::text AS age_ms
+       FROM request_finalize_journal rfj
+      WHERE rfj.state = 'finalizing'
+        AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+        AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_records ur
+           WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
+        )
+      ORDER BY rfj.updated_at ASC
+      LIMIT $3`,
+    [ms, DURABLE_CODEX_RECOVERY_VERSION, String(lim)],
+  )
+  return res.rows.map((r) => ({
+    requestId: r.request_id,
+    userId: r.user_id,
+    ageMs: Number(r.age_ms),
+  }))
+}
+
+/**
+ * 对每个老化 durable finalizing 行发一条 admin 告警(人工裁定),**不改任何行状态**。
+ *
+ * dedupe=行 id+天(`…:<request_id>:<YYYY-MM-DD>`):同一卡死行每天最多告警一次(持续提醒
+ * 而非刷屏),跨天再提醒直到人工处置。event_type 复用已注册的 ops.daily_anomaly(warning
+ * 级"周期性计费异常"桶)—— 本批所有权边界禁改 alertEvents.ts,故不新开 billing.finalize_
+ * stuck 事件;payload.source 作判别,升格为专用事件待有批次归入 alertEvents.ts 所有权。
+ * enqueue/scan 均可注入以便单测(默认走真 safeEnqueueAlert + 真 DB 扫描)。返回命中行数。
+ */
+export async function alertStuckDurableFinalizing(
+  alertAgeMs: number = DEFAULT_DURABLE_FINALIZING_ALERT_AGE_MS,
+  limit: number = DEFAULT_FINALIZING_ALERT_LIMIT,
+  enqueue: (event: Parameters<typeof safeEnqueueAlert>[0]) => void = safeEnqueueAlert,
+  scan: (
+    ageMs: number,
+    lim: number,
+  ) => Promise<StuckDurableFinalizingRow[]> = scanStuckDurableFinalizing,
+): Promise<number> {
+  const rows = await scan(alertAgeMs, limit)
+  if (rows.length === 0) return 0
+  const day = new Date().toISOString().slice(0, 10)
+  const ageHours = Math.round(alertAgeMs / 3_600_000)
+  for (const row of rows) {
+    enqueue({
+      event_type: EVENTS.OPS_DAILY_ANOMALY,
+      severity: 'warning',
+      title: 'durable finalize journal 卡死(疑假在途)',
+      body:
+        `durable Codex finalize journal 行 \`${row.requestId}\`(user \`${row.userId}\`)已停在 ` +
+        `\`finalizing\` ${Math.round(row.ageMs / 3_600_000)}h(> ${ageHours}h 告警龄)且无 ` +
+        `usage_records 证据。三条 reconciler CAS 都不覆盖此形态,不会自动终态(保守:可能仍有 ` +
+        `存活 settle owner)。请人工核对是否真卡死:确认后手工裁决(补 committed / 记 waiver)。`,
+      payload: {
+        source: 'finalizeJournalReconciler',
+        kind: 'durable_finalizing_stuck',
+        request_id: row.requestId,
+        user_id: row.userId,
+        age_ms: row.ageMs,
+        alert_age_ms: alertAgeMs,
+      },
+      dedupe_key: `${EVENTS.OPS_DAILY_ANOMALY}:finalize_stuck:${row.requestId}:${day}`,
+    })
+  }
+  return rows.length
 }
 
 /**
@@ -266,8 +389,14 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
 
 export interface ReconcilerHandle {
   stop(): void
-  /** 测试/运维:立即跑一轮(reconcile + 视 cadence 决定是否 GC)。与 interval tick 共用 running 守卫。 */
-  runNow(): Promise<{ committed: number; aborted: number; durableWaived: number; gc: number }>
+  /** 测试/运维:立即跑一轮(reconcile + durable finalizing 老化告警 + 视 cadence 决定是否 GC)。与 interval tick 共用 running 守卫。 */
+  runNow(): Promise<{
+    committed: number
+    aborted: number
+    durableWaived: number
+    finalizingAlerted: number
+    gc: number
+  }>
 }
 
 export interface ReconcilerOptions {
@@ -279,11 +408,17 @@ export interface ReconcilerOptions {
   gcAgeMs?: number
   gcIntervalMs?: number
   gcLimit?: number
+  /** durable finalizing 老化告警龄;不传 → 常量 48h(index.ts 归入所有权后再补 env 接线)。 */
+  durableFinalizingAlertAgeMs?: number
+  /** 单轮告警扫描行上限;默认 100。 */
+  finalizingAlertLimit?: number
   runOnStart?: boolean
   onError?: (err: unknown) => void
   /** 测试注入:覆盖默认 DB 调用。 */
   reconcileFn?: () => Promise<ReconcileCounts>
   gcFn?: () => Promise<number>
+  /** 测试注入:覆盖 durable finalizing 老化告警(返回命中行数)。 */
+  alertStuckFinalizingFn?: () => Promise<number>
   /** 测试注入:控制 GC cadence 判定的时钟。 */
   now?: () => number
 }
@@ -303,10 +438,15 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
   const gcAgeMs = Math.max(MIN_GC_AGE_MS, opts.gcAgeMs ?? DEFAULT_GC_AGE_MS)
   const gcIntervalMs = Math.max(interval, opts.gcIntervalMs ?? DEFAULT_GC_INTERVAL_MS)
   const gcLimit = Math.max(1, opts.gcLimit ?? DEFAULT_GC_LIMIT)
+  const finalizingAlertAgeMs = resolveDurableFinalizingAlertAgeMs(opts.durableFinalizingAlertAgeMs)
+  const finalizingAlertLimit = Math.max(1, opts.finalizingAlertLimit ?? DEFAULT_FINALIZING_ALERT_LIMIT)
   const reconcileFn = opts.reconcileFn ?? (
     () => reconcileStuckFinalizeJournal(thresholdMs, durableWaiverAgeMs)
   )
   const gcFn = opts.gcFn ?? (() => gcFinalizeJournal(gcAgeMs, gcLimit))
+  const alertStuckFinalizingFn = opts.alertStuckFinalizingFn ?? (
+    () => alertStuckDurableFinalizing(finalizingAlertAgeMs, finalizingAlertLimit)
+  )
   const onError = opts.onError ?? defaultOnError
   const runOnStart = opts.runOnStart ?? true
   const now = opts.now ?? Date.now
@@ -319,20 +459,30 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
     committed: number
     aborted: number
     durableWaived: number
+    finalizingAlerted: number
     gc: number
   }> {
-    if (running) return { committed: 0, aborted: 0, durableWaived: 0, gc: 0 } // DB 卡时跳过重叠 tick
+    // DB 卡时跳过重叠 tick
+    if (running) return { committed: 0, aborted: 0, durableWaived: 0, finalizingAlerted: 0, gc: 0 }
     running = true
     try {
       let committed = 0
       let aborted = 0
       let durableWaived = 0
+      let finalizingAlerted = 0
       let gc = 0
       try {
         const r = await reconcileFn()
         committed = r.committed
         aborted = r.aborted
         durableWaived = r.durableWaived
+      } catch (err) {
+        onError(err)
+      }
+      // durable finalizing 老化告警(二级检测):独立 try —— 告警扫描失败不拖累 reconcile/GC。
+      // 纯只读 + safeEnqueueAlert(fire-and-forget),不改任何行状态;dedupe 按行 id+天。
+      try {
+        finalizingAlerted = await alertStuckFinalizingFn()
       } catch (err) {
         onError(err)
       }
@@ -345,7 +495,7 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
           onError(err)
         }
       }
-      return { committed, aborted, durableWaived, gc }
+      return { committed, aborted, durableWaived, finalizingAlerted, gc }
     } finally {
       running = false
     }
