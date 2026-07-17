@@ -474,10 +474,16 @@ export function rebuildIndexes(sess: ChatSession): void {
 }
 
 /**
- * 该行是否为后端 server-authored 行(债A 团队卡跨设备骨架)。判定单一权威:
- * 显式 `_source === 'server'` 优先;回退到 canonical id 前缀 `srv-`(server 重写/持久化
- * 行的既有命名惯例,见 persist.ts docstring)。团队卡去重、live progress 绑定守卫共用它,
- * 保证「server 骨架行永不接收 live childBlocks / 永不吞本地富卡」。
+ * 该行是否为后端 server-authored 行(债A 团队卡跨设备骨架)。判定:显式 `_source === 'server'`
+ * 优先;回退到 canonical id 前缀 `srv-`(server 重写/持久化行的既有命名惯例,见 persist.ts docstring)。
+ *
+ * ⚠️ **硬约束(B7):`srv-` 前缀兜底仅限 agent-group / 团队卡语义**(团队卡去重、live progress
+ * 绑定守卫),用途是「server 骨架行永不接收 live childBlocks / 永不吞本地富卡」。
+ * **严禁**用本函数判定 assistant / thinking / tool 生成内容行的权威归属:v7 起主 agent 的
+ * live text/thinking/tool 直接采用引擎 messageId(形如 `srv-<peer>-<agent>-tN`),它们是 reducer
+ * **本地铸的乐观行**(无 `_source`)却带 `srv-` 前缀 → 本函数会因前缀兜底把它们**误判成
+ * server-authored**(参见 persist.ts `isSupersededLocalTurnRow` 为此显式改用 `_source` 的整段说明)。
+ * **新调用一律走 `_source === 'server'`**;`srv-` 兜底只为不能改的 v7 legacy 团队卡路径保留。
  */
 export function isServerAuthoredRow(
   m: Pick<ChatMessage, "id" | "_source"> | null | undefined,
