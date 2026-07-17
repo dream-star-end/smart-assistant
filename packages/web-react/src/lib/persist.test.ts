@@ -949,78 +949,111 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 同步权威传播(07-17 tail 洪水事故收尾根治):full/增量载荷自证的过期副本清除(P2)+
-// server 行删除传播(P1)。fixture 忠实还原事故手机缓存:老会话重开、无
-// completedClientMessageId、本地残留旧代码铸的 live 行(裸引擎 messageId,无
-// _clientMessageId/_seq/_orderSeq)+ 已被服务端清理的 tail runtime-event 行。
+// 同步权威传播(07-17 tail 洪水事故收尾根治):P1 版本护栏下的缺席删除传播 +
+// P2 载荷自证(证据为正)的过期副本清除。fixture 忠实还原事故手机缓存:老会话重开、
+// 无 completedClientMessageId、本地残留旧代码铸的 live 行(裸引擎 messageId,无
+// _clientMessageId/排序轴)+ 已被服务端清理的高 orderSeq tail 行。
 // ---------------------------------------------------------------------------
 describe("sync authority propagation", () => {
+  const TAPE = { _source: "server" as const, _turnTapeId: "tape-1", _clientMessageId: "cm-1" };
   const cleanServer: ChatMessage[] = [
     { id: "u-1", role: "user", text: "复刻这个游戏", ts: 100, _seq: 1, _orderSeq: 1 },
-    { id: "srv-peer-main-t1-thinking-s0", role: "thinking", text: "分析截图", ts: 200, _seq: 5, _orderSeq: 5, _source: "server", _clientMessageId: "cm-1" },
-    { id: "srv-peer-main-t1-s0", role: "assistant", text: "我来复刻这个游戏。", ts: 210, _seq: 5, _orderSeq: 5, _source: "server", _clientMessageId: "cm-1" },
-    { id: "srv-peer-main-t1-tool-tb1", role: "tool", text: "创建游戏目录", ts: 220, _seq: 5, _orderSeq: 5, _source: "server", _clientMessageId: "cm-1" },
-    { id: "srv-peer-main-t1-s1", role: "assistant", text: "已复刻完成,规则如下…", ts: 400, _seq: 5, _orderSeq: 5, _source: "server", _clientMessageId: "cm-1" },
+    { id: "srv-peer-main-t1-thinking-s0", role: "thinking", text: "分析截图", ts: 200, _seq: 5, _orderSeq: 5, ...TAPE },
+    { id: "srv-peer-main-t1-s0", role: "assistant", text: "我来复刻这个游戏。", ts: 210, _seq: 5, _orderSeq: 5, ...TAPE },
+    { id: "srv-peer-main-t1-tool-tb1", role: "tool", text: "创建游戏目录", ts: 220, _seq: 5, _orderSeq: 5, ...TAPE },
+    { id: "srv-peer-main-t1-s1", role: "assistant", text: "已复刻完成,规则如下…", ts: 400, _seq: 5, _orderSeq: 5, ...TAPE },
   ];
-  // 事故期缓存:旧代码铸的 live 行(无 _clientMessageId、无排序轴、id 与展开行不同)
+  const AUTH = { deletionAuthority: { maxSeq: 5 } };
+  // 事故期缓存:旧代码铸的 live 行(无 _clientMessageId、无排序轴;含 bare 前缀 id 与 tool 后缀 id)
   const staleLiveRows: ChatMessage[] = [
     { id: "srv-peer-main-t1", role: "thinking", text: "分析截图", ts: 200 },
     { id: "srv-peer-main-t1", role: "assistant", text: "我来复刻这个游戏。", ts: 210 },
+    { id: "srv-peer-main-t1-tool-oldtb", role: "tool", text: "创建游戏目录", ts: 220 },
   ];
-  // 已被服务端事故清理删掉的 tail 折叠行(_source server,不在 full 载荷)
+  // 已被服务端事故清理删掉的 tail 折叠行(_source server,高 orderSeq 但 ≤ 快照 maxSeq 才可删,
+  // 这里 orderSeq=2 ≤ maxSeq=5 → 属快照可见范围内的缺席)
   const deletedTailRow: ChatMessage = {
     id: "srv-peer-tail_abc-t1-runtime-10528", role: "runtime-event" as ChatMessage["role"],
     text: "", ts: 300, _seq: 2, _orderSeq: 2, _source: "server",
   };
 
-  test("老会话重开(无 completedClientMessageId):载荷覆盖 turn 的 legacy live 副本被 turn 前缀通道清除,server 删除的行跟删,最终顺序=server 序", () => {
+  test("事故缓存全愈:P2 前缀证据清 legacy live 行(bare/thinking/tool 后缀),P1 授权下清 server 已删行,最终=server 序", () => {
     const local = [cleanServer[0], ...staleLiveRows, deletedTailRow];
-    const merged = mergeFullServerWins(cleanServer, local);
+    const merged = mergeFullServerWins(cleanServer, local, 0, undefined, AUTH);
     expect(merged.map((m) => m.id)).toEqual(cleanServer.map((m) => m.id));
-    expect(merged.map((m) => m.text)).toEqual(cleanServer.map((m) => m.text));
   });
 
-  test("P2 clientMessageId 通道:带 _clientMessageId 的本地行被载荷自证清除,不依赖调用方传参", () => {
+  test("P2 证据为正,无授权也生效:clientMessageId 与前缀双通道都不依赖 deletionAuthority", () => {
     const local = [
       cleanServer[0],
-      { id: "srv-peer-main-t1", role: "assistant", text: "旧副本", ts: 210, _clientMessageId: "cm-1" } as ChatMessage,
+      { id: "srv-peer-main-t1", role: "assistant", text: "旧副本A", ts: 210 } as ChatMessage,
+      { id: "srv-x", role: "assistant", text: "旧副本B", ts: 215, _clientMessageId: "cm-1" } as ChatMessage,
     ];
     const merged = mergeFullServerWins(cleanServer, local);
-    expect(merged.some((m) => m.text === "旧副本")).toBe(false);
+    expect(merged.some((m) => m.text.startsWith("旧副本"))).toBe(false);
   });
 
-  test("未覆盖 turn 的 live 行必须保留(活跃 turn 安全):server 只回 t1,本地 t2 流式行原样存活", () => {
-    const activeTurnRows: ChatMessage[] = [
-      { id: "u-2", role: "user", text: "再加个存档功能", ts: 500 },
+  test("P1 无版本授权不删(BLOCKER 竞态):旧 full 快照晚到时 server 行缺席≠删除", () => {
+    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], deletedTailRow]);
+    expect(merged.some((m) => m.id === deletedTailRow.id)).toBe(true);
+  });
+
+  test("P1 maxSeq 豁免:orderSeq 晚于快照的本地 server 行(增量先到)不被旧快照缺席误删", () => {
+    const lateRow: ChatMessage = { id: "srv-peer-main-t2-s0", role: "assistant", text: "新回复", ts: 500, _seq: 9, _orderSeq: 9, _source: "server" };
+    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], lateRow], 0, undefined, AUTH);
+    expect(merged.some((m) => m.id === "srv-peer-main-t2-s0")).toBe(true);
+  });
+
+  test("活跃轮守卫:REST 已回终态、WS 仍在途——活跃 clientMessageId 的行双通道都不清", () => {
+    const activeRow: ChatMessage = { id: "srv-peer-main-t1", role: "assistant", text: "流式中…", ts: 210, _clientMessageId: "cm-1" };
+    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], activeRow], 0, undefined, {
+      ...AUTH, activeClientMessageId: "cm-1",
+    });
+    expect(merged.some((m) => m.text === "流式中…")).toBe(true);
+  });
+
+  test("未覆盖 turn 的 live 行保留(活跃/降级保存安全):server 只回 t1,本地 t2 行原样存活;t1 前缀不误伤 t12", () => {
+    const otherRows: ChatMessage[] = [
       { id: "srv-peer-main-t2", role: "assistant", text: "好,正在改…", ts: 510 },
-      { id: "srv-peer-main-t2-tool-tb9", role: "tool", text: "写入文件", ts: 520 },
+      { id: "srv-peer-main-t12-s0", role: "assistant", text: "t12 的行", ts: 520 },
     ];
-    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], ...staleLiveRows, ...activeTurnRows]);
-    expect(merged.filter((m) => m.ts >= 500).map((m) => m.id)).toEqual(activeTurnRows.map((m) => m.id));
+    const merged = mergeFullServerWins(cleanServer, [cleanServer[0], ...otherRows], 0, undefined, AUTH);
+    expect(merged.some((m) => m.text === "好,正在改…")).toBe(true);
+    expect(merged.some((m) => m.text === "t12 的行")).toBe(true);
   });
 
-  test("P1 不触碰归档水位下的 server 行;client-owned 行(user/system/团队卡)永不被清", () => {
-    const archivedRow: ChatMessage = { id: "srv-peer-main-t0-s0", role: "assistant", text: "更早的归档回复", ts: 10, _seq: 0, _orderSeq: 0, _source: "server" };
-    (archivedRow as { _orderSeq?: number })._orderSeq = 3;
+  test("v1 逐行 writer 不作证:无 _turnTapeId 的 server 行不入证据集,legacy live 行保留", () => {
+    const v1Server = cleanServer.map((m) => {
+      const { _turnTapeId: _drop, ...rest } = m as ChatMessage & { _turnTapeId?: string };
+      void _drop;
+      return rest as ChatMessage;
+    });
+    const merged = mergeFullServerWins(v1Server, [cleanServer[0], staleLiveRows[0]]);
+    expect(merged.some((m) => m.id === "srv-peer-main-t1")).toBe(true);
+  });
+
+  test("client-owned 行与归档行永不清:user/system/团队卡/plan + 水位下 server 行", () => {
+    const archivedRow: ChatMessage = { id: "srv-peer-main-t0-s0", role: "assistant", text: "更早的归档回复", ts: 10, _seq: 3, _orderSeq: 3, _source: "server" };
     const teamCard: ChatMessage = { id: "m-team-1", role: "agent-group" as ChatMessage["role"], text: "", ts: 250, _clientMessageId: "cm-1" };
     const sysRow: ChatMessage = { id: "m-sys-1", role: "system" as ChatMessage["role"], text: "上下文已重建", ts: 260 };
-    const merged = mergeFullServerWins(cleanServer, [archivedRow, cleanServer[0], teamCard, sysRow], 4);
-    expect(merged.some((m) => m.id === "srv-peer-main-t0-s0")).toBe(true);
-    expect(merged.some((m) => m.id === "m-team-1")).toBe(true);
-    expect(merged.some((m) => m.id === "m-sys-1")).toBe(true);
+    const planRow: ChatMessage = { id: "plan:tb:g0", role: "plan" as ChatMessage["role"], text: "任务列表", ts: 215 };
+    const merged = mergeFullServerWins(cleanServer, [archivedRow, cleanServer[0], teamCard, sysRow, planRow], 4, undefined, AUTH);
+    for (const id of ["srv-peer-main-t0-s0", "m-team-1", "m-sys-1", "plan:tb:g0"]) {
+      expect(merged.some((m) => m.id === id)).toBe(true);
+    }
   });
 
-  test("增量版 P2:incoming 带某 turn 的 server 生成行即自证覆盖,同 turn 过期 live 副本清除(不传 completedClientMessageId)", () => {
-    const local = [cleanServer[0], ...staleLiveRows];
-    const incoming = cleanServer.slice(1);
-    const merged = applyServerIncremental(local, incoming);
-    expect(merged.filter((m) => m.role !== "user").map((m) => m.id)).toEqual(incoming.map((m) => m.id));
+  test("增量版 P2:incoming 的 v2 tape 展开行自证覆盖,过期 live 副本清除(不传 completedClientMessageId)", () => {
+    const merged = applyServerIncremental([cleanServer[0], ...staleLiveRows], cleanServer.slice(1));
+    expect(merged.filter((m) => m.role !== "user").map((m) => m.id)).toEqual(cleanServer.slice(1).map((m) => m.id));
   });
 
-  test("增量缺席不代表删除:incoming 不含某 server 行时,本地该行保留(P1 不适用增量)", () => {
-    const local = [cleanServer[0], deletedTailRow];
-    const incoming = [cleanServer[4]];
-    const merged = applyServerIncremental(local, incoming);
+  test("增量缺席不代表删除 + 活跃轮守卫在增量同样生效", () => {
+    const activeRow: ChatMessage = { id: "srv-peer-main-t1", role: "assistant", text: "流式中…", ts: 210, _clientMessageId: "cm-1" };
+    const merged = applyServerIncremental([cleanServer[0], deletedTailRow, activeRow], [cleanServer[4]], undefined, {
+      activeClientMessageId: "cm-1",
+    });
     expect(merged.some((m) => m.id === deletedTailRow.id)).toBe(true);
+    expect(merged.some((m) => m.text === "流式中…")).toBe(true);
   });
 });

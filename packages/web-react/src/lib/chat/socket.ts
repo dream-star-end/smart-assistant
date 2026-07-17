@@ -1864,6 +1864,8 @@ export class ChatSocket {
       archivedThroughSeq?: number;
       archivedCount?: number;
       completedClientMessageId?: string;
+      /** 载荷的 SessionDetail.updatedAt:P1 缺席删除的版本护栏证据(见下)。 */
+      serverUpdatedAt?: number;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1871,14 +1873,34 @@ export class ChatSocket {
       typeof archive?.archivedThroughSeq === "number" && Number.isFinite(archive.archivedThroughSeq)
         ? archive.archivedThroughSeq
         : 0;
+    // 同步权威传播的版本护栏:loadHistory 与 syncSession 是两条独立 REST,旧 full 快照可能晚于
+    // 更新的合并抵达 —— 缺席判定(P1)只允许在「载荷 updatedAt ≥ 已应用水位」时执行,否则晚到
+    // 旧快照会把新行永久删丢(_maxSeq 游标单调,删了增量拉不回)。水位只在本进程内存(会话
+    // 重开从 0 起,任何 full 都≥0,首次即可授权)。活跃轮守卫:发送中的轮绝不被载荷自证清除。
+    const serverUpdatedAt = archive?.serverUpdatedAt;
+    const versionOk =
+      typeof serverUpdatedAt === "number" &&
+      Number.isFinite(serverUpdatedAt) &&
+      serverUpdatedAt >= (s._lastServerSyncUpdatedAt ?? 0);
+    const activeClientMessageId = s._sendingInFlight ? s._activeClientMessageId : undefined;
     s.messages = full
       ? mergeFullServerWins(
           msgs,
           s.messages,
           archivedThroughSeq,
           archive?.completedClientMessageId,
+          {
+            deletionAuthority:
+              versionOk && typeof maxSeq === "number" && Number.isFinite(maxSeq)
+                ? { maxSeq }
+                : undefined,
+            activeClientMessageId,
+          },
         )
-      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId);
+      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
+          activeClientMessageId,
+        });
+    if (versionOk) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
       s._archivedCount = archive.archivedCount;
