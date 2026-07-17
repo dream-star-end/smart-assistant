@@ -444,7 +444,12 @@ describe('marketplace Plugin kernel migration', () => {
     })
     const accountRow = await getPluginAccount(account.id, Number(author.rows[0]!.id), getPool())
     assert.ok(accountRow)
-    const facade = new PluginRuntimeFacade({ pool: getPool(), redis: null, env })
+    const facade = new PluginRuntimeFacade({
+      pool: getPool(),
+      redis: null,
+      env,
+      browserRuntime: { supportsContract: () => true } as never,
+    })
     assert.equal(
       await facade.classifyTarget(Number(author.rows[0]!.id), account.id),
       'managed-browser',
@@ -468,6 +473,34 @@ describe('marketplace Plugin kernel migration', () => {
     assert.deepEqual(
       currentManagement.accounts.map((item) => ({ id: item.id, executable: item.executable })),
       [{ id: account.id, executable: true }],
+    )
+    const unsupportedFacade = new PluginRuntimeFacade({
+      pool: getPool(),
+      redis: null,
+      env,
+      browserRuntime: { supportsContract: () => false } as never,
+    })
+    assert.equal(
+      await unsupportedFacade.classifyTarget(Number(author.rows[0]!.id), account.id),
+      null,
+    )
+    assert.deepEqual(await unsupportedFacade.catalog(Number(author.rows[0]!.id)), [])
+    assert.deepEqual(await unsupportedFacade.list(Number(author.rows[0]!.id)), [])
+    const unsupportedManagement = await unsupportedFacade.management(Number(author.rows[0]!.id))
+    assert.equal(unsupportedManagement.catalog.length, 1)
+    assert.deepEqual(
+      unsupportedManagement.accounts.map((item) => ({ id: item.id, executable: item.executable })),
+      [{ id: account.id, executable: false }],
+    )
+    await assert.rejects(
+      unsupportedFacade.call({
+        userId: Number(author.rows[0]!.id),
+        targetId: account.id,
+        actionId: 'read',
+        params: {},
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError && error.code === 'RUNTIME_UNAVAILABLE',
     )
     assert.equal(
       (await listDeclarativeConnections(Number(author.rows[0]!.id), getPool())).some(
@@ -546,6 +579,9 @@ describe('marketplace Plugin kernel migration', () => {
       redis: leaseRedis(),
       env,
       browserRuntime: {
+        supportsContract() {
+          return true
+        },
         async runReadAction() {
           throw new KnowledgePlanetRuntimeError('LOGIN_EXPIRED_ACCOUNT')
         },
@@ -1230,6 +1266,7 @@ describe('marketplace Plugin kernel migration', () => {
         pool: getPool(),
         redis: transitionRedis,
         env: process.env,
+        browserRuntime: { supportsContract: () => true } as never,
       })
       assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 15)
       const orphanManagement = await facade.management(orphanUserId)

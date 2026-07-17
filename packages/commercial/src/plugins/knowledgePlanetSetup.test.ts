@@ -4,9 +4,9 @@ import { describe, test } from 'node:test'
 import type { Pool, QueryResult, QueryResultRow } from 'pg'
 
 import {
-  KnowledgePlanetDockerService,
-  KnowledgePlanetRuntimeError,
+  type KnowledgePlanetDockerService,
   type KnowledgePlanetLoginWorkerHandle,
+  KnowledgePlanetRuntimeError,
 } from './knowledgePlanet.js'
 import {
   KnowledgePlanetSetupError,
@@ -82,6 +82,7 @@ describe('Knowledge Planet managed setup', () => {
     assert.equal(concurrent.sessionId, first.sessionId)
     assert.equal(recovered.sessionId, first.sessionId)
     assert.equal(recovered.status, 'waiting_for_scan')
+    assert.equal(recovered.phase, 'generating_qr')
   })
 
   test('stores an account only after authenticated worker cleanup completes', async () => {
@@ -110,27 +111,74 @@ describe('Knowledge Planet managed setup', () => {
       },
     } as unknown as Pool
     let accountCreates = 0
+    let finishAccount!: (value: { id: string }) => void
+    const account = new Promise<{ id: string }>((resolve) => {
+      finishAccount = resolve
+    })
     const manager = new KnowledgePlanetSetupManager(service, {
       pool,
       loadEntitledVersion: async () => 41,
       resolvePins: async () => [],
       createAccount: async () => {
         accountCreates++
-        return { id: '91' }
+        return account
       },
     })
     const started = await manager.start(7, true)
     assert.equal(started.status, 'waiting_for_scan')
+    assert.equal(started.phase, 'generating_qr')
+    callbacks!.onQr(Buffer.from('qr'))
+    assert.equal((await manager.status(7, started.sessionId)).phase, 'waiting_for_scan')
     callbacks!.onAuthenticated({ cookies: [], origins: [] })
-    assert.equal((await manager.status(7, started.sessionId)).status, 'finalizing')
+    const confirmed = await manager.status(7, started.sessionId)
+    assert.equal(confirmed.status, 'finalizing')
+    assert.equal(confirmed.phase, 'scan_confirmed')
+    callbacks!.onQr(Buffer.from('late-qr'))
+    callbacks!.onAuthenticated({ cookies: [], origins: [] })
+    assert.equal((await manager.status(7, started.sessionId)).phase, 'scan_confirmed')
     assert.equal(accountCreates, 0)
     workerDone.resolve()
     for (let i = 0; i < 20 && accountCreates === 0; i++)
       await new Promise((resolveWait) => setTimeout(resolveWait, 1))
     assert.equal(accountCreates, 1)
+    assert.equal((await manager.status(7, started.sessionId)).phase, 'saving')
+    finishAccount({ id: '91' })
+    for (let i = 0; i < 20; i++) {
+      if ((await manager.status(7, started.sessionId)).status === 'active') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1))
+    }
     const active = await manager.status(7, started.sessionId)
     assert.equal(active.status, 'active')
+    assert.equal(active.phase, 'active')
     assert.equal(active.accountId, '91')
+  })
+
+  test('reports runtime readiness independently from setup-compatible entitlement', async () => {
+    const workerDone = deferred()
+    const service = {
+      async startLogin(args: { sessionId: string }) {
+        return {
+          sessionId: args.sessionId,
+          done: workerDone.promise,
+          stop: async () => workerDone.reject(),
+        }
+      },
+      async closeAndDrain() {},
+    } as unknown as KnowledgePlanetDockerService
+    const pool = {
+      async query<Row extends QueryResultRow>(): Promise<QueryResult<Row>> {
+        return result<Row>()
+      },
+    } as unknown as Pool
+    const manager = new KnowledgePlanetSetupManager(service, {
+      pool,
+      loadEntitledVersion: async () => ({ versionId: 41, agentReady: false }),
+      resolvePins: async () => [],
+    })
+
+    const setup = await manager.start(7, true)
+    assert.equal(setup.agentReady, false)
+    await manager.cancel(7, setup.sessionId)
   })
 
   test('uses the account row as authority after unlink and allows immediate re-authorization', async () => {
@@ -229,7 +277,9 @@ describe('Knowledge Planet managed setup', () => {
       },
     })
     const started = await manager.start(7, true)
-    assert.equal((await manager.cancel(7, started.sessionId)).status, 'cancelled')
+    const cancelled = await manager.cancel(7, started.sessionId)
+    assert.equal(cancelled.status, 'cancelled')
+    assert.equal(cancelled.phase, 'cancelled')
     onAuthenticated!({ cookies: [], origins: [] })
     await new Promise((resolveWait) => setTimeout(resolveWait, 1))
     assert.equal(stopCalls, 1)

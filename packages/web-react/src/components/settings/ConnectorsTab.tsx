@@ -511,9 +511,13 @@ export function ConnectorsTab({
         auth={auth}
         plugin={setupRuntimeFor}
         onClose={() => setSetupRuntimeFor(null)}
-        onBound={() => {
+        onBound={(agentReady) => {
           setErr(null)
-          setSuccess('知识星球账号已授权并自动启用，Agent 现在可以直接读取相关内容。')
+          setSuccess(
+            agentReady
+              ? '知识星球账号已授权并自动启用，Agent 现在可以直接读取相关内容。'
+              : '知识星球登录信息已加密保存；系统完成 Plugin 升级后会自动启用。',
+          )
           reload()
         }}
       />
@@ -670,7 +674,7 @@ function KnowledgePlanetSetupDialog({
   auth: AuthSession
   plugin: RuntimePluginCatalogEntry | null
   onClose: () => void
-  onBound: () => void
+  onBound: (agentReady: boolean) => void
 }) {
   const [starting, setStarting] = useState(false)
   const [setup, setSetup] = useState<KnowledgePlanetSetupView | null>(null)
@@ -681,14 +685,24 @@ function KnowledgePlanetSetupDialog({
   const setupSessionId = setup?.sessionId ?? null
   const setupStatus = setup?.status ?? null
   const setupQrReady = setup?.qrReady === true
+  const setupPhase =
+    setup?.phase ??
+    (setupStatus === 'active'
+      ? 'active'
+      : setupStatus === 'finalizing'
+        ? 'saving'
+        : setupStatus === 'waiting_for_scan'
+          ? setupQrReady
+            ? 'waiting_for_scan'
+            : 'generating_qr'
+          : setupStatus)
 
   const findExistingAccount = useCallback(async (): Promise<
     RuntimePluginAccount | undefined
   > => {
     const management = await api.getPluginManagement(auth)
     return management.accounts.find(
-      (item) =>
-        item.provider === 'knowledge-planet' && item.status === 'active' && item.executable,
+      (item) => item.provider === 'knowledge-planet' && item.status === 'active',
     )
   }, [auth])
 
@@ -698,7 +712,9 @@ function KnowledgePlanetSetupDialog({
       setSetup({
         sessionId: sessionId ?? `existing-${account.id}`,
         status: 'active',
+        phase: 'active',
         qrReady: false,
+        agentReady: account.executable,
         createdAt: now,
         expiresAt: now,
         accountId: account.id,
@@ -792,14 +808,8 @@ function KnowledgePlanetSetupDialog({
   useEffect(() => {
     if (setupStatus !== 'active' || reportedActive) return
     setReportedActive(true)
-    onBound()
-  }, [onBound, reportedActive, setupStatus])
-
-  useEffect(() => {
-    if (setupStatus !== 'active') return
-    const timer = window.setTimeout(onClose, 1_200)
-    return () => window.clearTimeout(timer)
-  }, [onClose, setupStatus])
+    onBound(setup?.agentReady !== false)
+  }, [onBound, reportedActive, setup?.agentReady, setupStatus])
 
   const start = async () => {
     if (starting) return
@@ -856,20 +866,20 @@ function KnowledgePlanetSetupDialog({
       description="微信扫码一次即可；Plugin 只读取你已加入星球的内容，不执行发布、评论或删除。"
       footer={
         <>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={cancelling || setup?.status === 'finalizing'}
-            onClick={() => void close()}
-          >
-            {cancelling
-              ? '正在取消…'
-              : setup?.status === 'active'
-                ? '即将完成'
+          {setup?.status !== 'active' && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={cancelling || setup?.status === 'finalizing'}
+              onClick={() => void close()}
+            >
+              {cancelling
+                ? '正在取消…'
                 : setup?.status === 'finalizing'
                   ? '正在安全保存…'
                   : '取消'}
-          </Button>
+            </Button>
+          )}
           {!setup && (
             <Button
               variant="primary"
@@ -885,6 +895,11 @@ function KnowledgePlanetSetupDialog({
               重新授权
             </Button>
           )}
+          {setup?.status === 'active' && (
+            <Button variant="primary" size="sm" onClick={onClose}>
+              <Check size={13} /> 完成
+            </Button>
+          )}
         </>
       }
     >
@@ -896,6 +911,46 @@ function KnowledgePlanetSetupDialog({
             只通过固定域名白名单读取数据，不会发布、评论、点赞或删除内容。
           </div>
         )}
+        {setup && !terminalFailure && (
+          <ol
+            className="grid grid-cols-4 gap-1 rounded-lg border border-border bg-surface px-2 py-2"
+            aria-label="知识星球授权进度"
+          >
+            {['生成二维码', '微信确认', '加密保存', '授权完成'].map((label, index) => {
+              const current =
+                setupPhase === 'generating_qr'
+                  ? 0
+                  : setupPhase === 'waiting_for_scan'
+                    ? 1
+                    : setupPhase === 'scan_confirmed' || setupPhase === 'saving'
+                      ? 2
+                      : 3
+              const complete = setupPhase === 'active' || index < current
+              const active = index === current && setupPhase !== 'active'
+              return (
+                <li
+                  key={label}
+                  className={`flex min-w-0 flex-col items-center gap-1 text-center text-[10.5px] ${
+                    complete || active ? 'text-accent' : 'text-faint'
+                  }`}
+                >
+                  <span
+                    className={`flex size-5 items-center justify-center rounded-full border ${
+                      complete
+                        ? 'border-accent bg-accent text-white'
+                        : active
+                          ? 'border-accent bg-accent-soft'
+                          : 'border-border'
+                    }`}
+                  >
+                    {complete ? <Check size={12} /> : active ? <Spinner /> : index + 1}
+                  </span>
+                  <span className="truncate">{label}</span>
+                </li>
+              )
+            })}
+          </ol>
+        )}
         {setup?.status === 'waiting_for_scan' && (
           <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-border bg-white p-4">
             {qrUrl ? (
@@ -905,18 +960,30 @@ function KnowledgePlanetSetupDialog({
                 <Spinner /> 正在加载二维码…
               </div>
             )}
-            <p className="text-center text-[12px] text-muted" aria-live="polite">
-              等待扫码 · 请使用微信扫码，并在手机上确认登录
-            </p>
+            <output className="text-center text-[12px] text-muted" aria-live="polite">
+              {setupPhase === 'generating_qr'
+                ? '正在安全生成微信二维码，通常需要几秒…'
+                : '二维码已生成 · 请使用微信扫码，并在手机上确认登录'}
+            </output>
           </div>
         )}
         {setup?.status === 'finalizing' && (
-          <div className="flex items-center justify-center gap-2 py-12 text-[13px] text-muted">
-            <Spinner /> 手机已确认 · 正在安全保存并启用 Plugin…
-          </div>
+          <output
+            className="flex items-center justify-center gap-2 py-12 text-[13px] text-muted"
+            aria-live="polite"
+          >
+            <Spinner />{' '}
+            {setupPhase === 'scan_confirmed'
+              ? '微信扫码已确认 · 正在校验并关闭临时登录环境…'
+              : '登录状态有效 · 正在加密保存账号…'}
+          </output>
         )}
         {setup?.status === 'active' && (
-          <Alert tone="success">授权成功，知识星球已自动启用；即将返回账号列表。</Alert>
+          <Alert tone="success">
+            {setup.agentReady === false
+              ? '微信登录已确认，登录信息已加密保存。系统完成 Plugin 升级后会自动启用，无需再次扫码。'
+              : '授权成功，知识星球已自动启用；Agent 现在可以直接读取相关内容。'}
+          </Alert>
         )}
         {terminalFailure && (
           <Alert tone="warning">

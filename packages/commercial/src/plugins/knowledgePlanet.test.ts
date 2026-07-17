@@ -20,9 +20,11 @@ import {
   KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   KNOWLEDGE_PLANET_PLUGIN_SLUG,
   KNOWLEDGE_PLANET_PLUGIN_VERSION,
+  KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS,
   KNOWLEDGE_PLANET_WORKER_DIGEST,
   KnowledgePlanetDockerService,
   KnowledgePlanetRuntimeError,
+  classifyKnowledgePlanetSetupPin,
   createKnowledgePlanetRuntimeRegistries,
   decodeKnowledgePlanetWorkerFramesForTest,
   isOfficialKnowledgePlanetPluginIdentity,
@@ -73,6 +75,29 @@ describe('official Knowledge Planet Plugin', () => {
         reviewSource: 'platform',
       }),
       false,
+    )
+  })
+
+  test('accepts only the current or exact signed v1.0 pin for product setup', () => {
+    assert.equal(
+      classifyKnowledgePlanetSetupPin({
+        version: KNOWLEDGE_PLANET_PLUGIN_VERSION,
+        artifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+        execContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
+      }),
+      'current',
+    )
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 1)
+    assert.equal(
+      classifyKnowledgePlanetSetupPin(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!),
+      'compatible-predecessor',
+    )
+    assert.equal(
+      classifyKnowledgePlanetSetupPin({
+        ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
+        execContractHash: '0'.repeat(64),
+      }),
+      null,
     )
   })
 
@@ -178,7 +203,7 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('waits for the real QR image and never publishes the iframe loading mask', () => {
-    assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 15_000)
+    assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 45_000)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION, 0.15)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION, 0.2)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION, 70)

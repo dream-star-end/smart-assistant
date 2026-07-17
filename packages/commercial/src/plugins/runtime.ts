@@ -209,7 +209,8 @@ export class PluginRuntimeFacade {
         verified.pluginType !== 'managed-browser' ||
         verified.artifactHash !== candidate.account_artifact_hash ||
         verified.execContractHash !== candidate.account_exec_contract_hash ||
-        verified.contract.account.contractVersion !== candidate.auth_contract_version
+        verified.contract.account.contractVersion !== candidate.auth_contract_version ||
+        !this.browser.supportsContract(verified.contract)
       )
         return null
       return 'managed-browser'
@@ -253,6 +254,8 @@ export class PluginRuntimeFacade {
     for (const row of rows) {
       const item = verified.get(Number(row.id))
       if (!item || item.pluginType !== row.plugin_type) continue
+      if (item.pluginType === 'managed-browser' && !this.browser.supportsContract(item.contract))
+        continue
       out.push({
         versionId: row.id,
         slug: row.slug,
@@ -329,6 +332,14 @@ export class PluginRuntimeFacade {
     const verified = await listVerifiedRuntimePluginContracts(versionIds, this.pool, {
       env: this.opts.env,
     })
+    const runtimeSupportedVersionIds = new Set(
+      [...verified.values()]
+        .filter(
+          (item) =>
+            item.pluginType !== 'managed-browser' || this.browser.supportsContract(item.contract),
+        )
+        .map((item) => String(item.versionId)),
+    )
     const catalog: RuntimePluginManagementEntry[] = rows.rows.map((row) => {
       const installed = verified.get(Number(row.installed_id))
       const latest = row.latest_id ? verified.get(Number(row.latest_id)) : undefined
@@ -404,7 +415,8 @@ export class PluginRuntimeFacade {
         executable:
           row.status === 'active' &&
           plugin?.installedCurrent === true &&
-          plugin.versionId === row.connector_version_id,
+          plugin.versionId === row.connector_version_id &&
+          runtimeSupportedVersionIds.has(row.connector_version_id),
       }
     })
     return { catalog, accounts }
@@ -453,7 +465,12 @@ export class PluginRuntimeFacade {
     const managedTargets: RuntimePluginTargetEntry[] = []
     for (const row of accounts.rows) {
       const item = verified.get(Number(row.connector_version_id))
-      if (!item || item.pluginType !== 'managed-browser') continue
+      if (
+        !item ||
+        item.pluginType !== 'managed-browser' ||
+        !this.browser.supportsContract(item.contract)
+      )
+        continue
       managedTargets.push({
         id: row.id,
         provider: row.provider,
@@ -545,6 +562,11 @@ export class PluginRuntimeFacade {
     )
     if (initialVerified.pluginType !== 'managed-browser')
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
+    if (!this.browser.supportsContract(initialVerified.contract))
+      throw new PluginRuntimeFacadeError(
+        'RUNTIME_UNAVAILABLE',
+        'managed-browser Plugin runtime unavailable',
+      )
     const action = initialVerified.contract.actions.find((item) => item.id === input.actionId)
     if (!action) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
 
@@ -561,7 +583,8 @@ export class PluginRuntimeFacade {
       if (
         verified.pluginType !== 'managed-browser' ||
         verified.artifactHash !== initialVerified.artifactHash ||
-        verified.execContractHash !== initialVerified.execContractHash
+        verified.execContractHash !== initialVerified.execContractHash ||
+        !this.browser.supportsContract(verified.contract)
       )
         throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed before invoke')
       const fencedRow = await fencePluginAccountInvocation({
@@ -608,7 +631,8 @@ export class PluginRuntimeFacade {
       if (
         current.pluginType !== 'managed-browser' ||
         current.artifactHash !== verified.artifactHash ||
-        current.execContractHash !== verified.execContractHash
+        current.execContractHash !== verified.execContractHash ||
+        !this.browser.supportsContract(current.contract)
       )
         throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed during invoke')
       await assertRuntimePluginInstallEntitlement(input.userId, current, this.pool, {

@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import Docker from 'dockerode'
 import IORedis from 'ioredis'
 
+import { canonicalSha256Hex } from '../src/connectors/spec/canonical.js'
 import { closePool, getPool } from '../src/db/index.js'
 import { query } from '../src/db/queries.js'
 import {
@@ -28,6 +29,7 @@ import {
   KNOWLEDGE_PLANET_WORKER_DIGEST,
   KnowledgePlanetDockerService,
   KnowledgePlanetRuntimeError,
+  classifyKnowledgePlanetSetupPin,
   createKnowledgePlanetRuntimeRegistries,
   validateKnowledgePlanetAccountState,
 } from '../src/plugins/knowledgePlanet.js'
@@ -681,6 +683,92 @@ async function assertCurrentReleaseCompatible(targetRelease: string): Promise<vo
   )
 }
 
+async function assertSetupFirstSafe(phase: 'pre' | 'post'): Promise<void> {
+  const row = await query<{
+    listing_state: string
+    revoked_reason: string | null
+    version_id: string
+    version_review_source: string | null
+    active_installs: string
+    exact_active_installs: string
+    active_accounts: string
+  }>(
+    `SELECT l.state AS listing_state, l.revoked_reason,
+            v.id::text AS version_id, v.review_source AS version_review_source,
+            (SELECT count(*)::text FROM marketplace_installs i
+              WHERE i.slug = l.slug AND i.uninstalled_at IS NULL) AS active_installs,
+            (SELECT count(*)::text FROM marketplace_installs i
+              WHERE i.slug = l.slug AND i.version_id = v.id
+                AND i.artifact_hash = v.artifact_hash
+                AND i.uninstalled_at IS NULL) AS exact_active_installs,
+            (SELECT count(*)::text FROM connections c
+              WHERE c.provider = l.slug AND c.revoked_at IS NULL) AS active_accounts
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = $1 AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
+        AND v.status = 'approved' AND v.security_review_state = 'security_approved'
+        AND v.functional_verify_state = 'verified' AND v.exec_revoked_at IS NULL`,
+    [KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id],
+  )
+  const current = row.rows[0]
+  if (!current || current.version_review_source !== 'platform')
+    throw new Error('setup-first requires an approved platform Knowledge Planet version')
+  if (
+    (phase === 'pre' && (current.listing_state !== 'active' || current.revoked_reason !== null)) ||
+    (phase === 'post' &&
+      (current.listing_state !== 'unlisted' ||
+        current.revoked_reason !== OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON))
+  )
+    throw new Error(`setup-first ${phase} listing gate state is invalid`)
+  const versionId = Number(current.version_id)
+  if (!Number.isSafeInteger(versionId) || versionId <= 0)
+    throw new Error('setup-first current version ID is invalid')
+  const verified = await loadVerifiedRuntimePluginContract(versionId, getPool(), {
+    env: process.env,
+    allowUnlisted: phase === 'post',
+  })
+  if (
+    verified.pluginType !== 'managed-browser' ||
+    verified.slug !== KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id ||
+    verified.artifactHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash ||
+    classifyKnowledgePlanetSetupPin({
+      version: verified.contract.version,
+      artifactHash: verified.artifactHash,
+      execContractHash: verified.execContractHash,
+    }) !== 'compatible-predecessor'
+  )
+    throw new Error('setup-first current Plugin is not the exact compatible predecessor')
+  if (
+    canonicalSha256Hex(verified.contract.account) !==
+      canonicalSha256Hex(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.account) ||
+    canonicalSha256Hex(verified.contract.runtime.accountState) !==
+      canonicalSha256Hex(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.accountState)
+  )
+    throw new Error('setup-first predecessor browser account contract is incompatible')
+  const activeInstalls = Number(current.active_installs)
+  const exactActiveInstalls = Number(current.exact_active_installs)
+  const activeAccounts = Number(current.active_accounts)
+  if (
+    !Number.isSafeInteger(activeInstalls) ||
+    activeInstalls <= 0 ||
+    exactActiveInstalls !== activeInstalls
+  )
+    throw new Error('setup-first requires only exact current active installs')
+  if (!Number.isSafeInteger(activeAccounts) || activeAccounts !== 0)
+    throw new Error('setup-first requires zero active Knowledge Planet accounts')
+  process.stdout.write(
+    `${JSON.stringify({
+      safe: true,
+      phase,
+      currentVersionId: current.version_id,
+      currentArtifactHash: verified.artifactHash,
+      targetArtifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+      activeInstalls,
+      activeAccounts,
+    })}\n`,
+  )
+}
+
 async function classifyCurrentForRelease(targetRelease: string): Promise<void> {
   const target = await targetReleaseContractIfPresent(targetRelease, {
     allowStagedSource: true,
@@ -721,6 +809,9 @@ async function main(): Promise<void> {
   const classifyTarget = mode?.startsWith('--classify-current-for-release=')
     ? mode.slice('--classify-current-for-release='.length)
     : null
+  const setupFirstPhase = mode?.startsWith('--assert-setup-first-safe=')
+    ? mode.slice('--assert-setup-first-safe='.length)
+    : null
   if (
     process.argv.length !== 3 ||
     (mode !== '--smoke-only' &&
@@ -730,10 +821,12 @@ async function main(): Promise<void> {
       !transitionTarget &&
       !openGateTarget &&
       !compatibilityTarget &&
-      !classifyTarget)
+      !classifyTarget &&
+      setupFirstPhase !== 'pre' &&
+      setupFirstPhase !== 'post')
   )
     throw new Error(
-      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH',
+      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH|--assert-setup-first-safe=pre|post',
     )
   try {
     if (verifyUserId) await verifyUser(verifyUserId)
@@ -743,6 +836,8 @@ async function main(): Promise<void> {
     else if (transitionTarget) await transitionToRelease(transitionTarget)
     else if (openGateTarget) await openListingGateToRelease(openGateTarget)
     else if (compatibilityTarget) await assertCurrentReleaseCompatible(compatibilityTarget)
+    else if (setupFirstPhase === 'pre' || setupFirstPhase === 'post')
+      await assertSetupFirstSafe(setupFirstPhase)
     else await classifyCurrentForRelease(classifyTarget!)
   } finally {
     await closePool().catch(() => {})

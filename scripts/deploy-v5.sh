@@ -18,6 +18,8 @@
 #   scripts/deploy-v5.sh --bootstrap   # 首次:建源码树/HOME/openclaude.json/env/unit + 拷依赖 + 起服务
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --with-dist   # 代码+前端两生效面、【单次】重启(首选;两段式成对重启会二次掐断在途 turn)
+#   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
+#                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
 #   scripts/deploy-v5.sh --census-ccb-baseline  # 只读统计缺 baseline mount 的 V5 容器
@@ -180,6 +182,7 @@ assert_overrides_no_remove_keys() {
 }
 
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0
+DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 # P3 cohort lane 参数
@@ -198,6 +201,9 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
+    # Knowledge Planet v1.0。用户扫码后，正常 deploy 再消费同一账号升级到 v1.1。
+    --defer-knowledge-planet-upgrade) DEFER_KNOWLEDGE_PLANET_UPGRADE=1 ;;
     --enable-platform-bundle) ENABLE_BUNDLE_FLAG=1 ;;
     --enable-runtime-release) ENABLE_RELEASE_FLAG=1 ;;
     --disable-platform-bundle) DISABLE_BUNDLE_FLAG=1 ;;
@@ -253,6 +259,11 @@ done
 [[ "$MODE" == "promote" && ! "$PROMOTE_PCT" =~ ^([0-9]|[1-9][0-9]|100)$ ]] && { echo "✗ --promote=<pct> 需 pct∈0..100" >&2; exit 2; }
 [[ "$MODE" == "knowledge-planet-verify" && ! "$KNOWLEDGE_PLANET_VERIFY_USER" =~ ^[1-9][0-9]{0,15}$ ]] \
   && { echo "✗ --verify-knowledge-planet-user=<id> 需正整数用户 ID" >&2; exit 2; }
+if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
+      && ( "$MODE" != "deploy" || "$WITH_DIST" != 1 ) ]]; then
+  echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
+  exit 2
+fi
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 [[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
   || { echo "✗ CADDY_HTTP_PORT 必须是 1..65535 的规范十进制端口" >&2; exit 2; }
@@ -3867,6 +3878,43 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
 }
 
+# One-shot setup-first deploy guard. It permits exactly the currently signed
+# platform v1.0 predecessor, identical encrypted browser-account semantics,
+# exact active installs, and zero persisted accounts. The post phase repeats
+# the proof after the old gateway process has drained while the listing gate is
+# still closed, so a late QR completion cannot race the source cutover.
+knowledge_planet_plugin_assert_setup_first_safe() { # <pinned master release> <pre|post>
+  local release="$1" phase="$2"
+  [[ "$phase" == pre || "$phase" == post ]] || {
+    echo "✗ Knowledge Planet setup-first phase 非法:$phase" >&2
+    return 2
+  }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert Knowledge Planet setup-first $phase: exact signed v1.0 + exact installs + zero accounts @ $release"
+    return 0
+  fi
+  local output result
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--assert-setup-first-safe=$phase'")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e --arg phase "$phase" '
+    .safe == true and .phase == $phase and
+    (.currentVersionId | type == "string" and test("^[0-9]+$")) and
+    (.currentArtifactHash | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.targetArtifactHash | type == "string" and test("^[0-9a-f]{64}$")) and
+    .currentArtifactHash != .targetArtifactHash and
+    (.activeInstalls | type == "number" and . > 0) and
+    .activeAccounts == 0' >/dev/null <<<"$result" || {
+    echo "✗ Knowledge Planet setup-first $phase 返回非法结果" >&2
+    return 1
+  }
+}
+
 knowledge_planet_plugin_seed() { # <active master release>
   local release="$1"
   if [[ "$DRY" == 1 ]]; then
@@ -4117,9 +4165,15 @@ deploy() {
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
-  echo "── Knowledge Planet Plugin:noninteractive exact-image approval/handoff 预激活门(DB 零写入)──"
-  knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
-    || { echo "✗ Knowledge Planet Plugin 非交互预验证门失败,未激活新 release" >&2; exit 1; }
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:setup-first 前置守卫(旧 v1.0 exact pin + 零账号)──"
+    knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre \
+      || { echo "✗ Knowledge Planet setup-first 前置守卫失败,未激活新 release" >&2; exit 1; }
+  else
+    echo "── Knowledge Planet Plugin:noninteractive exact-image approval/handoff 预激活门(DB 零写入)──"
+    knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
+      || { echo "✗ Knowledge Planet Plugin 非交互预验证门失败,未激活新 release" >&2; exit 1; }
+  fi
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
@@ -4145,15 +4199,29 @@ deploy() {
     exit 1
   fi
   kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
-  if ! knowledge_planet_plugin_classify_previous_release \
-    "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
-    knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-      || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
-    end_planned_maintenance || true
-    echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
-    exit 1
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    if [[ "$DRY" != 1 && -z "$kp_previous_plugin_version_id" ]]; then
+      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || mark_deploy_recovery_required "Knowledge Planet setup-first gate closed without a current version and restore failed"
+      end_planned_maintenance || true
+      echo "✗ Knowledge Planet setup-first 关闭门后 current version 丢失" >&2
+      exit 1
+    fi
+    # pre guard has already proven the previous source/version is the exact
+    # compatible predecessor; keep this true so every later failure executes
+    # the ordinary symmetric source+gate compensation.
+    kp_had_previous_plugin=1
+  else
+    if ! knowledge_planet_plugin_classify_previous_release \
+      "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
+      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
+      end_planned_maintenance || true
+      echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
+      exit 1
+    fi
+    kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
   fi
-  kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
   echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
   if [[ "$hc_any" == 1 ]]; then
     if ! activate_runtime_tuple; then
@@ -4184,12 +4252,24 @@ deploy() {
       validation_failure="egress activation failed"
     fi
   fi
+  if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:setup-first drain 后守卫(门保持关闭、账号仍为零)──"
+    if ! knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" post; then
+      validation_failure="Knowledge Planet setup-first post-drain guard failed"
+    fi
+  fi
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
     validation_failure="full master smoke failed"
   fi
   if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
+  fi
+  if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:扫码 UI 已就绪，恢复旧 v1.0 listing gate──"
+    if ! knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"; then
+      validation_failure="Knowledge Planet setup-first old gate reopen failed"
+    fi
   fi
   if [[ -n "$validation_failure" ]]; then
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
@@ -4200,6 +4280,14 @@ deploy() {
     end_planned_maintenance || true
     echo "✗ 部署强校验失败；已确认回到旧 source/账号版本，部署未生效" >&2
     exit 1
+  fi
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
+    end_planned_maintenance
+    gc_releases
+    [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
+    echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
+    return 0
   fi
   echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
   if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then

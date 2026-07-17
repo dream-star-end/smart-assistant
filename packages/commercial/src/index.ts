@@ -1341,7 +1341,9 @@ export async function registerCommercial(
       expectedOwnerUid: 0,
     })
     pluginFacade = new PluginRuntimeFacade({ redis, browserRuntime })
-    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService)
+    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
   } else {
     pluginFacade = new PluginRuntimeFacade({ redis })
   }
