@@ -540,7 +540,11 @@ body {
 .prose strong { font-weight: 650; }
 .prose blockquote { margin: 0 0 16px; padding: 2px 0 2px 16px; border-left: 3px solid var(--border-strong); color: var(--muted); }
 .prose hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
-.prose table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 14.5px; display: block; overflow-x: auto; }
+.prose .markdown-table-wrap { margin: 0 0 16px; }
+.prose .markdown-table-hint { margin: 0 0 6px; font-size: 11px; color: var(--faint); }
+.prose .markdown-table-region { overflow-x: auto; border-radius: 6px; outline: none; }
+.prose .markdown-table-region:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
+.prose table { width: 100%; border-collapse: collapse; margin: 0; font-size: 14.5px; }
 .prose th, .prose td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
 .prose th { background: var(--hover); font-weight: 600; }
 .prose :not(pre) > code {
@@ -558,6 +562,21 @@ body {
    scope 到 .prose(katex-display 只出现在助手正文);padding-block 给极端 accent/大定界符
    墨迹留余量,避免被 overflow-y:hidden 裁掉。 */
 .prose .katex-display { overflow-x: auto; overflow-y: hidden; padding-block: 0.08em; }
+
+/* Center dialogs share one visual-viewport/safe-area positioning contract. Keep the existing
+   translateY(-50%) on each Radix content node. Declaration order is deliberate: vh is the old
+   WebView fallback, dvh handles modern browser chrome, and App's measured visualViewport px vars
+   are authoritative for iOS keyboard pan because Radix portals live outside fixed #root. */
+.oc-center-dialog {
+  --oc-center-safe-top: max(0.5rem, env(safe-area-inset-top));
+  --oc-center-safe-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  top: calc(var(--oc-center-safe-top) + (100vh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
+  max-height: min(85vh, calc(100vh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
+  top: calc(var(--oc-center-safe-top) + (100dvh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
+  max-height: min(85dvh, calc(100dvh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
+  top: calc(var(--oc-visual-offset-top, 0px) + var(--oc-center-safe-top) + (var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
+  max-height: min(var(--oc-visual-height-85, 85dvh), calc(var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
+}
 
 /* highlight.js bridged to our tokens */
 .hljs { color: var(--fg); background: transparent; }

@@ -300,7 +300,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
           </button>
         </div>
       ) : (
-        rs && (
+        report && rs && (
           <>
             {/* 窗口口径 4 张 Stat 卡 */}
             <div className="grid grid-cols-2 gap-2 px-5 py-4">

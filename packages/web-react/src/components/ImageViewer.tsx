@@ -185,6 +185,7 @@ export function ImageViewer({
   submitImageEdit: submitProp,
   initialMode = 'view',
   readOnly = false,
+  referrerPolicy,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -200,6 +201,8 @@ export function ImageViewer({
   initialMode?: ViewerMode
   /** 只读媒体(站内信/后台预览)：不从聊天上下文继承编辑、评论、分享动作。 */
   readOnly?: boolean
+  /** 外链只读图片沿用缩略态的 referrer policy。 */
+  referrerPolicy?: React.HTMLAttributeReferrerPolicy
 }) {
   const ctx = useContext(ImageEditActionsContext)
   const submitImageEdit = readOnly ? undefined : submitProp ?? ctx.submitImageEdit
@@ -566,6 +569,7 @@ export function ImageViewer({
                       src={viewerUrl}
                       alt={alt}
                       decoding="async"
+                      referrerPolicy={referrerPolicy}
                       className="max-h-full max-w-full object-contain opacity-100 transition-opacity duration-200"
                       draggable={false}
                     />
