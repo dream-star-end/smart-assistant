@@ -2,6 +2,10 @@ import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun, X } from "lucide-r
 import { type ReactNode, useEffect, useState } from "react";
 import type { Theme } from "../../hooks/useTheme";
 import { api, apiErrorMessage } from "../../lib/api";
+import {
+  readAutoContinuePreamblePref,
+  writeAutoContinuePreamblePref,
+} from "../../lib/chat/socket";
 import type { AuthSession, PublicModel } from "../../lib/types";
 import {
   initialModelFromPreferences,
@@ -184,6 +188,9 @@ export function PreferencesTab({
         </label>
       </div>
 
+      {/* 对话行为（客户端本地偏好，localStorage） */}
+      <ChatBehaviorSection />
+
       {/* Max+ 特色功能：V5 原生后台记忆整理（默认关闭，真实调用按实际积分计费）。 */}
       <div className="border-t border-border px-5 py-4">
         <div className="overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-sm">
@@ -278,6 +285,38 @@ export function PreferencesTab({
 
       {/* API Key 自管（admin-only rollout 命中 403 时整段隐藏） */}
       {canManageApiKeys && <ApiKeysSection auth={auth} />}
+    </div>
+  );
+}
+
+/**
+ * 对话行为（客户端本地偏好，localStorage，非后端 preferences）。
+ *
+ * 「自动继续执行」：模型给出行动承诺式开场白后误结束时，socket 会替用户再自动跑一轮
+ * （按实际用量扣积分）。这是替用户扣费的自动动作，给一个可关的开关，**默认开**（不改现行为）。
+ * 权威读写在 lib/chat/socket（与消费方 autoContinueActionPreamble 同源），此处仅呈现开关。
+ */
+function ChatBehaviorSection() {
+  const [autoContinue, setAutoContinue] = useState(readAutoContinuePreamblePref);
+  return (
+    <div className="border-t border-border px-5 py-4">
+      <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">对话行为</div>
+      <label className="flex items-start justify-between gap-3 py-2">
+        <span className="min-w-0">
+          <span className="block text-[13.5px] text-fg">自动继续执行</span>
+          <span className="mt-0.5 block text-[11.5px] leading-relaxed text-faint">
+            当助手说「我来处理…」却提前停下时，自动替你发起一次继续（按实际用量扣积分）。关闭后仅提示，不自动继续。
+          </span>
+        </span>
+        <Switch
+          aria-label="自动继续执行"
+          checked={autoContinue}
+          onCheckedChange={(c) => {
+            writeAutoContinuePreamblePref(c);
+            setAutoContinue(c);
+          }}
+        />
+      </label>
     </div>
   );
 }

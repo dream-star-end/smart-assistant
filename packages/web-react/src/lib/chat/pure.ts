@@ -389,8 +389,12 @@ export function shouldAutoContinueActionPreamble(p: {
   }>;
   targetMsgId: string;
   stopReason?: string | null;
+  /** 用户偏好开关:auto-continue 会替用户多跑一轮(扣费),显式关闭时不续写(仅提示)。
+   *  省略/true = 保持默认开(现行为不变);仅当显式为 false 才禁用。 */
+  enabled?: boolean;
 }): boolean {
-  const { messages, targetMsgId, stopReason } = p;
+  const { messages, targetMsgId, stopReason, enabled } = p;
+  if (enabled === false) return false;
   if (stopReason !== "end_turn" || !Array.isArray(messages)) return false;
   const idx = messages.findIndex((m) => m && m.id === targetMsgId);
   if (idx < 0 || isAutoContinueMsg(messages[idx])) return false;
