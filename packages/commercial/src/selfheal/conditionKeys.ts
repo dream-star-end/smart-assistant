@@ -66,7 +66,7 @@ export const SYSTEM_MAINTENANCE_ON = "system.maintenance_on";
 export const SELFHEAL_DRILL_TRANSPORT = "selfheal.drill:transport_v1";
 
 /**
- * 合成 release 演练 condition(exact;0161 seed;写点=演练脚本
+ * 合成 release 演练 condition(exact;0162 seed;写点=演练脚本
  * scripts/v5-selfheal-drill.ts --release 经 write_alert_condition)。
  *
  * ── 跨仓契约(改动必须两侧同步)──
