@@ -64,6 +64,15 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(km.matchesRoute('kimi-k2.6'), false)
     assert.equal(km.matchesRoute('kimi-k2.7-code-preview'), false)
   })
+  it('moonshot(kimi-k3)精确,大小写不敏感;与 kimi(k2.7)互不越界', () => {
+    const ms = getStaticProvider('moonshot')
+    assert.equal(ms.matchesRoute('kimi-k3'), true)
+    assert.equal(ms.matchesRoute('Kimi-K3'), true)
+    assert.equal(ms.matchesRoute('kimi-k3-preview'), false)
+    assert.equal(ms.matchesRoute('kimi-k2.7-code'), false)
+    // 两家 kimi 上游的路由面必须互斥:k2.7 → 火山 'kimi',k3 → 官方 'moonshot'
+    assert.equal(getStaticProvider('kimi').matchesRoute('kimi-k3'), false)
+  })
 })
 
 describe('staticKeyProviders — findRouteProviderForModel', () => {
@@ -75,6 +84,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
+    assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
     assert.equal(findRouteProviderForModel(''), undefined)
@@ -96,6 +106,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-plus',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
+    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
@@ -107,6 +118,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-max',
       'qwen3.7-plus',
       'kimi-k2.7-code',
+      'kimi-k3',
     ])
   })
 })
@@ -144,6 +156,12 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(km.canonicalizeForPricing('kimi-k2.7-code'), 'kimi-k2.7-code')
     assert.equal(km.canonicalizeForPricing('Kimi-K2.7-Code'), 'kimi-k2.7-code')
     assert.equal(km.canonicalizeForPricing('kimi-k2.6'), null)
+  })
+  it('moonshot → kimi-k3(小写归一)', () => {
+    const ms = getStaticProvider('moonshot')
+    assert.equal(ms.canonicalizeForPricing('kimi-k3'), 'kimi-k3')
+    assert.equal(ms.canonicalizeForPricing('Kimi-K3'), 'kimi-k3')
+    assert.equal(ms.canonicalizeForPricing('kimi-k2.7-code'), null)
   })
 })
 

@@ -117,6 +117,7 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
   "ark",
   "opencodego",
   "kimi",
+  "moonshot",
 ]);
 
 /**

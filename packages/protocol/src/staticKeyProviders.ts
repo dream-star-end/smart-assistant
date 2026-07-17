@@ -18,7 +18,7 @@
 //   route 匹配=大小写敏感前缀家族 / inbound 白名单=2 个精确字面量 / capability=2 个精确字面量(在 CCB) /
 //   pricing canonicalize=不特判(原样)。因此每个关注点是独立字段，不可统一。
 
-export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi'
+export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi' | 'moonshot'
 
 /**
  * 静态 provider key 解析表:provider id → 该 provider 的静态 key。
@@ -243,12 +243,47 @@ const ARK_PLAN_KIMI: StaticKeyProviderSpec = {
   supportsVision: false,
 }
 
+const MOONSHOT_CODING: StaticKeyProviderSpec = {
+  id: 'moonshot',
+  // Moonshot(月之暗面)官方「Kimi For Coding」订阅套餐的 Anthropic 兼容端点(2026-07-17 接入,
+  // boss 的 Allegretto 档订阅)。**与现有 id='kimi'(火山方舟 Agent Plan 托管 kimi-k2.7-code)
+  // 是两家上游**:端点/key/能力面全不同,不能合并——'kimi' 是方舟转售,本 spec 是厂商官方。
+  // 模型 kimi-k3(2026-07-16 发布旗舰,1M 窗口):官方文档声明恒推理(reasoning_effort 仅 max 档)、
+  // 多模态(image/video in)、tool calling。
+  // 实测(2026-07-17,部署机直连探针):非流式全通;thinking 默认返回带 signature 的 thinking block;
+  // **{type:'disabled'} 真生效**(纯直答无思考块,与 k2.7 的 400 不同,故不需要 stripDisabledThinking);
+  // image block 接受(supportsVision=true);max_tokens=100k 不拒(无 k2.7 那种 32768 输出硬顶)。
+  upstreamEndpoint: 'https://api.kimi.com/coding/v1/messages',
+  // 实测 x-api-key 鉴权可用(Anthropic 原生风格,官方 Claude Code 接入文档同款)。
+  authScheme: 'x-api-key',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'kimi-k3'
+  },
+  inboundModelIds: ['kimi-k3'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'kimi-k3' ? 'kimi-k3' : null
+  },
+  stripHeaders: ['anthropic-beta'],
+  // **保留 thinking**:kimi-k3 默认思考,实测接受 thinking:{type:enabled,budget_tokens} 且
+  // disabled 语义正确(见上)。effort 档位官方仅 max 一档 → 不暴露档位选择,output_config 整体
+  // strip(CCB capabilityZero 不生成是根治,这里兜底;与 minimax/opencodego/kimi 同款)。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  // kimi-k3 官方规格 1,048,576(1M)窗口,计费不按长度分段。
+  // 注意平台产品层另有按角色的窗口分档(admin 1M / 其他 500k),那是 commercial
+  // modelRolePolicy 的投影语义,不属于本机制注册表 —— 这里只声明机制上限。
+  maxInputTokens: 1_048_576,
+  // 官方多模态 + 实测 image block 接受 → 原生识图,master 不 strip 图,
+  // understand_image 工具不对它注入。
+  supportsVision: true,
+}
+
 export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   DEEPSEEK,
   MINIMAX,
   ARK,
   OPENCODE_GO,
   ARK_PLAN_KIMI,
+  MOONSHOT_CODING,
 ]
 
 const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
@@ -257,6 +292,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   ark: ARK,
   opencodego: OPENCODE_GO,
   kimi: ARK_PLAN_KIMI,
+  moonshot: MOONSHOT_CODING,
 }
 
 /** commercial proxy 路由判定：返回命中的 provider(用 matchesRoute)，否则 undefined(走 OAuth)。 */
