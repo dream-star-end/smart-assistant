@@ -18,6 +18,7 @@ interface DebitInput {
   bucket: "wallet" | "period" | "org_wallet" | "org_period";
   delta: string;
   org_id: string | null;
+  debited_at_us?: string;
 }
 
 interface WaiverState {
@@ -32,10 +33,13 @@ interface WaiverState {
 interface FakeState {
   debits: DebitInput[];
   wallet: bigint;
-  userSub: { id: string; period: bigint } | null;
+  userSub: { id: string; period: bigint; periodStartUs?: string; periodEndUs?: string } | null;
   /** Missing key means an impossible dangling historical org reference. */
   orgs: Map<string, bigint>;
-  orgSubs: Map<string, { id: string; period: bigint } | null>;
+  orgSubs: Map<
+    string,
+    { id: string; period: bigint; periodStartUs?: string; periodEndUs?: string } | null
+  >;
   waiver?: WaiverState;
 }
 
@@ -127,7 +131,13 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
         };
       }
       if (/FROM usage_records ur JOIN credit_ledger cl/.test(t)) {
-        return { rowCount: state.debits.length, rows: state.debits };
+        return {
+          rowCount: state.debits.length,
+          rows: state.debits.map((row) => ({
+            ...row,
+            debited_at_us: row.debited_at_us ?? "1000000",
+          })),
+        };
       }
       if (/FROM orgs WHERE id=\$1::bigint FOR UPDATE/.test(t)) {
         const credits = state.orgs.get(String(params[0]));
@@ -138,7 +148,15 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
       if (/FROM org_subscriptions WHERE org_id=\$1::bigint/.test(t)) {
         const sub = state.orgSubs.get(String(params[0]));
         return sub
-          ? { rowCount: 1, rows: [{ id: sub.id, period_credits: sub.period.toString() }] }
+          ? {
+              rowCount: 1,
+              rows: [{
+                id: sub.id,
+                period_credits: sub.period.toString(),
+                period_start_us: sub.periodStartUs ?? "0",
+                period_end_us: sub.periodEndUs ?? "2000000",
+              }],
+            }
           : { rowCount: 0, rows: [] };
       }
       if (/SELECT credits::text AS credits FROM users WHERE id=\$1 FOR UPDATE/.test(t)) {
@@ -148,7 +166,12 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
         return state.userSub
           ? {
               rowCount: 1,
-              rows: [{ id: state.userSub.id, period_credits: state.userSub.period.toString() }],
+              rows: [{
+                id: state.userSub.id,
+                period_credits: state.userSub.period.toString(),
+                period_start_us: state.userSub.periodStartUs ?? "0",
+                period_end_us: state.userSub.periodEndUs ?? "2000000",
+              }],
             }
           : { rowCount: 0, rows: [] };
       }
@@ -300,6 +323,96 @@ describe("applyTurnWaiver — exact owner/bucket reversal + inbox receipt", () =
     assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.orgId]), [["org_period", "5"]]);
   });
 
+  test("previous personal period debit refunds to wallet after subscription rollover", async () => {
+    const { pool, state, cap } = makeFakePool({
+      debits: [{
+        usage_id: "u1",
+        bucket: "period",
+        delta: "-40",
+        org_id: null,
+        debited_at_us: "1000100",
+      }],
+      wallet: 10n,
+      userSub: {
+        id: "51",
+        period: 20n,
+        periodStartUs: "1000900",
+        periodEndUs: "2000000",
+      },
+      orgs: new Map(),
+      orgSubs: new Map(),
+    });
+
+    await applyTurnWaiver(pool, input);
+    assert.equal(state.wallet, 50n);
+    assert.equal(state.userSub?.period, 20n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.delta]), [["wallet", 40n]]);
+    assert.match(cap.ledgerInserts[0]!.memo, /period→wallet\(expired period\)/);
+  });
+
+  test("previous org period debit refunds to the same org wallet after rollover", async () => {
+    const { pool, state, cap } = makeFakePool({
+      debits: [{
+        usage_id: "u1",
+        bucket: "org_period",
+        delta: "-300",
+        org_id: "5",
+        debited_at_us: "1000100",
+      }],
+      wallet: 0n,
+      userSub: null,
+      orgs: new Map([["5", 1_000n]]),
+      orgSubs: new Map([[
+        "5",
+        { id: "88", period: 700n, periodStartUs: "1000900", periodEndUs: "2000000" },
+      ]]),
+    });
+
+    await applyTurnWaiver(pool, input);
+    assert.equal(state.orgs.get("5"), 1_300n);
+    assert.equal(state.orgSubs.get("5")?.period, 700n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.bucket, r.orgId]), [["org_wallet", "5"]]);
+    assert.match(cap.ledgerInserts[0]!.memo, /org_period→org_wallet\(expired period\)/);
+  });
+
+  test("period membership uses the exact half-open start/end boundaries", async () => {
+    const { pool, state, cap } = makeFakePool({
+      debits: [
+        {
+          usage_id: "at-start",
+          bucket: "period",
+          delta: "-20",
+          org_id: null,
+          debited_at_us: "1000900",
+        },
+        {
+          usage_id: "at-end",
+          bucket: "period",
+          delta: "-30",
+          org_id: null,
+          debited_at_us: "2000000",
+        },
+      ],
+      wallet: 10n,
+      userSub: {
+        id: "51",
+        period: 40n,
+        periodStartUs: "1000900",
+        periodEndUs: "2000000",
+      },
+      orgs: new Map(),
+      orgSubs: new Map(),
+    });
+
+    await applyTurnWaiver(pool, input);
+    assert.equal(state.wallet, 40n);
+    assert.equal(state.userSub?.period, 60n);
+    assert.deepEqual(cap.ledgerInserts.map((r) => [r.usageId, r.bucket]), [
+      ["at-start", "period"],
+      ["at-end", "wallet"],
+    ]);
+  });
+
   test("zero-debit waiver still commits one receipt; retry creates neither ledger nor inbox duplicates", async () => {
     const { pool, cap } = makeFakePool({
       debits: [],
@@ -333,7 +446,8 @@ describe("applyTurnWaiver — exact owner/bucket reversal + inbox receipt", () =
     const debitQuery = cap.sqlSeen.find((sql) => /FROM usage_records ur JOIN credit_ledger cl/.test(sql));
     assert.ok(debitQuery);
     assert.match(debitQuery, /ur\.turn_key = \$2 OR ur\.parent_turn_key = \$2/);
-    assert.doesNotMatch(debitQuery, /session_id|created_at/);
+    assert.doesNotMatch(debitQuery, /session_id/);
+    assert.doesNotMatch(debitQuery, /WHERE .*created_at/);
     assert.equal(cap.ledgerInserts.length, 0);
     assert.equal(cap.inboxInserts.length, 0);
     assert.equal(cap.commits, 0);
