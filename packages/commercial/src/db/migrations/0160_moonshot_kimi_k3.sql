@@ -38,10 +38,12 @@ BEGIN
       'moonshot',
       NULL,                -- 上游 model 名与 model_id 相同(kimi-k3 实测直接可用)
       1048576,
+      -- 键名必须是 snake_case(parseCapabilityProfile 的 wire 契约;camelCase 会让快照
+      -- 重建 fail-closed → 全站模型面 503,2026-07-17 上线时踩过,契约测试已锁死)。
       '{
-        "supportsVision": true,
-        "reasoning": { "supported": [], "codexModelDefault": null },
-        "ccb": { "capabilityZero": true, "supportsThinking": true }
+        "supports_vision": true,
+        "reasoning": { "supported": [], "codex_model_default": null },
+        "ccb": { "capability_zero": true, "supports_thinking": true }
       }'::jsonb,
       1,
       NULL                 -- updated_by=NULL:迁移=系统操作(model_pricing.updated_by 有
