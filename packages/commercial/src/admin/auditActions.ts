@@ -75,8 +75,11 @@ export const ADMIN_AUDIT_ACTIONS = {
   "incident.resolve": { kind: "write", mode: "tx" },
   // 收尾批 H1b:解除 condition 压制(误压回滚;target=condition:<key>)。
   "condition.unsuppress": { kind: "write", mode: "tx" },
-  // 收尾批 §B:一键放行 pending_release 的 Tier2 修复部署(target=repair:<id>)。
+  // 收尾批 §B / 批1b:一键放行 pending_release 的 Tier2 修复部署(202 异步;
+  // target=repair:<id>,after 含 releaseRequestId + outcome='queued')。
   "repair.release": { kind: "write", mode: "tx" },
+  // 批1b:清除全局 Tier2 部署熔断(deploy_unknown 拉闸后人工收敛;target=release_fuse)。
+  "selfheal.fuse_clear": { kind: "write", mode: "tx" },
 
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },

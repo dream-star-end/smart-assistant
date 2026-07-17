@@ -195,19 +195,56 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 
 ### 4.1 改动分类 → 生效面矩阵(先分类再部署,漏一面=静默不生效)
 
-| 改动位置 | 生效面 | 必做动作 |
-|---|---|---|
-| master 侧代码(commercial/storage/cli 等) | master 进程 | `deploy-v5.sh`(rsync+restart+smoke) |
-| `packages/web-react` 前端 | dist 静态资源 | **`deploy-v5.sh --dist`**(vite build + 竞态安全 rsync + 资产 GC + restart + 版本握手 smoke);SPA 缓存必重启 |
-| **管理后台**(`packages/web-react/src/admin/**`,admin.html 第二 Vite 入口,2026-07-10 起) | dist 静态资源 | 同上 `--dist`;vanilla admin(web/public/admin.js)与 gateway legacy 透传已删,`?v=` 戳/bump-version 不再涉 v5 |
-| 告警脚本(`scripts/v5-monitor.sh`/`v5-daily-check.sh`/`v5-alert-fanout.sql`/`v5-alert-fail.sh`) | kl-mirror 脚本树 | 随 deploy rsync 即生效;**systemd 单元(deploy/v5/)仍手动 cp+daemon-reload**(alert-fail@ 模板免 enable) |
-| 容器内 gateway/CCB/storage/protocol/mcp-memory 源码 | **runtime source release**(feat/v5-runtime-hotcfg 起) | deploy 自动构建 release(content digest 命名)+ tuple 激活;存量容器 runtimeStale 滚动(重连秒级/idle≤30min)。**启用前提:env 已有 OC_RUNTIME_RELEASE 或 deploy `--enable-runtime-release` 首次开启;未启用=旧行为(重建镜像)** |
-| 平台配置(agent-sandbox/platform-runtime/**:oc-* 薄壳、entrypoint.ts、seed 声明/persona/种子技能、prompts 文案) | **platform bundle** | deploy 自动打 bundle(digest 命名+current 原子翻转);bin/prompts **真热**(存量容器立即),entrypoint/seed 走 boot_hash 滚动。启用开关同上(`--enable-platform-bundle`)。 |
-| `agent-sandbox/ccb-baseline/**` | **master release + 用户容器只读 bind** | deploy 在 `.complete` 前收紧 owner/mode/manifest，并校验 A/B 进程只用自己的 slot-local 路径；`OC_V3_CCB_BASELINE_OPTIONAL`/共享 DIR/远程 URL 生产禁用。baseline 内容有变化时，部署后用下方 remount 工具逐容器认证 drain 后重建；禁止 bulk force。 |
-| 工具链(Dockerfile:apt/pip/Quarto/Typst/codex CLI pin/Chromium/sudoers) | **runtime image**(纯工具链面) | 重建镜像+切 tag(§4.3);v5 生产 build 传 `OC_EMBED_SOURCE=0`(瘦身,源码走 release 挂载);重建后必须刷新 emergency tuple(§4.3) |
-| `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
-| `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
-| `packages/commercial/src/db/migrations/*.sql` | 共享 PG | AUTO_MIGRATE=0 → **人工受控 apply**(§4.5) |
+> **单一权威(selfheal 批1b 起)**:下表是**机器可读 manifest `deploy/v5/selfheal-deploy-surfaces.json`
+> 的生成投影**,自愈 Tier2 分类器与本表同源。**改分类改 manifest,勿手改锚点内的表**;
+> 锁定测试 `packages/commercial/src/__tests__/deploySurfacesManifest.test.ts` 会断言"锚点内容 === 由
+> manifest 生成"。每面的运维细节(dist 竞态 rsync/SPA 缓存重启、systemd 单元手动 cp+daemon-reload、
+> ccb-baseline 认证 drain remount、env 手动同步、迁移 §4.5、runtime image 切 tag §4.3、emergency
+> tuple 刷新)见 §4.2–§4.5 与各 lane 注释,不再于矩阵内重复。
+
+<!-- selfheal-deploy-surfaces:begin -->
+<!-- 本表由 deploy/v5/selfheal-deploy-surfaces.json 生成(改矩阵改 manifest,勿手改本段)。
+     生成器/锁定测试:packages/commercial/src/__tests__/deploySurfacesManifest.test.ts。 -->
+
+| 改动位置(glob) | 生效面 | 必做动作 | verify 层 |
+|---|---|---|---|
+| `packages/commercial/**`<br>`packages/storage/**`<br>`packages/cli/**`<br>`packages/protocol/**`<br>`docs/**` | master 进程 | deploy-v5.sh | `test:commercial:unit` |
+| `packages/web-react/**` | dist 静态资源 | deploy-v5.sh --dist(与后端代码同批时用 --with-dist) | `test:web-react` |
+| `packages/storage/**`<br>`packages/protocol/**`<br>`packages/gateway/**`<br>`packages/mcp-memory/**` | runtime source release | deploy-v5.sh(部署前活体断言 runtime-release 轴已启用,否则 manual) | `test:storage`, `test:gateway`, `test:mcp-memory` |
+| `**/agent-sandbox/platform-runtime/**` | platform bundle | deploy-v5.sh(部署前活体断言 platform-bundle 轴已启用,否则 manual) | — |
+| `packages/commercial/src/egress/**` | egress 进程 | deploy-v5.sh --egress(egress 进程;需 boss 明确放行后机器执行) | `test:commercial:unit` |
+| (见下方 manual-only 清单) | **manual-only(fail-closed)** | 人工受控(§4.5 apply / RFC §3);另:rules 零命中 / 未知路径 / 未知 manifest version / symlink·gitlink·typechange 亦整体 manual | — |
+
+**manual-only globs**(命中任一 → 整体 `manual_required`):
+
+- `**/migrations/**` — RFC §3 manual:DB migrations 人工受控 apply(§4.5)
+- `deploy/**` — RFC §3 manual:deploy/**(含 env overrides / systemd 单元 / release metadata)
+- `scripts/**` — RFC §3 manual:scripts/**(部署/告警/运维脚本随 rsync 生效,非自愈可安全自动)
+- `.github/**` — RFC §3 manual:.github/** CI 配置
+- `**/*.sh` — RFC §3 manual:任意 shell 脚本(镜像工具链/构建/host 脚本)
+- `**/package.json` — RFC §3 manual:所有层级 package.json(依赖/脚本变更需人工审)
+- `**/package-lock.json` — RFC §3 manual:npm lockfile(任一层级)
+- `**/bun.lock*` — RFC §3 manual:bun lockfile(bun.lock / bun.lockb)
+- `**/pnpm-lock.yaml` — RFC §3 manual:pnpm lockfile(任一层级;全部 lockfile 类)
+- `**/yarn.lock` — RFC §3 manual:yarn lockfile(任一层级;全部 lockfile 类)
+- `**/*.lockb` — RFC §3 manual:二进制 lockfile(bun.lockb 等任意 *.lockb;全部 lockfile 类)
+- `**/Cargo.lock` — RFC §3 manual:Cargo lockfile(Rust crate;全部 lockfile 类)
+- `**/Dockerfile*` — RFC §3 manual:Dockerfile 与镜像工具链(runtime image 面)
+- `**/agent-sandbox/ccb-baseline/**` — RFC §3 manual:ccb-baseline(存量用户容器只读 bind,需认证 drain remount)
+- `**/sudoers` — RFC §3 manual:sudoers 类(权限提升面)
+- `**/sudoers.d/**` — RFC §3 manual:sudoers.d 片段
+- `**/*.env` — RFC §3 manual:env 文件(线上 env 手动同步,增量部署不重生成)
+- `**/*.env.overrides` — RFC §3 manual:env overrides(deploy/v5/commercial-v5.env.overrides 等)
+- `**/AGENTS.md` — RFC §3 manual:AGENTS.md(agent 行为契约)
+- `**/CLAUDE.md` — RFC §3 manual:CLAUDE.md(仓内/全局指令)
+- `**/changelog.json` — RFC §3 manual:changelog.json(发版记账)
+- `deploy/v5/selfheal-deploy-surfaces.json` — RFC §3 manual:分类器 manifest 自身(改分类权威=人工审;亦被 deploy/** 覆盖,显式列出以逐项断言)
+- `packages/commercial/src/selfheal/**` — RFC §3 manual:自愈 TCB(检测/派单/incident 权威代码)
+- `packages/commercial/src/http/internal/selfhealRepairs.ts` — RFC §3 manual:自愈 TCB(回调分流/repair 收口 handler)
+- `packages/commercial/src/admin/selfhealOps.ts` — RFC §3 manual:自愈审批链 TCB(admin 放行事务/release request 权威,§P1)
+- `packages/commercial/src/http/admin/selfheal.ts` — RFC §3 manual:自愈审批链 TCB(admin 放行 HTTP 入口,§P1)
+- `packages/commercial/src/admin/audit*.ts` — RFC §3 manual:自愈审批链 TCB(永久 admin audit:audit.ts/auditActions.ts/auditRedact.ts/auditRetention.ts)
+<!-- selfheal-deploy-surfaces:end -->
 
 ### 4.2 标准部署
 
@@ -478,7 +515,7 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | 蓝绿:offline cutover lane 未适配 | stage/activate-staged/offline-recycle/prepare-offline-cutover 仍按实目录 in-place+mv 语义操作 REMOTE_SRC,symlink 布局下会破坏不变量 → 已 assert_not_bluegreen_for_cutover **fail-closed 拒绝**(不静默破坏);但也就用不了该 lane 做 GPT56 类离线大切换 | 做下一次离线大切换(image codex 版本切换等)前,把 stage/activate_staged 也改为 build_release+原子 symlink |
 | ~~selfheal:Tier1 动作无 host-routed 执行器~~ **已偿还**(2026-07-17,批1a) | Tier1 改**纯机器路径 host-routed**:master policy 声明 execution_class/action_opcode(0156,派单时同事务冻结到 repair 行)→个人版 jobWorker 按冻结 opcode 经**专用限权 ed25519 key**(authorized_keys `command="/usr/local/sbin/oc-selfheal-host-action"`)ssh kl-mirror 跑**版本化无参 opcode**;三层交集(master policy ∩ 个人版 CONDITION_OPCODE_MAP exact ∩ 远端 wrapper),任一漂移 fail-closed。零 clone/零 codex 会话。生产实证:停 egress→90s 自动拉起→probe 确认→resolved/source=auto | — |
 | selfheal:disk 类 auto_repair 未开(有意) | `ops.monitor:disk`(disk_root/disk_var)路由已就位(tier1 + `clean-v5-disk-v1`)但 **auto_repair=FALSE**。不开的理由不是欠账:磁盘 52% 健康→自愈根本不会触发;而 opcode 端到端契约验证要**真跑** `docker system prune -f`(清 ~25GB build cache)+ `journalctl --vacuum-size=500M`(把 986M journal 砍到 500M,**会清掉排查用的历史日志**)——健康系统上跑破坏性验证是纯代价。已确认 prune 安全面:**无 `--volumes`**(735 个卷一个不动)/停止容器 0/运行容器不受影响/有 tag 的回滚镜像不删(prune -f 只删 dangling+build cache) | 磁盘真到高水位,**或** build cache/journal 历史无所谓的时机:先经 action key 跑一次 `clean-v5-disk-v1` 端到端验证(断言 receipt exit=0 + 实际回收量),再翻 `auto_repair=TRUE` |
-| selfheal:Tier1×部署互斥靠 marker 不完备(批1a 遗留) | 与人工部署的协调现有两闸:①monitor 在 planned-maintenance 窗口不投影 condition(**主场景有效**:`deploy --egress` 的 marker 含 egress 两项 → 自愈不被派单);②host-action wrapper:marker 活跃则任何 opcode 让路(exit 66)。**但 marker 不能充当互斥锁**:TTL 仅 180s、**在部署后期才创建**(不覆盖 release build 段)、无健康检查时可 `SKIPPED`(闸消失)、wrapper 是"先检查再执行"= **TOCTOU**。残留风险低但非零(disk 类未开;主场景 marker 覆盖 restart 段)——**不得宣称已根治** | 根治=kl-mirror 独立 **production-mutation flock/lease**:`deploy-v5.sh` 每个写 lane(deploy/--dist/--with-dist/--egress/rollback/P3/baseline-remount/tuple 激活)**从第一次远端写或 build 前**持到 smoke/补偿结束;wrapper 改为 `flock -n` **取同一锁并持有整个 opcode 执行期**(消灭 TOCTOU),拿不到即让路;本地 deploy lock 与远端 lease **固定锁序**防死锁;marker 回归告警隔离本职。**非 deploy-v5 lane**(人工 migration/env 同步/systemd unit 安装/runtime image build+tag 切换)也须持同一 lease 或在 durable maintenance inhibit 下执行,否则"绝不冲突"不成立。详见 `docs/rfcs/RFC-v5-selfheal-batch1b.md` §1 |
+| ~~selfheal:Tier1×部署互斥靠 marker 不完备~~ **已偿还**(批1b,production-mutation lease)。**登记的显式例外**:lease 在翻转后失活时,补偿/回滚路径先阻塞重取(flock -w 180)、仍失败则降级继续补偿 + CRITICAL 告警(恢复稳态优先于严格互斥;残余窗口分别陈述:对 host-action ≤90s,对人工 with-production-mutation-lease.sh 持锁**无时长上限**——CRITICAL 已发,运维须先停人工操作再处理;RFC §1.2 例外条款)。非 deploy-v5 lane 入列走 scripts/with-production-mutation-lease.sh | 与人工部署的协调现有两闸:①monitor 在 planned-maintenance 窗口不投影 condition(**主场景有效**:`deploy --egress` 的 marker 含 egress 两项 → 自愈不被派单);②host-action wrapper:marker 活跃则任何 opcode 让路(exit 66)。**但 marker 不能充当互斥锁**:TTL 仅 180s、**在部署后期才创建**(不覆盖 release build 段)、无健康检查时可 `SKIPPED`(闸消失)、wrapper 是"先检查再执行"= **TOCTOU**。残留风险低但非零(disk 类未开;主场景 marker 覆盖 restart 段)——**不得宣称已根治** | 根治=kl-mirror 独立 **production-mutation flock/lease**:`deploy-v5.sh` 每个写 lane(deploy/--dist/--with-dist/--egress/rollback/P3/baseline-remount/tuple 激活)**从第一次远端写或 build 前**持到 smoke/补偿结束;wrapper 改为 `flock -n` **取同一锁并持有整个 opcode 执行期**(消灭 TOCTOU),拿不到即让路;本地 deploy lock 与远端 lease **固定锁序**防死锁;marker 回归告警隔离本职。**非 deploy-v5 lane**(人工 migration/env 同步/systemd unit 安装/runtime image build+tag 切换)也须持同一 lease 或在 durable maintenance inhibit 下执行,否则"绝不冲突"不成立。详见 `docs/rfcs/RFC-v5-selfheal-batch1b.md` §1 |
 | selfheal:writer-guard trigger 有意 deferred | schema_migrations 有 0136 记账行但 **trigger 不存在**(0137 显式 DROP 并把 SQL 移驻 db/deferred/selfheal_writer_guard.sql;当时回滚池仍含旧 writer)。**验收只认 pg_trigger,禁看 migration ledger** | 回滚池候选全部 ≥ selfheal 合并点后,以**新迁移版本**入仓启用(勿复用 0136 号) |
 | ~~selfheal:派单候选无优先级~~ **已偿还**(2026-07-17,批1a P4) | sweeper 派单 ORDER BY:critical(及等待>2h 的 warning 提级)优先→同级 opened_at ASC→id;不 LIMIT(熔断/冷却候选不挡后续事故) | — |
 | selfheal:Tier2 release 全链未通(批1b) | transport drill + **Tier1 机器路径已生产实证**(批1a),但 Tier2 代码修复的 真commit→verify→pending_release→一键放行→deployDriver 全链从未走通。**根因不止"没演练"**:①admin 放行→个人版 deployDriver 当前是**同步**的,而部署会重启 master → 放行请求很可能在写审计/返回 200 前被自己杀掉;②deployDriver **不懂 v5 生效面**(把 gateway 代码当普通文件一键 `--with-dist`,实际要重建 runtime image;egress 要 `--egress`;迁移/env/lockfile 不能走一键) | 批1b:先把放行→部署改 **durable async**(admin 事务=claim+审计+outbox→202;个人版 durable release job+独立 worker;结果经 callback outbox 回传;UI/脚本轮询 pending_release→deploying→deployed)+ 落 **touched-path 生效面分类器**(不能安全自动的面继续 pending/manual,禁假报 deployed)+ deployDriver merge 后 push origin(失败则不部署);再做 release drill(selfheal.drill:release_v1 seed + drill 脚本 --release,放行走 admin API 但保留显式 `--approve` 二段人工确认) |

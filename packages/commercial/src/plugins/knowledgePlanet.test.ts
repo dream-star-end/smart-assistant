@@ -28,11 +28,13 @@ import {
   createKnowledgePlanetRuntimeRegistries,
   decodeKnowledgePlanetWorkerFramesForTest,
   isOfficialKnowledgePlanetPluginIdentity,
+  validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
 import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
+  KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
@@ -202,10 +204,142 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(isKnowledgePlanetLoginProbeDue(999_999, 3_000, 48), false)
   })
 
+  test('uses a redirect only once to accelerate the authoritative API probe', () => {
+    const controls = Function(
+      `'use strict'; ${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}; return { scheduleKnowledgePlanetLoginProbe, hasAuthenticatedKnowledgePlanetSession };`,
+    )() as {
+      scheduleKnowledgePlanetLoginProbe: (
+        now: number,
+        pageAuthenticated: boolean,
+        pageHintApplied: boolean,
+        nextProbeAt: number,
+        attempts: number,
+      ) => { pageHintApplied: boolean; nextProbeAt: number; due: boolean }
+      hasAuthenticatedKnowledgePlanetSession: (probeAuthenticated: boolean) => boolean
+    }
+    let pageHintApplied = false
+    let nextProbeAt = KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS
+    let attempts = 0
+    const probeTimes: number[] = []
+    for (let now = 0; now <= 12_000; now += 1_000) {
+      const scheduled = controls.scheduleKnowledgePlanetLoginProbe(
+        now,
+        true,
+        pageHintApplied,
+        nextProbeAt,
+        attempts,
+      )
+      pageHintApplied = scheduled.pageHintApplied
+      nextProbeAt = scheduled.nextProbeAt
+      if (!scheduled.due) continue
+      probeTimes.push(now)
+      attempts += 1
+      nextProbeAt = now + KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS
+    }
+    assert.deepEqual(probeTimes, [0, 5_000, 10_000])
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(false), false)
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(true), true)
+
+    const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
+    const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
+    const loginSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(loginStart, entrypointStart)
+    assert.match(
+      loginSource,
+      /if \(hasAuthenticatedKnowledgePlanetSession\(probeAuthenticated\)\) \{[\s\S]*filteredState\([\s\S]*writeAuthenticatedAndExit/,
+    )
+    assert.doesNotMatch(loginSource, /pageAuthenticated \|\| probeAuthenticated/)
+  })
+
+  test('projects Playwright storage state to the exact signed account shape', () => {
+    const filteredStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('function filteredState')
+    const readAduidStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nfunction readAduid',
+      filteredStart,
+    )
+    assert.ok(filteredStart >= 0 && readAduidStart > filteredStart)
+    const filteredState = Function(
+      `'use strict'; ${KNOWLEDGE_PLANET_WORKER_SOURCE.slice(filteredStart, readAduidStart)}; return filteredState;`,
+    )() as (
+      state: unknown,
+      domains: string[],
+      origins: string[],
+    ) => { cookies: Array<Record<string, unknown>>; origins: Array<Record<string, unknown>> }
+    const projected = filteredState(
+      {
+        cookies: [
+          {
+            name: 'zsxq_access_token',
+            value: 'credential-value',
+            domain: '.zsxq.com',
+            path: '/',
+            expires: 1_786_872_498,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'Lax',
+            partitionKey: 'https://wx.zsxq.com',
+          },
+          {
+            name: 'outside',
+            value: 'discarded',
+            domain: '.example.com',
+            path: '/',
+            expires: -1,
+            httpOnly: false,
+            secure: true,
+            sameSite: 'Lax',
+          },
+        ],
+        origins: [
+          {
+            origin: 'https://wx.zsxq.com',
+            localStorage: [{ name: 'XAduid', value: 'device-value', extra: 'discarded' }],
+            indexedDB: [{ name: 'playwright-extension' }],
+          },
+          {
+            origin: 'https://example.com',
+            localStorage: [{ name: 'outside', value: 'discarded' }],
+          },
+        ],
+      },
+      ['api.zsxq.com', 'wx.zsxq.com', 'zsxq.com'],
+      ['https://api.zsxq.com:443', 'https://wx.zsxq.com:443'],
+    )
+    assert.deepEqual(projected, {
+      cookies: [
+        {
+          name: 'zsxq_access_token',
+          value: 'credential-value',
+          domain: '.zsxq.com',
+          path: '/',
+          expires: 1_786_872_498,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+      ],
+      origins: [
+        {
+          origin: 'https://wx.zsxq.com',
+          localStorage: [{ name: 'XAduid', value: 'device-value' }],
+        },
+      ],
+    })
+    const validated = validateKnowledgePlanetAccountState(projected)
+    assert.equal(validated.cookies[0]?.value, 'credential-value')
+    assert.equal(validated.origins[0]?.origin, 'https://wx.zsxq.com:443')
+    assert.deepEqual(validated.origins[0]?.localStorage, [
+      { name: 'XAduid', value: 'device-value' },
+    ])
+  })
+
   test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
-      /async function writeAuthenticatedAndExit\(storageState\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+      /async function writeTerminalAndExit\(value\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+    )
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /async function writeAuthenticatedAndExit\(storageState\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'authenticated', storageState \}\)/,
     )
     const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
     const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
@@ -216,6 +350,23 @@ describe('official Knowledge Planet Plugin', () => {
       /const state = filteredState\([\s\S]*await writeAuthenticatedAndExit\(state\)/,
     )
     assert.doesNotMatch(loginSource, /writeFrame\(\{ event: 'authenticated'/)
+  })
+
+  test('flushes action terminal frames before exiting instead of waiting on proxy cleanup', () => {
+    const actionStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runAction')
+    const probeStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nasync function authenticatedProbe',
+      actionStart,
+    )
+    assert.ok(actionStart >= 0 && probeStart > actionStart)
+    const actionSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(actionStart, probeStart)
+    assert.match(
+      actionSource,
+      /if \(!response\.ok\(\) \|\| data\?\.succeeded !== true\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'failed'/,
+    )
+    assert.match(actionSource, /await writeTerminalAndExit\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
   })
 
   test('waits for the real QR image and never publishes the iframe loading mask', () => {

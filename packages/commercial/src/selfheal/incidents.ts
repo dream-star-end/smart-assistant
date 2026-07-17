@@ -183,6 +183,13 @@ export async function updateIncident(
 export interface ResolveIncidentResult {
   resolved: boolean;
   rev: number;
+  /**
+   * 批1b F8:该 incident 下存在 status='deploying' 的 release request → resolve **推迟**
+   * (deferred=true, resolved=false, 不改 incident)。部署已在途,resolve 与 deploying 非真互斥:
+   * probe 抢先关 incident 会与 deployed/deploy_failed receipt 竞态。调用方 sweeper/reconciler
+   * 对 resolved=false 天然容忍(下轮重试);admin 路径据 deferred 单独回报"部署中不可 resolve"。
+   */
+  deferred?: boolean;
 }
 
 /**
@@ -230,6 +237,20 @@ async function resolveIncidentGuarded(
   client: PoolClient,
   skipWhileVerifying: boolean,
 ): Promise<ResolveIncidentResult> {
+  // 批1b F8:该 incident 下存在 status='deploying' 的 release request → **推迟 resolve**。
+  // 部署已在途(个人版执行权威),resolve×deploying 非真互斥:probe/auto 抢先关 incident 会与
+  // deployed/deploy_failed/deploy_unknown receipt 竞态,把归因/熔断裁决打乱。任何 mutation 之前
+  // 就返回 deferred,连 codex_repairs cancel_requested 也不做(部署中的 repair 不得被撤)。
+  const deploying = await client.query<{ one: number }>(
+    `SELECT 1 AS one FROM selfheal_release_requests rr
+       JOIN codex_repairs cr ON cr.id = rr.repair_id
+      WHERE cr.incident_id = $1::bigint AND rr.status = 'deploying'
+      LIMIT 1`,
+    [incidentId],
+  );
+  if (deploying.rows.length > 0) {
+    return { resolved: false, rev: 0, deferred: true };
+  }
   const r = await client.query<{ rev: string }>(
     `UPDATE incidents
         SET status = 'resolved', resolved_at = NOW(), resolve_source = $2,
@@ -253,16 +274,19 @@ async function resolveIncidentGuarded(
   if (r.rows.length === 0) return { resolved: false, rev: 0 };
   const rev = Number(r.rows[0].rev);
   // H2-cancel:活跃修复 → cancel_requested(同事务;verifying 有意不含)。
-  // release_claimed 的 repair 同样有意不含(与 adminReleaseRepair 的 claim CAS
-  // 真互斥:claim 先赢 → resolve 不取消,放行后由 done→verifying→探测 fence 裁决;
-  // resolve 先赢 → 行已 cancel_requested,claim 的 WHERE status='running' 落空。
-  // release 失败时 clearReleaseClaim 对已 resolved 的 incident 确定性补 cancel)。
+  // 批1b:排除有 **deploying** 状态 release request 的 repair —— 部署已在途,不能中途
+  // 撤销(个人版是执行权威,结果由 receipt 裁决;与 adminReleaseRepair 唯一活跃约束闭合)。
+  // queued/accepted 的请求会在下方同事务置 cancelled,其 repair 仍走 cancel_requested,
+  // cancel webhook 由现有 sweeper cancel 通道投递(body 带 rrid,§3.2 兼取消 release job)。
   const cancelled = await client.query<{ id: string }>(
     `UPDATE codex_repairs
         SET status = 'cancel_requested', updated_at = NOW()
       WHERE incident_id = $1::bigint
         AND status IN ('pending','dispatched','acked','running')
-        AND COALESCE(detail->>'release_claimed','') <> 'true'
+        AND NOT EXISTS (
+          SELECT 1 FROM selfheal_release_requests rr
+           WHERE rr.repair_id = codex_repairs.id AND rr.status = 'deploying'
+        )
       RETURNING id::text AS id`,
     [incidentId],
   );
@@ -273,5 +297,18 @@ async function resolveIncidentGuarded(
       [row.id, "incident resolved — cancel requested"],
     );
   }
+  // 批1b F2:只对**个人版从未收到**的 queued 请求(delivered_at IS NULL)直接 CAS cancelled
+  //(乐观撤单安全:个人版侧无对应 release job)。`accepted` 请求个人版已 202 收下,可能已
+  // pre-claim/在途——**不**在此单方置 cancelled(否则与个人版权威分叉);其 repair 已随上方
+  // cancel_requested 进 cancel 流,由 sweeper postCancel 拿 releaseCancel 裁决收口(cancelled/
+  // not_found→置 cancelled;too_late→留给 receipt)。deploying 早在函数首已 defer,不到这里。
+  await client.query(
+    `UPDATE selfheal_release_requests rr
+        SET status = 'cancelled', updated_at = NOW(), resolved_at = NOW(), resolved_by = $2
+       FROM codex_repairs cr
+      WHERE rr.repair_id = cr.id AND cr.incident_id = $1::bigint
+        AND rr.status = 'queued' AND rr.delivered_at IS NULL`,
+    [incidentId, source],
+  );
   return { resolved: true, rev };
 }

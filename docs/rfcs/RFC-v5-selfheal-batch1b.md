@@ -33,6 +33,7 @@ v1 以为缺的只是 release drill。实际有两个结构性根因:
 - host-action wrapper **不是查询它**,而是 `flock -n` **取得同一把锁并持有整个 opcode 执行期**;拿不到 → exit 66 让路(消灭 TOCTOU)。
 - 本地 `/var/lock/oc-v5-deploy.lock` 与远端 host-mutation lease **固定锁序**(先本地后远端),防死锁。
 - **marker 回归本职**:只做告警隔离,不承担互斥正确性。
+- **显式例外(补偿优先于互斥,实现审 R3/R4 收口)**:lease 在翻转后失活时,补偿/回滚路径**先阻塞重取**(`flock -w 180`);重取仍失败则**降级继续补偿**并打 CRITICAL 告警——恢复生产稳态优先于严格互斥。残余并发窗口按对方持有者**分别陈述**:与自愈 host-action opcode 并发时以其 90s 动作超时为上限;与人工 `with-production-mutation-lease.sh` 持锁操作并发时**无时长上限**(180s 等不到锁的最可能原因正是人工长操作在持锁)——此时 CRITICAL 告警已发出,运维纪律=**先停下人工持锁操作、确认补偿现场,再继续**。已知且接受。除该补偿降级分支外,写 lane 的任何前向翻转在 lease 失活时一律中止。
 - **非 deploy-v5 lane 也必须入列**(Codex MAJOR4):人工 migration / env 同步 / systemd unit 安装 / runtime image build+tag 切换等,要么走持同一 lease 的受控 wrapper/runbook,要么在 durable maintenance inhibit 下执行 —— 否则"绝不冲突"不成立。
 
 ### 1.3 批1b Tier2 部署面
@@ -139,7 +140,7 @@ post-deploy / pre-canonical-push 之间必须有 **set-once** 的 `deploy_effect
 
 ## 5. P4:release drill
 
-- 迁移号:**先查生产 ledger 取下一个单调编号**(0157 已被 lossless_runtime_batches 占,仓库已到 0159 → 大概率 0160,不得假定)。
+- 迁移号:**先查生产 ledger 取下一个单调编号**(0157 已被 lossless_runtime_batches 占;实现期间 0160 又被 moonshot_kimi_k3 并行批占走 → 实际落号 0161/0162,再次验证"不得假定")。
 - seed exact `selfheal.drill:release_v1`(常驻 `auto_repair=f`,`execution_class=tier2`)+ broker 分级白名单(release drill → context/report/verify/cutover;Tier1 拒)+ SKILL release 分支(append 唯一 repairId/UTC 行到 `docs/selfheal/RELEASE_DRILLS.md` → commit → verify → cutover → report progress 等放行)。
 - drill 脚本 `--release`:翻 policy → 轮询 pending_release → **`--approve <repairId>` 二段人工确认**(走**真实 admin 身份** API,凭据从受限 stdin/fd 或既有安全会话;**禁**写脚本/env 文件,禁 operator bypass)→ 断言真部署 + `/version` 翻转 + repair 终态 + 归因。
 - **condition 必须保持 firing**,直到同时确认:① `/version == candidate sha` ② deployed callback 已落库 ③ repair 已进 `verifying` —— 才写 false。提前翻 false 会让 probe 以 `source=probe` 抢先收口,演练归因失真。
