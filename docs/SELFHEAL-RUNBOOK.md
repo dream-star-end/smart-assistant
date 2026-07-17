@@ -303,6 +303,56 @@ SELECT tgname FROM pg_trigger WHERE tgname LIKE '%alert_condition%';   -- 1 行=
 
 ---
 
+## 步骤 5.5:Tier1 运维自愈激活(批1a,2026-07-17 已执行 — 留档 SOP)
+
+> **现状**:`svc_egress` + `http_egress` 已 `auto_repair=TRUE` 并**生产实证**
+> (停 egress → 90 秒自动拉起 → probe 确认 → `resolved/source=auto`)。
+> `disk` 有意未开(理由与触发条件见 playbook §5 债表)。
+
+**激活序(逐类放开的可复用 SOP)**:
+
+```bash
+# ① 前置核对:批1a 代码在两侧主线 + 零活跃 repair + auto_repair 全 FALSE
+ssh kl-mirror "psql \"\$DBURL\" -tAc \"SELECT COUNT(*) FROM codex_repairs WHERE status IN ('pending','dispatched','acked','running','verifying')\""
+
+# ② host-action provision(一次性):专用限权 key + 远端 wrapper + forced-command
+ssh-keygen -t ed25519 -N '' -C oc-selfheal-host-action -f /root/.secrets/v5-selfheal/action_key
+scp ops/oc-selfheal-host-action.sh kl-mirror:/usr/local/sbin/oc-selfheal-host-action   # root:root 0755
+# kl-mirror ~/.ssh/authorized_keys 追加:
+#   restrict,command="/usr/local/sbin/oc-selfheal-host-action" <action_key.pub>
+ssh -i /root/.secrets/v5-selfheal/action_key -o IdentitiesOnly=yes kl-mirror capabilities-v1
+#   => {"capabilities":["restart-v5-egress-v1","clean-v5-disk-v1"]}  ← 三层交集第一层实证
+
+# ③ env + 重启【合并成一次!分两次=多中断一次会话】
+cat >> /etc/openclaude/selfheal.env <<'EOF'
+OC_SELFHEAL_ACTION_HOST=kl-mirror
+OC_SELFHEAL_ACTION_KEY=/root/.secrets/v5-selfheal/action_key
+EOF
+# 绝不内联 systemctl restart(寄宿会话自杀式循环);走 P8 detached:
+TARGET_SHA=$(git -C /opt/openclaude/openclaude rev-parse HEAD)
+systemd-run --unit="openclaude-selfheal-closeout-${TARGET_SHA:0:12}" \
+  --property=RemainAfterExit=yes --on-active=30 \
+  /opt/openclaude/openclaude/scripts/selfheal-closeout-restart.sh "$TARGET_SHA"
+# 恢复后读 marker:/var/lib/openclaude-selfheal/closeout-<sha12>.json 须 phase=succeeded
+# 并核对 env 真进了运行进程:tr '\0' '\n' < /proc/$(systemctl show openclaude -p MainPID --value)/environ | grep ACTION
+
+# ④ 逐类翻闸(一次一类,实证后才开下一类)
+ssh kl-mirror "sudo -n -u postgres psql -d openclaude_commercial -c \"SET ROLE openclaude; UPDATE incident_policies SET auto_repair=TRUE WHERE match_key='ops.monitor:svc_egress'\""
+#    (DDL/DML 须 SET ROLE openclaude —— 表 owner 是 openclaude,app 角色无权)
+
+# ⑤ 故障注入实证(egress ≈90 秒中断,选低峰):
+ssh kl-mirror "systemctl stop openclaude-v5-egress.service"
+#    观察:monitor(2min tick)→ firing → incident open → repair tier1 →
+#    ssh opcode → egress 自动 active → done → probe(下轮)→ succeeded +
+#    incident resolved/source=auto;codex_repair_events 链应为
+#    dispatched → ack(机器签发)→ done([tier1 <opcode>] completed)→ note(探测确认)
+```
+
+**回滚**:出问题即 `UPDATE incident_policies SET auto_repair=FALSE WHERE match_key='<类>'`
+(秒级止血,不需重启);整体止血 = `OC_SELFHEAL_DISPATCH_DISABLED=1` + restart。
+
+---
+
 ## 步骤 6:watchdog + selector 迁移(独立小窗口)
 
 与自愈主链解耦,单独找低峰窗口(参照 release-checklist):
