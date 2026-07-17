@@ -2,7 +2,7 @@
 /** Deploy-only exact-image smoke and idempotent official Knowledge Planet Plugin seed. */
 
 import { randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import Docker from 'dockerode'
@@ -14,18 +14,35 @@ import {
   findApprovedKnowledgePlanetPluginForDeploy,
   seedKnowledgePlanetPlugin,
 } from '../src/marketplace/seedKnowledgePlanetPlugin.js'
+import {
+  type BrowserStorageStateV1,
+  PluginAccountError,
+  bindManagedBrowserPluginAccount,
+  decryptPluginAccountEnvelope,
+  getPluginAccount,
+} from '../src/plugins/accounts.js'
 import { ManagedBrowserRuntime } from '../src/plugins/browserRuntime.js'
 import {
   COMPILED_KNOWLEDGE_PLANET_PLUGIN,
   KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   KNOWLEDGE_PLANET_WORKER_DIGEST,
   KnowledgePlanetDockerService,
+  KnowledgePlanetRuntimeError,
   createKnowledgePlanetRuntimeRegistries,
   validateKnowledgePlanetAccountState,
 } from '../src/plugins/knowledgePlanet.js'
 import { resolveKnowledgePlanetLoginPins } from '../src/plugins/knowledgePlanetSetup.js'
 import { runKnowledgePlanetActionSmoke } from '../src/plugins/knowledgePlanetSmoke.js'
 import {
+  KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH,
+  type KnowledgePlanetVerificationExpected,
+  type KnowledgePlanetVerificationHandoff,
+  deleteKnowledgePlanetVerificationHandoff,
+  readKnowledgePlanetVerificationHandoff,
+  writeKnowledgePlanetVerificationHandoff,
+} from '../src/plugins/knowledgePlanetVerificationHandoff.js'
+import {
+  OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
   closeOfficialManagedBrowserPluginListingGate,
   openOfficialManagedBrowserPluginListingGate,
   transitionOfficialManagedBrowserPluginVersion,
@@ -33,28 +50,11 @@ import {
 import { loadVerifiedRuntimePluginContract } from '../src/plugins/review.js'
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
-const EVIDENCE_PATH = '/run/openclaude-v5/knowledge-planet-plugin-smoke.json'
+const SOURCE_COMMIT_RE = /^[0-9a-f]{40}$/
+const LEGACY_EVIDENCE_PATH = '/run/openclaude-v5/knowledge-planet-plugin-smoke.json'
 const QR_PATH = '/run/openclaude-v5/knowledge-planet-plugin-smoke-qr.png'
-const EVIDENCE_TTL_MS = 10 * 60_000
 const QR_DEADLINE_MS = 4 * 60_000
 const RELEASES_ROOT = '/opt/openclaude/openclaude-v5-releases'
-
-interface SmokeEvidence {
-  schemaVersion: 2
-  artifactHash: string
-  execContractHash: string
-  workerDigest: string
-  imageId: string
-  smokedAt: string
-  verification: 'authenticated-action-smoke' | 'existing-platform-approval'
-  passedActionIds: string[]
-  qrRendered: true
-  cleanupVerified: true
-}
-
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  return Object.keys(value).sort().join('\0') === [...keys].sort().join('\0')
-}
 
 function imageIdFromEnv(): string {
   if (process.env.OC_RUNTIME_CHANNEL !== 'v5')
@@ -63,6 +63,25 @@ function imageIdFromEnv(): string {
   if (!IMAGE_ID_RE.test(imageId))
     throw new Error('OC_RUNTIME_IMAGE_ID must be an exact sha256 image ID')
   return imageId
+}
+
+function sourceCommitFromEnv(): string {
+  const sourceCommit = process.env.OC_KNOWLEDGE_PLANET_SOURCE_COMMIT?.trim() ?? ''
+  if (!SOURCE_COMMIT_RE.test(sourceCommit))
+    throw new Error('OC_KNOWLEDGE_PLANET_SOURCE_COMMIT must be an exact full git commit')
+  return sourceCommit
+}
+
+function verificationExpected(imageId: string): KnowledgePlanetVerificationExpected {
+  return {
+    artifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+    execContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
+    workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST,
+    imageId,
+    sourceCommit: sourceCommitFromEnv(),
+    actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+    contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
+  }
 }
 
 function dockerClient(): Docker {
@@ -79,7 +98,7 @@ async function inspectExactImage(docker: Docker, imageId: string): Promise<void>
 }
 
 async function ensurePrivateRoot(): Promise<string> {
-  const root = dirname(EVIDENCE_PATH)
+  const root = dirname(QR_PATH)
   await mkdir(root, { recursive: true, mode: 0o700 })
   let rootStat = await lstat(root)
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== 0)
@@ -112,10 +131,6 @@ async function writePrivateFile(path: string, body: Buffer | string): Promise<vo
     throw new Error('Plugin smoke file is unsafe')
 }
 
-async function writeEvidence(evidence: SmokeEvidence): Promise<void> {
-  await writePrivateFile(EVIDENCE_PATH, `${JSON.stringify(evidence)}\n`)
-}
-
 async function writeQr(png: Buffer): Promise<void> {
   if (
     png.length < 8 ||
@@ -124,60 +139,6 @@ async function writeQr(png: Buffer): Promise<void> {
   )
     throw new Error('Knowledge Planet QR is not a bounded PNG')
   await writePrivateFile(QR_PATH, png)
-}
-
-async function readEvidence(imageId: string, now = Date.now()): Promise<SmokeEvidence> {
-  const stat = await lstat(EVIDENCE_PATH).catch(() => null)
-  if (
-    !stat ||
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.uid !== 0 ||
-    (stat.mode & 0o777) !== 0o600
-  )
-    throw new Error('valid Knowledge Planet Plugin smoke evidence is required')
-  let value: unknown
-  try {
-    value = JSON.parse(await readFile(EVIDENCE_PATH, 'utf8'))
-  } catch {
-    throw new Error('Knowledge Planet Plugin smoke evidence is invalid')
-  }
-  if (value === null || typeof value !== 'object' || Array.isArray(value))
-    throw new Error('Knowledge Planet Plugin smoke evidence is invalid')
-  const evidence = value as Record<string, unknown>
-  if (
-    !exactKeys(evidence, [
-      'schemaVersion',
-      'artifactHash',
-      'execContractHash',
-      'workerDigest',
-      'imageId',
-      'smokedAt',
-      'verification',
-      'passedActionIds',
-      'qrRendered',
-      'cleanupVerified',
-    ]) ||
-    evidence.schemaVersion !== 2 ||
-    evidence.artifactHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash ||
-    evidence.execContractHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash ||
-    evidence.workerDigest !== KNOWLEDGE_PLANET_WORKER_DIGEST ||
-    evidence.imageId !== imageId ||
-    !['authenticated-action-smoke', 'existing-platform-approval'].includes(
-      String(evidence.verification),
-    ) ||
-    !Array.isArray(evidence.passedActionIds) ||
-    evidence.passedActionIds.join('\0') !==
-      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id).join('\0') ||
-    evidence.qrRendered !== true ||
-    evidence.cleanupVerified !== true ||
-    typeof evidence.smokedAt !== 'string'
-  )
-    throw new Error('Knowledge Planet Plugin smoke evidence does not match this artifact/image')
-  const smokedAt = Date.parse(evidence.smokedAt)
-  if (!Number.isFinite(smokedAt) || smokedAt > now + 30_000 || now - smokedAt > EVIDENCE_TTL_MS)
-    throw new Error('Knowledge Planet Plugin smoke evidence expired')
-  return evidence as unknown as SmokeEvidence
 }
 
 async function beforeDeadline<T>(
@@ -196,20 +157,78 @@ async function beforeDeadline<T>(
   })
 }
 
-async function smokeOnly(): Promise<void> {
-  const imageId = imageIdFromEnv()
-  const docker = dockerClient()
-  await inspectExactImage(docker, imageId)
-  const alreadyApproved =
-    (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
-  const service = new KnowledgePlanetDockerService(docker, {
-    imageId,
-    workerRoot: '/var/lib/openclaude-v5/plugin-workers',
-    brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
+async function handoffExists(): Promise<boolean> {
+  return (await lstat(KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH).catch(() => null)) !== null
+}
+
+async function readHandoffIfPresent(
+  expected: KnowledgePlanetVerificationExpected,
+): Promise<KnowledgePlanetVerificationHandoff | null> {
+  if (!(await handoffExists())) return null
+  return readKnowledgePlanetVerificationHandoff({ expected, env: process.env })
+}
+
+async function runActionSmoke(
+  service: KnowledgePlanetDockerService,
+  storageState: BrowserStorageStateV1,
+): Promise<{ passedActionIds: string[]; storageState: BrowserStorageStateV1 }> {
+  const registries = createKnowledgePlanetRuntimeRegistries(service)
+  const runtime = new ManagedBrowserRuntime({
+    ...registries,
+    profileRoot: '/run/openclaude-v5/plugin-smoke-profiles',
     expectedOwnerUid: 0,
-    socketUid: 1000,
-    socketGid: 1000,
   })
+  return runKnowledgePlanetActionSmoke({
+    storageState,
+    run: ({ actionId, params, storageState: currentState }) =>
+      runtime.runReadAction({
+        contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
+        storageState: currentState,
+        actionId,
+        params,
+        signal: new AbortController().signal,
+      }),
+  })
+}
+
+async function loadReusableAccountState(
+  userId: number,
+): Promise<{ storageState: BrowserStorageStateV1; accountInstanceId: string } | null> {
+  const located = await query<{ id: string }>(
+    `SELECT id::text AS id FROM connections
+      WHERE user_id = $1 AND provider = $2 AND status IN ('active','error')
+        AND revoked_at IS NULL
+      ORDER BY id`,
+    [userId, KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id],
+  )
+  if (located.rowCount === 0) return null
+  if (located.rowCount !== 1)
+    throw new Error('Knowledge Planet user has multiple active Plugin accounts')
+  const row = await getPluginAccount(located.rows[0]!.id, userId, getPool(), {
+    includeError: true,
+  })
+  if (!row) throw new Error('Knowledge Planet reusable Plugin account disappeared')
+  const versionId = Number(row.connector_version_id)
+  if (!Number.isSafeInteger(versionId) || versionId <= 0)
+    throw new Error('Knowledge Planet reusable Plugin account version is invalid')
+  const verified = await loadVerifiedRuntimePluginContract(versionId, getPool(), {
+    env: process.env,
+  })
+  if (
+    verified.pluginType !== 'managed-browser' ||
+    verified.slug !== KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id ||
+    row.provider !== verified.slug ||
+    row.spec_hash.toString('hex') !== verified.artifactHash ||
+    row.exec_contract_hash.toString('hex') !== verified.execContractHash
+  )
+    throw new Error('Knowledge Planet reusable Plugin account trust pins do not match')
+  const envelope = decryptPluginAccountEnvelope(row, verified.contract, process.env)
+  return { storageState: envelope.storageState, accountInstanceId: envelope.accountInstanceId }
+}
+
+async function waitForQrLogin(
+  service: KnowledgePlanetDockerService,
+): Promise<BrowserStorageStateV1> {
   const sessionId = randomUUID()
   const deadlineMs = Date.now() + QR_DEADLINE_MS
   let handle: Awaited<ReturnType<KnowledgePlanetDockerService['startLogin']>> | null = null
@@ -231,8 +250,6 @@ async function smokeOnly(): Promise<void> {
     },
   )
   void authenticated.catch(() => {})
-  let verification: SmokeEvidence['verification'] = 'existing-platform-approval'
-  let passedActionIds = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id)
   try {
     const pins = await resolveKnowledgePlanetLoginPins()
     handle = await service.startLogin({
@@ -269,79 +286,196 @@ async function smokeOnly(): Promise<void> {
       deadlineMs,
       'Knowledge Planet QR did not render before the smoke deadline',
     )
-    process.stdout.write(`KNOWLEDGE_PLANET_SMOKE_QR_READY=${QR_PATH}\n`)
-
-    if (!alreadyApproved) {
-      process.stdout.write(
-        'Knowledge Planet v1.1 requires one release-verification scan; waiting for WeChat confirmation.\n',
-      )
-      const storageState = await beforeDeadline(
-        authenticated,
-        deadlineMs,
-        'Knowledge Planet verification scan was not confirmed before the deadline',
-      )
-      await handle.done
-      await rm(QR_PATH, { force: true })
-      const registries = createKnowledgePlanetRuntimeRegistries(service)
-      const runtime = new ManagedBrowserRuntime({
-        ...registries,
-        profileRoot: '/run/openclaude-v5/plugin-smoke-profiles',
-        expectedOwnerUid: 0,
-      })
-      const actionSmoke = await runKnowledgePlanetActionSmoke({
-        storageState,
-        run: ({ actionId, params, storageState: currentState }) =>
-          runtime.runReadAction({
-            contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
-            storageState: currentState,
-            actionId,
-            params,
-            signal: new AbortController().signal,
-          }),
-      })
-      passedActionIds = actionSmoke.passedActionIds
-      verification = 'authenticated-action-smoke'
-    }
+    process.stdout.write(`KNOWLEDGE_PLANET_VERIFICATION_QR_READY=${QR_PATH}\n`)
+    process.stdout.write('Waiting for one WeChat verification scan.\n')
+    const storageState = await beforeDeadline(
+      authenticated,
+      deadlineMs,
+      'Knowledge Planet verification scan was not confirmed before the deadline',
+    )
+    await handle.done
+    return storageState
   } finally {
     await handle?.stop().catch(() => {})
+    await rm(QR_PATH, { force: true })
+  }
+}
+
+function canRelinkAfter(error: unknown): boolean {
+  return (
+    (error instanceof KnowledgePlanetRuntimeError && error.code === 'LOGIN_EXPIRED_ACCOUNT') ||
+    (error instanceof PluginAccountError && error.code === 'INVALID_STATE')
+  )
+}
+
+async function verifyUser(userId: number): Promise<void> {
+  const imageId = imageIdFromEnv()
+  const expected = verificationExpected(imageId)
+  const docker = dockerClient()
+  await inspectExactImage(docker, imageId)
+  const alreadyApproved = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  if (await handoffExists()) {
+    try {
+      const existing = await readKnowledgePlanetVerificationHandoff({
+        expected,
+        env: process.env,
+      })
+      if (existing.metadata.userId !== userId)
+        throw new Error(
+          `a fresh Knowledge Planet verification is already pending for user ${existing.metadata.userId}`,
+        )
+      process.stdout.write(
+        `Knowledge Planet verification is already ready for user ${userId}; no scan needed.\n`,
+      )
+      return
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('already pending')) throw error
+      await deleteKnowledgePlanetVerificationHandoff()
+    }
+  }
+  const reusable = await loadReusableAccountState(userId)
+  if (alreadyApproved && reusable) {
+    process.stdout.write(
+      `Knowledge Planet exact candidate is approved and user ${userId} already has a reusable encrypted account; no scan needed.\n`,
+    )
+    return
+  }
+  await rm(LEGACY_EVIDENCE_PATH, { force: true })
+  await rm(QR_PATH, { force: true })
+  const service = new KnowledgePlanetDockerService(docker, {
+    imageId,
+    workerRoot: '/var/lib/openclaude-v5/plugin-workers',
+    brokerRoot: '/run/openclaude-v5/plugin-browser-brokers',
+    expectedOwnerUid: 0,
+    socketUid: 1000,
+    socketGid: 1000,
+  })
+  let verification: 'existing-account' | 'qr-login' = 'existing-account'
+  let replaceExistingAccount = false
+  let expectedExistingAccountInstanceId: string | null = null
+  let replacementAccountInstanceId: string | null = null
+  let completed: Awaited<ReturnType<typeof runActionSmoke>> | null = null
+  try {
+    if (reusable) {
+      expectedExistingAccountInstanceId = reusable.accountInstanceId
+      try {
+        completed = await runActionSmoke(
+          service,
+          validateKnowledgePlanetAccountState(reusable.storageState),
+        )
+        process.stdout.write(
+          `Knowledge Planet user ${userId} existing encrypted login passed all actions; no scan needed.\n`,
+        )
+      } catch (error) {
+        if (!canRelinkAfter(error)) throw error
+        verification = 'qr-login'
+        replaceExistingAccount = true
+        replacementAccountInstanceId = randomUUID()
+      }
+    } else {
+      verification = 'qr-login'
+    }
+    if (!completed) {
+      const authenticated = await waitForQrLogin(service)
+      completed = await runActionSmoke(service, authenticated)
+    }
+  } finally {
     await service.closeAndDrain()
     await rm(QR_PATH, { force: true })
   }
-  await writeEvidence({
-    schemaVersion: 2,
-    artifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
-    execContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
-    workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST,
-    imageId,
-    smokedAt: new Date().toISOString(),
+  if (!completed) throw new Error('Knowledge Planet verification did not complete')
+  const metadata = await writeKnowledgePlanetVerificationHandoff({
+    expected,
+    userId,
     verification,
-    passedActionIds,
-    qrRendered: true,
-    cleanupVerified: true,
+    replaceExistingAccount,
+    expectedExistingAccountInstanceId,
+    replacementAccountInstanceId,
+    passedActionIds: completed.passedActionIds,
+    storageState: completed.storageState,
+    env: process.env,
   })
   process.stdout.write(
-    `Knowledge Planet Plugin exact-image smoke passed (${verification}); cleanup verified.\n`,
+    `KNOWLEDGE_PLANET_VERIFICATION_READY=${KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH}\n`,
+  )
+  process.stdout.write(
+    `Knowledge Planet exact-image action smoke passed (${metadata.verification}); encrypted handoff expires at ${metadata.expiresAt}.\n`,
+  )
+}
+
+async function smokeOnly(): Promise<void> {
+  const imageId = imageIdFromEnv()
+  const expected = verificationExpected(imageId)
+  const docker = dockerClient()
+  await inspectExactImage(docker, imageId)
+  const alreadyApproved = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  const handoff = await readHandoffIfPresent(expected)
+  if (!alreadyApproved && !handoff)
+    throw new Error(
+      'new Knowledge Planet candidate requires preverification; run scripts/deploy-v5.sh --verify-knowledge-planet-user=<user-id>',
+    )
+  process.stdout.write(
+    `Knowledge Planet Plugin noninteractive exact-image gate passed (${handoff ? `verified user ${handoff.metadata.userId}` : 'existing platform approval'}).\n`,
   )
 }
 
 async function seedOnly(): Promise<void> {
   const imageId = imageIdFromEnv()
+  const expected = verificationExpected(imageId)
   const docker = dockerClient()
   await inspectExactImage(docker, imageId)
-  const evidence = await readEvidence(imageId)
-  const alreadyApproved =
-    (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
-  if (!alreadyApproved && evidence.verification !== 'authenticated-action-smoke')
-    throw new Error('new Knowledge Planet Plugin versions require authenticated action smoke')
+  const handoff = await readHandoffIfPresent(expected)
+  const alreadyApproved = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  if (!alreadyApproved && !handoff)
+    throw new Error('new Knowledge Planet Plugin versions require an encrypted action handoff')
   const redis = await leaseRedis()
   try {
+    let accountBind: Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>> | null = null
     const result = await seedKnowledgePlanetPlugin({
       functionalVerified: true,
       env: process.env,
       leaseRedis: redis,
+      ...(handoff
+        ? {
+            beforeListingOpen: async ({ versionId }: { versionId: string }) => {
+              const numericVersionId = Number(versionId)
+              if (!Number.isSafeInteger(numericVersionId) || numericVersionId <= 0)
+                throw new Error('Knowledge Planet approved version ID is invalid')
+              accountBind = await bindManagedBrowserPluginAccount({
+                userId: handoff.metadata.userId,
+                versionId: numericVersionId,
+                displayName: '知识星球',
+                accountHint: '微信扫码账号',
+                storageState: handoff.storageState,
+                existing: handoff.metadata.replaceExistingAccount
+                  ? ('replace' as const)
+                  : handoff.metadata.expectedExistingAccountInstanceId
+                    ? ('refresh-fenced' as const)
+                    : ('reuse-identical' as const),
+                ...(handoff.metadata.expectedExistingAccountInstanceId
+                  ? {
+                      expectedExistingAccountInstanceId:
+                        handoff.metadata.expectedExistingAccountInstanceId,
+                    }
+                  : {}),
+                ...(handoff.metadata.replacementAccountInstanceId
+                  ? {
+                      replacementAccountInstanceId: handoff.metadata.replacementAccountInstanceId,
+                    }
+                  : {}),
+                unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+                env: process.env,
+                pool: getPool(),
+              })
+            },
+          }
+        : {}),
     })
-    await rm(EVIDENCE_PATH, { force: true })
-    process.stdout.write(`${JSON.stringify(result)}\n`)
+    if (handoff && !accountBind)
+      throw new Error('Knowledge Planet verification handoff was not bound to its user')
+    if (handoff) await deleteKnowledgePlanetVerificationHandoff()
+    await rm(LEGACY_EVIDENCE_PATH, { force: true })
+    process.stdout.write(`${JSON.stringify({ ...result, accountBind })}\n`)
   } finally {
     await redis.quit().catch(() => redis.disconnect())
   }
@@ -426,10 +560,7 @@ async function targetReleaseContractIfPresent(
   const complete = await lstat(join(target, '.complete'))
   if (!complete.isFile() || complete.isSymbolicLink() || complete.uid !== 0)
     throw new Error('Plugin transition target release is unsafe')
-  const modulePath = join(
-    target,
-    'packages/commercial/src/plugins/knowledgePlanetContract.ts',
-  )
+  const modulePath = join(target, 'packages/commercial/src/plugins/knowledgePlanetContract.ts')
   const moduleStat = await lstat(modulePath).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return null
     throw error
@@ -573,6 +704,11 @@ async function classifyCurrentForRelease(targetRelease: string): Promise<void> {
 
 async function main(): Promise<void> {
   const mode = process.argv[2]
+  const verifyUserRaw = mode?.startsWith('--verify-user=')
+    ? mode.slice('--verify-user='.length)
+    : null
+  const verifyUserId =
+    verifyUserRaw && /^\d{1,16}$/.test(verifyUserRaw) ? Number(verifyUserRaw) : null
   const transitionTarget = mode?.startsWith('--transition-to-release=')
     ? mode.slice('--transition-to-release='.length)
     : null
@@ -590,16 +726,18 @@ async function main(): Promise<void> {
     (mode !== '--smoke-only' &&
       mode !== '--seed-only' &&
       mode !== '--close-listing-gate' &&
+      !(verifyUserId && Number.isSafeInteger(verifyUserId) && verifyUserId > 0) &&
       !transitionTarget &&
       !openGateTarget &&
       !compatibilityTarget &&
       !classifyTarget)
   )
     throw new Error(
-      'usage: seed-knowledge-planet-plugin.ts --smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH',
+      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH',
     )
   try {
-    if (mode === '--smoke-only') await smokeOnly()
+    if (verifyUserId) await verifyUser(verifyUserId)
+    else if (mode === '--smoke-only') await smokeOnly()
     else if (mode === '--seed-only') await seedOnly()
     else if (mode === '--close-listing-gate') await closeListingGate()
     else if (transitionTarget) await transitionToRelease(transitionTarget)
