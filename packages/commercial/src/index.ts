@@ -253,6 +253,16 @@ import {
   type TurnWaiveHandler,
 } from "./http/internalTurnWaive.js";
 import {
+  PROMPT_QUEUE_CLAIM_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
+  isPromptQueueV1Enabled,
+  makePromptQueueHandler,
+  type PromptQueueHandler,
+} from "./http/internalPromptQueue.js";
+import { PgPromptQueueStore } from "./promptQueue/pgPromptQueueStore.js";
+import {
   COST_EVENT_PATH,
   makeCostEventHandler,
   type CostEventHandler,
@@ -1839,6 +1849,14 @@ export async function registerCommercial(
         pgPool: getPool(),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
+      // V5 queue P1 compatibility layer:strict opt-in. Flag off means no store
+      // instance and no route registration, so legacy internal dispatch remains exact.
+      const promptQueueHandler: PromptQueueHandler | null = isPromptQueueV1Enabled()
+        ? makePromptQueueHandler({
+            identityRepo,
+            store: new PgPromptQueueStore(getPool()),
+          })
+        : null;
       // /internal/v3/marketplace/agent/* — 容器内 AI(market skill / oc-market CLI)
       // 代用户做市场操作(search/install/uninstall/publish),同款 verifyContainerIdentity
       // 限本用户;install 仅已审内容、publish 仅入 pending(管理员审核前不上线)。
@@ -2088,6 +2106,13 @@ export async function registerCommercial(
         }
         if (path === TURN_WAIVE_PATH) {
           return turnWaiveHandler(req, res, ctx);
+        }
+        if (
+          promptQueueHandler &&
+          (path === PROMPT_QUEUE_MUTATION_PATH || path === PROMPT_QUEUE_SNAPSHOT_PATH ||
+            path === PROMPT_QUEUE_DETAIL_PATH || path === PROMPT_QUEUE_CLAIM_PATH)
+        ) {
+          return promptQueueHandler(req, res, ctx);
         }
         if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
           return toolFailureAuditHandler(req, res, ctx);
@@ -5505,3 +5530,11 @@ export type {
   AlertSender,
   Snapshot,
 } from "./admin/alerts.js";
+// V5 prompt queue P1 repository/internal transport (feature remains opt-in).
+export { PgPromptQueueStore, PromptQueueStoreError } from "./promptQueue/pgPromptQueueStore.js";
+export type {
+  PromptQueueOwner,
+  PromptQueueDetail,
+  PromptQueueClaimRequest,
+  PromptQueueClaimResult,
+} from "./promptQueue/pgPromptQueueStore.js";

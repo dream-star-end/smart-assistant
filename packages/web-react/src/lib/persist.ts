@@ -533,7 +533,15 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
   return (out as ChatMessage | null) ?? serverMsg;
 }
 
-function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
+/**
+ * 历史全序稳定排序。展示主轴 = 冻结的 `_orderSeq`(首次持久化即定、任何 patch 不改);缺自身
+ * `_orderSeq` 的本地乐观行**锚定到插入序里最近一条带 `_orderSeq` 的耐久行**(anchorOrderSeq
+ * carry-forward),锚内再按 `(ts, 插入序 idx)` 定序 —— 这样耐久行位置绝对冻结,乐观窗只在锚点内
+ * 浮动,server echo 后自然收敛。比较器是**单一字典序元组** `(anchorOrderSeq, ts, idx)`:三键皆数字
+ * 且 idx 全局唯一 → **可传递、反对称、诱导全序**(消除旧版混排 `_seq`/`ts` 两域 + 缺 ts 整趟
+ * bail-out 造成的非传递环)。export 供 property/fuzz 单测直接验证该全序不变量。
+ */
+export function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
   if (messages.length <= 1) return messages;
   const orderOf = (m: ChatMessage): number | null =>
     typeof m._orderSeq === "number" &&
@@ -550,13 +558,22 @@ function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
         m,
         idx,
         anchorOrderSeq: ownOrderSeq ?? anchorOrderSeq,
+        // 同一 _orderSeq 槽内**耐久行恒先于**锚定其上的本地乐观行:锚点语义是「该乐观行按
+        // 插入序紧跟这条耐久行之后」,故即便时钟偏移让乐观行 ts 更小,也绝不得排到锚点耐久行
+        // 之前。这条 tiebreak 还消除 anchor carry-forward 的**非幂等**——否则乐观行被更小的
+        // ts 甩到锚点耐久行之前,下一趟排序会重新锚定到更靠前的耐久行 → 顺序反复漂移。
+        durableRank: ownOrderSeq !== null ? 0 : 1,
         ts: typeof m?.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
       };
     })
     // One lexicographic tuple for every pair makes the comparator transitive.
-    // Missing ts is a local tie-breaker value, never a whole-sort bailout.
+    // Durable-first-within-slot keeps it idempotent; missing ts is a local
+    // tie-breaker value, never a whole-sort bailout.
     .sort((a, b) =>
-      a.anchorOrderSeq - b.anchorOrderSeq || a.ts - b.ts || a.idx - b.idx)
+      a.anchorOrderSeq - b.anchorOrderSeq ||
+      a.durableRank - b.durableRank ||
+      a.ts - b.ts ||
+      a.idx - b.idx)
     .map((x) => x.m);
   return sorted.every((message, index) => message === messages[index]) ? messages : sorted;
 }

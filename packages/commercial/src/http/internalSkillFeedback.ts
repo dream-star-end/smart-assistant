@@ -26,6 +26,8 @@ import {
 } from '../auth/containerIdentity.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 import type { QueryRunner, SkillUsageLayer } from './internalSkillUsage.js'
+// 隐式弱差评的 tag 权威源(单一权威,勿在此重复字面量)。
+import { IMPLICIT_RATING_TAG } from '../responseRatings.js'
 
 export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
 
@@ -71,24 +73,33 @@ export type SkillFeedbackHandler = (
  * count(*) OVER () 在 LIMIT 之前对 CTE(每 session_key 一行)求窗口计数 → total 是未截断的
  * DISTINCT session_key 总数,refs 才受 LIMIT 截断。DISTINCT ON (session_key) 配
  * ORDER BY session_key, r.created_at DESC:同一会话多次差评只留**最近**一条的 trace。
+ *
+ * 训练侧 implicit 降权(方案 b):不剔除隐式弱差评(它是燃料),但**显式优先** ——
+ * 最终 ORDER BY is_implicit ASC 让显式(强)差评排前,训练侧只取前 ≤3 段时强信号先入,
+ * 与 responseRatings.ts "显式永远压过隐式" 同向。implicit_total 供 log 观测隐式占比;
+ * refs 结构不变(sessionKey/traceId/at),不把 is_implicit 泄漏到返回契约。
  */
 export async function querySkillFeedbackRefs(
   runner: QueryRunner,
   userId: number,
   slug: string,
   layer: SkillUsageLayer,
+  log?: Logger,
 ): Promise<SkillFeedbackResult> {
   const r = await runner.query<{
     session_key: string
     trace_id: string
     rated_at: Date | string
+    is_implicit: boolean
     total: string
+    implicit_total: string
   }>(
     `WITH down_refs AS (
        SELECT DISTINCT ON (e.session_key)
               e.session_key AS session_key,
               e.trace_id    AS trace_id,
-              r.created_at  AS rated_at
+              r.created_at  AS rated_at,
+              COALESCE($6 = ANY(r.tags), false) AS is_implicit
          FROM marketplace_skill_usage_events e
          JOIN response_rating r
            ON r.trace_id = e.trace_id AND r.user_id = e.user_id
@@ -103,18 +114,35 @@ export async function querySkillFeedbackRefs(
           AND r.created_at >= NOW() - make_interval(days => $4)
         ORDER BY e.session_key, r.created_at DESC
      )
-     SELECT session_key, trace_id, rated_at, count(*) OVER () AS total
+     -- explicit 优先(is_implicit ASC)让强信号先入训练素材;implicit_total 是窗口内隐式
+     -- 引用数(未截断,不受 LIMIT 影响),供 log 观测隐式占比。
+     SELECT session_key, trace_id, rated_at, is_implicit,
+            count(*) OVER ()                            AS total,
+            count(*) FILTER (WHERE is_implicit) OVER () AS implicit_total
        FROM down_refs
-      ORDER BY rated_at DESC
+      ORDER BY is_implicit ASC, rated_at DESC
       LIMIT $5`,
-    [userId, slug, layer, FEEDBACK_WINDOW_DAYS, MAX_FEEDBACK_REFS],
+    [userId, slug, layer, FEEDBACK_WINDOW_DAYS, MAX_FEEDBACK_REFS, IMPLICIT_RATING_TAG],
   )
   const total = r.rows.length > 0 ? Number.parseInt(r.rows[0].total, 10) || 0 : 0
+  const implicitTotal =
+    r.rows.length > 0 ? Number.parseInt(String(r.rows[0].implicit_total ?? '0'), 10) || 0 : 0
   const refs: SkillFeedbackRef[] = r.rows.map((x) => ({
     sessionKey: x.session_key,
     traceId: x.trace_id,
     at: x.rated_at instanceof Date ? x.rated_at.toISOString() : String(x.rated_at),
   }))
+  if (log && total > 0) {
+    // 误伤/降权观测:训练燃料里隐式弱差评的占比,便于回看隐式信号是否过多。
+    log.info('skill-feedback 训练燃料构成', {
+      slug,
+      layer,
+      total,
+      implicitDown: implicitTotal,
+      explicitDown: total - implicitTotal,
+      implicitPct: Math.round((implicitTotal / total) * 100),
+    })
+  }
   return { refs, total }
 }
 
@@ -174,7 +202,7 @@ export function makeSkillFeedbackHandler(deps: SkillFeedbackDeps): SkillFeedback
     }
 
     try {
-      const result = await querySkillFeedbackRefs(deps.queryRunner, identity.userId, slug, layer)
+      const result = await querySkillFeedbackRefs(deps.queryRunner, identity.userId, slug, layer, log)
       send(res, 200, result, requestId)
     } catch (err) {
       log.error('failed to query skill feedback refs', {

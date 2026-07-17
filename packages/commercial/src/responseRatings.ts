@@ -8,6 +8,7 @@
  */
 
 import { query } from "./db/queries.js";
+import { incrImplicitRatingOverridden } from "./admin/metrics.js";
 
 // ─── 用户侧:upsert 一条评分 ──────────────────────────────────────────
 
@@ -46,19 +47,32 @@ export function isImplicitRating(tags: string[]): boolean {
  */
 export async function upsertResponseRating(input: UpsertResponseRatingInput): Promise<void> {
   const incomingImplicit = isImplicitRating(input.tags);
-  await query(
-    `INSERT INTO response_rating
-       (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
-     VALUES ($1::bigint, $2, $3, $4, $5, $6, $7::text[], $8)
-     ON CONFLICT (user_id, message_id) DO UPDATE
-       SET rating     = EXCLUDED.rating,
-           tags       = EXCLUDED.tags,
-           comment    = EXCLUDED.comment,
-           model      = EXCLUDED.model,
-           trace_id   = EXCLUDED.trace_id,
-           session_id = EXCLUDED.session_id,
-           updated_at = NOW()
-     WHERE NOT $9::boolean OR $10 = ANY(response_rating.tags)`,
+  // existing CTE 在 upsert 之前对同一 (user,message) 读旧行的隐式态(语句快照 → 读到的是
+  // 旧值,看不到 upserted 的写入);upserted 保持原 INSERT..ON CONFLICT 语义不变,
+  // RETURNING 1 让 did_write 反映"确有写入"(隐式来件命中显式行时 WHERE 为假 → 0 行 → false)。
+  const r = await query<{ was_implicit: boolean | null; did_write: boolean }>(
+    `WITH existing AS (
+       SELECT ($10 = ANY(tags)) AS was_implicit
+         FROM response_rating
+        WHERE user_id = $1::bigint AND message_id = $3
+     ),
+     upserted AS (
+       INSERT INTO response_rating
+         (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
+       VALUES ($1::bigint, $2, $3, $4, $5, $6, $7::text[], $8)
+       ON CONFLICT (user_id, message_id) DO UPDATE
+         SET rating     = EXCLUDED.rating,
+             tags       = EXCLUDED.tags,
+             comment    = EXCLUDED.comment,
+             model      = EXCLUDED.model,
+             trace_id   = EXCLUDED.trace_id,
+             session_id = EXCLUDED.session_id,
+             updated_at = NOW()
+         WHERE NOT $9::boolean OR $10 = ANY(response_rating.tags)
+       RETURNING 1
+     )
+     SELECT (SELECT was_implicit FROM existing) AS was_implicit,
+            EXISTS (SELECT 1 FROM upserted)      AS did_write`,
     [
       input.userId,
       input.sessionId,
@@ -72,6 +86,12 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
       IMPLICIT_RATING_TAG,
     ],
   );
+  // E7 误伤率活体指标:显式来件(incomingImplicit=false)覆盖了原本 implicit 的行 →
+  // 用户主动纠正了一次隐式误判(误伤),打点。隐式来件不计(它压根不能覆盖显式)。
+  const row = r.rows[0];
+  if (!incomingImplicit && row?.did_write === true && row.was_implicit === true) {
+    incrImplicitRatingOverridden();
+  }
 }
 
 // ─── 用户侧:按会话回读该用户所有评分(前端"已评状态"恢复)──────────────

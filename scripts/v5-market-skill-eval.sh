@@ -42,10 +42,15 @@ echo "== $SLUG(《$displayName》, version=$versionId)"
 was_installed=$(curl -sf "${auth[@]}" "$V5_BASE/api/marketplace/installed" |
   jqpy "print('yes' if any(i.get('slug')=='$SLUG' for i in json.load(sys.stdin).get('installed',[])) else 'no')" 2>/dev/null || echo unknown)
 
+# 只有确知"原本已装"(was_installed=yes)才在 cleanup 里保留;no 或 unknown(探测失败)
+# 且本批确实装过 → 一律卸载还原,避免探测失败时把技能泄漏留在 canary 上污染后续评测。
+# installed_by_us 只在 install 成功后置 1:install 失败时 cleanup 不误删。
+installed_by_us=0
 cleanup() {
-  if [ "$was_installed" = "no" ]; then
+  if [ "$was_installed" != "yes" ] && [ "$installed_by_us" -eq 1 ]; then
     curl -sf -X DELETE "${auth[@]}" "$V5_BASE/api/marketplace/installed/$SLUG" >/dev/null 2>&1 \
-      && echo "· 已卸载还原(canary 原本未安装)" || echo "· 卸载还原失败,请手工清理 canary 的 $SLUG"
+      && echo "· 已卸载还原(canary 原本未安装/安装状态未知)" \
+      || echo "· 卸载还原失败,请手工清理 canary 的 $SLUG"
   fi
 }
 trap cleanup EXIT
@@ -53,6 +58,7 @@ trap cleanup EXIT
 curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
   "$V5_BASE/api/marketplace/install" -d "{\"versionId\":\"$versionId\"}" >/dev/null \
   || { echo "install 失败"; exit 2; }
+installed_by_us=1
 echo "· 已安装到 canary,等待 hub 同步…"
 
 # 触发并等待容器 hub 同步:**同步触发点在技能列表读**(handleUserSkillsList →
