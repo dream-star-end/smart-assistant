@@ -292,7 +292,7 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
             <button
               type="button"
               onClick={() => cb.onRetrySend?.(msg)}
-              className="inline-flex items-center gap-1 rounded-full bg-danger-soft px-2 py-0.5 font-medium text-danger transition-colors hover:brightness-95"
+              className="inline-flex items-center gap-1 rounded-full bg-danger-soft px-2 py-0.5 font-medium text-danger transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11"
             >
               <RotateCcw size={11} /> 重试
             </button>

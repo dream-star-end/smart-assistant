@@ -44,8 +44,14 @@ export function Modal({
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
           onEscapeKeyDown={onEscapeKeyDown}
+          // max-h 用 dvh 收口移动端浏览器动态工具栏(地址栏展开时 88vh 会溢出可视视口)。
+          // 桌面 dvh≡vh 故零回退;调用方仍可用自己的 max-h 覆盖(单类,tailwind-merge 后者覆盖)。
+          // 注:此处**不**并列 max-h-[88vh] 双回退——className 走 cn(tailwind-merge),同属性
+          // 会被折叠为最后一个,vh 回退会被剥掉(SettingsCenter 等能双类共存是因其 class 是纯
+          // 字符串、不过 cn)。dvh 在目标浏览器(iOS15.4+/Chromium108+,含现役鸿蒙/Quark 内核)
+          // 已普遍支持;更老 WebView 的 vh 回退 + safe-area 契约仍由 .oc-center-dialog(全尺寸 center)承担。
           className={cn(
-            "fixed left-1/2 top-1/2 z-50 flex max-h-[88vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-float outline-none data-[state=open]:animate-in",
+            "fixed left-1/2 top-1/2 z-50 flex max-h-[88dvh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-float outline-none data-[state=open]:animate-in",
             className,
           )}
         >
