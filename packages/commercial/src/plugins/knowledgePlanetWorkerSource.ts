@@ -536,8 +536,26 @@ function filteredState(state, domains, origins) {
     } catch { return null; }
   };
   return {
-    cookies: (Array.isArray(state?.cookies) ? state.cookies : []).filter((cookie) => domainSet.has(String(cookie.domain || '').replace(/^\./, '').toLowerCase())),
-    origins: (Array.isArray(state?.origins) ? state.origins : []).filter((origin) => originSet.has(normalizeOrigin(origin?.origin))),
+    cookies: (Array.isArray(state?.cookies) ? state.cookies : [])
+      .filter((cookie) => domainSet.has(String(cookie?.domain || '').replace(/^\./, '').toLowerCase()))
+      .map((cookie) => ({
+        name: cookie?.name,
+        value: cookie?.value,
+        domain: cookie?.domain,
+        path: cookie?.path,
+        expires: cookie?.expires,
+        httpOnly: cookie?.httpOnly,
+        secure: cookie?.secure,
+        sameSite: cookie?.sameSite,
+      })),
+    origins: (Array.isArray(state?.origins) ? state.origins : [])
+      .filter((origin) => originSet.has(normalizeOrigin(origin?.origin)))
+      .map((origin) => ({
+        origin: origin?.origin,
+        localStorage: Array.isArray(origin?.localStorage)
+          ? origin.localStorage.map((item) => ({ name: item?.name, value: item?.value }))
+          : origin?.localStorage,
+      })),
   };
 }
 
