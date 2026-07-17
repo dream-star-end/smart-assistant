@@ -263,6 +263,8 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
         purged.push(`${p.table}:${p.days}`);
         return 3;
       },
+      // 批D D3:注入 session_goals 终态清理(默认会打真 query,单测里注入避免碰 DB)。
+      sessionGoalsPurgeFn: async () => 7,
       onError: (table) => { errs.push(table); },
     });
     try {
@@ -272,6 +274,25 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       assert.deepEqual(errs, ["agent_audit"]);
       assert.ok(purged.includes("turn_traces:90"));
       assert.ok(purged.includes("rate_limit_events:30"));
+      // session_goals bespoke sweep 与 TTL policies 同 tick 执行,结果并入 deleted map。
+      assert.equal(res["session_goals"], 7);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("session_goals purge 抛错时不阻断其余,onError 收到 'session_goals'(批D D3)", async () => {
+    const errs: string[] = [];
+    const h = startAuditRetentionSweeper({
+      intervalMs: 60_000,
+      purgeFn: async () => 0,
+      sessionGoalsPurgeFn: async () => { throw new Error("goals boom"); },
+      onError: (table) => { errs.push(table); },
+    });
+    try {
+      const res = await h.runNow();
+      assert.equal(res["session_goals"], -1);
+      assert.deepEqual(errs, ["session_goals"]);
     } finally {
       h.stop();
     }

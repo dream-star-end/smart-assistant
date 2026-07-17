@@ -1,0 +1,13 @@
+{
+  "codexVersion": "0.144.0",
+  "rpcMethod": "thread/goal/set",
+  "rpcCode": -32600,
+  "messageTemplate": "cannot update goal for thread {thread}: no goal exists",
+  "messageSample": "cannot update goal for thread thread-goal-none: no goal exists",
+  "source": "extracted from codex 0.144.0 binary strings (ext/goal/src/extension.rs); production-observed 2026-07-17",
+  "binaryPath": "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "binarySha256": "901923c1808a151f6926d41d703c17ad48815662cefb1c8d832a052c44271429",
+  "binarySha256Source": "sha256sum of binaryPath (readable on this host; matches manifest.json binarySha256)",
+  "extraction": "strings -n 6 <binaryPath> | grep -i 'no goal exists' surfaces the format fragments 'cannot update goal for thread ' and ': no goal exists'",
+  "driftAlternatePhrasing": "cannot update goal because this thread has no goal"
+}

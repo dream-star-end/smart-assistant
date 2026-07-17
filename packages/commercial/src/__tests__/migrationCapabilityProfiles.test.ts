@@ -34,6 +34,23 @@ function jsonbLiterals(sql: string): string[] {
   return out
 }
 
+/** 去掉 SQL 行注释 `-- …` 与块注释 `/* … *​/`(避免注释里的提及被误计为调用)。 */
+function stripSqlComments(sql: string): string {
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '')
+}
+
+/**
+ * 统计一个迁移里 `fn_model_stage_version(...)` 的**真实调用**次数(SELECT/PERFORM 调用点),
+ * 排除:(a) 注释里的提及(如 0160 顶部说明);(b) 函数定义与授权语句
+ * `... FUNCTION fn_model_stage_version(...)`(CREATE/REVOKE/GRANT ... ON FUNCTION)。
+ */
+function countStageVersionCalls(sql: string): number {
+  const src = stripSqlComments(sql)
+  const total = [...src.matchAll(/\bfn_model_stage_version\s*\(/g)].length
+  const defsAndGrants = [...src.matchAll(/FUNCTION\s+fn_model_stage_version\s*\(/gi)].length
+  return total - defsAndGrants
+}
+
 describe('迁移文件 capability_profile ↔ parseCapabilityProfile 契约', () => {
   const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql'))
   // 只审"直接往 model_catalog 写 profile"的迁移(fn_model_stage_version / INSERT INTO
@@ -69,8 +86,24 @@ describe('迁移文件 capability_profile ↔ parseCapabilityProfile 契约', ()
         // 解析失败(错键名/错类型)会抛 → 测试红
         parseCapabilityProfile(`migration:${f}`, lit)
       }
+      // 结构性计数断言(批D D2):每次 fn_model_stage_version 调用都应携带一个能被探测器
+      // 看见的 '{…}'::jsonb profile 字面量。若"探测到的 profile 数 < 调用次数",几乎必然
+      // 是 profile 用了探测盲区形态(dollar-quote $$…$$::jsonb / jsonb_build_object() /
+      // 错键名让 reasoning+ccb 过滤器漏掉)——那会让上面的解析循环**空转、静默放绿**,
+      // 正是 2026-07-17 kimi-k3 事故(camelCase 键)想根治的漏网场景。数不齐=红。
+      const callCount = countStageVersionCalls(sql)
+      if (callCount > 0) {
+        assert.ok(
+          literals.length >= callCount,
+          `${f}: 探测到 ${literals.length} 个 profile 字面量,却有 ${callCount} 次 fn_model_stage_version 调用。` +
+            `每次 stage 都应带一个可被 parseCapabilityProfile 解析的 '{…}'::jsonb profile;` +
+            `数不齐通常意味着 profile 用了 dollar-quote / jsonb_build_object / 错键名等探测盲区形态,` +
+            `会绕过本契约静默放绿。修法:把 profile 写成受探测的 '{…}'::jsonb 单引号字面量。`,
+        )
+      }
       if (f === '0160_moonshot_kimi_k3.sql') {
         assert.ok(literals.length > 0, '0160 的 profile 字面量必须被本契约覆盖')
+        assert.equal(callCount, 1, '0160 应恰有 1 次 fn_model_stage_version 调用(计数器基准锚)')
       }
     })
   }
