@@ -10,6 +10,7 @@ import {
   KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   KNOWLEDGE_PLANET_WORKER_DIGEST,
 } from './knowledgePlanet.js'
+import { KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS } from './knowledgePlanetSmoke.js'
 import {
   type KnowledgePlanetVerificationExpected,
   deleteKnowledgePlanetVerificationHandoff,
@@ -44,6 +45,7 @@ const expected: KnowledgePlanetVerificationExpected = {
   imageId: `sha256:${'1'.repeat(64)}`,
   sourceCommit: '2'.repeat(40),
   actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+  resourceDependentActionIds: KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS,
   contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
 }
 
@@ -67,6 +69,7 @@ async function writeValid(file: Awaited<ReturnType<typeof fixture>>) {
     expectedExistingAccountInstanceId: null,
     replacementAccountInstanceId: null,
     passedActionIds: expected.actionIds,
+    resourceUnavailableActionIds: [],
     storageState: state,
     env,
     now,
@@ -103,6 +106,7 @@ describe('Knowledge Planet encrypted verification handoff', () => {
       expectedExistingAccountInstanceId: oldAccountInstanceId,
       replacementAccountInstanceId,
       passedActionIds: expected.actionIds,
+      resourceUnavailableActionIds: [],
       storageState: state,
       env,
       now,
@@ -125,6 +129,7 @@ describe('Knowledge Planet encrypted verification handoff', () => {
         expectedExistingAccountInstanceId: oldAccountInstanceId,
         replacementAccountInstanceId: oldAccountInstanceId,
         passedActionIds: expected.actionIds,
+        resourceUnavailableActionIds: [],
         storageState: state,
         env,
         now,
@@ -147,10 +152,12 @@ describe('Knowledge Planet encrypted verification handoff', () => {
     const original = JSON.parse(await readFile(file.path, 'utf8')) as Record<string, unknown>
 
     for (const mutation of [
+      { schemaVersion: 1 },
       { userId: 2 },
       { expectedExistingAccountInstanceId: '00000000-0000-4000-8000-000000000001' },
       { replacementAccountInstanceId: '00000000-0000-4000-8000-000000000002' },
       { passedActionIds: [...expected.actionIds].reverse() },
+      { resourceUnavailableActionIds: ['list_hashtag_topics'] },
       { cleanupVerified: false },
       { ciphertext: `${String(original.ciphertext).slice(0, -4)}AAAA` },
     ]) {
@@ -178,6 +185,55 @@ describe('Knowledge Planet encrypted verification handoff', () => {
         }),
         /does not match/,
       )
+    }
+  })
+
+  test('round-trips sparse coverage and rejects gaps, overlap, order drift, or non-resource skips', async () => {
+    const file = await fixture()
+    const resourceUnavailableActionIds = [
+      'list_hashtag_topics',
+      'list_column_topics',
+      'get_checkin',
+      'list_checkin_topics',
+    ]
+    const passedActionIds = expected.actionIds.filter(
+      (actionId) => !resourceUnavailableActionIds.includes(actionId),
+    )
+    const writeCoverage = (
+      passed: readonly string[],
+      unavailable: readonly string[],
+    ) =>
+      writeKnowledgePlanetVerificationHandoff({
+        expected,
+        userId: 1,
+        verification: 'existing-account',
+        replaceExistingAccount: false,
+        expectedExistingAccountInstanceId: '00000000-0000-4000-8000-000000000001',
+        replacementAccountInstanceId: null,
+        passedActionIds: passed,
+        resourceUnavailableActionIds: unavailable,
+        storageState: state,
+        env,
+        now,
+        file,
+      })
+
+    await writeCoverage(passedActionIds, resourceUnavailableActionIds)
+    const opened = await readKnowledgePlanetVerificationHandoff({ expected, env, now, file })
+    assert.deepEqual(opened.metadata.passedActionIds, passedActionIds)
+    assert.deepEqual(
+      opened.metadata.resourceUnavailableActionIds,
+      resourceUnavailableActionIds,
+    )
+
+    for (const [passed, unavailable] of [
+      [passedActionIds.slice(1), resourceUnavailableActionIds],
+      [expected.actionIds, ['list_hashtag_topics']],
+      [[...passedActionIds].reverse(), resourceUnavailableActionIds],
+      [passedActionIds, [...resourceUnavailableActionIds].reverse()],
+      [expected.actionIds.slice(1), ['list_groups']],
+    ] as const) {
+      await assert.rejects(writeCoverage(passed, unavailable), /result is invalid/)
     }
   })
 
@@ -249,6 +305,7 @@ describe('Knowledge Planet encrypted verification handoff', () => {
         expectedExistingAccountInstanceId: null,
         replacementAccountInstanceId: null,
         passedActionIds: expected.actionIds,
+        resourceUnavailableActionIds: [],
         storageState: state,
         env,
         now,
