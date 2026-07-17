@@ -52,7 +52,9 @@ export {
   KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   KNOWLEDGE_PLANET_PLUGIN_SLUG,
   KNOWLEDGE_PLANET_PLUGIN_VERSION,
+  KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS,
   KNOWLEDGE_PLANET_WORKER_DIGEST,
+  classifyKnowledgePlanetSetupPin,
   isOfficialKnowledgePlanetPluginIdentity,
 } from './knowledgePlanetContract.js'
 

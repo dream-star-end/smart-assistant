@@ -84,7 +84,7 @@ async function caddyRemoteFixture() {
 }
 
 describe('v5 release safety lanes', () => {
-  test('Knowledge Planet Plugin is gated before activation and seeded only after full smoke', async () => {
+  test('Knowledge Planet Plugin is noninteractively gated before activation and seeded only after full smoke', async () => {
     const [source, seedSource] = await Promise.all([
       readFile(deploy, 'utf8'),
       readFile(knowledgePlanetSeed, 'utf8'),
@@ -127,12 +127,32 @@ describe('v5 release safety lanes', () => {
       /seed-knowledge-planet-plugin\.ts --smoke-only[\s\S]*seed-knowledge-planet-plugin\.ts --seed-only/,
     )
     assert.doesNotMatch(seedSource, /smoke skipped/)
-    assert.match(seedSource, /await readEvidence\(imageId\)[\s\S]*seedKnowledgePlanetPlugin/)
+    const smokeOnly = seedSource.slice(
+      seedSource.indexOf('async function smokeOnly()'),
+      seedSource.indexOf('async function seedOnly()'),
+    )
+    assert.match(smokeOnly, /readHandoffIfPresent\(expected\)/)
+    assert.doesNotMatch(smokeOnly, /startLogin|waitForQrLogin/)
+    assert.match(seedSource, /readHandoffIfPresent\(expected\)[\s\S]*seedKnowledgePlanetPlugin/)
     assert.match(seedSource, /workerDigest: KNOWLEDGE_PLANET_WORKER_DIGEST/)
     assert.match(seedSource, /runKnowledgePlanetActionSmoke/)
     assert.match(seedSource, /findApprovedKnowledgePlanetPluginForDeploy/)
-    assert.match(seedSource, /evidence\.verification !== 'authenticated-action-smoke'/)
     assert.match(seedSource, /passedActionIds/)
+    assert.match(seedSource, /beforeListingOpen/)
+    assert.match(seedSource, /bindManagedBrowserPluginAccount/)
+    assert.match(seedSource, /--verify-user=/)
+    assert.match(
+      source,
+      /--verify-knowledge-planet-user=\*\)[\s\S]*MODE="knowledge-planet-verify"/,
+    )
+    assert.match(
+      source,
+      /OC_V5_KP_VERIFY_LOCK_FILE:-\/var\/lock\/oc-v5-knowledge-planet-verify\.lock/,
+    )
+    assert.match(
+      source,
+      /knowledge-planet-verify\) knowledge_planet_plugin_verify_user/,
+    )
     assert.match(seedSource, /--classify-current-for-release=/)
     assert.match(
       source,
@@ -154,6 +174,71 @@ describe('v5 release safety lanes', () => {
       source,
       /rollback_runtime_tuple 1 1 "\$kp_rollback_helper"[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*knowledge_planet_plugin_open_gate_to_release[\s\S]*"\$kp_rollback_helper" "\$kp_rollback_helper"/,
     )
+  })
+
+  test('Knowledge Planet setup-first deploy is one-shot, race-guarded, and skips the v1.1 seed', async () => {
+    const [source, seedSource] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(knowledgePlanetSeed, 'utf8'),
+    ])
+    const start = source.indexOf('\ndeploy() {')
+    const end = source.indexOf('\n# ───────────────────────── offline recycle', start)
+    const body = source.slice(start, end)
+    const built = body.indexOf('build_release ||')
+    const pre = body.indexOf(
+      'knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre',
+    )
+    const close = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
+    const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
+    const post = body.indexOf(
+      'knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" post',
+    )
+    const smoke = body.indexOf('smoke "$ACTIVE_PORT"', post)
+    const dist = body.indexOf('dist_handshake_smoke "$ACTIVE_PORT"', smoke)
+    const reopen = body.indexOf(
+      'knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"',
+      dist,
+    )
+    const setupDone = body.indexOf('knowledge-planet=setup-first', reopen)
+    const earlyReturn = body.indexOf('return 0', reopen)
+    const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
+    assert.ok(
+      built >= 0 &&
+        pre > built &&
+        close > pre &&
+        activation > close &&
+        post > activation &&
+        smoke > post &&
+        dist > smoke &&
+        reopen > dist &&
+        setupDone > reopen &&
+        earlyReturn > reopen &&
+        seed > earlyReturn,
+    )
+    assert.match(
+      seedSource,
+      /async function assertSetupFirstSafe\(phase: ['"]pre['"] \| ['"]post['"]\)/,
+    )
+    assert.match(seedSource, /version_review_source !== ['"]platform['"]/)
+    assert.match(seedSource, /OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON/)
+    assert.match(seedSource, /classifyKnowledgePlanetSetupPin\([\s\S]*compatible-predecessor/)
+    assert.match(seedSource, /exactActiveInstalls !== activeInstalls/)
+    assert.match(seedSource, /activeAccounts !== 0/)
+
+    const missingDist = run(deploy, ['--dry-run', '--defer-knowledge-planet-upgrade'])
+    assert.equal(missingDist.status, 2, missingDist.stdout + missingDist.stderr)
+    assert.match(missingDist.stderr, /仅允许与普通 deploy \+ --with-dist 同用/)
+
+    const accepted = run(deploy, [
+      '--dry-run',
+      '--with-dist',
+      '--defer-knowledge-planet-upgrade',
+    ])
+    assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr)
+    assert.match(accepted.stdout, /setup-first 前置守卫/)
+    assert.match(accepted.stdout, /setup-first drain 后守卫/)
+    assert.match(accepted.stdout, /knowledge-planet=setup-first/)
+    assert.doesNotMatch(accepted.stdout, /消费加密交接/)
   })
 
   test('Knowledge Planet first-publication and hotcfg compensation stay fail-closed', () => {
@@ -207,6 +292,22 @@ describe('v5 release safety lanes', () => {
       /hotcfg-first:rollback:1:1:new-release:0 smoke:18790(?:\n|$)/,
     )
     assert.doesNotMatch(result.stdout, /UNEXPECTED/)
+  })
+
+  test('Knowledge Planet verification is an explicit validated lane while ordinary deploy stays noninteractive', () => {
+    const verified = run(deploy, ['--dry-run', '--verify-knowledge-planet-user=1'])
+    assert.equal(verified.status, 0, verified.stdout + verified.stderr)
+    assert.match(verified.stdout, /Knowledge Planet Plugin preverification\(user=1\)/)
+    assert.match(verified.stdout, /one QR → 15 actions → encrypted handoff/)
+
+    for (const userId of ['0', '-1', 'abc', '']) {
+      const rejected = run(deploy, [
+        '--dry-run',
+        `--verify-knowledge-planet-user=${userId}`,
+      ])
+      assert.equal(rejected.status, 2, rejected.stdout + rejected.stderr)
+      assert.match(rejected.stderr, /需正整数用户 ID/)
+    }
   })
 
   test('trusted baseline guard mirrors the runtime manifest and hardens 775/664 releases', async () => {

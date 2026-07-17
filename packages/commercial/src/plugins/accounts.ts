@@ -434,7 +434,7 @@ export async function assertRuntimePluginInstallEntitlement(
   userId: number,
   verified: VerifiedRuntimePluginContract,
   runner: QueryRunner,
-  opts: { requireCurrent?: boolean } = {},
+  opts: { requireCurrent?: boolean; allowUnlisted?: boolean } = {},
 ): Promise<void> {
   const installed = await runner.query(
     `SELECT 1
@@ -442,7 +442,7 @@ export async function assertRuntimePluginInstallEntitlement(
        JOIN marketplace_skill_listings l ON l.slug = i.slug
       WHERE i.user_id = $1 AND i.slug = $2 AND i.version_id = $3
         AND i.artifact_hash = $4 AND i.uninstalled_at IS NULL
-        AND l.state = 'active'
+        AND (l.state = 'active' OR ($6::boolean AND l.state = 'unlisted'))
         AND ($5::boolean = FALSE OR l.current_approved_version_id = i.version_id)`,
     [
       userId,
@@ -450,13 +450,14 @@ export async function assertRuntimePluginInstallEntitlement(
       verified.versionId,
       verified.artifactHash,
       opts.requireCurrent === true,
+      opts.allowUnlisted === true,
     ],
   )
   if ((installed.rowCount ?? 0) !== 1)
     throw new PluginAccountError('NOT_INSTALLED', 'exact Plugin version is not installed')
 }
 
-export async function createManagedBrowserPluginAccount(input: {
+interface ManagedBrowserPluginAccountBindInput {
   userId: number
   versionId: number
   displayName?: string
@@ -464,12 +465,36 @@ export async function createManagedBrowserPluginAccount(input: {
   storageState: unknown
   env?: NodeJS.ProcessEnv
   pool?: Pool
-}): Promise<{ id: string; accountInstanceId: string }> {
+  /** Exact fail-closed listing-gate reason permitted for deploy-time bind only. */
+  unlistedGateReason?: string
+  /** Required old account identity when replacing a login proven expired. */
+  expectedExistingAccountInstanceId?: string
+  /** Predetermined replacement identity makes a verified relink replayable after a crash. */
+  replacementAccountInstanceId?: string
+}
+
+export interface ManagedBrowserPluginAccountBindResult {
+  id: string
+  accountInstanceId: string
+  outcome: 'created' | 'reused' | 'refreshed' | 'replaced'
+}
+
+/**
+ * Deploy/setup bind with explicit existing-account semantics. Runtime execution
+ * must never call this: the caller must have closed the listing gate before a
+ * replacement so no invocation can race the credential generation change.
+ */
+export async function bindManagedBrowserPluginAccount(
+  input: ManagedBrowserPluginAccountBindInput & {
+    existing: 'reject' | 'reuse-identical' | 'refresh-fenced' | 'replace'
+  },
+): Promise<ManagedBrowserPluginAccountBindResult> {
   const pool = input.pool ?? getPool()
   try {
     return await tx(async (client: PoolClient) => {
       const initial = await loadVerifiedRuntimePluginContract(input.versionId, client, {
         env: input.env,
+        allowUnlisted: Boolean(input.unlistedGateReason),
       })
       if (initial.pluginType !== 'managed-browser')
         throw new PluginAccountError('INVALID_STATE', 'Plugin does not use a browser account')
@@ -478,26 +503,228 @@ export async function createManagedBrowserPluginAccount(input: {
       if (!version || version.slug !== initial.slug)
         throw new PluginAccountError('ACCOUNT_STALE', 'Plugin version changed before account bind')
       const listing = await lockMarketplaceListing(client, initial.slug)
-      if (!listing || listing.pluginType !== 'managed-browser')
+      if (
+        !listing ||
+        listing.pluginType !== 'managed-browser' ||
+        !(
+          listing.state === 'active' ||
+          (typeof input.unlistedGateReason === 'string' &&
+            input.unlistedGateReason.length > 0 &&
+            listing.state === 'unlisted' &&
+            listing.revokedReason === input.unlistedGateReason)
+        )
+      )
         throw new PluginAccountError('ACCOUNT_STALE', 'Plugin listing changed before account bind')
       const verified = await loadVerifiedRuntimePluginContract(input.versionId, client, {
         env: input.env,
+        allowUnlisted: Boolean(input.unlistedGateReason),
       })
       if (verified.pluginType !== 'managed-browser')
         throw new PluginAccountError('ACCOUNT_STALE', 'Plugin subtype changed before account bind')
       await assertRuntimePluginInstallEntitlement(input.userId, verified, client, {
         requireCurrent: true,
+        allowUnlisted: Boolean(input.unlistedGateReason),
       })
-      const existing = await client.query(
-        `SELECT 1 FROM connections
+      if (
+        (input.existing === 'replace' &&
+          (!input.expectedExistingAccountInstanceId ||
+            !UUID_RE.test(input.expectedExistingAccountInstanceId) ||
+            !input.replacementAccountInstanceId ||
+            !UUID_RE.test(input.replacementAccountInstanceId) ||
+            input.replacementAccountInstanceId === input.expectedExistingAccountInstanceId)) ||
+        (input.existing !== 'replace' && input.replacementAccountInstanceId !== undefined)
+      )
+        throw new PluginAccountError(
+          'ACCOUNT_STALE',
+          'managed-browser Plugin replacement identity is invalid',
+        )
+      const storageState = validateBrowserStorageState(input.storageState, verified.contract)
+      const existing = await client.query<PluginAccountRow>(
+        `SELECT ${ACCOUNT_COLS} FROM connections
           WHERE user_id = $1 AND provider = $2 AND revoked_at IS NULL
           LIMIT 1 FOR UPDATE`,
         [input.userId, verified.slug],
       )
-      if ((existing.rowCount ?? 0) !== 0)
+      const current = existing.rows[0]
+      if (current && input.existing === 'reject')
         throw new PluginAccountError(
           'ACCOUNT_ALREADY_EXISTS',
           'managed-browser Plugin already has an active account',
+        )
+      if (current) {
+        if (
+          current.connector_version_id !== String(verified.versionId) ||
+          current.provider !== verified.slug ||
+          current.spec_hash.toString('hex') !== verified.artifactHash ||
+          current.exec_contract_hash.toString('hex') !== verified.execContractHash ||
+          current.auth_contract_version !== verified.contract.account.contractVersion
+        )
+          throw new PluginAccountError('ACCOUNT_STALE', 'existing Plugin account pin mismatch')
+        const currentEnvelope = decryptPluginAccountEnvelope(current, verified.contract, input.env)
+        const identicalState =
+          JSON.stringify(currentEnvelope.storageState) === JSON.stringify(storageState)
+        const replacementReplay =
+          input.existing === 'replace' &&
+          currentEnvelope.accountInstanceId === input.replacementAccountInstanceId &&
+          identicalState
+        if (
+          !replacementReplay &&
+          ((input.expectedExistingAccountInstanceId !== undefined &&
+            (!UUID_RE.test(input.expectedExistingAccountInstanceId) ||
+              currentEnvelope.accountInstanceId !== input.expectedExistingAccountInstanceId)) ||
+            (input.existing === 'refresh-fenced' &&
+              input.expectedExistingAccountInstanceId === undefined))
+        )
+          throw new PluginAccountError(
+            'ACCOUNT_STALE',
+            'managed-browser Plugin handoff account identity changed',
+          )
+        if (replacementReplay || (input.existing !== 'replace' && identicalState)) {
+          const reused = await client.query<{ id: string }>(
+            `UPDATE connections
+                SET status = 'active', last_error_code = NULL, last_verified_at = NOW(),
+                    revision = revision + 1, secret_generation = secret_generation + 1,
+                    updated_at = NOW()
+              WHERE id = $1::bigint AND user_id = $2 AND provider = $3
+                AND connector_version_id = $4 AND revision = $5 AND secret_generation = $6
+                AND revoked_at IS NULL AND status IN ('active','error')
+              RETURNING id::text AS id`,
+            [
+              current.id,
+              input.userId,
+              verified.slug,
+              verified.versionId,
+              current.revision,
+              current.secret_generation,
+            ],
+          )
+          if (reused.rowCount !== 1)
+            throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account reuse CAS failed')
+          return {
+            id: reused.rows[0]!.id,
+            accountInstanceId: currentEnvelope.accountInstanceId,
+            outcome: 'reused' as const,
+          }
+        }
+        if (input.existing === 'refresh-fenced') {
+          const aadSeed = randomUUID()
+          const envelope: PluginAccountEnvelopeV1 = {
+            schemaVersion: 1,
+            pluginType: 'managed-browser',
+            driverId: verified.contract.runtime.driverId,
+            driverVersion: verified.contract.runtime.driverVersion,
+            accountInstanceId: currentEnvelope.accountInstanceId,
+            storageState,
+          }
+          const encrypted = encryptEnvelope(
+            envelope,
+            input.userId,
+            verified.slug,
+            aadSeed,
+            input.env,
+          )
+          const refreshed = await client.query<{ id: string }>(
+            `UPDATE connections
+                SET display_name = $7, account_key = $8, aad_seed = $9::uuid,
+                    secret_enc = $10, secret_nonce = $11, meta = $12::jsonb,
+                    status = 'active', last_error_code = NULL, last_verified_at = NOW(),
+                    revision = revision + 1, secret_generation = secret_generation + 1,
+                    updated_at = NOW()
+              WHERE id = $1::bigint AND user_id = $2 AND provider = $3
+                AND connector_version_id = $4 AND revision = $5 AND secret_generation = $6
+                AND revoked_at IS NULL AND status IN ('active','error')
+              RETURNING id::text AS id`,
+            [
+              current.id,
+              input.userId,
+              verified.slug,
+              verified.versionId,
+              current.revision,
+              current.secret_generation,
+              (input.displayName ?? '').slice(0, 64),
+              computeAccountKey(
+                `plugin-account-v1:${verified.slug}:single`,
+                input.env ?? process.env,
+              ),
+              aadSeed,
+              encrypted.ciphertext,
+              encrypted.nonce,
+              JSON.stringify({
+                plugin_type: 'managed-browser',
+                account_hint: (input.accountHint ?? '').slice(0, 128),
+              }),
+            ],
+          )
+          if (refreshed.rowCount !== 1)
+            throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account refresh CAS failed')
+          return {
+            id: refreshed.rows[0]!.id,
+            accountInstanceId: currentEnvelope.accountInstanceId,
+            outcome: 'refreshed' as const,
+          }
+        }
+        if (input.existing !== 'replace')
+          throw new PluginAccountError(
+            'ACCOUNT_ALREADY_EXISTS',
+            'existing managed-browser Plugin account differs from verified state',
+          )
+        const accountInstanceId = input.replacementAccountInstanceId!
+        const aadSeed = randomUUID()
+        const envelope: PluginAccountEnvelopeV1 = {
+          schemaVersion: 1,
+          pluginType: 'managed-browser',
+          driverId: verified.contract.runtime.driverId,
+          driverVersion: verified.contract.runtime.driverVersion,
+          accountInstanceId,
+          storageState,
+        }
+        const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
+        const replaced = await client.query<{ id: string }>(
+          `UPDATE connections
+              SET display_name = $7, account_key = $8, aad_seed = $9::uuid,
+                  secret_enc = $10, secret_nonce = $11, meta = $12::jsonb,
+                  connector_version_id = $13, spec_hash = $14,
+                  exec_contract_hash = $15, auth_contract_version = $16,
+                  status = 'active', last_error_code = NULL, last_verified_at = NOW(),
+                  revision = revision + 1, secret_generation = secret_generation + 1,
+                  updated_at = NOW()
+            WHERE id = $1::bigint AND user_id = $2 AND provider = $3
+              AND connector_version_id = $4 AND revision = $5 AND secret_generation = $6
+              AND revoked_at IS NULL AND status IN ('active','error')
+            RETURNING id::text AS id`,
+          [
+            current.id,
+            input.userId,
+            verified.slug,
+            verified.versionId,
+            current.revision,
+            current.secret_generation,
+            (input.displayName ?? '').slice(0, 64),
+            computeAccountKey(
+              `plugin-account-v1:${verified.slug}:single`,
+              input.env ?? process.env,
+            ),
+            aadSeed,
+            encrypted.ciphertext,
+            encrypted.nonce,
+            JSON.stringify({
+              plugin_type: 'managed-browser',
+              account_hint: (input.accountHint ?? '').slice(0, 128),
+            }),
+            verified.versionId,
+            Buffer.from(verified.artifactHash, 'hex'),
+            Buffer.from(verified.execContractHash, 'hex'),
+            verified.contract.account.contractVersion,
+          ],
+        )
+        if (replaced.rowCount !== 1)
+          throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account replacement CAS failed')
+        return { id: replaced.rows[0]!.id, accountInstanceId, outcome: 'replaced' as const }
+      }
+      if (input.expectedExistingAccountInstanceId !== undefined)
+        throw new PluginAccountError(
+          'ACCOUNT_STALE',
+          'managed-browser Plugin handoff account disappeared',
         )
       const accountInstanceId = randomUUID()
       const accountKey = computeAccountKey(
@@ -511,7 +738,7 @@ export async function createManagedBrowserPluginAccount(input: {
         driverId: verified.contract.runtime.driverId,
         driverVersion: verified.contract.runtime.driverVersion,
         accountInstanceId,
-        storageState: validateBrowserStorageState(input.storageState, verified.contract),
+        storageState,
       }
       const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
       const inserted = await client.query<{ id: string }>(
@@ -538,7 +765,7 @@ export async function createManagedBrowserPluginAccount(input: {
           verified.contract.account.contractVersion,
         ],
       )
-      return { id: inserted.rows[0]!.id, accountInstanceId }
+      return { id: inserted.rows[0]!.id, accountInstanceId, outcome: 'created' as const }
     }, pool)
   } catch (error) {
     if (
@@ -551,6 +778,13 @@ export async function createManagedBrowserPluginAccount(input: {
       'managed-browser Plugin already has an active account',
     )
   }
+}
+
+export async function createManagedBrowserPluginAccount(
+  input: ManagedBrowserPluginAccountBindInput,
+): Promise<{ id: string; accountInstanceId: string }> {
+  const result = await bindManagedBrowserPluginAccount({ ...input, existing: 'reject' })
+  return { id: result.id, accountInstanceId: result.accountInstanceId }
 }
 
 /** Call-time entitlement + persistent generation fence. Invoke only while holding Redis lease. */

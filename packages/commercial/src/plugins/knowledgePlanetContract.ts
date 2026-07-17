@@ -551,6 +551,41 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Knowledge Planet Plugin contract subtype mismatch')
 
 /**
+ * Exact predecessor accepted only for the one-time product-login-first rollout.
+ * It was platform-reviewed and signed in production, and its browser account
+ * state contract is byte-for-byte compatible with v1.1. No other historical
+ * or user-published Knowledge Planet artifact is eligible for setup.
+ */
+export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.0.0',
+    artifactHash: '15ffb9bec94dfb42599bb55c04e98a9c7bf9b3f0af3a1ee420cd3bc1b8d080a7',
+    execContractHash: '41bc152b755ee305405a5d51b652e057cbe07e29b2040dc4075000b200c8e39c',
+  }),
+])
+
+export function classifyKnowledgePlanetSetupPin(input: {
+  version: string
+  artifactHash: string
+  execContractHash: string
+}): 'current' | 'compatible-predecessor' | null {
+  if (
+    input.version === KNOWLEDGE_PLANET_PLUGIN_VERSION &&
+    input.artifactHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash &&
+    input.execContractHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash
+  )
+    return 'current'
+  return KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.some(
+    (pin) =>
+      pin.version === input.version &&
+      pin.artifactHash === input.artifactHash &&
+      pin.execContractHash === input.execContractHash,
+  )
+    ? 'compatible-predecessor'
+    : null
+}
+
+/**
  * Single authority for the public "official" badge. Matching the public artifact
  * bytes is not enough: the row must have gone through the platform seed review
  * path and the signature-verified executable contract must match the pinned

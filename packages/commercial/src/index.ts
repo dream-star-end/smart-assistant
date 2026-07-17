@@ -1341,7 +1341,9 @@ export async function registerCommercial(
       expectedOwnerUid: 0,
     })
     pluginFacade = new PluginRuntimeFacade({ redis, browserRuntime })
-    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService)
+    knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
   } else {
     pluginFacade = new PluginRuntimeFacade({ redis })
   }
@@ -1677,6 +1679,8 @@ export async function registerCommercial(
           opencodego: cfg.OPENCODE_GO_API_KEY,
           // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
           kimi: cfg.ARK_AGENT_PLAN_KEY,
+          // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
+          moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
         },
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,

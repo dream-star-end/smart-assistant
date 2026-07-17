@@ -18,6 +18,8 @@
 #   scripts/deploy-v5.sh --bootstrap   # 首次:建源码树/HOME/openclaude.json/env/unit + 拷依赖 + 起服务
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --with-dist   # 代码+前端两生效面、【单次】重启(首选;两段式成对重启会二次掐断在途 turn)
+#   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
+#                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
 #   scripts/deploy-v5.sh --census-ccb-baseline  # 只读统计缺 baseline mount 的 V5 容器
@@ -185,6 +187,8 @@ assert_overrides_no_remove_keys() {
 }
 
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0
+DEFER_KNOWLEDGE_PLANET_UPGRADE=0
+KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 # P3 cohort lane 参数
 CANARY_RELEASE=""     # --canary [<rel-*目录名>];空=从当前 HEAD build_release
@@ -202,6 +206,9 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
+    # Knowledge Planet v1.0。用户扫码后，正常 deploy 再消费同一账号升级到 v1.1。
+    --defer-knowledge-planet-upgrade) DEFER_KNOWLEDGE_PLANET_UPGRADE=1 ;;
     --enable-platform-bundle) ENABLE_BUNDLE_FLAG=1 ;;
     --enable-runtime-release) ENABLE_RELEASE_FLAG=1 ;;
     --disable-platform-bundle) DISABLE_BUNDLE_FLAG=1 ;;
@@ -214,6 +221,10 @@ for arg in "$@"; do
     --bootstrap) MODE="bootstrap" ;;
     --migrate-bluegreen) MODE="migrate-bluegreen" ;;
     --smoke) MODE="smoke" ;;
+    --verify-knowledge-planet-user=*)
+      MODE="knowledge-planet-verify"
+      KNOWLEDGE_PLANET_VERIFY_USER="${arg#*=}"
+      ;;
     --census-ccb-baseline) MODE="baseline-census" ;;
     --remount-ccb-baseline) MODE="baseline-remount" ;;
     --dist) MODE="dist" ;;
@@ -251,6 +262,13 @@ for arg in "$@"; do
 done
 [[ "$MODE" == "rollback" && ! "$ROLLBACK_N" =~ ^[1-5]$ ]] && { echo "✗ --rollback=N 需 N∈1..5" >&2; exit 2; }
 [[ "$MODE" == "promote" && ! "$PROMOTE_PCT" =~ ^([0-9]|[1-9][0-9]|100)$ ]] && { echo "✗ --promote=<pct> 需 pct∈0..100" >&2; exit 2; }
+[[ "$MODE" == "knowledge-planet-verify" && ! "$KNOWLEDGE_PLANET_VERIFY_USER" =~ ^[1-9][0-9]{0,15}$ ]] \
+  && { echo "✗ --verify-knowledge-planet-user=<id> 需正整数用户 ID" >&2; exit 2; }
+if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
+      && ( "$MODE" != "deploy" || "$WITH_DIST" != 1 ) ]]; then
+  echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
+  exit 2
+fi
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 [[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
   || { echo "✗ CADDY_HTTP_PORT 必须是 1..65535 的规范十进制端口" >&2; exit 2; }
@@ -672,6 +690,7 @@ DEPLOY_HOLDER_OWNED=0
 MUTATION_LEASE_PID=""       # 后台 ssh(远端持 flock + sleep infinity)的本地 pid
 MUTATION_LEASE_ACTIVE=0     # 1=已持有,cleanup 需释放
 MUTATION_LEASE_BYPASSED=0   # 1=OC_V5_SKIP_MUTATION_LEASE 紧急旁路,活性断言直接放行
+KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=0
 
 begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
   local maintenance_mode="$1" include_egress="$2" target_commit nonce result healthy_checks
@@ -831,6 +850,8 @@ cleanup_deploy_process() {
   # 释放远端 lease 先于本地 holder(锁序反向):kill 后台 ssh → 远端 flock 随通道关闭而释放。
   release_production_mutation_lease >/dev/null 2>&1
   [[ "$DEPLOY_HOLDER_OWNED" == 1 ]] && rm -f "${DEPLOY_LOCK}.holder"
+  [[ "$KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED" == 1 ]] \
+    && rm -f "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
   exit "$rc"
 }
 
@@ -1498,11 +1519,12 @@ assert_not_bluegreen_for_cutover() {
 # 建到唯一 .staging-* → 完整性校验 → 写 .complete → **原子 mv -T 改名**为 rel-*(半成品永不落
 # rel-* 命名空间,activate/rollback/GC 只认带 .complete 的目录,Codex P0#3)。sha 全程钉死一次
 # 贯穿 archive/VERSION/dist(工作树必须干净=即该 sha,Codex P0#2)。
-BUILT_RELEASE=""
+BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""
 build_release() {
-  BUILT_RELEASE=""; DIST_BUILD_ID=""
+  BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
   full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
   short_sha="$(git -C "$REPO_ROOT" rev-parse --short "$full_sha")"   # 从 full_sha 派生,不二次读 HEAD(R2#2:消两读竞态)
   ts="$(date -u +%Y%m%d-%H%M%S)"
   cur="$(bg_current_release)"
@@ -3937,30 +3959,97 @@ wait_for_egress_release_ready() { # <expected-release> <require-authority-cap:0|
 }
 
 # Official managed-browser Plugin publication is a deploy-time operation, never a
-# gateway-startup side effect. The pre-activation gate exercises the exact pinned
-# runtime image and real QR flow without touching the DB; only after the new master
-# passes its normal smoke do we atomically publish/approve and additively migrate
-# legacy Knowledge Planet Skill users. A new artifact also requires one user-assisted
-# login plus schema-validated execution of every declared action; an already-approved
-# exact artifact keeps the lightweight QR/runtime regression gate on later deploys.
+# gateway-startup side effect. Human verification is an explicit pre-deploy lane:
+# it exercises the exact pinned image and all declared actions, then leaves only a
+# short-lived encrypted, candidate-bound account handoff. Normal deploy is strictly
+# noninteractive and fails fast before activation when a new candidate lacks it.
+knowledge_planet_candidate_commit() {
+  [[ "$BUILT_RELEASE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ Knowledge Planet candidate source commit is not pinned" >&2
+    return 1
+  }
+  printf '%s' "$BUILT_RELEASE_SOURCE_COMMIT"
+}
+
+knowledge_planet_plugin_verify_user() {
+  echo "══ Knowledge Planet Plugin preverification(user=$KNOWLEDGE_PLANET_VERIFY_USER)══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] clean pinned release → exact-image existing-account reuse or one QR → 15 actions → encrypted handoff"
+    return 0
+  fi
+  assert_no_rollout_in_progress
+  resolve_active_lane
+  assert_bluegreen_layout "$ACTIVE_SRC"
+  build_release || { echo "✗ Knowledge Planet verification release build failed" >&2; return 1; }
+  local source_commit
+  source_commit="$(knowledge_planet_candidate_commit)" || return 1
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    export OC_KNOWLEDGE_PLANET_SOURCE_COMMIT='$source_commit'
+    cd '$BUILT_RELEASE'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--verify-user=$KNOWLEDGE_PLANET_VERIFY_USER'"
+}
+
 knowledge_planet_plugin_smoke_gate() { # <pinned master release>
   local release="$1"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] exact-image Knowledge Planet QR/action smoke @ $release (DB zero-write)"
+    echo "  [dry-run] noninteractive exact-image Knowledge Planet approval/handoff gate @ $release"
     return 0
   fi
+  local source_commit
+  source_commit="$(knowledge_planet_candidate_commit)" || return 1
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    export OC_KNOWLEDGE_PLANET_SOURCE_COMMIT='$source_commit'
     cd '$release'
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
+}
+
+# One-shot setup-first deploy guard. It permits exactly the currently signed
+# platform v1.0 predecessor, identical encrypted browser-account semantics,
+# exact active installs, and zero persisted accounts. The post phase repeats
+# the proof after the old gateway process has drained while the listing gate is
+# still closed, so a late QR completion cannot race the source cutover.
+knowledge_planet_plugin_assert_setup_first_safe() { # <pinned master release> <pre|post>
+  local release="$1" phase="$2"
+  [[ "$phase" == pre || "$phase" == post ]] || {
+    echo "✗ Knowledge Planet setup-first phase 非法:$phase" >&2
+    return 2
+  }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert Knowledge Planet setup-first $phase: exact signed v1.0 + exact installs + zero accounts @ $release"
+    return 0
+  fi
+  local output result
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--assert-setup-first-safe=$phase'")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e --arg phase "$phase" '
+    .safe == true and .phase == $phase and
+    (.currentVersionId | type == "string" and test("^[0-9]+$")) and
+    (.currentArtifactHash | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.targetArtifactHash | type == "string" and test("^[0-9a-f]{64}$")) and
+    .currentArtifactHash != .targetArtifactHash and
+    (.activeInstalls | type == "number" and . > 0) and
+    .activeAccounts == 0' >/dev/null <<<"$result" || {
+    echo "✗ Knowledge Planet setup-first $phase 返回非法结果" >&2
+    return 1
+  }
 }
 
 knowledge_planet_plugin_seed() { # <active master release>
   local release="$1"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] verify smoke evidence → official Plugin seed + additive legacy Skill migration @ $release"
+    echo "  [dry-run] consume encrypted handoff when present → bind user before gate open → official seed/migration @ $release"
     return 0
   fi
+  local source_commit
+  source_commit="$(knowledge_planet_candidate_commit)" || return 1
   ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    export OC_KNOWLEDGE_PLANET_SOURCE_COMMIT='$source_commit'
     cd '$release'
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --seed-only"
 }
@@ -4201,9 +4290,15 @@ deploy() {
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
-  echo "── Knowledge Planet Plugin:exact-image QR/action 预激活门(DB 零写入)──"
-  knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
-    || { echo "✗ Knowledge Planet Plugin QR smoke 失败,未激活新 release" >&2; exit 1; }
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:setup-first 前置守卫(旧 v1.0 exact pin + 零账号)──"
+    knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre \
+      || { echo "✗ Knowledge Planet setup-first 前置守卫失败,未激活新 release" >&2; exit 1; }
+  else
+    echo "── Knowledge Planet Plugin:noninteractive exact-image approval/handoff 预激活门(DB 零写入)──"
+    knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
+      || { echo "✗ Knowledge Planet Plugin 非交互预验证门失败,未激活新 release" >&2; exit 1; }
+  fi
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
@@ -4236,15 +4331,29 @@ deploy() {
     exit 1
   fi
   kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
-  if ! knowledge_planet_plugin_classify_previous_release \
-    "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
-    knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-      || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
-    end_planned_maintenance || true
-    echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
-    exit 1
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    if [[ "$DRY" != 1 && -z "$kp_previous_plugin_version_id" ]]; then
+      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || mark_deploy_recovery_required "Knowledge Planet setup-first gate closed without a current version and restore failed"
+      end_planned_maintenance || true
+      echo "✗ Knowledge Planet setup-first 关闭门后 current version 丢失" >&2
+      exit 1
+    fi
+    # pre guard has already proven the previous source/version is the exact
+    # compatible predecessor; keep this true so every later failure executes
+    # the ordinary symmetric source+gate compensation.
+    kp_had_previous_plugin=1
+  else
+    if ! knowledge_planet_plugin_classify_previous_release \
+      "$BUILT_RELEASE" "$kp_previous_release" "$kp_previous_plugin_version_id"; then
+      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
+      end_planned_maintenance || true
+      echo "✗ 无法判定 Knowledge Planet previous release 是否可安全补偿" >&2
+      exit 1
+    fi
+    kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
   fi
-  kp_had_previous_plugin="$KNOWLEDGE_PLANET_PREVIOUS_RELEASE_AVAILABLE"
   echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
   if [[ "$hc_any" == 1 ]]; then
     if ! activate_runtime_tuple; then
@@ -4280,12 +4389,24 @@ deploy() {
       fi
     fi
   fi
+  if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:setup-first drain 后守卫(门保持关闭、账号仍为零)──"
+    if ! knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" post; then
+      validation_failure="Knowledge Planet setup-first post-drain guard failed"
+    fi
+  fi
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
     validation_failure="full master smoke failed"
   fi
   if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
+  fi
+  if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "── Knowledge Planet Plugin:扫码 UI 已就绪，恢复旧 v1.0 listing gate──"
+    if ! knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"; then
+      validation_failure="Knowledge Planet setup-first old gate reopen failed"
+    fi
   fi
   if [[ -n "$validation_failure" ]]; then
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
@@ -4299,7 +4420,15 @@ deploy() {
     echo "✗ 部署强校验失败；已确认回到旧 source/账号版本，部署未生效" >&2
     exit 1
   fi
-  echo "── Knowledge Planet Plugin:官方发布 + 账号/install 原子升级 + 旧 Skill 加法迁移──"
+  if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+    echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
+    end_planned_maintenance
+    gc_releases
+    [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
+    echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
+    return 0
+  fi
+  echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
   if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then
     echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
     # F7:同上,补偿前 best-effort 重取 lease(helper 幂等,与上方 validation 补偿可安全连调)。
@@ -5822,7 +5951,22 @@ fi
 # OC_V5_DEPLOY_LOCK_FILE 仅供**本地 hermetic 测试**注入独立锁文件(与 v5-runtime-release-lib.sh
 # 的 OC_HOTCFG_* 根路径同款"自测可覆盖"约定),避免测试去抢真实部署锁而挂死 900s。
 DEPLOY_LOCK="${OC_V5_DEPLOY_LOCK_FILE:-/var/lock/oc-v5-deploy.lock}"
+KNOWLEDGE_PLANET_VERIFY_LOCK="${OC_V5_KP_VERIFY_LOCK_FILE:-/var/lock/oc-v5-knowledge-planet-verify.lock}"
 trap cleanup_deploy_process EXIT
+# One verifier at a time. It also takes the global deploy lock below because
+# build_release writes the shared immutable-release namespace; the human wait
+# therefore cannot race deploy/GC, while ordinary deploy never launches QR.
+if [[ "$DRY" != 1 && "$MODE" == "knowledge-planet-verify" ]]; then
+  exec 9>"$KNOWLEDGE_PLANET_VERIFY_LOCK"
+  if ! flock -n 9; then
+    echo "⏳ Knowledge Planet 验证锁被占:$(cat "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder" 2>/dev/null || echo '持有者未知')"
+    flock -w 900 9 || { echo "✗ 900s 未取得 Knowledge Planet 验证锁" >&2; exit 3; }
+  fi
+  printf 'pid=%s user=%s tree=%s started=%s\n' \
+    "$$" "$KNOWLEDGE_PLANET_VERIFY_USER" "$REPO_ROOT" "$(date -Is)" \
+    > "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
+  KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=1
+fi
 if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" ]]; then
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then
     # ── 继承锁 FD(RFC-v5-selfheal-batch1b §4.1 锁交接协议 · probe-then-relock)──
@@ -5921,6 +6065,7 @@ case "$MODE" in
   bootstrap) bootstrap ;;
   migrate-bluegreen) migrate_to_bluegreen ;;
   smoke)     resolve_active_lane; smoke "$ACTIVE_PORT" ;;
+  knowledge-planet-verify) knowledge_planet_plugin_verify_user ;;
   baseline-census) run_ccb_baseline_remount census ;;
   baseline-remount) run_ccb_baseline_remount remount ;;
   deploy)    deploy ;;

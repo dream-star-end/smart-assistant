@@ -1,4 +1,4 @@
--- 0160_selfheal_release_requests — 批1b:放行→部署 durable async 账本(v5 侧权威)
+-- 0161_selfheal_release_requests — 批1b:放行→部署 durable async 账本(v5 侧权威)
 --
 -- RFC-v5-selfheal-batch1b §2:放行不再同步等个人版部署(部署会重启 master,同步
 -- handler 很可能在写审计前被自己杀掉)。改为:admin 放行事务内锁 repair + 结构化校验

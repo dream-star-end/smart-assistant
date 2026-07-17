@@ -1,7 +1,7 @@
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
-export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 15_000
+export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 45_000
 export const KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION = 0.15
 export const KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION = 0.2
 export const KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION = 70
@@ -50,12 +50,24 @@ function fail() {
   writeFrame({ event: 'failed', code: 'WORKER_FAILED' });
 }
 
-function writeFrame(value) {
+function encodeFrame(value) {
   const body = Buffer.from(JSON.stringify(value));
   if (body.length > MAX_OUTPUT) throw new Error('output');
   const header = Buffer.alloc(4);
   header.writeUInt32BE(body.length);
-  process.stdout.write(Buffer.concat([header, body]));
+  return Buffer.concat([header, body]);
+}
+
+function writeFrame(value) {
+  process.stdout.write(encodeFrame(value));
+}
+
+async function writeAuthenticatedAndExit(storageState) {
+  const output = encodeFrame({ event: 'authenticated', storageState });
+  await new Promise((resolve, reject) => {
+    process.stdout.write(output, (error) => error ? reject(error) : resolve());
+  });
+  process.exit(0);
 }
 
 async function readFrame() {
@@ -798,9 +810,7 @@ async function runLogin(input, relay) {
         : false;
       if (pageAuthenticated || probeAuthenticated) {
         const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
-        writeFrame({ event: 'authenticated', storageState: state });
-        terminal = true;
-        return;
+        await writeAuthenticatedAndExit(state);
       }
       await page.waitForTimeout(1000);
     }

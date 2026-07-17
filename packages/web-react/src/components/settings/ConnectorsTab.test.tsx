@@ -1022,7 +1022,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     expect(consumed).toHaveBeenCalledTimes(1)
   })
 
-  test('扫码成功后刷新账号卡、显示成功反馈并自动关闭弹层', async () => {
+  test('扫码成功后刷新账号卡并保留明确成功态，直到用户点完成', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
     mockedKnowledgeStart.mockResolvedValue({
@@ -1050,12 +1050,63 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
 
-    expect(await screen.findByText(/授权成功，知识星球已自动启用/)).toBeInTheDocument()
-    expect(await screen.findByText(/Agent 现在可以直接读取相关内容/)).toBeInTheDocument()
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), {
-      timeout: 4_000,
-    })
+    const successDialog = screen.getByRole('dialog')
+    expect(
+      await within(successDialog).findByText(/授权成功，知识星球已自动启用/),
+    ).toBeInTheDocument()
+    expect(
+      await within(successDialog).findByText(/Agent 现在可以直接读取相关内容/),
+    ).toBeInTheDocument()
+    await new Promise((resolve) => setTimeout(resolve, 1_300))
+    expect(successDialog).toBeInTheDocument()
+    fireEvent.click(within(successDialog).getByRole('button', { name: '完成' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(mockedPluginManagement.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  test('实时展示扫码确认与加密保存阶段，旧版兼容登录成功后不谎报 Agent 已可用', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    const base = {
+      sessionId: '25252525-2525-4252-8252-252525252525',
+      qrReady: false,
+      agentReady: false,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      expiresAt: '2026-07-17T00:04:00.000Z',
+    }
+    mockedKnowledgeStart.mockResolvedValue({
+      ...base,
+      status: 'waiting_for_scan',
+      phase: 'generating_qr',
+    })
+    mockedKnowledgeStatus
+      .mockResolvedValueOnce({
+        ...base,
+        status: 'finalizing',
+        phase: 'scan_confirmed',
+      })
+      .mockResolvedValueOnce({ ...base, status: 'finalizing', phase: 'saving' })
+      .mockResolvedValue({
+        ...base,
+        status: 'active',
+        phase: 'active',
+        accountId: '925',
+      })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByText(/微信扫码已确认/)).toBeInTheDocument()
+    expect(await within(dialog).findByText(/正在加密保存账号/)).toBeInTheDocument()
+    expect(await within(dialog).findByText(/无需再次扫码/)).toBeInTheDocument()
+    expect(screen.queryByText(/Agent 现在可以直接读取相关内容/)).not.toBeInTheDocument()
+    expect(
+      await within(dialog).findByText(/系统完成 Plugin 升级后会自动启用/),
+    ).toBeInTheDocument()
+    expect(dialog).toBeInTheDocument()
   })
 
   test('扫码状态因服务重启丢失时从账号权威恢复成功而不让用户空转', async () => {
@@ -1179,9 +1230,12 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
     expect(await screen.findByText(/Agent 现在可以直接读取相关内容/)).toBeInTheDocument()
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), {
-      timeout: 4_000,
-    })
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', {
+        name: '完成',
+      }),
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     const boundCard = providerCard('知识星球')
     fireEvent.click(within(boundCard).getByRole('button', { name: '解绑' }))
     fireEvent.click(

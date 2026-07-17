@@ -223,6 +223,32 @@ describe('managed-browser Plugin runtime', () => {
       }),
       /launcher pin mismatch/,
     )
+    assert.equal(mismatched.supportsContract(contract), false)
+  })
+
+  test('uses the same exact driver and launcher trust checks for discovery and execution', async () => {
+    const f = await fixture()
+    assert.equal(f.runtime.supportsContract(contract), true)
+    assert.equal(
+      f.runtime.supportsContract({
+        ...contract,
+        runtime: { ...contract.runtime, driverVersion: '1.0.1' },
+      }),
+      false,
+    )
+    assert.equal(
+      f.runtime.supportsContract({
+        ...contract,
+        runtime: {
+          ...contract.runtime,
+          network: {
+            ...contract.runtime.network,
+            origins: ['https://outside.example:443'],
+          },
+        },
+      }),
+      false,
+    )
   })
 
   test('resolves all DNS records, requires IPv4 and guards every request/redirect hop', async () => {

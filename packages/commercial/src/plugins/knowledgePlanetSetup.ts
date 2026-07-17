@@ -11,15 +11,16 @@ import {
   createManagedBrowserPluginAccount,
 } from './accounts.js'
 import type { ManagedBrowserPinnedOrigin } from './browserRuntime.js'
+import type { ManagedBrowserPluginContractV1 } from './contracts.js'
 import {
-  COMPILED_KNOWLEDGE_PLANET_PLUGIN,
   KNOWLEDGE_PLANET_LOGIN_ORIGINS,
   KNOWLEDGE_PLANET_PLUGIN_SLUG,
-  KnowledgePlanetRuntimeError,
   type KnowledgePlanetDockerService,
   type KnowledgePlanetLoginWorkerHandle,
+  KnowledgePlanetRuntimeError,
   validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
+import { classifyKnowledgePlanetSetupPin } from './knowledgePlanetContract.js'
 import { loadVerifiedRuntimePluginContract } from './review.js'
 
 const SETUP_TTL_MS = 4 * 60_000
@@ -55,6 +56,16 @@ type PublicSetupStatus =
 
 type TerminalClaim = 'authenticated' | 'cancelled' | 'expired' | 'failed'
 
+export type KnowledgePlanetSetupPhase =
+  | 'generating_qr'
+  | 'waiting_for_scan'
+  | 'scan_confirmed'
+  | 'saving'
+  | 'active'
+  | 'cancelled'
+  | 'expired'
+  | 'failed'
+
 interface SetupSession {
   id: string
   userId: number
@@ -62,6 +73,7 @@ interface SetupSession {
   createdAt: number
   expiresAt: number
   status: PublicSetupStatus
+  phase: KnowledgePlanetSetupPhase
   terminal: TerminalClaim | null
   qr: Buffer | null
   stateBuffer: Buffer | null
@@ -69,12 +81,15 @@ interface SetupSession {
   completion: Promise<void> | null
   accountId: string | null
   errorCode: string | null
+  agentReady: boolean
 }
 
 export interface KnowledgePlanetSetupView {
   sessionId: string
   status: PublicSetupStatus
+  phase: KnowledgePlanetSetupPhase
   qrReady: boolean
+  agentReady: boolean
   createdAt: string
   expiresAt: string
   accountId?: string
@@ -131,7 +146,10 @@ export class KnowledgePlanetSetupManager {
       resolver?: DnsResolver
       env?: NodeJS.ProcessEnv
       now?: () => number
-      loadEntitledVersion?: (userId: number) => Promise<number>
+      loadEntitledVersion?: (
+        userId: number,
+      ) => Promise<number | { versionId: number; agentReady: boolean }>
+      isAgentReady?: (contract: ManagedBrowserPluginContractV1) => boolean
       createAccount?: (input: {
         userId: number
         versionId: number
@@ -163,8 +181,13 @@ export class KnowledgePlanetSetupManager {
     }
   }
 
-  private async loadEntitledVersion(userId: number): Promise<number> {
-    if (this.opts.loadEntitledVersion) return this.opts.loadEntitledVersion(userId)
+  private async loadEntitledVersion(
+    userId: number,
+  ): Promise<{ versionId: number; agentReady: boolean }> {
+    if (this.opts.loadEntitledVersion) {
+      const loaded = await this.opts.loadEntitledVersion(userId)
+      return typeof loaded === 'number' ? { versionId: loaded, agentReady: true } : loaded
+    }
     const row = await this.pool.query<{ id: string }>(
       `SELECT v.id::text AS id
          FROM marketplace_installs i
@@ -174,7 +197,8 @@ export class KnowledgePlanetSetupManager {
         WHERE i.user_id = $1 AND i.slug = $2 AND i.uninstalled_at IS NULL
           AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
           AND l.state = 'active' AND l.current_approved_version_id = v.id
-          AND v.status = 'approved' AND v.security_review_state = 'security_approved'
+          AND v.status = 'approved' AND v.review_source = 'platform'
+          AND v.security_review_state = 'security_approved'
           AND v.functional_verify_state = 'verified' AND v.exec_revoked_at IS NULL
         LIMIT 1`,
       [userId, KNOWLEDGE_PLANET_PLUGIN_SLUG],
@@ -186,17 +210,22 @@ export class KnowledgePlanetSetupManager {
         'Knowledge Planet Plugin is not installed',
       )
     const verified = await loadVerifiedRuntimePluginContract(id, this.pool, { env: this.opts.env })
-    if (
-      verified.pluginType !== 'managed-browser' ||
-      verified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG ||
-      verified.artifactHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash ||
-      verified.execContractHash !== COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash
-    )
+    if (verified.pluginType !== 'managed-browser' || verified.slug !== KNOWLEDGE_PLANET_PLUGIN_SLUG)
+      throw new KnowledgePlanetSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
+    const setupPin = classifyKnowledgePlanetSetupPin({
+      version: verified.contract.version,
+      artifactHash: verified.artifactHash,
+      execContractHash: verified.execContractHash,
+    })
+    if (!setupPin)
       throw new KnowledgePlanetSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
     await assertRuntimePluginInstallEntitlement(userId, verified, this.pool, {
       requireCurrent: true,
     })
-    return id
+    return {
+      versionId: id,
+      agentReady: this.opts.isAgentReady?.(verified.contract) ?? setupPin === 'current',
+    }
   }
 
   private sessionFor(userId: number, sessionId: string): SetupSession {
@@ -210,7 +239,9 @@ export class KnowledgePlanetSetupManager {
     return {
       sessionId: session.id,
       status: session.status,
+      phase: session.phase,
       qrReady: session.status === 'waiting_for_scan' && session.qr !== null,
+      agentReady: session.agentReady,
       createdAt: new Date(session.createdAt).toISOString(),
       expiresAt: new Date(session.expiresAt).toISOString(),
       ...(session.accountId ? { accountId: session.accountId } : {}),
@@ -224,6 +255,7 @@ export class KnowledgePlanetSetupManager {
     wipe(session.stateBuffer)
     session.stateBuffer = null
     session.status = 'failed'
+    session.phase = 'failed'
     session.errorCode = code
   }
 
@@ -276,7 +308,7 @@ export class KnowledgePlanetSetupManager {
       this.sessions.delete(staleActive.id)
       if (this.currentByUser.get(userId) === staleActive.id) this.currentByUser.delete(userId)
     }
-    const versionId = await this.loadEntitledVersion(userId)
+    const entitled = await this.loadEntitledVersion(userId)
     const pins = this.opts.resolvePins
       ? await this.opts.resolvePins()
       : await resolveKnowledgePlanetLoginPins(this.opts.resolver)
@@ -284,10 +316,11 @@ export class KnowledgePlanetSetupManager {
     const session: SetupSession = {
       id: randomUUID(),
       userId,
-      versionId,
+      versionId: entitled.versionId,
       createdAt: now,
       expiresAt: now + SETUP_TTL_MS,
       status: 'waiting_for_scan',
+      phase: 'generating_qr',
       terminal: null,
       qr: null,
       stateBuffer: null,
@@ -295,6 +328,7 @@ export class KnowledgePlanetSetupManager {
       completion: null,
       accountId: null,
       errorCode: null,
+      agentReady: entitled.agentReady,
     }
     this.sessions.set(session.id, session)
     this.currentByUser.set(userId, session.id)
@@ -307,6 +341,7 @@ export class KnowledgePlanetSetupManager {
           if (session.terminal !== null || session.status !== 'waiting_for_scan') return
           wipe(session.qr)
           session.qr = Buffer.from(png)
+          session.phase = 'waiting_for_scan'
         },
         onAuthenticated: (state) => {
           if (!claim(session, 'authenticated')) return
@@ -316,6 +351,7 @@ export class KnowledgePlanetSetupManager {
             const validated = validateKnowledgePlanetAccountState(state)
             session.stateBuffer = Buffer.from(JSON.stringify(validated), 'utf8')
             session.status = 'finalizing'
+            session.phase = 'scan_confirmed'
           } catch {
             this.failSession(session)
           }
@@ -326,6 +362,7 @@ export class KnowledgePlanetSetupManager {
           wipe(session.qr)
           session.qr = null
           session.status = terminal === 'expired' ? 'expired' : 'failed'
+          session.phase = terminal === 'expired' ? 'expired' : 'failed'
           session.errorCode = code
         },
       })
@@ -337,6 +374,7 @@ export class KnowledgePlanetSetupManager {
           session.stateBuffer = null
           if (!stateBuffer) return this.failSession(session)
           try {
+            session.phase = 'saving'
             const storageState = JSON.parse(stateBuffer.toString('utf8'))
             const account = this.opts.createAccount
               ? await this.opts.createAccount({
@@ -355,6 +393,7 @@ export class KnowledgePlanetSetupManager {
                 })
             session.accountId = account.id
             session.status = 'active'
+            session.phase = 'active'
           } catch (error) {
             if (error instanceof PluginAccountError && error.code === 'ACCOUNT_ALREADY_EXISTS')
               this.failSession(session, 'ACCOUNT_ALREADY_EXISTS')
@@ -386,6 +425,7 @@ export class KnowledgePlanetSetupManager {
     if (session.status !== 'waiting_for_scan' || this.now() < session.expiresAt) return
     if (!claim(session, 'expired')) return
     session.status = 'expired'
+    session.phase = 'expired'
     session.errorCode = 'LOGIN_EXPIRED'
     wipe(session.qr)
     session.qr = null
@@ -410,6 +450,7 @@ export class KnowledgePlanetSetupManager {
     const session = this.sessionFor(safeUserId(userIdInput), sessionId)
     if (claim(session, 'cancelled')) {
       session.status = 'cancelled'
+      session.phase = 'cancelled'
       wipe(session.qr)
       session.qr = null
       wipe(session.stateBuffer)
@@ -426,6 +467,7 @@ export class KnowledgePlanetSetupManager {
     for (const session of this.sessions.values()) {
       if (claim(session, 'cancelled')) {
         session.status = 'cancelled'
+        session.phase = 'cancelled'
         wipe(session.qr)
         session.qr = null
         wipe(session.stateBuffer)

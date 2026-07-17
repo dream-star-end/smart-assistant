@@ -140,7 +140,7 @@ post-deploy / pre-canonical-push 之间必须有 **set-once** 的 `deploy_effect
 
 ## 5. P4:release drill
 
-- 迁移号:**先查生产 ledger 取下一个单调编号**(0157 已被 lossless_runtime_batches 占,仓库已到 0159 → 大概率 0160,不得假定)。
+- 迁移号:**先查生产 ledger 取下一个单调编号**(0157 已被 lossless_runtime_batches 占;实现期间 0160 又被 moonshot_kimi_k3 并行批占走 → 实际落号 0161/0162,再次验证"不得假定")。
 - seed exact `selfheal.drill:release_v1`(常驻 `auto_repair=f`,`execution_class=tier2`)+ broker 分级白名单(release drill → context/report/verify/cutover;Tier1 拒)+ SKILL release 分支(append 唯一 repairId/UTC 行到 `docs/selfheal/RELEASE_DRILLS.md` → commit → verify → cutover → report progress 等放行)。
 - drill 脚本 `--release`:翻 policy → 轮询 pending_release → **`--approve <repairId>` 二段人工确认**(走**真实 admin 身份** API,凭据从受限 stdin/fd 或既有安全会话;**禁**写脚本/env 文件,禁 operator bypass)→ 断言真部署 + `/version` 翻转 + repair 终态 + 归因。
 - **condition 必须保持 firing**,直到同时确认:① `/version == candidate sha` ② deployed callback 已落库 ③ repair 已进 `verifying` —— 才写 false。提前翻 false 会让 probe 以 `source=probe` 抢先收口,演练归因失真。
