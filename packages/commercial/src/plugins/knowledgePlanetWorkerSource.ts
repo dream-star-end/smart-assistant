@@ -2,6 +2,11 @@ export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
 export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 45_000
+// C3:zsxq 登录二维码约 2 分钟过期,而登录窗口有 4 分钟。只在 t=0 截一次会让窗口后半段
+// 展示死码(用户扫了也没用)。轮询期每 RECAPTURE_INTERVAL 重截一次,内容变化即重发 qr 帧;
+// 每次重截至多花 RECAPTURE_BUDGET(短预算,不阻塞认证轮询)。
+export const KNOWLEDGE_PLANET_QR_RECAPTURE_INTERVAL_MS = 15_000
+export const KNOWLEDGE_PLANET_QR_RECAPTURE_BUDGET_MS = 5_000
 export const KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION = 0.15
 export const KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION = 0.2
 export const KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION = 70
@@ -896,6 +901,8 @@ async function runLogin(input, relay) {
     if (qr.length > 512 * 1024) throw new Error('qr');
     remainingCaptureTimeout(qrCaptureDeadline);
     writeFrame({ event: 'qr', png: qr.toString('base64') });
+    let lastQrHash = createHash('sha256').update(qr).digest('hex');
+    let nextQrRecaptureAt = Date.now() + ${KNOWLEDGE_PLANET_QR_RECAPTURE_INTERVAL_MS};
     let nextProbeAt = Date.now() + ${KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS};
     let probeAttempts = 0;
     let pageHintApplied = false;
@@ -917,6 +924,21 @@ async function runLogin(input, relay) {
       if (hasAuthenticatedKnowledgePlanetSession(probeAuthenticated)) {
         const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
         await writeAuthenticatedAndExit(state);
+      }
+      // C3:先判认证(已扫码则上面已退出),未认证再看是否到点重截 QR。best-effort:
+      // 短预算内重截,内容 hash 变化(旧码过期、zsxq 刷新了 img)才重发一帧覆盖父侧 QR_PATH;
+      // 截不到(页面正在跳转/无可见 QR)只跳过本轮,绝不因此让登录失败。
+      if (Date.now() >= nextQrRecaptureAt) {
+        nextQrRecaptureAt = Date.now() + ${KNOWLEDGE_PLANET_QR_RECAPTURE_INTERVAL_MS};
+        const recaptureDeadline = Math.min(input.deadlineMs, Date.now() + ${KNOWLEDGE_PLANET_QR_RECAPTURE_BUDGET_MS});
+        const fresh = await captureQr(page, qrButton, switchButton, recaptureDeadline).catch(() => null);
+        if (fresh && fresh.length > 0 && fresh.length <= 512 * 1024) {
+          const freshHash = createHash('sha256').update(fresh).digest('hex');
+          if (freshHash !== lastQrHash) {
+            lastQrHash = freshHash;
+            writeFrame({ event: 'qr', png: fresh.toString('base64') });
+          }
+        }
       }
       await page.waitForTimeout(1000);
     }
