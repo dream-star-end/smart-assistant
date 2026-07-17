@@ -40,7 +40,7 @@ const SCHEMA_KEYS = new Set([
 // classes with a bounded repetition. This covers opaque IDs without admitting
 // publisher-controlled regular expressions with catastrophic backtracking.
 const SAFE_SCHEMA_PATTERN_RE = /^\^\[[A-Za-z0-9-]{1,64}\]\{([0-9]{1,4}),([0-9]{1,4})\}\$$/
-const SAFE_BROWSER_METHODS = new Set(['GET', 'HEAD', 'POST'])
+const SAFE_BROWSER_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'DELETE'])
 const INTERPRETER_BY_EXTENSION: Readonly<Record<string, string>> = {
   '.py': '/usr/bin/python3',
   '.mjs': '/usr/bin/node',
@@ -92,7 +92,7 @@ export interface LocalRuntimeContractV1 {
 
 export interface ManagedBrowserNetworkContractV1 {
   origins: readonly string[]
-  methods: readonly ('GET' | 'HEAD' | 'POST')[]
+  methods: readonly ('GET' | 'HEAD' | 'POST' | 'PUT' | 'DELETE')[]
   forbiddenChannels: typeof REQUIRED_BROWSER_FORBIDDEN_CHANNELS
   redirects: 'revalidate-every-hop'
   ipv4PinsRequired: true
@@ -439,7 +439,10 @@ export function validateRuntimePluginJson(
     )
 }
 
-function compileActions(raw: unknown): RuntimePluginActionContractV1[] {
+function compileActions(
+  raw: unknown,
+  maximumTimeoutSeconds = 120,
+): RuntimePluginActionContractV1[] {
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > 32)
     invalid('actions must contain 1-32 items')
   const seen = new Set<string>()
@@ -462,7 +465,7 @@ function compileActions(raw: unknown): RuntimePluginActionContractV1[] {
       timeoutSeconds: boundedInteger(
         action.timeoutSeconds,
         1,
-        120,
+        maximumTimeoutSeconds,
         `actions[${index}].timeoutSeconds`,
       ),
       params: safeSchema(action.params, `actions[${index}].params`),
@@ -683,20 +686,20 @@ function compileManaged(
   ].sort()
   if (origins.length !== network.origins.length)
     invalid('artifact.network origins contain duplicates')
-  if (!Array.isArray(network.methods) || network.methods.length === 0 || network.methods.length > 3)
-    invalid('artifact.network.methods must contain 1-3 methods')
+  if (!Array.isArray(network.methods) || network.methods.length === 0 || network.methods.length > 5)
+    invalid('artifact.network.methods must contain 1-5 methods')
   const methods = [
     ...new Set(
       network.methods.map((method) => {
         if (typeof method !== 'string' || !SAFE_BROWSER_METHODS.has(method))
           invalid('artifact.network method is not allowed')
-        return method as 'GET' | 'HEAD' | 'POST'
+        return method as 'GET' | 'HEAD' | 'POST' | 'PUT' | 'DELETE'
       }),
     ),
   ].sort()
   if (methods.length !== network.methods.length)
     invalid('artifact.network methods contain duplicates')
-  const actions = compileActions(root.actions)
+  const actions = compileActions(root.actions, 600)
   const execContract: ManagedBrowserPluginContractV1 = {
     schemaVersion: 1,
     pluginType: 'managed-browser',

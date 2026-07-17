@@ -83,6 +83,38 @@ function deps(overrides: Record<string, unknown> = {}): any {
       qr: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]),
       cancel: async () => ({ sessionId: SESSION, status: 'cancelled' }),
     },
+    knowledgePlanetAutomation: {
+      get: async () => ({
+        control: {
+          available: true,
+          enabled: false,
+          disclaimerVersion: 1,
+          acceptedVersion: null,
+          acceptedAt: null,
+          disclaimerText: 'automation notice',
+          accountDailyLimit: 10,
+          pausedReason: null,
+        },
+        rules: [],
+        recentRuns: [],
+      }),
+      setControl: async (input: Record<string, unknown>) => ({
+        available: true,
+        enabled: input.enabled === true,
+        disclaimerVersion: 1,
+        acceptedVersion: input.enabled === true ? 1 : null,
+        acceptedAt: input.enabled === true ? '2026-07-17T00:00:00.000Z' : null,
+        disclaimerText: 'automation notice',
+        accountDailyLimit: Number(input.accountDailyLimit ?? 10),
+        pausedReason: null,
+      }),
+      createRule: async (input: Record<string, unknown>) => ({ id: 'rule-created', ...input }),
+      patchRule: async (input: Record<string, unknown>) => ({
+        id: input.ruleId,
+        ...(input.patch as Record<string, unknown>),
+      }),
+      deleteRule: async () => undefined,
+    },
     ...overrides,
   }
 }
@@ -251,6 +283,132 @@ describe('Plugin management HTTP dispatcher', () => {
       dispatchPluginsRoute(await request('PATCH', '/api/plugins'), response(), ctx, deps()),
       (error: unknown) => error instanceof HttpError && error.status === 404,
     )
+  })
+
+  test('unattended automation uses separate consent and exact account/rule bindings', async () => {
+    const calls: Array<{ kind: string; input: unknown }> = []
+    const custom = deps({
+      knowledgePlanetAutomation: {
+        get: async (userId: number, targetId: string) => {
+          calls.push({ kind: 'get', input: { userId, targetId } })
+          return { control: { enabled: false }, rules: [], recentRuns: [] }
+        },
+        setControl: async (input: unknown) => {
+          calls.push({ kind: 'control', input })
+          return { enabled: true }
+        },
+        createRule: async (input: unknown) => {
+          calls.push({ kind: 'create', input })
+          return { id: '123e4567-e89b-42d3-a456-426614174001' }
+        },
+        patchRule: async (input: unknown) => {
+          calls.push({ kind: 'patch', input })
+          return { id: '123e4567-e89b-42d3-a456-426614174001', enabled: true }
+        },
+        deleteRule: async (userId: number, targetId: string, ruleId: string) => {
+          calls.push({ kind: 'delete', input: { userId, targetId, ruleId } })
+        },
+      },
+    })
+    let res = response()
+    await dispatchPluginsRoute(
+      await request('GET', '/api/plugins/accounts/901/automation'),
+      res,
+      ctx,
+      custom,
+    )
+    assert.deepEqual(calls.at(-1), {
+      kind: 'get',
+      input: { userId: 42, targetId: '901' },
+    })
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('PATCH', '/api/plugins/accounts/901/automation', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+        accountDailyLimit: 12,
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.deepEqual(calls.at(-1), {
+      kind: 'control',
+      input: {
+        userId: 42,
+        targetId: '901',
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+        accountDailyLimit: 12,
+      },
+    })
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('POST', '/api/plugins/accounts/901/automation/rules', {
+        groupId: '123456789',
+        name: '新主题',
+        instructions: '只回答产品问题',
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 201)
+    assert.deepEqual(calls.at(-1), {
+      kind: 'create',
+      input: {
+        userId: 42,
+        targetId: '901',
+        groupId: '123456789',
+        name: '新主题',
+        instructions: '只回答产品问题',
+      },
+    })
+
+    const ruleId = '123e4567-e89b-42d3-a456-426614174001'
+    await dispatchPluginsRoute(
+      await request('PATCH', `/api/plugins/accounts/901/automation/rules/${ruleId}`, {
+        enabled: true,
+      }),
+      response(),
+      ctx,
+      custom,
+    )
+    assert.deepEqual(calls.at(-1), {
+      kind: 'patch',
+      input: {
+        userId: 42,
+        targetId: '901',
+        ruleId,
+        patch: { enabled: true },
+      },
+    })
+    await dispatchPluginsRoute(
+      await request('DELETE', `/api/plugins/accounts/901/automation/rules/${ruleId}`),
+      response(),
+      ctx,
+      custom,
+    )
+    assert.equal(calls.at(-1)?.kind, 'delete')
+
+    for (const invalid of [
+      { enabled: true, accepted: true },
+      { enabled: false, accepted: true },
+      { enabled: 'true', accepted: true, disclaimerVersion: 1 },
+    ])
+      await assert.rejects(
+        dispatchPluginsRoute(
+          await request('PATCH', '/api/plugins/accounts/901/automation', invalid),
+          response(),
+          ctx,
+          custom,
+        ),
+        (error: unknown) => error instanceof HttpError && error.status === 400,
+      )
   })
 
   test('setup worker saturation is a stable retryable 429', async () => {

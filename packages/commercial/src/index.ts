@@ -393,6 +393,8 @@ import {
   createKnowledgePlanetRuntimeRegistries,
 } from './plugins/knowledgePlanet.js'
 import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
+import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutomation.js'
+import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -1332,11 +1334,33 @@ export async function registerCommercial(
 
   const preCheckRedis = wrapIoredisForPreCheck(redis);
 
+  const knowledgePlanetMediaResolverRef: {
+    current: ((userId: string) => Promise<UserMediaLocation>) | undefined
+  } = { current: undefined }
+  const knowledgePlanetMediaDeps = {
+    resolveUserMediaDirs: async (userId: string): Promise<UserMediaLocation> => {
+      if (!knowledgePlanetMediaResolverRef.current)
+        throw new Error('Knowledge Planet media resolver unavailable')
+      return knowledgePlanetMediaResolverRef.current(userId)
+    },
+    pullRemoteHostMedia: async (args: { hostUuid: string; remotePath: string }) => {
+      const target = await resolveServiceableHostTarget(args.hostUuid)
+      try {
+        return await nodeAgentGetFile(target, args.remotePath)
+      } finally {
+        target.psk?.fill(0)
+      }
+    },
+    stagingRoot: '/var/lib/openclaude-v5/plugin-media-staging',
+    expectedOwnerUid: 0,
+  }
+
   // Generic Plugin facade is process-scoped and shared by container RPC + browser HTTP.
   // The official Knowledge Planet driver is enabled only on V5 with the immutable image ID;
   // a mutable tag is never accepted as the worker trust root.
   let knowledgePlanetService: KnowledgePlanetDockerService | undefined
   let knowledgePlanetSetup: KnowledgePlanetSetupManager | undefined
+  let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -1356,10 +1380,15 @@ export async function registerCommercial(
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
     })
-    pluginFacade = new PluginRuntimeFacade({ redis, browserRuntime })
+    pluginFacade = new PluginRuntimeFacade({
+      redis,
+      browserRuntime,
+      knowledgePlanetMedia: knowledgePlanetMediaDeps,
+    })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
+    knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
   } else {
     pluginFacade = new PluginRuntimeFacade({ redis })
   }
@@ -3169,6 +3198,7 @@ export async function registerCommercial(
         docker: mediaResolverDocker,
       })
     : undefined;
+  knowledgePlanetMediaResolverRef.current = userMediaResolver
 
   // Shared remote-host upload closure. It is used by both gateway /api/uploads
   // and the master-side WeChat image ingest bridge so the two paths keep the
@@ -3253,6 +3283,7 @@ export async function registerCommercial(
     directContainerPreview,
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
+    knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
@@ -4811,6 +4842,38 @@ export async function registerCommercial(
         return { stop: () => h.stop() };
       },
     });
+  }
+
+  // 知识星球无人值守回复只写 v5 专属 0168 三表，并复用 Plugin 账号串行租约。
+  // 默认产品开关仍为关闭；scheduler 仅处理用户明确接受独立免责声明且启用的规则。
+  // 挂 LeaderBundle 保证双 slot 仅单 leader 扫描/生成/发送。关停：
+  // OC_KNOWLEDGE_PLANET_AUTOMATION_DISABLED=1。
+  if (
+    runtimeChannel === 'v5' &&
+    knowledgePlanetAutomation &&
+    process.env.OC_KNOWLEDGE_PLANET_AUTOMATION_DISABLED !== '1'
+  ) {
+    leaderBundle.add({
+      name: 'knowledgePlanetAutomation',
+      domain: 'v5-owned',
+      start: () => {
+        const raw = Number(process.env.OC_KNOWLEDGE_PLANET_AUTOMATION_INTERVAL_MS)
+        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000
+        const scheduler = trackScheduler('knowledgePlanetAutomation', 'v5-owned', startKnowledgePlanetAutomationScheduler({
+            runtime: pluginFacade,
+            preCheckRedis,
+            pricing,
+            apiKey: cfg.DEEPSEEK_API_KEY,
+            intervalMs,
+            onError: (duty, error) =>
+              rootLogger.warn('[knowledgePlanetAutomation] scheduler duty failed', {
+                duty,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+          }))
+        return { stop: () => scheduler.stop() }
+      },
+    })
   }
 
   if (runtimeChannel === "v5" && process.env.OC_GITHUB_WORKSPACE_SWEEPER_DISABLED !== "1") {

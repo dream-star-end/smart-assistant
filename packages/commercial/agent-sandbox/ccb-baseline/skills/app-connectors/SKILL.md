@@ -1,6 +1,6 @@
 ---
 name: app-connectors
-description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装 Plugin：邮件、WebDAV、Notion、GitHub、飞书，以及知识星球的读取、主题发布和评论。用户要访问外部应用或知识星球时使用。
+description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装 Plugin：邮件、WebDAV、Notion、GitHub、飞书，以及知识星球的读取、图文/附件发布、回复、点赞、主题编辑和删除。用户要访问外部应用或知识星球时使用。
 tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet]
 ---
 
@@ -63,17 +63,42 @@ echo '{"groupId":"123456789","keyword":"AI","count":10}' \
 | 标签及其主题 | `list_hashtags` / `list_hashtag_topics` |
 | 专栏及其主题 | `list_columns` / `list_column_topics` |
 | 打卡项目、详情及打卡主题 | `list_checkins` / `get_checkin` / `list_checkin_topics` |
-| 发布纯文本主题（需开关 + 逐次确认） | `create_topic` |
-| 发布纯文本评论（需开关 + 逐次确认） | `create_comment` |
+| 当前授权账号身份 | `get_self` |
+| 发布文字、图片或附件主题（需开关 + 逐次确认） | `create_topic` |
+| 发布文字/单图评论或回复（需开关 + 逐次确认） | `create_comment` |
+| 完整编辑普通主题（需开关 + 逐次确认） | `edit_topic` |
+| 设置主题/评论点赞状态（需开关 + 逐次确认） | `set_topic_like` / `set_comment_like` |
+| 永久删除主题/评论（需开关 + 逐次确认） | `delete_topic` / `delete_comment` |
 
 典型自动流程：先 `oc-plugin list` 确认知识星球可用 → `list_groups` 找目标星球 → 按请求调用
 主题/搜索/标签/专栏/打卡 action → 需要正文或评论时再用返回的 ID 深入读取。除非用户明确要求，
 不要无边界遍历所有星球；主题/动态分页每次最多 10 条，按需要继续。
 
-知识星球写入能力默认关闭。若 `oc-plugin list` 没有显示 `create_topic` / `create_comment`，
+知识星球写入能力默认关闭。若写 action 不可执行，
 明确引导用户到「设置 → 应用连接 → 知识星球账号」阅读免责声明并开启写入；不要反复尝试、
-不要绕过开关。开启后也必须走下方逐次确认流程。当前仅支持纯文本主题和评论，不要声称
-支持图片/文件、点赞、编辑、删除或无人值守自动回复。
+不要绕过开关。开启后也必须走下方逐次确认流程。
+
+图片/附件只能引用用户容器中已经存在的
+`/home/agent/.openclaude/uploads/<文件名>` 或 `/home/agent/.openclaude/generated/<文件名>`；
+先使用已有上传/生成结果，不要自行读取其它路径。主题最多 9 张图片和 9 个附件，单文件最多
+50 MiB；评论最多 1 张图片且不支持附件。`edit_topic` 仅支持普通 `talk` 主题，且是上游
+**完整替换**语义，默认保留现有媒体；修改前要把完整新正文讲清楚。问答、任务、文章主题在该 action
+中只读；知识星球没有可靠的评论正文编辑接口，不要用“删除后重发”冒充编辑。
+
+示例（均先产生确认卡，再按确认码执行）：
+
+```bash
+echo '{"groupId":"123456789","text":"周报","images":["/home/agent/.openclaude/uploads/chart.png"],"files":["/home/agent/.openclaude/uploads/report.pdf"]}' \
+  | oc-plugin call knowledge-planet create_topic
+echo '{"topicId":"987654321","text":"收到，稍后整理","repliedCommentId":"876543210"}' \
+  | oc-plugin call knowledge-planet create_comment
+echo '{"topicId":"987654321","liked":true}' \
+  | oc-plugin call knowledge-planet set_topic_like
+```
+
+无人值守自动回复由用户在「设置 → 应用连接 → 知识星球账号」中通过**另一份免责声明和独立开关**配置，
+不是 Agent 可静默开启的 action。它只会自动发送带 AI 标识的文字评论，不会自动上传媒体、点赞、
+编辑或删除；用户要求配置时，引导其在界面创建规则、限额和冷却时间，不要替用户接受条款。
 
 ### 写操作的确认流程(必须遵守)
 

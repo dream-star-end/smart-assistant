@@ -28,25 +28,27 @@ function hasAuthenticatedKnowledgePlanetSession(probeAuthenticated) {
   return probeAuthenticated === true;
 }`
 
-/** Single source for the two exact text-only write routes and byte signatures. */
+/** Single source for official write routes and the current Web signature. */
 export const KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE = String.raw`
-function buildKnowledgePlanetWriteRequest(action, params) {
-  if (action === 'create_topic' && NUMERIC_ID.test(params.groupId) && typeof params.text === 'string' && params.text.length >= 1 && params.text.length <= 10000) return {
+function buildKnowledgePlanetWriteRequest(action, params, uploaded) {
+  const imageIds = Array.isArray(uploaded?.imageIds) ? uploaded.imageIds : [];
+  const fileIds = Array.isArray(uploaded?.fileIds) ? uploaded.fileIds : [];
+  if (action === 'create_topic' && NUMERIC_ID.test(params.groupId) && typeof params.text === 'string' && params.text.length <= 10000 && (params.text.length > 0 || imageIds.length > 0 || fileIds.length > 0)) return {
     method: 'POST',
     path: '/v2/groups/' + params.groupId + '/topics',
     query: {},
     resultKind: 'topic',
     body: JSON.stringify({
       req_data: {
-        type: 'topic',
+        type: 'talk',
         text: params.text,
-        image_ids: [],
-        file_ids: [],
+        image_ids: imageIds,
+        file_ids: fileIds,
         mentioned_user_ids: [],
       },
     }),
   };
-  if (action === 'create_comment' && NUMERIC_ID.test(params.topicId) && typeof params.text === 'string' && params.text.length >= 1 && params.text.length <= 5000) return {
+  if (action === 'create_comment' && NUMERIC_ID.test(params.topicId) && typeof params.text === 'string' && params.text.length <= 1200 && (params.text.length > 0 || imageIds.length > 0) && imageIds.length <= 1 && fileIds.length === 0) return {
     method: 'POST',
     path: '/v2/topics/' + params.topicId + '/comments',
     query: {},
@@ -54,17 +56,36 @@ function buildKnowledgePlanetWriteRequest(action, params) {
     body: JSON.stringify({
       req_data: {
         text: params.text,
-        image_ids: [],
+        image_ids: imageIds,
+        ...(NUMERIC_ID.test(params.repliedCommentId || '') ? { replied_comment_id: params.repliedCommentId } : {}),
         mentioned_user_ids: [],
       },
     }),
   };
+  if (action === 'edit_topic' && NUMERIC_ID.test(params.groupId) && NUMERIC_ID.test(params.topicId) && typeof params.text === 'string' && params.text.length <= 10000 && (params.text.length > 0 || imageIds.length > 0 || fileIds.length > 0)) return {
+    method: 'PUT',
+    path: '/v2/groups/' + params.groupId + '/topics/' + params.topicId,
+    query: {},
+    resultKind: 'topic',
+    body: JSON.stringify({ req_data: { type: 'talk', text: params.text, image_ids: imageIds, file_ids: fileIds, mentioned_user_ids: [] } }),
+  };
+  if (action === 'delete_topic' && NUMERIC_ID.test(params.topicId)) return {
+    method: 'DELETE', path: '/v2/topics/' + params.topicId, query: {}, resultKind: 'ok', body: undefined,
+  };
+  if (action === 'delete_comment' && NUMERIC_ID.test(params.commentId)) return {
+    method: 'DELETE', path: '/v2/comments/' + params.commentId, query: {}, resultKind: 'ok', body: undefined,
+  };
+  if (action === 'set_topic_like' && NUMERIC_ID.test(params.topicId) && typeof params.liked === 'boolean') return {
+    method: params.liked ? 'POST' : 'DELETE', path: '/v2/topics/' + params.topicId + '/likes', query: {}, resultKind: 'ok', body: params.liked ? JSON.stringify({ req_data: {} }) : undefined,
+  };
+  if (action === 'set_comment_like' && NUMERIC_ID.test(params.commentId) && typeof params.liked === 'boolean') return {
+    method: params.liked ? 'POST' : 'DELETE', path: '/v2/comments/' + params.commentId + '/likes', query: {}, resultKind: 'ok', body: undefined,
+  };
   return null;
 }
 
-function knowledgePlanetPostSignature(timestamp, body) {
-  const bodyMd5 = createHash('md5').update(Buffer.from(body, 'utf8')).digest('hex');
-  return createHash('sha1').update(timestamp + bodyMd5).digest('hex');
+function knowledgePlanetSignature(url, timestamp, requestId) {
+  return createHash('sha1').update(url.replace(/'/g, '%27') + ' ' + timestamp + ' ' + requestId).digest('hex');
 }`
 
 export function isKnowledgePlanetQrPixelSampleReady(input: {
@@ -89,6 +110,7 @@ export function isKnowledgePlanetLoginProbeDue(
 
 /** Trusted source materialized read-only into the exact pinned runtime image. */
 export const KNOWLEDGE_PLANET_WORKER_SOURCE = String.raw`import { createHash, randomUUID } from 'node:crypto';
+import { open } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer, createConnection } from 'node:net';
 
@@ -292,6 +314,16 @@ function compact(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonicalJson(value[key])).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function contentDigest(value) {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
 function projectAuthor(value) {
   const raw = value && typeof value === 'object' ? value : {};
   return compact({ id: id(raw.user_id || raw.uid || raw.id), name: text(raw.name, 128) });
@@ -347,7 +379,7 @@ function projectTopic(value) {
   const article = talk.article || raw.article;
   const images = Array.isArray(talk.images) ? talk.images : Array.isArray(raw.images) ? raw.images : [];
   const files = Array.isArray(talk.files) ? talk.files : Array.isArray(raw.files) ? raw.files : [];
-  return compact({
+  const projected = compact({
     id: id(raw.topic_id || raw.id),
     type: text(raw.type, 32),
     createdAt: text(raw.create_time || raw.created_at, 64),
@@ -363,10 +395,16 @@ function projectTopic(value) {
     rewardCount: integer(raw.rewards_count ?? raw.reward_count),
     digested: booleanValue(raw.digested),
     sticky: booleanValue(raw.sticky),
+    liked: booleanValue(raw.user_specific?.liked ?? raw.liked),
     images: images.slice(0, 10).map(projectImage),
     files: files.slice(0, 10).map(projectFile),
     article: article && typeof article === 'object' ? projectArticle(article) : undefined,
   });
+  return { ...projected, contentDigest: contentDigest({
+    text: projected.text || '',
+    imageIds: Array.isArray(projected.images) ? projected.images.map((item) => item.id).filter(Boolean) : [],
+    fileIds: Array.isArray(projected.files) ? projected.files.map((item) => item.id).filter(Boolean) : [],
+  }) };
 }
 
 function projectGroup(value) {
@@ -387,15 +425,22 @@ function projectGroup(value) {
 
 function projectComment(value) {
   const raw = value && typeof value === 'object' ? value : {};
-  return compact({
+  const images = Array.isArray(raw.images) ? raw.images : [];
+  const projected = compact({
     id: id(raw.comment_id || raw.id),
     createdAt: text(raw.create_time || raw.created_at, 64),
-    text: text(raw.text, 5_000),
+    text: text(raw.text, 1_200),
     author: projectAuthor(raw.owner || raw.user),
     replyTo: projectAuthor(raw.repliee || raw.reply_to),
     likeCount: integer(raw.likes_count ?? raw.like_count),
     sticky: booleanValue(raw.sticky),
+    liked: booleanValue(raw.user_specific?.liked ?? raw.liked),
+    images: images.slice(0, 1).map(projectImage),
   });
+  return { ...projected, contentDigest: contentDigest({
+    text: projected.text || '',
+    imageIds: Array.isArray(projected.images) ? projected.images.map((item) => item.id).filter(Boolean) : [],
+  }) };
 }
 
 function projectHashtag(value) {
@@ -470,6 +515,7 @@ function topicQuery(params, count) {
 function buildAction(action, params) {
   const count = Number.isInteger(params.count) ? params.count : 10;
   const topicCount = Math.min(count, ${KNOWLEDGE_PLANET_TOPIC_PAGE_MAX});
+  if (action === 'get_self') return { path: '/v2/users/self', query: {}, project: (data) => ({ user: projectAuthor(objectAt(data, 'user')) }) };
   if (action === 'list_groups') return { path: '/v2/groups', query: {}, project: (data) => ({ groups: firstArrayAt(data, ['groups', 'items', 'list']).slice(0, 50).map(projectGroup) }) };
   if (action === 'get_group' && NUMERIC_ID.test(params.groupId)) return {
     path: '/v2/groups/' + params.groupId,
@@ -621,9 +667,7 @@ function readAduid(state) {
 function signedHeaders(url, state, body) {
   const requestId = randomUUID();
   const timestamp = String(Math.floor(Date.now() / 1000));
-  const signature = body === undefined
-    ? createHash('sha1').update(url.toString().replace(/'/g, '%27') + ' ' + timestamp + ' ' + requestId).digest('hex')
-    : knowledgePlanetPostSignature(timestamp, body);
+  const signature = knowledgePlanetSignature(url.toString(), timestamp, requestId);
   const headers = {
     accept: 'application/json, text/plain, */*',
     origin: 'https://wx.zsxq.com',
@@ -645,58 +689,231 @@ async function boundedJsonResponse(response) {
   catch { throw new Error('response'); }
 }
 
-async function runAction(input, relay) {
-  const spec = buildAction(input.actionId, input.params || {});
+const WRITE_ACTIONS = new Set(['create_topic', 'create_comment', 'edit_topic', 'delete_topic', 'delete_comment', 'set_topic_like', 'set_comment_like']);
+
+function apiUrl(spec) {
   const url = new URL(spec.path, 'https://api.zsxq.com');
-  for (const [key, value] of Object.entries(spec.query)) if (value !== undefined) url.searchParams.set(key, String(value));
+  for (const [key, value] of Object.entries(spec.query || {})) if (value !== undefined) url.searchParams.set(key, String(value));
+  return url;
+}
+
+async function fetchApi(api, spec, state, timeout = 120_000) {
+  const url = apiUrl(spec);
+  const response = await api.fetch(url.toString(), {
+    method: spec.method || 'GET',
+    ...(spec.body === undefined ? {} : { data: Buffer.from(spec.body, 'utf8') }),
+    failOnStatusCode: false,
+    timeout,
+    headers: signedHeaders(url, state || {}, spec.body),
+  });
+  let data;
+  try {
+    data = await boundedJsonResponse(response);
+  } catch {
+    if (response.status() === 401) await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+    throw new Error('response');
+  }
+  if (!response.ok() || data?.succeeded !== true) {
+    await writeTerminalAndExit({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
+  }
+  return data;
+}
+
+async function finishAction(api, input, result) {
+  const state = filteredState(await api.storageState(), input.cookieDomains, input.stateOrigins);
+  const serializedState = JSON.stringify(state);
+  if (Buffer.byteLength(serializedState, 'utf8') > MAX_STATE_JSON) throw new Error('state');
+  let completed = { event: 'completed', result, storageState: state };
+  if (Buffer.byteLength(JSON.stringify(completed), 'utf8') > MAX_OUTPUT) {
+    const listKey = Object.keys(result).find((key) => Array.isArray(result[key]));
+    if (!listKey) throw new Error('output');
+    result = { ...result, [listKey]: [...result[listKey]] };
+    while (result[listKey].length > 0 && Buffer.byteLength(JSON.stringify({ event: 'completed', result, storageState: state }), 'utf8') > MAX_OUTPUT) result[listKey].pop();
+    if ('nextEndTime' in result) result.nextEndTime = result[listKey].at(-1)?.createdAt;
+    completed = { event: 'completed', result: compact(result), storageState: state };
+  }
+  await writeTerminalAndExit(completed);
+}
+
+function exactObjectKeys(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+}
+
+async function verifyInputMedia(item) {
+  if (!exactObjectKeys(item, ['path', 'inputId', 'filename', 'sizeBytes', 'sha256', 'mimeType', 'kind'])) throw new Error('media');
+  if (!/^[A-Za-z0-9-]{1,64}$/.test(item.inputId) || !/^[0-9a-f]{64}$/.test(item.sha256) || !['image', 'file'].includes(item.kind)) throw new Error('media');
+  const file = await open('/inputs/' + item.inputId, 'r');
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size !== item.sizeBytes || stat.size <= 0 || stat.size > 50 * 1024 * 1024) throw new Error('media');
+    const bytes = await file.readFile();
+    try {
+      if (createHash('sha256').update(bytes).digest('hex') !== item.sha256) throw new Error('media');
+    } finally {
+      bytes.fill(0);
+    }
+  } finally {
+    await file.close();
+  }
+}
+
+function relevantTopicDigest(topic) {
+  return contentDigest({
+    text: topic?.text || '',
+    imageIds: Array.isArray(topic?.images) ? topic.images.map((item) => item.id).filter(Boolean) : [],
+    fileIds: Array.isArray(topic?.files) ? topic.files.map((item) => item.id).filter(Boolean) : [],
+  });
+}
+
+function automationTopicDigest(topic) {
+  const createdAt = new Date(topic?.createdAt || '');
+  if (!topic?.id || !Number.isFinite(createdAt.getTime())) return null;
+  return contentDigest(compact({
+    id: topic.id,
+    createdAt: createdAt.toISOString(),
+    type: typeof topic.type === 'string' ? topic.type : undefined,
+    title: typeof topic.title === 'string' ? topic.title : undefined,
+    text: typeof topic.text === 'string' ? topic.text : undefined,
+    question: typeof topic.question === 'string' ? topic.question : undefined,
+    answer: typeof topic.answer === 'string' ? topic.answer : undefined,
+    contentDigest: typeof topic.contentDigest === 'string' ? topic.contentDigest : undefined,
+    author: topic.author && typeof topic.author === 'object' ? topic.author : undefined,
+  }));
+}
+
+async function currentTopic(api, state, topicId) {
+  const data = await fetchApi(api, { method: 'GET', path: '/v2/topics/' + topicId, query: {} }, state);
+  return projectTopic(objectAt(data, 'topic'));
+}
+
+async function currentComment(api, state, topicId, commentId) {
+  for (const sort of ['desc', 'asc']) {
+    const data = await fetchApi(api, { method: 'GET', path: '/v2/topics/' + topicId + '/comments', query: { count: 50, sort } }, state);
+    const found = firstArrayAt(data, ['comments', 'items', 'list']).map(projectComment).find((item) => item.id === commentId);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function verifyWritePrecondition(api, state, action, params) {
+  if (action === 'create_comment' && params.automationSourceSnapshot) {
+    const snapshot = params.automationSourceSnapshot;
+    if (!exactObjectKeys(snapshot, ['expectedDigest']) || !/^[0-9a-f]{64}$/.test(snapshot.expectedDigest)) throw new Error('snapshot');
+    const topic = await currentTopic(api, state, params.topicId);
+    return automationTopicDigest(topic) === snapshot.expectedDigest;
+  }
+  if (action === 'edit_topic' || action === 'delete_topic') {
+    if (!params.editSnapshot && !params.deleteSnapshot) throw new Error('snapshot');
+    const snapshot = params.editSnapshot || params.deleteSnapshot;
+    const topic = await currentTopic(api, state, params.topicId);
+    return topic && relevantTopicDigest(topic) === snapshot.expectedDigest;
+  }
+  if (action === 'delete_comment') {
+    if (!params.deleteSnapshot) throw new Error('snapshot');
+    const comment = await currentComment(api, state, params.topicId, params.commentId);
+    return comment !== null && comment.contentDigest === params.deleteSnapshot.expectedDigest;
+  }
+  return true;
+}
+
+async function uploadOne(api, relay, state, item) {
+  const uploadBody = JSON.stringify({ req_data: item.kind === 'image'
+    ? { type: 'image', size: item.sizeBytes, name: '', hash: '' }
+    : { type: 'file', size: item.sizeBytes, name: item.filename, hash: item.sha256 } });
+  const tokenData = await fetchApi(api, { method: 'POST', path: '/v2/uploads', query: {}, body: uploadBody }, state);
+  const uploadData = dataAt(tokenData);
+  const token = uploadData.upload_token;
+  if (typeof token !== 'string' || token.length < 1 || token.length > 4096) throw new Error('upload');
+  const advertisedDomain = Array.isArray(uploadData.upload_zone?.domains) ? uploadData.upload_zone.domains[0] : undefined;
+  let uploadUrl = 'https://upload-z1.qiniup.com';
+  if (advertisedDomain !== undefined) {
+    if (typeof advertisedDomain !== 'string' || advertisedDomain.length > 256) throw new Error('upload');
+    const advertisedUrl = new URL(advertisedDomain);
+    if (advertisedUrl.origin !== uploadUrl || advertisedUrl.pathname !== '/' || advertisedUrl.search || advertisedUrl.hash) throw new Error('upload');
+    uploadUrl = advertisedUrl.origin;
+  }
+  const file = await open('/inputs/' + item.inputId, 'r');
+  let bytes;
+  try { bytes = await file.readFile(); } finally { await file.close(); }
+  const qiniu = await request.newContext({ proxy: { server: relay.proxy }, ignoreHTTPSErrors: false });
+  try {
+    const requestId = randomUUID();
+    const response = await qiniu.post(uploadUrl, {
+      multipart: {
+        file: { name: item.filename, mimeType: item.mimeType, buffer: bytes },
+        token,
+      },
+      headers: { 'x-request-id': requestId, 'x-version': '2.94.0' },
+      failOnStatusCode: false,
+      timeout: 120_000,
+    });
+    const data = await boundedJsonResponse(response);
+    if (!response.ok() || data?.succeeded !== true) throw new Error('upload');
+    const uploadedId = item.kind === 'image' ? dataAt(data).image_id : dataAt(data).file_id;
+    if (!NUMERIC_ID.test(typeof uploadedId === 'string' ? uploadedId : String(uploadedId || ''))) throw new Error('upload');
+    return String(uploadedId);
+  } finally {
+    bytes.fill(0);
+    await qiniu.dispose();
+  }
+}
+
+async function runWriteAction(input, relay, api) {
+  const params = { ...(input.params || {}) };
+  params.text = typeof params.text === 'string' ? params.text : '';
+  params.preserveExistingMedia = params.preserveExistingMedia !== false;
+  const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+  if (manifest.length > 18 || manifest.reduce((sum, item) => sum + Number(item?.sizeBytes || 0), 0) > 200 * 1024 * 1024) throw new Error('media');
+  if (manifest.filter((item) => item.kind === 'image').length > (input.actionId === 'create_comment' ? 1 : 9) || manifest.filter((item) => item.kind === 'file').length > 9) throw new Error('media');
+  for (const item of manifest) await verifyInputMedia(item);
+  if (!(await verifyWritePrecondition(api, input.storageState || {}, input.actionId, params))) {
+    await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+  }
+  writeFrame({ event: 'prepared' });
+  const dispatch = await readFrame();
+  if (!exactObjectKeys(dispatch, ['event']) || dispatch.event !== 'dispatch') throw new Error('dispatch');
+  if (!(await verifyWritePrecondition(api, input.storageState || {}, input.actionId, params))) {
+    await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+  }
+  const uploaded = { imageIds: [], fileIds: [] };
+  for (const item of manifest) {
+    const uploadedId = await uploadOne(api, relay, input.storageState || {}, item);
+    if (item.kind === 'image') uploaded.imageIds.push(uploadedId);
+    else uploaded.fileIds.push(uploadedId);
+  }
+  if (input.actionId === 'edit_topic' && params.preserveExistingMedia) {
+    uploaded.imageIds = [...params.editSnapshot.imageIds, ...uploaded.imageIds];
+    uploaded.fileIds = [...params.editSnapshot.fileIds, ...uploaded.fileIds];
+  }
+  if (uploaded.imageIds.length > 9 || uploaded.fileIds.length > 9) throw new Error('media');
+  // Uploading can take materially longer than the final API mutation. Recheck again after all
+  // uploads so the remaining unavoidable upstream GET→mutation race is kept as short as possible.
+  // A failed check may leave unreferenced upload objects, but never mutates the target topic.
+  if (!(await verifyWritePrecondition(api, input.storageState || {}, input.actionId, params))) {
+    await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+  }
+  const spec = buildKnowledgePlanetWriteRequest(input.actionId, params, uploaded);
+  if (!spec) throw new Error('action');
+  const data = await fetchApi(api, spec, input.storageState || {});
+  const result = spec.resultKind === 'topic'
+    ? { topic: projectTopic(objectAt(data, 'topic')) }
+    : spec.resultKind === 'comment'
+      ? { comment: projectComment(objectAt(data, 'comment')) }
+      : { ok: true };
+  await finishAction(api, input, result);
+}
+
+async function runAction(input, relay) {
   const api = await request.newContext({
     storageState: input.storageState,
     proxy: { server: relay.proxy },
     ignoreHTTPSErrors: false,
   });
   try {
-    const response = spec.method === 'POST'
-      ? await api.fetch(url.toString(), {
-          method: 'POST',
-          data: Buffer.from(spec.body, 'utf8'),
-          failOnStatusCode: false,
-          timeout: 30_000,
-          headers: signedHeaders(url, input.storageState || {}, spec.body),
-        })
-      : await api.get(url.toString(), {
-          failOnStatusCode: false,
-          timeout: 30_000,
-          headers: signedHeaders(url, input.storageState || {}),
-        });
-    let data;
-    try {
-      data = await boundedJsonResponse(response);
-    } catch {
-      if (response.status() === 401) {
-        await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
-      }
-      throw new Error('response');
-    }
-    if (!response.ok() || data?.succeeded !== true) {
-      await writeTerminalAndExit({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
-    }
-    const state = filteredState(await api.storageState(), input.cookieDomains, input.stateOrigins);
-    const serializedState = JSON.stringify(state);
-    if (Buffer.byteLength(serializedState, 'utf8') > MAX_STATE_JSON) throw new Error('state');
-    let result = spec.project(data);
-    let completed = { event: 'completed', result, storageState: state };
-    // The upstream may ignore the requested count. Keep a deterministic valid prefix rather
-    // than failing the whole action when a legal response approaches the frame
-    // ceiling. Pagination cursors are recomputed from the retained prefix.
-    if (Buffer.byteLength(JSON.stringify(completed), 'utf8') > MAX_OUTPUT) {
-      const listKey = Object.keys(result).find((key) => Array.isArray(result[key]));
-      if (!listKey) throw new Error('output');
-      result = { ...result, [listKey]: [...result[listKey]] };
-      while (result[listKey].length > 0 && Buffer.byteLength(JSON.stringify({ event: 'completed', result, storageState: state }), 'utf8') > MAX_OUTPUT) result[listKey].pop();
-      if ('nextEndTime' in result) result.nextEndTime = result[listKey].at(-1)?.createdAt;
-      completed = { event: 'completed', result: compact(result), storageState: state };
-    }
-    await writeTerminalAndExit(completed);
+    if (WRITE_ACTIONS.has(input.actionId)) return await runWriteAction(input, relay, api);
+    const spec = buildAction(input.actionId, input.params || {});
+    const data = await fetchApi(api, { ...spec, method: spec.method || 'GET' }, input.storageState || {}, 30_000);
+    await finishAction(api, input, spec.project(data));
   } finally {
     await api.dispose();
   }
@@ -957,9 +1174,9 @@ try {
   if (Object.keys(input).sort().join('\0') !== required.sort().join('\0')) throw new Error('input');
   if (!['action', 'login'].includes(input.mode) || typeof input.token !== 'string' || !Array.isArray(input.cookieDomains) || !Array.isArray(input.stateOrigins)) throw new Error('input');
   const remaining = Number(input.deadlineMs) - Date.now();
-  if (!Number.isFinite(remaining) || remaining < 1_000 || remaining > 5 * 60_000) throw new Error('deadline');
-  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.2', playwrightMcpVersion });
-  const relayHosts = new Set(input.mode === 'action' ? ['api.zsxq.com'] : input.allowedOrigins.map((origin) => new URL(origin).hostname));
+  if (!Number.isFinite(remaining) || remaining < 1_000 || remaining > 15 * 60_000) throw new Error('deadline');
+  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.3', playwrightMcpVersion });
+  const relayHosts = new Set(input.mode === 'action' ? ['api.zsxq.com', 'upload-z1.qiniup.com'] : input.allowedOrigins.map((origin) => new URL(origin).hostname));
   const relay = await startRelay(input.token, relayHosts);
   const timer = setTimeout(() => process.exit(124), remaining + 2_000);
   try {

@@ -80,6 +80,8 @@ export interface ManagedBrowserLaunchArgs {
   pins: readonly ManagedBrowserPinnedOrigin[]
   requestGuard: ManagedBrowserRequestGuard
   signal: AbortSignal
+  /** Trusted host path supplied by the platform, never by a Plugin artifact. */
+  inputDirectory?: string
 }
 
 export interface ManagedBrowserSession {
@@ -105,13 +107,14 @@ export interface ManagedBrowserDriverV1 {
   launcherVersion: string
   maximumNetwork: {
     origins: readonly string[]
-    methods: readonly ('GET' | 'HEAD' | 'POST')[]
+    methods: readonly ('GET' | 'HEAD' | 'POST' | 'PUT' | 'DELETE')[]
   }
   execute(args: {
     session: unknown
     actionId: string
     params: Record<string, unknown>
     signal: AbortSignal
+    beforeDispatch?: () => Promise<void>
   }): Promise<unknown>
 }
 
@@ -363,6 +366,10 @@ export class ManagedBrowserRuntime {
     actionId: string
     params: Record<string, unknown>
     signal: AbortSignal
+    /** Platform-owned durable fence. Signed Plugin params can never provide it. */
+    beforeDispatch?: () => Promise<void>
+    /** Platform-owned, invocation-scoped read-only input directory. */
+    inputDirectory?: string
   }): Promise<{ result: unknown; storageState: BrowserStorageStateV1 }> {
     const action = args.contract.actions.find((candidate) => candidate.id === args.actionId)
     if (!action)
@@ -413,6 +420,7 @@ export class ManagedBrowserRuntime {
           pins,
           requestGuard,
           signal: combined.signal,
+          ...(args.inputDirectory ? { inputDirectory: args.inputDirectory } : {}),
         }),
         combined.signal,
       )
@@ -423,6 +431,7 @@ export class ManagedBrowserRuntime {
           actionId: action.id,
           params: args.params,
           signal: combined.signal,
+          ...(args.beforeDispatch ? { beforeDispatch: args.beforeDispatch } : {}),
         }),
         combined.signal,
       )

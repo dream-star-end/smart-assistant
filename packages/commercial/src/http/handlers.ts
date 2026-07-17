@@ -102,6 +102,7 @@ import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
+import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 
 export interface CommercialHttpDeps {
@@ -118,6 +119,8 @@ export interface CommercialHttpDeps {
   pluginRuntime?: PluginRuntimeFacade
   /** Short-lived managed login coordinator for the official Knowledge Planet Plugin. */
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
+  /** Separate high-risk control/rules for official Knowledge Planet unattended replies. */
+  knowledgePlanetAutomation?: KnowledgePlanetAutomationService
   mailer: Mailer
   redis: RateLimitRedis
   turnstileSecret?: string

@@ -37,7 +37,7 @@ export interface ConnectorCallOptions {
   env?: NodeJS.ProcessEnv
   /** 注入 fetch(测试用);默认全局 fetch。 */
   fetchImpl?: typeof fetch
-  /** 请求总超时(含 body 读取)。默认 75s——略高于后端 60s 总时限,让后端自身错误优先返回。 */
+  /** 请求总超时(含 body 读取)。Plugin 媒体写最长 12min；普通连接器仍为 75s。 */
   timeoutMs?: number
   /** Historical default is connectors; oc-plugin selects the canonical plugins alias. */
   surface?: ConnectorRpcSurface
@@ -81,7 +81,8 @@ export async function callConnectors(
   const token = readContainerToken(env)
   const url = `${base}/v3/${opts.surface ?? 'connectors'}/${op}`
   const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? 75_000)
+  const defaultTimeoutMs = (opts.surface ?? 'connectors') === 'plugins' ? 720_000 : 75_000
+  const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? defaultTimeoutMs)
   try {
     const res = await doFetch(url, {
       method: 'POST',

@@ -18,6 +18,8 @@
  *   - skill_retrieval_shadow_events 30d 技能检索 shadow 排名/使用弱信号
  *   - prompt_queue_mutations 30d 队列幂等/冲突审计,覆盖常见离线重放窗口
  *   - connector_write_ledger 90d  写确认账本**终态**行(带 status 谓词;活跃态不删)
+ *   - plugin_automation_runs 90d  无人值守回复终态审计;生成/发送中状态不删
+ *   - plugin_automation_rules 90d 已软删规则;仅在关联运行审计全部离场后删除
  *   - refresh_tokens     过期后 30d  auth 死行回收(列=expires_at;revoked 未过期行
  *                             保留给重用检测,见注册表内注释)
  *   - admin_alert_outbox 90d  告警投递队列 sent/failed 终态行(带 status 谓词)
@@ -71,6 +73,20 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     column: "created_at",
     days: 90,
     predicate: "status IN ('succeeded','failed','unknown','expired','denied')",
+  },
+  {
+    table: "plugin_automation_runs",
+    column: "finished_at",
+    days: 90,
+    predicate: "status IN ('succeeded','skipped','failed','unknown')",
+  },
+  {
+    table: "plugin_automation_rules",
+    column: "deleted_at",
+    days: 90,
+    predicate:
+      "deleted_at IS NOT NULL AND NOT EXISTS (" +
+      "SELECT 1 FROM plugin_automation_runs par WHERE par.rule_id = plugin_automation_rules.id)",
   },
   // 2026-07-16 巡检批:本注册表是仓内 retention 的单一权威,收口范围从"审计/事件表"
   // 扩到"无自有 sweeper 的有界状态表"——与其为下面两张表各造一个清理调度器(第二机制),

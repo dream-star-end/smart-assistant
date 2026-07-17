@@ -72,6 +72,7 @@ export async function runKnowledgePlanetActionSmoke(input: {
     return completed.result
   }
 
+  await call('get_self', {})
   const groupsResult = await call('list_groups', {})
   const groups = rows(groupsResult, 'groups').slice(0, 20)
   const firstGroup = groups.find((group) => resourceId(group))

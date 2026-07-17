@@ -2,6 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { PluginAccountLeaseError } from '../plugins/accountLease.js'
 import { PluginAccountError } from '../plugins/accounts.js'
+import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
+import { KnowledgePlanetAutomationError } from '../plugins/knowledgePlanetAutomation.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
@@ -13,6 +15,7 @@ import { HttpError, readJsonBody, sendJson } from './util.js'
 export interface PluginHttpDeps {
   pluginRuntime?: PluginRuntimeFacade
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
+  knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
 function userIdFrom(value: string): number {
@@ -32,6 +35,33 @@ function runtime(deps: CommercialHttpDeps & PluginHttpDeps): PluginRuntimeFacade
   if (!deps.pluginRuntime)
     throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return deps.pluginRuntime
+}
+
+function automation(deps: CommercialHttpDeps & PluginHttpDeps): KnowledgePlanetAutomationService {
+  if (!deps.knowledgePlanetAutomation)
+    throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin automation unavailable')
+  return deps.knowledgePlanetAutomation
+}
+
+function mapAutomationError(error: unknown): never {
+  if (!(error instanceof KnowledgePlanetAutomationError)) throw error
+  switch (error.code) {
+    case 'BAD_REQUEST':
+    case 'CONSENT_REQUIRED':
+      throw new HttpError(400, error.code, 'Knowledge Planet automation request is invalid')
+    case 'NOT_FOUND':
+      throw new HttpError(404, error.code, 'Knowledge Planet automation target not found')
+    case 'CONFLICT':
+    case 'WRITE_DISABLED':
+      throw new HttpError(409, error.code, 'Knowledge Planet automation state conflicts')
+    default:
+      throw new HttpError(503, error.code, 'Knowledge Planet automation unavailable')
+  }
+}
+
+function exactBodyKeys(body: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allow = new Set(allowed)
+  return Object.keys(body).every((key) => allow.has(key))
 }
 
 function mapSetupError(error: unknown): never {
@@ -180,6 +210,164 @@ export async function dispatchPluginsRoute(
       return
     } catch (error) {
       mapRuntimeError(error)
+    }
+  }
+
+  const automationRoot = /^\/api\/plugins\/accounts\/(\d{1,16})\/automation$/.exec(path)
+  if (automationRoot && method === 'GET') {
+    try {
+      sendJson(res, 200, await automation(deps).get(userId, automationRoot[1]!))
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+  if (automationRoot && method === 'PATCH') {
+    const raw = await readJsonBody(req, 4096)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new HttpError(400, 'BAD_REQUEST', 'automation body must be an object')
+    const body = raw as Record<string, unknown>
+    if (
+      typeof body.enabled !== 'boolean' ||
+      !exactBodyKeys(body, ['enabled', 'accepted', 'disclaimerVersion', 'accountDailyLimit']) ||
+      (body.enabled === true &&
+        (body.accepted !== true || !Number.isInteger(body.disclaimerVersion))) ||
+      (body.enabled === false &&
+        (body.accepted !== undefined || body.disclaimerVersion !== undefined)) ||
+      (body.accountDailyLimit !== undefined && !Number.isInteger(body.accountDailyLimit))
+    )
+      throw new HttpError(400, 'BAD_REQUEST', 'automation body is invalid')
+    try {
+      const control = await automation(deps).setControl({
+        userId,
+        targetId: automationRoot[1]!,
+        enabled: body.enabled,
+        ...(body.accountDailyLimit !== undefined
+          ? { accountDailyLimit: Number(body.accountDailyLimit) }
+          : {}),
+        ...(body.enabled === true
+          ? {
+              accepted: true,
+              disclaimerVersion: Number(body.disclaimerVersion),
+            }
+          : {}),
+      })
+      sendJson(res, 200, { control })
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+
+  const automationRules = /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/rules$/.exec(path)
+  if (automationRules && method === 'POST') {
+    const raw = await readJsonBody(req, 16 * 1024)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule body must be an object')
+    const body = raw as Record<string, unknown>
+    if (
+      typeof body.groupId !== 'string' ||
+      typeof body.name !== 'string' ||
+      typeof body.instructions !== 'string' ||
+      (body.triggerKind !== undefined && typeof body.triggerKind !== 'string') ||
+      (body.dailyLimit !== undefined && !Number.isInteger(body.dailyLimit)) ||
+      (body.cooldownMinutes !== undefined && !Number.isInteger(body.cooldownMinutes)) ||
+      (body.maxReplyChars !== undefined && !Number.isInteger(body.maxReplyChars)) ||
+      !exactBodyKeys(body, [
+        'groupId',
+        'name',
+        'instructions',
+        'triggerKind',
+        'dailyLimit',
+        'cooldownMinutes',
+        'maxReplyChars',
+      ])
+    )
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule body is invalid')
+    try {
+      const rule = await automation(deps).createRule({
+        userId,
+        targetId: automationRules[1]!,
+        groupId: String(body.groupId ?? ''),
+        name: body.name as string,
+        instructions: body.instructions as string,
+        ...(body.triggerKind !== undefined
+          ? { triggerKind: body.triggerKind as 'new_topic' | 'new_question' }
+          : {}),
+        ...(body.dailyLimit !== undefined ? { dailyLimit: Number(body.dailyLimit) } : {}),
+        ...(body.cooldownMinutes !== undefined
+          ? { cooldownMinutes: Number(body.cooldownMinutes) }
+          : {}),
+        ...(body.maxReplyChars !== undefined ? { maxReplyChars: Number(body.maxReplyChars) } : {}),
+      })
+      sendJson(res, 201, { rule })
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+
+  const automationRule =
+    /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/rules\/([0-9a-f-]{36})$/.exec(path)
+  if (automationRule && method === 'PATCH') {
+    const raw = await readJsonBody(req, 16 * 1024)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule patch must be an object')
+    const body = raw as Record<string, unknown>
+    if (
+      Object.keys(body).length === 0 ||
+      (body.name !== undefined && typeof body.name !== 'string') ||
+      (body.instructions !== undefined && typeof body.instructions !== 'string') ||
+      (body.triggerKind !== undefined && typeof body.triggerKind !== 'string') ||
+      (body.enabled !== undefined && typeof body.enabled !== 'boolean') ||
+      (body.dailyLimit !== undefined && !Number.isInteger(body.dailyLimit)) ||
+      (body.cooldownMinutes !== undefined && !Number.isInteger(body.cooldownMinutes)) ||
+      (body.maxReplyChars !== undefined && !Number.isInteger(body.maxReplyChars)) ||
+      !exactBodyKeys(body, [
+        'name',
+        'instructions',
+        'triggerKind',
+        'enabled',
+        'dailyLimit',
+        'cooldownMinutes',
+        'maxReplyChars',
+      ])
+    )
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule patch is invalid')
+    try {
+      const rule = await automation(deps).patchRule({
+        userId,
+        targetId: automationRule[1]!,
+        ruleId: automationRule[2]!,
+        patch: {
+          ...(body.name !== undefined ? { name: body.name as string } : {}),
+          ...(body.instructions !== undefined ? { instructions: body.instructions as string } : {}),
+          ...(body.triggerKind !== undefined
+            ? { triggerKind: body.triggerKind as 'new_topic' | 'new_question' }
+            : {}),
+          ...(body.enabled !== undefined ? { enabled: body.enabled as boolean } : {}),
+          ...(body.dailyLimit !== undefined ? { dailyLimit: Number(body.dailyLimit) } : {}),
+          ...(body.cooldownMinutes !== undefined
+            ? { cooldownMinutes: Number(body.cooldownMinutes) }
+            : {}),
+          ...(body.maxReplyChars !== undefined
+            ? { maxReplyChars: Number(body.maxReplyChars) }
+            : {}),
+        },
+      })
+      sendJson(res, 200, { rule })
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+  if (automationRule && method === 'DELETE') {
+    try {
+      await automation(deps).deleteRule(userId, automationRule[1]!, automationRule[2]!)
+      sendJson(res, 200, { deleted: true })
+      return
+    } catch (error) {
+      mapAutomationError(error)
     }
   }
 

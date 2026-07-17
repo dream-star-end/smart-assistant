@@ -168,18 +168,45 @@ export function buildWriteSummary(
     }
     case 'knowledge-planet/create_topic': {
       const text = String(params.text ?? '')
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
       return ellipsize(
-        `用知识星球${hint}在星球 ${String(params.groupId ?? '')} 发布主题：「${ellipsize(text, 300)}」`,
+        `用知识星球${hint}在星球 ${String(params.groupId ?? '')} 发布主题（${media.filter((item) => (item as Record<string, unknown>)?.kind === 'image').length} 张图片、${media.filter((item) => (item as Record<string, unknown>)?.kind === 'file').length} 个附件）：「${ellipsize(text, 300)}」`,
         2000,
       )
     }
     case 'knowledge-planet/create_comment': {
       const text = String(params.text ?? '')
+      const reply = params.repliedCommentId ? `，回复评论 ${String(params.repliedCommentId)}` : ''
       return ellipsize(
-        `用知识星球${hint}在主题 ${String(params.topicId ?? '')} 发布评论：「${ellipsize(text, 300)}」`,
+        `用知识星球${hint}在主题 ${String(params.topicId ?? '')}${reply} 发布评论：「${ellipsize(text, 300)}」`,
         2000,
       )
     }
+    case 'knowledge-planet/edit_topic':
+      return ellipsize(
+        `用知识星球${hint}完整编辑主题 ${String(params.topicId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'knowledge-planet/delete_topic':
+      return ellipsize(
+        `用知识星球${hint}永久删除主题 ${String(params.topicId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'knowledge-planet/delete_comment':
+      return ellipsize(
+        `用知识星球${hint}永久删除主题 ${String(params.topicId ?? '')} 下的评论 ${String(params.commentId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'knowledge-planet/set_topic_like':
+      return ellipsize(
+        `用知识星球${hint}把主题 ${String(params.topicId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
+        2000,
+      )
+    case 'knowledge-planet/set_comment_like':
+      return ellipsize(
+        `用知识星球${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
+        2000,
+      )
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -242,12 +269,58 @@ export function buildWriteDetail(
         kind: 'knowledge_planet_topic',
         groupId: String(params.groupId ?? ''),
         text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
       }
     case 'knowledge-planet/create_comment':
       return {
         kind: 'knowledge_planet_comment',
         topicId: String(params.topicId ?? ''),
+        repliedCommentId: params.repliedCommentId ?? null,
         text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+      }
+    case 'knowledge-planet/edit_topic':
+      return {
+        kind: 'knowledge_planet_topic_edit',
+        groupId: String(params.groupId ?? ''),
+        topicId: String(params.topicId ?? ''),
+        previousText:
+          (params.editSnapshot as Record<string, unknown> | undefined)?.previousText ?? '',
+        text: String(params.text ?? ''),
+        preserveExistingMedia: params.preserveExistingMedia !== false,
+        existingImageIds:
+          (params.editSnapshot as Record<string, unknown> | undefined)?.imageIds ?? [],
+        existingFileIds:
+          (params.editSnapshot as Record<string, unknown> | undefined)?.fileIds ?? [],
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+        warning: '知识星球主题编辑是完整替换；最终校验与写入之间仍存在极短竞态窗口。',
+      }
+    case 'knowledge-planet/delete_topic':
+      return {
+        kind: 'knowledge_planet_delete_topic',
+        topicId: String(params.topicId ?? ''),
+        preview: (params.deleteSnapshot as Record<string, unknown> | undefined)?.preview ?? '',
+        irreversible: true,
+      }
+    case 'knowledge-planet/delete_comment':
+      return {
+        kind: 'knowledge_planet_delete_comment',
+        topicId: String(params.topicId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        preview: (params.deleteSnapshot as Record<string, unknown> | undefined)?.preview ?? '',
+        irreversible: true,
+      }
+    case 'knowledge-planet/set_topic_like':
+      return {
+        kind: 'knowledge_planet_topic_like',
+        topicId: String(params.topicId ?? ''),
+        liked: params.liked === true,
+      }
+    case 'knowledge-planet/set_comment_like':
+      return {
+        kind: 'knowledge_planet_comment_like',
+        commentId: String(params.commentId ?? ''),
+        liked: params.liked === true,
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)
