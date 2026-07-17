@@ -42,8 +42,9 @@ export const CONDITION_OPCODE_MAP: Record<string, string> = {
  *                   ran the command, non-zero, receipt bound) — still went to
  *                   the host, so recovery is decided by the master probe.
  * - 'rejected'      the action was NEVER authorized to run (local whitelist
- *                   miss, or the remote forced-command rejected the opcode:
- *                   exit 64/65) — a definite non-execution.
+ *                   miss, or the remote forced-command refused: exit 64/65
+ *                   malformed/unknown opcode, exit 66 = standing down for an
+ *                   active deploy window) — a definite non-execution.
  * - 'unknown'       transport ambiguity (timeout, ssh exit 255/signal, missing/
  *                   malformed receipt, opcode-mismatch): the action MAY have
  *                   run — never auto-replay; the probe fence adjudicates.
@@ -197,11 +198,13 @@ export async function executeHostOpcode(
   if (receipt.exit !== r.code) return unknown('receipt exit disagrees with process exit')
 
   // Classify by the (now trusted) exit, requiring the receipt outcome to match:
-  //  64/65 = forced-command rejected the opcode (never executed) = rejected
-  //  0     = completed;  else = action ran but failed.
+  //  64/65/66 = the forced-command refused (never executed) = rejected
+  //             (66 = standing down for an active deploy/maintenance window —
+  //              the coordination gate; the repair is retried on a later tick)
+  //  0        = completed;  else = action ran but failed.
   let outcome: HostActionOutcome
-  if (r.code === 64 || r.code === 65) {
-    if (receipt.outcome !== 'rejected') return unknown('exit 64/65 but outcome not rejected')
+  if (r.code === 64 || r.code === 65 || r.code === 66) {
+    if (receipt.outcome !== 'rejected') return unknown('exit 64/65/66 but outcome not rejected')
     outcome = 'rejected'
   } else if (r.code === 0) {
     if (receipt.outcome !== 'completed') return unknown('exit 0 but outcome not completed')

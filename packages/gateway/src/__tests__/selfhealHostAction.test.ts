@@ -61,6 +61,14 @@ describe('executeHostOpcode — strict outcome classification', () => {
     )
     assert.equal(r.outcome, 'action_failed')
   })
+  it('rejected on deploy stand-down (exit 66 — coordination gate)', async () => {
+    const r = await executeHostOpcode(
+      'restart-v5-egress-v1',
+      { ...CFG, runner: async () => ({ code: 66, stdout: recv('restart-v5-egress-v1', 'rejected', 66), stderr: '', timedOut: false }) },
+      clock,
+    )
+    assert.equal(r.outcome, 'rejected', 'standing down for an active deploy is a definite non-execution')
+  })
   it('rejected on remote forced-command refusal (exit 64/65)', async () => {
     const r = await executeHostOpcode(
       'restart-v5-egress-v1',
