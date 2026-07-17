@@ -541,8 +541,8 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
 }
 
 // Engine diagnostic projection. Platform controls and authoritative budgets
-// live in the header GoalControl; this row simply makes native goal updates
-// visible and updates in place through its stable block id.
+// live in the goal dialog opened from the composer "+" menu; this row simply
+// makes native goal updates visible and updates in place through its stable block id.
 export function GoalCard({ msg }: { msg: ChatMessage }) {
   const status = msg.cleared ? "已清除" : msg.goalStatus || "已同步";
   return (

@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { GoalControl } from "./GoalControl";
+import { GoalDialog } from "./GoalDialog";
 
 afterEach(() => {
   cleanup();
@@ -25,11 +25,10 @@ const goal: GoalStateSnapshot = {
   statusChangedAt: "2026-07-16T00:00:00.000Z",
 };
 
-describe("GoalControl", () => {
+describe("GoalDialog", () => {
   it("sets objective and both optional budgets", async () => {
     const onSet = vi.fn().mockResolvedValue(undefined);
-    render(<GoalControl goal={null} onSet={onSet} onAction={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "会话目标" }));
+    render(<GoalDialog open onOpenChange={() => {}} goal={null} onSet={onSet} onAction={vi.fn()} />);
     fireEvent.change(screen.getByPlaceholderText("这次会话要达成什么？"), { target: { value: "完成迁移" } });
     const optional = screen.getAllByPlaceholderText("可选");
     fireEvent.change(optional[0]!, { target: { value: "1200" } });
@@ -45,8 +44,7 @@ describe("GoalControl", () => {
 
   it("shows a soft warning near budget and exposes unified state actions", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
-    render(<GoalControl goal={goal} onSet={vi.fn()} onAction={onAction} />);
-    fireEvent.click(screen.getByRole("button", { name: "会话目标" }));
+    render(<GoalDialog open onOpenChange={() => {}} goal={goal} onSet={vi.fn()} onAction={onAction} />);
     expect(screen.getByText(/预算已接近或达到；这是软提醒/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /暂停/ }));
     await waitFor(() => expect(onAction).toHaveBeenCalledWith("pause"));
@@ -55,8 +53,7 @@ describe("GoalControl", () => {
   it("ticks active runtime locally between authoritative snapshots", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-16T00:00:00.000Z"));
-    render(<GoalControl goal={goal} onSet={vi.fn()} onAction={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "会话目标" }));
+    render(<GoalDialog open onOpenChange={() => {}} goal={goal} onSet={vi.fn()} onAction={vi.fn()} />);
     expect(screen.getByText("累计运行：1分 5秒")).toBeTruthy();
     act(() => { vi.advanceTimersByTime(2_000); });
     expect(screen.getByText("累计运行：1分 7秒")).toBeTruthy();

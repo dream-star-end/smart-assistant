@@ -1826,9 +1826,6 @@ export function App() {
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
-          goal={activeSess?.goalState}
-          onSetGoal={demo || !activeId ? undefined : setSessionGoal}
-          onGoalAction={demo || !activeId ? undefined : transitionSessionGoal}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
@@ -1949,6 +1946,9 @@ export function App() {
             prefill={composerPrefill}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
+            goal={activeSess?.goalState}
+            onSetGoal={demo || !activeId ? undefined : setSessionGoal}
+            onGoalAction={demo || !activeId ? undefined : transitionSessionGoal}
           />
         </div>
       </main>
