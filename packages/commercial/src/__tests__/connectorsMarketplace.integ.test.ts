@@ -64,6 +64,9 @@ import {
 } from '../marketplace/marketplaceDb.js'
 import { handleMarketplaceConnectorPublish } from '../marketplace/marketplaceRoutes.js'
 import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
+import { createManagedBrowserPluginAccount } from '../plugins/accounts.js'
+import { compileRuntimePluginArtifact } from '../plugins/contracts.js'
+import { approveRuntimePluginVersion } from '../plugins/review.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -624,7 +627,7 @@ describe('v5 connector marketplace', () => {
     )
   })
 
-  test('插件账号管理只聚合 connector 安装，不混入已安装 Skill', async (t) => {
+  test('声明式账号管理只聚合 declarative-http，不混入 Skill 或运行时 Plugin', async (t) => {
     if (skipIfNoDb(t)) return
     const owner = await createUser()
     const reviewer = await createUser('admin')
@@ -662,6 +665,62 @@ describe('v5 connector marketplace', () => {
     await reviewVersion({ versionId: skill.versionId, reviewerUserId: reviewer, approve: true })
     await installApprovedVersion({ userId: user, versionId: skill.versionId })
 
+    const runtimeSlug = `management-runtime-${Date.now() % 1_000_000}`
+    const runtimeArtifact = {
+      schemaVersion: 1,
+      pluginType: 'managed-browser',
+      id: runtimeSlug,
+      version: '1.0.0',
+      driver: { id: runtimeSlug, version: '1.0.0' },
+      account: { mode: 'required', contractVersion: 1 },
+      accountState: { cookieDomains: ['example.com'], origins: ['https://example.com'] },
+      network: { origins: ['https://example.com'], methods: ['GET'] },
+      actions: [
+        {
+          id: 'read',
+          description: 'Read one page',
+          effect: 'read',
+          timeoutSeconds: 10,
+          params: { type: 'object', properties: {}, additionalProperties: false },
+          result: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ],
+    }
+    const compiledRuntime = compileRuntimePluginArtifact(runtimeArtifact)
+    const runtime = await publishSkillVersion({
+      slug: runtimeSlug,
+      ownerUserId: owner,
+      version: '1.0.0',
+      name: 'Runtime Plugin',
+      description: 'Must stay in runtime Plugin management',
+      tags: ['plugin'],
+      rawSkillMd: null,
+      rawArtifact: JSON.stringify(runtimeArtifact),
+      artifactHash: compiledRuntime.artifactHash,
+      embeddingHash: compiledRuntime.artifactHash,
+      riskFlags: [],
+      policyVersion: 1,
+      submittedBy: owner,
+      kind: 'connector',
+      pluginType: 'managed-browser',
+      queueAiReview: false,
+    })
+    await approveRuntimePluginVersion({
+      versionId: runtime.versionId,
+      reviewerUserId: reviewer,
+      expectedArtifactHash: compiledRuntime.artifactHash,
+      functionalVerified: true,
+      pool: getPool(),
+    })
+    await installApprovedVersion({ userId: user, versionId: runtime.versionId })
+    await createManagedBrowserPluginAccount({
+      userId: user,
+      versionId: Number(runtime.versionId),
+      displayName: 'runtime account',
+      storageState: { cookies: [], origins: [] },
+      pool: getPool(),
+    })
+
     const installedSkill = (await listInstalled(user)).find((row) => row.slug === skillSlug)
     assert.equal(installedSkill?.kind, 'skill', 'Skill 安装本身必须保留在市场安装列表')
 
@@ -670,6 +729,16 @@ describe('v5 connector marketplace', () => {
       management.connectors.some((row) => row.slug === skillSlug),
       false,
       '非 connector 安装不能伪装成不可用 Plugin 账号卡片',
+    )
+    assert.equal(
+      management.connectors.some((row) => row.slug === runtimeSlug),
+      false,
+      'managed-browser 安装和账号必须只由运行时 Plugin 管理面展示',
+    )
+    assert.equal(
+      management.connections.some((row) => row.slug === runtimeSlug),
+      false,
+      'managed-browser 账号不能混入声明式连接列表',
     )
     const installedConnector = management.connectors.find((row) => row.slug === connectorSlug)
     assert.ok(installedConnector)
