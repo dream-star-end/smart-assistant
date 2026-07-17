@@ -29,7 +29,8 @@
     "0163_plugin_write_control",
     "0164_admin_audit_model_admin_grant",
     "0166_prompt_queue",
-    "0167_turn_waiver_receipts"
+    "0167_turn_waiver_receipts",
+    "0168_knowledge_planet_automation"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
