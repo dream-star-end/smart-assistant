@@ -7,6 +7,15 @@ export type KnowledgePlanetSmokeRunner = (input: {
   storageState: BrowserStorageStateV1
 }) => Promise<{ result: unknown; storageState: BrowserStorageStateV1 }>
 
+export const KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS = Object.freeze([
+  'get_topic',
+  'list_comments',
+  'list_hashtag_topics',
+  'list_column_topics',
+  'get_checkin',
+  'list_checkin_topics',
+])
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -39,16 +48,22 @@ function searchKeyword(topic: Record<string, unknown>, group: Record<string, unk
 }
 
 /**
- * Exercises every declared Knowledge Planet action against one authenticated,
- * in-memory browser state. Results are used only to discover IDs for dependent
- * reads; the returned evidence contains action IDs, never account content.
+ * Exercises every declared Knowledge Planet action that the authenticated
+ * account has a real resource for. A successful empty parent list classifies
+ * only its dependent reads as resource-unavailable. Evidence contains action
+ * IDs, never account content.
  */
 export async function runKnowledgePlanetActionSmoke(input: {
   storageState: BrowserStorageStateV1
   run: KnowledgePlanetSmokeRunner
-}): Promise<{ passedActionIds: string[]; storageState: BrowserStorageStateV1 }> {
+}): Promise<{
+  passedActionIds: string[]
+  resourceUnavailableActionIds: string[]
+  storageState: BrowserStorageStateV1
+}> {
   let storageState = input.storageState
   const passed = new Set<string>()
+  const resourceUnavailable = new Set<string>()
   const call = async (actionId: string, params: Record<string, unknown>) => {
     const completed = await input.run({ actionId, params, storageState })
     storageState = completed.storageState
@@ -65,9 +80,7 @@ export async function runKnowledgePlanetActionSmoke(input: {
 
   await call('get_group', { groupId: firstGroupId })
   await call('list_dynamics', { count: 20 })
-  const unreadResult = await call('get_unread_counts', {})
-  if (!rows(unreadResult, 'counts').length)
-    throw new Error('Knowledge Planet action smoke get_unread_counts produced no group count')
+  await call('get_unread_counts', {})
 
   const findGroupResource = async (
     actionId: 'list_topics' | 'list_hashtags' | 'list_columns',
@@ -76,7 +89,7 @@ export async function runKnowledgePlanetActionSmoke(input: {
     group: Record<string, unknown>
     groupId: string
     item: Record<string, unknown>
-  }> => {
+  } | null> => {
     for (const group of groups) {
       const groupId = resourceId(group)
       if (!groupId) continue
@@ -85,31 +98,49 @@ export async function runKnowledgePlanetActionSmoke(input: {
       const item = rows(result, resultKey).find((candidate) => resourceId(candidate))
       if (item) return { group, groupId, item }
     }
-    throw new Error(`Knowledge Planet action smoke ${actionId} produced no dependent resource`)
+    return null
   }
 
   const topicResource = await findGroupResource('list_topics', 'topics')
-  const topicId = resourceId(topicResource.item)!
-  await call('get_topic', { topicId })
-  await call('list_comments', { topicId, count: 20, sort: 'asc' })
-  await call('search_topics', {
-    groupId: topicResource.groupId,
-    keyword: searchKeyword(topicResource.item, topicResource.group),
-    count: 20,
-  })
+  if (topicResource) {
+    const topicId = resourceId(topicResource.item)!
+    await call('get_topic', { topicId })
+    await call('list_comments', { topicId, count: 20, sort: 'asc' })
+    await call('search_topics', {
+      groupId: topicResource.groupId,
+      keyword: searchKeyword(topicResource.item, topicResource.group),
+      count: 20,
+    })
+  } else {
+    resourceUnavailable.add('get_topic')
+    resourceUnavailable.add('list_comments')
+    await call('search_topics', {
+      groupId: firstGroupId,
+      keyword: searchKeyword({}, firstGroup),
+      count: 20,
+    })
+  }
 
   const hashtagResource = await findGroupResource('list_hashtags', 'hashtags')
-  await call('list_hashtag_topics', {
-    hashtagId: resourceId(hashtagResource.item)!,
-    count: 20,
-  })
+  if (hashtagResource) {
+    await call('list_hashtag_topics', {
+      hashtagId: resourceId(hashtagResource.item)!,
+      count: 20,
+    })
+  } else {
+    resourceUnavailable.add('list_hashtag_topics')
+  }
 
   const columnResource = await findGroupResource('list_columns', 'columns')
-  await call('list_column_topics', {
-    groupId: columnResource.groupId,
-    columnId: resourceId(columnResource.item)!,
-    count: 20,
-  })
+  if (columnResource) {
+    await call('list_column_topics', {
+      groupId: columnResource.groupId,
+      columnId: resourceId(columnResource.item)!,
+      count: 20,
+    })
+  } else {
+    resourceUnavailable.add('list_column_topics')
+  }
 
   let checkinResource: { groupId: string; item: Record<string, unknown> } | undefined
   for (const group of groups) {
@@ -125,19 +156,37 @@ export async function runKnowledgePlanetActionSmoke(input: {
     }
     if (checkinResource) break
   }
-  if (!checkinResource)
-    throw new Error('Knowledge Planet action smoke list_checkins produced no dependent resource')
-  const checkinId = resourceId(checkinResource.item)!
-  await call('get_checkin', { groupId: checkinResource.groupId, checkinId })
-  await call('list_checkin_topics', {
-    groupId: checkinResource.groupId,
-    checkinId,
-    count: 20,
-  })
+  if (checkinResource) {
+    const checkinId = resourceId(checkinResource.item)!
+    await call('get_checkin', { groupId: checkinResource.groupId, checkinId })
+    await call('list_checkin_topics', {
+      groupId: checkinResource.groupId,
+      checkinId,
+      count: 20,
+    })
+  } else {
+    resourceUnavailable.add('get_checkin')
+    resourceUnavailable.add('list_checkin_topics')
+  }
 
   const expectedActionIds = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id)
-  const missing = expectedActionIds.filter((actionId) => !passed.has(actionId))
+  const allowedUnavailable = new Set(KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS)
+  const invalidUnavailable = [...resourceUnavailable].filter(
+    (actionId) => !allowedUnavailable.has(actionId),
+  )
+  const overlap = [...resourceUnavailable].filter((actionId) => passed.has(actionId))
+  const missing = expectedActionIds.filter(
+    (actionId) => !passed.has(actionId) && !resourceUnavailable.has(actionId),
+  )
+  if (invalidUnavailable.length || overlap.length)
+    throw new Error('Knowledge Planet action smoke produced invalid resource coverage')
   if (missing.length)
     throw new Error(`Knowledge Planet action smoke missed actions: ${missing.join(',')}`)
-  return { passedActionIds: expectedActionIds, storageState }
+  return {
+    passedActionIds: expectedActionIds.filter((actionId) => passed.has(actionId)),
+    resourceUnavailableActionIds: expectedActionIds.filter((actionId) =>
+      resourceUnavailable.has(actionId),
+    ),
+    storageState,
+  }
 }

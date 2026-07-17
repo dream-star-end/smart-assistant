@@ -40,6 +40,7 @@ describe('Knowledge Planet authenticated action smoke', () => {
       completed.passedActionIds,
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
     )
+    assert.deepEqual(completed.resourceUnavailableActionIds, [])
     assert.deepEqual(calls.find((call) => call.actionId === 'get_topic')?.params, {
       topicId: '223456789',
     })
@@ -55,11 +56,92 @@ describe('Knowledge Planet authenticated action smoke', () => {
     })
   })
 
-  test('fails closed when an account cannot prove a dependent declared action', async () => {
+  test('classifies only resource-dependent reads when optional account data is absent', async () => {
+    const calls: { actionId: string; params: Record<string, unknown> }[] = []
+    const completed = await runKnowledgePlanetActionSmoke({
+      storageState: emptyState,
+      async run({ actionId, params, storageState }) {
+        calls.push({ actionId, params })
+        const result =
+          actionId === 'list_groups'
+            ? { groups: [{ id: '123456789', name: 'sparse group' }] }
+            : actionId === 'list_topics'
+              ? { topics: [{ id: '223456789', title: 'real topic' }] }
+              : actionId === 'get_unread_counts'
+                ? { counts: [] }
+                : actionId === 'list_hashtags'
+                  ? { hashtags: [] }
+                  : actionId === 'list_columns'
+                    ? { columns: [] }
+                    : actionId === 'list_checkins'
+                      ? { checkins: [] }
+                      : {}
+        return { result, storageState }
+      },
+    })
+
+    assert.deepEqual(completed.resourceUnavailableActionIds, [
+      'list_hashtag_topics',
+      'list_column_topics',
+      'get_checkin',
+      'list_checkin_topics',
+    ])
+    assert.deepEqual(
+      completed.passedActionIds,
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions
+        .map((action) => action.id)
+        .filter((actionId) => !completed.resourceUnavailableActionIds.includes(actionId)),
+    )
+    for (const actionId of completed.resourceUnavailableActionIds)
+      assert.equal(calls.some((call) => call.actionId === actionId), false)
+    assert.equal(calls.filter((call) => call.actionId === 'list_checkins').length, 3)
+  })
+
+  test('still executes search and classifies topic reads when an account has no topics', async () => {
+    const calls: { actionId: string; params: Record<string, unknown> }[] = []
+    const completed = await runKnowledgePlanetActionSmoke({
+      storageState: emptyState,
+      async run({ actionId, params, storageState }) {
+        calls.push({ actionId, params })
+        const result =
+          actionId === 'list_groups'
+            ? { groups: [{ id: '123456789', name: 'empty group' }] }
+            : actionId === 'list_topics'
+              ? { topics: [] }
+              : actionId === 'list_hashtags'
+                ? { hashtags: [] }
+                : actionId === 'list_columns'
+                  ? { columns: [] }
+                  : actionId === 'list_checkins'
+                    ? { checkins: [] }
+                    : actionId === 'get_unread_counts'
+                      ? { counts: [] }
+                      : {}
+        return { result, storageState }
+      },
+    })
+
+    assert.deepEqual(completed.resourceUnavailableActionIds, [
+      'get_topic',
+      'list_comments',
+      'list_hashtag_topics',
+      'list_column_topics',
+      'get_checkin',
+      'list_checkin_topics',
+    ])
+    assert.deepEqual(calls.find((call) => call.actionId === 'search_topics')?.params, {
+      groupId: '123456789',
+      keyword: 'empty group',
+      count: 20,
+    })
+  })
+
+  test('fails closed when a parent list action fails', async () => {
     await assert.rejects(
       runKnowledgePlanetActionSmoke({
         storageState: emptyState,
         async run({ actionId, storageState }) {
+          if (actionId === 'list_columns') throw new Error('upstream list_columns failed')
           const result =
             actionId === 'list_groups'
               ? { groups: [{ id: '123456789' }] }
@@ -69,11 +151,13 @@ describe('Knowledge Planet authenticated action smoke', () => {
                   ? { topics: [{ id: '223456789', title: 'topic' }] }
                   : actionId === 'list_hashtags'
                     ? { hashtags: [{ id: '323456789' }] }
-                    : { columns: [] }
+                    : actionId === 'get_unread_counts'
+                      ? { counts: [] }
+                      : {}
           return { result, storageState }
         },
       }),
-      /list_columns produced no dependent resource/,
+      /upstream list_columns failed/,
     )
   })
 })
