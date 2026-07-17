@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.2.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.2.1'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +18,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.2.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.2.1'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.2.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.2.1'
 
 const authorSchema = {
   type: 'object',
@@ -599,6 +599,11 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
  * or user-published Knowledge Planet artifact is eligible for setup.
  */
 export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.2.0',
+    artifactHash: 'ee306d2ede7fe277084e842687ff798317ada778aeda942e31bb5770c83f0824',
+    execContractHash: '240e3cfe91898d8cb13ba983a05f0cf1082ccee57a22d27674ebd409f894f949',
+  }),
   Object.freeze({
     version: '1.1.0',
     artifactHash: 'fed46671c5af6156a4395c213695f5171c655cecc3efd0ef176d72330b7d3e36',
