@@ -8517,6 +8517,20 @@ export class Gateway {
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
       clearTimeoutTimer()
+      // F4:委派子会话 bg bash 的后终态 tail 经 per-session 串行链**异步**持久化,其入
+      // _durableDelegateRuntimeEvents 收集器发生在持久化 acked|queued **之后**;下方
+      // 摘取该收集器构造 DurableAgentGroup 前,必须 await 该链(且在清收集器引用之前),
+      // 否则晚到的 queued tail 会丢出本 group。(不额外 waitForOutputDrain:turn 收尾
+      // 已 drain 过 stdout,此处再 drain 会把 drain 边界外的迟到帧误纳入 transcript;
+      // 只 await 已解析 tail 的折叠链即可。)
+      try {
+        await this.sessions.flushSessionTailFolding(session)
+      } catch (err) {
+        this.log.warn('delegate tail-fold flush before collection failed', {
+          sessionKey,
+          err: String(err),
+        })
+      }
       if (session._durableDelegateTranscript === durableTranscript) {
         session._durableDelegateTranscript = undefined
       }

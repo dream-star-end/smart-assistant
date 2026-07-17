@@ -135,6 +135,53 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.some((m) => m.id === "m-local-a1")).toBe(true);
   });
 
+  // C2:采用引擎 messageId(srv- 前缀)的本地 live 行 —— 无 _source,turn finalize 后 server 把该轮
+  // 展开成 `srv-…-tN-s{idx}` 分段行(id 不同,server-wins 按 id 漏)。完成证据去重必须按权威源
+  // `_source !== 'server'` 清掉它,而不能按 `isServerAuthoredRow`(srv- 前缀兜底会把 live 行误判成
+  // server-authored → 漏删 → 与 server 分段副本并存重复渲染)。
+  test("finalize full 同步:采用引擎 messageId 的本地行被 srv-* 分段副本替换,不再双份", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      // v7 live 行直接采用引擎 messageId(srv- 前缀但本地铸,无 _source),已被 addMessage 盖 _clientMessageId。
+      { id: "srv-peer-main-t1", role: "assistant", text: "答", ts: 2, _clientMessageId: "m-user-1" },
+    ];
+    const server: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      // finalize 后 server 把该轮展开成分段行(id 带 -s0 后缀,与 live 行不同)。
+      { id: "srv-peer-main-t1-s0", role: "assistant", text: "答", ts: 2, _source: "server", _clientMessageId: "m-user-1" },
+    ];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    const assistants = merged.filter((m) => m.role === "assistant");
+    expect(assistants.map((m) => m.id)).toEqual(["srv-peer-main-t1-s0"]); // 只剩 server 分段行
+    expect(merged.some((m) => m.id === "srv-peer-main-t1")).toBe(false); // live 引擎行被清
+  });
+
+  test("无完成证据(server 未回该轮 server 行)时引擎 messageId 本地行保留(落库失败降级不误删)", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1 },
+      { id: "srv-peer-main-t1", role: "assistant", text: "答", ts: 2, _clientMessageId: "m-user-1" },
+    ];
+    // server 只回 user 行(该轮 tape 尚未落库)→ 无完成证据 → 本地生成行必须保留。
+    const server: ChatMessage[] = [{ id: "m-user-1", role: "user", text: "u1", ts: 1 }];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    expect(merged.some((m) => m.id === "srv-peer-main-t1")).toBe(true);
+  });
+
+  test("user / agent-group 行永不因 _clientMessageId 命中被删(角色白名单收口)", () => {
+    const local: ChatMessage[] = [
+      { id: "m-user-1", role: "user", text: "u1", ts: 1, _clientMessageId: "m-user-1" },
+      { id: "m-group-1", role: "agent-group", text: "团队", ts: 2, _clientMessageId: "m-user-1", _delegateRunId: "run-1" },
+      { id: "srv-peer-main-t1", role: "assistant", text: "答", ts: 3, _clientMessageId: "m-user-1" },
+    ];
+    const server: ChatMessage[] = [
+      { id: "srv-peer-main-t1-s0", role: "assistant", text: "答", ts: 3, _source: "server", _clientMessageId: "m-user-1" },
+    ];
+    const merged = mergeFullServerWins(server, local, 0, "m-user-1");
+    expect(merged.some((m) => m.id === "m-user-1")).toBe(true); // user 保留
+    expect(merged.some((m) => m.id === "m-group-1")).toBe(true); // agent-group 保留
+    expect(merged.some((m) => m.id === "srv-peer-main-t1")).toBe(false); // 生成行被清
+  });
+
   test("mergeFullServerWins: server 权威 + 保留末尾乐观尾（server 不认识）", () => {
     const server = [msg("a", "S-a"), msg("b", "S-b")];
     // a 重叠（取 server），末尾 c 是本地乐观尾（server 还没持久化）→ 保留。
@@ -186,6 +233,18 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.map((m) => m.id)).toEqual(["a", "b", "c"]);
     expect(merged.find((m) => m.id === "b")!.text).toBe("S-b"); // 覆盖
     expect(merged[0].text).toBe("L-a"); // 顺序保持
+  });
+
+  // C2 同型逻辑:增量合并也按 `_source !== 'server'` 清掉采用引擎 messageId 的本地 live 行。
+  test("applyServerIncremental: 完成证据下清掉引擎 messageId 本地行,只留 server 分段行", () => {
+    const local: ChatMessage[] = [
+      { id: "srv-peer-main-t1", role: "assistant", text: "答", ts: 2, _clientMessageId: "m-user-1" },
+    ];
+    const incoming: ChatMessage[] = [
+      { id: "srv-peer-main-t1-s0", role: "assistant", text: "答", ts: 2, _source: "server", _clientMessageId: "m-user-1" },
+    ];
+    const merged = applyServerIncremental(local, incoming, "m-user-1");
+    expect(merged.map((m) => m.id)).toEqual(["srv-peer-main-t1-s0"]);
   });
 
   test("user server echo preserves the original message-level retry routing", () => {

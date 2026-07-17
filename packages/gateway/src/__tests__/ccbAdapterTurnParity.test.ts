@@ -345,6 +345,9 @@ describe("CcbAdapter turn parity", () => {
     const { adapter, runner } = makeAdapter();
     const eventsA: EngineEvent[] = [];
     const turnA = beginTurn(adapter, eventsA);
+    // F3:tail 归属靠 Bash tool_use_id 登记 —— 先发起 bg Bash 工具 tu1(否则 fail-closed
+    // 会把归属不明的 tail 丢弃)。
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "sleep 5 &" }));
     runner.msg(textDelta("A"));
     runner.msg(resultRow());
     await turnA.summary;
@@ -373,6 +376,208 @@ describe("CcbAdapter turn parity", () => {
     assert.ok(
       eventsB.some((e) => e.kind === "block" && (e.block as { text?: string }).text === "B"),
     );
+  });
+
+  test("A0 owner 路由:turn1 的 bg bash tail 在 turn2 期间归位 turn1(不污染 turn2 parser)", async () => {
+    const { adapter, runner } = makeAdapter();
+
+    // turn1:发起一个 bg Bash 工具(assistant snapshot 触发 onToolUse → 登记归属)。
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_event, block) =>
+        postTerminalA.push({ block: block as { kind: string; tail?: string } }),
+    });
+    runner.msg(toolUseStart("tu1", "Bash"));
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "sleep 100 &" }));
+    runner.msg(resultRow()); // turn1 终态,bg bash 仍在后台跑
+    await turnA.summary;
+
+    // turn2 激活:_routeTurn 切到 turn2。
+    const eventsB: EngineEvent[] = [];
+    const postTerminalB: unknown[] = [];
+    const turnB = beginTurn(adapter, eventsB, {
+      onPostTerminalRuntimeEvent: (event) => postTerminalB.push(event),
+    });
+    runner.msg(textDelta("B answering"));
+
+    // turn1 的 bg bash 在 turn2 期间继续 emit tail(tool_use_id = tu1)。
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "tu1",
+      tail: "still running",
+      total_bytes: 13,
+    });
+
+    // 断言:tail 经 turn1 的 onPostTerminalRuntimeEvent(finalized parser 的
+    // onPostFinalRuntimeEvent),而非灌进 turn2。
+    assert.equal(postTerminalA.length, 1, "turn1 收到其 bg bash 的 post-terminal tail");
+    assert.equal(postTerminalA[0].block.kind, "tool_output_tail");
+    assert.equal(postTerminalA[0].block.tail, "still running");
+    assert.equal(postTerminalB.length, 0, "turn2 不该收到 turn1 的 tail");
+
+    // turn2 的 parser 未被污染:snapshot.runtimeEvents 与事件流均无该 tail。
+    const snapB = turnB.getPartialSnapshot();
+    assert.equal(
+      snapB.runtimeEvents.some(
+        (e) => (e.payload as { subtype?: string })?.subtype === "bash_output_tail",
+      ),
+      false,
+      "turn2 parser runtimeEvents 不含 turn1 tail",
+    );
+    assert.equal(
+      eventsB.some(
+        (e) => e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+      ),
+      false,
+      "turn2 事件流不含 turn1 tail 的 tool_output_tail block",
+    );
+
+    // 收尾 turn2。
+    runner.msg(resultRow({ total_cost_usd: 0.09 }));
+    await turnB.summary;
+  });
+
+  test("F3 fail-closed:origin map 逐出后,归属不明 tail 丢弃(不回落当前 turn)", async () => {
+    const { adapter, runner } = makeAdapter();
+    // turn1 登记 258 个 Bash 工具 → 全局 origin map 上限 256,tu0/tu1 被逐出。
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminalA.push({ block: block as { kind: string; tail?: string } }),
+    });
+    const N = 258;
+    for (let i = 0; i < N; i++) {
+      runner.msg(assistantToolUse(`tu${i}`, "Bash", { command: `sleep 1 &` }));
+    }
+    runner.msg(resultRow());
+    await turnA.summary;
+
+    // turn2 激活(不拥有任何 turn1 的 Bash id)。
+    const eventsB: EngineEvent[] = [];
+    const turnB = beginTurn(adapter, eventsB);
+    runner.msg(textDelta("B"));
+
+    // tu0 已被 LRU 逐出 origin map + turn2 不拥有它 → fail-closed 丢弃。
+    runner.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu0", tail: "evicted", total_bytes: 7 });
+    // tu257(最近登记,仍在册)→ 命中 → 归位 turn1。
+    runner.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu257", tail: "retained", total_bytes: 8 });
+
+    assert.equal(postTerminalA.length, 1, "只有仍在册的 tu257 归位 turn1;被逐出的 tu0 丢弃");
+    assert.equal(postTerminalA[0].block.tail, "retained");
+    // turn2 未被污染。
+    assert.equal(
+      turnB.getPartialSnapshot().runtimeEvents.some(
+        (e) => (e.payload as { subtype?: string })?.subtype === "bash_output_tail",
+      ),
+      false,
+      "被丢弃的 tail 绝不灌进 turn2",
+    );
+
+    runner.msg(resultRow({ total_cost_usd: 0.02 }));
+    await turnB.summary;
+  });
+
+  test("F3⑤ shutdown:drain 期间的尾帧仍按 origin 归位,之后才清 map", async () => {
+    class DrainRunner extends FakeCcbRunner {
+      async shutdown(): Promise<void> {
+        // 模拟 SIGTERM drain 期间 bg bash 迟到的一帧 tail(map 此刻应仍在)。
+        this.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu1", tail: "drain-tail", total_bytes: 9 });
+      }
+    }
+    const runner = new DrainRunner();
+    const adapter = new CcbAdapter({} as EngineCreateOpts, runner as unknown as SubprocessRunner);
+    const events: EngineEvent[] = [];
+    const postTerminal: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turn = adapter.submitTurn({
+      input: "hi",
+      onEvent: (e) => events.push(e),
+      sessionTotals: makeTotals(),
+      toolUseIdToName: new Map(),
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminal.push({ block: block as { kind: string; tail?: string } }),
+    });
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "x &" }));
+    runner.msg(resultRow());
+    await turn.summary;
+
+    await adapter.shutdown(); // 内部 await runner.shutdown()(emit tail)后才清 map
+
+    assert.equal(postTerminal.length, 1, "drain 期尾帧按 origin 归位(清 map 在 await 之后)");
+    assert.equal(postTerminal[0].block.tail, "drain-tail");
+  });
+
+  test("F5 活跃态:子 agent bg bash tail 正常路由进当前 turn(不被 fail-closed 误丢)", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    // 子 agent(parent_tool_use_id 置位)发起 Bash 工具 → onBashToolObserved 登记归属
+    // (onToolUse 主 agent-only 不会触发,故不能靠它登记)。
+    runner.msg({
+      type: "assistant",
+      parent_tool_use_id: "agent-1",
+      message: { content: [{ type: "tool_use", id: "sub-bash", name: "Bash", input: { command: "x &" } }] },
+    });
+    // 活跃 turn 内子 agent 的 bash tail(带 parent)→ 路由进当前 turn,发 tool_output_tail。
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "sub-bash",
+      parent_tool_use_id: "agent-1",
+      tail: "sub output",
+      total_bytes: 10,
+    });
+    const tail = events.find(
+      (e): e is Extract<EngineEvent, { kind: "block" }> =>
+        e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+    );
+    assert.ok(tail, "活跃态子 agent bash tail 必须路由进当前 turn(非丢弃)");
+    assert.equal(
+      (tail!.block as { parentToolUseId?: string }).parentToolUseId,
+      "agent-1",
+      "带 parent → 前端归入 Agent 卡",
+    );
+    assert.equal((tail!.block as { tail?: string }).tail, "sub output");
+    runner.msg(resultRow());
+    await turn.summary;
+  });
+
+  test("F5 post-terminal:子 agent bg bash tail 在后续 turn 期间归位 origin turn", async () => {
+    const { adapter, runner } = makeAdapter();
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { tail?: string; parentToolUseId?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminalA.push({ block: block as { tail?: string; parentToolUseId?: string } }),
+    });
+    runner.msg({
+      type: "assistant",
+      parent_tool_use_id: "agent-1",
+      message: { content: [{ type: "tool_use", id: "sub-bash", name: "Bash", input: {} }] },
+    });
+    runner.msg(resultRow());
+    await turnA.summary;
+
+    const eventsB: EngineEvent[] = [];
+    const turnB = beginTurn(adapter, eventsB);
+    runner.msg(textDelta("B"));
+
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "sub-bash",
+      parent_tool_use_id: "agent-1",
+      tail: "late sub",
+      total_bytes: 8,
+    });
+    assert.equal(postTerminalA.length, 1, "子 agent post-terminal tail 归位 turn1");
+    assert.equal(postTerminalA[0].block.tail, "late sub");
+    assert.equal(postTerminalA[0].block.parentToolUseId, "agent-1");
+
+    runner.msg(resultRow({ total_cost_usd: 0.01 }));
+    await turnB.summary;
   });
 
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {

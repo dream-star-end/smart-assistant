@@ -18,7 +18,7 @@ import { EventEmitter } from "node:events";
 
 import { SessionManager, type AgentSession } from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
-import type { SessionStreamEvent } from "../engine/engineEvents.js";
+import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
 import type { SubprocessRunner } from "../subprocessRunner.js";
 import {
@@ -371,6 +371,23 @@ function makeCapturingSink(outcome: CapturedSinkOutcome = { ok: true }): Capture
     persistOrQueue: async (payload: V3MasterSinkPayload) => {
       payloads.push(payload);
       return outcome;
+    },
+    attemptOnce: async () => {
+      throw new Error("not used in this test");
+    },
+  } as unknown as V3MasterSink;
+  return { sink, payloads };
+}
+
+/** F6 — 延迟落定的 sink:拉宽"读 count → 落定 count++"之间的窗口,若 owner 预算不是
+ *  跨 session 串行临界区,共享 owner 的两 session 会同读旧 count 双双过 cap → 超发。 */
+function makeDelayingSink(delayMs: number): CapturedSink {
+  const payloads: V3MasterSinkPayload[] = [];
+  const sink = {
+    persistOrQueue: async (payload: V3MasterSinkPayload) => {
+      await new Promise((r) => setTimeout(r, delayMs));
+      payloads.push(payload);
+      return { ok: true } as CapturedSinkOutcome;
     },
     attemptOnce: async () => {
       throw new Error("not used in this test");
@@ -986,6 +1003,509 @@ describe("crash/interrupt partial persistence", () => {
       await runOneTurn(sm, session, events);
       assert.equal(captured.payloads.length, 0);
       assert.ok(events.some((e) => e.kind === "error"));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+});
+
+// ── A1 post-terminal bash_output_tail 折叠 ────────────────────────────────
+
+describe("post-terminal tail folding (A1)", () => {
+  const mkTail = (over: Record<string, unknown> = {}) => ({
+    type: "system",
+    subtype: "bash_output_tail",
+    tool_use_id: "tool-bg",
+    tail: "same output",
+    total_bytes: 11,
+    truncated_head: false,
+    ...over,
+  });
+
+  /** 跑一个最小 turn:发起若干 bg Bash 工具(F3 tail 归属登记点)+ text + result,
+   *  返回可继续注入这些工具 post-terminal tail 的句柄。 */
+  async function runFoldTurn(
+    sm: SessionManager,
+    requestId: string,
+    opts: { toolIds?: string[]; sessionOver?: Partial<AgentSession> } = {},
+  ): Promise<{
+    session: AgentSession;
+    runner: FakeCcbRunner;
+    events: SessionStreamEvent[];
+  }> {
+    const toolIds = opts.toolIds ?? ["tool-bg"];
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        // Bash tool_use → onToolUse 登记归属;bg bash 终态后继续 emit tail。
+        for (const id of toolIds) r.toolPair(id, "Bash", `initial ${id}`);
+        r.text("done");
+        r.result({ stop_reason: "end_turn", usage: { output_tokens: 1 } });
+      });
+    });
+    const session = makeSession(runner, {
+      channel: "webchat",
+      userId: "user-1",
+      ...opts.sessionOver,
+    });
+    await sm.submit(session, "go", (e) => events.push(e), undefined, undefined, requestId);
+    return { session, runner, events };
+  }
+
+  const flush = (sm: SessionManager, session: AgentSession): Promise<void> =>
+    (sm as unknown as { _flushTailFolding: (s: AgentSession) => Promise<void> })._flushTailFolding(
+      session,
+    );
+
+  const tailBlockCount = (events: SessionStreamEvent[]): number =>
+    events.filter(
+      (e) => e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+    ).length;
+
+  test("同 hash 连发 N 条:只落 1 条 continuation 且只转发 1 条 block", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { session, runner, events } = await runFoldTurn(sm, "e".repeat(32));
+      const baseline = captured.payloads.length; // main turn tape
+
+      runner.msg(mkTail()); // 首条 → 立即持久化
+      await sm.awaitPendingPersistence();
+      // 同内容连发 → 稳态早退丢弃(不落、不转、不进 durable 收集器)
+      for (let i = 0; i < 4; i++) runner.msg(mkTail());
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 1, "同 hash 只持久化 1 条");
+      assert.equal(tails[0].continuationOfTurnKey, captured.payloads[0].turnKey);
+      assert.equal(tailBlockCount(events), 1, "只转发 1 条 tool_output_tail block");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("内容变化但 <interval:trailing flush 恰一次(合并到最新一条)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      // 缩短限频窗口,用真定时器 + 短 sleep 精确观察 trailing flush。
+      (sm as unknown as { _tailFoldMinIntervalMs: number })._tailFoldMinIntervalMs = 40;
+      const { session, runner } = await runFoldTurn(sm, "f".repeat(32));
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail({ tail: "line-1", total_bytes: 1 })); // 立即落,锚定限频窗口
+      runner.msg(mkTail({ tail: "line-2", total_bytes: 2 })); // 窗口内变化 → pending
+      runner.msg(mkTail({ tail: "line-3", total_bytes: 3 }));
+      runner.msg(mkTail({ tail: "line-4", total_bytes: 4 }));
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length - baseline, 1, "限频窗口内只先落 tail(1)");
+
+      await new Promise((r) => setTimeout(r, 90)); // 等定时器到点
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 2, "trailing flush 恰一次");
+      assert.deepEqual(
+        tails.map((p) => (p.runtimeEvents?.[0].payload as { tail?: string }).tail),
+        ["line-1", "line-4"],
+        "只落首条 + 合并后的最新一条",
+      );
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("每流 cap:达上限后落 capped marker,之后既不落也不转", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as {
+        _tailFoldMinIntervalMs: number;
+        _tailFoldStreamCap: number;
+      };
+      smAny._tailFoldMinIntervalMs = 0; // 关限频:每条不同内容都立即持久化
+      smAny._tailFoldStreamCap = 3; // 缩小 cap 以精确断言
+      const { session, runner, events } = await runFoldTurn(sm, "g".repeat(32));
+      const baseline = captured.payloads.length;
+
+      // 前 3 条真实落,第 4 条(达 cap)落 capped marker。
+      for (let i = 1; i <= 4; i++) {
+        runner.msg(mkTail({ tail: `l-${i}`, total_bytes: i }));
+        await sm.awaitPendingPersistence();
+      }
+      // 封顶后:第 5、6 条丢弃。
+      runner.msg(mkTail({ tail: "l-5", total_bytes: 5 }));
+      runner.msg(mkTail({ tail: "l-6", total_bytes: 6 }));
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 4, "3 条真实 tail + 1 条 capped marker");
+      assert.deepEqual(
+        tails.map((p) => (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype),
+        [
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail_capped",
+        ],
+      );
+      const marker = tails[3].runtimeEvents?.[0].payload as {
+        suppressed_reason?: string;
+        tool_use_id?: string;
+      };
+      assert.equal(marker.suppressed_reason, "cap");
+      assert.equal(marker.tool_use_id, "tool-bg");
+      assert.equal(tailBlockCount(events), 3, "只转发 3 条真实 tail(marker 与封顶后事件不转发)");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("session destroy:flush pending(最终态豁免限频)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { session, runner } = await runFoldTurn(sm, "h".repeat(32));
+      const baseline = captured.payloads.length;
+      // 挂进 sessions 表,让 destroySession 能定位到它。
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      runner.msg(mkTail({ tail: "first", total_bytes: 1 })); // 立即落
+      runner.msg(mkTail({ tail: "second", total_bytes: 2 })); // 默认 5s 窗口内 → pending
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length - baseline, 1, "pending 未到点,仅首条落");
+
+      await sm.destroySession(session.sessionKey); // 应 flush pending,不等 5s 定时器
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 2, "destroy 触发 pending 的 terminal flush");
+      assert.equal(
+        (tails[1].runtimeEvents?.[0].payload as { tail?: string }).tail,
+        "second",
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F1 三态:queued(已可靠排队)等同成功 —— 转发 + 更新 hash(同内容后续被抑制)", async () => {
+    const captured = makeCapturingSink({ ok: false, queued: true, errorClass: "transient" });
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { session, runner, events } = await runFoldTurn(sm, "q".repeat(32));
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail()); // master 不可达 → queued(stage 已 fsync)
+      await sm.awaitPendingPersistence();
+      // queued 视作成功:已 stage(payload 落盘)+ 转发 + 更新 hash。
+      assert.equal(captured.payloads.length - baseline, 1, "queued 帧已 stage");
+      assert.equal(tailBlockCount(events), 1, "queued 帧照常转发(帧已可靠落盘)");
+
+      // 同内容后续:hash 已更新 → 稳态早退抑制,不再重复 stage。
+      runner.msg(mkTail());
+      runner.msg(mkTail());
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length - baseline, 1, "同内容不因 queued 反复重 stage");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F1 三态:dropped(永久丢弃)不算成功 —— 不转发、hash 不更新(下次重试)", async () => {
+    const captured = makeCapturingSink({ ok: false, queued: false, droppedReason: "gone-410" });
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _tailFoldMinIntervalMs: number })._tailFoldMinIntervalMs = 0; // 关限频
+      const { session, runner, events } = await runFoldTurn(sm, "r".repeat(32));
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail());
+      await sm.awaitPendingPersistence();
+      runner.msg(mkTail()); // 同内容:因 dropped 未更新 hash → 不被抑制,重试
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length - baseline, 2, "dropped 不更新 hash → 同内容会重试(2 次 stage 尝试)");
+      assert.equal(tailBlockCount(events), 0, "dropped 绝不转发(维持'转发的必已持久化')");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F2 owner 多流 cap:跨流聚合达 owner 上限 → 落一条 owner marker,该 owner 全停", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as {
+        _tailFoldMinIntervalMs: number;
+        _tailFoldStreamCap: number;
+        _tailFoldOwnerCap: number;
+      };
+      smAny._tailFoldMinIntervalMs = 0;
+      smAny._tailFoldStreamCap = 100; // 高到不触发 per-stream cap
+      smAny._tailFoldOwnerCap = 3; // 跨流聚合上限
+      const { session, runner, events } = await runFoldTurn(sm, "o".repeat(32), {
+        toolIds: ["ta", "tb", "tc", "td"],
+      });
+      const baseline = captured.payloads.length;
+
+      // 4 个不同流(同一 turn = 同一 ownerTurnKey)各发 1 条:前 3 落,第 4 触发 owner cap。
+      for (const id of ["ta", "tb", "tc", "td"]) {
+        runner.msg(mkTail({ tool_use_id: id, tail: `x-${id}` }));
+        await sm.awaitPendingPersistence();
+      }
+      // owner 已封顶:任意流后续事件全丢。
+      runner.msg(mkTail({ tool_use_id: "ta", tail: "after-cap" }));
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 4, "3 条真实 tail + 1 条 owner marker");
+      assert.deepEqual(
+        tails.map((p) => (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype),
+        [
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail_capped",
+        ],
+      );
+      assert.equal(
+        (tails[3].runtimeEvents?.[0].payload as { suppressed_reason?: string }).suppressed_reason,
+        "owner_cap",
+      );
+      assert.equal(tailBlockCount(events), 3, "封顶后不再转发");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F1b capped marker 冻结:dropped 时按同一 identity 重试,不生成多条不同 marker", async () => {
+    const captured = makeCapturingSink({ ok: false, queued: false, droppedReason: "gone" });
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as { _tailFoldMinIntervalMs: number; _tailFoldStreamCap: number };
+      smAny._tailFoldMinIntervalMs = 0;
+      smAny._tailFoldStreamCap = 2;
+      const { session, runner } = await runFoldTurn(sm, "z".repeat(32));
+      const baseline = captured.payloads.length;
+
+      // dropped sink:真实 tail 不计入 persistedCount(dropped 不更新)→ cap 永不到。
+      // 换 acked 让前 2 条落定后再切 dropped 不现实;改用 streamCap=0 直接触发 marker。
+      smAny._tailFoldStreamCap = 0;
+      runner.msg(mkTail({ tail: "a" }));
+      await sm.awaitPendingPersistence();
+      runner.msg(mkTail({ tail: "b" })); // 再触发一次 marker(仍 dropped)
+      await sm.awaitPendingPersistence();
+
+      const markers = captured.payloads
+        .slice(baseline)
+        .filter(
+          (p) =>
+            (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype ===
+            "bash_output_tail_capped",
+        );
+      assert.ok(markers.length >= 2, "dropped → marker 反复重试");
+      // 冻结验证:所有 marker 的 event ordinal + observedAt 完全一致(同一冻结对象)。
+      const first = markers[0].runtimeEvents?.[0];
+      for (const m of markers) {
+        const ev = m.runtimeEvents?.[0];
+        assert.equal(ev?.ordinal, first?.ordinal, "marker ordinal 冻结");
+        assert.equal(ev?.observedAt, first?.observedAt, "marker observedAt 冻结");
+      }
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  // 收集器里只挑 bash_output_tail(隔离 turn 本身在 turn-end 推入的 runtimeEvents)。
+  const tailsInCollector = (collector: unknown[]): string[] =>
+    collector
+      .map((e) => (e as { payload?: { subtype?: string; tail?: string } }).payload)
+      .filter((p): p is { subtype: string; tail?: string } => p?.subtype === "bash_output_tail")
+      .map((p) => p.tail ?? "");
+
+  test("F4 delegate 收集器:acked/queued 才进 + flush 排空 pending(摘取前 await 链)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const collector: DurableRuntimeEvent[] = [];
+      const { session, runner } = await runFoldTurn(sm, "d".repeat(32), {
+        sessionOver: { _durableDelegateRuntimeEvents: collector },
+      });
+
+      runner.msg(mkTail({ tail: "one", total_bytes: 1 })); // 立即落
+      runner.msg(mkTail({ tail: "two", total_bytes: 2 })); // <5s → pending
+      await sm.awaitPendingPersistence();
+      assert.deepEqual(tailsInCollector(collector), ["one"], "落定的 tail 进收集器(pending 未 flush)");
+
+      // flush 排空 pending → 收集器补齐(F4:handleDelegateTask 摘取前必须 await 该链)。
+      await flush(sm, session);
+      assert.deepEqual(tailsInCollector(collector), ["one", "two"], "flush 后 pending 也进收集器");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F4 delegate 收集器失败路径:dropped tail 绝不进收集器", async () => {
+    const captured = makeCapturingSink({ ok: false, queued: false, droppedReason: "gone" });
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const collector: DurableRuntimeEvent[] = [];
+      const { session, runner } = await runFoldTurn(sm, "p".repeat(32), {
+        sessionOver: { _durableDelegateRuntimeEvents: collector },
+      });
+
+      runner.msg(mkTail({ tail: "lost" }));
+      await sm.awaitPendingPersistence();
+      assert.deepEqual(tailsInCollector(collector), [], "dropped 的 tail 不进 delegate 收集器");
+
+      await flush(sm, session);
+      assert.deepEqual(tailsInCollector(collector), []);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F6 owner 预算跨 session 并发不超发:两 session 同 owner + 延迟 sink,总落定恰=cap", async () => {
+    const captured = makeDelayingSink(25); // 拉宽落定窗口,暴露非串行会超发
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as { _tailFoldMinIntervalMs: number; _tailFoldOwnerCap: number };
+      smAny._tailFoldMinIntervalMs = 0;
+      smAny._tailFoldOwnerCap = 1; // 硬:owner 只准落 1 条真实 tail
+      const owner = {
+        channel: "delegate",
+        _billingParentTurnKey: "shared-owner",
+        _usageAttribution: { mode: "delegate", parentSessionId: "shared-peer" },
+      } as unknown as Partial<AgentSession>;
+      const a = await runFoldTurn(sm, "a".repeat(32), { toolIds: ["a-bash"], sessionOver: owner });
+      const b = await runFoldTurn(sm, "b".repeat(32), { toolIds: ["b-bash"], sessionOver: owner });
+      const baseline = captured.payloads.length;
+
+      // 两 session 同一 ownerTurnKey 的 tail **并发**注入(不 await 间隔)。
+      a.runner.msg(mkTail({ tool_use_id: "a-bash", parent_tool_use_id: undefined, tail: "A1" }));
+      b.runner.msg(mkTail({ tool_use_id: "b-bash", parent_tool_use_id: undefined, tail: "B1" }));
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      const real = tails.filter(
+        (p) => (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype === "bash_output_tail",
+      );
+      const markers = tails.filter(
+        (p) =>
+          (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype ===
+          "bash_output_tail_capped",
+      );
+      assert.equal(real.length, 1, "owner cap=1:跨 session 并发也只落 1 条真实 tail(无超发)");
+      assert.equal(markers.length, 1, "第二条转为 owner marker");
+
+      await flush(sm, a.session);
+      await flush(sm, b.session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("F7 terminal flush 尊重 cap:owner capped 后 pending 不落盘(destroy 也不豁免)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _tailFoldOwnerCap: number })._tailFoldOwnerCap = 2; // 默认 5s 限频保留
+      const { session, runner } = await runFoldTurn(sm, "w".repeat(32), { toolIds: ["t1", "t2"] });
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail({ tool_use_id: "t1", tail: "a" })); // 立即落,owner=1
+      await sm.awaitPendingPersistence();
+      runner.msg(mkTail({ tool_use_id: "t2", tail: "b" })); // 立即落,owner=2
+      await sm.awaitPendingPersistence();
+      // 各流第二条(<5s)→ pending;此刻 owner 未 capped(尚无 tail 超过 cap)。
+      runner.msg(mkTail({ tool_use_id: "t1", tail: "a2" }));
+      runner.msg(mkTail({ tool_use_id: "t2", tail: "c" }));
+
+      await sm.destroySession(session.sessionKey); // terminal flush(runner 已停)
+
+      const tails = captured.payloads.slice(baseline);
+      const real = tails.filter(
+        (p) => (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype === "bash_output_tail",
+      );
+      // a2 触发 owner cap → 转 owner marker;c 落入 owner.capped → 丢弃。真实 tail 恒=cap。
+      assert.equal(real.length, 2, "真实 tail 恰=owner cap(terminal flush 不豁免 cap)");
+      assert.deepEqual(
+        real.map((p) => (p.runtimeEvents?.[0].payload as { tail?: string }).tail).sort(),
+        ["a", "b"],
+        "a2/c 均未作为真实 tail 落盘",
+      );
+      assert.ok(
+        tails.some(
+          (p) =>
+            (p.runtimeEvents?.[0].payload as { suppressed_reason?: string }).suppressed_reason ===
+            "owner_cap",
+        ),
+        "落一条 owner marker",
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("legacy 'skipped'(未落盘非失败):tail 仍转发 + 更新 hash 去重,但不计预算", async () => {
+    setV3MasterSinkSingleton(null); // 无 sink → legacy 本地路径;post-terminal tail(空 text)→ skipped
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as { _tailFoldMinIntervalMs: number; _tailFoldStreamCap: number };
+      smAny._tailFoldMinIntervalMs = 0;
+      smAny._tailFoldStreamCap = 2; // 若 skipped 误计预算,3 条不同内容会触发 cap marker
+      const { session, runner, events } = await runFoldTurn(sm, "s".repeat(32));
+
+      // 4 条不同内容 → 全 skipped:全部转发,且因 hash 更新使重复被去重。
+      for (const n of [1, 2, 3, 4]) {
+        runner.msg(mkTail({ tail: `k-${n}`, total_bytes: n }));
+        await sm.awaitPendingPersistence();
+      }
+      runner.msg(mkTail({ tail: "k-4", total_bytes: 4 })); // 与上条同内容 → 去重丢弃
+      await sm.awaitPendingPersistence();
+
+      assert.equal(tailBlockCount(events), 4, "skipped 仍转发(4 条不同内容各转发一次)");
+      // 若 skipped 计预算,streamCap=2 会在第 3 条落 cap marker → 但 legacy 无 sink 不落盘,
+      // 关键断言是"未触发 cap 提前静默":第 4 条仍被转发(未因 cap 停流)。
+      const lastTail = events
+        .filter(
+          (e): e is Extract<SessionStreamEvent, { kind: "block" }> =>
+            e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+        )
+        .pop();
+      assert.equal((lastTail!.block as { tail?: string }).tail, "k-4", "第 4 条(cap 之外)仍转发 → skipped 不计预算");
+
+      await flush(sm, session);
     } finally {
       setV3MasterSinkSingleton(null);
     }

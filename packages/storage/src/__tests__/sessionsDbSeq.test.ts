@@ -159,19 +159,19 @@ describe('normalizeAndAssignSeqs — legacy backfill (Codex review #2)', () => {
     assert.equal(r.nextSeq, 3)
   })
 
-  it('handles partial-legacy oldMsgs (some have _seq, some do not)', () => {
-    // This shouldn't normally happen, but defensive: if ANY oldMsg lacks
-    // _seq, treat the whole row as legacy and reassign in array order.
+  it('partial-legacy oldMsgs: preserves valid seq, backfills only the missing row (tail-flood fix)', () => {
+    // 收紧后(tail-flood 根治):任一行已有合法 _seq 就不再整数组按位重编——旧实现会把
+    // a 的 _seq 从 5 抹成 1,在并发窗口重排热行。现在 a 保留 5,只有缺号的 b 向后补号。
     const oldMsgs: Msg[] = [
-      m('a', 100, { _seq: 5 }),  // claims _seq=5
-      m('b', 200),               // no _seq
+      m('a', 100, { _seq: 5 }),  // 已有合法 _seq=5
+      m('b', 200),               // 缺 _seq
     ]
     const finalMsgs: Msg[] = [m('a', 100, { _seq: 5 }), m('b', 200)]
     const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 6)
-    // Reassigned in order: 1, 2.
-    assert.equal((r.messages[0] as Msg)._seq, 1)
-    assert.equal((r.messages[1] as Msg)._seq, 2)
-    assert.equal(r.nextSeq, 3)
+    // a 保 5;b 从 max(currentNextSeq=6, maxValid+1=6)=6 补号。绝不从 1 整重编。
+    assert.equal((r.messages[0] as Msg)._seq, 5)
+    assert.equal((r.messages[1] as Msg)._seq, 6)
+    assert.equal(r.nextSeq, 7)
   })
 })
 
@@ -189,6 +189,81 @@ describe('normalizeAndAssignSeqs — defensive next_seq correction', () => {
     const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 5)  // bogus low next_seq
     assert.equal((r.messages[2] as Msg)._seq, 11, 'fresh _seq strictly > max(oldMsgs._seq)')
     assert.equal(r.nextSeq, 12)
+  })
+})
+
+describe('normalizeAndAssignSeqs — legacy tightening (tail-flood fix)', () => {
+  it('1) partial-missing seq + advanced next_seq: keeps valid seq, backfills from max(next_seq, maxValid+1)', () => {
+    // 部分行缺 seq、游标已推进:已有 seq 的 a/c 原样不动,只有缺号的 b 补号。
+    const oldMsgs: Msg[] = [
+      m('a', 100, { _seq: 3 }),
+      m('b', 200),               // 缺 seq
+      m('c', 300, { _seq: 7 }),
+    ]
+    const finalMsgs: Msg[] = [
+      m('a', 100, { _seq: 3 }),
+      m('b', 200),
+      m('c', 300, { _seq: 7 }),
+    ]
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 10)  // next_seq 已推进到 10
+    // 已有合法 seq 的 a=3 / c=7 绝不重编;缺号的 b 从 max(10, 7+1)=10 补(此处 next_seq 胜出)。
+    assert.equal((r.messages[0] as Msg)._seq, 3)
+    assert.equal((r.messages[1] as Msg)._seq, 10)
+    assert.equal((r.messages[2] as Msg)._seq, 7)
+    assert.equal(r.nextSeq, 11)
+    assert.equal(r.maxSeq, 10)
+  })
+
+  it('2) all-missing seq + next_seq<=1: still does true-legacy positional renumber from 1', () => {
+    // 真 legacy:整行从未有 seq 且游标停在迁移默认值 → 保持既有整数组重编行为(既有用例不许红)。
+    const oldMsgs: Msg[] = [m('a', 100), m('b', 200), m('c', 300)]
+    const finalMsgs: Msg[] = [m('a', 100), m('b', 200), m('c', 300)]
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 1)
+    assert.equal((r.messages[0] as Msg)._seq, 1)
+    assert.equal((r.messages[1] as Msg)._seq, 2)
+    assert.equal((r.messages[2] as Msg)._seq, 3)
+    assert.equal(r.nextSeq, 4)
+    assert.equal(r.maxSeq, 3)
+  })
+
+  it('3) all-missing seq + next_seq>1 (drift): does NOT positional-renumber, backfills from next_seq', () => {
+    // 漂移场景:全缺 seq 但游标已推进到 50 —— 若从 1 整重编会与早已发放的 1..49 撞号。
+    // 收紧后走补号路径:从 max(50, 0+1)=50 起顺序补,不整重编。
+    const oldMsgs: Msg[] = [m('a', 100), m('b', 200)]
+    const finalMsgs: Msg[] = [m('a', 100), m('b', 200)]
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 50)
+    assert.equal((r.messages[0] as Msg)._seq, 50)
+    assert.equal((r.messages[1] as Msg)._seq, 51)
+    assert.equal(r.nextSeq, 52)
+    assert.equal(r.maxSeq, 51)
+  })
+
+  it('4) duplicate _seq among oldMsgs: keeps first, reassigns the rest, invariants hold, warns', () => {
+    // 旧行间 seq 重复(a 与 b 都是 5):不静默重排——第一条 a 保 5,重复的 b 换新号,
+    // 并通过 onWarn 上报;所有不变量仍成立。
+    const warnings: string[] = []
+    const oldMsgs: Msg[] = [
+      m('a', 100, { _seq: 5 }),
+      m('b', 200, { _seq: 5 }),  // 与 a 重复
+      m('c', 300, { _seq: 8 }),
+    ]
+    const finalMsgs: Msg[] = [
+      m('a', 100, { _seq: 5 }),
+      m('b', 200, { _seq: 5 }),
+      m('c', 300, { _seq: 8 }),
+    ]
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 6, (msg) => warnings.push(msg))
+    const seqs = r.messages.map((mm) => (mm as Msg)._seq as number)
+    // 第一条 a 保 5;c 保 8;重复的 b 换新号(严格 > maxValid=8 → 9)。
+    assert.equal(seqs[0], 5)
+    assert.equal(seqs[2], 8)
+    assert.equal(seqs[1], 9, 'duplicate row reassigned strictly above maxValidSeq')
+    // 不变量:全为正整数 + 行内唯一 + nextSeq > max(_seq)。
+    assert.ok(seqs.every((s) => Number.isInteger(s) && s > 0), 'every _seq is a positive integer')
+    assert.equal(new Set(seqs).size, seqs.length, 'seqs unique within the row')
+    assert.ok(r.nextSeq > Math.max(...seqs), 'nextSeq strictly greater than max(_seq)')
+    // 不静默:重复必须被 onWarn 报告(恰好一条,针对重复的 b)。
+    assert.equal(warnings.length, 1, 'duplicate reported via onWarn, not silently reordered')
   })
 })
 

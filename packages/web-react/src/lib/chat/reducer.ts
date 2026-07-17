@@ -1064,41 +1064,57 @@ export function applyOutboundMessage(
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return;
 
   const hasBlocks = Array.isArray(frame.blocks) && frame.blocks.length > 0;
+  // tool_output_tail-only 帧(bg bash 每秒一条 tail 快照)是长命令的尾巴刷新,不是模型新内容、也不是
+  // turn 生命周期信号。它**只做两件事**:① markFrameReceived 帧计活 ② 下方 block 循环对**既有**
+  // tool_output_tail 卡的原位刷新(bash tail)。其余一律短路——不复活发送态、不绑 reply tracker、
+  // 不改 user 行状态、不触发 onLiveFrame。否则旧 turn 的 bg bash tail 与新 turn 的用户行重叠时会:
+  // 把已结束轮点亮成"回复中"(生产事故:一条 bg bash tail 让终态轮亮 13 分钟)、把新 turn 尚未回复
+  // 的用户行错标成 read、发出错误的 live 生命周期信号。final 帧**永不**算 tail-only(其收尾逻辑必须
+  // 照常跑)。混合帧(tail + text/tool)代表模型确有新生成 → 行为完全不变。thinking-safety 不受影响:
+  // 计时器触发时按 _lastFrameAt(markFrameReceived 推进)做 liveness 复检,长 bash 只发 tail 也不误超时。
+  const tailOnlyFrame =
+    !frame.isFinal &&
+    hasBlocks &&
+    (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "tool_output_tail");
   // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
-  if (!frame.isFinal && !frame.cronJob && hasBlocks && !sess._sendingInFlight) sess._sendingInFlight = true;
+  if (!frame.isFinal && !frame.cronJob && hasBlocks && !tailOnlyFrame && !sess._sendingInFlight)
+    sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
-  // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。
-  if (sess._sendingInFlight && !frame.isFinal) effects.onLiveFrame?.(sess);
+  // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
+  if (sess._sendingInFlight && !frame.isFinal && !tailOnlyFrame) effects.onLiveFrame?.(sess);
 
-  // reply tracker 绑定（跳过 queued）。
-  if (!sess._replyingToMsgId) {
-    const pending = [...sess.messages]
-      .reverse()
-      .find((m) => m.role === "user" && m.status && m.status !== "replied" && m.status !== "queued");
-    if (pending) {
-      sess._replyingToMsgId = pending.id;
-      sess._currentTurnAnswerCount = 0;
+  // reply tracker 绑定 / user 行状态 / answer 计数 / isFinal 收尾 —— tail-only 帧全部短路(见上注释)。
+  if (!tailOnlyFrame) {
+    // reply tracker 绑定（跳过 queued）。
+    if (!sess._replyingToMsgId) {
+      const pending = [...sess.messages]
+        .reverse()
+        .find((m) => m.role === "user" && m.status && m.status !== "replied" && m.status !== "queued");
+      if (pending) {
+        sess._replyingToMsgId = pending.id;
+        sess._currentTurnAnswerCount = 0;
+      }
     }
-  }
-  const targetMsg = sess._replyingToMsgId ? sess.messages.find((m) => m.id === sess._replyingToMsgId) : null;
-  // tracker 指向已删消息（/clear mid-turn）→ 自愈重绑。
-  if (sess._replyingToMsgId && !targetMsg) resetReplyTracker(sess);
+    const targetMsg = sess._replyingToMsgId ? sess.messages.find((m) => m.id === sess._replyingToMsgId) : null;
+    // tracker 指向已删消息（/clear mid-turn）→ 自愈重绑。
+    if (sess._replyingToMsgId && !targetMsg) resetReplyTracker(sess);
 
-  // answer-block 计数（白名单，thinking 不算）。
-  if (targetMsg && hasBlocks) {
-    sess._currentTurnAnswerCount = (sess._currentTurnAnswerCount || 0) + countAnswerBlocks(frame.blocks);
-  }
-  if (targetMsg) {
-    if (hasBlocks && targetMsg.status !== "read" && targetMsg.status !== "replied") {
-      targetMsg.status = "read";
+    // answer-block 计数（白名单，thinking 不算）。
+    if (targetMsg && hasBlocks) {
+      sess._currentTurnAnswerCount = (sess._currentTurnAnswerCount || 0) + countAnswerBlocks(frame.blocks);
     }
-    if (frame.isFinal) {
-      deferredEmptyNotice = {
-        targetMsgId: targetMsg.id,
-        stopReason: frame.meta?.stopReason,
-        hadAnswerLookahead: !!sess._currentTurnAnswerCount || !!sess._streamingAssistant,
-      };
-      resetReplyTracker(sess);
+    if (targetMsg) {
+      if (hasBlocks && targetMsg.status !== "read" && targetMsg.status !== "replied") {
+        targetMsg.status = "read";
+      }
+      if (frame.isFinal) {
+        deferredEmptyNotice = {
+          targetMsgId: targetMsg.id,
+          stopReason: frame.meta?.stopReason,
+          hadAnswerLookahead: !!sess._currentTurnAnswerCount || !!sess._streamingAssistant,
+        };
+        resetReplyTracker(sess);
+      }
     }
   }
 

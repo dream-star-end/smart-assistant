@@ -64,6 +64,7 @@ import {
   type MessageLike,
   mergePreservingServerAuthored,
   normalizeAndAssignSeqs,
+  _warnSeqAnomaly,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
   planCostPatch,
@@ -1797,7 +1798,7 @@ export function createPgSessionsBackend(
           const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[];
           const currentNextSeq =
             existing && typeof existing.next_seq === "number" && existing.next_seq > 0 ? existing.next_seq : 1;
-          const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq);
+          const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq, _warnSeqAnomaly);
 
           const now = Date.now();
           const plan = planSpillOverflow(finalMessages, bigIntNumOr(existing?.archived_through_seq, 0));

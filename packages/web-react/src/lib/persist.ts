@@ -263,6 +263,31 @@ export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMess
  * v5 server-authored 通道只写 assistant|thinking|tool、从不产出 system 行,故中段 system 行同
  * user/团队卡一样是"server 端根本没有的内容",一并保留(否则下次 sync 就把重建提示抹掉)。
  */
+/**
+ * 完成证据去重的删除判据:本地这一轮被 server 权威 tape 取代、应从本地移除的**生成内容行**。
+ * 三要素全满足才删:
+ *  ① 非 server-authored 本地行——权威标记是 `_source !== 'server'`,**不是** id 前缀 `srv-`。
+ *     v7 起主 agent 的 live text/thinking/tool 直接采用引擎 messageId(形如 `srv-<peer>-<agent>-tN`),
+ *     它们是 reducer 本地铸的乐观行(无 `_source`)却带 `srv-` 前缀 → `isServerAuthoredRow()` 因
+ *     srv- 前缀兜底会把它们**误判成 server-authored**。若按 `isServerAuthoredRow=false` 过滤,恰好
+ *     漏掉这批「采用引擎 messageId 的本地行」——而它们正是要清的重复源(turn finalize 后 server 把
+ *     该轮展开成 `srv-…-tN-s{idx}` 分段行,id 不同 → server-wins 按 id 漏)。故这里用权威源 `_source`
+ *     精确区分:server-loaded 行必带 `_source:'server'`(见 commercial pgSessionsBackend),本地乐观
+ *     行永不带。
+ *  ② `_clientMessageId` 命中已完成轮(由调用方 hasExactCompletionEvidence 断言 server 已回该轮的
+ *     server-authored 行;server 未回完成证据时本地行必须保留,不误删落库失败降级场景)。
+ *  ③ 角色 ∈ {assistant, thinking, tool}——只清生成内容行;user/system/agent-group/goal/
+ *     delegate-progress 等 client-owned 行**绝不**因 `_clientMessageId` 命中被删(server-authored
+ *     通道从不产出它们,server 无副本,删了就真丢)。
+ */
+function isSupersededLocalTurnRow(m: ChatMessage, completedClientMessageId: string): boolean {
+  return (
+    m._source !== "server" &&
+    m._clientMessageId === completedClientMessageId &&
+    (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
+  );
+}
+
 export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
@@ -278,14 +303,7 @@ export function mergeFullServerWins(
         (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
     );
   if (hasExactCompletionEvidence) {
-    local = local.filter(
-      (m) =>
-        !(
-          m.id?.startsWith("m-") &&
-          m._clientMessageId === completedClientMessageId &&
-          (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
-        ),
-    );
+    local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
   }
   // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
@@ -341,14 +359,7 @@ export function applyServerIncremental(
         (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
     )
   ) {
-    local = local.filter(
-      (m) =>
-        !(
-          m.id?.startsWith("m-") &&
-          m._clientMessageId === completedClientMessageId &&
-          (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
-        ),
-    );
+    local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
   }
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);

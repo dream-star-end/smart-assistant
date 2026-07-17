@@ -22,6 +22,7 @@
 
 import type { MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import {
+  _warnSeqAnomaly,
   appendServerAuthoredPure,
   ARCHIVE_CHUNK_MAX_BYTES,
   ARCHIVE_CHUNK_MAX_MSGS,
@@ -219,7 +220,7 @@ export function planAppendServerAuthoredBatch(
   if (!applied) return { kind: 'already_exists' }
 
   const dedupedMessages = mergePreservingServerAuthored(next, next) as MessageLike[]
-  const normalized = normalizeAndAssignSeqs(existingMsgs, dedupedMessages, currentNextSeq)
+  const normalized = normalizeAndAssignSeqs(existingMsgs, dedupedMessages, currentNextSeq, _warnSeqAnomaly)
   const spill = planSpillOverflow(normalized.messages, currentArchivedThroughSeq)
   const finalJson = JSON.stringify(spill.tail)
   if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
@@ -271,6 +272,7 @@ export function planAppendServerAuthored(
     existingMsgs,
     dedupedMessages,
     currentNextSeq,
+    _warnSeqAnomaly,
   )
 
   // 热尾巴 + 归档:normalize 后把最老的消息搬进归档,行只留热尾巴。
