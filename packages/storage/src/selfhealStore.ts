@@ -91,6 +91,73 @@ const SELFHEAL_JOBS_COLUMNS_DDL = `
       updated_at   INTEGER NOT NULL
 `
 
+// Column body of selfheal_callback_outbox — single source for the base CREATE
+// and the batch1b release-schema rebuild guard. `release_request_id` (NULL =
+// legacy repair-level callback) discriminates the two durable callback kinds.
+// The legacy UNIQUE(repair_id, phase) TABLE constraint is REPLACED by two
+// PARTIAL unique indexes (created post-guard, see
+// SELFHEAL_CALLBACK_OUTBOX_PARTIAL_INDEXES): repair-level rows dedup on
+// (repair_id, phase); release rows dedup on (release_request_id, phase) — so a
+// repair's per-release callbacks (deploying + one terminal PER release request)
+// coexist without colliding on the legacy repair key. The phase CHECK carries
+// the release phases; the wire transport still maps them to progress|done|
+// failed in the pump.
+const SELFHEAL_CALLBACK_OUTBOX_COLUMNS_DDL = `
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      repair_id          TEXT NOT NULL,
+      release_request_id TEXT,
+      phase              TEXT NOT NULL CHECK (phase IN
+                           ('pending_release','done','failed','deploying','deployed','deploy_failed','deploy_unknown','manual_required')),
+      message            TEXT NOT NULL,
+      detail_json        TEXT NOT NULL,
+      status             TEXT NOT NULL DEFAULT 'queued'
+                           CHECK (status IN ('queued','sent','abandoned')),
+      attempts           INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at    INTEGER NOT NULL,
+      created_at         INTEGER NOT NULL,
+      updated_at         INTEGER NOT NULL
+`
+
+// The two partial unique indexes that replace the legacy UNIQUE(repair_id,
+// phase) constraint. Created AFTER all schema guards run, so the
+// `release_request_id` column is guaranteed present (fresh DB: base CREATE;
+// upgraded DB: the release rebuild guard). Idempotent (IF NOT EXISTS).
+const SELFHEAL_CALLBACK_OUTBOX_PARTIAL_INDEXES = `
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_cb_repair_phase
+      ON selfheal_callback_outbox(repair_id, phase) WHERE release_request_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_cb_release_phase
+      ON selfheal_callback_outbox(release_request_id, phase) WHERE release_request_id IS NOT NULL;
+`
+
+// Column body of selfheal_release_jobs (batch1b, §5.1). A DEDICATED ledger,
+// physically isolated from selfheal_jobs: the latter's received→…→terminal
+// LEASE is built for "crash → re-claim/redrive", whereas a release deployment
+// must be "claim → NEVER replay" (opposite recovery semantics). Mixing them
+// would let the generic reclaimer re-run a deploy. Timestamps here are ISO-8601
+// TEXT (contract §5.1 DDL verbatim), unlike selfheal_jobs' epoch integers.
+const SELFHEAL_RELEASE_JOBS_COLUMNS_DDL = `
+      release_request_id TEXT PRIMARY KEY,
+      repair_id          TEXT NOT NULL,
+      incident_id        TEXT NOT NULL,
+      payload_hash       TEXT NOT NULL,
+      status             TEXT NOT NULL DEFAULT 'received' CHECK (status IN
+                           ('received','deploying','deployed','deploy_failed','deploy_unknown','manual_required','cancelled')),
+      approved_sha       TEXT NOT NULL,
+      base_sha           TEXT,
+      deploy_plan_hash   TEXT,
+      manifest_hash      TEXT,
+      plan_json          TEXT NOT NULL,
+      origin             TEXT NOT NULL DEFAULT 'v5' CHECK (origin IN ('v5','breakglass','auto')),
+      claimed_at         TEXT,
+      scope_unit         TEXT,
+      receipt_json       TEXT,
+      checkpoint_json    TEXT,
+      canonical_pushed_at TEXT,
+      failure_reason     TEXT,
+      created_at         TEXT NOT NULL,
+      updated_at         TEXT NOT NULL
+`
+
 /**
  * Idempotent schema guard: an older selfheal.db was created with a status CHECK
  * that lacks 'cancelling'. SQLite cannot ALTER a CHECK, so rebuild the table
@@ -192,6 +259,44 @@ function ensureCallbackFailedPhase(db: Database.Database): void {
   })()
 }
 
+/**
+ * Idempotent schema guard (batch1b): an outbox created before the release batch
+ * lacks the `release_request_id` column, the release phase CHECK values, and
+ * still carries the legacy UNIQUE(repair_id, phase) TABLE constraint. SQLite can
+ * ALTER neither a CHECK nor a table constraint — rebuild (new table → copy →
+ * drop → rename) in ONE transaction, preserving in-flight rows verbatim (legacy
+ * rows take release_request_id = NULL, keeping them under the repair-level
+ * partial index). The two partial unique indexes are (re)created by the caller
+ * after all guards run — see SELFHEAL_CALLBACK_OUTBOX_PARTIAL_INDEXES. Runs
+ * AFTER ensureCallbackFailedPhase so a pre-'failed' DB is first normalized.
+ */
+function ensureReleaseCallbackSchema(db: Database.Database): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='selfheal_callback_outbox'")
+    .get() as { sql: string } | undefined
+  if (!row) return
+  const hasRrid = (
+    db.prepare('PRAGMA table_info(selfheal_callback_outbox)').all() as { name: string }[]
+  ).some((c) => c.name === 'release_request_id')
+  // Already batch1b (has the column AND the release phase values) → no rebuild.
+  if (hasRrid && row.sql.includes("'deploying'")) return
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE selfheal_callback_outbox_rebuild (${SELFHEAL_CALLBACK_OUTBOX_COLUMNS_DDL});
+      INSERT INTO selfheal_callback_outbox_rebuild
+        (id, repair_id, release_request_id, phase, message, detail_json, status,
+         attempts, next_attempt_at, created_at, updated_at)
+        SELECT id, repair_id, NULL, phase, message, detail_json, status,
+               attempts, next_attempt_at, created_at, updated_at
+        FROM selfheal_callback_outbox;
+      DROP TABLE selfheal_callback_outbox;
+      ALTER TABLE selfheal_callback_outbox_rebuild RENAME TO selfheal_callback_outbox;
+      CREATE INDEX IF NOT EXISTS idx_selfheal_cb_outbox_due
+        ON selfheal_callback_outbox(status, next_attempt_at);
+    `)
+  })()
+}
+
 function ensureTier1Columns(db: Database.Database): void {
   const cols = new Set(
     (db.prepare('PRAGMA table_info(selfheal_jobs)').all() as { name: string }[]).map((c) => c.name),
@@ -258,27 +363,39 @@ export async function getSelfhealDb(): Promise<Database.Database> {
     );
 
     -- Durable broker→master callback outbox (BLOCKER2). One row per
-    -- (repair_id, phase): 'pending_release' carries the release-gate progress
-    -- marker, 'done' the deployed callback. Enqueue is idempotent (UNIQUE +
-    -- ON CONFLICT DO NOTHING); the callbackPump drains queued rows in id order
-    -- with exponential backoff and never gives up short of an explicit
-    -- master-side refusal (→ 'abandoned').
-    CREATE TABLE IF NOT EXISTS selfheal_callback_outbox (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      repair_id       TEXT NOT NULL,
-      phase           TEXT NOT NULL CHECK (phase IN ('pending_release','done','failed')),
-      message         TEXT NOT NULL,
-      detail_json     TEXT NOT NULL,
-      status          TEXT NOT NULL DEFAULT 'queued'
-                        CHECK (status IN ('queued','sent','abandoned')),
-      attempts        INTEGER NOT NULL DEFAULT 0,
-      next_attempt_at INTEGER NOT NULL,
-      created_at      INTEGER NOT NULL,
-      updated_at      INTEGER NOT NULL,
-      UNIQUE(repair_id, phase)
-    );
+    -- (repair_id, phase) for legacy repair-level callbacks (release_request_id
+    -- NULL: 'pending_release' progress, 'done'/'failed' terminal), and one row
+    -- per (release_request_id, phase) for batch1b release callbacks (deploying/
+    -- deployed/deploy_failed/deploy_unknown/manual_required). Enqueue is
+    -- idempotent (partial unique indexes + ON CONFLICT DO NOTHING); the
+    -- callbackPump drains queued rows in id order with exponential backoff and
+    -- never gives up short of an explicit master-side refusal (→ 'abandoned').
+    -- Partial unique indexes are created after the schema guards (see below).
+    CREATE TABLE IF NOT EXISTS selfheal_callback_outbox (${SELFHEAL_CALLBACK_OUTBOX_COLUMNS_DDL});
     CREATE INDEX IF NOT EXISTS idx_selfheal_cb_outbox_due
       ON selfheal_callback_outbox(status, next_attempt_at);
+
+    -- batch1b (§5.1): durable release-deployment ledger, ISOLATED from
+    -- selfheal_jobs (opposite recovery semantics — claim-then-never-replay).
+    -- Idempotent PK = release_request_id; pre-claim (claimed_at set-once) is the
+    -- at-most-once deploy gate; receipt/checkpoint are set-once durable proofs.
+    CREATE TABLE IF NOT EXISTS selfheal_release_jobs (${SELFHEAL_RELEASE_JOBS_COLUMNS_DDL});
+    CREATE INDEX IF NOT EXISTS idx_selfheal_release_jobs_status
+      ON selfheal_release_jobs(status);
+
+    -- batch1b (§5.2): local Tier2 release fuse (single row, id = 1). Engaged on
+    -- deploy_unknown to block ANY new release claim locally BEFORE a callback
+    -- reaches PG; cleared only via the audited two-sided converge protocol.
+    CREATE TABLE IF NOT EXISTS selfheal_release_fuse (
+      id                 INTEGER PRIMARY KEY CHECK (id = 1),
+      engaged            INTEGER NOT NULL DEFAULT 0,
+      reason             TEXT,
+      release_request_id TEXT,
+      engaged_at         TEXT,
+      cleared_at         TEXT,
+      cleared_by         TEXT
+    );
+    INSERT OR IGNORE INTO selfheal_release_fuse (id, engaged) VALUES (1, 0);
   `)
 
   // Schema guard: rebuild selfheal_jobs when an old DB lacks 'cancelling' in the
@@ -289,6 +406,11 @@ export async function getSelfhealDb(): Promise<Database.Database> {
   ensureConditionKeyColumn(db)
   ensureTier1Columns(db)
   ensureCallbackFailedPhase(db)
+  ensureReleaseCallbackSchema(db)
+  // Partial unique indexes replace the legacy UNIQUE(repair_id, phase) TABLE
+  // constraint (batch1b). Created AFTER the guards so `release_request_id` is
+  // guaranteed to exist on both fresh and upgraded DBs.
+  db.exec(SELFHEAL_CALLBACK_OUTBOX_PARTIAL_INDEXES)
 
   // Periodic WAL checkpoint to bound WAL growth (mirrors sessionsDb.ts).
   _walTimer = setInterval(() => {
@@ -1112,12 +1234,26 @@ export async function overwriteBrokerActionResponse(
 
 // ── broker→master callback outbox (durable delivery — BLOCKER2) ──────────────
 
-export type SelfhealCallbackPhase = 'pending_release' | 'done' | 'failed'
+export type SelfhealCallbackPhase =
+  | 'pending_release'
+  | 'done'
+  | 'failed'
+  /** batch1b release phases. Wire transport still maps them (pending_release/
+   *  deploying → progress; deployed/done → done; deploy_failed/deploy_unknown/
+   *  manual_required/failed → failed); the release semantics live in detail. */
+  | 'deploying'
+  | 'deployed'
+  | 'deploy_failed'
+  | 'deploy_unknown'
+  | 'manual_required'
 export type SelfhealCallbackStatus = 'queued' | 'sent' | 'abandoned'
 
 export interface SelfhealCallbackRow {
   id: number
   repairId: string
+  /** batch1b: NULL for legacy repair-level callbacks; the release request id for
+   *  release callbacks (the master routes on it — see §4). */
+  releaseRequestId: string | null
   phase: SelfhealCallbackPhase
   message: string
   /** JSON-serialized detail OBJECT (the master requires an object detail). */
@@ -1137,6 +1273,7 @@ export const SELFHEAL_CALLBACK_BACKOFF_CAP_MS = 5 * 60_000
 interface CallbackOutboxDbRow {
   id: number
   repair_id: string
+  release_request_id: string | null
   phase: SelfhealCallbackPhase
   message: string
   detail_json: string
@@ -1151,6 +1288,7 @@ function rowToCallback(r: CallbackOutboxDbRow): SelfhealCallbackRow {
   return {
     id: r.id,
     repairId: r.repair_id,
+    releaseRequestId: r.release_request_id,
     phase: r.phase,
     message: r.message,
     detailJson: r.detail_json,
@@ -1203,26 +1341,64 @@ export async function terminalizeTier1WithCallback(input: {
       INSERT INTO selfheal_callback_outbox
         (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
       VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-      ON CONFLICT(repair_id, phase) DO NOTHING
+      ON CONFLICT(repair_id, phase) WHERE release_request_id IS NULL DO NOTHING
     `).run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
     return true
   })
   return txn()
 }
 
+/** The frozen fields of a release-job intake, shared by the standalone
+ *  {@link insertReleaseJobReceived} and the SAME-TRANSACTION insert inside
+ *  {@link commitBrokerOutcomeWithCallback} (R2-4: the auto-deploy enqueue is now
+ *  durable WITH the cutover commit, not a best-effort post-commit hook). The
+ *  transaction owns the `created_at`/`updated_at` clock. */
+export interface ReleaseJobInsertInput {
+  releaseRequestId: string
+  repairId: string
+  incidentId: string
+  payloadHash: string
+  approvedSha: string
+  baseSha?: string | null
+  deployPlanHash?: string | null
+  manifestHash?: string | null
+  planJson: string
+  origin?: SelfhealReleaseJobOrigin
+}
+
+/**
+ * Atomically commit a broker outcome and its durable side effects in ONE SQLite
+ * transaction (审计R2 BLOCKER + R2-4):
+ *   - `finalize` — CAS each claimed broker_action → committed (the outcome);
+ *   - `overwriteCommitted` — optional response overwrite of an already-committed
+ *     record (pending_release → deployed on a one-click release);
+ *   - `callback` — optional repair-level master callback (deduped on
+ *     (repair_id, phase) for release_request_id IS NULL);
+ *   - `releaseJobInsert` — optional local release job, PK-idempotent on
+ *     release_request_id (ON CONFLICT DO NOTHING → crash-replay safe). The auto
+ *     cutover uses this so "cutover committed ⟺ release job exists" holds across
+ *     a crash (no more "record present, job absent" post-commit window).
+ * Because everything runs in the single transaction, ANY failure (disk full, a
+ * malformed insert) rolls the WHOLE outcome back — the caller reports
+ * commit_failed and the claim stays held (fail-closed), never a half state.
+ */
 export async function commitBrokerOutcomeWithCallback(input: {
   finalize: { claimKey: string; response: string }[]
   overwriteCommitted?: { claimKey: string; response: string }
-  callback: {
+  callback?: {
     repairId: string
     phase: SelfhealCallbackPhase
     message: string
     detail: Record<string, unknown>
   }
+  releaseJobInsert?: ReleaseJobInsertInput
   now?: number
 }): Promise<void> {
   const db = await getSelfhealDb()
   const now = input.now ?? Date.now()
+  // The release_jobs ledger stores ISO-8601 TEXT timestamps (unlike the outbox's
+  // epoch-ms integers) — project the transaction clock accordingly.
+  const iso = new Date(now).toISOString()
   const txn = db.transaction(() => {
     for (const f of input.finalize) {
       db.prepare(
@@ -1234,47 +1410,118 @@ export async function commitBrokerOutcomeWithCallback(input: {
         "UPDATE broker_actions SET response = ?, updated_at = ? WHERE claim_key = ? AND status = 'committed'",
       ).run(input.overwriteCommitted.response, now, input.overwriteCommitted.claimKey)
     }
-    db.prepare(`
-      INSERT INTO selfheal_callback_outbox
-        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-      ON CONFLICT(repair_id, phase) DO NOTHING
-    `).run(
-      input.callback.repairId,
-      input.callback.phase,
-      input.callback.message,
-      JSON.stringify(input.callback.detail),
-      now,
-      now,
-      now,
-    )
+    if (input.callback) {
+      db.prepare(`
+        INSERT INTO selfheal_callback_outbox
+          (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+        ON CONFLICT(repair_id, phase) WHERE release_request_id IS NULL DO NOTHING
+      `).run(
+        input.callback.repairId,
+        input.callback.phase,
+        input.callback.message,
+        JSON.stringify(input.callback.detail),
+        now,
+        now,
+        now,
+      )
+    }
+    if (input.releaseJobInsert) {
+      const j = input.releaseJobInsert
+      // PK-idempotent on release_request_id: a crash-replayed cutover commit must
+      // NOT insert a second job. ON CONFLICT(release_request_id) DO NOTHING only
+      // swallows a PK re-hit — a genuinely malformed insert (NOT NULL/CHECK) still
+      // throws and rolls the whole transaction back (atomicity preserved).
+      const ins = db.prepare(`
+        INSERT INTO selfheal_release_jobs
+          (release_request_id, repair_id, incident_id, payload_hash, status, approved_sha,
+           base_sha, deploy_plan_hash, manifest_hash, plan_json, origin, created_at, updated_at)
+        VALUES (@rrid, @repairId, @incidentId, @payloadHash, 'received', @approvedSha,
+                @baseSha, @deployPlanHash, @manifestHash, @planJson, @origin, @iso, @iso)
+        ON CONFLICT(release_request_id) DO NOTHING
+      `).run({
+        rrid: j.releaseRequestId,
+        repairId: j.repairId,
+        incidentId: j.incidentId,
+        payloadHash: j.payloadHash,
+        approvedSha: j.approvedSha,
+        baseSha: j.baseSha ?? null,
+        deployPlanHash: j.deployPlanHash ?? null,
+        manifestHash: j.manifestHash ?? null,
+        planJson: j.planJson,
+        origin: j.origin ?? 'auto',
+        iso,
+      })
+      // R3-3: the conflict path must be an EXACT replay, not a same-rrid different-
+      // content collision — re-read the surviving row and verify the identity
+      // fields; a mismatch poisons the commit (throw → the whole cutover finalize
+      // rolls back and the claim stays held for human inspection).
+      if (ins.changes === 0) {
+        const existing = db
+          .prepare(
+            `SELECT repair_id, payload_hash, approved_sha FROM selfheal_release_jobs
+              WHERE release_request_id = ?`,
+          )
+          .get(j.releaseRequestId) as
+          | { repair_id: string; payload_hash: string; approved_sha: string }
+          | undefined
+        if (
+          !existing ||
+          existing.repair_id !== j.repairId ||
+          existing.payload_hash !== j.payloadHash ||
+          existing.approved_sha !== j.approvedSha
+        ) {
+          throw new Error(
+            `selfheal release job rrid conflict is not an exact replay (rrid=${j.releaseRequestId})`,
+          )
+        }
+      }
+    }
   })
   txn()
 }
 
 /**
- * Idempotently enqueue a broker→master callback. UNIQUE(repair_id, phase) +
- * ON CONFLICT DO NOTHING: a crash-re-driven cutover/release can call this again
- * without producing a duplicate delivery. Returns true when THIS call inserted
- * the row.
+ * Idempotently enqueue a broker→master callback. Two idempotency keys, selected
+ * by whether `releaseRequestId` is present:
+ *   - absent/NULL → legacy repair-level callback, deduped on (repair_id, phase)
+ *     under the `ux_cb_repair_phase` partial index (release_request_id IS NULL);
+ *   - present     → batch1b release callback, deduped on (release_request_id,
+ *     phase) under `ux_cb_release_phase` — so a repair's per-release callbacks
+ *     coexist without colliding on the legacy repair key.
+ * ON CONFLICT DO NOTHING keeps a crash-re-driven cutover/release from producing
+ * a duplicate delivery. Returns true when THIS call inserted the row.
  */
 export async function enqueueCallback(input: {
   repairId: string
   phase: SelfhealCallbackPhase
   message: string
   detail: Record<string, unknown>
+  releaseRequestId?: string | null
   now?: number
 }): Promise<boolean> {
   const db = await getSelfhealDb()
   const now = input.now ?? Date.now()
-  const res = db
-    .prepare(`
-      INSERT INTO selfheal_callback_outbox
-        (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-      ON CONFLICT(repair_id, phase) DO NOTHING
-    `)
-    .run(input.repairId, input.phase, input.message, JSON.stringify(input.detail), now, now, now)
+  const rrid = input.releaseRequestId ?? null
+  const detailJson = JSON.stringify(input.detail)
+  const res =
+    rrid === null
+      ? db
+          .prepare(`
+            INSERT INTO selfheal_callback_outbox
+              (repair_id, release_request_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+            VALUES (?, NULL, ?, ?, ?, 'queued', 0, ?, ?, ?)
+            ON CONFLICT(repair_id, phase) WHERE release_request_id IS NULL DO NOTHING
+          `)
+          .run(input.repairId, input.phase, input.message, detailJson, now, now, now)
+      : db
+          .prepare(`
+            INSERT INTO selfheal_callback_outbox
+              (repair_id, release_request_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+            ON CONFLICT(release_request_id, phase) WHERE release_request_id IS NOT NULL DO NOTHING
+          `)
+          .run(input.repairId, rrid, input.phase, input.message, detailJson, now, now, now)
   return res.changes > 0
 }
 
@@ -1368,4 +1615,527 @@ export async function listCallbacksForRepair(repairId: string): Promise<Selfheal
     .prepare('SELECT * FROM selfheal_callback_outbox WHERE repair_id = ? ORDER BY id ASC')
     .all(repairId) as CallbackOutboxDbRow[]
   return rows.map(rowToCallback)
+}
+
+// ── Release jobs (batch1b Tier2 code self-heal:放行→部署) ─────────────────────
+//
+// A DEDICATED ledger (§5.1), never mixed into selfheal_jobs: a release deploy is
+// "claim → NEVER replay" while selfheal_jobs is "claim → re-claim/redrive on
+// crash" — the generic reclaimer must never touch these rows. Every mutation is
+// a set-once / CAS write in a transaction, mirroring claimJobTier1 /
+// setJobTier1Receipt / terminalizeTier1WithCallback. All timestamps are ISO-8601
+// TEXT (contract §5.1 DDL); the callback outbox keeps its epoch-integer clock, so
+// the two-table writes carry both an ISO string and its epoch-ms projection.
+
+export type SelfhealReleaseJobStatus =
+  | 'received'
+  | 'deploying'
+  | 'deployed'
+  | 'deploy_failed'
+  | 'deploy_unknown'
+  | 'manual_required'
+  | 'cancelled'
+
+export type SelfhealReleaseJobOrigin = 'v5' | 'breakglass' | 'auto'
+
+/** The four terminal deploy phases that carry a callback (deployed → done wire;
+ *  deploy_failed/deploy_unknown/manual_required → failed wire). `cancelled` is a
+ *  terminal status too but is reached via {@link cancelReleaseJob} with NO
+ *  callback (the master initiated the cancel and already knows). */
+export type SelfhealReleaseTerminalPhase =
+  | 'deployed'
+  | 'deploy_failed'
+  | 'deploy_unknown'
+  | 'manual_required'
+
+const RELEASE_TERMINAL_STATUSES: SelfhealReleaseJobStatus[] = [
+  'deployed',
+  'deploy_failed',
+  'deploy_unknown',
+  'manual_required',
+  'cancelled',
+]
+
+export interface SelfhealReleaseJob {
+  releaseRequestId: string
+  repairId: string
+  incidentId: string
+  payloadHash: string
+  status: SelfhealReleaseJobStatus
+  approvedSha: string
+  baseSha: string | null
+  deployPlanHash: string | null
+  manifestHash: string | null
+  /** Full deploy plan frozen at intake from the LOCAL durable cutover record
+   *  (§7): surfaces / deployArgs / manualReasons / hashes + changedFiles. */
+  planJson: string
+  origin: SelfhealReleaseJobOrigin
+  /** Pre-claim timestamp (set-once): the at-most-once deploy gate. */
+  claimedAt: string | null
+  /** systemd transient scope unit name (leftover-process identification). */
+  scopeUnit: string | null
+  /** Set-once terminal receipt JSON (§8.2). */
+  receiptJson: string | null
+  /** Set-once durable checkpoint JSON (§9): the ONLY token that lets recovery
+   *  "retry push only" instead of deploy_unknown. */
+  checkpointJson: string | null
+  canonicalPushedAt: string | null
+  failureReason: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+interface ReleaseJobRow {
+  release_request_id: string
+  repair_id: string
+  incident_id: string
+  payload_hash: string
+  status: SelfhealReleaseJobStatus
+  approved_sha: string
+  base_sha: string | null
+  deploy_plan_hash: string | null
+  manifest_hash: string | null
+  plan_json: string
+  origin: SelfhealReleaseJobOrigin
+  claimed_at: string | null
+  scope_unit: string | null
+  receipt_json: string | null
+  checkpoint_json: string | null
+  canonical_pushed_at: string | null
+  failure_reason: string | null
+  created_at: string
+  updated_at: string
+}
+
+function rowToReleaseJob(r: ReleaseJobRow): SelfhealReleaseJob {
+  return {
+    releaseRequestId: r.release_request_id,
+    repairId: r.repair_id,
+    incidentId: r.incident_id,
+    payloadHash: r.payload_hash,
+    status: r.status,
+    approvedSha: r.approved_sha,
+    baseSha: r.base_sha,
+    deployPlanHash: r.deploy_plan_hash,
+    manifestHash: r.manifest_hash,
+    planJson: r.plan_json,
+    origin: r.origin,
+    claimedAt: r.claimed_at,
+    scopeUnit: r.scope_unit,
+    receiptJson: r.receipt_json,
+    checkpointJson: r.checkpoint_json,
+    canonicalPushedAt: r.canonical_pushed_at,
+    failureReason: r.failure_reason,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function isoNow(now?: string): string {
+  return now ?? new Date().toISOString()
+}
+
+/** Project an ISO timestamp to the outbox's epoch-ms clock (falls back to
+ *  wall-clock if the ISO string is unparseable — never NaN into the DB). */
+function isoToEpochMs(iso: string): number {
+  const ms = Date.parse(iso)
+  return Number.isNaN(ms) ? Date.now() : ms
+}
+
+export type InsertReleaseJobResult =
+  | { outcome: 'inserted'; job: SelfhealReleaseJob }
+  | { outcome: 'duplicate'; job: SelfhealReleaseJob } // same rrid + same payload_hash
+  | { outcome: 'conflict'; job: SelfhealReleaseJob } // same rrid, DIFFERENT payload_hash
+
+/**
+ * Durably record a release request at intake (§3.1 step 4). The receiver has
+ * ALREADY re-verified the frozen fields against the LOCAL durable cutover record
+ * and passes them here — the store is the single durable authority for the job,
+ * not the webhook. Idempotent on release_request_id (PK): a re-delivery with the
+ * same payload_hash → duplicate (202); a different payload_hash → conflict (409).
+ * The read-check-insert runs in one transaction against concurrent redelivery.
+ */
+export async function insertReleaseJobReceived(input: {
+  releaseRequestId: string
+  repairId: string
+  incidentId: string
+  payloadHash: string
+  approvedSha: string
+  baseSha?: string | null
+  deployPlanHash?: string | null
+  manifestHash?: string | null
+  planJson: string
+  origin?: SelfhealReleaseJobOrigin
+  now?: string
+}): Promise<InsertReleaseJobResult> {
+  const db = await getSelfhealDb()
+  const now = isoNow(input.now)
+  const txn = db.transaction((): InsertReleaseJobResult => {
+    const existing = db
+      .prepare('SELECT * FROM selfheal_release_jobs WHERE release_request_id = ?')
+      .get(input.releaseRequestId) as ReleaseJobRow | undefined
+    if (existing) {
+      const job = rowToReleaseJob(existing)
+      if (existing.payload_hash === input.payloadHash) return { outcome: 'duplicate', job }
+      return { outcome: 'conflict', job }
+    }
+    db.prepare(`
+      INSERT INTO selfheal_release_jobs
+        (release_request_id, repair_id, incident_id, payload_hash, status, approved_sha,
+         base_sha, deploy_plan_hash, manifest_hash, plan_json, origin, created_at, updated_at)
+      VALUES (@rrid, @repairId, @incidentId, @payloadHash, 'received', @approvedSha,
+              @baseSha, @deployPlanHash, @manifestHash, @planJson, @origin, @now, @now)
+    `).run({
+      rrid: input.releaseRequestId,
+      repairId: input.repairId,
+      incidentId: input.incidentId,
+      payloadHash: input.payloadHash,
+      approvedSha: input.approvedSha,
+      baseSha: input.baseSha ?? null,
+      deployPlanHash: input.deployPlanHash ?? null,
+      manifestHash: input.manifestHash ?? null,
+      planJson: input.planJson,
+      origin: input.origin ?? 'v5',
+      now,
+    })
+    const inserted = db
+      .prepare('SELECT * FROM selfheal_release_jobs WHERE release_request_id = ?')
+      .get(input.releaseRequestId) as ReleaseJobRow
+    return { outcome: 'inserted', job: rowToReleaseJob(inserted) }
+  })
+  return txn()
+}
+
+export type ClaimReleaseJobResult =
+  | { outcome: 'claimed'; job: SelfhealReleaseJob }
+  /** Another release is already 'deploying' host-wide (global singleflight) —
+   *  the caller must NOT claim; retry when the in-flight deploy settles. */
+  | { outcome: 'busy' }
+  /** This job is not claimable (already claimed / terminal / cancelled / absent
+   *  / not 'received'). The pre-claim CAS lost — nothing was mutated. */
+  | { outcome: 'noop' }
+
+/**
+ * Atomic pre-claim (§8 step 3): CAS `received & claimed_at IS NULL` →
+ * `deploying + claimed_at + scope_unit`, GATED by a GLOBAL singleflight — if ANY
+ * OTHER row is already 'deploying', return `busy` and mutate nothing (at most one
+ * host-wide deploy in flight, honoring the single production-mutation lease).
+ * When `deployingCallback` is supplied, the winning claim ALSO enqueues the
+ * 'deploying' progress callback in the SAME transaction (idempotent on
+ * (release_request_id, phase)), so the master's `accepted → deploying` progress
+ * can never be lost between a durable claim and a separate enqueue commit. Only
+ * the claim WINNER enqueues; a `noop`/`busy` never does.
+ */
+export async function claimReleaseJob(input: {
+  releaseRequestId: string
+  scopeUnit: string
+  deployingCallback?: { repairId: string; message: string; detail: Record<string, unknown> }
+  now?: string
+}): Promise<ClaimReleaseJobResult> {
+  const db = await getSelfhealDb()
+  const now = isoNow(input.now)
+  const nowMs = isoToEpochMs(now)
+  const txn = db.transaction((): ClaimReleaseJobResult => {
+    const other = db
+      .prepare(
+        "SELECT release_request_id FROM selfheal_release_jobs WHERE status = 'deploying' AND release_request_id != ? LIMIT 1",
+      )
+      .get(input.releaseRequestId) as { release_request_id: string } | undefined
+    if (other) return { outcome: 'busy' }
+    const cas = db
+      .prepare(`
+        UPDATE selfheal_release_jobs
+        SET status = 'deploying', claimed_at = @now, scope_unit = @scopeUnit, updated_at = @now
+        WHERE release_request_id = @rrid AND status = 'received' AND claimed_at IS NULL
+      `)
+      .run({ now, scopeUnit: input.scopeUnit, rrid: input.releaseRequestId })
+    if (cas.changes === 0) return { outcome: 'noop' }
+    if (input.deployingCallback) {
+      db.prepare(`
+        INSERT INTO selfheal_callback_outbox
+          (repair_id, release_request_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+        VALUES (?, ?, 'deploying', ?, ?, 'queued', 0, ?, ?, ?)
+        ON CONFLICT(release_request_id, phase) WHERE release_request_id IS NOT NULL DO NOTHING
+      `).run(
+        input.deployingCallback.repairId,
+        input.releaseRequestId,
+        input.deployingCallback.message,
+        JSON.stringify(input.deployingCallback.detail),
+        nowMs,
+        nowMs,
+        nowMs,
+      )
+    }
+    const row = db
+      .prepare('SELECT * FROM selfheal_release_jobs WHERE release_request_id = ?')
+      .get(input.releaseRequestId) as ReleaseJobRow
+    return { outcome: 'claimed', job: rowToReleaseJob(row) }
+  })
+  return txn()
+}
+
+/** Set-once durable checkpoint (§9 deploy_effect_applied). Returns false if a
+ *  checkpoint already exists — the first (post-proof) write is authoritative and
+ *  is never overwritten. */
+export async function setReleaseJobCheckpoint(
+  releaseRequestId: string,
+  checkpointJson: string,
+  now?: string,
+): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(now)
+  const res = db
+    .prepare(
+      'UPDATE selfheal_release_jobs SET checkpoint_json = ?, updated_at = ? WHERE release_request_id = ? AND checkpoint_json IS NULL',
+    )
+    .run(checkpointJson, iso, releaseRequestId)
+  return res.changes > 0
+}
+
+/**
+ * Set-once terminal receipt (§8.2), then READ BACK and return the LANDED value
+ * (single-authority discipline, aligning with setJobTier1Receipt): a caller that
+ * LOST the set-once race still learns the AUTHORITATIVE receipt that is durably
+ * stored, never its own rejected write. `applied` tells the caller whether THIS
+ * call won. Both the CAS and the read-back run in one transaction.
+ */
+export async function setReleaseJobReceipt(
+  releaseRequestId: string,
+  receiptJson: string,
+  now?: string,
+): Promise<{ applied: boolean; receiptJson: string | null }> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(now)
+  const txn = db.transaction((): { applied: boolean; receiptJson: string | null } => {
+    const res = db
+      .prepare(
+        'UPDATE selfheal_release_jobs SET receipt_json = ?, updated_at = ? WHERE release_request_id = ? AND receipt_json IS NULL',
+      )
+      .run(receiptJson, iso, releaseRequestId)
+    const row = db
+      .prepare('SELECT receipt_json FROM selfheal_release_jobs WHERE release_request_id = ?')
+      .get(releaseRequestId) as { receipt_json: string | null } | undefined
+    return { applied: res.changes > 0, receiptJson: row?.receipt_json ?? null }
+  })
+  return txn()
+}
+
+/**
+ * ATOMICALLY terminalize a release job AND enqueue its terminal callback in ONE
+ * transaction (mirrors terminalizeTier1WithCallback). The CAS gates the enqueue:
+ * if the job is no longer in `fromStatuses` (a cancel or a prior terminal won),
+ * NOTHING is enqueued and this returns false. The callback phase equals the
+ * terminal status (deployed/deploy_failed/deploy_unknown/manual_required); the
+ * outbox row is idempotent per (release_request_id, phase). `failureReason` is
+ * persisted onto the row (also usable to stamp `canonical_push_pending` on a
+ * deployed terminal — §8.2).
+ */
+export async function terminalizeReleaseJobWithCallback(input: {
+  releaseRequestId: string
+  repairId: string
+  fromStatuses: SelfhealReleaseJobStatus[]
+  toStatus: SelfhealReleaseTerminalPhase
+  message: string
+  detail: Record<string, unknown>
+  failureReason?: string | null
+  now?: string
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(input.now)
+  const nowMs = isoToEpochMs(iso)
+  const placeholders = input.fromStatuses.map(() => '?').join(',')
+  const txn = db.transaction((): boolean => {
+    const cas = db
+      .prepare(
+        `UPDATE selfheal_release_jobs SET status = ?, failure_reason = ?, updated_at = ? WHERE release_request_id = ? AND status IN (${placeholders})`,
+      )
+      .run(input.toStatus, input.failureReason ?? null, iso, input.releaseRequestId, ...input.fromStatuses)
+    if (cas.changes === 0) return false // a cancel (or prior terminal) won — no callback
+    db.prepare(`
+      INSERT INTO selfheal_callback_outbox
+        (repair_id, release_request_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      ON CONFLICT(release_request_id, phase) WHERE release_request_id IS NOT NULL DO NOTHING
+    `).run(
+      input.repairId,
+      input.releaseRequestId,
+      input.toStatus,
+      input.message,
+      JSON.stringify(input.detail),
+      nowMs,
+      nowMs,
+      nowMs,
+    )
+    return true
+  })
+  return txn()
+}
+
+export type CancelReleaseJobResult = 'cancelled' | 'too_late' | 'idempotent' | 'not_found'
+
+/**
+ * Cancel a release job by release_request_id (§3.2). Three defined outcomes plus
+ * not_found:
+ *   - 'received' & NOT pre-claimed → CAS to 'cancelled' → 'cancelled' (200);
+ *   - claimed but not yet terminal ('deploying') → 'too_late' (409 — the receipt
+ *     adjudicates the real outcome);
+ *   - already terminal → 'idempotent' (200);
+ *   - no such row → 'not_found' (caller decides the HTTP mapping).
+ * The read-decide-CAS runs in one transaction so a concurrent claim cannot slip
+ * between the read and the cancel.
+ */
+export async function cancelReleaseJob(
+  releaseRequestId: string,
+  now?: string,
+): Promise<CancelReleaseJobResult> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(now)
+  const txn = db.transaction((): CancelReleaseJobResult => {
+    const row = db
+      .prepare('SELECT status, claimed_at FROM selfheal_release_jobs WHERE release_request_id = ?')
+      .get(releaseRequestId) as { status: SelfhealReleaseJobStatus; claimed_at: string | null } | undefined
+    if (!row) return 'not_found'
+    if (RELEASE_TERMINAL_STATUSES.includes(row.status)) return 'idempotent'
+    if (row.status === 'received' && row.claimed_at === null) {
+      db.prepare(
+        "UPDATE selfheal_release_jobs SET status = 'cancelled', updated_at = ? WHERE release_request_id = ? AND status = 'received' AND claimed_at IS NULL",
+      ).run(iso, releaseRequestId)
+      return 'cancelled'
+    }
+    return 'too_late' // 'deploying' (pre-claimed) — receipt adjudicates
+  })
+  return txn()
+}
+
+/** Set-once record that the approved SHA was fast-forward pushed to canonical
+ *  (§8 step 5 / §4.2 ⑥). Returns false if already stamped. */
+export async function markReleaseJobCanonicalPushed(
+  releaseRequestId: string,
+  now?: string,
+): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(now)
+  const res = db
+    .prepare(
+      'UPDATE selfheal_release_jobs SET canonical_pushed_at = ?, updated_at = ? WHERE release_request_id = ? AND canonical_pushed_at IS NULL',
+    )
+    .run(iso, iso, releaseRequestId)
+  return res.changes > 0
+}
+
+/** Update the observability failure_reason on a release job (e.g. stamp
+ *  'canonical_push_pending' after a deployed terminal whose canonical push kept
+ *  failing — §8.2). Not set-once: it tracks the evolving push state. */
+export async function setReleaseJobFailureReason(
+  releaseRequestId: string,
+  failureReason: string,
+  now?: string,
+): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(now)
+  const res = db
+    .prepare(
+      'UPDATE selfheal_release_jobs SET failure_reason = ?, updated_at = ? WHERE release_request_id = ?',
+    )
+    .run(failureReason, iso, releaseRequestId)
+  return res.changes > 0
+}
+
+export async function getReleaseJob(releaseRequestId: string): Promise<SelfhealReleaseJob | null> {
+  const db = await getSelfhealDb()
+  const row = db
+    .prepare('SELECT * FROM selfheal_release_jobs WHERE release_request_id = ?')
+    .get(releaseRequestId) as ReleaseJobRow | undefined
+  return row ? rowToReleaseJob(row) : null
+}
+
+/** List release jobs in any of the given states (worker sweep / ops). */
+export async function listReleaseJobsByStatus(
+  statuses: SelfhealReleaseJobStatus[],
+): Promise<SelfhealReleaseJob[]> {
+  if (statuses.length === 0) return []
+  const db = await getSelfhealDb()
+  const placeholders = statuses.map(() => '?').join(',')
+  const rows = db
+    .prepare(
+      `SELECT * FROM selfheal_release_jobs WHERE status IN (${placeholders}) ORDER BY created_at ASC`,
+    )
+    .all(...statuses) as ReleaseJobRow[]
+  return rows.map(rowToReleaseJob)
+}
+
+// ── Release fuse (batch1b §5.2: local Tier2 deploy circuit breaker) ───────────
+
+export interface SelfhealReleaseFuse {
+  engaged: boolean
+  reason: string | null
+  releaseRequestId: string | null
+  engagedAt: string | null
+  clearedAt: string | null
+  clearedBy: string | null
+}
+
+interface ReleaseFuseRow {
+  engaged: number
+  reason: string | null
+  release_request_id: string | null
+  engaged_at: string | null
+  cleared_at: string | null
+  cleared_by: string | null
+}
+
+/** Read the single fuse row (id=1). Seeded on DB open, so it always exists. */
+export async function getReleaseFuse(): Promise<SelfhealReleaseFuse> {
+  const db = await getSelfhealDb()
+  const r = db
+    .prepare(
+      'SELECT engaged, reason, release_request_id, engaged_at, cleared_at, cleared_by FROM selfheal_release_fuse WHERE id = 1',
+    )
+    .get() as ReleaseFuseRow | undefined
+  return {
+    engaged: (r?.engaged ?? 0) === 1,
+    reason: r?.reason ?? null,
+    releaseRequestId: r?.release_request_id ?? null,
+    engagedAt: r?.engaged_at ?? null,
+    clearedAt: r?.cleared_at ?? null,
+    clearedBy: r?.cleared_by ?? null,
+  }
+}
+
+/** Engage the local Tier2 fuse (idempotent CAS engaged 0→1): records reason +
+ *  rrid + time and clears any prior clear stamp. Returns true only for the call
+ *  that flipped it — an already-engaged fuse is a no-op (keeps the ORIGINAL
+ *  reason/rrid, the first cause of the halt). */
+export async function engageReleaseFuse(input: {
+  reason: string
+  releaseRequestId?: string | null
+  now?: string
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(input.now)
+  const res = db
+    .prepare(`
+      UPDATE selfheal_release_fuse
+      SET engaged = 1, reason = ?, release_request_id = ?, engaged_at = ?, cleared_at = NULL, cleared_by = NULL
+      WHERE id = 1 AND engaged = 0
+    `)
+    .run(input.reason, input.releaseRequestId ?? null, iso)
+  return res.changes > 0
+}
+
+/** Clear the local Tier2 fuse (idempotent CAS engaged 1→0): records cleared_by +
+ *  time, preserving reason/rrid as the audit trail of what was cleared. Returns
+ *  true only for the call that flipped it. */
+export async function clearReleaseFuse(input: {
+  clearedBy: string
+  now?: string
+}): Promise<boolean> {
+  const db = await getSelfhealDb()
+  const iso = isoNow(input.now)
+  const res = db
+    .prepare(
+      'UPDATE selfheal_release_fuse SET engaged = 0, cleared_at = ?, cleared_by = ? WHERE id = 1 AND engaged = 1',
+    )
+    .run(iso, input.clearedBy)
+  return res.changes > 0
 }

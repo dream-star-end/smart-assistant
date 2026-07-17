@@ -27,9 +27,12 @@ const {
   claimNextJob,
   claimQueuedTurn,
   closeSelfhealDb,
+  commitBrokerOutcomeWithCallback,
   enqueueCallback,
   enqueueExecution,
   getBrokerAction,
+  getReleaseJob,
+  getSelfhealDb,
   getExecution,
   getJob,
   insertCancelTombstone,
@@ -695,5 +698,98 @@ describe('broker action record read/overwrite (release path, block C)', () => {
     })
     assert.equal(await overwriteBrokerActionResponse(kc, '{"status":"deployed"}'), false)
     assert.equal((await getBrokerAction(kc))?.response, null)
+  })
+})
+
+describe('commitBrokerOutcomeWithCallback — atomic cutover commit + release-job insert (R2-4)', () => {
+  const SHA = 'a'.repeat(40)
+  const rj = (rrid: string) => ({
+    releaseRequestId: rrid,
+    repairId: 'r4',
+    incidentId: 'i4',
+    payloadHash: 'ph4',
+    approvedSha: SHA,
+    baseSha: 'b'.repeat(40),
+    deployPlanHash: 'p'.repeat(64),
+    manifestHash: 'm'.repeat(64),
+    planJson: JSON.stringify({ classification: { surfaces: ['web'], manual: [] } }),
+    origin: 'auto' as const,
+  })
+  const queued = JSON.stringify({ ok: true, status: 'queued' })
+
+  it('commit ⟹ BOTH the cutover broker_action is committed AND the release job exists', async () => {
+    const k = 'r4a:cutover'
+    await tryClaimBrokerAction({ claimKey: k, repairId: 'r4', actionKind: 'cutover', paramsHash: 'h' })
+    await commitBrokerOutcomeWithCallback({
+      finalize: [{ claimKey: k, response: queued }],
+      releaseJobInsert: rj('r4a-rrid'),
+    })
+    assert.equal((await getBrokerAction(k))?.status, 'committed')
+    assert.equal(JSON.parse((await getBrokerAction(k))?.response ?? '{}').status, 'queued')
+    const job = await getReleaseJob('r4a-rrid')
+    assert.equal(job?.status, 'received')
+    assert.equal(job?.origin, 'auto')
+    assert.equal(job?.approvedSha, SHA)
+  })
+
+  it('a crash inside the txn (malformed insert) rolls BOTH back — cutover NOT committed, no job', async () => {
+    const k = 'r4b:cutover'
+    await tryClaimBrokerAction({ claimKey: k, repairId: 'r4', actionKind: 'cutover', paramsHash: 'h' })
+    // Inject a constraint violation (bad `origin` — CHECK is v5|breakglass|auto)
+    // AFTER the finalize UPDATE in the same transaction → the whole txn rolls back.
+    await assert.rejects(
+      commitBrokerOutcomeWithCallback({
+        finalize: [{ claimKey: k, response: queued }],
+        releaseJobInsert: { ...rj('r4b-rrid'), origin: 'CRASH_INJECT' as unknown as 'auto' },
+      }),
+    )
+    // Atomic: the broker_action stays 'claimed' (not committed) and NO job exists.
+    assert.equal((await getBrokerAction(k))?.status, 'claimed')
+    assert.equal((await getBrokerAction(k))?.response, null)
+    assert.equal(await getReleaseJob('r4b-rrid'), null)
+  })
+
+  it('a replayed cutover commit does NOT insert a second job (PK-idempotent, replay-safe)', async () => {
+    const k = 'r4c:cutover'
+    await tryClaimBrokerAction({ claimKey: k, repairId: 'r4', actionKind: 'cutover', paramsHash: 'h' })
+    await commitBrokerOutcomeWithCallback({
+      finalize: [{ claimKey: k, response: queued }],
+      releaseJobInsert: rj('r4c-rrid'),
+    })
+    // Re-drive the SAME commit (crash-replay): finalize is a no-op (already
+    // committed) and the release-job insert hits ON CONFLICT(rrid) DO NOTHING.
+    await commitBrokerOutcomeWithCallback({
+      finalize: [{ claimKey: k, response: queued }],
+      releaseJobInsert: rj('r4c-rrid'),
+    })
+    const db = await getSelfhealDb()
+    const n = (
+      db.prepare('SELECT COUNT(*) n FROM selfheal_release_jobs WHERE release_request_id = ?').get('r4c-rrid') as { n: number }
+    ).n
+    assert.equal(n, 1, 'PK-idempotent: the replay inserts no duplicate')
+  })
+
+  it('R3-3: a same-rrid DIFFERENT-content conflict poisons the commit (throws, full rollback)', async () => {
+    const k1 = 'r4d:cutover'
+    await tryClaimBrokerAction({ claimKey: k1, repairId: 'r4', actionKind: 'cutover', paramsHash: 'h' })
+    await commitBrokerOutcomeWithCallback({
+      finalize: [{ claimKey: k1, response: queued }],
+      releaseJobInsert: rj('r4d-rrid'),
+    })
+    // A second commit reusing the SAME rrid but different identity fields must NOT
+    // be silently swallowed as a replay — it would associate the cutover with an
+    // unrelated existing job. The whole finalize rolls back (claim stays held).
+    const k2 = 'r4e:cutover'
+    await tryClaimBrokerAction({ claimKey: k2, repairId: 'r4e', actionKind: 'cutover', paramsHash: 'h' })
+    await assert.rejects(
+      commitBrokerOutcomeWithCallback({
+        finalize: [{ claimKey: k2, response: queued }],
+        releaseJobInsert: { ...rj('r4d-rrid'), repairId: 'r4e', payloadHash: 'ph-DIFFERENT' },
+      }),
+      /not an exact replay/,
+    )
+    assert.equal((await getBrokerAction(k2))?.status, 'claimed', 'poisoned commit fully rolled back')
+    const job = await getReleaseJob('r4d-rrid')
+    assert.equal(job?.repairId, 'r4', 'the surviving job is untouched')
   })
 })
