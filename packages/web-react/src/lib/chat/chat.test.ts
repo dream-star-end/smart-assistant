@@ -3450,6 +3450,59 @@ describe("applyServerMessages 版本护栏", () => {
     sock.stop();
   });
 
+  test("免单事务推进版本后，晚到的免单前 full 被整体拒绝", () => {
+    const sock = makeSocket();
+    const applied = {
+      ...srvRow("srv-waived", 2, 201),
+      usage: { costCredits: "259", waived: true },
+    };
+    sock.applyServerMessages("s1", "main", [applied], true, 2, { serverUpdatedAt: 201 });
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [{ ...srvRow("srv-waived", 2, 200), usage: { costCredits: "259" } }],
+      true,
+      2,
+      { serverUpdatedAt: 200 },
+    );
+    const message = sock.sessions.get("s1")!.messages.find((m) => m.id === "srv-waived")!;
+    expect(message.text).toBe("v201");
+    expect(message.usage?.waived).toBe(true);
+    sock.stop();
+  });
+
+  test("live 免单先到时，同版本旧 full 可更新其他字段但不能撤销 waived", () => {
+    const sock = makeSocket();
+    const turnKey = "d".repeat(64);
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [{ ...srvRow("srv-waived", 2, 200), _turnKey: turnKey, usage: { costCredits: "259" } }],
+      true,
+      2,
+      { serverUpdatedAt: 200 },
+    );
+    const session = sock.sessions.get("s1")!;
+    applyCostWaived(session, {
+      type: "outbound.cost_waived",
+      sessionId: "s1",
+      turnKey,
+      refundedCredits: "259",
+    });
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [{ ...srvRow("srv-waived", 2, 199), _turnKey: turnKey, usage: { costCredits: "300" } }],
+      true,
+      2,
+      { serverUpdatedAt: 200 },
+    );
+    const message = session.messages.find((m) => m.id === "srv-waived")!;
+    expect(message.text).toBe("v199");
+    expect(message.usage).toEqual({ costCredits: "300", waived: true });
+    sock.stop();
+  });
+
   test("等于/高于水位的载荷正常应用,水位随 full 与增量共同推进", () => {
     const sock = makeSocket();
     sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 200)], true, 2, { serverUpdatedAt: 200 });

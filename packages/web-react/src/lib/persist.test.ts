@@ -204,6 +204,39 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.find((m) => m.id === "c")!.text).toBe("L-c"); // 乐观尾保留
   });
 
+  test("waived=true 在 full/incremental 同 id 合并中不可逆，其余字段仍 server-wins", () => {
+    const localWaived: ChatMessage = {
+      id: "srv-waived",
+      role: "assistant",
+      text: "local",
+      ts: 1,
+      usage: { costCredits: "259", waived: true },
+    };
+    const serverBeforeWaiver: ChatMessage = {
+      id: "srv-waived",
+      role: "assistant",
+      text: "server-full",
+      ts: 1,
+      usage: { costCredits: "300" },
+    };
+    const full = mergeFullServerWins([serverBeforeWaiver], [localWaived]);
+    expect(full[0].text).toBe("server-full");
+    expect(full[0].usage).toEqual({ costCredits: "300", waived: true });
+
+    const incremental = applyServerIncremental(
+      [localWaived],
+      [{ ...serverBeforeWaiver, text: "server-incremental", usage: { costCredits: "301", waived: false } }],
+    );
+    expect(incremental[0].text).toBe("server-incremental");
+    expect(incremental[0].usage).toEqual({ costCredits: "301", waived: true });
+
+    const serverUpgrade = applyServerIncremental(
+      [{ ...localWaived, usage: { costCredits: "259", waived: false } }],
+      [{ ...serverBeforeWaiver, usage: { costCredits: "259", waived: true } }],
+    );
+    expect(serverUpgrade[0].usage?.waived).toBe(true);
+  });
+
   test("mergeFullServerWins: 丢弃历史中段的 local-only 陈旧消息（不在尾部）", () => {
     const server = [msg("a", "S-a"), msg("b", "S-b")];
     // stale 在中段（其后还有 server 认识的 b）→ 视为陈旧丢弃；末尾无本地独有 → 纯 server。
