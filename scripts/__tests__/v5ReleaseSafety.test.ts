@@ -176,7 +176,7 @@ describe('v5 release safety lanes', () => {
     )
   })
 
-  test('Knowledge Planet setup-first deploy is one-shot, race-guarded, and skips the v1.1 seed', async () => {
+  test('Knowledge Planet setup-first deploy is race-guarded, repeat-safe, and skips the v1.1 seed', async () => {
     const [source, seedSource] = await Promise.all([
       readFile(deploy, 'utf8'),
       readFile(knowledgePlanetSeed, 'utf8'),
@@ -188,6 +188,10 @@ describe('v5 release safety lanes', () => {
     const pre = body.indexOf(
       'knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre',
     )
+    const capturedVersion = body.indexOf(
+      'kp_setup_plugin_version_id="$KNOWLEDGE_PLANET_SETUP_VERSION_ID"',
+      pre,
+    )
     const close = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const post = body.indexOf(
@@ -196,7 +200,7 @@ describe('v5 release safety lanes', () => {
     const smoke = body.indexOf('smoke "$ACTIVE_PORT"', post)
     const dist = body.indexOf('dist_handshake_smoke "$ACTIVE_PORT"', smoke)
     const reopen = body.indexOf(
-      'knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"',
+      'knowledge_planet_plugin_open_setup_first_gate_to_version',
       dist,
     )
     const setupDone = body.indexOf('knowledge-planet=setup-first', reopen)
@@ -205,7 +209,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(
       built >= 0 &&
         pre > built &&
-        close > pre &&
+        capturedVersion > pre &&
+        close > capturedVersion &&
         activation > close &&
         post > activation &&
         smoke > post &&
@@ -224,6 +229,11 @@ describe('v5 release safety lanes', () => {
     assert.match(seedSource, /classifyKnowledgePlanetSetupPin\([\s\S]*compatible-predecessor/)
     assert.match(seedSource, /exactActiveInstalls !== activeInstalls/)
     assert.match(seedSource, /activeAccounts !== 0/)
+    assert.match(seedSource, /--open-setup-first-gate-to-version=ID/)
+    assert.match(
+      seedSource,
+      /async function openSetupFirstListingGateToVersion[\s\S]*loadVerifiedRuntimePluginContract[\s\S]*classifyKnowledgePlanetSetupPin[\s\S]*compatible-predecessor[\s\S]*canonicalSha256Hex\(verified\.contract\.account\)[\s\S]*canonicalSha256Hex\(verified\.contract\.runtime\.accountState\)[\s\S]*openOfficialManagedBrowserPluginListingGate/,
+    )
 
     const missingDist = run(deploy, ['--dry-run', '--defer-knowledge-planet-upgrade'])
     assert.equal(missingDist.status, 2, missingDist.stdout + missingDist.stderr)
@@ -239,6 +249,44 @@ describe('v5 release safety lanes', () => {
     assert.match(accepted.stdout, /setup-first drain 后守卫/)
     assert.match(accepted.stdout, /knowledge-planet=setup-first/)
     assert.doesNotMatch(accepted.stdout, /消费加密交接/)
+  })
+
+  test('Knowledge Planet setup-first compensation restores source then the exact predecessor without a Plugin transition', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=()',
+      'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
+      'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
+      'knowledge_planet_plugin_open_gate_to_release() { calls+=("UNEXPECTED-release-open:$*"); return 92; }',
+      'knowledge_planet_plugin_open_setup_first_gate_to_version() { calls+=("open-exact:$1:$2"); }',
+      'activate_release() { calls+=("activate:$1"); }',
+      'activate_egress_release() { calls+=("UNEXPECTED-egress:$*"); return 93; }',
+      'rollback_runtime_tuple() { calls+=("rollback:$1:$2:$3:$4"); }',
+      'smoke() { calls+=("smoke:$1"); }',
+      'ACTIVE_PORT=18790',
+      'knowledge_planet_compensate_setup_first new-release old-release 0 0 "" 1606',
+      'printf "classic:%s\n" "${calls[*]}"',
+      'calls=()',
+      'knowledge_planet_compensate_setup_first new-release old-release 1 0 "" 1606',
+      'printf "hotcfg:%s\n" "${calls[*]}"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(
+      result.stdout,
+      /classic:close:new-release activate:old-release smoke:18790 open-exact:new-release:1606/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg:rollback:1:1:new-release:0 smoke:18790 open-exact:new-release:1606/,
+    )
+    assert.doesNotMatch(result.stdout, /UNEXPECTED/)
   })
 
   test('Knowledge Planet first-publication and hotcfg compensation stay fail-closed', () => {

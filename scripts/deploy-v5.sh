@@ -4010,12 +4010,14 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
 # still closed, so a late QR completion cannot race the source cutover.
 knowledge_planet_plugin_assert_setup_first_safe() { # <pinned master release> <pre|post>
   local release="$1" phase="$2"
+  KNOWLEDGE_PLANET_SETUP_VERSION_ID=""
   [[ "$phase" == pre || "$phase" == post ]] || {
     echo "✗ Knowledge Planet setup-first phase 非法:$phase" >&2
     return 2
   }
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] assert Knowledge Planet setup-first $phase: exact signed v1.0 + exact installs + zero accounts @ $release"
+    KNOWLEDGE_PLANET_SETUP_VERSION_ID=1
     return 0
   fi
   local output result
@@ -4038,6 +4040,7 @@ knowledge_planet_plugin_assert_setup_first_safe() { # <pinned master release> <p
     echo "✗ Knowledge Planet setup-first $phase 返回非法结果" >&2
     return 1
   }
+  KNOWLEDGE_PLANET_SETUP_VERSION_ID="$(jq -r '.currentVersionId' <<<"$result")"
 }
 
 knowledge_planet_plugin_seed() { # <active master release>
@@ -4145,6 +4148,33 @@ knowledge_planet_plugin_open_gate_to_release() { # <helper release> <target rele
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--open-listing-gate-to-release=$target'"
 }
 
+knowledge_planet_plugin_open_setup_first_gate_to_version() { # <helper release> <exact predecessor version ID>
+  local runner="$1" version_id="$2"
+  [[ "$version_id" =~ ^[1-9][0-9]{0,15}$ ]] || {
+    echo "✗ Knowledge Planet setup-first version ID 非法:${version_id:-<empty>}" >&2
+    return 2
+  }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] verify/open exact signed Knowledge Planet setup-first predecessor version=$version_id @ $runner"
+    return 0
+  fi
+  local output result
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts '--open-setup-first-gate-to-version=$version_id'")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e --arg version_id "$version_id" '
+    .setupFirst == true and (.changed | type == "boolean") and
+    .currentVersionId == $version_id' >/dev/null <<<"$result" || {
+    echo "✗ Knowledge Planet setup-first exact gate open 返回非法结果" >&2
+    return 1
+  }
+}
+
 # Non-normal activation lanes are not allowed to change the global managed
 # browser account contract: two masters cannot safely execute different driver
 # pins against one shared account table. A mismatch must go through deploy(),
@@ -4208,6 +4238,40 @@ knowledge_planet_compensate_deploy() { # <helper/new> <previous> <hotcfg:0|1> <e
   return "$failed"
 }
 
+# setup-first never changes the Plugin/install/account version pin. Compensation
+# therefore restores only source/tuple/egress while the gate stays closed, then
+# reopens the exact signed predecessor captured by the pre-cutover DB guard.
+knowledge_planet_compensate_setup_first() { # <helper/new> <previous> <hotcfg:0|1> <egress-switched:0|1> <previous-egress> <predecessor-version-id>
+  local helper="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
+  local predecessor_version_id="$6" failed=0 source_restored=0
+  [[ "$predecessor_version_id" =~ ^[1-9][0-9]{0,15}$ ]] || {
+    echo "✗ Knowledge Planet setup-first compensation version ID 非法:${predecessor_version_id:-<empty>}" >&2
+    return 2
+  }
+  if [[ "$egress_switched" == 1 ]]; then
+    activate_egress_release "$previous_egress" "$helper" || failed=1
+  fi
+  if [[ "$hotcfg" == 1 ]]; then
+    if rollback_runtime_tuple 1 1 "$helper" 0 && smoke "$ACTIVE_PORT"; then
+      source_restored=1
+    else
+      failed=1
+    fi
+  elif knowledge_planet_plugin_close_gate "$helper" \
+    && activate_release "$previous" \
+    && smoke "$ACTIVE_PORT"; then
+    source_restored=1
+  else
+    failed=1
+  fi
+  if [[ "$source_restored" == 1 ]] \
+    && ! knowledge_planet_plugin_open_setup_first_gate_to_version \
+      "$helper" "$predecessor_version_id"; then
+    failed=1
+  fi
+  return "$failed"
+}
+
 activate_egress_release() {
   local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps require_cap=0
   if [[ "$DRY" == 1 ]]; then
@@ -4266,7 +4330,7 @@ deploy() {
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
   local egress_prev_release="" kp_previous_release=""
-  local kp_previous_plugin_version_id="" kp_had_previous_plugin=0
+  local kp_previous_plugin_version_id="" kp_setup_plugin_version_id="" kp_had_previous_plugin=0
   kp_previous_release="$(bg_current_release "$ACTIVE_SRC")"
   [[ "$DRY" == 1 || -n "$kp_previous_release" ]] || {
     echo "✗ 无法钉住 Knowledge Planet Plugin source 回退点" >&2; exit 1;
@@ -4294,6 +4358,7 @@ deploy() {
     echo "── Knowledge Planet Plugin:setup-first 前置守卫(旧 v1.0 exact pin + 零账号)──"
     knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre \
       || { echo "✗ Knowledge Planet setup-first 前置守卫失败,未激活新 release" >&2; exit 1; }
+    kp_setup_plugin_version_id="$KNOWLEDGE_PLANET_SETUP_VERSION_ID"
   else
     echo "── Knowledge Planet Plugin:noninteractive exact-image approval/handoff 预激活门(DB 零写入)──"
     knowledge_planet_plugin_smoke_gate "$BUILT_RELEASE" \
@@ -4324,24 +4389,30 @@ deploy() {
   fi
   echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
   if ! knowledge_planet_plugin_close_gate "$BUILT_RELEASE"; then
-    knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-      || mark_deploy_recovery_required "Knowledge Planet gate close commit unknown and restore failed"
+    if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+      knowledge_planet_plugin_open_setup_first_gate_to_version \
+        "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
+        || mark_deploy_recovery_required "Knowledge Planet setup-first gate close commit unknown and exact restore failed"
+    else
+      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+        || mark_deploy_recovery_required "Knowledge Planet gate close commit unknown and restore failed"
+    fi
     end_planned_maintenance || true
     echo "✗ Knowledge Planet Plugin 执行门关闭失败(live 未改)" >&2
     exit 1
   fi
   kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
-    if [[ "$DRY" != 1 && -z "$kp_previous_plugin_version_id" ]]; then
-      knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-        || mark_deploy_recovery_required "Knowledge Planet setup-first gate closed without a current version and restore failed"
+    if [[ "$DRY" != 1 && "$kp_previous_plugin_version_id" != "$kp_setup_plugin_version_id" ]]; then
+      knowledge_planet_plugin_open_setup_first_gate_to_version \
+        "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
+        || mark_deploy_recovery_required "Knowledge Planet setup-first close changed the exact predecessor and restore failed"
       end_planned_maintenance || true
-      echo "✗ Knowledge Planet setup-first 关闭门后 current version 丢失" >&2
+      echo "✗ Knowledge Planet setup-first 关闭门前后 current version 不一致(pre=${kp_setup_plugin_version_id:-<none>} close=${kp_previous_plugin_version_id:-<none>})" >&2
       exit 1
     fi
-    # pre guard has already proven the previous source/version is the exact
-    # compatible predecessor; keep this true so every later failure executes
-    # the ordinary symmetric source+gate compensation.
+    # pre guard has already proven the exact compatible predecessor. setup-first
+    # never transitions its DB pin; compensation reopens this captured ID.
     kp_had_previous_plugin=1
   else
     if ! knowledge_planet_plugin_classify_previous_release \
@@ -4358,8 +4429,14 @@ deploy() {
   if [[ "$hc_any" == 1 ]]; then
     if ! activate_runtime_tuple; then
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
-        knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-          || mark_deploy_recovery_required "tuple 激活回滚后 Knowledge Planet 执行门未恢复"
+        if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+          knowledge_planet_plugin_open_setup_first_gate_to_version \
+            "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
+            || mark_deploy_recovery_required "tuple 激活回滚后 Knowledge Planet setup-first exact gate 未恢复"
+        else
+          knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+            || mark_deploy_recovery_required "tuple 激活回滚后 Knowledge Planet 执行门未恢复"
+        fi
       fi
       end_planned_maintenance || true
       echo "✗ tuple 激活失败(saga 已自动回滚)" >&2
@@ -4368,8 +4445,14 @@ deploy() {
   else
     if ! activate_release "$BUILT_RELEASE"; then
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
-        knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
-          || mark_deploy_recovery_required "release 激活回滚后 Knowledge Planet 执行门未恢复"
+        if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+          knowledge_planet_plugin_open_setup_first_gate_to_version \
+            "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
+            || mark_deploy_recovery_required "release 激活回滚后 Knowledge Planet setup-first exact gate 未恢复"
+        else
+          knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+            || mark_deploy_recovery_required "release 激活回滚后 Knowledge Planet 执行门未恢复"
+        fi
       fi
       end_planned_maintenance || true
       exit 1
@@ -4393,6 +4476,8 @@ deploy() {
     echo "── Knowledge Planet Plugin:setup-first drain 后守卫(门保持关闭、账号仍为零)──"
     if ! knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" post; then
       validation_failure="Knowledge Planet setup-first post-drain guard failed"
+    elif [[ "$DRY" != 1 && "$KNOWLEDGE_PLANET_SETUP_VERSION_ID" != "$kp_setup_plugin_version_id" ]]; then
+      validation_failure="Knowledge Planet setup-first predecessor changed during drain"
     fi
   fi
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
@@ -4404,18 +4489,26 @@ deploy() {
   fi
   if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "── Knowledge Planet Plugin:扫码 UI 已就绪，恢复旧 v1.0 listing gate──"
-    if ! knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"; then
-      validation_failure="Knowledge Planet setup-first old gate reopen failed"
+    if ! knowledge_planet_plugin_open_setup_first_gate_to_version \
+      "$BUILT_RELEASE" "$kp_setup_plugin_version_id"; then
+      validation_failure="Knowledge Planet setup-first exact old gate reopen failed"
     fi
   fi
   if [[ -n "$validation_failure" ]]; then
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
     # F7:补偿(恢复旧稳态)前 best-effort 重取 lease,缩小与自愈 host-action 并发窗;失败也照样补偿(恢复稳态优先)。
     reacquire_mutation_lease_best_effort "deploy-validation-compensation"
-    knowledge_planet_compensate_deploy \
-      "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
-      "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
-      || { mark_deploy_recovery_required "pre-seed validation failed and Plugin/source compensation failed: $validation_failure"; exit 1; }
+    if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+      knowledge_planet_compensate_setup_first \
+        "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+        "$egress_switched" "$egress_prev_release" "$kp_setup_plugin_version_id" \
+        || { mark_deploy_recovery_required "setup-first validation failed and exact source/gate compensation failed: $validation_failure"; exit 1; }
+    else
+      knowledge_planet_compensate_deploy \
+        "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+        "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
+        || { mark_deploy_recovery_required "pre-seed validation failed and Plugin/source compensation failed: $validation_failure"; exit 1; }
+    fi
     end_planned_maintenance || true
     echo "✗ 部署强校验失败；已确认回到旧 source/账号版本，部署未生效" >&2
     exit 1

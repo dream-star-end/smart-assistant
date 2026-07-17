@@ -648,6 +648,44 @@ async function openListingGateToRelease(targetRelease: string): Promise<void> {
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 
+async function openSetupFirstListingGateToVersion(versionIdRaw: string): Promise<void> {
+  if (!/^\d{1,16}$/.test(versionIdRaw))
+    throw new Error('setup-first Plugin version ID must be a positive integer')
+  const versionId = Number(versionIdRaw)
+  if (!Number.isSafeInteger(versionId) || versionId <= 0)
+    throw new Error('setup-first Plugin version ID must be a positive safe integer')
+  const verified = await loadVerifiedRuntimePluginContract(versionId, getPool(), {
+    env: process.env,
+    allowUnlisted: true,
+  })
+  if (
+    verified.pluginType !== 'managed-browser' ||
+    verified.slug !== KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id ||
+    classifyKnowledgePlanetSetupPin({
+      version: verified.contract.version,
+      artifactHash: verified.artifactHash,
+      execContractHash: verified.execContractHash,
+    }) !== 'compatible-predecessor'
+  )
+    throw new Error('setup-first gate target is not the exact compatible predecessor')
+  if (
+    canonicalSha256Hex(verified.contract.account) !==
+      canonicalSha256Hex(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.account) ||
+    canonicalSha256Hex(verified.contract.runtime.accountState) !==
+      canonicalSha256Hex(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.accountState)
+  )
+    throw new Error('setup-first gate target browser account contract is incompatible')
+  const result = await openOfficialManagedBrowserPluginListingGate({
+    slug: verified.slug,
+    expectedVersionId: String(versionId),
+    expectedArtifactHash: verified.artifactHash,
+    expectedExecContractHash: verified.execContractHash,
+    env: process.env,
+    pool: getPool(),
+  })
+  process.stdout.write(`${JSON.stringify({ ...result, setupFirst: true })}\n`)
+}
+
 async function assertCurrentReleaseCompatible(targetRelease: string): Promise<void> {
   const target = await targetReleaseContract(targetRelease, { allowStagedSource: true })
   const row = await query<{ version_id: string }>(
@@ -803,6 +841,9 @@ async function main(): Promise<void> {
   const openGateTarget = mode?.startsWith('--open-listing-gate-to-release=')
     ? mode.slice('--open-listing-gate-to-release='.length)
     : null
+  const openSetupFirstGateVersion = mode?.startsWith('--open-setup-first-gate-to-version=')
+    ? mode.slice('--open-setup-first-gate-to-version='.length)
+    : null
   const compatibilityTarget = mode?.startsWith('--assert-current-release-compatible=')
     ? mode.slice('--assert-current-release-compatible='.length)
     : null
@@ -820,13 +861,14 @@ async function main(): Promise<void> {
       !(verifyUserId && Number.isSafeInteger(verifyUserId) && verifyUserId > 0) &&
       !transitionTarget &&
       !openGateTarget &&
+      !openSetupFirstGateVersion &&
       !compatibilityTarget &&
       !classifyTarget &&
       setupFirstPhase !== 'pre' &&
       setupFirstPhase !== 'post')
   )
     throw new Error(
-      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH|--assert-setup-first-safe=pre|post',
+      'usage: seed-knowledge-planet-plugin.ts --verify-user=ID|--smoke-only|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--open-setup-first-gate-to-version=ID|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH|--assert-setup-first-safe=pre|post',
     )
   try {
     if (verifyUserId) await verifyUser(verifyUserId)
@@ -835,6 +877,8 @@ async function main(): Promise<void> {
     else if (mode === '--close-listing-gate') await closeListingGate()
     else if (transitionTarget) await transitionToRelease(transitionTarget)
     else if (openGateTarget) await openListingGateToRelease(openGateTarget)
+    else if (openSetupFirstGateVersion)
+      await openSetupFirstListingGateToVersion(openSetupFirstGateVersion)
     else if (compatibilityTarget) await assertCurrentReleaseCompatible(compatibilityTarget)
     else if (setupFirstPhase === 'pre' || setupFirstPhase === 'post')
       await assertSetupFirstSafe(setupFirstPhase)
