@@ -308,20 +308,12 @@ export class ManagedBrowserRuntime {
     },
   ) {}
 
-  async runReadAction(args: {
-    contract: ManagedBrowserPluginContractV1
-    storageState: BrowserStorageStateV1
-    actionId: string
-    params: Record<string, unknown>
-    signal: AbortSignal
-  }): Promise<{ result: unknown; storageState: BrowserStorageStateV1 }> {
-    const action = args.contract.actions.find((candidate) => candidate.id === args.actionId)
-    if (!action)
-      throw new ManagedBrowserRuntimeError('ACTION_NOT_FOUND', 'managed-browser action not found')
-    validateRuntimePluginJson(action.params, args.params, 'params')
-    if (args.signal.aborted) throw args.signal.reason
+  private resolveContractRuntime(contract: ManagedBrowserPluginContractV1): {
+    driver: ManagedBrowserDriverV1
+    launcher: ManagedBrowserLauncherV1
+  } {
     const driver = (this.opts.drivers ?? PRODUCTION_MANAGED_BROWSER_DRIVERS).get(
-      registryKey(args.contract.runtime.driverId, args.contract.runtime.driverVersion),
+      registryKey(contract.runtime.driverId, contract.runtime.driverVersion),
     )
     if (!driver)
       throw new ManagedBrowserRuntimeError(
@@ -330,14 +322,14 @@ export class ManagedBrowserRuntime {
       )
     assertRegistryIdentity(driver.id, driver.version, 'driver')
     if (
-      driver.id !== args.contract.runtime.driverId ||
-      driver.version !== args.contract.runtime.driverVersion
+      driver.id !== contract.runtime.driverId ||
+      driver.version !== contract.runtime.driverVersion
     )
       throw new ManagedBrowserRuntimeError(
         'DRIVER_UNAVAILABLE',
         'managed-browser driver pin mismatch',
       )
-    assertContractWithinDriverMaximum(args.contract, driver)
+    assertContractWithinDriverMaximum(contract, driver)
     const launcher = (this.opts.launchers ?? PRODUCTION_MANAGED_BROWSER_LAUNCHERS).get(
       registryKey(driver.launcherId, driver.launcherVersion),
     )
@@ -352,6 +344,32 @@ export class ManagedBrowserRuntime {
         'LAUNCHER_UNAVAILABLE',
         'managed-browser launcher pin mismatch',
       )
+    return { driver, launcher }
+  }
+
+  /** Pure registry/trust check used by discovery, setup status and invocation fences. */
+  supportsContract(contract: ManagedBrowserPluginContractV1): boolean {
+    try {
+      this.resolveContractRuntime(contract)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async runReadAction(args: {
+    contract: ManagedBrowserPluginContractV1
+    storageState: BrowserStorageStateV1
+    actionId: string
+    params: Record<string, unknown>
+    signal: AbortSignal
+  }): Promise<{ result: unknown; storageState: BrowserStorageStateV1 }> {
+    const action = args.contract.actions.find((candidate) => candidate.id === args.actionId)
+    if (!action)
+      throw new ManagedBrowserRuntimeError('ACTION_NOT_FOUND', 'managed-browser action not found')
+    validateRuntimePluginJson(action.params, args.params, 'params')
+    if (args.signal.aborted) throw args.signal.reason
+    const { driver, launcher } = this.resolveContractRuntime(args.contract)
     const pins = await resolveManagedBrowserPins(args.contract, this.opts.resolver)
     const requestGuard = makeManagedBrowserRequestGuard(args.contract, pins)
     const storageState = validateBrowserStorageState(args.storageState, args.contract)

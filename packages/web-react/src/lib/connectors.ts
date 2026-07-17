@@ -215,7 +215,17 @@ export type PluginManagementResponse = {
 export type KnowledgePlanetSetupView = {
   sessionId: string
   status: 'waiting_for_scan' | 'finalizing' | 'active' | 'cancelled' | 'expired' | 'failed'
+  phase?:
+    | 'generating_qr'
+    | 'waiting_for_scan'
+    | 'scan_confirmed'
+    | 'saving'
+    | 'active'
+    | 'cancelled'
+    | 'expired'
+    | 'failed'
   qrReady: boolean
+  agentReady?: boolean
   createdAt: string
   expiresAt: string
   accountId?: string
