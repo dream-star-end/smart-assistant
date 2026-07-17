@@ -570,7 +570,7 @@ const ADMIN_SELF_AUTH_ROUTES = new Set<string>(['GET /api/admin/metrics'])
  */
 const ANY_METHOD = '*'
 
-interface Route {
+export interface Route {
   /** HTTP method,或 ANY_METHOD('*')= 该路径任意 method 都转发给 handler(见 ANY_METHOD)。 */
   method: string
   /**
@@ -586,15 +586,16 @@ interface Route {
   handler: RouteHandler
 }
 
-export function createCommercialHandler(
-  deps: CommercialHttpDeps,
-  options: {
-    /** 测试可注入特定 logger;默认走 rootLogger.child({ subsys: "commercial" }) */
-    logger?: Logger
-  } = {},
-): CommercialHandler {
-  const httpLogger = options.logger ?? rootLogger.child({ subsys: 'commercial' })
-  const routes: Route[] = [
+/**
+ * commercialHandler 的路由注册表(路由所有权单一权威之一)。
+ *
+ * 抽为模块级导出函数(而非 createCommercialHandler 内的局部 const),让 routeOwnership
+ * 契约测试能在**运行时**拿到真实的 Route[] 值 —— 含 `pathPrefix: SELFHEAL_REPAIRS_PREFIX`
+ * 这类常量间接引用(源码正则扫不到),再与 COMMERCIAL_ROUTE_PREFIXES 做 `routes ⊆ prefixes`
+ * 对账。deps 只在各 handler 闭包内被捕获,构造 Route[] 时不读取其字段,故测试可传桩 deps。
+ */
+export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
+  return [
     { method: 'POST', path: '/api/auth/register', handler: handleRegister },
     { method: 'POST', path: '/api/auth/login', handler: handleLogin },
     { method: 'POST', path: '/api/auth/refresh', handler: handleRefresh },
@@ -1300,8 +1301,15 @@ export function createCommercialHandler(
       handler: handleAdminSignSessionMedia,
     },
   ]
-  // 所有命中的前缀,fallback 时通过它判断是否要兜底 405 / 404
-  const prefixes = [
+}
+
+/**
+ * commercialHandler 认领的路径前缀清单 —— **路由所有权单一权威**。fallback 时据此判断
+ * 是否兜底 405/404。buildCommercialRoutes() 里每条 path/pathPrefix 必须被本清单覆盖
+ * (path === p || path.startsWith(p)),否则 handler 永不可达(fall through 到 gateway
+ * 404/401)。两处同步铁律由 routeOwnership.test.ts 运行时契约测试锁死(见该文件头注释)。
+ */
+export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/auth/',
     '/api/me',
     '/api/public/',
@@ -1366,6 +1374,36 @@ export function createCommercialHandler(
     // 否则 commercialHandler 返回 false → fall through gateway 404。鉴权在 handler 内自理。
     SELFHEAL_REPAIRS_PREFIX,
   ]
+
+/**
+ * pre-route adapters —— 由 commercialHandler **直接**处理、不经 buildCommercialRoutes()
+ * 数组的路径。它们不参与 `routes ⊆ prefixes` 对账(routes 里没有它们),但仍是 commercial
+ * 认领面的一部分,显式登记于此供 routeOwnership 契约测试枚举核对(新增 pre-route handler
+ * 必须同步登记,否则测试提示"pre-route 面有未登记路径")。
+ * `requiresPrefix` 标注它是否**必须**被 COMMERCIAL_ROUTE_PREFIXES 覆盖:
+ *   - anthropic:true —— 维护期闸门 + isOurs 兜底都靠 prefixes 命中(见 /api/anthropic/ 注释);
+ *   - fileProxy:false —— 在 isOurs 兜底前就 return,故意不在 prefixes 内(见 BLOCKED/容器代理块)。
+ */
+export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
+  path: string
+  kind: 'exact' | 'prefix'
+  requiresPrefix: boolean
+}[] = [
+  { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
+  { path: '/api/file', kind: 'prefix', requiresPrefix: false },
+  { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
+]
+
+export function createCommercialHandler(
+  deps: CommercialHttpDeps,
+  options: {
+    /** 测试可注入特定 logger;默认走 rootLogger.child({ subsys: "commercial" }) */
+    logger?: Logger
+  } = {},
+): CommercialHandler {
+  const httpLogger = options.logger ?? rootLogger.child({ subsys: 'commercial' })
+  const routes = buildCommercialRoutes(deps)
+  const prefixes = COMMERCIAL_ROUTE_PREFIXES
 
   return async function commercialHandler(req, res): Promise<boolean> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)

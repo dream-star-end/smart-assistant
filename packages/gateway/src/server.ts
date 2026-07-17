@@ -52,6 +52,7 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   isCodexEngineModel,
   isClientMessageId,
+  shouldServeInline,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
@@ -13620,33 +13621,11 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
   return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
 }
 
-/** MIME types that can execute scripts in the browser and must be force-downloaded. */
-const ACTIVE_CONTENT_TYPES = new Set([
-  'text/html',
-  'image/svg+xml',
-  'text/xml',
-  'application/xml',
-  'application/xhtml+xml',
-  // JavaScript is also browser-executable and must not be served inline
-  'application/javascript',
-  'text/javascript',
-])
-
-/**
- * Returns true if the MIME type can execute scripts when rendered inline by the browser.
- * Stripping charset suffix before matching (e.g. "text/html; charset=utf-8" → "text/html").
- */
-function isActiveContentType(mime: string): boolean {
-  const base = mime.split(';')[0].trim().toLowerCase()
-  return ACTIVE_CONTENT_TYPES.has(base)
-}
-
-/** True only for resources that must render inline in chat (<img>/<audio>/<video>). */
-export function shouldServeInline(mime: string): boolean {
-  const base = mime.split(';')[0].trim().toLowerCase()
-  if (ACTIVE_CONTENT_TYPES.has(base)) return false
-  return base.startsWith('image/') || base.startsWith('audio/') || base.startsWith('video/')
-}
+// 活跃内容 MIME 集合 + inline 判定已收敛到 @openclaude/protocol 的单一权威(批D D5)。
+// shouldServeInline 在文件顶部从 protocol import 供本模块内部使用;此处 re-export 保持
+// 既有 import 路径(如 security.test.ts `import { shouldServeInline } from '../server.js'`)不变。
+// (原 ACTIVE_CONTENT_TYPES 集合与未被引用的 isActiveContentType 一并移入 protocol。)
+export { shouldServeInline }
 
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
