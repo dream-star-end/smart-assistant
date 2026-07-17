@@ -1,0 +1,85 @@
+{
+  "schema": "selfheal-deploy-surfaces",
+  "version": 1,
+  "_comment": "自愈 Tier2 部署生效面分类的可信权威 manifest(RFC-v5-selfheal-batch1b §3 / 契约 §7)。个人版 deployDriver 分类器读【合并前的 trusted 版本】(git show <canonicalBranch>:deploy/v5/selfheal-deploy-surfaces.json),严格 schema 校验后据此把 base..sha 的 raw diff 映射成生效面集合 + deploy argv;playbook §4.1 的矩阵表由本文件生成并被测试锁定(packages/commercial/src/__tests__/deploySurfacesManifest.test.ts)。fail-closed 铁律:manual 任一 glob 命中 / rules 零命中 / 未知路径 / symlink·gitlink·typechange / 未知 version 一律整体 manual_required。改矩阵改本文件,勿手改 playbook 表。",
+  "surfaces": {
+    "master": {
+      "label": "master 进程",
+      "deployAction": "deploy-v5.sh",
+      "verifyLayers": ["test:commercial:unit"],
+      "requiresAxis": null,
+      "note": "playbook §4.1 · master 侧代码(commercial/storage/cli/protocol/docs 源码,源行 ~200):普通 deploy(rsync+restart+smoke)"
+    },
+    "web": {
+      "label": "dist 静态资源",
+      "deployAction": "deploy-v5.sh --dist(与后端代码同批时用 --with-dist)",
+      "verifyLayers": ["test:web-react"],
+      "requiresAxis": null,
+      "note": "playbook §4.1 · packages/web-react 前端 + 管理后台 admin 入口(源行 ~201-202):dist 生效面"
+    },
+    "runtime-source": {
+      "label": "runtime source release",
+      "deployAction": "deploy-v5.sh(部署前活体断言 runtime-release 轴已启用,否则 manual)",
+      "verifyLayers": ["test:storage", "test:gateway", "test:mcp-memory"],
+      "requiresAxis": "runtime-release",
+      "note": "playbook §4.1 · 容器内 gateway/CCB/storage/protocol/mcp-memory 源码(源行 ~204):runtime source release 轴;启用前提=env 有 OC_RUNTIME_RELEASE 或曾 --enable-runtime-release"
+    },
+    "platform-runtime": {
+      "label": "platform bundle",
+      "deployAction": "deploy-v5.sh(部署前活体断言 platform-bundle 轴已启用,否则 manual)",
+      "verifyLayers": [],
+      "requiresAxis": "platform-bundle",
+      "note": "playbook §4.1 · agent-sandbox/platform-runtime/**(oc-* 薄壳/entrypoint/seed 声明/persona/种子技能/prompts,源行 ~205):platform bundle 轴;启用前提=--enable-platform-bundle"
+    },
+    "egress": {
+      "label": "egress 进程",
+      "deployAction": "deploy-v5.sh --egress(egress 进程;需 boss 明确放行后机器执行)",
+      "verifyLayers": ["test:commercial:unit"],
+      "requiresAxis": null,
+      "note": "playbook §4.1 · packages/commercial/src/egress/**(源行 ~208):egress 独立进程,普通 deploy 基础上追加 --egress"
+    }
+  },
+  "rules": [
+    { "glob": "packages/web-react/**", "surface": "web", "note": "playbook §4.1 前端/管理后台(源行 ~201-202)→ dist" },
+    { "glob": "packages/commercial/src/egress/**", "surface": "egress", "note": "playbook §4.1 egress 进程(源行 ~208)→ --egress" },
+    { "glob": "packages/commercial/**", "surface": "master", "note": "playbook §4.1 master 侧代码(源行 ~200);egress/自愈TCB/ccb-baseline 等子路径由 union+manual 收紧" },
+    { "glob": "packages/storage/**", "surface": "master", "note": "playbook §4.1 storage 亦驱动 master 进程(源行 ~200)" },
+    { "glob": "packages/storage/**", "surface": "runtime-source", "note": "playbook §4.1 storage 亦在容器 runtime source(源行 ~204):storage 双面,union 取并集" },
+    { "glob": "packages/cli/**", "surface": "master", "note": "playbook §4.1 cli(源行 ~200)→ master 进程" },
+    { "glob": "packages/protocol/**", "surface": "master", "note": "playbook §4.1 protocol 驱动 master 进程(源行 ~200)" },
+    { "glob": "packages/protocol/**", "surface": "runtime-source", "note": "playbook §4.1 protocol 亦在容器 runtime source(源行 ~204):protocol 双面" },
+    { "glob": "packages/gateway/**", "surface": "runtime-source", "note": "playbook §4.1 容器 gateway 源码(源行 ~204)→ runtime source release" },
+    { "glob": "packages/mcp-memory/**", "surface": "runtime-source", "note": "playbook §4.1 容器 mcp-memory 源码(源行 ~204)→ runtime source release" },
+    { "glob": "**/agent-sandbox/platform-runtime/**", "surface": "platform-runtime", "note": "playbook §4.1 平台配置(源行 ~205)→ platform bundle 轴" },
+    { "glob": "docs/**", "surface": "master", "note": "playbook §4.1 docs-only 亦走普通 deploy(重启 master,MINOR:deployed≠resolved)→ master 进程" }
+  ],
+  "manual": [
+    { "glob": "**/migrations/**", "note": "RFC §3 manual:DB migrations 人工受控 apply(§4.5)" },
+    { "glob": "deploy/**", "note": "RFC §3 manual:deploy/**(含 env overrides / systemd 单元 / release metadata)" },
+    { "glob": "scripts/**", "note": "RFC §3 manual:scripts/**(部署/告警/运维脚本随 rsync 生效,非自愈可安全自动)" },
+    { "glob": ".github/**", "note": "RFC §3 manual:.github/** CI 配置" },
+    { "glob": "**/*.sh", "note": "RFC §3 manual:任意 shell 脚本(镜像工具链/构建/host 脚本)" },
+    { "glob": "**/package.json", "note": "RFC §3 manual:所有层级 package.json(依赖/脚本变更需人工审)" },
+    { "glob": "**/package-lock.json", "note": "RFC §3 manual:npm lockfile(任一层级)" },
+    { "glob": "**/bun.lock*", "note": "RFC §3 manual:bun lockfile(bun.lock / bun.lockb)" },
+    { "glob": "**/pnpm-lock.yaml", "note": "RFC §3 manual:pnpm lockfile(任一层级;全部 lockfile 类)" },
+    { "glob": "**/yarn.lock", "note": "RFC §3 manual:yarn lockfile(任一层级;全部 lockfile 类)" },
+    { "glob": "**/*.lockb", "note": "RFC §3 manual:二进制 lockfile(bun.lockb 等任意 *.lockb;全部 lockfile 类)" },
+    { "glob": "**/Cargo.lock", "note": "RFC §3 manual:Cargo lockfile(Rust crate;全部 lockfile 类)" },
+    { "glob": "**/Dockerfile*", "note": "RFC §3 manual:Dockerfile 与镜像工具链(runtime image 面)" },
+    { "glob": "**/agent-sandbox/ccb-baseline/**", "note": "RFC §3 manual:ccb-baseline(存量用户容器只读 bind,需认证 drain remount)" },
+    { "glob": "**/sudoers", "note": "RFC §3 manual:sudoers 类(权限提升面)" },
+    { "glob": "**/sudoers.d/**", "note": "RFC §3 manual:sudoers.d 片段" },
+    { "glob": "**/*.env", "note": "RFC §3 manual:env 文件(线上 env 手动同步,增量部署不重生成)" },
+    { "glob": "**/*.env.overrides", "note": "RFC §3 manual:env overrides(deploy/v5/commercial-v5.env.overrides 等)" },
+    { "glob": "**/AGENTS.md", "note": "RFC §3 manual:AGENTS.md(agent 行为契约)" },
+    { "glob": "**/CLAUDE.md", "note": "RFC §3 manual:CLAUDE.md(仓内/全局指令)" },
+    { "glob": "**/changelog.json", "note": "RFC §3 manual:changelog.json(发版记账)" },
+    { "glob": "deploy/v5/selfheal-deploy-surfaces.json", "note": "RFC §3 manual:分类器 manifest 自身(改分类权威=人工审;亦被 deploy/** 覆盖,显式列出以逐项断言)" },
+    { "glob": "packages/commercial/src/selfheal/**", "note": "RFC §3 manual:自愈 TCB(检测/派单/incident 权威代码)" },
+    { "glob": "packages/commercial/src/http/internal/selfhealRepairs.ts", "note": "RFC §3 manual:自愈 TCB(回调分流/repair 收口 handler)" },
+    { "glob": "packages/commercial/src/admin/selfhealOps.ts", "note": "RFC §3 manual:自愈审批链 TCB(admin 放行事务/release request 权威,§P1)" },
+    { "glob": "packages/commercial/src/http/admin/selfheal.ts", "note": "RFC §3 manual:自愈审批链 TCB(admin 放行 HTTP 入口,§P1)" },
+    { "glob": "packages/commercial/src/admin/audit*.ts", "note": "RFC §3 manual:自愈审批链 TCB(永久 admin audit:audit.ts/auditActions.ts/auditRedact.ts/auditRetention.ts)" }
+  ]
+}
