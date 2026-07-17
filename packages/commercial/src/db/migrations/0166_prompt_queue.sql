@@ -1,4 +1,8 @@
+<<<<<<<< HEAD:packages/commercial/src/db/migrations/0165_prompt_queue.sql
 -- 0165_prompt_queue — V5 durable prompt queue repository (P1, flag off)
+========
+-- 0166_prompt_queue — V5 durable prompt queue repository (P1, flag off)
+>>>>>>>> origin/feat/v5-aurora-rewrite:packages/commercial/src/db/migrations/0166_prompt_queue.sql
 --
 -- PG is the durable authority. Runtime coordinators can only mutate through
 -- the container-authenticated internal API; every write locks one head row.

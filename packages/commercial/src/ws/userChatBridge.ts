@@ -1184,6 +1184,38 @@ function sanitizeCloseCode(code: number): number {
   return CLOSE_BRIDGE.NORMAL;
 }
 
+/**
+ * Goal 归因加载的**二分语义**(2026-07-17 goal 停摆事故根治;批D D8 单测锁死)。
+ *
+ *   - loadGoalState 抛 GoalStateError(NOT_FOUND) → client_sessions 行还不存在(WS-only
+ *     首轮,尚无 PUT /api/sessions),目标不可能存在 → `{kind:'ok', goalState:null}` **放行**;
+ *     归因仍可修复(无行的会话上设不了目标)。
+ *   - 抛其它(瞬态 PG 读失败等)→ `{kind:'unavailable'}` **拒轮**:绝不静默降级为 null
+ *     ——那会让本轮无 goal_id 落地、后续 durable 修复不可能。调用方据此发
+ *     GOAL_STATE_UNAVAILABLE 并回滚已预留的计费/槽位。
+ *
+ * 抽成纯函数(无副作用:错误帧/日志/回滚仍留调用方)使这条二分成为**单一可测权威**,
+ * 而非埋在转发闭包里靠注释维系。
+ */
+export type TurnGoalResolution =
+  | { kind: "ok"; goalState: GoalStateSnapshot | null }
+  | { kind: "unavailable"; err: unknown };
+
+export async function resolveTurnGoalState(
+  loadGoalState: (uid: bigint, sessionId: string) => Promise<GoalStateSnapshot | null>,
+  uid: bigint,
+  sessionId: string,
+): Promise<TurnGoalResolution> {
+  try {
+    return { kind: "ok", goalState: await loadGoalState(uid, sessionId) };
+  } catch (err) {
+    if (err instanceof GoalStateError && err.code === "NOT_FOUND") {
+      return { kind: "ok", goalState: null };
+    }
+    return { kind: "unavailable", err };
+  }
+}
+
 // ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
@@ -2140,12 +2172,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // ── 角色分档窗口投影(modelRolePolicy)────────────────────────────────
+      // ── 角色分档窗口投影(modelRolePolicy · 执行轴)──────────────────────────
       // descriptor.contextWindow 是 CCB auto-compact 的实际执行窗口 —— 在签发前按本连接
       // 角色收窄(如 kimi-k3:admin 1M / 其他 500k)。签名 envelope 只对 descriptor 整体签名,
-      // egress gate 校验的是快照级 executionRevision(catalog 行未动,不受影响)。
-      // role 取连接 claims(JWT):与 listForUser/egress 的 DB role 相比,晋升迟一个 token
-      // 生命周期生效(收窄方向保守);降级窗口 ≤ token TTL,与 grants 30s 刷新同级别容忍。
+      // egress gate 校验的是快照级 executionRevision(catalog 机制行未动,不受影响)。
+      //
+      // ⚠ 一致性边界(审计纠偏):这是**执行轴**,role 取连接 claims(JWT),**从不进
+      //   projectionRevision 对账**。只有列表轴(listForUser 的 DB role)才有 master↔egress
+      //   的 409 对账网;本处窗口收窄不会被任何 409 兜住。JWT/DB 角色在 15min TTL 内的漂移
+      //   是被设计容忍的(晋升迟一个 token 生命周期、收窄方向保守;降级窗口 ≤ token TTL,与
+      //   grants 30s 刷新同级别容忍)。⇒ 执行轴一致性的**唯一防线** = 与 listForUser 共用
+      //   同一纯函数 projectContextWindowForRole + 两处落点单测(modelRolePolicy.test.ts 纯
+      //   函数契约 / modelAuthorityBridge.test.ts:431 bridge 签发)。别删这两个测试,也别新增
+      //   旁路投影而不加对应落点单测。
       const projectedWindow = projectContextWindowForRole(
         exec.canonicalModel,
         exec.descriptor.contextWindow,
@@ -2517,18 +2556,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           err,
         });
       }
-      if (deps.loadGoalState) try {
-        const goal = await deps.loadGoalState(uid, peerId);
-        enriched = { ...enriched, _goalState: goal };
-      } catch (err) {
-        if (err instanceof GoalStateError && err.code === "NOT_FOUND") {
-          // NOT_FOUND is a definitive answer, not a transient failure: the
-          // client_sessions row does not exist yet (first turn of a fresh
-          // WS-only session, before any PUT /api/sessions), so no goal can
-          // exist either. Attribution stays repairable — a goal cannot be
-          // set on a session that has no row.
-          enriched = { ...enriched, _goalState: null };
-        } else {
+      if (deps.loadGoalState) {
+        // 二分语义收敛到 resolveTurnGoalState 单一权威(NOT_FOUND=确定性放行 vs 其它=拒轮);
+        // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
+        const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);
+        if (resolved.kind === "unavailable") {
           // Goal attribution is part of the paid turn's durable authority. A
           // transient PG read failure must not be converted to `null`: doing so
           // would run the turn without goal_id and make later repair impossible.
@@ -2537,7 +2569,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // pre-forward compensation path.
           turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
             sessionId: peerId,
-            err,
+            err: resolved.err,
           });
           if (!cleaned && userWs.readyState === WebSocket.OPEN) {
             sendErrorFrame(
@@ -2548,6 +2580,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
           return null;
         }
+        // NOT_FOUND → resolved.goalState===null(放行,归因仍可修复);否则真实快照。
+        enriched = { ...enriched, _goalState: resolved.goalState };
       }
       return enriched;
     };

@@ -29,28 +29,31 @@ DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
 # ⚠️ shell fanout 路径没有 TS enqueueAlert 的"零通道→inbox 兜底":info 级匹配不到
 # 任何通道(企微 severity_min=warning)会静默零投递,所以站内信必须由 inbox_notice
 # 直插(对齐 v5-daily-check.sh 日报惯例,uid=1)。
+# 返回真实投递结果:0=确认投递,1=未投递(缺 DBURL/缺模板/psql 失败)。
+# 调用方据此判定"零投递 → 升级 OnFailure"(见问题/失败路径)。
 fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
-  if [ -z "$DBURL" ]; then log "FANOUT-SKIP no DATABASE_URL event=$1"; return 0; fi
-  if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP no $FANOUT_SQL event=$1"; return 0; fi
+  if [ -z "$DBURL" ]; then log "FANOUT-SKIP no DATABASE_URL event=$1"; return 1; fi
+  if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP no $FANOUT_SQL event=$1"; return 1; fi
   if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
        -v event_type="$1" -v severity="$2" -v dedupe_key="$3" \
        -v title="$4" -v body="$5" -v payload="$6" \
        -f "$FANOUT_SQL" >/dev/null 2>&1; then
-    log "FANOUT-OK $1 sev=$2"
+    log "FANOUT-OK $1 sev=$2"; return 0
   else
-    log "FANOUT-FAIL $1 sev=$2"
+    log "FANOUT-FAIL $1 sev=$2"; return 1
   fi
 }
 
 BOSS_UID="${OC_EVAL_BOSS_UID:-1}"
+# 返回真实投递结果:0=确认写入站内信,1=未写入(缺 DBURL / psql 失败)。
 inbox_notice() { # <level info|warning> <title> <body>
-  if [ -z "$DBURL" ]; then log "INBOX-SKIP no DATABASE_URL"; return 0; fi
+  if [ -z "$DBURL" ]; then log "INBOX-SKIP no DATABASE_URL"; return 1; fi
   if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
        -v lvl="$1" -v title="$2" -v body="$3" -v uid="$BOSS_UID" <<'SQL' >/dev/null 2>&1
 INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
 VALUES ('user', :'uid'::bigint, :'title', :'body', :'lvl', :'uid'::bigint);
 SQL
-  then log "INBOX-OK $2"; else log "INBOX-FAIL $2"; fi
+  then log "INBOX-OK $2"; return 0; else log "INBOX-FAIL $2"; return 1; fi
 }
 
 exec 9>"$LOCK_FILE"
@@ -142,13 +145,19 @@ if [ "$run_rc" -ne 0 ] || [ "$problems_n" -gt 0 ]; then
 
 完整结果:kl-mirror $RESULTS_FILE
 $report"
+  delivered=0
   fanout_alert baseline_evals warning "baseline-evals:$STAMP" \
     "baseline 技能评测回归异常($problems_n 项)" "$body" \
-    "{\"rc\":$run_rc,\"problems\":$problems_n}"
-  inbox_notice warning "baseline 技能评测回归异常($problems_n 项)" "$body"
-  log "回归异常 rc=$run_rc problems=$problems_n"
-  # 告警已自行送达 → 单元按"完成职责"退 0;非零留给"没能自行报告"的崩溃/超时,
-  # 那才轮到 OnFailure=alert-fail 兜底,避免同一事件双告警。
+    "{\"rc\":$run_rc,\"problems\":$problems_n}" && delivered=1
+  inbox_notice warning "baseline 技能评测回归异常($problems_n 项)" "$body" && delivered=1
+  log "回归异常 rc=$run_rc problems=$problems_n delivered=$delivered"
+  if [ "$delivered" -eq 0 ]; then
+    # 两通道均未确认投递 → 本单元没能自行把异常报出去,升级到 .service OnFailure 兜底
+    # (与凭据缺失路径同范式:能自送才退 0,自送失败才 exit 1,避免异常被静默吞掉)。
+    log "两通道均未确认投递 → 升级 OnFailure(exit 1)"
+    exit 1
+  fi
+  # 至少一个通道确认投递 → 完成职责退 0(避免 OnFailure 对同一事件造成双告警)。
   exit 0
 fi
 

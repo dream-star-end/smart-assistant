@@ -89,6 +89,13 @@ TURN_ERR_WINDOW_SECS="${V5MON_TURN_ERR_WINDOW:-600}"   # turn 失败回看窗口
 TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个用户同窗失败
 TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
 TURN_ERR_SOLO_EVENTS="${V5MON_TURN_ERR_SOLO:-8}"       # 单源阈:单窗总失败 ≥N 次
+# KP 官方托管浏览器插件版本(= KNOWLEDGE_PLANET_PLUGIN_VERSION;插件 bump 版本时同步本值)。
+KP_PLUGIN_VERSION="${V5MON_KP_VERSION:-1.2.0}"
+# 客户端 4xx 风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。背景:2026-07-17 /api/media-signed
+# 20min 内 410×381 无人告警。日志消费与 check_mail 同法(grep app 日志 + 解析 "ts")。
+CLIENT_4XX_WINDOW_SECS="${V5MON_CLIENT_4XX_WINDOW:-600}"     # 回看窗(10min)
+CLIENT_4XX_THRESHOLD="${V5MON_CLIENT_4XX_THRESHOLD:-50}"     # 同 client×route >N 次 4xx = 风暴
+CLIENT_4XX_SCAN_LINES="${V5MON_CLIENT_4XX_SCAN_LINES:-8000}" # http_error 回看行数上限(bound 日志扫描)
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -227,6 +234,76 @@ check_turn_failures() {
   fi
 }
 
+check_kp_plugin() {
+  # KP 官方托管浏览器插件"休眠"探针:结构门等价于 seedKnowledgePlanetPlugin 运行时
+  # findApprovedKnowledgePlanetPlugin(状态 active + 门未撤 + current_approved 指向已审批&验签&
+  # 未吊销的当前版本)。任一不满足 = listing 对用户休眠(门被悄悄关闭/撤下/版本漂移/签名缺失),
+  # 用户无法发布到知识星球却全链路健康端点全绿 → 本探针补盲区。仅只读 EXISTS。
+  local serving
+  if [ -z "$DBURL" ]; then record kp_plugin ok "KP 插件:无 DATABASE_URL(跳过)"; return; fi
+  if ! serving="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -c "
+    SELECT EXISTS (
+      SELECT 1
+        FROM marketplace_skill_listings l
+        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+       WHERE l.slug = 'knowledge-planet'
+         AND l.kind = 'connector'
+         AND l.plugin_type = 'managed-browser'
+         AND l.state = 'active'
+         AND l.revoked_reason IS NULL
+         AND v.version = '${KP_PLUGIN_VERSION}'
+         AND v.status = 'approved'
+         AND v.review_source = 'platform'
+         AND v.security_review_state = 'security_approved'
+         AND v.functional_verify_state = 'verified'
+         AND v.exec_revoked_at IS NULL
+         AND v.exec_contract_hash IS NOT NULL
+         AND v.signature IS NOT NULL
+         AND v.signature_scheme = 'plugin-v2')" 2>&1)"; then
+    record kp_plugin bad "KP 插件:psql 查询失败:$(echo "$serving" | head -c 120)"; return
+  fi
+  case "$serving" in
+    t) record kp_plugin ok "KP 官方插件:已审批且在服务(v${KP_PLUGIN_VERSION}/active/plugin-v2)" ;;
+    f) record kp_plugin bad "KP 官方插件休眠:listing 未在服务(门关闭/撤下/无审批当前版本/版本漂移/签名或验证缺失)——用户无法发布到知识星球" ;;
+    *) record kp_plugin bad "KP 插件:EXISTS 返回非法值:$(echo "$serving" | head -c 120)" ;;
+  esac
+}
+
+check_client_4xx_storm() {
+  # 客户端 4xx 重试风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。数据源 = 结构化 app 日志
+  # (router.ts 每条 HttpError 打 {"msg":"http_error","status":4xx,"route":...,"clientIp":...,"ts":...})。
+  # ts 是 ISO8601 UTC(Z),与 date -u 生成的截止串按**字典序**比较即等价于时间比较,免逐行 date -d。
+  local cutoff_iso recent top
+  if [ ! -r "$MAIL_LOG" ]; then record client_4xx_storm ok "4xx 风暴:$MAIL_LOG 不可读(跳过)"; return; fi
+  cutoff_iso="$(date -u -d "@$((NOW - CLIENT_4XX_WINDOW_SECS))" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo '')"
+  if [ -z "$cutoff_iso" ]; then record client_4xx_storm ok "4xx 风暴:无法计算窗口截止(跳过)"; return; fi
+  recent="$(grep -a '"msg":"http_error"' "$MAIL_LOG" 2>/dev/null | tail -n "$CLIENT_4XX_SCAN_LINES")"
+  if [ -z "$recent" ]; then record client_4xx_storm ok "4xx 风暴:窗口内无 http_error"; return; fi
+  # awk 分组计数:窗口内 + 4xx,按 clientIp|route 聚合取最大值;超阈打印 "max\tkey\tstatus"。
+  top="$(printf '%s\n' "$recent" | awk -v cutoff="$cutoff_iso" -v thr="$CLIENT_4XX_THRESHOLD" '
+    {
+      ts=""; st=""; rt=""; ip="";
+      if (match($0, /"ts":"[^"]+"/))       { ts=substr($0, RSTART+6,  RLENGTH-7)  }
+      if (match($0, /"status":[0-9]+/))    { st=substr($0, RSTART+9,  RLENGTH-9)  }
+      if (match($0, /"route":"[^"]*"/))    { rt=substr($0, RSTART+9,  RLENGTH-10) }
+      if (match($0, /"clientIp":"[^"]*"/)) { ip=substr($0, RSTART+12, RLENGTH-13) }
+      if (ts == "" || ts < cutoff) next;
+      if (st !~ /^4[0-9][0-9]$/) next;
+      if (ip == "") ip="<unknown>"; if (rt == "") rt="<unknown>";
+      key=ip "|" rt; c[key]++;
+      if (c[key] > max) { max=c[key]; mk=key; mst=st }
+    }
+    END { if (max+0 >= thr+0) printf "%d\t%s\t%s", max, mk, mst }
+  ')"
+  if [ -n "$top" ]; then
+    local n mk mst
+    IFS=$'\t' read -r n mk mst <<<"$top"
+    record client_4xx_storm bad "客户端 4xx 风暴:${mk%%|*} 对 ${mk#*|} 在 ${CLIENT_4XX_WINDOW_SECS}s 内 ${n} 次 4xx(样本 status=${mst},阈值 ${CLIENT_4XX_THRESHOLD})——签名过期/权限退化/路由异常无人知(2026-07-17 /api/media-signed 410×381 盲区)"
+  else
+    record client_4xx_storm ok "客户端 4xx 风暴:窗口内无单 client×route 超阈"
+  fi
+}
+
 slot_unit() { case "$1" in A) echo openclaude-v5 ;; B) echo openclaude-v5-b ;; *) return 1 ;; esac; }
 slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEALTH_URL" ;; *) return 1 ;; esac; }
 
@@ -302,7 +379,8 @@ check_serving_masters() {
 check_severity() {
   case "$1" in
     deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
-    disk_root|disk_var|mem) echo warning ;;
+    # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -337,6 +415,8 @@ check_pool
 check_image
 check_mail
 check_turn_failures
+check_kp_plugin
+check_client_4xx_storm
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

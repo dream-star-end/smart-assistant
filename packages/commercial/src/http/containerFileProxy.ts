@@ -37,6 +37,7 @@ import { request as httpRequest } from "node:http";
 import { createHmac } from "node:crypto";
 import { isIPv4 } from "node:net";
 import { basename } from "node:path";
+import { ACTIVE_CONTENT_TYPES, isActiveContentType } from "@openclaude/protocol";
 import type { TLSSocket } from "node:tls";
 import type { RequestContext } from "./handlers.js";
 import type { V3ContainerStatus, V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
@@ -94,26 +95,19 @@ function rfc5987(name: string): string {
 }
 
 /**
- * 安全 inline 白名单:图片(SVG 除外)、音频、视频、PDF。
- * 图片 SVG / HTML / XML / JS 都算活跃内容,强制 attachment。
+ * 安全 inline 白名单:图片(活跃内容除外)、音频、视频、PDF。
+ * HTML / SVG / XML / JS 等活跃内容一律强制 attachment —— 活跃内容判定收敛到
+ * @openclaude/protocol 的 isActiveContentType(与 gateway shouldServeInline 同源,批D D5);
+ * 原 `image/svg+xml` 特判 + 本地 ACTIVE_TYPES 集合都被这唯一权威取代。
+ * export 供 activeContentDisposition 契约测试断言两侧对活跃内容判定逐字一致。
  */
-function isSafeInlineType(typeBase: string): boolean {
-  if (typeBase === "image/svg+xml") return false;
+export function isSafeInlineType(typeBase: string): boolean {
+  if (isActiveContentType(typeBase)) return false;
   if (typeBase.startsWith("image/")) return true;
   if (typeBase.startsWith("audio/")) return true;
   if (typeBase.startsWith("video/")) return true;
   return typeBase === "application/pdf";
 }
-
-const ACTIVE_TYPES = new Set([
-  "text/html",
-  "image/svg+xml",
-  "text/xml",
-  "application/xml",
-  "application/xhtml+xml",
-  "application/javascript",
-  "text/javascript",
-]);
 
 /** 转发的上游请求头白名单 */
 const FORWARD_HEADERS = new Set([
@@ -409,7 +403,7 @@ function buildClientResponseHead(
   const type = String(Array.isArray(ctRaw) ? ctRaw[0] : ctRaw ?? "application/octet-stream");
   const typeBase = (type.split(";")[0] ?? "").trim().toLowerCase();
   const mode =
-    !isFilePath && isSafeInlineType(typeBase) && !ACTIVE_TYPES.has(typeBase)
+    !isFilePath && isSafeInlineType(typeBase) && !ACTIVE_CONTENT_TYPES.has(typeBase)
       ? "inline"
       : "attachment";
 
