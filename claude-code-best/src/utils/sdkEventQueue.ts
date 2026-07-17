@@ -200,51 +200,73 @@ export type BashTailSnapshot = {
   truncatedHead: boolean
 }
 
-// Per-tool_use_id last-emitted snapshot, used to suppress unchanged frames.
+/**
+ * Cheap, non-cryptographic fingerprint of a tail frame, used as the dedup key
+ * so the store retains a short string per stream instead of the (potentially
+ * multi-MB) tail text — which is what lets the cap below be generous.
+ *
+ * `totalBytes` and `truncatedHead` are kept verbatim (exact discriminators —
+ * bash output is append-only, so totalBytes strictly grows on any new
+ * content); only the large `tail` string is reduced, via two independent
+ * 32-bit rolling hashes (FNV-1a + djb2) concatenated for ~64-bit width in fast
+ * integer math (no BigInt, single pass). A dropped change would require
+ * identical totalBytes AND truncatedHead AND a 64-bit hash clash on differing
+ * tails — negligible for append-only output.
+ */
+export function bashTailFingerprint(next: BashTailSnapshot): string {
+  const s = next.tail
+  let h1 = 0x811c9dc5 // FNV-1a offset basis
+  let h2 = 5381 // djb2
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 0x01000193) // FNV prime
+    h2 = (Math.imul(h2, 33) + c) | 0
+  }
+  return `${next.totalBytes}|${next.truncatedHead ? 1 : 0}|${(h1 >>> 0).toString(36)}.${(h2 >>> 0).toString(36)}`
+}
+
+// Per-tool_use_id last-emitted fingerprint, used to suppress unchanged frames.
 // The tail poller ticks at ~1 Hz for the whole life of a (possibly
 // backgrounded) bash command; when output stops growing, every tick would
 // otherwise re-emit an identical frame — a production incident saw a silent
 // background command flood one frame/sec for 13 minutes.
 //
-// Bounded FIFO to keep the map from growing across a long session with many
-// commands: entries are keyed by first-seen order and the oldest is evicted
-// past the cap. Eviction of a still-live command only costs a single
-// redundant (re-emitted) frame the next tick, never a flood, so no
-// cross-module lifecycle teardown is needed — the dedup lifecycle stays fully
-// encapsulated in this single emitter.
-const BASH_TAIL_DEDUP_MAX = 64
-const bashTailDedupStore = new Map<string, BashTailSnapshot>()
+// Bounded FIFO keyed by first-seen order to keep the map from growing across a
+// long session with many commands. Storing a cheap fingerprint (not the full
+// snapshot) lets the cap be generous: within 1024 concurrently active streams
+// there is no eviction and dedup is exact. Beyond 1024 simultaneously-live
+// streams FIFO can cycle-evict (each re-emits on its next tick) — a rare
+// pathological fan-out that the gateway's tail-collapse layer backstops. The
+// fingerprint keeps the dedup lifecycle fully encapsulated in this single
+// emitter with no cross-module teardown.
+const BASH_TAIL_DEDUP_MAX = 1024
+const bashTailDedupStore = new Map<string, string>()
 
 /**
  * Dedup decision for a bash_output_tail frame. State-injection style (the
  * caller owns `store`) so it is unit-testable without module singletons.
  *
- * Returns true (emit) and records `next` when the snapshot differs from the
+ * Returns true (emit) and records the fingerprint when `next` differs from the
  * last one recorded for `toolUseId` — including the first frame (no prior) and
  * any change to tail / totalBytes / truncatedHead. Returns false (skip) when
- * the snapshot is byte-for-byte identical to the last recorded one.
+ * the fingerprint is identical to the last recorded one.
  *
  * When a new key pushes the store past `maxEntries`, the oldest first-seen
  * entry is evicted (FIFO). Updating an existing key never triggers eviction.
  */
 export function dedupeBashOutputTail(
-  store: Map<string, BashTailSnapshot>,
+  store: Map<string, string>,
   toolUseId: string,
   next: BashTailSnapshot,
   maxEntries: number,
 ): boolean {
-  const prev = store.get(toolUseId)
-  if (
-    prev &&
-    prev.tail === next.tail &&
-    prev.totalBytes === next.totalBytes &&
-    prev.truncatedHead === next.truncatedHead
-  ) {
+  const fingerprint = bashTailFingerprint(next)
+  if (store.get(toolUseId) === fingerprint) {
     return false
   }
   // Map.set on an existing key preserves its insertion position, so first-seen
   // order (and therefore FIFO eviction order) is stable across updates.
-  store.set(toolUseId, next)
+  store.set(toolUseId, fingerprint)
   if (store.size > maxEntries) {
     const oldest = store.keys().next().value
     if (oldest !== undefined) {

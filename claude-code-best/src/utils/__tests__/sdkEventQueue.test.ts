@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	type BashTailSnapshot,
+	bashTailFingerprint,
 	dedupeBashOutputTail,
 } from "../sdkEventQueue";
 
@@ -12,12 +13,12 @@ const snap = (
 
 describe("dedupeBashOutputTail", () => {
 	test("emits the first frame for a tool_use_id", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		expect(dedupeBashOutputTail(store, "t1", snap("hello", 5), 64)).toBe(true);
 	});
 
 	test("skips an identical repeat (the silent-flood case)", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		dedupeBashOutputTail(store, "t1", snap("hello", 5), 64);
 		// Same snapshot resent every poll tick — all dropped.
 		for (let i = 0; i < 100; i++) {
@@ -28,7 +29,7 @@ describe("dedupeBashOutputTail", () => {
 	});
 
 	test("re-emits when any payload field changes, then dedups again", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		expect(dedupeBashOutputTail(store, "t1", snap("a", 1), 64)).toBe(true);
 		// tail changed
 		expect(dedupeBashOutputTail(store, "t1", snap("ab", 2), 64)).toBe(true);
@@ -47,7 +48,7 @@ describe("dedupeBashOutputTail", () => {
 	});
 
 	test("terminal frame carrying new bytes still emits after a quiet period", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		expect(dedupeBashOutputTail(store, "t1", snap("running", 7), 64)).toBe(true);
 		// quiet ticks
 		expect(dedupeBashOutputTail(store, "t1", snap("running", 7), 64)).toBe(
@@ -60,7 +61,7 @@ describe("dedupeBashOutputTail", () => {
 	});
 
 	test("tracks each tool_use_id independently", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		expect(dedupeBashOutputTail(store, "t1", snap("x", 1), 64)).toBe(true);
 		// Different id with the same content is still a first frame -> emit.
 		expect(dedupeBashOutputTail(store, "t2", snap("x", 1), 64)).toBe(true);
@@ -69,7 +70,7 @@ describe("dedupeBashOutputTail", () => {
 	});
 
 	test("FIFO-evicts the oldest key past the cap without unbounded growth", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		const max = 4;
 		// Seed 4 distinct ids (fills the cap exactly).
 		for (let i = 0; i < max; i++) {
@@ -80,13 +81,15 @@ describe("dedupeBashOutputTail", () => {
 		expect(dedupeBashOutputTail(store, "id-4", snap("v", 1), max)).toBe(true);
 		expect(store.size).toBe(max);
 		expect(store.has("id-0")).toBe(false);
-		// id-0 was evicted, so its next frame is treated as first -> emits once
-		// (single redundant frame, never a flood).
+		// id-0 was evicted (only reachable past the cap — 1024 concurrent active
+		// streams in prod), so its next frame is treated as first -> emits once
+		// and re-inserts. Cycle-eviction past the cap is a rare pathological
+		// fan-out the gateway's tail-collapse layer backstops.
 		expect(dedupeBashOutputTail(store, "id-0", snap("v", 1), max)).toBe(true);
 	});
 
 	test("updating an existing key does not grow the store or trigger eviction", () => {
-		const store = new Map<string, BashTailSnapshot>();
+		const store = new Map<string, string>();
 		const max = 2;
 		dedupeBashOutputTail(store, "a", snap("1", 1), max);
 		dedupeBashOutputTail(store, "b", snap("1", 1), max);
@@ -97,5 +100,36 @@ describe("dedupeBashOutputTail", () => {
 		}
 		expect(store.size).toBe(2);
 		expect(store.has("b")).toBe(true);
+	});
+});
+
+describe("bashTailFingerprint", () => {
+	test("is stable for an identical snapshot", () => {
+		expect(bashTailFingerprint(snap("hello", 5))).toBe(
+			bashTailFingerprint(snap("hello", 5)),
+		);
+	});
+
+	test("differs on any changed field", () => {
+		const base = bashTailFingerprint(snap("hello", 5, false));
+		expect(bashTailFingerprint(snap("hellO", 5, false))).not.toBe(base); // tail
+		expect(bashTailFingerprint(snap("hello", 6, false))).not.toBe(base); // bytes
+		expect(bashTailFingerprint(snap("hello", 5, true))).not.toBe(base); // trunc
+	});
+
+	test("distinguishes same-length different-content tails", () => {
+		// The tail hash (not just totalBytes) guards content-only changes.
+		expect(bashTailFingerprint(snap("abcd", 4))).not.toBe(
+			bashTailFingerprint(snap("abce", 4)),
+		);
+	});
+
+	test("does not confuse hash-part concatenation with the separator", () => {
+		// The two rolling hashes are joined with a '.' so distinct (h1,h2) pairs
+		// cannot collide via boundary ambiguity; large distinct inputs stay
+		// distinct.
+		const a = bashTailFingerprint(snap("x".repeat(1000), 1000));
+		const b = bashTailFingerprint(snap(`${"x".repeat(999)}y`, 1000));
+		expect(a).not.toBe(b);
 	});
 });

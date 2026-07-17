@@ -575,30 +575,65 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(tool?.bashTail?.totalBytes).toBe(100);
   });
 
-  // C3:turn 终态后晚到的纯 tool_output_tail 帧(bg bash 每秒一条尾巴刷新)不得复活发送态。
-  test("tail-only 帧不复活已结束轮的发送态(bg bash tail 不点亮回复中)", () => {
+  // C3:turn 终态后晚到的纯 tool_output_tail 帧(bg bash 每秒一条尾巴刷新)只做帧计活 + bash 卡原位
+  // 刷新,其余生命周期信号(复活发送态/绑 reply tracker/标 user read/onLiveFrame)一律短路。
+  test("tail-only 帧短路生命周期:不复活/不绑 tracker/不标 user read/不触发 onLiveFrame(但 bash 卡原位刷新)", () => {
     const s = sess();
-    // 先建一张 Bash 工具卡,tail 帧才能按 blockId 找到它。
+    const onLiveFrame = vi.fn();
+    // 旧 turn 留下的 Bash 工具卡。
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Bash", blockId: "t1", partial: false, inputJson: {} }] }));
-    // 模拟本轮已收尾:发送态已清(onFinal 会清 _sendingInFlight)。
+    // 模拟旧 turn 已收尾 + 新 turn 的用户行刚发出(尚未回复)。
     s._sendingInFlight = false;
-    // 纯 tool_output_tail 帧 —— 不得复活发送态。
-    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false }] }));
-    expect(s._sendingInFlight).toBe(false);
-    // 但 tail 内容照常落到工具卡(帧计活/渲染不受影响)。
-    expect(s.messages.find((m) => m.blockId === "t1")?.bashTail?.tail).toBe("chunk");
+    s._replyingToMsgId = null;
+    const u = addMessage(s, "user", "新问题", { status: "sent" });
+    // 旧 turn 的 bg bash tail 晚到(纯 tool_output_tail 帧)——与新 turn 用户行重叠。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [{ kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false }] }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(false); // 不复活发送态
+    expect(s._replyingToMsgId).toBeFalsy(); // 不绑 reply tracker
+    expect(u.status).toBe("sent"); // 新 user 行不被错标 read
+    expect(onLiveFrame).not.toHaveBeenCalled(); // 不发 live 生命周期信号
+    expect(s.messages.find((m) => m.blockId === "t1")?.bashTail?.tail).toBe("chunk"); // 但 bash 卡原位刷新
   });
 
-  test("混合帧(tail + text)仍复活发送态", () => {
+  test("活跃 turn 中的 tail-only 帧也不触发 onLiveFrame(帧仍被处理:bash 卡刷新)", () => {
     const s = sess();
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Bash", blockId: "t1", partial: false, inputJson: {} }] }));
+    s._sendingInFlight = true; // turn 仍在进行(长 bash 只发 tail)
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [{ kind: "tool_output_tail", toolUseBlockId: "t1", tail: "更多", totalBytes: 9, truncatedHead: false }] }),
+      { onLiveFrame },
+    );
+    expect(onLiveFrame).not.toHaveBeenCalled(); // tail-only 不发 onLiveFrame
+    expect(s._sendingInFlight).toBe(true); // 活跃态不受影响
+    expect(s.messages.find((m) => m.blockId === "t1")?.bashTail?.tail).toBe("更多"); // 帧仍被处理(块循环原位刷新)
+  });
+
+  test("混合帧(tail + text)行为不变:复活发送态 + 触发 onLiveFrame + 绑 tracker + 标 user read", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Bash", blockId: "t1", partial: false, inputJson: {} }] }));
     s._sendingInFlight = false;
-    // tail + text 混合:text 代表模型确有新生成 → 仍复活。
-    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [
-      { kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false },
-      { kind: "text", text: "继续", messageId: "srv-x" },
-    ] }));
-    expect(s._sendingInFlight).toBe(true);
+    s._replyingToMsgId = null;
+    const u = addMessage(s, "user", "新问题", { status: "sent" });
+    // tail + text 混合:text 代表模型确有新生成 → 生命周期一律照旧。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [
+        { kind: "tool_output_tail", toolUseBlockId: "t1", tail: "chunk", totalBytes: 5, truncatedHead: false },
+        { kind: "text", text: "继续", messageId: "srv-x" },
+      ] }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true); // 复活
+    expect(onLiveFrame).toHaveBeenCalledWith(s); // 生命周期信号照旧
+    expect(s._replyingToMsgId).toBe(u.id); // 绑 tracker
+    expect(u.status).toBe("read"); // 标 read
   });
 
   // C2:采用引擎 messageId(srv- 前缀)的 live 生成行也应被盖上当前活跃轮的 _clientMessageId,

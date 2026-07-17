@@ -345,6 +345,9 @@ describe("CcbAdapter turn parity", () => {
     const { adapter, runner } = makeAdapter();
     const eventsA: EngineEvent[] = [];
     const turnA = beginTurn(adapter, eventsA);
+    // F3:tail 归属靠 Bash tool_use_id 登记 —— 先发起 bg Bash 工具 tu1(否则 fail-closed
+    // 会把归属不明的 tail 丢弃)。
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "sleep 5 &" }));
     runner.msg(textDelta("A"));
     runner.msg(resultRow());
     await turnA.summary;
@@ -434,6 +437,76 @@ describe("CcbAdapter turn parity", () => {
     // 收尾 turn2。
     runner.msg(resultRow({ total_cost_usd: 0.09 }));
     await turnB.summary;
+  });
+
+  test("F3 fail-closed:origin map 逐出后,归属不明 tail 丢弃(不回落当前 turn)", async () => {
+    const { adapter, runner } = makeAdapter();
+    // turn1 登记 258 个 Bash 工具 → 全局 origin map 上限 256,tu0/tu1 被逐出。
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminalA.push({ block: block as { kind: string; tail?: string } }),
+    });
+    const N = 258;
+    for (let i = 0; i < N; i++) {
+      runner.msg(assistantToolUse(`tu${i}`, "Bash", { command: `sleep 1 &` }));
+    }
+    runner.msg(resultRow());
+    await turnA.summary;
+
+    // turn2 激活(不拥有任何 turn1 的 Bash id)。
+    const eventsB: EngineEvent[] = [];
+    const turnB = beginTurn(adapter, eventsB);
+    runner.msg(textDelta("B"));
+
+    // tu0 已被 LRU 逐出 origin map + turn2 不拥有它 → fail-closed 丢弃。
+    runner.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu0", tail: "evicted", total_bytes: 7 });
+    // tu257(最近登记,仍在册)→ 命中 → 归位 turn1。
+    runner.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu257", tail: "retained", total_bytes: 8 });
+
+    assert.equal(postTerminalA.length, 1, "只有仍在册的 tu257 归位 turn1;被逐出的 tu0 丢弃");
+    assert.equal(postTerminalA[0].block.tail, "retained");
+    // turn2 未被污染。
+    assert.equal(
+      turnB.getPartialSnapshot().runtimeEvents.some(
+        (e) => (e.payload as { subtype?: string })?.subtype === "bash_output_tail",
+      ),
+      false,
+      "被丢弃的 tail 绝不灌进 turn2",
+    );
+
+    runner.msg(resultRow({ total_cost_usd: 0.02 }));
+    await turnB.summary;
+  });
+
+  test("F3⑤ shutdown:drain 期间的尾帧仍按 origin 归位,之后才清 map", async () => {
+    class DrainRunner extends FakeCcbRunner {
+      async shutdown(): Promise<void> {
+        // 模拟 SIGTERM drain 期间 bg bash 迟到的一帧 tail(map 此刻应仍在)。
+        this.msg({ type: "system", subtype: "bash_output_tail", tool_use_id: "tu1", tail: "drain-tail", total_bytes: 9 });
+      }
+    }
+    const runner = new DrainRunner();
+    const adapter = new CcbAdapter({} as EngineCreateOpts, runner as unknown as SubprocessRunner);
+    const events: EngineEvent[] = [];
+    const postTerminal: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turn = adapter.submitTurn({
+      input: "hi",
+      onEvent: (e) => events.push(e),
+      sessionTotals: makeTotals(),
+      toolUseIdToName: new Map(),
+      onPostTerminalRuntimeEvent: (_e, block) =>
+        postTerminal.push({ block: block as { kind: string; tail?: string } }),
+    });
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "x &" }));
+    runner.msg(resultRow());
+    await turn.summary;
+
+    await adapter.shutdown(); // 内部 await runner.shutdown()(emit tail)后才清 map
+
+    assert.equal(postTerminal.length, 1, "drain 期尾帧按 origin 归位(清 map 在 await 之后)");
+    assert.equal(postTerminal[0].block.tail, "drain-tail");
   });
 
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {
