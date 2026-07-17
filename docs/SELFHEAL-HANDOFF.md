@@ -82,7 +82,7 @@ bash scripts/test-mutex.sh commercial 'psql "postgres://test:test@127.0.0.1:5543
 ## 5. 接手必须知道的红线
 
 1. **writer-guard 在回滚双重门通过前必须保持禁用**。0136 是不可改写的历史迁移；0137 会显式删除其 trigger/function，使已应用和未应用过 0136 的环境收敛。真实 SQL 位于 `db/deferred/selfheal_writer_guard.sql`，双重门通过后再用新的迁移版本号上线。
-2. **`OC_SELFHEAL_DISPATCH_DISABLED` 默认 = 1(禁派单)**,`OC_SELFHEAL_AUTO_DEPLOY_TIER2` 默认 = 0(生产 cutover 需人工一键放行)。首次上线两者都不要动。
+2. **`OC_SELFHEAL_DISPATCH_DISABLED` 默认 = 1(禁派单)**,首次上线不要动。**Tier2 没有「自动部署」env 闸**:代码里**不存在** `OC_SELFHEAL_AUTO_DEPLOY_TIER2`(只在早期 RFC 设计里提过一档「测试全绿自动 cutover」,从未落地成 env)。生产 cutover 的唯一放行入口是**人工放行门** `adminReleaseRepair`(`admin/selfhealOps.ts`,route `POST /api/admin/selfheal/repairs/:id/release`)—— 它是 `selfheal_release_requests` 的**唯一 inserter**,本身就是「人工一键放行」,不存在自动 cutover 档位。
 3. **commercial 测试必经 `test-mutex.sh`**(跨 worktree 共享 octest PG)。
 4. **跨仓契约(改一侧必须同步另一侧)**:
    - HMAC 签名串:`${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`
