@@ -191,12 +191,82 @@ export function emitTaskTerminatedSdk(
   })
 }
 
+// The three payload fields of a bash_output_tail frame that define its
+// content identity. Two frames with equal snapshots carry no new information
+// for the consumer (which REPLACES its tail buffer wholesale).
+export type BashTailSnapshot = {
+  tail: string
+  totalBytes: number
+  truncatedHead: boolean
+}
+
+// Per-tool_use_id last-emitted snapshot, used to suppress unchanged frames.
+// The tail poller ticks at ~1 Hz for the whole life of a (possibly
+// backgrounded) bash command; when output stops growing, every tick would
+// otherwise re-emit an identical frame — a production incident saw a silent
+// background command flood one frame/sec for 13 minutes.
+//
+// Bounded FIFO to keep the map from growing across a long session with many
+// commands: entries are keyed by first-seen order and the oldest is evicted
+// past the cap. Eviction of a still-live command only costs a single
+// redundant (re-emitted) frame the next tick, never a flood, so no
+// cross-module lifecycle teardown is needed — the dedup lifecycle stays fully
+// encapsulated in this single emitter.
+const BASH_TAIL_DEDUP_MAX = 64
+const bashTailDedupStore = new Map<string, BashTailSnapshot>()
+
+/**
+ * Dedup decision for a bash_output_tail frame. State-injection style (the
+ * caller owns `store`) so it is unit-testable without module singletons.
+ *
+ * Returns true (emit) and records `next` when the snapshot differs from the
+ * last one recorded for `toolUseId` — including the first frame (no prior) and
+ * any change to tail / totalBytes / truncatedHead. Returns false (skip) when
+ * the snapshot is byte-for-byte identical to the last recorded one.
+ *
+ * When a new key pushes the store past `maxEntries`, the oldest first-seen
+ * entry is evicted (FIFO). Updating an existing key never triggers eviction.
+ */
+export function dedupeBashOutputTail(
+  store: Map<string, BashTailSnapshot>,
+  toolUseId: string,
+  next: BashTailSnapshot,
+  maxEntries: number,
+): boolean {
+  const prev = store.get(toolUseId)
+  if (
+    prev &&
+    prev.tail === next.tail &&
+    prev.totalBytes === next.totalBytes &&
+    prev.truncatedHead === next.truncatedHead
+  ) {
+    return false
+  }
+  // Map.set on an existing key preserves its insertion position, so first-seen
+  // order (and therefore FIFO eviction order) is stable across updates.
+  store.set(toolUseId, next)
+  if (store.size > maxEntries) {
+    const oldest = store.keys().next().value
+    if (oldest !== undefined) {
+      store.delete(oldest)
+    }
+  }
+  return true
+}
+
 /**
  * Emit a snapshot of a bash command's tail output. Snapshot semantics:
  * the consumer (gateway → web) replaces its prior tail buffer with `tail`
  * rather than appending — the polling cadence is deliberately lossy on
  * the head when output exceeds the tail window, which is signalled by
  * `truncatedHead`.
+ *
+ * Unchanged-frame suppression: frames whose (tail, totalBytes, truncatedHead)
+ * are identical to the previously emitted one for this toolUseId are dropped
+ * here at the single emitter, covering both the foreground onProgress path and
+ * the backgrounded keepalive (which reuses the same onProgress closure). Any
+ * content change — including the first frame and a terminal frame carrying new
+ * bytes / a changed truncated flag — still emits.
  */
 export function emitBashOutputTail(
   toolUseId: string,
@@ -205,6 +275,16 @@ export function emitBashOutputTail(
   truncatedHead: boolean,
   opts?: { taskId?: string; parentToolUseId?: string },
 ): void {
+  if (
+    !dedupeBashOutputTail(
+      bashTailDedupStore,
+      toolUseId,
+      { tail, totalBytes, truncatedHead },
+      BASH_TAIL_DEDUP_MAX,
+    )
+  ) {
+    return
+  }
   enqueueSdkEvent({
     type: 'system',
     subtype: 'bash_output_tail',
