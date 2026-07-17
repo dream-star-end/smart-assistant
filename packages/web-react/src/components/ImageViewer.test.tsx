@@ -44,6 +44,8 @@ type HarnessProps = {
   src?: string
   alt?: string
   cacheIdentity?: string | null
+  readOnly?: boolean
+  referrerPolicy?: React.HTMLAttributeReferrerPolicy
 }
 
 function Harness({
@@ -57,6 +59,8 @@ function Harness({
   src = SIGNED,
   alt = '海报',
   cacheIdentity,
+  readOnly,
+  referrerPolicy,
 }: HarnessProps) {
   const [open, setOpen] = useState(true)
   return (
@@ -75,6 +79,8 @@ function Harness({
         peek={peek ?? (() => SIGNED)}
         submitImageEdit={submitImageEdit}
         initialMode={initialMode}
+        readOnly={readOnly}
+        referrerPolicy={referrerPolicy}
       />
     </ImageEditActionsContext.Provider>
   )
@@ -131,6 +137,23 @@ describe('ImageViewer 全屏查看器', () => {
     render(<Harness />)
     for (const label of ['编辑', '评论', '调整大小']) {
       expect(screen.getByRole('button', { name: label })).toBeDisabled()
+    }
+  })
+
+  test('只读外链查看器保留 no-referrer 且不暴露写交互', () => {
+    render(
+      <Harness
+        src="https://cdn.test/inbox.png"
+        signPath={null}
+        cacheIdentity={null}
+        readOnly
+        referrerPolicy="no-referrer"
+      />,
+    )
+    expect(screen.getByAltText('海报')).toHaveAttribute('referrerpolicy', 'no-referrer')
+    expect(screen.getByRole('button', { name: '下载' })).toBeInTheDocument()
+    for (const label of ['编辑', '评论', '调整大小', '分享', '更多']) {
+      expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument()
     }
   })
 
