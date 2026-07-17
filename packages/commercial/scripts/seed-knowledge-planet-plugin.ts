@@ -871,8 +871,6 @@ async function advisoryStatus(): Promise<void> {
   const imageId = imageIdFromEnv()
   await inspectExactImage(docker, imageId)
   const expected = verificationExpected(imageId)
-  const approvedForDeploy = (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
-  const handoff = await readHandoffIfPresent(expected)
   const current = await query<{ artifact_hash: string }>(
     `SELECT v.artifact_hash
        FROM marketplace_skill_listings l
@@ -882,14 +880,22 @@ async function advisoryStatus(): Promise<void> {
     [KNOWLEDGE_PLANET_PLUGIN_CONTRACT.id],
   )
   const currentApprovedArtifactHash = current.rows[0]?.artifact_hash ?? null
+  const artifactMatchesCurrentApproved =
+    currentApprovedArtifactHash !== null &&
+    currentApprovedArtifactHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash
+  // A changed artifact is the normal "not approved yet" advisory state, not
+  // an infrastructure/trust-read failure. Only reuse of the exact approved
+  // artifact needs the strict deploy lookup; its deeper mismatch still throws.
+  const approvedForDeploy =
+    artifactMatchesCurrentApproved &&
+    (await findApprovedKnowledgePlanetPluginForDeploy(process.env)) !== null
+  const handoff = await readHandoffIfPresent(expected)
   process.stdout.write(
     `${JSON.stringify({
       advisory: 'knowledge-planet',
       approvedForDeploy,
       handoffPresent: handoff !== null,
-      artifactMatchesCurrentApproved:
-        currentApprovedArtifactHash !== null &&
-        currentApprovedArtifactHash === COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+      artifactMatchesCurrentApproved,
     })}\n`,
   )
 }
