@@ -423,6 +423,20 @@ export interface AgentSession {
    * channel is not persisted as its own chat session, so handleDelegateTask
    * moves this collector into the parent DurableAgentGroup. */
   _durableDelegateRuntimeEvents?: DurableRuntimeEvent[]
+  /** A1 — post-terminal bash_output_tail 折叠状态(per session,懒建)。键 =
+   *  `${ownerTurnKey}\0${parentToolUseId}\0${toolUseId}`。见
+   *  SessionManager._foldPostTerminalTail:把 CCB bg bash 在 turn 终态后每秒不变的
+   *  tail 洪泛压成"内容变化才落 / 5s 限频 / 每流 24 条 + 每 turn 64 条封顶"。
+   *  session 销毁时 flush pending 后清空(见 _flushTailFolding)。 */
+  _tailFoldStreams?: Map<string, TailFoldStreamState>
+  /** A1 — 每 ownerTurnKey 已持久化 tail 总数(跨流聚合封顶)。 */
+  _tailFoldOwnerCounts?: Map<string, number>
+  /** A1 — 折叠抑制计数(会话销毁时汇总 log 一次,不引入新监控机制)。 */
+  _tailFoldMetrics?: { unchangedSuppressed: number; rateCoalesced: number; capped: number }
+  /** A1 — 折叠 tail 与非折叠 post-terminal 事件共享的 **per-session** 串行持久化链。
+   *  定时器 flush 与事件回调都经它串行化,杜绝并发双 flush;含义即原 per-turn
+   *  postTerminalRuntimeChain 提升到 session 维度。 */
+  _postTerminalRuntimeChain?: Promise<void>
   /** Complete engine-reported billing frames for this delegate subtree.
    * handleDelegateTask moves them into the parent DurableAgentGroup. */
   _durableDelegateEngineBillings?: EngineBillingEvent[]
@@ -1031,6 +1045,52 @@ function persistPostTerminalRuntimeEvent(args: {
   })
 }
 
+/** A1 — 单条待折叠/持久化的 post-terminal bash_output_tail。归属值(ownerTurnKey/
+ *  ownerSessionId/turnIndex/onEvent)由发起 turn 的闭包捕获传入;因 tool_use_id 是
+ *  流键的一部分、且一个 tool_use_id 只归一个 turn,同一 stream key 的这些值恒定。 */
+interface TailFoldItem {
+  event: DurableRuntimeEvent
+  block: OutboundContentBlock
+  hash: string
+  ownerTurnKey: string
+  ownerSessionId: string
+  turnIndex: number
+  toolUseId: string
+  parentToolUseId: string
+  onEvent: (e: SessionStreamEvent) => void
+}
+
+/** A1 — 单个 tail 流(键 = ownerTurnKey + parentToolUseId + toolUseId)的折叠状态。 */
+interface TailFoldStreamState {
+  /** 上次**持久化成功**的内容 hash(失败不更新 → 下次重试);null = 尚未持久化。 */
+  lastPersistedHash: string | null
+  /** 上次持久化**尝试**时刻(限频锚点;0 = 从未尝试)。 */
+  lastPersistAt: number
+  /** 本流已成功持久化的真实 tail 条数(per-stream cap 判定)。 */
+  persistedCount: number
+  /** trailing-edge 合并槽:限频窗口内只保留最新一条。 */
+  pending: TailFoldItem | null
+  timer: ReturnType<typeof setTimeout> | null
+  /** cap 触发后置位:该流之后的事件既不持久化也不转发。 */
+  capped: boolean
+}
+
+/** tail 内容指纹 = tail + total_bytes + truncated_head + tool_use_id +
+ *  parent_tool_use_id。bg bash 每秒 emit 的不变 tail 指纹相同 → 折叠丢弃。 */
+function tailContentHash(payload: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(typeof payload.tail === 'string' ? payload.tail : '')
+    .update('\0')
+    .update(String(typeof payload.total_bytes === 'number' ? payload.total_bytes : 0))
+    .update('\0')
+    .update(String(!!payload.truncated_head))
+    .update('\0')
+    .update(typeof payload.tool_use_id === 'string' ? payload.tool_use_id : '')
+    .update('\0')
+    .update(typeof payload.parent_tool_use_id === 'string' ? payload.parent_tool_use_id : '')
+    .digest('hex')
+}
+
 /**
  * M2 — turn-waive 上报的记账键选择(exported for tests)。
  *
@@ -1068,6 +1128,11 @@ export class SessionManager {
   private _runtimeRecycleDrainTimer: ReturnType<typeof setTimeout> | null = null
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
   private maxIdleMsChat = 2 * 60 * 60 * 1000 // 2 hours for webchat sessions (resume-map persists for reconnect)
+  // A1 post-terminal tail 折叠参数(默认值即生产值;private 供单测按小值/短窗覆盖,
+  // 不下沉到 env 面以免扩散配置权威)。
+  private _tailFoldMinIntervalMs = 5000
+  private _tailFoldStreamCap = 24
+  private _tailFoldOwnerCap = 64
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
@@ -1363,6 +1428,194 @@ export class SessionManager {
   async awaitPendingPersistence(): Promise<void> {
     if (this._pendingPersistence.size === 0) return
     await Promise.allSettled([...this._pendingPersistence])
+  }
+
+  /** A1 — 把一次 tail 持久化(或 capped marker)追加到 **per-session** 串行链,并
+   *  纳入 pending-persistence 跟踪。折叠/非折叠 post-terminal 事件都经此串行化,
+   *  故定时器 flush 与事件回调不会并发双写。 */
+  private _chainTailPersist(session: AgentSession, task: () => Promise<void>): void {
+    const chain = (session._postTerminalRuntimeChain ?? Promise.resolve())
+      .then(task)
+      .catch((err) => {
+        log.error(
+          'post-terminal runtime persist failed',
+          { sessionKey: session.sessionKey },
+          err as Error,
+        )
+      })
+    session._postTerminalRuntimeChain = chain
+    this._trackPersistence(chain)
+  }
+
+  /** A1 — 实际持久化一条 tail;达 cap 时改持久化一条 capped marker 并封停该流。
+   *  cap 判定与计数增量全部在**串行链任务内**完成(读到的是最新值,不受 enqueue
+   *  时刻的陈旧快照影响)。先持久化后转发;持久化失败不更新 hash 也不转发,从而
+   *  维持"转发的必已持久化"。exemptCap 只给 session 销毁时每流一次的 terminal flush。 */
+  private _enqueueTailPersist(
+    session: AgentSession,
+    st: TailFoldStreamState,
+    item: TailFoldItem,
+    opts: { exemptCap: boolean },
+  ): void {
+    // 限频锚点:尝试时刻同步置位(而非落定时刻),给后续事件稳定的 5s 间隔判定。
+    st.lastPersistAt = Date.now()
+    this._chainTailPersist(session, async () => {
+      const ownerCounts = (session._tailFoldOwnerCounts ??= new Map())
+      const metrics = (session._tailFoldMetrics ??= {
+        unchangedSuppressed: 0,
+        rateCoalesced: 0,
+        capped: 0,
+      })
+      // 迟到同内容:rapid-fire 的重复 tail 在首条持久化落定前已排进 pending,
+      // 落定后其 hash 已等于 lastPersistedHash → 不重复落(否则 flush 会写重)。
+      if (item.hash === st.lastPersistedHash) {
+        metrics.unchangedSuppressed++
+        return
+      }
+      if (st.capped) return
+      const ownerCount = ownerCounts.get(item.ownerTurnKey) ?? 0
+      const capReached =
+        st.persistedCount >= this._tailFoldStreamCap || ownerCount >= this._tailFoldOwnerCap
+      if (capReached && !opts.exemptCap) {
+        st.capped = true
+        metrics.capped++
+        log.warn('post-terminal tail stream capped', {
+          sessionKey: session.sessionKey,
+          ownerTurnKey: item.ownerTurnKey,
+          toolUseId: item.toolUseId,
+          persistedCount: st.persistedCount,
+          ownerCount,
+        })
+        await persistPostTerminalRuntimeEvent({
+          sessionKey: session.sessionKey,
+          sessionId: item.ownerSessionId,
+          turnIndex: item.turnIndex,
+          continuationOfTurnKey: item.ownerTurnKey,
+          event: {
+            ordinal: item.event.ordinal,
+            observedAt: Date.now(),
+            source: 'gateway',
+            payload: {
+              type: 'system',
+              subtype: 'bash_output_tail_capped',
+              tool_use_id: item.toolUseId,
+              ...(item.parentToolUseId ? { parent_tool_use_id: item.parentToolUseId } : {}),
+              suppressed_reason: 'cap',
+            },
+          },
+        })
+        // marker 无对应 UI block:只持久化不转发(仍满足"转发的必已持久化")。
+        return
+      }
+      // 真实 tail:committed 才进 delegate durable 收集器(被抑制/封顶的绝不进,
+      // 否则 delegate transcript 会跟着一起洪泛)。
+      session._durableDelegateRuntimeEvents?.push(structuredClone(item.event))
+      const ok = await persistPostTerminalRuntimeEvent({
+        sessionKey: session.sessionKey,
+        sessionId: item.ownerSessionId,
+        turnIndex: item.turnIndex,
+        continuationOfTurnKey: item.ownerTurnKey,
+        event: item.event,
+      })
+      if (ok) {
+        st.lastPersistedHash = item.hash
+        st.persistedCount++
+        ownerCounts.set(item.ownerTurnKey, ownerCount + 1)
+        item.onEvent({ kind: 'block', block: item.block })
+      }
+    })
+  }
+
+  /** A1 — bash_output_tail 折叠入口(在发起 turn 的 onPostTerminalRuntimeEvent 内
+   *  为每条 tail 调用)。去重(内容不变直接丢弃)→ 限频(<5s trailing-edge 合并,
+   *  只保留最新一条,定时器到点 flush)→ 否则立即 enqueue 持久化。 */
+  private _foldPostTerminalTail(
+    session: AgentSession,
+    item: TailFoldItem,
+    streamKey: string,
+  ): void {
+    const streams = (session._tailFoldStreams ??= new Map())
+    const metrics = (session._tailFoldMetrics ??= {
+      unchangedSuppressed: 0,
+      rateCoalesced: 0,
+      capped: 0,
+    })
+    let st = streams.get(streamKey)
+    if (!st) {
+      st = {
+        lastPersistedHash: null,
+        lastPersistAt: 0,
+        persistedCount: 0,
+        pending: null,
+        timer: null,
+        capped: false,
+      }
+      streams.set(streamKey, st)
+    }
+    // 已封顶:静默丢弃(cap 已在触发时计数 + warn 一次)。
+    if (st.capped) return
+    // 稳态洪泛:内容与上次持久化相同 → 丢弃(不持久化、不转发、不进 durable 收集器)。
+    if (item.hash === st.lastPersistedHash) {
+      metrics.unchangedSuppressed++
+      return
+    }
+    const now = Date.now()
+    if (st.lastPersistAt > 0 && now - st.lastPersistAt < this._tailFoldMinIntervalMs) {
+      // 限频:trailing-edge 合并,只保留最新一条 pending;到点 flush 走同一串行链。
+      metrics.rateCoalesced++
+      st.pending = item
+      if (!st.timer) {
+        const delay = Math.max(0, st.lastPersistAt + this._tailFoldMinIntervalMs - now)
+        st.timer = setTimeout(() => {
+          st!.timer = null
+          const pending = st!.pending
+          st!.pending = null
+          if (pending) this._enqueueTailPersist(session, st!, pending, { exemptCap: false })
+        }, delay)
+        // 折叠定时器不该拖住进程退出:销毁路径会主动 flush pending 并 clear。
+        const t = st.timer as { unref?: () => void }
+        if (typeof t.unref === 'function') t.unref()
+      }
+      return
+    }
+    this._enqueueTailPersist(session, st, item, { exemptCap: false })
+  }
+
+  /** A1 — session 销毁收尾(destroySession / LRU 驱逐 / shutdownAll 三处)。调用前
+   *  caller 必须已 await runner.shutdown()(确保底座停产出)。flush 各流 pending
+   *  (最终态豁免限频 + 每流一个豁免 cap 的 terminal 槽位),await 串行链排空,
+   *  汇总 log 抑制指标一次,再清状态与定时器。 */
+  private async _flushTailFolding(session: AgentSession): Promise<void> {
+    const streams = session._tailFoldStreams
+    if (streams) {
+      for (const st of streams.values()) {
+        if (st.timer) {
+          clearTimeout(st.timer)
+          st.timer = null
+        }
+        const pending = st.pending
+        st.pending = null
+        if (pending && !st.capped) {
+          this._enqueueTailPersist(session, st, pending, { exemptCap: true })
+        }
+      }
+    }
+    if (session._postTerminalRuntimeChain) {
+      await session._postTerminalRuntimeChain.catch(() => {})
+    }
+    const m = session._tailFoldMetrics
+    if (m && (m.unchangedSuppressed || m.rateCoalesced || m.capped)) {
+      log.info('post-terminal tail folding summary', {
+        sessionKey: session.sessionKey,
+        unchanged_suppressed: m.unchangedSuppressed,
+        rate_coalesced: m.rateCoalesced,
+        capped: m.capped,
+      })
+    }
+    session._tailFoldStreams = undefined
+    session._tailFoldOwnerCounts = undefined
+    session._tailFoldMetrics = undefined
+    session._postTerminalRuntimeChain = undefined
   }
 
   /** Record a platform-executed turn (for example a trusted Image 2 edit)
@@ -2848,12 +3101,10 @@ export class SessionManager {
     // merely the last card projection) so a disconnected browser is never the
     // sole durable copy.
     const structuredBlocks: Array<Record<string, unknown>> = []
-    let postTerminalRuntimeChain: Promise<void> = Promise.resolve()
     const onPostTerminalRuntimeEvent = (
       event: DurableRuntimeEvent,
       block: OutboundContentBlock,
     ): void => {
-      session._durableDelegateRuntimeEvents?.push(structuredClone(event))
       const ownerTurnKey = session.channel === 'delegate'
         ? session._billingParentTurnKey
         : turnKey
@@ -2861,28 +3112,52 @@ export class SessionManager {
         ? session._usageAttribution?.parentSessionId
         : session.peerId
       if (!ownerTurnKey || !ownerSessionId) {
+        // 无法归属(缺 turnKey / sessionId)→ 保持旧的直接转发(不持久化)兜底语义。
         onEvent({ kind: 'block', block })
         return
       }
-      postTerminalRuntimeChain = postTerminalRuntimeChain.then(async () => {
-        await persistPostTerminalRuntimeEvent({
-          sessionKey: session.sessionKey,
-          sessionId: ownerSessionId,
-          turnIndex: prevTurns + 1,
-          continuationOfTurnKey: ownerTurnKey,
-          event,
+      const payload =
+        event.payload && typeof event.payload === 'object'
+          ? (event.payload as Record<string, unknown>)
+          : null
+      // 非 bash_output_tail 的 post-terminal 事件:保持既有逐条持久化路径不变
+      // (仅把原 per-turn 链提升为 per-session 串行链,先持久化后转发,行为等价)。
+      if (!payload || payload.subtype !== 'bash_output_tail') {
+        session._durableDelegateRuntimeEvents?.push(structuredClone(event))
+        this._chainTailPersist(session, async () => {
+          await persistPostTerminalRuntimeEvent({
+            sessionKey: session.sessionKey,
+            sessionId: ownerSessionId,
+            turnIndex: prevTurns + 1,
+            continuationOfTurnKey: ownerTurnKey,
+            event,
+          })
+          // Never show a post-terminal snapshot before its exact raw event is
+          // fsynced in the sink queue (and normally ACKed by master).
+          onEvent({ kind: 'block', block })
         })
-        // Never show a post-terminal snapshot before its exact raw event is
-        // fsynced in the sink queue (and normally ACKed by master).
-        onEvent({ kind: 'block', block })
-      }).catch((err) => {
-        log.error(
-          'post-terminal runtime continuation persist failed',
-          { sessionKey: session.sessionKey, turnKey: ownerTurnKey },
-          err as Error,
-        )
-      })
-      this._trackPersistence(postTerminalRuntimeChain)
+        return
+      }
+      // bash_output_tail → 折叠(去重 / 5s 限频 / 每流 24 + 每 turn 64 封顶),把
+      // CCB bg bash 在 turn 终态后每秒不变的 tail 洪泛压掉。
+      const toolUseId = typeof payload.tool_use_id === 'string' ? payload.tool_use_id : ''
+      const parentToolUseId =
+        typeof payload.parent_tool_use_id === 'string' ? payload.parent_tool_use_id : ''
+      this._foldPostTerminalTail(
+        session,
+        {
+          event,
+          block,
+          hash: tailContentHash(payload),
+          ownerTurnKey,
+          ownerSessionId,
+          turnIndex: prevTurns + 1,
+          toolUseId,
+          parentToolUseId,
+          onEvent,
+        },
+        [ownerTurnKey, parentToolUseId, toolUseId].join('\u0000'),
+      )
     }
 
     // Snapshot session totals so we can roll back on auth error / phantom turn
@@ -3992,6 +4267,8 @@ export class SessionManager {
       // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
       //  闭包链整体可 GC,无需再显式卸 'message' listener。)
       await s.runner.shutdown()
+      // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态(await 持久化链)。
+      await this._flushTailFolding(s)
       // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
       // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
       if (s.executionTarget.kind === 'remote' && s.userId) {
@@ -4044,6 +4321,9 @@ export class SessionManager {
     }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     await Promise.all(muxReleases.map((fn) => fn()))
+    // A1:底座已全部停产出,flush 各 session 折叠 tail 的 pending(其持久化随后被
+    // awaitPendingPersistence 一并排空)。
+    await Promise.all([...this.sessions.values()].map((s) => this._flushTailFolding(s)))
     // Drain server-authored persistence promises (turn-end fan-outs +
     // handleExit setTimeout-150ms partial flushes registered while the
     // runners were being torn down). Must complete before server.ts
@@ -4110,6 +4390,8 @@ export class SessionManager {
             try {
               await s.runner.shutdown()
             } catch {}
+            // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
+            await this._flushTailFolding(s)
             // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
             if (s.executionTarget.kind === 'remote' && s.userId) {
               await this._remoteTargetController

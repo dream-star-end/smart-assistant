@@ -992,6 +992,187 @@ describe("crash/interrupt partial persistence", () => {
   });
 });
 
+// ── A1 post-terminal bash_output_tail 折叠 ────────────────────────────────
+
+describe("post-terminal tail folding (A1)", () => {
+  const mkTail = (over: Record<string, unknown> = {}) => ({
+    type: "system",
+    subtype: "bash_output_tail",
+    tool_use_id: "tool-bg",
+    tail: "same output",
+    total_bytes: 11,
+    truncated_head: false,
+    ...over,
+  });
+
+  /** 跑一个最小 turn(text+result),返回可继续注入 post-terminal tail 的句柄。 */
+  async function runFoldTurn(sm: SessionManager, requestId: string): Promise<{
+    session: AgentSession;
+    runner: FakeCcbRunner;
+    events: SessionStreamEvent[];
+  }> {
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.text("done");
+        r.result({ stop_reason: "end_turn", usage: { output_tokens: 1 } });
+      });
+    });
+    const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+    await sm.submit(session, "go", (e) => events.push(e), undefined, undefined, requestId);
+    return { session, runner, events };
+  }
+
+  const flush = (sm: SessionManager, session: AgentSession): Promise<void> =>
+    (sm as unknown as { _flushTailFolding: (s: AgentSession) => Promise<void> })._flushTailFolding(
+      session,
+    );
+
+  const tailBlockCount = (events: SessionStreamEvent[]): number =>
+    events.filter(
+      (e) => e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+    ).length;
+
+  test("同 hash 连发 N 条:只落 1 条 continuation 且只转发 1 条 block", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { session, runner, events } = await runFoldTurn(sm, "e".repeat(32));
+      const baseline = captured.payloads.length; // main turn tape
+
+      runner.msg(mkTail()); // 首条 → 立即持久化
+      await sm.awaitPendingPersistence();
+      // 同内容连发 → 稳态早退丢弃(不落、不转、不进 durable 收集器)
+      for (let i = 0; i < 4; i++) runner.msg(mkTail());
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 1, "同 hash 只持久化 1 条");
+      assert.equal(tails[0].continuationOfTurnKey, captured.payloads[0].turnKey);
+      assert.equal(tailBlockCount(events), 1, "只转发 1 条 tool_output_tail block");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("内容变化但 <interval:trailing flush 恰一次(合并到最新一条)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      // 缩短限频窗口,用真定时器 + 短 sleep 精确观察 trailing flush。
+      (sm as unknown as { _tailFoldMinIntervalMs: number })._tailFoldMinIntervalMs = 40;
+      const { session, runner } = await runFoldTurn(sm, "f".repeat(32));
+      const baseline = captured.payloads.length;
+
+      runner.msg(mkTail({ tail: "line-1", total_bytes: 1 })); // 立即落,锚定限频窗口
+      runner.msg(mkTail({ tail: "line-2", total_bytes: 2 })); // 窗口内变化 → pending
+      runner.msg(mkTail({ tail: "line-3", total_bytes: 3 }));
+      runner.msg(mkTail({ tail: "line-4", total_bytes: 4 }));
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length - baseline, 1, "限频窗口内只先落 tail(1)");
+
+      await new Promise((r) => setTimeout(r, 90)); // 等定时器到点
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 2, "trailing flush 恰一次");
+      assert.deepEqual(
+        tails.map((p) => (p.runtimeEvents?.[0].payload as { tail?: string }).tail),
+        ["line-1", "line-4"],
+        "只落首条 + 合并后的最新一条",
+      );
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("每流 cap:达上限后落 capped marker,之后既不落也不转", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as {
+        _tailFoldMinIntervalMs: number;
+        _tailFoldStreamCap: number;
+      };
+      smAny._tailFoldMinIntervalMs = 0; // 关限频:每条不同内容都立即持久化
+      smAny._tailFoldStreamCap = 3; // 缩小 cap 以精确断言
+      const { session, runner, events } = await runFoldTurn(sm, "g".repeat(32));
+      const baseline = captured.payloads.length;
+
+      // 前 3 条真实落,第 4 条(达 cap)落 capped marker。
+      for (let i = 1; i <= 4; i++) {
+        runner.msg(mkTail({ tail: `l-${i}`, total_bytes: i }));
+        await sm.awaitPendingPersistence();
+      }
+      // 封顶后:第 5、6 条丢弃。
+      runner.msg(mkTail({ tail: "l-5", total_bytes: 5 }));
+      runner.msg(mkTail({ tail: "l-6", total_bytes: 6 }));
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 4, "3 条真实 tail + 1 条 capped marker");
+      assert.deepEqual(
+        tails.map((p) => (p.runtimeEvents?.[0].payload as { subtype?: string }).subtype),
+        [
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail",
+          "bash_output_tail_capped",
+        ],
+      );
+      const marker = tails[3].runtimeEvents?.[0].payload as {
+        suppressed_reason?: string;
+        tool_use_id?: string;
+      };
+      assert.equal(marker.suppressed_reason, "cap");
+      assert.equal(marker.tool_use_id, "tool-bg");
+      assert.equal(tailBlockCount(events), 3, "只转发 3 条真实 tail(marker 与封顶后事件不转发)");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("session destroy:flush pending(最终态豁免限频)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { session, runner } = await runFoldTurn(sm, "h".repeat(32));
+      const baseline = captured.payloads.length;
+      // 挂进 sessions 表,让 destroySession 能定位到它。
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      runner.msg(mkTail({ tail: "first", total_bytes: 1 })); // 立即落
+      runner.msg(mkTail({ tail: "second", total_bytes: 2 })); // 默认 5s 窗口内 → pending
+      await sm.awaitPendingPersistence();
+      assert.equal(captured.payloads.length - baseline, 1, "pending 未到点,仅首条落");
+
+      await sm.destroySession(session.sessionKey); // 应 flush pending,不等 5s 定时器
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 2, "destroy 触发 pending 的 terminal flush");
+      assert.equal(
+        (tails[1].runtimeEvents?.[0].payload as { tail?: string }).tail,
+        "second",
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+});
+
 describe("active-turn replay lock-owner lifecycle", () => {
   test("a queued submit cannot replace the marker until it actually owns session.lock", async () => {
     const sm = new SessionManager(makeConfigStub());

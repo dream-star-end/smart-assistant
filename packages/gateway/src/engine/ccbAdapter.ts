@@ -198,6 +198,17 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * pendingToolCalls 归 0、telemetry 停止 ingest。
    */
   private _activeTurn: CcbTurnContext | null = null
+  /**
+   * A0 owner attribution:tool_use_id → 发起它的 turn 上下文。CCB bg bash 的
+   * bash_output_tail 在后续 turn 期间仍持续 emit,若一律按 _routeTurn(最近一次
+   * submitTurn)路由,turn1 的 bg bash tail 会被错误灌进 turn2 的活跃 parser
+   * (记进 turn2 的 runtimeEvents/tape)。靠本 map 把 tail 路由回**发起 turn**的
+   * (已 finalized)parser → onPostFinalRuntimeEvent → 正确 ownerTurnKey。
+   * 登记点 = 每个 turn parser 的 onToolUse 回调(仅主 agent 工具);FIFO 逐出最旧
+   * 防长会话泄漏;shutdown 清空。
+   */
+  private readonly _toolOriginByUseId = new Map<string, CcbTurnContext>()
+  private static readonly TOOL_ORIGIN_MAX = 256
 
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
@@ -208,7 +219,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     // parser.parse 之前的顺序,且对 parser 会忽略的消息(system init 等)同样计活。
     this.runner.on('message', (msg: SdkMessage) => {
       this.emit('activity')
-      this._routeTurn?.parser.parse(msg)
+      // A0:post-terminal bash_output_tail 命中原 turn → 路由回它(已 finalized)的
+      // parser;其余消息(含 tail 未命中/属当前 turn)逐字节维持 _routeTurn 路由。
+      ;(this._resolveTailOrigin(msg) ?? this._routeTurn)?.parser.parse(msg)
     })
     // telemetry 只喂尚未终态的当前 turn(旧 per-turn 'telemetry' 监听在 detach()
     // 卸载 → turn 间事件丢弃,语义一致)。
@@ -245,7 +258,11 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // 旧 parser 回调升格为一等事件,与内容事件同一条同步顺序流:
       // tool_use_detected 先于 finalized tool_use block,tool_result block 先于
       // tool_result_detected —— 与旧回调触发点逐一对位。
-      onToolUse: (tool) => params.onEvent({ kind: 'tool_use_detected', tool }),
+      onToolUse: (tool) => {
+        // A0:登记 tool_use_id → 本 turn ctx,供 turn 终态后其 bash_output_tail 归位。
+        this._registerToolOrigin(tool.id, ctx)
+        params.onEvent({ kind: 'tool_use_detected', tool })
+      },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
@@ -288,11 +305,41 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
+  /** A0:onToolUse 回调点登记 tool_use_id → 本 turn ctx(FIFO 逐出最旧)。
+   *  同一 turn 内 tool_use_id 唯一,重复登记极少;重复时先删再插以刷新 FIFO 位置。 */
+  private _registerToolOrigin(toolUseId: string, ctx: CcbTurnContext): void {
+    if (!toolUseId) return
+    const map = this._toolOriginByUseId
+    if (map.has(toolUseId)) map.delete(toolUseId)
+    map.set(toolUseId, ctx)
+    while (map.size > CcbAdapter.TOOL_ORIGIN_MAX) {
+      const oldest = map.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
+  }
+
+  /** A0:post-terminal bash_output_tail 的 owner 路由目标。命中 map 且 origin
+   *  ≠ 当前 _routeTurn(即发起它的 turn 已被后续 turn 顶替)→ 返回 origin ctx
+   *  (其 parser 已 finalized,tail 走 onPostFinalRuntimeEvent);其余(非 tail /
+   *  未命中 / origin 即 _routeTurn)→ null,由 caller 维持现状 _routeTurn 路由。
+   *  只做浅形状检查,不触碰全量解析。 */
+  private _resolveTailOrigin(msg: SdkMessage): CcbTurnContext | null {
+    const m = msg as { type?: unknown; subtype?: unknown; tool_use_id?: unknown }
+    if (m?.type !== 'system' || m?.subtype !== 'bash_output_tail') return null
+    const toolUseId = m.tool_use_id
+    if (typeof toolUseId !== 'string' || toolUseId.length === 0) return null
+    const origin = this._toolOriginByUseId.get(toolUseId)
+    return origin && origin !== this._routeTurn ? origin : null
+  }
+
   interrupt(): boolean {
     return this.runner.interrupt()
   }
 
   shutdown(): Promise<void> {
+    // session 终结:tool_use_id 归属随 CCB 进程一同作废,清空防跨进程误路由 + 泄漏。
+    this._toolOriginByUseId.clear()
     return this.runner.shutdown()
   }
 

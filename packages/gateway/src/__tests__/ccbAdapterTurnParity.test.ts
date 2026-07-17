@@ -375,6 +375,67 @@ describe("CcbAdapter turn parity", () => {
     );
   });
 
+  test("A0 owner 路由:turn1 的 bg bash tail 在 turn2 期间归位 turn1(不污染 turn2 parser)", async () => {
+    const { adapter, runner } = makeAdapter();
+
+    // turn1:发起一个 bg Bash 工具(assistant snapshot 触发 onToolUse → 登记归属)。
+    const eventsA: EngineEvent[] = [];
+    const postTerminalA: Array<{ block: { kind: string; tail?: string } }> = [];
+    const turnA = beginTurn(adapter, eventsA, {
+      onPostTerminalRuntimeEvent: (_event, block) =>
+        postTerminalA.push({ block: block as { kind: string; tail?: string } }),
+    });
+    runner.msg(toolUseStart("tu1", "Bash"));
+    runner.msg(assistantToolUse("tu1", "Bash", { command: "sleep 100 &" }));
+    runner.msg(resultRow()); // turn1 终态,bg bash 仍在后台跑
+    await turnA.summary;
+
+    // turn2 激活:_routeTurn 切到 turn2。
+    const eventsB: EngineEvent[] = [];
+    const postTerminalB: unknown[] = [];
+    const turnB = beginTurn(adapter, eventsB, {
+      onPostTerminalRuntimeEvent: (event) => postTerminalB.push(event),
+    });
+    runner.msg(textDelta("B answering"));
+
+    // turn1 的 bg bash 在 turn2 期间继续 emit tail(tool_use_id = tu1)。
+    runner.msg({
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "tu1",
+      tail: "still running",
+      total_bytes: 13,
+    });
+
+    // 断言:tail 经 turn1 的 onPostTerminalRuntimeEvent(finalized parser 的
+    // onPostFinalRuntimeEvent),而非灌进 turn2。
+    assert.equal(postTerminalA.length, 1, "turn1 收到其 bg bash 的 post-terminal tail");
+    assert.equal(postTerminalA[0].block.kind, "tool_output_tail");
+    assert.equal(postTerminalA[0].block.tail, "still running");
+    assert.equal(postTerminalB.length, 0, "turn2 不该收到 turn1 的 tail");
+
+    // turn2 的 parser 未被污染:snapshot.runtimeEvents 与事件流均无该 tail。
+    const snapB = turnB.getPartialSnapshot();
+    assert.equal(
+      snapB.runtimeEvents.some(
+        (e) => (e.payload as { subtype?: string })?.subtype === "bash_output_tail",
+      ),
+      false,
+      "turn2 parser runtimeEvents 不含 turn1 tail",
+    );
+    assert.equal(
+      eventsB.some(
+        (e) => e.kind === "block" && (e.block as { kind: string }).kind === "tool_output_tail",
+      ),
+      false,
+      "turn2 事件流不含 turn1 tail 的 tool_output_tail block",
+    );
+
+    // 收尾 turn2。
+    runner.msg(resultRow({ total_cost_usd: 0.09 }));
+    await turnB.summary;
+  });
+
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {
     const { adapter, runner } = makeAdapter();
     let activity = 0;
