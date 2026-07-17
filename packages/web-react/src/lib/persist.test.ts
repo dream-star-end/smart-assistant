@@ -6,6 +6,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   SessionStore,
+  stableSortByTs,
   type StoredSession,
 } from "./persist";
 
@@ -702,6 +703,130 @@ describe("persist — 历史合并纯函数", () => {
     };
     const merged = applyServerIncremental([localRich], [incoming]);
     expect(merged.map((m) => m.id)).toEqual(["m-g", "srv-g2"]);
+  });
+});
+
+// ─── B4(b) stableSortByTs 全序不变量:property / fuzz ─────────────────────────
+// 审计根因:旧比较器混排 _seq/ts 两域 + 缺 ts 整趟 bail-out → 非传递,V8 输出不可预测。
+// 新比较器 = 单一字典序元组 (anchorOrderSeq, durableRank, ts, idx),此处随机构造大量
+// {_orderSeq?, _seq?, ts?} 数组,断言:诱导全序(输出元组单调,无环)、幂等(fixed point)、
+// 确定性、耐久行按 _orderSeq 单调(时间轴)、置换保元素、缺字段不抛。
+describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
+  // 可复现 PRNG(mulberry32),不引入外部依赖。
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // 有效 _orderSeq 判据必须与实现一致(safe int > 0)。
+  const validOrder = (v: unknown): v is number =>
+    typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+
+  // 重放实现的锚点 carry-forward,得到每行参与排序的元组,用来独立验证「输出确实按元组单调」。
+  function tuplesInInputOrder(msgs: ChatMessage[]): Array<{
+    id: string;
+    anchor: number;
+    rank: number;
+    ts: number;
+    idx: number;
+  }> {
+    let anchor = 0;
+    return msgs.map((m, idx) => {
+      const own = validOrder(m._orderSeq) ? (m._orderSeq as number) : null;
+      if (own !== null) anchor = own;
+      return {
+        id: m.id,
+        anchor: own ?? anchor,
+        rank: own !== null ? 0 : 1,
+        ts: typeof m.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
+        idx,
+      };
+    });
+  }
+
+  const cmpTuple = (
+    a: { anchor: number; rank: number; ts: number; idx: number },
+    b: { anchor: number; rank: number; ts: number; idx: number },
+  ): number => a.anchor - b.anchor || a.rank - b.rank || a.ts - b.ts || a.idx - b.idx;
+
+  function randomMessages(rnd: () => number): ChatMessage[] {
+    const n = Math.floor(rnd() * 9); // 0..8 条(含空/单元素边界)
+    const out: ChatMessage[] = [];
+    for (let i = 0; i < n; i++) {
+      const m: ChatMessage = { id: `m${i}`, role: "assistant", text: "" };
+      // ~65% 带 _orderSeq(小池子 → 制造碰撞/乱序/时钟偏移);其余为本地乐观行(无 _orderSeq)。
+      if (rnd() < 0.65) m._orderSeq = 1 + Math.floor(rnd() * 6);
+      if (rnd() < 0.5) m._seq = 1 + Math.floor(rnd() * 40); // 比较器应完全忽略 _seq
+      const tsRoll = rnd();
+      if (tsRoll < 0.15) {
+        /* 缺 ts */
+      } else if (tsRoll < 0.3) {
+        m.ts = Number.NaN; // 非有限 ts → 实现按 0 兜底,不得整趟 bail-out
+      } else {
+        m.ts = Math.floor(rnd() * 8); // 小池子:与 _orderSeq 顺序刻意冲突(时钟偏移)
+      }
+      out.push(m);
+    }
+    return out;
+  }
+
+  test("2000 组随机输入:全序单调 + 幂等 + 确定性 + 耐久行 _orderSeq 单调 + 置换 + 不抛", () => {
+    const rnd = mulberry32(0x51ede15);
+    for (let trial = 0; trial < 2000; trial++) {
+      const input = randomMessages(rnd);
+      const inputIds = input.map((m) => m.id);
+
+      const sorted = stableSortByTs(input.map((m) => ({ ...m })));
+      const sortedIds = sorted.map((m) => m.id);
+
+      // ① 置换保元素:输出是输入的排列(无丢、无增、无重)。
+      expect([...sortedIds].sort()).toEqual([...inputIds].sort());
+
+      // ② 诱导全序:输出按实现所用元组 (anchor, rank, ts, idx) 字典序**单调非降**。
+      //    元组来自输入序的锚点重放,按输出 id 取回后逐对断言 → 证明存在一致全序(无环)。
+      const tupleById = new Map(tuplesInInputOrder(input).map((t) => [t.id, t]));
+      for (let k = 1; k < sorted.length; k++) {
+        const prev = tupleById.get(sortedIds[k - 1])!;
+        const cur = tupleById.get(sortedIds[k])!;
+        expect(cmpTuple(prev, cur)).toBeLessThanOrEqual(0);
+      }
+
+      // ③ 幂等:对已排序结果再排一次,顺序不变(fixed point → 无 anchor 重锚漂移)。
+      const twice = stableSortByTs(sorted.map((m) => ({ ...m })));
+      expect(twice.map((m) => m.id)).toEqual(sortedIds);
+
+      // ④ 确定性:同结构输入独立再排,结果相同(V8 不再"输出不可预测")。
+      const again = stableSortByTs(input.map((m) => ({ ...m })));
+      expect(again.map((m) => m.id)).toEqual(sortedIds);
+
+      // ⑤ 时间轴单调:带有效 _orderSeq 的耐久行在输出中按 _orderSeq 非降(冻结顺序不被打乱)。
+      const durable = sorted.filter((m) => validOrder(m._orderSeq)).map((m) => m._orderSeq as number);
+      for (let k = 1; k < durable.length; k++) {
+        expect(durable[k]).toBeGreaterThanOrEqual(durable[k - 1]);
+      }
+    }
+  });
+
+  test("审计原环三元组(以 _orderSeq 承载)确定且幂等:低 ts 乐观行不被甩到锚点耐久行之前", () => {
+    // A(_orderSeq=5,ts=10)、B(本地乐观,无 _orderSeq,ts=20)、C(_orderSeq=2,ts=30):旧比较器
+    // 混排 _seq/ts 会成环;新比较器下 B 锚定到插入序里它前面最近的耐久行 A(_orderSeq=5),
+    // 且 durableRank 令 A 恒先于 B。
+    const input: ChatMessage[] = [
+      { id: "A", role: "assistant", text: "", _orderSeq: 5, ts: 10 },
+      { id: "B", role: "assistant", text: "", ts: 20 },
+      { id: "C", role: "user", text: "", _orderSeq: 2, ts: 30 },
+    ];
+    const once = stableSortByTs(input.map((m) => ({ ...m })));
+    // C(_orderSeq=2) < A(_orderSeq=5);B 锚定 A 且排在 A 之后(durable-first) → [C, A, B]。
+    expect(once.map((m) => m.id)).toEqual(["C", "A", "B"]);
+    const twice = stableSortByTs(once.map((m) => ({ ...m })));
+    expect(twice.map((m) => m.id)).toEqual(["C", "A", "B"]);
   });
 });
 

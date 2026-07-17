@@ -41,6 +41,7 @@ interface DebitRow {
   bucket: LedgerBucketRow
   delta: string
   org_id: string | null
+  debited_at_us: string
 }
 
 interface WaiverRow {
@@ -55,7 +56,13 @@ interface WaiverRow {
 interface OrgLock {
   credits: bigint
   credits0: bigint
-  sub: { id: string; period: bigint; period0: bigint } | null
+  sub: {
+    id: string
+    period: bigint
+    period0: bigint
+    periodStartUs: bigint
+    periodEndUs: bigint
+  } | null
 }
 
 const REASON_COPY: Record<TurnWaiveReason, string> = {
@@ -151,7 +158,8 @@ export async function applyTurnWaiver(
 
     const debits = await client.query<DebitRow>(
       `SELECT ur.id::text AS usage_id, cl.bucket, cl.delta::text AS delta,
-              cl.org_id::text AS org_id
+              cl.org_id::text AS org_id,
+              FLOOR(EXTRACT(EPOCH FROM cl.created_at) * 1000000)::bigint::text AS debited_at_us
          FROM usage_records ur
          JOIN credit_ledger cl
            ON cl.ref_type = 'usage_record' AND cl.ref_id = ur.id::text
@@ -192,16 +200,30 @@ export async function applyTurnWaiver(
       orgLocks.set(oid, { credits, credits0: credits, sub: null })
     }
     for (const oid of orgIds) {
-      const sub = await client.query<{ id: string; period_credits: string }>(
-        `SELECT id::text AS id, period_credits::text AS period_credits
+      const sub = await client.query<{
+        id: string
+        period_credits: string
+        period_start_us: string
+        period_end_us: string
+      }>(
+        `SELECT id::text AS id, period_credits::text AS period_credits,
+                FLOOR(EXTRACT(EPOCH FROM period_start) * 1000000)::bigint::text AS period_start_us,
+                FLOOR(EXTRACT(EPOCH FROM period_end) * 1000000)::bigint::text AS period_end_us
            FROM org_subscriptions
-          WHERE org_id=$1::bigint AND status='active' AND period_end > NOW()
+          WHERE org_id=$1::bigint AND status='active'
+            AND period_start <= NOW() AND period_end > NOW()
           ORDER BY id DESC LIMIT 1 FOR UPDATE`,
         [oid],
       )
       if (sub.rowCount) {
         const period = BigInt(sub.rows[0]!.period_credits)
-        orgLocks.get(oid)!.sub = { id: sub.rows[0]!.id, period, period0: period }
+        orgLocks.get(oid)!.sub = {
+          id: sub.rows[0]!.id,
+          period,
+          period0: period,
+          periodStartUs: BigInt(sub.rows[0]!.period_start_us),
+          periodEndUs: BigInt(sub.rows[0]!.period_end_us),
+        }
       }
     }
 
@@ -211,10 +233,18 @@ export async function applyTurnWaiver(
     )
     if (!user.rowCount) throw new Error(`refund invariant: user ${uid} is missing`)
     let wallet = BigInt(user.rows[0]!.credits)
-    const sub = await client.query<{ id: string; period_credits: string }>(
-      `SELECT id::text AS id, period_credits::text AS period_credits
+    const sub = await client.query<{
+      id: string
+      period_credits: string
+      period_start_us: string
+      period_end_us: string
+    }>(
+      `SELECT id::text AS id, period_credits::text AS period_credits,
+              FLOOR(EXTRACT(EPOCH FROM period_start) * 1000000)::bigint::text AS period_start_us,
+              FLOOR(EXTRACT(EPOCH FROM period_end) * 1000000)::bigint::text AS period_end_us
          FROM user_subscriptions
-        WHERE user_id=$1 AND status='active' AND period_end > NOW()
+        WHERE user_id=$1 AND status='active'
+          AND period_start <= NOW() AND period_end > NOW()
         ORDER BY id DESC LIMIT 1 FOR UPDATE`,
       [uid],
     )
@@ -249,7 +279,13 @@ export async function applyTurnWaiver(
         if (!row.org_id) throw new Error(`refund invariant: ${row.bucket} debit missing org_id`)
         const lock = orgLocks.get(row.org_id)
         if (!lock) throw new Error(`refund invariant: org ${row.org_id} was not locked`)
-        if (row.bucket === 'org_period' && lock.sub) {
+        const debitAtUs = BigInt(row.debited_at_us)
+        const refundToOrgPeriod =
+          row.bucket === 'org_period' &&
+          lock.sub !== null &&
+          debitAtUs >= lock.sub.periodStartUs &&
+          debitAtUs < lock.sub.periodEndUs
+        if (refundToOrgPeriod && lock.sub) {
           lock.sub.period += back
           await writeLedger(back, lock.sub.period, 'org_period', row.org_id, row.usage_id, memo)
         } else {
@@ -260,13 +296,18 @@ export async function applyTurnWaiver(
             'org_wallet',
             row.org_id,
             row.usage_id,
-            row.bucket === 'org_period' ? `${memo};org_period→org_wallet(no active sub)` : memo,
+            row.bucket === 'org_period' ? `${memo};org_period→org_wallet(expired period)` : memo,
           )
         }
         continue
       }
 
-      const refundToPeriod = row.bucket === 'period' && activeSub !== null
+      const debitAtUs = BigInt(row.debited_at_us)
+      const refundToPeriod =
+        row.bucket === 'period' &&
+        activeSub !== null &&
+        debitAtUs >= BigInt(activeSub.period_start_us) &&
+        debitAtUs < BigInt(activeSub.period_end_us)
       if (refundToPeriod) {
         period += back
         await writeLedger(back, period, 'period', null, row.usage_id, memo)
@@ -278,7 +319,7 @@ export async function applyTurnWaiver(
           'wallet',
           null,
           row.usage_id,
-          row.bucket === 'period' ? `${memo};period→wallet(no active sub)` : memo,
+          row.bucket === 'period' ? `${memo};period→wallet(expired period)` : memo,
         )
       }
     }

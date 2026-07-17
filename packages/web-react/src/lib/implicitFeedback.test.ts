@@ -8,6 +8,7 @@ import {
   findRewriteTarget,
   findStopTarget,
   isExpensiveTurn,
+  newTokenRatio,
   rewriteSimilarity,
 } from "./implicitFeedback";
 
@@ -44,6 +45,26 @@ describe("rewriteSimilarity", () => {
 
   test("归一化后长度<2 且不等 → 0", () => {
     expect(rewriteSimilarity("啊", "哦")).toBe(0);
+  });
+});
+
+describe("newTokenRatio", () => {
+  test("单字换主题（真·改写）→ 新词占比很低（< 0.3）", () => {
+    // 「春天」→「秋天」只换 1 字，共享 10/11 字。
+    expect(newTokenRatio("帮我写一首关于春天的诗", "帮我写一首关于秋天的诗")).toBeLessThan(0.3);
+  });
+
+  test("整词换实体（顺序任务）→ 新词占比很高（≥ 0.3）", () => {
+    // 「快排」→「归并」是完全不同的技术名(归/并 均为新 token)。
+    expect(newTokenRatio("写Python快排", "写Python归并")).toBeGreaterThanOrEqual(0.3);
+  });
+
+  test("完全一致 → 0", () => {
+    expect(newTokenRatio("写Python快排", "写Python快排")).toBe(0);
+  });
+
+  test("新文本为空 → 0（不触发收窄）", () => {
+    expect(newTokenRatio("写Python快排", "")).toBe(0);
   });
 });
 
@@ -107,6 +128,17 @@ describe("findRewriteTarget", () => {
       traceId: null,
     });
   });
+
+  test("高相似但换了新实体（顺序任务，非改写不满）→ null（误伤缓解）", () => {
+    // 「写Python快排」→「写Python归并」：相似度 ≥0.55 但引入新实体(归并),是接着做的顺序任务。
+    const seq = [
+      mk("user", "写Python快排", now - MIN, { id: "u1" }),
+      mk("assistant", "def quicksort(a): ...", now - MIN + 1000, { id: "a1", usage: { traceId: "t1" } }),
+    ];
+    // 前置确认:确实越过了相似度门(证明是新词占比收窄在起作用,而非相似度低导致的 null)。
+    expect(rewriteSimilarity("写Python快排", "写Python归并")).toBeGreaterThanOrEqual(0.55);
+    expect(findRewriteTarget(seq, "写Python归并", now)).toBeNull();
+  });
 });
 
 describe("findStopTarget", () => {
@@ -140,6 +172,23 @@ describe("findStopTarget", () => {
       mk("assistant", "连接断开", now - 15_000, { id: "a2", _errorCode: "STREAM_ERROR" }),
     ];
     expect(findStopTarget(msgs, now)).toEqual({ messageId: "a1", traceId: "t1" });
+  });
+
+  test("产出很长（≥200 字符）后被 Stop → null（够了已满意，误伤缓解）", () => {
+    const longBody = "内容".repeat(120); // 240 字符,无完成语形态
+    const msgs = [
+      mk("user", "详细讲讲量子纠缠", now - 30_000, { id: "u1" }),
+      mk("assistant", longBody, now - 20_000, { id: "a1", usage: { traceId: "t1" } }),
+    ];
+    expect(findStopTarget(msgs, now)).toBeNull();
+  });
+
+  test("短产出但已带完成语形态后被 Stop → null（已收尾，误伤缓解）", () => {
+    const msgs = [
+      mk("user", "帮我改一下这段代码", now - 30_000, { id: "u1" }),
+      mk("assistant", "已经改好了，希望对你有帮助！", now - 20_000, { id: "a1", usage: { traceId: "t1" } }),
+    ];
+    expect(findStopTarget(msgs, now)).toBeNull();
   });
 });
 

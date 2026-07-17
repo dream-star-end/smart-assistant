@@ -7,7 +7,6 @@ import {
   ModelAuthorityError,
   TURN_LEASE_TTL_MS,
   type TurnLease,
-  turnLeaseOriginalIssuedAt,
   verifyTurnLease,
 } from '@openclaude/protocol'
 import type { Pool } from 'pg'
@@ -114,15 +113,6 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
       return
     }
 
-    const originalIssuedAt = turnLeaseOriginalIssuedAt(lease)
-    const absoluteExpiresAt = originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS
-    if (now >= absoluteExpiresAt) {
-      sendJson(res, 409, {
-        error: { code: 'TURN_LIFETIME_EXCEEDED', message: 'turn lifetime exceeded' },
-      })
-      return
-    }
-
     const client = await deps.pgPool.connect()
     try {
       await client.query('BEGIN')
@@ -148,21 +138,52 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         state: string
         source: string | null
         turn_key: string | null
+        created_at_ms: string
       }>(
         `SELECT request_id, state, ctx->>'source' AS source,
-                ctx->>'turnKey' AS turn_key
+                ctx->>'turnKey' AS turn_key,
+                FLOOR(EXTRACT(EPOCH FROM created_at) * 1000)::bigint::text AS created_at_ms
            FROM request_finalize_journal
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'authorityTurnId'=$3
-            AND created_at >= to_timestamp($4::double precision / 1000.0)
+            AND created_at >= NOW() - INTERVAL '13 hours'
           ORDER BY request_id
           FOR UPDATE`,
-        [identity.userId, identity.containerId, lease.authorityTurnId, originalIssuedAt - 60_000],
+        [identity.userId, identity.containerId, lease.authorityTurnId],
       )
       if (!evidence.rowCount) {
         await client.query('ROLLBACK')
         sendJson(res, 409, {
           error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence not found' },
+        })
+        return
+      }
+
+      const evidenceStartedAt = Math.min(
+        ...evidence.rows.map((row) => Number(row.created_at_ms)),
+      )
+      if (!Number.isSafeInteger(evidenceStartedAt)) {
+        await client.query('ROLLBACK')
+        sendJson(res, 409, {
+          error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence is malformed' },
+        })
+        return
+      }
+      // Keep the signed v1 lease wire shape unchanged for rolling old
+      // gateways/egress readers. The absolute lifetime anchor is durable
+      // server evidence, not a new lease field that old strict parsers reject.
+      // A previously experimental originalIssuedAt is accepted only as a
+      // conservative earlier bound, then stripped from the renewed envelope.
+      const absoluteStartedAt = Math.min(
+        evidenceStartedAt,
+        lease.issuedAt,
+        lease.originalIssuedAt ?? Number.POSITIVE_INFINITY,
+      )
+      const absoluteExpiresAt = absoluteStartedAt + AUTHORITY_TURN_MAX_LIFETIME_MS
+      if (now >= absoluteExpiresAt) {
+        await client.query('ROLLBACK')
+        sendJson(res, 409, {
+          error: { code: 'TURN_LIFETIME_EXCEEDED', message: 'turn lifetime exceeded' },
         })
         return
       }
@@ -223,10 +244,10 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
       }
 
       const expiresAt = Math.min(now + TURN_LEASE_TTL_MS, absoluteExpiresAt)
+      const { originalIssuedAt: _legacyOriginalIssuedAt, ...legacyWireLease } = lease
       const renewed = {
-        ...lease,
+        ...legacyWireLease,
         keyId: signer.activeKeyId,
-        originalIssuedAt,
         issuedAt: now,
         expiresAt,
       }

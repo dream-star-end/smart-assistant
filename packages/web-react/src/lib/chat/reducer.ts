@@ -651,28 +651,45 @@ function isLaterGoalCard(candidate: ChatMessage, current: ChatMessage): boolean 
 
 /** Hydration can return one server-authored goal projection per historical
  * turn. Collapse them to the same stable identity used by the live reducer so
- * refresh/reconnect never recreates a row per Codex notification. */
+ * refresh/reconnect never recreates a row per Codex notification.
+ *
+ * 位置一致性(与实时 reducer 对齐):实时侧目标卡在**首次投影**处创建、后续修订就地
+ * Object.assign 更新(同对象、同 id、首位置、内容取最新)。hydrate 每个历史 turn 会各投一张
+ * 同身份卡,这里折叠时必须保持同一心智模型——**槽位取最早出现处(位置 min)、内容取最高
+ * 修订(内容 max)**,否则刷新后目标卡会跳到「最后更新的 turn」位置,与实时不一致。 */
 export function normalizeGoalCards(sess: ChatSession): void {
-  const latest = new Map<string, ChatMessage>();
-  const remove = new Set<ChatMessage>();
-  let changed = false;
+  // anchor = 每个身份最早出现的卡(位置权威);winner = 修订最高的卡(内容权威)。
+  const anchor = new Map<string, ChatMessage>();
+  const winner = new Map<string, ChatMessage>();
   for (const msg of sess.messages) {
     const identity = goalCardIdentity(msg);
     if (!identity) continue;
-    if (msg.blockId !== identity) {
-      msg.blockId = identity;
-      changed = true;
-    }
-    const current = latest.get(identity);
-    if (!current) {
-      latest.set(identity, msg);
+    if (!anchor.has(identity)) anchor.set(identity, msg);
+    const w = winner.get(identity);
+    if (!w || isLaterGoalCard(msg, w)) winner.set(identity, msg);
+  }
+  if (anchor.size === 0) return;
+
+  let changed = false;
+  const remove = new Set<ChatMessage>();
+  for (const msg of sess.messages) {
+    const identity = goalCardIdentity(msg);
+    if (!identity) continue;
+    const slot = anchor.get(identity)!;
+    if (msg !== slot) {
+      // 非最早槽位的同身份卡:折叠移除(内容已并入 slot)。
+      remove.add(msg);
       continue;
     }
-    if (isLaterGoalCard(msg, current)) {
-      remove.add(current);
-      latest.set(identity, msg);
-    } else {
-      remove.add(msg);
+    // 最早槽位卡:归一 blockId,并把最高修订的内容并入。保留 slot 自身 id/ts(位置/创建时刻
+    // 稳定,与实时首次创建的卡一致),仅内容取 winner —— 位置 min、内容 max。
+    const win = winner.get(identity)!;
+    if (win !== slot) {
+      Object.assign(slot, win, { id: slot.id, ts: slot.ts, blockId: identity });
+      changed = true;
+    } else if (slot.blockId !== identity) {
+      slot.blockId = identity;
+      changed = true;
     }
   }
   if (remove.size > 0) {

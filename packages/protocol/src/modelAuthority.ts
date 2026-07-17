@@ -65,9 +65,10 @@ export const TURN_LEASE_TTL_MS = PLATFORM_MAX_TURN_MS + TURN_LEASE_GRACE_MS
 
 /**
  * bridge turn 的绝对寿命上限。lease 本身仍保持 50min 的短滚动窗口；活跃长任务由
- * master 在每次续签时把 `expiresAt` 向后滚动，但永远不能越过
- * `originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一窗口执行硬终止，
- * 因此签发与执行不会再次出现「票据先过期、任务仍被允许继续」的双口径。
+ * master 在每次续签时把 `expiresAt` 向后滚动，但永远不能越过 durable journal 的
+ * turn 起点加 `AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一逻辑 turn 起点执行硬终止，
+ * 因此签发与执行不会再次出现「票据先过期、任务仍被允许继续」的双口径。起点不进
+ * lease wire，避免破坏仍在滚动运行的严格 v1 reader。
  */
 export const AUTHORITY_TURN_MAX_LIFETIME_MS = 12 * 60 * 60_000
 
@@ -197,8 +198,9 @@ export interface TurnLease {
   readonly securityEpoch: number
   readonly connectionChallenge: string
   /**
-   * 本逻辑 turn 首次签发时刻，续签时保持不变；缺席只兼容续签能力上线前的旧 lease，
-   * 消费侧按 `issuedAt` 解释。新签/续签一律显式携带。
+   * 一次未成功上线的滚动续签实验曾携带此字段。生产签发与续签必须省略它，
+   * 以保持旧 v1 严格 reader 的字段集不变；master 从 durable journal 取绝对起点。
+   * reader 只保留可选解析，用于把实验票保守收敛回旧 wire shape。
    */
   readonly originalIssuedAt?: number
   /** 本张 lease 的签发/续签时刻。 */
@@ -452,7 +454,7 @@ export function verifyTurnLease(
   return typed
 }
 
-/** 兼容旧 lease：没有 originalIssuedAt 时，其第一次 issuedAt 就是逻辑起点。 */
+/** 只供实验票保守解析；生产绝对起点来自 master durable journal。 */
 export function turnLeaseOriginalIssuedAt(lease: TurnLease): number {
   return lease.originalIssuedAt ?? lease.issuedAt
 }

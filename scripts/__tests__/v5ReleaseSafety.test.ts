@@ -3016,7 +3016,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.ok(start >= 0 && end > start, '未找到 production-mutation remote holder')
     const holder = source.slice(start, end)
     const parentCapture = holder.indexOf('lease_parent=\\"\\$PPID\\"')
-    const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
+    // C1:trap 现在同时清 fencing meta 再退出。
+    const signalTrap = holder.indexOf("trap 'drop_meta; exit 0' HUP INT TERM")
     const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
     const leased = holder.indexOf('echo LEASED')
     const loop = holder.indexOf('while :; do', leased)
@@ -3033,6 +3034,40 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       'parent-watch 必须同时复核内核实时 PPid 与 parent 活性',
     )
     assert.doesNotMatch(holder, /exec sleep infinity/, '禁止 PID 1 收养的无限 sleep 继续持锁')
+    // C1 硬 TTL + fencing 证据:meta 在 LEASED 前落盘,TTL 在 watch 循环里到点自 exit,
+    // 每条退出路径都清自己的 meta。这几条一起消除"SIGKILL 部署→残活 ssh 焊死远端 lease 永不过期"。
+    assert.ok(holder.indexOf('write_meta\necho LEASED') >= 0, 'fencing meta 必须在 LEASED 握手前写(write_meta 调用)')
+    assert.ok(holder.indexOf('lease_ttl=') > parentCapture && holder.indexOf('lease_ttl=') < leased, 'remote holder 缺硬 TTL 变量 lease_ttl')
+    assert.ok(
+      holder.indexOf('-ge \\"\\$lease_ttl\\"', loop) > loop,
+      'parent-watch 循环缺到点自释放的硬 TTL 检查',
+    )
+    assert.ok(holder.indexOf('drop_meta', loop) > loop, 'holder 退出路径必须清 fencing meta')
+  })
+
+  test('reclaim-mutation-lease is read-only rescue: skips every write-fence and the global lease', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // 子命令入口 + dispatch 存在
+    assert.match(source, /--reclaim-mutation-lease\) MODE="reclaim-mutation-lease"/)
+    assert.match(source, /reclaim-mutation-lease\) reclaim_production_mutation_lease/)
+    // 陈旧裁决:kill -0 校验 holder + 超 TTL,二者任一为陈旧才清,否则 REFUSE
+    const fn = source.slice(
+      source.indexOf('reclaim_production_mutation_lease() {'),
+      source.indexOf('\nrelease_production_mutation_lease() {'),
+    )
+    assert.ok(fn.length > 0, '未找到 reclaim_production_mutation_lease')
+    assert.match(fn, /kill -0 "\$rpid"/)
+    assert.match(fn, /REFUSE:holder-live/)
+    assert.match(fn, /CLEAN:/)
+    assert.match(fn, /OC_V5_RECLAIM_FORCE/)
+    // reclaim 必须不抢本地 deploy lock、不取全局 lease,也不被 recovery marker 挡住(否则被同一残留焊死)。
+    assert.match(
+      source,
+      /MODE" != "reclaim-mutation-lease" \]\]; then\n {2}# reclaim 是"陈旧锁被同一残留焊死"/,
+      'reclaim 必须跳过本地 deploy lock 获取',
+    )
+    assert.match(source, /reclaim-mutation-lease\) ;;\n {2}# knowledge-planet-verify/, 'reclaim 必须跳过全局 mutation lease 获取')
+    assert.match(source, /"\$MODE" != "reclaim-mutation-lease" \]\]; then\n {2}assert_no_deploy_recovery_marker/, 'reclaim 必须能在 recovery marker 存在时照跑')
   })
 
   test('mutation holder releases its flock after its session parent is SIGKILLed', async () => {

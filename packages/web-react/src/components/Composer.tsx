@@ -2,7 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
@@ -106,6 +106,8 @@ export function Composer({
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // 附件 file input 的稳定 id：供「+」菜单里的 <label htmlFor> 原生激活(见下方附件项)。
+  const fileInputId = useId();
   const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
@@ -301,12 +303,18 @@ export function Composer({
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
+          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合下方
+              <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
+              合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
+              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。 */}
           <input
             data-product-feature={PRODUCT_CAPABILITIES.files.id}
+            id={fileInputId}
             ref={fileRef}
             type="file"
             multiple
-            className="hidden"
+            tabIndex={-1}
+            className="sr-only"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。
@@ -320,19 +328,34 @@ export function Composer({
                   aria-label="更多选项"
                   title="更多选项"
                   disabled={disabled}
-                  className="mb-0.5"
+                  className="relative mb-0.5"
                 >
                   <Plus size={20} />
+                  {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
+                      不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
+                  {visibleGoal && (
+                    <span
+                      aria-hidden
+                      data-testid="composer-goal-dot"
+                      className={cn(
+                        "absolute right-1 top-1 size-1.5 rounded-full",
+                        goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                      )}
+                    />
+                  )}
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" side="top">
                 {canAttach && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    onSelect={() => fileRef.current?.click()}
-                  >
-                    <Paperclip size={16} className="shrink-0 text-muted" />
-                    添加附件
+                  // 附件项渲染为原生 <label htmlFor>：点击/触摸经浏览器原生 label 激活直接打开
+                  // file input,不走合成 input.click()——避免 Radix 菜单关闭/卸载与合成 click 的
+                  // 竞态,以及国产内核/iOS Safari 对合成 click 的静默吞噬。asChild 把菜单项语义与
+                  // 键盘可达性(Radix 管理)叠加到 label 上,桌面行为不变。
+                  <DropdownMenuItem asChild data-product-feature={PRODUCT_CAPABILITIES.files.id}>
+                    <label htmlFor={fileInputId}>
+                      <Paperclip size={16} className="shrink-0 text-muted" />
+                      添加附件
+                    </label>
                   </DropdownMenuItem>
                 )}
                 {canGoal && (

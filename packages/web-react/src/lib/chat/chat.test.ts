@@ -39,7 +39,12 @@ import {
   normalizeGoalCards,
   type FrameEffects,
 } from "./reducer";
-import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
+import {
+  ChatSocket,
+  messageAttemptIdempotencyKey,
+  writeAutoContinuePreamblePref,
+  type ChatSocketDeps,
+} from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -202,6 +207,19 @@ describe("classifyEmptyTurn / shouldAutoContinueEmptyTurn", () => {
       targetMsgId: "u1",
       stopReason: "max_tokens",
     })).toBe(false);
+  });
+
+  test("F5 用户偏好关闭（enabled:false）拒绝续写；省略/true 保持默认开", () => {
+    const matching = [
+      { id: "u1", role: "user", text: "修一下" },
+      { id: "a1", role: "assistant", text: "好的，我现在检查并修复这个问题。" },
+    ];
+    // 默认（省略 enabled）：内容命中 → 开（现行为不变）。
+    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn" })).toBe(true);
+    // 显式开：同默认。
+    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn", enabled: true })).toBe(true);
+    // 显式关：即便内容命中也不自动续写（仅提示，不替用户扣费）。
+    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn", enabled: false })).toBe(false);
   });
 });
 
@@ -511,6 +529,43 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
       platformStateRevision: 2,
       goalStatus: "paused",
     });
+  });
+
+  test("F6 hydrate 折叠后目标卡固定在最早槽位（位置 min、内容 max），与实时一致", () => {
+    const s = sess();
+    const platformGoalId = "22222222-2222-4222-8222-222222222222";
+    // 交错非目标消息以观测位置：user → goal(rev1,anchor) → assistant → goal(rev2,winner)。
+    addMessage(s, "user", "u-before");
+    const anchor = addMessage(s, "goal", "old", {
+      blockId: "codex-goal-turn-1",
+      platformGoalId,
+      platformStateRevision: 1,
+      goalStatus: "active",
+      updatedAt: 10,
+    });
+    addMessage(s, "assistant", "a-mid");
+    addMessage(s, "goal", "latest", {
+      blockId: "codex-goal-turn-2",
+      platformGoalId,
+      platformStateRevision: 2,
+      goalStatus: "paused",
+      updatedAt: 20,
+    });
+    normalizeGoalCards(s);
+
+    const goals = s.messages.filter((m) => m.role === "goal");
+    expect(goals).toHaveLength(1);
+    // 位置 min：卡片留在最早槽位（user 之后、assistant 之前），不跳到「最后更新 turn」的位置。
+    expect(s.messages.map((m) => m.role)).toEqual(["user", "goal", "assistant"]);
+    // 内容 max：取最高修订。
+    expect(goals[0]).toMatchObject({
+      text: "latest",
+      blockId: `platform-goal-${platformGoalId}`,
+      platformStateRevision: 2,
+      goalStatus: "paused",
+    });
+    // 槽位 id 稳定（沿用最早 anchor 卡，对齐实时「首次创建的持久对象就地更新」）。
+    expect(goals[0].id).toBe(anchor.id);
   });
 
   test("goal snapshot merge rejects REST/WS regression and accepts monotonic usage", () => {
@@ -3137,6 +3192,46 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     vi.advanceTimersByTime(10);
     expect(ws.sent.map((data) => JSON.parse(data)).filter((payload) =>
       String(payload.idempotencyKey ?? "").startsWith("autocont-preamble-")).length).toBe(1);
+  });
+
+  test("F5 用户关闭「自动继续执行」偏好 → preamble 命中也不自动续写（不替用户扣费）", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    writeAutoContinuePreamblePref(false); // 设备级偏好：关闭
+    try {
+      const sock = makeSocket();
+      sock.setGateReady(true);
+      const ws = FakeWS.instances.at(-1)!;
+      ws.open();
+      sock.sendMessage({
+        sessId: "s1",
+        agentId: "main",
+        text: "检查问题",
+        model: "gpt-5.6-sol",
+        effortLevel: "high",
+      });
+      ws.onmessage?.({
+        data: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: "agent:main:webchat:dm:s1",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          frameSeq: 1,
+          isFinal: true,
+          ts: 9e12,
+          blocks: [{ kind: "text", text: "好的，我现在检查并修复这个问题。" }],
+          meta: { stopReason: "end_turn" },
+        }),
+      });
+      vi.advanceTimersByTime(10);
+      const sent = ws.sent.map((data) => JSON.parse(data));
+      // 关闭后：不发起 preamble 续写，也不落地「↻ 自动继续执行」披露行。
+      expect(sent.some((p) => String(p.idempotencyKey ?? "").startsWith("autocont-preamble-"))).toBe(false);
+      expect(sock.sessions.get("s1")!.messages.some((m) =>
+        m.role === "user" && m.text === "↻ 自动继续执行")).toBe(false);
+    } finally {
+      writeAutoContinuePreamblePref(true); // 复原默认开，避免泄漏到其它用例
+    }
   });
 
   test("合成续写复用被中断 turn 的路由字段(model/teamMode)——缺失会被 codex 计费闸拒", () => {
