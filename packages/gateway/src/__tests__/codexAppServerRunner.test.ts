@@ -2244,6 +2244,30 @@ describe('handleNotification — goals', () => {
     await h.cleanup()
   })
 
+  it('treats -32600 "no goal exists" on a clearing sync as idempotent success (2026-07-17 outage)', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const runner = h.runner as any
+    runner.attached = true
+    runner.threadId = 'thread-goal-none'
+    const calls: Array<{ method: string; params: unknown }> = []
+    runner.sendRequest = async (method: string, params: unknown) => {
+      calls.push({ method, params })
+      throw Object.assign(
+        new Error('thread/goal/set -> -32600: cannot update goal for thread thread-goal-none: no goal exists'),
+        { rpcCode: -32600, rpcMessage: 'cannot update goal for thread thread-goal-none: no goal exists', rpcMethod: 'thread/goal/set' },
+      )
+    }
+    // 从未设过目标的会话:清除同步必须吞掉 "no goal exists" 而不是让整轮失败
+    await h.runner.setGoalState(null)
+    assert.equal(calls.length, 1)
+    // 已 stamp 'cleared':同状态再同步必须短路,不再重发注定失败的 RPC
+    await h.runner.setGoalState(null)
+    assert.equal(calls.length, 1)
+    // 同样的错误出现在非清除同步(真实 goal set)上仍然必须硬抛
+    await assert.rejects(h.runner.setGoalState(goal()), /no goal exists/)
+    await h.cleanup()
+  })
+
   it('stamps native notifications with the last successfully synced platform generation', async () => {
     const h = await makeHarness({ withFakeProc: true })
     const runner = h.runner as any
