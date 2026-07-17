@@ -19,10 +19,16 @@
  *
  * 收尾批新增:
  *   - listConditions(suppressed 过滤)/ adminUnsuppressCondition(误压回滚,audit tx)。
- *   - adminReleaseRepair:boss 一键放行 pending_release 的 Tier2 部署 →
- *     claimRelease 原子占位(HIGH2 TOCTOU 收口)→ repairDispatcher.postRelease
- *     经隧道通知个人版,只认其同步部署裁决 body.status==='deployed' 为成功
- *     (BLOCKER1);失败审计如实记 failed 并清 claim 允许重试(见函数头时序)。
+ *
+ * 批1b 重写(放行→部署 durable async):
+ *   - adminReleaseRepair:boss 一键放行 → 单事务锁 repair + 结构化校验最新
+ *     pending_release 事件 + 熔断检查 + INSERT selfheal_release_requests(唯一活跃
+ *     约束保证同 repair 至多一条 queued/accepted/deploying)+ 永久审计 →
+ *     **202 + releaseRequestId**(不再同步等个人版部署)。交付/回调各自异步驱动
+ *     (交付=sweeper delivery 步 postReleaseDelivery;回调分流=http/internal/selfhealRepairs)。
+ *     **废除 detail.release_claimed 第二权威**:唯一活跃请求由关系约束保证。
+ *   - getReleaseRequest / getReleaseFuse / clearReleaseFuse:admin 读接口 + 熔断收敛。
+ *   - getIncidentDetail:每 repair 附 releaseRequests[](§6.3 前端契约)。
  */
 
 import type { PoolClient } from "pg";
@@ -35,7 +41,6 @@ import {
   unsuppressCondition,
 } from "../selfheal/conditions.js";
 import { resolveIncident } from "../selfheal/incidents.js";
-import { postRelease as _postRelease } from "../selfheal/repairDispatcher.js";
 
 export const INCIDENTS_DEFAULT_LIMIT = 50;
 export const INCIDENTS_MAX_LIMIT = 200;
@@ -157,6 +162,20 @@ export async function listIncidents(
 
 // ─── detail:incident + repairs + events(脱敏)──────────────────────
 
+/**
+ * release request 在 incident detail 里的摘要投影(§6.3 前端契约,字段名逐字对齐:
+ * 前端据此渲染放行进度卡/manual reasons/失败原因)。
+ */
+export interface ReleaseRequestSummary {
+  releaseRequestId: string;
+  status: string;
+  approvedSha: string;
+  baseSha: string | null;
+  deployPlanHash: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
 export interface RepairView {
   id: string;
   incident_id: string;
@@ -173,6 +192,8 @@ export interface RepairView {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** 批1b:该 repair 的 release request(202 异步放行账本;§6.3)。 */
+  releaseRequests: ReleaseRequestSummary[];
 }
 export interface RepairEventView {
   id: string;
@@ -211,6 +232,37 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
        FROM codex_repairs WHERE incident_id = $1::bigint ORDER BY id DESC`,
     [id],
   );
+  // 批1b:每 repair 的 release request(§6.3)。一次查全,按 repair_id 归组。
+  const releaseByRepair = new Map<string, ReleaseRequestSummary[]>();
+  if (repR.rows.length > 0) {
+    const rrR = await query<{
+      release_request_id: string; repair_id: string; status: string;
+      approved_sha: string; base_sha: string | null; deploy_plan_hash: string | null;
+      failure_reason: string | null; created_at: Date; updated_at: Date;
+    }>(
+      `SELECT release_request_id, repair_id::text AS repair_id, status,
+              approved_sha, base_sha, deploy_plan_hash, failure_reason, created_at, updated_at
+         FROM selfheal_release_requests
+        WHERE repair_id = ANY($1::bigint[])
+        ORDER BY id ASC`,
+      [repR.rows.map((r) => r.id)],
+    );
+    for (const rr of rrR.rows) {
+      const arr = releaseByRepair.get(rr.repair_id) ?? [];
+      arr.push({
+        releaseRequestId: rr.release_request_id,
+        status: rr.status,
+        approvedSha: rr.approved_sha,
+        baseSha: rr.base_sha,
+        deployPlanHash: rr.deploy_plan_hash,
+        failureReason: scrubText(rr.failure_reason),
+        createdAt: rr.created_at.toISOString(),
+        updatedAt: rr.updated_at.toISOString(),
+      });
+      releaseByRepair.set(rr.repair_id, arr);
+    }
+  }
+
   const repairs: RepairView[] = repR.rows.map((r) => ({
     id: r.id,
     incident_id: r.incident_id,
@@ -228,6 +280,7 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
     finished_at: r.finished_at ? r.finished_at.toISOString() : null,
     created_at: r.created_at.toISOString(),
     updated_at: r.updated_at.toISOString(),
+    releaseRequests: releaseByRepair.get(r.id) ?? [],
   }));
 
   let events: RepairEventView[] = [];
@@ -258,7 +311,7 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
 
 // ─── admin 手动 resolve(tx:mode-aware 处置 condition + resolve + audit fail-closed)──
 
-export type AdminResolveOutcome = "resolved" | "not_found" | "already_resolved";
+export type AdminResolveOutcome = "resolved" | "not_found" | "already_resolved" | "deploy_in_progress";
 /** 处置结果(H1b 判定表,见文件头);响应/审计双带,前端据此区分 toast 文案。 */
 export type AdminResolveResolution =
   | "suppressed_until_clear"
@@ -284,6 +337,19 @@ export async function adminResolveIncident(
     if (cur.rows.length === 0) return { outcome: "not_found" as const };
     if (cur.rows[0].status === "resolved") return { outcome: "already_resolved" as const };
     const conditionKey = cur.rows[0].condition_key;
+
+    // 批1b F8:该 incident 有 status='deploying' 的 release request → 部署在途,admin 也不得
+    // 手动 resolve(与 deployed/deploy_failed receipt 竞态)。在**任何** condition 处置之前
+    // fail-closed 返回 deploy_in_progress,保持 tx 原子(不改 condition、不写审计、不 resolve)。
+    // resolveIncident 内部虽也 defer,但那已在 condition 处置之后,会留半改现场;故此处早拦。
+    const deploying = await client.query<{ one: number }>(
+      `SELECT 1 AS one FROM selfheal_release_requests rr
+         JOIN codex_repairs cr ON cr.id = rr.repair_id
+        WHERE cr.incident_id = $1::bigint AND rr.status = 'deploying'
+        LIMIT 1`,
+      [id],
+    );
+    if (deploying.rows.length > 0) return { outcome: "deploy_in_progress" as const };
 
     // 1) mode-aware 处置 condition(判定表见文件头;condition 缺失/已 !firing → 仅 resolve)。
     const condR = await client.query<{ mode: string; level: string | null; snapshot: unknown; firing: boolean }>(
@@ -415,170 +481,305 @@ export async function adminUnsuppressCondition(
   });
 }
 
-// ─── repair 一键放行(§B:pending_release → 个人版 releaseApproved)────
-
-export type ReleaseOutcome = "released" | "not_found" | "conflict" | "failed";
+// ─── repair 一键放行 → release request(批1b:202 durable async)──────────
 
 /**
- * HIGH2:release-claim(PG 原子 CAS)。读检查(放行门)与网络请求之间的 TOCTOU 收口:
- * 在 codex_repairs.detail 上原子置 `release_claimed=true`,WHERE 同时校验
- * status='running' 且尚未 claim。该 UPDATE 与 resolveIncident 的 cancel CAS
- * (running→cancel_requested)竞争**同一行**(行锁序化,谁先赢谁说了算):
- *   - cancel/resolve 先赢 → status 已非 running → 0 行 → 不发放行请求;
- *   - claim 先赢 → cancel 在行锁后依旧可推进状态(个人版 releaseApproved 侧再重验)。
- * 0 行 → false(已被 cancel/resolve,或已有放行在途/已放行)。
+ * pending_release 事件 detail 的结构化契约(跨仓,个人版 broker.handleCutover 冻结):
+ *   { phase:'pending_release', sha:<40hex>, baseSha:<40hex|null>,
+ *     deployPlanHash:<hex>, manifestHash:<hex>, classification?, verifyLayers?, changedFiles? }
+ * 放行事务只信本地 durable 事件(个人版 intake 还会用 trusted cutover 记录再核一次)。
  */
-export async function claimRelease(repairId: string): Promise<boolean> {
-  const r = await query<{ id: string }>(
-    `UPDATE codex_repairs
-        SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb),
-            updated_at = NOW()
-      WHERE id = $1::bigint AND status = 'running'
-        AND COALESCE(detail->>'release_claimed','') <> 'true'
-      RETURNING id`,
-    [repairId],
-  );
-  return r.rows.length > 0;
+interface PendingReleaseFrozen {
+  approvedSha: string;
+  baseSha: string | null;
+  deployPlanHash: string;
+  manifestHash: string;
+  planDetail: Record<string, unknown>;
+}
+
+const SHA40_RE = /^[0-9a-f]{40}$/;
+
+/** 从最新 pending_release 事件 detail 结构化校验 + 冻结字段(缺/形态错 → null=malformed)。 */
+function freezePendingRelease(detail: unknown): PendingReleaseFrozen | null {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) return null;
+  const d = detail as Record<string, unknown>;
+  if (d.phase !== "pending_release") return null;
+  const sha = typeof d.sha === "string" ? d.sha : "";
+  if (!SHA40_RE.test(sha)) return null;
+  const deployPlanHash = typeof d.deployPlanHash === "string" ? d.deployPlanHash : "";
+  const manifestHash = typeof d.manifestHash === "string" ? d.manifestHash : "";
+  if (deployPlanHash.length === 0 || manifestHash.length === 0) return null;
+  let baseSha: string | null = null;
+  if (d.baseSha !== undefined && d.baseSha !== null) {
+    if (typeof d.baseSha !== "string" || !SHA40_RE.test(d.baseSha)) return null;
+    baseSha = d.baseSha;
+  }
+  return { approvedSha: sha, baseSha, deployPlanHash, manifestHash, planDetail: d };
+}
+
+export type ReleaseOutcome = "queued" | "not_found" | "conflict" | "malformed" | "fuse_engaged";
+
+export interface AdminReleaseResult {
+  outcome: ReleaseOutcome;
+  releaseRequestId?: string;
+  reason?: string;
 }
 
 /**
- * HIGH2:postRelease 失败/异常后清 claim,允许重试(成功保留,挡二次放行)。
- * R2 补:claim 期间 resolveIncident 的 cancel CAS 会跳过 release_claimed 行
- * (真互斥,见 incidents.ts)——所以 release 失败且 incident 已 resolved 时,
- * 这里必须**确定性补 cancel**(否则该 repair 永远无人取消,占槽到超时)。
- * 同一事务:清 claim + 条件 CAS running→cancel_requested + cancel 事件。
- */
-export async function clearReleaseClaim(repairId: string): Promise<void> {
-  await tx(async (client) => {
-    await client.query(
-      `UPDATE codex_repairs
-          SET detail = detail - 'release_claimed', updated_at = NOW()
-        WHERE id = $1::bigint`,
-      [repairId],
-    );
-    const cancelled = await client.query(
-      `UPDATE codex_repairs r
-          SET status = 'cancel_requested', updated_at = NOW()
-         FROM incidents i
-        WHERE r.id = $1::bigint AND i.id = r.incident_id
-          AND r.status = 'running' AND i.status = 'resolved'`,
-      [repairId],
-    );
-    if ((cancelled.rowCount ?? 0) > 0) {
-      await client.query(
-        `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
-         VALUES ($1::bigint, 'cancel', 'release 失败且事故已恢复 — 补发取消', '{}'::jsonb)`,
-        [repairId],
-      );
-    }
-  });
-}
-
-/**
- * pending_release 标记契约(跨仓,个人版 broker.notifyPendingRelease 同步):
- * 个人版在 Tier2 修复 verify 过、等待放行时上报
- * `POST .../progress { message, detail: { phase: 'pending_release', ... } }`,
- * 本端以 codex_repair_events(kind='progress' AND detail->>'phase'='pending_release')
- * 判定"待放行"。放行门:repair 当前 status='running' 且存在该事件。
- *
- * 时序(BLOCKER1 + HIGH2):
- *   1) 读侧放行门 → 2) claimRelease 原子 CAS(0 行 → conflict,不发请求)→
- *   3) postRelease(只认个人版同步裁决 body.status==='deployed' 为成功,见其头注)→
- *   4a) 成功:同事务 note 事件 + 成功审计,claim 保留;
- *   4b) 失败/异常:审计如实记 failed(不留成功假象),finally 清 claim 允许重试。
- *
- * 注意:break-glass(个人版 root 直连路径)**不经此门**——那是绕开 v5 控制面的
- * break-glass 语义,本 claim 只序列化 v5 admin 面的放行入口。
+ * 一键放行(批1b:202 异步)。单事务:
+ *   1) SELECT … FOR UPDATE 锁 repair 行 → 校验 status='running'。
+ *   2) 取最新 pending_release 事件,结构化冻结 sha/baseSha/deployPlanHash/manifestHash
+ *      (phase='pending_release' 且 sha 40hex 且两 hash 非空;缺/形态错 → malformed 400)。
+ *      事件不存在 → conflict(该 repair 未在待放行姿态)。
+ *   3) 全局熔断 engaged → fuse_engaged 423。
+ *   4) INSERT selfheal_release_requests(冻结字段全部来自事件 detail;唯一活跃索引
+ *      冲突 → conflict 409:同 repair 已有 queued/accepted/deploying 请求)。
+ *   5) writeAdminAudit(action='repair.release', outcome='queued', 含 rrid;tx fail-closed)。
+ *   → 202 { releaseRequestId, status:'queued' }。
+ * 真实部署由 delivery 步交付 + callback 回传,不在此同步等待(部署会重启 master)。
+ * break-glass(个人版 root 直连路径)不经此门。
  */
 export async function adminReleaseRepair(
   repairId: string,
   input: AdminResolveInput,
-): Promise<{ outcome: ReleaseOutcome; httpStatus?: number; reason?: string }> {
+): Promise<AdminReleaseResult> {
   if (!ID_RE.test(repairId)) throw new RangeError("invalid id");
-  // 1) 放行门校验(读侧;个人版 releaseApproved 会再重验 pending_release 记录+ancestry)。
-  const r = await query<{ id: string; incident_id: string; status: string; pending_release: boolean }>(
-    `SELECT r.id::text AS id, r.incident_id::text AS incident_id, r.status,
-            EXISTS (
-              SELECT 1 FROM codex_repair_events e
-               WHERE e.repair_id = r.id AND e.kind = 'progress'
-                 AND e.detail->>'phase' = 'pending_release'
-            ) AS pending_release
-       FROM codex_repairs r WHERE r.id = $1::bigint`,
-    [repairId],
-  );
-  const row = r.rows[0];
-  if (!row) return { outcome: "not_found" };
-  if (row.status !== "running" || !row.pending_release) {
-    return {
-      outcome: "conflict",
-      reason: row.status !== "running" ? `repair is ${row.status}` : "no pending_release event",
-    };
-  }
-
-  // 2) HIGH2:release-claim CAS(读检查后、网络请求前)。0 行 = 已被 cancel/resolve
-  //    抢先,或已有放行在途/已放行 → conflict,绝不重复发放行请求。
-  if (!(await claimRelease(repairId))) {
-    return { outcome: "conflict", reason: "release already claimed or repair no longer running" };
-  }
-
-  let released = false;
   try {
-    // 3) 经隧道通知个人版 releaseApproved(网络操作在事务外)。BLOCKER1:del.ok 已是
-    //    "个人版确认部署完成"(2xx ∧ body.ok ∧ status==='deployed'),不是裸 HTTP 2xx。
-    const del = await _postRelease({ repairId: row.id, incidentId: row.incident_id });
-    if (!del.ok) {
-      const reason =
-        del.reason ??
-        (del.remoteStatus !== undefined
-          ? `personal-side status: ${del.remoteStatus}`
-          : (del.error ??
-            (del.httpStatus !== undefined ? `http ${del.httpStatus}` : "release delivery failed")));
-      // 4b) 审计如实记 failed(不写 note 事件,不留"已放行并部署"假象);claim 在 finally 清。
-      await tx(async (client: PoolClient) => {
-        await writeAdminAudit(client, {
-          adminId: input.adminId,
-          action: "repair.release",
-          target: `repair:${repairId}`,
-          after: {
-            repair_id: repairId,
-            incident_id: row.incident_id,
-            outcome: "failed",
-            reason,
-            remote_status: del.remoteStatus ?? null,
-            http_status: del.httpStatus ?? null,
-          },
-          ip: input.ip ?? null,
-          userAgent: input.userAgent ?? null,
-        });
-      });
-      return { outcome: "failed", httpStatus: del.httpStatus, reason };
-    }
-
-    // 4a) 部署确认成功 → 同事务:note 事件 + 成功审计(tx fail-closed)。
-    await tx(async (client: PoolClient) => {
-      await client.query(
-        `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
-         VALUES ($1::bigint, 'note', $2, '{}'::jsonb)`,
-        [repairId, "管理员一键放行,个人版已确认部署完成(release deployed)"],
+    return await tx(async (client: PoolClient) => {
+      const rep = await client.query<{ id: string; incident_id: string; status: string }>(
+        `SELECT id::text AS id, incident_id::text AS incident_id, status
+           FROM codex_repairs WHERE id = $1::bigint FOR UPDATE`,
+        [repairId],
       );
+      const row = rep.rows[0];
+      if (!row) return { outcome: "not_found" as const };
+      if (row.status !== "running") {
+        return { outcome: "conflict" as const, reason: `repair is ${row.status}` };
+      }
+      // 最新 pending_release 事件(个人版 verify 过、待放行时上报)。
+      const evt = await client.query<{ detail: unknown }>(
+        `SELECT detail FROM codex_repair_events
+          WHERE repair_id = $1::bigint AND kind = 'progress'
+            AND detail->>'phase' = 'pending_release'
+          ORDER BY id DESC LIMIT 1`,
+        [repairId],
+      );
+      if (evt.rows.length === 0) {
+        return { outcome: "conflict" as const, reason: "no pending_release event" };
+      }
+      const frozen = freezePendingRelease(evt.rows[0].detail);
+      if (!frozen) {
+        return {
+          outcome: "malformed" as const,
+          reason: "pending_release event detail malformed (phase/sha/deployPlanHash/manifestHash)",
+        };
+      }
+      // 全局熔断:engaged 时禁再放行(Tier2 新部署熔断,人工 clear 后才可放行)。
+      const fuse = await client.query<{ engaged: boolean }>(
+        `SELECT engaged FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE`,
+      );
+      if (fuse.rows[0]?.engaged) {
+        return { outcome: "fuse_engaged" as const, reason: "release fuse engaged" };
+      }
+      // INSERT release request(冻结字段全部来自事件 detail;唯一活跃索引冲突 → 23505 → 409)。
+      const ins = await client.query<{ release_request_id: string }>(
+        `INSERT INTO selfheal_release_requests
+           (repair_id, incident_id, requested_by, approved_sha, base_sha,
+            deploy_plan_hash, manifest_hash, plan_detail)
+         VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, $7, $8::jsonb)
+         RETURNING release_request_id`,
+        [
+          repairId,
+          row.incident_id,
+          String(input.adminId),
+          frozen.approvedSha,
+          frozen.baseSha,
+          frozen.deployPlanHash,
+          frozen.manifestHash,
+          JSON.stringify(frozen.planDetail),
+        ],
+      );
+      const rrid = ins.rows[0].release_request_id;
       await writeAdminAudit(client, {
         adminId: input.adminId,
         action: "repair.release",
         target: `repair:${repairId}`,
-        after: { repair_id: repairId, incident_id: row.incident_id, outcome: "released" },
+        after: {
+          repair_id: repairId,
+          incident_id: row.incident_id,
+          release_request_id: rrid,
+          approved_sha: frozen.approvedSha,
+          outcome: "queued",
+        },
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
       });
+      return { outcome: "queued" as const, releaseRequestId: rrid };
     });
-    released = true; // claim 保留:已放行部署的修复不允许再次放行。
-    return { outcome: "released", httpStatus: del.httpStatus };
-  } finally {
-    if (!released) {
-      // postRelease 失败/任何异常(含 4a 事务写失败——此时无成功审计,重试得到真实状态)
-      // → 清 claim 允许重试。
-      await clearReleaseClaim(repairId);
+  } catch (err) {
+    if ((err as { code?: string })?.code === "23505") {
+      // ux_selfheal_release_active:同 repair 已有活跃请求(queued/accepted/deploying)。
+      return { outcome: "conflict", reason: "release request already active for this repair" };
     }
+    throw err;
   }
+}
+
+// ─── release request / fuse 读接口 + 熔断收敛(§6.3)────────────────────
+
+export interface ReleaseRequestView {
+  releaseRequestId: string;
+  repairId: string;
+  incidentId: string;
+  status: string;
+  requestedBy: string;
+  approvedSha: string;
+  baseSha: string | null;
+  deployPlanHash: string | null;
+  manifestHash: string | null;
+  planDetail: unknown; // 已脱敏
+  failureReason: string | null;
+  deliveryAttempts: number;
+  nextDeliveryAt: string | null;
+  deliveredAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+}
+export interface ReleaseRequestDetail {
+  request: ReleaseRequestView;
+  events: RepairEventView[];
+}
+
+/** rrid 白名单:v5 UUID text / break-glass|auto 形态(仅字母数字下划线短横,cap 128)。 */
+const RRID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** GET release request:行 + 关联 events(codex_repair_events 里 detail.releaseRequestId=rrid)。 */
+export async function getReleaseRequest(rrid: string): Promise<ReleaseRequestDetail | null> {
+  if (!RRID_RE.test(rrid)) throw new RangeError("invalid releaseRequestId");
+  const r = await query<{
+    release_request_id: string; repair_id: string; incident_id: string; status: string;
+    requested_by: string; approved_sha: string; base_sha: string | null;
+    deploy_plan_hash: string | null; manifest_hash: string | null; plan_detail: unknown;
+    failure_reason: string | null; delivery_attempts: number; next_delivery_at: Date | null;
+    delivered_at: Date | null; created_at: Date; updated_at: Date;
+    resolved_at: Date | null; resolved_by: string | null;
+  }>(
+    `SELECT release_request_id, repair_id::text AS repair_id, incident_id::text AS incident_id,
+            status, requested_by, approved_sha, base_sha, deploy_plan_hash, manifest_hash,
+            plan_detail, failure_reason, delivery_attempts, next_delivery_at, delivered_at,
+            created_at, updated_at, resolved_at, resolved_by
+       FROM selfheal_release_requests WHERE release_request_id = $1`,
+    [rrid],
+  );
+  if (r.rows.length === 0) return null;
+  const rr = r.rows[0];
+  const evR = await query<{
+    id: string; repair_id: string; kind: string; message: string; detail: unknown; created_at: Date;
+  }>(
+    `SELECT id::text AS id, repair_id::text AS repair_id, kind, message, detail, created_at
+       FROM codex_repair_events
+      WHERE repair_id = $1::bigint AND detail->>'releaseRequestId' = $2
+      ORDER BY id ASC`,
+    [rr.repair_id, rrid],
+  );
+  return {
+    request: {
+      releaseRequestId: rr.release_request_id,
+      repairId: rr.repair_id,
+      incidentId: rr.incident_id,
+      status: rr.status,
+      requestedBy: rr.requested_by,
+      approvedSha: rr.approved_sha,
+      baseSha: rr.base_sha,
+      deployPlanHash: rr.deploy_plan_hash,
+      manifestHash: rr.manifest_hash,
+      planDetail: redactOpsPayload(rr.plan_detail),
+      failureReason: scrubText(rr.failure_reason),
+      deliveryAttempts: Number(rr.delivery_attempts),
+      nextDeliveryAt: rr.next_delivery_at ? rr.next_delivery_at.toISOString() : null,
+      deliveredAt: rr.delivered_at ? rr.delivered_at.toISOString() : null,
+      createdAt: rr.created_at.toISOString(),
+      updatedAt: rr.updated_at.toISOString(),
+      resolvedAt: rr.resolved_at ? rr.resolved_at.toISOString() : null,
+      resolvedBy: rr.resolved_by,
+    },
+    events: evR.rows.map((e) => ({
+      id: e.id,
+      repair_id: e.repair_id,
+      kind: e.kind,
+      message: scrubSecretsInString(e.message),
+      detail: redactOpsPayload(e.detail),
+      created_at: e.created_at.toISOString(),
+    })),
+  };
+}
+
+export interface ReleaseFuseView {
+  engaged: boolean;
+  reason: string | null;
+  releaseRequestId: string | null;
+  engagedAt: string | null;
+  engagedBy: string | null;
+  clearedAt: string | null;
+  clearedBy: string | null;
+  personalAckAt: string | null;
+}
+
+/** GET release fuse(全局 Tier2 部署熔断当前值)。 */
+export async function getReleaseFuse(): Promise<ReleaseFuseView> {
+  const r = await query<{
+    engaged: boolean; reason: string | null; release_request_id: string | null;
+    engaged_at: Date | null; engaged_by: string | null;
+    cleared_at: Date | null; cleared_by: string | null; personal_ack_at: Date | null;
+  }>(
+    `SELECT engaged, reason, release_request_id, engaged_at, engaged_by,
+            cleared_at, cleared_by, personal_ack_at
+       FROM selfheal_release_fuse WHERE id = 1`,
+  );
+  const f = r.rows[0];
+  return {
+    engaged: Boolean(f?.engaged),
+    reason: f?.reason ?? null,
+    releaseRequestId: f?.release_request_id ?? null,
+    engagedAt: f?.engaged_at ? f.engaged_at.toISOString() : null,
+    engagedBy: f?.engaged_by ?? null,
+    clearedAt: f?.cleared_at ? f.cleared_at.toISOString() : null,
+    clearedBy: f?.cleared_by ?? null,
+    personalAckAt: f?.personal_ack_at ? f.personal_ack_at.toISOString() : null,
+  };
+}
+
+export type FuseClearOutcome = "cleared" | "not_engaged";
+
+/**
+ * 清除全局熔断(带审计,tx fail-closed)。CAS engaged=TRUE → FALSE + cleared_at/by;
+ * personal_ack_at 复位(sweeper fuse 双侧收敛步据 cleared_at 非空 ∧ personal_ack_at 空
+ * 向个人版投递 fuse-clear,确认后回填)。熔断只拦 Tier2 新放行,不拦人工 rollback/recover。
+ */
+export async function clearReleaseFuse(
+  input: AdminResolveInput & { reason?: string | null },
+): Promise<{ outcome: FuseClearOutcome }> {
+  return tx(async (client: PoolClient) => {
+    const cas = await client.query<{ id: number }>(
+      `UPDATE selfheal_release_fuse
+          SET engaged = FALSE, cleared_at = NOW(), cleared_by = $1, personal_ack_at = NULL
+        WHERE id = 1 AND engaged = TRUE
+        RETURNING id`,
+      [String(input.adminId)],
+    );
+    if (cas.rows.length === 0) return { outcome: "not_engaged" as const };
+    await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: "selfheal.fuse_clear",
+      target: "release_fuse",
+      after: { reason: input.reason ?? null },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    });
+    return { outcome: "cleared" as const };
+  });
 }
 
 // ─── user recovery notice approval audit ────────────────────────────

@@ -182,6 +182,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/release-fuse",
+    "handler": "handleAdminGetReleaseFuse"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/selfheal/release-fuse/clear",
+    "handler": "handleAdminClearReleaseFuse"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/selfheal/release-requests/",
+    "handler": "handleAdminGetReleaseRequest"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/pricing",
     "handler": "handleAdminListPricing"
   },

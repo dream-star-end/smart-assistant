@@ -2,20 +2,19 @@
  * v5 自愈体系收尾批 集成测试(octest PG,真迁移 schema)——
  *   A1 suppression 全场景(压制不重开/恢复自动清/恢复后再故障重开/unsuppress 重开/
  *      latched 关闭路径/already-clear/reconciler 兜底 resolve)
- *   A2 resolveIncident 同事务取消活跃修复(verifying 不动)
+ *   A2 resolveIncident 同事务取消活跃修复(verifying 不动;批1b:deploying release request
+ *      的 repair 不取消 / queued|accepted request 同事务置 cancelled)
  *   A1 dispatcher 压制守卫(suppressed 不派单)
  *   A9/L1 inbox 幂等键带 rev(updated:N 各一条,同 rev 重放仍一条)
  *   M1 writer-guard 兼容覆盖(已部署 trigger 时验证检测列拒绝/operator 列放行)
  *   B1 policy 覆盖契约(每个生产 producer key 必命中 policy,防 key 域再漂移)
- *   §B adminReleaseRepair 放行链(pending_release 门 + HMAC 签名 POST + audit)
  *
+ * 批1b 放行链(202 异步 / 回调分流 / fuse)的集成覆盖见 selfhealReleaseRequests.integ.test.ts。
  * pg 不可用时 skip。断言=行为(DB round-trip / HTTP 副作用),非源码 regex。
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type Server } from "node:http";
-import { createHash, createHmac } from "node:crypto";
 import type { PoolClient } from "pg";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
@@ -34,9 +33,6 @@ import {
 import {
   adminResolveIncident,
   adminUnsuppressCondition,
-  adminReleaseRepair,
-  claimRelease,
-  clearReleaseClaim,
   getIncidentDetail,
   listConditions,
   listIncidents,
@@ -316,52 +312,61 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
     assert.equal(r.rows[0].status, "verifying");
   });
 
-  test("release_claimed 的 running repair:resolve 不取消(与放行 claim 真互斥,审计R2 HIGH1)", async (t) => {
+  test("批1b:deploying release request 的 running repair:resolve 不取消(receipt 裁决)", async (t) => {
     if (skipIfNoPg(t)) return;
     const { incidentId, repairId } = await seedIncidentWithRepair("running");
     await query(
-      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
-      [repairId],
+      `INSERT INTO selfheal_release_requests
+         (repair_id, incident_id, requested_by, approved_sha, status)
+       VALUES ($1::bigint, $2::bigint, '1', $3, 'deploying')`,
+      [repairId, incidentId, "a".repeat(40)],
     );
     await tx((client: PoolClient) => resolveIncident(incidentId, "probe", client));
     const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
-    assert.equal(r.rows[0].status, "running", "claim 先赢 → resolve 不取消,放行后由 verify fence 裁决");
+    assert.equal(r.rows[0].status, "running", "deploying 在途 → resolve 不取消 repair,交 receipt 裁决");
+    const rr = await query<{ status: string }>(
+      `SELECT status FROM selfheal_release_requests WHERE repair_id=$1::bigint`, [repairId]);
+    assert.equal(rr.rows[0].status, "deploying", "deploying 请求不被 resolve 置 cancelled");
   });
 
-  test("clearReleaseClaim:incident 已 resolved → 确定性补 cancel_requested + cancel 事件", async (t) => {
+  test("批1b F2:queued(未交付)request resolve 同事务置 cancelled;accepted(已交付)保持 accepted;两者 repair 均 cancel_requested", async (t) => {
     if (skipIfNoPg(t)) return;
-    const { incidentId, repairId } = await seedIncidentWithRepair("running");
-    await query(
-      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
-      [repairId],
-    );
-    await tx((client: PoolClient) => resolveIncident(incidentId, "probe", client));
-    await clearReleaseClaim(repairId);
-    const r = await query<{ status: string; claimed: string | null }>(
-      `SELECT status, detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
-      [repairId],
-    );
-    assert.equal(r.rows[0].status, "cancel_requested", "release 失败且事故已恢复 → 补 cancel(否则占槽到超时)");
-    assert.equal(r.rows[0].claimed, null);
-    const ev = await query<{ kind: string }>(
-      `SELECT kind FROM codex_repair_events WHERE repair_id=$1::bigint ORDER BY id DESC LIMIT 1`, [repairId]);
-    assert.equal(ev.rows[0].kind, "cancel");
-  });
-
-  test("clearReleaseClaim:incident 仍 open → 只清 claim,repair 保持 running", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const { repairId } = await seedIncidentWithRepair("running");
-    await query(
-      `UPDATE codex_repairs SET detail = jsonb_set(COALESCE(detail,'{}'::jsonb),'{release_claimed}','true'::jsonb) WHERE id=$1::bigint`,
-      [repairId],
-    );
-    await clearReleaseClaim(repairId);
-    const r = await query<{ status: string; claimed: string | null }>(
-      `SELECT status, detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
-      [repairId],
-    );
-    assert.equal(r.rows[0].status, "running");
-    assert.equal(r.rows[0].claimed, null);
+    // queued(delivered_at NULL,个人版从未收到)→ 乐观撤单安全,同事务直接置 cancelled。
+    {
+      const { incidentId, repairId } = await seedIncidentWithRepair("running");
+      await query(
+        `INSERT INTO selfheal_release_requests
+           (repair_id, incident_id, requested_by, approved_sha, status)
+         VALUES ($1::bigint, $2::bigint, '1', $3, 'queued')`,
+        [repairId, incidentId, "a".repeat(40)],
+      );
+      await tx((client: PoolClient) => resolveIncident(incidentId, "admin", client));
+      const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
+      assert.equal(r.rows[0].status, "cancel_requested", "queued:repair → cancel_requested");
+      const rr = await query<{ status: string; resolved_by: string | null }>(
+        `SELECT status, resolved_by FROM selfheal_release_requests WHERE repair_id=$1::bigint`, [repairId]);
+      assert.equal(rr.rows[0].status, "cancelled", "queued:request 同事务置 cancelled");
+      assert.equal(rr.rows[0].resolved_by, "admin");
+      await cleanup();
+    }
+    // accepted(个人版已 202 收下,delivered_at set)→ F2:不单方 cancelled(可能已 pre-claim/在途),
+    // 交 sweeper postCancel 的 releaseCancel 裁决收口;repair 仍进 cancel 流。
+    {
+      const { incidentId, repairId } = await seedIncidentWithRepair("running");
+      await query(
+        `INSERT INTO selfheal_release_requests
+           (repair_id, incident_id, requested_by, approved_sha, status, delivered_at)
+         VALUES ($1::bigint, $2::bigint, '1', $3, 'accepted', NOW())`,
+        [repairId, incidentId, "a".repeat(40)],
+      );
+      await tx((client: PoolClient) => resolveIncident(incidentId, "admin", client));
+      const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
+      assert.equal(r.rows[0].status, "cancel_requested", "accepted:repair 仍进 cancel 流");
+      const rr = await query<{ status: string }>(
+        `SELECT status FROM selfheal_release_requests WHERE repair_id=$1::bigint`, [repairId]);
+      assert.equal(rr.rows[0].status, "accepted", "accepted:request 不被单方 cancelled(交 cancel webhook 收口)");
+      await cleanup();
+    }
   });
 
   test("admin resolve 全链:suppression + 修复取消同一事务", async (t) => {
@@ -474,209 +479,6 @@ describe("B1 policy 覆盖契约:每个生产 producer key 必命中 policy", ()
     }
     // 反例:未登记 key 不命中(policy 域收敛)。
     assert.equal(await matchPolicy("random.unknown.key"), null);
-  });
-});
-
-// ═══ §B — adminReleaseRepair 放行链 ═════════════════════════════════════
-
-describe("§B adminReleaseRepair(一键放行)", () => {
-  let server: Server | null = null;
-  let received: Array<{ url: string; method: string; headers: Record<string, string | string[] | undefined>; body: string }> = [];
-  let respondStatus = 200;
-  // BLOCKER1 契约:个人版 release 端点同步返回部署裁决,body 恒 {ok,status,detail}。
-  const defaultBody = (): string =>
-    respondStatus === 200
-      ? JSON.stringify({ ok: true, status: "deployed", detail: null })
-      : JSON.stringify({ ok: false, status: "deploy_failed", detail: { reason: "deploy smoke failed" } });
-  let respondBody: () => string = defaultBody;
-
-  async function startReleaseServer(): Promise<number> {
-    received = [];
-    respondStatus = 200;
-    respondBody = defaultBody;
-    server = createServer((req, res) => {
-      let body = "";
-      req.on("data", (c) => { body += String(c); });
-      req.on("end", () => {
-        received.push({ url: req.url ?? "", method: req.method ?? "", headers: req.headers, body });
-        res.statusCode = respondStatus;
-        res.end(respondBody());
-      });
-    });
-    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
-    const addr = server!.address();
-    const port = typeof addr === "object" && addr ? addr.port : 0;
-    process.env.OC_SELFHEAL_DISPATCH_URL = `http://127.0.0.1:${port}`;
-    return port;
-  }
-
-  async function stopReleaseServer(): Promise<void> {
-    if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
-    server = null;
-    process.env.OC_SELFHEAL_DISPATCH_URL = "http://127.0.0.1:59999";
-  }
-
-  async function seedPendingRelease(status = "running", withEvent = true): Promise<string> {
-    const inc = await query<{ id: string }>(
-      `INSERT INTO incidents (dedupe_key, condition_key, status, severity, surface, audience, user_title, user_message)
-       VALUES ('k.rel','k.rel','repairing','critical','global','all','t','m') RETURNING id::text AS id`,
-    );
-    const rep = await query<{ id: string }>(
-      `INSERT INTO codex_repairs (incident_id, status, attempt, tier)
-       VALUES ($1::bigint, $2, 1, 'tier2') RETURNING id::text AS id`,
-      [inc.rows[0].id, status],
-    );
-    if (withEvent) {
-      await query(
-        `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
-         VALUES ($1::bigint, 'progress', '修复已验证,等待放行部署', '{"phase":"pending_release","sha":"abc123"}'::jsonb)`,
-        [rep.rows[0].id],
-      );
-    }
-    return rep.rows[0].id;
-  }
-
-  /** codex_repairs.detail->>'release_claimed' 现值(null = 无 claim)。 */
-  async function releaseClaimed(repairId: string): Promise<string | null> {
-    const r = await query<{ claimed: string | null }>(
-      `SELECT detail->>'release_claimed' AS claimed FROM codex_repairs WHERE id=$1::bigint`,
-      [repairId],
-    );
-    return r.rows[0]?.claimed ?? null;
-  }
-
-  test("放行门通过 → POST release(HMAC 路由绑定签名可验)+ note event + audit", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const repairId = await seedPendingRelease();
-    await startReleaseServer();
-    try {
-      const r = await adminReleaseRepair(repairId, adminInput());
-      assert.equal(r.outcome, "released");
-      assert.equal(received.length, 1, "个人版收到恰一次 release POST");
-      const req0 = received[0];
-      assert.equal(req0.url, "/api/webhooks/v5-selfheal-release");
-      assert.equal(req0.method, "POST");
-      assert.deepEqual(JSON.parse(req0.body), { repairId, incidentId: "1" }, "body 只含 id");
-      // 验签(M3 契约:METHOD.path.ts.nonce.repairId.bodySha)。
-      const ts = String(req0.headers["x-selfheal-ts"]);
-      const nonce = String(req0.headers["x-selfheal-nonce"]);
-      const sig = String(req0.headers["x-selfheal-sig"]);
-      const bodySha = createHash("sha256").update(req0.body).digest("hex");
-      const expect = createHmac("sha256", WEBHOOK_SECRET)
-        .update(`POST./api/webhooks/v5-selfheal-release.${ts}.${nonce}.${repairId}.${bodySha}`)
-        .digest("hex");
-      assert.equal(sig, expect, "release 走与 dispatch 相同的路由绑定 HMAC");
-
-      const ev = await query<{ kind: string; message: string }>(
-        `SELECT kind, message FROM codex_repair_events WHERE repair_id=$1::bigint ORDER BY id DESC LIMIT 1`, [repairId]);
-      assert.equal(ev.rows[0].kind, "note");
-      assert.match(ev.rows[0].message, /放行/);
-      assert.match(ev.rows[0].message, /部署完成/, "note 只在个人版确认 deployed 后才写");
-      assert.equal(await auditRows("repair.release"), 1);
-      const audit = await query<{ outcome: string | null }>(
-        `SELECT after->>'outcome' AS outcome FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
-      assert.equal(audit.rows[0].outcome, "released");
-      // HIGH2:成功保留 claim(挡二次放行)→ 再次放行必 conflict 且零新 POST。
-      assert.equal(await releaseClaimed(repairId), "true");
-      const again = await adminReleaseRepair(repairId, adminInput());
-      assert.equal(again.outcome, "conflict");
-      assert.equal(received.length, 1, "二次放行不重发 release POST");
-    } finally {
-      await stopReleaseServer();
-    }
-  });
-
-  test("放行门:无 pending_release 事件 / 非 running / 不存在 → 拒", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const noEvent = await seedPendingRelease("running", false);
-    assert.equal((await adminReleaseRepair(noEvent, adminInput())).outcome, "conflict");
-    await cleanup();
-    const wrongStatus = await seedPendingRelease("verifying", true);
-    assert.equal((await adminReleaseRepair(wrongStatus, adminInput())).outcome, "conflict");
-    assert.equal((await adminReleaseRepair("999999", adminInput())).outcome, "not_found");
-    assert.equal(await auditRows("repair.release"), 0, "被拒路径零审计零事件");
-  });
-
-  test("个人版 5xx → failed:审计如实记 failed(零 note 事件),清 claim 后可重试成功", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const repairId = await seedPendingRelease();
-    await startReleaseServer();
-    respondStatus = 500;
-    try {
-      const r = await adminReleaseRepair(repairId, adminInput());
-      assert.equal(r.outcome, "failed");
-      assert.equal(r.reason, "deploy smoke failed", "body.detail.reason 透传供展示");
-      const ev = await query<{ n: string }>(
-        `SELECT COUNT(*)::text AS n FROM codex_repair_events WHERE repair_id=$1::bigint AND kind='note'`, [repairId]);
-      assert.equal(ev.rows[0].n, "0", "失败绝不写'已放行并部署'note(不留成功假象)");
-      // BLOCKER1:失败也留审计,但 outcome 必须如实为 failed。
-      assert.equal(await auditRows("repair.release"), 1);
-      const audit = await query<{ outcome: string | null; reason: string | null }>(
-        `SELECT after->>'outcome' AS outcome, after->>'reason' AS reason
-           FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
-      assert.equal(audit.rows[0].outcome, "failed");
-      assert.equal(audit.rows[0].reason, "deploy smoke failed");
-      // HIGH2 CAS 例3:失败已清 claim → 重试成功路径仍通。
-      assert.equal(await releaseClaimed(repairId), null, "失败后 claim 必须被清,否则永久卡死重试");
-      respondStatus = 200;
-      assert.equal((await adminReleaseRepair(repairId, adminInput())).outcome, "released");
-      assert.equal(await releaseClaimed(repairId), "true", "成功保留 claim");
-    } finally {
-      await stopReleaseServer();
-    }
-  });
-
-  test("BLOCKER1:个人版 2xx 但 body.status!=='deployed' → failed(不写成功事件/成功审计),清 claim", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const repairId = await seedPendingRelease();
-    await startReleaseServer();
-    respondBody = () =>
-      JSON.stringify({ ok: false, status: "pending", detail: { reason: "operator gate not approved" } });
-    try {
-      const r = await adminReleaseRepair(repairId, adminInput());
-      assert.equal(r.outcome, "failed", "裸 HTTP 2xx 不是部署成功的权威");
-      assert.equal(r.reason, "operator gate not approved");
-      const ev = await query<{ n: string }>(
-        `SELECT COUNT(*)::text AS n FROM codex_repair_events WHERE repair_id=$1::bigint AND kind='note'`, [repairId]);
-      assert.equal(ev.rows[0].n, "0");
-      const audit = await query<{ outcome: string | null; remote: string | null }>(
-        `SELECT after->>'outcome' AS outcome, after->>'remote_status' AS remote
-           FROM admin_audit WHERE action='repair.release' ORDER BY id DESC LIMIT 1`);
-      assert.equal(audit.rows[0].outcome, "failed");
-      assert.equal(audit.rows[0].remote, "pending");
-      assert.equal(await releaseClaimed(repairId), null, "失败清 claim 允许重试");
-    } finally {
-      await stopReleaseServer();
-    }
-  });
-
-  test("HIGH2 CAS 例1:cancel(resolveIncident)先赢 → claim 0 行拒,conflict 且零放行 POST", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const repairId = await seedPendingRelease();
-    const incR = await query<{ incident_id: string }>(
-      `SELECT incident_id::text AS incident_id FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
-    // cancel CAS 先赢:running → cancel_requested(与 claim UPDATE 竞争同一行)。
-    await tx((client: PoolClient) => resolveIncident(incR.rows[0].incident_id, "admin", client));
-    // claim CAS 直接验证:status 已非 running → 0 行 → false。
-    assert.equal(await claimRelease(repairId), false, "cancel 先赢后 claim 必须 0 行拒");
-    // 全链:不发请求(未起 server —— 若走到 POST 会得 failed 而非 conflict)。
-    const r = await adminReleaseRepair(repairId, adminInput());
-    assert.equal(r.outcome, "conflict");
-    assert.equal(await auditRows("repair.release"), 0, "conflict 路径零审计");
-  });
-
-  test("HIGH2 CAS 例2:重复 claim 拒 —— 已在放行中(claim 持有)时二次放行 conflict,不发请求", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const repairId = await seedPendingRelease();
-    assert.equal(await claimRelease(repairId), true, "首次 claim 成功");
-    assert.equal(await releaseClaimed(repairId), "true");
-    assert.equal(await claimRelease(repairId), false, "重复 claim 必须 0 行拒");
-    // 读侧放行门(running + pending_release)全过,但 claim CAS 挡住 → conflict。
-    // 未起 server:若绕过 claim 走到 POST,会得 failed 而非 conflict。
-    const r = await adminReleaseRepair(repairId, adminInput());
-    assert.equal(r.outcome, "conflict");
-    assert.match(r.reason ?? "", /already claimed/);
-    assert.equal(await releaseClaimed(repairId), "true", "他人持有的 claim 不被 conflict 路径清除");
   });
 });
 

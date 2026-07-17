@@ -144,6 +144,9 @@ import {
   handleAdminListIncidents,
   handleAdminListSelfhealConditions,
   handleAdminReleaseRepair,
+  handleAdminGetReleaseRequest,
+  handleAdminGetReleaseFuse,
+  handleAdminClearReleaseFuse,
   handleAdminResolveIncident,
   handleAdminUnsuppressCondition,
 } from './admin/selfheal.js'
@@ -895,6 +898,23 @@ export function createCommercialHandler(
       method: 'POST',
       pathPrefix: '/api/admin/selfheal/repairs/',
       handler: handleAdminReleaseRepair,
+    },
+    // 批1b:release request 读接口 + 全局熔断读/清。exact(release-fuse / release-fuse/clear)
+    // 排在 release-requests/:rrid prefix 之前(matchRoute exact-first)。
+    {
+      method: 'GET',
+      path: '/api/admin/selfheal/release-fuse',
+      handler: handleAdminGetReleaseFuse,
+    },
+    {
+      method: 'POST',
+      path: '/api/admin/selfheal/release-fuse/clear',
+      handler: handleAdminClearReleaseFuse,
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/admin/selfheal/release-requests/',
+      handler: handleAdminGetReleaseRequest,
     },
     // 切片②ⓐ:codex 修复回调(经 SSH 隧道 loopback 到达)。ANY_METHOD 通配转发,method/子路由
     // (ack/progress/verify/done/failed/claim-capability/context)权威 + capability/webhook HMAC

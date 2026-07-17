@@ -24,11 +24,20 @@
  *   sig = hex(HMAC-SHA256(OC_SELFHEAL_WEBHOOK_HMAC,
  *           `${METHOD}.${path}.${ts}.${nonce}.${repairId}.${bodySha256}`))
  *   (METHOD 大写;path = URL pathname,无 query —— 签名绑路由,防跨端点重放)。
- * 端点路径:/api/webhooks/v5-selfheal(派单)/ -cancel(取消)/ -release(放行)。
- * cancel 响应:200 `{terminated: boolean, accepted?: boolean}`。
- * release 响应(BLOCKER1,同步部署裁决,body 恒 {ok,status,detail}):deployed→200 /
- *   pending|rejected→409 / in_progress→423 / deploy_failed→500 / 内部异常→503;
- *   本端只认 2xx ∧ body.ok===true ∧ body.status==='deployed' 为成功(见 postRelease)。
+ * 端点路径:/api/webhooks/v5-selfheal(派单)/ -cancel(取消)/ -release(放行交付)。
+ * cancel 响应(跨仓契约,个人版逐字同步 —— 批1b F2,R2-1 修订):
+ *   200 `{terminated:boolean, accepted?:boolean,
+ *         releaseCancel?:'cancelled'|'idempotent'|'not_found'|'too_late', releaseRequestId?:string}`
+ *        —— 正常路径一律 200:repair 级(terminated/accepted)与 release 级(releaseCancel)两组裁决同体返回;
+ *           **too_late(release job 已 pre-claim 部署)也走 200,不再是 409**。
+ *   409 `{ok:false, releaseCancel:'repair_mismatch'}`(唯一 409:rrid 不属于该 repair 的契约校验失败)。
+ *   `releaseCancel` 仅在 postCancel 携带 releaseRequestId(兼取消 release job)时有意义:
+ *   cancelled/not_found/idempotent = 个人版不会再部署该 release(v5 sweeper 收口活跃行置 cancelled);
+ *   too_late = 已在部署,v5 不动 release 行,交 deployed/deploy_failed receipt 裁决(repair 在 cancel
+ *   途中被 deployed receipt 收口到 verifying,见 selfhealRepairs.ts R2-1②);repair_mismatch = 契约校验失败,不收口。
+ * release 交付响应(批1b durable async intake,只认状态码,见 postReleaseDelivery):
+ *   202 accepted / 409 authority_mismatch|conflict / 423 fuse_engaged / 其余=retry。
+ *   真实部署裁决不同步返回,由个人版 release worker 异步 callback(§4)回传。
  * SSRF 钉死(M5):派单 URL 由 selfheal/config.assertSelfhealConfig 限定 loopback;
  * fetch 全部 redirect:'manual',3xx 一律按失败(okStatus 只认 2xx),重定向逃逸封死。
  */
@@ -40,7 +49,18 @@ import { rootLogger, type Logger } from "../logging/logger.js";
 import { safeEnqueueAlert as _safeEnqueueAlert, type AlertEventInput } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 import { repairCooldownMs } from "./config.js";
-import { SELFHEAL_DRILL_TRANSPORT } from "./conditionKeys.js";
+import { SELFHEAL_DRILL_TRANSPORT, SELFHEAL_DRILL_RELEASE } from "./conditionKeys.js";
+
+/**
+ * 冷却豁免精确常量集(与个人版 broker drill 白名单同纪律):只认精确 conditionKey,
+ * 绝不放宽到 `selfheal.drill:` 前缀。新增 drill 类型必须来这里显式扩表。
+ * 演练要求连续可重跑(验收=连跑全过),其 incident/repair 生命周期由演练脚本持
+ * advisory lock 串行编排,无轰炸面。
+ */
+const COOLDOWN_EXEMPT_CONDITIONS: ReadonlySet<string> = new Set([
+  SELFHEAL_DRILL_TRANSPORT,
+  SELFHEAL_DRILL_RELEASE,
+]);
 
 /**
  * ops 升级告警 event_type —— 单一真理源在 alertEvents.ts EVENTS(已登记 EVENT_META 'ops' 组,
@@ -90,6 +110,14 @@ export type DispatchOutcome =
   | { status: "pending_post_failed"; repairId: string; attempt: number }
   | { status: "skipped"; reason: string };
 
+/**
+ * release job cancel 裁决(个人版跨仓契约 F2,R2-1 修订)。仅 postCancel 带 rrid 时非空。
+ *   cancelled/idempotent/not_found → 200,sweeper CAS 活跃 release 行置 cancelled;
+ *   too_late              → 200,release 已 pre-claim 部署,不动 release 行,交 receipt 裁决;
+ *   repair_mismatch       → 409,rrid 不属于该 repair 的契约校验失败,不收口(仅告警)。
+ */
+export type ReleaseCancelVerdict = "cancelled" | "idempotent" | "not_found" | "too_late" | "repair_mismatch";
+
 export interface CancelDelivery {
   /** 网络/签发是否成功(2xx)。false = 失败(fail-closed,不释放槽)。 */
   ok: boolean;
@@ -98,6 +126,14 @@ export interface CancelDelivery {
   /** 个人版已受理 cancel 但尚未确认终止(→ cancelling,下轮再问)。 */
   accepted: boolean;
   httpStatus?: number;
+  /**
+   * 批1b F2(R2-1 修订):附带 releaseRequestId 时,个人版对该 release job 的取消裁决。
+   * 正常裁决(cancelled/idempotent/not_found/too_late)走 200;repair_mismatch 走 409。两者都解析。
+   * cancelled/not_found/idempotent → sweeper 收口 release request 行置 cancelled;
+   * too_late(个人版已 pre-claim 部署)→ 不动,交 receipt 裁决;repair_mismatch → 不收口(仅告警)。
+   * 无 rrid / 无该字段 / 非法值 → null。
+   */
+  releaseCancel: ReleaseCancelVerdict | null;
 }
 
 // ─── env / 签名 helpers ────────────────────────────────────────────────
@@ -285,11 +321,8 @@ export async function dispatchRepair(
   }
 
   // 3) 冷却:同 event_type 30min 内已有派单记录 → 跳过(防轰炸)。
-  //    transport drill 豁免:演练要求连续可重跑(验收=连跑两次全过),其
-  //    incident/repair 生命周期由演练脚本持 advisory lock 串行编排,无轰炸面。
-  //    豁免只认精确常量,绝不放宽到 `selfheal.drill:` 前缀——新增 drill 类型
-  //    必须来这里显式扩(与个人版 broker 白名单同纪律)。
-  const cd = eventType === SELFHEAL_DRILL_TRANSPORT ? 0 : repairCooldownMs();
+  //    drill 豁免走精确常量集 COOLDOWN_EXEMPT_CONDITIONS(见其头注)。
+  const cd = COOLDOWN_EXEMPT_CONDITIONS.has(eventType) ? 0 : repairCooldownMs();
   if (cd > 0) {
     const since = new Date(d.now() - cd);
     const coolR = await d.query<{ one: number }>(
@@ -431,116 +464,199 @@ export async function redispatchPending(deps: DispatcherDeps = {}): Promise<numb
 
 /**
  * 经隧道 POST 个人版 cancel 端点(块B 实现),请求终止某 repair 的 codex 会话。
- * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-cancel`,同 webhook HMAC 头,
- *   body `{ repairId, incidentId, reason }`;返回 200 `{ terminated: boolean, accepted?: boolean }`。
- * 语义:terminated=true → 已确认终止(sweeper 据此释放 singleflight 槽置 cancelled);
- *   accepted=true/terminated=false → 已受理未确认(→ cancelling,下轮再问);
- *   非 2xx / 网络失败 → ok=false(**fail-closed:不释放槽**,旧 root 进程可能仍跑)。
+ * 契约(R2-1 修订):`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-cancel`,同 webhook HMAC 头,
+ *   body `{ repairId, incidentId, reason }`(批1b:携带活跃 release request 时另加
+ *   可选 `releaseRequestId` —— 个人版据此兼取消对应 release job,见 §3.2:未 pre-claim → cancelled;
+ *   已 pre-claim → too_late 由 receipt 裁决)。
+ *   响应:正常一律 200 `{ terminated, accepted?, releaseCancel?, releaseRequestId? }`(**too_late 也走 200**);
+ *   唯一 409 `{ ok:false, releaseCancel:'repair_mismatch' }`(rrid 不属于该 repair 的契约校验失败)。
+ * 解析两组字段(repair 级 + release 级),互不干扰:
+ *   - repair 级(terminated/accepted)**只在 2xx 成功时**解释;terminated=true → 已确认终止(sweeper 据此
+ *     释放 singleflight 槽置 cancelled);accepted=true/terminated=false → 已受理未确认(→ cancelling,下轮再问)。
+ *   - release 级(releaseCancel)在 200 与 409 都解析透传(sweeper 据其收口 release request 行)。
+ *   - 非 2xx / 网络失败 → repair 级 ok=false(**fail-closed:不释放槽**,旧 root 进程可能仍跑),
+ *     releaseCancel 仍按 body 透传(如 409 repair_mismatch)。
  */
 export async function postCancel(
-  input: { repairId: string; incidentId: string; reason: string },
+  input: { repairId: string; incidentId: string; reason: string; releaseRequestId?: string | null },
   deps: DispatcherDeps = {},
 ): Promise<CancelDelivery> {
   const d = resolveDeps(deps);
+  const body: Record<string, unknown> = {
+    repairId: input.repairId,
+    incidentId: input.incidentId,
+    reason: input.reason.slice(0, 500),
+  };
+  // 不带 rrid = 原 repair 级 cancel 语义不变;带 rrid = 兼取消 release job(§3.2)。
+  if (input.releaseRequestId) body.releaseRequestId = input.releaseRequestId;
   const { res, rawText } = await postSigned(
     "/api/webhooks/v5-selfheal-cancel",
-    { repairId: input.repairId, incidentId: input.incidentId, reason: input.reason.slice(0, 500) },
+    body,
     input.repairId,
     (s) => s >= 200 && s < 300,
     { fetch: d.fetch, now: d.now, logger: d.logger },
   );
-  if (!res.ok) {
-    return { ok: false, terminated: false, accepted: false, httpStatus: res.httpStatus };
-  }
+  // F2(R2-1):releaseCancel 裁决在 200(cancelled/idempotent/not_found/too_late)与 409(repair_mismatch)
+  // 都可能带,故无论 res.ok 都解析 body 取它;terminated/accepted(repair 级 cancel 语义)只在 2xx 成功时解释。
   let terminated = false;
   let accepted = true;
+  let releaseCancel: ReleaseCancelVerdict | null = null;
   if (rawText) {
     try {
-      const parsed = JSON.parse(rawText) as { terminated?: unknown; accepted?: unknown };
-      terminated = parsed.terminated === true;
-      if (typeof parsed.accepted === "boolean") accepted = parsed.accepted;
+      const parsed = JSON.parse(rawText) as { terminated?: unknown; accepted?: unknown; releaseCancel?: unknown };
+      if (
+        typeof parsed.releaseCancel === "string" &&
+        (parsed.releaseCancel === "cancelled" ||
+          parsed.releaseCancel === "idempotent" ||
+          parsed.releaseCancel === "not_found" ||
+          parsed.releaseCancel === "too_late" ||
+          parsed.releaseCancel === "repair_mismatch")
+      ) {
+        releaseCancel = parsed.releaseCancel;
+      }
+      if (res.ok) {
+        terminated = parsed.terminated === true;
+        if (typeof parsed.accepted === "boolean") accepted = parsed.accepted;
+      }
     } catch {
-      /* 无 JSON body:视为已受理未确认 */
+      /* 无 JSON body:视为已受理未确认;无 releaseCancel 裁决 */
     }
   }
-  return { ok: true, terminated, accepted, httpStatus: res.httpStatus };
+  if (!res.ok) {
+    // 非 2xx(含 409 repair_mismatch):repair 级 cancel fail-closed 不释放槽;releaseCancel 已解析透传。
+    return { ok: false, terminated: false, accepted: false, httpStatus: res.httpStatus, releaseCancel };
+  }
+  return { ok: true, terminated, accepted, httpStatus: res.httpStatus, releaseCancel };
 }
 
-// ─── 放行通知(隧道 → 个人版 release 端点;收尾批 §B)──────────────────
+// ─── 放行交付(隧道 → 个人版 release 端点;批1b:durable async intake)────
+
+/**
+ * 交付裁决(sweeper delivery 步据此推进 release request 状态,见 §6.2)。
+ *   - accepted:个人版 202 durable intake 已受理 → request queued→accepted。
+ *   - authority_mismatch:个人版 409(本地权威复核不符 / rrid 冲突)→ manual_required。
+ *   - fuse_engaged:个人版 423(本地熔断)→ 退避重投(request 保持 queued)。
+ *   - retry:网络 / 5xx / 3xx / 配置缺失 → attempts++ 指数退避重投。
+ */
+export type ReleaseDeliveryOutcome = "accepted" | "authority_mismatch" | "fuse_engaged" | "retry";
 
 export interface ReleaseDelivery {
-  /**
-   * true = 个人版确认**部署完成**:HTTP 2xx **且** body.ok===true **且**
-   * body.status==='deployed'(BLOCKER1:2xx 只证明 receiver 活着,部署成败的
-   * 权威在 body;2xx + 非 deployed body / body 非 JSON 一律按失败)。
-   */
-  ok: boolean;
+  outcome: ReleaseDeliveryOutcome;
   httpStatus?: number;
   /** 网络/配置层错误(fetch 异常、URL/secret 未配置)。 */
   error?: string;
-  /** 个人版 body.status(deployed/pending/rejected/in_progress/deploy_failed…);body 非 JSON → undefined。 */
-  remoteStatus?: string;
-  /** 个人版 body.detail.reason(或 detail 为字符串时其本体);失败时供上层展示。 */
+  /** 个人版 body.error / body.detail.reason;manual_required 时落 failure_reason 供展示。 */
   reason?: string;
 }
 
 /**
- * 经隧道 POST 个人版 release 端点,放行一个 pending_release 的 Tier2 修复部署。
- * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-release`,与
- *   dispatch 完全相同的 HMAC 信任链(M3 路由绑定签名),body `{ repairId, incidentId }`。
- * 个人版 receiver 验签后走**进程内** releaseApproved(repairId)(重验 pending_release
- * 记录 + ancestry + denylist → deployDriver),**同步**返回部署裁决(跨仓契约,BLOCKER1):
- *   deployed      → 200 `{ok:true,  status:'deployed',    detail}`
- *   pending/rejected → 409 `{ok:false, status:'pending'|'rejected', detail}`
- *   in_progress   → 423 `{ok:false, status:'in_progress', detail}`
- *   deploy_failed → 500 `{ok:false, status:'deploy_failed', detail}`
- *   内部异常       → 503 `{ok:false, status:'…',           detail}`
- * (body 恒有 {ok,status,detail}。)只有 2xx ∧ body.ok===true ∧ body.status==='deployed'
- * 才算成功;其余(含 2xx 但 body 非 deployed / 非 JSON)一律 ok=false,并携带
- * remoteStatus / detail.reason 供上层(adminReleaseRepair → admin UI)如实展示。
+ * 经隧道 POST 个人版 release 端点,交付一个已放行的 release request(durable async intake)。
+ * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-release`,与 dispatch
+ *   完全相同的 HMAC 信任链(M3 路由绑定签名,repairId 作签名 id 分量),body(§3.1):
+ *   `{ repairId, incidentId, releaseRequestId, approvedSha, baseSha, deployPlanHash, manifestHash }`。
+ * 个人版处理(durable intake,立即返回,批1b 语义重写):
+ *   1. 本地熔断 engaged            → 423 `{ok:false, error:'release_fuse_engaged'}`(v5 退避重投)
+ *   2. 本地权威复核不符 / rrid 冲突 → 409 `{ok:false, error:'authority_mismatch'}`(v5 置 manual_required)
+ *   3. 落 selfheal_release_jobs(received) → 202 `{ok:true, status:'accepted', releaseRequestId}`
+ * v5 交付步只以 **HTTP 状态码** 定裁决(202/409/423/其余),body 仅取 error/reason 展示。
+ * 真实部署裁决**不**在此同步返回,由个人版 release worker 异步经 callback(§4)回传。
  */
-export async function postRelease(
-  input: { repairId: string; incidentId: string },
+export async function postReleaseDelivery(
+  input: {
+    repairId: string;
+    incidentId: string;
+    releaseRequestId: string;
+    approvedSha: string;
+    baseSha: string | null;
+    deployPlanHash: string | null;
+    manifestHash: string | null;
+  },
   deps: DispatcherDeps = {},
 ): Promise<ReleaseDelivery> {
   const d = resolveDeps(deps);
   const { res, rawText } = await postSigned(
     "/api/webhooks/v5-selfheal-release",
-    { repairId: input.repairId, incidentId: input.incidentId },
+    {
+      repairId: input.repairId,
+      incidentId: input.incidentId,
+      releaseRequestId: input.releaseRequestId,
+      approvedSha: input.approvedSha,
+      baseSha: input.baseSha,
+      deployPlanHash: input.deployPlanHash,
+      manifestHash: input.manifestHash,
+    },
     input.repairId,
-    (s) => s >= 200 && s < 300,
+    (s) => s === 202,
     { fetch: d.fetch, now: d.now, logger: d.logger },
   );
-  // body 恒为 {ok,status,detail}(含 409/423/5xx 失败码);解析失败 → body=null 按失败。
-  let body: { ok?: unknown; status?: unknown; detail?: unknown } | null = null;
+  // body 用于取 error/reason 展示;裁决只认状态码。
+  let body: { ok?: unknown; error?: unknown; status?: unknown; detail?: unknown } | null = null;
   if (rawText) {
     try {
       const parsed: unknown = JSON.parse(rawText);
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        body = parsed as { ok?: unknown; status?: unknown; detail?: unknown };
+        body = parsed as { ok?: unknown; error?: unknown; status?: unknown; detail?: unknown };
       }
     } catch {
-      /* body 非 JSON → 按失败处理 */
+      /* body 非 JSON → reason 留空,按状态码裁决 */
     }
   }
-  const remoteStatus = typeof body?.status === "string" ? body.status : undefined;
-  const detail = body?.detail;
   let reason: string | undefined;
-  if (typeof detail === "string" && detail.length > 0) {
+  if (typeof body?.error === "string" && body.error.length > 0) reason = body.error;
+  const detail = body?.detail;
+  if (reason === undefined && typeof detail === "string" && detail.length > 0) {
     reason = detail;
-  } else if (detail !== null && typeof detail === "object") {
+  } else if (reason === undefined && detail !== null && typeof detail === "object") {
     const r = (detail as { reason?: unknown }).reason;
     if (typeof r === "string" && r.length > 0) reason = r;
   }
-  const deployed = res.ok && body !== null && body.ok === true && remoteStatus === "deployed";
-  if (!deployed) {
-    d.logger.warn("selfheal_release_post_failed", {
+
+  const status = res.httpStatus;
+  let outcome: ReleaseDeliveryOutcome;
+  if (status === 202) outcome = "accepted";
+  else if (status === 423) outcome = "fuse_engaged";
+  else if (status === 409) outcome = "authority_mismatch";
+  else outcome = "retry";
+
+  if (outcome !== "accepted") {
+    d.logger.warn("selfheal_release_delivery_nonaccepted", {
       repairId: input.repairId,
-      httpStatus: res.httpStatus,
-      remoteStatus,
+      releaseRequestId: input.releaseRequestId,
+      httpStatus: status,
+      outcome,
       reason,
-      error: res.error ?? (res.ok ? "release response body not deployed" : undefined),
+      error: res.error,
     });
   }
-  return { ok: deployed, httpStatus: res.httpStatus, error: res.error, remoteStatus, reason };
+  return { outcome, httpStatus: status, error: res.error, reason };
+}
+
+// ─── 熔断双侧收敛(隧道 → 个人版 fuse-clear 端点;§3.3)────────────────────
+
+export interface FuseClearDelivery {
+  /** 个人版 200 已清本地熔断 → v5 回填 personal_ack_at。 */
+  ok: boolean;
+  httpStatus?: number;
+  error?: string;
+}
+
+/**
+ * 经隧道 POST 个人版 fuse-clear 端点,把 v5 侧已清除的熔断收敛到个人版本地熔断表。
+ * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-fuse-clear`,同 HMAC
+ *   信任链(repairId 固定串 "fuse" 复用签名串格式),body `{ repairId:'fuse', reason, clearedBy }`。
+ * 个人版清本地熔断 + 记审计日志行,返回 200。2xx=成功;其余/网络异常=失败(下轮再收敛)。
+ */
+export async function postFuseClear(
+  input: { reason: string; clearedBy: string },
+  deps: DispatcherDeps = {},
+): Promise<FuseClearDelivery> {
+  const d = resolveDeps(deps);
+  const { res } = await postSigned(
+    "/api/webhooks/v5-selfheal-fuse-clear",
+    { repairId: "fuse", reason: input.reason.slice(0, 500), clearedBy: input.clearedBy.slice(0, 128) },
+    "fuse",
+    (s) => s >= 200 && s < 300,
+    { fetch: d.fetch, now: d.now, logger: d.logger },
+  );
+  return { ok: res.ok, httpStatus: res.httpStatus, error: res.error };
 }

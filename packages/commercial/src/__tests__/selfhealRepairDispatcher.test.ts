@@ -12,7 +12,8 @@ import { createHash, createHmac } from "node:crypto";
 import {
   dispatchRepair,
   postCancel,
-  postRelease,
+  postReleaseDelivery,
+  postFuseClear,
   type FetchLike,
   type DispatcherDeps,
 } from "../selfheal/repairDispatcher.js";
@@ -259,71 +260,147 @@ describe("repairDispatcher.postCancel", () => {
     assert.equal(r.ok, false);
     assert.equal(r.terminated, false);
   });
+
+  test("批1b:带 releaseRequestId → body 含 rrid(兼取消 release job);不带 → 不含", async () => {
+    const withR = makeFetch(200, JSON.stringify({ terminated: true }));
+    await postCancel(
+      { repairId: "10", incidentId: "7", reason: "resolve", releaseRequestId: "rr-abc" },
+      { fetch: withR.fetchFn, now: () => NOW },
+    );
+    assert.equal(JSON.parse(withR.calls[0].init.body).releaseRequestId, "rr-abc");
+    const withoutR = makeFetch(200, JSON.stringify({ terminated: true }));
+    await postCancel({ repairId: "10", incidentId: "7", reason: "timeout" }, { fetch: withoutR.fetchFn, now: () => NOW });
+    assert.equal("releaseRequestId" in JSON.parse(withoutR.calls[0].init.body), false, "无 rrid 时 body 不含该键");
+  });
+
+  // ── 批1b F2:release cancel 裁决 releaseCancel(200 与 409 都解析)──
+  test("F2:200 {releaseCancel:'cancelled'} → ok+releaseCancel='cancelled'", async () => {
+    const { fetchFn } = makeFetch(200, JSON.stringify({ terminated: false, releaseCancel: "cancelled" }));
+    const r = await postCancel({ repairId: "10", incidentId: "7", reason: "resolve", releaseRequestId: "rr1" },
+      { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, true);
+    assert.equal(r.releaseCancel, "cancelled");
+  });
+
+  test("F2:200 {releaseCancel:'not_found'} → 'not_found'", async () => {
+    const { fetchFn } = makeFetch(200, JSON.stringify({ releaseCancel: "not_found" }));
+    const r = await postCancel({ repairId: "10", incidentId: "7", reason: "resolve", releaseRequestId: "rr1" },
+      { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.releaseCancel, "not_found");
+  });
+
+  test("F2/R2-1:200 {releaseCancel:'too_late'} → ok=true(too_late 不再是 409),releaseCancel 透传", async () => {
+    const { fetchFn } = makeFetch(200, JSON.stringify({ terminated: false, accepted: true, releaseCancel: "too_late" }));
+    const r = await postCancel({ repairId: "10", incidentId: "7", reason: "resolve", releaseRequestId: "rr1" },
+      { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, true, "too_late 走 200,repair 级不再 fail-closed");
+    assert.equal(r.terminated, false);
+    assert.equal(r.accepted, true, "个人版受理但未终止(部署在途,repair 待 receipt 收口)");
+    assert.equal(r.releaseCancel, "too_late", "release 级裁决透传(sweeper 不动 release 行,交 receipt)");
+  });
+
+  test("F2/R2-1:409 {ok:false,releaseCancel:'repair_mismatch'} → ok=false 但仍解析 releaseCancel", async () => {
+    const { fetchFn } = makeFetch(409, JSON.stringify({ ok: false, releaseCancel: "repair_mismatch" }));
+    const r = await postCancel({ repairId: "10", incidentId: "7", reason: "resolve", releaseRequestId: "rr1" },
+      { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, false, "唯一 409(契约校验失败)→ repair 级 fail-closed");
+    assert.equal(r.releaseCancel, "repair_mismatch", "409 body 的 releaseCancel 仍透传(sweeper 仅告警不收口)");
+  });
+
+  test("F2:无 releaseCancel 字段 / 非法值 → null", async () => {
+    const { fetchFn: f1 } = makeFetch(200, JSON.stringify({ terminated: true }));
+    assert.equal((await postCancel({ repairId: "10", incidentId: "7", reason: "x" }, { fetch: f1, now: () => NOW })).releaseCancel, null);
+    const { fetchFn: f2 } = makeFetch(200, JSON.stringify({ releaseCancel: "bogus" }));
+    assert.equal((await postCancel({ repairId: "10", incidentId: "7", reason: "x", releaseRequestId: "rr1" }, { fetch: f2, now: () => NOW })).releaseCancel, null);
+  });
 });
 
-describe("repairDispatcher.postRelease(收尾批 §B + BLOCKER1 body 裁决)", () => {
-  test("200 {ok:true,status:'deployed'} → ok,POST 到 /api/webhooks/v5-selfheal-release,body 只含 id,同 HMAC 契约", async () => {
-    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true, status: "deployed", detail: null }));
-    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
-    assert.equal(r.ok, true);
-    assert.equal(r.remoteStatus, "deployed");
+const RELEASE_BODY = {
+  repairId: "10",
+  incidentId: "7",
+  releaseRequestId: "rr-uuid-123",
+  approvedSha: "a".repeat(40),
+  baseSha: "b".repeat(40),
+  deployPlanHash: "c".repeat(64),
+  manifestHash: "d".repeat(64),
+};
+
+describe("repairDispatcher.postReleaseDelivery(批1b:durable async intake,只认状态码)", () => {
+  test("202 → accepted;POST 到 /api/webhooks/v5-selfheal-release,body 为 §3.1 全字段,同 HMAC 契约", async () => {
+    const { fetchFn, calls } = makeFetch(202, JSON.stringify({ ok: true, status: "accepted", releaseRequestId: "rr-uuid-123" }));
+    const r = await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.outcome, "accepted");
     assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal-release");
-    assert.deepEqual(JSON.parse(calls[0].init.body), { repairId: "10", incidentId: "7" });
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      repairId: "10", incidentId: "7", releaseRequestId: "rr-uuid-123",
+      approvedSha: "a".repeat(40), baseSha: "b".repeat(40),
+      deployPlanHash: "c".repeat(64), manifestHash: "d".repeat(64),
+    });
     const h = calls[0].init.headers;
     const bodySha = createHash("sha256").update(calls[0].init.body).digest("hex");
     const expected = createHmac("sha256", "webhook-hmac-secret")
       .update(`POST./api/webhooks/v5-selfheal-release.${h["X-Selfheal-Ts"]}.${h["X-Selfheal-Nonce"]}.10.${bodySha}`)
       .digest("hex");
-    assert.equal(h["X-Selfheal-Sig"], expected);
+    assert.equal(h["X-Selfheal-Sig"], expected, "release 交付走与 dispatch 相同的路由绑定 HMAC");
   });
 
-  test("BLOCKER1 负例:200 但 body.status!=='deployed' → ok=false,携带 remoteStatus/reason", async () => {
-    const { fetchFn } = makeFetch(
-      200,
-      JSON.stringify({ ok: true, status: "in_progress", detail: { reason: "deploy already running" } }),
-    );
-    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
-    assert.equal(r.ok, false, "2xx 不是部署成功的权威,body.status 才是");
-    assert.equal(r.remoteStatus, "in_progress");
-    assert.equal(r.reason, "deploy already running");
-  });
-
-  test("BLOCKER1 负例:200 但 body.ok!==true → ok=false", async () => {
-    const { fetchFn } = makeFetch(200, JSON.stringify({ ok: false, status: "deployed", detail: null }));
-    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
-    assert.equal(r.ok, false);
-  });
-
-  test("BLOCKER1 负例:200 但 body 非 JSON → ok=false", async () => {
-    const { fetchFn } = makeFetch(200, "OK");
-    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
-    assert.equal(r.ok, false, "无法解析的 body 绝不算部署成功");
-    assert.equal(r.remoteStatus, undefined);
-  });
-
-  test("非 2xx(409 pending/rejected)→ ok=false,body 的 status/detail.reason 仍被解析供展示", async () => {
-    const { fetchFn } = makeFetch(
-      409,
-      JSON.stringify({ ok: false, status: "rejected", detail: { reason: "denylist hit: deploy-v5.sh" } }),
-    );
-    const r = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fetchFn, now: () => NOW });
-    assert.equal(r.ok, false);
+  test("409 → authority_mismatch,body.error 作 reason 透传(→ manual_required)", async () => {
+    const { fetchFn } = makeFetch(409, JSON.stringify({ ok: false, error: "authority_mismatch" }));
+    const r = await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.outcome, "authority_mismatch");
     assert.equal(r.httpStatus, 409);
-    assert.equal(r.remoteStatus, "rejected");
-    assert.equal(r.reason, "denylist hit: deploy-v5.sh");
+    assert.equal(r.reason, "authority_mismatch");
   });
 
-  test("3xx(SSRF 重定向逃逸面)按失败;5xx/网络异常 → ok=false", async () => {
+  test("423 → fuse_engaged(退避重投,不转终态)", async () => {
+    const { fetchFn } = makeFetch(423, JSON.stringify({ ok: false, error: "release_fuse_engaged" }));
+    const r = await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.outcome, "fuse_engaged");
+    assert.equal(r.reason, "release_fuse_engaged");
+  });
+
+  test("5xx / 3xx / 网络异常 → retry(attempts++ 退避)", async () => {
+    const { fetchFn: f500 } = makeFetch(500, "boom");
+    assert.equal((await postReleaseDelivery(RELEASE_BODY, { fetch: f500, now: () => NOW })).outcome, "retry");
     const { fetchFn: f302 } = makeFetch(302, "");
-    assert.equal((await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f302, now: () => NOW })).ok, false);
-    const { fetchFn: f500 } = makeFetch(500, JSON.stringify({ ok: false, status: "deploy_failed", detail: { reason: "smoke failed" } }));
-    const r500 = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: f500, now: () => NOW });
-    assert.equal(r500.ok, false);
-    assert.equal(r500.remoteStatus, "deploy_failed");
-    assert.equal(r500.reason, "smoke failed");
+    assert.equal((await postReleaseDelivery(RELEASE_BODY, { fetch: f302, now: () => NOW })).outcome, "retry");
     const fThrow: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
-    const rThrow = await postRelease({ repairId: "10", incidentId: "7" }, { fetch: fThrow, now: () => NOW });
-    assert.equal(rThrow.ok, false);
+    const rThrow = await postReleaseDelivery(RELEASE_BODY, { fetch: fThrow, now: () => NOW });
+    assert.equal(rThrow.outcome, "retry");
     assert.equal(rThrow.error, "ECONNREFUSED");
+  });
+
+  test("200(非 202)→ retry(intake 必须精确 202 才算受理)", async () => {
+    const { fetchFn } = makeFetch(200, JSON.stringify({ ok: true, status: "accepted" }));
+    assert.equal((await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW })).outcome, "retry");
+  });
+
+  test("baseSha=null 序列化进 body(首部署无 base)", async () => {
+    const { fetchFn, calls } = makeFetch(202, "");
+    await postReleaseDelivery({ ...RELEASE_BODY, baseSha: null }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(JSON.parse(calls[0].init.body).baseSha, null);
+  });
+});
+
+describe("repairDispatcher.postFuseClear(批1b:熔断双侧收敛)", () => {
+  test("2xx → ok;POST 到 /api/webhooks/v5-selfheal-fuse-clear,body repairId='fuse',同 HMAC 契约", async () => {
+    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true }));
+    const r = await postFuseClear({ reason: "admin cleared", clearedBy: "42" }, { fetch: fetchFn, now: () => NOW });
+    assert.equal(r.ok, true);
+    assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal-fuse-clear");
+    assert.deepEqual(JSON.parse(calls[0].init.body), { repairId: "fuse", reason: "admin cleared", clearedBy: "42" });
+    const h = calls[0].init.headers;
+    const bodySha = createHash("sha256").update(calls[0].init.body).digest("hex");
+    const expected = createHmac("sha256", "webhook-hmac-secret")
+      .update(`POST./api/webhooks/v5-selfheal-fuse-clear.${h["X-Selfheal-Ts"]}.${h["X-Selfheal-Nonce"]}.fuse.${bodySha}`)
+      .digest("hex");
+    assert.equal(h["X-Selfheal-Sig"], expected, "fuse-clear 用固定 repairId='fuse' 复用签名串格式");
+  });
+
+  test("非 2xx / 网络异常 → ok=false(下轮再收敛)", async () => {
+    const { fetchFn: f500 } = makeFetch(500, "");
+    assert.equal((await postFuseClear({ reason: "x", clearedBy: "1" }, { fetch: f500, now: () => NOW })).ok, false);
+    const fThrow: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
+    assert.equal((await postFuseClear({ reason: "x", clearedBy: "1" }, { fetch: fThrow, now: () => NOW })).ok, false);
   });
 });
