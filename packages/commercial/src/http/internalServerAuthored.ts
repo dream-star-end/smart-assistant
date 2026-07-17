@@ -1728,6 +1728,38 @@ function isLosslessTurnTapeWireBody(raw: unknown): boolean {
     && (raw as Record<string, unknown>).protocolVersion === LOSSLESS_TURN_TAPE_VERSION;
 }
 
+/**
+ * turn tape 落库错误的**瞬态 vs 永久**判定(止血批 A · A3)。
+ *
+ * part/finalize 若因 PG **瞬态**故障失败(statement timeout / 连接类 / 死锁 / 锁不可得 /
+ * 服务重启),必须回 **503 + TURN_TAPE_RETRYABLE**,让容器侧 fsync 队列**幂等重试**;绝不能
+ * 回 409 —— 409 语义=永久不可变冲突(别重试),会让本可重试的 part/finalize 永久丢失。
+ * 409(TURN_TAPE_CONFLICT)只留给真正的 immutable 冲突(同 index 不同 sha、聚合/校验失败等,
+ * 重试也不会变的确定性错误)。
+ *
+ * 判据:PG SQLSTATE(node-pg 挂在 err.code,仓内既有惯例即直读 .code,见 plugins/accounts.ts
+ * 的 '23505' 判定)+ message 兜底(socket 级错误可能无 code)。
+ *   57014 query_canceled(statement timeout) · 40001 serialization_failure ·
+ *   40P01 deadlock_detected · 55P03 lock_not_available ·
+ *   08*  连接异常类 · 57P0* 服务 shutdown / cannot_connect_now。
+ */
+function isTransientTurnTapeStorageError(err: unknown): boolean {
+  const code =
+    err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
+      ? (err as { code: string }).code
+      : "";
+  if (
+    code === "57014" || code === "40001" || code === "40P01" || code === "55P03"
+    || code.startsWith("08") || code.startsWith("57P")
+  ) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return /statement timeout|canceling statement due to|connection terminated|terminating connection|server closed the connection|ECONNRESET|ETIMEDOUT|EPIPE/i.test(
+    msg,
+  );
+}
+
 async function handleLosslessTurnTapeRequest(args: {
   raw: unknown;
   userId: string;
@@ -1786,11 +1818,19 @@ async function handleLosslessTurnTapeRequest(args: {
       sendJsonOk(args.res, 200, { ok: true, idempotent: result.applied === "idempotent" }, args.requestId);
       return;
     } catch (err) {
+      const transient = isTransientTurnTapeStorageError(err);
       args.userLog.error("lossless_turn_tape_part_failed", {
         tapeId: body.tapeId,
         partIndex: body.partIndex,
+        transient,
         err: err as Error,
       });
+      if (transient) {
+        // 瞬态落库故障(statement timeout / 连接 / 死锁…)→ 503,让容器 fsync 队列幂等重试,
+        // 别误报永久冲突(part 可重放,数据无损)。
+        sendJsonError(args.res, 503, "TURN_TAPE_RETRYABLE", "turn tape part storage transient failure", args.requestId);
+        return;
+      }
       sendJsonError(args.res, 409, "TURN_TAPE_CONFLICT", "turn tape immutable data conflict", args.requestId);
       return;
     }
@@ -1921,10 +1961,17 @@ async function handleLosslessTurnTapeRequest(args: {
       }, args.requestId);
       return;
     } catch (err) {
+      const transient = isTransientTurnTapeStorageError(err);
       args.userLog.error("lossless_turn_tape_finalize_failed", {
         tapeId: body.tapeId,
+        transient,
         err: err as Error,
       });
+      if (transient) {
+        // 瞬态落库故障 → 503,让幂等 finalize 重试;409 只留给校验/物化的永久冲突。
+        sendJsonError(args.res, 503, "TURN_TAPE_RETRYABLE", "turn tape finalize storage transient failure", args.requestId);
+        return;
+      }
       sendJsonError(args.res, 409, "TURN_TAPE_CONFLICT", "turn tape verification or materialization failed", args.requestId);
       return;
     }

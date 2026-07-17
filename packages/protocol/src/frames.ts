@@ -87,6 +87,11 @@ export type MediaRef = Static<typeof MediaRef>
 // 大小硬约束需要压回 5。取 8 保用户体验(boss 铁律:优化不得降低体验)。
 export const MAX_ATTACHMENTS_PER_MESSAGE = 8
 
+/** Prompt queue durable-content budget. Keep this aligned with gateway's
+ * existing per-message aggregate upload ceiling; P1 imports this authority
+ * instead of inventing a smaller repository-only limit. */
+export const PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES = 300 * 1024 * 1024
+
 // ───────────────────────────────────────────────
 // Inbound (channel → gateway)
 // ───────────────────────────────────────────────
