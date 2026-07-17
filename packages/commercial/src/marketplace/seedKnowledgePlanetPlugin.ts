@@ -39,13 +39,14 @@ import { scanSkillArtifact } from './skillScanner.js'
 const LEGACY_KNOWLEDGE_PLANET_SKILL = 'zsxq-persistent-connector'
 const OFFICIAL_NAME = '知识星球'
 const OFFICIAL_DESCRIPTION =
-  '安全读取已授权知识星球的星球、主题、评论、动态、标签、专栏与打卡内容；扫码后自动启用，账号状态加密保存，执行时使用隔离的只读受管浏览器。'
-const OFFICIAL_TAGS = ['知识星球', '社群内容', '知识检索', '只读插件']
+  '安全读取已授权知识星球的星球、主题、评论、动态、标签、专栏与打卡内容；用户主动开启并接受免责声明后，还可在逐次确认下发布纯文本主题和评论。账号状态加密保存，执行时使用隔离受管浏览器。'
+const OFFICIAL_TAGS = ['知识星球', '社群内容', '知识检索', '内容发布']
 const OFFICIAL_USE_CASES = [
   '查看已加入的知识星球与未读数量',
   '读取、筛选或搜索主题与评论',
   '汇总跨星球动态、标签和专栏内容',
   '读取打卡项目及其主题',
+  '经账号开关和逐次确认发布纯文本主题或评论',
 ]
 
 export interface SeedKnowledgePlanetPluginResult {
@@ -422,9 +423,10 @@ export async function seedKnowledgePlanetPlugin(input: {
           '列出账号已加入的星球和未读数，并以结构化结果供 Agent 继续处理',
           '按星球、标签、专栏或打卡项目读取主题，再读取指定主题的正文与评论',
           '汇总所有星球的最近动态并继续做检索、归纳或内容分析',
+          '在用户开启写入并确认本次操作后，发布一条纯文本主题或评论',
         ],
         humanMd:
-          '平台官方只读 Plugin。安装后会自动进入微信扫码授权；扫码成功后自动启用。账号状态加密保存，调用仅允许访问签名契约内的知识星球读取接口，不支持发布、评论、点赞或删除。',
+          '平台官方 Plugin。安装后会自动进入微信扫码授权；扫码成功后默认仅开放读取能力。发布主题和评论默认关闭，只有用户在插件账号页接受免责声明并开启后才会向 Agent 显示，而且每一次写入仍需用户在确认卡中单独批准。账号状态加密保存；不支持自动重试、点赞、编辑或删除。',
         queueAiReview: false,
       })
       located = await locateVersion()

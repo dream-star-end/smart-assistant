@@ -66,6 +66,9 @@ function mapRuntimeError(error: unknown): never {
         throw new HttpError(404, error.code, 'Plugin account not found')
       case 'TARGET_STALE':
         throw new HttpError(409, error.code, 'Plugin account changed; retry')
+      case 'WRITE_DISABLED':
+      case 'WRITE_REQUIRES_CONFIRMATION':
+        throw new HttpError(409, error.code, 'Plugin writes are not enabled')
       case 'RUNTIME_BUSY':
         throw new HttpError(429, error.code, 'Plugin runtime is busy')
       case 'RELINK_REQUIRED':
@@ -139,6 +142,41 @@ export async function dispatchPluginsRoute(
         ...(await runtime(deps).revokeManagedAccount(userId, account[1]!)),
         status: 'revoked',
       })
+      return
+    } catch (error) {
+      mapRuntimeError(error)
+    }
+  }
+
+  const writeAccess = /^\/api\/plugins\/accounts\/(\d{1,16})\/write-access$/.exec(path)
+  if (writeAccess && method === 'PATCH') {
+    const body = await readJsonBody(req, 2048)
+    if (body === null || typeof body !== 'object' || Array.isArray(body))
+      throw new HttpError(400, 'BAD_REQUEST', 'write access body must be an object')
+    const value = body as Record<string, unknown>
+    const keys = Object.keys(value).sort()
+    const enabled = value.enabled
+    const validDisable = enabled === false && keys.join('\0') === 'enabled'
+    const validEnable =
+      enabled === true &&
+      value.accepted === true &&
+      Number.isInteger(value.disclaimerVersion) &&
+      keys.join('\0') === ['accepted', 'disclaimerVersion', 'enabled'].join('\0')
+    if (!validDisable && !validEnable)
+      throw new HttpError(400, 'BAD_REQUEST', 'write access body is invalid')
+    try {
+      const writeControl = await runtime(deps).setManagedAccountWriteAccess({
+        userId,
+        targetId: writeAccess[1]!,
+        enabled: enabled as boolean,
+        ...(validEnable
+          ? {
+              accepted: true as const,
+              disclaimerVersion: Number(value.disclaimerVersion),
+            }
+          : {}),
+      })
+      sendJson(res, 200, { writeControl })
       return
     } catch (error) {
       mapRuntimeError(error)

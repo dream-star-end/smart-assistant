@@ -40,6 +40,7 @@ export type ConnectorErrorCode =
   | 'CONFIRMATION_IN_PROGRESS'
   | 'CONFIRMATION_ALREADY_FINALIZED'
   | 'REVISION_MISMATCH'
+  | 'WRITE_DISABLED'
   // OAuth
   | 'OAUTH_STATE_MISMATCH'
   | 'OAUTH_EXCHANGE_FAILED'
@@ -84,6 +85,7 @@ function defaultHttpStatus(code: ConnectorErrorCode): number {
     case 'CONFIRMATION_NOT_APPROVED':
     case 'CONFIRMATION_ALREADY_FINALIZED':
     case 'REVISION_MISMATCH':
+    case 'WRITE_DISABLED':
     case 'ACCOUNT_ALREADY_LINKED':
     case 'CONNECTOR_NOT_INSTALLED':
       return 409

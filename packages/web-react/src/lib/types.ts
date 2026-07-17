@@ -284,8 +284,8 @@ export type SessionMeta = {
  * maxSeq 由 messages 实算（非 next_seq-1），客户端据此推进游标。
  *
  * 归档(热尾巴)扩展：行体积到顶前 server 会把最老的一截消息搬进归档 chunk，full/增量
- * 两分支的 `messages` 都可能**只含热尾巴**（`_seq > archivedThroughSeq` 的那截）。
- * `archivedThroughSeq` = 已归档的最大 `_seq`（合并时本地 `_seq ≤ 此值`的行无条件保留，
+ * 两分支的 `messages` 都可能**只含热尾巴**（`_orderSeq > archivedThroughSeq` 的那截）。
+ * `archivedThroughSeq` = 已归档的最大 `_orderSeq`（字段名为滚动兼容保留，
  * 见 persist.mergeFullServerWins）；`archivedCount` = 已归档条数（会话总数 = tail + 归档）。
  * 两者可缺省（老后端/未归档会话）→ 按 0 处理。
  */
@@ -304,14 +304,14 @@ export type SessionDetail = {
   maxSeq: number;
   /** 已归档条数（会话总数 = 返回的 tail 数 + 此值）。缺省=0（未归档/老后端）。*/
   archivedCount?: number;
-  /** 已归档的最大 `_seq` 水位；本地 `_seq ≤ 此值`的行 full 合并时无条件保留。缺省=0。*/
+  /** 已归档的最大 `_orderSeq` 水位；字段名为滚动兼容保留。缺省=0。*/
   archivedThroughSeq?: number;
 };
 
 /**
  * GET /api/sessions/:id/archive?before=<seq>&limit=<n> → 归档分页（滚动加载更早历史）。
- * `messages` = `_seq < before` 的最近 `limit` 条归档消息（升序返回，server-authored）；
- * `hasMore` = 更早还有；`oldestSeq` = 本页最老 `_seq`（继续上翻的下一个 before，空页为 null）。
+ * `messages` = `_orderSeq < before` 的最近 `limit` 条归档消息（升序返回）；
+ * `oldestSeq` = 本页最老 `_orderSeq`（字段名保留兼容）。
  */
 export type SessionArchivePage = {
   messages: unknown[];

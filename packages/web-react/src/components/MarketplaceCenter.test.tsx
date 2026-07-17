@@ -107,6 +107,8 @@ test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
   expect(screen.getByRole("button", { name: "关闭" })).toHaveClass("shrink-0", "[@media(hover:none)]:size-11");
   expect(screen.getByRole("button", { name: "技能" })).toHaveClass("[@media(hover:none)]:min-h-11");
   expect(screen.getByRole("heading", { name: "AI 市场" }).parentElement).toHaveClass("min-w-0");
+  expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "h-[min(85vh,46rem)]", "h-[min(85dvh,46rem)]");
+  expect(screen.getByRole("dialog")).not.toHaveClass("top-1/2");
 });
 
 test("连接器旧 kind 在产品层显示为插件；通过通知 CTA 实时刷新并一次性打开条目", () => {

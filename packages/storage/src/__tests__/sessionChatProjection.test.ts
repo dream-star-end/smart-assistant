@@ -28,6 +28,18 @@ function runtime(
 }
 
 describe('browser chat history projection', () => {
+  test('orders projected history by frozen _orderSeq when a patch made _seq non-chronological', () => {
+    const chat = projectClientSessionMessagesForChat([
+      { id: 'u1', role: 'user', text: 'one', ts: 100, _seq: 5, _orderSeq: 1 },
+      // Duplicate mutable seq is a storage anomaly, but can no longer make
+      // presentation order ambiguous because the axes are independent.
+      { id: 'u2', role: 'user', text: 'two', ts: 300, _seq: 5, _orderSeq: 3 },
+      { id: 'a1', role: 'assistant', text: 'patched', ts: 200, _seq: 13, _orderSeq: 2 },
+    ])
+
+    assert.deepEqual(chat.map((row) => row.id), ['u1', 'a1', 'u2'])
+  })
+
   test('20k large hidden runtime rows collapse to one tiny checkpoint', () => {
     const blob = 'x'.repeat(4096)
     const exact = Array.from({ length: 20_000 }, (_, i) =>

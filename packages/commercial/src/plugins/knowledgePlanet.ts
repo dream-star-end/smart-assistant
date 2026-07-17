@@ -20,13 +20,17 @@ import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const WORKER_FILE = 'knowledge-planet-worker.mjs'
-const WORKER_RUNTIME = 'knowledge-planet-worker-v1.1'
+const WORKER_RUNTIME = 'knowledge-planet-worker-v1.2'
 const EXPECTED_PLAYWRIGHT_MCP_VERSION = '0.0.76'
 const WORKER_MAX_FRAME_BYTES = 1024 * 1024
 const WORKER_STDERR_MAX_BYTES = 64 * 1024
 const WORKER_LABEL = 'com.openclaude.plugin.worker'
-const WORKER_LABEL_VALUE = 'knowledge-planet-v1.1'
-const RECLAIMABLE_WORKER_LABEL_VALUES = new Set(['knowledge-planet-v1', WORKER_LABEL_VALUE])
+const WORKER_LABEL_VALUE = 'knowledge-planet-v1.2'
+const RECLAIMABLE_WORKER_LABEL_VALUES = new Set([
+  'knowledge-planet-v1',
+  'knowledge-planet-v1.1',
+  WORKER_LABEL_VALUE,
+])
 const WORKER_EXPIRY_LABEL = 'com.openclaude.plugin.expires_at_ms'
 const WORKER_BOOT_LABEL = 'com.openclaude.plugin.boot_id'
 const WORKER_SESSION_LABEL = 'com.openclaude.plugin.session_id'
@@ -843,7 +847,7 @@ export function createKnowledgePlanetRuntimeRegistries(service: KnowledgePlanetD
     version: KNOWLEDGE_PLANET_DRIVER_VERSION,
     launcherId: KNOWLEDGE_PLANET_LAUNCHER_ID,
     launcherVersion: KNOWLEDGE_PLANET_LAUNCHER_VERSION,
-    maximumNetwork: { origins: ['https://api.zsxq.com'], methods: ['GET'] },
+    maximumNetwork: { origins: ['https://api.zsxq.com'], methods: ['GET', 'POST'] },
     async execute(args) {
       if (!(args.session instanceof KnowledgePlanetManagedSession))
         throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'driver session is invalid')

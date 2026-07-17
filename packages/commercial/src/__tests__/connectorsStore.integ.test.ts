@@ -657,7 +657,7 @@ describe('connector_write_ledger 状态机', () => {
 // ─── sweeper 三职责(活跃态转换;P1#11:retention 已迁 auditRetention) ─────────
 
 describe('connectorSweeper', () => {
-  test('stale executing→unknown(绝不回 approved)/ 过期→expired / oauth DELETE', async (t) => {
+  test('stale executing 按 dispatch fence 收敛 / 过期→expired / oauth DELETE', async (t) => {
     if (skipIfNoDb(t)) return
     const uid = await mkUser()
     const { connection } = await mkConnection(uid)
@@ -684,6 +684,37 @@ describe('connectorSweeper', () => {
     await query(
       `UPDATE connector_write_ledger SET started_at = now() - interval '10 minutes' WHERE id = $1::uuid`,
       [pExec.id],
+    )
+
+    // ①b Plugin crash after beginExecute committed but before the DB arm:
+    // the persisted fence-required bit proves no external dispatch started.
+    const pPluginPreArm = await proposeWrite({
+      userId: uid,
+      connectionId: connection.id,
+      connectionRevision: connection.revision,
+      provider: 'notion',
+      action: 'create_page',
+      params: { parentPageId: 'e'.repeat(32), title: 'pre-arm', content: '' },
+      summary: 'plugin pre-arm crash',
+      dispatchFenceRequired: true,
+    })
+    await approveConfirmation(pPluginPreArm.id, uid)
+    assert.equal(
+      (
+        await beginExecute({
+          id: pPluginPreArm.id,
+          userId: uid,
+          connectionId: connection.id,
+          expectedProvider: 'notion',
+          expectedAction: 'create_page',
+        })
+      ).kind,
+      'ok',
+    )
+    await query(
+      `UPDATE connector_write_ledger SET started_at = now() - interval '10 minutes'
+        WHERE id = $1::uuid`,
+      [pPluginPreArm.id],
     )
 
     // ② 过期 pending
@@ -746,9 +777,26 @@ describe('connectorSweeper', () => {
     }
 
     const exec = (await getLedgerRow(pExec.id, uid))!
+    assert.equal(exec.dispatch_fence_required, false)
     assert.equal(exec.status, 'unknown') // 绝不回 approved
     assert.equal(exec.error_code, 'STALE_EXECUTING')
     assert.equal(exec.params_enc, null)
+    const preArm = (await getLedgerRow(pPluginPreArm.id, uid))!
+    assert.equal(preArm.dispatch_fence_required, true)
+    assert.equal(preArm.dispatch_armed_at, null)
+    assert.equal(preArm.status, 'failed')
+    assert.equal(preArm.error_code, 'PRE_DISPATCH_STALE')
+    assert.equal(preArm.params_enc, null)
+    assert.equal(preArm.params_nonce, null)
+    const preArmReplay = await beginExecute({
+      id: pPluginPreArm.id,
+      userId: uid,
+      connectionId: connection.id,
+      expectedProvider: 'notion',
+      expectedAction: 'create_page',
+    })
+    assert.equal(preArmReplay.kind, 'replay')
+    if (preArmReplay.kind === 'replay') assert.equal(preArmReplay.status, 'failed')
     const expd = (await getLedgerRow(pExpired.id, uid))!
     assert.equal(expd.status, 'expired')
     assert.equal(expd.params_enc, null)

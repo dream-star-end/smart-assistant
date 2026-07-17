@@ -5,11 +5,10 @@
  * 前端 messages 数组 = 尾巴 + 用户经「从云端加载更早的历史」按钮陆续拉回并**前插**的归档行。
  *
  * 关键不变量(决定分页 UI 无跳变):
- *  - 归档行携带 server 权威 `_seq` 且 `_seq ≤ archivedThroughSeq`(水位线);热尾巴行的
- *    `_seq > 水位` 或本地乐观行无 `_seq`。据此可纯函数判定「已拉回多少归档行」。
+ *  - 归档行携带 server 权威 `_orderSeq` 且不高于水位;热尾巴行高于水位。
  *  - 拉一页归档后,新加载的**可见行**全部从窗口裁剪量中扣除 → 既有可见窗口 `visible`
  *    不需 bump,刚拉回的归档行天然落在挂载窗口内(不会被再次藏进「加载更多」按钮)。
- *  - lossless tape 的一个归档 anchor 会展开成多条可见行且共享同一 `_seq`;因此窗口计算按
+ *  - lossless tape 的一个归档 anchor 会展开成多条可见行且共享同一 `_orderSeq`;因此窗口计算按
  *    已加载可见行数,而「还有 N 条归档」按 distinct `_seq` anchor 数,两者不可混用。
  */
 import type { ChatMessage } from "../../lib/chat/model";
@@ -17,21 +16,22 @@ import type { ChatMessage } from "../../lib/chat/model";
 /**
  * 当前 messages 数组里「已从云端拉回」的归档投影统计。
  * - rows:匹配水位的投影行数,用于保证刚拉回的可见行全部挂载。
- * - anchors:distinct `_seq` 数。lossless tape 的所有展开行共享 anchor `_seq`,用于从
+ * - anchors:distinct `_orderSeq` 数。lossless tape 的所有展开行共享该 anchor,用于从
  *   `archivedCount` 扣除真正已加载的归档 anchor。
  * archivedThroughSeq ≤ 0 或无归档时恒 0。O(n),n 为当前会话内存行数。
  */
 export function loadedArchivedMetrics(
-  messages: Pick<ChatMessage, "_seq">[],
+  messages: Pick<ChatMessage, "_seq" | "_orderSeq">[],
   archivedThroughSeq: number,
 ): { rows: number; anchors: number } {
   if (!(archivedThroughSeq > 0)) return { rows: 0, anchors: 0 };
   let rows = 0;
   const anchors = new Set<number>();
   for (const m of messages) {
-    if (typeof m._seq === "number" && m._seq <= archivedThroughSeq) {
+    const orderSeq = typeof m._orderSeq === "number" ? m._orderSeq : m._seq;
+    if (typeof orderSeq === "number" && orderSeq <= archivedThroughSeq) {
       rows++;
-      anchors.add(m._seq);
+      anchors.add(orderSeq);
     }
   }
   return { rows, anchors: anchors.size };

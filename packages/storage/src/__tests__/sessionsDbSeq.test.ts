@@ -69,6 +69,37 @@ describe('_messageContentEqualForSeq', () => {
 })
 
 describe('normalizeAndAssignSeqs — happy path', () => {
+  it('freezes _orderSeq while a content patch advances only the _seq version cursor', () => {
+    const oldMsgs: Msg[] = [
+      m('u1', 100, { role: 'user', _seq: 1, _orderSeq: 1 }),
+      m('a1', 200, { role: 'assistant', text: 'draft', _seq: 2, _orderSeq: 2 }),
+    ]
+    const finalMsgs: Msg[] = [
+      m('u1', 100, { role: 'user', _seq: 1 }),
+      m('a1', 200, { role: 'assistant', text: 'final', _seq: 2 }),
+    ]
+
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 3)
+    assert.equal((r.messages[0] as Msg)._seq, 1)
+    assert.equal(r.messages[0]?._orderSeq, 1)
+    assert.equal((r.messages[1] as Msg)._seq, 3)
+    assert.equal(r.messages[1]?._orderSeq, 2)
+  })
+
+  it('derives legacy _orderSeq once from durable array order and restores it after a client reorder', () => {
+    const oldMsgs: Msg[] = [
+      m('u1', 100, { role: 'user', _seq: 5 }),
+      m('a1', 400, { role: 'assistant', _seq: 13 }),
+      m('u2', 300, { role: 'user', _seq: 6 }),
+    ]
+    const finalMsgs: Msg[] = [oldMsgs[0]!, oldMsgs[2]!, oldMsgs[1]!]
+
+    const r = normalizeAndAssignSeqs(oldMsgs, finalMsgs, 14)
+    assert.deepEqual(r.messages.map((row) => row.id), ['u1', 'a1', 'u2'])
+    assert.deepEqual(r.messages.map((row) => row._orderSeq), [1, 2, 3])
+    assert.deepEqual(r.messages.map((row) => row._seq), [5, 13, 6])
+  })
+
   it('inherits _seq for unchanged messages, allocates fresh _seq for new ones', () => {
     const oldMsgs: Msg[] = [
       m('a', 100, { _seq: 1 }),

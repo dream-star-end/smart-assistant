@@ -21,6 +21,33 @@ describe("currentTurnStartIndex", () => {
 });
 
 describe("turnFinalAssistantFlags(评价行轮末条判定)", () => {
+  test("错序数组仍按 _clientMessageId 分组，为每个真实 turn 各锚一条评分卡", () => {
+    const u1 = mk("user", { id: "m-u1", text: "轮1", _orderSeq: 1 });
+    const u2 = mk("user", { id: "m-u2", text: "轮2", _orderSeq: 3 });
+    const a1 = mk("assistant", {
+      id: "srv-a1",
+      text: "答1",
+      _clientMessageId: u1.id,
+      _orderSeq: 2,
+    });
+    const a2 = mk("assistant", {
+      id: "srv-a2",
+      text: "答2",
+      _clientMessageId: u2.id,
+      _orderSeq: 4,
+    });
+    expect(finals([u1, u2, a1, a2])).toEqual([2, 3]);
+  });
+
+  test("同一 _clientMessageId 的多段正文按 _orderSeq 选择末段而非数组末项", () => {
+    const msgs = [
+      mk("user", { id: "m-u1", text: "问", _orderSeq: 1 }),
+      mk("assistant", { text: "末段", _clientMessageId: "m-u1", _orderSeq: 3 }),
+      mk("assistant", { text: "中段", _clientMessageId: "m-u1", _orderSeq: 2 }),
+    ];
+    expect(finals(msgs)).toEqual([1]);
+  });
+
   test("一轮多段正文 + 穿插工具卡 → 只标最后一段正文,中间段不标", () => {
     const msgs = [
       mk("user", { text: "问" }),

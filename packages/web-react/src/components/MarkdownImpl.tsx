@@ -12,10 +12,10 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
-import type { ReactNode } from "react";
+import { Children, isValidElement, useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import { SignedAudio, SignedFileCard, SignedImg, SignedVideo } from "./chat/media";
+import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
@@ -144,6 +144,37 @@ function rehypeEmbedMedia() {
   }
 }
 
+function MarkdownTable({ children, ...props }: ComponentPropsWithoutRef<"table">) {
+  const [showHint, setShowHint] = useState(true);
+  const dismissHint = () => setShowHint(false);
+
+  return (
+    <div className="markdown-table-wrap">
+      {showHint && <p className="markdown-table-hint sm:hidden">表格可左右滑动查看更多</p>}
+      <section
+        aria-label="Markdown 表格，可横向滚动"
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
+        tabIndex={0}
+        className="markdown-table-region"
+        onPointerDown={dismissHint}
+        onScroll={dismissHint}
+        onKeyDown={(event) => {
+          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) dismissHint();
+        }}
+      >
+        <table {...props}>{children}</table>
+      </section>
+    </div>
+  );
+}
+
+function hasMarkdownImage(children: ReactNode): boolean {
+  return Children.toArray(children).some((child) => {
+    if (!isValidElement<{ node?: { tagName?: string }; children?: ReactNode }>(child)) return false;
+    return child.props.node?.tagName === "img" || hasMarkdownImage(child.props.children);
+  });
+}
+
 export default function MarkdownImpl({ children, signMedia, live, readOnly }: MarkdownProps) {
   return (
     <div className="prose">
@@ -158,18 +189,21 @@ export default function MarkdownImpl({ children, signMedia, live, readOnly }: Ma
         ]}
         components={{
           pre: ({ children }) => <>{children}</>,
+          table: ({ node: _node, ...props }) => <MarkdownTable {...props} />,
           ...(signMedia
             ? {
                 img: ({ node: _node, ...props }) => {
                   const src = typeof props.src === "string" ? props.src : "";
                   if (readOnly && /^(?:https?:)?\/\//i.test(src)) {
                     return (
-                      <img
-                        {...props}
+                      <ZoomableImage
+                        src={src}
                         alt={props.alt ?? ""}
-                        loading="lazy"
+                        title={props.title}
+                        imgClassName="max-w-full rounded-lg border border-border"
                         referrerPolicy="no-referrer"
-                        className="max-w-full rounded-lg border border-border"
+                        loading="lazy"
+                        readOnly
                       />
                     );
                   }
@@ -213,6 +247,31 @@ export default function MarkdownImpl({ children, signMedia, live, readOnly }: Ma
           },
           a: ({ children, href, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
+            // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
+            // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
+            if (readOnly && hasMarkdownImage(children)) {
+              return (
+                <span className="inline-flex max-w-full flex-col items-start gap-1">
+                  {children}
+                  {containerLocal ? (
+                    <a
+                      {...props}
+                      href={href}
+                      data-container-local-preview="true"
+                      data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
+                      title="在容器内安全预览"
+                      className="text-xs"
+                    >
+                      打开关联链接 · 容器预览
+                    </a>
+                  ) : (
+                    <a {...props} href={href} target="_blank" rel="noreferrer" className="text-xs">
+                      打开关联链接
+                    </a>
+                  )}
+                </span>
+              );
+            }
             if (containerLocal) {
               return (
                 <a
