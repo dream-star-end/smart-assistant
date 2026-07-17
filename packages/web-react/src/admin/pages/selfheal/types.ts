@@ -60,7 +60,39 @@ export interface IncidentFull extends IncidentRow {
   created_at?: string;
 }
 
-/** GET …/:id 关联 repair 行。 */
+/**
+ * release request 状态机（批1b 契约 §1，v5 PG 权威）：
+ *   queued → accepted → deploying → deployed | deploy_failed | deploy_unknown；
+ * 另有终态 manual_required（分类器 fail-closed / 权威复核不符）与 cancelled（仅 queued/accepted 可达）。
+ * 字符串联合 + 未知回落，兼容后端扩态。
+ */
+export type ReleaseRequestStatus =
+  | "queued"
+  | "accepted"
+  | "deploying"
+  | "deployed"
+  | "deploy_failed"
+  | "deploy_unknown"
+  | "manual_required"
+  | "cancelled"
+  | (string & {});
+
+/**
+ * GET …/:id 的 repair 附带 release request 行（契约 §6.3，字段名逐字对齐 serializer）。
+ * baseSha/deployPlanHash/failureReason 可为 null（后端列可空）。
+ */
+export interface ReleaseRequestRow {
+  releaseRequestId: string;
+  status: ReleaseRequestStatus;
+  approvedSha: string;
+  baseSha: string | null;
+  deployPlanHash: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** GET …/:id 关联 repair 行。批1b：附最新放行请求（缺省=无放行请求）。 */
 export interface RepairRow {
   id: string;
   status: RepairStatus;
@@ -68,21 +100,48 @@ export interface RepairRow {
   summary: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** 契约 §6.3：每 repair 附 release request 列表（按 createdAt 升序，缺省=无）。 */
+  releaseRequests?: ReleaseRequestRow[];
 }
 
-/** GET …/:id 的 repair_events 时间线条目（append-only 进度流）。 */
+/**
+ * GET …/:id 的 repair_events 时间线条目（append-only 进度流）。
+ * 批1b：detail 承载结构化上下文（经 redactOpsPayload）；pending_release 事件的 detail
+ * 形如契约 §11（phase/sha/baseSha/changedFiles/classification/verification/deployPlanHash/manifestHash）。
+ */
 export interface RepairEventRow {
   id: string;
   repair_id: string;
   kind: string;
   message: string | null;
   created_at: string;
+  detail?: Record<string, unknown> | null;
 }
 
 export interface IncidentDetailResp {
   incident: IncidentFull;
   repairs: RepairRow[];
   events: RepairEventRow[];
+}
+
+/**
+ * GET /selfheal/release-fuse —— 全局 Tier2 部署熔断状态（契约 §6.3 / RFC §6「全局熔断」）。
+ * engaged=true 时全站放行按钮禁用；清除走 POST /selfheal/release-fuse/clear {reason}。
+ * 假设 serializer 输出 camelCase（对齐 SuppressedConditionRow 等既有 admin serializer）。
+ */
+export interface ReleaseFuseResp {
+  engaged: boolean;
+  reason?: string | null;
+  releaseRequestId?: string | null;
+  engagedAt?: string | null;
+  engagedBy?: string | null;
+}
+
+/** POST …/repairs/:id/release 的 202 异步回执（契约 §6.1）。 */
+export interface ReleaseRequestAck {
+  ok?: boolean;
+  releaseRequestId?: string;
+  status?: ReleaseRequestStatus;
 }
 
 /**
