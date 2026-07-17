@@ -407,8 +407,9 @@ export function mergeFullServerWins(
   const evidence = buildServerTurnEvidence(server);
   // 同步权威传播(见 buildServerTurnEvidence docstring):
   //  P1(缺席判定,需 deletionAuthority=调用方已过版本护栏)—— `_source:'server'` 的本地行,
-  //    full 载荷不带、高于归档水位、且不晚于快照(orderSeq ≤ maxSeq)→ server 已删除
-  //    (事故清理/终态行离场),本地跟删,否则服务端清理永远传播不到端上。无授权时跳过:
+  //    full 载荷不带且高于归档水位 → server 已删除(事故清理/终态行离场),本地跟删,否则
+  //    服务端清理永远传播不到端上。无行级 seq 豁免(maxSeq 非单调且与 _orderSeq 跨轴;
+  //    "增量先到旧 full 晚到"由 applyServerMessages 整体丢弃过期载荷闭合)。无授权时跳过:
   //    旧 full 快照的缺席不是删除证明(BLOCKER:晚到旧快照会把新行永久删丢——_maxSeq 游标
   //    单调,删了就再也增量不回来)。
   //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。

@@ -703,7 +703,9 @@ function hydrateTapeRecord(
     _turnTapeMsgId: row.msg_id,
     _turnTapeSha256: row.tape_sha256,
     _turnTapeExpanded: true,
-    ...(fromCompleteAnchor ? { _turnTapeComplete: true } : {}),
+    // 来源边界硬化:legacy 分支显式压掉 payload 自带的同名字段(受信 materializer 不会产出,
+    // 但作证标记的唯一权威必须是本函数的 fromCompleteAnchor 判定,不能被 ...full 透传)。
+    ...(fromCompleteAnchor ? { _turnTapeComplete: true } : { _turnTapeComplete: undefined }),
     // A tape is one atomic sync unit. Expanded records intentionally share
     // its anchor sequence: partial sync either returns every record or none.
     ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
