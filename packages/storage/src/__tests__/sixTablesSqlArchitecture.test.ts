@@ -64,6 +64,10 @@ const WHITELIST = new Set<string>([
   "packages/commercial/src/db/pgSessionsBackend.ts",
   "packages/commercial/src/db/sessionsStoreAuthority.ts",
   "packages/commercial/src/goal/goalStateService.ts",
+  // 批D D3:session_goals 终态离场 sweeper(retention 单一权威模块)。对 client_sessions 仅
+  // **只读 JOIN deleted_at**(判定"会话已软删")——不写六表、不绕 ownership fence;放 backend
+  // 反而把 goal 域的离场语义搬进 sessions backend,内聚更差。写入面仍只经白名单 backend。
+  "packages/commercial/src/admin/auditRetention.ts",
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",
