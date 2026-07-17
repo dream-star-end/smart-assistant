@@ -23,7 +23,7 @@ import {
   isOauthAuthMode,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
-import { Alert, Button, IconButton, Input, Modal, Spinner, useConfirm } from "../ui";
+import { Alert, Button, IconButton, Input, Modal, Spinner, Switch, useConfirm } from "../ui";
 
 /** 把 ApiError 的机器码映射为中文（无码/未知码走 apiErrorMessage 收口：后端中文直显、
  *  英文/技术串回退 fallback + 追踪号，绝不裸露码或英文原文）。 */
@@ -434,6 +434,7 @@ export function ConnectorsTab({
           return (
             <RuntimePluginCard
               key={plugin.slug}
+              auth={auth}
               plugin={plugin}
               accounts={accounts}
               onAuthorize={() => {
@@ -444,6 +445,16 @@ export function ConnectorsTab({
               onUpdate={() => void updateRuntimePlugin(plugin, accounts.length)}
               onUninstall={() => void uninstallRuntimePlugin(plugin, accounts.length)}
               onRevoke={(account) => void revokeRuntimeAccount(account)}
+              onWriteAccessChanged={(enabled) => {
+                setErr(null)
+                setSuccess(
+                  enabled
+                    ? '知识星球写入能力已开启；每次发布主题或评论仍需在对话中单独确认。'
+                    : '知识星球写入能力已关闭。',
+                )
+                reload()
+              }}
+              onWriteAccessError={(error) => setErr(errText(error, '切换 Plugin 写入能力失败'))}
             />
           )
         })}
@@ -515,7 +526,7 @@ export function ConnectorsTab({
           setErr(null)
           setSuccess(
             agentReady
-              ? '知识星球账号已授权并自动启用，Agent 现在可以直接读取相关内容。'
+              ? '知识星球账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。'
               : '知识星球登录信息已加密保存；系统完成 Plugin 升级后会自动启用。',
           )
           reload()
@@ -527,22 +538,71 @@ export function ConnectorsTab({
 }
 
 function RuntimePluginCard({
+  auth,
   plugin,
   accounts,
   onAuthorize,
   onUpdate,
   onUninstall,
   onRevoke,
+  onWriteAccessChanged,
+  onWriteAccessError,
 }: {
+  auth: AuthSession
   plugin: RuntimePluginCatalogEntry
   accounts: RuntimePluginAccount[]
   onAuthorize: () => void
   onUpdate: () => void
   onUninstall: () => void
   onRevoke: (account: RuntimePluginAccount) => void
+  onWriteAccessChanged: (enabled: boolean) => void
+  onWriteAccessError: (error: unknown) => void
 }) {
   const Icon = connectorIcon(plugin.slug)
   const canSelfAuthorize = plugin.slug === 'knowledge-planet' && plugin.installedCurrent
+  const readCount = plugin.actions.filter((action) => action.readOnly).length
+  const writeCount = plugin.actions.length - readCount
+  const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)
+  const [consentChecked, setConsentChecked] = useState(false)
+  const [consentError, setConsentError] = useState<string | null>(null)
+  const [writeBusyId, setWriteBusyId] = useState<string | null>(null)
+
+  const disableWrite = async (account: RuntimePluginAccount) => {
+    if (writeBusyId) return
+    setWriteBusyId(account.id)
+    try {
+      await api.setPluginWriteAccess(auth, account.id, { enabled: false })
+      onWriteAccessChanged(false)
+    } catch (error) {
+      onWriteAccessError(error)
+    } finally {
+      setWriteBusyId(null)
+    }
+  }
+
+  const enableWrite = async () => {
+    const account = consentAccount
+    const control = account?.writeControl
+    if (!account || !control || !consentChecked || writeBusyId) return
+    setConsentError(null)
+    setWriteBusyId(account.id)
+    try {
+      await api.setPluginWriteAccess(auth, account.id, {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: control.disclaimerVersion,
+      })
+      setConsentAccount(null)
+      setConsentChecked(false)
+      setConsentError(null)
+      onWriteAccessChanged(true)
+    } catch (error) {
+      setConsentError(errText(error, '开启 Plugin 写入能力失败'))
+      onWriteAccessError(error)
+    } finally {
+      setWriteBusyId(null)
+    }
+  }
   return (
     <div className="rounded-xl border border-border bg-surface p-3.5">
       <div className="flex items-start gap-3">
@@ -552,7 +612,9 @@ function RuntimePluginCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-[14px] font-medium text-fg">{plugin.label}</span>
-            <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">只读</span>
+            <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">
+              {writeCount > 0 ? '可读写' : '只读'}
+            </span>
             {plugin.installed ? (
               <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
                 市场已安装 · v{plugin.installedVersion}
@@ -580,7 +642,7 @@ function RuntimePluginCard({
           </div>
           <p className="mt-0.5 text-[12px] leading-snug text-faint">{plugin.description}</p>
           <p className="mt-1 text-[11px] text-faint">
-            {plugin.actions.length} 项只读能力
+            {readCount} 项读取能力{writeCount > 0 ? ` · ${writeCount} 项写入能力（默认关闭）` : ''}
             {plugin.accountMode === 'none' ? ' · 无需账号' : ' · 账号登录状态加密保存'}
           </p>
         </div>
@@ -629,7 +691,7 @@ function RuntimePluginCard({
       {accounts.length > 0 && (
         <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
           {accounts.map((account) => (
-            <li key={account.id} className="flex items-center gap-2 py-2">
+            <li key={account.id} className="flex flex-wrap items-center gap-2 py-2">
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[13px] text-fg">
                   {account.displayName || plugin.label}
@@ -649,6 +711,25 @@ function RuntimePluginCard({
                         ? '需重新授权'
                         : '当前不可用'}
               </span>
+              {account.writeControl && (
+                <div className="flex items-center gap-2 text-[11.5px] text-muted">
+                  <span>{account.writeControl.enabled ? '写入已开启' : '写入已关闭'}</span>
+                  <Switch
+                    aria-label={`${account.displayName || plugin.label}写入能力`}
+                    checked={account.writeControl.enabled}
+                    disabled={!account.executable || writeBusyId === account.id}
+                    onCheckedChange={(checked) => {
+                      if (checked) {
+                        setConsentChecked(false)
+                        setConsentError(null)
+                        setConsentAccount(account)
+                      } else {
+                        void disableWrite(account)
+                      }
+                    }}
+                  />
+                </div>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
@@ -661,6 +742,60 @@ function RuntimePluginCard({
           ))}
         </ul>
       )}
+      <Modal
+        open={consentAccount != null}
+        onOpenChange={(open) => {
+          if (!open && !writeBusyId) {
+            setConsentAccount(null)
+            setConsentChecked(false)
+            setConsentError(null)
+          }
+        }}
+        title="开启知识星球写入能力"
+        description="开启后仍不会自动发布；每一次主题或评论都必须由你在对话确认卡中单独批准。"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={writeBusyId != null}
+              onClick={() => {
+                setConsentAccount(null)
+                setConsentChecked(false)
+                setConsentError(null)
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!consentChecked || writeBusyId != null}
+              onClick={() => void enableWrite()}
+            >
+              {writeBusyId ? '正在开启…' : '同意并开启'}
+            </Button>
+          </>
+        }
+      >
+        {consentAccount?.writeControl && (
+          <div className="flex flex-col gap-3">
+            {consentError && <Alert tone="danger">{consentError}</Alert>}
+            <Alert tone="warning" className="text-[12px] leading-relaxed">
+              {consentAccount.writeControl.disclaimerText}
+            </Alert>
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-[12px] leading-relaxed text-muted">
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 accent-accent"
+                checked={consentChecked}
+                onChange={(event) => setConsentChecked(event.target.checked)}
+              />
+              <span>我已阅读并理解上述风险与责任，并同意开启写入能力。</span>
+            </label>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }
@@ -863,7 +998,7 @@ function KnowledgePlanetSetupDialog({
       open={plugin != null}
       onOpenChange={(open) => !open && void close()}
       title="授权知识星球"
-      description="微信扫码一次即可；Plugin 只读取你已加入星球的内容，不执行发布、评论或删除。"
+      description="微信扫码一次即可复用登录。读取能力授权后可用；发布主题和评论默认关闭，需另行阅读免责声明并手动开启。"
       footer={
         <>
           {setup?.status !== 'active' && (
@@ -907,8 +1042,8 @@ function KnowledgePlanetSetupDialog({
         {error && <Alert tone="danger">{error}</Alert>}
         {!setup && (
           <div className="rounded-lg bg-hover px-3 py-2.5 text-[12px] leading-relaxed text-muted">
-            点击“同意并生成二维码”即表示你同意使用微信扫码授权只读访问。登录状态仅保存在服务端加密账号库中；Plugin
-            只通过固定域名白名单读取数据，不会发布、评论、点赞或删除内容。
+            点击“同意并生成二维码”即表示你同意使用微信扫码保存知识星球登录状态。登录状态仅保存在服务端加密账号库中；Plugin
+            只访问固定域名白名单。扫码本身不会开启发布能力，写入需在账号卡片中另行同意并开启，且每次执行仍需确认。
           </div>
         )}
         {setup && !terminalFailure && (
@@ -982,7 +1117,7 @@ function KnowledgePlanetSetupDialog({
           <Alert tone="success">
             {setup.agentReady === false
               ? '微信登录已确认，登录信息已加密保存。系统完成 Plugin 升级后会自动启用，无需再次扫码。'
-              : '授权成功，知识星球已自动启用；Agent 现在可以直接读取相关内容。'}
+              : '授权成功，Agent 现在可以直接读取知识星球内容；写入能力保持关闭，需你另行开启。'}
           </Alert>
         )}
         {terminalFailure && (

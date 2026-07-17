@@ -247,7 +247,16 @@ export interface ConnectorsRpcDeps {
   now?: () => number
   log?: RpcLog
   /** Non-declarative Plugin facade. Omitted in old tests/dev assembly = declarative aliases only. */
-  pluginFacade?: Pick<PluginRuntimeFacade, 'catalog' | 'list' | 'classifyTarget' | 'call'>
+  pluginFacade?: Pick<
+    PluginRuntimeFacade,
+    | 'catalog'
+    | 'list'
+    | 'classifyTarget'
+    | 'actionEffect'
+    | 'call'
+    | 'proposeWrite'
+    | 'executeConfirmedWrite'
+  >
 }
 
 export interface ConnectorsRpcCtx {
@@ -696,21 +705,68 @@ async function handleCall(
   if (rt.pluginSurface && rt.deps.pluginFacade) {
     const pluginType = await rt.deps.pluginFacade.classifyTarget(who.userId, body.connectionId)
     if (pluginType !== null) {
-      if (body.confirmId)
-        throw new ConnectorError('BAD_REQUEST', 'runtime Plugin actions are read-only')
-      if (!rt.limiter.check(who.containerId, rt.now()))
-        throw new ConnectorError('RATE_LIMITED', 'per-container window exceeded')
-      await checkRedisWindow(rt.deps.redis, 'read', who.userId, rt.now(), rt.log)
       try {
-        const result = await rt.deps.pluginFacade.call({
+        if (body.confirmId) {
+          const executed = await rt.deps.pluginFacade.executeConfirmedWrite({
+            userId: who.userId,
+            targetId: body.connectionId,
+            confirmId: body.confirmId,
+          })
+          if (executed.kind === 'in_progress') {
+            sendEnvelope(res, { kind: 'in_progress', id: body.confirmId })
+            return
+          }
+          if (executed.kind === 'replay') {
+            sendEnvelope(res, {
+              kind: 'replay',
+              status: executed.status,
+              ...(executed.errorCode ? { errorCode: executed.errorCode } : {}),
+              ...(executed.resultDigest ? { resultDigest: executed.resultDigest } : {}),
+            })
+            return
+          }
+          sendEnvelope(res, { kind: 'result', result: executed.result, pluginType })
+          return
+        }
+
+        const actionId = requireBodyAction(body.action)
+        const effect = await rt.deps.pluginFacade.actionEffect({
           userId: who.userId,
           targetId: body.connectionId,
-          actionId: requireBodyAction(body.action),
+          actionId,
+        })
+        if (effect === 'read') {
+          if (!rt.limiter.check(who.containerId, rt.now()))
+            throw new ConnectorError('RATE_LIMITED', 'per-container window exceeded')
+          await checkRedisWindow(rt.deps.redis, 'read', who.userId, rt.now(), rt.log)
+          const result = await rt.deps.pluginFacade.call({
+            userId: who.userId,
+            targetId: body.connectionId,
+            actionId,
+            params: body.params ?? {},
+          })
+          sendEnvelope(res, { kind: 'result', result, pluginType })
+          return
+        }
+
+        await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
+        const proposed = await rt.deps.pluginFacade.proposeWrite({
+          userId: who.userId,
+          targetId: body.connectionId,
+          actionId,
           params: body.params ?? {},
         })
-        sendEnvelope(res, { kind: 'result', result, pluginType })
+        sendEnvelope(res, {
+          kind: 'confirmation_required',
+          id: proposed.confirmId,
+          provider: proposed.provider,
+          action: actionId,
+          summary: proposed.summary,
+          expiresAt: proposed.expiresAt.toISOString(),
+        })
         return
       } catch (error) {
+        if (error instanceof ConnectorError) throw error
         const code = (error as { code?: unknown })?.code
         if (code === 'LEASE_BUSY' || code === 'RUNTIME_BUSY')
           throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
@@ -727,6 +783,10 @@ async function handleCall(
           throw new ConnectorError('RELINK_REQUIRED', 'Plugin target is no longer executable')
         if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'ACTION_NOT_FOUND')
           throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
+        if (code === 'WRITE_DISABLED')
+          throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')
+        if (code === 'WRITE_REQUIRES_CONFIRMATION')
+          throw new ConnectorError('BAD_REQUEST', 'Plugin write confirmation is required')
         throw new ConnectorError('CONNECTION_ERROR', 'Plugin runtime unavailable')
       }
     }

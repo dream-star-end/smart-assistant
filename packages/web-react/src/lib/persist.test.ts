@@ -94,6 +94,17 @@ function stored(id: string, over: Partial<StoredSession> = {}): StoredSession {
 }
 
 describe("persist — 历史合并纯函数", () => {
+  test("_orderSeq 是全序主轴：patch 后高 _seq 不移位，缺 ts 也不整趟放弃排序", () => {
+    const server = [
+      { id: "u2", role: "user", text: "two", ts: 300, _seq: 5, _orderSeq: 3 },
+      { id: "a1", role: "assistant", text: "patched", _seq: 13, _orderSeq: 2, _source: "server" },
+      { id: "u1", role: "user", text: "one", ts: 100, _seq: 5, _orderSeq: 1 },
+    ] as ChatMessage[];
+
+    const out = mergeFullServerWins(server, []);
+    expect(out.map((row) => row.id)).toEqual(["u1", "a1", "u2"]);
+  });
+
   test("exact terminal evidence replaces only that turn's m-* fallback, not a queued next turn", () => {
     const local: ChatMessage[] = [
       { id: "m-user-1", role: "user", text: "u1", ts: 1 },
@@ -465,22 +476,22 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.map((m) => m.id)).toEqual(["old", "u1", "mid", "u2", "tail"]);
   });
 
-  test("applyServerIncremental: invalid ts falls back to original merge order", () => {
+  test("applyServerIncremental: invalid ts uses 0 tie-breaker without abandoning the whole sort", () => {
     const local = [msg("a", "L-a"), { ...msg("b", "L-b"), ts: Number.NaN }];
     const incoming = [{ ...msg("c", "S-c"), ts: 0 }];
     const merged = applyServerIncremental(local, incoming);
-    expect(merged.map((m) => m.id)).toEqual(["a", "b", "c"]);
+    expect(merged.map((m) => m.id)).toEqual(["b", "c", "a"]);
   });
 
-  test("applyServerIncremental: _seq(server 权威序)优先于 ts,消客户端时钟偏移错序", () => {
+  test("applyServerIncremental: _orderSeq 冻结顺序优先于 ts/_seq,消客户端时钟偏移错序", () => {
     // 设备钟快 → user 气泡(server 侧也按客户端 ts 存档,ts=9000)大于本轮助手 server ts(1001),
     // 但两行都被 server echo 回、带单调 _seq(user=10 在前、助手=11 在后)。按 _seq 应回 user→助手;
     // 旧的纯 ts 排序会因 9000 > 1001 把 user 气泡错排到答案之后。
     const local = [
-      { id: "srv-u", role: "user", text: "问", ts: 9000, _source: "server", _seq: 10 } as ChatMessage,
+      { id: "srv-u", role: "user", text: "问", ts: 9000, _source: "server", _seq: 99, _orderSeq: 10 } as ChatMessage,
     ];
     const incoming = [
-      { id: "srv-a", role: "assistant", text: "答", ts: 1001, _source: "server", _seq: 11 } as ChatMessage,
+      { id: "srv-a", role: "assistant", text: "答", ts: 1001, _source: "server", _seq: 11, _orderSeq: 11 } as ChatMessage,
     ];
     const merged = applyServerIncremental(local, incoming);
     expect(merged.map((m) => m.id)).toEqual(["srv-u", "srv-a"]);

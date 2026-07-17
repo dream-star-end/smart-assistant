@@ -58,6 +58,22 @@ const plan = (
 })
 
 describe('mergePreservingServerAuthored', () => {
+  it('partitions phantom dedupe by frozen _orderSeq rather than mutable ts/_seq order', () => {
+    const server = [
+      { id: 'u1', role: 'user', text: 'one', ts: 100, _seq: 5, _orderSeq: 1 },
+      { id: 'a1', role: 'assistant', text: 'done one', ts: 400, _seq: 13, _orderSeq: 2, _source: 'server' },
+      { id: 'u2', role: 'user', text: 'two', ts: 300, _seq: 6, _orderSeq: 3 },
+    ] as Msg[]
+    const client = [
+      server[0]!,
+      server[2]!,
+      { id: 'a2-local', role: 'assistant', text: 'stream two', ts: 350 },
+    ] as Msg[]
+
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(out.map((row) => row.id), ['u1', 'a1', 'u2', 'a2-local'])
+  })
+
   it('returns client reference verbatim when server side has no server-authored messages', () => {
     const server: Msg[] = [cli('u1', 100), cli('u2', 200)]
     const client: Msg[] = [cli('u1', 100), cli('u2', 200), cli('u3', 300)]
@@ -99,6 +115,23 @@ describe('mergePreservingServerAuthored', () => {
 
     const out = mergePreservingServerAuthored([] as Msg[], client)
     assert.equal(out, client, 'cross-turn legacy blockIds are not duplicates')
+  })
+
+  it('uses frozen order for plan turn grouping even when no row is server-authored', () => {
+    const server = [
+      { ...cli('u1', 100), _orderSeq: 1 },
+      { ...plan('p-turn-1', 200, 'shared-plan', ['completed']), _orderSeq: 2 },
+      { ...cli('u2', 300), _orderSeq: 3 },
+      { ...plan('p-turn-2', 400, 'shared-plan', ['pending']), _orderSeq: 4 },
+    ] as Msg[]
+    // A stale client PUT moved both user boundaries ahead of both plan rows.
+    // Raw-array grouping would now treat the plans as duplicates in turn 2.
+    const client = [server[0]!, server[2]!, server[1]!, server[3]!] as Msg[]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    assert.deepEqual(
+      new Set(out.map((m) => m.id)),
+      new Set(['u1', 'p-turn-1', 'u2', 'p-turn-2']),
+    )
   })
 
   it('re-inserts a server-authored message the client dropped', () => {

@@ -1901,10 +1901,10 @@ export class ChatSocket {
   }
 
   /**
-   * 下一页归档 getSessionArchive 的 before 游标 = 当前已加载的最老 server `_seq`(server 返回
-   * `_seq < before` 的一页)。本地还没拉过归档时,最老 server 行即热尾巴首行(`_seq =
+   * 下一页归档 getSessionArchive 的 before 游标 = 当前已加载的最老 server `_orderSeq`。
+   * 本地还没拉过归档时,最老 server 行即热尾巴首行(`_orderSeq =
    * archivedThroughSeq+1`)→ before 落在 archivedThroughSeq+1,取到最新归档页;每前插一页,最老
-   * `_seq` 下降 → 自然上翻。全无 `_seq`(纯乐观/未同步)→ 回退 archivedThroughSeq+1;都缺 → 0
+   * `_orderSeq` 下降 → 自然上翻。全无顺序轴(纯乐观/未同步)→ 回退水位+1;都缺 → 0
    * (server 按缺省取最新页)。
    */
   archiveBeforeSeq(sessId: string): number {
@@ -1912,7 +1912,8 @@ export class ChatSocket {
     if (!s) return 0;
     let min: number | null = null;
     for (const m of s.messages) {
-      if (typeof m._seq === "number" && Number.isFinite(m._seq) && (min === null || m._seq < min)) min = m._seq;
+      const orderSeq = typeof m._orderSeq === "number" ? m._orderSeq : m._seq;
+      if (typeof orderSeq === "number" && Number.isFinite(orderSeq) && (min === null || orderSeq < min)) min = orderSeq;
     }
     if (min !== null) return min;
     return typeof s._archivedThroughSeq === "number" && s._archivedThroughSeq > 0 ? s._archivedThroughSeq + 1 : 0;

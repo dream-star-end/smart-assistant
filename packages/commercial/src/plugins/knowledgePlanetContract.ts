@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.1.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.2.0'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +18,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.1.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.2.0'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.1.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.2.0'
 
 const authorSchema = {
   type: 'object',
@@ -164,7 +164,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     cookieDomains: ['api.zsxq.com', 'wx.zsxq.com', 'zsxq.com'],
     origins: ['https://api.zsxq.com', 'https://wx.zsxq.com'],
   },
-  network: { origins: ['https://api.zsxq.com'], methods: ['GET'] },
+  network: { origins: ['https://api.zsxq.com'], methods: ['GET', 'POST'] },
   actions: [
     {
       id: 'list_groups',
@@ -540,6 +540,48 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
       },
       result: topicListResultSchema,
     },
+    {
+      id: 'create_topic',
+      description: '在指定知识星球发布纯文本主题（每次执行都需用户单独确认）',
+      effect: 'write',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          groupId: numericIdParamSchema,
+          text: { type: 'string', minLength: 1, maxLength: 10_000 },
+        },
+        required: ['groupId', 'text'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { topic: topicSchema },
+        required: ['topic'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'create_comment',
+      description: '在指定主题发布纯文本评论（每次执行都需用户单独确认）',
+      effect: 'write',
+      timeoutSeconds: 30,
+      params: {
+        type: 'object',
+        properties: {
+          topicId: numericIdParamSchema,
+          text: { type: 'string', minLength: 1, maxLength: 5_000 },
+        },
+        required: ['topicId', 'text'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { comment: commentSchema },
+        required: ['comment'],
+        additionalProperties: false,
+      },
+    },
   ],
 } as const)
 
@@ -553,10 +595,15 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
 /**
  * Exact predecessor accepted only for the one-time product-login-first rollout.
  * It was platform-reviewed and signed in production, and its browser account
- * state contract is byte-for-byte compatible with v1.1. No other historical
+ * state contract is byte-for-byte compatible with v1.2. No other historical
  * or user-published Knowledge Planet artifact is eligible for setup.
  */
 export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.1.0',
+    artifactHash: 'fed46671c5af6156a4395c213695f5171c655cecc3efd0ef176d72330b7d3e36',
+    execContractHash: '2f27efdba9c06947ab4e0081deedc9e0b988f6a96d09ae36c6cbc8f54209892c',
+  }),
   Object.freeze({
     version: '1.0.0',
     artifactHash: '15ffb9bec94dfb42599bb55c04e98a9c7bf9b3f0af3a1ee420cd3bc1b8d080a7',

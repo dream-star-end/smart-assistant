@@ -240,7 +240,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(c?.status, undefined, 'replied dropped (derived now)')
   })
 
-  it('drops + counts server-authoritative fields (_source/_seq/usage/_truncated/_errorCode/_errorDetail)', () => {
+  it('drops + counts server-authoritative fields (_source/_seq/_orderSeq/usage/_truncated/_errorCode/_errorDetail)', () => {
     const cleaned = _stripClientPutMessage({
       id: 'm-evil',
       role: 'assistant',
@@ -248,6 +248,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       ts: 1,
       _source: 'server',
       _seq: 9999,
+      _orderSeq: 7777,
       usage: { costCredits: '1000', inputTokens: 0 },
       _truncated: true,
       _errorCode: 'oops',
@@ -255,6 +256,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     })
     assert.equal(cleaned?._source, undefined)
     assert.equal(cleaned?._seq, undefined)
+    assert.equal(cleaned?._orderSeq, undefined)
     assert.equal(cleaned?.usage, undefined)
     assert.equal(cleaned?._truncated, undefined)
     assert.equal(cleaned?._errorCode, undefined)
@@ -263,6 +265,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     const counts = getClientPutBlockedFieldCounts()
     assert.equal(counts._source, 1)
     assert.equal(counts._seq, 1)
+    assert.equal(counts._orderSeq, 1)
     assert.equal(counts.usage, 1)
     assert.equal(counts._truncated, 1)
     assert.equal(counts._errorCode, 1)
@@ -337,6 +340,7 @@ describe('upsertClientSession applies strip end-to-end (T24)', () => {
           status: 'replied', // forbidden — must be stripped
           _source: 'server',
           _seq: 9999,
+          _orderSeq: 9999,
           usage: { costCredits: '1000' },
           _truncated: true,
           _errorCode: 'oops',
@@ -383,11 +387,13 @@ describe('upsertClientSession applies strip end-to-end (T24)', () => {
     // _seq is reassigned by normalizeAndAssignSeqs since this is a new
     // message — but the *forged* 9999 must NOT survive.
     assert.notEqual(m._seq, 9999)
+    assert.notEqual(m._orderSeq, 9999)
 
     // Metric counters bumped for the deny-listed fields.
     const counts = getClientPutBlockedFieldCounts()
     assert.equal(counts._source, 1)
     assert.equal(counts._seq, 1)
+    assert.equal(counts._orderSeq, 1)
     assert.equal(counts.usage, 1)
     assert.equal(counts._truncated, 1)
     assert.equal(counts._errorCode, 1)

@@ -29,6 +29,7 @@ import {
   MAX_SESSION_BYTES,
   type MessageLike,
   mergePreservingServerAuthored,
+  normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
   SESSION_SOFT_TRIM_BYTES,
   SESSION_TAIL_MIN_MSGS,
@@ -39,9 +40,9 @@ import {
 
 /** 一个待 INSERT 的归档 chunk(执行层按 INSERT OR IGNORE 落库,PK=(session_id, first_seq))。 */
 export interface SpillChunkPlan {
-  /** chunk 内 _seq 最小值(= PK 的一半;chunk 之间 _seq 池 disjoint,故唯一)。 */
+  /** chunk 内 _orderSeq 最小值(物理列名 first_seq,滚动兼容)。 */
   firstSeq: number
-  /** chunk 内 _seq 最大值(idx_csa_chunks_last 的分页锚点)。 */
+  /** chunk 内 _orderSeq 最大值(idx_csa_chunks_last 的分页锚点)。 */
   lastSeq: number
   /** chunk 内消息条数(= messages.length)。 */
   messageCount: number
@@ -58,7 +59,7 @@ export interface SpillOverflowPlan {
   chunksToInsert: SpillChunkPlan[]
   /** 待 INSERT 的 archived_ids 消息 id(spill 段中带 string id 者,按数组序)。 */
   idsToInsert: string[]
-  /** 归档水位 = max(既有水位, 本次 spill 段 _seq 最大值)。无 spill → 既有水位。单调不降。 */
+  /** 归档水位 = max(既有水位, 本次 spill 段 _orderSeq 最大值)。 */
   archivedThroughSeq: number
 }
 
@@ -71,7 +72,7 @@ export interface SpillOverflowPlan {
  *   - **软阈值触发**:序列化字节 ≤ SESSION_SOFT_TRIM_BYTES → 零副作用(tail === msgs 同引用)。
  *   - **缺 _seq 防御**:任一消息缺数字 _seq → 不 spill 原样返回(安全 no-op,非错误)。
  *   - **尾巴下限**:总条数 ≤ SESSION_TAIL_MIN_MSGS → 不搬(保住兜底注入窗口)。
- *   - **搬不删,_seq 冻结**:归档与保留尾巴 _seq 不变不重排(增量协议依赖单调 _seq)。
+ *   - **双轴不变**:按 _orderSeq 搬运且冻结顺序;_seq 原值保留给增量协议。
  *   - **chunk 切分**:数组序贪心切(每 chunk ≤ARCHIVE_CHUNK_MAX_MSGS 条且 ≤ARCHIVE_CHUNK_MAX_BYTES,
  *     先到者为界;单条 >上限也独立成 chunk 不空转)。
  */
@@ -87,35 +88,53 @@ export function planSpillOverflow(
     archivedThroughSeq: currentWatermark,
   })
 
+  // 新写路径全员有冻结的 `_orderSeq`;先规范成展示/归档顺序再从数组头搬。滚动兼容旧
+  // 调用者(尚无 `_orderSeq`)时保留原数组,物理归档键回退既有 `_seq`。
+  const hasCompleteOrderAxis = msgs.every(
+    (m) => typeof m?._orderSeq === 'number' && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0,
+  )
+  const orderedMsgs = hasCompleteOrderAxis
+    ? msgs
+        .map((value, index) => ({ value, index }))
+        .sort((a, b) =>
+          ((a.value._orderSeq as number) - (b.value._orderSeq as number)) || a.index - b.index)
+        .map(({ value }) => value)
+    : msgs
+  const orderedNoop = (): SpillOverflowPlan => {
+    const unchanged = orderedMsgs === msgs ||
+      orderedMsgs.every((message, index) => message === msgs[index])
+    return unchanged ? noop() : { ...noop(), tail: orderedMsgs }
+  }
+
   // Fast path:行仍在软阈值内 → 什么都不搬(此处 JSON.stringify 是精确字节度量)。
-  if (Buffer.byteLength(JSON.stringify(msgs), 'utf8') <= SESSION_SOFT_TRIM_BYTES) {
-    return noop()
+  if (Buffer.byteLength(JSON.stringify(orderedMsgs), 'utf8') <= SESSION_SOFT_TRIM_BYTES) {
+    return orderedNoop()
   }
 
   // 防御:spill 要求全员有数字 _seq(归档/增量游标)。缺 _seq → 拒绝 spill,原样返回。
-  for (const m of msgs) {
+  for (const m of orderedMsgs) {
     if (!m || typeof m._seq !== 'number' || !Number.isFinite(m._seq)) {
-      return noop()
+      return orderedNoop()
     }
   }
 
   // 尾巴不能低于下限:即便超软阈值,若总条数 ≤ MIN_MSGS 也不搬。
-  if (msgs.length <= SESSION_TAIL_MIN_MSGS) {
-    return noop()
+  if (orderedMsgs.length <= SESSION_TAIL_MIN_MSGS) {
+    return orderedNoop()
   }
 
   // 逐条序列化字节(数组序)+ 1 字节分隔符估算。
   const SEP = 1
-  const perBytes = new Array<number>(msgs.length)
+  const perBytes = new Array<number>(orderedMsgs.length)
   let totalBytes = 2 // 外层 [ ]
-  for (let i = 0; i < msgs.length; i++) {
-    const b = Buffer.byteLength(JSON.stringify(msgs[i]), 'utf8') + SEP
+  for (let i = 0; i < orderedMsgs.length; i++) {
+    const b = Buffer.byteLength(JSON.stringify(orderedMsgs[i]), 'utf8') + SEP
     perBytes[i] = b
     totalBytes += b
   }
 
   // 从数组头(最老)向后搬,直到剩余尾巴 ≤ TAIL_TARGET;但绝不搬到尾巴 < MIN_MSGS。
-  const maxSpill = msgs.length - SESSION_TAIL_MIN_MSGS
+  const maxSpill = orderedMsgs.length - SESSION_TAIL_MIN_MSGS
   let spillCount = 0
   let tailBytes = totalBytes
   while (spillCount < maxSpill && tailBytes > SESSION_TAIL_TARGET_BYTES) {
@@ -124,11 +143,11 @@ export function planSpillOverflow(
   }
   if (spillCount <= 0) {
     // 溢出全集中在最新的 MIN_MSGS 条里 → 搬无可搬(硬闸 MAX_SESSION_BYTES 兜底)。
-    return noop()
+    return orderedNoop()
   }
 
-  const spilled = msgs.slice(0, spillCount)
-  const tail = msgs.slice(spillCount)
+  const spilled = orderedMsgs.slice(0, spillCount)
+  const tail = orderedMsgs.slice(spillCount)
 
   const chunksToInsert: SpillChunkPlan[] = []
   const idsToInsert: string[] = []
@@ -147,11 +166,12 @@ export function planSpillOverflow(
       j++
     }
     const chunkMsgs = spilled.slice(i, j)
-    // first_seq/last_seq = chunk 内 _seq 的 min/max(chunk 之间 _seq 池 disjoint,min 唯一)。
+    // 物理列名为 rolling-compatible first_seq/last_seq,语义已切为冻结的 order 轴。
+    // 旧消息缺 `_orderSeq` 时回退其已冻结的 archive `_seq`。
     let minSeq = Number.POSITIVE_INFINITY
     let maxSeq = 0
     for (const m of chunkMsgs) {
-      const s = m._seq as number
+      const s = typeof m._orderSeq === 'number' ? m._orderSeq : (m._seq as number)
       if (s < minSeq) minSeq = s
       if (s > maxSeq) maxSeq = s
     }
@@ -220,7 +240,13 @@ export function planAppendServerAuthoredBatch(
   if (!applied) return { kind: 'already_exists' }
 
   const dedupedMessages = mergePreservingServerAuthored(next, next) as MessageLike[]
-  const normalized = normalizeAndAssignSeqs(existingMsgs, dedupedMessages, currentNextSeq, _warnSeqAnomaly)
+  const normalized = normalizeAndAssignSeqs(
+    existingMsgs,
+    dedupedMessages,
+    currentNextSeq,
+    _warnSeqAnomaly,
+    currentArchivedThroughSeq,
+  )
   const spill = planSpillOverflow(normalized.messages, currentArchivedThroughSeq)
   const finalJson = JSON.stringify(spill.tail)
   if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
@@ -273,6 +299,7 @@ export function planAppendServerAuthored(
     dedupedMessages,
     currentNextSeq,
     _warnSeqAnomaly,
+    currentArchivedThroughSeq,
   )
 
   // 热尾巴 + 归档:normalize 后把最老的消息搬进归档,行只留热尾巴。
@@ -337,10 +364,16 @@ export function planCostPatch(
   currentNextSeq: number,
   currentArchivedThroughSeq: number,
 ): CostPatchPlan {
-  const idx = messages.findIndex((m) => m && m.id === msgId && m._source === 'server')
+  const orderedMessages = normalizeAndAssignOrderSeqs(
+    messages,
+    messages,
+    currentArchivedThroughSeq,
+    _warnSeqAnomaly,
+  ).messages
+  const idx = orderedMessages.findIndex((m) => m && m.id === msgId && m._source === 'server')
   if (idx < 0) return { kind: 'not_found' }
 
-  const existing = messages[idx] as MessageLike & { usage?: Record<string, unknown> }
+  const existing = orderedMessages[idx] as MessageLike & { usage?: Record<string, unknown> }
   const prevCost = existing.usage?.costCredits
   // 幂等重放:成本未变 → noop,**不** bump _seq(防重试膨胀 seq 空间触发无谓尾巴重载)。
   if (typeof prevCost === 'string' && prevCost === costCredits) return { kind: 'noop' }
@@ -350,7 +383,7 @@ export function planCostPatch(
     _seq: currentNextSeq,
     usage: { ...(existing.usage ?? {}), costCredits },
   }
-  const next: MessageLike[] = [...messages]
+  const next: MessageLike[] = [...orderedMessages]
   next[idx] = patched
 
   // 热尾巴 + 归档:patch bump _seq/加 usage 键后行可能微涨,越软阈值则 spill。
@@ -443,11 +476,17 @@ export function planDelegateCostMerge(
 
   // 会话缺位(尚未 sink / 已删)→ 保守保留 pending。
   if (messages === null) return { kind: 'target_not_ready' }
-  const idx = messages.findIndex((m) => m && m.id === msgId && m._source === 'server')
+  const orderedMessages = normalizeAndAssignOrderSeqs(
+    messages,
+    messages,
+    currentArchivedThroughSeq,
+    _warnSeqAnomaly,
+  ).messages
+  const idx = orderedMessages.findIndex((m) => m && m.id === msgId && m._source === 'server')
   // 找不到队长助手行(未落库 / 被删)→ 保守保留 pending。
   if (idx < 0) return { kind: 'target_not_ready' }
 
-  const existing = messages[idx] as MessageLike & { usage?: Record<string, unknown> }
+  const existing = orderedMessages[idx] as MessageLike & { usage?: Record<string, unknown> }
   let base = 0n
   try {
     base = BigInt((existing.usage?.costCredits as string) ?? '0')
@@ -486,7 +525,7 @@ export function planDelegateCostMerge(
       ...(delegates.length > 0 ? { delegates } : {}),
     },
   }
-  const next: MessageLike[] = [...messages]
+  const next: MessageLike[] = [...orderedMessages]
   next[idx] = patched
 
   const spill = planSpillOverflow(next, currentArchivedThroughSeq)

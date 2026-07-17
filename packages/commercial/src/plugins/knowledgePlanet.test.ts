@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +8,7 @@ import { afterEach, describe, test } from 'node:test'
 
 import type Docker from 'dockerode'
 
+import { ManagedBrowserRuntime } from './browserRuntime.js'
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 
 import {
@@ -31,10 +32,10 @@ import {
   validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
 import {
+  KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
-  KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
@@ -43,6 +44,7 @@ import {
   KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
   KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES,
   KNOWLEDGE_PLANET_WORKER_SOURCE,
+  KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE,
   isKnowledgePlanetLoginProbeDue,
   isKnowledgePlanetQrPixelSampleReady,
 } from './knowledgePlanetWorkerSource.js'
@@ -80,7 +82,7 @@ describe('official Knowledge Planet Plugin', () => {
     )
   })
 
-  test('accepts only the current or exact signed v1.0 pin for product setup', () => {
+  test('accepts only the current or exact signed compatible predecessors for product setup', () => {
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         version: KNOWLEDGE_PLANET_PLUGIN_VERSION,
@@ -89,11 +91,9 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 1)
-    assert.equal(
-      classifyKnowledgePlanetSetupPin(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!),
-      'compatible-predecessor',
-    )
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 2)
+    for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
+      assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
@@ -103,11 +103,11 @@ describe('official Knowledge Planet Plugin', () => {
     )
   })
 
-  test('has a read-only action network separated from login/account state', () => {
+  test('has a signed read/write action network separated from login/account state', () => {
     assert.equal(COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType, 'managed-browser')
     assert.deepEqual(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network, {
       origins: ['https://api.zsxq.com:443'],
-      methods: ['GET'],
+      methods: ['GET', 'POST'],
       forbiddenChannels: [
         'background-network',
         'doh',
@@ -122,11 +122,18 @@ describe('official Knowledge Planet Plugin', () => {
     })
     assert.ok(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.accountState.origins.length > 1)
     assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://open.weixin.qq.com:443'))
-    assert.ok(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.every((action) => action.effect === 'read'))
+    assert.equal(
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
+      15,
+    )
+    assert.equal(
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'write').length,
+      2,
+    )
   })
 
-  test('v1.1 exposes the complete bounded read surface without credential-bearing result fields', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.1.0')
+  test('v1.2 exposes bounded reads plus confirmed text writes without credential-bearing results', () => {
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.2.0')
     assert.deepEqual(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
       [
@@ -145,6 +152,8 @@ describe('official Knowledge Planet Plugin', () => {
         'list_checkins',
         'get_checkin',
         'list_checkin_topics',
+        'create_topic',
+        'create_comment',
       ],
     )
     const forbidden = /(?:url|uri|href|token|cookie|header|signature|secret)/i
@@ -191,8 +200,58 @@ describe('official Knowledge Planet Plugin', () => {
         checked++
       }
     }
-    assert.equal(checked, 15)
+    assert.equal(checked, 17)
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /const NUMERIC_ID = \/\^\\d\{6,32\}\$\//)
+  })
+
+  test('builds exact one-shot POST bytes and signatures for topic and comment writes', () => {
+    const helpers = Function(
+      'createHash',
+      'Buffer',
+      'NUMERIC_ID',
+      `'use strict'; ${KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE}; return { buildKnowledgePlanetWriteRequest, knowledgePlanetPostSignature };`,
+    )(createHash, Buffer, /^\d{6,32}$/) as {
+      buildKnowledgePlanetWriteRequest: (
+        action: string,
+        params: Record<string, unknown>,
+      ) => { path: string; body: string; method: string } | null
+      knowledgePlanetPostSignature: (timestamp: string, body: string) => string
+    }
+    const topic = helpers.buildKnowledgePlanetWriteRequest('create_topic', {
+      groupId: '123456789',
+      text: '含中文与 "引号"',
+    })!
+    assert.equal(topic.method, 'POST')
+    assert.equal(topic.path, '/v2/groups/123456789/topics')
+    assert.equal(
+      topic.body,
+      JSON.stringify({
+        req_data: {
+          type: 'topic',
+          text: '含中文与 "引号"',
+          image_ids: [],
+          file_ids: [],
+          mentioned_user_ids: [],
+        },
+      }),
+    )
+    const timestamp = '1774404109'
+    const expected = createHash('sha1')
+      .update(timestamp + createHash('md5').update(Buffer.from(topic.body, 'utf8')).digest('hex'))
+      .digest('hex')
+    assert.equal(helpers.knowledgePlanetPostSignature(timestamp, topic.body), expected)
+
+    const comment = helpers.buildKnowledgePlanetWriteRequest('create_comment', {
+      topicId: '223456789',
+      text: '评论',
+    })!
+    assert.equal(comment.path, '/v2/topics/223456789/comments')
+    assert.equal(
+      comment.body,
+      JSON.stringify({ req_data: { text: '评论', image_ids: [], mentioned_user_ids: [] } }),
+    )
+    assert.equal([...KNOWLEDGE_PLANET_WORKER_SOURCE.matchAll(/api\.fetch\(/g)].length, 1)
+    assert.doesNotMatch(KNOWLEDGE_PLANET_WORKER_SOURCE, /retry|retries/i)
   })
 
   test('login API probe is delayed, five-second limited and capped at 48 attempts', () => {
@@ -364,6 +423,10 @@ describe('official Knowledge Planet Plugin', () => {
       actionSource,
       /if \(!response\.ok\(\) \|\| data\?\.succeeded !== true\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'failed'/,
     )
+    assert.match(
+      actionSource,
+      /catch \{[\s\S]*response\.status\(\) === 401[\s\S]*code: 'LOGIN_EXPIRED'/,
+    )
     assert.match(actionSource, /await writeTerminalAndExit\(completed\)/)
     assert.doesNotMatch(actionSource, /writeFrame\(completed\)/)
     assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
@@ -500,7 +563,7 @@ describe('official Knowledge Planet Plugin', () => {
     }
     const ready = workerFrame({
       event: 'ready',
-      runtime: 'knowledge-planet-worker-v1.1',
+      runtime: 'knowledge-planet-worker-v1.2',
       playwrightMcpVersion: '0.0.76',
     })
     const completedBase = {
@@ -519,10 +582,7 @@ describe('official Knowledge Planet Plugin', () => {
     })
     assert.equal(completed.length, KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES + 4)
     assert.ok(ready.length + completed.length > KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES + 4)
-    assert.equal(
-      decodeKnowledgePlanetWorkerFramesForTest(Buffer.concat([ready, completed])),
-      2,
-    )
+    assert.equal(decodeKnowledgePlanetWorkerFramesForTest(Buffer.concat([ready, completed])), 2)
   })
 
   test('normalizes explicit-port login pins before browser route checks', () => {
@@ -549,6 +609,27 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       KNOWLEDGE_PLANET_LAUNCHER_ID,
       `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`,
+    )
+    const driver = registries.drivers.get(
+      `${KNOWLEDGE_PLANET_DRIVER_ID}@${KNOWLEDGE_PLANET_DRIVER_VERSION}`,
+    )
+    assert.ok(driver)
+    assert.deepEqual(
+      driver.maximumNetwork.origins.map((origin) => new URL(origin).origin),
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network.origins.map(
+        (origin) => new URL(origin).origin,
+      ),
+    )
+    assert.deepEqual(
+      driver.maximumNetwork.methods,
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network.methods,
+    )
+    assert.equal(
+      new ManagedBrowserRuntime({
+        ...registries,
+        profileRoot: '/tmp/not-used',
+      }).supportsContract(KNOWLEDGE_PLANET_PLUGIN_CONTRACT),
+      true,
     )
   })
 

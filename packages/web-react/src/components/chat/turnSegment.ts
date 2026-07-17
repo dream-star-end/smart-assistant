@@ -43,18 +43,53 @@ export function turnFinalAssistantFlags(messages: ChatMessage[]): boolean[] {
     typeof m.text === "string" &&
     m.text.trim().length > 0 &&
     !m._errorCode;
-  // lastBody = 当前(尚未落幕的)轮里最近一条 assistant 正文下标,-1=本轮还没有正文。
+  const orderTuple = (m: ChatMessage, index: number): [number, number, number] => [
+    typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0
+      ? m._orderSeq
+      : 0,
+    typeof m.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
+    index,
+  ];
+  const tupleAfter = (a: [number, number, number], b: [number, number, number]): boolean =>
+    a[0] > b[0] ||
+    (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])));
+
+  // Durable/live rows carry the exact user message id that owns their turn.
+  // Grouping on it is independent of a temporarily polluted array order.
+  const grouped = new Map<string, { index: number; tuple: [number, number, number] }>();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!isBody(message) || typeof message._clientMessageId !== "string" || !message._clientMessageId) continue;
+    const tuple = orderTuple(message, i);
+    const previous = grouped.get(message._clientMessageId);
+    if (!previous || tupleAfter(tuple, previous.tuple)) {
+      grouped.set(message._clientMessageId, { index: i, tuple });
+    }
+  }
+  for (const winner of grouped.values()) flags[winner.index] = true;
+
+  // Rolling legacy rows have no _clientMessageId. Keep the user-boundary
+  // fallback per array segment, but do not add a second rating when that
+  // segment already contains a keyed body.
   let lastBody = -1;
+  let segmentHasGroupedBody = false;
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m?.role === "user") {
       // 轮边界:上一轮落幕 → 其最后记录的正文即该轮末条。
-      if (lastBody >= 0) flags[lastBody] = true;
+      if (lastBody >= 0 && !segmentHasGroupedBody) flags[lastBody] = true;
       lastBody = -1;
+      segmentHasGroupedBody = false;
       continue; // user 行本身永不是正文。
     }
-    if (isBody(m)) lastBody = i;
+    if (isBody(m)) {
+      if (typeof m?._clientMessageId === "string" && m._clientMessageId) {
+        segmentHasGroupedBody = true;
+      } else {
+        lastBody = i;
+      }
+    }
   }
-  if (lastBody >= 0) flags[lastBody] = true; // 收尾:最后一轮(无后继 user)的末条。
+  if (lastBody >= 0 && !segmentHasGroupedBody) flags[lastBody] = true;
   return flags;
 }

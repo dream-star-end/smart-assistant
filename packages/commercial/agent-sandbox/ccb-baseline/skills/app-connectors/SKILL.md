@@ -1,6 +1,6 @@
 ---
 name: app-connectors
-description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装 Plugin：邮件、WebDAV、Notion、GitHub、飞书，以及知识星球的星球/主题/评论/动态/标签/专栏/打卡读取。用户要访问外部应用或知识星球时使用。
+description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装 Plugin：邮件、WebDAV、Notion、GitHub、飞书，以及知识星球的读取、主题发布和评论。用户要访问外部应用或知识星球时使用。
 tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet]
 ---
 
@@ -51,7 +51,7 @@ echo '{"groupId":"123456789","keyword":"AI","count":10}' \
   | oc-plugin call knowledge-planet search_topics --account 42
 ```
 
-### 知识星球只读能力
+### 知识星球能力
 
 按用户目标自动组合调用，不要要求用户先提供内部 ID：需要 ID 时先从上一步列表结果取得。
 
@@ -63,10 +63,17 @@ echo '{"groupId":"123456789","keyword":"AI","count":10}' \
 | 标签及其主题 | `list_hashtags` / `list_hashtag_topics` |
 | 专栏及其主题 | `list_columns` / `list_column_topics` |
 | 打卡项目、详情及打卡主题 | `list_checkins` / `get_checkin` / `list_checkin_topics` |
+| 发布纯文本主题（需开关 + 逐次确认） | `create_topic` |
+| 发布纯文本评论（需开关 + 逐次确认） | `create_comment` |
 
 典型自动流程：先 `oc-plugin list` 确认知识星球可用 → `list_groups` 找目标星球 → 按请求调用
 主题/搜索/标签/专栏/打卡 action → 需要正文或评论时再用返回的 ID 深入读取。除非用户明确要求，
 不要无边界遍历所有星球；主题/动态分页每次最多 10 条，按需要继续。
+
+知识星球写入能力默认关闭。若 `oc-plugin list` 没有显示 `create_topic` / `create_comment`，
+明确引导用户到「设置 → 应用连接 → 知识星球账号」阅读免责声明并开启写入；不要反复尝试、
+不要绕过开关。开启后也必须走下方逐次确认流程。当前仅支持纯文本主题和评论，不要声称
+支持图片/文件、点赞、编辑、删除或无人值守自动回复。
 
 ### 写操作的确认流程(必须遵守)
 
@@ -77,10 +84,13 @@ echo '{"groupId":"123456789","keyword":"AI","count":10}' \
 
 ```bash
 echo '{}' | oc-connect call imap send_email --confirm <确认码>
+# Plugin 写操作同理，params 仍以确认账本为准，可传空对象：
+echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 ```
 
 4. 确认窗口 10 分钟;过期/被拒绝就如实告知用户,需要时重新发起。
 5. 返回 `in_progress`=已在执行别催;`replay`=该确认码已执行过,**不要**再原样重发一单。
+   尤其 `replay.status=unknown` 表示可能已经写入：先让用户到知识星球核实，绝不自动重试。
 
 ## 各 provider 一览
 

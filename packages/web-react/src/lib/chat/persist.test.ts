@@ -254,6 +254,16 @@ describe("socket — 归档分页并入 / 游标", () => {
     expect(s.archiveBeforeSeq("s1")).toBe(3);
   });
 
+  test("archiveBeforeSeq：优先冻结 _orderSeq，不受 patch 后高 _seq 干扰", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages.push(
+      { ...srv("patched", 99), _orderSeq: 3 },
+      { ...srv("later", 4), _orderSeq: 4 },
+    );
+    expect(s.archiveBeforeSeq("s1")).toBe(3);
+  });
+
   test("archiveBeforeSeq：无任何 server _seq 行 → 回退 archivedThroughSeq+1(取最新归档页)", () => {
     const s = socket();
     const sess = s.ensureSession("s1", "main");

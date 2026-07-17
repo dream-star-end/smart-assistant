@@ -1548,6 +1548,7 @@ export function App() {
       const h = vv?.height || window.innerHeight;
       if (Number.isFinite(h) && h > 0) {
         document.documentElement.style.setProperty("--oc-visual-height", `${Math.round(h)}px`);
+        document.documentElement.style.setProperty("--oc-visual-height-85", `${Math.round(h * 0.85)}px`);
       }
       const top = vv?.offsetTop || 0;
       if (Number.isFinite(top)) {
@@ -1590,6 +1591,7 @@ export function App() {
       document.removeEventListener("focusout", realign);
       document.removeEventListener("visibilitychange", onVisible);
       document.documentElement.style.removeProperty("--oc-visual-height");
+      document.documentElement.style.removeProperty("--oc-visual-height-85");
       document.documentElement.style.removeProperty("--oc-visual-offset-top");
     };
   }, [inWorkspace, sending, scrollToChatBottom]);
