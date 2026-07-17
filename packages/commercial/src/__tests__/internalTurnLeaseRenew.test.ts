@@ -5,7 +5,6 @@ import { describe, test } from 'node:test'
 import {
   AUTHORITY_TURN_MAX_LIFETIME_MS,
   TURN_LEASE_TTL_MS,
-  turnLeaseOriginalIssuedAt,
   verifyTurnLease,
 } from '@openclaude/protocol'
 import type { Pool, PoolClient } from 'pg'
@@ -21,6 +20,19 @@ const ORIGINAL = 1_780_000_000_000
 const TURN_KEY = 'c'.repeat(64)
 const SECRET = 'ab'.repeat(32)
 const TOKEN = `Bearer oc-v3.7.${SECRET}`
+const LEGACY_TURN_LEASE_KEYS = [
+  'authorityTurnId',
+  'auxModels',
+  'canonicalModel',
+  'connectionChallenge',
+  'containerId',
+  'expiresAt',
+  'issuedAt',
+  'keyId',
+  'securityEpoch',
+  'uid',
+  'v',
+]
 
 class MockReq extends Readable {
   method = 'POST'
@@ -73,6 +85,7 @@ function fakePool(
     evidenceTurnKey?: string | null
     evidenceState?: string
     evidenceSource?: string
+    evidenceCreatedAtMs?: number
     epoch?: bigint
   } = {},
 ): { pool: Pool; sql: Array<{ text: string; params: readonly unknown[] }> } {
@@ -102,6 +115,7 @@ function fakePool(
                   state: opts.evidenceState ?? 'committed',
                   source: opts.evidenceSource ?? 'ccb_proxy',
                   turn_key: opts.evidenceTurnKey === undefined ? TURN_KEY : opts.evidenceTurnKey,
+                  created_at_ms: String(opts.evidenceCreatedAtMs ?? ORIGINAL),
                 },
               ]
             : [],
@@ -125,6 +139,13 @@ function fakePool(
     } as unknown as Pool,
     sql,
   }
+}
+
+function leaseWirePayload(envelope: string): Record<string, unknown> {
+  const decoded = JSON.parse(Buffer.from(envelope, 'base64url').toString('utf8')) as {
+    payload: Record<string, unknown>
+  }
+  return decoded.payload
 }
 
 function mint(signer: AuthoritySigner, now = ORIGINAL) {
@@ -161,10 +182,12 @@ async function run(handler: TurnLeaseRenewHandler, body: unknown): Promise<MockR
 }
 
 describe('internal turn-lease renewal', () => {
-  test('authenticated active turn renews under the shared turn lock and preserves originalIssuedAt', async () => {
+  test('initial and consecutive renewed leases preserve the strict legacy v1 wire shape', async () => {
     const signer = AuthoritySigner.createEphemeral()
     const initial = mint(signer)
-    const now = ORIGINAL + 30 * 60_000
+    assert.deepEqual(Object.keys(leaseWirePayload(initial.bundle.lease)).sort(), LEGACY_TURN_LEASE_KEYS)
+
+    let now = ORIGINAL + 30 * 60_000
     const db = fakePool()
     const handler = makeTurnLeaseRenewHandler({
       identityRepo: identityRepo(),
@@ -177,9 +200,22 @@ describe('internal turn-lease renewal', () => {
     assert.equal(res.statusCode, 200)
     const body = res.json()
     const renewed = verifyTurnLease(body.lease, signer.publicKeyring(), now)
-    assert.equal(turnLeaseOriginalIssuedAt(renewed), ORIGINAL)
+    assert.equal(renewed.originalIssuedAt, undefined)
     assert.equal(renewed.issuedAt, now)
     assert.equal(renewed.expiresAt, now + TURN_LEASE_TTL_MS)
+    assert.deepEqual(Object.keys(leaseWirePayload(body.lease)).sort(), LEGACY_TURN_LEASE_KEYS)
+
+    now = ORIGINAL + 60 * 60_000
+    const second = await run(handler, { turnKey: TURN_KEY, lease: body.lease })
+    assert.equal(second.statusCode, 200)
+    const renewedAgain = verifyTurnLease(second.json().lease, signer.publicKeyring(), now)
+    assert.equal(renewedAgain.originalIssuedAt, undefined)
+    assert.equal(renewedAgain.issuedAt, now)
+    assert.equal(renewedAgain.expiresAt, now + TURN_LEASE_TTL_MS)
+    assert.deepEqual(
+      Object.keys(leaseWirePayload(second.json().lease)).sort(),
+      LEGACY_TURN_LEASE_KEYS,
+    )
     const evidence = db.sql.find((q) => /FROM request_finalize_journal/.test(q.text))
     assert.deepEqual(evidence?.params.slice(0, 3), [42, 7, initial.lease.authorityTurnId])
     assert.ok(db.sql.some((q) => /pg_advisory_xact_lock/.test(q.text)))
@@ -250,6 +286,52 @@ describe('internal turn-lease renewal', () => {
     assert.equal(res.statusCode, 200)
     const renewed = verifyTurnLease(res.json().lease, signer.publicKeyring(), now)
     assert.equal(renewed.expiresAt, ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS)
+    assert.equal(renewed.originalIssuedAt, undefined)
+  })
+
+  test('journal-anchored 12h deadline rejects renewal and never drifts with lease issuedAt', async () => {
+    const signer = AuthoritySigner.createEphemeral()
+    const initial = mint(signer)
+    const lateLease = signer.signTurnLease({
+      ...initial.lease,
+      issuedAt: ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS - 60_000,
+      expiresAt: ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS + TURN_LEASE_TTL_MS,
+    })
+    const db = fakePool()
+    const handler = makeTurnLeaseRenewHandler({
+      identityRepo: identityRepo(),
+      pgPool: db.pool,
+      getSigner: () => signer,
+      now: () => ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS,
+    })
+
+    const res = await run(handler, { turnKey: TURN_KEY, lease: lateLease })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'TURN_LIFETIME_EXCEEDED')
+    assert.ok(db.sql.some((q) => q.text === 'ROLLBACK'))
+  })
+
+  test('experimental originalIssuedAt is a conservative cap input but is stripped on renewal', async () => {
+    const signer = AuthoritySigner.createEphemeral()
+    const initial = mint(signer)
+    const experimental = signer.signTurnLease({
+      ...initial.lease,
+      originalIssuedAt: ORIGINAL - 60_000,
+    })
+    const now = ORIGINAL + 30 * 60_000
+    const db = fakePool()
+    const handler = makeTurnLeaseRenewHandler({
+      identityRepo: identityRepo(),
+      pgPool: db.pool,
+      getSigner: () => signer,
+      now: () => now,
+    })
+
+    const res = await run(handler, { turnKey: TURN_KEY, lease: experimental })
+    assert.equal(res.statusCode, 200)
+    const renewed = verifyTurnLease(res.json().lease, signer.publicKeyring(), now)
+    assert.equal(renewed.originalIssuedAt, undefined)
+    assert.deepEqual(Object.keys(leaseWirePayload(res.json().lease)).sort(), LEGACY_TURN_LEASE_KEYS)
   })
 
   test('terminal or already-waived turn is rejected before active evidence and rolls back', async () => {
