@@ -28,6 +28,7 @@ import {
   createKnowledgePlanetRuntimeRegistries,
   decodeKnowledgePlanetWorkerFramesForTest,
   isOfficialKnowledgePlanetPluginIdentity,
+  validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
 import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
@@ -247,6 +248,88 @@ describe('official Knowledge Planet Plugin', () => {
       /if \(hasAuthenticatedKnowledgePlanetSession\(probeAuthenticated\)\) \{[\s\S]*filteredState\([\s\S]*writeAuthenticatedAndExit/,
     )
     assert.doesNotMatch(loginSource, /pageAuthenticated \|\| probeAuthenticated/)
+  })
+
+  test('projects Playwright storage state to the exact signed account shape', () => {
+    const filteredStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('function filteredState')
+    const readAduidStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nfunction readAduid',
+      filteredStart,
+    )
+    assert.ok(filteredStart >= 0 && readAduidStart > filteredStart)
+    const filteredState = Function(
+      `'use strict'; ${KNOWLEDGE_PLANET_WORKER_SOURCE.slice(filteredStart, readAduidStart)}; return filteredState;`,
+    )() as (
+      state: unknown,
+      domains: string[],
+      origins: string[],
+    ) => { cookies: Array<Record<string, unknown>>; origins: Array<Record<string, unknown>> }
+    const projected = filteredState(
+      {
+        cookies: [
+          {
+            name: 'zsxq_access_token',
+            value: 'credential-value',
+            domain: '.zsxq.com',
+            path: '/',
+            expires: 1_786_872_498,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'Lax',
+            partitionKey: 'https://wx.zsxq.com',
+          },
+          {
+            name: 'outside',
+            value: 'discarded',
+            domain: '.example.com',
+            path: '/',
+            expires: -1,
+            httpOnly: false,
+            secure: true,
+            sameSite: 'Lax',
+          },
+        ],
+        origins: [
+          {
+            origin: 'https://wx.zsxq.com',
+            localStorage: [{ name: 'XAduid', value: 'device-value', extra: 'discarded' }],
+            indexedDB: [{ name: 'playwright-extension' }],
+          },
+          {
+            origin: 'https://example.com',
+            localStorage: [{ name: 'outside', value: 'discarded' }],
+          },
+        ],
+      },
+      ['api.zsxq.com', 'wx.zsxq.com', 'zsxq.com'],
+      ['https://api.zsxq.com:443', 'https://wx.zsxq.com:443'],
+    )
+    assert.deepEqual(projected, {
+      cookies: [
+        {
+          name: 'zsxq_access_token',
+          value: 'credential-value',
+          domain: '.zsxq.com',
+          path: '/',
+          expires: 1_786_872_498,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+      ],
+      origins: [
+        {
+          origin: 'https://wx.zsxq.com',
+          localStorage: [{ name: 'XAduid', value: 'device-value' }],
+        },
+      ],
+    })
+    const validated = validateKnowledgePlanetAccountState(projected)
+    assert.equal(validated.cookies[0]?.value, 'credential-value')
+    assert.equal(validated.origins[0]?.origin, 'https://wx.zsxq.com:443')
+    assert.deepEqual(validated.origins[0]?.localStorage, [
+      { name: 'XAduid', value: 'device-value' },
+    ])
   })
 
   test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
