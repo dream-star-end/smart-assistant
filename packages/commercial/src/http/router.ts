@@ -1321,6 +1321,10 @@ export function createCommercialHandler(
     // 401/404("not found")。2026-07-11 连接器目录 not found 事故根因即漏登本处。
     '/api/connectors',
     '/api/plugins',
+    // 会话目标(GoalState)REST 面。2026-07-17 事故:PR#76 只登了 routes 数组漏了
+    // 本清单 → goal 全部 REST 404(GET 被前端当"无目标"吞,PUT 炸出 not found)。
+    // 两处同步铁律由 routeOwnership.test.ts 契约测试锁死。
+    '/api/session-goals/',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     '/api/remote-hosts',
     // P0/P1:commercial user 的 memory/skills/tasks/agent 管理 API 由 master
