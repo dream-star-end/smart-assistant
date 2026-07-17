@@ -64,3 +64,16 @@ export const SYSTEM_MAINTENANCE_ON = "system.maintenance_on";
  * 两侧显式扩表,严禁改成前缀匹配。
  */
 export const SELFHEAL_DRILL_TRANSPORT = "selfheal.drill:transport_v1";
+
+/**
+ * 合成 release 演练 condition(exact;0161 seed;写点=演练脚本
+ * scripts/v5-selfheal-drill.ts --release 经 write_alert_condition)。
+ *
+ * ── 跨仓契约(改动必须两侧同步)──
+ * 个人版 broker 以同一字面量对冻结 conditionKey === 本值的 repair 做 release drill
+ * 分级白名单强制:放行 context/report/**verify/cutover**(区别于 transport drill 仅
+ * context/report);Tier1 host opcode 对一切 drill 拒绝。
+ * dispatcher 的冷却豁免同样只认本精确常量。未来新增 drill 类型 = 新常量 + 两侧显式
+ * 扩表,严禁改成前缀匹配。
+ */
+export const SELFHEAL_DRILL_RELEASE = "selfheal.drill:release_v1";

@@ -1,6 +1,6 @@
-import { AlertTriangle, RefreshCw, Rocket } from "lucide-react";
+import { AlertTriangle, Check, FileText, RefreshCw, Rocket, ShieldX, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { Badge, Button, Modal, useConfirm, useToast } from "../../../components/ui";
+import { Badge, Button, Modal, useConfirm, usePrompt, useToast } from "../../../components/ui";
 import {
   type Column,
   CopyChip,
@@ -22,6 +22,9 @@ import {
   type IncidentListResp,
   type IncidentRow,
   type IncidentStatus,
+  type ReleaseFuseResp,
+  type ReleaseRequestAck,
+  type ReleaseRequestRow,
   type RepairEventRow,
   type RepairRow,
   type RepairStatus,
@@ -96,12 +99,364 @@ function latestEventFor(repairId: string, events: RepairEventRow[]): RepairEvent
   return latest;
 }
 
+// ── 批1b：放行（Tier2 部署门）辅助 ──────────────────────────────────────────
+
+const PENDING_RELEASE_PHASE = "pending_release";
+/** 展示用短 sha / 短 hash（前 12 位；缺失回落 —）。 */
+function short(v?: string | null, n = 12): string {
+  return v ? v.slice(0, n) : "—";
+}
+
+/**
+ * release request 状态 → 中文文案 + 徽标色（RFC MINOR：文案严格区分
+ * 「代码已部署」与「事故已由探测验证恢复」—— deployed ≠ resolved）。未知回落 neutral。
+ */
+const RELEASE_STATUS_META: Record<string, { label: string; tone: BadgeTone; spin?: boolean }> = {
+  queued: { label: "已提交，排队投递中", tone: "info" },
+  accepted: { label: "执行侧已接收，准备部署", tone: "info" },
+  deploying: { label: "正在部署…", tone: "info", spin: true },
+  // deployed = 代码落地，事故是否恢复由探测（probe）另行裁决，不等于 resolved。
+  deployed: { label: "代码已部署（等待探测确认事故恢复）", tone: "success" },
+  deploy_failed: { label: "部署失败", tone: "danger" },
+  deploy_unknown: { label: "部署结果未知，已触发全局熔断，等待人工裁决", tone: "danger" },
+  manual_required: { label: "需人工处理（分类/权威复核未通过）", tone: "warning" },
+  cancelled: { label: "已取消", tone: "neutral" },
+};
+/** 部署进行中（占用唯一活跃请求，不可再次放行）。 */
+const RELEASE_INFLIGHT = new Set(["queued", "accepted", "deploying"]);
+/** 可重新放行的终态（上次放行未成功，回到待放行姿态 → 新 rrid）。 */
+const RELEASE_RETRIABLE = new Set(["deploy_failed", "manual_required", "cancelled"]);
+
+function releaseStatusMeta(status: string): { label: string; tone: BadgeTone; spin?: boolean } {
+  return RELEASE_STATUS_META[status] ?? { label: status, tone: "neutral" };
+}
+
+/** 取该 repair 最新放行请求（按 updatedAt 降序，tiebreak createdAt）。 */
+function latestReleaseRequest(reqs?: ReleaseRequestRow[]): ReleaseRequestRow | null {
+  if (!reqs || reqs.length === 0) return null;
+  return reqs.reduce((best, r) => {
+    if (!best) return r;
+    const a = `${r.updatedAt}#${r.createdAt}`;
+    const b = `${best.updatedAt}#${best.createdAt}`;
+    return a > b ? r : best;
+  }, null as ReleaseRequestRow | null);
+}
+
+// —— detail 防御式解析（detail 是 redact 后的 Record<string,unknown>，字段全部可缺）——
+function asStr(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function asStrArr(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+function asObj(v: unknown): Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {};
+}
+
+interface PlanView {
+  sha?: string;
+  baseSha?: string;
+  changedFiles: string[];
+  changedFilesTotal: number;
+  surfaces: string[];
+  deployArgs: string[];
+  manual: { path: string; reason: string }[];
+  verifyLayers: string[];
+  verificationLayers: { name: string; ok: boolean }[];
+  deployPlanHash?: string;
+  manifestHash?: string;
+  /** 结构化完整（sha + deployPlanHash + manifestHash 齐备，对齐后端 §6.1 放行前置校验）。 */
+  complete: boolean;
+}
+
+/**
+ * 归一化 pending_release 事件 detail（契约 §11）为可展示 PlanView。
+ * changedFiles 权威形状为分类器输出的 `{paths,total}`（契约 §7）；同时兼容
+ * `string[]`（配 changedFilesTotal）与 `{files,total}` 两种历史形态。
+ * 任一字段缺失均优雅降级（空数组 / undefined），绝不抛错。
+ */
+function normalizePlan(raw: Record<string, unknown> | null | undefined): PlanView {
+  const d = raw ?? {};
+  const sha = asStr(d.sha);
+  const baseSha = asStr(d.baseSha);
+  let changedFiles: string[];
+  let changedFilesTotal: number;
+  if (Array.isArray(d.changedFiles)) {
+    changedFiles = asStrArr(d.changedFiles);
+    changedFilesTotal =
+      typeof d.changedFilesTotal === "number" ? d.changedFilesTotal : changedFiles.length;
+  } else {
+    const cf = asObj(d.changedFiles);
+    changedFiles = asStrArr(cf.paths ?? cf.files);
+    changedFilesTotal = typeof cf.total === "number" ? cf.total : changedFiles.length;
+  }
+  const cls = asObj(d.classification);
+  const manual = (Array.isArray(cls.manual) ? cls.manual : [])
+    .map((m) => {
+      const o = asObj(m);
+      const path = asStr(o.path);
+      return path ? { path, reason: asStr(o.reason) ?? "unspecified" } : null;
+    })
+    .filter((x): x is { path: string; reason: string } => x !== null);
+  const verificationLayers = (Array.isArray(asObj(d.verification).layers)
+    ? (asObj(d.verification).layers as unknown[])
+    : []
+  )
+    .map((l) => {
+      const o = asObj(l);
+      const name = asStr(o.name);
+      return name ? { name, ok: o.ok === true } : null;
+    })
+    .filter((x): x is { name: string; ok: boolean } => x !== null);
+  const deployPlanHash = asStr(d.deployPlanHash);
+  const manifestHash = asStr(d.manifestHash);
+  return {
+    sha,
+    baseSha,
+    changedFiles,
+    changedFilesTotal,
+    surfaces: asStrArr(cls.surfaces),
+    deployArgs: asStrArr(cls.deployArgs),
+    manual,
+    verifyLayers: asStrArr(cls.verifyLayers),
+    verificationLayers,
+    deployPlanHash,
+    manifestHash,
+    complete: !!sha && !!deployPlanHash && !!manifestHash,
+  };
+}
+
+const CHANGED_FILES_SHOWN = 12;
+
+/**
+ * 待放行卡（RFC §6「human gate 是真信任锚」）—— 不允许盲点一键：
+ * 展示 base→sha 短值、改动文件（截断+总数）、分类结果（surfaces/deployArgs/manual 高亮）、
+ * 验证层结果、deployPlanHash 短值；manual 非空时按钮旁显著警示。
+ * 放行为 202 异步：显示最新 release request 的状态流（沿用详情 15s 轮询驱动更新）。
+ */
+function PendingReleaseCard({
+  repair,
+  planDetail,
+  fuse,
+  releasing,
+  onRelease,
+}: {
+  repair: RepairRow;
+  planDetail: Record<string, unknown> | null | undefined;
+  fuse: ReleaseFuseResp | null;
+  releasing: boolean;
+  onRelease: (repairId: string, manualCount: number) => void;
+}) {
+  const plan = normalizePlan(planDetail);
+  const rr = latestReleaseRequest(repair.releaseRequests);
+  const fuseEngaged = !!fuse?.engaged;
+  const inflight = rr ? RELEASE_INFLIGHT.has(rr.status) : false;
+  const terminalNoRetry = rr?.status === "deployed" || rr?.status === "deploy_unknown";
+  const isRetry = !!rr && RELEASE_RETRIABLE.has(rr.status);
+  const buttonDisabled = releasing || fuseEngaged || inflight || terminalNoRetry;
+  const buttonLabel = releasing ? "放行中…" : isRetry ? "重新放行" : "一键放行";
+
+  let header: string;
+  if (inflight) header = "部署放行进行中";
+  else if (rr?.status === "deployed") header = "代码已部署，等待探测确认恢复";
+  else if (rr?.status === "deploy_unknown") header = "部署结果未知，等待人工裁决";
+  else if (isRetry) header = "上次放行未成功，可重新放行";
+  else header = "修复已就绪，待放行部署";
+
+  return (
+    <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-[13px] font-semibold text-warning">
+            <Rocket size={14} />
+            {header}
+          </div>
+          <div className="mt-1.5 text-[13px] text-fg">
+            codex 修复已通过验证（第 {repair.attempt} 次尝试）。核对下方改动与分类后再放行 —— 放行即通知执行侧合并并部署该 SHA（全链审计留痕）。
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => onRelease(repair.id, plan.manual.length)}
+            disabled={buttonDisabled}
+          >
+            {buttonLabel}
+          </Button>
+          {plan.manual.length > 0 && !buttonDisabled && (
+            <span className="text-right text-[11px] font-medium text-danger">
+              含需人工介入的改动，放行将被置为「需人工处理」
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* 全局熔断提示（Modal 覆盖页面顶部 banner，卡片内需自证为何禁用）。 */}
+      {fuseEngaged && (
+        <div className="mt-2 flex items-center gap-1.5 text-[12px] font-medium text-danger">
+          <ShieldX size={13} className="shrink-0" />
+          全局部署熔断已触发，暂不可放行；请先在页面顶部清除熔断。
+        </div>
+      )}
+
+      {/* 放行请求状态流（202 异步；随详情轮询自动更新）。 */}
+      {rr && (
+        <div className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-[12px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-faint">放行请求</span>
+            <span className="flex items-center gap-1.5">
+              {releaseStatusMeta(rr.status).spin && (
+                <RefreshCw size={12} className="animate-spin text-info" />
+              )}
+              <Badge tone={releaseStatusMeta(rr.status).tone}>
+                {releaseStatusMeta(rr.status).label}
+              </Badge>
+            </span>
+          </div>
+          <div className="mt-1 flex items-center justify-between gap-2 text-faint">
+            <span className="font-mono">{short(rr.releaseRequestId, 8)}…</span>
+            <TimeAgo value={rr.updatedAt} />
+          </div>
+          {rr.failureReason && (RELEASE_RETRIABLE.has(rr.status) || rr.status === "deploy_unknown") && (
+            <div className="mt-1.5 rounded border border-danger/30 bg-danger-soft px-2 py-1 text-danger">
+              上次失败原因：{rr.failureReason}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 放行内容清单（human gate）—— 数据源=最新 pending_release 事件 detail。 */}
+      <div className="mt-3 space-y-2 rounded-md border border-warning/30 bg-surface px-3 py-2.5 text-[12px]">
+        {!plan.complete && (
+          <div className="flex items-center gap-1.5 font-medium text-danger">
+            <AlertTriangle size={13} className="shrink-0" />
+            放行信息不完整（后端 detail 缺 sha/plan/manifest 字段），请人工核对后再操作。
+          </div>
+        )}
+
+        <KeyValue
+          label="部署 SHA"
+          value={
+            <span className="font-mono text-[11.5px] text-fg">
+              {short(plan.baseSha)}
+              <span className="mx-1 text-faint">→</span>
+              {short(plan.sha)}
+            </span>
+          }
+        />
+
+        {plan.surfaces.length > 0 && (
+          <KeyValue
+            label="影响面"
+            value={
+              <span className="flex flex-wrap justify-end gap-1">
+                {plan.surfaces.map((s) => (
+                  <Badge key={s} tone="accent">
+                    {s}
+                  </Badge>
+                ))}
+              </span>
+            }
+          />
+        )}
+
+        <KeyValue
+          label="部署参数"
+          value={
+            plan.deployArgs.length > 0 ? (
+              <span className="font-mono text-[11.5px] text-fg">{plan.deployArgs.join(" ")}</span>
+            ) : (
+              <span className="text-faint">（无附加参数）</span>
+            )
+          }
+        />
+
+        {plan.deployPlanHash && (
+          <KeyValue
+            label="deployPlanHash"
+            value={<span className="font-mono text-[11.5px] text-muted">{short(plan.deployPlanHash)}…</span>}
+          />
+        )}
+
+        {/* manual 路径高亮警示（无法安全自动部署）。 */}
+        {plan.manual.length > 0 && (
+          <div className="rounded border border-danger/40 bg-danger-soft px-2 py-1.5 text-danger">
+            <div className="flex items-center gap-1.5 font-semibold">
+              <AlertTriangle size={13} className="shrink-0" />
+              以下改动无法安全自动部署（放行将被执行侧置为「需人工处理」）：
+            </div>
+            <ul className="mt-1 space-y-0.5">
+              {plan.manual.map((m) => (
+                <li key={m.path} className="break-all">
+                  <span className="font-mono">{m.path}</span>
+                  <span className="text-danger/80"> — {m.reason}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* 验证层结果（verifier 逐层通过/失败）。 */}
+        {plan.verificationLayers.length > 0 && (
+          <div>
+            <div className="text-faint">验证层结果</div>
+            <ul className="mt-0.5 space-y-0.5">
+              {plan.verificationLayers.map((l) => (
+                <li key={l.name} className="flex items-center gap-1.5">
+                  {l.ok ? (
+                    <Check size={12} className="shrink-0 text-success" />
+                  ) : (
+                    <X size={12} className="shrink-0 text-danger" />
+                  )}
+                  <span className={l.ok ? "text-muted" : "font-medium text-danger"}>{l.name}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {plan.verifyLayers.length > 0 && (
+          <KeyValue
+            label="部署校验层"
+            value={<span className="font-mono text-[11.5px] text-muted">{plan.verifyLayers.join(", ")}</span>}
+          />
+        )}
+
+        {/* 改动文件（截断列表 + 总数）。 */}
+        {plan.changedFilesTotal > 0 && (
+          <div>
+            <div className="flex items-center gap-1.5 text-faint">
+              <FileText size={12} className="shrink-0" />
+              改动文件（{plan.changedFilesTotal}）
+            </div>
+            <ul className="mt-0.5 space-y-0.5 font-mono text-[11.5px] text-muted">
+              {plan.changedFiles.slice(0, CHANGED_FILES_SHOWN).map((f) => (
+                <li key={f} className="break-all">
+                  {f}
+                </li>
+              ))}
+            </ul>
+            {plan.changedFilesTotal > plan.changedFiles.slice(0, CHANGED_FILES_SHOWN).length && (
+              <div className="mt-0.5 text-faint">
+                …共 {plan.changedFilesTotal} 个文件（仅显示前 {CHANGED_FILES_SHOWN} 个）
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /**
  * 事故详情弹窗体 —— 经 key 按 incidentId 挂载，自拉 detail（15s 轮询以跟进进行中 repair）。
  * 顶部「正在修复」卡（活跃 repair 的最新进度）；随后 incident 全字段 + repairs + 事件时间线。
  * retry/cancel 属切片②，置灰留 TODO。
  */
-function IncidentDetailBody({ id }: { id: string }) {
+function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | null }) {
   const toast = useToast();
   const [confirm, confirmEl] = useConfirm();
   const [releasing, setReleasing] = useState(false);
@@ -119,30 +474,44 @@ function IncidentDetailBody({ id }: { id: string }) {
     () => (data?.repairs ?? []).find((r) => ACTIVE_REPAIR_STATUSES.has(r.status)) ?? null,
     [data],
   );
-  // 待放行 repair(设计 §B):status='running' 且时间线里有 message 含 'pending_release'
-  // 的 progress 事件 = 修复已过验证、部署停待 boss 放行(Tier2 部署门)。
+  // 待放行 repair(RFC §6):status='running' 且时间线里有 detail.phase==='pending_release'
+  // 的事件 = 修复已过验证、部署停待 boss 放行(Tier2 部署门)。判定统一到结构化 detail,
+  // 废除旧 message 文本匹配(deploy_failed/manual_required 后 repair 仍停留 running)。
   const pendingReleaseRepair = useMemo(
     () =>
       (data?.repairs ?? []).find(
         (r) =>
           r.status === "running" &&
           sortedEvents.some(
-            (e) =>
-              e.repair_id === r.id &&
-              e.kind === "progress" &&
-              (e.message ?? "").includes("pending_release"),
+            (e) => e.repair_id === r.id && e.detail?.phase === PENDING_RELEASE_PHASE,
           ),
       ) ?? null,
     [data, sortedEvents],
   );
+  // 该 repair 最新 pending_release 事件的 detail —— 待放行卡富化的唯一数据源(契约 §11)。
+  const pendingReleaseDetail = useMemo(() => {
+    if (!pendingReleaseRepair) return undefined;
+    let latest: RepairEventRow | null = null;
+    for (const e of sortedEvents) {
+      if (e.repair_id !== pendingReleaseRepair.id) continue;
+      if (e.detail?.phase !== PENDING_RELEASE_PHASE) continue;
+      if (!latest || e.created_at > latest.created_at) latest = e;
+    }
+    return latest?.detail ?? undefined;
+  }, [pendingReleaseRepair, sortedEvents]);
 
-  const onRelease = async (repairId: string) => {
+  const onRelease = async (repairId: string, manualCount: number) => {
     const ok = await confirm({
       title: "放行部署？",
       body: (
         <span className="text-[13px] text-muted">
-          codex 修复已通过验证，部署正等待人工放行。确认后将通知执行侧合并并部署该修复
-          （全链审计留痕）。仅在核对过修复内容后操作。
+          codex 修复已通过验证，部署正等待人工放行。确认后将向执行侧提交放行请求，由其异步合并并部署该
+          SHA（全链审计留痕）—— 部署结果与事故是否恢复稍后在卡片内跟踪。仅在核对过改动内容与分类后操作。
+          {manualCount > 0 && (
+            <strong className="mt-1.5 block text-danger">
+              注意：本次含 {manualCount} 项无法安全自动部署的改动，放行后将被执行侧置为「需人工处理」。
+            </strong>
+          )}
         </span>
       ),
       confirmText: "确认放行",
@@ -151,10 +520,18 @@ function IncidentDetailBody({ id }: { id: string }) {
     if (!ok) return;
     setReleasing(true);
     try {
-      await adminSend("POST", `/selfheal/repairs/${encodeURIComponent(repairId)}/release`);
-      // BLOCKER1:200 = 个人版已同步确认部署完成(deployed),文案如实;失败(含个人版
-      // 部署被拒/失败)走 catch,reason 由后端 RELEASE_FAILED message 透传。
-      toast("已放行，个人版已确认部署完成", "success");
+      // 202 异步:放行请求已入队,执行侧异步合并+部署;不再当"已部署"。真实状态经
+      // repair.releaseRequests 状态流展示(详情 15s 轮询驱动)。deployed ≠ resolved。
+      const ack = await adminSend<ReleaseRequestAck | undefined>(
+        "POST",
+        `/selfheal/repairs/${encodeURIComponent(repairId)}/release`,
+      );
+      toast(
+        ack?.releaseRequestId
+          ? `已提交放行请求（${short(ack.releaseRequestId, 8)}…），执行侧将异步合并并部署，可在卡片内跟踪状态`
+          : "已提交放行请求，执行侧将异步合并并部署，可在卡片内跟踪状态",
+        "success",
+      );
       refresh();
     } catch (e) {
       toast(apiErrorMessage(e, "放行失败"), "error");
@@ -180,30 +557,16 @@ function IncidentDetailBody({ id }: { id: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* 待放行卡（修复已过验证，部署停待人工放行 —— 一键放行经 useConfirm 二次确认）。 */}
+      {/* 待放行卡（RFC §6 human gate：base→sha / 改动文件 / 分类 / 验证层 / manual 警示，
+          放行 202 异步 + 状态流；全局熔断禁用放行）。 */}
       {pendingReleaseRepair && (
-        <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 text-[13px] font-semibold text-warning">
-                <Rocket size={14} />
-                修复已就绪，待放行部署
-              </div>
-              <div className="mt-1.5 text-[13px] text-fg">
-                codex 修复已通过验证（第 {pendingReleaseRepair.attempt} 次尝试），部署等待人工放行。
-              </div>
-            </div>
-            <Button
-              variant="primary"
-              size="sm"
-              className="shrink-0"
-              onClick={() => void onRelease(pendingReleaseRepair.id)}
-              disabled={releasing}
-            >
-              {releasing ? "放行中…" : "一键放行"}
-            </Button>
-          </div>
-        </div>
+        <PendingReleaseCard
+          repair={pendingReleaseRepair}
+          planDetail={pendingReleaseDetail}
+          fuse={fuse}
+          releasing={releasing}
+          onRelease={(repairId, manualCount) => void onRelease(repairId, manualCount)}
+        />
       )}
 
       {/* 正在修复卡（活跃 repair 的最新进度；待放行时上卡已覆盖，不重复）。 */}
@@ -356,12 +719,14 @@ export default function SelfhealPage() {
   const meta = getAdminPage("selfheal");
   const toast = useToast();
   const [confirm, confirmEl] = useConfirm();
+  const [promptReason, promptReasonEl] = usePrompt();
 
   const [status, setStatus] = useState<"" | IncidentStatus>("");
   const [limit, setLimit] = useState(PAGE);
   const [selected, setSelected] = useState<IncidentRow | null>(null);
   const [resolving, setResolving] = useState(false);
   const [unsuppressing, setUnsuppressing] = useState<string | null>(null);
+  const [clearingFuse, setClearingFuse] = useState(false);
 
   const { data, error, loading, refresh } = useAdminPoll<IncidentListResp>(
     () => adminGet("/selfheal/incidents", { status, limit }),
@@ -384,17 +749,23 @@ export default function SelfhealPage() {
       intervalMs: POLL_MS,
     });
 
+  // 全局 Tier2 部署熔断（契约 §6.3）。engaged → 顶部红色 banner + 全站放行禁用。
+  const { data: fuseData, refresh: refreshFuse } = useAdminPoll<ReleaseFuseResp>(
+    () => adminGet("/selfheal/release-fuse"),
+    { intervalMs: POLL_MS },
+  );
+
   const incidents = data?.incidents ?? [];
   const canLoadMore = !!data?.nextBeforeId && limit < MAX_LIMIT;
   const suppressedRows = suppressedData?.items ?? [];
   const noticeRows = noticeData?.proposals ?? [];
 
   // 列表刷新后同步弹窗选中行的状态（如已被后台标记 resolved，footer 的 resolve 钮随之禁用）。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 有意只在列表数据 data 到达时同步一次;依赖 selected/incidents 会在 setSelected 后自触发循环。
   useEffect(() => {
     if (!selected) return;
     const fresh = incidents.find((i) => i.id === selected.id);
     if (fresh && fresh.status !== selected.status) setSelected(fresh);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
   const onResolve = async (row: IncidentRow) => {
@@ -449,6 +820,34 @@ export default function SelfhealPage() {
       toast(apiErrorMessage(e, "操作失败"), "error");
     } finally {
       setUnsuppressing(null);
+    }
+  };
+
+  // 清除全局部署熔断（RFC §6 双侧收敛）：二次确认 + 必填 reason（写审计），
+  // 清除后 v5 恢复接受放行、个人版本地阻断解除。usePrompt 强制非空 reason。
+  const onClearFuse = async () => {
+    const reason = await promptReason({
+      title: "清除 Tier2 部署熔断？",
+      body: (
+        <span className="text-[13px] text-muted">
+          熔断通常由 deploy_unknown（部署结果未知）触发。清除前请人工核对线上 /version、deploy_state
+          与远端 candidate ref，确认没有遗留部署仍在后台推进。填写清除原因（写入审计留痕）。
+        </span>
+      ),
+      placeholder: "清除原因（如：已人工核对 xxx 恢复稳定，无遗留部署）",
+      confirmText: "确认清除",
+      maxLength: 200,
+    });
+    if (!reason) return;
+    setClearingFuse(true);
+    try {
+      await adminSend("POST", "/selfheal/release-fuse/clear", { reason });
+      toast("已清除部署熔断，Tier2 放行恢复可用", "success");
+      refreshFuse();
+    } catch (e) {
+      toast(apiErrorMessage(e, "清除熔断失败"), "error");
+    } finally {
+      setClearingFuse(false);
     }
   };
 
@@ -567,6 +966,38 @@ export default function SelfhealPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader title={meta.title} desc={meta.desc} />
+
+      {/* 全局 Tier2 部署熔断 banner（deploy_unknown 触发）—— 触发期间所有一键放行禁用。 */}
+      {fuseData?.engaged && (
+        <div className="flex items-start gap-3 rounded-lg border border-danger/50 bg-danger-soft px-4 py-3">
+          <ShieldX size={18} className="mt-0.5 shrink-0 text-danger" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-semibold text-danger">
+              Tier2 部署熔断已触发 —— 所有一键放行已禁用
+            </div>
+            <div className="mt-1 text-[13px] text-fg break-words">
+              原因：{fuseData.reason || "未提供"}
+              {fuseData.releaseRequestId && (
+                <span className="text-muted">（关联请求 {short(fuseData.releaseRequestId, 8)}…）</span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[12px] text-muted">
+              触发时间：
+              {fuseData.engagedAt ? <TimeAgo value={fuseData.engagedAt} /> : "—"}
+              {fuseData.engagedBy && <> · {fuseData.engagedBy}</>}
+            </div>
+          </div>
+          <Button
+            variant="danger"
+            size="sm"
+            className="shrink-0"
+            onClick={() => void onClearFuse()}
+            disabled={clearingFuse}
+          >
+            {clearingFuse ? "清除中…" : "清除熔断"}
+          </Button>
+        </div>
+      )}
 
       <div className="flex flex-col gap-3">
         <FilterBar>
@@ -691,10 +1122,13 @@ export default function SelfhealPage() {
           </>
         }
       >
-        {selected && <IncidentDetailBody key={selected.id} id={selected.id} />}
+        {selected && (
+          <IncidentDetailBody key={selected.id} id={selected.id} fuse={fuseData ?? null} />
+        )}
       </Modal>
 
       {confirmEl}
+      {promptReasonEl}
     </div>
   );
 }
