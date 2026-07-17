@@ -1843,33 +1843,83 @@ export function _messageContentEqualForSeq(a: MessageLike, b: MessageLike): bool
  * Pure: doesn't mutate inputs; returns a new messages array whose elements
  * may share references with `finalMsgs` only when no `_seq` change was needed
  * (kept references reduce GC pressure; not relied on for correctness).
+ *
+ * Legacy 收紧(见 Step 1):整数组「按位从 1 重编」只在真 legacy(所有旧行都缺
+ * 合法 _seq 且 currentNextSeq <= 1)发生;其余情形已有合法 _seq 的行绝不重编,缺号
+ * 行只向后补新号,避免并发窗口把热行 _seq 重排(seq 序脱离 ts 序/数组序)。
+ *
+ * `onWarn`(可选,默认无副作用,不改既有 3 参调用方):当旧行间发现重复合法 _seq 时,
+ * **不静默重排**——保留第一条、其余换新号,并通过该回调上报一条诊断信息。本文件无既有
+ * logger,故以可选回调作为最小侵入的 warn 通道,保持函数纯性。
  */
 export function normalizeAndAssignSeqs<T extends MessageLike>(
   oldMsgs: readonly T[],
   finalMsgs: readonly T[],
   currentNextSeq: number,
+  onWarn?: (message: string) => void,
 ): { messages: T[]; nextSeq: number; maxSeq: number } {
-  // Step 1: legacy backfill on oldMsgs side.
-  // If ANY old message lacks `_seq`, reassign the entire oldMsgs row in
-  // current array order starting from 1; this makes the row "post-migration"
-  // for the rest of this normalization. We deliberately ignore
-  // `currentNextSeq` here because legacy rows have `next_seq = 1` (default
-  // from the migration), which is meaningless until backfill happens.
+  // 合法 _seq:正安全整数(正、整、在 Number 安全范围内)。
+  // 比旧判据(`typeof === 'number' && isFinite`)更严:0 / 负数 / 小数 / 超安全范围
+  // 都视为「缺失」,由补号路径重新分配,以真正兑现「每行 _seq 正整数」不变量。
+  const isValidSeq = (s: unknown): s is number =>
+    typeof s === 'number' && Number.isSafeInteger(s) && s > 0
+
+  // Step 1: 归一化 oldMsgs 侧的 _seq,并确定本行的 nextSeq 起点。
+  //
+  // 分支收紧(tail-flood 事故根治):旧实现「任一旧行缺合法 _seq → 整数组按位从 1
+  // 重编」,在并发窗口会把已分配的热行 _seq 全部重排,造成 seq 序 ≠ ts 序 ≠ 数组序。
+  // _seq 语义是「server-visible content version」游标(内容变化才换号),不是时间序,
+  // 因此**已持有合法 _seq 的行绝不重编**。整数组按位重编只保留给「真 legacy」:
+  //   全部旧行都缺合法 _seq  且  currentNextSeq <= 1(游标从未推进 = 迁移默认值)。
+  // 其余情形(部分行有 seq / 游标已推进 / 存在重复 seq)一律走「保留 + 补号」路径:
+  //   已有合法且未重复的 seq 原样保留;缺号 / 重复号的行从 max(currentNextSeq,
+  //   maxValidSeq+1) 起顺序补新号(严格大于任何既有合法 seq,不覆盖、不回绕)。
   let oldNormalized: Array<T & { _seq: number }>
   let nextSeq: number
-  const anyOldMissingSeq = oldMsgs.some(
-    (m) => !m || typeof (m as MessageLike)._seq !== 'number' || !Number.isFinite((m as MessageLike)._seq as number),
-  )
-  if (anyOldMissingSeq) {
+
+  let maxValidSeq = 0
+  let anyValidSeq = false
+  for (const mm of oldMsgs) {
+    const s = mm ? (mm as MessageLike)._seq : undefined
+    if (isValidSeq(s)) {
+      anyValidSeq = true
+      if (s > maxValidSeq) maxValidSeq = s
+    }
+  }
+  const allOldMissingSeq = !anyValidSeq
+  const isTrueLegacy = allOldMissingSeq && currentNextSeq <= 1
+
+  if (isTrueLegacy) {
+    // 真 legacy:整行从未有过合法 _seq 且游标停在迁移默认值 → 按当前数组序从 1 重编。
+    // 这里刻意忽略 currentNextSeq(=1,尚无意义)。
     oldNormalized = oldMsgs.map((m, idx) => ({ ...(m as object), _seq: idx + 1 } as T & { _seq: number }))
     nextSeq = oldMsgs.length + 1
   } else {
-    oldNormalized = oldMsgs as Array<T & { _seq: number }>
-    // Defensive: even when oldMsgs all have _seq, the persisted next_seq column
-    // may have drifted (e.g., a botched manual SQL edit). Force monotonic.
-    let maxOldSeq = 0
-    for (const m of oldNormalized) if (m._seq > maxOldSeq) maxOldSeq = m._seq
-    nextSeq = Math.max(currentNextSeq, maxOldSeq + 1)
+    // 保留 + 补号:补号游标从 max(currentNextSeq, maxValidSeq+1) 起,保证严格单调、
+    // 不与任何既有合法 seq 相撞(合法 seq 均 <= maxValidSeq < alloc)。此路径同时兼容
+    // 旧「else」分支的 next_seq 漂移防御(全员有 seq 但持久化 next_seq 落后时强制单调)。
+    let alloc = Math.max(currentNextSeq, maxValidSeq + 1)
+    const seenSeqs = new Set<number>()
+    oldNormalized = oldMsgs.map((m) => {
+      const s = m ? (m as MessageLike)._seq : undefined
+      if (isValidSeq(s) && !seenSeqs.has(s)) {
+        // 已有合法且首次出现的 seq:绝不重编,原样继承(可复用引用,减少 GC)。
+        seenSeqs.add(s)
+        return m as T & { _seq: number }
+      }
+      // 缺号,或与前面某行 seq 重复 → 分配新号(严格大于所有既有合法 seq)。
+      if (isValidSeq(s)) {
+        // 重复:不静默重排——保留第一条、其余换新号,并通过 onWarn 上报(默认无副作用,
+        // 保持纯性;既有 3 参调用方不受影响)。
+        onWarn?.(
+          `normalizeAndAssignSeqs: duplicate _seq ${s} in oldMsgs; keeping first occurrence, reassigning duplicate row to ${alloc}`,
+        )
+      }
+      const assigned = alloc++
+      seenSeqs.add(assigned)
+      return { ...(m as object), _seq: assigned } as T & { _seq: number }
+    })
+    nextSeq = alloc
   }
   // Build oldById map AFTER normalization so inherited values are post-backfill.
   const oldById = new Map<string, T & { _seq: number }>()
