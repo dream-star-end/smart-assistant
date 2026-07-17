@@ -202,6 +202,22 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(isKnowledgePlanetLoginProbeDue(999_999, 3_000, 48), false)
   })
 
+  test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /async function writeAuthenticatedAndExit\(storageState\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+    )
+    const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
+    const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
+    assert.ok(loginStart >= 0 && entrypointStart > loginStart)
+    const loginSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(loginStart, entrypointStart)
+    assert.match(
+      loginSource,
+      /const state = filteredState\([\s\S]*await writeAuthenticatedAndExit\(state\)/,
+    )
+    assert.doesNotMatch(loginSource, /writeFrame\(\{ event: 'authenticated'/)
+  })
+
   test('waits for the real QR image and never publishes the iframe loading mask', () => {
     assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 45_000)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION, 0.15)
