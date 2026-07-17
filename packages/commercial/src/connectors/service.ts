@@ -166,6 +166,20 @@ export function buildWriteSummary(
         2000,
       )
     }
+    case 'knowledge-planet/create_topic': {
+      const text = String(params.text ?? '')
+      return ellipsize(
+        `用知识星球${hint}在星球 ${String(params.groupId ?? '')} 发布主题：「${ellipsize(text, 300)}」`,
+        2000,
+      )
+    }
+    case 'knowledge-planet/create_comment': {
+      const text = String(params.text ?? '')
+      return ellipsize(
+        `用知识星球${hint}在主题 ${String(params.topicId ?? '')} 发布评论：「${ellipsize(text, 300)}」`,
+        2000,
+      )
+    }
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -222,6 +236,18 @@ export function buildWriteDetail(
         receiveId: String(params.receiveId ?? ''),
         receiveIdType: String(params.receiveIdType ?? ''),
         text: String(params.text ?? ''), // 全文
+      }
+    case 'knowledge-planet/create_topic':
+      return {
+        kind: 'knowledge_planet_topic',
+        groupId: String(params.groupId ?? ''),
+        text: String(params.text ?? ''),
+      }
+    case 'knowledge-planet/create_comment':
+      return {
+        kind: 'knowledge_planet_comment',
+        topicId: String(params.topicId ?? ''),
+        text: String(params.text ?? ''),
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

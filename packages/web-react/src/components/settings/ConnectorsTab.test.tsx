@@ -23,6 +23,7 @@ import type {
   ConnectorsResponse,
   DeclarativeCatalogEntry,
   DeclarativeManagementConnector,
+  RuntimePluginAccount,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
@@ -55,6 +56,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getKnowledgePlanetSetupQr: vi.fn(),
       cancelKnowledgePlanetSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
+      setPluginWriteAccess: vi.fn(),
     },
   };
 });
@@ -81,6 +83,7 @@ const mockedKnowledgeStatus = vi.mocked(api.getKnowledgePlanetSetup)
 const mockedKnowledgeQr = vi.mocked(api.getKnowledgePlanetSetupQr)
 const mockedKnowledgeCancel = vi.mocked(api.cancelKnowledgePlanetSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
+const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
 
 afterEach(cleanup);
 beforeEach(() => {
@@ -243,16 +246,35 @@ function knowledgePlanetPlugin() {
     slug: 'knowledge-planet',
     pluginType: 'managed-browser' as const,
     label: '知识星球',
-    description: '安全读取已授权知识星球的主题与评论',
+    description: '读取已授权知识星球，并可在用户确认后发布主题或评论',
     accountMode: 'required' as const,
-    actions: [{ id: 'list_groups', description: '列出星球', readOnly: true as const }],
+    actions: [
+      { id: 'list_groups', description: '列出星球', readOnly: true as const },
+      { id: 'create_topic', description: '发布主题', readOnly: false as const },
+      { id: 'create_comment', description: '发布评论', readOnly: false as const },
+    ],
     installed: true,
-    installedVersion: '1.0.0',
+    installedVersion: '1.2.0',
     latestVersionId: '101',
-    latestVersion: '1.0.0',
+    latestVersion: '1.2.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
+  }
+}
+
+function knowledgePlanetWriteControl(
+  overrides: Partial<NonNullable<RuntimePluginAccount['writeControl']>> = {},
+): NonNullable<RuntimePluginAccount['writeControl']> {
+  return {
+    available: true,
+    enabled: false,
+    disclaimerVersion: 1,
+    acceptedVersion: null,
+    acceptedAt: null,
+    disclaimerText:
+      '写入会以你的真实身份发布到知识星球。请确认内容合法、准确且不侵犯他人权益；结果不明确时不要重复提交。',
+    ...overrides,
   }
 }
 
@@ -847,7 +869,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
           ...knowledgePlanetPlugin(),
           installedVersion: '1.0.0',
           latestVersionId: '202',
-          latestVersion: '1.1.0',
+          latestVersion: '1.2.0',
           installedCurrent: false,
           updateAvailable: true,
         },
@@ -858,7 +880,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       ok: true,
       slug: 'knowledge-planet',
       kind: 'connector',
-      version: '1.1.0',
+      version: '1.2.0',
       note: 'updated',
       installedDeps: 0,
       installedCapabilities: [],
@@ -870,7 +892,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     await screen.findByText('知识星球')
     const card = providerCard('知识星球')
-    expect(within(card).getByText('可更新 v1.1.0')).toBeInTheDocument()
+    expect(within(card).getByText('可更新 v1.2.0')).toBeInTheDocument()
     fireEvent.click(within(card).getByRole('button', { name: '更新' }))
 
     await waitFor(() => expect(mockedInstallMarketplace).toHaveBeenCalledWith(auth, '202'))
@@ -883,7 +905,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
         {
           ...knowledgePlanetPlugin(),
           latestVersionId: '202',
-          latestVersion: '1.1.0',
+          latestVersion: '1.2.0',
           installedCurrent: false,
           updateAvailable: true,
         },
@@ -899,6 +921,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
           actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
           versionId: '101',
           executable: false,
+          writeControl: knowledgePlanetWriteControl(),
         },
       ],
     })
@@ -926,6 +949,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
           actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
           versionId: '101',
           executable: false,
+          writeControl: knowledgePlanetWriteControl(),
         },
       ],
     })
@@ -1052,10 +1076,10 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     const successDialog = screen.getByRole('dialog')
     expect(
-      await within(successDialog).findByText(/授权成功，知识星球已自动启用/),
+      await within(successDialog).findByText(/授权成功，Agent 现在可以直接读取知识星球内容/),
     ).toBeInTheDocument()
     expect(
-      await within(successDialog).findByText(/Agent 现在可以直接读取相关内容/),
+      await within(successDialog).findByText(/写入能力保持关闭/),
     ).toBeInTheDocument()
     await new Promise((resolve) => setTimeout(resolve, 1_300))
     expect(successDialog).toBeInTheDocument()
@@ -1126,6 +1150,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
             actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
             versionId: '101',
             executable: true,
+            writeControl: knowledgePlanetWriteControl(),
           },
         ],
       })
@@ -1149,7 +1174,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
 
-    expect(await screen.findByText(/授权成功，知识星球已自动启用/)).toBeInTheDocument()
+    expect(
+      await screen.findByText(/授权成功，Agent 现在可以直接读取知识星球内容/),
+    ).toBeInTheDocument()
     expect(screen.queryByText(/扫码会话已失效/)).not.toBeInTheDocument()
   })
 
@@ -1168,6 +1195,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
           actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
           versionId: '101',
           executable: true,
+          writeControl: knowledgePlanetWriteControl(),
         },
       ],
     })
@@ -1187,6 +1215,146 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     await waitFor(() => expect(mockedPluginManagement).toHaveBeenCalledTimes(2))
   })
 
+  test('写入默认关闭，必须阅读免责声明并勾选后才能精确开启', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const disabledAccount: RuntimePluginAccount = {
+      id: '905',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '我的知识星球',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl(),
+    }
+    const enabledControl = knowledgePlanetWriteControl({
+      enabled: true,
+      acceptedVersion: 1,
+      acceptedAt: '2026-07-17T01:02:03.000Z',
+    })
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [disabledAccount] })
+      .mockResolvedValue({
+        catalog: [knowledgePlanetPlugin()],
+        accounts: [{ ...disabledAccount, writeControl: enabledControl }],
+      })
+    mockedSetPluginWriteAccess.mockResolvedValue(enabledControl)
+
+    render(<ConnectorsTab auth={auth} />)
+    const writeSwitch = await screen.findByRole('switch', {
+      name: '我的知识星球写入能力',
+    })
+    expect(writeSwitch).not.toBeChecked()
+    expect(screen.getByText('写入已关闭')).toBeInTheDocument()
+
+    fireEvent.click(writeSwitch)
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/写入会以你的真实身份发布到知识星球/)).toBeInTheDocument()
+    const enable = within(dialog).getByRole('button', { name: '同意并开启' })
+    expect(enable).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    expect(enable).toBeEnabled()
+    fireEvent.click(enable)
+
+    await waitFor(() =>
+      expect(mockedSetPluginWriteAccess).toHaveBeenCalledWith(auth, '905', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+      }),
+    )
+    expect(await screen.findByText(/知识星球写入能力已开启/)).toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        screen.getByRole('switch', { name: '我的知识星球写入能力' }),
+      ).toBeChecked(),
+    )
+  })
+
+  test('开启写入失败时在免责声明弹层内说明错误且不乐观翻转', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '907',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '失败探针账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl(),
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    mockedSetPluginWriteAccess.mockRejectedValue(
+      new ApiError({ status: 409, code: 'WRITE_DISABLED', message: 'failed' }),
+    )
+
+    render(<ConnectorsTab auth={auth} />)
+    const writeSwitch = await screen.findByRole('switch', {
+      name: '失败探针账号写入能力',
+    })
+    fireEvent.click(writeSwitch)
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并开启' }))
+
+    expect(
+      await within(dialog).findByText(
+        '写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启',
+      ),
+    ).toBeInTheDocument()
+    expect(writeSwitch).not.toBeChecked()
+    expect(dialog).toBeInTheDocument()
+  })
+
+  test('关闭写入无需再次接受条款，失败时不乐观翻转界面', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const enabledControl = knowledgePlanetWriteControl({
+      enabled: true,
+      acceptedVersion: 1,
+      acceptedAt: '2026-07-17T01:02:03.000Z',
+    })
+    const account: RuntimePluginAccount = {
+      id: '906',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '发布账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: enabledControl,
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    mockedSetPluginWriteAccess.mockRejectedValue(
+      new ApiError({ status: 409, code: 'WRITE_DISABLED', message: 'failed' }),
+    )
+
+    render(<ConnectorsTab auth={auth} />)
+    const writeSwitch = await screen.findByRole('switch', { name: '发布账号写入能力' })
+    expect(writeSwitch).toBeChecked()
+    fireEvent.click(writeSwitch)
+
+    await waitFor(() =>
+      expect(mockedSetPluginWriteAccess).toHaveBeenCalledWith(auth, '906', { enabled: false }),
+    )
+    expect(
+      await screen.findByText('写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: '发布账号写入能力' })).toBeChecked()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
   test('授权成功提示在解绑时立即清除，解绑后无需刷新即可重新发起扫码', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     const account = {
@@ -1199,6 +1367,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       actions: [{ id: 'list_groups', description: '列出星球', readOnly: true as const }],
       versionId: '101',
       executable: true,
+      writeControl: knowledgePlanetWriteControl(),
     }
     mockedPluginManagement
       .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [] })

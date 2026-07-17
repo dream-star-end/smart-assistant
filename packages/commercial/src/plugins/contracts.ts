@@ -74,7 +74,7 @@ export class RuntimePluginContractError extends Error {
 export interface RuntimePluginActionContractV1 {
   id: string
   description: string
-  effect: 'read'
+  effect: 'read' | 'write'
   timeoutSeconds: number
   params: Record<string, unknown>
   result: Record<string, unknown>
@@ -324,8 +324,7 @@ function safeSchema(value: unknown, label: string, depth = 0): Record<string, un
     if (!match) invalid(`${label}.pattern is not an allowed bounded ASCII pattern`)
     const minimum = Number(match[1])
     const maximum = Number(match[2])
-    if (minimum > maximum || maximum > 4096)
-      invalid(`${label}.pattern repetition is invalid`)
+    if (minimum > maximum || maximum > 4096) invalid(`${label}.pattern repetition is invalid`)
     try {
       new RegExp(schema.pattern)
     } catch {
@@ -441,8 +440,8 @@ export function validateRuntimePluginJson(
 }
 
 function compileActions(raw: unknown): RuntimePluginActionContractV1[] {
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 16)
-    invalid('actions must contain 1-16 items')
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 32)
+    invalid('actions must contain 1-32 items')
   const seen = new Set<string>()
   return raw.map((item, index) => {
     const action = plainObject(item, `actions[${index}]`)
@@ -454,11 +453,12 @@ function compileActions(raw: unknown): RuntimePluginActionContractV1[] {
     const id = boundedString(action.id, 1, 64, `actions[${index}].id`)
     if (!ACTION_RE.test(id) || seen.has(id)) invalid(`actions[${index}].id is invalid or duplicate`)
     seen.add(id)
-    if (action.effect !== 'read') invalid('runtime Plugin actions must be read-only in contract v1')
+    if (action.effect !== 'read' && action.effect !== 'write')
+      invalid('runtime Plugin action effect must be read or write')
     return {
       id,
       description: boundedString(action.description, 1, 512, `actions[${index}].description`),
-      effect: 'read',
+      effect: action.effect,
       timeoutSeconds: boundedInteger(
         action.timeoutSeconds,
         1,

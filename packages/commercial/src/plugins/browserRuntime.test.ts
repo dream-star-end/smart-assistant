@@ -85,6 +85,7 @@ async function fixture(
     close?: ManagedBrowserSession['close']
     removeProfile?: (path: string) => Promise<void>
     removeFails?: boolean
+    networkMethods?: Array<'GET' | 'POST'>
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'oc-browser-runtime-'))
@@ -100,8 +101,9 @@ async function fixture(
       launchedProfile = args.profileDir
       if (opts.launch) return opts.launch(args)
       assert.equal(args.pins[0]!.ip, '93.184.216.34')
+      const method = opts.networkMethods?.includes('POST') ? 'POST' : 'GET'
       assert.equal(
-        args.requestGuard({ url: 'https://example.com/post', method: 'GET' }).ip,
+        args.requestGuard({ url: 'https://example.com/post', method }).ip,
         '93.184.216.34',
       )
       return {
@@ -122,7 +124,10 @@ async function fixture(
     version: '1.0.0',
     launcherId: 'secure-launcher',
     launcherVersion: '1.0.0',
-    maximumNetwork: { origins: ['https://example.com'], methods: ['GET'] },
+    maximumNetwork: {
+      origins: ['https://example.com'],
+      methods: opts.networkMethods ?? ['GET'],
+    },
     execute: opts.execute ?? (async () => ({ ok: true })),
   }
   const runtime = new ManagedBrowserRuntime({
@@ -295,6 +300,61 @@ describe('managed-browser Plugin runtime', () => {
     assert.ok(f.profile)
     const { lstat } = await import('node:fs/promises')
     assert.equal(await lstat(f.profile).catch(() => null), null)
+  })
+
+  test('read-only entry point rejects writes while the internal action runner accepts a signed POST write', async () => {
+    const writeContract: ManagedBrowserPluginContractV1 = {
+      ...contract,
+      actions: [
+        ...contract.actions,
+        {
+          id: 'write',
+          description: 'Write',
+          effect: 'write',
+          timeoutSeconds: 1,
+          params: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { text: { type: 'string', maxLength: 100 } },
+            required: ['text'],
+          },
+          result: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { ok: { type: 'boolean' } },
+            required: ['ok'],
+          },
+        },
+      ],
+      runtime: {
+        ...contract.runtime,
+        network: { ...contract.runtime.network, methods: ['GET', 'POST'] },
+      },
+    }
+    const f = await fixture({ networkMethods: ['GET', 'POST'] })
+    await assert.rejects(
+      f.runtime.runReadAction({
+        contract: writeContract,
+        storageState,
+        actionId: 'write',
+        params: { text: 'hello' },
+        signal: new AbortController().signal,
+      }),
+      (error: unknown) =>
+        error instanceof ManagedBrowserRuntimeError && error.code === 'ACTION_NOT_FOUND',
+    )
+    assert.equal(f.profile, '')
+
+    const output = await f.runtime.runAction({
+      contract: writeContract,
+      storageState,
+      actionId: 'write',
+      params: { text: 'hello' },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(output, { result: { ok: true }, storageState })
+    assert.equal(f.closed, 1)
+    assert.equal(f.terminated, 1)
   })
 
   test('cleanup failure suppresses the business result', async () => {

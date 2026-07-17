@@ -23,6 +23,45 @@ function hasAuthenticatedKnowledgePlanetSession(probeAuthenticated) {
   return probeAuthenticated === true;
 }`
 
+/** Single source for the two exact text-only write routes and byte signatures. */
+export const KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE = String.raw`
+function buildKnowledgePlanetWriteRequest(action, params) {
+  if (action === 'create_topic' && NUMERIC_ID.test(params.groupId) && typeof params.text === 'string' && params.text.length >= 1 && params.text.length <= 10000) return {
+    method: 'POST',
+    path: '/v2/groups/' + params.groupId + '/topics',
+    query: {},
+    resultKind: 'topic',
+    body: JSON.stringify({
+      req_data: {
+        type: 'topic',
+        text: params.text,
+        image_ids: [],
+        file_ids: [],
+        mentioned_user_ids: [],
+      },
+    }),
+  };
+  if (action === 'create_comment' && NUMERIC_ID.test(params.topicId) && typeof params.text === 'string' && params.text.length >= 1 && params.text.length <= 5000) return {
+    method: 'POST',
+    path: '/v2/topics/' + params.topicId + '/comments',
+    query: {},
+    resultKind: 'comment',
+    body: JSON.stringify({
+      req_data: {
+        text: params.text,
+        image_ids: [],
+        mentioned_user_ids: [],
+      },
+    }),
+  };
+  return null;
+}
+
+function knowledgePlanetPostSignature(timestamp, body) {
+  const bodyMd5 = createHash('md5').update(Buffer.from(body, 'utf8')).digest('hex');
+  return createHash('sha1').update(timestamp + bodyMd5).digest('hex');
+}`
+
 export function isKnowledgePlanetQrPixelSampleReady(input: {
   darkFraction: number
   lightFraction: number
@@ -59,6 +98,7 @@ const NUMERIC_ID = /^\d{6,32}$/;
 let terminal = false;
 
 ${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}
+${KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE}
 
 function fail() {
   if (terminal) return;
@@ -522,6 +562,13 @@ function buildAction(action, params) {
     query: topicQuery(params, topicCount),
     project: topicListResult,
   };
+  const write = buildKnowledgePlanetWriteRequest(action, params);
+  if (write) return {
+    ...write,
+    project: write.resultKind === 'topic'
+      ? (data) => ({ topic: projectTopic(objectAt(data, 'topic')) })
+      : (data) => ({ comment: projectComment(objectAt(data, 'comment')) }),
+  };
   throw new Error('action');
 }
 
@@ -566,11 +613,13 @@ function readAduid(state) {
   return randomUUID();
 }
 
-function signedHeaders(url, state) {
+function signedHeaders(url, state, body) {
   const requestId = randomUUID();
   const timestamp = String(Math.floor(Date.now() / 1000));
-  const signature = createHash('sha1').update(url.toString().replace(/'/g, '%27') + ' ' + timestamp + ' ' + requestId).digest('hex');
-  return {
+  const signature = body === undefined
+    ? createHash('sha1').update(url.toString().replace(/'/g, '%27') + ' ' + timestamp + ' ' + requestId).digest('hex')
+    : knowledgePlanetPostSignature(timestamp, body);
+  const headers = {
     accept: 'application/json, text/plain, */*',
     origin: 'https://wx.zsxq.com',
     referer: 'https://wx.zsxq.com/',
@@ -580,6 +629,8 @@ function signedHeaders(url, state) {
     'x-signature': signature,
     'x-aduid': readAduid(state),
   };
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  return headers;
 }
 
 async function boundedJsonResponse(response) {
@@ -599,12 +650,28 @@ async function runAction(input, relay) {
     ignoreHTTPSErrors: false,
   });
   try {
-    const response = await api.get(url.toString(), {
-      failOnStatusCode: false,
-      timeout: 30_000,
-      headers: signedHeaders(url, input.storageState || {}),
-    });
-    const data = await boundedJsonResponse(response);
+    const response = spec.method === 'POST'
+      ? await api.fetch(url.toString(), {
+          method: 'POST',
+          data: Buffer.from(spec.body, 'utf8'),
+          failOnStatusCode: false,
+          timeout: 30_000,
+          headers: signedHeaders(url, input.storageState || {}, spec.body),
+        })
+      : await api.get(url.toString(), {
+          failOnStatusCode: false,
+          timeout: 30_000,
+          headers: signedHeaders(url, input.storageState || {}),
+        });
+    let data;
+    try {
+      data = await boundedJsonResponse(response);
+    } catch {
+      if (response.status() === 401) {
+        await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+      }
+      throw new Error('response');
+    }
     if (!response.ok() || data?.succeeded !== true) {
       await writeTerminalAndExit({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
     }
@@ -869,7 +936,7 @@ try {
   if (!['action', 'login'].includes(input.mode) || typeof input.token !== 'string' || !Array.isArray(input.cookieDomains) || !Array.isArray(input.stateOrigins)) throw new Error('input');
   const remaining = Number(input.deadlineMs) - Date.now();
   if (!Number.isFinite(remaining) || remaining < 1_000 || remaining > 5 * 60_000) throw new Error('deadline');
-  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.1', playwrightMcpVersion });
+  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.2', playwrightMcpVersion });
   const relayHosts = new Set(input.mode === 'action' ? ['api.zsxq.com'] : input.allowedOrigins.map((origin) => new URL(origin).hostname));
   const relay = await startRelay(input.token, relayHosts);
   const timer = setTimeout(() => process.exit(124), remaining + 2_000);

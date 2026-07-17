@@ -185,7 +185,7 @@ export type RuntimePluginCatalogEntry = {
   label: string
   description: string
   accountMode: 'none' | 'required'
-  actions: Array<{ id: string; description: string; readOnly: true }>
+  actions: Array<{ id: string; description: string; readOnly: boolean }>
   installed: boolean
   installedVersion: string
   latestVersionId: string | null
@@ -202,9 +202,17 @@ export type RuntimePluginAccount = {
   displayName: string
   accountHint: string
   status: 'active' | 'error'
-  actions: Array<{ id: string; description: string; readOnly: true }>
+  actions: Array<{ id: string; description: string; readOnly: boolean }>
   versionId: string
   executable: boolean
+  writeControl: {
+    available: boolean
+    enabled: boolean
+    disclaimerVersion: number
+    acceptedVersion: number | null
+    acceptedAt: string | null
+    disclaimerText: string
+  } | null
 }
 
 export type PluginManagementResponse = {
@@ -370,6 +378,7 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   PLUGIN_SETUP_FAILED: 'Plugin 授权未完成，请重新扫码',
   LEASE_BUSY: '账号正在执行任务，请稍后再解绑',
   LEASE_UNAVAILABLE: '账号安全锁暂不可用，请稍后重试',
+  WRITE_DISABLED: '写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启',
   TARGET_NOT_FOUND: 'Plugin 账号不存在或已解绑',
   TARGET_STALE: 'Plugin 账号状态已变化，请刷新后重试',
   INTERNAL: '服务暂时不可用，请稍后重试',
