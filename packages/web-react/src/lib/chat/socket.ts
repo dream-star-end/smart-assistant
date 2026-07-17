@@ -116,6 +116,8 @@ export type ChatSocketDeps = {
   onAuthExpired: (expectedEpoch: number) => void;
   /** 商业版余额刷新（cost_charged / 4506 / insufficient_credits）。*/
   refreshBalance?: () => void;
+  /** 自动免单回执已落站内信后，立即刷新未读角标。 */
+  refreshInbox?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportClientError?: (p: { type: string; code: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
@@ -1219,6 +1221,7 @@ export class ChatSocket {
         const sess =
           (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ?? this.costTargetSession();
         applyCostWaived(sess, frame, this.effects());
+        this.deps.refreshInbox?.();
         return;
       }
       case "sys.cold_start": {

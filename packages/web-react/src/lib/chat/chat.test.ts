@@ -1765,31 +1765,78 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
 });
 
 describe("applyCostWaived (turn 免单退款)", () => {
-  test("命中最近一条已扣费助手消息 → 减额 + waived 标记 + 刷余额", () => {
+  test("迟到的 A 轮免单只修改精确 turnKey，不碰更新的 B 轮或无归属 pending", () => {
     const s = sess();
-    const a = addMessage(s, "assistant", "半截", { ts: 1, usage: { costCredits: "11" } });
-    const refreshBalance = vi.fn();
-    applyCostWaived(s, { type: "outbound.cost_waived", sessionId: "x", refundedCredits: "11", balanceAfter: "100" }, { refreshBalance });
-    expect(a.usage?.costCredits).toBe("0");
-    expect(a.usage?.waived).toBe(true);
-    expect(refreshBalance).toHaveBeenCalledTimes(1);
-  });
-  test("退款先抵扣 _pendingCostCredits,余量再落消息", () => {
-    const s = sess();
-    const a = addMessage(s, "assistant", "半截", { ts: 1, usage: { costCredits: "5" } });
+    const a = addMessage(s, "assistant", "A", {
+      ts: 1,
+      _turnKey: "a".repeat(64),
+      usage: { costCredits: "11" },
+    });
+    const b = addMessage(s, "assistant", "B", {
+      ts: 2,
+      _turnKey: "b".repeat(64),
+      usage: { costCredits: "7" },
+    });
     s._pendingCostCredits = "6";
-    applyCostWaived(s, { type: "outbound.cost_waived", refundedCredits: "11" }, {});
-    expect(s._pendingCostCredits).toBe("0");
-    expect(a.usage?.costCredits).toBe("0");
+    const refreshBalance = vi.fn();
+    applyCostWaived(s, {
+      type: "outbound.cost_waived",
+      sessionId: "x",
+      turnKey: "a".repeat(64),
+      refundedCredits: "11",
+      balanceAfter: "100",
+    }, { refreshBalance });
+    expect(a.usage?.costCredits).toBe("11");
+    expect(a.usage?.waived).toBe(true);
+    expect(b.usage).toEqual({ costCredits: "7" });
+    expect(s._pendingCostCredits).toBe("6");
+    expect(refreshBalance).toHaveBeenCalledTimes(1);
+  });
+  test("零额退款仍给精确轮标 waived（无扣费轮也有站内信回执）", () => {
+    const s = sess();
+    const a = addMessage(s, "assistant", "无响应", { ts: 1, _turnKey: "c".repeat(64) });
+    applyCostWaived(s, {
+      type: "outbound.cost_waived",
+      turnKey: "c".repeat(64),
+      refundedCredits: "0",
+    }, {});
     expect(a.usage?.waived).toBe(true);
   });
-  test("无 session / 非法金额 → 只刷余额,不崩", () => {
+  test("无 session / turnKey 未命中 → 只刷余额，不猜最近一轮", () => {
     const refreshBalance = vi.fn();
-    applyCostWaived(null, { type: "outbound.cost_waived", refundedCredits: "x", balanceAfter: "1" }, { refreshBalance });
+    applyCostWaived(null, {
+      type: "outbound.cost_waived",
+      turnKey: "d".repeat(64),
+      refundedCredits: "11",
+      balanceAfter: "1",
+    }, { refreshBalance });
     expect(refreshBalance).toHaveBeenCalledTimes(1);
     const s = sess();
-    applyCostWaived(s, { type: "outbound.cost_waived", refundedCredits: "-5" }, {});
-    expect(s._pendingCostCredits).toBe("0");
+    const forceSync = vi.fn();
+    const latest = addMessage(s, "assistant", "B", {
+      ts: 2,
+      _turnKey: "e".repeat(64),
+      usage: { costCredits: "9" },
+    });
+    s._pendingCostCredits = "4";
+    applyCostWaived(s, {
+      type: "outbound.cost_waived",
+      turnKey: "f".repeat(64),
+      refundedCredits: "9",
+    }, { forceSync });
+    expect(latest.usage).toEqual({ costCredits: "9" });
+    expect(s._pendingCostCredits).toBe("4");
+    expect(forceSync).toHaveBeenCalledWith(s.id);
+  });
+  test("滚动升级期间缺 turnKey 的旧帧不会命中同样未标记的历史消息", () => {
+    const s = sess();
+    const legacy = addMessage(s, "assistant", "旧消息", { ts: 1, usage: { costCredits: "8" } });
+    applyCostWaived(s, {
+      type: "outbound.cost_waived",
+      turnKey: undefined as never,
+      refundedCredits: "8",
+    }, {});
+    expect(legacy.usage).toEqual({ costCredits: "8" });
   });
 });
 
@@ -2209,6 +2256,30 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s._activeClientMessageId).toBe(user.id);
     expect(s._sendingInFlight).toBe(true);
     expect(user.status).toBe("sent");
+  });
+
+  test("cost_waived 同时刷新余额与站内信未读角标", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const refreshBalance = vi.fn();
+    const refreshInbox = vi.fn();
+    const sock = makeSocket({ refreshBalance, refreshInbox });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.cost_waived",
+      sessionId: "s1",
+      turnKey: "9".repeat(64),
+      refundedCredits: "259",
+      balanceAfter: "1234",
+      reason: "platform_authority_expired",
+      inboxMessageId: "901",
+    }) });
+
+    expect(refreshBalance).toHaveBeenCalledTimes(1);
+    expect(refreshInbox).toHaveBeenCalledTimes(1);
   });
 
   test("annotated image sends hidden source/mask to gateway but only shows the guide in the user bubble", () => {

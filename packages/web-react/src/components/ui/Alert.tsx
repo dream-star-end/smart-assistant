@@ -33,7 +33,7 @@ export function Alert({ className, tone, icon, title, children, ...props }: Aler
   return (
     <div role="alert" className={cn(alertVariants({ tone }), className)} {...props}>
       {icon && <span className={cn("mt-0.5 shrink-0", iconTone[tone ?? "info"])}>{icon}</span>}
-      <div className="min-w-0 text-fg">
+      <div className="min-w-0 flex-1 text-fg">
         {title && <div className="font-semibold">{title}</div>}
         {children && <div className={cn(title && "mt-0.5 text-muted")}>{children}</div>}
       </div>

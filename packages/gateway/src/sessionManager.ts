@@ -39,20 +39,20 @@ import type {
 import { createEngine, resolveEngine } from './engine/registry.js'
 import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
-import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
-import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
 import {
   deriveLosslessTurnKey,
   getV3MasterSinkOrNull,
   type V3MasterSinkPayload,
 } from './v3MasterSink.js'
-import type {
-  DurableAgentGroup,
-  DurableGoalUsageRecord,
-  GoalStateSnapshot,
-  OutboundContentBlock,
+import {
+  AUTHORITY_TURN_MAX_LIFETIME_MS,
+  type TurnWaiveReason,
+  type DurableAgentGroup,
+  type DurableGoalUsageRecord,
+  type GoalStateSnapshot,
+  type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import {
@@ -379,9 +379,6 @@ export interface AgentSession {
    *  SubprocessRunner)。字段名保留 `runner` —— server.ts 等引用面零扩散。 */
   runner: EngineAdapter
   ccbSessionId: string | null
-  /** 本 turn 起始 ms(submit 进入执行段时打点)。idle-timeout 免单上报用它圈定
-   *  master 侧退款窗口(masterTurnWaive),turn 间不清零 — 只在超时路径读。 */
-  _turnStartedAtMs?: number
   /**
    * P2 债A — 本 turn 内已完成的委派(团队卡)server-authored durable 缓冲。
    *
@@ -404,7 +401,7 @@ export interface AgentSession {
     status: 'interrupted' | 'crashed',
     reason: string,
     errorCode: string,
-    settleAfter?: boolean,
+    waiveReason?: TurnWaiveReason,
   ) => Promise<void>
   /** Root user-visible turn that owns this delegate session's billed work.
    * Every nested delegate inherits the same key instead of re-parenting cost
@@ -718,6 +715,7 @@ function persistServerAuthoredTurnOutcome(args: {
    * as `_clientMessageId` for exact client reconciliation. */
   clientMessageId?: string
   turnKey?: string
+  waiveReason?: TurnWaiveReason
   continuationOfTurnKey?: string
   createdAt?: number
   text: string
@@ -796,6 +794,7 @@ function persistServerAuthoredTurnOutcome(args: {
       turnIndex: args.turnIndex,
       ...(args.clientMessageId ? { clientMessageId: args.clientMessageId } : {}),
       ...(args.turnKey ? { turnKey: args.turnKey } : {}),
+      ...(args.waiveReason ? { waiveReason: args.waiveReason } : {}),
       ...(args.continuationOfTurnKey
         ? { continuationOfTurnKey: args.continuationOfTurnKey }
         : {}),
@@ -1151,33 +1150,23 @@ function tailContentHash(payload: Record<string, unknown>): string {
     .digest('hex')
 }
 
-/**
- * M2 — turn-waive 上报的记账键选择(exported for tests)。
- *
- * 按 EngineCapabilities.billingMode 能力分支(消灭 provider 字符串 if/else 散点,
- * 见 engineAdapter.ts 契约):
- *   - 'engine-reported'(codex 等):记账键 = engineSessionId(sessionKey)——
- *     与 CodexAdapter 经 billing 事件下发、master settle 落 usage_records.session_id
- *     的值**同 helper 同入参**,方案红线"settle 与 waive 必须同一值"由构造保证。
- *     该值恒可派生,不依赖底座学到任何 native id。
- *   - 'proxy'(CCB)/ 未知:沿用 CCB 原生 session id(anthropicProxy settle 落的
- *     就是它);未学到(null)→ 返回 null,caller 跳过上报并 warn。
- */
-export function waiveAccountingSessionId(args: {
-  billingMode: 'proxy' | 'engine-reported' | undefined
-  sessionKey: string
-  ccbSessionId: string | null
-}): string | null {
-  if (args.billingMode === 'engine-reported') return engineSessionId(args.sessionKey)
-  return args.ccbSessionId
-}
-
 /** A short-lived host-controlled drain rejected a new runtime turn. */
 export class RuntimeRecycleDrainingError extends Error {
   readonly code = 'RUNTIME_RECYCLE_DRAINING'
   constructor() {
     super('runtime is draining for a stale-image recycle')
     this.name = 'RuntimeRecycleDrainingError'
+  }
+}
+
+class TurnIdleTimeoutError extends Error {
+  readonly code = 'TURN_IDLE_TIMEOUT'
+}
+
+class TurnHardLimitError extends Error {
+  readonly code = 'TURN_HARD_LIMIT'
+  constructor() {
+    super('turn reached the platform 12 hour execution limit')
   }
 }
 
@@ -1951,33 +1940,6 @@ export class SessionManager {
    *  entry so the next spawn starts a fresh session silently — UI history
    *  stays visible (it lives in the DB), but CCB has no memory of previous
    *  turns (unavoidable when the JSONL is gone). */
-  /** idle-timeout 免单上报(见 masterTurnWaive.ts 头注)。ccb session id 未知
-   *  (首 turn 未学到)时无法圈定 master 侧记录,跳过并 warn —— 该场景下本 turn
-   *  多半也没有可退的成功 settle(连首个事件都没等到)。
-   *
-   *  M2(codex 复活)— 记账键按 billingMode 能力分支(waiveAccountingSessionId):
-   *  engine-reported 底座(codex)上报 engineSessionId(sessionKey),与 settle
-   *  落 usage_records.session_id 同一 helper 同一入参 —— 方案红线"settle 与
-   *  waive 必须同一值"。M1a 前旧口径(codex 上报 thread id)永远对不上号,
-   *  已随本函数收口修正。 */
-  private _reportTurnWaive(session: AgentSession, reason: 'idle_timeout' | 'no_response'): void {
-    try {
-      const sessionId = waiveAccountingSessionId({
-        billingMode: session.runner?.capabilities?.billingMode,
-        sessionKey: session.sessionKey,
-        ccbSessionId: session.ccbSessionId ?? this._resumeMap.get(session.sessionKey) ?? null,
-      })
-      if (!sessionId) {
-        log.warn('turn waive skipped — ccb session id unknown', { sessionKey: session.sessionKey })
-        return
-      }
-      const sinceTs = (session._turnStartedAtMs ?? Date.now()) - 15_000
-      sendTurnWaiveBestEffort({ sessionId, sinceTs, reason })
-    } catch (err) {
-      log.warn('turn waive report threw', { sessionKey: session.sessionKey }, err as Error)
-    }
-  }
-
   private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
@@ -2906,12 +2868,14 @@ export class SessionManager {
       // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
       // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
       const CHECK_INTERVAL = 15_000 // check every 15s
-      // 免单窗口打点:master 退款只圈本 turn 内 settle 的请求。回拨 15s 容忍
-      // 容器/DB 时钟微偏 —— 上一 turn 早已结束,cushion 不会误圈到它。
-      session._turnStartedAtMs = Date.now()
+      const logicalTurnStartedAt = Date.now()
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
+          if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
+            reject(new TurnHardLimitError())
+            return
+          }
           const idleMs = Date.now() - session.runner.lastActivityAt
           // pendingToolCalls 经 adapter 读当前活跃 turn 的 parser(turn 间为 0),
           // 语义与旧 session._currentParser?.pendingToolCalls 一致。
@@ -2921,7 +2885,7 @@ export class SessionManager {
             session.providerTag,
           )
           if (idleMs > threshold) {
-            reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
+            reject(new TurnIdleTimeoutError(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
           }
         }, CHECK_INTERVAL)
       })
@@ -2943,25 +2907,23 @@ export class SessionManager {
         if (livenessTimer) clearInterval(livenessTimer)
       }
     } catch (err: any) {
-      if (err?.message?.includes('idle timeout')) {
+      if (err instanceof TurnIdleTimeoutError || err?.code === 'TURN_IDLE_TIMEOUT') {
         const persistTimedOutTurn = session._persistActiveTurn
         // Actually interrupt the runner so the subprocess stops
         try { session.runner.interrupt() } catch {}
-        // boss 红线:本轮模型无响应/超时不扣费。上报 master 冲正本 turn 已扣费用
-        // (fire-and-forget,内部延迟 5s 让在飞 settle 落定;个人版 env 缺失自动 no-op)。
-        this._reportTurnWaive(session, 'idle_timeout')
         // Extract idle seconds from the inner error so the user-facing
         // message reflects the actual silence duration (avoids confusing
         // mismatch with the inner 30-min idle timer's fixed wording).
         const m = /\((\d+)s/.exec(String(err?.message))
         const minutes = m ? Math.round(Number(m[1]) / 60) : null
         const detail = minutes ? `约 ${minutes} 分钟无输出` : '长时间无输出'
-        const reason = `子进程${detail},已中断。请重试。`
+        const reason = `任务${detail}，已中断。本轮已自动免单，积分将原路退回；请重试。`
         if (persistTimedOutTurn) {
           const persistence = persistTimedOutTurn(
             'interrupted',
             reason,
             'LIVENESS_TIMEOUT',
+            'idle_timeout',
           )
           this._trackPersistence(persistence)
           await persistence
@@ -2973,6 +2935,26 @@ export class SessionManager {
           { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
           err,
         )
+      } else if (err instanceof TurnHardLimitError || err?.code === 'TURN_HARD_LIMIT') {
+        const persistLimitedTurn = session._persistActiveTurn
+        try { session.runner.interrupt() } catch {}
+        const reason = '任务已达到 12 小时运行上限，系统已中断。本轮已自动免单，积分将原路退回；请重新发起。'
+        if (persistLimitedTurn) {
+          const persistence = persistLimitedTurn(
+            'interrupted',
+            reason,
+            'TURN_LIMIT',
+            'turn_limit',
+          )
+          this._trackPersistence(persistence)
+          await persistence
+        } else {
+          onEvent({ kind: 'error', error: reason })
+        }
+        log.warn('turn hard limit reached, interrupted', {
+          sessionKey: session.sessionKey,
+          ...(traceId ? { traceId } : {}),
+        })
       } else {
         unhandledTurnError = err
         throw err
@@ -3030,10 +3012,10 @@ export class SessionManager {
      *  Sub-30 minute lifetime — scoped to this turn's retry budget. */
     traceId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
-    /** 模型权威批次 §4:本 turn 的上游凭据。**跨 retry 复用同一张票**是有意的 ——
-     *  authority 的短 TTL 只约束「开始执行」,turn 内(含 phantom/transient 重试)的
-     *  续跑认 lease(TTL = 最大 turn 窗口 + grace);安全撤销由 egress 每请求 epoch
-     *  fence 兜住,不靠票据过期。 */
+    /** 模型权威批次 §4:本 turn 的上游凭据。短 authority 只约束
+     *  「开始执行」；turn 内(含 phantom/transient 重试)复用同一份逻辑
+     *  lease，并由 CCB adapter 定期向 master 续签。安全撤销仍由 egress 每请求
+     *  epoch fence 兜住，不靠 lease 自然过期。 */
     modelAuthority?: TurnModelAuthority,
     /** Validated browser user-row id for exact durable attribution. */
     clientMessageId?: string,
@@ -3363,6 +3345,7 @@ export class SessionManager {
             reason: string,
             errorCode: string,
             settleAfter?: boolean,
+            waiveReason?: TurnWaiveReason,
           ) => Promise<void>)
         | null = null
       let requestTerminalPersistence:
@@ -3370,8 +3353,15 @@ export class SessionManager {
             status: 'interrupted' | 'crashed',
             reason: string,
             errorCode: string,
+            waiveReason?: TurnWaiveReason,
           ) => Promise<void>)
         | null = null
+      let requestedTerminal: {
+        status: 'interrupted' | 'crashed'
+        reason: string
+        errorCode: string
+        waiveReason?: TurnWaiveReason
+      } | null = null
 
       // Idle timeout — refreshed on every adapter 'activity'(底座每条原始消息,
       // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
@@ -3381,12 +3371,12 @@ export class SessionManager {
       const timer = setTimeout(
         () => {
           if (!turn?.finalized) {
-            this._reportTurnWaive(session, 'idle_timeout')
-            const reason = '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。'
+            const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
             const persistence = requestTerminalPersistence?.(
               'interrupted',
               reason,
               'IDLE_TIMEOUT',
+              'idle_timeout',
             )
               ?? Promise.resolve()
             this._trackPersistence(persistence)
@@ -3585,6 +3575,7 @@ export class SessionManager {
         reason: string,
         errorCode: string,
         settleAfter = true,
+        waiveReason?: TurnWaiveReason,
       ): Promise<void> => {
         if (terminalPersistenceClaim !== 'none') {
           return partialPersistencePromise ?? Promise.resolve()
@@ -3631,6 +3622,7 @@ export class SessionManager {
                 ...activeGoalAttribution(session),
                 ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
+                ...(waiveReason ? { waiveReason } : {}),
                 text: partialAssistant.text,
                 ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
                 status,
@@ -3677,10 +3669,12 @@ export class SessionManager {
         status: 'interrupted' | 'crashed',
         reason: string,
         errorCode: string,
+        waiveReason?: TurnWaiveReason,
       ): Promise<void> => {
         // Record the terminal observation immediately, before a cooperative
         // interrupt can produce more engine events. Its global ordinal thus
         // reconstructs the exact live ordering after refresh.
+        requestedTerminal ??= { status, reason, errorCode, ...(waiveReason ? { waiveReason } : {}) }
         retainTerminalError(status, reason, errorCode)
         if (terminalRequestPromise) return terminalRequestPromise
         terminalRequestPromise = (async () => {
@@ -3688,7 +3682,7 @@ export class SessionManager {
           if (!activeTurn) {
             await Promise.resolve()
             if (!turn) {
-              await persistTerminalSnapshot?.(status, reason, errorCode)
+              await persistTerminalSnapshot?.(status, reason, errorCode, true, waiveReason)
               return
             }
           }
@@ -3711,6 +3705,9 @@ export class SessionManager {
           if (summaryFinished) {
             await finalizationDone
             await partialPersistencePromise
+            if (terminalPersistenceClaim === 'none') {
+              await persistTerminalSnapshot?.(status, reason, errorCode, true, waiveReason)
+            }
             return
           }
 
@@ -3736,7 +3733,7 @@ export class SessionManager {
             await partialPersistencePromise
             return
           }
-          await persistTerminalSnapshot?.(status, reason, errorCode)
+          await persistTerminalSnapshot?.(status, reason, errorCode, true, waiveReason)
         })()
         return terminalRequestPromise
       }
@@ -3793,6 +3790,30 @@ export class SessionManager {
             session._lastCcbCumulativeCost = prevLastCcbCost
             settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
             return
+          }
+
+          const modelAuthorityFailure = result?.errorKind === 'model_authority'
+          const modelAuthorityReason = modelAuthorityFailure
+            ? '任务运行时间较长，平台执行凭证未能继续。本轮已自动免单，积分将原路退回；你可以重新尝试。'
+            : undefined
+          // A generic runner error may be emitted before the remaining stdout
+          // drains into a valid terminal result (pipe/error ordering). Preserve
+          // that diagnostic runtime event, but only a platform-owned waiver
+          // request is allowed to override a subsequently completed summary.
+          let terminalOverride = (requestedTerminal?.waiveReason ? requestedTerminal : null) ?? (modelAuthorityFailure
+            ? {
+                status: 'crashed' as const,
+                reason: modelAuthorityReason!,
+                errorCode: 'MODEL_AUTHORITY_EXPIRED',
+                waiveReason: 'platform_authority_expired' as const,
+              }
+            : null)
+          if (terminalOverride) {
+            retainTerminalError(
+              terminalOverride.status,
+              terminalOverride.reason,
+              terminalOverride.errorCode,
+            )
           }
 
           // Phantom-turn detection — three-state logic (v3):
@@ -3875,6 +3896,7 @@ export class SessionManager {
                 turnPermissionCount === 0
               break
           }
+          if (terminalOverride) isPhantomTurn = false
 
           if (isPhantomTurn) {
             if (result && retryPhantomErrors) {
@@ -3898,11 +3920,38 @@ export class SessionManager {
             } else {
               await persistTerminalSnapshot?.(
                 'crashed',
-                'CCB 子进程持续返回空响应,已重启子进程。',
+                '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
                 'PHANTOM_TURN',
+                true,
+                'no_response',
               )
             }
             return
+          }
+
+          // Proxy billing already treats a successfully metered call with
+          // zero output tokens as no-response and charges 0. Carry the same
+          // exact reason onto the terminal tape so that decision is never a
+          // silent waiver: even a zero-debit turn gets one inbox receipt.
+          if (
+            !terminalOverride &&
+            result &&
+            result.usage.outputTokens === 0 &&
+            (result.usage.inputTokens > 0 ||
+              result.usage.cacheReadTokens > 0 ||
+              result.usage.cacheCreationTokens > 0)
+          ) {
+            terminalOverride = {
+              status: 'crashed',
+              reason: '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
+              errorCode: 'NO_RESPONSE',
+              waiveReason: 'no_response',
+            }
+            retainTerminalError(
+              terminalOverride.status,
+              terminalOverride.reason,
+              terminalOverride.errorCode,
+            )
           }
 
           // Update session accumulators from turn result
@@ -4004,9 +4053,11 @@ export class SessionManager {
               )
             }
             const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
-            const completedHasError = result.isError || result.errorDetail !== undefined
+            const completedHasError =
+              terminalOverride !== null || result.isError || result.errorDetail !== undefined
             if (completedHasError) {
-              terminalErrorForClient = result.errorDetail ?? 'engine reported an error'
+              terminalErrorForClient =
+                terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
             }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
@@ -4047,7 +4098,10 @@ export class SessionManager {
                 ...(turnKey ? { turnKey } : {}),
                 text: assistantText,
                 ...(completedHasThinking ? { thinkingText } : {}),
-                status: 'completed',
+                status: terminalOverride?.status ?? 'completed',
+                ...(terminalOverride?.waiveReason
+                  ? { waiveReason: terminalOverride.waiveReason }
+                  : {}),
                 // Plan §4.4 改动 7 — wire telemetry into the sink so master
                 // can persist `usage` + render refresh-stable truncated pill.
                 // requestId may be absent on non-codex / non-master paths;
@@ -4078,8 +4132,13 @@ export class SessionManager {
                 ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
                 ...(completedHasError
                   ? {
-                      errorCode: result.errorKind === 'auth' ? 'AUTH_ERROR' : 'ENGINE_ERROR',
-                      errorDetail: result.errorDetail ?? 'engine reported an error',
+                      errorCode:
+                        terminalOverride?.errorCode ??
+                        (result.errorKind === 'auth' ? 'AUTH_ERROR' : 'ENGINE_ERROR'),
+                      errorDetail:
+                        terminalOverride?.reason ??
+                        result.errorDetail ??
+                        'engine reported an error',
                     }
                   : {}),
                 ...(completedHasTools ? { tools: result.tools } : {}),

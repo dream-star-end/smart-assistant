@@ -9,7 +9,7 @@
  *      anthropic 路径的同规则在 proxyBilling 层,codex 直连 settle 必须本层显式补);
  *   3. usage_records.account_id 恒写 NULL(不再用 v3 的 accountId=0n 假账号);
  *   4. usage_records.session_id = engineSessionId(`oceng-<48hex>`,
- *      deriveEngineSessionId 单一权威),turn-waive 退款窗口才能命中 codex 记录。
+ *      deriveEngineSessionId 单一权威)，turn 账务另按 turnKey 精确归因。
  *   bridge 接线与 inflight/drain 状态机属 M2,本文件不含 bridge 依赖。
  *
  * 职责:接 outbound.codex_billing 帧的 token usage,按 derivedPricing(已 apply
@@ -104,10 +104,9 @@ export function isPermanentCodexWaiver(reason: unknown): reason is string {
 /**
  * v5 计费口径(M1b):codex turn 的 usage_records.session_id 单一口径 ——
  * `'oceng-' + sha256(sessionKey).hex.slice(0,48)`(共 54 字符),满足
- * internalTurnWaive 的 SESSION_ID_RE(不放宽端点校验),settle 落库与 turn-waive
- * 上报必须用同一值,idle-timeout 退款窗口(refund.refundSessionWindow 按
- * usage_records.session_id 圈定)才能命中。**禁止各模块自行 hash** —— 本 helper
- * 是唯一权威;gateway M1a 经 billing 事件传来的 engineSessionId 也是本算法产物。
+ * 相同格式。**禁止各模块自行 hash** —— 本 helper 是唯一权威;
+ * gateway M1a 经 billing 事件传来的 engineSessionId 也是本算法产物。
+ * 逻辑 turn 免单另外用 turnKey / parentTurnKey 精确归因。
  */
 export const ENGINE_SESSION_ID_RE = /^oceng-[0-9a-f]{48}$/;
 
@@ -128,7 +127,7 @@ export interface CodexFinalizeContext {
   /**
    * v5(M1b):usage_records.session_id 落库值 — 必须是 `deriveEngineSessionId`
    * 产出的 `oceng-<48hex>` 形状(makeCodexFinalizer 构造期 fail-closed 校验)。
-   * 旧 v3 形态用 containerId 字符串占位导致 turn-waive/退款窗口永远对不上,已废弃。
+   * 旧 v3 形态用 containerId 字符串占位，会破坏会话聚合，已废弃。
    */
   engineSessionId: string;
   /** effective model — 从 effectiveModelForFrame 取,可能是 gpt-5.5 / gpt-5.5-codex 等。 */
@@ -212,7 +211,7 @@ export interface CodexFinalizeHandle {
 
 export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHandle {
   // v5(M1b)fail-closed:session_id 口径错(旧 containerId 占位 / 各模块自行 hash)
-  // 会让 turn-waive 退款窗口永远圈不到 codex 记录 —— 构造期直接拒,不让脏口径入库。
+  // 会切裂同一会话的计费审计 —— 构造期直接拒，不让脏口径入库。
   if (!ENGINE_SESSION_ID_RE.test(ctx.engineSessionId)) {
     throw new TypeError(
       `makeCodexFinalizer: engineSessionId must match ${String(ENGINE_SESSION_ID_RE)} (use deriveEngineSessionId), got ${JSON.stringify(ctx.engineSessionId)}`,

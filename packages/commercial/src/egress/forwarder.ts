@@ -14,7 +14,7 @@
  *     (master 控制口 listener 用它替代 socket.remoteAddress 做 boundIp 因子)。
  *
  * master 不可达(重启窗口)→ 503 EGRESS_UPSTREAM_DOWN。容器侧调用方
- * (v3MasterSink / masterTurnWaive / mmx wrapper …)对 5xx 一律按 transient
+ * (v3MasterSink / turn-lease renew / mmx wrapper …)对 5xx 一律按 transient
  * 重试,恰好覆盖重启的秒级窗口。
  */
 

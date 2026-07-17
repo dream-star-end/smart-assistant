@@ -64,6 +64,7 @@ import {
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type TurnWaiveReason,
 } from '@openclaude/protocol'
 
 import { createLogger } from './logger.js'
@@ -122,6 +123,9 @@ export interface V3MasterSinkWirePayload {
   status: 'completed' | 'interrupted' | 'crashed'
   /** Stable logical turn identity used by lossless persistence and exact billing. */
   turnKey?: string
+  /** Platform-owned reason for waiving this exact logical turn. It travels
+   * with every fsynced tape envelope so retries cannot lose the billing fence. */
+  waiveReason?: TurnWaiveReason
   /** This tape is an immutable post-terminal continuation of an already
    * finalized paid turn (currently CCB background Bash tail events). It is
    * content-only and must never consume or redirect billing patches. */
@@ -328,6 +332,7 @@ export function buildLosslessTurnTapeRequests(
     totalBytes: canonical.length,
     partCount,
     createdAt,
+    ...(payload.waiveReason ? { waiveReason: payload.waiveReason } : {}),
   } as const
   const parts: LosslessTurnTapePartRequest[] = []
   for (let partIndex = 0; partIndex < partCount; partIndex++) {

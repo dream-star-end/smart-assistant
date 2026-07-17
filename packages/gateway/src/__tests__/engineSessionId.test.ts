@@ -2,9 +2,9 @@
  * engineSessionId 口径测试(M0)。
  *
  * 锁死算法:'oceng-' + sha256(sessionKey).hex.slice(0, 48),共 54 字符。
- * 该 id 是 M2 codex turn 记账(usage_records.session_id)与 idle-timeout
- * 免单/退款窗口(internalTurnWaive SESSION_ID_RE)的唯一口径 —— 任何实现漂移
- * 都会让 settle 落库与 waive 上报对不上号,直接钱安全事故,故逐性质断言。
+ * 该 id 是 M2 codex turn 记账(usage_records.session_id)的唯一会话口径；
+ * 任何实现漂移都会切裂计费审计和重连聚合，故逐性质断言。
+ * 免单另按 turnKey / parentTurnKey 精确归因。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/engineSessionId.test.ts
  */
@@ -18,7 +18,7 @@ import {
   engineSessionId,
 } from "../engine/engineSessionId.js";
 
-// internalTurnWaive.ts 的端点校验(不放宽),这里镜像锁一致性。
+// 稳定 session id 的公共 wire 形状。
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 describe("engineSessionId", () => {

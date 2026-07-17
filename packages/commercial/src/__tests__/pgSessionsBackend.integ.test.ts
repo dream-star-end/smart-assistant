@@ -81,6 +81,35 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0147, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_GOAL_STATE, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0157, { encoding: "utf8" }));
+  // 0163 also alters billing/inbox tables that are intentionally absent from
+  // this isolated sessions schema. Mirror its tape column and waiver table so
+  // the backend contract still exercises the production SQL shape.
+  await pool.query(`
+    ALTER TABLE client_session_turn_tapes
+      ADD COLUMN waive_reason TEXT
+        CHECK (waive_reason IS NULL OR waive_reason IN (
+          'idle_timeout', 'no_response', 'platform_authority_expired', 'turn_limit'
+        ));
+    CREATE TABLE turn_waivers (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      turn_key TEXT NOT NULL CHECK (turn_key ~ '^[0-9a-f]{64}$'),
+      reason TEXT NOT NULL CHECK (reason IN (
+        'idle_timeout', 'no_response', 'platform_authority_expired', 'turn_limit'
+      )),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
+      refunded_credits BIGINT NOT NULL DEFAULT 0,
+      record_count INTEGER NOT NULL DEFAULT 0,
+      inbox_message_id BIGINT,
+      applied_at TIMESTAMPTZ,
+      UNIQUE (user_id, turn_key),
+      CHECK (
+        (status = 'pending' AND applied_at IS NULL AND inbox_message_id IS NULL)
+        OR
+        (status = 'applied' AND applied_at IS NOT NULL AND inbox_message_id IS NOT NULL)
+      )
+    );
+  `);
   // 状态机行(pg_authoritative 须带 source_digest/completed_at,见 0134 CHECK)。
   await pool.query(
     `INSERT INTO sessions_store_migration_state (singleton, authority, generation, cutover_id, source_digest, completed_at)
@@ -102,7 +131,8 @@ beforeEach(async () => {
   if (!pgAvailable) return;
   await pool.query(
     `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-             server_authored_request_map, pending_usage_patches, wechat_bindings CASCADE`,
+             server_authored_request_map, pending_usage_patches, turn_waivers,
+             wechat_bindings CASCADE`,
   );
 });
 
@@ -144,6 +174,15 @@ function buildTape(payload: Record<string, unknown>) {
     totalBytes: canonical.length,
     partCount,
     createdAt: payload.createdAt as number,
+    ...(typeof payload.waiveReason === "string"
+      ? {
+          waiveReason: payload.waiveReason as
+            | "idle_timeout"
+            | "no_response"
+            | "platform_authority_expired"
+            | "turn_limit",
+        }
+      : {}),
   } as const;
   return {
     canonical,
@@ -457,6 +496,101 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("waived terminal tape commits one immutable pending billing fence", async () => {
+    const sessionId = "s-waived-terminal";
+    const userId = "c:7";
+    const turnKey = "8".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "crashed",
+      waiveReason: "platform_authority_expired",
+      turnKey,
+      text: "",
+      errorCode: "MODEL_AUTHORITY_EXPIRED",
+      errorDetail: "safe platform message",
+      createdAt: 1_783_944_000_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    assert.deepEqual(await backend.finalizeLosslessTurnTape(userId, tape.finalize), {
+      applied: "finalized",
+      recordCount: 1,
+      engineBillings: [],
+    });
+    assert.deepEqual(await backend.finalizeLosslessTurnTape(userId, tape.finalize), {
+      applied: "idempotent",
+      recordCount: 1,
+      engineBillings: [],
+    });
+    const rows = await pool.query<{
+      waive_reason: string;
+      reason: string;
+      status: string;
+    }>(
+      `SELECT t.waive_reason,w.reason,w.status
+         FROM client_session_turn_tapes t
+         JOIN turn_waivers w ON w.user_id=7 AND w.turn_key=t.turn_key
+        WHERE t.session_id=$1 AND t.user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.deepEqual(rows.rows, [{
+      waive_reason: "platform_authority_expired",
+      reason: "platform_authority_expired",
+      status: "pending",
+    }]);
+
+    for (const projection of [undefined, { projection: "chat" as const }]) {
+      const hydrated = await backend.getClientSession(sessionId, userId, projection);
+      const messages = hydrated?.messages as Array<{
+        role?: unknown;
+        _turnKey?: unknown;
+        usage?: { waived?: unknown };
+      }> | undefined;
+      const assistant = messages?.find((message) => message.role === "assistant");
+      assert.equal(
+        assistant?._turnKey,
+        turnKey,
+        "billing anchor must retain its exact logical turn for live waiver projection",
+      );
+      assert.equal(
+        assistant?.usage?.waived,
+        undefined,
+        "a pending decision must not claim that refund and receipt already completed",
+      );
+    }
+
+    await pool.query(
+      `UPDATE turn_waivers
+          SET status='applied', applied_at=NOW(), inbox_message_id=901
+        WHERE user_id=7 AND turn_key=$1`,
+      [turnKey],
+    );
+    for (const projection of [undefined, { projection: "chat" as const }]) {
+      const hydrated = await backend.getClientSession(sessionId, userId, projection);
+      const assistant = (hydrated?.messages as Array<{
+        role?: unknown;
+        usage?: { waived?: unknown };
+      }> | undefined)?.find((message) => message.role === "assistant");
+      assert.equal(
+        assistant?.usage?.waived,
+        true,
+        "an applied waiver with receipt must survive refresh and cross-device hydration",
+      );
+    }
+
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, {
+        ...tape.finalize,
+        waiveReason: "idle_timeout",
+      }),
+      /finalize header conflict/,
+    );
+  });
+
   maybe("publishes goal usage only after finalize and late-cost commits", async () => {
     const sessionId = "s-goal-live-usage";
     const userId = "c:42";

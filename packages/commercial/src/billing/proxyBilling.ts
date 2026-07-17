@@ -37,6 +37,7 @@ import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
 import { spendTwoBucket } from "./spend.js";
+import { lockTurnBillingKeys } from "./turnLock.js";
 import { resolveOrgBillingContext } from "../org/orgBilling.js";
 import type { ModelPricing } from "./pricing.js";
 import {
@@ -683,6 +684,31 @@ export async function settleUsageAndLedger(
   let commitAttempted = false;
   try {
     await client.query("BEGIN");
+    // Exact turn-waiver fence. Delegate usage locks both child and parent/root
+    // in canonical order; terminal finalization/refund uses the same key and
+    // therefore cannot race between "checked marker" and debit COMMIT.
+    const billingTurnKeys = await lockTurnBillingKeys(client, args.userId, [
+      args.turnKey,
+      args.parentTurnKey,
+    ]);
+    let turnWaived = false;
+    if (billingTurnKeys.length > 0) {
+      const waived = await client.query(
+        `SELECT 1 FROM turn_waivers
+          WHERE user_id=$1 AND turn_key = ANY($2::text[])
+          LIMIT 1`,
+        [args.userId.toString(), billingTurnKeys],
+      );
+      turnWaived = (waived.rowCount ?? 0) > 0;
+    }
+    const settledCostCredits = turnWaived ? 0n : args.costCredits;
+    const settledSnapshotJson = turnWaived
+      ? JSON.stringify({
+          ...(JSON.parse(args.snapshotJson) as Record<string, unknown>),
+          waived: "turn_auto_waive",
+          wouldHaveCharged: args.costCredits.toString(),
+        })
+      : args.snapshotJson;
     // org 归属解析(0112 企业版):tx 内、锁前一次索引点查。成员在某 active org 语境 →
     // 打戳 usage_records.org_id(**与扣费桶解耦**:只看成员是否在 org,无论钱从哪个桶扣);
     // billing_enabled=true 才让 org 钱包参与扣费(下面 spendTwoBucket 传 orgId)。
@@ -699,9 +725,10 @@ export async function settleUsageAndLedger(
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
            price_snapshot, cost_credits, session_id, parent_session_id,
            delegate_agent_id, request_id, status, org_id,
-           execution_revision, projection_revision, security_epoch, authority_kind)
+           execution_revision, projection_revision, security_epoch, authority_kind,
+           turn_key, parent_turn_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20)
+                 $17, $18, $19, $20, $21, $22)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -713,8 +740,8 @@ export async function settleUsageAndLedger(
           BigInt(args.usage.output_tokens).toString(),
           BigInt(args.usage.cache_read_tokens).toString(),
           BigInt(args.usage.cache_write_tokens).toString(),
-          args.snapshotJson,
-          args.costCredits.toString(),
+          settledSnapshotJson,
+          settledCostCredits.toString(),
           args.sessionId,
           args.parentSessionId ?? null,
           args.delegateAgentId ?? null,
@@ -727,6 +754,8 @@ export async function settleUsageAndLedger(
           args.authority?.projectionRevision ?? null,
           args.authority ? args.authority.securityEpoch.toString() : null,
           args.authority?.kind ?? null,
+          args.turnKey ?? null,
+          args.parentTurnKey ?? null,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);
@@ -760,17 +789,17 @@ export async function settleUsageAndLedger(
       }
       throw err;
     }
-    if (args.status === "success" && args.costCredits > 0n) {
+    if (args.status === "success" && settledCostCredits > 0n) {
       // 双钱包扣费收口（0096）：先扣 period_credits 期内桶再扣 users.credits 持久钱包，
       // 各桶 FOR UPDATE 行锁串行化、按桶各写一条 credit_ledger（balance_after=该桶扣后值）。
       // 余额 < cost：不回滚 stream(已发字节回不来)，clamp 到总可用；status 仍 'success'，
       // billing_debit_total{result="insufficient"} +1 由 runCommit 据 settled.clamped 上报。
       const spend = await spendTwoBucket(client, {
         userId: args.userId,
-        amount: args.costCredits,
+        amount: settledCostCredits,
         reason: "chat",
         ref: { type: "usage_record", id: usageId.toString() },
-        memo: `cost=${args.costCredits}`,
+        memo: `cost=${settledCostCredits}`,
         // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时
         // spendTwoBucket 内 FOR UPDATE 会再兜底 fail-open 降级个人桶。
         orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,

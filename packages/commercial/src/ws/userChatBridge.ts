@@ -965,10 +965,10 @@ function ensureRequestIdServerSide(): string {
  * engineSessionId 记账键。
  *
  * M2 变化:finalizer **延迟到 billing 帧到达时构造** —— usage_records.session_id
- * 的权威值 = 帧上的 engineSessionId(gateway 唯一 helper engineSessionId(sessionKey)
- * 产物,与 idle-timeout waive 上报同值,方案红线)。inbound 时 bridge 不可靠知道
- * gateway 侧 sessionKey(agent 路由可改写),自行派生会破坏 settle=waive 同值
- * 不变量,故不在 inbound 期构造。
+ * 的权威值 = 帧上的 engineSessionId(gateway 唯一 helper
+ * engineSessionId(sessionKey) 产物)。inbound 时 bridge 不可靠知道 gateway 侧
+ * sessionKey(agent 路由可改写)，故不在 inbound 期自行派生。turn 账务归因
+ * 不依赖该字段，独立使用 turnKey / parentTurnKey。
  */
 interface CodexTurnSnapshot {
   /** server-owned 32-hex id;Map key 与本字段同值,仅冗余便于日志。 */
@@ -3600,7 +3600,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
 
               // M2 — inflight snapshot:finalizer 延迟到 billing 帧构造(engineSessionId
-              // 权威来自帧,settle=waive 同值红线);abandon 承接旧 finalizer.fail 语义
+              // 权威来自帧);abandon 承接旧 finalizer.fail 语义
               // (abort journal + release reservation,不扣费)。snapState 单一状态机
               // 保证 getFinalizer/abandon 互斥幂等,与旧"构造期单 finalizer + _done
               // 守门"钱安全不变量等价。
@@ -4158,9 +4158,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // —— 与 snapshot 无关的帧字段解析(主路径与跨桥 fallback 共用)——
             // M2 — engineSessionId fail-closed 校验(方案 §D 红线 2)。
             // settle 落 usage_records.session_id 的**唯一**权威 = 帧上的
-            // engineSessionId(gateway 经 engineSessionId(sessionKey) 派生,与
-            // idle-timeout waive 上报同值)。缺失(旧容器镜像)/ 形状非法(伪造/
-            // 漂移)→ **不扣费**(见下方两个消费点)。
+            // engineSessionId(gateway 经 engineSessionId(sessionKey) 派生)。缺失
+            // (旧容器镜像)/形状非法(伪造/漂移)→ **不扣费**(见下方两个消费点)。
             const engineSidRaw = billing.engineSessionId;
             const engineSid =
               typeof engineSidRaw === "string" && ENGINE_SESSION_ID_RE.test(engineSidRaw)
@@ -4279,9 +4278,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // engineSessionId fail-closed(解析已上移):缺失 / 形状非法 →
             // **不扣费**:abandon(abort journal + release reservation)+ error
-            // 告警。宁可少收不可乱扣 —— 口径错的 session_id 一旦入库,waive 退款
-            // 窗口(refund.refundSessionWindow)永远圈不到,会变成"该退不退"的
-            // 乱扣。与 usage 缺失的 fail-safe 策略(免单并告警)对齐。
+            // 告警。宁可少收不可乱扣；逻辑 turn 免单的账务归因另用
+            // turnKey / parentTurnKey 精确完成，不依赖该会话字段。
             if (engineSid === null) {
               billingLog?.error("user-chat-bridge: codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
                 engineSessionId: typeof engineSidRaw === "string" ? engineSidRaw.slice(0, 80) : typeof engineSidRaw,

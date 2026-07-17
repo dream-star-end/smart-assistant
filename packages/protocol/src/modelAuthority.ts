@@ -63,6 +63,17 @@ export const PLATFORM_MAX_TURN_MS = 45 * 60_000
 export const TURN_LEASE_GRACE_MS = 5 * 60_000
 export const TURN_LEASE_TTL_MS = PLATFORM_MAX_TURN_MS + TURN_LEASE_GRACE_MS
 
+/**
+ * bridge turn 的绝对寿命上限。lease 本身仍保持 50min 的短滚动窗口；活跃长任务由
+ * master 在每次续签时把 `expiresAt` 向后滚动，但永远不能越过
+ * `originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一窗口执行硬终止，
+ * 因此签发与执行不会再次出现「票据先过期、任务仍被允许继续」的双口径。
+ */
+export const AUTHORITY_TURN_MAX_LIFETIME_MS = 12 * 60 * 60_000
+
+/** 首次续签时机。保留 20min 失败重试余量，不把瞬时 master 抖动变成用户故障。 */
+export const TURN_LEASE_RENEW_AFTER_MS = 30 * 60_000
+
 /** 签名域分离前缀 —— authority 与 lease 的签名字节前缀不同,签名不可跨类型复用。 */
 const AUTHORITY_SIGNING_DOMAIN = 'oc-model-authority-v1'
 const TURN_LEASE_SIGNING_DOMAIN = 'oc-turn-lease-v1'
@@ -185,6 +196,12 @@ export interface TurnLease {
   readonly auxModels?: readonly string[]
   readonly securityEpoch: number
   readonly connectionChallenge: string
+  /**
+   * 本逻辑 turn 首次签发时刻，续签时保持不变；缺席只兼容续签能力上线前的旧 lease，
+   * 消费侧按 `issuedAt` 解释。新签/续签一律显式携带。
+   */
+  readonly originalIssuedAt?: number
+  /** 本张 lease 的签发/续签时刻。 */
   readonly issuedAt: number
   readonly expiresAt: number
 }
@@ -430,8 +447,27 @@ export function verifyTurnLease(
   const { payload, sig } = decodeEnvelope(envelopeB64, TURN_LEASE_KIND)
   const typed = parseTurnLease(payload)
   verifySignature(turnLeaseSigningInput(typed), sig, typed.keyId, keyring)
+  assertLeaseTimeWindow(typed)
   assertNotExpired(typed.expiresAt, now)
   return typed
+}
+
+/** 兼容旧 lease：没有 originalIssuedAt 时，其第一次 issuedAt 就是逻辑起点。 */
+export function turnLeaseOriginalIssuedAt(lease: TurnLease): number {
+  return lease.originalIssuedAt ?? lease.issuedAt
+}
+
+function assertLeaseTimeWindow(lease: TurnLease): void {
+  const original = turnLeaseOriginalIssuedAt(lease)
+  if (original > lease.issuedAt) {
+    throw new ModelAuthorityError('BadShape', 'turn lease originalIssuedAt is after issuedAt')
+  }
+  if (lease.issuedAt >= lease.expiresAt) {
+    throw new ModelAuthorityError('BadShape', 'turn lease issuedAt must be before expiresAt')
+  }
+  if (lease.expiresAt > original + AUTHORITY_TURN_MAX_LIFETIME_MS) {
+    throw new ModelAuthorityError('BadShape', 'turn lease exceeds absolute turn lifetime')
+  }
 }
 
 /**
@@ -721,6 +757,9 @@ function parseTurnLease(raw: unknown): TurnLease {
     ...(o.auxModels === undefined ? {} : { auxModels: modelList(o, 'auxModels') }),
     securityEpoch: int(o, 'securityEpoch'),
     connectionChallenge: str(o, 'connectionChallenge'),
+    ...(o.originalIssuedAt === undefined
+      ? {}
+      : { originalIssuedAt: int(o, 'originalIssuedAt') }),
     issuedAt: int(o, 'issuedAt'),
     expiresAt: int(o, 'expiresAt'),
   }
@@ -734,6 +773,7 @@ function parseTurnLease(raw: unknown): TurnLease {
     'auxModels',
     'securityEpoch',
     'connectionChallenge',
+    'originalIssuedAt',
     'issuedAt',
     'expiresAt',
   ])

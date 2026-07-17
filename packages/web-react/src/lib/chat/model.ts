@@ -145,6 +145,8 @@ export type ChatMessage = {
    * this from the immutable lossless tape; local fallback m-* output rows are
    * tagged while streaming so final sync can replace only the right turn. */
   _clientMessageId?: string;
+  /** Master-authored exact logical turn key used for targeted billing updates. */
+  _turnKey?: string;
   /** Sanitized server history control row. Raw runtime events never enter the
    * browser chat projection; these rows are hidden and persist only cursor or
    * bounded Bash-tail update semantics. */

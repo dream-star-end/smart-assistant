@@ -11,6 +11,7 @@ import { sign as cryptoSign, generateKeyPairSync } from 'node:crypto'
 import { describe, it } from 'node:test'
 
 import {
+  AUTHORITY_TURN_MAX_LIFETIME_MS,
   AUTHORITY_TTL_MS,
   type JsonValue,
   MODEL_AUTHORITY_FIELD,
@@ -27,6 +28,7 @@ import {
   isModelAllowedByAuthority,
   parseAuthorityKeyring,
   stripModelAuthorityField,
+  turnLeaseOriginalIssuedAt,
   turnLeaseSigningInput,
   verifyAuthority,
   verifyTurnLease,
@@ -394,6 +396,44 @@ describe('verifyTurnLease + assertLeaseMatchesAuthority', () => {
     const t = NOW + 6 * 60_000 // 6 分钟:authority(2min TTL)已过期
     expectCode(() => verifyAuthority(signAuthorityEnvelope(p), keyring, t), 'Expired')
     assert.ok(verifyTurnLease(signLeaseEnvelope(l), keyring, t))
+  })
+
+  it('滚动续签保持 originalIssuedAt，可用到 12h 绝对上限前', () => {
+    const originalIssuedAt = NOW
+    const renewed = makeLease({
+      originalIssuedAt,
+      issuedAt: NOW + 11 * 60 * 60_000,
+      expiresAt: originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS,
+    })
+    const verified = verifyTurnLease(
+      signLeaseEnvelope(renewed),
+      keyring,
+      renewed.expiresAt - 1,
+    )
+    assert.equal(turnLeaseOriginalIssuedAt(verified), originalIssuedAt)
+    expectCode(() => verifyTurnLease(signLeaseEnvelope(renewed), keyring, renewed.expiresAt), 'Expired')
+  })
+
+  it('兼容旧 lease：缺 originalIssuedAt 时以 issuedAt 作逻辑起点', () => {
+    const legacy = makeLease()
+    const verified = verifyTurnLease(signLeaseEnvelope(legacy), keyring, NOW)
+    assert.equal(verified.originalIssuedAt, undefined)
+    assert.equal(turnLeaseOriginalIssuedAt(verified), legacy.issuedAt)
+  })
+
+  it('拒绝倒置时间窗口和越过 12h 绝对上限的签名 lease', () => {
+    const cases: TurnLease[] = [
+      makeLease({ originalIssuedAt: NOW + 1, issuedAt: NOW }),
+      makeLease({ originalIssuedAt: NOW, issuedAt: NOW + 10, expiresAt: NOW + 10 }),
+      makeLease({
+        originalIssuedAt: NOW,
+        issuedAt: NOW + 60_000,
+        expiresAt: NOW + AUTHORITY_TURN_MAX_LIFETIME_MS + 1,
+      }),
+    ]
+    for (const lease of cases) {
+      expectCode(() => verifyTurnLease(signLeaseEnvelope(lease), keyring, NOW), 'BadShape')
+    }
   })
 
   it('绑定字段任一不一致 → LeaseMismatch', () => {

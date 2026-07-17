@@ -261,6 +261,111 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(finalizeCalls, 2);
     assert.equal(settleCalls, 2, "idempotent finalize must replay durable billing evidence");
   });
+
+  test("waived finalize ACKs only after exact refund+inbox apply and emits one live projection", async () => {
+    let finalizeCalls = 0;
+    let applyCalls = 0;
+    const broadcasts: Array<{ uid: bigint; payload: Record<string, unknown> }> = [];
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          finalizeCalls++;
+          return {
+            applied: finalizeCalls === 1 ? "finalized" : "idempotent",
+            recordCount: 1,
+            engineBillings: [],
+          };
+        },
+      },
+      async applyTurnWaiver(input) {
+        applyCalls++;
+        assert.deepEqual(
+          { userId: input.userId, turnKey: input.turnKey, reason: input.reason },
+          { userId: 42n, turnKey: "a".repeat(64), reason: "platform_authority_expired" },
+        );
+        if (applyCalls === 1) throw new Error("temporary inbox transaction failure");
+        return {
+          waiverId: "71",
+          newlyApplied: applyCalls === 2,
+          refundedCredits: 259n,
+          recordCount: 28,
+          totalAfter: 1_234n,
+          inboxMessageId: "901",
+        };
+      },
+      broadcastToUser(uid, payload) {
+        broadcasts.push({ uid, payload });
+      },
+    });
+    const finalize: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "crashed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "e".repeat(64),
+      totalBytes: 1,
+      partCount: 1,
+      waiveReason: "platform_authority_expired",
+      createdAt: 1_783_944_000_000,
+    };
+
+    const first = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      first.res,
+      CTX,
+    );
+    assert.equal(first.rec.status, 503, "refund or inbox failure must retain the fsynced retry");
+    assert.equal(broadcasts.length, 0);
+
+    const retry = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      retry.res,
+      CTX,
+    );
+    assert.equal(retry.rec.status, 200);
+    assert.deepEqual(JSON.parse(retry.rec.body), {
+      ok: true,
+      idempotent: true,
+      recordCount: 1,
+      waived: true,
+      refundedCredits: "259",
+      inboxMessageId: "901",
+    });
+    assert.deepEqual(broadcasts, [{
+      uid: 42n,
+      payload: {
+        type: "outbound.cost_waived",
+        sessionId: "web-test1",
+        turnKey: finalize.turnKey,
+        refundedCredits: "259",
+        balanceAfter: "1234",
+        reason: "platform_authority_expired",
+        inboxMessageId: "901",
+      },
+    }]);
+
+    const ackLossRetry = makeRes();
+    await handler(
+      makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }),
+      ackLossRetry.res,
+      CTX,
+    );
+    assert.equal(ackLossRetry.rec.status, 200);
+    assert.equal(broadcasts.length, 1, "ACK-loss retry must not replay a refund projection");
+    assert.equal(finalizeCalls, 3);
+    assert.equal(applyCalls, 3);
+  });
 });
 
 // ─── tests ───────────────────────────────────────────────────────────────

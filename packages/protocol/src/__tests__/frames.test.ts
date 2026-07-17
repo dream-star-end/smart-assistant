@@ -317,7 +317,7 @@ describe('OutboundCodexBilling schema', () => {
       false,
     )
   })
-  // M2 — engineSessionId(engine-reported 计费记账键,settle=waive 同值红线)。
+  // M2 — engineSessionId(engine-reported 计费的稳定会话维度)。
   // Optional(渐进部署:旧容器镜像不带)+ 形状钉死 'oceng-' + 48 hex 小写。
   it('accepts frame without engineSessionId (渐进部署兼容)', () => {
     assert.equal(Value.Check(OutboundCodexBilling, baseOutboundCodexBilling()), true)

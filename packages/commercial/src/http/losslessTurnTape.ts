@@ -5,6 +5,7 @@ import {
   isClientMessageId,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   type DurableCodexBilling,
+  type TurnWaiveReason,
 } from "@openclaude/protocol";
 import type { MessageLike } from "@openclaude/storage";
 
@@ -14,6 +15,7 @@ export type LosslessTurnPayload = {
   turnIndex: number;
   clientMessageId?: string;
   status: "completed" | "interrupted" | "crashed";
+  waiveReason?: TurnWaiveReason;
   turnKey: string;
   continuationOfTurnKey?: string;
   parentTurnKey?: string;
@@ -71,6 +73,12 @@ export type MaterializedLosslessTurn = {
 const SAFE_AGENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_TURN_KEY = /^[0-9a-f]{64}$/;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TURN_WAIVE_REASONS = new Set<TurnWaiveReason>([
+  "idle_timeout",
+  "no_response",
+  "platform_authority_expired",
+  "turn_limit",
+]);
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -327,6 +335,10 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     throw new Error("turn tape payload.status is invalid");
   }
   if (!SAFE_TURN_KEY.test(turnKey)) throw new Error("turn tape payload.turnKey is invalid");
+  const waiveReason = optionalString(raw, "waiveReason");
+  if (waiveReason !== undefined && !TURN_WAIVE_REASONS.has(waiveReason as TurnWaiveReason)) {
+    throw new Error("turn tape payload.waiveReason is invalid");
+  }
   const parentTurnKey = optionalString(raw, "parentTurnKey");
   if (parentTurnKey !== undefined && !SAFE_TURN_KEY.test(parentTurnKey)) {
     throw new Error("turn tape payload.parentTurnKey is invalid");
@@ -399,6 +411,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       status !== "completed" ||
       requiredString(raw, "text") !== "" ||
       parentTurnKey !== undefined ||
+      waiveReason !== undefined ||
       clientMessageId !== undefined ||
       requestId !== undefined ||
       agentSessionId !== undefined ||
@@ -426,6 +439,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     turnIndex,
     status,
     turnKey,
+    ...(waiveReason !== undefined ? { waiveReason: waiveReason as TurnWaiveReason } : {}),
     ...(clientMessageId !== undefined ? { clientMessageId } : {}),
     ...(continuationOfTurnKey !== undefined ? { continuationOfTurnKey } : {}),
     ...(parentTurnKey !== undefined ? { parentTurnKey } : {}),
@@ -828,6 +842,7 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
         text: segment.text,
         ts: segment.ts,
         status: body.status,
+        ...(last ? { _turnKey: body.turnKey } : {}),
         ...(last && body.usage ? { usage: body.usage } : {}),
         ...(last && body.truncated ? { _truncated: true } : {}),
         ...(last && body.errorCode ? { _errorCode: body.errorCode } : {}),
@@ -844,6 +859,7 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
       text: visibleText,
       ts: baseTs,
       status: body.status,
+      _turnKey: body.turnKey,
       ...(body.text.length === 0 ? { _isError: true } : {}),
       ...(body.usage ? { usage: body.usage } : {}),
       ...(body.truncated ? { _truncated: true } : {}),

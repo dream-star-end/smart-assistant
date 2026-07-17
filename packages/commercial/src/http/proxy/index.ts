@@ -917,6 +917,13 @@ export function makeAnthropicProxyHandler(
       }
       const session: PreparedUpstreamSession = pickRes.session;
 
+      // Derive exact billing attribution before journal admission so a future
+      // rolling-lease renewal can prove that this signed authorityTurnId was
+      // actually used by this immutable turnKey. Prompt/response content is
+      // never written to the journal.
+      const attribution = extractUsageAttribution(body.metadata);
+      const sessionId = attribution.sessionId;
+
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //
       // case (c) release ownership:journal fail 时 session 已 ready 但 finalizer 还没装,
@@ -942,6 +949,7 @@ export function makeAnthropicProxyHandler(
                       authorityTurnId: gate.authorityTurnId,
                       turnLeaseIssuedAtMs: gate.turnLeaseIssuedAtMs,
                       turnLeaseVerifiedAtMs: gate.turnLeaseVerifiedAtMs,
+                      ...(attribution.turnKey ? { turnKey: attribution.turnKey } : {}),
                     }
                   : {}),
               }
@@ -995,8 +1003,6 @@ export function makeAnthropicProxyHandler(
       // extractUsageAttribution(body.metadata) 算一次,sessionId 既作为 finalize
       // 配置也作为 RoundTripCtx.sessionId 传给 core.ts —— 单一权威源,避免后续
       // 广播与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
-      const attribution = extractUsageAttribution(body.metadata);
-      const sessionId = attribution.sessionId;
       // 归因键已提取完毕 → 从 user_id JSON 剥掉 oc_ 内部键再转发上游
       // (内部会话拓扑不出代理;普通 chat 请求无 oc_ 键,原串零改写)。
       if (body.metadata?.user_id !== undefined) {

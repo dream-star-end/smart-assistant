@@ -17,7 +17,7 @@
  * 硬约束:CCB stream-json SdkMessage 形状不跨出本模块。
  */
 import { EventEmitter } from 'node:events'
-import type { GoalStateSnapshot } from '@openclaude/protocol'
+import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -35,6 +35,7 @@ import type {
   TurnParams,
 } from './engineAdapter.js'
 import type {
+  DurableRuntimeEvent,
   EngineEvent,
   PartialSnapshot,
   PhantomSignals,
@@ -43,6 +44,7 @@ import type {
 } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { createLogger } from '../logger.js'
+import { renewTurnLease } from '../masterTurnLease.js'
 
 const log = createLogger({ module: 'ccbAdapter' })
 
@@ -61,13 +63,48 @@ const AUTH_KEYWORDS_RE =
   /authenticat|credentials|401|unauthorized|run \/login|token (?:has been )?revoked|invalid api key|organization has been disabled/i
 // CCB's exact error prefix when API auth fails — safe to match even without isError flag.
 const AUTH_ERROR_PREFIX_RE = /^Failed to authenticate\b/
+const MODEL_AUTHORITY_INVALID_RE = /\bMODEL_AUTHORITY_INVALID\b/
+
+function containsModelAuthorityInvalid(value: unknown): boolean {
+  if (typeof value === 'string') return MODEL_AUTHORITY_INVALID_RE.test(value)
+  try {
+    return MODEL_AUTHORITY_INVALID_RE.test(JSON.stringify(value))
+  } catch {
+    return false
+  }
+}
+
+function redactModelAuthorityRuntimeEvents(
+  events: readonly DurableRuntimeEvent[],
+): DurableRuntimeEvent[] {
+  return events.map((event) =>
+    containsModelAuthorityInvalid(event.payload)
+      ? {
+          ordinal: event.ordinal,
+          observedAt: event.observedAt,
+          source: event.source,
+          payload: {
+            type: 'platform_error',
+            code: 'MODEL_AUTHORITY_EXPIRED',
+          },
+        }
+      : structuredClone(event),
+  )
+}
 
 /** CCB 错误字符串分类(底座私有知识,从 sessionManager 下沉)。
  *  与迁移前 sessionManager.onFinish 的 isAuthError 判定逐条件一致。 */
 export function classifyCcbErrorKind(result: {
   isError: boolean
   assistantText: string
-}): 'auth' | 'other' | undefined {
+  errorDetail?: string
+}): 'auth' | 'model_authority' | 'other' | undefined {
+  if (
+    containsModelAuthorityInvalid(result.assistantText) ||
+    containsModelAuthorityInvalid(result.errorDetail)
+  ) {
+    return 'model_authority'
+  }
   const isAuth =
     (result.isError && AUTH_KEYWORDS_RE.test(result.assistantText)) ||
     AUTH_ERROR_PREFIX_RE.test(result.assistantText)
@@ -109,6 +146,7 @@ interface CcbTurnContext {
    * 不明的 tail 灌进当前 turn)。per-turn 不设上限(受本 turn 工具数天然约束)。
    */
   ownedBashToolUseIds: Set<string>
+  stopLeaseRenewal?: () => void
 }
 
 function toPhantomSignals(telemetry: TelemetryChannel): PhantomSignals {
@@ -128,17 +166,23 @@ function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): Turn
       cacheReadTokens: result.cacheReadTokens,
       cacheCreationTokens: result.cacheCreationTokens,
     },
-    assistantText: result.assistantText,
+    assistantText: errorKind === 'model_authority' ? '' : result.assistantText,
     thinkingText: result.thinkingText,
-    assistantSegments: result.assistantSegments,
+    assistantSegments: errorKind === 'model_authority' ? [] : result.assistantSegments,
     thinkingSegments: result.thinkingSegments,
     tools: result.tools,
-    runtimeEvents: result.runtimeEvents,
+    runtimeEvents: errorKind === 'model_authority'
+      ? redactModelAuthorityRuntimeEvents(result.runtimeEvents)
+      : result.runtimeEvents,
     stopReason: result.stopReason,
     numTurns: result.numTurns,
     isError: result.isError,
     ...(errorKind ? { errorKind } : {}),
-    ...(result.errorDetail !== undefined ? { errorDetail: result.errorDetail } : {}),
+    ...(errorKind === 'model_authority'
+      ? { errorDetail: 'MODEL_AUTHORITY_EXPIRED' }
+      : result.errorDetail !== undefined
+        ? { errorDetail: result.errorDetail }
+        : {}),
     staleResumeId: result.staleResumeId,
     phantomSignals: toPhantomSignals(telemetry),
     // apiState='called' 且零输出时 sessionManager 的 warn 日志字段(与旧代码
@@ -159,7 +203,7 @@ function snapshotOf(parser: CcbMessageParser): PartialSnapshot {
     completedTools: parser.snapshotToolsForPersistence(),
     assistantSegments: parser.assistantSegments.map((s) => ({ ...s })),
     thinkingSegments: parser.thinkingSegments.map((s) => ({ ...s })),
-    runtimeEvents: parser.runtimeEvents.map((event) => structuredClone(event)),
+    runtimeEvents: redactModelAuthorityRuntimeEvents(parser.runtimeEvents),
   }
 }
 
@@ -260,7 +304,13 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     const parser = new CcbMessageParser({
       toolUseIdToName: params.toolUseIdToName,
       // parser 只会产出内容事件(codex_billing 变体无生产者),向 EngineEvent 收窄安全。
-      onEvent: (e: SessionStreamEvent) => params.onEvent(e as EngineEvent),
+      onEvent: (e: SessionStreamEvent) => {
+        // A platform lease rejection is not a provider-login failure and its
+        // raw internal response must not become a red user-facing card. The
+        // terminal result below emits one normalized, waived outcome.
+        if (e.kind === 'error' && containsModelAuthorityInvalid(e.error)) return
+        params.onEvent(e as EngineEvent)
+      },
       assistantMessageId: params.assistantMessageId,
       thinkingMessageId: params.thinkingMessageId,
       toolMessageIdFactory: params.toolMessageIdFactory,
@@ -283,6 +333,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
+        ctx.stopLeaseRenewal?.()
         resolveSummary(result ? buildTurnSummary(result, telemetry) : null)
       },
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
@@ -296,12 +347,17 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     // 模型权威批次 §4 — modelAuthority 由 runner.submit 转成本 turn 的
     // ANTHROPIC_CUSTOM_HEADERS(先于 user message 写 stdin);无值 = 本地路径,
     // runner 侧自取 local_catalog token 并清位(单一收口,adapter 不做判定)。
-    const submitted = this.runner.submit(
-      params.input,
-      params.requestId,
-      params.modelAuthority,
-      params.turnKey,
-    )
+    const submitted = this.runner
+      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
+      .then(() => {
+        if (params.modelAuthority && params.turnKey && this._activeTurn === ctx) {
+          ctx.stopLeaseRenewal = this._startLeaseRenewal(
+            ctx,
+            params.turnKey,
+            params.modelAuthority.leaseEnvelope,
+          )
+        }
+      })
     return {
       submitted,
       summary,
@@ -316,6 +372,52 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       get pendingToolCalls() {
         return parser.pendingToolCalls
       },
+    }
+  }
+
+  private _startLeaseRenewal(
+    ctx: CcbTurnContext,
+    turnKey: string,
+    initialLease: string,
+  ): () => void {
+    let stopped = false
+    let timer: NodeJS.Timeout | null = null
+    let currentLease = initialLease
+    let failures = 0
+    const schedule = (delayMs: number): void => {
+      if (stopped) return
+      timer = setTimeout(() => void run(), delayMs)
+      timer.unref?.()
+    }
+    const run = async (): Promise<void> => {
+      if (stopped || this._activeTurn !== ctx) return
+      try {
+        const renewed = await renewTurnLease(turnKey, currentLease)
+        if (stopped || this._activeTurn !== ctx) return
+        await this.runner.updateTurnLease(renewed.lease)
+        currentLease = renewed.lease
+        failures = 0
+        log.info('rolling turn lease renewed', { turnKey, expiresAt: renewed.expiresAt })
+        schedule(TURN_LEASE_RENEW_AFTER_MS)
+      } catch (err) {
+        failures++
+        if (failures === 1 || failures % 10 === 0) {
+          log.warn('rolling turn lease renewal failed; retrying', {
+            turnKey,
+            failures,
+            error: (err as Error).message,
+          })
+        }
+        // Initial renewal starts with 20 minutes of lease headroom. A one-minute
+        // retry cadence tolerates control-plane deploys without request floods.
+        schedule(60_000)
+      }
+    }
+    schedule(TURN_LEASE_RENEW_AFTER_MS)
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+      timer = null
     }
   }
 
