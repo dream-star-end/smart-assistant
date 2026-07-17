@@ -34,7 +34,10 @@ import {
   validateKnowledgePlanetAccountState,
 } from '../src/plugins/knowledgePlanet.js'
 import { resolveKnowledgePlanetLoginPins } from '../src/plugins/knowledgePlanetSetup.js'
-import { runKnowledgePlanetActionSmoke } from '../src/plugins/knowledgePlanetSmoke.js'
+import {
+  KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS,
+  runKnowledgePlanetActionSmoke,
+} from '../src/plugins/knowledgePlanetSmoke.js'
 import {
   KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH,
   type KnowledgePlanetVerificationExpected,
@@ -82,6 +85,7 @@ function verificationExpected(imageId: string): KnowledgePlanetVerificationExpec
     imageId,
     sourceCommit: sourceCommitFromEnv(),
     actionIds: KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.map((action) => action.id),
+    resourceDependentActionIds: KNOWLEDGE_PLANET_RESOURCE_DEPENDENT_ACTION_IDS,
     contract: KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   }
 }
@@ -173,7 +177,11 @@ async function readHandoffIfPresent(
 async function runActionSmoke(
   service: KnowledgePlanetDockerService,
   storageState: BrowserStorageStateV1,
-): Promise<{ passedActionIds: string[]; storageState: BrowserStorageStateV1 }> {
+): Promise<{
+  passedActionIds: string[]
+  resourceUnavailableActionIds: string[]
+  storageState: BrowserStorageStateV1
+}> {
   const registries = createKnowledgePlanetRuntimeRegistries(service)
   const runtime = new ManagedBrowserRuntime({
     ...registries,
@@ -366,7 +374,7 @@ async function verifyUser(userId: number): Promise<void> {
           validateKnowledgePlanetAccountState(reusable.storageState),
         )
         process.stdout.write(
-          `Knowledge Planet user ${userId} existing encrypted login passed all actions; no scan needed.\n`,
+          `Knowledge Planet user ${userId} existing encrypted login executed ${completed.passedActionIds.length} actions; ${completed.resourceUnavailableActionIds.length} resource-dependent actions lacked account data; no scan needed.\n`,
         )
       } catch (error) {
         if (!canRelinkAfter(error)) throw error
@@ -394,6 +402,7 @@ async function verifyUser(userId: number): Promise<void> {
     expectedExistingAccountInstanceId,
     replacementAccountInstanceId,
     passedActionIds: completed.passedActionIds,
+    resourceUnavailableActionIds: completed.resourceUnavailableActionIds,
     storageState: completed.storageState,
     env: process.env,
   })
@@ -401,7 +410,7 @@ async function verifyUser(userId: number): Promise<void> {
     `KNOWLEDGE_PLANET_VERIFICATION_READY=${KNOWLEDGE_PLANET_VERIFICATION_HANDOFF_PATH}\n`,
   )
   process.stdout.write(
-    `Knowledge Planet exact-image action smoke passed (${metadata.verification}); encrypted handoff expires at ${metadata.expiresAt}.\n`,
+    `Knowledge Planet exact-image action smoke passed (${metadata.verification}; ${metadata.passedActionIds.length} actions executed, ${metadata.resourceUnavailableActionIds.length} resource-dependent actions lacked account data); encrypted handoff expires at ${metadata.expiresAt}.\n`,
   )
 }
 

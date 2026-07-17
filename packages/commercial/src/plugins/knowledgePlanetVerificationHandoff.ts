@@ -15,7 +15,7 @@ const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const SOURCE_COMMIT_RE = /^[0-9a-f]{40}$/
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
-const HKDF_INFO = 'openclaude:knowledge-planet-verification-handoff:v1'
+const HKDF_INFO = 'openclaude:knowledge-planet-verification-handoff:v2'
 const HANDOFF_TTL_MS = 15 * 60_000
 const FUTURE_SKEW_MS = 30_000
 const MAX_FILE_BYTES = 512 * 1024
@@ -33,11 +33,12 @@ export interface KnowledgePlanetVerificationExpected {
   imageId: string
   sourceCommit: string
   actionIds: readonly string[]
+  resourceDependentActionIds: readonly string[]
   contract: ManagedBrowserPluginContractV1
 }
 
 export interface KnowledgePlanetVerificationMetadata {
-  schemaVersion: 1
+  schemaVersion: 2
   artifactHash: string
   execContractHash: string
   workerDigest: string
@@ -49,6 +50,7 @@ export interface KnowledgePlanetVerificationMetadata {
   expectedExistingAccountInstanceId: string | null
   replacementAccountInstanceId: string | null
   passedActionIds: string[]
+  resourceUnavailableActionIds: string[]
   cleanupVerified: true
   createdAt: string
   expiresAt: string
@@ -74,6 +76,7 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 }
 
 function validateExpected(expected: KnowledgePlanetVerificationExpected): void {
+  const actionIds = new Set(expected.actionIds)
   if (
     !HASH_RE.test(expected.artifactHash) ||
     !HASH_RE.test(expected.execContractHash) ||
@@ -81,10 +84,48 @@ function validateExpected(expected: KnowledgePlanetVerificationExpected): void {
     !IMAGE_ID_RE.test(expected.imageId) ||
     !SOURCE_COMMIT_RE.test(expected.sourceCommit) ||
     expected.actionIds.length === 0 ||
-    new Set(expected.actionIds).size !== expected.actionIds.length ||
-    expected.actionIds.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 128)
+    actionIds.size !== expected.actionIds.length ||
+    expected.actionIds.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 128) ||
+    new Set(expected.resourceDependentActionIds).size !==
+      expected.resourceDependentActionIds.length ||
+    expected.resourceDependentActionIds.some((id) => !actionIds.has(id))
   )
     throw new Error('Knowledge Planet verification expectation is invalid')
+}
+
+function validateCoverage(
+  passedValue: unknown,
+  unavailableValue: unknown,
+  expected: KnowledgePlanetVerificationExpected,
+): { passedActionIds: string[]; resourceUnavailableActionIds: string[] } | null {
+  if (!Array.isArray(passedValue) || !Array.isArray(unavailableValue)) return null
+  if (
+    passedValue.some((id) => typeof id !== 'string') ||
+    unavailableValue.some((id) => typeof id !== 'string')
+  )
+    return null
+  const passedActionIds = passedValue as string[]
+  const resourceUnavailableActionIds = unavailableValue as string[]
+  const passed = new Set(passedActionIds)
+  const unavailable = new Set(resourceUnavailableActionIds)
+  const allowedUnavailable = new Set(expected.resourceDependentActionIds)
+  if (
+    passed.size !== passedActionIds.length ||
+    unavailable.size !== resourceUnavailableActionIds.length ||
+    [...unavailable].some((id) => !allowedUnavailable.has(id)) ||
+    [...passed].some((id) => unavailable.has(id)) ||
+    expected.actionIds.some((id) => !passed.has(id) && !unavailable.has(id)) ||
+    [...passed].some((id) => !expected.actionIds.includes(id)) ||
+    passedActionIds.join('\0') !==
+      expected.actionIds.filter((id) => passed.has(id)).join('\0') ||
+    resourceUnavailableActionIds.join('\0') !==
+      expected.actionIds.filter((id) => unavailable.has(id)).join('\0')
+  )
+    return null
+  return {
+    passedActionIds: [...passedActionIds],
+    resourceUnavailableActionIds: [...resourceUnavailableActionIds],
+  }
 }
 
 function validateUserId(userId: number): void {
@@ -198,8 +239,13 @@ function parseMetadata(
   expected: KnowledgePlanetVerificationExpected,
   now: number,
 ): KnowledgePlanetVerificationMetadata {
+  const coverage = validateCoverage(
+    raw.passedActionIds,
+    raw.resourceUnavailableActionIds,
+    expected,
+  )
   if (
-    raw.schemaVersion !== 1 ||
+    raw.schemaVersion !== 2 ||
     raw.artifactHash !== expected.artifactHash ||
     raw.execContractHash !== expected.execContractHash ||
     raw.workerDigest !== expected.workerDigest ||
@@ -225,8 +271,7 @@ function parseMetadata(
         raw.replacementAccountInstanceId === null ||
         raw.replacementAccountInstanceId === raw.expectedExistingAccountInstanceId)) ||
     (raw.replaceExistingAccount === false && raw.replacementAccountInstanceId !== null) ||
-    !Array.isArray(raw.passedActionIds) ||
-    raw.passedActionIds.join('\0') !== expected.actionIds.join('\0') ||
+    !coverage ||
     raw.cleanupVerified !== true ||
     typeof raw.createdAt !== 'string' ||
     typeof raw.expiresAt !== 'string'
@@ -243,7 +288,7 @@ function parseMetadata(
   )
     throw new Error('Knowledge Planet verification handoff expired')
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     artifactHash: expected.artifactHash,
     execContractHash: expected.execContractHash,
     workerDigest: expected.workerDigest,
@@ -254,7 +299,8 @@ function parseMetadata(
     replaceExistingAccount: raw.replaceExistingAccount,
     expectedExistingAccountInstanceId: raw.expectedExistingAccountInstanceId as string | null,
     replacementAccountInstanceId: raw.replacementAccountInstanceId as string | null,
-    passedActionIds: [...expected.actionIds],
+    passedActionIds: coverage.passedActionIds,
+    resourceUnavailableActionIds: coverage.resourceUnavailableActionIds,
     cleanupVerified: true,
     createdAt: raw.createdAt,
     expiresAt: raw.expiresAt,
@@ -269,6 +315,7 @@ export async function writeKnowledgePlanetVerificationHandoff(input: {
   expectedExistingAccountInstanceId: string | null
   replacementAccountInstanceId: string | null
   passedActionIds: readonly string[]
+  resourceUnavailableActionIds: readonly string[]
   storageState: unknown
   env?: NodeJS.ProcessEnv
   now?: number
@@ -276,8 +323,13 @@ export async function writeKnowledgePlanetVerificationHandoff(input: {
 }): Promise<KnowledgePlanetVerificationMetadata> {
   validateExpected(input.expected)
   validateUserId(input.userId)
+  const coverage = validateCoverage(
+    input.passedActionIds,
+    input.resourceUnavailableActionIds,
+    input.expected,
+  )
   if (
-    input.passedActionIds.join('\0') !== input.expected.actionIds.join('\0') ||
+    !coverage ||
     (input.verification === 'existing-account' && input.replaceExistingAccount) ||
     !(
       input.expectedExistingAccountInstanceId === null ||
@@ -297,7 +349,7 @@ export async function writeKnowledgePlanetVerificationHandoff(input: {
   const now = input.now ?? Date.now()
   if (!Number.isFinite(now)) throw new Error('Knowledge Planet verification time is invalid')
   const metadata: KnowledgePlanetVerificationMetadata = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     artifactHash: input.expected.artifactHash,
     execContractHash: input.expected.execContractHash,
     workerDigest: input.expected.workerDigest,
@@ -308,7 +360,8 @@ export async function writeKnowledgePlanetVerificationHandoff(input: {
     replaceExistingAccount: input.replaceExistingAccount,
     expectedExistingAccountInstanceId: input.expectedExistingAccountInstanceId,
     replacementAccountInstanceId: input.replacementAccountInstanceId,
-    passedActionIds: [...input.expected.actionIds],
+    passedActionIds: coverage.passedActionIds,
+    resourceUnavailableActionIds: coverage.resourceUnavailableActionIds,
     cleanupVerified: true,
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + HANDOFF_TTL_MS).toISOString(),
@@ -371,6 +424,7 @@ export async function readKnowledgePlanetVerificationHandoff(input: {
       'expectedExistingAccountInstanceId',
       'replacementAccountInstanceId',
       'passedActionIds',
+      'resourceUnavailableActionIds',
       'cleanupVerified',
       'createdAt',
       'expiresAt',
