@@ -285,6 +285,17 @@ export const securityEventWriteFailures = new Counter({
 });
 
 /**
+ * 隐式反馈误伤率活体指标(方案 b / 批E E7)。计数"先落 implicit(弱)down、随后被同一
+ * (user, message) 显式评分覆盖"的事件 —— 用户主动纠正说明那条隐式 down 是误判(误伤)。
+ * 单独 counter,不改表结构;误伤"率"在 Prometheus 侧对隐式产生量取比即可。
+ */
+export const implicitRatingOverridden = new Counter({
+  name: "implicit_rating_overridden_by_explicit_total",
+  help: "Implicit (weak) response ratings later overridden by an explicit rating on the same (user,message) — proxy for implicit-feedback false-positive rate",
+  labelNames: [],
+});
+
+/**
  * preCheck reservation 被 cap 到余额的次数(per model)。
  *
  * 2026-04-26 v1.0.3:preCheck 改为允许 drain-to-zero 后,余额 < 估算 cost
@@ -320,6 +331,11 @@ export function incrAdminAuditWriteFailure(action: string): void {
 
 export function incrSecurityEventWriteFailure(type: string): void {
   securityEventWriteFailures.inc({ type });
+}
+
+/** 隐式 down 被显式评分覆盖(误伤被用户纠正)时 +1。见 implicitRatingOverridden。 */
+export function incrImplicitRatingOverridden(): void {
+  implicitRatingOverridden.inc({});
 }
 
 /**
@@ -703,6 +719,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   claudeApiRequests.render(out);
   adminAuditWriteFailures.render(out);
   securityEventWriteFailures.render(out);
+  implicitRatingOverridden.render(out);
   precheckCappedTotal.render(out);
   // V3 2I-2 新增系列
   anthropicProxyTtft.render(out);
@@ -728,6 +745,8 @@ export function resetMetricsForTest(): void {
   billingDebits.reset();
   claudeApiRequests.reset();
   adminAuditWriteFailures.reset();
+  securityEventWriteFailures.reset();
+  implicitRatingOverridden.reset();
   precheckCappedTotal.reset();
   // V3 2I-2
   anthropicProxyTtft.reset();

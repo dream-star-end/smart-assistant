@@ -24,6 +24,10 @@ TOK=$(curl -sf -X POST "$V5_BASE/api/auth/login" -H 'Content-Type: application/j
 
 auth=(-H "Authorization: Bearer $TOK")
 
+# fail 早于默认清单枚举初始化:枚举阶段(用户技能拉取失败)也要能把它置 1,
+# 且不能被后置的重复初始化清零(fail-closed)。
+fail=0
+
 skills=("$@")
 if [ ${#skills[@]} -eq 0 ]; then
   # 默认清单 = 平台 baseline 里带 evals 的技能(从仓库树枚举 —— /api/skills 是
@@ -35,13 +39,31 @@ if [ ${#skills[@]} -eq 0 ]; then
       skills+=("$(basename "$(dirname "$(dirname "$f")")")")
     done < <(find "$BASELINE_SKILLS_DIR" -mindepth 3 -maxdepth 3 -name evals.json -path '*/evals/*' | sort)
   fi
-  mapfile -t user_skills < <(curl -sf "${auth[@]}" "$V5_BASE/api/skills" |
-    python3 -c 'import sys,json;[print(s["name"]) for s in json.load(sys.stdin).get("skills",[])]')
-  skills+=("${user_skills[@]}")
+  # 用户自建技能:进程替换 `mapfile < <(curl|python3)` 会吞掉 curl/python 的退出码,
+  # 拉取失败时静默得到空数组 → 用户技能被悄悄漏评。落临时文件 + 显式校验退出码,
+  # 失败重试一次;仍失败计 fail(不阻断已枚举的 baseline 平台技能评测,但整轮非零退出)。
+  user_skills_file="$(mktemp)"
+  fetched_user_skills=0
+  for attempt in 1 2; do
+    if curl -sf "${auth[@]}" "$V5_BASE/api/skills" |
+         python3 -c 'import sys,json;[print(s["name"]) for s in json.load(sys.stdin).get("skills",[])]' \
+         > "$user_skills_file"; then
+      fetched_user_skills=1
+      break
+    fi
+    [ "$attempt" -lt 2 ] && sleep 15
+  done
+  if [ "$fetched_user_skills" -eq 1 ]; then
+    mapfile -t user_skills < "$user_skills_file"
+    skills+=("${user_skills[@]}")
+  else
+    echo "== user-skills LIST FAILED (/api/skills 拉取 2 次均失败;本轮仅评测 baseline 平台技能,整轮非零退出)"
+    fail=1
+  fi
+  rm -f "$user_skills_file"
 fi
-[ ${#skills[@]} -gt 0 ] || { echo "no skills to evaluate"; exit 0; }
+[ ${#skills[@]} -gt 0 ] || { echo "no skills to evaluate"; exit "$fail"; }
 
-fail=0
 for name in "${skills[@]}"; do
   # 取 evals 必须区分"确认无 evals"与"取数失败"(容器冷启动的代理瞬态 5xx 曾把
   # web-context 静默跳过):失败重试,重试耗尽计 fail 而不是当作无用例跳过。
@@ -56,7 +78,22 @@ for name in "${skills[@]}"; do
     fail=1
     continue
   fi
-  cases=$(echo "$evals" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len((d.get("evals") or {}).get("cases",[])))' 2>/dev/null || echo 0)
+  # parse 也要 fail-closed:只有"确认无 evals"(合法 JSON 且 cases==0)才允许跳过;取到了
+  # 响应但解析不出(非法 JSON / 结构异常)不能静默当 0 用例漏评。python 成功输出数字,
+  # 异常捕获后输出哨兵 PARSE_ERR;python 本身跑不起来(退出非零)也经 `|| cases=...` 归为哨兵。
+  cases=$(printf '%s' "$evals" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(len((d.get("evals") or {}).get("cases", [])))
+except Exception:
+    print("PARSE_ERR")
+' 2>/dev/null) || cases="PARSE_ERR"
+  if [ "$cases" = "PARSE_ERR" ]; then
+    echo "== eval $name: PARSE FAILED (evals 响应非合法 JSON/结构异常,非'无 evals')"
+    fail=1
+    continue
+  fi
   [ "$cases" -eq 0 ] && continue
   echo "== eval $name ($cases cases) =="
   runId=$(curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
