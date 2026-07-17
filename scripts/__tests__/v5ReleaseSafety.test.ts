@@ -126,6 +126,17 @@ describe('v5 release safety lanes', () => {
     // advisory gate 必须校验 stdout JSON 契约,不依赖 tsx 退出码(fail-open 历史教训)。
     assert.match(source, /advisory == "knowledge-planet"/)
     assert.match(source, /--advisory-status/)
+    const advisoryStatus = seedSource.slice(
+      seedSource.indexOf('async function advisoryStatus()'),
+      seedSource.indexOf('async function assertSetupFirstSafe'),
+    )
+    const artifactMatch = advisoryStatus.indexOf('const artifactMatchesCurrentApproved')
+    const strictLookup = advisoryStatus.indexOf('findApprovedKnowledgePlanetPluginForDeploy')
+    assert.ok(artifactMatch >= 0 && strictLookup > artifactMatch)
+    assert.match(
+      advisoryStatus,
+      /const approvedForDeploy =\s*artifactMatchesCurrentApproved &&\s*\(await findApprovedKnowledgePlanetPluginForDeploy/,
+    )
     assert.equal(
       body.match(/"\$egress_prev_release" "\$kp_had_previous_plugin"/g)?.length,
       2,
