@@ -9,6 +9,20 @@ export const KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES = 1024 * 1024
 export const KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES = 256 * 1024
 export const KNOWLEDGE_PLANET_TOPIC_PAGE_MAX = 10
 
+export const KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE = String.raw`
+function scheduleKnowledgePlanetLoginProbe(now, pageAuthenticated, pageHintApplied, nextProbeAt, attempts) {
+  const applyPageHint = pageAuthenticated && !pageHintApplied;
+  return {
+    pageHintApplied: pageHintApplied || pageAuthenticated,
+    nextProbeAt: applyPageHint ? Math.min(nextProbeAt, now) : nextProbeAt,
+    due: now >= (applyPageHint ? Math.min(nextProbeAt, now) : nextProbeAt) && attempts < ${KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS},
+  };
+}
+
+function hasAuthenticatedKnowledgePlanetSession(probeAuthenticated) {
+  return probeAuthenticated === true;
+}`
+
 export function isKnowledgePlanetQrPixelSampleReady(input: {
   darkFraction: number
   lightFraction: number
@@ -44,6 +58,8 @@ const MAX_STATE_JSON = ${KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES};
 const NUMERIC_ID = /^\d{6,32}$/;
 let terminal = false;
 
+${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}
+
 function fail() {
   if (terminal) return;
   terminal = true;
@@ -62,12 +78,16 @@ function writeFrame(value) {
   process.stdout.write(encodeFrame(value));
 }
 
-async function writeAuthenticatedAndExit(storageState) {
-  const output = encodeFrame({ event: 'authenticated', storageState });
+async function writeTerminalAndExit(value) {
+  const output = encodeFrame(value);
   await new Promise((resolve, reject) => {
     process.stdout.write(output, (error) => error ? reject(error) : resolve());
   });
   process.exit(0);
+}
+
+async function writeAuthenticatedAndExit(storageState) {
+  await writeTerminalAndExit({ event: 'authenticated', storageState });
 }
 
 async function readFrame() {
@@ -568,9 +588,7 @@ async function runAction(input, relay) {
     });
     const data = await boundedJsonResponse(response);
     if (!response.ok() || data?.succeeded !== true) {
-      writeFrame({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
-      terminal = true;
-      return;
+      await writeTerminalAndExit({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
     }
     const state = filteredState(await api.storageState(), input.cookieDomains, input.stateOrigins);
     const serializedState = JSON.stringify(state);
@@ -588,8 +606,7 @@ async function runAction(input, relay) {
       if ('nextEndTime' in result) result.nextEndTime = result[listKey].at(-1)?.createdAt;
       completed = { event: 'completed', result: compact(result), storageState: state };
     }
-    writeFrame(completed);
-    terminal = true;
+    await writeTerminalAndExit(completed);
   } finally {
     await api.dispose();
   }
@@ -796,11 +813,15 @@ async function runLogin(input, relay) {
     writeFrame({ event: 'qr', png: qr.toString('base64') });
     let nextProbeAt = Date.now() + ${KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS};
     let probeAttempts = 0;
+    let pageHintApplied = false;
     while (Date.now() < input.deadlineMs) {
       const url = page.url();
       const loginVisible = await page.getByText('登录知识星球', { exact: false }).first().isVisible().catch(() => false);
       const pageAuthenticated = !/\/login(?:[/?#]|$)/.test(new URL(url).pathname + new URL(url).search) && !loginVisible;
-      const probeAuthenticated = Date.now() >= nextProbeAt && probeAttempts < ${KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS}
+      const probeSchedule = scheduleKnowledgePlanetLoginProbe(Date.now(), pageAuthenticated, pageHintApplied, nextProbeAt, probeAttempts);
+      pageHintApplied = probeSchedule.pageHintApplied;
+      nextProbeAt = probeSchedule.nextProbeAt;
+      const probeAuthenticated = probeSchedule.due
         ? await (async () => {
             probeAttempts += 1;
             const result = await authenticatedProbe(context);
@@ -808,7 +829,7 @@ async function runLogin(input, relay) {
             return result;
           })()
         : false;
-      if (pageAuthenticated || probeAuthenticated) {
+      if (hasAuthenticatedKnowledgePlanetSession(probeAuthenticated)) {
         const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
         await writeAuthenticatedAndExit(state);
       }

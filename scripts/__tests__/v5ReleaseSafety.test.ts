@@ -176,7 +176,7 @@ describe('v5 release safety lanes', () => {
     )
   })
 
-  test('Knowledge Planet setup-first deploy is one-shot, race-guarded, and skips the v1.1 seed', async () => {
+  test('Knowledge Planet setup-first deploy is race-guarded, repeat-safe, and skips the v1.1 seed', async () => {
     const [source, seedSource] = await Promise.all([
       readFile(deploy, 'utf8'),
       readFile(knowledgePlanetSeed, 'utf8'),
@@ -188,6 +188,10 @@ describe('v5 release safety lanes', () => {
     const pre = body.indexOf(
       'knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre',
     )
+    const capturedVersion = body.indexOf(
+      'kp_setup_plugin_version_id="$KNOWLEDGE_PLANET_SETUP_VERSION_ID"',
+      pre,
+    )
     const close = body.indexOf('knowledge_planet_plugin_close_gate "$BUILT_RELEASE"')
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const post = body.indexOf(
@@ -196,7 +200,7 @@ describe('v5 release safety lanes', () => {
     const smoke = body.indexOf('smoke "$ACTIVE_PORT"', post)
     const dist = body.indexOf('dist_handshake_smoke "$ACTIVE_PORT"', smoke)
     const reopen = body.indexOf(
-      'knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release"',
+      'knowledge_planet_plugin_open_setup_first_gate_to_version',
       dist,
     )
     const setupDone = body.indexOf('knowledge-planet=setup-first', reopen)
@@ -205,7 +209,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(
       built >= 0 &&
         pre > built &&
-        close > pre &&
+        capturedVersion > pre &&
+        close > capturedVersion &&
         activation > close &&
         post > activation &&
         smoke > post &&
@@ -224,6 +229,11 @@ describe('v5 release safety lanes', () => {
     assert.match(seedSource, /classifyKnowledgePlanetSetupPin\([\s\S]*compatible-predecessor/)
     assert.match(seedSource, /exactActiveInstalls !== activeInstalls/)
     assert.match(seedSource, /activeAccounts !== 0/)
+    assert.match(seedSource, /--open-setup-first-gate-to-version=ID/)
+    assert.match(
+      seedSource,
+      /async function openSetupFirstListingGateToVersion[\s\S]*loadVerifiedRuntimePluginContract[\s\S]*classifyKnowledgePlanetSetupPin[\s\S]*compatible-predecessor[\s\S]*canonicalSha256Hex\(verified\.contract\.account\)[\s\S]*canonicalSha256Hex\(verified\.contract\.runtime\.accountState\)[\s\S]*openOfficialManagedBrowserPluginListingGate/,
+    )
 
     const missingDist = run(deploy, ['--dry-run', '--defer-knowledge-planet-upgrade'])
     assert.equal(missingDist.status, 2, missingDist.stdout + missingDist.stderr)
@@ -239,6 +249,44 @@ describe('v5 release safety lanes', () => {
     assert.match(accepted.stdout, /setup-first drain 后守卫/)
     assert.match(accepted.stdout, /knowledge-planet=setup-first/)
     assert.doesNotMatch(accepted.stdout, /消费加密交接/)
+  })
+
+  test('Knowledge Planet setup-first compensation restores source then the exact predecessor without a Plugin transition', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'calls=()',
+      'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
+      'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
+      'knowledge_planet_plugin_open_gate_to_release() { calls+=("UNEXPECTED-release-open:$*"); return 92; }',
+      'knowledge_planet_plugin_open_setup_first_gate_to_version() { calls+=("open-exact:$1:$2"); }',
+      'activate_release() { calls+=("activate:$1"); }',
+      'activate_egress_release() { calls+=("UNEXPECTED-egress:$*"); return 93; }',
+      'rollback_runtime_tuple() { calls+=("rollback:$1:$2:$3:$4"); }',
+      'smoke() { calls+=("smoke:$1"); }',
+      'ACTIVE_PORT=18790',
+      'knowledge_planet_compensate_setup_first new-release old-release 0 0 "" 1606',
+      'printf "classic:%s\n" "${calls[*]}"',
+      'calls=()',
+      'knowledge_planet_compensate_setup_first new-release old-release 1 0 "" 1606',
+      'printf "hotcfg:%s\n" "${calls[*]}"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(
+      result.stdout,
+      /classic:close:new-release activate:old-release smoke:18790 open-exact:new-release:1606/,
+    )
+    assert.match(
+      result.stdout,
+      /hotcfg:rollback:1:1:new-release:0 smoke:18790 open-exact:new-release:1606/,
+    )
+    assert.doesNotMatch(result.stdout, /UNEXPECTED/)
   })
 
   test('Knowledge Planet first-publication and hotcfg compensation stay fail-closed', () => {
@@ -2936,5 +2984,140 @@ describe('v5 monitor deploy_state serving lanes', () => {
     assert.doesNotMatch(result.stdout, /openclaude-v5 状态=/)
     assert.match(result.stdout, /write_alert_condition\('ops\.monitor:deploy_state','probe',true/)
     assert.doesNotMatch(result.stdout, /write_alert_condition\('ops\.monitor:(svc_v5|http_v5)'/)
+  })
+})
+
+describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
+  test('F6: inherited deploy-lock fd uses probe-then-relock (rejects unlocked liar)', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // 继承锁 FD 分支:从 `if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then` 到 else 分支起点 `exec 8>"$DEPLOY_LOCK"`。
+    const start = source.indexOf('if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then')
+    const end = source.indexOf('exec 8>"$DEPLOY_LOCK"', start)
+    assert.ok(start >= 0 && end > start, '未找到继承锁 FD 分支')
+    const branch = source.slice(start, end)
+    // ① 另开独立 OFD 的 probe fd(区分"真持锁 vs 谎称持锁"的核心)
+    const probeOpen = branch.indexOf('exec {probe_fd}>"$DEPLOY_LOCK"')
+    // ② probe flock -n 复核:竟成功=锁本空闲=谎称已持锁 → flock -u 释放 + exit 3
+    const probeTry = branch.indexOf('if flock -n "$probe_fd"; then')
+    const probeUnlock = branch.indexOf('flock -u "$probe_fd"')
+    const probeExit = branch.indexOf('exit 3', probeTry)
+    // ③ probe fd 关闭
+    const probeClose = branch.indexOf('exec {probe_fd}>&-')
+    // ④ 与父同 OFD 重入取锁(幂等)必须成功
+    const relock = branch.indexOf('if ! flock -n "$lock_fd"; then')
+    assert.ok(probeOpen >= 0, 'probe fd 未以独立 OFD 打开(exec {probe_fd}>)')
+    assert.ok(probeTry > probeOpen, 'probe flock -n 复核缺失或顺序错(应在 probe fd 打开后)')
+    assert.ok(
+      probeUnlock > probeTry && probeExit > probeUnlock,
+      'probe 抢到锁(谎称已持锁)未走 flock -u 释放 + exit 3',
+    )
+    assert.ok(probeClose > probeOpen, 'probe fd 未关闭(exec {probe_fd}>&-)')
+    assert.ok(relock > probeTry, '末尾对 lock_fd 的重入 flock -n 缺失或顺序错(应在 probe 复核之后)')
+    // ── R2-5:relock 之前的 per-fd FLOCK 归属证明(消 probe→relock 残留 TOCTOU)──
+    // 说明:原议"/proc/locks 取持有 pid + PPid 祖先链"对 flock(1) 不可行(/proc/locks 记录临时 flock 命令
+    // 进程的 pid,检时已 reap,fd-继承协议下既非 $$ 亦非祖先);改用 /proc/self/fdinfo/<fd> 的 per-fd
+    // `lock:` 行直证继承 fd 确已持锁——零 TOCTOU、无需祖先链。断言其存在且在 relock **之前**。
+    const fdinfoProof = branch.indexOf('/proc/self/fdinfo/$lock_fd')
+    const fdinfoGrep = branch.indexOf('FLOCK[[:space:]]+ADVISORY[[:space:]]+WRITE')
+    assert.ok(fdinfoProof >= 0, 'R2-5:缺 /proc/self/fdinfo/<fd> per-fd 归属证明')
+    assert.ok(fdinfoGrep >= 0, 'R2-5:缺 FLOCK ADVISORY WRITE per-fd 校验(继承 fd 确已持锁)')
+    assert.ok(
+      fdinfoProof > probeTry && fdinfoProof < relock,
+      'R2-5:fdinfo 归属证明须在 probe 复核之后、relock **之前**(relock 若 fresh-acquire 会掩盖谎称)',
+    )
+    // 归属证明失败必须 fail-closed(exit 3),而非放行继承。
+    const fdinfoExit = branch.indexOf('exit 3', fdinfoProof)
+    assert.ok(fdinfoExit >= 0 && fdinfoExit < relock, 'R2-5:fdinfo 归属证明失败未 fail-closed exit 3')
+  })
+
+  test('F7: mutation-lease deactivation covered on compensation + emergency/staged flips', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // helper 已定义
+    assert.match(source, /reacquire_mutation_lease_best_effort\(\) \{/)
+    // ── R2-6:补偿路径改为**阻塞等待**重取(远端 flock -w 180),等待失败才降级续作补偿 ──
+    {
+      const rqStart = source.indexOf('reacquire_mutation_lease_best_effort() {')
+      const rqEnd = source.indexOf('# ───────────────────────── dangerous offline cutover', rqStart)
+      assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 reacquire 函数体')
+      const rq = source.slice(rqStart, rqEnd)
+      assert.match(rq, /acquire_production_mutation_lease 180/, 'R2-6:reacquire 未走 180s 阻塞等待重取')
+      assert.match(rq, /CRITICAL/, 'R2-6:reacquire 降级路径缺 CRITICAL stderr')
+      assert.ok(
+        rq.includes('补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受'),
+        'R2-6:reacquire 降级路径缺"已知且接受残余窗口"注记(须同时在函数注释)',
+      )
+    }
+    // acquire 支持可配置等待秒数(默认 60,reacquire 传 180),远端 flock 用参数化等待。
+    assert.ok(source.includes('local lease_wait="${1:-60}"'), 'R2-6:acquire 未参数化等待秒数(默认 60)')
+    assert.match(source, /flock -w \$\{lease_wait\} 9 \|\| exit 75/, 'R2-6:remote lease flock 未用参数化等待秒数')
+    // deploy 两条补偿路径(validation + plugin seed)各挂一次
+    assert.equal(
+      source.match(/reacquire_mutation_lease_best_effort "deploy-validation-compensation"/g)?.length,
+      2,
+      'deploy 补偿(validation + plugin seed)未各挂一次 reacquire',
+    )
+    // deploy 补偿内 reacquire 先于 knowledge_planet_compensate_deploy
+    const deployStart = source.indexOf('\ndeploy() {')
+    const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
+    const deployBody = source.slice(deployStart, deployEnd)
+    assert.ok(
+      deployBody.indexOf('reacquire_mutation_lease_best_effort "deploy-validation-compensation"') <
+        deployBody.indexOf('knowledge_planet_compensate_deploy'),
+      'deploy 补偿 reacquire 未先于 compensate',
+    )
+    // rollback 补偿全覆盖:hotcfg 两条 reverse compensation + 非 hotcfg 三条补偿入口,共 5 次。
+    assert.equal(
+      source.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+      5,
+      'rollback 补偿路径(hotcfg 2 + 非 hotcfg 3)未全挂 reacquire',
+    )
+    // hotcfg 两条紧邻先于 rollback_runtime_tuple 1 1(反向补偿)。
+    assert.match(
+      source,
+      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
+    )
+    // 非 hotcfg 三条:reacquire 紧邻先于 Knowledge Planet 补偿(open_gate / transition)。
+    assert.match(
+      source,
+      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
+    )
+    // 全部 5 次 reacquire 都落在 rollback() 函数体内(不外溢别的 lane)。
+    {
+      const rbStart = source.indexOf('\nrollback() {')
+      const rbEnd = source.indexOf('\nrollback_runtime_tuple() {', rbStart)
+      const rbBody = source.slice(rbStart, rbEnd)
+      assert.equal(
+        rbBody.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+        5,
+        'rollback-compensation reacquire 未全部落在 rollback() 内',
+      )
+    }
+    // abort_continue 恢复动作(caddy_render_reload)前调用
+    const abortStart = source.indexOf('\nabort_continue() {')
+    const abortEnd = source.indexOf('\n# ═════════ --recover', abortStart)
+    const abortBody = source.slice(abortStart, abortEnd)
+    const abortReacquire = abortBody.indexOf('reacquire_mutation_lease_best_effort "abort-continue"')
+    assert.ok(
+      abortReacquire >= 0 && abortReacquire < abortBody.indexOf('caddy_render_reload'),
+      'abort_continue 恢复动作前未挂 reacquire',
+    )
+    // emergency tuple 翻转点:activate saga 前断言 lease
+    const emStart = source.indexOf('\nactivate_emergency_tuple() {')
+    const emEnd = source.indexOf('\nmigrate_to_bluegreen() {', emStart)
+    const emBody = source.slice(emStart, emEnd)
+    const emAssert = emBody.indexOf('assert_mutation_lease_alive "emergency-tuple-flip"')
+    assert.ok(
+      emAssert >= 0 && emAssert < emBody.indexOf('oc_hotcfg_activate_saga'),
+      'emergency tuple 翻转点未在 activate saga 前断言 lease',
+    )
+    // activate-staged 翻转点:systemctl start 前断言 lease
+    const asStart = source.indexOf('\nactivate_staged_inner() {')
+    const asEnd = source.indexOf('\nactivate_staged() {', asStart)
+    const asBody = source.slice(asStart, asEnd)
+    const asAssert = asBody.indexOf('assert_mutation_lease_alive "activate-staged-flip"')
+    assert.ok(
+      asAssert >= 0 && asAssert < asBody.indexOf('systemctl start $V5_UNIT'),
+      'activate-staged 翻转点未在 systemctl start 前断言 lease',
+    )
   })
 })

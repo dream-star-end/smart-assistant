@@ -26,6 +26,9 @@ import {
   listConditions,
   adminUnsuppressCondition,
   adminReleaseRepair,
+  getReleaseRequest,
+  getReleaseFuse,
+  clearReleaseFuse,
   getUserNoticeApprovalState,
   INCIDENTS_MAX_LIMIT,
 } from "../../admin/selfhealOps.js";
@@ -111,6 +114,10 @@ export async function handleAdminResolveIncident(
     if (r.outcome === "already_resolved") {
       throw new HttpError(409, "ALREADY_RESOLVED", "incident already resolved");
     }
+    if (r.outcome === "deploy_in_progress") {
+      // 批1b F8:release 部署在途,禁手动 resolve(与 deployed/deploy_failed receipt 竞态)。
+      throw new HttpError(409, "DEPLOY_IN_PROGRESS", "release deploy in progress; cannot resolve now");
+    }
     sendJson(res, 200, { resolved: true, rev: r.rev, resolution: r.resolution });
   } catch (err) {
     translateRangeError(err);
@@ -164,7 +171,7 @@ export async function handleAdminUnsuppressCondition(
   }
 }
 
-// ─── POST /api/admin/selfheal/repairs/:id/release ───────────────────
+// ─── POST /api/admin/selfheal/repairs/:id/release(批1b:202 异步)────────
 
 const RELEASE_RE = /^\/api\/admin\/selfheal\/repairs\/([1-9][0-9]{0,19})\/release$/;
 
@@ -187,19 +194,26 @@ export async function handleAdminReleaseRepair(
       userAgent: ctx.userAgent,
     });
     if (r.outcome === "not_found") throw new HttpError(404, "NOT_FOUND", "repair not found");
+    if (r.outcome === "malformed") {
+      throw new HttpError(
+        400,
+        "PENDING_RELEASE_MALFORMED",
+        r.reason ?? "pending_release event detail malformed",
+      );
+    }
     if (r.outcome === "conflict") {
       throw new HttpError(409, "CONFLICT", r.reason ?? "repair is not pending release");
     }
-    if (r.outcome === "failed") {
-      // BLOCKER1:含"个人版 2xx 但部署未完成/被拒/失败"——reason 带个人版 status/detail,
-      // 如实透传给 admin UI;claim 已清,可重试。
-      throw new HttpError(
-        502,
-        "RELEASE_FAILED",
-        r.reason ?? "personal-side release failed; retry later",
-      );
+    if (r.outcome === "fuse_engaged") {
+      throw new HttpError(423, "RELEASE_FUSE_ENGAGED", r.reason ?? "release fuse engaged");
     }
-    sendJson(res, 200, { released: true, repairId: m[1] });
+    // 202 已受理(异步):部署由交付步 + callback 异步驱动,Location 指向请求资源。
+    sendJson(
+      res,
+      202,
+      { ok: true, releaseRequestId: r.releaseRequestId, status: "queued" },
+      { Location: `/api/admin/selfheal/release-requests/${r.releaseRequestId}` },
+    );
   } catch (err) {
     translateRangeError(err);
   }
@@ -207,6 +221,65 @@ export async function handleAdminReleaseRepair(
 
 /** router prefix 派发(POST /api/admin/selfheal/repairs/:id/release)。 */
 export const SELFHEAL_REPAIRS_ADMIN_PREFIX = "/api/admin/selfheal/repairs/";
+
+// ─── GET /api/admin/selfheal/release-requests/:rrid(批1b)────────────────
+
+const RELEASE_REQUEST_RE = /^\/api\/admin\/selfheal\/release-requests\/([A-Za-z0-9_-]{1,128})$/;
+
+export async function handleAdminGetReleaseRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  _deps: CommercialHttpDeps,
+): Promise<void> {
+  const m = RELEASE_REQUEST_RE.exec(pathOf(req));
+  if (!m) throw new HttpError(400, "VALIDATION", "invalid releaseRequestId in URL");
+  try {
+    const detail = await getReleaseRequest(m[1]);
+    if (!detail) throw new HttpError(404, "NOT_FOUND", "release request not found");
+    sendJson(res, 200, detail);
+  } catch (err) {
+    translateRangeError(err);
+  }
+}
+
+/** router prefix 派发(GET /api/admin/selfheal/release-requests/:rrid)。 */
+export const SELFHEAL_RELEASE_REQUESTS_PREFIX = "/api/admin/selfheal/release-requests/";
+
+// ─── GET /api/admin/selfheal/release-fuse ; POST …/release-fuse/clear(批1b)──
+
+export async function handleAdminGetReleaseFuse(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  _deps: CommercialHttpDeps,
+): Promise<void> {
+  sendJson(res, 200, await getReleaseFuse());
+}
+
+export async function handleAdminClearReleaseFuse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdmin(req, deps.jwtSecret);
+  const raw = (await readJsonBody(req).catch(() => ({}))) as { reason?: unknown };
+  const reason =
+    typeof raw?.reason === "string" && raw.reason.trim().length > 0
+      ? raw.reason.trim().slice(0, 500)
+      : null;
+  const r = await clearReleaseFuse({
+    adminId: admin.id,
+    ip: ctx.clientIp,
+    userAgent: ctx.userAgent,
+    reason,
+  });
+  if (r.outcome === "not_engaged") {
+    throw new HttpError(409, "NOT_ENGAGED", "release fuse is not engaged");
+  }
+  sendJson(res, 200, { cleared: true });
+}
 
 
 // ─── GET /api/admin/selfheal/user-notices ──────────────────────────

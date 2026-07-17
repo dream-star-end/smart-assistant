@@ -33,6 +33,7 @@ import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
+  KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
@@ -202,10 +203,60 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(isKnowledgePlanetLoginProbeDue(999_999, 3_000, 48), false)
   })
 
+  test('uses a redirect only once to accelerate the authoritative API probe', () => {
+    const controls = Function(
+      `'use strict'; ${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}; return { scheduleKnowledgePlanetLoginProbe, hasAuthenticatedKnowledgePlanetSession };`,
+    )() as {
+      scheduleKnowledgePlanetLoginProbe: (
+        now: number,
+        pageAuthenticated: boolean,
+        pageHintApplied: boolean,
+        nextProbeAt: number,
+        attempts: number,
+      ) => { pageHintApplied: boolean; nextProbeAt: number; due: boolean }
+      hasAuthenticatedKnowledgePlanetSession: (probeAuthenticated: boolean) => boolean
+    }
+    let pageHintApplied = false
+    let nextProbeAt = KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS
+    let attempts = 0
+    const probeTimes: number[] = []
+    for (let now = 0; now <= 12_000; now += 1_000) {
+      const scheduled = controls.scheduleKnowledgePlanetLoginProbe(
+        now,
+        true,
+        pageHintApplied,
+        nextProbeAt,
+        attempts,
+      )
+      pageHintApplied = scheduled.pageHintApplied
+      nextProbeAt = scheduled.nextProbeAt
+      if (!scheduled.due) continue
+      probeTimes.push(now)
+      attempts += 1
+      nextProbeAt = now + KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS
+    }
+    assert.deepEqual(probeTimes, [0, 5_000, 10_000])
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(false), false)
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(true), true)
+
+    const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
+    const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
+    const loginSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(loginStart, entrypointStart)
+    assert.match(
+      loginSource,
+      /if \(hasAuthenticatedKnowledgePlanetSession\(probeAuthenticated\)\) \{[\s\S]*filteredState\([\s\S]*writeAuthenticatedAndExit/,
+    )
+    assert.doesNotMatch(loginSource, /pageAuthenticated \|\| probeAuthenticated/)
+  })
+
   test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
-      /async function writeAuthenticatedAndExit\(storageState\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+      /async function writeTerminalAndExit\(value\)[\s\S]*process\.stdout\.write\(output, \(error\) => error \? reject\(error\) : resolve\(\)\);[\s\S]*process\.exit\(0\)/,
+    )
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /async function writeAuthenticatedAndExit\(storageState\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'authenticated', storageState \}\)/,
     )
     const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
     const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
@@ -216,6 +267,23 @@ describe('official Knowledge Planet Plugin', () => {
       /const state = filteredState\([\s\S]*await writeAuthenticatedAndExit\(state\)/,
     )
     assert.doesNotMatch(loginSource, /writeFrame\(\{ event: 'authenticated'/)
+  })
+
+  test('flushes action terminal frames before exiting instead of waiting on proxy cleanup', () => {
+    const actionStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runAction')
+    const probeStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nasync function authenticatedProbe',
+      actionStart,
+    )
+    assert.ok(actionStart >= 0 && probeStart > actionStart)
+    const actionSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(actionStart, probeStart)
+    assert.match(
+      actionSource,
+      /if \(!response\.ok\(\) \|\| data\?\.succeeded !== true\) \{[\s\S]*await writeTerminalAndExit\(\{ event: 'failed'/,
+    )
+    assert.match(actionSource, /await writeTerminalAndExit\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(completed\)/)
+    assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
   })
 
   test('waits for the real QR image and never publishes the iframe loading mask', () => {

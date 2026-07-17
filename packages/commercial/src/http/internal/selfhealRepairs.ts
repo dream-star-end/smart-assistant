@@ -263,6 +263,99 @@ async function consumeJti(
   return (ins.rowCount ?? 0) > 0;
 }
 
+/**
+ * done → verifying set-once CAS(verify_after=done_at freshness fence 锚点;set-once:
+ * 重复 done 不延窗)。返回受影响行数(0=repair 不在可收口态)。handleDone 与批1b
+ * release deployed 回调共用本 CAS(单一权威——verifying 转移的 SQL/set-once 语义在此一处)。
+ *
+ * 源状态集按调用方分叉(R2-1②):
+ *   - 普通(非 release)done:allowCancelStates=false(默认)→ 只 acked/running/verifying,**保持不变**。
+ *   - release deployed receipt:allowCancelStates=true → 额外允许 cancel_requested/cancelling,
+ *     使"cancel 途中的 repair 收到 deployed receipt"能收口到 verifying(消'request deployed、repair
+ *     永久 cancelling'双权威死锁)。仅由 settleRepairOnDeployedReceipt 传 true。
+ */
+async function casRepairToVerifying(
+  client: PoolClient,
+  repairId: string,
+  summary: string,
+  budgetMs: number,
+  opts: { allowCancelStates?: boolean } = {},
+): Promise<number> {
+  // 源状态集为受控字面量常量(无用户输入拼接),按调用方分叉:release deployed 收口额外纳入 cancel 中间态。
+  const sourceStates = opts.allowCancelStates
+    ? "('acked','running','verifying','cancel_requested','cancelling')"
+    : "('acked','running','verifying')";
+  const cas = await client.query(
+    `UPDATE codex_repairs
+        SET status='verifying',
+            summary=$3,
+            verify_after=COALESCE(verify_after, NOW()),
+            verify_deadline=COALESCE(verify_deadline, NOW() + ($2::bigint * INTERVAL '1 millisecond')),
+            updated_at=NOW()
+      WHERE id=$1::bigint AND status IN ${sourceStates}`,
+    [repairId, budgetMs, summary],
+  );
+  return cas.rowCount ?? 0;
+}
+
+/**
+ * R2-1②:release deployed receipt 的 repair 收口(单一权威,applyDeployedReceipt 与未知 rrid deployed
+ * 分支共用)。扩展 CAS 允许 acked/running/verifying/cancel_requested/cancelling → verifying:
+ *   - 此前处于 cancel_requested/cancelling(cancel 途中,release 已 pre-claim 部署=too_late)且收口成功
+ *     → append cancelReceiptRace 事件(receipt 胜,repair 转入探测验证);
+ *   - 此前处于 running/acked/verifying → 正常 deployed 收口(不额外记 race);
+ *   - 0 行(repair 已真终态 cancelled/failed/succeeded…)→ append 跳过警示(部署事实已落库,归因交人工)。
+ * FOR UPDATE 锁定 repair 行:先读旧态再 CAS,同事务内一致(request 行已在上游 FOR UPDATE,锁序 request→repair)。
+ */
+async function settleRepairOnDeployedReceipt(
+  client: PoolClient,
+  repairId: string,
+  summary: string,
+  eventDetail: Record<string, unknown>,
+): Promise<void> {
+  const prev = await client.query<{ status: string }>(
+    `SELECT status FROM codex_repairs WHERE id=$1::bigint FOR UPDATE`,
+    [repairId],
+  );
+  const priorStatus = prev.rows[0]?.status ?? null;
+  const n = await casRepairToVerifying(client, repairId, summary, verifyBudgetMs(), { allowCancelStates: true });
+  if (n === 0) {
+    await appendEvent(
+      client,
+      repairId,
+      "note",
+      "deployed 回调:repair 不在可收口态(cancelled/已终态),verifying 收口跳过(部署事实已记录)",
+      eventDetail,
+    );
+    return;
+  }
+  if (priorStatus === "cancel_requested" || priorStatus === "cancelling") {
+    await appendEvent(
+      client,
+      repairId,
+      "note",
+      "cancelReceiptRace: receipt 胜,repair 转入探测验证(cancel 途中收到 deployed receipt,收口到 verifying)",
+      { ...eventDetail, cancelReceiptRace: true },
+    );
+  }
+}
+
+/**
+ * 批1b F8②:部署流程中(该 repair 有活跃 release request:queued/accepted/deploying)时,
+ * 模型不得用普通 done/failed **独立终态** repair —— repair 必须停在 running(pending_release
+ * 姿态),由 release callback(deployed→verifying / deploy_failed→留 running)驱动。
+ * 返回 true = 存在活跃 release request(调用方据此 409,且必须在 jti 消费**之前**判定,
+ * 避免误吞 jti 让合法重试受阻)。
+ */
+async function hasActiveReleaseRequest(client: PoolClient, repairId: string): Promise<boolean> {
+  const r = await client.query(
+    `SELECT 1 FROM selfheal_release_requests
+      WHERE repair_id = $1::bigint AND status IN ('queued','accepted','deploying') LIMIT 1`,
+    [repairId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 async function handleDone(
   id: string,
   message: string,
@@ -271,23 +364,16 @@ async function handleDone(
 ): Promise<ActionResult> {
   const budget = verifyBudgetMs();
   return tx(async (client) => {
+    // F8②:活跃 release request 在途 → 模型不得普通 done 终态 repair(在 jti 消费前判定,不吞 token)。
+    if (await hasActiveReleaseRequest(client, id)) {
+      return { code: "conflict", message: "repair has an active release request; deploy flow owns terminal transition" };
+    }
     // M2:jti 一次性消费与状态 CAS + event 同事务;冲突 = 该 token 已成功 done 过 → 409。
     if (!(await consumeJti(client, id, jti, "done"))) {
       return { code: "conflict", message: "capability token already consumed for done (replay)" };
     }
-    // done → verifying(不直接 succeeded);verify_after=done_at(freshness fence 锚点,
-    // set-once:重复 done 不延窗)。
-    const cas = await client.query(
-      `UPDATE codex_repairs
-          SET status='verifying',
-              summary=$3,
-              verify_after=COALESCE(verify_after, NOW()),
-              verify_deadline=COALESCE(verify_deadline, NOW() + ($2::bigint * INTERVAL '1 millisecond')),
-              updated_at=NOW()
-        WHERE id=$1::bigint AND status IN ('acked','running','verifying')`,
-      [id, budget, message.slice(0, 1000)],
-    );
-    if ((cas.rowCount ?? 0) === 0) {
+    // done → verifying(不直接 succeeded);verify_after=done_at(freshness fence 锚点,set-once)。
+    if ((await casRepairToVerifying(client, id, message.slice(0, 1000), budget)) === 0) {
       const cur = await client.query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [id]);
       const st = cur.rows[0]?.status;
       if (!st) return { code: "not_found" };
@@ -305,6 +391,11 @@ async function handleFailed(
   jti: string,
 ): Promise<ActionResult> {
   return tx(async (client) => {
+    // F8②:活跃 release request 在途 → 模型不得普通 failed 终态 repair(deploy_failed 由 release
+    // callback 驱动,repair 停留 running 待 boss 重新放行)。在 jti 消费前判定,不吞 token。
+    if (await hasActiveReleaseRequest(client, id)) {
+      return { code: "conflict", message: "repair has an active release request; deploy flow owns terminal transition" };
+    }
     // M2:同 handleDone,jti 消费与 CAS 同事务;冲突 = 重放 → 409。
     if (!(await consumeJti(client, id, jti, "failed"))) {
       return { code: "conflict", message: "capability token already consumed for failed (replay)" };
@@ -324,6 +415,227 @@ async function handleFailed(
     }
     await appendEvent(client, id, "failed", message, detail);
     return { code: "ok", body: { status: "failed" } };
+  });
+}
+
+// ─── 批1b:release 回调分流(detail.releaseRequestId)────────────────────
+
+/** release request 活跃(可推进)状态。终态/cancelled 到达 = 幂等 no-op。 */
+const RELEASE_ACTIVE = ["queued", "accepted", "deploying"];
+
+/**
+ * 部署终态 receipt(个人版 release worker 异步回传)。请求行已被乐观 cancel 时收到这些 =
+ * receipt 胜过乐观 cancel(F2③):照常应用终态转移(deployed 仍推 verifying;deploy_unknown 仍拉熔断)。
+ */
+const TERMINAL_RECEIPT_PHASES = new Set(["deployed", "deploy_failed", "deploy_unknown"]);
+
+/** deployed receipt:请求→deployed + 事件 + jti + repair(含 cancel 途中)→verifying 收口(R2-1②/F8③)。 */
+async function applyDeployedReceipt(
+  client: PoolClient,
+  rrid: string,
+  repairId: string,
+  action: string,
+  message: string,
+  eventDetail: Record<string, unknown>,
+  jti: string | undefined,
+): Promise<void> {
+  await client.query(
+    `UPDATE selfheal_release_requests
+        SET status='deployed', updated_at=NOW(), resolved_at=NOW()
+      WHERE release_request_id=$1`,
+    [rrid],
+  );
+  await appendEvent(client, repairId, action, message, eventDetail);
+  // 请求 CAS 已是 replay 守卫,jti 消费为 belt-and-suspenders(与正常 done 同纪律)。
+  if (jti) await consumeJti(client, repairId, jti, "done");
+  // §4/R2-1②:同一事务 repair running/cancel_requested/cancelling → verifying 收口(deployed receipt 胜过
+  // 在途 cancel);F8③:repair 已真终态(cancelled/failed/…)时 CAS 0 行,只 append 警示事件(不失败)。
+  await settleRepairOnDeployedReceipt(client, repairId, message.slice(0, 1000), eventDetail);
+}
+
+/** deploy_unknown receipt:请求→deploy_unknown + 全局熔断 engage + 事件 + F13① critical 告警事件。 */
+async function applyDeployUnknownReceipt(
+  client: PoolClient,
+  rrid: string,
+  repairId: string,
+  action: string,
+  message: string,
+  eventDetail: Record<string, unknown>,
+  reason: string | null,
+): Promise<void> {
+  await client.query(
+    `UPDATE selfheal_release_requests
+        SET status='deploy_unknown', failure_reason=$2, updated_at=NOW(), resolved_at=NOW()
+      WHERE release_request_id=$1`,
+    [rrid, reason],
+  );
+  // §4:同事务 engage 全局 Tier2 部署熔断(fuse 行 CAS,首次 engage first-write-wins;新 engage 复位)。
+  await client.query(
+    `UPDATE selfheal_release_fuse
+        SET engaged=TRUE, reason=$2, release_request_id=$1, engaged_at=NOW(),
+            engaged_by='callback:deploy_unknown',
+            cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
+      WHERE id=1 AND engaged=FALSE`,
+    [rrid, reason ?? "deploy_unknown"],
+  );
+  await appendEvent(client, repairId, action, message, eventDetail);
+  // F13①:同事务 append 一条 critical 告警事件(durable 记录);实际 outbox enqueue 由 sweeper
+  // fuse-engaged 步幂等发(callback 端不在 tx 内做 fire-and-forget enqueue,避免非事务副作用)。
+  await appendEvent(
+    client,
+    repairId,
+    "note",
+    `CRITICAL deploy_unknown:全局 Tier2 部署熔断已 engage(reason=${reason ?? "deploy_unknown"});` +
+      "禁自动部署,待人工按 /version·deploy_state·远端 ref 裁决后走 fuse-clear 审计流。",
+    { ...eventDetail, critical: true, fuseEngaged: true },
+  );
+}
+
+/**
+ * F9a:未知 rrid(break-glass 本地 rrid)终态回调也要收口(操作在 URL/capability 认证的 repair 上;
+ * 无请求行可 CAS,故不动 selfheal_release_requests):
+ *   - deployed → repair running→verifying 收口 + 事件(break-glass/auto 部署成功也要走探测归因);
+ *   - deploy_unknown → 同事务 engage 全局熔断 + 事件 + F13① critical 告警事件;
+ *   - 其余 → 照旧仅记录事件。
+ */
+async function handleUnknownRridReleaseCallback(
+  client: PoolClient,
+  repairIdFromPath: string,
+  rrid: string,
+  releasePhase: string,
+  action: string,
+  message: string,
+  eventDetail: Record<string, unknown>,
+  reason: string | null,
+  jti: string | undefined,
+): Promise<ActionResult> {
+  const body = { status: "release_event_recorded", releaseRequestId: rrid };
+  if (releasePhase === "deployed") {
+    await appendEvent(client, repairIdFromPath, action, message, eventDetail);
+    if (jti) await consumeJti(client, repairIdFromPath, jti, "done");
+    // R2-1②:break-glass deployed 同样按扩展 CAS 收口(cancel 途中的 repair 也不能永久卡 cancelling)。
+    await settleRepairOnDeployedReceipt(client, repairIdFromPath, message.slice(0, 1000), eventDetail);
+    return { code: "ok", body };
+  }
+  if (releasePhase === "deploy_unknown") {
+    await client.query(
+      `UPDATE selfheal_release_fuse
+          SET engaged=TRUE, reason=$1, release_request_id=$2, engaged_at=NOW(),
+              engaged_by='callback:deploy_unknown:unknown_rrid',
+              cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
+        WHERE id=1 AND engaged=FALSE`,
+      [reason ?? "deploy_unknown", rrid],
+    );
+    await appendEvent(client, repairIdFromPath, action, message, eventDetail);
+    await appendEvent(client, repairIdFromPath, "note",
+      `CRITICAL deploy_unknown(未知 rrid):全局 Tier2 部署熔断已 engage(reason=${reason ?? "deploy_unknown"});禁自动部署,待人工裁决。`,
+      { ...eventDetail, critical: true, fuseEngaged: true });
+    return { code: "ok", body };
+  }
+  // deploying / deploy_failed / manual_required / 非法:照旧仅记录事件(容忍 break-glass)。
+  await appendEvent(client, repairIdFromPath, action, message, eventDetail);
+  return { code: "ok", body };
+}
+
+/**
+ * release 回调处理(§4)。传输 action 仍 progress|done|failed,release 语义放 detail:
+ *   deploying → progress;deployed → done;deploy_failed/deploy_unknown/manual_required → failed。
+ * 分流纪律:
+ *   - 有 rrid:**只**更新 selfheal_release_requests(CAS by rrid)+ append event。
+ *     `deployed` **同一事务**再做 repair running→verifying 收口(复用 casRepairToVerifying);
+ *     `deploy_failed/manual_required` **不**动 repair(停留 running,boss 可重新放行 → 新 rrid);
+ *     `deploy_unknown` 同事务 engage 全局熔断 + F13① critical 告警事件。
+ *   - rrid 未知 → F9a:deployed/deploy_unknown 也在 URL 认证 repair 上收口,其余仅事件。
+ *   - 请求行 status='cancelled' 收到终态 receipt(deployed/deploy_failed/deploy_unknown)→ F2③:
+ *     **receipt 胜过乐观 cancel**,照常应用终态转移 + 一条竞态警示事件。
+ * 请求行 CAS(WHERE status IN active)是重放/乱序守卫:终态到达即幂等,天然不回退。
+ */
+async function handleReleaseCallback(
+  repairIdFromPath: string,
+  rrid: string,
+  releasePhase: string,
+  action: string,
+  message: string,
+  detail: Record<string, unknown>,
+  jti: string | undefined,
+): Promise<ActionResult> {
+  // 事件 detail 必带 releaseRequestId+releasePhase(getReleaseRequest 靠它关联;
+  // 防个人版 detail 顶层遗漏或被脱敏挪位)。
+  const eventDetail: Record<string, unknown> = { ...detail, releaseRequestId: rrid, releasePhase };
+  const reason = typeof detail.reason === "string" ? detail.reason.slice(0, 2000) : null;
+  return tx(async (client) => {
+    const rq = await client.query<{ repair_id: string; status: string }>(
+      `SELECT repair_id::text AS repair_id, status
+         FROM selfheal_release_requests WHERE release_request_id = $1 FOR UPDATE`,
+      [rrid],
+    );
+    if (rq.rows.length === 0) {
+      // F9a:未知 rrid(break-glass 本地 rrid 等)终态回调也要收口。
+      return handleUnknownRridReleaseCallback(
+        client, repairIdFromPath, rrid, releasePhase, action, message, eventDetail, reason, jti,
+      );
+    }
+    // capability 逐 repair 最小权限强绑定:rrid 必须属于 URL/capability 认证的同一 repair。
+    // 否则"repair X 的 capability + repair Y 的 rrid"可跨界推进他人请求(污染事件流/
+    // deployed 推 verifying/deploy_unknown 拉全局熔断)。不匹配 = 409,不泄露行归属。
+    if (rq.rows[0].repair_id !== repairIdFromPath) {
+      return { code: "conflict", message: "releaseRequestId does not belong to this repair" };
+    }
+    const repairId = rq.rows[0].repair_id;
+    const curStatus = rq.rows[0].status;
+
+    // F2③:请求已被乐观置 cancelled,但收到终态 receipt → receipt 胜(照常应用终态转移)。
+    const cancelReceiptRace = curStatus === "cancelled" && TERMINAL_RECEIPT_PHASES.has(releasePhase);
+    // 终态/cancelled:幂等,只记录事件不改状态(per-repair 保序保证 deploying 先于终态)。
+    // 例外:cancelled × 终态 receipt(cancelReceiptRace)落到下方 switch 应用终态转移。
+    if (!RELEASE_ACTIVE.includes(curStatus) && !cancelReceiptRace) {
+      await appendEvent(client, repairId, action, message, eventDetail);
+      return { code: "ok", body: { status: curStatus, releaseRequestId: rrid } };
+    }
+    if (cancelReceiptRace) {
+      // 竞态警示事件:请求已乐观 cancel,个人版 receipt 表明部署实际有了终态。下方终态 UPDATE
+      // 无 status 守卫,会从 cancelled 覆盖到 receipt 终态(deployed 仍推 verifying / deploy_unknown 仍拉熔断)。
+      await appendEvent(client, repairId, "note",
+        `cancel/receipt 竞态,receipt 胜(releasePhase=${releasePhase}):${message}`,
+        { ...eventDetail, cancelReceiptRace: true });
+    }
+
+    switch (releasePhase) {
+      case "deploying": {
+        await client.query(
+          `UPDATE selfheal_release_requests SET status='deploying', updated_at=NOW()
+            WHERE release_request_id=$1 AND status IN ('queued','accepted','deploying')`,
+          [rrid],
+        );
+        await appendEvent(client, repairId, action, message, eventDetail);
+        return { code: "ok", body: { status: "deploying", releaseRequestId: rrid } };
+      }
+      case "deployed": {
+        await applyDeployedReceipt(client, rrid, repairId, action, message, eventDetail, jti);
+        return { code: "ok", body: { status: "deployed", releaseRequestId: rrid } };
+      }
+      case "deploy_failed":
+      case "manual_required": {
+        await client.query(
+          `UPDATE selfheal_release_requests
+              SET status=$2, failure_reason=$3, updated_at=NOW(), resolved_at=NOW()
+            WHERE release_request_id=$1`,
+          [rrid, releasePhase, reason],
+        );
+        await appendEvent(client, repairId, action, message, eventDetail);
+        // repair 不动(停留 running,pending_release 姿态)。
+        return { code: "ok", body: { status: releasePhase, releaseRequestId: rrid } };
+      }
+      case "deploy_unknown": {
+        await applyDeployUnknownReceipt(client, rrid, repairId, action, message, eventDetail, reason);
+        return { code: "ok", body: { status: "deploy_unknown", releaseRequestId: rrid } };
+      }
+      default: {
+        // rrid 已知但 releasePhase 非法:仅记录事件(留痕),不改状态,200 ack 避免重投风暴。
+        await appendEvent(client, repairId, action, message, eventDetail);
+        return { code: "ok", body: { status: curStatus, releaseRequestId: rrid } };
+      }
+    }
   });
 }
 
@@ -460,26 +772,42 @@ export async function dispatchSelfhealRepairsRoute(
   // M4:message 是 codex 自由文本,同样过值级凭据清洗(key 级对纯字符串是 no-op)。
   const message = scrubSecretsInString(parsed.message);
 
+  // 批1b:release 回调分流(§4)。detail.releaseRequestId 存在 = release 语义(progress/done/
+  // failed 传输仍不变,语义在 detail.releasePhase);无 rrid = 原 repair 语义完全不变。
+  // rrid/phase 取**未脱敏**的 parsed.detail(路由字段,非凭据)。
+  const rawDetail = parsed.detail;
+  const rrid =
+    rawDetail && typeof rawDetail.releaseRequestId === "string" && rawDetail.releaseRequestId.length > 0
+      ? rawDetail.releaseRequestId
+      : null;
+  const releasePhase =
+    rawDetail && typeof rawDetail.releasePhase === "string" ? rawDetail.releasePhase : "";
+  const isReleaseAction = action === "progress" || action === "done" || action === "failed";
+
   try {
     let result: ActionResult;
-    switch (action) {
-      case "ack":
-        result = await handleAck(repairId, message, detail);
-        break;
-      case "progress":
-        result = await handleProgress(repairId, message, detail);
-        break;
-      case "verify":
-        result = await handleVerify(repairId, message, detail);
-        break;
-      case "done":
-        result = await handleDone(repairId, message, detail, cap.jti!);
-        break;
-      case "failed":
-        result = await handleFailed(repairId, message, detail, cap.jti!);
-        break;
-      default:
-        result = { code: "not_found" };
+    if (rrid && isReleaseAction) {
+      result = await handleReleaseCallback(repairId, rrid, releasePhase, action, message, detail, cap.jti);
+    } else {
+      switch (action) {
+        case "ack":
+          result = await handleAck(repairId, message, detail);
+          break;
+        case "progress":
+          result = await handleProgress(repairId, message, detail);
+          break;
+        case "verify":
+          result = await handleVerify(repairId, message, detail);
+          break;
+        case "done":
+          result = await handleDone(repairId, message, detail, cap.jti!);
+          break;
+        case "failed":
+          result = await handleFailed(repairId, message, detail, cap.jti!);
+          break;
+        default:
+          result = { code: "not_found" };
+      }
     }
     if (result.code === "not_found") {
       sendError(res, 404, "NOT_FOUND", "repair not found", requestId);
