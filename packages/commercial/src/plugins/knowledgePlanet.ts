@@ -847,7 +847,7 @@ export function createKnowledgePlanetRuntimeRegistries(service: KnowledgePlanetD
     version: KNOWLEDGE_PLANET_DRIVER_VERSION,
     launcherId: KNOWLEDGE_PLANET_LAUNCHER_ID,
     launcherVersion: KNOWLEDGE_PLANET_LAUNCHER_VERSION,
-    maximumNetwork: { origins: ['https://api.zsxq.com'], methods: ['GET'] },
+    maximumNetwork: { origins: ['https://api.zsxq.com'], methods: ['GET', 'POST'] },
     async execute(args) {
       if (!(args.session instanceof KnowledgePlanetManagedSession))
         throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'driver session is invalid')

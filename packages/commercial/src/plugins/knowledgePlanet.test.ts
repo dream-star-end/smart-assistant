@@ -8,6 +8,7 @@ import { afterEach, describe, test } from 'node:test'
 
 import type Docker from 'dockerode'
 
+import { ManagedBrowserRuntime } from './browserRuntime.js'
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 
 import {
@@ -608,6 +609,27 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       KNOWLEDGE_PLANET_LAUNCHER_ID,
       `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`,
+    )
+    const driver = registries.drivers.get(
+      `${KNOWLEDGE_PLANET_DRIVER_ID}@${KNOWLEDGE_PLANET_DRIVER_VERSION}`,
+    )
+    assert.ok(driver)
+    assert.deepEqual(
+      driver.maximumNetwork.origins.map((origin) => new URL(origin).origin),
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network.origins.map(
+        (origin) => new URL(origin).origin,
+      ),
+    )
+    assert.deepEqual(
+      driver.maximumNetwork.methods,
+      KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.network.methods,
+    )
+    assert.equal(
+      new ManagedBrowserRuntime({
+        ...registries,
+        profileRoot: '/tmp/not-used',
+      }).supportsContract(KNOWLEDGE_PLANET_PLUGIN_CONTRACT),
+      true,
     )
   })
 
