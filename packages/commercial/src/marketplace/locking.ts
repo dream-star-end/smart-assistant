@@ -159,6 +159,7 @@ export interface LockedMarketplaceListing {
   kind: 'skill' | 'agent' | 'connector'
   pluginType: MarketplacePluginType | null
   state: string
+  revokedReason: string | null
   ownerUserId: string
   orgId: string | null
   currentApprovedVersionId: string | null
@@ -174,11 +175,12 @@ export async function lockMarketplaceListing(
     kind: 'skill' | 'agent' | 'connector'
     plugin_type: MarketplacePluginType | null
     state: string
+    revoked_reason: string | null
     owner_user_id: string
     org_id: string | null
     current_approved_version_id: string | null
   }>(
-    `SELECT slug, kind, plugin_type, state, owner_user_id::text,
+    `SELECT slug, kind, plugin_type, state, revoked_reason, owner_user_id::text,
             org_id::text, current_approved_version_id::text
        FROM marketplace_skill_listings
       WHERE slug = $1
@@ -192,6 +194,7 @@ export async function lockMarketplaceListing(
     kind: row.kind,
     pluginType: row.plugin_type,
     state: row.state,
+    revokedReason: row.revoked_reason,
     ownerUserId: row.owner_user_id,
     orgId: row.org_id,
     currentApprovedVersionId: row.current_approved_version_id,

@@ -11,7 +11,7 @@ import { skillContentHash } from '@openclaude/storage'
 import { canonicalBytes } from '../connectors/spec/canonical.js'
 import { getPool } from '../db/index.js'
 import { query, tx } from '../db/queries.js'
-import { lockMarketplaceListing, lockMarketplaceVersion } from './locking.js'
+import type { PluginLeaseRedis } from '../plugins/accountLease.js'
 import {
   COMPILED_KNOWLEDGE_PLANET_PLUGIN,
   KNOWLEDGE_PLANET_PLUGIN_ARTIFACT,
@@ -19,14 +19,15 @@ import {
   KNOWLEDGE_PLANET_PLUGIN_VERSION,
 } from '../plugins/knowledgePlanetContract.js'
 import {
+  OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+  openOfficialManagedBrowserPluginListingGate,
+  transitionOfficialManagedBrowserPluginVersion,
+} from '../plugins/officialManagedBrowserTransition.js'
+import {
   approveOfficialRuntimePluginVersion,
   loadVerifiedRuntimePluginContract,
 } from '../plugins/review.js'
-import type { PluginLeaseRedis } from '../plugins/accountLease.js'
-import {
-  OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
-  transitionOfficialManagedBrowserPluginVersion,
-} from '../plugins/officialManagedBrowserTransition.js'
+import { lockMarketplaceListing, lockMarketplaceVersion } from './locking.js'
 import {
   MarketplaceError,
   installApprovedVersion,
@@ -366,6 +367,8 @@ export async function seedKnowledgePlanetPlugin(input: {
   env?: NodeJS.ProcessEnv
   leaseRedis?: PluginLeaseRedis | null
   migrateLegacyInstalls?: boolean
+  /** Runs after account/install pins move while the listing remains unlisted. */
+  beforeListingOpen?: (target: { versionId: string }) => Promise<void>
 }): Promise<SeedKnowledgePlanetPluginResult> {
   if (input.functionalVerified !== true)
     throw new Error('Knowledge Planet Plugin requires live functional verification')
@@ -458,7 +461,19 @@ export async function seedKnowledgePlanetPlugin(input: {
     env,
     pool: getPool(),
     redis: input.leaseRedis,
+    ...(input.beforeListingOpen ? { openListingAtCommit: false } : {}),
   })
+  if (input.beforeListingOpen) {
+    await input.beforeListingOpen({ versionId: located.id })
+    await openOfficialManagedBrowserPluginListingGate({
+      slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      expectedVersionId: located.id,
+      expectedArtifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
+      expectedExecContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
+      env,
+      pool: getPool(),
+    })
+  }
   const trusted = await findApprovedKnowledgePlanetPlugin(env)
   if (!trusted || trusted.versionId !== located.id || trusted.ownerUserId !== ownerUserId)
     throw new Error('Knowledge Planet Plugin approval failed exact trust verification')
@@ -468,9 +483,7 @@ export async function seedKnowledgePlanetPlugin(input: {
       ? { migrated: 0, skippedExisting: 0 }
       : await migrateLegacySkillInstalls(located.id)
   const retiredLegacyListing =
-    input.migrateLegacyInstalls === false
-      ? false
-      : await retireLegacyKnowledgePlanetSkillListing()
+    input.migrateLegacyInstalls === false ? false : await retireLegacyKnowledgePlanetSkillListing()
   return {
     ownerUserId,
     versionId: located.id,

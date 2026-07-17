@@ -21,7 +21,9 @@ import {
   findApprovedKnowledgePlanetPluginForDeploy,
   seedKnowledgePlanetPlugin,
 } from '../marketplace/seedKnowledgePlanetPlugin.js'
+import { acquirePluginAccountLease } from '../plugins/accountLease.js'
 import {
+  bindManagedBrowserPluginAccount,
   commitPluginAccountState,
   createManagedBrowserPluginAccount,
   decryptPluginAccountEnvelope,
@@ -30,7 +32,6 @@ import {
 } from '../plugins/accounts.js'
 import { compileRuntimePluginArtifact } from '../plugins/contracts.js'
 import { KnowledgePlanetRuntimeError } from '../plugins/knowledgePlanet.js'
-import { acquirePluginAccountLease } from '../plugins/accountLease.js'
 import {
   COMPILED_KNOWLEDGE_PLANET_PLUGIN,
   KNOWLEDGE_PLANET_PLUGIN_ARTIFACT,
@@ -38,15 +39,16 @@ import {
   KNOWLEDGE_PLANET_PLUGIN_VERSION,
 } from '../plugins/knowledgePlanetContract.js'
 import {
-  approveOfficialRuntimePluginVersion,
-  approveRuntimePluginVersion,
-  loadVerifiedRuntimePluginContract,
-} from '../plugins/review.js'
-import {
+  OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
   closeOfficialManagedBrowserPluginListingGate,
   openOfficialManagedBrowserPluginListingGate,
   transitionOfficialManagedBrowserPluginVersion,
 } from '../plugins/officialManagedBrowserTransition.js'
+import {
+  approveOfficialRuntimePluginVersion,
+  approveRuntimePluginVersion,
+  loadVerifiedRuntimePluginContract,
+} from '../plugins/review.js'
 import { PluginRuntimeFacade, PluginRuntimeFacadeError } from '../plugins/runtime.js'
 
 const TEST_DB_URL =
@@ -611,6 +613,7 @@ describe('marketplace Plugin kernel migration', () => {
          ('knowledge-planet-active@test.local', 'x', TRUE),
          ('knowledge-planet-error@test.local', 'x', TRUE),
          ('knowledge-planet-no-account@test.local', 'x', TRUE),
+         ('knowledge-planet-mutation@test.local', 'x', TRUE),
          ('knowledge-planet-soft@test.local', 'x', TRUE),
          ('knowledge-planet-orphan@test.local', 'x', TRUE),
          ('knowledge-planet-partial@test.local', 'x', TRUE)
@@ -735,12 +738,14 @@ describe('marketplace Plugin kernel migration', () => {
       const activeUserId = transitionUserId('knowledge-planet-active@test.local')
       const errorUserId = transitionUserId('knowledge-planet-error@test.local')
       const noAccountUserId = transitionUserId('knowledge-planet-no-account@test.local')
+      const mutationUserId = transitionUserId('knowledge-planet-mutation@test.local')
       const softUserId = transitionUserId('knowledge-planet-soft@test.local')
       const orphanUserId = transitionUserId('knowledge-planet-orphan@test.local')
       for (const userId of [
         activeUserId,
         errorUserId,
         noAccountUserId,
+        mutationUserId,
         softUserId,
         orphanUserId,
         partialUserId,
@@ -846,18 +851,256 @@ describe('marketplace Plugin kernel migration', () => {
         env: process.env,
       })
 
+      const initialHandoffBinds: Array<
+        Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
+      > = []
+      const refreshedHandoffBinds: Array<
+        Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
+      > = []
+      const replacementHandoffBinds: Array<
+        Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
+      > = []
+      const initialHandoffState = storageState('verified-handoff-initial')
+      const verifiedHandoffState = storageState('verified-handoff-refreshed')
+      const relinkedHandoffState = storageState('verified-handoff-relinked')
+      const relinkedAccountInstanceId = '10000000-0000-4000-8000-000000000001'
       const seeded = await seedKnowledgePlanetPlugin({
         functionalVerified: true,
         ownerUserId: Number(admin.rows[0]!.id),
         env: process.env,
         leaseRedis: transitionRedis,
+        beforeListingOpen: async ({ versionId }) => {
+          const gate = await query<{ state: string }>(
+            'SELECT state FROM marketplace_skill_listings WHERE slug = $1',
+            [KNOWLEDGE_PLANET_PLUGIN_SLUG],
+          )
+          assert.equal(gate.rows[0]?.state, 'unlisted')
+          initialHandoffBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              displayName: 'Verified Knowledge Planet',
+              accountHint: 'one scan',
+              storageState: initialHandoffState,
+              existing: 'reuse-identical',
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+          await assert.rejects(
+            bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              storageState: verifiedHandoffState,
+              existing: 'reuse-identical',
+              expectedExistingAccountInstanceId: initialHandoffBinds[0]!.accountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+            /differs from verified state/,
+          )
+          await assert.rejects(
+            bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              storageState: verifiedHandoffState,
+              existing: 'refresh-fenced',
+              expectedExistingAccountInstanceId: '00000000-0000-4000-8000-000000000001',
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+            /handoff account identity changed/,
+          )
+          refreshedHandoffBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              displayName: 'Verified Knowledge Planet',
+              accountHint: 'refreshed during action smoke',
+              storageState: verifiedHandoffState,
+              existing: 'refresh-fenced',
+              expectedExistingAccountInstanceId: initialHandoffBinds[0]!.accountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+          assert.equal(
+            refreshedHandoffBinds[0]!.accountInstanceId,
+            initialHandoffBinds[0]!.accountInstanceId,
+          )
+          const refreshedRow = await getPluginAccount(
+            refreshedHandoffBinds[0]!.id,
+            noAccountUserId,
+            getPool(),
+            { includeError: true },
+          )
+          const refreshedVerified = await loadVerifiedRuntimePluginContract(
+            Number(versionId),
+            getPool(),
+            { env: process.env, allowUnlisted: true },
+          )
+          assert.ok(refreshedRow && refreshedVerified.pluginType === 'managed-browser')
+          if (!refreshedRow || refreshedVerified.pluginType !== 'managed-browser')
+            throw new Error('unexpected refreshed handoff account')
+          assert.deepEqual(
+            decryptPluginAccountEnvelope(refreshedRow, refreshedVerified.contract, process.env)
+              .storageState,
+            verifiedHandoffState,
+          )
+          await assert.rejects(
+            bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              storageState: relinkedHandoffState,
+              existing: 'replace',
+              expectedExistingAccountInstanceId: '00000000-0000-4000-8000-000000000001',
+              replacementAccountInstanceId: relinkedAccountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+            /handoff account identity changed/,
+          )
+          replacementHandoffBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              displayName: 'Verified Knowledge Planet',
+              accountHint: 'relinked after expiry',
+              storageState: relinkedHandoffState,
+              existing: 'replace',
+              expectedExistingAccountInstanceId: refreshedHandoffBinds[0]!.accountInstanceId,
+              replacementAccountInstanceId: relinkedAccountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+        },
       })
       assert.equal(seeded.published, true)
       assert.equal(seeded.migratedUsers, 1)
       assert.equal(seeded.skippedExistingUsers, 1)
-      assert.equal(seeded.migratedPluginInstalls, 4)
+      assert.equal(seeded.migratedPluginInstalls, 5)
       assert.equal(seeded.migratedPluginAccounts, 2)
       assert.equal(seeded.retiredLegacyListing, true)
+      assert.equal(initialHandoffBinds[0]?.outcome, 'created')
+      assert.equal(refreshedHandoffBinds[0]?.outcome, 'refreshed')
+      assert.equal(replacementHandoffBinds[0]?.outcome, 'replaced')
+      assert.equal(replacementHandoffBinds[0]?.accountInstanceId, relinkedAccountInstanceId)
+
+      await closeOfficialManagedBrowserPluginListingGate({
+        slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+        env: process.env,
+      })
+      await assert.rejects(
+        seedKnowledgePlanetPlugin({
+          functionalVerified: true,
+          env: process.env,
+          leaseRedis: transitionRedis,
+          beforeListingOpen: async () => {
+            throw new Error('simulated crash after transition before handoff bind')
+          },
+        }),
+        /simulated crash/,
+      )
+      const closedAfterCrash = await query<{ state: string }>(
+        'SELECT state FROM marketplace_skill_listings WHERE slug = $1',
+        [KNOWLEDGE_PLANET_PLUGIN_SLUG],
+      )
+      assert.equal(closedAfterCrash.rows[0]?.state, 'unlisted')
+      const retryHandoffBinds: Array<Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>> =
+        []
+      await seedKnowledgePlanetPlugin({
+        functionalVerified: true,
+        env: process.env,
+        leaseRedis: transitionRedis,
+        beforeListingOpen: async ({ versionId }) => {
+          retryHandoffBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              displayName: 'Verified Knowledge Planet',
+              accountHint: 'one scan',
+              storageState: relinkedHandoffState,
+              existing: 'reuse-identical',
+              expectedExistingAccountInstanceId: replacementHandoffBinds[0]!.accountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+        },
+      })
+      assert.equal(retryHandoffBinds[0]?.outcome, 'reused')
+
+      const crashReplacementState = storageState('verified-handoff-crash-replacement')
+      const crashReplacementAccountInstanceId = '10000000-0000-4000-8000-000000000002'
+      const crashReplacementBinds: Array<
+        Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
+      > = []
+      await closeOfficialManagedBrowserPluginListingGate({
+        slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+        env: process.env,
+      })
+      await assert.rejects(
+        seedKnowledgePlanetPlugin({
+          functionalVerified: true,
+          env: process.env,
+          leaseRedis: transitionRedis,
+          beforeListingOpen: async ({ versionId }) => {
+            crashReplacementBinds.push(
+              await bindManagedBrowserPluginAccount({
+                userId: noAccountUserId,
+                versionId: Number(versionId),
+                displayName: 'Verified Knowledge Planet',
+                accountHint: 'replacement committed before crash',
+                storageState: crashReplacementState,
+                existing: 'replace',
+                expectedExistingAccountInstanceId: relinkedAccountInstanceId,
+                replacementAccountInstanceId: crashReplacementAccountInstanceId,
+                unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+                env: process.env,
+              }),
+            )
+            throw new Error('simulated crash after handoff replacement before listing open')
+          },
+        }),
+        /simulated crash after handoff replacement/,
+      )
+      assert.equal(crashReplacementBinds[0]?.outcome, 'replaced')
+      assert.equal(crashReplacementBinds[0]?.accountInstanceId, crashReplacementAccountInstanceId)
+      const closedAfterReplacementCrash = await query<{ state: string }>(
+        'SELECT state FROM marketplace_skill_listings WHERE slug = $1',
+        [KNOWLEDGE_PLANET_PLUGIN_SLUG],
+      )
+      assert.equal(closedAfterReplacementCrash.rows[0]?.state, 'unlisted')
+      const replayedReplacementBinds: Array<
+        Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
+      > = []
+      await seedKnowledgePlanetPlugin({
+        functionalVerified: true,
+        env: process.env,
+        leaseRedis: transitionRedis,
+        beforeListingOpen: async ({ versionId }) => {
+          replayedReplacementBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              displayName: 'Verified Knowledge Planet',
+              accountHint: 'replacement replay',
+              storageState: crashReplacementState,
+              existing: 'replace',
+              expectedExistingAccountInstanceId: relinkedAccountInstanceId,
+              replacementAccountInstanceId: crashReplacementAccountInstanceId,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+        },
+      })
+      assert.equal(replayedReplacementBinds[0]?.outcome, 'reused')
+      assert.equal(
+        replayedReplacementBinds[0]?.accountInstanceId,
+        crashReplacementAccountInstanceId,
+      )
       const trusted = await findApprovedKnowledgePlanetPlugin(process.env)
       assert.equal(trusted?.versionId, seeded.versionId)
       const detail = await getListingDetail(KNOWLEDGE_PLANET_PLUGIN_SLUG)
@@ -948,6 +1191,23 @@ describe('marketplace Plugin kernel migration', () => {
         agent_ids: ['main', `user-${noAccountUserId}`],
         uninstalled_at: null,
       })
+      const handoffAccount = await query<{ id: string }>(
+        `SELECT id::text AS id FROM connections
+          WHERE user_id = $1 AND provider = $2 AND revoked_at IS NULL`,
+        [noAccountUserId, KNOWLEDGE_PLANET_PLUGIN_SLUG],
+      )
+      assert.equal(handoffAccount.rowCount, 1)
+      const handoffRow = await getPluginAccount(
+        handoffAccount.rows[0]!.id,
+        noAccountUserId,
+        getPool(),
+        { includeError: true },
+      )
+      assert.ok(handoffRow)
+      assert.deepEqual(
+        decryptPluginAccountEnvelope(handoffRow, newVerified.contract, process.env).storageState,
+        crashReplacementState,
+      )
       const untouchedInstalls = await query<{
         user_id: number
         version_id: string
@@ -1044,8 +1304,7 @@ describe('marketplace Plugin kernel migration', () => {
       assert.equal(await facade.classifyTarget(activeUserId, activeAccount.id), null)
       await assert.rejects(
         installApprovedVersion({ userId: softUserId, versionId: seeded.versionId }),
-        (error: unknown) =>
-          error instanceof MarketplaceError && error.code === 'NOT_INSTALLABLE',
+        (error: unknown) => error instanceof MarketplaceError && error.code === 'NOT_INSTALLABLE',
       )
       await assert.rejects(
         createManagedBrowserPluginAccount({
@@ -1138,7 +1397,7 @@ describe('marketplace Plugin kernel migration', () => {
         openListingAtCommit: false,
       })
       await new Promise((resolve) => setTimeout(resolve, 300))
-      assert.equal(await recordUninstall(noAccountUserId, KNOWLEDGE_PLANET_PLUGIN_SLUG), true)
+      assert.equal(await recordUninstall(mutationUserId, KNOWLEDGE_PLANET_PLUGIN_SLUG), true)
       await heldInvocationLease.release()
       const downgraded = await downgradePromise
       assert.equal(downgraded.targetVersionId, oldVersion.rows[0]!.id)
@@ -1151,9 +1410,9 @@ describe('marketplace Plugin kernel migration', () => {
       })
       assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 4)
       await installApprovedVersion({
-        userId: noAccountUserId,
+        userId: mutationUserId,
         versionId: oldVersion.rows[0]!.id,
-        agentIds: ['main', `user-${noAccountUserId}`],
+        agentIds: ['main', `user-${mutationUserId}`],
         scopeMode: 'replace',
       })
 
