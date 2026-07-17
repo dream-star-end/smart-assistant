@@ -62,12 +62,16 @@ function writeFrame(value) {
   process.stdout.write(encodeFrame(value));
 }
 
-async function writeAuthenticatedAndExit(storageState) {
-  const output = encodeFrame({ event: 'authenticated', storageState });
+async function writeTerminalAndExit(value) {
+  const output = encodeFrame(value);
   await new Promise((resolve, reject) => {
     process.stdout.write(output, (error) => error ? reject(error) : resolve());
   });
   process.exit(0);
+}
+
+async function writeAuthenticatedAndExit(storageState) {
+  await writeTerminalAndExit({ event: 'authenticated', storageState });
 }
 
 async function readFrame() {
@@ -568,9 +572,7 @@ async function runAction(input, relay) {
     });
     const data = await boundedJsonResponse(response);
     if (!response.ok() || data?.succeeded !== true) {
-      writeFrame({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
-      terminal = true;
-      return;
+      await writeTerminalAndExit({ event: 'failed', code: response.status() === 401 || [1001, 1002, 1059].includes(data?.code) ? 'LOGIN_EXPIRED' : 'UPSTREAM_FAILED' });
     }
     const state = filteredState(await api.storageState(), input.cookieDomains, input.stateOrigins);
     const serializedState = JSON.stringify(state);
@@ -588,8 +590,7 @@ async function runAction(input, relay) {
       if ('nextEndTime' in result) result.nextEndTime = result[listKey].at(-1)?.createdAt;
       completed = { event: 'completed', result: compact(result), storageState: state };
     }
-    writeFrame(completed);
-    terminal = true;
+    await writeTerminalAndExit(completed);
   } finally {
     await api.dispose();
   }
