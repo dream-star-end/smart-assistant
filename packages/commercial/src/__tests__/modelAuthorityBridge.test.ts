@@ -432,6 +432,9 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
   });
 
   test("角色分档窗口投影:kimi-k3 user 签 512000,admin 签 1048576;glm-5.2 不受影响", async () => {
+    // 结构 guard(勿删):这是**执行轴**(JWT 角色 → bridge 签发 descriptor.contextWindow)
+    // 唯一的端到端证据。执行轴不进 projectionRevision 409 对账(那只覆盖 listForUser 的 DB
+    // 角色列表轴),所以删掉本用例 = 拆掉执行轴唯一防线的另一半,漂移将无任何自动化拦截。
     // modelRolePolicy 的签发边界落点:descriptor.contextWindow 按连接角色收窄,
     // 驱动 CCB auto-compact —— 这是"admin 1M / 其他 500k"的实际执行面。
     const grab = async (role: "user" | "admin", model: string): Promise<number | null> => {

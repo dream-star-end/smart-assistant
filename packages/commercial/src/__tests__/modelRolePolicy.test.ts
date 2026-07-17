@@ -28,7 +28,12 @@ import {
 } from '../billing/modelRolePolicy.js'
 
 // ─── 纯函数契约 ──────────────────────────────────────────────────────────
-
+//
+// 结构 guard(勿删):projectContextWindowForRole 是列表轴与**执行轴**共用的唯一纯函数。
+// 执行轴(userChatBridge 按 JWT 角色签发 descriptor.contextWindow)**从不进 409 对账**——
+// 它的一致性没有对账兜底,唯一防线就是这个纯函数 + 两处落点单测(本文件 / modelAuthority
+// Bridge.test.ts:431 bridge 签发)。删掉本 describe = 拆掉执行轴唯一防线的一半;新增任何按
+// 角色投影模型窗口的消费方,必须同步扩这里的契约用例。
 describe('projectContextWindowForRole — 纯函数契约', () => {
   test('kimi-k3:admin 1M 原样,user 收窄 500k(512000)', () => {
     assert.equal(projectContextWindowForRole('kimi-k3', 1_048_576, 'admin'), 1_048_576)
