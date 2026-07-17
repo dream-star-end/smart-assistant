@@ -3426,3 +3426,52 @@ describe("sys.context_rebuilt 帧处理", () => {
     sock.stop();
   });
 });
+
+// ═══════════════ 同步权威传播:过期载荷整体拒绝(版本护栏)═══════════════
+describe("applyServerMessages 版本护栏", () => {
+  const srvRow = (id: string, seq: number, updTs: number): ChatMessage =>
+    ({ id, role: "assistant", text: `v${updTs}`, ts: updTs, _source: "server", _seq: seq, _orderSeq: seq }) as ChatMessage;
+
+  test("被证明过期的载荷(updatedAt<水位)整体丢弃:不覆盖消息、不回退归档计数、水位不动", () => {
+    const sock = makeSocket();
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 200)], true, 2, {
+      archivedThroughSeq: 0, archivedCount: 7, serverUpdatedAt: 200,
+    });
+    const before = sock.sessions.get("s1")!;
+    expect(before.messages.find((m) => m.id === "srv-a")!.text).toBe("v200");
+    // 旧 full 晚到:同 id 旧内容 + 回退的归档计数 → 必须整体无副作用
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 1, 100)], true, 1, {
+      archivedThroughSeq: 0, archivedCount: 3, serverUpdatedAt: 100,
+    });
+    const s = sock.sessions.get("s1")!;
+    expect(s.messages.find((m) => m.id === "srv-a")!.text).toBe("v200");
+    expect(s._archivedCount).toBe(7);
+    expect(s._lastServerSyncUpdatedAt).toBe(200);
+    sock.stop();
+  });
+
+  test("等于/高于水位的载荷正常应用,水位随 full 与增量共同推进", () => {
+    const sock = makeSocket();
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 200)], true, 2, { serverUpdatedAt: 200 });
+    // 增量推进水位到 300
+    sock.applyServerMessages("s1", "main", [srvRow("srv-b", 3, 300)], false, 3, { serverUpdatedAt: 300 });
+    expect(sock.sessions.get("s1")!._lastServerSyncUpdatedAt).toBe(300);
+    // 250 的旧 full(介于两者)被拒:srv-b 不被"缺席删除"
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 200)], true, 2, { serverUpdatedAt: 250 });
+    expect(sock.sessions.get("s1")!.messages.some((m) => m.id === "srv-b")).toBe(true);
+    // 350 的 fresh full 不含 srv-b → 版本护栏通过,缺席删除传播生效
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 340)], true, 2, { serverUpdatedAt: 350 });
+    expect(sock.sessions.get("s1")!.messages.some((m) => m.id === "srv-b")).toBe(false);
+    sock.stop();
+  });
+
+  test("无版本信息的载荷照常合并但不授出缺席删除", () => {
+    const sock = makeSocket();
+    sock.applyServerMessages("s1", "main", [srvRow("srv-a", 2, 200)], true, 2, { serverUpdatedAt: 200 });
+    sock.applyServerMessages("s1", "main", [srvRow("srv-c", 4, 400)], true, 4);
+    const s = sock.sessions.get("s1")!;
+    expect(s.messages.some((m) => m.id === "srv-c")).toBe(true);
+    expect(s.messages.some((m) => m.id === "srv-a")).toBe(true); // 缺席但无授权 → 保留
+    sock.stop();
+  });
+});
