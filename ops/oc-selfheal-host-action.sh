@@ -24,7 +24,16 @@ emit() { # emit <outcome> <exit_code> <detail-json>
     "$OPCODE" "$1" "$2" "${3:-null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
-# ── 与正常部署/开发的协调(最后一道闸)────────────────────────────────
+# ── 互斥正确性来源 = production-mutation lease(flock,见 acquire_mutation_lease)──
+# 批1b 起,每个 mutating opcode 执行前对 /run/openclaude-v5/production-mutation.lock
+# 取非阻塞 flock(见下方 acquire_mutation_lease),与 deploy-v5.sh 的远端写 lane 争用
+# **同一把锁**;跨部署/自愈的互斥正确性由该 lease 保证——自愈的 ssh 动作现在会被
+# 正在收尾的 deploy 持锁挡下(下面旧注释担心的"ssh 动作拦不住它"已由 lease 根治)。
+# 因此下面的 maintenance marker 检查**回归本职:只做告警隔离**(RFC §1.2),不再承担
+# 互斥正确性,仅作为过渡冗余保留(marker TTL 180s 早于 lease 建立/收尾更久那段边缘
+# 窗口的双保险/灰度期便于观测)。
+#
+# ── 与正常部署/开发的协调(过渡冗余:marker 告警隔离)──────────────────
 # 第一道闸在 monitor:planned-maintenance 窗口内的 check 不投影 condition,自愈
 # 根本不会被派单。但 marker TTL 只有 180s,而部署收尾/失败/回滚可能更久:那个
 # 边缘窗口里 monitor 会重新写 firing,自愈就可能和正在收尾的部署**抢着重启同一
@@ -51,6 +60,27 @@ stand_down_if_maintenance() { # 退出码 66 = 为部署让路(与 64/65 同属"
   exit 66
 }
 
+# ── production-mutation lease(批1b:跨部署/自愈互斥的**唯一正确性来源**)────────
+# 在 mutating opcode 执行前取非阻塞 flock,持有到进程退出(fd 9 一直开着 = 一直持有,
+# 绝不 flock -u)。与 deploy-v5.sh 的远端写 lane 争用同一把锁——deploy 持锁时自愈让路。
+# lease 目录可能尚不存在 → best-effort 创建;无法创建/打开锁 = fail-closed → rejected 66
+#(绝不在无 lease 的情况下继续执行 opcode)。busy 与 marker 让路同族,统一用 exit 66。
+acquire_mutation_lease() {
+  local dir="/run/openclaude-v5"
+  local lease="${OC_SELFHEAL_MUTATION_LEASE:-$dir/production-mutation.lock}"
+  mkdir -p "$dir" 2>/dev/null || true
+  # exec 的重定向失败在 `if !` 条件里会被捕获(返回非零),不会让脚本静默退出;
+  # 因此这里能 fail-closed 地 emit 后再 exit,而不是被 redirect error 直接掐断。
+  if ! exec 9>"$lease"; then
+    emit rejected 66 "$(printf '{"reason":"cannot open production-mutation lease (fail-closed)","lease":"%s"}' "$lease")"
+    exit 66
+  fi
+  if ! flock -n 9; then
+    emit rejected 66 "$(printf '{"reason":"production-mutation lease busy: deploy/mutation in progress","lease":"%s"}' "$lease")"
+    exit 66
+  fi
+}
+
 # opcode 必须是单 token 版本化标识,禁一切参数/空格/元字符。
 if [[ ! "$OPCODE" =~ ^[a-z0-9-]+$ ]]; then
   emit rejected 64 '{"reason":"opcode must be a single versioned token, no args"}'
@@ -65,7 +95,8 @@ case "$OPCODE" in
     ;;
 
   restart-v5-egress-v1)
-    stand_down_if_maintenance
+    stand_down_if_maintenance   # 过渡冗余告警隔离(互斥正确性来自下面的 lease)
+    acquire_mutation_lease      # 持有 lease 直到进程退出,包住整个 opcode
     out="$(systemctl restart "$EGRESS_UNIT" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       emit completed 0 "$(printf '{"unit":"%s"}' "$EGRESS_UNIT")"
@@ -77,7 +108,8 @@ case "$OPCODE" in
     ;;
 
   clean-v5-disk-v1)
-    stand_down_if_maintenance
+    stand_down_if_maintenance   # 过渡冗余告警隔离(互斥正确性来自下面的 lease)
+    acquire_mutation_lease      # 持有 lease 直到进程退出,包住整个 opcode
     # 固定步骤、固定上限,绝不接受调用方参数。docker 只 prune 对象(NEVER
     # --volumes:卷含真实数据是红线);journal 定量回收。
     d_out="$(docker system prune -f 2>&1)"; d_rc=$?

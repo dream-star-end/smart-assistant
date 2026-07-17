@@ -274,9 +274,35 @@ export interface VerifyOpts {
   canonicalRepo?: string
   canonicalBranch?: string
   layers?: VerificationLayer[]
+  /** Surface-specific layer NAMES to run on top of the base layers (batch1b:
+   *  the classification's `verifyLayers`). Each is unioned+de-duplicated, then
+   *  fail-closed validated: the name must match `^[a-z0-9:_-]+$` AND exist as a
+   *  script in the checked-out tree's package.json. A name that fails either is
+   *  recorded as a FAILED layer (never executed) so a surface whose required
+   *  test cannot run can never yield `allPassed=true`. */
+  extraLayers?: string[]
   installStep?: VerificationLayer | null
   signingKey?: string
   run?: CommandRunner
+}
+
+/** Layer/script name shape for the fail-closed extra-layer allowlist. */
+const LAYER_NAME_RE = /^[a-z0-9:_-]+$/
+
+/** Read the set of npm `scripts` names from the checked-out tree's package.json.
+ *  Any read/parse error yields an empty set (fail-closed: every extra layer then
+ *  reports "no such script" rather than silently passing). */
+function readPackageScripts(worktreeDir: string): Set<string> {
+  try {
+    const pkg = JSON.parse(readFileSync(join(worktreeDir, 'package.json'), 'utf-8')) as {
+      scripts?: unknown
+    }
+    const s = pkg.scripts
+    if (s && typeof s === 'object' && !Array.isArray(s)) return new Set(Object.keys(s))
+  } catch {
+    /* fall through to empty — fail closed */
+  }
+  return new Set()
 }
 
 export interface VerifyOutcome {
@@ -401,7 +427,34 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
     throw new Error(`worktree add failed (code ${wt.code}): ${wt.stderr.slice(0, 500)}`)
   }
 
-  const steps: VerificationLayer[] = installStep ? [installStep, ...layers] : [...layers]
+  // Surface-specific extra layers (batch1b), fail-closed. Names already covered
+  // by a base layer are dropped; the rest are validated against the tree's
+  // package.json scripts + the name allowlist. Invalid ones become FAILED layers
+  // that are never executed (a required surface test that can't run must never
+  // let `allPassed` be true).
+  const baseNames = new Set(layers.map((l) => l.name))
+  const requestedExtra = (opts.extraLayers ?? []).filter((n, i, a) => a.indexOf(n) === i)
+  const resolvedExtra: VerificationLayer[] = []
+  const invalidExtra: { name: string; reason: string }[] = []
+  if (requestedExtra.length > 0) {
+    const scripts = readPackageScripts(worktreeDir)
+    for (const name of requestedExtra) {
+      if (baseNames.has(name)) continue
+      if (!LAYER_NAME_RE.test(name)) {
+        invalidExtra.push({ name, reason: 'illegal layer name' })
+      } else if (!scripts.has(name)) {
+        invalidExtra.push({ name, reason: 'no such npm script' })
+      } else {
+        resolvedExtra.push({ name, cmd: 'npm', args: ['run', name] })
+      }
+    }
+  }
+
+  const steps: VerificationLayer[] = [
+    ...(installStep ? [installStep] : []),
+    ...layers,
+    ...resolvedExtra,
+  ]
   const results: VerificationLayerResult[] = []
   let allPassed = true
   for (const layer of steps) {
@@ -434,6 +487,20 @@ export async function verify(opts: VerifyOpts): Promise<VerifyOutcome> {
       allPassed = false
       break // fail fast — no point running later layers
     }
+  }
+
+  // Fail-closed extra layers: only relevant if everything runnable passed. A
+  // single unavailable required layer forces allPassed=false without executing.
+  if (allPassed && invalidExtra.length > 0) {
+    const inv = invalidExtra[0]
+    results.push({
+      name: inv.name,
+      ok: false,
+      code: -1,
+      durationMs: 0,
+      tail: `layer unavailable: ${inv.reason}`,
+    })
+    allPassed = false
   }
 
   const result: VerificationResult = {

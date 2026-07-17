@@ -79,14 +79,41 @@ describe('SKILL.md subcommand surface', () => {
     }
   })
 
-  it('routes the transport drill to context/report only', () => {
+  it('grades the drill sub-branches: transport = context/report only, release = verify+cutover', () => {
+    // Both drill keys must be documented.
     assert.match(skill, /selfheal\.drill:transport_v1/)
-    const drillSection = skill.slice(
-      skill.indexOf('## 演练'),
-      skill.indexOf('## 流程'),
+    assert.match(skill, /selfheal\.drill:release_v1/)
+
+    // The drill section splits into a transport sub-branch then a release
+    // sub-branch, both before `## 流程`. Anchor on the stable sub-headers.
+    const drillStart = skill.indexOf('## 演练')
+    const transportStart = skill.indexOf('### 传输演练')
+    const releaseStart = skill.indexOf('### 放行演练')
+    const drillEnd = skill.indexOf('## 流程')
+    assert.ok(
+      drillStart >= 0 &&
+        transportStart > drillStart &&
+        releaseStart > transportStart &&
+        drillEnd > releaseStart,
+      'drill section must carry a transport sub-branch then a release sub-branch, before ## 流程',
     )
-    assert.ok(drillSection.length > 0, 'SKILL must carry a drill branch')
-    assert.doesNotMatch(drillSection, /oc-selfheal\s+(verify|cutover)/)
+
+    // Transport sub-branch: names its key and NEVER escalates to verify/cutover.
+    const transport = skill.slice(transportStart, releaseStart)
+    assert.match(transport, /selfheal\.drill:transport_v1/)
+    assert.doesNotMatch(
+      transport,
+      /oc-selfheal\s+(verify|cutover)/,
+      'transport drill must stay context/report only',
+    )
+
+    // Release sub-branch: names its key AND drives the full verify→cutover
+    // release lane, appending to the release-drill ledger.
+    const release = skill.slice(releaseStart, drillEnd)
+    assert.match(release, /selfheal\.drill:release_v1/)
+    assert.match(release, /oc-selfheal\s+verify/, 'release drill must verify the drill commit')
+    assert.match(release, /oc-selfheal\s+cutover/, 'release drill must cutover the drill commit')
+    assert.match(release, /RELEASE_DRILLS\.md/, 'release drill must append to the release-drill ledger')
   })
 })
 

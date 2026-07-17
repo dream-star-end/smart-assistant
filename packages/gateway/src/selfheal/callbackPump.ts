@@ -39,6 +39,33 @@ import { CapabilityClaimRejectedError, claimSelfhealCapability } from './jobWork
 
 const rootLog = createLogger({ module: 'selfheal-callback-pump' })
 
+/**
+ * Map an outbox phase to the wire callback action (§5.3). The v5 side reads the
+ * real release phase from detail.releasePhase; the transport action is only
+ * progress|done|failed:
+ *   pending_release / deploying                        → progress
+ *   deployed / done                                    → done
+ *   deploy_failed / deploy_unknown / manual_required   → failed
+ *   failed                                             → failed
+ */
+export function phaseToAction(phase: string): 'progress' | 'done' | 'failed' {
+  switch (phase) {
+    case 'pending_release':
+    case 'deploying':
+      return 'progress'
+    case 'deployed':
+    case 'done':
+      return 'done'
+    case 'deploy_failed':
+    case 'deploy_unknown':
+    case 'manual_required':
+    case 'failed':
+      return 'failed'
+    default:
+      return 'failed'
+  }
+}
+
 const DEFAULT_INTERVAL_MS = 5_000
 const DEFAULT_BATCH_LIMIT = 16
 const SEND_TIMEOUT_MS = 20_000
@@ -196,8 +223,7 @@ export class SelfhealCallbackPump {
   }
 
   private async deliver(row: SelfhealCallbackRow): Promise<void> {
-    const action: 'progress' | 'done' | 'failed' =
-      row.phase === 'pending_release' ? 'progress' : row.phase === 'failed' ? 'failed' : 'done'
+    const action = phaseToAction(row.phase)
     const ctx = { id: row.id, repairId: row.repairId, phase: row.phase, attempts: row.attempts }
 
     // Fresh capability per send (the 90min TTL would otherwise 401 a late

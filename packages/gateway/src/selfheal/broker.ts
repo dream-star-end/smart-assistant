@@ -37,6 +37,7 @@ import { type Server, type Socket, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
   type BrokerClaimResult,
+  type ReleaseJobInsertInput,
   type SelfhealCallbackPhase,
   commitBrokerOutcomeWithCallback,
   finalizeBrokerAction,
@@ -53,8 +54,13 @@ import {
   type CommandRunner,
   type RunOpts,
 } from './brokerActions.js'
-import { listToolchainTouches } from './deployDriver.js'
-import { withRepairLock } from './executionLedger.js'
+import {
+  type CutoverClassifyResult,
+  classifyDiff,
+  classifyForCutover,
+  loadTrustedManifest,
+} from './deploySurfaces.js'
+import { releasePayloadHash } from './releaseIntake.js'
 import {
   type SignedVerification,
   type VerifyOutcome,
@@ -122,6 +128,11 @@ export interface RepairAuthorityRecord {
    *  start. Drill authorization reads ONLY this value — never the model's
    *  self-description. null/absent = not frozen = treated as non-drill. */
   conditionKey?: string | null
+  /** Incident this repair belongs to (from the durable repair record). The
+   *  auto-deploy enqueue freezes it into the release job; sourced from the SAME
+   *  authority fetch rather than a second job read. null/absent ⇒ auto release
+   *  is refused (fail-closed — a release job must be traceable to an incident). */
+  incidentId?: string | null
 }
 
 /**
@@ -133,6 +144,30 @@ export interface RepairAuthorityRecord {
  * boundary). Exact-match only; future drill kinds extend this set explicitly.
  */
 export const SELFHEAL_DRILL_TRANSPORT_KEY = 'selfheal.drill:transport_v1'
+
+/**
+ * Release-drill condition key (batch1b) — cross-repo contract with the v5 side
+ * (packages/commercial/src/selfheal/conditionKeys.ts SELFHEAL_DRILL_RELEASE,
+ * SAME string). A repair whose FROZEN key equals this may exercise the full
+ * verify + cutover release path (still held at pending_release — a drill never
+ * auto-deploys), but NOTHING else.
+ */
+export const SELFHEAL_DRILL_RELEASE_KEY = 'selfheal.drill:release_v1'
+
+/**
+ * Per-drill server-side action allowlist, keyed by the FROZEN condition key.
+ * A drill repair may ONLY perform actions in its set; everything else — every
+ * Tier1 host opcode included — is rejected before the idempotency claim.
+ *
+ * INVARIANT (RFC §5 "Tier1 拒一切 drill"): no drill allowlist may ever contain a
+ * Tier1 host-opcode kind. Because these sets hold only block-C kinds
+ * (context/report/verify/cutover), Tier1 opcodes (routed via handleTier1) are
+ * structurally denied for every drill — this map is the single authority.
+ */
+const DRILL_ALLOWED_ACTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  [SELFHEAL_DRILL_TRANSPORT_KEY, new Set([CONTEXT_KIND, REPORT_KIND])],
+  [SELFHEAL_DRILL_RELEASE_KEY, new Set([CONTEXT_KIND, REPORT_KIND, VERIFY_KIND, CUTOVER_KIND])],
+])
 
 /** Resolves the durable repair record for a repairId (or null if none). */
 export type RepairAuthority = (repairId: string) => Promise<RepairAuthorityRecord | null>
@@ -150,6 +185,7 @@ const defaultRepairAuthority: RepairAuthority = async (repairId) => {
         capability: job.capability,
         releaseRevoked: job.releaseRevoked,
         conditionKey: job.conditionKey,
+        incidentId: job.incidentId,
       }
     : null
 }
@@ -177,35 +213,12 @@ export interface BrokerResponse {
     message: string
     detail: Record<string, unknown>
   }
-}
-
-/**
- * Map a releaseApproved outcome onto the release endpoints' HTTP status
- * (BLOCKER1). The v5 admin side treats "2xx && body.ok && body.status ===
- * 'deployed'" as success, so every non-deployed outcome MUST be non-2xx —
- * a refused/held/failed release can never be read as applied:
- *   deployed (incl. idempotent replay)          → 200
- *   pending_release / rejected (ancestry,
- *     denylist, missing record, release_revoked) → 409
- *   in_progress (unfinalized prior release)      → 423
- *   deploy_failed                                → 500
- * Store/internal exceptions never reach this mapper — the handlers catch them
- * and answer 503 directly.
- */
-export function releaseHttpStatusFor(resp: BrokerResponse): number {
-  switch (resp.status) {
-    case 'deployed':
-      return 200
-    case 'pending_release':
-    case 'rejected':
-      return 409
-    case 'in_progress':
-      return 423
-    case 'deploy_failed':
-      return 500
-    default:
-      return 500
-  }
+  /** INTERNAL (never serialized): a local release job to insert in the SAME
+   *  SQLite transaction as this outcome's finalize (R2-4). The auto-cutover sets
+   *  it so the durable cutover broker_action and its release job commit atomically
+   *  ("cutover committed ⟺ job exists") — replacing the old best-effort
+   *  post-commit enqueue hook that could leave "record present, job absent". */
+  releaseJobInsert?: ReleaseJobInsertInput
 }
 
 // ── idempotency store (durable, atomic single-winner claim) ──────────────────
@@ -237,18 +250,23 @@ export interface BrokerClaimStore {
   /** Update the recorded response of a COMMITTED record (e.g. pending_release →
    *  deployed after a one-click release). Never touches claimed rows. */
   overwriteCommitted(claimKey: string, response: string): Promise<void>
-  /** 审计R2 BLOCKER:finalize(+可选 overwrite)与 master 回调 enqueue 必须同一
-   *  事务。失败时 claim 保持 'claimed'(replay=in_progress fail-closed),调用方
-   *  上报 commit_failed —— 绝不出现"已提交却无回调"的半状态。 */
+  /** 审计R2 BLOCKER + R2-4:finalize(+可选 overwrite)与 master 回调 enqueue
+   *  以及可选的 release job 插入必须同一事务。失败时 claim 保持 'claimed'
+   *  (replay=in_progress fail-closed),调用方上报 commit_failed —— 绝不出现
+   *  "已提交却无回调 / 已提交却无 release job"的半状态。`callback` 可缺省(auto
+   *  cutover 只需原子插 release job,无 master 回调)。 */
   finalizeWithCallback(
     finalize: { claimKey: string; response: string }[],
     overwriteCommitted: { claimKey: string; response: string } | undefined,
-    callback: {
-      repairId: string
-      phase: SelfhealCallbackPhase
-      message: string
-      detail: Record<string, unknown>
-    },
+    callback:
+      | {
+          repairId: string
+          phase: SelfhealCallbackPhase
+          message: string
+          detail: Record<string, unknown>
+        }
+      | undefined,
+    releaseJobInsert?: ReleaseJobInsertInput,
   ): Promise<void>
 }
 
@@ -264,8 +282,8 @@ export const durableBrokerClaimStore: BrokerClaimStore = {
   overwriteCommitted: async (claimKey, response) => {
     await overwriteBrokerActionResponse(claimKey, response)
   },
-  finalizeWithCallback: async (finalize, overwriteCommitted, callback) => {
-    await commitBrokerOutcomeWithCallback({ finalize, overwriteCommitted, callback })
+  finalizeWithCallback: async (finalize, overwriteCommitted, callback, releaseJobInsert) => {
+    await commitBrokerOutcomeWithCallback({ finalize, overwriteCommitted, callback, releaseJobInsert })
   },
 }
 
@@ -320,32 +338,48 @@ export class InMemoryBrokerClaimStore implements BrokerClaimStore {
     message: string
     detail: Record<string, unknown>
   }[] = []
+  /** Test-visible mirror of release jobs inserted in the SAME atomic commit
+   *  (R2-4), PK-idempotent on release_request_id like the durable path. */
+  readonly releaseJobs: ReleaseJobInsertInput[] = []
   async finalizeWithCallback(
     finalize: { claimKey: string; response: string }[],
     overwriteCommitted: { claimKey: string; response: string } | undefined,
-    callback: {
-      repairId: string
-      phase: SelfhealCallbackPhase
-      message: string
-      detail: Record<string, unknown>
-    },
+    callback:
+      | {
+          repairId: string
+          phase: SelfhealCallbackPhase
+          message: string
+          detail: Record<string, unknown>
+        }
+      | undefined,
+    releaseJobInsert?: ReleaseJobInsertInput,
   ): Promise<void> {
     for (const f of finalize) await this.finalize(f.claimKey, f.response)
     if (overwriteCommitted)
       await this.overwriteCommitted(overwriteCommitted.claimKey, overwriteCommitted.response)
-    if (!this.outbox.some((r) => r.repairId === callback.repairId && r.phase === callback.phase))
+    if (
+      callback &&
+      !this.outbox.some((r) => r.repairId === callback.repairId && r.phase === callback.phase)
+    )
       this.outbox.push(callback)
+    if (
+      releaseJobInsert &&
+      !this.releaseJobs.some((j) => j.releaseRequestId === releaseJobInsert.releaseRequestId)
+    )
+      this.releaseJobs.push(releaseJobInsert)
   }
 }
 
-// ── deploy driver ────────────────────────────────────────────────────────────
+// ── cutover classifier ───────────────────────────────────────────────────────
 
-/** Executes the trusted production cutover for a validated sha. Injectable so
- *  the default posture (auto-deploy off) and tests never touch prod. */
-export type DeployDriver = (
-  sha: string,
-  ctx: { log: Logger; repairId?: string },
-) => Promise<BrokerResponse>
+/** Classifies a cutover's deploy surfaces (batch1b §7). Injectable so tests can
+ *  stub the classification without real git/manifest; production defaults to
+ *  {@link classifyForCutover} bound to the broker's runner. */
+export type CutoverClassifier = (input: {
+  canonicalRepo: string
+  canonicalBranch: string
+  sha: string
+}) => Promise<CutoverClassifyResult>
 
 export interface SelfhealBrokerOpts {
   socketPath: string
@@ -380,11 +414,24 @@ export interface SelfhealBrokerOpts {
   verificationDir?: string
   /** HMAC key to verify signed verifications. Default OC_SELFHEAL_VERIFY_HMAC. */
   verifyKey?: string
-  /** When true (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1), a fully-gated cutover runs the
-   *  deploy driver. Default false ⇒ record + notify "pending release" only. */
+  /** When true (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1), a fully-gated cutover ENQUEUES
+   *  a local release job (origin='auto') for the release worker; the broker never
+   *  deploys synchronously (batch1b §11). Default false ⇒ park pending release. */
   autoDeployTier2?: boolean
-  /** Trusted deploy driver (invoked on auto cutover AND one-click release). */
-  deployDriver?: DeployDriver
+  /** Deploy-surface classifier (batch1b §7). Default = {@link classifyForCutover}
+   *  bound to the broker's runner (reads the trusted pre-merge manifest). */
+  classifyCutover?: CutoverClassifier
+  /** Resolve the surface-specific verify layers for a clone at VERIFY time
+   *  (batch1b §6): classifies the diff canonical-HEAD..sha in the (de-privileged)
+   *  clone so the required per-surface tests run. Default classifies against the
+   *  trusted pre-merge manifest; a failure fails the verify (fail-closed). Tests
+   *  inject a stub. */
+  classifyClone?: (input: {
+    clonePath: string
+    canonicalRepo: string
+    canonicalBranch: string
+    sha: string
+  }) => Promise<{ verifyLayers: string[] }>
   /** Called when a gated cutover is held for manual release (default posture).
    *  `toolchain` lists deploy-toolchain files the candidate touches (if any) —
    *  such a candidate can ONLY ship via a human offline standard deploy. */
@@ -405,6 +452,8 @@ export interface SelfhealBrokerOpts {
     clonePath: string
     canonicalRepo: string
     canonicalBranch: string
+    /** Surface-specific extra layers resolved from the classification (§6). */
+    extraLayers?: string[]
   }) => Promise<VerifyOutcome>
   /** Report free-text caps (defaults 2000 / 8192 chars). */
   reportMessageMaxChars?: number
@@ -607,18 +656,18 @@ export class SelfhealBroker {
         },
       }
     }
-    // Transport-drill repairs may ONLY pull context and report.
-    if (
-      frozenKey === SELFHEAL_DRILL_TRANSPORT_KEY &&
-      req.actionKind !== CONTEXT_KIND &&
-      req.actionKind !== REPORT_KIND
-    ) {
+    // Drill repairs may ONLY perform actions in their FROZEN key's allowlist
+    // (transport → context/report; release → context/report/verify/cutover).
+    // Anything outside — including every Tier1 host opcode — is rejected here,
+    // before the claim. A SKILL instruction is guidance, not a permission grant.
+    const drillAllowed = DRILL_ALLOWED_ACTIONS.get(frozenKey)
+    if (drillAllowed && !drillAllowed.has(req.actionKind)) {
       this.audit(req, 'rejected', { reason: 'drill_forbidden_action' })
       return {
         ok: false,
         status: 'rejected',
         detail: {
-          reason: `drill repair may only context/report — "${req.actionKind}" is forbidden`,
+          reason: `drill repair may only ${[...drillAllowed].join('/')} — "${req.actionKind}" is forbidden`,
         },
       }
     }
@@ -691,16 +740,19 @@ export class SelfhealBroker {
     }
     if (this.isCommitted(response)) {
       const cb = response.masterCallback
-      if (cb) {
-        // 审计R2 BLOCKER:committed 结果与其 master 回调必须同一 SQLite 事务。
-        // 失败 → claim 保持 'claimed'(replay=in_progress fail-closed),如实上报
-        // commit_failed;绝不 release(否则重试会重跑副作用)。
-        const { masterCallback: _stripped, ...wire } = response
+      const rji = response.releaseJobInsert
+      // Strip INTERNAL fields (never serialized to the socket / durable store).
+      const { masterCallback: _cb, releaseJobInsert: _rji, ...wire } = response
+      if (cb || rji) {
+        // 审计R2 BLOCKER + R2-4:committed 结果 + 其 master 回调 + 其 release job
+        // 插入必须同一 SQLite 事务。失败 → claim 保持 'claimed'(replay=in_progress
+        // fail-closed),如实上报 commit_failed;绝不 release(否则重试会重跑副作用)。
         try {
           await this.store.finalizeWithCallback(
             [{ claimKey: key, response: JSON.stringify(wire) }],
             undefined,
-            { repairId: req.repairId, ...cb },
+            cb ? { repairId: req.repairId, ...cb } : undefined,
+            rji,
           )
         } catch (err) {
           this.log.error(
@@ -722,10 +774,10 @@ export class SelfhealBroker {
         }
         return wire
       }
-      await this.store.finalize(key, JSON.stringify(response))
-    } else {
-      await this.store.release(key)
+      await this.store.finalize(key, JSON.stringify(wire))
+      return wire
     }
+    await this.store.release(key)
     return response
   }
 
@@ -833,21 +885,73 @@ export class SelfhealBroker {
       return this.rejectCutover(req, 'sha is not a descendant of the canonical branch')
     }
 
-    // (c) Auto-deploy gate. Default posture: hold for manual release. The
-    //     toolchain denylist is probed here too so the pending notification
-    //     carries the "manual offline deploy only" annotation up front (the
-    //     driver re-enforces it as the hard gate at deploy time).
+    // (c) Auto-deploy gate. Default posture: hold for manual release. Before
+    //     parking, classify the deploy surfaces against the TRUSTED pre-merge
+    //     manifest (batch1b §7): the result is frozen into BOTH the durable
+    //     cutover record (authoritative — the personal release-job intake
+    //     re-checks deployPlanHash/manifestHash) and the pending_release callback
+    //     (v5 admin display). A classifier throw (git failure / invalid manifest)
+    //     is a hard, fail-closed refusal — never park an un-classified request.
     if (!this.autoDeployTier2) {
-      const touched = (await listToolchainTouches(this.run, this.canonicalRepo, sha)) ?? []
-      this.audit(req, 'pending_release', { sha, ...(touched.length ? { toolchain: touched } : {}) })
+      let cls: CutoverClassifyResult
+      try {
+        const classifier =
+          this.opts.classifyCutover ??
+          ((input: { canonicalRepo: string; canonicalBranch: string; sha: string }) =>
+            classifyForCutover({ ...input, run: this.run }))
+        cls = await classifier({
+          canonicalRepo: this.canonicalRepo,
+          canonicalBranch: this.canonicalBranch,
+          sha,
+        })
+      } catch (err) {
+        return this.rejectCutover(
+          req,
+          `deploy-surface classification failed: ${String((err as Error).message).slice(0, 200)}`,
+        )
+      }
+      const c = cls.classification
+      // §11 detail shape. `verification` records the layers actually run by the
+      // signed verification (not the classification's REQUIRED verifyLayers).
+      const releaseDetail = {
+        sha,
+        baseSha: cls.baseSha,
+        changedFiles: c.changedFiles,
+        classification: {
+          surfaces: c.surfaces,
+          deployArgs: c.deployArgs,
+          manual: c.manual,
+          verifyLayers: c.verifyLayers,
+          requiredAxes: c.requiredAxes,
+        },
+        verification: {
+          layers: vr.layers.map((l) => ({ name: l.name, ok: l.ok, code: l.code })),
+          ref: verificationRef,
+        },
+        deployPlanHash: c.deployPlanHash,
+        manifestHash: c.manifestHash,
+        manifestVersion: c.manifestVersion,
+      }
+      const manualPaths = c.manual.map((m) => m.path)
+      this.audit(req, 'pending_release', {
+        sha,
+        baseSha: cls.baseSha,
+        surfaces: c.surfaces,
+        deployPlanHash: c.deployPlanHash,
+        manual: c.manual.length,
+      })
       this.opts.notifyPendingRelease?.({
         repairId: req.repairId,
         sha,
-        ...(touched.length ? { toolchain: touched } : {}),
+        // Transitional: `toolchain` now carries the classifier's manual paths
+        // (its consumer, server.ts, is owned by a later wave that will rename it).
+        ...(manualPaths.length ? { toolchain: manualPaths } : {}),
       })
       this.log.warn('cutover fully gated but AUTO_DEPLOY_TIER2=0 — held for manual release', {
         repairId: req.repairId,
         sha,
+        surfaces: c.surfaces,
+        manual: c.manual.length,
       })
       // Deterministic root-side pending_release marker to the master (seam
       // contract: the admin release gate requires a progress event with
@@ -859,100 +963,120 @@ export class SelfhealBroker {
         ok: false,
         status: 'pending_release',
         detail: {
-          sha,
-          ...(touched.length ? { toolchain: true, files: touched.slice(0, 20) } : {}),
+          ...releaseDetail,
           reason: 'awaiting one-click release (OC_SELFHEAL_AUTO_DEPLOY_TIER2=0)',
         },
         masterCallback: {
           phase: 'pending_release',
           message: 'pending_release: verified and gated — awaiting one-click release',
-          detail: { phase: 'pending_release', sha, ...(touched.length ? { toolchain: true } : {}) },
+          detail: { phase: 'pending_release', ...releaseDetail },
         },
       }
     }
 
-    // (d) Trusted, self-held deploy (driver re-checks the toolchain denylist as
-    //     the execution-time hard gate, then ff-merges + runs canonical deploy).
-    const driver = this.opts.deployDriver
-    if (!driver) {
-      return this.rejectCutover(req, 'no trusted deploy driver configured')
-    }
-    const result = await driver(sha, { log: this.log, repairId: req.repairId })
-    this.audit(req, result.status, { sha, ...result.detail })
-    if (result.status === 'deployed') {
-      const trustedAttestation = await this.buildTrustedAttestation(
-        req.repairId,
-        authority,
-        'deploy_v5',
-        result.detail?.healthCheck,
-      )
-      // Auto-deploy path closes the loop root-side: master → 'verifying',
-      // probe fence adjudicates real recovery. done 标记与 finalize 原子提交
-      // (审计R2 BLOCKER,经 masterCallback → handleRequest 合并事务)。
-      return {
-        ...result,
-        masterCallback: {
-          phase: 'done',
-          message: 'auto cutover deployed',
-          detail: {
-            phase: 'deployed',
-            sha,
-            ...(trustedAttestation ? { trusted_attestation: trustedAttestation } : {}),
-          },
-        },
-      }
-    }
-    return result
+    // (d) Auto-deploy (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1): ENQUEUE a durable local
+    //     release job (origin='auto') — the release worker deploys it via the
+    //     lane and drives its own deploying/deployed callbacks + trusted
+    //     attestation. The broker no longer runs a synchronous deploy driver
+    //     (batch1b §11); the worker is the single at-most-once deployer.
+    return await this.enqueueAutoRelease(req, authority, sha, verificationRef, vr)
   }
 
   /**
-   * Root-authored attestation for the narrow fully-automatic deploy path.
-   * Model-authored `report done` and human release never call this method.
+   * Auto-deploy enqueue (§11): re-classify the cutover (the manual-park branch
+   * above is skipped when autoDeployTier2 is on) and record a local release job
+   * for the worker. A classifier throw is a hard, fail-closed refusal — never
+   * enqueue an un-classified deploy. The frozen plan is the SINGLE authority the
+   * worker + lane act on; a manual classification is closed `manual_required` by
+   * the worker's single manual adjudicator, so we still enqueue it here.
    */
-  private async buildTrustedAttestation(
-    repairId: string,
+  private async enqueueAutoRelease(
+    req: BrokerRequest,
     authority: RepairAuthorityRecord,
-    action: string,
-    healthCheck: unknown,
-  ): Promise<Record<string, unknown> | null> {
-    if (!healthCheck || typeof healthCheck !== 'object' || Array.isArray(healthCheck)) return null
-    const h = healthCheck as Record<string, unknown>
-    if (
-      h.kind !== 'deploy-v5-smoke' ||
-      h.ok !== true ||
-      h.target !== 'service:v5' ||
-      typeof h.checkedAt !== 'string' ||
-      !Number.isFinite(Date.parse(h.checkedAt))
-    )
-      return null
-    const context = await this.handleContext(
-      { repairId, actionKind: CONTEXT_KIND, params: {} },
-      authority,
-    )
-    const raw = context.detail?.context
-    if (!context.ok || !raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const c = raw as Record<string, unknown>
-    const incidentId = typeof c.incidentId === 'string' ? c.incidentId : ''
-    const conditionKey = typeof c.conditionKey === 'string' ? c.conditionKey : ''
-    const target =
-      conditionKey === 'ops.monitor:svc_v5' || conditionKey === 'ops.monitor:http_v5'
-        ? 'service:v5'
-        : ''
-    if (!incidentId || !conditionKey || !target) return null
+    sha: string,
+    verificationRef: string,
+    vr: VerifyOutcome['signed']['result'],
+  ): Promise<BrokerResponse> {
+    let cls: CutoverClassifyResult
+    try {
+      const classifier =
+        this.opts.classifyCutover ??
+        ((input: { canonicalRepo: string; canonicalBranch: string; sha: string }) =>
+          classifyForCutover({ ...input, run: this.run }))
+      cls = await classifier({
+        canonicalRepo: this.canonicalRepo,
+        canonicalBranch: this.canonicalBranch,
+        sha,
+      })
+    } catch (err) {
+      return this.rejectCutover(
+        req,
+        `deploy-surface classification failed: ${String((err as Error).message).slice(0, 200)}`,
+      )
+    }
+    const c = cls.classification
+    const releaseDetail = {
+      sha,
+      baseSha: cls.baseSha,
+      changedFiles: c.changedFiles,
+      classification: {
+        surfaces: c.surfaces,
+        deployArgs: c.deployArgs,
+        manual: c.manual,
+        verifyLayers: c.verifyLayers,
+        requiredAxes: c.requiredAxes,
+      },
+      verification: {
+        layers: vr.layers.map((l) => ({ name: l.name, ok: l.ok, code: l.code })),
+        ref: verificationRef,
+      },
+      deployPlanHash: c.deployPlanHash,
+      manifestHash: c.manifestHash,
+      manifestVersion: c.manifestVersion,
+    }
+    const incidentId = authority.incidentId ?? ''
+    if (!incidentId) return this.rejectCutover(req, 'auto release has no incident id to enqueue')
+    const releaseRequestId = `auto-${req.repairId}-${Date.now()}`
+    this.audit(req, 'queued', {
+      sha,
+      releaseRequestId,
+      surfaces: c.surfaces,
+      manual: c.manual.length,
+    })
+    // R2-4: return a COMMITTED cutover outcome carrying the release job to insert
+    // in the SAME SQLite transaction as the cutover broker_action finalize
+    // (handleRequest → store.finalizeWithCallback). "cutover committed ⟺ job
+    // exists" now holds across a crash — no more best-effort post-commit enqueue
+    // window that could leave a durable cutover record with no job. A combined
+    // commit failure is fail-closed (commit_failed, claim held). The frozen
+    // payload_hash is computed the same way the intake webhook does (§3.1) so a
+    // later v5 re-delivery of the same rrid is a duplicate, not a conflict.
     return {
-      version: 1,
-      repairId,
-      incidentId,
-      conditionKey,
-      target,
-      action,
-      executionMode: 'fully_automatic',
-      executed: true,
-      remoteResult: {
-        ok: true,
-        target,
-        healthOk: true,
-        checkedAt: h.checkedAt,
+      ok: true,
+      status: 'queued',
+      detail: {
+        ...releaseDetail,
+        releaseRequestId,
+        reason: 'auto-deploy release job enqueued (OC_SELFHEAL_AUTO_DEPLOY_TIER2=1)',
+      },
+      releaseJobInsert: {
+        releaseRequestId,
+        repairId: req.repairId,
+        incidentId,
+        payloadHash: releasePayloadHash({
+          repairId: req.repairId,
+          incidentId,
+          sha,
+          baseSha: cls.baseSha,
+          deployPlanHash: c.deployPlanHash,
+          manifestHash: c.manifestHash,
+        }),
+        approvedSha: sha,
+        baseSha: cls.baseSha,
+        deployPlanHash: c.deployPlanHash,
+        manifestHash: c.manifestHash,
+        planJson: JSON.stringify(releaseDetail),
+        origin: 'auto',
       },
     }
   }
@@ -1032,6 +1156,35 @@ export class SelfhealBroker {
       }
     }
     const clonePath = join(this.ochealSelfhealRoot, req.repairId)
+
+    // (§6) Resolve the surface-specific verify layers from the classification so
+    // a touched surface's required tests actually run. Fail-closed: a
+    // classification failure fails the verify (a surface whose tests can't be
+    // planned must never yield allPassed=true downstream).
+    let extraLayers: string[]
+    try {
+      extraLayers = (
+        await this.resolveVerifyLayers({
+          clonePath,
+          canonicalRepo: this.canonicalRepo,
+          canonicalBranch: this.canonicalBranch,
+          sha,
+        })
+      ).verifyLayers
+    } catch (err) {
+      this.audit(req, 'verify_failed', {
+        sha,
+        reason: `classification failed: ${String((err as Error).message).slice(0, 200)}`,
+      })
+      return {
+        ok: false,
+        status: 'verify_failed',
+        detail: {
+          reason: `deploy-surface classification failed: ${String((err as Error).message).slice(0, 200)}`,
+        },
+      }
+    }
+
     const runVerify =
       this.opts.verifyRunner ??
       (async (input: {
@@ -1040,6 +1193,7 @@ export class SelfhealBroker {
         clonePath: string
         canonicalRepo: string
         canonicalBranch: string
+        extraLayers?: string[]
       }) => {
         if (this.ochealUid === undefined || this.ochealGid === undefined) {
           throw new Error('ochealUid/ochealGid not configured — refusing a root-privileged verify')
@@ -1050,6 +1204,7 @@ export class SelfhealBroker {
           clonePath: input.clonePath,
           canonicalRepo: input.canonicalRepo,
           canonicalBranch: input.canonicalBranch,
+          extraLayers: input.extraLayers,
           ochealUid: this.ochealUid,
           ochealGid: this.ochealGid,
           verificationDir: this.opts.verificationDir,
@@ -1064,6 +1219,7 @@ export class SelfhealBroker {
         clonePath,
         canonicalRepo: this.canonicalRepo,
         canonicalBranch: this.canonicalBranch,
+        extraLayers,
       })
       const result = outcome.signed.result
       const dir =
@@ -1089,6 +1245,38 @@ export class SelfhealBroker {
         detail: { reason: String((err as Error).message).slice(0, 300) },
       }
     }
+  }
+
+  /**
+   * Resolve the surface-specific verify layers (§6) by classifying the diff
+   * canonical-HEAD..sha. The manifest + base are read from the TRUSTED canonical
+   * repo (root git), but the `git diff` runs in the (candidate-owned) clone
+   * DE-PRIVILEGED — consistent with verify's own posture (it already runs npm/
+   * tests as ocheal in that clone). Tests inject {@link SelfhealBrokerOpts.classifyClone}.
+   */
+  private async resolveVerifyLayers(input: {
+    clonePath: string
+    canonicalRepo: string
+    canonicalBranch: string
+    sha: string
+  }): Promise<{ verifyLayers: string[] }> {
+    if (this.opts.classifyClone) return this.opts.classifyClone(input)
+    const manifest = await loadTrustedManifest(input.canonicalRepo, input.canonicalBranch, {
+      run: this.run,
+    })
+    const base = await this.run('git', ['-C', input.canonicalRepo, 'rev-parse', input.canonicalBranch])
+    const baseSha = base.stdout.trim()
+    if (base.code !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+      throw new Error('canonical base resolution failed')
+    }
+    const asOcheal: RunOpts | undefined =
+      this.ochealUid !== undefined && this.ochealGid !== undefined
+        ? { uid: this.ochealUid, gid: this.ochealGid }
+        : undefined
+    const clsRun: CommandRunner = (cmd, args, opts) =>
+      this.run(cmd, args, asOcheal ? { ...(opts ?? {}), ...asOcheal } : opts)
+    const cls = await classifyDiff(input.clonePath, baseSha, input.sha, manifest, { run: clsRun })
+    return { verifyLayers: cls.verifyLayers }
   }
 
   /** `report {repairId, outcome, message, detail?}` — forward a redacted,
@@ -1173,205 +1361,6 @@ export class SelfhealBroker {
         detail: { outcome, reason: String((err as Error).message).slice(0, 200) },
       }
     }
-  }
-
-  // ── one-click release (in-process ONLY — never a socket action) ─────────────
-
-  /**
-   * Release a held cutover (design §C3). Callers: the HMAC-verified release
-   * webhook (v5 admin one-click) and the root break-glass route — both hold a
-   * reference to this broker instance; nothing on the ocheal socket can reach
-   * this method.
-   *
-   * Re-verifies EVERYTHING from durable state (never trusts the request):
-   *   1. the durable cutover record must exist, be committed, and be
-   *      'pending_release' (the sha comes from that record, not the caller);
-   *   2. its own release claim (at-most-once deploy across duplicates/crashes);
-   *   3. canonical ancestry, re-checked from scratch;
-   *   4. the deploy driver — whose toolchain denylist re-runs as the hard gate,
-   *      so a toolchain-touching candidate is refused here too.
-   */
-  async releaseApproved(repairId: string): Promise<BrokerResponse> {
-    if (!/^[A-Za-z0-9._:-]+$/.test(repairId)) {
-      return { ok: false, status: 'rejected', detail: { reason: 'illegal repairId' } }
-    }
-
-    // Release fuse (HIGH3): a cancel of a terminal job durably revokes any held
-    // release — checked at entry, before the claim, so a revoked repair can
-    // never consume a release claim or reach the driver. Authority lookup
-    // failure fails CLOSED (this method's outcome is a production deploy).
-    let authRec: RepairAuthorityRecord | null
-    try {
-      authRec = await this.repairAuthority(repairId)
-    } catch (err) {
-      this.log.error('release authority lookup failed — refusing', { repairId }, err)
-      return { ok: false, status: 'rejected', detail: { reason: 'authority unavailable' } }
-    }
-    if (authRec?.releaseRevoked) {
-      this.log.warn('release refused — revoked by cancel', { repairId })
-      this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'rejected', {
-        reason: 'release_revoked',
-      })
-      return { ok: false, status: 'rejected', detail: { reason: 'release_revoked' } }
-    }
-
-    const cutoverKey = `${repairId}:${CUTOVER_KIND}`
-    const rec = await this.store.get(cutoverKey)
-    if (!rec || rec.status !== 'committed' || !rec.response) {
-      this.log.warn('release refused — no committed cutover record', { repairId })
-      return {
-        ok: false,
-        status: 'rejected',
-        detail: { reason: 'no committed cutover record for this repair' },
-      }
-    }
-    let prior: BrokerResponse
-    try {
-      prior = JSON.parse(rec.response) as BrokerResponse
-    } catch {
-      return { ok: false, status: 'rejected', detail: { reason: 'corrupt cutover record' } }
-    }
-    // The sha authority is the DURABLE record's detail (present for both a
-    // pending_release and an already-released record) — never the caller.
-    const sha = typeof prior.detail?.sha === 'string' ? (prior.detail.sha as string) : ''
-    if (!/^[0-9a-f]{40}$/.test(sha)) {
-      return {
-        ok: false,
-        status: 'rejected',
-        detail: { reason: 'cutover record has no valid sha' },
-      }
-    }
-
-    // At-most-once release claim (durable): duplicates replay, a crash mid-deploy
-    // is fail-closed 'in_progress' (never re-run the deploy blindly). This MUST
-    // precede the pending-status check: a successful release flips the cutover
-    // record to 'deployed', and a duplicate release must replay — not reject.
-    const releaseKey = `${repairId}:${RELEASE_CLAIM_KIND}`
-    const paramsHash = createHash('sha256').update(stableStringify({ sha })).digest('hex')
-    const claim = await this.store.tryClaim({
-      claimKey: releaseKey,
-      repairId,
-      actionKind: RELEASE_CLAIM_KIND,
-      paramsHash,
-    })
-    if (claim.outcome === 'replay') {
-      const priorRelease = JSON.parse(claim.response ?? '{}') as BrokerResponse
-      this.log.info('release idempotent replay', { repairId, status: priorRelease.status })
-      return { ...priorRelease, detail: { ...priorRelease.detail, replayed: true } }
-    }
-    if (claim.outcome === 'in_progress') {
-      return {
-        ok: false,
-        status: 'in_progress',
-        detail: { reason: 'a prior release did not finalize; not re-executing (at-most-once)' },
-      }
-    }
-    if (claim.outcome === 'conflict') {
-      return {
-        ok: false,
-        status: 'rejected',
-        detail: { reason: 'release claim conflict (sha changed?)' },
-      }
-    }
-    // We won the claim — the record must still be awaiting release.
-    if (prior.status !== 'pending_release') {
-      await this.store.release(releaseKey)
-      return {
-        ok: false,
-        status: 'rejected',
-        detail: { reason: `cutover is not pending release (status ${prior.status})` },
-      }
-    }
-
-    let response: BrokerResponse
-    try {
-      // HIGH2(审计R2):从 fuse 终检到 driver 执行必须与 terminal-cancel 的
-      // fuse 写入共享同一 per-repair 临界区 —— 入口检查早已通过的在途 release,
-      // cancel 设 fuse 后不得再进 driver。锁内 fresh 读,先赢者胜:release 先赢
-      // 则锁持有至部署结束(cancel 等待,部署后取消=业务上"太迟",审计留痕);
-      // cancel 先赢则这里拒绝。deploy 时长受锁保护是有意为之(bounded,单 repair)。
-      response = await withRepairLock(repairId, async (): Promise<BrokerResponse> => {
-        let fresh: RepairAuthorityRecord | null
-        try {
-          fresh = await this.repairAuthority(repairId)
-        } catch (err) {
-          this.log.error('release authority re-check failed — refusing', { repairId }, err)
-          return { ok: false, status: 'rejected', detail: { reason: 'authority unavailable' } }
-        }
-        if (fresh?.releaseRevoked) {
-          this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'rejected', {
-            reason: 'release_revoked',
-          })
-          return { ok: false, status: 'rejected', detail: { reason: 'release_revoked' } }
-        }
-        const ancestor = await this.checkCanonicalAncestry(repairId, sha)
-        if (!ancestor) {
-          return {
-            ok: false,
-            status: 'rejected',
-            detail: { reason: 'sha is not a descendant of the canonical branch' },
-          }
-        }
-        const driver = this.opts.deployDriver
-        if (!driver) {
-          return {
-            ok: false,
-            status: 'rejected',
-            detail: { reason: 'no trusted deploy driver configured' },
-          }
-        }
-        return await driver(sha, { log: this.log, repairId })
-      })
-    } catch (err) {
-      await this.store.release(releaseKey)
-      throw err
-    }
-
-    if (response.status === 'deployed') {
-      // 审计R2 BLOCKER:done 标记 + release finalize + cutover 记录翻转必须同一
-      // SQLite 事务 —— 部署已发生却没有 outbox 行 = master 永远等不到 done。
-      // 事务失败:release claim 保持 'claimed'(replay=in_progress fail-closed,
-      // 绝不重跑部署),如实上报 commit_failed(500),人工按 runbook 收口。
-      try {
-        await this.store.finalizeWithCallback(
-          [{ claimKey: releaseKey, response: JSON.stringify(response) }],
-          { claimKey: cutoverKey, response: JSON.stringify(response) },
-          {
-            repairId,
-            phase: 'done',
-            message: 'released and deployed',
-            detail: { phase: 'deployed', sha },
-          },
-        )
-      } catch (err) {
-        this.log.error(
-          'release outcome commit failed — claim held fail-closed',
-          { repairId },
-          err as Error,
-        )
-        this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, 'commit_failed', {
-          sha,
-          reason: String((err as Error).message).slice(0, 200),
-        })
-        return {
-          ok: false,
-          status: 'commit_failed',
-          detail: {
-            sha,
-            reason: 'deploy succeeded but durable commit failed — claim held; see runbook',
-          },
-        }
-      }
-    } else {
-      // Not deployed (toolchain hold / driver failure / gate reject): release
-      // the claim so a corrected future release attempt can retry.
-      await this.store.release(releaseKey)
-    }
-    this.audit({ repairId, actionKind: RELEASE_CLAIM_KIND }, response.status, {
-      sha,
-      ...response.detail,
-    })
-    return response
   }
 
   private rejectCutover(req: BrokerRequest, reason: string): BrokerResponse {

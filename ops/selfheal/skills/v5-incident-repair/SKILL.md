@@ -36,12 +36,34 @@ oc-selfheal cutover <repairId> <sha> [verificationRef]
 
 ## 演练(drill)分支
 
-`context` 返回的 `conditionKey` 若为 `selfheal.drill:transport_v1`(自愈体系合成演练;`selfheal.drill:` 前缀族目前仅此一种):
+`context` 返回的 `conditionKey` 属于 `selfheal.drill:` 前缀族时,这是自愈体系**合成的演练**(不是真实事故),按 drill 类型分两支处理。**两支都只用四条真实 CLI 子命令,不碰任何红线**。
+
+### 传输演练 `selfheal.drill:transport_v1`
+
+只验证 context/report 通路是否正常,**不改任何代码、不 verify、不 cutover**(服务端也会拒绝传输 drill 的 verify/cutover——那不是你失败,是演练语义):
 
 1. `report <repairId> progress "drill 已接单,链路正常"`
 2. `report <repairId> done "transport drill 完成:context/report 通路验证通过"`
 
-**仅此两步。不改任何代码、不 verify、不 cutover**(服务端也会拒绝 drill 的 verify/cutover——那不是你失败,是演练语义)。
+**仅此两步。**
+
+### 放行演练 `selfheal.drill:release_v1`
+
+验证**改动→验证→cutover→待放行**这条放行链路(演练**永不自动部署**,始终停在 `pending_release`)。会话提示里的 clone 已就绪、归你所有、你在其中有 git;append/commit 用 clone 内**普通 git**(不经 oc-selfheal),verify/cutover/report 走真实 CLI。
+
+先 `oc-selfheal report <repairId> progress "release-drill接单,开始演练放行链路"` 接单,然后:
+
+1. 在 clone 内向 `docs/selfheal/RELEASE_DRILLS.md` **append 一行** `"<repairId> <UTC ISO>"` 并提交(纯 git):
+   ```bash
+   printf '%s %s\n' "<repairId>" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> docs/selfheal/RELEASE_DRILLS.md
+   git add docs/selfheal/RELEASE_DRILLS.md
+   git commit -m "selfheal release drill <repairId>"
+   ```
+2. 对刚提交的 drill commit(40 位完整 sha)跑降权四层验证:`oc-selfheal verify <repairId> <sha>`。
+3. 验证通过后申请上线:`oc-selfheal cutover <repairId> <sha>`(演练同样停在 `pending_release`,CLI 以退出码 0 返回=预期姿态,**不是失败**)。
+4. 回报进度并**停在待放行**:`oc-selfheal report <repairId> progress "…等待放行"`。
+
+**不自动部署、不 `report done`**:演练的价值是把整条放行链路(clone commit → verify → cutover → `pending_release` 姿态)完整跑通并留痕,最终停在待人工放行,由 boss 在 admin 决定是否放行。
 
 ## 流程
 

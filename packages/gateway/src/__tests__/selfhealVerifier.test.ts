@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -296,5 +296,114 @@ describe('verifier.prepareClone', () => {
       }),
       /clone failed/,
     )
+  })
+})
+
+describe('verifier.verify extra layers — fail-closed whitelist (batch1b)', () => {
+  let vdir: string
+  let cwd: string
+  let wt: string
+  beforeEach(() => {
+    vdir = mkdtempSync(join(tmpdir(), 'oc-vx-out-'))
+    cwd = mkdtempSync(join(tmpdir(), 'oc-vx-clone-'))
+    // The worktree add is stubbed, so pre-create the tree + a package.json for
+    // the fail-closed script check to read.
+    wt = join(cwd, '.verify')
+    mkdirSync(wt, { recursive: true })
+  })
+  afterEach(() => {
+    rmSync(vdir, { recursive: true, force: true })
+    rmSync(cwd, { recursive: true, force: true })
+  })
+
+  function writeScripts(names: string[]): void {
+    const scripts: Record<string, string> = {}
+    for (const n of names) scripts[n] = 'true'
+    writeFileSync(join(wt, 'package.json'), JSON.stringify({ scripts }))
+  }
+
+  const baseArgs = {
+    ochealUid: OCHEAL_UID,
+    ochealGid: OCHEAL_GID,
+    signingKey: KEY,
+  }
+
+  it('runs a valid extra layer (present in package.json) and records it in the signed set', async () => {
+    writeScripts(['lint', 'typecheck', 'test:gateway', 'test:web', 'test:commercial'])
+    const { run, calls } = stubRunner(successfulDefaultRun)
+    const out = await verify({
+      ...baseArgs,
+      repairId: 'vx-ok',
+      sha: 'a'.repeat(40),
+      clonePath: cwd,
+      worktreeDir: wt,
+      verificationDir: vdir,
+      extraLayers: ['test:commercial'],
+      run,
+    })
+    assert.equal(out.signed.result.allPassed, true)
+    const npm = calls.filter((c) => c.cmd === 'npm').map((c) => c.args.join(' '))
+    assert.ok(npm.includes('run test:commercial'), 'the valid extra layer must run')
+    assert.ok(
+      out.signed.result.layers.some((l) => l.name === 'test:commercial' && l.ok),
+      'the actual layer set is recorded in the signed result',
+    )
+  })
+
+  it('de-duplicates an extra layer already covered by a base layer', async () => {
+    writeScripts(['lint', 'typecheck', 'test:gateway', 'test:web'])
+    const { run, calls } = stubRunner(successfulDefaultRun)
+    await verify({
+      ...baseArgs,
+      repairId: 'vx-dup',
+      sha: 'a'.repeat(40),
+      clonePath: cwd,
+      worktreeDir: wt,
+      verificationDir: vdir,
+      extraLayers: ['typecheck', 'test:web'],
+      run,
+    })
+    const typechecks = calls.filter((c) => c.cmd === 'npm' && c.args.join(' ') === 'run typecheck')
+    assert.equal(typechecks.length, 1, 'a base-covered extra layer must not run twice')
+  })
+
+  it('fails closed on an extra layer that is NOT a package.json script (never executed)', async () => {
+    writeScripts(['lint', 'typecheck', 'test:gateway', 'test:web'])
+    const { run, calls } = stubRunner(successfulDefaultRun)
+    const out = await verify({
+      ...baseArgs,
+      repairId: 'vx-missing',
+      sha: 'a'.repeat(40),
+      clonePath: cwd,
+      worktreeDir: wt,
+      verificationDir: vdir,
+      extraLayers: ['test:commercial'],
+      run,
+    })
+    assert.equal(out.signed.result.allPassed, false)
+    const layer = out.signed.result.layers.find((l) => l.name === 'test:commercial')
+    assert.equal(layer?.ok, false)
+    assert.ok(
+      !calls.some((c) => c.cmd === 'npm' && c.args.join(' ') === 'run test:commercial'),
+      'an unavailable required layer must never be executed',
+    )
+  })
+
+  it('fails closed on an illegal extra layer name', async () => {
+    writeScripts(['lint', 'typecheck', 'test:gateway', 'test:web'])
+    const { run } = stubRunner(successfulDefaultRun)
+    const out = await verify({
+      ...baseArgs,
+      repairId: 'vx-illegal',
+      sha: 'a'.repeat(40),
+      clonePath: cwd,
+      worktreeDir: wt,
+      verificationDir: vdir,
+      extraLayers: ['weird name'],
+      run,
+    })
+    assert.equal(out.signed.result.allPassed, false)
+    const layer = out.signed.result.layers.find((l) => l.name === 'weird name')
+    assert.equal(layer?.ok, false)
   })
 })

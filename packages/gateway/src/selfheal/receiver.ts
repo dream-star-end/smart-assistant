@@ -23,8 +23,18 @@
 // already rejected at step 3.
 
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
-import { insertJobReceived, purgeExpiredNonces, recordNonceIfFresh } from '@openclaude/storage'
+import {
+  cancelReleaseJob,
+  clearReleaseFuse,
+  getReleaseFuse,
+  getReleaseJob,
+  insertJobReceived,
+  purgeExpiredNonces,
+  recordNonceIfFresh,
+} from '@openclaude/storage'
+import type { CancelOutcome } from './cancel.js'
 import { createLogger } from '../logger.js'
+import { enqueueReleaseJob, readCommittedCutoverPlan } from './releaseIntake.js'
 
 const log = createLogger({ module: 'selfheal-receiver' })
 
@@ -33,9 +43,13 @@ export const SELFHEAL_WEBHOOK_PATH = '/api/webhooks/v5-selfheal'
 /** Canonical cancel path (design §A2/§C4) — same trust chain as dispatch. The
  *  legacy /internal/selfheal/cancel route is deleted. */
 export const SELFHEAL_CANCEL_WEBHOOK_PATH = '/api/webhooks/v5-selfheal-cancel'
-/** One-click release path (design §C3) — same trust chain as dispatch; the only
- *  remote entry into broker.releaseApproved (release is NEVER a socket action). */
+/** One-click release path (batch1b §3.1) — same trust chain as dispatch. Durable
+ *  intake: a 202 means the release job is on disk; the release worker deploys it
+ *  asynchronously (release is NEVER a synchronous socket action). */
 export const SELFHEAL_RELEASE_WEBHOOK_PATH = '/api/webhooks/v5-selfheal-release'
+/** Release-fuse clear path (batch1b §3.3) — same trust chain; body carries the
+ *  fixed repairId literal "fuse" so the shared signed-string format is reused. */
+export const SELFHEAL_FUSE_CLEAR_WEBHOOK_PATH = '/api/webhooks/v5-selfheal-fuse-clear'
 
 const DEFAULT_MAX_BODY_BYTES = 8 * 1024 // dispatch bodies are 3 ids — kilobytes, not megabytes
 const DEFAULT_TS_TOLERANCE_MS = 120_000
@@ -81,7 +95,7 @@ export interface SelfhealWebhookInput {
 }
 
 export interface ReceiverResult {
-  status: 202 | 400 | 401 | 403 | 409 | 413
+  status: 200 | 202 | 400 | 401 | 403 | 409 | 413 | 423
   body: Record<string, unknown>
 }
 
@@ -234,14 +248,15 @@ export function bodyPayloadHash(rawBody: Buffer): string {
 const SELFHEAL_ID_RE = /^[a-zA-Z0-9_.:-]{1,128}$/
 
 /**
- * Parse a signed command body carrying ids only (cancel / release). Returns
- * null on any deviation. `requireIncidentId` is set for cancel (the tombstone's
- * NOT NULL incident_id comes from the body — design §A2).
+ * Parse a signed command body carrying ids only (cancel). Returns null on any
+ * deviation. `requireIncidentId` is set for cancel (the tombstone's NOT NULL
+ * incident_id comes from the body — design §A2). An OPTIONAL `releaseRequestId`
+ * (batch1b §3.2) routes cancel to a specific release job instead of the repair.
  */
 export function parseSelfhealIdBody(
   raw: Buffer,
   opts: { requireIncidentId?: boolean } = {},
-): { repairId: string; incidentId?: string } | null {
+): { repairId: string; incidentId?: string; releaseRequestId?: string } | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw.toString('utf8'))
@@ -251,15 +266,24 @@ export function parseSelfhealIdBody(
   if (typeof parsed !== 'object' || parsed === null) return null
   const p = parsed as Record<string, unknown>
   if (typeof p.repairId !== 'string' || !SELFHEAL_ID_RE.test(p.repairId)) return null
+  let releaseRequestId: string | undefined
+  if (p.releaseRequestId !== undefined) {
+    if (typeof p.releaseRequestId !== 'string' || !SELFHEAL_ID_RE.test(p.releaseRequestId)) {
+      return null
+    }
+    releaseRequestId = p.releaseRequestId
+  }
+  const withRrid = <T extends { repairId: string }>(base: T): T & { releaseRequestId?: string } =>
+    releaseRequestId ? { ...base, releaseRequestId } : base
   if (opts.requireIncidentId) {
     if (typeof p.incidentId !== 'string' || !SELFHEAL_ID_RE.test(p.incidentId)) return null
-    return { repairId: p.repairId, incidentId: p.incidentId }
+    return withRrid({ repairId: p.repairId, incidentId: p.incidentId })
   }
   if (p.incidentId !== undefined) {
     if (typeof p.incidentId !== 'string' || !SELFHEAL_ID_RE.test(p.incidentId)) return null
-    return { repairId: p.repairId, incidentId: p.incidentId }
+    return withRrid({ repairId: p.repairId, incidentId: p.incidentId })
   }
-  return { repairId: p.repairId }
+  return withRrid({ repairId: p.repairId })
 }
 
 /**
@@ -329,4 +353,342 @@ export async function receiveSelfhealDispatch(
     status: 202,
     body: { ok: true, repairId: body.repairId, deduped: result.outcome === 'duplicate' },
   }
+}
+
+const HEX40_RE = /^[0-9a-f]{40}$/
+const HEX64_RE = /^[0-9a-f]{64}$/
+
+export interface ReleaseWebhookBody {
+  repairId: string
+  incidentId: string
+  releaseRequestId: string
+  approvedSha: string
+  baseSha: string | null
+  deployPlanHash: string
+  manifestHash: string
+}
+
+/** Parse the v5 admin one-click release body (§3.1). Strict shape — any
+ *  deviation is null (the caller answers 400). The frozen fields carried here are
+ *  re-checked against the LOCAL durable cutover record; the webhook is never the
+ *  authority for them. */
+export function parseReleaseBody(raw: Buffer): ReleaseWebhookBody | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw.toString('utf8'))
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const p = parsed as Record<string, unknown>
+  if (typeof p.repairId !== 'string' || !SELFHEAL_ID_RE.test(p.repairId)) return null
+  if (typeof p.incidentId !== 'string' || !SELFHEAL_ID_RE.test(p.incidentId)) return null
+  if (typeof p.releaseRequestId !== 'string' || !SELFHEAL_ID_RE.test(p.releaseRequestId)) return null
+  if (typeof p.approvedSha !== 'string' || !HEX40_RE.test(p.approvedSha)) return null
+  let baseSha: string | null = null
+  if (p.baseSha !== null && p.baseSha !== undefined) {
+    if (typeof p.baseSha !== 'string' || !HEX40_RE.test(p.baseSha)) return null
+    baseSha = p.baseSha
+  }
+  if (typeof p.deployPlanHash !== 'string' || !HEX64_RE.test(p.deployPlanHash)) return null
+  if (typeof p.manifestHash !== 'string' || !HEX64_RE.test(p.manifestHash)) return null
+  return {
+    repairId: p.repairId,
+    incidentId: p.incidentId,
+    releaseRequestId: p.releaseRequestId,
+    approvedSha: p.approvedSha,
+    baseSha,
+    deployPlanHash: p.deployPlanHash,
+    manifestHash: p.manifestHash,
+  }
+}
+
+/**
+ * Durable intake for the v5 admin one-click release (§3.1). Verify → local fuse
+ * → LOCAL authority re-check → idempotent insert → 202. A 202 means the release
+ * job is on disk; the release worker deploys it asynchronously.
+ *
+ *   423 release_fuse_engaged  — local Tier2 fuse tripped (v5 keeps queued, retries)
+ *   409 authority_mismatch    — no local cutover record, or its frozen
+ *                               sha/deployPlanHash/manifestHash != the webhook's
+ *   409 release_job_conflict  — same rrid, different frozen plan
+ *   202 { ok, status:'accepted', releaseRequestId }
+ */
+export async function receiveSelfhealRelease(
+  input: SelfhealWebhookInput,
+  cfg: SelfhealReceiverConfig,
+  now = Date.now(),
+): Promise<ReceiverResult> {
+  if (input.rawBody.length > cfg.maxBodyBytes) {
+    return { status: 413, body: { error: 'payload too large' } }
+  }
+  const body = parseReleaseBody(input.rawBody)
+  if (!body) return { status: 400, body: { error: 'invalid release body' } }
+  const verified = await verifySelfhealSignedRequest(
+    {
+      remoteAddress: input.remoteAddress,
+      method: input.method,
+      path: input.path,
+      ts: input.ts,
+      nonce: input.nonce,
+      sig: input.sig,
+      rawBody: input.rawBody,
+      repairId: body.repairId,
+    },
+    cfg,
+    now,
+  )
+  if (!verified.ok) return { status: verified.status, body: { error: verified.error } }
+
+  // §3.1(1) local fuse — v5 keeps the request queued and backs off.
+  const fuse = await getReleaseFuse()
+  if (fuse.engaged) {
+    log.warn('release refused — local fuse engaged', { repairId: body.repairId })
+    return { status: 423, body: { ok: false, error: 'release_fuse_engaged' } }
+  }
+
+  // §3.1(2) LOCAL authority re-check — the durable committed cutover record is
+  // the single authority; the webhook's frozen fields must match it exactly. When
+  // the webhook carries a baseSha it MUST equal the local record's baseSha too
+  // (§F11 authority binding — the base a plan was classified against is part of
+  // its identity).
+  const plan = await readCommittedCutoverPlan(body.repairId)
+  if (
+    !plan ||
+    plan.sha !== body.approvedSha ||
+    plan.deployPlanHash !== body.deployPlanHash ||
+    plan.manifestHash !== body.manifestHash ||
+    (body.baseSha !== null && plan.baseSha !== body.baseSha)
+  ) {
+    log.warn('release refused — authority mismatch', {
+      repairId: body.repairId,
+      haveRecord: !!plan,
+    })
+    return { status: 409, body: { ok: false, error: 'authority_mismatch' } }
+  }
+
+  // §3.1(3-4) idempotent durable insert (frozen from the LOCAL record).
+  const result = await enqueueReleaseJob({
+    repairId: body.repairId,
+    incidentId: body.incidentId,
+    releaseRequestId: body.releaseRequestId,
+    origin: 'v5',
+    plan,
+  })
+  if (result.outcome === 'conflict') {
+    log.warn('release rrid reused with a different frozen plan', {
+      repairId: body.repairId,
+      releaseRequestId: body.releaseRequestId,
+    })
+    return { status: 409, body: { ok: false, error: 'release_job_conflict' } }
+  }
+  log.info('release accepted', {
+    repairId: body.repairId,
+    releaseRequestId: body.releaseRequestId,
+    deduped: result.outcome === 'duplicate',
+  })
+  return {
+    status: 202,
+    body: { ok: true, status: 'accepted', releaseRequestId: body.releaseRequestId },
+  }
+}
+
+/** Machine outcome of a release-job-scoped cancel (§3.2 + §F11). The cross-repo
+ *  cancel response contract (the v5 side mirrors it exactly):
+ *    200 { ok:true,  releaseCancel: 'cancelled' | 'idempotent' | 'not_found' }
+ *    409 { ok:false, releaseCancel: 'too_late' | 'repair_mismatch' } */
+export interface ReleaseJobCancelResult {
+  status: 200 | 409
+  body: {
+    ok: boolean
+    releaseRequestId: string
+    releaseCancel: 'cancelled' | 'idempotent' | 'not_found' | 'too_late' | 'repair_mismatch'
+    /** Terminal job status when releaseCancel='idempotent' (post-cancel re-read,
+     *  so a concurrent worker terminalization is never mis-snapshotted). Drives
+     *  the R3-1 skip decision in {@link resolveDualCancel}. */
+    releaseJobStatus?: string
+  }
+}
+
+/**
+ * Resolve a release-job-scoped cancel (rrid present on the cancel webhook).
+ * §F11 rrid↔repair binding: the signature is route-bound to the body's repairId,
+ * but the rrid is a SEPARATE id, so the targeted job MUST exist AND belong to
+ * that repair before we ever cancel it — a mismatched (rrid, repairId) pair is
+ * 409 repair_mismatch (never cancels an unrelated repair's release). Otherwise
+ * the three-state cancelReleaseJob decides (received-unclaimed→cancelled,
+ * terminal→idempotent, claimed→too_late, vanished→not_found).
+ */
+export async function resolveReleaseJobCancel(
+  releaseRequestId: string,
+  repairId: string,
+): Promise<ReleaseJobCancelResult> {
+  const job = await getReleaseJob(releaseRequestId)
+  if (!job) {
+    return { status: 200, body: { ok: true, releaseRequestId, releaseCancel: 'not_found' } }
+  }
+  if (job.repairId !== repairId) {
+    return { status: 409, body: { ok: false, releaseRequestId, releaseCancel: 'repair_mismatch' } }
+  }
+  const result = await cancelReleaseJob(releaseRequestId)
+  const status = result === 'too_late' ? 409 : 200
+  // R3-1: 'idempotent' means "already terminal" — but terminal-HOW decides whether a
+  // repair-level cancel may still run (cancelled/manual_required/deploy_failed: yes;
+  // deployed/deploy_unknown: the deploy effect exists, the receipt/probe owns the
+  // repair's fate). Re-read AFTER the cancel so a concurrent worker terminalization
+  // between the earlier getReleaseJob and cancelReleaseJob is never mis-snapshotted.
+  let releaseJobStatus: string | undefined
+  if (result === 'idempotent') {
+    releaseJobStatus = (await getReleaseJob(releaseRequestId))?.status
+  }
+  return {
+    status,
+    body: {
+      ok: result !== 'too_late',
+      releaseRequestId,
+      releaseCancel: result,
+      ...(releaseJobStatus ? { releaseJobStatus } : {}),
+    },
+  }
+}
+
+/** The merged HTTP result of an rrid-scoped cancel: the release-job three-state
+ *  AND the repair-level four-case, so the v5 postCancel can collect BOTH the
+ *  release job and the repair in one round-trip (§3.2 + §F11 dual cancel). */
+export interface DualCancelResult {
+  status: number
+  body: Record<string, unknown>
+}
+
+/**
+ * Orchestrate an rrid-present cancel: run the release-job resolver AND the
+ * repair-level cancel, then merge (R2-1 BLOCKER — the old handler dropped the
+ * repair-level `terminated/accepted/status`, so v5's postCancel could never
+ * settle a repair stuck `cancelling`).
+ *
+ * Contract (the v5 side mirrors it verbatim):
+ *   - `repair_mismatch` — a suspicious (rrid, repairId) pair: keep the resolver's
+ *     409 and run NO cancel of any kind (neither release job nor repair). This is
+ *     the ONLY non-200 outcome now.
+ *   - otherwise — BOTH ran: the resolver already applied the release-job
+ *     three-state; `runRepairCancel` applies the repair four-case. The REPAIR
+ *     result decides the main HTTP code (200 — the original repair contract), and
+ *     `releaseCancel`/`releaseRequestId` ride along in the body. A `too_late`/
+ *     `not_found`/`idempotent` release outcome is NO LONGER a separate 409 — v5
+ *     reads the body value and adjudicates.
+ *
+ * `runRepairCancel` is a thunk so it is invoked ONLY when NOT a mismatch (the
+ * skip is part of the contract), and so the whole decision is unit-testable
+ * without the HTTP server or a live session backend.
+ */
+export async function resolveDualCancel(
+  releaseOutcome: ReleaseJobCancelResult,
+  runRepairCancel: () => Promise<CancelOutcome>,
+): Promise<DualCancelResult> {
+  if (releaseOutcome.body.releaseCancel === 'repair_mismatch') {
+    return { status: releaseOutcome.status, body: releaseOutcome.body }
+  }
+  // R3-1 BLOCKER: when the deploy is IN FLIGHT (too_late) or its effect EXISTS /
+  // is AMBIGUOUS (idempotent over deployed / deploy_unknown), the repair's fate
+  // belongs to the receipt → probe pipeline — running the repair-level cancel here
+  // could report terminated=true and let v5 terminal-cancel a repair whose code IS
+  // live in production (the deployed receipt can then never push a terminal
+  // `cancelled` repair to verifying). Skip the repair-level cancel entirely and
+  // answer terminated=false so v5 leaves the repair in cancel_requested; the
+  // release-scoped terminal callback settles it (deployed → verifying via the
+  // cancel-state-aware CAS; unknown → fuse + human).
+  const rc = releaseOutcome.body.releaseCancel
+  const jobStatus = releaseOutcome.body.releaseJobStatus
+  const deployOwnsRepair =
+    rc === 'too_late' || (rc === 'idempotent' && (jobStatus === 'deployed' || jobStatus === 'deploy_unknown'))
+  if (deployOwnsRepair) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        terminated: false,
+        accepted: false,
+        status: `release_${jobStatus ?? 'deploying'}`,
+        releaseCancel: rc,
+        releaseRequestId: releaseOutcome.body.releaseRequestId,
+        ...(jobStatus ? { releaseJobStatus: jobStatus } : {}),
+      },
+    }
+  }
+  const repair = await runRepairCancel()
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      repairId: repair.repairId,
+      terminated: repair.terminated,
+      accepted: repair.accepted,
+      status: repair.status,
+      releaseCancel: rc,
+      releaseRequestId: releaseOutcome.body.releaseRequestId,
+      ...(jobStatus ? { releaseJobStatus: jobStatus } : {}),
+    },
+  }
+}
+
+export interface FuseClearBody {
+  repairId: 'fuse'
+  reason: string
+  clearedBy: string
+}
+
+/** Parse the fuse-clear body (§3.3): the fixed repairId literal "fuse" (so the
+ *  shared HMAC signed-string format applies) + free-text reason / clearedBy. */
+export function parseFuseClearBody(raw: Buffer): FuseClearBody | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw.toString('utf8'))
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const p = parsed as Record<string, unknown>
+  if (p.repairId !== 'fuse') return null
+  if (typeof p.reason !== 'string' || p.reason.length === 0 || p.reason.length > 500) return null
+  if (typeof p.clearedBy !== 'string' || p.clearedBy.length === 0 || p.clearedBy.length > 200) {
+    return null
+  }
+  return { repairId: 'fuse', reason: p.reason, clearedBy: p.clearedBy }
+}
+
+/** Clear the LOCAL Tier2 release fuse (§3.3), audited. The v5 side initiates
+ *  this only after a human-audited PG-side clear (double-sided convergence). */
+export async function receiveSelfhealFuseClear(
+  input: SelfhealWebhookInput,
+  cfg: SelfhealReceiverConfig,
+  now = Date.now(),
+): Promise<ReceiverResult> {
+  if (input.rawBody.length > cfg.maxBodyBytes) {
+    return { status: 413, body: { error: 'payload too large' } }
+  }
+  const body = parseFuseClearBody(input.rawBody)
+  if (!body) return { status: 400, body: { error: 'invalid fuse-clear body' } }
+  const verified = await verifySelfhealSignedRequest(
+    {
+      remoteAddress: input.remoteAddress,
+      method: input.method,
+      path: input.path,
+      ts: input.ts,
+      nonce: input.nonce,
+      sig: input.sig,
+      rawBody: input.rawBody,
+      repairId: body.repairId,
+    },
+    cfg,
+    now,
+  )
+  if (!verified.ok) return { status: verified.status, body: { error: verified.error } }
+  const flipped = await clearReleaseFuse({ clearedBy: body.clearedBy, now: new Date(now).toISOString() })
+  // Durable audit line — the fuse clear is a privileged Tier2 gate reset.
+  log.warn('selfheal release fuse clear', {
+    clearedBy: body.clearedBy,
+    reason: body.reason,
+    flipped,
+  })
+  return { status: 200, body: { ok: true, cleared: flipped } }
 }

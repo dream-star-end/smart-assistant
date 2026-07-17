@@ -3,19 +3,45 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import type { SelfhealCallbackPhase } from '@openclaude/storage'
+import type { ReleaseJobInsertInput, SelfhealCallbackPhase } from '@openclaude/storage'
 import {
   type BrokerRequest,
   type BrokerResponse,
+  type CutoverClassifier,
   InMemoryBrokerClaimStore,
   type RepairAuthority,
+  SELFHEAL_DRILL_RELEASE_KEY,
   SelfhealBroker,
-  releaseHttpStatusFor,
 } from '../selfheal/broker.js'
 import { type CommandRunner, type RunResult, TIER1_ACTIONS } from '../selfheal/brokerActions.js'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
+
+// Cutover classification is stubbed in these broker fixtures — the classifier's
+// own logic (raw-diff parsing, glob, argv, plan hash) is exercised end-to-end in
+// selfhealDeploySurfaces.test.ts. Here we only assert the broker PLUMBS the
+// classification into the durable record + pending_release callback.
+const CLS_BASE = 'b'.repeat(40)
+const CLS_HASH = 'e'.repeat(64)
+const CLS_PLAN = 'a'.repeat(64)
+function stubClassifier(manual: { path: string; reason: string }[] = []): CutoverClassifier {
+  const isManual = manual.length > 0
+  return async () => ({
+    baseSha: CLS_BASE,
+    classification: {
+      surfaces: isManual ? [] : ['web'],
+      deployArgs: isManual ? [] : ['--dist'],
+      manual,
+      verifyLayers: ['lint', 'test:gateway', 'test:web', 'typecheck'],
+      requiredAxes: [],
+      changedFiles: { paths: ['packages/web-react/App.tsx'], total: 1 },
+      manifestVersion: 1,
+      manifestHash: CLS_HASH,
+      deployPlanHash: CLS_PLAN,
+    },
+  })
+}
 
 // Capability authorization test fixtures: an active repair holding CAP with a
 // frozen (non-drill) condition key — the batch0 posture every real repair has
@@ -25,6 +51,7 @@ const activeAuthority: RepairAuthority = async () => ({
   status: 'running',
   capability: CAP,
   conditionKey: 'ops.monitor:svc_v5',
+  incidentId: 'inc-active-1',
 })
 
 function stubRunner(handler: (cmd: string, args: string[]) => Partial<RunResult> | undefined): {
@@ -296,6 +323,7 @@ describe('SelfhealBroker Tier2 cutover', () => {
       verificationDir: vdir,
       canonicalRepo: '/canon',
       run,
+      classifyCutover: stubClassifier(),
       notifyPendingRelease: (i) => pending.push(i),
       ...opts,
     })
@@ -304,44 +332,18 @@ describe('SelfhealBroker Tier2 cutover', () => {
 
   it('default posture (AUTO_DEPLOY_TIER2 off) holds a fully-gated cutover for release', async () => {
     writeSignedVerification(vdir, passingVerification('c1'))
-    let deployed = false
-    const { broker, pending } = makeBroker({
-      autoDeployTier2: false,
-      deployDriver: async () => {
-        deployed = true
-        return { ok: true, status: 'deployed' }
-      },
-    })
+    const { broker, pending } = makeBroker({ autoDeployTier2: false })
     const resp = await broker.handleRequest({
       repairId: 'c1',
       capability: CAP,
       actionKind: 'cutover',
       params: { sha: SHA, verificationRef: 'c1' },
     })
+    // batch1b §11: the broker no longer deploys synchronously — a fully-gated
+    // cutover parks pending_release; deploy is the release worker's job.
     assert.equal(resp.status, 'pending_release')
     assert.equal(resp.ok, false)
-    assert.equal(deployed, false, 'must NOT auto-deploy when AUTO_DEPLOY_TIER2=0')
     assert.deepEqual(pending, [{ repairId: 'c1', sha: SHA }])
-  })
-
-  it('AUTO_DEPLOY_TIER2 on runs the trusted deploy driver after all gates', async () => {
-    writeSignedVerification(vdir, passingVerification('c2'))
-    const seen: string[] = []
-    const { broker } = makeBroker({
-      autoDeployTier2: true,
-      deployDriver: async (sha) => {
-        seen.push(sha)
-        return { ok: true, status: 'deployed', detail: { sha } }
-      },
-    })
-    const resp = await broker.handleRequest({
-      repairId: 'c2',
-      capability: CAP,
-      actionKind: 'cutover',
-      params: { sha: SHA, verificationRef: 'c2' },
-    })
-    assert.equal(resp.status, 'deployed')
-    assert.deepEqual(seen, [SHA])
   })
 
   it('rejects a tampered verification signature', async () => {
@@ -388,8 +390,8 @@ describe('SelfhealBroker Tier2 cutover', () => {
       verifyKey: VERIFY_KEY,
       verificationDir: vdir,
       autoDeployTier2: true,
+      classifyCutover: stubClassifier(),
       run,
-      deployDriver: async () => ({ ok: true, status: 'deployed' }),
     })
     const resp = await broker.handleRequest({
       repairId: 'c5',
@@ -423,6 +425,154 @@ describe('SelfhealBroker Tier2 cutover', () => {
       params: { sha: 'not-a-sha', verificationRef: 'c7' },
     })
     assert.equal(resp.status, 'rejected')
+  })
+
+  it('pending_release detail is enriched with the frozen deploy plan (§11 shape)', async () => {
+    writeSignedVerification(vdir, passingVerification('c-enrich'))
+    const { broker } = makeBroker({ autoDeployTier2: false })
+    const resp = await broker.handleRequest({
+      repairId: 'c-enrich',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-enrich' },
+    })
+    assert.equal(resp.status, 'pending_release')
+    // Authoritative durable cutover record detail — the personal release-job
+    // intake re-checks sha/deployPlanHash/manifestHash against it (fail-closed).
+    const d = resp.detail as Record<string, unknown>
+    assert.equal(d.sha, SHA)
+    assert.equal(d.baseSha, CLS_BASE)
+    assert.equal(d.deployPlanHash, CLS_PLAN)
+    assert.equal(d.manifestHash, CLS_HASH)
+    assert.equal(d.manifestVersion, 1)
+    assert.deepEqual((d.classification as { surfaces: string[] }).surfaces, ['web'])
+    assert.deepEqual((d.classification as { deployArgs: string[] }).deployArgs, ['--dist'])
+    assert.deepEqual((d.classification as { manual: unknown[] }).manual, [])
+    assert.deepEqual(d.changedFiles, { paths: ['packages/web-react/App.tsx'], total: 1 })
+    // verification block records the layers actually run + the ref.
+    const v = d.verification as { layers: { name: string }[]; ref: string }
+    assert.equal(v.ref, 'c-enrich')
+    assert.deepEqual(
+      v.layers.map((l) => l.name),
+      ['typecheck'],
+    )
+  })
+
+  it('a classifier throw is a fail-closed cutover refusal (never parks un-classified)', async () => {
+    writeSignedVerification(vdir, passingVerification('c-clsfail'))
+    const { broker } = makeBroker({
+      autoDeployTier2: false,
+      classifyCutover: async () => {
+        throw new Error('git show manifest failed')
+      },
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'c-clsfail',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-clsfail' },
+    })
+    assert.equal(resp.status, 'rejected')
+    assert.match(String(resp.detail?.reason), /classification failed/)
+  })
+
+  it('a manual classification still parks pending_release, carrying manual reasons', async () => {
+    writeSignedVerification(vdir, passingVerification('c-manual'))
+    const manual = [{ path: 'scripts/deploy-v5.sh', reason: 'manual_glob:**/*.sh' }]
+    const { broker, pending } = makeBroker({
+      autoDeployTier2: false,
+      classifyCutover: stubClassifier(manual),
+    })
+    const resp = await broker.handleRequest({
+      repairId: 'c-manual',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-manual' },
+    })
+    assert.equal(resp.status, 'pending_release')
+    const cls = (resp.detail as Record<string, unknown>).classification as {
+      manual: { path: string }[]
+      deployArgs: string[]
+    }
+    assert.deepEqual(cls.manual, manual)
+    assert.deepEqual(cls.deployArgs, [], 'manual short-circuits the deploy argv')
+    // The pending notification carries the manual paths (transitional field).
+    assert.deepEqual(pending, [{ repairId: 'c-manual', sha: SHA, toolchain: [manual[0].path] }])
+  })
+
+  // ── R2-4: auto-deploy release job inserted in the SAME atomic commit ────────
+
+  it('R2-4: an auto cutover records the release job in the SAME commit as the cutover finalize', async () => {
+    writeSignedVerification(vdir, passingVerification('c-auto'))
+    const store = new InMemoryBrokerClaimStore()
+    const { broker } = makeBroker({ autoDeployTier2: true, store })
+    const resp = await broker.handleRequest({
+      repairId: 'c-auto',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-auto' },
+    })
+    assert.equal(resp.status, 'queued')
+    assert.equal(resp.ok, true)
+    // "cutover committed ⟺ job present": both landed via finalizeWithCallback.
+    assert.equal((await store.get('c-auto:cutover'))?.status, 'committed')
+    assert.equal(store.releaseJobs.length, 1, 'exactly one release job recorded atomically')
+    const job = store.releaseJobs[0]
+    assert.equal(job.origin, 'auto')
+    assert.equal(job.repairId, 'c-auto')
+    assert.equal(job.approvedSha, SHA)
+    assert.equal(job.deployPlanHash, CLS_PLAN)
+    assert.equal(job.manifestHash, CLS_HASH)
+    assert.match(job.releaseRequestId, /^auto-c-auto-/)
+    // The wire response carries the rrid but NEVER the internal releaseJobInsert.
+    assert.equal((resp as { releaseJobInsert?: unknown }).releaseJobInsert, undefined)
+    assert.equal((resp.detail as { releaseRequestId?: string }).releaseRequestId, job.releaseRequestId)
+  })
+
+  it('R2-4: a combined-commit failure is FAIL-CLOSED — commit_failed, claim held, NO job', async () => {
+    // The atomic finalize+insert failing (disk full) must NOT leave the cutover
+    // committed nor the job present; the claim is held so a retry reports in_progress.
+    writeSignedVerification(vdir, passingVerification('c-auto2'))
+    class ThrowStore extends InMemoryBrokerClaimStore {
+      override async finalizeWithCallback(): Promise<void> {
+        throw new Error('combined commit disk full (injected)')
+      }
+    }
+    const store = new ThrowStore()
+    const { broker } = makeBroker({ autoDeployTier2: true, store })
+    const resp = await broker.handleRequest({
+      repairId: 'c-auto2',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-auto2' },
+    })
+    assert.equal(resp.status, 'commit_failed', 'never a silent success')
+    assert.equal(store.releaseJobs.length, 0, 'no job recorded on a failed commit')
+    assert.equal((await store.get('c-auto2:cutover'))?.status, 'claimed', 'claim held (not committed)')
+    const retry = await broker.handleRequest({
+      repairId: 'c-auto2',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: SHA, verificationRef: 'c-auto2' },
+    })
+    assert.equal(retry.status, 'in_progress', 'claim held fail-closed — never re-executed blindly')
+  })
+
+  it('R2-4: a replayed auto cutover does NOT record a second job (idempotent)', async () => {
+    writeSignedVerification(vdir, passingVerification('c-auto3'))
+    const store = new InMemoryBrokerClaimStore()
+    const { broker } = makeBroker({ autoDeployTier2: true, store })
+    const run = () =>
+      broker.handleRequest({
+        repairId: 'c-auto3',
+        capability: CAP,
+        actionKind: 'cutover',
+        params: { sha: SHA, verificationRef: 'c-auto3' },
+      })
+    await run()
+    const replay = await run()
+    assert.equal(replay.status, 'queued', 'idempotent replay of the committed outcome')
+    assert.equal(store.releaseJobs.length, 1, 'no duplicate release job on replay')
   })
 })
 
@@ -513,6 +663,7 @@ describe('broker verify kind — de-privileged four-layer run via verifier', () 
       clonePath: string
       canonicalRepo: string
       canonicalBranch: string
+      extraLayers?: string[]
     }[] = []
     const SHA = 'd'.repeat(40)
     const broker = new SelfhealBroker({
@@ -522,6 +673,9 @@ describe('broker verify kind — de-privileged four-layer run via verifier', () 
       verificationDir: '/var/lib/test-verifications',
       canonicalRepo: '/trusted/v5',
       canonicalBranch: 'repair-main',
+      // batch1b §6: verify resolves surface-specific extra layers from the
+      // classification and threads them into the runner.
+      classifyClone: async () => ({ verifyLayers: ['lint', 'typecheck'] }),
       verifyRunner: async (input) => {
         seen.push(input)
         return {
@@ -564,6 +718,7 @@ describe('broker verify kind — de-privileged four-layer run via verifier', () 
         clonePath: '/home/ocheal/selfheal/v-1',
         canonicalRepo: '/trusted/v5',
         canonicalBranch: 'repair-main',
+        extraLayers: ['lint', 'typecheck'],
       },
     ])
   })
@@ -590,6 +745,7 @@ describe('broker verify kind — de-privileged four-layer run via verifier', () 
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
       repairAuthority: activeAuthority,
+      classifyClone: async () => ({ verifyLayers: [] }),
       verifyRunner: async () => {
         throw new Error('worktree add failed')
       },
@@ -725,9 +881,6 @@ describe('release structural isolation (design §C2 R2-BLOCKER2)', () => {
       socketPath: '/unused',
       store: new InMemoryBrokerClaimStore(),
       repairAuthority: activeAuthority,
-      deployDriver: async () => {
-        throw new Error('must never be reached from the socket')
-      },
     })
     for (const kind of ['release', 'release_approved']) {
       const resp = await broker.handleRequest({
@@ -739,180 +892,6 @@ describe('release structural isolation (design §C2 R2-BLOCKER2)', () => {
       assert.equal(resp.status, 'rejected', kind)
       assert.match(String(resp.detail?.reason), /not a socket action/)
     }
-  })
-})
-
-describe('releaseApproved — re-verifies pending record + ancestry + denylist', () => {
-  const SHA = 'f'.repeat(40)
-
-  // Fully self-contained fixture per test (no shared mutable state — tests may
-  // interleave). `ancestry.ok` is mutable so a test can flip it AFTER parking
-  // the pending cutover, exercising the release-time re-check.
-  function releaseFixture(opts: { deployStatus?: string; deployOk?: boolean } = {}) {
-    const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-rel-'))
-    const store = new InMemoryBrokerClaimStore()
-    const deployed: string[] = []
-    const ancestry = { ok: true }
-    // Mutable release fuse (HIGH3): a test flips it AFTER parking the pending
-    // cutover to model a cancel of the (terminal) job revoking the release.
-    const revoked = { v: false }
-    const { run } = stubRunner((cmd, args) => {
-      if (cmd === 'git' && args.includes('merge-base')) {
-        return { code: ancestry.ok ? 0 : 1 }
-      }
-      return { code: 0 }
-    })
-    const broker = new SelfhealBroker({
-      socketPath: '/unused',
-      store,
-      repairAuthority: async () => ({
-        status: 'running',
-        capability: CAP,
-        releaseRevoked: revoked.v,
-        conditionKey: 'ops.monitor:svc_v5',
-      }),
-      verifyKey: VERIFY_KEY,
-      verificationDir: vdir,
-      canonicalRepo: '/canon',
-      run,
-      autoDeployTier2: false, // default posture → cutover parks in pending_release
-      deployDriver: async (sha) => {
-        deployed.push(sha)
-        return {
-          ok: opts.deployOk ?? true,
-          status: opts.deployStatus ?? 'deployed',
-          detail: { sha },
-        }
-      },
-    })
-    async function parkPendingCutover(repairId: string): Promise<void> {
-      const result = {
-        repairId,
-        sha: SHA,
-        clonePath: `/home/ocheal/selfheal/${repairId}`,
-        layers: [{ name: 'typecheck', ok: true, code: 0, durationMs: 1 }],
-        allPassed: true,
-        verifiedAt: new Date().toISOString(),
-      }
-      writeSignedVerification(vdir, result)
-      const resp = await broker.handleRequest({
-        repairId,
-        capability: CAP,
-        actionKind: 'cutover',
-        params: { sha: SHA, verificationRef: repairId },
-      })
-      assert.equal(resp.status, 'pending_release')
-    }
-    const cleanup = () => rmSync(vdir, { recursive: true, force: true })
-    return { broker, store, deployed, ancestry, revoked, parkPendingCutover, cleanup }
-  }
-
-  it('happy path: pending record found → ancestry re-checked → driver deploys; replay is idempotent', async () => {
-    const fx = releaseFixture()
-    await fx.parkPendingCutover('rl-1')
-    const resp = await fx.broker.releaseApproved('rl-1')
-    assert.equal(resp.status, 'deployed')
-    assert.equal(resp.ok, true)
-    assert.deepEqual(fx.deployed, [SHA])
-    // The durable cutover record now reflects the deployed outcome.
-    const rec = await fx.store.get('rl-1:cutover')
-    assert.equal(JSON.parse(rec?.response ?? '{}').status, 'deployed')
-    // A duplicate release replays — the deploy runs EXACTLY once.
-    const again = await fx.broker.releaseApproved('rl-1')
-    assert.equal(again.status, 'deployed')
-    assert.equal(again.detail?.replayed, true)
-    assert.deepEqual(fx.deployed, [SHA], 'at-most-once deploy')
-    fx.cleanup()
-  })
-
-  it('refuses when there is no pending cutover record', async () => {
-    const fx = releaseFixture()
-    const resp = await fx.broker.releaseApproved('rl-none')
-    assert.equal(resp.status, 'rejected')
-    assert.match(String(resp.detail?.reason), /no committed cutover record/)
-    assert.deepEqual(fx.deployed, [])
-    fx.cleanup()
-  })
-
-  it('re-runs ancestry at release time and refuses a non-descendant (deploy never invoked)', async () => {
-    const fx = releaseFixture()
-    await fx.parkPendingCutover('rl-anc')
-    // Ancestry passed at cutover time; canonical moved on → flip it for release.
-    fx.ancestry.ok = false
-    const resp = await fx.broker.releaseApproved('rl-anc')
-    assert.equal(resp.status, 'rejected')
-    assert.match(String(resp.detail?.reason), /not a descendant/)
-    assert.deepEqual(fx.deployed, [], 'deploy never invoked')
-    fx.cleanup()
-  })
-
-  it('denylist refusal from the driver leaves the release retryable and NOT deployed', async () => {
-    const fx = releaseFixture({ deployOk: false, deployStatus: 'pending_release' })
-    await fx.parkPendingCutover('rl-deny')
-    const resp = await fx.broker.releaseApproved('rl-deny')
-    assert.equal(resp.status, 'pending_release', 'toolchain-touching sha stays held')
-    // The release claim was released → a later legitimate attempt can retry.
-    const releaseRec = await fx.store.get('rl-deny:release_approved')
-    assert.equal(releaseRec, null)
-    // The cutover record still says pending_release (not deployed).
-    const cutRec = await fx.store.get('rl-deny:cutover')
-    assert.equal(JSON.parse(cutRec?.response ?? '{}').status, 'pending_release')
-    fx.cleanup()
-  })
-
-  it('a second release of an already-deployed cutover replays without re-deploying', async () => {
-    const fx = releaseFixture()
-    await fx.parkPendingCutover('rl-twice')
-    assert.equal((await fx.broker.releaseApproved('rl-twice')).status, 'deployed')
-    // Replay path returns the recorded deploy; the driver ran once.
-    assert.equal((await fx.broker.releaseApproved('rl-twice')).detail?.replayed, true)
-    assert.equal(fx.deployed.length, 1)
-    fx.cleanup()
-  })
-
-  it('refuses a release revoked by a terminal-job cancel (HIGH3 fuse — deploy never invoked)', async () => {
-    const fx = releaseFixture()
-    await fx.parkPendingCutover('rl-revoked')
-    // Cancel of the terminal job flips the durable fuse after the park.
-    fx.revoked.v = true
-    const resp = await fx.broker.releaseApproved('rl-revoked')
-    assert.equal(resp.status, 'rejected')
-    assert.equal(resp.detail?.reason, 'release_revoked')
-    assert.deepEqual(fx.deployed, [], 'deploy never invoked')
-    // The fuse is checked at ENTRY: no release claim was consumed either.
-    assert.equal(await fx.store.get('rl-revoked:release_approved'), null)
-    fx.cleanup()
-  })
-})
-
-// ── BLOCKER1: release endpoint HTTP mapping (server.ts consumes this) ─────────
-
-describe('releaseHttpStatusFor — 5-tier release HTTP mapping matrix', () => {
-  it('maps every broker release outcome onto the seam contract', () => {
-    // deployed → 200, including an idempotent replay of a deployed record.
-    assert.equal(releaseHttpStatusFor({ ok: true, status: 'deployed' }), 200)
-    assert.equal(
-      releaseHttpStatusFor({ ok: true, status: 'deployed', detail: { replayed: true } }),
-      200,
-    )
-    // gate refusals (ancestry / denylist / missing record / release_revoked)
-    // and a still-held pending → 409.
-    assert.equal(releaseHttpStatusFor({ ok: false, status: 'pending_release' }), 409)
-    assert.equal(releaseHttpStatusFor({ ok: false, status: 'rejected' }), 409)
-    assert.equal(
-      releaseHttpStatusFor({
-        ok: false,
-        status: 'rejected',
-        detail: { reason: 'release_revoked' },
-      }),
-      409,
-    )
-    // an unfinalized prior release → 423.
-    assert.equal(releaseHttpStatusFor({ ok: false, status: 'in_progress' }), 423)
-    // driver failure → 500.
-    assert.equal(releaseHttpStatusFor({ ok: false, status: 'deploy_failed' }), 500)
-    // anything unexpected is a server error, never a 2xx.
-    assert.equal(releaseHttpStatusFor({ ok: false, status: 'error' }), 500)
   })
 })
 
@@ -947,15 +926,13 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       override async finalizeWithCallback(
         finalize: { claimKey: string; response: string }[],
         overwriteCommitted: { claimKey: string; response: string } | undefined,
-        callback: {
-          repairId: string
-          phase: SelfhealCallbackPhase
-          message: string
-          detail: Record<string, unknown>
-        },
+        callback:
+          | { repairId: string; phase: SelfhealCallbackPhase; message: string; detail: Record<string, unknown> }
+          | undefined,
+        releaseJobInsert?: ReleaseJobInsertInput,
       ): Promise<void> {
         if (opts.outboxThrows) throw new Error('outbox disk full')
-        await super.finalizeWithCallback(finalize, overwriteCommitted, callback)
+        await super.finalizeWithCallback(finalize, overwriteCommitted, callback, releaseJobInsert)
       }
     }
     const store = new SeamStore()
@@ -973,25 +950,10 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
       verificationDir: vdir,
       canonicalRepo: '/canon',
       run,
+      classifyCutover: stubClassifier(),
       autoDeployTier2: opts.autoDeploy ?? false,
       callbackBaseUrl: 'http://127.0.0.1:18796',
       fetchImpl: impl,
-      deployDriver: async (sha) => {
-        deployed.push(sha)
-        return {
-          ok: true,
-          status: 'deployed',
-          detail: {
-            sha,
-            healthCheck: {
-              kind: 'deploy-v5-smoke',
-              ok: true,
-              target: 'service:v5',
-              checkedAt: '2026-07-13T02:00:00.000Z',
-            },
-          },
-        }
-      },
     })
     function park(repairId: string) {
       writeSignedVerification(vdir, {
@@ -1043,54 +1005,6 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     fx.cleanup()
   })
 
-  it('releaseApproved ENQUEUES done (phase=deployed) after a successful human release', async () => {
-    const fx = seamFixture()
-    await fx.park('seam-2')
-    const resp = await fx.broker.releaseApproved('seam-2')
-    assert.equal(resp.status, 'deployed')
-    assert.deepEqual(fx.deployed, [SHA])
-    const done = fx.enqueued.find((e) => e.phase === 'done')
-    assert.ok(done, 'the broker (not codex) closes the loop after release — durably')
-    assert.equal(done?.repairId, 'seam-2')
-    assert.equal(done?.detail.phase, 'deployed')
-    assert.equal(done?.detail.sha, SHA)
-    assert.equal(
-      fx.calls.some((c) => c.url.endsWith('/done')),
-      false,
-      'no direct done POST from the broker',
-    )
-    fx.cleanup()
-  })
-
-  it('an auto-deployed cutover (AUTO_DEPLOY_TIER2=1) enqueues done as well', async () => {
-    const fx = seamFixture({ autoDeploy: true })
-    const resp = await fx.park('seam-auto')
-    assert.equal(resp.status, 'deployed')
-    const done = fx.enqueued.find((e) => e.phase === 'done')
-    assert.equal(done?.detail.phase, 'deployed')
-    assert.deepEqual(done?.detail.trusted_attestation, {
-      version: 1,
-      repairId: 'seam-auto',
-      incidentId: '88',
-      conditionKey: 'ops.monitor:svc_v5',
-      target: 'service:v5',
-      action: 'deploy_v5',
-      executionMode: 'fully_automatic',
-      executed: true,
-      remoteResult: {
-        ok: true,
-        target: 'service:v5',
-        healthOk: true,
-        checkedAt: (done?.detail.trusted_attestation as any).remoteResult.checkedAt,
-      },
-    })
-    assert.equal(
-      fx.enqueued.some((e) => e.phase === 'pending_release'),
-      false,
-    )
-    fx.cleanup()
-  })
-
   it('combined commit failure is FAIL-CLOSED: commit_failed + claim held, never a silent success', async () => {
     // 审计R2 BLOCKER:enqueue 失败绝不允许 outcome 照常 committed(那会永久
     // 孤儿化 master 状态机)。失败 = commit_failed,claim 保持,重试报 in_progress。
@@ -1101,84 +1015,6 @@ describe('broker → master callback seam (durable outbox — BLOCKER2)', () => 
     const retry = await fx.park('seam-3')
     assert.equal(retry.status, 'in_progress', 'claim held fail-closed — never re-executed blindly')
     fx.cleanup()
-  })
-
-  it('release combined commit failure holds the release claim and never re-deploys', async () => {
-    const fx = seamFixture()
-    await fx.park('seam-3b')
-    // Flip the store into failure mode only for the release commit.
-    ;(fx as unknown as { failNext?: boolean }).failNext = true
-    const store = fx.broker as unknown as { store: { finalizeWithCallback: unknown } }
-    const orig = store.store.finalizeWithCallback as (...a: unknown[]) => Promise<void>
-    store.store.finalizeWithCallback = async () => {
-      throw new Error('outbox disk full')
-    }
-    const rel = await fx.broker.releaseApproved('seam-3b')
-    assert.equal(rel.status, 'commit_failed', 'deploy ran but commit failed — reported honestly')
-    assert.equal(fx.deployed.length, 1)
-    store.store.finalizeWithCallback = orig
-    const retry = await fx.broker.releaseApproved('seam-3b')
-    assert.equal(retry.status, 'in_progress', 'claim held — the deploy is never blindly re-run')
-    assert.equal(fx.deployed.length, 1, 'no second deploy')
-    fx.cleanup()
-  })
-
-  it('a terminal-cancel fuse set AFTER the entry check still blocks the deploy (per-repair fence)', async () => {
-    // HIGH2(审计R2):releaseApproved 的终检在 per-repair 锁内 fresh 读 fuse。
-    // 模拟:入口检查时未 revoked,锁内终检时已 revoked(cancel 先赢)。
-    const vdir = mkdtempSync(join(tmpdir(), 'oc-verif-fence-'))
-    const { run } = stubRunner((cmd, args) => {
-      if (cmd === 'git' && args.includes('merge-base')) return { code: 0 }
-      return { code: 0 }
-    })
-    let reads = 0
-    const flippingAuthority: RepairAuthority = async () => {
-      reads += 1
-      // 1st read: handleRequest authorize; 2nd: release entry check; 3rd+ (locked
-      // re-check): revoked.
-      return {
-        status: 'running',
-        capability: CAP,
-        releaseRevoked: reads >= 3,
-        conditionKey: 'ops.monitor:svc_v5',
-      }
-    }
-    const deployed: string[] = []
-    const store = new InMemoryBrokerClaimStore()
-    const broker = new SelfhealBroker({
-      socketPath: '/unused',
-      store,
-      repairAuthority: flippingAuthority,
-      verifyKey: VERIFY_KEY,
-      verificationDir: vdir,
-      canonicalRepo: '/canon',
-      run,
-      autoDeployTier2: false,
-      deployDriver: async (sha) => {
-        deployed.push(sha)
-        return { ok: true, status: 'deployed', detail: { sha } }
-      },
-    })
-    writeSignedVerification(vdir, {
-      repairId: 'fence-1',
-      sha: SHA,
-      clonePath: '/home/ocheal/selfheal/fence-1',
-      layers: [{ name: 'typecheck', ok: true, code: 0, durationMs: 1 }],
-      allPassed: true,
-      verifiedAt: new Date().toISOString(),
-    })
-    const parked = await broker.handleRequest({
-      repairId: 'fence-1',
-      capability: CAP,
-      actionKind: 'cutover',
-      params: { sha: SHA, verificationRef: 'fence-1' },
-    })
-    assert.equal(parked.status, 'pending_release')
-    const rel = await broker.releaseApproved('fence-1')
-    assert.equal(rel.status, 'rejected')
-    assert.equal(rel.detail?.reason, 'release_revoked')
-    assert.equal(deployed.length, 0, 'the fuse won the fence — driver never ran')
-    rmSync(vdir, { recursive: true, force: true })
   })
 
   it('a replayed cutover does not enqueue a second marker', async () => {
@@ -1277,6 +1113,66 @@ describe('drill authorization — frozen condition key, server-side allowlist', 
       params: { outcome: 'progress', message: 'drill 已接单' },
     })
     assert.doesNotMatch(String(rep.detail?.reason ?? ''), /drill repair/)
+  })
+
+  it('release-drill repair may verify/cutover but NOT any Tier1 opcode', async () => {
+    process.env.OC_SELFHEAL_RESTART_UNITS = 'openclaude-v5'
+    const { run, calls } = stubRunner(() => ({ code: 0 }))
+    const releaseDrillAuthority: RepairAuthority = async () => ({
+      status: 'running',
+      capability: CAP,
+      conditionKey: SELFHEAL_DRILL_RELEASE_KEY,
+    })
+    const broker = new SelfhealBroker({
+      socketPath: '/unused',
+      store: new InMemoryBrokerClaimStore(),
+      repairAuthority: releaseDrillAuthority,
+      actions: TIER1_ACTIONS,
+      // Stub the verify-layer classifier so verify's §6 classification doesn't
+      // reach the shared runner — this test asserts a drill never reaches the
+      // runner via a Tier1 opcode, not via verify's manifest read.
+      classifyClone: async () => ({ verifyLayers: [] }),
+      run,
+    })
+    // verify + cutover PASS the drill gate (they fail later for unrelated
+    // reasons — no uid / no verification file — which proves they got past it).
+    const verify = await broker.handleRequest({
+      repairId: 'r-rel-drill',
+      capability: CAP,
+      actionKind: 'verify',
+      params: { sha: 'a'.repeat(40) },
+    })
+    assert.doesNotMatch(String(verify.detail?.reason ?? ''), /drill repair/)
+    const cutover = await broker.handleRequest({
+      repairId: 'r-rel-drill',
+      capability: CAP,
+      actionKind: 'cutover',
+      params: { sha: 'a'.repeat(40), verificationRef: 'r-rel-drill' },
+    })
+    assert.doesNotMatch(String(cutover.detail?.reason ?? ''), /drill repair/)
+    // Tier1 host opcodes are still rejected for a release drill.
+    for (const a of [
+      { actionKind: 'restart_service', params: { unit: 'openclaude-v5' } },
+      { actionKind: 'clean_disk', params: { target: 'docker' } },
+    ]) {
+      const resp = await broker.handleRequest({
+        repairId: 'r-rel-drill',
+        capability: CAP,
+        actionKind: a.actionKind,
+        params: a.params,
+      })
+      assert.equal(resp.status, 'rejected', `${a.actionKind} must be drill-rejected`)
+      assert.match(
+        String(resp.detail?.reason),
+        /drill repair may only context\/report\/verify\/cutover/,
+      )
+    }
+    assert.equal(
+      calls.length,
+      0,
+      'a drill repair must never reach a command runner via a Tier1 opcode',
+    )
+    setOrUnset('OC_SELFHEAL_RESTART_UNITS', undefined)
   })
 
   it('a NON-drill frozen condition key is not drill-gated', async () => {
