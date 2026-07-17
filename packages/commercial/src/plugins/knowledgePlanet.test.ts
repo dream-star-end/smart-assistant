@@ -33,6 +33,7 @@ import {
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS,
+  KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
@@ -200,6 +201,52 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(isKnowledgePlanetLoginProbeDue(2_999, 3_000, 0), false)
     assert.equal(isKnowledgePlanetLoginProbeDue(3_000, 3_000, 0), true)
     assert.equal(isKnowledgePlanetLoginProbeDue(999_999, 3_000, 48), false)
+  })
+
+  test('uses a redirect only once to accelerate the authoritative API probe', () => {
+    const controls = Function(
+      `'use strict'; ${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}; return { scheduleKnowledgePlanetLoginProbe, hasAuthenticatedKnowledgePlanetSession };`,
+    )() as {
+      scheduleKnowledgePlanetLoginProbe: (
+        now: number,
+        pageAuthenticated: boolean,
+        pageHintApplied: boolean,
+        nextProbeAt: number,
+        attempts: number,
+      ) => { pageHintApplied: boolean; nextProbeAt: number; due: boolean }
+      hasAuthenticatedKnowledgePlanetSession: (probeAuthenticated: boolean) => boolean
+    }
+    let pageHintApplied = false
+    let nextProbeAt = KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS
+    let attempts = 0
+    const probeTimes: number[] = []
+    for (let now = 0; now <= 12_000; now += 1_000) {
+      const scheduled = controls.scheduleKnowledgePlanetLoginProbe(
+        now,
+        true,
+        pageHintApplied,
+        nextProbeAt,
+        attempts,
+      )
+      pageHintApplied = scheduled.pageHintApplied
+      nextProbeAt = scheduled.nextProbeAt
+      if (!scheduled.due) continue
+      probeTimes.push(now)
+      attempts += 1
+      nextProbeAt = now + KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS
+    }
+    assert.deepEqual(probeTimes, [0, 5_000, 10_000])
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(false), false)
+    assert.equal(controls.hasAuthenticatedKnowledgePlanetSession(true), true)
+
+    const loginStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function runLogin')
+    const entrypointStart = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\ntry {', loginStart)
+    const loginSource = KNOWLEDGE_PLANET_WORKER_SOURCE.slice(loginStart, entrypointStart)
+    assert.match(
+      loginSource,
+      /if \(hasAuthenticatedKnowledgePlanetSession\(probeAuthenticated\)\) \{[\s\S]*filteredState\([\s\S]*writeAuthenticatedAndExit/,
+    )
+    assert.doesNotMatch(loginSource, /pageAuthenticated \|\| probeAuthenticated/)
   })
 
   test('flushes authenticated state before exiting so host cleanup can finish immediately', () => {
