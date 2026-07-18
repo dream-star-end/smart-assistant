@@ -81,6 +81,7 @@ async function manualLeaseFixture() {
   const blockerRelease = path.join(dir, 'blocker-release')
   const sshPids = path.join(dir, 'ssh-pids')
   const remotePids = path.join(dir, 'remote-pids')
+  const commandPids = path.join(dir, 'command-pids')
   const wrapper = path.join(dir, 'with-production-mutation-lease.sh')
   const command = path.join(dir, 'wrapped-command.sh')
   const source = await readFile(manualMutationLease, 'utf8')
@@ -94,12 +95,28 @@ async function manualLeaseFixture() {
     [
       '#!/bin/bash',
       'printf "%s\\n" "$$" >>"$FAKE_SSH_PIDS"',
+      'while [[ "${1:-}" == "-o" ]]; do',
+      '  [[ $# -ge 2 ]] || exit 2',
+      '  shift 2',
+      'done',
+      '[[ $# -ge 2 ]] || exit 2',
       'shift',
-      'bash -c "$1" &',
+      'remote_out=""',
+      'if [[ "${FAKE_SSH_BUFFER_OUTPUT_UNTIL_REMOTE_EXIT:-0}" == 1 ]]; then',
+      '  remote_out="$(mktemp)"',
+      '  bash -c "$1" >"$remote_out" &',
+      'else',
+      '  bash -c "$1" &',
+      'fi',
       'remote_pid=$!',
       'printf "%s\\n" "$remote_pid" >>"$FAKE_REMOTE_PIDS"',
       "trap 'exit 0' HUP INT TERM",
       'wait "$remote_pid"',
+      'rc=$?',
+      'if [[ -n "$remote_out" ]]; then cat "$remote_out"; rm -f -- "$remote_out"; fi',
+      'delay="${FAKE_SSH_EXIT_DELAY_SECONDS:-0}"',
+      '[[ "$delay" == 0 ]] || sleep "$delay"',
+      'exit "$rc"',
     ].join('\n') + '\n',
   )
   await chmod(path.join(bin, 'ssh'), 0o755)
@@ -122,6 +139,7 @@ async function manualLeaseFixture() {
     blockerRelease,
     sshPids,
     remotePids,
+    commandPids,
     wrapper,
     command,
     env: {
@@ -130,6 +148,7 @@ async function manualLeaseFixture() {
       KL_HOST: 'fake-manual-lease',
       FAKE_SSH_PIDS: sshPids,
       FAKE_REMOTE_PIDS: remotePids,
+      COMMAND_PIDS: commandPids,
       COMMAND_STARTED: commandStarted,
       COMMAND_RELEASE: commandRelease,
       BLOCKER_STARTED: blockerStarted,
@@ -147,6 +166,33 @@ async function killManualLeaseFixtureProcesses(...pidFiles: string[]): Promise<v
       try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
     }
   }
+}
+
+async function allRecordedProcessesExited(pidFile: string): Promise<boolean> {
+  const raw = await readFile(pidFile, 'utf8').catch(() => '')
+  const pids = raw.split(/\s+/).map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1)
+  if (pids.length === 0) return false
+  return pids.every((pid) => {
+    try { process.kill(pid, 0); return false } catch { return true }
+  })
+}
+
+async function writeStubbornManualCommand(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<string> {
+  const command = path.join(fx.dir, 'stubborn-command.sh')
+  await writeFile(command, [
+    '#!/bin/bash',
+    "trap '' TERM",
+    'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+    '(',
+    "  trap '' TERM",
+    '  printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+    '  while :; do sleep 0.1; done',
+    ') &',
+    ': >"$COMMAND_STARTED"',
+    'while :; do sleep 0.1; done',
+  ].join('\n') + '\n')
+  await chmod(command, 0o755)
+  return command
 }
 
 async function caddyRemoteFixture() {
@@ -3570,8 +3616,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
 
   test('manual mutation wrapper holder watches its live sshd parent and isolates stdin', async () => {
     const source = await readFile(manualMutationLease, 'utf8')
-    const start = source.indexOf('REMOTE_HOLDER="')
-    const end = source.indexOf('\nssh "$KL_HOST" "$REMOTE_HOLDER"', start)
+    const start = source.indexOf('remote_holder="')
+    const end = source.indexOf('\n\n  # Keepalive bounds', start)
     assert.ok(start >= 0 && end > start, '未找到 manual production-mutation remote holder')
     const holder = source.slice(start, end)
     const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
@@ -3589,8 +3635,21 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.ok(loop > leased, 'manual holder 缺 parent-watch 循环')
     assert.ok(holder.indexOf('/proc/\\$\\$/status', loop) > loop, '循环未重读实时 PPid')
     assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop, '循环未复核 parent 活性')
+    assert.ok(
+      holder.indexOf('lease_ttl=') > firstKernelParent && holder.indexOf('lease_ttl=') < leased,
+      'manual holder 须在 LEASED 前固定可配置 hard TTL',
+    )
+    assert.ok(holder.indexOf('now - lease_start', loop) > loop, 'manual holder 循环未执行 hard TTL 到点释放')
     assert.doesNotMatch(holder, /exec sleep infinity/, 'manual holder 禁止 orphanable infinite sleep')
-    assert.match(source, /ssh "\$KL_HOST" "\$REMOTE_HOLDER" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
+    assert.match(source, /ServerAliveInterval=2/, '后台 ssh 必须设置 transport keepalive')
+    assert.match(source, /ServerAliveCountMax=2/, '后台 ssh 必须限制连续 keepalive 丢失次数')
+    assert.match(source, /"\$KL_HOST" "\$remote_holder" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
+    const sshSpawn = source.indexOf('ssh -o ServerAliveInterval=2')
+    const localTtlSpawn = source.indexOf('sleep "$local_ttl" &')
+    assert.ok(localTtlSpawn >= 0 && localTtlSpawn < sshSpawn, '本地 TTL 必须早于 ssh/远端 TTL 启动')
+    const waitRace = source.indexOf('if wait -n -p completed')
+    assert.ok(waitRace >= 0, 'manual supervisor 缺命令/lease/watchdog 首退竞速')
+    assert.ok(source.indexOf('"$SUP_LOCAL_TTL_PID"', waitRace) > waitRace, '本地安全 TTL 未加入首退竞速')
   })
 
   test('manual mutation wrapper normal cleanup releases a reparented remote holder', async () => {
@@ -3661,6 +3720,181 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       blocker.kill('SIGKILL')
       child?.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper SIGKILL watchdog terminates ssh and the whole command group', async () => {
+    const fx = await manualLeaseFixture()
+    const command = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'stubborn command never started',
+      )
+      assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual lease was not held')
+      assert.equal(child.kill('SIGKILL'), true, 'failed to SIGKILL outer wrapper')
+      assert.equal(await waitForChildExit(child, 3_000), true, 'outer wrapper did not die')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        true,
+        'independent supervisor did not release the mutation lease after wrapper SIGKILL',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 6_000),
+        true,
+        'wrapper SIGKILL left the command or its TERM-ignoring grandchild alive',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper fences a running command when the lease ssh disappears', async () => {
+    const fx = await manualLeaseFixture()
+    const command = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'stubborn command never started',
+      )
+      const sshPid = Number((await readFile(fx.sshPids, 'utf8')).trim().split(/\s+/).at(-1))
+      assert.equal(Number.isSafeInteger(sshPid) && sshPid > 1, true, 'missing fake ssh pid')
+      process.kill(sshPid, 'SIGKILL')
+      assert.equal(await waitForChildExit(child, 8_000), true, 'wrapper did not fail after lease ssh loss')
+      assert.equal(child.exitCode, 86, `lease loss must use the dedicated exit code; signal=${child.signalCode}`)
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 6_000),
+        true,
+        'lease loss left the command or its TERM-ignoring grandchild alive',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        true,
+        'lease ssh loss left the remote flock held',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper hard TTL fences long commands and preserves normal command status', async () => {
+    const ttlFx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(ttlFx)
+    const ttlChild = spawn('bash', [ttlFx.wrapper, stubborn], {
+      env: { ...ttlFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(ttlFx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'TTL command never started',
+      )
+      assert.equal(await waitForChildExit(ttlChild, 8_000), true, 'hard TTL did not stop the wrapper')
+      assert.equal(ttlChild.exitCode, 86, `hard TTL must surface as lease loss; signal=${ttlChild.signalCode}`)
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(ttlFx.commandPids), 6_000),
+        true,
+        'hard TTL left command-group processes alive',
+      )
+    } finally {
+      ttlChild.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(ttlFx.commandPids, ttlFx.sshPids, ttlFx.remotePids)
+    }
+
+    const rcFx = await manualLeaseFixture()
+    const rcCommand = path.join(rcFx.dir, 'exit-23.sh')
+    await writeFile(rcCommand, '#!/bin/bash\nexit 23\n')
+    await chmod(rcCommand, 0o755)
+    const result = spawnSync('bash', [rcFx.wrapper, rcCommand], {
+      env: rcFx.env,
+      stdio: 'ignore',
+      timeout: 10_000,
+    })
+    try {
+      assert.equal(result.status, 23, `normal command status was not preserved; signal=${result.signal}`)
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', rcFx.lock, 'true']).status === 0, 4_000),
+        true,
+        'normal nonzero command exit left the lease held',
+      )
+    } finally {
+      await killManualLeaseFixtureProcesses(rcFx.sshPids, rcFx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper local TTL fences before a live ssh observes remote TTL close', async () => {
+    const fx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, stubborn], {
+      env: {
+        ...fx.env,
+        OC_V5_MUTATION_LEASE_TTL_SECONDS: '3',
+        FAKE_SSH_EXIT_DELAY_SECONDS: '5',
+      },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'delayed-close command never started',
+      )
+      assert.equal(
+        await waitUntilManualLease(async () => {
+          if (spawnSync('flock', ['-n', fx.lock, 'true']).status !== 0) return false
+          assert.equal(
+            await allRecordedProcessesExited(fx.commandPids),
+            true,
+            'remote flock became acquirable while the old command group was still alive',
+          )
+          return true
+        }, 6_000),
+        true,
+        'remote hard TTL did not release the lease after local fencing',
+      )
+      assert.equal(await waitForChildExit(child, 4_000), true, 'wrapper did not finish local-TTL cleanup')
+      assert.equal(child.exitCode, 86, `local TTL must surface as lease loss; signal=${child.signalCode}`)
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper rejects a stale LEASED receipt delivered after remote TTL', async () => {
+    const fx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, stubborn], {
+      env: {
+        ...fx.env,
+        OC_V5_MUTATION_LEASE_TTL_SECONDS: '3',
+        FAKE_SSH_BUFFER_OUTPUT_UNTIL_REMOTE_EXIT: '1',
+        FAKE_SSH_EXIT_DELAY_SECONDS: '5',
+      },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(await waitForChildExit(child, 6_000), true, 'stale-LEASED wrapper did not fail closed')
+      assert.equal(child.exitCode, 86, `stale LEASED must surface as lease loss; signal=${child.signalCode}`)
+      assert.equal(
+        await readFile(fx.commandStarted).then(() => true).catch(() => false),
+        false,
+        'wrapped command started from a stale LEASED receipt after remote flock release',
+      )
+      assert.equal(
+        await readFile(fx.commandPids, 'utf8').then((raw) => raw.trim().length > 0).catch(() => false),
+        false,
+        'stale LEASED spawned the wrapped command process group',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
     }
   })
 
