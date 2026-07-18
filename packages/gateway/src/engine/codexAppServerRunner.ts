@@ -182,6 +182,27 @@ interface QueuedTurn {
    *  一 closure 拿,不读 instance 字段。 */
   requestId?: string
   collabAgentPolicy?: CollabAgentPolicy
+  queueTurn?: boolean
+}
+
+export class PromptQueueRunnerInvariantError extends Error {
+  readonly code = 'PROMPT_QUEUE_RUNNER_INVARIANT'
+  constructor(message: string) {
+    super(message)
+    this.name = 'PromptQueueRunnerInvariantError'
+  }
+}
+
+export function assertPromptQueueRunnerAdmission(
+  queueTurn: boolean,
+  processing: boolean,
+  queuedTurns: number,
+): void {
+  if (queueTurn && (processing || queuedTurns > 0)) {
+    throw new PromptQueueRunnerInvariantError(
+      `queue turn cannot enter Codex runner backlog (processing=${processing}, queued=${queuedTurns})`,
+    )
+  }
 }
 
 interface PendingRequest {
@@ -1459,6 +1480,7 @@ export class CodexAppServerRunner extends EventEmitter {
     /** PR2 v1.0.66 — 见 QueuedTurn.requestId 注释。 */
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
+    queueTurn = false,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1466,8 +1488,9 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emit('spawn', { resumed: this.threadId != null })
     }
     const prompt = normalisePrompt(textOrBlocks)
+    assertPromptQueueRunnerAdmission(queueTurn, this.processing, this.queue.length)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy })
+      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy, queueTurn })
       void this.drain()
     })
   }

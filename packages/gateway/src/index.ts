@@ -19,6 +19,9 @@ export * from './runLog.js'
 export * from './logger.js'
 export * from './metrics.js'
 export * from './outboundRing.js'
+export * from './promptQueueClient.js'
+export * from './promptQueueCoordinator.js'
+export * from './engine/codexAdapter.js'
 // 模型执行权威(容器侧验签消费)。导出 CONTAINER_ATTEST_FRAME_TYPE 等常量供 commercial
 // 侧的 parity 测试锁定 —— 两包不互相 import 生产代码,但「attest 帧 type 必须同值」这条
 // 契约要有一处硬断言,否则改一侧就是静默失联(bridge 永远等不到 attest → 全站拒连接)。

@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from 'node:crypto'
-import type { Pool, PoolClient } from 'pg'
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES,
@@ -9,6 +8,8 @@ import {
   type PromptQueueMutationOutcome,
   type PromptQueueSnapshot,
 } from '@openclaude/protocol'
+import type { Pool, PoolClient } from 'pg'
+import { appendPromptQueueUserMessageInTransaction } from '../db/pgSessionsBackend.js'
 
 const MAX_QUEUE_ITEMS = 50
 const CLAIM_TTL_SECONDS = 30
@@ -36,11 +37,30 @@ export interface PromptQueueDetail {
   /** Queue version read atomically with the detail projection. */
   snapshotVersion: string
   itemId: string
+  clientMessageId: string
   state: string
   content: Record<string, unknown>
   contentHash: string
   contentBytes: string
+  attachments: Array<{
+    ordinal: number
+    kind: string
+    url: string
+    mimeType?: string
+    filename?: string
+    hidden?: boolean
+    contentSha256?: string
+    sizeBytes?: string
+  }>
   requestedExecution: Record<string, unknown>
+  deliveryIntent?: {
+    mode?: string
+    expectedTurnId?: string
+    idempotencyKey?: string
+  }
+  /** Server-only recovery fields. They are never projected into browser snapshots. */
+  deliveryToken?: string
+  engineReceipt?: Record<string, unknown>
   blockedReasonCode?: string
   createdAt: number
   updatedAt: number
@@ -60,8 +80,19 @@ export type PromptQueueClaimRequest =
       epoch: string
       claimToken: string
       turnId: string
+      /** Actual durable reservation made by SessionManager; never guessed by the coordinator. */
+      turnIndex: number
       traceId?: string
       steerDelivery: 'native' | 'fork-native' | 'turn-boundary'
+    }
+  | {
+      action: 'complete'
+      turnId: string
+      turnIndex: number
+    }
+  | {
+      action: 'interrupt_ack'
+      turnId: string
     }
 
 export interface PromptQueueClaimResult {
@@ -73,7 +104,15 @@ export interface PromptQueueClaimResult {
     leaseUntil: number
     renewed: boolean
   }
-  outcome: 'acquired' | 'renewed' | 'released' | 'activated' | 'empty' | 'rejected'
+  outcome:
+    | 'acquired'
+    | 'renewed'
+    | 'released'
+    | 'activated'
+    | 'completed'
+    | 'interrupt_acknowledged'
+    | 'empty'
+    | 'rejected'
   code?: string
 }
 
@@ -123,6 +162,11 @@ interface ItemRow {
   content_sha256: string
   content_bytes: string
   requested_execution: Record<string, unknown>
+  delivery_mode: string | null
+  expected_turn_id: string | null
+  delivery_idempotency_key: string | null
+  delivery_token: string | null
+  engine_receipt: Record<string, unknown> | null
   blocked_reason_code: string | null
   created_at: Date
   updated_at: Date
@@ -180,6 +224,7 @@ export class PgPromptQueueStore {
       const row = await client.query<ItemRow>(
         `SELECT item_id,client_message_id,position,state,display_text,content_json,
                 content_sha256,content_bytes::text,requested_execution,blocked_reason_code,
+                delivery_mode,expected_turn_id,delivery_idempotency_key,delivery_token,engine_receipt,
                 created_at,updated_at
            FROM prompt_queue_items
           WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3`,
@@ -187,15 +232,54 @@ export class PgPromptQueueStore {
       )
       if (!row.rows[0]) throw new PromptQueueStoreError('ITEM_NOT_FOUND', 'queue item not found')
       const item = row.rows[0]
+      const attachmentRows = await client.query<{
+        ordinal: number
+        kind: string
+        url: string
+        mime_type: string | null
+        filename: string | null
+        hidden: boolean
+        content_sha256: string | null
+        size_bytes: string | null
+      }>(
+        `SELECT ordinal,kind,url,mime_type,filename,hidden,content_sha256,size_bytes::text
+           FROM prompt_queue_item_attachments
+          WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3 ORDER BY ordinal`,
+        [owner.userId, owner.sessionKey, itemId],
+      )
       return {
         owner: ownerProjection(owner),
         snapshotVersion: head.rows[0]!.version,
         itemId: item.item_id,
+        clientMessageId: item.client_message_id,
         state: item.state,
         content: item.content_json,
         contentHash: item.content_sha256,
         contentBytes: item.content_bytes,
+        attachments: attachmentRows.rows.map((attachment) => ({
+          ordinal: attachment.ordinal,
+          kind: attachment.kind,
+          url: attachment.url,
+          ...(attachment.mime_type ? { mimeType: attachment.mime_type } : {}),
+          ...(attachment.filename ? { filename: attachment.filename } : {}),
+          ...(attachment.hidden ? { hidden: true } : {}),
+          ...(attachment.content_sha256 ? { contentSha256: attachment.content_sha256 } : {}),
+          ...(attachment.size_bytes ? { sizeBytes: attachment.size_bytes } : {}),
+        })),
         requestedExecution: item.requested_execution,
+        ...(item.delivery_mode || item.expected_turn_id || item.delivery_idempotency_key
+          ? {
+              deliveryIntent: {
+                ...(item.delivery_mode ? { mode: item.delivery_mode } : {}),
+                ...(item.expected_turn_id ? { expectedTurnId: item.expected_turn_id } : {}),
+                ...(item.delivery_idempotency_key
+                  ? { idempotencyKey: item.delivery_idempotency_key }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(item.delivery_token ? { deliveryToken: item.delivery_token } : {}),
+        ...(item.engine_receipt ? { engineReceipt: item.engine_receipt } : {}),
         ...(item.blocked_reason_code ? { blockedReasonCode: item.blocked_reason_code } : {}),
         createdAt: item.created_at.getTime(),
         updatedAt: item.updated_at.getTime(),
@@ -203,7 +287,10 @@ export class PgPromptQueueStore {
     })
   }
 
-  async mutate(owner: PromptQueueOwner, frame: PromptQueueMutationFrame): Promise<PromptQueueMutationResult> {
+  async mutate(
+    owner: PromptQueueOwner,
+    frame: PromptQueueMutationFrame,
+  ): Promise<PromptQueueMutationResult> {
     assertOwner(owner)
     assertFrameOwner(frame, owner)
     const operation = operationOf(frame)
@@ -246,7 +333,8 @@ export class PgPromptQueueStore {
       } else {
         switch (operation) {
           case 'enqueue': {
-            if (frame.type !== 'inbound.prompt_queue.enqueue') throw new Error('operation/type mismatch')
+            if (frame.type !== 'inbound.prompt_queue.enqueue')
+              throw new Error('operation/type mismatch')
             const prepared = prepareContent(frame.content as Record<string, unknown>)
             assertBoundedId('itemId', frame.itemId, 128, ITEM_ID_RE)
             assertBoundedId('clientMessageId', frame.clientMessageId, 128, ITEM_ID_RE)
@@ -265,7 +353,11 @@ export class PgPromptQueueStore {
               code = 'ITEM_ALREADY_EXISTS'
               break
             }
-            const totals = await client.query<{ count: string; bytes: string; max_position: number | null }>(
+            const totals = await client.query<{
+              count: string
+              bytes: string
+              max_position: number | null
+            }>(
               `SELECT COUNT(*)::text AS count,COALESCE(SUM(content_bytes),0)::text AS bytes,
                       MAX(position) AS max_position
                  FROM prompt_queue_items WHERE owner_user_id=$1 AND session_key=$2`,
@@ -273,9 +365,15 @@ export class PgPromptQueueStore {
             )
             const total = totals.rows[0]!
             if (Number(total.count) >= MAX_QUEUE_ITEMS) {
-              throw new PromptQueueStoreError('QUEUE_LIMIT', `queue is limited to ${MAX_QUEUE_ITEMS} items`)
+              throw new PromptQueueStoreError(
+                'QUEUE_LIMIT',
+                `queue is limited to ${MAX_QUEUE_ITEMS} items`,
+              )
             }
-            if (BigInt(total.bytes) + prepared.bytes > BigInt(PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES)) {
+            if (
+              BigInt(total.bytes) + prepared.bytes >
+              BigInt(PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES)
+            ) {
               throw new PromptQueueStoreError('CONTENT_LIMIT', 'queue content budget exceeded')
             }
             const requestedExecution = {
@@ -306,7 +404,8 @@ export class PgPromptQueueStore {
             break
           }
           case 'edit': {
-            if (frame.type !== 'inbound.prompt_queue.edit') throw new Error('operation/type mismatch')
+            if (frame.type !== 'inbound.prompt_queue.edit')
+              throw new Error('operation/type mismatch')
             const item = await lockItem(client, owner, frame.itemId)
             if (!item) {
               outcome = 'rejected'
@@ -324,7 +423,10 @@ export class PgPromptQueueStore {
                 WHERE owner_user_id=$1 AND session_key=$2 AND item_id<>$3`,
               [owner.userId, owner.sessionKey, frame.itemId],
             )
-            if (BigInt(totals.rows[0]!.bytes) + prepared.bytes > BigInt(PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES)) {
+            if (
+              BigInt(totals.rows[0]!.bytes) + prepared.bytes >
+              BigInt(PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES)
+            ) {
               throw new PromptQueueStoreError('CONTENT_LIMIT', 'queue content budget exceeded')
             }
             await client.query(
@@ -332,15 +434,23 @@ export class PgPromptQueueStore {
                   SET content_json=$4::jsonb,content_sha256=$5,content_bytes=$6,display_text=$7,
                       state='queued',blocked_reason_code=NULL,blocked_at=NULL,updated_at=NOW()
                 WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3`,
-              [owner.userId, owner.sessionKey, frame.itemId, prepared.canonical, prepared.hash,
-                prepared.bytes.toString(), prepared.displayText],
+              [
+                owner.userId,
+                owner.sessionKey,
+                frame.itemId,
+                prepared.canonical,
+                prepared.hash,
+                prepared.bytes.toString(),
+                prepared.displayText,
+              ],
             )
             await replaceAttachments(client, owner, frame.itemId, prepared.attachments)
             changed = true
             break
           }
           case 'delete': {
-            if (frame.type !== 'inbound.prompt_queue.delete') throw new Error('operation/type mismatch')
+            if (frame.type !== 'inbound.prompt_queue.delete')
+              throw new Error('operation/type mismatch')
             const item = await lockItem(client, owner, frame.itemId)
             if (!item) {
               outcome = 'rejected'
@@ -367,7 +477,8 @@ export class PgPromptQueueStore {
             break
           }
           case 'reorder': {
-            if (frame.type !== 'inbound.prompt_queue.reorder') throw new Error('operation/type mismatch')
+            if (frame.type !== 'inbound.prompt_queue.reorder')
+              throw new Error('operation/type mismatch')
             const waiting = await client.query<{ item_id: string }>(
               `SELECT item_id FROM prompt_queue_items
                 WHERE owner_user_id=$1 AND session_key=$2 AND state IN ('queued','blocked')
@@ -391,7 +502,8 @@ export class PgPromptQueueStore {
             break
           }
           case 'interject': {
-            if (frame.type !== 'inbound.prompt_queue.interject') throw new Error('operation/type mismatch')
+            if (frame.type !== 'inbound.prompt_queue.interject')
+              throw new Error('operation/type mismatch')
             const item = await lockItem(client, owner, frame.itemId)
             if (!item) {
               outcome = 'rejected'
@@ -410,8 +522,8 @@ export class PgPromptQueueStore {
               outcome = 'turn_changed'
               code = 'TURN_CHANGED'
             } else if (
-              frame.mode === 'insert_current'
-              && (delivery === 'native' || delivery === 'fork-native')
+              frame.mode === 'insert_current' &&
+              (delivery === 'native' || delivery === 'fork-native')
             ) {
               deliveryToken = randomToken()
               await client.query(
@@ -419,8 +531,15 @@ export class PgPromptQueueStore {
                     SET position=NULL,state='steer_pending',delivery_mode=$4,expected_turn_id=$5,
                         delivery_idempotency_key=$6,delivery_token=$7,updated_at=NOW()
                   WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3`,
-                [owner.userId, owner.sessionKey, frame.itemId, frame.mode, frame.expectedTurnId,
-                  frame.idempotencyKey, deliveryToken],
+                [
+                  owner.userId,
+                  owner.sessionKey,
+                  frame.itemId,
+                  frame.mode,
+                  frame.expectedTurnId,
+                  frame.idempotencyKey,
+                  deliveryToken,
+                ],
               )
               await closePositionGap(client, owner, item.position!)
               outcome = 'delivery_pending'
@@ -430,8 +549,14 @@ export class PgPromptQueueStore {
                 `UPDATE prompt_queue_items
                     SET delivery_mode=$4,expected_turn_id=$5,delivery_idempotency_key=$6,updated_at=NOW()
                   WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3`,
-                [owner.userId, owner.sessionKey, frame.itemId, frame.mode, frame.expectedTurnId,
-                  frame.idempotencyKey],
+                [
+                  owner.userId,
+                  owner.sessionKey,
+                  frame.itemId,
+                  frame.mode,
+                  frame.expectedTurnId,
+                  frame.idempotencyKey,
+                ],
               )
               outcome = 'delivery_pending'
             }
@@ -485,10 +610,18 @@ export class PgPromptQueueStore {
 
       if (request.action === 'acquire') {
         if (request.expectedVersion !== head.version) {
-          return { snapshot: await readSnapshot(client, owner), outcome: 'rejected', code: 'VERSION_CONFLICT' }
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'rejected',
+            code: 'VERSION_CONFLICT',
+          }
         }
         if (head.active_turn_id) {
-          return { snapshot: await readSnapshot(client, owner), outcome: 'rejected', code: 'ACTIVE_TURN' }
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'rejected',
+            code: 'ACTIVE_TURN',
+          }
         }
         const current = await client.query<{
           item_id: string
@@ -506,7 +639,11 @@ export class PgPromptQueueStore {
             [head.lease_until],
           )
           const live = lease.rows[0]?.live === true
-          if (head.lease_owner === leaseOwner && live && head.current_claim_token === claimed.claim_token) {
+          if (
+            head.lease_owner === leaseOwner &&
+            live &&
+            head.current_claim_token === claimed.claim_token
+          ) {
             const renewed = await client.query<{ lease_until: Date }>(
               `UPDATE prompt_queue_heads
                   SET lease_until=NOW()+make_interval(secs=>$3),updated_at=NOW()
@@ -531,7 +668,11 @@ export class PgPromptQueueStore {
             }
           }
           if (live) {
-            return { snapshot: await readSnapshot(client, owner), outcome: 'rejected', code: 'CLAIM_HELD' }
+            return {
+              snapshot: await readSnapshot(client, owner),
+              outcome: 'rejected',
+              code: 'CLAIM_HELD',
+            }
           }
           const epoch = nextEpoch(head.coordinator_epoch)
           const token = randomToken()
@@ -569,9 +710,10 @@ export class PgPromptQueueStore {
         const item = next.rows[0]
         if (!item) return { snapshot: await readSnapshot(client, owner), outcome: 'empty' }
 
-        const epoch = head.lease_owner === leaseOwner
-          ? head.coordinator_epoch
-          : nextEpoch(head.coordinator_epoch)
+        const epoch =
+          head.lease_owner === leaseOwner
+            ? head.coordinator_epoch
+            : nextEpoch(head.coordinator_epoch)
         const token = randomToken()
         const lease = await client.query<{ lease_until: Date }>(
           `UPDATE prompt_queue_heads
@@ -602,15 +744,92 @@ export class PgPromptQueueStore {
         }
       }
 
+      if (request.action === 'complete' || request.action === 'interrupt_ack') {
+        if (head.active_turn_id !== request.turnId || !head.active_item_id) {
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'rejected',
+            code: 'TURN_CHANGED',
+          }
+        }
+        if (request.action === 'interrupt_ack') {
+          await client.query(
+            `UPDATE prompt_queue_items
+                SET engine_receipt=COALESCE(engine_receipt,'{}'::jsonb)
+                    || jsonb_build_object('interruptAcknowledgedAt',($4::bigint)),updated_at=NOW()
+              WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3 AND state='active'`,
+            [owner.userId, owner.sessionKey, head.active_item_id, Date.now().toString()],
+          )
+          head = await bumpVersion(client, owner, head)
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'interrupt_acknowledged',
+          }
+        }
+
+        const active = await client.query<{ turn_index: string | null }>(
+          `SELECT engine_receipt->>'turnIndex' AS turn_index
+             FROM prompt_queue_items
+            WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3 AND state='active' FOR UPDATE`,
+          [owner.userId, owner.sessionKey, head.active_item_id],
+        )
+        if (active.rows[0]?.turn_index !== String(request.turnIndex)) {
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'rejected',
+            code: 'ENGINE_RECEIPT_MISMATCH',
+          }
+        }
+        const anchor = await client.query(
+          `SELECT 1 FROM server_authored_turn_anchor_map
+            WHERE user_id=$1 AND turn_key=$2 AND session_id=$3`,
+          [`c:${owner.userId.toString()}`, request.turnId, owner.clientSessionId],
+        )
+        if (!anchor.rowCount) {
+          return {
+            snapshot: await readSnapshot(client, owner),
+            outcome: 'rejected',
+            code: 'TAPE_NOT_ACKED',
+          }
+        }
+        await client.query(
+          `DELETE FROM prompt_queue_items
+            WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3 AND state='active'`,
+          [owner.userId, owner.sessionKey, head.active_item_id],
+        )
+        await client.query(
+          `UPDATE prompt_queue_heads
+              SET active_turn_id=NULL,active_item_id=NULL,active_trace_id=NULL,
+                  active_started_at=NULL,steer_delivery=NULL,updated_at=NOW()
+            WHERE owner_user_id=$1 AND session_key=$2`,
+          [owner.userId, owner.sessionKey],
+        )
+        head = await bumpVersion(client, owner, {
+          ...head,
+          active_turn_id: null,
+          active_item_id: null,
+          active_trace_id: null,
+          active_started_at: null,
+          steer_delivery: null,
+        })
+        return { snapshot: await readSnapshot(client, owner), outcome: 'completed' }
+      }
+
       assertClaimCas(head, leaseOwner, request.epoch, request.claimToken)
-      const item = await client.query<{ item_id: string }>(
-        `SELECT item_id FROM prompt_queue_items
+      const item = await client.query<{
+        item_id: string
+        client_message_id: string
+        content_json: Record<string, unknown>
+        created_at: Date
+      }>(
+        `SELECT item_id,client_message_id,content_json,created_at FROM prompt_queue_items
           WHERE owner_user_id=$1 AND session_key=$2 AND state='dispatch_claimed'
             AND claim_token=$3 AND claim_until>NOW() FOR UPDATE`,
         [owner.userId, owner.sessionKey, request.claimToken],
       )
       const claimed = item.rows[0]
-      if (!claimed) throw new PromptQueueStoreError('CLAIM_CAS_MISMATCH', 'claim is absent or expired')
+      if (!claimed)
+        throw new PromptQueueStoreError('CLAIM_CAS_MISMATCH', 'claim is absent or expired')
 
       if (request.action === 'release') {
         await client.query(
@@ -637,12 +856,35 @@ export class PgPromptQueueStore {
         return { snapshot: await readSnapshot(client, owner), outcome: 'released' }
       }
 
+      const content = claimed.content_json
+      const rawMedia = Array.isArray(content.media) ? content.media : []
+      const persistedMedia = rawMedia.filter((entry) => !isRecord(entry) || entry.hidden !== true)
+      const materialized = await appendPromptQueueUserMessageInTransaction(
+        client,
+        owner.clientSessionId,
+        `c:${owner.userId.toString()}`,
+        {
+          id: claimed.client_message_id,
+          role: 'user',
+          text: typeof content.text === 'string' ? content.text : '',
+          ts: claimed.created_at.getTime(),
+          ...(persistedMedia.length > 0 ? { _media: persistedMedia } : {}),
+        },
+      )
+      if (!materialized.applied) {
+        // This is an infrastructure/transaction failure, not a caller contract
+        // error. Let the HTTP boundary return 500 so the coordinator retries the
+        // same CAS claim; the surrounding transaction rolls every mutation back.
+        throw new Error(`queue user row materialization failed: ${materialized.reason}`)
+      }
+
       await client.query(
         `UPDATE prompt_queue_items
             SET state='active',claim_token=NULL,claim_until=NULL,
-                blocked_reason_code=NULL,blocked_at=NULL,updated_at=NOW()
+                blocked_reason_code=NULL,blocked_at=NULL,
+                engine_receipt=jsonb_build_object('turnIndex',$4::integer),updated_at=NOW()
           WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3`,
-        [owner.userId, owner.sessionKey, claimed.item_id],
+        [owner.userId, owner.sessionKey, claimed.item_id, request.turnIndex],
       )
       await client.query(
         `UPDATE prompt_queue_heads
@@ -650,8 +892,14 @@ export class PgPromptQueueStore {
                 active_started_at=NOW(),steer_delivery=$6,current_claim_token=NULL,
                 lease_until=NULL,updated_at=NOW()
           WHERE owner_user_id=$1 AND session_key=$2`,
-        [owner.userId, owner.sessionKey, request.turnId, claimed.item_id,
-          request.traceId ?? null, request.steerDelivery],
+        [
+          owner.userId,
+          owner.sessionKey,
+          request.turnId,
+          claimed.item_id,
+          request.traceId ?? null,
+          request.steerDelivery,
+        ],
       )
       head = await bumpVersion(client, owner, {
         ...head,
@@ -672,7 +920,11 @@ export class PgPromptQueueStore {
       await client.query('COMMIT')
       return result
     } catch (err) {
-      try { await client.query('ROLLBACK') } catch { /* preserve original error */ }
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        /* preserve original error */
+      }
       throw err
     } finally {
       client.release()
@@ -687,7 +939,11 @@ export class PgPromptQueueStore {
       await client.query('COMMIT')
       return result
     } catch (err) {
-      try { await client.query('ROLLBACK') } catch { /* preserve original error */ }
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        /* preserve original error */
+      }
       throw err
     } finally {
       client.release()
@@ -723,7 +979,8 @@ function assertHeadOwner(head: HeadRow | undefined, owner: PromptQueueOwner): vo
 
 async function bumpVersion(client: Db, owner: PromptQueueOwner, head: HeadRow): Promise<HeadRow> {
   const current = BigInt(head.version)
-  if (current >= PG_BIGINT_MAX) throw new PromptQueueStoreError('VERSION_EXHAUSTED', 'queue version exhausted')
+  if (current >= PG_BIGINT_MAX)
+    throw new PromptQueueStoreError('VERSION_EXHAUSTED', 'queue version exhausted')
   const version = (current + 1n).toString()
   await client.query(
     `UPDATE prompt_queue_heads SET version=$3,updated_at=NOW()
@@ -733,7 +990,11 @@ async function bumpVersion(client: Db, owner: PromptQueueOwner, head: HeadRow): 
   return { ...head, version }
 }
 
-async function readMutation(client: Db, owner: PromptQueueOwner, key: string): Promise<MutationRow | undefined> {
+async function readMutation(
+  client: Db,
+  owner: PromptQueueOwner,
+  key: string,
+): Promise<MutationRow | undefined> {
   const result = await client.query<MutationRow>(
     `SELECT idempotency_key,operation,request_sha256,outcome,applied_version::text,
             result_code,delivery_token
@@ -763,17 +1024,31 @@ async function insertMutation(
        (owner_user_id,session_key,idempotency_key,operation,request_sha256,item_id,
         outcome,applied_version,result_code,delivery_token)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [owner.userId, owner.sessionKey, args.idempotencyKey, args.operation, args.requestHash,
-      args.itemId ?? null, args.outcome, args.appliedVersion ?? null, args.code ?? null,
-      args.deliveryToken ?? null],
+    [
+      owner.userId,
+      owner.sessionKey,
+      args.idempotencyKey,
+      args.operation,
+      args.requestHash,
+      args.itemId ?? null,
+      args.outcome,
+      args.appliedVersion ?? null,
+      args.code ?? null,
+      args.deliveryToken ?? null,
+    ],
   )
 }
 
-async function lockItem(client: Db, owner: PromptQueueOwner, itemId: string): Promise<ItemRow | undefined> {
+async function lockItem(
+  client: Db,
+  owner: PromptQueueOwner,
+  itemId: string,
+): Promise<ItemRow | undefined> {
   assertBoundedId('itemId', itemId, 128, ITEM_ID_RE)
   const result = await client.query<ItemRow>(
     `SELECT item_id,client_message_id,position,state,display_text,content_json,
             content_sha256,content_bytes::text,requested_execution,blocked_reason_code,
+            delivery_mode,expected_turn_id,delivery_idempotency_key,delivery_token,engine_receipt,
             created_at,updated_at
        FROM prompt_queue_items
       WHERE owner_user_id=$1 AND session_key=$2 AND item_id=$3 FOR UPDATE`,
@@ -810,6 +1085,7 @@ async function readSnapshot(
   const rows = await client.query<ItemRow>(
     `SELECT item_id,client_message_id,position,state,display_text,content_json,
             content_sha256,content_bytes::text,requested_execution,blocked_reason_code,
+            delivery_mode,expected_turn_id,delivery_idempotency_key,delivery_token,engine_receipt,
             created_at,updated_at
        FROM prompt_queue_items
       WHERE owner_user_id=$1 AND session_key=$2
@@ -849,15 +1125,16 @@ async function readSnapshot(
     type: 'outbound.prompt_queue.snapshot',
     owner: ownerProjection(owner),
     version: head.version,
-    activeTurn: head.active_turn_id && head.active_item_id && head.active_started_at && head.steer_delivery
-      ? {
-          id: head.active_turn_id,
-          sourceItemId: head.active_item_id,
-          ...(head.active_trace_id ? { traceId: head.active_trace_id } : {}),
-          startedAt: head.active_started_at.getTime(),
-          steerDelivery: head.steer_delivery,
-        }
-      : null,
+    activeTurn:
+      head.active_turn_id && head.active_item_id && head.active_started_at && head.steer_delivery
+        ? {
+            id: head.active_turn_id,
+            sourceItemId: head.active_item_id,
+            ...(head.active_trace_id ? { traceId: head.active_trace_id } : {}),
+            startedAt: head.active_started_at.getTime(),
+            steerDelivery: head.steer_delivery,
+          }
+        : null,
     items: rows.rows.map((row) => ({
       id: row.item_id,
       clientMessageId: row.client_message_id,
@@ -891,7 +1168,8 @@ function ownerProjection(owner: PromptQueueOwner): PromptQueueSnapshot['owner'] 
 }
 
 function prepareContent(content: Record<string, unknown>): PreparedContent {
-  if (!isRecord(content)) throw new PromptQueueStoreError('INVALID_REQUEST', 'content must be an object')
+  if (!isRecord(content))
+    throw new PromptQueueStoreError('INVALID_REQUEST', 'content must be an object')
   const media = content.media
   const attachments: PromptQueueAttachmentRef[] = []
   if (media !== undefined) {
@@ -902,8 +1180,16 @@ function prepareContent(content: Record<string, unknown>): PreparedContent {
       if (!isRecord(raw) || typeof raw.kind !== 'string' || !MEDIA_KINDS.has(raw.kind)) {
         throw new PromptQueueStoreError('INVALID_REQUEST', 'invalid attachment kind')
       }
-      if ('base64' in raw || 'localSrc' in raw || typeof raw.url !== 'string' || !MEDIA_URL_RE.test(raw.url)) {
-        throw new PromptQueueStoreError('INVALID_REQUEST', 'attachments must use content-addressed URLs')
+      if (
+        'base64' in raw ||
+        'localSrc' in raw ||
+        typeof raw.url !== 'string' ||
+        !MEDIA_URL_RE.test(raw.url)
+      ) {
+        throw new PromptQueueStoreError(
+          'INVALID_REQUEST',
+          'attachments must use content-addressed URLs',
+        )
       }
       assertOptionalString('mimeType', raw.mimeType, 128)
       assertOptionalString('filename', raw.filename, 512)
@@ -947,15 +1233,29 @@ async function replaceAttachments(
   for (const ref of attachments) {
     await client.query(
       `INSERT INTO prompt_queue_item_attachments
-         (owner_user_id,session_key,item_id,ordinal,kind,url,mime_type,filename,hidden)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [owner.userId, owner.sessionKey, itemId, ref.ordinal, ref.kind, ref.url,
-        ref.mimeType ?? null, ref.filename ?? null, ref.hidden ?? false],
+         (owner_user_id,session_key,item_id,ordinal,kind,url,mime_type,filename,hidden,content_sha256)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        owner.userId,
+        owner.sessionKey,
+        itemId,
+        ref.ordinal,
+        ref.kind,
+        ref.url,
+        ref.mimeType ?? null,
+        ref.filename ?? null,
+        ref.hidden ?? false,
+        /^\/api\/media\/([0-9a-f]{64})\./.exec(ref.url)?.[1] ?? null,
+      ],
     )
   }
 }
 
-async function closePositionGap(client: Db, owner: PromptQueueOwner, oldPosition: number): Promise<void> {
+async function closePositionGap(
+  client: Db,
+  owner: PromptQueueOwner,
+  oldPosition: number,
+): Promise<void> {
   await client.query(
     `UPDATE prompt_queue_items SET position=position-1,updated_at=NOW()
       WHERE owner_user_id=$1 AND session_key=$2 AND position>$3`,
@@ -963,7 +1263,12 @@ async function closePositionGap(client: Db, owner: PromptQueueOwner, oldPosition
   )
 }
 
-async function moveToHead(client: Db, owner: PromptQueueOwner, itemId: string, oldPosition: number): Promise<void> {
+async function moveToHead(
+  client: Db,
+  owner: PromptQueueOwner,
+  itemId: string,
+  oldPosition: number,
+): Promise<void> {
   if (oldPosition === 1) return
   await client.query(
     `UPDATE prompt_queue_items SET position=position+1,updated_at=NOW()
@@ -989,14 +1294,19 @@ function assertClaimCas(head: HeadRow, leaseOwner: string, epoch: string, token:
   if (!/^(0|[1-9][0-9]*)$/.test(epoch) || !/^[0-9a-f]{64}$/.test(token)) {
     throw new PromptQueueStoreError('CLAIM_CAS_MISMATCH', 'malformed claim CAS')
   }
-  if (head.lease_owner !== leaseOwner || head.coordinator_epoch !== epoch || head.current_claim_token !== token) {
+  if (
+    head.lease_owner !== leaseOwner ||
+    head.coordinator_epoch !== epoch ||
+    head.current_claim_token !== token
+  ) {
     throw new PromptQueueStoreError('CLAIM_CAS_MISMATCH', 'claim owner, epoch, or token mismatch')
   }
 }
 
 function nextEpoch(current: string): string {
   const value = BigInt(current)
-  if (value >= PG_BIGINT_MAX) throw new PromptQueueStoreError('EPOCH_EXHAUSTED', 'coordinator epoch exhausted')
+  if (value >= PG_BIGINT_MAX)
+    throw new PromptQueueStoreError('EPOCH_EXHAUSTED', 'coordinator epoch exhausted')
   return (value + 1n).toString()
 }
 
@@ -1034,28 +1344,36 @@ function assertOwner(owner: PromptQueueOwner): void {
 
 function assertFrameOwner(frame: PromptQueueMutationFrame, owner: PromptQueueOwner): void {
   if (
-    frame.agentId !== owner.agentId
-    || frame.peer.kind !== 'dm'
-    || frame.peer.id !== owner.peer.id
-    || (frame.type === 'inbound.prompt_queue.enqueue' && frame.channel !== 'webchat')
+    frame.agentId !== owner.agentId ||
+    frame.peer.kind !== 'dm' ||
+    frame.peer.id !== owner.peer.id ||
+    (frame.type === 'inbound.prompt_queue.enqueue' && frame.channel !== 'webchat')
   ) {
     throw new PromptQueueStoreError('INVALID_OWNER', 'mutation owner metadata mismatch')
   }
 }
 
-function assertBoundedId(name: string, value: unknown, maxBytes: number, pattern?: RegExp): asserts value is string {
+function assertBoundedId(
+  name: string,
+  value: unknown,
+  maxBytes: number,
+  pattern?: RegExp,
+): asserts value is string {
   if (
-    typeof value !== 'string'
-    || value.length === 0
-    || Buffer.byteLength(value, 'utf8') > maxBytes
-    || (pattern && !pattern.test(value))
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    Buffer.byteLength(value, 'utf8') > maxBytes ||
+    (pattern && !pattern.test(value))
   ) {
     throw new PromptQueueStoreError('INVALID_REQUEST', `${name} is invalid`)
   }
 }
 
 function assertOptionalString(name: string, value: unknown, maxBytes: number): void {
-  if (value !== undefined && (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > maxBytes)) {
+  if (
+    value !== undefined &&
+    (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > maxBytes)
+  ) {
     throw new PromptQueueStoreError('INVALID_REQUEST', `${name} is invalid`)
   }
 }
@@ -1072,13 +1390,21 @@ function validateRequestedExecution(value: Record<string, unknown>): void {
 }
 
 function stableStringify(value: unknown): string {
-  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+  if (
+    value === null ||
+    typeof value === 'boolean' ||
+    typeof value === 'number' ||
+    typeof value === 'string'
+  ) {
     return JSON.stringify(value)
   }
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
   if (isRecord(value)) {
-    return `{${Object.keys(value).filter((key) => value[key] !== undefined).sort()
-      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(',')}}`
   }
   throw new PromptQueueStoreError('INVALID_REQUEST', 'content is not canonical JSON')
 }
@@ -1088,8 +1414,12 @@ function sha256(value: string): string {
 }
 
 function sameSet(left: string[], right: string[]): boolean {
-  return left.length === right.length && new Set(left).size === left.length
-    && new Set(right).size === right.length && left.every((item) => right.includes(item))
+  return (
+    left.length === right.length &&
+    new Set(left).size === left.length &&
+    new Set(right).size === right.length &&
+    left.every((item) => right.includes(item))
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
