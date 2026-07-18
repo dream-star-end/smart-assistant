@@ -41,6 +41,7 @@ const {
   getTurnDispatchStateByDispatch,
   inboxSinkStaged,
   inboxTerminal,
+  isInboundBypassMethodAllowed,
   isTurnDispatchLive,
   markTurnDispatchLive,
   normalizeDispatchUserId,
@@ -911,6 +912,19 @@ describe('M5 resolveInboxTerminalAck(CAS null 不删 entry)', () => {
 })
 
 // ── B4(R3):buildTurnDispatchStateResponse — 行缺失 → state:'absent' 单一权威 ──────────
+describe('inbound bypass method×path 契约(2026-07-19 GET 恒 401 回归锁)', () => {
+  test('GET 仅放行 turn-dispatch-state;POST 全放;其余方法全拒', () => {
+    assert.equal(isInboundBypassMethodAllowed('GET', '/internal/v3/turn-dispatch-state'), true)
+    assert.equal(isInboundBypassMethodAllowed('GET', '/internal/v3/turn-reject-if-absent'), false)
+    assert.equal(isInboundBypassMethodAllowed('GET', '/internal/v3/turn-dispatch-state/extra'), false)
+    assert.equal(isInboundBypassMethodAllowed('POST', '/internal/v3/turn-reject-if-absent'), true)
+    assert.equal(isInboundBypassMethodAllowed('POST', '/internal/v3/turn-dispatch-state'), true)
+    assert.equal(isInboundBypassMethodAllowed('PUT', '/internal/v3/turn-dispatch-state'), false)
+    assert.equal(isInboundBypassMethodAllowed('DELETE', '/internal/v3/turn-dispatch-state'), false)
+    assert.equal(isInboundBypassMethodAllowed('', '/internal/v3/turn-dispatch-state'), false)
+  })
+})
+
 describe('B4 buildTurnDispatchStateResponse(缺行 → absent)', () => {
   test('row=null → found:false + state:absent(非 null)', () => {
     assert.deepEqual(buildTurnDispatchStateResponse(null), {
