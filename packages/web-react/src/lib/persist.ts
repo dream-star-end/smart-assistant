@@ -295,11 +295,15 @@ export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMess
  *     内容；旧逻辑只保尾部会在「团队轮之后又有新轮」的 reopen 场景整卡丢失。保留后由
  *     normalizeDelegateCards（loadStored/applyServerMessages 收口处）按 blockId/runId
  *     兜底折叠,不会与 server 带回的 delegate 工具行形成重复卡。
+ *  ⑦ **本地 permission 卡**（中段）——permission_request / permission_settled 只在 reducer
+ *     生成客户端过程卡，server 历史不产出该 role。断线重连的 auto-deny 往往紧邻 final；full
+ *     sync 必须保住它并维持原槽，否则会丢卡或漂到 final 后。
  *
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
- * 合并后按 `(anchorOrderSeq, ts, index)` 真全序：耐久行位置冻结，本地乐观窗只在锚点内
- * 用 ts/index 排列，server echo 后自然收敛到 `_orderSeq`。
+ * 合并时先按 local 原槽位放回 server 同 id 行与 client-owned 行，再追加 local 尚未见到的
+ * server 行，最后按 `(anchorOrderSeq, ts, index)` 真全序：耐久行位置冻结，本地乐观窗只在
+ * 原槽位前一条耐久行的锚点内用 ts/index 排列，server echo 后自然收敛到 `_orderSeq`。
  *
  * **债A 偿还(server-authored 团队卡)**：server 现会带回 agent-group 骨架行(id `srv-*`、
  * `_source:'server'`、无 childBlocks),用于跨设备/清缓存场景保住团队结构+终态。去重按 runId:
@@ -357,6 +361,18 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
  */
 function isLocallyExpandedTapeRow(m: ChatMessage): boolean {
   return typeof m._tapeExpandedFrom === "string" && m._tapeExpandedFrom.length > 0;
+}
+
+/**
+ * Full merge 的排序轴信任边界：本地 reducer / IndexedDB 铸的行不得携带 `_orderSeq` 进入
+ * durable axis；即使缓存被旧版本污染，也只能按原槽位锚定。显式 `_source:'server'` 的行是
+ * 热尾归档或 tape 展开留下的 server-derived durable cache，必须保留冻结轴（不能退回客户端 ts）。
+ */
+function sanitizePreservedLocalRow(m: ChatMessage): ChatMessage {
+  if (m._source === "server" || !("_orderSeq" in m)) return m;
+  const { _orderSeq: _untrustedOrderSeq, ...safe } = m;
+  void _untrustedOrderSeq;
+  return safe as ChatMessage;
 }
 
 /**
@@ -518,6 +534,8 @@ export function mergeFullServerWins(
           // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
           m.role === "user" ||
           (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
+          // ⑦ permission_request / settled 是 client-owned 过程卡；server 历史无此 role。
+          m.role === "permission" ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m)) ||
           // ⑥ §9 折叠卷展开行:server 只回折叠 anchor、从不回展开行。折叠 tape 非末轮(展开行落在
@@ -527,8 +545,39 @@ export function mergeFullServerWins(
   if (!tail.length && !preservedMid.length) {
     return applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server));
   }
-  // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
-  return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...preservedMid, ...tail]));
+  const safePreservedMid = preservedMid.map(sanitizePreservedLocalRow);
+  const safeTail = tail.map(sanitizePreservedLocalRow);
+  const hasDurableOrderAxis = serverMerged.some(
+    (m) => typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0,
+  );
+  if (!hasDurableOrderAxis) {
+    // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
+    return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]));
+  }
+  const preserved = new Set<ChatMessage>([...preservedMid, ...tail]);
+  const serverMergedById = new Map<string, ChatMessage>();
+  for (const m of serverMerged) if (m?.id) serverMergedById.set(m.id, m);
+  const emittedServerIds = new Set<string>();
+  const inLocalOrder: ChatMessage[] = [];
+  for (const m of local) {
+    const serverRow = m?.id ? serverMergedById.get(m.id) : undefined;
+    if (serverRow) {
+      if (!emittedServerIds.has(serverRow.id)) {
+        inLocalOrder.push(serverRow);
+        emittedServerIds.add(serverRow.id);
+      }
+    } else if (preserved.has(m)) {
+      inLocalOrder.push(sanitizePreservedLocalRow(m));
+    }
+  }
+  // Full sync 可能首次带回 final；放到原 local 槽位重建之后，再由 durable order axis 归位。
+  for (const m of serverMerged) {
+    if (!m?.id || !emittedServerIds.has(m.id)) {
+      inLocalOrder.push(m);
+      if (m?.id) emittedServerIds.add(m.id);
+    }
+  }
+  return applyHistoryProjectionPatches(stableSortByTs(inLocalOrder));
 }
 
 /**
