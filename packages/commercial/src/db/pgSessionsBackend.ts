@@ -2764,6 +2764,19 @@ export function createPgSessionsBackend(
   const backend: PgSessionsBackend = {
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
       return withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+        // 0) 幂等建行:用户首条消息本身就是「会话存在」的权威。前端 ensureServerSession 的
+        //    PUT 是 fire-and-forget、与 WS 首帧天然竞态(legacy persist 路径靠 [0,50,150]ms
+        //    重试吸收;受理路径「受理先于一切」撞库更早,不建行则新会话首条消息必
+        //    session_not_found)。ON CONFLICT DO NOTHING:已存在的行(含他人所有/墓碑)分毫
+        //    不动 —— 归属与墓碑仍由下方 append 的 (id,user_id)/deleted_at 核对裁定,
+        //    session_not_found / session_deleted 语义不变,不会跨用户建行或复活墓碑。
+        //    后到的 ensure PUT(baseSyncedAt=0)命中本行 → rejected_stale 空操作,不 clobber。
+        await client.query(
+          `INSERT INTO client_sessions (id, user_id, agent_id, title, created_at, last_at, updated_at)
+           VALUES ($1, $2, $3, DEFAULT, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL})
+           ON CONFLICT (id) DO NOTHING`,
+          [input.sessionId, input.sessionUserId, input.agentId],
+        );
         // 1) 幂等 append user 行(既有 id 幂等)。
         const appended = await pgAppendServerAuthoredCore(
           client,

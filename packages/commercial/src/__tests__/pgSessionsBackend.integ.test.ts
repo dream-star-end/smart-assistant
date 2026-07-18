@@ -1685,6 +1685,46 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
     assert.equal(dd.kind, "deduplicated");
   });
 
+  maybe("受理即建行(PUT-vs-WS 竞态根治):无预建行 admitted;ensure PUT 后到 rejected_stale;墓碑/他人行不动", async () => {
+    // ① 无预建行(前端 ensure PUT 尚未到达,2026-07-18 线上新会话首条消息必失败根因):
+    //    受理事务自建行 → admitted,user 行与 anchorSeq 同事务落地。
+    const fresh = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-race-1", clientMessageId: "cm-dd-race-1" }),
+    );
+    assert.equal(fresh.kind, "admitted");
+    assert.ok((fresh as { dispatch: { anchorSeq: bigint | null } }).dispatch.anchorSeq !== null);
+    const sess = await backend.getClientSession("s-dd-race-1", CUSER);
+    assert.ok(sess);
+    assert.equal(sess.agentId, "main");
+    assert.equal(sess.title, "新会话");
+    assert.ok(sess.messages.some((m) => (m as { id?: string }).id === "cm-dd-race-1"));
+    // ② 后到的 ensure PUT(messages:[]、baseSyncedAt=0)→ rejected_stale 空操作,user 行不丢。
+    const late = await backend.upsertClientSession(
+      mkSession({ id: "s-dd-race-1", userId: CUSER, updatedAt: 0 }),
+      0,
+    );
+    assert.equal(late, "rejected_stale");
+    const after = await backend.getClientSession("s-dd-race-1", CUSER);
+    assert.ok(after!.messages.some((m) => (m as { id?: string }).id === "cm-dd-race-1"));
+    // ③ 墓碑不复活:已删会话受理仍 session_deleted。
+    await backend.upsertClientSession(mkSession({ id: "s-dd-race-2", userId: CUSER }));
+    await backend.deleteClientSession("s-dd-race-2", CUSER);
+    const tomb = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-race-2", clientMessageId: "cm-dd-race-2" }),
+    );
+    assert.equal(tomb.kind, "session_deleted");
+    // ④ 同 id 他人行不劫持:受理 session_not_found,原行归属不变。
+    await backend.upsertClientSession(mkSession({ id: "s-dd-race-3", userId: "c:8" }));
+    const foreign = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-race-3", clientMessageId: "cm-dd-race-3" }),
+    );
+    assert.equal(foreign.kind, "session_not_found");
+    const owner = await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM client_sessions WHERE id = 's-dd-race-3'",
+    );
+    assert.equal(owner.rows[0]!.user_id, "c:8");
+  });
+
   maybe("finalize 收敛(§2.4):tape header 带 dispatch 身份 → dispatch terminal(outcome=tape.status)", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-conv-2", userId: CUSER }));
     const admit = await backend.admitUserTurn(
