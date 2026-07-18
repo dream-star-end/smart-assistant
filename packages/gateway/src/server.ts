@@ -302,6 +302,7 @@ import {
   inboxReject,
   inboxSinkStageFailedByDispatch,
   inboxSinkStagedByDispatch,
+  isInboundBypassMethodAllowed,
   isTurnDispatchLive,
   markTurnDispatchLive,
   normalizeDispatchUserId,
@@ -4458,7 +4459,7 @@ export class Gateway {
     if (!/^[A-Za-z0-9_-]{43}$/.test(INBOUND_NONCE)) return false
     const remoteIp = req.socket.remoteAddress || ''
     if (remoteIp !== TRUST_BRIDGE_IP && remoteIp !== `::ffff:${TRUST_BRIDGE_IP}`) return false
-    if ((req.method || '') !== 'POST') return false
+    if (!isInboundBypassMethodAllowed(req.method || '', url.pathname)) return false
     // Phase 1 只用一个端点,但前缀放开方便后续 broker → 容器扩控制面(notify-user 等)。
     // 任何不以 /internal/v3/ 开头的路径直接拒,确保 bypass 不会泄到其它路由。
     if (!url.pathname.startsWith('/internal/v3/')) return false

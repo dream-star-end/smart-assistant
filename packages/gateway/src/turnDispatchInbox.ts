@@ -662,6 +662,23 @@ export function buildSyntheticCrashedTapePayload(row: TurnDispatchInboxRow): {
 }
 
 // ---------------------------------------------------------------------------
+// inbound bypass 的 method×path 契约(checkInboundBypass 复用)
+// ---------------------------------------------------------------------------
+
+/**
+ * master→容器 internal 通道的 method 白名单:POST 为默认;GET **仅**放行
+ * turn-dispatch-state(reconciler 只读求证,RFC §2.4/§3)。
+ *
+ * 共享 bypass 曾钉死 POST,durable 批新增 GET 端点后鉴权恒 401 —— §2.4 收敛链在
+ * SSRF 网段错配之下还叠着这一层,两层都是"上线以来零次成功"的静默死链
+ * (2026-07-19,SSRF 修通后才暴露)。新增 GET 端点必须在这里显式登记。
+ */
+export function isInboundBypassMethodAllowed(method: string, pathname: string): boolean {
+  if (method === 'POST') return true
+  return method === 'GET' && pathname === '/internal/v3/turn-dispatch-state'
+}
+
+// ---------------------------------------------------------------------------
 // 活执行注册表(live dispatch registry)
 // ---------------------------------------------------------------------------
 //
