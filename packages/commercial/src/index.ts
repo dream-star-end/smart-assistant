@@ -3299,12 +3299,18 @@ export async function registerCommercial(
         parentOrigin: containerPreviewBaseUrl,
         tunnelOrigin: `http://127.0.0.1:${options.gatewayPort}`,
         cloudflaredBinary: process.env.OC_CONTAINER_PREVIEW_CLOUDFLARED_BIN,
+        previewHostnameSuffix:
+          process.env.OC_CONTAINER_PREVIEW_HOST_SUFFIX?.trim() || undefined,
         maxSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
         warmTunnels: Number(process.env.OC_CONTAINER_PREVIEW_WARM_TUNNELS || 2),
         logger: rootLogger.child({ subsys: "commercial", module: "directContainerPreview" }),
       });
       // eslint-disable-next-line no-console
-      console.log("[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)");
+      console.log(
+        process.env.OC_CONTAINER_PREVIEW_HOST_SUFFIX?.trim()
+          ? "[commercial] V5 native iframe preview ENABLED (same-site hostname)"
+          : "[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)",
+      );
     } catch (err) {
       rootLogger.error("[commercial] native iframe preview disabled", {
         error: (err as Error)?.message ?? String(err),

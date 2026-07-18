@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -15,6 +15,8 @@ const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
+const previewCaddy = path.join(root, 'scripts/install-v5-preview-host.sh')
+const previewDns = path.join(root, 'scripts/configure-v5-preview-dns.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
 const commercialIndex = path.join(root, 'packages/commercial/src/index.ts')
@@ -2549,6 +2551,151 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(source, /@v5_upstream_unavailable status/)
     const result = run(caddy, ['--dry-run'])
     assert.equal(result.status, 0, result.stderr)
+  })
+
+  test('same-site preview Caddy and DNS installers are narrow, log-free and dry-run inert', async () => {
+    const [caddySource, dnsSource] = await Promise.all([
+      readFile(previewCaddy, 'utf8'),
+      readFile(previewDns, 'utf8'),
+    ])
+    assert.match(caddySource, /http:\/\/\*\.claudeai\.chat/)
+    assert.match(caddySource, /http\.request\.host.*ocp-\[0-9a-f\]\{32\}\\\\\.claudeai/)
+    assert.match(caddySource, /header >X-OC-Preview-Route "v1"/)
+    assert.match(caddySource, /upstream forged preview route marker survived/)
+    assert.match(caddySource, /HTTP\/1\.1 101 Switching Protocols/)
+    assert.match(caddySource, /preview host not found.*404/)
+    assert.match(caddySource, /preview site must not enable access logging/)
+
+    assert.match(dnsSource, /settings\/ssl/)
+    assert.match(dnsSource, /pre_state == "absent" or \.pre_state == "identical"/)
+    assert.match(dnsSource, /conflicting or ambiguous state; no mutation made/)
+    assert.match(dnsSource, /created_record_id/)
+    assert.match(dnsSource, /owned DNS record attributes drifted; refusing deletion/)
+    assert.match(dnsSource, /X-OC-Preview-Route: v1/)
+    assert.doesNotMatch(dnsSource, /dns_records\/\$id"[^\n]*PUT/)
+
+    for (const script of [previewCaddy, previewDns]) {
+      const result = run(script, ['--dry-run'])
+      assert.equal(result.status, 0, result.stderr)
+    }
+  })
+
+  test('same-site preview DNS apply and rollback own only the record they create', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-preview-dns-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    const snapshots = path.join(dir, 'snapshots')
+    const state = path.join(dir, 'state')
+    const record = path.join(dir, 'record.json')
+    const log = path.join(dir, 'curl.log')
+    const keys = path.join(dir, 'keys')
+    await mkdir(bin)
+    await writeFile(state, 'absent\n')
+    await writeFile(
+      keys,
+      `CLOUDFLARE_API_TOKEN=test-token\nCLOUDFLARE_ZONE_ID_CLAUDEAI=${'b'.repeat(32)}\n`,
+    )
+    await chmod(keys, 0o600)
+    await writeFile(
+      path.join(bin, 'curl'),
+      `#!/usr/bin/env bash
+set -euo pipefail
+method=GET; output=''; headers=''; payload=''; url=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --request) method="$2"; shift 2 ;;
+    --output|-o) output="$2"; shift 2 ;;
+    -D) headers="$2"; shift 2 ;;
+    --data-binary) payload="\${2#@}"; shift 2 ;;
+    --config|--write-out|--max-time) shift 2 ;;
+    --silent|--show-error|-sS) shift ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+printf '%s %s\n' "$method" "$url" >>"$FAKE_CF_LOG"
+if [[ "$url" != https://api.cloudflare.com/* ]]; then
+  printf 'HTTP/2 200\\r\\nX-OC-Preview-Route: v1\\r\\n\\r\\n' >"$headers"
+  exit 0
+fi
+case "$url" in
+  */user/tokens/verify) branch=verify; body='{"success":true,"result":{"status":"active"}}' ;;
+  */settings/ssl) branch=ssl; body='{"success":true,"result":{"value":"flexible"}}' ;;
+  */dns_records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+    branch=delete
+    [[ "$method" == DELETE ]]
+    printf 'absent\\n' >"$FAKE_CF_STATE"
+    body='{"success":true,"result":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
+  */dns_records\?*)
+    branch=list
+    if [[ "$(cat "$FAKE_CF_STATE")" == absent ]]; then
+      body='{"success":true,"result":[],"result_info":{"total_count":0}}'
+    else
+      body="$(jq -cn --slurpfile record "$FAKE_CF_RECORD" '{success:true,result:$record,result_info:{total_count:($record|length)}}')"
+    fi ;;
+  */dns_records)
+    branch=create
+    [[ "$method" == POST ]]
+    jq '. + {id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' "$payload" >"$FAKE_CF_RECORD"
+    printf 'present\\n' >"$FAKE_CF_STATE"
+    body="$(jq -cn --slurpfile record "$FAKE_CF_RECORD" '{success:true,result:$record[0]}')" ;;
+  */zones/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+    branch=zone
+    body='{"success":true,"result":{"name":"claudeai.chat","status":"active"}}' ;;
+  *) body='{"success":false,"errors":[{"code":99999}]}' ;;
+esac
+printf 'BRANCH %s STATE %s\n' "$branch" "$(cat "$FAKE_CF_STATE")" >>"$FAKE_CF_LOG"
+printf '%s' "$body" >"$output"
+printf 200
+`,
+    )
+    await writeFile(path.join(bin, 'dig'), '#!/bin/sh\nprintf "104.21.89.221\\n"\n')
+    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\ncat >/dev/null\n')
+    await Promise.all(['curl', 'dig', 'ssh'].map((name) => chmod(path.join(bin, name), 0o755)))
+    const env = {
+      PATH: `${bin}:${process.env.PATH}`,
+      OC_CLOUDFLARE_KEYS_FILE: keys,
+      OC_PREVIEW_DNS_SNAPSHOT_DIR: snapshots,
+      KL_HOST: 'fake-v5',
+      FAKE_CF_STATE: state,
+      FAKE_CF_RECORD: record,
+      FAKE_CF_LOG: log,
+    }
+
+    const applied = run(previewDns, ['--apply'], env)
+    assert.equal(applied.status, 0, applied.stderr || applied.stdout)
+    assert.equal((await readFile(state, 'utf8')).trim(), 'present')
+    const snapshot = applied.stdout.match(/snapshot=(\S+)/)?.[1]
+    assert.ok(snapshot)
+    assert.equal((await readFile(snapshot, 'utf8')).includes('test-token'), false)
+    assert.equal((await stat(snapshot)).mode & 0o777, 0o600)
+
+    const rolledBack = run(previewDns, ['--rollback', snapshot], env)
+    assert.equal(
+      rolledBack.status,
+      0,
+      `${rolledBack.stderr || rolledBack.stdout}\n${await readFile(log, 'utf8')}`,
+    )
+    assert.equal((await readFile(state, 'utf8')).trim(), 'absent')
+    const idempotent = run(previewDns, ['--rollback', snapshot], env)
+    assert.equal(idempotent.status, 0, idempotent.stderr || idempotent.stdout)
+
+    await writeFile(
+      record,
+      JSON.stringify({
+        id: 'cccccccccccccccccccccccccccccccc',
+        type: 'A',
+        name: '*.claudeai.chat',
+        content: '192.0.2.1',
+        proxied: true,
+        ttl: 1,
+      }),
+    )
+    await writeFile(state, 'present\n')
+    const conflict = run(previewDns, ['--apply'], env)
+    assert.notEqual(conflict.status, 0)
+    assert.match(conflict.stderr, /conflicting or ambiguous state; no mutation made/)
+    assert.equal(JSON.parse(await readFile(record, 'utf8')).id, 'cccccccccccccccccccccccccccccccc')
   })
 
   test('P3 Caddy port keeps the production render golden and validates boundaries', () => {
