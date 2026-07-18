@@ -1,0 +1,18 @@
+# v5 线上持续 turn 探针(2026-07-18 门禁审计批B)—— 每 30 分钟由 turn-probe.timer 触发,
+# 矩阵轮转跑一格真 turn(codex-new/ccb-new/codex-reuse),结果落
+# /var/lib/openclaude-v5/turn-probe.json,由 v5-monitor.sh check_turn_probe 消费告警。
+# 与 monitor 同模式:WorkingDirectory=slot A symlink,脚本随 release 更新;probe 内部
+# 自行按 deploy_state 解析真实 serving slot/release(含 B-active 场景),symlink 只供
+# 取 wrapper 脚本本体。维护窗/生产变更 lease 持有时自动跳过(不告警不误报)。
+[Unit]
+Description=OpenClaude v5 continuous turn probe (matrix rotation, every 30min)
+After=network.target
+OnFailure=openclaude-v5-alert-fail@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-turn-probe.sh
+TimeoutStartSec=360

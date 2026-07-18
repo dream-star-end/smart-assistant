@@ -373,6 +373,34 @@ check_serving_masters() {
   fi
 }
 
+check_probe_result() { # <name> <file> <interval_secs> <人话>
+  # 持续探针结果消费(2026-07-18 门禁审计批B):探针(turn=kl-mirror timer 30min /
+  # e2e=部署发起机 timer 60min)只写结果文件,告警统一走本管线(去重/6h 重提/恢复)。
+  # 判定:文件缺失=探针未安装(bad,fail-visible);ok=false=探针失败(bad);
+  # 结果陈旧 >3×interval 且当前无 maintenance=探针失联(bad;本机宕机/timer 失效也要可见);
+  # kind=skipped(维护窗/变更 lease 避让)与 kind=flaky(重试通过)都算 ok(flake 流水账
+  # 由 e2e_flake 检查单独盯)。
+  local name="$1" f="$2" interval="$3" human="$4" ok at kind detail age
+  if [ ! -f "$f" ]; then record "$name" bad "$human:探针未安装/无结果($f)——跑 scripts/install-v5-probes.sh"; return; fi
+  ok="$(jq -r '.ok // false' "$f" 2>/dev/null || echo parse-error)"
+  at="$(jq -r '.at // 0' "$f" 2>/dev/null || echo 0)"
+  kind="$(jq -r '.kind // ""' "$f" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "$f" 2>/dev/null | head -c 200)"
+  if [ "$ok" = "parse-error" ] || ! [ "$at" -gt 0 ] 2>/dev/null; then
+    record "$name" bad "$human:结果文件损坏($f)"; return
+  fi
+  age=$((NOW - at))
+  if [ "$age" -gt $((interval * 3)) ]; then
+    record "$name" bad "$human:结果陈旧 $((age/60))min(>3×${interval}s)——timer 失效/探针机失联"
+    return
+  fi
+  if [ "$ok" = "true" ]; then
+    record "$name" ok "$human:${kind:-probe} ok($((age/60))min 前)"
+  else
+    record "$name" bad "$human:探针失败(kind=$kind,$((age/60))min 前):$detail"
+  fi
+}
+
 check_smoke_waiver() {
   # 部署门豁免留痕(2026-07-18 门禁审计):deploy-v5.sh 在 V5_SMOKE_TURN=0/V5_SMOKE_E2E=0
   # 豁免时写 /var/lib/openclaude-v5/smoke-waiver-<gate>.json,对应门后续真跑通过才清除。
@@ -411,10 +439,12 @@ check_e2e_flake() {
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
+    # turn_probe = 主链路真 turn 主动探针,失败即"用户此刻发消息大概率挂"→ critical。
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures|turn_probe) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
     # smoke_waiver/e2e_flake = 部署验证债与门 flake 记账,值得看但非现网故障。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake) echo warning ;;
+    # e2e_probe 依赖部署发起机在线,失联概率高于现网故障,先按 warning(稳定后可升级)。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -453,6 +483,8 @@ check_kp_plugin
 check_client_4xx_storm
 check_smoke_waiver
 check_e2e_flake
+check_probe_result turn_probe /var/lib/openclaude-v5/turn-probe.json 1800 "持续 turn 探针"
+check_probe_result e2e_probe  /var/lib/openclaude-v5/e2e-probe.json  3600 "持续 E2E 旅程探针"
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

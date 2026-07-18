@@ -39,7 +39,7 @@
     "test:commercial:integ:strict": "REQUIRE_TEST_DB=1 npm run test:commercial:integ",
     "test:commercial:prompt-queue": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 packages/commercial/src/__tests__/internalPromptQueue.test.ts packages/commercial/src/__tests__/promptQueueDispatch.test.ts packages/commercial/src/__tests__/promptQueueStore.integ.test.ts packages/commercial/src/__tests__/userChatBridgeCodexBilling.test.ts'",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
-    "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts",
+    "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts scripts/__tests__/v5TurnCanaryContract.test.ts",
     "check:tutorials": "tsx scripts/check-v5-tutorials.ts",
     "tutorials:accept": "tsx scripts/check-v5-tutorials.ts accept",
     "tutorials:media": "tsx scripts/generate-v5-tutorial-media.ts",

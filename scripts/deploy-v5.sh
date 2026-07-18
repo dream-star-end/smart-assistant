@@ -4193,8 +4193,10 @@ smoke_turn_canary() { # <pinned master release> [port]
     echo "  [dry-run] real-turn canary(codex 引擎全链路)@ $release"
     return 0
   fi
-  echo "── smoke:canary 真 turn(codex 引擎全链路,port=$port)──"
-  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' timeout 300 node scripts/v5-smoke-turn-canary.mjs" \
+  # 2026-07-18 批B:canary 升级为三格矩阵(codex-new/ccb-new/codex-reuse),串行三个真
+  # turn,timeout 从 300 提到 720(xhigh 思考档单 turn 可近 90s 静默窗)。
+  echo "── smoke:canary 真 turn 矩阵(codex/ccb × 新建/复用,port=$port)──"
+  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' timeout 720 node scripts/v5-smoke-turn-canary.mjs" \
     || return 1
   clear_smoke_waiver turn
 }
